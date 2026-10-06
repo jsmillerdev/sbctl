@@ -12,13 +12,6 @@ import (
 	"github.com/OWNER/sbctl/internal/backup"
 )
 
-// walExitFatal is the exit status of `wal fetch` when the archive could not be read.
-// PostgreSQL treats any restore_command exit status above 125 (or a signal) as fatal
-// and aborts recovery; every other non-zero status means "file not in the archive"
-// and ends recovery at that point. A storage outage must not look like the end of
-// the archive, or recovery would stop early and promote a cluster missing data.
-const walExitFatal = 126
-
 const (
 	walPushTimeout  = 10 * time.Minute
 	walFetchTimeout = 5 * time.Minute
@@ -97,5 +90,5 @@ func walService() (*backup.Service, error) {
 
 func exitFatal(err error) {
 	fmt.Fprintln(os.Stderr, "sbctl:", err)
-	os.Exit(walExitFatal)
+	os.Exit(backup.WALExitFatal)
 }

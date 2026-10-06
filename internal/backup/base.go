@@ -138,7 +138,7 @@ func (s *Service) runBase(ctx context.Context, proj *registry.Project, id string
 		select current_setting('data_directory'), current_setting('server_version_num')::int,
 		       current_setting('archive_mode'), current_setting('archive_command'), current_setting('full_page_writes'),
 		       (select count(*) from pg_tablespace where spcname not in ('pg_default', 'pg_global')),
-		       (select wal_segment_size from pg_control_init()), pg_is_in_recovery()`).
+		       (select bytes_per_wal_segment from pg_control_init()), pg_is_in_recovery()`).
 		Scan(&f.DataDir, &f.VersionNum, &f.ArchiveMode, &f.ArchiveCommand, &f.FullPageWrites, &f.Tablespaces, &f.WALSegmentSize, &f.InRecovery)
 	if err != nil {
 		return nil, fmt.Errorf("inspect cluster: %w", err)
