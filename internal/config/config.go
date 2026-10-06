@@ -48,6 +48,7 @@ type Config struct {
 	Backup    Backup    `toml:"backup"`
 	Artifacts Artifacts `toml:"artifacts"`
 	Studio    Studio    `toml:"studio"`
+	API       API       `toml:"api"`
 	Defaults  Limits    `toml:"defaults"`
 }
 
