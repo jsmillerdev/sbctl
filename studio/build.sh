@@ -22,6 +22,7 @@
 #                         and public/: skip fetch, install and build, only package (used by tests)
 #   STUDIO_PREBUILT_PLACEHOLDERS  placeholders.json that matches STUDIO_PREBUILT (default placeholders.json)
 #   STUDIO_NODE_DIR       use this node distribution (needs bin/node) instead of downloading one
+#   STUDIO_UNTIL=prune    stop after fetch, patch, prune and the lockfile check (a light preflight)
 #   STUDIO_KEEP_WORK=1    keep the scratch directory
 #   STUDIO_SKIP_VERIFY=1  do not start the packaged build to check it
 set -euo pipefail
@@ -141,7 +142,7 @@ log "node $(node --version)"
 
 # ---- fetch, patch, install, build -------------------------------------------------------------
 if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
-  export NEXT_TELEMETRY_DISABLED=1 CI=1 npm_config_update_notifier=false
+  export NEXT_TELEMETRY_DISABLED=1 TURBO_TELEMETRY_DISABLED=1 DO_NOT_TRACK=1 CI=1 npm_config_update_notifier=false
   PNPM_HOME_DIR="$TOOLS/pnpm"
   if [[ ! -x "$PNPM_HOME_DIR/node_modules/.bin/pnpm" ]]; then
     log "installing pnpm@$PNPM_VERSION"
@@ -187,6 +188,11 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
     cp "$SRC/LICENSE" "$WORK/UPSTREAM-LICENSE"
     rm -rf "$SRC/apps" "$SRC/packages"   # frees ~200 MB; the pruned copy is the build tree now
   fi
+
+  # Cheap early failure: the pruned lockfile must satisfy the pruned manifests.
+  log "lockfile check"
+  (cd "$APP" && pnpm install --frozen-lockfile --lockfile-only --reporter=append-only)
+  if [[ "${STUDIO_UNTIL:-}" == prune ]]; then log "stopping after prune (STUDIO_UNTIL=prune)"; exit 0; fi
 
   log "pnpm install (frozen lockfile)"
   (cd "$APP" && pnpm install --frozen-lockfile --filter 'studio...' \
