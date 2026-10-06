@@ -7,6 +7,8 @@ Type=oneshot
 User=sbctl
 Group=sbctl
 Slice=sbctl.slice
+# SBCTL_REGISTRY_DSN (and any other SBCTL_* override) for processes outside the daemon.
+EnvironmentFile=-/etc/sbctl/sbctl.env
 Nice=10
 IOSchedulingClass=idle
 ExecStart=/usr/local/bin/sbctl backups create %i --reason scheduled

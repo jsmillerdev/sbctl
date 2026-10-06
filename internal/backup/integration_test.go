@@ -303,26 +303,57 @@ func idsString(ids []int) string { return fmt.Sprint(ids) }
 
 // TestPointInTimeRestore is the workstream's required test: write, back up, write,
 // note a time, destroy, then restore to the noted time (as a new project and in
-// place) from a base backup plus WAL fetched through the real sbctl binary.
+// place) from a base backup plus WAL fetched through the real sbctl binary. The
+// backend is a local directory.
 func TestPointInTimeRestore(t *testing.T) {
+	root := t.TempDir()
+	archiveDir := filepath.Join(root, "archive")
+	st, err := NewFileStore(archiveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runPointInTimeRestore(t, root, st, fmt.Sprintf("[backup]\nbackend = %q\nretention_days = 7\n", "file://"+archiveDir))
+}
+
+// TestPointInTimeRestoreS3Fake runs the scenario over the S3 backend against an
+// in-process fake S3 server (gofakes3), which the sbctl children reach over loopback.
+func TestPointInTimeRestoreS3Fake(t *testing.T) {
+	pgBinDir(t)
+	runPointInTimeRestoreS3(t, fakeS3(t))
+}
+
+// TestPointInTimeRestoreS3 is the same test over a real S3-compatible service: CI
+// only, skipped without SBCTL_TEST_S3_* (see store_s3_test.go).
+func TestPointInTimeRestoreS3(t *testing.T) {
+	pgBinDir(t)
+	runPointInTimeRestoreS3(t, s3FromEnv(t))
+}
+
+func runPointInTimeRestoreS3(t *testing.T, o S3Options) {
+	st, err := NewS3Store(context.Background(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanS3(t, st)
+	toml := fmt.Sprintf("[backup]\nbackend = %q\ns3_endpoint = %q\ns3_region = %q\ns3_force_path_style = true\ns3_access_key_id = %q\ns3_secret_access_key = %q\nretention_days = 7\n",
+		"s3://"+o.Bucket+"/"+o.Prefix, o.Endpoint, o.Region, o.AccessKeyID, o.SecretKey)
+	runPointInTimeRestore(t, t.TempDir(), st, toml)
+}
+
+// runPointInTimeRestore runs the scenario with store as the backend and backupToml as
+// the [backup] section the sbctl children (archive_command, restore_command) read.
+func runPointInTimeRestore(t *testing.T, root string, st Store, backupToml string) {
 	bin := pgBinDir(t)
 	sbctl := sbctlBinary(t)
 	ctx := context.Background()
 	e := newTestEnv(t)
 	e.now = time.Now() // base backups and restores run on the real clock here
 	e.svc.opt.Now = time.Now
-	root := e.root
 
-	archiveDir := filepath.Join(root, "archive")
 	cfgPath := filepath.Join(root, "sbctl.toml")
-	writeFile(t, cfgPath, []byte(fmt.Sprintf("state_dir = %q\nbin_path = %q\n\n[backup]\nbackend = %q\nretention_days = 7\n",
-		filepath.Join(root, "state"), sbctl, "file://"+archiveDir)))
+	writeFile(t, cfgPath, []byte(fmt.Sprintf("state_dir = %q\nbin_path = %q\n\n%s", filepath.Join(root, "state"), sbctl, backupToml)))
 	e.cfg.BinPath = sbctl
-	st, err := NewFileStore(archiveDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	e.svc.opt.Store, e.store = st, st
+	e.svc.opt.Store, e.store = st, nil
 	e.svc.opt.ConfigPath = cfgPath
 
 	src := newSourceCluster(t, bin, root, testRef, ArchiveSettings(e.cfg, testRef, cfgPath))
@@ -423,10 +454,10 @@ func TestPointInTimeRestore(t *testing.T) {
 	}
 	// The clone archives to its own ref (its new timeline's history file), never the source's.
 	waitFor(t, "the clone's first archived file", 60*time.Second, func() (bool, error) {
-		_, err := e.store.Stat(ctx, walKey(testRef2, "00000002.history"))
+		_, err := st.Stat(ctx, walKey(testRef2, "00000002.history"))
 		return err == nil, err
 	})
-	if _, err := e.store.Stat(ctx, walKey(testRef, "00000002.history")); err == nil {
+	if _, err := st.Stat(ctx, walKey(testRef, "00000002.history")); err == nil {
 		t.Error("the clone wrote timeline 2 into the source project's archive")
 	}
 	clone.stop()
@@ -454,7 +485,7 @@ func TestPointInTimeRestore(t *testing.T) {
 	}
 	// A new base backup works on the promoted cluster, so the project is protected again.
 	waitFor(t, "archiving on the new timeline", 60*time.Second, func() (bool, error) {
-		_, err := e.store.Stat(ctx, walKey(testRef, "00000002.history"))
+		_, err := st.Stat(ctx, walKey(testRef, "00000002.history"))
 		return err == nil, err
 	})
 	if _, err := e.svc.BaseBackup(ctx, testRef); err != nil {

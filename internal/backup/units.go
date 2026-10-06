@@ -20,6 +20,11 @@ const (
 	BackupTimerUnit   = "sb-basebackup@.timer"
 )
 
+// EnvFile is the optional environment file the backup service reads. `sbctl backups`
+// runs outside the daemon and finds the registry through SBCTL_REGISTRY_DSN, which
+// the installer or lifecycle writes here.
+const EnvFile = "/etc/sbctl/sbctl.env"
+
 // BackupTimerInstance is the timer instance to enable for ref.
 func BackupTimerInstance(ref string) string { return "sb-basebackup@" + ref + ".timer" }
 
@@ -37,6 +42,8 @@ Type=oneshot
 User=sbctl
 Group=sbctl
 Slice=%s
+# SBCTL_REGISTRY_DSN (and any other SBCTL_* override) for processes outside the daemon.
+EnvironmentFile=-%s
 Nice=10
 IOSchedulingClass=idle
 ExecStart=%s backups create %%i --reason scheduled
@@ -44,7 +51,7 @@ ExecStart=%s backups prune %%i
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
-`, config.Slice, bin, bin)
+`, config.Slice, EnvFile, bin, bin)
 }
 
 // RenderBackupTimer renders sb-basebackup@.timer. onCalendar is a systemd OnCalendar

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -321,6 +322,9 @@ func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) e
 	if err := writeSyncFile(filepath.Join(dataDir, "recovery.signal"), nil, 0o600); err != nil {
 		return err
 	}
+	if err := chownLikeParent(dataDir); err != nil {
+		return err
+	}
 	return syncTree(dataDir)
 }
 
@@ -410,6 +414,30 @@ func extractTar(ctx context.Context, tr *tar.Reader, root string) error {
 			return fmt.Errorf("unsupported entry type %q for %s", hdr.Typeflag, name)
 		}
 	}
+}
+
+// chownLikeParent gives the tree under root the owner of root's parent directory when
+// sbctl runs as root. An administrator who runs `sudo sbctl backups restore` must not
+// leave root-owned files behind: Postgres runs as the sbctl user and refuses a data
+// directory it does not own. As any other user it does nothing (files are already ours).
+func chownLikeParent(root string) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	fi, err := os.Stat(filepath.Dir(root))
+	if err != nil {
+		return err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	return filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Lchown(p, int(st.Uid), int(st.Gid))
+	})
 }
 
 // syncTree fsyncs every directory under root, deepest first, so the new tree is durable.
