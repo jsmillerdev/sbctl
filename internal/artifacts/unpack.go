@@ -41,6 +41,7 @@ func Unpack(r io.Reader, dest string) (UnpackStats, error) {
 func extractTar(tr *tar.Reader, dest string) (UnpackStats, error) {
 	var st UnpackStats
 	symlinks := map[string]bool{} // cleaned relative paths of extracted symlinks
+	linkTargets := map[string]string{}
 	dirModes := map[string]os.FileMode{}
 
 	for {
@@ -102,6 +103,7 @@ func extractTar(tr *tar.Reader, dest string) (UnpackStats, error) {
 				return st, err
 			}
 			symlinks[rel] = true
+			linkTargets[rel] = hdr.Linkname
 			st.Symlinks++
 		case tar.TypeLink:
 			src, err := cleanEntryName(hdr.Linkname)
@@ -121,6 +123,15 @@ func extractTar(tr *tar.Reader, dest string) (UnpackStats, error) {
 			st.Files++
 		default:
 			return st, fmt.Errorf("artifacts: entry %q has unsupported type %q", hdr.Name, string(hdr.Typeflag))
+		}
+	}
+
+	// The per-entry check above is lexical. Now that every link exists, resolve each
+	// through the others so that a chain such as s -> . and l -> s/.. cannot point out
+	// of the artifact.
+	for rel, name := range linkTargets {
+		if err := resolveLink(rel, name, linkTargets); err != nil {
+			return st, err
 		}
 	}
 
@@ -165,6 +176,43 @@ func checkLinkTarget(rel, linkname string) error {
 	resolved := path.Clean(path.Join(path.Dir(rel), linkname))
 	if resolved == ".." || strings.HasPrefix(resolved, "../") {
 		return fmt.Errorf("artifacts: symlink %q escapes the artifact: %q", rel, linkname)
+	}
+	return nil
+}
+
+// maxLinkHops bounds symlink expansion, like the kernel's limit, so loops end.
+const maxLinkHops = 40
+
+// resolveLink follows the symlink at rel (target name) through the other symlinks in
+// links, as the kernel would, and fails if it leaves the artifact root or loops.
+func resolveLink(rel, name string, links map[string]string) error {
+	stack := []string{}
+	if d := path.Dir(rel); d != "." {
+		stack = strings.Split(d, "/")
+	}
+	queue := strings.Split(name, "/")
+	hops := 0
+	for len(queue) > 0 {
+		c := queue[0]
+		queue = queue[1:]
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) == 0 {
+				return fmt.Errorf("artifacts: symlink %q escapes the artifact through other links: %q", rel, name)
+			}
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		stack = append(stack, c)
+		if t, ok := links[strings.Join(stack, "/")]; ok {
+			if hops++; hops > maxLinkHops {
+				return fmt.Errorf("artifacts: symlink %q loops or nests too deeply: %q", rel, name)
+			}
+			stack = stack[:len(stack)-1]
+			queue = append(strings.Split(t, "/"), queue...)
+		}
 	}
 	return nil
 }

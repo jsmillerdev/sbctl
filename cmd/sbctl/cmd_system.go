@@ -114,7 +114,7 @@ configuration. Run it as the user that owns the state directory (sbctl).`,
 
 	install := &cobra.Command{
 		Use:   "install-units",
-		Short: "Install the systemd units and the polkit rule (needs root)",
+		Short: "Install the systemd units and the polkit rule, and enable the system units (needs root)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			changed, err := systemd.Install(sysUnitDir, sysPolkitDir)
@@ -126,18 +126,17 @@ configuration. Run it as the user that owns the state directory (sbctl).`,
 			}
 			if len(changed) == 0 {
 				fmt.Fprintln(cmd.OutOrStdout(), "units are up to date")
-				return nil
 			}
 			cfg, err := loadConfig()
 			if err != nil {
 				return err
 			}
-			sup, err := lifecycle.OpenOptions{Log: newLogger(cfg)}.Reloader(cfg)
+			apply, err := lifecycle.OpenOptions{Log: newLogger(cfg)}.UnitInstaller(cfg)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "run `systemctl daemon-reload` to load the new units:", err)
+				fmt.Fprintln(os.Stderr, "run `systemctl daemon-reload` and enable the system units yourself:", err)
 				return nil
 			}
-			return sup(cmd.Context())
+			return apply(cmd.Context(), len(changed) > 0)
 		},
 	}
 	install.Flags().StringVar(&sysUnitDir, "unit-dir", "/etc/systemd/system", "where to write unit files")

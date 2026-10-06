@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -633,5 +634,82 @@ func TestClasses(t *testing.T) {
 		if n == ClassSystem {
 			t.Fatal("system class must not be user selectable")
 		}
+	}
+}
+
+// A seed carries its own role passwords, so fresh keys could never log in.
+func TestCreateSeedWithoutKeysIsRejected(t *testing.T) {
+	h := newHarness(t)
+	seed := DataSeeder(func(context.Context, *registry.Project, string) error { return nil })
+	_, err := h.e.Create(context.Background(), CreateRequest{Seed: seed})
+	if err == nil || !strings.Contains(err.Error(), "Keys") {
+		t.Fatalf("err = %v", err)
+	}
+	if ps, _ := h.reg.ListProjects(context.Background()); len(ps) != 0 || len(h.plane.calls) != 0 {
+		t.Fatalf("rows=%+v calls=%v", ps, h.plane.calls)
+	}
+}
+
+// An existing cluster is somebody's data: Create refuses, does not call the data
+// plane's Delete (which removes the directory) and forgets the row it made.
+func TestCreateOverExistingClusterLeavesDataAlone(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.plane.failOn["Create"] = fmt.Errorf("%w: /somewhere", ErrClusterExists)
+	_, err := h.e.Create(ctx, CreateRequest{Ref: "abcdefghijklmnopqrst"})
+	if !errors.Is(err, ErrClusterExists) || !strings.Contains(err.Error(), "untouched") {
+		t.Fatalf("err = %v", err)
+	}
+	if h.plane.has("Delete abcdefghijklmnopqrst") {
+		t.Fatalf("existing data was deleted: %v", h.plane.calls)
+	}
+	if _, err := h.reg.GetProject(ctx, "abcdefghijklmnopqrst"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("row remains: %v", err)
+	}
+}
+
+// With the Postgres registry, a second Engine (another process) waits for the first
+// one's operation on the same ref, and different refs do not block each other.
+func TestLockIsCrossProcessWithPostgresRegistry(t *testing.T) {
+	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	reg, err := registry.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	cfg := config.Default()
+	e1 := NewEngine(cfg, reg, nil, fakeArts{}, newFakePlane(), Options{})
+	e2 := NewEngine(cfg, reg, nil, fakeArts{}, newFakePlane(), Options{})
+	unlock, err := e1.lock(ctx, "abcdefghijklmnopqrst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := e2.lock(ctx, "bbbbbbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other()
+	got := make(chan struct{})
+	go func() {
+		u, err := e2.lock(ctx, "abcdefghijklmnopqrst")
+		if err == nil {
+			u()
+		}
+		close(got)
+	}()
+	select {
+	case <-got:
+		t.Fatal("second engine took the lock while the first held it")
+	case <-time.After(500 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second engine never got the lock")
 	}
 }

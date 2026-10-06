@@ -134,16 +134,23 @@ func (pl *PostgresPlane) apiSpecs(p *registry.Project, keys *secrets.ProjectKeys
 			"GOTRUE_DB_DATABASE_URL": dsnURL(RoleAuthAdmin, keys.AuthAdminPassword, pgPort, "postgres"),
 			"DATABASE_URL":           dsnURL(RoleAuthAdmin, keys.AuthAdminPassword, pgPort, "postgres"),
 			// Two connections is the artifact's default; five absorbs bursts of sign-ins.
-			"GOTRUE_DB_MAX_POOL_SIZE":       "5",
-			"API_EXTERNAL_URL":              pl.authExternalURL(p.Ref),
-			"GOTRUE_SITE_URL":               pl.siteURL(p.Ref),
-			"GOTRUE_JWT_SECRET":             keys.JWTSecret,
-			"GOTRUE_JWT_ISSUER":             pl.authExternalURL(p.Ref),
-			"GOTRUE_JWT_AUD":                "authenticated",
-			"GOTRUE_JWT_DEFAULT_GROUP_NAME": "authenticated",
-			"GOTRUE_JWT_ADMIN_ROLES":        "service_role",
-			"GOTRUE_JWT_EXP":                "3600",
-			"GOTRUE_EXTERNAL_EMAIL_ENABLED": "true",
+			"GOTRUE_DB_MAX_POOL_SIZE": "5",
+			"API_EXTERNAL_URL":        pl.authExternalURL(p.Ref),
+			"GOTRUE_SITE_URL":         pl.siteURL(p.Ref),
+			// GoTrue resolves these paths against API_EXTERNAL_URL with
+			// url.ResolveReference, so the default "/verify" would drop the /auth/v1
+			// prefix. Absolute URLs keep every email link routable.
+			"GOTRUE_MAILER_URLPATHS_INVITE":       pl.authExternalURL(p.Ref) + "/verify",
+			"GOTRUE_MAILER_URLPATHS_CONFIRMATION": pl.authExternalURL(p.Ref) + "/verify",
+			"GOTRUE_MAILER_URLPATHS_RECOVERY":     pl.authExternalURL(p.Ref) + "/verify",
+			"GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE": pl.authExternalURL(p.Ref) + "/verify",
+			"GOTRUE_JWT_SECRET":                   keys.JWTSecret,
+			"GOTRUE_JWT_ISSUER":                   pl.authExternalURL(p.Ref),
+			"GOTRUE_JWT_AUD":                      "authenticated",
+			"GOTRUE_JWT_DEFAULT_GROUP_NAME":       "authenticated",
+			"GOTRUE_JWT_ADMIN_ROLES":              "service_role",
+			"GOTRUE_JWT_EXP":                      "3600",
+			"GOTRUE_EXTERNAL_EMAIL_ENABLED":       "true",
 			// Without an SMTP server nobody can confirm an address, so projects start with
 			// auto-confirm on; the Management API turns it off when SMTP is configured.
 			"GOTRUE_MAILER_AUTOCONFIRM": "true",

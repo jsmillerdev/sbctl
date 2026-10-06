@@ -54,8 +54,10 @@ setup_node() {
   # The sbctl user drives systemd over D-Bus; that needs polkit and the rule that
   # `sbctl system install-units` installs.
   if ! command -v pkaction >/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y polkitd pkexec \
-      || DEBIAN_FRONTEND=noninteractive apt-get install -y policykit-1 \
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq || log "apt-get update failed; trying the install anyway"
+    apt-get install -y polkitd pkexec \
+      || apt-get install -y policykit-1 \
       || fail "polkit is not installed and could not be installed"
   fi
   id "$SBCTL_USER" >/dev/null 2>&1 || useradd --system --home-dir "$SBCTL_STATE" --shell /usr/sbin/nologin "$SBCTL_USER"

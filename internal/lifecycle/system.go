@@ -20,10 +20,86 @@ import (
 )
 
 // SystemDatabases are created in the system cluster next to "postgres" (GoTrue's
-// dashboard auth schema) and "sbctl" (the registry). Each holds a schema of the same
-// name, owned by supabase_admin. The fleet services connect as supabase_admin;
-// supabase_storage_admin may also use _storage.
+// dashboard auth schema) and "sbctl" (the registry, used by supabase_admin). Each of the
+// others belongs to one fleet service: see FleetRoles.
 var SystemDatabases = []string{"sbctl", "_supavisor", "_realtime", "_storage"}
+
+// FleetRole is the login role one fleet service uses for its own database in the
+// system cluster. It owns that database and the same-named schema and nothing else, and
+// PUBLIC may not connect to the database, so a compromised fleet service cannot read
+// the registry or another service's data the way supabase_admin could.
+type FleetRole struct {
+	Service  string // "supavisor", "realtime", "storage"
+	Database string
+	Role     string
+}
+
+// FleetRoles lists the fleet services' roles. Their passwords are sealed in the
+// registry under the system project (see Engine.FleetCredentials).
+var FleetRoles = []FleetRole{
+	{Service: "supavisor", Database: "_supavisor", Role: "sbctl_supavisor"},
+	{Service: "realtime", Database: "_realtime", Role: "sbctl_realtime"},
+	{Service: "storage", Database: "_storage", Role: "sbctl_storage"},
+}
+
+func fleetSecretName(service string) string { return "fleet_" + service + "_password" }
+
+// FleetCredential is a fleet service's database login.
+type FleetCredential struct {
+	FleetRole
+	Password string
+}
+
+// FleetCredentials returns the decrypted logins of the fleet services' roles, which
+// InitSystem creates. Workstream E connects with these instead of supabase_admin.
+func (e *Engine) FleetCredentials(ctx context.Context) ([]FleetCredential, error) {
+	out := make([]FleetCredential, 0, len(FleetRoles))
+	for _, fr := range FleetRoles {
+		sealed, err := e.reg.GetSecret(ctx, config.SystemRef, fleetSecretName(fr.Service))
+		if err != nil {
+			return nil, fmt.Errorf("lifecycle: credentials of %s: %w (run `sbctl system init`)", fr.Role, err)
+		}
+		pt, err := e.sec.Open(sealed)
+		if err != nil {
+			return nil, fmt.Errorf("lifecycle: open credentials of %s: %w", fr.Role, err)
+		}
+		out = append(out, FleetCredential{FleetRole: fr, Password: string(pt)})
+	}
+	return out, nil
+}
+
+// ensureFleetCredentials gives each fleet role a password and seals it in the registry,
+// unless it already has one. It runs after the system project row exists.
+func (e *Engine) ensureFleetCredentials(ctx context.Context, pp pgPaths) error {
+	c, err := connect(ctx, socketDSN(pp, "postgres"))
+	if err != nil {
+		return err
+	}
+	defer c.Close(context.WithoutCancel(ctx))
+	for _, fr := range FleetRoles {
+		if _, err := e.reg.GetSecret(ctx, config.SystemRef, fleetSecretName(fr.Service)); err == nil {
+			continue
+		} else if !errors.Is(err, registry.ErrNotFound) {
+			return err
+		}
+		pw := secrets.NewPassword()
+		var stmt string
+		if err := c.QueryRow(ctx, `select format('alter role %I password %L', $1::text, $2::text)`, fr.Role, pw).Scan(&stmt); err != nil {
+			return err
+		}
+		if _, err := c.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("lifecycle: set password of %s: %w", fr.Role, err)
+		}
+		sealed, err := e.sec.Seal([]byte(pw))
+		if err != nil {
+			return err
+		}
+		if err := e.reg.PutSecret(ctx, config.SystemRef, fleetSecretName(fr.Service), sealed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // OpenOptions configure Open and InitSystem.
 type OpenOptions struct {
@@ -183,6 +259,22 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	pp := plane.paths(p)
 	_, statErr := os.Stat(filepath.Join(pp.Data, "PG_VERSION"))
 	existing := statErr == nil
+	_, pendErr := os.Stat(filepath.Join(pp.Data, initPendingWitness))
+	if existing || pendErr == nil {
+		// A crash during an earlier init leaves a cluster nobody can use. Detect that and
+		// start over instead of failing on every rerun.
+		stale, why, serr := plane.staleSystem(ctx, p, pendErr == nil)
+		if serr != nil {
+			return nil, serr
+		}
+		if stale {
+			log.Warn("system cluster was never fully initialized; removing it and starting over", "reason", why)
+			if err = plane.Delete(ctx, config.SystemRef); err != nil {
+				return nil, fmt.Errorf("lifecycle: remove the unfinished system cluster: %w", err)
+			}
+			existing = false
+		}
+	}
 
 	var keys *secrets.ProjectKeys
 	var reg *registry.Postgres
@@ -245,19 +337,76 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 			return nil, err
 		}
 	}
+	if err = eng.ensureFleetCredentials(ctx, plane.paths(p)); err != nil {
+		return nil, err
+	}
 	if err = plane.startAPI(ctx, p, keys); err != nil {
 		return nil, err
 	}
 	if err = reg.SetProjectStatus(ctx, config.SystemRef, registry.StatusActiveHealthy); err != nil {
 		return nil, err
 	}
-	if en, ok := sup.(units.Enabler); ok {
-		if err = en.Enable(ctx, config.UnitName(config.SvcPostgres, config.SystemRef), config.UnitName(config.SvcGoTrue, config.SystemRef)); err != nil {
-			return nil, err
-		}
-	}
 	eng.event(ctx, config.SystemRef, "system.initialized", map[string]bool{"existing": existing})
 	return node, nil
+}
+
+// initPendingWitness is the file supabase-postgres-start leaves in PGDATA until the
+// first boot has finished; while it exists the launcher refuses to start the cluster.
+const initPendingWitness = ".supabase-postgres-init-pending"
+
+// staleSystem decides whether the system cluster on disk is the leftover of an init
+// that was interrupted, so that it holds nothing worth keeping: either the launcher's
+// first boot never finished (pending), or the cluster has no registry or no system
+// credentials and no other project. It starts the cluster to look. A cluster that has
+// other projects but lost the system credentials is not touched; the error says how to
+// recover.
+func (pl *PostgresPlane) staleSystem(ctx context.Context, p *registry.Project, pending bool) (stale bool, why string, err error) {
+	if pending {
+		return true, "the first boot did not finish (" + initPendingWitness + " is present)", nil
+	}
+	dir := pl.cfg.Paths().Project(config.SystemRef)
+	if err := pl.startRendered(ctx, p); err != nil {
+		return false, "", fmt.Errorf("%w; if %s holds nothing you need (a failed first init), stop the units, remove that directory and run `sbctl system init` again", err, dir)
+	}
+	pp := pl.paths(p)
+	c, err := connect(ctx, socketDSN(pp, "postgres"))
+	if err != nil {
+		return false, "", err
+	}
+	var hasDB bool
+	err = c.QueryRow(ctx, `select exists (select 1 from pg_database where datname = 'sbctl')`).Scan(&hasDB)
+	c.Close(context.WithoutCancel(ctx))
+	if err != nil {
+		return false, "", err
+	}
+	if !hasDB {
+		return true, "the sbctl registry database was never created", nil
+	}
+	rc, err := connect(ctx, socketDSN(pp, "sbctl"))
+	if err != nil {
+		return false, "", err
+	}
+	defer rc.Close(context.WithoutCancel(ctx))
+	var hasTables bool
+	if err := rc.QueryRow(ctx, `select to_regclass('sbctl.project_secrets') is not null and to_regclass('sbctl.projects') is not null`).Scan(&hasTables); err != nil {
+		return false, "", err
+	}
+	if !hasTables {
+		return true, "the registry schema was never created", nil
+	}
+	var secretRows, others int
+	if err := rc.QueryRow(ctx, `select (select count(*) from sbctl.project_secrets where ref = 'system'),
+	                                    (select count(*) from sbctl.projects where ref <> 'system')`).Scan(&secretRows, &others); err != nil {
+		return false, "", err
+	}
+	switch {
+	case secretRows > 0:
+		return false, "", nil
+	case others == 0:
+		return true, "the registry holds no system credentials and no projects", nil
+	default:
+		return false, "", fmt.Errorf("lifecycle: the registry in %s has %d project(s) but no system credentials; restore the system secrets from a registry backup, or, to give up on the data, stop the sb-* units, remove %s and run `sbctl system init` (existing projects stay on disk but are no longer registered)", dir, others, dir)
+	}
 }
 
 // keysStored reports whether the system credentials are in the registry.
@@ -271,32 +420,61 @@ func keysStored(n *Node, p *registry.Project) bool {
 
 func (o *OpenOptions) now() time.Time { return time.Now() }
 
-// createSystemDatabases creates the databases of SystemDatabases that do not exist and
-// the same-named schema in each.
+// createSystemDatabases creates the databases of SystemDatabases that do not exist. Each
+// fleet database is owned by its FleetRole (a login role without a password until
+// ensureFleetCredentials sets one), holds a same-named schema owned by that role, and is
+// closed to PUBLIC (so is the registry database). Databases and schemas an earlier version left owned by
+// supabase_admin are handed over.
 func createSystemDatabases(ctx context.Context, pp pgPaths) error {
 	c, err := connect(ctx, socketDSN(pp, "postgres"))
 	if err != nil {
 		return err
 	}
 	defer c.Close(context.Background())
+	exec := func(format string, args ...any) error {
+		var stmt string
+		if err := c.QueryRow(ctx, format, args...).Scan(&stmt); err != nil {
+			return err
+		}
+		_, err := c.Exec(ctx, stmt)
+		return err
+	}
+	owners := map[string]string{}
+	for _, fr := range FleetRoles {
+		owners[fr.Database] = fr.Role
+		var exists bool
+		if err := c.QueryRow(ctx, `select exists (select 1 from pg_roles where rolname = $1)`, fr.Role).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			if err := exec(`select format('create role %I login nosuperuser nocreatedb nocreaterole noinherit', $1::text)`, fr.Role); err != nil {
+				return fmt.Errorf("lifecycle: create role %s: %w", fr.Role, err)
+			}
+		}
+	}
 	for _, db := range SystemDatabases {
+		owner := RoleAdmin
+		if o, ok := owners[db]; ok {
+			owner = o
+		}
 		var exists bool
 		if err := c.QueryRow(ctx, `select exists (select 1 from pg_database where datname = $1)`, db).Scan(&exists); err != nil {
 			return err
 		}
 		if !exists {
-			var stmt string
-			if err := c.QueryRow(ctx, `select format('create database %I owner %I', $1::text, $2::text)`, db, RoleAdmin).Scan(&stmt); err != nil {
-				return err
-			}
-			if _, err := c.Exec(ctx, stmt); err != nil {
+			if err := exec(`select format('create database %I owner %I', $1::text, $2::text)`, db, owner); err != nil {
 				return fmt.Errorf("lifecycle: create database %s: %w", db, err)
 			}
+		} else if err := exec(`select format('alter database %I owner to %I', $1::text, $2::text)`, db, owner); err != nil {
+			return err
+		}
+		if err := exec(`select format('revoke all on database %I from public', $1::text)`, db); err != nil {
+			return err
 		}
 		if db == "sbctl" {
 			continue // the registry creates its own schema
 		}
-		if err := ensureSchema(ctx, pp, db); err != nil {
+		if err := ensureSchema(ctx, pp, db, owner); err != nil {
 			return err
 		}
 	}
@@ -304,14 +482,20 @@ func createSystemDatabases(ctx context.Context, pp pgPaths) error {
 	return err
 }
 
-func ensureSchema(ctx context.Context, pp pgPaths, db string) error {
+func ensureSchema(ctx context.Context, pp pgPaths, db, owner string) error {
 	c, err := connect(ctx, socketDSN(pp, db))
 	if err != nil {
 		return err
 	}
 	defer c.Close(context.Background())
 	var stmt string
-	if err := c.QueryRow(ctx, `select format('create schema if not exists %I authorization %I', $1::text, $2::text)`, db, RoleAdmin).Scan(&stmt); err != nil {
+	if err := c.QueryRow(ctx, `select format('create schema if not exists %I authorization %I', $1::text, $2::text)`, db, owner).Scan(&stmt); err != nil {
+		return err
+	}
+	if _, err = c.Exec(ctx, stmt); err != nil {
+		return err
+	}
+	if err := c.QueryRow(ctx, `select format('alter schema %I owner to %I', $1::text, $2::text)`, db, owner).Scan(&stmt); err != nil {
 		return err
 	}
 	_, err = c.Exec(ctx, stmt)
@@ -366,18 +550,31 @@ func StopAll(ctx context.Context, cfg *config.Config, o OpenOptions) error {
 	return first
 }
 
-// Reloader returns a function that makes systemd re-read unit files, or an error when
-// the configured supervisor has no systemd (the exec backend, or a non-Linux build).
-func (o OpenOptions) Reloader(cfg *config.Config) (func(context.Context) error, error) {
+// UnitInstaller returns a function that makes systemd re-read unit files when reload
+// is set and enables the system project's units for boot. It needs root: the polkit rule
+// deliberately does not grant daemon-reload or unit-file management to the sbctl user.
+// It returns an error when the configured supervisor has no systemd (the exec backend,
+// or a non-Linux build).
+func (o OpenOptions) UnitInstaller(cfg *config.Config) (func(ctx context.Context, reload bool) error, error) {
 	sup, err := o.supervisor(cfg)
 	if err != nil {
 		return nil, err
 	}
 	r, ok := sup.(interface{ Reload(context.Context) error })
-	if !ok {
+	en, ok2 := sup.(units.Enabler)
+	if !ok || !ok2 {
+		closeSup(sup)
 		return nil, errors.New("the configured supervisor does not use systemd")
 	}
-	return func(ctx context.Context) error { defer closeSup(sup); return r.Reload(ctx) }, nil
+	return func(ctx context.Context, reload bool) error {
+		defer closeSup(sup)
+		if reload {
+			if err := r.Reload(ctx); err != nil {
+				return err
+			}
+		}
+		return en.Enable(ctx, config.UnitName(config.SvcPostgres, config.SystemRef), config.UnitName(config.SvcGoTrue, config.SystemRef))
+	}, nil
 }
 
 func closeSup(s units.Supervisor) {

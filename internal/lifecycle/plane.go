@@ -160,15 +160,20 @@ func (pl *PostgresPlane) Create(ctx context.Context, p *registry.Project, keys *
 	return pl.startAPI(ctx, p, keys)
 }
 
+// ErrClusterExists is returned by Create when the project directory already holds a
+// cluster and no seed was given. Create never initializes over it, and Engine.Create
+// leaves the data alone instead of cleaning it up.
+var ErrClusterExists = errors.New("lifecycle: directory already holds a cluster; refusing to initialize over it")
+
 // createDatabase is Create without the API units: the cluster is initialized or seeded,
 // started and ready, with its role passwords set.
 func (pl *PostgresPlane) createDatabase(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, seed DataSeeder) error {
-	if err := pl.prepare(p, keys); err != nil {
-		return err
-	}
 	pp := pl.paths(p)
 	if _, err := os.Stat(filepath.Join(pp.Data, "PG_VERSION")); err == nil && seed == nil {
-		return fmt.Errorf("lifecycle: %s already holds a cluster; refusing to initialize over it", pp.Data)
+		return fmt.Errorf("%w: %s", ErrClusterExists, pp.Data)
+	}
+	if err := pl.prepare(p, keys); err != nil {
+		return err
 	}
 	if seed != nil {
 		if err := seed(ctx, p, pp.Data); err != nil {

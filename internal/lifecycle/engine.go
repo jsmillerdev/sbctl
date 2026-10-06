@@ -10,6 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/fleet"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -55,12 +58,40 @@ func NewEngine(cfg *config.Config, reg registry.Registry, sec secrets.Secrets, a
 	return &Engine{cfg: cfg, reg: reg, sec: sec, arts: arts, plane: plane, opts: opts, log: opts.Log}
 }
 
-// lock serializes operations on one project.
-func (e *Engine) lock(ref string) func() {
+// advisoryPool is implemented by the Postgres registry; the in-memory one has no
+// other process to coordinate with.
+type advisoryPool interface{ Pool() *pgxpool.Pool }
+
+// lock serializes mutating operations on one project: a mutex within this process and,
+// when the registry is Postgres, a session-level advisory lock so that the CLI and the
+// daemon (separate processes) cannot, say, delete and resume the same ref at once. The
+// advisory lock uses its own connection rather than the pool, so held locks cannot
+// starve registry queries, and it is released when that connection closes, even if the
+// process dies. The returned function releases both.
+func (e *Engine) lock(ctx context.Context, ref string) (func(), error) {
 	m, _ := e.locks.LoadOrStore(ref, &sync.Mutex{})
 	mu := m.(*sync.Mutex)
 	mu.Lock()
-	return mu.Unlock
+	ap, ok := e.reg.(advisoryPool)
+	if !ok || ap.Pool() == nil {
+		return mu.Unlock, nil
+	}
+	conn, err := pgx.ConnectConfig(ctx, ap.Pool().Config().ConnConfig)
+	if err != nil {
+		mu.Unlock()
+		return nil, fmt.Errorf("lifecycle: lock %s: %w", ref, err)
+	}
+	if _, err := conn.Exec(ctx, `select pg_advisory_lock(hashtext('sbctl:' || $1::text))`, ref); err != nil {
+		_ = conn.Close(context.WithoutCancel(ctx))
+		mu.Unlock()
+		return nil, fmt.Errorf("lifecycle: lock %s: %w", ref, err)
+	}
+	return func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = conn.Close(cctx) // ends the session, which drops the advisory lock
+		mu.Unlock()
+	}, nil
 }
 
 // cleanupCtx outlives a cancelled request: cleanup after a failure must still run.
@@ -165,6 +196,11 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 	if _, err := ClassFor(class); err != nil {
 		return nil, err
 	}
+	if req.Seed != nil && req.Keys == nil {
+		// A seeded cluster already holds its role passwords and Create does not reset
+		// them, so fresh keys would never match and the units could not authenticate.
+		return nil, errors.New("lifecycle: CreateRequest.Seed needs CreateRequest.Keys (the seeded cluster's own credentials)")
+	}
 	ref := req.Ref
 	switch {
 	case ref == "":
@@ -172,7 +208,11 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 	case !secrets.ValidRef(ref):
 		return nil, fmt.Errorf("lifecycle: %q is not a valid project ref (20 lowercase letters)", ref)
 	}
-	defer e.lock(ref)()
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	org, err := e.org(ctx, req.OrgSlug)
 	if err != nil {
@@ -214,7 +254,16 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 	fail := func(stage string, cause error) (*registry.Project, error) {
 		cctx, cancel := cleanupCtx(ctx)
 		defer cancel()
-		e.cleanup(cctx, p)
+		if errors.Is(cause, ErrClusterExists) {
+			// The data belongs to someone else (an orphan, or a restore target that was
+			// not cleared): leave it alone and forget the row this call just made.
+			e.cleanup(cctx, p, true)
+			if err := e.reg.DeleteProject(cctx, ref); err != nil {
+				e.log.Error("could not remove the registry row of a refused create", "ref", ref, "error", err)
+			}
+			return nil, fmt.Errorf("lifecycle: create %s refused, existing data left untouched (move %s away or choose another ref): %w", ref, e.cfg.Paths().Project(ref), cause)
+		}
+		e.cleanup(cctx, p, false)
 		if err := e.reg.SetProjectStatus(cctx, ref, registry.StatusInitFailed); err != nil {
 			e.log.Error("could not mark project INIT_FAILED", "ref", ref, "error", err)
 		}
@@ -243,7 +292,8 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 }
 
 // cleanup undoes what Create may have started, ignoring errors (it is already failing).
-func (e *Engine) cleanup(ctx context.Context, p *registry.Project) {
+// keepData skips the data plane, whose Delete removes the project directory.
+func (e *Engine) cleanup(ctx context.Context, p *registry.Project, keepData bool) {
 	if len(e.opts.Fleet) > 0 {
 		if err := e.opts.Fleet.RemoveTenant(ctx, p.Ref); err != nil {
 			e.log.Warn("cleanup: remove tenants", "ref", p.Ref, "error", err)
@@ -251,6 +301,9 @@ func (e *Engine) cleanup(ctx context.Context, p *registry.Project) {
 	}
 	if err := e.reg.DeleteRoute(ctx, e.cfg.ProjectHost(p.Ref)); err != nil && !errors.Is(err, registry.ErrNotFound) {
 		e.log.Warn("cleanup: delete route", "ref", p.Ref, "error", err)
+	}
+	if keepData {
+		return
 	}
 	if err := e.plane.Delete(ctx, p.Ref); err != nil {
 		e.log.Error("cleanup: data plane delete failed; units or data may remain", "ref", p.Ref, "error", err)
@@ -268,7 +321,11 @@ func invalidState(p *registry.Project, op string) error {
 // Pause implements Manager: GoTrue, PostgREST and PostgreSQL stop, in that order, and
 // the project becomes INACTIVE. Its route and fleet tenants stay; the data stays.
 func (e *Engine) Pause(ctx context.Context, ref string) error {
-	defer e.lock(ref)()
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
 		return err
@@ -293,7 +350,11 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 // Resume implements Manager: the reverse of Pause. If a unit does not come up, what
 // started is stopped again and the project stays INACTIVE, so Resume can be retried.
 func (e *Engine) Resume(ctx context.Context, ref string) error {
-	defer e.lock(ref)()
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
 		return err
@@ -339,7 +400,11 @@ func (e *Engine) Delete(ctx context.Context, ref string) error {
 // leaves the project GOING_DOWN so that Delete can be run again. A project that failed
 // to initialize has nothing worth backing up and skips the backup.
 func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) error {
-	defer e.lock(ref)()
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
 		return err
@@ -404,7 +469,11 @@ func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev regi
 // gets new stored keys; its env files are rewritten when it resumes. If applying the
 // keys fails, the previous keys are restored.
 func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKeys, error) {
-	defer e.lock(ref)()
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -475,7 +544,11 @@ func (e *Engine) StartActive(ctx context.Context) map[string]error {
 }
 
 func (e *Engine) startOne(ctx context.Context, p *registry.Project) error {
-	defer e.lock(p.Ref)()
+	unlock, err := e.lock(ctx, p.Ref)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	keys, err := e.loadKeys(ctx, p.Ref)
 	if err == nil {
 		err = e.plane.Start(ctx, p, keys)

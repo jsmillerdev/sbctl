@@ -1,6 +1,8 @@
 package lifecycle
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,9 +136,14 @@ func TestAPISpecs(t *testing.T) {
 		"GOTRUE_DB_DRIVER":       "postgres",
 		"GOTRUE_DB_DATABASE_URL": "postgres://supabase_auth_admin:" + keys.AuthAdminPassword + "@127.0.0.1:20006/postgres?sslmode=disable",
 		"API_EXTERNAL_URL":       "https://abcdefghijklmnopqrst.api.example.test/auth/v1",
-		"GOTRUE_JWT_SECRET":      keys.JWTSecret,
-		"GOTRUE_JWT_AUD":         "authenticated",
-		"GOTRUE_DISABLE_SIGNUP":  "false",
+		// Email links must keep the /auth/v1 prefix (GoTrue resolves the path absolutely).
+		"GOTRUE_MAILER_URLPATHS_INVITE":       "https://abcdefghijklmnopqrst.api.example.test/auth/v1/verify",
+		"GOTRUE_MAILER_URLPATHS_CONFIRMATION": "https://abcdefghijklmnopqrst.api.example.test/auth/v1/verify",
+		"GOTRUE_MAILER_URLPATHS_RECOVERY":     "https://abcdefghijklmnopqrst.api.example.test/auth/v1/verify",
+		"GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE": "https://abcdefghijklmnopqrst.api.example.test/auth/v1/verify",
+		"GOTRUE_JWT_SECRET":                   keys.JWTSecret,
+		"GOTRUE_JWT_AUD":                      "authenticated",
+		"GOTRUE_DISABLE_SIGNUP":               "false",
 	}
 	for k, v := range wantAuth {
 		if auth.Env[k] != v {
@@ -285,5 +292,29 @@ func TestDSNURLEscapes(t *testing.T) {
 	got := dsnURL("u", "p@ss/w:rd", 5, "postgres")
 	if got != "postgres://u:p%40ss%2Fw%3Ard@127.0.0.1:5/postgres?sslmode=disable" {
 		t.Fatalf("dsn = %s", got)
+	}
+}
+
+// createDatabase refuses an existing cluster with ErrClusterExists, before it renders
+// or writes anything into the project directory.
+func TestCreateDatabaseRefusesExistingCluster(t *testing.T) {
+	pl, cfg := testPlane(t)
+	p := testProject(cfg, "abcdefghijklmnopqrst", 1)
+	pp := pl.paths(p)
+	if err := os.MkdirAll(pp.Data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pp.Data, "PG_VERSION"), []byte("17\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := pl.createDatabase(context.Background(), p, testKeys(t, p.Ref), nil)
+	if !errors.Is(err, ErrClusterExists) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := os.Stat(pp.HBA); err == nil {
+		t.Fatal("createDatabase wrote files before refusing")
+	}
+	if _, err := os.Stat(filepath.Join(pp.Data, "PG_VERSION")); err != nil {
+		t.Fatal("existing data was touched")
 	}
 }

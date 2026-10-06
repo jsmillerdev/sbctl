@@ -126,6 +126,28 @@ func TestIntegrationSystemAndProject(t *testing.T) {
 		t.Fatal("second init changed the system credentials")
 	}
 
+	// Each fleet service has its own role: it reaches its database and nothing else.
+	creds, err := n.Engine.FleetCredentials(ctx)
+	if err != nil || len(creds) != len(FleetRoles) {
+		t.Fatalf("fleet credentials = %+v %v", creds, err)
+	}
+	for _, fc := range creds {
+		own, err := pgx.Connect(ctx, dsnURL(fc.Role, fc.Password, cfg.Ports.SystemPostgres, fc.Database))
+		if err != nil {
+			t.Fatalf("%s into %s: %v", fc.Role, fc.Database, err)
+		}
+		own.Close(ctx)
+		for _, other := range []string{"sbctl", "_supavisor", "_realtime", "_storage"} {
+			if other == fc.Database {
+				continue
+			}
+			if oc, err := pgx.Connect(ctx, dsnURL(fc.Role, fc.Password, cfg.Ports.SystemPostgres, other)); err == nil {
+				oc.Close(ctx)
+				t.Fatalf("%s can connect to %s", fc.Role, other)
+			}
+		}
+	}
+
 	p, err := n.Engine.Create(ctx, CreateRequest{Name: "it", Class: "micro"})
 	if err != nil {
 		t.Fatal(err)
@@ -226,6 +248,28 @@ func TestIntegrationSystemAndProject(t *testing.T) {
 		return err
 	}(); get == nil {
 		t.Fatal("postgres still listens after delete")
+	}
+
+	// An init interrupted during the launcher's first boot leaves a witness file and a
+	// cluster nobody can use; running init again starts over instead of failing.
+	n.Close()
+	if err := StopAll(ctx, cfg, oo); err != nil {
+		t.Fatal(err)
+	}
+	witness := filepath.Join(pathsFor(cfg, config.SystemRef, cfg.Ports.SystemPostgres).Data, initPendingWitness)
+	if err := os.WriteFile(witness, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n3, err := InitSystem(ctx, cfg, oo, false)
+	if err != nil {
+		t.Fatalf("init after an interrupted init: %v", err)
+	}
+	defer n3.Close()
+	if after, err := n3.Engine.Keys(ctx, config.SystemRef); err != nil || after.JWTSecret == before.JWTSecret {
+		t.Fatalf("expected fresh credentials after starting over: %v", err)
+	}
+	if _, err := os.Stat(witness); !os.IsNotExist(err) {
+		t.Fatalf("witness remains after re-init: %v", err)
 	}
 }
 

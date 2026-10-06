@@ -19,7 +19,9 @@ project's PostgreSQL, GoTrue and PostgREST as units of a `units.Supervisor`.
    The launcher initializes PGDATA and runs the artifact's roles and migrations once.
    Role passwords of `postgres`, `supabase_admin`, `authenticator`,
    `supabase_auth_admin`, `supabase_storage_admin` and `supabase_replication_admin` are set
-   afterwards over the unix socket. `CreateRequest.Seed` replaces initdb and role setup.
+   afterwards over the unix socket. `CreateRequest.Seed` replaces initdb and role setup and
+requires `CreateRequest.Keys` (the seeded cluster's own credentials; fresh ones would not
+match its passwords).
 3. GoTrue (`bin/auth migrate`, then `bin/auth`) and PostgREST, each health-checked with a
    real request (`/health`, `/`).
 4. `fleet.Fleet.EnsureTenant` (skipped while the fleet is empty), `PutRoute` for
@@ -27,7 +29,13 @@ project's PostgreSQL, GoTrue and PostgREST as units of a `units.Supervisor`.
 
 Any failure after the row exists stops and removes units and data, removes tenants and
 route, and leaves the row `INIT_FAILED` with an event that carries the cause. Cleanup uses
-a context that outlives the cancelled request.
+a context that outlives the cancelled request. The one exception is `ErrClusterExists`
+(the project directory already holds a cluster, for example an orphan after a registry
+restore): Create refuses before writing anything, leaves the data alone and forgets the row.
+
+Mutating operations on one ref are serialized by a mutex in the process and, with the
+Postgres registry, by a session-level advisory lock on a dedicated connection, so the CLI
+and the daemon cannot run, say, delete and resume on the same project at once.
 
 `pg_hba.conf` is ours, not the artifact's: the artifact trusts all loopback connections,
 which on a shared host means every local user. Ours trusts `supabase_admin` on the unix
@@ -53,12 +61,19 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
 
 `InitSystem` is the same code path with ref `system` on `[ports] system_postgres` and
 `system_gotrue`, class `system`, and no PostgREST. It creates the master key, starts the
-cluster, creates databases `sbctl`, `_supavisor`, `_realtime` and `_storage` (each of the
-last three with a same-named schema owned by `supabase_admin`; `supabase_storage_admin`
-may use `_storage`), applies the registry migrations, records the system project and its
+cluster, creates databases `sbctl`, `_supavisor`, `_realtime` and `_storage`. Each of the
+last three belongs to its own login role (`FleetRoles`: `sbctl_supavisor`,
+`sbctl_realtime`, `sbctl_storage`), which owns the database and the same-named schema,
+has no other access, and whose password is sealed in the registry
+(`Engine.FleetCredentials`); fleet services connect with those, not as `supabase_admin`.
+`supabase_storage_admin` may also use `_storage`. It applies the registry migrations, records the system project and its
 sealed credentials, and starts GoTrue for Studio sign-in (`GOTRUE_SITE_URL` is
 `https://studio.<domain>`, sign-up closed). It is idempotent. If the first-time init fails
-before the credentials are in the registry, it deletes what it created.
+before the credentials are in the registry, it deletes what it created. If the process
+dies mid-init, the next run notices (the launcher's init-pending witness, or a cluster with
+no registry, no system credentials and no projects), removes that cluster and starts over;
+a registry that holds projects but lost the system credentials is left alone and the error
+says how to recover.
 `Open` connects to an initialized node for everything else; `RegistryDSN` is the DSN other
 packages use to reach the registry.
 
@@ -67,7 +82,9 @@ Choices worth knowing:
 - `wal_level` stays `logical` (the artifact's value): Realtime's `postgres_changes` needs
   it, and it is a superset of `replica`, so archiving and base backups are unaffected.
 - `API_EXTERNAL_URL` is `https://<ref>.api.<domain>/auth/v1`, as hosted projects and the
-  dockerless CLI set it, so email links and OAuth callbacks are right without extra env.
+  dockerless CLI set it. GoTrue resolves its mailer paths against that URL with an absolute
+  path, which would drop `/auth/v1`, so `GOTRUE_MAILER_URLPATHS_{INVITE,CONFIRMATION,
+  RECOVERY,EMAIL_CHANGE}` are set to `<API_EXTERNAL_URL>/verify`, as the dockerless CLI does.
 - `GOTRUE_MAILER_AUTOCONFIRM=true` until SMTP is configured; nobody could confirm an
   address otherwise.
 - The seeder contract: `DataSeeder` fills `<project>/postgres/data`; `postmaster.opts` is

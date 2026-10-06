@@ -25,9 +25,14 @@ log "system init (downloads artifacts)"
 system_init
 for u in sb-postgres@system sb-gotrue@system; do
   wait_active "$u.service" 30
-  [[ $(systemctl is-enabled "$u.service") == enabled ]] || fail "$u is not enabled for boot"
+  [[ $(systemctl is-enabled "$u.service") == enabled ]] || fail "$u is not enabled for boot (install-units enables it)"
 done
 sbctl system status || fail "system status"
+
+log "polkit: the sbctl user must not reload systemd or manage unit files"
+if sudo -u "$SBCTL_USER" systemctl --no-ask-password daemon-reload 2>/dev/null; then
+  fail "the sbctl user can run daemon-reload (polkit rule too broad)"
+fi
 
 log "create two projects"
 REFS=()
@@ -105,7 +110,8 @@ for ref in "$A" "$B"; do
     [[ $(unit_state "sb-$svc@$ref.service") == inactive ]] || fail "sb-$svc@$ref still $(unit_state "sb-$svc@$ref.service")"
   done
   [[ ! -e "$SBCTL_STATE/projects/$ref" ]] || fail "$ref: data directory remains"
-  compgen -G "/etc/systemd/system.control/sb-*@$ref.service.d" >/dev/null && fail "$ref: resource drop-ins remain"
+  # The drop-in files stay (removing them needs a polkit action sbctl must not hold); the limits are lifted.
+  [[ $(systemctl show -p MemoryMax --value "sb-postgres@$ref.service") == infinity ]] || fail "$ref: MemoryMax limit remains"
 done
 [[ $(unit_state sb-postgres@system.service) == active ]] || fail "system postgres stopped"
 sbctl system status || fail "system status after deletes"

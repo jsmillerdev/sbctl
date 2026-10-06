@@ -23,9 +23,11 @@ import (
 // <state_dir>/projects/<ref>/<svc>.env, which Render writes as the sbctl user. Per-unit
 // MemoryMax and CPUQuota are persistent drop-ins that systemd writes itself
 // (SetUnitProperties with runtime=false, under /etc/systemd/system.control), so
-// Render never needs a daemon-reload. Reload is only needed after the templates change.
+// Render never needs a daemon-reload. Reload is only needed after the templates
+// change, which only root does (sbctl system install-units).
 //
-// Running as a non-root user needs the polkit rule in deploy/systemd/50-sbctl.rules.
+// Running as a non-root user needs the polkit rule in deploy/systemd/50-sbctl.rules,
+// which grants manage-units on sb-* units and nothing else.
 type Systemd struct {
 	cfg *config.Config
 	log *slog.Logger
@@ -196,7 +198,7 @@ func (s *Systemd) Status(ctx context.Context, unit string) (Status, error) {
 	return st, nil
 }
 
-// Remove implements Supervisor: stop the unit, drop its resource drop-in and delete
+// Remove implements Supervisor: stop the unit, lift its resource limits and delete
 // the files Render wrote.
 func (s *Systemd) Remove(ctx context.Context, unit string) error {
 	files, _, _, err := runFilesFor(s.cfg, unit)
@@ -217,18 +219,20 @@ func (s *Systemd) Remove(ctx context.Context, unit string) error {
 	return removeFiles(files)
 }
 
-// revert deletes the persistent drop-ins systemd wrote for unit (RevertUnitFiles).
+// revert lifts the limits SetLimits wrote by setting them back to infinity. Removing the
+// drop-in files (RevertUnitFiles) would need the manage-unit-files polkit action, which
+// the sbctl user must not hold; the inert drop-in that remains is harmless and a later
+// project with the same ref overwrites it.
 func (s *Systemd) revert(ctx context.Context, unit string) error {
-	bus, err := godbus.ConnectSystemBus()
+	c, err := s.dial(ctx)
 	if err != nil {
 		return err
 	}
-	defer bus.Close()
-	obj := bus.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
-	if err := obj.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.RevertUnitFiles", 0, []string{unit}).Err; err != nil {
-		return err
-	}
-	return s.Reload(ctx)
+	inf := ^uint64(0)
+	return c.SetUnitPropertiesContext(ctx, unit, false,
+		sddbus.Property{Name: "MemoryMax", Value: godbus.MakeVariant(inf)},
+		sddbus.Property{Name: "CPUQuotaPerSecUSec", Value: godbus.MakeVariant(inf)},
+	)
 }
 
 var _ Enabler = (*Systemd)(nil)
