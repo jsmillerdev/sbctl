@@ -60,6 +60,23 @@ func (s *PGStore) UpdateUser(ctx context.Context, u *User) error {
 	return err
 }
 
+func (s *PGStore) ListUsers(ctx context.Context) ([]User, error) {
+	rows, err := s.pool.Query(ctx, `select `+userCols+` from sbctl.api_users order by id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *u)
+	}
+	return out, rows.Err()
+}
+
 func (s *PGStore) PutLoginSession(ctx context.Context, l LoginSession) error {
 	_, err := s.pool.Exec(ctx, `
 		insert into sbctl.api_cli_login_sessions (session_id, user_id, token_id, server_public_key, nonce, ciphertext, expires_at)

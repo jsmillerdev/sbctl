@@ -17,6 +17,8 @@ type Store interface {
 	GetUser(ctx context.Context, userID string) (*User, error)
 	GetUserByID(ctx context.Context, id int64) (*User, error)
 	UpdateUser(ctx context.Context, u *User) error
+	// ListUsers returns every dashboard user, oldest first.
+	ListUsers(ctx context.Context) ([]User, error)
 
 	PutLoginSession(ctx context.Context, s LoginSession) error
 	// TakeLoginSession returns the session and deletes it, so a code works once.

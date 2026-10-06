@@ -96,6 +96,17 @@ func (m *MemoryStore) UpdateUser(_ context.Context, u *User) error {
 	return nil
 }
 
+func (m *MemoryStore) ListUsers(_ context.Context) ([]User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]User, 0, len(m.users))
+	for _, u := range m.users {
+		out = append(out, *u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
 func (m *MemoryStore) PutLoginSession(_ context.Context, s LoginSession) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
