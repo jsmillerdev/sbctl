@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -243,8 +244,8 @@ func TestResetRecoverySettingsLeavesThemWhenRecoveryDoesNotFinish(t *testing.T) 
 		t.Error("recovery settings were reset while the cluster was still in recovery")
 		return nil
 	}
-	if e.svc.resetRecoverySettings(ctx, testRef) {
-		t.Fatal("reported success")
+	if done, err := e.svc.resetRecoverySettings(ctx, testRef); done || err != nil {
+		t.Fatalf("slow recovery = %v, %v: not done and not an error", done, err)
 	}
 	evs, err := e.reg.ListEvents(ctx, testRef, 10)
 	if err != nil {
@@ -264,11 +265,135 @@ func TestResetRecoverySettingsLeavesThemWhenRecoveryDoesNotFinish(t *testing.T) 
 
 func TestResetRecoverySettingsWithoutAccessIsRecordedNotFatal(t *testing.T) {
 	e := newTestEnv(t)
-	if e.svc.resetRecoverySettings(context.Background(), testRef) {
-		t.Fatal("no access cannot succeed")
+	if done, err := e.svc.resetRecoverySettings(context.Background(), testRef); done || err != nil {
+		t.Fatalf("no access = %v, %v", done, err)
 	}
 	evs, _ := e.reg.ListEvents(context.Background(), testRef, 10)
 	if len(evs) != 1 || evs[0].Kind != "restore.cleanup_failed" {
 		t.Fatalf("events = %+v", evs)
+	}
+}
+
+// A cluster that was replaying WAL and then stops answering has died of a fatal recovery
+// error (no commit after the target in the archive): the restore must fail, not succeed.
+func TestFinishRecoveryFailsWhenClusterDiesDuringRecovery(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	e.svc.opt.RecoveryPoll = time.Millisecond
+	e.svc.opt.RecoveryFailGrace = 20 * time.Millisecond
+	var probes atomic.Int32
+	e.svc.probe = func(context.Context, string) (bool, error) {
+		if probes.Add(1) <= 3 {
+			return true, nil // hot standby accepts connections while replaying
+		}
+		return true, errors.New("connection refused") // then FATAL and shutdown
+	}
+	e.svc.alter = func(context.Context, string, []string) error {
+		t.Error("recovery settings reset on a dead cluster")
+		return nil
+	}
+	done, err := e.svc.resetRecoverySettings(ctx, testRef)
+	if done || !errors.Is(err, errRecoveryFailed) {
+		t.Fatalf("dead cluster = %v, %v; want errRecoveryFailed", done, err)
+	}
+	evs, _ := e.reg.ListEvents(ctx, testRef, 10)
+	if len(evs) != 1 || evs[0].Kind != "restore.recovery_failed" {
+		t.Fatalf("events = %+v", evs)
+	}
+}
+
+func TestFinishRecoveryFailsWhenClusterNeverAnswers(t *testing.T) {
+	e := newTestEnv(t)
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	e.svc.opt.RecoveryPoll = time.Millisecond
+	e.svc.opt.RecoveryTimeout = 30 * time.Millisecond
+	e.svc.probe = func(context.Context, string) (bool, error) { return true, errors.New("connection refused") }
+	if err := e.svc.finishRecovery(context.Background(), testRef, 30*time.Millisecond); !errors.Is(err, errRecoveryFailed) {
+		t.Fatalf("never answering = %v; want errRecoveryFailed", err)
+	}
+}
+
+// Restoring as a new project must report a failed recovery as an error.
+func TestRestoreAsNewReportsFailedRecovery(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	e.storeBase(t, testRef, fakeDataDir(t), e.now.Add(-time.Hour), nil)
+	e.svc.opt.Manager = &fakeManager{e: e, dataDir: filepath.Join(t.TempDir(), "restored")}
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	e.svc.opt.RecoveryPoll = time.Millisecond
+	e.svc.opt.RecoveryFailGrace = time.Millisecond
+	var n atomic.Int32
+	e.svc.probe = func(context.Context, string) (bool, error) {
+		if n.Add(1) == 1 {
+			return true, nil
+		}
+		return true, errors.New("connection refused")
+	}
+	if p, err := e.svc.RestoreWith(ctx, testRef, e.now, "bcdefghijklmnopqrstu", RestoreOptions{}); err == nil || !errors.Is(err, errRecoveryFailed) {
+		t.Fatalf("restore with a dying cluster = %v, %v; want an error wrapping errRecoveryFailed", p, err)
+	}
+	evs, _ := e.reg.ListEvents(ctx, testRef, 10)
+	var failed bool
+	for _, ev := range evs {
+		if ev.Kind == "restore.completed" {
+			t.Fatal("a failed restore recorded restore.completed")
+		}
+		failed = failed || ev.Kind == "restore.failed"
+	}
+	if !failed {
+		t.Fatalf("no restore.failed event: %+v", evs)
+	}
+}
+
+// An in-place restore whose recovery dies puts the original data back.
+func TestRestoreInPlaceRollsBackWhenRecoveryFails(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	e.storeBase(t, testRef, fakeDataDir(t), e.now.Add(-time.Hour), nil)
+	dd := e.svc.opt.DataDir(testRef)
+	writeFile(t, filepath.Join(dd, "PG_VERSION"), []byte("old"))
+	fm := &fakeManager{e: e}
+	e.svc.opt.Manager = fm
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	e.svc.opt.RecoveryPoll = time.Millisecond
+	e.svc.opt.RecoveryFailGrace = time.Millisecond
+	var n atomic.Int32
+	e.svc.probe = func(context.Context, string) (bool, error) {
+		if n.Add(1) == 1 {
+			return true, nil
+		}
+		return true, errors.New("connection refused")
+	}
+	if _, err := e.svc.RestoreWith(ctx, testRef, e.now, "", RestoreOptions{Force: true}); !errors.Is(err, errRecoveryFailed) {
+		t.Fatalf("in-place restore with a dying cluster = %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dd, "PG_VERSION")); string(b) != "old" {
+		t.Fatalf("original data not back in place: %q", b)
+	}
+	if failed, _ := filepath.Glob(dd + ".failed-restore-*"); len(failed) != 1 {
+		t.Fatalf("failed restore not kept for inspection: %v", failed)
+	}
+}
+
+func TestRestoreInPlaceRefusesWhatIsNotADataDirectory(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	e.storeBase(t, testRef, fakeDataDir(t), e.now.Add(-time.Hour), nil)
+	dd := e.svc.opt.DataDir(testRef)
+	writeFile(t, filepath.Join(dd, "pgdata", "PG_VERSION"), []byte("old")) // PGDATA one level down
+	fm := &fakeManager{e: e}
+	e.svc.opt.Manager = fm
+	if _, err := e.svc.RestoreWith(ctx, testRef, e.now, "", RestoreOptions{Force: true}); err == nil || !strings.Contains(err.Error(), "PG_VERSION") {
+		t.Fatalf("restore over a directory without PG_VERSION = %v", err)
+	}
+	if len(fm.paused) != 0 {
+		t.Fatal("nothing may be stopped before the directory is checked")
+	}
+	if _, err := os.Stat(filepath.Join(dd, "pgdata", "PG_VERSION")); err != nil {
+		t.Fatalf("the directory was touched: %v", err)
 	}
 }

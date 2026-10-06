@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/OWNER/sbctl/internal/backup"
+	"github.com/OWNER/sbctl/internal/config"
 )
 
 func runRoot(t *testing.T, args ...string) (string, error) {
@@ -96,5 +97,63 @@ func TestWarnEnvFileMode(t *testing.T) {
 		if (out.Len() > 0) != tc.warn {
 			t.Errorf("mode %04o: output %q, want warning=%v", tc.mode, out.String(), tc.warn)
 		}
+	}
+}
+
+func TestRefuseRoot(t *testing.T) {
+	if err := refuseRoot(0); !errors.Is(err, errRunAsRoot) || !strings.Contains(err.Error(), "sudo -u sbctl") {
+		t.Fatalf("refuseRoot(0) = %v", err)
+	}
+	for _, euid := range []int{1, 100, 1000} {
+		if err := refuseRoot(euid); err != nil {
+			t.Errorf("refuseRoot(%d) = %v", euid, err)
+		}
+	}
+	// Both command groups carry the check, so no subcommand can forget it.
+	for _, name := range []string{"backups", "wal"} {
+		c, _, err := rootCmd.Find([]string{name})
+		if err != nil || c.PersistentPreRunE == nil {
+			t.Errorf("sbctl %s has no root check: %v", name, err)
+		}
+	}
+}
+
+func TestCreateRejectsUnknownReason(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root is refused before flags are looked at")
+	}
+	if _, err := runRoot(t, "backups", "create", "abcdefghijklmnopqrst", "--reason", "because"); err == nil || !strings.Contains(err.Error(), "--reason") {
+		t.Fatalf("unknown --reason = %v", err)
+	}
+	for _, r := range []string{"manual", "scheduled", "final", "post-restore"} {
+		if !validReason(r) {
+			t.Errorf("%s must be valid", r)
+		}
+	}
+}
+
+func TestWarnConfigFileMode(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	cfg := &config.Config{}
+	warnConfigFileMode(&out, p, cfg)
+	if out.Len() != 0 {
+		t.Fatalf("no secret in config, no warning: %q", out.String())
+	}
+	cfg.Backup.S3SecretAccessKey = "secret"
+	warnConfigFileMode(&out, p, cfg)
+	if !strings.Contains(out.String(), "0600") || strings.Contains(out.String(), "secret\n") {
+		t.Fatalf("warning = %q", out.String())
+	}
+	out.Reset()
+	if err := os.Chmod(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	warnConfigFileMode(&out, p, cfg)
+	if out.Len() != 0 {
+		t.Fatalf("0600 file warned: %q", out.String())
 	}
 }

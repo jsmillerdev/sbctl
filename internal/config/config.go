@@ -77,7 +77,9 @@ type Backup struct {
 	BaseBackupOnCalendar string `toml:"base_backup_on_calendar"`
 	// S3AccessKeyID and S3SecretAccessKey are optional static credentials for the s3
 	// backend. When empty the AWS default chain applies (environment, shared config,
-	// instance role), which is what the CloudFormation install uses.
+	// instance role), which is what the CloudFormation install uses. The secret key sits in
+	// config.toml in plain text: with it set, config.toml must be mode 0600 and owned by
+	// the sbctl user (sbctl backups warns otherwise).
 	S3AccessKeyID     string `toml:"s3_access_key_id"`
 	S3SecretAccessKey string `toml:"s3_secret_access_key"`
 	// ArchiveTimeoutSeconds is PostgreSQL's archive_timeout for project clusters: the

@@ -45,6 +45,15 @@ type Store interface {
 	URL(key string) string
 }
 
+// TempCleaner is implemented by stores that stage uploads in temporary objects of their
+// own, which a crash can leave behind (FileStore). S3 keeps no such objects; its
+// abandoned multipart uploads need a bucket lifecycle rule (see the README).
+type TempCleaner interface {
+	// DeleteStaleTemps removes leftover in-flight objects under prefix (empty or ending
+	// in "/") that were last written before cutoff, and returns how many.
+	DeleteStaleTemps(ctx context.Context, prefix string, cutoff time.Time) (int, error)
+}
+
 // OpenStore builds the Store named by cfg.Backend ("file:///dir" or "s3://bucket/prefix").
 func OpenStore(ctx context.Context, cfg config.Backup) (Store, error) {
 	u, err := url.Parse(cfg.Backend)

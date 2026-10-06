@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -186,15 +185,15 @@ func (s *Service) RestoreWith(ctx context.Context, ref string, target time.Time,
 		}
 	}
 
-	if mode == RestoreToLatest {
+	// A running source holds its newest transactions in a WAL segment that is not archived
+	// until it fills or archive_timeout passes. A time target needs a commit after it in the
+	// archive, and "latest" wants everything, so archive that segment first. A backup target
+	// needs only the backup's own WAL.
+	if mode != RestoreToBackup {
 		s.flushArchive(ctx, ref)
 	}
 	plan, err := s.PlanRestoreWith(ctx, ref, target, opts)
 	if err != nil {
-		return nil, err
-	}
-	keys, err := s.sourceKeys(ctx, &plan.Manifest)
-	if err != nil && !inPlace {
 		return nil, err
 	}
 
@@ -202,6 +201,10 @@ func (s *Service) RestoreWith(ctx context.Context, ref string, target time.Time,
 	if inPlace {
 		p, err = s.restoreInPlace(ctx, plan)
 	} else {
+		var keys *secrets.ProjectKeys
+		if keys, err = s.sourceKeys(ctx, &plan.Manifest); err != nil {
+			return nil, err
+		}
 		plan.TargetRef = newRef
 		p, err = s.restoreAsNew(ctx, plan, keys)
 	}
@@ -235,7 +238,9 @@ func (s *Service) restoreAsNew(ctx context.Context, plan *RestorePlan, src *secr
 	if err != nil {
 		return nil, fmt.Errorf("backup: create restored project %s: %w", plan.TargetRef, err)
 	}
-	s.resetRecoverySettings(ctx, plan.TargetRef)
+	if _, err := s.resetRecoverySettings(ctx, plan.TargetRef); err != nil {
+		return nil, fmt.Errorf("backup: project %s was created but its recovery did not finish, so it holds no usable data (it is registered: read its postgres log, then delete it): %w", plan.TargetRef, err)
+	}
 	return p, nil
 }
 
@@ -249,10 +254,15 @@ func (s *Service) restoreInPlace(ctx context.Context, plan *RestorePlan) (*regis
 		return nil, errors.New("backup: no data directory resolver configured")
 	}
 	dataDir := s.opt.DataDir(ref)
+	if err := s.checkDataDir(ctx, ref, dataDir); err != nil {
+		return nil, err
+	}
+	s.warnPasswordDrift(ctx, ref, &plan.Manifest)
 	if err := s.opt.Manager.Pause(ctx, ref); err != nil {
 		return nil, fmt.Errorf("backup: stop %s: %w", ref, err)
 	}
-	aside := dataDir + ".pre-restore-" + s.opt.Now().UTC().Format("20060102T150405Z")
+	stamp := s.opt.Now().UTC().Format("20060102T150405Z")
+	aside := dataDir + ".pre-restore-" + stamp
 	if err := os.Rename(dataDir, aside); err != nil {
 		_ = s.opt.Manager.Resume(ctx, ref)
 		return nil, fmt.Errorf("backup: move data directory aside: %w", err)
@@ -271,7 +281,17 @@ func (s *Service) restoreInPlace(ctx context.Context, plan *RestorePlan) (*regis
 	if err := s.opt.Manager.Resume(ctx, ref); err != nil {
 		return nil, fmt.Errorf("backup: start %s after restore (original data kept in %s): %w", ref, aside, err)
 	}
-	if s.resetRecoverySettings(ctx, ref) {
+	done, err := s.resetRecoverySettings(ctx, ref)
+	if err != nil {
+		// Recovery ended in a fatal error (typically: no commit after the target time in
+		// the archive). Put the original data back rather than leave a dead project.
+		failed := dataDir + ".failed-restore-" + stamp
+		if rerr := s.rollbackInPlace(ctx, ref, dataDir, aside, failed); rerr != nil {
+			return nil, fmt.Errorf("backup: recovery of %s did not finish (%v) and the original could not be put back (%v); original data is in %s, the failed restore in %s", ref, err, rerr, aside, dataDir)
+		}
+		return nil, fmt.Errorf("backup: recovery of %s did not finish; the original data is back in place and the failed restore is kept in %s: %w", ref, failed, err)
+	}
+	if done {
 		// The new timeline has no base backup yet, and the ones of the old timeline taken
 		// after the fork are unusable for it. Take one now rather than at the next timer run.
 		if _, err := s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonRestore}); err != nil {
@@ -285,8 +305,95 @@ func (s *Service) restoreInPlace(ctx context.Context, plan *RestorePlan) (*regis
 	return s.opt.Registry.GetProject(ctx, ref)
 }
 
+// rollbackInPlace undoes a failed in-place restore: stops the project (it may already be
+// dead), moves the restored directory to failed, puts the original back and resumes.
+func (s *Service) rollbackInPlace(ctx context.Context, ref, dataDir, aside, failed string) error {
+	_ = s.opt.Manager.Pause(ctx, ref)
+	if err := os.Rename(dataDir, failed); err != nil {
+		return err
+	}
+	if err := os.Rename(aside, dataDir); err != nil {
+		return err
+	}
+	return s.opt.Manager.Resume(ctx, ref)
+}
+
+// checkDataDir refuses an in-place restore unless dataDir is the cluster's data
+// directory: it must hold PG_VERSION and, when the cluster is reachable, be the
+// directory the server itself reports. Base backups read the server's data_directory,
+// so a resolver that points at a parent directory would otherwise move the wrong tree.
+func (s *Service) checkDataDir(ctx context.Context, ref, dataDir string) error {
+	if _, err := os.Stat(filepath.Join(dataDir, "PG_VERSION")); err != nil {
+		return fmt.Errorf("backup: %s is not a PostgreSQL data directory (no PG_VERSION): %w; refusing to replace it", dataDir, err)
+	}
+	if s.opt.Access == nil {
+		return nil
+	}
+	conn, err := s.adminConn(ctx, ref)
+	if err != nil {
+		return nil // not running: the PG_VERSION check is all there is
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	var actual string
+	if err := conn.QueryRow(ctx, "select current_setting('data_directory')").Scan(&actual); err != nil {
+		return nil
+	}
+	if !samePath(actual, dataDir) {
+		return fmt.Errorf("backup: the server of %s runs on %s, not on %s; refusing to replace the wrong directory", ref, actual, dataDir)
+	}
+	return nil
+}
+
+// samePath compares two directories after resolving symlinks where possible.
+func samePath(a, b string) bool {
+	if ra, err := filepath.EvalSymlinks(a); err == nil {
+		a = ra
+	}
+	if rb, err := filepath.EvalSymlinks(b); err == nil {
+		b = rb
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+// warnPasswordDrift records when the registry's database passwords differ from the ones
+// the backup holds. An in-place restore brings the old passwords back inside the
+// cluster while the registry, GoTrue and PostgREST keep the current ones, so the services
+// would fail to log in. Only a password reset between backup and restore causes this
+// (RotateKeys does not touch database passwords).
+func (s *Service) warnPasswordDrift(ctx context.Context, ref string, m *Manifest) {
+	old, err := s.sourceKeys(ctx, m)
+	if err != nil {
+		return
+	}
+	sealed, err := s.opt.Registry.GetSecrets(ctx, ref)
+	if err != nil {
+		return
+	}
+	plain := make(map[string]string, len(sealed))
+	for name, blob := range sealed {
+		pt, err := s.opt.Secrets.Open(blob)
+		if err != nil {
+			return
+		}
+		plain[name] = string(pt)
+	}
+	cur := secrets.KeysFromMap(plain)
+	if cur.DBPassword == old.DBPassword && cur.AdminPassword == old.AdminPassword &&
+		cur.AuthenticatorPassword == old.AuthenticatorPassword && cur.AuthAdminPassword == old.AuthAdminPassword &&
+		cur.StorageAdminPassword == old.StorageAdminPassword && cur.ReplicationPassword == old.ReplicationPassword {
+		return
+	}
+	s.opt.Log.Warn("database passwords changed since the backup; the restored cluster has the old ones and the services will fail to log in until they are reset", "ref", ref, "backup", m.ID)
+	_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.password_drift", map[string]any{"backup": m.ID})
+}
+
 // errStillRecovering means the cluster did not leave recovery within the wait.
 var errStillRecovering = errors.New("cluster is still in recovery")
+
+// errRecoveryFailed means the cluster stopped answering after it had been in recovery, or
+// never answered at all: PostgreSQL ended recovery with a fatal error (most often "recovery
+// ended before configured recovery target was reached") and shut down.
+var errRecoveryFailed = errors.New("cluster stopped before recovery finished")
 
 // resetRecoverySettings waits for the restored cluster to finish recovery, then removes
 // the recovery settings the seeder put in postgresql.auto.conf, so a later start never
@@ -299,12 +406,17 @@ var errStillRecovering = errors.New("cluster is still in recovery")
 // with hot_standby on is also a cluster that is still replaying. So nothing is reset
 // until pg_is_in_recovery() is false. If that does not happen in RecoveryTimeout the
 // settings stay and a restore.cleanup_pending event is recorded; FinishRestore finishes
-// the job later. Failure is logged and recorded, not returned: the project is restored.
-func (s *Service) resetRecoverySettings(ctx context.Context, ref string) bool {
+// the job later. A slow recovery is logged and recorded, not returned: the project is
+// restored. A cluster that died during recovery is returned as an error wrapping
+// errRecoveryFailed: the restore did not produce a project.
+func (s *Service) resetRecoverySettings(ctx context.Context, ref string) (bool, error) {
 	err := s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout)
 	switch {
 	case err == nil:
-		return true
+		return true, nil
+	case errors.Is(err, errRecoveryFailed):
+		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.recovery_failed", map[string]any{"error": err.Error()})
+		return false, err
 	case errors.Is(err, errStillRecovering):
 		s.opt.Log.Warn("restored cluster is still in recovery; recovery settings left in place (run `sbctl backups finish-restore`)", "ref", ref, "err", err)
 		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.cleanup_pending", map[string]any{"error": err.Error()})
@@ -312,7 +424,7 @@ func (s *Service) resetRecoverySettings(ctx context.Context, ref string) bool {
 		s.opt.Log.Warn("could not clear recovery settings after restore", "ref", ref, "err", err)
 		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.cleanup_failed", map[string]any{"error": err.Error()})
 	}
-	return false
+	return false, nil
 }
 
 // FinishRestore waits up to RecoveryTimeout for ref's cluster to finish recovery and
@@ -329,21 +441,34 @@ func (s *Service) FinishRestore(ctx context.Context, ref string) error {
 }
 
 // finishRecovery polls until the cluster has left recovery (connecting as often as
-// needed, since the server may still be starting), then resets recoveryGUCs.
+// needed, since the server may still be starting), then resets recoveryGUCs. A server
+// that was seen in recovery and then stays unreachable for RecoveryFailGrace has died,
+// and one that never answers within wait never started: both are errRecoveryFailed.
 func (s *Service) finishRecovery(ctx context.Context, ref string, wait time.Duration) error {
 	if s.opt.Access == nil {
 		return errors.New("no database access configured")
 	}
 	wctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
-	var last error = errStillRecovering
+	var (
+		last      error = errStillRecovering
+		seenUp    bool
+		downSince time.Time
+	)
 	for {
 		inRec, err := s.probe(wctx, ref)
 		switch {
 		case err != nil:
 			last = err
+			if seenUp {
+				if downSince.IsZero() {
+					downSince = time.Now()
+				} else if time.Since(downSince) >= s.opt.RecoveryFailGrace {
+					return fmt.Errorf("%w (unreachable for %s while recovering: %v)", errRecoveryFailed, s.opt.RecoveryFailGrace, err)
+				}
+			}
 		case inRec:
-			last = errStillRecovering
+			seenUp, downSince, last = true, time.Time{}, errStillRecovering
 		default:
 			return s.alter(ctx, ref, recoveryGUCs)
 		}
@@ -351,6 +476,9 @@ func (s *Service) finishRecovery(ctx context.Context, ref string, wait time.Dura
 		case <-wctx.Done():
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if !seenUp {
+				return fmt.Errorf("%w (never accepted a connection in %s: %v)", errRecoveryFailed, wait, last)
 			}
 			return fmt.Errorf("%w after %s (last: %v)", errStillRecovering, wait, last)
 		case <-time.After(s.opt.RecoveryPoll):
@@ -396,8 +524,8 @@ func (s *Service) adminConn(ctx context.Context, ref string) (*pgx.Conn, error) 
 	return pgx.Connect(cctx, dsn)
 }
 
-// flushArchive makes a running source archive its newest WAL before a restore to the
-// end of the archive: it switches to a new segment and waits for the archiver to
+// flushArchive makes a running source archive its newest WAL before a restore to a time
+// or to the end of the archive: it switches to a new segment and waits for the archiver to
 // catch up. Best effort: a source that is down or gone (a deleted project) has nothing
 // to flush, and a restore must not fail because of it.
 func (s *Service) flushArchive(ctx context.Context, ref string) {
@@ -412,12 +540,11 @@ func (s *Service) flushArchive(ctx context.Context, ref string) {
 		return
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	// pg_switch_wal() returns the end of the segment it closed, or the start of the current
+	// one when nothing was written since the last switch; minus one byte is the last
+	// segment that must be archived either way.
 	var seg string
-	if err := conn.QueryRow(fctx, "select pg_walfile_name(pg_current_wal_lsn())").Scan(&seg); err != nil {
-		s.opt.Log.Debug("cannot read the source's WAL position", "ref", ref, "err", err)
-		return
-	}
-	if _, err := conn.Exec(fctx, "select pg_switch_wal()"); err != nil {
+	if err := conn.QueryRow(fctx, "select pg_walfile_name(pg_switch_wal() - 1)").Scan(&seg); err != nil {
 		s.opt.Log.Warn("could not switch WAL on the source", "ref", ref, "err", err)
 		return
 	}
@@ -531,9 +658,6 @@ func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) e
 	if err := writeSyncFile(filepath.Join(dataDir, "recovery.signal"), nil, 0o600); err != nil {
 		return err
 	}
-	if err := chownLikeParent(dataDir); err != nil {
-		return err
-	}
 	return syncTree(dataDir)
 }
 
@@ -641,30 +765,6 @@ func extractTar(ctx context.Context, tr *tar.Reader, root string) error {
 			return fmt.Errorf("unsupported entry type %q for %s", hdr.Typeflag, name)
 		}
 	}
-}
-
-// chownLikeParent gives the tree under root the owner of root's parent directory when
-// sbctl runs as root. An administrator who runs `sudo sbctl backups restore` must not
-// leave root-owned files behind: Postgres runs as the sbctl user and refuses a data
-// directory it does not own. As any other user it does nothing (files are already ours).
-func chownLikeParent(root string) error {
-	if os.Geteuid() != 0 {
-		return nil
-	}
-	fi, err := os.Stat(filepath.Dir(root))
-	if err != nil {
-		return err
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return nil
-	}
-	return filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		return os.Lchown(p, int(st.Uid), int(st.Gid))
-	})
 }
 
 // syncTree fsyncs every directory under root, deepest first, so the new tree is durable.

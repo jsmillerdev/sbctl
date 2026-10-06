@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -21,6 +24,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -56,6 +61,8 @@ type S3Store struct {
 	bucket   string
 	prefix   string
 	partSize int64
+	// needMD5 is set once the service has refused DeleteObjects without Content-MD5.
+	needMD5 atomic.Bool
 }
 
 // NewS3Store connects with the AWS SDK default credential chain, or static
@@ -356,7 +363,7 @@ func (s *S3Store) Delete(ctx context.Context, keys ...string) error {
 			}
 			ids[i] = types.ObjectIdentifier{Key: aws.String(s.key(k))}
 		}
-		out, err := s.c.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		out, err := s.deleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: &s.bucket, Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
 		})
 		if err != nil {
@@ -369,4 +376,63 @@ func (s *S3Store) Delete(ctx context.Context, keys ...string) error {
 		keys = keys[n:]
 	}
 	return nil
+}
+
+// deleteObjects sends DeleteObjects the way the SDK does (a CRC32 checksum header, which
+// AWS accepts). Some S3-compatible services insist on Content-MD5 instead and answer
+// with MissingContentMD5 or InvalidRequest; the first such answer switches this store to
+// sending Content-MD5 and the request is repeated, so retention keeps working there.
+func (s *S3Store) deleteObjects(ctx context.Context, in *s3.DeleteObjectsInput) (*s3.DeleteObjectsOutput, error) {
+	if s.needMD5.Load() {
+		return s.c.DeleteObjects(ctx, in, withContentMD5)
+	}
+	out, err := s.c.DeleteObjects(ctx, in)
+	if err != nil && wantsContentMD5(err) {
+		s.needMD5.Store(true)
+		return s.c.DeleteObjects(ctx, in, withContentMD5)
+	}
+	return out, err
+}
+
+// wantsContentMD5 reports whether err is a service's refusal of a DeleteObjects request
+// that carries no Content-MD5 header.
+func wantsContentMD5(err error) bool {
+	var ae smithy.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch ae.ErrorCode() {
+	case "MissingContentMD5", "InvalidRequest", "InvalidDigest":
+		return true
+	}
+	return false
+}
+
+// withContentMD5 adds a Content-MD5 header over the serialized request body.
+func withContentMD5(o *s3.Options) {
+	o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+		return stack.Build.Add(contentMD5Middleware{}, middleware.After)
+	})
+}
+
+type contentMD5Middleware struct{}
+
+func (contentMD5Middleware) ID() string { return "sbctlContentMD5" }
+
+func (contentMD5Middleware) HandleBuild(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+	req, ok := in.Request.(*smithyhttp.Request)
+	if !ok || req.GetStream() == nil {
+		return next.HandleBuild(ctx, in)
+	}
+	body, err := io.ReadAll(req.GetStream())
+	if err != nil {
+		return middleware.BuildOutput{}, middleware.Metadata{}, fmt.Errorf("backup: s3 content-md5: %w", err)
+	}
+	sum := md5.Sum(body)
+	req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(sum[:]))
+	if req, err = req.SetStream(bytes.NewReader(body)); err != nil {
+		return middleware.BuildOutput{}, middleware.Metadata{}, err
+	}
+	in.Request = req
+	return next.HandleBuild(ctx, in)
 }

@@ -25,13 +25,23 @@ type PruneResult struct {
 
 // retainedBackups applies the retention rule to backups (oldest first). A backup is
 // kept when it finished within the window, plus the newest one that finished before the
-// window starts (the anchor: without it the oldest instant in the window could not be
-// restored), so at least one backup always survives.
-func retainedBackups(all []Manifest, now time.Time, days int) (keep, drop []Manifest) {
+// window starts and can still be restored from (the anchor: without it the oldest
+// instant in the window could not be restored), so at least one backup always survives.
+//
+// usable reports whether a restore can start from a backup (on the archive's current
+// timeline history, see timelineHistory.onHistory); nil accepts every backup. An
+// off-history backup, such as a timeline-1 backup taken after an in-place restore forked
+// timeline 2, must not become the anchor: it would crowd out the older backup that
+// restores can actually use, and the WAL that backup needs would be deleted.
+func retainedBackups(all []Manifest, now time.Time, days int, usable func(*Manifest) bool) (keep, drop []Manifest) {
 	cutoff := now.Add(-time.Duration(days) * 24 * time.Hour)
-	anchor := -1
-	for i, m := range all {
-		if m.StopTime.Before(cutoff) && (anchor < 0 || m.StopTime.After(all[anchor].StopTime)) {
+	anchor, newest := -1, -1
+	for i := range all {
+		m := &all[i]
+		if newest < 0 || m.StopTime.After(all[newest].StopTime) {
+			newest = i
+		}
+		if m.StopTime.Before(cutoff) && (usable == nil || usable(m)) && (anchor < 0 || m.StopTime.After(all[anchor].StopTime)) {
 			anchor = i
 		}
 	}
@@ -40,6 +50,14 @@ func retainedBackups(all []Manifest, now time.Time, days int) (keep, drop []Mani
 			keep = append(keep, m)
 		} else {
 			drop = append(drop, m)
+		}
+	}
+	if len(keep) == 0 && newest >= 0 { // every backup is old and off-history: still keep one
+		keep, drop = []Manifest{all[newest]}, nil
+		for i, m := range all {
+			if i != newest {
+				drop = append(drop, m)
+			}
 		}
 	}
 	return keep, drop
@@ -93,7 +111,11 @@ func (s *Service) Prune(ctx context.Context, ref string) (*PruneResult, error) {
 	if len(all) == 0 {
 		return res, nil
 	}
-	keep, drop := retainedBackups(all, s.opt.Now(), days)
+	hist, err := s.latestHistory(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	keep, drop := retainedBackups(all, s.opt.Now(), days, hist.onHistory)
 	for _, m := range keep {
 		res.KeptBackups = append(res.KeptBackups, m.ID)
 	}
@@ -159,15 +181,23 @@ func (s *Service) dropRegistryRow(ctx context.Context, ref, id string) {
 // orphanAge, and marks registry rows stuck in "running" for that long as failed.
 func (s *Service) pruneOrphans(ctx context.Context, ref string, complete []Manifest) (int, error) {
 	st := s.opt.Store
+	n := 0
+	if tc, ok := st.(TempCleaner); ok {
+		// Files from Puts that crashed half way: List never shows them.
+		c, err := tc.DeleteStaleTemps(ctx, ref+"/", s.opt.Now().Add(-orphanAge))
+		if err != nil {
+			return 0, err
+		}
+		n += c
+	}
 	ids, err := st.ListDirs(ctx, baseDir(ref))
 	if err != nil {
-		return 0, err
+		return n, err
 	}
 	have := map[string]bool{}
 	for _, m := range complete {
 		have[m.ID] = true
 	}
-	n := 0
 	for _, id := range ids {
 		if have[id] {
 			continue
@@ -184,7 +214,7 @@ func (s *Service) pruneOrphans(ctx context.Context, ref string, complete []Manif
 				fresh = true
 			}
 		}
-		if fresh {
+		if fresh || len(keys) == 0 {
 			continue
 		}
 		if err := st.Delete(ctx, keys...); err != nil {

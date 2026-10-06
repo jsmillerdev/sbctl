@@ -55,8 +55,12 @@ type Options struct {
 	// interval (default 1 second).
 	RecoveryTimeout time.Duration
 	RecoveryPoll    time.Duration
+	// RecoveryFailGrace is how long a cluster that was replaying WAL may stay unreachable
+	// before the restore counts as failed: PostgreSQL shuts down on a fatal recovery error
+	// (default 15 seconds).
+	RecoveryFailGrace time.Duration
 	// ArchiveFlushTimeout bounds how long a restore to the end of the archive waits for a
-	// running source to archive its newest WAL (default 60 seconds).
+	// running source to archive its newest WAL before a time or latest restore (default 60 seconds).
 	ArchiveFlushTimeout time.Duration
 }
 
@@ -90,6 +94,9 @@ func New(o Options) (*Service, error) {
 	}
 	if o.RecoveryPoll <= 0 {
 		o.RecoveryPoll = time.Second
+	}
+	if o.RecoveryFailGrace <= 0 {
+		o.RecoveryFailGrace = 15 * time.Second
 	}
 	if o.ArchiveFlushTimeout <= 0 {
 		o.ArchiveFlushTimeout = time.Minute

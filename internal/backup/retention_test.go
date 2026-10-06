@@ -2,6 +2,10 @@ package backup
 
 import (
 	"context"
+	"errors"
+	fs2 "io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -72,7 +76,7 @@ func TestRetainedBackups(t *testing.T) {
 		return o
 	}
 	all := []Manifest{mk(20), mk(12), mk(9), mk(5), mk(1)} // oldest first
-	keep, drop := retainedBackups(all, now, 7)
+	keep, drop := retainedBackups(all, now, 7, nil)
 	// Within 7 days: 5 and 1. Anchor: newest before the window = 9 days old.
 	if len(keep) != 3 || len(drop) != 2 {
 		t.Fatalf("keep=%v drop=%v", ids(keep), ids(drop))
@@ -82,13 +86,33 @@ func TestRetainedBackups(t *testing.T) {
 	}
 
 	// Everything is older than the window: exactly one survives, the newest.
-	keep, drop = retainedBackups([]Manifest{mk(40), mk(30), mk(20)}, now, 7)
+	keep, drop = retainedBackups([]Manifest{mk(40), mk(30), mk(20)}, now, 7, nil)
 	if len(keep) != 1 || keep[0].ID != mk(20).ID || len(drop) != 2 {
 		t.Fatalf("keep=%v drop=%v", ids(keep), ids(drop))
 	}
 	// A single old backup is never dropped.
-	if keep, drop = retainedBackups([]Manifest{mk(400)}, now, 1); len(keep) != 1 || len(drop) != 0 {
+	if keep, drop = retainedBackups([]Manifest{mk(400)}, now, 1, nil); len(keep) != 1 || len(drop) != 0 {
 		t.Fatalf("keep=%v drop=%v", ids(keep), ids(drop))
+	}
+}
+
+// After an in-place restore the newest pre-window backup can be off the timeline history.
+// It must not become the anchor and crowd out the older, usable backup.
+func TestRetainedBackupsAnchorMustBeOnHistory(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	mk := func(ageDays, tli int) Manifest {
+		return Manifest{ID: backupID(now.Add(-days(ageDays))), StopTime: now.Add(-days(ageDays)), Timeline: tli}
+	}
+	a, b, c := mk(8, 1), mk(7, 1), mk(0, 2) // b is off the history: it ended after timeline 2 forked
+	usable := func(m *Manifest) bool { return m.Timeline == 2 || m.ID == a.ID }
+	keep, drop := retainedBackups([]Manifest{a, b, c}, now, 1, usable)
+	if len(keep) != 2 || keep[0].ID != a.ID || keep[1].ID != c.ID || len(drop) != 1 || drop[0].ID != b.ID {
+		t.Fatalf("keep=%v drop=%v: want a and c kept, b dropped", keep, drop)
+	}
+	// Nothing old is usable and nothing is inside the window: the newest backup is kept anyway.
+	keep, drop = retainedBackups([]Manifest{a, b}, now, 1, func(*Manifest) bool { return false })
+	if len(keep) != 1 || keep[0].ID != b.ID || len(drop) != 1 {
+		t.Fatalf("keep=%v drop=%v", keep, drop)
 	}
 }
 
@@ -123,7 +147,8 @@ func TestPruneDeletesOldBackupsAndWAL(t *testing.T) {
 	old := e.fakeBackup(t, testRef, e.now.Add(-days(20)), 1, 10)
 	anchor := e.fakeBackup(t, testRef, e.now.Add(-days(9)), 1, 30)
 	recent := e.fakeBackup(t, testRef, e.now.Add(-days(2)), 1, 50)
-	e.fakeWAL(t, testRef, walName(1, 5), walName(1, 10), walName(1, 29), walName(1, 30), walName(1, 55), "00000002.history", walName(2, 1))
+	e.fakeWAL(t, testRef, walName(1, 5), walName(1, 10), walName(1, 29), walName(1, 30), walName(1, 55), walName(2, 1))
+	e.putHistory(t, testRef, 2, "1\t0/2000000\tno recovery target specified\n") // fork after every backup above
 
 	res, err := e.svc.Prune(ctx, testRef)
 	if err != nil {
@@ -160,6 +185,58 @@ func TestPruneDeletesOldBackupsAndWAL(t *testing.T) {
 	res, err = e.svc.Prune(ctx, testRef)
 	if err != nil || len(res.DeletedBackups) != 0 || res.DeletedWAL != 0 {
 		t.Fatalf("second prune = %+v, %v", res, err)
+	}
+}
+
+// Prune must not let a timeline-1 backup taken after an in-place restore (off the history
+// of timeline 2) displace the older usable one, nor delete the WAL that one needs.
+func TestPruneAnchorIsOnTheTimelineHistory(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	e.cfg.Backup.RetentionDays = 7
+	e.putHistory(t, testRef, 2, "1\t0/2000000\tno recovery target specified\n")
+
+	a := e.fakeBackup(t, testRef, e.now.Add(-days(9)), 1, 10) // stops at 0/1000100: before the fork
+	b := e.fakeBackup(t, testRef, e.now.Add(-days(8)), 1, 40)
+	b.StopLSN = "0/3000000" // taken after the fork: unusable for timeline 2
+	if err := e.svc.writeManifest(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+	c := e.fakeBackup(t, testRef, e.now.Add(-days(1)), 2, 50)
+	e.fakeWAL(t, testRef, walName(1, 10), walName(1, 39), walName(2, 50))
+
+	res, err := e.svc.Prune(ctx, testRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(res.KeptBackups, ",") != a.ID+","+c.ID || len(res.DeletedBackups) != 1 || res.DeletedBackups[0] != b.ID {
+		t.Fatalf("prune = %+v; want a and c kept, b deleted", res)
+	}
+	if got := strings.Join(e.walNames(t, testRef), ","); got != strings.Join([]string{walName(1, 10), walName(1, 39), "00000002.history", walName(2, 50)}, ",") {
+		t.Fatalf("WAL left = %s: a's WAL must survive", got)
+	}
+}
+
+func TestPruneRemovesStaleTempFilesOfCrashedPuts(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.cfg.Backup.RetentionDays = 7
+	e.fakeBackup(t, testRef, e.now.Add(-days(1)), 1, 1)
+	tmp := filepath.Join(e.store.root, testRef, "wal", "000000010000000000000001.zst"+tmpMarker+"123")
+	writeFile(t, tmp, []byte("half"))
+	if res, err := e.svc.Prune(ctx, testRef); err != nil || res.DeletedOrphans != 0 {
+		t.Fatalf("a fresh temp file belongs to a Put in flight: %+v, %v", res, err)
+	}
+	real := e.now
+	e.now = time.Now().Add(2 * orphanAge)
+	res, err := e.svc.Prune(ctx, testRef)
+	e.now = real
+	if err != nil || res.DeletedOrphans != 1 {
+		t.Fatalf("stale temp file: %+v, %v", res, err)
+	}
+	if _, err := os.Stat(tmp); !errors.Is(err, fs2.ErrNotExist) {
+		t.Fatalf("temp file left: %v", err)
 	}
 }
 

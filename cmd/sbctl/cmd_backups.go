@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -45,12 +47,53 @@ func warnEnvFileMode(w io.Writer, path string) {
 	fmt.Fprintf(w, "warning: %s is mode %04o; it holds the registry password and must be 0600 and owned by the sbctl user\n", path, fi.Mode().Perm())
 }
 
+// errRunAsRoot is returned by the wal and backups commands when run with euid 0. The
+// file backend and the restored data directory are owned by the user who runs sbctl; a
+// root run would leave root-owned objects that the timer (User=sbctl) can no longer
+// read, prune or restore.
+var errRunAsRoot = errors.New("sbctl wal and backups commands must not run as root: they would create root-owned backup files that the sbctl user cannot read; run `sudo -u sbctl sbctl ...`")
+
+// refuseRoot returns errRunAsRoot when euid is 0.
+func refuseRoot(euid int) error {
+	if euid == 0 {
+		return errRunAsRoot
+	}
+	return nil
+}
+
+// warnConfigFileMode warns when config.toml holds an S3 secret key and is readable by
+// group or others. Missing or unreadable files are not this check's business.
+func warnConfigFileMode(w io.Writer, path string, cfg *config.Config) {
+	if cfg.Backup.S3SecretAccessKey == "" {
+		return
+	}
+	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		fmt.Fprintf(w, "warning: %s is mode %04o and holds backup.s3_secret_access_key; it must be 0600 and owned by the sbctl user\n", path, fi.Mode().Perm())
+	}
+}
+
+// configFilePath is the file loadConfig reads.
+func configFilePath() string {
+	if configPath != "" {
+		return configPath
+	}
+	if p := os.Getenv("SBCTL_CONFIG"); p != "" {
+		return p
+	}
+	return config.DefaultPath
+}
+
 // newLifecycleManager builds the lifecycle.Manager that `backups restore` needs. It
 // is nil until the lifecycle workstream registers one from its own cmd file.
 var newLifecycleManager func(ctx context.Context, cfg *config.Config, reg registry.Registry, sec secrets.Secrets) (lifecycle.Manager, error)
 
 func init() {
-	backups := &cobra.Command{Use: "backups", Short: "Base backups, retention and point-in-time restore"}
+	backups := &cobra.Command{
+		Use:   "backups",
+		Short: "Base backups, retention and point-in-time restore",
+		// Subcommands that define their own PersistentPreRunE must call refuseRoot too.
+		PersistentPreRunE: func(*cobra.Command, []string) error { return refuseRoot(os.Geteuid()) },
+	}
 
 	var createReason string
 	create := &cobra.Command{
@@ -58,6 +101,9 @@ func init() {
 		Short: "Take a base backup of a project now",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !validReason(createReason) {
+				return fmt.Errorf("--reason %q is not one of %s", createReason, strings.Join(reasons, ", "))
+			}
 			svc, closeFn, err := openBackupService(cmd.Context(), false)
 			if err != nil {
 				return err
@@ -72,7 +118,7 @@ func init() {
 			return nil
 		},
 	}
-	create.Flags().StringVar(&createReason, "reason", backup.ReasonManual, "reason recorded in the manifest: manual, scheduled, final or post-restore")
+	create.Flags().StringVar(&createReason, "reason", backup.ReasonManual, "reason recorded in the manifest: "+strings.Join(reasons, ", "))
 
 	var listStore, listJSON bool
 	list := &cobra.Command{
@@ -160,7 +206,8 @@ func init() {
 		Long: "Builds a cluster from the newest base backup before --to and replays archived WAL.\n\n" +
 			"  --to <RFC3339 time>  stop at that time. PostgreSQL stops at the first commit after\n" +
 			"                       the time, so some transaction must have committed after it\n" +
-			"                       in the archive; otherwise recovery fails and nothing is restored.\n" +
+			"                       in the archive (a running source first archives its newest WAL).\n" +
+			"                       If there is none, recovery fails and the restore reports an error.\n" +
 			"  --to latest          replay the whole archive (a running source first archives its\n" +
 			"                       newest WAL). Use this to restore a deleted project's last state.\n" +
 			"  --to backup          the exact state of a base backup (--backup-id, default newest).\n\n" +
@@ -233,12 +280,21 @@ func init() {
 	rootCmd.AddCommand(backups)
 }
 
+// reasons are the values `backups create --reason` accepts.
+var reasons = []string{backup.ReasonManual, backup.ReasonScheduled, backup.ReasonFinal, backup.ReasonRestore}
+
+func validReason(r string) bool { return slices.Contains(reasons, r) }
+
 // openBackupService wires a Service from config, the registry and the master key.
 // withManager also builds the lifecycle.Manager (restore only).
 func openBackupService(ctx context.Context, withManager bool) (*backup.Service, func(), error) {
 	cfg, err := loadConfig()
 	if err != nil {
 		return nil, nil, err
+	}
+	warnConfigFileMode(os.Stderr, configFilePath(), cfg)
+	if err := backup.ValidateOnCalendar(cfg.Backup.BaseBackupOnCalendar); err != nil {
+		return nil, nil, fmt.Errorf("config backup.base_backup_on_calendar: %w", err)
 	}
 	store, err := backup.OpenStore(ctx, cfg.Backup)
 	if err != nil {

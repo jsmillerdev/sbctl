@@ -3,7 +3,9 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,5 +187,72 @@ func TestAccessDeniedHintNamesListBucket(t *testing.T) {
 	}
 	if h := accessDeniedHint(errors.New("boom")); h != "" {
 		t.Errorf("hint for an unrelated error = %q", h)
+	}
+}
+
+// Some S3-compatible services refuse DeleteObjects without Content-MD5 (the SDK sends a
+// CRC32 header instead). The store must switch to Content-MD5 and carry on; gofakes3
+// does not check the header, so this uses a stub that does.
+func TestS3DeleteFallsBackToContentMD5(t *testing.T) {
+	var plain, withMD5 atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost || !r.URL.Query().Has("delete") {
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusTeapot)
+			return
+		}
+		got := r.Header.Get("Content-MD5")
+		if got == "" {
+			plain.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>MissingContentMD5</Code><Message>Missing required header for this request: Content-MD5.</Message></Error>`)
+			return
+		}
+		sum := md5.Sum(body)
+		if got != base64.StdEncoding.EncodeToString(sum[:]) {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `<Error><Code>BadDigest</Code><Message>wrong digest</Message></Error>`)
+			return
+		}
+		withMD5.Add(1)
+		w.Header().Set("Content-Type", "application/xml")
+		io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`)
+	}))
+	defer srv.Close()
+	st, err := NewS3Store(context.Background(), S3Options{Bucket: "b", Prefix: "p", Endpoint: srv.URL, Region: "us-east-1",
+		ForcePathStyle: true, AccessKeyID: "k", SecretKey: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := st.Delete(context.Background(), "ref/wal/a.zst", "ref/wal/b.zst"); err != nil {
+			t.Fatalf("delete #%d: %v", i+1, err)
+		}
+	}
+	// The first call is refused once and repeated with Content-MD5; the second goes straight there.
+	if plain.Load() != 1 || withMD5.Load() != 2 {
+		t.Fatalf("requests without MD5 = %d, with MD5 = %d; want 1 and 2", plain.Load(), withMD5.Load())
+	}
+}
+
+// A service that does not ask for Content-MD5 never gets it, and other errors are not retried.
+func TestS3DeleteDoesNotRetryOtherErrors(t *testing.T) {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>no</Message></Error>`)
+	}))
+	defer srv.Close()
+	st, err := NewS3Store(context.Background(), S3Options{Bucket: "b", Endpoint: srv.URL, Region: "us-east-1",
+		ForcePathStyle: true, AccessKeyID: "k", SecretKey: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Delete(context.Background(), "ref/wal/a.zst"); err == nil {
+		t.Fatal("AccessDenied was swallowed")
+	}
+	if n.Load() != 1 || st.needMD5.Load() {
+		t.Fatalf("requests = %d, needMD5 = %v", n.Load(), st.needMD5.Load())
 	}
 }

@@ -23,6 +23,9 @@ func init() {
 	wal := &cobra.Command{
 		Use:   "wal",
 		Short: "WAL archive commands used by PostgreSQL (archive_command and restore_command)",
+		// Postgres runs these as its own (sbctl) user. Run by hand as root they would create
+		// root-owned objects in a file backend.
+		PersistentPreRunE: func(*cobra.Command, []string) error { return refuseRoot(os.Geteuid()) },
 	}
 	push := &cobra.Command{
 		Use:   "push --ref <ref> <path>",

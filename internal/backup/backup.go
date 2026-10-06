@@ -10,7 +10,9 @@
 //	<ref>/base/<id>/backup.json              the manifest; written last, so its presence
 //	                                         means the base backup is complete
 //
-// <id> is the backup start time, UTC, as 20060102T150405Z.
+// <id> is the backup start time, UTC, as 20060102T150405Z, plus "-" and six random hex
+// digits (20060102T150405Z-3f9a1c), so two backups that start in the same second never
+// share a directory.
 package backup
 
 import (

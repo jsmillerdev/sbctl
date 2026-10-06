@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // tmpMarker is part of the name of in-flight files in the file store. List skips them.
@@ -186,6 +187,44 @@ func (s *FileStore) Delete(_ context.Context, keys ...string) error {
 		}
 	}
 	return nil
+}
+
+var _ TempCleaner = (*FileStore)(nil)
+
+// DeleteStaleTemps implements TempCleaner: it removes *.tmp-* files that a crashed Put
+// left behind and that have not been written to since cutoff.
+func (s *FileStore) DeleteStaleTemps(ctx context.Context, prefix string, cutoff time.Time) (int, error) {
+	n := 0
+	err := filepath.WalkDir(filepath.Join(s.root, filepath.FromSlash(prefix)), func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if d.IsDir() || !strings.Contains(d.Name(), tmpMarker) {
+			return nil
+		}
+		fi, err := d.Info()
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !fi.ModTime().Before(cutoff) {
+			return nil // a Put in flight
+		}
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		n++
+		return nil
+	})
+	return n, err
 }
 
 // mkdirAllSync is os.MkdirAll that also fsyncs the parent of every directory it creates.

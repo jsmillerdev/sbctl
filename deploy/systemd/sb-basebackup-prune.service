@@ -1,0 +1,16 @@
+[Unit]
+Description=sbctl backup retention for every project and every deleted project's archive
+
+[Service]
+Type=oneshot
+User=sbctl
+Group=sbctl
+Slice=sbctl.slice
+EnvironmentFile=-/etc/sbctl/sbctl.env
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=/usr/local/bin/sbctl backups prune
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes

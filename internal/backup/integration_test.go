@@ -110,12 +110,20 @@ func (p *pgInstance) ctl(args ...string) ([]byte, error) {
 
 func (p *pgInstance) start() {
 	p.t.Helper()
+	if err := p.tryStart(); err != nil {
+		p.t.Fatal(err)
+	}
+}
+
+// tryStart is start that returns the failure, with the server log, instead of failing the test.
+func (p *pgInstance) tryStart() error {
 	out, err := p.ctl("-w", "-t", "120", "-l", p.log, "-o", fmt.Sprintf("-p %d", p.port), "start")
+	p.t.Cleanup(p.stop)
 	if err != nil {
 		log, _ := os.ReadFile(p.log)
-		p.t.Fatalf("pg_ctl start: %v\n%s\n--- server log ---\n%s", err, out, tail(log, 4000))
+		return fmt.Errorf("pg_ctl start: %v\n%s\n--- server log ---\n%s", err, out, tail(log, 4000))
 	}
-	p.t.Cleanup(p.stop)
+	return nil
 }
 
 // stop shuts the server down; it is safe to call when it is not running.
@@ -210,6 +218,9 @@ type pgManager struct {
 	root   string
 	access *portAccess
 	insts  map[string]*pgInstance
+	// failStart makes Create return pg_ctl's failure instead of failing the test: a cluster
+	// that dies in recovery may do so before pg_ctl sees it accept connections.
+	failStart bool
 }
 
 func (m *pgManager) Create(ctx context.Context, req lifecycle.CreateRequest) (*registry.Project, error) {
@@ -223,7 +234,13 @@ func (m *pgManager) Create(ctx context.Context, req lifecycle.CreateRequest) (*r
 	m.access.set(req.Ref, inst.port)
 	// Return as soon as the server accepts connections, like lifecycle's health check:
 	// with hot_standby on that can be while recovery is still replaying WAL.
-	inst.start()
+	if m.failStart {
+		if err := inst.tryStart(); err != nil {
+			return nil, err
+		}
+	} else {
+		inst.start()
+	}
 	if err := m.e.reg.CreateProject(ctx, p); err != nil {
 		return nil, err
 	}
@@ -529,5 +546,90 @@ func TestBaseBackupRefusals(t *testing.T) {
 	}
 	if rows, _ := e.reg.ListBackups(ctx, testRef); len(rows) != 1 || rows[0].Status != registry.BackupFailed {
 		t.Fatalf("rows = %+v", rows)
+	}
+}
+
+// Restoring a running source to a recent time: the commit after the target is in the
+// current WAL segment, which the archiver has not shipped (archive_timeout is minutes
+// away). The restore must archive it first, or recovery runs out of WAL, Postgres shuts
+// down with "recovery ended before configured recovery target was reached", and a dead
+// project would be reported as restored. A target after the newest commit still cannot
+// be reached, and that must be an error, not a registered corpse.
+func TestRestoreRunningSourceToRecentTime(t *testing.T) {
+	bin := pgBinDir(t)
+	sbctl := sbctlBinary(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	archiveDir := filepath.Join(root, "archive")
+	st, err := NewFileStore(archiveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newTestEnv(t)
+	e.now = time.Now()
+	e.svc.opt.Now = time.Now
+	cfgPath := filepath.Join(root, "sbctl.toml")
+	writeFile(t, cfgPath, []byte(fmt.Sprintf("state_dir = %q\nbin_path = %q\n\n[backup]\nbackend = %q\nretention_days = 7\n",
+		filepath.Join(root, "state"), sbctl, "file://"+archiveDir)))
+	e.cfg.BinPath = sbctl
+	e.svc.opt.Store, e.store = st, nil
+	e.svc.opt.ConfigPath = cfgPath
+	e.svc.opt.RecoveryPoll = 200 * time.Millisecond
+	e.svc.opt.RecoveryFailGrace = 3 * time.Second
+
+	src := newSourceCluster(t, bin, root, testRef, ArchiveSettings(e.cfg, testRef, cfgPath))
+	src.start()
+	e.addProject(t, testRef)
+	access := &portAccess{ports: map[string]int{testRef: src.port}}
+	mgr := &pgManager{t: t, e: e, bin: bin, root: root, access: access, insts: map[string]*pgInstance{testRef: src}}
+	e.svc.opt.Access, e.svc.opt.Manager = access, mgr
+
+	c := src.connect(ctx)
+	mustExec := func(sql string) {
+		t.Helper()
+		if _, err := c.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	mustExec("create table public.t (id int primary key)")
+	mustExec("insert into public.t values (1)")
+	if _, err := e.svc.BaseBackup(ctx, testRef); err != nil {
+		t.Fatal(err)
+	}
+	mustExec("insert into public.t values (2)")
+	var target time.Time
+	if err := c.QueryRow(ctx, "select clock_timestamp()").Scan(&target); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	mustExec("insert into public.t values (3)") // the commit after the target, not archived yet
+
+	p, err := e.svc.Restore(ctx, testRef, target, testRef2)
+	if err != nil {
+		t.Fatalf("restore of a running source to a recent time: %v", err)
+	}
+	clone := mgr.insts[p.Ref]
+	if ids := queryIDs(t, ctx, clone.connect(ctx)); idsString(ids) != "[1 2]" {
+		t.Fatalf("restored rows = %v, want [1 2]", ids)
+	}
+	clone.stop()
+
+	// A target after the newest commit: no commit follows it, so recovery cannot stop there.
+	mgr.failStart = true
+	time.Sleep(1200 * time.Millisecond)
+	var late time.Time
+	if err := c.QueryRow(ctx, "select clock_timestamp()").Scan(&late); err != nil {
+		t.Fatal(err)
+	}
+	p3, err := e.svc.Restore(ctx, testRef, late, testRef3)
+	if err == nil {
+		t.Fatalf("restore to a time after the last commit succeeded: %+v", p3)
+	}
+	t.Logf("restore past the last commit failed as it must: %v", err)
+	evs, _ := e.reg.ListEvents(ctx, testRef, 20)
+	for _, ev := range evs {
+		if ev.Kind == "restore.completed" && strings.Contains(string(ev.Payload), testRef3) {
+			t.Fatal("a failed restore was recorded as completed")
+		}
 	}
 }

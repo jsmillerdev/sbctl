@@ -1,8 +1,10 @@
 package backup
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/OWNER/sbctl/internal/config"
 )
@@ -27,6 +29,32 @@ const (
 // backups` warns when it is readable by group or others.
 const EnvFile = "/etc/sbctl/sbctl.env"
 
+// The node-wide prune pair covers what the per-project timers cannot: a deleted project's
+// timer is gone, but its final backup and WAL stay in the backend and must still age out.
+// It runs `sbctl backups prune` without a ref, which prunes every ref in the registry and
+// in the backend. Enable it once per node: systemctl enable --now sb-basebackup-prune.timer.
+const (
+	PruneServiceUnit = "sb-basebackup-prune.service"
+	PruneTimerUnit   = "sb-basebackup-prune.timer"
+	// PruneOnCalendar is when the node-wide prune runs: after the nightly base backups.
+	PruneOnCalendar = "*-*-* 05:00:00"
+)
+
+// ValidateOnCalendar rejects a calendar expression that cannot be put in a unit file as
+// is: empty, or containing a control character (a newline would inject directives).
+// Whether systemd understands the expression is for `systemd-analyze calendar` to say.
+func ValidateOnCalendar(s string) error {
+	if strings.TrimSpace(s) == "" {
+		return errors.New("OnCalendar expression is empty")
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("OnCalendar expression %q contains a control character", s)
+		}
+	}
+	return nil
+}
+
 // BackupTimerInstance is the timer instance to enable for ref.
 func BackupTimerInstance(ref string) string { return "sb-basebackup@" + ref + ".timer" }
 
@@ -47,7 +75,10 @@ Slice=%s
 # SBCTL_REGISTRY_DSN (and any other SBCTL_* override) for processes outside the daemon.
 EnvironmentFile=-%s
 Nice=10
-IOSchedulingClass=idle
+# Not "idle": an idle-class backup can be starved indefinitely on a busy disk while
+# pg_backup_start() is held, which keeps the cluster in backup mode.
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 ExecStart=%s backups create %%i --reason scheduled
 ExecStart=%s backups prune %%i
 NoNewPrivileges=yes
@@ -59,7 +90,23 @@ ProtectHome=yes
 // RenderBackupTimer renders sb-basebackup@.timer. onCalendar is a systemd OnCalendar
 // expression (config.Backup.BaseBackupOnCalendar). The randomized delay spreads many
 // projects over a quarter of an hour instead of starting them in the same second.
+//
+// An invalid expression (see ValidateOnCalendar) never reaches the unit file: the
+// default schedule is rendered instead. Callers that want the error use
+// RenderBackupTimerChecked.
 func RenderBackupTimer(onCalendar string) string {
+	t, err := RenderBackupTimerChecked(onCalendar)
+	if err != nil {
+		t, _ = RenderBackupTimerChecked(config.Default().Backup.BaseBackupOnCalendar)
+	}
+	return t
+}
+
+// RenderBackupTimerChecked is RenderBackupTimer that reports an invalid expression.
+func RenderBackupTimerChecked(onCalendar string) (string, error) {
+	if err := ValidateOnCalendar(onCalendar); err != nil {
+		return "", err
+	}
 	return fmt.Sprintf(`[Unit]
 Description=Nightly sbctl base backup of project %%i
 
@@ -70,7 +117,43 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
-`, onCalendar)
+`, onCalendar), nil
+}
+
+// RenderPruneService renders sb-basebackup-prune.service for the sbctl binary at binPath.
+func RenderPruneService(binPath string) string {
+	return fmt.Sprintf(`[Unit]
+Description=sbctl backup retention for every project and every deleted project's archive
+
+[Service]
+Type=oneshot
+User=sbctl
+Group=sbctl
+Slice=%s
+EnvironmentFile=-%s
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=%s backups prune
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+`, config.Slice, EnvFile, unitExec(binPath))
+}
+
+// RenderPruneTimer renders sb-basebackup-prune.timer.
+func RenderPruneTimer() string {
+	return fmt.Sprintf(`[Unit]
+Description=Daily sbctl backup retention
+
+[Timer]
+OnCalendar=%s
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+`, PruneOnCalendar)
 }
 
 // unitExec quotes a path for an ExecStart= line.
