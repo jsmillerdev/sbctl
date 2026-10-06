@@ -1,1 +1,29 @@
-# Workstream A: build environment for platform-mode Studio.
+# Reproducible build of the platform-mode Studio artifact. Same steps as running studio/build.sh
+# on a CI runner; the image only provides a clean Ubuntu with the tools build.sh needs.
+#
+#   docker buildx build --platform linux/amd64 -f studio/Dockerfile.build --target artifact \
+#       --output type=local,dest=studio/dist .
+#
+# The build context is the repository root. The output directory receives
+# sbctl-studio-<tag>-p<N>-linux-<arch>.tar.zst and SHA256SUMS. The build needs about 8 GB of RAM
+# (give the Docker VM 10 GB or more) and 9 GB of disk.
+FROM ubuntu:24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl git python3 build-essential zstd xz-utils procps && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /sbctl
+COPY versions.yaml LICENSE ./
+COPY studio ./studio
+
+# build.sh names the artifact after the host architecture (no cross builds), so the container's
+# architecture decides the platform.
+RUN set -eux; \
+    case "$(uname -m)" in x86_64) platform=linux-amd64 ;; aarch64) platform=linux-arm64 ;; *) exit 1 ;; esac; \
+    STUDIO_OUT=/out studio/build.sh "$platform"
+
+FROM scratch AS artifact
+COPY --from=build /out/ /
