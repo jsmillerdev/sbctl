@@ -1,0 +1,7 @@
+.worktrees/
+/bin/
+/dist/
+*.tar.zst
+.build-cache/
+node_modules/
+.DS_Store
