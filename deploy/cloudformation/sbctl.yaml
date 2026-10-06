@@ -1,0 +1,4 @@
+# Workstream G: one-click AWS stack.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: sbctl node (not implemented)
+Resources: {}

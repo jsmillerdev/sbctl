@@ -1,0 +1,19 @@
+# Pinned upstream releases. Artifacts come from github.com/supabase/slim-services/releases
+# (tag = <service>-<upstream version>-r<packaging revision>). Bump through a PR; the
+# conformance suite gates the merge. Never hand-guess a tag: copy it from the releases page.
+artifacts:
+  postgres: postgres-17.11.0.004-r1
+  auth: auth-v2.195.0-r1
+  postgrest: postgrest-v16.4-r0
+  pooler: pooler-v2.9.13-r1
+  realtime: realtime-v2.140.10-r0
+  storage: storage-v1.79.36-r0
+  pgmeta: pgmeta-v0.100.0-r0
+  imgproxy: imgproxy-v3.26.0-r0
+  edge-runtime: edge-runtime-v1.77.4-r0
+studio:
+  # Upstream Studio git ref we build in platform mode (studio/build.sh). The slim
+  # studio artifact of the same upstream version is studio-2026.10.05-sha-94b8b06-r0.
+  tag: 2026.10.05-sha-94b8b06
+cli:
+  version_tested: ""

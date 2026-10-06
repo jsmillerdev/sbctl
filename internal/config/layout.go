@@ -1,0 +1,180 @@
+package config
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+// SystemRef is the reserved ref of the system project (registry, fleet metadata, dashboard auth).
+const SystemRef = "system"
+
+// Default ports (HANDOFF.md section 1). Everything except Supavisor and the public
+// proxy listens on loopback only. All of them can be changed in [ports] so that dev
+// machines and tests can run several nodes side by side.
+const (
+	PortSupavisorSession     = 5432 // public
+	PortSupavisorTransaction = 6543 // public
+	PortSystemPostgres       = 5433
+	PortSystemGoTrue         = 9999
+	PortRealtime             = 4000
+	PortStorage              = 5000
+	PortStorageAdmin         = 5001
+	PortImgproxy             = 5002
+	PortPGMeta               = 8080
+	PortStudio               = 3000
+	PortEdgeRuntime          = 9000
+	PortAdmin                = 7000
+	PortProjectBase          = 20000
+)
+
+// Ports is the [ports] config section.
+type Ports struct {
+	// ProjectBase: project n gets Postgres ProjectBase+3n, GoTrue +1, PostgREST +2.
+	ProjectBase          int `toml:"project_base"`
+	SupavisorSession     int `toml:"supavisor_session"`
+	SupavisorTransaction int `toml:"supavisor_transaction"`
+	SystemPostgres       int `toml:"system_postgres"`
+	SystemGoTrue         int `toml:"system_gotrue"`
+	Realtime             int `toml:"realtime"`
+	Storage              int `toml:"storage"`
+	StorageAdmin         int `toml:"storage_admin"`
+	Imgproxy             int `toml:"imgproxy"`
+	PGMeta               int `toml:"pgmeta"`
+	Studio               int `toml:"studio"`
+	EdgeRuntime          int `toml:"edge_runtime"`
+}
+
+// DefaultPorts returns the production port plan.
+func DefaultPorts() Ports {
+	return Ports{
+		ProjectBase: PortProjectBase, SupavisorSession: PortSupavisorSession, SupavisorTransaction: PortSupavisorTransaction,
+		SystemPostgres: PortSystemPostgres, SystemGoTrue: PortSystemGoTrue, Realtime: PortRealtime, Storage: PortStorage,
+		StorageAdmin: PortStorageAdmin, Imgproxy: PortImgproxy, PGMeta: PortPGMeta, Studio: PortStudio, EdgeRuntime: PortEdgeRuntime,
+	}
+}
+
+// ProjectPorts are the loopback ports of a project's own units. Zero means the
+// project has no such unit.
+type ProjectPorts struct {
+	Postgres  int
+	GoTrue    int
+	PostgREST int
+}
+
+// MaxProjectSeq is the largest sequence whose ports fit below 65536.
+func (c *Config) MaxProjectSeq() int { return (65535 - c.Ports.ProjectBase - 2) / 3 }
+
+// PortsFor returns the ports of a project with registry sequence seq. User projects
+// use seq >= 1; the system project has fixed ports and no PostgREST.
+func (c *Config) PortsFor(ref string, seq int) ProjectPorts {
+	if ref == SystemRef {
+		return ProjectPorts{Postgres: c.Ports.SystemPostgres, GoTrue: c.Ports.SystemGoTrue}
+	}
+	b := c.Ports.ProjectBase + 3*seq
+	return ProjectPorts{Postgres: b, GoTrue: b + 1, PostgREST: b + 2}
+}
+
+// Service names, as used in unit names, env file names, artifact directories and
+// project subdirectories. The artifact (slim-services) name can differ: see ArtifactName.
+const (
+	SvcPostgres    = "postgres"
+	SvcGoTrue      = "gotrue"
+	SvcPostgREST   = "postgrest"
+	SvcSupavisor   = "supavisor"
+	SvcRealtime    = "realtime"
+	SvcStorage     = "storage"
+	SvcPGMeta      = "pgmeta"
+	SvcStudio      = "studio"
+	SvcImgproxy    = "imgproxy"
+	SvcEdgeRuntime = "edge-runtime"
+)
+
+// ProjectServices are templated per project; the rest are fleet singletons.
+var ProjectServices = []string{SvcPostgres, SvcGoTrue, SvcPostgREST}
+
+// ArtifactName maps a service to its slim-services release name (versions.yaml key).
+func ArtifactName(svc string) string {
+	switch svc {
+	case SvcGoTrue:
+		return "auth"
+	case SvcSupavisor:
+		return "pooler"
+	}
+	return svc
+}
+
+// UnitName returns the systemd unit for a service. Project services are template
+// instances (sb-postgres@<ref>.service); fleet services are singletons (sb-realtime.service).
+func UnitName(svc, ref string) string {
+	for _, s := range ProjectServices {
+		if s == svc {
+			return fmt.Sprintf("sb-%s@%s.service", svc, ref)
+		}
+	}
+	return "sb-" + svc + ".service"
+}
+
+// Slice is the systemd slice every sbctl unit runs in.
+const Slice = "sbctl.slice"
+
+// Paths is the state-directory layout under StateDir:
+//
+//	artifacts/<service>/<version>/   unpacked artifacts (artifacts/.cache holds archives)
+//	projects/<ref>/<svc>/            per-project service state (projects/system is the system project)
+//	projects/<ref>/<svc>.env         unit environment files, 0600
+//	system/<svc>/                    fleet service state (storage file backend, studio, ...)
+//	certs/                           CertMagic storage
+//	backups/                         local backup backend (file://)
+type Paths struct{ Root string }
+
+func (c *Config) Paths() Paths { return Paths{Root: c.StateDir} }
+
+func (p Paths) Artifacts() string { return filepath.Join(p.Root, "artifacts") }
+func (p Paths) Artifact(svc, version string) string {
+	return filepath.Join(p.Root, "artifacts", ArtifactName(svc), version)
+}
+func (p Paths) Project(ref string) string { return filepath.Join(p.Root, "projects", ref) }
+func (p Paths) ProjectService(ref, svc string) string {
+	return filepath.Join(p.Root, "projects", ref, svc)
+}
+func (p Paths) EnvFile(ref, svc string) string {
+	return filepath.Join(p.Root, "projects", ref, svc+".env")
+}
+func (p Paths) System(svc string) string { return filepath.Join(p.Root, "system", svc) }
+func (p Paths) Certs() string            { return filepath.Join(p.Root, "certs") }
+func (p Paths) Backups() string          { return filepath.Join(p.Root, "backups") }
+
+// BaseDomain is Domain, or "<public_ip>.sslip.io" when no domain is configured.
+func (c *Config) BaseDomain() string {
+	if c.Domain != "" {
+		return strings.TrimSuffix(strings.ToLower(c.Domain), ".")
+	}
+	if c.PublicIP != "" {
+		return strings.ReplaceAll(c.PublicIP, ":", "-") + ".sslip.io"
+	}
+	return ""
+}
+
+// Hostnames (HANDOFF.md section 1).
+func (c *Config) ProjectHost(ref string) string { return ref + ".api." + c.BaseDomain() }
+func (c *Config) StudioHost() string            { return "studio." + c.BaseDomain() }
+func (c *Config) APIHost() string               { return "api." + c.BaseDomain() }
+func (c *Config) PoolerHost() string            { return "pooler." + c.BaseDomain() }
+
+// RefFromProjectHost returns the ref of "<ref>.api.<base>" or "" if host is not a project host.
+func (c *Config) RefFromProjectHost(host string) string {
+	host = strings.ToLower(host)
+	if h, _, ok := strings.Cut(host, ":"); ok {
+		host = h
+	}
+	suffix := ".api." + c.BaseDomain()
+	if c.BaseDomain() == "" || !strings.HasSuffix(host, suffix) {
+		return ""
+	}
+	return strings.TrimSuffix(host, suffix)
+}
+
+// RealtimeInternalHost is the Host header sbctl sends to Realtime; Realtime resolves
+// the tenant from the first label.
+func RealtimeInternalHost(ref string) string { return ref + ".realtime.internal" }
