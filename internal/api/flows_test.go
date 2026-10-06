@@ -378,3 +378,102 @@ func TestHealth(t *testing.T) {
 		t.Fatalf("health: %s", rec.Body)
 	}
 }
+
+func TestPlatformProjectOperations(t *testing.T) {
+	f := newFixture(t)
+	ref := testRef
+	if rec := f.do("POST", "/platform/projects/"+ref+"/pause", nil); rec.Code != 201 {
+		t.Fatalf("pause: %d", rec.Code)
+	}
+	if rec := f.do("GET", "/platform/projects/"+ref+"/status", nil); jsonField(t, rec, "status") != "INACTIVE" {
+		t.Fatalf("status: %s", rec.Body)
+	}
+	if rec := f.do("POST", "/platform/projects/"+ref+"/restore", nil); rec.Code != 201 {
+		t.Fatalf("restore: %d", rec.Code)
+	}
+	if rec := f.do("POST", "/platform/projects/"+ref+"/restart", nil); rec.Code != 201 || len(f.mgr.paused) != 2 || len(f.mgr.resumed) != 2 {
+		t.Fatalf("restart: %d paused=%v resumed=%v", rec.Code, f.mgr.paused, f.mgr.resumed)
+	}
+	if rec := f.do("PATCH", "/platform/projects/"+ref, map[string]any{"name": "Platform name"}); rec.Code != 200 {
+		t.Fatalf("patch: %d %s", rec.Code, rec.Body)
+	} else {
+		validateAgainstSpec(t, "PATCH /platform/projects/{ref}", rec.Body.Bytes())
+	}
+	if rec := f.do("DELETE", "/platform/projects/"+ref, nil); rec.Code != 200 {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body)
+	} else {
+		validateAgainstSpec(t, "DELETE /platform/projects/{ref}", rec.Body.Bytes())
+	}
+	if rec := f.do("GET", "/platform/projects", nil); jsonField(t, rec, "pagination.count") != float64(0) {
+		t.Fatalf("list after delete: %s", rec.Body)
+	}
+}
+
+func TestMiscRoutes(t *testing.T) {
+	f := newFixture(t)
+	f.run(t, []step{
+		{key: "POST /platform/organizations", body: map[string]any{"name": "Second Team"}, status: 201, check: want("slug", "second-team")},
+		{key: "GET /v1/projects/{ref}/branches/{name}", path: "/v1/projects/" + testRef + "/branches/main", status: 404},
+		{key: "GET /v1/branches/{branch_id_or_ref}", path: "/v1/branches/abc", status: 404},
+		{key: "PUT /v1/projects/{ref}/api-keys/legacy", path: "/v1/projects/" + testRef + "/api-keys/legacy?enabled=true"},
+		{key: "POST /v1/projects/{ref}/functions", body: map[string]any{"slug": "legacy", "name": "Legacy", "verify_jwt": false}, status: 201, check: want("verify_jwt", false)},
+	})
+	rec := f.do("GET", "/platform/projects/"+testRef+"/settings", nil)
+	if jsonField(t, rec, "jwt_secret") == nil || !strings.Contains(rec.Body.String(), "service_role") {
+		t.Fatalf("settings carry the keys the dashboard shows: %s", rec.Body)
+	}
+	tok := decodeBody(t, f.do("POST", "/platform/profile/access-tokens", map[string]any{"name": "t"})).(map[string]any)
+	id := itoa(int64(tok["id"].(float64)))
+	if rec := f.do("GET", "/platform/profile/access-tokens/"+id, nil); rec.Code != 200 {
+		t.Fatalf("get token: %d", rec.Code)
+	} else {
+		validateAgainstSpec(t, "GET /platform/profile/access-tokens/{id}", rec.Body.Bytes())
+	}
+}
+
+// TestProxyRoutes calls every proxy route once against a fake upstream.
+func TestProxyRoutes(t *testing.T) {
+	f := newFixture(t)
+	var paths []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+	f.srv.upstreamOverride = func(*registry.Project, string) string { return up.URL }
+	n := 0
+	call := func(key string) {
+		method, tmpl, _ := strings.Cut(key, " ")
+		path := strings.NewReplacer("{ref}", testRef, "{id}", "id1").Replace(tmpl)
+		var body any
+		if method != "GET" {
+			body = map[string]any{"paths": []string{"x"}}
+		}
+		if rec := f.do(method, path, body); rec.Code != 200 {
+			t.Errorf("%s: %d %s", key, rec.Code, rec.Body)
+		}
+		n++
+	}
+	for key := range authMap {
+		call(key)
+	}
+	for key := range storageMap {
+		call(key)
+	}
+	ops, _ := Operations()
+	for _, op := range ops {
+		if strings.HasPrefix(op.Path, "/platform/pg-meta/{ref}/") {
+			path := strings.ReplaceAll(op.Path, "{ref}", testRef)
+			if rec := f.do(op.Method, path, map[string]any{"query": "select 1"}); rec.Code != 200 {
+				t.Errorf("%s: %d %s", op.Key(), rec.Code, rec.Body)
+			}
+			if got := f.meta.last(); got.Method != op.Method || got.Path != strings.TrimPrefix(path, "/platform/pg-meta/"+testRef) {
+				t.Errorf("%s forwarded as %s %s", op.Key(), got.Method, got.Path)
+			}
+		}
+	}
+	if len(paths) != n {
+		t.Errorf("%d upstream requests for %d proxy calls: %v", len(paths), n, paths)
+	}
+}

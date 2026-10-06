@@ -376,3 +376,14 @@ func TestIntegrationServe(t *testing.T) {
 		}
 	}
 }
+
+// TestIntegrationStore runs the Store conformance suite against the Postgres store
+// and the migrations of internal/registry/migrations/0100_api.sql.
+func TestIntegrationStore(t *testing.T) {
+	s := startStack(t)
+	pg, ok := s.Server.store.(*PGStore)
+	if !ok {
+		t.Fatalf("expected the Postgres store, got %T", s.Server.store)
+	}
+	testStore(t, pg, s.Ref)
+}

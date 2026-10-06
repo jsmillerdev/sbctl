@@ -235,6 +235,43 @@ func (s *Server) routesPlatformProject(add func(string, handlerFunc)) {
 	add("POST /platform/projects/{ref}/api-keys/temporary", s.temporaryKey)
 	add("GET /v2/projects/{ref}/config", s.v2Config)
 	add("GET /platform/database/{ref}/backups", s.platformBackups)
+	add("GET /platform/projects/{ref}/config/storage", s.storageConfig("GET /platform/projects/{ref}/config/storage"))
+	add("GET /v1/projects/{ref}/config/storage", s.storageConfig("GET /v1/projects/{ref}/config/storage"))
+	add("GET /platform/projects/{ref}/config/pgbouncer", s.pgbouncerConfig)
+	add("GET /platform/projects/{ref}/config/supavisor", s.v1Pooler)
+}
+
+// storageConfig reports Storage's defaults. Per-project storage settings are not
+// stored yet, so PATCH keeps answering with a stub.
+func (s *Server) storageConfig(key string) handlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := s.loadProject(r.Context(), r.PathValue("ref")); err != nil {
+			return err
+		}
+		resp := base(key)
+		set(resp, "fileSizeLimit", 50*1024*1024) // Storage's FILE_SIZE_LIMIT default
+		writeJSON(w, http.StatusOK, resp)
+		return nil
+	}
+}
+
+// pgbouncerConfig describes the shared pooler entry (Supavisor) in the shape the
+// dashboard's database settings page reads.
+func (s *Server) pgbouncerConfig(w http.ResponseWriter, r *http.Request) error {
+	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
+	if err != nil {
+		return err
+	}
+	user := "postgres." + p.Ref
+	resp := base("GET /platform/projects/{ref}/config/pgbouncer")
+	setAll(resp, map[string]any{
+		"connection_string": fmt.Sprintf("postgres://%s:[YOUR-PASSWORD]@%s:%d/postgres", user, s.cfg.PoolerHost(), s.cfg.Ports.SupavisorTransaction),
+		"db_dns_name":       s.cfg.PoolerHost(), "db_host": s.cfg.PoolerHost(), "db_name": "postgres",
+		"db_port": s.cfg.Ports.SupavisorTransaction, "db_user": user, "inserted_at": ts(p.CreatedAt),
+		"pgbouncer_enabled": true, "pool_mode": "transaction", "ssl_enforced": false,
+	})
+	writeJSON(w, http.StatusOK, resp)
+	return nil
 }
 
 func (s *Server) platformSettings(w http.ResponseWriter, r *http.Request) error {

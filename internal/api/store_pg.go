@@ -80,7 +80,7 @@ func (s *PGStore) ListUsers(ctx context.Context) ([]User, error) {
 func (s *PGStore) PutLoginSession(ctx context.Context, l LoginSession) error {
 	_, err := s.pool.Exec(ctx, `
 		insert into sbctl.api_cli_login_sessions (session_id, user_id, token_id, server_public_key, nonce, ciphertext, expires_at)
-		values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
+		values ($1::uuid, $2::uuid, nullif($3::bigint, 0), $4, $5, $6, $7)
 		on conflict (session_id) do update set user_id = excluded.user_id, token_id = excluded.token_id,
 		  server_public_key = excluded.server_public_key, nonce = excluded.nonce, ciphertext = excluded.ciphertext,
 		  expires_at = excluded.expires_at`,

@@ -47,10 +47,11 @@ type authenticator struct {
 	secret    string
 	secretAt  time.Time
 	touchedAt map[int64]time.Time
+	seenAt    map[string]time.Time // dashboard users by id: last time their row was refreshed
 }
 
 func newAuthenticator(reg registry.Registry, keys func(context.Context, string) (*secrets.ProjectKeys, error), store Store, now func() time.Time) *authenticator {
-	return &authenticator{reg: reg, keys: keys, store: store, now: now, touchedAt: map[int64]time.Time{}}
+	return &authenticator{reg: reg, keys: keys, store: store, now: now, touchedAt: map[int64]time.Time{}, seenAt: map[string]time.Time{}}
 }
 
 // systemSecret returns the HS256 secret of sb-gotrue@system, cached briefly.
@@ -154,9 +155,20 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 	}
 	email, _ := claims["email"].(string)
 	p := &Principal{UserID: sub, Email: email, Via: "jwt"}
-	meta, _ := claims["user_metadata"].(map[string]any)
-	if _, err := a.store.UpsertUser(ctx, userFromClaims(sub, email, meta)); err != nil {
-		return nil, err
+	// Record the user on first sight, then at most once a minute: every dashboard
+	// request carries a JWT and none of them should write to the database.
+	now := a.now()
+	a.mu.Lock()
+	last, seen := a.seenAt[sub]
+	a.mu.Unlock()
+	if !seen || now.Sub(last) >= touchEvery {
+		meta, _ := claims["user_metadata"].(map[string]any)
+		if _, err := a.store.UpsertUser(ctx, userFromClaims(sub, email, meta)); err != nil {
+			return nil, err
+		}
+		a.mu.Lock()
+		a.seenAt[sub] = now
+		a.mu.Unlock()
 	}
 	return p, nil
 }

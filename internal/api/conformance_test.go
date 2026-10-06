@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -76,7 +77,7 @@ func (f *fixture) run(t *testing.T, steps []step) {
 			if rec.Header().Get("X-Sbctl-Stub") != "" {
 				t.Errorf("%s is served by a stub but is expected to be implemented", st.key)
 			}
-			if rec.Body.Len() > 0 {
+			if rec.Body.Len() > 0 && rec.Code < 300 {
 				validateAgainstSpec(t, st.key, rec.Body.Bytes())
 			}
 			if st.check != nil {
@@ -111,10 +112,12 @@ func want(path string, expected any) func(*testing.T, *httptest.ResponseRecorder
 	return func(t *testing.T, rec *httptest.ResponseRecorder) {
 		t.Helper()
 		got := jsonField(t, rec, path)
-		switch got.(type) {
+		switch x := got.(type) {
 		case []any, map[string]any:
 			b, _ := json.Marshal(got)
 			got = string(b)
+		case float64:
+			got = strconv.FormatFloat(x, 'f', -1, 64)
 		}
 		if fmt.Sprint(got) != fmt.Sprint(expected) {
 			t.Errorf("%s = %v, want %v", path, got, expected)
@@ -169,6 +172,10 @@ func TestImplementedRoutesMatchSpec(t *testing.T) {
 		{key: "GET /platform/projects/{ref}/config/postgrest"},
 		{key: "POST /platform/projects/{ref}/api-keys/temporary"},
 		{key: "GET /v2/projects/{ref}/config", check: want("data.id", testRef)},
+		{key: "GET /platform/projects/{ref}/config/storage", check: want("fileSizeLimit", 52428800)},
+		{key: "GET /v1/projects/{ref}/config/storage", check: want("fileSizeLimit", 52428800)},
+		{key: "GET /platform/projects/{ref}/config/pgbouncer", check: want("pool_mode", "transaction")},
+		{key: "GET /platform/projects/{ref}/config/supavisor", check: want("0.identifier", testRef)},
 		{key: "GET /platform/database/{ref}/backups", path: "/platform/database/" + testRef + "/backups"},
 		// keys
 		{key: "GET /v1/projects/{ref}/api-keys", path: "/v1/projects/" + testRef + "/api-keys?reveal=true", check: want("0.name", "anon")},

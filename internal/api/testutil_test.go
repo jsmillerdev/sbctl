@@ -260,8 +260,12 @@ func (f *fixture) do(method, path string, body any, headers ...string) *httptest
 	return f.doAs(f.jwt, method, path, body, headers...)
 }
 
+// calledRoutes records every "METHOD path" the tests send, for the coverage check.
+var calledRoutes sync.Map
+
 func (f *fixture) doAs(token, method, path string, body any, headers ...string) *httptest.ResponseRecorder {
 	f.t.Helper()
+	calledRoutes.Store(method+" "+strings.SplitN(path, "?", 2)[0], true)
 	var rd io.Reader
 	switch b := body.(type) {
 	case nil:
