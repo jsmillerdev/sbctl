@@ -318,3 +318,60 @@ func TestCreateDatabaseRefusesExistingCluster(t *testing.T) {
 		t.Fatal("existing data was touched")
 	}
 }
+
+// recSup is a Supervisor that records calls, reports a fixed state and a configurable
+// "changed" result from RenderChanged.
+type recSup struct {
+	calls   []string
+	state   units.State
+	changed bool
+}
+
+func (r *recSup) Render(context.Context, units.Spec) error {
+	r.calls = append(r.calls, "render")
+	return nil
+}
+func (r *recSup) RenderChanged(context.Context, units.Spec) (bool, error) {
+	r.calls = append(r.calls, "render")
+	return r.changed, nil
+}
+func (r *recSup) Start(context.Context, string) error { r.calls = append(r.calls, "start"); return nil }
+func (r *recSup) Stop(context.Context, string) error  { r.calls = append(r.calls, "stop"); return nil }
+func (r *recSup) Remove(context.Context, string) error {
+	r.calls = append(r.calls, "remove")
+	return nil
+}
+func (r *recSup) Status(context.Context, string) (units.Status, error) {
+	return units.Status{State: r.state}, nil
+}
+
+// TestStartDatabaseAppliesChangedSettings: new rendered settings restart a running
+// cluster, and leave a stopped or unchanged one alone.
+func TestStartDatabaseAppliesChangedSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		state   units.State
+		changed bool
+		want    string
+	}{
+		{"running and changed", units.StateActive, true, "render stop start"},
+		{"running and unchanged", units.StateActive, false, "render start"},
+		{"stopped and changed", units.StateInactive, true, "render start"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.StateDir = shortTempDir(t)
+			cfg.Domain = "example.test"
+			cfg.BinPath = "/usr/local/bin/sbctl"
+			sup := &recSup{state: tc.state, changed: tc.changed}
+			// The cluster never answers, so the wait after Start fails fast; only the
+			// call order before it matters here.
+			pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: time.Millisecond})
+			p := testProject(cfg, "abcdefghijklmnopqrst", 2)
+			_ = pl.StartDatabase(context.Background(), p, testKeys(t, p.Ref))
+			if got := strings.Join(sup.calls, " "); got != tc.want {
+				t.Fatalf("calls = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

@@ -587,12 +587,30 @@ func (e *Engine) Health(ctx context.Context, ref string) ([]ServiceHealth, error
 			}
 		}
 		if want != p.Status {
-			if err := e.reg.SetProjectStatus(ctx, ref, want); err != nil {
-				e.log.Warn("health: update status", "ref", ref, "error", err)
-			}
+			e.settleStatus(ctx, ref, p.Status, want)
 		}
 	}
 	return hs, nil
+}
+
+// settleStatus moves ref from the status a health check started under to want, but only
+// if the project still has that status once it holds the per-ref lock. The checks run
+// without the lock and can take seconds; a Pause, Resume or Delete that finished in the
+// meantime owns the status, and a stale ACTIVE_UNHEALTHY must not overwrite INACTIVE.
+func (e *Engine) settleStatus(ctx context.Context, ref string, from, want registry.Status) {
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		e.log.Warn("health: lock for status update", "ref", ref, "error", err)
+		return
+	}
+	defer unlock()
+	cur, err := e.reg.GetProject(ctx, ref)
+	if err != nil || cur.Status != from {
+		return
+	}
+	if err := e.reg.SetProjectStatus(ctx, ref, want); err != nil {
+		e.log.Warn("health: update status", "ref", ref, "error", err)
+	}
 }
 
 // ConnString implements Manager.

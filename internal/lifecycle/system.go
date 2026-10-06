@@ -76,6 +76,9 @@ func (e *Engine) ensureFleetCredentials(ctx context.Context, pp pgPaths) error {
 		return err
 	}
 	defer c.Close(context.WithoutCancel(ctx))
+	if err := quietSession(ctx, c); err != nil {
+		return err
+	}
 	for _, fr := range FleetRoles {
 		if _, err := e.reg.GetSecret(ctx, config.SystemRef, fleetSecretName(fr.Service)); err == nil {
 			continue
@@ -83,12 +86,8 @@ func (e *Engine) ensureFleetCredentials(ctx context.Context, pp pgPaths) error {
 			return err
 		}
 		pw := secrets.NewPassword()
-		var stmt string
-		if err := c.QueryRow(ctx, `select format('alter role %I password %L', $1::text, $2::text)`, fr.Role, pw).Scan(&stmt); err != nil {
+		if err := setPassword(ctx, c, fr.Role, pw); err != nil {
 			return err
-		}
-		if _, err := c.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("lifecycle: set password of %s: %w", fr.Role, err)
 		}
 		sealed, err := e.sec.Seal([]byte(pw))
 		if err != nil {

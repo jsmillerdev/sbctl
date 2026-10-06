@@ -148,6 +148,16 @@ func TestIntegrationSystemAndProject(t *testing.T) {
 		}
 	}
 
+	// The passwords were set during init; none may appear in the Postgres log (the
+	// artifact logs DDL, so a plaintext ALTER ROLE would end up there).
+	var sysPasswords []string
+	for _, fc := range creds {
+		sysPasswords = append(sysPasswords, fc.Password)
+	}
+	skeys, _ := n.Engine.Keys(ctx, config.SystemRef)
+	sysPasswords = append(sysPasswords, skeys.DBPassword, skeys.AdminPassword, skeys.AuthenticatorPassword, skeys.AuthAdminPassword, skeys.StorageAdminPassword, skeys.ReplicationPassword)
+	assertNotInLogs(t, cfg, sysPasswords...)
+
 	p, err := n.Engine.Create(ctx, CreateRequest{Name: "it", Class: "micro"})
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +167,7 @@ func TestIntegrationSystemAndProject(t *testing.T) {
 	}
 	ports := cfg.PortsFor(p.Ref, p.Seq)
 	keys, _ := n.Engine.Keys(ctx, p.Ref)
+	assertNotInLogs(t, cfg, keys.DBPassword, keys.AdminPassword, keys.AuthenticatorPassword, keys.AuthAdminPassword, keys.StorageAdminPassword, keys.ReplicationPassword)
 
 	// Services answer, with real requests.
 	get := func(url, bearer string) int {
@@ -270,6 +281,26 @@ func TestIntegrationSystemAndProject(t *testing.T) {
 	}
 	if _, err := os.Stat(witness); !os.IsNotExist(err) {
 		t.Fatalf("witness remains after re-init: %v", err)
+	}
+}
+
+// assertNotInLogs fails if any of the secrets appears in a unit log file of the exec backend.
+func assertNotInLogs(t *testing.T, cfg *config.Config, secrets ...string) {
+	t.Helper()
+	files, _ := filepath.Glob(filepath.Join(cfg.StateDir, "logs", "*.log"))
+	if len(files) == 0 {
+		t.Fatal("no unit logs found to check")
+	}
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range secrets {
+			if s != "" && strings.Contains(string(b), s) {
+				t.Errorf("a stored password appears in %s", filepath.Base(f))
+			}
+		}
 	}
 }
 

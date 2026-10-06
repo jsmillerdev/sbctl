@@ -94,8 +94,9 @@ type Runner interface {
 	StartDatabase(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
 	// Stop stops the units of ref in reverse dependency order: PostgREST, GoTrue, Postgres.
 	Stop(ctx context.Context, ref string) error
-	// Reconfigure re-renders the env files of p's API units from keys and restarts the
-	// ones that run, so that a new JWT secret takes effect.
+	// Reconfigure re-renders the env files of p's API units from keys and restarts all of
+	// them (a unit that failed on earlier keys is started again), so that a new JWT secret
+	// takes effect. Callers pass only projects that should be running.
 	Reconfigure(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
 	// Health checks each unit of p with a real request, not only its unit state.
 	Health(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) []ServiceHealth

@@ -224,8 +224,23 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 	if err != nil {
 		return err
 	}
-	if err := pl.sup.Render(ctx, spec); err != nil {
+	changed := false
+	if cr, ok := pl.sup.(units.ChangeRenderer); ok {
+		if changed, err = cr.RenderChanged(ctx, spec); err != nil {
+			return err
+		}
+	} else if err := pl.sup.Render(ctx, spec); err != nil {
 		return err
+	}
+	if changed {
+		// A running cluster keeps the settings it started with (Start on a running unit is
+		// a no-op), so changed sizing, archive_command or launcher path need a restart.
+		if st, err := pl.sup.Status(ctx, spec.Unit()); err == nil && (st.State == units.StateActive || st.State == units.StateActivating) {
+			pl.log.Info("postgres settings changed; restarting the running cluster", "unit", spec.Unit())
+			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
+				return err
+			}
+		}
 	}
 	if err := pl.sup.Start(ctx, spec.Unit()); err != nil {
 		return err
@@ -376,10 +391,9 @@ func (pl *PostgresPlane) Reconfigure(ctx context.Context, p *registry.Project, k
 		}
 	}
 	for _, spec := range specs {
-		st, err := pl.sup.Status(ctx, spec.Unit())
-		if err != nil || st.State != units.StateActive {
-			continue
-		}
+		// Restart every API unit whatever its state: the caller passes only projects that
+		// should be running, and a rollback after a failed rotation must also bring back a
+		// unit that failed on the new keys (it is "failed", not "active", by then).
 		if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
 			return err
 		}

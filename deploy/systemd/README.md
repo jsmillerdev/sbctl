@@ -37,13 +37,24 @@ affected template and record why in the template.
 ## Containment and residual risk
 
 Every unit runs as the `sbctl` user (a settled convention), so systemd sandboxing is the
-only wall between services. The API and fleet templates hide `/etc/sbctl` (master key,
-config) and every project directory except their own (`TemporaryFileSystem` plus
-`BindPaths`) and their own project's `postgres/` directory (sockets, pgsodium root key; they use TCP). The Postgres template keeps its own project directory and the backups
-directory, which `wal push` needs. What remains: all services share one uid, so a
-compromised service can still reach other services over loopback TCP, and, because the
-`sbctl` user owns the cluster sockets and `pg_hba.conf` trusts `supabase_admin` on them, a
-process that can see a socket can connect as `supabase_admin`. The sandbox hides every
-socket directory from the API and fleet units; `sbctl.service` itself and the Postgres
-units keep access. Not verified on a
-running systemd yet (the Linux smoke test covers it).
+only wall between services. The API and fleet templates mount an empty tmpfs over
+`/var/lib/sbctl` (`TemporaryFileSystem=/var/lib/sbctl:ro`) and bring back only the
+artifacts (`BindReadOnlyPaths`), their own project directory (`projects/<ref>`, or
+`projects/system` for the singletons) and, for singletons, their own
+`/var/lib/sbctl/system/<svc>` directory. So they cannot see `backups/` (every project's WAL
+and base backups), `certs/` (TLS keys), `run/`, `logs/`, other projects, or another
+service's state. `/etc/sbctl` (master key, config), the cluster directory
+(`postgres/`: sockets, pgsodium root key) and the sibling services' env files in the same
+directory (`InaccessiblePaths`) are hidden as well, so Studio cannot read `supavisor.env` or
+`storage.env`. The Postgres template keeps its own project directory and the backups
+directory, which `wal push` needs; it is the only template that sees `backups/`.
+
+What remains: all services share one uid, so a compromised service can still reach other
+services over loopback TCP, and can read the `.run` launcher scripts of siblings in the
+shared `projects/system` directory (they hold no secrets). Because the `sbctl` user owns the
+cluster sockets and `pg_hba.conf` trusts `supabase_admin` on them, a process that can see a
+socket can connect as `supabase_admin`; the sandbox hides every socket directory from the
+API and fleet units, while `sbctl.service` and the Postgres units keep access. The
+singleton `system/<svc>` directories are optional (`-` prefix): create one before a service
+needs to write there. `tests/linux/systemd-smoke.sh` checks the hiding on a real systemd;
+it has not been run yet.

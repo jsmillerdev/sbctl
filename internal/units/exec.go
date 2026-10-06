@@ -83,8 +83,13 @@ func (e *Exec) lock(unit string) func() {
 
 // Render implements Supervisor. Limits are not enforced by this backend.
 func (e *Exec) Render(ctx context.Context, spec Spec) error {
-	_, err := renderFiles(e.cfg, spec)
+	_, err := e.RenderChanged(ctx, spec)
 	return err
+}
+
+// RenderChanged implements ChangeRenderer.
+func (e *Exec) RenderChanged(_ context.Context, spec Spec) (bool, error) {
+	return renderFiles(e.cfg, spec)
 }
 
 // Start implements Supervisor. It returns once the launcher has been exec'd; a launcher

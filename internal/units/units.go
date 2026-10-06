@@ -64,6 +64,13 @@ type Supervisor interface {
 	Remove(ctx context.Context, unit string) error
 }
 
+// ChangeRenderer is implemented by both backends. RenderChanged is Render that also
+// reports whether the env file or run script differed from what was on disk, which tells
+// a caller that a running unit still runs on the old files and needs a restart.
+type ChangeRenderer interface {
+	RenderChanged(ctx context.Context, spec Spec) (changed bool, err error)
+}
+
 // StandardExec returns the artifact launcher of svc, relative to the artifact root.
 func StandardExec(svc string) []string {
 	switch svc {

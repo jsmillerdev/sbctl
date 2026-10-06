@@ -43,16 +43,18 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0027
-ReadWritePaths=/var/lib/sbctl/projects/system /var/lib/sbctl/system
+ReadWritePaths=/var/lib/sbctl/projects/system -/var/lib/sbctl/system/studio
 # Containment: every unit runs as the sbctl user, so without this a compromised service
-# could read the master key and every other project's files (and, through the unix
-# socket that pg_hba.conf trusts for supabase_admin, every cluster). Hide /etc/sbctl and
-# all project directories but this unit's own, and the cluster directory (socket, root
-# key) of that one too: these services reach Postgres over TCP. The residual risk is documented in
-# deploy/systemd/README.md.
-InaccessiblePaths=-/etc/sbctl -/var/lib/sbctl/projects/system/postgres
-TemporaryFileSystem=/var/lib/sbctl/projects:ro
-BindPaths=/var/lib/sbctl/projects/system
+# could read the master key, every project's data (including backups) and the TLS keys.
+# The unit sees only the artifacts (read-only) and its own state. Everything else under
+# /var/lib/sbctl (backups, certs, run, logs, other projects, other services' state) is
+# replaced by an empty tmpfs, /etc/sbctl is hidden, and so are the env files of sibling
+# services and the cluster directory (socket, root key): these services reach Postgres
+# over TCP. The residual risk is documented in deploy/systemd/README.md.
+InaccessiblePaths=-/etc/sbctl -/var/lib/sbctl/projects/system/postgres -/var/lib/sbctl/projects/system/supavisor.env -/var/lib/sbctl/projects/system/realtime.env -/var/lib/sbctl/projects/system/storage.env -/var/lib/sbctl/projects/system/pgmeta.env -/var/lib/sbctl/projects/system/imgproxy.env -/var/lib/sbctl/projects/system/edge-runtime.env -/var/lib/sbctl/projects/system/postgres.env -/var/lib/sbctl/projects/system/gotrue.env
+TemporaryFileSystem=/var/lib/sbctl:ro
+BindReadOnlyPaths=/var/lib/sbctl/artifacts
+BindPaths=/var/lib/sbctl/projects/system -/var/lib/sbctl/system/studio
 
 [Install]
 WantedBy=multi-user.target

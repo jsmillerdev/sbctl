@@ -19,7 +19,10 @@ project's PostgreSQL, GoTrue and PostgREST as units of a `units.Supervisor`.
    The launcher initializes PGDATA and runs the artifact's roles and migrations once.
    Role passwords of `postgres`, `supabase_admin`, `authenticator`,
    `supabase_auth_admin`, `supabase_storage_admin` and `supabase_replication_admin` are set
-   afterwards over the unix socket. `CreateRequest.Seed` replaces initdb and role setup and
+   afterwards over the unix socket as SCRAM-SHA-256 verifiers computed in Go (the artifact
+logs DDL, so a plaintext `alter role` would land in journald), with statement logging also
+silenced for that session. A running cluster whose rendered settings changed is restarted by
+`StartDatabase`. `CreateRequest.Seed` replaces initdb and role setup and
 requires `CreateRequest.Keys` (the seeded cluster's own credentials; fresh ones would not
 match its passwords).
 3. GoTrue (`bin/auth migrate`, then `bin/auth`) and PostgREST, each health-checked with a

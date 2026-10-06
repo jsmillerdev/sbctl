@@ -360,3 +360,35 @@ func TestExecAcrossProcesses(t *testing.T) {
 		t.Fatal("not stopped")
 	}
 }
+
+// Every API and fleet template must hide the state root except the artifacts and its own
+// directories; the Postgres, daemon, slice and rule files are exempt.
+func TestTemplatesContainment(t *testing.T) {
+	var names []string
+	for _, s := range []string{"gotrue@", "postgrest@"} {
+		names = append(names, "sb-"+s+".service")
+	}
+	for _, s := range []string{"supavisor", "realtime", "storage", "pgmeta", "studio", "imgproxy", "edge-runtime"} {
+		names = append(names, "sb-"+s+".service")
+	}
+	for _, name := range names {
+		b, err := systemd.Read(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"TemporaryFileSystem=/var/lib/sbctl:ro\n",
+			"BindReadOnlyPaths=/var/lib/sbctl/artifacts\n",
+			"InaccessiblePaths=-/etc/sbctl ",
+		} {
+			if !strings.Contains(string(b), want) {
+				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+		for _, bad := range []string{"/var/lib/sbctl/backups", "/var/lib/sbctl/certs"} {
+			if strings.Contains(string(b), bad+" ") || strings.Contains(string(b), bad+"\n") {
+				t.Errorf("%s must not bind %s", name, bad)
+			}
+		}
+	}
+}

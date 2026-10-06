@@ -20,10 +20,11 @@ var errNoSystemd = errors.New("units: the systemd supervisor is only available o
 
 func NewSystemd(*config.Config, *slog.Logger) (*Systemd, error) { return nil, errNoSystemd }
 
-func (*Systemd) Close()                                         {}
-func (*Systemd) Reload(context.Context) error                   { return errNoSystemd }
-func (*Systemd) Render(context.Context, Spec) error             { return errNoSystemd }
-func (*Systemd) Start(context.Context, string) error            { return errNoSystemd }
-func (*Systemd) Stop(context.Context, string) error             { return errNoSystemd }
-func (*Systemd) Remove(context.Context, string) error           { return errNoSystemd }
-func (*Systemd) Status(context.Context, string) (Status, error) { return Status{}, errNoSystemd }
+func (*Systemd) Close()                                            {}
+func (*Systemd) Reload(context.Context) error                      { return errNoSystemd }
+func (*Systemd) RenderChanged(context.Context, Spec) (bool, error) { return false, errNoSystemd }
+func (*Systemd) Render(context.Context, Spec) error                { return errNoSystemd }
+func (*Systemd) Start(context.Context, string) error               { return errNoSystemd }
+func (*Systemd) Stop(context.Context, string) error                { return errNoSystemd }
+func (*Systemd) Remove(context.Context, string) error              { return errNoSystemd }
+func (*Systemd) Status(context.Context, string) (Status, error)    { return Status{}, errNoSystemd }

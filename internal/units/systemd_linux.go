@@ -86,10 +86,18 @@ func (s *Systemd) Reload(ctx context.Context) error {
 // Render implements Supervisor: it writes the env file and run script and applies the
 // unit's resource limits if they differ from what systemd has.
 func (s *Systemd) Render(ctx context.Context, spec Spec) error {
-	if _, err := renderFiles(s.cfg, spec); err != nil {
-		return err
+	_, err := s.RenderChanged(ctx, spec)
+	return err
+}
+
+// RenderChanged implements ChangeRenderer. The limits are applied to a running unit
+// immediately, so only the env file and run script count as a change.
+func (s *Systemd) RenderChanged(ctx context.Context, spec Spec) (bool, error) {
+	changed, err := renderFiles(s.cfg, spec)
+	if err != nil {
+		return false, err
 	}
-	return s.applyLimits(ctx, spec.Unit(), spec.Limits)
+	return changed, s.applyLimits(ctx, spec.Unit(), spec.Limits)
 }
 
 func (s *Systemd) applyLimits(ctx context.Context, unit string, l config.Limits) error {

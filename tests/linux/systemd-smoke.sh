@@ -76,6 +76,27 @@ check_project() { # REF
 check_project "$A"
 check_project "$B"
 
+# What an API or fleet unit can see, from inside its own mount namespace as the sbctl user.
+sees() { # UNIT PATH: exit 0 if PATH is readable from UNIT's namespace
+  local pid
+  pid=$(systemctl show -p MainPID --value "$1")
+  [[ $pid -gt 0 ]] || fail "$1 has no main pid"
+  nsenter -t "$pid" -m -- runuser -u "$SBCTL_USER" -- test -r "$2" 2>/dev/null
+}
+log "containment: sb-gotrue@$A sees only its own project and the artifacts"
+G="sb-gotrue@$A.service"
+sees "$G" "$SBCTL_STATE/projects/$A/gotrue.env" || fail "$G cannot read its own env file"
+sees "$G" "$SBCTL_STATE/artifacts" || fail "$G cannot read the artifacts"
+for hidden in "$SBCTL_STATE/backups" "$SBCTL_STATE/certs" "$SBCTL_STATE/projects/$B" "$SBCTL_STATE/projects/$A/postgres" \
+    "$SBCTL_STATE/projects/$A/postgres.env" "$SBCTL_STATE/projects/$A/postgrest.env" "$SBCTL_STATE/projects/system" /etc/sbctl; do
+  if sees "$G" "$hidden"; then fail "$G can read $hidden"; fi
+done
+if [[ $(unit_state sb-studio.service) == active ]]; then
+  for hidden in "$SBCTL_STATE/projects/system/supavisor.env" "$SBCTL_STATE/projects/system/storage.env" "$SBCTL_STATE/backups"; do
+    if sees sb-studio.service "$hidden"; then fail "sb-studio can read $hidden"; fi
+  done
+fi
+
 log "pause and resume $A"
 sbctl projects pause "$A"
 for svc in postgres gotrue postgrest; do
