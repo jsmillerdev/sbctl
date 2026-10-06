@@ -433,11 +433,13 @@ func TestWebSocketPassthrough(t *testing.T) {
 	seen := make(chan captured, 1)
 	rt.mu.Lock()
 	rt.handler = func(w http.ResponseWriter, r *http.Request) {
-		c, err := websocket.Accept(w, r, nil)
+		// Origin policy is the real Realtime's business; the fake accepts any origin.
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 		if err != nil {
 			return
 		}
 		defer c.CloseNow()
+		c.SetReadLimit(1 << 20)
 		seen <- captured{Path: r.URL.Path, RawQuery: r.URL.RawQuery, Host: r.Host, Header: r.Header.Clone()}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
@@ -461,6 +463,7 @@ func TestWebSocketPassthrough(t *testing.T) {
 		t.Fatalf("dial: %v (%v)", err, resp)
 	}
 	defer c.CloseNow()
+	c.SetReadLimit(1 << 20)
 	for _, m := range []string{"hello", strings.Repeat("big", 100000)} {
 		if err := c.Write(ctx, websocket.MessageText, []byte(m)); err != nil {
 			t.Fatal(err)
