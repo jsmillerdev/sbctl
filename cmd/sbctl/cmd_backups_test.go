@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -23,7 +25,7 @@ func runRoot(t *testing.T, args ...string) (string, error) {
 func TestBackupsCommandsAreRegistered(t *testing.T) {
 	for _, path := range [][]string{
 		{"wal", "push"}, {"wal", "fetch"},
-		{"backups", "create"}, {"backups", "list"}, {"backups", "prune"}, {"backups", "restore"},
+		{"backups", "create"}, {"backups", "list"}, {"backups", "prune"}, {"backups", "restore"}, {"backups", "finish-restore"},
 	} {
 		c, _, err := rootCmd.Find(path)
 		if err != nil || c == nil || c.Name() != path[len(path)-1] {
@@ -46,6 +48,12 @@ func TestRestoreValidatesBeforeTouchingAnything(t *testing.T) {
 			t.Errorf("%v = %v, want ErrForceRequired", args, err)
 		}
 	}
+	// latest and backup are targets of their own; in place still needs --force.
+	for _, to := range []string{"latest", "backup"} {
+		if _, err := runRoot(t, "backups", "restore", ref, "--to", to); !errors.Is(err, backup.ErrForceRequired) {
+			t.Errorf("--to %s in place = %v, want ErrForceRequired", to, err)
+		}
+	}
 	if _, err := runRoot(t, "backups", "restore", ref); err == nil {
 		t.Error("--to is required")
 	}
@@ -61,6 +69,32 @@ func TestHumanBytes(t *testing.T) {
 	for n, want := range map[int64]string{0: "0 B", 1023: "1023 B", 1024: "1.0 KiB", 1536: "1.5 KiB", 5 << 20: "5.0 MiB", 3 << 30: "3.0 GiB"} {
 		if got := humanBytes(n); got != want {
 			t.Errorf("humanBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+func TestWarnEnvFileMode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sbctl.env")
+	var out bytes.Buffer
+	warnEnvFileMode(&out, p) // missing: silent
+	if out.Len() != 0 {
+		t.Fatalf("missing file warned: %q", out.String())
+	}
+	for _, tc := range []struct {
+		mode os.FileMode
+		warn bool
+	}{{0o600, false}, {0o640, true}, {0o644, true}, {0o400, false}} {
+		if err := os.WriteFile(p, []byte("SBCTL_REGISTRY_DSN=x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, tc.mode); err != nil {
+			t.Fatal(err)
+		}
+		out.Reset()
+		warnEnvFileMode(&out, p)
+		if (out.Len() > 0) != tc.warn {
+			t.Errorf("mode %04o: output %q, want warning=%v", tc.mode, out.String(), tc.warn)
 		}
 	}
 }

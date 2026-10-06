@@ -144,6 +144,17 @@ func isNotFound(err error) bool {
 	return false
 }
 
+// accessDeniedHint explains the usual cause of a 403 on a key lookup. Without
+// s3:ListBucket, S3 answers 403 instead of 404 for a key that does not exist, so a
+// first-time wal push or the end of a wal fetch looks like a permission failure.
+func accessDeniedHint(err error) string {
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusForbidden {
+		return " (HTTP 403: the credentials need s3:ListBucket on the bucket as well as s3:GetObject, otherwise S3 answers 403 for a missing key)"
+	}
+	return ""
+}
+
 // Put implements Store. Objects up to one part are a single PutObject; larger streams
 // use a multipart upload that is aborted on failure, so no partial object is visible.
 func (s *S3Store) Put(ctx context.Context, key string, r io.Reader) error {
@@ -266,7 +277,7 @@ func (s *S3Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 		if isNotFound(err) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("backup: s3 get %s: %w", k, err)
+		return nil, fmt.Errorf("backup: s3 get %s: %w%s", k, err, accessDeniedHint(err))
 	}
 	return out.Body, nil
 }
@@ -282,7 +293,7 @@ func (s *S3Store) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 		if isNotFound(err) {
 			return ObjectInfo{}, ErrNotFound
 		}
-		return ObjectInfo{}, fmt.Errorf("backup: s3 head %s: %w", k, err)
+		return ObjectInfo{}, fmt.Errorf("backup: s3 head %s: %w%s", k, err, accessDeniedHint(err))
 	}
 	return ObjectInfo{Key: key, Size: aws.ToInt64(out.ContentLength), ModTime: aws.ToTime(out.LastModified)}, nil
 }

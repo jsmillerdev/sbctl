@@ -22,7 +22,9 @@ const (
 
 // EnvFile is the optional environment file the backup service reads. `sbctl backups`
 // runs outside the daemon and finds the registry through SBCTL_REGISTRY_DSN, which
-// the installer or lifecycle writes here.
+// the installer or lifecycle writes here. The DSN contains the registry password, so
+// the file must be mode 0600 and owned by the sbctl user (HANDOFF section 1); `sbctl
+// backups` warns when it is readable by group or others.
 const EnvFile = "/etc/sbctl/sbctl.env"
 
 // BackupTimerInstance is the timer instance to enable for ref.

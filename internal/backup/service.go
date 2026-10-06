@@ -50,11 +50,22 @@ type Options struct {
 	Version string
 	Now     func() time.Time
 	Log     *slog.Logger
+	// RecoveryTimeout bounds the wait for a restored cluster to finish recovery before
+	// its recovery settings are cleared (default 30 minutes). RecoveryPoll is the poll
+	// interval (default 1 second).
+	RecoveryTimeout time.Duration
+	RecoveryPoll    time.Duration
+	// ArchiveFlushTimeout bounds how long a restore to the end of the archive waits for a
+	// running source to archive its newest WAL (default 60 seconds).
+	ArchiveFlushTimeout time.Duration
 }
 
 // Service implements Backup over a Store and the registry.
 type Service struct {
 	opt Options
+	// probe and alter are the database calls of the post-restore wait; tests replace them.
+	probe func(ctx context.Context, ref string) (inRecovery bool, err error)
+	alter func(ctx context.Context, ref string, gucs []string) error
 }
 
 var _ Backup = (*Service)(nil)
@@ -74,7 +85,18 @@ func New(o Options) (*Service, error) {
 		paths := o.Config.Paths()
 		o.DataDir = func(ref string) string { return paths.ProjectService(ref, config.SvcPostgres) }
 	}
-	return &Service{opt: o}, nil
+	if o.RecoveryTimeout <= 0 {
+		o.RecoveryTimeout = 30 * time.Minute
+	}
+	if o.RecoveryPoll <= 0 {
+		o.RecoveryPoll = time.Second
+	}
+	if o.ArchiveFlushTimeout <= 0 {
+		o.ArchiveFlushTimeout = time.Minute
+	}
+	s := &Service{opt: o}
+	s.probe, s.alter = s.pgInRecovery, s.pgResetSettings
+	return s, nil
 }
 
 // Store returns the backend the service writes to.

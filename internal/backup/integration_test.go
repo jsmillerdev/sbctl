@@ -221,8 +221,9 @@ func (m *pgManager) Create(ctx context.Context, req lifecycle.CreateRequest) (*r
 	inst := &pgInstance{t: m.t, bin: m.bin, dir: dir, port: freePort(m.t), log: filepath.Join(m.root, "restored-"+req.Ref+".log")}
 	m.insts[req.Ref] = inst
 	m.access.set(req.Ref, inst.port)
+	// Return as soon as the server accepts connections, like lifecycle's health check:
+	// with hot_standby on that can be while recovery is still replaying WAL.
 	inst.start()
-	waitPromoted(m.t, inst)
 	if err := m.e.reg.CreateProject(ctx, p); err != nil {
 		return nil, err
 	}
@@ -235,9 +236,7 @@ func (m *pgManager) Pause(_ context.Context, ref string) error {
 }
 
 func (m *pgManager) Resume(_ context.Context, ref string) error {
-	inst := m.insts[ref]
-	inst.start()
-	waitPromoted(m.t, inst)
+	m.insts[ref].start()
 	return nil
 }
 
@@ -254,28 +253,6 @@ func waitFor(t *testing.T, what string, timeout time.Duration, fn func() (bool, 
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s (last error: %v)", what, last)
-}
-
-// waitPromoted waits until the cluster accepts connections and has left recovery.
-func waitPromoted(t *testing.T, p *pgInstance) {
-	t.Helper()
-	waitFor(t, "recovery to finish on port "+fmt.Sprint(p.port), 90*time.Second, func() (bool, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		c, err := pgx.Connect(ctx, p.dsn())
-		if err != nil {
-			return false, err
-		}
-		defer c.Close(ctx)
-		var rec bool
-		if err := c.QueryRow(ctx, "select pg_is_in_recovery()").Scan(&rec); err != nil {
-			return false, err
-		}
-		return !rec, errors.New("still in recovery")
-	})
-	if log, err := os.ReadFile(p.log); err == nil && strings.Contains(string(log), "FATAL") {
-		t.Logf("server log has FATAL lines:\n%s", tail(log, 3000))
-	}
 }
 
 func queryIDs(t *testing.T, ctx context.Context, c *pgx.Conn) []int {
@@ -483,14 +460,50 @@ func runPointInTimeRestore(t *testing.T, root string, st Store, backupToml strin
 	if err := c2.QueryRow(ctx, "select timeline_id from pg_control_checkpoint()").Scan(&tl); err != nil || tl < 2 {
 		t.Errorf("timeline after restore = %d, %v", tl, err)
 	}
-	// A new base backup works on the promoted cluster, so the project is protected again.
+	// The recovery settings are gone once RestoreWith returned: it waited for promotion
+	// first (the manager returned while recovery could still be running).
+	var inRec bool
+	var restoreCmd string
+	if err := c2.QueryRow(ctx, "select pg_is_in_recovery(), current_setting('restore_command')").Scan(&inRec, &restoreCmd); err != nil || inRec || restoreCmd != "" {
+		t.Fatalf("after in-place restore: in recovery %v, restore_command %q, %v", inRec, restoreCmd, err)
+	}
+	// The restore took a base backup of the new timeline itself.
 	waitFor(t, "archiving on the new timeline", 60*time.Second, func() (bool, error) {
 		_, err := st.Stat(ctx, walKey(testRef, "00000002.history"))
 		return err == nil, err
 	})
+	ms, err = e.svc.ListBackups(ctx, testRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var post *Manifest
+	for i := range ms {
+		if ms[i].Reason == ReasonRestore {
+			post = &ms[i]
+		}
+	}
+	if post == nil || post.Timeline != 2 {
+		t.Fatalf("no post-restore base backup on timeline 2: %+v", ms)
+	}
 	if _, err := e.svc.BaseBackup(ctx, testRef); err != nil {
 		t.Fatalf("base backup after restore: %v", err)
 	}
+
+	// Restore to the end of the archive as another new project: a row written on the new
+	// timeline after the restore must be there, with no target time to satisfy. The source
+	// is running, so its newest WAL is archived first.
+	if _, err := c2.Exec(ctx, "insert into public.t values (3)"); err != nil {
+		t.Fatal(err)
+	}
+	p3, err := e.svc.RestoreWith(ctx, testRef, time.Time{}, testRef3, RestoreOptions{Latest: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clone3 := mgr.insts[p3.Ref]
+	if ids := queryIDs(t, ctx, clone3.connect(ctx)); idsString(ids) != "[1 2 3]" {
+		t.Fatalf("rows restored to the latest state = %v, want [1 2 3]", ids)
+	}
+	clone3.stop()
 }
 
 // TestBaseBackupRefusals checks the guard rails: a cluster without archiving cannot

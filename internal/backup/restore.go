@@ -28,6 +28,14 @@ import (
 // RestoreOptions.Force is not set.
 var ErrForceRequired = errors.New("backup: restoring in place replaces the project's data with an older copy; pass Force to confirm")
 
+// Restore targets. A time target stops at the first commit or abort record after the
+// time, so it needs a transaction that ended after it in the archive; the other two do not.
+const (
+	RestoreToTime   = "time"   // replay to a point in time
+	RestoreToLatest = "latest" // replay every archived WAL file, then promote
+	RestoreToBackup = "backup" // stop at the end of the chosen base backup (recovery_target = immediate)
+)
+
 // RestoreOptions tunes RestoreWith.
 type RestoreOptions struct {
 	// Force allows restoring over the source project itself (newRef empty or equal to ref).
@@ -35,24 +43,79 @@ type RestoreOptions struct {
 	Force bool
 	// BackupID pins the base backup instead of choosing the newest one before the target.
 	BackupID string
+	// Latest restores to the end of the archive and ignores the target time. It is the
+	// way to restore a deleted project's last state from its final backup, and to
+	// restore "now" on a running project (its newest WAL is archived first).
+	Latest bool
+	// ToBackup restores exactly the state of a base backup (BackupID, default the
+	// newest) and ignores the target time. It needs no WAL beyond the backup's own.
+	ToBackup bool
 }
 
-// RestorePlan is the outcome of choosing a base backup for a target time.
+func (o RestoreOptions) mode() (string, error) {
+	switch {
+	case o.Latest && o.ToBackup:
+		return "", errors.New("backup: Latest and ToBackup are exclusive")
+	case o.Latest:
+		return RestoreToLatest, nil
+	case o.ToBackup:
+		return RestoreToBackup, nil
+	}
+	return RestoreToTime, nil
+}
+
+// RestorePlan is the outcome of choosing a base backup for a target.
 type RestorePlan struct {
-	Source    string // ref whose archive is replayed
-	TargetRef string // ref the restored cluster archives to (Source for in-place)
-	Target    time.Time
+	Source    string    // ref whose archive is replayed
+	TargetRef string    // ref the restored cluster archives to (Source for in-place)
+	Mode      string    // RestoreToTime (default), RestoreToLatest or RestoreToBackup
+	Target    time.Time // for RestoreToTime
 	Manifest  Manifest
 }
 
 // PlanRestore picks the newest base backup of ref that finished at or before target
 // (or backupID) and checks that the WAL it starts from is in the archive.
 func (s *Service) PlanRestore(ctx context.Context, ref string, target time.Time, backupID string) (*RestorePlan, error) {
+	return s.PlanRestoreWith(ctx, ref, target, RestoreOptions{BackupID: backupID})
+}
+
+// farFuture stands in for "no upper bound" when choosing the newest base backup.
+var farFuture = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// PlanRestoreWith is PlanRestore for any restore target. Only base backups on the
+// archive's current timeline history qualify: after an in-place restore forked timeline
+// 2 off at T, a backup of timeline 1 taken after T is in the archive but cannot be the
+// base of a restore that follows timeline 2.
+func (s *Service) PlanRestoreWith(ctx context.Context, ref string, target time.Time, opts RestoreOptions) (*RestorePlan, error) {
+	mode, err := opts.mode()
+	if err != nil {
+		return nil, err
+	}
 	all, err := s.ListBackups(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
-	m, err := pickBackup(all, target, backupID)
+	hist, err := s.latestHistory(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	var eligible []Manifest
+	for i := range all {
+		if hist.onHistory(&all[i]) {
+			eligible = append(eligible, all[i])
+		} else if all[i].ID == opts.BackupID {
+			return nil, fmt.Errorf("backup: backup %s (timeline %d, ended at %s) is not on the history of timeline %d: a restore from it cannot follow the later timeline",
+				all[i].ID, all[i].Timeline, all[i].StopLSN, hist.Latest)
+		}
+	}
+	if len(all) > 0 && len(eligible) == 0 {
+		return nil, fmt.Errorf("backup: none of the %d base backups of %s is on the history of timeline %d; take a new base backup", len(all), ref, hist.Latest)
+	}
+	pick := target
+	if mode != RestoreToTime {
+		pick = farFuture
+	}
+	m, err := pickBackup(eligible, pick, opts.BackupID)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +125,7 @@ func (s *Service) PlanRestore(ctx context.Context, ref string, target time.Time,
 		}
 		return nil, err
 	}
-	return &RestorePlan{Source: ref, TargetRef: ref, Target: target, Manifest: *m}, nil
+	return &RestorePlan{Source: ref, TargetRef: ref, Mode: mode, Target: target, Manifest: *m}, nil
 }
 
 // Restore implements Backup. With newRef set it creates a new project; with newRef
@@ -86,6 +149,13 @@ func (s *Service) RestoreWith(ctx context.Context, ref string, target time.Time,
 	if err := validRef(ref); err != nil {
 		return nil, err
 	}
+	if ref == config.SystemRef {
+		return nil, errors.New("backup: the system cluster holds the registry that a restore needs to run; restore it by hand with the control plane stopped (README, \"Disaster recovery of the system cluster\")")
+	}
+	mode, err := opts.mode()
+	if err != nil {
+		return nil, err
+	}
 	for _, c := range []struct {
 		what string
 		ok   bool
@@ -107,9 +177,19 @@ func (s *Service) RestoreWith(ctx context.Context, ref string, target time.Time,
 		} else if !errors.Is(err, registry.ErrNotFound) {
 			return nil, err
 		}
+		// A deleted project keeps its archive. Reusing its ref would mix two histories:
+		// the clone's WAL would collide with the old one and archiving would stall.
+		if left, err := s.opt.Store.ListDirs(ctx, newRef+"/"); err != nil {
+			return nil, err
+		} else if len(left) > 0 {
+			return nil, fmt.Errorf("backup: the archive already holds data for ref %s (%s); a deleted project's backups are kept, so restore under a different ref", newRef, strings.Join(left, ", "))
+		}
 	}
 
-	plan, err := s.PlanRestore(ctx, ref, target, opts.BackupID)
+	if mode == RestoreToLatest {
+		s.flushArchive(ctx, ref)
+	}
+	plan, err := s.PlanRestoreWith(ctx, ref, target, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -126,10 +206,10 @@ func (s *Service) RestoreWith(ctx context.Context, ref string, target time.Time,
 		p, err = s.restoreAsNew(ctx, plan, keys)
 	}
 	if err != nil {
-		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.failed", map[string]any{"target": target, "as": newRef, "error": err.Error()})
+		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.failed", map[string]any{"mode": mode, "target": target, "as": newRef, "error": err.Error()})
 		return nil, err
 	}
-	_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.completed", map[string]any{"target": target, "as": p.Ref, "backup": plan.Manifest.ID})
+	_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.completed", map[string]any{"mode": mode, "target": target, "as": p.Ref, "backup": plan.Manifest.ID})
 	return p, nil
 }
 
@@ -191,43 +271,172 @@ func (s *Service) restoreInPlace(ctx context.Context, plan *RestorePlan) (*regis
 	if err := s.opt.Manager.Resume(ctx, ref); err != nil {
 		return nil, fmt.Errorf("backup: start %s after restore (original data kept in %s): %w", ref, aside, err)
 	}
-	s.resetRecoverySettings(ctx, ref)
+	if s.resetRecoverySettings(ctx, ref) {
+		// The new timeline has no base backup yet, and the ones of the old timeline taken
+		// after the fork are unusable for it. Take one now rather than at the next timer run.
+		if _, err := s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonRestore}); err != nil {
+			s.opt.Log.Warn("base backup after in-place restore failed; run `sbctl backups create`", "ref", ref, "err", err)
+			_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.backup_pending", map[string]any{"error": err.Error()})
+		}
+	} else {
+		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.backup_pending", map[string]any{"error": "recovery had not finished"})
+	}
 	s.opt.Log.Info("restored in place", "ref", ref, "original_data", aside)
 	return s.opt.Registry.GetProject(ctx, ref)
 }
 
-// resetRecoverySettings removes the recovery settings the seeder put in
-// postgresql.auto.conf, so a later start never replays another project's archive.
-// Failure is logged and recorded as an event, not returned: the project is restored.
-func (s *Service) resetRecoverySettings(ctx context.Context, ref string) {
-	err := func() error {
-		if s.opt.Access == nil {
-			return errors.New("no database access configured")
-		}
-		dsn, err := s.opt.Access.ConnString(ctx, ref, roleAdmin)
-		if err != nil {
-			return err
-		}
-		conn, err := pgx.Connect(ctx, dsn)
-		if err != nil {
-			return err
-		}
-		defer conn.Close(context.WithoutCancel(ctx))
-		for _, g := range recoveryGUCs {
-			if _, err := conn.Exec(ctx, "alter system reset "+g); err != nil {
-				return err
-			}
-		}
-		_, err = conn.Exec(ctx, "select pg_reload_conf()")
-		return err
-	}()
-	if err != nil {
+// errStillRecovering means the cluster did not leave recovery within the wait.
+var errStillRecovering = errors.New("cluster is still in recovery")
+
+// resetRecoverySettings waits for the restored cluster to finish recovery, then removes
+// the recovery settings the seeder put in postgresql.auto.conf, so a later start never
+// replays another project's archive. It reports whether the settings were cleared.
+//
+// Clearing restore_command while recovery still runs is not safe: it is a reloadable
+// setting, recovery would run out of WAL before its target, and the cluster would stop
+// with a fatal error and refuse to start again (recovery.signal present, no
+// restore_command). Manager.Create and Resume only promise a running cluster, which
+// with hot_standby on is also a cluster that is still replaying. So nothing is reset
+// until pg_is_in_recovery() is false. If that does not happen in RecoveryTimeout the
+// settings stay and a restore.cleanup_pending event is recorded; FinishRestore finishes
+// the job later. Failure is logged and recorded, not returned: the project is restored.
+func (s *Service) resetRecoverySettings(ctx context.Context, ref string) bool {
+	err := s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, errStillRecovering):
+		s.opt.Log.Warn("restored cluster is still in recovery; recovery settings left in place (run `sbctl backups finish-restore`)", "ref", ref, "err", err)
+		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.cleanup_pending", map[string]any{"error": err.Error()})
+	default:
 		s.opt.Log.Warn("could not clear recovery settings after restore", "ref", ref, "err", err)
 		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.cleanup_failed", map[string]any{"error": err.Error()})
 	}
+	return false
 }
 
-var recoveryGUCs = []string{"restore_command", "recovery_target_time", "recovery_target_action", "recovery_target_timeline"}
+// FinishRestore waits up to RecoveryTimeout for ref's cluster to finish recovery and
+// then clears the recovery settings. It completes a restore that reported
+// restore.cleanup_pending, and is safe to run on a cluster that is already done.
+func (s *Service) FinishRestore(ctx context.Context, ref string) error {
+	if err := validRef(ref); err != nil {
+		return err
+	}
+	if err := s.need("database access", s.opt.Access != nil); err != nil {
+		return err
+	}
+	return s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout)
+}
+
+// finishRecovery polls until the cluster has left recovery (connecting as often as
+// needed, since the server may still be starting), then resets recoveryGUCs.
+func (s *Service) finishRecovery(ctx context.Context, ref string, wait time.Duration) error {
+	if s.opt.Access == nil {
+		return errors.New("no database access configured")
+	}
+	wctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	var last error = errStillRecovering
+	for {
+		inRec, err := s.probe(wctx, ref)
+		switch {
+		case err != nil:
+			last = err
+		case inRec:
+			last = errStillRecovering
+		default:
+			return s.alter(ctx, ref, recoveryGUCs)
+		}
+		select {
+		case <-wctx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("%w after %s (last: %v)", errStillRecovering, wait, last)
+		case <-time.After(s.opt.RecoveryPoll):
+		}
+	}
+}
+
+// pgInRecovery asks ref's cluster whether it is still replaying WAL.
+func (s *Service) pgInRecovery(ctx context.Context, ref string) (bool, error) {
+	conn, err := s.adminConn(ctx, ref)
+	if err != nil {
+		return true, err
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	var rec bool
+	err = conn.QueryRow(ctx, "select pg_is_in_recovery()").Scan(&rec)
+	return rec, err
+}
+
+// pgResetSettings runs ALTER SYSTEM RESET for each setting and reloads the configuration.
+func (s *Service) pgResetSettings(ctx context.Context, ref string, gucs []string) error {
+	conn, err := s.adminConn(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	for _, g := range gucs {
+		if _, err := conn.Exec(ctx, "alter system reset "+g); err != nil {
+			return err
+		}
+	}
+	_, err = conn.Exec(ctx, "select pg_reload_conf()")
+	return err
+}
+
+func (s *Service) adminConn(ctx context.Context, ref string) (*pgx.Conn, error) {
+	dsn, err := s.opt.Access.ConnString(ctx, ref, roleAdmin)
+	if err != nil {
+		return nil, err
+	}
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return pgx.Connect(cctx, dsn)
+}
+
+// flushArchive makes a running source archive its newest WAL before a restore to the
+// end of the archive: it switches to a new segment and waits for the archiver to
+// catch up. Best effort: a source that is down or gone (a deleted project) has nothing
+// to flush, and a restore must not fail because of it.
+func (s *Service) flushArchive(ctx context.Context, ref string) {
+	if s.opt.Access == nil {
+		return
+	}
+	fctx, cancel := context.WithTimeout(ctx, s.opt.ArchiveFlushTimeout)
+	defer cancel()
+	conn, err := s.adminConn(fctx, ref)
+	if err != nil {
+		s.opt.Log.Debug("source cluster not reachable; restoring what is archived", "ref", ref, "err", err)
+		return
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	var seg string
+	if err := conn.QueryRow(fctx, "select pg_walfile_name(pg_current_wal_lsn())").Scan(&seg); err != nil {
+		s.opt.Log.Debug("cannot read the source's WAL position", "ref", ref, "err", err)
+		return
+	}
+	if _, err := conn.Exec(fctx, "select pg_switch_wal()"); err != nil {
+		s.opt.Log.Warn("could not switch WAL on the source", "ref", ref, "err", err)
+		return
+	}
+	for {
+		var ok bool
+		if err := conn.QueryRow(fctx, "select coalesce(last_archived_wal >= $1, false) from pg_stat_archiver", seg).Scan(&ok); err == nil && ok {
+			return
+		}
+		select {
+		case <-fctx.Done():
+			s.opt.Log.Warn("the source's newest WAL is not archived yet; the restore may end earlier than the last transaction", "ref", ref, "segment", seg)
+			return
+		case <-time.After(s.opt.RecoveryPoll):
+		}
+	}
+}
+
+// recoveryGUCs are the settings the seeder writes for the recovery itself.
+var recoveryGUCs = []string{"restore_command", "recovery_target", "recovery_target_time", "recovery_target_action", "recovery_target_timeline"}
 
 // sourceKeys opens the credentials the restored cluster was running with: the sealed
 // copy stored in the backup, or, for backups without one, the source project's
@@ -330,6 +539,9 @@ func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) e
 
 // recoveryConf is the block appended to postgresql.auto.conf. Later lines win, so it
 // overrides anything the source's own ALTER SYSTEM history left there.
+//
+// The archive_* lines stay after the restore: the data directory's postgresql.conf is
+// the source's, and without them the clone would archive into the source's archive.
 func (s *Service) recoveryConf(plan *RestorePlan) string {
 	bin, cfgPath := config.DefaultBinPath, s.opt.ConfigPath
 	c := s.opt.Config
@@ -337,11 +549,26 @@ func (s *Service) recoveryConf(plan *RestorePlan) string {
 		bin = c.BinPath
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n# --- sbctl restore of %s (backup %s) to %s ---\n", plan.Source, plan.Manifest.ID, plan.Target.UTC().Format(time.RFC3339))
+	switch plan.Mode {
+	case RestoreToLatest:
+		fmt.Fprintf(&b, "\n# --- sbctl restore of %s (backup %s) to the end of the archive ---\n", plan.Source, plan.Manifest.ID)
+	case RestoreToBackup:
+		fmt.Fprintf(&b, "\n# --- sbctl restore of %s to the end of backup %s ---\n", plan.Source, plan.Manifest.ID)
+	default:
+		fmt.Fprintf(&b, "\n# --- sbctl restore of %s (backup %s) to %s ---\n", plan.Source, plan.Manifest.ID, plan.Target.UTC().Format(time.RFC3339))
+	}
 	fmt.Fprintf(&b, "archive_mode = on\narchive_command = %s\n", confString(ArchiveCommand(bin, plan.TargetRef, cfgPath)))
 	fmt.Fprintf(&b, "restore_command = %s\n", confString(RestoreCommand(bin, plan.Source, cfgPath)))
-	fmt.Fprintf(&b, "recovery_target_time = %s\n", confString(plan.Target.UTC().Format("2006-01-02 15:04:05.999999")+"+00"))
-	b.WriteString("recovery_target_action = 'promote'\nrecovery_target_timeline = 'latest'\n")
+	switch plan.Mode {
+	case RestoreToLatest:
+		// No target: recovery replays every archived file and then promotes.
+	case RestoreToBackup:
+		b.WriteString("recovery_target = 'immediate'\nrecovery_target_action = 'promote'\n")
+	default:
+		fmt.Fprintf(&b, "recovery_target_time = %s\n", confString(plan.Target.UTC().Format("2006-01-02 15:04:05.999999")+"+00"))
+		b.WriteString("recovery_target_action = 'promote'\n")
+	}
+	b.WriteString("recovery_target_timeline = 'latest'\n")
 	return b.String()
 }
 

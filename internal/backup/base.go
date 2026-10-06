@@ -21,7 +21,7 @@ const stopTimeout = 15 * time.Minute
 
 // BackupOptions tunes one base backup.
 type BackupOptions struct {
-	// Reason is recorded in the manifest: ReasonManual (default), ReasonScheduled or ReasonFinal.
+	// Reason is recorded in the manifest: ReasonManual (default), ReasonScheduled, ReasonFinal or ReasonRestore.
 	Reason string
 }
 
@@ -66,7 +66,7 @@ func (s *Service) BaseBackupWith(ctx context.Context, ref string, bo BackupOptio
 	}
 
 	started := s.opt.Now().UTC().Truncate(time.Second)
-	id := backupID(started)
+	id := newBackupID(started)
 	rec := &registry.Backup{Ref: ref, Kind: "base", Status: registry.BackupRunning, StartedAt: started,
 		Location: s.opt.Store.URL(baseDir(ref) + id)}
 	if err := reg.CreateBackup(ctx, rec); err != nil {

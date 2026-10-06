@@ -2,6 +2,8 @@ package backup
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,7 +27,8 @@ const (
 const (
 	ReasonManual    = "manual"
 	ReasonScheduled = "scheduled"
-	ReasonFinal     = "final" // taken by project delete
+	ReasonFinal     = "final"        // taken by project delete
+	ReasonRestore   = "post-restore" // taken right after an in-place restore, so the new timeline has a base
 )
 
 // Manifest describes one complete base backup. It lives next to the data and is the
@@ -75,6 +78,17 @@ type ManifestProject struct {
 func (m *Manifest) Dir() string { return baseDir(m.Ref) + m.ID }
 
 func backupID(t time.Time) string { return t.UTC().Format(idLayout) }
+
+// newBackupID is backupID plus a random suffix. Two runs that start in the same second
+// (the timer racing a manual backup or a final backup) must never share a directory:
+// the loser's cleanup would delete the winner's objects.
+func newBackupID(t time.Time) string {
+	var b [3]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err) // crypto/rand does not fail on supported platforms
+	}
+	return backupID(t) + "-" + hex.EncodeToString(b[:])
+}
 
 // ListBackups returns ref's complete base backups from the store, oldest first.
 // Directories without a manifest (uploads in flight or abandoned) are not listed.

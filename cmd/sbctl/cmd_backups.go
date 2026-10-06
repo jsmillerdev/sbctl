@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"text/tabwriter"
 	"time"
@@ -25,11 +26,23 @@ const envRegistryDSN = "SBCTL_REGISTRY_DSN"
 // openRegistry connects to the registry. The default reads SBCTL_REGISTRY_DSN; the
 // integration step may replace it with whatever the daemon uses to find the system cluster.
 var openRegistry = func(ctx context.Context, _ *config.Config) (registry.Registry, error) {
+	warnEnvFileMode(os.Stderr, backup.EnvFile)
 	dsn := os.Getenv(envRegistryDSN)
 	if dsn == "" {
 		return nil, fmt.Errorf("registry DSN unknown: set %s", envRegistryDSN)
 	}
 	return registry.Open(ctx, dsn)
+}
+
+// warnEnvFileMode warns when the env file that carries the registry DSN (with its
+// password) is readable by group or others. A missing file is fine: the variable may
+// come from the environment.
+func warnEnvFileMode(w io.Writer, path string) {
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	fmt.Fprintf(w, "warning: %s is mode %04o; it holds the registry password and must be 0600 and owned by the sbctl user\n", path, fi.Mode().Perm())
 }
 
 // newLifecycleManager builds the lifecycle.Manager that `backups restore` needs. It
@@ -59,7 +72,7 @@ func init() {
 			return nil
 		},
 	}
-	create.Flags().StringVar(&createReason, "reason", backup.ReasonManual, "reason recorded in the manifest: manual, scheduled or final")
+	create.Flags().StringVar(&createReason, "reason", backup.ReasonManual, "reason recorded in the manifest: manual, scheduled, final or post-restore")
 
 	var listStore, listJSON bool
 	list := &cobra.Command{
@@ -142,17 +155,32 @@ func init() {
 	var restoreTo, restoreAs, restoreBackup string
 	var restoreForce bool
 	restore := &cobra.Command{
-		Use:   "restore <ref> --to <RFC3339 time> [--as <newref>] [--force]",
-		Short: "Restore a project to a point in time",
-		Long: "Builds a cluster from the newest base backup before --to and replays archived WAL up\n" +
-			"to --to. With --as <newref> the result is a new project (the source is untouched).\n" +
-			"Without --as the project itself is replaced, which needs --force; its old data\n" +
-			"directory is kept next to it as <dir>.pre-restore-<time>.",
+		Use:   "restore <ref> --to <RFC3339 time | latest | backup> [--as <newref>] [--force]",
+		Short: "Restore a project to a point in time, to the latest archived state, or to a base backup",
+		Long: "Builds a cluster from the newest base backup before --to and replays archived WAL.\n\n" +
+			"  --to <RFC3339 time>  stop at that time. PostgreSQL stops at the first commit after\n" +
+			"                       the time, so some transaction must have committed after it\n" +
+			"                       in the archive; otherwise recovery fails and nothing is restored.\n" +
+			"  --to latest          replay the whole archive (a running source first archives its\n" +
+			"                       newest WAL). Use this to restore a deleted project's last state.\n" +
+			"  --to backup          the exact state of a base backup (--backup-id, default newest).\n\n" +
+			"With --as <newref> the result is a new project (the source is untouched; <newref> must\n" +
+			"have no archive of its own). Without --as the project itself is replaced, which needs\n" +
+			"--force; its old data directory is kept next to it as <dir>.pre-restore-<time>.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			target, err := time.Parse(time.RFC3339, restoreTo)
-			if err != nil {
-				return fmt.Errorf("--to must be an RFC3339 timestamp such as 2026-10-06T14:30:00Z: %w", err)
+			opts := backup.RestoreOptions{Force: restoreForce, BackupID: restoreBackup}
+			var target time.Time
+			switch restoreTo {
+			case "latest":
+				opts.Latest = true
+			case "backup":
+				opts.ToBackup = true
+			default:
+				var err error
+				if target, err = time.Parse(time.RFC3339, restoreTo); err != nil {
+					return fmt.Errorf("--to must be an RFC3339 timestamp such as 2026-10-06T14:30:00Z, \"latest\" or \"backup\": %w", err)
+				}
 			}
 			if (restoreAs == "" || restoreAs == args[0]) && !restoreForce {
 				return backup.ErrForceRequired
@@ -162,21 +190,46 @@ func init() {
 				return err
 			}
 			defer closeFn()
-			p, err := svc.RestoreWith(cmd.Context(), args[0], target, restoreAs, backup.RestoreOptions{Force: restoreForce, BackupID: restoreBackup})
+			p, err := svc.RestoreWith(cmd.Context(), args[0], target, restoreAs, opts)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "restored %s to %s as project %s (%s)\n", args[0], target.UTC().Format(time.RFC3339), p.Ref, p.Status)
+			what := target.UTC().Format(time.RFC3339)
+			if restoreTo == "latest" || restoreTo == "backup" {
+				what = restoreTo
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "restored %s to %s as project %s (%s)\n", args[0], what, p.Ref, p.Status)
 			return nil
 		},
 	}
-	restore.Flags().StringVar(&restoreTo, "to", "", "point in time to restore to (RFC3339)")
+	restore.Flags().StringVar(&restoreTo, "to", "", "restore target: an RFC3339 time, \"latest\" (end of the archive) or \"backup\" (a base backup)")
 	restore.Flags().StringVar(&restoreAs, "as", "", "ref of the new project; empty restores in place")
 	restore.Flags().BoolVar(&restoreForce, "force", false, "allow replacing the project's own data (in-place restore)")
 	restore.Flags().StringVar(&restoreBackup, "backup-id", "", "use this base backup instead of the newest one before --to")
 	_ = restore.MarkFlagRequired("to")
 
-	backups.AddCommand(create, list, prune, restore)
+	finish := &cobra.Command{
+		Use:   "finish-restore <ref>",
+		Short: "Clear the recovery settings of a restored project once its recovery has finished",
+		Long: "A restore leaves the recovery settings in place while the cluster is still replaying\n" +
+			"WAL (the restore then reports restore.cleanup_pending). This waits for the cluster to\n" +
+			"promote and removes them. It does nothing harmful on a project that is already done.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, closeFn, err := openBackupService(cmd.Context(), false)
+			if err != nil {
+				return err
+			}
+			defer closeFn()
+			if err := svc.FinishRestore(cmd.Context(), args[0]); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s: recovery finished and recovery settings cleared\n", args[0])
+			return nil
+		},
+	}
+
+	backups.AddCommand(create, list, prune, restore, finish)
 	rootCmd.AddCommand(backups)
 }
 

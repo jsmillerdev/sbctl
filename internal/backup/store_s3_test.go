@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 )
@@ -164,3 +168,21 @@ func TestS3StoreAgainstFakeServer(t *testing.T) { runS3Suite(t, fakeS3(t)) }
 // TestS3StoreAgainstRealService is the CI-only variant: it needs a real S3-compatible
 // endpoint (a MinIO service container in CI) and is skipped without SBCTL_TEST_S3_*.
 func TestS3StoreAgainstRealService(t *testing.T) { runS3Suite(t, s3FromEnv(t)) }
+
+// A 403 on a key lookup is what S3 answers for a missing key when the caller lacks
+// s3:ListBucket; the error must say so instead of looking like a plain failure.
+func TestAccessDeniedHintNamesListBucket(t *testing.T) {
+	forbidden := &awshttp.ResponseError{ResponseError: &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusForbidden}},
+		Err:      errors.New("AccessDenied"),
+	}}
+	if h := accessDeniedHint(forbidden); !strings.Contains(h, "s3:ListBucket") {
+		t.Errorf("hint = %q", h)
+	}
+	if isNotFound(forbidden) {
+		t.Error("a 403 must not be taken for a missing key")
+	}
+	if h := accessDeniedHint(errors.New("boom")); h != "" {
+		t.Errorf("hint for an unrelated error = %q", h)
+	}
+}

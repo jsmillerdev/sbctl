@@ -17,6 +17,7 @@ import (
 const (
 	testRef  = "abcdefghijklmnopqrst"
 	testRef2 = "tsrqponmlkjihgfedcba"
+	testRef3 = "bcdefghijklmnopqrstu"
 )
 
 // testEnv is a Service over a FileStore and the in-memory registry.

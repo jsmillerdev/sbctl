@@ -12,6 +12,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+# initdb refuses to run as root, so the Postgres tests cannot run in a root shell
+# (a bare `sudo` step or a root container). Run the job as an unprivileged user.
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo "refusing to run as root: initdb will not start. Run this script as an unprivileged user." >&2
+  exit 1
+fi
+
 if [[ -z "${SBCTL_TEST_PG_BIN:-}" ]]; then
   case "$(uname -m)" in
     x86_64) platform=linux-amd64 ;;
@@ -24,9 +31,11 @@ if [[ -z "${SBCTL_TEST_PG_BIN:-}" ]]; then
   trap 'rm -rf "$dir"' EXIT
   url="https://github.com/supabase/slim-services/releases/download/${tag}/${tag}-${platform}.tar.zst"
   curl -fsSL "$url" -o "$dir/pg.tar.zst"
-  if [[ -n "${SBCTL_CI_PG_SHA256:-}" ]]; then
-    echo "${SBCTL_CI_PG_SHA256}  $dir/pg.tar.zst" | sha256sum -c -
-  fi
+  # Always verify against the SHA256SUMS the release publishes next to the artifact.
+  curl -fsSL "https://github.com/supabase/slim-services/releases/download/${tag}/SHA256SUMS" -o "$dir/SHA256SUMS"
+  want=$(awk -v f="${tag}-${platform}.tar.zst" '$2 == f || $2 == "*" f {print $1; exit}' "$dir/SHA256SUMS")
+  [[ -n "$want" ]] || { echo "SHA256SUMS of ${tag} has no entry for ${tag}-${platform}.tar.zst" >&2; exit 1; }
+  echo "${want}  $dir/pg.tar.zst" | sha256sum -c -
   mkdir "$dir/pg"
   zstd -dc "$dir/pg.tar.zst" | tar -x -C "$dir/pg"
   export SBCTL_TEST_PG_BIN="$dir/pg/bin"
