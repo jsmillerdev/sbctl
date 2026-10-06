@@ -1,0 +1,24 @@
+// polkit rule: lets the sbctl user manage sb-* units over D-Bus without root.
+// Install as /etc/polkit-1/rules.d/50-sbctl.rules (sbctl system install-units does).
+polkit.addRule(function(action, subject) {
+  if (subject.user !== "sbctl") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  var ids = [
+    "org.freedesktop.systemd1.manage-units",
+    "org.freedesktop.systemd1.manage-unit-files",
+    "org.freedesktop.systemd1.reload-daemon"
+  ];
+  if (ids.indexOf(action.id) < 0) {
+    return polkit.Result.NOT_HANDLED;
+  }
+  // manage-units always names the unit; restrict it to ours. The other two actions
+  // carry no unit name (daemon-reload, enabling unit files).
+  if (action.id === "org.freedesktop.systemd1.manage-units") {
+    var unit = action.lookup("unit") || "";
+    if (unit.indexOf("sb-") !== 0 && unit !== "sbctl.service") {
+      return polkit.Result.NOT_HANDLED;
+    }
+  }
+  return polkit.Result.YES;
+});

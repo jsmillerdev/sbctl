@@ -1,0 +1,50 @@
+[Unit]
+Description=sbctl Supavisor, the shared Postgres pooler
+Documentation=https://github.com/OWNER/sbctl
+Requires=sb-postgres@system.service
+After=network.target local-fs.target sb-postgres@system.service
+StartLimitIntervalSec=0
+
+[Service]
+# sbctl renders the two files below (units.Supervisor.Render) before it starts the unit.
+Type=exec
+User=sbctl
+Group=sbctl
+Slice=sbctl.slice
+EnvironmentFile=/var/lib/sbctl/projects/system/supavisor.env
+ExecStart=/var/lib/sbctl/projects/system/supavisor.run
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30
+LimitNOFILE=65536
+# MemoryMax and CPUQuota come from the project record: sbctl applies them over D-Bus
+# as persistent per-unit drop-ins.
+MemoryAccounting=yes
+CPUAccounting=yes
+SyslogIdentifier=sb-supavisor
+
+# Hardening. MemoryDenyWriteExecute is deliberately absent: Postgres (JIT), the BEAM
+# and Node all map writable+executable memory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+ReadWritePaths=/var/lib/sbctl/projects/system /var/lib/sbctl/system
+
+[Install]
+WantedBy=multi-user.target

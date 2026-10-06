@@ -1,0 +1,55 @@
+[Unit]
+Description=sbctl Postgres for project %i
+Documentation=https://github.com/OWNER/sbctl
+After=network.target local-fs.target 
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+# sbctl renders the two files below (units.Supervisor.Render) before it starts the unit.
+Type=exec
+User=sbctl
+Group=sbctl
+Slice=sbctl.slice
+EnvironmentFile=/var/lib/sbctl/projects/%i/postgres.env
+ExecStart=/var/lib/sbctl/projects/%i/postgres.run
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=90
+LimitNOFILE=16384
+OOMScoreAdjust=-500
+# MemoryMax and CPUQuota come from the project record: sbctl applies them over D-Bus
+# as persistent per-unit drop-ins.
+MemoryAccounting=yes
+CPUAccounting=yes
+SyslogIdentifier=sb-postgres@%i
+# SIGINT is Postgres's fast shutdown: abort open transactions, checkpoint, exit.
+# systemd sends it to the postmaster only, and SIGKILL to what is left on timeout.
+KillMode=mixed
+KillSignal=SIGINT
+
+# Hardening. MemoryDenyWriteExecute is deliberately absent: Postgres (JIT), the BEAM
+# and Node all map writable+executable memory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+ReadWritePaths=/var/lib/sbctl/projects/%i
+
+[Install]
+WantedBy=multi-user.target

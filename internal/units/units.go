@@ -20,8 +20,12 @@ type Spec struct {
 	Env         map[string]string
 	Limits      config.Limits
 	// Exec overrides the artifact launcher (path relative to ArtifactDir, plus args).
-	// Empty means the service's standard launcher.
+	// Empty means the service's standard launcher (StandardExec) without arguments.
 	Exec []string
+	// PreStart lists one-shot commands (path relative to ArtifactDir, plus args) run
+	// in order before Exec, with the same environment; a failing command stops the
+	// unit. GoTrue uses it for "bin/auth migrate".
+	PreStart [][]string
 }
 
 // Unit returns the systemd unit name for the spec.
@@ -58,4 +62,29 @@ type Supervisor interface {
 	Status(ctx context.Context, unit string) (Status, error)
 	// Remove stops the unit and deletes everything Render wrote for it.
 	Remove(ctx context.Context, unit string) error
+}
+
+// StandardExec returns the artifact launcher of svc, relative to the artifact root.
+func StandardExec(svc string) []string {
+	switch svc {
+	case config.SvcPostgres:
+		return []string{"bin/supabase-postgres-start"}
+	case config.SvcGoTrue:
+		return []string{"bin/auth"}
+	case config.SvcPostgREST:
+		return []string{"bin/postgrest"}
+	case config.SvcSupavisor, config.SvcRealtime:
+		return []string{"bin/server"}
+	case config.SvcStorage:
+		return []string{"bin/storage"}
+	case config.SvcPGMeta:
+		return []string{"bin/pgmeta"}
+	case config.SvcStudio:
+		return []string{"bin/studio"}
+	case config.SvcImgproxy:
+		return []string{"bin/imgproxy"}
+	case config.SvcEdgeRuntime:
+		return []string{"bin/edge-runtime"}
+	}
+	return nil
 }
