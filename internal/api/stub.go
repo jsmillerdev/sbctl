@@ -3,7 +3,9 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -16,6 +18,8 @@ import (
 
 const maxStubDepth = 12
 
+var digitsRe = regexp.MustCompile(`^\^\\d\{(\d+)\}\$$`)
+
 // MinimalValue returns the smallest JSON-compatible value valid for s.
 func MinimalValue(s *openapi3.SchemaRef) any { return minimal(s, 0) }
 
@@ -24,6 +28,9 @@ func minimal(ref *openapi3.SchemaRef, depth int) any {
 		return nil
 	}
 	s := ref.Value
+	if s.Const != nil {
+		return s.Const
+	}
 	if len(s.Enum) > 0 {
 		return s.Enum[0]
 	}
@@ -70,7 +77,12 @@ func minimalObject(s *openapi3.Schema, depth int) any {
 	for _, name := range s.Required {
 		p, ok := s.Properties[name]
 		if !ok {
-			out[name] = nil
+			// Required but not declared: the value schema is additionalProperties.
+			if ap := s.AdditionalProperties.Schema; ap != nil {
+				out[name] = minimal(ap, depth+1)
+			} else {
+				out[name] = map[string]any{}
+			}
 			continue
 		}
 		out[name] = minimal(p, depth+1)
@@ -126,7 +138,13 @@ func minimalString(s *openapi3.Schema) string {
 
 // fromPattern handles the few patterns the Supabase specs use for plain tokens.
 func fromPattern(p string) string {
+	if m := digitsRe.FindStringSubmatch(p); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		return strings.Repeat("0", n)
+	}
 	switch {
+	case strings.HasPrefix(p, "^(?:[01]\\d|2[0-3]):[0-5]\\d"):
+		return "00:00"
 	case strings.HasPrefix(p, "^[a-z]+$"):
 		return "a"
 	case strings.HasPrefix(p, `^[\w-]+$`), strings.HasPrefix(p, "^[a-zA-Z0-9_-]+$"):
@@ -142,6 +160,23 @@ func minimalNumber(s *openapi3.Schema, integer bool) any {
 	}
 	if s.Max != nil && *s.Max < v {
 		v = *s.Max
+	}
+	// Exclusive bounds: boolean (OpenAPI 3.0) or numeric (3.1).
+	if s.ExclusiveMin.IsSet() {
+		lo := 0.0
+		if s.Min != nil {
+			lo = *s.Min
+		}
+		if s.ExclusiveMin.Value != nil {
+			lo = *s.ExclusiveMin.Value
+		}
+		if v <= lo {
+			if integer {
+				v = lo + 1
+			} else {
+				v = lo + 0.5
+			}
+		}
 	}
 	if integer {
 		return int64(v)

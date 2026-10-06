@@ -287,10 +287,10 @@ func (s *Server) entitlements(key string) handlerFunc {
 	list := make([]map[string]any, 0, len(keys))
 	for _, k := range keys {
 		name, _ := k.(string)
-		e := map[string]any{"feature": map[string]any{"key": name, "type": entitlementKind(name)}, "hasAccess": true}
-		switch entitlementKind(name) {
+		kind := entitlementKind(name)
+		e := map[string]any{"feature": map[string]any{"key": name, "type": kind}, "type": kind, "hasAccess": true}
+		switch kind {
 		case "numeric":
-			e["type"] = "numeric"
 			e["config"] = map[string]any{"enabled": true, "value": 0, "unlimited": true, "unit": "count"}
 		case "set":
 			e["config"] = map[string]any{"enabled": true, "set": []string{}}

@@ -190,6 +190,11 @@ func firstNonEmpty(vs ...string) string {
 
 // cleanFilePath makes a client file name safe to store: relative, no "..".
 func cleanFilePath(name string) (string, bool) {
+	for _, seg := range strings.FieldsFunc(name, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return "", false
+		}
+	}
 	n := path.Clean("/" + strings.ReplaceAll(name, "\\", "/"))
 	n = strings.TrimPrefix(n, "/")
 	return n, n != "" && n != "." && !strings.Contains(n, "..")
@@ -236,10 +241,13 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 				return errf(http.StatusBadRequest, "Invalid metadata: %v", err)
 			}
 			haveMeta = true
-		case part.FileName() != "":
-			name, ok := cleanFilePath(part.FileName())
+		case partFileName(part) != "":
+			// Part.FileName() keeps only the base name; function files keep their
+			// directories (imports are relative).
+			raw := partFileName(part)
+			name, ok := cleanFilePath(raw)
 			if !ok {
-				return errf(http.StatusBadRequest, "Invalid file name %q", part.FileName())
+				return errf(http.StatusBadRequest, "Invalid file name %q", raw)
 			}
 			files = append(files, FunctionFile{Path: name, Content: data})
 		}
@@ -265,6 +273,15 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeJSON(w, http.StatusCreated, fnJSON(f))
 	return nil
+}
+
+// partFileName returns the filename parameter of a part's Content-Disposition as sent.
+func partFileName(p *multipart.Part) string {
+	_, params, err := mime.ParseMediaType(p.Header.Get("Content-Disposition"))
+	if err != nil {
+		return ""
+	}
+	return params["filename"]
 }
 
 func slugFromName(name string) string {
