@@ -351,6 +351,11 @@ func (s *Store) install(archive, final string, m Marker) error {
 	if err := os.WriteFile(filepath.Join(tmp, markerFile), append(mb, '\n'), 0o644); err != nil {
 		return err
 	}
+	// MkdirTemp creates 0700; artifacts are public software that the sbctl user runs even
+	// when root fetched them, so the root of the tree must be traversable.
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return err
+	}
 	if err := os.Rename(tmp, final); err != nil {
 		if _, serr := os.Stat(final); serr == nil {
 			return nil // another process installed it first

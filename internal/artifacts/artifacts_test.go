@@ -170,6 +170,9 @@ func TestFetchVerifiesUnpacksAndCaches(t *testing.T) {
 	if err != nil || m.Tag != tag || m.Platform != "linux-arm64" {
 		t.Fatalf("marker = %+v, %v", m, err)
 	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("artifact root mode = %v, %v; the sbctl user must be able to traverse a root-fetched artifact", fi, err)
+	}
 	// Second fetch is a no-op.
 	if _, err := s.Fetch(context.Background(), config.SvcGoTrue); err != nil || downloads.Load() != 1 {
 		t.Fatalf("refetch: %v, downloads = %d", err, downloads.Load())

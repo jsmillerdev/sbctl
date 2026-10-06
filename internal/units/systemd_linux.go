@@ -225,7 +225,7 @@ func (s *Systemd) revert(ctx context.Context, unit string) error {
 	}
 	defer bus.Close()
 	obj := bus.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
-	if err := obj.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.RevertUnitFiles", 0, []string{unit}, false).Err; err != nil {
+	if err := obj.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.RevertUnitFiles", 0, []string{unit}).Err; err != nil {
 		return err
 	}
 	return s.Reload(ctx)
