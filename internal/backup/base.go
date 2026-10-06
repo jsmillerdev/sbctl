@@ -1,0 +1,292 @@
+package backup
+
+import (
+	"archive/tar"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/OWNER/sbctl/internal/registry"
+)
+
+// stopTimeout bounds pg_backup_stop, which waits for the WAL of the backup to reach
+// the archive. It only runs long when archive_command is failing.
+const stopTimeout = 15 * time.Minute
+
+// BackupOptions tunes one base backup.
+type BackupOptions struct {
+	// Reason is recorded in the manifest: ReasonManual (default), ReasonScheduled or ReasonFinal.
+	Reason string
+}
+
+// BaseBackup implements Backup: a manual base backup of ref.
+func (s *Service) BaseBackup(ctx context.Context, ref string) (*registry.Backup, error) {
+	return s.BaseBackupWith(ctx, ref, BackupOptions{})
+}
+
+// FinalBackup is the delete-time hook: lifecycle.Manager.Delete calls it while the
+// project's cluster is still running and aborts the delete if it fails. It also
+// satisfies lifecycle.DataPlane.Snapshot's shape.
+func (s *Service) FinalBackup(ctx context.Context, ref string) (*registry.Backup, error) {
+	return s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonFinal})
+}
+
+// BaseBackupWith takes a base backup of ref's running cluster.
+//
+// Method: pg_backup_start() on a superuser connection, a copy of the data directory
+// straight into a tar.zst object in the backend, then pg_backup_stop(), which waits
+// until the WAL covering the backup is archived. Files are read directly because
+// sbctl runs on the same host as the cluster; no replication connection, HBA entry
+// or max_wal_senders is needed (the Supabase Postgres artifact ships none of them
+// ready, and has no pg_basebackup binary). The manifest is written last and marks
+// the backup complete; a failed backup leaves no manifest and its objects are removed.
+func (s *Service) BaseBackupWith(ctx context.Context, ref string, bo BackupOptions) (*registry.Backup, error) {
+	if err := validRef(ref); err != nil {
+		return nil, err
+	}
+	if err := s.need("registry", s.opt.Registry != nil); err != nil {
+		return nil, err
+	}
+	if err := s.need("database access", s.opt.Access != nil); err != nil {
+		return nil, err
+	}
+	if bo.Reason == "" {
+		bo.Reason = ReasonManual
+	}
+	reg := s.opt.Registry
+	proj, err := reg.GetProject(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("backup: project %s: %w", ref, err)
+	}
+
+	started := s.opt.Now().UTC().Truncate(time.Second)
+	id := backupID(started)
+	rec := &registry.Backup{Ref: ref, Kind: "base", Status: registry.BackupRunning, StartedAt: started,
+		Location: s.opt.Store.URL(baseDir(ref) + id)}
+	if err := reg.CreateBackup(ctx, rec); err != nil {
+		return nil, err
+	}
+
+	m, err := s.runBase(ctx, proj, id, started, bo.Reason)
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	now := s.opt.Now()
+	rec.FinishedAt = &now
+	if err != nil {
+		rec.Status, rec.Error = registry.BackupFailed, err.Error()
+		s.cleanupBackup(fctx, ref, id)
+		_ = reg.UpdateBackup(fctx, rec)
+		_ = reg.AppendEvent(fctx, ref, "backup.failed", map[string]any{"id": id, "reason": bo.Reason, "error": err.Error()})
+		return rec, fmt.Errorf("backup: base backup of %s failed: %w", ref, err)
+	}
+	rec.Status, rec.Timeline, rec.StartLSN, rec.StopLSN, rec.SizeBytes = registry.BackupCompleted, m.Timeline, m.StartLSN, m.StopLSN, m.StoredBytes
+	if err := reg.UpdateBackup(fctx, rec); err != nil {
+		return rec, err
+	}
+	_ = reg.AppendEvent(fctx, ref, "backup.completed", map[string]any{"id": id, "reason": bo.Reason, "stored_bytes": m.StoredBytes, "start_lsn": m.StartLSN, "stop_lsn": m.StopLSN})
+	return rec, nil
+}
+
+// cleanupBackup removes whatever a failed backup uploaded.
+func (s *Service) cleanupBackup(ctx context.Context, ref, id string) {
+	objs, err := s.opt.Store.List(ctx, baseDir(ref)+id+"/")
+	if err != nil {
+		return
+	}
+	keys := make([]string, len(objs))
+	for i, o := range objs {
+		keys[i] = o.Key
+	}
+	_ = s.opt.Store.Delete(ctx, keys...)
+}
+
+type serverFacts struct {
+	DataDir        string
+	VersionNum     int
+	ArchiveMode    string
+	ArchiveCommand string
+	FullPageWrites string
+	Tablespaces    int
+	WALSegmentSize int64
+	InRecovery     bool
+}
+
+func (s *Service) runBase(ctx context.Context, proj *registry.Project, id string, started time.Time, reason string) (*Manifest, error) {
+	ref := proj.Ref
+	dsn, err := s.opt.Access.ConnString(ctx, ref, roleAdmin)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("connect to %s: %w", ref, err)
+	}
+	defer func() {
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		conn.Close(cctx)
+	}()
+
+	var f serverFacts
+	err = conn.QueryRow(ctx, `
+		select current_setting('data_directory'), current_setting('server_version_num')::int,
+		       current_setting('archive_mode'), current_setting('archive_command'), current_setting('full_page_writes'),
+		       (select count(*) from pg_tablespace where spcname not in ('pg_default', 'pg_global')),
+		       (select wal_segment_size from pg_control_init()), pg_is_in_recovery()`).
+		Scan(&f.DataDir, &f.VersionNum, &f.ArchiveMode, &f.ArchiveCommand, &f.FullPageWrites, &f.Tablespaces, &f.WALSegmentSize, &f.InRecovery)
+	if err != nil {
+		return nil, fmt.Errorf("inspect cluster: %w", err)
+	}
+	switch {
+	case f.InRecovery:
+		return nil, errors.New("cluster is in recovery; base backups are taken from a primary")
+	case f.VersionNum < 150000:
+		return nil, fmt.Errorf("PostgreSQL %d is too old (pg_backup_start needs 15)", f.VersionNum)
+	case f.ArchiveMode != "on" && f.ArchiveMode != "always":
+		return nil, errors.New("WAL archiving is off (archive_mode): a base backup is useless without archived WAL; configure archive_mode and archive_command (backup.ArchiveSettings)")
+	case strings.TrimSpace(f.ArchiveCommand) == "" || f.ArchiveCommand == "(disabled)":
+		return nil, errors.New("archive_command is empty: configure it with backup.ArchiveSettings")
+	case f.FullPageWrites != "on":
+		return nil, errors.New("full_page_writes is off, which makes file-level backups unsafe")
+	case f.Tablespaces > 0:
+		return nil, ErrTablespaces
+	}
+
+	var locked bool
+	if err := conn.QueryRow(ctx, `select pg_try_advisory_lock(hashtext('sbctl.basebackup'))`).Scan(&locked); err != nil {
+		return nil, err
+	}
+	if !locked {
+		return nil, errors.New("another base backup of this project is running")
+	}
+
+	var startLSN, startWAL string
+	var timeline int
+	if err := conn.QueryRow(ctx, `select pg_backup_start($1, true)::text`, "sbctl "+id).Scan(&startLSN); err != nil {
+		return nil, fmt.Errorf("pg_backup_start: %w", err)
+	}
+	if err := conn.QueryRow(ctx, `select pg_walfile_name($1::pg_lsn), (select timeline_id from pg_control_checkpoint())`, startLSN).Scan(&startWAL, &timeline); err != nil {
+		return nil, err
+	}
+
+	var (
+		stats                    tarStats
+		stopLSN, stopWAL         string
+		stopTime                 time.Time
+		labelFile, tablespaceMap string
+	)
+	dir := baseDir(ref) + id
+	stored, err := s.streamTar(ctx, dir+"/"+dataName, func(tw *tar.Writer) error {
+		var err error
+		if stats, err = writeDataDirTar(ctx, f.DataDir, tw); err != nil {
+			return err
+		}
+		sctx, cancel := context.WithTimeout(ctx, stopTimeout)
+		defer cancel()
+		if err := conn.QueryRow(sctx, `select lsn::text, labelfile, spcmapfile, pg_walfile_name(lsn), clock_timestamp() from pg_backup_stop(true)`).
+			Scan(&stopLSN, &labelFile, &tablespaceMap, &stopWAL, &stopTime); err != nil {
+			return fmt.Errorf("pg_backup_stop (waits for WAL archiving): %w", err)
+		}
+		if err := writeTarFile(tw, "backup_label", []byte(labelFile)); err != nil {
+			return err
+		}
+		if tablespaceMap != "" {
+			return writeTarFile(tw, "tablespace_map", []byte(tablespaceMap))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	m := &Manifest{
+		Version: manifestVersion, ID: id, Ref: ref, Reason: reason,
+		Timeline: timeline, StartLSN: startLSN, StopLSN: stopLSN, StartWAL: startWAL, StopWAL: stopWAL,
+		StartTime: started, StopTime: stopTime.UTC(),
+		PGVersionNum: f.VersionNum, WALSegmentSize: f.WALSegmentSize,
+		Data: dataName, SizeBytes: stats.Bytes, StoredBytes: stored, Files: stats.Files,
+		SBCtlVersion: s.opt.Version,
+	}
+	if m.Project, err = s.projectMeta(ctx, proj); err != nil {
+		return nil, err
+	}
+	if sealed, err := s.opt.Registry.GetSecrets(ctx, ref); err != nil {
+		return nil, err
+	} else if len(sealed) > 0 {
+		b, err := json.Marshal(sealed) // []byte values are base64 in JSON
+		if err != nil {
+			return nil, err
+		}
+		if err := s.opt.Store.Put(ctx, dir+"/"+secretsName, strings.NewReader(string(b))); err != nil {
+			return nil, err
+		}
+		m.Secrets = secretsName
+		m.StoredBytes += int64(len(b))
+	}
+	if err := s.writeManifest(ctx, m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (s *Service) projectMeta(ctx context.Context, p *registry.Project) (*ManifestProject, error) {
+	mp := &ManifestProject{Name: p.Name, Region: p.Region, Class: p.Class, Engine: string(p.Engine), Versions: p.Versions, Limits: p.Limits}
+	if p.OrgID != 0 {
+		o, err := s.opt.Registry.GetOrganizationByID(ctx, p.OrgID)
+		if err != nil {
+			return nil, err
+		}
+		mp.OrgSlug = o.Slug
+	}
+	return mp, nil
+}
+
+func writeTarFile(tw *tar.Writer, name string, b []byte) error {
+	if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: 0o600, Size: int64(len(b)), ModTime: time.Now()}); err != nil {
+		return err
+	}
+	_, err := tw.Write(b)
+	return err
+}
+
+// streamTar runs produce against a tar writer whose output is zstd-compressed and
+// streamed into the store under key, and returns the stored (compressed) size.
+// If produce fails nothing is stored.
+func (s *Service) streamTar(ctx context.Context, key string, produce func(*tar.Writer) error) (int64, error) {
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		err := s.opt.Store.Put(ctx, key, pr)
+		pr.CloseWithError(err)
+		done <- err
+	}()
+
+	cw := &countingWriter{w: pw}
+	err := func() error {
+		enc, err := newEncoder(cw, 2)
+		if err != nil {
+			return err
+		}
+		tw := tar.NewWriter(enc)
+		if err := produce(tw); err != nil {
+			enc.Close()
+			return err
+		}
+		if err := tw.Close(); err != nil {
+			enc.Close()
+			return err
+		}
+		return enc.Close()
+	}()
+	pw.CloseWithError(err) // a nil err closes normally; a real one makes Put abort
+	if perr := <-done; err == nil {
+		err = perr
+	}
+	return cw.n, err
+}

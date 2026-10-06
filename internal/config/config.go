@@ -75,6 +75,15 @@ type Backup struct {
 	RetentionDays    int    `toml:"retention_days"`
 	// BaseBackupOnCalendar is a systemd OnCalendar expression for the nightly base backup timer.
 	BaseBackupOnCalendar string `toml:"base_backup_on_calendar"`
+	// S3AccessKeyID and S3SecretAccessKey are optional static credentials for the s3
+	// backend. When empty the AWS default chain applies (environment, shared config,
+	// instance role), which is what the CloudFormation install uses.
+	S3AccessKeyID     string `toml:"s3_access_key_id"`
+	S3SecretAccessKey string `toml:"s3_secret_access_key"`
+	// ArchiveTimeoutSeconds is PostgreSQL's archive_timeout for project clusters: the
+	// longest an unarchived WAL change waits before the segment is switched and pushed.
+	// Zero means backup.DefaultArchiveTimeout (300 seconds).
+	ArchiveTimeoutSeconds int `toml:"archive_timeout_seconds"`
 }
 
 type Artifacts struct {
