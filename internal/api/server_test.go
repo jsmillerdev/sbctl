@@ -10,14 +10,18 @@ func TestRouteTableBuilds(t *testing.T) {
 	f := newFixture(t) // NewServer panics-or-errors on mux pattern conflicts
 	ops, _ := Operations()
 	impl := f.srv.implemented()
-	missing := 0
+	inSpec := 0
 	for key := range impl {
-		if operationByKey(key) == nil && !strings.Contains(key, "/platform/storage/") && key != "GET /platform/auth/{ref}/users" {
-			t.Errorf("implemented route %q is not an operation of the pinned specs", key)
-			missing++
+		switch {
+		case operationByKey(key) != nil:
+			inSpec++
+		case strings.Contains(key, "/platform/storage/"), key == "GET /platform/auth/{ref}/users":
+			// Studio calls these; the platform spec omits them.
+		default:
+			t.Errorf("implemented route %q is neither an operation of the pinned specs nor a known extra", key)
 		}
 	}
-	t.Logf("%d operations in the specs, %d implemented by hand, %d stubbed", len(ops), len(impl), len(ops)-len(impl))
+	t.Logf("%d operations in the specs: %d implemented by hand, %d stubbed; %d extra routes", len(ops), inSpec, len(ops)-inSpec, len(impl)-inSpec)
 }
 
 func TestAuth(t *testing.T) {

@@ -33,33 +33,96 @@ func (s *Server) upstream(p *registry.Project, svc string) string {
 	return ""
 }
 
-// authMap maps platform auth operations to GoTrue's admin API: method of the
-// upstream request, and its path with {id} substituted.
-var authMap = map[string]struct{ method, path string }{
-	"POST /platform/auth/{ref}/users":        {http.MethodPost, "/admin/users"},
-	"GET /platform/auth/{ref}/users":         {http.MethodGet, "/admin/users"},
-	"PATCH /platform/auth/{ref}/users/{id}":  {http.MethodPut, "/admin/users/{id}"},
-	"DELETE /platform/auth/{ref}/users/{id}": {http.MethodDelete, "/admin/users/{id}"},
-	"POST /platform/auth/{ref}/invite":       {http.MethodPost, "/invite"},
-	"POST /platform/auth/{ref}/magiclink":    {http.MethodPost, "/magiclink"},
-	"POST /platform/auth/{ref}/otp":          {http.MethodPost, "/otp"},
-	"POST /platform/auth/{ref}/recover":      {http.MethodPost, "/recover"},
+// hook rewrites a dashboard request body for the upstream: in is the decoded JSON
+// body ({} when empty), id the {id} path value. It returns the upstream path and body.
+type hook func(r *http.Request, id string, in map[string]any) (path string, body map[string]any)
+
+// proxyRoute maps a platform operation to a call of a project service.
+type proxyRoute struct {
+	method, path string
+	// req rewrites the request body; nil forwards the body untouched.
+	req hook
+	// resp rewrites a 2xx response body; nil forwards it untouched.
+	resp func(s *Server, p *registry.Project, body []byte) []byte
 }
 
-// storageMap maps the dashboard's storage routes (not in the platform spec) to
-// Storage's own API. {id} is the bucket id.
-var storageMap = map[string]struct{ method, path string }{
-	"GET /platform/storage/{ref}/buckets":                      {http.MethodGet, "/bucket"},
-	"POST /platform/storage/{ref}/buckets":                     {http.MethodPost, "/bucket"},
-	"GET /platform/storage/{ref}/buckets/{id}":                 {http.MethodGet, "/bucket/{id}"},
-	"PATCH /platform/storage/{ref}/buckets/{id}":               {http.MethodPut, "/bucket/{id}"},
-	"DELETE /platform/storage/{ref}/buckets/{id}":              {http.MethodDelete, "/bucket/{id}"},
-	"POST /platform/storage/{ref}/buckets/{id}/empty":          {http.MethodPost, "/bucket/{id}/empty"},
-	"POST /platform/storage/{ref}/buckets/{id}/objects/list":   {http.MethodPost, "/object/list/{id}"},
-	"POST /platform/storage/{ref}/buckets/{id}/objects/move":   {http.MethodPost, "/object/move"},
-	"POST /platform/storage/{ref}/buckets/{id}/objects/copy":   {http.MethodPost, "/object/copy"},
-	"POST /platform/storage/{ref}/buckets/{id}/objects/sign":   {http.MethodPost, "/object/sign/{id}"},
-	"POST /platform/storage/{ref}/buckets/{id}/objects/delete": {http.MethodDelete, "/object/{id}"},
+// authMap maps platform auth operations to GoTrue's admin API.
+var authMap = map[string]proxyRoute{
+	"POST /platform/auth/{ref}/users":       {method: http.MethodPost, path: "/admin/users"},
+	"GET /platform/auth/{ref}/users":        {method: http.MethodGet, path: "/admin/users"},
+	"PATCH /platform/auth/{ref}/users/{id}": {method: http.MethodPut, path: "/admin/users/{id}"},
+	"POST /platform/auth/{ref}/invite":      {method: http.MethodPost, path: "/invite"},
+	"POST /platform/auth/{ref}/magiclink":   {method: http.MethodPost, path: "/magiclink"},
+	"POST /platform/auth/{ref}/otp":         {method: http.MethodPost, path: "/otp"},
+	"POST /platform/auth/{ref}/recover":     {method: http.MethodPost, path: "/recover"},
+	"DELETE /platform/auth/{ref}/users/{id}": {method: http.MethodDelete, path: "/admin/users/{id}", req: func(r *http.Request, id string, _ map[string]any) (string, map[string]any) {
+		return "/admin/users/" + id, map[string]any{"should_soft_delete": r.URL.Query().Get("soft_delete") == "true"}
+	}},
+}
+
+// storageMap maps the dashboard's storage routes to Storage's own API ({id} is the
+// bucket id). The request shapes are the platform spec's; Storage's are in
+// supabase/storage src/http/routes.
+var storageMap = map[string]proxyRoute{
+	"GET /platform/storage/{ref}/buckets": {method: http.MethodGet, path: "/bucket"},
+	"POST /platform/storage/{ref}/buckets": {method: http.MethodPost, path: "/bucket", req: func(_ *http.Request, _ string, in map[string]any) (string, map[string]any) {
+		in["name"] = in["id"] // Storage wants a name; the dashboard sends only the id
+		return "/bucket", in
+	}},
+	"GET /platform/storage/{ref}/buckets/{id}":        {method: http.MethodGet, path: "/bucket/{id}"},
+	"PATCH /platform/storage/{ref}/buckets/{id}":      {method: http.MethodPut, path: "/bucket/{id}"},
+	"DELETE /platform/storage/{ref}/buckets/{id}":     {method: http.MethodDelete, path: "/bucket/{id}"},
+	"POST /platform/storage/{ref}/buckets/{id}/empty": {method: http.MethodPost, path: "/bucket/{id}/empty"},
+	"POST /platform/storage/{ref}/buckets/{id}/objects/list": {method: http.MethodPost, path: "/object/list/{id}", req: func(_ *http.Request, id string, in map[string]any) (string, map[string]any) {
+		out := map[string]any{"prefix": in["path"]}
+		if opts, ok := in["options"].(map[string]any); ok {
+			for k, v := range opts {
+				out[k] = v
+			}
+		}
+		return "/object/list/" + id, out
+	}},
+	"POST /platform/storage/{ref}/buckets/{id}/objects/move": {method: http.MethodPost, path: "/object/move", req: moveCopy},
+	"POST /platform/storage/{ref}/buckets/{id}/objects/copy": {method: http.MethodPost, path: "/object/copy", req: moveCopy},
+	"DELETE /platform/storage/{ref}/buckets/{id}/objects": {method: http.MethodDelete, path: "/object/{id}", req: func(_ *http.Request, id string, in map[string]any) (string, map[string]any) {
+		var prefixes []string
+		paths, _ := in["paths"].([]any)
+		for _, p := range paths {
+			switch x := p.(type) {
+			case string:
+				prefixes = append(prefixes, x)
+			case map[string]any:
+				prefixes = append(prefixes, str(x, "path"))
+			}
+		}
+		return "/object/" + id, map[string]any{"prefixes": prefixes}
+	}},
+	"POST /platform/storage/{ref}/buckets/{id}/objects/sign": {method: http.MethodPost, path: "/object/sign/{id}", req: func(_ *http.Request, id string, in map[string]any) (string, map[string]any) {
+		out := map[string]any{"expiresIn": in["expiresIn"]}
+		if opts, ok := in["options"].(map[string]any); ok && opts["transform"] != nil {
+			out["transform"] = opts["transform"]
+		}
+		return "/object/sign/" + id + "/" + strings.TrimPrefix(str(in, "path"), "/"), out
+	}, resp: func(s *Server, p *registry.Project, body []byte) []byte {
+		// Storage answers {signedURL: "/object/sign/..."}; the dashboard wants the full URL.
+		var in struct {
+			SignedURL string `json:"signedURL"`
+		}
+		if json.Unmarshal(body, &in) != nil || in.SignedURL == "" {
+			return body
+		}
+		out, _ := json.Marshal(map[string]string{"signedUrl": s.projectURL(p.Ref) + "/storage/v1" + in.SignedURL})
+		return out
+	}},
+}
+
+// moveCopy maps the dashboard's {from, to} to Storage's bucket-qualified keys.
+func moveCopy(_ *http.Request, id string, in map[string]any) (string, map[string]any) {
+	out := map[string]any{"bucketId": id, "sourceKey": in["from"], "destinationKey": in["to"]}
+	if v, ok := in["sourceVersionId"]; ok {
+		out["sourceVersionId"] = v
+	}
+	return "", out
 }
 
 func (s *Server) routesProxies(add func(string, handlerFunc)) {
@@ -70,17 +133,16 @@ func (s *Server) routesProxies(add func(string, handlerFunc)) {
 		}
 	}
 	for key, m := range authMap {
-		add(key, s.adminProxy(upGoTrue, m.method, m.path, false))
+		add(key, s.adminProxy(upGoTrue, m))
 	}
 	for key, m := range storageMap {
-		add(key, s.adminProxy(upStorage, m.method, m.path, strings.HasSuffix(key, "/objects/delete")))
+		add(key, s.adminProxy(upStorage, m))
 	}
 }
 
 // adminProxy forwards the request to a project service with the project's
-// service_role key. path may contain {id}. deleteObjects rewrites the dashboard's
-// {paths} body into Storage's {prefixes}.
-func (s *Server) adminProxy(svc, method, path string, deleteObjects bool) handlerFunc {
+// service_role key.
+func (s *Server) adminProxy(svc string, m proxyRoute) handlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		p, err := s.running(r.Context(), r.PathValue("ref"))
 		if err != nil {
@@ -90,24 +152,29 @@ func (s *Server) adminProxy(svc, method, path string, deleteObjects bool) handle
 		if err != nil {
 			return err
 		}
-		target := strings.ReplaceAll(path, "{id}", r.PathValue("id"))
+		id := r.PathValue("id")
+		target := strings.ReplaceAll(m.path, "{id}", id)
 		body := io.Reader(http.MaxBytesReader(w, r.Body, maxBody))
-		if deleteObjects {
-			var in struct {
-				Paths []string `json:"paths"`
-			}
+		if m.req != nil {
+			in := map[string]any{}
 			if err := decode(r, &in); err != nil {
 				return err
 			}
-			b, _ := json.Marshal(map[string]any{"prefixes": in.Paths})
+			path, out := m.req(r, id, in)
+			if path != "" {
+				target = path
+			}
+			b, _ := json.Marshal(out)
 			body = bytes.NewReader(b)
 		}
-		req, err := http.NewRequestWithContext(r.Context(), method, s.upstream(p, svc)+target, body)
+		req, err := http.NewRequestWithContext(r.Context(), m.method, s.upstream(p, svc)+target, body)
 		if err != nil {
 			return err
 		}
 		req.URL.RawQuery = r.URL.RawQuery
-		if ct := r.Header.Get("Content-Type"); ct != "" {
+		if m.req != nil {
+			req.Header.Set("Content-Type", "application/json")
+		} else if ct := r.Header.Get("Content-Type"); ct != "" {
 			req.Header.Set("Content-Type", ct)
 		}
 		req.Header.Set("Authorization", "Bearer "+keys.ServiceRoleKey)
@@ -121,6 +188,14 @@ func (s *Server) adminProxy(svc, method, path string, deleteObjects bool) handle
 			return errf(http.StatusBadGateway, "%s is unavailable", svc)
 		}
 		defer resp.Body.Close()
+		if m.resp != nil && resp.StatusCode < 300 {
+			b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+			if err != nil {
+				return err
+			}
+			writeRaw(w, resp.StatusCode, resp.Header.Get("Content-Type"), m.resp(s, p, b))
+			return nil
+		}
 		for _, h := range []string{"Content-Type", "Content-Length"} {
 			if v := resp.Header.Get(h); v != "" {
 				w.Header().Set(h, v)

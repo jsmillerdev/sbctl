@@ -258,7 +258,7 @@ func TestAuthAndStorageProxy(t *testing.T) {
 	if r.Method != "PUT" || r.URL.Path != "/admin/users/u1" || r.Header.Get("Authorization") != "Bearer "+keys.ServiceRoleKey {
 		t.Fatalf("upstream: %s %s auth=%s", r.Method, r.URL.Path, r.Header.Get("Authorization"))
 	}
-	if rec := f.do("POST", "/platform/storage/"+testRef+"/buckets/b1/objects/delete", map[string]any{"paths": []string{"a/b.txt"}}); rec.Code != 200 {
+	if rec := f.do("DELETE", "/platform/storage/"+testRef+"/buckets/b1/objects", map[string]any{"paths": []string{"a/b.txt"}}); rec.Code != 200 {
 		t.Fatalf("storage proxy: %d %s", rec.Code, rec.Body)
 	}
 	r = seen[len(seen)-1]
@@ -476,4 +476,44 @@ func TestProxyRoutes(t *testing.T) {
 	if len(paths) != n {
 		t.Errorf("%d upstream requests for %d proxy calls: %v", len(paths), n, paths)
 	}
+}
+
+func TestStorageRequestMapping(t *testing.T) {
+	f := newFixture(t)
+	type seen struct{ method, path, body string }
+	var got seen
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = seen{r.Method, r.URL.RequestURI(), string(b)}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"signedURL":"/object/sign/b1/a/b.png?token=tok"}`))
+	}))
+	defer up.Close()
+	f.srv.upstreamOverride = func(*registry.Project, string) string { return up.URL }
+	base := "/platform/storage/" + testRef + "/buckets"
+	for _, tc := range []struct {
+		method, path string
+		body         any
+		wantPath     string
+		wantBody     string
+	}{
+		{"POST", base, map[string]any{"id": "avatars", "public": true}, "/bucket", `"name":"avatars"`},
+		{"PATCH", base + "/avatars", map[string]any{"public": false}, "/bucket/avatars", `"public":false`},
+		{"POST", base + "/avatars/objects/list", map[string]any{"path": "folder", "options": map[string]any{"limit": 10, "search": "x"}}, "/object/list/avatars", `"prefix":"folder"`},
+		{"POST", base + "/avatars/objects/move", map[string]any{"from": "a", "to": "b"}, "/object/move", `"bucketId":"avatars","destinationKey":"b","sourceKey":"a"`},
+		{"DELETE", base + "/avatars/objects", map[string]any{"paths": []any{"a", map[string]any{"path": "b", "versionId": "v"}}}, "/object/avatars", `"prefixes":["a","b"]`},
+		{"DELETE", "/platform/auth/" + testRef + "/users/u1?soft_delete=true", nil, "/admin/users/u1", `"should_soft_delete":true`},
+	} {
+		if rec := f.do(tc.method, tc.path, tc.body); rec.Code != 200 {
+			t.Fatalf("%s %s: %d %s", tc.method, tc.path, rec.Code, rec.Body)
+		}
+		if !strings.HasPrefix(got.path, tc.wantPath) || !strings.Contains(got.body, tc.wantBody) {
+			t.Errorf("%s %s -> upstream %s %s %s; want path %s body containing %s", tc.method, tc.path, got.method, got.path, got.body, tc.wantPath, tc.wantBody)
+		}
+	}
+	rec := f.do("POST", base+"/b1/objects/sign", map[string]any{"path": "a/b.png", "expiresIn": 60})
+	if got.path != "/object/sign/b1/a/b.png" || jsonField(t, rec, "signedUrl") != "http://"+testRef+".api.example.test/storage/v1/object/sign/b1/a/b.png?token=tok" && jsonField(t, rec, "signedUrl") != "https://"+testRef+".api.example.test/storage/v1/object/sign/b1/a/b.png?token=tok" {
+		t.Fatalf("sign: upstream %s response %s", got.path, rec.Body)
+	}
+	validateAgainstSpec(t, "POST /platform/storage/{ref}/buckets/{id}/objects/sign", rec.Body.Bytes())
 }
