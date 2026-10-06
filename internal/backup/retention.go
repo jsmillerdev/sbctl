@@ -250,4 +250,3 @@ func (s *Service) PruneAll(ctx context.Context) ([]*PruneResult, error) {
 	}
 	return out, firstErr
 }
-

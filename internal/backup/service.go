@@ -106,7 +106,6 @@ func archiveTimeout(c *config.Config) int {
 	return DefaultArchiveTimeout
 }
 
-
 // RegistryRows lists ref's backup rows in the registry, newest first.
 func (s *Service) RegistryRows(ctx context.Context, ref string) ([]registry.Backup, error) {
 	if err := validRef(ref); err != nil {

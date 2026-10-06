@@ -216,18 +216,12 @@ func (s *Service) runBase(ctx context.Context, proj *registry.Project, id string
 	if m.Project, err = s.projectMeta(ctx, proj); err != nil {
 		return nil, err
 	}
-	if sealed, err := s.opt.Registry.GetSecrets(ctx, ref); err != nil {
+	sealed, err := s.opt.Registry.GetSecrets(ctx, ref)
+	if err != nil {
 		return nil, err
-	} else if len(sealed) > 0 {
-		b, err := json.Marshal(sealed) // []byte values are base64 in JSON
-		if err != nil {
-			return nil, err
-		}
-		if err := s.opt.Store.Put(ctx, dir+"/"+secretsName, strings.NewReader(string(b))); err != nil {
-			return nil, err
-		}
-		m.Secrets = secretsName
-		m.StoredBytes += int64(len(b))
+	}
+	if err := s.writeSecretsFile(ctx, m, sealed); err != nil {
+		return nil, err
 	}
 	if err := s.writeManifest(ctx, m); err != nil {
 		return nil, err
@@ -289,4 +283,23 @@ func (s *Service) streamTar(ctx context.Context, key string, produce func(*tar.W
 		err = perr
 	}
 	return cw.n, err
+}
+
+// writeSecretsFile stores the project's sealed secrets next to the data and records
+// them in m. They are the credentials the cluster inside the backup was running
+// with, which restore must reuse. They stay sealed with the node's master key.
+func (s *Service) writeSecretsFile(ctx context.Context, m *Manifest, sealed map[string][]byte) error {
+	if len(sealed) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(sealed) // []byte values are base64 in JSON
+	if err != nil {
+		return err
+	}
+	if err := s.opt.Store.Put(ctx, m.Dir()+"/"+secretsName, strings.NewReader(string(b))); err != nil {
+		return err
+	}
+	m.Secrets = secretsName
+	m.StoredBytes += int64(len(b))
+	return nil
 }
