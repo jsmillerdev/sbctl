@@ -1,0 +1,135 @@
+From 383c7211549224957bd547c46812410a572e244f Mon Sep 17 00:00:00 2001
+From: sbctl <sbctl@users.noreply.invalid>
+Date: Tue, 6 Oct 2026 11:24:56 -0700
+Subject: [PATCH 1/3] fix(studio): render hCaptcha only when a site key is set
+
+Platform-mode builds that do not configure NEXT_PUBLIC_HCAPTCHA_SITE_KEY
+(for example a self-operated control plane with its own GoTrue) cannot
+sign in: the invisible hCaptcha widget never initializes and the sign-in
+and forgot-password forms wait on it.
+
+Render the widget only when a site key is configured. Both forms already
+treat a missing captcha ref as "no token", so GoTrue instances without
+captcha enabled accept the request.
+---
+ .../SignIn/ForgotPasswordWizard.tsx           | 29 ++++++++++--------
+ .../interfaces/SignIn/SignIn.utils.ts         |  7 +++++
+ .../interfaces/SignIn/SignInForm.tsx          | 30 ++++++++++---------
+ 3 files changed, 39 insertions(+), 27 deletions(-)
+
+diff --git a/apps/studio/components/interfaces/SignIn/ForgotPasswordWizard.tsx b/apps/studio/components/interfaces/SignIn/ForgotPasswordWizard.tsx
+index 6eb2bbc..dc7284a 100644
+--- a/apps/studio/components/interfaces/SignIn/ForgotPasswordWizard.tsx
++++ b/apps/studio/components/interfaces/SignIn/ForgotPasswordWizard.tsx
+@@ -9,6 +9,7 @@ import { Admonition } from 'ui-patterns/Admonition'
+ import { FormItemLayout } from 'ui-patterns/form/FormItemLayout/FormItemLayout'
+ import * as z from 'zod'
+ 
++import { HCAPTCHA_SITE_KEY } from './SignIn.utils'
+ import { useResetPasswordMutation } from '@/data/misc/reset-password-mutation'
+ import { BASE_PATH } from '@/lib/constants'
+ import { auth } from '@/lib/gotrue'
+@@ -178,19 +179,21 @@ const ForgotPasswordForm = ({ onSuccess }: { onSuccess: (email: string) => void
+           )}
+         />
+ 
+-        <div className="self-center">
+-          <HCaptcha
+-            ref={captchaRef}
+-            sitekey={process.env.NEXT_PUBLIC_HCAPTCHA_SITE_KEY!}
+-            size="invisible"
+-            onVerify={(token) => {
+-              setCaptchaToken(token)
+-            }}
+-            onExpire={() => {
+-              setCaptchaToken(null)
+-            }}
+-          />
+-        </div>
++        {HCAPTCHA_SITE_KEY && (
++          <div className="self-center">
++            <HCaptcha
++              ref={captchaRef}
++              sitekey={HCAPTCHA_SITE_KEY}
++              size="invisible"
++              onVerify={(token) => {
++                setCaptchaToken(token)
++              }}
++              onExpire={() => {
++                setCaptchaToken(null)
++              }}
++            />
++          </div>
++        )}
+ 
+         <div className="border-t border-overlay-border" />
+ 
+diff --git a/apps/studio/components/interfaces/SignIn/SignIn.utils.ts b/apps/studio/components/interfaces/SignIn/SignIn.utils.ts
+index e9229aa..6a7c99e 100644
+--- a/apps/studio/components/interfaces/SignIn/SignIn.utils.ts
++++ b/apps/studio/components/interfaces/SignIn/SignIn.utils.ts
+@@ -5,6 +5,13 @@ import { toast } from 'sonner'
+ import { captureCriticalError } from '@/lib/error-reporting'
+ import type { useTrackFunnelError } from '@/lib/telemetry/use-track-funnel-error'
+ 
++/**
++ * hCaptcha is only rendered when a site key is configured. Without a key the
++ * widget cannot initialize and would block sign-in; callers treat a missing
++ * captcha ref as "no token".
++ */
++export const HCAPTCHA_SITE_KEY = process.env.NEXT_PUBLIC_HCAPTCHA_SITE_KEY
++
+ type TrackFunnelError = ReturnType<typeof useTrackFunnelError>
+ 
+ export async function resolveCaptchaToken(
+diff --git a/apps/studio/components/interfaces/SignIn/SignInForm.tsx b/apps/studio/components/interfaces/SignIn/SignInForm.tsx
+index ac85aef..e1f35ef 100644
+--- a/apps/studio/components/interfaces/SignIn/SignInForm.tsx
++++ b/apps/studio/components/interfaces/SignIn/SignInForm.tsx
+@@ -14,7 +14,7 @@ import { FormItemLayout } from 'ui-patterns/form/FormItemLayout/FormItemLayout'
+ import z from 'zod'
+ 
+ import { LastSignInWrapper } from './LastSignInWrapper'
+-import { resolveCaptchaToken } from './SignIn.utils'
++import { HCAPTCHA_SITE_KEY, resolveCaptchaToken } from './SignIn.utils'
+ import { AlertError } from '@/components/ui/AlertError'
+ import { useAddLoginEvent } from '@/data/misc/audit-login-mutation'
+ import { getMfaAuthenticatorAssuranceLevel } from '@/data/profile/mfa-authenticator-assurance-level-query'
+@@ -205,19 +205,21 @@ export const SignInForm = () => {
+           </Link>
+         </div>
+ 
+-        <div className="self-center">
+-          <HCaptcha
+-            ref={captchaRef}
+-            sitekey={process.env.NEXT_PUBLIC_HCAPTCHA_SITE_KEY!}
+-            size="invisible"
+-            onVerify={(token) => {
+-              setCaptchaToken(token)
+-            }}
+-            onExpire={() => {
+-              setCaptchaToken(null)
+-            }}
+-          />
+-        </div>
++        {HCAPTCHA_SITE_KEY && (
++          <div className="self-center">
++            <HCaptcha
++              ref={captchaRef}
++              sitekey={HCAPTCHA_SITE_KEY}
++              size="invisible"
++              onVerify={(token) => {
++                setCaptchaToken(token)
++              }}
++              onExpire={() => {
++                setCaptchaToken(null)
++              }}
++            />
++          </div>
++        )}
+ 
+         <LastSignInWrapper type="email">
+           <Button
+-- 
+2.50.1 (Apple Git-155)
+
