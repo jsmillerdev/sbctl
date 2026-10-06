@@ -63,6 +63,7 @@ type TLS struct {
 	Email       string            `toml:"email"`
 	DNSProvider string            `toml:"dns_provider"` // route53 | cloudflare | hetzner | digitalocean
 	CA          string            `toml:"ca"`           // ACME directory URL; empty = Let's Encrypt production
+	CACert      string            `toml:"ca_cert"`      // PEM file of the root that signs the ACME directory's own TLS certificate (private CAs, Pebble)
 	Credentials map[string]string `toml:"credentials"`  // provider-specific, e.g. api_token
 }
 
