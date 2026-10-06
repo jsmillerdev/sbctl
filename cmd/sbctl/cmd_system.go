@@ -71,6 +71,33 @@ configuration. Run it as the user that owns the state directory (sbctl).`,
 		},
 	}
 
+	start := &cobra.Command{
+		Use:   "start",
+		Short: "Start the system project and every active project",
+		Long:  "Starts the system cluster and GoTrue, then every project the registry lists as active. Use it after `sbctl system stop`; on a server the daemon and systemd do this at boot.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			n, err := lifecycle.InitSystem(cmd.Context(), cfg, openOptions(cfg), false)
+			if err != nil {
+				return err
+			}
+			defer n.Close()
+			errs := n.Engine.StartActive(cmd.Context())
+			for ref, err := range errs {
+				fmt.Fprintf(os.Stderr, "project %s: %v\n", ref, err)
+			}
+			if len(errs) > 0 {
+				return fmt.Errorf("%d project(s) failed to start", len(errs))
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "started")
+			return nil
+		},
+	}
+
 	stop := &cobra.Command{
 		Use:   "stop",
 		Short: "Stop every project's units, then the system project's",
@@ -116,6 +143,6 @@ configuration. Run it as the user that owns the state directory (sbctl).`,
 	install.Flags().StringVar(&sysUnitDir, "unit-dir", "/etc/systemd/system", "where to write unit files")
 	install.Flags().StringVar(&sysPolkitDir, "polkit-dir", "/etc/polkit-1/rules.d", "where to write the polkit rule (empty skips it)")
 
-	systemCmd.AddCommand(initCmd, status, stop, install)
+	systemCmd.AddCommand(initCmd, status, start, stop, install)
 	rootCmd.AddCommand(systemCmd)
 }

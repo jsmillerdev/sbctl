@@ -452,6 +452,44 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 	return &nk, nil
 }
 
+// StartActive starts every project the registry lists as ACTIVE (after a reboot, or
+// after `sbctl system stop`), one at a time, and returns the errors by ref. A project
+// that fails to start is marked ACTIVE_UNHEALTHY; paused projects are left alone.
+func (e *Engine) StartActive(ctx context.Context) map[string]error {
+	errs := map[string]error{}
+	ps, err := e.reg.ListProjects(ctx)
+	if err != nil {
+		errs[""] = err
+		return errs
+	}
+	for i := range ps {
+		p := ps[i]
+		if p.Ref == config.SystemRef || !active(p.Status) {
+			continue
+		}
+		if err := e.startOne(ctx, &p); err != nil {
+			errs[p.Ref] = err
+		}
+	}
+	return errs
+}
+
+func (e *Engine) startOne(ctx context.Context, p *registry.Project) error {
+	defer e.lock(p.Ref)()
+	keys, err := e.loadKeys(ctx, p.Ref)
+	if err == nil {
+		err = e.plane.Start(ctx, p, keys)
+	}
+	want := registry.StatusActiveHealthy
+	if err != nil {
+		want = registry.StatusActiveUnhealthy
+	}
+	if want != p.Status {
+		_ = e.reg.SetProjectStatus(ctx, p.Ref, want)
+	}
+	return err
+}
+
 // Keys implements Manager.
 func (e *Engine) Keys(ctx context.Context, ref string) (*secrets.ProjectKeys, error) {
 	if _, err := e.reg.GetProject(ctx, ref); err != nil {

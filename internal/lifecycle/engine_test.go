@@ -1,0 +1,637 @@
+package lifecycle
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/fleet"
+	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/OWNER/sbctl/internal/secrets"
+)
+
+// fakePlane records calls and fails on demand; it stands in for PostgresPlane.
+type fakePlane struct {
+	mu      sync.Mutex
+	calls   []string
+	failOn  map[string]error
+	seeded  bool
+	keysIn  *secrets.ProjectKeys
+	reconf  []string // JWT secrets passed to Reconfigure
+	healthy bool
+}
+
+func newFakePlane() *fakePlane { return &fakePlane{failOn: map[string]error{}, healthy: true} }
+
+func (f *fakePlane) rec(call string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, call)
+	return f.failOn[strings.SplitN(call, " ", 2)[0]]
+}
+
+func (f *fakePlane) has(call string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if c == call {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakePlane) Create(_ context.Context, p *registry.Project, k *secrets.ProjectKeys, seed DataSeeder) error {
+	f.keysIn, f.seeded = k, seed != nil
+	return f.rec("Create " + p.Ref)
+}
+func (f *fakePlane) Delete(_ context.Context, ref string) error { return f.rec("Delete " + ref) }
+func (f *fakePlane) Snapshot(context.Context, string) (*registry.Backup, error) {
+	return nil, ErrNoSnapshot
+}
+func (f *fakePlane) Route(context.Context, string) (Upstreams, error) { return Upstreams{}, nil }
+func (f *fakePlane) Usage(context.Context, string) (Usage, error)     { return Usage{}, nil }
+func (f *fakePlane) Start(_ context.Context, p *registry.Project, _ *secrets.ProjectKeys) error {
+	return f.rec("Start " + p.Ref)
+}
+func (f *fakePlane) StartDatabase(_ context.Context, p *registry.Project, _ *secrets.ProjectKeys) error {
+	return f.rec("StartDatabase " + p.Ref)
+}
+func (f *fakePlane) Stop(_ context.Context, ref string) error { return f.rec("Stop " + ref) }
+func (f *fakePlane) Reconfigure(_ context.Context, p *registry.Project, k *secrets.ProjectKeys) error {
+	f.reconf = append(f.reconf, k.JWTSecret)
+	return f.rec("Reconfigure " + p.Ref)
+}
+func (f *fakePlane) Health(_ context.Context, p *registry.Project, _ *secrets.ProjectKeys) []ServiceHealth {
+	return []ServiceHealth{{Name: config.SvcPostgres, Healthy: f.healthy, Status: "x"}}
+}
+
+type fakeArts struct{}
+
+func (fakeArts) Dir(svc string) (string, error) { return "/art/" + svc, nil }
+func (fakeArts) Tag(svc string) (string, error) { return svc + "-tag", nil }
+
+type fakeTenant struct {
+	mu      sync.Mutex
+	ensured []fleet.TenantSpec
+	removed []string
+	err     error
+}
+
+func (f *fakeTenant) Service() string { return config.SvcRealtime }
+func (f *fakeTenant) EnsureTenant(_ context.Context, s fleet.TenantSpec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensured = append(f.ensured, s)
+	return f.err
+}
+func (f *fakeTenant) RemoveTenant(_ context.Context, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = append(f.removed, ref)
+	return f.err
+}
+
+type fakeBackup struct {
+	calls []string
+	err   error
+}
+
+func (f *fakeBackup) BaseBackup(_ context.Context, ref string) (*registry.Backup, error) {
+	f.calls = append(f.calls, ref)
+	return &registry.Backup{Ref: ref}, f.err
+}
+
+type harness struct {
+	e      *Engine
+	reg    *registry.Memory
+	plane  *fakePlane
+	tenant *fakeTenant
+	backup *fakeBackup
+	cfg    *config.Config
+	sec    secrets.Secrets
+}
+
+func newHarness(t *testing.T) *harness {
+	t.Helper()
+	cfg := config.Default()
+	cfg.Domain = "example.test"
+	key := make([]byte, 32)
+	sec, err := secrets.New(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &harness{reg: registry.NewMemory(), plane: newFakePlane(), tenant: &fakeTenant{}, backup: &fakeBackup{}, cfg: cfg, sec: sec}
+	h.e = NewEngine(cfg, h.reg, sec, fakeArts{}, h.plane, Options{Fleet: fleet.Fleet{h.tenant}, Backup: h.backup})
+	return h
+}
+
+func (h *harness) create(t *testing.T) *registry.Project {
+	t.Helper()
+	p, err := h.e.Create(context.Background(), CreateRequest{Name: "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestCreateHappyPath(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	if p.Status != registry.StatusActiveHealthy || p.Seq != 1 || p.Class != DefaultClass || !secrets.ValidRef(p.Ref) {
+		t.Fatalf("project = %+v", p)
+	}
+	if p.Versions[config.SvcGoTrue] != "gotrue-tag" || p.Limits != h.cfg.Defaults {
+		t.Fatalf("versions/limits = %v %v", p.Versions, p.Limits)
+	}
+	routes, _ := h.reg.ListRoutes(ctx)
+	if len(routes) != 1 || routes[0].Host != p.Ref+".api.example.test" || routes[0].Ref != p.Ref {
+		t.Fatalf("routes = %+v", routes)
+	}
+	keys, err := h.e.Keys(ctx, p.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *keys != *h.plane.keysIn {
+		t.Fatal("stored keys differ from the keys the data plane received")
+	}
+	if _, err := secrets.ParseHS256(keys.AnonKey, keys.JWTSecret); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.tenant.ensured) != 1 || h.tenant.ensured[0].Ref != p.Ref || h.tenant.ensured[0].DBPort != h.cfg.PortsFor(p.Ref, 1).Postgres ||
+		h.tenant.ensured[0].JWTSecret != keys.JWTSecret || h.tenant.ensured[0].Host != p.Ref+".api.example.test" {
+		t.Fatalf("tenant spec = %+v", h.tenant.ensured)
+	}
+	// The fleet is called after the units are up.
+	if h.plane.calls[0] != "Create "+p.Ref {
+		t.Fatalf("calls = %v", h.plane.calls)
+	}
+	evs, _ := h.reg.ListEvents(ctx, p.Ref, 10)
+	if len(evs) != 1 || evs[0].Kind != "project.created" {
+		t.Fatalf("events = %+v", evs)
+	}
+	org, err := h.reg.GetOrganization(ctx, "default")
+	if err != nil || p.OrgID != org.ID {
+		t.Fatalf("org = %+v %v", org, err)
+	}
+}
+
+func TestCreateRequestOptions(t *testing.T) {
+	h := newHarness(t)
+	k, err := secrets.NewProjectKeys("abcdefghijklmnopqrst", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := DataSeeder(func(context.Context, *registry.Project, string) error { return nil })
+	lim := config.Limits{MemoryMax: "512M", CPUQuota: "50%"}
+	p, err := h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu"})
+	if err == nil {
+		t.Fatal("unknown organization must fail")
+	}
+	if _, err := h.reg.CreateOrganization(context.Background(), "acme", "Acme"); err != nil {
+		t.Fatal(err)
+	}
+	p, err = h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Ref != "abcdefghijklmnopqrst" || p.Class != "micro" || p.Limits != lim || p.Region != "eu" || p.Name != p.Ref {
+		t.Fatalf("project = %+v", p)
+	}
+	if !h.plane.seeded || h.plane.keysIn.JWTSecret != k.JWTSecret || h.plane.keysIn.DBPassword != "pw" {
+		t.Fatalf("seed=%v keys=%+v", h.plane.seeded, h.plane.keysIn)
+	}
+	if k.DBPassword == "pw" {
+		t.Fatal("caller's keys were modified")
+	}
+	// Same ref again.
+	if _, err := h.e.Create(context.Background(), CreateRequest{Ref: p.Ref, OrgSlug: "acme"}); !errors.Is(err, registry.ErrConflict) {
+		t.Fatalf("duplicate: %v", err)
+	}
+}
+
+func TestCreateValidation(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	for _, req := range []CreateRequest{{Ref: "system"}, {Ref: "SHORT"}, {Class: "huge"}, {Class: ClassSystem}} {
+		if _, err := h.e.Create(ctx, req); err == nil {
+			t.Errorf("%+v: expected error", req)
+		}
+	}
+	h.cfg.Domain = ""
+	if _, err := h.e.Create(ctx, CreateRequest{}); err == nil || !strings.Contains(err.Error(), "domain") {
+		t.Fatalf("no domain: %v", err)
+	}
+	if ps, _ := h.reg.ListProjects(ctx); len(ps) != 0 {
+		t.Fatalf("validation errors must not leave rows: %+v", ps)
+	}
+}
+
+// A failure after the row exists leaves INIT_FAILED, removes units, route and tenants,
+// and records why.
+func TestCreateFailureLeavesInitFailedAndCleansUp(t *testing.T) {
+	for _, stage := range []string{"plane", "fleet"} {
+		t.Run(stage, func(t *testing.T) {
+			h := newHarness(t)
+			ctx := context.Background()
+			boom := errors.New("boom")
+			if stage == "plane" {
+				h.plane.failOn["Create"] = boom
+			} else {
+				h.tenant.err = boom
+			}
+			_, err := h.e.Create(ctx, CreateRequest{Ref: "abcdefghijklmnopqrst"})
+			if !errors.Is(err, boom) || !strings.Contains(err.Error(), "INIT_FAILED") {
+				t.Fatalf("err = %v", err)
+			}
+			p, err := h.reg.GetProject(ctx, "abcdefghijklmnopqrst")
+			if err != nil || p.Status != registry.StatusInitFailed {
+				t.Fatalf("project = %+v %v", p, err)
+			}
+			if !h.plane.has("Delete abcdefghijklmnopqrst") {
+				t.Fatalf("data plane was not cleaned up: %v", h.plane.calls)
+			}
+			if routes, _ := h.reg.ListRoutes(ctx); len(routes) != 0 {
+				t.Fatalf("routes = %+v", routes)
+			}
+			if stage == "fleet" && len(h.tenant.removed) != 1 {
+				t.Fatalf("tenants not removed: %v", h.tenant.removed)
+			}
+			evs, _ := h.reg.ListEvents(ctx, p.Ref, 10)
+			if len(evs) != 1 || evs[0].Kind != "project.init_failed" || !strings.Contains(string(evs[0].Payload), "boom") {
+				t.Fatalf("events = %+v", evs)
+			}
+			// An INIT_FAILED project can be deleted without a backup attempt.
+			if err := h.e.Delete(ctx, p.Ref); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.backup.calls) != 0 {
+				t.Fatalf("backup of a failed project: %v", h.backup.calls)
+			}
+			if _, err := h.reg.GetProject(ctx, p.Ref); !errors.Is(err, registry.ErrNotFound) {
+				t.Fatalf("row still there: %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateFailureSurvivesCancelledContext(t *testing.T) {
+	h := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	h.plane.failOn["Create"] = context.Canceled
+	cancel()
+	// CreateProject on the memory registry ignores ctx; the cleanup must still run.
+	_, err := h.e.Create(ctx, CreateRequest{Ref: "abcdefghijklmnopqrst"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	p, _ := h.reg.GetProject(context.Background(), "abcdefghijklmnopqrst")
+	if p == nil || p.Status != registry.StatusInitFailed || !h.plane.has("Delete abcdefghijklmnopqrst") {
+		t.Fatalf("cleanup did not run: %+v %v", p, h.plane.calls)
+	}
+}
+
+func TestPauseResume(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	if err := h.e.Resume(ctx, p.Ref); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("resume of active: %v", err)
+	}
+	if err := h.e.Pause(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusInactive {
+		t.Fatalf("status = %s", got.Status)
+	}
+	if err := h.e.Pause(ctx, p.Ref); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("pause twice: %v", err)
+	}
+	if err := h.e.Resume(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusActiveHealthy {
+		t.Fatalf("status = %s", got.Status)
+	}
+	if err := h.e.Pause(ctx, "nosuchproject"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("missing: %v", err)
+	}
+	if err := h.e.Pause(ctx, config.SystemRef); err == nil {
+		t.Fatal("system must not pause")
+	}
+}
+
+func TestResumeFailureStaysInactive(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	if err := h.e.Pause(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	h.plane.calls = nil
+	h.plane.failOn["Start"] = errors.New("no postgres")
+	if err := h.e.Resume(ctx, p.Ref); err == nil {
+		t.Fatal("expected error")
+	}
+	if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusInactive {
+		t.Fatalf("status = %s", got.Status)
+	}
+	if !h.plane.has("Stop " + p.Ref) {
+		t.Fatalf("partial start was not stopped: %v", h.plane.calls)
+	}
+	delete(h.plane.failOn, "Start")
+	if err := h.e.Resume(ctx, p.Ref); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+}
+
+func TestPauseFailureMarksUnhealthy(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	h.plane.failOn["Stop"] = errors.New("stuck")
+	if err := h.e.Pause(ctx, p.Ref); err == nil {
+		t.Fatal("expected error")
+	}
+	if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusActiveUnhealthy {
+		t.Fatalf("status = %s", got.Status)
+	}
+}
+
+func TestDelete(t *testing.T) {
+	ctx := context.Background()
+	t.Run("active takes a final backup first", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		h.plane.calls = nil
+		if err := h.e.Delete(ctx, p.Ref); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.backup.calls) != 1 || h.plane.has("StartDatabase "+p.Ref) || !h.plane.has("Delete "+p.Ref) {
+			t.Fatalf("backup=%v calls=%v", h.backup.calls, h.plane.calls)
+		}
+		if len(h.tenant.removed) != 1 {
+			t.Fatalf("tenants removed: %v", h.tenant.removed)
+		}
+		if routes, _ := h.reg.ListRoutes(ctx); len(routes) != 0 {
+			t.Fatalf("routes: %+v", routes)
+		}
+		if _, err := h.reg.GetProject(ctx, p.Ref); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatal("row remains")
+		}
+		if _, err := h.reg.GetSecrets(ctx, p.Ref); err != nil {
+			// secrets cascade with the project; Memory returns an empty map or ErrNotFound
+			if !errors.Is(err, registry.ErrNotFound) {
+				t.Fatal(err)
+			}
+		}
+	})
+	t.Run("paused starts the database for the backup then stops it", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		if err := h.e.Pause(ctx, p.Ref); err != nil {
+			t.Fatal(err)
+		}
+		h.plane.calls = nil
+		if err := h.e.Delete(ctx, p.Ref); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"StartDatabase " + p.Ref, "Stop " + p.Ref, "Delete " + p.Ref}
+		if strings.Join(h.plane.calls, "|") != strings.Join(want, "|") || len(h.backup.calls) != 1 {
+			t.Fatalf("calls = %v backup = %v", h.plane.calls, h.backup.calls)
+		}
+	})
+	t.Run("backup failure keeps the project", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		h.backup.err = errors.New("s3 down")
+		h.plane.calls = nil
+		err := h.e.Delete(ctx, p.Ref)
+		if err == nil || !strings.Contains(err.Error(), "s3 down") {
+			t.Fatalf("err = %v", err)
+		}
+		got, gerr := h.reg.GetProject(ctx, p.Ref)
+		if gerr != nil || got.Status != registry.StatusActiveHealthy || h.plane.has("Delete "+p.Ref) || len(h.tenant.removed) != 0 {
+			t.Fatalf("project not intact: %+v %v calls=%v", got, gerr, h.plane.calls)
+		}
+		if err := h.e.DeleteWith(ctx, p.Ref, DeleteOptions{SkipFinalBackup: true}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("no backup engine skips it", func(t *testing.T) {
+		h := newHarness(t)
+		h.e.opts.Backup = nil
+		p := h.create(t)
+		if err := h.e.Delete(ctx, p.Ref); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("tenant cleanup failure does not block deletion", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		h.tenant.err = errors.New("realtime down")
+		if err := h.e.Delete(ctx, p.Ref); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.reg.GetProject(ctx, p.Ref); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatal("row remains")
+		}
+	})
+	t.Run("data plane failure leaves GOING_DOWN so delete can be repeated", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		h.plane.failOn["Delete"] = errors.New("busy")
+		if err := h.e.Delete(ctx, p.Ref); err == nil {
+			t.Fatal("expected error")
+		}
+		if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusGoingDown {
+			t.Fatalf("status = %s", got.Status)
+		}
+		delete(h.plane.failOn, "Delete")
+		if err := h.e.Delete(ctx, p.Ref); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("system cannot be deleted", func(t *testing.T) {
+		h := newHarness(t)
+		h.reg.CreateProject(ctx, &registry.Project{Ref: config.SystemRef, Name: "system", Status: registry.StatusActiveHealthy})
+		if err := h.e.Delete(ctx, config.SystemRef); !errors.Is(err, ErrInvalidState) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestRotateKeys(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	old, _ := h.e.Keys(ctx, p.Ref)
+	nk, err := h.e.RotateKeys(ctx, p.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nk.JWTSecret == old.JWTSecret || nk.AnonKey == old.AnonKey || nk.ServiceRoleKey == old.ServiceRoleKey ||
+		nk.PublishableKey == old.PublishableKey || nk.SecretKey == old.SecretKey {
+		t.Fatal("a key was not rotated")
+	}
+	if nk.DBPassword != old.DBPassword || nk.AdminPassword != old.AdminPassword || nk.PGSodiumRootKey != old.PGSodiumRootKey {
+		t.Fatal("database credentials must not change")
+	}
+	if _, err := secrets.ParseHS256(old.AnonKey, nk.JWTSecret); err == nil {
+		t.Fatal("old anon key still verifies")
+	}
+	if _, err := secrets.ParseHS256(nk.ServiceRoleKey, nk.JWTSecret); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := h.e.Keys(ctx, p.Ref)
+	if *stored != *nk {
+		t.Fatal("rotated keys were not stored")
+	}
+	if len(h.plane.reconf) != 1 || h.plane.reconf[0] != nk.JWTSecret {
+		t.Fatalf("reconfigure got %v", h.plane.reconf)
+	}
+	if got := h.tenant.ensured[len(h.tenant.ensured)-1]; got.JWTSecret != nk.JWTSecret {
+		t.Fatal("fleet tenants were not updated")
+	}
+}
+
+func TestRotateKeysRestoresOnFailure(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	old, _ := h.e.Keys(ctx, p.Ref)
+	h.plane.failOn["Reconfigure"] = errors.New("gotrue will not start")
+	if _, err := h.e.RotateKeys(ctx, p.Ref); err == nil {
+		t.Fatal("expected error")
+	}
+	h.plane.failOn = map[string]error{}
+	got, _ := h.e.Keys(ctx, p.Ref)
+	if *got != *old {
+		t.Fatal("previous keys were not restored")
+	}
+	if n := len(h.plane.reconf); n != 2 || h.plane.reconf[1] != old.JWTSecret {
+		t.Fatalf("units not restarted on the old secret: %v", h.plane.reconf)
+	}
+}
+
+func TestRotateKeysPausedOnlyStoresKeys(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	h.e.Pause(ctx, p.Ref)
+	nk, err := h.e.RotateKeys(ctx, p.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.plane.reconf) != 0 {
+		t.Fatal("paused project must not be restarted")
+	}
+	if got, _ := h.e.Keys(ctx, p.Ref); got.JWTSecret != nk.JWTSecret {
+		t.Fatal("keys not stored")
+	}
+}
+
+func TestHealthUpdatesStatus(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	h.plane.healthy = false
+	hs, err := h.e.Health(ctx, p.Ref)
+	if err != nil || healthyAll(hs) {
+		t.Fatalf("health = %+v %v", hs, err)
+	}
+	if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusActiveUnhealthy {
+		t.Fatalf("status = %s", got.Status)
+	}
+	h.plane.healthy = true
+	h.e.Health(ctx, p.Ref)
+	if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusActiveHealthy {
+		t.Fatalf("status = %s", got.Status)
+	}
+	// A paused project keeps its status however unhealthy its units are.
+	h.e.Pause(ctx, p.Ref)
+	h.plane.healthy = false
+	h.e.Health(ctx, p.Ref)
+	if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusInactive {
+		t.Fatalf("status = %s", got.Status)
+	}
+}
+
+func healthyAll(hs []ServiceHealth) bool {
+	for _, h := range hs {
+		if !h.Healthy {
+			return false
+		}
+	}
+	return true
+}
+
+func TestConnString(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	keys, _ := h.e.Keys(ctx, p.Ref)
+	dsn, err := h.e.ConnString(ctx, p.Ref, "postgres")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("postgres://postgres:%s@127.0.0.1:%d/postgres?sslmode=disable", keys.DBPassword, h.cfg.PortsFor(p.Ref, p.Seq).Postgres)
+	if dsn != want {
+		t.Fatalf("dsn = %s", dsn)
+	}
+	if _, err := h.e.ConnString(ctx, p.Ref, "authenticator"); err == nil {
+		t.Fatal("only postgres and supabase_admin are supported")
+	}
+}
+
+func TestStartActive(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	a, b := h.create(t), h.create(t)
+	if err := h.e.Pause(ctx, b.Ref); err != nil {
+		t.Fatal(err)
+	}
+	h.plane.calls = nil
+	if errs := h.e.StartActive(ctx); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if !h.plane.has("Start "+a.Ref) || h.plane.has("Start "+b.Ref) {
+		t.Fatalf("calls = %v", h.plane.calls)
+	}
+	h.plane.failOn["Start"] = errors.New("nope")
+	errs := h.e.StartActive(ctx)
+	if errs[a.Ref] == nil {
+		t.Fatal("expected a failure for the active project")
+	}
+	if got, _ := h.reg.GetProject(ctx, a.Ref); got.Status != registry.StatusActiveUnhealthy {
+		t.Fatalf("status = %s", got.Status)
+	}
+}
+
+func TestClasses(t *testing.T) {
+	for _, n := range ClassNames() {
+		c, err := ClassFor(n)
+		if err != nil || c.MaxConnections <= 0 || c.SharedBuffers == "" {
+			t.Fatalf("class %s: %+v %v", n, c, err)
+		}
+	}
+	if _, err := ClassFor("nope"); err == nil {
+		t.Fatal("unknown class accepted")
+	}
+	// The default must stay small: a developer machine runs several of these.
+	d, _ := ClassFor("")
+	if d.SharedBuffers != "32MB" || d.MaxConnections != 60 {
+		t.Fatalf("default class = %+v", d)
+	}
+	for _, n := range ClassNames() {
+		if n == ClassSystem {
+			t.Fatal("system class must not be user selectable")
+		}
+	}
+}

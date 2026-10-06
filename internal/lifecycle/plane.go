@@ -93,8 +93,11 @@ func (pl *PostgresPlane) prepare(p *registry.Project, keys *secrets.ProjectKeys)
 	if n := len(pp.SockFile); n > unixSocketMax {
 		return fmt.Errorf("lifecycle: unix socket path %s is %d bytes, over the %d the OS allows; use a shorter state_dir", pp.SockFile, n, unixSocketMax)
 	}
-	for _, d := range []string{pl.cfg.Paths().Project(p.Ref), pp.Dir, pp.Sock,
-		pl.cfg.Paths().ProjectService(p.Ref, config.SvcGoTrue), pl.cfg.Paths().ProjectService(p.Ref, config.SvcPostgREST)} {
+	dirs := []string{pl.cfg.Paths().Project(p.Ref), pp.Dir, pp.Sock, pl.cfg.Paths().ProjectService(p.Ref, config.SvcGoTrue)}
+	if hasPostgREST(p.Ref) {
+		dirs = append(dirs, pl.cfg.Paths().ProjectService(p.Ref, config.SvcPostgREST))
+	}
+	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o750); err != nil {
 			return err
 		}
