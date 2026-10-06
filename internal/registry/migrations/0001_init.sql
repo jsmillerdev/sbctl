@@ -1,7 +1,7 @@
 -- sbctl registry, database "sbctl" in the system cluster.
 -- Migration files are applied in lexical order. Number ranges per area avoid
 -- collisions between parallel work: 0001-0099 core, 0100-0199 api, 0200-0299 proxy,
--- 0300-0399 lifecycle/units, 0400-0499 backup, 0500-0599 fleet, 0600-0699 installer.
+-- 0300-0399 lifecycle/units, 0400-0499 backup, 0500-0599 fleet, 0600-0699 installer, 0700-0799 branching.
 
 create table sbctl.organizations (
   id         bigint generated always as identity primary key,

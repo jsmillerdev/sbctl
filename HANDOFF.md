@@ -93,11 +93,18 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 - `tests/conformance/`: given a running node, create two projects and run the upstream `supabase-js` test suites for auth, postgrest, realtime, storage against each, plus Playwright smoke on Studio (sign in, switch project, table editor, SQL editor). Nightly and on every `versions.yaml` bump.
 - `tests/specdiff/`: nightly fetch of the three OpenAPI specs and a diff against the routes the server registers; new P0-tier routes fail the build.
 
+### I. Branching (starts once B, D and F are merged; DESIGN.md section 9a)
+- Registry: `projects.parent_ref`, `branch_name`, `persistent`, `expires_at` (migration range 0700-0799). A branch is a project; its ref, keys and host are its own.
+- API: `GET/POST /v1/projects/{ref}/branches`, `GET /v1/projects/{ref}/branches/{name}`, `GET/PATCH/DELETE /v1/branches/{id_or_ref}`, `POST /v1/branches/{id_or_ref}/merge|reset|push`, plus the `/platform` twins Studio uses and the entitlement that unlocks branching in the CLI. Shapes from the specs.
+- Create: schema-only by default (parent's `supabase_migrations` history and `seed.sql`); `with_data` clones the parent's data directory copy-on-write (reflink inside `pg_backup_start`/`pg_backup_stop`) on XFS, btrfs or ZFS, else restores the parent's latest base backup plus WAL through F.
+- Merge, reset, push as schema operations over migration history; expiry sweeper for `expires_at`.
+- Verify with the Supabase MCP server's branch tools and `supabase branches create|list|delete`; CI measures clone time and disk for a 1 GB parent on XFS and ext4.
+
 ### Phase 2 workstreams (start once A to H are green)
 - Edge Functions: tenant-aware main service in `functions-main/`, `sb-edge-runtime` unit, `/functions/v1` route, `/v1/projects/{ref}/functions*` and secrets endpoints wired to the per-project functions directory.
 - Idle sleep in C and D.
 - imgproxy unit and Storage transform flag.
-- Members and RBAC, clone-based branching on top of F, restore UI.
+- Members and RBAC, restore UI.
 
 ## 4. Dependencies between workstreams
 
@@ -105,6 +112,7 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 A (Studio + call list) ----> B (API stubs tightened)
 D (units/lifecycle) -------> E (fleet tenants)  -------> H (conformance)
 B + C + D + E + F ---------> G (installer)      -------> H
+B + D + F -----------------> I (branching)      -------> H
 ```
 
 A, B, C, D, F can start simultaneously. E needs D's system cluster. G needs a working binary. H needs G.

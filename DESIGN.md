@@ -106,7 +106,16 @@ Laptops are not a target. Supabase's own `supabase start --runtime native` alrea
 - **Idle sleep.** Because `sbctl` is the proxy, it can stop a project's GoTrue and PostgREST after an idle period and start them on the next request. Not in v1: measured Postgres idle is 15 to 20 MB, so a hundred warm projects already fit on one machine.
 - **File-database engine.** The project record carries `engine: postgres | file` from day one and the data-plane sits behind a five-call interface. Turso has no open multi-tenant server yet, so nothing is built on it; when one exists it becomes one more shared process per shard, with auth and quotas in `sbctl`'s proxy.
 - **Edge Functions, image transforms, Logflare.** Optional units behind flags; Functions needs our tenant-aware main service.
-- **Members and RBAC, clone-based branching, restore UI, multi-node scheduling.** After the single-node product is solid.
+- **Members and RBAC, restore UI, multi-node scheduling.** After the single-node product is solid.
+
+## 9a. Branching for agents (right after v1)
+
+Self-hosted Supabase has no branching; hosted gives every branch its own Postgres instance. AI agents need exactly that: a disposable environment each, many in parallel. A branch in `sbctl` is a project with a `parent_ref`, so it gets its own cluster, keys and host for about 100 MB idle. `sbctl` implements the Management API branch endpoints (`/v1/projects/{ref}/branches`, `/v1/branches/{id}`, `merge`, `reset`, `push`), so the stock Supabase MCP server and CLI branch tools work unchanged.
+
+- **Schema-only** (hosted default): new project, then the parent's migrations and `seed.sql`.
+- **With data**: a copy-on-write clone of the parent's data directory (`pg_backup_start`, reflink copy, `pg_backup_stop`) when the data disk is XFS, btrfs or ZFS, so creation time and disk use do not grow with the database; otherwise a restore from the parent's latest base backup plus WAL (workstream F).
+- **Merge** applies the branch's new migrations to the parent; **reset** recreates the branch from the parent; **push** (rebase) applies the parent's new migrations to the branch.
+- **Expiry**: branches carry an optional TTL and are deleted when it lapses; with idle sleep, an unused branch costs only disk.
 
 ## 10. What was cut from earlier drafts and why
 
@@ -129,8 +138,9 @@ Ordering only, no dates. The workstream split and shared conventions for paralle
 
 0. **Spike.** Build platform-mode Studio with the three patches. Generate a mock `/platform` and `/v1` from the specs. Sign in, list two projects, open the table editor on each, run SQL, `supabase link`, MCP `list_tables`. Exit: the captured list of endpoints Studio calls and which tolerate stubs.
 1. **Single-node v1.** `sbctl` proxy, ACME, units, artifact fetch, lifecycle, fleet tenant calls, P0 API subset, WAL archiving and restore, installer, conformance suite. Exit: Auth, REST, Realtime, Storage and Studio at parity on Ubuntu 24.04; measured Linux footprint at 10, 25 and 50 projects.
-2. **AWS and Functions.** CloudFormation quick-create, Edge Functions main service, imgproxy, idle sleep.
-3. **Product.** Members, branching, restore UI, metrics, docs, name and trademark check, upstream PRs.
+2. **Branching.** Section 9a: branch API, schema-only and copy-on-write data branches, merge, reset, push, expiry. Exit: the Supabase MCP server's branch tools work against `sbctl` unchanged.
+3. **AWS and Functions.** CloudFormation quick-create, Edge Functions main service, imgproxy, idle sleep.
+4. **Product.** Members, restore UI, metrics, docs, name and trademark check, upstream PRs.
 
 ## 12. Open items
 
