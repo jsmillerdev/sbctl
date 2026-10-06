@@ -155,7 +155,7 @@ func (s *Server) v1Orgs(w http.ResponseWriter, r *http.Request) error {
 	}
 	out := make([]v1.OrganizationResponseV1Output, 0, len(orgs))
 	for _, o := range orgs {
-		out = append(out, v1.OrganizationResponseV1Output{Id: itoa(o.ID), Name: o.Name, Slug: o.Slug})
+		out = append(out, v1.OrganizationResponseV1Output{Id: o.Slug, Name: o.Name, Slug: o.Slug})
 	}
 	writeJSON(w, http.StatusOK, out)
 	return nil
@@ -167,7 +167,7 @@ func (s *Server) v1Org(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	resp := base("GET /v1/organizations/{slug}")
-	setAll(resp, map[string]any{"id": itoa(o.ID), "name": o.Name, "opt_in_tags": []any{}, "allowed_release_channels": []string{"ga"}})
+	setAll(resp, map[string]any{"id": o.Slug, "name": o.Name, "opt_in_tags": []any{}, "allowed_release_channels": []string{"ga"}})
 	set(resp, "plan", "enterprise")
 	writeJSON(w, http.StatusOK, resp)
 	return nil

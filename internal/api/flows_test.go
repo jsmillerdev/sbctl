@@ -208,9 +208,6 @@ func TestPGMetaProxyAndSQL(t *testing.T) {
 	if dsn := f.meta.last().DSN; !strings.Contains(dsn, "default_transaction_read_only") || !strings.Contains(dsn, "sslmode=disable") {
 		t.Fatalf("read-only DSN: %s", dsn)
 	}
-	if rec := f.do("POST", "/v1/projects/"+testRef+"/database/query", map[string]any{"query": "select $1", "parameters": []any{1}}); rec.Code != 400 {
-		t.Fatalf("parameters: %d", rec.Code)
-	}
 	// pg-meta down.
 	f.meta.Close()
 	if rec := f.do("POST", "/v1/projects/"+testRef+"/database/query", map[string]any{"query": "select 1"}); rec.Code != 503 {

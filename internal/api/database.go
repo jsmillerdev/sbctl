@@ -45,14 +45,16 @@ func (s *Server) dbQuery(readOnlyRoute bool) handlerFunc {
 		if strings.TrimSpace(in.Query) == "" {
 			return errf(http.StatusBadRequest, "query is required")
 		}
-		if len(in.Parameters) > 0 {
-			return errf(http.StatusBadRequest, "Query parameters are not supported; inline the values")
-		}
 		p, err := s.running(r.Context(), r.PathValue("ref"))
 		if err != nil {
 			return err
 		}
-		rows, err := s.sqlRows(r.Context(), p.Ref, "postgres", readOnlyRoute || in.ReadOnly, in.Query)
+		var rows json.RawMessage
+		if len(in.Parameters) > 0 {
+			rows, err = s.sqlParams(r.Context(), p.Ref, "postgres", readOnlyRoute || in.ReadOnly, in.Query, in.Parameters)
+		} else {
+			rows, err = s.sqlRows(r.Context(), p.Ref, "postgres", readOnlyRoute || in.ReadOnly, in.Query)
+		}
 		if err != nil {
 			return err
 		}

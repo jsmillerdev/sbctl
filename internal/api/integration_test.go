@@ -253,6 +253,20 @@ func TestIntegrationDatabase(t *testing.T) {
 	if !strings.Contains(string(b), `"message"`) || !strings.Contains(string(b), "nope") {
 		t.Fatalf("error body: %s", b)
 	}
+	// Parameters bind over the extended protocol (the MCP server's list_tables does this).
+	b = mustStatus(201, "POST", p+"/database/query", map[string]any{"query": "select $1::int as n, $2::text as s, name from public.widgets where id = $3", "parameters": []any{5, "x", 1}})
+	if strings.TrimSpace(string(b)) != `[{"n":5,"s":"x","name":"a"}]` {
+		t.Fatalf("parameterized select: %s", b)
+	}
+	mustStatus(201, "POST", p+"/database/query", map[string]any{"query": "insert into public.widgets values ($1, $2)", "parameters": []any{3, "c"}})
+	b = mustStatus(201, "POST", p+"/database/query", map[string]any{"query": "update public.widgets set name = $1 where id = $2 returning id, name", "parameters": []any{"d", 3}})
+	if strings.TrimSpace(string(b)) != `[{"id":3,"name":"d"}]` {
+		t.Fatalf("returning: %s", b)
+	}
+	b = mustStatus(400, "POST", p+"/database/query/read-only", map[string]any{"query": "insert into public.widgets values ($1, $2)", "parameters": []any{4, "e"}})
+	if !strings.Contains(string(b), "read-only") {
+		t.Fatalf("read-only with parameters: %s", b)
+	}
 	// Read-only is enforced by Postgres.
 	b = mustStatus(400, "POST", p+"/database/query/read-only", map[string]any{"query": "create table public.nope (id int)"})
 	if !strings.Contains(string(b), "read-only") {
@@ -337,3 +351,28 @@ func TestIntegrationDatabase(t *testing.T) {
 }
 
 func mustJSON2(v any) []byte { b, _ := json.Marshal(v); return b }
+
+// TestIntegrationServe starts the stack and keeps it up so real clients (the
+// Supabase CLI, the MCP server) can be pointed at it from a shell:
+//
+//	SBCTL_API_SERVE_FILE=$PWD/stack.json ... go test ./internal/api -run IntegrationServe
+//
+// It writes connection details to the file as JSON and runs until the file is deleted.
+func TestIntegrationServe(t *testing.T) {
+	path := os.Getenv("SBCTL_API_SERVE_FILE")
+	if path == "" {
+		t.Skip("set SBCTL_API_SERVE_FILE to serve the stack for manual client runs")
+	}
+	s := startStack(t)
+	info, _ := json.MarshalIndent(map[string]any{
+		"api_url": s.APIURL, "pat": s.PAT, "jwt": s.JWT, "ref": s.Ref, "dsn": s.DSN, "pg_port": s.PGPort,
+	}, "", "  ")
+	if err := os.WriteFile(path, info, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(30 * time.Minute); time.Now().Before(deadline); time.Sleep(time.Second) {
+		if _, err := os.Stat(path); err != nil {
+			return
+		}
+	}
+}

@@ -7,9 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/OWNER/sbctl/internal/api/cryptojs"
 	"github.com/OWNER/sbctl/internal/config"
@@ -184,4 +188,66 @@ func (s *Server) pgmetaProxy(w http.ResponseWriter, r *http.Request) error {
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 	return nil
+}
+
+// sqlParams runs a parameterized query (the Management API's "parameters" array)
+// over a direct connection with the extended protocol, which pg-meta cannot do.
+// Rows are serialized by Postgres itself (json_agg), like the pg-meta path returns
+// them. Statements that cannot sit in a CTE (DDL) run unwrapped and answer [].
+func (s *Server) sqlParams(ctx context.Context, ref, role string, readOnly bool, query string, params []any) (json.RawMessage, error) {
+	dsn, err := s.mgr.ConnString(ctx, ref, role)
+	if err != nil {
+		return nil, err
+	}
+	cc, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("api: connection string: %w", err)
+	}
+	if readOnly {
+		cc.RuntimeParams["default_transaction_read_only"] = "on"
+	}
+	conn, err := pgx.ConnectConfig(ctx, cc)
+	if err != nil {
+		s.log.Error("project database unreachable", "ref", ref, "err", err)
+		return nil, errf(http.StatusServiceUnavailable, "Project database is unavailable")
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	args := make([]any, len(params))
+	for i, p := range params {
+		args[i] = pgArg(p)
+	}
+	var out string
+	wrapped := "with sbctl_q as (" + query + "\n) select coalesce(json_agg(sbctl_q), '[]'::json)::text from sbctl_q"
+	err = conn.QueryRow(ctx, wrapped, args...).Scan(&out)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "42601" || pgErr.Code == "0A000") { // not a row-returning statement
+		if _, err2 := conn.Exec(ctx, query, args...); err2 == nil {
+			return json.RawMessage("[]"), nil
+		} else {
+			err = err2
+		}
+	}
+	if err != nil {
+		if errors.As(err, &pgErr) {
+			return nil, errf(http.StatusBadRequest, "ERROR: %s: %s", pgErr.Code, pgErr.Message)
+		}
+		return nil, err
+	}
+	return json.RawMessage(out), nil
+}
+
+// pgArg converts a decoded JSON value to a driver argument: integral numbers become
+// int64 so integer parameters bind, objects and arrays become JSON text.
+func pgArg(v any) any {
+	switch x := v.(type) {
+	case float64:
+		if x == math.Trunc(x) && math.Abs(x) < 1<<53 {
+			return int64(x)
+		}
+		return x
+	case map[string]any, []any:
+		b, _ := json.Marshal(x)
+		return string(b)
+	}
+	return v
 }

@@ -63,7 +63,7 @@ func (s *Server) v1Project(ctx context.Context, p *registry.Project) (*v1.V1Proj
 		return nil, err
 	}
 	out := &v1.V1ProjectWithDatabaseResponseOutput{
-		CreatedAt: ts(p.CreatedAt), Id: p.Ref, Name: p.Name, OrganizationId: fmt.Sprint(org.ID),
+		CreatedAt: ts(p.CreatedAt), Id: p.Ref, Name: p.Name, OrganizationId: org.Slug,
 		OrganizationSlug: org.Slug, Ref: p.Ref, Region: regionOf(p),
 		Status: v1.V1ProjectWithDatabaseResponseOutputStatus(p.Status),
 	}
@@ -115,8 +115,10 @@ func (s *Server) v1GetProject(w http.ResponseWriter, r *http.Request) error {
 type createInput struct {
 	Name             string `json:"name"`
 	OrganizationSlug string `json:"organization_slug"`
-	Region           string `json:"region"`
-	DBPass           string `json:"db_pass"`
+	// OrganizationID is accepted as the slug: the v1 API's organization ids are slugs.
+	OrganizationID string `json:"organization_id"`
+	Region         string `json:"region"`
+	DBPass         string `json:"db_pass"`
 }
 
 // createProject provisions a project through the lifecycle manager and returns it
@@ -128,6 +130,9 @@ func (s *Server) createProject(ctx context.Context, in createInput) (*registry.P
 	}
 	var org *registry.Organization
 	var err error
+	if in.OrganizationSlug == "" {
+		in.OrganizationSlug = in.OrganizationID
+	}
 	if in.OrganizationSlug == "" {
 		org, err = s.defaultOrg(ctx)
 	} else {
@@ -187,7 +192,7 @@ func (s *Server) v1CreateProject(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	writeJSON(w, http.StatusCreated, &v1.V1ProjectResponseOutput{
-		CreatedAt: ts(p.CreatedAt), Id: p.Ref, Name: p.Name, OrganizationId: fmt.Sprint(org.ID),
+		CreatedAt: ts(p.CreatedAt), Id: p.Ref, Name: p.Name, OrganizationId: org.Slug,
 		OrganizationSlug: org.Slug, Ref: p.Ref, Region: regionOf(p), Status: v1.V1ProjectResponseOutputStatus(p.Status),
 	})
 	return nil

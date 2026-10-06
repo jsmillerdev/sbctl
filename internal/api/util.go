@@ -203,6 +203,14 @@ func (s *Server) userProjects(ctx context.Context) ([]registry.Project, error) {
 func (s *Server) orgBySlug(ctx context.Context, slug string) (*registry.Organization, error) {
 	o, err := s.reg.GetOrganization(ctx, slug)
 	if errors.Is(err, registry.ErrNotFound) {
+		// Older clients pass the numeric id where the slug goes.
+		if id, perr := strconv.ParseInt(slug, 10, 64); perr == nil {
+			if o, err = s.reg.GetOrganizationByID(ctx, id); err == nil {
+				return o, nil
+			}
+		}
+	}
+	if errors.Is(err, registry.ErrNotFound) {
 		return nil, errf(http.StatusNotFound, "Organization not found")
 	}
 	return o, err
