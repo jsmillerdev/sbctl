@@ -15,7 +15,7 @@ import (
 
 // TestPebbleIssuance obtains real certificates from a Pebble ACME test server
 // over HTTP-01 and TLS-ALPN-01, through our own listeners. It is CI only: see
-// scripts/pebble-test.sh. Required environment:
+// internal/proxy/pebble-test.sh. Required environment:
 //
 //	SBCTL_TEST_PEBBLE_URL        ACME directory, e.g. https://localhost:14000/dir
 //	SBCTL_TEST_PEBBLE_CA         PEM root that signs Pebble's own HTTPS certificate
@@ -27,7 +27,7 @@ import (
 func TestPebbleIssuance(t *testing.T) {
 	dir := os.Getenv("SBCTL_TEST_PEBBLE_URL")
 	if dir == "" {
-		t.Skip("SBCTL_TEST_PEBBLE_URL not set (CI-only test, see scripts/pebble-test.sh)")
+		t.Skip("SBCTL_TEST_PEBBLE_URL not set (CI-only test, see internal/proxy/pebble-test.sh)")
 	}
 	httpPort := envPort(t, "SBCTL_TEST_PEBBLE_HTTP_PORT", 5002)
 	tlsPort := envPort(t, "SBCTL_TEST_PEBBLE_TLS_PORT", 5001)
