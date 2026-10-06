@@ -82,3 +82,43 @@ type DataPlane interface {
 	Route(ctx context.Context, ref string) (Upstreams, error)
 	Usage(ctx context.Context, ref string) (Usage, error)
 }
+
+// Runner is the process half of a data plane: bringing a project's units up and down
+// and asking whether they work. PostgresPlane implements it next to DataPlane; the
+// Engine needs both (see Plane).
+type Runner interface {
+	// Start renders and starts every unit of p in dependency order and waits until each
+	// answers. It is idempotent: units that already run are left alone.
+	Start(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
+	// StartDatabase starts only the cluster (a paused project's final backup needs it).
+	StartDatabase(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
+	// Stop stops the units of ref in reverse dependency order: PostgREST, GoTrue, Postgres.
+	Stop(ctx context.Context, ref string) error
+	// Reconfigure re-renders the env files of p's API units from keys and restarts the
+	// ones that run, so that a new JWT secret takes effect.
+	Reconfigure(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
+	// Health checks each unit of p with a real request, not only its unit state.
+	Health(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) []ServiceHealth
+}
+
+// Plane is what the Engine drives: a DataPlane that can also be started and stopped.
+type Plane interface {
+	DataPlane
+	Runner
+}
+
+// BaseBackuper takes a base backup of a running project. backup.Backup satisfies it.
+// The Engine calls it before it deletes a project; a nil BaseBackuper skips the backup.
+type BaseBackuper interface {
+	BaseBackup(ctx context.Context, ref string) (*registry.Backup, error)
+}
+
+// ErrNoSnapshot is returned by DataPlane.Snapshot when no BaseBackuper is configured.
+var ErrNoSnapshot = errors.New("lifecycle: no backup engine configured")
+
+// DeleteOptions tune Engine.DeleteWith.
+type DeleteOptions struct {
+	// SkipFinalBackup deletes without the final base backup. Use it only for projects
+	// that are broken or disposable: the data is gone afterwards.
+	SkipFinalBackup bool
+}

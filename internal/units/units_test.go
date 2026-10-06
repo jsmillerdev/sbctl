@@ -313,6 +313,7 @@ func TestExecKillsStubbornProcess(t *testing.T) {
 func TestExecStartFailureReportsLog(t *testing.T) {
 	e, cfg := execBackend(t)
 	ctx := context.Background()
+	e.StartGrace = 5 * time.Second // a loaded CI machine can be slow to spawn sh
 	art := fakeArtifact(t, `echo "boom: cannot bind" >&2; exit 3`)
 	spec := Spec{Service: config.SvcGoTrue, Ref: "abcdefghijklmnopqrst", ArtifactDir: art, Exec: []string{"bin/run"}, WorkDir: cfg.StateDir}
 	e.Render(ctx, spec)

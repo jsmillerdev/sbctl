@@ -35,6 +35,8 @@ type Exec struct {
 	// Stop timeouts; tests shorten them.
 	PostgresStopTimeout time.Duration // SIGINT (fast shutdown) before SIGQUIT
 	StopTimeout         time.Duration // SIGTERM before SIGKILL for everything else
+	// StartGrace is how long Start watches for a launcher that dies immediately.
+	StartGrace time.Duration
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -47,7 +49,7 @@ func NewExec(cfg *config.Config, log *slog.Logger) *Exec {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Exec{cfg: cfg, log: log, PostgresStopTimeout: 90 * time.Second, StopTimeout: 15 * time.Second, locks: map[string]*sync.Mutex{}}
+	return &Exec{cfg: cfg, log: log, PostgresStopTimeout: 90 * time.Second, StopTimeout: 15 * time.Second, StartGrace: 500 * time.Millisecond, locks: map[string]*sync.Mutex{}}
 }
 
 type pidRecord struct {
@@ -142,7 +144,7 @@ func (e *Exec) Start(ctx context.Context, unit string) error {
 	case werr := <-exited:
 		_ = os.Remove(e.pidPath(unit))
 		return fmt.Errorf("units: %s exited right after start (%v)\n%s", unit, werr, e.tail(unit, 20))
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(e.StartGrace):
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -277,6 +279,9 @@ func (e *Exec) running(unit string) (*pidRecord, bool) {
 	}
 	return &rec, true
 }
+
+// Tail returns the last n lines of unit's log.
+func (e *Exec) Tail(unit string, n int) string { return e.tail(unit, n) }
 
 func (e *Exec) tail(unit string, n int) string {
 	b, err := os.ReadFile(e.logPath(unit))

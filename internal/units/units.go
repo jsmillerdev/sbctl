@@ -88,3 +88,9 @@ func StandardExec(svc string) []string {
 	}
 	return nil
 }
+
+// LogTailer is implemented by backends that keep a unit's output in a file the
+// process can read (the exec backend). The systemd backend logs to journald only.
+type LogTailer interface {
+	Tail(unit string, lines int) string
+}

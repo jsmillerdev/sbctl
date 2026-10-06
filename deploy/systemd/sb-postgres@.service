@@ -1,7 +1,7 @@
 [Unit]
 Description=sbctl Postgres for project %i
 Documentation=https://github.com/OWNER/sbctl
-After=network.target local-fs.target 
+After=network.target local-fs.target
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
@@ -49,7 +49,8 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0027
-ReadWritePaths=/var/lib/sbctl/projects/%i
+# The local backup backend (file://) writes WAL from archive_command into backups/.
+ReadWritePaths=/var/lib/sbctl/projects/%i -/var/lib/sbctl/backups
 
 [Install]
 WantedBy=multi-user.target
