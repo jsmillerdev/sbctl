@@ -493,3 +493,34 @@ func TestWebSocketPassthrough(t *testing.T) {
 		t.Fatalf("keyless handshake: err=%v resp=%v", err, resp)
 	}
 }
+
+// TestEscapedPathReachesUpstreamUnchanged: S3 SigV4 signs the client's canonical
+// URI, so reserved characters must not be re-escaped on the way to Storage.
+func TestEscapedPathReachesUpstreamUnchanged(t *testing.T) {
+	h := newHarness(t)
+	for _, c := range []struct {
+		name, target, svc string
+		wantURI           string
+	}{
+		{"s3 plus and parens", "/storage/v1/s3/b/a%28b%29%2Bc%21.txt?x-id=PutObject", "storage", "/s3/b/a%28b%29%2Bc%21.txt?x-id=PutObject"},
+		{"s3 raw parens and plus", "/storage/v1/s3/b/a(b)+c.txt", "storage", "/s3/b/a(b)+c.txt"},
+		{"object name with encoded space", "/storage/v1/object/b/my%20file%2B1.txt", "storage", "/object/b/my%20file%2B1.txt"},
+		{"rest filter path", "/rest/v1/rpc/f%C3%A9", "rest", "/rpc/f%C3%A9"},
+		// An encoded dot segment is cleaned on the decoded form; the escaped form would disagree, so it is re-escaped.
+		{"encoded dot segments", "/rest/v1/a/%2e%2e/b", "rest", "/b"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			svc := svcStorage
+			if c.svc == "rest" {
+				svc = svcRest
+			}
+			resp, body := h.project("PUT", c.target, "apikey", h.k.PublishableKey, "Authorization", "AWS4-HMAC-SHA256 Credential=abc")
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d: %s", resp.StatusCode, body)
+			}
+			if got := h.ups[svc].last(t).RequestURI; got != c.wantURI {
+				t.Fatalf("upstream saw %q, want %q", got, c.wantURI)
+			}
+		})
+	}
+}

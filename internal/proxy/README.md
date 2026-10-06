@@ -32,7 +32,7 @@ The table is `routes.go`; its sources are the Envoy template `docker/volumes/api
 
 ## Keys
 
-`apikey` header, else `?apikey=` (removed from the forwarded query; other parameters are forwarded byte for byte), else an `Authorization: Bearer sb_...` value. `sb_publishable_*` becomes the project's anon JWT and `sb_secret_*` its service_role JWT, in `apikey` and, unless the caller sent a real JWT, in `Authorization`. Legacy keys are accepted when they equal the project's anon or service_role key or are HS256 JWTs signed with the project secret with role `anon` or `service_role` and a matching `ref` claim. A missing or invalid key on a protected route is `401 Unauthorized` (text/plain, as upstream); a valid anon key on an admin route is `403 RBAC: access denied`. Comparisons are constant time.
+`apikey` header, else `?apikey=` (removed from the forwarded query; other parameters are forwarded byte for byte), else an `Authorization: Bearer sb_...` value. `sb_publishable_*` becomes the project's anon JWT and `sb_secret_*` its service_role JWT, in `apikey` and, unless the caller sent a real JWT, in `Authorization`. Legacy keys are accepted when they equal the project's anon or service_role key or are HS256 JWTs signed with the project secret with role `anon` or `service_role`. A `ref` claim is optional (self-hosted keys made from the docs have none); when present it must equal the project ref. The signature already ties the token to the project. A missing or invalid key on a protected route is `401 Unauthorized` (text/plain, as upstream); a valid anon key on an admin route is `403 RBAC: access denied`. Comparisons are constant time.
 
 ## Caches
 
@@ -45,24 +45,26 @@ Host to project and project keys are in memory. They follow registry changes (`S
 | Effective mode | Certificates |
 |---|---|
 | `dns01` | `*.api.<domain>`, `api.<domain>`, `studio.<domain>` by DNS-01 only; route53 (instance role or keys), cloudflare, hetzner, digitalocean |
-| `auto` (provider and domain set) | the same, plus on-demand HTTP-01 or TLS-ALPN-01 for registry routes with custom hostnames |
+| `auto` (provider and domain set) | the same, plus on-demand HTTP-01 or TLS-ALPN-01 for registry routes with custom hostnames, from a second CertMagic config |
 | `http01` (no provider, or forced) | `api.`, `studio.` at startup; project hosts on first handshake |
 | `http01` on `<ip>.sslip.io` (no domain) | same, no wildcard possible |
 | `off` | plain HTTP on both listeners (tests, or a TLS-terminating front end) |
 
+CertMagic uses DNS-01 exclusively for any issuer that has a DNS solver, so `auto` runs two configs on one certificate cache: one with the DNS solver for `*.api.<domain>`, `api.` and `studio.`, one without it for custom hostnames, which is the only one with on-demand issuance. The TLS handshake picks the config by SNI; renewals pick it by the certificate's names; :80 answers the HTTP-01 issuer's challenges.
+
 On-demand issuance is gated by `allowHost`: only `api.`, `studio.`, derived project hosts of registered projects and registry routes qualify, and never a host the wildcard already covers. Provider credentials come from `[tls] credentials` or `SBCTL_TLS_CREDENTIALS_<KEY>` (`api_token`; route53 optional `region`, `hosted_zone_id`, `access_key_id`, `secret_access_key`). `tls.ca` selects another ACME directory and `tls.ca_cert` the root that signs that directory's own HTTPS certificate (Pebble, private CAs). Certificates live in `Paths.Certs()`. Running with TLS enabled accepts the CA's subscriber agreement.
 
-`sbctl proxy --registry-dsn ...` runs the edge alone for development.
+`sbctl proxy` runs the edge alone for development. It reads the existing master key (`key_path`) and never creates one; prefer `SBCTL_REGISTRY_DSN` over `--registry-dsn`, which shows up in the process list.
 
 ## Tests
 
 ```
 go test ./internal/proxy/                       # unit and httptest tests, no network
 SBCTL_TEST_DATABASE_URL=postgres://... go test -run TestPostgresRegistry ./internal/proxy/
-internal/proxy/pebble-test.sh                   # CI only: real ACME against Pebble
+internal/proxy/pebble-test.sh                   # CI only: real ACME against Pebble (no CI job runs it yet)
 ```
 
-The unit tests cover every route and rewrite against `httptest` upstreams, the key translation table, query stripping, CORS, spoofed headers, streaming, upstream failures, the Waker hook, project status gating, WebSocket passthrough, cache invalidation, resubscribe, the TLS mode and issuance decision logic, certificate manager configuration and the :80 handler. `TestPostgresRegistry` needs an empty database in a throwaway cluster and exercises real LISTEN/NOTIFY, including a killed LISTEN connection.
+The unit tests cover every route and rewrite against `httptest` upstreams, the key translation table, query stripping, CORS, spoofed headers, streaming, upstream failures, the Waker hook, project status gating, WebSocket passthrough, cache invalidation, resubscribe, the TLS mode and issuance decision logic, certificate manager configuration and the :80 handler. `TestPostgresRegistry` needs a role that may create databases in a throwaway cluster, runs in a database of its own (created and dropped by the test, so it cannot collide with other packages sharing `SBCTL_TEST_DATABASE_URL`) and exercises real LISTEN/NOTIFY, including a killed LISTEN connection.
 
 ## Not done
 

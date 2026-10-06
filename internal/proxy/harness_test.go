@@ -21,8 +21,8 @@ const testDomain = "example.test"
 
 // captured is one request as an upstream saw it.
 type captured struct {
-	Method, Path, RawQuery, Host, Body string
-	Header                             http.Header
+	Method, Path, RequestURI, RawQuery, Host, Body string
+	Header                                         http.Header
 }
 
 // upstream is a fake service that records what it receives.
@@ -40,7 +40,7 @@ func newUpstream(t *testing.T, name string) *upstream {
 	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		u.mu.Lock()
-		u.reqs = append(u.reqs, captured{Method: r.Method, Path: r.URL.Path, RawQuery: r.URL.RawQuery, Host: r.Host, Body: string(body), Header: r.Header.Clone()})
+		u.reqs = append(u.reqs, captured{Method: r.Method, Path: r.URL.Path, RequestURI: r.RequestURI, RawQuery: r.URL.RawQuery, Host: r.Host, Body: string(body), Header: r.Header.Clone()})
 		h := u.handler
 		u.mu.Unlock()
 		if h != nil {

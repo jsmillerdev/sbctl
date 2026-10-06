@@ -68,7 +68,7 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) serveStudio(w http.ResponseWriter, r *http.Request) {
 	s.forward(w, r, &target{
-		addr: s.upstream(svcStudio, project{}), path: r.URL.Path, rawQuery: r.URL.RawQuery,
+		addr: s.upstream(svcStudio, project{}), path: r.URL.Path, rawPath: r.URL.EscapedPath(), rawQuery: r.URL.RawQuery,
 		fwdHost: r.Host, timeout: 60 * time.Second, studio: true,
 	})
 }
@@ -131,7 +131,7 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 	}
 
 	tg := &target{
-		addr: s.upstream(rt.svc, p), path: rt.upstreamPath(pth, trailing), rawQuery: res.rawQuery,
+		addr: s.upstream(rt.svc, p), path: rt.upstreamPath(pth, trailing), rawPath: escapedUpstreamPath(r.URL, pth, rt, trailing), rawQuery: res.rawQuery,
 		fwdHost: r.Host, fwdPrefix: rt.fwdPrefix, timeout: rt.timeout, set: res.set, del: res.del,
 	}
 	for _, h := range rt.setHeaders {
@@ -169,8 +169,11 @@ func servable(st registry.Status) bool {
 
 // target describes one upstream request.
 type target struct {
-	addr     string
-	path     string
+	addr string
+	path string
+	// rawPath is path as the client escaped it; empty lets Go re-escape path. S3
+	// SigV4 signatures cover the client's canonical URI, so it must reach Storage unchanged.
+	rawPath  string
 	rawQuery string
 	// host overrides the upstream Host header; empty keeps the client's.
 	host      string
@@ -195,7 +198,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 			out.URL.Scheme = "http"
 			out.URL.Host = tg.addr
 			out.URL.Path = tg.path
-			out.URL.RawPath = ""
+			out.URL.RawPath = tg.rawPath
 			out.URL.RawQuery = tg.rawQuery
 			out.Host = pr.In.Host
 			if tg.host != "" {

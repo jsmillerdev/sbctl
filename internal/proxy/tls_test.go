@@ -253,19 +253,22 @@ func TestNewCertManager(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer cm.close()
-		if cm.issuer.CA != certmagic.LetsEncryptProductionCA {
-			t.Errorf("default CA %q", cm.issuer.CA)
+		if cm.dns != nil || cm.dnsIssuer != nil {
+			t.Error("http01 mode must not have a DNS-01 config")
 		}
-		if cm.issuer.DNS01Solver != nil || cm.issuer.DisableHTTPChallenge {
+		if cm.httpIssuer.CA != certmagic.LetsEncryptProductionCA {
+			t.Errorf("default CA %q", cm.httpIssuer.CA)
+		}
+		if cm.httpIssuer.DNS01Solver != nil || cm.httpIssuer.DisableHTTPChallenge {
 			t.Error("http01 mode must not use DNS-01 and must keep HTTP-01")
 		}
-		if fs, ok := cm.magic.Storage.(*certmagic.FileStorage); !ok || fs.Path != filepath.Join(cfg.StateDir, "certs") {
-			t.Errorf("storage %#v, want file storage under state_dir/certs", cm.magic.Storage)
+		if fs, ok := cm.http.Storage.(*certmagic.FileStorage); !ok || fs.Path != filepath.Join(cfg.StateDir, "certs") {
+			t.Errorf("storage %#v, want file storage under state_dir/certs", cm.http.Storage)
 		}
-		if cm.magic.OnDemand == nil || cm.magic.OnDemand.DecisionFunc == nil {
+		if cm.http.OnDemand == nil || cm.http.OnDemand.DecisionFunc == nil {
 			t.Error("on-demand issuance has no decision function")
 		}
-		if !cm.issuer.Agreed {
+		if !cm.httpIssuer.Agreed {
 			t.Error("issuer does not agree to the CA terms")
 		}
 	})
@@ -275,18 +278,60 @@ func TestNewCertManager(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer cm.close()
-		if cm.issuer.DNS01Solver == nil || !cm.issuer.DisableHTTPChallenge || !cm.issuer.DisableTLSALPNChallenge {
+		if cm.dnsIssuer.DNS01Solver == nil || !cm.dnsIssuer.DisableHTTPChallenge || !cm.dnsIssuer.DisableTLSALPNChallenge {
 			t.Error("dns01 mode must use only DNS-01")
 		}
+		if cm.http != nil || cm.httpIssuer != nil {
+			t.Error("dns01 mode must not have an HTTP-01 config")
+		}
+		for _, n := range []string{"api.example.com", "x.api.example.com", "db.customer.example", ""} {
+			if cm.configFor(n) != cm.dns {
+				t.Errorf("dns01: %q is not served by the DNS config", n)
+			}
+		}
 	})
-	t.Run("auto keeps HTTP-01 next to DNS-01", func(t *testing.T) {
+	t.Run("auto: DNS-01 for the wildcard, HTTP-01 for custom hosts, in separate configs", func(t *testing.T) {
 		cm, err := newCertManager(certOptions{cfg: cfg, mode: tlsAuto, provider: prov, allow: allow, log: quietLog()})
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer cm.close()
-		if cm.issuer.DNS01Solver == nil || cm.issuer.DisableHTTPChallenge {
-			t.Error("auto mode needs DNS-01 and HTTP-01")
+		if cm.dnsIssuer == nil || cm.dnsIssuer.DNS01Solver == nil {
+			t.Fatal("auto mode needs a DNS-01 issuer for the wildcard")
+		}
+		// CertMagic uses DNS-01 exclusively when an issuer has a DNS solver, so the
+		// issuer for custom hosts must not have one.
+		if cm.httpIssuer == nil || cm.httpIssuer.DNS01Solver != nil || cm.httpIssuer.DisableHTTPChallenge || cm.httpIssuer.DisableTLSALPNChallenge {
+			t.Fatal("auto mode needs a separate HTTP-01 issuer without a DNS solver")
+		}
+		if cm.dns.OnDemand != nil || cm.http.OnDemand == nil || cm.http.OnDemand.DecisionFunc == nil {
+			t.Error("only the HTTP-01 config issues on demand, through the decision function")
+		}
+		for name, want := range map[string]*certmagic.Config{
+			"db.customer.example":     cm.http,
+			"evil.example.org":        cm.http,
+			"example.com":             cm.http,
+			"api.example.com":         cm.dns,
+			"studio.example.com":      cm.dns,
+			"ref.api.example.com":     cm.dns,
+			"REF.API.example.com.":    cm.dns,
+			"x.y.api.example.com":     cm.dns,
+			"":                        cm.dns,
+			"notapi.example.com":      cm.http,
+			"api.example.com.evil.io": cm.http,
+		} {
+			if got := cm.configFor(name); got != want {
+				t.Errorf("configFor(%q) picked the wrong config", name)
+			}
+		}
+		if cm.configForNames([]string{"*.api.example.com"}) != cm.dns || cm.configForNames([]string{"db.customer.example"}) != cm.http {
+			t.Error("configForNames (renewal) picks the wrong config")
+		}
+		if cm.challengeIssuer() != cm.httpIssuer {
+			t.Error(":80 must answer the HTTP-01 issuer's challenges")
+		}
+		if cm.tlsConfig().GetCertificate == nil {
+			t.Error("no SNI dispatch on the TLS config")
 		}
 	})
 	t.Run("dns without provider", func(t *testing.T) {
@@ -307,8 +352,8 @@ func TestNewCertManager(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer cm.close()
-		if cm.issuer.CA != c.TLS.CA || cm.issuer.Email != "ops@example.com" || cm.issuer.TrustedRoots == nil {
-			t.Errorf("issuer: CA=%q email=%q roots=%v", cm.issuer.CA, cm.issuer.Email, cm.issuer.TrustedRoots)
+		if is := cm.httpIssuer; is.CA != c.TLS.CA || is.Email != "ops@example.com" || is.TrustedRoots == nil {
+			t.Errorf("issuer: CA=%q email=%q roots=%v", is.CA, is.Email, is.TrustedRoots)
 		}
 		if err := os.WriteFile(c.TLS.CACert, []byte("not pem"), 0o600); err != nil {
 			t.Fatal(err)
@@ -424,4 +469,30 @@ func selfSignedPEM(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// TestServeClosesListenersOnCertSetupFailure: a bad ca_cert fails Serve before any
+// server owns the listeners, and Serve must not leak them.
+func TestServeClosesListenersOnCertSetupFailure(t *testing.T) {
+	s := tlsServer(t, func(c *config.Config) {
+		c.Domain, c.TLS.Mode = "example.com", "http01"
+		c.TLS.CACert = filepath.Join(t.TempDir(), "missing.pem")
+	})
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Serve(context.Background(), httpLn, httpsLn); err == nil {
+		t.Fatal("Serve accepted a missing ca_cert")
+	}
+	for _, ln := range []net.Listener{httpLn, httpsLn} {
+		if c, err := net.Dial("tcp", ln.Addr().String()); err == nil {
+			c.Close()
+			t.Errorf("listener %s still accepts connections", ln.Addr())
+		}
+	}
 }

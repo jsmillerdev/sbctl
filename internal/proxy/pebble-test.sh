@@ -3,7 +3,7 @@
 #
 # Starts pebble and pebble-challtestsrv (built from source with Go), points Pebble's
 # DNS at the challenge test server so every name resolves to 127.0.0.1, and runs
-# TestPebbleIssuance against it. Needs: go, git, free ports 5001, 5002, 8053, 8055, 14000, 15000.
+# TestPebbleIssuance against it. Needs: go, git, curl, free ports 5001, 5002, 8053, 8055, 14000, 15000.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -27,7 +27,18 @@ JSON
 pids+=($!)
 PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=0 "$work/pebble-bin" -config "$work/pebble.json" -dnsserver 127.0.0.1:8053 &
 pids+=($!)
-sleep 3
+
+# Wait until Pebble's directory and the challenge test server's management API answer.
+wait_for() { # url...
+  for _ in $(seq 1 60); do
+    if curl -sk --max-time 2 -o /dev/null "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $*" >&2
+  return 1
+}
+wait_for https://localhost:14000/dir
+wait_for -X POST -d '{}' http://127.0.0.1:8055/clear-request-history
 
 cd "$root"
 SBCTL_TEST_PEBBLE_URL=https://localhost:14000/dir \

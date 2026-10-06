@@ -51,6 +51,11 @@ type table struct {
 	projects map[string]project // by ref
 	custom   map[string]string  // registry routes (any kind): host -> ref
 	keyCache map[string]keyEntry
+	// keyGen counts invalidations per ref and keyEpoch counts full reloads. A key
+	// fetch caches its result only if neither moved while it ran, so a fetch that
+	// read secrets before a rotation committed cannot undo the invalidation.
+	keyGen   map[string]uint64
+	keyEpoch uint64
 	sf       singleflight.Group
 }
 
@@ -58,6 +63,7 @@ func newTable(cfg *config.Config, reg registry.Registry, keys KeySource, log *sl
 	return &table{
 		cfg: cfg, reg: reg, keys: keys, log: log, now: time.Now, retry: time.Second,
 		projects: map[string]project{}, custom: map[string]string{}, keyCache: map[string]keyEntry{},
+		keyGen: map[string]uint64{},
 	}
 }
 
@@ -81,11 +87,12 @@ func (t *table) lookup(host string) (project, bool) {
 	host = normalizeHost(host)
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if ref, ok := t.custom[host]; ok {
+	// A derived project host always belongs to its own project; routes cannot take it over.
+	if ref := t.cfg.RefFromProjectHost(host); ref != "" {
 		p, ok := t.projects[ref]
 		return p, ok
 	}
-	if ref := t.cfg.RefFromProjectHost(host); ref != "" {
+	if ref, ok := t.custom[host]; ok {
 		p, ok := t.projects[ref]
 		return p, ok
 	}
@@ -132,17 +139,25 @@ func (t *table) reload(ctx context.Context) error {
 	}
 	t.mu.Lock()
 	t.projects = projects
-	t.custom = customRoutes(rs)
-	t.keyCache = map[string]keyEntry{}
+	t.custom = t.customRoutes(rs)
+	t.dropAllKeysLocked()
 	t.mu.Unlock()
 	t.log.Debug("proxy table reloaded", "projects", len(projects), "routes", len(rs))
 	return nil
 }
 
-func customRoutes(rs []registry.Route) map[string]string {
+// customRoutes indexes registry routes by host. Rows for a host the proxy owns
+// itself (a derived project host, api.<domain>, studio.<domain>) are ignored: no
+// route may take over another project's host or the control-plane hosts.
+func (t *table) customRoutes(rs []registry.Route) map[string]string {
 	m := make(map[string]string, len(rs))
 	for _, r := range rs {
-		m[normalizeHost(r.Host)] = r.Ref
+		h := normalizeHost(r.Host)
+		if t.cfg.RefFromProjectHost(h) != "" || h == t.cfg.APIHost() || h == t.cfg.StudioHost() {
+			t.log.Warn("proxy table: ignoring route for a host the proxy owns", "host", h, "ref", r.Ref)
+			continue
+		}
+		m[h] = r.Ref
 	}
 	return m
 }
@@ -154,7 +169,7 @@ func (t *table) apply(ctx context.Context, c registry.Change) {
 		if c.Op == "delete" {
 			t.mu.Lock()
 			delete(t.projects, c.Key)
-			delete(t.keyCache, c.Key)
+			t.dropKeysLocked(c.Key)
 			t.mu.Unlock()
 			return
 		}
@@ -163,7 +178,7 @@ func (t *table) apply(ctx context.Context, c registry.Change) {
 		case errors.Is(err, registry.ErrNotFound):
 			t.mu.Lock()
 			delete(t.projects, c.Key)
-			delete(t.keyCache, c.Key)
+			t.dropKeysLocked(c.Key)
 			t.mu.Unlock()
 		case err != nil:
 			t.log.Warn("proxy table: project refresh failed, reloading", "ref", c.Key, "err", err)
@@ -180,16 +195,29 @@ func (t *table) apply(ctx context.Context, c registry.Change) {
 			return
 		}
 		t.mu.Lock()
-		t.custom = customRoutes(rs)
+		t.custom = t.customRoutes(rs)
 		t.mu.Unlock()
 	case "project_secrets":
 		t.invalidateKeys(c.Key)
 	}
 }
 
+// dropKeysLocked forgets ref's cached keys and marks fetches in flight stale.
+// t.mu must be held.
+func (t *table) dropKeysLocked(ref string) {
+	delete(t.keyCache, ref)
+	t.keyGen[ref]++
+}
+
+// dropAllKeysLocked is dropKeysLocked for every project. t.mu must be held.
+func (t *table) dropAllKeysLocked() {
+	t.keyCache = map[string]keyEntry{}
+	t.keyEpoch++
+}
+
 func (t *table) invalidateKeys(ref string) {
 	t.mu.Lock()
-	delete(t.keyCache, ref)
+	t.dropKeysLocked(ref)
 	t.mu.Unlock()
 	// A fetch already in flight may carry the old keys; forget it so the next request refetches.
 	t.sf.Forget(ref)
@@ -208,12 +236,19 @@ func (t *table) projectKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 		// Detached from the caller: one client hanging up must not fail the shared fetch.
 		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
+		t.mu.RLock()
+		gen, epoch := t.keyGen[ref], t.keyEpoch
+		t.mu.RUnlock()
 		k, err := t.keys.Keys(fctx, ref)
 		if err != nil {
 			return nil, err
 		}
 		t.mu.Lock()
-		t.keyCache[ref] = keyEntry{keys: k, expires: t.now().Add(keysTTL)}
+		// Cache only if nothing invalidated ref while the fetch ran; otherwise this
+		// request still gets k, but the next one refetches.
+		if t.keyGen[ref] == gen && t.keyEpoch == epoch {
+			t.keyCache[ref] = keyEntry{keys: k, expires: t.now().Add(keysTTL)}
+		}
 		t.mu.Unlock()
 		return k, nil
 	})

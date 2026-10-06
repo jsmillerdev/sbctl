@@ -21,7 +21,9 @@ func init() {
 		Use:   "proxy",
 		Short: "Run only the HTTPS edge (development)",
 		Long: `Runs the edge proxy without the Management API: host to project routing, apikey
-handling and TLS, against the registry in --registry-dsn. api.<domain> answers 503.
+handling and TLS, against the registry in $SBCTL_REGISTRY_DSN (recommended) or
+--registry-dsn (the DSN, password included, is visible in the process list).
+The master key at key_path must already exist. api.<domain> answers 503.
 Listen addresses, ports and TLS come from the config file and SBCTL_* variables,
 for example SBCTL_TLS_MODE=off SBCTL_LISTEN_HTTP=127.0.0.1:33080 SBCTL_LISTEN_HTTPS=127.0.0.1:33443.`,
 		Args: cobra.NoArgs,
@@ -42,7 +44,13 @@ for example SBCTL_TLS_MODE=off SBCTL_LISTEN_HTTP=127.0.0.1:33080 SBCTL_LISTEN_HT
 				return err
 			}
 			defer reg.Close()
-			sec, err := secrets.LoadOrCreate(cfg.KeyPath)
+			// Load, never create: a wrong key_path must not mint a new master key that
+			// cannot open any project's sealed secrets.
+			keyBody, err := os.ReadFile(cfg.KeyPath)
+			if err != nil {
+				return fmt.Errorf("proxy: reading the master key (key_path): %w", err)
+			}
+			sec, err := secrets.Load(keyBody)
 			if err != nil {
 				return err
 			}
@@ -60,6 +68,6 @@ for example SBCTL_TLS_MODE=off SBCTL_LISTEN_HTTP=127.0.0.1:33080 SBCTL_LISTEN_HT
 			return srv.Run(ctx)
 		},
 	}
-	cmd.Flags().StringVar(&dsn, "registry-dsn", "", "Postgres DSN of the sbctl registry database (or $SBCTL_REGISTRY_DSN)")
+	cmd.Flags().StringVar(&dsn, "registry-dsn", "", "Postgres DSN of the sbctl registry database; prefer $SBCTL_REGISTRY_DSN, a flag is visible in the process list")
 	rootCmd.AddCommand(cmd)
 }

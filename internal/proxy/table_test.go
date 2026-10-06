@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -250,5 +252,131 @@ func TestRegistryKeys(t *testing.T) {
 	}
 	if got.JWTSecret != want.JWTSecret || got.PublishableKey != want.PublishableKey || got.ServiceRoleKey != want.ServiceRoleKey {
 		t.Fatalf("keys differ after seal/open: %+v", got)
+	}
+}
+
+// blockingKeys returns its first call's keys only after release is closed, to hold
+// a fetch in flight while the test invalidates the cache.
+type blockingKeys struct {
+	mu      sync.Mutex
+	calls   int
+	first   *secrets.ProjectKeys
+	later   *secrets.ProjectKeys
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingKeys) Keys(_ context.Context, _ string) (*secrets.ProjectKeys, error) {
+	b.mu.Lock()
+	b.calls++
+	n := b.calls
+	b.mu.Unlock()
+	if n == 1 {
+		close(b.entered)
+		<-b.release
+		return b.first, nil
+	}
+	return b.later, nil
+}
+
+// TestInvalidationBeatsInFlightFetch: a fetch that read the old secrets before a
+// rotation committed must not put them back into the cache after the invalidation.
+func TestInvalidationBeatsInFlightFetch(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		invalidate func(tb *table)
+	}{
+		{"per-ref", func(tb *table) { tb.invalidateKeys(testRef) }},
+		{"reload", func(tb *table) {
+			if err := tb.reload(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bk := &blockingKeys{first: testKeys(t, testRef), later: testKeys(t, testRef), entered: make(chan struct{}), release: make(chan struct{})}
+			cfg := config.Default()
+			cfg.Domain = testDomain
+			tb := newTable(cfg, registry.NewMemory(), bk, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			done := make(chan *secrets.ProjectKeys, 1)
+			go func() {
+				k, _ := tb.projectKeys(context.Background(), testRef)
+				done <- k
+			}()
+			<-bk.entered
+			tc.invalidate(tb)
+			close(bk.release)
+			if k := <-done; k != bk.first {
+				t.Fatal("the in-flight request should still get its own result")
+			}
+			k, err := tb.projectKeys(context.Background(), testRef)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if k != bk.later {
+				t.Fatal("stale keys cached after invalidation: the old keys stay valid for keysTTL")
+			}
+		})
+	}
+}
+
+// TestRouteCannotTakeOverOwnedHosts: registry routes naming another project's
+// derived host, api.<domain> or studio.<domain> are ignored.
+func TestRouteCannotTakeOverOwnedHosts(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	const other = "bbbbbbbbbbbbbbbbbbbb"
+	h.keys.set(other, testKeys(t, other))
+	if err := h.reg.CreateProject(ctx, &registry.Project{Ref: other, Name: "p2", Status: registry.StatusActiveHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{h.host(h.ref), "api." + testDomain, "studio." + testDomain} {
+		if err := h.reg.PutRoute(ctx, registry.Route{Host: host, Ref: other, Kind: "custom"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A legitimate route added last proves the table has processed the earlier rows.
+	if err := h.reg.PutRoute(ctx, registry.Route{Host: "ok.customer.example", Ref: other, Kind: "custom"}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "route table refreshed", func() bool { return h.srv.table.routeKind("ok.customer.example") == "custom" })
+	p, ok := h.srv.table.lookup(h.host(h.ref))
+	if !ok || p.ref != h.ref {
+		t.Fatalf("derived host resolved to %q (ok=%v), want %q", p.ref, ok, h.ref)
+	}
+	for _, host := range []string{"api." + testDomain, "studio." + testDomain} {
+		if k := h.srv.table.routeKind(host); k != "" {
+			t.Fatalf("%s is routed as %q", host, k)
+		}
+	}
+}
+
+// TestUpstreamPorts checks the service -> loopback port map that every other test
+// replaces with upstreamFn.
+func TestUpstreamPorts(t *testing.T) {
+	cfg := config.Default()
+	cfg.Domain = testDomain
+	cfg.TLS.Mode = "off"
+	s, err := New(Options{Config: cfg, Registry: registry.NewMemory(), Keys: newFakeKeys(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := project{ref: testRef, seq: 4}
+	pp := cfg.PortsFor(p.ref, p.seq)
+	addr := func(port int) string { return fmt.Sprintf("127.0.0.1:%d", port) }
+	for svc, want := range map[service]string{
+		svcRest:      addr(pp.PostgREST),
+		svcAuth:      addr(pp.GoTrue),
+		svcRealtime:  addr(cfg.Ports.Realtime),
+		svcStorage:   addr(cfg.Ports.Storage),
+		svcFunctions: addr(cfg.Ports.EdgeRuntime),
+		svcStudio:    addr(cfg.Ports.Studio),
+	} {
+		if got := s.upstream(svc, p); got != want {
+			t.Errorf("%s: upstream = %s, want %s", svc, got, want)
+		}
+	}
+	if pp.PostgREST == pp.GoTrue {
+		t.Fatal("test needs distinct PostgREST and GoTrue ports")
 	}
 }

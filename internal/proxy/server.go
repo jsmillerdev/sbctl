@@ -116,6 +116,9 @@ func (s *Server) Serve(ctx context.Context, httpLn, httpsLn net.Listener) error 
 			httpPort: portOf(httpLn), httpsPort: httpsPort, log: s.log,
 		})
 		if err != nil {
+			// No server owns the listeners yet; do not leak them.
+			httpLn.Close()
+			httpsLn.Close()
 			return err
 		}
 		defer cm.close()

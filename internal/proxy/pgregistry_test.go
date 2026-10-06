@@ -2,11 +2,17 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -15,21 +21,20 @@ import (
 
 // TestPostgresRegistry runs the proxy over the real Postgres registry and real
 // LISTEN/NOTIFY, with keys opened from sealed project_secrets (RegistryKeys). It
-// needs SBCTL_TEST_DATABASE_URL, an empty database in a throwaway cluster.
+// needs SBCTL_TEST_DATABASE_URL, a role that may create databases in a throwaway
+// cluster; it runs in a database of its own, so it cannot collide with other
+// packages' tests that use the same DSN.
 func TestPostgresRegistry(t *testing.T) {
 	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SBCTL_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
-	reg, err := registry.Open(ctx, dsn)
+	reg, err := registry.Open(ctx, privateDatabase(t, dsn))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reg.Close()
-	if _, err := reg.Pool().Exec(ctx, `truncate sbctl.projects, sbctl.organizations cascade`); err != nil {
-		t.Fatal(err)
-	}
 	sec, err := secrets.New(secrets.RandomBytes(32))
 	if err != nil {
 		t.Fatal(err)
@@ -106,4 +111,46 @@ func TestPostgresRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, "deleted project gone", func() bool { return get(ref2, k3.PublishableKey) == 404 })
+}
+
+// privateDatabase creates a database that only this test uses, drops it when the
+// test ends, and returns its DSN. Other packages' tests truncate tables in the
+// database named by SBCTL_TEST_DATABASE_URL while their binaries run in parallel.
+func privateDatabase(t *testing.T, dsn string) string {
+	t.Helper()
+	ctx := context.Background()
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatal(err)
+	}
+	name := "sbctl_proxy_test_" + hex.EncodeToString(b[:])
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(ctx)
+	if _, err := admin.Exec(ctx, "create database "+pgx.Identifier{name}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), dsn)
+		if err != nil {
+			t.Errorf("dropping %s: %v", name, err)
+			return
+		}
+		defer c.Close(context.Background())
+		// Connections close in earlier cleanups; force covers a straggler.
+		if _, err := c.Exec(context.Background(), "drop database if exists "+pgx.Identifier{name}.Sanitize()+" with (force)"); err != nil {
+			t.Errorf("dropping %s: %v", name, err)
+		}
+	})
+	if strings.Contains(dsn, "://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.Path = "/" + name
+		return u.String()
+	}
+	return dsn + " dbname=" + name // keyword/value DSN: the last dbname wins
 }

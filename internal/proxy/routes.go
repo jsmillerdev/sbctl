@@ -159,6 +159,18 @@ func (rt *route) upstreamPath(p string, trailingSlash bool) string {
 	return rt.upstream + suffix
 }
 
+// escapedUpstreamPath is the upstream path in the client's own escaping (for
+// example %2B stays %2B and a raw "(" stays raw). cleanPath already validated u; the
+// escaped form is used only when cleaning it gives the same path and route as the
+// decoded form, otherwise "" makes the proxy re-escape the decoded path.
+func escapedUpstreamPath(u *url.URL, decoded string, rt *route, trailing bool) string {
+	clean := path.Clean(u.EscapedPath())
+	if dec, err := url.PathUnescape(clean); err != nil || dec != decoded || matchRoute(clean) != rt {
+		return ""
+	}
+	return rt.upstreamPath(clean, trailing)
+}
+
 var errBadPath = errors.New("proxy: malformed request path")
 
 // cleanPath normalizes a request path the way the upstream gateway does

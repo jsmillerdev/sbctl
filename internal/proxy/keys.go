@@ -36,7 +36,8 @@ func eqConst(got, want string) bool {
 //   - sb_publishable_* maps to the anon JWT and sb_secret_* to the service_role JWT.
 //   - A legacy key is accepted when it equals the project's anon or service_role
 //     key, or is any HS256 JWT signed with the project secret whose role is anon or
-//     service_role and whose ref claim, if present, is this project.
+//     service_role and whose ref claim, if present, is this project (the claim is optional:
+//     the project secret's signature already binds the token to the project).
 func classify(k *secrets.ProjectKeys, ref, apikey string) (role, jwt string, ok bool) {
 	if k == nil || apikey == "" {
 		return "", "", false
