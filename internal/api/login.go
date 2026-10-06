@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -207,6 +208,12 @@ func (s *Server) cliLoginCreate(w http.ResponseWriter, r *http.Request) error {
 	if name == "" {
 		name = "cli_login"
 	}
+	// Tokens of sessions that expired unclaimed, or that this one replaces, would
+	// otherwise stay valid with nobody holding them.
+	s.reapLoginSessions(r.Context())
+	if old, err := s.store.TakeLoginSession(r.Context(), in.SessionID); err == nil {
+		s.dropLoginToken(r.Context(), old)
+	}
 	token, t, err := s.newPAT(r, u, name, nil)
 	if err != nil {
 		return err
@@ -224,44 +231,74 @@ func (s *Server) cliLoginCreate(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// dropLoginToken deletes the PAT held by an unclaimed login session.
+func (s *Server) dropLoginToken(ctx context.Context, sess *LoginSession) {
+	if sess.TokenID != 0 {
+		_ = s.reg.DeleteAccessToken(ctx, sess.UserID, sess.TokenID)
+	}
+}
+
+// reapLoginSessions removes expired sessions and the tokens they hold.
+func (s *Server) reapLoginSessions(ctx context.Context) {
+	list, err := s.store.ReapLoginSessions(ctx)
+	if err != nil {
+		s.log.Warn("reaping login sessions", "err", err)
+		return
+	}
+	for i := range list {
+		s.dropLoginToken(ctx, &list[i])
+	}
+}
+
 // cliLoginPoll is the CLI half: it claims the sealed token with the verification
 // code. The session works once; wrong codes burn it after maxLoginFailures.
 func (s *Server) cliLoginPoll(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
 	id := r.PathValue("session_id")
 	code := r.URL.Query().Get("device_code")
 	if !uuidRe.MatchString(id) || code == "" {
 		return errf(http.StatusNotFound, "Login session not found")
 	}
-	sess, err := s.store.TakeLoginSession(r.Context(), id)
+	notFound := errf(http.StatusNotFound, "Cannot find login session")
+	sess, err := s.store.GetLoginSession(ctx, id)
 	if errors.Is(err, ErrNotFound) {
-		return errf(http.StatusNotFound, "Cannot find login session")
+		return notFound
 	}
 	if err != nil {
 		return err
 	}
+	if !sess.ExpiresAt.After(s.now()) {
+		if gone, err := s.store.TakeLoginSession(ctx, id); err == nil {
+			s.dropLoginToken(ctx, gone)
+		}
+		return notFound
+	}
 	want := sess.Nonce[:8]
 	if subtle.ConstantTimeCompare([]byte(strings.ToLower(code)), []byte(want)) != 1 {
-		s.loginMu.Lock()
-		s.loginFails[id]++
-		n := s.loginFails[id]
-		if n >= maxLoginFailures {
-			delete(s.loginFails, id)
+		// One atomic increment: a concurrent correct claim still sees the session.
+		n, err := s.store.FailLoginSession(ctx, id)
+		if errors.Is(err, ErrNotFound) {
+			return notFound
 		}
-		s.loginMu.Unlock()
-		if n < maxLoginFailures {
-			if err := s.store.PutLoginSession(r.Context(), *sess); err != nil {
-				return err
+		if err != nil {
+			return err
+		}
+		if n >= maxLoginFailures {
+			if gone, err := s.store.TakeLoginSession(ctx, id); err == nil {
+				s.dropLoginToken(ctx, gone)
 			}
-		} else if sess.TokenID != 0 {
-			_ = s.reg.DeleteAccessToken(r.Context(), sess.UserID, sess.TokenID)
 		}
 		return errf(http.StatusBadRequest, "Incorrect verification code")
 	}
-	s.loginMu.Lock()
-	delete(s.loginFails, id)
-	s.loginMu.Unlock()
+	claimed, err := s.store.TakeLoginSession(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return notFound
+	}
+	if err != nil {
+		return err
+	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"access_token": sess.Ciphertext, "public_key": sess.ServerPublicKey, "nonce": sess.Nonce,
+		"access_token": claimed.Ciphertext, "public_key": claimed.ServerPublicKey, "nonce": claimed.Nonce,
 	})
 	return nil
 }

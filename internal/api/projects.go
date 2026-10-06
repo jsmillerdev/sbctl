@@ -122,8 +122,9 @@ type createInput struct {
 }
 
 // createProject provisions a project through the lifecycle manager and returns it
-// as soon as it is visible in the registry (COMING_UP). Provisioning continues in
-// the background; its failure is logged and shows as INIT_FAILED.
+// as soon as it is visible in the registry (COMING_UP), or after createWait with
+// the allocated ref as COMING_UP. Provisioning continues in the background; its
+// failure is logged and shows as INIT_FAILED.
 func (s *Server) createProject(ctx context.Context, in createInput) (*registry.Project, error) {
 	if strings.TrimSpace(in.Name) == "" {
 		return nil, errf(http.StatusBadRequest, "name is required")
@@ -171,7 +172,11 @@ func (s *Server) createProject(ctx context.Context, in createInput) (*registry.P
 				return p, nil
 			}
 		case <-timeout:
-			return nil, errf(http.StatusGatewayTimeout, "Project creation did not start in time")
+			// Provisioning keeps running, so the project may still appear: a 504 would
+			// invite a retry that creates a second one. Answer with the allocated ref
+			// as COMING_UP; clients poll the project by ref.
+			s.log.Warn("project creation is slow; answering COMING_UP", "ref", ref)
+			return &registry.Project{Ref: ref, OrgID: org.ID, Name: req.Name, Region: req.Region, Status: registry.StatusComingUp, CreatedAt: s.now()}, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}

@@ -22,6 +22,21 @@ type API struct {
 	// DisableDeviceLogin turns off the `supabase login` browser flow (PATs created in
 	// the dashboard keep working).
 	DisableDeviceLogin bool `toml:"disable_device_login"`
+	// AdminEmails is a comma-separated allowlist of dashboard users (matched on the
+	// session's email, case-insensitively) who may use the API even without the
+	// app_metadata.sbctl_admin claim that sbctl sets on the users it creates.
+	AdminEmails string `toml:"admin_emails"`
+}
+
+// Admins returns AdminEmails split, trimmed and lower-cased, empty entries removed.
+func (a API) Admins() []string {
+	var out []string
+	for _, e := range strings.Split(a.AdminEmails, ",") {
+		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // Origins returns AllowedOrigins split and trimmed, empty entries removed.

@@ -30,6 +30,7 @@ type fakeManager struct {
 
 	mu       sync.Mutex
 	keys     map[string]*secrets.ProjectKeys
+	keyCalls map[string]int // Keys calls by ref
 	created  []lifecycle.CreateRequest
 	paused   []string
 	resumed  []string
@@ -38,7 +39,7 @@ type fakeManager struct {
 }
 
 func newFakeManager(reg registry.Registry, sec secrets.Secrets) *fakeManager {
-	return &fakeManager{reg: reg, sec: sec, dsn: "postgres://postgres:pw@127.0.0.1:5432/postgres", keys: map[string]*secrets.ProjectKeys{}}
+	return &fakeManager{reg: reg, sec: sec, dsn: "postgres://postgres:pw@127.0.0.1:5432/postgres", keys: map[string]*secrets.ProjectKeys{}, keyCalls: map[string]int{}}
 }
 
 func (m *fakeManager) addProject(t testing.TB, ref, name string, orgID int64, status registry.Status) *registry.Project {
@@ -109,6 +110,7 @@ func (m *fakeManager) RotateKeys(context.Context, string) (*secrets.ProjectKeys,
 func (m *fakeManager) Keys(_ context.Context, ref string) (*secrets.ProjectKeys, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.keyCalls[ref]++
 	if k, ok := m.keys[ref]; ok {
 		return k, nil
 	}
@@ -244,7 +246,9 @@ func newFixture(t testing.TB) *fixture {
 
 func (f *fixture) signJWT(claims map[string]any) string {
 	f.t.Helper()
-	c := jwt.MapClaims{"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "aud": "authenticated"}
+	// Like the users sbctl creates in sb-gotrue@system, sessions carry the admin claim.
+	c := jwt.MapClaims{"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "aud": "authenticated",
+		"app_metadata": map[string]any{AdminClaim: true}}
 	for k, v := range claims {
 		c[k] = v
 	}

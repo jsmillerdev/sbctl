@@ -49,11 +49,17 @@ func (s *Server) dbQuery(readOnlyRoute bool) handlerFunc {
 		if err != nil {
 			return err
 		}
+		// Read-only queries run as roleReadOnly, a role that cannot write whatever
+		// the SQL says; a default_transaction_read_only setting alone could be undone.
+		role := "postgres"
+		if readOnlyRoute || in.ReadOnly {
+			role = roleReadOnly
+		}
 		var rows json.RawMessage
 		if len(in.Parameters) > 0 {
-			rows, err = s.sqlParams(r.Context(), p.Ref, "postgres", readOnlyRoute || in.ReadOnly, in.Query, in.Parameters)
+			rows, err = s.sqlParams(r.Context(), p.Ref, role, false, in.Query, in.Parameters)
 		} else {
-			rows, err = s.sqlRows(r.Context(), p.Ref, "postgres", readOnlyRoute || in.ReadOnly, in.Query)
+			rows, err = s.sqlRows(r.Context(), p.Ref, role, false, in.Query)
 		}
 		if err != nil {
 			return err
@@ -133,9 +139,12 @@ func (s *Server) applyMigration(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 	}
-	version := s.now().UTC().Format("20060102150405")
+	// One batch, one implicit transaction: the advisory lock serializes concurrent
+	// migrations, and the version is picked in the same transaction as the insert, so
+	// two migrations in the same second still get distinct, increasing versions.
 	var b strings.Builder
-	b.WriteString(`create schema if not exists supabase_migrations;
+	b.WriteString(`select pg_advisory_xact_lock(hashtext('sbctl.apply_migration'));
+create schema if not exists supabase_migrations;
 create table if not exists ` + tbl + ` (version text not null primary key, statements text[], name text);
 alter table ` + tbl + ` add column if not exists created_by text;
 alter table ` + tbl + ` add column if not exists idempotency_key text unique;
@@ -143,8 +152,10 @@ alter table ` + tbl + ` add column if not exists rollback text[];
 `)
 	b.WriteString(in.Query)
 	b.WriteString("\n;\n")
-	b.WriteString(`insert into ` + tbl + ` (version, name, statements, rollback, idempotency_key) values (` +
-		sqlLiteral(version) + `, ` + nullable(in.Name) + `, array[` + sqlLiteral(in.Query) + `], ` + nullableArray(in.Rollback) + `, ` + nullable(key) + `);`)
+	b.WriteString(`insert into ` + tbl + ` (version, name, statements, rollback, idempotency_key)
+select greatest(to_char(now() at time zone 'utc', 'YYYYMMDDHH24MISS')::bigint,
+                coalesce(max(case when version ~ '^[0-9]{1,18}$' then version::bigint end), 0) + 1)::text, ` +
+		nullable(in.Name) + `, array[` + sqlLiteral(in.Query) + `], ` + nullableArray(in.Rollback) + `, ` + nullable(key) + ` from ` + tbl + `;`)
 	if _, err := s.sqlRows(r.Context(), p.Ref, "postgres", false, b.String()); err != nil {
 		return err
 	}
@@ -180,7 +191,7 @@ func (s *Server) typescriptTypes(w http.ResponseWriter, r *http.Request) error {
 	if !schemaListRe.MatchString(schemas) {
 		return errf(http.StatusBadRequest, "invalid included_schemas")
 	}
-	resp, err := s.pgmetaDo(r.Context(), p.Ref, "supabase_admin", false, http.MethodGet, "/generators/typescript",
+	resp, err := s.pgmetaDo(r.Context(), p.Ref, "postgres", false, http.MethodGet, "/generators/typescript",
 		"included_schemas="+strings.ReplaceAll(schemas, " ", ""), nil, http.Header{})
 	if err != nil {
 		return err
@@ -196,6 +207,12 @@ func (s *Server) typescriptTypes(w http.ResponseWriter, r *http.Request) error {
 	writeJSON(w, http.StatusOK, &v1.TypescriptResponseOutput{Types: string(b)})
 	return nil
 }
+
+// Login role name prefixes: read-write roles must start with cli_login_ for the CLI.
+const (
+	loginRolePrefix         = "cli_login_"
+	readOnlyLoginRolePrefix = "sbctl_cli_ro_"
+)
 
 // loginRoleTTL is how long a temporary CLI login role stays valid.
 const loginRoleTTL = time.Hour
@@ -214,12 +231,23 @@ func (s *Server) createLoginRole(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	role := "cli_login_" + strings.ToLower(secrets.RandomString(8, "abcdefghijklmnopqrstuvwxyz"))
+	// The CLI runs `SET SESSION ROLE postgres` after connecting as any cli_login_*
+	// user (cli-go internal/utils/connect.go), which a read-only role cannot do, so
+	// read-only roles carry another prefix and the CLI uses them as they are.
+	prefix := loginRolePrefix
+	if in.ReadOnly {
+		prefix = readOnlyLoginRolePrefix
+	}
+	role := prefix + strings.ToLower(secrets.RandomString(8, "abcdefghijklmnopqrstuvwxyz"))
 	pw := secrets.NewPassword()
 	until := s.now().Add(loginRoleTTL).UTC().Format("2006-01-02 15:04:05+00")
 	var b strings.Builder
 	b.WriteString(dropExpiredLoginRoles)
-	b.WriteString(fmt.Sprintf("create role %s login password %s valid until %s", sqlIdent(role), sqlLiteral(pw), sqlLiteral(until)))
+	verifier, err := scramVerifier(pw) // not the cleartext: statement logs must not see the password
+	if err != nil {
+		return err
+	}
+	b.WriteString(fmt.Sprintf("create role %s login password %s valid until %s", sqlIdent(role), sqlLiteral(verifier), sqlLiteral(until)))
 	if in.ReadOnly {
 		b.WriteString(" in role pg_read_all_data;\n")
 		b.WriteString(fmt.Sprintf("alter role %s set default_transaction_read_only = on;", sqlIdent(role)))
@@ -235,7 +263,7 @@ func (s *Server) createLoginRole(w http.ResponseWriter, r *http.Request) error {
 }
 
 const dropExpiredLoginRoles = `do $$ declare r record; begin
-  for r in select rolname from pg_roles where rolname like 'cli\_login\_%' and rolvaliduntil < now() loop
+  for r in select rolname from pg_roles where (rolname like 'cli\_login\_%' or rolname like 'sbctl\_cli\_ro\_%') and rolvaliduntil < now() loop
     execute format('drop role %I', r.rolname);
   end loop;
 end $$;
@@ -247,7 +275,7 @@ func (s *Server) deleteLoginRoles(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 	q := `do $$ declare r record; begin
-  for r in select rolname from pg_roles where rolname like 'cli\_login\_%' loop
+  for r in select rolname from pg_roles where rolname like 'cli\_login\_%' or rolname like 'sbctl\_cli\_ro\_%' loop
     execute format('drop role %I', r.rolname);
   end loop;
 end $$;`

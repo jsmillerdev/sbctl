@@ -64,8 +64,8 @@ type Server struct {
 	pgmetaKeyMu    chan struct{} // 1-slot lock around pgmetaKeyCache
 	pgmetaKeyCache string
 
-	loginMu    sync.Mutex
-	loginFails map[string]int
+	roMu      sync.Mutex
+	roEnsured map[string]readOnlyEnsured // by project ref
 
 	handler http.Handler
 }
@@ -95,7 +95,7 @@ func NewServer(d Deps) (*Server, error) {
 	s := &Server{
 		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, cfg: d.Config, log: d.Logger, store: d.Store,
 		hc: d.HTTPClient, now: d.Now, pgmetaURL: d.PGMetaURL, upstreamOverride: d.Upstream, createWait: d.CreateWait,
-		pgmetaKeyMu: make(chan struct{}, 1), loginFails: map[string]int{},
+		pgmetaKeyMu: make(chan struct{}, 1), roEnsured: map[string]readOnlyEnsured{},
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
@@ -121,7 +121,7 @@ func NewServer(d Deps) (*Server, error) {
 			s.store = NewMemoryStore()
 		}
 	}
-	s.auth = newAuthenticator(s.reg, s.mgr.Keys, s.store, s.now)
+	s.auth = newAuthenticator(s.reg, s.mgr.Keys, s.store, s.now, s.cfg.API.Admins())
 	h, err := s.build()
 	if err != nil {
 		return nil, err

@@ -20,10 +20,19 @@ type Store interface {
 	// ListUsers returns every dashboard user, oldest first.
 	ListUsers(ctx context.Context) ([]User, error)
 
+	// PutLoginSession creates or replaces a session (failures reset to 0).
 	PutLoginSession(ctx context.Context, s LoginSession) error
-	// TakeLoginSession returns the session and deletes it, so a code works once.
-	// Expired sessions are reported as ErrNotFound.
+	// GetLoginSession returns the session, expired or not (callers check ExpiresAt).
+	GetLoginSession(ctx context.Context, sessionID string) (*LoginSession, error)
+	// FailLoginSession counts one wrong verification code and returns the total.
+	// It is a single atomic update, so concurrent claims never hide the session.
+	FailLoginSession(ctx context.Context, sessionID string) (int, error)
+	// TakeLoginSession returns the session, expired or not, and deletes it, so a
+	// code works once. ErrNotFound when it is gone.
 	TakeLoginSession(ctx context.Context, sessionID string) (*LoginSession, error)
+	// ReapLoginSessions deletes the expired sessions and returns them, so the caller
+	// can delete the tokens they hold.
+	ReapLoginSessions(ctx context.Context) ([]LoginSession, error)
 
 	UpsertFunction(ctx context.Context, f *Function, files []FunctionFile) error
 	ListFunctions(ctx context.Context, ref string) ([]Function, error)
@@ -39,9 +48,12 @@ type Store interface {
 	GetContent(ctx context.Context, ref, id string) (*Content, error)
 	// UpsertContent inserts c (empty ID) or replaces the row with that ID.
 	UpsertContent(ctx context.Context, c *Content) error
-	DeleteContent(ctx context.Context, ref string, ids []string) ([]string, error)
+	// DeleteContent removes the items of ref with these ids that are shared or owned
+	// by ownerID (private items of other users are left alone) and returns the ids.
+	DeleteContent(ctx context.Context, ref string, ownerID int64, ids []string) ([]string, error)
 	CountContent(ctx context.Context, ref string, ownerID int64) (ContentCount, error)
 	ListFolders(ctx context.Context, ref string, parentID *string) ([]ContentFolder, error)
+	GetFolder(ctx context.Context, ref, id string) (*ContentFolder, error)
 	CreateFolder(ctx context.Context, f *ContentFolder) error
 	RenameFolder(ctx context.Context, ref, id, name string) error
 	DeleteFolders(ctx context.Context, ref string, ids []string) error
@@ -72,6 +84,7 @@ type LoginSession struct {
 	Nonce           string // hex, 12 bytes; its first 8 characters are the verification code
 	Ciphertext      string // hex, AES-256-GCM ciphertext with the tag appended
 	ExpiresAt       time.Time
+	Failures        int // wrong verification codes so far
 }
 
 // Function is one Edge Function deployment of a project.

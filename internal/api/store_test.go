@@ -50,10 +50,37 @@ func testStore(t *testing.T, s Store, ref string) {
 	if _, err := s.TakeLoginSession(ctx, sess.SessionID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second take: %v", err)
 	}
+	// wrong codes are counted in place; Put resets the count
+	_ = s.PutLoginSession(ctx, sess)
+	for want := 1; want <= 2; want++ {
+		if n, err := s.FailLoginSession(ctx, sess.SessionID); err != nil || n != want {
+			t.Fatalf("fail %d: %d %v", want, n, err)
+		}
+	}
+	if g, err := s.GetLoginSession(ctx, sess.SessionID); err != nil || g.Failures != 2 {
+		t.Fatalf("get after failures: %+v %v", g, err)
+	}
+	_ = s.PutLoginSession(ctx, sess)
+	if g, _ := s.GetLoginSession(ctx, sess.SessionID); g == nil || g.Failures != 0 {
+		t.Fatalf("put must reset failures: %+v", g)
+	}
+	if _, err := s.FailLoginSession(ctx, "00000000-0000-4000-8000-000000000000"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("fail of a missing session: %v", err)
+	}
+	// expired sessions are still returned (so their token can be deleted), and reaped once
 	sess.ExpiresAt = time.Now().Add(-time.Second)
 	_ = s.PutLoginSession(ctx, sess)
+	if g, err := s.GetLoginSession(ctx, sess.SessionID); err != nil || g.ExpiresAt.After(time.Now()) {
+		t.Fatalf("expired session: %+v %v", g, err)
+	}
+	if reaped, err := s.ReapLoginSessions(ctx); err != nil || len(reaped) != 1 || reaped[0].SessionID != sess.SessionID {
+		t.Fatalf("reap: %+v %v", reaped, err)
+	}
+	if reaped, _ := s.ReapLoginSessions(ctx); len(reaped) != 0 {
+		t.Fatalf("second reap: %+v", reaped)
+	}
 	if _, err := s.TakeLoginSession(ctx, sess.SessionID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("expired session: %v", err)
+		t.Fatalf("take after reap: %v", err)
 	}
 
 	// functions
@@ -112,6 +139,12 @@ func testStore(t *testing.T, s Store, ref string) {
 	folder := &ContentFolder{Ref: ref, OwnerID: u.ID, Name: "reports"}
 	if err := s.CreateFolder(ctx, folder); err != nil || folder.ID == "" {
 		t.Fatalf("folder: %+v %v", folder, err)
+	}
+	if got, err := s.GetFolder(ctx, ref, folder.ID); err != nil || got.Name != "reports" {
+		t.Fatalf("get folder: %+v %v", got, err)
+	}
+	if _, err := s.GetFolder(ctx, "otherref", folder.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("folder of another project: %v", err)
 	}
 	sub := &ContentFolder{Ref: ref, OwnerID: u.ID, Name: "sub", ParentID: &folder.ID}
 	if err := s.CreateFolder(ctx, sub); err != nil {
@@ -181,7 +214,17 @@ func testStore(t *testing.T, s Store, ref string) {
 	if r, _ := s.ListContent(ctx, ref, ContentQuery{RootOnly: true}); len(r) != 3 {
 		t.Fatalf("content must survive its folder: %d", len(r))
 	}
-	deleted, err := s.DeleteContent(ctx, ref, []string{a.ID, "00000000-0000-4000-8000-000000000000"})
+	priv := mk("private", "sql", "user", false, nil)
+	if got, err := s.DeleteContent(ctx, ref, u.ID+1000, []string{priv.ID}); err != nil || len(got) != 0 {
+		t.Fatalf("another user's private item was deleted: %v %v", got, err)
+	}
+	if got, err := s.DeleteContent(ctx, ref, u.ID, []string{priv.ID}); err != nil || len(got) != 1 {
+		t.Fatalf("owner could not delete: %v %v", got, err)
+	}
+	if _, err := s.GetFolder(ctx, ref, "00000000-0000-4000-8000-000000000000"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing folder: %v", err)
+	}
+	deleted, err := s.DeleteContent(ctx, ref, u.ID, []string{a.ID, "00000000-0000-4000-8000-000000000000"})
 	if err != nil || len(deleted) != 1 || deleted[0] != a.ID {
 		t.Fatalf("delete content: %v %v", deleted, err)
 	}

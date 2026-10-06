@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -83,28 +82,50 @@ func (s *PGStore) PutLoginSession(ctx context.Context, l LoginSession) error {
 		values ($1::uuid, $2::uuid, nullif($3::bigint, 0), $4, $5, $6, $7)
 		on conflict (session_id) do update set user_id = excluded.user_id, token_id = excluded.token_id,
 		  server_public_key = excluded.server_public_key, nonce = excluded.nonce, ciphertext = excluded.ciphertext,
-		  expires_at = excluded.expires_at`,
+		  expires_at = excluded.expires_at, failures = 0`,
 		l.SessionID, l.UserID, l.TokenID, l.ServerPublicKey, l.Nonce, l.Ciphertext, l.ExpiresAt)
-	if err == nil {
-		// Opportunistic cleanup keeps the table small without a janitor goroutine.
-		_, err = s.pool.Exec(ctx, `delete from sbctl.api_cli_login_sessions where expires_at < now() - interval '1 hour'`)
-	}
 	return err
 }
 
-func (s *PGStore) TakeLoginSession(ctx context.Context, id string) (*LoginSession, error) {
+const loginCols = `session_id::text, user_id::text, coalesce(token_id, 0), server_public_key, nonce, ciphertext, expires_at, failures`
+
+func scanLogin(row pgx.Row) (*LoginSession, error) {
 	var l LoginSession
-	err := s.pool.QueryRow(ctx, `
-		delete from sbctl.api_cli_login_sessions where session_id = $1::uuid
-		returning session_id::text, user_id::text, coalesce(token_id, 0), server_public_key, nonce, ciphertext, expires_at`, id).
-		Scan(&l.SessionID, &l.UserID, &l.TokenID, &l.ServerPublicKey, &l.Nonce, &l.Ciphertext, &l.ExpiresAt)
-	if err != nil {
+	if err := row.Scan(&l.SessionID, &l.UserID, &l.TokenID, &l.ServerPublicKey, &l.Nonce, &l.Ciphertext, &l.ExpiresAt, &l.Failures); err != nil {
 		return nil, notFound(err)
 	}
-	if !l.ExpiresAt.After(time.Now()) {
-		return nil, ErrNotFound
-	}
 	return &l, nil
+}
+
+func (s *PGStore) GetLoginSession(ctx context.Context, id string) (*LoginSession, error) {
+	return scanLogin(s.pool.QueryRow(ctx, `select `+loginCols+` from sbctl.api_cli_login_sessions where session_id = $1::uuid`, id))
+}
+
+func (s *PGStore) FailLoginSession(ctx context.Context, id string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `update sbctl.api_cli_login_sessions set failures = failures + 1 where session_id = $1::uuid returning failures`, id).Scan(&n)
+	return n, notFound(err)
+}
+
+func (s *PGStore) TakeLoginSession(ctx context.Context, id string) (*LoginSession, error) {
+	return scanLogin(s.pool.QueryRow(ctx, `delete from sbctl.api_cli_login_sessions where session_id = $1::uuid returning `+loginCols, id))
+}
+
+func (s *PGStore) ReapLoginSessions(ctx context.Context) ([]LoginSession, error) {
+	rows, err := s.pool.Query(ctx, `delete from sbctl.api_cli_login_sessions where expires_at < now() returning `+loginCols)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LoginSession
+	for rows.Next() {
+		l, err := scanLogin(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *l)
+	}
+	return out, rows.Err()
 }
 
 const fnCols = `ref, slug, id::text, name, version, status, verify_jwt, coalesce(entrypoint_path,''), coalesce(import_map_path,''), created_at, updated_at`
@@ -295,8 +316,8 @@ func (s *PGStore) UpsertContent(ctx context.Context, c *Content) error {
 	return nil
 }
 
-func (s *PGStore) DeleteContent(ctx context.Context, ref string, ids []string) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `delete from sbctl.api_content where ref = $1 and id = any($2::uuid[]) returning id::text`, ref, ids)
+func (s *PGStore) DeleteContent(ctx context.Context, ref string, ownerID int64, ids []string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `delete from sbctl.api_content where ref = $1 and id = any($2::uuid[]) and (visibility <> 'user' or owner_id = $3) returning id::text`, ref, ids, ownerID)
 	if err != nil {
 		return nil, err
 	}
@@ -331,6 +352,10 @@ func scanFolder(row pgx.Row) (*ContentFolder, error) {
 }
 
 const folderCols = `id::text, ref, parent_id::text, owner_id, name, created_at, updated_at`
+
+func (s *PGStore) GetFolder(ctx context.Context, ref, id string) (*ContentFolder, error) {
+	return scanFolder(s.pool.QueryRow(ctx, `select `+folderCols+` from sbctl.api_content_folders where ref = $1 and id = $2::uuid`, ref, id))
+}
 
 func (s *PGStore) ListFolders(ctx context.Context, ref string, parentID *string) ([]ContentFolder, error) {
 	rows, err := s.pool.Query(ctx, `select `+folderCols+` from sbctl.api_content_folders

@@ -62,9 +62,15 @@ changes nothing.
 
 | Route family | Credentials |
 |---|---|
-| `/platform/*` | GoTrue session JWT from `sb-gotrue@system`: HS256, signed with the system project's JWT secret (`Manager.Keys("system")`, re-read when verification fails so a rotation takes effect), `role: authenticated`, not anonymous |
+| `/platform/*` | GoTrue session JWT from `sb-gotrue@system`: HS256, signed with the system project's JWT secret (`Manager.Keys("system")`; re-read when a signature fails, at most once every 5 seconds, so a rotation takes effect and garbage tokens cost nothing), `role: authenticated`, not anonymous, **and an admin** (below) |
 | `/v1/*`, `/v2/*` | `sbp_` personal access token (`sbp_` + 40 hex, also `sbp_v0_`, `sbp_oauth_`; looked up by `secrets.HashToken`, expiry honored, `last_used_at` touched at most once a minute) **or** a dashboard JWT |
 | `GET /platform/cli/login/{session_id}` | none (the CLI has no token yet); guarded by the verification code |
+
+**Admin gate.** A valid session is not enough: the user needs `app_metadata.sbctl_admin = true`
+(`api.AdminClaim`; GoTrue lets users edit `user_metadata` but not `app_metadata`) or an email in
+`[api] admin_emails`, otherwise the answer is `403`. sbctl sets the claim on every dashboard user
+it creates, and `sb-gotrue@system` **must run with `GOTRUE_DISABLE_SIGNUP=true`** so nobody else
+can obtain a session at all; the gate is defense in depth if that setting is ever lost.
 
 Dashboard users are recorded in `sbctl.api_users` on first sight (profile fields come from
 GoTrue's `user_metadata`; later edits win). Every authenticated user can see and change
@@ -79,7 +85,9 @@ public key (ECDH, shared secret as the AES-256-GCM key) and returns `{nonce}`; t
 hex digits of the nonce are the verification code the page shows. The CLI then polls
 `GET /platform/cli/login/{session_id}?device_code=<code>` and gets
 `{access_token, public_key, nonce}`. A session works once and lives 10 minutes; five wrong
-codes destroy it and its token. Protocol read from `supabase/cli` (`login-crypto.layer.ts`,
+codes (counted in place with one atomic update) destroy it and its token. A session that
+expires unclaimed, or is replaced by a new authorization with the same id, takes its token
+with it (reaped on the next login request or claim attempt). Protocol read from `supabase/cli` (`login-crypto.layer.ts`,
 `ensure-login.ts`) and Studio (`pages/cli/login.tsx`). Set `[api] disable_device_login` to
 turn it off.
 
@@ -88,15 +96,36 @@ turn it off.
 | Key | Meaning |
 |---|---|
 | `allowed_origins` | extra CORS origins besides the Studio URL (`*` is not accepted: Studio sends credentials) |
-| `pgmeta_crypto_key` | passphrase shared with sb-pgmeta (`CRYPTO_KEY`). Empty: a random key kept sealed in the registry as system secret `pgmeta_crypto_key` |
+| `pgmeta_crypto_key` | passphrase shared with sb-pgmeta (`CRYPTO_KEY`). Empty: a random key kept sealed in the registry as system secret `pgmeta_crypto_key`, created by `api.EnsurePGMetaCryptoKey(ctx, reg, sec)`. The unit renderer for sb-pgmeta must call that function before it renders the unit; the API calls it on first use and fails (no ephemeral key) when the registry cannot store the key |
 | `public_url`, `dashboard_url` | override the derived `https://api.<domain>` and `https://studio.<domain>` |
 | `disable_device_login` | turn off the browser login flow |
+| `admin_emails` | comma-separated emails allowed to use the API without the `sbctl_admin` claim |
 
 ## What this package needs from the rest of the system
 
-- **`Manager.ConnString(ref, role)`** for roles `postgres` (SQL, migrations) and
-  `supabase_admin` (pg-meta, types, login roles). Parameterized queries connect with pgx
-  to that DSN directly; everything else goes through pg-meta.
+- **`Manager.ConnString(ref, role)`** for roles `postgres` (SQL, migrations, the Studio
+  pg-meta proxy, types) and `supabase_admin` (creating login roles and the read-only role).
+  Parameterized queries connect with pgx to that DSN directly; everything else goes
+  through pg-meta. The DSN must be a URL (`postgres://...`), and the project's `pg_hba`
+  must accept password (SCRAM) logins on loopback for the roles below.
+- **Studio's pg-meta runs as `postgres`**, not `supabase_admin` as upstream's self-hosted
+  Studio does: objects made in the SQL editor then belong to the role the CLI and
+  migrations use and can be altered or dropped by them. A feature that needs a superuser
+  would fail with a permission error; that is the trade-off taken.
+- **Read-only SQL runs as the role `sbctl_read_only`**: `login`, member of `pg_read_all_data`
+  and nothing else, `default_transaction_read_only = on` as a second layer. The API creates
+  it on demand (as `supabase_admin`, re-checked every 30 s) with a password derived from the
+  project's admin password (HMAC) and a SCRAM verifier, never cleartext. A client cannot
+  write by sending `begin read write` or `reset role`: the role lacks the privileges
+  (`TestIntegrationDatabase` runs those escapes on both read-only routes). Used by
+  `database/query/read-only` and `database/query` with `read_only: true`, which the MCP
+  server's `--read-only` mode relies on.
+- **CLI login roles**: `cli_login_<rand>` (member of `postgres`, `set role = postgres`) for
+  read-write; read-only requests get `sbctl_cli_ro_<rand>` (member of `pg_read_all_data`),
+  because the CLI runs `SET SESSION ROLE postgres` after connecting as any `cli_login_*`
+  user (cli-go `internal/utils/connect.go`) and a read-only role cannot do that. Both expire
+  after an hour, are dropped by the next create or by `DELETE .../cli/login-role`, and are
+  created with a SCRAM verifier.
 - **sb-pgmeta** at `127.0.0.1:<ports.pgmeta>` with `CRYPTO_KEY` equal to the key above. The
   `x-connection-encrypted` header is built in `cryptojs/` (crypto-js passphrase AES, checked
   against vectors from the real library in `testdata/cryptojs/`). pg-meta also listens on
@@ -104,15 +133,26 @@ turn it off.
 - **GoTrue** per project at `127.0.0.1:<PortsFor(ref, seq).GoTrue>` and **Storage** at
   `127.0.0.1:<ports.storage>` (multi-tenant, tenant from `x-forwarded-host`).
 - **`Manager.Create`** may block until the project is healthy: `POST /v1/projects` returns
-  `201 COMING_UP` as soon as the registry row exists (ten seconds at most) and lets
-  provisioning continue in the background.
+  `201 COMING_UP` as soon as the registry row exists, or after ten seconds with the
+  allocated ref (never a 504, which would invite a retry that creates a second project;
+  clients poll `GET .../projects/{ref}`, which answers 404 until the row exists). Better
+  for clients: have `Manager.Create` insert the registry row before it does anything slow.
+- **`sb-gotrue@system`** with `GOTRUE_DISABLE_SIGNUP=true`, and `app_metadata.sbctl_admin = true`
+  on each dashboard user sbctl creates (see Authentication).
 
 ## State
 
-Migration `internal/registry/migrations/0100_api.sql` (range 0100-0199): `api_users`,
-`api_cli_login_sessions`, `api_functions`, `api_function_files`, `api_function_secrets`,
-`api_content`, `api_content_folders`. `Store` (`store.go`) has a Postgres and a memory
+Migrations `internal/registry/migrations/0100_api.sql` and `0101_api_login_failures.sql`
+(range 0100-0199): `api_users`, `api_cli_login_sessions`, `api_functions`,
+`api_function_files`, `api_function_secrets`, `api_content`, `api_content_folders`. `Store` (`store.go`) has a Postgres and a memory
 implementation behind one conformance suite (`store_test.go`).
+
+## Generated types
+
+`gen/` is generated from the pinned specs by `go generate ./internal/api/gen`, which works
+offline on the committed `gen/specs/*.json`. Re-pinning the specs is a separate, deliberate
+step: `sh internal/api/gen/fetch-specs.sh` (a `make specs` target should call it), review
+the diff, then generate.
 
 ## `sbctl api profile`
 
@@ -181,6 +221,10 @@ python3 internal/api/testdata/cli-login.py ./profile.yaml /path/stack.json
   endpoints work when the link is opened on the right host (`cli-login.py` does that).
 - The MCP server derives `get_project_url` from the API host (`*.supabase.red`); the URL it
   returns is wrong for any custom domain. Upstream fix proposed in `research/05`.
+- Parameterized queries are wrapped in a CTE so Postgres serializes the rows (trailing
+  semicolons and comments are stripped first). Statements that cannot sit in a CTE (DDL,
+  INSERT without RETURNING, SHOW, EXPLAIN) run unwrapped and their rows are marshaled from
+  the driver's values, which can differ from Postgres's JSON for exotic types.
 - `database/query` for `parameters` and for pg-meta SQL return rows as Postgres/pg-meta
   serialize them; `bigint` columns can differ between the two paths (number vs string).
 - Advisors return no lints; function bodies are stored but not run; branches are always empty;

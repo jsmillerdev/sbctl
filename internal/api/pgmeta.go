@@ -9,11 +9,12 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/OWNER/sbctl/internal/api/cryptojs"
 	"github.com/OWNER/sbctl/internal/config"
@@ -26,7 +27,52 @@ import (
 // not configured. The unit renderer must give sb-pgmeta the same value.
 const SecretPGMetaCryptoKey = "pgmeta_crypto_key"
 
-// pgmetaKey returns the passphrase of the x-connection-encrypted header.
+// ensureKeyMu serializes EnsurePGMetaCryptoKey within a process.
+var ensureKeyMu sync.Mutex
+
+// EnsurePGMetaCryptoKey returns the passphrase shared with sb-pgmeta (its CRYPTO_KEY),
+// creating it when absent: a random value sealed in the registry as system project
+// secret SecretPGMetaCryptoKey. Insert-if-absent, then read back, so concurrent
+// callers (the unit renderer and the API, possibly in different processes) agree on
+// one key. The unit renderer must call this before it renders sb-pgmeta, and the
+// API calls it on first use. It never falls back to an ephemeral key: when the
+// registry cannot hold the key it returns an error.
+func EnsurePGMetaCryptoKey(ctx context.Context, reg registry.Registry, sec secrets.Secrets) (string, error) {
+	ensureKeyMu.Lock()
+	defer ensureKeyMu.Unlock()
+	open := func() (string, error) {
+		sealed, err := reg.GetSecret(ctx, config.SystemRef, SecretPGMetaCryptoKey)
+		if err != nil {
+			return "", err
+		}
+		plain, err := sec.Open(sealed)
+		if err != nil {
+			return "", fmt.Errorf("api: open %s: %w", SecretPGMetaCryptoKey, err)
+		}
+		return string(plain), nil
+	}
+	key, err := open()
+	if !errors.Is(err, registry.ErrNotFound) {
+		return key, err
+	}
+	sealed, err := sec.Seal([]byte(secrets.NewPassword()))
+	if err != nil {
+		return "", err
+	}
+	if pg, ok := reg.(interface{ Pool() *pgxpool.Pool }); ok {
+		_, err = pg.Pool().Exec(ctx, `insert into sbctl.project_secrets (ref, name, ciphertext) values ($1, $2, $3) on conflict (ref, name) do nothing`,
+			config.SystemRef, SecretPGMetaCryptoKey, sealed)
+	} else {
+		err = reg.PutSecret(ctx, config.SystemRef, SecretPGMetaCryptoKey, sealed)
+	}
+	if err != nil {
+		return "", fmt.Errorf("api: store %s: %w", SecretPGMetaCryptoKey, err)
+	}
+	return open()
+}
+
+// pgmetaKey returns the passphrase of the x-connection-encrypted header: [api]
+// pgmeta_crypto_key when set, else the registry's (see EnsurePGMetaCryptoKey).
 func (s *Server) pgmetaKey(ctx context.Context) (string, error) {
 	s.pgmetaKeyMu <- struct{}{}
 	defer func() { <-s.pgmetaKeyMu }()
@@ -37,47 +83,20 @@ func (s *Server) pgmetaKey(ctx context.Context) (string, error) {
 		s.pgmetaKeyCache = k
 		return k, nil
 	}
-	sealed, err := s.reg.GetSecret(ctx, config.SystemRef, SecretPGMetaCryptoKey)
-	switch {
-	case err == nil:
-		plain, err := s.sec.Open(sealed)
-		if err != nil {
-			return "", fmt.Errorf("api: open %s: %w", SecretPGMetaCryptoKey, err)
-		}
-		s.pgmetaKeyCache = string(plain)
-	case errors.Is(err, registry.ErrNotFound):
-		key := secrets.NewPassword()
-		sealed, err := s.sec.Seal([]byte(key))
-		if err != nil {
-			return "", err
-		}
-		if err := s.reg.PutSecret(ctx, config.SystemRef, SecretPGMetaCryptoKey, sealed); err != nil {
-			// No system project row yet (tests, first boot): keep a process-local key.
-			s.log.Warn("pg-meta crypto key not persisted; set [api] pgmeta_crypto_key", "err", err)
-		}
-		s.pgmetaKeyCache = key
-	default:
-		return "", err
-	}
-	return s.pgmetaKeyCache, nil
-}
-
-// pgmetaConn builds the x-connection-encrypted header value for ref's database as
-// role. readOnly makes every transaction of the connection read only.
-func (s *Server) pgmetaConn(ctx context.Context, ref, role string, readOnly bool) (string, error) {
-	dsn, err := s.mgr.ConnString(ctx, ref, role)
+	key, err := EnsurePGMetaCryptoKey(ctx, s.reg, s.sec)
 	if err != nil {
 		return "", err
 	}
-	if readOnly {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return "", fmt.Errorf("api: connection string: %w", err)
-		}
-		q := u.Query()
-		q.Set("options", "-c default_transaction_read_only=on")
-		u.RawQuery = q.Encode()
-		dsn = u.String()
+	s.pgmetaKeyCache = key
+	return key, nil
+}
+
+// pgmetaConn builds the x-connection-encrypted header value for ref's database as
+// role (see Server.dsn for the roles and readOnly).
+func (s *Server) pgmetaConn(ctx context.Context, ref, role string, readOnly bool) (string, error) {
+	dsn, err := s.dsn(ctx, ref, role, readOnly)
+	if err != nil {
+		return "", err
 	}
 	key, err := s.pgmetaKey(ctx)
 	if err != nil {
@@ -154,7 +173,8 @@ func (s *Server) sqlRows(ctx context.Context, ref, role string, readOnly bool, q
 		status := resp.StatusCode
 		if status >= 500 {
 			// pg-meta reports SQL errors as 400; 5xx means pg-meta itself failed.
-			s.log.Error("pg-meta error", "status", status, "body", string(b))
+			// The body can echo the statement, so log a short prefix of the message only.
+			s.log.Error("pg-meta error", "status", status, "message", truncate(pgmetaErrorMessage(b, status), 120))
 			return nil, errf(http.StatusBadGateway, "Database metadata service failed: %s", pgmetaErrorMessage(b, status))
 		}
 		return nil, errf(status, "%s", pgmetaErrorMessage(b, status))
@@ -165,6 +185,11 @@ func (s *Server) sqlRows(ctx context.Context, ref, role string, readOnly bool, q
 // pgmetaProxy forwards /platform/pg-meta/{ref}/<path> to sb-pgmeta, replacing the
 // connection header Studio sends with one built here, and relays the answer
 // verbatim: Studio reads pg-meta's own error format.
+//
+// It connects as postgres, not supabase_admin like upstream's self-hosted Studio
+// does: objects created in the SQL editor then belong to postgres, the role the CLI
+// and migrations use, and can be altered or dropped by them. supabase_admin is used
+// only where a superuser is needed (login roles, the read-only role).
 func (s *Server) pgmetaProxy(w http.ResponseWriter, r *http.Request) error {
 	ref := r.PathValue("ref")
 	if _, err := s.running(r.Context(), ref); err != nil {
@@ -175,7 +200,7 @@ func (s *Server) pgmetaProxy(w http.ResponseWriter, r *http.Request) error {
 		rest = "/"
 	}
 	body := http.MaxBytesReader(w, r.Body, maxBody)
-	resp, err := s.pgmetaDo(r.Context(), ref, "supabase_admin", false, r.Method, rest, r.URL.RawQuery, body, r.Header)
+	resp, err := s.pgmetaDo(r.Context(), ref, "postgres", false, r.Method, rest, r.URL.RawQuery, body, r.Header)
 	if err != nil {
 		return err
 	}
@@ -193,18 +218,16 @@ func (s *Server) pgmetaProxy(w http.ResponseWriter, r *http.Request) error {
 // sqlParams runs a parameterized query (the Management API's "parameters" array)
 // over a direct connection with the extended protocol, which pg-meta cannot do.
 // Rows are serialized by Postgres itself (json_agg), like the pg-meta path returns
-// them. Statements that cannot sit in a CTE (DDL) run unwrapped and answer [].
+// them. Statements that cannot sit in a CTE (DDL, INSERT without RETURNING, SHOW,
+// EXPLAIN) run unwrapped; their rows, if any, are marshaled from the driver's values.
 func (s *Server) sqlParams(ctx context.Context, ref, role string, readOnly bool, query string, params []any) (json.RawMessage, error) {
-	dsn, err := s.mgr.ConnString(ctx, ref, role)
+	dsn, err := s.dsn(ctx, ref, role, readOnly)
 	if err != nil {
 		return nil, err
 	}
 	cc, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("api: connection string: %w", err)
-	}
-	if readOnly {
-		cc.RuntimeParams["default_transaction_read_only"] = "on"
 	}
 	conn, err := pgx.ConnectConfig(ctx, cc)
 	if err != nil {
@@ -217,14 +240,14 @@ func (s *Server) sqlParams(ctx context.Context, ref, role string, readOnly bool,
 		args[i] = pgArg(p)
 	}
 	var out string
-	wrapped := "with sbctl_q as (" + query + "\n) select coalesce(json_agg(sbctl_q), '[]'::json)::text from sbctl_q"
+	// A trailing semicolon or comment would end the CTE early (syntax error).
+	wrapped := "with sbctl_q as (" + trimStatementEnd(query) + "\n) select coalesce(json_agg(sbctl_q), '[]'::json)::text from sbctl_q"
 	err = conn.QueryRow(ctx, wrapped, args...).Scan(&out)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && (pgErr.Code == "42601" || pgErr.Code == "0A000") { // not a row-returning statement
-		if _, err2 := conn.Exec(ctx, query, args...); err2 == nil {
-			return json.RawMessage("[]"), nil
-		} else {
-			err = err2
+		var res json.RawMessage
+		if res, err = queryUnwrapped(ctx, conn, query, args); err == nil {
+			return res, nil
 		}
 	}
 	if err != nil {
@@ -234,6 +257,161 @@ func (s *Server) sqlParams(ctx context.Context, ref, role string, readOnly bool,
 		return nil, err
 	}
 	return json.RawMessage(out), nil
+}
+
+// queryUnwrapped runs query as is and returns its rows (if the command produces
+// any) as a JSON array of objects.
+func queryUnwrapped(ctx context.Context, conn *pgx.Conn, query string, args []any) (json.RawMessage, error) {
+	rows, err := conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	fds := rows.FieldDescriptions()
+	list := []map[string]any{}
+	for rows.Next() {
+		if len(fds) == 0 {
+			continue
+		}
+		vals, err := rows.Values()
+		if err != nil {
+			return nil, err
+		}
+		row := make(map[string]any, len(fds))
+		for i, fd := range fds {
+			row[fd.Name] = vals[i]
+		}
+		list = append(list, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return json.Marshal(list)
+}
+
+// trimStatementEnd removes trailing whitespace, comments and semicolons from a
+// single SQL statement so it can be embedded in a CTE. It scans string literals
+// (including E'..' and dollar-quoted ones), quoted identifiers and comments, so a
+// semicolon or "--" inside them is left alone.
+func trimStatementEnd(q string) string {
+	for {
+		end, ok := lastSignificant(q)
+		if !ok { // ends inside a string or comment: leave it for Postgres to reject
+			return q
+		}
+		if end > 0 && q[end-1] == ';' {
+			q = q[:end-1]
+			continue
+		}
+		return q[:end]
+	}
+}
+
+// lastSignificant returns the offset just past the last byte of q that is neither
+// whitespace nor inside a comment. ok is false when q ends inside an unterminated
+// string, quoted identifier, dollar quote or block comment.
+func lastSignificant(q string) (end int, ok bool) {
+	last := 0
+	i, n := 0, len(q)
+	isIdent := func(c byte) bool {
+		return c == '_' || c == '$' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= 0x80
+	}
+	for i < n {
+		c := q[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
+			i++
+		case c == '-' && i+1 < n && q[i+1] == '-':
+			for i < n && q[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < n && q[i+1] == '*':
+			depth := 0
+			for i < n {
+				switch {
+				case q[i] == '/' && i+1 < n && q[i+1] == '*':
+					depth++
+					i += 2
+				case q[i] == '*' && i+1 < n && q[i+1] == '/':
+					depth--
+					i += 2
+				default:
+					i++
+				}
+				if depth == 0 {
+					break
+				}
+			}
+			if depth != 0 {
+				return last, false
+			}
+		case c == '\'':
+			esc := i > 0 && (q[i-1] == 'e' || q[i-1] == 'E') && (i < 2 || !isIdent(q[i-2]))
+			i++
+			closed := false
+			for i < n {
+				if esc && q[i] == '\\' {
+					i += 2
+					continue
+				}
+				if q[i] == '\'' {
+					if i+1 < n && q[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return last, false
+			}
+			i++
+			last = i
+		case c == '"':
+			i++
+			closed := false
+			for i < n {
+				if q[i] == '"' {
+					if i+1 < n && q[i+1] == '"' {
+						i += 2
+						continue
+					}
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return last, false
+			}
+			i++
+			last = i
+		case c == '$':
+			// Dollar quote: $tag$ ... $tag$ (tag may be empty). Otherwise a parameter or operator char.
+			j := i + 1
+			for j < n && (isIdent(q[j]) && q[j] != '$') {
+				j++
+			}
+			if j < n && q[j] == '$' && (j == i+1 || !(q[i+1] >= '0' && q[i+1] <= '9')) {
+				tag := q[i : j+1]
+				if k := strings.Index(q[j+1:], tag); k >= 0 {
+					i = j + 1 + k + len(tag)
+				} else {
+					return last, false
+				}
+				last = i
+			} else {
+				i++
+				last = i
+			}
+		default:
+			i++
+			last = i
+		}
+	}
+	return last, true
 }
 
 // pgArg converts a decoded JSON value to a driver argument: integral numbers become

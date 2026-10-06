@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
@@ -34,6 +36,17 @@ var patRe = regexp.MustCompile(`^sbp_(oauth_|v0_)?[a-f0-9]{40}$`)
 // jwtSecretTTL bounds how stale a rotated dashboard JWT secret can be.
 const jwtSecretTTL = 30 * time.Second
 
+// jwtRefreshEvery is the shortest gap between forced re-reads of the dashboard JWT
+// secret. Only a token whose signature fails triggers one, so garbage tokens cost
+// at most one registry read per interval.
+const jwtRefreshEvery = 5 * time.Second
+
+// AdminClaim is the app_metadata key that marks a dashboard user as allowed to use
+// the Management API. sbctl sets it (to true) on every user it creates in
+// sb-gotrue@system; sb-gotrue@system runs with signup disabled, so nobody else can
+// obtain a session. The gate is defense in depth against an open signup.
+const AdminClaim = "sbctl_admin"
+
 // touchEvery limits last_used_at writes per token.
 const touchEvery = time.Minute
 
@@ -42,30 +55,42 @@ type authenticator struct {
 	keys  func(ctx context.Context, ref string) (*secrets.ProjectKeys, error)
 	store Store
 	now   func() time.Time
+	// admins is the [api] admin_emails allowlist, lower-cased.
+	admins []string
 
 	mu        sync.Mutex
 	secret    string
 	secretAt  time.Time
+	refreshAt time.Time // last forced re-read of the secret
 	touchedAt map[int64]time.Time
 	seenAt    map[string]time.Time // dashboard users by id: last time their row was refreshed
 }
 
-func newAuthenticator(reg registry.Registry, keys func(context.Context, string) (*secrets.ProjectKeys, error), store Store, now func() time.Time) *authenticator {
-	return &authenticator{reg: reg, keys: keys, store: store, now: now, touchedAt: map[int64]time.Time{}, seenAt: map[string]time.Time{}}
+func newAuthenticator(reg registry.Registry, keys func(context.Context, string) (*secrets.ProjectKeys, error), store Store, now func() time.Time, admins []string) *authenticator {
+	return &authenticator{reg: reg, keys: keys, store: store, now: now, admins: admins, touchedAt: map[int64]time.Time{}, seenAt: map[string]time.Time{}}
 }
 
 // systemSecret returns the HS256 secret of sb-gotrue@system, cached briefly.
 func (a *authenticator) systemSecret(ctx context.Context, fresh bool) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !fresh && a.secret != "" && a.now().Sub(a.secretAt) < jwtSecretTTL {
-		return a.secret, nil
+	now := a.now()
+	if a.secret != "" {
+		if !fresh && now.Sub(a.secretAt) < jwtSecretTTL {
+			return a.secret, nil
+		}
+		if fresh && now.Sub(a.refreshAt) < jwtRefreshEvery {
+			return a.secret, nil
+		}
+	}
+	if fresh {
+		a.refreshAt = now
 	}
 	k, err := a.keys(ctx, config.SystemRef)
 	if err != nil {
 		return "", err
 	}
-	a.secret, a.secretAt = k.JWTSecret, a.now()
+	a.secret, a.secretAt = k.JWTSecret, now
 	return a.secret, nil
 }
 
@@ -126,19 +151,22 @@ func (a *authenticator) touch(ctx context.Context, id int64) {
 }
 
 func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, error) {
-	var claims map[string]any
-	for _, fresh := range []bool{false, true} {
-		secret, err := a.systemSecret(ctx, fresh)
-		if err != nil {
-			return nil, err
+	secret, err := a.systemSecret(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	claims, err := secrets.ParseHS256(token, secret)
+	if errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		// Possibly signed with a rotated secret: re-read it (rate limited), once.
+		fresh, ferr := a.systemSecret(ctx, true)
+		if ferr != nil {
+			return nil, ferr
 		}
-		c, err := secrets.ParseHS256(token, secret)
-		if err == nil {
-			claims = c
-			break
+		if fresh != secret {
+			claims, err = secrets.ParseHS256(token, fresh)
 		}
 	}
-	if claims == nil {
+	if err != nil {
 		return nil, errUnauthorized
 	}
 	// Dashboard sessions are GoTrue access tokens of signed-in users. API keys of
@@ -154,6 +182,9 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 		return nil, errUnauthorized
 	}
 	email, _ := claims["email"].(string)
+	if !a.isAdmin(claims, email) {
+		return nil, errForbidden
+	}
 	p := &Principal{UserID: sub, Email: email, Via: "jwt"}
 	// Record the user on first sight, then at most once a minute: every dashboard
 	// request carries a JWT and none of them should write to the database.
@@ -171,6 +202,24 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 		a.mu.Unlock()
 	}
 	return p, nil
+}
+
+// isAdmin reports whether a verified dashboard session may use the API: the user
+// carries app_metadata.sbctl_admin = true, or the email is on the [api]
+// admin_emails allowlist. GoTrue lets users edit user_metadata but not app_metadata.
+func (a *authenticator) isAdmin(claims map[string]any, email string) bool {
+	if app, _ := claims["app_metadata"].(map[string]any); app != nil {
+		if v, _ := app[AdminClaim].(bool); v {
+			return true
+		}
+	}
+	email = strings.ToLower(email)
+	for _, e := range a.admins {
+		if e == email && email != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // userFromClaims derives the profile fields of a first-seen user from GoTrue claims.

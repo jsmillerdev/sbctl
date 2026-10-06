@@ -178,6 +178,11 @@ func (s *Server) putContent(w http.ResponseWriter, r *http.Request) error {
 	}
 	if v, ok := in["folder_id"]; ok {
 		if f, _ := v.(string); f != "" && uuidRe.MatchString(f) {
+			if _, err := s.store.GetFolder(r.Context(), p.Ref, f); errors.Is(err, ErrNotFound) {
+				return errf(http.StatusBadRequest, "folder_id does not belong to this project")
+			} else if err != nil {
+				return err
+			}
 			c.FolderID = &f
 		} else {
 			c.FolderID = nil
@@ -189,7 +194,10 @@ func (s *Server) putContent(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(c.Name) == "" {
 		return errf(http.StatusBadRequest, "name is required")
 	}
-	if err := s.store.UpsertContent(r.Context(), c); err != nil {
+	if err := s.store.UpsertContent(r.Context(), c); errors.Is(err, ErrNotFound) {
+		// The id belongs to an item of another project.
+		return errf(http.StatusNotFound, "Content not found")
+	} else if err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusOK)
@@ -213,7 +221,11 @@ func (s *Server) deleteContent(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	deleted, err := s.store.DeleteContent(r.Context(), p.Ref, idsParam(r))
+	u, err := s.currentUser(r)
+	if err != nil {
+		return err
+	}
+	deleted, err := s.store.DeleteContent(r.Context(), p.Ref, u.ID, idsParam(r))
 	if err != nil {
 		return err
 	}

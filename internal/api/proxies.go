@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/OWNER/sbctl/internal/registry"
@@ -56,7 +57,7 @@ var authMap = map[string]proxyRoute{
 	"POST /platform/auth/{ref}/otp":         {method: http.MethodPost, path: "/otp"},
 	"POST /platform/auth/{ref}/recover":     {method: http.MethodPost, path: "/recover"},
 	"DELETE /platform/auth/{ref}/users/{id}": {method: http.MethodDelete, path: "/admin/users/{id}", req: func(r *http.Request, id string, _ map[string]any) (string, map[string]any) {
-		return "/admin/users/" + id, map[string]any{"should_soft_delete": r.URL.Query().Get("soft_delete") == "true"}
+		return "/admin/users/" + url.PathEscape(id), map[string]any{"should_soft_delete": r.URL.Query().Get("soft_delete") == "true"}
 	}},
 }
 
@@ -80,7 +81,7 @@ var storageMap = map[string]proxyRoute{
 				out[k] = v
 			}
 		}
-		return "/object/list/" + id, out
+		return "/object/list/" + url.PathEscape(id), out
 	}},
 	"POST /platform/storage/{ref}/buckets/{id}/objects/move": {method: http.MethodPost, path: "/object/move", req: moveCopy},
 	"POST /platform/storage/{ref}/buckets/{id}/objects/copy": {method: http.MethodPost, path: "/object/copy", req: moveCopy},
@@ -95,14 +96,14 @@ var storageMap = map[string]proxyRoute{
 				prefixes = append(prefixes, str(x, "path"))
 			}
 		}
-		return "/object/" + id, map[string]any{"prefixes": prefixes}
+		return "/object/" + url.PathEscape(id), map[string]any{"prefixes": prefixes}
 	}},
 	"POST /platform/storage/{ref}/buckets/{id}/objects/sign": {method: http.MethodPost, path: "/object/sign/{id}", req: func(_ *http.Request, id string, in map[string]any) (string, map[string]any) {
 		out := map[string]any{"expiresIn": in["expiresIn"]}
 		if opts, ok := in["options"].(map[string]any); ok && opts["transform"] != nil {
 			out["transform"] = opts["transform"]
 		}
-		return "/object/sign/" + id + "/" + strings.TrimPrefix(str(in, "path"), "/"), out
+		return "/object/sign/" + url.PathEscape(id) + "/" + escapePath(strings.TrimPrefix(str(in, "path"), "/")), out
 	}, resp: func(s *Server, p *registry.Project, body []byte) []byte {
 		// Storage answers {signedURL: "/object/sign/..."}; the dashboard wants the full URL.
 		var in struct {
@@ -114,6 +115,25 @@ var storageMap = map[string]proxyRoute{
 		out, _ := json.Marshal(map[string]string{"signedUrl": s.projectURL(p.Ref) + "/storage/v1" + in.SignedURL})
 		return out
 	}},
+}
+
+// escapePath escapes each segment of an object path and keeps the slashes.
+func escapePath(p string) string {
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.Join(segs, "/")
+}
+
+// hasDotSegment reports whether an (escaped) URL path has a "." or ".." segment.
+func hasDotSegment(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // moveCopy maps the dashboard's {from, to} to Storage's bucket-qualified keys.
@@ -152,8 +172,13 @@ func (s *Server) adminProxy(svc string, m proxyRoute) handlerFunc {
 		if err != nil {
 			return err
 		}
+		// PathValue decodes %2F, so an id could climb out of its place in the upstream
+		// path. Ids are one segment: reject separators and dot segments, escape the rest.
 		id := r.PathValue("id")
-		target := strings.ReplaceAll(m.path, "{id}", id)
+		if strings.Contains(id, "/") || id == "." || id == ".." {
+			return errf(http.StatusBadRequest, "Invalid id")
+		}
+		target := strings.ReplaceAll(m.path, "{id}", url.PathEscape(id))
 		body := io.Reader(http.MaxBytesReader(w, r.Body, maxBody))
 		if m.req != nil {
 			in := map[string]any{}
@@ -163,6 +188,9 @@ func (s *Server) adminProxy(svc string, m proxyRoute) handlerFunc {
 			path, out := m.req(r, id, in)
 			if path != "" {
 				target = path
+			}
+			if hasDotSegment(target) {
+				return errf(http.StatusBadRequest, "Invalid path")
 			}
 			b, _ := json.Marshal(out)
 			body = bytes.NewReader(b)

@@ -272,3 +272,11 @@ func withQuery(u string, kv url.Values) string {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// truncate shortens s to at most n bytes plus an ellipsis, for log fields and messages.
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
+}

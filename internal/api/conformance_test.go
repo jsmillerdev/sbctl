@@ -41,13 +41,6 @@ func validateAgainstSpec(t *testing.T, key string, body []byte) {
 	}
 }
 
-func truncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n] + "..."
-	}
-	return s
-}
-
 type step struct {
 	key    string // spec operation, "METHOD /template"
 	path   string // concrete path; defaults to the template with {ref} = testRef

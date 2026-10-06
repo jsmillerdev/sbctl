@@ -110,20 +110,55 @@ func (m *MemoryStore) ListUsers(_ context.Context) ([]User, error) {
 func (m *MemoryStore) PutLoginSession(_ context.Context, s LoginSession) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	s.Failures = 0
 	m.sessions[s.SessionID] = s
 	return nil
+}
+
+func (m *MemoryStore) GetLoginSession(_ context.Context, id string) (*LoginSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return &s, nil
+}
+
+func (m *MemoryStore) FailLoginSession(_ context.Context, id string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	s.Failures++
+	m.sessions[id] = s
+	return s.Failures, nil
 }
 
 func (m *MemoryStore) TakeLoginSession(_ context.Context, id string) (*LoginSession, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.sessions[id]
-	if !ok || !s.ExpiresAt.After(m.now()) {
-		delete(m.sessions, id)
+	if !ok {
 		return nil, ErrNotFound
 	}
 	delete(m.sessions, id)
 	return &s, nil
+}
+
+func (m *MemoryStore) ReapLoginSessions(context.Context) ([]LoginSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []LoginSession
+	for id, s := range m.sessions {
+		if !s.ExpiresAt.After(m.now()) {
+			out = append(out, s)
+			delete(m.sessions, id)
+		}
+	}
+	return out, nil
 }
 
 func fkey(ref, slug string) string { return ref + "/" + slug }
@@ -261,7 +296,10 @@ func (m *MemoryStore) UpsertContent(_ context.Context, c *Content) error {
 	now := m.now()
 	if c.ID == "" {
 		c.ID, c.InsertedAt = newUUID(), now
-	} else if cur, ok := m.content[c.ID]; ok && cur.Ref == c.Ref {
+	} else if cur, ok := m.content[c.ID]; ok {
+		if cur.Ref != c.Ref { // the Postgres store's `where ref = excluded.ref` guard
+			return ErrNotFound
+		}
 		c.InsertedAt = cur.InsertedAt
 	} else {
 		c.InsertedAt = now
@@ -272,12 +310,12 @@ func (m *MemoryStore) UpsertContent(_ context.Context, c *Content) error {
 	return nil
 }
 
-func (m *MemoryStore) DeleteContent(_ context.Context, ref string, ids []string) ([]string, error) {
+func (m *MemoryStore) DeleteContent(_ context.Context, ref string, ownerID int64, ids []string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []string
 	for _, id := range ids {
-		if c, ok := m.content[id]; ok && c.Ref == ref {
+		if c, ok := m.content[id]; ok && c.Ref == ref && (c.Visibility != "user" || c.OwnerID == ownerID) {
 			delete(m.content, id)
 			out = append(out, id)
 		}
@@ -320,6 +358,16 @@ func (m *MemoryStore) ListFolders(_ context.Context, ref string, parentID *strin
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+func (m *MemoryStore) GetFolder(_ context.Context, ref, id string) (*ContentFolder, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if f, ok := m.folders[id]; ok && f.Ref == ref {
+		cp := *f
+		return &cp, nil
+	}
+	return nil, ErrNotFound
 }
 
 func (m *MemoryStore) CreateFolder(_ context.Context, f *ContentFolder) error {

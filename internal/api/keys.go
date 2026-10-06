@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net/http"
+	"strings"
 
 	v1 "github.com/OWNER/sbctl/internal/api/gen/v1"
 )
@@ -56,16 +57,31 @@ func (s *Server) apiKeys(r *http.Request, reveal bool) ([]v1.ApiKeyResponseOutpu
 		}
 		return out
 	}
+	secretKey := mk("default", "secret", k.SecretKey, "", true)
+	// The CLI treats a secret key as the service_role key when its template says so
+	// (cli-go internal/utils/tenant/client.go isServiceRole); without it the CLI
+	// falls back to the legacy service_role JWT.
+	secretKey.SecretJwtTemplate = &map[string]interface{}{"role": "service_role"}
 	return []v1.ApiKeyResponseOutput{
 		mk("anon", "legacy", k.AnonKey, "Legacy anon API key", false),
 		mk("service_role", "legacy", k.ServiceRoleKey, "Legacy service_role API key", true),
 		mk("default", "publishable", k.PublishableKey, "", false),
-		mk("default", "secret", k.SecretKey, "", true),
+		secretKey,
 	}, nil
 }
 
+// truthy parses the spec's "Boolean string": true, 1, yes, on, y and enabled
+// (case-insensitively) are true, everything else is false.
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on", "y", "enabled":
+		return true
+	}
+	return false
+}
+
 func (s *Server) listAPIKeys(w http.ResponseWriter, r *http.Request) error {
-	keys, err := s.apiKeys(r, r.URL.Query().Get("reveal") == "true")
+	keys, err := s.apiKeys(r, truthy(r.URL.Query().Get("reveal")))
 	if err != nil {
 		return err
 	}
@@ -74,7 +90,7 @@ func (s *Server) listAPIKeys(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) getAPIKey(w http.ResponseWriter, r *http.Request) error {
-	keys, err := s.apiKeys(r, r.URL.Query().Get("reveal") == "true")
+	keys, err := s.apiKeys(r, truthy(r.URL.Query().Get("reveal")))
 	if err != nil {
 		return err
 	}
