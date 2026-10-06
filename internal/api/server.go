@@ -64,7 +64,8 @@ type Server struct {
 	pgmetaKeyMu    chan struct{} // 1-slot lock around pgmetaKeyCache
 	pgmetaKeyCache string
 
-	roMu      sync.Mutex
+	roMu      sync.Mutex                 // guards roEnsured and roLocks, never held across I/O
+	roLocks   map[string]*sync.Mutex     // per-project role setup locks
 	roEnsured map[string]readOnlyEnsured // by project ref
 
 	handler http.Handler

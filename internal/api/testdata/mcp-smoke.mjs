@@ -1,6 +1,9 @@
 // Smoke test of the Supabase MCP server (stdio) against a Management API.
 //
-//   node mcp-smoke.mjs <api-url> <pat> <project-ref>
+//   SUPABASE_ACCESS_TOKEN=<pat> node mcp-smoke.mjs <api-url> <project-ref>
+//
+// The token travels in the environment, never in argv, where any local user could
+// read it from the process list.
 //
 // Starts @supabase/mcp-server-supabase with --api-url, speaks newline-delimited
 // JSON-RPC to it and calls the tools sbctl's API must serve. Exits non-zero when a
@@ -8,9 +11,10 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
-const [apiUrl, pat, ref] = process.argv.slice(2);
+const [apiUrl, ref] = process.argv.slice(2);
+const pat = process.env.SUPABASE_ACCESS_TOKEN;
 if (!apiUrl || !pat || !ref) {
-  console.error("usage: node mcp-smoke.mjs <api-url> <pat> <project-ref>");
+  console.error("usage: SUPABASE_ACCESS_TOKEN=<pat> node mcp-smoke.mjs <api-url> <project-ref>");
   process.exit(2);
 }
 const version = process.env.MCP_VERSION || "latest";
@@ -21,9 +25,9 @@ const text = (r) => (r.result?.content ?? []).map((c) => c.text ?? "").join("\n"
 // runs fn with a tool-calling helper.
 async function session(label, projectRef, fn) {
   console.log(`--- ${label}`);
-  const args = ["-y", `@supabase/mcp-server-supabase@${version}`, "--api-url", apiUrl, "--access-token", pat];
+  const args = ["-y", `@supabase/mcp-server-supabase@${version}`, "--api-url", apiUrl];
   if (projectRef) args.push("--project-ref", projectRef);
-  const child = spawn("npx", args, { stdio: ["pipe", "pipe", "inherit"] });
+  const child = spawn("npx", args, { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, SUPABASE_ACCESS_TOKEN: pat } });
   const pending = new Map();
   let nextId = 1;
   createInterface({ input: child.stdout }).on("line", (line) => {

@@ -71,6 +71,11 @@ changes nothing.
 `[api] admin_emails`, otherwise the answer is `403`. sbctl sets the claim on every dashboard user
 it creates, and `sb-gotrue@system` **must run with `GOTRUE_DISABLE_SIGNUP=true`** so nobody else
 can obtain a session at all; the gate is defense in depth if that setting is ever lost.
+The email allowlist trusts the JWT's `email` claim: GoTrue's access token carries no claim
+that proves the address was confirmed, so with open signup and autoconfirm an unregistered
+allowlisted address could be claimed. Keep signup disabled; prefer the `sbctl_admin` claim.
+A PAT is not re-checked against the user's admin status on each use: delete a user's tokens
+when you remove their access.
 
 Dashboard users are recorded in `sbctl.api_users` on first sight (profile fields come from
 GoTrue's `user_metadata`; later edits win). Every authenticated user can see and change
@@ -112,20 +117,25 @@ turn it off.
   Studio does: objects made in the SQL editor then belong to the role the CLI and
   migrations use and can be altered or dropped by them. A feature that needs a superuser
   would fail with a permission error; that is the trade-off taken.
-- **Read-only SQL runs as the role `sbctl_read_only`**: `login`, member of `pg_read_all_data`
-  and nothing else, `default_transaction_read_only = on` as a second layer. The API creates
-  it on demand (as `supabase_admin`, re-checked every 30 s) with a password derived from the
-  project's admin password (HMAC) and a SCRAM verifier, never cleartext. A client cannot
+- **Read-only SQL runs as the role `sbctl_read_only`**: `login`, `bypassrls` (as upstream's
+  `supabase_read_only_user`: `pg_read_all_data` alone does not bypass row level security, so
+  RLS tables would read as empty) and member of `pg_read_all_data`, `default_transaction_read_only = on`
+  as a second layer. The API creates it on demand (as `supabase_admin`; a cheap catalog check
+  every 2 minutes per project, a write only when the role differs) with a password derived from the
+  project's admin password (HMAC) and a deterministic SCRAM verifier, never cleartext. A client cannot
   write by sending `begin read write` or `reset role`: the role lacks the privileges
   (`TestIntegrationDatabase` runs those escapes on both read-only routes). Used by
   `database/query/read-only` and `database/query` with `read_only: true`, which the MCP
   server's `--read-only` mode relies on.
 - **CLI login roles**: `cli_login_<rand>` (member of `postgres`, `set role = postgres`) for
-  read-write; read-only requests get `sbctl_cli_ro_<rand>` (member of `pg_read_all_data`),
+  read-write; read-only requests get `sbctl_cli_ro_<rand>` (`bypassrls`, member of `pg_read_all_data`;
+  `pg_dump` runs with `row_security = off` and needs it on RLS tables),
   because the CLI runs `SET SESSION ROLE postgres` after connecting as any `cli_login_*`
   user (cli-go `internal/utils/connect.go`) and a read-only role cannot do that. Both expire
   after an hour, are dropped by the next create or by `DELETE .../cli/login-role`, and are
-  created with a SCRAM verifier.
+  created with a SCRAM verifier. The CLI's `db dump --role-only` skips only `cli_login_*`, so
+  it lists `sbctl_read_only` and any live `sbctl_cli_ro_*` role; a read-only role cannot use
+  the `cli_login_` name (see above), so this stays a known limit.
 - **sb-pgmeta** at `127.0.0.1:<ports.pgmeta>` with `CRYPTO_KEY` equal to the key above. The
   `x-connection-encrypted` header is built in `cryptojs/` (crypto-js passphrase AES, checked
   against vectors from the real library in `testdata/cryptojs/`). pg-meta also listens on
@@ -189,7 +199,8 @@ internal/api/testdata/serve-stack.sh /path/stack.json &        # writes api_url,
 API=$(jq -r .api_url /path/stack.json); PAT=$(jq -r .pat /path/stack.json)
 
 # MCP server over stdio: list_tables, execute_sql, migrations, types, advisors, projects ...
-scripts/guard.sh -- node internal/api/testdata/mcp-smoke.mjs $API $PAT abcdefghijklmnopqrst
+# (the token goes in the environment, never in argv)
+SUPABASE_ACCESS_TOKEN=$PAT scripts/guard.sh -- node internal/api/testdata/mcp-smoke.mjs $API abcdefghijklmnopqrst
 
 # Supabase CLI
 cat > profile.yaml <<EOF
@@ -209,6 +220,12 @@ supabase --profile=./profile.yaml secrets set FOO=bar
 # `supabase login` browser flow, driven with a pty (the CLI side) and a POST (Studio's side)
 python3 internal/api/testdata/cli-login.py ./profile.yaml /path/stack.json
 ```
+
+When a run is over, check that nothing of ours is left: `lsof -iTCP -sTCP:LISTEN -nP | grep -E ':32[1-9][0-9][0-9] '`
+must list nothing, and `pgrep -fl 'supabase.*--profile'` must find no CLI started with your profile.
+The Supabase CLI may also have started its own stack host (`supabase __supabase_stack_host__`)
+for the project directory it ran in; that process belongs to the CLI and to whatever project
+you ran it from, so check its working directory (`lsof -p <pid> | grep cwd`) before stopping it.
 
 ## Not done / known limits
 

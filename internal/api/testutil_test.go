@@ -137,6 +137,7 @@ type fakePGMeta struct {
 	Requests []pgmetaRequest
 	// Rows answers POST /query: the first rule whose substring is in the query wins.
 	Rules []pgmetaRule
+	hits  map[int]int // matches per rule index, for Skip
 }
 
 type pgmetaRequest struct {
@@ -147,6 +148,9 @@ type pgmetaRule struct {
 	Contains string
 	Status   int
 	Body     string
+	// Skip passes over the first Skip matching requests, so a rule can answer a later
+	// request differently from an earlier one.
+	Skip int
 }
 
 func newFakePGMeta(t testing.TB, key string) *fakePGMeta {
@@ -162,12 +166,21 @@ func newFakePGMeta(t testing.TB, key string) *fakePGMeta {
 		f.Requests = append(f.Requests, pgmetaRequest{r.Method, r.URL.Path, r.URL.RawQuery, dsn, string(b)})
 		rules := f.Rules
 		f.mu.Unlock()
+		skipped := func(i int) bool {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.hits == nil {
+				f.hits = map[int]int{}
+			}
+			f.hits[i]++
+			return f.hits[i] <= rules[i].Skip
+		}
 		switch {
 		case r.URL.Path == "/query":
 			var in struct{ Query string }
 			_ = json.Unmarshal(b, &in)
-			for _, rule := range rules {
-				if strings.Contains(in.Query, rule.Contains) {
+			for i, rule := range rules {
+				if strings.Contains(in.Query, rule.Contains) && !skipped(i) {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(rule.Status)
 					_, _ = w.Write([]byte(rule.Body))

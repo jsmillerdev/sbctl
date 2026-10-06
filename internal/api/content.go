@@ -333,7 +333,16 @@ func (s *Server) createFolder(w http.ResponseWriter, r *http.Request) error {
 		return errf(http.StatusBadRequest, "name is required")
 	}
 	f := &ContentFolder{Ref: p.Ref, OwnerID: u.ID, Name: in.Name}
-	if in.ParentID != "" && uuidRe.MatchString(in.ParentID) {
+	if in.ParentID != "" {
+		// Same guard as putContent's folder_id: the parent must exist in this project.
+		if !uuidRe.MatchString(in.ParentID) {
+			return errf(http.StatusBadRequest, "parent_id is not a valid id")
+		}
+		if _, err := s.store.GetFolder(r.Context(), p.Ref, in.ParentID); errors.Is(err, ErrNotFound) {
+			return errf(http.StatusBadRequest, "parent_id does not belong to this project")
+		} else if err != nil {
+			return err
+		}
 		f.ParentID = &in.ParentID
 	}
 	if err := s.store.CreateFolder(r.Context(), f); err != nil {

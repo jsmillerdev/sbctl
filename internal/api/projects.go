@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/OWNER/sbctl/internal/api/gen/v1"
@@ -118,13 +119,16 @@ type createInput struct {
 	// OrganizationID is accepted as the slug: the v1 API's organization ids are slugs.
 	OrganizationID string `json:"organization_id"`
 	Region         string `json:"region"`
-	DBPass         string `json:"db_pass"`
+	// DBRegion is what Studio's CreateProjectBody sends instead of region.
+	DBRegion string `json:"db_region"`
+	DBPass   string `json:"db_pass"`
 }
 
 // createProject provisions a project through the lifecycle manager and returns it
 // as soon as it is visible in the registry (COMING_UP), or after createWait with
-// the allocated ref as COMING_UP. Provisioning continues in the background; its
-// failure is logged and shows as INIT_FAILED.
+// the allocated ref as COMING_UP. Provisioning continues in the background; a
+// failure after that answer is logged and recorded as an INIT_FAILED registry row,
+// so the ref the client holds does not 404.
 func (s *Server) createProject(ctx context.Context, in createInput) (*registry.Project, error) {
 	if strings.TrimSpace(in.Name) == "" {
 		return nil, errf(http.StatusBadRequest, "name is required")
@@ -142,6 +146,9 @@ func (s *Server) createProject(ctx context.Context, in createInput) (*registry.P
 	if err != nil {
 		return nil, err
 	}
+	if in.Region == "" {
+		in.Region = in.DBRegion
+	}
 	ref := secrets.NewRef()
 	req := lifecycle.CreateRequest{Name: strings.TrimSpace(in.Name), OrgSlug: org.Slug, Region: in.Region, Ref: ref, DBPassword: in.DBPass}
 	type result struct {
@@ -149,13 +156,18 @@ func (s *Server) createProject(ctx context.Context, in createInput) (*registry.P
 		err error
 	}
 	done := make(chan result, 1)
+	var answeredComingUp atomic.Bool
 	go func() {
 		// The request may end before provisioning does.
-		p, err := s.mgr.Create(context.WithoutCancel(ctx), req)
+		bg := context.WithoutCancel(ctx)
+		p, err := s.mgr.Create(bg, req)
 		if err != nil {
 			s.log.Error("project creation failed", "ref", ref, "err", err)
 		}
 		done <- result{p, err}
+		if err != nil && answeredComingUp.Load() {
+			s.recordInitFailed(bg, ref, org.ID, req)
+		}
 	}()
 	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
@@ -176,10 +188,31 @@ func (s *Server) createProject(ctx context.Context, in createInput) (*registry.P
 			// invite a retry that creates a second one. Answer with the allocated ref
 			// as COMING_UP; clients poll the project by ref.
 			s.log.Warn("project creation is slow; answering COMING_UP", "ref", ref)
+			answeredComingUp.Store(true)
+			select {
+			case res := <-done: // it failed in the instant before the flag was set
+				if res.err != nil {
+					return nil, mapErr(res.err)
+				}
+				return res.p, nil
+			default:
+			}
 			return &registry.Project{Ref: ref, OrgID: org.ID, Name: req.Name, Region: req.Region, Status: registry.StatusComingUp, CreatedAt: s.now()}, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+	}
+}
+
+// recordInitFailed marks ref INIT_FAILED after a failed background Create, inserting
+// the row when Create did not get as far as writing one.
+func (s *Server) recordInitFailed(ctx context.Context, ref string, orgID int64, req lifecycle.CreateRequest) {
+	err := s.reg.SetProjectStatus(ctx, ref, registry.StatusInitFailed)
+	if errors.Is(err, registry.ErrNotFound) {
+		err = s.reg.CreateProject(ctx, &registry.Project{Ref: ref, OrgID: orgID, Name: req.Name, Region: req.Region, Status: registry.StatusInitFailed})
+	}
+	if err != nil {
+		s.log.Error("recording INIT_FAILED failed", "ref", ref, "err", err)
 	}
 }
 

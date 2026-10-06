@@ -181,6 +181,10 @@ func TestReadOnlyUsesRestrictedRole(t *testing.T) {
 	if ensure == nil || !strings.Contains(ensure.Body, "SCRAM-SHA-256$") || !strings.Contains(ensure.Body, "pg_read_all_data") {
 		t.Fatalf("role setup request: %+v", ensure)
 	}
+	// BYPASSRLS: pg_read_all_data alone reads RLS tables as empty.
+	if !strings.Contains(ensure.Body, "bypassrls") || strings.Contains(strings.ToLower(ensure.Body), "nobypassrls") {
+		t.Fatalf("the read-only role must be BYPASSRLS: %s", ensure.Body)
+	}
 	k, _ := f.mgr.Keys(context.Background(), testRef)
 	pw, _ := f.srv.readOnlyPassword(context.Background(), testRef)
 	if strings.Contains(ensure.Body, pw) || strings.Contains(ensure.DSN, k.AdminPassword) || pw == k.AdminPassword {
@@ -388,4 +392,105 @@ func newRecordingUpstream(t *testing.T, paths *[]string) string {
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
+}
+
+func TestMigrationRetryRacedByAnotherRequest(t *testing.T) {
+	f := newFixture(t)
+	// The pre-check misses; the batch then fails (the other request won the advisory
+	// lock and ran first); the key is recorded by now, so this retry is a success.
+	f.meta.Rules = []pgmetaRule{
+		{Contains: "idempotency_key = ", Skip: 1, Status: 200, Body: `[{"hit":true}]`},
+		{Contains: "pg_advisory_xact_lock", Status: 400, Body: `{"error":"duplicate key value violates unique constraint"}`},
+	}
+	rec := f.do("POST", "/v1/projects/"+testRef+"/database/migrations", map[string]any{"query": "create table t (id int)"}, "Idempotency-Key", "k1")
+	if rec.Code != 200 {
+		t.Fatalf("raced retry: %d %s", rec.Code, rec.Body)
+	}
+	// Without a recorded key the failure stays a failure.
+	f.meta.Rules = []pgmetaRule{{Contains: "pg_advisory_xact_lock", Status: 400, Body: `{"error":"boom"}`}}
+	if rec := f.do("POST", "/v1/projects/"+testRef+"/database/migrations", map[string]any{"query": "select 1"}, "Idempotency-Key", "k2"); rec.Code != 400 {
+		t.Fatalf("real failure: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestContentFolderParentChecked(t *testing.T) {
+	f := newFixture(t)
+	base := "/platform/projects/" + testRef + "/content/folders"
+	missing := "00000000-0000-4000-8000-000000000000"
+	if rec := f.do("POST", base, map[string]any{"name": "x", "parent_id": missing}); rec.Code != 400 {
+		t.Fatalf("unknown parent: %d %s", rec.Code, rec.Body)
+	}
+	if rec := f.do("POST", base, map[string]any{"name": "x", "parent_id": "nope"}); rec.Code != 400 {
+		t.Fatalf("malformed parent: %d %s", rec.Code, rec.Body)
+	}
+	rec := f.do("POST", base, map[string]any{"name": "root"})
+	if rec.Code != 201 {
+		t.Fatalf("root folder: %d %s", rec.Code, rec.Body)
+	}
+	parent := jsonField(t, rec, "id").(string)
+	if rec := f.do("POST", base, map[string]any{"name": "child", "parent_id": parent}); rec.Code != 201 {
+		t.Fatalf("child folder: %d %s", rec.Code, rec.Body)
+	}
+	// A folder of another project is not a parent.
+	f.mgr.addProject(t, "zzzzzzzzzzzzzzzzzzzz", "Second", f.org.ID, registry.StatusActiveHealthy)
+	if rec := f.do("POST", "/platform/projects/zzzzzzzzzzzzzzzzzzzz/content/folders", map[string]any{"name": "x", "parent_id": parent}); rec.Code != 400 {
+		t.Fatalf("parent in another project: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestCreateReadsDBRegion(t *testing.T) {
+	f := newFixture(t)
+	if rec := f.do("POST", "/platform/projects", map[string]any{"name": "r", "db_region": "us-east-1", "cloud_provider": "AWS", "organization_slug": f.org.Slug, "db_pass": "x"}); rec.Code != 201 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	f.mgr.mu.Lock()
+	defer f.mgr.mu.Unlock()
+	if got := f.mgr.created[len(f.mgr.created)-1].Region; got != "us-east-1" {
+		t.Fatalf("region = %q", got)
+	}
+}
+
+func TestCreateFailureAfterTimeoutIsRecorded(t *testing.T) {
+	f := newFixture(t)
+	f.srv.createWait = 50 * time.Millisecond
+	release := make(chan struct{})
+	f.mgr.createFn = func(req lifecycle.CreateRequest) (*registry.Project, error) {
+		<-release
+		return nil, errors.New("boom")
+	}
+	rec := f.do("POST", "/v1/projects", map[string]any{"name": "doomed"})
+	if rec.Code != 201 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	ref := jsonField(t, rec, "id").(string)
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if p, err := f.reg.GetProject(context.Background(), ref); err == nil {
+			if p.Status != registry.StatusInitFailed {
+				t.Fatalf("status = %s", p.Status)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no INIT_FAILED row for the ref the client holds")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rec := f.do("GET", "/v1/projects/"+ref, nil); rec.Code != 200 || jsonField(t, rec, "status") != "INIT_FAILED" {
+		t.Fatalf("get: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestReadOnlyLoginRoleBypassesRLS(t *testing.T) {
+	f := newFixture(t)
+	for _, ro := range []bool{true, false} {
+		if rec := f.do("POST", "/v1/projects/"+testRef+"/cli/login-role", map[string]any{"read_only": ro}); rec.Code != 201 {
+			t.Fatalf("login role: %d %s", rec.Code, rec.Body)
+		}
+		body := f.meta.last().Body
+		if got := strings.Contains(body, "bypassrls in role pg_read_all_data"); got != ro {
+			t.Fatalf("read_only=%v: bypassrls on the read-only role = %v: %s", ro, got, body)
+		}
+	}
 }

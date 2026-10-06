@@ -8,7 +8,7 @@ login link it prints, authorizes that session the way Studio's /cli/login page d
 (POST /platform/cli/login with the dashboard session), types the 8-character
 verification code the page would show, and then checks that the saved token works.
 """
-import json, os, pty, re, select, subprocess, sys, time, urllib.request
+import atexit, json, os, pty, re, select, subprocess, sys, time, urllib.request
 
 profile, stack_file = sys.argv[1:3]
 stack = json.load(open(stack_file))
@@ -21,6 +21,7 @@ for k in ("SUPABASE_ACCESS_TOKEN", "CLAUDECODE", "CLAUDE_CODE"):
 master, slave = pty.openpty()
 proc = subprocess.Popen(["supabase", f"--profile={profile}", "--agent=no", "--output-format=text", "login", "--no-browser", "--name", "cli_login_test"],
                         stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True)
+atexit.register(lambda: proc.poll() is None and proc.kill())  # a CLI left behind spins on its closed pty
 buf = ""
 
 def squashed():

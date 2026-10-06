@@ -126,18 +126,23 @@ func (s *Server) applyMigration(w http.ResponseWriter, r *http.Request) error {
 	}
 	const tbl = "supabase_migrations.schema_migrations"
 	key := r.Header.Get("Idempotency-Key")
-	if key != "" {
-		// A repeated key is a retry of a migration that already ran.
-		hit, err := s.sqlRows(r.Context(), p.Ref, "postgres", true, `select to_regclass('`+tbl+`') is not null and exists (select 1 from `+tbl+` where idempotency_key = `+sqlLiteral(key)+`) as hit`)
-		if err == nil {
-			var h []struct {
-				Hit bool `json:"hit"`
-			}
-			if json.Unmarshal(hit, &h) == nil && len(h) == 1 && h[0].Hit {
-				w.WriteHeader(http.StatusOK)
-				return nil
-			}
+	// A repeated key is a retry of a migration that already ran.
+	seen := func() bool {
+		if key == "" {
+			return false
 		}
+		hit, err := s.sqlRows(r.Context(), p.Ref, "postgres", true, `select to_regclass('`+tbl+`') is not null and exists (select 1 from `+tbl+` where idempotency_key = `+sqlLiteral(key)+`) as hit`)
+		if err != nil {
+			return false
+		}
+		var h []struct {
+			Hit bool `json:"hit"`
+		}
+		return json.Unmarshal(hit, &h) == nil && len(h) == 1 && h[0].Hit
+	}
+	if seen() {
+		w.WriteHeader(http.StatusOK)
+		return nil
 	}
 	// One batch, one implicit transaction: the advisory lock serializes concurrent
 	// migrations, and the version is picked in the same transaction as the insert, so
@@ -157,6 +162,14 @@ select greatest(to_char(now() at time zone 'utc', 'YYYYMMDDHH24MISS')::bigint,
                 coalesce(max(case when version ~ '^[0-9]{1,18}$' then version::bigint end), 0) + 1)::text, ` +
 		nullable(in.Name) + `, array[` + sqlLiteral(in.Query) + `], ` + nullableArray(in.Rollback) + `, ` + nullable(key) + ` from ` + tbl + `;`)
 	if _, err := s.sqlRows(r.Context(), p.Ref, "postgres", false, b.String()); err != nil {
+		// Two concurrent retries both pass the check above; the loser waits on the
+		// advisory lock and then fails (duplicate key, or the SQL's own "already
+		// exists"). The batch rolled back. When the key is now recorded, the
+		// winner did the work and this retry is a success.
+		if seen() {
+			w.WriteHeader(http.StatusOK)
+			return nil
+		}
 		return err
 	}
 	w.WriteHeader(http.StatusOK)
@@ -249,7 +262,8 @@ func (s *Server) createLoginRole(w http.ResponseWriter, r *http.Request) error {
 	}
 	b.WriteString(fmt.Sprintf("create role %s login password %s valid until %s", sqlIdent(role), sqlLiteral(verifier), sqlLiteral(until)))
 	if in.ReadOnly {
-		b.WriteString(" in role pg_read_all_data;\n")
+		// BYPASSRLS: pg_dump runs with row_security off and errors on RLS tables otherwise.
+		b.WriteString(" bypassrls in role pg_read_all_data;\n")
 		b.WriteString(fmt.Sprintf("alter role %s set default_transaction_read_only = on;", sqlIdent(role)))
 	} else {
 		b.WriteString(" in role postgres;\n")

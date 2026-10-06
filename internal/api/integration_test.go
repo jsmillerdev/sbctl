@@ -316,6 +316,17 @@ func TestIntegrationDatabase(t *testing.T) {
 			t.Fatalf("read-only %s identity or visibility: %s", route, b)
 		}
 	}
+	// Row level security: pg_read_all_data does not bypass it, so the read-only role
+	// must be BYPASSRLS or RLS tables read as empty. Same count both ways.
+	mustStatus(201, "POST", p+"/database/query", map[string]any{"query": "create table public.notes (id int primary key, body text); alter table public.notes enable row level security; insert into public.notes values (1, 'a'), (2, 'b')"})
+	for _, route := range []string{"/database/query", "/database/query/read-only"} {
+		if b := mustStatus(201, "POST", p+route, roBody("select count(*) as n from public.notes")); !strings.Contains(string(b), `"n":2`) {
+			t.Fatalf("read-only %s sees an RLS table as empty: %s", route, b)
+		}
+	}
+	if b := mustStatus(201, "POST", p+"/database/query", map[string]any{"query": "select count(*) as n from public.notes where id > $1", "parameters": []any{0}, "read_only": true}); !strings.Contains(string(b), `"n":2`) {
+		t.Fatalf("parameterized read-only sees an RLS table as empty: %s", b)
+	}
 	if b := mustStatus(201, "POST", p+"/database/query", map[string]any{"query": "select count(*) as n from public.widgets where id = 42 or name = 'x'"}); !strings.Contains(string(b), `"n":0`) || mustCount(t, s, p, "pg_class where relname = 'escaped'") != 0 {
 		t.Fatalf("a read-only query changed data: %s", b)
 	}
