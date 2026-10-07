@@ -40,21 +40,24 @@ RestrictNamespaces=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# The EC2 instance role (backup bucket, DNS) must not reach tenant-facing code through IMDS.
+IPAddressDeny=169.254.169.254
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0027
-ReadWritePaths=/var/lib/sbctl/projects/system -/var/lib/sbctl/system/studio
-# Containment: every unit runs as the sbctl user, so without this a compromised service
-# could read the master key, every project's data (including backups) and the TLS keys.
-# The unit sees only the artifacts (read-only) and its own state. Everything else under
-# /var/lib/sbctl (backups, certs, run, logs, other projects, other services' state) is
-# replaced by an empty tmpfs, /etc/sbctl is hidden, and so are the env files of sibling
-# services and the cluster directory (socket, root key): these services reach Postgres
-# over TCP. The residual risk is documented in deploy/systemd/README.md.
-InaccessiblePaths=-/etc/sbctl -/var/lib/sbctl/projects/system/postgres -/var/lib/sbctl/projects/system/supavisor.env -/var/lib/sbctl/projects/system/realtime.env -/var/lib/sbctl/projects/system/storage.env -/var/lib/sbctl/projects/system/pgmeta.env -/var/lib/sbctl/projects/system/imgproxy.env -/var/lib/sbctl/projects/system/edge-runtime.env -/var/lib/sbctl/projects/system/postgres.env -/var/lib/sbctl/projects/system/gotrue.env
+# Studio rewrites its runtime-config templates and Next's image cache inside its artifact
+# directory at every start, so that one directory is writable (studio/README.md).
+ReadWritePaths=-/var/lib/sbctl/system/studio /var/lib/sbctl/artifacts/studio
+# Containment (allowlist). Every unit runs as the sbctl user, so the mount namespace is
+# what keeps a service away from the master key, other projects' data and the backups. The
+# unit sees an empty tmpfs where /var/lib/sbctl is, plus the artifacts (read-only), its own
+# launcher script (read-only) and its own state directory. It never needs to read an
+# environment file: systemd reads EnvironmentFile= before it builds the namespace. This
+# does not isolate tenants from a compromised service (same uid, /proc); see README.md.
+InaccessiblePaths=-/etc/sbctl
 TemporaryFileSystem=/var/lib/sbctl:ro
-BindReadOnlyPaths=/var/lib/sbctl/artifacts
-BindPaths=/var/lib/sbctl/projects/system -/var/lib/sbctl/system/studio
+BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/system/studio.run
+BindPaths=-/var/lib/sbctl/system/studio /var/lib/sbctl/artifacts/studio
 
 [Install]
 WantedBy=multi-user.target

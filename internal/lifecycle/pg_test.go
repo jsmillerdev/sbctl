@@ -55,3 +55,29 @@ func TestScramVerifierRandomSalt(t *testing.T) {
 		t.Fatalf("verifiers should differ per call: %s %s", a, b)
 	}
 }
+
+// Postgres and libpq run SASLprep over the password: a non-breaking space is mapped to a
+// plain space, a full-width digit is folded (NFKC). A verifier built from the raw bytes
+// would never match what a client sends.
+func TestScramVerifierAppliesSASLprep(t *testing.T) {
+	salt := []byte("0123456789abcdef")
+	same := [][2]string{
+		{"pass word", "pass word"},
+		{"pw１２", "pw12"},
+		{"plain-ascii", "plain-ascii"},
+	}
+	for _, c := range same {
+		a, _ := scramVerifierWithSalt(c[0], salt, 4096)
+		b, _ := scramVerifierWithSalt(c[1], salt, 4096)
+		if a != b {
+			t.Errorf("verifier of %q differs from %q: SASLprep is not applied", c[0], c[1])
+		}
+	}
+	if a, _ := scramVerifierWithSalt("pw1", salt, 4096); a == func() string { b, _ := scramVerifierWithSalt("pw2", salt, 4096); return b }() {
+		t.Error("different passwords gave the same verifier")
+	}
+	// Not valid UTF-8: used as it is, like pg_saslprep.
+	if got := saslprep("\xff\xfe"); got != "\xff\xfe" {
+		t.Errorf("invalid UTF-8 changed: %q", got)
+	}
+}

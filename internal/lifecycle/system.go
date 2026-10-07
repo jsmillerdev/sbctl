@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/OWNER/sbctl/internal/artifacts"
@@ -104,10 +105,19 @@ func (e *Engine) ensureFleetCredentials(ctx context.Context, pp pgPaths) error {
 type OpenOptions struct {
 	Log *slog.Logger
 	// ConfigPath, ArchiveCommand: see PlaneOptions.
-	ConfigPath     string
-	ArchiveCommand string
-	Fleet          fleet.Fleet
-	Backup         BaseBackuper
+	ConfigPath        string
+	ArchiveCommand    string
+	ArchiveCommandFor func(ref string) string
+	ArchiveTimeout    int
+	Fleet             fleet.Fleet
+	Backup            BaseBackuper
+	// BackupFactory builds the BaseBackuper once the registry and the secrets are open
+	// (the backup service needs both, and the Engine needs the backup service). When the
+	// result also has a SetManager(Manager) method, Open hands it the Engine. Ignored
+	// when Backup is set.
+	BackupFactory func(n *Node) (BaseBackuper, error)
+	// Timers replaces the backup timer control (tests); nil means the systemd backend's.
+	Timers Timers
 	// Supervisor replaces the backend chosen by cfg.Supervisor (tests).
 	Supervisor units.Supervisor
 	// Artifacts replaces the artifact store (tests).
@@ -124,7 +134,8 @@ func (o *OpenOptions) log() *slog.Logger {
 }
 
 func (o *OpenOptions) planeOptions() PlaneOptions {
-	return PlaneOptions{Log: o.log(), ConfigPath: o.ConfigPath, ArchiveCommand: o.ArchiveCommand, Backup: o.Backup}
+	return PlaneOptions{Log: o.log(), ConfigPath: o.ConfigPath, ArchiveCommand: o.ArchiveCommand,
+		ArchiveCommandFor: o.ArchiveCommandFor, ArchiveTimeout: o.ArchiveTimeout, Backup: o.Backup}
 }
 
 // Node is everything a process needs to manage projects on this machine: the secrets
@@ -165,6 +176,11 @@ func (o *OpenOptions) artifactStore(cfg *config.Config) (Artifacts, error) {
 	return artifacts.New(cfg, opts...)
 }
 
+// ErrRegistryUnreachable is wrapped by Open when the registry in the system cluster does
+// not answer: the cluster may still be starting (systemd orders sbctl.service after the
+// start of sb-postgres@system, not its readiness), so a daemon retries on it.
+var ErrRegistryUnreachable = errors.New("cannot reach the registry in the system cluster")
+
 // Open connects to an initialized node: it loads the master key, reaches the registry
 // through the system cluster's private unix socket, and builds the Engine. It does not
 // start anything; run `sbctl system init` (or start sb-postgres@system) first.
@@ -187,17 +203,106 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	}
 	reg, err := registry.Open(ctx, RegistryDSN(cfg))
 	if err != nil {
-		return nil, fmt.Errorf("lifecycle: cannot reach the registry in the system cluster (is sb-postgres@system running? run `sbctl system init`): %w", err)
+		if c, ok := sup.(interface{ Close() }); ok {
+			c.Close() // a caller that retries must not leak a bus connection per attempt
+		}
+		return nil, fmt.Errorf("lifecycle: %w (is sb-postgres@system running? run `sbctl system init`): %w", ErrRegistryUnreachable, err)
 	}
-	plane := NewPostgresPlane(cfg, sup, arts, reg, o.planeOptions())
-	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: o.Backup})
-	return &Node{Cfg: cfg, Secrets: sec, Supervisor: sup, Artifacts: arts, Registry: reg, Plane: plane, Engine: eng}, nil
+	node := &Node{Cfg: cfg, Secrets: sec, Supervisor: sup, Artifacts: arts, Registry: reg}
+	bk := o.lateBackup(node)
+	po := o.planeOptions()
+	po.Backup = bk
+	node.Plane = NewPostgresPlane(cfg, sup, arts, reg, po)
+	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup)})
+	return node, nil
+}
+
+// supervisorTimers starts and stops sb-basebackup@<ref>.timer through the supervisor
+// (D-Bus StartUnit, which the polkit rule allows for sb-* units). The timers are not
+// enabled for boot: the daemon starts them again for every active project at start.
+type supervisorTimers struct{ sup units.Supervisor }
+
+func (t supervisorTimers) StartTimer(ctx context.Context, ref string) error {
+	return t.sup.Start(ctx, "sb-basebackup@"+ref+".timer")
+}
+func (t supervisorTimers) StopTimer(ctx context.Context, ref string) error {
+	return t.sup.Stop(ctx, "sb-basebackup@"+ref+".timer")
+}
+
+// timers returns the backup timer control for the systemd backend; the exec backend has
+// no timers (backups are taken with `sbctl backups create`).
+func (o *OpenOptions) timers(cfg *config.Config, sup units.Supervisor) Timers {
+	if o.Timers != nil {
+		return o.Timers
+	}
+	if cfg.Supervisor != config.SupervisorSystemd {
+		return nil
+	}
+	return supervisorTimers{sup: sup}
+}
+
+// lateBackup returns o.Backup, or a BaseBackuper that builds itself from BackupFactory on
+// first use: the backup service needs the opened registry and secrets (n), and its
+// restore needs the Engine, and neither exists yet while the plane and Engine are built.
+func (o *OpenOptions) lateBackup(n *Node) BaseBackuper {
+	if o.Backup != nil {
+		return o.Backup
+	}
+	if o.BackupFactory == nil {
+		return nil
+	}
+	return &lateBackuper{node: n, factory: o.BackupFactory}
+}
+
+type lateBackuper struct {
+	node    *Node
+	factory func(n *Node) (BaseBackuper, error)
+	mu      sync.Mutex
+	b       BaseBackuper
+}
+
+func (l *lateBackuper) get() (BaseBackuper, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.b != nil {
+		return l.b, nil
+	}
+	b, err := l.factory(l.node)
+	if err != nil {
+		return nil, err
+	}
+	if m, ok := b.(interface{ SetManager(Manager) }); ok && l.node.Engine != nil {
+		m.SetManager(l.node.Engine)
+	}
+	l.b = b
+	return b, nil
+}
+
+// FinalBackup implements FinalBackuper: the delete-time backup, when the service has one.
+func (l *lateBackuper) FinalBackup(ctx context.Context, ref string) (*registry.Backup, error) {
+	b, err := l.get()
+	if err != nil {
+		return nil, fmt.Errorf("lifecycle: backup service: %w", err)
+	}
+	if fb, ok := b.(FinalBackuper); ok {
+		return fb.FinalBackup(ctx, ref)
+	}
+	return b.BaseBackup(ctx, ref)
+}
+
+// BaseBackup implements BaseBackuper.
+func (l *lateBackuper) BaseBackup(ctx context.Context, ref string) (*registry.Backup, error) {
+	b, err := l.get()
+	if err != nil {
+		return nil, fmt.Errorf("lifecycle: backup service: %w", err)
+	}
+	return b.BaseBackup(ctx, ref)
 }
 
 // systemProject is the registry view of the system cluster.
 func systemProject(cfg *config.Config, versions map[string]string) *registry.Project {
 	return &registry.Project{
-		Ref: config.SystemRef, Seq: 0, Name: "system", Region: "local", Engine: registry.EnginePostgres,
+		Ref: config.SystemRef, Seq: 0, Name: "system", Region: cfg.ProjectRegion(""), Engine: registry.EnginePostgres,
 		Class: ClassSystem, Status: registry.StatusComingUp, Versions: versions, Limits: cfg.Defaults,
 	}
 }
@@ -318,7 +423,9 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	}
 	node.Registry = reg
 	plane.reg = reg
-	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: o.Backup})
+	bk := o.lateBackup(node)
+	plane.opts.Backup = bk
+	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup)})
 	node.Engine = eng
 
 	if existing {
@@ -345,6 +452,7 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	if err = reg.SetProjectStatus(ctx, config.SystemRef, registry.StatusActiveHealthy); err != nil {
 		return nil, err
 	}
+	eng.startTimer(ctx, config.SystemRef)
 	eng.event(ctx, config.SystemRef, "system.initialized", map[string]bool{"existing": existing})
 	return node, nil
 }

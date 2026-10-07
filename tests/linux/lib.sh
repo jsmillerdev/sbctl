@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for tests/linux/*.sh. Sourced, not executed.
 #
-# These scripts are meant for an ephemeral Ubuntu 24.04 (or 22.04, Debian 12) CI VM with
+# These scripts are meant for an ephemeral Ubuntu 24.04 (or Debian 12) CI VM with
 # systemd and sudo. They create a system user, install units under /etc/systemd/system,
 # and start real PostgreSQL clusters. Do not run them on a machine you care about.
 

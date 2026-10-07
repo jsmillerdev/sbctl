@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/OWNER/sbctl/deploy/systemd"
+	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 )
 
@@ -117,7 +118,17 @@ configuration. Run it as the user that owns the state directory (sbctl).`,
 		Short: "Install the systemd units and the polkit rule, and enable the system units (needs root)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			changed, err := systemd.Install(sysUnitDir, sysPolkitDir)
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			// The embedded timer carries the default schedule; the node's own comes from
+			// config and is written in the same pass, so a second run changes nothing.
+			timer, err := backup.RenderBackupTimerChecked(cfg.Backup.BaseBackupOnCalendar)
+			if err != nil {
+				return fmt.Errorf("config backup.base_backup_on_calendar: %w", err)
+			}
+			changed, err := systemd.InstallWith(sysUnitDir, sysPolkitDir, map[string][]byte{backup.BackupTimerUnit: []byte(timer)})
 			if err != nil {
 				return err
 			}
@@ -126,10 +137,6 @@ configuration. Run it as the user that owns the state directory (sbctl).`,
 			}
 			if len(changed) == 0 {
 				fmt.Fprintln(cmd.OutOrStdout(), "units are up to date")
-			}
-			cfg, err := loadConfig()
-			if err != nil {
-				return err
 			}
 			apply, err := lifecycle.OpenOptions{Log: newLogger(cfg)}.UnitInstaller(cfg)
 			if err != nil {

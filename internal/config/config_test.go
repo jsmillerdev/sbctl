@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +90,40 @@ func TestLayout(t *testing.T) {
 	}
 	if got := c.Paths().Artifact(SvcGoTrue, "auth-v2"); got != "/var/lib/sbctl/artifacts/auth/auth-v2" {
 		t.Fatal(got)
+	}
+}
+
+func TestRegion(t *testing.T) {
+	c := Default()
+	if c.Region != "us-east-1" {
+		t.Fatalf("default region %q", c.Region)
+	}
+	for in, want := range map[string]string{"": "us-east-1", "local": "us-east-1", "Frankfurt": "us-east-1", "eu-west-2": "eu-west-2", "ap-southeast-2": "ap-southeast-2", "ap-southeast-4": "us-east-1", "us-gov-west-1": "us-east-1", "eu-south-1": "us-east-1"} {
+		if got := c.ProjectRegion(in); got != want {
+			t.Errorf("ProjectRegion(%q) = %q, want %q", in, got, want)
+		}
+	}
+	c.Region = "eu-central-1"
+	if got := c.ProjectRegion("local"); got != "eu-central-1" {
+		t.Errorf("configured region not used: %q", got)
+	}
+	bad := Default()
+	for _, r := range []string{"mars", "eu-south-1", "ap-east-1", "us-gov-west-1", "xx-word-1"} {
+		bad.Region = r
+		if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "regions.ts") {
+			t.Errorf("region %q: Validate = %v, want a rejection that names Studio's list", r, err)
+		}
+	}
+	for _, r := range Regions {
+		ok := Default()
+		ok.Region = r
+		if err := ok.Validate(); err != nil {
+			t.Errorf("region %q: %v", r, err)
+		}
+	}
+	empty := Default()
+	empty.Region = ""
+	if err := empty.Validate(); err != nil || empty.Region != "us-east-1" {
+		t.Errorf("empty region: %v %q", err, empty.Region)
 	}
 }

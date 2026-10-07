@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/OWNER/sbctl/deploy/systemd"
 	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/config"
 )
@@ -155,5 +156,35 @@ func TestWarnConfigFileMode(t *testing.T) {
 	warnConfigFileMode(&out, p, cfg)
 	if out.Len() != 0 {
 		t.Fatalf("0600 file warned: %q", out.String())
+	}
+}
+
+func TestInstallUnitsIsIdempotentWithACustomBackupSchedule(t *testing.T) {
+	dir := t.TempDir()
+	cal := "*-*-* 01:30:00"
+	timer, err := backup.RenderBackupTimerChecked(cal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ov := map[string][]byte{backup.BackupTimerUnit: []byte(timer)}
+	first, err := systemd.InstallWith(dir, "", ov)
+	if err != nil || len(first) == 0 {
+		t.Fatalf("first install: %v %v", first, err)
+	}
+	if second, err := systemd.InstallWith(dir, "", ov); err != nil || len(second) != 0 {
+		t.Fatalf("second install with a custom schedule changed %v (err %v)", second, err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "sb-basebackup@.timer"))
+	if !strings.Contains(string(b), "OnCalendar=*-*-* 01:30:00\n") {
+		t.Errorf("timer file:\n%s", b)
+	}
+	if _, err := backup.RenderBackupTimerChecked("bad\nExecStart=/bin/sh"); err == nil {
+		t.Error("an expression with a newline must be rejected, not written into the unit")
+	}
+}
+
+func TestServeIsRegistered(t *testing.T) {
+	if c, _, err := rootCmd.Find([]string{"serve"}); err != nil || c == nil || c.Name() != "serve" {
+		t.Fatalf("sbctl serve is not registered: %v", err)
 	}
 }

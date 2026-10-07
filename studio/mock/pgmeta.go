@@ -73,9 +73,16 @@ func evpBytesToKey(pass, salt []byte, keyLen, ivLen int) (key, iv []byte) {
 	return out[:keyLen], out[keyLen : keyLen+ivLen]
 }
 
-// connectionString is the opaque value in a project's `connectionString` field: the DB URL,
-// encrypted for postgres-meta. Studio sends it back unchanged as x-connection-encrypted.
-func (s *server) connectionString(p *Project) string {
+// connectionString is the value of a project's `connectionString` field. Studio only needs
+// it to be non-empty before it runs queries and does not use it otherwise: the API must
+// never put the database password, encrypted or not, in a response every dashboard user
+// reads (research/08 section 2). The mock answers an opaque, secret-free token; the
+// encrypted connection is built per request in pgMetaQuery, as the real API does.
+func (s *server) connectionString(p *Project) string { return "sbctl-mock-connection-" + p.Ref }
+
+// encryptedConnection is the x-connection-encrypted header for postgres-meta: the project's
+// DB URL encrypted with the shared key.
+func (s *server) encryptedConnection(p *Project) string {
 	enc, err := encryptConnString(p.DBURL, s.cfg.PgmetaCryptoKey)
 	if err != nil {
 		return ""
@@ -116,7 +123,7 @@ func (s *server) pgMetaQuery(w *respWriter, r *http.Request, c *reqCtx) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Connection-Encrypted", s.connectionString(p))
+	req.Header.Set("X-Connection-Encrypted", s.encryptedConnection(p))
 	if app := r.Header.Get("X-Pg-Application-Name"); app != "" {
 		req.Header.Set("X-Pg-Application-Name", app)
 	}

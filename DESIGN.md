@@ -83,7 +83,7 @@ Management API subset: `/v1` projects, api-keys, `database/query`, migrations, `
 
 **AWS.** Click the Launch Stack link. Fill in instance size, admin email, optional domain and hosted zone. CloudFormation creates one Ubuntu 24.04 instance, an IAM role, a security group and an S3 bucket; user data runs the installer; the stack outputs the dashboard URL and a one-time claim token. First project in under ten minutes.
 
-**Any Linux server.** Ubuntu 22.04+ or Debian 12+ (glibc 2.35 floor). Two DNS records, then:
+**Any Linux server.** Ubuntu 24.04+ or Debian 12+ (glibc 2.35 floor for the artifacts; polkit 121+ for the unit-management rule, so Ubuntu 22.04 is out). Two DNS records, then:
 
 ```bash
 curl -fsSL https://get.<name>.dev | sudo bash -s -- --domain example.com --dns cloudflare

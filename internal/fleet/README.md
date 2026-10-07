@@ -101,5 +101,5 @@ On darwin-arm64 with the slim-services artifacts under the exec backend, through
 - The pooler certificate is self-signed (see Pooler TLS); verifying clients need it, and a CertMagic export is not done.
 - The S3 backend of Storage and its S3 protocol endpoint in multi-tenant mode (DESIGN open item) were not run; only the environment is tested.
 - Image transformation (imgproxy), the Storage queue (`PG_QUEUE_ENABLE`), Realtime clustering and Supavisor clustering are off.
-- `sbctl system stop` (`lifecycle.StopAll`) does not stop the fleet units; use `sbctl fleet stop` first. Starting the fleet at boot belongs to the daemon (`fleet.Setup` with `Start`); the units are not enabled for boot.
+- `sbctl system stop` (`lifecycle.StopAll`) does not stop the fleet units; use `sbctl fleet stop` first. `sbctl serve` starts the shared services at boot (`app.startFleet`, next to the projects, systemd supervisor only) and registers projects through a `Lazy` fleet; the units are not enabled for boot, the daemon is.
 - Storage objects of a deleted project stay where the backend keeps them (`<ref>/`).
