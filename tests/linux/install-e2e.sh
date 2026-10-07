@@ -6,7 +6,8 @@
 #   sudo SBCTL_BIN=/path/to/sbctl tests/linux/install-e2e.sh
 #
 # SBCTL_BIN is a Linux build of this checkout with -X main.version=v0.0.1, SBCTL_BIN_V2 one
-# with v0.0.2 (the self-update target); without them the script builds both with go. Needs
+# with v0.0.2 (the installer upgrade target) and SBCTL_BIN_V3 one with v0.0.3 (the self-update
+# target); without them the script builds them with go. Needs
 # root, systemd, cgroup v2 and network access (artifact downloads). The node is configured with `--tls off --public-ip 127.0.0.1`, so every name is
 # <something>.127.0.0.1.sslip.io and the script reaches the proxy on 127.0.0.1 with Host
 # headers; nothing needs DNS. E2E_STUDIO=0 skips the dashboard build (a stand-in: the slim
@@ -74,19 +75,19 @@ openssl pkey -in "$KEYS/sign.pem" -pubout -out "$KEYS/pub.pem"
 openssl genpkey -algorithm ed25519 -out "$KEYS/other.pem"
 openssl pkey -in "$KEYS/other.pem" -pubout -out "$KEYS/other.pub"
 
-make_release() { # TAG BINARY-FILE: builds $WORK/srv/download/TAG and the fake GitHub API files for repo o/r
-  local tag=$1 bin=$2 d=$WORK/srv/download/$1
+make_release() { # TAG BINARY-FILE [nolatest]: builds $WORK/srv/download/TAG and the fake GitHub API files for repo o/r
+  local tag=$1 bin=$2 latest=${3:-latest} d=$WORK/srv/download/$1
   rm -rf "$d"; mkdir -p "$d"
   cp "$bin" "$d/sbctl-linux-$ARCH"
   if [[ $ARCH == amd64 ]]; then echo other-arch >"$d/sbctl-linux-arm64"; else echo other-arch >"$d/sbctl-linux-amd64"; fi
   echo "not a real studio build" >"$d/sbctl-studio-test-p1-linux-$ARCH.tar.zst"
   deploy/release-assets.sh "$d" "$KEYS/sign.pem" "$KEYS/pub.pem" >/dev/null
   mkdir -p "$WORK/srv/repos/o/r/releases/tags"
-  python3 - "$tag" "$d" "$SRV_PORT" "$WORK/srv/repos/o/r/releases" <<'PY'
+  python3 - "$tag" "$d" "$SRV_PORT" "$WORK/srv/repos/o/r/releases" "$latest" <<'PY'
 import json, os, sys
-tag, d, port, out = sys.argv[1:]
+tag, d, port, out, latest = sys.argv[1:]
 rel = {"tag_name": tag, "assets": [{"name": n, "browser_download_url": f"http://127.0.0.1:{port}/download/{tag}/{n}"} for n in sorted(os.listdir(d))]}
-for name in ("latest", f"tags/{tag}"):
+for name in (("latest",) if latest == "latest" else ()) + (f"tags/{tag}",):
     with open(os.path.join(out, name), "w") as f:
         json.dump(rel, f)
 PY
@@ -135,6 +136,11 @@ installer deploy/install.sh --version v0.0.1 --verify-only >/dev/null || fail "r
 # Through a pipe, the way the documented one-liner runs it.
 out=$(cat deploy/install.sh | installer bash -s -- --version v0.0.1 --verify-only 2>&1) || fail "install.sh through a pipe: $out"
 [[ $out == *"verified v0.0.1"* ]] || fail "install.sh through a pipe: $out"
+# An older signed binary attached to a newer tag (the signature covers the checksums, not the tag).
+make_release v0.0.9 "$SBCTL_BIN" nolatest
+if out=$(installer deploy/install.sh --version v0.0.9 --verify-only 2>&1); then fail "install.sh accepted v0.0.1's binary under the tag v0.0.9"; fi
+[[ $out == *"ships a binary that reports"* ]] || fail "install.sh downgrade refusal message: $out"
+log "refused a signed older binary under a newer tag"
 bash -n "$D/install.sh"
 grep -q __SBCTL_RELEASE_PUBKEY_B64__ "$D/install.sh" && fail "the stamped install.sh still has the key marker"
 
@@ -167,7 +173,8 @@ grep -q "sbctl is running" "$WORK/install.log" || fail "install.sh did not repor
 grep -q "Dashboard   http://studio.$BASE" "$WORK/install.log" || fail "install.sh printed no dashboard URL"
 TOKEN=$(tr -d '[:space:]' <"$WORK/claim-token")
 [[ $TOKEN =~ ^sbc_[0-9a-f]{48}$ ]] || fail "the claim token file does not hold a claim token"
-grep -q "$TOKEN" "$WORK/install.log" || fail "install.sh did not print the claim token"
+grep -q "$TOKEN" "$WORK/install.log" && fail "install.sh printed the claim token although --claim-token-file was given (an unattended install logs its output)"
+grep -q "$WORK/claim-token" "$WORK/install.log" || fail "install.sh did not say where the claim token is"
 [[ $(stat -c '%a' "$WORK/claim-token") == 600 ]] || fail "the claim token file is not 0600"
 
 log "host state"
@@ -306,30 +313,53 @@ wait_active sbctl.service 120
 for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
 [[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "a config change restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
 
+# ---- 6b. re-running install.sh with a newer binary restarts the daemon onto it ------------
+build_version() { # VERSION OUT [GIVEN-PATH]
+  local v=$1 out=$2 given=${3:-}
+  if [[ -n $given ]]; then cp "$given" "$out"
+  elif command -v go >/dev/null; then CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$v" -o "$out" ./cmd/sbctl
+  else fail "no SBCTL_BIN for $v and no go toolchain"; fi
+  [[ $("$out" --version) == *"$v"* ]] || fail "the $v binary reports: $("$out" --version)"
+}
+V2=$WORK/sbctl-v2; build_version v0.0.2 "$V2" "${SBCTL_BIN_V2:-}"
+V3=$WORK/sbctl-v3; build_version v0.0.3 "$V3" "${SBCTL_BIN_V3:-}"
+daemon_version() { "/proc/$(systemctl show -p MainPID --value sbctl.service)/exe" --version; }
+[[ $(daemon_version) == *v0.0.1* ]] || fail "the daemon does not run v0.0.1 before the upgrade: $(daemon_version)"
+log "re-running install.sh with the v0.0.2 binary moves the daemon onto it"
+ENTER=$(systemctl show -p ActiveEnterTimestampMonotonic --value sbctl.service)
+deploy/install.sh --binary "$V2" 2>&1 | tee "$WORK/install3.log"
+[[ ${PIPESTATUS[0]} -eq 0 ]] || fail "install.sh with the v0.0.2 binary failed"
+[[ $(/usr/local/bin/sbctl --version) == *v0.0.2* ]] || fail "install.sh did not install the v0.0.2 binary"
+wait_active sbctl.service 120
+[[ $(systemctl show -p ActiveEnterTimestampMonotonic --value sbctl.service) != "$ENTER" ]] || fail "install.sh left the daemon running the old binary"
+[[ $(daemon_version) == *v0.0.2* ]] || fail "the daemon still reports $(daemon_version) after install.sh installed v0.0.2"
+[[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "the binary upgrade restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
+[[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") == "$PG_PID" ]] || fail "the binary upgrade restarted the project's Postgres"
+for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
+[[ $(papi GET "/v1/projects/$REF" | jq_ 'd["status"]') == ACTIVE_HEALTHY ]] || fail "project unhealthy after the binary upgrade"
+
 # ---- 7. self-update ----------------------------------------------------------------------
-V2=${SBCTL_BIN_V2:-}
-if [[ -z $V2 ]] && command -v go >/dev/null; then
-  V2=$WORK/sbctl-v2
-  CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o "$V2" ./cmd/sbctl
-fi
-if [[ -n $V2 ]]; then
-  [[ $("$V2" --version) == *v0.0.2* ]] || fail "SBCTL_BIN_V2 must be built with -X main.version=v0.0.2"
-  log "self-update: sign v0.0.2 and update from the local release server"
-  make_release v0.0.2 "$V2"
+if [[ -n $V3 ]]; then
+  log "self-update: sign v0.0.3 and update from the local release server"
+  make_release v0.0.3 "$V3"
   SU=(/usr/local/bin/sbctl self-update --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" --public-key-file "$KEYS/pub.pem")
-  [[ $("${SU[@]}" --check) == *"update available"* ]] || fail "self-update --check did not see v0.0.2: $("${SU[@]}" --check)"
-  D2=$WORK/srv/download/v0.0.2
-  cp "$D2/sbctl-linux-$ARCH" "$WORK/good-v2"
+  [[ $("${SU[@]}" --check) == *"update available"* ]] || fail "self-update --check did not see v0.0.3: $("${SU[@]}" --check)"
+  D2=$WORK/srv/download/v0.0.3
+  cp "$D2/sbctl-linux-$ARCH" "$WORK/good-v3"
   echo tampered >>"$D2/sbctl-linux-$ARCH"
   if out=$("${SU[@]}" 2>&1); then fail "self-update installed a tampered binary"; fi
   [[ $out == *"does not match its checksum"* ]] || fail "self-update tamper message: $out"
-  [[ $(/usr/local/bin/sbctl --version) == *v0.0.1* ]] || fail "the binary changed although the update was refused"
-  cp "$WORK/good-v2" "$D2/sbctl-linux-$ARCH"
+  [[ $(/usr/local/bin/sbctl --version) == *v0.0.2* ]] || fail "the binary changed although the update was refused"
+  cp "$WORK/good-v3" "$D2/sbctl-linux-$ARCH"
+  if out=$("${SU[@]}" --version v0.0.9 --force 2>&1); then fail "self-update installed an older signed binary under the newer tag v0.0.9"; fi
+  [[ $out == *"refusing to install"* ]] || fail "self-update downgrade message: $out"
+  [[ $(/usr/local/bin/sbctl --version) == *v0.0.2* ]] || fail "the binary changed although the downgrade was refused"
   if out=$(/usr/local/bin/sbctl self-update --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" --public-key-file "$KEYS/other.pub" 2>&1); then fail "self-update accepted a release signed by another key"; fi
   [[ $out == *"does not verify"* ]] || fail "self-update wrong-key message: $out"
   "${SU[@]}" 2>&1 | tee "$WORK/selfupdate.log"
   [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "self-update failed"
-  [[ $(/usr/local/bin/sbctl --version) == *v0.0.2* ]] || fail "the binary is not v0.0.2 after self-update"
+  [[ $(/usr/local/bin/sbctl --version) == *v0.0.3* ]] || fail "the binary is not v0.0.3 after self-update"
+  [[ $(daemon_version) == *v0.0.3* ]] || fail "the daemon does not run v0.0.3 after self-update: $(daemon_version)"
   [[ -x /usr/local/bin/sbctl.prev ]] || fail "the previous binary was not kept"
   wait_active sbctl.service 120
   [[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") == "$PG_PID" ]] || fail "self-update restarted the project's Postgres"
@@ -339,8 +369,25 @@ if [[ -n $V2 ]]; then
   n=$(rest -H "apikey: $PUB" "http://127.0.0.1/rest/v1/e2e_items?select=id" | jq_ 'len(d)') || true
   [[ $n == 2 ]] || fail "REST after self-update returned '$n' rows"
   [[ $("${SU[@]}" 2>&1) == *"already up to date"* ]] || fail "a second self-update did not report up to date"
+
+  # A release whose daemon dies after it forks: systemd reports the unit active, so only the
+  # readiness probe notices. self-update must put v0.0.3 back and re-render its units.
+  log "self-update rollback: v0.0.4 starts but its daemon exits"
+  BAD=$WORK/sbctl-bad
+  printf '%s\n' '#!/bin/sh' 'case "$1" in' '  --version) echo "sbctl version v0.0.4" ;;' \
+    '  serve) echo "simulated crash" >&2; exit 1 ;;' '  *) exit 0 ;;' 'esac' >"$BAD"
+  chmod 755 "$BAD"
+  make_release v0.0.4 "$BAD"
+  if out=$("${SU[@]}" --wait 20s 2>&1); then fail "self-update reported success for a daemon that exits"; fi
+  [[ $out == *"rolled back to the previous binary, which is running"* ]] || fail "self-update rollback message: $out"
+  [[ $(/usr/local/bin/sbctl --version) == *v0.0.3* ]] || fail "the binary was not rolled back: $(/usr/local/bin/sbctl --version)"
+  wait_active sbctl.service 120
+  [[ $(daemon_version) == *v0.0.3* ]] || fail "the daemon does not run the restored binary: $(daemon_version)"
+  for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
+  [[ $(papi GET "/v1/projects/$REF" | jq_ 'd["status"]') == ACTIVE_HEALTHY ]] || fail "project not healthy after the rollback"
+  [[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") == "$PG_PID" ]] || fail "the rollback restarted the project's Postgres"
 else
-  fail "no SBCTL_BIN_V2 and no go toolchain: the self-update step cannot run"
+  fail "no v0.0.3 binary: the self-update step cannot run"
 fi
 
 log "install end to end: all checks passed"

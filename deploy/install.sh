@@ -92,9 +92,9 @@ main() {
   for a in "${PASS[@]+"${PASS[@]}"}"; do [[ $a == --skip-os-check ]] && skip_os=1; done
   os_major=${VERSION_ID:-}; os_major=${os_major%%.*}
   case ${ID:-} in
-    ubuntu) [[ ${os_major:-0} =~ ^[0-9]+$ && $os_major -ge 22 ]] || [[ $skip_os -eq 1 ]] || die "Ubuntu ${VERSION_ID:-?} is too old: 22.04 or later is required" ;;
+    ubuntu) [[ ${os_major:-0} =~ ^[0-9]+$ && $os_major -ge 24 ]] || [[ $skip_os -eq 1 ]] || die "Ubuntu ${VERSION_ID:-?} is too old: 24.04 or later is required (22.04 ships a polkit that ignores the rule sbctl needs)" ;;
     debian) [[ ${os_major:-0} =~ ^[0-9]+$ && $os_major -ge 12 ]] || [[ $skip_os -eq 1 ]] || die "Debian ${VERSION_ID:-?} is too old: 12 or later is required" ;;
-    *) [[ $skip_os -eq 1 ]] || die "${PRETTY_NAME:-this distribution} is not supported: Ubuntu 22.04+ or Debian 12+ is required (--skip-os-check tries anyway)" ;;
+    *) [[ $skip_os -eq 1 ]] || die "${PRETTY_NAME:-this distribution} is not supported: Ubuntu 24.04+ or Debian 12+ is required (--skip-os-check tries anyway)" ;;
   esac
 
   glibc=$(ldd --version 2>&1 | sed -n 1p | grep -Eo '[0-9]+\.[0-9]+$' || true)
@@ -162,6 +162,11 @@ main() {
     fetch "$asset"
     (cd "$tmp" && printf '%s\n' "$line" | sha256sum -c - >/dev/null) || die "$asset does not match its checksum: refusing to install"
     log "$asset matches its checksum"
+    # The signature covers the checksums, not the tag in GitHub's metadata. A binary that does not
+    # name the tag it was published under is an older signed release attached to a newer tag.
+    chmod +x "$tmp/$asset"
+    reported=$("$tmp/$asset" --version 2>&1 | head -n1 || true)
+    [[ " $reported " == *" $TAG "* ]] || die "release $TAG ships a binary that reports '${reported:-nothing}': refusing to install (an older signed binary under a newer tag would be a downgrade)"
     SRC=$tmp/$asset
     # Studio ships as a release asset too; hand its URL and checksum (from the verified
     # list) to `sbctl install` unless the caller chose their own.

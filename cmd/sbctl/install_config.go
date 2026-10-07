@@ -345,8 +345,11 @@ func parseOSRelease(b []byte) map[string]string {
 	return m
 }
 
-// checkOS accepts Ubuntu 22.04 and later and Debian 12 and later, the platforms the
-// service artifacts (glibc 2.35 and later) run on.
+// checkOS accepts Ubuntu 24.04 and later and Debian 12 and later. The service artifacts need
+// glibc 2.35, but the floor is higher because the polkit rule that lets the sbctl user manage
+// its units is JavaScript, which polkit 121 and later read (Debian 12 and Ubuntu 23.04 and
+// later). Ubuntu 22.04 ships polkit 0.105, which ignores .rules files; a .pkla grant could not
+// be limited to sb-* units, so it would let the sbctl user start any unit as root.
 func checkOS(rel map[string]string) error {
 	id, ver := rel["ID"], rel["VERSION_ID"]
 	major, err := strconv.Atoi(strings.SplitN(ver, ".", 2)[0])
@@ -355,8 +358,8 @@ func checkOS(rel map[string]string) error {
 	}
 	switch id {
 	case "ubuntu":
-		if major < 22 {
-			return fmt.Errorf("Ubuntu %s is too old: 22.04 or later is required", ver)
+		if major < 24 {
+			return fmt.Errorf("Ubuntu %s is too old: 24.04 or later is required (22.04 ships a polkit that ignores the rule sbctl needs)", ver)
 		}
 		return nil
 	case "debian":
@@ -365,7 +368,7 @@ func checkOS(rel map[string]string) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("%q is not supported: Ubuntu 22.04+ or Debian 12+ is required (--skip-os-check tries anyway if its glibc is 2.35 or newer)", rel["PRETTY_NAME"])
+	return fmt.Errorf("%q is not supported: Ubuntu 24.04+ or Debian 12+ is required (--skip-os-check tries anyway if its glibc is 2.35 or newer)", rel["PRETTY_NAME"])
 }
 
 var glibcRe = regexp.MustCompile(`(\d+)\.(\d+)\s*$`)

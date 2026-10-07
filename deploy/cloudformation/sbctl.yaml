@@ -393,6 +393,10 @@ Resources:
           - |
             #!/bin/bash
             # sbctl first boot: data volume, installer, claim token, signal. Logs: /var/log/sbctl-bootstrap.log
+            # The log is created 0600 before anything is written: it must not be readable by the
+            # tenant-facing services that run on this host. The installer prints no secret when it
+            # is given --claim-token-file, and cloud-init copies this output to the console log.
+            install -m 0600 /dev/null /var/log/sbctl-bootstrap.log
             exec > >(tee -a /var/log/sbctl-bootstrap.log) 2>&1
             set -uo pipefail
             export DEBIAN_FRONTEND=noninteractive
@@ -455,6 +459,14 @@ Resources:
               echo "UUID=$(blkid -s UUID -o value "$DEV") /var/lib/sbctl xfs defaults,nofail 0 2" >> /etc/fstab
             fi
             mountpoint -q /var/lib/sbctl || mount /var/lib/sbctl || fail "mount /var/lib/sbctl"
+            # If the volume is missing at a later boot, the daemon and the system Postgres must fail
+            # rather than start against an empty /var/lib/sbctl on the root disk (nofail only keeps
+            # the boot itself going).
+            for u in sbctl.service sb-postgres@.service; do
+              mkdir -p "/etc/systemd/system/$u.d"
+              printf '[Unit]\nRequiresMountsFor=/var/lib/sbctl\n' > "/etc/systemd/system/$u.d/10-sbctl-data-mount.conf"
+            done
+            systemctl daemon-reload
 
             step "downloading the installer"
             REL='${ReleaseBase}'
@@ -473,9 +485,11 @@ Resources:
 
             step "storing the claim token"
             if [ -s /root/claim-token ]; then
+              # From a file, not argv: command lines are readable by every process on the host.
+              (umask 077; tr -d '[:space:]' < /root/claim-token > /root/claim-token.secret)
               aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
-                --secret-string "$(cat /root/claim-token)" >/dev/null || fail "cannot write the claim token secret"
-              shred -u /root/claim-token 2>/dev/null || rm -f /root/claim-token
+                --secret-string file:///root/claim-token.secret >/dev/null || fail "cannot write the claim token secret"
+              shred -u /root/claim-token /root/claim-token.secret 2>/dev/null || rm -f /root/claim-token /root/claim-token.secret
             fi
             rm -f /root/sbctl-install.sh
 

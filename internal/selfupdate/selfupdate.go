@@ -98,9 +98,9 @@ type Options struct {
 	Force bool
 	// Out receives progress lines; nil discards them.
 	Out io.Writer
-	// Probe runs the downloaded binary to check that it starts; nil means run it with
-	// --version. Tests replace it.
-	Probe func(ctx context.Context, path string) error
+	// Probe runs the downloaded binary to check that it starts and returns what it
+	// prints for --version; nil means run it with --version. Tests replace it.
+	Probe func(ctx context.Context, path string) (string, error)
 }
 
 func (o *Options) repo() string {
@@ -316,9 +316,17 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 	if probe == nil {
 		probe = runVersion
 	}
-	if err := probe(ctx, tmpPath); err != nil {
+	reported, err := probe(ctx, tmpPath)
+	if err != nil {
 		os.Remove(tmpPath)
 		return nil, fmt.Errorf("the downloaded binary does not start: %w", err)
+	}
+	// The signature covers the checksums, not the release tag, which comes from unsigned
+	// GitHub metadata. A binary that does not name the tag it was published under is an
+	// older (validly signed) release attached to a newer tag: a downgrade.
+	if !ReportsVersion(reported, rel.Tag) {
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("release %s ships a binary that reports %q: refusing to install (an older signed binary under a newer tag would be a downgrade)", rel.Tag, strings.TrimSpace(reported))
 	}
 	// Keep the old inode reachable as <name>.prev, then swap the new file in.
 	prev := exe + ".prev"
@@ -334,13 +342,25 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 	return &Result{Tag: rel.Tag, Replaced: true, Previous: prev}, nil
 }
 
-func runVersion(ctx context.Context, path string) error {
+func runVersion(ctx context.Context, path string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if out, err := exec.CommandContext(ctx, path, "--version").CombinedOutput(); err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	out, err := exec.CommandContext(ctx, path, "--version").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return string(out), nil
+}
+
+// ReportsVersion reports whether the output of `sbctl --version` ("sbctl version v1.2.3")
+// names tag as one of its words.
+func ReportsVersion(output, tag string) bool {
+	for _, f := range strings.Fields(output) {
+		if f == tag {
+			return true
+		}
+	}
+	return false
 }
 
 // VerifySums checks the signature of the checksum list.

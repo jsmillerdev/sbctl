@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -212,7 +213,8 @@ func TestCheckOS(t *testing.T) {
 		ok      bool
 	}{
 		{"ID=ubuntu\nVERSION_ID=\"24.04\"\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"", true},
-		{"ID=ubuntu\nVERSION_ID=\"22.04\"", true},
+		{"ID=ubuntu\nVERSION_ID=\"22.04\"", false},
+		{"ID=ubuntu\nVERSION_ID=\"25.10\"", true},
 		{"ID=ubuntu\nVERSION_ID=\"20.04\"", false},
 		{"ID=debian\nVERSION_ID=\"12\"", true},
 		{"ID=debian\nVERSION_ID=\"11\"", false},
@@ -284,5 +286,105 @@ func TestDNSRecordsAndPorts(t *testing.T) {
 	}
 	if got := publicPorts(cfg); len(got) != 4 || got[0] != 5432 || got[1] != 6543 || got[2] != 80 || got[3] != 443 {
 		t.Fatalf("ports %v", got)
+	}
+}
+
+func TestCheckPolkitVersion(t *testing.T) {
+	for _, tc := range []struct {
+		out string
+		ok  bool
+	}{
+		{"pkaction version 124\n", true},
+		{"pkaction version 122", true},
+		{"pkaction version 121", true},
+		{"pkaction version 0.105\n", false},
+		{"pkaction version 120", false},
+		{"", false},
+		{"polkit unknown", false},
+	} {
+		if err := checkPolkitVersion(tc.out); (err == nil) != tc.ok {
+			t.Errorf("%q: %v", tc.out, err)
+		}
+	}
+}
+
+func TestExeStale(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "sbctl")
+	if err := os.WriteFile(bin, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A hard link stands in for /proc/<pid>/exe: it keeps the inode the process runs.
+	running := filepath.Join(dir, "exe")
+	if err := os.Link(bin, running); err != nil {
+		t.Fatal(err)
+	}
+	if exeStale(running, bin) {
+		t.Fatal("the same file reads as stale")
+	}
+	// install.sh replaces the binary by rename: the path gets a new inode.
+	next := filepath.Join(dir, "sbctl.new")
+	if err := os.WriteFile(next, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(next, bin); err != nil {
+		t.Fatal(err)
+	}
+	if !exeStale(running, bin) {
+		t.Fatal("a daemon on the replaced inode does not read as stale")
+	}
+	// A re-run of the installer with the same release replaces the file with identical bytes
+	// (same size, new inode): the daemon is not stale.
+	same := filepath.Join(dir, "sbctl.same")
+	if err := os.WriteFile(same, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(same, bin); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(running); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(bin, running); err != nil {
+		t.Fatal(err)
+	}
+	again := filepath.Join(dir, "sbctl.again")
+	if err := os.WriteFile(again, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(again, bin); err != nil {
+		t.Fatal(err)
+	}
+	if exeStale(running, bin) {
+		t.Fatal("identical bytes under a new inode read as stale: every re-run would restart the daemon")
+	}
+	// Same size, different bytes.
+	other := filepath.Join(dir, "sbctl.other")
+	if err := os.WriteFile(other, []byte("nex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(other, bin); err != nil {
+		t.Fatal(err)
+	}
+	if !exeStale(running, bin) {
+		t.Fatal("same size, different bytes did not read as stale")
+	}
+	if exeStale(filepath.Join(dir, "missing"), bin) || exeStale(running, filepath.Join(dir, "missing")) {
+		t.Fatal("an unreadable side must not force a restart")
+	}
+}
+
+func TestSummaryKeepsTheTokenOutOfTheLogWhenItGoesToAFile(t *testing.T) {
+	cfg := config.Default()
+	cfg.Domain = "example.com"
+	const tok = "sbc_0123456789abcdef"
+	var withFile, without bytes.Buffer
+	printSummary(&withFile, cfg, "203.0.113.7", tok, false, installOptions{ClaimTokenFile: "/root/claim-token"})
+	printSummary(&without, cfg, "203.0.113.7", tok, false, installOptions{})
+	if strings.Contains(withFile.String(), tok) || !strings.Contains(withFile.String(), "/root/claim-token") {
+		t.Fatalf("summary with --claim-token-file:\n%s", withFile.String())
+	}
+	if !strings.Contains(without.String(), tok) {
+		t.Fatalf("summary without a file must show the token:\n%s", without.String())
 	}
 }

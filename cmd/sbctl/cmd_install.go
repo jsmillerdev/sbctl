@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -30,7 +31,7 @@ func init() {
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Set this server up as an sbctl node (run as root; deploy/install.sh calls it)",
-		Long: `Turns a Linux server into an sbctl node. It checks the host (Ubuntu 22.04+ or Debian 12+,
+		Long: `Turns a Linux server into an sbctl node. It checks the host (Ubuntu 24.04+ or Debian 12+,
 glibc 2.35+, systemd), creates the sbctl user, writes /etc/sbctl/config.toml from the flags,
 installs the systemd units and the polkit rule, opens the firewall ports, creates the system
 project (` + "`sbctl system init`" + `), starts the shared services, enables and starts sbctl.service and
@@ -250,8 +251,14 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 		return err
 	}
 	verb := "start"
-	if configChanged && existed {
+	switch {
+	case configChanged && existed:
 		verb = "restart" // the running daemon holds the old settings
+	case in.daemonStale():
+		// install.sh swapped the binary file under a daemon that is still running the old
+		// one, and the units were just re-rendered by the new one.
+		in.step("the running daemon is not the installed binary: restarting it")
+		verb = "restart"
 	}
 	if err := in.run("systemctl", verb, "sbctl.service"); err != nil {
 		_ = in.run("journalctl", "-u", "sbctl.service", "-n", "40", "--no-pager")
@@ -268,6 +275,65 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	}
 	printSummary(in.out, cfg, publicIP, token, claimed, o)
 	return nil
+}
+
+// daemonStale reports whether sbctl.service runs a binary other than the one at BinPath.
+// Replacing the file by rename leaves the daemon on the old inode until it restarts.
+func (in *installer) daemonStale() bool {
+	out, err := exec.CommandContext(in.ctx, "systemctl", "show", "-p", "MainPID", "--value", "sbctl.service").Output()
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || pid <= 0 {
+		return false // not running
+	}
+	return exeStale(filepath.Join("/proc", strconv.Itoa(pid), "exe"), in.cfg.BinPath)
+}
+
+// exeStale reports whether the process executable at procExe (a /proc/<pid>/exe link) holds
+// different bytes from the file at path. Comparing contents rather than inodes matters:
+// install.sh replaces the binary by rename on every run, and a re-run with the same release
+// must not restart the daemon. It answers false when either cannot be read.
+func exeStale(procExe, path string) bool {
+	running, err := os.Stat(procExe)
+	if err != nil {
+		return false
+	}
+	installed, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if os.SameFile(running, installed) {
+		return false
+	}
+	if running.Size() != installed.Size() {
+		return true
+	}
+	a, err := fileSHA256(procExe)
+	if err != nil {
+		return false
+	}
+	b, err := fileSHA256(path)
+	if err != nil {
+		return false
+	}
+	return a != b
+}
+
+func fileSHA256(path string) ([32]byte, error) {
+	var sum [32]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return sum, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
 }
 
 // preflight checks the platform before anything is changed.
@@ -368,9 +434,40 @@ func writeFileAtomic(path string, b []byte, mode os.FileMode, uid, gid int) erro
 // ensurePolkit installs polkit when the host lacks it: the sbctl user drives systemd over
 // D-Bus, which needs polkit and the rule `system install-units` installs.
 func (in *installer) ensurePolkit() error {
-	if _, err := exec.LookPath("pkaction"); err == nil {
-		return nil
+	if _, err := exec.LookPath("pkaction"); err != nil {
+		if err := in.installPolkit(); err != nil {
+			return err
+		}
 	}
+	out, err := exec.CommandContext(in.ctx, "pkaction", "--version").Output()
+	if err != nil {
+		return fmt.Errorf("pkaction --version: %w", err)
+	}
+	return checkPolkitVersion(string(out))
+}
+
+var polkitVersionRe = regexp.MustCompile(`(\d+)(?:\.(\d+))?\s*$`)
+
+// checkPolkitVersion requires polkit 121 or later. The rule that lets the sbctl user manage
+// its units is JavaScript; polkit 0.105 (Ubuntu 22.04) reads only .pkla files, so the rule
+// would never load and every unit call from sbctl would fail with access denied.
+func checkPolkitVersion(out string) error {
+	m := polkitVersionRe.FindStringSubmatch(strings.TrimSpace(out))
+	if m == nil {
+		return fmt.Errorf("cannot read the polkit version from %q", strings.TrimSpace(out))
+	}
+	major, _ := strconv.Atoi(m[1])
+	if major < 121 {
+		v := m[1]
+		if m[2] != "" {
+			v += "." + m[2]
+		}
+		return fmt.Errorf("polkit %s is too old: 121 or later is required to load the JavaScript rule sbctl installs (Ubuntu 24.04 and Debian 12 have it)", v)
+	}
+	return nil
+}
+
+func (in *installer) installPolkit() error {
 	in.step("installing polkit")
 	env := append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
 	apt := func(args ...string) error {
@@ -401,8 +498,6 @@ func publicPorts(cfg *config.Config) []int {
 	}
 	return ports
 }
-
-var sshPortRe = regexp.MustCompile(`(?im)^\s*Port\s+(\d+)`)
 
 // firewall opens the public ports in ufw. The shared services listen on more interfaces
 // than they should (fleet README); a host firewall or security group that admits only
@@ -443,17 +538,9 @@ func (in *installer) firewall(mode string) error {
 	in.step("opening TCP %s in ufw", strings.Join(list, ", "))
 	if !active {
 		// Enabling ufw must not lock the administrator out: SSH first.
-		sshPorts := []string{"22"}
-		if b, err := os.ReadFile("/etc/ssh/sshd_config"); err == nil {
-			if ms := sshPortRe.FindAllStringSubmatch(string(b), -1); len(ms) > 0 {
-				sshPorts = sshPorts[:0]
-				for _, m := range ms {
-					sshPorts = append(sshPorts, m[1])
-				}
-			}
-		}
+		sshPorts := sshPorts(in.ctx)
 		for _, p := range sshPorts {
-			if err := in.run("ufw", "allow", p+"/tcp"); err != nil {
+			if err := in.run("ufw", "allow", strconv.Itoa(p)+"/tcp"); err != nil {
 				return err
 			}
 		}
@@ -535,7 +622,13 @@ func printSummary(w io.Writer, cfg *config.Config, ip, token string, claimed boo
 	case claimed:
 		fmt.Fprintln(w, "The first administrator already exists. Invite more users with: sudo -u sbctl sbctl users invite <email>")
 	default:
-		fmt.Fprintf(w, "Create the first administrator at %s/claim with this token (works once, expires in %s):\n\n  %s\n\n", cfg.APIURL(), o.ClaimTTL, token)
+		if o.ClaimTokenFile != "" {
+			// An unattended install (cloud-init) logs everything it prints; the token goes only
+			// to the file, which the caller moves to a secret store.
+			fmt.Fprintf(w, "Create the first administrator at %s/claim with the token in %s (works once, expires in %s).\n\n", cfg.APIURL(), o.ClaimTokenFile, o.ClaimTTL)
+		} else {
+			fmt.Fprintf(w, "Create the first administrator at %s/claim with this token (works once, expires in %s):\n\n  %s\n\n", cfg.APIURL(), o.ClaimTTL, token)
+		}
 		fmt.Fprintln(w, "Need another token later? sudo -u sbctl sbctl claim token")
 	}
 }

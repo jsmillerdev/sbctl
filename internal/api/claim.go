@@ -12,6 +12,7 @@ import (
 	"html/template"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/mail"
 	"net/url"
@@ -379,11 +380,11 @@ func (a *Accounts) RemoveUser(ctx context.Context, email string) (tokens int, er
 	}
 	for _, u := range users {
 		if strings.EqualFold(u.Email, email) {
+			// Tokens first: if the GoTrue delete fails afterwards, the account still exists
+			// and `users remove` can be run again; the other order would leave live tokens
+			// of an account nobody can find.
 			ts, err := a.Reg.ListAccessTokens(ctx, u.ID)
 			if err != nil {
-				return 0, err
-			}
-			if _, err := a.goTrue(ctx, http.MethodDelete, "/admin/users/"+url.PathEscape(u.ID), nil, nil); err != nil {
 				return 0, err
 			}
 			for _, t := range ts {
@@ -391,6 +392,9 @@ func (a *Accounts) RemoveUser(ctx context.Context, email string) (tokens int, er
 					return tokens, err
 				}
 				tokens++
+			}
+			if _, err := a.goTrue(ctx, http.MethodDelete, "/admin/users/"+url.PathEscape(u.ID), nil, nil); err != nil {
+				return tokens, err
 			}
 			return tokens, nil
 		}
@@ -400,35 +404,93 @@ func (a *Accounts) RemoveUser(ctx context.Context, email string) (tokens int, er
 
 // ---- HTTP -----------------------------------------------------------------
 
-// claimLimiter bounds failed redemptions node-wide: with 192-bit tokens guessing is out
-// of reach, so this only keeps the endpoint from being a free oracle for load.
+// claimLimiter bounds failed redemptions per client address: with 192-bit tokens guessing is
+// out of reach, so this only keeps the endpoint from being a free oracle for load. It is keyed
+// by client so that an anonymous caller who sends junk cannot lock the first administrator or
+// an invitee out; a distributed flood is a load problem for the network layer, not something a
+// shared counter could absorb without becoming a lockout.
 type claimLimiter struct {
-	mu     sync.Mutex
-	window time.Time
-	fails  int
+	mu      sync.Mutex
+	clients map[string]*claimWindow
+}
+
+type claimWindow struct {
+	start time.Time
+	fails int
 }
 
 const (
 	claimFailLimit  = 10
 	claimFailWindow = time.Minute
+	claimMaxClients = 4096 // bounds memory; entries older than a window are dropped first
 )
 
-func (l *claimLimiter) blocked(now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if now.Sub(l.window) > claimFailWindow {
-		l.window, l.fails = now, 0
+// window returns the live window of key (starting a new one when the old expired). Caller holds mu.
+func (l *claimLimiter) window(key string, now time.Time) *claimWindow {
+	if l.clients == nil {
+		l.clients = map[string]*claimWindow{}
 	}
-	return l.fails >= claimFailLimit
+	w := l.clients[key]
+	if w != nil && now.Sub(w.start) <= claimFailWindow {
+		return w
+	}
+	if w == nil && len(l.clients) >= claimMaxClients {
+		for k, o := range l.clients {
+			if now.Sub(o.start) > claimFailWindow {
+				delete(l.clients, k)
+			}
+		}
+		if len(l.clients) >= claimMaxClients {
+			// Every slot is a live window: share one bucket rather than grow without bound.
+			key = "*overflow*"
+			if w = l.clients[key]; w != nil && now.Sub(w.start) <= claimFailWindow {
+				return w
+			}
+		}
+	}
+	w = &claimWindow{start: now}
+	l.clients[key] = w
+	return w
 }
 
-func (l *claimLimiter) fail(now time.Time) {
+func (l *claimLimiter) blocked(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if now.Sub(l.window) > claimFailWindow {
-		l.window, l.fails = now, 0
+	return l.window(key, now).fails >= claimFailLimit
+}
+
+func (l *claimLimiter) fail(key string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.window(key, now).fails++
+}
+
+// claimClient names the caller for rate limiting. Requests reach the API through sbctl's own
+// reverse proxy on loopback, which replaces X-Forwarded-For with the real client address; a
+// request that did not come through loopback is keyed by its own address. IPv6 clients are
+// grouped by /64, the smallest block a single subscriber controls.
+func claimClient(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
 	}
-	l.fails++
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+			// Take the last entry: whatever precedes it was supplied by the caller.
+			if i := strings.LastIndex(xff, ","); i >= 0 {
+				xff = strings.TrimSpace(xff[i+1:])
+			}
+			host = xff
+		}
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return host
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String()
 }
 
 // claimRoutes registers GET and POST /claim, served on api.<domain> and the loopback
@@ -446,7 +508,8 @@ func (s *Server) claimRoutes(mux *muxSet) {
 	}))
 	mux.handle("POST /claim", s.wrap(authNone, func(w http.ResponseWriter, r *http.Request) error {
 		now := s.now()
-		if lim.blocked(now) {
+		client := claimClient(r)
+		if lim.blocked(client, now) {
 			w.Header().Set("Retry-After", "60")
 			return errf(http.StatusTooManyRequests, "Too many failed attempts; wait a minute")
 		}
@@ -457,7 +520,7 @@ func (s *Server) claimRoutes(mux *muxSet) {
 		res, err := s.accounts.Redeem(r.Context(), in)
 		if err != nil {
 			if e := asError(err); e.Status == http.StatusForbidden {
-				lim.fail(now)
+				lim.fail(client, now)
 			}
 			return err
 		}
@@ -518,7 +581,7 @@ button:disabled{opacity:.6;cursor:wait}
 #out{margin-top:1rem}.err{color:var(--err)}.ok a{color:var(--acc)}
 </style></head><body><main>
 <h1>Create your account</h1>
-<p>Use the claim token the installer printed, or the invite token an administrator gave you.</p>
+<p>Use the claim token the installer printed or saved, or the invite token an administrator gave you.</p>
 <form id="f" autocomplete="off">
 <label for="token">Token</label><input id="token" name="token" required spellcheck="false" autocapitalize="off">
 <label for="email">Email</label><input id="email" name="email" type="email" autocomplete="username"><small>Required for the first administrator. An invite already names its address.</small>

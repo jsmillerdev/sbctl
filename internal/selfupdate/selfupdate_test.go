@@ -81,7 +81,7 @@ func (r *releaseServer) opts(t *testing.T, current string) (Options, string) {
 		t.Fatal(err)
 	}
 	return Options{Repo: "o/r", APIBase: r.URL, Platform: "linux-amd64", Current: current, ExecPath: exe, Key: r.pub,
-		Probe: func(context.Context, string) error { return nil }}, exe
+		Probe: func(context.Context, string) (string, error) { return "sbctl version " + r.tag, nil }}, exe
 }
 
 func read(t *testing.T, p string) string {
@@ -184,7 +184,7 @@ func TestUpdateChecksumListWithoutThePlatform(t *testing.T) {
 func TestUpdateProbeFailureKeepsTheOldBinary(t *testing.T) {
 	r := newReleaseServer(t, "v1.2.0", "new binary")
 	o, exe := r.opts(t, "v1.0.0")
-	o.Probe = func(context.Context, string) error { return fmt.Errorf("exec format error") }
+	o.Probe = func(context.Context, string) (string, error) { return "", fmt.Errorf("exec format error") }
 	if _, err := Update(context.Background(), o); err == nil || !strings.Contains(err.Error(), "does not start") {
 		t.Fatalf("%v", err)
 	}
@@ -295,5 +295,38 @@ func TestVerifiesWhatOpenSSLSigned(t *testing.T) {
 	}
 	if h, err := ChecksumFor(sums, "sbctl-linux-arm64"); err != nil || len(h) != 64 {
 		t.Fatalf("%q %v", h, err)
+	}
+}
+
+func TestUpdateRefusesAnOlderBinaryUnderANewerTag(t *testing.T) {
+	// An attacker who can publish a release attaches the signed assets of v1.0.0 to v9.0.0.
+	r := newReleaseServer(t, "v9.0.0", "old signed binary")
+	o, exe := r.opts(t, "v1.1.0")
+	o.Probe = func(context.Context, string) (string, error) { return "sbctl version v1.0.0\n", nil }
+	_, err := Update(context.Background(), o)
+	if err == nil || !strings.Contains(err.Error(), "refusing to install") || !strings.Contains(err.Error(), "downgrade") {
+		t.Fatalf("%v", err)
+	}
+	if read(t, exe) != "old binary" {
+		t.Fatal("the installed binary was replaced")
+	}
+	if entries, _ := filepath.Glob(filepath.Join(filepath.Dir(exe), ".sbctl.new-*")); len(entries) != 0 {
+		t.Fatalf("temporary file left behind: %v", entries)
+	}
+}
+
+func TestReportsVersion(t *testing.T) {
+	for _, tc := range []struct {
+		out, tag string
+		ok       bool
+	}{
+		{"sbctl version v1.2.3\n", "v1.2.3", true},
+		{"sbctl version v1.2.30", "v1.2.3", false},
+		{"sbctl version dev", "v1.2.3", false},
+		{"", "v1.2.3", false},
+	} {
+		if got := ReportsVersion(tc.out, tc.tag); got != tc.ok {
+			t.Errorf("%q vs %s: %v", tc.out, tc.tag, got)
+		}
 	}
 }

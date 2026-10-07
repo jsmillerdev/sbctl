@@ -134,3 +134,30 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
           fi
+
+  # Optional: copy the CloudFormation template to a public S3 object so the Quick-create link in
+  # deploy/README.md works. Runs only when the repository variables SBCTL_TEMPLATE_BUCKET and
+  # SBCTL_TEMPLATE_ROLE_ARN exist (an IAM role that trusts this repository's OIDC tokens and may
+  # s3:PutObject on the bucket). The bucket must allow public reads of its objects: CloudFormation
+  # fetches the template anonymously. Nothing is created by this workflow itself.
+  publish-template:
+    needs: publish
+    if: ${{ vars.SBCTL_TEMPLATE_BUCKET != '' && vars.SBCTL_TEMPLATE_ROLE_ARN != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.SBCTL_TEMPLATE_ROLE_ARN }}
+          aws-region: ${{ vars.SBCTL_TEMPLATE_REGION || 'us-east-1' }}
+      - name: upload sbctl.yaml
+        env:
+          BUCKET: ${{ vars.SBCTL_TEMPLATE_BUCKET }}
+        run: |
+          aws s3 cp deploy/cloudformation/sbctl.yaml "s3://$BUCKET/$GITHUB_REF_NAME/sbctl.yaml"
+          # `sbctl.yaml` at the top is what the README link names: only stable releases move it.
+          [[ "$GITHUB_REF_NAME" == *-* ]] || aws s3 cp deploy/cloudformation/sbctl.yaml "s3://$BUCKET/sbctl.yaml"

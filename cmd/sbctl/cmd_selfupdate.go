@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/selfupdate"
 )
 
@@ -24,6 +25,7 @@ func init() {
 		force     bool
 		noRestart bool
 		noUnits   bool
+		wait      time.Duration
 		apiBase   string
 		keyFile   string
 	)
@@ -35,8 +37,10 @@ func init() {
 into this binary, checks the binary against its checksum, replaces /usr/local/bin/sbctl
 atomically (the previous binary stays beside it as sbctl.prev), refreshes the systemd units
 with the new binary and restarts sbctl.service. Project units are not restarted: they
-belong to systemd and keep running. If sbctl.service does not come back within 30 seconds
-the previous binary is put back.
+belong to systemd and keep running. If the restarted daemon does not answer on its admin
+listener within --wait (default 2 minutes; the installer's readiness check, because systemd
+calls a daemon active the moment it forks), the previous binary is put back, the units are
+rendered again with it and the service is restarted.
 
 Needs root (the binary's directory is root's). Artifacts upgrade through versions.yaml,
 not through this command.`,
@@ -99,13 +103,13 @@ not through this command.`,
 				return nil
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "restarting sbctl.service (a restart waits for running operations, up to 10 minutes)")
-			if err := restartAndWait(cmd.Context()); err != nil {
+			cfg, _, cerr := readConfigFile(selfUpdateConfigPath())
+			if cerr != nil {
+				return cerr
+			}
+			if err := restartAndWait(cmd.Context(), cfg, wait); err != nil {
 				if res.Previous != "" {
-					fmt.Fprintf(cmd.ErrOrStderr(), "sbctl.service did not come back (%v); restoring the previous binary\n", err)
-					if rerr := os.Rename(res.Previous, exe); rerr != nil {
-						return fmt.Errorf("%w; and restoring %s failed: %v", err, res.Previous, rerr)
-					}
-					_ = exec.CommandContext(cmd.Context(), "systemctl", "restart", "sbctl.service").Run()
+					return rollback(cmd, exe, res.Previous, cfg, wait, err, noUnits)
 				}
 				return err
 			}
@@ -119,6 +123,7 @@ not through this command.`,
 	cmd.Flags().BoolVar(&force, "force", false, "install even when the release is not newer")
 	cmd.Flags().BoolVar(&noRestart, "no-restart", false, "do not restart sbctl.service")
 	cmd.Flags().BoolVar(&noUnits, "no-units", false, "do not refresh the systemd units")
+	cmd.Flags().DurationVar(&wait, "wait", 2*time.Minute, "how long the restarted daemon has to answer before the update is rolled back")
 	// For tests against a local release server and a throwaway key; a release build
 	// verifies against the key compiled into the binary.
 	cmd.Flags().StringVar(&apiBase, "api-base", "", "GitHub API root (tests)")
@@ -132,28 +137,46 @@ func serviceInstalled(ctx context.Context) bool {
 	return exec.CommandContext(ctx, "systemctl", "cat", "sbctl.service").Run() == nil
 }
 
-// restartAndWait restarts sbctl.service and waits up to 30 seconds for it to be active
-// and stay so for two seconds (a crash loop passes through "active" briefly).
-func restartAndWait(ctx context.Context) error {
+// selfUpdateConfigPath is the config file of the node: --config, SBCTL_CONFIG, or the default.
+func selfUpdateConfigPath() string {
+	if p := configPath; p != "" {
+		return p
+	}
+	if p := os.Getenv(config.EnvConfigPath); p != "" {
+		return p
+	}
+	return config.DefaultPath
+}
+
+// restartAndWait restarts sbctl.service and waits until the daemon answers on its admin
+// listener. Type=simple reports "active" at fork, and a daemon that dies later (the registry
+// wait, a listener that cannot bind) is restarted by systemd in a loop, so is-active proves
+// nothing; the installer's readiness probe does.
+func restartAndWait(ctx context.Context, cfg *config.Config, wait time.Duration) error {
 	if out, err := exec.CommandContext(ctx, "systemctl", "restart", "sbctl.service").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl restart: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	stable := 0
-	for time.Now().Before(deadline) {
-		out, _ := exec.CommandContext(ctx, "systemctl", "is-active", "sbctl.service").Output()
-		if strings.TrimSpace(string(out)) == "active" {
-			if stable++; stable >= 2 {
-				return nil
-			}
-		} else {
-			stable = 0
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
+	return waitDaemon(ctx, cfg, wait)
+}
+
+// rollback puts the previous binary back, re-renders the units with it (the new binary just
+// installed its own), restarts the service and checks that the old daemon answers.
+func rollback(cmd *cobra.Command, exe, prev string, cfg *config.Config, wait time.Duration, cause error, noUnits bool) error {
+	ctx := cmd.Context()
+	fmt.Fprintf(cmd.ErrOrStderr(), "sbctl.service did not come back (%v); restoring the previous binary\n", cause)
+	if rerr := os.Rename(prev, exe); rerr != nil {
+		return fmt.Errorf("%w; and restoring %s failed: %v", cause, prev, rerr)
+	}
+	if !noUnits {
+		c := exec.CommandContext(ctx, exe, "system", "install-units")
+		c.Stdout, c.Stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
+		if err := c.Run(); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: sbctl system install-units with the restored binary failed: %v\n", err)
 		}
 	}
-	return errors.New("sbctl.service is not active 30 seconds after the restart")
+	_ = exec.CommandContext(ctx, "systemctl", "reset-failed", "sbctl.service").Run()
+	if err := restartAndWait(ctx, cfg, wait); err != nil {
+		return fmt.Errorf("%w; the previous binary is back at %s but the service still does not answer: %v", cause, exe, err)
+	}
+	return fmt.Errorf("%w; rolled back to the previous binary, which is running", cause)
 }

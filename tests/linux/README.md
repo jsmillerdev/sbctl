@@ -1,6 +1,6 @@
 # tests/linux
 
-Scripts for an ephemeral Ubuntu 24.04 VM (22.04 and Debian 12 should work too) with systemd,
+Scripts for an ephemeral Ubuntu 24.04 VM (Debian 12 should work too; Ubuntu 22.04 cannot, its polkit ignores .rules files) with systemd,
 cgroup v2, sudo and network access. They create the `sbctl` user, install units under
 `/etc/systemd/system`, download the real artifacts and start real clusters. Do not run them
 on a machine you care about; development machines run the exec-backend tests instead

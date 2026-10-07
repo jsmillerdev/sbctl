@@ -4,7 +4,7 @@ How an sbctl node gets installed, claimed, updated and released.
 
 | Path | What |
 |---|---|
-| `install.sh` | The bootstrap for any Ubuntu 22.04+ or Debian 12+ server: host checks, release download with signature and checksum verification, then `sbctl install`. |
+| `install.sh` | The bootstrap for any Ubuntu 24.04+ or Debian 12+ server: host checks, release download with signature and checksum verification, then `sbctl install`. |
 | `release-assets.sh` | Signs a release (`SHA256SUMS`, `SHA256SUMS.sig`), stamps the public key into `install.sh`. Used by the release workflow and by the `install-e2e` job. |
 | `cloudformation/sbctl.yaml` | One-instance AWS stack. |
 | `systemd/` | The unit templates the binary embeds (`systemd/README.md`). |
@@ -22,18 +22,20 @@ curl -fsSL https://github.com/jsmillerdev/sbctl/releases/latest/download/install
 
 For a trial without a domain, leave `--domain` and `--dns` out: the node uses `<public ip>.sslip.io` and requests per-host certificates over HTTP-01.
 
-`install.sh` checks the host (Ubuntu 22.04+ or Debian 12+, amd64 or arm64, glibc 2.35+, systemd), downloads the release's `SHA256SUMS` and its signature, verifies the signature against the key stamped into the script, downloads `sbctl-linux-<arch>`, checks its SHA-256 against the signed list, installs it at `/usr/local/bin/sbctl` and runs `sbctl install` with your flags. A signature or checksum that does not match stops the install before anything is changed. The copy of `install.sh` in the repository has no key; the one attached to a release does. `--binary PATH` installs a file you built instead (nothing verifies it).
+`install.sh` checks the host (Ubuntu 24.04+ or Debian 12+, amd64 or arm64, glibc 2.35+, systemd; Ubuntu 22.04 is not supported because its polkit 0.105 ignores the JavaScript rule that lets the `sbctl` user manage its units), downloads the release's `SHA256SUMS` and its signature, verifies the signature against the key stamped into the script, downloads `sbctl-linux-<arch>`, checks its SHA-256 against the signed list, runs it with `--version` and refuses a binary that does not name the release tag (the signature covers the checksums, not the tag, so an older signed binary attached to a newer tag would otherwise be a downgrade), installs it at `/usr/local/bin/sbctl` and runs `sbctl install` with your flags. A signature or checksum that does not match stops the install before anything is changed. The copy of `install.sh` in the repository has no key; the one attached to a release does. `--binary PATH` installs a file you built instead (nothing verifies it).
 
 `sbctl install` then:
 
 1. creates the `sbctl` system user and the directories;
 2. writes `/etc/sbctl/config.toml` (mode 0600, owned by `sbctl`) with the settings you passed that differ from the defaults;
 3. installs the systemd units and the polkit rule (`sbctl system install-units`), and installs polkit when the host lacks it;
-4. opens TCP 80, 443, 5432 and 6543 in ufw when ufw is active (`--firewall ufw` installs, enables and configures it, SSH included; `--firewall none` leaves the host alone);
+4. opens TCP 80, 443, 5432 and 6543 in ufw when ufw is active (`--firewall ufw` installs, enables and configures it; the SSH ports come from what sshd or `ssh.socket` listens on, then `sshd -T` and `sshd_config.d`, then 22; `--firewall none` leaves the host alone);
 5. creates the system project: `sbctl system init` downloads the Postgres and auth artifacts, initializes the registry cluster and the dashboard GoTrue (sign-up disabled);
 6. starts the shared services (`sbctl fleet start`: postgres-meta, Supavisor, Realtime, Storage, and Studio when the release carries it);
 7. enables and starts `sbctl.service`, which starts the project units and the shared services again at every boot;
-8. prints the dashboard URL and, while nobody has claimed yet, the claim token.
+8. prints the dashboard URL and, while nobody has claimed yet, the claim token (or, with `--claim-token-file`, the file it is in).
+
+A re-run that carries a new binary (the installer swaps the file, as a new release does) restarts `sbctl.service` onto it; the daemon is compared with the installed file by content, so a re-run with the same release restarts nothing. Shared services and projects keep running.
 
 Run it again at any time. A flag you leave out keeps its value in `config.toml`; the master key, the registry and the projects are never touched; a re-run that changes nothing restarts nothing. To change one setting, repeat the command with that flag (for example `--email`). `sbctl install --print-config <flags>` shows the file a run would write without changing anything.
 
@@ -50,7 +52,7 @@ Run `sbctl install --help` for the full list. The ones most installs need:
 | `--public-ip` | Detected from the EC2 metadata service or `checkip.amazonaws.com` when omitted. |
 | `--tls off` | Plain HTTP on 80 and 443, for tests or behind a TLS terminator. |
 | `--set path=value` | Any `config.toml` setting, for example `--set ports.project_base=38000`. |
-| `--claim-token-file PATH` | Also write the token to a file (0600). |
+| `--claim-token-file PATH` | Write the token to a file (0600) and do not print it; the summary names the file. For unattended installs whose output is logged (the CloudFormation user data uses it). |
 
 ### DNS and TLS
 
@@ -94,7 +96,7 @@ sudo sbctl self-update --version v1.2.3
 sbctl self-update --check
 ```
 
-`self-update` fetches the release, verifies the ed25519 signature of `SHA256SUMS` against the public key compiled into the binary (`internal/selfupdate/release_key.pem`) and the binary against its checksum, replaces `/usr/local/bin/sbctl` with one rename (the previous binary stays as `sbctl.prev`), refreshes the units with the new binary and restarts `sbctl.service`. If the service is not active 30 seconds later the previous binary is put back. Project units keep running while the daemon restarts. Artifact versions move with `versions.yaml` inside a release, not through this command.
+`self-update` fetches the release, verifies the ed25519 signature of `SHA256SUMS` against the public key compiled into the binary (`internal/selfupdate/release_key.pem`) and the binary against its checksum, replaces `/usr/local/bin/sbctl` with one rename (the previous binary stays as `sbctl.prev`), refreshes the units with the new binary and restarts `sbctl.service`. Then it waits up to `--wait` (2 minutes) for the daemon to answer on its admin listener, the check the installer uses (a daemon can be `active` to systemd and still crash a moment later). If it does not answer, `self-update` puts the previous binary back, re-renders the units with it and restarts the service. Project units keep running while the daemon restarts. Artifact versions move with `versions.yaml` inside a release, not through this command.
 
 A binary built without a committed release key refuses to self-update (it names the missing key).
 
@@ -151,7 +153,9 @@ To rotate the key: generate a new pair, commit the new public file, replace the 
 - the claim: wrong token refused, claim works once and fails the second time, sign-in, an invite redeemed and removed;
 - a personal access token, a project created through `POST /v1/projects`, its keys, a table created through `database/query`, a REST call through the proxy with the publishable key, Storage through the proxy, pooler logins on 5432 and 6543;
 - a re-run changes nothing and restarts nothing, and a re-run with one flag changes that setting only;
-- `sbctl self-update` against a local release server: refuses a tampered binary and a wrong key, installs v0.0.2, restarts the daemon, leaves the project's Postgres running.
+- a re-run of `install.sh` with a v0.0.2 binary moves the daemon onto it (the daemon's `/proc/<pid>/exe` reports v0.0.2) without restarting shared services or projects;
+- `sbctl self-update` against a local release server: refuses a tampered binary, a wrong key and an older signed binary under a newer tag, installs v0.0.3, restarts the daemon, leaves the project's Postgres running; then a release whose daemon exits on `serve` is rolled back to v0.0.3, whose daemon answers again;
+- the claim token stays out of the installer's output when `--claim-token-file` is used.
 
 Go unit tests: `internal/selfupdate` (signature, checksum, atomic replace, refusals, an OpenSSL-made signature fixture), `internal/api/claim_test.go` (the endpoint, single use, expiry, rate limit, concurrent redemption, invites, user removal; the Postgres store runs when `SBCTL_TEST_DATABASE_URL` is set), `cmd/sbctl/cmd_install_test.go` (flag to config mapping, minimal config rendering, `--set`, OS and glibc checks, EC2 metadata).
 
@@ -161,4 +165,5 @@ Go unit tests: `internal/selfupdate` (signature, checksum, atomic replace, refus
 - `install.sh` resolves `latest` through a redirect of github.com and trusts TLS for that step only: the tag it gets is then used for signed files, so a wrong tag can only pick an older signed release.
 - The claim page is at `api.<domain>/claim`, not `studio.<domain>/claim`: the Studio host belongs to Studio.
 - No email: invites and the claim token are handed over out of band.
-- The AWS stack is unverified in AWS (see above), and the Quick-create link needs a published template.
+- The AWS stack is unverified in AWS (see above), and the Quick-create link needs a published template. `release.yml` has an optional `publish-template` job that uploads it when the repository variables `SBCTL_TEMPLATE_BUCKET` and `SBCTL_TEMPLATE_ROLE_ARN` are set; it is untested, and nothing sets those variables.
+- The instance role of the AWS stack is reachable from every process on the instance through IMDS. The tenant-facing units deny `169.254.169.254` (`deploy/systemd/README.md`, cloud metadata); Postgres (WAL archiving) and Storage with the S3 backend cannot, and workstream J must keep the rule on the edge runtime.

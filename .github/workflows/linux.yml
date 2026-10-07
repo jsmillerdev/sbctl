@@ -157,12 +157,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: build sbctl v0.0.1 and v0.0.2 (the self-update target)
+      - name: build sbctl v0.0.1, v0.0.2 (installer upgrade) and v0.0.3 (self-update target)
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/sbctl ./cmd/sbctl
           CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/sbctl-v2 ./cmd/sbctl
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.3" -o /tmp/sbctl-v3 ./cmd/sbctl
       - name: install end to end
-        run: sudo LOG_DIR=/tmp/sbctl-install-logs SBCTL_BIN=/tmp/sbctl SBCTL_BIN_V2=/tmp/sbctl-v2 tests/linux/install-e2e.sh
+        run: sudo LOG_DIR=/tmp/sbctl-install-logs SBCTL_BIN=/tmp/sbctl SBCTL_BIN_V2=/tmp/sbctl-v2 SBCTL_BIN_V3=/tmp/sbctl-v3 tests/linux/install-e2e.sh
       - if: always()
         name: collect logs
         run: sudo chmod -R a+rX /tmp/sbctl-install-logs || true

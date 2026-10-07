@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -30,7 +31,9 @@ type fakeGoTrue struct {
 	// failWith, when set, answers the next create with this status and error code.
 	failWith int
 	failCode string
-	auth     []string
+	// failDelete, when set, answers the next delete with a 500.
+	failDelete bool
+	auth       []string
 }
 
 func newFakeGoTrue(t *testing.T) *fakeGoTrue {
@@ -75,6 +78,11 @@ func newFakeGoTrue(t *testing.T) *fakeGoTrue {
 	mux.HandleFunc("DELETE /admin/users/{id}", func(w http.ResponseWriter, r *http.Request) {
 		g.mu.Lock()
 		defer g.mu.Unlock()
+		if g.failDelete {
+			g.failDelete = false
+			w.WriteHeader(500)
+			return
+		}
 		delete(g.users, r.PathValue("id"))
 		w.WriteHeader(200)
 		_, _ = io.WriteString(w, "{}")
@@ -129,9 +137,20 @@ func newClaimFixture(t *testing.T) *claimFixture {
 func (f *claimFixture) advance(d time.Duration) { f.nowM.Lock(); f.now = f.now.Add(d); f.nowM.Unlock() }
 
 func (f *claimFixture) post(body any) *httptest.ResponseRecorder {
+	return f.postFrom("", "", body)
+}
+
+// postFrom posts from a remote address (empty keeps httptest's 192.0.2.1) with an X-Forwarded-For.
+func (f *claimFixture) postFrom(remote, xff string, body any) *httptest.ResponseRecorder {
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest("POST", "/claim", strings.NewReader(string(b)))
 	req.Header.Set("Content-Type", "application/json")
+	if remote != "" {
+		req.RemoteAddr = remote
+	}
+	if xff != "" {
+		req.Header.Set("X-Forwarded-For", xff)
+	}
 	rec := httptest.NewRecorder()
 	f.srv.ServeHTTP(rec, req)
 	return rec
@@ -499,4 +518,84 @@ func TestPGClaimStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	testClaimStore(t, NewPGClaimStore(r.Pool()))
+}
+
+func TestClaimLimiterIsPerClient(t *testing.T) {
+	f := newClaimFixture(t)
+	junk := RedeemRequest{Token: "not-a-token", Password: goodPassword}
+	// One anonymous client sends junk until it is limited.
+	for i := 0; i < claimFailLimit; i++ {
+		if rec := f.postFrom("198.51.100.9:4000", "", junk); rec.Code != 403 {
+			t.Fatalf("junk %d: %d", i, rec.Code)
+		}
+	}
+	if rec := f.postFrom("198.51.100.9:4001", "", junk); rec.Code != 429 {
+		t.Fatalf("the noisy client was not limited: %d", rec.Code)
+	}
+	// The administrator, from another address, is not.
+	token, _, _ := f.acc.IssueClaimToken(context.Background(), 0, false)
+	if rec := f.postFrom("203.0.113.5:5000", "", RedeemRequest{Token: token, Email: "a@example.test", Password: goodPassword}); rec.Code != 201 {
+		t.Fatalf("a different client was locked out: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestClaimClientKey(t *testing.T) {
+	for _, tc := range []struct{ remote, xff, want string }{
+		{"203.0.113.5:1", "", "203.0.113.5"},
+		{"203.0.113.5:1", "10.9.9.9", "203.0.113.5"}, // not from our proxy: the header is the caller's
+		{"127.0.0.1:1", "198.51.100.7", "198.51.100.7"},
+		{"127.0.0.1:1", "1.2.3.4, 198.51.100.7", "198.51.100.7"}, // the last entry is the proxy's
+		{"[::1]:1", "2001:db8:1:2:3:4:5:6", "2001:db8:1:2::"},
+		{"127.0.0.1:1", "", "127.0.0.1"},
+	} {
+		r := httptest.NewRequest("POST", "/claim", nil)
+		r.RemoteAddr = tc.remote
+		if tc.xff != "" {
+			r.Header.Set("X-Forwarded-For", tc.xff)
+		}
+		if got := claimClient(r); got != tc.want {
+			t.Errorf("%s xff %q: %q, want %q", tc.remote, tc.xff, got, tc.want)
+		}
+	}
+}
+
+func TestClaimLimiterMemoryIsBounded(t *testing.T) {
+	var l claimLimiter
+	now := time.Now()
+	for i := 0; i < claimMaxClients+500; i++ {
+		l.fail(fmt.Sprintf("client-%d", i), now)
+	}
+	if len(l.clients) > claimMaxClients+1 {
+		t.Fatalf("%d tracked clients", len(l.clients))
+	}
+	if !l.blocked("*overflow*", now) {
+		t.Fatal("the shared overflow bucket did not collect the clients beyond the bound")
+	}
+}
+
+func TestRemoveUserDeletesTokensBeforeTheAccount(t *testing.T) {
+	f := newClaimFixture(t)
+	ctx := context.Background()
+	token, _, _ := f.acc.IssueClaimToken(ctx, 0, false)
+	var res RedeemResult
+	_ = json.Unmarshal(f.post(RedeemRequest{Token: token, Email: "a@example.test", Password: goodPassword}).Body.Bytes(), &res)
+	if err := f.reg.CreateAccessToken(ctx, &registry.AccessToken{UserID: res.UserID, Name: "t", Hash: secrets.HashToken(secrets.NewPAT()), Prefix: "sbp_x"}); err != nil {
+		t.Fatal(err)
+	}
+	f.gt.failDelete = true
+	if _, err := f.acc.RemoveUser(ctx, "a@example.test"); err == nil {
+		t.Fatal("a failed GoTrue delete was reported as success")
+	}
+	if ts, _ := f.reg.ListAccessTokens(ctx, res.UserID); len(ts) != 0 {
+		t.Fatalf("tokens of the account survived the attempt: %d", len(ts))
+	}
+	if us, _ := f.acc.ListUsers(ctx); len(us) != 1 {
+		t.Fatalf("the account must still be findable to retry: %+v", us)
+	}
+	if _, err := f.acc.RemoveUser(ctx, "a@example.test"); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if us, _ := f.acc.ListUsers(ctx); len(us) != 0 {
+		t.Fatalf("user left after the retry: %+v", us)
+	}
 }
