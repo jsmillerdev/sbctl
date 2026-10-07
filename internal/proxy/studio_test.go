@@ -1,9 +1,15 @@
 package proxy
 
 import (
+	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jsmillerdev/supavise/internal/notice"
 )
 
 func TestIncidentBannerIsAnsweredByTheProxy(t *testing.T) {
@@ -121,5 +127,78 @@ func TestDashboardAuthIsForwardedToTheSystemGoTrue(t *testing.T) {
 	// Traversal cannot step out of /auth/v1.
 	if resp, _ := h.req("GET", api, "/auth/v1/../../v1/projects"); resp.StatusCode != 404 {
 		t.Errorf("path traversal out of /auth/v1: %d, want 404", resp.StatusCode)
+	}
+}
+
+// While the operator has a window announced or an upgrade runs, the answer lists it as an
+// incident Studio shows to everyone; an available update never appears.
+func TestIncidentBannerShowsMaintenanceAndUpgrade(t *testing.T) {
+	h := newHarness(t)
+	now := time.Date(2026, 10, 12, 21, 0, 0, 0, time.UTC)
+	h.srv.noticeNow = func() time.Time { return now }
+	get := func() map[string]any {
+		t.Helper()
+		resp, body := h.req("GET", "studio."+testDomain, "/api/incident-banner")
+		if resp.StatusCode != 200 {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		var out map[string]any
+		if err := json.Unmarshal([]byte(body), &out); err != nil {
+			t.Fatalf("%v: %q", err, body)
+		}
+		return out
+	}
+	incidents := func() []any { return get()["incidents"].([]any) }
+
+	if len(incidents()) != 0 {
+		t.Fatal("a banner with nothing announced")
+	}
+	// An update that is merely available is not for the dashboard's users.
+	sysdir := filepath.Join(h.cfg.StateDir, "system")
+	if err := os.MkdirAll(sysdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysdir, "update.json"), []byte(`{"latest":"v9.9.9","available":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents()) != 0 {
+		t.Fatal("an available update reached the banner")
+	}
+
+	// Announced with the CLI's code path; the next request sees it, with no restart.
+	if _, err := notice.WriteMaintenance(h.cfg.Paths(), notice.Maintenance{Message: "Database maintenance", StartsAt: now.Add(-time.Minute), EndsAt: now.Add(time.Hour)}, now); err != nil {
+		t.Fatal(err)
+	}
+	got := incidents()
+	if len(got) != 1 {
+		t.Fatalf("%v", got)
+	}
+	inc := got[0].(map[string]any)
+	if inc["show_banner"] != "force" || inc["message"] != "Database maintenance" || !strings.HasPrefix(inc["id"].(string), "maintenance-") {
+		t.Errorf("%v", inc)
+	}
+
+	up, _ := json.Marshal(notice.Upgrade{Phase: "rollout", From: "v1.0.0", To: "v1.1.0", StartedAt: now.Add(-time.Minute)})
+	if err := os.WriteFile(filepath.Join(sysdir, "upgrade.json"), up, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents()) != 2 {
+		t.Errorf("maintenance and upgrade together: %v", incidents())
+	}
+
+	// Cleared and finished: back to nothing.
+	if _, err := notice.ClearMaintenance(h.cfg.Paths()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(sysdir, "upgrade.json")); err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents()) != 0 {
+		t.Errorf("%v", incidents())
+	}
+	// HEAD still answers 200 with no body, and the answer is never cached.
+	resp, body := h.req("HEAD", "studio."+testDomain, "/api/incident-banner")
+	if resp.StatusCode != 200 || body != "" || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("HEAD: %d %q %q", resp.StatusCode, body, resp.Header.Get("Cache-Control"))
 	}
 }
