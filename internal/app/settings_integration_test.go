@@ -502,6 +502,85 @@ func TestSettingsIntegration(t *testing.T) {
 		})
 	})
 
+	t.Run("pooler pool size and client limit", func(t *testing.T) {
+		// What Supavisor holds for the tenant, read from its own database in the system cluster.
+		tenant := func() (pool, maxClients, userPool int) {
+			t.Helper()
+			c, err := pgx.Connect(ctx, lifecycle.SystemSocketDSN(cfg, "_supavisor"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close(ctx)
+			if err := c.QueryRow(ctx, `select default_pool_size, default_max_clients from _supavisor.tenants where external_id = $1`, p.Ref).Scan(&pool, &maxClients); err != nil {
+				t.Fatalf("Supavisor's tenant %s: %v", p.Ref, err)
+			}
+			if err := c.QueryRow(ctx, `select pool_size from _supavisor.users where tenant_external_id = $1 and is_manager`, p.Ref).Scan(&userPool); err != nil {
+				t.Fatalf("Supavisor's manager user of %s: %v", p.Ref, err)
+			}
+			return pool, maxClients, userPool
+		}
+		login := func() error {
+			dsn := fmt.Sprintf("postgres://postgres.%s:%s@127.0.0.1:%d/postgres?sslmode=disable&default_query_exec_mode=simple_protocol", p.Ref, url.QueryEscape(keys.DBPassword), cfg.Ports.SupavisorSession)
+			c, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				return err
+			}
+			defer c.Close(ctx)
+			var one int
+			return c.QueryRow(ctx, "select 1").Scan(&one)
+		}
+		if pool, maxClients, userPool := tenant(); pool != 15 || userPool != 15 || maxClients != 1000 {
+			t.Fatalf("defaults in Supavisor: pool %d, manager pool %d, max clients %d", pool, userPool, maxClients)
+		}
+		if err := login(); err != nil {
+			t.Fatalf("pooler login before: %v", err)
+		}
+		var got struct {
+			DefaultPoolSize int    `json:"default_pool_size"`
+			PoolMode        string `json:"pool_mode"`
+		}
+		_ = json.Unmarshal(mustAPI("PATCH", cfgPath+"/config/database/pooler", map[string]any{"default_pool_size": 7, "pool_mode": "transaction"}), &got)
+		if got.DefaultPoolSize != 7 || got.PoolMode != "transaction" {
+			t.Fatalf("PATCH response: %+v", got)
+		}
+		if pool, maxClients, userPool := tenant(); pool != 7 || userPool != 7 || maxClients != 1000 {
+			t.Fatalf("after the v1 save: Supavisor has pool %d, manager pool %d, max clients %d", pool, userPool, maxClients)
+		}
+		mustAPI("PATCH", cfgPath+"/config/database/pooler", map[string]any{"max_client_conn": 321, "default_pool_size": 9}) // PATs only reach /v1; Studio's twin is covered by the API tests
+		if pool, maxClients, userPool := tenant(); pool != 9 || userPool != 9 || maxClients != 321 {
+			t.Fatalf("after the second save: Supavisor has pool %d, manager pool %d, max clients %d", pool, userPool, maxClients)
+		}
+		if err := login(); err != nil {
+			t.Fatalf("pooler login after the tenant was updated: %v", err)
+		}
+		var read []struct {
+			DefaultPoolSize int `json:"default_pool_size"`
+			MaxClientConn   int `json:"max_client_conn"`
+		}
+		_ = json.Unmarshal(mustAPI("GET", cfgPath+"/config/database/pooler", nil), &read)
+		if len(read) != 1 || read[0].DefaultPoolSize != 9 || read[0].MaxClientConn != 321 {
+			t.Fatalf("GET: %+v", read)
+		}
+		// What the pooler cannot do is refused, and Supavisor keeps what it had.
+		if code, out := api("PATCH", cfgPath+"/config/database/pooler", map[string]any{"pool_mode": "session"}); code != 400 {
+			t.Fatalf("pool_mode session: %d %s", code, out)
+		}
+		if code, out := api("PATCH", cfgPath+"/config/database/pooler", map[string]any{"ignore_startup_parameters": "options"}); code != 400 {
+			t.Fatalf("ignore_startup_parameters: %d %s", code, out)
+		}
+		if pool, maxClients, _ := tenant(); pool != 9 || maxClients != 321 {
+			t.Fatalf("a refused save changed Supavisor: pool %d, max clients %d", pool, maxClients)
+		}
+		// A reset returns both to the defaults.
+		mustAPI("PATCH", cfgPath+"/config/database/pooler", map[string]any{"default_pool_size": nil, "max_client_conn": nil})
+		if pool, maxClients, userPool := tenant(); pool != 15 || userPool != 15 || maxClients != 1000 {
+			t.Fatalf("after the reset: pool %d, manager pool %d, max clients %d", pool, userPool, maxClients)
+		}
+		if err := login(); err != nil {
+			t.Fatalf("pooler login after the reset: %v", err)
+		}
+	})
+
 	t.Run("api key revocation", func(t *testing.T) {
 		var created map[string]any
 		_ = json.Unmarshal(mustAPI("POST", cfgPath+"/api-keys", map[string]any{"type": "secret", "name": "ci"}), &created)

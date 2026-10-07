@@ -196,6 +196,24 @@ func RenderRealtime(set Values) RealtimeSettings {
 	return out
 }
 
+// PoolerSettings are the per-project Supavisor tenant settings; zero means the service's default.
+type PoolerSettings struct {
+	PoolSize   int
+	MaxClients int
+}
+
+// RenderPooler returns the saved Supavisor tenant settings.
+func RenderPooler(set Values) PoolerSettings {
+	var out PoolerSettings
+	if n, ok := set.Int("default_pool_size"); ok {
+		out.PoolSize = int(n)
+	}
+	if n, ok := set.Int("max_client_conn"); ok {
+		out.MaxClients = int(n)
+	}
+	return out
+}
+
 // The methods below are what the lifecycle engine reads when it renders units and tenants.
 
 // AuthEnv implements lifecycle's settings source: GoTrue's saved settings as environment.
@@ -246,6 +264,15 @@ func (m *Manager) RealtimeSettings(ctx context.Context, ref string) (RealtimeSet
 		return RealtimeSettings{}, err
 	}
 	return RenderRealtime(st.Set), nil
+}
+
+// PoolerSettings is the saved Supavisor tenant settings.
+func (m *Manager) PoolerSettings(ctx context.Context, ref string) (PoolerSettings, error) {
+	st, err := m.Get(ctx, ref, Pooler)
+	if err != nil {
+		return PoolerSettings{}, err
+	}
+	return RenderPooler(st.Set), nil
 }
 
 // Template returns the saved body of an email template ("invite", "magic_link", ...) and

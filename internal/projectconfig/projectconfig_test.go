@@ -326,6 +326,37 @@ func TestStorageAndRealtimeSettings(t *testing.T) {
 	wantInvalid(t, m, Realtime, map[string]any{"max_events_per_second": float64(0)}, "between")
 }
 
+func TestPoolerSettings(t *testing.T) {
+	m, _ := newManager(t)
+	ctx := context.Background()
+	if ps, _ := m.PoolerSettings(ctx, ref); ps != (PoolerSettings{}) {
+		t.Fatalf("nothing saved renders the service's defaults: %+v", ps)
+	}
+	st, _ := m.Get(ctx, ref, Pooler)
+	if pool, _ := st.Effective.Int("default_pool_size"); pool != 15 {
+		t.Fatalf("default pool size = %d", pool)
+	}
+	if n, _ := st.Effective.Int("max_client_conn"); n != 1000 {
+		t.Fatalf("default client limit = %d", n)
+	}
+	patch(t, m, Pooler, map[string]any{"default_pool_size": float64(40), "max_client_conn": float64(300)})
+	if ps, _ := m.PoolerSettings(ctx, ref); ps != (PoolerSettings{PoolSize: 40, MaxClients: 300}) {
+		t.Fatalf("saved: %+v", ps)
+	}
+	patch(t, m, Pooler, map[string]any{"default_pool_size": nil})
+	if ps, _ := m.PoolerSettings(ctx, ref); ps != (PoolerSettings{MaxClients: 300}) {
+		t.Fatalf("a null returns the pool size to its default: %+v", ps)
+	}
+	wantInvalid(t, m, Pooler, map[string]any{"default_pool_size": float64(0)}, "between")
+	wantInvalid(t, m, Pooler, map[string]any{"default_pool_size": float64(4951)}, "between")
+	wantInvalid(t, m, Pooler, map[string]any{"max_client_conn": float64(54001)}, "between")
+	wantInvalid(t, m, Pooler, map[string]any{"max_client_conn": 1.5}, "integer")
+	patch(t, m, Pooler, map[string]any{"pool_mode": "session"}) // not a setting of the pooler: ignored here, the API refuses it
+	if st, _ := m.Get(ctx, ref, Pooler); len(st.Set) != 1 {
+		t.Fatalf("an unknown key was stored: %v", st.Set)
+	}
+}
+
 func TestPostgresRules(t *testing.T) {
 	m, _ := newManager(t)
 	patch(t, m, Postgres, map[string]any{"statement_timeout": "30 s", "work_mem": "16MB", "log_connections": true, "max_connections": float64(80), "cron.log_statement": false})

@@ -244,6 +244,7 @@ func (s *Server) routesPlatformProject(add func(string, handlerFunc)) {
 	add("POST /platform/projects/{ref}/api-keys/temporary", s.temporaryKey)
 	add("GET /platform/database/{ref}/backups", s.platformBackups)
 	add("GET /platform/projects/{ref}/config/pgbouncer", s.pgbouncerConfig)
+	add("PATCH /platform/projects/{ref}/config/pgbouncer", s.patchPgbouncer)
 	add("GET /platform/projects/{ref}/config/supavisor", s.v1Pooler)
 }
 
@@ -255,8 +256,14 @@ func (s *Server) pgbouncerConfig(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	user := "postgres." + p.Ref
+	st, err := s.poolerState(r, p)
+	if err != nil {
+		return err
+	}
+	pool, maxClients := poolerValues(st)
 	resp := base("GET /platform/projects/{ref}/config/pgbouncer")
 	setAll(resp, map[string]any{
+		"default_pool_size": pool, "max_client_conn": maxClients, "ignore_startup_parameters": poolerIgnoredParams,
 		"connection_string": fmt.Sprintf("postgres://%s:[YOUR-PASSWORD]@%s:%d/postgres", user, s.cfg.PoolerHost(), s.cfg.Ports.SupavisorTransaction),
 		"db_dns_name":       s.cfg.PoolerHost(), "db_host": s.cfg.PoolerHost(), "db_name": "postgres",
 		"db_port": s.cfg.Ports.SupavisorTransaction, "db_user": user, "inserted_at": ts(p.CreatedAt),

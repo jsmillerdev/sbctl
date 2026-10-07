@@ -21,6 +21,9 @@ type Settings interface {
 	PostgresSettings(ctx context.Context, ref string) ([]string, error)
 	StorageSettings(ctx context.Context, ref string) (projectconfig.StorageSettings, error)
 	RealtimeSettings(ctx context.Context, ref string) (projectconfig.RealtimeSettings, error)
+	// PoolerSettings returns the saved pool size and client limit of the project's Supavisor
+	// tenant (zero: the service's default).
+	PoolerSettings(ctx context.Context, ref string) (projectconfig.PoolerSettings, error)
 }
 
 // cmdlineSettings are the settings the class puts on the postmaster's command line (and

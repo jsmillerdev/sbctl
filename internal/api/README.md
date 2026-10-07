@@ -45,7 +45,7 @@ registered in a second mux of a chain, tried in order.
 |---|---|
 | Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (the full branch API, served by `internal/branching`, see below); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`, `restart-services`; `POST /v1/projects/{ref}/restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/database/{ref}/backups` (empty) |
 | Keys | `/v1/projects/{ref}/api-keys`: list, create (publishable and secret keys with names; the secret is shown in full by the create and by `reveal=true`, masked otherwise), get, patch, delete (a revocation), `api-keys/legacy` get and put (`?enabled=`). See Settings and keys below |
-| Settings | `GET` and `PATCH /v1/projects/{ref}/config/auth` and `/platform/auth/{ref}/config` (+ `/hooks`), `/v1/projects/{ref}/postgrest` and `/platform/projects/{ref}/config/postgrest`, `config/realtime`, `config/storage` (v1 and platform), `GET` and `PUT /v1/projects/{ref}/config/database/postgres`, `GET /v2/projects/{ref}/config` (the document the CLI diffs), `PATCH /v1/projects/{ref}/database/password` and `/platform/projects/{ref}/db-password` |
+| Settings | `GET` and `PATCH /v1/projects/{ref}/config/auth` and `/platform/auth/{ref}/config` (+ `/hooks`), `/v1/projects/{ref}/postgrest` and `/platform/projects/{ref}/config/postgrest`, `config/realtime`, `config/storage` (v1 and platform), `GET` and `PUT /v1/projects/{ref}/config/database/postgres`, `GET` and `PATCH /v1/projects/{ref}/config/database/pooler` (and `/platform/projects/{ref}/config/pgbouncer`; `config/supavisor` is the read), `GET /v2/projects/{ref}/config` (the document the CLI diffs), `PATCH /v1/projects/{ref}/database/password` and `/platform/projects/{ref}/db-password` |
 | Database | `database/query`, `database/query/read-only` (rows as JSON; `parameters` supported), `database/migrations` list and apply (`supabase_migrations.schema_migrations`), `types/typescript` (pg-meta generator), `cli/login-role` create and delete, `advisors/*` (no lints yet) |
 | Functions and secrets | `functions` list, create, deploy (multipart), get, patch, delete, `body`; `secrets` list (digests), create, delete. Sources, bundles and sealed secrets are stored. Uploads: multipart sources (`POST .../functions/deploy`, `supabase functions deploy --use-api`, the CLI when Docker is not running, Studio's editor; where `Deps.Functions` is set the runtime serves bundles only, because a function run from source files could import other projects' files, so the hook's `api.SourceBundler` bundles the sources in a sandbox and they are stored together with the bundle (`.sbctl-bundle.ezbr`, `.sbctl-bundle.json`; answers: 400 with the bundler's output for broken code, 501 where the node cannot bundle, 429 when the queue is full); the sources stay readable through `.../body`) and bundles (`POST` create and `PATCH` update with `Content-Type: application/vnd.denoland.eszip` and a body of `EZBR` + Brotli, which is what plain `supabase functions deploy` sends; metadata in the query, `ezbr_sha256` checked, stored as the file `.sbctl-bundle.ezbr`; `functions_bundle.go`). `Deps.Functions` (`api.FunctionsHook`, `functions_hook.go`) is told after each change so `internal/functions` can put the files where the Edge Runtime reads them |
 | Identity | `/v1/profile`, `/platform/profile` (get, post, patch), `profile/permissions` and `permissions/v2` (computed from the caller's roles), `profile/access-tokens` (list, create, get, delete), `/platform/cli/login` and `/platform/cli/login/{session_id}` (device login) |
@@ -56,8 +56,26 @@ registered in a second mux of a chain, tried in order.
 | Auth admin | `/platform/auth/{ref}/users` (list, create, patch, delete), `invite`, `magiclink`, `otp`, `recover`, proxied to the project's GoTrue admin API with its `service_role` key |
 | Storage admin | `/platform/storage/{ref}/buckets` (list, create, get, patch, delete, empty) and `objects` (list, list-v2, move, copy, delete, sign, sign-multi), proxied to Storage with `x-forwarded-host: <ref>.api.<domain>`; `objects/public-url` (built here, after checking that the bucket is public); `credentials` (the project's S3 access keys, through Storage's admin API) |
 
-Everything else (billing, integrations, replication, log drains, network restrictions,
-Supavisor pool settings, ...) is a stub: it answers a valid empty value and changes nothing.
+Everything else (billing, integrations, replication, log drains, network restrictions, ...) is a stub: it answers a valid empty value and changes nothing.
+
+## Pooler config
+
+`GET /v1/projects/{ref}/config/database/pooler` (what the CLI diffs as `db.pooler.*`), `GET
+/platform/projects/{ref}/config/supavisor` and `config/pgbouncer` (what Studio's database settings page reads),
+and `/v2/projects/{ref}/config` report the project's `default_pool_size` (default 15) and `max_client_conn`
+(default 1000, Supavisor's `default_max_clients`) from the saved settings (`projectconfig.Pooler`).
+`PATCH /v1/projects/{ref}/config/database/pooler` (`default_pool_size`, `pool_mode`; `max_client_conn` is accepted
+too) and `PATCH /platform/projects/{ref}/config/pgbouncer` (Studio sends `default_pool_size` and the
+`ignore_startup_parameters` it was shown) save them and update the project's Supavisor tenant (`EnsureTenant`),
+which ends the tenant's pooled connections. A `null` returns a field to its default. The shared Supavisor cannot
+honor every field, so these are refused with 400 `{"message": ...}` and nothing is saved: `pool_mode` other than
+`transaction` (session mode is the other port, for every project), the PgBouncer settings `server_idle_timeout`,
+`server_lifetime`, `query_wait_timeout` and `reserve_pool_size`, `pgbouncer_enabled: false`, an
+`ignore_startup_parameters` that is neither empty nor the value the GET reports, a `default_pool_size` of 0
+(it would leave the tenant without a database connection) or over the route's limit (3000 on v1, 4950 on the platform route), and a
+`max_client_conn` outside 1 to 54000. A field that already has the value it would get is accepted, because the
+dashboard saves every field it was shown. Both PATCH routes need the permission to update project settings (Owner
+or Administrator).
 
 ## Settings and keys
 

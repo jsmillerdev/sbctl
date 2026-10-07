@@ -192,6 +192,8 @@ func TestSupavisorTenantLifecycle(t *testing.T) {
 	wantTenant := map[string]any{
 		"db_host": "127.0.0.1", "db_port": float64(20003), "db_database": "postgres", "require_user": false,
 		"auth_query": "SELECT * FROM pgbouncer.get_auth($1)", "upstream_ssl": false, "enforce_ssl": false, "default_pool_size": float64(15),
+		// sent even when nothing is saved: an update that omits it keeps a limit that was reset
+		"default_max_clients": float64(1000),
 	}
 	for key, want := range wantTenant {
 		if tenant[key] != want {

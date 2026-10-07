@@ -20,6 +20,7 @@ type fakeSettings struct {
 	pg         []string
 	storage    projectconfig.StorageSettings
 	realtime   projectconfig.RealtimeSettings
+	pooler     projectconfig.PoolerSettings
 	err        error
 }
 
@@ -37,6 +38,9 @@ func (f *fakeSettings) StorageSettings(context.Context, string) (projectconfig.S
 }
 func (f *fakeSettings) RealtimeSettings(context.Context, string) (projectconfig.RealtimeSettings, error) {
 	return f.realtime, f.err
+}
+func (f *fakeSettings) PoolerSettings(context.Context, string) (projectconfig.PoolerSettings, error) {
+	return f.pooler, f.err
 }
 
 func TestSavedSettingsAreRenderedIntoUnits(t *testing.T) {
@@ -180,6 +184,19 @@ func TestApplyConfigTouchesOnlyTheOwningService(t *testing.T) {
 	}
 	if len(rt.ensured) != 1 || rt.ensured[0].Storage.FileSizeLimit != 100<<20 {
 		t.Fatalf("storage tenant spec: %+v", rt.ensured)
+	}
+	// The pooler's pool size and client limit go to the Supavisor tenant, and are what a later
+	// EnsureTenant (a resume, a key rotation) sends too.
+	rt.ensured, cp.services = nil, nil
+	set.pooler = projectconfig.PoolerSettings{PoolSize: 40, MaxClients: 300}
+	if _, err := h.e.ApplyConfig(ctx, p.Ref, projectconfig.Pooler, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.ensured) != 1 || rt.ensured[0].PoolSize != 40 || rt.ensured[0].MaxClients != 300 {
+		t.Fatalf("pooler tenant spec: %+v", rt.ensured)
+	}
+	if len(cp.services) != 0 || len(cp.fakePlane.reconf) != 0 {
+		t.Fatalf("applying the pooler settings must not restart a unit: %v", cp.services)
 	}
 	cp.pending = true
 	res, err := h.e.ApplyConfig(ctx, p.Ref, projectconfig.Postgres, ApplyOptions{RestartDatabase: true})

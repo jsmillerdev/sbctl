@@ -81,7 +81,7 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 		err = cp.ReconfigureService(ctx, p, keys, config.SvcGoTrue)
 	case projectconfig.PostgREST:
 		err = cp.ReconfigureService(ctx, p, keys, config.SvcPostgREST)
-	case projectconfig.Realtime, projectconfig.Storage:
+	case projectconfig.Realtime, projectconfig.Storage, projectconfig.Pooler:
 		var spec fleet.TenantSpec
 		if spec, err = e.tenantSpec(ctx, p, keys); err == nil && len(e.opts.Fleet) > 0 {
 			err = e.opts.Fleet.EnsureTenant(ctx, spec)
@@ -107,7 +107,7 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 
 // applySavedSettings applies, once a resumed project's cluster answers, the settings that
 // were saved while it was paused and that no unit renders: the Postgres settings applied with
-// ALTER SYSTEM, and the Storage and Realtime tenant settings (the shared services keep
+// ALTER SYSTEM, and the Storage, Realtime and pooler tenant settings (the shared services keep
 // running while a project is paused, but a tenant is not touched while its database is down).
 // Auth and PostgREST need nothing here: Start rendered them. A failure is logged and recorded
 // as an event and does not undo the resume: the project is up, and saving the setting again
@@ -134,7 +134,7 @@ func (e *Engine) applySavedSettings(ctx context.Context, p *registry.Project, ke
 			err = e.opts.Fleet.EnsureTenant(ctx, spec)
 		}
 		if err != nil {
-			fail("storage and realtime settings", err)
+			fail("storage, realtime and pooler settings", err)
 		}
 	}
 }

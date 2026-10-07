@@ -38,6 +38,11 @@ func (s *Server) v2Config(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	poolSt, err := get(projectconfig.Pooler)
+	if err != nil {
+		return err
+	}
+	poolSize, poolMax := poolerValues(poolSt)
 
 	resp := base("GET /v2/projects/{ref}/config")
 	set(resp, "data.id", p.Ref)
@@ -81,10 +86,10 @@ func (s *Server) v2Config(w http.ResponseWriter, r *http.Request) error {
 		"data.attributes.database.major_version":           pgMajor(p),
 		"data.attributes.database.ssl_enforced":            false,
 		"data.attributes.database.postgres_settings":       settings,
-		"data.attributes.pooler.default_pool_size":         15,
-		"data.attributes.pooler.max_client_conn":           200,
-		"data.attributes.pooler.pool_mode":                 "transaction",
-		"data.attributes.pooler.ignore_startup_parameters": "extra_float_digits",
+		"data.attributes.pooler.default_pool_size":         poolSize,
+		"data.attributes.pooler.max_client_conn":           poolMax,
+		"data.attributes.pooler.pool_mode":                 poolerMode,
+		"data.attributes.pooler.ignore_startup_parameters": poolerIgnoredParams,
 	})
 	writeJSON(w, http.StatusOK, resp)
 	return nil

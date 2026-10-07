@@ -141,6 +141,8 @@ func matrixCases() []routeCase {
 		rc("YYNNNN", "PATCH", pp+"/config/postgrest", map[string]any{"max_rows": 500}),
 		rc("YYNNNN", "PUT", p+"/config/database/postgres", map[string]any{"max_connections": 60}),
 		rc("YYNNNN", "PATCH", p+"/postgrest", map[string]any{"max_rows": 500}),
+		rc("YYNNNN", "PATCH", p+"/config/database/pooler", map[string]any{"default_pool_size": 20}),
+		rc("YYNNNN", "PATCH", pp+"/config/pgbouncer", map[string]any{"default_pool_size": 20}),
 		rd("YYNNNN", "PATCH", p+"/database/password", map[string]any{"password": "a-new-database-password"}),
 		rc("YYNNNN", "POST", pp+"/disk", map[string]any{}), // a stub: unnamed project writes need the settings permission
 		rc("YYNNNN", "POST", p+"/upgrade", map[string]any{}),

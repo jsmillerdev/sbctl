@@ -43,6 +43,7 @@ func (s *Server) routesProjects(add func(string, handlerFunc)) {
 	add("POST /v1/projects/{ref}/restart", s.restartProject(http.StatusOK))
 	add("GET /v1/projects/{ref}/health", s.v1Health)
 	add("GET /v1/projects/{ref}/config/database/pooler", s.v1Pooler)
+	add("PATCH /v1/projects/{ref}/config/database/pooler", s.patchPoolerV1)
 
 	add("GET /platform/projects", s.platformListProjects)
 	add("POST /platform/projects", s.platformCreateProject)
@@ -468,8 +469,9 @@ func (s *Server) v1Health(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// v1Pooler describes the shared Supavisor entry of a project. The password is a
-// placeholder: it never leaves the secret store through this route.
+// v1Pooler describes the shared Supavisor entry of a project, with the pool size and client
+// limit saved for it (config_pooler.go). The password is a placeholder: it never leaves the
+// secret store through this route.
 func (s *Server) v1Pooler(w http.ResponseWriter, r *http.Request) error {
 	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
 	if err != nil {
@@ -477,8 +479,13 @@ func (s *Server) v1Pooler(w http.ResponseWriter, r *http.Request) error {
 	}
 	user := "postgres." + p.Ref
 	conn := fmt.Sprintf("postgres://%s:[YOUR-PASSWORD]@%s:%d/postgres", user, s.cfg.PoolerHost(), s.cfg.Ports.SupavisorTransaction)
-	mode := v1.SupavisorConfigResponseOutputPoolMode("transaction")
-	size, maxConn := 15, 200
+	mode := v1.SupavisorConfigResponseOutputPoolMode(poolerMode)
+	st, err := s.poolerState(r, p)
+	if err != nil {
+		return err
+	}
+	pool, maxClients := poolerValues(st)
+	size, maxConn := int(pool), int(maxClients)
 	writeJSON(w, http.StatusOK, []v1.SupavisorConfigResponseOutput{{
 		ConnectionString: conn, ConnectionStringSnake: conn, DatabaseType: "PRIMARY",
 		DbHost: s.cfg.PoolerHost(), DbName: "postgres", DbPort: s.cfg.Ports.SupavisorTransaction, DbUser: user,

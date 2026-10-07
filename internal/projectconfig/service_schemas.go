@@ -74,6 +74,18 @@ var RealtimeSchema = withResetStoresDefault(NewSchema(Realtime, []Field{
 
 func withResetStoresDefault(s *Schema) *Schema { s.ResetStoresDefault = true; return s }
 
+// PoolerSchema is the settings of a project's Supavisor tenant: the fields of the Management
+// API's pooler config (UpdateSupavisorConfigBody, UpdatePgbouncerConfigBody) that the shared
+// pooler can honor. The defaults are what the tenant runs without them: Supavisor's own pool
+// size (15, the default sent when nothing is saved) and its default_max_clients (1000). A pool
+// size of 0, which the specs allow, would leave the pooler with no connection to the database,
+// so the range starts at 1 and null returns the default. The limits are those of the larger
+// platform spec.
+var PoolerSchema = NewSchema(Pooler, []Field{
+	{Name: "default_pool_size", Kind: Int, Default: int64(15), Min: 1, Max: 4950, HasRange: true},
+	{Name: "max_client_conn", Kind: Int, Default: int64(1000), Min: 1, Max: 54000, HasRange: true},
+})
+
 // StorageSchema is the settings of a project's Storage tenant (UpdateStorageConfigBody).
 var StorageSchema = buildStorageSchema()
 
