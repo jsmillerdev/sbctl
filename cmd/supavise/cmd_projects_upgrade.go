@@ -238,10 +238,13 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 	_, stopRelay := app.StartWALRelay(ctx, n.Cfg, newLogger(n.Cfg), true, relayRefs...)
 	defer stopRelay()
 
-	// Smallest databases first: a canary that fails costs the least to put right.
-	sort.SliceStable(todo, func(i, j int) bool {
-		return diskBytes(ctx, n, todo[i].Project.Ref) < diskBytes(ctx, n, todo[j].Project.Ref)
-	})
+	// Smallest databases first: a canary that fails costs the least to put right. Each size is
+	// measured once (it walks the project's directory), not once per comparison.
+	size := make(map[string]int64, len(todo))
+	for _, r := range todo {
+		size[r.Project.Ref] = diskBytes(ctx, n, r.Project.Ref)
+	}
+	sort.SliceStable(todo, func(i, j int) bool { return size[todo[i].Project.Ref] < size[todo[j].Project.Ref] })
 	refs := make([]string, len(todo))
 	for i, r := range todo {
 		refs[i] = r.Project.Ref

@@ -21,6 +21,7 @@ import (
 //	POST /v1/projects/{ref}/upgrade               start (201 with a tracking id; the project is UPGRADING)
 //	GET  /v1/projects/{ref}/upgrade/status        the newest upgrade's progress, as Studio's upgrade screen reads it
 //	GET  /platform/projects/{ref}/service-versions  the versions the project's services run
+//	GET  /platform/projects/{ref}/disk            the disk the upgrade dialog reads (see projectDisk)
 //
 // target_version is Postgres's major version, as the spec's example shows ("17"), or the app
 // version the eligibility answer names. There is one target per node: the node's pins.
@@ -30,6 +31,7 @@ func (s *Server) routesUpgrade(add func(string, handlerFunc)) {
 	add("POST /v1/projects/{ref}/upgrade", s.upgradeProject)
 	add("GET /v1/projects/{ref}/upgrade/status", s.upgradeStatus)
 	add("GET /platform/projects/{ref}/service-versions", s.serviceVersions)
+	add("GET /platform/projects/{ref}/disk", s.projectDisk)
 }
 
 // upgradeTimeout bounds one upgrade, which includes its base backup (a large database takes
@@ -252,6 +254,27 @@ func (s *Server) serviceVersions(w http.ResponseWriter, r *http.Request) error {
 	set(resp, "gotrue", lifecycle.ShortVersion(config.SvcGoTrue, cur[config.SvcGoTrue]))
 	set(resp, "postgrest", lifecycle.ShortVersion(config.SvcPostgREST, cur[config.SvcPostgREST]))
 	set(resp, "supabase-postgres", lifecycle.ShortVersion(config.SvcPostgres, cur[config.SvcPostgres]))
+	writeJSON(w, http.StatusOK, resp)
+	return nil
+}
+
+// includedDiskGB is the disk size Studio treats as the plan's own for an enterprise
+// organization on gp3 (PLAN_DETAILS in DiskManagement.constants).
+const includedDiskGB = 8
+
+// projectDisk answers the disk call of Studio's "Upgrade project" dialog. The dialog adds
+// "Your current disk size of NGB will also be right-sized with the upgrade" whenever the disk
+// differs from the plan's included size. A project here has no provisioned volume and an upgrade
+// never resizes anything, so the answer is the included size and the note stays out.
+func (s *Server) projectDisk(w http.ResponseWriter, r *http.Request) error {
+	if _, err := s.loadProject(r.Context(), r.PathValue("ref")); err != nil {
+		return err
+	}
+	resp := base("GET /platform/projects/{ref}/disk")
+	set(resp, "attributes", map[string]any{
+		"type": "gp3", "size_gb": includedDiskGB, "iops": 3000,
+		"throughput_mbps": 125, "throughput_mibps": 125,
+	})
 	writeJSON(w, http.StatusOK, resp)
 	return nil
 }

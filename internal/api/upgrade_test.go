@@ -217,6 +217,33 @@ func TestUpgradeEligibilityAndServiceVersions(t *testing.T) {
 	}
 }
 
+// Studio renders the upgrade alert, the validation errors and the warnings of the Service
+// versions section only when project_settings:database_upgrades is enabled, and its upgrade
+// dialog prints a "right-sized" disk note unless the disk call returns the plan's included size.
+func TestStudioCanOfferTheUpgrade(t *testing.T) {
+	f := newUpgradeFixture(t)
+	rec := f.do("GET", "/platform/profile", nil)
+	if rec.Code != 200 {
+		t.Fatalf("profile = %d", rec.Code)
+	}
+	var prof struct {
+		Disabled []string `json:"disabled_features"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &prof); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range prof.Disabled {
+		if d == "project_settings:database_upgrades" {
+			t.Fatalf("disabled_features hides the upgrade section: %v", prof.Disabled)
+		}
+	}
+	disk := upJSON(t, f.fixture, "GET", "/platform/projects/"+testRef+"/disk", nil, 200, "GET /platform/projects/{ref}/disk")
+	attrs, _ := disk["attributes"].(map[string]any)
+	if attrs["type"] != "gp3" || attrs["size_gb"] != float64(includedDiskGB) {
+		t.Fatalf("disk attributes = %v, want the plan's included gp3 size so Studio prints no right-sizing note", attrs)
+	}
+}
+
 func TestUpgradeThroughTheAPI(t *testing.T) {
 	f := newUpgradeFixture(t)
 	const p = "/v1/projects/" + testRef

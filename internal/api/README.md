@@ -718,7 +718,13 @@ node's pins move with a Supavise release. Studio shows the project's versions in
 "Service versions" (`GET /platform/projects/{ref}/service-versions`: `gotrue`, `postgrest`,
 `supabase-postgres`, as release tags without the service prefix, for example `v2.195.0-r1`), and
 offers "Upgrade project" when the eligibility answer says `eligible`. Studio places this section
-on the General page, not on Infrastructure. Routes and rules (`upgrade.go`, `internal/lifecycle/upgrade.go`):
+on the General page, not on Infrastructure. The section (the alert, the validation errors and the
+warnings) renders only while the profile does not list `project_settings:database_upgrades` in
+`disabled_features`, so the list leaves it out (`TestStudioCanOfferTheUpgrade`). The upgrade dialog
+also reads `GET /platform/projects/{ref}/disk` and prints "Your current disk size of NGB will also be
+right-sized" unless `size_gb` equals the plan's included size (8 for an enterprise organization on
+gp3), so that call answers 8 GB gp3; a project has no provisioned volume and an upgrade resizes
+nothing. Routes and rules (`upgrade.go`, `internal/lifecycle/upgrade.go`):
 
 - `GET .../upgrade/eligibility`: `current_app_version` and `latest_app_version` are
   `supabase-<postgres release tag>` (Studio shows what follows `supabase-postgres-`),
