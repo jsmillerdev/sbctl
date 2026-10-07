@@ -41,6 +41,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	cfg := config.Default()
 	cfg.StateDir = filepath.Join(root, "state")
 	cfg.BinPath = "/usr/local/bin/sbctl"
+	cfg.Backup.WALRelay = "off" // relay_test.go covers the relay forms
 	sec, err := secrets.New(make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)

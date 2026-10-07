@@ -56,6 +56,7 @@ func testKeys(t *testing.T, ref string) *secrets.ProjectKeys {
 
 func TestPostgresSpec(t *testing.T) {
 	pl, cfg := testPlane(t)
+	cfg.Backup.WALRelay = "off" // TestPostgresSpecArchivesThroughTheRelay covers the relay form
 	p := testProject(cfg, "abcdefghijklmnopqrst", 2)
 	keys := testKeys(t, p.Ref)
 	spec, err := pl.postgresSpec(p, keys)
@@ -111,6 +112,39 @@ func TestPostgresSpec(t *testing.T) {
 	p.Class = "bogus"
 	if _, err := pl.postgresSpec(p, keys); err == nil {
 		t.Fatal("unknown class accepted")
+	}
+}
+
+// On a systemd node the cluster archives through the daemon's relay socket and its unit gets
+// neither the config file nor SBCTL_CONFIG.
+func TestPostgresSpecArchivesThroughTheRelay(t *testing.T) {
+	pl, cfg := testPlane(t)
+	cfg.Backup.WALRelay = "on"
+	pl.opts.ConfigPath = "/etc/sbctl/config.toml"
+	p := testProject(cfg, "abcdefghijklmnopqrst", 2)
+	spec, err := pl.postgresSpec(p, testKeys(t, p.Ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(spec.Exec, " ")
+	want := "archive_command='/usr/local/bin/sbctl' wal push --ref abcdefghijklmnopqrst --socket '" + cfg.Paths().WALSocket(p.Ref) + "' %p"
+	if !strings.Contains(args, want) {
+		t.Fatalf("args lack %q:\n%s", want, args)
+	}
+	if _, ok := spec.Env["SBCTL_CONFIG"]; ok {
+		t.Fatal("SBCTL_CONFIG is exported although the cluster archives through the relay and cannot read the config")
+	}
+	// prepare creates the relay directory before the cluster starts, and tells the daemon.
+	var ready []string
+	pl.opts.ArchiveReady = func(ref string) { ready = append(ready, ref) }
+	if err := pl.prepare(p, testKeys(t, p.Ref)); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(cfg.Paths().WALDir(p.Ref)); err != nil || !fi.IsDir() {
+		t.Fatalf("no relay directory: %v", err)
+	}
+	if len(ready) != 1 || ready[0] != p.Ref {
+		t.Fatalf("ArchiveReady calls = %v", ready)
 	}
 }
 

@@ -84,6 +84,18 @@ ExecStart=%s backups prune %%i
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
+# The same uid runs every unit, and a process may read /proc/<pid>/environ and /proc/<pid>/root of
+# another process of its uid unless that process has capabilities the reader lacks. These units read
+# the master key and the backend credentials, so they hold one harmless capability in their permitted
+# set (sbctl.service does the same); the sb-* units that run tenant code have none (deploy/systemd/README.md).
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Mount allowlist: the unit sees the registry's socket, this project's data directory (read-only)
+# and WAL socket directory, and the file backend's directory (no effect on S3), not other projects'
+# data directories, environment files or functions.
+TemporaryFileSystem=/var/lib/sbctl:ro
+BindReadOnlyPaths=/var/lib/sbctl/projects/system/postgres/sock /var/lib/sbctl/projects/%%i/postgres
+BindPaths=-/var/lib/sbctl/projects/%%i/wal -/var/lib/sbctl/backups
 `, config.Slice, EnvFile, bin, bin)
 }
 
@@ -138,6 +150,16 @@ ExecStart=%s backups prune
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
+# The same uid runs every unit, and a process may read /proc/<pid>/environ and /proc/<pid>/root of
+# another process of its uid unless that process has capabilities the reader lacks. These units read
+# the master key and the backend credentials, so they hold one harmless capability in their permitted
+# set (sbctl.service does the same); the sb-* units that run tenant code have none (deploy/systemd/README.md).
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Mount allowlist: the registry's socket and the file backend's directory, no project directory.
+TemporaryFileSystem=/var/lib/sbctl:ro
+BindReadOnlyPaths=/var/lib/sbctl/projects/system/postgres/sock
+BindPaths=-/var/lib/sbctl/backups
 `, config.Slice, EnvFile, unitExec(binPath))
 }
 

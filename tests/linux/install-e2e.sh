@@ -15,6 +15,7 @@
 #
 # Do not run it on a machine you care about: it creates the sbctl user, writes /etc/sbctl,
 # installs units and starts real clusters. Exit status is non-zero on the first failure.
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 E2E_STUDIO=${E2E_STUDIO:-1}
@@ -37,7 +38,7 @@ trap cleanup EXIT
 need_root
 preflight
 ARCH=$(dpkg --print-architecture)
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 if [[ -z $SBCTL_BIN ]]; then
   command -v go >/dev/null || fail "no SBCTL_BIN and no go toolchain"
@@ -60,7 +61,7 @@ jq_() { python3 -c 'import json,sys; d=json.load(sys.stdin); print('"$1"')'; }
 log "static checks"
 bash -n deploy/install.sh deploy/release-assets.sh tests/linux/install-e2e.sh
 if command -v shellcheck >/dev/null; then
-  shellcheck -S warning deploy/install.sh deploy/release-assets.sh
+  shellcheck -x -S warning deploy/install.sh deploy/release-assets.sh tests/linux/install-e2e.sh
 else
   log "shellcheck is not installed; skipped"
 fi
@@ -193,6 +194,13 @@ for p in 7000 5433 9999; do
   ss -ltnH "sport = :$p" | awk '{print $4}' | grep -q "^127.0.0.1:$p$" || fail "port $p is not loopback only"
 done
 
+log "re-running the installer before anyone has claimed keeps the claim token (it would otherwise be revoked behind the back of whatever stored it)"
+deploy/install.sh --binary "$SBCTL_BIN" --claim-token-file "$WORK/claim-token-rerun" 2>&1 | tee "$WORK/install-preclaim.log"
+[[ ${PIPESTATUS[0]} -eq 0 ]] || fail "the re-run before the claim failed"
+[[ ! -s "$WORK/claim-token-rerun" ]] || fail "the re-run before the claim issued a second claim token"
+grep -q "claim token from an earlier run is still valid" "$WORK/install-preclaim.log" || fail "the re-run did not say that the earlier claim token is still valid"
+grep -q "$TOKEN" "$WORK/install-preclaim.log" && fail "the re-run printed the claim token"
+
 log "dashboard through the proxy"
 [[ $(code -H "Host: studio.$BASE" http://127.0.0.1/api/incident-banner) == 200 ]] || fail "studio host: the proxy does not answer its banner route"
 if [[ $E2E_STUDIO == 1 ]]; then
@@ -233,8 +241,21 @@ INVITE=$(sbctl users invite invitee@example.com 2>/dev/null)
 [[ $INVITE =~ ^sbi_[0-9a-f]{48}$ ]] || fail "invite token: $INVITE"
 [[ $(api POST /claim -H 'Content-Type: application/json' -d "{\"token\":\"$INVITE\",\"password\":\"$ADMIN_PASSWORD\"}" -o "$WORK/inv.json" -w '%{http_code}') == 201 ]] || { cat "$WORK/inv.json" >&2; fail "redeeming the invite"; }
 sbctl users list | grep invitee@example.com >/dev/null || fail "the invited user is not listed"
+# The invitee signs in and makes a personal access token; `users remove` must end both at once.
+INV_JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
+  -d "{\"email\":\"invitee@example.com\",\"password\":\"$ADMIN_PASSWORD\"}" | jq_ 'd["access_token"]') || fail "the invitee cannot sign in"
+INV_PAT=$(api POST /platform/profile/access-tokens -H "Authorization: Bearer $INV_JWT" -H 'Content-Type: application/json' -d '{"name":"invitee"}' | jq_ 'd["token"]') \
+  || fail "the invitee cannot create a personal access token"
+[[ $(api GET /platform/profile -H "Authorization: Bearer $INV_JWT" -o /dev/null -w '%{http_code}') == 200 ]] || fail "the invitee's session is refused before the removal"
+[[ $(api GET /v1/organizations -H "Authorization: Bearer $INV_PAT" -o /dev/null -w '%{http_code}') == 200 ]] || fail "the invitee's token is refused before the removal"
 sbctl users remove invitee@example.com | grep removed >/dev/null || fail "users remove"
 if sbctl users list | grep invitee@example.com >/dev/null; then fail "the removed user is still listed"; fi
+[[ $(api GET /platform/profile -H "Authorization: Bearer $INV_JWT" -o /dev/null -w '%{http_code}') == 401 ]] || fail "the removed user's session still works (it is valid for an hour)"
+[[ $(api GET /v1/organizations -H "Authorization: Bearer $INV_PAT" -o /dev/null -w '%{http_code}') == 401 ]] || fail "the removed user's personal access token still works"
+[[ $(api POST /platform/profile/access-tokens -H "Authorization: Bearer $INV_JWT" -H 'Content-Type: application/json' -d '{"name":"after"}' -o /dev/null -w '%{http_code}') == 401 ]] \
+  || fail "the removed user's session can still mint a personal access token"
+[[ $(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
+  -d "{\"email\":\"invitee@example.com\",\"password\":\"$ADMIN_PASSWORD\"}" -o /dev/null -w '%{http_code}') =~ ^4 ]] || fail "the removed user can still sign in at GoTrue"
 
 # ---- 5. a project through the API with a PAT ---------------------------------------------
 log "personal access token"

@@ -7,7 +7,13 @@ name: release
 # One-time setup (deploy/README.md, "Release signing"):
 #   openssl genpkey -algorithm ed25519 -out sbctl-signing.pem
 #   openssl pkey -in sbctl-signing.pem -pubout -out internal/selfupdate/release_key.pem   # commit this file
-#   gh secret set SBCTL_SIGNING_KEY < sbctl-signing.pem                                   # then delete the file
+#   gh secret set SBCTL_SIGNING_KEY --env release < sbctl-signing.pem                     # then delete the file
+#
+# The key lives in an Environment, not in a repository secret: a repository secret is readable by
+# any workflow run that someone with write access starts from any branch, and this key is the
+# root of trust for self-update and install.sh on every node. Create the Environment "release" in
+# the repository settings with a deployment rule that admits only the tags v* (and, optionally, a
+# required reviewer); the jobs below that read the key name it with `environment: release`.
 on:
   push:
     tags: ["v*"]
@@ -22,6 +28,7 @@ defaults:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    environment: release
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +41,7 @@ jobs:
         run: |
           openssl pkey -pubin -in internal/selfupdate/release_key.pem -noout 2>/dev/null \
             || { echo "internal/selfupdate/release_key.pem is not a public key: see deploy/README.md, Release signing"; exit 1; }
-          [[ -n "$SBCTL_SIGNING_KEY" ]] || { echo "the repository secret SBCTL_SIGNING_KEY is not set: see deploy/README.md, Release signing"; exit 1; }
+          [[ -n "$SBCTL_SIGNING_KEY" ]] || { echo "the secret SBCTL_SIGNING_KEY of the Environment release is not set: see deploy/README.md, Release signing"; exit 1; }
           umask 077
           printf '%s\n' "$SBCTL_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
           a=$(openssl pkey -in "$RUNNER_TEMP/sign.pem" -pubout -outform DER | openssl dgst -sha256)
@@ -101,6 +108,7 @@ jobs:
   publish:
     needs: [binaries, studio]
     runs-on: ubuntu-24.04
+    environment: release
     timeout-minutes: 20
     permissions:
       contents: write   # create the release and attach the assets

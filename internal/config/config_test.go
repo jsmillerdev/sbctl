@@ -127,3 +127,29 @@ func TestRegion(t *testing.T) {
 		t.Errorf("empty region: %v %q", err, empty.Region)
 	}
 }
+
+// A direct `sbctl wal push` cannot work inside a systemd Postgres unit (no /etc/sbctl, no
+// backups directory), so wal_relay = "off" is refused there and still allowed under exec.
+func TestWALRelayOffNeedsExecSupervisor(t *testing.T) {
+	for _, tc := range []struct {
+		supervisor, relay string
+		ok                bool
+	}{
+		{SupervisorSystemd, "off", false},
+		{SupervisorSystemd, "on", true},
+		{SupervisorSystemd, "auto", true},
+		{SupervisorSystemd, "", true},
+		{SupervisorExec, "off", true},
+		{SupervisorExec, "on", true},
+	} {
+		t.Setenv("SBCTL_SUPERVISOR", tc.supervisor)
+		t.Setenv("SBCTL_BACKUP_WAL_RELAY", tc.relay)
+		_, err := Load(filepath.Join(t.TempDir(), "absent.toml"))
+		if tc.ok && err != nil {
+			t.Errorf("%s/%q: %v", tc.supervisor, tc.relay, err)
+		}
+		if !tc.ok && (err == nil || !strings.Contains(err.Error(), "wal_relay")) {
+			t.Errorf("%s/%q: want a wal_relay error, got %v", tc.supervisor, tc.relay, err)
+		}
+	}
+}

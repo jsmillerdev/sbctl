@@ -43,8 +43,9 @@ RestrictNamespaces=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# The EC2 instance role (backup bucket, DNS) must not reach tenant-facing code through IMDS.
-IPAddressDeny=169.254.169.254
+# The EC2 instance role (backup bucket, DNS) must not reach tenant-facing code through the
+# instance metadata service (IPv4 and IPv6 addresses). Only sbctl.service holds credentials.
+IPAddressDeny=169.254.169.254 fd00:ec2::254
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0027
@@ -55,7 +56,7 @@ ReadWritePaths=/var/lib/sbctl/projects/%i/gotrue
 # launcher script (read-only) and its own state directory. It never needs to read an
 # environment file: systemd reads EnvironmentFile= before it builds the namespace. This
 # does not isolate tenants from a compromised service (same uid, /proc); see README.md.
-InaccessiblePaths=-/etc/sbctl
+InaccessiblePaths=-/etc/sbctl -/run/dbus
 TemporaryFileSystem=/var/lib/sbctl:ro
 BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/%i/gotrue.run
 BindPaths=/var/lib/sbctl/projects/%i/gotrue

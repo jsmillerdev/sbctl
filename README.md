@@ -35,10 +35,13 @@ commit; `config.Regions` copies it): Studio resolves it against that table and t
 on anything else, including real AWS regions such as `eu-south-1` (a project created with another
 label gets this value).
 
-Every project's Postgres can read `/etc/sbctl/config.toml` (`archive_command` runs `sbctl wal push`
-inside the unit), so `backup.s3_secret_access_key` and `tls.credentials` in that file are readable by
-the tenants' clusters. Prefer an instance profile for S3 and HTTP-01 over DNS-01 where tenants run
-untrusted code; see `deploy/systemd/README.md`.
+No project's units read `/etc/sbctl` or the backups: a cluster's `archive_command` and
+`restore_command` talk to the daemon over a unix socket in the project's own directory
+(`[backup] wal_relay`, on under systemd), and the daemon holds the backup credentials; every `sb-*`
+unit is denied the cloud instance metadata service, so the EC2 instance role is out of reach of SQL,
+`pg_net` and the like. What the per-unit sandbox does and does not isolate (same uid, `/proc`) is
+spelled out in `deploy/systemd/README.md`; do not take it for a boundary against code execution
+inside a unit.
 
 `sbctl serve` is the daemon that `sbctl.service` runs. On SIGTERM it refuses new lifecycle
 operations (503) and waits up to 10 minutes for running ones (a delete with its final backup, a

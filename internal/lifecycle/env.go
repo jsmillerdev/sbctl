@@ -50,9 +50,15 @@ func (pl *PostgresPlane) archiveCommand(ref string) string {
 		return c
 	}
 	// Fallback for callers that did not wire the backup package (lifecycle cannot import
-	// it): the same quoting rules as backup.ArchiveCommand, which the daemon and the CLI
-	// install through PlaneOptions.ArchiveCommandFor.
-	return fmt.Sprintf("'%s' wal push --ref %s %%p", strings.ReplaceAll(strings.ReplaceAll(pl.cfg.BinPath, "%", "%%"), "'", `'\''`), ref)
+	// it): the same forms and quoting rules as backup.ArchiveCommandFor, which the daemon and
+	// the CLI install through PlaneOptions.ArchiveCommandFor.
+	q := func(s string) string {
+		return "'" + strings.ReplaceAll(strings.ReplaceAll(s, "%", "%%"), "'", `'\''`) + "'"
+	}
+	if pl.cfg.WALRelayEnabled() {
+		return fmt.Sprintf("%s wal push --ref %s --socket %s %%p", q(pl.cfg.BinPath), ref, q(pl.cfg.Paths().WALSocket(ref)))
+	}
+	return fmt.Sprintf("%s wal push --ref %s %%p", q(pl.cfg.BinPath), ref)
 }
 
 func (pl *PostgresPlane) archiveTimeout() int {
@@ -118,7 +124,7 @@ func (pl *PostgresPlane) postgresSpec(p *registry.Project, keys *secrets.Project
 		// for the life of the cluster.
 		env["POSTGRES_PASSWORD"] = keys.AdminPassword
 	}
-	if pl.opts.ConfigPath != "" {
+	if pl.opts.ConfigPath != "" && !pl.cfg.WALRelayEnabled() {
 		env["SBCTL_CONFIG"] = pl.opts.ConfigPath
 	}
 	return units.Spec{

@@ -40,9 +40,10 @@ Later users come by invitation: ` + "`sbctl users invite <email>`" + `.`,
 	}
 
 	var (
-		ttl   time.Duration
-		force bool
-		file  string
+		ttl    time.Duration
+		force  bool
+		ifNone bool
+		file   string
 	)
 	token := &cobra.Command{
 		Use:   "token",
@@ -58,6 +59,18 @@ file readable only by its owner.`,
 				return err
 			}
 			defer closeFn()
+			if ifNone {
+				live, err := acc.HasLiveClaimToken(cmd.Context())
+				if err != nil {
+					return err
+				}
+				if live {
+					// Nothing on stdout: the earlier token cannot be shown again, and replacing it
+					// would break whatever stored it (a re-run of the installer, a secret).
+					fmt.Fprintln(cmd.ErrOrStderr(), "A claim token that nobody has used and that has not expired exists; none was issued.")
+					return nil
+				}
+			}
 			tok, exp, err := acc.IssueClaimToken(cmd.Context(), ttl, force)
 			if err != nil {
 				return err
@@ -74,6 +87,7 @@ file readable only by its owner.`,
 	}
 	token.Flags().DurationVar(&ttl, "ttl", api.DefaultClaimTTL, "how long the token stays valid")
 	token.Flags().BoolVar(&force, "force", false, "issue a token although the first administrator already exists")
+	token.Flags().BoolVar(&ifNone, "if-none", false, "issue nothing (and print nothing) while an unused, unexpired claim token exists")
 	token.Flags().StringVar(&file, "file", "", "also write the token to this file (mode 0600)")
 
 	status := &cobra.Command{

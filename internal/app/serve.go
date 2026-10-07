@@ -43,15 +43,27 @@ var registryWait = 2 * time.Minute
 // Project units are systemd's, not the daemon's: stopping Serve leaves them running.
 func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	log := o.log()
+	// The WAL relay is the only holder of the backup credentials that clusters archive
+	// through (backup.Relay). It starts before the node opens, because the system cluster
+	// archives too and the daemon may wait for it to be reachable, and it stops after the
+	// drain: a delete's final base backup needs WAL archived until the very end.
+	if relay, stop := StartWALRelay(ctx, cfg, log, false); relay != nil {
+		defer stop()
+		o.ArchiveReady = func(ref string) {
+			if err := relay.Ensure(ref); err != nil {
+				log.Warn("wal relay: cannot serve project", "ref", ref, "error", err)
+			}
+		}
+	}
 	lo := LifecycleOptions(cfg, o)
 	// Without a Fleet from the caller the Engine registers projects with Supavisor,
 	// Realtime and Storage through a Lazy fleet (credentials loaded on first use, a
 	// service this node never rendered skipped), so a project created through the API
 	// reaches the shared services exactly as one created by `sbctl projects create`.
-	var lz *fleet.Lazy
+	bindFleet := o.BindFleet
 	if len(o.Fleet) == 0 {
-		lz = fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
-		lo.Fleet = lz.Fleet()
+		lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
+		lo.Fleet, bindFleet = lz.Fleet(), lz.Bind
 	}
 	backups := memoizeBackups(&lo)
 	node, err := openNode(ctx, cfg, lo, log)
@@ -59,8 +71,8 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		return err
 	}
 	defer node.Close() // after the drain below: Serve returns only when nothing runs any more
-	if lz != nil {
-		lz.Bind(node.Registry, node.Secrets)
+	if bindFleet != nil {
+		bindFleet(node.Registry, node.Secrets)
 	}
 
 	// Create the shared postgres-meta passphrase now, so the unit that starts pg-meta
@@ -170,13 +182,12 @@ func superviseStop(g *errgroup.Group, gctx context.Context, budget time.Duration
 // first starts them (`sbctl fleet start`); a service whose artifact was never fetched
 // fails here and is logged, and the rest of the node still comes up.
 func startFleet(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
-	m, err := fleet.NewManager(fleet.Deps{Cfg: n.Cfg, Log: log.With("component", "fleet"), Registry: n.Registry,
-		Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts})
+	// fleet.Setup generates the services' sealed secrets on first use, renders and starts
+	// the units in order, and waits for each. Its tenants are not used here: the Engine's
+	// own Fleet (a Lazy over the same Setup) registers projects.
+	_, err := fleet.Setup(ctx, fleet.Deps{Cfg: n.Cfg, Log: log.With("component", "fleet"), Registry: n.Registry,
+		Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts, Start: true})
 	if err != nil {
-		log.Error("fleet not started", "error", err)
-		return
-	}
-	if err := m.Start(ctx); err != nil {
 		log.Error("shared services did not all start", "error", err)
 		return
 	}
@@ -196,6 +207,9 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 				log.Warn("backup timer did not start", "unit", unit, "error", err)
 			}
 		}
+	}
+	if n.Cfg.Supervisor == config.SupervisorSystemd {
+		refreshSystem(ctx, n, log)
 	}
 	for ref, err := range n.Engine.ResumeRecovered(ctx, recovered) {
 		log.Error("project did not resume after an interrupted restart", "ref", ref, "error", err)
@@ -218,6 +232,27 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 	log.Info("projects started", "active", started, "failed", len(errs))
 	if bk != nil {
 		finishRestores(ctx, bk, log)
+	}
+}
+
+// refreshSystem re-renders the system cluster with the current settings. StartActive covers
+// the user projects, but sb-postgres@system is started by systemd at boot from the files an
+// earlier run rendered: after an upgrade that changes how clusters archive (the relay, whose
+// unit no longer reads the config) its run script would still hold the old archive_command and
+// archiving would fail silently. Nothing is restarted when the files are unchanged.
+func refreshSystem(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+	p, err := n.Registry.GetProject(ctx, config.SystemRef)
+	if err != nil {
+		log.Warn("system cluster not refreshed", "error", err)
+		return
+	}
+	keys, err := n.Engine.Keys(ctx, config.SystemRef)
+	if err != nil {
+		log.Warn("system cluster not refreshed", "error", err)
+		return
+	}
+	if err := n.Plane.StartDatabase(ctx, p, keys); err != nil {
+		log.Warn("system cluster not refreshed", "error", err)
 	}
 }
 

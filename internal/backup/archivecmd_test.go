@@ -47,6 +47,7 @@ func TestArchiveCommandSurvivesShell(t *testing.T) {
 func TestArchiveSettings(t *testing.T) {
 	c := config.Default()
 	c.BinPath = "/usr/local/bin/sbctl"
+	c.Backup.WALRelay = "off"
 	got := ArchiveSettings(c, testRef, "")
 	for _, want := range []string{
 		"archive_mode = on\n",
@@ -60,6 +61,10 @@ func TestArchiveSettings(t *testing.T) {
 	c.Backup.ArchiveTimeoutSeconds = 60
 	if got := ArchiveSettings(c, testRef, ""); !strings.Contains(got, "archive_timeout = 60s") {
 		t.Errorf("archive_timeout not configurable:\n%s", got)
+	}
+	c.Backup.WALRelay = "on"
+	if got := ArchiveSettings(c, testRef, ""); !strings.Contains(got, "archive_command = '/usr/local/bin/sbctl wal push --ref "+testRef+" --socket "+c.Paths().WALSocket(testRef)+" %p'\n") {
+		t.Errorf("relay form missing:\n%s", got)
 	}
 	if got := confString("it's"); got != "'it''s'" {
 		t.Errorf("confString = %q", got)

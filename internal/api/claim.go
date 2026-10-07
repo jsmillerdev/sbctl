@@ -123,6 +123,13 @@ func (a *Accounts) IssueClaimToken(ctx context.Context, ttl time.Duration, force
 	return token, expires, nil
 }
 
+// HasLiveClaimToken reports whether a claim token that nobody has used and that has not
+// expired exists. Its value is not recoverable (only the hash is kept), which is why an
+// installer that re-runs asks first instead of replacing it.
+func (a *Accounts) HasLiveClaimToken(ctx context.Context) (bool, error) {
+	return a.Store.HasLiveClaimToken(ctx, KindClaim, a.now())
+}
+
 // IssueInvite creates an invite token for email and revokes the unused one for the same
 // address.
 func (a *Accounts) IssueInvite(ctx context.Context, email string, ttl time.Duration) (token string, expires time.Time, err error) {
@@ -366,9 +373,18 @@ func (a *Accounts) ListUsers(ctx context.Context) ([]DashboardUser, error) {
 	return out, nil
 }
 
-// RemoveUser deletes the dashboard user with this email and the personal access tokens
-// the user created, which would otherwise keep working: a token is not re-checked
-// against its owner's account. It returns the number of tokens removed.
+// RemoveUser removes the dashboard user with this email, and ends the user's access at
+// once. The order matters, and a failed step leaves the account findable so that the
+// command can be run again:
+//
+//  1. The user is recorded as removed. From that moment the API refuses the user's GoTrue
+//     session (which would otherwise stay valid until it expires, an hour) and every
+//     personal access token the user holds, on the next request.
+//  2. The personal access tokens the user created are deleted.
+//  3. The GoTrue account is deleted, which also deletes the user's sessions and refresh
+//     tokens there, so no new access token can be issued.
+//
+// It returns the number of tokens removed.
 func (a *Accounts) RemoveUser(ctx context.Context, email string) (tokens int, err error) {
 	email, err = normalizeEmail(email)
 	if err != nil {
@@ -380,9 +396,9 @@ func (a *Accounts) RemoveUser(ctx context.Context, email string) (tokens int, er
 	}
 	for _, u := range users {
 		if strings.EqualFold(u.Email, email) {
-			// Tokens first: if the GoTrue delete fails afterwards, the account still exists
-			// and `users remove` can be run again; the other order would leave live tokens
-			// of an account nobody can find.
+			if err := a.Store.MarkUserRemoved(ctx, u.ID, u.Email); err != nil {
+				return 0, err
+			}
 			ts, err := a.Reg.ListAccessTokens(ctx, u.ID)
 			if err != nil {
 				return 0, err

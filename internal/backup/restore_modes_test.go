@@ -226,7 +226,7 @@ func TestFinishRecoveryWaitsForPromotion(t *testing.T) {
 		}
 		return nil
 	}
-	if err := e.svc.finishRecovery(context.Background(), testRef, 5*time.Second); err != nil {
+	if err := e.svc.finishRecovery(context.Background(), testRef, 5*time.Second, false); err != nil {
 		t.Fatal(err)
 	}
 	if altered.Load() != 1 {
@@ -310,7 +310,7 @@ func TestFinishRecoveryFailsWhenClusterNeverAnswers(t *testing.T) {
 	e.svc.opt.RecoveryPoll = time.Millisecond
 	e.svc.opt.RecoveryTimeout = 30 * time.Millisecond
 	e.svc.probe = func(context.Context, string) (bool, error) { return true, errors.New("connection refused") }
-	if err := e.svc.finishRecovery(context.Background(), testRef, 30*time.Millisecond); !errors.Is(err, errRecoveryFailed) {
+	if err := e.svc.finishRecovery(context.Background(), testRef, 30*time.Millisecond, false); !errors.Is(err, errRecoveryFailed) {
 		t.Fatalf("never answering = %v; want errRecoveryFailed", err)
 	}
 }
@@ -505,5 +505,101 @@ func TestFinishPendingRestores(t *testing.T) {
 	}
 	if got := e.svc.PendingRestores(ctx); len(got) != 0 {
 		t.Fatalf("still pending after finish: %v", got)
+	}
+}
+
+// Manager.Create and Resume return once the cluster accepts connections. A restore passes
+// that knowledge on, so a cluster that dies of a fatal recovery error before the first
+// probe fails the restore after RecoveryFailGrace, not after the whole RecoveryTimeout
+// (an in-place restore leaves the production project down until it does).
+func TestFinishRecoveryFailsFastWhenTheStartedClusterIsUnreachable(t *testing.T) {
+	e := newTestEnv(t)
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	e.svc.opt.RecoveryPoll = time.Millisecond
+	e.svc.opt.RecoveryFailGrace = 30 * time.Millisecond
+	e.svc.probe = func(context.Context, string) (bool, error) { return true, errors.New("connection refused") }
+	e.svc.alter = func(context.Context, string, []string) error {
+		t.Error("recovery settings reset on a dead cluster")
+		return nil
+	}
+	start := time.Now()
+	err := e.svc.finishRecovery(context.Background(), testRef, 10*time.Minute, true)
+	if !errors.Is(err, errRecoveryFailed) {
+		t.Fatalf("unreachable from the first probe = %v; want errRecoveryFailed", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("took %s to notice a dead cluster; the grace is 30ms", d)
+	}
+}
+
+// Under systemd a cluster that died of the fatal error restarts, replays and answers
+// again for a moment, which resets the grace period every time. Counting the outages
+// still ends the restore, and it is a failure, never restore.cleanup_pending.
+func TestRestoreFailsWhenTheClusterFlapsBetweenRecoveryAndDeath(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	e.svc.opt.RecoveryPoll = time.Millisecond
+	e.svc.opt.RecoveryFailGrace = time.Hour // the flapping never lets a single outage reach it
+	e.svc.opt.RecoveryTimeout = 30 * time.Second
+	var n atomic.Int32
+	e.svc.probe = func(context.Context, string) (bool, error) {
+		if n.Add(1)%2 == 1 {
+			return true, nil // back in recovery
+		}
+		return true, errors.New("connection refused") // and dead again
+	}
+	e.svc.alter = func(context.Context, string, []string) error {
+		t.Error("recovery settings reset on a crash-looping cluster")
+		return nil
+	}
+	done, err := e.svc.resetRecoverySettings(ctx, testRef)
+	if done || !errors.Is(err, errRecoveryFailed) {
+		t.Fatalf("flapping cluster = %v, %v; want errRecoveryFailed", done, err)
+	}
+	if !strings.Contains(err.Error(), "went down 3 times") {
+		t.Fatalf("error does not say why: %v", err)
+	}
+	evs, _ := e.reg.ListEvents(ctx, testRef, 10)
+	if len(evs) != 1 || evs[0].Kind != "restore.recovery_failed" {
+		t.Fatalf("events = %+v; want one restore.recovery_failed and no restore.cleanup_pending", evs)
+	}
+}
+
+// A cluster that is down when the wait ends was not still recovering.
+func TestFinishRecoveryDownAtTheDeadlineIsAFailure(t *testing.T) {
+	e := newTestEnv(t)
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	e.svc.opt.RecoveryPoll = 5 * time.Millisecond
+	e.svc.opt.RecoveryFailGrace = time.Hour
+	var n atomic.Int32
+	e.svc.probe = func(context.Context, string) (bool, error) {
+		if n.Add(1) < 3 {
+			return true, nil
+		}
+		return true, errors.New("connection refused")
+	}
+	if err := e.svc.finishRecovery(context.Background(), testRef, 60*time.Millisecond, false); !errors.Is(err, errRecoveryFailed) {
+		t.Fatalf("down at the deadline = %v; want errRecoveryFailed", err)
+	}
+}
+
+func TestFinishRecoveryRemovesTheRestoreSourceFile(t *testing.T) {
+	e := newTestEnv(t)
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	p := e.cfg.Paths().RestoreSources(testRef)
+	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(testRef2+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.probe = func(context.Context, string) (bool, error) { return false, nil }
+	e.svc.alter = func(context.Context, string, []string) error { return nil }
+	if err := e.svc.finishRecovery(context.Background(), testRef, time.Second, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restore-sources file still there after recovery: %v", err)
 	}
 }

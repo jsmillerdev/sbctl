@@ -654,12 +654,26 @@ func (e *Engine) StartActive(ctx context.Context) map[string]error {
 	return errs
 }
 
-func (e *Engine) startOne(ctx context.Context, p *registry.Project) error {
-	unlock, err := e.lock(ctx, p.Ref)
+func (e *Engine) startOne(ctx context.Context, listed *registry.Project) error {
+	unlock, err := e.lock(ctx, listed.Ref)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	// StartActive listed the projects before this lock, and sbctl serve runs it next to the
+	// API: a pause or delete that landed in between must not be undone (the units started
+	// again, the backup timer running, while the registry says INACTIVE). Decide on the row
+	// as it is now.
+	p, err := e.reg.GetProject(ctx, listed.Ref)
+	if errors.Is(err, registry.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !active(p.Status) {
+		return nil
+	}
 	keys, err := e.loadKeys(ctx, p.Ref)
 	if err == nil {
 		err = e.plane.Start(ctx, p, keys)

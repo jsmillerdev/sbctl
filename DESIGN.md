@@ -52,7 +52,7 @@ sbctl
 
 **TLS.** Wildcard certificate by DNS-01 through CertMagic (Route 53 via the instance role on AWS; Cloudflare, Hetzner, DigitalOcean tokens elsewhere). Without a DNS API, per-project HTTP-01 certificates on first request. Without a domain, `<ref>.api.<ip>.sslip.io`. Wildcard DNS is required; there is no path-based mode.
 
-**Backups.** Postgres's own `archive_command` calls `sbctl wal push`, which writes to S3 or a local directory. A nightly `pg_basebackup` per project gives per-project point-in-time recovery with no wal-g, no pgBackRest. Restore creates a new project from a base backup plus WAL, which is also how clone-based branching will work.
+**Backups.** Postgres's own `archive_command` calls `sbctl wal push`, which writes to S3 or a local directory; on a systemd node the command talks to the daemon over a per-project unix socket and the daemon does the storage I/O, so no cluster holds backend credentials or can reach another project's archive (`internal/backup/README.md`, "The WAL relay"). A nightly `pg_basebackup` per project gives per-project point-in-time recovery with no wal-g, no pgBackRest. Restore creates a new project from a base backup plus WAL, which is also how clone-based branching will work.
 
 **State.** Registry, secrets (encrypted with a key in `/etc/sbctl`), refs, ports and versions live in the system Postgres. Project data lives in `/var/lib/sbctl/projects/<ref>`.
 

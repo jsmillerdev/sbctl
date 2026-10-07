@@ -48,25 +48,30 @@ RestrictNamespaces=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Postgres runs tenant code (SQL, pg_net and http, an agent with execute_sql). The EC2
+# instance role (the whole backup bucket, DNS) must not be one HTTP request away from it:
+# IMDS is denied here, and WAL archiving does not need it, because archive_command talks to
+# the daemon over the unix socket below and the daemon holds the credentials.
+IPAddressDeny=169.254.169.254 fd00:ec2::254
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0027
-# The local backup backend (file://) writes WAL from archive_command into backups/<ref>/,
-# which sbctl creates before the first start. The launcher chmods a script inside the
-# postgres artifact on first boot, so that one artifact directory is writable too.
-ReadWritePaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/postgres -/var/lib/sbctl/backups/%i
+# The launcher chmods a script inside the postgres artifact on first boot, so that one
+# artifact directory is writable. The backup directory is not: WAL leaves through the relay.
+ReadWritePaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/postgres
 # Containment (allowlist). Every unit runs as the sbctl user, so the mount namespace is
-# what keeps this cluster away from the master key, other projects' data and other
-# projects' backups. The unit sees an empty tmpfs where /var/lib/sbctl is, plus the
-# artifacts (read-only, the postgres one writable), its launcher script, its own cluster
-# directory and its own backup directory. The master key is hidden: archive_command
-# (`sbctl wal push`) reads only config.toml. Environment files are read by systemd before
-# the namespace exists. This does not isolate tenants from a compromised cluster (same
-# uid, /proc); see README.md.
-InaccessiblePaths=-/etc/sbctl/master.key
+# what keeps this cluster away from the master key, the config file (backup credentials),
+# other projects' data and every project's backups. The unit sees an empty tmpfs where
+# /var/lib/sbctl is, plus the artifacts (read-only, the postgres one writable), its launcher
+# script, its own cluster directory and the WAL relay directory (read-only: connecting to the
+# socket in it needs no write access). archive_command and restore_command
+# (`sbctl wal push|fetch --socket`) read no file of /etc/sbctl. Environment files are read by
+# systemd before the namespace exists. This does not isolate tenants from a compromised
+# cluster (same uid, /proc); see README.md.
+InaccessiblePaths=-/etc/sbctl -/run/dbus
 TemporaryFileSystem=/var/lib/sbctl:ro
-BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/%i/postgres.run
-BindPaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/postgres -/var/lib/sbctl/backups/%i
+BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/%i/postgres.run -/var/lib/sbctl/projects/%i/wal
+BindPaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/postgres
 
 [Install]
 WantedBy=multi-user.target

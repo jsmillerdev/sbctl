@@ -12,7 +12,6 @@ import (
 
 	"github.com/OWNER/sbctl/internal/app"
 	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 )
 
@@ -47,13 +46,17 @@ func effectiveConfigPath() string {
 // appOptions is what every command that drives projects tells the composition: the
 // logger, the config file the children must read, and the fleet.
 func appOptions(cfg *config.Config) app.Options {
-	return app.Options{Log: newLogger(cfg), ConfigPath: effectiveConfigPath(), Version: version, Fleet: newFleet(cfg)}
+	log := newLogger(cfg)
+	fl, bind := newFleet(cfg, log)
+	return app.Options{Log: log, ConfigPath: effectiveConfigPath(), Version: version, Fleet: fl, BindFleet: bind}
 }
 
 // openOptions wires the backup service into the lifecycle (archive_command, the final
 // backup on delete, restore); see app.LifecycleOptions.
 func openOptions(cfg *config.Config) lifecycle.OpenOptions {
-	return app.LifecycleOptions(cfg, appOptions(cfg))
+	o := appOptions(cfg)
+	o.Fleet, o.BindFleet = nil, nil // these commands never create, re-key or delete projects
+	return app.LifecycleOptions(cfg, o)
 }
 
 // openNode loads the config and connects to an initialized node. Its Engine registers,
@@ -64,14 +67,12 @@ func openNode(ctx context.Context) (*lifecycle.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: newLogger(cfg)})
-	oo := openOptions(cfg)
-	oo.Fleet = lz.Fleet()
-	n, err := lifecycle.Open(ctx, cfg, oo)
+	o := appOptions(cfg)
+	n, err := lifecycle.Open(ctx, cfg, app.LifecycleOptions(cfg, o))
 	if err != nil {
 		return nil, err
 	}
-	lz.Bind(n.Registry, n.Secrets)
+	o.BindFleet(n.Registry, n.Secrets)
 	return n, nil
 }
 

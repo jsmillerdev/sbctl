@@ -223,6 +223,12 @@ func storageEnv(cfg *config.Config, c *creds) (map[string]string, error) {
 		if f.StorageS3Bucket == "" {
 			return nil, fmt.Errorf("fleet: [fleet] storage_backend = \"s3\" needs storage_s3_bucket")
 		}
+		if cfg.Supervisor == config.SupervisorSystemd && (f.StorageS3AccessKeyID == "" || f.StorageS3SecretAccessKey == "") {
+			// sb-storage denies the instance metadata service (deploy/systemd/README.md), so
+			// the instance role is out of reach by design: Storage holds the objects of every
+			// project and runs on user input, and the role also covers the backups.
+			return nil, fmt.Errorf("fleet: [fleet] storage_backend = \"s3\" needs storage_s3_access_key_id and storage_s3_secret_access_key under systemd: sb-storage cannot reach the instance role (IMDS is denied to it), so give it a key scoped to the objects bucket")
+		}
 		env["STORAGE_BACKEND"] = "s3"
 		env["STORAGE_S3_BUCKET"] = f.StorageS3Bucket
 		region := f.StorageS3Region

@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/OWNER/sbctl/internal/app"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -172,6 +173,10 @@ func init() {
 		})
 	del := projectCmd("delete <ref>", "Delete a project: final base backup, tenants, units, data", cobra.ExactArgs(1),
 		func(cmd *cobra.Command, n *lifecycle.Node, a []string) error {
+			// The final base backup waits for its WAL to be archived through the daemon's
+			// relay; serve the sockets nobody answers while the daemon is down.
+			_, stopRelay := app.StartWALRelay(cmd.Context(), n.Cfg, newLogger(n.Cfg), true, a[0])
+			defer stopRelay()
 			if err := n.Engine.DeleteWith(cmd.Context(), a[0], lifecycle.DeleteOptions{SkipFinalBackup: pSkipBackup}); err != nil {
 				return err
 			}

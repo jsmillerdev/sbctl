@@ -418,7 +418,7 @@ var errRecoveryFailed = errors.New("cluster stopped before recovery finished")
 // restored. A cluster that died during recovery is returned as an error wrapping
 // errRecoveryFailed: the restore did not produce a project.
 func (s *Service) resetRecoverySettings(ctx context.Context, ref string) (bool, error) {
-	err := s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout)
+	err := s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout, true)
 	switch {
 	case err == nil:
 		_ = s.opt.Registry.AppendEvent(ctx, ref, eventRecoveryFinished, nil)
@@ -446,7 +446,7 @@ func (s *Service) FinishRestore(ctx context.Context, ref string) error {
 	if err := s.need("database access", s.opt.Access != nil); err != nil {
 		return err
 	}
-	if err := s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout); err != nil {
+	if err := s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout, false); err != nil {
 		return err
 	}
 	if s.opt.Registry != nil {
@@ -461,10 +461,23 @@ func (s *Service) FinishRestore(ctx context.Context, ref string) error {
 const eventRecoveryFinished = "restore.recovery_finished"
 
 // finishRecovery polls until the cluster has left recovery (connecting as often as
-// needed, since the server may still be starting), then resets recoveryGUCs. A server
-// that was seen in recovery and then stays unreachable for RecoveryFailGrace has died,
-// and one that never answers within wait never started: both are errRecoveryFailed.
-func (s *Service) finishRecovery(ctx context.Context, ref string, wait time.Duration) error {
+// needed, since the server may still be starting), then resets recoveryGUCs, and removes
+// the file that let the project's relay read another project's archive.
+//
+// started says the caller has already seen the cluster accept connections (restore calls
+// this right after Manager.Create or Resume returned): from the first probe on, a cluster
+// that is unreachable for RecoveryFailGrace has died of a fatal recovery error ("recovery
+// ended before configured recovery target was reached"), and a restore must not wait the
+// whole RecoveryTimeout to say so (an in-place restore keeps the production project down
+// until it does). Without it (FinishRestore, a sweep after a daemon restart) the cluster
+// may legitimately still be starting, so only one that was seen up counts.
+//
+// Under systemd the dead cluster restarts (Restart=on-failure), replays and is seen in
+// recovery again before it dies again. Each reappearance would reset the grace period, so
+// the number of times the cluster went from up to down is counted too: RecoveryMaxOutages
+// of them is a failed recovery as well. A server that was seen in recovery and then stays
+// unreachable, or went down that often, or never answers within wait: errRecoveryFailed.
+func (s *Service) finishRecovery(ctx context.Context, ref string, wait time.Duration, started bool) error {
 	if s.opt.Access == nil {
 		return errors.New("no database access configured")
 	}
@@ -472,7 +485,9 @@ func (s *Service) finishRecovery(ctx context.Context, ref string, wait time.Dura
 	defer cancel()
 	var (
 		last      error = errStillRecovering
-		seenUp    bool
+		seenUp          = started
+		up              = started
+		outages   int
 		downSince time.Time
 	)
 	for {
@@ -480,6 +495,12 @@ func (s *Service) finishRecovery(ctx context.Context, ref string, wait time.Dura
 		switch {
 		case err != nil:
 			last = err
+			if up {
+				up = false
+				if outages++; outages >= s.opt.RecoveryMaxOutages {
+					return fmt.Errorf("%w (went down %d times while recovering, so it restarts and fails again: %v)", errRecoveryFailed, outages, err)
+				}
+			}
 			if seenUp {
 				if downSince.IsZero() {
 					downSince = time.Now()
@@ -488,9 +509,13 @@ func (s *Service) finishRecovery(ctx context.Context, ref string, wait time.Dura
 				}
 			}
 		case inRec:
-			seenUp, downSince, last = true, time.Time{}, errStillRecovering
+			seenUp, up, downSince, last = true, true, time.Time{}, errStillRecovering
 		default:
-			return s.alter(ctx, ref, recoveryGUCs)
+			if err := s.alter(ctx, ref, recoveryGUCs); err != nil {
+				return err
+			}
+			s.clearRestoreSources(ref)
+			return nil
 		}
 		select {
 		case <-wctx.Done():
@@ -500,9 +525,20 @@ func (s *Service) finishRecovery(ctx context.Context, ref string, wait time.Dura
 			if !seenUp {
 				return fmt.Errorf("%w (never accepted a connection in %s: %v)", errRecoveryFailed, wait, last)
 			}
+			if !downSince.IsZero() {
+				return fmt.Errorf("%w (unreachable when the %s wait ended: %v)", errRecoveryFailed, wait, last)
+			}
 			return fmt.Errorf("%w after %s (last: %v)", errStillRecovering, wait, last)
 		case <-time.After(s.opt.RecoveryPoll):
 		}
+	}
+}
+
+// clearRestoreSources removes the file that lets ref's relay read another project's
+// archive; recovery is over, so nothing needs it any more.
+func (s *Service) clearRestoreSources(ref string) {
+	if s.opt.Config != nil {
+		_ = os.Remove(s.opt.Config.Paths().RestoreSources(ref))
 	}
 }
 
@@ -646,6 +682,9 @@ func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) e
 	if err := os.Chmod(dataDir, 0o700); err != nil {
 		return err
 	}
+	if err := s.allowSource(plan); err != nil {
+		return err
+	}
 	rc, err := s.opt.Store.Get(ctx, m.Dir()+"/"+m.Data)
 	if err != nil {
 		return fmt.Errorf("backup: read base backup %s: %w", m.ID, err)
@@ -687,16 +726,32 @@ func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) e
 	return syncTree(dataDir)
 }
 
+// allowSource lets the relay of a restored clone read the archive of its source project
+// (the clone's restore_command names the source). The file sits in the clone's project
+// directory, which no unit of the clone sees; the relay reads it on every fetch, and
+// finishRecovery removes it. A restore in place needs nothing: a project always reads its own.
+func (s *Service) allowSource(plan *RestorePlan) error {
+	if s.opt.Config == nil || plan.Source == plan.TargetRef {
+		return nil
+	}
+	p := s.opt.Config.Paths().RestoreSources(plan.TargetRef)
+	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+		return err
+	}
+	return writeSyncFile(p, []byte(plan.Source+"\n"), 0o600)
+}
+
 // recoveryConf is the block appended to postgresql.auto.conf. Later lines win, so it
 // overrides anything the source's own ALTER SYSTEM history left there.
 //
 // The archive_* lines stay after the restore: the data directory's postgresql.conf is
 // the source's, and without them the clone would archive into the source's archive.
 func (s *Service) recoveryConf(plan *RestorePlan) string {
-	bin, cfgPath := config.DefaultBinPath, s.opt.ConfigPath
+	cfgPath := s.opt.ConfigPath
 	c := s.opt.Config
-	if c != nil && c.BinPath != "" {
-		bin = c.BinPath
+	if c == nil {
+		c = config.Default()
+		c.Backup.WALRelay = "off"
 	}
 	var b strings.Builder
 	switch plan.Mode {
@@ -707,8 +762,8 @@ func (s *Service) recoveryConf(plan *RestorePlan) string {
 	default:
 		fmt.Fprintf(&b, "\n# --- sbctl restore of %s (backup %s) to %s ---\n", plan.Source, plan.Manifest.ID, plan.Target.UTC().Format(time.RFC3339))
 	}
-	fmt.Fprintf(&b, "archive_mode = on\narchive_command = %s\n", confString(ArchiveCommand(bin, plan.TargetRef, cfgPath)))
-	fmt.Fprintf(&b, "restore_command = %s\n", confString(RestoreCommand(bin, plan.Source, cfgPath)))
+	fmt.Fprintf(&b, "archive_mode = on\narchive_command = %s\n", confString(ArchiveCommandFor(c, plan.TargetRef, cfgPath)))
+	fmt.Fprintf(&b, "restore_command = %s\n", confString(RestoreCommandFor(c, plan.Source, plan.TargetRef, cfgPath)))
 	switch plan.Mode {
 	case RestoreToLatest:
 		// No target: recovery replays every archived file and then promotes.

@@ -971,3 +971,60 @@ func TestRecoverResumesAnInterruptedRestart(t *testing.T) {
 		t.Fatalf("a stale restart intent resumed a deliberately paused project: %+v", rs)
 	}
 }
+
+// racyRegistry runs after() once ListProjects has returned its rows, which is the window
+// in which an API pause or delete lands between StartActive's listing and startOne's lock.
+type racyRegistry struct {
+	*registry.Memory
+	after func()
+}
+
+func (r racyRegistry) ListProjects(ctx context.Context) ([]registry.Project, error) {
+	ps, err := r.Memory.ListProjects(ctx)
+	if r.after != nil {
+		r.after()
+	}
+	return ps, err
+}
+
+// StartActive reads the project list before taking each project's lock. A pause that
+// lands in between must stay a pause: no Start, no backup timer, status untouched.
+func TestStartActiveDoesNotUndoAPauseThatLandedAfterTheListing(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	mem := h.reg
+	racy := racyRegistry{Memory: mem}
+	e := NewEngine(h.cfg, racy, h.sec, fakeArts{}, h.plane, Options{Fleet: fleet.Fleet{h.tenant}, Backup: h.backup})
+	racy.after = func() { _ = mem.SetProjectStatus(ctx, p.Ref, registry.StatusInactive) }
+	e.reg = racy
+	h.plane.calls = nil
+	if errs := e.StartActive(ctx); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if h.plane.has("Start " + p.Ref) {
+		t.Fatalf("a project paused after the listing was started again: %v", h.plane.calls)
+	}
+	if got, _ := mem.GetProject(ctx, p.Ref); got.Status != registry.StatusInactive {
+		t.Fatalf("status = %s; the registry said INACTIVE", got.Status)
+	}
+}
+
+// A project deleted after the listing is skipped, not an error.
+func TestStartActiveSkipsAProjectDeletedAfterTheListing(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	mem := h.reg
+	racy := racyRegistry{Memory: mem}
+	e := NewEngine(h.cfg, racy, h.sec, fakeArts{}, h.plane, Options{Fleet: fleet.Fleet{h.tenant}, Backup: h.backup})
+	racy.after = func() { _ = mem.DeleteProject(ctx, p.Ref) }
+	e.reg = racy
+	h.plane.calls = nil
+	if errs := e.StartActive(ctx); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if h.plane.has("Start " + p.Ref) {
+		t.Fatalf("a deleted project was started: %v", h.plane.calls)
+	}
+}

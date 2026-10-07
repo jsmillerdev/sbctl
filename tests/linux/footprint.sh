@@ -13,6 +13,7 @@
 #
 # Not run in development. CI runs it on an ephemeral Ubuntu 24.04 VM sized like the target
 # (state the instance type in the results).
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SIZES="10 25 50"
