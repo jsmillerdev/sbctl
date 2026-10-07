@@ -63,7 +63,7 @@ supabase-js 2.117.3:
   `range`, exact counts, `single`/`maybeSingle`; RPC (POST, GET, security invoker function under
   RLS, a missing function: `PGRST202`); RLS: the anon role cannot insert, a user sees only their
   rows, anon sees only `done` rows, the secret key sees all, another user cannot update, delete or
-  forge an owner; no key and a wrong key are 401; GraphQL at `/graphql/v1`; project A's keys are
+  forge an owner; no key and a wrong key are 401; GraphQL at `/graphql/v1` after `create extension pg_graphql` (it is off in a new project, as on hosted Supabase); project A's keys are
   refused by project B.
 - **Realtime** (`realtime.test.mjs`): `postgres_changes` INSERT event (the table is added to the
   `supabase_realtime` publication), broadcast between two clients with acknowledgement, presence

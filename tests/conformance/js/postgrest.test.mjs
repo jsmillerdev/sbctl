@@ -161,7 +161,10 @@ for (const kind of kinds(keys.a)) {
       assert.equal(wrong.status, 401)
     })
 
-    test('GraphQL answers at /graphql/v1', async () => {
+    test('GraphQL answers at /graphql/v1 once pg_graphql is enabled', async () => {
+      // New projects have pg_graphql off (the artifact's 20260421000000_pg_graphql-off-by-default
+      // migration, as on hosted Supabase); `graphql_public.graphql` then answers that it is not enabled.
+      await sql(p, 'create extension if not exists pg_graphql')
       const r = await fetch(`${p.url}/graphql/v1`, {
         method: 'POST',
         headers: { apikey: kind.anon, Authorization: `Bearer ${kind.anon}`, 'Content-Type': 'application/json' },
