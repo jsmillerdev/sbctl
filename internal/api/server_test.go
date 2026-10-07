@@ -36,6 +36,14 @@ func TestAuth(t *testing.T) {
 		{"dashboard jwt on platform", f.jwt, "/platform/profile", 200},
 		{"wrong secret", f.signJWTWith("other-secret", "authenticated"), "/platform/profile", 401},
 		{"anon role", f.signJWT(map[string]any{"sub": f.userID, "role": "anon"}), "/platform/profile", 401},
+		// GoTrue's admin createuser leaves auth.users.role empty, so these users' tokens
+		// carry role "": the session is identified by audience and signature.
+		{"admin-created user, empty role", f.signJWT(map[string]any{"sub": f.userID, "role": ""}), "/platform/profile", 200},
+		{"admin-created user, no role claim", f.signJWT(map[string]any{"sub": f.userID, "role": nil}), "/platform/profile", 200},
+		{"audience list", f.signJWT(map[string]any{"sub": f.userID, "aud": []string{"authenticated"}}), "/platform/profile", 200},
+		{"other audience", f.signJWT(map[string]any{"sub": f.userID, "aud": "service"}), "/platform/profile", 401},
+		{"no audience", f.signJWT(map[string]any{"sub": f.userID, "aud": nil}), "/platform/profile", 401},
+		{"no exp", f.signJWT(map[string]any{"sub": f.userID, "exp": nil}), "/platform/profile", 401},
 		{"expired", f.signJWT(map[string]any{"sub": f.userID, "role": "authenticated", "exp": 1}), "/platform/profile", 401},
 		{"project key is not a dashboard session", f.projectJWT(), "/v1/projects", 401},
 	} {

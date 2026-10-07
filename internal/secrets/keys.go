@@ -150,12 +150,25 @@ func NewLegacyKey(jwtSecret, ref, role string, now time.Time) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(jwtSecret))
 }
 
-// ParseHS256 verifies an HS256 JWT and returns its claims.
+// ParseHS256 verifies an HS256 JWT and returns its claims. An exp claim is checked when
+// present but not required: legacy API keys made by hand from the self-hosting docs may
+// carry none.
 func ParseHS256(token, jwtSecret string) (jwt.MapClaims, error) {
+	return parseHS256(token, jwtSecret)
+}
+
+// ParseSessionHS256 is ParseHS256 for a dashboard session: the exp claim is required.
+// GoTrue access tokens always carry one, so a token without it is not a GoTrue session.
+func ParseSessionHS256(token, jwtSecret string) (jwt.MapClaims, error) {
+	return parseHS256(token, jwtSecret, jwt.WithExpirationRequired())
+}
+
+func parseHS256(token, jwtSecret string, opts ...jwt.ParserOption) (jwt.MapClaims, error) {
 	claims := jwt.MapClaims{}
+	opts = append(opts, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 	_, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
 		return []byte(jwtSecret), nil
-	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	}, opts...)
 	if err != nil {
 		return nil, err
 	}

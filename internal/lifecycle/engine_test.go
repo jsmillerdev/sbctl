@@ -191,18 +191,18 @@ func TestCreateRequestOptions(t *testing.T) {
 	}
 	seed := DataSeeder(func(context.Context, *registry.Project, string) error { return nil })
 	lim := config.Limits{MemoryMax: "512M", CPUQuota: "50%"}
-	p, err := h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu"})
+	p, err := h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu-west-2"})
 	if err == nil {
 		t.Fatal("unknown organization must fail")
 	}
 	if _, err := h.reg.CreateOrganization(context.Background(), "acme", "Acme"); err != nil {
 		t.Fatal(err)
 	}
-	p, err = h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu"})
+	p, err = h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu-west-2"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Ref != "abcdefghijklmnopqrst" || p.Class != "micro" || p.Limits != lim || p.Region != "eu" || p.Name != p.Ref {
+	if p.Ref != "abcdefghijklmnopqrst" || p.Class != "micro" || p.Limits != lim || p.Region != "eu-west-2" || p.Name != p.Ref {
 		t.Fatalf("project = %+v", p)
 	}
 	if !h.plane.seeded || h.plane.keysIn.JWTSecret != k.JWTSecret || h.plane.keysIn.DBPassword != "pw" {
@@ -711,5 +711,263 @@ func TestLockIsCrossProcessWithPostgresRegistry(t *testing.T) {
 	case <-got:
 	case <-time.After(5 * time.Second):
 		t.Fatal("second engine never got the lock")
+	}
+}
+
+func TestDeleteSkipsFinalBackupWhenNothingIsRestorable(t *testing.T) {
+	h := newHarness(t)
+	p := h.create(t)
+	h.backup.err = fmt.Errorf("backup %s: %w (the clone never finished recovery)", p.Ref, ErrNoRestorableState)
+	if err := h.e.Delete(context.Background(), p.Ref); err != nil {
+		t.Fatalf("delete of a project with no restorable state failed: %v", err)
+	}
+	if _, err := h.reg.GetProject(context.Background(), p.Ref); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("project row remains: %v", err)
+	}
+	evs, _ := h.reg.ListEvents(context.Background(), p.Ref, 50)
+	var skipped bool
+	for _, e := range evs {
+		skipped = skipped || e.Kind == "project.final_backup_skipped"
+	}
+	if !skipped {
+		t.Error("the skipped final backup was not recorded as an event")
+	}
+	// Any other backup error still keeps the project.
+	q := h.create(t)
+	h.backup.err = errors.New("disk full")
+	if err := h.e.Delete(context.Background(), q.Ref); err == nil {
+		t.Fatal("a real backup failure must keep the project")
+	}
+	if got, _ := h.reg.GetProject(context.Background(), q.Ref); got == nil || got.Status == registry.StatusGoingDown {
+		t.Fatalf("project not restored to its previous status: %+v", got)
+	}
+}
+
+func TestRecoverMovesInterruptedProjects(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	mk := func(status registry.Status, route bool) string {
+		p := h.create(t)
+		if !route {
+			if err := h.reg.DeleteRoute(ctx, h.cfg.ProjectHost(p.Ref)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := h.reg.SetProjectStatus(ctx, p.Ref, status); err != nil {
+			t.Fatal(err)
+		}
+		return p.Ref
+	}
+	pausing := mk(registry.StatusPausing, true)
+	resuming := mk(registry.StatusComingUp, true)
+	creating := mk(registry.StatusComingUp, false)
+	goingDown := mk(registry.StatusGoingDown, true)
+	healthy := mk(registry.StatusActiveHealthy, true)
+
+	got := h.e.Recover(ctx)
+	want := map[string]registry.Status{pausing: registry.StatusInactive, resuming: registry.StatusInactive, creating: registry.StatusInitFailed}
+	if len(got) != len(want) {
+		t.Fatalf("recovered %+v, want %d projects", got, len(want))
+	}
+	for ref, status := range want {
+		p, _ := h.reg.GetProject(ctx, ref)
+		if p.Status != status {
+			t.Errorf("%s is %s, want %s", ref, p.Status, status)
+		}
+	}
+	for _, ref := range []string{goingDown, healthy} {
+		p, _ := h.reg.GetProject(ctx, ref)
+		wantStatus := registry.StatusActiveHealthy
+		if ref == goingDown {
+			wantStatus = registry.StatusGoingDown
+		}
+		if p.Status != wantStatus {
+			t.Errorf("%s was touched: %s", ref, p.Status)
+		}
+	}
+	if !h.plane.has("Stop "+pausing) || !h.plane.has("Stop "+resuming) || h.plane.has("Stop "+creating) {
+		t.Errorf("units stopped for the wrong projects: %v", h.plane.calls)
+	}
+	if again := h.e.Recover(ctx); len(again) != 0 {
+		t.Errorf("a second pass found work: %+v", again)
+	}
+}
+
+func TestCreateRegionIsARealRegionCode(t *testing.T) {
+	h := newHarness(t)
+	for in, want := range map[string]string{"": "us-east-1", "local": "us-east-1", "eu-central-1": "eu-central-1", "Frankfurt": "us-east-1"} {
+		p, err := h.e.Create(context.Background(), CreateRequest{Name: "r", Region: in})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Region != want {
+			t.Errorf("region %q -> %q, want %q", in, p.Region, want)
+		}
+	}
+}
+
+type fakeTimers struct{ calls []string }
+
+func (f *fakeTimers) StartTimer(_ context.Context, ref string) error {
+	f.calls = append(f.calls, "start "+ref)
+	return nil
+}
+func (f *fakeTimers) StopTimer(_ context.Context, ref string) error {
+	f.calls = append(f.calls, "stop "+ref)
+	return errors.New("not running") // logged, never fatal
+}
+
+func TestBackupTimersFollowTheProject(t *testing.T) {
+	h := newHarness(t)
+	ft := &fakeTimers{}
+	h.e.opts.Timers = ft
+	ctx := context.Background()
+	p := h.create(t)
+	if err := h.e.Pause(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.e.Resume(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if errs := h.e.StartActive(ctx); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if err := h.e.Delete(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"start " + p.Ref, "stop " + p.Ref, "start " + p.Ref, "start " + p.Ref, "stop " + p.Ref}
+	if fmt.Sprint(ft.calls) != fmt.Sprint(want) {
+		t.Errorf("timer calls = %v, want %v", ft.calls, want)
+	}
+}
+
+// A delete cut off after its final backup settled is finished by Recover without a
+// second backup; one cut off during the backup returns the project to where it was.
+func TestRecoverFinishesOrRevertsAnInterruptedDelete(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("backup settled: removal finished, no second backup", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		h.plane.failOn["Delete"] = errors.New("daemon stopped")
+		if err := h.e.Delete(ctx, p.Ref); err == nil {
+			t.Fatal("delete should have failed at the data plane")
+		}
+		if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusGoingDown {
+			t.Fatalf("status = %s, want GOING_DOWN", got.Status)
+		}
+		delete(h.plane.failOn, "Delete")
+		h.backup.calls = nil
+		rs := h.e.Recover(ctx)
+		if len(rs) != 1 || rs[0].To != StatusDeleted {
+			t.Fatalf("recovered = %+v", rs)
+		}
+		if _, err := h.reg.GetProject(ctx, p.Ref); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("project row remains: %v", err)
+		}
+		if len(h.backup.calls) != 0 {
+			t.Fatalf("a second final backup ran: %v", h.backup.calls)
+		}
+	})
+
+	t.Run("a retried delete does not back up again", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		h.plane.failOn["Delete"] = errors.New("first attempt cut off")
+		_ = h.e.Delete(ctx, p.Ref)
+		delete(h.plane.failOn, "Delete")
+		h.backup.calls = nil
+		h.backup.err = errors.New("the cluster is gone") // would abort the delete if it ran
+		if err := h.e.Delete(ctx, p.Ref); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		if len(h.backup.calls) != 0 {
+			t.Fatalf("retry ran the backup: %v", h.backup.calls)
+		}
+	})
+
+	t.Run("backup cut off: the paused project is kept and stopped", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		if err := h.e.Pause(ctx, p.Ref); err != nil {
+			t.Fatal(err)
+		}
+		// What DeleteWith leaves when the process dies inside the backup.
+		h.e.event(ctx, p.Ref, EventDeleteStarted, map[string]string{"prev": string(registry.StatusInactive)})
+		if err := h.reg.SetProjectStatus(ctx, p.Ref, registry.StatusGoingDown); err != nil {
+			t.Fatal(err)
+		}
+		h.plane.calls = nil
+		rs := h.e.Recover(ctx)
+		if len(rs) != 1 || rs[0].To != registry.StatusInactive {
+			t.Fatalf("recovered = %+v", rs)
+		}
+		if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusInactive {
+			t.Fatalf("status = %s, want INACTIVE", got.Status)
+		}
+		if !h.plane.has("Stop " + p.Ref) {
+			t.Errorf("the database the backup started was not stopped: %v", h.plane.calls)
+		}
+	})
+
+	t.Run("no record: only logged", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		_ = h.reg.SetProjectStatus(ctx, p.Ref, registry.StatusGoingDown)
+		if rs := h.e.Recover(ctx); len(rs) != 0 {
+			t.Fatalf("recovered = %+v", rs)
+		}
+	})
+}
+
+// The nightly timer stops as soon as the final backup is settled, even when the rest of
+// the delete fails.
+func TestDeleteStopsTheTimerAfterTheFinalBackup(t *testing.T) {
+	h := newHarness(t)
+	ft := &fakeTimers{}
+	h.e.opts.Timers = ft
+	p := h.create(t)
+	h.plane.failOn["Delete"] = errors.New("units would not go")
+	ft.calls = nil
+	if err := h.e.Delete(context.Background(), p.Ref); err == nil {
+		t.Fatal("expected the data plane failure")
+	}
+	if fmt.Sprint(ft.calls) != fmt.Sprint([]string{"stop " + p.Ref}) {
+		t.Fatalf("timer calls = %v, want a stop", ft.calls)
+	}
+}
+
+// A restart cut off after its pause leaves the project INACTIVE with a request nobody
+// finished: Recover flags it and ResumeRecovered brings it back.
+func TestRecoverResumesAnInterruptedRestart(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	cut := h.create(t)
+	stale := h.create(t)
+	for _, p := range []*registry.Project{cut, stale} {
+		h.e.event(ctx, p.Ref, EventRestartRequested, nil)
+	}
+	if err := h.e.Pause(ctx, cut.Ref); err != nil { // the restart's pause, then the process died
+		t.Fatal(err)
+	}
+	rs := h.e.Recover(ctx)
+	if len(rs) != 1 || rs[0].Ref != cut.Ref || !rs[0].Resume {
+		t.Fatalf("recovered = %+v, want only %s flagged for resume", rs, cut.Ref)
+	}
+	if errs := h.e.ResumeRecovered(ctx, rs); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if got, _ := h.reg.GetProject(ctx, cut.Ref); got.Status != registry.StatusActiveHealthy {
+		t.Fatalf("status = %s, want ACTIVE_HEALTHY", got.Status)
+	}
+	if h.e.restartPending(ctx, cut.Ref) || h.e.restartPending(ctx, stale.Ref) {
+		t.Fatal("restart intents were not closed")
+	}
+	// A manual pause later is not undone by the next start.
+	if err := h.e.Pause(ctx, stale.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if rs := h.e.Recover(ctx); len(rs) != 0 {
+		t.Fatalf("a stale restart intent resumed a deliberately paused project: %+v", rs)
 	}
 }

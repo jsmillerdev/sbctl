@@ -107,7 +107,7 @@ func init() {
 	create.Flags().StringVar(&pOrg, "org", "", "organization slug (default \"default\", created on first use)")
 	create.Flags().StringVar(&pClass, "class", lifecycle.DefaultClass, fmt.Sprintf("size class %v", lifecycle.ClassNames()))
 	create.Flags().StringVar(&pRef, "ref", "", "force the ref (20 lowercase letters); default random")
-	create.Flags().StringVar(&pRegion, "region", "local", "region label")
+	create.Flags().StringVar(&pRegion, "region", "", "AWS region code shown for the project (default: region in the config, us-east-1)")
 	create.Flags().BoolVar(&pShowKeys, "show-keys", false, "print the project's keys and database password")
 	create.Flags().BoolVar(&pJSON, "json", false, "print JSON")
 

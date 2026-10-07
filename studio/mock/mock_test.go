@@ -237,7 +237,7 @@ func TestProjectsListsAndPagination(t *testing.T) {
 	}
 }
 
-func TestProjectDetailConnectionStringDecryptsToTheDBURL(t *testing.T) {
+func TestProjectDetailConnectionStringCarriesNoSecret(t *testing.T) {
 	s, ts, tok := newTestServer(t, "")
 	_, body, _ := do(t, "GET", ts.URL+"/platform/projects/"+refB, tok, "")
 	var out struct {
@@ -248,9 +248,19 @@ func TestProjectDetailConnectionStringDecryptsToTheDBURL(t *testing.T) {
 	if err := json.Unmarshal(body, &out); err != nil {
 		t.Fatal(err)
 	}
-	got, err := decryptConnString(out.ConnectionString, testCryptoKey)
-	if err != nil || got != s.cfg.Projects[1].DBURL || out.Status != "ACTIVE_HEALTHY" || out.Ref != refB {
-		t.Fatalf("connectionString: %q %v (%s)", got, err, body)
+	if out.ConnectionString == "" || out.Status != "ACTIVE_HEALTHY" || out.Ref != refB {
+		t.Fatalf("project detail: %s", body)
+	}
+	// Neither the password nor an encryption of the DB URL may reach a dashboard user.
+	if _, err := decryptConnString(out.ConnectionString, testCryptoKey); err == nil {
+		t.Fatalf("connectionString decrypts to a database URL: %q", out.ConnectionString)
+	}
+	if strings.Contains(string(body), "p%40ss") || strings.Contains(string(body), "postgresql://") {
+		t.Fatalf("database URL in the response: %s", body)
+	}
+	// The encrypted connection that postgres-meta needs is built per request, from the project.
+	if got, err := decryptConnString(s.encryptedConnection(&s.cfg.Projects[1]), testCryptoKey); err != nil || got != s.cfg.Projects[1].DBURL {
+		t.Fatalf("encryptedConnection: %q %v", got, err)
 	}
 }
 

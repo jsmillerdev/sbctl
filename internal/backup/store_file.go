@@ -25,7 +25,7 @@ type FileStore struct{ root string }
 // NewFileStore returns a FileStore rooted at dir, creating it if needed.
 func NewFileStore(dir string) (*FileStore, error) {
 	dir = filepath.Clean(dir)
-	if err := mkdirAllSync(dir, 0o750); err != nil {
+	if err := mkdirAllSync(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("backup: file store %s: %w", dir, err)
 	}
 	return &FileStore{root: dir}, nil
@@ -43,7 +43,7 @@ func (s *FileStore) Put(ctx context.Context, key string, r io.Reader) (err error
 	}
 	dst := s.path(key)
 	dir := filepath.Dir(dst)
-	if err := mkdirAllSync(dir, 0o750); err != nil {
+	if err := mkdirAllSync(dir, 0o700); err != nil {
 		return err
 	}
 	f, err := os.CreateTemp(dir, filepath.Base(dst)+tmpMarker+"*")
@@ -60,7 +60,7 @@ func (s *FileStore) Put(ctx context.Context, key string, r io.Reader) (err error
 	if _, err = io.Copy(f, ctxReader{ctx, r}); err != nil {
 		return err
 	}
-	if err = f.Chmod(0o640); err != nil {
+	if err = f.Chmod(0o600); err != nil {
 		return err
 	}
 	if err = f.Sync(); err != nil {

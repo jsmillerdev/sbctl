@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
@@ -33,6 +34,11 @@ type PlaneOptions struct {
 	// ArchiveCommand overrides archive_command. Empty means "<bin_path> wal push --ref
 	// <ref> %p"; "off" turns archiving off (tests and nodes without a backup backend).
 	ArchiveCommand string
+	// ArchiveCommandFor builds archive_command per project (backup.ArchiveCommand, which
+	// the lifecycle package cannot import); it wins over ArchiveCommand when it returns
+	// a value. ArchiveTimeout is archive_timeout in seconds (default 900).
+	ArchiveCommandFor func(ref string) string
+	ArchiveTimeout    int
 	// ConfigPath is exported to Postgres as SBCTL_CONFIG so that archive_command, which
 	// runs inside the postmaster, loads the same config file as the daemon.
 	ConfigPath string
@@ -105,11 +111,26 @@ func (pl *PostgresPlane) prepare(p *registry.Project, keys *secrets.ProjectKeys)
 	if err := os.Chmod(pp.Sock, 0o700); err != nil {
 		return err
 	}
+	if err := pl.ensureBackupDir(p.Ref); err != nil {
+		return err
+	}
 	if _, err := writeFile(pp.HBA, []byte(hbaRules), 0o600); err != nil {
 		return err
 	}
 	_, err := writeFile(pp.RootKey, []byte(keys.PGSodiumRootKey), 0o600)
 	return err
+}
+
+// ensureBackupDir creates <backups>/<ref> for the local (file://) backup backend. The
+// systemd template binds that one directory into the cluster's namespace for
+// archive_command, and a bind of a missing path is skipped, so it must exist before the
+// first start. Other backends and a backend outside the state directory need nothing here.
+func (pl *PostgresPlane) ensureBackupDir(ref string) error {
+	dir, ok := strings.CutPrefix(pl.cfg.Backup.Backend, "file://")
+	if !ok || filepath.Clean(dir) != pl.cfg.Paths().Backups() {
+		return nil
+	}
+	return os.MkdirAll(filepath.Join(dir, ref), 0o700)
 }
 
 // hbaRules is the cluster's pg_hba.conf. The artifact's default trusts every loopback
@@ -189,7 +210,13 @@ func (pl *PostgresPlane) createDatabase(ctx context.Context, p *registry.Project
 	if seed == nil {
 		// A seeded cluster already has these roles with these passwords (the restore
 		// reuses the source project's keys), and may still be in recovery.
-		return setRolePasswords(ctx, pp, pl.rolePasswords(keys))
+		if err := setRolePasswords(ctx, pp, pl.rolePasswords(keys)); err != nil {
+			return err
+		}
+		// The first boot is over: render the unit again without the bootstrap password.
+		// The files differ, so StartDatabase restarts the cluster, which also drops the
+		// password from the postmaster's environment.
+		return pl.StartDatabase(ctx, p, keys)
 	}
 	return nil
 }
@@ -235,7 +262,17 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 	if changed {
 		// A running cluster keeps the settings it started with (Start on a running unit is
 		// a no-op), so changed sizing, archive_command or launcher path need a restart.
-		if st, err := pl.sup.Status(ctx, spec.Unit()); err == nil && (st.State == units.StateActive || st.State == units.StateActivating) {
+		st, serr := pl.sup.Status(ctx, spec.Unit())
+		switch {
+		case serr != nil:
+			// Cannot tell whether it runs. Start on a running unit is a no-op, so skipping
+			// the stop would leave the cluster on its old settings without a trace; Stop on a
+			// stopped unit is harmless, so stop it.
+			pl.log.Warn("postgres settings changed; unit status unknown, restarting to be safe", "unit", spec.Unit(), "error", serr)
+			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
+				return err
+			}
+		case st.State == units.StateActive || st.State == units.StateActivating:
 			pl.log.Info("postgres settings changed; restarting the running cluster", "unit", spec.Unit())
 			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
 				return err

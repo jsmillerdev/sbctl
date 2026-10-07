@@ -49,7 +49,7 @@ func (s *Server) platformProject(p *registry.Project, org *registry.Organization
 	return plat.ProjectDetailResponseOutput{
 		CloudProvider: "AWS", ConnectionString: &conn, DbVersion: &ver, DbHost: s.dbHost(p.Ref),
 		Id: projectNumID(p), InsertedAt: ts(p.CreatedAt), UpdatedAt: ts(p.UpdatedAt),
-		Name: p.Name, OrganizationId: float32(org.ID), Ref: p.Ref, Region: regionOf(p),
+		Name: p.Name, OrganizationId: float32(org.ID), Ref: p.Ref, Region: s.regionOf(p),
 		RestUrl: s.projectURL(p.Ref) + "/rest/v1/", Status: plat.ProjectDetailResponseOutputStatus(p.Status),
 		SubscriptionId: "sbctl",
 	}
@@ -120,7 +120,7 @@ func (s *Server) platformListProjects(w http.ResponseWriter, r *http.Request) er
 		rows = append(rows, setAll(row, map[string]any{
 			"cloud_provider": "AWS", "id": projectNumID(p), "inserted_at": ts(p.CreatedAt), "is_branch_enabled": false,
 			"is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID, "organization_slug": org.Slug,
-			"preview_branch_refs": []string{}, "ref": p.Ref, "region": regionOf(p), "status": string(p.Status), "subscription_id": "sbctl",
+			"preview_branch_refs": []string{}, "ref": p.Ref, "region": s.regionOf(p), "status": string(p.Status), "subscription_id": "sbctl",
 		}))
 	}
 	resp := base("GET /platform/projects")
@@ -164,7 +164,7 @@ func (s *Server) platformCreateProject(w http.ResponseWriter, r *http.Request) e
 	setAll(resp, map[string]any{
 		"cloud_provider": "AWS", "endpoint": s.projectURL(p.Ref), "id": projectNumID(p), "inserted_at": ts(p.CreatedAt),
 		"is_branch_enabled": false, "is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID,
-		"organization_slug": org.Slug, "preview_branch_refs": []string{}, "ref": p.Ref, "region": regionOf(p),
+		"organization_slug": org.Slug, "preview_branch_refs": []string{}, "ref": p.Ref, "region": s.regionOf(p),
 		"status": string(p.Status), "subscription_id": "sbctl",
 	})
 	if keys != nil {
@@ -215,10 +215,10 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 			item := ops.Response.Value.Properties["projects"].Value.Items.Value.Properties["databases"].Value.Items
 			db, _ = MinimalValue(item).(map[string]any)
 		}
-		setAll(db, map[string]any{"cloud_provider": "AWS", "identifier": p.Ref, "region": regionOf(&p), "status": string(p.Status), "type": "PRIMARY"})
+		setAll(db, map[string]any{"cloud_provider": "AWS", "identifier": p.Ref, "region": s.regionOf(&p), "status": string(p.Status), "type": "PRIMARY"})
 		setAll(row, map[string]any{
 			"cloud_provider": "AWS", "databases": []any{db}, "inserted_at": ts(p.CreatedAt), "integration_source": nil,
-			"is_branch": false, "name": p.Name, "ref": p.Ref, "region": regionOf(&p), "status": string(p.Status),
+			"is_branch": false, "name": p.Name, "ref": p.Ref, "region": s.regionOf(&p), "status": string(p.Status),
 		})
 		rows = append(rows, row)
 	}
@@ -283,7 +283,7 @@ func (s *Server) platformSettings(w http.ResponseWriter, r *http.Request) error 
 	setAll(resp, map[string]any{
 		"cloud_provider": "AWS", "db_dns_name": s.dbHost(p.Ref), "db_host": s.dbHost(p.Ref), "db_name": "postgres",
 		"db_port": s.cfg.Ports.SupavisorSession, "db_user": "postgres", "inserted_at": ts(p.CreatedAt), "name": p.Name,
-		"ref": p.Ref, "region": regionOf(p), "ssl_enforced": false, "status": string(p.Status), "is_sensitive": false,
+		"ref": p.Ref, "region": s.regionOf(p), "ssl_enforced": false, "status": string(p.Status), "is_sensitive": false,
 		"app_config": map[string]any{
 			"db_schema": "public", "endpoint": s.cfg.ProjectHost(p.Ref), "storage_endpoint": s.cfg.ProjectHost(p.Ref),
 			"protocol": s.publicScheme(),

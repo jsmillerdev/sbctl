@@ -7,9 +7,9 @@ Platform-mode Studio for `sbctl`: a build of upstream Studio with `NEXT_PUBLIC_I
 | `patches/` | The three patches, one `git format-patch` file each, made against `supabase/supabase@94b8b06eb294cf6b217c68d30357566cc8f146d9` (`versions.yaml` `studio.tag`). |
 | `build.sh <platform>` | Fetch, patch, install, build, package, verify. Writes `dist/sbctl-studio-<tag>-p<N>-<platform>.tar.zst` and a line in `dist/SHA256SUMS`. |
 | `Dockerfile.build` | The same build in a clean Ubuntu 24.04 image (`docker buildx build --target artifact --output type=local,dest=studio/dist`). |
-| `ci-prepare.sh` | For a GitHub-hosted runner: frees disk, adds 6 GB swap, installs zstd. |
+| `ci-prepare.sh` | For a GitHub-hosted runner (needs `SBCTL_CI=1` or `GITHUB_ACTIONS` in the environment, which `sudo` drops: `sudo env SBCTL_CI=1 studio/ci-prepare.sh`): frees disk, adds 6 GB swap, installs zstd, curl, git, python3 and build-essential when missing. |
 | `verify.sh` | Starts a packaged build on a loopback port and checks it (also run by `build.sh` before it writes the artifact). |
-| `runtime/` | What goes into the artifact: launcher, entrypoint, runtime substitution, packaging fixups, and their tests. |
+| `runtime/` | What goes into the artifact: launcher, entrypoint, runtime substitution and its tests. |
 | `placeholders.json` | The per-install values baked into the build as placeholders. |
 | `PATCHSET` | Revision `N` in the artifact name. Bump it when the patches or `runtime/` change without a new upstream tag. |
 | `mock/` | Mock Management API (Go, `package main`). See `mock/README.md`. |
@@ -55,9 +55,11 @@ Next inlines `NEXT_PUBLIC_*` and evaluates the CSP at build time, so `build.sh` 
 
 `/_next/static` chunks keep their file names when a value changes, and Next serves them as immutable. After changing `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_GOTRUE_URL` on a running install, users need a hard reload once.
 
-### Packaging fixups
+### Studio's own routes the proxy answers
 
-`runtime/package-fixups.mjs` edits generated output before the scan: it rewrites `/api/incident-banner` to a static `{"incidents": []}` (`public/sbctl/incident-banner.json` plus one `beforeFiles` rewrite in `routes-manifest.json`). Without it, sign-in took 22 s in the spike (research/08 section 9). This is not a source patch; the script stops the packaging if the route or the manifest shape changes.
+Studio asks its own `/api/incident-banner` route for incident.io banners on every page. Without an incident.io key it answers 500, react-query retries it after 1, 4 and 16 s, and the sign-in form awaits that query, so the redirect after sign-in took 22 s in the spike (research/08 section 9). The artifact is not changed for this: sbctl's proxy answers `GET studio.<domain>/api/incident-banner` itself with `{"incidents":[]}` (`internal/proxy`), so Studio keeps exactly the three patches. Running the artifact without the proxy (`verify.sh`) shows the 500; the spike's browser script answers the route itself for the same reason.
+
+The proxy also rewrites the Content-Security-Policy that Studio sends so that the browser cannot reach `usercentrics.eu`, the consent-banner vendor Studio calls on every page load (`internal/proxy`, `studio.go`).
 
 ## Patches, as reviewed
 
@@ -74,14 +76,14 @@ sudo studio/ci-prepare.sh          # GitHub-hosted runner only
 studio/build.sh linux-amd64        # or linux-arm64, on a machine of that architecture
 ```
 
-`build.sh` downloads its own checksum-pinned Node and pnpm, so it needs nothing preinstalled beyond `git`, `curl`, `tar` and `zstd`. `spike.sh` does not: it needs `go` (to build the mock; or set `SPIKE_MOCK_BIN` to a prebuilt binary), `node` with `npm` (for `playwright-core`), and, for the browser, `sudo` without a password or root for `playwright install-deps` (the browser binaries themselves are installed as the invoking user). There is no CI workflow in this directory; whoever owns `.github/` needs to wire `actions/setup-go` and `actions/setup-node` before the `spike.sh` step, plus the cache and artifact upload of `studio/.build-cache/spike/out`.
+`build.sh` downloads its own checksum-pinned Node and pnpm, so it needs nothing preinstalled beyond `git`, `curl`, `tar`, `zstd` and `python3`, plus a C toolchain (`build-essential`: the pnpm install compiles native modules such as `libpg-query`, as upstream's Dockerfile does) for the real build; `STUDIO_PREBUILT` packaging needs only `curl`, `tar`, `zstd` and `node`'s download. `spike.sh` does not: it needs `go` (to build the mock; or set `SPIKE_MOCK_BIN` to a prebuilt binary), `node` with `npm` (for `playwright-core`), and, for the browser, `sudo` without a password or root for `playwright install-deps` (the browser binaries themselves are installed as the invoking user). The `studio` workflow (`.github/workflows/studio.yml`) runs `ci-prepare.sh`, `build.sh` and `spike.sh` on amd64 and arm64 runners and uploads `studio/dist` and `studio/.build-cache/spike/out`.
 
 `build.sh` runs `next build` with one static-generation worker (`STUDIO_BUILD_WORKERS`, set through `CIRCLE_NODE_TOTAL`, which Next uses to size its worker pool) and a 4 GB V8 heap per node process (`STUDIO_BUILD_HEAP_MB`), on any host size. Expect about 9 GB of disk and a peak near 8 GB of RAM for `next build` (Turbopack; measured on the maintainer's Mac, not on a runner); `build.sh` prints the peak from `/usr/bin/time -v` and warns if RAM plus swap is under 11 GB. The artifact is about 75 MB compressed (the repackaged Mac output measured 73 MB). `STUDIO_UNTIL=prune` runs only the fetch, patch, prune and lockfile check (a few minutes, 300 MB).
 
 ## Test it
 
 ```bash
-node --test studio/runtime/test/                     # substitution, fixups (13 cases)
+node --test studio/runtime/test/                     # substitution (placeholders, runtime config)
 go test ./studio/mock/                               # the mock (needs no Studio)
 STUDIO_PREBUILT=<apps/studio with .next/standalone> studio/build.sh <platform>   # packaging, launcher and verify.sh without the Next build
 studio/spike.sh                                      # whole spike; see the header of the script

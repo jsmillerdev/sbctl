@@ -388,7 +388,7 @@ func TestPlatformProjectOperations(t *testing.T) {
 	if rec := f.do("GET", "/platform/projects/"+ref+"/status", nil); jsonField(t, rec, "status") != "INACTIVE" {
 		t.Fatalf("status: %s", rec.Body)
 	}
-	if rec := f.do("POST", "/platform/projects/"+ref+"/restore", nil); rec.Code != 201 {
+	if rec := f.do("POST", "/platform/projects/"+ref+"/restore", nil); rec.Code != 200 {
 		t.Fatalf("restore: %d", rec.Code)
 	}
 	if rec := f.do("POST", "/platform/projects/"+ref+"/restart", nil); rec.Code != 201 || len(f.mgr.paused) != 2 || len(f.mgr.resumed) != 2 {
