@@ -122,6 +122,12 @@ func (s *server) pgMetaQuery(w *respWriter, r *http.Request, c *reqCtx) {
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
+		c.err = err.Error()
+		if r.Context().Err() != nil {
+			// The browser gave up (it navigated away); nothing to answer. 499 as nginx logs it.
+			w.WriteHeader(499)
+			return
+		}
 		w.message(http.StatusBadGateway, "postgres-meta unreachable: "+err.Error())
 		return
 	}

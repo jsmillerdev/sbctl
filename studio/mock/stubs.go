@@ -48,6 +48,12 @@ func stubHandler(w *respWriter, r *http.Request, c *reqCtx) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// Analytics endpoints (usage counts, logs) wrap rows in {"result": [...]}; the specs document no
+	// fields for them, and Studio shows "Failed to load" for a bare {}.
+	if strings.Contains(rt.template, "/analytics/endpoints/") {
+		w.json(200, map[string]any{"result": []any{}})
+		return
+	}
 	body := stubBody(rt.shape)
 	if body == nil {
 		w.WriteHeader(rt.shape.Status)

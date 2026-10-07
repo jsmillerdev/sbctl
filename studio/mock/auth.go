@@ -64,7 +64,9 @@ func (a *authState) verifyRequest(r *http.Request) (*user, string) {
 	if sub == "" {
 		return nil, "invalid"
 	}
-	if role, _ := claims["role"].(string); role != "authenticated" {
+	// GoTrue's `admin createuser` leaves the role claim empty, so the audience is what identifies
+	// a dashboard session.
+	if !audienceIncludes(claims["aud"], "authenticated") {
 		return nil, "invalid"
 	}
 	email, _ := claims["email"].(string)
@@ -156,4 +158,18 @@ func (a *authState) serve(w *respWriter, r *http.Request, body []byte) {
 	default:
 		w.json(http.StatusNotFound, map[string]any{"code": 404, "msg": "not found"})
 	}
+}
+
+func audienceIncludes(aud any, want string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == want
+	case []any:
+		for _, x := range v {
+			if s, _ := x.(string); s == want {
+				return true
+			}
+		}
+	}
+	return false
 }

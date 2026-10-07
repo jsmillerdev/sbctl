@@ -75,15 +75,12 @@ def parse(path):
                 for k in range(i + 1, end):
                     pm = re.match(r"^      (\S+?)(\?)?:(?: (.*))?$", lines[k])
                     if pm and not pm.group(2) and not pm.group(1).startswith("["):
-                        kind = zero_kind(pm.group(3) or "")
-                        if kind == "o":
-                            # an inline object type: it is an array when its closing brace is `}[]`
-                            j = k + 1
-                            while j < end and not lines[j].startswith("      }"):
-                                j += 1
-                            if j < end and lines[j].startswith("      }[]"):
-                                kind = "a"
-                        req.append((pm.group(1).strip("'"), kind))
+                        # the property's text: this line plus the lines up to the next property
+                        j = k + 1
+                        while j < end and not re.match(r"^      [\w'\[]", lines[j]):
+                            j += 1
+                        block = [(pm.group(3) or "")] + [l.strip() for l in lines[k + 1 : j] if not l.strip().startswith(("/**", "*", "//"))]
+                        req.append((pm.group(1).strip("'"), zero_kind(block)))
                 schemas[m.group(1)] = ("object", req)
                 i = end
             else:
@@ -92,29 +89,38 @@ def parse(path):
     return paths, ops, schemas
 
 
-def zero_kind(t):
-    """One letter for the neutral value of a field type: n null, s string, i number, b boolean,
-    a array, o object, or the first string literal of a union (prefixed with a quote)."""
-    t = t.strip()
-    if not t:
-        return "n"  # multi-line union: unknown, use null
-    if t.startswith("{"):
-        return "o"
-    if t.endswith("[]") or t.startswith("(") and t.endswith("[]"):
+def zero_kind(block):
+    """One letter for the neutral value of a field type, from the lines of its declaration:
+    n null, s string, i number, b boolean, a array, o object, or the first string literal of an
+    enum (prefixed with a quote)."""
+    first = block[0].strip()
+    last = block[-1].strip()
+    text = " ".join(block)
+    if len(block) > 1 and (last.endswith("[]") and (first.startswith(("{", "(")) or first == "")):
         return "a"
-    if "null" in t.split("|")[-1] or t.startswith("null"):
-        return "n"
-    if t.startswith("string"):
+    if first.startswith("{"):
+        return "o"
+    if first.endswith("[]") and not first.startswith("|"):
+        return "a"
+    if first.startswith("string"):
         return "s"
-    if t.startswith("number"):
+    if first.startswith("number"):
         return "i"
-    if t.startswith("boolean"):
+    if first.startswith("boolean"):
         return "b"
-    m = re.match(r"'([^']*)'", t)
+    if first.startswith("null"):
+        return "n"
+    m = re.match(r"'([^']*)'", first)
+    if not m and first == "" and len(block) > 1:
+        m = re.match(r"\|\s*'([^']*)'", block[1])
+        if not m and re.match(r"\|\s*\{", block[1]):
+            return "o"
     if m:
         return "'" + m.group(1)
-    if t.startswith("components["):
-        return "o"
+    if first.startswith("components["):
+        return "a" if first.endswith("[]") else "o"
+    if "null" in text.split("|")[-1]:
+        return "n"
     return "n"
 
 

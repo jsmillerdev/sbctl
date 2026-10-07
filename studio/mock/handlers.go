@@ -42,6 +42,31 @@ func (s *server) registerReal() {
 	s.handle("POST", "/platform/projects/{ref}/api-keys/temporary", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
 		w.json(201, map[string]any{"api_key": s.legacyKey(p, "service_role")})
 	}))
+	s.handle("GET", "/platform/projects/{ref}/databases", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
+		w.json(200, []map[string]any{s.primaryDatabase(p)})
+	}))
+	s.handle("GET", "/platform/projects/{ref}/databases-statuses", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
+		w.json(200, []map[string]any{{"identifier": p.Ref, "status": statusOK}})
+	}))
+	s.handle("GET", "/platform/projects/{ref}/config/postgrest", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
+		w.json(200, map[string]any{
+			"db_anon_role": "anon", "db_extra_search_path": "public,extensions", "db_schema": "public,storage,graphql_public",
+			"jwt_secret": p.JWTSecret, "max_rows": 1000, "role_claim_key": ".role",
+		})
+	}))
+	s.handle("GET", "/platform/projects/{ref}/config/storage", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
+		w.json(200, map[string]any{
+			"fileSizeLimit": 52428800, "migrationVersion": nil,
+			"capabilities": map[string]any{"iceberg_catalog": false, "list_v2": true},
+			"external":     map[string]any{"upstreamTarget": "main"},
+			"features": map[string]any{
+				"imageTransformation": map[string]any{"enabled": false},
+				"s3Protocol":          map[string]any{"enabled": false},
+				"icebergCatalog":      map[string]any{"enabled": false, "maxNamespaces": 0, "maxTables": 0, "maxCatalogs": 0},
+				"vectorBuckets":       map[string]any{"enabled": false, "maxBuckets": 0, "maxIndexes": 0},
+			},
+		})
+	}))
 	s.handle("GET", "/v1/projects/{ref}/api-keys", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
 		w.json(200, s.apiKeys(p))
 	}))
@@ -54,7 +79,7 @@ func (s *server) registerReal() {
 	s.handle("GET", "/v1/projects/{ref}/health", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
 		var out []map[string]any
 		for _, name := range []string{"auth", "db", "pooler", "realtime", "rest", "storage"} {
-			out = append(out, map[string]any{"name": name, "healthy": true, "status": "ACTIVE_HEALTHY"})
+			out = append(out, map[string]any{"name": name, "healthy": true, "status": "HEALTHY"})
 		}
 		w.json(200, out)
 	}))

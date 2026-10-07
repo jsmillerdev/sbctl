@@ -29,6 +29,7 @@ type logEntry struct {
 	Origin    string            `json:"origin,omitempty"`
 	Headers   map[string]string `json:"headers,omitempty"`
 	SQL       string            `json:"sql,omitempty"` // first 300 characters of a pg-meta query
+	Err       string            `json:"err,omitempty"` // upstream failure text
 }
 
 // requestLog appends JSON lines to a file; a nil file discards.

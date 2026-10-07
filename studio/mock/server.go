@@ -29,6 +29,7 @@ type reqCtx struct {
 	user   *user
 	body   []byte
 	sql    string // set by the pg-meta handler, for the request log
+	err    string // upstream error text for the request log
 }
 
 type handlerFunc func(w *respWriter, r *http.Request, c *reqCtx)
@@ -92,8 +93,10 @@ type server struct {
 
 func newServer(cfg *Config) (*server, error) {
 	s := &server{
-		cfg:     cfg,
-		client:  &http.Client{Timeout: 70 * time.Second},
+		cfg: cfg,
+		// postgres-meta (fastify) closes idle keep-alive connections after 5 s; closing ours sooner
+		// avoids a request landing on a connection the server just closed (seen as 502 EOF).
+		client:  &http.Client{Timeout: 70 * time.Second, Transport: &http.Transport{IdleConnTimeout: 2 * time.Second, MaxIdleConnsPerHost: 8}},
 		auth:    newAuthState(cfg),
 		content: map[string]map[string]any{},
 	}
@@ -264,6 +267,7 @@ func (s *server) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		entry.Handler = "real"
 	}
 	entry.SQL = c.sql
+	entry.Err = c.err
 }
 
 type routeKey struct{}

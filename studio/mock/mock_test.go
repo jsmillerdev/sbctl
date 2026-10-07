@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 const (
@@ -124,6 +127,20 @@ func TestAPIRequiresAValidDashboardToken(t *testing.T) {
 	code, body, _ := do(t, "GET", ts.URL+"/platform/profile", tok, "")
 	if code != 200 || !strings.Contains(string(body), `"primary_email":"admin@example.test"`) {
 		t.Fatalf("profile: %d %s", code, body)
+	}
+	// A GoTrue token from `admin createuser` has an empty role claim and still is a dashboard session.
+	emptyRole, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": "u1", "aud": "authenticated", "role": "", "email": "u@example.test", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(testJWTSecret))
+	if code, _, _ := do(t, "GET", ts.URL+"/platform/profile", emptyRole, ""); code != 200 {
+		t.Fatalf("empty role claim: %d", code)
+	}
+	// A project API key is not a dashboard session.
+	apiKey, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss": "supabase", "ref": refA, "role": "service_role", "sub": "x", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(testJWTSecret))
+	if code, _, _ := do(t, "GET", ts.URL+"/platform/profile", apiKey, ""); code != 401 {
+		t.Fatalf("service key accepted as dashboard session: %d", code)
 	}
 }
 
@@ -304,7 +321,7 @@ func TestCORS(t *testing.T) {
 func TestStubsFollowTheDocumentedShape(t *testing.T) {
 	_, ts, tok := newTestServer(t, "")
 	// documented array -> []
-	code, body, _ := do(t, "GET", ts.URL+"/platform/projects/"+refA+"/databases", tok, "")
+	code, body, _ := do(t, "GET", ts.URL+"/platform/projects/"+refA+"/load-balancers", tok, "")
 	if code != 200 || strings.TrimSpace(string(body)) != "[]" {
 		t.Fatalf("array stub: %d %s", code, body)
 	}
@@ -318,6 +335,11 @@ func TestStubsFollowTheDocumentedShape(t *testing.T) {
 	code, _, _ = do(t, "POST", ts.URL+"/platform/telemetry/event", tok, `{}`)
 	if code != 201 {
 		t.Fatalf("telemetry event: %d", code)
+	}
+	// analytics endpoints wrap rows in result
+	code, body, _ = do(t, "GET", ts.URL+"/platform/projects/"+refA+"/analytics/endpoints/usage.api-counts?interval=1hr", tok, "")
+	if code != 200 || strings.TrimSpace(string(body)) != `{"result":[]}` {
+		t.Fatalf("analytics stub: %d %s", code, body)
 	}
 	// not documented at all: baseline from the supastack mock
 	if code, body, _ = do(t, "GET", ts.URL+"/platform/never/heard/of/it", tok, ""); code != 200 || strings.TrimSpace(string(body)) != "{}" {
@@ -353,7 +375,7 @@ func TestRequestLogAndSummarize(t *testing.T) {
 	do(t, "GET", ts.URL+"/platform/profile", tok, "")
 	do(t, "GET", ts.URL+"/platform/profile", tok, "")
 	do(t, "GET", ts.URL+"/platform/projects/"+refA, tok, "")
-	do(t, "GET", ts.URL+"/platform/projects/"+refA+"/databases", tok, "")
+	do(t, "GET", ts.URL+"/platform/projects/"+refA+"/load-balancers", tok, "")
 	do(t, "GET", ts.URL+"/platform/zzz", tok, "")
 	do(t, "OPTIONS", ts.URL+"/platform/profile", "", "", "Origin", studioOrigin)
 	s.log.close()
@@ -381,7 +403,7 @@ func TestRequestLogAndSummarize(t *testing.T) {
 	for _, want := range []string{
 		"| GET | `/platform/profile` | 2 | 200 x2 | real x2 |",
 		"| GET | `/platform/projects/{ref}` | 1 |",
-		"| GET | `/platform/projects/{ref}/databases` | 1 | 200 x1 | stub x1 |",
+		"| GET | `/platform/projects/{ref}/load-balancers` | 1 | 200 x1 | stub x1 |",
 		"| GET | `/platform/zzz` | 1 | 200 x1 | unknown x1 |",
 	} {
 		if !strings.Contains(out, want) {
@@ -415,4 +437,34 @@ func TestConfigValidation(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
+}
+
+func TestClientCancelIsNotAServerError(t *testing.T) {
+	block := make(chan struct{})
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-block }))
+	defer fake.Close()
+	defer close(block)
+	s, ts, tok := newTestServer(t, fake.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "POST", ts.URL+"/platform/pg-meta/"+refA+"/query", strings.NewReader(`{"query":"select pg_sleep(60)"}`))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-Connection-Encrypted", "x")
+	if _, err := http.DefaultClient.Do(req); err == nil {
+		t.Fatal("expected the client to give up")
+	}
+	// the mock logs the cancelled request as 499, not 502
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		raw, _ := os.ReadFile(s.cfg.RequestLog)
+		if strings.Contains(string(raw), `"status":499`) {
+			return
+		}
+		if strings.Contains(string(raw), `"status":502`) {
+			t.Fatalf("cancelled request logged as 502:\n%s", raw)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("no 499 in the request log")
 }

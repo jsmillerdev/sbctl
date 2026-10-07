@@ -93,6 +93,9 @@ check_round() { # api origin, hosts-regex-literal
   echo "$headers" | grep -i '^content-security-policy:' | grep -qF "$api" || fail "CSP does not allow $api"
   echo "$headers" | grep -i '^content-security-policy:' | grep -qF "wss://$host_a" || fail "CSP does not allow wss://$host_a"
   if echo "$headers" | grep -qi 'sbctl-placeholder'; then fail "CSP still has a placeholder"; fi
+  # CSP source expressions with a path match that exact path only, so the API origin must appear
+  # as a bare origin token (an entry like https://host/platform would block /platform/profile).
+  echo "$headers" | grep -i '^content-security-policy:' | tr ' ;' '\n\n' | grep -qxF "$api" || fail "CSP has no bare $api token"
   ok "CSP carries $api and wss://$host_a"
 
   # IS_PLATFORM is baked in: platform mode answers 404 for Studio's own /api/platform/* routes.

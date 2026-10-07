@@ -183,3 +183,13 @@ func (s *server) apiKeys(p *Project) []map[string]any {
 	}
 	return []map[string]any{mk("anon", "anon", "anon"), mk("service_role", "service_role", "service_role")}
 }
+
+// primaryDatabase is the project's only database entry (no replicas).
+func (s *server) primaryDatabase(p *Project) map[string]any {
+	return map[string]any{
+		"identifier": p.Ref, "cloud_provider": provider, "region": region, "status": statusOK, "size": "micro",
+		"inserted_at": createdAt, "db_host": "db." + s.host(p), "db_name": "postgres", "db_port": 5432, "db_user": "postgres",
+		"restUrl": fmt.Sprintf("%s://%s/rest/v1/", s.cfg.Scheme, s.host(p)), "connectionString": s.connectionString(p),
+		"connection_string_read_only": nil,
+	}
+}
