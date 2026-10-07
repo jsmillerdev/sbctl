@@ -293,6 +293,8 @@ func TestPostgRESTSettings(t *testing.T) {
 		t.Error("db_pool 0 means default and must not render")
 	}
 	wantInvalid(t, m, PostgREST, map[string]any{"db_schema": `pub"lic`}, "quote")
+	wantInvalid(t, m, PostgREST, map[string]any{"db_schema": " , "}, "at least one schema")
+	patch(t, m, PostgREST, map[string]any{"db_extra_search_path": ""}) // an empty search path is fine
 	wantInvalid(t, m, PostgREST, map[string]any{"max_rows": float64(-1)}, "between")
 }
 

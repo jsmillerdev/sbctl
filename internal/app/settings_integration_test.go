@@ -426,6 +426,16 @@ func TestSettingsIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("postgrest refuses an empty schema list", func(t *testing.T) {
+		code, out := api("PATCH", cfgPath+"/postgrest", map[string]any{"db_schema": ""})
+		if code != 400 || !strings.Contains(string(out), "at least one schema") {
+			t.Fatalf("empty db_schema: %d %s", code, out)
+		}
+		if c, _, _ := project("GET", "/rest/v1/items", nil, "apikey", keys.PublishableKey, "Accept-Profile", "api_extra"); c != 200 {
+			t.Fatalf("the exposed schema stopped being served after a rejected save: %d", c)
+		}
+	})
+
 	t.Run("storage upload limit", func(t *testing.T) {
 		svc := "Bearer " + keys.SecretKey
 		hdr := []string{"apikey", keys.SecretKey, "Authorization", svc, "Content-Type", "application/json"}

@@ -23,18 +23,30 @@ func schemaList(v any) any {
 func buildPostgRESTSchema() *Schema {
 	schemas := Field{Name: "db_schema", Kind: String, Env: "PGRST_DB_SCHEMAS", Default: "public,graphql_public", Normalize: schemaList, MaxLen: 2048,
 		Check: func(v any) error {
+			n := 0
 			for _, s := range strings.Split(v.(string), ",") {
 				if s = strings.TrimSpace(s); s == "" {
 					continue
 				}
+				n++
 				if strings.ContainsAny(s, "\"'\\") {
 					return fmt.Errorf("schema name %q contains a quote or backslash", s)
 				}
 			}
+			if n == 0 {
+				// PostgREST falls back to "public" for an empty list, so "off" would not be
+				// what runs; the Data API cannot be switched off on a node.
+				return fmt.Errorf("must list at least one schema (the Data API cannot be switched off)")
+			}
 			return nil
 		}}
 	path := Field{Name: "db_extra_search_path", Kind: String, Env: "PGRST_DB_EXTRA_SEARCH_PATH", Default: "public,extensions", Normalize: schemaList, MaxLen: 2048,
-		Check: schemas.Check}
+		Check: func(v any) error {
+			if strings.TrimSpace(v.(string)) == "" {
+				return nil
+			}
+			return schemas.Check(v)
+		}}
 	return NewSchema(PostgREST, []Field{
 		schemas, path,
 		{Name: "max_rows", Kind: Int, Env: "PGRST_DB_MAX_ROWS", Default: int64(1000), Min: 0, Max: 1000000, HasRange: true},
