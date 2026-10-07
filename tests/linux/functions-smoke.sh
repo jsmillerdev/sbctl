@@ -171,9 +171,12 @@ ok() { echo "probe: ok $*"; }
 cat /proc/self/environ >/dev/null 2>&1 && ok "reads its own /proc/self/environ" || violate "cannot read /proc/self/environ (control)"
 ls /var/lib/sbctl/artifacts >/dev/null 2>&1 && ok "reads the artifacts" || violate "cannot read the artifacts (control)"
 touch /var/cache/sb-edge-bundle/probe 2>/dev/null && ok "writes its cache directory" || violate "cannot write /var/cache/sb-edge-bundle (control)"
-touch /var/lib/sbctl/system/edge-bundle/work/out/probe 2>/dev/null && ok "writes the output directory" || violate "cannot write the output directory (control)"
-# What it must not do.
+# The two files the daemon creates are writable, and nothing else can be made there.
+echo probe >/var/lib/sbctl/system/edge-bundle/work/out/out.eszip 2>/dev/null && ok "writes the output file" || violate "cannot write the output file (control)"
+touch /var/lib/sbctl/system/edge-bundle/work/out/other 2>/dev/null && violate "creates a file next to the output files"
 touch /var/lib/sbctl/system/edge-bundle/work/src/probe 2>/dev/null && violate "writes the sources"
+rm -f /var/lib/sbctl/system/edge-bundle/work/out/out.eszip 2>/dev/null && violate "deletes the output file"
+# What it must not do.
 env_file="$PROBE_TENANTS/$PROBE_REF/functions-env.json"
 cat "$env_file" >/dev/null 2>&1 && violate "reads $env_file"
 for pid in $PROBE_RT_PID $PROBE_DAEMON_PID; do
@@ -193,6 +196,8 @@ done
 PROBE
 chmod 0755 /usr/local/sbin/sbctl-bundle-probe
 install -d -o "$SBCTL_USER" -g "$SBCTL_USER" -m 0755 "$SBCTL_STATE/system/edge-bundle/work/src" "$SBCTL_STATE/system/edge-bundle/work/out"
+install -m 0666 /dev/null "$SBCTL_STATE/system/edge-bundle/work/out/out.eszip"
+chown "$SBCTL_USER:$SBCTL_USER" "$SBCTL_STATE/system/edge-bundle/work/out/out.eszip"
 cat >/run/systemd/system/$B.d/90-probe.conf <<CONF
 [Service]
 Environment=PROBE_RT_PID=$RT_PID PROBE_DAEMON_PID=$DAEMON_PID PROBE_SBCTL_UID=$(id -u "$SBCTL_USER") PROBE_TENANTS=$SBCTL_STATE/system/edge-runtime/tenants PROBE_REF=$REF_A
