@@ -18,6 +18,8 @@ Metadata:
         Parameters: [DomainName, HostedZoneId]
       - Label: { default: "Access (optional)" }
         Parameters: [AccessCidr, EnableSessionManager, SshCidr, KeyName]
+      - Label: { default: "Master key copy (optional; leave empty to run escrow-key yourself)" }
+        Parameters: [KeyEscrowPassphrase]
       - Label: { default: "Advanced (leave empty unless you know you need them)" }
         Parameters: [VpcId, SubnetId, AmiId, DataSnapshotId]
     ParameterLabels:
@@ -25,6 +27,7 @@ Metadata:
       InstanceType: { default: Instance type }
       DataVolumeSize: { default: Data volume size (GiB) }
       DailySnapshotsKept: { default: Daily data volume snapshots to keep (0 = none) }
+      KeyEscrowPassphrase: { default: Passphrase for an encrypted copy of the master key (empty = none) }
       SupaviseVersion: { default: Supavise release }
       DomainName: { default: Domain name }
       HostedZoneId: { default: Route 53 hosted zone ID }
@@ -97,6 +100,22 @@ Parameters:
     AllowedPattern: "^(latest|v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?)$"
     ConstraintDescription: Enter "latest" or a release tag such as v1.2.3.
     Description: The Supavise release to install. The template of a release names that release here.
+  KeyEscrowPassphrase:
+    Type: String
+    NoEcho: true
+    Default: ""
+    AllowedPattern: "^$|^.{12,128}$"
+    ConstraintDescription: Enter at least 12 characters (at most 128), or leave it empty.
+    Description: >-
+      Optional. A passphrase of at least 12 characters that you keep: the installer then stores a copy
+      of the node's master key and config.toml, encrypted with it, in the backup bucket (the master key
+      is the one thing the bucket cannot rebuild a node without). Leave it empty to keep the key by
+      hand (supavise system export-key, or system escrow-key on the instance). The stack hands the
+      passphrase to the instance through a Secrets Manager secret, never through user data, and the
+      instance overwrites the secret with a note once the key is stored. Do not start it with ESCROWED:. Write the passphrase down
+      offline: nothing on the node keeps it and without it the copy cannot be opened. Set it when
+      creating the stack and keep it on later updates (an update that leaves it empty removes the
+      secret); changing it later does not re-encrypt a copy that exists.
   DomainName:
     Type: String
     Default: ""
@@ -217,6 +236,7 @@ Conditions:
   HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
   HasAmiId: !Not [!Equals [!Ref AmiId, ""]]
   HasDataSnapshot: !Not [!Equals [!Ref DataSnapshotId, ""]]
+  HasKeyEscrow: !Not [!Equals [!Ref KeyEscrowPassphrase, ""]]
   DailySnapshotsOn: !Not [!Equals [!Ref DailySnapshotsKept, "0"]]
   SessionManagerOn: !Equals [!Ref EnableSessionManager, "true"]
   CreateNetwork: !Equals [!Ref VpcId, ""]
@@ -432,6 +452,21 @@ Resources:
       Description: One-time token that creates the first Supavise dashboard administrator at /claim. Single use; replace by running "sudo -u supavise supavise claim token" on the instance.
       SecretString: "pending - the instance writes the token here when the install finishes"
 
+  # Only the transport of KeyEscrowPassphrase to the instance (user data would show it to anyone who may
+  # describe the instance). The instance reads it once, hands it to the installer in a file that only
+  # root can read, and overwrites the secret with a note, so that it does not stay in the account.
+  KeyEscrowSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasKeyEscrow
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_149
+            comment: Holds the passphrase only until the instance has used it and replaced it with a note; the AWS managed key (aws/secretsmanager) is enough and needs no key policy.
+    Properties:
+      Description: Passphrase for the encrypted copy of the master key, kept here only until the instance has used it (then replaced by a note). Never commit or share it; keep your own offline copy.
+      SecretString: !Ref KeyEscrowPassphrase
+
   # ---- identity ------------------------------------------------------------------------
   InstanceRole:
     Type: AWS::IAM::Role
@@ -458,6 +493,19 @@ Resources:
               - Effect: Allow
                 Action: "secretsmanager:PutSecretValue"
                 Resource: !Ref ClaimTokenSecret
+  # The passphrase secret: read it once, replace it once, and nothing else. Optional like the secret.
+  KeyEscrowPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasKeyEscrow
+    Properties:
+      PolicyName: key-escrow-passphrase
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
+            Resource: !Ref KeyEscrowSecret
   # DNS-01 certificates: change TXT records named _acme-challenge.<something under the domain>
   # in the one hosted zone and nothing else. The A records are the stack's own (DnsRecords). The
   # instance role is also what an attacker who reaches the instance metadata service would hold,
@@ -590,6 +638,9 @@ Resources:
             exec > >(tee -a /var/log/supavise-bootstrap.log) 2>&1
             set -uo pipefail
             export DEBIAN_FRONTEND=noninteractive
+            # The key escrow passphrase, when there is one, is written to this file for the installer. It
+            # is removed whichever way the script ends (and no command here prints it or runs with -x).
+            trap 'shred -u /root/key-passphrase 2>/dev/null || rm -f /root/key-passphrase' EXIT
             # The snap fallback below installs the AWS CLI to /snap/bin, which cloud-init's PATH lacks.
             export PATH="$PATH:/snap/bin"
             HANDLE_URL='${InstallHandle}'
@@ -714,6 +765,7 @@ Resources:
             esac
             ${DomainArgs}
             ${VersionArgs}
+            ${KeyEscrowFetch}
             bash /root/supavise-install.sh "$@" || fail "the supavise installer failed"
 
             step "storing the claim token"
@@ -733,6 +785,7 @@ Resources:
                 >/dev/null || echo "could not update the claim token secret"
             fi
             rm -f /root/supavise-install.sh
+            ${KeyEscrowDone}
 
             step "done"
             signal SUCCESS "supavise is installed"
@@ -751,6 +804,38 @@ Resources:
               - IsLatest
               - "true"
               - !Sub "set -- \"$@\" --version '${SupaviseVersion}'"
+            # An instance that is replaced in the same stack finds the note in the secret: the master key
+            # is already escrowed (it is on the data volume and in the bucket), so it installs without one.
+            KeyEscrowFetch: !If
+              - HasKeyEscrow
+              - !Sub |
+                  step "reading the key escrow passphrase"
+                  # ${KeyEscrowPolicy} is attached by now; IAM can take a moment to show it to this instance.
+                  got=0
+                  for i in $(seq 1 12); do
+                    if (umask 077; aws secretsmanager get-secret-value --region "$REGION" --secret-id '${KeyEscrowSecret}' \
+                      --query SecretString --output text > /root/key-passphrase); then got=1; break; fi
+                    sleep 5
+                  done
+                  [ "$got" = 1 ] || fail "cannot read the key escrow secret"
+                  if [ "$(head -c 9 /root/key-passphrase)" = 'ESCROWED:' ]; then
+                    echo "the key escrow passphrase was used on an earlier install of this stack: no new copy of the key"
+                    rm -f /root/key-passphrase
+                  else
+                    set -- "$@" --key-passphrase-file /root/key-passphrase
+                  fi
+              - "true"
+            KeyEscrowDone: !If
+              - HasKeyEscrow
+              - !Sub |
+                  if [ -s /root/key-passphrase ]; then
+                    step "removing the key escrow passphrase from Secrets Manager"
+                    aws secretsmanager put-secret-value --region "$REGION" --secret-id '${KeyEscrowSecret}' \
+                      --secret-string 'ESCROWED: the master key was copied to the backup bucket, encrypted with the passphrase you gave as KeyEscrowPassphrase. This note replaced the passphrase, which nothing on the node keeps.' \
+                      >/dev/null || echo "could not replace the passphrase in Secrets Manager: overwrite the secret by hand"
+                    shred -u /root/key-passphrase 2>/dev/null || rm -f /root/key-passphrase
+                  fi
+              - "true"
 
   # DNS records, when the stack owns the zone. The wildcard covers every project.
   DnsRecords:
