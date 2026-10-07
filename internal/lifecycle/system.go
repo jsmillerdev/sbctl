@@ -157,6 +157,15 @@ type Node struct {
 	Settings *projectconfig.Manager
 }
 
+// newSettings is the saved-settings manager over the registry's database.
+func (o *OpenOptions) newSettings(cfg *config.Config, reg *registry.Postgres, sec secrets.Secrets) *projectconfig.Manager {
+	return projectconfig.NewManager(projectconfig.NewPGStore(reg.Pool()), sec, projectconfig.Options{
+		TemplateBaseURL: TemplateBaseURL(cfg),
+		Event:           func(ctx context.Context, ref, kind string, payload any) { _ = reg.AppendEvent(ctx, ref, kind, payload) },
+		Log:             o.log(),
+	})
+}
+
 // TemplateBaseURL is where a project's GoTrue fetches its email templates: the daemon's
 // loopback admin listener (internal/api serves /internal/templates/<ref>/<name>).
 func TemplateBaseURL(cfg *config.Config) string {
@@ -231,11 +240,7 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	bk := o.lateBackup(node)
 	po := o.planeOptions()
 	po.Backup = bk
-	node.Settings = projectconfig.NewManager(projectconfig.NewPGStore(reg.Pool()), sec, projectconfig.Options{
-		TemplateBaseURL: TemplateBaseURL(cfg),
-		Event:           func(ctx context.Context, ref, kind string, payload any) { _ = reg.AppendEvent(ctx, ref, kind, payload) },
-		Log:             o.log(),
-	})
+	node.Settings = o.newSettings(cfg, reg, sec)
 	po.Settings = node.Settings
 	node.Plane = NewPostgresPlane(cfg, sup, arts, reg, po)
 	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
@@ -450,7 +455,9 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	plane.reg = reg
 	bk := o.lateBackup(node)
 	plane.opts.Backup = bk
-	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup)})
+	node.Settings = o.newSettings(cfg, reg, sec)
+	plane.opts.Settings = node.Settings
+	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
 	node.Engine = eng
 
 	if existing {
