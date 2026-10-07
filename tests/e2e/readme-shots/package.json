@@ -1,0 +1,13 @@
+{
+  "name": "supavise-readme-shots",
+  "private": true,
+  "type": "module",
+  "description": "Seeds a Supavise node and captures the Studio screenshots used in README.md (see README.md in this directory)",
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "@supabase/supabase-js": "2.117.3",
+    "playwright-core": "1.63.0",
+    "sharp": "0.35.5",
+    "supabase": "2.120.0"
+  }
+}
