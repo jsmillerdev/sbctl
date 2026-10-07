@@ -1,6 +1,6 @@
 # 08 - Studio platform-mode calls (static analysis)
 
-Status: first version, 2026-10-06, from source only. Studio at `supabase/supabase@94b8b06eb294cf6b217c68d30357566cc8f146d9` (= `versions.yaml` `studio.tag` 2026.10.05-sha-94b8b06), Next.js build, `NEXT_PUBLIC_IS_PLATFORM=true`. Nothing in this file was observed at runtime: section 9 is reserved for the request log of the dynamic spike (`studio/spike.sh`). Read it with that in mind: *stub* and *fail-soft* statements below are readings of the code, not measurements.
+Status: first version, 2026-10-06. Sections 1 to 8 are from source only; section 9 holds the results of a local dry run of the spike. Studio at `supabase/supabase@94b8b06eb294cf6b217c68d30357566cc8f146d9` (= `versions.yaml` `studio.tag` 2026.10.05-sha-94b8b06), Next.js build, `NEXT_PUBLIC_IS_PLATFORM=true`. Outside section 9 nothing in this file was observed at runtime: *stub* and *fail-soft* statements in sections 1 to 8 are readings of the code, not measurements. Section 9 is the request log of a local dry run of `studio/spike.sh` (mock Management API, real Postgres, GoTrue and postgres-meta, real Studio build output, headless Chrome); the CI run on Linux has not happened yet.
 
 Input for workstream B (Management API). Evidence level: facts about request shapes, headers and paths come from the source files named in each row. The three OpenAPI type files (`packages/api-types/types/{platform,api-v1,api-v2}.d.ts`, 297, 115 and 34 paths) are the response contract; B generates server types from the live specs, as `HANDOFF.md` section 1 says.
 
@@ -473,8 +473,9 @@ Counts: stub column `yes` 177, `defaults` 94, `no` 115.
 
 | Route | What it does | Needs outside access? |
 |---|---|---|
-| `/api/get-utc-time`, `/api/get-ip-address`, `/api/get-deployment-commit` | clock, caller IP, build commit | no |
-| `/api/incident-status`, `/api/incident-banner`, `/api/status-page`, `/api/status-override` | status banner and incident pages | yes: statuspage.io, incident.io; failures are logged and the banner stays empty (reading, unverified) |
+| `/api/get-utc-time`, `/api/get-ip-address`, `/api/get-deployment-commit` | clock, caller IP, build commit | no (`get-utc-time` answered 200 in `studio/verify.sh`) |
+| `/api/incident-banner` | incident.io banner list, requested on every page | yes: incident.io. Observed: answers 500 without a key, react-query retries after 1, 4 and 16 s, and the sign-in redirect waits for it (21 s). The artifact rewrites it to a static `{"incidents": []}` (section 9) |
+| `/api/incident-status`, `/api/status-page`, `/api/status-override` | status banner and incident pages | yes: statuspage.io, incident.io; not requested on the visited pages; failure behavior unverified |
 | `/api/ai/*` (sql generate, policy, title, filter, docs, onboarding, feedback) | AI assistant | yes: needs `OPENAI_API_KEY` (server env); absent key disables the assistant (reading, unverified) |
 | `/api/check-cname`, `/api/edge-functions/test`, `/api/edge-functions/body`, `/api/generate-attachment-url`, `/api/content/graphql`, `/api/parse-query`, `/api/scoped-access-token-permissions`, `/api/integrations/stripe-sync` | custom domains, edge function tester, support attachments, docs search, SQL parsing, token scopes, Stripe | mixed; none is on the four P0 flows |
 
@@ -492,29 +493,86 @@ Not Management API calls. They need the project hosts (`<ref>.api.<domain>`) rea
 
 ## 9. Dynamic spike results
 
-<!-- SPIKE-LOG:BEGIN (filled by hand from studio/spike.sh output; keep this marker) -->
+<!-- SPIKE-LOG:BEGIN (generated from studio/spike.sh results; replace with the CI run when it exists) -->
 
-Not yet run. The spike runs on an ephemeral Ubuntu 24.04 runner with `studio/spike.sh`. It writes `request-log.jsonl` (one JSON object per request the mock saw) and a screenshot per step into `$SPIKE_OUT`. Summarize the log with:
+### 9.1 Local dry run on darwin-arm64 (2026-10-06)
 
-```bash
-go run ./studio/mock summarize $SPIKE_OUT/request-log.jsonl > calls.md
-```
+This is a dry run of `studio/spike.sh` on the maintainer's Mac, not the CI run. What was real and what was not:
 
-Paste the output below and fill the last two columns by hand from the screenshots and the browser console.
+- Real: Postgres 17.11 (slim artifact, one cluster, `shared_buffers=16MB`, two databases cloned from the image's template and migrated by GoTrue), GoTrue v2.195.0 (real sign-in), postgres-meta v0.100.0, the packaged platform-mode Studio (`bin/studio` launcher, runtime substitution of all six placeholders), headless Google Chrome driven by Playwright 1.63.
+- Not real: the Studio build was not made by `build.sh` end to end. A Next.js output of the same upstream commit and the three patches, built earlier on this machine with placeholder values, was repackaged by `build.sh` (`STUDIO_PREBUILT`) after rewriting its placeholders to the current set. The Linux CI build, its memory use and the Linux artifacts have not been run. The Management API is the mock (`studio/mock`), not workstream B's server.
+- Result: 19 of 19 steps passed on the last run: sign-in, project list, then for each of the two projects table editor (rows of that project's `todos` table), SQL editor (`select current_database()` returns that project's database), project home, Auth users, Storage files, Database tables, Settings general and API keys; plus a check that the mock saw successful pg-meta queries for both projects and no 5xx. Wall time of the browser steps about 11 s.
+- The mock answered 44 distinct (method, template) pairs; **all 44 are rows of section 5** (no call was missed by the static scan on these pages). 27 of them were answered by a generic stub built from the specs (array becomes `[]`, object becomes its required fields with neutral values, analytics endpoints become `{"result": []}`); the pages rendered without Studio's error boundary. No unknown route was requested, so the catch-all (`GET {}`, other methods 204) never ran.
+- Pages not visited: Realtime, Edge Functions, Logs, Advisors, Integrations, Reports, Database sub-pages other than Tables, organization settings, account pages. Their rows in section 5 remain static readings.
 
-Spike build: `<artifact name and sha256>`; mock `<git sha>`; date `<date>`.
+Findings, in order of importance:
 
-| Method | Path template | Calls | Statuses the mock returned | Matched a row in section 5? | Fail-soft: did the page render without it? | Notes |
-|---|---|---|---|---|---|---|
-| | | | | | | |
+1. **Sign-in took 22 s.** After the token call Studio waited for `GET /api/incident-banner` (Studio's own route) to finish: it answers 500 without an incident.io key, react-query retries it after 1 s, 4 s and 16 s, and the sign-in form awaits the query cache reset. The artifact now rewrites that route to a static `{"incidents": []}` (`studio/runtime/package-fixups.mjs`); sign-in then takes about 1 s. `studio/verify.sh` checks the route.
+2. **A stub with `null` for an array crashes a page.** `GET /v1/projects/{ref}/upgrade/eligibility` with `validation_errors: null` threw in Settings/General. Stubs must return `[]` for array fields, not `null`; the mock's generator now derives that from the spec.
+3. **Studio calls a third party on every page load**: `GET https://api.usercentrics.eu/settings//latest/languages.json` (18 calls, 403, empty settings id) although `NEXT_PUBLIC_USERCENTRICS_RULESET_ID` is unset. It fails soft but it is an outbound request from the browser. Not fixable without a fourth patch; the CSP allows it by default.
+4. Values the P0 handlers must get right beyond the required fields: `/v1/projects/{ref}/health` entries use `status: "HEALTHY"`; `GET /platform/projects/{ref}/databases` must return the primary database; the project `region` must be a real AWS region code; the project database needs GoTrue's migrated `auth` schema or the Users page reports `column users.banned_until does not exist`.
+5. GoTrue's `admin createuser` leaves `auth.users.role` empty, so the access token carries `"role": ""`. B must identify a dashboard session by `aud: "authenticated"` and a valid signature, not by the role claim.
+6. postgres-meta closes idle keep-alive connections after 5 s. A Go client that reuses a connection at that moment sees `EOF`; set `IdleConnTimeout` below 5 s (the mock uses 2 s) or retry. A browser navigation cancels in-flight queries; do not log that as a server error.
+7. Console noise that does not matter: `Minified React error #418` once on `/sign-in` (hydration text mismatch from the "last used" badge), Monaco `Canceled` rejections, a hard-coded probe of Supabase's edge-functions health host (blocked by the CSP).
 
-Step results (fill from `$SPIKE_OUT/steps.json`): sign-in, project list (two projects), table editor on each, SQL editor, project home, auth users, storage, database pages, settings and API keys.
+Resident memory after the run (macOS, RSS in MB, sums over each service's processes): Postgres 46, postgres-meta 106, GoTrue 31, mock 17, Studio 157 plus its launcher 35. These are not Linux numbers.
 
-Questions the spike must answer and this file cannot:
+Calls seen (generated with `mock summarize`; last three columns filled from this run):
 
-1. Which of the `yes` rows does Studio really accept as an empty `200 {}` or `[]` (no console error, no blocking toast)?
-2. Which unknown routes can a catch-all answer (`GET {}`, others `204`, the supastack baseline) without a visible regression?
-3. Does any P1 call block rendering that this file marks as non-blocking?
-4. Are there calls this scan missed (paths built at runtime)? Every path in the log that is not in section 5 is one.
+| Method | Path template | Calls | Statuses the mock returned | Answered by | In section 5? | Fail-soft: did the page render without it? | Notes |
+|---|---|---|---|---|---|---|---|
+| GET | `/platform/auth/{ref}/config` | 8 | 200 x8 | stub x8 | yes (P1) | yes: pages rendered, no error boundary | stub with neutral values for the required fields rendered the Auth pages |
+| GET | `/platform/database/{ref}/backups` | 2 | 200 x2 | stub x2 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/integrations/github/authorization` | 16 | 200 x16 | stub x16 | yes (P2) | yes: pages rendered, no error boundary | every project page (16 calls); stub |
+| GET | `/platform/integrations/github/connections` | 3 | 200 x3 | stub x3 | yes (P2) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/integrations/{slug}` | 1 | 200 x1 | stub x1 | yes (P2) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/notifications` | 18 | 200 x18 | stub x18 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/organizations` | 17 | 200 x17 | real x17 | yes (P0) | n/a (real handler) |  |
+| GET | `/platform/organizations/{slug}/entitlements` | 15 | 200 x15 | real x15 | yes (P1) | n/a (real handler) | granted every key as a boolean; numeric keys carry {unlimited: true} |
+| GET | `/platform/organizations/{slug}/oauth/apps` | 2 | 200 x2 | stub x2 | yes (P2) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/organizations/{slug}/projects` | 3 | 200 x3 | real x3 | yes (P0) | n/a (real handler) |  |
+| GET | `/platform/organizations/{slug}/usage` | 15 | 200 x15 | stub x15 | yes (P1) | yes: pages rendered, no error boundary |  |
+| POST | `/platform/pg-meta/{ref}/query` | 82 | 200 x82 | real x82 | yes (P0) | n/a (real handler) | 82 queries across the run; one client-cancelled (navigation) logged as 499 |
+| GET | `/platform/profile` | 18 | 200 x18 | real x18 | yes (P0) | n/a (real handler) |  |
+| POST | `/platform/profile/audit-login` | 1 | 201 x1 | stub x1 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/profile/permissions` | 18 | 200 x18 | real x18 | yes (P0) | n/a (real handler) |  |
+| GET | `/platform/projects` | 8 | 200 x8 | real x8 | yes (P0) | n/a (real handler) |  |
+| GET | `/platform/projects-resource-warnings` | 44 | 200 x44 | stub x44 | yes (P1) | yes: pages rendered, no error boundary | refetched on every page (43 calls); stub [] |
+| GET | `/platform/projects/{ref}` | 16 | 200 x16 | real x16 | yes (P0) | n/a (real handler) |  |
+| GET | `/platform/projects/{ref}/analytics/endpoints/usage.api-counts` | 2 | 200 x2 | stub x2 | yes (P1) | partly: "{}" showed a failure banner, "{"result": []}" does not | a bare {} showed "Failed to load project usage" on the project home; {"result": []} renders zero counts |
+| GET | `/platform/projects/{ref}/billing/addons` | 6 | 200 x6 | stub x6 | yes (P2) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/projects/{ref}/config/postgrest` | 2 | 200 x2 | real x2 | yes (P1) | n/a (real handler) |  |
+| GET | `/platform/projects/{ref}/config/secrets/update-status` | 2 | 200 x2 | stub x2 | yes (P2) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/projects/{ref}/config/storage` | 9 | 200 x9 | real x9 | yes (P1) | n/a (real handler) | real shape needed for the storage page; stub values rendered |
+| GET | `/platform/projects/{ref}/content` | 4 | 200 x4 | stub x4 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/projects/{ref}/content/count` | 2 | 200 x2 | stub x2 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/projects/{ref}/content/folders` | 2 | 200 x2 | stub x2 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/projects/{ref}/databases` | 16 | 200 x16 | real x16 | yes (P1) | n/a (real handler) | must list the primary database; an empty list made the SQL editor offer a "Read Replica" source |
+| GET | `/platform/projects/{ref}/databases-statuses` | 2 | 200 x2 | real x2 | yes (P1) | n/a (real handler) |  |
+| GET | `/platform/projects/{ref}/infra-monitoring` | 2 | 200 x2 | stub x2 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/projects/{ref}/load-balancers` | 2 | 200 x2 | stub x2 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/projects/{ref}/run-lints` | 18 | 200 x18 | stub x18 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/projects/{ref}/service-versions` | 2 | 200 x2 | stub x2 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/projects/{ref}/settings` | 8 | 200 x8 | real x8 | yes (P0) | n/a (real handler) | region must be a real AWS region code: an unknown one requests /img/regions/undefined.svg (404) |
+| GET | `/platform/storage/{ref}/buckets` | 2 | 200 x2 | stub x2 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/platform/stripe/invoices/overdue` | 18 | 200 x18 | stub x18 | yes (P2) | yes: pages rendered, no error boundary | every page, although billing is hidden (18 calls); stub |
+| GET | `/platform/telemetry/feature-flags` | 34 | 200 x33, 401 x1 | auth x1, stub x33 | yes (P1) | yes: pages rendered, no error boundary | one 401 before the session exists, then 200 with the stub; no visible effect |
+| GET | `/v1/projects/{ref}/api-keys` | 20 | 200 x20 | real x20 | yes (P1) | n/a (real handler) |  |
+| GET | `/v1/projects/{ref}/api-keys/legacy` | 2 | 200 x2 | real x2 | yes (P1) | n/a (real handler) |  |
+| GET | `/v1/projects/{ref}/branches` | 16 | 200 x16 | real x16 | yes (P1) | n/a (real handler) |  |
+| GET | `/v1/projects/{ref}/config/auth/signing-keys/legacy` | 2 | 200 x2 | stub x2 | yes (P1) | yes: pages rendered, no error boundary |  |
+| GET | `/v1/projects/{ref}/health` | 3 | 200 x3 | real x3 | yes (P1) | n/a (real handler) | status must be HEALTHY, not ACTIVE_HEALTHY, or the home tile shows Unhealthy |
+| POST | `/v1/projects/{ref}/network-bans/retrieve` | 16 | 201 x16 | stub x16 | yes (P2) | yes: pages rendered, no error boundary | POST on every project open (16 calls); stub {banned_ipv4_addresses: []} |
+| GET | `/v1/projects/{ref}/upgrade/eligibility` | 2 | 200 x2 | stub x2 | yes (P1) | no with null arrays (crash), yes with [] | array fields stubbed as null crashed Settings/General ("Cannot read properties of null (reading length)"); [] renders |
+| GET | `/v1/projects/{ref}/upgrade/status` | 3 | 200 x3 | stub x3 | yes (P1) | yes: pages rendered, no error boundary |  |
+
+Questions the spike must answer, and the state after the dry run:
+
+1. *Which `yes` rows does Studio accept as an empty `200`?* On the pages visited, every stubbed row above. Two needed more than `{}` (rows for `usage.api-counts` and `upgrade/eligibility`). Rows on unvisited pages are unanswered.
+2. *Can a catch-all answer unknown routes?* Not exercised: no unknown route was requested.
+3. *Does any P1 call block rendering that this file calls non-blocking?* No P1 call blocked a page. One non-P0 call blocked the sign-in redirect for 21 s (finding 1), through Studio's own route, not the Management API.
+4. *Were calls missed by the scan?* None on the visited pages.
+
+To refresh this section from a CI run: `studio/spike.sh` writes `request-log.jsonl`, `calls.md`, `steps.json` (steps, warnings, bad responses, console errors) and screenshots into `$SPIKE_OUT`; replace the table and the facts above with those and note the runner, artifact checksum and mock commit.
 
 <!-- SPIKE-LOG:END -->
