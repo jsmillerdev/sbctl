@@ -19,7 +19,8 @@ RUN apt-get update -qq && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /supavise
-COPY versions.yaml LICENSE ./
+COPY LICENSE ./
+COPY internal/versions/versions.yaml ./internal/versions/versions.yaml
 COPY studio ./studio
 
 # build.sh names the artifact after the host architecture (no cross builds), so the container's

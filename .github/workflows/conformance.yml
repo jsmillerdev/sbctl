@@ -8,7 +8,7 @@ on:
   push:
     branches: [main, ws/conformance]
   pull_request:
-    paths: [versions.yaml, "tests/conformance/**", ".github/workflows/conformance.yml"]
+    paths: [internal/versions/versions.yaml, "tests/conformance/**", ".github/workflows/conformance.yml"]
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * *"
@@ -83,7 +83,7 @@ jobs:
           path: ${{ runner.temp }}/specdiff-report.md
           if-no-files-found: ignore
 
-  # Every pin of versions.yaml (and the client pins of the suite) must still exist upstream;
+  # Every pin of internal/versions/versions.yaml (and the client pins of the suite) must still exist upstream;
   # newer releases are listed in the job summary and never fail the run.
   bump-check:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref != 'refs/heads/main'

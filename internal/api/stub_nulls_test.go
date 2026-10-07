@@ -21,7 +21,7 @@ func findNulls(v any, path string, out *[]string) {
 	}
 }
 
-// Studio's pages crash on a null where the schema has an array (research/08 section 9,
+// Studio's pages crash on a null where the schema has an array (docs/research/08 section 9,
 // finding 2: upgrade/eligibility validation_errors). No stub may contain a null at all:
 // arrays are [] and every other type has a neutral value.
 func TestStubsContainNoNulls(t *testing.T) {
@@ -47,7 +47,7 @@ func TestStubsContainNoNulls(t *testing.T) {
 }
 
 // Studio's project home shows "Failed to load project usage" for a bare {} from the analytics
-// endpoints and renders zero counts for {"result": []} (research/08 section 9). The stubs
+// endpoints and renders zero counts for {"result": []} (docs/research/08 section 9). The stubs
 // of every analytics endpoint must be the latter.
 func TestAnalyticsStubsWrapEmptyRows(t *testing.T) {
 	ops, err := Operations()

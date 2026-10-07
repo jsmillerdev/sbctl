@@ -73,7 +73,7 @@ async function step(name, fn) {
       throw new Error('Studio showed its error boundary')
     }
     // Banners such as "Failed to load project usage" do not fail a step (they mean a stub was not
-    // enough), but they are what section 9 of research/08 needs, so keep them.
+    // enough), but they are what section 9 of docs/research/08 needs, so keep them.
     for (const el of await page.getByText(/^Failed to (load|retrieve|fetch)/i).all()) {
       if (await el.isVisible().catch(() => false)) {
         warnings.push({ step: name, text: (await el.innerText()).slice(0, 200) })

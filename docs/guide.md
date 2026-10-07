@@ -106,7 +106,7 @@ A node needs about 1.5 GB of memory for itself and about 150 MB per idle project
 | `t4g.xlarge` | 16 GiB | about 90 |
 | `m7g.2xlarge` | 32 GiB | about 200 |
 
-These figures come from measurements up to 50 projects on amd64 and arm64 ([research/09-footprint.md](../research/09-footprint.md)); the 32 GiB row extends them. On AWS you pay AWS directly for the instance, storage and traffic; the deploy guide lists each item in [What it costs](../deploy/README.md#what-it-costs).
+These figures come from measurements up to 50 projects on amd64 and arm64 ([docs/research/09-footprint.md](research/09-footprint.md)); the 32 GiB row extends them. On AWS you pay AWS directly for the instance, storage and traffic; the deploy guide lists each item in [What it costs](../deploy/README.md#what-it-costs).
 
 ## FAQ
 

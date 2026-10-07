@@ -30,7 +30,7 @@
 #      table and secret are untouched. The same holds after a reset.
 #
 # Runs as root on an ephemeral Ubuntu 24.04 VM with systemd. No Docker. Artifacts come from the
-# releases pinned in versions.yaml (supavise system init).
+# releases pinned in internal/versions/versions.yaml (supavise system init).
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 HTTP_PORT=18080

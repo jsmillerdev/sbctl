@@ -1,5 +1,5 @@
 // Package branching gives AI agents disposable databases: a branch is a project with a
-// parent, so it has its own cluster, keys, host and fleet tenants (DESIGN.md section 9a).
+// parent, so it has its own cluster, keys, host and fleet tenants (docs/design.md section 9a).
 //
 // The Management API's branch endpoints (internal/api) are thin wrappers over Service.
 // Long operations (create, merge, reset, push) run detached from the request that started

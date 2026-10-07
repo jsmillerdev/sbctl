@@ -374,7 +374,7 @@ func (s *Server) build() (http.Handler, error) {
 
 // unknown answers requests for routes that neither the specs nor we define. Studio
 // calls a handful of platform paths that no spec lists; an empty answer keeps its
-// pages alive (research/05 section 4.4). Everything else is a 404.
+// pages alive (docs/research/05 section 4.4). Everything else is a 404.
 func (s *Server) unknown(w http.ResponseWriter, r *http.Request) error {
 	s.log.Debug("unknown route", "method", r.Method, "path", r.URL.Path)
 	if !strings.HasPrefix(r.URL.Path, "/platform/") {

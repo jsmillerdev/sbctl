@@ -113,7 +113,7 @@ sudo supavise self-update --version v1.2.3
 supavise self-update --check
 ```
 
-`self-update` fetches the release, verifies the ed25519 signature of `SHA256SUMS` against the public key compiled into the binary (`internal/selfupdate/release_key.pem`) and the binary against its checksum, replaces `/usr/local/bin/supavise` with one rename (the previous binary stays as `supavise.prev`), refreshes the units with the new binary and restarts `supavise.service`. Then it waits up to `--wait` (5 minutes, as in the installer) for the daemon to answer on its admin listener, the check the installer uses (a daemon can be `active` to systemd and still crash a moment later). If it does not answer, `self-update` puts the previous binary back, re-renders the units with it and restarts the service. Project units keep running while the daemon restarts. Artifact versions move with `versions.yaml` inside a release, not through this command.
+`self-update` fetches the release, verifies the ed25519 signature of `SHA256SUMS` against the public key compiled into the binary (`internal/selfupdate/release_key.pem`) and the binary against its checksum, replaces `/usr/local/bin/supavise` with one rename (the previous binary stays as `supavise.prev`), refreshes the units with the new binary and restarts `supavise.service`. Then it waits up to `--wait` (5 minutes, as in the installer) for the daemon to answer on its admin listener, the check the installer uses (a daemon can be `active` to systemd and still crash a moment later). If it does not answer, `self-update` puts the previous binary back, re-renders the units with it and restarts the service. Project units keep running while the daemon restarts. Artifact versions move with `internal/versions/versions.yaml` inside a release, not through this command.
 
 A binary built without a committed release key refuses to self-update (it names the missing key).
 
@@ -268,7 +268,7 @@ The token works once and expires after 72 hours. To get a new one while nobody h
 
 ### Sizing
 
-A node needs about 1.5 GB of memory before the first project and about 150 MB for each idle project (measured, [research/09-footprint.md](../research/09-footprint.md)). The default instance, `t4g.large` (Graviton, 8 GiB), holds about 20 projects and leaves about 3.5 GiB for load. The table keeps 1 GiB for the operating system and counts idle projects only; a project that serves traffic needs more (memory per connection, cache, extensions), so size up for busy projects. The measurement reached 50 projects; the larger rows extend it.
+A node needs about 1.5 GB of memory before the first project and about 150 MB for each idle project (measured, [docs/research/09-footprint.md](../docs/research/09-footprint.md)). The default instance, `t4g.large` (Graviton, 8 GiB), holds about 20 projects and leaves about 3.5 GiB for load. The table keeps 1 GiB for the operating system and counts idle projects only; a project that serves traffic needs more (memory per connection, cache, extensions), so size up for busy projects. The measurement reached 50 projects; the larger rows extend it.
 
 | RAM | Instance types | Idle projects that fit |
 |---|---|---|

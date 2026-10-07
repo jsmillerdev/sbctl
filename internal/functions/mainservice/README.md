@@ -116,9 +116,9 @@ The unit passes them in the environment (`internal/fleet/edgeruntime.go`); defau
 ## Develop
 
 ```
-cd functions-main
+cd internal/functions/mainservice
 deno task fmt && deno task lint && deno task check && deno task test    # deno 2.x; CI: ci.yml, job functions-main
-go test ./functions-main ./internal/fleet                                 # the embed list, the unit spec
+go test ./internal/functions/mainservice ./internal/fleet                                 # the embed list, the unit spec
 ```
 
 `deno test` covers the JWT checks, the file layout and its containment rules, and the handler against a fake runtime (`src/testutil.ts`; its responses are read to the end by `draining`, as the HTTP server reads them, because a response holds its place in the budgets until then); the real runtime is exercised by `tests/functions/run.sh` (macOS, exec backend) and `tests/linux/functions-smoke.sh` (Linux, systemd). Imports are relative and there is no remote module, so adding a file means adding it to the `go:embed` line in `embed.go` too; `embed_test.go` fails otherwise.
