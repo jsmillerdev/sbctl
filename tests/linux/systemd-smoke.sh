@@ -381,6 +381,11 @@ for ((i = 0; i < 30; i++)); do
   [[ $(unit_state "sb-postgrest@$B.service") == active && $(systemctl show -p MainPID --value "sb-postgrest@$B.service") != "$PID" ]] && break
   sleep 1
 done
+# The unit is active with a new process before PostgREST answers (it loads its schema cache first).
+for ((i = 0; i < 30; i++)); do
+  sbctl projects health "$B" && break
+  sleep 1
+done
 sbctl projects health "$B" || fail "$B did not recover from a PostgREST crash"
 
 JWT=$(mint_dashboard_jwt "$(project_field system 'd["keys"]["jwt_secret"]' --show-keys)")
