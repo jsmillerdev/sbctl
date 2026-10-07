@@ -173,7 +173,8 @@ To rotate the key: generate a new pair, commit the new public file, replace the 
 
 - release signing with a throwaway key; `install.sh --verify-only` accepts it and refuses a tampered binary, a changed checksum list, a bad signature, a release signed by another key and the keyless repository copy, each without installing anything;
 - `install.sh --binary` with `--tls off` and `--public-ip 127.0.0.1` (every name is `*.127.0.0.1.sslip.io`, reached with Host headers): units active and enabled, file modes, loopback-only ports, the dashboard host through the proxy (with the slim Studio artifact of the pinned upstream version as a stand-in for our platform build), sign-up refused;
-- the claim: wrong token refused, claim works once and fails the second time, sign-in, an invite redeemed and removed;
+- a re-run of the installer before anyone has claimed keeps the claim token (no second token, none printed);
+- the claim: wrong token refused, claim works once and fails the second time, sign-in, an invite redeemed and removed (and the removed user's access refused at once: unit tests, `internal/api/claim_test.go`);
 - a personal access token, a project created through `POST /v1/projects`, its keys, a table created through `database/query`, a REST call through the proxy with the publishable key, Storage through the proxy, pooler logins on 5432 and 6543;
 - a re-run changes nothing and restarts nothing, and a re-run with one flag changes that setting only;
 - a re-run of `install.sh` with a v0.0.2 binary moves the daemon onto it (the daemon's `/proc/<pid>/exe` reports v0.0.2) without restarting shared services or projects;

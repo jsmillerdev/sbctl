@@ -194,6 +194,13 @@ for p in 7000 5433 9999; do
   ss -ltnH "sport = :$p" | awk '{print $4}' | grep -q "^127.0.0.1:$p$" || fail "port $p is not loopback only"
 done
 
+log "re-running the installer before anyone has claimed keeps the claim token (it would otherwise be revoked behind the back of whatever stored it)"
+deploy/install.sh --binary "$SBCTL_BIN" --claim-token-file "$WORK/claim-token-rerun" 2>&1 | tee "$WORK/install-preclaim.log"
+[[ ${PIPESTATUS[0]} -eq 0 ]] || fail "the re-run before the claim failed"
+[[ ! -s "$WORK/claim-token-rerun" ]] || fail "the re-run before the claim issued a second claim token"
+grep -q "claim token from an earlier run is still valid" "$WORK/install-preclaim.log" || fail "the re-run did not say that the earlier claim token is still valid"
+grep -q "$TOKEN" "$WORK/install-preclaim.log" && fail "the re-run printed the claim token"
+
 log "dashboard through the proxy"
 [[ $(code -H "Host: studio.$BASE" http://127.0.0.1/api/incident-banner) == 200 ]] || fail "studio host: the proxy does not answer its banner route"
 if [[ $E2E_STUDIO == 1 ]]; then
