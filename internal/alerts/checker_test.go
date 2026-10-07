@@ -482,3 +482,263 @@ func TestDiskAndBackupsAreStillRaisedDuringAnUpgradeAndNotResolvedEarly(t *testi
 		t.Errorf("disk recovery during the upgrade: %+v", last)
 	}
 }
+
+// downProjects marks n projects of the report (named by index) as down; the others are healthy.
+func (r *rig) downProjects(down ...int) {
+	r.report.Projects = nil
+	isDown := map[int]bool{}
+	for _, i := range down {
+		isDown[i] = true
+	}
+	for i := 0; i < 12; i++ {
+		p := health.ProjectResult{Ref: strings.Repeat(string(rune('a'+i)), 20), State: health.OK, Probed: true,
+			Services: []health.ServiceResult{{Name: "postgres", OK: true}}}
+		if isDown[i] {
+			p.State = health.Fail
+			p.Services = []health.ServiceResult{{Name: "postgres", OK: false, Error: "down"}}
+		}
+		r.report.Projects = append(r.report.Projects, p)
+	}
+}
+
+func (r *rig) resolved() (n int) {
+	for _, w := range r.sent() {
+		if w.Resolved {
+			n++
+		}
+	}
+	return n
+}
+
+// Three projects were reported; a shared failure takes down five more. The three are still
+// down, so nobody is told they recovered.
+func TestAGrowingFailureDoesNotReportTheFirstProjectsRecovered(t *testing.T) {
+	r := newRig(t)
+	r.downProjects(0, 1, 2)
+	for i := 0; i < 4; i++ {
+		r.cycle()
+	}
+	if r.sink.count() != 3 {
+		t.Fatalf("%d alerts for three down projects", r.sink.count())
+	}
+	r.downProjects(0, 1, 2, 3, 4, 5, 6, 7)
+	for i := 0; i < 3; i++ {
+		r.cycle()
+		if r.resolved() != 0 {
+			t.Fatalf("a recovery was sent while the projects are still down: %+v", r.sent())
+		}
+	}
+	r.cycle() // the group has now been over the threshold for the debounce
+	got := r.sent()
+	if r.resolved() != 0 || len(got) != 4 || !strings.Contains(got[3].Title, "Many projects") || !strings.Contains(got[3].Detail, "8 projects") {
+		t.Fatalf("after the group formed: %+v", got)
+	}
+	for i := 0; i < 10; i++ {
+		r.cycle()
+	}
+	if r.sink.count() != 4 {
+		t.Errorf("%d alerts for a standing failure", r.sink.count())
+	}
+	// Everything heals: the group and the three single alerts are each told once.
+	r.downProjects()
+	r.cycle()
+	if r.resolved() != 4 || r.sink.count() != 8 {
+		t.Errorf("recoveries: %d resolved of %d sent", r.resolved(), r.sink.count())
+	}
+}
+
+// Eight down become five: the group stands down without a recovery, and the five are reported by name.
+func TestAShrinkingFailureDoesNotReportTheGroupRecovered(t *testing.T) {
+	r := newRig(t)
+	r.downProjects(0, 1, 2, 3, 4, 5, 6, 7)
+	for i := 0; i < 4; i++ {
+		r.cycle()
+	}
+	if got := r.sent(); len(got) != 1 || !strings.Contains(got[0].Title, "Many projects") {
+		t.Fatalf("%+v", got)
+	}
+	r.downProjects(0, 1, 2, 3, 4)
+	r.cycle()
+	if r.resolved() != 0 {
+		t.Fatalf("the group was reported over while five projects are down: %+v", r.sent())
+	}
+	got := r.sent()
+	if len(got) != 6 {
+		t.Fatalf("want the group and five single alerts, got %d", len(got))
+	}
+	refs := map[string]bool{}
+	for _, w := range got[1:] {
+		if w.Kind != KindProjectUnhealthy || w.Ref == "" {
+			t.Errorf("%+v", w)
+		}
+		refs[w.Ref] = true
+	}
+	if len(refs) != 5 {
+		t.Errorf("single alerts for %v", refs)
+	}
+	active, _ := r.checker.Notifier.Active()
+	if _, ok := active[manyKey]; ok {
+		t.Error("the group alert is still active")
+	}
+	// A project of the five heals: that one is told, with its own name.
+	r.downProjects(0, 1, 2, 3)
+	r.cycle()
+	if got := r.sent(); r.resolved() != 1 || got[len(got)-1].Ref != strings.Repeat("e", 20) {
+		t.Errorf("%+v", got[len(got)-1])
+	}
+}
+
+func (r *rig) writeUpgradeMarker(marker any, mtime time.Time) {
+	r.t.Helper()
+	b, _ := json.Marshal(marker)
+	dir := filepath.Join(r.cfg.StateDir, "system")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		r.t.Fatal(err)
+	}
+	f := filepath.Join(dir, "upgrade.json")
+	if err := os.WriteFile(f, b, 0o644); err != nil {
+		r.t.Fatal(err)
+	}
+	if err := os.Chtimes(f, mtime, mtime); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// A killed upgrade leaves its marker behind. It must not keep alerts quiet.
+func TestACrashedUpgradeDoesNotSilenceAlertsForLong(t *testing.T) {
+	for name, tc := range map[string]struct {
+		marker any
+		mtime  func(r *rig) time.Time
+	}{
+		"no started_at, file untouched for hours": {
+			map[string]any{"phase": "rollout", "from": "v1", "to": "v2"},
+			func(r *rig) time.Time { return r.clk.now().Add(-5 * time.Hour) },
+		},
+		"started long ago": {
+			notice.Upgrade{Phase: "rollout", From: "v1", To: "v2"},
+			func(r *rig) time.Time { return r.clk.now().Add(-5 * time.Hour) },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			r.report.Projects[0].Services = []health.ServiceResult{{Name: "postgres", OK: false, Error: "down"}}
+			m := tc.marker
+			if u, ok := m.(notice.Upgrade); ok {
+				u.StartedAt = r.clk.now().Add(-5 * time.Hour)
+				m = u
+			}
+			r.writeUpgradeMarker(m, tc.mtime(r))
+			for i := 0; i < 4; i++ {
+				r.cycle()
+			}
+			if got := r.sent(); len(got) != 1 || got[0].Kind != KindProjectUnhealthy {
+				t.Errorf("a stale marker silenced the alert: %+v", got)
+			}
+		})
+	}
+}
+
+func TestAMarkerWithoutStartedAtIsBelievedWhileTheFileIsFresh(t *testing.T) {
+	r := newRig(t)
+	r.report.Projects[0].Services = []health.ServiceResult{{Name: "postgres", OK: false, Error: "down"}}
+	r.writeUpgradeMarker(map[string]any{"phase": "rollout", "from": "v1", "to": "v2"}, r.clk.now())
+	for i := 0; i < 4; i++ {
+		r.cycle()
+	}
+	if r.sink.count() != 0 {
+		t.Errorf("%d alerts during an upgrade whose marker was just written", r.sink.count())
+	}
+}
+
+// Planned downtime covers projects and ordinary shared services, not the system cluster.
+func TestACriticalNodeProblemIsRaisedInsideAWindowAndAnUpgrade(t *testing.T) {
+	for _, mode := range []string{"window", "upgrade"} {
+		t.Run(mode, func(t *testing.T) {
+			r := newRig(t)
+			r.report.Projects[0].Services = []health.ServiceResult{{Name: "postgres", OK: false, Error: "down"}}
+			r.report.Components = append(r.report.Components,
+				health.Component{Name: "system postgres", State: health.Fail, Critical: true, Detail: "unit is inactive"},
+				health.Component{Name: "supavisor", State: health.Warn, Detail: "restarting"})
+			if mode == "window" {
+				if _, err := notice.WriteMaintenance(r.cfg.Paths(), notice.Maintenance{Message: "m", StartsAt: r.clk.now().Add(-time.Minute), EndsAt: r.clk.now().Add(time.Hour)}, r.clk.now()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				r.writeUpgradeMarker(notice.Upgrade{Phase: "rollout", From: "v1", To: "v2", StartedAt: r.clk.now()}, r.clk.now())
+			}
+			for i := 0; i < 4; i++ {
+				r.cycle()
+			}
+			got := r.sent()
+			if len(got) != 1 || got[0].Kind != KindNodeUnhealthy || !strings.Contains(got[0].Title, "system postgres") {
+				t.Errorf("want only the critical system postgres alert: %+v", got)
+			}
+		})
+	}
+}
+
+// A window announced for a month (or a file edited by hand to one) stops quieting alerts after a day.
+func TestALongWindowStopsQuietingAlertsAfterTheCap(t *testing.T) {
+	r := newRig(t)
+	r.report.Projects[0].Services = []health.ServiceResult{{Name: "postgres", OK: false, Error: "down"}}
+	start := r.clk.now().Add(-time.Minute)
+	if _, err := notice.WriteMaintenance(r.cfg.Paths(), notice.Maintenance{Message: "m", StartsAt: start, EndsAt: start.Add(720 * time.Hour)}, r.clk.now()); err == nil {
+		t.Fatal("a month-long window was announced without --allow-long")
+	}
+	// Edited into place by hand.
+	b, _ := json.Marshal(notice.Maintenance{ID: "x", Message: "m", StartsAt: start, EndsAt: start.Add(720 * time.Hour)})
+	if err := os.MkdirAll(filepath.Join(r.cfg.StateDir, "system"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(r.cfg.StateDir, "system", "maintenance.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		r.cycle()
+	}
+	if r.sink.count() != 0 {
+		t.Fatalf("%d alerts inside the window", r.sink.count())
+	}
+	r.clk.add(notice.MaxWindow)
+	for i := 0; i < 4; i++ {
+		r.cycle()
+	}
+	if r.sink.count() != 1 {
+		t.Errorf("%d alerts after the cap, want 1", r.sink.count())
+	}
+}
+
+// update_available is one message per version, so it is not left to the hourly cap.
+func TestUpdateAvailableIsSentEvenWhenTheHourlyCapIsReached(t *testing.T) {
+	r := newRig(t)
+	r.cfg.Alerts.MaxPerHour = 1
+	r.checker = r.newChecker()
+	r.report.Projects[0].Backup = &health.BackupResult{LastFailed: "x"}
+	r.report.Projects[1].Backup = &health.BackupResult{LastFailed: "y"} // held back by the cap
+	for i := 0; i < 4; i++ {
+		r.cycle()
+	}
+	if r.sink.count() != 1 {
+		t.Fatalf("%d alerts under a cap of 1", r.sink.count())
+	}
+	api := githubAPI(t, "v2.0.0", 200)
+	r.checker.CheckUpdate = func(ctx context.Context, now time.Time) (*health.UpdateRecord, error) {
+		return health.CheckUpdate(ctx, r.cfg, "v1.0.0", health.UpdateSource{APIBase: api.URL}, now)
+	}
+	r.cycle()
+	var update, backup int
+	for _, w := range r.sent() {
+		switch w.Kind {
+		case KindUpdateAvailable:
+			update++
+		case KindBackupFailed:
+			backup++
+		}
+	}
+	if update != 1 || backup != 1 {
+		t.Errorf("%d update notices, %d backup alerts: %+v", update, backup, r.sent())
+	}
+	if rec, _ := health.ReadUpdate(r.cfg.Paths()); rec == nil || rec.NotifiedVersion != "v2.0.0" {
+		t.Errorf("record %+v", rec)
+	}
+}

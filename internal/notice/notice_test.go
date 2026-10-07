@@ -48,10 +48,36 @@ func TestMaintenanceValidation(t *testing.T) {
 		"ends too early": {Message: "m", StartsAt: t0, EndsAt: t0.Add(-time.Hour)},
 		"zero length":    {Message: "m", StartsAt: t0, EndsAt: t0},
 		"negative lead":  {Message: "m", StartsAt: t0, EndsAt: t0.Add(time.Hour), LeadSeconds: -1},
+		"month long":     {Message: "m", StartsAt: t0, EndsAt: t0.Add(720 * time.Hour)},
 	} {
 		if m.Validate() == nil {
 			t.Errorf("%s was accepted", name)
 		}
+	}
+}
+
+func TestLongMaintenanceNeedsPermissionAndIsCapped(t *testing.T) {
+	long := Maintenance{Message: "m", StartsAt: t0, EndsAt: t0.Add(48 * time.Hour)}
+	if long.Validate() == nil {
+		t.Fatal("a 48 hour window was accepted without permission")
+	}
+	if err := (Maintenance{Message: "m", StartsAt: t0, EndsAt: t0.Add(MaxWindow)}).Validate(); err != nil {
+		t.Errorf("a window of exactly %s: %v", MaxWindow, err)
+	}
+	long.Extended = true
+	if err := long.Validate(); err != nil {
+		t.Fatalf("with permission: %v", err)
+	}
+	if !long.Quiet(t0.Add(40 * time.Hour)) {
+		t.Error("an extended window is quiet for all of it")
+	}
+	// A file edited by hand to a month, without permission: quiet for MaxWindow, no longer.
+	edited := Maintenance{Message: "m", StartsAt: t0, EndsAt: t0.Add(720 * time.Hour)}
+	if !edited.Quiet(t0.Add(time.Hour)) || edited.Quiet(t0.Add(MaxWindow+time.Minute)) {
+		t.Error("an unextended window must stop being quiet after MaxWindow")
+	}
+	if edited.Quiet(t0.Add(-time.Hour)) {
+		t.Error("quiet before the window opens")
 	}
 }
 
@@ -124,17 +150,37 @@ func TestUpgradeRunning(t *testing.T) {
 	}{
 		{"rolling out", Upgrade{Phase: "rollout", From: "v1", To: "v2", StartedAt: t0}, true},
 		{"fetching", Upgrade{Phase: "fetch", StartedAt: t0.Add(-time.Hour)}, true},
-		{"no start time is believed", Upgrade{Phase: "backup"}, true},
+		{"no start time and no file date is not believed", Upgrade{Phase: "backup"}, false},
+		{"no start time, file touched a minute ago", Upgrade{Phase: "backup", Heartbeat: t0}, true},
+		{"no start time, file untouched for hours", Upgrade{Phase: "backup", Heartbeat: t0.Add(-3 * time.Hour)}, false},
+		{"old start, touched at every phase", Upgrade{Phase: "rollout", StartedAt: t0.Add(-5 * time.Hour), Heartbeat: t0}, true},
 		{"done", Upgrade{Phase: "done", StartedAt: t0}, false},
 		{"failed", Upgrade{Phase: "failed", StartedAt: t0}, false},
 		{"rolled back, any case", Upgrade{Phase: "Rolled_Back", StartedAt: t0}, false},
 		{"empty phase", Upgrade{StartedAt: t0}, false},
-		{"left behind by a dead process", Upgrade{Phase: "rollout", StartedAt: t0.Add(-13 * time.Hour)}, false},
+		{"left behind by a dead process", Upgrade{Phase: "rollout", StartedAt: t0.Add(-3 * time.Hour)}, false},
+		{"just inside the limit", Upgrade{Phase: "rollout", StartedAt: t0.Add(-100 * time.Minute)}, true},
 	}
 	for _, c := range cases {
 		if got := c.u.Running(t0.Add(time.Minute)); got != c.want {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestReadUpgradeDatesTheMarkerByTheFile(t *testing.T) {
+	p := paths(t)
+	writeUpgrade(t, p, map[string]any{"phase": "rollout", "from": "v1.0.0", "to": "v1.1.0"})
+	mtime := t0.Add(-time.Minute)
+	if err := os.Chtimes(filepath.Join(p.Root, "system", "upgrade.json"), mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := UpgradeRunning(p, t0); !ok {
+		t.Error("a marker without started_at, touched a minute ago, is running")
+	}
+	// A crashed upgrade leaves the marker; hours later it is no longer believed.
+	if _, ok := UpgradeRunning(p, t0.Add(3*time.Hour)); ok {
+		t.Error("a marker untouched for hours still counts as running")
 	}
 }
 

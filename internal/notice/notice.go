@@ -25,10 +25,17 @@ const (
 	upgradeFile     = "upgrade.json"
 )
 
-// staleUpgrade is how long an upgrade marker is believed. A marker that outlives it was left
-// by a process that died; showing "upgrade in progress" for days would be worse than showing
-// nothing.
-const staleUpgrade = 12 * time.Hour
+// staleUpgrade is how long an upgrade marker is believed after its last sign of life (started_at,
+// or the file's modification time, whichever is later). A marker that outlives it was left by a
+// process that died. While it is believed the alerts stay quiet about restarted services, so it
+// is kept short: a crashed upgrade is when projects are most likely down. The upgrade rewrites
+// the marker at each phase change, which keeps it alive.
+const staleUpgrade = 2 * time.Hour
+
+// MaxWindow is the longest maintenance window an announcement grants without Extended. The
+// window quiets alerts for its whole length, so a typo such as --duration 720h must not silence
+// them for a month.
+const MaxWindow = 24 * time.Hour
 
 func file(p config.Paths, name string) string { return filepath.Join(p.Root, "system", name) }
 
@@ -45,6 +52,8 @@ type Maintenance struct {
 	// window is open.
 	LeadSeconds int       `json:"lead_seconds,omitempty"`
 	AnnouncedAt time.Time `json:"announced_at"`
+	// Extended is the operator's explicit permission (--allow-long) for a window longer than MaxWindow.
+	Extended bool `json:"extended,omitempty"`
 }
 
 // Validate checks the announcement the CLI is about to write.
@@ -60,6 +69,8 @@ func (m Maintenance) Validate() error {
 		return errors.New("the maintenance window must end after it starts")
 	case m.LeadSeconds < 0:
 		return errors.New("the notice lead must not be negative")
+	case !m.Extended && m.EndsAt.Sub(m.StartsAt) > MaxWindow:
+		return fmt.Errorf("the maintenance window is longer than %s, and alerts stay quiet for all of it; pass --allow-long if you mean it", MaxWindow)
 	}
 	return nil
 }
@@ -72,6 +83,13 @@ func (m Maintenance) Active(now time.Time) bool {
 // InProgress reports whether the window is open at now.
 func (m Maintenance) InProgress(now time.Time) bool {
 	return !now.Before(m.StartsAt) && now.Before(m.EndsAt)
+}
+
+// Quiet reports whether alerts about restarted services are held back at now: the window is
+// open and, unless the operator allowed a long one, no more than MaxWindow old. The second
+// condition guards a file edited by hand; Validate already refuses such an announcement.
+func (m Maintenance) Quiet(now time.Time) bool {
+	return m.InProgress(now) && (m.Extended || now.Sub(m.StartsAt) < MaxWindow)
 }
 
 // ReadMaintenance returns the announced window, or nil when there is none. A window that has
@@ -118,6 +136,9 @@ type Upgrade struct {
 	From      string    `json:"from"`
 	To        string    `json:"to"`
 	StartedAt time.Time `json:"started_at"`
+	// Heartbeat is the file's modification time, set by ReadUpgrade and not stored in the file.
+	// A marker without started_at is dated by it.
+	Heartbeat time.Time `json:"-"`
 }
 
 // terminal are the phases that mean the upgrade is over, whichever way it ended.
@@ -126,12 +147,18 @@ var terminal = map[string]bool{
 	"failed": true, "rolled_back": true, "rolled-back": true, "rollback": true, "aborted": true, "refused": true, "idle": true,
 }
 
-// Running reports whether the marker describes an upgrade that is still going at now.
+// Running reports whether the marker describes an upgrade that is still going at now. It fails
+// closed: a marker with neither started_at nor a modification time is not believed, and neither
+// is one whose last sign of life is older than staleUpgrade.
 func (u Upgrade) Running(now time.Time) bool {
 	if terminal[strings.ToLower(strings.TrimSpace(u.Phase))] {
 		return false
 	}
-	return u.StartedAt.IsZero() || now.Sub(u.StartedAt) < staleUpgrade
+	alive := u.StartedAt
+	if u.Heartbeat.After(alive) {
+		alive = u.Heartbeat
+	}
+	return !alive.IsZero() && now.Sub(alive) < staleUpgrade
 }
 
 // ReadUpgrade returns the upgrade marker, or nil when there is none. It is tolerant: the file
@@ -140,6 +167,9 @@ func ReadUpgrade(p config.Paths) *Upgrade {
 	var u Upgrade
 	if ok, err := readJSON(file(p, upgradeFile), &u); err != nil || !ok {
 		return nil
+	}
+	if fi, err := os.Stat(file(p, upgradeFile)); err == nil {
+		u.Heartbeat = fi.ModTime()
 	}
 	return &u
 }

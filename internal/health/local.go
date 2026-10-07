@@ -91,15 +91,19 @@ func (d *Deps) checkCertificates(ctx context.Context) Component {
 	now := d.now()
 	var (
 		first              *certInfo
-		nManaged           int
 		nearLive, nRetired int
+		// newest is, for each managed name, the certificate that ends last. CertMagic keeps one
+		// copy per issuer, so a name can have an old copy that is never renewed (after [tls] ca or
+		// the issuer changed); only the newest says whether the name is covered.
+		newest = map[string]int{}
 	)
 	for i, ci := range certs {
 		switch {
 		case ci.anyOf(managed):
-			nManaged++
-			if first == nil || ci.end.Before(first.end) {
-				first = &certs[i]
+			for _, n := range ci.names {
+				if j, ok := newest[n]; managed[n] && (!ok || ci.end.After(certs[j].end)) {
+					newest[n] = i
+				}
 			}
 		case ci.anyOf(live):
 			if ci.end.Sub(now) < warn {
@@ -109,6 +113,14 @@ func (d *Deps) checkCertificates(ctx context.Context) Component {
 			nRetired++
 		}
 	}
+	covering := map[int]bool{}
+	for _, i := range newest {
+		covering[i] = true
+		if first == nil || certs[i].end.Before(first.end) {
+			first = &certs[i]
+		}
+	}
+	nManaged := len(covering)
 	switch {
 	case first == nil:
 		c.State, c.Detail = Info, "none issued yet for "+d.Cfg.APIHost()+" and "+d.Cfg.StudioHost()

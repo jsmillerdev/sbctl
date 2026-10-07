@@ -9,7 +9,9 @@ Both live in small JSON files under `<state_dir>/system/` (0644, written atomica
 | `maintenance.json` | `supavise maintenance announce` / `clear` | `id`, `message`, `starts_at`, `ends_at`, `lead_seconds`, `announced_at` |
 | `upgrade.json` | the upgrade (`supavise upgrade`) | `phase`, `from`, `to`, `started_at` |
 
-An upgrade counts as running while `phase` is not a finished one (`done`, `complete`, `succeeded`, `failed`, `rolled_back`, `aborted`, `refused`, empty) and it began under 12 hours ago, so a marker left by a process that died does not show a banner for days. The upgrade should remove the file or set a finished phase when it ends. An unreadable file reads as "no upgrade".
+An upgrade counts as running while `phase` is not a finished one (`done`, `complete`, `succeeded`, `failed`, `rolled_back`, `aborted`, `refused`, empty) and its last sign of life is under two hours old, so a marker left by a process that died stops counting soon. The last sign of life is `started_at` or the file's modification time, whichever is later (`Upgrade.Heartbeat`); a marker with neither does not count. The upgrade should rewrite the file at each phase change, which keeps it alive, and remove it or set a finished phase when it ends. An unreadable file reads as "no upgrade".
+
+A maintenance window longer than 24 hours (`MaxWindow`) is refused unless the operator passes `--allow-long` (`extended` in the file). `Quiet(now)`, which the alert checker uses, is true only while the window is open and, unless extended, less than 24 hours after its start, so a file edited by hand cannot silence alerts for a month.
 
 ## The banner
 

@@ -21,9 +21,11 @@ import (
 // asks for the newest release and raises update_available once per version.
 //
 // While an upgrade runs or a maintenance window is open the checker raises and resolves no
-// project_unhealthy or node_unhealthy: the operator caused that downtime, and the upgrade
-// reports its own events. A disk running out (an upgrade takes fresh backups first), a backup
-// that fails and a certificate that does not renew are still raised.
+// project_unhealthy and no node_unhealthy below critical: the operator caused that downtime, and
+// the upgrade reports its own events. A critical node_unhealthy (the system cluster or the
+// registry down), a disk running out (an upgrade takes fresh backups first), a backup that fails
+// and a certificate that does not renew are still raised. The marker of a crashed upgrade and a
+// window that was not extended stop counting after a short time (see internal/notice).
 type Checker struct {
 	Notifier *Notifier
 	// Report returns the current health of the node (health.Monitor.Fresh).
@@ -76,7 +78,15 @@ func (c *Checker) Run(ctx context.Context) {
 // condition is one thing that is wrong now.
 type condition struct {
 	key, kind, severity, ref, title, detail string
+	// heldBy is the key of the group alert that reports this condition in its place. A held
+	// condition is tracked (it is still wrong, and its debounce runs) but sent only if the group dissolves.
+	heldBy string
+	// members are the keys of the conditions a group alert stands for.
+	members []string
 }
+
+// manyKey is the key of the alert that stands for more than groupAbove unhealthy projects.
+const manyKey = KindProjectUnhealthy + "/many"
 
 // owned are the kinds of condition the checker raises and resolves; the other kinds in the
 // notifier's state belong to whoever raised them.
@@ -88,9 +98,11 @@ func owned(kind string) bool {
 	return false
 }
 
-// restartedByWindow are the kinds a window the operator opened is expected to cause.
-func restartedByWindow(kind string) bool {
-	return kind == KindProjectUnhealthy || kind == KindNodeUnhealthy
+// restartedByWindow reports whether a window the operator opened is expected to cause a
+// condition of this kind and severity. A critical node condition is not: the system cluster or
+// the registry being down is never planned downtime to stay silent about.
+func restartedByWindow(kind, severity string) bool {
+	return kind == KindProjectUnhealthy || (kind == KindNodeUnhealthy && severity != SeverityCritical)
 }
 
 // Once runs one check: conditions first, then the update check when it is due.
@@ -101,7 +113,7 @@ func (c *Checker) Once(ctx context.Context) {
 	paths := c.Cfg.Paths()
 	_, upgrading := notice.UpgradeRunning(paths, now)
 	m, merr := notice.ReadMaintenance(paths)
-	quiet := upgrading || (merr == nil && m != nil && m.InProgress(now))
+	quiet := upgrading || (merr == nil && m != nil && m.Quiet(now))
 	rep, err := c.Report(ctx)
 	if err != nil {
 		c.log().Warn("alert check: no health report", "error", err)
@@ -110,21 +122,34 @@ func (c *Checker) Once(ctx context.Context) {
 	conds := conditionsOf(rep)
 	if quiet {
 		// What the window restarts is not judged, and its debounce starts over when it ends.
-		conds = slices.DeleteFunc(conds, func(cd condition) bool { return restartedByWindow(cd.kind) })
+		conds = slices.DeleteFunc(conds, func(cd condition) bool { return restartedByWindow(cd.kind, cd.severity) })
 	}
-	debounce := c.Cfg.Alerts.Debounce()
 	if c.firstSeen == nil {
 		c.firstSeen = map[string]time.Time{}
 	}
 	current := map[string]bool{}
 	for _, cd := range conds {
 		current[cd.key] = true
-		first, seen := c.firstSeen[cd.key]
-		if !seen {
-			first = now
+		if _, seen := c.firstSeen[cd.key]; !seen && cd.members == nil {
 			c.firstSeen[cd.key] = now
 		}
-		if now.Sub(first) < debounce {
+	}
+	for _, cd := range conds {
+		// A group alert is as old as the group: it inherits the debounce its members already
+		// served, so a growing failure is reported when it crosses the threshold, not three
+		// minutes later. It waits for the (groupAbove+1)th oldest member, so one old failure plus
+		// a burst of restarts does not raise it at once.
+		if _, seen := c.firstSeen[cd.key]; !seen && cd.members != nil {
+			c.firstSeen[cd.key] = c.groupFirstSeen(cd.members, now)
+		}
+	}
+	debounce := c.Cfg.Alerts.Debounce()
+	anyProjectDown := false
+	for _, cd := range conds {
+		if cd.kind == KindProjectUnhealthy && cd.members == nil {
+			anyProjectDown = true
+		}
+		if cd.heldBy != "" || now.Sub(c.firstSeen[cd.key]) < debounce {
 			continue
 		}
 		// Notify sends it once and again only after the repeat interval.
@@ -143,7 +168,16 @@ func (c *Checker) Once(ctx context.Context) {
 		return
 	}
 	for key, a := range active {
-		if !owned(a.Kind) || current[key] || (quiet && restartedByWindow(a.Kind)) {
+		if !owned(a.Kind) || current[key] || (quiet && restartedByWindow(a.Kind, a.Severity)) {
+			continue
+		}
+		if key == manyKey && anyProjectDown {
+			// Fewer than the threshold are down now, and those are reported one by one. "Many
+			// projects" ends without a recovery message: projects are still down.
+			if err := c.Notifier.Forget(key); err != nil {
+				c.log().Warn("cannot drop the group alert", "error", err)
+			}
+			c.log().Info("alert: the group of unhealthy projects dissolved into single alerts")
 			continue
 		}
 		ev := Event{Kind: a.Kind, Severity: a.Severity, Ref: a.Ref, Key: key, Title: a.Title, Resolved: true,
@@ -244,11 +278,16 @@ func conditionsOf(r *health.Report) []condition {
 		}
 	}
 	// A few projects down are told one by one. Many at once mean something shared broke, and
-	// fifty messages would bury the one that says what.
+	// fifty messages would bury the one that says what. Each project stays a (held) condition of
+	// its own, so one that was already reported is not told "this is over" because it joined a
+	// group, and the single alerts take over when the group shrinks.
 	if len(down) > groupAbove {
 		refs := make([]string, 0, len(down))
-		for _, d := range down {
-			refs = append(refs, d.ref)
+		members := make([]string, 0, len(down))
+		for i := range down {
+			refs = append(refs, down[i].ref)
+			members = append(members, down[i].key)
+			down[i].heldBy = manyKey
 		}
 		shown := refs
 		if len(shown) > 10 {
@@ -258,10 +297,26 @@ func conditionsOf(r *health.Report) []condition {
 		if len(refs) > len(shown) {
 			detail += fmt.Sprintf(" and %d more", len(refs)-len(shown))
 		}
-		down = []condition{{key: KindProjectUnhealthy + "/many", kind: KindProjectUnhealthy, severity: SeverityCritical,
-			title: "Many projects are not healthy", detail: fmt.Sprintf("%d projects do not answer: %s. Run `supavise status`.", len(refs), detail)}}
+		out = append(out, condition{key: manyKey, kind: KindProjectUnhealthy, severity: SeverityCritical, members: members,
+			title: "Many projects are not healthy", detail: fmt.Sprintf("%d projects do not answer: %s. Run `supavise status`.", len(refs), detail)})
 	}
 	return append(out, down...)
+}
+
+// groupFirstSeen is when a group of conditions was first big enough to be one alert: the time
+// the (groupAbove+1)th of its members was first seen.
+func (c *Checker) groupFirstSeen(members []string, now time.Time) time.Time {
+	var seen []time.Time
+	for _, k := range members {
+		if t, ok := c.firstSeen[k]; ok {
+			seen = append(seen, t)
+		}
+	}
+	slices.SortFunc(seen, func(a, b time.Time) int { return a.Compare(b) })
+	if len(seen) > groupAbove {
+		return seen[groupAbove]
+	}
+	return now
 }
 
 // groupAbove is how many unhealthy projects are reported one by one.

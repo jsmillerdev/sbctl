@@ -794,8 +794,27 @@ func TestHourlyCapDoesNotHoldBackCriticalAlertsOrTheUpgradesOwnEvents(t *testing
 	_ = n.Notify(ctx, Event{Kind: KindUpgradeFailed, Severity: SeverityCritical, Title: "Upgrade failed"})
 	_ = n.Notify(ctx, Event{Kind: KindUpgradeSucceeded, Severity: SeverityInfo, Title: "Upgraded"})
 	_ = n.Notify(ctx, Event{Kind: KindDiskLow, Severity: SeverityCritical, Title: "Disk"})
-	if s.count() != 5 {
-		t.Errorf("%d sent, want 5: an upgrade event or a critical alert was held back", s.count())
+	// One message per version: held back by the cap it would never come again.
+	_ = n.Notify(ctx, Event{Kind: KindUpdateAvailable, Severity: SeverityInfo, Key: KindUpdateAvailable + "/v2", Title: "v2 is available"})
+	if s.count() != 6 {
+		t.Errorf("%d sent, want 6: an upgrade event, a critical alert or update_available was held back", s.count())
+	}
+}
+
+func TestForgetDropsAnActiveAlertWithoutSendingAnything(t *testing.T) {
+	s := newSink(t)
+	cfg := testCfg(t, config.AlertWebhook{URL: s.srv.URL})
+	n := New(cfg, Options{Now: newClock().now})
+	ctx := context.Background()
+	_ = n.Notify(ctx, Event{Kind: KindBackupFailed, Ref: "p", Key: "k", Title: "t"})
+	if err := n.Forget("k"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Forget("never-sent"); err != nil {
+		t.Errorf("forgetting an unknown key: %v", err)
+	}
+	if a, _ := n.Active(); len(a) != 0 || s.count() != 1 {
+		t.Errorf("active %v, %d sent", a, s.count())
 	}
 }
 

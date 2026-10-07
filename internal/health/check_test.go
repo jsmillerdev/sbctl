@@ -397,6 +397,12 @@ func TestDisk(t *testing.T) {
 
 func writeCert(t *testing.T, dir, host string, notAfter time.Time) {
 	t.Helper()
+	writeCertFrom(t, dir, "acme-v02.api.letsencrypt.org-directory", host, notAfter)
+}
+
+// writeCertFrom stores the certificate under the issuer's directory, as CertMagic does.
+func writeCertFrom(t *testing.T, dir, issuer, host string, notAfter time.Time) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -409,7 +415,7 @@ func writeCert(t *testing.T, dir, host string, notAfter time.Time) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := filepath.Join(dir, "certificates", "acme-v02.api.letsencrypt.org-directory", host)
+	d := filepath.Join(dir, "certificates", issuer, host)
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -447,6 +453,30 @@ func TestCertificates(t *testing.T) {
 	e.cfg.TLS.Mode = "off"
 	if c, _ := e.check().Component("certificates"); c.State != OK || c.Detail != "TLS is off" {
 		t.Errorf("TLS off: %+v", c)
+	}
+}
+
+// CertMagic keeps a copy per issuer. After [tls] ca changes, the old issuer's copy is never
+// renewed; the copy being served decides, not the oldest file.
+func TestCertificatesJudgeTheNewestCopyOfAName(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.TLS.Mode = "auto"
+	e.cfg.Domain = "example.com"
+	certs := e.cfg.Paths().Certs()
+	for _, host := range []string{"api.example.com", "studio.example.com", "*.api.example.com"} {
+		writeCertFrom(t, certs, "acme-v02.api.letsencrypt.org-directory", host, e.now.Add(60*24*time.Hour))
+	}
+	// The staging copy of the API certificate expired long ago and nothing renews it.
+	writeCertFrom(t, certs, "acme-staging-v02.api.letsencrypt.org-directory", "api.example.com", e.now.Add(-30*24*time.Hour))
+	r := e.check()
+	c, _ := r.Component("certificates")
+	if c.State != OK || !strings.Contains(c.Detail, "3 issued") {
+		t.Fatalf("an old issuer's expired copy changed the verdict: %+v", c)
+	}
+	// When the newest copy of a name is the one that expired, that is still a failure.
+	writeCertFrom(t, certs, "acme-v02.api.letsencrypt.org-directory", "studio.example.com", e.now.Add(-time.Hour))
+	if c, _ := e.check().Component("certificates"); c.State != Fail || !strings.Contains(c.Detail, "studio.example.com") {
+		t.Errorf("the newest copy expired: %+v", c)
 	}
 }
 

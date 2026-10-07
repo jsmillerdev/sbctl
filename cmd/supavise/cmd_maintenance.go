@@ -13,10 +13,12 @@ import (
 
 var maintenanceCmd = &cobra.Command{
 	Use:   "maintenance",
-	Short: "Announce a maintenance window in the dashboard",
+	Short: "Announce a maintenance window to the operator and the alerts",
 	Long: `An announced window is shown by 'supavise status' and /healthz/detail while it is
-open, and the alerts stay quiet about the services the window restarts, so planned downtime
-does not page anyone. Projects keep running. An upgrade is shown the same way while it runs.
+open, and the alerts stay quiet about the project and shared-service problems the window
+restarts, so planned downtime does not page anyone. A critical problem with the system cluster or
+the registry, a low disk, a failed backup and an expiring certificate are still sent. Projects
+keep running. An upgrade is shown the same way while it runs.
 
 The dashboard banner stays empty for now: Studio draws any incident as "We are investigating a
 technical issue" with a link to Supabase's status page, which would present planned work as an
@@ -25,11 +27,13 @@ outage. The message you give is kept for 'supavise status' and for the day Studi
 
 func init() {
 	var at, until, duration, lead, message string
+	var allowLong bool
 	announce := &cobra.Command{
 		Use:   "announce --at <time> --message <text> [--duration 2h | --until <time>] [--notice 24h]",
 		Short: "Announce a maintenance window",
 		Long: `Announces a window that starts at --at and lasts --duration (default 2h) or ends at --until.
 Times are RFC 3339 ("2026-10-12T22:00:00+02:00") or "2006-01-02 15:04" in UTC, or "now".
+A window longer than 24h needs --allow-long, because alerts stay quiet for all of it.
 A new announcement replaces the old one.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -38,7 +42,7 @@ A new announcement replaces the old one.`,
 				return err
 			}
 			now := time.Now()
-			m, err := buildMaintenance(now, at, until, duration, lead, message)
+			m, err := buildMaintenance(now, at, until, duration, lead, message, allowLong)
 			if err != nil {
 				return err
 			}
@@ -53,8 +57,9 @@ A new announcement replaces the old one.`,
 	announce.Flags().StringVar(&at, "at", "", "when the window starts")
 	announce.Flags().StringVar(&until, "until", "", "when the window ends (instead of --duration)")
 	announce.Flags().StringVar(&duration, "duration", "2h", "how long the window lasts")
-	announce.Flags().StringVar(&lead, "notice", "0", "treat the window as announced this long before it opens (for example 24h)")
-	announce.Flags().StringVar(&message, "message", "", "what the dashboard's users should know")
+	announce.Flags().StringVar(&lead, "notice", "0", "announce the window this long before it opens (for example 24h); only affects a dashboard banner, which is not shown yet")
+	announce.Flags().StringVar(&message, "message", "", "what the operators should know (shown by 'supavise status'; the dashboard does not show it yet)")
+	announce.Flags().BoolVar(&allowLong, "allow-long", false, "allow a window longer than 24h; alerts stay quiet for all of it")
 	_ = announce.MarkFlagRequired("at")
 	_ = announce.MarkFlagRequired("message")
 
@@ -115,7 +120,7 @@ A new announcement replaces the old one.`,
 	rootCmd.AddCommand(maintenanceCmd)
 }
 
-func buildMaintenance(now time.Time, at, until, duration, leadArg, message string) (*notice.Maintenance, error) {
+func buildMaintenance(now time.Time, at, until, duration, leadArg, message string, allowLong bool) (*notice.Maintenance, error) {
 	start, err := parseWhen(at, now)
 	if err != nil {
 		return nil, fmt.Errorf("--at: %w", err)
@@ -140,7 +145,7 @@ func buildMaintenance(now time.Time, at, until, duration, leadArg, message strin
 		}
 		leadSecs = int(d.Seconds())
 	}
-	m := &notice.Maintenance{Message: strings.TrimSpace(message), StartsAt: start, EndsAt: end, LeadSeconds: leadSecs}
+	m := &notice.Maintenance{Message: strings.TrimSpace(message), StartsAt: start, EndsAt: end, LeadSeconds: leadSecs, Extended: allowLong}
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}

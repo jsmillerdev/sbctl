@@ -133,7 +133,7 @@ func (n *Notifier) Notify(ctx context.Context, ev Event) error {
 		case !ev.Resolved && !oneShot(ev.Kind) && active && now.Sub(prev.LastSent) < n.cfg.Repeat():
 			return errSkip
 		}
-		// The hourly cap. A critical alert and the upgrade's own events are not held back: a
+		// The hourly cap. A critical alert, the upgrade's own events and update_available are not held back: a
 		// burst of conditions must not swallow the one message that says an upgrade failed.
 		cutoff := now.Add(-time.Hour)
 		kept := s.Sent[:0]
@@ -225,9 +225,11 @@ func (r reservation) release(s *state) {
 	}
 }
 
-// exemptFromCap reports whether ev is sent even when the hourly cap is reached.
+// exemptFromCap reports whether ev is sent even when the hourly cap is reached. update_available
+// is one message per version and the checker records the version as told once it is sent, so a
+// held-back notice would never come again.
 func exemptFromCap(ev Event) bool {
-	return ev.Severity == SeverityCritical || strings.HasPrefix(ev.Kind, "upgrade_")
+	return ev.Severity == SeverityCritical || strings.HasPrefix(ev.Kind, "upgrade_") || ev.Kind == KindUpdateAvailable
 }
 
 // worthLogging reports whether ev is news for the log. The checker offers every standing
@@ -264,6 +266,23 @@ func (n *Notifier) Active() (map[string]ActiveAlert, error) {
 		return nil, err
 	}
 	return s.Active, nil
+}
+
+// Forget drops an active alert without sending anything. The checker uses it when one alert
+// stands down in favor of others that say the same thing (a group of unhealthy projects that
+// shrinks to single alerts), where a recovery message would be false.
+func (n *Notifier) Forget(key string) error {
+	err := n.st.update(func(s *state) error {
+		if _, ok := s.Active[key]; !ok {
+			return errSkip
+		}
+		delete(s.Active, key)
+		return nil
+	})
+	if errors.Is(err, errSkip) {
+		return nil
+	}
+	return err
 }
 
 // Test sends a test alert to every destination, ignoring de-duplication and the hourly cap,

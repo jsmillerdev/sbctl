@@ -19,7 +19,7 @@ rep.Verdict.ExitCode() // 0 healthy, 1 degraded, 2 down
 | each project | `PostgresPlane.Health`: Postgres answers a query, GoTrue `/health`, PostgREST `/`, all on loopback; then whether Supavisor, Realtime and Storage hold the project's tenant (`fleet.Fleet.TenantPresence`, one GET each, no retries); then the age of the newest completed base backup | degraded |
 | `system backup` | the same freshness rule for the system project, which holds the registry | degraded |
 | `disk` | free space of the state volume | degraded |
-| `certificates` | the earliest expiry among the certificates the node must keep valid: `api.<domain>`, `studio.<domain>` and the `*.api.<domain>` wildcard under `<state_dir>/certs` | degraded |
+| `certificates` | the earliest expiry among the certificates the node must keep valid: `api.<domain>`, `studio.<domain>` and the `*.api.<domain>` wildcard under `<state_dir>/certs`; for each name the newest copy counts, because CertMagic keeps one copy per issuer and an old issuer's copy (after `[tls] ca` changed) is never renewed | degraded |
 | `key escrow` | whether the backup backend holds an encrypted copy of the master key | note |
 | `update` | the record of the daily update check (below) | note |
 | `upgrade`, `maintenance` | the notice files (`internal/notice`) | note |
@@ -76,7 +76,7 @@ go test ./internal/health/
 
 `supavise status` exits 0, 1 or 2 only for a verdict. An error before there is one (no readable config, a user who may not read the node's files, a cancelled context) exits 1 through the shared error path, the same code as degraded, so a gate such as `supavise upgrade --unattended` reads the report (`CheckNode`, or `--json`'s `status` field), not the exit status alone.
 
-Unit tests with fakes for the registry, the plane, the shared services, the tenants, the disk and the clock: the verdict and exit-code table, the summary, project statuses, backup freshness, tenants missing or unreachable, disk thresholds, real certificates generated in the test (stale on-demand certificates for removed hosts that must not judge the node), advisories that must not change the verdict, the report's JSON shape, the monitor's cache, single flight and stale-answer rules, the update check against a fake GitHub API, the `[update]` reader's defaults, the escrow lookup against a file backend. `cmd/supavise/cmd_ops_test.go` runs `supavise status` against a node that is not running (exit status 2); the `install-e2e` job runs it on a healthy node, stops one project's PostgREST and expects degraded and exit status 1.
+Unit tests with fakes for the registry, the plane, the shared services, the tenants, the disk and the clock: the verdict and exit-code table, the summary, project statuses, backup freshness, tenants missing or unreachable, disk thresholds, real certificates generated in the test (an expired copy from an old issuer next to a good one; stale on-demand certificates for removed hosts that must not judge the node), advisories that must not change the verdict, the report's JSON shape, the monitor's cache, single flight and stale-answer rules, the update check against a fake GitHub API, the `[update]` reader's defaults, the escrow lookup against a file backend. `cmd/supavise/cmd_ops_test.go` runs `supavise status` against a node that is not running (exit status 2); the `install-e2e` job runs it on a healthy node, stops one project's PostgREST and expects degraded and exit status 1.
 
 ## Not done
 
