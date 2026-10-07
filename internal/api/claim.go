@@ -123,6 +123,13 @@ func (a *Accounts) IssueClaimToken(ctx context.Context, ttl time.Duration, force
 	return token, expires, nil
 }
 
+// HasLiveClaimToken reports whether a claim token that nobody has used and that has not
+// expired exists. Its value is not recoverable (only the hash is kept), which is why an
+// installer that re-runs asks first instead of replacing it.
+func (a *Accounts) HasLiveClaimToken(ctx context.Context) (bool, error) {
+	return a.Store.HasLiveClaimToken(ctx, KindClaim, a.now())
+}
+
 // IssueInvite creates an invite token for email and revokes the unused one for the same
 // address.
 func (a *Accounts) IssueInvite(ctx context.Context, email string, ttl time.Duration) (token string, expires time.Time, err error) {

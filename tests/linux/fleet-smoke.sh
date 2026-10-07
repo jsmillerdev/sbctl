@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Shared services under real systemd units: system init, `sbctl fleet start`, one project
-# registered with Supavisor, Realtime and Storage, then pooler logins (session and
-# transaction mode), a Storage bucket, upload and signed-URL download, a Realtime channel
-# join, key rotation, crash recovery of the services, tenant removal and project delete.
+# Shared services under real systemd units, through the daemon: system init, `sbctl fleet
+# start` once (it fetches the artifacts, as the installer does), then `sbctl serve` (sbctl.service)
+# brings the shared services up by itself and a project created through the Management API is
+# registered with Supavisor, Realtime and Storage by the daemon's engine. Then: REST through the
+# proxy, a Storage upload through the proxy, pooler logins (session and transaction mode, plain and
+# sslmode=require), a Storage bucket, upload and signed-URL download, a Realtime channel join, key
+# rotation, crash recovery of the services, the instance metadata service denied to every shared
+# service, tenant removal with the project's delete through the API.
 #
 #   sudo SBCTL_BIN=/path/to/sbctl-linux-amd64 tests/linux/fleet-smoke.sh [--teardown]
 #
@@ -16,6 +20,7 @@
 #
 # Not run in development: it needs root, systemd and Linux. CI runs it on an ephemeral
 # Ubuntu 24.04 VM (amd64 and arm64).
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TEARDOWN=0
@@ -57,18 +62,6 @@ studio = $P_STUDIO
 [fleet]
 supavisor_api_port = $P_API
 CONF
-
-# Workaround for a finding of the first CI run, to be removed once sb-postgres@.service lets
-# the launcher do it: supabase-postgres-init.sh runs `chmod +x` on share/supabase-cli/config/
-# pgsodium_getkey.sh inside the artifact on the first boot, and ProtectSystem=strict makes
-# the artifact directory read-only ("chmod: ... Read-only file system", exit 1). The drop-in
-# exists only on this VM; deploy/systemd is not touched here.
-install -d /etc/systemd/system/sb-postgres@.service.d
-cat >/etc/systemd/system/sb-postgres@.service.d/10-fleet-smoke.conf <<'CONF'
-[Service]
-ReadWritePaths=/var/lib/sbctl/artifacts
-CONF
-systemctl daemon-reload
 
 log "system init (downloads artifacts)"
 system_init
@@ -116,16 +109,65 @@ for other in realtime storage pgmeta; do
   fi
 done
 
-log "create a project and register it with the services"
-REF=$(create_project fleet-a micro)
-[[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
-sbctl fleet ensure-tenant "$REF" || fail "ensure-tenant"
-sbctl fleet ensure-tenant "$REF" || fail "second ensure-tenant (must be a no-op)"
-DBPW=$(project_field "$REF" 'd["keys"]["db_password"]' --show-keys)
+log "instance metadata: denied to every shared service, from inside its unit"
+imds_up
+trap 'rc=$?; imds_down; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
+for svc in pgmeta supavisor realtime storage; do
+  imds_denied_by_unit "sb-$svc.service"
+  imds_blocked_in "sb-$svc.service"
+done
+imds_down
+trap 'rc=$?; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
+
+log "the daemon starts the shared services at boot (sbctl serve, fleet.Setup)"
+sbctl fleet stop || fail "fleet stop"
+for svc in pgmeta supavisor realtime storage; do
+  [[ $(unit_state "sb-$svc.service") == inactive ]] || fail "sb-$svc is $(unit_state "sb-$svc.service") after fleet stop"
+done
+systemctl start sbctl.service
+for ((i = 0; i < 180; i++)); do
+  sbctl fleet status >/dev/null 2>&1 && break
+  sleep 2
+done
+sbctl fleet status || { journalctl --no-pager -u sbctl.service | tail -40 >&2; fail "the daemon did not bring the shared services up"; }
+for svc in pgmeta supavisor realtime storage; do
+  [[ $(unit_state "sb-$svc.service") == active ]] || fail "sb-$svc is $(unit_state "sb-$svc.service") after the daemon started"
+done
+for ((i = 0; i < 30; i++)); do
+  [[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] && break
+  sleep 1
+done
+[[ $(http_code -H "Host: $API_HOST" http://127.0.0.1/v1/projects) == 401 ]] || fail "the Management API does not answer through the proxy"
+
+log "create a project through the Management API: the daemon registers it with the shared services"
+claim_and_token
+REF=$(api_create_project fleet-api)
+DBPW=$DBPASS
+project_keys "$REF"
 SVC=$(project_field "$REF" 'd["keys"]["service_role_key"]' --show-keys)
 ANON=$(project_field "$REF" 'd["keys"]["anon_key"]' --show-keys)
 HOST="$REF.api.$SBCTL_DOMAIN"
 PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
+sbctl fleet ensure-tenant "$REF" || fail "ensure-tenant (the tenants the daemon registered must make this a no-op)"
+
+log "REST through the proxy with the publishable key"
+rest_through_proxy "$REF" "$PUB"
+
+log "Storage through the proxy: bucket, upload and read-back with the secret key"
+st_proxy() { curl -fsS -m 30 -H "Host: $HOST" -H "apikey: $SEC" -H "Authorization: Bearer $SEC" "$@"; }
+st_proxy -X POST -H 'Content-Type: application/json' -d '{"name":"proxied"}' "http://127.0.0.1/storage/v1/bucket" >/dev/null || fail "create a bucket through the proxy"
+st_proxy -X POST -H 'Content-Type: text/plain' --data-binary 'uploaded through the proxy' "http://127.0.0.1/storage/v1/object/proxied/hello.txt" >/dev/null \
+  || fail "upload through the proxy"
+got=$(st_proxy "http://127.0.0.1/storage/v1/object/proxied/hello.txt") || fail "download through the proxy"
+[[ $got == 'uploaded through the proxy' ]] || fail "downloaded '$got'"
+
+log "pooler: postgres.$REF through Supavisor with sslmode=require on both ports"
+for port in $P_SESSION $P_TRANSACTION; do
+  info=$(PGPASSWORD=$DBPW "$PSQL" "host=127.0.0.1 port=$port user=postgres.$REF dbname=postgres sslmode=require connect_timeout=10" \
+    -At -c 'select count(*) from public.smoke_items' -c '\conninfo' </dev/null) || fail "pooler port $port: sslmode=require login failed"
+  grep -q '^2$' <<<"$info" || fail "pooler port $port: the project's table did not come back: $info"
+  grep -Eiq 'ssl connection.*(protocol|true)' <<<"$info" || fail "pooler port $port: sslmode=require connected without TLS: $info"
+done
 
 log "pooler: postgres.$REF logs in on the session and transaction ports"
 for port in $P_SESSION $P_TRANSACTION; do
@@ -253,15 +295,19 @@ done
 ws_join "$P_REALTIME" "$REF.realtime.internal" "$NEWANON" || fail "realtime tenant lost after the restart"
 
 fleet_memory "one project registered, after the crash recovery"
-log "remove the tenants, then delete the project"
+log "remove the tenants, then delete the project through the API"
 sbctl fleet remove-tenant "$REF" || fail "remove-tenant"
 [[ $(http_code -H "x-forwarded-host: $HOST" -H "Authorization: Bearer $NEWSVC" "http://127.0.0.1:$P_STORAGE/bucket") != 200 ]] || fail "storage still serves a removed tenant"
 if PGPASSWORD=$DBPW "$PSQL" "host=127.0.0.1 port=$P_SESSION user=postgres.$REF dbname=postgres sslmode=disable connect_timeout=10" -Atc 'select 1' </dev/null >/dev/null 2>&1; then
   fail "pooler still serves a removed tenant"
 fi
-sbctl projects delete "$REF" --skip-final-backup >/dev/null || fail "project delete"
+papi DELETE "/v1/projects/$REF" -o /dev/null -m 900 || fail "project delete through the API"
+for svc in postgres gotrue postgrest; do
+  [[ $(unit_state "sb-$svc@$REF.service") == inactive ]] || fail "sb-$svc@$REF is $(unit_state "sb-$svc@$REF.service") after the delete"
+done
 
 log "fleet stop"
+systemctl stop sbctl.service
 sbctl fleet stop || fail "fleet stop"
 for svc in pgmeta supavisor realtime storage; do
   [[ $(unit_state "sb-$svc.service") == inactive ]] || fail "sb-$svc is $(unit_state "sb-$svc.service") after fleet stop"

@@ -32,7 +32,11 @@ type Options struct {
 	// Version is recorded in backup manifests.
 	Version string
 	// Fleet registers projects with the shared services (Supavisor, Realtime, Storage).
-	Fleet fleet.Fleet
+	// BindFleet gives a lazily built Fleet (fleet.Lazy) the registry and secrets of the
+	// opened node; Serve and the commands call it right after lifecycle.Open. With no Fleet
+	// at all, Serve builds a Lazy itself.
+	Fleet     fleet.Fleet
+	BindFleet func(reg registry.Registry, sec secrets.Secrets)
 	// Artifacts replaces the artifact store (tests with unpacked artifacts); nil means the
 	// store under state_dir.
 	Artifacts lifecycle.Artifacts

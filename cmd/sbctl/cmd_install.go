@@ -551,8 +551,10 @@ func (in *installer) firewall(mode string) error {
 	st, _ := exec.CommandContext(in.ctx, "ufw", "status").Output()
 	active := strings.Contains(string(st), "Status: active")
 	if !active && mode == "auto" {
-		in.warn("ufw is installed but inactive, so no host firewall is configured: the shared services listen on more ports than the public ones. Allow TCP %s only in your security group, or re-run with --firewall ufw", strings.Join(list, ", "))
-		return nil
+		// Cloud images often ship ufw installed and off. Carrying on would leave Supavisor's
+		// API and its shard listeners (ephemeral ports) open on every interface, so the
+		// operator decides, in the open.
+		return fmt.Errorf("ufw is installed but inactive, so no host firewall is configured, and the shared services listen on more ports than the public ones (Supavisor's API and its shard listeners). Re-run with --firewall ufw (the installer enables ufw with SSH and TCP %s open) or with --firewall none (you then allow TCP %s only, from outside, in a security group or firewall of your own)", strings.Join(list, ", "), strings.Join(list, ", "))
 	}
 	in.step("opening TCP %s in ufw", strings.Join(list, ", "))
 	if !active {
@@ -612,10 +614,15 @@ func (in *installer) claimToken(o installOptions) (token string, claimed bool, e
 		return "", true, nil
 	}
 	var tok bytes.Buffer
-	if err := in.asSbctl(&tok, "claim", "token", "--ttl", o.ClaimTTL.String()); err != nil {
+	// --if-none: a re-run before anyone has claimed must not replace a live token. The value
+	// an earlier run stored elsewhere (the CloudFormation stack's secret) would stop working.
+	if err := in.asSbctl(&tok, "claim", "token", "--if-none", "--ttl", o.ClaimTTL.String()); err != nil {
 		return "", false, err
 	}
 	token = strings.TrimSpace(tok.String())
+	if token == "" {
+		return "", false, nil
+	}
 	if o.ClaimTokenFile != "" {
 		if err := writeSecretFile(o.ClaimTokenFile, []byte(token+"\n")); err != nil {
 			return "", false, err
@@ -638,6 +645,10 @@ func printSummary(w io.Writer, cfg *config.Config, ip, token string, claimed boo
 	}
 	fmt.Fprintln(w)
 	switch {
+	case token == "" && !claimed:
+		fmt.Fprintf(w, "A claim token from an earlier run is still valid, so none was issued: it is not shown again (only its hash is kept). Create the first administrator at %s/claim with it.\n", cfg.APIURL())
+		fmt.Fprintln(w, "Lost it? sudo -u sbctl sbctl claim token   (revokes the old one)")
+		fmt.Fprintln(w)
 	case claimed:
 		fmt.Fprintln(w, "The first administrator already exists. Invite more users with: sudo -u sbctl sbctl users invite <email>")
 	default:

@@ -41,6 +41,8 @@ type ClaimStore interface {
 	ReleaseClaimToken(ctx context.Context, id int64) error
 	// Claimed reports whether a claim token has been used.
 	Claimed(ctx context.Context) (bool, error)
+	// HasLiveClaimToken reports whether a token of this kind is unused and not expired at now.
+	HasLiveClaimToken(ctx context.Context, kind string, now time.Time) (bool, error)
 	// MarkUserRemoved records that the dashboard user was removed (migration
 	// 0610_removed_users.sql). The API refuses the user's sessions and tokens from then on.
 	MarkUserRemoved(ctx context.Context, userID, email string) error
@@ -105,6 +107,12 @@ func (s *PGClaimStore) Claimed(ctx context.Context) (bool, error) {
 	return ok, err
 }
 
+func (s *PGClaimStore) HasLiveClaimToken(ctx context.Context, kind string, now time.Time) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx, `select exists (select 1 from sbctl.claim_tokens where kind = $1 and used_at is null and expires_at > $2)`, kind, now).Scan(&ok)
+	return ok, err
+}
+
 func (s *PGClaimStore) MarkUserRemoved(ctx context.Context, userID, email string) error {
 	_, err := s.pool.Exec(ctx, `insert into sbctl.removed_users (user_id, email) values ($1, $2) on conflict (user_id) do nothing`, userID, email)
 	return err
@@ -122,6 +130,17 @@ type MemoryClaimStore struct {
 	next    int64
 	tokens  map[int64]*memClaim
 	removed map[string]bool
+}
+
+func (m *MemoryClaimStore) HasLiveClaimToken(_ context.Context, kind string, now time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range m.tokens {
+		if t.Kind == kind && t.UsedAt == nil && t.ExpiresAt.After(now) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (m *MemoryClaimStore) MarkUserRemoved(_ context.Context, userID, _ string) error {

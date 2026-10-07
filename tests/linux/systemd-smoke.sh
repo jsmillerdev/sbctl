@@ -10,6 +10,7 @@
 #
 # Not run in development: it needs root, systemd and Linux. CI runs it on an ephemeral
 # Ubuntu 24.04 VM.
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TEARDOWN=0
@@ -93,34 +94,26 @@ for hidden in "$SBCTL_STATE/backups" "$SBCTL_STATE/certs" "$SBCTL_STATE/projects
     "$SBCTL_STATE/projects/$A/postgrest.run" "$SBCTL_STATE/projects/system" /etc/sbctl; do
   if sees "$G" "$hidden"; then fail "$G can read $hidden"; fi
 done
-log "containment: sb-postgres@$A sees its cluster, its own backups and nothing of the node"
+log "containment: sb-postgres@$A sees its cluster and its own WAL relay directory, and nothing of the node"
 PGU="sb-postgres@$A.service"
 sees "$PGU" "$SBCTL_STATE/projects/$A/postgres" || fail "$PGU cannot read its cluster directory"
 sees "$PGU" "$SBCTL_STATE/projects/$A/postgres.run" || fail "$PGU cannot read its launcher"
-for hidden in /etc/sbctl/master.key "$SBCTL_STATE/projects/$B" "$SBCTL_STATE/projects/system" "$SBCTL_STATE/projects/$A/postgres.env" \
-    "$SBCTL_STATE/projects/$A/gotrue.env" "$SBCTL_STATE/certs" "$SBCTL_STATE/backups/$B"; do
+sees "$PGU" "$SBCTL_STATE/projects/$A/wal" || fail "$PGU cannot see its WAL relay directory"
+# No backend credentials and no backups: config.toml may hold the S3 key, and the shared backups
+# directory holds every project's WAL and base backups. WAL leaves through the relay socket.
+for hidden in /etc/sbctl /etc/sbctl/config.toml /etc/sbctl/master.key "$SBCTL_STATE/projects/$B" "$SBCTL_STATE/projects/$B/wal" \
+    "$SBCTL_STATE/projects/system" "$SBCTL_STATE/projects/system/wal" "$SBCTL_STATE/projects/$A/postgres.env" \
+    "$SBCTL_STATE/projects/$A/gotrue.env" "$SBCTL_STATE/certs" "$SBCTL_STATE/backups" "$SBCTL_STATE/backups/$A" "$SBCTL_STATE/backups/$B"; do
   if sees "$PGU" "$hidden"; then fail "$PGU can read $hidden"; fi
 done
-# archive_command must still work from inside that namespace: it writes into backups/<ref>.
-sees "$PGU" /etc/sbctl/config.toml || fail "$PGU cannot read config.toml, so archive_command cannot find its backend"
+if nsenter -t "$(systemctl show -p MainPID --value "$PGU")" -m -- runuser -u "$SBCTL_USER" -- sh -c "echo x > '$SBCTL_STATE/projects/$A/wal/probe'" 2>/dev/null; then
+  fail "$PGU can write into its WAL relay directory (it must be read-only)"
+fi
 if [[ $(unit_state sb-studio.service) == active ]]; then
   for hidden in "$SBCTL_STATE/projects/system/supavisor.env" "$SBCTL_STATE/projects/system/storage.env" "$SBCTL_STATE/backups"; do
     if sees sb-studio.service "$hidden"; then fail "sb-studio can read $hidden"; fi
   done
 fi
-
-log "WAL archiving: a switched segment of $A reaches the backend through sbctl wal push"
-PGPORT_A=$(project_field "$A" 'd["ports"]["Postgres"]')
-PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
-SEG=$(sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$A/postgres/sock port=$PGPORT_A user=supabase_admin dbname=postgres" \
-  -Atc "select pg_walfile_name(pg_switch_wal() - 1)" </dev/null) || fail "$A: could not switch WAL over the cluster socket"
-for ((i = 0; i < 40; i++)); do
-  [[ -s "$SBCTL_STATE/backups/$A/wal/$SEG.zst" ]] && break
-  sleep 1
-done
-[[ -s "$SBCTL_STATE/backups/$A/wal/$SEG.zst" ]] || { journalctl --no-pager -u "sb-postgres@$A" | tail -20 >&2; fail "$A: WAL segment $SEG was not archived (archive_command inside the namespace)"; }
-[[ $(sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$A/postgres/sock port=$PGPORT_A user=supabase_admin dbname=postgres" \
-  -Atc "select failed_count from pg_stat_archiver" </dev/null) == 0 ]] || fail "$A: archive_command has failed"
 
 log "daemon: sbctl.service (sbctl serve) next to the CLI"
 systemctl start sbctl.service
@@ -145,9 +138,103 @@ for t in "sb-basebackup@$A.timer" "sb-basebackup@system.timer" sb-basebackup-pru
   [[ $(unit_state "$t") == active ]] || { journalctl --no-pager -u sbctl.service | tail -20 >&2; fail "$t was not started by the daemon"; }
 done
 
+PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
+pg_admin() { # REF SQL: run SQL as supabase_admin over the cluster's private socket
+  local ref=$1 port
+  port=$(project_field "$ref" 'd["ports"]["Postgres"]')
+  sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$ref/postgres/sock port=$port user=supabase_admin dbname=postgres" -Atc "$2" </dev/null
+}
+wait_archived() { # REF SEGMENT SECONDS: the segment is in the file backend
+  local ref=$1 seg=$2 n=${3:-40} i
+  for ((i = 0; i < n; i++)); do
+    [[ -s "$SBCTL_STATE/backups/$ref/wal/$seg.zst" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+log "WAL archiving: a switched segment of $A reaches the backend through the daemon's relay, not through the cluster's unit"
+for ref in system "$A" "$B"; do
+  [[ -S "$SBCTL_STATE/projects/$ref/wal/r.sock" ]] || fail "$ref: the daemon serves no WAL relay socket"
+done
+archive_cmd=$(pg_admin "$A" "show archive_command")
+[[ $archive_cmd == *"--socket $SBCTL_STATE/projects/$A/wal/r.sock"* && $archive_cmd != *--config* ]] || fail "$A: archive_command is not the relay form: $archive_cmd"
+SEG=$(pg_admin "$A" "select pg_walfile_name(pg_switch_wal() - 1)") || fail "$A: could not switch WAL over the cluster socket"
+wait_archived "$A" "$SEG" 90 || { journalctl --no-pager -u "sb-postgres@$A" -u sbctl.service | tail -30 >&2; fail "$A: WAL segment $SEG was not archived through the relay"; }
+[[ $(pg_admin "$A" "select last_archived_wal is not null from pg_stat_archiver") == t ]] || fail "$A: pg_stat_archiver shows no archived WAL"
+# From inside the cluster's own namespace: its socket works, another project's is not there, and
+# the socket of $A refuses to read $B's archive.
+PGPID=$(systemctl show -p MainPID --value "$PGU")
+inns() { nsenter -t "$PGPID" -m -- runuser -u "$SBCTL_USER" -- "$@"; }
+[[ $(inns curl -sS -m 10 -o /dev/null -w '%{http_code}' --unix-socket "$SBCTL_STATE/projects/$A/wal/r.sock" http://relay/v1/ping) == 204 ]] || fail "$A: the relay does not answer from inside the unit's namespace"
+if inns test -e "$SBCTL_STATE/projects/$B/wal/r.sock"; then fail "$PGU sees the WAL relay socket of $B"; fi
+[[ $(inns curl -sS -m 10 -o /dev/null -w '%{http_code}' --unix-socket "$SBCTL_STATE/projects/$A/wal/r.sock" \
+  "http://relay/v1/wal/fetch?ref=$B&name=000000010000000000000001") == 403 ]] || fail "$A's relay served the archive of $B"
+[[ $(inns curl -sS -m 10 -o /dev/null -w '%{http_code}' --unix-socket "$SBCTL_STATE/projects/$A/wal/r.sock" -X POST --data-binary x \
+  "http://relay/v1/wal/push?ref=$B&name=000000010000000000000001") == 403 ]] || fail "$A's relay accepted a push for $B"
+
+log "WAL archiving fails closed when the daemon is down, and resumes when it is back"
+systemctl stop sbctl.service
+SEG2=$(pg_admin "$A" "select pg_walfile_name(pg_switch_wal() - 1)") || fail "$A: could not switch WAL"
+FAILS0=$(pg_admin "$A" "select failed_count from pg_stat_archiver")
+for ((i = 0; i < 30; i++)); do
+  [[ $(pg_admin "$A" "select failed_count from pg_stat_archiver") -gt $FAILS0 ]] && break
+  sleep 1
+done
+[[ $(pg_admin "$A" "select failed_count from pg_stat_archiver") -gt $FAILS0 ]] || fail "$A: archive_command did not fail while the daemon was down (WAL must not be buffered anywhere else)"
+[[ ! -e "$SBCTL_STATE/backups/$A/wal/$SEG2.zst" ]] || fail "$A: $SEG2 reached the backend with the daemon down"
+systemctl start sbctl.service
+for ((i = 0; i < 30; i++)); do
+  [[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] && break
+  sleep 1
+done
+# Postgres retries by itself (the archiver waits up to a minute between rounds).
+wait_archived "$A" "$SEG2" 150 || { journalctl --no-pager -u "sb-postgres@$A" -u sbctl.service | tail -30 >&2; fail "$A: $SEG2 was not archived after the daemon came back"; }
+
+log "instance metadata: denied to every sb-* unit that runs tenant code, from inside the unit"
+imds_up
+trap 'rc=$?; imds_down; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
+for u in "sb-postgres@$A.service" "sb-postgres@system.service" "sb-gotrue@$A.service" "sb-postgrest@$A.service"; do
+  imds_denied_by_unit "$u"
+  imds_blocked_in "$u"
+done
+[[ -z $(systemctl show -p IPAddressDeny --value sbctl.service) ]] || fail "sbctl.service must keep access to the instance role (it is the only holder of the backup credentials)"
+# The threat itself: SQL that runs a program (superuser here; pg_net, http and untrusted
+# extensions reach the same network) cannot fetch role credentials. The program runs as a
+# child of the postmaster, in the unit's cgroup.
+pg_admin "$A" "copy (select 1) to program '/usr/bin/curl -sS -m 5 -o /dev/null -w %{http_code} http://169.254.169.254:$IMDS_PORT/ > $SBCTL_STATE/projects/$A/postgres/imds-probe.txt 2>&1; echo \" rc=\$?\" >> $SBCTL_STATE/projects/$A/postgres/imds-probe.txt'" >/dev/null 2>&1 || true
+PROBE=$(cat "$SBCTL_STATE/projects/$A/postgres/imds-probe.txt" 2>/dev/null || echo "no probe output")
+[[ $PROBE != 200* && $PROBE != *"rc=0"* ]] || fail "SQL running a program inside sb-postgres@$A reached the metadata service: $PROBE"
+[[ $PROBE == *"curl: ("* ]] || fail "the metadata probe from SQL did not run curl, so it proves nothing: $PROBE"
+log "COPY TO PROGRAM inside sb-postgres@$A: $PROBE"
+rm -f "$SBCTL_STATE/projects/$A/postgres/imds-probe.txt"
+imds_down
+trap 'rc=$?; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
+
+log "a project created through the Management API: REST through the proxy"
+claim_and_token
+C=$(api_create_project smoke-api)
+project_keys "$C"
+rest_through_proxy "$C" "$PUB"
+[[ $(http_code -H "Host: $C.api.$SBCTL_DOMAIN" -H "apikey: sb_publishable_wrong" http://127.0.0.1/rest/v1/smoke_items) == 401 ]] || fail "$C: a wrong key was not a 401"
+[[ -S "$SBCTL_STATE/projects/$C/wal/r.sock" ]] || fail "$C: no WAL relay socket for a project created through the API"
+SEGC=$(pg_admin "$C" "select pg_walfile_name(pg_switch_wal() - 1)")
+wait_archived "$C" "$SEGC" 90 || fail "$C: WAL of a project created through the API was not archived"
+papi DELETE "/v1/projects/$C" -o /dev/null -m 900 || fail "$C: delete through the API"
+
 log "nightly backup: the sb-basebackup@$A service runs as the timer would"
 systemctl start "sb-basebackup@$A.service" || { journalctl --no-pager -u "sb-basebackup@$A" | tail -30 >&2; fail "$A: sb-basebackup service failed"; }
 [[ $(sbctl backups list "$A" | grep -c completed) -ge 1 ]] || { sbctl backups list "$A" >&2 || true; fail "$A: no completed base backup after the backup service ran"; }
+
+log "a base backup with the daemon down: the command serves the relay sockets nobody answers while it runs"
+systemctl stop sbctl.service
+sbctl backups create "$B" --reason manual || { journalctl --no-pager -u "sb-postgres@$B" | tail -20 >&2; fail "$B: base backup with the daemon down"; }
+[[ $(sbctl backups list "$B" | grep -c completed) -ge 1 ]] || fail "$B: no completed base backup after a backup with the daemon down"
+systemctl start sbctl.service
+for ((i = 0; i < 30; i++)); do
+  [[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] && break
+  sleep 1
+done
 
 log "daemon restart leaves the projects running"
 PG_PID=$(systemctl show -p MainPID --value "sb-postgres@$A.service")
@@ -196,20 +283,6 @@ for ((i = 0; i < 30; i++)); do
 done
 sbctl projects health "$B" || fail "$B did not recover from a PostgREST crash"
 
-# mint_dashboard_jwt SECRET: a dashboard session as GoTrue issues it (HS256 with the system
-# project's secret, aud "authenticated", app_metadata.sbctl_admin), for the Management API.
-mint_dashboard_jwt() {
-  python3 - "$1" <<'PY'
-import base64, hashlib, hmac, json, sys, time
-def b64(x): return base64.urlsafe_b64encode(x).rstrip(b"=")
-head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-body = b64(json.dumps({"aud": "authenticated", "sub": "00000000-0000-4000-8000-000000000001",
-                       "email": "smoke@example.test", "role": "", "app_metadata": {"sbctl_admin": True},
-                       "exp": int(time.time()) + 1800}).encode())
-sig = b64(hmac.new(sys.argv[1].encode(), head + b"." + body, hashlib.sha256).digest())
-print((head + b"." + body + b"." + sig).decode())
-PY
-}
 JWT=$(mint_dashboard_jwt "$(project_field system 'd["keys"]["jwt_secret"]' --show-keys)")
 [[ $(http_code -H "Authorization: Bearer $JWT" http://127.0.0.1:7000/v1/projects) == 200 ]] || fail "a dashboard session is not accepted by the Management API"
 

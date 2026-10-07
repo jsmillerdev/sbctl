@@ -9,13 +9,14 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: Instance }
-        Parameters: [Architecture, InstanceType, DataVolumeSize, AdminEmail, SbctlVersion]
+        Parameters: [Architecture, AmiId, InstanceType, DataVolumeSize, AdminEmail, SbctlVersion]
       - Label: { default: "Domain (optional; leave empty to use sslip.io on the Elastic IP)" }
         Parameters: [DomainName, HostedZoneId]
       - Label: { default: Network }
         Parameters: [VpcId, SubnetId, AccessCidr, SshCidr, EnableSessionManager]
     ParameterLabels:
       Architecture: { default: CPU architecture }
+      AmiId: { default: "Ubuntu 24.04 image ID (look it up once, see the description)" }
       InstanceType: { default: Instance type }
       DataVolumeSize: { default: Data volume size (GiB) }
       AdminEmail: { default: Admin email }
@@ -119,16 +120,19 @@ Parameters:
     Default: "true"
     AllowedValues: ["true", "false"]
     Description: Add a minimal policy (Session Manager channels only) so you can open a shell without SSH. Set to false to give the instance role no Systems Manager rights.
-  # Resolved by CloudFormation when the stack is created; both are listed so that the
-  # architecture choice can pick one without the template knowing the AMI id.
-  UbuntuArm64Ami:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id
-    Description: Canonical's public SSM parameter for Ubuntu 24.04 arm64. Leave the default.
-  UbuntuAmd64Ami:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
-    Description: Canonical's public SSM parameter for Ubuntu 24.04 amd64. Leave the default.
+  # A plain image ID, not an SSM-typed parameter: CloudFormation resolves an SSM-typed
+  # parameter again on every stack update, so as soon as Canonical published a newer Ubuntu image
+  # any update (even a changed AccessCidr) replaced the instance. A replacement cannot attach the
+  # data volume while the old instance holds it. With a plain ID the image changes only when you
+  # change this parameter on purpose (README, "Replacing the instance").
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Ubuntu 24.04 image of the stack's region and architecture. Look it up once, when you create
+      the stack: aws ssm get-parameter --region <region> --query Parameter.Value --output text
+      --name /aws/service/canonical/ubuntu/server/24.04/stable/current/<arm64|amd64>/hvm/ebs-gp3/ami-id
+      (arm64 for the default Architecture, amd64 for x86_64). Keep the same value on later
+      updates: changing it replaces the instance, which needs the procedure in the README.
 
 Rules:
   ArchitectureMatchesInstanceType:
@@ -153,7 +157,6 @@ Rules:
         AssertDescription: Give both the VPC and the subnet, or neither.
 
 Conditions:
-  IsArm: !Equals [!Ref Architecture, arm64]
   HasDomain: !Not [!Equals [!Ref DomainName, ""]]
   HasZone: !Not [!Equals [!Ref HostedZoneId, ""]]
   HasSsh: !Not [!Equals [!Ref SshCidr, ""]]
@@ -325,7 +328,10 @@ Resources:
               - Effect: Allow
                 Action: "secretsmanager:PutSecretValue"
                 Resource: !Ref ClaimTokenSecret
-  # DNS-01 certificates: change records in the one hosted zone and nothing else.
+  # DNS-01 certificates: change TXT records named _acme-challenge.<something under the domain>
+  # in the one hosted zone and nothing else. The A records are the stack's own (DnsRecords). The
+  # instance role is also what an attacker who reaches the instance metadata service would hold,
+  # so it must not be able to repoint api.<domain> or any other name of the zone.
   DnsPolicy:
     Type: AWS::IAM::Policy
     Condition: HasZone
@@ -336,7 +342,17 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Action: ["route53:ChangeResourceRecordSets", "route53:ListResourceRecordSets"]
+            Action: "route53:ChangeResourceRecordSets"
+            Resource: !Sub "arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}"
+            Condition:
+              ForAllValues:StringEquals:
+                "route53:ChangeResourceRecordSetsRecordTypes": [TXT]
+              ForAllValues:StringLike:
+                "route53:ChangeResourceRecordSetsNormalizedRecordNames":
+                  - !Sub "_acme-challenge.${DomainName}"
+                  - !Sub "_acme-challenge.*.${DomainName}"
+          - Effect: Allow
+            Action: "route53:ListResourceRecordSets"
             Resource: !Sub "arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}"
           - Effect: Allow
             Action: "route53:GetChange"
@@ -399,7 +415,7 @@ Resources:
           # SubnetId defaults to "" and is only used when VpcId is given (CreateNetwork is false).
           ignore_checks: [W1030]
     Properties:
-      ImageId: !If [IsArm, !Ref UbuntuArm64Ami, !Ref UbuntuAmd64Ami]
+      ImageId: !Ref AmiId
       InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref InstanceProfile
       NetworkInterfaces:
@@ -492,6 +508,30 @@ Resources:
             for u in sbctl.service sb-postgres@.service; do
               mkdir -p "/etc/systemd/system/$u.d"
               printf '[Unit]\nRequiresMountsFor=/var/lib/sbctl\n' > "/etc/systemd/system/$u.d/10-sbctl-data-mount.conf"
+            done
+            systemctl daemon-reload
+
+            step "keeping the node's state on the data volume"
+            # /etc/sbctl holds the master key (it unseals every secret in the registry) and
+            # config.toml. On the root volume they would be lost with the instance, and the
+            # data volume's secrets with them. Bind /etc/sbctl to the data volume before the
+            # installer writes anything, and give a replacement instance the same owner uid
+            # so that the files on the volume stay readable.
+            mkdir -p /var/lib/sbctl/etc /etc/sbctl
+            mountpoint -q /etc/sbctl || mount --bind /var/lib/sbctl/etc /etc/sbctl || fail "bind-mount /etc/sbctl"
+            grep -q ' /etc/sbctl ' /etc/fstab \
+              || echo '/var/lib/sbctl/etc /etc/sbctl none bind,nofail,x-systemd.requires-mounts-for=/var/lib/sbctl 0 0' >> /etc/fstab
+            OWNER_UID=$(stat -c %u /var/lib/sbctl); OWNER_GID=$(stat -c %g /var/lib/sbctl)
+            if [ "$OWNER_UID" != 0 ] && ! id sbctl >/dev/null 2>&1; then
+              # The volume already holds an install (an instance that was replaced): recreate the user
+              # with the uid that owns the files. The installer then runs as a repair and keeps the master key.
+              echo "the data volume holds an earlier install (owner uid $OWNER_UID): repairing it, keeping the master key"
+              getent group "$OWNER_GID" >/dev/null || groupadd --system --gid "$OWNER_GID" sbctl
+              useradd --system --uid "$OWNER_UID" --gid "$OWNER_GID" --home-dir /var/lib/sbctl --no-create-home \
+                --shell /usr/sbin/nologin sbctl || fail "cannot recreate the sbctl user with uid $OWNER_UID"
+            fi
+            for u in sbctl.service sb-postgres@.service; do
+              printf '[Unit]\nRequiresMountsFor=/etc/sbctl\n' > "/etc/systemd/system/$u.d/20-sbctl-etc-mount.conf"
             done
             systemctl daemon-reload
 

@@ -302,11 +302,13 @@ func openBackupService(ctx context.Context, withManager bool) (*backup.Service, 
 	// the sockets nobody answers while it runs.
 	_, stopRelay := app.StartWALRelay(ctx, cfg, opts.Log, true)
 	if withManager {
-		node, err := lifecycle.Open(ctx, cfg, openOptions(cfg))
+		// A restore creates a project, so the Engine registers it with the shared services.
+		node, err := lifecycle.Open(ctx, cfg, app.LifecycleOptions(cfg, opts))
 		if err != nil {
 			stopRelay()
 			return nil, nil, err
 		}
+		opts.BindFleet(node.Registry, node.Secrets)
 		svc, err := app.NewBackupService(ctx, cfg, node.Registry, node.Secrets, opts)
 		if err != nil {
 			node.Close()

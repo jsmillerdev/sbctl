@@ -15,6 +15,7 @@
 #
 # Do not run it on a machine you care about: it creates the sbctl user, writes /etc/sbctl,
 # installs units and starts real clusters. Exit status is non-zero on the first failure.
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 E2E_STUDIO=${E2E_STUDIO:-1}
@@ -37,7 +38,7 @@ trap cleanup EXIT
 need_root
 preflight
 ARCH=$(dpkg --print-architecture)
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 if [[ -z $SBCTL_BIN ]]; then
   command -v go >/dev/null || fail "no SBCTL_BIN and no go toolchain"
@@ -60,7 +61,7 @@ jq_() { python3 -c 'import json,sys; d=json.load(sys.stdin); print('"$1"')'; }
 log "static checks"
 bash -n deploy/install.sh deploy/release-assets.sh tests/linux/install-e2e.sh
 if command -v shellcheck >/dev/null; then
-  shellcheck -S warning deploy/install.sh deploy/release-assets.sh
+  shellcheck -x -S warning deploy/install.sh deploy/release-assets.sh tests/linux/install-e2e.sh
 else
   log "shellcheck is not installed; skipped"
 fi

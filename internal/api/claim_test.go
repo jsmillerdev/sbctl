@@ -448,6 +448,9 @@ func testClaimStore(t *testing.T, s ClaimStore) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
 
+	if live, err := s.HasLiveClaimToken(ctx, KindClaim, now); err != nil || live {
+		t.Fatalf("HasLiveClaimToken on empty: %v %v", live, err)
+	}
 	uid := "0a1b2c3d-0000-4000-8000-000000000042"
 	if gone, err := s.UserRemoved(ctx, uid); err != nil || gone {
 		t.Fatalf("UserRemoved before any removal: %v %v", gone, err)
@@ -471,6 +474,15 @@ func testClaimStore(t *testing.T, s ClaimStore) {
 	t1, err := s.CreateClaimToken(ctx, KindClaim, h1, "", now.Add(time.Hour))
 	if err != nil || t1.Kind != KindClaim || t1.Email != "" {
 		t.Fatalf("create: %+v %v", t1, err)
+	}
+	if live, err := s.HasLiveClaimToken(ctx, KindClaim, now); err != nil || !live {
+		t.Fatalf("HasLiveClaimToken with a live token: %v %v", live, err)
+	}
+	if live, _ := s.HasLiveClaimToken(ctx, KindInvite, now); live {
+		t.Fatal("a claim token counts as a live invite")
+	}
+	if live, _ := s.HasLiveClaimToken(ctx, KindClaim, now.Add(2*time.Hour)); live {
+		t.Fatal("an expired claim token counts as live")
 	}
 	// A second claim token revokes the first.
 	if _, err := s.CreateClaimToken(ctx, KindClaim, h2, "", now.Add(time.Hour)); err != nil {

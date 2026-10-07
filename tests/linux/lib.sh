@@ -111,6 +111,132 @@ wait_active() { # UNIT SECONDS
 
 http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" || true; }
 
+# ---- the daemon's Management API ------------------------------------------------------
+# The proxy listens on 127.0.0.1:80 (config tls.mode off); every name is reached with a Host header.
+API_HOST="api.$SBCTL_DOMAIN"
+api() { # METHOD PATH [curl args...]: the Management API through the proxy
+  local m=$1 p=$2; shift 2
+  curl -sS -m 120 -X "$m" -H "Host: $API_HOST" "$@" "http://127.0.0.1$p"
+}
+
+# claim_and_token: claims the node with the install-style token (an admin and an organization),
+# signs in and creates a personal access token. Sets PAT and ORG for papi.
+claim_and_token() {
+  local tok jwt
+  tok=$(sbctl claim token 2>/dev/null) || fail "sbctl claim token"
+  [[ $(api POST /claim -H 'Content-Type: application/json' \
+      -d "{\"token\":\"$tok\",\"email\":\"smoke@example.com\",\"password\":\"smoke-correct-horse-battery\",\"organization_name\":\"Smoke\"}" \
+      -o /dev/null -w '%{http_code}') == 201 ]] || fail "claim with the token failed"
+  jwt=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
+    -d '{"email":"smoke@example.com","password":"smoke-correct-horse-battery"}' | json_get 'd["access_token"]') || fail "dashboard sign-in"
+  PAT=$(api POST /platform/profile/access-tokens -H "Authorization: Bearer $jwt" -H 'Content-Type: application/json' -d '{"name":"smoke"}' | json_get 'd["token"]') \
+    || fail "creating a personal access token"
+  [[ $PAT == sbp_* ]] || fail "personal access token: $PAT"
+  ORG=$(papi GET /v1/organizations | json_get 'd[0]["slug"]') || fail "listing organizations with the token"
+}
+papi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H "Authorization: Bearer $PAT" "$@"; }
+
+# api_create_project NAME: creates a project through POST /v1/projects, waits until it is
+# ACTIVE_HEALTHY and prints its ref. Sets DBPASS.
+api_create_project() {
+  local name=$1 ref status="" i
+  DBPASS=Smoke-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  ref=$(papi POST /v1/projects -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$name\",\"organization_slug\":\"$ORG\",\"db_pass\":\"$DBPASS\",\"region\":\"us-east-1\"}" | json_get 'd["ref"]') || fail "creating project $name through the API"
+  [[ $ref =~ ^[a-z]{20}$ ]] || fail "project ref: $ref"
+  for ((i = 0; i < 180; i++)); do
+    status=$(papi GET "/v1/projects/$ref" | json_get 'd["status"]' 2>/dev/null || true)
+    [[ $status == ACTIVE_HEALTHY || $status == INIT_FAILED ]] && break
+    sleep 3
+  done
+  [[ $status == ACTIVE_HEALTHY ]] || { journalctl --no-pager -u sbctl.service -n 60 >&2; fail "project $ref is $status"; }
+  echo "$ref"
+}
+
+# project_keys REF: sets PUB (publishable key) and SEC (secret key) of an API project.
+project_keys() {
+  local k
+  k=$(papi GET "/v1/projects/$1/api-keys?reveal=true")
+  PUB=$(printf '%s' "$k" | json_get '[x["api_key"] for x in d if str(x.get("api_key","")).startswith("sb_publishable_")][0]') || fail "no publishable key: $k"
+  SEC=$(printf '%s' "$k" | json_get '[x["api_key"] for x in d if str(x.get("api_key","")).startswith("sb_secret_")][0]') || fail "no secret key: $k"
+}
+
+# rest_through_proxy REF PUB: creates a table through database/query and reads it back with the
+# publishable key through the proxy.
+rest_through_proxy() {
+  local ref=$1 pub=$2 n="" i sql
+  sql="create table public.smoke_items (id int primary key, label text); insert into public.smoke_items values (1, 'one'), (2, 'two'); grant select on public.smoke_items to anon; notify pgrst, 'reload schema';"
+  papi POST "/v1/projects/$ref/database/query" -H 'Content-Type: application/json' \
+    -d "$(python3 -c 'import json,sys; print(json.dumps({"query": sys.argv[1]}))' "$sql")" >/dev/null || fail "$ref: create table through database/query"
+  for ((i = 0; i < 30; i++)); do
+    n=$(curl -sS -m 30 -H "Host: $ref.api.$SBCTL_DOMAIN" -H "apikey: $pub" "http://127.0.0.1/rest/v1/smoke_items?select=id" | json_get 'len(d)' 2>/dev/null || true)
+    [[ $n == 2 ]] && return 0
+    sleep 2
+  done
+  fail "$ref: REST through the proxy returned '$n' rows, want 2"
+}
+
+# ---- cloud metadata (IMDS) --------------------------------------------------------------
+# The EC2 instance role must not be reachable from the units that run tenant code. CI VMs have
+# no instance metadata service, so a mock listens on the metadata addresses (added to lo, on a
+# high port: the daemon owns :80); IPAddressDeny matches the destination address, not the port.
+# imds_blocked_in tests the real unit: it moves a curl into the unit's cgroup, where the BPF
+# program of IPAddressDeny applies, and the same curl outside the unit must reach the mock.
+IMDS_PORT=38169
+IMDS_DIR=/tmp/sbctl-imds-mock
+imds_up() {
+  mkdir -p "$IMDS_DIR"; echo imds-role-credentials >"$IMDS_DIR/index.html"
+  ip addr add 169.254.169.254/32 dev lo 2>/dev/null || true
+  ip -6 addr add fd00:ec2::254/128 dev lo nodad 2>/dev/null || true
+  (cd "$IMDS_DIR" && nohup python3 -m http.server "$IMDS_PORT" --bind 169.254.169.254 >"$IMDS_DIR/v4.log" 2>&1 & echo $! >"$IMDS_DIR/v4.pid")
+  (cd "$IMDS_DIR" && nohup python3 -m http.server "$IMDS_PORT" --bind fd00:ec2::254 >"$IMDS_DIR/v6.log" 2>&1 & echo $! >"$IMDS_DIR/v6.pid")
+  local i
+  for ((i = 0; i < 20; i++)); do
+    curl -fsS -m 2 -o /dev/null "http://169.254.169.254:$IMDS_PORT/" && curl -fsS -m 2 -g -o /dev/null "http://[fd00:ec2::254]:$IMDS_PORT/" && return 0
+    sleep 0.5
+  done
+  cat "$IMDS_DIR"/*.log >&2 || true
+  fail "the metadata mock does not answer from outside the units"
+}
+imds_down() {
+  for f in v4 v6; do [[ -f $IMDS_DIR/$f.pid ]] && kill "$(cat "$IMDS_DIR/$f.pid")" 2>/dev/null || true; done
+  ip addr del 169.254.169.254/32 dev lo 2>/dev/null || true
+  ip -6 addr del fd00:ec2::254/128 dev lo 2>/dev/null || true
+  rm -rf "$IMDS_DIR"
+}
+imds_blocked_in() { # UNIT: fails unless the unit's cgroup cannot reach the mock on either address
+  local unit=$1 cg url
+  cg=$(systemctl show -p ControlGroup --value "$unit")
+  [[ -n $cg && -w /sys/fs/cgroup$cg/cgroup.procs ]] || fail "$unit: no writable cgroup ($cg)"
+  for url in "http://169.254.169.254:$IMDS_PORT/" "http://[fd00:ec2::254]:$IMDS_PORT/"; do
+    curl -fsS -m 3 -g -o /dev/null "$url" || fail "the mock does not answer outside $unit ($url)"
+    if bash -c 'echo $$ >"$1" && exec curl -fsS -m 3 -g -o /dev/null "$2"' _ "/sys/fs/cgroup$cg/cgroup.procs" "$url" 2>/dev/null; then
+      fail "$unit can reach the instance metadata service at $url"
+    fi
+  done
+  log "$unit: the instance metadata service is not reachable (IPv4 and IPv6)"
+}
+imds_denied_by_unit() { # UNIT: the unit file denies both metadata addresses
+  local d
+  d=$(systemctl show -p IPAddressDeny --value "$1")
+  [[ $d == *169.254.169.254* && $d == *fd00:ec2::254* ]] || fail "$1: IPAddressDeny is '$d'"
+}
+
+# mint_dashboard_jwt SECRET: a dashboard session as GoTrue issues it (HS256 with the system
+# project's secret, aud "authenticated", app_metadata.sbctl_admin), for the Management API.
+mint_dashboard_jwt() {
+  python3 - "$1" <<'PY'
+import base64, hashlib, hmac, json, sys, time
+def b64(x): return base64.urlsafe_b64encode(x).rstrip(b"=")
+head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+body = b64(json.dumps({"aud": "authenticated", "sub": "00000000-0000-4000-8000-000000000001",
+                       "email": "smoke@example.test", "role": "", "app_metadata": {"sbctl_admin": True},
+                       "exp": int(time.time()) + 1800}).encode())
+sig = b64(hmac.new(sys.argv[1].encode(), head + b"." + body, hashlib.sha256).digest())
+print((head + b"." + body + b"." + sig).decode())
+PY
+}
+
 collect_logs() {
   mkdir -p "$LOG_DIR"
   journalctl --no-pager -o short-iso -u 'sb-*' -u sbctl.service >"$LOG_DIR/journal.log" 2>&1 || true
@@ -121,5 +247,6 @@ collect_logs() {
 }
 
 teardown() {
+  imds_down 2>/dev/null || true
   systemctl stop 'sb-*' 2>/dev/null || true
 }

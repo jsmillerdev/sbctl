@@ -441,3 +441,44 @@ func TestSummaryKeepsTheTokenOutOfTheLogWhenItGoesToAFile(t *testing.T) {
 		t.Fatalf("summary without a file must show the token:\n%s", without.String())
 	}
 }
+
+// A fake ufw on PATH: `ufw status` answers with the given first line.
+func fakeUFW(t *testing.T, status string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = status ]; then echo '" + status + "'; fi\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "ufw"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// With ufw installed but off (the cloud-image default) and no --firewall flag, the installer
+// stops and says what to choose: carrying on would leave Supavisor's API and shard listeners
+// open on every interface.
+func TestFirewallAutoStopsWhenUFWIsInactive(t *testing.T) {
+	fakeUFW(t, "Status: inactive")
+	var out, errb bytes.Buffer
+	in := &installer{ctx: context.Background(), out: &out, err: &errb, cfg: config.Default()}
+	err := in.firewall("auto")
+	if err == nil || !strings.Contains(err.Error(), "--firewall ufw") || !strings.Contains(err.Error(), "--firewall none") {
+		t.Fatalf("auto with ufw inactive = %v; want an error naming both choices", err)
+	}
+	// The explicit choice that leaves the host alone still works.
+	if err := in.firewall("none"); err != nil {
+		t.Fatalf("--firewall none: %v", err)
+	}
+}
+
+// With ufw active, auto opens the public ports.
+func TestFirewallAutoWithActiveUFWOpensThePublicPorts(t *testing.T) {
+	fakeUFW(t, "Status: active")
+	var out, errb bytes.Buffer
+	in := &installer{ctx: context.Background(), out: &out, err: &errb, cfg: config.Default()}
+	if err := in.firewall("auto"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "opening TCP") {
+		t.Fatalf("output = %q", out.String())
+	}
+}

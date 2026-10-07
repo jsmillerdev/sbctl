@@ -60,10 +60,10 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	// Realtime and Storage through a Lazy fleet (credentials loaded on first use, a
 	// service this node never rendered skipped), so a project created through the API
 	// reaches the shared services exactly as one created by `sbctl projects create`.
-	var lz *fleet.Lazy
+	bindFleet := o.BindFleet
 	if len(o.Fleet) == 0 {
-		lz = fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
-		lo.Fleet = lz.Fleet()
+		lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
+		lo.Fleet, bindFleet = lz.Fleet(), lz.Bind
 	}
 	backups := memoizeBackups(&lo)
 	node, err := openNode(ctx, cfg, lo, log)
@@ -71,8 +71,8 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		return err
 	}
 	defer node.Close() // after the drain below: Serve returns only when nothing runs any more
-	if lz != nil {
-		lz.Bind(node.Registry, node.Secrets)
+	if bindFleet != nil {
+		bindFleet(node.Registry, node.Secrets)
 	}
 
 	// Create the shared postgres-meta passphrase now, so the unit that starts pg-meta
@@ -182,13 +182,12 @@ func superviseStop(g *errgroup.Group, gctx context.Context, budget time.Duration
 // first starts them (`sbctl fleet start`); a service whose artifact was never fetched
 // fails here and is logged, and the rest of the node still comes up.
 func startFleet(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
-	m, err := fleet.NewManager(fleet.Deps{Cfg: n.Cfg, Log: log.With("component", "fleet"), Registry: n.Registry,
-		Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts})
+	// fleet.Setup generates the services' sealed secrets on first use, renders and starts
+	// the units in order, and waits for each. Its tenants are not used here: the Engine's
+	// own Fleet (a Lazy over the same Setup) registers projects.
+	_, err := fleet.Setup(ctx, fleet.Deps{Cfg: n.Cfg, Log: log.With("component", "fleet"), Registry: n.Registry,
+		Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts, Start: true})
 	if err != nil {
-		log.Error("fleet not started", "error", err)
-		return
-	}
-	if err := m.Start(ctx); err != nil {
 		log.Error("shared services did not all start", "error", err)
 		return
 	}

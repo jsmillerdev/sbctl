@@ -1,13 +1,27 @@
 package main
 
 import (
+	"log/slog"
+
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/fleet"
+	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/OWNER/sbctl/internal/secrets"
 )
 
-// newFleet returns the tenant fleet every command that creates or deletes projects
-// registers them with. It is empty until the fleet workstream's fleet.Setup is wired in
-// here: an empty fleet.Fleet skips the tenant calls, so projects work without Supavisor,
-// Realtime and Storage. Both `sbctl serve` and the project commands use it, so the daemon
-// and the CLI register tenants the same way.
-func newFleet(_ *config.Config) fleet.Fleet { return fleet.Fleet{} }
+// newFleet returns the tenant fleet that every process creating, re-keying or deleting
+// projects registers them with (Supavisor, Realtime and Storage), and the function that
+// binds it to the node's registry and master key once lifecycle.Open has them.
+//
+// The tenants are the ones fleet.Setup builds: `sbctl serve` and the project commands go
+// through the same code, so a project created through the Management API reaches the
+// shared services exactly as one created with `sbctl projects create`. lifecycle.Open builds
+// its Engine before the registry and the master key exist, and Setup needs both, so the
+// fleet is a fleet.Lazy: its tenants run Setup on first use and skip a service whose unit
+// this node never rendered (a node that does not run the shared services still creates
+// projects). `sbctl serve` additionally starts the services themselves at boot
+// (app.startFleet calls fleet.Setup with Start set), which is what the installer relies on.
+func newFleet(cfg *config.Config, log *slog.Logger) (fleet.Fleet, func(reg registry.Registry, sec secrets.Secrets)) {
+	lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
+	return lz.Fleet(), lz.Bind
+}
