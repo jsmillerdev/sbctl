@@ -262,7 +262,17 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 	if changed {
 		// A running cluster keeps the settings it started with (Start on a running unit is
 		// a no-op), so changed sizing, archive_command or launcher path need a restart.
-		if st, err := pl.sup.Status(ctx, spec.Unit()); err == nil && (st.State == units.StateActive || st.State == units.StateActivating) {
+		st, serr := pl.sup.Status(ctx, spec.Unit())
+		switch {
+		case serr != nil:
+			// Cannot tell whether it runs. Start on a running unit is a no-op, so skipping
+			// the stop would leave the cluster on its old settings without a trace; Stop on a
+			// stopped unit is harmless, so stop it.
+			pl.log.Warn("postgres settings changed; unit status unknown, restarting to be safe", "unit", spec.Unit(), "error", serr)
+			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
+				return err
+			}
+		case st.State == units.StateActive || st.State == units.StateActivating:
 			pl.log.Info("postgres settings changed; restarting the running cluster", "unit", spec.Unit())
 			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
 				return err

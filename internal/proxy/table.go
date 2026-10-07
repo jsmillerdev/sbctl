@@ -117,6 +117,25 @@ func (t *table) routeKind(host string) string {
 	return ""
 }
 
+// hostProject returns the project a derived or custom host reaches, with "derived" or
+// "custom" ("" when none).
+func (t *table) hostProject(host string) (project, string) {
+	host = normalizeHost(host)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if ref := t.cfg.RefFromProjectHost(host); ref != "" {
+		if p, ok := t.projects[ref]; ok {
+			return p, "derived"
+		}
+	}
+	if ref, ok := t.custom[host]; ok {
+		if p, ok := t.projects[ref]; ok {
+			return p, "custom"
+		}
+	}
+	return project{}, ""
+}
+
 func routable(ref string) bool { return ref != config.SystemRef }
 
 // reload replaces the whole table from the registry and drops cached keys.
@@ -153,8 +172,13 @@ func (t *table) customRoutes(rs []registry.Route) map[string]string {
 	m := make(map[string]string, len(rs))
 	for _, r := range rs {
 		h := normalizeHost(r.Host)
-		if t.cfg.RefFromProjectHost(h) != "" || h == t.cfg.APIHost() || h == t.cfg.StudioHost() {
-			t.log.Warn("proxy table: ignoring route for a host the proxy owns", "host", h, "ref", r.Ref)
+		if own := t.cfg.RefFromProjectHost(h); own != "" || h == t.cfg.APIHost() || h == t.cfg.StudioHost() {
+			// The lifecycle engine writes exactly such a row for every project (Kind "api",
+			// the derived host); it is redundant, not wrong. Only a row that points a
+			// derived or control-plane host at something else deserves a warning.
+			if own != r.Ref || own == "" {
+				t.log.Warn("proxy table: ignoring route for a host the proxy owns", "host", h, "ref", r.Ref)
+			}
 			continue
 		}
 		m[h] = r.Ref

@@ -5,7 +5,6 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { applyFixups } from '../package-fixups.mjs'
 import {
   TEMPLATE_SUFFIX,
   allPlaceholderStrings,
@@ -242,37 +241,4 @@ test('SBCTL_STUDIO_SKIP_RUNTIME_CONFIG skips everything', () => {
 test('url-platform keeps an existing /platform suffix and trims slashes', () => {
   const { resolved } = resolveValues(spec, { ...goodEnv, NEXT_PUBLIC_API_URL: 'http://127.0.0.1:7000/platform//' })
   assert.equal(resolved.NEXT_PUBLIC_API_URL, 'http://127.0.0.1:7000/platform')
-})
-
-test('package fixup rewrites /api/incident-banner to a static file, once', () => {
-  const root = mkdtempSync(join(tmpdir(), 'sbctl-studio-fixup-'))
-  try {
-    const next = join(root, 'apps/studio/.next')
-    mkdirSync(next, { recursive: true })
-    const manifest = {
-      basePath: '',
-      staticRoutes: [{ page: '/api/incident-banner' }],
-      rewrites: { beforeFiles: [], afterFiles: [{ source: '/x', destination: '/y', regex: '^/x$' }], fallback: [] },
-    }
-    writeFileSync(join(next, 'routes-manifest.json'), JSON.stringify(manifest))
-    applyFixups(root)
-    applyFixups(root) // idempotent
-    const out = JSON.parse(readFileSync(join(next, 'routes-manifest.json'), 'utf8'))
-    assert.equal(out.rewrites.beforeFiles.length, 1)
-    assert.deepEqual(out.rewrites.beforeFiles[0], {
-      source: '/api/incident-banner',
-      destination: '/sbctl/incident-banner.json',
-      regex: '^/api/incident\\-banner(?:/)?$',
-    })
-    assert.equal(out.rewrites.afterFiles.length, 1)
-    assert.ok(new RegExp(out.rewrites.beforeFiles[0].regex).test('/api/incident-banner'))
-    assert.equal(readFileSync(join(root, 'apps/studio/public/sbctl/incident-banner.json'), 'utf8').trim(), '{"incidents":[]}')
-    // a build that no longer has the route, or has a base path, must stop the packaging
-    writeFileSync(join(next, 'routes-manifest.json'), JSON.stringify({ ...manifest, staticRoutes: [] }))
-    assert.throws(() => applyFixups(root), /not a route of this build/)
-    writeFileSync(join(next, 'routes-manifest.json'), JSON.stringify({ ...manifest, basePath: '/dashboard' }))
-    assert.throws(() => applyFixups(root), /basePath/)
-  } finally {
-    rmSync(root, { recursive: true })
-  }
 })

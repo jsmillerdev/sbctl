@@ -9,7 +9,7 @@ Platform-mode Studio for `sbctl`: a build of upstream Studio with `NEXT_PUBLIC_I
 | `Dockerfile.build` | The same build in a clean Ubuntu 24.04 image (`docker buildx build --target artifact --output type=local,dest=studio/dist`). |
 | `ci-prepare.sh` | For a GitHub-hosted runner: frees disk, adds 6 GB swap, installs zstd. |
 | `verify.sh` | Starts a packaged build on a loopback port and checks it (also run by `build.sh` before it writes the artifact). |
-| `runtime/` | What goes into the artifact: launcher, entrypoint, runtime substitution, packaging fixups, and their tests. |
+| `runtime/` | What goes into the artifact: launcher, entrypoint, runtime substitution and its tests. |
 | `placeholders.json` | The per-install values baked into the build as placeholders. |
 | `PATCHSET` | Revision `N` in the artifact name. Bump it when the patches or `runtime/` change without a new upstream tag. |
 | `mock/` | Mock Management API (Go, `package main`). See `mock/README.md`. |
@@ -55,9 +55,11 @@ Next inlines `NEXT_PUBLIC_*` and evaluates the CSP at build time, so `build.sh` 
 
 `/_next/static` chunks keep their file names when a value changes, and Next serves them as immutable. After changing `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_GOTRUE_URL` on a running install, users need a hard reload once.
 
-### Packaging fixups
+### Studio's own routes the proxy answers
 
-`runtime/package-fixups.mjs` edits generated output before the scan: it rewrites `/api/incident-banner` to a static `{"incidents": []}` (`public/sbctl/incident-banner.json` plus one `beforeFiles` rewrite in `routes-manifest.json`). Without it, sign-in took 22 s in the spike (research/08 section 9). This is not a source patch; the script stops the packaging if the route or the manifest shape changes.
+Studio asks its own `/api/incident-banner` route for incident.io banners on every page. Without an incident.io key it answers 500, react-query retries it after 1, 4 and 16 s, and the sign-in form awaits that query, so the redirect after sign-in took 22 s in the spike (research/08 section 9). The artifact is not changed for this: sbctl's proxy answers `GET studio.<domain>/api/incident-banner` itself with `{"incidents":[]}` (`internal/proxy`), so Studio keeps exactly the three patches. Running the artifact without the proxy (`verify.sh`) shows the 500; the spike's browser script answers the route itself for the same reason.
+
+The proxy also rewrites the Content-Security-Policy that Studio sends so that the browser cannot reach `usercentrics.eu`, the consent-banner vendor Studio calls on every page load (`internal/proxy`, `studio.go`).
 
 ## Patches, as reviewed
 
@@ -81,7 +83,7 @@ studio/build.sh linux-amd64        # or linux-arm64, on a machine of that archit
 ## Test it
 
 ```bash
-node --test studio/runtime/test/                     # substitution, fixups (13 cases)
+node --test studio/runtime/test/                     # substitution (placeholders, runtime config)
 go test ./studio/mock/                               # the mock (needs no Studio)
 STUDIO_PREBUILT=<apps/studio with .next/standalone> studio/build.sh <platform>   # packaging, launcher and verify.sh without the Next build
 studio/spike.sh                                      # whole spike; see the header of the script

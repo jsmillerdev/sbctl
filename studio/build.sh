@@ -271,9 +271,6 @@ chmod 755 "$STAGE/bin/studio" "$STAGE/node/bin/node"
 cp "$HERE/runtime/docker-entrypoint.mjs" "$HERE/runtime/sbctl-runtime-config.mjs" "$STAGE/app/apps/studio/"
 chmod 755 "$STAGE/app/apps/studio/docker-entrypoint.mjs"
 
-# Fixups on generated output (static answer for /api/incident-banner), before the placeholder scan.
-node "$HERE/runtime/package-fixups.mjs" "$STAGE/app"
-
 # Runtime substitution: find every file that holds a placeholder, keep a pristine copy of each,
 # and record the list. Fails if a placeholder did not survive the build.
 log "placeholder scan"

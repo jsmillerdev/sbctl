@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -522,5 +523,42 @@ func TestEscapedPathReachesUpstreamUnchanged(t *testing.T) {
 				t.Fatalf("upstream saw %q, want %q", got, c.wantURI)
 			}
 		})
+	}
+}
+
+// Open routes need no key, so a key lookup that fails (registry hiccup, decrypt error)
+// must not take them down; protected routes still fail closed.
+func TestOpenRoutesSurviveKeyLookupFailure(t *testing.T) {
+	h := newHarness(t)
+	h.keys.setFail(errors.New("registry unavailable"))
+	h.srv.table.dropAllKeysLocked() // no cached keys to hide the failure
+	for _, target := range []string{"/auth/v1/verify?token=abc&type=signup", "/auth/v1/callback?code=1", "/storage/v1/object/public/avatars/a.png"} {
+		if resp, body := h.project("GET", target); resp.StatusCode != 200 {
+			t.Errorf("GET %s with failing keys = %d %s, want it forwarded", target, resp.StatusCode, body)
+		}
+	}
+	if resp, _ := h.project("GET", "/rest/v1/todos", "apikey", h.k.PublishableKey); resp.StatusCode != 503 {
+		t.Errorf("protected route with failing keys = %d, want 503 (fail closed)", resp.StatusCode)
+	}
+	// A project that is not active is still held back, keys or not.
+	if err := h.reg.SetProjectStatus(context.Background(), h.ref, registry.StatusInactive); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "status reaches the table", func() bool {
+		resp, _ := h.project("GET", "/auth/v1/verify?token=abc")
+		return resp.StatusCode == 503
+	})
+}
+
+func TestDerivedProjectRouteRowIsQuiet(t *testing.T) {
+	h := newHarness(t)
+	var buf strings.Builder
+	h.srv.table.log = slog.New(slog.NewTextHandler(&buf, nil))
+	h.srv.table.customRoutes([]registry.Route{
+		{Host: h.host(h.ref), Ref: h.ref, Kind: "api"},     // what lifecycle writes for every project
+		{Host: h.host("tsrqponmlkjihgfedcba"), Ref: h.ref}, // a takeover attempt
+	})
+	if n := strings.Count(buf.String(), "ignoring route"); n != 1 {
+		t.Fatalf("%d warnings, want exactly one (for the takeover only):\n%s", n, buf.String())
 	}
 }

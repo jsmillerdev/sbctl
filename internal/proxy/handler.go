@@ -67,6 +67,9 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveStudio(w http.ResponseWriter, r *http.Request) {
+	if answerStudioLocally(w, r) {
+		return
+	}
 	s.forward(w, r, &target{
 		addr: s.upstream(svcStudio, project{}), path: r.URL.Path, rawPath: r.URL.EscapedPath(), rawQuery: r.URL.RawQuery,
 		fwdHost: r.Host, timeout: 60 * time.Second, studio: true,
@@ -99,6 +102,16 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 	if rt.keys != keyNone {
 		k, err := s.table.projectKeys(r.Context(), p.ref)
 		switch {
+		case err != nil && rt.access == accessOpen:
+			// An open route (GoTrue verify and callback, public storage objects) needs no
+			// key to be allowed through; upstream's Envoy forwards these with static keys.
+			// A registry hiccup, a decrypt error or a project whose secrets are not written
+			// yet must not take them down. The request goes on with its credentials
+			// untouched, and the status gate below still holds back an inactive project.
+			if !errors.Is(err, registry.ErrNotFound) {
+				s.log.Warn("proxy: project keys unavailable; forwarding an open route without key translation", "ref", p.ref, "path", pth, "err", err)
+			}
+			k = nil
 		case errors.Is(err, registry.ErrNotFound):
 			writeJSON(w, http.StatusNotFound, "Project not found")
 			return
@@ -107,10 +120,12 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 			writeJSON(w, http.StatusServiceUnavailable, "Project credentials are unavailable")
 			return
 		}
-		res = authorize(rt, k, p.ref, r.Header, r.URL.RawQuery)
-		if res.status != 0 {
-			writeText(w, res.status, res.body)
-			return
+		if k != nil {
+			res = authorize(rt, k, p.ref, r.Header, r.URL.RawQuery)
+			if res.status != 0 {
+				writeText(w, res.status, res.body)
+				return
+			}
 		}
 	}
 
@@ -228,7 +243,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 			}
 		},
 		ModifyResponse: func(res *http.Response) error {
-			if !tg.studio {
+			if tg.studio {
+				rewriteStudioResponse(res.Header)
+			} else {
 				// One CORS policy, ours: upstream services add their own and the browser rejects duplicates.
 				for name := range res.Header {
 					if strings.HasPrefix(http.CanonicalHeaderKey(name), "Access-Control-") {
