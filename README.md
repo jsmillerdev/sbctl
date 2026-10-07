@@ -27,7 +27,10 @@ Self-hosted Supabase runs one project per Docker stack, with a single-project da
 - **The tools you already use.** Supabase Studio and `supabase-js` work against your server, and apps only change the URL. The Supabase CLI connects with a profile file.
 - **A database for every agent.** Give each preview or AI agent its own branch or project in seconds.
 
-<!-- screenshot:projects -->
+<p align="center">
+  <img alt="Supabase Studio on Supavise: the Acme organization's project list with five projects" src="docs/images/screenshots/projects-dark.png" width="880">
+  <br><sub>The real Supabase Studio, running on Supavise.</sub>
+</p>
 
 ## Get started
 
@@ -62,7 +65,9 @@ Either way, open the claim URL, enter the token to create your admin account, an
 | **API keys** | Publishable and secret keys, legacy JWT keys and key rotation |
 | **Operations** | Automatic HTTPS, signed self-updates and a one-field AWS template |
 
-<!-- screenshot:table-editor -->
+<p align="center">
+  <img alt="Supabase Studio's table editor on Supavise showing a products table with 12 rows" src="docs/images/screenshots/table-editor-dark.png" width="880">
+</p>
 
 ## How it works
 
