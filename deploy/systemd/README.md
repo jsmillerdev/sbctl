@@ -36,54 +36,89 @@ affected template and record why in the template.
 ## Trust model: what the sandbox does and does not do
 
 HANDOFF section 1 settles one service user: every unit, Postgres included, runs as `sbctl`,
-and so does the daemon. That has a consequence this section states plainly.
+and so does the daemon. The mount namespace of each unit and a few other controls do the
+isolating. This section says exactly what they cover and what they do not, because a node
+hosts projects that run user code (SQL functions, extensions such as pg_net and http, an
+agent with `execute_sql`, a compromised app).
 
-**The mount sandbox is not tenant isolation.** All services share one uid, and the kernel
-lets a process of a uid open `/proc/<pid>/environ` and `/proc/<pid>/root` of every other
-process of that uid. A compromised GoTrue or PostgREST of project A can therefore read
-`/proc/<postgres-pid-of-B>/root/...` (B's data directory) and the environment of every other
-unit: B's JWT secret and database passwords sit in the environment of B's GoTrue and
-PostgREST. A file-read bug in a service reaches the same files (a path traversal can read
-`/proc/<pid>/environ`). `TemporaryFileSystem`, `BindPaths` and `InaccessiblePaths` do not stop
-any of that, and no unit option available on Ubuntu 22.04 and 24.04 and Debian 12 (systemd 249
-to 255) does: `ProtectProc=invisible` hides only other users' processes, and `PrivatePIDs=`
-needs systemd 257.
+### What is isolated
 
-**What it does buy.** The allowlist below keeps a service from reading, by plain path, what it
-has no business with: the master key and config (`/etc/sbctl`), TLS keys, other projects' data
-and backups, and sibling units' environment files. That stops accidents, a service that wanders
-through the file system, and exploit classes that reach only paths and not `/proc`. It is
-defense in depth, not a boundary, and the documentation must not promise tenant isolation on
-a single node: **treat every project on a node as sharing a trust domain with every other
-project and with the control plane.** Postgres is the most exposed process (reachable through
-Supavisor, runs C extensions), which is why it gets the same allowlist, and why
-`POSTGRES_PASSWORD` (the `supabase_admin` superuser password, read only on the first boot) is
-rendered into `postgres.env` only until the cluster is initialized, then removed and the
-cluster restarted, so it is not in the postmaster's environment for the life of the cluster.
-The other passwords cannot be removed from the environments of the units that need them.
+| Threat | Control | Checked by |
+|---|---|---|
+| Code of one project reads another project's data directory, environment files, launcher or backups by path | Allowlist mount namespace (below): every unit sees an empty tmpfs where `/var/lib/sbctl` is, plus its own paths | `tests/linux/systemd-smoke.sh` and `fleet-smoke.sh`, from inside the namespaces of real units (CI, amd64 and arm64) |
+| Code in a unit reads the master key or `config.toml` (S3 and DNS credentials) | `InaccessiblePaths=-/etc/sbctl` on every unit. Postgres no longer needs the config: its WAL goes through the relay | same |
+| Code in a project's Postgres reads or overwrites another project's WAL or base backups, or its own | The Postgres unit has no backup directory and no backend credentials. `archive_command` and `restore_command` are `sbctl wal push\|fetch --socket <projects/<ref>/wal/r.sock>`: the daemon (the only holder of the credentials) does the storage I/O over a unix socket that only that project's unit can see. The socket serves exactly one project: it refuses a push for another ref and a fetch of another ref's archive unless the daemon recorded it as the source of this project's restore | `relay_test.go` (the socket contract), `systemd-smoke.sh` (the unit sees only its own socket directory, read-only; the relay answers 403 for a foreign ref) |
+| Code reaches the cloud instance credentials (EC2 role: the whole backup bucket, Route 53) | `IPAddressDeny=169.254.169.254 fd00:ec2::254` on every `sb-*` unit: Postgres, GoTrue, PostgREST, postgres-meta, Realtime, Supavisor, Storage, Studio, imgproxy, the edge runtime. Only `sbctl.service` (and the `sb-basebackup` units, which run `sbctl`) keep access | `systemd-smoke.sh` and `fleet-smoke.sh`: a mock listens on both metadata addresses; a curl placed in the unit's cgroup fails, the same curl outside reaches it, and `COPY ... TO PROGRAM 'curl ...'` inside the project's Postgres fails (see "Checking the metadata rule" below) |
+| A crashed or stopped daemon makes WAL pile up somewhere insecure | There is no other path: with the daemon down `archive_command` fails and Postgres retries it (the segment stays in `pg_wal`, nothing is buffered elsewhere); `restore_command` exits 126, which aborts recovery instead of ending it early | `systemd-smoke.sh` (archiving stops, then resumes), `cli_test.go` (exit statuses) |
 
-**Allowlist, per template.** `TemporaryFileSystem=/var/lib/sbctl:ro` replaces the state
-directory with an empty tmpfs, and the unit gets back only:
+The relay keeps the `archive_command` contract exactly: success only after the compressed file is
+durable in the backend, an identical re-push succeeds, a different file under the same name fails,
+and a file missing from the archive is exit 1 while an unreadable archive is exit 126
+(`internal/backup/README.md`).
+
+### What is not isolated
+
+**The mount sandbox is not a boundary against code that runs inside a unit.** All services
+share one uid, and the kernel lets a process of a uid open `/proc/<pid>/environ` and
+`/proc/<pid>/root` of every other process of that uid. A compromised GoTrue or PostgREST of
+project A can therefore read `/proc/<postgres-pid-of-B>/root/...` (B's data directory) and the
+environment of every other unit: B's JWT secret and database passwords sit in the environment
+of B's GoTrue and PostgREST, and the daemon's `/proc/<pid>/root` shows everything the daemon
+sees (the master key, the config, every backup). A file-read bug in a service reaches the same
+files (a path traversal can read `/proc/<pid>/environ`). `TemporaryFileSystem`, `BindPaths` and
+`InaccessiblePaths` do not stop any of that, and no unit option available on Ubuntu 22.04,
+24.04 and Debian 12 (systemd 249 to 255) does: `ProtectProc=invisible` hides only other users'
+processes, and `PrivatePIDs=` needs systemd 257.
+
+So the controls above close the paths that do not go through `/proc`: plain file reads, the
+metadata service, the backup credentials and the other projects' archives. They do not make a
+node safe against an attacker who has arbitrary code execution as the `sbctl` user inside one
+unit. Postgres runs C extensions and is reachable through Supavisor, so it is the most exposed
+process; a tenant who can run `COPY ... TO PROGRAM` (a superuser: Supabase does not give that
+role to the `postgres` user) or load an untrusted extension has code execution inside the unit
+and reaches the others through `/proc`. Practical consequences:
+
+- Treat every project on a node as sharing a trust domain with every other project and with the
+  control plane **as far as code execution inside a unit goes**. The credentials and data of the
+  other projects are out of reach of SQL, `pg_net`/`http`, an `execute_sql` agent and a plain file
+  read; they are within reach of an exploit that gives code execution as `sbctl`.
+- `POSTGRES_PASSWORD` (the `supabase_admin` superuser password, read only on the first boot) is
+  rendered into `postgres.env` only until the cluster is initialized, then removed and the
+  cluster restarted, so it is not in the postmaster's environment for the life of the cluster.
+  The other passwords cannot be removed from the environments of the units that need them.
+- Another project's database is also reachable over loopback TCP (`127.0.0.1:<port>`), behind
+  scram-sha-256; knowing a password is not the same as being able to read a data directory, and the
+  passwords are not in any file a unit can open.
+- The Edge Runtime (workstream J) runs user code of every project in one process tree. Keep
+  `IPAddressDeny` on it, and materialize each project's functions under a directory the runtime owns
+  (for example `system/edge-runtime/functions/<ref>/`), never by binding `/var/lib/sbctl/projects`
+  (that directory holds every project's environment files and data directories):
+  `TestTemplatesContainment` fails a template that binds more than the allowlist.
+
+### Allowlist, per template
+
+`TemporaryFileSystem=/var/lib/sbctl:ro` replaces the state directory with an empty tmpfs, and
+the unit gets back only:
 
 | Unit | Read-only | Writable |
 |---|---|---|
-| `sb-postgres@<ref>` | `artifacts/`, `projects/<ref>/postgres.run` | `projects/<ref>/postgres/`, `artifacts/postgres/` (the launcher chmods a script there on first boot), `backups/<ref>/` (file backend; sbctl creates it) |
+| `sb-postgres@<ref>` | `artifacts/`, `projects/<ref>/postgres.run`, `projects/<ref>/wal/` (the relay socket; connecting needs no write access) | `projects/<ref>/postgres/`, `artifacts/postgres/` (the launcher chmods a script there on first boot) |
 | `sb-gotrue@<ref>`, `sb-postgrest@<ref>` | `artifacts/`, `projects/<ref>/<svc>.run` | `projects/<ref>/<svc>/` |
 | fleet singletons | `artifacts/`, `projects/system/<svc>.run` | `system/<svc>/` (optional: create it first); Studio also `artifacts/studio/` |
 
-No template binds a project or system directory as a whole, and none needs to read an
-environment file: systemd (PID 1) reads `EnvironmentFile=` before it builds the namespace.
-The Postgres template hides only `/etc/sbctl/master.key`, because `archive_command`
-(`sbctl wal push`) reads `config.toml` for the backend. **That makes `/etc/sbctl/config.toml`
-readable by every project's Postgres, and with it whatever secrets it holds:
-`backup.s3_secret_access_key` (and the access key id) and the DNS-01 provider credentials in
-`tls.credentials`.** A tenant that can run code in its cluster can read them, so anyone who
-runs untrusted SQL extensions or hands out `postgres`-role access should keep S3 and DNS
-credentials out of `config.toml`: use an instance profile or a bucket policy scoped to the
-backup prefix for S3, and the HTTP-01 challenge instead of DNS-01. (A backup-only file that the
-Postgres units can read, with `config.toml` hidden from them, is the fix; it is not done.) `internal/units`
-(`TestTemplatesContainment`) pins this shape, and `tests/linux/systemd-smoke.sh` checks it
-from inside the namespaces of a real node (CI, amd64 and arm64).
+No template binds a project or system directory as a whole, none needs to read an environment file
+(systemd, PID 1, reads `EnvironmentFile=` before it builds the namespace), and none sees `/etc/sbctl`,
+the `backups` directory or the certificates. `internal/units` (`TestTemplatesContainment`) pins this
+shape, and `tests/linux/systemd-smoke.sh` and `fleet-smoke.sh` check it from inside the namespaces of
+a real node.
+
+The WAL relay directory `projects/<ref>/wal/` is created by the lifecycle engine before the cluster
+starts (`PostgresPlane.prepare`), and the daemon's `backup.Relay` serves one socket in it per
+project, picking up new projects within three seconds or at once through the engine's hook. The
+bind is optional (`-` prefix) so a unit that predates the directory still starts; it archives
+nothing until the engine has created the directory and the unit restarted. An upgrade from a node
+without the relay therefore needs one restart of each project's Postgres (the daemon's next
+start of a project does it; `sbctl projects pause|resume <ref>` forces it).
 
 **The writable artifact directory is a persistence path.** `artifacts/postgres/` is writable
 in every project's Postgres namespace and shared by all clusters, the system cluster that holds
@@ -96,12 +131,23 @@ which fails on a read-only or foreign-owned tree even when the bit is already se
 and read-only, give each cluster a private writable copy of only `share/supabase-cli/config`
 (a per-project `BindPaths=` rendered into the unit's drop-in by the plane, since the template
 cannot know the artifact tag), drop `handOver`, and send the upstream change that makes the
-chmod conditional. This is part of the same trust model as above: one trust domain per node.
+chmod conditional. This is part of the same trust model as above.
 
-Two limits of the file backend follow from the allowlist: it must live under
-`/var/lib/sbctl/backups` for the systemd backend (a backend elsewhere needs a drop-in that
-adds its path to the Postgres template), and `backups/<ref>` must exist before the unit
-starts, which sbctl guarantees at create and start.
+### Checking the metadata rule
+
+CI virtual machines have no instance metadata service, so the check puts a mock on both
+addresses: `ip addr add 169.254.169.254/32 dev lo` and `ip -6 addr add fd00:ec2::254/128 dev lo`
+with an HTTP server on a high port (`imds_up` in `tests/linux/lib.sh`; `IPAddressDeny` matches the
+destination address, not the port). `imds_blocked_in <unit>` then moves a `curl` into the unit's
+cgroup (`echo $$ > /sys/fs/cgroup/<ControlGroup>/cgroup.procs`), where systemd's BPF filter
+applies, and expects it to fail on both addresses, while the same `curl` outside the unit must
+reach the mock (so the mock works). `systemd-smoke.sh` also runs `COPY (select 1) TO PROGRAM
+'curl ...'` as `supabase_admin` inside a project's Postgres: the program is a child of the
+postmaster in the unit's cgroup, which is the real attack path (SQL reaching the network).
+`imds_denied_by_unit` reads `systemctl show -p IPAddressDeny` for the same units. To try it by
+hand on a node: `sudo bash -c 'echo $$ > /sys/fs/cgroup$(systemctl show -p ControlGroup --value
+sb-gotrue@<ref>.service)/cgroup.procs && exec curl -m 3 http://169.254.169.254/'` fails with
+"Operation not permitted" while the same `curl` from a plain shell reaches the metadata service.
 
 ## Future hardening: one uid per project
 
@@ -126,16 +172,16 @@ socket, so a process that can enter a cluster's socket directory is a superuser 
 allowlist hides every socket directory from the other units, but not from the daemon, which
 needs them.
 
-**Cloud metadata.** On AWS (deploy/cloudformation/sbctl.yaml) the instance role holds write
-access to the whole backup bucket (every project's WAL and base backups) and Route 53 changes,
-and IMDSv2's hop limit of 1 does not stop a process on the instance itself. The tenant-facing
-units (GoTrue, PostgREST, postgres-meta, Realtime, Supavisor, Studio, imgproxy, edge runtime)
-therefore carry `IPAddressDeny=169.254.169.254`. Two exceptions need the role and keep access:
-`sbctl.service` and the backup units, and `sb-postgres@` (its `archive_command` runs
-`sbctl wal push` inside the postmaster, which signs S3 requests with the role), plus
-`sb-storage` when `storage_backend = "s3"` relies on the role. A Postgres extension or a
-Storage bug could still reach the credentials, so the AWS template should be paired, once
-workstream J runs user code in Edge Functions, with a bucket policy or a separate role for
-Storage and with static credentials for the WAL archiver (`--s3-credentials-file`). Workstream
-J: keep `IPAddressDeny=169.254.169.254` on `sb-edge-runtime.service` and on any unit that runs
-tenant code.
+**Cloud metadata.** See "What is isolated" and "Checking the metadata rule". On AWS
+(deploy/cloudformation/sbctl.yaml) the instance role holds write access to the whole backup
+bucket (every project's WAL and base backups) and TXT changes for `_acme-challenge` names in one
+Route 53 zone, and IMDSv2's hop limit of 1 does not stop a process on the instance itself.
+Every `sb-*` unit therefore denies the metadata addresses. Two things follow:
+
+- WAL archiving does not use the role inside Postgres: the daemon does. The role is only used by
+  `sbctl.service` and by the `sb-basebackup` units.
+- `sb-storage` cannot use the role either. Its S3 backend (`[fleet] storage_backend = "s3"`)
+  needs a static key (`storage_s3_access_key_id` and `storage_s3_secret_access_key`) scoped to the
+  objects bucket under systemd; `fleet.Setup` refuses to render the unit without one and says why.
+  The key sits in `config.toml` (0600, owned by `sbctl`, hidden from every unit) and in the unit's own
+  0600 environment file.

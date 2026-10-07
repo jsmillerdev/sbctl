@@ -66,7 +66,7 @@ The wildcard record for `*.api.<domain>` is required: Realtime and Storage resol
 
 ### Firewall and ports
 
-Only 80, 443, 5432 and 6543 are meant to be reachable. The shared services listen on more interfaces than that (`internal/fleet/README.md`, "Supavisor's API and shard listeners"), so a host firewall or a security group that admits only those four ports is part of the install. With ufw inactive and `--firewall auto`, the installer prints a warning instead of guessing. The CloudFormation template does this with a security group.
+Only 80, 443, 5432 and 6543 are meant to be reachable. The shared services listen on more interfaces than that (`internal/fleet/README.md`, "Supavisor's API and shard listeners"), so a host firewall or a security group that admits only those four ports is part of the install. With ufw installed but inactive (the default of several cloud images) and no `--firewall` flag, the installer stops and asks for `--firewall ufw` (it enables ufw with the SSH ports and the four public ports open) or `--firewall none` (you close the other ports yourself); it does not guess. With ufw not installed it prints a warning. The CloudFormation template does this with a security group.
 
 ## The first administrator and more users
 
@@ -76,7 +76,7 @@ Only 80, 443, 5432 and 6543 are meant to be reachable. The shared services liste
 2. Enter the token, an email, a password (12 to 72 characters) and an optional organization name.
 3. Sign in at `https://studio.<domain>`.
 
-The token is single use and expires after 72 hours (`--claim-ttl`); the database keeps only its SHA-256. A request that fails (the address exists, the password is refused) gives the token back. Failed attempts are limited node-wide. While the node is unclaimed, `sudo -u sbctl sbctl claim token` issues a new token and revokes the old one; after the claim it refuses unless you pass `--force` (an administrator locked out). The endpoint is `GET` and `POST /claim` on `api.<domain>` and on the loopback admin listener (`127.0.0.1:7000`).
+The token is single use and expires after 72 hours (`--claim-ttl`); the database keeps only its SHA-256. A request that fails (the address exists, the password is refused) gives the token back. Failed attempts are limited node-wide. While the node is unclaimed, `sudo -u sbctl sbctl claim token` issues a new token and revokes the old one (`--if-none` issues nothing while an unused, unexpired token exists, which is how a re-run of the installer avoids replacing a token that was already handed over, for example the one in the CloudFormation secret); after the claim it refuses unless you pass `--force` (an administrator locked out). The endpoint is `GET` and `POST /claim` on `api.<domain>` and on the loopback admin listener (`127.0.0.1:7000`).
 
 Later users come by invitation. sbctl sends no email: it prints a token and you hand it over.
 
@@ -116,6 +116,7 @@ The stack creates one Ubuntu 24.04 instance (arm64 by default), an Elastic IP, a
 |---|---|
 | `AdminEmail` | ACME contact (required). |
 | `Architecture`, `InstanceType` | arm64 with `t4g.medium` by default. About 100 MB of RAM per idle project: 4 GiB fits a handful of small projects, 16 GiB about a hundred. |
+| `AmiId` | The Ubuntu 24.04 image of the stack's region and architecture (required). Look it up once, when you create the stack, and keep the value on every later update: `aws ssm get-parameter --region <region> --name /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text` (`amd64` for `x86_64`). It is a plain image ID on purpose: an SSM-typed parameter is resolved again on every update, so a newer Canonical image would replace the instance on the next update of any parameter, even `AccessCidr`. |
 | `DataVolumeSize` | GiB for project data (default 100). |
 | `DomainName`, `HostedZoneId` | Both given: the stack creates the four DNS records and the node issues a wildcard certificate by DNS-01 with the instance role. Only the domain: create the records listed in the `DnsRecordsNeeded` output yourself. Neither: sslip.io on the Elastic IP. |
 | `AccessCidr`, `SshCidr` | Who may reach the four ports (default everyone; port 80 must stay open for HTTP-01 without a hosted zone) and, optionally, SSH. No SSH rule by default: Session Manager is the way in. |
@@ -123,7 +124,22 @@ The stack creates one Ubuntu 24.04 instance (arm64 by default), an Elastic IP, a
 | `SbctlVersion` | `latest` or a release tag. |
 | `VpcId`, `SubnetId` | An existing VPC and public subnet, both or neither. |
 
-The instance role may write only this bucket, put a value into only the claim-token secret, change records in only the given hosted zone (`ChangeResourceRecordSets`, `ListResourceRecordSets`, and `GetChange` on change IDs), and, unless `EnableSessionManager` is `false`, use Session Manager (the minimal policy above, no Run Command). User data prepares the volume, runs `install.sh` from the release with the stack's parameters, stores the claim token in the secret, and signals the stack with `cfn-signal` (with a `curl` fallback when the helper package cannot be installed). The stack waits 30 minutes for that signal and fails with the installer's last error when it comes. The installer log is `/var/log/sbctl-bootstrap.log` on the instance.
+The instance role may write only this bucket, put a value into only the claim-token secret, change only TXT records named `_acme-challenge.<domain>` or `_acme-challenge.*.<domain>` in the given hosted zone (`ChangeResourceRecordSets` with conditions on the record type and the normalized record name; `ListResourceRecordSets`, and `GetChange` on change IDs; the stack's own `DnsRecords` resource makes the A records), and, unless `EnableSessionManager` is `false`, use Session Manager (the minimal policy above, no Run Command). User data prepares the volume, runs `install.sh` from the release with the stack's parameters, stores the claim token in the secret, and signals the stack with `cfn-signal` (with a `curl` fallback when the helper package cannot be installed). The stack waits 30 minutes for that signal and fails with the installer's last error when it comes. The installer log is `/var/log/sbctl-bootstrap.log` on the instance.
+
+The role is what a process on the instance could take from the instance metadata service. The tenant-facing units cannot reach that service (`deploy/systemd/README.md`): every `sb-*` unit denies it with `IPAddressDeny`, WAL archiving goes through the daemon (`internal/backup/README.md`, "The WAL relay"), and Storage's S3 backend needs a static key. Only `sbctl.service` and the base backup units use the role.
+
+**Node state lives on the data volume.** User data bind-mounts `/etc/sbctl` (the master key that unseals every secret in the registry, and `config.toml`) to `/var/lib/sbctl/etc` before the installer runs, with an `fstab` entry and `RequiresMountsFor=` on the daemon and the system Postgres, so nothing the node needs to restart sits on the root volume. When the volume already holds an install, user data recreates the `sbctl` user with the uid that owns the files and the installer runs as a repair that keeps the master key (an unchanged `config.toml` and registry are never touched; the claim token is kept too, see below).
+
+### Replacing the instance
+
+Do not change `AmiId`, `Architecture`, the subnet or the root volume of a running stack casually: CloudFormation replaces the instance, creates the new one first and then tries to attach the data volume to it while the old instance still holds it, so the update fails and rolls back. To move a node to a new image the supported path is an OS upgrade on the instance (`apt-get dist-upgrade`, then a reboot). When an instance really has to be replaced, swap it by hand around the update:
+
+1. On the instance: `sudo systemctl stop sbctl.service`, then `sudo -u sbctl sbctl fleet stop` and `sudo -u sbctl sbctl system stop` (the daemon leaves project units running; stopping them gives a clean data volume), then `sync`.
+2. Take a snapshot of the data volume (the stack's `DataVolume` keeps a final snapshot when the stack or the volume is deleted, but take one now), and **detach the volume** (`aws ec2 detach-volume --volume-id <id>`; wait until it is `available`).
+3. Update the stack with the new `AmiId`. The new instance attaches the volume, user data finds the earlier install (bind-mounts `/etc/sbctl`, recreates the user with the same uid, runs the installer as a repair) and the node comes back with the same master key, registry and projects. The new instance has the same Elastic IP, so DNS stays.
+4. When the update is done, check `sudo -u sbctl sbctl system status` and `sbctl projects list`.
+
+Not run in AWS: this procedure and the repair path in user data are untested; the first real replacement is their first test. Keep the snapshot from step 2 until it has worked once.
 
 When the stack is ready, read the outputs: `DashboardUrl`, `ClaimUrl` and `ClaimTokenSecretArn`. Fetch the token with
 
@@ -133,7 +149,7 @@ aws secretsmanager get-secret-value --secret-id <ClaimTokenSecretArn> --query Se
 
 and use it on `ClaimUrl`. Creating the stack needs the "I acknowledge that CloudFormation might create IAM resources" box.
 
-Checked: `cfn-lint` passes, and the user-data script passes `bash -n` with the template's substitutions applied. **Not deployed:** nothing here has run in an AWS account, so the first launch is the first test of the data-volume discovery, the `awscli` package on Ubuntu 24.04, the Secrets Manager write and the signal.
+Checked: `cfn-lint` passed on the template before the Route 53 conditions, the `AmiId` parameter and the `/etc/sbctl` bind mount were added; those changes were not linted again (cfn-lint was not available where they were made), and the user-data script was last checked with `bash -n` before them too. **Not deployed:** nothing here has run in an AWS account, so the first launch is the first test of the data-volume discovery, the `awscli` package on Ubuntu 24.04, the Secrets Manager write and the signal.
 
 ## Release signing
 
@@ -173,4 +189,5 @@ Go unit tests: `internal/selfupdate` (signature, checksum, atomic replace, refus
 - The claim page is at `api.<domain>/claim`, not `studio.<domain>/claim`: the Studio host belongs to Studio.
 - No email: invites and the claim token are handed over out of band.
 - The AWS stack is unverified in AWS (see above), and the Quick-create link needs a published template. `release.yml` has an optional `publish-template` job that uploads it when the repository variables `SBCTL_TEMPLATE_BUCKET` and `SBCTL_TEMPLATE_ROLE_ARN` are set; it is untested, and nothing sets those variables.
-- The instance role of the AWS stack is reachable from every process on the instance through IMDS. The tenant-facing units deny `169.254.169.254` (`deploy/systemd/README.md`, cloud metadata); Postgres (WAL archiving) and Storage with the S3 backend cannot, and workstream J must keep the rule on the edge runtime.
+- The instance role of the AWS stack is reachable through IMDS from processes outside the `sb-*` units (the daemon and the base backup units use it, as intended). A process that gets code execution as the `sbctl` user inside a unit can still reach the daemon's and other units' memory through `/proc` (`deploy/systemd/README.md`, "What is not isolated"). Workstream J must keep `IPAddressDeny` on the edge runtime.
+- Ubuntu 22.04 is out (polkit 0.105 ignores JavaScript rules). A sudoers drop-in for `systemctl start|stop|restart|enable|disable sb-*` would bring it back at the cost of a `sudo` call in the supervisor; that needs a decision of the lead (HANDOFF section 0), so nothing is done.

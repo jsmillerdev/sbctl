@@ -136,11 +136,14 @@ claim_and_token() {
 }
 papi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H "Authorization: Bearer $PAT" "$@"; }
 
-# api_create_project NAME: creates a project through POST /v1/projects, waits until it is
-# ACTIVE_HEALTHY and prints its ref. Sets DBPASS.
+# gen_dbpass: sets DBPASS (the database password a project is created with). It cannot be set
+# inside api_create_project, which runs in a command substitution.
+gen_dbpass() { DBPASS=Smoke-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n'); }
+
+# api_create_project NAME: creates a project with the password in DBPASS through POST
+# /v1/projects, waits until it is ACTIVE_HEALTHY and prints its ref.
 api_create_project() {
   local name=$1 ref status="" i
-  DBPASS=Smoke-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
   ref=$(papi POST /v1/projects -H 'Content-Type: application/json' \
     -d "{\"name\":\"$name\",\"organization_slug\":\"$ORG\",\"db_pass\":\"$DBPASS\",\"region\":\"us-east-1\"}" | json_get 'd["ref"]') || fail "creating project $name through the API"
   [[ $ref =~ ^[a-z]{20}$ ]] || fail "project ref: $ref"

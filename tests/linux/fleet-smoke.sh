@@ -141,8 +141,9 @@ done
 
 log "create a project through the Management API: the daemon registers it with the shared services"
 claim_and_token
-REF=$(api_create_project fleet-api)
+gen_dbpass
 DBPW=$DBPASS
+REF=$(api_create_project fleet-api)
 project_keys "$REF"
 SVC=$(project_field "$REF" 'd["keys"]["service_role_key"]' --show-keys)
 ANON=$(project_field "$REF" 'd["keys"]["anon_key"]' --show-keys)

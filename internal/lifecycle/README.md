@@ -12,7 +12,7 @@ project's PostgreSQL, GoTrue and PostgREST as units of a `units.Supervisor`.
    PGDATA (0600), then `bin/supabase-postgres-start` with these server arguments:
    `-p <port>`, `listen_addresses=127.0.0.1`, `unix_socket_directories=<project>/postgres/sock`
    (mode 0700), `hba_file`, `wal_level=logical`, `archive_mode=on`,
-   `archive_command` and `archive_timeout`, `PlaneOptions.ArchiveCommandFor` and `ArchiveTimeout`: `internal/app` passes `backup.ArchiveCommand(bin_path, ref, config file)` (shell-quoted, `%` doubled, `--config` when the daemon loaded a non-default file) and `[backup] archive_timeout_seconds` (default 300); without them the plane falls back to a built-in quoting of `bin_path` and 900 s,
+   `archive_command` and `archive_timeout`, `PlaneOptions.ArchiveCommandFor` and `ArchiveTimeout`: `internal/app` passes `backup.ArchiveCommandFor(cfg, ref, config file)` (shell-quoted, `%` doubled; the relay form `--socket <state>/projects/<ref>/wal/r.sock` under systemd, otherwise `--config` when the daemon loaded a non-default file; the relay form also drops `SBCTL_CONFIG` from the unit's environment) and `[backup] archive_timeout_seconds` (default 300); without them the plane falls back to a built-in quoting of `bin_path` and 900 s,
    `max_wal_senders=5`, and `shared_buffers`, `effective_cache_size`,
    `maintenance_work_mem`, `max_wal_size`, `max_connections` from the project class
    (`micro`, `default`/`small`, `medium`, `large`; default is 32MB and 60 connections).
@@ -64,7 +64,8 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
   GoTrue and PostgREST restart, fleet tenants update; previous keys are restored on error.
 - `Health`: unit state plus SQL ping, GoTrue `/health`, PostgREST `/`; moves
   `ACTIVE_HEALTHY` and `ACTIVE_UNHEALTHY` to match.
-- `StartActive`: starts every active project (after a reboot or `sbctl system stop`).
+- `StartActive`: starts every active project (after a reboot or `sbctl system stop`). It lists the projects first and starts them one at a time; each start re-reads the project after taking its lock, so a pause or delete that landed in between is not undone.
+- `PostgresPlane.prepare` also creates `projects/<ref>/wal/` (the relay directory the Postgres unit bind-mounts read-only) and calls `PlaneOptions.ArchiveReady(ref)` so the daemon serves that project's WAL relay socket before the cluster starts.
 - `Recover`: run once by the daemon before `StartActive`. A crash in the middle of an
   operation leaves a project in a status nothing else would move: `PAUSING` becomes
   `INACTIVE` (units stopped), `COMING_UP` or `RESTARTING` with a route (a resume or restart

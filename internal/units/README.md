@@ -10,6 +10,7 @@ interface has two backends.
   `MemoryMax` and `CPUQuota` as persistent drop-ins with `SetUnitProperties` (systemd writes
   them under `/etc/systemd/system.control`). No daemon-reload is needed for a new project;
   `Reload` exists for after the templates change. `Remove` reverts the drop-ins.
+  The templates are an allowlist (`TestTemplatesContainment`): every unit hides `/etc/sbctl`, sees an empty tmpfs where `/var/lib/sbctl` is plus its own paths, and denies the cloud instance metadata addresses (`IPAddressDeny`); a project's Postgres also gets its WAL relay directory read-only and no backup directory (`deploy/systemd/README.md`).
   Running as the `sbctl` user needs the polkit rule `deploy/systemd/50-sbctl.rules`, which grants `manage-units` on `sb-*` units only. Daemon-reload and enabling the system units for boot need root and happen in `sbctl system install-units`; on delete, `Remove` sets MemoryMax and CPUQuota back to infinity and leaves the inert drop-in.
 - **exec** (`exec.go`, development and tests): runs `<svc>.run` as a detached child in its
   own session, logs to `<state_dir>/logs/<unit>.log`, keeps `<state_dir>/run/<unit>.pid`

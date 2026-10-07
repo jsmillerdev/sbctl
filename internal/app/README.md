@@ -18,22 +18,39 @@ is the daemon that `sbctl.service` runs.
   master key, Engine), runs `Engine.Recover` (statuses a crash left behind), creates the pg-meta
   key, builds the Management API (`api.NewServer`, the Postgres store) and the edge proxy
   (`proxy.New`, `KeySource` = the Engine, no-op `Waker`), listens for the API on the loopback
-  admin address and at `api.<domain>` through the proxy, and starts every active project one at a
-  time next to the listeners (the system project's backup timer and the prune timer too, on
-  systemd). `ctx` ending (SIGTERM) first drains the API (`api.Server.Drain`: new lifecycle operations
+  admin address and at `api.<domain>` through the proxy, starts the shared services (below) and
+  every active project one at a time next to the listeners (the system project's backup timer and
+  the prune timer too, on systemd). `ctx` ending (SIGTERM) first drains the API (`api.Server.Drain`: new lifecycle operations
   answer 503, running ones, including creates and a delete's final backup, finish, bounded by
   `StopBudget`, 10 minutes; `sbctl.service` allows 660 s to stop). The edge proxy keeps serving
   project, `api.<domain>` and `studio.<domain>` traffic during the drain and stops only after it
   returns (`superviseStop`); then the admin listener and the registry close; project units belong to systemd and keep running. At boot it
   waits up to 2 minutes for the registry (`lifecycle.ErrRegistryUnreachable`), resumes projects
   whose restart was cut off after the pause (`Engine.ResumeRecovered`), and keeps finishing restored
-  clones tagged `restore.cleanup_pending` (`backup.Service.FinishPendingRestores`). The system project must exist (`sbctl system init`).
+  clones tagged `restore.cleanup_pending` (`backup.Service.FinishPendingRestores`). `StartActive`
+  re-reads each project after taking its lock, so an API pause or delete that lands between the
+  listing and the start is not undone. The system project must exist (`sbctl system init`).
+
+- **The shared services.** On a systemd node `Serve` calls `fleet.Setup` with `Start` set next to the
+  projects (`startFleet`): it generates the services' sealed secrets on first use, renders the
+  units, starts postgres-meta, Supavisor, Realtime, Storage and Studio in order and waits for each,
+  so a reboot brings the whole node back from `sbctl.service` alone (the units are not enabled for
+  boot). The Engine registers, re-keys and removes tenants (Supavisor, Realtime, Storage) on project
+  create, rotate-keys and delete through the same `fleet.Setup`, built lazily
+  (`cmd/sbctl/serve_fleet.go`: a `fleet.Lazy`, bound to the registry and master key right after
+  `lifecycle.Open`, `Options.BindFleet`), so the daemon and the CLI register tenants the same way.
+  A service whose artifact was never fetched fails at boot and is logged; the rest of the node
+  comes up. The installer fetches the artifacts with `sbctl fleet start` first.
+- **The WAL relay.** With `[backup] wal_relay` on (the default under systemd) `Serve` starts
+  `app.StartWALRelay` before it opens the registry and stops it after the lifecycle drain; it serves
+  one unix socket per project through which the clusters archive and restore WAL without holding
+  any backend credential (`internal/backup/README.md`, "The WAL relay"). The lifecycle engine
+  tells it about a project before the cluster starts (`Options.ArchiveReady`). The same function
+  serves the sockets nobody answers for a command-line process that waits for WAL
+  (`sbctl backups ...`, `projects delete`) while the daemon is down.
 
 ## Not done
 
-- The fleet (`Options.Fleet`) is an empty `fleet.Fleet` until `cmd/sbctl/serve_fleet.go` calls
-  the fleet workstream's `fleet.Setup`; nothing here starts Supavisor, Realtime, Storage,
-  postgres-meta or Studio.
 - `Serve` does not supervise: a crashed project unit is systemd's to restart (`Restart=on-failure`)
   and shows as unhealthy through `Health`.
 

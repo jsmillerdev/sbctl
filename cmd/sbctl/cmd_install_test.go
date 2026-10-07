@@ -460,13 +460,17 @@ func TestFirewallAutoStopsWhenUFWIsInactive(t *testing.T) {
 	fakeUFW(t, "Status: inactive")
 	var out, errb bytes.Buffer
 	in := &installer{ctx: context.Background(), out: &out, err: &errb, cfg: config.Default()}
-	err := in.firewall("auto")
+	err := in.firewall("auto", false)
 	if err == nil || !strings.Contains(err.Error(), "--firewall ufw") || !strings.Contains(err.Error(), "--firewall none") {
 		t.Fatalf("auto with ufw inactive = %v; want an error naming both choices", err)
 	}
 	// The explicit choice that leaves the host alone still works.
-	if err := in.firewall("none"); err != nil {
+	if err := in.firewall("none", false); err != nil {
 		t.Fatalf("--firewall none: %v", err)
+	}
+	// A re-run of an installed node warns: the choice was made at the first install.
+	if err := in.firewall("auto", true); err != nil || !strings.Contains(out.String(), "WARNING") {
+		t.Fatalf("re-run with ufw inactive: %v, output %q", err, out.String())
 	}
 }
 
@@ -475,7 +479,7 @@ func TestFirewallAutoWithActiveUFWOpensThePublicPorts(t *testing.T) {
 	fakeUFW(t, "Status: active")
 	var out, errb bytes.Buffer
 	in := &installer{ctx: context.Background(), out: &out, err: &errb, cfg: config.Default()}
-	if err := in.firewall("auto"); err != nil {
+	if err := in.firewall("auto", false); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "opening TCP") {

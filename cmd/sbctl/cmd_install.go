@@ -233,7 +233,7 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	if err := in.run(cfg.BinPath, "--config", config.DefaultPath, "system", "install-units"); err != nil {
 		return err
 	}
-	if err := in.firewall(o.Firewall); err != nil {
+	if err := in.firewall(o.Firewall, existed); err != nil {
 		return err
 	}
 
@@ -521,7 +521,7 @@ func publicPorts(cfg *config.Config) []int {
 // firewall opens the public ports in ufw. The shared services listen on more interfaces
 // than they should (fleet README); a host firewall or security group that admits only
 // these ports is part of the install.
-func (in *installer) firewall(mode string) error {
+func (in *installer) firewall(mode string, rerun bool) error {
 	ports := publicPorts(in.cfg)
 	list := make([]string, len(ports))
 	for i, p := range ports {
@@ -550,6 +550,12 @@ func (in *installer) firewall(mode string) error {
 	}
 	st, _ := exec.CommandContext(in.ctx, "ufw", "status").Output()
 	active := strings.Contains(string(st), "Status: active")
+	if !active && mode == "auto" && rerun {
+		// A re-run of a node that is already installed: the operator made this choice at the
+		// first install (nothing stores it), so remind instead of refusing every re-run.
+		in.warn("ufw is installed but inactive, so no host firewall is configured: the shared services listen on more ports than the public ones. Allow TCP %s only in your security group or firewall, or re-run with --firewall ufw", strings.Join(list, ", "))
+		return nil
+	}
 	if !active && mode == "auto" {
 		// Cloud images often ship ufw installed and off. Carrying on would leave Supavisor's
 		// API and its shard listeners (ephemeral ports) open on every interface, so the

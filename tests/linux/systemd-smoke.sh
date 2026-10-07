@@ -144,6 +144,9 @@ pg_admin() { # REF SQL: run SQL as supabase_admin over the cluster's private soc
   port=$(project_field "$ref" 'd["ports"]["Postgres"]')
   sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$ref/postgres/sock port=$port user=supabase_admin dbname=postgres" -Atc "$2" </dev/null
 }
+# switch_wal REF: writes a WAL record and switches to a new segment, so the switch is never a
+# no-op on an idle cluster; prints the name of the segment that was just completed.
+switch_wal() { pg_admin "$1" "select pg_walfile_name(pg_switch_wal() - 1) from (select pg_logical_emit_message(true, 'smoke', 'x')) s"; }
 wait_archived() { # REF SEGMENT SECONDS: the segment is in the file backend
   local ref=$1 seg=$2 n=${3:-40} i
   for ((i = 0; i < n; i++)); do
@@ -159,7 +162,7 @@ for ref in system "$A" "$B"; do
 done
 archive_cmd=$(pg_admin "$A" "show archive_command")
 [[ $archive_cmd == *"--socket $SBCTL_STATE/projects/$A/wal/r.sock"* && $archive_cmd != *--config* ]] || fail "$A: archive_command is not the relay form: $archive_cmd"
-SEG=$(pg_admin "$A" "select pg_walfile_name(pg_switch_wal() - 1)") || fail "$A: could not switch WAL over the cluster socket"
+SEG=$(switch_wal "$A") || fail "$A: could not switch WAL over the cluster socket"
 wait_archived "$A" "$SEG" 90 || { journalctl --no-pager -u "sb-postgres@$A" -u sbctl.service | tail -30 >&2; fail "$A: WAL segment $SEG was not archived through the relay"; }
 [[ $(pg_admin "$A" "select last_archived_wal is not null from pg_stat_archiver") == t ]] || fail "$A: pg_stat_archiver shows no archived WAL"
 # From inside the cluster's own namespace: its socket works, another project's is not there, and
@@ -175,7 +178,7 @@ if inns test -e "$SBCTL_STATE/projects/$B/wal/r.sock"; then fail "$PGU sees the 
 
 log "WAL archiving fails closed when the daemon is down, and resumes when it is back"
 systemctl stop sbctl.service
-SEG2=$(pg_admin "$A" "select pg_walfile_name(pg_switch_wal() - 1)") || fail "$A: could not switch WAL"
+SEG2=$(switch_wal "$A") || fail "$A: could not switch WAL"
 FAILS0=$(pg_admin "$A" "select failed_count from pg_stat_archiver")
 for ((i = 0; i < 30; i++)); do
   [[ $(pg_admin "$A" "select failed_count from pg_stat_archiver") -gt $FAILS0 ]] && break
@@ -213,12 +216,13 @@ trap 'rc=$?; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
 
 log "a project created through the Management API: REST through the proxy"
 claim_and_token
+gen_dbpass
 C=$(api_create_project smoke-api)
 project_keys "$C"
 rest_through_proxy "$C" "$PUB"
 [[ $(http_code -H "Host: $C.api.$SBCTL_DOMAIN" -H "apikey: sb_publishable_wrong" http://127.0.0.1/rest/v1/smoke_items) == 401 ]] || fail "$C: a wrong key was not a 401"
 [[ -S "$SBCTL_STATE/projects/$C/wal/r.sock" ]] || fail "$C: no WAL relay socket for a project created through the API"
-SEGC=$(pg_admin "$C" "select pg_walfile_name(pg_switch_wal() - 1)")
+SEGC=$(switch_wal "$C")
 wait_archived "$C" "$SEGC" 90 || fail "$C: WAL of a project created through the API was not archived"
 papi DELETE "/v1/projects/$C" -o /dev/null -m 900 || fail "$C: delete through the API"
 
