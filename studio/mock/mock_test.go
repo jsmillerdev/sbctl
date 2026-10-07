@@ -488,3 +488,30 @@ func TestClientCancelIsNotAServerError(t *testing.T) {
 	}
 	t.Fatal("no 499 in the request log")
 }
+
+func TestRedactSQLHidesPasswordLiterals(t *testing.T) {
+	for in, want := range map[string]string{
+		`alter role app with password 'hunter2'`:     `alter role app with password '***'`,
+		`ALTER ROLE app PASSWORD = 'it''s secret'`:   `ALTER ROLE app PASSWORD = '***'`,
+		`create role r login password E'x\'y'`:       `create role r login password '***'`,
+		`select 1 as password_hint, 'password' as x`: `select 1 as password_hint, 'password' as x`,
+	} {
+		if got := redactSQL(in); got != want {
+			t.Errorf("redactSQL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestRequestLogFileIsPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	if _, err := newRequestLog(path); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("request log mode = %v, want 0600", st.Mode().Perm())
+	}
+}

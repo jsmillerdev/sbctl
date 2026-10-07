@@ -105,7 +105,7 @@ func (s *server) pgMetaQuery(w *respWriter, r *http.Request, c *reqCtx) {
 		Query string `json:"query"`
 	}
 	_ = json.Unmarshal(c.body, &in)
-	c.sql = in.Query
+	c.sql = redactSQL(in.Query)
 	if len(c.sql) > 300 {
 		c.sql = c.sql[:300]
 	}

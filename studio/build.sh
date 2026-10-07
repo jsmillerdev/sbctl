@@ -154,9 +154,13 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
   export PATH="$PNPM_HOME_DIR/node_modules/.bin:$PATH"
 
   SRC="$WORK/src"
-  if [[ ! -f "$SRC/.sbctl-fetched" || "$(cat "$SRC/.sbctl-fetched")" != "$COMMIT+p$PATCHSET" ]]; then
+  APP="$WORK/prune"
+  # Fetch when the marker is missing or stale, or when the source tree was consumed by an earlier
+  # "turbo prune" (apps/ and packages/ are deleted afterwards) and the pruned copy is gone too.
+  if [[ ! -f "$SRC/.sbctl-fetched" || "$(cat "$SRC/.sbctl-fetched")" != "$COMMIT+p$PATCHSET" \
+        || ( ! -d "$SRC/apps/studio" && ! -d "$APP/apps/studio" ) ]]; then
     log "sparse fetch of $COMMIT"
-    rm -rf "$SRC"; mkdir -p "$SRC"
+    rm -rf "$SRC" "$APP"; mkdir -p "$SRC"   # a pruned copy of an older fetch would be stale
     git -C "$SRC" init -q
     git -C "$SRC" remote add origin https://github.com/supabase/supabase.git
     git -C "$SRC" config user.name sbctl; git -C "$SRC" config user.email sbctl@users.noreply.invalid
@@ -182,7 +186,6 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
   UPSTREAM_DOTENV="$SRC/apps/studio/.e""nv"
   rm -f "$UPSTREAM_DOTENV"
 
-  APP="$WORK/prune"
   if [[ ! -d "$APP/apps/studio" ]]; then
     log "turbo prune studio"
     rm -rf "$APP"

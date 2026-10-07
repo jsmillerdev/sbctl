@@ -279,10 +279,20 @@ cp "$HERE/spike/spike.mjs" "$HERE/spike/package.json" "$PWDIR/"
 (cd "$PWDIR" && npm install --silent --no-audit --no-fund "playwright-core@$PW_VERSION")
 export PLAYWRIGHT_BROWSERS_PATH="$SPIKE_DIR/browsers"
 if [[ -z "${SPIKE_CHROME:-}" ]]; then
-  deps=()
-  if [[ "$(uname -s)" == Linux ]] && { [[ "$(id -u)" -eq 0 ]] || sudo -n true 2>/dev/null; }; then deps=(--with-deps); fi
-  (cd "$PWDIR" && if [[ ${#deps[@]} -gt 0 && "$(id -u)" -ne 0 ]]; then sudo -n env "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" "$(command -v node)" node_modules/playwright-core/cli.js install "${deps[@]}" chromium
-       else node node_modules/playwright-core/cli.js install "${deps[@]}" chromium; fi)
+  PW_CLI=node_modules/playwright-core/cli.js
+  # System packages need root; the browser binaries must stay owned by the invoking user (under umask 077 a
+  # root-run "install" would leave them 0700 root, and the unprivileged browser step could not launch them).
+  # So the two steps are split: install-deps as root, install as the user.
+  if [[ "$(uname -s)" == Linux ]]; then
+    if [[ "$(id -u)" -eq 0 ]]; then
+      (cd "$PWDIR" && node "$PW_CLI" install-deps chromium)
+    elif sudo -n true 2>/dev/null; then
+      (cd "$PWDIR" && sudo -n "$(command -v node)" "$PW_CLI" install-deps chromium)
+    else
+      log "no root: skipping 'playwright install-deps'; chromium may miss system libraries"
+    fi
+  fi
+  (cd "$PWDIR" && node "$PW_CLI" install chromium)
 fi
 snapshot_resources before-browser
 set +e

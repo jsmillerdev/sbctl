@@ -139,7 +139,7 @@ func summarize(path string, out io.Writer) error {
 	return sc.Err()
 }
 
-// passwordLiteral matches `PASSWORD '...'` (also `PASSWORD = '...'`, and escape strings such as E-prefixed literals) so that role
+// passwordLiteral matches `PASSWORD '...'` (also `PASSWORD = '...'`, and E” strings) so that role
 // passwords sent from the Database Roles page or the SQL editor do not end up in the request log.
 var passwordLiteral = regexp.MustCompile(`(?i)(\bpassword\s*(?:=\s*)?)(?:e'(?:[^'\\]|\\.|'')*'|'(?:[^']|'')*')`)
 

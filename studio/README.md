@@ -51,6 +51,8 @@ Next inlines `NEXT_PUBLIC_*` and evaluates the CSP at build time, so `build.sh` 
 
 **Requirement for unit D:** the artifact directory (`app/`) must be writable by the service user at start, for example `ReadWritePaths=` on the artifact directory under `ProtectSystem=strict`. Next also writes `app/apps/studio/.next/cache` at runtime (image cache).
 
+**Also for unit D, exit codes:** the launcher exits 78 (`EX_CONFIG`) on a missing or unsafe configuration value and mirrors the child's exit status, so a SIGTERM stop ends as 143. The unit needs `RestartPreventExitStatus=78` (a bad value would otherwise restart-loop) and `SuccessExitStatus=143` (a normal stop is not a failure).
+
 `/_next/static` chunks keep their file names when a value changes, and Next serves them as immutable. After changing `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_GOTRUE_URL` on a running install, users need a hard reload once.
 
 ### Packaging fixups
@@ -72,6 +74,8 @@ sudo studio/ci-prepare.sh          # GitHub-hosted runner only
 studio/build.sh linux-amd64        # or linux-arm64, on a machine of that architecture
 ```
 
+`build.sh` downloads its own checksum-pinned Node and pnpm, so it needs nothing preinstalled beyond `git`, `curl`, `tar` and `zstd`. `spike.sh` does not: it needs `go` (to build the mock; or set `SPIKE_MOCK_BIN` to a prebuilt binary), `node` with `npm` (for `playwright-core`), and, for the browser, `sudo` without a password or root for `playwright install-deps` (the browser binaries themselves are installed as the invoking user). There is no CI workflow in this directory; whoever owns `.github/` needs to wire `actions/setup-go` and `actions/setup-node` before the `spike.sh` step, plus the cache and artifact upload of `studio/.build-cache/spike/out`.
+
 `build.sh` runs `next build` with one static-generation worker (`STUDIO_BUILD_WORKERS`, set through `CIRCLE_NODE_TOTAL`, which Next uses to size its worker pool) and a 4 GB V8 heap per node process (`STUDIO_BUILD_HEAP_MB`), on any host size. Expect about 9 GB of disk and a peak near 8 GB of RAM for `next build` (Turbopack; measured on the maintainer's Mac, not on a runner); `build.sh` prints the peak from `/usr/bin/time -v` and warns if RAM plus swap is under 11 GB. The artifact is about 75 MB compressed (the repackaged Mac output measured 73 MB). `STUDIO_UNTIL=prune` runs only the fetch, patch, prune and lockfile check (a few minutes, 300 MB).
 
 ## Test it
@@ -86,6 +90,6 @@ studio/spike.sh                                      # whole spike; see the head
 ## Not done, not verified
 
 - The Next build has not run on Linux or on a CI runner. Verified up to the lockfile check (fetch, patches, prune) on the real upstream commit. The packaging, launcher, substitution and `verify.sh` ran on darwin-arm64 against a platform-mode Next output of the same commit built earlier on this machine; the Linux node binary, `tar --sort`, `cp --reflink`, `/usr/bin/time` and `ci-prepare.sh` paths were not executed.
-- `spike.sh` ran to a green result on darwin-arm64 only (19 of 19 steps), with `SPIKE_CHROME` pointing at Chrome. The Linux parts (artifact download and checksum, `playwright install --with-deps`, apt) are untested.
+- `spike.sh` ran to a green result on darwin-arm64 only (19 of 19 steps), with `SPIKE_CHROME` pointing at Chrome. The Linux parts (artifact download and checksum, `playwright install-deps` and `install`, apt) are untested.
 - Studio makes a request to `api.usercentrics.eu` on every page load even without a ruleset id (it fails soft). Removing it needs a fourth patch; proposed upstream change: skip Usercentrics initialization when `NEXT_PUBLIC_USERCENTRICS_RULESET_ID` is unset.
 - Pages beyond the spike's list (Realtime, Edge Functions, Logs, Advisors, Integrations, Reports) are not exercised.
