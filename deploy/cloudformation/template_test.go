@@ -146,7 +146,7 @@ func strList(t *testing.T, v any) []string {
 
 func TestParametersAreMinimal(t *testing.T) {
 	params := get(t, load(t), "Parameters").(doc)
-	want := []string{"AccessCidr", "AdminEmail", "AmiId", "DataSnapshotId", "DataVolumeSize", "DomainName", "EnableSessionManager",
+	want := []string{"AccessCidr", "AdminEmail", "AmiId", "DailySnapshotsKept", "DataSnapshotId", "DataVolumeSize", "DomainName", "EnableSessionManager",
 		"HostedZoneId", "InstanceType", "KeyName", "SbctlVersion", "SshCidr", "SubnetId", "VpcId"}
 	if got := keys(params); !reflect.DeepEqual(got, want) {
 		t.Fatalf("parameters changed (update the README table and this list together):\n got %v\nwant %v", got, want)
@@ -465,6 +465,231 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 	for _, want := range []string{"ChangeResourceRecordSetsRecordTypes", "TXT", "ChangeResourceRecordSetsNormalizedRecordNames", "_acme-challenge.${DomainName}", "_acme-challenge.*.${DomainName}"} {
 		if !strings.Contains(dns, want) {
 			t.Errorf("DnsPolicy lost %q", want)
+		}
+	}
+}
+
+// TestDailySnapshotsOfTheDataVolume pins the promises of the Data Lifecycle Manager policy: it
+// selects the stack's own volume and nothing else, keeps DailySnapshotsKept snapshots, copies the
+// volume's Name tag so that a snapshot can be passed back as DataSnapshotId, is switched off by 0,
+// and runs under a role that only the dlm service can assume.
+func TestDailySnapshotsOfTheDataVolume(t *testing.T) {
+	d := load(t)
+	r := resources(t, d)
+
+	// The knob: 7 by default, 0 turns the policy and its role off.
+	count := get(t, d, "Parameters", "DailySnapshotsKept")
+	if get(t, count, "Type") != "Number" || get(t, count, "Default") != 7 || get(t, count, "MinValue") != 0 {
+		t.Errorf("DailySnapshotsKept must be a Number from 0 with default 7: %v", count)
+	}
+	if max := get(t, count, "MaxValue"); max != 1000 {
+		t.Errorf("DailySnapshotsKept maximum is %v: a Data Lifecycle Manager schedule keeps at most 1000", max)
+	}
+	if got, want := fmt.Sprint(get(t, d, "Conditions", "DailySnapshotsOn")), "map[Fn::Not:[map[Fn::Equals:[map[Ref:DailySnapshotsKept] 0]]]]"; got != want {
+		t.Errorf("DailySnapshotsOn = %s, want %s", got, want)
+	}
+	iface := get(t, d, "Metadata", "AWS::CloudFormation::Interface", "ParameterGroups").([]any)
+	var inStorage bool
+	for _, g := range iface {
+		if p := strs(t, get(t, g, "Parameters")); len(p) > 1 && p[0] == "InstanceType" {
+			for _, n := range p {
+				inStorage = inStorage || n == "DailySnapshotsKept"
+			}
+		}
+	}
+	if !inStorage {
+		t.Error("DailySnapshotsKept belongs in the size and storage group, next to DataVolumeSize")
+	}
+
+	// The policy, and only one.
+	var dlm []string
+	for name, res := range r {
+		if get(t, res, "Type") == "AWS::DLM::LifecyclePolicy" {
+			dlm = append(dlm, name)
+		}
+	}
+	if !reflect.DeepEqual(dlm, []string{"DataSnapshotPolicy"}) {
+		t.Fatalf("lifecycle policies: %v, want [DataSnapshotPolicy]", dlm)
+	}
+	pol := r["DataSnapshotPolicy"]
+	if get(t, pol, "Condition") != "DailySnapshotsOn" {
+		t.Error("the policy must be conditional on DailySnapshotsOn (0 disables it)")
+	}
+	props := get(t, pol, "Properties")
+	if get(t, props, "State") != "ENABLED" {
+		t.Error("the policy must be ENABLED")
+	}
+	if desc := fmt.Sprint(get(t, props, "Description")); !regexp.MustCompile(`^map\[Fn::Sub:[0-9A-Za-z _$\{\}:-]+\]$`).MatchString(desc) {
+		// The service accepts only letters, digits, spaces, underscores and hyphens.
+		t.Errorf("the policy description may hold only letters, digits, spaces, _ and - after substitution: %s", desc)
+	}
+	if arn := fmt.Sprint(get(t, props, "ExecutionRoleArn")); arn != "map[Fn::GetAtt:[DataSnapshotRole Arn]]" {
+		t.Errorf("ExecutionRoleArn = %s, want the stack's own DataSnapshotRole", arn)
+	}
+	details := get(t, props, "PolicyDetails")
+	if got := strs(t, get(t, details, "ResourceTypes")); !reflect.DeepEqual(got, []string{"VOLUME"}) {
+		t.Errorf("ResourceTypes = %v, want [VOLUME]", got)
+	}
+	if get(t, details, "PolicyType") != "EBS_SNAPSHOT_MANAGEMENT" {
+		t.Errorf("PolicyType = %v", get(t, details, "PolicyType"))
+	}
+
+	// The target tag is on the data volume, and its value is unique to this stack.
+	targets := get(t, details, "TargetTags").([]any)
+	if len(targets) != 1 {
+		t.Fatalf("want exactly one target tag, got %v", targets)
+	}
+	key, val := get(t, targets[0], "Key"), fmt.Sprint(get(t, targets[0], "Value"))
+	if val != "map[Ref:AWS::StackId]" {
+		t.Errorf("the target tag value is %s: it must be the stack ID, which no other stack shares", val)
+	}
+	found := false
+	for _, tag := range get(t, r["DataVolume"], "Properties", "Tags").([]any) {
+		if get(t, tag, "Key") == key && fmt.Sprint(get(t, tag, "Value")) == val {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the data volume does not carry the policy's target tag %v=%s", key, val)
+	}
+	for name, res := range r {
+		if name == "DataVolume" || get(t, res, "Type") != "AWS::EC2::Volume" {
+			continue
+		}
+		t.Errorf("%s is another volume: the target tag must stay on the data volume alone", name)
+	}
+
+	// Daily, DailySnapshotsKept deep, with the volume's tags (its Name tag) on every snapshot.
+	sched := get(t, details, "Schedules").([]any)
+	if len(sched) != 1 {
+		t.Fatalf("want one schedule, got %d", len(sched))
+	}
+	if get(t, sched[0], "CreateRule", "Interval") != 24 || get(t, sched[0], "CreateRule", "IntervalUnit") != "HOURS" {
+		t.Errorf("the schedule must run every 24 hours: %v", get(t, sched[0], "CreateRule"))
+	}
+	if got := fmt.Sprint(get(t, sched[0], "RetainRule", "Count")); got != "map[Ref:DailySnapshotsKept]" {
+		t.Errorf("retention = %s, want the DailySnapshotsKept parameter", got)
+	}
+	if get(t, sched[0], "CopyTags") != true {
+		t.Error("CopyTags must be true: the snapshots carry the volume's Name tag")
+	}
+	named := false
+	for _, tag := range get(t, r["DataVolume"], "Properties", "Tags").([]any) {
+		named = named || get(t, tag, "Key") == "Name"
+	}
+	if !named {
+		t.Error("the data volume needs its Name tag: the snapshots copy it")
+	}
+
+	// The role: assumed by the dlm service for this account's policies only, with the AWS managed
+	// policy of that service and nothing inline.
+	role := r["DataSnapshotRole"]
+	if get(t, role, "Type") != "AWS::IAM::Role" || get(t, role, "Condition") != "DailySnapshotsOn" {
+		t.Errorf("DataSnapshotRole must be a role that exists only while snapshots are on")
+	}
+	rp := get(t, role, "Properties")
+	if has(rp, "Policies") || has(rp, "RoleName") {
+		t.Error("DataSnapshotRole carries no inline policy and no fixed name")
+	}
+	managed := get(t, rp, "ManagedPolicyArns").([]any)
+	if len(managed) != 1 || fmt.Sprint(managed[0]) != "map[Fn::Sub:arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole]" {
+		t.Errorf("the role must carry exactly the AWS managed policy AWSDataLifecycleManagerServiceRole: %v", managed)
+	}
+	sts := statements(t, get(t, rp, "AssumeRolePolicyDocument"))
+	if len(sts) != 1 {
+		t.Fatalf("the trust policy has %d statements, want 1", len(sts))
+	}
+	if get(t, sts[0], "Principal", "Service") != "dlm.amazonaws.com" || get(t, sts[0], "Action") != "sts:AssumeRole" {
+		t.Errorf("only dlm.amazonaws.com may assume the role: %v", sts[0])
+	}
+	cond := fmt.Sprint(get(t, sts[0], "Condition"))
+	for _, want := range []string{"aws:SourceAccount", "AWS::AccountId", "aws:SourceArn", ":dlm:", "AWS::Region", "policy/*"} {
+		if !strings.Contains(cond, want) {
+			t.Errorf("the trust policy lost %q (confused deputy protection): %s", want, cond)
+		}
+	}
+	// The node itself gets nothing from this: no EC2 rights, and the instance profile holds only
+	// the instance role.
+	if got := fmt.Sprint(get(t, r["InstanceProfile"], "Properties", "Roles")); got != "[map[Ref:InstanceRole]]" {
+		t.Errorf("InstanceProfile roles = %s", got)
+	}
+
+	// The output that lists the snapshots follows the same condition.
+	out := get(t, d, "Outputs", "DataSnapshotsCommand")
+	if get(t, out, "Condition") != "DailySnapshotsOn" || !strings.Contains(fmt.Sprint(get(t, out, "Value")), "ec2 describe-snapshots") {
+		t.Errorf("DataSnapshotsCommand: %v", out)
+	}
+}
+
+// userData returns the first-boot script with every ${...} of the template replaced by a word.
+func userData(t *testing.T) string {
+	t.Helper()
+	sub := get(t, resources(t, load(t))["Instance"], "Properties", "UserData", "Fn::Base64", "Fn::Sub").([]any)
+	script := strings.ReplaceAll(sub[0].(string), "${!", "${")
+	return regexp.MustCompile(`\$\{[^}]+\}`).ReplaceAllString(script, "X")
+}
+
+func TestUserDataIsValidBash(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	cmd := exec.Command(bash, "-n")
+	cmd.Stdin = strings.NewReader(userData(t))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the user data does not parse as bash: %v\n%s", err, out)
+	}
+}
+
+// The snap fallback installs the AWS CLI to /snap/bin, which cloud-init's PATH does not hold. The
+// claim-token write is the first use of the CLI after the install.
+func TestUserDataCanRunAwsFromSnap(t *testing.T) {
+	ud := userData(t)
+	pathLine := regexp.MustCompile(`(?m)^\s*export PATH="\$PATH:/snap/bin"$`).FindStringIndex(ud)
+	if pathLine == nil {
+		t.Fatal(`user data must add /snap/bin to PATH (export PATH="$PATH:/snap/bin")`)
+	}
+	for _, later := range []string{"snap install aws-cli", "aws secretsmanager put-secret-value"} {
+		if i := strings.Index(ud, later); i < 0 || i < pathLine[0] {
+			t.Errorf("the PATH export must come before %q (at %d, export at %d)", later, i, pathLine[0])
+		}
+	}
+}
+
+// A repair of a restored volume issues no claim token. The secret must then say so instead of
+// keeping the placeholder that promises one.
+func TestUserDataReplacesTheTokenPlaceholderWhenNoneIsIssued(t *testing.T) {
+	ud := userData(t)
+	if n := strings.Count(ud, "aws secretsmanager put-secret-value"); n != 2 {
+		t.Fatalf("want two writes of the claim secret (the token, or the note that none was issued), got %d", n)
+	}
+	tail := ud[strings.Index(ud, "step \"storing the claim token\""):]
+	if !strings.Contains(tail, "No claim token was issued") || !strings.Contains(tail, "sudo -u sbctl sbctl claim token") || !strings.Contains(tail, "--force") {
+		t.Errorf("the note must say no token was issued and how to get one:\n%s", tail)
+	}
+}
+
+// The README states what was checked and what was not. These phrases guard the two places where
+// a claim was once stated as fact that nobody had run in AWS.
+func TestReadmeStatesWhatIsNotChecked(t *testing.T) {
+	raw, err := os.ReadFile("../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(raw)
+	for _, line := range strings.Split(readme, "\n") {
+		if strings.Contains(line, "AmiId") && strings.Contains(line, "on an update") && strings.Contains(line, "CloudFormation") {
+			if !strings.Contains(line, "may") || !strings.Contains(line, "not been checked") {
+				t.Errorf("the README states the empty AmiId update behavior as fact: %s", line)
+			}
+		}
+	}
+	for _, want := range []string{
+		"crash-consistent", "AWSDataLifecycleManagerServiceRole", "DailySnapshotsKept",
+		"https://aws.amazon.com/ebs/pricing/", "sbctl claim token --force", "Stop the instance",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("the README lacks %q", want)
 		}
 	}
 }

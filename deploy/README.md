@@ -139,11 +139,11 @@ With your own domain in Route 53:
   --domain example.com --hosted-zone-id Z0123456789ABCDEFGHIJ
 ```
 
-The script runs `aws cloudformation deploy`, waits, then prints the dashboard URL and the command that fetches the claim token. It needs the AWS CLI v2 and credentials that may create CloudFormation, EC2, IAM, S3, Route 53 and Secrets Manager resources. Other options: `--instance-type`, `--stack-name`, `--volume-size`, `--version`, `--access-cidr`, `--ssh-cidr` with `--key-name`, `--no-session-manager`, `--ami-id`, `--data-snapshot-id`, `--profile`; `--help` lists them.
+The script runs `aws cloudformation deploy`, waits, then prints the dashboard URL and the command that fetches the claim token. It needs the AWS CLI v2 and credentials that may create CloudFormation, EC2, IAM, S3, Route 53 and Secrets Manager resources. Other options: `--instance-type`, `--stack-name`, `--volume-size`, `--daily-snapshots`, `--version`, `--access-cidr`, `--ssh-cidr` with `--key-name`, `--no-session-manager`, `--ami-id`, `--data-snapshot-id`, `--profile`; `--help` lists them.
 
-- `--dry-run` prints the exact `aws` commands and runs none.
+- `--dry-run` prints the exact `aws` commands, including the lookups it would make first (does the stack exist, which image does it run), and runs none.
 - Running it again with the same `--stack-name` updates the stack. The script passes the image the instance already runs, so an update does not replace the instance when Canonical publishes a newer Ubuntu image.
-- `--delete` deletes the stack after a warning and a confirmation (see [Tear down](#tear-down)).
+- `--delete` stops the instance, then deletes the stack, after a warning and a confirmation (see [Tear down](#tear-down)).
 
 From a checkout, the script is `deploy/aws/deploy.sh` and finds the template by itself.
 
@@ -238,6 +238,7 @@ The stack's **Outputs** list:
 | `BackupBucket` | The S3 bucket with WAL archives and base backups. Kept when the stack is deleted. |
 | `InstanceId`, `ConnectCommand` | The instance and the Session Manager command that opens a shell on it. |
 | `DataVolumeId` | The EBS volume that holds the node's state. A final snapshot is kept when the stack is deleted. |
+| `DataSnapshotsCommand` | One `aws` command that lists the daily snapshots of that volume (absent when `DailySnapshotsKept` is 0). |
 | `PublicIp`, `DnsRecordsNeeded` | The Elastic IP and the DNS records you create yourself (see below). |
 
 1. Run the `ClaimTokenCommand` value. It prints a token, `aws secretsmanager get-secret-value --region <region> --secret-id <ClaimTokenSecretArn> --query SecretString --output text`.
@@ -270,7 +271,7 @@ The `t` types are burstable: they run well while load is light and slow down whe
 You pay AWS directly. Prices change by region and over time, so check the pages:
 
 - The instance, billed per hour or second ([EC2 on-demand pricing](https://aws.amazon.com/ec2/pricing/on-demand/)). This is the largest part.
-- Storage: the 30 GiB root volume and the data volume, plus the final snapshot after a delete ([EBS pricing](https://aws.amazon.com/ebs/pricing/)).
+- Storage: the 30 GiB root volume and the data volume, plus the snapshots: the daily ones while the stack runs and the final one after a delete ([EBS pricing](https://aws.amazon.com/ebs/pricing/), snapshots section). A snapshot stores only the blocks that changed since the one before it, so the cost of keeping 7 grows with how much the volume changes; `DailySnapshotsKept` set to 0 takes none.
 - The backup bucket: stored data, requests and versions kept for 30 days ([S3 pricing](https://aws.amazon.com/s3/pricing/)).
 - Data transfer out of AWS, which API, database and Studio traffic produces ([EC2 on-demand pricing, data transfer](https://aws.amazon.com/ec2/pricing/on-demand/)).
 - The public IPv4 address of the Elastic IP ([VPC pricing](https://aws.amazon.com/vpc/pricing/)).
@@ -278,13 +279,14 @@ You pay AWS directly. Prices change by region and over time, so check the pages:
 
 ### What the stack creates
 
-One Ubuntu 24.04 instance (Graviton by default), an Elastic IP, a data volume formatted XFS and mounted at `/var/lib/sbctl` (XFS with reflinks is what copy-on-write branching needs later), an S3 bucket for backups (versioned, encrypted, public access blocked, TLS only), a security group for ports 80, 443, 5432 and 6543, an instance role, and a Secrets Manager secret for the claim token. Without a VPC of your own it also creates a small VPC with one public subnet. Everything sits in one file: no nested stacks, no Lambda code, no custom resources, so the console can upload it as it is.
+One Ubuntu 24.04 instance (Graviton by default), an Elastic IP, a data volume formatted XFS and mounted at `/var/lib/sbctl` (XFS with reflinks is what copy-on-write branching needs later), an S3 bucket for backups (versioned, encrypted, public access blocked, TLS only), a security group for ports 80, 443, 5432 and 6543, an instance role, a Secrets Manager secret for the claim token, and a Data Lifecycle Manager policy (with its own role) that snapshots the data volume every day. Without a VPC of your own it also creates a small VPC with one public subnet. Everything sits in one file: no nested stacks, no Lambda code, no custom resources, so the console can upload it as it is.
 
 | Parameter | Meaning |
 |---|---|
 | `AdminEmail` | The only required field. Contact address for the Let's Encrypt account. |
 | `InstanceType` | Default `t4g.large`. See [Sizing](#sizing). |
 | `DataVolumeSize` | GiB for project data (default 100). |
+| `DailySnapshotsKept` | Daily snapshots of the data volume to keep (default 7; `0` takes none and creates no policy). See [Backups and restore](#backups-and-restore). |
 | `SbctlVersion` | `latest`, or a release tag. The template of a release names that release. |
 | `DomainName`, `HostedZoneId` | See [Domain and DNS](#domain-and-dns). |
 | `AccessCidr` | Who may reach ports 80, 443, 5432 and 6543 (default everyone; port 80 must stay open for HTTP-01 without a hosted zone). |
@@ -316,19 +318,29 @@ sudo -u sbctl sbctl backups restore <ref> --to latest --force                   
 
 `internal/backup/README.md` explains the options. Two limits matter on AWS:
 
-- **The bucket alone cannot rebuild a node.** The passwords in a backup are sealed with the node's master key, which lives on the data volume. Back up the volume as well: turn on EBS snapshots for it with AWS Backup or Data Lifecycle Manager, because this template does not schedule any.
-- **Deleting the stack keeps the bucket and takes a final snapshot of the volume** (see below), so a deleted stack does not lose either.
+- **The bucket alone cannot rebuild a node.** The passwords in a backup are sealed with the node's master key, which lives on the data volume. The daily snapshots below cover the volume.
+- **Deleting the stack keeps the bucket and takes a final snapshot of the volume** (see [Tear down](#tear-down)), so a deleted stack does not lose either.
+
+#### Daily snapshots of the data volume
+
+The S3 backups hold Postgres only. Storage objects (the file backend on the data volume), Edge Function bundles, `config.toml` and the master key live on the data volume and in no bucket. The stack therefore creates an Amazon Data Lifecycle Manager policy that snapshots the data volume once a day at 03:00 UTC and keeps the newest `DailySnapshotsKept` of them (7 by default; `0` creates neither the policy nor its role). The policy selects the volume by a tag whose value is the stack's ID, so it cannot reach another stack's volume. Every snapshot carries the volume's `Name` tag (`<stack name>-data`) and the tag `sbctl:snapshot=daily`.
+
+The policy runs under a role that only the Data Lifecycle Manager service can assume, for policies of this account and region. The role carries the AWS managed policy `AWSDataLifecycleManagerServiceRole`, which AWS documents as the permission set of the service's default role. It is wider than this one volume (it can create and delete snapshots in the account), and the template uses it deliberately: a hand-written subset that misses an action would stop the snapshots without a visible error. The instance cannot assume this role and holds no EC2 permission.
+
+The snapshots are crash-consistent: they capture the volume at one moment, without what the instance still holds in memory, so they look like the disk after a power cut. Postgres replays its write-ahead log when it starts from one, which is the recovery a power cut needs, so the databases should come up. A file that a service was writing at that moment (a Storage upload, a function bundle being deployed) can be incomplete. That is why the S3 point-in-time backups stay the primary database backup, and the snapshots protect the rest of the volume and give a whole-node fallback. Prices: [EBS pricing](https://aws.amazon.com/ebs/pricing/) (see [What it costs](#what-it-costs)).
+
+To restore from one, list the snapshots with the `DataSnapshotsCommand` output (or `aws ec2 describe-snapshots --owner-ids self --filters Name=tag:Name,Values=<stack name>-data`), pick one by its `StartTime`, and create a new stack with `DataSnapshotId` set to it (`--data-snapshot-id snap-...`), as in [Bring the node back](#tear-down). A volume made from a snapshot cannot replace the volume of a running stack, so use a new stack name while the old stack exists, or delete the old stack first. The whole node, projects included, returns to the state of that snapshot; to bring back one project to a point in time, use `sbctl backups restore` above, which is finer.
 
 ### Update
 
-On the instance, `sudo sbctl self-update` (see [Update](#update)). That moves the binary; the stack keeps its parameters and the template it was created from. To change a parameter (for example `AccessCidr` or `DataVolumeSize`), update the stack: with `deploy.sh`, run it again with the new value (it keeps the instance's image); in the console, choose **Update, Use existing template**, and in **AmiId** enter the image ID the instance runs (EC2 console, instance details) if you left it empty at creation. An empty `AmiId` on an update makes CloudFormation look up the newest Ubuntu image again, and a changed image replaces the instance.
+On the instance, `sudo sbctl self-update` (see [Update](#update)). That moves the binary; the stack keeps its parameters and the template it was created from. To change a parameter (for example `AccessCidr` or `DataVolumeSize`), update the stack: with `deploy.sh`, run it again with the new value (it keeps the instance's image); in the console, choose **Update, Use existing template**, and in **AmiId** enter the image ID the instance runs (EC2 console, instance details) if you left it empty at creation. An empty `AmiId` on an update may make CloudFormation look up the newest Ubuntu image again, and a changed image replaces the instance; this has not been checked in AWS, so give the ID.
 
 ### Replacing the instance
 
 Do not change `AmiId`, `InstanceType` to another architecture, the subnet or the root volume of a running stack casually: CloudFormation replaces the instance, creates the new one first and then tries to attach the data volume to it while the old instance still holds it, so the update fails and rolls back. To move a node to a new Ubuntu image the supported path is an OS upgrade on the instance (`apt-get dist-upgrade`, then a reboot). Changing `InstanceType` within the same architecture restarts the instance in place, so it needs no special handling. When an instance really has to be replaced, swap it by hand around the update:
 
 1. On the instance: `sudo systemctl stop sbctl.service`, then `sudo -u sbctl sbctl fleet stop` and `sudo -u sbctl sbctl system stop` (the daemon leaves project units running; stopping them gives a clean data volume), then `sync`.
-2. Take a snapshot of the data volume (the stack's `DataVolume` keeps a final snapshot when the stack or the volume is deleted, but take one now), and **detach the volume** (`aws ec2 detach-volume --volume-id <id>`; wait until it is `available`).
+2. Take a snapshot of the data volume (the stack's `DataVolume` keeps a final snapshot when the stack or the volume is deleted, and the daily snapshots may be up to a day old, so take one now), and **detach the volume** (`aws ec2 detach-volume --volume-id <id>`; wait until it is `available`).
 3. Update the stack with the new `AmiId`. The new instance attaches the volume, user data finds the earlier install and the node comes back with the same master key, registry and projects. The new instance has the same Elastic IP, so DNS stays.
 4. When the update is done, check `sudo -u sbctl sbctl system status` and `sbctl projects list`.
 
@@ -342,9 +354,10 @@ Deleting the stack never deletes your data silently:
 |---|---|
 | Backup bucket (`BackupBucket`) | **Kept.** WAL archives and base backups stay, and so does the bucket policy. You pay for them until you delete the bucket. |
 | Data volume (`DataVolumeId`) | **Snapshotted, then deleted.** The snapshot (encrypted) holds the master key, the registry and every project. You pay for it until you delete it. |
+| Daily snapshots of the data volume | **Kept, and no longer pruned.** The stack deletes the lifecycle policy, and deleting a policy does not delete the snapshots it made. Delete the ones you do not need (`aws ec2 delete-snapshot`). |
 | Instance, Elastic IP, security group, role, claim-token secret, DNS records, a VPC the stack made | Deleted. |
 
-Delete with `./sbctl-aws-deploy.sh --region <region> --stack-name sbctl --delete` (it prints the bucket and volume, then asks you to type the stack name), or in the console: CloudFormation, select the stack, **Delete**. Afterwards, find the snapshot:
+Stop the instance before you delete the stack. The final snapshot is taken from the volume when the stack deletes it, and a snapshot of a running node is only crash-consistent (see [Backups and restore](#backups-and-restore)). `./sbctl-aws-deploy.sh --region <region> --stack-name sbctl --delete` does it: it prints the bucket, volume and instance, asks you to type the stack name, stops the instance, waits until it is stopped, and only then deletes the stack (it keeps the stack if the instance does not stop). In the console, stop the instance first (EC2, select the instance from the `InstanceId` output, **Instance state**, **Stop instance**; wait for **Stopped**), then in CloudFormation select the stack and choose **Delete**. Afterwards, find the snapshots, the final one and the daily ones:
 
 ```bash
 aws ec2 describe-snapshots --region <region> --owner-ids self \
@@ -353,11 +366,13 @@ aws ec2 describe-snapshots --region <region> --owner-ids self \
 
 **Bring the node back.** Create a new stack with `DataSnapshotId` set to that snapshot (`--data-snapshot-id snap-...`) and `DataVolumeSize` at least the snapshot's size. User data finds the earlier install on the volume and the installer runs as a repair that keeps the master key, the registry and the projects. The new stack makes a new bucket and a new Elastic IP, so update DNS if you manage it yourself; the new node writes new backups to the new bucket, and the old bucket still holds the older archives.
 
+The existing administrator keeps working: the accounts are in the registry on the volume, so sign in at the new `DashboardUrl` as before. The repair issues no claim token, so the new stack's claim-token secret does not hold one: user data replaces its placeholder with a note, and `ClaimTokenCommand` prints that note. When you need a token (nobody can sign in, or the node was never claimed), open a shell (`ConnectCommand`) and run `sudo -u sbctl sbctl claim token --force` (without `--force` while nobody has claimed); it prints a token, which you enter at `ClaimUrl` as in [First login](#first-login).
+
 **Delete everything.** After the stack is gone, delete the snapshot (`aws ec2 delete-snapshot`) and empty and delete the bucket (it is versioned: remove all versions, for example with the S3 console's **Empty** button) when you no longer need them.
 
 ### Checked and not checked
 
-Checked offline, on every push (`.github/workflows/ci.yml`): `cfn-lint`; `checkov` (the six findings it reports are skipped in the template, each with a reason); `shellcheck` on `deploy.sh`; Go tests (`deploy/cloudformation`, `deploy/aws`) that parse the template and assert the parameters, the console form, the outputs, the retain policies, the IAM actions and their scoping, and run `deploy.sh` against a stub `aws` (argument errors, `--dry-run`, the create, update and delete paths); and `release-assets.sh`. **Not deployed:** nothing here has run in an AWS account. The first launch is the first test of the data-volume discovery, the restore from `DataSnapshotId`, the `awscli` package on Ubuntu 24.04, the Secrets Manager write, the signal, the Session Manager permissions (an SSM agent that needs more than the `ssm` and `ssmmessages` actions shows up as an instance that never appears in Session Manager), the dynamic lookup of the Ubuntu image, the Launch Stack link and the release job that uploads the template.
+Checked offline, on every push (`.github/workflows/ci.yml`): `cfn-lint`; `checkov` (the six findings it reports are skipped in the template, each with a reason); `shellcheck` on `deploy.sh`; Go tests (`deploy/cloudformation`, `deploy/aws`) that parse the template and assert the parameters, the console form, the outputs, the retain policies, the IAM actions and their scoping, and run `deploy.sh` against a stub `aws` (argument errors, `--dry-run`, the create, update and delete paths, including stopping the instance before the delete); and `release-assets.sh`. **Not deployed:** nothing here has run in an AWS account. The first launch is the first test of the data-volume discovery, the restore from `DataSnapshotId`, the daily snapshot policy and its role (the first scheduled run is the first proof that the role carries the permissions the service needs), the `/snap/bin` fallback for the AWS CLI on Ubuntu 24.04 (and the `awscli` package), the Secrets Manager write, the signal, the Session Manager permissions (an SSM agent that needs more than the `ssm` and `ssmmessages` actions shows up as an instance that never appears in Session Manager), the dynamic lookup of the Ubuntu image, the Launch Stack link and the release job that uploads the template.
 
 ## Release signing
 

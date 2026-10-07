@@ -40,7 +40,8 @@ type result struct {
 }
 
 // stubAWS writes an `aws` that logs every call and answers like the real CLI would for the few
-// calls deploy.sh makes. STACK_EXISTS=1 makes describe-stacks find a stack.
+// calls deploy.sh makes. STACK_EXISTS=1 makes describe-stacks find a stack; STOP_FAILS=1 makes
+// stop-instances fail.
 func stubAWS(t *testing.T) (dir, log string) {
 	t.Helper()
 	dir = t.TempDir()
@@ -59,9 +60,11 @@ case "$*" in
     printf 'ClaimTokenCommand\taws secretsmanager get-secret-value --region us-east-1 --secret-id arn:aws:secretsmanager:us-east-1:111122223333:secret:x --query SecretString --output text\n'
     printf 'DnsRecordsNeeded\tNot needed (sslip.io resolves the Elastic IP)\n'
     printf 'ConnectCommand\taws ssm start-session --region us-east-1 --target i-0abc\n'
-    printf 'InstanceId\ti-0abc\nBackupBucket\tsbctl-backupbucket-xyz\nDataVolumeId\tvol-0123456789abcdef0\n' ;;
+    printf 'InstanceId\ti-0123456789abcdef0\nBackupBucket\tsbctl-backupbucket-xyz\nDataVolumeId\tvol-0123456789abcdef0\n' ;;
   *"ssm get-parameter"*) echo ami-0123456789abcdef0 ;;
   *"ec2 describe-instances"*) echo ami-0bbbbbbbbbbbbbbbb ;;
+  *"ec2 stop-instances"*)
+    if [ -n "$STOP_FAILS" ]; then echo "An error occurred (IncorrectInstanceState) when calling the StopInstances operation" >&2; exit 254; fi ;;
   *) ;;
 esac
 `
@@ -124,6 +127,8 @@ func TestArgumentErrors(t *testing.T) {
 		{"bad cidr", []string{"--region", "us-east-1", "--email", "a@b.co", "--access-cidr", "10.0.0.0"}, "--access-cidr must be"},
 		{"ssh without key", []string{"--region", "us-east-1", "--email", "a@b.co", "--ssh-cidr", "10.0.0.1/32"}, "--ssh-cidr needs --key-name"},
 		{"bad volume", []string{"--region", "us-east-1", "--email", "a@b.co", "--volume-size", "5"}, "--volume-size must be"},
+		{"bad snapshot count", []string{"--region", "us-east-1", "--email", "a@b.co", "--daily-snapshots", "many"}, "--daily-snapshots must be"},
+		{"too many snapshots", []string{"--region", "us-east-1", "--email", "a@b.co", "--daily-snapshots", "1001"}, "--daily-snapshots must be"},
 		{"bad ami", []string{"--region", "us-east-1", "--email", "a@b.co", "--ami-id", "ubuntu"}, "--ami-id must look like"},
 		{"bad snapshot", []string{"--region", "us-east-1", "--email", "a@b.co", "--data-snapshot-id", "x"}, "--data-snapshot-id must look like"},
 		{"missing value", []string{"--region"}, "--region needs a value"},
@@ -183,12 +188,17 @@ func TestDryRunMinimal(t *testing.T) {
 			// The default instance type is Graviton, so the lookup asks for arm64.
 			"aws --region us-east-1 ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text",
 			"aws --region us-east-1 cloudformation describe-stacks --stack-name sbctl --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text",
+			// The lookups the real run makes are printed too: does the stack exist, which image
+			// does it hold and, when AmiId is empty, which image its instance runs.
+			"aws --region us-east-1 cloudformation describe-stacks --stack-name sbctl --query 'Stacks[0].StackStatus' --output text",
+			"aws --region us-east-1 cloudformation describe-stacks --stack-name sbctl --query 'Stacks[0].Parameters[].[ParameterKey,ParameterValue]' --output text",
+			"aws --region us-east-1 ec2 describe-instances --instance-ids '<InstanceId>' --query 'Reservations[0].Instances[0].ImageId' --output text",
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("%s: output lacks %q:\n%s", b, want, out)
 			}
 		}
-		for _, bad := range []string{"InstanceType=", "DomainName=", "HostedZoneId=", "SshCidr=", "AccessCidr="} {
+		for _, bad := range []string{"InstanceType=", "DomainName=", "HostedZoneId=", "SshCidr=", "AccessCidr=", "DailySnapshotsKept="} {
 			if strings.Contains(out, bad) {
 				t.Errorf("%s: an option that was not given shows up (%s):\n%s", b, bad, out)
 			}
@@ -202,10 +212,10 @@ func TestDryRunAllOptions(t *testing.T) {
 			"--region=eu-west-1", "--email", "you@example.com", "--domain", "example.com", "--hosted-zone-id", "Z0123456789ABCDEFGHIJ",
 			"--instance-type", "m7i.large", "--stack-name", "my-sbctl", "--volume-size", "200", "--version", "v1.2.3",
 			"--access-cidr", "203.0.113.0/24", "--ssh-cidr", "203.0.113.4/32", "--key-name", "mykey", "--no-session-manager",
-			"--data-snapshot-id", "snap-0123456789abcdef0", "--profile", "work")
+			"--data-snapshot-id", "snap-0123456789abcdef0", "--daily-snapshots", "014", "--profile", "work")
 		for _, want := range []string{
 			"aws --region eu-west-1 --profile work cloudformation deploy --stack-name my-sbctl",
-			"AdminEmail=you@example.com", "InstanceType=m7i.large", "DataVolumeSize=200", "SbctlVersion=v1.2.3",
+			"AdminEmail=you@example.com", "InstanceType=m7i.large", "DataVolumeSize=200", "DailySnapshotsKept=14", "SbctlVersion=v1.2.3",
 			"DomainName=example.com", "HostedZoneId=Z0123456789ABCDEFGHIJ", "AccessCidr=203.0.113.0/24",
 			"SshCidr=203.0.113.4/32", "KeyName=mykey", "EnableSessionManager=false", "DataSnapshotId=snap-0123456789abcdef0",
 			// An x86 type looks up the amd64 image.
@@ -247,7 +257,8 @@ func TestParameterNamesExistInTemplate(t *testing.T) {
 	out := dryRun(t, bashes(t)[0], nil,
 		"--region", "us-east-1", "--email", "a@b.co", "--domain", "example.com", "--hosted-zone-id", "Z0123456789ABCDEFGHIJ",
 		"--instance-type", "t4g.xlarge", "--volume-size", "50", "--version", "v1.0.0", "--access-cidr", "10.0.0.0/8",
-		"--ssh-cidr", "10.0.0.1/32", "--key-name", "k", "--no-session-manager", "--data-snapshot-id", "snap-0123456789abcdef0")
+		"--ssh-cidr", "10.0.0.1/32", "--key-name", "k", "--no-session-manager", "--data-snapshot-id", "snap-0123456789abcdef0",
+		"--daily-snapshots", "0")
 	idx := strings.Index(out, "--parameter-overrides ")
 	if idx < 0 {
 		t.Fatalf("no parameter overrides:\n%s", out)
@@ -265,8 +276,8 @@ func TestParameterNamesExistInTemplate(t *testing.T) {
 			t.Errorf("deploy.sh passes %s, which the template does not declare", name)
 		}
 	}
-	if n != 12 {
-		t.Errorf("expected 12 parameters, got %d: %s", n, line)
+	if n != 13 {
+		t.Errorf("expected 13 parameters, got %d: %s", n, line)
 	}
 }
 
@@ -317,10 +328,19 @@ func TestDryRunDelete(t *testing.T) {
 			"aws --region us-east-1 cloudformation delete-stack --stack-name sbctl",
 			"aws --region us-east-1 cloudformation wait stack-delete-complete --stack-name sbctl",
 			"ec2 describe-snapshots --owner-ids self",
+			// The delete path stops the instance first, and the dry run shows its lookups.
+			"aws --region us-east-1 cloudformation describe-stacks --stack-name sbctl --query 'Stacks[0].StackStatus' --output text",
+			"aws --region us-east-1 ec2 stop-instances --instance-ids '<InstanceId>'",
+			"aws --region us-east-1 ec2 wait instance-stopped --instance-ids '<InstanceId>'",
+			"daily snapshots of the data volume",
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("%s: lacks %q:\n%s", b, want, out)
 			}
+		}
+		stop, wait, del := strings.Index(out, "ec2 stop-instances"), strings.Index(out, "ec2 wait instance-stopped"), strings.Index(out, "cloudformation delete-stack")
+		if !(0 < stop && stop < wait && wait < del) {
+			t.Errorf("%s: the instance must be stopped, and waited for, before the stack is deleted:\n%s", b, out)
 		}
 	}
 }
@@ -388,7 +408,7 @@ func TestRealRunExistingStackKeepsItsImage(t *testing.T) {
 	if r.code != 0 {
 		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
 	}
-	if joined = strings.Join(calls(t, log), "\n"); !strings.Contains(joined, "ec2 describe-instances --instance-ids i-0abc") || !strings.Contains(joined, "AmiId=ami-0bbbbbbbbbbbbbbbb") {
+	if joined = strings.Join(calls(t, log), "\n"); !strings.Contains(joined, "ec2 describe-instances --instance-ids i-0123456789abcdef0") || !strings.Contains(joined, "AmiId=ami-0bbbbbbbbbbbbbbbb") {
 		t.Errorf("an empty AmiId must be filled from the running instance:\n%s", joined)
 	}
 }
@@ -419,9 +439,34 @@ func TestRealRunDelete(t *testing.T) {
 	if got := re.FindAllStringSubmatch(strings.Join(calls(t, log), "\n"), -1); len(got) != 2 {
 		t.Errorf("want delete-stack and wait, got %v", calls(t, log))
 	}
-	for _, want := range []string{"Backup bucket:  sbctl-backupbucket-xyz", "Data volume:    vol-0123456789abcdef0", "volume-id,Values=vol-0123456789abcdef0"} {
+	// The instance is stopped, and waited for, before the stack goes: the final snapshot then
+	// comes from a node that shut down in order.
+	idx := func(sub string) int {
+		for i, l := range calls(t, log) {
+			if strings.Contains(l, sub) {
+				return i
+			}
+		}
+		return -1
+	}
+	stop, wait, del := idx("ec2 stop-instances --instance-ids i-0123456789abcdef0"), idx("ec2 wait instance-stopped --instance-ids i-0123456789abcdef0"), idx("cloudformation delete-stack")
+	if !(0 <= stop && stop < wait && wait < del) {
+		t.Errorf("want stop-instances, wait instance-stopped, delete-stack in that order, got %v", calls(t, log))
+	}
+	for _, want := range []string{"Backup bucket:  sbctl-backupbucket-xyz", "Data volume:    vol-0123456789abcdef0", "Instance:       i-0123456789abcdef0 (stopped first)", "volume-id,Values=vol-0123456789abcdef0"} {
 		if !strings.Contains(r.stdout, want) {
 			t.Errorf("stdout lacks %q:\n%s", want, r.stdout)
 		}
+	}
+
+	// An instance that cannot be stopped keeps the stack: a crash image is not what the person
+	// was told to expect.
+	dir, log = stubAWS(t)
+	r = run(t, bashes(t)[0], dir, []string{"STACK_EXISTS=1", "STOP_FAILS=1"}, "--region", "us-east-1", "--delete", "--yes")
+	if r.code == 0 || !strings.Contains(r.stderr, "could not stop i-0123456789abcdef0") {
+		t.Errorf("want a refusal when the instance does not stop: exit %d\n%s%s", r.code, r.stdout, r.stderr)
+	}
+	if re.MatchString(strings.Join(calls(t, log), "\n")) {
+		t.Error("deleted the stack although the instance did not stop")
 	}
 }

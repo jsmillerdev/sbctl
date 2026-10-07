@@ -3,16 +3,17 @@ Description: >-
   sbctl: multi-project Supabase on one Ubuntu 24.04 instance. Only an admin email is required.
   Creates the instance, an Elastic IP, an encrypted XFS data volume, a backup bucket, a security
   group, a least-privilege instance role and a Secrets Manager secret that holds the one-time
-  claim token. A domain with a Route 53 hosted zone is optional. Deleting the stack keeps the
-  backup bucket and a final snapshot of the data volume.
+  claim token. A daily snapshot of the data volume (7 kept by default) protects the node's files
+  between database backups. A domain with a Route 53 hosted zone is optional. Deleting the stack
+  keeps the backup bucket and a final snapshot of the data volume.
 
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: "Required" }
         Parameters: [AdminEmail]
-      - Label: { default: "Size and version (the defaults hold about 20 projects)" }
-        Parameters: [InstanceType, DataVolumeSize, SbctlVersion]
+      - Label: { default: "Size, storage and version (the defaults hold about 20 projects)" }
+        Parameters: [InstanceType, DataVolumeSize, DailySnapshotsKept, SbctlVersion]
       - Label: { default: "Domain (optional; leave empty to use sslip.io on the Elastic IP)" }
         Parameters: [DomainName, HostedZoneId]
       - Label: { default: "Access (optional)" }
@@ -23,6 +24,7 @@ Metadata:
       AdminEmail: { default: Admin email }
       InstanceType: { default: Instance type }
       DataVolumeSize: { default: Data volume size (GiB) }
+      DailySnapshotsKept: { default: Daily data volume snapshots to keep (0 = none) }
       SbctlVersion: { default: sbctl release }
       DomainName: { default: Domain name }
       HostedZoneId: { default: Route 53 hosted zone ID }
@@ -77,6 +79,16 @@ Parameters:
       local artifact cache; about 75 MB per new project plus what the project stores). It can grow
       later (update this value, then run xfs_growfs on the instance) but never shrink. When
       restoring from a snapshot it must be at least the snapshot's size.
+  DailySnapshotsKept:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 1000
+    Description: >-
+      How many daily snapshots of the data volume to keep (Amazon Data Lifecycle Manager takes
+      one a day at 03:00 UTC and deletes the oldest). They cover what the database backups in S3
+      do not: Storage files, Edge Function bundles, the configuration and the master key. They
+      are crash-consistent. EBS bills snapshot storage (README, "What it costs"). 0 takes none.
   SbctlVersion:
     Type: String
     Default: latest
@@ -136,9 +148,9 @@ Parameters:
     AllowedPattern: "^$|^subnet-[0-9a-f]{8,17}$"
     Description: A public subnet (one that routes to an internet gateway) of that VPC.
   # Empty means: the newest Canonical Ubuntu 24.04 image of the instance's architecture, looked up
-  # once by CloudFormation through the public SSM parameter. CloudFormation looks it up again on
-  # every update, so a stack created with an empty value would try to replace the instance as soon
-  # as Canonical publishes a newer image, and a replacement cannot attach the data volume while
+  # by CloudFormation through the public SSM parameter. CloudFormation may look it up again on an
+  # update (this has not been checked in AWS); if it does and Canonical has published a newer
+  # image, the instance would be replaced, and a replacement cannot attach the data volume while
   # the old instance holds it. deploy/aws/deploy.sh therefore always passes the image ID it used;
   # in the console, give the same ID on later updates (README, "Replacing the instance").
   AmiId:
@@ -203,6 +215,7 @@ Conditions:
   HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
   HasAmiId: !Not [!Equals [!Ref AmiId, ""]]
   HasDataSnapshot: !Not [!Equals [!Ref DataSnapshotId, ""]]
+  DailySnapshotsOn: !Not [!Equals [!Ref DailySnapshotsKept, 0]]
   SessionManagerOn: !Equals [!Ref EnableSessionManager, "true"]
   CreateNetwork: !Equals [!Ref VpcId, ""]
   IsLatest: !Equals [!Ref SbctlVersion, latest]
@@ -334,7 +347,9 @@ Resources:
 
   # Holds the master key, the registry and every project. Deleting the stack, or replacing this
   # volume, takes a final snapshot first (EBS bills it until you delete it). The snapshot carries
-  # the volume's Name tag and can be passed back as DataSnapshotId.
+  # the volume's Name tag and can be passed back as DataSnapshotId. The sbctl:stack tag is what
+  # DataSnapshotPolicy selects on; the stack ID is unique to this stack, so the policy cannot
+  # reach another stack's volume.
   DataVolume:
     Type: AWS::EC2::Volume
     DeletionPolicy: Snapshot
@@ -345,13 +360,61 @@ Resources:
       SnapshotId: !If [HasDataSnapshot, !Ref DataSnapshotId, !Ref "AWS::NoValue"]
       VolumeType: gp3
       Encrypted: true
-      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-data" }]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-data" }
+        - { Key: "sbctl:stack", Value: !Ref "AWS::StackId" }
   DataVolumeAttachment:
     Type: AWS::EC2::VolumeAttachment
     Properties:
       InstanceId: !Ref Instance
       VolumeId: !Ref DataVolume
       Device: /dev/sdf
+
+  # Daily snapshots of the data volume, kept DailySnapshotsKept deep (0 creates neither the policy
+  # nor its role). The database has its own point-in-time backups in the S3 bucket; these cover
+  # the rest of the volume (Storage objects, Edge Function bundles, config, the master key).
+  # They are crash-consistent: Postgres replays its WAL when it starts from one, which is the
+  # same recovery a power cut needs. CopyTags puts the volume's Name tag on every snapshot, so a
+  # snapshot can be passed back as DataSnapshotId. Deleting the stack deletes the policy but not
+  # the snapshots it made: they stay, unpruned, until you delete them (README, "Tear down").
+  DataSnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Condition: DailySnapshotsOn
+    Properties:
+      Description: !Sub "sbctl daily snapshots of ${AWS::StackName}"
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt DataSnapshotRole.Arn
+      PolicyDetails:
+        PolicyType: EBS_SNAPSHOT_MANAGEMENT
+        ResourceTypes: [VOLUME]
+        TargetTags: [{ Key: "sbctl:stack", Value: !Ref "AWS::StackId" }]
+        Schedules:
+          - Name: daily
+            CreateRule: { Interval: 24, IntervalUnit: HOURS, Times: ["03:00"] }
+            RetainRule: { Count: !Ref DailySnapshotsKept }
+            CopyTags: true
+            TagsToAdd: [{ Key: "sbctl:snapshot", Value: daily }]
+  # The role Data Lifecycle Manager assumes. It carries the AWS managed policy that AWS documents
+  # for this service (the one behind its default role), not a hand-written subset: a subset that
+  # misses an action would stop the snapshots without any visible error until the first run, and
+  # this stack cannot be tried in AWS here. Only the dlm service can assume it, and only for a
+  # policy of this account and region (the confused deputy conditions AWS recommends). The
+  # instance cannot assume it and holds no EC2 rights (the tests pin both).
+  DataSnapshotRole:
+    Type: AWS::IAM::Role
+    Condition: DailySnapshotsOn
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: dlm.amazonaws.com }
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:dlm:${AWS::Region}:${AWS::AccountId}:policy/*" }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
 
   # The claim token is generated on the instance; the instance role may only write this secret.
   # No fixed name: Secrets Manager keeps a deleted secret's name reserved for its recovery window,
@@ -525,6 +588,8 @@ Resources:
             exec > >(tee -a /var/log/sbctl-bootstrap.log) 2>&1
             set -uo pipefail
             export DEBIAN_FRONTEND=noninteractive
+            # The snap fallback below installs the AWS CLI to /snap/bin, which cloud-init's PATH lacks.
+            export PATH="$PATH:/snap/bin"
             HANDLE_URL='${InstallHandle}'
             REGION='${AWS::Region}'
 
@@ -656,6 +721,13 @@ Resources:
               aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
                 --secret-string file:///root/claim-token.secret >/dev/null || fail "cannot write the claim token secret"
               shred -u /root/claim-token /root/claim-token.secret 2>/dev/null || rm -f /root/claim-token /root/claim-token.secret
+            else
+              # No token comes from a repair of a data volume that already holds this node's
+              # administrator (or an unused token, which cannot be shown again). Replace the
+              # placeholder so that the secret does not promise a token that never arrives.
+              aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
+                --secret-string 'No claim token was issued: this node restored an earlier data volume and its administrator still works. To get a token, run on the instance: sudo -u sbctl sbctl claim token (add --force when an administrator exists).' \
+                >/dev/null || echo "could not update the claim token secret"
             fi
             rm -f /root/sbctl-install.sh
 
@@ -718,6 +790,10 @@ Outputs:
   DataVolumeId:
     Description: EBS data volume (master key, registry, projects). A final snapshot is kept when the stack is deleted; find it with this volume ID.
     Value: !Ref DataVolume
+  DataSnapshotsCommand:
+    Condition: DailySnapshotsOn
+    Description: Lists the daily snapshots of the data volume. Pass one as DataSnapshotId to restore (README, "Backups and restore").
+    Value: !Sub "aws ec2 describe-snapshots --region ${AWS::Region} --owner-ids self --filters Name=volume-id,Values=${DataVolume} --query 'Snapshots[].[SnapshotId,StartTime,State]' --output text"
   PublicIp:
     Description: The Elastic IP. Point DNS here when the stack does not own the zone.
     Value: !Ref ElasticIp
