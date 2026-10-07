@@ -6,7 +6,7 @@
 # release.yml runs it before it builds anything. It asks the GitHub API (through `gh`, with
 # GH_TOKEN and GITHUB_REPOSITORY set) for the runs of the workflows below on COMMIT_SHA and
 # succeeds only when the newest run of each ended in success. A run that is still going is waited
-# for. A workflow with no run on the commit fails the gate: push the commit to main (or dispatch the
+# for. Runs from pull requests do not count (see newest_run). A workflow with no run on the commit fails the gate: push the commit to main (or dispatch the
 # workflow on the branch) and tag again.
 #
 # REQUIRED is a space-separated list of WORKFLOW-FILE or WORKFLOW-FILE:JOB-PREFIX. A bare file
@@ -34,9 +34,11 @@ begin=$(date +%s)
 fail() { echo "::error::release gate: $*" >&2; exit 1; }
 
 # newest_run WORKFLOW prints the newest run of the workflow on the commit as one JSON line, or nothing.
+# Only runs that tested the commit itself count. A pull_request run reports the PR head as its
+# head_sha but tests the merge of the PR into its base, so a green one proves nothing about the tag.
 newest_run() {
   gh api "repos/$repo/actions/workflows/$1/runs?head_sha=$sha&per_page=100" |
-    jq -c --arg sha "$sha" '[.workflow_runs[] | select(.head_sha == $sha)] | sort_by(.created_at) | last // empty'
+    jq -c --arg sha "$sha" '[.workflow_runs[] | select(.head_sha == $sha and (.event | IN("push", "workflow_dispatch", "schedule")))] | sort_by(.created_at) | last // empty'
 }
 
 # settled_run WORKFLOW waits for the newest run to finish and prints it.

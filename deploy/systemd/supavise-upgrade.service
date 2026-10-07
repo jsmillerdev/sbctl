@@ -13,6 +13,11 @@ Type=oneshot
 # and only in auto mode and only while the maintenance window is open does it run
 # `supavise upgrade --unattended`. It never starts an upgrade outside the window.
 EnvironmentFile=-/etc/supavise/supavise.env
+# The service's own memory (the pause after a failed upgrade, the window that already ran) lives
+# in /var/lib/supavise-upgrade, owned by root. It must not sit in /var/lib/supavise, where every
+# supavise unit can write and could clear the pause. A custom state_dir puts it at <state_dir>-upgrade.
+StateDirectory=supavise-upgrade
+StateDirectoryMode=0755
 ExecStart=/usr/local/bin/supavise update run
 # A drain waits up to 10 minutes for running lifecycle operations, and every project gets a fresh
 # backup first; a long upgrade must not be cut off by systemd half way.

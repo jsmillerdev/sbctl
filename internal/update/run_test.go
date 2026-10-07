@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -49,6 +50,9 @@ type rig struct {
 	latestEr error
 	reboots  int
 	rebootOK bool
+	// blocker is what RebootBlocker answers; upgradeTakes is how far Upgrade moves the clock.
+	blocker      string
+	upgradeTakes time.Duration
 }
 
 // sunday is 2026-10-04, a Sunday; the default test window is Sun 03:00-05:00 UTC.
@@ -69,12 +73,14 @@ func newRig(t *testing.T, mode string) *rig {
 				i = len(r.upgrades) - 1
 			}
 			r.calls++
+			r.now = r.now.Add(r.upgradeTakes)
 			if r.upgrades[i] < 0 {
 				return -1, errors.New("exec failed")
 			}
 			return r.upgrades[i], nil
 		},
 		RebootRequired: func(context.Context) bool { return r.rebootOK },
+		RebootBlocker:  func(context.Context) string { return r.blocker },
 		Reboot:         func(context.Context) error { r.reboots++; return nil },
 	}
 	return r
@@ -184,10 +190,99 @@ func TestRolledBackUpgradeFailsTheUnitAndWaitsForTheNextWindow(t *testing.T) {
 		t.Errorf("a rollback leaves the node healthy and does not pause automatic upgrades: %q", st.Blocked)
 	}
 	r.at("2026-10-11 03:00")
+	r.latest = "v1.2.0" // a newer release: worth another try
 	_ = r.run()
 	if r.calls != 2 {
-		t.Errorf("the next window tries again, got %d calls", r.calls)
+		t.Errorf("the next window tries a newer release, got %d calls", r.calls)
 	}
+}
+
+// A release that rolled back is not tried again every week: the node waits for a newer one.
+func TestRolledBackReleaseIsNotRetriedUntilANewerOneAppears(t *testing.T) {
+	r := newRig(t, config.UpdateAuto)
+	r.upgrades = []int{ExitRolledBack}
+	r.at("2026-10-04 03:00")
+	_ = r.run()
+	if st, _ := r.d.Store.Load(); st.RolledBack != "v1.1.0" {
+		t.Fatalf("the rolled-back release is remembered: %q", st.RolledBack)
+	}
+	for _, when := range []string{"2026-10-11 03:00", "2026-10-18 03:00", "2026-10-18 03:15"} {
+		r.at(when)
+		if err := r.run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r.calls != 1 {
+		t.Fatalf("the same release was tried again: %d calls", r.calls)
+	}
+	if n := r.logs.count("unattended_upgrade_skipped"); n != 2 {
+		t.Errorf("want one skip event per window (2), got %d", n)
+	}
+	// GitHub out of reach: the node cannot tell the release is new, so it keeps waiting.
+	r.latestEr = errors.New("github is down")
+	r.at("2026-10-25 03:00")
+	_ = r.run()
+	if r.calls != 1 {
+		t.Errorf("tried without knowing that the release changed: %d calls", r.calls)
+	}
+	// resume lifts the skip for the same release.
+	r.latestEr = nil
+	was, err := Resume(r.d.Store)
+	if err != nil || !strings.Contains(was, "v1.1.0") {
+		t.Fatalf("Resume = %q, %v", was, err)
+	}
+	r.upgrades = []int{ExitOK}
+	r.at("2026-11-01 03:00")
+	_ = r.run()
+	if r.calls != 2 {
+		t.Errorf("after resume the window tries again: %d calls", r.calls)
+	}
+	if st, _ := r.d.Store.Load(); st.RolledBack != "" {
+		t.Errorf("a successful upgrade forgets the rollback: %q", st.RolledBack)
+	}
+}
+
+// The last stretch of the window starts no upgrade: it would run its outage past the close.
+func TestNoUpgradeStartsInTheLastHourOfTheWindow(t *testing.T) {
+	r := newRig(t, config.UpdateAuto) // Sun 03:00-05:00: the cutoff is 60 min
+	r.at("2026-10-04 04:01")
+	if err := r.run(); err != nil {
+		t.Fatal(err)
+	}
+	if r.calls != 0 || r.logs.count("unattended_upgrade_skipped") != 1 {
+		t.Fatalf("started with 59 min left: %d calls", r.calls)
+	}
+	r.at("2026-10-04 04:00") // exactly the cutoff: still allowed
+	_ = r.run()
+	if r.calls != 1 {
+		t.Errorf("an upgrade at the cutoff is allowed: %d calls", r.calls)
+	}
+	// The next window starts on time.
+	r.at("2026-10-11 03:00")
+	_ = r.run()
+	if r.calls != 2 {
+		t.Errorf("%d calls", r.calls)
+	}
+	// A short window still has a time to start in: half of it.
+	r = newRig(t, config.UpdateAuto)
+	r.d.Update.Window = "Sun 03:00-03:30"
+	if got := StartCutoff(mustWindow(t, "Sun 03:00-03:30")); got != 15*time.Minute {
+		t.Errorf("StartCutoff of 30 min = %s", got)
+	}
+	r.at("2026-10-04 03:10")
+	_ = r.run()
+	if r.calls != 1 {
+		t.Errorf("a short window must not be shut for good: %d calls", r.calls)
+	}
+}
+
+func mustWindow(t *testing.T, s string) config.Window {
+	t.Helper()
+	w, err := config.ParseWindow(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
 }
 
 func TestOperatorFailureBlocksUntilResumed(t *testing.T) {
@@ -368,6 +463,113 @@ func TestUpgradeThenRebootInOneRun(t *testing.T) {
 	}
 }
 
+// An upgrade that outlasts the window must not be followed by a reboot after the close.
+func TestNoRebootAfterTheWindowClosedDuringTheUpgrade(t *testing.T) {
+	r := newRig(t, config.UpdateAuto)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	r.upgradeTakes = 2 * time.Hour // 03:30 + 2 h = 05:30, after the 05:00 close
+	r.at("2026-10-04 03:30")
+	if err := r.run(); err != nil {
+		t.Fatal(err)
+	}
+	if r.calls != 1 {
+		t.Fatalf("the upgrade ran %d times", r.calls)
+	}
+	if r.reboots != 0 || r.logs.count("os_reboot_deferred") != 1 {
+		t.Fatalf("rebooted %d time(s) after the window closed", r.reboots)
+	}
+	if st, _ := r.d.Store.Load(); !st.RebootWindow.IsZero() {
+		t.Errorf("a deferred reboot must not use up the window's reboot: %+v", st)
+	}
+	// The next window reboots.
+	r.upgradeTakes = 0
+	r.at("2026-10-11 03:30")
+	_ = r.run()
+	if r.reboots != 1 {
+		t.Errorf("the next window reboots: %d", r.reboots)
+	}
+}
+
+// An upgrade that ends inside the window still allows the reboot, if enough of the window is left.
+func TestRebootAfterAShortUpgradeInTheSameRun(t *testing.T) {
+	r := newRig(t, config.UpdateAuto)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	r.upgradeTakes = 30 * time.Minute // 03:00 -> 03:30
+	r.at("2026-10-04 03:00")
+	_ = r.run()
+	if r.reboots != 1 {
+		t.Errorf("reboots: %d", r.reboots)
+	}
+}
+
+func TestNoRebootInTheLastMinutesOfTheWindow(t *testing.T) {
+	r := newRig(t, config.UpdateNotify)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	r.at("2026-10-04 04:46") // 14 min left, the cutoff is 15
+	_ = r.run()
+	if r.reboots != 0 || r.logs.count("os_reboot_deferred") != 1 {
+		t.Fatalf("rebooted with 14 min left: %d", r.reboots)
+	}
+	r.at("2026-10-04 04:45")
+	_ = r.run()
+	if r.reboots != 1 {
+		t.Errorf("a reboot at the cutoff is allowed: %d", r.reboots)
+	}
+}
+
+func TestNoRebootAfterARefusedUpgrade(t *testing.T) {
+	r := newRig(t, config.UpdateAuto)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	r.upgrades = []int{ExitRefused, ExitOK}
+	r.at("2026-10-04 03:00")
+	_ = r.run()
+	if r.reboots != 0 || r.logs.count("os_reboot_deferred") != 1 {
+		t.Fatalf("the node rebooted in the pass in which its upgrade was refused: %d", r.reboots)
+	}
+	// The next tick's upgrade goes through and the reboot follows in the same window.
+	r.at("2026-10-04 03:15")
+	_ = r.run()
+	if r.calls != 2 || r.reboots != 1 {
+		t.Errorf("calls %d, reboots %d", r.calls, r.reboots)
+	}
+}
+
+func TestNoRebootWhileTheNodeIsUnhealthyOrBusy(t *testing.T) {
+	r := newRig(t, config.UpdateNotify)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	r.blocker = "a base backup is running: supavise-basebackup@abc.service"
+	r.at("2026-10-04 03:00")
+	_ = r.run()
+	r.at("2026-10-04 03:15")
+	_ = r.run()
+	if r.reboots != 0 || r.logs.count("os_reboot_deferred") != 2 {
+		t.Fatalf("rebooted a busy node: %d reboot(s), %d deferrals", r.reboots, r.logs.count("os_reboot_deferred"))
+	}
+	r.blocker = ""
+	r.at("2026-10-04 03:30")
+	_ = r.run()
+	if r.reboots != 1 {
+		t.Errorf("the reboot follows once the node is quiet: %d", r.reboots)
+	}
+}
+
+func TestNoGateNoReboot(t *testing.T) {
+	r := newRig(t, config.UpdateNotify)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	r.d.RebootBlocker = nil
+	r.at("2026-10-04 03:00")
+	_ = r.run()
+	if r.reboots != 0 {
+		t.Error("a reboot without a health gate")
+	}
+}
+
 func TestStateFile(t *testing.T) {
 	dir := t.TempDir()
 	s := Store{Path: filepath.Join(dir, "a", "b", "state.json")}
@@ -387,5 +589,73 @@ func TestStateFile(t *testing.T) {
 	}
 	if _, err := s.Load(); err == nil {
 		t.Error("a corrupt state file must be an error, not an empty state")
+	}
+}
+
+func TestStatePathIsOutsideTheStateDirectory(t *testing.T) {
+	if got := StatePath("/var/lib/supavise"); got != "/var/lib/supavise-upgrade/state.json" {
+		t.Errorf("StatePath = %s", got)
+	}
+	if got := StatePath("/data/sv/"); got != "/data/sv-upgrade/state.json" {
+		t.Errorf("StatePath = %s", got)
+	}
+}
+
+// The directory is trusted only when it is a plain directory of the user running the update that
+// others cannot write; a symlink or a lax mode is refused.
+func TestStoreRefusesAnUntrustedDirectory(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Store{Path: filepath.Join(link, "state.json")}).Save(State{Latest: "v1"}); err == nil || !strings.Contains(err.Error(), "not a plain directory") {
+		t.Errorf("Save through a symlinked directory: %v", err)
+	}
+	lax := filepath.Join(base, "lax")
+	if err := os.Mkdir(lax, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lax, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Store{Path: filepath.Join(lax, "state.json")}).Save(State{}); err == nil || !strings.Contains(err.Error(), "writable by group or others") {
+		t.Errorf("Save into a group-writable directory: %v", err)
+	}
+	good := Store{Path: filepath.Join(base, "good", "state.json")}
+	if err := good.Save(State{Latest: "v1"}); err != nil {
+		t.Errorf("a directory the store made itself: %v", err)
+	}
+}
+
+func TestProjectBlocker(t *testing.T) {
+	cases := []struct{ name, json, want string }{
+		{"healthy", `[{"ref":"a","status":"ACTIVE_HEALTHY"},{"ref":"b","status":"INACTIVE"},{"ref":"c","status":"REMOVED"}]`, ""},
+		{"none", `[]`, ""},
+		{"an operation in flight", `[{"ref":"a","status":"ACTIVE_HEALTHY"},{"ref":"b","status":"UPGRADING"}]`, "lifecycle operation is in flight: b UPGRADING"},
+		{"a restore", `[{"ref":"b","status":"RESTORING"}]`, "in flight"},
+		{"unhealthy", `[{"ref":"a","status":"ACTIVE_UNHEALTHY"}]`, "not healthy: a ACTIVE_UNHEALTHY"},
+		{"busy beats unhealthy", `[{"ref":"a","status":"ACTIVE_UNHEALTHY"},{"ref":"b","status":"RESTARTING"}]`, "in flight"},
+		{"garbage", `not json`, "cannot read the project list"},
+	}
+	for _, c := range cases {
+		got := ProjectBlocker([]byte(c.json))
+		if c.want == "" && got != "" || !strings.Contains(got, c.want) {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestUnitListParsing(t *testing.T) {
+	out := "● supavise-basebackup@abc.service loaded failed failed Base backup\n  supavise-upgrade.service loaded failed failed Supavise\n\nsupavise-gotrue@abc.service loaded failed failed GoTrue\n"
+	if got := strings.Join(FailedUnits(out), ","); got != "supavise-basebackup@abc.service,supavise-gotrue@abc.service" {
+		t.Errorf("FailedUnits = %s", got)
+	}
+	if got := UnitNames(""); len(got) != 0 {
+		t.Errorf("UnitNames of nothing = %v", got)
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -163,10 +164,12 @@ configuration. A re-run of the installer keeps what this sets.
 		Short: "One pass of the release check, the unattended upgrade and the OS reboot (what supavise-upgrade.timer runs)",
 		Long: `Checks for a release (at most every update.check_interval) and logs update_available once per
 release. In auto mode, while the maintenance window is open, runs ` + "`supavise upgrade --unattended`" + `: once
-per window, except that a refusal (exit 2, nothing changed) is tried again at the next tick. With
+per window, except that a refusal (exit 2, nothing changed) is tried again at the next tick; it
+starts no upgrade in the last hour of the window (at most half of a short one). With
 update.os_security_updates and update.os_reboot = "window", reboots the node inside the window when an
-OS patch needs it, once per window. It does nothing else, and nothing outside the window except the
-check. Needs root. The timer runs it; run it by hand to see what it would do now.`,
+OS patch needs it, once per window, not in the last 15 minutes of it, and only when the node is
+healthy and no backup or lifecycle operation is running. It does nothing else, and nothing outside
+the window except the check. Needs root. The timer runs it; run it by hand to see what it would do now.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if runtime.GOOS != "linux" {
@@ -207,7 +210,9 @@ check. Needs root. The timer runs it; run it by hand to see what it would do now
 					return update.RunUpgrade(ctx, exe, configPath, cmd.OutOrStdout(), cmd.ErrOrStderr())
 				},
 				RebootRequired: update.HostRebootRequired,
-				Reboot:         update.HostReboot,
+				RebootBlocker: update.HostRebootBlocker(update.Gate{
+					Exe: exe, ConfigPath: cmp.Or(configPath, config.DefaultPath), User: installUser, StateDir: cfg.StateDir}),
+				Reboot: update.HostReboot,
 			})
 		},
 	}
@@ -217,9 +222,10 @@ check. Needs root. The timer runs it; run it by hand to see what it would do now
 	// ---- resume ------------------------------------------------------------
 	resumeCmd := &cobra.Command{
 		Use:   "resume",
-		Short: "Let automatic upgrades run again after a failure that needed you",
+		Short: "Let automatic upgrades run again after a failure",
 		Long: `After an unattended upgrade fails in a way that needs the operator (` + "`supavise upgrade`" + ` exit 4),
-the node stops trying until you have looked. Check the node, then run this.`,
+the node stops trying until you have looked. After one that was rolled back (exit 3), the node skips
+that release until a newer one exists. Check the node, then run this to lift either.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := loadConfig()
@@ -234,10 +240,10 @@ the node stops trying until you have looked. Check the node, then run this.`,
 				return err
 			}
 			if was == "" {
-				fmt.Fprintln(cmd.OutOrStdout(), "automatic upgrades were not paused")
+				fmt.Fprintln(cmd.OutOrStdout(), "nothing was stopping automatic upgrades")
 				return nil
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "automatic upgrades resume at the next maintenance window (they were paused: %s)\n", was)
+			fmt.Fprintf(cmd.OutOrStdout(), "automatic upgrades resume at the next maintenance window (cleared: %s)\n", was)
 			return nil
 		},
 	}
@@ -354,6 +360,7 @@ type updateReport struct {
 	Available    bool           `json:"update_available"`
 	LastResult   *update.Result `json:"last_unattended_upgrade,omitempty"`
 	Blocked      string         `json:"automatic_upgrades_paused,omitempty"`
+	RolledBack   string         `json:"rolled_back_release,omitempty"`
 	Timer        string         `json:"timer,omitempty"`
 	RebootNeeded bool           `json:"reboot_needed"`
 }
@@ -364,7 +371,7 @@ func buildUpdateReport(ctx context.Context, cfg *config.Config, st update.State,
 		return nil, err
 	}
 	r := &updateReport{Installed: version, Settings: cfg.Update, TimeZone: now.Location().String(),
-		WindowOpen: win.Contains(now), Latest: st.Latest, LastResult: st.Result, Blocked: st.Blocked}
+		WindowOpen: win.Contains(now), Latest: st.Latest, LastResult: st.Result, Blocked: st.Blocked, RolledBack: st.RolledBack}
 	if t, ok := win.Next(now); ok {
 		r.NextWindow = t.Format(time.RFC3339)
 	}
@@ -423,6 +430,9 @@ func (r *updateReport) print(w io.Writer) {
 	}
 	if r.LastResult != nil {
 		fmt.Fprintf(w, "Last auto   exit %d at %s: %s\n", r.LastResult.Exit, r.LastResult.At.Format(time.RFC3339), r.LastResult.Meaning)
+	}
+	if r.RolledBack != "" {
+		fmt.Fprintf(w, "SKIPPING    %s: its automatic upgrade was rolled back; the node waits for a newer release (or `sudo supavise update resume` to try it again)\n", r.RolledBack)
 	}
 	if r.Blocked != "" {
 		fmt.Fprintf(w, "PAUSED      automatic upgrades wait for you (%s); check `supavise status`, then `sudo supavise update resume`\n", r.Blocked)

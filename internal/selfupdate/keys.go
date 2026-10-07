@@ -3,6 +3,7 @@ package selfupdate
 import (
 	"crypto/ed25519"
 	_ "embed"
+	"encoding/pem"
 	"errors"
 	"fmt"
 )
@@ -29,7 +30,29 @@ func EmbeddedKeys() ([]ed25519.PublicKey, error) {
 	return keysFromPEM(releaseKeyPEM, releaseKeyNextPEM)
 }
 
+// onlyPublicBlocks fails when b holds a PEM block that is not a PUBLIC KEY. A key file may be
+// empty (no key set) or hold public keys; a PRIVATE KEY block there is a mistake that must not
+// pass as "no key", because it means a private key reached the repository.
+func onlyPublicBlocks(name string, b []byte) error {
+	for rest := b; ; {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			return nil
+		}
+		if blk.Type != "PUBLIC KEY" {
+			return fmt.Errorf("%s holds a PEM block of type %q, want PUBLIC KEY: remove it, and if it is a private key, treat that key as leaked", name, blk.Type)
+		}
+	}
+}
+
 func keysFromPEM(current, next []byte) ([]ed25519.PublicKey, error) {
+	if err := onlyPublicBlocks("release key", current); err != nil {
+		return nil, err
+	}
+	if err := onlyPublicBlocks("next release key", next); err != nil {
+		return nil, err
+	}
 	cur, err := ParsePublicKey(current)
 	if err != nil {
 		return nil, err

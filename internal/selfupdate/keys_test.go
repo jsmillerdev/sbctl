@@ -1,6 +1,7 @@
 package selfupdate
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -50,6 +51,18 @@ func TestKeysFromPEM(t *testing.T) {
 	}
 	if _, err := keysFromPEM(pemOf(t, cur), pemOf(t, cur)); err == nil || !strings.Contains(err.Error(), "needs a new key") {
 		t.Errorf("next == current: %v", err)
+	}
+	// A PEM block of another type is an error in either file, never "no key": a private key that
+	// reached the repository must stop the build.
+	priv := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("x")})
+	if _, err := keysFromPEM(pemOf(t, cur), priv); err == nil || errors.Is(err, ErrNoKey) || !strings.Contains(err.Error(), "PRIVATE KEY") {
+		t.Errorf("private key in the next key file: %v", err)
+	}
+	if _, err := keysFromPEM(priv, placeholder); err == nil || errors.Is(err, ErrNoKey) {
+		t.Errorf("private key in the current key file: %v", err)
+	}
+	if _, err := keysFromPEM(pemOf(t, cur), append(append([]byte("note\n"), pemOf(t, next)...), priv...)); err == nil {
+		t.Errorf("a private key after a public one in the next key file passed")
 	}
 	// A next key that is PEM but not ed25519 is an error, not silence: a broken rotation must not pass unnoticed.
 	rsaLike := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: []byte("garbage")})
@@ -152,5 +165,17 @@ func TestKeyRotationNeedsNoReinstall(t *testing.T) {
 	o.Key, o.Keys = nil, []ed25519.PublicKey{oldPub, newPub}
 	if _, err := Update(context.Background(), o); err != nil {
 		t.Fatalf("current key during the overlap: %v", err)
+	}
+}
+
+// The committed key files hold public keys or nothing, and the binary embeds them as they are.
+func TestCommittedKeyFiles(t *testing.T) {
+	for name, b := range map[string][]byte{"release_key.pem": releaseKeyPEM, "release_key_next.pem": releaseKeyNextPEM} {
+		if bytes.Contains(b, []byte("PRIVATE KEY")) {
+			t.Errorf("%s contains a private key", name)
+		}
+		if err := onlyPublicBlocks(name, b); err != nil {
+			t.Error(err)
+		}
 	}
 }

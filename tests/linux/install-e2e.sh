@@ -379,6 +379,10 @@ deploy/install.sh --binary "$SUPAVISE_BIN" >/dev/null 2>&1 || fail "re-run after
 # Outside the window an auto-mode node does not upgrade (Wednesday 12:00 UTC); the check failing (no release exists) is not an error.
 out=$(timeout 120 $SV update run --at 2026-10-07T12:00:00Z 2>&1) || fail "update run outside the window failed: $out"
 [[ $out != *unattended_upgrade_started* ]] || fail "an upgrade started outside the window: $out"
+# The service keeps its memory in a root-owned directory of its own, not in the state directory that the supavise user can write.
+[[ $(systemctl show -p StateDirectory --value supavise-upgrade.service) == supavise-upgrade ]] || fail "supavise-upgrade.service has no StateDirectory of its own"
+[[ ! -e /var/lib/supavise/update ]] || fail "update state sits in the supavise-writable state directory"
+[[ ! -d /var/lib/supavise-upgrade ]] || [[ $(stat -c %U /var/lib/supavise-upgrade) == root ]] || fail "/var/lib/supavise-upgrade is not owned by root"
 # The installer flags set the same keys.
 deploy/install.sh --binary "$SUPAVISE_BIN" --auto-upgrade=false --maintenance-window "Sun 04:00-06:00" >/dev/null 2>&1 || fail "re-run with --auto-upgrade=false"
 [[ $($SV update config | grep -E '^(mode|window)' | tr '\n' ' ') == 'mode = "notify" window = "Sun 04:00-06:00" ' ]] || fail "the installer flags did not set the update settings: $($SV update config)"

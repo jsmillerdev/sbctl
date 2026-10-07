@@ -73,6 +73,10 @@ jobs:
           # key, that key must parse and must not be the current one (deploy/README.md, "Rotating the
           # release signing key").
           next=internal/selfupdate/release_key_next.pem
+          for f in internal/selfupdate/release_key.pem "$next"; do
+            if grep -q -e 'PRIVATE KEY' "$f"; then echo "$f contains a private key: remove it and treat that key as leaked"; exit 1; fi
+            if grep -- '^-----BEGIN ' "$f" | grep -qv -e '-----BEGIN PUBLIC KEY-----'; then echo "$f holds a PEM block that is not a PUBLIC KEY"; exit 1; fi
+          done
           if grep -q -- '-----BEGIN PUBLIC KEY-----' "$next"; then
             openssl pkey -pubin -in "$next" -noout 2>/dev/null || { echo "$next holds a PEM block that is not a public key"; exit 1; }
             a=$(openssl pkey -pubin -in "$next" -pubout -outform DER | openssl dgst -sha256)

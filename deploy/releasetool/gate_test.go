@@ -64,11 +64,15 @@ func runs(workflow string, items ...string) (string, string) {
 }
 
 func run(id int, status, conclusion, created string) string {
+	return runOn(id, "push", status, conclusion, created)
+}
+
+func runOn(id int, event, status, conclusion, created string) string {
 	c := "null"
 	if conclusion != "" {
 		c = `"` + conclusion + `"`
 	}
-	return fmt.Sprintf(`{"id":%d,"head_sha":"%s","status":"%s","conclusion":%s,"created_at":"%s"}`, id, sha, status, c, created)
+	return fmt.Sprintf(`{"id":%d,"event":"%s","head_sha":"%s","status":"%s","conclusion":%s,"created_at":"%s"}`, id, event, sha, status, c, created)
 }
 
 func jobs(id int, items ...string) (string, string) {
@@ -171,6 +175,29 @@ func TestGateUsesTheNewestRun(t *testing.T) {
 	set(t, dir, p, b)
 	if out, err := gate(); err == nil {
 		t.Fatalf("a newer failure was ignored:\n%s", out)
+	}
+}
+
+// A pull_request run reports the PR head as head_sha but tested the merge ref: it does not stand
+// in for the tagged commit, whether it is green or newer than the push run.
+func TestGateIgnoresPullRequestRuns(t *testing.T) {
+	dir, gate := gateRig(t)
+	allGreen(t, dir)
+	p, b := runs("ci.yml", run(1, "completed", "failure", "2026-10-07T01:00:00Z"), runOn(9, "pull_request", "completed", "success", "2026-10-07T02:00:00Z"))
+	set(t, dir, p, b)
+	if out, err := gate(); err == nil || !strings.Contains(out, "ci.yml run 1") {
+		t.Fatalf("a newer green pull_request run replaced the push run: %v\n%s", err, out)
+	}
+	p, b = runs("ci.yml", runOn(9, "pull_request", "completed", "success", "2026-10-07T02:00:00Z"))
+	set(t, dir, p, b)
+	if out, err := gate(); err == nil || !strings.Contains(out, "ci.yml has no run on "+sha) {
+		t.Fatalf("a pull_request run alone passed the gate: %v\n%s", err, out)
+	}
+	// A manual dispatch on the commit does count.
+	p, b = runs("ci.yml", runOn(9, "workflow_dispatch", "completed", "success", "2026-10-07T02:00:00Z"))
+	set(t, dir, p, b)
+	if out, err := gate(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
 	}
 }
 
