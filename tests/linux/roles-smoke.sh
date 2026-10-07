@@ -203,11 +203,14 @@ def can(action, resource):
 want = {
   "owner": {("write:Update", "organizations"): True, ("write:Create", "projects"): True, ("read:Read", "service_api_keys"): True, ("tenant:Sql:Write:Insert", "*"): True},
   "admin": {("write:Update", "organizations"): False, ("write:Create", "projects"): True, ("read:Read", "service_api_keys"): True, ("tenant:Sql:Write:Insert", "*"): True},
-  "dev": {("write:Update", "organizations"): False, ("write:Create", "projects"): False, ("read:Read", "service_api_keys"): True, ("tenant:Sql:Write:Insert", "*"): True, ("write:Update", "custom_config_gotrue"): False},
-  "ro": {("write:Update", "organizations"): False, ("write:Create", "projects"): False, ("read:Read", "service_api_keys"): False, ("tenant:Sql:Write:Insert", "*"): False, ("tenant:Sql:Query", "*"): True, ("read:Read", "organizations"): True, ("write:Create", "user_content"): True},
+  "dev": {("write:Update", "organizations"): False, ("write:Create", "projects"): False, ("read:Read", "service_api_keys"): True, ("tenant:Sql:Write:Insert", "*"): True, ("write:Update", "custom_config_gotrue"): False, ("infra:Execute", "reboot"): True},
+  "ro": {("write:Update", "organizations"): False, ("write:Create", "projects"): False, ("read:Read", "service_api_keys"): False, ("tenant:Sql:Write:Insert", "*"): False, ("tenant:Sql:Query", "*"): True, ("read:Read", "organizations"): True, ("infra:Execute", "queue_jobs.projects.pause"): False},
 }[role]
 bad = [f"{a} on {r}: want {w}" for (a, r), w in want.items() if can(a, r) != w]
 if bad: sys.exit(role + ": " + "; ".join(bad))
+# Saved content: a Developer's and a Read-only member's changes are conditioned on the item's owner.
+if role in ("dev", "ro") and not any(p["resources"] == ["user_content"] and "write:Update" in p["actions"] and "resource.owner_id" in json.dumps(p["condition"]) for p in perms):
+    sys.exit(role + ": saved-content writes are not conditioned on the owner")
 if role == "owner" and not any(p["actions"] == ["%"] and p["resources"] == ["%"] and not p["restrictive"] and p["condition"] is None for p in perms):
     sys.exit("owner has no unconditional % on %")
 PY
