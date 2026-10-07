@@ -40,6 +40,9 @@ type Server struct {
 	mu         sync.Mutex
 	transports map[time.Duration]*http.Transport
 
+	// noticeNow is the clock of the Studio banner (tests); nil is time.Now.
+	noticeNow func() time.Time
+
 	// fnToken is the secret the edge runtime's main service demands (functionsToken).
 	fnTokenMu sync.Mutex
 	fnToken   string

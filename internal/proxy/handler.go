@@ -79,7 +79,7 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveStudio(w http.ResponseWriter, r *http.Request) {
-	if answerStudioLocally(w, r) {
+	if s.answerStudioLocally(w, r) {
 		return
 	}
 	s.forward(w, r, &target{

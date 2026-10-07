@@ -73,6 +73,9 @@ type Deps struct {
 	// it. Nil means the node has no backup service: the list is empty, PITR is off and restores
 	// are refused. Restores also need a Manager that is a lifecycle.DatabaseRestorer.
 	Backups BackupSource
+	// Health serves GET /healthz and GET /healthz/detail (health.go). Nil: /healthz is a
+	// liveness check and the detail route answers 503.
+	Health HealthSource
 	// CreateWait bounds how long POST /v1/projects waits for the new project to show
 	// up in the registry before answering 201 COMING_UP. Zero means 10 seconds.
 	CreateWait time.Duration
@@ -80,17 +83,18 @@ type Deps struct {
 
 // Server is the Management API. It implements http.Handler.
 type Server struct {
-	reg      registry.Registry
-	sec      secrets.Secrets
-	mgr      lifecycle.Manager
-	branches *branching.Service
-	backups  BackupSource
-	cfg      *config.Config
-	log      *slog.Logger
-	store    Store
-	hc       *http.Client
-	now      func() time.Time
-	auth     *authenticator
+	reg       registry.Registry
+	sec       secrets.Secrets
+	mgr       lifecycle.Manager
+	branches  *branching.Service
+	backups   BackupSource
+	healthSrc HealthSource
+	cfg       *config.Config
+	log       *slog.Logger
+	store     Store
+	hc        *http.Client
+	now       func() time.Time
+	auth      *authenticator
 	// settings are the saved per-project settings; cfgLocks serialize save and apply.
 	settings *projectconfig.Manager
 	cfgLocks sync.Map
@@ -205,7 +209,7 @@ func NewServer(d Deps) (*Server, error) {
 		return nil, fmt.Errorf("api: Deps needs Registry, Secrets, Manager and Config")
 	}
 	s := &Server{
-		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, branches: d.Branching, backups: d.Backups, cfg: d.Config, log: d.Logger, store: d.Store,
+		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, branches: d.Branching, backups: d.Backups, healthSrc: d.Health, cfg: d.Config, log: d.Logger, store: d.Store,
 		hc: d.HTTPClient, now: d.Now, fnHook: d.Functions, pgmetaURL: d.PGMetaURL, upstreamOverride: d.Upstream, createWait: d.CreateWait,
 		pgmetaKeyMu: make(chan struct{}, 1), roEnsured: map[string]readOnlyEnsured{},
 	}
@@ -339,6 +343,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesContent(add)
 	s.routesProxies(add)
 	s.routesLogin(add)
+	s.routesHealth(add)
 	// The device-login poll carries no credentials: the CLI has none yet.
 	r := m["GET /platform/cli/login/{session_id}"]
 	r.auth = authNone
@@ -375,6 +380,7 @@ func (s *Server) build() (http.Handler, error) {
 		}
 	}
 	s.claimRoutes(mux)
+	s.healthzRoutes(mux)
 	mux.handle("GET /internal/templates/{ref}/{name}", s.wrap("", authNone, s.serveTemplate))
 	mux.handle("POST "+sso.HookPath, s.wrap("", authNone, s.serveBeforeUserCreated))
 	mux.fallback = s.wrap("", authAny, s.unknown)

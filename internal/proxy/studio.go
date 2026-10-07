@@ -3,30 +3,42 @@ package proxy
 import (
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/jsmillerdev/supavise/internal/notice"
 )
 
 // Studio is served unmodified (three patches, no fixups), so the two things its build
 // gets wrong for a self-hosted node are corrected here, on the way through.
 
-// incidentBanner is what Studio's banner code expects when there is no incident. Studio's
-// own /api/incident-banner route asks incident.io, answers 500 without a key, and
+// Studio's own /api/incident-banner route asks incident.io, answers 500 without a key, and
 // react-query retries it after 1, 4 and 16 seconds while the sign-in form awaits the query
 // cache reset: sign-in took 22 seconds (docs/research/08 section 9). The proxy answers the route
-// itself, instantly and with no outbound call.
-const incidentBanner = `{"incidents":[]}` + "\n"
+// itself, instantly and with no outbound call. With nothing to announce the answer is
+// {"incidents":[]}; while the operator has a maintenance window announced
+// (`supavise maintenance announce`) or an upgrade is running (<state_dir>/system/upgrade.json)
+// the answer lists it, as an incident that Studio shows to every signed-in user (internal/notice).
+//
+// Studio's banner code takes no text from this answer: it shows its own fixed wording
+// ("We are investigating a technical issue") with a link to the status page. The announcement's
+// message travels in the answer for other readers, and in `supavise status` for the operator.
 
 // answerStudioLocally serves the routes supavise answers instead of Studio. It reports
 // whether it wrote a response.
-func answerStudioLocally(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) answerStudioLocally(w http.ResponseWriter, r *http.Request) bool {
 	if r.URL.Path != "/api/incident-banner" || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
 		return false
+	}
+	now := time.Now
+	if s.noticeNow != nil {
+		now = s.noticeNow
 	}
 	h := w.Header()
 	h.Set("Content-Type", "application/json; charset=utf-8")
 	h.Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodGet {
-		_, _ = w.Write([]byte(incidentBanner))
+		_, _ = w.Write(notice.BannerJSON(s.cfg.Paths(), now()))
 	}
 	return true
 }
