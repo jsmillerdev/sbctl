@@ -369,8 +369,12 @@ func (s *S3Store) Delete(ctx context.Context, keys ...string) error {
 		if err != nil {
 			return fmt.Errorf("backup: s3 delete: %w", err)
 		}
-		if len(out.Errors) > 0 {
-			e := out.Errors[0]
+		for _, e := range out.Errors {
+			// AWS answers a missing key with success; some S3-compatible services (Garage)
+			// report NoSuchKey per key. The object is gone either way.
+			if c := aws.ToString(e.Code); c == "NoSuchKey" || c == "NotFound" {
+				continue
+			}
 			return fmt.Errorf("backup: s3 delete %s: %s: %s", aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
 		}
 		keys = keys[n:]

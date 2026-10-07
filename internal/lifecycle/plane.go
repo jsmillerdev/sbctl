@@ -130,7 +130,7 @@ func (pl *PostgresPlane) ensureBackupDir(ref string) error {
 	if !ok || filepath.Clean(dir) != pl.cfg.Paths().Backups() {
 		return nil
 	}
-	return os.MkdirAll(filepath.Join(dir, ref), 0o750)
+	return os.MkdirAll(filepath.Join(dir, ref), 0o700)
 }
 
 // hbaRules is the cluster's pg_hba.conf. The artifact's default trusts every loopback

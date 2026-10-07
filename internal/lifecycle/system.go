@@ -270,6 +270,18 @@ func (l *lateBackuper) get() (BaseBackuper, error) {
 	return b, nil
 }
 
+// FinalBackup implements FinalBackuper: the delete-time backup, when the service has one.
+func (l *lateBackuper) FinalBackup(ctx context.Context, ref string) (*registry.Backup, error) {
+	b, err := l.get()
+	if err != nil {
+		return nil, fmt.Errorf("lifecycle: backup service: %w", err)
+	}
+	if fb, ok := b.(FinalBackuper); ok {
+		return fb.FinalBackup(ctx, ref)
+	}
+	return b.BaseBackup(ctx, ref)
+}
+
 // BaseBackup implements BaseBackuper.
 func (l *lateBackuper) BaseBackup(ctx context.Context, ref string) (*registry.Backup, error) {
 	b, err := l.get()

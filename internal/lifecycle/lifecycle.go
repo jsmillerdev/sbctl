@@ -114,6 +114,12 @@ type BaseBackuper interface {
 	BaseBackup(ctx context.Context, ref string) (*registry.Backup, error)
 }
 
+// FinalBackuper is an optional BaseBackuper capability: the delete-time backup, recorded
+// with the reason "final" (backup.Service has it). The Engine prefers it over BaseBackup.
+type FinalBackuper interface {
+	FinalBackup(ctx context.Context, ref string) (*registry.Backup, error)
+}
+
 // ErrNoRestorableState is returned (wrapped) by a BaseBackuper for a project whose
 // cluster never became a database a base backup can be taken from: a restore-as-new clone
 // whose recovery failed or has not finished, with no completed base backup of its own.

@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
 )
 
@@ -63,6 +64,9 @@ func (s *Service) BaseBackupWith(ctx context.Context, ref string, bo BackupOptio
 	proj, err := reg.GetProject(ctx, ref)
 	if err != nil {
 		return nil, fmt.Errorf("backup: project %s: %w", ref, err)
+	}
+	if never, why := s.neverRecovered(ctx, ref); never {
+		return nil, fmt.Errorf("backup: %s has no restorable state: %s: %w", ref, why, lifecycle.ErrNoRestorableState)
 	}
 
 	started := s.opt.Now().UTC().Truncate(time.Second)
@@ -302,4 +306,39 @@ func (s *Service) writeSecretsFile(ctx context.Context, m *Manifest, sealed map[
 	m.Secrets = secretsName
 	m.StoredBytes += int64(len(b))
 	return nil
+}
+
+// neverRecovered reports whether ref is a restore-as-new clone whose cluster never left
+// recovery and that holds no completed base backup of its own: its recovery failed
+// (restore.recovery_failed) or has not finished (restore.cleanup_pending), and no later
+// restore.recovery_finished exists. Such a project cannot be backed up (a cluster in
+// recovery refuses, a dead one cannot be reached), and lifecycle.Manager.Delete treats
+// the resulting lifecycle.ErrNoRestorableState as "skip the final backup". Without this
+// the delete contract (abort when the final backup fails) would make the project
+// impossible to remove.
+func (s *Service) neverRecovered(ctx context.Context, ref string) (bool, string) {
+	bs, err := s.opt.Registry.ListBackups(ctx, ref)
+	if err != nil {
+		return false, ""
+	}
+	for _, b := range bs {
+		if b.Status == registry.BackupCompleted {
+			return false, ""
+		}
+	}
+	evs, err := s.opt.Registry.ListEvents(ctx, ref, 200) // newest first
+	if err != nil {
+		return false, ""
+	}
+	for _, e := range evs {
+		switch e.Kind {
+		case eventRecoveryFinished:
+			return false, ""
+		case "restore.recovery_failed":
+			return true, "its restore failed during recovery and it holds no completed base backup"
+		case "restore.cleanup_pending":
+			return true, "its restore has not finished recovery and it holds no completed base backup"
+		}
+	}
+	return false, ""
 }

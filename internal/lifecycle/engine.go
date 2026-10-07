@@ -495,6 +495,10 @@ func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev regi
 			}
 		}()
 	}
+	if fb, ok := e.opts.Backup.(FinalBackuper); ok {
+		_, err = fb.FinalBackup(ctx, p.Ref)
+		return err
+	}
 	_, err = e.opts.Backup.BaseBackup(ctx, p.Ref)
 	return err
 }
