@@ -95,6 +95,71 @@ func DiffVersions(from, to map[string]string) []ServiceChange {
 
 var majorRe = regexp.MustCompile(`\d+`)
 
+// tagRe is a release tag without its service prefix: the upstream version (dotted numbers, with
+// an optional leading v) and the packaging revision.
+var tagRe = regexp.MustCompile(`^v?(\d+(?:\.\d+)*)-r(\d+)$`)
+
+// CompareTags orders two release tags of svc: negative when a is older than b, zero when they are
+// the same release, positive when a is newer. The upstream version is compared number by number,
+// then the packaging revision. It fails when either tag does not have that shape; callers that
+// guard against a downgrade treat that as "cannot tell" and refuse.
+func CompareTags(svc, a, b string) (int, error) {
+	if a == b {
+		return 0, nil
+	}
+	va, ra, err := parseTag(svc, a)
+	if err != nil {
+		return 0, err
+	}
+	vb, rb, err := parseTag(svc, b)
+	if err != nil {
+		return 0, err
+	}
+	for i := 0; i < max(len(va), len(vb)); i++ {
+		var x, y int
+		if i < len(va) {
+			x = va[i]
+		}
+		if i < len(vb) {
+			y = vb[i]
+		}
+		if x != y {
+			return cmpInt(x, y), nil
+		}
+	}
+	if ra != rb {
+		return cmpInt(ra, rb), nil
+	}
+	return 0, nil
+}
+
+func cmpInt(x, y int) int {
+	if x < y {
+		return -1
+	}
+	return 1
+}
+
+// parseTag returns the numbers of a tag's upstream version and its packaging revision.
+func parseTag(svc, tag string) (version []int, revision int, err error) {
+	m := tagRe.FindStringSubmatch(ShortVersion(svc, tag))
+	if m == nil {
+		return nil, 0, fmt.Errorf("lifecycle: %q is not a release tag of the form <name>-<version>-r<revision>", tag)
+	}
+	for _, f := range strings.Split(m[1], ".") {
+		n, err := strconv.Atoi(f)
+		if err != nil {
+			return nil, 0, fmt.Errorf("lifecycle: %q: %w", tag, err)
+		}
+		version = append(version, n)
+	}
+	revision, err = strconv.Atoi(m[2])
+	if err != nil {
+		return nil, 0, fmt.Errorf("lifecycle: %q: %w", tag, err)
+	}
+	return version, revision, nil
+}
+
 // PostgresMajor is the major version in a postgres release tag ("postgres-17.11.0.004-r1" is
 // 17); 0 when the tag has none.
 func PostgresMajor(tag string) int {

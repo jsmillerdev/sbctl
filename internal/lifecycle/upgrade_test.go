@@ -575,6 +575,16 @@ func (h *upHarness) daemonOf() *Engine {
 	return NewEngine(h.cfg, h.reg, h.e.sec, h.arts, h.plane, Options{Fleet: fleet.Fleet{&fakeTenant{}}, Backup: h.backup, Timers: h.e.opts.Timers})
 }
 
+// setProgress moves the project's running upgrade row to progress, as the runner's saves do.
+func (h *upHarness) setProgress(t *testing.T, progress string) {
+	t.Helper()
+	u := h.latest(t)
+	u.Progress = progress
+	if err := h.reg.PutUpgrade(context.Background(), u); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A process that stopped in the middle of an upgrade: Recover stops the units, ends the
 // upgrade, and lets StartActive start the project on the recorded versions.
 func TestRecoverAnInterruptedUpgrade(t *testing.T) {
@@ -593,7 +603,8 @@ func TestRecoverAnInterruptedUpgrade(t *testing.T) {
 	if rec := daemon.SettleUpgrades(ctx); len(rec) != 0 || h.project(t).Status != registry.StatusUpgrading {
 		t.Fatalf("SettleUpgrades touched an upgrade that is running: %+v", rec)
 	}
-	run.(*upgradeRun).release() // the process that ran it is gone
+	h.setProgress(t, ProgressStopping) // it had reached the units
+	run.(*upgradeRun).release()        // the process that ran it is gone
 	h.e.upgrading.Delete(h.ref)
 	rec := daemon.Recover(ctx)
 	if len(rec) != 1 || rec[0].From != registry.StatusUpgrading || rec[0].To != registry.StatusActiveUnhealthy {
@@ -615,6 +626,58 @@ func TestRecoverAnInterruptedUpgrade(t *testing.T) {
 	}
 }
 
+// An upgrade that dies before it touches a unit (the artifact fetch, the base backup) leaves a
+// serving project: Recover and SettleUpgrades close the upgrade and do not stop or start anything.
+func TestInterruptedUpgradeBeforeAnyUnitIsTouchedKeepsTheProjectServing(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ progress, code string }{
+		{ProgressRequested, UpgradeErrArtifacts},
+		{ProgressStarted, UpgradeErrArtifacts},
+		{ProgressArtifactsReady, UpgradeErrBackup}, // the base backup runs here
+		{ProgressBackupDone, UpgradeErrStart},
+	} {
+		for _, via := range []string{"Recover", "SettleUpgrades"} {
+			t.Run(via+" "+tc.progress, func(t *testing.T) {
+				h := newUpHarness(t)
+				run, err := h.e.BeginUpgrade(ctx, h.ref, UpgradeRequest{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				h.setProgress(t, tc.progress)
+				run.(*upgradeRun).release()
+				h.e.upgrading.Delete(h.ref)
+				h.plane.steps = nil
+				daemon := h.daemonOf()
+				var rec []Recovered
+				if via == "Recover" {
+					rec = daemon.Recover(ctx)
+				} else {
+					rec = daemon.SettleUpgrades(ctx)
+				}
+				if len(rec) != 1 || rec[0].To != registry.StatusActiveHealthy {
+					t.Fatalf("recovered = %+v", rec)
+				}
+				if got := h.plane.log(); got != "" {
+					t.Fatalf("a project that was serving was touched: %s", got)
+				}
+				if p := h.project(t); p.Status != registry.StatusActiveHealthy || p.Versions[config.SvcGoTrue] != oldAuth {
+					t.Fatalf("project = %s %v", p.Status, p.Versions)
+				}
+				st := h.latest(t)
+				if st.Status != registry.UpgradeFailed || st.Error != tc.code || !strings.Contains(st.Detail, "before any service was touched") {
+					t.Fatalf("status row = %+v", st)
+				}
+				if !strings.HasSuffix(h.events(t), "project.upgrade_failed,project.recovered") {
+					t.Fatalf("events = %s", h.events(t))
+				}
+				if _, err := daemon.UpgradeProject(ctx, h.ref, nil); err != nil {
+					t.Fatalf("upgrade after the settle: %v", err)
+				}
+			})
+		}
+	}
+}
+
 // A CLI upgrade that dies while the daemon runs: the periodic settle starts the project on its
 // previous versions, and a second upgrade of it is accepted afterwards.
 func TestSettleUpgradesStartsAProjectWhoseRunnerDied(t *testing.T) {
@@ -628,13 +691,17 @@ func TestSettleUpgradesStartsAProjectWhoseRunnerDied(t *testing.T) {
 	if _, err := h.daemonOf().BeginUpgrade(ctx, h.ref, UpgradeRequest{}); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("a second runner: %v", err)
 	}
+	h.setProgress(t, ProgressServices)
 	run.(*upgradeRun).release()
 	h.e.upgrading.Delete(h.ref)
 	h.plane.steps = nil
 	daemon := h.daemonOf()
 	rec := daemon.SettleUpgrades(ctx)
-	if len(rec) != 1 || rec[0].Ref != h.ref {
+	if len(rec) != 1 || rec[0].Ref != h.ref || rec[0].To != registry.StatusActiveUnhealthy {
 		t.Fatalf("settled = %+v", rec)
+	}
+	if !strings.HasPrefix(h.plane.log(), "Stop, Start ") {
+		t.Fatalf("a project whose upgrade had touched its units was not stopped and started: %s", h.plane.log())
 	}
 	if p := h.project(t); p.Status != registry.StatusActiveHealthy || p.Versions[config.SvcGoTrue] != oldAuth {
 		t.Fatalf("project = %s %v", p.Status, p.Versions)
@@ -796,6 +863,86 @@ func TestCollectArtifactsKeepsWhatProjectsRun(t *testing.T) {
 		To: map[string]string{config.SvcGoTrue: oldAuth}, Status: registry.UpgradeRunning})
 	if gone, err = e.CollectArtifacts(ctx, 1, true); err != nil || len(gone) != 0 {
 		t.Fatalf("dry run during an upgrade = %+v, %v", gone, err)
+	}
+}
+
+// The node's pins can be older than what a project runs (the binary was rolled back, or the
+// versions file points at an older release). Such a project is not offered an upgrade, which
+// would be a downgrade, and BeginUpgrade refuses it before anything changes.
+func TestUpgradeNeverDowngrades(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		pins  map[string]string
+		want  string // a fragment of the blocker; Ahead lists this many services
+		ahead int
+	}{
+		{"gotrue only", map[string]string{config.SvcGoTrue: "auth-v2.50.0-r1", config.SvcPostgREST: "postgrest-v12.0-r0"}, "newer than", 1},
+		{"older packaging revision", map[string]string{config.SvcGoTrue: "auth-v2.100.0-r0", config.SvcPostgREST: "postgrest-v12.0-r0"}, "newer than", 1},
+		{"postgres minor", map[string]string{config.SvcPostgres: "postgres-17.0.5-r1"}, "newer than", 1},
+		{"one older and one newer service", map[string]string{config.SvcGoTrue: "auth-v2.50.0-r1"}, "newer than", 1},
+		{"tags that cannot be ordered", map[string]string{config.SvcGoTrue: "auth-nightly"}, "cannot tell", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newUpHarness(t)
+			for svc, tag := range tc.pins {
+				h.arts.pin(svc, tag)
+			}
+			el, err := h.e.UpgradeEligibility(ctx, h.ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if el.Eligible || len(el.Ahead) != tc.ahead || len(el.Blockers) == 0 || el.Blockers[0].Type != BlockerNoUpgradePath || !strings.Contains(el.Blockers[0].Message, tc.want) {
+				t.Fatalf("eligibility = %+v", el)
+			}
+			if _, err := h.e.BeginUpgrade(ctx, h.ref, UpgradeRequest{}); !errors.Is(err, ErrUpgradeUnsupported) {
+				t.Fatalf("err = %v", err)
+			}
+			if _, err := h.e.UpgradeProject(ctx, h.ref, nil); !errors.Is(err, ErrUpgradeUnsupported) {
+				t.Fatalf("UpgradeProject err = %v", err)
+			}
+			if _, err := h.reg.LatestUpgrade(ctx, h.ref); !errors.Is(err, registry.ErrNotFound) {
+				t.Fatalf("a refused upgrade left a status row: %v", err)
+			}
+			p := h.project(t)
+			if p.Status != registry.StatusActiveHealthy || p.Versions[config.SvcGoTrue] != oldAuth || p.Versions[config.SvcPostgres] != oldPG {
+				t.Fatalf("project = %s %v", p.Status, p.Versions)
+			}
+			if got := h.plane.log(); got != "" || len(h.backup.calls) != 0 || len(h.arts.fetched) != 0 {
+				t.Fatalf("a refused upgrade did work: steps %q, backups %v, fetched %v", got, h.backup.calls, h.arts.fetched)
+			}
+		})
+	}
+	t.Run("an explicit older target", func(t *testing.T) {
+		h := newUpHarness(t)
+		if _, err := h.e.UpgradeProject(ctx, h.ref, map[string]string{config.SvcGoTrue: "auth-v2.50.0-r1"}); !errors.Is(err, ErrUpgradeUnsupported) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestCompareTags(t *testing.T) {
+	for _, tc := range []struct {
+		svc, a, b string
+		want      int
+		bad       bool
+	}{
+		{config.SvcGoTrue, "auth-v2.100.0-r1", "auth-v2.195.0-r1", -1, false},
+		{config.SvcGoTrue, "auth-v2.195.0-r1", "auth-v2.100.0-r1", 1, false},
+		{config.SvcGoTrue, "auth-v2.9.0-r1", "auth-v2.10.0-r1", -1, false}, // numbers, not text
+		{config.SvcGoTrue, "auth-v2.100.0-r1", "auth-v2.100.0-r2", -1, false},
+		{config.SvcGoTrue, "auth-v2.100.0-r1", "auth-v2.100.0-r1", 0, false},
+		{config.SvcPostgREST, "postgrest-v12.0-r5", "postgrest-v12.0.0-r5", 0, false},
+		{config.SvcPostgREST, "postgrest-v12.1-r5", "postgrest-v12.1.0-r0", 1, false}, // revision, not a longer version
+		{config.SvcPostgres, "postgres-17.1.0.001-r1", "postgres-17.11.0.004-r1", -1, false},
+		{config.SvcPostgres, "postgres-17.11.0.004-r1", "postgres-18.0.0.001-r1", -1, false},
+		{config.SvcGoTrue, "auth-v2.100.0-rc1", "auth-v2.100.0-r1", 0, true},
+		{config.SvcGoTrue, "", "auth-v2.100.0-r1", 0, true},
+	} {
+		got, err := CompareTags(tc.svc, tc.a, tc.b)
+		if (err != nil) != tc.bad || (err == nil && got != tc.want) {
+			t.Errorf("CompareTags(%q, %q) = %d, %v; want %d, error %v", tc.a, tc.b, got, err, tc.want, tc.bad)
+		}
 	}
 }
 

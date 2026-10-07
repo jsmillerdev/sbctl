@@ -324,6 +324,33 @@ func TestUpgradeAcrossMajorVersionsIsRefused(t *testing.T) {
 	}
 }
 
+// A node whose pins went back (a rolled-back binary) does not offer a project that runs newer
+// releases an upgrade, and the upgrade route refuses it.
+func TestUpgradeToOlderPinsIsRefused(t *testing.T) {
+	f := newUpgradeFixture(t)
+	f.arts.pin(config.SvcPostgres, "postgres-17.0.5.001-r1")
+	f.arts.pin(config.SvcGoTrue, "auth-v2.50.0-r1")
+	const p = "/v1/projects/" + testRef
+	m := upJSON(t, f.fixture, "GET", p+"/upgrade/eligibility", nil, 200, "GET /v1/projects/{ref}/upgrade/eligibility")
+	if m["eligible"] != false || len(m["target_upgrade_versions"].([]any)) != 0 {
+		t.Fatalf("eligibility = %v", m)
+	}
+	if m["current_app_version"] != "supabase-"+oldPG || m["latest_app_version"] != "supabase-"+oldPG {
+		t.Fatalf("a project ahead of the node has nothing newer to offer: current %v, latest %v", m["current_app_version"], m["latest_app_version"])
+	}
+	rec := f.do("POST", p+"/upgrade", map[string]any{"target_version": "17"})
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "newer than") {
+		t.Fatalf("downgrade = %d %s", rec.Code, rec.Body.String())
+	}
+	st := upJSON(t, f.fixture, "GET", p+"/upgrade/status", nil, 200, "GET /v1/projects/{ref}/upgrade/status")
+	if st["databaseUpgradeStatus"] != nil {
+		t.Fatalf("a refused upgrade left a status: %v", st)
+	}
+	if pr, _ := f.reg.GetProject(context.Background(), testRef); pr.Status != registry.StatusActiveHealthy || pr.Versions[config.SvcGoTrue] != oldAuth {
+		t.Fatalf("project = %s %v", pr.Status, pr.Versions)
+	}
+}
+
 func TestUpgradePausedProjectAndNoBackupService(t *testing.T) {
 	f := newUpgradeFixture(t)
 	const p = "/v1/projects/" + testRef

@@ -105,7 +105,15 @@ func eligibilityBody(el *lifecycle.UpgradeEligibility) map[string]any {
 	set(resp, "eligible", el.Eligible)
 	set(resp, "current_app_version", lifecycle.AppVersion(el.Current[pg]))
 	set(resp, "current_app_version_release_channel", "ga")
-	set(resp, "latest_app_version", lifecycle.AppVersion(el.Latest[pg]))
+	// A project ahead of the node on Postgres has nothing newer to offer: report its own version as
+	// the latest, so Studio shows "Latest" and no upgrade button.
+	latest := el.Latest[pg]
+	for _, c := range el.Ahead {
+		if c.Service == pg {
+			latest = el.Current[pg]
+		}
+	}
+	set(resp, "latest_app_version", lifecycle.AppVersion(latest))
 	set(resp, "target_upgrade_versions", targets)
 	set(resp, "duration_estimate_hours", el.DowntimeHours)
 	set(resp, "legacy_auth_custom_roles", []any{})

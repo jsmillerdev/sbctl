@@ -38,6 +38,8 @@ func (r upgradeRow) state() string {
 	switch {
 	case r.El.Eligible:
 		return "upgrade"
+	case len(r.El.Ahead) > 0:
+		return "ahead of the node; stays on its versions"
 	case len(r.El.Blockers) > 0:
 		return "skip: " + r.El.Blockers[0].Message
 	}
@@ -46,7 +48,7 @@ func (r upgradeRow) state() string {
 
 // changesText is "gotrue v2.100.0-r1 -> v2.195.0-r1, postgrest ...".
 func changesText(el *lifecycle.UpgradeEligibility) string {
-	if len(el.Changes) == 0 {
+	if len(el.Changes) == 0 || len(el.Ahead) > 0 {
 		return "-"
 	}
 	parts := make([]string, 0, len(el.Changes))
@@ -295,10 +297,12 @@ type versionsView struct {
 	Versions map[string]string `json:"versions"`
 	Node     map[string]string `json:"node_versions"`
 	Upgrade  struct {
-		Available bool     `json:"available"`
-		UpToDate  bool     `json:"up_to_date"`
-		Blockers  []string `json:"blockers,omitempty"`
-		Changes   []string `json:"changes,omitempty"`
+		Available bool `json:"available"`
+		UpToDate  bool `json:"up_to_date"`
+		// Ahead: the project runs a newer release than the node pins; it is not upgraded.
+		Ahead    bool     `json:"ahead_of_node"`
+		Blockers []string `json:"blockers,omitempty"`
+		Changes  []string `json:"changes,omitempty"`
 	} `json:"upgrade"`
 	Last *lastUpgradeView `json:"last_upgrade,omitempty"`
 }
@@ -315,11 +319,14 @@ type lastUpgradeView struct {
 
 func viewVersions(ctx context.Context, n *lifecycle.Node, r upgradeRow) versionsView {
 	v := versionsView{Ref: r.Project.Ref, Name: r.Project.Name, Status: string(r.Project.Status), Versions: r.El.Current, Node: r.El.Latest}
-	v.Upgrade.Available, v.Upgrade.UpToDate = r.El.Eligible, r.El.UpToDate
+	v.Upgrade.Available, v.Upgrade.UpToDate, v.Upgrade.Ahead = r.El.Eligible, r.El.UpToDate, len(r.El.Ahead) > 0
 	for _, b := range r.El.Blockers {
 		v.Upgrade.Blockers = append(v.Upgrade.Blockers, b.Message)
 	}
 	for _, c := range r.El.Changes {
+		if v.Upgrade.Ahead {
+			break
+		}
 		v.Upgrade.Changes = append(v.Upgrade.Changes, fmt.Sprintf("%s %s -> %s", c.Service, c.From, c.To))
 	}
 	if store := registry.Upgrades(n.Registry); store != nil {
@@ -357,6 +364,11 @@ func runVersions(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 			mark := ""
 			if r.El.Current[svc] != r.El.Latest[svc] {
 				mark = "differs"
+			}
+			for _, c := range r.El.Ahead {
+				if c.Service == svc {
+					mark = "ahead"
+				}
 			}
 			fmt.Fprintf(t, "%s\t%s\t%s\t%s\n", svc, lifecycle.ShortVersion(svc, r.El.Current[svc]), lifecycle.ShortVersion(svc, r.El.Latest[svc]), mark)
 		}

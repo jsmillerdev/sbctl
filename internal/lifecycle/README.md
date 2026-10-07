@@ -136,7 +136,8 @@ onto a new instance: the three services change by minor release inside one Postg
 and that does not change the on-disk format.
 
 1. `BeginUpgrade`, under the project's lock: only `ACTIVE_HEALTHY` projects, a node with a backup
-   service, something to change and no other Postgres major version (`ErrInvalidState`,
+   service, something to change, no other Postgres major version and no service that would move to
+   an older release than the project runs (`ErrInvalidState`,
    `ErrNoBackupEngine`, `ErrUpgradeNotNeeded`, `ErrUpgradeUnsupported`; nothing changes on a
    refusal). It claims the upgrade of the ref (a session-level advisory lock on a connection of its
    own, `supavise:upgrade:<ref>`, held until `Run` ends; the lock goes when the process dies),
@@ -177,7 +178,10 @@ upgrade` ignores SIGHUP and SIGPIPE, so a dropped SSH session does not end it, b
 OOM killer can). The claim tells a live runner from a dead one. A project that is `UPGRADING` with
 the claim free lost its runner: `Recover` (at the daemon's start, before `StartActive`) and
 `SettleUpgrades` (the daemon calls it every 2 minutes) stop its units, mark the upgrade failed and
-set `ACTIVE_UNHEALTHY`, and start it on the recorded, previous versions. While the claim is held
+set `ACTIVE_UNHEALTHY`, and start it on the recorded, previous versions. An upgrade that died
+before it touched a unit (progress before `4_attached_volume_to_original_instance`: the artifact
+fetch, the base backup) only has its row marked failed and the project set `ACTIVE_HEALTHY`:
+nothing is stopped. While the claim is held
 they leave the project alone, so a daemon restart during a CLI upgrade's base backup does not stop
 a serving project. The same pass closes an upgrade row that still says running on a project that is
 not `UPGRADING` (the process died after recording the versions, or after a rollback): `done` when
@@ -222,6 +226,8 @@ recording, `9_completed_upgrade`. Error codes: `1_upgraded_instance_launch_faile
 
 `Engine.UpgradeEligibility` answers for the node's pins: current and target versions, the changes
 and whether PostgreSQL restarts, blockers (not `ACTIVE_HEALTHY`, another Postgres major version,
+a service the project runs a newer release of than the target (`Ahead`; `CompareTags` orders the
+tags by upstream version, then packaging revision, and tags it cannot order are refused too),
 no backup service, the system project, an extension the target release cannot serve), an
 estimated downtime (about 3 minutes without PostgreSQL restarting, 15 when it restarts; the base
 backup does not count, the project serves during it) and notes. `Rollout` (`rollout.go`) runs many upgrades for `supavise projects upgrade --all`:

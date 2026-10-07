@@ -51,7 +51,13 @@ import (
 // service starts and only go forward, so a previous GoTrue may meet a schema that a newer one
 // migrated. The base backup of step 2 is the way back for the data (`supavise backups restore`);
 // the upgrade's status, events and error name its id. Recover (a daemon stopped in the middle)
-// stops the project's units and lets StartActive start them on the recorded, previous versions.
+// stops the project's units and lets StartActive start them on the recorded, previous versions;
+// an upgrade that died before step 3 touched a unit only marks the upgrade failed.
+//
+// An upgrade never moves a service to an older release than the project runs: the node's pins go
+// back after a rollback of the binary, and a project upgraded on the newer release stays on it
+// (the eligibility says so) until the node pins newer ones. Tags that cannot be ordered are
+// refused as well (CompareTags).
 //
 // Whoever runs an upgrade (the daemon for the API, the CLI for `supavise projects upgrade`)
 // holds a session-level advisory lock on the project from BeginUpgrade to the end of Run, the
@@ -96,7 +102,8 @@ var (
 	// ErrUpgradeNotNeeded: the project already runs the target versions.
 	ErrUpgradeNotNeeded = errors.New("lifecycle: the project already runs the target versions")
 	// ErrUpgradeUnsupported: no upgrade path from the project's versions to the target (another
-	// Postgres major version, a downgrade) or a rule of the node forbids it.
+	// Postgres major version, an older release, tags that cannot be ordered) or a rule of the
+	// node forbids it.
 	ErrUpgradeUnsupported = errors.New("lifecycle: no upgrade path to the target versions")
 	// ErrNoBackupEngine: the node has no backup service, and an upgrade does not start without
 	// the backup it would roll back to.
@@ -141,6 +148,11 @@ type UpgradeEligibility struct {
 	// drops. Otherwise only GoTrue and PostgREST restart and the database stays up.
 	PostgresRestart bool
 	Blockers        []UpgradeBlocker
+	// Ahead lists the services the project runs a newer release of than the target (From is what
+	// it runs, To the older target). A project is never moved to an older release, so each is
+	// also a blocker: the node's pins went back (a rollback of the binary, an older versions
+	// file) and the project stays where it is until the node pins newer ones.
+	Ahead []ServiceChange
 	// Extensions are the installed extensions the target Postgres release cannot serve; each is
 	// also a blocker.
 	Extensions []ExtensionProblem
@@ -237,6 +249,19 @@ func (e *Engine) plan(ctx context.Context, p *registry.Project, target map[strin
 	}
 	block := func(typ, format string, args ...any) {
 		el.Blockers = append(el.Blockers, UpgradeBlocker{Type: typ, Message: fmt.Sprintf(format, args...)})
+	}
+	// Hosted never offers a downgrade, and an older GoTrue may meet a schema that a newer one
+	// migrated forward. A pair of tags that cannot be ordered is refused the same way.
+	for _, c := range el.Changes {
+		cmp, err := CompareTags(c.Service, c.From, c.To)
+		switch {
+		case c.From == "":
+		case err != nil:
+			block(BlockerNoUpgradePath, "cannot tell whether %s %s -> %s is an upgrade: %v", c.Service, ShortVersion(c.Service, c.From), ShortVersion(c.Service, c.To), err)
+		case cmp > 0:
+			el.Ahead = append(el.Ahead, c)
+			block(BlockerNoUpgradePath, "the project runs %s %s, which is newer than %s; it stays on its versions until the node pins newer ones", c.Service, ShortVersion(c.Service, c.From), ShortVersion(c.Service, c.To))
+		}
 	}
 	switch {
 	case p.Ref == config.SystemRef:
@@ -659,8 +684,9 @@ func (r *upgradeRun) swap(ctx context.Context) error {
 	target := *p
 	target.Versions = mergeVersions(p.Versions, r.up.To)
 
-	e.stopTimer(ctx, ref)
+	// The progress comes first: from here on a recovery treats the units as touched.
 	r.save(ctx, ProgressStopping)
+	e.stopTimer(ctx, ref)
 	code, serr := r.install(ctx, &target, keys)
 	if serr == nil {
 		r.save(ctx, ProgressHealth)
@@ -803,11 +829,13 @@ func healthError(hs []ServiceHealth) error {
 	return nil
 }
 
-// settleUpgrading settles a project that is UPGRADING with no process running its upgrade: its
-// units stop (they may run the target versions, which the registry never recorded), its upgrade
-// is marked failed, and the project becomes ACTIVE_UNHEALTHY, which is what StartActive starts
-// on the versions the registry has. It reports false when the project had moved on by the time
-// the lock was held.
+// settleUpgrading settles a project that is UPGRADING with no process running its upgrade, and
+// reports false when the project had moved on by the time the lock was held. Its upgrade is marked
+// failed. If the upgrade died before it touched a unit (during the artifact fetch or the base
+// backup), the units still run the recorded versions and the project goes back to ACTIVE_HEALTHY
+// without a stop. Otherwise its units stop (they may run the target versions, which the registry
+// never recorded) and the project becomes ACTIVE_UNHEALTHY, which is what StartActive starts on the
+// versions the registry has.
 func (e *Engine) settleUpgrading(ctx context.Context, ref string) (Recovered, bool) {
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
@@ -819,22 +847,25 @@ func (e *Engine) settleUpgrading(ctx context.Context, ref string) (Recovered, bo
 	if err != nil || cur.Status != registry.StatusUpgrading {
 		return Recovered{}, false
 	}
-	e.recoverUpgrade(ctx, ref)
-	const note = "the process that ran the upgrade stopped; the project starts on its previous versions"
-	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusActiveUnhealthy); err != nil {
+	to, note := registry.StatusActiveUnhealthy, "the process that ran the upgrade stopped; the project starts on its previous versions"
+	if !e.recoverUpgrade(ctx, ref) {
+		to, note = registry.StatusActiveHealthy, "the process that ran the upgrade stopped before it touched any service; the project kept running its versions"
+	}
+	if err := e.reg.SetProjectStatus(ctx, ref, to); err != nil {
 		e.log.Error("recover: set status", "ref", ref, "error", err)
 		return Recovered{}, false
 	}
-	e.event(ctx, ref, "project.recovered", map[string]string{"from": string(registry.StatusUpgrading), "to": string(registry.StatusActiveUnhealthy), "note": note})
-	e.log.Warn("recovered project after an interrupted operation", "ref", ref, "from", registry.StatusUpgrading, "to", registry.StatusActiveUnhealthy, "note", note)
-	return Recovered{Ref: ref, From: registry.StatusUpgrading, To: registry.StatusActiveUnhealthy, Note: note}, true
+	e.event(ctx, ref, "project.recovered", map[string]string{"from": string(registry.StatusUpgrading), "to": string(to), "note": note})
+	e.log.Warn("recovered project after an interrupted operation", "ref", ref, "from", registry.StatusUpgrading, "to", to, "note", note)
+	return Recovered{Ref: ref, From: registry.StatusUpgrading, To: to, Note: note}, true
 }
 
 // SettleUpgrades is Recover's UPGRADING step for a daemon that keeps running: an upgrade run by
 // the CLI whose process died (a dropped SSH session that took it along, a kill, the OOM killer)
 // leaves its project UPGRADING with nobody to finish it, and Studio would show the upgrade screen
 // for good. Each such project is stopped, marked ACTIVE_UNHEALTHY and started again on its
-// recorded versions; an upgrade whose process still holds its claim is not touched. The daemon
+// recorded versions (one whose upgrade died before touching a unit just goes back to
+// ACTIVE_HEALTHY); an upgrade whose process still holds its claim is not touched. The daemon
 // calls it every few minutes.
 func (e *Engine) SettleUpgrades(ctx context.Context) []Recovered {
 	ps, err := e.reg.ListProjects(ctx)
@@ -853,6 +884,9 @@ func (e *Engine) SettleUpgrades(ctx context.Context) []Recovered {
 			continue
 		}
 		out = append(out, r)
+		if r.To == registry.StatusActiveHealthy {
+			continue // its units were never stopped
+		}
 		cur, err := e.reg.GetProject(ctx, p.Ref)
 		if err != nil {
 			continue
@@ -910,12 +944,27 @@ func (e *Engine) settleUpgradeRows(ctx context.Context, ps []registry.Project) {
 	}
 }
 
-// recoverUpgrade ends the running upgrade record of ref as failed and stops the project's units.
-func (e *Engine) recoverUpgrade(ctx context.Context, ref string) {
+// recoverUpgrade ends the running upgrade record of ref as failed. It stops the project's units
+// and reports true, unless the upgrade died before it touched any (progress before
+// ProgressStopping): then the units still run the recorded versions, nothing is stopped, and it
+// reports false. A missing or already closed record counts as touched.
+func (e *Engine) recoverUpgrade(ctx context.Context, ref string) (touched bool) {
+	touched = true
 	if store := registry.Upgrades(e.reg); store != nil {
 		if u, err := store.LatestUpgrade(ctx, ref); err == nil && u.Status == registry.UpgradeRunning {
 			u.Status, u.Error, u.LatestStatusAt = registry.UpgradeFailed, UpgradeErrHealth, e.opts.Now().UTC()
 			u.Detail = "the process that ran the upgrade stopped; the project starts on its previous versions"
+			if u.Progress < ProgressStopping {
+				touched = false
+				u.Error = UpgradeErrArtifacts
+				switch u.Progress {
+				case ProgressArtifactsReady:
+					u.Error = UpgradeErrBackup
+				case ProgressBackupDone:
+					u.Error = UpgradeErrStart
+				}
+				u.Detail = "the process that ran the upgrade stopped before any service was touched; the project kept running its versions"
+			}
 			if err := store.PutUpgrade(ctx, u); err != nil {
 				e.log.Warn("recover: could not mark the upgrade failed", "ref", ref, "error", err)
 			}
@@ -924,9 +973,13 @@ func (e *Engine) recoverUpgrade(ctx context.Context, ref string) {
 			e.log.Error("upgrade_failed", "ref", ref, "tracking_id", u.TrackingID, "stage", u.Progress, "backup_id", u.BackupID, "outcome", "interrupted")
 		}
 	}
+	if !touched {
+		return false
+	}
 	if err := e.plane.Stop(ctx, ref); err != nil {
 		e.log.Warn("recover: stopping units", "ref", ref, "error", err)
 	}
+	return true
 }
 
 // CollectArtifacts removes the artifacts that nothing references: not the node's pins, not those

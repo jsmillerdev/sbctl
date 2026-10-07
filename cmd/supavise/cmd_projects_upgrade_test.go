@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
 )
 
 func TestProjectsUpgradeCommandsAreRegistered(t *testing.T) {
@@ -33,4 +35,19 @@ func TestProjectsUpgradeNeedsOneProjectOrAll(t *testing.T) {
 		}
 	}
 	runRoot(t, "projects", "upgrade", "--all=false") // leave the flag as it was
+}
+
+// A project that runs newer releases than the node pins is listed as ahead and never as an
+// upgrade, and its plan shows no changes.
+func TestAheadOfTheNodeIsListedAndSkipped(t *testing.T) {
+	c := lifecycle.ServiceChange{Service: "gotrue", From: "auth-v2.195.0-r1", To: "auth-v2.100.0-r1"}
+	el := &lifecycle.UpgradeEligibility{Changes: []lifecycle.ServiceChange{c}, Ahead: []lifecycle.ServiceChange{c},
+		Blockers: []lifecycle.UpgradeBlocker{{Type: lifecycle.BlockerNoUpgradePath, Message: "newer"}}}
+	r := upgradeRow{El: el}
+	if got := r.state(); !strings.HasPrefix(got, "ahead of the node") {
+		t.Fatalf("state = %q", got)
+	}
+	if got := changesText(el); got != "-" {
+		t.Fatalf("changes = %q", got)
+	}
 }
