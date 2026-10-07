@@ -86,7 +86,7 @@ white          #ffffff   the word on black and dark grounds
 
 `readme/` holds the two images the README embeds, each in a dark and a light variant so `<picture>` can follow the reader's GitHub theme. Both are SVG with no embedded rasters and no webfonts: GitHub shows them through `<img>`, which blocks external references. The lockup is outlined paths; every other word is live text in the system font stack (`-apple-system, Segoe UI, Inter, Helvetica, Arial`), so it matches the surrounding page on each platform.
 
-- Banner: lockup at the left, tagline "Many Supabase projects. One server.", one line of small print that says it is not affiliated with Supabase Inc. The oversized mark off the right edge is a neutral gray watermark, not teal, so the banner stays quiet.
+- Banner: lockup at the left, tagline "Multiple Supabase Orgs and Projects. Self-hosted, one server.", one line of small print that says it is not affiliated with Supabase Inc. The oversized mark off the right edge is a neutral gray watermark, not teal, so the banner stays quiet.
 - Architecture: clients on the left, the Supavise node in the middle, backups on the right. Boxes are neutral grays; teal (dark) or ink (light) marks only the node, the `supavise` binary and the data flow. One stroke width throughout. Text is 12 to 19 px in a 1200 px canvas, which is about 9 to 14 px at GitHub's 880 px README width.
 - Change the diagram in `arch_svg()` in `build.py`, then re-run it. Check it in a browser as well as `sips`: browser system fonts run wider than the fallback `sips` uses, and the narrowest labels ("Edge Runtime", "WAL + base backups") are the ones that touch their boxes first.
 

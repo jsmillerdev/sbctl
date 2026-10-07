@@ -175,8 +175,8 @@ def og_svg(k, size=OG, name="link preview"):
 # secondary text are neutral grays, picked to keep at least 4.5:1 against their ground.
 SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif"
 MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
-TAGLINE = "Many Supabase projects. One server."
-SUBLINE = "Self-hosted and open source. Not affiliated with Supabase Inc."
+TAGLINE = "Multiple Supabase Orgs and Projects. Self-hosted, one server."
+SUBLINE = "Open source. Not affiliated with Supabase Inc."
 
 THEMES = {
     "dark":  dict(bg=BLACK, accent=BRAND, word=WHITE, text=WHITE, sub="#a3a3a3", box="#151515", line="#3a3a3a",

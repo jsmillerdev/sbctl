@@ -2,13 +2,13 @@
   <a href="https://supavise.dev">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="brand/readme/banner-dark.svg">
-      <img alt="Supavise: many Supabase projects, one server" src="brand/readme/banner-light.svg" width="100%">
+      <img alt="Supavise: multiple Supabase orgs and projects, self-hosted on one server" src="brand/readme/banner-light.svg" width="100%">
     </picture>
   </a>
 </p>
 
 <p align="center">
-  Run many Supabase projects on one server, with the dashboard, API and tools of hosted Supabase.
+  Run multiple Supabase organizations and projects on one self-hosted server, with the dashboard, API and tools of hosted Supabase.
 </p>
 
 <p align="center">
