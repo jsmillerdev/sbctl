@@ -128,6 +128,20 @@ supavise self-update --check
 
 A binary built without a committed release key refuses to self-update (it names the missing key).
 
+### Project versions
+
+A release pins the Postgres, GoTrue and PostgREST versions that new projects get. Existing projects keep the versions they run until their Owner or Administrator upgrades them, the way hosted Supabase lets a project owner decide when to upgrade: in Studio under Settings > General, "Service versions" (the "Upgrade project" button appears when the node pins newer versions than the project runs), with `POST /v1/projects/{ref}/upgrade`, or on the node:
+
+```bash
+supavise projects versions                 # what every project runs and whether an upgrade is available
+supavise projects versions <ref>           # one project, with the last upgrade's outcome
+supavise projects upgrade <ref>            # shows the plan, asks, upgrades one project
+supavise projects upgrade --all --yes      # every eligible project: canary first, then batches; stops at the first failure
+supavise artifacts gc --dry-run            # which unused artifacts would go
+```
+
+An upgrade takes a fresh base backup first (reason `pre-upgrade`) while the project serves, and changes nothing if the backup fails. Then GoTrue and PostgREST restart on the new releases (PostgreSQL too when its release changes) and every service is health checked; if one does not come up, the previous versions start again. The data directory stays where it is: these are minor-release changes of the same Postgres major version, so no data is copied and the project is offline for about a minute (longer when PostgreSQL restarts and recovers). Upgrades across Postgres major versions are refused. GoTrue's database migrations run when it starts and only go forward, so the pre-upgrade backup, not the rollback, is the way back for the data (`supavise backups restore`). The artifacts of the previous release stay on disk for `[upgrade] keep_releases` releases (default 2) and while any project runs them; `supavise projects upgrade` removes the rest after it succeeds. `[upgrade] canary_projects` (default 1) and `batch_size` (default 3) set the rollout of `--all`. Details: `internal/lifecycle/README.md`, "Service versions and project upgrades".
+
 ## AWS
 
 One CloudFormation template (`cloudformation/supavise.yaml`) creates a complete node. You fill in an admin email; everything else has a default. There are three ways to deploy it, simplest first. All three give the same stack.
@@ -427,6 +441,8 @@ To rotate the key: generate a new pair, commit the new public file, replace the 
 - a re-run of `install.sh` with a v0.0.2 binary moves the daemon onto it (the daemon's `/proc/<pid>/exe` reports v0.0.2) without restarting shared services or projects;
 - `supavise self-update` against a local release server: refuses a tampered binary, a wrong key and an older signed binary under a newer tag, installs v0.0.3, restarts the daemon, leaves the project's Postgres running; then a release whose daemon exits on `serve` is rolled back to v0.0.3, whose daemon answers again;
 - the claim token stays out of the installer's output when `--claim-token-file` is used.
+
+`tests/linux/upgrade-smoke.sh` (the `upgrade-smoke` job) covers project upgrades under systemd: projects on older GoTrue and PostgREST releases than the node's pins, kept on them by a node update, an upgrade onto a release that does not start (rolled back), the upgrade that works through the Management API (versions, the running processes, the data and an auth user intact), `supavise projects upgrade --all --yes` and `supavise artifacts gc` (`tests/linux/README.md`).
 
 Go unit tests: `internal/selfupdate` (signature, checksum, atomic replace, refusals, an OpenSSL-made signature fixture), `internal/api/claim_test.go` (the endpoint, single use, expiry, rate limit, concurrent redemption, invites, user removal; the Postgres store runs when `SUPAVISE_TEST_DATABASE_URL` is set), `cmd/supavise/cmd_install_test.go` (flag to config mapping, minimal config rendering, `--set`, OS and glibc checks, EC2 metadata).
 

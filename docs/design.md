@@ -89,7 +89,7 @@ Management API subset: `/v1` projects, api-keys, `database/query`, migrations, `
 curl -fsSL https://get.<name>.dev | sudo bash -s -- --domain example.com --dns cloudflare
 ```
 
-The installer verifies checksums, creates the `supavise` user, writes `/etc/supavise/config.toml`, installs the units, starts `supavise`, and prints the dashboard URL and claim token. Re-running is idempotent and keeps secrets. `supavise self-update` upgrades the binary; artifacts upgrade through `internal/versions/versions.yaml`.
+The installer verifies checksums, creates the `supavise` user, writes `/etc/supavise/config.toml`, installs the units, starts `supavise`, and prints the dashboard URL and claim token. Re-running is idempotent and keeps secrets. `supavise self-update` upgrades the binary; artifacts upgrade through `internal/versions/versions.yaml`, and each project follows the node's pins when its Owner or Administrator upgrades it (Studio, the Management API or `supavise projects upgrade`).
 
 Laptops are not a target. Supabase's own `supabase start --runtime native` already covers local development with the same artifacts, and a project exported from it restores into `supavise`.
 
@@ -99,7 +99,7 @@ Laptops are not a target. Supabase's own `supabase start --runtime native` alrea
 2. The conformance suite stands up a node, creates two projects, and runs the upstream client test suites and Studio smoke tests against both. Green merges.
 3. The three Studio patches rebase in CI on each tag and are proposed upstream.
 4. Nightly diff of the `v1`, `v2` and `platform` OpenAPI specs against our server.
-5. Per-project rolling upgrades with per-project version pinning.
+5. Per-project rolling upgrades with per-project version pinning (`internal/lifecycle/README.md`, "Service versions and project upgrades").
 
 ## 9. Reserved for later, designed in now
 
