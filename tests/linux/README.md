@@ -11,6 +11,7 @@ on a machine you care about; development machines run the exec-backend tests ins
 | `systemd-smoke.sh` | system init, two projects, health (units, user, slice, `MemoryMax` drop-in, GoTrue, PostgREST, bad-JWT rejection, sign-up, no passwordless TCP), pause, resume, key rotation, `kill -9` recovery, delete (units, data, drop-ins gone). Non-zero exit on any failure. |
 | `fleet-smoke.sh` | the shared services under systemd: `sbctl fleet start`, one project registered as a tenant of Supavisor, Realtime and Storage, pooler logins (session and transaction port), Storage bucket, upload and signed-URL download, Realtime channel join, key rotation, `kill -9` of each service, tenant removal, project delete, `fleet stop`. Skips Studio (no slim artifact). |
 | `footprint.sh` | grows to 10, 25 and 50 projects; per size records create time, per-project PSS and RSS, system project PSS, `sbctl.slice` memory, disk per project, resume time and whole-node cold start; prints a markdown table (`$LOG_DIR/footprint.md`). |
+| `install-e2e.sh` | `deploy/install.sh` on a fresh VM and everything after it: signature and checksum refusals, the install, the claim flow, a project through the API with a PAT, REST and Storage through the proxy, the pooler, an idempotent re-run, `sbctl self-update`. See `deploy/README.md`, Tests. |
 | `lib.sh` | shared helpers |
 
 ```
