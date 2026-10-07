@@ -208,3 +208,47 @@ func TestUpdateReport(t *testing.T) {
 		t.Errorf("a paused node must say so:\n%s", out.String())
 	}
 }
+
+// install-units writes supavise-upgrade.timer from the node's [update] settings, and a second run
+// finds nothing to change.
+func TestInstallUnitsRendersTheUpgradeTimerFromTheConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	body := "supervisor = \"exec\"\nstate_dir = " + `"` + dir + `"` + "\n[update]\nmode = \"auto\"\nwindow = \"Sat 02:00-03:00\"\ncheck_interval = \"off\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	units := filepath.Join(dir, "units")
+	args := []string{"--config", cfgPath, "system", "install-units", "--unit-dir", units, "--polkit-dir", ""}
+	out, err := runRoot(t, args...)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	b, err := os.ReadFile(filepath.Join(units, update.TimerUnit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	for _, want := range []string{"OnCalendar=Sat *-*-* 02:00:00", "OnCalendar=Sat *-*-* 02:45:00"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("timer lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "OnBootSec") {
+		t.Errorf("checks are off, so there is no boot check:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(units, update.ServiceUnit)); err != nil {
+		t.Errorf("the service unit was not installed: %v", err)
+	}
+	out, err = runRoot(t, args...)
+	if err != nil || !strings.Contains(out, "units are up to date") {
+		t.Errorf("second run: %v\n%s", err, out)
+	}
+	// A bad window never reaches a unit file.
+	if err := os.WriteFile(cfgPath, []byte(strings.Replace(body, "Sat 02:00-03:00", "someday", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runRoot(t, args...); err == nil {
+		t.Errorf("a bad window was accepted:\n%s", out)
+	}
+}

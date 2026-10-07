@@ -134,7 +134,14 @@ configuration. Run it as the user that owns the state directory (supavise).`,
 			if err != nil {
 				return fmt.Errorf("config backup.base_backup_on_calendar: %w", err)
 			}
-			changed, err := systemd.InstallWith(sysUnitDir, sysPolkitDir, map[string][]byte{backup.BackupTimerUnit: []byte(timer)})
+			upgradeTimer, err := update.RenderTimer(cfg.Update)
+			if err != nil {
+				return fmt.Errorf("config update: %w", err)
+			}
+			changed, err := systemd.InstallWith(sysUnitDir, sysPolkitDir, map[string][]byte{
+				backup.BackupTimerUnit: []byte(timer),
+				update.TimerUnit:       []byte(upgradeTimer),
+			})
 			if err != nil {
 				return err
 			}
@@ -149,7 +156,17 @@ configuration. Run it as the user that owns the state directory (supavise).`,
 				fmt.Fprintln(os.Stderr, "run `systemctl daemon-reload` and enable the system units yourself:", err)
 				return nil
 			}
-			return apply(cmd.Context(), len(changed) > 0)
+			if err := apply(cmd.Context(), len(changed) > 0); err != nil {
+				return err
+			}
+			if sysUnitDir != defaultUnitDir {
+				return nil // a test directory: systemd loads nothing from it
+			}
+			timerChanged := false
+			for _, f := range changed {
+				timerChanged = timerChanged || strings.HasSuffix(f, "/"+update.TimerUnit)
+			}
+			return applyUpgradeTimer(cmd.Context(), cfg, timerChanged, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
 	install.Flags().StringVar(&sysUnitDir, "unit-dir", defaultUnitDir, "where to write unit files")
