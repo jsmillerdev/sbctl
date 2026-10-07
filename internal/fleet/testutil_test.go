@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -90,24 +89,23 @@ func (n *testNode) deps() Deps {
 	return Deps{Cfg: n.cfg, Registry: n.reg, Secrets: n.sec}
 }
 
-// freePorts returns n distinct free loopback ports.
-func freePorts(t *testing.T, n int) []int {
+// listenLoopback returns n listeners on distinct free loopback ports. Serve on them as they
+// are: closing one to bind its port again later races every other socket on the host for it.
+func listenLoopback(t *testing.T, n int) []net.Listener {
 	t.Helper()
-	var ls []net.Listener
-	var ports []int
-	for i := 0; i < n; i++ {
+	ls := make([]net.Listener, n)
+	for i := range ls {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		ls = append(ls, l)
-		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
+		t.Cleanup(func() { l.Close() })
+		ls[i] = l
 	}
-	for _, l := range ls {
-		l.Close()
-	}
-	return ports
+	return ls
 }
+
+func portOf(l net.Listener) int { return l.Addr().(*net.TCPAddr).Port }
 
 // fakeSupervisor records what the Manager asks of it. Start makes the unit "active" and
 // runs the hook registered for it (tests use it to bring a health server up).
@@ -204,20 +202,16 @@ func allArtifacts() fakeArtifacts {
 	return a
 }
 
-// healthServer answers the health path of svc on port with 200 once up() was called.
+// healthServer answers the health path of svc on l with 200 once up() was called.
 type healthServer struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 	up  bool
 }
 
-func serveHealth(t *testing.T, port int, path string) *healthServer {
+func serveHealth(t *testing.T, l net.Listener, path string) *healthServer {
 	t.Helper()
 	h := &healthServer{}
-	l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
-	if err != nil {
-		t.Fatal(err)
-	}
 	h.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		up := h.up
@@ -228,6 +222,7 @@ func serveHealth(t *testing.T, port int, path string) *healthServer {
 		}
 		w.WriteHeader(200)
 	}))
+	h.srv.Listener.Close()
 	h.srv.Listener = l
 	h.srv.Start()
 	t.Cleanup(h.srv.Close)

@@ -3,6 +3,7 @@ package fleet
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,11 +26,15 @@ type managerRig struct {
 func newManagerRig(t *testing.T, mutate func(*Deps)) *managerRig {
 	t.Helper()
 	n := newTestNode(t)
-	ports := freePorts(t, 5)
-	n.cfg.Ports.PGMeta, n.cfg.Ports.Realtime, n.cfg.Ports.Storage, n.cfg.Ports.Studio, n.cfg.Fleet.SupavisorAPIPort = ports[0], ports[1], ports[2], ports[3], ports[4]
+	ls := listenLoopback(t, 5)
+	byPort := map[int]net.Listener{}
+	for _, l := range ls {
+		byPort[portOf(l)] = l
+	}
+	n.cfg.Ports.PGMeta, n.cfg.Ports.Realtime, n.cfg.Ports.Storage, n.cfg.Ports.Studio, n.cfg.Fleet.SupavisorAPIPort = portOf(ls[0]), portOf(ls[1]), portOf(ls[2]), portOf(ls[3]), portOf(ls[4])
 	r := &managerRig{n: n, sup: newFakeSupervisor(), health: map[string]*healthServer{}}
 	for _, svc := range Services {
-		h := serveHealth(t, Port(n.cfg, svc), healthPath(svc))
+		h := serveHealth(t, byPort[Port(n.cfg, svc)], healthPath(svc))
 		r.health[svc] = h
 		r.sup.hooks[unitOf(svc)] = func() { h.setUp(true) }
 	}
