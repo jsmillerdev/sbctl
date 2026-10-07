@@ -274,9 +274,9 @@ with data has these defaults:
    listens on `127.0.0.1` only; GoTrue, PostgREST, the pooler and the fleet connect to it) or the unix socket, which a
    filter on IP addresses does not touch. An earlier release allowed 127.0.0.0/8: the next render of a unit narrows it.
    The IP filter does not touch unix sockets, so the Postgres unit template (`deploy/systemd/sb-postgres@.service`) hides
-   three of them with `InaccessiblePaths`, next to the master key: systemd-resolved's varlink socket
-   (`/run/systemd/resolve/io.systemd.Resolve`, which glibc uses for lookups through `nss-resolve`), the D-Bus system bus
-   (`/run/dbus/system_bus_socket`, where a polkit rule could let the unit lift its own filter) and nscd's socket. They are hidden
+   them with `InaccessiblePaths`: all of `/etc/sbctl` (master key and config) and `/run/dbus` (the system bus, where a
+   polkit rule could let the unit lift its own filter), plus systemd-resolved's varlink socket
+   (`/run/systemd/resolve/io.systemd.Resolve`, which glibc uses for lookups through `nss-resolve`) and nscd's socket. They are hidden
    for every project's Postgres, not only for a branch's: systemd 255 does not let `InaccessiblePaths` of a unit change over D-Bus
    (checked on Ubuntu 24.04), so it cannot depend on the policy, and a Postgres needs none of them. Names then resolve only through
    `/etc/hosts` or a resolver on 127.0.0.1:53 (dnsmasq, unbound), which the loopback allow still reaches. A node installed before
@@ -503,7 +503,7 @@ plus a parent and at most two branches, class micro):
   and signs the user in again, the parent's token still works afterwards; cron jobs name the branch's port and the parent's are
   unchanged; a database with `datallowconn = false` (and one that is a template) has its foreign servers disabled and its Vault
   secret rewritten and keeps its flags. Under systemd `tests/linux/branching-egress.sh` checks that the denied unit hides the resolver
-  socket and D-Bus inside its mount namespace and still hides the master key.
+  socket, nscd's socket, `/run/dbus` and `/etc/sbctl` inside its mount namespace.
 * Outbound isolation: `TestIntegrationCloneIsolatesTheParentsIntegrations` also checks, on the exec backend, that the
   branch reports `egress: unenforced` with a detail that says "egress NOT blocked", that the paused cron job is
   recorded in `sbctl_branch.paused_cron_jobs` (and the table is absent with `keep_cron_jobs`), and that

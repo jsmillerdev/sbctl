@@ -479,7 +479,7 @@ func TestRealtimeWebSocketAcceptedWhileLegacyKeysDisabled(t *testing.T) {
 func TestRealtimeRecheckRetriesAfterFailedLookup(t *testing.T) {
 	h := newHarness(t)
 	serveEchoRealtime(h)
-	h.srv.recheckWait = 10 * time.Millisecond
+	h.srv.recheckWait = 50 * time.Millisecond // retry budget (6 x 50 ms) well above the 60 ms outage below
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c := h.dialRealtime(t, ctx, nil)

@@ -304,3 +304,25 @@ func (r *hookRegistry) SetBranchEgress(ctx context.Context, ref, from, to string
 	}
 	return r.Registry.SetBranchEgress(ctx, ref, from, to)
 }
+
+// Named keys created through the Management API are the parent's too: each becomes the branch's
+// default key of its type, and a revoked key (its value erased) is not looked for.
+func TestCredentialSwapReplacesAPICreatedKeys(t *testing.T) {
+	parent, branch := twoKeySets(t)
+	ref := "pppppppppppppppppppp"
+	sec := secrets.NewSecretKey()
+	pub := secrets.NewPublishableKey()
+	parent.SetRecord(secrets.APIKeyRecord{ID: secrets.KeyID(ref, "cron", secrets.KeyTypeSecret), Name: "cron", Type: secrets.KeyTypeSecret, Key: sec})
+	parent.SetRecord(secrets.APIKeyRecord{ID: secrets.KeyID(ref, "site", secrets.KeyTypePublishable), Name: "site", Type: secrets.KeyTypePublishable, Key: pub})
+	parent.SetRecord(secrets.APIKeyRecord{ID: secrets.KeyID(ref, "old", secrets.KeyTypeSecret), Name: "old", Type: secrets.KeyTypeSecret, Revoked: true})
+	sw := newCredentialSwap(parent, branch)
+
+	got, labels := sw.rewrite(`{"Authorization": "Bearer ` + sec + `"}`)
+	if strings.Contains(got, sec) || !strings.Contains(got, branch.SecretKey) || len(labels) != 1 || labels[0] != "secret_key:cron" {
+		t.Fatalf("named secret key not swapped: %q %v", got, labels)
+	}
+	got, labels = sw.rewrite(pub)
+	if got != branch.PublishableKey || len(labels) != 1 || labels[0] != "publishable_key:site" {
+		t.Fatalf("named publishable key not swapped: %q %v", got, labels)
+	}
+}

@@ -28,7 +28,8 @@ import (
 //
 // What counts as the parent's credential: the legacy anon and service_role JWTs (and any other
 // anon or service_role JWT that verifies against the parent's JWT secret, an older key included),
-// the sb_publishable_ and sb_secret_ keys, the JWT secret, and the parent's six database
+// the sb_publishable_ and sb_secret_ keys (the defaults and every named key created through the
+// Management API, each mapped to the branch's default key of its type), the JWT secret, and the parent's six database
 // passwords. A value is rewritten when it contains one (a "Bearer <key>" header, a connection
 // string), not only when it equals one, except that a credential shorter than
 // minSubstringLen (none that sbctl generates) is matched whole.
@@ -75,6 +76,21 @@ func newCredentialSwap(parent, branch *secrets.ProjectKeys) *credentialSwap {
 	} {
 		if p.old != "" && p.new != "" && p.old != p.new {
 			cs.literals = append(cs.literals, p)
+		}
+	}
+	// Keys created through the Management API (named publishable and secret keys) belong to the
+	// parent too: each maps to the branch's default key of the same type. Revoked keys have no
+	// stored value left to look for.
+	for _, r := range parent.AllRecords() {
+		if r.Default || r.Key == "" {
+			continue
+		}
+		nk := branch.SecretKey
+		if r.Type == secrets.KeyTypePublishable {
+			nk = branch.PublishableKey
+		}
+		if nk != "" && r.Key != nk {
+			cs.literals = append(cs.literals, keyPair{r.Type + "_key:" + r.Name, r.Key, nk})
 		}
 	}
 	if cs.jwtSecret.old == "" || cs.jwtSecret.new == "" || cs.jwtSecret.old == cs.jwtSecret.new {
