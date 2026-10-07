@@ -40,7 +40,7 @@ func (s *Service) Merge(ctx context.Context, idOrRef string, in ActionInput) (st
 	if err != nil {
 		return "", err
 	}
-	if err := s.checkIdle(b); err != nil {
+	if err := s.checkIdle(ctx, b); err != nil {
 		return "", err
 	}
 	if err := s.activeBranch(ctx, b); err != nil {
@@ -118,7 +118,7 @@ func (s *Service) Push(ctx context.Context, idOrRef string, in ActionInput) (str
 	if err != nil {
 		return "", err
 	}
-	if err := s.checkIdle(b); err != nil {
+	if err := s.checkIdle(ctx, b); err != nil {
 		return "", err
 	}
 	if err := s.activeBranch(ctx, b); err != nil {
@@ -221,7 +221,7 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 	if err != nil {
 		return "", err
 	}
-	if err := s.checkIdle(b); err != nil {
+	if err := s.checkIdle(ctx, b); err != nil {
 		return "", err
 	}
 	parent, err := s.activeParent(ctx, b)

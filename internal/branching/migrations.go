@@ -220,8 +220,9 @@ func applyOne(ctx context.Context, q interface {
 			return fmt.Errorf("migration %s (statement %d): %w", m.Version, i+1, err)
 		}
 	}
-	_, err := q.Exec(ctx, `insert into `+migrationsTable+` (version, name, statements) values ($1, nullif($2, ''), $3)
-		on conflict (version) do nothing`, m.Version, m.Name, m.Statements)
+	// A plain insert: a version that is already recorded aborts the transaction instead of
+	// letting its DDL run twice with only one record.
+	_, err := q.Exec(ctx, `insert into `+migrationsTable+` (version, name, statements) values ($1, nullif($2, ''), $3)`, m.Version, m.Name, m.Statements)
 	return err
 }
 
@@ -245,11 +246,31 @@ func (d *pgDatabase) Apply(ctx context.Context, ref string, ms []Migration, o Ap
 		return res, fmt.Errorf("prepare %s: %w", migrationsTable, err)
 	}
 	if o.Atomic {
+		// One merge at a time per project: two would interleave their DDL. The lock belongs to
+		// this session, so it also covers the statement-by-statement fallback below, and it is
+		// released when the connection closes. The decision to apply was made before the lock
+		// was held: look again, so that a version another merge just applied is not run twice.
+		if _, err := c.Exec(ctx, `select pg_advisory_lock(hashtext('sbctl.branching.apply'))`); err != nil {
+			return res, fmt.Errorf("wait for other migrations on %s: %w", ref, err)
+		}
+		versions := make([]string, len(ms))
+		for i, m := range ms {
+			versions[i] = m.Version
+		}
+		rows, err := c.Query(ctx, `select version from `+migrationsTable+` where version = any($1) order by version`, versions)
+		if err != nil {
+			return res, err
+		}
+		have, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return res, err
+		}
+		if len(have) > 0 {
+			return res, fmt.Errorf("%w: %s already applied to %s while this operation waited; read the histories again", ErrDiverged, strings.Join(have, ", "), ref)
+		}
+	}
+	if o.Atomic {
 		err := pgx.BeginFunc(ctx, c, func(tx pgx.Tx) error {
-			// One merge at a time per project: two would interleave their DDL.
-			if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock(hashtext('sbctl.branching.apply'))`); err != nil {
-				return err
-			}
 			for _, m := range ms {
 				if err := applyOne(ctx, tx, m); err != nil {
 					return err

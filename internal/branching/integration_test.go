@@ -9,6 +9,7 @@ package branching
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -466,6 +467,21 @@ func TestIntegrationBranching(t *testing.T) {
 	if fp, _ := st.node.Registry.GetProject(ctx, fromBackup.Ref); fp.Branch == nil || fp.Branch.ParentRef != pref || fp.Name != "from-backup" {
 		t.Fatalf("restored project is not a branch of the parent: %+v", fp)
 	}
+	// Reset of a base-backup branch: the old cluster goes, the row stays, the restore goes into
+	// the kept row, and the branch comes back with the parent's data and the same id and ref.
+	st.exec(fromBackup.Ref, `insert into public.items values (777, 'scratch on the restored branch')`)
+	st.cfg.Branching.Clone = "backup"
+	if _, err := st.svc.Reset(ctx, fromBackup.ID, ActionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	again := st.wait(fromBackup.Ref)
+	st.cfg.Branching.Clone = ""
+	if again.State != registry.BranchMigrationsPassed || again.Ref != fromBackup.Ref || again.ID != fromBackup.ID || again.CloneMethod != MethodBackup {
+		t.Fatalf("reset of the restored branch: %+v", again)
+	}
+	if n := st.count(again.Ref, "public.items"); n != 201 {
+		t.Fatalf("restored branch items after reset = %d, want 201 (the scratch row must be gone)", n)
+	}
 	// The parent's archive is untouched by the restore, and the branch has its own.
 	if _, err := st.svc.Delete(ctx, fromBackup.Ref, DeleteOptions{}); err != nil {
 		t.Fatal(err)
@@ -613,4 +629,291 @@ func cloneMS(res map[string]any) string {
 		return fmt.Sprintf("%d ms (%d files, %d WAL segments)", c.CopyMillis, c.Files, c.WALSegments)
 	}
 	return "n/a (base backup restore)"
+}
+
+// TestIntegrationCloneUnderWriteLoad clones a parent that is being written to and checkpointed
+// the whole time, which is what the low-level backup procedure has to survive: the clone must
+// recover, hold a state between the rows committed before and after, contain no duplicate or
+// corrupt rows or index entries (amcheck), and have an empty unlogged table.
+func TestIntegrationCloneUnderWriteLoad(t *testing.T) {
+	st := newStack(t)
+	ctx := context.Background()
+	if m := os.Getenv("SBCTL_TEST_EXPECT_METHOD"); m == MethodBackup {
+		t.Skip("this filesystem uses the base-backup path; the write-load test covers the file-clone path")
+	}
+	parent, err := st.node.Engine.Create(ctx, lifecycle.CreateRequest{Name: "busy parent", Class: "small"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pref := parent.Ref
+	st.exec(pref, `create table public.w (id bigserial primary key, wr int not null, v int not null, payload text not null);
+		create index w_v on public.w (v);
+		create unlogged table public.u (n int)`)
+
+	const writers = 4
+	conns := make([]*pgx.Conn, writers)
+	for i := range conns {
+		conns[i] = st.conn(pref, "postgres")
+	}
+	admin := st.conn(pref, lifecycle.RoleAdmin)
+	loadCtx, stop := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var loadErrs []error
+	note := func(err error) {
+		if err != nil && loadCtx.Err() == nil {
+			mu.Lock()
+			loadErrs = append(loadErrs, err)
+			mu.Unlock()
+		}
+	}
+	for i, c := range conns {
+		wg.Add(1)
+		go func(i int, c *pgx.Conn) {
+			defer wg.Done()
+			for loadCtx.Err() == nil {
+				// Each writer updates only its own rows: writers must not deadlock with each other.
+				_, err := c.Exec(loadCtx, `insert into public.w (wr, v, payload) select $1, g, repeat('x', 300) from generate_series(1, 25) g`, i)
+				note(err)
+				_, err = c.Exec(loadCtx, `update public.w set v = v + 1 where id in (select id from public.w where wr = $1 order by id desc limit 25)`, i)
+				note(err)
+				_, err = c.Exec(loadCtx, `insert into public.u values (1)`)
+				note(err)
+			}
+		}(i, c)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for loadCtx.Err() == nil {
+			_, err := admin.Exec(loadCtx, `checkpoint`)
+			note(err)
+			select {
+			case <-loadCtx.Done():
+			case <-time.After(150 * time.Millisecond):
+			}
+		}
+	}()
+	probe := st.conn(pref, "postgres")
+	maxID := func() int64 {
+		var n int64
+		if err := probe.QueryRow(ctx, `select coalesce(max(id), 0) from public.w`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	time.Sleep(time.Second)
+	lo := maxID()
+	b := st.createBranch(pref, "under-load", func(in *CreateInput) { in.WithData = true })
+	hi := maxID()
+	stop()
+	wg.Wait()
+	for _, err := range loadErrs {
+		t.Errorf("writer: %v", err)
+	}
+	t.Logf("clone method %s; parent ids committed before the clone %d, after %d: %s", b.CloneMethod, lo, hi, b.Detail)
+	if b.CloneMethod != MethodClonefile && b.CloneMethod != MethodReflink {
+		t.Fatalf("method = %s, want a file clone", b.CloneMethod)
+	}
+
+	var maxB, n, distinct int64
+	bc := st.conn(b.Ref, "postgres")
+	if err := bc.QueryRow(ctx, `select coalesce(max(id), 0), count(*), count(distinct id) from public.w`).Scan(&maxB, &n, &distinct); err != nil {
+		t.Fatal(err)
+	}
+	if maxB < lo || maxB > hi {
+		t.Errorf("the clone's newest id %d is outside the window [%d, %d] committed around the clone", maxB, lo, hi)
+	}
+	if n != distinct {
+		t.Errorf("the clone has %d rows but %d distinct ids", n, distinct)
+	}
+	if n < lo/2 { // sequences skip ids of rolled back inserts, but not by half
+		t.Errorf("the clone has only %d rows for ids up to %d", n, maxB)
+	}
+	ba := st.conn(b.Ref, lifecycle.RoleAdmin)
+	if _, err := ba.Exec(ctx, `create extension if not exists amcheck`); err != nil {
+		t.Fatalf("amcheck: %v", err)
+	}
+	if _, err := ba.Exec(ctx, `select bt_index_check(index => 'public.w_pkey'::regclass, heapallindexed => true), bt_index_check(index => 'public.w_v'::regclass, heapallindexed => true)`); err != nil {
+		t.Errorf("index check on the clone: %v", err)
+	}
+	var bad int
+	if err := ba.QueryRow(ctx, `select count(*) from verify_heapam('public.w')`).Scan(&bad); err != nil || bad != 0 {
+		t.Errorf("verify_heapam on the clone: %d problems (%v)", bad, err)
+	}
+	var unlogged int
+	if err := bc.QueryRow(ctx, `select count(*) from public.u`).Scan(&unlogged); err != nil || unlogged != 0 {
+		t.Errorf("the unlogged table has %d rows on the clone, want 0 (%v)", unlogged, err)
+	}
+	var tl int
+	if err := ba.QueryRow(ctx, `select timeline_id from pg_control_checkpoint()`).Scan(&tl); err != nil || tl != 1 {
+		t.Errorf("clone timeline = %d (%v), want 1", tl, err)
+	}
+	if _, err := st.svc.Delete(ctx, b.Ref, DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestIntegrationCloneIsolatesTheParentsIntegrations gives the parent an enabled logical
+// replication subscription (aimed at nothing that exists) and a pg_cron job, clones it, and
+// checks that the branch has neither running: subscription disabled and detached from its slot,
+// job inactive, and the node's ordinary settings back after the first start.
+func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
+	st := newStack(t)
+	ctx := context.Background()
+	parent, err := st.node.Engine.Create(ctx, lifecycle.CreateRequest{Name: "integrated parent", Class: "small"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pref := parent.Ref
+	admin := st.conn(pref, lifecycle.RoleAdmin)
+	for _, q := range []string{
+		`create table public.t (id int primary key)`,
+		`insert into public.t values (1), (2)`,
+		// connect = false makes the subscription without contacting a publisher; it is then given
+		// a slot name and enabled, which is what a live subscription looks like in the data
+		// directory (subenabled, subslotname, subconninfo).
+		`create subscription sbctl_dummy connection 'host=127.0.0.1 port=1 dbname=nowhere user=nobody' publication nothing with (connect = false)`,
+		`alter subscription sbctl_dummy set (slot_name = 'sbctl_dummy_slot')`,
+		`alter subscription sbctl_dummy enable`,
+	} {
+		if _, err := admin.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	cron := true
+	if _, err := admin.Exec(ctx, `create extension if not exists pg_cron`); err != nil {
+		t.Logf("pg_cron is not usable on this cluster, the cron assertions are skipped: %v", err)
+		cron = false
+	} else if _, err := admin.Exec(ctx, `select cron.schedule('sbctl-test-job', '* * * * *', 'select 1')`); err != nil {
+		t.Logf("cannot schedule a pg_cron job, the cron assertions are skipped: %v", err)
+		cron = false
+	}
+	var enabled bool
+	if err := admin.QueryRow(ctx, `select subenabled from pg_subscription where subname = 'sbctl_dummy'`).Scan(&enabled); err != nil || !enabled {
+		t.Fatalf("the parent's subscription: enabled=%v err=%v", enabled, err)
+	}
+	var parentWorkers string
+	if err := admin.QueryRow(ctx, `show max_logical_replication_workers`).Scan(&parentWorkers); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `checkpoint`); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("SBCTL_TEST_EXPECT_METHOD") == MethodBackup {
+		if _, err := st.bk.BaseBackup(ctx, pref); err != nil {
+			t.Fatalf("base backup of the parent: %v", err)
+		}
+	}
+
+	check := func(b *Branch, keepJobs bool) {
+		t.Helper()
+		ba := st.conn(b.Ref, lifecycle.RoleAdmin)
+		var subs int
+		var slot *string
+		var on bool
+		if err := ba.QueryRow(ctx, `select count(*), bool_or(subenabled), max(subslotname) from pg_subscription where subname = 'sbctl_dummy'`).Scan(&subs, &on, &slot); err != nil {
+			t.Fatal(err)
+		}
+		if subs != 1 || on || slot != nil {
+			t.Errorf("branch %s: subscriptions=%d enabled=%v slot=%v, want 1 disabled, detached", b.Name, subs, on, slot)
+		}
+		if cron {
+			var active bool
+			if err := ba.QueryRow(ctx, `select active from cron.job where jobname = 'sbctl-test-job'`).Scan(&active); err != nil {
+				t.Fatal(err)
+			}
+			if active != keepJobs {
+				t.Errorf("branch %s: cron job active = %v, want %v", b.Name, active, keepJobs)
+			}
+		}
+		// The first-start settings are gone and the cluster runs with the node's settings.
+		var workers, launch string
+		if err := ba.QueryRow(ctx, `show max_logical_replication_workers`).Scan(&workers); err != nil || workers != parentWorkers {
+			t.Errorf("branch %s: max_logical_replication_workers = %q (%v), want %q", b.Name, workers, err, parentWorkers)
+		}
+		if cron {
+			if err := ba.QueryRow(ctx, `show cron.launch_active_jobs`).Scan(&launch); err != nil || launch != "on" {
+				t.Errorf("branch %s: cron.launch_active_jobs = %q (%v)", b.Name, launch, err)
+			}
+		}
+		if conf, _ := os.ReadFile(filepath.Join(st.cfg.Paths().ProjectService(b.Ref, config.SvcPostgres), "data", "postgresql.auto.conf")); strings.Contains(string(conf), quarantineMark) {
+			t.Errorf("branch %s: first-start settings left in postgresql.auto.conf:\n%s", b.Name, conf)
+		}
+		// The parent is untouched.
+		var penabled bool
+		if err := admin.QueryRow(ctx, `select subenabled from pg_subscription where subname = 'sbctl_dummy'`).Scan(&penabled); err != nil || !penabled {
+			t.Errorf("the parent's subscription changed: enabled=%v err=%v", penabled, err)
+		}
+		if n := st.count(b.Ref, "public.t"); n != 2 {
+			t.Errorf("branch %s has %d rows, want 2", b.Name, n)
+		}
+	}
+	b := st.createBranch(pref, "isolated", func(in *CreateInput) { in.WithData = true })
+	t.Logf("method %s", b.CloneMethod)
+	check(b, false)
+	evs, _ := st.node.Registry.ListEvents(ctx, b.Ref, 50)
+	var isolated bool
+	for _, e := range evs {
+		var res IsolateResult
+		if e.Kind == "branch.isolated" && json.Unmarshal(e.Payload, &res) == nil && res.Subscriptions == 1 {
+			isolated = true
+			if cron && res.CronJobs != 1 {
+				t.Errorf("isolation deactivated %d cron jobs, want 1", res.CronJobs)
+			}
+		}
+	}
+	if !isolated {
+		t.Errorf("no branch.isolated event with one subscription in %d events", len(evs))
+	}
+
+	// keep_cron_jobs leaves the jobs as the parent had them; subscriptions are always detached.
+	st.cfg.Branching.KeepCronJobs = true
+	kept := st.createBranch(pref, "keeps-jobs", func(in *CreateInput) { in.WithData = true })
+	check(kept, true)
+}
+
+// A version that another merge applied while this one waited for the lock is refused, not run
+// a second time.
+func TestIntegrationApplyRefusesAVersionAlreadyApplied(t *testing.T) {
+	st := newStack(t)
+	ctx := context.Background()
+	parent, err := st.node.Engine.Create(ctx, lifecycle.CreateRequest{Name: "p", Class: "micro"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := Migration{Version: "20260201000000", Name: "t", Statements: []string{"create table public.once (id int)"}}
+	opts := ApplyOptions{Atomic: true, LockTimeout: 10 * time.Second}
+	if _, err := st.svc.db.Apply(ctx, parent.Ref, []Migration{m}, opts); err != nil {
+		t.Fatal(err)
+	}
+	// The same version again: the DDL would fail anyway, which is why the check comes before it.
+	m2 := Migration{Version: m.Version, Name: "t", Statements: []string{"insert into public.once values (1)"}}
+	_, err = st.svc.db.Apply(ctx, parent.Ref, []Migration{m2}, opts)
+	if !errors.Is(err, ErrDiverged) {
+		t.Fatalf("second apply = %v, want ErrDiverged", err)
+	}
+	if n := st.count(parent.Ref, "public.once"); n != 0 {
+		t.Fatalf("the refused migration ran: %d rows", n)
+	}
+	// Two applies of the same new version at once: one wins, the other is refused after the lock.
+	m3 := Migration{Version: "20260202000000", Name: "race", Statements: []string{"select pg_sleep(1)", "create table public.raced (id int)"}}
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() { _, err := st.svc.db.Apply(ctx, parent.Ref, []Migration{m3}, opts); errs <- err }()
+	}
+	var ok, diverged int
+	for i := 0; i < 2; i++ {
+		switch err := <-errs; {
+		case err == nil:
+			ok++
+		case errors.Is(err, ErrDiverged):
+			diverged++
+		default:
+			t.Errorf("racing apply: %v", err)
+		}
+	}
+	if ok != 1 || diverged != 1 {
+		t.Fatalf("racing applies: %d succeeded, %d refused (want 1 and 1)", ok, diverged)
+	}
 }

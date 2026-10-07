@@ -8,13 +8,16 @@ package branching
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/OWNER/sbctl/internal/backup"
@@ -69,6 +72,12 @@ type Service struct {
 	http *http.Client
 
 	createWait, opTimeout, staleAfter time.Duration
+
+	// instance, host and pid say who runs this service's operations: they are recorded in
+	// the started event of every operation, so that another process (the sweeper of a
+	// restarted daemon) can tell an abandoned operation from one that is still running.
+	instance, host string
+	pid            int
 
 	// Seams for tests.
 	detect func(srcData, dstParent string) (method, fsys, reason string)
@@ -130,6 +139,8 @@ func New(d Deps) (*Service, error) {
 	s.detect = func(srcData, dstParent string) (string, string, string) {
 		return detectClone(srcData, dstParent)
 	}
+	s.instance, s.pid = newUUID(), os.Getpid()
+	s.host, _ = os.Hostname()
 	s.rotate = s.rotateCredentials
 	s.isolate = s.isolateBranch
 	s.clone = s.cloneParent
@@ -328,15 +339,78 @@ func (s *Service) running(ref string) (string, bool) {
 }
 
 // checkIdle refuses an operation on a branch that is busy, here or (by its registry
-// state) in another process.
-func (s *Service) checkIdle(b *Branch) error {
+// state) in another process whose operation is not known to be abandoned.
+func (s *Service) checkIdle(ctx context.Context, b *Branch) error {
 	if op, ok := s.running(b.Ref); ok {
 		return conflict("branch %s is busy with %s", b.Name, op)
 	}
-	if busy(b.State) && s.now().Sub(b.UpdatedAt) < s.staleAfter {
+	if busy(b.State) && !s.abandoned(ctx, b) {
 		return conflict("branch %s is busy (%s)", b.Name, b.State)
 	}
 	return nil
+}
+
+// abandoned reports whether a branch whose registry state is busy has no process working on
+// it: no operation runs here, and either its state has not changed for staleAfter, or the
+// process that started the operation (recorded in its started event) is gone.
+func (s *Service) abandoned(ctx context.Context, b *Branch) bool {
+	if !busy(b.State) {
+		return false
+	}
+	if _, ok := s.running(b.Ref); ok {
+		return false
+	}
+	return s.now().Sub(b.UpdatedAt) >= s.staleAfter || s.ownerGone(ctx, b.Ref)
+}
+
+// ownerGone reports whether the process that started the newest operation on ref is known to
+// be gone: it ran on this host with a pid that no longer exists, or it was an earlier service
+// of this very process. A missing record (an older version) or another host is "not known".
+func (s *Service) ownerGone(ctx context.Context, ref string) bool {
+	evs, err := s.reg.ListEvents(ctx, ref, 50) // newest first
+	if err != nil {
+		return false
+	}
+	for _, e := range evs {
+		if !strings.HasPrefix(e.Kind, "branch.") {
+			continue
+		}
+		if strings.HasSuffix(e.Kind, ".succeeded") || strings.HasSuffix(e.Kind, ".failed") {
+			return false // the newest operation finished; the busy state is not its doing
+		}
+		if !strings.HasSuffix(e.Kind, ".started") {
+			continue
+		}
+		var pl struct {
+			Owner *struct {
+				Host     string `json:"host"`
+				PID      int    `json:"pid"`
+				Instance string `json:"instance"`
+			} `json:"owner"`
+		}
+		if json.Unmarshal(e.Payload, &pl) != nil || pl.Owner == nil || pl.Owner.PID <= 0 {
+			return false
+		}
+		o := pl.Owner
+		if o.Host != s.host {
+			return false
+		}
+		if o.PID == s.pid {
+			return o.Instance != s.instance // an earlier service of this process cannot still be working
+		}
+		return !pidAlive(o.PID)
+	}
+	return false
+}
+
+// pidAlive reports whether a process with the pid exists (signal 0 tests without sending).
+func pidAlive(pid int) bool {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = p.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // WaitIdle blocks until no operation runs on ref (here, or by registry state elsewhere).

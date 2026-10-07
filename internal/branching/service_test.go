@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -842,5 +843,73 @@ func TestQuarantineSettingsComeAndGo(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(empty, "postgresql.auto.conf")); !strings.Contains(string(b), "cron.launch_active_jobs") {
 		t.Fatalf("written: %q", b)
+	}
+}
+
+// A branch interrupted by a crash is recovered at once when the process that started the
+// operation is known to be gone, not only after staleAfter.
+func TestAbandonedOperationIsRecoveredWithoutWaiting(t *testing.T) {
+	deadPID := func() int {
+		cmd := exec.Command("true")
+		if err := cmd.Run(); err != nil {
+			t.Skipf("cannot start a process to get a dead pid: %v", err)
+		}
+		return cmd.Process.Pid
+	}()
+	ctx := context.Background()
+	host, _ := os.Hostname()
+	cases := []struct {
+		name  string
+		owner map[string]any
+		gone  bool
+	}{
+		{"dead pid on this host", map[string]any{"host": host, "pid": deadPID, "instance": "old"}, true},
+		{"an earlier service of this process", map[string]any{"host": host, "pid": os.Getpid(), "instance": "earlier"}, true},
+		{"a live process on this host", map[string]any{"host": host, "pid": os.Getppid(), "instance": "other"}, false},
+		{"another host", map[string]any{"host": host + "-elsewhere", "pid": deadPID, "instance": "old"}, false},
+		{"no record", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t, nil) // its own clock: the time rule below moves it
+			b := h.create("x", nil)
+			// An operation that started, and never finished.
+			if c.owner != nil {
+				h.svc.event(ctx, b.Ref, "branch.merge.started", map[string]any{"operation": "merge", "owner": c.owner})
+			} else {
+				h.svc.event(ctx, b.Ref, "branch.merge.started", map[string]any{"operation": "merge"})
+			}
+			h.svc.setState(ctx, b.Ref, registry.BranchRunningMigration, "merging", nil)
+			// No time has passed: only a known-dead owner makes it abandoned.
+			_, mergeErr := h.svc.Merge(ctx, b.Ref, ActionInput{})
+			if c.gone != (mergeErr == nil) {
+				t.Fatalf("merge after the crash: %v (abandoned = %v)", mergeErr, c.gone)
+			}
+			if !c.gone {
+				res, _ := h.svc.Sweep(ctx, false)
+				if len(res.Stale) != 0 {
+					t.Fatalf("swept a branch whose owner may be alive: %+v", res)
+				}
+				h.advance(time.Hour)
+				if res, _ := h.svc.Sweep(ctx, false); len(res.Stale) != 1 {
+					t.Fatalf("the time rule still applies: %+v", res)
+				}
+				return
+			}
+			// Merge ran and finished: the branch is idle again, not stale.
+			h.wait(b.Ref)
+			if got, _ := h.svc.Resolve(ctx, b.Ref); busy(got.State) {
+				t.Fatalf("state = %s", got.State)
+			}
+			// The sweeper fails a fresh abandoned operation without waiting, too.
+			h.svc.event(ctx, b.Ref, "branch.push.started", map[string]any{"operation": "push", "owner": c.owner})
+			h.svc.setState(ctx, b.Ref, registry.BranchRunningMigration, "pushing", nil)
+			if res, _ := h.svc.Sweep(ctx, false); len(res.Stale) != 1 || res.Stale[0] != b.Ref {
+				t.Fatalf("sweep: %+v", res)
+			}
+			if got, _ := h.svc.Resolve(ctx, b.Ref); got.State != registry.BranchMigrationsFailed {
+				t.Fatalf("state = %s", got.State)
+			}
+		})
 	}
 }

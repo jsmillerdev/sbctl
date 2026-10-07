@@ -45,7 +45,9 @@ type SweepResult struct {
 
 // Sweep deletes non-persistent branches past expires_at and branches whose scheduled
 // deletion has come, without a final backup unless the branch is persistent, and marks
-// operations that no process has worked on for [StaleAfter] as failed. dryRun only reports.
+// operations that no process works on as failed: the process that started one is gone (same
+// host, pid no longer exists), or the branch has been busy for [StaleAfter] with no change.
+// dryRun only reports.
 func (s *Service) Sweep(ctx context.Context, dryRun bool) (*SweepResult, error) {
 	all, err := s.reg.ListProjects(ctx)
 	if err != nil {
@@ -62,7 +64,7 @@ func (s *Service) Sweep(ctx context.Context, dryRun bool) (*SweepResult, error) 
 		if _, running := s.running(p.Ref); running {
 			continue
 		}
-		if busy(b.State) && now.Sub(b.UpdatedAt) >= s.staleAfter {
+		if s.abandoned(ctx, b) {
 			res.Stale = append(res.Stale, p.Ref)
 			if !dryRun {
 				s.setState(ctx, p.Ref, registry.BranchMigrationsFailed, "interrupted: no process was working on this operation (the daemon stopped?)", nil)
@@ -70,7 +72,7 @@ func (s *Service) Sweep(ctx context.Context, dryRun bool) (*SweepResult, error) 
 			continue
 		}
 		if busy(b.State) {
-			continue // another process (the CLI) is working on it; a stale one was handled above
+			continue // another process (the CLI) is working on it
 		}
 		lapsed := (!b.Persistent && b.ExpiresAt != nil && !b.ExpiresAt.After(now)) ||
 			(b.DeletionScheduledAt != nil && !b.DeletionScheduledAt.After(now))
