@@ -15,7 +15,15 @@
 #      server, its pg_cron job is inactive and recorded, and the parent's job is untouched;
 #   3. the restriction survives a pause and resume, and a reset (which recreates the cluster);
 #   4. a branch created with --allow-egress reaches the server and keeps its cron job active;
-#   5. deleting a branch lifts the restriction from the unit (a later project with the ref gets none).
+#   5. deleting a branch lifts the restriction from the unit (a later project with the ref gets none);
+#   6. the loopback allow is 127.0.0.1 and ::1 only: from the branch's Postgres a pg_net request to
+#      127.0.0.1 is answered (clients of the cluster, pg_cron included, keep working) and one to
+#      127.0.0.2 (the rest of 127.0.0.0/8, where systemd-resolved's stub lives) is dropped;
+#   7. a parent with a loopback postgres_fdw server to another project and a Vault secret that holds
+#      its own service key: in the branch the foreign table cannot write (the server is disabled and
+#      its password dropped, recorded in sbctl_branch.paused_foreign_servers), the Vault secret holds
+#      the branch's service key, the other project is not written to, and the parent's own foreign
+#      table and secret are untouched. The same holds after a reset.
 #
 # Runs as root on an ephemeral Ubuntu 24.04 VM with systemd. No Docker. Artifacts come from the
 # releases pinned in versions.yaml (sbctl system init).
@@ -75,9 +83,9 @@ sql() { # REF SQL: run SQL as the superuser over the cluster's own socket, print
   sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$ref/postgres/sock port=$port user=supabase_admin dbname=postgres" \
     -qAtX -v ON_ERROR_STOP=1 -c "$2" </dev/null
 }
-net_request() { # REF TAG: pg_net GET to the test server; prints "<status>|<error>" once the response row exists
-  local ref=$1 tag=$2 id row=
-  id=$(sql "$ref" "select net.http_get('http://$HOSTIP:$HTTP_PORT/?who=$tag')") || fail "$ref: net.http_get failed"
+net_request() { # REF TAG [HOST]: pg_net GET to the test server; prints "<status>|<error>" once the response row exists
+  local ref=$1 tag=$2 host=${3:-$HOSTIP} id row=
+  id=$(sql "$ref" "select net.http_get('http://$host:$HTTP_PORT/?who=$tag')") || fail "$ref: net.http_get failed"
   for ((i = 0; i < 40; i++)); do
     row=$(sql "$ref" "select coalesce(status_code::text, ''), coalesce(error_msg, '') from net._http_response where id = $id")
     [[ -n "$row" ]] && break
@@ -96,6 +104,24 @@ log "parent $A"
 sql "$A" "create extension if not exists pg_net; create extension if not exists pg_cron;
   create table public.items (id int primary key); insert into public.items select generate_series(1, 100);
   select cron.schedule('egress-test-job', '* * * * *', 'select 1');" >/dev/null || fail "$A: could not set up pg_net, pg_cron and data"
+
+# A second project the parent reaches through a loopback postgres_fdw server, and a Vault secret that
+# holds the parent's own service key (the cron-to-functions pattern keeps it there).
+D=$(create_project egress-other micro)
+DPORT=$(project_field "$D" 'd["ports"]["Postgres"]')
+DPW=$(project_field "$D" 'd["keys"]["db_password"]' --show-keys)
+A_SERVICE=$(project_field "$A" 'd["keys"]["service_role_key"]' --show-keys)
+sql "$D" "create table public.victim (id int primary key, v text); insert into public.victim values (1, 'orig');" >/dev/null || fail "$D: could not set up the other project"
+sql "$A" "create extension if not exists postgres_fdw;
+  create server other_pg foreign data wrapper postgres_fdw options (host '127.0.0.1', port '$DPORT', dbname 'postgres');
+  create user mapping for public server other_pg options (user 'postgres', password '$DPW');
+  create foreign table public.victim_ft (id int, v text) server other_pg options (schema_name 'public', table_name 'victim');
+  create extension if not exists supabase_vault cascade;
+  select vault.create_secret('$A_SERVICE', 'parent_service_key');
+  insert into public.victim_ft values (2, 'written by the parent');" >/dev/null || fail "$A: could not set up postgres_fdw and the Vault secret"
+[[ $(sql "$D" "select count(*) from public.victim") == 2 ]] || fail "control: the parent's foreign table did not write to the other project"
+log "control ok: the parent writes to $D through postgres_fdw"
+
 row=$(net_request "$A" parent)
 [[ $row == "200|" ]] || fail "control: the parent's own pg_net request to the test server answered '$row', want '200|' (the test cannot tell anything otherwise)"
 [[ $(served parent) -ge 1 ]] || fail "control: the test server never saw the parent's request"
@@ -115,7 +141,9 @@ B=$(create_branch egress-denied)
 PGB="sb-postgres@$B.service"
 deny=$(unit_prop IPAddressDeny "$PGB") allow=$(unit_prop IPAddressAllow "$PGB")
 [[ $deny == *0.0.0.0/0* && $deny == *::/0* ]] || fail "$PGB: IPAddressDeny is '$deny', want the whole address space"
-[[ $allow == *127.0.0.0/8* && $allow == *::1* ]] || fail "$PGB: IPAddressAllow is '$allow', want loopback"
+# systemd prints a full-length prefix without it: 127.0.0.1/32 as 127.0.0.1, ::1/128 as ::1.
+allow_norm=$(printf '%s\n' $allow | sed -e 's#/32$##' -e 's#/128$##' | LC_ALL=C sort | tr '\n' ' ')
+[[ $allow_norm == "127.0.0.1 ::1 " ]] || fail "$PGB: IPAddressAllow is '$allow', want exactly 127.0.0.1 and ::1 (not 127.0.0.0/8: 127.0.0.53 is the DNS stub)"
 for svc in gotrue postgrest; do
   [[ -z $(unit_prop IPAddressDeny "sb-$svc@$B.service") ]] || fail "sb-$svc@$B has an egress restriction (only the cluster's Postgres should)"
 done
@@ -133,6 +161,52 @@ row=$(net_request "$B" branch-denied)
 [[ $(served branch-denied) -eq 0 ]] || fail "$B: the test server saw the branch's request, so egress is not blocked"
 log "$B: pg_net request failed as it must ($row)"
 
+# The allow list is the two loopback addresses and nothing else: the test server listens on every
+# address, so 127.0.0.1 (allowed) and 127.0.0.2 (the rest of 127.0.0.0/8, dropped) tell them apart.
+row=$(net_request "$B" branch-lo1 127.0.0.1)
+[[ $row == "200|" && $(served branch-lo1) -ge 1 ]] || fail "$B: a pg_net request to 127.0.0.1 answered '$row'; loopback must stay reachable"
+row=$(net_request "$B" branch-lo2 127.0.0.2)
+[[ $row == '|'?* && $(served branch-lo2) -eq 0 ]] || fail "$B: a pg_net request to 127.0.0.2 answered '$row' or reached the server; only 127.0.0.1 and ::1 may be allowed"
+log "$B: 127.0.0.1 is reachable, 127.0.0.2 is not"
+# pg_cron connects back to the cluster over loopback (or the socket): a job that runs proves it works behind the filter.
+sql "$B" "select cron.schedule('egress-loopback-job', '* * * * *', 'select 1')" >/dev/null || fail "$B: could not schedule a cron job"
+ok=
+for ((i = 0; i < 100; i++)); do
+  [[ $(sql "$B" "select count(*) from cron.job_run_details d join cron.job j using (jobid) where j.jobname = 'egress-loopback-job' and d.status = 'succeeded'") -ge 1 ]] && { ok=1; break; }
+  sleep 2
+done
+[[ -n $ok ]] || fail "$B: a pg_cron job did not run behind the egress filter: $(sql "$B" "select coalesce(string_agg(status || ': ' || coalesce(return_message, ''), '; '), 'no runs') from cron.job_run_details")"
+sql "$B" "select cron.unschedule('egress-loopback-job')" >/dev/null
+
+# Foreign servers and parent credentials in the data.
+check_isolated_data() { # BRANCH: the foreign server is disabled, the Vault secret is the branch's own, the other project is untouched
+  local b=$1 host passwords secret bsvc
+  host=$(sql "$b" "select (select split_part(o, '=', 2) from unnest(srvoptions) o where o like 'host=%') from pg_foreign_server where srvname = 'other_pg'")
+  [[ $host == /nonexistent/sbctl-branch-disabled ]] || fail "$b: the foreign server other_pg has host '$host', want it disabled"
+  passwords=$(sql "$b" "select count(*) from pg_user_mappings m, unnest(m.umoptions) o where m.srvname = 'other_pg' and o like 'password=%'")
+  [[ $passwords == 0 ]] || fail "$b: $passwords user mapping password(s) of other_pg remain"
+  if sql "$b" "insert into public.victim_ft values (3, 'written by the branch')" >/dev/null 2>&1; then
+    fail "$b: the foreign table accepted a write"
+  fi
+  [[ $(sql "$D" "select count(*) from public.victim") == 2 ]] || fail "$b: the other project $D was written to"
+  [[ $(sql "$b" "select original_host || ':' || original_port || ' ' || passwords_dropped_for::text from sbctl_branch.paused_foreign_servers where server_name = 'other_pg'") == "127.0.0.1:$DPORT {public}" ]] \
+    || fail "$b: other_pg is not recorded in sbctl_branch.paused_foreign_servers"
+  [[ $(sql "$b" "select count(*) from sbctl_branch.paused_foreign_servers t where t::text like '%$DPW%'") == 0 ]] || fail "$b: the stored password is in sbctl_branch.paused_foreign_servers"
+  bsvc=$(project_field "$b" 'd["keys"]["service_role_key"]' --show-keys)
+  secret=$(sql "$b" "select decrypted_secret from vault.decrypted_secrets where name = 'parent_service_key'")
+  [[ $bsvc != "$A_SERVICE" && -n $bsvc ]] || fail "$b: the branch has the parent's service key"
+  [[ $secret == "$bsvc" ]] || fail "$b: the Vault secret is not the branch's service key (it is the parent's: $([[ $secret == "$A_SERVICE" ]] && echo yes || echo no))"
+  [[ $(sql "$b" "select count(*) from sbctl_branch.rewritten_credentials where kind = 'vault_secret' and name = 'parent_service_key'") == 1 ]] || fail "$b: the rewritten secret is not recorded by name"
+  [[ $(sql "$b" "select count(*) from sbctl_branch.rewritten_credentials t where t::text like '%$A_SERVICE%' or t::text like '%$bsvc%'") == 0 ]] || fail "$b: sbctl_branch.rewritten_credentials holds a key"
+}
+check_isolated_data "$B"
+# The parent is untouched: its foreign table still writes, its secret is still its own key.
+sql "$A" "insert into public.victim_ft values (4, 'parent again')" >/dev/null || fail "the parent's foreign table stopped working"
+[[ $(sql "$D" "select count(*) from public.victim") == 3 ]] || fail "the parent's write after the branch did not reach the other project"
+[[ $(sql "$A" "select decrypted_secret from vault.decrypted_secrets where name = 'parent_service_key'") == "$A_SERVICE" ]] || fail "the parent's Vault secret changed"
+sql "$D" "delete from public.victim where id = 4" >/dev/null
+log "$B: foreign server disabled, Vault secret is the branch's own, the parent's fdw and secret are untouched"
+
 log "the restriction survives a pause and resume"
 sbctl projects pause "$B"
 sbctl projects resume "$B"
@@ -146,6 +220,7 @@ sbctl branches reset "$B"
 [[ $(branch_json "$B" 'd.get("egress", "")') == denied ]] || fail "$B: egress after reset is '$(branch_json "$B" 'd.get("egress", "")')', want denied"
 [[ $(unit_prop IPAddressDeny "$PGB") == *0.0.0.0/0* ]] || fail "$PGB: no restriction after reset"
 [[ $(sql "$B" "select active from cron.job where jobname = 'egress-test-job'") == f ]] || fail "$B: the cron job is active after reset"
+check_isolated_data "$B"
 row=$(net_request "$B" branch-denied-after-reset)
 [[ $row == '|'?* && $(served branch-denied-after-reset) -eq 0 ]] || fail "$B: after reset a pg_net request answered '$row' or reached the server"
 

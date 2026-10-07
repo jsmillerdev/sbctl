@@ -46,7 +46,12 @@ parent), `git_branch`, `persistent`, `with_data`, `expires_at`, `deletion_schedu
 `notify_url`, `branch_state`, `branch_detail`, `clone_method`, `review_requested_at`.
 `registry.Project.Branch` (`*registry.BranchInfo`) is set on branches only.
 `Registry.UpdateBranch` writes the branch fields and nothing else, so a status change made by
-the lifecycle at the same moment is not overwritten.
+the lifecycle at the same moment is not overwritten. That includes the egress policy
+(`branch_egress`): `UpdateBranch` never writes it, so a PATCH, a restore or a status change that
+read the row earlier cannot put a stale policy back. The policy is part of the row a create inserts
+and is changed afterwards only through `Registry.SetBranchEgress(ref, from, to)`, a compare-and-set
+(`ErrConflict` when the policy is no longer `from`) used by reset and by the end of isolation
+(`denyEgress`, pending to denied).
 
 Branches are hidden from `GET /v1/projects` and `GET /platform/projects` and reported under
 their parent (`preview_branch_refs`); they open by ref like any project (`parent_project_ref`
@@ -141,6 +146,22 @@ start (the clone path replaces them before the project is created; `backup.Resto
 the same), so the parent's service key never works on the branch. Only the six role passwords are
 the parent's until the rotation finishes.
 
+**The parent's credentials inside the data**: the data also holds credentials where the parent's
+own setup put them, and a branch can reach the node's loopback, so a cloned service key is a key to
+the parent that whoever runs SQL in the branch can read. After the rotation, `rewriteCredentials`
+(`credswap.go`) replaces, with the branch's corresponding value, every parent credential it finds
+in three places: Vault secrets (`vault.decrypted_secrets`, rewritten with `vault.update_secret`),
+the commands of pg_cron jobs (paused or not), and database and role settings
+(`pg_db_role_setting`, for example `app.settings.service_role_key`). A parent credential is the
+legacy anon and service_role JWTs, any other anon or service_role JWT that verifies against the
+parent's JWT secret (an older key, expired or not), the `sb_publishable_` and `sb_secret_` keys,
+the JWT secret, and the parent's six database passwords. A value is rewritten when it contains one
+(`Bearer <key>`, a connection string), not only when it equals one; a credential shorter than 20
+characters (sbctl generates none) is matched whole. What was replaced is recorded by name, never
+by value: the event `branch.credentials_rewritten` and the table `sbctl_branch.rewritten_credentials`
+(kind, name, which credentials). A failure stops the branch like a failed rotation. Not detected:
+see "What a branch with data can and cannot reach".
+
 **Isolation from the parent's integrations**: a copy of the data directory carries every outbound
 connection of the parent, and a branch that kept them would act as a second parent toward those
 systems. A logical replication subscription is copied enabled with the same slot name, so the
@@ -162,23 +183,60 @@ like a failed rotation). A pg_cron job that was paused is recorded in `sbctl_bra
 database that holds `cron.job` (`jobid`, `jobname`, `schedule`, `database`, `username`, `paused_at`), so that
 whoever owns the branch can opt in later:
 `update cron.job set active = true where jobid in (select jobid from sbctl_branch.paused_cron_jobs);`.
+Re-activating a job is not enough to make it behave as in the parent, because two things inside
+its command were changed: a connection string written as a literal (`dblink('host=... password=...', ...)`)
+was replaced by a disabled one (the jobs are in `sbctl_branch.neutralized_cron_commands`; the original
+is not kept, it may hold a password), and a parent credential (an API key, a JWT secret, a database
+password) was replaced by the branch's own (`sbctl_branch.rewritten_credentials`). A job that reaches a
+foreign server by name needs that server turned on again (next paragraph).
 Tested on real clusters (`TestIntegrationCloneIsolatesTheParentsIntegrations`).
 
-**Outbound isolation (egress)**: subscriptions, cron and the pg_net queue are what the isolation step
-neutralizes in the data. Everything else the parent's data can do toward the outside world is
-outbound traffic from the branch's Postgres: database webhooks and triggers that call `pg_net`, cron jobs
-that make HTTP calls, foreign servers (`postgres_fdw`, `dblink`, Wrappers), any other extension that
-connects out. A branch must not act on production's systems as if it were production, so a branch
-with data has three defaults:
+**Foreign servers**: a copy of the data carries the parent's foreign servers and user mappings. A
+remote target is already blocked by the egress filter, but a server whose host is loopback reaches
+another project on this node (or the parent itself) as whoever its stored password says. So in every
+database of a branch that does not have the egress opt-out, **every** foreign server that speaks the
+Postgres protocol is disabled, loopback or not: `postgres_fdw` and `dblink_fdw` servers, and any server
+that carries a libpq option (`host`, `hostaddr`, `port`, `dbname`, `service`), which `dblink_connect`
+accepts by name. Its `host` becomes a unix socket path that does not exist
+(`/nonexistent/sbctl-branch-disabled`: no network, no DNS) and `hostaddr` and `service` are dropped.
+Every user mapping of any wrapper with a `password`, `sslpassword` or `passwd` option loses it.
+Another wrapper whose validator refuses the change is left as it was and
+named in the `branch.isolated` event (`foreign_servers_not_neutralized`) and in the table. This is
+`neutralizeForeign` (`foreign.go`), in one transaction per database, safe to run twice.
+What was done is recorded in `sbctl_branch.paused_foreign_servers` (server, wrapper, the host,
+hostaddr, port and plain database name it had, the roles whose mapping lost a password, a note).
+**The passwords are not recorded anywhere**: they are credentials, the table is readable by whoever
+owns the branch (maybe an untrusted agent), and a copy encrypted with a key the node holds would be
+a second place to protect for no use the branch needs. **Turning a server back on therefore means
+setting its options again and re-entering the password in its user mapping**:
+`alter server s options (set host '...'); alter user mapping for ... server s options (add password '...');`
+(a dbname that is a connection string or URI is not recorded either, it may contain one).
+Foreign tables, views and functions that use the server stay as they are and fail until then. The
+connection strings in cron commands are handled the same way (above).
 
-1. **Its Postgres unit may reach loopback only.** Under systemd the unit is given `IPAddressDeny=any` and
-   `IPAddressAllow=localhost` (127.0.0.0/8 and ::1) through the per-unit drop-in, the same persistent
+**Outbound isolation (egress)**: subscriptions, cron, the pg_net queue and the Postgres foreign servers are what the
+isolation step neutralizes in the data. Everything else the parent's data can do toward the outside world is
+outbound traffic from the branch's Postgres: database webhooks and triggers that call `pg_net`, cron jobs
+that make HTTP calls, other foreign servers (Wrappers), any other extension that
+connects out. A branch must not act on production's systems as if it were production, so a branch
+with data has these defaults:
+
+1. **Its Postgres unit may reach the two loopback addresses only.** Under systemd the unit is given
+   `IPAddressDeny=any` and `IPAddressAllow=127.0.0.1/32 ::1/128` through the per-unit drop-in, the same persistent
    drop-in mechanism as `MemoryMax` (`SetUnitProperties` over D-Bus with `runtime=false`, `units.Spec.DenyEgress`).
+   The allow list is deliberately not systemd's `localhost` (all of 127.0.0.0/8): on a host the rest of that block holds
+   addresses something answers on, systemd-resolved's stub at 127.0.0.53 first, which forwards queries upstream and so
+   would be a DNS side channel out of a confined unit. Every client of a project's Postgres uses 127.0.0.1 (the cluster
+   listens on `127.0.0.1` only; GoTrue, PostgREST, the pooler and the fleet connect to it) or the unix socket, which a
+   filter on IP addresses does not touch. An earlier release allowed 127.0.0.0/8: the next render of a unit narrows it.
    The filter is a cgroup BPF program on the unit, so it covers every process of the cluster (backends, the pg_net
    and pg_cron workers, `COPY ... PROGRAM`) and it survives restarts and reboots. The unit
    still talks to its own GoTrue and PostgREST and to the pooler over loopback and unix sockets.
 2. **The parent's pg_cron jobs are paused** (above), whatever the supervisor.
 3. **Subscriptions are detached and the pg_net queue is emptied** (above), whatever the supervisor.
+4. **Foreign servers are disabled and cron connection strings replaced** (above), whatever the supervisor.
+5. **The parent's credentials inside the data are replaced by the branch's own** (above), whatever the supervisor
+   and also with the opt-out.
 
 The filter is applied after the first start, not before: the first postmaster already runs with the
 first-start settings, and a base-backup restore may need the backup backend to finish recovery.
@@ -189,17 +247,20 @@ A reset keeps the policy: the new cluster is created open, then denied again aft
 
 **Opt-out**: `sbctl branches create ... --with-data --allow-egress`, or `POST /v1/projects/{ref}/branches?allow_egress=true`
 (the query parameter is ours, like `force` on merge: the spec's create body is unchanged, so the stock CLI and the
-MCP server cannot set it and always get the default). With it the branch keeps the parent's outbound side effects: no egress block, and the
-cron jobs stay active, as they do with `[branching] keep_cron_jobs` (the node-wide setting, which keeps
-only the cron jobs and leaves egress denied). `egress` is `allowed`. Subscriptions are detached either way.
-Use it for a branch that must call a real service, for example a sandbox or staging API.
+MCP server cannot set it and always get the default). With it the branch keeps the parent's outbound side effects: no egress block, the
+cron jobs stay active (as they do with `[branching] keep_cron_jobs`, the node-wide setting, which keeps
+only the cron jobs and leaves egress denied), and foreign servers, user mappings (passwords included)
+and connection strings in cron commands stay as the parent had them, so a loopback foreign server still
+reaches another project on the node. `egress` is `allowed`. Subscriptions are detached and the parent's
+credentials inside the data are replaced by the branch's own either way. Use it for a branch that must
+call a real service, for example a sandbox or staging API, and not for an agent you do not trust.
 
 **On the exec backend egress cannot be blocked.** `supervisor = "exec"` (development and tests) runs the
 units as plain child processes, with no cgroup to attach a filter to. A branch with data created there reports
 `egress: unenforced` and its detail starts the egress sentence with "egress NOT blocked", so the state does not
-claim an isolation that is not there. The cron jobs are still paused, subscriptions are still detached and the queue is still emptied,
-so a webhook or foreign server in the data can still reach the outside world from such a branch: do not clone a production database
-through the exec backend. Verified under systemd by `tests/linux/branching-egress.sh` (CI job `branching-xfs`): a with-data branch's pg_net request to an
+claim an isolation that is not there. The cron jobs are still paused, subscriptions are still detached, the queue is still emptied, Postgres foreign servers are still
+disabled and the parent's credentials are still replaced, but a webhook, a pg_net call or any other extension in the data can
+still reach the outside world from such a branch: do not clone a production database through the exec backend. Verified under systemd by `tests/linux/branching-egress.sh` (CI job `branching-xfs`): a with-data branch's pg_net request to an
 external host fails while the parent's succeeds, the unit carries the deny and allow lists, the cron jobs are inactive and
 recorded, and a branch created with `--allow-egress` reaches the host.
 
@@ -210,6 +271,55 @@ branch on an S3 node keeps failing and its WAL piles up in `pg_wal` (expected fr
 tested against S3): give a persistent or write-heavy branch there `--allow-egress`, or delete it when its work is done. A schema-only branch replays the parent's migrations and may therefore schedule its own cron
 jobs or install triggers that call out: it is not isolated, because it inherits no data (the check is on
 `with_data` branches). The Realtime, Storage and pooler tenants of a branch are not confined; only its Postgres unit is.
+
+### What a branch with data can and cannot reach
+
+For a `with_data` branch created without `--allow-egress`, on the systemd supervisor, and nothing more
+than that (on the exec backend there is no network filter at all). Where something is verified, the tests
+are named under Verified.
+
+**It cannot** (enforced; tested except where noted):
+
+* Send anything from its Postgres unit to an address other than 127.0.0.1 and ::1: another host, the internet, the node's own
+  non-loopback addresses, the resolver stub at 127.0.0.53 (a name that `/etc/hosts` does not answer cannot be resolved). Every process of the
+  unit's cgroup is covered. Not tested for IPv6.
+* Use a foreign server of the cloned data (postgres_fdw, dblink, any server with libpq options) to write to or read from the parent or
+  another project: the server is disabled and its stored passwords are dropped (above). A dblink connection string
+  in a cron command is replaced, and the cron jobs are paused.
+* Use the parent's API keys, JWT secret or database passwords where the parent's setup kept them
+  (Vault, cron commands, database and role settings): they are the branch's own keys now (above).
+* Open another project's Postgres through its unix socket or read its files: the unit sees an empty
+  `/var/lib/sbctl` with only its own cluster directory (the mount namespace in `sb-postgres@.service`; read from the unit file, not tested here).
+* Keep the parent's subscriptions, queued pg_net requests or active cron jobs (above).
+
+**It can**:
+
+* Reach **any port on 127.0.0.1 and ::1**. The filter is on addresses, not ports, so from the branch's Postgres
+  the parent's Postgres and every other project's (their ports follow from the project's sequence number), the
+  proxy, sbctl's admin API (`127.0.0.1:7000` by default) and the fleet services are connectable. What stands between the branch and
+  those is their own authentication, which is why the parent's credentials are replaced. pg_net, `COPY ... PROGRAM` (superuser only),
+  untrusted procedural languages and a `dblink` connection string typed into a query all connect from there.
+* Use any credential of the parent that the branch's data holds in a place that is **not** rewritten, or that someone brings in.
+
+**Residual risk, not covered**:
+
+* **Credentials for the parent embedded in arbitrary user tables are not detected**, nor are those in function bodies, in trigger
+  arguments (the headers of a database webhook), in the options of foreign tables or of other wrappers' servers, in Storage objects,
+  in a Vault secret's name or description, in encoded or split form, or set with `ALTER SYSTEM`. Whoever can run SQL in the branch can read
+  them and use them against the parent over loopback (a database connection, or an HTTP call through the proxy with
+  the parent's host name). Only the credentials listed above are replaced, and only where listed: a credential of a third
+  party (a Stripe key in the Vault) is not the branch's to replace, and it cannot leave the node while egress is denied.
+* A branch with data gives whoever can run SQL in it a copy of the parent's data, whatever is rewritten.
+* The shared pgsodium root key (see Credentials): whoever holds the parent's root key can decrypt the branch's Vault secrets that were not rewritten.
+* The unit's isolation from other projects is a mount namespace and an IP filter, not a sandbox: all units run as the same user and
+  share `/proc`, so arbitrary code execution inside a branch's Postgres (a superuser, or a vulnerability) is not contained.
+* A schema-only branch holds no table data but replays the parent's migrations and seed verbatim; a credential written into a
+  migration (a key in a `cron.schedule` command, an `alter database ... set` with a key) is in the branch, and nothing rewrites it.
+  A schema-only branch is not isolated.
+* On a node without systemd (the exec backend) the network is not filtered.
+
+**For untrusted agents, prefer schema-only branches** (the default, as on hosted): they copy no data, so there is nothing of the
+parent's in them to find. A branch with data is for work that needs the data, by an agent you trust with a copy of it.
 
 ### Free disk
 
@@ -337,6 +447,17 @@ plus a parent and at most two branches, class micro):
   fails after pg_net's 5 s timeout (packets are dropped, not refused) and the test server never sees it, the cron job is
   inactive and recorded, the restriction holds after pause/resume and reset, `--allow-egress` reaches the server, and a
   delete lifts the restriction from the unit.
+* `TestIntegrationCloneNeutralizesForeignServersAndParentCredentials` (darwin-arm64, exec backend, ~27 s): a parent with a
+  loopback `postgres_fdw` server to another project (with a user mapping password and a foreign table), a `dblink_fdw` server, two cron
+  jobs (one with a dblink connection string, one with the service key in its command), Vault secrets (the service key, `Bearer <anon key>`,
+  an unrelated one) and database settings holding the service key. In the branch both servers have the disabled host and no password,
+  an insert through the foreign table and `dblink_connect` fail and the other project is not written to, the table names the servers and
+  holds no password, the cron command keeps its SQL but not its connection string, the Vault secrets, the cron command and the setting
+  hold the branch's keys and the unrelated ones are unchanged, the names (not values) are in `sbctl_branch.rewritten_credentials` and in
+  the events; the parent's foreign table, vault and cron commands are unchanged. A branch with `allow_egress` keeps the foreign server
+  and its password and still gets its credentials replaced. Unit tests cover the credential matching (current and older keys, expired
+  keys, other roles, keys of another project, short secrets), the connection-string scanner, the order (rotate, then rewrite), the failure
+  path (the branch is stopped), the compare-and-set setter, and the stale-update race for the egress policy.
 * `TestIntegrationApplyRefusesAVersionAlreadyApplied`: a version already recorded is refused with
   `ErrDiverged` before its statements run, and of two concurrent applies of one new version one wins.
 * Unit tests (fake engine): a reset refused before anything is removed (data path gone, no base
@@ -397,8 +518,10 @@ is a full copy; on XFS and APFS it stays flat.
 * `reflink` (XFS) and the ext4 base-backup path ran in CI only, on a loop-file XFS; btrfs and ZFS were not run.
 * Egress is blocked only where the supervisor can do it (systemd); on the exec backend a branch with data reports
   `egress: unenforced` (see Outbound isolation). The block covers the branch's Postgres unit, not its other services, and
-  it blocks WAL archiving to an `s3://` backup backend; a schema-only branch is not isolated at all.
-* The paused pg_cron jobs are restored by hand (the SQL under Isolation); there is no `sbctl` command for it.
+  it blocks WAL archiving to an `s3://` backup backend; a schema-only branch is not isolated at all. Loopback is open on every port
+  (see "What a branch with data can and cannot reach", which also lists what the credential replacement does not find).
+* The paused pg_cron jobs, the disabled foreign servers and their passwords are restored by hand (the SQL under Isolation and Foreign
+  servers); there is no `sbctl` command for it. The passwords are not kept, so the owner enters them again.
 * The base-backup reset path is tested end to end on APFS (`TestIntegrationBranching`); the unit tests
   fake the failure after the old cluster is removed, because a failing restore needs a real archive.
 * No idle sleep: an unused branch costs its idle memory (about 130 MB with GoTrue and PostgREST).
