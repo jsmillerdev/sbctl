@@ -16,8 +16,8 @@ import (
 // lives in an encrypted row of its own tenants table. Tenants are managed on a second port,
 // the admin API, with an `apikey` header from SERVER_ADMIN_API_KEYS.
 //
-// Upstream's create route (POST /<tenant>) inserts and fails on a second call, while PUT
-// /<tenant> upserts, so EnsureTenant uses PUT. Either route runs the tenant's storage
+// Upstream's create route (POST /tenants/<tenant>) inserts and fails on a second call, while
+// PUT /tenants/<tenant> upserts, so EnsureTenant uses PUT. Either route runs the tenant's storage
 // schema migrations in the project's database straight away, which is why the HTTP
 // timeout is long.
 const (
@@ -44,9 +44,11 @@ func (t *storageTenant) Service() string { return config.SvcStorage }
 
 func (t *storageTenant) headers() map[string]string { return map[string]string{"apikey": t.adminKey} }
 
-func (t *storageTenant) tenantURL(ref string) string { return t.base + "/" + url.PathEscape(ref) }
+func (t *storageTenant) tenantURL(ref string) string {
+	return t.base + "/tenants/" + url.PathEscape(ref)
+}
 
-// storageBody is PUT /<tenant>, the `schema` of src/http/routes/admin/tenants.ts: anonKey,
+// storageBody is PUT /tenants/<tenant>, the `schema` of src/http/routes/admin/tenants.ts: anonKey,
 // databaseUrl, jwtSecret and serviceKey are required.
 func storageBody(spec TenantSpec, dbURL string, fileSize int64) map[string]any {
 	return map[string]any{
@@ -114,7 +116,7 @@ func (t *storageTenant) EnsureTenant(ctx context.Context, spec TenantSpec) error
 	return nil
 }
 
-// RemoveTenant implements Tenant: DELETE /<tenant> removes the tenant row (its objects
+// RemoveTenant implements Tenant: DELETE /tenants/<tenant> removes the tenant row (its objects
 // stay where the backend keeps them: <ref>/ under the file directory or the bucket).
 func (t *storageTenant) RemoveTenant(ctx context.Context, ref string) error {
 	if err := validTenantRef(ref); err != nil {

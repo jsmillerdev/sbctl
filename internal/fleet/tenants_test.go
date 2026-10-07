@@ -391,7 +391,7 @@ func TestStorageTenantLifecycle(t *testing.T) {
 	n := newTestNode(t)
 	k := n.project(t, testRef)
 	const adminKey = "storage-admin-key-0123456789"
-	api := newFakeAPI(t, func(h http.Header) bool { return h.Get("apikey") == adminKey }, pathTenant("/"), 204)
+	api := newFakeAPI(t, func(h http.Header) bool { return h.Get("apikey") == adminKey }, pathTenant("/tenants/"), 204)
 	cl, _ := testClient(config.SvcStorage)
 	tn := &storageTenant{cl: cl, store: tenantStore{reg: n.reg, sec: n.sec}, base: api.srv.URL, adminKey: adminKey, fileSize: 1234,
 		adminPassword: registryAdminPassword(n.reg, n.sec)}
@@ -405,7 +405,7 @@ func TestStorageTenantLifecycle(t *testing.T) {
 		t.Fatalf("calls = %s (PUT upserts; POST fails on a second call)", got)
 	}
 	put := api.last()
-	if put.Path != "/"+testRef {
+	if put.Path != "/tenants/"+testRef {
 		t.Errorf("path = %s", put.Path)
 	}
 	want := map[string]any{
@@ -448,7 +448,7 @@ func TestStorageTenantLifecycle(t *testing.T) {
 func TestStorageTenantWithoutAdminPassword(t *testing.T) {
 	n := newTestNode(t)
 	k := n.project(t, testRef)
-	api := newFakeAPI(t, func(http.Header) bool { return true }, pathTenant("/"), 204)
+	api := newFakeAPI(t, func(http.Header) bool { return true }, pathTenant("/tenants/"), 204)
 	cl, _ := testClient("storage")
 	tn := &storageTenant{cl: cl, store: tenantStore{reg: n.reg, sec: n.sec}, base: api.srv.URL, adminKey: "x",
 		adminPassword: func(context.Context, string) (string, error) { return "", errors.New("no such secret") }}
@@ -540,7 +540,7 @@ func TestClientErrorsAreNotRetried(t *testing.T) {
 }
 
 func TestRetryStopsWhenTheContextEnds(t *testing.T) {
-	api := newFakeAPI(t, func(http.Header) bool { return true }, pathTenant("/"), 204)
+	api := newFakeAPI(t, func(http.Header) bool { return true }, pathTenant("/tenants/"), 204)
 	api.fail = func(call, int) int { return 503 }
 	ctx, cancel := context.WithCancel(context.Background())
 	cl := &apiClient{name: "storage", http: http.DefaultClient, retry: Retry{Attempts: 50, Base: time.Hour, Max: time.Hour}, log: discardLog(),

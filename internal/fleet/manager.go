@@ -134,7 +134,8 @@ func Port(cfg *config.Config, svc string) int {
 	return 0
 }
 
-// healthPath is the unauthenticated URL path that answers 200 when svc works.
+// healthPath is the unauthenticated URL path that answers 2xx when svc works (Supavisor's
+// answers 204).
 func healthPath(svc string) string {
 	switch svc {
 	case config.SvcSupavisor:
@@ -151,7 +152,7 @@ func healthPath(svc string) string {
 	return "/"
 }
 
-// probe asks svc's health endpoint for a 200.
+// probe asks svc's health endpoint for a 2xx answer.
 func (m *Manager) probe(ctx context.Context, svc string) error {
 	url := "http://" + Addr(m.cfg(), svc) + healthPath(svc)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -164,7 +165,7 @@ func (m *Manager) probe(ctx context.Context, svc string) error {
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 	}
 	return nil
