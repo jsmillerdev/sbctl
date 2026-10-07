@@ -83,14 +83,26 @@ sees() { # UNIT PATH: exit 0 if PATH is readable from UNIT's namespace
   [[ $pid -gt 0 ]] || fail "$1 has no main pid"
   nsenter -t "$pid" -m -- runuser -u "$SBCTL_USER" -- test -r "$2" 2>/dev/null
 }
-log "containment: sb-gotrue@$A sees only its own project and the artifacts"
+log "containment: sb-gotrue@$A sees only the artifacts, its launcher and its own work directory"
 G="sb-gotrue@$A.service"
-sees "$G" "$SBCTL_STATE/projects/$A/gotrue.env" || fail "$G cannot read its own env file"
+sees "$G" "$SBCTL_STATE/projects/$A/gotrue.run" || fail "$G cannot read its own launcher"
+sees "$G" "$SBCTL_STATE/projects/$A/gotrue" || fail "$G cannot read its work directory"
 sees "$G" "$SBCTL_STATE/artifacts" || fail "$G cannot read the artifacts"
 for hidden in "$SBCTL_STATE/backups" "$SBCTL_STATE/certs" "$SBCTL_STATE/projects/$B" "$SBCTL_STATE/projects/$A/postgres" \
-    "$SBCTL_STATE/projects/$A/postgres.env" "$SBCTL_STATE/projects/$A/postgrest.env" "$SBCTL_STATE/projects/system" /etc/sbctl; do
+    "$SBCTL_STATE/projects/$A/gotrue.env" "$SBCTL_STATE/projects/$A/postgres.env" "$SBCTL_STATE/projects/$A/postgrest.env" \
+    "$SBCTL_STATE/projects/$A/postgrest.run" "$SBCTL_STATE/projects/system" /etc/sbctl; do
   if sees "$G" "$hidden"; then fail "$G can read $hidden"; fi
 done
+log "containment: sb-postgres@$A sees its cluster, its own backups and nothing of the node"
+PGU="sb-postgres@$A.service"
+sees "$PGU" "$SBCTL_STATE/projects/$A/postgres" || fail "$PGU cannot read its cluster directory"
+sees "$PGU" "$SBCTL_STATE/projects/$A/postgres.run" || fail "$PGU cannot read its launcher"
+for hidden in /etc/sbctl/master.key "$SBCTL_STATE/projects/$B" "$SBCTL_STATE/projects/system" "$SBCTL_STATE/projects/$A/postgres.env" \
+    "$SBCTL_STATE/projects/$A/gotrue.env" "$SBCTL_STATE/certs" "$SBCTL_STATE/backups/$B"; do
+  if sees "$PGU" "$hidden"; then fail "$PGU can read $hidden"; fi
+done
+# archive_command must still work from inside that namespace: it writes into backups/<ref>.
+sees "$PGU" /etc/sbctl/config.toml || fail "$PGU cannot read config.toml, so archive_command cannot find its backend"
 if [[ $(unit_state sb-studio.service) == active ]]; then
   for hidden in "$SBCTL_STATE/projects/system/supavisor.env" "$SBCTL_STATE/projects/system/storage.env" "$SBCTL_STATE/backups"; do
     if sees sb-studio.service "$hidden"; then fail "sb-studio can read $hidden"; fi

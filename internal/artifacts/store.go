@@ -356,6 +356,9 @@ func (s *Store) install(archive, final string, m Marker) error {
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		return err
 	}
+	if err := handOver(tmp, s.cfg.StateDir); err != nil {
+		return err
+	}
 	if err := os.Rename(tmp, final); err != nil {
 		if _, serr := os.Stat(final); serr == nil {
 			return nil // another process installed it first

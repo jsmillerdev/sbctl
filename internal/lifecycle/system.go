@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/OWNER/sbctl/internal/artifacts"
@@ -104,10 +105,17 @@ func (e *Engine) ensureFleetCredentials(ctx context.Context, pp pgPaths) error {
 type OpenOptions struct {
 	Log *slog.Logger
 	// ConfigPath, ArchiveCommand: see PlaneOptions.
-	ConfigPath     string
-	ArchiveCommand string
-	Fleet          fleet.Fleet
-	Backup         BaseBackuper
+	ConfigPath        string
+	ArchiveCommand    string
+	ArchiveCommandFor func(ref string) string
+	ArchiveTimeout    int
+	Fleet             fleet.Fleet
+	Backup            BaseBackuper
+	// BackupFactory builds the BaseBackuper once the registry and the secrets are open
+	// (the backup service needs both, and the Engine needs the backup service). When the
+	// result also has a SetManager(Manager) method, Open hands it the Engine. Ignored
+	// when Backup is set.
+	BackupFactory func(n *Node) (BaseBackuper, error)
 	// Supervisor replaces the backend chosen by cfg.Supervisor (tests).
 	Supervisor units.Supervisor
 	// Artifacts replaces the artifact store (tests).
@@ -124,7 +132,8 @@ func (o *OpenOptions) log() *slog.Logger {
 }
 
 func (o *OpenOptions) planeOptions() PlaneOptions {
-	return PlaneOptions{Log: o.log(), ConfigPath: o.ConfigPath, ArchiveCommand: o.ArchiveCommand, Backup: o.Backup}
+	return PlaneOptions{Log: o.log(), ConfigPath: o.ConfigPath, ArchiveCommand: o.ArchiveCommand,
+		ArchiveCommandFor: o.ArchiveCommandFor, ArchiveTimeout: o.ArchiveTimeout, Backup: o.Backup}
 }
 
 // Node is everything a process needs to manage projects on this machine: the secrets
@@ -189,9 +198,59 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	if err != nil {
 		return nil, fmt.Errorf("lifecycle: cannot reach the registry in the system cluster (is sb-postgres@system running? run `sbctl system init`): %w", err)
 	}
-	plane := NewPostgresPlane(cfg, sup, arts, reg, o.planeOptions())
-	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: o.Backup})
-	return &Node{Cfg: cfg, Secrets: sec, Supervisor: sup, Artifacts: arts, Registry: reg, Plane: plane, Engine: eng}, nil
+	node := &Node{Cfg: cfg, Secrets: sec, Supervisor: sup, Artifacts: arts, Registry: reg}
+	bk := o.lateBackup(node)
+	po := o.planeOptions()
+	po.Backup = bk
+	node.Plane = NewPostgresPlane(cfg, sup, arts, reg, po)
+	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk})
+	return node, nil
+}
+
+// lateBackup returns o.Backup, or a BaseBackuper that builds itself from BackupFactory on
+// first use: the backup service needs the opened registry and secrets (n), and its
+// restore needs the Engine, and neither exists yet while the plane and Engine are built.
+func (o *OpenOptions) lateBackup(n *Node) BaseBackuper {
+	if o.Backup != nil {
+		return o.Backup
+	}
+	if o.BackupFactory == nil {
+		return nil
+	}
+	return &lateBackuper{node: n, factory: o.BackupFactory}
+}
+
+type lateBackuper struct {
+	node    *Node
+	factory func(n *Node) (BaseBackuper, error)
+	mu      sync.Mutex
+	b       BaseBackuper
+}
+
+func (l *lateBackuper) get() (BaseBackuper, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.b != nil {
+		return l.b, nil
+	}
+	b, err := l.factory(l.node)
+	if err != nil {
+		return nil, err
+	}
+	if m, ok := b.(interface{ SetManager(Manager) }); ok && l.node.Engine != nil {
+		m.SetManager(l.node.Engine)
+	}
+	l.b = b
+	return b, nil
+}
+
+// BaseBackup implements BaseBackuper.
+func (l *lateBackuper) BaseBackup(ctx context.Context, ref string) (*registry.Backup, error) {
+	b, err := l.get()
+	if err != nil {
+		return nil, fmt.Errorf("lifecycle: backup service: %w", err)
+	}
+	return b.BaseBackup(ctx, ref)
 }
 
 // systemProject is the registry view of the system cluster.
@@ -318,7 +377,9 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	}
 	node.Registry = reg
 	plane.reg = reg
-	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: o.Backup})
+	bk := o.lateBackup(node)
+	plane.opts.Backup = bk
+	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk})
 	node.Engine = eng
 
 	if existing {

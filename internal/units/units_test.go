@@ -361,34 +361,58 @@ func TestExecAcrossProcesses(t *testing.T) {
 	}
 }
 
-// Every API and fleet template must hide the state root except the artifacts and its own
-// directories; the Postgres, daemon, slice and rule files are exempt.
+// Every template, Postgres included, must replace /var/lib/sbctl with an empty tmpfs and
+// bring back only the artifacts, its own launcher script and its own state directory
+// (an allowlist). Binding a project or system directory as a whole would expose the
+// siblings' environment files and cluster directories.
 func TestTemplatesContainment(t *testing.T) {
 	var names []string
-	for _, s := range []string{"gotrue@", "postgrest@"} {
+	for _, s := range []string{"postgres@", "gotrue@", "postgrest@"} {
 		names = append(names, "sb-"+s+".service")
 	}
 	for _, s := range []string{"supavisor", "realtime", "storage", "pgmeta", "studio", "imgproxy", "edge-runtime"} {
 		names = append(names, "sb-"+s+".service")
+	}
+	line := func(body, key string) string {
+		for _, l := range strings.Split(body, "\n") {
+			if v, ok := strings.CutPrefix(l, key+"="); ok {
+				return v
+			}
+		}
+		return ""
 	}
 	for _, name := range names {
 		b, err := systemd.Read(name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{
-			"TemporaryFileSystem=/var/lib/sbctl:ro\n",
-			"BindReadOnlyPaths=/var/lib/sbctl/artifacts\n",
-			"InaccessiblePaths=-/etc/sbctl ",
-		} {
-			if !strings.Contains(string(b), want) {
-				t.Errorf("%s lacks %q", name, want)
+		body := string(b)
+		svc := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(name, ".service"), "sb-"), "@")
+		if !strings.Contains(body, "TemporaryFileSystem=/var/lib/sbctl:ro\n") {
+			t.Errorf("%s lacks the tmpfs over /var/lib/sbctl", name)
+		}
+		if !strings.Contains(body, "InaccessiblePaths=-/etc/sbctl") {
+			t.Errorf("%s does not hide /etc/sbctl or the master key", name)
+		}
+		ro := strings.Fields(line(body, "BindReadOnlyPaths"))
+		if len(ro) != 2 || ro[0] != "/var/lib/sbctl/artifacts" || !strings.HasSuffix(ro[1], "/"+svc+".run") {
+			t.Errorf("%s: BindReadOnlyPaths must be the artifacts and its own launcher script, got %v", name, ro)
+		}
+		for _, p := range strings.Fields(line(body, "BindPaths")) {
+			switch strings.TrimPrefix(p, "-") {
+			case "/var/lib/sbctl/projects/%i", "/var/lib/sbctl/projects/system", "/var/lib/sbctl/projects", "/var/lib/sbctl/backups",
+				"/var/lib/sbctl/certs", "/var/lib/sbctl/system", "/var/lib/sbctl":
+				t.Errorf("%s binds %s as a whole", name, p)
 			}
 		}
-		for _, bad := range []string{"/var/lib/sbctl/backups", "/var/lib/sbctl/certs"} {
-			if strings.Contains(string(b), bad+" ") || strings.Contains(string(b), bad+"\n") {
-				t.Errorf("%s must not bind %s", name, bad)
-			}
+		if strings.Contains(body, "/var/lib/sbctl/certs") {
+			t.Errorf("%s must not mention the certificate directory", name)
+		}
+		if strings.Contains(line(body, "InaccessiblePaths"), ".env") {
+			t.Errorf("%s still hides sibling environment files (denylist); use the allowlist", name)
+		}
+		if svc == "postgres" && line(body, "InaccessiblePaths") != "-/etc/sbctl/master.key" {
+			t.Errorf("%s must hide the master key only (config.toml is read by archive_command)", name)
 		}
 	}
 }

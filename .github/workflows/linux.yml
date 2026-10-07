@@ -43,26 +43,44 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: start minio
+      # MinIO no longer publishes images or binaries (dl.min.io answers 410), so the real
+      # S3 service is SeaweedFS's S3 gateway, a maintained S3-compatible server.
+      - name: start S3 (SeaweedFS)
         run: |
-          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data
-          for i in $(seq 1 60); do curl -fs http://127.0.0.1:9000/minio/health/live && break; sleep 1; done
+          mkdir -p /tmp/s3
+          cat >/tmp/s3/s3.json <<'JSON'
+          {"identities":[{"name":"ci","credentials":[{"accessKey":"sbctlci","secretKey":"sbctlci-secret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}
+          JSON
+          docker run -d --name s3 -p 9000:8333 -v /tmp/s3/s3.json:/etc/seaweedfs/s3.json \
+            chrislusf/seaweedfs:latest server -s3 -s3.config=/etc/seaweedfs/s3.json -dir=/data -ip.bind=0.0.0.0
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ || true)
+            [ "$code" != "000" ] && [ "$code" != "502" ] && break
+            sleep 1
+          done
+          echo "S3 answered $code"
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - name: create bucket
         run: |
-          curl -fsSL -o /tmp/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /tmp/mc
-          /tmp/mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
-          /tmp/mc mb -p local/sbctl-test
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /tmp/mb.out -w '%{http_code}' -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" \
+              --user sbctlci:sbctlci-secret http://127.0.0.1:9000/sbctl-test || true)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          cat /tmp/mb.out; echo "create bucket: $code"; [ "$code" = "200" ]
       - name: backup integration
         env:
           SBCTL_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           SBCTL_TEST_S3_BUCKET: sbctl-test
-          SBCTL_TEST_S3_ACCESS_KEY: minioadmin
-          SBCTL_TEST_S3_SECRET_KEY: minioadmin
+          SBCTL_TEST_S3_ACCESS_KEY: sbctlci
+          SBCTL_TEST_S3_SECRET_KEY: sbctlci-secret
         run: internal/backup/ci-integration.sh
+      - if: failure()
+        run: docker logs s3 | tail -50
 
   pebble:
     runs-on: ubuntu-24.04
