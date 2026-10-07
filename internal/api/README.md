@@ -379,6 +379,30 @@ like every other `/auth/v1` path.
   signs in (GoTrue links an identity provider's user to the existing account by name id or verified email), and removal
   ends their sessions. A provider with an Owner among its users is the business of an Owner or the operator (403 for
   an Administrator).
+- **One address, several accounts.** GoTrue keeps email addresses unique among password accounts only (its index skips
+  SSO users), and an identity provider may vouch for any address, including one that has a password account. The two
+  are separate accounts, and the SSO one is the newer, so it comes first in GoTrue's list. Nothing that acts on an
+  address takes the first match. `Accounts.ResolveUser` resolves an address to the password account when there is
+  exactly one, and to the only account when a single one exists; with several SSO accounts and no password account, or
+  with a selector that matches none, it refuses (`AmbiguousUserError`, listing ids and providers). `sbctl users role`
+  and `sbctl users remove` take `--user-id` and `--provider` (`email`, or an identity provider id) to name another
+  account and print when the account they changed is an SSO one; `sbctl users list` shows how each account signs in
+  and its id. Invitations (`users invite`, the Team page) look at password accounts only: an address that only an
+  identity provider has an account for gets the link that creates a password account. A first sign-in whose address
+  has a password account is logged and recorded in the `sso.user.first_sign_in` event (`shares_email_with`); the
+  SSO account gets the provider's default role like any other, and nothing of the password account.
+- **Denying and removing.** `deny` re-checks the memberships first: a user who became a member since the last request
+  (invited, `sbctl users role`) is not denied (409) and the account stays. Removing a provider removes the memberships
+  and project roles of the users that signed in through it, in every organization (the accounts cannot sign in again),
+  before anything else changes; when one of them is the only Owner of an organization the removal is refused (409)
+  until another Owner exists, as `sbctl users remove` refuses it.
+- **Domains are claimed node-wide.** GoTrue finds the provider by the email domain, across the whole node, and sbctl
+  does not verify that the registrant controls the domain: the first provider to register a domain gets it (a second
+  one is refused, 409). A provider is also refused for a domain that another organization's default-role rule holds,
+  with or without a default role, unless the caller owns that organization (the operator may). An organization that
+  registers a provider for a domain that another organization's members use, before that organization did, takes over
+  the "Continue with SSO" sign-in for those addresses, so on a node with several organizations the Owners should
+  register their domains early and `sbctl sso list` shows who holds which. There is no DNS verification yet.
 - **Sign-up stays closed.** GoTrue's own switch (`GOTRUE_DISABLE_SIGNUP`) also stops an SSO user's first sign-in, so
   it is off on `sb-gotrue@system` and its before-user-created hook is on: GoTrue asks `POST
   /internal/hooks/before-user-created` on the loopback admin listener (signed with a secret derived from the master key

@@ -220,7 +220,7 @@ printed either way). Without it sbctl sends no email: pass the link on yourself.
 				return printJSON(cmd.OutOrStdout(), rows)
 			}
 			t := newTable(cmd.OutOrStdout())
-			fmt.Fprintln(t, "EMAIL\tROLES\tCREATED\tLAST SIGN-IN")
+			fmt.Fprintln(t, "EMAIL\tSIGN-IN\tROLES\tCREATED\tLAST SIGN-IN\tID")
 			for _, u := range rows {
 				last := "never"
 				if u.LastSignIn != nil {
@@ -230,21 +230,31 @@ printed either way). Without it sbctl sends no email: pass the link on yourself.
 				if roles == "" {
 					roles = "none"
 				}
-				fmt.Fprintf(t, "%s\t%s\t%s\t%s\n", u.Email, roles, u.CreatedAt.Local().Format("2006-01-02"), last)
+				signIn := "password"
+				if u.SSOProvider != "" {
+					signIn = "sso:" + u.SSOProvider
+				}
+				fmt.Fprintf(t, "%s\t%s\t%s\t%s\t%s\t%s\n", u.Email, signIn, roles, u.CreatedAt.Local().Format("2006-01-02"), last, u.ID)
 			}
 			return t.Flush()
 		},
 	}
 	list.Flags().BoolVar(&asJSON, "json", false, "print JSON")
 
-	var roleOrg string
+	var roleOrg, roleUserID, roleProvider string
 	role := &cobra.Command{
 		Use:   "role <email> <role>",
 		Short: "Set the organization-wide role of a dashboard user",
 		Long: `Sets a user's role in an organization (owner, administrator, developer or read-only) and adds
 the user to the organization when they are not a member. It is how to give an organization an
 owner again after the last one was removed with --force. The last owner of an organization cannot
-be demoted.`,
+be demoted.
+
+An address can belong to a password account and to accounts that a single sign-on identity
+provider created (the provider vouches for the address; GoTrue does not keep those unique). The
+password account is the one this command changes. Name another with --user-id or --provider
+(` + "`sbctl users list`" + ` shows the ids and how each account signs in); an address that several
+accounts share without a password account among them is refused until you do.`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			acc, _, closeFn, err := openAccounts(cmd.Context())
@@ -252,17 +262,23 @@ be demoted.`,
 				return err
 			}
 			defer closeFn()
-			org, err := acc.SetRole(cmd.Context(), args[0], roleOrg, args[1])
+			org, u, err := acc.SetRoleOf(cmd.Context(), args[0], roleOrg, args[1], api.UserSelector{UserID: roleUserID, Provider: roleProvider})
 			if err != nil {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s is now %s in %s\n", args[0], args[1], org.Slug)
+			if u != nil && u.SSOProvider != "" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "The account is the single sign-on account %s of provider %s.\n", u.ID, u.SSOProvider)
+			}
 			return nil
 		},
 	}
 	role.Flags().StringVar(&roleOrg, "org", "", "organization slug (not needed when there is one)")
+	role.Flags().StringVar(&roleUserID, "user-id", "", "the account's id, when the address belongs to several accounts")
+	role.Flags().StringVar(&roleProvider, "provider", "", "email, or a single sign-on provider id, when the address belongs to several accounts")
 
 	var forceRemove bool
+	var removeUserID, removeProvider string
 	remove := &cobra.Command{
 		Use:   "remove <email>",
 		Short: "Delete a dashboard user, their memberships and the access tokens they created",
@@ -271,7 +287,11 @@ personal access token it created (a token is not re-checked against its owner's 
 would keep working). Sessions already issued by GoTrue expire within an hour.
 
 An organization always keeps an owner: removing the only owner of an organization is refused
-unless --force is given.`,
+unless --force is given.
+
+An address can belong to a password account and to accounts that a single sign-on identity
+provider created. The password account is the one removed; name another with --user-id or
+--provider (` + "`sbctl users list`" + ` shows the ids).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			acc, _, closeFn, err := openAccounts(cmd.Context())
@@ -279,15 +299,21 @@ unless --force is given.`,
 				return err
 			}
 			defer closeFn()
-			n, err := acc.RemoveUser(cmd.Context(), args[0], forceRemove)
+			u, n, err := acc.RemoveUserBy(cmd.Context(), args[0], forceRemove, api.UserSelector{UserID: removeUserID, Provider: removeProvider})
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "removed %s and %d access token(s)\n", args[0], n)
+			what := args[0]
+			if u != nil && u.SSOProvider != "" {
+				what += " (single sign-on account of provider " + u.SSOProvider + ")"
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "removed %s and %d access token(s)\n", what, n)
 			return nil
 		},
 	}
 	remove.Flags().BoolVar(&forceRemove, "force", false, "also remove the only owner of an organization")
+	remove.Flags().StringVar(&removeUserID, "user-id", "", "the account's id, when the address belongs to several accounts")
+	remove.Flags().StringVar(&removeProvider, "provider", "", "email, or a single sign-on provider id, when the address belongs to several accounts")
 
 	defaults := &cobra.Command{
 		Use:   "default-role",

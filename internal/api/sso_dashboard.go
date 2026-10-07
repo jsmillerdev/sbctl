@@ -234,9 +234,11 @@ func (d *DashboardSSO) checkUsers(ctx context.Context, actor *members.Access, or
 	return nil
 }
 
-// ruleConflict refuses to give domains the default role of org when another organization's
-// default-role rule holds one of them, unless actor (nil: the operator) owns that organization:
-// the rule is somebody else's.
+// ruleConflict refuses to register domains for org when another organization's default-role rule
+// holds one of them, unless actor (nil: the operator) owns that organization: the domain is
+// somebody else's, and a provider for it (even one that gives no role) would take over the sign-in
+// of its addresses. It is the only check of who may claim a domain: claims are global on the node, first
+// come first served, and not verified (see the SSO section of the README).
 func (d *DashboardSSO) ruleConflict(ctx context.Context, actor *members.Access, org members.OrgRef, domains []string) error {
 	if actor == nil || d.Members == nil {
 		return nil
@@ -351,10 +353,8 @@ func (d *DashboardSSO) Add(ctx context.Context, actor *members.Access, in AddPro
 	if err := d.domainsTaken(ctx, domains, ""); err != nil {
 		return nil, err
 	}
-	if in.DefaultRole != 0 {
-		if err := d.ruleConflict(ctx, actor, in.Org, domains); err != nil {
-			return nil, err
-		}
+	if err := d.ruleConflict(ctx, actor, in.Org, domains); err != nil {
+		return nil, err
 	}
 	c, err := d.clientCtx(ctx)
 	if err != nil {
@@ -546,10 +546,8 @@ func (d *DashboardSSO) Update(ctx context.Context, actor *members.Access, id str
 		}
 		body.Domains = &newDomains
 	}
-	if newRole != 0 {
-		if err := d.ruleConflict(ctx, actor, org, newDomains); err != nil {
-			return nil, err
-		}
+	if err := d.ruleConflict(ctx, actor, org, newDomains); err != nil {
+		return nil, err
 	}
 	if in.Metadata != nil {
 		if in.Metadata.XML != "" {
@@ -580,8 +578,8 @@ func (d *DashboardSSO) Update(ctx context.Context, actor *members.Access, id str
 	return d.view(ctx, p, row), nil
 }
 
-// Remove deletes a provider: sbctl stops accepting its users at once, their personal access
-// tokens are revoked (a token would otherwise outlive the identity provider that vouched for
+// Remove deletes a provider: sbctl stops accepting its users at once, their memberships and
+// roles are removed, their personal access tokens are revoked (a token would otherwise outlive the identity provider that vouched for
 // its owner), and the provider goes from GoTrue. It finishes a removal that stopped halfway:
 // a provider that only GoTrue still has can be removed too. orgID limits the removal to that
 // organization (0: any).
@@ -613,6 +611,13 @@ func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id str
 		return nil, errf(http.StatusForbidden, "Your role does not allow removing a provider that sbctl did not register")
 	}
 	if row != nil {
+		// The users are unreachable once the provider is gone, and the rows that name them go with
+		// it, so their memberships go first: otherwise they would stay in the member lists and
+		// count as Owners for the last-owner rule. Removing the only Owner of an organization is
+		// refused (nothing of the provider changes then), as `sbctl users remove` refuses it.
+		if err := d.removeMemberships(ctx, id); err != nil {
+			return nil, err
+		}
 		users, err := d.Store.DeleteProvider(ctx, id)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return nil, err
@@ -639,6 +644,30 @@ func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id str
 	d.changed(ctx)
 	d.log().Info("dashboard SSO provider removed", "provider", id)
 	return d.view(ctx, p, row), nil
+}
+
+// removeMemberships removes the memberships and project roles of every user that signed in
+// through the provider, in every organization (the accounts can sign in no more). It stops at
+// the first user whose removal would leave an organization without an Owner; the users removed
+// before that stay removed (they wait for approval, were the provider kept), and running the
+// removal again after another Owner exists finishes it.
+func (d *DashboardSSO) removeMemberships(ctx context.Context, providerID string) error {
+	if d.Members == nil {
+		return nil
+	}
+	us, err := d.Store.ListSSOUsers(ctx, "", []string{providerID})
+	if err != nil {
+		return err
+	}
+	for _, u := range us {
+		if err := d.Members.RemoveUser(ctx, u.UserID, false); err != nil {
+			if errors.Is(err, members.ErrLastOwner) {
+				return errf(http.StatusConflict, "%s signs in through this provider and is the only Owner of an organization; make another member an Owner first", u.Email)
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *DashboardSSO) revokeTokens(ctx context.Context, userID string) {
@@ -762,11 +791,26 @@ func (d *DashboardSSO) Approve(ctx context.Context, actor *members.Access, org m
 }
 
 // Deny refuses a pending user for good: the account is deleted from sb-gotrue@system and the
-// user's sessions end. Signing in again creates a new account, which waits again.
+// user's sessions end. Signing in again creates a new account, which waits again. A user who has
+// become a member since the last request is not denied (409): the stored state is refreshed
+// only when the user makes a request, and the account may carry access elsewhere.
 func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org members.OrgRef, userID string) error {
 	u, err := d.pendingOf(ctx, org, userID)
 	if err != nil {
 		return err
+	}
+	// The stored state is as old as the user's last request: a user who joined an organization
+	// since (invited, `sbctl users role`) is a member, and deleting the account would end that access too.
+	if member, err := d.isMember(ctx, userID); err != nil {
+		return err
+	} else if member {
+		if err := d.Store.SetSSOUserState(ctx, userID, SSOActive, d.now()); err != nil {
+			return err
+		}
+		d.mu.Lock()
+		delete(d.admitted, userID)
+		d.mu.Unlock()
+		return errf(http.StatusConflict, "This user is a member of an organization now and is not waiting for approval; remove the member instead")
 	}
 	if d.Accounts != nil {
 		if err := d.Accounts.Store.MarkUserRemoved(ctx, u.UserID, u.Email); err != nil {
@@ -931,7 +975,19 @@ func (d *DashboardSSO) firstSight(ctx context.Context, row *SSOProviderRow, user
 	if _, err := d.Store.InsertSSOUser(ctx, u); err != nil {
 		return nil, err
 	}
-	d.event(ctx, "sso.user.first_sign_in", map[string]any{"user": userID, "provider": row.ID, "state": u.State})
+	payload := map[string]any{"user": userID, "provider": row.ID, "state": u.State}
+	// An identity provider can vouch for an address that already has a password account; the two
+	// stay separate accounts (GoTrue keeps SSO accounts out of its email uniqueness). Say so in the
+	// audit trail: the operator's commands never take the SSO account for the password account.
+	if d.Accounts != nil {
+		if pw, err := d.Accounts.passwordAccount(ctx, u.Email); err != nil {
+			d.log().Warn("could not check whether a single sign-on user shares an address with a password account", "user", userID, "error", err)
+		} else if pw != nil {
+			payload["shares_email_with"] = pw.ID
+			d.log().Warn("a single sign-on user has the address of a password account; they are separate accounts", "user", userID, "provider", row.ID, "email", u.Email, "password_account", pw.ID)
+		}
+	}
+	d.event(ctx, "sso.user.first_sign_in", payload)
 	d.log().Info("single sign-on user seen for the first time", "user", userID, "email", u.Email, "provider", row.ID, "state", u.State)
 	return &u, nil
 }

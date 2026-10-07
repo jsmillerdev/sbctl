@@ -61,14 +61,117 @@ func (a *Accounts) UserCreatedAt(ctx context.Context, userID string) (time.Time,
 	return u.CreatedAt, nil
 }
 
-// findUser returns the dashboard account with this address, nil when there is none.
-func (a *Accounts) findUser(ctx context.Context, email string) (*DashboardUser, error) {
+// UserSelector picks one account when an email address belongs to several. GoTrue keeps email
+// addresses unique among password accounts only, so an identity provider that vouches for an
+// address creates a second account with it; the operator's commands name which one they mean.
+type UserSelector struct {
+	// UserID is the account's id (see `sbctl users list --json`).
+	UserID string
+	// Provider is "email" (or "password") for the password account, or the id of a single
+	// sign-on identity provider, with or without the "sso:" prefix.
+	Provider string
+}
+
+func (s UserSelector) empty() bool { return s.UserID == "" && s.Provider == "" }
+
+// AmbiguousUserError says that an address belongs to several accounts and the selector did not
+// pick one.
+type AmbiguousUserError struct {
+	Email   string
+	Matches []DashboardUser
+}
+
+func (e *AmbiguousUserError) Error() string {
+	parts := make([]string, len(e.Matches))
+	for i, u := range e.Matches {
+		parts[i] = u.ID + " (" + u.kind() + ")"
+	}
+	return fmt.Sprintf("%s belongs to several dashboard accounts: %s; name one with --user-id <id>, or with --provider email or --provider <identity provider id>",
+		e.Email, strings.Join(parts, ", "))
+}
+
+// kind describes how the account signs in.
+func (u DashboardUser) kind() string {
+	if u.SSOProvider != "" {
+		return "single sign-on, provider " + u.SSOProvider
+	}
+	return "password"
+}
+
+// ResolveUser returns the dashboard account of an email address, nil when there is none.
+//
+// An address can belong to a password account and to single sign-on accounts at once: GoTrue's
+// uniqueness index leaves SSO accounts out, and an identity provider may vouch for any address.
+// So an address is never resolved by taking the first match. With a selector, the account it names
+// is the one (an error when none matches). Without one, the password account is the one when there
+// is exactly one: an account that an identity provider created never takes the place of the account
+// sbctl created for the address, and it is reached only by naming it. An address that only
+// single sign-on accounts have resolves to its account when there is just one. Anything else is an
+// AmbiguousUserError.
+func (a *Accounts) ResolveUser(ctx context.Context, email string, sel UserSelector) (*DashboardUser, error) {
+	users, err := a.ListUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var matches, password []DashboardUser
+	for _, u := range users {
+		if !strings.EqualFold(u.Email, email) {
+			continue
+		}
+		matches = append(matches, u)
+		if u.SSOProvider == "" {
+			password = append(password, u)
+		}
+	}
+	if !sel.empty() {
+		var picked []DashboardUser
+		prov := strings.ToLower(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(sel.Provider)), "sso:"))
+		for _, u := range matches {
+			switch {
+			case sel.UserID != "" && !strings.EqualFold(u.ID, strings.TrimSpace(sel.UserID)):
+			case prov == "":
+				picked = append(picked, u)
+			case prov == "email" || prov == "password":
+				if u.SSOProvider == "" {
+					picked = append(picked, u)
+				}
+			case u.SSOProvider == prov:
+				picked = append(picked, u)
+			}
+		}
+		switch len(picked) {
+		case 0:
+			if len(matches) == 0 {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("none of the dashboard accounts of %s has that --user-id or --provider", email)
+		case 1:
+			return &picked[0], nil
+		}
+		return nil, &AmbiguousUserError{Email: email, Matches: picked}
+	}
+	switch {
+	case len(matches) == 0:
+		return nil, nil
+	case len(matches) == 1:
+		return &matches[0], nil
+	case len(password) == 1:
+		return &password[0], nil
+	}
+	return nil, &AmbiguousUserError{Email: email, Matches: matches}
+}
+
+// passwordAccount returns the account sbctl created for an address (one that signs in with a
+// password or a magic link), nil when there is none. Accounts of identity providers do not count:
+// an invitation goes to the person who owns the address, not to whoever an identity provider says
+// has it.
+func (a *Accounts) passwordAccount(ctx context.Context, email string) (*DashboardUser, error) {
 	users, err := a.ListUsers(ctx)
 	if err != nil {
 		return nil, err
 	}
 	for i := range users {
-		if strings.EqualFold(users[i].Email, email) {
+		if users[i].SSOProvider == "" && strings.EqualFold(users[i].Email, email) {
 			return &users[i], nil
 		}
 	}
@@ -114,7 +217,7 @@ func (a *Accounts) InviteToOrganization(ctx context.Context, actor *members.Acce
 		return nil, errf(http.StatusBadRequest, "%v", err)
 	}
 	in.Email = email
-	existing, err := a.findUser(ctx, email)
+	existing, err := a.passwordAccount(ctx, email)
 	if err != nil {
 		return nil, err
 	}
@@ -275,37 +378,45 @@ func (a *Accounts) InviteByEmail(ctx context.Context, email, orgSlug, role strin
 	return res, org, err
 }
 
-// SetRole is `sbctl users role`: the operator sets the organization-wide role of an account,
-// adding the account to the organization when it is not a member. It is how an organization
-// that lost every Owner gets one back. The last Owner still cannot be demoted.
+// SetRole is SetRoleOf for the account an address resolves to without a selector.
 func (a *Accounts) SetRole(ctx context.Context, email, orgSlug, role string) (members.OrgRef, error) {
+	org, _, err := a.SetRoleOf(ctx, email, orgSlug, role, UserSelector{})
+	return org, err
+}
+
+// SetRoleOf is `sbctl users role`: the operator sets the organization-wide role of an account,
+// adding the account to the organization when it is not a member. It is how an organization
+// that lost every Owner gets one back. The last Owner still cannot be demoted. When the address
+// belongs to several accounts the selector names one (ResolveUser); the account that got the role
+// is returned.
+func (a *Accounts) SetRoleOf(ctx context.Context, email, orgSlug, role string, sel UserSelector) (members.OrgRef, *DashboardUser, error) {
 	ro, err := members.ParseRole(role)
 	if err != nil {
-		return members.OrgRef{}, err
+		return members.OrgRef{}, nil, err
 	}
 	org, err := a.orgBySlugOrOnly(ctx, orgSlug)
 	if err != nil {
-		return org, err
+		return org, nil, err
 	}
 	email, err = normalizeEmail(email)
 	if err != nil {
-		return org, err
+		return org, nil, err
 	}
-	u, err := a.findUser(ctx, email)
+	u, err := a.ResolveUser(ctx, email, sel)
 	if err != nil {
-		return org, err
+		return org, nil, err
 	}
 	if u == nil {
-		return org, fmt.Errorf("no dashboard user %s", email)
+		return org, nil, fmt.Errorf("no dashboard user %s", email)
 	}
 	if _, err := a.Members.Store.GetMember(ctx, org.ID, u.ID); errors.Is(err, members.ErrNotFound) {
-		return org, a.Members.Store.Update(ctx, org.ID, func(ops members.Ops) error {
+		return org, u, a.Members.Store.Update(ctx, org.ID, func(ops members.Ops) error {
 			return ops.PutMember(ctx, members.Member{OrgID: org.ID, UserID: u.ID, RoleID: ro.ID})
 		})
 	} else if err != nil {
-		return org, err
+		return org, nil, err
 	}
-	return org, a.Members.SetOrgRole(ctx, nil, org, u.ID, ro.ID)
+	return org, u, a.Members.SetOrgRole(ctx, nil, org, u.ID, ro.ID)
 }
 
 // UserRoles describes where a dashboard user belongs, for `sbctl users list`: one entry per

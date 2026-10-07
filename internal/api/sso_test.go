@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1228,7 +1229,8 @@ func TestSSOProviderRoleOverridesAnOperatorsRule(t *testing.T) {
 	}
 }
 
-// A domain that another organization's rule holds is not the Administrator's to take.
+// A domain that another organization's rule holds is not the Administrator's to take, with a
+// default role or without one.
 func TestSSOProviderCannotOverwriteAnotherOrganizationsRule(t *testing.T) {
 	f := newSSOFixture(t)
 	ctx := context.Background()
@@ -1251,16 +1253,275 @@ func TestSSOProviderCannotOverwriteAnotherOrganizationsRule(t *testing.T) {
 	if r, err := f.srv.members.Store.GetDomainDefault(ctx, "acme.test"); err != nil || r.OrgID != bravo.ID || r.RoleID != members.RoleReadOnly {
 		t.Fatalf("bravo's rule: %+v, %v", r, err)
 	}
-	// Without a role the provider sets no rule, so it does not collide. Raising it later does.
+	// A provider without a role sets no rule, but it still takes over the sign-in of the domain's
+	// addresses (GoTrue finds the provider by domain, node-wide), so it is refused as well; so is
+	// moving a provider onto the domain later.
 	rec := f.as("admin", "POST", orgSSO+"/providers", map[string]any{"type": "saml", "metadata_xml": testIdPMetadata(acmeIdP), "domains": []string{"acme.test"}})
-	if rec.Code != 201 {
-		t.Fatalf("add without a role: %d %s", rec.Code, rec.Body)
+	if rec.Code != 409 {
+		t.Fatalf("add without a role for a domain of another organization's rule: %d %s", rec.Code, rec.Body)
 	}
-	id := jsonField(t, rec, "id").(string)
+	id := f.addProvider(acmeIdP, "", "other.acme.test")
+	if rec := f.as("admin", "PUT", orgSSO+"/providers/"+id, map[string]any{"domains": []string{"acme.test"}}); rec.Code != 409 {
+		t.Fatalf("moving a provider onto another organization's domain: %d %s", rec.Code, rec.Body)
+	}
 	if r, err := f.srv.members.Store.GetDomainDefault(ctx, "acme.test"); err != nil || r.OrgID != bravo.ID {
-		t.Fatalf("bravo's rule after a provider without a role: %+v, %v", r, err)
+		t.Fatalf("bravo's rule after the refusals: %+v, %v", r, err)
 	}
-	if rec := f.as("admin", "PUT", orgSSO+"/providers/"+id, map[string]any{"default_role": "developer"}); rec.Code != 409 {
-		t.Fatalf("raising the role over another organization's rule: %d %s", rec.Code, rec.Body)
+}
+
+// ---- one address, several accounts -------------------------------------------
+
+// addSSOAccount puts an account that came from single sign-on in the fake GoTrue, whose uniqueness
+// index (like GoTrue's) does not count it.
+func (g *fakeGoTrue) addSSOAccount(id, email, provider string, created time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.users[id] = map[string]any{"id": id, "email": email, "created_at": created.UTC().Format(time.RFC3339),
+		"app_metadata": map[string]any{"provider": "sso:" + provider, "providers": []string{"sso:" + provider}}}
+}
+
+func (g *fakeGoTrue) has(id string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_, ok := g.users[id]
+	return ok
+}
+
+const (
+	pwUser     = "cccccccc-0000-4000-8000-000000000001"
+	shadowUser = "cccccccc-0000-4000-8000-000000000002"
+	shadow2    = "cccccccc-0000-4000-8000-000000000003"
+)
+
+// An identity provider can vouch for the address of a password account, and the newer SSO account
+// then comes first in GoTrue's list. The operator's commands and the invitation path must never
+// take it for the password account: `users role ... owner` would make it Owner.
+func TestSSOAccountOfAnExistingAddressDoesNotShadowThePasswordAccount(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	acc := f.srv.accounts
+	other := "https://idp.other.test/saml"
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	id2 := f.gt.sso.add(other, "other.test")
+	f.gt.addUser(pwUser, "carol@acme.test", time.Now().Add(-48*time.Hour))
+	f.addMember(pwUser, members.RoleDeveloper)
+	f.gt.addSSOAccount(shadowUser, "Carol@Acme.test", id, time.Now())
+	f.gt.addSSOAccount(shadow2, "carol@acme.test", id2, time.Now().Add(-time.Hour))
+
+	users, err := acc.ListUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]DashboardUser{}
+	for _, u := range users {
+		seen[u.ID] = u
+	}
+	if seen[shadowUser].SSOProvider != id || seen[shadow2].SSOProvider != id2 || seen[pwUser].SSOProvider != "" {
+		t.Fatalf("the list does not say how each account signs in: %+v", seen)
+	}
+
+	// Resolution: the password account, unless the operator names another.
+	for name, tc := range map[string]struct {
+		sel  UserSelector
+		want string
+	}{
+		"no selector":        {UserSelector{}, pwUser},
+		"password provider":  {UserSelector{Provider: "email"}, pwUser},
+		"the SSO provider":   {UserSelector{Provider: id}, shadowUser},
+		"with the prefix":    {UserSelector{Provider: "sso:" + id2}, shadow2},
+		"by id":              {UserSelector{UserID: shadowUser}, shadowUser},
+		"by id and provider": {UserSelector{UserID: shadow2, Provider: id2}, shadow2},
+	} {
+		u, err := acc.ResolveUser(ctx, "carol@acme.test", tc.sel)
+		if err != nil || u == nil || u.ID != tc.want {
+			t.Errorf("%s: %+v, %v; want %s", name, u, err, tc.want)
+		}
+	}
+	if _, err := acc.ResolveUser(ctx, "carol@acme.test", UserSelector{UserID: pwUser, Provider: id}); err == nil {
+		t.Error("an id and a provider of different accounts resolved")
+	}
+
+	// `users role`: the password account gets the role, the shadow does not.
+	if _, u, err := acc.SetRoleOf(ctx, "carol@acme.test", "", "owner", UserSelector{}); err != nil || u.ID != pwUser {
+		t.Fatalf("set role: %+v, %v", u, err)
+	}
+	if got := f.roleOf(pwUser); got != members.RoleOwner {
+		t.Fatalf("the password account is %d, want Owner", got)
+	}
+	if got := f.roleOf(shadowUser); got != 0 {
+		t.Fatalf("the single sign-on account got role %d", got)
+	}
+	// Naming the SSO account is how to give it a role.
+	if _, u, err := acc.SetRoleOf(ctx, "carol@acme.test", "", "read-only", UserSelector{Provider: id}); err != nil || u.ID != shadowUser {
+		t.Fatalf("set role of the SSO account: %+v, %v", u, err)
+	}
+	if got := f.roleOf(shadowUser); got != members.RoleReadOnly || f.roleOf(pwUser) != members.RoleOwner {
+		t.Fatalf("roles: SSO %d, password %d", got, f.roleOf(pwUser))
+	}
+
+	// `users invite`: the address has a password account, so the invitee is an existing user (no
+	// claim link); the SSO accounts do not count as "already a member" either.
+	if _, err := acc.InviteToOrganization(ctx, nil, members.OrgRef{ID: f.org.ID, Slug: f.org.Slug}, members.InviteInput{Email: "carol@acme.test", RoleID: members.RoleDeveloper}); !errors.Is(err, members.ErrAlreadyMember) {
+		t.Fatalf("inviting the password account, a member: %v", err)
+	}
+
+	// `users remove` removes the password account only.
+	if _, err := acc.RemoveUser(ctx, "carol@acme.test", true); err != nil {
+		t.Fatal(err)
+	}
+	if f.gt.has(pwUser) || !f.gt.has(shadowUser) || !f.gt.has(shadow2) {
+		t.Fatal("remove did not take exactly the password account")
+	}
+	// What is left is two SSO accounts: ambiguous without a selector.
+	var amb *AmbiguousUserError
+	if _, err := acc.ResolveUser(ctx, "carol@acme.test", UserSelector{}); !errors.As(err, &amb) || len(amb.Matches) != 2 ||
+		!strings.Contains(err.Error(), "--user-id") || !strings.Contains(err.Error(), shadowUser) {
+		t.Fatalf("two SSO accounts without a selector: %v", err)
+	}
+	if _, err := acc.RemoveUser(ctx, "carol@acme.test", true); !errors.As(err, &amb) || !f.gt.has(shadowUser) || !f.gt.has(shadow2) {
+		t.Fatalf("remove with an ambiguous address: %v", err)
+	}
+	if _, err := acc.SetRole(ctx, "carol@acme.test", "", "owner"); !errors.As(err, &amb) {
+		t.Fatalf("set role with an ambiguous address: %v", err)
+	}
+	// Naming one removes that one, and the address then has a single account.
+	if u, _, err := acc.RemoveUserBy(ctx, "carol@acme.test", true, UserSelector{Provider: id2}); err != nil || u.ID != shadow2 {
+		t.Fatalf("remove by provider: %+v, %v", u, err)
+	}
+	if u, err := acc.ResolveUser(ctx, "carol@acme.test", UserSelector{}); err != nil || u == nil || u.ID != shadowUser {
+		t.Fatalf("the one account left: %+v, %v", u, err)
+	}
+	if u, err := acc.ResolveUser(ctx, "nobody@acme.test", UserSelector{}); err != nil || u != nil {
+		t.Fatalf("an unknown address: %+v, %v", u, err)
+	}
+}
+
+// An address that only an identity provider has an account for is invited like a new address: the
+// invitee gets the link that creates a password account.
+func TestInvitingAnAddressThatOnlyAnSSOAccountHas(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	id := f.addProvider(acmeIdP, "", "acme.test")
+	f.gt.addSSOAccount(shadowUser, "dave@acme.test", id, time.Now())
+	f.srv.accounts.NoMail = true
+	res, org, err := f.srv.accounts.InviteByEmail(ctx, "dave@acme.test", "", "developer", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ClaimURL == "" {
+		t.Fatalf("no link that creates the password account: %+v", res)
+	}
+	// The SSO account stays what it was: not a member.
+	if m, err := f.srv.members.Store.GetMember(ctx, org.ID, shadowUser); err == nil && m != nil {
+		t.Fatalf("the SSO account became a member: %+v", m)
+	}
+}
+
+// A first sign-in whose address has a password account is recorded as such in the audit trail.
+func TestSSOFirstSignInWithAPasswordAccountsAddressIsAudited(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	f.gt.addUser(pwUser, "alice@acme.test", time.Now().Add(-time.Hour))
+	f.addMember(pwUser, members.RoleOwner)
+	f.gt.addSSOAccount(ssoUser1, "alice@acme.test", id, time.Now())
+	if rec := f.doAs(f.ssoToken(ssoUser1, "alice@acme.test", id), "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("first sign-in: %d %s", rec.Code, rec.Body)
+	}
+	evs, err := f.reg.ListEvents(ctx, config.SystemRef, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range evs {
+		if e.Kind == "sso.user.first_sign_in" && strings.Contains(string(e.Payload), `"shares_email_with":"`+pwUser+`"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no first-sign-in event names the password account: %+v", evs)
+	}
+	// The SSO user did not take the password account's Owner role.
+	if f.roleOf(ssoUser1) != members.RoleDeveloper || f.roleOf(pwUser) != members.RoleOwner {
+		t.Fatalf("roles: SSO %d, password %d", f.roleOf(ssoUser1), f.roleOf(pwUser))
+	}
+}
+
+// Denying a user who joined an organization since the last request does not delete the account.
+func TestSSODenyRefusesAUserWhoIsAMemberNow(t *testing.T) {
+	f := newSSOFixture(t)
+	id := f.addProvider(acmeIdP, "", "acme.test")
+	tok := f.ssoToken(ssoUser1, "alice@acme.test", id)
+	f.gt.addUser(ssoUser1, "alice@acme.test", time.Now())
+	if rec := f.doAs(tok, "GET", "/platform/profile", nil); rec.Code != 403 {
+		t.Fatalf("pending: %d", rec.Code)
+	}
+	// Made a member by other means (`sbctl users role`) before the user's next request.
+	f.addMember(ssoUser1, members.RoleDeveloper)
+	if rec := f.as("owner", "DELETE", orgSSO+"/pending/"+ssoUser1, nil); rec.Code != 409 {
+		t.Fatalf("deny a member: %d %s", rec.Code, rec.Body)
+	}
+	if !f.gt.has(ssoUser1) {
+		t.Fatal("the member's account was deleted")
+	}
+	if u, err := f.srv.sso.Store.GetSSOUser(context.Background(), ssoUser1); err != nil || u.State != SSOActive {
+		t.Fatalf("state %+v, %v", u, err)
+	}
+	if rec := f.doAs(tok, "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("the member's session: %d %s", rec.Code, rec.Body)
+	}
+	if n := len(jsonField(t, f.as("owner", "GET", orgSSO+"/pending", nil), "items").([]any)); n != 0 {
+		t.Fatalf("the member is still listed as pending")
+	}
+}
+
+// Removing a provider removes its users' memberships (they cannot sign in any more), and refuses
+// when one of them is the only Owner of an organization.
+func TestSSORemovingAProviderRemovesItsUsersMemberships(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	org := members.OrgRef{ID: f.org.ID, Slug: f.org.Slug}
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	for u, email := range map[string]string{ssoUser1: "alice@acme.test", ssoUser2: "bob@acme.test"} {
+		if rec := f.doAs(f.ssoToken(u, email, id), "GET", "/platform/projects", nil); rec.Code != 200 {
+			t.Fatalf("first sign-in of %s: %d", email, rec.Code)
+		}
+	}
+	if err := f.srv.members.AssignProjectRole(ctx, nil, org, ssoUser2, members.RoleReadOnly, []string{testRef}); err != nil {
+		t.Fatal(err)
+	}
+	// Bob is promoted to Owner; the original Owner steps down, so Bob is the only one.
+	if err := f.srv.members.SetOrgRole(ctx, nil, org, ssoUser2, members.RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.srv.members.SetOrgRole(ctx, nil, org, f.userID, members.RoleDeveloper); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.srv.sso.Remove(ctx, nil, id, 0); err == nil || !strings.Contains(err.Error(), "only Owner") {
+		t.Fatalf("removing the provider of the only Owner: %v", err)
+	}
+	if got := f.gt.sso.ids(); len(got) != 1 {
+		t.Fatalf("the refused removal reached GoTrue: %v", got)
+	}
+	if f.roleOf(ssoUser2) != members.RoleOwner {
+		t.Fatal("the only Owner lost the role in a refused removal")
+	}
+	// With another Owner, the removal goes through and takes every SSO user's memberships.
+	if err := f.srv.members.SetOrgRole(ctx, nil, org, f.userID, members.RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.srv.sso.Remove(ctx, nil, id, 0); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	for _, u := range []string{ssoUser1, ssoUser2} {
+		if ms, _ := f.srv.members.Store.MembershipsOf(ctx, u); len(ms) != 0 {
+			t.Errorf("%s still has memberships: %+v", u, ms)
+		}
+		if prs, _ := f.srv.members.Store.ProjectRolesOf(ctx, u); len(prs) != 0 {
+			t.Errorf("%s still has project roles: %+v", u, prs)
+		}
+	}
+	if n, _ := f.srv.members.Store.CountOwners(ctx, f.org.ID); n != 1 {
+		t.Errorf("the organization has %d Owners, want the one password Owner", n)
 	}
 }
