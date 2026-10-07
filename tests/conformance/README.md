@@ -85,6 +85,13 @@ supabase-js 2.117.3:
   Functions wiring (the syncer loop, the Management API hook and the proxy route):
   `internal/app/serve_integration_test.go` only checks that the setting reaches the proxy, and
   it skips in `ci.yml` without `SUPAVISE_TEST_UNPACKED`.
+- **pg_cron** (`cron.test.mjs`): `create extension pg_cron`, `cron.schedule` with a seconds schedule, a
+  `succeeded` row in `cron.job_run_details` and the job's insert in a table, `cron.unschedule`
+  stops it. A node whose pg_cron cannot connect to its own cluster records every run as failed.
+- **Branches** (`branches.test.mjs`): a schema-only branch created with `POST /v1/projects/{ref}/branches`,
+  the endpoint behind `supabase branches create` and Studio; it reaches `MIGRATIONS_PASSED`, is listed
+  next to the default branch and found by name, carries the parent's migration and none of its data,
+  and `DELETE /v1/branches/{id}` removes it (list and get answer 404).
 
 Supabase CLI (`cli.sh`), through a profile file made by `supavise api profile`:
 
