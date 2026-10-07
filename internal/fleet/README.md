@@ -93,6 +93,8 @@ registry, so the CLI never sends defaults over saved settings.
 Supavisor's `GET /api/tenants/<ref>/terminate` ("Stop tenant's pools and clear cache") makes the
 new password of a role take effect at once through the pooler. Lazy tenants forward it.
 
+`Fleet.QuiesceTenant(ref)` calls `Quiescer.QuiesceTenant` before a project's PostgreSQL stops (pause, a settings-driven restart): Realtime's `POST /api/tenants/<ref>/reload` stops the tenant's CDC processes and database pool and disconnects its sockets. Without it, Realtime's logical replication connection (a walsender) keeps a fast shutdown from finishing, and systemd kills the cluster after its 90 second stop timeout (found by `tests/linux/settings-smoke.sh`). The service reconnects when a client next asks for the tenant.
+
 ## Verified
 
 On darwin-arm64 with the slim-services artifacts under the exec backend, through `internal/proxy` and supabase-js 2.117.2 against `<ref>.api.127.0.0.1.sslip.io` (see `TestIntegrationFleetTenants` for what is automated):

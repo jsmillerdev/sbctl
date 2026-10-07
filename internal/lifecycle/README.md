@@ -47,7 +47,7 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
 
 ## Other operations
 
-- `Pause`: PostgREST, GoTrue, PostgreSQL stop in that order; `INACTIVE`; route and tenants
+- `Pause`: the shared services are asked to let go of the project's database (`fleet.Quiescer`), then PostgREST, GoTrue, PostgreSQL stop in that order; `INACTIVE`; route and tenants
   stay. `Resume` reverses it; on failure what started is stopped and the project stays
   `INACTIVE`.
 - `Delete`/`DeleteWith`: final base backup through `BaseBackuper` (the `FinalBackuper` method
@@ -100,7 +100,9 @@ makes a saved change take effect and touches only what the service owns: `Reconf
 re-renders both API unit files but restarts only GoTrue or PostgREST and waits for it to answer;
 Realtime and Storage get `EnsureTenant`; Postgres goes through `ApplyPostgresSettings`
 (`ALTER SYSTEM` for the settings not on the command line, a reset for those no longer saved,
-`pg_reload_conf`, and a restart when asked and needed; `pg_settings.pending_restart` and a diff of
+`pg_reload_conf`, and a restart when asked and needed: the whole project restarts like a pause and
+a resume, because the GoTrue and PostgREST units are bound to the cluster's, after the shared
+services were asked to let go of its database; `pg_settings.pending_restart` and a diff of
 the command-line settings against the running ones say whether one is pending). A paused project
 is not touched, a project in a transitional status is refused (`ErrInvalidState`).
 
