@@ -8,6 +8,7 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // RestoreRequest says what an in-place restore brings back.
@@ -45,6 +46,10 @@ var ErrNoRestorer = errors.New("lifecycle: this node has no backup service, so t
 // EventRestoreRequested records that a restore began through the Engine (the Management
 // API). The backup service writes restore.completed or restore.failed when it ends.
 const EventRestoreRequested = "restore.requested"
+
+// EventRestorePasswordsFailed records that the role passwords of a restored cluster could not
+// be set to the registry's (see reapplyRolePasswords).
+const EventRestorePasswordsFailed = "restore.passwords_failed"
 
 // restoringKey marks a context as belonging to an in-place restore, whose Pause and Resume
 // calls must leave the project RESTORING instead of walking it through PAUSING, INACTIVE and
@@ -93,8 +98,9 @@ type Restore struct {
 // BeginRestore moves an active project to RESTORING and returns the handle that runs the
 // restore. It refuses (ErrInvalidState) a project that is paused, starting, being deleted or
 // already being restored, so two operations never overlap: every other operation checks the
-// status under the same per-project lock. The caller must call Run; until then the project
-// stays RESTORING.
+// status under the same per-project lock. It refuses with ErrInsufficientDisk when the disk
+// cannot hold the restored copy next to the current data. The caller must call Run; until
+// then the project stays RESTORING.
 func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, error) {
 	if e.restorer() == nil {
 		return nil, ErrNoRestorer
@@ -107,6 +113,9 @@ func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, erro
 	if ref == config.SystemRef {
 		return nil, fmt.Errorf("%w: the system project holds the registry and cannot be restored this way", ErrInvalidState)
 	}
+	// The data directory is measured before the lock, so a large one does not hold up the
+	// project's other operations; the status checks below still come first in the answer.
+	spaceErr := e.checkRestoreSpace(ref)
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -119,6 +128,9 @@ func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, erro
 	if !active(p.Status) {
 		return nil, invalidState(p, "restore")
 	}
+	if spaceErr != nil {
+		return nil, spaceErr
+	}
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusRestoring); err != nil {
 		return nil, err
 	}
@@ -128,8 +140,10 @@ func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, erro
 
 // Run restores the project in place and settles its status: ACTIVE_HEALTHY when the restore
 // worked; after a failure ACTIVE_UNHEALTHY until a health check finds the project running on
-// its original data again (the backup service puts the original back when it can). The
-// outcome is the backup service's error, if any.
+// its original data again (the backup service puts the original back when it can). After a
+// restore that worked it also sets the cluster's role passwords to the registry's, and it
+// bounds the old data directories the restores left (pruneRestoreLeftovers). The outcome is
+// the backup service's error, if any.
 func (r *Restore) Run(ctx context.Context, req RestoreRequest) error {
 	e := r.e
 	defer e.restoring.Delete(r.ref)
@@ -138,6 +152,10 @@ func (r *Restore) Run(ctx context.Context, req RestoreRequest) error {
 
 	cctx, cancel := cleanupCtx(ctx)
 	defer cancel()
+	if err == nil {
+		e.reapplyRolePasswords(cctx, r.ref)
+	}
+	e.pruneRestoreLeftovers(r.ref, err == nil)
 	if serr := e.settleRestore(cctx, r.ref, err == nil); serr != nil {
 		e.log.Warn("restore: could not settle the project status", "ref", r.ref, "error", serr)
 	}
@@ -146,6 +164,48 @@ func (r *Restore) Run(ctx context.Context, req RestoreRequest) error {
 		return fmt.Errorf("lifecycle: restore %s: %w", r.ref, err)
 	}
 	return nil
+}
+
+// rolePasswordPlane is implemented by a data plane that can set every service role's password
+// in a running cluster from the project's keys; PostgresPlane has it.
+type rolePasswordPlane interface {
+	SetRolePasswords(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
+}
+
+// reapplyRolePasswords gives the restored cluster the role passwords the registry holds. A
+// restore to a time before a database password reset brings the old password back inside the
+// cluster, and the registry, GoTrue and PostgREST keep the current ones: this puts the
+// cluster back in line, the invariant SetDatabasePassword keeps. A failure is logged and
+// recorded as a restore.passwords_failed event; the restore itself stands.
+func (e *Engine) reapplyRolePasswords(ctx context.Context, ref string) {
+	pp, ok := e.plane.(rolePasswordPlane)
+	if !ok {
+		return
+	}
+	fail := func(err error) {
+		e.log.Warn("restore: could not set the role passwords of the restored cluster to the current ones; the services may fail to log in until the database password is reset", "ref", ref, "error", err)
+		e.event(ctx, ref, EventRestorePasswordsFailed, map[string]string{"error": err.Error()})
+	}
+	p, err := e.reg.GetProject(ctx, ref)
+	if err != nil {
+		fail(err)
+		return
+	}
+	keys, err := e.loadKeys(ctx, ref)
+	if err != nil {
+		fail(err)
+		return
+	}
+	if err := pp.SetRolePasswords(ctx, p, keys); err != nil {
+		fail(err)
+		return
+	}
+	if len(e.opts.Fleet) > 0 {
+		// The pooler may hold the verifier of the password the restore brought back.
+		if err := e.opts.Fleet.RefreshTenant(ctx, ref); err != nil {
+			e.log.Warn("restore: the pooler could not drop its cached logins", "ref", ref, "error", err)
+		}
+	}
 }
 
 // settleRestore ends RESTORING. A project that someone else moved on in the meantime (a

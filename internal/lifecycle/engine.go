@@ -78,6 +78,8 @@ type Engine struct {
 	locks sync.Map // ref -> *sync.Mutex
 	// restoring holds the refs whose in-place restore is running in this process (restore.go).
 	restoring sync.Map
+	// freeBytes reads the free space of the disk holding a path (-1: unknown); tests replace it.
+	freeBytes func(path string) int64
 }
 
 var _ Manager = (*Engine)(nil)
@@ -90,7 +92,7 @@ func NewEngine(cfg *config.Config, reg registry.Registry, sec secrets.Secrets, a
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	return &Engine{cfg: cfg, reg: reg, sec: sec, arts: arts, plane: plane, opts: opts, log: opts.Log}
+	return &Engine{cfg: cfg, reg: reg, sec: sec, arts: arts, plane: plane, opts: opts, log: opts.Log, freeBytes: diskFree}
 }
 
 // advisoryPool is implemented by the Postgres registry; the in-memory one has no

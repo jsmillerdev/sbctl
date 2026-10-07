@@ -159,8 +159,10 @@ func (s *Server) beginOp() (func(), error) {
 // Drain stops the server from starting lifecycle operations (they answer 503) and waits
 // until the ones in flight have finished or ctx ends. Call it when shutdown begins and
 // close the registry only after it returns. A nil error means nothing is left running;
-// otherwise the error says how many operations were cut off, and lifecycle.Engine.Recover
-// finishes or reverts them at the next start.
+// otherwise the error says how many operations were cut off. lifecycle.Engine.Recover
+// finishes or reverts most of them at the next start, but not a restore: that project stays
+// RESTORING until an operator settles it (internal/backup/README.md), so a restart during
+// one is to be avoided.
 func (s *Server) Drain(ctx context.Context) error {
 	s.ops.mu.Lock()
 	s.ops.draining = true

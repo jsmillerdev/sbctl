@@ -28,9 +28,12 @@ type BackupSource interface {
 	RestoreWindow(ctx context.Context, ref string, running bool) (backup.RestoreWindow, error)
 }
 
-// restoreTimeout bounds one restore: the base backup is unpacked, WAL is replayed (up to the
-// backup service's recovery timeout of 30 minutes), and a new base backup is taken.
-const restoreTimeout = 4 * time.Hour
+// restoreWarnAfter is how long a restore may run before the log says it is taking long: the
+// base backup is unpacked, WAL is replayed (up to the backup service's recovery timeout of 30
+// minutes), and a new base backup is taken. The restore itself has no deadline: one that
+// expired halfway would also expire the rollback, which stops and starts the project, and
+// leave it down on its original data.
+const restoreWarnAfter = 4 * time.Hour
 
 // errNoBackups answers a restore on a node whose backup service is not set up.
 var errNoBackups = errf(http.StatusServiceUnavailable, "Backups are not set up on this Supavise node, so there is nothing to restore from")
@@ -314,16 +317,19 @@ func (s *Server) restorePITRRoute(w http.ResponseWriter, r *http.Request) error 
 // startRestore moves the project to RESTORING and runs the restore in the background, outside
 // the request: a client that leaves must not stop it halfway. The answer is 201 once the project
 // is RESTORING; the dashboard then follows the project's status until it is ACTIVE_HEALTHY again.
-// A project that is not active, or is already being restored, is refused with 409.
+// A project that is not active, or is already being restored, is refused with 409, and so is
+// one whose disk cannot hold the restored copy.
 func (s *Server) startRestore(w http.ResponseWriter, r *http.Request, p *registry.Project, req lifecycle.RestoreRequest) error {
 	dr, ok := s.mgr.(lifecycle.DatabaseRestorer)
 	if !ok {
 		return errNoBackups
 	}
-	ctx, cancel, err := s.detach(r, restoreTimeout)
+	ctx, cancel, err := s.detach(r, restoreWarnAfter)
 	if err != nil {
 		return err
 	}
+	// detach's deadline bounds BeginRestore; the restore runs on a context without one.
+	rctx := context.WithoutCancel(ctx)
 	rs, err := dr.BeginRestore(ctx, p.Ref)
 	switch {
 	case errors.Is(err, lifecycle.ErrNoRestorer):
@@ -335,7 +341,11 @@ func (s *Server) startRestore(w http.ResponseWriter, r *http.Request, p *registr
 	}
 	go func() {
 		defer cancel()
-		if err := rs.Run(ctx, req); err != nil {
+		slow := time.AfterFunc(restoreWarnAfter, func() {
+			s.log.Warn("restore is taking long", "ref", p.Ref, "after", restoreWarnAfter)
+		})
+		defer slow.Stop()
+		if err := rs.Run(rctx, req); err != nil {
 			s.log.Error("restore failed", "ref", p.Ref, "err", err)
 			return
 		}

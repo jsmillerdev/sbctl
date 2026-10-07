@@ -28,6 +28,8 @@ func mapErr(err error) error {
 		return errf(http.StatusConflict, "Already exists")
 	case errors.Is(err, lifecycle.ErrInvalidState):
 		return errf(http.StatusConflict, "%v", err)
+	case errors.Is(err, lifecycle.ErrInsufficientDisk):
+		return errf(http.StatusConflict, "%v", err)
 	}
 	return err
 }

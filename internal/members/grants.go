@@ -153,8 +153,10 @@ func roleEntries(role int, ownerRoleIDs []int64) []Permission {
 			perm([]string{ActCreate}, []string{ResUserContent}, false),
 			ownContent(perm([]string{ActUpdate, ActDelete}, []string{ResUserContent}, false), nil),
 			perm(writeActions, []string{ResPreviewBranches}, false),
-			// Hosted lists Restart for Developers; Pause, Restore, Delete and the backup
-			// restores stay with Administrators.
+			// Hosted lists Restart for Developers; Pause, Restore and Delete stay with
+			// Administrators. Hosted also lists the backup restores for Developers; Supavise
+			// keeps them for Owners and Administrators on purpose, because a restore
+			// overwrites the project's data.
 			perm([]string{ActInfraExecute}, developerInfra, false),
 		}
 	case RoleReadOnly:

@@ -394,6 +394,11 @@ func (pl *PostgresPlane) RestartDatabase(ctx context.Context, p *registry.Projec
 	return pl.restartDatabase(ctx, p, keys)
 }
 
+// SetRolePasswords sets the login passwords of all the service roles to the ones in keys.
+func (pl *PostgresPlane) SetRolePasswords(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error {
+	return setRolePasswords(ctx, pl.paths(p), pl.rolePasswords(keys))
+}
+
 // SetRolePassword sets the login password of role in p's cluster (as a SCRAM verifier,
 // with statement logging off), over the unix socket as supabase_admin.
 func (pl *PostgresPlane) SetRolePassword(ctx context.Context, p *registry.Project, role, password string) error {

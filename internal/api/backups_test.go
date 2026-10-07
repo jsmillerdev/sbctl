@@ -326,6 +326,44 @@ func TestRestoreFromABackupRefusals(t *testing.T) {
 	}
 }
 
+// A backup id is a registry row id, and rows of other projects are numbered in the same
+// sequence: naming another project's backup must not restore it into this one, even when
+// the backup service happens to know the manifest.
+func TestRestoreRefusesAnotherProjectsBackup(t *testing.T) {
+	b := newBackupFixture(t)
+	b.mgr.restores = make(chan restoreRecord, 4)
+	ctx := context.Background()
+	const otherRef = "zyxwvutsrqponmlkjihg"
+	if err := b.reg.CreateProject(ctx, &registry.Project{Ref: otherRef, Name: "other", Status: registry.StatusActiveHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := backup.Manifest{ID: "20261003T120000Z-cccccc", Ref: otherRef, Timeline: 1, StartTime: b.now.Add(-72 * time.Hour), StopTime: b.now.Add(-72*time.Hour + time.Minute)}
+	row := &registry.Backup{Ref: otherRef, Kind: "base", Status: registry.BackupCompleted, StartedAt: foreign.StartTime,
+		Location: "file:///var/lib/supavise/backups/" + otherRef + "/base/" + foreign.ID}
+	if err := b.reg.CreateBackup(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	// The fake source ignores the ref, so only the ref-scoped row lookup stands in the way.
+	b.src.window.Backups = append(b.src.window.Backups, foreign)
+	for _, path := range []string{
+		"/platform/database/" + testRef + "/backups/restore",
+		"/platform/database/" + testRef + "/backups/restore-physical",
+		"/v1/projects/" + testRef + "/database/backups/restore",
+	} {
+		if rec := b.post(path, map[string]any{"id": row.ID}); rec.Code != 404 {
+			t.Errorf("POST %s with another project's backup: %d %s, want 404", path, rec.Code, rec.Body)
+		}
+	}
+	if got := b.status(); got != registry.StatusActiveHealthy {
+		t.Errorf("status after the refusals = %s", got)
+	}
+	select {
+	case r := <-b.mgr.restores:
+		t.Fatalf("a refused request ran a restore: %+v", r)
+	default:
+	}
+}
+
 func TestRestorePhysicalToATimeFromABackup(t *testing.T) {
 	b := newBackupFixture(t)
 	b.mgr.restores = make(chan restoreRecord, 4)
@@ -433,6 +471,11 @@ func TestRestoreRefusedWhileNotActiveOrWithoutBackends(t *testing.T) {
 	if rec := b.post(path, body); rec.Code != 409 {
 		t.Errorf("the Engine refuses: %d %s", rec.Code, rec.Body)
 	}
+	// A disk without room for the restored copy is a 409 that says so, and the project is untouched.
+	b.mgr.beginErr = fmt.Errorf("%w: the disk has 1.0 GiB free and restoring project %s needs about 9.0 GiB", lifecycle.ErrInsufficientDisk, testRef)
+	if rec := b.post(path, body); rec.Code != 409 || !strings.Contains(rec.Body.String(), "free") || b.status() != registry.StatusActiveHealthy {
+		t.Errorf("not enough disk: %d %s, status %s", rec.Code, rec.Body, b.status())
+	}
 	b.mgr.beginErr = nil
 	// While the project is not running, its time is not judged against a window that ends with the
 	// archive: the answer is 409 (a second restore during RESTORING), not a 400 about the time.
@@ -447,6 +490,20 @@ func TestRestoreRefusedWhileNotActiveOrWithoutBackends(t *testing.T) {
 		if b.status() != st {
 			t.Errorf("a refused restore moved %s to %s", st, b.status())
 		}
+	}
+}
+
+// The restore itself has no deadline: one that expired halfway would also expire the rollback
+// that stops and starts the project.
+func TestRestoreRunsWithoutADeadline(t *testing.T) {
+	b := newBackupFixture(t)
+	b.mgr.restores = make(chan restoreRecord, 4)
+	rec := b.post("/platform/database/"+testRef+"/backups/pitr", map[string]any{"recovery_time_target_unix": b.now.Add(-time.Hour).Unix()})
+	if rec.Code != 201 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if got := b.waitRestore(); got.deadline {
+		t.Error("the restore's context carries a deadline")
 	}
 }
 

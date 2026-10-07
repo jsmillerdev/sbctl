@@ -62,6 +62,8 @@ type fakeManager struct {
 type restoreRecord struct {
 	ref string
 	req lifecycle.RestoreRequest
+	// deadline is whether the context Run got carried a deadline.
+	deadline bool
 }
 
 func (m *fakeManager) observe(op string, ctx context.Context) {
@@ -181,7 +183,8 @@ func (r *fakeRestore) Run(ctx context.Context, req lifecycle.RestoreRequest) err
 	}
 	_ = m.reg.SetProjectStatus(context.WithoutCancel(ctx), r.ref, status)
 	if out != nil {
-		out <- restoreRecord{r.ref, req}
+		_, hasDeadline := ctx.Deadline()
+		out <- restoreRecord{ref: r.ref, req: req, deadline: hasDeadline}
 	}
 	return err
 }

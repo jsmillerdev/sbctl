@@ -3,11 +3,14 @@ package lifecycle
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/jsmillerdev/supavise/internal/fleet"
 	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // fakeRestorer stands in for backup.Service: like the real one it pauses the project and
@@ -234,5 +237,189 @@ func TestInterruptedRestoreCanBeDeleted(t *testing.T) {
 	}
 	if err := h.e.Delete(ctx, p.Ref); err != nil {
 		t.Fatalf("delete of a project left RESTORING: %v", err)
+	}
+}
+
+// pwPlane is a data plane that can set the service roles' passwords, as PostgresPlane can.
+type pwPlane struct {
+	*fakePlane
+	set []string
+	err error
+}
+
+func (p *pwPlane) SetRolePasswords(_ context.Context, _ *registry.Project, keys *secrets.ProjectKeys) error {
+	p.set = append(p.set, keys.DBPassword)
+	return p.err
+}
+
+func eventKinds(t *testing.T, h *harness, ref string) []string {
+	t.Helper()
+	evs, err := h.reg.ListEvents(context.Background(), ref, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, ev := range evs {
+		out = append(out, ev.Kind)
+	}
+	return out
+}
+
+func TestRestoreReappliesTheCurrentRolePasswords(t *testing.T) {
+	ctx := context.Background()
+	h, fr := newRestoreHarness(t)
+	pl := &pwPlane{fakePlane: h.plane}
+	h.e = NewEngine(h.cfg, h.reg, h.sec, fakeArts{}, pl, Options{Fleet: fleet.Fleet{h.tenant}, Backup: fr})
+	p := h.create(t)
+	keys, err := h.e.Keys(ctx, p.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := func() error {
+		r, err := h.e.BeginRestore(ctx, p.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Run(ctx, RestoreRequest{Target: time.Now()})
+	}
+	if err := run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(pl.set) != 1 || pl.set[0] != keys.DBPassword {
+		t.Fatalf("role passwords set after the restore: %v, want the registry's", pl.set)
+	}
+
+	// A restore that failed put the original back: its passwords are the registry's already.
+	fr.err = errors.New("recovery ended before configured recovery target was reached")
+	if err := run(); err == nil {
+		t.Fatal("the failed restore reported success")
+	}
+	if len(pl.set) != 1 {
+		t.Errorf("a failed restore set role passwords: %v", pl.set)
+	}
+
+	// A cluster that refuses the passwords does not undo a restore that worked; the event says so.
+	fr.err = nil
+	pl.err = errors.New("cluster is read-only")
+	if err := run(); err != nil {
+		t.Fatalf("restore with failing role passwords: %v", err)
+	}
+	if got := status(t, h, p.Ref); got != registry.StatusActiveHealthy {
+		t.Errorf("status = %s", got)
+	}
+	var seen bool
+	for _, k := range eventKinds(t, h, p.Ref) {
+		seen = seen || k == EventRestorePasswordsFailed
+	}
+	if !seen {
+		t.Error("no restore.passwords_failed event")
+	}
+}
+
+// diskHarness is a restore harness whose state directory is a temp directory with a project
+// data directory of size bytes, and a disk reporting free bytes.
+func diskHarness(t *testing.T, size, free int64) (*harness, *fakeRestorer, *registry.Project) {
+	t.Helper()
+	h, fr := newRestoreHarness(t)
+	h.cfg.StateDir = t.TempDir()
+	p := h.create(t)
+	data := h.cfg.Paths().PostgresData(p.Ref)
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "base"), make([]byte, size), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.e.freeBytes = func(string) int64 { return free }
+	return h, fr, p
+}
+
+func TestBeginRestoreRefusesWhenTheDiskCannotHoldTheCopy(t *testing.T) {
+	ctx := context.Background()
+	const size = 4 << 20
+	need := restoreNeed(size)
+
+	h, fr, p := diskHarness(t, size, need-1)
+	_, err := h.e.BeginRestore(ctx, p.Ref)
+	if !errors.Is(err, ErrInsufficientDisk) {
+		t.Fatalf("BeginRestore with %d free, %d needed: %v", need-1, need, err)
+	}
+	if got := status(t, h, p.Ref); got != registry.StatusActiveHealthy {
+		t.Errorf("a refused restore left the status %s", got)
+	}
+	if len(fr.reqs) != 0 {
+		t.Errorf("a refused restore ran: %+v", fr.reqs)
+	}
+	// Enough room, and an unreadable disk, both go ahead; a status refusal still comes first.
+	h.e.freeBytes = func(string) int64 { return need }
+	r, err := h.e.BeginRestore(ctx, p.Ref)
+	if err != nil {
+		t.Fatalf("BeginRestore with enough room: %v", err)
+	}
+	if err := r.Run(ctx, RestoreRequest{Target: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	h.e.freeBytes = func(string) int64 { return -1 }
+	if _, err := h.e.BeginRestore(ctx, p.Ref); err != nil {
+		t.Fatalf("BeginRestore with an unreadable disk: %v", err)
+	}
+	h.e.freeBytes = func(string) int64 { return 0 }
+	if _, err := h.e.BeginRestore(ctx, p.Ref); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("restore of a project already RESTORING on a full disk: %v", err)
+	}
+}
+
+func TestRestoreKeepsOnlyTheNewestOldDataDirectory(t *testing.T) {
+	ctx := context.Background()
+	h, fr, p := diskHarness(t, 1024, 1<<40)
+	data := h.cfg.Paths().PostgresData(p.Ref)
+	mk := func(suffix string) string {
+		d := data + suffix
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	oldPre1 := mk(".pre-restore-20261001T030000Z")
+	oldPre2 := mk(".pre-restore-20261002T030000Z")
+	oldFailed := mk(".failed-restore-20261002T040000Z")
+	// The restore moves the data aside as the backup service does.
+	aside := data + ".pre-restore-20261003T030000Z"
+	fr.duringFn = func(context.Context) {
+		if err := os.MkdirAll(aside, 0o700); err != nil {
+			t.Error(err)
+		}
+	}
+	exists := func(d string) bool { _, err := os.Stat(d); return err == nil }
+	run := func() error {
+		r, err := h.e.BeginRestore(ctx, p.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Run(ctx, RestoreRequest{Target: time.Now()})
+	}
+
+	// A failed restore keeps the newest failed directory and every pre-restore one: a failed
+	// rollback leaves the original data in one of them.
+	failedNew := mk(".failed-restore-20261003T040000Z")
+	fr.err = errors.New("recovery failed")
+	if err := run(); err == nil {
+		t.Fatal("the failed restore reported success")
+	}
+	if exists(oldFailed) || !exists(failedNew) || !exists(oldPre1) || !exists(oldPre2) || !exists(aside) {
+		t.Errorf("after a failure: older failed %v, newest failed %v, pre-restore %v %v %v", exists(oldFailed), exists(failedNew), exists(oldPre1), exists(oldPre2), exists(aside))
+	}
+
+	// A restore that worked keeps the directory it just set aside and nothing older.
+	fr.err = nil
+	if err := run(); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(aside) || exists(oldPre1) || exists(oldPre2) || exists(failedNew) {
+		t.Errorf("after a restore: newest pre-restore %v, older %v %v, failed %v", exists(aside), exists(oldPre1), exists(oldPre2), exists(failedNew))
+	}
+	if !exists(data) {
+		t.Error("the data directory itself was removed")
 	}
 }
