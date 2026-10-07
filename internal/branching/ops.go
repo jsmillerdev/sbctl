@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -73,9 +74,18 @@ func (s *Service) Merge(ctx context.Context, idOrRef string, in ActionInput) (st
 			return "", err
 		}
 		if len(apply) == 0 {
-			return "nothing to merge: the parent already has every migration of the branch", nil
+			return "nothing to merge: the parent already has every migration of the branch" + s.functionsNote(ctx, b.Ref, parent.Ref), nil
 		}
-		res, err := s.db.Apply(ctx, parent.Ref, apply, ApplyOptions{Atomic: true, LockTimeout: mergeLockTimeout})
+		// The plan was made before Apply took the parent's apply lock. A merge from another
+		// branch may have landed since: judge the history the parent has under the lock, so
+		// that a serial merge and a concurrent one are refused alike.
+		verify := func(current []Migration) error {
+			if d := Compare(branchMigs, current).Summary(); d != "" && !in.Force {
+				return fmt.Errorf("%w: the parent changed while this merge waited: %s (use force to merge anyway)", ErrDiverged, d)
+			}
+			return nil
+		}
+		res, err := s.db.Apply(ctx, parent.Ref, apply, ApplyOptions{Atomic: true, LockTimeout: mergeLockTimeout, Verify: verify})
 		if err != nil {
 			return "", fmt.Errorf("apply to the parent (rolled back where the SQL allows): %w", err)
 		}
@@ -86,9 +96,39 @@ func (s *Service) Merge(ctx context.Context, idOrRef string, in ActionInput) (st
 		if in.Force && len(plan.Conflicts) > 0 {
 			detail += fmt.Sprintf("; skipped %d version(s) with different content", len(plan.Conflicts))
 		}
-		return detail, nil
+		return detail + s.functionsNote(ctx, b.Ref, parent.Ref), nil
 	})
 	return r.id, nil
+}
+
+// functionsNote is the sentence a merge adds when the branch has Edge Functions that the
+// parent lacks or has in another version: a merge carries migrations only, and a client that
+// reads "merged" must not take the functions to be on the parent. Empty when there is nothing
+// to say.
+func (s *Service) functionsNote(ctx context.Context, branchRef, parentRef string) string {
+	if s.fns == nil {
+		return ""
+	}
+	bf, err := s.fns.Digests(ctx, branchRef)
+	if err == nil {
+		var pf map[string]string
+		if pf, err = s.fns.Digests(ctx, parentRef); err == nil {
+			var differ []string
+			for slug, d := range bf {
+				if pd, ok := pf[slug]; !ok || pd != d {
+					differ = append(differ, slug)
+				}
+			}
+			if len(differ) == 0 {
+				return ""
+			}
+			sort.Strings(differ)
+			return fmt.Sprintf("; Edge Functions are NOT merged: %d function(s) of the branch are missing from the parent or differ from it (%s); deploy them to the parent (supabase functions deploy --project-ref %s)",
+				len(differ), strings.Join(differ, ", "), parentRef)
+		}
+	}
+	s.log.Warn("merge: could not compare the Edge Functions of the branch and the parent", "branch", branchRef, "err", err)
+	return "; Edge Functions are not merged (a merge carries migrations only) and could not be compared"
 }
 
 // upTo keeps the migrations with version <= v ("" keeps all); v must name one of them.

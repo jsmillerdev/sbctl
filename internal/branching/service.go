@@ -45,7 +45,10 @@ type Deps struct {
 	// supports copy-on-write clones.
 	Backup *backup.Service
 	// DB runs SQL in project databases. Nil connects with pgx through Engine.ConnString.
-	DB         Database
+	DB Database
+	// Functions, when set, lets Merge report Edge Functions that exist only on the branch or
+	// differ from the parent's. Nil: merge reports nothing about functions.
+	Functions  FunctionSource
 	Log        *slog.Logger
 	Now        func() time.Time
 	HTTPClient *http.Client // notify_url calls; nil builds a client that refuses private addresses
@@ -59,10 +62,19 @@ type Deps struct {
 	StaleAfter time.Duration
 }
 
+// FunctionSource reads the Edge Function deployments stored for a project, so that Merge can
+// tell an agent which of a branch's functions it does not carry back (it merges migrations
+// only). Digest maps function slug to a digest of the deployed function: its source files and
+// settings.
+type FunctionSource interface {
+	Digests(ctx context.Context, ref string) (map[string]string, error)
+}
+
 // Service implements branching.
 type Service struct {
 	cfg  *config.Config
 	reg  registry.Registry
+	fns  FunctionSource
 	sec  secrets.Secrets
 	eng  Engine
 	bk   *backup.Service
@@ -109,7 +121,7 @@ func New(d Deps) (*Service, error) {
 		return nil, err
 	}
 	s := &Service{
-		cfg: d.Cfg, reg: d.Registry, sec: d.Secrets, eng: d.Engine, bk: d.Backup, db: d.DB, log: d.Log, now: d.Now,
+		cfg: d.Cfg, reg: d.Registry, sec: d.Secrets, eng: d.Engine, bk: d.Backup, db: d.DB, fns: d.Functions, log: d.Log, now: d.Now,
 		http: d.HTTPClient, createWait: d.CreateWait, opTimeout: d.OpTimeout, staleAfter: d.StaleAfter,
 		detect: nil, runs: map[string]*run{},
 	}

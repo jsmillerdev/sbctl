@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/OWNER/sbctl/internal/api"
 	"github.com/OWNER/sbctl/internal/app"
 	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/branching"
@@ -36,9 +37,11 @@ func openBranching(ctx context.Context) (*branching.Service, func(), error) {
 	} else {
 		bk.SetManager(n.Engine)
 	}
-	svc, err := branching.New(branching.Deps{
-		Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Engine: n.Engine, Backup: bk, Log: log,
-	})
+	deps := branching.Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Engine: n.Engine, Backup: bk, Log: log}
+	if pg, ok := n.Registry.(*registry.Postgres); ok {
+		deps.Functions = api.FunctionDigests(api.NewPGStore(pg.Pool()))
+	}
+	svc, err := branching.New(deps)
 	if err != nil {
 		n.Close()
 		return nil, nil, err

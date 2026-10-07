@@ -135,6 +135,11 @@ type ApplyOptions struct {
 	// LockTimeout bounds how long a statement waits for a lock (0: no limit). Merges set it
 	// so that DDL on a busy parent fails instead of queueing behind, and blocking, traffic.
 	LockTimeout time.Duration
+	// Verify, with Atomic, is called while Apply holds the project's apply lock with the
+	// target's migration history as it is then, before anything runs. The history the plan was
+	// made from may have changed while Apply waited for the lock (another merge); an error
+	// from Verify aborts Apply without running anything.
+	Verify func(current []Migration) error
 }
 
 // ApplyResult reports how Apply ran.
@@ -177,6 +182,11 @@ func (d *pgDatabase) Migrations(ctx context.Context, ref string) ([]Migration, e
 		return nil, err
 	}
 	defer closeConn(c)
+	return readMigrations(ctx, c)
+}
+
+// readMigrations reads the migration history over an open connection.
+func readMigrations(ctx context.Context, c *pgx.Conn) ([]Migration, error) {
 	var has bool
 	if err := c.QueryRow(ctx, `select to_regclass('`+migrationsTable+`') is not null`).Scan(&has); err != nil {
 		return nil, err
@@ -249,24 +259,17 @@ func (d *pgDatabase) Apply(ctx context.Context, ref string, ms []Migration, o Ap
 		// One merge at a time per project: two would interleave their DDL. The lock belongs to
 		// this session, so it also covers the statement-by-statement fallback below, and it is
 		// released when the connection closes. The decision to apply was made before the lock
-		// was held: look again, so that a version another merge just applied is not run twice.
+		// was held: look again, so that a version another merge just applied is not run twice, and let
+		// the caller check its whole plan (divergence included) against the history as it is now.
 		if _, err := c.Exec(ctx, `select pg_advisory_lock(hashtext('sbctl.branching.apply'))`); err != nil {
 			return res, fmt.Errorf("wait for other migrations on %s: %w", ref, err)
 		}
-		versions := make([]string, len(ms))
-		for i, m := range ms {
-			versions[i] = m.Version
-		}
-		rows, err := c.Query(ctx, `select version from `+migrationsTable+` where version = any($1) order by version`, versions)
+		current, err := readMigrations(ctx, c)
 		if err != nil {
 			return res, err
 		}
-		have, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
+		if err := recheck(ref, ms, current, o.Verify); err != nil {
 			return res, err
-		}
-		if len(have) > 0 {
-			return res, fmt.Errorf("%w: %s already applied to %s while this operation waited; read the histories again", ErrDiverged, strings.Join(have, ", "), ref)
 		}
 	}
 	if o.Atomic {
@@ -294,6 +297,29 @@ func (d *pgDatabase) Apply(ctx context.Context, ref string, ms []Migration, o Ap
 		res.Applied++
 	}
 	return res, nil
+}
+
+// recheck is Apply's look at the target's history once it holds the lock: none of the
+// migrations may be there already, and the caller's own check (Verify) must still pass.
+func recheck(ref string, ms, current []Migration, verify func([]Migration) error) error {
+	have := map[string]bool{}
+	for _, m := range current {
+		have[m.Version] = true
+	}
+	var dup []string
+	for _, m := range ms {
+		if have[m.Version] {
+			dup = append(dup, m.Version)
+		}
+	}
+	if len(dup) > 0 {
+		sort.Strings(dup)
+		return fmt.Errorf("%w: %s already applied to %s while this operation waited; read the histories again", ErrDiverged, strings.Join(dup, ", "), ref)
+	}
+	if verify != nil {
+		return verify(current)
+	}
+	return nil
 }
 
 // applyEach runs one migration in its own transaction, or outside one when a statement

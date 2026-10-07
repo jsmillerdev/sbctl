@@ -245,7 +245,7 @@ func TestWithDataCloneUsesParentCredentialsThenRotates(t *testing.T) {
 	if req.Keys.JWTSecret == pk.JWTSecret || req.Keys.PublishableKey == pk.PublishableKey || req.Keys.AnonKey == pk.AnonKey {
 		t.Fatal("clone must get its own JWT secret and API keys")
 	}
-	if err := req.Seed(context.Background(), nil, "/x/data"); err != nil || len(cloned) != 1 || cloned[0] != parentRef+" clonefile" {
+	if err := req.Seed(context.Background(), nil, t.TempDir()); err != nil || len(cloned) != 1 || cloned[0] != parentRef+" clonefile" {
 		t.Fatalf("seeder: %v %v", err, cloned)
 	}
 	if len(h.eng.rotated) != 1 || h.eng.rotated[0] != b.Ref {
@@ -339,6 +339,84 @@ func TestMergeRefusesDivergence(t *testing.T) {
 	h.mustState(got, registry.BranchMigrationsPassed)
 	if v := h.db.applied[parentRef]; len(v) != 1 || v[0] != "20260110000000" {
 		t.Fatalf("forced merge applied %v", v)
+	}
+}
+
+// A merge from another branch that lands between this merge's plan and its lock is judged against
+// the parent's history as it is then: B lacks the migration A just merged, so B is refused as it
+// would be if the merges ran one after the other.
+func TestMergeRefusesWhatAConcurrentMergeMadeDivergent(t *testing.T) {
+	h := newHarness(t, nil)
+	b := h.create("b", nil)
+	ctx := context.Background()
+	h.db.migs[b.Ref] = append(h.db.migs[b.Ref], mig("20260130000000", "b work", "create table b (id int)"))
+	h.db.raceOnApply = func(d *fakeDB, ref string) {
+		if ref == parentRef {
+			d.migs[ref] = append(d.migs[ref], mig("20260120000000", "a work", "create table a (id int)"))
+			d.raceOnApply = nil // once
+		}
+	}
+	if _, err := h.svc.Merge(ctx, b.Ref, ActionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	got := h.wait(b.Ref)
+	h.mustState(got, registry.BranchMigrationsFailed)
+	if !strings.Contains(got.Detail, "20260120000000") || !strings.Contains(got.Detail, "diverged") {
+		t.Fatalf("detail = %q", got.Detail)
+	}
+	if len(h.db.applied[parentRef]) != 0 {
+		t.Fatalf("the refused merge ran: %v", h.db.applied[parentRef])
+	}
+	// Forced, the merge goes through on top of the other one.
+	if _, err := h.svc.Merge(ctx, b.Ref, ActionInput{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	h.mustState(h.wait(b.Ref), registry.BranchMigrationsPassed)
+	if v := h.db.applied[parentRef]; len(v) != 1 || v[0] != "20260130000000" {
+		t.Fatalf("forced merge applied %v", v)
+	}
+}
+
+type fakeFunctions map[string]map[string]string // ref -> slug -> digest
+
+func (f fakeFunctions) Digests(_ context.Context, ref string) (map[string]string, error) {
+	return f[ref], nil
+}
+
+// A merge carries migrations only. When the branch has Edge Functions that the parent lacks or
+// has in another version, the result says so, so that an agent does not take them as merged.
+func TestMergeSaysWhichFunctionsItDidNotCarry(t *testing.T) {
+	h := newHarness(t, nil)
+	fns := fakeFunctions{}
+	h.svc.fns = fns
+	b := h.create("feat", nil)
+	ctx := context.Background()
+	h.db.migs[b.Ref] = append(h.db.migs[b.Ref], mig("20260110000000", "feature", "create table f (id int)"))
+	fns[parentRef] = map[string]string{"same": "1", "changed": "1", "parent-only": "1"}
+	fns[b.Ref] = map[string]string{"same": "1", "changed": "2", "new-fn": "1"}
+	if _, err := h.svc.Merge(ctx, b.Ref, ActionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	got := h.wait(b.Ref)
+	h.mustState(got, registry.BranchMigrationsPassed)
+	if !strings.Contains(got.Detail, "merged 1 migration") || !strings.Contains(got.Detail, "Edge Functions are NOT merged") ||
+		!strings.Contains(got.Detail, "changed, new-fn") || strings.Contains(got.Detail, "same") || strings.Contains(got.Detail, "parent-only") {
+		t.Fatalf("detail = %q", got.Detail)
+	}
+	// Nothing left to merge still tells about functions.
+	if _, err := h.svc.Merge(ctx, b.Ref, ActionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if got = h.wait(b.Ref); !strings.Contains(got.Detail, "nothing to merge") || !strings.Contains(got.Detail, "Edge Functions are NOT merged") {
+		t.Fatalf("detail = %q", got.Detail)
+	}
+	// Equal functions: no remark.
+	fns[b.Ref] = map[string]string{"same": "1", "changed": "1"}
+	if _, err := h.svc.Merge(ctx, b.Ref, ActionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if got = h.wait(b.Ref); strings.Contains(got.Detail, "Edge Functions") {
+		t.Fatalf("detail = %q", got.Detail)
 	}
 }
 
@@ -870,6 +948,46 @@ func TestQuarantineSettingsComeAndGo(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(empty, "postgresql.auto.conf")); !strings.Contains(string(b), "cron.launch_active_jobs") {
 		t.Fatalf("written: %q", b)
+	}
+}
+
+// A copy-on-write clone starts its first postmaster from the parent's postgresql.auto.conf, so
+// the seeder has to write the first-start settings, as the base-backup path does.
+func TestCloneSeederWritesTheFirstStartSettings(t *testing.T) {
+	for _, method := range []string{MethodClonefile, MethodReflink} {
+		t.Run(method, func(t *testing.T) {
+			h := newHarness(t, nil)
+			h.svc.clone = func(_ context.Context, _, m, dst string) (*CloneStats, error) {
+				// What a clone of the parent leaves in the new data directory.
+				conf := "max_logical_replication_workers = '8'\nwork_mem = '8MB'\n"
+				return &CloneStats{Method: m}, os.WriteFile(filepath.Join(dst, "postgresql.auto.conf"), []byte(conf), 0o600)
+			}
+			dir := t.TempDir()
+			parent, err := h.reg.GetProject(context.Background(), parentRef)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var st *CloneStats
+			if err := h.svc.cloneSeeder(parent, method, &st)(context.Background(), nil, dir); err != nil {
+				t.Fatal(err)
+			}
+			conf, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
+			for _, q := range quarantineSettings {
+				if !strings.Contains(string(conf), q.key+" = "+q.value) {
+					t.Errorf("copy-on-write seeder left postgresql.auto.conf without %s = %s:\n%s", q.key, q.value, conf)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(dir, quarantineSaved)); err != nil {
+				t.Errorf("the parent's own lines were not saved for clearQuarantine: %v", err)
+			}
+			if err := clearQuarantine(dir); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
+			if want := "work_mem = '8MB'\nmax_logical_replication_workers = '8'\n"; string(got) != want {
+				t.Errorf("after clearing: %q, want %q", got, want)
+			}
+		})
 	}
 }
 

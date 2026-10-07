@@ -55,7 +55,11 @@ default branch (the project itself, `name: main`, `is_default: true`, a stable U
 from the ref) first, as on hosted. Called with a branch's ref it returns the whole family.
 
 A parent cannot be deleted while it has branches: `Engine.DeleteWith` refuses before it
-stops anything, and the foreign key backs that up.
+stops anything, and the foreign key backs that up. A branch create and a parent delete hold
+different lifecycle locks, so each looks at the other's write: the delete sets the parent
+`GOING_DOWN` and then looks for branch rows again (backing out if one landed), and the branch's
+`Engine.Create` looks at the parent's status after its own row exists (removing the row if the parent
+is going down). Whichever order they interleave in, no branch is left on a deleted parent.
 
 ## Operations
 
@@ -122,9 +126,15 @@ procedure is retried (three attempts). A file that cannot be cloned falls back t
 is up the service seals new passwords for all six service roles, sets them over the cluster's
 private unix socket as SCRAM verifiers (never plaintext, with statement logging off), and calls
 `Manager.RotateKeys`: new JWT secret and API keys, GoTrue and PostgREST restart, fleet tenants are
-updated. The parent's database password does not open the branch (tested). The pgsodium root key
+updated. The parent's database password does not open the branch (tested). The temporary CLI login
+roles the parent issued (`cli_login_*`, `sbctl_cli_ro_*`) are copied with their password verifiers;
+the rotation sets them `NOLOGIN` with no password and an expired validity (the API's expired-role
+sweep drops them), so a parent's `supabase db push` password does not open the branch either
+(tested). The pgsodium root key
 cannot change (the Vault secrets inside the data are encrypted with it): a branch with data shares
-it with its parent. The JWT secret, API keys and publishable and secret keys are new from the first
+it with its parent, and whoever holds the parent's root key can decrypt the branch's copy of the
+parent's Vault secrets. Re-encrypting `vault.secrets` under a key of the branch's own is **required
+for full separation and is not done** (see Not done). The JWT secret, API keys and publishable and secret keys are new from the first
 start (the clone path replaces them before the project is created; `backup.RestoreWith` as new does
 the same), so the parent's service key never works on the branch. Only the six role passwords are
 the parent's until the rotation finishes.
@@ -137,7 +147,10 @@ never receives. pg_cron jobs, pg_net calls included, would run on both. Requests
 would be sent twice. So both with_data paths start the cluster the first time with
 `max_logical_replication_workers = 0`, `cron.launch_active_jobs = off` and `pg_net.database_name`
 pointing at a database that does not exist (written to `postgresql.auto.conf` by the data seeder,
-marked `# sbctl-branch-quarantine`). Over the private socket, in every database, every subscription
+marked `# sbctl-branch-quarantine`: by the copy-on-write seeder right after the clone, and by the
+restore's seeder on the base-backup path, in both cases before the first postmaster starts; unit tests
+cover both seeders, and the integration test asks the first postmaster for its settings and its
+replication processes before isolation runs). Over the private socket, in every database, every subscription
 is disabled and detached from its slot (`ALTER SUBSCRIPTION ... DISABLE`, then `SET (slot_name =
 NONE)`, so the publisher's slot is not dropped either), `cron.job` rows are set inactive (unless
 `[branching] keep_cron_jobs = true`) and `net.http_request_queue` is emptied. Then the marked lines
@@ -154,7 +167,9 @@ Tested on real clusters (`TestIntegrationCloneIsolatesTheParentsIntegrations`).
   transaction under a session advisory lock (`lock_timeout` 30 s so DDL on a busy parent fails instead
   of queueing traffic behind it). The histories were compared before the lock was held, so the
   versions are read again under it: one that another merge applied meanwhile is refused (`409`), not
-  run twice, and the version insert is a plain insert so a duplicate aborts the transaction; a statement that cannot run in a transaction block makes it fall back
+  run twice, the whole divergence check is made again against the history read under the lock (a
+  merge from another branch that landed meanwhile makes this one diverge exactly as a serial merge
+  would), and the version insert is a plain insert so a duplicate aborts the transaction; a statement that cannot run in a transaction block makes it fall back
   to one transaction per migration and the result says so. It **refuses on divergence**: the parent
   has migrations the branch lacks, a version exists on both sides with different content, or a
   branch migration is older than the parent's latest. `?force=true` (our extension; the Management
@@ -290,7 +305,10 @@ is a full copy; on XFS and APFS it stays flat.
 * **Edge Functions are not copied by branching yet.** They are workstream J (v1, in progress on
   `ws/j-functions`: the `sb-edge-runtime` unit, the tenant-aware main service, and the materializer
   that writes a project's stored deployments under `projects/<ref>/functions/`). Until J is merged a
-  branch has no functions, and `merge` moves migrations only (hosted also merges functions). Once J
+  branch has no functions, and `merge` moves migrations only (hosted also merges functions); when the
+  branch has functions the parent lacks or has in another version (compared by settings and source
+  files through `Deps.Functions`), the merge result says "Edge Functions are NOT merged" and names
+  them, so an agent does not take them as merged. Once J
   is on main, create copies the parent's stored deployments and secrets into the branch (rows, then
   re-materialize: a branch has its own functions directory) and merge carries function changes back;
   `secrets` in the create body is refused until then. This is an open I/J integration item in
@@ -309,7 +327,9 @@ is a full copy; on XFS and APFS it stays flat.
 * The base-backup reset path is tested end to end on APFS (`TestIntegrationBranching`); the unit tests
   fake the failure after the old cluster is removed, because a failing restore needs a real archive.
 * No idle sleep: an unused branch costs its idle memory (about 130 MB with GoTrue and PostgREST).
-* Branches share the parent's pgsodium root key (see Credentials). `reset` of a branch made by the
+* Branches with data share the parent's pgsodium root key (see Credentials): the root key is
+  required to be separate for full isolation of Vault secrets, and is not. Re-encrypting
+  `vault.secrets` under a new root key after the first start is the missing step. `reset` of a branch made by the
   base-backup path gets new credentials.
 * The Management API's action-run endpoints (`/v1/projects/{ref}/actions`, used by Studio's branch
   pages) are stubs; progress is the branch's status and `branch_detail`.

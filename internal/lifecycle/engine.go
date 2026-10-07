@@ -295,6 +295,16 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 		p = cur
 	} else if err := e.reg.CreateProject(ctx, p); err != nil {
 		return nil, fmt.Errorf("lifecycle: create project %s: %w", ref, err)
+	} else if p.Branch != nil {
+		// The branch row exists now. A delete of the parent holds the parent's lock, not this
+		// ref's: it sets GOING_DOWN and only then looks for branches, so either it sees this row
+		// or this check sees GOING_DOWN. A branch must not be left on a parent that goes away.
+		if par, perr := e.reg.GetProject(ctx, p.Branch.ParentRef); perr != nil || par.Status == registry.StatusGoingDown {
+			if derr := e.reg.DeleteProject(context.WithoutCancel(ctx), ref); derr != nil {
+				e.log.Warn("create: could not remove the row of a branch whose parent is going away", "ref", ref, "err", derr)
+			}
+			return nil, fmt.Errorf("%w: parent project %s is being deleted or gone", ErrInvalidState, p.Branch.ParentRef)
+		}
 	}
 	fail := func(stage string, cause error) (*registry.Project, error) {
 		cctx, cancel := cleanupCtx(ctx)
@@ -487,6 +497,17 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	}
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusGoingDown); err != nil {
 		return err
+	}
+	// A branch created after the first look has inserted its row by now or will see GOING_DOWN
+	// (Create): look again, and back out if one landed in between.
+	if prev != registry.StatusGoingDown {
+		if kids, err := e.branchesOf(ctx, ref); err != nil || len(kids) > 0 {
+			_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, prev)
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: %s still has branches (%s); delete them first", ErrInvalidState, ref, strings.Join(kids, ", "))
+		}
 	}
 	if !backupDone {
 		if e.opts.Backup != nil && !o.SkipFinalBackup && prev != registry.StatusInitFailed {

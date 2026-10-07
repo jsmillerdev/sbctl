@@ -1,8 +1,13 @@
 package api
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
+	"sort"
 
 	openapi_types "github.com/oapi-codegen/runtime/types"
 
@@ -28,6 +33,36 @@ func (s *Server) routesBranches(add func(string, handlerFunc)) {
 	add("POST /v1/branches/{branch_id_or_ref}/push", s.branchAction("push"))
 	add("POST /v1/branches/{branch_id_or_ref}/restore", s.restoreBranch)
 	add("GET /v1/branches/{branch_id_or_ref}/diff", s.diffBranch)
+}
+
+// FunctionDigests is the branching.FunctionSource over the API's store of Edge Function
+// deployments.
+func FunctionDigests(st Store) branching.FunctionSource { return functionDigests{st} }
+
+type functionDigests struct{ st Store }
+
+// Digests maps each function slug of ref to a digest of its settings and source files.
+func (f functionDigests) Digests(ctx context.Context, ref string) (map[string]string, error) {
+	fns, err := f.st.ListFunctions(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(fns))
+	for _, fn := range fns {
+		files, err := f.st.FunctionFiles(ctx, ref, fn.Slug)
+		if err != nil {
+			return nil, err
+		}
+		sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+		h := sha256.New()
+		fmt.Fprintf(h, "%t\x00%s\x00%s\x00", fn.VerifyJWT, fn.EntrypointPath, fn.ImportMapPath)
+		for _, file := range files {
+			fc := sha256.Sum256(file.Content)
+			fmt.Fprintf(h, "%s\x00%x\x00", file.Path, fc)
+		}
+		out[fn.Slug] = hex.EncodeToString(h.Sum(nil))
+	}
+	return out, nil
 }
 
 // mapBranchErr turns branching errors into API errors.

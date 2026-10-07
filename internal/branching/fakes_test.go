@@ -157,6 +157,9 @@ type fakeDB struct {
 	applyErr map[string]error
 	atomic   map[string]bool
 	readErr  map[string]error
+	// raceOnApply, when set, runs at the start of Apply, standing for another operation that
+	// lands while this one waits for the apply lock.
+	raceOnApply func(d *fakeDB, ref string)
 }
 
 func newFakeDB() *fakeDB {
@@ -181,6 +184,14 @@ func (d *fakeDB) Apply(_ context.Context, ref string, ms []Migration, o ApplyOpt
 	}
 	if err := d.applyErr["*"]; err != nil {
 		return ApplyResult{}, err
+	}
+	if d.raceOnApply != nil {
+		d.raceOnApply(d, ref)
+	}
+	if o.Atomic {
+		if err := recheck(ref, ms, d.migs[ref], o.Verify); err != nil {
+			return ApplyResult{}, err
+		}
 	}
 	d.atomic[ref] = o.Atomic
 	for _, m := range ms {

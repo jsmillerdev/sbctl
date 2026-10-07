@@ -66,16 +66,17 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		return fmt.Errorf("serve: the registry is %T, want Postgres", node.Registry)
 	}
 	// Branches: the Management API's branch endpoints and the expiry sweeper (internal/branching).
+	store := api.NewPGStore(pg.Pool()) // explicit: the API's state must survive restarts
 	bsvc, err := branching.New(branching.Deps{
 		Cfg: cfg, Registry: node.Registry, Secrets: node.Secrets, Engine: node.Engine,
-		Backup: backups(node), Log: log.With("component", "branching"),
+		Backup: backups(node), Functions: api.FunctionDigests(store), Log: log.With("component", "branching"),
 	})
 	if err != nil {
 		return err
 	}
 	apiH, err := api.NewServer(api.Deps{
 		Registry: node.Registry, Secrets: node.Secrets, Manager: node.Engine, Config: cfg, Branching: bsvc,
-		Store:  api.NewPGStore(pg.Pool()), // explicit: the API's state must survive restarts
+		Store:  store,
 		Logger: log.With("component", "api"),
 	})
 	if err != nil {

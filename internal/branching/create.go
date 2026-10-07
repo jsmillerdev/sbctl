@@ -308,6 +308,12 @@ func (s *Service) cloneSeeder(parent *registry.Project, method string, out **Clo
 			return err
 		}
 		*out = st
+		// The clone carries the parent's postgresql.auto.conf. The branch's first postmaster must
+		// start with the parent's integrations switched off, as the base-backup path does
+		// (stampManager.Create); isolate runs only after the first start.
+		if err := writeQuarantine(dataDir); err != nil {
+			return fmt.Errorf("write the first-start settings of the branch: %w", err)
+		}
 		s.log.Info("cloned the parent's data directory", "parent", parent.Ref, "method", st.Method, "fs", st.FS,
 			"files", st.Files, "cloned", st.Cloned, "copied", st.Copied, "bytes", st.Bytes, "extra_disk", st.ExtraDiskByte, "ms", st.TotalMillis)
 		return nil

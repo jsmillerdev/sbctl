@@ -90,3 +90,69 @@ func TestKeepRecordAndRecreate(t *testing.T) {
 		t.Fatalf("row after delete: %v", err)
 	}
 }
+
+// Delete and a branch create race on different locks. Either order ends with no branch on a
+// deleted parent: a create that finds the parent GOING_DOWN removes its row, and a delete that
+// finds a branch row after flipping the status backs out.
+func TestBranchCreateRefusesAParentGoingDown(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	parent := h.create(t)
+	if err := h.reg.SetProjectStatus(ctx, parent.Ref, registry.StatusGoingDown); err != nil {
+		t.Fatal(err)
+	}
+	const ref = "bbbbbbbbbbbbbbbbbbbb"
+	_, err := h.e.Create(ctx, CreateRequest{Name: "late", Ref: ref, Class: "micro", Branch: &registry.BranchInfo{
+		ID: "6f9619ff-8b86-4011-b42d-00c04fc964ff", ParentRef: parent.Ref, Name: "late", State: registry.BranchCreatingProject}})
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("create on a parent going down: %v", err)
+	}
+	if _, err := h.reg.GetProject(ctx, ref); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("the refused branch left a row: %v", err)
+	}
+	if len(h.plane.calls) != 0 && strings.Contains(strings.Join(h.plane.calls, ","), ref) {
+		t.Fatalf("units were made for a refused branch: %v", h.plane.calls)
+	}
+}
+
+// racyRegistry runs a hook the moment a project is set GOING_DOWN, standing for a branch create
+// that inserts its row between Delete's first look at the branches and its status change.
+type racyRegistry struct {
+	registry.Registry
+	onGoingDown func()
+}
+
+func (r *racyRegistry) SetProjectStatus(ctx context.Context, ref string, st registry.Status) error {
+	err := r.Registry.SetProjectStatus(ctx, ref, st)
+	if err == nil && st == registry.StatusGoingDown && r.onGoingDown != nil {
+		f := r.onGoingDown
+		r.onGoingDown = nil
+		f()
+	}
+	return err
+}
+
+func TestDeleteBacksOutWhenABranchLandsAfterTheFirstLook(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	parent := h.create(t)
+	const ref = "bbbbbbbbbbbbbbbbbbbb"
+	rr := &racyRegistry{Registry: h.reg}
+	rr.onGoingDown = func() {
+		org, _ := h.reg.GetOrganization(ctx, "default")
+		_ = h.reg.CreateProject(ctx, &registry.Project{Ref: ref, OrgID: org.ID, Name: "late", Class: "micro", Status: registry.StatusComingUp,
+			Branch: &registry.BranchInfo{ID: "6f9619ff-8b86-4011-b42d-00c04fc964ff", ParentRef: parent.Ref, Name: "late", State: registry.BranchCreatingProject}})
+	}
+	h.e.reg = rr
+	callsBefore := len(h.plane.calls)
+	err := h.e.Delete(ctx, parent.Ref)
+	if !errors.Is(err, ErrInvalidState) || !strings.Contains(err.Error(), ref) {
+		t.Fatalf("delete with a branch that landed late: %v", err)
+	}
+	if len(h.plane.calls) != callsBefore || len(h.backup.calls) != 0 {
+		t.Fatalf("the refused delete did work: calls=%v backups=%v", h.plane.calls[callsBefore:], h.backup.calls)
+	}
+	if p, err := h.reg.GetProject(ctx, parent.Ref); err != nil || p.Status != registry.StatusActiveHealthy {
+		t.Fatalf("parent after the refused delete: %+v %v", p, err)
+	}
+}

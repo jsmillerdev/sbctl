@@ -24,8 +24,15 @@ import (
 //  3. Manager.RotateKeys: new JWT secret and API keys, GoTrue and PostgREST restart on the
 //     new environment, and the fleet tenants (Supavisor, Realtime, Storage) are updated
 //
+// The temporary login roles the parent issued for `supabase db push|pull|dump` (cli_login_*,
+// sbctl_cli_ro_*) came along with their password verifiers; step 2 also disables them
+// (NOLOGIN, no password, already expired), so that a parent's CLI password does not open the
+// branch. The API drops them with the next expired-role sweep.
+//
 // The pgsodium root key cannot change: the Vault secrets inside the data are encrypted
-// with it. The branch shares it with the parent.
+// with it. The branch shares it with the parent, so whoever holds the parent's root key can
+// decrypt the branch's copy of the parent's Vault secrets. Re-encrypting vault.secrets under
+// a key of its own is not done (required for full separation, see the README).
 func (s *Service) rotateCredentials(ctx context.Context, ref string) error {
 	p, err := s.reg.GetProject(ctx, ref)
 	if err != nil {
@@ -59,8 +66,30 @@ func (s *Service) rotateCredentials(ctx context.Context, ref string) error {
 	}); err != nil {
 		return err
 	}
+	if err := disableLoginRoles(ctx, s.adminSocketDSN(ref, p.Seq)); err != nil {
+		return err
+	}
 	if _, err := s.eng.RotateKeys(ctx, ref); err != nil {
 		return err
+	}
+	return nil
+}
+
+// disableLoginRoles makes the parent's temporary CLI login roles unusable on the branch: no
+// login, no password, validity in the past (the API's expired-role sweep then drops them).
+func disableLoginRoles(ctx context.Context, dsn string) error {
+	c, err := connect(ctx, dsn, "")
+	if err != nil {
+		return err
+	}
+	defer closeConn(c)
+	_, err = c.Exec(ctx, `do $$ declare r record; begin
+  for r in select rolname from pg_roles where rolname like 'cli\_login\_%' or rolname like 'sbctl\_cli\_ro\_%' loop
+    execute format('alter role %I nologin password null valid until %L', r.rolname, '1970-01-01 00:00:00+00');
+  end loop;
+end $$`)
+	if err != nil {
+		return fmt.Errorf("disable the parent's temporary login roles: %w", err)
 	}
 	return nil
 }

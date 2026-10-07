@@ -331,7 +331,16 @@ func TestIntegrationBranching(t *testing.T) {
 			t.Fatalf("base backup of the parent: %v", err)
 		}
 	}
+	// A temporary CLI login role the parent issued (api createLoginRole) must not open the clone.
+	st.exec(pref, `create role cli_login_parentcli login password 'parent-cli-password' valid until '2099-01-01 00:00:00+00'`)
 	withData := st.createBranch(pref, "with-data", func(in *CreateInput) { in.WithData = true })
+	var canLogin, hasPassword bool
+	if err := st.conn(withData.Ref, lifecycle.RoleAdmin).QueryRow(ctx, `select rolcanlogin, rolpassword is not null from pg_authid where rolname = 'cli_login_parentcli'`).Scan(&canLogin, &hasPassword); err != nil {
+		t.Fatalf("the parent's CLI login role on the clone: %v", err)
+	}
+	if canLogin || hasPassword {
+		t.Fatalf("the parent's CLI login role still works on the clone: login=%v password=%v", canLogin, hasPassword)
+	}
 	t.Logf("with_data branch: method=%s detail=%s", withData.CloneMethod, withData.Detail)
 	switch {
 	case expect != "" && withData.CloneMethod != expect:
@@ -809,8 +818,54 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 		}
 	}
 
+	// Observe the first start itself, not only the end state: just before isolation runs the
+	// cluster is on its first postmaster, which must already be running without logical
+	// replication workers, cron launching jobs and pg_net on the parent's database. A clone that
+	// starts with the parent's postgresql.auto.conf would show the node's settings here, and the
+	// parent's enabled subscription would have an apply worker attached to its publisher.
+	var firstStart sync.Map // branch ref -> string describing a violation, "" when quarantined
+	realIsolate := st.svc.isolate
+	st.svc.isolate = func(ctx context.Context, ref string) error {
+		p, err := st.node.Registry.GetProject(ctx, ref)
+		if err != nil {
+			return err
+		}
+		c, err := connect(ctx, st.svc.adminSocketDSN(ref, p.Seq), "")
+		if err != nil {
+			return err
+		}
+		var workers, launch, netdb string
+		var running int
+		err = c.QueryRow(ctx, `select current_setting('max_logical_replication_workers'),
+			coalesce(current_setting('cron.launch_active_jobs', true), 'unset'),
+			coalesce(current_setting('pg_net.database_name', true), 'unset'),
+			(select count(*) from pg_stat_activity where backend_type like 'logical replication%')`).Scan(&workers, &launch, &netdb, &running)
+		closeConn(c)
+		if err != nil {
+			return err
+		}
+		bad := ""
+		if workers != "0" || running != 0 {
+			bad += fmt.Sprintf(" max_logical_replication_workers=%s, %d logical replication processes;", workers, running)
+		}
+		if launch == "on" {
+			bad += " cron.launch_active_jobs=on;"
+		}
+		if netdb == "postgres" {
+			bad += " pg_net.database_name=postgres;"
+		}
+		firstStart.Store(ref, bad)
+		return realIsolate(ctx, ref)
+	}
+	defer func() { st.svc.isolate = realIsolate }()
+
 	check := func(b *Branch, keepJobs bool) {
 		t.Helper()
+		if v, ok := firstStart.Load(b.Ref); !ok {
+			t.Errorf("branch %s: the first start was not observed", b.Name)
+		} else if v.(string) != "" {
+			t.Errorf("branch %s: the first postmaster ran with the parent's integrations live:%s", b.Name, v)
+		}
 		ba := st.conn(b.Ref, lifecycle.RoleAdmin)
 		var subs int
 		var slot *string
@@ -905,6 +960,22 @@ func TestIntegrationApplyRefusesAVersionAlreadyApplied(t *testing.T) {
 	}
 	if n := st.count(parent.Ref, "public.once"); n != 0 {
 		t.Fatalf("the refused migration ran: %d rows", n)
+	}
+	// A Verify that refuses stops the apply before anything runs.
+	m4 := Migration{Version: "20260203000000", Name: "verified", Statements: []string{"create table public.verified (id int)"}}
+	vopts := opts
+	vopts.Verify = func(cur []Migration) error {
+		if len(cur) == 0 {
+			t.Error("Verify saw an empty history")
+		}
+		return fmt.Errorf("%w: refused by Verify", ErrDiverged)
+	}
+	if _, err := st.svc.db.Apply(ctx, parent.Ref, []Migration{m4}, vopts); !errors.Is(err, ErrDiverged) {
+		t.Fatalf("apply with a refusing Verify = %v, want ErrDiverged", err)
+	}
+	var verified bool
+	if err := st.conn(parent.Ref, lifecycle.RoleAdmin).QueryRow(ctx, `select to_regclass('public.verified') is not null`).Scan(&verified); err != nil || verified {
+		t.Fatalf("a refused apply ran: %v %v", verified, err)
 	}
 	// Two applies of the same new version at once: one wins, the other is refused after the lock.
 	m3 := Migration{Version: "20260202000000", Name: "race", Statements: []string{"select pg_sleep(1)", "create table public.raced (id int)"}}

@@ -294,3 +294,42 @@ func TestBranchesWithoutService(t *testing.T) {
 		t.Fatalf("get: %d", rec.Code)
 	}
 }
+
+// The digest of a function follows its files and settings, not the project it is deployed to
+// or its version counter, so a branch's copy of an unchanged function equals the parent's.
+func TestFunctionDigests(t *testing.T) {
+	ctx := context.Background()
+	st := NewMemoryStore()
+	deploy := func(ref, slug, body string, verify bool) {
+		t.Helper()
+		f := &Function{Ref: ref, Slug: slug, Name: slug, VerifyJWT: verify, EntrypointPath: "index.ts"}
+		if err := st.UpsertFunction(ctx, f, []FunctionFile{{Path: "index.ts", Content: []byte(body)}, {Path: "lib/a.ts", Content: []byte("a")}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deploy("parentparentparentpa", "hello", "v1", true)
+	deploy("branchbranchbranchbr", "hello", "v1", true)
+	deploy("branchbranchbranchbr", "other", "v1", true)
+	deploy("parentparentparentpa", "edited", "v1", true)
+	deploy("branchbranchbranchbr", "edited", "v2", true)
+	deploy("parentparentparentpa", "flag", "v1", true)
+	deploy("branchbranchbranchbr", "flag", "v1", false)
+	src := FunctionDigests(st)
+	p, err := src.Digests(ctx, "parentparentparentpa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := src.Digests(ctx, "branchbranchbranchbr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p["hello"] == "" || p["hello"] != b["hello"] {
+		t.Errorf("the same function differs: %q %q", p["hello"], b["hello"])
+	}
+	if p["edited"] == b["edited"] || p["flag"] == b["flag"] {
+		t.Error("changed source or settings must change the digest")
+	}
+	if _, ok := p["other"]; ok || b["other"] == "" {
+		t.Errorf("other: parent %q branch %q", p["other"], b["other"])
+	}
+}
