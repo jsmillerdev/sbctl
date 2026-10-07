@@ -31,6 +31,7 @@ is the daemon that `supavise.service` runs.
   re-reads each project after taking its lock, so an API pause or delete that lands between the
   listing and the start is not undone. The system project must exist (`supavise system init`).
 
+- **Health and alerts.** `Serve` builds one `health.Monitor` over `health.CheckNode` (`health.ForNode` with `InDaemon`, and a `fleet.Lazy` of its own for the tenant checks) and hands it to the Management API (`api.Deps.Health`: `GET /healthz`, `GET /healthz/detail`). It makes an `alerts.Notifier` the package default (`alerts.Notify` for the rest of the node) and runs an `alerts.Checker` next to the listeners: conditions from the health report every minute, the daily update check, and nothing while an upgrade or a maintenance window is on (`internal/health/README.md`, `internal/alerts/README.md`).
 - **The shared services.** On a systemd node `Serve` calls `fleet.Setup` with `Start` set next to the
   projects (`startFleet`): it generates the services' sealed secrets on first use, renders the
   units, starts postgres-meta, Supavisor, Realtime, Storage and Studio in order and waits for each,

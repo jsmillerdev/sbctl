@@ -218,6 +218,11 @@ grep -q '^OnCalendar=Sun \*-\*-\* 04:00:00$' /etc/systemd/system/supavise-upgrad
 # A new install reboots inside the window for OS patches, so the timer ticks every quarter hour through the two-hour window.
 [[ $(grep -c '^OnCalendar=' /etc/systemd/system/supavise-upgrade.timer) == 8 ]] || fail "a new install (OS reboot in the window) wants 8 ticks in a two-hour window: $(cat /etc/systemd/system/supavise-upgrade.timer)"
 [[ -n $(systemctl list-timers supavise-upgrade.timer --no-legend) ]] || fail "systemd has no next run for supavise-upgrade.timer"
+# The daemon checks for releases; the timer holds the window and nothing else.
+! grep -q '^OnBootSec=\|^OnUnitActiveSec=' /etc/systemd/system/supavise-upgrade.timer || fail "the timer carries a release check: $(cat /etc/systemd/system/supavise-upgrade.timer)"
+# An upgrade the service is stopped in the middle of gets SIGTERM and time to end, not a start timeout or a SIGKILL.
+[[ $(systemctl show -p KillMode --value supavise-upgrade.service) == mixed ]] || fail "supavise-upgrade.service: KillMode $(systemctl show -p KillMode --value supavise-upgrade.service), want mixed"
+[[ $(systemctl show -p TimeoutStartUSec --value supavise-upgrade.service) == infinity ]] || fail "supavise-upgrade.service has a start timeout: $(systemctl show -p TimeoutStartUSec --value supavise-upgrade.service)"
 $SV update status | tee "$WORK/update-status.txt" | grep -q 'Mode        notify' || fail "update status: $(cat "$WORK/update-status.txt")"
 assert_os_updates on
 
@@ -335,6 +340,81 @@ for port in 5432 6543; do
   [[ $got == 2 ]] || fail "pooler on $port returned '$got'"
 done
 
+# ---- 5b. status, /healthz, the operator's view and the dashboard banner --------------------
+# `supavise status` runs as the user that owns the state directory, like the other commands (lib.sh).
+sup() { supavise "$@"; }
+verdict() { jq_ 'd["status"]' <"$1"; }
+
+log "supavise status --json on a healthy node: exit status 0, every check named"
+rc=0; sup status --json >"$WORK/status.json" || rc=$?
+if [[ $rc -ne 0 || $(verdict "$WORK/status.json") != healthy ]]; then cat "$WORK/status.json" >&2; fail "supavise status exited $rc with verdict '$(verdict "$WORK/status.json")' on a healthy node"; fi
+python3 - "$WORK/status.json" "$REF" <<'PY' || fail "the status report is missing a check (see above)"
+import json, sys
+d = json.load(open(sys.argv[1])); ref = sys.argv[2]
+names = {c["name"] for c in d["components"]}
+want = {"daemon", "edge", "system postgres", "system gotrue", "supavisor", "realtime", "storage", "pgmeta", "disk", "certificates", "update"}
+missing = want - names
+assert not missing, f"components missing: {sorted(missing)} (have {sorted(names)})"
+p = [p for p in d["projects"] if p["ref"] == ref]
+assert p and p[0]["state"] == "ok" and p[0]["probed"], p
+assert {s["name"] for s in p[0]["services"]} == {"postgres", "gotrue", "postgrest"}, p[0]["services"]
+assert {t["service"] for t in p[0]["tenants"]} >= {"realtime", "storage"}, p[0]["tenants"]
+assert all(t["present"] for t in p[0]["tenants"]), p[0]["tenants"]
+assert d["summary"].startswith("healthy:"), d["summary"]
+PY
+HUMAN=$(sup status) || fail "supavise status exited non-zero on a healthy node"
+[[ ${HUMAN%%$'\n'*} == healthy:* ]] || fail "the first line of supavise status is not the verdict: ${HUMAN%%$'\n'*}"
+
+log "GET /healthz: public, a verdict and nothing else"
+HZ=$(api GET /healthz)
+[[ $HZ == '{"status":"healthy"}' ]] || fail "/healthz answered '$HZ'"
+[[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a healthy node"
+[[ $HZ != *"$REF"* ]] || fail "/healthz names a project"
+[[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz/detail) == 401 ]] || fail "/healthz/detail answered without credentials"
+DETAIL=$(papi GET /healthz/detail)
+[[ $(printf '%s' "$DETAIL" | jq_ 'd["status"]') == healthy && $DETAIL == *"$REF"* ]] || fail "/healthz/detail with the owner's token: $DETAIL"
+
+log "stopping the project's PostgREST degrades the node: exit status 1, the project named, /healthz still 200"
+systemctl stop "supavise-postgrest@$REF.service"
+rc=0; sup status --json >"$WORK/status.json" || rc=$?
+[[ $rc -eq 1 ]] || { cat "$WORK/status.json" >&2; fail "supavise status exited $rc with PostgREST stopped, want 1"; }
+[[ $(verdict "$WORK/status.json") == degraded ]] || fail "verdict '$(verdict "$WORK/status.json")' with PostgREST stopped, want degraded"
+python3 - "$WORK/status.json" "$REF" <<'PY' || fail "the degraded report does not blame the project's PostgREST (see above)"
+import json, sys
+d = json.load(open(sys.argv[1])); ref = sys.argv[2]
+p = [p for p in d["projects"] if p["ref"] == ref][0]
+assert p["state"] == "fail", p
+assert [s for s in p["services"] if s["name"] == "postgrest"][0]["ok"] is False, p["services"]
+assert ref in d["summary"] and d["summary"].startswith("degraded:"), d["summary"]
+PY
+HUMAN=$(sup status) || true # exit status 1 is the point
+[[ ${HUMAN%%$'\n'*} == degraded:*"$REF"* ]] || fail "the verdict line does not name $REF: ${HUMAN%%$'\n'*}"
+# /healthz reuses a report for 20 seconds: wait for the new verdict, and see that it is a 200.
+HZ=""
+for ((i = 0; i < 40; i++)); do
+  HZ=$(api GET /healthz); [[ $HZ == '{"status":"degraded"}' ]] && break; sleep 2
+done
+[[ $HZ == '{"status":"degraded"}' ]] || fail "/healthz is '$HZ' with a project's PostgREST stopped, want degraded"
+[[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a degraded node (a load balancer would pull it)"
+systemctl start "supavise-postgrest@$REF.service"
+wait_active "supavise-postgrest@$REF.service" 60
+rc=1
+for ((i = 0; i < 30; i++)); do rc=0; sup status --json >"$WORK/status.json" || rc=$?; [[ $rc -eq 0 ]] && break; sleep 2; done
+[[ $rc -eq 0 ]] || fail "the node did not report healthy again after PostgREST was started"
+
+log "a maintenance window shows in status, and the dashboard banner stays empty (Studio would draw it as an outage)"
+STUDIO_HOST=studio.$BASE
+banner() { curl -sS -m 30 -H "Host: $STUDIO_HOST" http://127.0.0.1/api/incident-banner; }
+[[ $(banner) == '{"incidents":[]}' ]] || fail "the banner is not empty on a quiet node: $(banner)"
+sup maintenance announce --at now --duration 10m --message "e2e maintenance" >/dev/null || fail "maintenance announce"
+sup status --json >"$WORK/status.json" || fail "an announced window made status unhealthy"
+[[ $(jq_ 'len([c for c in d["components"] if c["name"] == "maintenance" and "e2e maintenance" in c["detail"]])' <"$WORK/status.json") == 1 ]] || fail "the announced window is not in status: $(cat "$WORK/status.json")"
+[[ $(banner) == '{"incidents":[]}' ]] || fail "the announced window reached the dashboard banner: $(banner)"
+sup maintenance clear >/dev/null || fail "maintenance clear"
+sup status --json >"$WORK/status.json" || fail "status after the window was cleared"
+[[ $(jq_ 'len([c for c in d["components"] if c["name"] == "maintenance"])' <"$WORK/status.json") == 0 ]] || fail "status still shows a cleared window"
+[[ $(sup alerts list) == "no active alerts" ]] || fail "alerts are active on a healthy node: $(sup alerts list)"
+
 # ---- 6. re-run: idempotent, secrets kept -------------------------------------------------
 log "re-running install.sh keeps everything"
 KEY_SUM=$(sha256sum /etc/supavise/master.key)
@@ -379,6 +459,12 @@ deploy/install.sh --binary "$SUPAVISE_BIN" >/dev/null 2>&1 || fail "re-run after
 # Outside the window an auto-mode node does not upgrade (Wednesday 12:00 UTC); the check failing (no release exists) is not an error.
 out=$(timeout 120 $SV update run --at 2026-10-07T12:00:00Z 2>&1) || fail "update run outside the window failed: $out"
 [[ $out != *unattended_upgrade_started* ]] || fail "an upgrade started outside the window: $out"
+# --dry-run (and --at, which implies it) says what a pass inside the window would do and changes nothing: no upgrade, no reboot, no record.
+STATE_SUM=$(sha256sum /var/lib/supavise-upgrade/state.json 2>/dev/null || echo none)
+out=$(timeout 120 $SV update run --dry-run --at 2026-10-05T01:30:00Z 2>&1) || fail "update run --dry-run inside the window failed: $out"
+[[ $out == *unattended_upgrade_started* && $out == *dry_run* ]] || fail "update run --dry-run inside the window did not say it would upgrade: $out"
+[[ $(sha256sum /var/lib/supavise-upgrade/state.json 2>/dev/null || echo none) == "$STATE_SUM" ]] || fail "update run --dry-run changed the record"
+[[ $(/usr/local/bin/supavise --version) == *v0.0.1* ]] || fail "update run --dry-run changed the binary"
 # The service keeps its memory in a root-owned directory of its own, not in the state directory that the supavise user can write.
 [[ $(systemctl show -p StateDirectory --value supavise-upgrade.service) == supavise-upgrade ]] || fail "supavise-upgrade.service has no StateDirectory of its own"
 [[ ! -e /var/lib/supavise/update ]] || fail "update state sits in the supavise-writable state directory"
@@ -391,6 +477,8 @@ log "OS security updates can be switched off and on, and a re-run keeps the choi
 $SV update config --os-security-updates=false >/dev/null || fail "update config --os-security-updates=false"
 assert_os_updates off
 [[ $(grep -c '^OnCalendar=' "$T") == 1 ]] || fail "notify mode with no OS reboot should wake once per window"
+# Nothing waits for the window (notify mode, no managed reboot), so the timer is off: the daemon does the release check.
+[[ $(systemctl is-enabled supavise-upgrade.timer 2>/dev/null || true) != enabled ]] || fail "notify mode with no managed reboot still has supavise-upgrade.timer enabled"
 deploy/install.sh --binary "$SUPAVISE_BIN" >/dev/null 2>&1 || fail "re-run with OS updates off"
 assert_os_updates off
 $SV update config --os-security-updates=true >/dev/null || fail "update config --os-security-updates=true"

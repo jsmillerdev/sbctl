@@ -343,7 +343,9 @@ wait_cron_success() {
 # assert_os_updates on|off: what `supavise system os-updates` leaves on a Ubuntu or Debian host.
 # On: unattended-upgrades is installed and reads only the security origins (checked through
 # apt-config and through the program's own "Allowed origins" line), never reboots by itself, and
-# needrestart is told to leave supavise-* units alone. Off: Supavise's files are gone.
+# needrestart is told to leave supavise-* units alone. Off: the apt configuration is gone; the
+# needrestart setting stays wherever needrestart is installed, because it protects the projects
+# from a manual apt upgrade too.
 assert_os_updates() { # on|off
   if [[ $1 == on ]]; then
     [[ -f /etc/apt/apt.conf.d/52supavise-unattended-upgrades ]] || fail "the apt configuration for unattended security updates is missing"
@@ -371,7 +373,7 @@ assert_os_updates() { # on|off
     [[ ! -d /etc/needrestart/conf.d || -f /etc/needrestart/conf.d/50-supavise.conf ]] || fail "needrestart may restart supavise units"
   else
     [[ ! -e /etc/apt/apt.conf.d/52supavise-unattended-upgrades ]] || fail "the apt configuration is still there"
-    [[ ! -e /etc/needrestart/conf.d/50-supavise.conf ]] || fail "the needrestart drop-in is still there"
+    [[ ! -d /etc/needrestart/conf.d || -f /etc/needrestart/conf.d/50-supavise.conf ]] || fail "needrestart may restart supavise units after the opt-out"
   fi
 }
 

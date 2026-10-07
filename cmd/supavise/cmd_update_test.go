@@ -12,6 +12,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/health"
 	"github.com/jsmillerdev/supavise/internal/update"
 )
 
@@ -184,9 +185,9 @@ func TestUpdateReport(t *testing.T) {
 	cfg.Update.Mode = "auto"
 	cfg.Update.Window = "Sun 03:00-05:00"
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC) // a Wednesday
-	st := update.State{Latest: "v9.9.9", CheckedAt: now.Add(-time.Hour),
-		Result: &update.Result{At: now.Add(-72 * time.Hour), Exit: 0, Meaning: "upgraded, or nothing to do"}}
-	r, err := buildUpdateReport(context.Background(), cfg, st, now)
+	st := update.State{Result: &update.Result{At: now.Add(-72 * time.Hour), Exit: 0, Meaning: "upgraded, or nothing to do"}}
+	rec := &health.UpdateRecord{Latest: "v9.9.9", CheckedAt: now.Add(-time.Hour)} // the daemon's check
+	r, err := buildUpdateReport(context.Background(), cfg, st, rec, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +202,7 @@ func TestUpdateReport(t *testing.T) {
 		}
 	}
 	st.Blocked = "needs the operator"
-	r, _ = buildUpdateReport(context.Background(), cfg, st, now)
+	r, _ = buildUpdateReport(context.Background(), cfg, st, rec, now)
 	out.Reset()
 	r.print(&out)
 	if !strings.Contains(out.String(), "PAUSED") || !strings.Contains(out.String(), "supavise update resume") {
@@ -235,7 +236,7 @@ func TestInstallUnitsRendersTheUpgradeTimerFromTheConfig(t *testing.T) {
 		}
 	}
 	if strings.Contains(got, "OnBootSec") {
-		t.Errorf("checks are off, so there is no boot check:\n%s", got)
+		t.Errorf("the daemon checks for releases; the timer has no boot check:\n%s", got)
 	}
 	if _, err := os.Stat(filepath.Join(units, update.ServiceUnit)); err != nil {
 		t.Errorf("the service unit was not installed: %v", err)

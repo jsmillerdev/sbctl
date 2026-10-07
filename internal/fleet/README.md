@@ -120,3 +120,7 @@ On darwin-arm64 with the slim-services artifacts under the exec backend, through
 - Image transformation (imgproxy), the Storage queue (`PG_QUEUE_ENABLE`), Realtime clustering and Supavisor clustering are off.
 - `supavise system stop` (`lifecycle.StopAll`) does not stop the fleet units; use `supavise fleet stop` first. `supavise serve` starts the shared services at boot (`app.startFleet`, next to the projects, systemd supervisor only) and registers projects through a `Lazy` fleet; the units are not enabled for boot, the daemon is.
 - Storage objects of a deleted project stay where the backend keeps them (`<ref>/`).
+
+## Tenant presence
+
+`TenantChecker.HasTenant(ctx, ref)` asks a service whether it holds a project's tenant: one GET of the tenant record, 2xx is present, 404 absent, anything else (and a service that cannot be reached) an error, with no retries so that a health check never waits out `EnsureTenant`'s backoff. Supavisor, Realtime and Storage implement it; `Fleet.TenantPresence(ctx, ref)` asks all of them at once and keeps the fleet's order. The lazy tenants skip a service the node never rendered and answer "present". `internal/health` uses it for the per-project check.

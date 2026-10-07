@@ -1,6 +1,7 @@
-// Package update runs the node's own maintenance: the periodic look for a new Supavise release,
-// the opt-in automatic upgrade inside the maintenance window, the reboot an OS patch asks for,
-// and the host-side setup (the systemd timer, unattended-upgrades) that goes with them.
+// Package update runs the node's own maintenance: the opt-in automatic upgrade inside the
+// maintenance window, the reboot an OS patch asks for, and the host-side setup (the systemd
+// timer, unattended-upgrades) that goes with them. The daemon, not this package, looks for new
+// releases (internal/health.CheckUpdate) and announces them (internal/alerts).
 //
 // `supavise update run` calls Run from supavise-upgrade.service, which supavise-upgrade.timer
 // starts. The upgrade itself is `supavise upgrade --unattended` (the upgrade engine owns what it
@@ -47,7 +48,9 @@ type Deps struct {
 	Store   Store
 	Log     *slog.Logger
 	Now     func() time.Time
-	// Latest returns the tag of the newest stable release.
+	// Latest returns the tag of the newest stable release the node knows of: the daemon's last
+	// check (internal/health), or a lookup when there is none. Run uses it only to tell whether a
+	// rolled-back release has a successor; the daemon's check is the one that announces releases.
 	Latest func(ctx context.Context) (string, error)
 	// Upgrade runs `supavise upgrade --unattended` and returns its exit status. The error is for
 	// a command that could not run at all.
@@ -80,12 +83,14 @@ func StartCutoff(w config.Window) time.Duration { return min(upgradeCutoff, w.Le
 // RebootCutoff is how long before the window closes the last OS reboot may start.
 func RebootCutoff(w config.Window) time.Duration { return min(rebootCutoff, w.Length()/4) }
 
-// Run does one pass of the node's maintenance. It never does anything outside the maintenance
-// window except check for and announce a release; in notify mode it never upgrades. It starts
+// Run does one pass of the node's maintenance. It does nothing outside the maintenance window,
+// and in notify mode it never upgrades. (Looking for a release and announcing it belong to the
+// daemon: internal/health records the check, internal/alerts raises update_available.) It starts
 // neither an upgrade nor a reboot in the last stretch of the window (StartCutoff, RebootCutoff),
 // and it reboots only when the node is healthy and quiet (Deps.RebootBlocker). The events it logs
-// have stable messages (update_available, unattended_upgrade_started, unattended_upgrade_result,
-// unattended_upgrade_skipped, os_reboot, os_reboot_deferred, update_check_failed) for whatever
+// have stable messages (unattended_upgrade_started, unattended_upgrade_result,
+// unattended_upgrade_skipped, unattended_upgrade_interrupted, os_reboot, os_reboot_deferred,
+// update_check_failed) for whatever
 // collects them.
 func Run(ctx context.Context, d Deps) error {
 	now := d.Now()
@@ -100,22 +105,21 @@ func Run(ctx context.Context, d Deps) error {
 	before := st
 	opened, closes, inWindow := win.Occurrence(now)
 
-	// 1. Look for a release and announce it once.
-	if every, on, _ := d.Update.CheckEvery(); on && now.Sub(st.CheckedAt) >= every-time.Minute {
-		latest, err := d.Latest(ctx)
-		if err != nil {
-			d.Log.Warn("update_check_failed", "error", err.Error())
-		} else {
-			st.CheckedAt, st.Latest = now, latest
-			if selfupdate.Newer(latest, d.Version) && st.Notified != latest {
-				d.Log.Warn("update_available", "installed", d.Version, "latest", latest,
-					"mode", d.Update.Mode, "window", win.String(), "next_window", nextWindow(win, now))
-				st.Notified = latest
-			}
+	// 0. An unattended upgrade that began and left no result was cut short: the node crashed, the
+	// kernel killed the process, the power failed, or something killed the service. Nobody knows
+	// what state it left, so a person looks before the node tries again.
+	if p := st.InProgress; p != nil {
+		st.InProgress = nil
+		st.Blocked = fmt.Sprintf("the unattended upgrade that started at %s did not report how it ended (the node or the service was stopped part way through)", p.Started.Format(time.RFC3339))
+		d.Log.Error("unattended_upgrade_interrupted", "started", p.Started.Format(time.RFC3339), "window", p.Window.Format(time.RFC3339),
+			"installed", d.Version, "fix", "run `supavise status` and `supavise upgrade --check`, fix the node, then `sudo supavise update resume`")
+		if err := d.Store.Save(st); err != nil {
+			return err
 		}
+		return fmt.Errorf("an unattended upgrade was interrupted; automatic upgrades are paused until `sudo supavise update resume`")
 	}
 
-	// 2. In auto mode, inside the window, run the upgrade: once per window unless it was refused.
+	// 1. In auto mode, inside the window, run the upgrade: once per window unless it was refused.
 	var upgradeErr error
 	upgradeFailed, upgradeRefused := false, false
 	if d.Update.Mode == config.UpdateAuto && inWindow {
@@ -131,8 +135,15 @@ func Run(ctx context.Context, d Deps) error {
 		case d.skipRolledBack(ctx, &st):
 			st.Window = opened // decided for this window; the next one looks again
 		default:
+			// The record goes to disk before the upgrade starts: no upgrade without the note that
+			// lets the next run see it never finished.
+			st.InProgress = &Progress{Window: opened, Started: d.Now(), Version: d.Version}
+			if err := d.Store.Save(st); err != nil {
+				return err
+			}
 			d.Log.Info("unattended_upgrade_started", "installed", d.Version, "window", opened.Format(time.RFC3339))
 			exit, runErr := d.Upgrade(ctx)
+			st.InProgress = nil
 			if runErr != nil {
 				exit = -1
 			}
@@ -154,7 +165,7 @@ func Run(ctx context.Context, d Deps) error {
 			case ExitRolledBack:
 				st.Window = opened
 				upgradeFailed = true
-				st.RolledBack = d.rolledBackTarget(ctx, &st)
+				st.RolledBack = d.rolledBackTarget(ctx)
 				d.Log.Error("unattended_upgrade_result", "exit", exit, "outcome", "rolled_back", "detail", res.Meaning, "release", st.RolledBack)
 				upgradeErr = fmt.Errorf("unattended upgrade failed and was rolled back (supavise upgrade exit %d); automatic upgrades skip that release until a newer one appears or `supavise update resume`", exit)
 			default:
@@ -169,7 +180,7 @@ func Run(ctx context.Context, d Deps) error {
 		}
 	}
 
-	// 3. An OS patch that needs a reboot gets it inside the window, once per window. The reboot
+	// 2. An OS patch that needs a reboot gets it inside the window, once per window. The reboot
 	// waits when the upgrade failed or was refused (a person should see the node first, and a
 	// refusal means the node is unhealthy or not backed up), when the window is about to close or
 	// closed during the upgrade, and while the node is unhealthy or busy.
@@ -229,7 +240,6 @@ func (d Deps) skipRolledBack(ctx context.Context, st *State) bool {
 	if err != nil {
 		d.Log.Warn("update_check_failed", "error", err.Error())
 	} else {
-		st.CheckedAt, st.Latest = d.Now(), latest
 		if selfupdate.Newer(latest, st.RolledBack) {
 			st.RolledBack = ""
 			return false
@@ -240,15 +250,12 @@ func (d Deps) skipRolledBack(ctx context.Context, st *State) bool {
 	return true
 }
 
-// rolledBackTarget is the release a rolled-back upgrade was after: the newest the node can see
-// now, or the last one it saw. It is empty when the node has never seen one (checks are off and
-// GitHub is out of reach), and the next window then tries again.
-func (d Deps) rolledBackTarget(ctx context.Context, st *State) string {
-	if latest, err := d.Latest(ctx); err == nil {
-		st.CheckedAt, st.Latest = d.Now(), latest
-	}
-	if selfupdate.Newer(st.Latest, d.Version) {
-		return st.Latest
+// rolledBackTarget is the release a rolled-back upgrade was after: the newest the node knows of,
+// if it is newer than the running version. It is empty when the node knows of none (checks are
+// off and GitHub is out of reach), and the next window then tries again.
+func (d Deps) rolledBackTarget(ctx context.Context) string {
+	if latest, err := d.Latest(ctx); err == nil && selfupdate.Newer(latest, d.Version) {
+		return latest
 	}
 	return ""
 }

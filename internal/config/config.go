@@ -60,6 +60,8 @@ type Config struct {
 	Fleet     Fleet     `toml:"fleet"`
 	Functions Functions `toml:"functions"`
 	Branching Branching `toml:"branching"`
+	Alerts    Alerts    `toml:"alerts"`
+	Health    Health    `toml:"health"`
 	Defaults  Limits    `toml:"defaults"`
 }
 
@@ -177,7 +179,7 @@ func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	switch {
 	case err == nil:
-		if err := toml.Unmarshal(b, c); err != nil {
+		if err := toml.Unmarshal(quoteBareCheckInterval(b), c); err != nil {
 			return nil, fmt.Errorf("config %s: %w", path, err)
 		}
 	case errors.Is(err, os.ErrNotExist):
@@ -218,6 +220,12 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.Update.validate(); err != nil {
+		return err
+	}
+	if err := c.Health.validate(); err != nil {
+		return err
+	}
+	if err := c.validateAlerts(); err != nil {
 		return err
 	}
 	if c.StateDir == "" {

@@ -318,8 +318,9 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 // failure is a warning: the node works without them, and a re-run tries again.
 func (in *installer) osUpdates() {
 	if !in.cfg.Update.OSSecurityUpdates {
-		// The operator opted out, or the node predates the setting. Take down Supavise's own
-		// files only, if an earlier run wrote them.
+		// The operator opted out, or the node predates the setting. Take down Supavise's apt
+		// configuration if an earlier run wrote it; the needrestart setting stays, where
+		// needrestart is installed, so that a manual apt upgrade cannot restart a project.
 		if err := applyOSUpdates(in.ctx, io.Discard, in.err, false); err != nil {
 			in.warn("could not remove the unattended-upgrades configuration: %v", err)
 		}

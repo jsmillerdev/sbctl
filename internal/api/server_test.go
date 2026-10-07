@@ -17,6 +17,8 @@ func TestRouteTableBuilds(t *testing.T) {
 			inSpec++
 		case strings.Contains(key, "/platform/storage/"), key == "GET /platform/auth/{ref}/users":
 			// Studio calls these; the platform spec omits them.
+		case key == "GET /healthz/detail":
+			// supavise's own: the node's health for operators (health.go).
 		case strings.Contains(key, "/platform/organizations/{slug}/sso/"):
 			// supavise's own routes for several identity providers and the users waiting for approval.
 		default:

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jsmillerdev/supavise/internal/selfupdate"
@@ -70,9 +71,15 @@ func LatestStable(ctx context.Context, o selfupdate.Options) (string, error) {
 	return rel.Tag, nil
 }
 
+// UpgradeStopTimeout is how long RunUpgrade waits, once its context is cancelled (systemd stops
+// the service, the node shuts down), for `supavise upgrade` to finish the step it is on or roll
+// back before it is killed. supavise-upgrade.service's TimeoutStopSec is longer.
+const UpgradeStopTimeout = 50 * time.Minute
+
 // RunUpgrade runs `<exe> upgrade --unattended` and returns its exit status. An exit status is
 // not an error here: the contract gives each one a meaning. The error is for a command that did
-// not run.
+// not run. When ctx is cancelled the command gets SIGTERM, not SIGKILL, and UpgradeStopTimeout to
+// end on its own terms: an upgrade cut off mid-step is the worst way for it to stop.
 func RunUpgrade(ctx context.Context, exe, configPath string, stdout, stderr io.Writer) (int, error) {
 	args := []string{}
 	if configPath != "" {
@@ -80,6 +87,8 @@ func RunUpgrade(ctx context.Context, exe, configPath string, stdout, stderr io.W
 	}
 	args = append(args, "upgrade", "--unattended")
 	c := exec.CommandContext(ctx, exe, args...)
+	c.Cancel = func() error { return c.Process.Signal(syscall.SIGTERM) }
+	c.WaitDelay = UpgradeStopTimeout
 	c.Stdout, c.Stderr = stdout, stderr
 	err := c.Run()
 	var ee *exec.ExitError
@@ -98,7 +107,16 @@ type Gate struct {
 	ConfigPath string // its config file
 	User       string // the user that owns the state directory and may open the registry
 	StateDir   string
+	// LockPath is the host lock that `supavise upgrade` and `supavise self-update` hold while
+	// they run (an flock; HostLockPath). The reboot waits while somebody else holds it. Empty:
+	// no lock to check.
+	LockPath string
 }
+
+// HostLockPath is the flock that every command that replaces the binary or restarts the fleet
+// (`supavise upgrade`, `supavise self-update`) holds for as long as it runs, so that the OS
+// reboot in the maintenance window never lands in the middle of one an operator started by hand.
+const HostLockPath = "/run/supavise-maintenance.lock"
 
 // HostRebootBlocker returns the check that stands in front of the OS reboot. The node may restart
 // only when:
@@ -106,8 +124,11 @@ type Gate struct {
 //   - supavise.service runs and no supavise-* unit has failed (supavise-upgrade.service itself
 //     is not counted: it fails when an upgrade rolls back);
 //   - no base backup is running (supavise-basebackup@*.service, the prune service);
-//   - no project is in a transitional status (a lifecycle operation is in flight: a Postgres
-//     upgrade an Owner started from Studio, a restore, a pause) or in a failed or unhealthy one.
+//   - nobody holds the host lock (Gate.LockPath): no `supavise upgrade` or `supavise self-update`
+//     is running;
+//   - every project is in a quiet, good status (ACTIVE_HEALTHY, INACTIVE or REMOVED). A transitional
+//     one means a lifecycle operation is in flight (a Postgres upgrade an Owner started from
+//     Studio, a restore, a pause); a failed, unhealthy or unknown one means a person should look.
 //
 // The project statuses come from `supavise projects list --json` run as the supavise user, the
 // way the installer runs the other commands that open the registry. A check that cannot run
@@ -121,6 +142,16 @@ func HostRebootBlocker(g Gate) func(ctx context.Context) string {
 		}
 		if err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", "supavise.service").Run(); err != nil {
 			return "supavise.service is not running"
+		}
+		if g.LockPath != "" {
+			release, held, err := tryLock(g.LockPath)
+			switch {
+			case err != nil:
+				return "cannot check the host lock: " + err.Error()
+			case held:
+				return "an upgrade or self-update is running (" + g.LockPath + " is held)"
+			}
+			release()
 		}
 		out, err := systemctl("list-units", "--state=failed", "supavise*")
 		if err != nil {
@@ -168,8 +199,9 @@ func FailedUnits(out string) []string {
 }
 
 // ProjectBlocker reads the JSON of `supavise projects list --json` and returns why the node must
-// not reboot, or "". Only projects that should be running count: a paused (INACTIVE) project is
-// quiet, a removed one is gone.
+// not reboot, or "". A paused (INACTIVE) project is quiet and a removed one is gone; a project in
+// ACTIVE_HEALTHY is as it should be. Every other status blocks, the ones this list does not name
+// included, so that a status added later errs on the side of no reboot.
 func ProjectBlocker(listJSON []byte) string {
 	var ps []struct {
 		Ref    string `json:"ref"`
@@ -183,7 +215,8 @@ func ProjectBlocker(listJSON []byte) string {
 		switch p.Status {
 		case "COMING_UP", "PAUSING", "RESTORING", "RESTARTING", "UPGRADING", "GOING_DOWN":
 			busy = append(busy, p.Ref+" "+p.Status)
-		case "ACTIVE_UNHEALTHY", "RESTORE_FAILED", "INIT_FAILED", "UNKNOWN":
+		case "ACTIVE_HEALTHY", "INACTIVE", "REMOVED":
+		default:
 			bad = append(bad, p.Ref+" "+p.Status)
 		}
 	}

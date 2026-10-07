@@ -357,12 +357,12 @@ def icon(name, x, y, size, color):
 
 FEATURES = [
     ("dashboard", "Dashboard", "The real Supabase Studio, with multiple organizations and projects"),
-    ("project", "Every project", "Postgres, Auth, REST, GraphQL, Realtime, Storage and Edge Functions"),
+    ("project", "Every project", "Postgres, Auth, REST, GraphQL, Realtime, Storage, Edge Functions and custom domains"),
     ("branch", "Branching", "Schema-only branches or full copies of your data, for previews and agents"),
-    ("backup", "Backups", "Continuous backups with point-in-time restore"),
-    ("team", "Teams", "Roles, invitations, SAML single sign-on and MFA requirements"),
+    ("backup", "Backups", "Point-in-time restore from the dashboard, including Storage files"),
+    ("team", "Teams", "Organizations, roles, invitations, SAML single sign-on and MFA"),
     ("key", "API keys", "Publishable and secret keys, legacy JWT keys and key rotation"),
-    ("shield", "Operations", "Automatic HTTPS and signed self-updates"),
+    ("shield", "Operations", "Automatic HTTPS, health checks, alerts and signed updates"),
     ("cloud", "AWS", "A one-field CloudFormation template"),
 ]
 

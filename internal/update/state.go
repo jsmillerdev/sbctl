@@ -11,22 +11,22 @@ import (
 
 // State is what `supavise update run` remembers between runs, as JSON in StatePath.
 // It is the node's own bookkeeping, not configuration: deleting the file loses the memory of
-// which release was announced and which window already ran, and nothing else.
+// which window already ran and any pause after a failed upgrade, and nothing else.
 type State struct {
-	// CheckedAt is when GitHub was last asked for the latest release, and Latest what it answered.
-	CheckedAt time.Time `json:"checked_at,omitempty"`
-	Latest    string    `json:"latest,omitempty"`
-	// Notified is the release the update_available event was logged for, so a release is
-	// announced once, not at every check.
-	Notified string `json:"notified,omitempty"`
 	// Window is the opening time of the maintenance window occurrence in which an unattended
 	// upgrade last ran to an end (upgraded, nothing to do, rolled back or failed) or was skipped
 	// because it would repeat a rolled-back release: the window gets one such attempt. A refusal (exit 2) leaves it unset, so the next tick of the window retries.
 	Window time.Time `json:"window,omitempty"`
+	// InProgress is set (and saved) before an unattended upgrade starts and cleared when the
+	// upgrade command returns. A run that finds it set means the upgrade was cut short with no
+	// word of how it ended (a crash, an OOM kill, a power cut, a kill of the service): Run then
+	// pauses automatic upgrades as needing the operator, as for exit 4, instead of starting the
+	// upgrade again.
+	InProgress *Progress `json:"in_progress,omitempty"`
 	// Result is the outcome of the last unattended upgrade.
 	Result *Result `json:"result,omitempty"`
 	// Blocked is why automatic upgrades stopped: the last one failed in a way that needs a person
-	// (exit 4). `supavise update resume` clears it.
+	// (exit 4), or was cut short with no result (InProgress). `supavise update resume` clears it.
 	Blocked string `json:"blocked,omitempty"`
 	// RolledBack is the release the last unattended upgrade rolled back (exit 3). Automatic
 	// upgrades skip it until a newer release exists, so that a release that cannot upgrade this
@@ -36,6 +36,13 @@ type State struct {
 	// RebootWindow is the opening time of the window occurrence in which the node last rebooted
 	// itself for an OS patch: one reboot per window, whatever the marker file says afterwards.
 	RebootWindow time.Time `json:"reboot_window,omitempty"`
+}
+
+// Progress is the record of an unattended upgrade that has started.
+type Progress struct {
+	Window  time.Time `json:"window"`
+	Started time.Time `json:"started"`
+	Version string    `json:"version,omitempty"`
 }
 
 // Result is the outcome of one `supavise upgrade --unattended` run.
@@ -134,4 +141,21 @@ func (s Store) Save(st State) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), s.Path)
+}
+
+// ErrBusy means another `supavise update run` holds the lock.
+var ErrBusy = errors.New("another `supavise update run` is in progress")
+
+// Lock takes the lock that keeps two passes from running at once (the timer's service and a
+// run by hand): the second one would otherwise read the first one's in-progress record as a
+// crashed upgrade. The lock is a flock, so a crash releases it. It sits next to the state file.
+func (s Store) Lock() (release func(), err error) {
+	release, held, err := tryLock(filepath.Join(filepath.Dir(s.Path), "run.lock"))
+	switch {
+	case err != nil:
+		return nil, err
+	case held:
+		return nil, ErrBusy
+	}
+	return release, nil
 }

@@ -206,22 +206,22 @@ func TestUpdateDefaultsAndValidation(t *testing.T) {
 	if u.Mode != UpdateNotify || u.Channel != "stable" || u.OSReboot != "window" || u.OSSecurityUpdates {
 		t.Errorf("defaults: %+v", u)
 	}
-	if d, ok, err := u.CheckEvery(); err != nil || !ok || d != 6*time.Hour {
+	if d, ok, err := u.CheckEvery(); err != nil || !ok || d != 24*time.Hour {
 		t.Errorf("CheckEvery() = %v, %v, %v", d, ok, err)
 	}
 	if u.RebootsInWindow() {
 		t.Error("an existing node (os_security_updates unset) must not reboot itself")
 	}
-	if !u.TimerWanted() {
-		t.Error("the release check alone is a reason for the timer")
-	}
-	u.CheckInterval = "off"
 	if u.TimerWanted() {
-		t.Error("notify mode with no check and no managed OS updates needs no timer")
+		t.Error("notify mode with no managed OS updates needs no timer: the daemon does the release check")
 	}
 	u.Mode = UpdateAuto
 	if !u.TimerWanted() {
-		t.Error("auto mode needs the timer even without checks")
+		t.Error("auto mode needs the timer")
+	}
+	u.Mode, u.OSSecurityUpdates = UpdateNotify, true
+	if !u.TimerWanted() {
+		t.Error("the reboot in the window needs the timer")
 	}
 
 	for name, mut := range map[string]func(*Config){
@@ -229,9 +229,9 @@ func TestUpdateDefaultsAndValidation(t *testing.T) {
 		"channel":  func(c *Config) { c.Update.Channel = "edge" },
 		"reboot":   func(c *Config) { c.Update.OSReboot = "sometimes" },
 		"window":   func(c *Config) { c.Update.Window = "Sun 3am" },
-		"interval": func(c *Config) { c.Update.CheckInterval = "5m" },
 		"garbage":  func(c *Config) { c.Update.CheckInterval = "often" },
-		"long":     func(c *Config) { c.Update.CheckInterval = "720h" },
+		"negative": func(c *Config) { c.Update.CheckInterval = "-2h" },
+		"zerodays": func(c *Config) { c.Update.CheckInterval = "0d" },
 	} {
 		c := Default()
 		mut(c)
@@ -256,7 +256,84 @@ func TestUpdateLoadsFromFileAndEnvironment(t *testing.T) {
 	if c.Update.Mode != "auto" || c.Update.Window != "Sat 02:00-04:00" || c.Update.OSReboot != "never" {
 		t.Errorf("loaded %+v", c.Update)
 	}
-	if c.Update.Channel != "stable" || c.Update.CheckInterval != "6h" {
+	if c.Update.Channel != "stable" || c.Update.CheckInterval != "24h" {
 		t.Errorf("keys absent from the file keep their defaults: %+v", c.Update)
+	}
+}
+
+// One grammar for update.check_interval, shared with the daemon's release check (internal/health).
+func TestParseCheckInterval(t *testing.T) {
+	for in, want := range map[string]time.Duration{
+		"":      24 * time.Hour,
+		"12h":   12 * time.Hour,
+		"90m":   90 * time.Minute,
+		"2d":    48 * time.Hour,
+		"2D":    48 * time.Hour,
+		"7200":  2 * time.Hour,
+		"5m":    time.Hour, // never under an hour
+		"30":    time.Hour,
+		" 6h ":  6 * time.Hour,
+		"1h30m": 90 * time.Minute,
+		"720h":  720 * time.Hour,
+	} {
+		d, on, err := ParseCheckInterval(in)
+		if err != nil || !on || d != want {
+			t.Errorf("ParseCheckInterval(%q) = %v, %v, %v; want %v", in, d, on, err, want)
+		}
+	}
+	for _, in := range []string{"off", "OFF", "never", "0"} {
+		if _, on, err := ParseCheckInterval(in); err != nil || on {
+			t.Errorf("ParseCheckInterval(%q): on %v, err %v; want checks off", in, on, err)
+		}
+	}
+	for _, in := range []string{"often", "d", "-1", "-2h", "0d", "1.5d", "2w"} {
+		if _, _, err := ParseCheckInterval(in); err == nil {
+			t.Errorf("ParseCheckInterval(%q) was accepted", in)
+		}
+	}
+}
+
+// The forms that internal/health documents load through the config file and validate: a bare
+// number of seconds in TOML, whole days, "never".
+func TestCheckIntervalLoadsInEveryDocumentedForm(t *testing.T) {
+	for body, want := range map[string]time.Duration{
+		"[update]\ncheck_interval = 7200\n":     2 * time.Hour,
+		"[update]\ncheck_interval = \"2d\"\n":   48 * time.Hour,
+		"[update]\ncheck_interval = \"12h\"\n":  12 * time.Hour,
+		"[update]\ncheck_interval = \"7200\"\n": 2 * time.Hour,
+		"[update]\nmode = \"auto\"\n":           24 * time.Hour,
+	} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Errorf("%q: %v", body, err)
+			continue
+		}
+		if d, on, err := c.Update.CheckEvery(); err != nil || !on || d != want {
+			t.Errorf("%q: CheckEvery() = %v, %v, %v; want %v", body, d, on, err, want)
+		}
+	}
+	for _, body := range []string{"[update]\ncheck_interval = 0\n", "[update]\ncheck_interval = \"never\"\n"} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Errorf("%q: %v", body, err)
+			continue
+		}
+		if _, on, _ := c.Update.CheckEvery(); on {
+			t.Errorf("%q: checks should be off", body)
+		}
+	}
+	t.Setenv("SUPAVISE_UPDATE_CHECK_INTERVAL", "3d")
+	if c, err := Load(filepath.Join(t.TempDir(), "none.toml")); err != nil {
+		t.Fatal(err)
+	} else if d, _, _ := c.Update.CheckEvery(); d != 72*time.Hour {
+		t.Errorf("environment: %v", d)
 	}
 }

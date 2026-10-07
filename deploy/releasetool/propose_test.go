@@ -243,3 +243,98 @@ func TestProposeRefusesUnexpectedNames(t *testing.T) {
 		t.Errorf("output:\n%s\n%s", out, r.ghCalls())
 	}
 }
+
+// personPushes puts a commit by somebody other than the bump job on origin's bump/auth.
+func (r *proposeRig) personPushes() {
+	r.t.Helper()
+	person := filepath.Join(r.dir, "person")
+	for _, args := range [][]string{
+		{"clone", "-q", "--branch", "bump/auth", r.origin, person},
+		{"commit", "-q", "--allow-empty", "-m", "fix a test for the new release"},
+		{"push", "-q", "origin", "bump/auth"},
+	} {
+		c := exec.Command("git", args...)
+		if args[0] != "clone" {
+			c.Dir = person
+		}
+		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Ada", "GIT_AUTHOR_EMAIL=ada@example.com", "GIT_COMMITTER_NAME=Ada", "GIT_COMMITTER_EMAIL=ada@example.com")
+		if out, err := c.CombinedOutput(); err != nil {
+			r.t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
+func (r *proposeRig) branchHead() string {
+	out, err := exec.Command("git", "--git-dir", r.origin, "rev-parse", "bump/auth").Output()
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// A commit a person pushed to an open proposal (a fix for the new release) is never overwritten
+// by the next night's bump.
+func TestProposeLeavesABranchWithAPersonsCommitAlone(t *testing.T) {
+	r := newProposeRig(t)
+	r.write("bumps.json", bumpsJSON)
+	if out, err := r.run(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	r.personPushes()
+	head := r.branchHead()
+	r.openPRs = `[{"number":7,"title":"Bump auth to auth-v2.195.0-r1"}]`
+	r.write("bumps.json", strings.Replace(bumpsJSON, "auth-v2.195.0-r1", "auth-v2.196.0-r0", 1))
+	out, err := r.run()
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if got := r.branchHead(); got != head {
+		t.Errorf("the branch moved from %s to %s: a person's commit was overwritten", head, got)
+	}
+	if !strings.Contains(out, "auth: bump/auth has a commit that is not the bump job's; not touched") {
+		t.Errorf("output:\n%s", out)
+	}
+	if calls := r.ghCalls(); strings.Contains(calls, "pr edit") || strings.Contains(calls, "workflow run ci.yml --repo o/r --ref bump/auth") {
+		t.Errorf("the pull request was edited anyway:\n%s", calls)
+	}
+}
+
+// A push that lands while the job works (after it read the branch) makes the job's own push fail,
+// instead of being overwritten.
+func TestProposeLeaseRefusesToOverwriteALaterPush(t *testing.T) {
+	r := newProposeRig(t)
+	r.write("bumps.json", bumpsJSON)
+	if out, err := r.run(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	r.openPRs = `[{"number":7,"title":"Bump auth to auth-v2.195.0-r1"}]`
+	r.write("bumps.json", strings.Replace(bumpsJSON, "auth-v2.195.0-r1", "auth-v2.196.0-r0", 1))
+	// The releasetool wrapper pushes a person's commit while the script is between reading the
+	// branch and pushing it.
+	person := filepath.Join(r.dir, "person-race")
+	wrapper := r.write("tool-wrapper.sh", `#!/usr/bin/env bash
+if [[ ! -e `+person+` ]]; then
+  git clone -q --branch bump/auth `+r.origin+` `+person+`
+  GIT_AUTHOR_NAME=Ada GIT_AUTHOR_EMAIL=ada@example.com GIT_COMMITTER_NAME=Ada GIT_COMMITTER_EMAIL=ada@example.com \
+    git -C `+person+` commit -q --allow-empty -m "late fix"
+  git -C `+person+` push -q origin bump/auth
+fi
+exec `+r.bin+` "$@"
+`)
+	if err := os.Chmod(wrapper, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before := r.branchHead()
+	out, err := r.run("RELEASETOOL=" + wrapper)
+	if err == nil {
+		t.Fatalf("the push over a later commit succeeded:\n%s", out)
+	}
+	if got := r.branchHead(); got == before || !strings.Contains(r.gitLog(), "late fix") {
+		t.Errorf("the person's commit is not on the branch (head %s):\n%s", got, r.gitLog())
+	}
+}
+
+func (r *proposeRig) gitLog() string {
+	out, _ := exec.Command("git", "--git-dir", r.origin, "log", "--format=%an: %s", "bump/auth").Output()
+	return string(out)
+}

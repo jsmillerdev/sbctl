@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jsmillerdev/supavise/internal/config"
 )
@@ -25,11 +24,9 @@ func TestRenderTimerDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v := lines(got, "OnBootSec="); len(v) != 1 || v[0] != "900s" {
-		t.Errorf("OnBootSec: %v", v)
-	}
-	if v := lines(got, "OnUnitActiveSec="); len(v) != 1 || v[0] != "21600s" {
-		t.Errorf("OnUnitActiveSec: %v", v)
+	// The release check belongs to the daemon: the timer holds the window and nothing else.
+	if strings.Contains(got, "OnBootSec") || strings.Contains(got, "OnUnitActiveSec") {
+		t.Errorf("the timer has a release check:\n%s", got)
 	}
 	// Notify mode on a node with no managed OS updates: the window only needs one wake-up.
 	if v := lines(got, "OnCalendar="); len(v) != 1 || v[0] != "Sun *-*-* 04:00:00" {
@@ -58,13 +55,10 @@ func TestShippedTimerMatchesTheDefaultRendering(t *testing.T) {
 
 func TestRenderTimerAutoModeTicksThroughTheWindow(t *testing.T) {
 	u := config.DefaultUpdate()
-	u.Mode, u.Window, u.CheckInterval = config.UpdateAuto, "Sun 03:00-05:00", "off"
+	u.Mode, u.Window = config.UpdateAuto, "Sun 03:00-05:00"
 	got, err := RenderTimer(u)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if v := lines(got, "OnBootSec="); len(v) != 0 {
-		t.Errorf("checks are off but the timer still has a boot check: %v", v)
 	}
 	want := []string{"Sun *-*-* 03:00:00", "Sun *-*-* 03:15:00", "Sun *-*-* 03:30:00", "Sun *-*-* 03:45:00",
 		"Sun *-*-* 04:00:00", "Sun *-*-* 04:15:00", "Sun *-*-* 04:30:00", "Sun *-*-* 04:45:00"}
@@ -117,18 +111,5 @@ func TestRenderTimerRefusesBadSettings(t *testing.T) {
 	u.Window = "never"
 	if _, err := RenderTimer(u); err == nil {
 		t.Error("a bad window must not become a unit file")
-	}
-	u = config.DefaultUpdate()
-	u.CheckInterval = "1s"
-	if _, err := RenderTimer(u); err == nil {
-		t.Error("a bad interval must not become a unit file")
-	}
-}
-
-func TestShort(t *testing.T) {
-	for in, want := range map[time.Duration]string{15 * time.Minute: "15m", 6 * time.Hour: "6h", 90 * time.Minute: "1h30m", 30 * time.Minute: "30m", 24 * time.Hour: "24h", 10 * time.Minute: "10m"} {
-		if got := short(in); got != want {
-			t.Errorf("short(%v) = %q, want %q", in, got, want)
-		}
 	}
 }

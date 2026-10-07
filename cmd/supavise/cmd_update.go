@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/health"
 	"github.com/jsmillerdev/supavise/internal/selfupdate"
 	"github.com/jsmillerdev/supavise/internal/update"
 )
@@ -29,21 +30,23 @@ func init() {
 		Use:   "update",
 		Short: "Release checks, the maintenance window and automatic upgrades",
 		Long: `Supavise tells you when a release exists and, only if you opt in, installs it by itself
-inside a maintenance window. The setting is the [update] section of config.toml:
+inside a maintenance window. The daemon checks for releases and raises the update_available alert
+(see ` + "`supavise status`" + `). The setting is the [update] section of config.toml:
 
-  mode                "notify" (the default) logs that a release is available and changes nothing;
-                      "auto" runs ` + "`supavise upgrade --unattended`" + ` inside the window
+  mode                "notify" (the default) only tells you that a release exists and changes
+                      nothing; "auto" runs ` + "`supavise upgrade --unattended`" + ` inside the window
   window              the weekly maintenance window in the node's time zone, "Sun 04:00-06:00"
                       (days, then HH:MM-HH:MM; "Sat,Sun", "Mon-Fri" and "daily" work; a window may
                       cross midnight)
   channel             "stable", the only channel
-  check_interval      how often the node asks GitHub for the latest release, "6h" ("off" stops it)
+  check_interval      how often the daemon asks GitHub for the latest release: "12h", "2d" or seconds;
+                      24h by default, one hour at the least; "off" stops the check
   os_security_updates unattended-upgrades for security updates only (a new install sets it)
   os_reboot           "window" reboots the node inside the window when an OS patch needs it, "never"
 
 ` + "`supavise update config`" + ` changes these; ` + "`supavise update status`" + ` shows them and what the node did last.
-A systemd timer (supavise-upgrade.timer) wakes the node at the window; nothing starts an
-upgrade outside it, and notify mode never starts one.`,
+In auto mode (or with os_reboot = "window") a systemd timer (supavise-upgrade.timer) wakes the
+node in the window; nothing starts an upgrade outside it, and notify mode never starts one.`,
 	}
 
 	// ---- config ------------------------------------------------------------
@@ -123,7 +126,7 @@ configuration. A re-run of the installer keeps what this sets.
 	cf.StringVar(&fMode, "mode", "", `"notify" (log that a release exists) or "auto" (upgrade inside the window)`)
 	cf.StringVar(&fWindow, "window", "", `maintenance window in the node's time zone, for example "Sun 03:00-05:00"`)
 	cf.StringVar(&fChannel, "channel", "", `release channel; "stable" is the only one`)
-	cf.StringVar(&fInterval, "check-interval", "", `how often to ask GitHub for the latest release, "6h"; "off" stops the check`)
+	cf.StringVar(&fInterval, "check-interval", "", `how often the daemon asks GitHub for the latest release: "12h", "2d" or seconds, one hour at the least; "off" stops the check`)
 	cf.BoolVar(&fOSUpdates, "os-security-updates", false, "unattended OS security updates (Ubuntu and Debian)")
 	cf.StringVar(&fReboot, "os-reboot", "", `"window" reboots inside the maintenance window when an OS patch needs it; "never"`)
 
@@ -142,7 +145,8 @@ configuration. A re-run of the installer keeps what this sets.
 			if err != nil {
 				return err
 			}
-			rep, err := buildUpdateReport(cmd.Context(), cfg, st, time.Now())
+			rec, _ := health.ReadUpdate(cfg.Paths())
+			rep, err := buildUpdateReport(cmd.Context(), cfg, st, rec, time.Now())
 			if err != nil {
 				return err
 			}
@@ -159,17 +163,20 @@ configuration. A re-run of the installer keeps what this sets.
 
 	// ---- run (the timer's command) ----------------------------------------
 	var at string
+	var dryRun bool
 	runCmd := &cobra.Command{
 		Use:   "run",
-		Short: "One pass of the release check, the unattended upgrade and the OS reboot (what supavise-upgrade.timer runs)",
-		Long: `Checks for a release (at most every update.check_interval) and logs update_available once per
-release. In auto mode, while the maintenance window is open, runs ` + "`supavise upgrade --unattended`" + `: once
+		Short: "One pass of the unattended upgrade and the OS reboot (what supavise-upgrade.timer runs)",
+		Long: `In auto mode, while the maintenance window is open, runs ` + "`supavise upgrade --unattended`" + `: once
 per window, except that a refusal (exit 2, nothing changed) is tried again at the next tick; it
 starts no upgrade in the last hour of the window (at most half of a short one). With
 update.os_security_updates and update.os_reboot = "window", reboots the node inside the window when an
 OS patch needs it, once per window, not in the last 15 minutes of it, and only when the node is
 healthy and no backup or lifecycle operation is running. It does nothing else, and nothing outside
-the window except the check. Needs root. The timer runs it; run it by hand to see what it would do now.`,
+the window. The daemon, not this command, checks for releases. Needs root.
+
+This command acts: run by hand inside the window it upgrades and reboots for real. --dry-run logs
+what a pass would do and changes nothing (no upgrade, no reboot, no record kept).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if runtime.GOOS != "linux" {
@@ -196,14 +203,21 @@ the window except the check. Needs root. The timer runs it; run it by hand to se
 					return fmt.Errorf("--at: %w", err)
 				}
 				now = func() time.Time { return t }
+				dryRun = true // a pretend clock must never start a real upgrade or reboot
 			}
-			return update.Run(cmd.Context(), update.Deps{
+			log := newLogger(cfg).With("component", "update")
+			store := update.Store{Path: update.StatePath(cfg.StateDir)}
+			d := update.Deps{
 				Update:  cfg.Update,
 				Version: version,
-				Store:   update.Store{Path: update.StatePath(cfg.StateDir)},
-				Log:     newLogger(cfg).With("component", "update"),
+				Store:   store,
+				Log:     log,
 				Now:     now,
 				Latest: func(ctx context.Context) (string, error) {
+					// The daemon's last check; a lookup only when it has made none.
+					if rec, _ := health.ReadUpdate(cfg.Paths()); rec != nil && rec.Latest != "" {
+						return rec.Latest, nil
+					}
 					return update.LatestStable(ctx, selfupdate.Options{})
 				},
 				Upgrade: func(ctx context.Context) (int, error) {
@@ -211,12 +225,47 @@ the window except the check. Needs root. The timer runs it; run it by hand to se
 				},
 				RebootRequired: update.HostRebootRequired,
 				RebootBlocker: update.HostRebootBlocker(update.Gate{
-					Exe: exe, ConfigPath: cmp.Or(configPath, config.DefaultPath), User: installUser, StateDir: cfg.StateDir}),
+					Exe: exe, ConfigPath: cmp.Or(configPath, config.DefaultPath), User: installUser, StateDir: cfg.StateDir,
+					LockPath: update.HostLockPath}),
 				Reboot: update.HostReboot,
-			})
+			}
+			if dryRun {
+				// A copy of the record in a scratch directory, so that the pass leaves the real one alone.
+				st, err := store.Load()
+				if err != nil {
+					return err
+				}
+				dir, err := os.MkdirTemp("", "supavise-update-dryrun-")
+				if err != nil {
+					return err
+				}
+				defer os.RemoveAll(dir)
+				d.Store = update.Store{Path: filepath.Join(dir, "state.json")}
+				if err := d.Store.Save(st); err != nil {
+					return err
+				}
+				d.Upgrade = func(context.Context) (int, error) {
+					log.Info("dry_run", "would", "run `supavise upgrade --unattended`")
+					return update.ExitOK, nil
+				}
+				d.Reboot = func(context.Context) error {
+					log.Info("dry_run", "would", "reboot the node (systemctl reboot)")
+					return nil
+				}
+				return update.Run(cmd.Context(), d)
+			}
+			// One pass at a time: the timer's service and a run by hand would otherwise read each
+			// other's in-progress record as a crashed upgrade.
+			release, err := store.Lock()
+			if err != nil {
+				return err
+			}
+			defer release()
+			return update.Run(cmd.Context(), d)
 		},
 	}
-	runCmd.Flags().StringVar(&at, "at", "", "pretend it is this time (RFC 3339), to see what a run would do (tests)")
+	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "log what a pass would do (no upgrade, no reboot, no record kept)")
+	runCmd.Flags().StringVar(&at, "at", "", "pretend it is this time (RFC 3339); implies --dry-run (tests)")
 	_ = runCmd.Flags().MarkHidden("at")
 
 	// ---- resume ------------------------------------------------------------
@@ -259,7 +308,9 @@ that release until a newer one exists. Check the node, then run this to lift eit
 		Long: `Writes the apt configuration that turns on unattended-upgrades for security updates only
 (Ubuntu and Debian), installs unattended-upgrades and needrestart when they are missing, and keeps
 needrestart from restarting supavise-* units. Without a flag it follows update.os_security_updates in
-config.toml: on, it sets everything up; off, it removes the files Supavise wrote and leaves the packages.
+config.toml: on, it sets everything up; off, it removes the apt configuration Supavise wrote and
+leaves the packages. The needrestart setting stays whenever needrestart is installed, because it
+protects the projects from a manual apt upgrade too.
 The installer calls it.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -365,20 +416,22 @@ type updateReport struct {
 	RebootNeeded bool           `json:"reboot_needed"`
 }
 
-func buildUpdateReport(ctx context.Context, cfg *config.Config, st update.State, now time.Time) (*updateReport, error) {
+// buildUpdateReport gathers what `update status` shows. rec is the daemon's last release check
+// (nil: none yet).
+func buildUpdateReport(ctx context.Context, cfg *config.Config, st update.State, rec *health.UpdateRecord, now time.Time) (*updateReport, error) {
 	win, err := cfg.Update.ParsedWindow()
 	if err != nil {
 		return nil, err
 	}
 	r := &updateReport{Installed: version, Settings: cfg.Update, TimeZone: now.Location().String(),
-		WindowOpen: win.Contains(now), Latest: st.Latest, LastResult: st.Result, Blocked: st.Blocked, RolledBack: st.RolledBack}
+		WindowOpen: win.Contains(now), LastResult: st.Result, Blocked: st.Blocked, RolledBack: st.RolledBack}
 	if t, ok := win.Next(now); ok {
 		r.NextWindow = t.Format(time.RFC3339)
 	}
-	if !st.CheckedAt.IsZero() {
-		r.CheckedAt = st.CheckedAt.Format(time.RFC3339)
+	if rec != nil && rec.Latest != "" {
+		r.Latest, r.CheckedAt = rec.Latest, rec.CheckedAt.Format(time.RFC3339)
+		r.Available = selfupdate.Newer(rec.Latest, version)
 	}
-	r.Available = st.Latest != "" && selfupdate.Newer(st.Latest, version)
 	if runtime.GOOS == "linux" {
 		if out, _ := exec.CommandContext(ctx, "systemctl", "is-active", update.TimerUnit).Output(); len(out) > 0 {
 			r.Timer = strings.TrimSpace(string(out))
@@ -404,10 +457,10 @@ func (r *updateReport) print(w io.Writer) {
 	}
 	fmt.Fprintln(w)
 	check := "every " + r.Settings.CheckInterval
-	if strings.EqualFold(r.Settings.CheckInterval, "off") {
+	if _, on, _ := r.Settings.CheckEvery(); !on {
 		check = "off"
 	}
-	fmt.Fprintf(w, "Release     %s check %s", r.Settings.Channel, check)
+	fmt.Fprintf(w, "Release     %s check by the daemon %s", r.Settings.Channel, check)
 	switch {
 	case r.Latest == "":
 		fmt.Fprint(w, "; not checked yet")
@@ -444,24 +497,10 @@ func (r *updateReport) print(w io.Writer) {
 // applyOSUpdates sets up unattended security updates, or removes what Supavise wrote.
 func applyOSUpdates(ctx context.Context, out, errOut io.Writer, enable bool) error {
 	if !enable {
-		for _, f := range []string{update.AptConfigFile, update.NeedrestartFile} {
-			b, err := os.ReadFile(f)
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if !bytes.Contains(b, []byte("Managed by Supavise")) {
-				fmt.Fprintf(out, "%s is not Supavise's file; left alone\n", f)
-				continue
-			}
-			if err := os.Remove(f); err != nil {
-				return err
-			}
-			fmt.Fprintf(out, "removed %s\n", f)
+		if err := removeManagedFile(update.AptConfigFile, out); err != nil {
+			return err
 		}
-		return nil
+		return writeNeedrestartDropIn(out)
 	}
 	rel, err := os.ReadFile("/etc/os-release")
 	if err != nil {
@@ -479,10 +518,8 @@ func applyOSUpdates(ctx context.Context, out, errOut io.Writer, enable bool) err
 	if err := writeIfChanged(update.AptConfigFile, []byte(body), out); err != nil {
 		return err
 	}
-	if st, err := os.Stat(filepath.Dir(update.NeedrestartFile)); err == nil && st.IsDir() {
-		if err := writeIfChanged(update.NeedrestartFile, []byte(update.RenderNeedrestart()), out); err != nil {
-			return err
-		}
+	if err := writeNeedrestartDropIn(out); err != nil {
+		return err
 	}
 	if _, err := os.Stat("/run/systemd/system"); err == nil {
 		// The distribution's own timers do the patching; make sure they run.
@@ -491,6 +528,36 @@ func applyOSUpdates(ctx context.Context, out, errOut io.Writer, enable bool) err
 		}
 	}
 	return nil
+}
+
+// removeManagedFile removes f when Supavise wrote it.
+func removeManagedFile(f string, out io.Writer) error {
+	b, err := os.ReadFile(f)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !bytes.Contains(b, []byte("Managed by Supavise")) {
+		fmt.Fprintf(out, "%s is not Supavise's file; left alone\n", f)
+		return nil
+	}
+	if err := os.Remove(f); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "removed %s\n", f)
+	return nil
+}
+
+// writeNeedrestartDropIn keeps needrestart (when it is installed) from restarting supavise-*
+// units, whether apt runs unattended or an operator runs it by hand. It writes nothing on a host
+// without needrestart's configuration directory.
+func writeNeedrestartDropIn(out io.Writer) error {
+	if st, err := os.Stat(filepath.Dir(update.NeedrestartFile)); err != nil || !st.IsDir() {
+		return nil
+	}
+	return writeIfChanged(update.NeedrestartFile, []byte(update.RenderNeedrestart()), out)
 }
 
 func writeIfChanged(path string, body []byte, out io.Writer) error {

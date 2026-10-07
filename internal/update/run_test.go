@@ -313,76 +313,112 @@ func TestOperatorFailureBlocksUntilResumed(t *testing.T) {
 	}
 }
 
-func TestReleaseIsAnnouncedOnce(t *testing.T) {
+// The daemon announces releases (internal/health, internal/alerts); a pass of `update run` never
+// logs update_available, whatever Latest says.
+func TestRunDoesNotAnnounceReleases(t *testing.T) {
 	r := newRig(t, config.UpdateNotify)
-	r.d.Update.CheckInterval = "1h"
 	r.at("2026-10-06 12:00")
-	for i := 0; i < 3; i++ {
-		if err := r.run(); err != nil {
-			t.Fatal(err)
-		}
-		r.now = r.now.Add(2 * time.Hour)
+	r.d.Latest = func(context.Context) (string, error) {
+		t.Fatal("asked for the latest release in notify mode")
+		return "", nil
 	}
-	if n := r.logs.count("update_available"); n != 1 {
-		t.Errorf("update_available logged %d times for one release", n)
-	}
-	r.latest = "v1.2.0"
 	if err := r.run(); err != nil {
 		t.Fatal(err)
 	}
-	if n := r.logs.count("update_available"); n != 2 {
-		t.Errorf("a newer release is announced again: %d", n)
-	}
-	r.latest = "v1.0.0" // nothing newer than the installed version
-	r.d.Version = "v1.2.0"
-	r.now = r.now.Add(2 * time.Hour)
-	_ = r.run()
-	if n := r.logs.count("update_available"); n != 2 {
-		t.Errorf("a release that is not newer must not be announced: %d", n)
+	if r.logs.count("update_available") != 0 || r.logs.count("update_check_failed") != 0 {
+		t.Error("update run must leave the release check to the daemon")
 	}
 }
 
-func TestCheckIntervalAndFailures(t *testing.T) {
-	r := newRig(t, config.UpdateNotify)
-	checks := 0
-	r.d.Latest = func(context.Context) (string, error) { checks++; return r.latest, r.latestEr }
-	r.d.Update.CheckInterval = "6h"
-	r.at("2026-10-06 12:00")
-	_ = r.run()
-	r.now = r.now.Add(time.Hour)
-	_ = r.run()
-	if checks != 1 {
-		t.Errorf("a check one hour after the last one with a 6h interval: %d checks", checks)
-	}
-	r.now = r.now.Add(5 * time.Hour)
-	_ = r.run()
-	if checks != 2 {
-		t.Errorf("after the interval the node asks again: %d checks", checks)
-	}
-	r.d.Update.CheckInterval = "off"
-	r.now = r.now.Add(48 * time.Hour)
-	_ = r.run()
-	if checks != 2 {
-		t.Errorf("checks are off: %d", checks)
-	}
-
-	// A failed check is logged and does not fail the unit.
-	r = newRig(t, config.UpdateNotify)
-	r.latestEr = errors.New("github is down")
-	r.at("2026-10-06 12:00")
-	if err := r.run(); err != nil || r.logs.count("update_check_failed") != 1 {
-		t.Errorf("failed check: %v, logged %d", err, r.logs.count("update_check_failed"))
-	}
-}
-
-func TestAutoModeUpgradesWithChecksOff(t *testing.T) {
+// Latest is asked only to tell whether a rolled-back release has a successor, so a node whose
+// checks are off upgrades without it.
+func TestAutoModeUpgradesWithoutAskingForTheLatestRelease(t *testing.T) {
 	r := newRig(t, config.UpdateAuto)
-	r.d.Update.CheckInterval = "off"
-	r.d.Latest = func(context.Context) (string, error) { t.Fatal("asked GitHub with checks off"); return "", nil }
+	r.d.Latest = func(context.Context) (string, error) { t.Fatal("asked for the latest release"); return "", nil }
 	r.at("2026-10-04 03:00")
 	if err := r.run(); err != nil || r.calls != 1 {
 		t.Fatalf("%v, %d calls", err, r.calls)
 	}
+}
+
+// An upgrade that began and never reported (the node lost power, the process was killed) is not
+// started again by the next tick of the window: a person looks first.
+func TestInterruptedUpgradePausesInsteadOfRunningAgain(t *testing.T) {
+	r := newRig(t, config.UpdateAuto)
+	r.at("2026-10-04 03:00")
+	died := r.d.Upgrade
+	r.d.Upgrade = func(ctx context.Context) (int, error) {
+		// What the disk holds when the node dies in the middle of the upgrade.
+		st, err := r.d.Store.Load()
+		if err != nil || st.InProgress == nil || st.InProgress.Version != "v1.0.0" || !st.InProgress.Window.Equal(r.now) {
+			t.Errorf("the record must be saved before the upgrade starts: %+v, %v", st.InProgress, err)
+		}
+		panic("power cut")
+	}
+	func() {
+		defer func() { _ = recover() }()
+		_ = r.run()
+	}()
+	r.d.Upgrade = died
+
+	r.at("2026-10-04 03:15") // the next tick of the same window
+	err := r.run()
+	if err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("Run = %v, want the interruption reported", err)
+	}
+	if r.calls != 0 || r.logs.count("unattended_upgrade_interrupted") != 1 {
+		t.Fatalf("the upgrade ran again after a crash: %d calls", r.calls)
+	}
+	st, _ := r.d.Store.Load()
+	if st.InProgress != nil || !strings.Contains(st.Blocked, "did not report how it ended") {
+		t.Errorf("state: %+v", st)
+	}
+	// The pause holds into later windows, and no reboot happens meanwhile.
+	r.d.Update.OSSecurityUpdates, r.rebootOK = true, true
+	r.at("2026-10-11 03:00")
+	if err := r.run(); err != nil || r.calls != 0 || r.reboots != 0 || r.logs.count("unattended_upgrade_skipped") != 1 {
+		t.Fatalf("a paused node: %v, %d calls, %d reboots", err, r.calls, r.reboots)
+	}
+	if was, err := Resume(r.d.Store); err != nil || was == "" {
+		t.Fatalf("Resume = %q, %v", was, err)
+	}
+	r.at("2026-10-18 03:00")
+	if err := r.run(); err != nil || r.calls != 1 {
+		t.Fatalf("after resume the window runs: %v, %d calls", err, r.calls)
+	}
+	if st, _ := r.d.Store.Load(); st.InProgress != nil || st.Result == nil {
+		t.Errorf("a finished upgrade leaves no in-progress record: %+v", st)
+	}
+}
+
+// A refused or failed upgrade clears the record too: only a run that never returned leaves it.
+func TestEveryExitClearsTheInProgressRecord(t *testing.T) {
+	for _, exit := range []int{ExitOK, ExitRefused, ExitRolledBack, ExitNeedsOperator, -1} {
+		r := newRig(t, config.UpdateAuto)
+		r.upgrades = []int{exit}
+		r.at("2026-10-04 03:00")
+		_ = r.run()
+		if st, _ := r.d.Store.Load(); st.InProgress != nil {
+			t.Errorf("exit %d left an in-progress record", exit)
+		}
+	}
+}
+
+func TestStoreLockKeepsTwoPassesApart(t *testing.T) {
+	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	release, err := s.Lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Lock(); !errors.Is(err, ErrBusy) {
+		t.Errorf("a second pass: %v, want ErrBusy", err)
+	}
+	release()
+	again, err := s.Lock()
+	if err != nil {
+		t.Fatalf("after release: %v", err)
+	}
+	again()
 }
 
 func TestOSRebootOnlyInsideTheWindowAndOncePerWindow(t *testing.T) {
@@ -576,12 +612,12 @@ func TestStateFile(t *testing.T) {
 	if st, err := s.Load(); err != nil || st != (State{}) {
 		t.Fatalf("missing file: %+v, %v", st, err)
 	}
-	want := State{Latest: "v1.2.3", Notified: "v1.2.3", Blocked: "x", Result: &Result{Exit: 4}}
+	want := State{Blocked: "x", Result: &Result{Exit: 4}, InProgress: &Progress{Version: "v1"}}
 	if err := s.Save(want); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Load()
-	if err != nil || got.Latest != want.Latest || got.Blocked != "x" || got.Result.Exit != 4 {
+	if err != nil || got.InProgress == nil || got.InProgress.Version != "v1" || got.Blocked != "x" || got.Result.Exit != 4 {
 		t.Fatalf("round trip: %+v, %v", got, err)
 	}
 	if err := writeFile(s.Path, "{not json"); err != nil {
@@ -613,7 +649,7 @@ func TestStoreRefusesAnUntrustedDirectory(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := (Store{Path: filepath.Join(link, "state.json")}).Save(State{Latest: "v1"}); err == nil || !strings.Contains(err.Error(), "not a plain directory") {
+	if err := (Store{Path: filepath.Join(link, "state.json")}).Save(State{Blocked: "v1"}); err == nil || !strings.Contains(err.Error(), "not a plain directory") {
 		t.Errorf("Save through a symlinked directory: %v", err)
 	}
 	lax := filepath.Join(base, "lax")
@@ -627,7 +663,7 @@ func TestStoreRefusesAnUntrustedDirectory(t *testing.T) {
 		t.Errorf("Save into a group-writable directory: %v", err)
 	}
 	good := Store{Path: filepath.Join(base, "good", "state.json")}
-	if err := good.Save(State{Latest: "v1"}); err != nil {
+	if err := good.Save(State{Blocked: "v1"}); err != nil {
 		t.Errorf("a directory the store made itself: %v", err)
 	}
 }
@@ -640,6 +676,7 @@ func TestProjectBlocker(t *testing.T) {
 		{"a restore", `[{"ref":"b","status":"RESTORING"}]`, "in flight"},
 		{"unhealthy", `[{"ref":"a","status":"ACTIVE_UNHEALTHY"}]`, "not healthy: a ACTIVE_UNHEALTHY"},
 		{"busy beats unhealthy", `[{"ref":"a","status":"ACTIVE_UNHEALTHY"},{"ref":"b","status":"RESTARTING"}]`, "in flight"},
+		{"a status nobody listed", `[{"ref":"a","status":"PAUSE_FAILED"},{"ref":"b","status":"RESIZING"}]`, "not healthy: a PAUSE_FAILED, b RESIZING"},
 		{"garbage", `not json`, "cannot read the project list"},
 	}
 	for _, c := range cases {

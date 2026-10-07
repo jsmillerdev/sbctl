@@ -14,7 +14,9 @@
 #     itself.
 # It never merges anything: a person reads the upstream release notes in the pull request and
 # merges it once the runs are green. It skips a release that is a pre-release, a version whose
-# pull request is already open, and one whose pull request a person closed without merging.
+# pull request is already open, one whose pull request a person closed without merging, and a
+# bump/<service> branch that carries a commit by anybody but the bot (a fix pushed to an open
+# proposal); the force-push is leased to the commit it read, so a later push is never overwritten.
 #
 # Needs git, gh (GH_TOKEN with contents: write, pull-requests: write and actions: write),
 # jq and either `go` or RELEASETOOL (a built deploy/releasetool). Environment: GITHUB_REPOSITORY,
@@ -28,6 +30,7 @@ workflows=${WORKFLOWS:-"ci.yml conformance.yml linux.yml"}
 dry=${DRY_RUN:-}
 cd "$(git rev-parse --show-toplevel)"
 versions=internal/versions/versions.yaml
+bot_email="41898282+github-actions[bot]@users.noreply.github.com"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
@@ -70,6 +73,19 @@ while IFS=$'\t' read -r svc pinned newest; do
     continue
   fi
 
+  # The branch belongs to this job, but a person may have pushed a fix to an open proposal. Read
+  # where it stands now: the push below is leased to exactly that commit, and a branch that
+  # carries a commit by anybody else is left alone.
+  remote_sha=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
+  if [[ -n $remote_sha ]]; then
+    git fetch --quiet origin "refs/heads/$branch"
+    others=$(git log --format=%ae "$base_ref..$remote_sha" | grep -vxF "$bot_email" || true)
+    if [[ -n $others ]]; then
+      say "$svc: $branch has a commit that is not the bump job's; not touched (merge or close that pull request first)"
+      continue
+    fi
+  fi
+
   git checkout --quiet -B "$branch" "$base_ref"
   rc=0
   tool bump -versions "$versions" -service "$svc" -to "$newest" || rc=$?
@@ -105,12 +121,12 @@ while IFS=$'\t' read -r svc pinned newest; do
     echo "Opened by .github/workflows/bump-proposals.yml (tests/conformance/propose-bumps.sh)."
   } >"$scratch/body.md"
 
-  git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-    commit --quiet -m "$title" -m "Proposed by the nightly bump check. The conformance suite and the upgrade test gate the merge." -- "$versions"
-  # The branch belongs to this job; --force-with-lease keeps even that from overwriting a commit
-  # somebody else pushed to it.
-  git fetch --quiet origin "$branch" 2>/dev/null || true
-  run git push --force-with-lease origin "$branch"
+  GIT_AUTHOR_NAME="github-actions[bot]" GIT_AUTHOR_EMAIL="$bot_email" \
+    GIT_COMMITTER_NAME="github-actions[bot]" GIT_COMMITTER_EMAIL="$bot_email" \
+    git commit --quiet -m "$title" -m "Proposed by the nightly bump check. The conformance suite and the upgrade test gate the merge." -- "$versions"
+  # The lease names the commit read above (empty: the branch must not exist yet), so a push that
+  # landed since then makes this one fail instead of being overwritten.
+  run git push "--force-with-lease=refs/heads/$branch:$remote_sha" origin "$branch"
 
   if [[ -n $existing ]]; then
     n=$(jq -r .number <<<"$existing")
