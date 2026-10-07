@@ -487,20 +487,24 @@ func TestFunctionWithoutSourcesIsNotServed(t *testing.T) {
 
 func TestReconcileFollowsKeyRotationAndSkipsWhatIsNotAProject(t *testing.T) {
 	e := newEnv(t)
+	const failed, paused = "cccccccccccccccccccc", "dddddddddddddddddddd"
 	e.addProject(refA, registry.StatusActiveHealthy)
-	e.addProject("cccccccccccccccccccc", registry.StatusInitFailed)
-	e.addProject("dddddddddddddddddddd", registry.StatusInactive) // paused: still gets its files
+	e.addProject(failed, registry.StatusInitFailed)
+	e.addProject(paused, registry.StatusInactive) // paused: still gets its files
 	e.addProject(config.SystemRef, registry.StatusActiveHealthy)
+	for _, ref := range []string{refA, failed, paused} {
+		e.deploy(ref, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+	}
 	if err := e.s.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(EnvPath(e.cfg, "cccccccccccccccccccc")); err == nil {
+	if _, err := os.Stat(EnvPath(e.cfg, failed)); err == nil {
 		t.Error("a failed project got files")
 	}
 	if _, err := os.Stat(EnvPath(e.cfg, config.SystemRef)); err == nil {
 		t.Error("the system project got files")
 	}
-	if _, err := os.Stat(EnvPath(e.cfg, "dddddddddddddddddddd")); err != nil {
+	if _, err := os.Stat(EnvPath(e.cfg, paused)); err != nil {
 		t.Error("a paused project got no files")
 	}
 	before := readEnvDoc(t, e.cfg, refA)
@@ -517,6 +521,67 @@ func TestReconcileFollowsKeyRotationAndSkipsWhatIsNotAProject(t *testing.T) {
 	after := readEnvDoc(t, e.cfg, refA)
 	if after.JWTSecret == before.JWTSecret || after.JWTSecret != k.JWTSecret {
 		t.Fatal("rotated keys did not reach the environment file")
+	}
+}
+
+func TestAProjectThatDoesNotUseFunctionsGetsNoFiles(t *testing.T) {
+	e := newEnv(t)
+	e.addProject(refA, registry.StatusActiveHealthy)
+	e.sync(refA)
+	for _, p := range []string{EnvPath(e.cfg, refA), FunctionsDir(e.cfg, refA)} {
+		if _, err := os.Lstat(p); err == nil {
+			t.Fatalf("%s exists for a project without functions or secrets", p)
+		}
+	}
+	// A secret alone is enough to need the file (secrets are set before the first deploy).
+	sealed, _ := e.sec.Seal([]byte("v"))
+	if err := e.store.PutFunctionSecrets(context.Background(), refA, map[string][]byte{"K": sealed}); err != nil {
+		t.Fatal(err)
+	}
+	e.sync(refA)
+	if readEnvDoc(t, e.cfg, refA).Secrets["K"] != "v" {
+		t.Fatal("secret missing")
+	}
+	// Removing the last function and the last secret removes the files again.
+	e.deploy(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+	e.sync(refA)
+	_ = e.store.DeleteFunction(context.Background(), refA, "hello")
+	_ = e.store.DeleteFunctionSecrets(context.Background(), refA, []string{"K"})
+	e.sync(refA)
+	for _, p := range []string{EnvPath(e.cfg, refA), FunctionsDir(e.cfg, refA)} {
+		if _, err := os.Lstat(p); err == nil {
+			t.Fatalf("%s survived the removal of everything", p)
+		}
+	}
+}
+
+// vanishingStore deletes the project directory while the syncer is reading the store, the way
+// a project delete that runs at the same moment would.
+type vanishingStore struct {
+	Store
+	dir string
+}
+
+func (v vanishingStore) ListFunctionSecrets(ctx context.Context, ref string) ([]api.FunctionSecret, error) {
+	out, err := v.Store.ListFunctionSecrets(ctx, ref)
+	_ = os.RemoveAll(v.dir)
+	return out, err
+}
+
+func TestAProjectDeletedDuringASyncIsNotRecreated(t *testing.T) {
+	e := newEnv(t)
+	e.addProject(refA, registry.StatusActiveHealthy)
+	e.deploy(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+	s, err := New(Deps{Cfg: e.cfg, Registry: e.reg, Secrets: e.sec, Keys: e.s.d.Keys,
+		Store: vanishingStore{Store: e.store, dir: e.cfg.Paths().Project(refA)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncProject(context.Background(), refA); err != nil {
+		t.Fatalf("a project that vanished is not an error: %v", err)
+	}
+	if _, err := os.Stat(e.cfg.Paths().Project(refA)); err == nil {
+		t.Fatal("the project directory was recreated")
 	}
 }
 

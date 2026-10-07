@@ -179,20 +179,33 @@ func (s *Syncer) SyncProject(ctx context.Context, ref string) error {
 	if fi, err := os.Stat(cfg.Paths().Project(ref)); err != nil || !fi.IsDir() {
 		return nil
 	}
-	env, err := s.buildEnv(ctx, p)
-	if err != nil {
-		return err
-	}
-	if _, err := writeIfChanged(EnvPath(cfg, ref), env, 0o600); err != nil {
-		return err
-	}
 	fns, err := s.d.Store.ListFunctions(ctx, ref)
 	if err != nil {
 		return err
 	}
-	dir := FunctionsDir(cfg, ref)
-	if err := os.MkdirAll(filepath.Join(dir, genDirName), 0o700); err != nil {
+	secretNames, err := s.d.Store.ListFunctionSecrets(ctx, ref)
+	if err != nil {
 		return err
+	}
+	if len(fns) == 0 && len(secretNames) == 0 {
+		// Nothing to run and nothing to configure: the project's keys are not copied into
+		// a file for a project that does not use Edge Functions.
+		return s.removeFiles(ref)
+	}
+	env, err := s.buildEnv(ctx, p, secretNames)
+	if err != nil {
+		return err
+	}
+	if _, err := writeIfChanged(EnvPath(cfg, ref), env, 0o600); err != nil {
+		return projectGone(err)
+	}
+	dir := FunctionsDir(cfg, ref)
+	// Mkdir, not MkdirAll: a project that is deleted while this runs must not get its
+	// directory back, with a functions tree in it, after the delete removed it.
+	for _, d := range []string{dir, filepath.Join(dir, genDirName)} {
+		if err := os.Mkdir(d, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+			return projectGone(err)
+		}
 	}
 	var errs []error
 	want := map[string]bool{}
@@ -217,6 +230,11 @@ func (s *Syncer) RemoveProject(ref string) error {
 		return err
 	}
 	defer s.lock(ref)()
+	return s.removeFiles(ref)
+}
+
+// removeFiles deletes everything this package wrote for ref (the caller holds the lock).
+func (s *Syncer) removeFiles(ref string) error {
 	var first error
 	for _, p := range []string{FunctionsDir(s.d.Cfg, ref), EnvPath(s.d.Cfg, ref)} {
 		if err := os.RemoveAll(p); err != nil && first == nil {
@@ -224,6 +242,15 @@ func (s *Syncer) RemoveProject(ref string) error {
 		}
 	}
 	return first
+}
+
+// projectGone turns "the project directory disappeared" (a delete that ran meanwhile)
+// into success: there is nothing left to write for it.
+func projectGone(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // envDoc is functions-env.json.
@@ -237,7 +264,7 @@ type envDoc struct {
 // buildEnv renders functions-env.json for p: the values hosted passes to functions
 // (SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_DB_URL), the
 // opaque keys as the newer client libraries read them, and the project's secrets.
-func (s *Syncer) buildEnv(ctx context.Context, p *registry.Project) ([]byte, error) {
+func (s *Syncer) buildEnv(ctx context.Context, p *registry.Project, stored []api.FunctionSecret) ([]byte, error) {
 	k, err := s.d.Keys(ctx, p.Ref)
 	if err != nil {
 		return nil, fmt.Errorf("project keys: %w", err)
@@ -261,12 +288,8 @@ func (s *Syncer) buildEnv(ctx context.Context, p *registry.Project) ([]byte, err
 	if k.SecretKey != "" {
 		sb["SUPABASE_SECRET_KEYS"] = jsonObject(map[string]string{"default": k.SecretKey})
 	}
-	list, err := s.d.Store.ListFunctionSecrets(ctx, p.Ref)
-	if err != nil {
-		return nil, err
-	}
-	sec := make(map[string]string, len(list))
-	for _, e := range list {
+	sec := make(map[string]string, len(stored))
+	for _, e := range stored {
 		plain, err := s.d.Secrets.Open(e.Sealed)
 		if err != nil {
 			return nil, fmt.Errorf("open secret %s: %w", e.Name, err)
