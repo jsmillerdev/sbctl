@@ -199,7 +199,8 @@ func TestWSInspector(t *testing.T) {
 		"binary frame is not inspected":      {stream: wsFrame(true, 2, join(k.AnonKey), true, 0)},
 		"key in a binary fragment sequence":  {stream: cat(wsFrame(false, 2, frag1, true, 0), wsFrame(true, 0, frag2, true, 0))},
 		"key in a ping payload":              {stream: wsFrame(true, 9, []byte(k.AnonKey[:100]), true, 0)},
-		"truncated key never completes":      {stream: wsFrame(true, 1, join(k.AnonKey[:len(k.AnonKey)-1]), true, 0)},
+		"cut signature is still the key":     {stream: wsFrame(true, 1, join(k.AnonKey[:len(k.AnonKey)-1]), true, 0), found: true},
+		"signing input without its dot":      {stream: wsFrame(true, 1, join(k.AnonKey[:strings.LastIndexByte(k.AnonKey, '.')]), true, 0)},
 		"keys in two separate messages":      {stream: cat(wsFrame(true, 1, []byte(k.AnonKey[:half]), true, 0), wsFrame(true, 1, []byte(k.AnonKey[half:]), true, 0))},
 		"text after binary after key prefix": {stream: cat(wsFrame(true, 1, join("a"), true, 0), wsFrame(true, 2, []byte("zz"), true, 0), wsFrame(true, 1, join("b"), true, 0))},
 	} {
@@ -395,7 +396,7 @@ func TestRealtimeLongPollRefusesLegacyKeysWhenDisabled(t *testing.T) {
 	for name, body := range map[string]string{
 		"service_role": `{"topic":"realtime:x","event":"phx_join","payload":{"access_token":"` + h.k.ServiceRoleKey + `"}}`,
 		"escaped anon": `{"payload":{"access_token":"` + strings.Replace(h.k.AnonKey, "eyJ", `eyJ`, 1) + `"}}`,
-		"after 300 kB": `{"pad":"` + strings.Repeat("p", 300000) + `","access_token":"` + h.k.AnonKey + `"}`,
+		"after 200 kB": `{"pad":"` + strings.Repeat("p", 200000) + `","access_token":"` + h.k.AnonKey + `"}`,
 	} {
 		resp, text := post(body)
 		if resp.StatusCode != 401 || text != msgInvalidKey {

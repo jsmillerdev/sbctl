@@ -3,11 +3,13 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,14 +30,22 @@ import (
 
 var errLegacyKeyInStream = errors.New("proxy: a legacy API key was sent while the project's legacy keys are disabled")
 
-// legacyNeedles returns the exact keys to look for, or nil when the legacy keys are enabled.
+// legacyNeedles returns the byte strings that give away a legacy key, or nil when the legacy
+// keys are enabled. For a JWT it is "<header>.<payload>." of the key: the HMAC input plus the
+// dot that starts the signature. Whatever follows (the signature in its canonical spelling, with
+// flipped unused low bits, with "=" padding) does not change what the token is, so matching the
+// whole key text would let a re-encoded signature through while upstream still accepts it.
 func legacyNeedles(k *secrets.ProjectKeys) [][]byte {
 	if k == nil || !k.LegacyDisabled {
 		return nil
 	}
 	var n [][]byte
 	for _, key := range []string{k.AnonKey, k.ServiceRoleKey} {
-		if key != "" {
+		switch in, ok := signingInput(key); {
+		case key == "":
+		case ok && strings.Count(key, ".") == 2:
+			n = append(n, []byte(in+"."))
+		default:
 			n = append(n, []byte(key))
 		}
 	}
@@ -301,19 +311,80 @@ func (w *wsInspector) inspect(p []byte) bool {
 	return false
 }
 
-// wsGuardConn is the hijacked client connection of a guarded socket. Reads pass through the
-// inspector; a hit sends a close frame with a reason, drops the data read and fails the read,
-// which makes the reverse proxy tear both sides down. Writes are serialized so the close frame
-// cannot land inside another frame the proxy is relaying to the client.
+// wsFrameTracker follows the server-to-client frames the proxy relays, to know whether the
+// next byte it writes starts a frame. A close frame injected anywhere else would land inside a
+// frame the client is still reading and corrupt it.
+type wsFrameTracker struct {
+	hdr  [14]byte
+	nhdr int
+	left uint64 // payload bytes left in the current frame
+	lost bool   // an impossible length: the boundary is unknown from here on
+}
+
+func (t *wsFrameTracker) boundary() bool { return !t.lost && t.nhdr == 0 && t.left == 0 }
+
+func (t *wsFrameTracker) feed(b []byte) {
+	for len(b) > 0 && !t.lost {
+		if t.left > 0 {
+			n := len(b)
+			if uint64(n) > t.left {
+				n = int(t.left)
+			}
+			t.left -= uint64(n)
+			b = b[n:]
+			continue
+		}
+		t.hdr[t.nhdr] = b[0]
+		t.nhdr++
+		b = b[1:]
+		if t.nhdr < 2 {
+			continue
+		}
+		need, l := 2, t.hdr[1]&0x7f
+		switch l {
+		case 126:
+			need = 4
+		case 127:
+			need = 10
+		}
+		if t.hdr[1]&0x80 != 0 { // server frames are not masked; tolerate it anyway
+			need += 4
+		}
+		if t.nhdr < need {
+			continue
+		}
+		switch l {
+		case 126:
+			t.left = uint64(binary.BigEndian.Uint16(t.hdr[2:4]))
+		case 127:
+			if t.left = binary.BigEndian.Uint64(t.hdr[2:10]); t.left>>63 != 0 {
+				t.lost = true
+			}
+		default:
+			t.left = uint64(l)
+		}
+		t.nhdr = 0
+	}
+}
+
+// wsGuardConn is the hijacked client connection of a Realtime socket. Reads of a guarded
+// socket pass through the inspector; a hit drops the data read and fails the read, which makes
+// the reverse proxy tear both sides down. Writes are serialized, and a close frame with a reason
+// is sent only when the last byte relayed to the client ended a frame; otherwise the connection
+// is simply torn down.
 type wsGuardConn struct {
 	net.Conn
 	r       io.Reader
-	insp    *wsInspector
+	insp    *wsInspector // nil: the socket is only tracked, not inspected
 	onBlock func(reason string)
+	onClose func()
 
 	wmu    sync.Mutex
 	closed bool
+	srv    wsFrameTracker
 	err    error
+
+	closeOnce sync.Once
 }
 
 const wsCloseReason = "legacy API keys are disabled for this project"
@@ -323,7 +394,7 @@ func (c *wsGuardConn) Read(p []byte) (int, error) {
 		return 0, c.err
 	}
 	n, err := c.r.Read(p)
-	if n > 0 {
+	if n > 0 && c.insp != nil {
 		if found, why := c.insp.feed(p[:n]); found || why != "" {
 			if found {
 				why = wsCloseReason
@@ -342,24 +413,129 @@ func (c *wsGuardConn) Write(p []byte) (int, error) {
 	if c.closed {
 		return 0, net.ErrClosed
 	}
-	return c.Conn.Write(p)
+	n, err := c.Conn.Write(p)
+	c.srv.feed(p[:n])
+	return n, err
 }
 
-// block sends a close frame (1008, policy violation) and stops further writes.
-func (c *wsGuardConn) block(reason string) {
+func (c *wsGuardConn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return c.Conn.Close()
+}
+
+// sendClose stops further writes and, when the client's frame stream is at a frame boundary,
+// sends a close frame (1008, policy violation) with reason.
+func (c *wsGuardConn) sendClose(reason string) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	if !c.closed {
-		c.closed = true
-		if len(reason) > 123 {
-			reason = reason[:123]
-		}
-		frame := append([]byte{0x88, byte(2 + len(reason)), 0x03, 0xF0}, reason...)
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		_, _ = c.Conn.Write(frame)
+	if c.closed {
+		return
 	}
+	c.closed = true
+	if !c.srv.boundary() {
+		return
+	}
+	if len(reason) > 123 {
+		reason = reason[:123]
+	}
+	frame := append([]byte{0x88, byte(2 + len(reason)), 0x03, 0xF0}, reason...)
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, _ = c.Conn.Write(frame)
+}
+
+// block ends the connection because the client sent a legacy key or broke a framing rule.
+func (c *wsGuardConn) block(reason string) {
+	c.sendClose(reason)
 	if c.onBlock != nil {
 		c.onBlock(reason)
+	}
+}
+
+// sever ends the connection from outside (the project's keys changed); the blocked Read makes
+// the reverse proxy tear down the upstream side.
+func (c *wsGuardConn) sever(reason string) {
+	c.sendClose(reason)
+	_ = c.Close()
+}
+
+// socketSet tracks the Realtime sockets that were opened without inspection (the legacy keys
+// were enabled), per project, so they can be closed when the project's legacy keys are
+// switched off: nothing inspects them, and one can carry a legacy access_token for as long as
+// the client keeps it open.
+type socketSet struct {
+	mu sync.Mutex
+	m  map[string]map[*wsGuardConn]struct{}
+}
+
+func (s *socketSet) add(ref string, c *wsGuardConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil {
+		s.m = map[string]map[*wsGuardConn]struct{}{}
+	}
+	if s.m[ref] == nil {
+		s.m[ref] = map[*wsGuardConn]struct{}{}
+	}
+	s.m[ref][c] = struct{}{}
+}
+
+func (s *socketSet) remove(ref string, c *wsGuardConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.m[ref], c)
+	if len(s.m[ref]) == 0 {
+		delete(s.m, ref)
+	}
+}
+
+// refs lists the projects with a tracked socket; with ref set, just that project if it has one.
+func (s *socketSet) refs(ref string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ref != "" {
+		if len(s.m[ref]) > 0 {
+			return []string{ref}
+		}
+		return nil
+	}
+	out := make([]string, 0, len(s.m))
+	for r := range s.m {
+		out = append(out, r)
+	}
+	return out
+}
+
+// closeAll severs every tracked socket of ref and reports how many there were.
+func (s *socketSet) closeAll(ref, reason string) int {
+	s.mu.Lock()
+	conns := make([]*wsGuardConn, 0, len(s.m[ref]))
+	for c := range s.m[ref] {
+		conns = append(conns, c)
+	}
+	delete(s.m, ref)
+	s.mu.Unlock()
+	for _, c := range conns {
+		c.sever(reason)
+	}
+	return len(conns)
+}
+
+// recheckSockets closes the project's tracked sockets when its legacy keys are now disabled.
+// ref "" checks every project that has one. A failed key lookup leaves the sockets as they are;
+// the next invalidation or the periodic reload checks again.
+func (s *Server) recheckSockets(ref string) {
+	for _, r := range s.sockets.refs(ref) {
+		k, err := s.table.projectKeys(context.Background(), r)
+		if err != nil || k == nil || !k.LegacyDisabled {
+			continue
+		}
+		if n := s.sockets.closeAll(r, wsCloseReason); n > 0 {
+			s.log.Warn("proxy: closed Realtime sockets opened before the legacy API keys were disabled", "ref", r, "sockets", n)
+		}
 	}
 }
 
@@ -382,30 +558,66 @@ func (w *guardedWriter) Flush() { _ = http.NewResponseController(w.ResponseWrite
 func (w *guardedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // maxGuardedBody bounds the memory held for a long-poll request body. A long-poll body is one
-// or a few Phoenix messages; it is read in full, so that a refused one never reaches Realtime
-// partly (a streamed check would have sent everything before the key upstream already).
-const maxGuardedBody = 4 << 20
+// or a few Phoenix messages. It is buffered, so that a refused body never reaches Realtime
+// partly (a pass-through check would have sent everything before the key upstream already), but
+// it is scanned as it arrives and the request ends at the first hit.
+const maxGuardedBody = 256 << 10
 
-// checkBody reads the request body of a guarded non-upgrade request, answers the refusal itself
-// when it carries a legacy key or is too large, and otherwise puts the body back for forwarding.
+// checkBody reads the request body of a guarded request, answers the refusal itself when it
+// carries a legacy key or is too large, and otherwise puts the body back for forwarding.
 func checkBody(w http.ResponseWriter, r *http.Request, needles [][]byte) (ok bool, hit bool) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return true, false
 	}
-	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxGuardedBody))
-	if err != nil {
-		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
-			writeJSON(w, http.StatusRequestEntityTooLarge, "Request body too large")
-		} else {
-			writeJSON(w, http.StatusBadRequest, "Bad Request")
-		}
+	if r.ContentLength > maxGuardedBody {
+		writeJSON(w, http.StatusRequestEntityTooLarge, "Request body too large")
 		return false, false
 	}
-	if newKeyScanner(needles).write(b) {
-		writeText(w, http.StatusUnauthorized, msgInvalidKey)
-		return false, true
+	body := http.MaxBytesReader(w, r.Body, maxGuardedBody)
+	scan := newKeyScanner(needles)
+	var buf bytes.Buffer
+	chunk := make([]byte, 16<<10)
+	for {
+		n, err := body.Read(chunk)
+		if n > 0 {
+			buf.Write(chunk[:n])
+			if scan.write(chunk[:n]) {
+				writeText(w, http.StatusUnauthorized, msgInvalidKey)
+				return false, true
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(err, &mbe) {
+				writeJSON(w, http.StatusRequestEntityTooLarge, "Request body too large")
+			} else {
+				writeJSON(w, http.StatusBadRequest, "Bad Request")
+			}
+			return false, false
+		}
 	}
-	r.Body = io.NopCloser(bytes.NewReader(b))
+	r.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
 	return true, false
+}
+
+// isWebSocketHandshake reports whether r is a WebSocket opening handshake: a GET that asks
+// for the "websocket" upgrade with a Connection header that lists "upgrade" (the condition
+// under which httputil.ReverseProxy switches protocols).
+func isWebSocketHandshake(r *http.Request) bool {
+	return r.Method == http.MethodGet && connectionUpgrade(r.Header) && strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket")
+}
+
+// connectionUpgrade reports whether a Connection header lists the "upgrade" token.
+func connectionUpgrade(h http.Header) bool {
+	for _, v := range h.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }

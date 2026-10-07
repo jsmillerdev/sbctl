@@ -191,6 +191,9 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		tg.set[TenantHeader] = p.ref
 	}
 	tg.dropTenant = rt.svc != svcFunctions
+	if rt.keys == keyRealtime {
+		tg.trackRef = p.ref
+	}
 	if len(guardKeys) > 0 {
 		// Legacy keys are disabled: watch what the client sends into the socket (or the long-poll
 		// body) for a legacy key. A compressing extension would hide the text, so it is not offered
@@ -239,22 +242,47 @@ type target struct {
 	// inside a WebSocket text message or a request body (see wsguard.go); onGuard is told of a hit.
 	guardKeys [][]byte
 	onGuard   func(reason string)
+	// trackRef, set for a Realtime socket route, is the project whose sockets that were not
+	// inspected (legacy keys enabled) are closed when its legacy keys are switched off.
+	trackRef string
 }
 
 // forward proxies r to tg, streaming in both directions and passing WebSocket
 // upgrades through.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
-	if len(tg.guardKeys) > 0 {
-		if r.Header.Get("Upgrade") != "" {
-			w = &guardedWriter{ResponseWriter: w, wrap: func(c net.Conn, brw *bufio.ReadWriter) net.Conn {
-				return &wsGuardConn{Conn: c, r: brw.Reader, insp: newWSInspector(tg.guardKeys), onBlock: tg.onGuard}
-			}}
-		} else if ok, hit := checkBody(w, r, tg.guardKeys); !ok {
+	guarded := len(tg.guardKeys) > 0
+	if guarded {
+		// Every guarded request with a body is checked, whatever its headers claim: a request
+		// that is not a WebSocket handshake never becomes a socket, so its body is the only
+		// place a key can travel.
+		if ok, hit := checkBody(w, r, tg.guardKeys); !ok {
 			if hit && tg.onGuard != nil {
 				tg.onGuard("request body")
 			}
 			return
 		}
+		if !isWebSocketHandshake(r) {
+			// ReverseProxy would still pass an Upgrade request (any method, any protocol)
+			// through as a raw tunnel, where nothing inspects the bytes: forward it as the
+			// plain request it is, and let a 101 from upstream fail as an unrequested upgrade.
+			r.Header.Del("Upgrade")
+		}
+	}
+	if isWebSocketHandshake(r) && (guarded || tg.trackRef != "") {
+		w = &guardedWriter{ResponseWriter: w, wrap: func(c net.Conn, brw *bufio.ReadWriter) net.Conn {
+			gc := &wsGuardConn{Conn: c, r: brw.Reader, onBlock: tg.onGuard}
+			if guarded {
+				gc.insp = newWSInspector(tg.guardKeys)
+				return gc
+			}
+			// Opened while the legacy keys are enabled: not inspected, but closed when they are
+			// switched off. The keys may have changed between the check above and now, so look again.
+			ref := tg.trackRef
+			s.sockets.add(ref, gc)
+			gc.onClose = func() { s.sockets.remove(ref, gc) }
+			go s.recheckSockets(ref)
+			return gc
+		}}
 	}
 	rp := &httputil.ReverseProxy{
 		Transport:     s.transport(tg.timeout),

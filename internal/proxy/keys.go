@@ -101,23 +101,65 @@ func legacyKey(k *secrets.ProjectKeys, ref, apikey string) (role, jwt string, ok
 	return "", "", false
 }
 
-// disabledLegacyBearer reports whether bearer is exactly the project's anon or service_role
-// key while the legacy keys are disabled. Such a token is what a leaked legacy key looks
-// like on the wire, and the switch exists to make it stop working. Other JWTs signed with the
-// project's secret (users' sessions, which GoTrue signs with it) stay valid in Authorization
-// until the JWT secret is rotated, as on hosted.
-func disabledLegacyBearer(k *secrets.ProjectKeys, bearer string) bool {
-	return k != nil && k.LegacyDisabled && bearer != "" && !strings.HasPrefix(bearer, "sb_") &&
-		(eqConst(bearer, k.AnonKey) || eqConst(bearer, k.ServiceRoleKey))
+// signingInput returns the "<header>.<payload>" part of a JWT-shaped token: the bytes the
+// HMAC covers. ok is false for a token without a dot.
+func signingInput(tok string) (string, bool) {
+	i := strings.IndexByte(tok, '.')
+	if i < 0 {
+		return "", false
+	}
+	if j := strings.IndexByte(tok[i+1:], '.'); j >= 0 {
+		return tok[:i+1+j], true
+	}
+	return tok, true
 }
 
-// refusedLegacy reports whether key is a legacy credential of the project (anon or
-// service_role key, or a JWT signed with the project secret for one of those roles) that the
-// disabled legacy switch turns away. The dashboard's temporary key is spared. Opaque sb_ keys
-// are never legacy.
+// isLegacyKeyToken reports whether tok is the project's anon or service_role key in any
+// encoding the upstream verifiers accept: its header and payload segments (the signing input)
+// equal those of the key. The signature segment is not compared. It can be re-encoded without
+// changing the bytes it stands for (flipped unused low bits of its last character, "="
+// padding), verifiers decode it leniently, and a signature that does not verify gets the token
+// nowhere anyway. Comparing the signing input exactly is what a canonical comparison needs:
+// the HMAC covers those segments as text, so any other spelling of them fails verification.
+func isLegacyKeyToken(k *secrets.ProjectKeys, tok string) bool {
+	if k == nil || tok == "" {
+		return false
+	}
+	in, ok := signingInput(tok)
+	if !ok {
+		return false
+	}
+	var hit bool
+	for _, key := range []string{k.AnonKey, k.ServiceRoleKey} {
+		want, _ := signingInput(key)
+		// No early exit, as in eqConst.
+		if eqConst(in, want) {
+			hit = true
+		}
+	}
+	return hit
+}
+
+// disabledLegacyBearer reports whether bearer is the project's anon or service_role key while
+// the legacy keys are disabled (in any signature encoding, see isLegacyKeyToken). Such a token
+// is what a leaked legacy key looks like on the wire, and the switch exists to make it stop
+// working. Other JWTs signed with the project's secret (users' sessions, which GoTrue signs
+// with it) stay valid in Authorization until the JWT secret is rotated, as on hosted.
+func disabledLegacyBearer(k *secrets.ProjectKeys, bearer string) bool {
+	return k != nil && k.LegacyDisabled && bearer != "" && !strings.HasPrefix(bearer, "sb_") &&
+		isLegacyKeyToken(k, bearer)
+}
+
+// refusedLegacy reports whether key is a legacy credential of the project (the anon or
+// service_role key in any signature encoding, or a JWT signed with the project secret for one
+// of those roles) that the disabled legacy switch turns away. The dashboard's temporary key
+// is spared. Opaque sb_ keys are never legacy.
 func refusedLegacy(k *secrets.ProjectKeys, ref, key string) bool {
 	if k == nil || !k.LegacyDisabled || key == "" || strings.HasPrefix(key, "sb_") {
 		return false
+	}
+	if isLegacyKeyToken(k, key) {
+		return true
 	}
 	if _, _, tmp := temporaryKey(k, ref, key); tmp {
 		return false

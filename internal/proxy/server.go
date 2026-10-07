@@ -32,6 +32,9 @@ type Server struct {
 	// upstreamFn overrides the upstream address resolution (tests).
 	upstreamFn func(service, project) string
 
+	// sockets are the Realtime sockets opened without inspection (see wsguard.go).
+	sockets socketSet
+
 	mu         sync.Mutex
 	transports map[time.Duration]*http.Transport
 }
@@ -66,6 +69,11 @@ func New(opts Options) (*Server, error) {
 		}
 	}
 	s.table = newTable(s.cfg, opts.Registry, opts.Keys, s.log)
+	s.table.onKeysDropped = func(ref string) {
+		if len(s.sockets.refs(ref)) > 0 {
+			go s.recheckSockets(ref)
+		}
+	}
 	if err := s.table.reload(context.Background()); err != nil {
 		return nil, fmt.Errorf("proxy: loading routes: %w", err)
 	}
