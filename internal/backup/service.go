@@ -43,8 +43,8 @@ type Options struct {
 	// ConfigPath is embedded as --config in archive_command and restore_command when
 	// it is not the default, so Postgres children find the same configuration.
 	ConfigPath string
-	// DataDir returns a project's Postgres data directory, used by in-place restore.
-	// Default: config.Paths.ProjectService(ref, "postgres").
+	// DataDir returns a project's Postgres data directory (PGDATA), used by in-place restore.
+	// Default: config.Paths.PostgresData.
 	DataDir func(ref string) string
 	// Version is recorded in backup manifests.
 	Version string
@@ -92,7 +92,7 @@ func New(o Options) (*Service, error) {
 	}
 	if o.DataDir == nil && o.Config != nil {
 		paths := o.Config.Paths()
-		o.DataDir = func(ref string) string { return paths.ProjectService(ref, config.SvcPostgres) }
+		o.DataDir = paths.PostgresData
 	}
 	if o.RecoveryTimeout <= 0 {
 		o.RecoveryTimeout = 30 * time.Minute

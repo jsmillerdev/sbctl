@@ -143,3 +143,13 @@ func TestRestoreInPlaceModes(t *testing.T) {
 		})
 	}
 }
+
+// An in-place restore replaces PGDATA, which is <project>/postgres/data (lifecycle's layout), not
+// the project's postgres directory, which also holds the socket directory and the launcher's files.
+func TestDefaultDataDirIsPGDATA(t *testing.T) {
+	e := newTestEnv(t)
+	want := filepath.Join(e.cfg.StateDir, "projects", testRef, "postgres", "data")
+	if got := e.svc.opt.DataDir(testRef); got != want {
+		t.Fatalf("DataDir = %s, want %s", got, want)
+	}
+}
