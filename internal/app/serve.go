@@ -101,22 +101,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	if budget <= 0 {
 		budget = StopBudget
 	}
-	g.Go(func() error {
-		<-gctx.Done()
-		// Operations the API detached from their requests (and the create goroutines)
-		// must end before the registry closes: a delete cut off after the data plane is
-		// gone, or a restart cut off after the pause, would need Recover at the next start.
-		// New mutations answer 503 from here on; the listener stays up so that clients of
-		// the running ones still get their answers.
-		sctx, cancel := context.WithTimeout(context.Background(), budget)
-		defer cancel()
-		log.Info("stopping: waiting for running lifecycle operations", "budget", budget.String())
-		if err := apiH.Drain(sctx); err != nil {
-			log.Warn("stopping with lifecycle operations unfinished; the next start recovers them", "error", err)
-		}
-		return admin.Shutdown(sctx)
-	})
-	g.Go(func() error { return edge.Run(gctx) })
+	superviseStop(g, gctx, budget, edge.Run, apiH.Drain, admin.Shutdown, log)
 	g.Go(func() error {
 		startProjects(gctx, node, recovered, backups(node), log)
 		return nil
@@ -125,6 +110,38 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	err = g.Wait()
 	log.Info("sbctl stopped")
 	return err
+}
+
+// superviseStop runs the edge proxy and, once gctx ends (SIGTERM), drains the lifecycle
+// operations the API detached from their requests (and the create goroutines): they must
+// end before the registry closes, because a delete cut off after the data plane is gone,
+// or a restart cut off after the pause, would need Recover at the next start. New
+// mutations answer 503 from the first moment of the drain.
+//
+// The edge runs on its own context, cancelled only after the drain: project traffic
+// (REST, Auth, Storage), api.<domain> and studio.<domain> keep answering while a long
+// operation (a delete with its final base backup) finishes, so clients of that operation
+// that came through api.<domain> still get their answer and a restart does not take the
+// whole node's public edge down for the length of the drain. The loopback admin listener
+// shuts down last, with the same budget.
+func superviseStop(g *errgroup.Group, gctx context.Context, budget time.Duration,
+	edgeRun func(context.Context) error, drain, shutdownAdmin func(context.Context) error, log *slog.Logger) {
+	edgeCtx, stopEdge := context.WithCancel(context.WithoutCancel(gctx))
+	g.Go(func() error {
+		<-gctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
+		log.Info("stopping: waiting for running lifecycle operations; the proxy keeps serving", "budget", budget.String())
+		if err := drain(sctx); err != nil {
+			log.Warn("stopping with lifecycle operations unfinished; the next start recovers them", "error", err)
+		}
+		stopEdge()
+		return shutdownAdmin(sctx)
+	})
+	g.Go(func() error {
+		defer stopEdge()
+		return edgeRun(edgeCtx)
+	})
 }
 
 // startProjects brings the system project's backup timer and every active project up

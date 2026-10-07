@@ -22,8 +22,9 @@ is the daemon that `sbctl.service` runs.
   time next to the listeners (the system project's backup timer and the prune timer too, on
   systemd). `ctx` ending (SIGTERM) first drains the API (`api.Server.Drain`: new lifecycle operations
   answer 503, running ones, including creates and a delete's final backup, finish, bounded by
-  `StopBudget`, 10 minutes; `sbctl.service` allows 660 s to stop) and only then closes the
-  listeners and the registry; project units belong to systemd and keep running. At boot it
+  `StopBudget`, 10 minutes; `sbctl.service` allows 660 s to stop). The edge proxy keeps serving
+  project, `api.<domain>` and `studio.<domain>` traffic during the drain and stops only after it
+  returns (`superviseStop`); then the admin listener and the registry close; project units belong to systemd and keep running. At boot it
   waits up to 2 minutes for the registry (`lifecycle.ErrRegistryUnreachable`), resumes projects
   whose restart was cut off after the pause (`Engine.ResumeRecovered`), and keeps finishing restored
   clones tagged `restore.cleanup_pending` (`backup.Service.FinishPendingRestores`). The system project must exist (`sbctl system init`).

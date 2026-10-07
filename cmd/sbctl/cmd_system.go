@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -119,7 +118,17 @@ configuration. Run it as the user that owns the state directory (sbctl).`,
 		Short: "Install the systemd units and the polkit rule, and enable the system units (needs root)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			changed, err := systemd.Install(sysUnitDir, sysPolkitDir)
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			// The embedded timer carries the default schedule; the node's own comes from
+			// config and is written in the same pass, so a second run changes nothing.
+			timer, err := backup.RenderBackupTimerChecked(cfg.Backup.BaseBackupOnCalendar)
+			if err != nil {
+				return fmt.Errorf("config backup.base_backup_on_calendar: %w", err)
+			}
+			changed, err := systemd.InstallWith(sysUnitDir, sysPolkitDir, map[string][]byte{backup.BackupTimerUnit: []byte(timer)})
 			if err != nil {
 				return err
 			}
@@ -128,17 +137,6 @@ configuration. Run it as the user that owns the state directory (sbctl).`,
 			}
 			if len(changed) == 0 {
 				fmt.Fprintln(cmd.OutOrStdout(), "units are up to date")
-			}
-			cfg, err := loadConfig()
-			if err != nil {
-				return err
-			}
-			// The embedded timer carries the default schedule; the node's own comes from config.
-			if timerChanged, err := installBackupTimer(sysUnitDir, cfg.Backup.BaseBackupOnCalendar); err != nil {
-				return err
-			} else if timerChanged {
-				changed = append(changed, "sb-basebackup@.timer")
-				fmt.Fprintln(cmd.OutOrStdout(), "installed", filepath.Join(sysUnitDir, "sb-basebackup@.timer"), "(schedule from backup.base_backup_on_calendar)")
 			}
 			apply, err := lifecycle.OpenOptions{Log: newLogger(cfg)}.UnitInstaller(cfg)
 			if err != nil {
@@ -153,22 +151,4 @@ configuration. Run it as the user that owns the state directory (sbctl).`,
 
 	systemCmd.AddCommand(initCmd, status, start, stop, install)
 	rootCmd.AddCommand(systemCmd)
-}
-
-// installBackupTimer writes sb-basebackup@.timer with the configured OnCalendar when it
-// differs from what is in dir, and reports whether it wrote. An invalid expression is an
-// error: silently keeping the default would hide a typo in the config.
-func installBackupTimer(dir, onCalendar string) (bool, error) {
-	want, err := backup.RenderBackupTimerChecked(onCalendar)
-	if err != nil {
-		return false, fmt.Errorf("config backup.base_backup_on_calendar: %w", err)
-	}
-	path := filepath.Join(dir, "sb-basebackup@.timer")
-	if cur, err := os.ReadFile(path); err == nil && string(cur) == want {
-		return false, nil
-	}
-	if err := os.WriteFile(path, []byte(want), 0o644); err != nil {
-		return false, err
-	}
-	return true, nil
 }

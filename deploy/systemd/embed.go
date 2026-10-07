@@ -30,6 +30,14 @@ func Read(name string) ([]byte, error) { return files.ReadFile(name) }
 // It returns the files whose content changed, so the caller can daemon-reload only
 // when something did.
 func Install(unitDir, polkitDir string) (changed []string, err error) {
+	return InstallWith(unitDir, polkitDir, nil)
+}
+
+// InstallWith is Install with per-file content overrides, keyed by embedded file name.
+// A node whose config differs from an embedded default (the base backup schedule) passes
+// its rendering here, so the file is written once with its final content and a second
+// run reports no change.
+func InstallWith(unitDir, polkitDir string, override map[string][]byte) (changed []string, err error) {
 	for _, name := range Names() {
 		dir := unitDir
 		if filepath.Ext(name) == ".rules" {
@@ -38,9 +46,11 @@ func Install(unitDir, polkitDir string) (changed []string, err error) {
 			}
 			dir = polkitDir
 		}
-		b, err := files.ReadFile(name)
-		if err != nil {
-			return changed, err
+		b, ok := override[name]
+		if !ok {
+			if b, err = files.ReadFile(name); err != nil {
+				return changed, err
+			}
 		}
 		dst := filepath.Join(dir, name)
 		if cur, err := os.ReadFile(dst); err == nil && string(cur) == string(b) {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/OWNER/sbctl/deploy/systemd"
 	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/config"
 )
@@ -158,22 +159,26 @@ func TestWarnConfigFileMode(t *testing.T) {
 	}
 }
 
-func TestInstallBackupTimerUsesTheConfiguredSchedule(t *testing.T) {
+func TestInstallUnitsIsIdempotentWithACustomBackupSchedule(t *testing.T) {
 	dir := t.TempDir()
-	if changed, err := installBackupTimer(dir, "*-*-* 03:00:00"); err != nil || !changed {
-		t.Fatalf("first install: %v %v", changed, err)
+	cal := "*-*-* 01:30:00"
+	timer, err := backup.RenderBackupTimerChecked(cal)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if changed, _ := installBackupTimer(dir, "*-*-* 03:00:00"); changed {
-		t.Error("an unchanged timer was rewritten")
+	ov := map[string][]byte{backup.BackupTimerUnit: []byte(timer)}
+	first, err := systemd.InstallWith(dir, "", ov)
+	if err != nil || len(first) == 0 {
+		t.Fatalf("first install: %v %v", first, err)
 	}
-	if changed, err := installBackupTimer(dir, "*-*-* 01:30:00"); err != nil || !changed {
-		t.Fatalf("new schedule: %v %v", changed, err)
+	if second, err := systemd.InstallWith(dir, "", ov); err != nil || len(second) != 0 {
+		t.Fatalf("second install with a custom schedule changed %v (err %v)", second, err)
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "sb-basebackup@.timer"))
 	if !strings.Contains(string(b), "OnCalendar=*-*-* 01:30:00\n") {
 		t.Errorf("timer file:\n%s", b)
 	}
-	if _, err := installBackupTimer(dir, "bad\nExecStart=/bin/sh"); err == nil {
+	if _, err := backup.RenderBackupTimerChecked("bad\nExecStart=/bin/sh"); err == nil {
 		t.Error("an expression with a newline must be rejected, not written into the unit")
 	}
 }
