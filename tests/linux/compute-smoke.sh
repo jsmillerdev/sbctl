@@ -15,7 +15,7 @@
 # (Large to Small with more replication slots in use than Small allows) fails and puts Large back.
 # `supavise projects sizes` and `projects resize` work while the daemon runs, and the project's
 # disk size is set through POST /v1/projects/{ref}/config/disk: the XFS project quota is in force
-# (a write past it fails with "Disk quota exceeded").
+# (a write past it fails with ENOSPC while the volume has room).
 #
 # Without SUPAVISE_BIN the script builds supavise with the go toolchain. It needs network access
 # for the artifact downloads. Not run in development (root, systemd and Linux required); CI runs it
@@ -210,8 +210,12 @@ xfs_quota -x -c "report -p -b -N" "$SUPAVISE_STATE" | awk -v id="#$PID_Q" '$1 ==
 UTIL=$(papi GET "/v1/projects/$REF/config/disk/util")
 [[ $(json_get 'd["metrics"]["fs_size_bytes"]' <<<"$UTIL") == 1073741824 && $(json_get 'd["metrics"]["fs_used_bytes"]' <<<"$UTIL") -gt 0 ]] || fail "disk util under a quota: $UTIL"
 FILL=$(sudo -u "$SUPAVISE_USER" dd if=/dev/zero of="$SUPAVISE_STATE/projects/$REF/fill" bs=1M count=1200 2>&1 || true)
+# XFS answers a project quota that is full with ENOSPC ("No space left on device"), not EDQUOT. That the
+# volume itself has room is what makes the failure the quota's.
+FREE_KB=$(df --output=avail -k "$SUPAVISE_STATE" | tail -1 | tr -dc 0-9)
 rm -f "$SUPAVISE_STATE/projects/$REF/fill"
-[[ $FILL == *"quota exceeded"* ]] || fail "a write past the quota did not fail: $FILL"
+[[ $FILL == *"No space left on device"* || $FILL == *"quota exceeded"* ]] || fail "a write past the quota did not fail: $FILL"
+(( FREE_KB > 2 * 1024 * 1024 )) || fail "the volume itself is full ($FREE_KB KB free), so the quota proves nothing"
 # A cluster that hit the quota while the file was written may be recovering for a moment.
 for ((i = 0; i < 60; i++)); do
   [[ $(sql "$REF" "select label from public.compute_smoke where id = 1" 2>/dev/null || true) == before ]] && break
