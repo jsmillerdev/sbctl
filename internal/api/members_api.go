@@ -513,6 +513,12 @@ func parseInvitations(body map[string]any) ([]invitationRequest, error) {
 	if len(out) > 50 {
 		return nil, errf(http.StatusBadRequest, "at most 50 invitations at a time")
 	}
+	// An address that is not one cannot be reported back in the answer's email fields.
+	for _, rq := range out {
+		if _, err := members.NormalizeEmail(rq.email); err != nil {
+			return nil, errf(http.StatusBadRequest, "%q is not a valid email address", rq.email)
+		}
+	}
 	return out, nil
 }
 

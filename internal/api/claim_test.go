@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -34,9 +36,26 @@ type fakeGoTrue struct {
 	// failDelete, when set, answers the next delete with a 500.
 	failDelete bool
 	auth       []string
+	// calls records the mail-related calls ("POST /invite?redirect_to=...").
+	calls []string
+	// mailFail makes /invite and /magiclink answer 500, as GoTrue does when SMTP is down.
+	mailFail bool
 }
 
-func newFakeGoTrue(t *testing.T) *fakeGoTrue {
+func (g *fakeGoTrue) callList() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.calls...)
+}
+
+// addUser puts an account in the fake, as GoTrue would have it.
+func (g *fakeGoTrue) addUser(id, email string, created time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.users[id] = map[string]any{"id": id, "email": email, "created_at": created.UTC().Format(time.RFC3339), "app_metadata": map[string]any{AdminClaim: true}}
+}
+
+func newFakeGoTrue(t testing.TB) *fakeGoTrue {
 	g := &fakeGoTrue{users: map[string]map[string]any{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/users", func(w http.ResponseWriter, r *http.Request) {
@@ -85,6 +104,57 @@ func newFakeGoTrue(t *testing.T) *fakeGoTrue {
 		}
 		delete(g.users, r.PathValue("id"))
 		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "{}")
+	})
+	mux.HandleFunc("GET /admin/users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		u, ok := g.users[r.PathValue("id")]
+		if !ok {
+			w.WriteHeader(404)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(u)
+	})
+	mux.HandleFunc("PUT /admin/users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.calls = append(g.calls, "PUT "+r.URL.Path)
+		u, ok := g.users[r.PathValue("id")]
+		if !ok {
+			w.WriteHeader(404)
+			return
+		}
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		for k, v := range in {
+			u[k] = v
+		}
+		_ = json.NewEncoder(w).Encode(u)
+	})
+	mux.HandleFunc("POST /invite", func(w http.ResponseWriter, r *http.Request) {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.calls = append(g.calls, "POST /invite?"+r.URL.RawQuery)
+		if g.mailFail {
+			w.WriteHeader(500)
+			return
+		}
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		id := fmt.Sprintf("00000000-0000-4000-8000-1%011d", len(g.users))
+		u := map[string]any{"id": id, "email": in["email"], "created_at": time.Now().UTC().Format(time.RFC3339)}
+		g.users[id] = u
+		_ = json.NewEncoder(w).Encode(u)
+	})
+	mux.HandleFunc("POST /magiclink", func(w http.ResponseWriter, r *http.Request) {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.calls = append(g.calls, "POST /magiclink?"+r.URL.RawQuery)
+		if g.mailFail {
+			w.WriteHeader(500)
+			return
+		}
 		_, _ = io.WriteString(w, "{}")
 	})
 	g.Server = httptest.NewServer(mux)
@@ -619,5 +689,70 @@ func TestRemoveUserDeletesTokensBeforeTheAccount(t *testing.T) {
 	}
 	if us, _ := f.acc.ListUsers(ctx); len(us) != 0 {
 		t.Fatalf("user left after the retry: %+v", us)
+	}
+}
+
+// The claimed first user owns the organization; an organization keeps its Owner when the
+// account is removed; removing an account removes its memberships.
+func TestClaimedUserIsOwnerAndTheLastOwnerStays(t *testing.T) {
+	f := newClaimFixture(t)
+	ctx := context.Background()
+	token, _, _ := f.acc.IssueClaimToken(ctx, 0, false)
+	rec := f.post(RedeemRequest{Token: token, Email: "first@example.test", Password: goodPassword, Organization: "Acme"})
+	if rec.Code != 201 {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	res := body[RedeemResult](t, rec)
+	org, _ := f.reg.GetOrganization(ctx, res.Organization)
+	a, err := f.srv.members.Access(ctx, res.UserID)
+	if err != nil || a.OrgRole(org.ID) != members.RoleOwner {
+		t.Fatalf("the first user is Owner of %s: %+v %v", res.Organization, a, err)
+	}
+	if _, err := f.srv.store.GetUser(ctx, res.UserID); err != nil {
+		t.Fatalf("the user is recorded at creation: %v", err)
+	}
+	// Invited with a role, the account joins on creation.
+	inv, err := f.acc.InviteToOrganization(ctx, nil, members.OrgRef{ID: org.ID, Slug: org.Slug}, members.InviteInput{Email: "dev@example.test", RoleID: members.RoleDeveloper})
+	if err != nil || inv.ClaimURL == "" {
+		t.Fatalf("invite: %+v %v", inv, err)
+	}
+	u, _ := url.Parse(inv.ClaimURL)
+	frag, _ := url.ParseQuery(u.Fragment)
+	rec = f.post(RedeemRequest{Token: frag.Get("token"), Email: "dev@example.test", Password: goodPassword})
+	if rec.Code != 201 {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	dev := body[RedeemResult](t, rec)
+	if a, _ := f.srv.members.Access(ctx, dev.UserID); a.OrgRole(org.ID) != members.RoleDeveloper {
+		t.Fatalf("the invited user: %+v", a.Memberships)
+	}
+	// An invite token for an address nobody invited to an organization creates an account without access.
+	tok, _, _ := f.acc.IssueInvite(ctx, "bare@example.test", 0)
+	rec = f.post(RedeemRequest{Token: tok, Email: "bare@example.test", Password: goodPassword})
+	if rec.Code != 201 {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	bare := body[RedeemResult](t, rec)
+	if a, _ := f.srv.members.Access(ctx, bare.UserID); len(a.Memberships) != 0 {
+		t.Fatalf("a bare account has no memberships: %+v", a.Memberships)
+	}
+	// users remove: the only Owner stays unless forced; memberships go with the account.
+	if _, err := f.acc.RemoveUser(ctx, "first@example.test", false); !errors.Is(err, members.ErrLastOwner) {
+		t.Fatalf("removing the only owner: %v", err)
+	}
+	if _, ok := f.gt.users[res.UserID]; !ok {
+		t.Fatal("the account was deleted although the removal was refused")
+	}
+	if _, err := f.acc.RemoveUser(ctx, "dev@example.test", false); err != nil {
+		t.Fatal(err)
+	}
+	if ms, _ := f.srv.members.Store.MembershipsOf(ctx, dev.UserID); len(ms) != 0 {
+		t.Fatalf("memberships after removing the account: %+v", ms)
+	}
+	if _, err := f.acc.RemoveUser(ctx, "first@example.test", true); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := f.srv.members.Store.CountOwners(ctx, org.ID); n != 0 {
+		t.Fatalf("--force removes the last owner: %d", n)
 	}
 }

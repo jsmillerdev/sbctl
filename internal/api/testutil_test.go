@@ -293,6 +293,8 @@ type fixture struct {
 	system  *secrets.ProjectKeys
 	userID  string
 	jwt     string
+	// gt is the stand-in for sb-gotrue@system the server's account calls go to.
+	gt *fakeGoTrue
 }
 
 const testRef = "abcdefghijklmnopqrst"
@@ -316,9 +318,18 @@ func newFixture(t testing.TB) *fixture {
 	mgr.addProject(t, config.SystemRef, "system", 0, registry.StatusActiveHealthy)
 	f.system, _ = mgr.Keys(ctx, config.SystemRef)
 	f.project = mgr.addProject(t, testRef, "First project", f.org.ID, registry.StatusActiveHealthy)
+	f.gt = newFakeGoTrue(t)
 	f.srv, err = NewServer(Deps{
 		Registry: reg, Secrets: sec, Manager: mgr, Config: cfg, PGMetaURL: f.meta.URL,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CreateWait: 2 * time.Second,
+		Upstream: func(p *registry.Project, svc string) string {
+			if p.Ref == config.SystemRef && svc == upGoTrue {
+				return f.gt.URL
+			}
+			// Nothing of ours listens here, whatever else this machine runs on its default ports
+			// (macOS answers on 5000).
+			return "http://127.0.0.1:1"
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

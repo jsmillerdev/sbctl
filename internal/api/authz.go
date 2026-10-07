@@ -230,7 +230,6 @@ var routeRules = []routeRule{
 	rule("POST", "/v1/projects/{ref}/database/query/read-only", chk(members.ActSQLQuery, members.ResAny)),
 	rule("POST", "/platform/pg-meta/{ref}/query", chk(members.ActSQLQuery, members.ResAny)),
 	rule("R", "/platform/pg-meta/{ref}/**", need{action: members.ActSQLAdminRead, resourceFn: pgmetaResource}),
-	rule("W", "/platform/pg-meta/{ref}/**", need{action: members.ActSQLAdminWrite, resourceFn: pgmetaResource}),
 	rule("R", "/v1/projects/{ref}/database/migrations/**", chk(members.ActSQLSelect, members.ResAny)),
 	rule("W", "/v1/projects/{ref}/database/migrations/**", chk(members.ActSQLAdminWrite, "migrations")),
 	rule("R", "/v1/projects/{ref}/types/typescript", chk(members.ActSQLAdminRead, "schemas")),
@@ -296,7 +295,6 @@ var routeRules = []routeRule{
 	rule("POST", "/v1/projects/{ref}/vanity-subdomain/check-availability", chk(members.ActRead, P)),
 	rule("W", "/v1/projects/{ref}/billing/**", chk(members.ActBillingWrite, "stripe.subscriptions")),
 	rule("W", "/platform/projects/{ref}/billing/**", chk(members.ActBillingWrite, "stripe.subscriptions")),
-	rule("R", "/platform/projects/{ref}/api-keys/**", chk(members.ActRead, P)),
 }
 
 // routeNeed resolves a route (method and template path) to its need, applying the defaults.

@@ -332,4 +332,3 @@ func (s *Server) subscription(w http.ResponseWriter, r *http.Request) error {
 	writeJSON(w, http.StatusOK, resp)
 	return nil
 }
-
