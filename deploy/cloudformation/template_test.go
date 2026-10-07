@@ -1,0 +1,668 @@
+// Package cloudformation_test guards the drop-in AWS path: the template parses, its console form
+// is clear, its outputs name what a person needs, nothing that holds data is deleted silently and
+// the instance role stays narrow. cfn-lint and checkov (ci.yml) check the syntax and the generic
+// rules; these tests check the promises of this template, so that an edit cannot break them
+// unnoticed. They run offline and touch no AWS account.
+package cloudformation_test
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+type doc = map[string]any
+
+// load parses sbctl.yaml. CloudFormation's short forms (!Ref, !Sub, !If ...) become the long
+// forms ({"Ref": ...}, {"Fn::Sub": ...}), so the assertions read like the JSON of the template.
+func load(t *testing.T) doc {
+	t.Helper()
+	raw, err := os.ReadFile("sbctl.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(raw, &root); err != nil {
+		t.Fatalf("sbctl.yaml does not parse: %v", err)
+	}
+	return convert(t, &root).(doc)
+}
+
+func convert(t *testing.T, n *yaml.Node) any {
+	t.Helper()
+	var v any
+	switch n.Kind {
+	case yaml.DocumentNode:
+		return convert(t, n.Content[0])
+	case yaml.MappingNode:
+		m := doc{}
+		for i := 0; i < len(n.Content); i += 2 {
+			m[n.Content[i].Value] = convert(t, n.Content[i+1])
+		}
+		v = m
+	case yaml.SequenceNode:
+		l := make([]any, 0, len(n.Content))
+		for _, c := range n.Content {
+			l = append(l, convert(t, c))
+		}
+		v = l
+	case yaml.AliasNode:
+		t.Fatalf("line %d: aliases are not CloudFormation", n.Line)
+	default:
+		if strings.HasPrefix(n.Tag, "!") && !strings.HasPrefix(n.Tag, "!!") {
+			v = n.Value
+		} else if err := n.Decode(&v); err != nil {
+			t.Fatalf("line %d: %v", n.Line, err)
+		}
+	}
+	if strings.HasPrefix(n.Tag, "!") && !strings.HasPrefix(n.Tag, "!!") {
+		name := n.Tag[1:]
+		switch name {
+		case "Ref", "Condition":
+		case "GetAtt":
+			if s, ok := v.(string); ok {
+				a, b, _ := strings.Cut(s, ".")
+				v = []any{a, b}
+			}
+			name = "Fn::GetAtt"
+		default:
+			name = "Fn::" + name
+		}
+		return doc{name: v}
+	}
+	return v
+}
+
+func get(t *testing.T, v any, path ...string) any {
+	t.Helper()
+	for _, p := range path {
+		m, ok := v.(doc)
+		if !ok {
+			t.Fatalf("%s: not a map at %q", strings.Join(path, "."), p)
+		}
+		v, ok = m[p]
+		if !ok {
+			t.Fatalf("%s: missing %q", strings.Join(path, "."), p)
+		}
+	}
+	return v
+}
+
+func has(v any, path ...string) bool {
+	for _, p := range path {
+		m, ok := v.(doc)
+		if !ok {
+			return false
+		}
+		if v, ok = m[p]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func keys(m doc) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func strs(t *testing.T, v any) []string {
+	t.Helper()
+	l, ok := v.([]any)
+	if !ok {
+		t.Fatalf("not a list: %v", v)
+	}
+	out := make([]string, 0, len(l))
+	for _, x := range l {
+		s, ok := x.(string)
+		if !ok {
+			t.Fatalf("not a string: %v", x)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// strList reads a value that is one string or a list of strings.
+func strList(t *testing.T, v any) []string {
+	t.Helper()
+	if s, ok := v.(string); ok {
+		return []string{s}
+	}
+	return strs(t, v)
+}
+
+func TestParametersAreMinimal(t *testing.T) {
+	params := get(t, load(t), "Parameters").(doc)
+	want := []string{"AccessCidr", "AdminEmail", "AmiId", "DataSnapshotId", "DataVolumeSize", "DomainName", "EnableSessionManager",
+		"HostedZoneId", "InstanceType", "KeyName", "SbctlVersion", "SshCidr", "SubnetId", "VpcId"}
+	if got := keys(params); !reflect.DeepEqual(got, want) {
+		t.Fatalf("parameters changed (update the README table and this list together):\n got %v\nwant %v", got, want)
+	}
+	// Only the admin email is required: everything else has a default, so the console form needs
+	// one field.
+	for name, p := range params {
+		_, hasDefault := p.(doc)["Default"]
+		if name == "AdminEmail" && hasDefault {
+			t.Errorf("AdminEmail must have no default")
+		}
+		if name != "AdminEmail" && !hasDefault {
+			t.Errorf("parameter %s has no default: only AdminEmail may be required", name)
+		}
+		if d, _ := p.(doc)["Description"].(string); strings.TrimSpace(d) == "" {
+			t.Errorf("parameter %s has no description", name)
+		}
+	}
+}
+
+func TestDefaultsAreGravitonAndSized(t *testing.T) {
+	d := load(t)
+	def := get(t, d, "Parameters", "InstanceType", "Default").(string)
+	if def != "t4g.large" {
+		t.Errorf("default instance type is %s; research/09-footprint.md sizes t4g.large (8 GiB) for about 20 projects", def)
+	}
+	arch := get(t, d, "Mappings", "InstanceTypes", def, "Ubuntu")
+	if arch != "arm64" {
+		t.Errorf("default instance type must be Graviton (arm64), got %v", arch)
+	}
+	allowed := strs(t, get(t, d, "Parameters", "InstanceType", "AllowedValues"))
+	mapped := keys(get(t, d, "Mappings", "InstanceTypes").(doc))
+	sort.Strings(allowed)
+	if !reflect.DeepEqual(allowed, mapped) {
+		t.Errorf("InstanceType AllowedValues and Mappings.InstanceTypes differ:\n%v\n%v", allowed, mapped)
+	}
+	graviton := regexp.MustCompile(`^[a-z]+[0-9]+g[a-z]*\.`)
+	for _, ty := range allowed {
+		want := "amd64"
+		if graviton.MatchString(ty) {
+			want = "arm64"
+		}
+		if got := get(t, d, "Mappings", "InstanceTypes", ty, "Ubuntu"); got != want {
+			t.Errorf("%s maps to %v, want %s", ty, got, want)
+		}
+	}
+	// A node needs about 1.5 GB before the first project: nothing under 4 GiB.
+	for _, ty := range allowed {
+		if strings.HasSuffix(ty, ".small") || strings.HasSuffix(ty, ".micro") || strings.HasSuffix(ty, ".nano") {
+			t.Errorf("%s is too small for the fixed footprint", ty)
+		}
+	}
+	if v := get(t, d, "Parameters", "SbctlVersion", "Default"); v != "latest" {
+		t.Errorf("the repository template defaults SbctlVersion to latest (release-assets.sh stamps the tag), got %v", v)
+	}
+}
+
+func TestConsoleFormCoversEveryParameter(t *testing.T) {
+	d := load(t)
+	params := get(t, d, "Parameters").(doc)
+	iface := get(t, d, "Metadata", "AWS::CloudFormation::Interface")
+	groups := get(t, iface, "ParameterGroups").([]any)
+	seen := map[string]int{}
+	for i, g := range groups {
+		label := get(t, g, "Label", "default").(string)
+		if label == "" {
+			t.Errorf("group %d has no label", i)
+		}
+		for _, p := range strs(t, get(t, g, "Parameters")) {
+			seen[p]++
+			if _, ok := params[p]; !ok {
+				t.Errorf("group %q lists %s, which is not a parameter", label, p)
+			}
+		}
+	}
+	labels := get(t, iface, "ParameterLabels").(doc)
+	for name := range params {
+		if seen[name] != 1 {
+			t.Errorf("parameter %s is in %d groups, want 1", name, seen[name])
+		}
+		if !has(labels, name, "default") {
+			t.Errorf("parameter %s has no label", name)
+		}
+	}
+	for name := range labels {
+		if _, ok := params[name]; !ok {
+			t.Errorf("label for unknown parameter %s", name)
+		}
+	}
+	first := strs(t, get(t, groups[0], "Parameters"))
+	if !reflect.DeepEqual(first, []string{"AdminEmail"}) {
+		t.Errorf("the first group is the required one: want [AdminEmail], got %v", first)
+	}
+}
+
+func TestOutputsNameWhatAPersonNeeds(t *testing.T) {
+	d := load(t)
+	outs := get(t, d, "Outputs").(doc)
+	for _, k := range []string{"DashboardUrl", "ApiUrl", "ClaimUrl", "ClaimTokenCommand", "BackupBucket", "InstanceId", "DataVolumeId", "ConnectCommand", "PublicIp", "DnsRecordsNeeded"} {
+		o, ok := outs[k]
+		if !ok {
+			t.Errorf("output %s is missing", k)
+			continue
+		}
+		if s, _ := get(t, o, "Description").(string); strings.TrimSpace(s) == "" {
+			t.Errorf("output %s has no description", k)
+		}
+	}
+	cmd := fmt.Sprint(get(t, outs["ClaimTokenCommand"], "Value"))
+	for _, want := range []string{"aws secretsmanager get-secret-value", "--region", "ClaimTokenSecret", "--query SecretString", "--output text"} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("ClaimTokenCommand lacks %q: %s", want, cmd)
+		}
+	}
+	if c := fmt.Sprint(get(t, outs["ConnectCommand"], "Value")); !strings.Contains(c, "aws ssm start-session") {
+		t.Errorf("ConnectCommand: %s", c)
+	}
+	// The dashboard and the API must resolve on the sslip.io default as well as on the domain.
+	for _, k := range []string{"DashboardUrl", "ApiUrl", "ClaimUrl"} {
+		v := fmt.Sprint(get(t, outs[k], "Value"))
+		if !strings.Contains(v, "sslip.io") || !strings.Contains(v, "DomainName") {
+			t.Errorf("%s must cover the domain and the sslip.io default: %s", k, v)
+		}
+	}
+}
+
+func resources(t *testing.T, d doc) doc { return get(t, d, "Resources").(doc) }
+
+func TestDataIsNeverDeletedSilently(t *testing.T) {
+	d := load(t)
+	r := resources(t, d)
+	for _, c := range []struct{ name, policy string }{
+		{"BackupBucket", "Retain"},
+		{"DataVolume", "Snapshot"},
+	} {
+		for _, attr := range []string{"DeletionPolicy", "UpdateReplacePolicy"} {
+			got := get(t, r[c.name], attr)
+			if got != c.policy && got != "Retain" {
+				t.Errorf("%s %s = %v, want %s (or Retain)", c.name, attr, got, c.policy)
+			}
+		}
+	}
+	// Nothing else may be retained or snapshotted by accident, and nothing that holds data may
+	// be left without a policy: list every resource type that stores data.
+	for name, res := range r {
+		typ := get(t, res, "Type").(string)
+		switch typ {
+		case "AWS::S3::Bucket", "AWS::EC2::Volume", "AWS::RDS::DBInstance", "AWS::EFS::FileSystem":
+			if !has(res, "DeletionPolicy") || !has(res, "UpdateReplacePolicy") {
+				t.Errorf("%s (%s) holds data and needs DeletionPolicy and UpdateReplacePolicy", name, typ)
+			}
+		}
+	}
+	vol := get(t, r["DataVolume"], "Properties")
+	if get(t, vol, "Encrypted") != true {
+		t.Error("the data volume must be encrypted")
+	}
+	if !has(vol, "SnapshotId") {
+		t.Error("the data volume must accept DataSnapshotId (restore path)")
+	}
+	bucket := get(t, r["BackupBucket"], "Properties")
+	if get(t, bucket, "VersioningConfiguration", "Status") != "Enabled" {
+		t.Error("the backup bucket must be versioned")
+	}
+	for _, k := range []string{"BlockPublicAcls", "BlockPublicPolicy", "IgnorePublicAcls", "RestrictPublicBuckets"} {
+		if get(t, bucket, "PublicAccessBlockConfiguration", k) != true {
+			t.Errorf("backup bucket: %s must be true", k)
+		}
+	}
+	if !has(bucket, "BucketEncryption") {
+		t.Error("the backup bucket must be encrypted")
+	}
+	// The bucket must not name itself: a fixed name would collide when the stack is made again
+	// while the retained bucket still exists.
+	if has(bucket, "BucketName") {
+		t.Error("the backup bucket must have a generated name (a retained bucket would block a new stack)")
+	}
+	// A fixed secret name stays reserved for the recovery window after the stack is deleted.
+	if has(r["ClaimTokenSecret"], "Properties", "Name") {
+		t.Error("ClaimTokenSecret must have a generated name (a deleted secret's name is reserved for 30 days)")
+	}
+	pol := fmt.Sprint(get(t, r["BackupBucketPolicy"], "Properties", "PolicyDocument"))
+	if !strings.Contains(pol, "aws:SecureTransport") {
+		t.Error("the bucket policy must deny non-TLS access")
+	}
+}
+
+func statements(t *testing.T, policyDoc any) []any {
+	t.Helper()
+	s := get(t, policyDoc, "Statement")
+	if l, ok := s.([]any); ok {
+		return l
+	}
+	return []any{s}
+}
+
+// TestInstanceRoleIsLeastPrivilege lists every action the instance role may take. A new line here
+// is a decision, not an accident.
+func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
+	d := load(t)
+	r := resources(t, d)
+
+	role := get(t, r["InstanceRole"], "Properties")
+	if has(role, "ManagedPolicyArns") {
+		t.Error("the role must carry no managed policies (AmazonSSMManagedInstanceCore reads every Parameter Store value)")
+	}
+	trust := get(t, role, "AssumeRolePolicyDocument")
+	for _, st := range statements(t, trust) {
+		if svc := get(t, st, "Principal", "Service"); svc != "ec2.amazonaws.com" {
+			t.Errorf("the role may be assumed by %v, want ec2.amazonaws.com only", svc)
+		}
+	}
+
+	// Every IAM statement of the stack: role inline policies and AWS::IAM::Policy resources.
+	type stmt struct {
+		where   string
+		actions []string
+		res     string
+		cond    bool
+	}
+	var all []stmt
+	collect := func(where string, pd any) {
+		for _, st := range statements(t, pd) {
+			if get(t, st, "Effect") != "Allow" {
+				t.Errorf("%s: only Allow statements expected", where)
+			}
+			if has(st, "NotAction") || has(st, "NotResource") || has(st, "Principal") {
+				t.Errorf("%s: NotAction, NotResource and Principal are not allowed", where)
+			}
+			all = append(all, stmt{where, strList(t, get(t, st, "Action")), fmt.Sprint(get(t, st, "Resource")), has(st, "Condition")})
+		}
+	}
+	for _, p := range get(t, role, "Policies").([]any) {
+		collect("role/"+get(t, p, "PolicyName").(string), get(t, p, "PolicyDocument"))
+	}
+	var policyNames []string
+	for name, res := range r {
+		if get(t, res, "Type") != "AWS::IAM::Policy" {
+			continue
+		}
+		policyNames = append(policyNames, name)
+		if ref := fmt.Sprint(get(t, res, "Properties", "Roles")); !strings.Contains(ref, "InstanceRole") {
+			t.Errorf("%s is attached to something other than InstanceRole: %s", name, ref)
+		}
+		collect(name, get(t, res, "Properties", "PolicyDocument"))
+	}
+	sort.Strings(policyNames)
+	if want := []string{"DnsPolicy", "SessionManagerPolicy"}; !reflect.DeepEqual(policyNames, want) {
+		t.Errorf("IAM policy resources are %v, want %v", policyNames, want)
+	}
+	for _, name := range policyNames {
+		if !has(r[name], "Condition") {
+			t.Errorf("%s must be conditional (it is optional)", name)
+		}
+	}
+
+	allowed := map[string]bool{
+		// the backup bucket
+		"s3:ListBucket": true, "s3:GetBucketLocation": true, "s3:ListBucketMultipartUploads": true,
+		"s3:GetObject": true, "s3:PutObject": true, "s3:DeleteObject": true,
+		"s3:AbortMultipartUpload": true, "s3:ListMultipartUploadParts": true,
+		// the claim token
+		"secretsmanager:PutSecretValue": true,
+		// DNS-01 certificates
+		"route53:ChangeResourceRecordSets": true, "route53:ListResourceRecordSets": true, "route53:GetChange": true,
+		// Session Manager channels
+		"ssm:UpdateInstanceInformation":    true,
+		"ssmmessages:CreateControlChannel": true, "ssmmessages:CreateDataChannel": true,
+		"ssmmessages:OpenControlChannel": true, "ssmmessages:OpenDataChannel": true,
+	}
+	starOK := map[string]bool{ // actions that accept no narrower resource
+		"ssm:UpdateInstanceInformation":    true,
+		"ssmmessages:CreateControlChannel": true, "ssmmessages:CreateDataChannel": true,
+		"ssmmessages:OpenControlChannel": true, "ssmmessages:OpenDataChannel": true,
+	}
+	for _, s := range all {
+		for _, a := range s.actions {
+			if strings.Contains(a, "*") {
+				t.Errorf("%s: wildcard action %s", s.where, a)
+			}
+			if !allowed[a] {
+				t.Errorf("%s: unexpected action %s (add it here only when the node needs it)", s.where, a)
+			}
+			if strings.HasPrefix(a, "iam:") || strings.HasPrefix(a, "sts:") || strings.HasPrefix(a, "ec2:") || strings.HasPrefix(a, "kms:") {
+				t.Errorf("%s: %s must not be granted to the instance", s.where, a)
+			}
+			if s.res == "*" && !starOK[a] {
+				t.Errorf("%s: %s on Resource * (scope it)", s.where, a)
+			}
+			switch {
+			case strings.HasPrefix(a, "s3:"):
+				if !strings.Contains(s.res, "BackupBucket") {
+					t.Errorf("%s: %s must be scoped to BackupBucket, got %s", s.where, a, s.res)
+				}
+			case strings.HasPrefix(a, "secretsmanager:"):
+				if !strings.Contains(s.res, "ClaimTokenSecret") || a != "secretsmanager:PutSecretValue" {
+					t.Errorf("%s: %s must be PutSecretValue on ClaimTokenSecret only, got %s", s.where, a, s.res)
+				}
+			case a == "route53:ChangeResourceRecordSets":
+				if !strings.Contains(s.res, "hostedzone/") || !strings.Contains(s.res, "HostedZoneId") {
+					t.Errorf("%s: %s must name the one hosted zone, got %s", s.where, a, s.res)
+				}
+				if !s.cond {
+					t.Errorf("%s: %s needs a condition on the record type and name", s.where, a)
+				}
+			case strings.HasPrefix(a, "route53:"):
+				if s.res == "*" {
+					t.Errorf("%s: %s must be scoped", s.where, a)
+				}
+			}
+		}
+	}
+
+	// The DNS-01 statement may change only _acme-challenge TXT records of the domain.
+	dns := fmt.Sprint(get(t, r["DnsPolicy"], "Properties", "PolicyDocument"))
+	for _, want := range []string{"ChangeResourceRecordSetsRecordTypes", "TXT", "ChangeResourceRecordSetsNormalizedRecordNames", "_acme-challenge.${DomainName}", "_acme-challenge.*.${DomainName}"} {
+		if !strings.Contains(dns, want) {
+			t.Errorf("DnsPolicy lost %q", want)
+		}
+	}
+}
+
+func TestNetworkAndInstanceHardening(t *testing.T) {
+	d := load(t)
+	r := resources(t, d)
+
+	var ports []string
+	for _, rule := range get(t, r["SecurityGroup"], "Properties", "SecurityGroupIngress").([]any) {
+		ports = append(ports, fmt.Sprint(get(t, rule, "FromPort")))
+		if from, to := get(t, rule, "FromPort"), get(t, rule, "ToPort"); from != to {
+			t.Errorf("ingress %v-%v is a range", from, to)
+		}
+		if fmt.Sprint(get(t, rule, "CidrIp")) != "map[Ref:AccessCidr]" {
+			t.Errorf("ingress on %v must use AccessCidr", get(t, rule, "FromPort"))
+		}
+	}
+	sort.Strings(ports)
+	if want := []string{"443", "5432", "6543", "80"}; !reflect.DeepEqual(ports, want) {
+		t.Errorf("security group ports %v, want %v: SSH is a separate, conditional rule", ports, want)
+	}
+	ssh := r["SshIngress"]
+	if get(t, ssh, "Condition") != "HasSsh" || fmt.Sprint(get(t, ssh, "Properties", "CidrIp")) != "map[Ref:SshCidr]" {
+		t.Error("SSH must open only when SshCidr is given, from SshCidr")
+	}
+	if p := get(t, d, "Parameters", "SshCidr", "Default"); p != "" {
+		t.Errorf("SshCidr defaults to %q: SSH must be off by default", p)
+	}
+	if p := get(t, d, "Parameters", "EnableSessionManager", "Default"); p != "true" {
+		t.Errorf("Session Manager is the default way in, got %v", p)
+	}
+
+	inst := get(t, r["Instance"], "Properties")
+	if get(t, inst, "MetadataOptions", "HttpTokens") != "required" {
+		t.Error("the instance must require IMDSv2")
+	}
+	if get(t, inst, "MetadataOptions", "HttpPutResponseHopLimit") != 1 {
+		t.Error("IMDS hop limit must be 1 (no containers or forwarded requests)")
+	}
+	for _, m := range get(t, inst, "BlockDeviceMappings").([]any) {
+		if get(t, m, "Ebs", "Encrypted") != true {
+			t.Error("the root volume must be encrypted")
+		}
+	}
+	if !has(inst, "KeyName") || !strings.Contains(fmt.Sprint(get(t, inst, "KeyName")), "HasKeyName") {
+		t.Error("KeyName must be optional (HasKeyName)")
+	}
+	if ud := fmt.Sprint(get(t, inst, "UserData")); !strings.Contains(ud, "--claim-token-file") || !strings.Contains(ud, "--firewall none") {
+		t.Error("user data must write the claim token to a file and leave the firewall to the security group")
+	}
+	// The image is a plain ID when given, otherwise the Canonical Ubuntu 24.04 parameter of the
+	// instance's architecture.
+	img := fmt.Sprint(get(t, inst, "ImageId"))
+	for _, want := range []string{"HasAmiId", "AmiId", "/aws/service/canonical/ubuntu/server/24.04/stable/current/", "ami-id", "InstanceTypes"} {
+		if !strings.Contains(img, want) {
+			t.Errorf("ImageId lost %q: %s", want, img)
+		}
+	}
+}
+
+func TestTemplateIsSelfContained(t *testing.T) {
+	raw, err := os.ReadFile("sbctl.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// aws cloudformation deploy sends the file in the request when it is below 51,200 bytes and
+	// needs a bucket above it. deploy.sh does not ask for one.
+	if len(raw) > 48000 {
+		t.Errorf("sbctl.yaml is %d bytes; deploy.sh needs it under 51,200 (keep a margin)", len(raw))
+	}
+	d := load(t)
+	for name, res := range resources(t, d) {
+		typ := get(t, res, "Type").(string)
+		if typ == "AWS::CloudFormation::Stack" || strings.HasPrefix(typ, "AWS::Lambda::") || strings.HasPrefix(typ, "AWS::Serverless") || typ == "AWS::CloudFormation::CustomResource" || strings.HasPrefix(typ, "Custom::") {
+			t.Errorf("%s is %s: the template must stay one file with no nested stacks, Lambda code or custom resources", name, typ)
+		}
+	}
+	if has(d, "Transform") {
+		t.Error("no Transform: the console must be able to upload the file as it is")
+	}
+	if strings.Contains(string(raw), "TemplateURL") {
+		t.Error("no TemplateURL: no nested stacks")
+	}
+	// Outside the user data, a statically known place for jsmillerdev/sbctl is the release download.
+	if !strings.Contains(string(raw), "https://github.com/jsmillerdev/sbctl/releases/") {
+		t.Error("user data downloads install.sh from the GitHub release")
+	}
+}
+
+func TestCheckovSkipsAreExplained(t *testing.T) {
+	d := load(t)
+	for name, res := range resources(t, d) {
+		skips, ok := res.(doc)["Metadata"].(doc)["checkov"].(doc)["skip"].([]any)
+		if !ok {
+			continue
+		}
+		for _, s := range skips {
+			if c, _ := get(t, s, "comment").(string); len(c) < 20 {
+				t.Errorf("%s: checkov skip %v needs a real comment", name, get(t, s, "id"))
+			}
+		}
+	}
+}
+
+func TestRulesAndConditionsStayInStep(t *testing.T) {
+	d := load(t)
+	conds := get(t, d, "Conditions").(doc)
+	raw, _ := os.ReadFile("sbctl.yaml")
+	for name := range conds {
+		// Each condition is used at least once outside its own definition.
+		if n := len(regexp.MustCompile(`\b`+name+`\b`).FindAllString(string(raw), -1)); n < 2 {
+			t.Errorf("condition %s is never used", name)
+		}
+	}
+	for _, rule := range []string{"ZoneNeedsDomain", "VpcNeedsSubnet"} {
+		if !has(d, "Rules", rule, "Assertions") {
+			t.Errorf("rule %s is gone", rule)
+		}
+	}
+}
+
+// TestReleaseAssetsStampTheTag runs the real deploy/release-assets.sh with a throwaway key and
+// checks what a release attaches: the template carries the tag as its default release and the
+// AWS deploy script travels with it.
+func TestReleaseAssetsStampTheTag(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not installed")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not installed")
+	}
+	tmp := t.TempDir()
+	run := func(name string, args ...string) {
+		t.Helper()
+		cmd := exec.Command(name, args...)
+		cmd.Dir = tmp
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	run("openssl", "genpkey", "-algorithm", "ed25519", "-out", "priv.pem")
+	run("openssl", "pkey", "-in", "priv.pem", "-pubout", "-out", "pub.pem")
+	dist := filepath.Join(tmp, "dist")
+	if err := os.MkdirAll(dist, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"sbctl-linux-amd64", "sbctl-linux-arm64"} {
+		if err := os.WriteFile(filepath.Join(dist, f), []byte("not a binary"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script, _ := filepath.Abs("../release-assets.sh")
+	cmd := exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
+	cmd.Env = append(os.Environ(), "SBCTL_RELEASE_TAG=v9.8.7-rc.1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("release-assets.sh: %v\n%s", err, out)
+	}
+	tpl, err := os.ReadFile(filepath.Join(dist, "sbctl.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(tpl, &root); err != nil {
+		t.Fatalf("the stamped template does not parse: %v", err)
+	}
+	stamped := get(t, convert(t, &root), "Parameters", "SbctlVersion", "Default")
+	if stamped != "v9.8.7-rc.1" {
+		t.Errorf("stamped default is %v, want the tag", stamped)
+	}
+	orig, _ := os.ReadFile("sbctl.yaml")
+	if d := len(tpl) - len(orig); d != len("v9.8.7-rc.1")-len("latest") {
+		t.Errorf("stamping changed more than the default: size differs by %d", d)
+	}
+	for _, f := range []string{"sbctl-aws-deploy.sh", "install.sh", "SHA256SUMS", "SHA256SUMS.sig"} {
+		if _, err := os.Stat(filepath.Join(dist, f)); err != nil {
+			t.Errorf("release asset %s missing: %v", f, err)
+		}
+	}
+	if fi, err := os.Stat(filepath.Join(dist, "sbctl-aws-deploy.sh")); err == nil && fi.Mode()&0o111 == 0 {
+		t.Error("sbctl-aws-deploy.sh must be executable")
+	}
+
+	// Without a tag the template is attached as it is.
+	cmd = exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
+	cmd.Env = append(os.Environ(), "SBCTL_RELEASE_TAG=")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("release-assets.sh without a tag: %v\n%s", err, out)
+	}
+	tpl, _ = os.ReadFile(filepath.Join(dist, "sbctl.yaml"))
+	if string(tpl) != string(orig) {
+		t.Error("without SBCTL_RELEASE_TAG the template must be copied unchanged")
+	}
+
+	// A tag that is not a version is refused: it would end up in a parameter default.
+	cmd = exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
+	cmd.Env = append(os.Environ(), "SBCTL_RELEASE_TAG=latest; rm -rf /")
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Errorf("a bad tag must fail, got success:\n%s", out)
+	}
+}

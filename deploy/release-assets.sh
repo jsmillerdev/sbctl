@@ -8,7 +8,10 @@
 #   SHA256SUMS       sha256sum of every file above
 #   SHA256SUMS.sig   raw ed25519 signature of SHA256SUMS (what install.sh and `sbctl self-update` verify)
 #   install.sh       deploy/install.sh with the public key stamped in
-#   sbctl.yaml       the CloudFormation template
+#   sbctl.yaml       the CloudFormation template; with SBCTL_RELEASE_TAG set (v1.2.3), its
+#                    SbctlVersion default names that tag instead of "latest", so the template
+#                    of a release installs that release
+#   sbctl-aws-deploy.sh  deploy/aws/deploy.sh, the one-command deploy for people with the AWS CLI
 # It refuses when the private key is not the one the public key names, and it verifies its own
 # signature before it returns. The release workflow runs it with the repository secret; the
 # install-e2e job runs it with a throwaway key so that the same code is tested.
@@ -42,4 +45,13 @@ sed "s|__SBCTL_RELEASE_PUBKEY_B64__|$b64|" "$here/install.sh" >install.sh
 chmod 0755 install.sh
 if grep -q '__SBCTL_RELEASE_PUBKEY_B64__' install.sh; then echo "the key marker is still in install.sh" >&2; exit 1; fi
 cp "$here/cloudformation/sbctl.yaml" sbctl.yaml
+tag=${SBCTL_RELEASE_TAG:-}
+if [[ -n $tag ]]; then
+  [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "SBCTL_RELEASE_TAG $tag is not vMAJOR.MINOR.PATCH[-suffix]" >&2; exit 1; }
+  # The SbctlVersion parameter is the only place the template says "Default: latest".
+  sed "s|^    Default: latest\$|    Default: $tag|" sbctl.yaml >sbctl.yaml.new && mv sbctl.yaml.new sbctl.yaml
+  [[ $(grep -c "^    Default: $tag\$" sbctl.yaml) -eq 1 ]] || { echo "could not stamp $tag into sbctl.yaml" >&2; exit 1; }
+fi
+cp "$here/aws/deploy.sh" sbctl-aws-deploy.sh
+chmod 0755 sbctl-aws-deploy.sh
 echo "signed ${#files[@]} files; key sha256 $(der "$pub")"

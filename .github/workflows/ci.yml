@@ -58,6 +58,29 @@ jobs:
           "$RUNNER_TEMP/cfn/bin/pip" install --quiet cfn-lint
           "$RUNNER_TEMP/cfn/bin/cfn-lint" deploy/cloudformation/sbctl.yaml
 
+  # The drop-in AWS path (deploy/cloudformation/sbctl.yaml, deploy/aws/deploy.sh, the release
+  # assets). Nothing here calls AWS. checkov's generic rules run on the template; the few it
+  # reports and we accept are skipped inline in the template, each with a reason. The Go tests
+  # (deploy/cloudformation, deploy/aws) assert the parameter interface, the outputs, the retain
+  # policies, the IAM scoping, deploy.sh's argument parsing and --dry-run output, and the release
+  # assets. checkov is pinned so that a new upstream rule cannot turn this job red by itself.
+  aws-deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: checkov (security rules for the template)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/checkov"
+          "$RUNNER_TEMP/checkov/bin/pip" install --quiet checkov==3.3.25
+          "$RUNNER_TEMP/checkov/bin/checkov" -f deploy/cloudformation/sbctl.yaml --framework cloudformation --compact --quiet
+      - name: shellcheck
+        run: shellcheck deploy/aws/deploy.sh deploy/release-assets.sh
+      - name: template, deploy.sh and release assets
+        run: go test -count=1 -v ./deploy/...
+
   functions-main:
     # The Deno main service of the Edge Runtime (functions-main/): format, lint, type check
     # and unit tests. The Go side embeds these files; internal/fleet tests keep the two in step.
