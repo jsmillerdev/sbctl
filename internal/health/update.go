@@ -97,6 +97,9 @@ type UpdateSettings struct {
 	// CheckInterval is the pause between checks: 24 hours unless [update] check_interval says
 	// otherwise, and never under an hour (an unauthenticated client may ask GitHub 60 times an hour).
 	CheckInterval time.Duration
+	// Off is set by check_interval = "off" (or "never", or 0): a node with no route to GitHub
+	// asks nobody, and `supavise status` says no check has run.
+	Off bool
 }
 
 const (
@@ -108,7 +111,7 @@ const (
 
 // ReadUpdateSettings reads [update] from the config file at path (empty: none) and the
 // environment. A missing file, a missing section and a value it cannot read all give the
-// default; the check never fails the daemon for a setting.
+// default; the check never fails the daemon for a setting. "off" turns the check off.
 func ReadUpdateSettings(path string) UpdateSettings {
 	s := UpdateSettings{CheckInterval: defaultUpdateInterval}
 	var raw string
@@ -124,13 +127,21 @@ func ReadUpdateSettings(path string) UpdateSettings {
 				case string:
 					raw = v
 				case int64:
-					raw = strconv.FormatInt(v, 10) + "s" // a bare number is seconds
+					raw = strconv.FormatInt(v, 10) + "s" // a bare number is seconds, and 0 is off
+					if v == 0 {
+						raw = "0"
+					}
 				}
 			}
 		}
 	}
 	if v := os.Getenv(EnvUpdateInterval); v != "" {
 		raw = v
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "off", "never", "0":
+		s.Off = true
+		return s
 	}
 	if d, ok := parseInterval(raw); ok {
 		s.CheckInterval = max(d, minUpdateInterval)

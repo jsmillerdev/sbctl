@@ -121,12 +121,12 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	monitor := health.NewMonitor(func(ctx context.Context) (*health.Report, error) { return health.CheckNode(ctx, hdeps) }, cfg.Health.Cache())
 	notifier := alerts.New(cfg, alerts.Options{Log: log.With("component", "alerts")})
 	alerts.SetDefault(notifier) // what the rest of the node raises through alerts.Notify
-	checker := &alerts.Checker{
-		Notifier: notifier, Report: monitor.Fresh, Cfg: cfg, Log: log.With("component", "alerts"),
-		UpdateInterval: health.ReadUpdateSettings(o.ConfigPath).CheckInterval,
-		CheckUpdate: func(ctx context.Context, now time.Time) (*health.UpdateRecord, error) {
+	checker := &alerts.Checker{Notifier: notifier, Report: monitor.Fresh, Cfg: cfg, Log: log.With("component", "alerts")}
+	if us := health.ReadUpdateSettings(o.ConfigPath); !us.Off {
+		checker.UpdateInterval = us.CheckInterval
+		checker.CheckUpdate = func(ctx context.Context, now time.Time) (*health.UpdateRecord, error) {
 			return health.CheckUpdate(ctx, cfg, o.Version, health.UpdateSource{}, now)
-		},
+		}
 	}
 	apiDeps := api.Deps{
 		Health:   monitor,

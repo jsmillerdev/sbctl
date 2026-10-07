@@ -148,6 +148,14 @@ func TestReadUpdateSettingsIsDefensive(t *testing.T) {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
 	}
+	for _, off := range []string{"[update]\ncheck_interval = 'off'\n", "[update]\ncheck_interval = 'never'\n", "[update]\ncheck_interval = 0\n"} {
+		if !ReadUpdateSettings(write(off)).Off {
+			t.Errorf("%q does not turn the check off", off)
+		}
+	}
+	if ReadUpdateSettings("").Off {
+		t.Error("the check is off by default")
+	}
 	t.Setenv(EnvUpdateInterval, "12h")
 	if got := ReadUpdateSettings(write("[update]\ncheck_interval = '6h'\n")).CheckInterval; got != 12*time.Hour {
 		t.Errorf("the environment does not override the file: %v", got)

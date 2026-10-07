@@ -52,7 +52,7 @@ The escrow lookup lists the backup backend, which can be slow, so inside the dae
 
 ## The update check
 
-`CheckUpdate` asks GitHub (`selfupdate.Latest`) for the newest release and records it in `<state_dir>/system/update.json`: when it checked, the installed version, the latest, whether it is newer (never for a development build) and which version the operator was already told about. It installs nothing. The daemon's alert checker runs it once a day (see `internal/alerts`); `supavise status` shows the record. It reads `[update] check_interval` (a duration such as `12h` or whole days such as `2d`; a bare number is seconds) and `SUPAVISE_UPDATE_CHECK_INTERVAL` on its own, with a 24-hour default and a one-hour floor, and ignores every other key of the section: that section belongs to the release tooling, and a missing or unreadable one gives the default.
+`CheckUpdate` asks GitHub (`selfupdate.Latest`) for the newest release and records it in `<state_dir>/system/update.json`: when it checked, the installed version, the latest, whether it is newer (never for a development build) and which version the operator was already told about. It installs nothing. The daemon's alert checker runs it once a day (see `internal/alerts`); `supavise status` shows the record. It reads `[update] check_interval` (a duration such as `12h` or whole days such as `2d`; a bare number is seconds) and `SUPAVISE_UPDATE_CHECK_INTERVAL` on its own, with a 24-hour default and a one-hour floor (`off`, `never` or `0` turns the check off, for a node with no route to GitHub), and ignores every other key of the section: that section belongs to the release tooling, and a missing or unreadable one gives the default.
 
 ## Config
 
