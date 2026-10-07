@@ -18,6 +18,10 @@ const (
 	msgForbidden    = "RBAC: access denied"
 	msgInvalidKey   = "Invalid API key"
 	msgConflict     = "Conflicting API keys"
+
+	// msgRealtimeLongPollOff answers any non-WebSocket request on the Realtime route while the
+	// project's legacy keys are disabled.
+	msgRealtimeLongPollOff = "Realtime long-polling is unavailable while legacy API keys are disabled; use WebSocket"
 )
 
 // eqConst compares two secrets in constant time with respect to their content and

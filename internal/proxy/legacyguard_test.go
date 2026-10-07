@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,6 +58,7 @@ var wireRoutes = []struct{ name, method, target string }{
 	{"storage-v1-s3", "GET", "/storage/v1/s3/b/o"},
 	{"functions-v1", "GET", "/functions/v1/f"},
 	{"realtime-v1-api", "GET", "/realtime/v1/api/ping"},
+	{"realtime-v1-ws", "GET", "/realtime/v1/websocket"},
 	{"realtime-v1-longpoll", "GET", "/realtime/v1/longpoll"},
 	{"realtime-v1-longpoll-post", "POST", "/realtime/v1/longpoll"},
 }
@@ -138,9 +140,18 @@ func wireHarness(t *testing.T, disabled bool) *harness {
 	return h
 }
 
+// wsHeaders turns hd into the headers of a WebSocket handshake.
+func wsHeaders(hd http.Header) http.Header {
+	hd = hd.Clone()
+	hd.Set("Connection", "Upgrade")
+	hd.Set("Upgrade", "websocket")
+	return hd
+}
+
 // With the legacy keys disabled, a request that carries a legacy key anywhere in its headers or
 // query string is refused on every route of the project host, before the route reads it, and
-// never reaches an upstream.
+// never reaches an upstream. The Realtime long-poll routes refuse it as every long-poll request
+// is refused (403), a WebSocket handshake with the key (401).
 func TestLegacyKeyRefusedAnywhereOnTheWire(t *testing.T) {
 	h := wireHarness(t, true)
 	keys := map[string]string{"anon": h.k.AnonKey, "service_role": h.k.ServiceRoleKey}
@@ -165,7 +176,11 @@ func TestLegacyKeyRefusedAnywhereOnTheWire(t *testing.T) {
 				if q != "" {
 					target += "?" + q
 				}
-				code, ctype, body := h.serve(rt.method, target, hd)
+				rhd := hd
+				if rt.name == "realtime-v1-ws" {
+					rhd = wsHeaders(hd)
+				}
+				code, ctype, body := h.serve(rt.method, target, rhd)
 				checked++
 				if rt.name == "storage-v1-s3" {
 					if code != 403 || !strings.HasPrefix(ctype, "application/xml") || !strings.Contains(body, "<Code>AccessDenied</Code>") {
@@ -173,9 +188,13 @@ func TestLegacyKeyRefusedAnywhereOnTheWire(t *testing.T) {
 					}
 					continue
 				}
+				wantCode, wantMsg := 401, msgInvalidKey
+				if strings.HasPrefix(rt.name, "realtime-v1-longpoll") {
+					wantCode, wantMsg = 403, msgRealtimeLongPollOff
+				}
 				var msg struct{ Message string }
-				if code != 401 || !strings.HasPrefix(ctype, "application/json") || json.Unmarshal([]byte(body), &msg) != nil || msg.Message != msgInvalidKey {
-					t.Errorf("%s / %s / %s: %d %q %q, want 401 JSON %q", rt.name, pl.name, kname, code, ctype, body, msgInvalidKey)
+				if code != wantCode || !strings.HasPrefix(ctype, "application/json") || json.Unmarshal([]byte(body), &msg) != nil || msg.Message != wantMsg {
+					t.Errorf("%s / %s / %s: %d %q %q, want %d JSON %q", rt.name, pl.name, kname, code, ctype, body, wantCode, wantMsg)
 				}
 			}
 		}
@@ -211,6 +230,9 @@ func TestLegacyGuardLeavesLegitimateTrafficAlone(t *testing.T) {
 		"s3 sigv4 with the secret session": {"Authorization": {sigv4}, "X-Amz-Security-Token": {sec}},
 	} {
 		for _, rt := range wireRoutes {
+			if rt.name == "realtime-v1-ws" {
+				continue // needs a real connection; the socket tests cover it
+			}
 			// The S3 rules about POST uploads and the route's own access rules are not the point.
 			code, _, body := h.serve(rt.method, rt.target+"?filter=eq.1&sig="+percentEncodeAll(user), hd)
 			if code == 401 && strings.Contains(body, msgInvalidKey) {
@@ -273,12 +295,9 @@ func TestLegacyWireNeedles(t *testing.T) {
 	if percentDecode("a%2Eb%zz%4") != "a.b%zz%4" || percentDecode("%41%61") != "Aa" {
 		t.Errorf("percentDecode: %q %q", percentDecode("a%2Eb%zz%4"), percentDecode("%41%61"))
 	}
-	if got := queryValues("a=1&token=x%2Ey&Token=z&token=%zz&token", "token"); len(got) != 2 || got[0] != "x.y" || got[1] != "%zz" {
-		t.Errorf("queryValues: %q", got)
-	}
 }
 
-// ---- Realtime long-poll sessions ----
+// ---- Realtime is WebSocket-only while the legacy keys are disabled ----
 
 // serveFakeLongPoll makes Realtime behave like Phoenix's long-poll transport: a GET without a
 // token opens a session (HTTP 410 and a token in the body), anything with a token resumes it.
@@ -289,7 +308,7 @@ func serveFakeLongPoll(h *harness) {
 	defer rt.mu.Unlock()
 	rt.handler = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodGet && r.URL.Query().Get("token") == "" {
+		if r.Method == http.MethodGet && r.URL.Query().Get("token") == "" && r.Header.Get("X-Phoenix-Longpoll-Token") == "" {
 			i := atomic.AddInt32(&n, 1)
 			w.WriteHeader(http.StatusGone)
 			fmt.Fprintf(w, `{"token":"SFMyNTY.session-%d.sig_%d","messages":[]}`, i, i)
@@ -299,223 +318,185 @@ func serveFakeLongPoll(h *harness) {
 	}
 }
 
-func (h *harness) openSession(t *testing.T, apikey string) string {
-	t.Helper()
-	resp, body := h.req("GET", h.host(h.ref), "/realtime/v1/longpoll?vsn=2.0.0&apikey="+apikey)
-	var v struct{ Token string }
-	if resp.StatusCode != http.StatusGone || json.Unmarshal([]byte(body), &v) != nil || v.Token == "" {
-		t.Fatalf("opening a session: %d %q", resp.StatusCode, body)
-	}
-	return v.Token
-}
-
-func (h *harness) pollSession(method, token string) (int, string) {
-	h.t.Helper()
-	resp, body := h.reqBody(method, h.host(h.ref), "/realtime/v1/longpoll?vsn=2.0.0&apikey="+h.k.PublishableKey+"&token="+token, `[]`)
-	return resp.StatusCode, body
-}
-
 func (h *harness) realtimeHits() int { return h.ups[svcRealtime].count() }
 
-func TestRealtimeLongPollSessionOpenedBeforeSwitchIsRevoked(t *testing.T) {
-	h := newHarness(t) // legacy keys enabled
+// A long-poll request in one of the forms a client or an attacker can send.
+type lpForm struct {
+	name, method, target, body string
+	headers                    []string
+}
+
+// longPollForms are the long-poll requests that must be refused while the keys are disabled and
+// that work while they are enabled. stale is the token of a session opened while they were enabled.
+func longPollForms(h *harness, stale string) []lpForm {
+	pub, svc := h.k.PublishableKey, h.k.ServiceRoleKey
+	base := "/realtime/v1/longpoll?vsn=2.0.0&apikey=" + pub
+	join := `{"topic":"realtime:x","event":"phx_join","payload":{"access_token":"` + pub + `"}}`
+	jh := []string{"Content-Type", "application/json"}
+	return []lpForm{
+		{"GET, no token", "GET", base, "", nil},
+		{"GET, query token", "GET", base + "&token=" + stale, "", nil},
+		{"GET, query token, re-spelled name", "GET", base + "&to%6Ben=" + stale, "", nil},
+		{"GET, query token, re-spelled value", "GET", base + "&token=" + strings.ReplaceAll(stale, ".", "%2E"), "", nil},
+		{"GET, query token twice", "GET", base + "&token=fresh&token=" + stale, "", nil},
+		{"GET, query token, other case", "GET", base + "&Token=" + stale, "", nil},
+		{"GET, token header", "GET", base, "", []string{"X-Phoenix-Longpoll-Token", stale}},
+		{"GET, token header and query token", "GET", base + "&token=" + stale, "", []string{"X-Phoenix-Longpoll-Token", stale}},
+		{"GET, stale token", "GET", base + "&token=SFMyNTY.long-gone.sig", "", nil},
+		{"GET, empty token", "GET", base + "&token=", "", nil},
+		{"GET, publishable key in a header", "GET", "/realtime/v1/longpoll?vsn=2.0.0", "", []string{"Apikey", pub}},
+		{"GET, no key at all", "GET", "/realtime/v1/longpoll", "", nil},
+		{"GET, trailing slash", "GET", "/realtime/v1/longpoll/?apikey=" + pub, "", nil},
+		{"GET, dot segments", "GET", "/realtime/v1/x/../longpoll?apikey=" + pub, "", nil},
+		{"POST, token, clean body", "POST", base + "&token=" + stale, join, jh},
+		{"POST, no token, clean body", "POST", base, join, jh},
+		{"POST, no body", "POST", base + "&token=" + stale, "", nil},
+		{"POST, legacy key in the body", "POST", base + "&token=" + stale, `{"payload":{"access_token":"` + svc + `"}}`, jh},
+		{"POST, re-encoded key in the body", "POST", base, `{"payload":{"access_token":"` + reencodings(h.t, svc)["= padding"] + `"}}`, jh},
+		{"POST, large body", "POST", base + "&token=" + stale, strings.Repeat("p", 300<<10), nil},
+		{"PUT", "PUT", base + "&token=" + stale, join, jh},
+		{"DELETE", "DELETE", base + "&token=" + stale, "", nil},
+		{"HEAD", "HEAD", base, "", nil},
+		{"POST with upgrade headers", "POST", base, join, append([]string{"Connection", "Upgrade", "Upgrade", "websocket"}, jh...)},
+		{"GET with Upgrade only", "GET", base, "", []string{"Upgrade", "websocket"}},
+		{"GET with another upgrade protocol", "GET", base, "", []string{"Connection", "Upgrade", "Upgrade", "h2c"}},
+		{"handshake to longpoll", "GET", base, "", []string{"Connection", "Upgrade", "Upgrade", "websocket"}},
+		{"handshake to another subpath", "GET", "/realtime/v1/socket?apikey=" + pub, "", []string{"Connection", "Upgrade", "Upgrade", "websocket"}},
+		{"handshake to websocket subpath", "GET", "/realtime/v1/websocket/x?apikey=" + pub, "", []string{"Connection", "Upgrade", "Upgrade", "websocket"}},
+		{"handshake to websocket, trailing slash", "GET", "/realtime/v1/websocket/?apikey=" + pub, "", []string{"Connection", "Upgrade", "Upgrade", "websocket"}},
+		{"handshake to the prefix", "GET", "/realtime/v1?apikey=" + pub, "", []string{"Connection", "Upgrade", "Upgrade", "websocket"}},
+		{"handshake with a body", "GET", "/realtime/v1/websocket?apikey=" + pub, "x", []string{"Connection", "Upgrade", "Upgrade", "websocket"}},
+		{"websocket path without a handshake", "GET", "/realtime/v1/websocket?apikey=" + pub, "", nil},
+		{"websocket path, POST", "POST", "/realtime/v1/websocket?apikey=" + pub, join, jh},
+		{"other subpath", "GET", "/realtime/v1/anything?apikey=" + pub, "", nil},
+		{"the prefix", "GET", "/realtime/v1?apikey=" + pub, "", nil},
+	}
+}
+
+func TestRealtimeLongPollRefusedWhileLegacyKeysDisabled(t *testing.T) {
+	h := wireHarness(t, true)
 	serveFakeLongPoll(h)
-	a := h.openSession(t, h.k.ServiceRoleKey) // connected with a legacy key
-	b := h.openSession(t, h.k.PublishableKey)
-	if code, _ := h.pollSession("GET", a); code != 200 {
-		t.Fatalf("poll before the switch: %d", code)
-	}
-	if code, _ := h.pollSession("POST", a); code != 200 {
-		t.Fatalf("push before the switch: %d", code)
-	}
-	eventually(t, "both sessions tracked", func() bool {
-		h.srv.lp.mu.Lock()
-		defer h.srv.lp.mu.Unlock()
-		return len(h.srv.lp.m[h.ref].live) == 2
-	})
-
-	h.flipLegacy(t, true)
-	eventually(t, "sessions revoked", func() bool { return len(h.srv.lp.refs(h.ref)) == 0 })
-
 	hits := h.realtimeHits()
-	for _, tok := range []string{a, b, strings.ReplaceAll(a, ".", "%2E"), "other&token=" + a} {
-		for _, method := range []string{"GET", "POST"} {
-			code, body := h.pollSession(method, tok)
-			if code != http.StatusGone || !strings.Contains(body, `"status":410`) || strings.Contains(body, `"token"`) {
-				t.Errorf("%s with revoked token %q: %d %q, want 410 without a token", method, tok, code, body)
+	for _, f := range longPollForms(h, "SFMyNTY.session-1.sig_1") {
+		resp, body := h.reqBody(f.method, h.host(h.ref), f.target, f.body, f.headers...)
+		var msg struct{ Message string }
+		if f.method != "HEAD" && (json.Unmarshal([]byte(body), &msg) != nil || msg.Message != msgRealtimeLongPollOff) {
+			t.Errorf("%s: body %q, want the JSON message %q", f.name, body, msgRealtimeLongPollOff)
+		}
+		if resp.StatusCode != http.StatusForbidden || !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+			t.Errorf("%s: %d %q, want 403 JSON", f.name, resp.StatusCode, resp.Header.Get("Content-Type"))
+		}
+	}
+	if got := h.realtimeHits(); got != hits {
+		t.Errorf("%d long-poll requests reached Realtime", got-hits)
+	}
+	// The message is the one the decision names.
+	if msgRealtimeLongPollOff != "Realtime long-polling is unavailable while legacy API keys are disabled; use WebSocket" {
+		t.Errorf("message: %q", msgRealtimeLongPollOff)
+	}
+}
+
+// Realtime's /api routes are not long poll and keep working with the legacy keys off.
+func TestRealtimeAPIUnaffectedByLongPollRefusal(t *testing.T) {
+	h := wireHarness(t, true)
+	if code, _, _ := h.serve("GET", "/realtime/v1/api/ping", http.Header{"Apikey": {h.k.PublishableKey}}); code != 200 {
+		t.Errorf("realtime api with the legacy keys off: %d", code)
+	}
+}
+
+// While the keys are enabled every one of those forms is forwarded as before, and the sessions
+// it opens work; when the keys are switched off, the same sessions die because every later
+// request is refused, and a real WebSocket still works.
+func TestRealtimeLongPollWorksWhileEnabledAndDiesOnSwitch(t *testing.T) {
+	h := newHarness(t)
+	serveFakeLongPoll(h)
+	open := func(apikey string) string {
+		t.Helper()
+		resp, body := h.req("GET", h.host(h.ref), "/realtime/v1/longpoll?vsn=2.0.0&apikey="+apikey)
+		var v struct{ Token string }
+		if resp.StatusCode != http.StatusGone || json.Unmarshal([]byte(body), &v) != nil || v.Token == "" {
+			t.Fatalf("opening a session: %d %q", resp.StatusCode, body)
+		}
+		return v.Token
+	}
+	a := open(h.k.ServiceRoleKey) // connected with a legacy key
+	b := open(h.k.PublishableKey)
+	for _, tok := range []string{a, b} {
+		for _, f := range longPollForms(h, tok) {
+			if !strings.HasPrefix(f.name, "GET, query token") && !strings.HasPrefix(f.name, "POST, token") && f.name != "GET, token header" {
+				continue
+			}
+			if strings.Contains(f.name, "re-spelled name") || strings.Contains(f.name, "other case") {
+				continue // the fake Realtime does not read those spellings as a token
+			}
+			resp, body := h.reqBody(f.method, h.host(h.ref), f.target, f.body, f.headers...)
+			if resp.StatusCode != 200 {
+				t.Errorf("%s while enabled: %d %q", f.name, resp.StatusCode, body)
 			}
 		}
 	}
-	// A duplicate token parameter does not hide the revoked one.
-	if resp, _ := h.req("GET", h.host(h.ref), "/realtime/v1/longpoll?apikey="+h.k.PublishableKey+"&token=fresh&token="+a); resp.StatusCode != http.StatusGone {
-		t.Errorf("duplicate token parameter: %d", resp.StatusCode)
+	before := h.realtimeHits()
+	if resp, _ := h.req("GET", h.host(h.ref), "/realtime/v1/longpoll?apikey="+h.k.PublishableKey); resp.StatusCode != http.StatusGone {
+		t.Errorf("a new session while enabled: %d", resp.StatusCode)
 	}
-	if got := h.realtimeHits(); got != hits {
-		t.Errorf("%d resumed requests with a revoked token reached Realtime", got-hits)
+	if h.realtimeHits() != before+1 {
+		t.Errorf("the new session did not reach Realtime")
 	}
 
-	// The client starts a new session through the guarded path: a legacy key is refused, the
-	// publishable key opens a session that keeps working, and its token is not revoked later.
-	if resp, _ := h.req("GET", h.host(h.ref), "/realtime/v1/longpoll?apikey="+h.k.ServiceRoleKey); resp.StatusCode != 401 {
-		t.Errorf("a new session with a legacy key: %d", resp.StatusCode)
-	}
-	c := h.openSession(t, h.k.PublishableKey)
-	if code, _ := h.pollSession("GET", c); code != 200 {
-		t.Errorf("poll of a session opened after the switch: %d", code)
-	}
-	h.flipLegacy(t, true) // another notification
-	time.Sleep(50 * time.Millisecond)
-	if code, _ := h.pollSession("GET", c); code != 200 {
-		t.Errorf("session opened after the switch revoked by a later notification: %d", code)
-	}
-	if code, _ := h.pollSession("GET", a); code != http.StatusGone {
-		t.Errorf("revoked token after another notification: %d", code)
-	}
-}
-
-// Sessions stay valid while the keys change but legacy stays enabled.
-func TestRealtimeLongPollSessionStaysWhileLegacyKeysAreEnabled(t *testing.T) {
-	h := newHarness(t)
-	serveFakeLongPoll(h)
-	a := h.openSession(t, h.k.ServiceRoleKey)
-	calls := h.keys.callCount(h.ref)
-	h.flipLegacy(t, false) // a rotation, say
-	eventually(t, "keys looked up again", func() bool { return h.keys.callCount(h.ref) > calls })
-	time.Sleep(50 * time.Millisecond)
-	if code, _ := h.pollSession("GET", a); code != 200 {
-		t.Errorf("poll after a key change with the legacy keys enabled: %d", code)
-	}
-	if got := len(h.srv.lp.refs(h.ref)); got != 1 {
-		t.Errorf("tracked projects: %d", got)
-	}
-}
-
-// A session whose opening raced the switch (keys read before it, answer after it) is caught by
-// the check that follows its registration.
-func TestRealtimeLongPollSessionOpenedDuringSwitchIsRevoked(t *testing.T) {
-	h := newHarness(t)
-	serveFakeLongPoll(h)
-	// Sync's first full reload drops every cached key; let it happen before the stale entry goes in.
-	eventually(t, "the first reload", func() bool {
-		h.srv.table.mu.RLock()
-		defer h.srv.table.mu.RUnlock()
-		return h.srv.table.keyEpoch >= 2
-	})
-	k := *h.k
-	k.LegacyDisabled = true
-	h.keys.set(h.ref, &k)
-	h.srv.table.mu.Lock()
-	h.srv.table.keyCache[h.ref] = keyEntry{keys: h.k, expires: time.Now().Add(time.Hour)}
-	h.srv.table.mu.Unlock()
-	a := h.openSession(t, h.k.ServiceRoleKey) // authorized on the stale, enabled keys
-	h.srv.table.invalidateKeys(h.ref)         // the late notification
-	eventually(t, "session revoked", func() bool { return len(h.srv.lp.refs(h.ref)) == 0 })
-	if code, _ := h.pollSession("GET", a); code != http.StatusGone {
-		t.Errorf("session opened during the switch: %d", code)
-	}
-}
-
-// A project's sessions do not affect another project's.
-func TestRealtimeLongPollRevocationIsPerProject(t *testing.T) {
-	h := newHarness(t)
-	serveFakeLongPoll(h)
-	h.srv.lp.add("otherproject00000000", "SFMyNTY.x.y")
-	a := h.openSession(t, h.k.PublishableKey)
 	h.flipLegacy(t, true)
-	eventually(t, "revoked", func() bool { return len(h.srv.lp.refs(h.ref)) == 0 })
-	if code, _ := h.pollSession("GET", a); code != http.StatusGone {
-		t.Errorf("own session: %d", code)
-	}
-	if got := h.srv.lp.refs("otherproject00000000"); len(got) != 1 {
-		t.Errorf("another project's session was touched: %v", got)
-	}
-}
-
-// The answer to a new session is passed on byte for byte, large or odd answers included.
-func TestRealtimeLongPollAnswerPassesThrough(t *testing.T) {
-	h := newHarness(t)
-	rt := h.ups[svcRealtime]
-	big := `{"token":"SFMyNTY.big.sig","messages":["` + strings.Repeat("m", lpMaxSessionRs) + `"]}`
-	answers := []string{`not json`, `{"token":""}`, `{"token":5}`, big, ""}
-	var i int32
-	rt.mu.Lock()
-	rt.handler = func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusGone)
-		fmt.Fprint(w, answers[int(atomic.AddInt32(&i, 1))-1])
-	}
-	rt.mu.Unlock()
-	for _, want := range answers {
-		resp, body := h.req("GET", h.host(h.ref), "/realtime/v1/longpoll?apikey="+h.k.PublishableKey)
-		if resp.StatusCode != http.StatusGone || body != want {
-			t.Errorf("answer %.30q came back as %d %.30q (%d bytes)", want, resp.StatusCode, body, len(body))
+	hits := h.realtimeHits()
+	for _, tok := range []string{a, b} {
+		for _, f := range longPollForms(h, tok) {
+			resp, _ := h.reqBody(f.method, h.host(h.ref), f.target, f.body, f.headers...)
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("%s after the switch: %d, want 403", f.name, resp.StatusCode)
+			}
 		}
 	}
-	// Only the large answer's token could have been tracked, and it is too large to be read.
-	time.Sleep(20 * time.Millisecond)
-	if got := h.srv.lp.refs(""); len(got) != 0 {
-		t.Errorf("tracked from an unreadable answer: %v", got)
+	if got := h.realtimeHits(); got != hits {
+		t.Errorf("%d long-poll requests reached Realtime after the switch", got-hits)
+	}
+
+	// Switched back on, long poll works again.
+	h.flipLegacy(t, false)
+	if resp, _ := h.req("GET", h.host(h.ref), "/realtime/v1/longpoll?apikey="+h.k.PublishableKey+"&token="+a); resp.StatusCode != 200 {
+		t.Errorf("long poll after the keys are enabled again: %d", resp.StatusCode)
 	}
 }
 
-func TestLongPollSessionBookkeeping(t *testing.T) {
-	now := time.Unix(1_000_000, 0)
-	s := &lpSessions{now: func() time.Time { return now }}
-	s.add("p", "t1")
-	now = now.Add(lpLiveIdle - time.Second)
-	s.seen("p", []string{"t1"}) // a poll keeps it alive
-	now = now.Add(lpLiveIdle - time.Second)
-	s.add("p", "t2") // prunes only what is idle
-	if n := s.revoke("p"); n != 2 {
-		t.Errorf("revoked %d, want 2 (t1 was polled)", n)
-	}
-	if !s.seen("p", []string{"zzz", "t1"}) {
-		t.Error("t1 not refused")
-	}
-	now = now.Add(lpRevokedFor + time.Second)
-	if s.seen("p", []string{"t1"}) {
-		t.Error("revocation never expires")
-	}
-	s.add("p", "idle")
-	now = now.Add(lpLiveIdle + time.Second)
-	s.add("p", "fresh")
-	if n := s.revoke("p"); n != 1 {
-		t.Errorf("an idle session was still tracked: revoked %d", n)
-	}
-	// The cap drops the least recently used session.
-	for i := 0; i < lpMaxLive+5; i++ {
-		now = now.Add(time.Millisecond)
-		s.add("q", fmt.Sprint("t", i))
-	}
-	if n := len(s.m["q"].live); n != lpMaxLive {
-		t.Errorf("tracked %d, cap %d", n, lpMaxLive)
-	}
-	if _, ok := s.m["q"].live["t0"]; ok {
-		t.Error("the oldest session survived the cap")
-	}
-	if _, ok := s.m["q"].live[fmt.Sprint("t", lpMaxLive+4)]; !ok {
-		t.Error("the newest session was dropped")
-	}
+// A WebSocket with the publishable key is the one thing the route accepts while the keys are off.
+func TestRealtimeWebSocketAcceptedWhileLegacyKeysDisabled(t *testing.T) {
+	h := disabledHarness(t)
+	serveEchoRealtime(h)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c := h.dialRealtime(t, ctx, nil)
+	defer c.CloseNow()
+	echoOK(t, ctx, c, "hello")
 }
 
-// A failed key lookup during the recheck does not leave the tracked connections open for good.
+// A failed key lookup during the recheck does not leave a tracked socket open for good.
 func TestRealtimeRecheckRetriesAfterFailedLookup(t *testing.T) {
 	h := newHarness(t)
-	serveFakeLongPoll(h)
+	serveEchoRealtime(h)
 	h.srv.recheckWait = 10 * time.Millisecond
-	a := h.openSession(t, h.k.ServiceRoleKey)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c := h.dialRealtime(t, ctx, nil)
+	defer c.CloseNow()
+	echoOK(t, ctx, c, "one")
 	k := *h.k
 	k.LegacyDisabled = true
 	h.keys.set(h.ref, &k)
 	h.keys.setFail(errors.New("registry down"))
 	h.srv.table.invalidateKeys(h.ref)
 	time.Sleep(60 * time.Millisecond)
-	if len(h.srv.lp.refs(h.ref)) != 1 {
-		t.Fatal("the session was revoked without knowing the keys")
+	if len(h.srv.sockets.refs(h.ref)) != 1 {
+		t.Fatal("the socket was closed without knowing the keys")
 	}
 	h.keys.setFail(nil)
-	eventually(t, "the retry revoked the session", func() bool { return len(h.srv.lp.refs(h.ref)) == 0 })
-	if code, _ := h.pollSession("GET", a); code != http.StatusGone {
-		t.Errorf("poll after the retry: %d", code)
+	eventually(t, "the retry closed the socket", func() bool { return len(h.srv.sockets.refs(h.ref)) == 0 })
+	if _, _, err := c.Read(ctx); err == nil {
+		t.Fatal("socket still open")
 	}
 }

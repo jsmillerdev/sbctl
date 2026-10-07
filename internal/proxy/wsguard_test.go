@@ -382,31 +382,3 @@ func TestRealtimeSocketLegacyKeysPassWhenEnabled(t *testing.T) {
 	echoOK(t, ctx, c, `["1","1","realtime:x","phx_join",{"access_token":"`+h.k.ServiceRoleKey+`"}]`)
 	_ = up
 }
-
-// The long-poll transport of /realtime/v1 carries the same events in POST bodies.
-func TestRealtimeLongPollRefusesLegacyKeysWhenDisabled(t *testing.T) {
-	h := disabledHarness(t)
-	up := serveEchoRealtime(h)
-	post := func(body string) (*http.Response, string) {
-		return h.reqBody("POST", h.host(h.ref), "/realtime/v1/longpoll?apikey="+h.k.PublishableKey, body, "Content-Type", "application/json")
-	}
-	if resp, _ := post(`{"topic":"realtime:x","event":"phx_join","payload":{"access_token":"` + h.k.PublishableKey + `"}}`); resp.StatusCode != 200 {
-		t.Fatalf("clean long-poll body: %d", resp.StatusCode)
-	}
-	for name, body := range map[string]string{
-		"service_role": `{"topic":"realtime:x","event":"phx_join","payload":{"access_token":"` + h.k.ServiceRoleKey + `"}}`,
-		"escaped anon": `{"payload":{"access_token":"` + strings.Replace(h.k.AnonKey, "eyJ", `eyJ`, 1) + `"}}`,
-		"after 200 kB": `{"pad":"` + strings.Repeat("p", 200000) + `","access_token":"` + h.k.AnonKey + `"}`,
-	} {
-		resp, text := post(body)
-		if resp.StatusCode != 401 || text != msgInvalidKey {
-			t.Errorf("%s: %d %q, want 401 %q", name, resp.StatusCode, text, msgInvalidKey)
-		}
-	}
-	if resp, _ := post(strings.Repeat("p", maxGuardedBody+1)); resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Errorf("oversized long-poll body: %d, want 413", resp.StatusCode)
-	}
-	if got := up.received(); len(got) != 1 {
-		t.Errorf("Realtime received %d bodies, want only the clean one", len(got))
-	}
-}

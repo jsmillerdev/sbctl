@@ -19,8 +19,9 @@ import (
 // Realtime too. Realtime also takes a JWT inside the socket (the access_token of a phx_join
 // payload or of an "access_token" event) and authorizes channels with its claims, which the
 // handshake check cannot see. So the proxy watches the client-to-server direction of a
-// /realtime/v1 socket, and the body of a long-poll request, for one of the project's exact
-// legacy keys, and ends the connection when it finds one. Everything else streams untouched.
+// /realtime/v1 socket for one of the project's legacy keys, and ends the connection when it finds
+// one. (Long poll, the other Realtime transport, is refused while the keys are disabled; see
+// handler.go.) Everything else streams untouched.
 //
 // Memory per connection is constant: a frame is never buffered. Its payload is unmasked in a
 // small scratch buffer, JSON string escapes are decoded on the fly (so "eyJ..." is the
@@ -540,52 +541,6 @@ func (w *guardedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (w *guardedWriter) Flush() { _ = http.NewResponseController(w.ResponseWriter).Flush() }
 
 func (w *guardedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
-
-// maxGuardedBody bounds the memory held for a long-poll request body. A long-poll body is one
-// or a few Phoenix messages. It is buffered, so that a refused body never reaches Realtime
-// partly (a pass-through check would have sent everything before the key upstream already), but
-// it is scanned as it arrives and the request ends at the first hit.
-const maxGuardedBody = 256 << 10
-
-// checkBody reads the request body of a guarded request, answers the refusal itself when it
-// carries a legacy key or is too large, and otherwise puts the body back for forwarding.
-func checkBody(w http.ResponseWriter, r *http.Request, needles [][]byte) (ok bool, hit bool) {
-	if r.Body == nil || r.Body == http.NoBody {
-		return true, false
-	}
-	if r.ContentLength > maxGuardedBody {
-		writeJSON(w, http.StatusRequestEntityTooLarge, "Request body too large")
-		return false, false
-	}
-	body := http.MaxBytesReader(w, r.Body, maxGuardedBody)
-	scan := newKeyScanner(needles)
-	var buf bytes.Buffer
-	chunk := make([]byte, 16<<10)
-	for {
-		n, err := body.Read(chunk)
-		if n > 0 {
-			buf.Write(chunk[:n])
-			if scan.write(chunk[:n]) {
-				writeText(w, http.StatusUnauthorized, msgInvalidKey)
-				return false, true
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			var mbe *http.MaxBytesError
-			if errors.As(err, &mbe) {
-				writeJSON(w, http.StatusRequestEntityTooLarge, "Request body too large")
-			} else {
-				writeJSON(w, http.StatusBadRequest, "Bad Request")
-			}
-			return false, false
-		}
-	}
-	r.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
-	return true, false
-}
 
 // isWebSocketHandshake reports whether r is a WebSocket opening handshake: a GET that asks
 // for the "websocket" upgrade with a Connection header that lists "upgrade" (the condition

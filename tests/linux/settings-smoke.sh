@@ -333,24 +333,37 @@ KID=$(json_get 'd["id"]' <<<"$NEW")
 must 200 DELETE "$CFG/api-keys/$KID"
 [[ $(pcode GET /rest/v1/ -H "apikey: $KEY") == 401 ]] || fail "a revoked key is still accepted"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SEC") == 200 ]] || fail "revoking one key took the default secret key down"
-# A Realtime long-poll session opened with a legacy key while the keys are enabled keeps the key it connected with: the
-# proxy must stop it at the switch. Phoenix answers a GET without a token with the session token.
+# Realtime long poll works while the legacy keys are enabled. A session opened then keeps the key it connected with, which
+# the proxy cannot inspect, so with the keys disabled the Realtime route is WebSocket-only: every long-poll request is refused
+# (403 and a JSON message), which ends existing sessions, and nothing but a WebSocket handshake to /realtime/v1/websocket
+# reaches Realtime. Phoenix answers a GET without a token with the session token.
 LP=$(proj GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$SVC" || true)
 LP_TOKEN=$(json_get 'd["token"]' <<<"$LP" 2>/dev/null || true)
 [[ -n $LP_TOKEN ]] || fail "Realtime did not open a long-poll session: $LP"
+LP_CODE=$(pcode GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP_TOKEN")
+[[ $LP_CODE == 200 || $LP_CODE == 204 ]] || fail "a long-poll session could not be polled while the legacy keys are enabled (answered $LP_CODE)"
 must 200 PUT "$CFG/api-keys/legacy?enabled=false"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SVC") == 401 ]] || fail "a legacy key is accepted while disabled"
-LP_CODE=$(pcode GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP_TOKEN")
-[[ $LP_CODE == 410 ]] || fail "a long-poll session opened before the switch can still be polled (answered $LP_CODE)"
-LP_CODE=$(pcode POST "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP_TOKEN" -H 'Content-Type: application/x-ndjson' -d '')
-[[ $LP_CODE == 410 ]] || fail "a long-poll session opened before the switch can still be pushed to (answered $LP_CODE)"
-# A new session goes through the guarded path: a legacy key is refused, the publishable key opens one that works.
-[[ $(pcode GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$SVC") == 401 ]] || fail "a legacy key opened a long-poll session while disabled"
-LP2=$(proj GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB" || true)
-LP2_TOKEN=$(json_get 'd["token"]' <<<"$LP2" 2>/dev/null || true)
-[[ -n $LP2_TOKEN ]] || fail "no long-poll session with the publishable key while the legacy keys are off: $LP2"
-LP_CODE=$(pcode GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP2_TOKEN")
-[[ $LP_CODE == 200 || $LP_CODE == 204 ]] || fail "a long-poll session opened after the switch was refused (answered $LP_CODE)"
+LP_MSG='Realtime long-polling is unavailable while legacy API keys are disabled; use WebSocket'
+lp_refused() { # what METHOD TARGET [curl args]: expect 403 and the JSON message, from the proxy
+  local what=$1 out; shift
+  out=$(proj "$@" -w ' [%{http_code}]' || true)
+  [[ $out == *"$LP_MSG"*"[403]" ]] || fail "$what was not refused with 403 and the message: $out"
+}
+lp_refused "polling a session opened before the switch" GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP_TOKEN"
+lp_refused "pushing to a session opened before the switch" POST "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP_TOKEN" -H 'Content-Type: application/x-ndjson' -d ''
+lp_refused "a long-poll push with a body" POST "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP_TOKEN" -H 'Content-Type: application/json' -d '{"topic":"realtime:smoke","event":"phx_join","payload":{}}'
+lp_refused "a long-poll push whose body carries a legacy key" POST "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB" -H 'Content-Type: application/json' -d "{\"payload\":{\"access_token\":\"$SVC\"}}"
+lp_refused "the session token in a header" GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB" -H "x-phoenix-longpoll-token: $LP_TOKEN"
+lp_refused "the session token with its parameter name percent-encoded" GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&to%6Ben=$LP_TOKEN"
+lp_refused "a stale token" GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=SFMyNTY.long-gone.sig"
+lp_refused "a new session with the publishable key" GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB"
+lp_refused "a new session with no key" GET "/realtime/v1/longpoll"
+lp_refused "a new session with a legacy key" GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$SVC"
+lp_refused "another subpath of the Realtime route" GET "/realtime/v1/socket?apikey=$PUB"
+lp_refused "the websocket path without a handshake" GET "/realtime/v1/websocket?apikey=$PUB"
+# The WebSocket path stays open: the handshake with the publishable key joins (ws_probe, below), and /api is not long poll.
+[[ $(proj GET /realtime/v1/api/ping -H "apikey: $PUB" || true) != *"$LP_MSG"* ]] || fail "Realtime /api was refused as long poll"
 [[ $(pcode GET /auth/v1/settings -H "apikey: $ANON") == 401 ]] || fail "the legacy anon key is accepted while disabled"
 # Storage verifies the JWT itself, so the legacy key must be turned away there too, in every position.
 storage_code() { pcode GET /storage/v1/bucket "$@"; }
@@ -388,6 +401,9 @@ must 200 PUT "$CFG/api-keys/legacy?enabled=true"
 OUT=$(s3_probe "" -H "x-amz-security-token: $SVC")
 [[ $OUT != *"legacy API keys are disabled"* ]] || fail "the S3 session token is still refused with the legacy keys back on: $OUT"
 [[ $(ws_probe "$PUB" "$SVC") == joined ]] || fail "a Realtime join with a legacy key failed after the legacy keys came back: $(ws_probe "$PUB" "$SVC")"
+# Long poll is back with the legacy keys.
+LP3=$(proj GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB" || true)
+[[ -n $(json_get 'd["token"]' <<<"$LP3" 2>/dev/null || true) ]] || fail "no long-poll session after the legacy keys came back: $LP3"
 
 log "database password reset"
 NEWPW='a-brand-new-password-42'
