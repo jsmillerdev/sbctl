@@ -50,6 +50,7 @@ type Config struct {
 	Studio    Studio    `toml:"studio"`
 	API       API       `toml:"api"`
 	Fleet     Fleet     `toml:"fleet"`
+	Functions Functions `toml:"functions"`
 	Defaults  Limits    `toml:"defaults"`
 }
 
