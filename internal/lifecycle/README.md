@@ -52,8 +52,10 @@ that its pg_hba.conf trusts; ours does not trust a loopback connection, so a lib
 with "connection failed". Workers need no connection, no pg_hba rule and no network, which also
 keeps them working behind a branch's egress filter and independent of the `nodename` and `nodeport`
 stored in `cron.job`. A saved `max_worker_processes` overrides the 16 (it is a command-line setting
-like the class's sizing, applied at the next restart); keep it above `cron.max_running_jobs` plus
-two (pg_cron's launcher and pg_net's worker each hold a slot). A project that already runs picks the
+like the class's sizing, applied at the next restart); the Postgres settings save refuses a value below
+10, which is `cron.max_running_jobs` plus two (pg_cron's launcher and pg_net's worker each hold a slot).
+A value of 4 to 9 that was saved before that rule stays in force, and the project then runs fewer
+concurrent jobs: a job that cannot get a worker fails to start. A project that already runs picks the
 settings up the next time the daemon starts (`StartActive` renders the unit again and restarts a
 running cluster whose rendered settings changed), or on resume (a Postgres settings save also renders it and reports a
 pending restart); no migration is needed.

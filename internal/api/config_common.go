@@ -64,6 +64,20 @@ func asValidation(err error) error {
 	return err
 }
 
+// maxConnections is the project's max_connections: the saved Postgres setting, else the class's
+// (0 when neither is known, which turns off the checks that need it).
+func (s *Server) maxConnections(ctx context.Context, p *registry.Project) int64 {
+	if st, err := s.settings.Get(ctx, p.Ref, projectconfig.Postgres); err == nil {
+		if n, ok := st.Effective.Int("max_connections"); ok && n > 0 {
+			return n
+		}
+	}
+	if c, err := lifecycle.ClassFor(p.Class); err == nil {
+		return int64(c.MaxConnections)
+	}
+	return 0
+}
+
 // saveSettings validates and saves patch as the settings of svc and applies the change to
 // the running project. When applying fails the previous settings are saved again and
 // applied (best effort), so a rejected save leaves the project as it was. The apply runs on
@@ -86,7 +100,12 @@ func (s *Server) saveSettings(ctx context.Context, p *registry.Project, svc proj
 	if err != nil {
 		return nil, lifecycle.ApplyResult{}, err
 	}
-	ch, err := s.settings.Patch(ctx, p.Ref, svc, patch, projectconfig.CrossContext{MemoryLimit: memoryLimit(p)})
+	cx := projectconfig.CrossContext{MemoryLimit: memoryLimit(p)}
+	if svc == projectconfig.Pooler {
+		cx.MaxConnections = s.maxConnections(ctx, p)
+		cx.PoolerMaxClients = int64(s.cfg.Fleet.PoolerMaxClients())
+	}
+	ch, err := s.settings.Patch(ctx, p.Ref, svc, patch, cx)
 	if err != nil {
 		return nil, lifecycle.ApplyResult{}, asValidation(err)
 	}

@@ -55,6 +55,41 @@ func TestPostgresRefusesSettingsThePostmasterCannotStartWith(t *testing.T) {
 	wantInvalidWith(t, patchWith(m, Postgres, map[string]any{"shared_buffers": "300MB", "max_locks_per_transaction": float64(1024)}, CrossContext{MemoryLimit: 512 << 20}), "memory limit")
 }
 
+// pg_cron's launcher and pg_net's worker take two of max_worker_processes and a running job one
+// each (cron.max_running_jobs is 8): fewer than 10 leaves jobs without a worker.
+func TestPostgresKeepsWorkersForPgCron(t *testing.T) {
+	m, _ := newManager(t)
+	for _, n := range []float64{0, 4, 9} {
+		wantInvalidWith(t, patchWith(m, Postgres, map[string]any{"max_worker_processes": n}, CrossContext{}), "pg_cron")
+	}
+	if err := patchWith(m, Postgres, map[string]any{"max_worker_processes": float64(10)}, CrossContext{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The pool is bounded by the project's max_connections and the client limit by the node; the
+// values a tenant runs with unsaved always pass, and an unknown limit (0) checks nothing.
+func TestPoolerLimits(t *testing.T) {
+	m, _ := newManager(t)
+	cx := CrossContext{MaxConnections: 60, PoolerMaxClients: 5000}
+	wantInvalidWith(t, patchWith(m, Pooler, map[string]any{"default_pool_size": float64(51)}, cx), "at most 50")
+	wantInvalidWith(t, patchWith(m, Pooler, map[string]any{"max_client_conn": float64(5001)}, cx), "pooler_max_client_conn")
+	for _, body := range []map[string]any{{"default_pool_size": float64(50), "max_client_conn": float64(5000)}, {"default_pool_size": nil, "max_client_conn": nil}} {
+		if err := patchWith(m, Pooler, body, cx); err != nil {
+			t.Errorf("%v: %v", body, err)
+		}
+	}
+	// Small database, small ceiling: the shipped defaults (15 and 1000) are never refused.
+	tiny := CrossContext{MaxConnections: 20, PoolerMaxClients: 100}
+	if err := patchWith(m, Pooler, map[string]any{"default_pool_size": float64(15), "max_client_conn": float64(1000)}, tiny); err != nil {
+		t.Error(err)
+	}
+	wantInvalidWith(t, patchWith(m, Pooler, map[string]any{"default_pool_size": float64(16)}, tiny), "at most 15")
+	if err := patchWith(m, Pooler, map[string]any{"default_pool_size": float64(4950), "max_client_conn": float64(54000)}, CrossContext{}); err != nil {
+		t.Errorf("no known limit: %v", err)
+	}
+}
+
 // A line break cannot be carried by a unit's environment: the save is refused, so a resume
 // never fails on it.
 func TestEnvSettingsRefuseLineBreaks(t *testing.T) {

@@ -79,6 +79,11 @@ type Schema struct {
 type CrossContext struct {
 	// MemoryLimit is the project's memory limit in bytes (0: unknown).
 	MemoryLimit int64
+	// MaxConnections is the project's max_connections, saved or the class's (0: unknown).
+	MaxConnections int64
+	// PoolerMaxClients is the most client connections the node lets one project's pooler tenant
+	// hold ([fleet] pooler_max_client_conn; 0: no ceiling).
+	PoolerMaxClients int64
 }
 
 // NewSchema indexes fields. It panics on a duplicate name.

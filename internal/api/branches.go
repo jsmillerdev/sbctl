@@ -406,6 +406,23 @@ func (s *Server) branchAction(op string) handlerFunc {
 		// The Management API has no force flag; the query parameter is ours.
 		ai.Force = r.URL.Query().Get("force") == "true"
 		id := r.PathValue("branch_id_or_ref")
+		if op == "reset" {
+			// A reset clones the parent's current data again into a branch that has data: the same
+			// copy of production that creating it needs the Owner or Administrator role for.
+			b, err := s.branches.Resolve(r.Context(), id)
+			if err != nil {
+				return mapBranchErr(err)
+			}
+			if b.WithData {
+				p, err := s.branchParent(r.Context(), id)
+				if err != nil {
+					return err
+				}
+				if err := s.requireBranchData(r, p); err != nil {
+					return err
+				}
+			}
+		}
 		var run string
 		switch op {
 		case "merge":

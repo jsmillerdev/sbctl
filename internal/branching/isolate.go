@@ -187,7 +187,10 @@ type IsolateResult struct {
 	AuthTablesNotReviewed []string         `json:"auth_tables_not_reviewed,omitempty"`
 	// StorageRowsDeleted counts the rows removed, per table, from the parent's Storage object
 	// metadata (isolate_storage.go): a branch has none of the parent's objects, only its buckets.
+	// StorageWipeSkipped says, per database, why the wipe did not run there: a table of the
+	// project has a foreign key into the object metadata, with the constraint names.
 	StorageRowsDeleted map[string]int64 `json:"storage_rows_deleted,omitempty"`
+	StorageWipeSkipped []string         `json:"storage_wipe_skipped,omitempty"`
 	// DatabasesOpened names databases that refuse connections (datallowconn = false) and that
 	// isolation opened for its own session and closed again.
 	DatabasesOpened []string `json:"databases_opened,omitempty"`

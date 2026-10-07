@@ -406,3 +406,53 @@ func TestBranchWithDataNeedsOwnerOrAdministrator(t *testing.T) {
 		}
 	}
 }
+
+// A reset clones the parent's current data again into a branch that has data, so it needs the same
+// role as creating one: a Developer, who could otherwise pull a fresh copy of production into a
+// branch an Owner made, is refused. Resetting a schema-only branch stays open to Developers.
+func TestResetOfBranchWithDataNeedsOwnerOrAdministrator(t *testing.T) {
+	rf := newRolesFixture(t)
+	mk := func(name string, withData bool) string {
+		rec := rf.status(201, "owner", "POST", "/v1/projects/"+testRef+"/branches", map[string]any{"branch_name": name})
+		b := decodeBody(t, rec).(map[string]any)
+		rf.waitBranch(t, name, "MIGRATIONS_PASSED")
+		if withData {
+			// The fixture's node cannot clone data, so a branch that was created without it is
+			// marked as having it: what the reset route looks at is the registry row.
+			ref := b["project_ref"].(string)
+			p, err := rf.reg.GetProject(context.Background(), ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nb := *p.Branch
+			nb.WithData = true
+			if err := rf.reg.UpdateBranch(context.Background(), ref, &nb); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b["id"].(string)
+	}
+	data, plain := mk("data", true), mk("plain", false)
+	for _, role := range []string{"dev", "ro", "scoped"} {
+		rec := rf.as(role, "POST", "/v1/branches/"+data+"/reset", map[string]any{})
+		if rec.Code != 403 {
+			t.Fatalf("%s: reset of a branch with data answered %d %s, want 403", role, rec.Code, rec.Body)
+		}
+		// Read-only is already refused by the route's own rule; the others reach this check.
+		if msg, _ := jsonField(t, rec, "message").(string); !strings.HasPrefix(msg, "Your role does not allow this action") || (role != "ro" && !strings.Contains(msg, "Owner or Administrator")) {
+			t.Errorf("%s: message %q", role, msg)
+		}
+	}
+	// The schema-only branch resets for the Developer, the project-scoped one included.
+	for _, role := range []string{"dev", "scoped"} {
+		rf.status(201, role, "POST", "/v1/branches/"+plain+"/reset", map[string]any{})
+		rf.waitBranch(t, "plain", "MIGRATIONS_PASSED")
+	}
+	// Owner and Administrator pass the check. The reset itself then needs a node that can clone,
+	// which the fixture is not, so only the absence of a 403 is asserted.
+	for _, role := range []string{"owner", "admin"} {
+		if rec := rf.as(role, "POST", "/v1/branches/"+data+"/reset", map[string]any{}); rec.Code == 403 {
+			t.Errorf("%s: reset of a branch with data refused: %s", role, rec.Body)
+		}
+	}
+}

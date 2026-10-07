@@ -193,6 +193,7 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 	// Storage's protect_delete and fails any DELETE that does not suppress triggers.
 	must(`create schema if not exists storage`)
 	must(`create table if not exists storage.buckets (id text primary key, name text not null)`)
+	must(`create table if not exists storage.migrations (id int primary key, name text)`) // the marker the wipe looks for
 	must(`create table if not exists storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text references storage.buckets(id), name text)`)
 	must(`create or replace function public.test_protect_delete() returns trigger language plpgsql as $f$ begin raise exception 'Direct deletion from storage tables is not allowed'; end $f$`)
 	must(`drop trigger if exists test_protect_delete on storage.objects`)
@@ -518,5 +519,32 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 		if err := admin.QueryRow(ctx, `select command from cron.job where jobname = 'dblink-job'`).Scan(&cmd); err != nil || !strings.Contains(cmd, otherKeys.DBPassword) {
 			t.Errorf("the parent's cron command changed: %q %v", cmd, err)
 		}
+	}
+
+	// A table of the user's with a foreign key into storage.objects: the wipe would leave rows that
+	// point at nothing, so it is skipped (with the reason recorded) and the branch is still created.
+	must(`create table public.user_avatars (id int primary key, object_id uuid references storage.objects(id))`)
+	must(`insert into public.user_avatars select 1, id from storage.objects order by name limit 1`)
+	fk := st.createBranch(pref, "storage-fk", func(in *CreateInput) { in.WithData = true })
+	fkConn := st.conn(fk.Ref, lifecycle.RoleAdmin)
+	var objects, avatars int
+	if err := fkConn.QueryRow(ctx, `select (select count(*) from storage.objects), (select count(*) from public.user_avatars)`).Scan(&objects, &avatars); err != nil || objects != 2 || avatars != 1 {
+		t.Errorf("branch %s: storage.objects has %d rows and user_avatars %d (%v), want the parent's 2 and 1 (the wipe is skipped)", fk.Name, objects, avatars, err)
+	}
+	var skipped bool
+	fkEvs, _ := st.node.Registry.ListEvents(ctx, fk.Ref, 50)
+	for _, e := range fkEvs {
+		if e.Kind != "branch.isolated" {
+			continue
+		}
+		var res IsolateResult
+		if err := json.Unmarshal(e.Payload, &res); err != nil {
+			t.Fatal(err)
+		}
+		skipped = len(res.StorageWipeSkipped) == 1 && strings.Contains(res.StorageWipeSkipped[0], "user_avatars_object_id_fkey") &&
+			strings.Contains(res.StorageWipeSkipped[0], "public.user_avatars -> storage.objects") && len(res.StorageRowsDeleted) == 0
+	}
+	if !skipped {
+		t.Errorf("branch %s: the isolation event does not say that the Storage wipe was skipped: %v", fk.Name, fkEvs)
 	}
 }

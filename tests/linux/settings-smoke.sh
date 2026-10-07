@@ -255,6 +255,8 @@ POOLER=$(api GET "$CFG/config/database/pooler")
 pooler_login "$DBPW" || fail "pooler login after the tenant was updated"
 must 400 PATCH "$CFG/config/database/pooler" '{"pool_mode":"session"}'
 must 400 PATCH "$CFG/config/database/pooler" '{"default_pool_size":0}'
+must 400 PATCH "$CFG/config/database/pooler" '{"default_pool_size":3000}'  # more than the project's max_connections can serve
+must 400 PATCH "$CFG/config/database/pooler" '{"max_client_conn":50000}'   # above the node's per-project ceiling
 [[ $(pool_row) == "7,321,7" ]] || fail "a refused pooler save changed Supavisor's tenant (got '$(pool_row)')"
 must 200 PATCH "$CFG/config/database/pooler" '{"default_pool_size":null,"max_client_conn":null}'
 [[ $(pool_row) == "15,1000,15" ]] || fail "Supavisor's tenant did not return to the defaults (got '$(pool_row)')"

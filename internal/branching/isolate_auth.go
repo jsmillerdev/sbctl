@@ -186,34 +186,44 @@ func appendUnique(l []string, s string) []string {
 	return append(l, s)
 }
 
-// checkWipeClosure fails when a table that is kept has a foreign key into a wiped table of
+// wipeFK is a foreign key from a table that is kept into a table that is wiped.
+type wipeFK struct{ Constraint, From, To string }
+
+func (f wipeFK) String() string { return fmt.Sprintf("%s (%s -> %s)", f.Constraint, f.From, f.To) }
+
+// wipeClosureViolations lists the foreign keys from a table that is kept into a wiped table of
 // schema: with foreign-key actions suppressed, wiping the referenced table would leave dangling rows.
-func checkWipeClosure(ctx context.Context, tx pgx.Tx, schema string, wiped []string) error {
+func wipeClosureViolations(ctx context.Context, tx pgx.Tx, schema string, wiped []string) ([]wipeFK, error) {
 	rows, err := tx.Query(ctx, `
-		select con.conname, src.relname, dst.relname
+		select con.conname, src.relnamespace::regnamespace::text || '.' || src.relname, dst.relnamespace::regnamespace::text || '.' || dst.relname
 		from pg_constraint con
 		join pg_class src on src.oid = con.conrelid
 		join pg_class dst on dst.oid = con.confrelid
 		where con.contype = 'f'
 		  and dst.relnamespace = $2::text::regnamespace
 		  and dst.relname = any($1)
-		  and not (src.relnamespace = $2::text::regnamespace and src.relname = any($1))`, wiped, schema)
+		  and not (src.relnamespace = $2::text::regnamespace and src.relname = any($1))
+		order by 1, 2`, wiped, schema)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	type fk struct{ name, from, to string }
-	bad, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (fk, error) {
-		var f fk
-		err := r.Scan(&f.name, &f.from, &f.to)
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (wipeFK, error) {
+		var f wipeFK
+		err := r.Scan(&f.Constraint, &f.From, &f.To)
 		return f, err
 	})
+}
+
+// checkWipeClosure fails when wipeClosureViolations finds any.
+func checkWipeClosure(ctx context.Context, tx pgx.Tx, schema string, wiped []string) error {
+	bad, err := wipeClosureViolations(ctx, tx, schema, wiped)
 	if err != nil {
 		return err
 	}
 	if len(bad) > 0 {
 		var l []string
 		for _, f := range bad {
-			l = append(l, fmt.Sprintf("%s (%s -> %s.%s)", f.name, f.from, schema, f.to))
+			l = append(l, f.String())
 		}
 		return fmt.Errorf("a kept table references a wiped table, so the wipe would leave dangling rows: %s", strings.Join(l, ", "))
 	}

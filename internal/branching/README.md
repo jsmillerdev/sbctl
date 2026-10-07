@@ -113,7 +113,8 @@ migration history (the SQL editor, `execute_sql`) are not in a schema-only branc
 > meant for trusted users and agents. See "What a branch with data can and cannot reach".
 >
 > Creating a `with_data` branch through the Management API needs the Owner or Administrator role (also
-> when the role is scoped to the parent project); Developers keep creating schema-only branches. The API
+> when the role is scoped to the parent project), and so does resetting one (a reset clones the parent's
+> current data again); Developers keep creating and resetting schema-only branches. The API
 > answers 403 with the usual role-denial body. `sbctl branches create` runs on the node as its operator
 > and is not checked.
 
@@ -124,7 +125,7 @@ migration history (the SQL editor, `execute_sql`) are not in a schema-only branc
 | Database schema and migration history | the parent's `supabase_migrations` history, replayed, then the seed | everything in the parent's database |
 | Rows | none, except what the migrations and the seed insert | all of them (auth users and identities included; their sessions and one-time tokens are removed) |
 | Storage buckets | those the migrations create | the parent's buckets, with their settings and policies |
-| Storage objects | none | none: the rows of `storage.objects` (and `storage.prefixes`, `storage.s3_multipart_uploads*`) are removed from the clone; the files stay with the parent |
+| Storage objects | none | none: the rows of `storage.objects` (and `storage.prefixes`, `storage.s3_multipart_uploads*`) are removed from the clone; the files stay with the parent. Exception: when a table of yours has a foreign key into one of them, the rows stay (see below) |
 | Edge Functions | none | none |
 | Function secrets | none | none |
 | API keys, JWT secret, database password | the branch's own | the branch's own (the parent's are replaced everywhere sbctl finds them) |
@@ -138,6 +139,15 @@ with the parent and nothing is copied half way:
   would answer 404. Isolation therefore empties the object metadata tables of a branch with data (counts in
   the `branch.isolated` event, `storage_rows_deleted`; user triggers do not fire, Storage's `protect_delete`
   included) and leaves the buckets. Upload what the branch needs to the branch, or script it from the parent.
+  Isolation acts only in a database that has Storage's own tables (`storage.buckets`, `storage.objects` and
+  `storage.migrations`). **Exception:** if a table outside Storage has a foreign key into one of the emptied
+  tables (an `avatar_id uuid references storage.objects(id)` column, say), emptying them would leave rows
+  that point at nothing, and changing your tables is not isolation's job. The wipe is then skipped in that
+  database, as a whole so that the folder tree and the objects stay consistent, and the branch is created
+  anyway: it lists the parent's objects and they answer 404 until you remove or re-upload them. The
+  `branch.isolated` event names the database and the constraints (`storage_wipe_skipped`), and
+  `storage_rows_deleted` is absent. Drop the foreign key (or make it a plain column) in the parent to get the
+  empty object tables.
 - **Edge Functions.** A function exists on a project once someone deploys it: `supabase functions deploy
   --project-ref <branch ref>`, or the Management API on the branch's ref. Branch create, `reset` and `push`
   never read the parent's deployments, and `merge` does not carry the branch's functions to the parent (the

@@ -140,7 +140,7 @@ func TestPoolerConfigRollsBackWhenTheTenantRefuses(t *testing.T) {
 		}
 		return nil
 	}
-	rec := f.do("PATCH", v1, map[string]any{"default_pool_size": 99})
+	rec := f.do("PATCH", v1, map[string]any{"default_pool_size": 45})
 	if rec.Code < 500 {
 		t.Fatalf("a refused apply answered %d %s", rec.Code, rec.Body)
 	}
@@ -166,4 +166,38 @@ func TestPoolerConfigOnAProjectThatIsNotRunning(t *testing.T) {
 	}
 	f.mustDo("PATCH", v1, map[string]any{"default_pool_size": 30}, 200)
 	f.mustDo("PATCH", "/v1/projects/zzzzzzzzzzzzzzzzzzzz/config/database/pooler", map[string]any{"default_pool_size": 30}, 404)
+}
+
+// The pool cannot be larger than the project's database can serve, and one project cannot claim
+// more client connections than the node allows it: a request above either is refused with the
+// usual 400 body. The default class has max_connections 60 and keeps 10 of them back.
+func TestPoolerConfigIsBoundedByTheProjectAndTheNode(t *testing.T) {
+	f := newFixture(t)
+	const v1 = "/v1/projects/" + testRef + "/config/database/pooler"
+	const pgb = "/platform/projects/" + testRef + "/config/pgbouncer"
+	refused := func(path string, body map[string]any, want string) {
+		t.Helper()
+		msg, _ := bodyMap(t, f.mustDo("PATCH", path, body, 400))["message"].(string)
+		if !strings.Contains(msg, want) {
+			t.Errorf("PATCH %s %v: message %q does not name %q", path, body, msg, want)
+		}
+	}
+	refused(v1, map[string]any{"default_pool_size": 51}, "max_connections is 60")
+	refused(pgb, map[string]any{"default_pool_size": 3000}, "at most 50")
+	f.mustDo("PATCH", v1, map[string]any{"default_pool_size": 50}, 200)
+	// The project's own max_connections, once saved, is what counts.
+	f.mustDo("PUT", "/v1/projects/"+testRef+"/config/database/postgres", map[string]any{"max_connections": 200}, 200)
+	f.mustDo("PATCH", v1, map[string]any{"default_pool_size": 190}, 200)
+	refused(v1, map[string]any{"default_pool_size": 191}, "max_connections is 200")
+
+	// Client connections: the node's ceiling ([fleet] pooler_max_client_conn, 5000 unless set).
+	refused(pgb, map[string]any{"max_client_conn": 5001}, "pooler_max_client_conn")
+	f.mustDo("PATCH", pgb, map[string]any{"max_client_conn": 5000}, 200)
+	f.cfg.Fleet.PoolerMaxClientConn = 2000
+	refused(pgb, map[string]any{"max_client_conn": 2001}, "at most 2000")
+	f.mustDo("PATCH", pgb, map[string]any{"max_client_conn": 2000}, 200)
+	// A ceiling below Supavisor's own default does not stop a client from saving that default back.
+	f.cfg.Fleet.PoolerMaxClientConn = 500
+	f.mustDo("PATCH", pgb, map[string]any{"max_client_conn": 1000}, 200)
+	refused(pgb, map[string]any{"max_client_conn": 1001}, "at most 1000")
 }

@@ -171,6 +171,13 @@ func init() {
 	PostgresSchema.Cross = postgresCross
 }
 
+// minWorkerProcesses is cron.max_running_jobs (8, internal/lifecycle) plus the two workers of
+// pg_cron's launcher and pg_net. The project renders max_worker_processes=16 unless one is saved.
+const minWorkerProcesses = 10
+
+// defaultWorkerProcesses is what the project runs with when nothing is saved (cronSettings).
+const defaultWorkerProcesses = 16
+
 // postgresCross rejects combinations that would starve the project's own services or
 // exceed what its memory limit allows. memory limit is only known to the caller.
 func postgresCross(eff, _ Values, cx CrossContext) error {
@@ -192,8 +199,11 @@ func postgresCross(eff, _ Values, cx CrossContext) error {
 	if n, ok := eff.Int("max_replication_slots"); ok && n < 2 {
 		return invalid("max_replication_slots must be at least 2: Realtime and base backups use slots")
 	}
-	if n, ok := eff.Int("max_worker_processes"); ok && n < 4 {
-		return invalid("max_worker_processes must be at least 4")
+	if n, ok := eff.Int("max_worker_processes"); ok && n < minWorkerProcesses {
+		// pg_cron runs its jobs in background workers (internal/lifecycle cronSettings): its launcher
+		// and pg_net's worker hold two slots, and each running job one of the rest, up to
+		// cron.max_running_jobs (8). With fewer, a job that starts while others run fails to get a worker.
+		return invalid("max_worker_processes must be at least %d: pg_cron runs its jobs in background workers (up to 8 at a time, plus two for pg_cron's launcher and pg_net's worker)", minWorkerProcesses)
 	}
 	if mc, ok := eff.Int("max_connections"); ok {
 		if n, ok := eff.Int("max_wal_senders"); ok && n > mc {
@@ -243,9 +253,9 @@ func postmasterMemory(eff Values, cx CrossContext) error {
 		return def
 	}
 	// Postgres' defaults stand in for settings that were not saved (the class's sizing is
-	// not known here and is smaller).
+	// not known here and is smaller; the worker count is what the project renders).
 	conns := intOr("max_connections", 100)
-	workers := intOr("max_worker_processes", 8)
+	workers := intOr("max_worker_processes", defaultWorkerProcesses)
 	senders := intOr("max_wal_senders", 10)
 	backends := conns + workers + senders + 3 /* autovacuum workers */ + 1
 	if backends > 0x3FFFF {
