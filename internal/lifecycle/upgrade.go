@@ -171,6 +171,11 @@ type UpgradeRequest struct {
 	// TargetVersion is the version the caller asked for ("17", an app version); it is kept in
 	// the upgrade's status as it was written.
 	TargetVersion string
+	// AllowOlder lets the target be older than what the project runs. It is for putting a
+	// project back on the releases it ran before the upgrade of a node that is being rolled
+	// back (`supavise rollback`); every other caller leaves it false, and a project is never
+	// moved to an older release by accident.
+	AllowOlder bool
 }
 
 // ProjectUpgrader is the optional Manager capability behind the Management API's upgrade
@@ -217,15 +222,22 @@ const (
 
 // UpgradeEligibility implements ProjectUpgrader: whether ref can move to the node's pins.
 func (e *Engine) UpgradeEligibility(ctx context.Context, ref string) (*UpgradeEligibility, error) {
+	return e.UpgradeEligibilityFor(ctx, ref, UpgradeRequest{})
+}
+
+// UpgradeEligibilityFor is UpgradeEligibility for the target a request names (nil Target: the
+// node's pins). `supavise upgrade` plans with the services it moves.
+func (e *Engine) UpgradeEligibilityFor(ctx context.Context, ref string, req UpgradeRequest) (*UpgradeEligibility, error) {
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
-	return e.plan(ctx, p, nil)
+	return e.plan(ctx, p, req.Target, req.AllowOlder)
 }
 
-// plan computes the eligibility of p for target (nil: the node's pins).
-func (e *Engine) plan(ctx context.Context, p *registry.Project, target map[string]string) (*UpgradeEligibility, error) {
+// plan computes the eligibility of p for target (nil: the node's pins). allowOlder lifts the
+// refusal of a target older than what p runs.
+func (e *Engine) plan(ctx context.Context, p *registry.Project, target map[string]string, allowOlder bool) (*UpgradeEligibility, error) {
 	node, err := e.versions()
 	if err != nil {
 		return nil, err
@@ -258,6 +270,7 @@ func (e *Engine) plan(ctx context.Context, p *registry.Project, target map[strin
 		case c.From == "":
 		case err != nil:
 			block(BlockerNoUpgradePath, "cannot tell whether %s %s -> %s is an upgrade: %v", c.Service, ShortVersion(c.Service, c.From), ShortVersion(c.Service, c.To), err)
+		case cmp > 0 && allowOlder:
 		case cmp > 0:
 			el.Ahead = append(el.Ahead, c)
 			block(BlockerNoUpgradePath, "the project runs %s %s, which is newer than %s; it stays on its versions until the node pins newer ones", c.Service, ShortVersion(c.Service, c.From), ShortVersion(c.Service, c.To))
@@ -349,7 +362,7 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 	if p.Status != registry.StatusActiveHealthy {
 		return nil, invalidState(p, "upgrade")
 	}
-	el, err := e.plan(ctx, p, req.Target)
+	el, err := e.plan(ctx, p, req.Target, req.AllowOlder)
 	if err != nil {
 		return nil, err
 	}
@@ -450,7 +463,12 @@ func (e *Engine) runnerLive(ctx context.Context, ref string) bool {
 // UpgradeProject upgrades ref to the target versions (nil: the node's pins) and returns when it
 // is done: BeginUpgrade, then Run. The returned upgrade is the final state, also on failure.
 func (e *Engine) UpgradeProject(ctx context.Context, ref string, target map[string]string) (*registry.Upgrade, error) {
-	run, err := e.BeginUpgrade(ctx, ref, UpgradeRequest{Target: target})
+	return e.UpgradeProjectWith(ctx, ref, UpgradeRequest{Target: target})
+}
+
+// UpgradeProjectWith is UpgradeProject for a whole request.
+func (e *Engine) UpgradeProjectWith(ctx context.Context, ref string, req UpgradeRequest) (*registry.Upgrade, error) {
+	run, err := e.BeginUpgrade(ctx, ref, req)
 	if err != nil {
 		return nil, err
 	}

@@ -27,7 +27,7 @@ under `<state_dir>/artifacts/<service>/<tag>/` (`config.Paths.Artifact`).
   kept). `Store.KeepSet` and `Store.GC` remove the unpacked artifacts that nothing needs: not the
   pins, not the newest recorded release (what the daemon last started with; the binary that runs GC
   may be newer than the daemon), not the last `[upgrade] keep_releases` releases of the history
-  (default 2: the current one and the previous one, so a rollback finds its artifacts), not any tag the caller names (the
+  (default 3: the current one and the two before, so a rollback finds its artifacts), not any tag the caller names (the
   lifecycle names every version a project runs or is being upgraded to). Directories that start
   with a dot (the archive cache, unpacking in progress) are never touched. Entry points:
   `supavise artifacts gc [--dry-run] [--keep N]` and, after a successful `supavise projects upgrade`,

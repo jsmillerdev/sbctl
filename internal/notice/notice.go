@@ -129,13 +129,19 @@ func ClearMaintenance(p config.Paths) (bool, error) {
 }
 
 // Upgrade is the marker the upgrade writes to <state_dir>/system/upgrade.json: the phase it is
-// in, the versions it moves between and when it began. The upgrade removes the file when it
-// ends, or leaves a terminal Phase in it.
+// in, the versions it moves between and when it began. The upgrade leaves a terminal Phase in the
+// file when it ends ("done", "rolled_back", "failed"), so that `supavise status` can say how the
+// last one went.
 type Upgrade struct {
 	Phase     string    `json:"phase"`
 	From      string    `json:"from"`
 	To        string    `json:"to"`
 	StartedAt time.Time `json:"started_at"`
+	// PID is the process that runs the upgrade; another `supavise upgrade` refuses to start while
+	// it is alive. Zero when unknown.
+	PID int `json:"pid,omitempty"`
+	// Detail says what the phase is doing now ("Realtime"), for `supavise status`.
+	Detail string `json:"detail,omitempty"`
 	// Heartbeat is the file's modification time, set by ReadUpgrade and not stored in the file.
 	// A marker without started_at is dated by it.
 	Heartbeat time.Time `json:"-"`
@@ -159,6 +165,24 @@ func (u Upgrade) Running(now time.Time) bool {
 		alive = u.Heartbeat
 	}
 	return !alive.IsZero() && now.Sub(alive) < staleUpgrade
+}
+
+// WriteUpgrade replaces the upgrade marker. The upgrade calls it at each phase change, which also
+// keeps the marker alive (Running counts the file's modification time).
+func WriteUpgrade(p config.Paths, u Upgrade) error {
+	return writeJSON(file(p, upgradeFile), u)
+}
+
+// ClearUpgrade removes the upgrade marker; it reports whether there was one.
+func ClearUpgrade(p config.Paths) (bool, error) {
+	err := os.Remove(file(p, upgradeFile))
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	}
+	return false, err
 }
 
 // ReadUpgrade returns the upgrade marker, or nil when there is none. It is tolerant: the file

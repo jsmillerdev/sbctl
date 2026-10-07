@@ -5,7 +5,12 @@
 #
 # DIST_DIR holds supavise-linux-amd64, supavise-linux-arm64 and any supavise-studio-*-linux-*.tar.zst.
 # The script writes into DIST_DIR:
-#   SHA256SUMS       sha256sum of every file above
+#   release.json     the release manifest {"version": "v1.4.0", "min_upgrade_from": "v1.2.0"}, which
+#                    `supavise upgrade` and `supavise self-update` read after the signature is checked.
+#                    "version" is SUPAVISE_RELEASE_TAG (omitted when unset); "min_upgrade_from" is
+#                    SUPAVISE_MIN_UPGRADE_FROM, the oldest release that may install this one directly
+#                    (omitted when unset: no limit). The release workflow sets both.
+#   SHA256SUMS       sha256sum of every file above and of release.json
 #   SHA256SUMS.sig   raw ed25519 signature of SHA256SUMS (what install.sh and `supavise self-update` verify)
 #   install.sh       deploy/install.sh with the public key stamped in
 #   supavise.yaml       the CloudFormation template; with SUPAVISE_RELEASE_TAG set (v1.2.3), its
@@ -32,7 +37,19 @@ cd "$dist"
 for f in supavise-linux-amd64 supavise-linux-arm64; do
   [[ -s $f ]] || { echo "missing $f in $dist" >&2; exit 1; }
 done
-files=(supavise-linux-amd64 supavise-linux-arm64)
+tag=${SUPAVISE_RELEASE_TAG:-}
+minfrom=${SUPAVISE_MIN_UPGRADE_FROM:-}
+vre='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+if [[ -n $tag && ! $tag =~ $vre ]]; then echo "SUPAVISE_RELEASE_TAG $tag is not vMAJOR.MINOR.PATCH[-suffix]" >&2; exit 1; fi
+if [[ -n $minfrom && ! $minfrom =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "SUPAVISE_MIN_UPGRADE_FROM $minfrom is not vMAJOR.MINOR.PATCH" >&2; exit 1; fi
+{
+  printf '{'
+  sep=''
+  if [[ -n $tag ]]; then printf '%s"version": "%s"' "$sep" "$tag"; sep=', '; fi
+  if [[ -n $minfrom ]]; then printf '%s"min_upgrade_from": "%s"' "$sep" "$minfrom"; fi
+  printf '}\n'
+} >release.json
+files=(supavise-linux-amd64 supavise-linux-arm64 release.json)
 for f in supavise-studio-*-linux-*.tar.zst; do [[ -e $f ]] && files+=("$f"); done
 sha256sum "${files[@]}" >SHA256SUMS
 openssl pkeyutl -sign -rawin -inkey "$priv" -in SHA256SUMS -out SHA256SUMS.sig
@@ -45,9 +62,7 @@ sed "s|__SUPAVISE_RELEASE_PUBKEY_B64__|$b64|" "$here/install.sh" >install.sh
 chmod 0755 install.sh
 if grep -q '__SUPAVISE_RELEASE_PUBKEY_B64__' install.sh; then echo "the key marker is still in install.sh" >&2; exit 1; fi
 cp "$here/cloudformation/supavise.yaml" supavise.yaml
-tag=${SUPAVISE_RELEASE_TAG:-}
 if [[ -n $tag ]]; then
-  [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "SUPAVISE_RELEASE_TAG $tag is not vMAJOR.MINOR.PATCH[-suffix]" >&2; exit 1; }
   # The SupaviseVersion parameter is the only place the template says "Default: latest".
   sed "s|^    Default: latest\$|    Default: $tag|" supavise.yaml >supavise.yaml.new && mv supavise.yaml.new supavise.yaml
   [[ $(grep -c "^    Default: $tag\$" supavise.yaml) -eq 1 ]] || { echo "could not stamp $tag into supavise.yaml" >&2; exit 1; }

@@ -28,6 +28,20 @@ type releaseServer struct {
 	sums, sig []byte
 	omit      map[string]bool
 	calls     map[string]int
+	// manifest, when set, is served as release.json; signed puts its checksum in the signed list.
+	manifest []byte
+	signed   bool
+}
+
+// withManifest serves body as release.json and, when signed, lists its checksum under the signature.
+func (r *releaseServer) withManifest(body string, signed bool) *releaseServer {
+	r.manifest, r.signed = []byte(body), signed
+	if signed {
+		sum := sha256.Sum256(r.manifest)
+		r.sums = append(r.sums, []byte(hex.EncodeToString(sum[:])+"  release.json\n")...)
+		r.sig = ed25519.Sign(r.priv, r.sums)
+	}
+	return r
 }
 
 func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
@@ -49,7 +63,11 @@ func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
 			return
 		}
 		assets := []map[string]string{}
-		for _, n := range []string{"SHA256SUMS", "SHA256SUMS.sig", "supavise-linux-amd64", "supavise-linux-arm64"} {
+		names := []string{"SHA256SUMS", "SHA256SUMS.sig", "supavise-linux-amd64", "supavise-linux-arm64"}
+		if r.manifest != nil {
+			names = append(names, "release.json")
+		}
+		for _, n := range names {
 			if !r.omit[n] {
 				assets = append(assets, map[string]string{"name": n, "browser_download_url": r.URL + "/dl/" + n})
 			}
@@ -66,6 +84,8 @@ func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
 			_, _ = w.Write(r.sig)
 		case "supavise-linux-amd64":
 			_, _ = w.Write(r.bin)
+		case "release.json":
+			_, _ = w.Write(r.manifest)
 		default:
 			http.NotFound(w, req)
 		}

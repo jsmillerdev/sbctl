@@ -427,6 +427,38 @@ func TestStartDatabaseAppliesChangedSettings(t *testing.T) {
 	}
 }
 
+// GoTrue and PostgREST keep the binary they started with unless the unit is stopped: a unit
+// whose rendered files changed (a release or a setting changed what it runs) restarts, one
+// that did not change is left alone, and a stopped one is only started.
+func TestStartAPIRestartsUnitsWhoseFilesChanged(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		state   units.State
+		changed bool
+		want    string
+	}{
+		{"running and changed", units.StateActive, true, "render stop start"},
+		{"running and unchanged", units.StateActive, false, "render start"},
+		{"stopped and changed", units.StateInactive, true, "render start"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.StateDir = shortTempDir(t)
+			cfg.Domain = "example.test"
+			cfg.BinPath = "/usr/local/bin/supavise"
+			sup := &recSup{state: tc.state, changed: tc.changed}
+			pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{ServiceReadyTimeout: time.Millisecond})
+			p := testProject(cfg, "abcdefghijklmnopqrst", 2)
+			// Nothing answers, so the wait after the first unit's Start fails; the order of the
+			// calls before it is what is checked.
+			_ = pl.startAPI(context.Background(), p, testKeys(t, p.Ref))
+			if got := strings.Join(sup.calls, " "); got != tc.want {
+				t.Fatalf("calls = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // Deleting a project also removes the bundler's unit instance of the project: the module
 // cache of its uploads is private to that unit and goes with it.
 type namedRemoveSup struct {

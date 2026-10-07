@@ -49,6 +49,10 @@ type Deps struct {
 	// Skip names services (config.Svc*) that Start leaves alone, for example config.SvcStudio
 	// on a node without a Studio artifact.
 	Skip []string
+	// HaltOnFailure makes Start stop at the first service that does not start, leaving the ones
+	// after it as they are. The daemon sets it while a node upgrade runs, so that a release
+	// whose Realtime does not come up does not also restart Storage.
+	HaltOnFailure bool
 	// ReadyTimeout bounds the wait for one service to answer after its unit started
 	// (default 3 minutes: Realtime and Supavisor run their migrations first).
 	ReadyTimeout time.Duration
@@ -263,6 +267,10 @@ func (m *Manager) Start(ctx context.Context) error {
 		if err != nil {
 			m.log.Error("fleet service did not start", "service", svc, "error", err)
 			errs = append(errs, fmt.Errorf("%s: %w", svc, err))
+			if m.d.HaltOnFailure {
+				m.log.Error("not starting the shared services after it while a node upgrade runs", "service", svc)
+				break
+			}
 		}
 	}
 	return errors.Join(errs...)

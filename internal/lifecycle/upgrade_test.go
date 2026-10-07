@@ -569,6 +569,44 @@ func TestUpgradeToAnExplicitTarget(t *testing.T) {
 	}
 }
 
+// `supavise rollback` puts the projects an upgrade moved back on the releases they ran before, which
+// is the one move to an older release that is allowed, and only when the request says so.
+func TestUpgradeAllowOlderPutsAProjectBack(t *testing.T) {
+	ctx := context.Background()
+	h := newUpHarness(t)
+	before := h.project(t).Versions
+	if _, err := h.e.UpgradeProject(ctx, h.ref, nil); err != nil {
+		t.Fatal(err)
+	}
+	back := map[string]string{config.SvcGoTrue: before[config.SvcGoTrue], config.SvcPostgREST: before[config.SvcPostgREST]}
+	if _, err := h.e.UpgradeProjectWith(ctx, h.ref, UpgradeRequest{Target: back}); !errors.Is(err, ErrUpgradeUnsupported) {
+		t.Fatalf("an older target without AllowOlder: %v", err)
+	}
+	el, err := h.e.UpgradeEligibilityFor(ctx, h.ref, UpgradeRequest{Target: back, AllowOlder: true})
+	if err != nil || !el.Eligible || len(el.Ahead) != 0 || len(el.Changes) != 2 {
+		t.Fatalf("eligibility for the way back = %+v, %v", el, err)
+	}
+	up, err := h.e.UpgradeProjectWith(ctx, h.ref, UpgradeRequest{Target: back, AllowOlder: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := h.project(t)
+	if p.Status != registry.StatusActiveHealthy || p.Versions[config.SvcGoTrue] != oldAuth || p.Versions[config.SvcPostgREST] != "postgrest-v12.0-r0" || p.Versions[config.SvcPostgres] != oldPG {
+		t.Fatalf("project = %s %v", p.Status, p.Versions)
+	}
+	if up.Status != registry.UpgradeDone || up.From[config.SvcGoTrue] != newAuth || up.To[config.SvcGoTrue] != oldAuth {
+		t.Fatalf("upgrade row = %+v", up)
+	}
+	// Tags that cannot be ordered stay refused even then.
+	if _, err := h.e.UpgradeEligibilityFor(ctx, h.ref, UpgradeRequest{Target: map[string]string{config.SvcGoTrue: "auth-nightly"}, AllowOlder: true}); err != nil {
+		t.Fatal(err)
+	}
+	el, _ = h.e.UpgradeEligibilityFor(ctx, h.ref, UpgradeRequest{Target: map[string]string{config.SvcGoTrue: "auth-nightly"}, AllowOlder: true})
+	if el.Eligible {
+		t.Fatalf("a tag that cannot be ordered was allowed: %+v", el)
+	}
+}
+
 // daemonOf is a second Engine over the harness's registry and plane: the daemon, next to the
 // CLI process whose Engine (h.e) runs an upgrade.
 func (h *upHarness) daemonOf() *Engine {
@@ -962,5 +1000,42 @@ func TestVersionHelpers(t *testing.T) {
 	d := DiffVersions(map[string]string{"postgres": "a", "gotrue": "b", "postgrest": "c"}, map[string]string{"gotrue": "b2", "postgrest": "c", "postgres": ""})
 	if len(d) != 1 || d[0] != (ServiceChange{Service: "gotrue", From: "b", To: "b2"}) {
 		t.Fatalf("diff = %+v", d)
+	}
+}
+
+// EnsureTenants registers the active projects with the shared services again, and only them: a
+// paused project's database is down, and an upgrading one is registered by its upgrade.
+func TestEnsureTenantsRegistersActiveProjectsOnly(t *testing.T) {
+	ctx := context.Background()
+	h := newUpHarness(t)
+	tn := h.e.opts.Fleet[0].(*fakeTenant)
+	p2, err := h.e.Create(ctx, CreateRequest{Name: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p3, err := h.e.Create(ctx, CreateRequest{Name: "third"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.reg.SetProjectStatus(ctx, p3.Ref, registry.StatusInactive); err != nil {
+		t.Fatal(err)
+	}
+	tn.mu.Lock()
+	tn.ensured = nil
+	tn.mu.Unlock()
+	if errs := h.e.EnsureTenants(ctx); len(errs) != 0 {
+		t.Fatalf("errors: %v", errs)
+	}
+	got := map[string]bool{}
+	for _, s := range tn.ensured {
+		got[s.Ref] = true
+	}
+	if !got[h.ref] || !got[p2.Ref] || got[p3.Ref] || len(got) != 2 {
+		t.Fatalf("registered %v, want the two active projects and not the paused one", got)
+	}
+	tn.err = errors.New("storage is down")
+	errs := h.e.EnsureTenants(ctx)
+	if len(errs) != 2 || errs[h.ref] == nil || errs[p2.Ref] == nil {
+		t.Fatalf("errors by ref = %v", errs)
 	}
 }

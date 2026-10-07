@@ -3,11 +3,14 @@ package registry
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -83,4 +86,39 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, stopBefore string) error {
 		}
 	}
 	return nil
+}
+
+// SchemaVersion is the name of the newest migration this binary embeds ("1190_custom_domains.sql"),
+// which is the registry schema it expects. Migrations only go forward, so a registry whose
+// AppliedSchema is newer than this was migrated by a newer binary.
+func SchemaVersion() string {
+	names, err := Migrations()
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+	return strings.TrimPrefix(names[len(names)-1], "migrations/")
+}
+
+// AppliedSchema returns the newest migration recorded in the registry database at dsn, without
+// applying any (Open would). It is "" for a registry that has none. `supavise upgrade` reads it to
+// see whether a binary can still run on the registry as it is.
+func AppliedSchema(ctx context.Context, dsn string) (string, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	var v *string
+	err = conn.QueryRow(ctx, `select max(version) from supavise.schema_migrations`).Scan(&v)
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.Code == "42P01" { // undefined_table: never migrated
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if v == nil {
+		return "", nil
+	}
+	return strings.TrimPrefix(*v, "migrations/"), nil
 }

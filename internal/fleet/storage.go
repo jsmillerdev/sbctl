@@ -35,6 +35,10 @@ type storageTenant struct {
 	base     string // admin API: http://127.0.0.1:<storage_admin>
 	adminKey string
 	fileSize int64
+	// release is the release tag of the Storage this node runs. It is part of the tenant's
+	// fingerprint: Storage migrates a tenant's database when the tenant is updated, so a
+	// new release has to send every tenant again.
+	release string
 	// adminPassword finds the supabase_storage_admin password of a project when the
 	// TenantSpec does not carry it.
 	adminPassword func(ctx context.Context, ref string) (string, error)
@@ -102,6 +106,7 @@ func (t *storageTenant) EnsureTenant(ctx context.Context, spec TenantSpec) error
 	if err != nil {
 		return err
 	}
+	fp = withRelease(fp, t.release)
 	got, err := t.cl.do(ctx, "GET", t.tenantURL(spec.Ref), t.headers(), nil)
 	if err != nil {
 		return err

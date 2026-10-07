@@ -21,6 +21,7 @@ import (
 	"github.com/jsmillerdev/supavise/internal/functions"
 	"github.com/jsmillerdev/supavise/internal/health"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/notice"
 	"github.com/jsmillerdev/supavise/internal/proxy"
 	"github.com/jsmillerdev/supavise/internal/registry"
 )
@@ -209,10 +210,33 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		return err
 	}
 	superviseStop(g, gctx, budget, edge.Run, drain, admin.Shutdown, log)
+	fleetUp := make(chan bool, 1)
+	projectsUp := make(chan struct{})
 	if cfg.Supervisor == config.SupervisorSystemd {
 		// Next to the projects: a shared service that takes minutes to answer (Realtime and
 		// Supavisor run migrations first) must not hold the projects back.
-		g.Go(func() error { startFleet(gctx, node, log); return nil })
+		g.Go(func() error { fleetUp <- startFleet(gctx, node, log); return nil })
+		// Once both are up, every project is registered with the shared services again. It is a
+		// no-op when nothing changed, and when a release moved Storage or Realtime it is what runs
+		// the new release's migrations in each project's database (they need the database, so the
+		// projects come first).
+		g.Go(func() error {
+			select {
+			case ok := <-fleetUp:
+				if !ok {
+					return nil
+				}
+			case <-gctx.Done():
+				return nil
+			}
+			select {
+			case <-projectsUp:
+			case <-gctx.Done():
+				return nil
+			}
+			ensureTenants(gctx, node, log)
+			return nil
+		})
 	}
 	g.Go(func() error {
 		_ = bsvc.Run(gctx) // expiry sweeper; returns when the daemon stops
@@ -230,6 +254,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	}
 	g.Go(func() error {
 		startProjects(gctx, node, recovered, backups(node), log)
+		close(projectsUp)
 		return nil
 	})
 	g.Go(func() error { settleUpgrades(gctx, node, log); return nil })
@@ -275,20 +300,37 @@ func superviseStop(g *errgroup.Group, gctx context.Context, budget time.Duration
 // Studio) at boot. Their units are not enabled for boot, like every unit of the
 // control plane's own: the daemon starts them, in order, once the registry is up, so a
 // reboot brings the whole node back from one enabled unit (supavise.service). Already
-// running services whose files are unchanged are left alone. The installer renders and
-// first starts them (`supavise fleet start`); a service whose artifact was never fetched
-// fails here and is logged, and the rest of the node still comes up.
-func startFleet(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+// running services whose files are unchanged are left alone, and one whose files changed
+// (a release moved its pin) is restarted, one at a time, each waited for. The installer renders
+// and first starts them (`supavise fleet start`); a service whose artifact was never fetched
+// fails here and is logged, and the rest of the node still comes up. While a `supavise upgrade`
+// runs, the first failure ends the roll instead, so that the upgrade, which watches the
+// services, rolls back with the later ones still on the old release. It reports whether every
+// service started.
+func startFleet(ctx context.Context, n *lifecycle.Node, log *slog.Logger) bool {
 	// fleet.Setup generates the services' sealed secrets on first use, renders and starts
 	// the units in order, and waits for each. Its tenants are not used here: the Engine's
 	// own Fleet (a Lazy over the same Setup) registers projects.
+	_, upgrading := notice.UpgradeRunning(n.Cfg.Paths(), time.Now())
 	_, err := fleet.Setup(ctx, fleet.Deps{Cfg: n.Cfg, Log: log.With("component", "fleet"), Registry: n.Registry,
-		Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts, Start: true})
+		Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts, Start: true, HaltOnFailure: upgrading})
 	if err != nil {
 		log.Error("shared services did not all start", "error", err)
-		return
+		return false
 	}
 	log.Info("shared services started")
+	return true
+}
+
+// ensureTenants registers the active projects with the shared services again (see
+// lifecycle.Engine.EnsureTenants). A failure is logged: `supavise status` reports a project
+// whose tenant is missing, and the next change to the project registers it.
+func ensureTenants(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+	errs := n.Engine.EnsureTenants(ctx)
+	for ref, err := range errs {
+		log.Warn("project not registered with the shared services", "ref", ref, "error", err)
+	}
+	log.Info("projects registered with the shared services", "failed", len(errs))
 }
 
 // startProjects brings the system project's backup timer and every active project up

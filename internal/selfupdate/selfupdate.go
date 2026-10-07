@@ -72,6 +72,7 @@ const (
 	SigAsset     = "SHA256SUMS.sig"
 	maxSumsBytes = 1 << 20
 	maxBinary    = 300 << 20
+	maxManifest  = 64 << 10
 )
 
 // BinaryAsset is the asset name of the supavise binary for a platform such as "linux-amd64".
@@ -98,6 +99,9 @@ type Options struct {
 	Force bool
 	// Out receives progress lines; nil discards them.
 	Out io.Writer
+	// StageDir is where Stage writes the downloaded binary; empty means the directory of
+	// ExecPath.
+	StageDir string
 	// Probe runs the downloaded binary to check that it starts and returns what it
 	// prints for --version; nil means run it with --version. Tests replace it.
 	Probe func(ctx context.Context, path string) (string, error)
@@ -233,12 +237,9 @@ type Result struct {
 
 // Update installs the selected release over ExecPath, or reports that it is current.
 func Update(ctx context.Context, o Options) (*Result, error) {
-	key := o.Key
-	if key == nil {
-		var err error
-		if key, err = EmbeddedKey(); err != nil {
-			return nil, err
-		}
+	key, err := o.key()
+	if err != nil {
+		return nil, err
 	}
 	if o.Platform == "" {
 		return nil, errors.New("selfupdate: Options.Platform is required")
@@ -256,6 +257,56 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 		o.say("already running %s", o.Current)
 		return &Result{Tag: rel.Tag}, nil
 	}
+	res, err := o.verify(ctx, key, rel)
+	if err != nil {
+		return nil, err
+	}
+	st, err := res.Stage(ctx, o)
+	if err != nil {
+		return nil, err
+	}
+	return st.Install()
+}
+
+func (o *Options) key() (ed25519.PublicKey, error) {
+	if o.Key != nil {
+		return o.Key, nil
+	}
+	return EmbeddedKey()
+}
+
+// Resolved is a release whose checksum list has been verified against the key: everything
+// listed in it can be trusted, the binary and the manifest included.
+type Resolved struct {
+	Release *Release
+	// Sums is the signed checksum list.
+	Sums []byte
+	// Manifest is the release's signed manifest, or nil when it ships none.
+	Manifest *Manifest
+	platform string
+}
+
+// Resolve fetches the release o selects, verifies the signature of its checksum list, reads its
+// manifest and refuses it when its manifest says Current may not install it (a jump that skips
+// a release the manifest requires, or a manifest of another version). It downloads no binary and
+// changes nothing; `supavise upgrade --check` and the plan use it. Unlike Update it does not
+// stop when the release is not newer: the caller decides what that means.
+func Resolve(ctx context.Context, o Options) (*Resolved, error) {
+	key, err := o.key()
+	if err != nil {
+		return nil, err
+	}
+	if o.Platform == "" {
+		return nil, errors.New("selfupdate: Options.Platform is required")
+	}
+	rel, err := Latest(ctx, o)
+	if err != nil {
+		return nil, err
+	}
+	return o.verify(ctx, key, rel)
+}
+
+func (o *Options) verify(ctx context.Context, key ed25519.PublicKey, rel *Release) (*Resolved, error) {
 	asset := BinaryAsset(o.Platform)
 	for _, need := range []string{SumsAsset, SigAsset, asset} {
 		if rel.Assets[need] == "" {
@@ -273,12 +324,77 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 	if err := VerifySums(key, sums, sig); err != nil {
 		return nil, err
 	}
-	want, err := ChecksumFor(sums, asset)
-	if err != nil {
+	if _, err := ChecksumFor(sums, asset); err != nil {
 		return nil, fmt.Errorf("release %s: %w", rel.Tag, err)
 	}
-	o.say("signature verified; downloading %s", asset)
+	res := &Resolved{Release: rel, Sums: sums, platform: o.Platform}
+	if url := rel.Assets[ManifestAsset]; url != "" {
+		want, err := ChecksumFor(sums, ManifestAsset)
+		if err != nil {
+			// An asset the signature does not cover could say anything, including that every
+			// old version may jump to it.
+			return nil, fmt.Errorf("release %s ships %s, but the signed checksum list does not cover it: refusing to trust it", rel.Tag, ManifestAsset)
+		}
+		body, err := o.fetch(ctx, url, maxManifest)
+		if err != nil {
+			return nil, fmt.Errorf("download %s: %w", ManifestAsset, err)
+		}
+		if got := sha256.Sum256(body); hex.EncodeToString(got[:]) != want {
+			return nil, fmt.Errorf("%s does not match its checksum in the signed list", ManifestAsset)
+		}
+		if res.Manifest, err = ParseManifest(body); err != nil {
+			return nil, fmt.Errorf("release %s: %w", rel.Tag, err)
+		}
+		if err := res.Manifest.Check(rel.Tag, o.Current); err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
+}
 
+// Studio returns the dashboard build the release ships for its platform, as the signed list
+// names it: the asset name, its download URL and its SHA-256. ok is false when there is none.
+func (r *Resolved) Studio() (name, url, sha string, ok bool) {
+	suffix := "-" + r.platform + ".tar.zst"
+	sc := bufio.NewScanner(bytes.NewReader(r.Sums))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) != 2 || len(f[0]) != 64 {
+			continue
+		}
+		n := strings.TrimPrefix(f[1], "*")
+		if strings.HasPrefix(n, "supavise-studio-") && strings.HasSuffix(n, suffix) && r.Release.Assets[n] != "" {
+			return n, r.Release.Assets[n], strings.ToLower(f[0]), true
+		}
+	}
+	return "", "", "", false
+}
+
+// Staged is a release binary that has been downloaded, checked against the signed list and run
+// with --version, and that sits next to the file it will replace. Install swaps it in;
+// Discard throws it away.
+type Staged struct {
+	*Resolved
+	// Path is the verified binary.
+	Path string
+	// Reported is what it printed for --version.
+	Reported string
+
+	exe string
+	o   Options
+}
+
+// Stage downloads the binary of the release, verifies it against the checksum in the signed
+// list, and checks that it starts and reports the tag it was published under. Nothing that is
+// installed changes. The file is created in StageDir, or in the directory of ExecPath, so that
+// Install is one rename.
+func (r *Resolved) Stage(ctx context.Context, o Options) (*Staged, error) {
+	asset := BinaryAsset(o.Platform)
+	want, err := ChecksumFor(r.Sums, asset)
+	if err != nil {
+		return nil, fmt.Errorf("release %s: %w", r.Release.Tag, err)
+	}
+	o.say("signature verified; downloading %s", asset)
 	exe := o.ExecPath
 	if exe == "" {
 		if exe, err = os.Executable(); err != nil {
@@ -289,6 +405,9 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 	dir := filepath.Dir(exe)
+	if o.StageDir != "" {
+		dir = o.StageDir
+	}
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(exe)+".new-*")
 	if err != nil {
 		return nil, fmt.Errorf("cannot write next to %s (run as root): %w", exe, err)
@@ -296,7 +415,7 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 	tmpPath := tmp.Name()
 	cleanup := func() { tmp.Close(); os.Remove(tmpPath) }
 	h := sha256.New()
-	if err := o.stream(ctx, rel.Assets[asset], io.MultiWriter(tmp, h)); err != nil {
+	if err := o.stream(ctx, r.Release.Assets[asset], io.MultiWriter(tmp, h)); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("download %s: %w", asset, err)
 	}
@@ -324,22 +443,30 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 	// The signature covers the checksums, not the release tag, which comes from unsigned
 	// GitHub metadata. A binary that does not name the tag it was published under is an
 	// older (validly signed) release attached to a newer tag: a downgrade.
-	if !ReportsVersion(reported, rel.Tag) {
+	if !ReportsVersion(reported, r.Release.Tag) {
 		os.Remove(tmpPath)
-		return nil, fmt.Errorf("release %s ships a binary that reports %q: refusing to install (an older signed binary under a newer tag would be a downgrade)", rel.Tag, strings.TrimSpace(reported))
+		return nil, fmt.Errorf("release %s ships a binary that reports %q: refusing to install (an older signed binary under a newer tag would be a downgrade)", r.Release.Tag, strings.TrimSpace(reported))
 	}
-	// Keep the old inode reachable as <name>.prev, then swap the new file in.
-	prev := exe + ".prev"
+	return &Staged{Resolved: r, Path: tmpPath, Reported: reported, exe: exe, o: o}, nil
+}
+
+// Discard removes the staged file.
+func (s *Staged) Discard() { _ = os.Remove(s.Path) }
+
+// Install keeps the old inode reachable as <name>.prev and renames the staged binary over the
+// installed one.
+func (s *Staged) Install() (*Result, error) {
+	prev := s.exe + ".prev"
 	_ = os.Remove(prev)
-	if err := os.Link(exe, prev); err != nil {
+	if err := os.Link(s.exe, prev); err != nil {
 		prev = ""
 	}
-	if err := os.Rename(tmpPath, exe); err != nil {
-		os.Remove(tmpPath)
+	if err := os.Rename(s.Path, s.exe); err != nil {
+		os.Remove(s.Path)
 		return nil, err
 	}
-	o.say("installed %s at %s", rel.Tag, exe)
-	return &Result{Tag: rel.Tag, Replaced: true, Previous: prev}, nil
+	s.o.say("installed %s at %s", s.Release.Tag, s.exe)
+	return &Result{Tag: s.Release.Tag, Replaced: true, Previous: prev}, nil
 }
 
 func runVersion(ctx context.Context, path string) (string, error) {

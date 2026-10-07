@@ -2,21 +2,20 @@ package config
 
 import "fmt"
 
-// Upgrade is the [upgrade] section: how `supavise projects upgrade --all` rolls the projects of
-// a node onto the node's pinned service versions, and how many releases of artifacts the node
-// keeps. A single project's upgrade (Studio, the Management API, `projects upgrade <ref>`)
-// ignores the rollout settings.
+// Upgrade is the [upgrade] section: how `supavise upgrade` and `supavise projects upgrade --all`
+// roll the projects of a node onto the node's pinned service versions, and how many releases
+// (binaries and artifacts) the node keeps for `supavise rollback`. A single project's upgrade
+// (Studio, the Management API, `projects upgrade <ref>`) ignores the rollout settings.
 type Upgrade struct {
 	// CanaryProjects is how many projects `--all` upgrades first, one at a time, before it
 	// starts on the rest. A failure in a canary stops the rollout. Zero means 1; -1 means none.
 	CanaryProjects int `toml:"canary_projects"`
 	// BatchSize is how many projects `--all` upgrades at once after the canaries (each one
-	// still takes its own base backup first). Zero means 3.
+	// still takes its own base backup first). Zero means 5.
 	BatchSize int `toml:"batch_size"`
-	// KeepReleases is how many of the releases this node has run keep their artifacts on disk
-	// when `supavise artifacts gc` runs (the current one counts), so that `supavise rollback`
-	// finds the previous release's artifacts. Artifacts a project still uses are never removed.
-	// Zero means 2.
+	// KeepReleases is how many of the releases this node has run keep their binary and their
+	// artifacts on disk (the current one counts), so that `supavise rollback` finds the previous
+	// release's. Artifacts a project still uses are never removed. Zero means 3.
 	KeepReleases int `toml:"keep_releases"`
 }
 
@@ -34,7 +33,7 @@ func (u Upgrade) Canary() int {
 // Batch returns BatchSize with its default applied.
 func (u Upgrade) Batch() int {
 	if u.BatchSize <= 0 {
-		return 3
+		return 5
 	}
 	return u.BatchSize
 }
@@ -42,7 +41,7 @@ func (u Upgrade) Batch() int {
 // Keep returns KeepReleases with its default applied.
 func (u Upgrade) Keep() int {
 	if u.KeepReleases <= 0 {
-		return 2
+		return 3
 	}
 	return u.KeepReleases
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -24,8 +25,28 @@ import (
 
 var (
 	upAll, upYes, upDryRun, upNoGC bool
+	upAllowOlder                   bool
+	upTo                           []string
 	versionsJSON                   bool
 )
+
+// upgradeRequest is what the flags ask for: --to names the releases to move to (the node's pins
+// for the services it does not name), --allow-older lifts the refusal of an older one.
+func upgradeRequest() (lifecycle.UpgradeRequest, error) {
+	req := lifecycle.UpgradeRequest{AllowOlder: upAllowOlder}
+	for _, kv := range upTo {
+		svc, tag, ok := strings.Cut(kv, "=")
+		svc = serviceOf(svc)
+		if !ok || tag == "" || !slices.Contains(config.ProjectServices, svc) {
+			return req, fmt.Errorf("--to %q: want <service>=<release tag> with the service one of %s", kv, strings.Join(config.ProjectServices, ", "))
+		}
+		if req.Target == nil {
+			req.Target = map[string]string{}
+		}
+		req.Target[svc] = tag
+	}
+	return req, nil
+}
 
 // upgradeRow is what the CLI knows about one project's upgrade: its eligibility and why a
 // project is skipped.
@@ -59,7 +80,7 @@ func changesText(el *lifecycle.UpgradeEligibility) string {
 }
 
 // upgradeRows computes the eligibility of every user project (or of refs).
-func upgradeRows(ctx context.Context, n *lifecycle.Node, refs []string) ([]upgradeRow, error) {
+func upgradeRows(ctx context.Context, n *lifecycle.Node, refs []string, req lifecycle.UpgradeRequest) ([]upgradeRow, error) {
 	ps, err := n.Registry.ListProjects(ctx)
 	if err != nil {
 		return nil, err
@@ -75,7 +96,7 @@ func upgradeRows(ctx context.Context, n *lifecycle.Node, refs []string) ([]upgra
 			continue
 		}
 		delete(want, p.Ref)
-		el, err := n.Engine.UpgradeEligibility(ctx, p.Ref)
+		el, err := n.Engine.UpgradeEligibilityFor(ctx, p.Ref, req)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", p.Ref, err)
 		}
@@ -137,9 +158,9 @@ func (l *lineWriter) printf(format string, args ...any) {
 
 // upgradeProject upgrades ref to the node's versions and prints the steps as the registry's
 // status for the upgrade moves through them.
-func upgradeProject(ctx context.Context, n *lifecycle.Node, out *lineWriter, ref string) error {
+func upgradeProject(ctx context.Context, n *lifecycle.Node, out *lineWriter, ref string, req lifecycle.UpgradeRequest) error {
 	started := time.Now()
-	run, err := n.Engine.BeginUpgrade(ctx, ref, lifecycle.UpgradeRequest{})
+	run, err := n.Engine.BeginUpgrade(ctx, ref, req)
 	if err != nil {
 		out.printf("%s: refused: %v\n", ref, err)
 		return err
@@ -181,7 +202,11 @@ func upgradeProject(ctx context.Context, n *lifecycle.Node, out *lineWriter, ref
 func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 	ctx := cmd.Context()
 	out := &lineWriter{w: cmd.OutOrStdout()}
-	rows, err := upgradeRows(ctx, n, args)
+	req, err := upgradeRequest()
+	if err != nil {
+		return err
+	}
+	rows, err := upgradeRows(ctx, n, args, req)
 	if err != nil {
 		return err
 	}
@@ -250,7 +275,7 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 		refs[i] = r.Project.Ref
 	}
 	opts := lifecycle.RolloutOptions{Canary: 0, Batch: 1,
-		Upgrade: func(ctx context.Context, ref string) error { return upgradeProject(ctx, n, out, ref) }}
+		Upgrade: func(ctx context.Context, ref string) error { return upgradeProject(ctx, n, out, ref, req) }}
 	if upAll && len(refs) > 1 {
 		opts.Canary, opts.Batch = n.Cfg.Upgrade.Canary(), n.Cfg.Upgrade.Batch()
 		out.printf("rolling out to %d projects: %d canary project(s) first, then %d at a time; it stops at the first failure\n", len(refs), min(opts.Canary, len(refs)), opts.Batch)
@@ -343,7 +368,7 @@ func viewVersions(ctx context.Context, n *lifecycle.Node, r upgradeRow) versions
 
 func runVersions(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 	ctx := cmd.Context()
-	rows, err := upgradeRows(ctx, n, args)
+	rows, err := upgradeRows(ctx, n, args, lifecycle.UpgradeRequest{})
 	if err != nil {
 		return err
 	}
@@ -445,7 +470,7 @@ never updates extensions itself. The command keeps running if the SSH session dr
 left UPGRADING by a killed upgrade is started again on its previous versions by the daemon.
 
 --all upgrades every eligible project: the first [upgrade] canary_projects (default 1, the
-smallest databases) one at a time, then [upgrade] batch_size (default 3) at a time. It stops at
+smallest databases) one at a time, then [upgrade] batch_size (default 5) at a time. It stops at
 the first failure and starts nobody after it. Paused and unhealthy projects are skipped and
 listed. Afterwards the artifacts that nothing runs or keeps for a rollback are removed
 ([upgrade] keep_releases; --no-gc keeps them).
@@ -456,6 +481,8 @@ and stops. Run as the user that owns the state directory (supavise).`
 	upgrade.Flags().BoolVar(&upYes, "yes", false, "do not ask for confirmation")
 	upgrade.Flags().BoolVar(&upDryRun, "dry-run", false, "show what would be upgraded and stop")
 	upgrade.Flags().BoolVar(&upNoGC, "no-gc", false, "keep the artifacts that nothing needs any more")
+	upgrade.Flags().StringArrayVar(&upTo, "to", nil, "move this service to this release instead of the node's pin, <service>=<release tag> (repeatable; services not named keep the version they run)")
+	upgrade.Flags().BoolVar(&upAllowOlder, "allow-older", false, "allow --to to name an older release than the project runs (what `supavise rollback` does for the projects an upgrade moved)")
 
 	versions := projectCmd("versions [<ref>]", "Show the service versions projects run and whether an upgrade is available", cobra.MaximumNArgs(1), runVersions)
 	versions.Flags().BoolVar(&versionsJSON, "json", false, "print JSON")

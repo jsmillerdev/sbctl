@@ -332,3 +332,36 @@ func TestServedBannerStaysEmptyWhileStudioCannotShowOurWords(t *testing.T) {
 		t.Errorf("%q", got)
 	}
 }
+
+// The upgrade writes the marker at each phase and leaves a finished phase when it ends; the
+// banner and `supavise status` read the same file.
+func TestWriteUpgradeRoundTrip(t *testing.T) {
+	p := paths(t)
+	if had, err := ClearUpgrade(p); err != nil || had {
+		t.Fatalf("clearing nothing: %v %v", had, err)
+	}
+	u := Upgrade{Phase: "services", From: "v1.0.0", To: "v1.1.0", StartedAt: t0, PID: 4242, Detail: "realtime"}
+	if err := WriteUpgrade(p, u); err != nil {
+		t.Fatal(err)
+	}
+	got := ReadUpgrade(p)
+	if got == nil || got.Phase != "services" || got.From != "v1.0.0" || got.To != "v1.1.0" || got.PID != 4242 || got.Detail != "realtime" || !got.StartedAt.Equal(t0) {
+		t.Fatalf("read back %+v", got)
+	}
+	if _, ok := UpgradeRunning(p, t0.Add(time.Minute)); !ok {
+		t.Fatal("a marker written a minute ago is not running")
+	}
+	u.Phase = "done"
+	if err := WriteUpgrade(p, u); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := UpgradeRunning(p, t0.Add(time.Minute)); ok {
+		t.Fatal("a finished upgrade still counts as running")
+	}
+	if ReadUpgrade(p) == nil {
+		t.Fatal("the finished marker was not kept")
+	}
+	if had, err := ClearUpgrade(p); err != nil || !had || ReadUpgrade(p) != nil {
+		t.Fatalf("ClearUpgrade: %v %v", had, err)
+	}
+}

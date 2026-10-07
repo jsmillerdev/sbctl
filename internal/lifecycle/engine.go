@@ -846,6 +846,60 @@ func (e *Engine) StartActive(ctx context.Context) map[string]error {
 	return errs
 }
 
+// EnsureTenants registers every active project with the shared services again, one at a time, and
+// returns the errors by ref. The calls are idempotent: a tenant whose configuration and whose
+// services' releases are unchanged sends nothing. After a Supavise release moved the pins of Storage
+// or Realtime, the new tag changes their tenants' fingerprints, so this call is what makes the new
+// release run its tenant migrations in every project (Storage on the tenant update, Realtime on the
+// tenant create). The daemon calls it once the shared services and the projects have started.
+func (e *Engine) EnsureTenants(ctx context.Context) map[string]error {
+	errs := map[string]error{}
+	if len(e.opts.Fleet) == 0 {
+		return errs
+	}
+	ps, err := e.reg.ListProjects(ctx)
+	if err != nil {
+		errs[""] = err
+		return errs
+	}
+	for i := range ps {
+		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) {
+			continue
+		}
+		if err := e.ensureTenantsOf(ctx, ps[i].Ref); err != nil {
+			errs[ps[i].Ref] = err
+		}
+	}
+	return errs
+}
+
+func (e *Engine) ensureTenantsOf(ctx context.Context, ref string) error {
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	p, err := e.reg.GetProject(ctx, ref)
+	if errors.Is(err, registry.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !active(p.Status) {
+		return nil // paused, upgrading or being restored since the list: its own operation registers it
+	}
+	keys, err := e.loadKeys(ctx, ref)
+	if err != nil {
+		return err
+	}
+	spec, err := e.tenantSpec(ctx, p, keys)
+	if err != nil {
+		return err
+	}
+	return e.opts.Fleet.EnsureTenant(ctx, spec)
+}
+
 func (e *Engine) startOne(ctx context.Context, listed *registry.Project) error {
 	unlock, err := e.lock(ctx, listed.Ref)
 	if err != nil {

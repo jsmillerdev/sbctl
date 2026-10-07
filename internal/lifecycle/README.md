@@ -124,8 +124,8 @@ runs them: `Engine.CollectArtifacts` (`supavise artifacts gc`, and after a succe
 pins, what the newest recorded release pinned (what the daemon last started with, whatever
 `keep_releases` says: the CLI that runs the collection may be a newer binary than the daemon), and
 what the last `[upgrade] keep_releases` releases of the node's release history pinned
-(`artifacts.Store.RecordPins`, written at daemon start; default 2: the current release and the
-previous one).
+(`artifacts.Store.RecordPins`, written at daemon start; default 3: the current release and the
+two before).
 
 `Engine.UpgradeProject(ref, target)` (`BeginUpgrade` + `Run`; the `ProjectUpgrader` capability of
 the Manager, which the Management API and the CLI use) moves a project to other versions, the
@@ -231,7 +231,7 @@ tags by upstream version, then packaging revision, and tags it cannot order are 
 no backup service, the system project, an extension the target release cannot serve), an
 estimated downtime (about 3 minutes without PostgreSQL restarting, 15 when it restarts; the base
 backup does not count, the project serves during it) and notes. `Rollout` (`rollout.go`) runs many upgrades for `supavise projects upgrade --all`:
-`[upgrade] canary_projects` (default 1) one at a time, then `[upgrade] batch_size` (default 3)
+`[upgrade] canary_projects` (default 1) one at a time, then `[upgrade] batch_size` (default 5)
 at once, halting at the first failure.
 
 ## Branches

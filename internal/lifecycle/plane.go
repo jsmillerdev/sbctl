@@ -332,7 +332,7 @@ func (pl *PostgresPlane) startAPI(ctx context.Context, p *registry.Project, keys
 		return err
 	}
 	for _, spec := range specs {
-		if err := pl.sup.Render(ctx, spec); err != nil {
+		if err := pl.renderStopIfChanged(ctx, spec); err != nil {
 			return err
 		}
 		if err := pl.sup.Start(ctx, spec.Unit()); err != nil {
@@ -342,6 +342,30 @@ func (pl *PostgresPlane) startAPI(ctx context.Context, p *registry.Project, keys
 		if err := pl.wait(ctx, spec.Unit(), svc, pl.opts.ServiceReadyTimeout, func(ctx context.Context) error { return pl.checkHTTP(ctx, p, svc) }); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// renderStopIfChanged renders spec and, when its files changed under a unit that is running,
+// stops the unit, so that the Start that follows runs the new files: Start on a running unit is
+// a no-op, and GoTrue or PostgREST would otherwise keep the binary and settings it started with
+// after a release or a setting changed what the unit runs. An unchanged unit is left alone.
+func (pl *PostgresPlane) renderStopIfChanged(ctx context.Context, spec units.Spec) error {
+	changed := false
+	if cr, ok := pl.sup.(units.ChangeRenderer); ok {
+		var err error
+		if changed, err = cr.RenderChanged(ctx, spec); err != nil {
+			return err
+		}
+	} else if err := pl.sup.Render(ctx, spec); err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	if st, err := pl.sup.Status(ctx, spec.Unit()); err == nil && (st.State == units.StateActive || st.State == units.StateActivating) {
+		pl.log.Info("service files changed; restarting the running unit", "unit", spec.Unit())
+		return pl.sup.Stop(ctx, spec.Unit())
 	}
 	return nil
 }

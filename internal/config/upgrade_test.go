@@ -8,11 +8,11 @@ import (
 
 func TestUpgradeDefaultsAndValidation(t *testing.T) {
 	var u Upgrade
-	if u.Canary() != 1 || u.Batch() != 3 || u.Keep() != 2 {
+	if u.Canary() != 1 || u.Batch() != 5 || u.Keep() != 3 {
 		t.Fatalf("defaults = %d %d %d", u.Canary(), u.Batch(), u.Keep())
 	}
-	u = Upgrade{CanaryProjects: -1, BatchSize: 5, KeepReleases: 4}
-	if u.Canary() != 0 || u.Batch() != 5 || u.Keep() != 4 {
+	u = Upgrade{CanaryProjects: -1, BatchSize: 7, KeepReleases: 4}
+	if u.Canary() != 0 || u.Batch() != 7 || u.Keep() != 4 {
 		t.Fatalf("explicit = %d %d %d", u.Canary(), u.Batch(), u.Keep())
 	}
 	for _, bad := range []Upgrade{{CanaryProjects: -2}, {BatchSize: -1}, {KeepReleases: -1}} {

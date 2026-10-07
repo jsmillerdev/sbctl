@@ -15,7 +15,7 @@ func TestProjectsUpgradeCommandsAreRegistered(t *testing.T) {
 		}
 	}
 	up, _, _ := rootCmd.Find([]string{"projects", "upgrade"})
-	for _, flag := range []string{"all", "yes", "dry-run", "no-gc"} {
+	for _, flag := range []string{"all", "yes", "dry-run", "no-gc", "to", "allow-older"} {
 		if up.Flags().Lookup(flag) == nil {
 			t.Errorf("projects upgrade has no --%s", flag)
 		}
@@ -49,5 +49,24 @@ func TestAheadOfTheNodeIsListedAndSkipped(t *testing.T) {
 	}
 	if got := changesText(el); got != "-" {
 		t.Fatalf("changes = %q", got)
+	}
+}
+
+func TestUpgradeRequestFromFlags(t *testing.T) {
+	defer func() { upTo, upAllowOlder = nil, false }()
+	upTo, upAllowOlder = []string{"auth=auth-v2.195.0-r1", "postgrest=postgrest-v16.4-r0"}, true
+	req, err := upgradeRequest()
+	if err != nil || !req.AllowOlder || req.Target["gotrue"] != "auth-v2.195.0-r1" || req.Target["postgrest"] != "postgrest-v16.4-r0" || len(req.Target) != 2 {
+		t.Fatalf("request = %+v, %v (the release name auth is the service gotrue)", req, err)
+	}
+	upTo, upAllowOlder = nil, false
+	if req, err = upgradeRequest(); err != nil || req.Target != nil || req.AllowOlder {
+		t.Fatalf("no flags: %+v, %v", req, err)
+	}
+	for _, bad := range []string{"gotrue", "gotrue=", "realtime=realtime-v1-r0", "=x"} {
+		upTo = []string{bad}
+		if _, err := upgradeRequest(); err == nil {
+			t.Errorf("--to %q was accepted", bad)
+		}
 	}
 }

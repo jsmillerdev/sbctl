@@ -246,6 +246,15 @@ func validTenantRef(ref string) error {
 	return nil
 }
 
+// withRelease folds the release tag of the service into a tenant fingerprint. An empty tag (a node
+// that cannot say which release it runs) leaves the fingerprint as it was.
+func withRelease(fp, tag string) string {
+	if tag == "" {
+		return fp
+	}
+	return fingerprint(fp, tag)
+}
+
 // fingerprintOf hashes the JSON form of a tenant request body (map keys are sorted, so the
 // encoding is stable).
 func fingerprintOf(v any) (string, error) {

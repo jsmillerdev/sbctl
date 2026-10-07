@@ -134,7 +134,7 @@ func init() {
 	artifactsFetchCmd.Flags().BoolVar(&artifactsFetchStudio, "studio", false, "also fetch our Studio build")
 	artifactsGCCmd.Long = `Removes the unpacked artifacts that nothing needs: not the versions this binary pins,
 not the versions any project runs (or is being upgraded to), and not those of the last
-[upgrade] keep_releases releases this node ran (default 2: the current one and the previous, so a
+[upgrade] keep_releases releases this node ran (default 3: the current one and the two before, so a
 rollback finds its artifacts). The archive cache is left alone. Run as the user that owns the
 state directory (supavise).`
 	artifactsGCCmd.Flags().BoolVar(&artifactsGCDry, "dry-run", false, "list what would be removed")
