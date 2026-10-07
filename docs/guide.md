@@ -1,6 +1,6 @@
 # Using Supavise
 
-This guide picks up after the install in the [README](../README.md#get-started). For server and AWS options in depth, see the [deploy guide](../deploy/README.md).
+This guide picks up after the install in the [README](../README.md#get-started). Your Supavise server is called a node. For server and AWS options in depth, see the [deploy guide](../deploy/README.md).
 
 - [Claim the node and sign in](#claim-the-node-and-sign-in)
 - [Create a project and connect an app](#create-a-project-and-connect-an-app)
@@ -31,15 +31,17 @@ import { createClient } from '@supabase/supabase-js'
 const supabase = createClient('https://<ref>.api.<domain>', '<publishable key>')
 ```
 
-The URL is the only part that differs from supabase.com. Auth, REST, Realtime, Storage and Edge Functions all answer on it.
+`<ref>` is the project ID, shown in the dashboard URL and in **Project Settings**. The URL is the only part that differs from supabase.com. Auth, REST, Realtime, Storage and Edge Functions all answer on it.
 
 ## Use the Supabase CLI
 
-The Supabase CLI reaches a node through a profile file. Print the profile on the node and copy it to your machine. Then create an access token in the dashboard, under **Account settings**, **Access Tokens**:
+The Supabase CLI reaches a node through a profile file. Print the profile on the node, then save the output as `supavise-profile.yaml` on your machine:
 
 ```bash
-sudo supavise api profile --format yaml > supavise-profile.yaml
+sudo -u supavise supavise api profile --format yaml
 ```
+
+Create an access token in the dashboard, under **Account settings**, **Access Tokens**, then:
 
 ```bash
 supabase --profile ./supavise-profile.yaml login --token sbp_...
@@ -59,11 +61,15 @@ supabase --profile ./supavise-profile.yaml branches get agent-task-42 --project-
 
 `branches get` prints the branch's connection details. A branch with data needs the Owner or Administrator role; Developers create schema-only branches (leave out `--with-data`). A branch deletes itself after 7 days unless you mark it persistent.
 
-The same branch is one call to `POST /v1/projects/<ref>/branches` with `{"branch_name": "agent-task-42", "with_data": true}`. The Supabase MCP server's branch tools work when you start it with `--api-url https://api.<domain>`.
+The same branch is one call to `POST /v1/projects/<ref>/branches` with `{"branch_name": "agent-task-42", "with_data": true}`. The Supabase MCP server's branch tools work when you start it with `--api-url https://api.<domain>` and without `--project-ref`.
 
 ## Back up and restore
 
-Backups start on their own: every project archives its write-ahead log (WAL) and takes a nightly base backup, on local disk or in S3 (`--s3-bucket` and `--s3-region` at install, see the deploy guide's [flags](../deploy/README.md#flags); the AWS stack uses its own bucket). Restore on the server:
+Backups start on their own. Every project archives its write-ahead log (WAL) continuously and takes a nightly base backup.
+
+Backups go to local disk by default. To keep them in S3, pass `--s3-bucket` and `--s3-region` at install (see the deploy guide's [flags](../deploy/README.md#flags)). The AWS stack uses its own bucket.
+
+Restore on the server:
 
 ```bash
 sudo -u supavise supavise backups list <ref>
@@ -75,7 +81,7 @@ sudo -u supavise supavise backups restore <ref> --to latest --force             
 
 | | Self-hosted Supabase (Docker Compose) | Supavise | Hosted Supabase |
 |---|---|---|---|
-| Projects | One per stack | Many per server, about 20 on an 8 GiB server | Managed for you; each project gets its own Postgres instance |
+| Projects | One per stack | Many per server, about 20 on an 8 GB server | Managed for you; each project gets its own Postgres instance |
 | Organizations | One | Many, each with its own members and projects | Many |
 | Dashboard | Studio for a single project | Supabase Studio in its hosted, multi-project mode | Supabase Studio |
 | Management API and `supabase link` | Not available | Yes: the parts that Studio, the Supabase CLI and the MCP server call | Yes |
@@ -108,10 +114,18 @@ These figures come from measurements up to 50 projects on amd64 and arm64 ([rese
 No. Supavise is an independent open-source project and is not affiliated with or endorsed by Supabase Inc. It runs Supabase's open-source services.
 
 **Does it replace hosted Supabase?**
-Not entirely. You get organizations, projects, the dashboard, the CLI, branching and backups on a server you run. Supavise runs on one server, so it has no high availability, failover or read replicas; if the server stops, its projects stop. Backups and point-in-time restore run from the `supavise backups` command, not from the dashboard. Management API operations beyond what Studio, the CLI and the MCP server call, such as billing and log drains, answer with empty placeholders.
+Not entirely. You get organizations, projects, the dashboard, the CLI, branching and backups on a server you run. The differences:
+
+- One server, so no high availability, failover or read replicas. If the server stops, its projects stop.
+- Backups and point-in-time restore run from the `supavise backups` command, not from the dashboard.
+- Management API operations that Studio, the CLI and the MCP server don't call, such as billing and log drains, answer with empty placeholders.
 
 **Do my apps need to change?**
 No. Apps use the same client libraries and API paths as on supabase.com; only the host name changes, to `<ref>.api.<domain>`.
 
 **Is my data backed up?**
-Yes. Every database archives its WAL continuously and takes a nightly base backup, and you can restore to any point in the retention window (7 days by default). Backups go to local disk unless you give an S3 bucket, so use a bucket to survive the loss of the server. Database backups cover Postgres only. On AWS, daily snapshots of the data volume also cover Storage files, function bundles and the node's keys.
+Your databases are. Every database archives its WAL continuously and takes a nightly base backup, and you can restore to any point in the retention window (7 days by default).
+
+- Backups go to local disk unless you give an S3 bucket. A bucket keeps them off the server.
+- Rebuilding a lost node also needs its master key, `/etc/supavise/master.key`, which is not in the bucket. On your own server, copy it and `/etc/supavise/config.toml` somewhere safe.
+- Database backups cover Postgres only. On AWS, daily snapshots of the data volume also cover Storage files, function bundles and the master key.
