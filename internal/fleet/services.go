@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
@@ -88,7 +89,7 @@ func (m *Manager) spec(svc string, c *creds) (units.Spec, error) {
 		}
 		s.Env = env // the server runs the multi-tenant migrations itself at start
 	case config.SvcStudio:
-		s.Env = studioEnv(cfg)
+		s.Env = studioEnv(cfg, c.dashboardSSO)
 	case config.SvcEdgeRuntime:
 		return edgeRuntimeSpec(cfg, s)
 	default:
@@ -260,7 +261,13 @@ func storageEnv(cfg *config.Config, c *creds) (map[string]string, error) {
 // studioEnv is the runtime configuration of our platform-mode Studio build (see
 // studio/README.md). The browser reaches the Management API and the system GoTrue
 // through the proxy on api.<domain>; project API hosts are allowed in the CSP.
-func studioEnv(cfg *config.Config) map[string]string {
+//
+// sso says whether the dashboard has a SAML identity provider. Studio hides "Continue with
+// SSO" unless the feature dashboard_auth:sign_in_with_sso is enabled, and its default list of
+// disabled features (studio/placeholders.json) disables it, so with a provider the list is
+// given without it. The flag is read when Studio starts, which is why adding the first
+// provider restarts the unit (Manager.RefreshStudio).
+func studioEnv(cfg *config.Config, sso bool) map[string]string {
 	env := map[string]string{
 		"HOSTNAME":                "127.0.0.1",
 		"PORT":                    strconv.Itoa(cfg.Ports.Studio),
@@ -272,5 +279,33 @@ func studioEnv(cfg *config.Config) map[string]string {
 	if k := cfg.Studio.HCaptchaSiteKey; k != "" {
 		env["NEXT_PUBLIC_HCAPTCHA_SITE_KEY"] = k
 	}
+	if sso {
+		env["NEXT_PUBLIC_DISABLED_FEATURES"] = strings.Join(StudioDisabledFeatures(true), ",")
+	}
 	return env
+}
+
+// studioDisabledByDefault is the list of features Studio's build disables before login
+// (studio/placeholders.json, NEXT_PUBLIC_DISABLED_FEATURES): public sign-up, GitHub and ChatGPT
+// sign-in, SSO, the testimonial and the terms notice. A test keeps it equal to the file.
+var studioDisabledByDefault = []string{
+	"dashboard_auth:sign_up",
+	"dashboard_auth:sign_in_with_github",
+	"dashboard_auth:sign_in_with_chatgpt",
+	"dashboard_auth:sign_in_with_sso",
+	"dashboard_auth:show_testimonial",
+	"dashboard_auth:show_tos",
+}
+
+// StudioDisabledFeatures is the list Studio is started with: the default list, without the
+// SSO sign-in when withSSO.
+func StudioDisabledFeatures(withSSO bool) []string {
+	var out []string
+	for _, f := range studioDisabledByDefault {
+		if withSSO && f == "dashboard_auth:sign_in_with_sso" {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
 }

@@ -243,3 +243,27 @@ type Registry interface {
 
 	Close()
 }
+
+// SecretCreator is implemented by registries that can store a secret only when none is stored
+// yet, in one atomic step (both of ours do).
+type SecretCreator interface {
+	// PutSecretIfAbsent stores sealed under (ref, name) unless that secret exists. It reports
+	// whether it stored it.
+	PutSecretIfAbsent(ctx context.Context, ref, name string, sealed []byte) (bool, error)
+}
+
+// PutSecretIfAbsent stores a secret that something else may be creating at the same time (a
+// signing key that the daemon and the CLI both create on first use): the first writer wins and
+// the others keep reading what it stored. Registries without SecretCreator fall back to a
+// check followed by a write, which is only as safe as that race allows.
+func PutSecretIfAbsent(ctx context.Context, reg Registry, ref, name string, sealed []byte) (bool, error) {
+	if c, ok := reg.(SecretCreator); ok {
+		return c.PutSecretIfAbsent(ctx, ref, name, sealed)
+	}
+	if _, err := reg.GetSecret(ctx, ref, name); err == nil {
+		return false, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return false, err
+	}
+	return true, reg.PutSecret(ctx, ref, name, sealed)
+}

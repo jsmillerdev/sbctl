@@ -176,9 +176,12 @@ func buildAuthSchema() *Schema {
 		fStr("webauthn_rp_origins", "GOTRUE_WEBAUTHN_RP_ORIGINS"),
 	)
 
-	// SAML is workstream L's: stored and reported, not rendered, because GoTrue refuses to
-	// start with SAML enabled and no signing key.
-	add(fBool("saml_enabled", "", false), Field{Name: "saml_external_url", Kind: String, Pattern: noComma})
+	// SAML: GoTrue refuses to start with SAML enabled and no signing key, so Manager.AuthEnv
+	// adds the project's own key (Options.SigningKey) whenever saml_enabled renders as true.
+	samlURL := fStr("saml_external_url", "GOTRUE_SAML_EXTERNAL_URL")
+	samlURL.Pattern, samlURL.Check = noComma, checkURL
+	add(fBool("saml_enabled", "GOTRUE_SAML_ENABLED", false), samlURL,
+		fBool("saml_allow_encrypted_assertions", "GOTRUE_SAML_ALLOW_ENCRYPTED_ASSERTIONS", false))
 
 	// Security, sessions, captcha.
 	captcha := Field{Name: "security_captcha_provider", Kind: Enum, Enum: []string{"turnstile", "hcaptcha"}, Env: "GOTRUE_SECURITY_CAPTCHA_PROVIDER"}

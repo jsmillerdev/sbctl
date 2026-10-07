@@ -18,7 +18,12 @@ type Options struct {
 	TemplateBaseURL string
 	// Event records an audit event for a project (registry.AppendEvent). Optional.
 	Event func(ctx context.Context, ref, kind string, payload any)
-	Log   *slog.Logger
+	// SigningKey returns the SAML signing key of a project (sso.EnsureSigningKey: created and
+	// sealed on first use, never shared between projects). AuthEnv hands it to GoTrue as
+	// GOTRUE_SAML_PRIVATE_KEY while the project has SAML enabled. Optional: without it a
+	// project with SAML enabled renders no key, and GoTrue refuses to start.
+	SigningKey func(ctx context.Context, ref string) (string, error)
+	Log        *slog.Logger
 }
 
 // Manager reads, validates, saves and renders the settings of every project.

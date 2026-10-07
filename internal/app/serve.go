@@ -273,6 +273,13 @@ func refreshSystem(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 	}
 	if err := n.Plane.StartDatabase(ctx, p, keys); err != nil {
 		log.Warn("system cluster not refreshed", "error", err)
+		return
+	}
+	// The dashboard's sign-in service gets the same treatment: a node upgraded to a version that
+	// turns on dashboard SSO (SAML key, the sign-up hook) or a changed [mail] section renders
+	// new files, and the unit is restarted only when they differ.
+	if err := n.Plane.RefreshSystemAuth(ctx, p, keys); err != nil {
+		log.Warn("the dashboard's sign-in service is not refreshed; run `sbctl system init` to apply its settings", "error", err)
 	}
 }
 

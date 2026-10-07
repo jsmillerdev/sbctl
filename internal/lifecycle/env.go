@@ -204,6 +204,13 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 	if system {
 		// Outgoing mail of the dashboard (organization invitations): [mail] in config.toml.
 		mergeEnv(auth.Env, pl.cfg.Mail.GoTrueEnv())
+		if pl.opts.SystemAuth != nil {
+			sa, err := pl.opts.SystemAuth(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("lifecycle: dashboard SSO configuration: %w", err)
+			}
+			mergeEnv(auth.Env, systemSSOEnv(sa))
+		}
 	}
 	if pl.opts.Settings != nil && !system {
 		over, err := pl.opts.Settings.AuthEnv(ctx, p.Ref, pl.authExternalURL(p.Ref))
@@ -253,6 +260,21 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 		mergeEnv(rest.Env, over)
 	}
 	return append(specs, rest), nil
+}
+
+// systemSSOEnv is what turns on single sign-on in sb-gotrue@system: SAML with the node's own
+// signing key, and a sign-up that is open to GoTrue but closed to everyone the hook does not
+// vouch for (see SystemAuth). GOTRUE_DISABLE_SIGNUP cannot stay on: it also stops the first
+// sign-in of an SSO user, whose account is created by that sign-in.
+func systemSSOEnv(sa *SystemAuth) map[string]string {
+	return map[string]string{
+		"GOTRUE_DISABLE_SIGNUP":                   "false",
+		"GOTRUE_SAML_ENABLED":                     "true",
+		"GOTRUE_SAML_PRIVATE_KEY":                 sa.SigningKey,
+		"GOTRUE_HOOK_BEFORE_USER_CREATED_ENABLED": "true",
+		"GOTRUE_HOOK_BEFORE_USER_CREATED_URI":     sa.HookURL,
+		"GOTRUE_HOOK_BEFORE_USER_CREATED_SECRETS": sa.HookSecret,
+	}
 }
 
 // mergeEnv lays the saved settings over a unit's base environment; an empty value removes

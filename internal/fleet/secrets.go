@@ -60,6 +60,11 @@ func loginSecretName(service string) string { return "fleet_" + service + "_pass
 
 // creds are the decrypted secrets of the shared services.
 type creds struct {
+	// dashboardSSO is true while at least one SAML identity provider of the dashboard is
+	// registered: Studio then shows "Continue with SSO". It is read with the credentials
+	// because rendering Studio's unit needs the registry like they do.
+	dashboardSSO bool
+
 	supavisorAPIJWT, supavisorMetricsJWT, supavisorSecretBase, supavisorVaultKey string
 	realtimeAPIJWT, realtimeMetricsJWT, realtimeSecretBase                       string
 	realtimeDBEncKey, realtimeDBEncKeyGCM                                        string
@@ -161,7 +166,26 @@ func loadCreds(ctx context.Context, d Deps, create bool) (*creds, error) {
 		}
 		c.logins[ld.Service] = Login{User: ld.User, Password: pw, Database: ld.Database}
 	}
+	var err error
+	if c.dashboardSSO, err = d.dashboardSSO(ctx); err != nil {
+		return nil, fmt.Errorf("fleet: are there dashboard SSO providers: %w", err)
+	}
 	return c, nil
+}
+
+// dashboardSSO reports whether a SAML identity provider of the dashboard is registered:
+// Deps.DashboardSSO when given, else the registry's own answer (the Postgres registry has
+// one; the in-memory registry of tests has none and so reports false).
+func (d Deps) dashboardSSO(ctx context.Context) (bool, error) {
+	if d.DashboardSSO != nil {
+		return d.DashboardSSO(ctx)
+	}
+	if r, ok := d.Registry.(interface {
+		HasDashboardSSO(ctx context.Context) (bool, error)
+	}); ok {
+		return r.HasDashboardSSO(ctx)
+	}
+	return false, nil
 }
 
 func readSecret(ctx context.Context, reg registry.Registry, sec secrets.Secrets, name string) (string, error) {

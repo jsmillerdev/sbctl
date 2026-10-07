@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -269,7 +271,7 @@ func TestStudioEnv(t *testing.T) {
 	cfg := config.Default()
 	cfg.Domain = "example.com"
 	cfg.Ports.Studio = 37040
-	env := studioEnv(cfg)
+	env := studioEnv(cfg, false)
 	want := map[string]string{
 		"HOSTNAME":                "127.0.0.1",
 		"PORT":                    "37040",
@@ -288,7 +290,7 @@ func TestStudioEnv(t *testing.T) {
 	}
 	cfg.Studio.HCaptchaSiteKey = "site-key"
 	cfg.TLS.Mode = "off"
-	env = studioEnv(cfg)
+	env = studioEnv(cfg, false)
 	if env["NEXT_PUBLIC_HCAPTCHA_SITE_KEY"] != "site-key" || env["NEXT_PUBLIC_API_URL"] != "http://api.example.com/platform" {
 		t.Errorf("env = %v", env)
 	}
@@ -313,4 +315,53 @@ func TestPGMetaEnv(t *testing.T) {
 	if _, ok := env["PG_META_CRYPTO_KEY"]; ok {
 		t.Error("pg-meta reads CRYPTO_KEY; PG_META_CRYPTO_KEY is Studio's name for it")
 	}
+}
+
+// With a dashboard SSO provider Studio is started with its default list of disabled features
+// minus the SSO sign-in; without one the variable is left to the build's default.
+func TestStudioEnvOffersSSOOnlyWithAProvider(t *testing.T) {
+	cfg := config.Default()
+	cfg.Domain = "example.com"
+	if _, ok := studioEnv(cfg, false)["NEXT_PUBLIC_DISABLED_FEATURES"]; ok {
+		t.Error("without a provider the build's default list must apply")
+	}
+	got := studioEnv(cfg, true)["NEXT_PUBLIC_DISABLED_FEATURES"]
+	if got == "" || strings.Contains(got, "sign_in_with_sso") {
+		t.Fatalf("with a provider the list is %q, which must not disable the SSO sign-in", got)
+	}
+	for _, f := range []string{"dashboard_auth:sign_up", "dashboard_auth:sign_in_with_github", "dashboard_auth:show_tos"} {
+		if !strings.Contains(got, f) {
+			t.Errorf("%s is no longer disabled: %q", f, got)
+		}
+	}
+	safe := regexp.MustCompile(`^[A-Za-z0-9._~:/@%+,*=-]*$`)
+	if !safe.MatchString(got) {
+		t.Errorf("%q has characters the launcher refuses", got)
+	}
+}
+
+// The Go copy of the build's default list stays equal to studio/placeholders.json.
+func TestStudioDisabledFeaturesMatchThePlaceholderFile(t *testing.T) {
+	b, err := os.ReadFile("../../studio/placeholders.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Values []struct {
+			Env     string `json:"env"`
+			Default string `json:"default"`
+		} `json:"values"`
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range doc.Values {
+		if v.Env == "NEXT_PUBLIC_DISABLED_FEATURES" {
+			if want := strings.Join(StudioDisabledFeatures(false), ","); v.Default != want {
+				t.Fatalf("studio/placeholders.json lists %q, fleet.StudioDisabledFeatures %q", v.Default, want)
+			}
+			return
+		}
+	}
+	t.Fatal("NEXT_PUBLIC_DISABLED_FEATURES is not in studio/placeholders.json")
 }

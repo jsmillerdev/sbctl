@@ -50,6 +50,47 @@ func (pl *PostgresPlane) ReconfigureService(ctx context.Context, p *registry.Pro
 	return pl.wait(ctx, target.Unit(), svc, pl.opts.ServiceReadyTimeout, func(ctx context.Context) error { return pl.checkHTTP(ctx, p, svc) })
 }
 
+// RefreshSystemAuth renders sb-gotrue@system again and restarts it when what it renders
+// changed: a node upgraded to a version that turns on dashboard SSO, or a changed [mail]
+// section. A unit whose files are unchanged is left alone (the daemon calls this at every
+// start). It does nothing for a unit that is not running: whoever starts it renders it first.
+func (pl *PostgresPlane) RefreshSystemAuth(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error {
+	specs, err := pl.apiSpecs(ctx, p, keys)
+	if err != nil {
+		return err
+	}
+	cr, ok := pl.sup.(units.ChangeRenderer)
+	for _, spec := range specs {
+		changed := false
+		if ok {
+			if changed, err = cr.RenderChanged(ctx, spec); err != nil {
+				return err
+			}
+		} else if err := pl.sup.Render(ctx, spec); err != nil {
+			return err
+		}
+		if !changed {
+			continue
+		}
+		st, err := pl.sup.Status(ctx, spec.Unit())
+		if err != nil || (st.State != units.StateActive && st.State != units.StateActivating) {
+			continue
+		}
+		pl.log.Info("the dashboard's sign-in service runs on older settings; restarting it", "unit", spec.Unit())
+		if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
+			return err
+		}
+		if err := pl.sup.Start(ctx, spec.Unit()); err != nil {
+			return err
+		}
+		svc := spec.Service
+		if err := pl.wait(ctx, spec.Unit(), svc, pl.opts.ServiceReadyTimeout, func(ctx context.Context) error { return pl.checkHTTP(ctx, p, svc) }); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ApplyPostgresSettings makes the saved Postgres settings of p take effect in a running
 // cluster: settings that overlap the class's command-line sizing are rendered into the
 // unit (they apply at the next restart), every other saved setting is applied with ALTER
