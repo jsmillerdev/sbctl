@@ -56,8 +56,10 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
   route, units, data, registry row. A failed backup keeps the project, except one that wraps
   `ErrNoRestorableState` (a restore-as-new clone whose recovery failed or never finished and
   that has no base backup): there is nothing to back up, the delete records
-  `project.final_backup_skipped` and goes on. A failure after the backup leaves `GOING_DOWN`
-  so the delete can be repeated.
+  `project.final_backup_skipped` and goes on. A delete records `project.delete_started` (with
+  the status to go back to) and `project.delete_backup_done` (the backup step is settled); the
+  nightly timer stops right after it. A failure after the backup leaves `GOING_DOWN`, and a
+  repeated delete resumes from the recorded step without a second backup.
 - `RotateKeys`: new JWT secret, legacy and opaque keys; database passwords unchanged;
   GoTrue and PostgREST restart, fleet tenants update; previous keys are restored on error.
 - `Health`: unit state plus SQL ping, GoTrue `/health`, PostgREST `/`; moves
@@ -67,8 +69,14 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
   operation leaves a project in a status nothing else would move: `PAUSING` becomes
   `INACTIVE` (units stopped), `COMING_UP` or `RESTARTING` with a route (a resume or restart
   was cut short) becomes `INACTIVE`, and `COMING_UP` without a route (a create that never
-  finished) becomes `INIT_FAILED`. `GOING_DOWN` is left for the operator (delete is repeatable)
-  and `RESTORING` is not touched. Each move is a `project.recovered` event.
+  finished) becomes `INIT_FAILED`. `GOING_DOWN` is read from the delete's events: with the backup
+  step settled the removal is finished at once (no second backup); cut off during the backup,
+  the project returns to the status it had (a paused one is stopped again); with no record (an
+  older version) it is only logged, naming `--skip-final-backup`. A restart (the API's pause and
+  resume, bracketed by `project.restart_requested` and `project.restart_finished`) cut off after
+  the pause is flagged `Recovered.Resume`, and `ResumeRecovered` brings the project back; a stale
+  request on a project that is not paused is cleared. `RESTORING` is not touched. Each move is a
+  `project.recovered` event.
 - Backup timers: with the systemd backend the Engine starts `sb-basebackup@<ref>.timer` when
   a project becomes active (create, resume, start) and stops it on pause and delete
   (`Options.Timers`; failures are logged, never fatal). The timers are not enabled for boot;
@@ -129,7 +137,8 @@ removed on exit.
 
 ## Not done
 
-- `Recover` does not finish an interrupted delete (`GOING_DOWN`) or restore (`RESTORING`).
+- `Recover` does not finish an interrupted restore (`RESTORING`), and a delete interrupted by a
+  version that recorded no events (`GOING_DOWN` with no `project.delete_started`) is only logged.
 - `pg_hba.conf` is rewritten on start but a changed file is not reloaded in a running cluster.
 - Fleet tenant calls are a hook (`Options.Fleet`); the services themselves are the fleet
   workstream's.

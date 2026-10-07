@@ -20,8 +20,13 @@ is the daemon that `sbctl.service` runs.
   (`proxy.New`, `KeySource` = the Engine, no-op `Waker`), listens for the API on the loopback
   admin address and at `api.<domain>` through the proxy, and starts every active project one at a
   time next to the listeners (the system project's backup timer and the prune timer too, on
-  systemd). `ctx` ending (SIGTERM) shuts the listeners down gracefully; project units belong to
-  systemd and keep running. The system project must exist (`sbctl system init`).
+  systemd). `ctx` ending (SIGTERM) first drains the API (`api.Server.Drain`: new lifecycle operations
+  answer 503, running ones, including creates and a delete's final backup, finish, bounded by
+  `StopBudget`, 10 minutes; `sbctl.service` allows 660 s to stop) and only then closes the
+  listeners and the registry; project units belong to systemd and keep running. At boot it
+  waits up to 2 minutes for the registry (`lifecycle.ErrRegistryUnreachable`), resumes projects
+  whose restart was cut off after the pause (`Engine.ResumeRecovered`), and keeps finishing restored
+  clones tagged `restore.cleanup_pending` (`backup.Service.FinishPendingRestores`). The system project must exist (`sbctl system init`).
 
 ## Not done
 
