@@ -4,7 +4,8 @@
 
 Writes brand/mark/*.svg, brand/lockups/*.svg, brand/favicon.svg, brand/social/*.svg, brand/readme/*.svg
 (the README banner, architecture diagram, feature grid, path cards, heading glyph and footer, each in a dark
-and a light variant, plus four badges) and brand/variants.html.
+and a light variant, narrow single-column variants of the feature grid and the path cards for phones, plus four
+badges) and brand/variants.html.
 Needs fontTools (pip install fonttools) and network access the first time,
 to fetch Manrope (OFL) from the google/fonts repo into a temp dir.
 
@@ -407,6 +408,59 @@ def path_svg(theme, key):
            f'<path d="M110 104V118M105 113L110 119L115 113" fill="none" stroke="{c["accent"]}" stroke-width="2"/>']
     return frame(W_, H_, f"{title}: {line}. {cta}", f"Get started on {title}. {line}. {cta}.", "\n  ".join(out))
 
+# Narrow variants for phones. The README picks them with <source media="(max-width: 600px)">. The grid and the cards
+# are drawn for a 1200 and a 580 unit wide page: a phone shows the grid at about a quarter of that and each of the two
+# side by side cards at 49% of a 340 px column, so their text comes out near 6 px. These are drawn at the size they
+# are shown at (a phone column is 340 to 400 px wide, so a unit is about a pixel): the grid is one column of cards, and
+# a path card is one column too (icon, title, text and call to action stacked), 200 units wide so that two of them
+# still sit side by side at 49% each, as in the wide layout. Smallest text is 15 units.
+
+def features_narrow_svg(theme):
+    c = THEMES[theme]; W_, CW, GAP_ = 400, 400, 12
+    out = []; y = 1
+    for ic, title, line in FEATURES:
+        lines = wrap(line, 34)
+        ch = max(88, 62 + 21 * len(lines) + 16)
+        out.append(f'<rect x="1" y="{y}" width="{CW - 2}" height="{ch - 2}" rx="10" fill="{c["box"]}" stroke="{c["line"]}" stroke-width="1.5"/>')
+        out.append(icon(ic, 20, y + (ch - 40) / 2, 40, c["accent"]))
+        out.append(text(80, y + 36, title, 21, c["text"], 700))
+        for j, ln in enumerate(lines):
+            out.append(text(80, y + 62 + j * 21, ln, 15, c["sub"]))
+        y += ch + GAP_
+    H_ = y - GAP_ + 1
+    desc = "What is included: " + " ".join(f"{t}: {l}." for _, t, l in FEATURES)
+    return frame(W_, H_, f"What is included ({theme}, narrow)", desc, "\n  ".join(out))
+
+NARROW_PATH_W = 200
+
+def path_narrow_layout(key):
+    ic, title, line, cta = PATHS[key]
+    return ic, title, wrap(line, 22), wrap(cta, 22)
+
+def path_narrow_height():
+    # Both cards are drawn the same height, so that they line up when they sit side by side.
+    hs = []
+    for key in PATHS:
+        _, _, body, cta = path_narrow_layout(key)
+        hs.append(112 + 20 * len(body) + 14 + 20 * len(cta) + 18)
+    return max(hs)
+
+def path_narrow_svg(theme, key):
+    c = THEMES[theme]; W_ = NARROW_PATH_W; H_ = path_narrow_height()
+    ic, title, body, cta = path_narrow_layout(key)
+    cta_c = c["accent"] if theme == "dark" else c["text"]
+    y = 112 + 20 * len(body) + 14
+    out = [f'<rect x="1" y="1" width="{W_ - 2}" height="{H_ - 2}" rx="12" fill="{c["box"]}" stroke="{c["accent"]}" stroke-width="2"/>',
+           icon(ic, 18, 18, 40, c["accent"]),
+           text(18, 92, title, 22, c["text"], 700)]
+    for j, ln in enumerate(body):
+        out.append(text(18, 118 + j * 20, ln, 15, c["sub"]))
+    # The arrow sits left of the call to action, the way it does on the wide card, and spans both lines.
+    out.append(f'<path d="M24 {y + 2:g}V{y + 16:g}M19 {y + 11:g}L24 {y + 17:g}L29 {y + 11:g}" fill="none" stroke="{c["accent"]}" stroke-width="2"/>')
+    for j, ln in enumerate(cta):
+        out.append(text(40, y + 16 + j * 20, ln, 15, cta_c, 600))
+    return frame(W_, H_, f"{PATHS[key][1]}: {PATHS[key][2]}. {PATHS[key][3]}", f"Get started on {PATHS[key][1]}. {PATHS[key][2]}. {PATHS[key][3]}.", "\n  ".join(out))
+
 BADGES = [("license", "Apache-2.0", "license", "Apache-2.0"),
           ("platform", "Ubuntu 24.04+ | Debian 12+", "runs on", "Ubuntu 24.04+ | Debian 12+"),
           ("arch", "amd64 | arm64", "arch", "amd64 | arm64"),
@@ -508,8 +562,11 @@ if __name__ == "__main__":
         write(f"brand/readme/banner-{theme}.svg", banner_svg(theme, k))
         write(f"brand/readme/architecture-{theme}.svg", arch_svg(theme))
         write(f"brand/readme/features-{theme}.svg", features_svg(theme))
+        write(f"brand/readme/features-narrow-{theme}.svg", features_narrow_svg(theme))
         write(f"brand/readme/path-server-{theme}.svg", path_svg(theme, "server"))
         write(f"brand/readme/path-aws-{theme}.svg", path_svg(theme, "aws"))
+        write(f"brand/readme/path-server-narrow-{theme}.svg", path_narrow_svg(theme, "server"))
+        write(f"brand/readme/path-aws-narrow-{theme}.svg", path_narrow_svg(theme, "aws"))
         write(f"brand/readme/glyph-{theme}.svg", glyph_svg(theme))
         write(f"brand/readme/footer-{theme}.svg", footer_svg(theme, k))
     for slug, _, label, msg in BADGES:

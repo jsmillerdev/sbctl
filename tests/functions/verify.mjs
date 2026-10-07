@@ -35,6 +35,30 @@ async function call(url, { headers = {}, method = 'GET', body, timeoutMs = 45_00
 
 const bearer = (token) => ({ authorization: `Bearer ${token}` })
 
+/**
+ * What a function that the runtime ends (CPU limit, memory limit, idle timeout) may answer through
+ * the main service. Normally the main service answers with its own error: 546 WORKER_RESOURCE_LIMIT
+ * (the request was cancelled by the supervisor), 504 IDLE_TIMEOUT (macOS, where no CPU timer exists),
+ * or 500 (the worker died while answering), all with an sb-error-code header.
+ * One more answer is legitimate and is not ours to change: when the supervisor ends the worker it
+ * also cancels the connection's token, and if that happens before the main service's response
+ * has gone back, the runtime's own HTTP server drops the response and answers 503 with an empty body
+ * and an x-served-by header, and logs "connection aborted" (crates/base/src/server.rs of
+ * supabase/edge-runtime v1.77.4: "If the token has already been canceled, return 503 instead of
+ * dropping the socket connection"). That is a race between the two, seen intermittently in CI. The main service's own 503s all have a JSON body and an sb-error-code, so an empty one
+ * can only be the runtime's, and it is accepted here only in that exact shape.
+ */
+function assertEndedByRuntime(what, r, codes) {
+  if (r.status === 503) {
+    assert.equal(r.text, '', `${what}: a 503 must be the runtime's own empty one, got ${r.text}`)
+    assert.equal(r.headers.get('sb-error-code'), null, `${what}: a 503 from the main service has a body`)
+    assert.match(r.headers.get('x-served-by') ?? '', /\/server$/, `${what}: the empty 503 is not the runtime's (x-served-by)`)
+    return
+  }
+  assert.ok(codes.includes(r.status), `${what}: ${r.status} ${r.text}`)
+  assert.ok(r.headers.get('sb-error-code'), `${what}: no sb-error-code`)
+}
+
 function hs256(secret, claims, header = { alg: 'HS256', typ: 'JWT' }) {
   const enc = (o) => Buffer.from(JSON.stringify(o)).toString('base64url')
   const data = `${enc(header)}.${enc(claims)}`
@@ -315,15 +339,13 @@ async function mainPhase() {
     for (const r of during) assert.equal(r.status, 200, `during the spin: ${r.status} ${r.text}`)
     assert.ok(Math.max(...during.map((r) => r.ms)) < 3000, `requests were slow during the spin: ${during.map((r) => r.ms)}`)
     const r = await spin
-    assert.ok([500, 504, 546].includes(r.status), `spin: ${r.status} ${r.text}`)
-    assert.ok(r.headers.get('sb-error-code'), 'spin: no sb-error-code')
-    console.log(`   (the runaway function ended with ${r.status} ${r.headers.get('sb-error-code')} after ${r.ms} ms)`)
+    assertEndedByRuntime('spin', r, [500, 504, 546])
+    console.log(`   (the runaway function ended with ${r.status} ${r.headers.get('sb-error-code') ?? 'the runtime\'s own 503'} after ${r.ms} ms)`)
     ok('a runaway function ends by the runtime limits while both projects keep answering')
   }
   {
     const r = await call(fnUrl(a, 'hog'), { headers: bearer(a.anon), timeoutMs: 90_000 })
-    assert.ok([500, 546].includes(r.status), `hog: ${r.status} ${r.text}`)
-    assert.ok(r.headers.get('sb-error-code'))
+    assertEndedByRuntime('hog', r, [500, 546])
     const ha = await invoke(a, 'hello')
     assert.equal(ha.data?.who, 'project-a', `A/hello after hog: ${ha.error?.name}: ${ha.error?.message} ${ha.error?.context?.status}`)
     const hb = await invoke(b, 'hello')

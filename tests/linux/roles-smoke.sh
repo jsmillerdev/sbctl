@@ -367,12 +367,14 @@ fi
 log "the real Supabase CLI: Read-only lists and is refused secrets set, Owner sets"
 if [[ -n ${SUPABASE_CLI:-} ]]; then
   mkdir -p "$WORK/proj" "$WORK/home"
+  # pooler_host is the registrable domain of the pooler host; supavise derives it, as `supavise api profile` does for users.
+  POOLER_DOMAIN=$(supavise api profile --format json | json_get 'd["pooler_host"]') || fail "supavise api profile"
   cat >"$WORK/profile.yaml" <<PROFILE
 name: supavise-roles
 api_url: $ADMIN
 dashboard_url: http://127.0.0.1:1
 project_host: api.$SUPAVISE_DOMAIN
-pooler_host: pooler.$SUPAVISE_DOMAIN
+pooler_host: $POOLER_DOMAIN
 PROFILE
   cli() { local t=$1; shift; (cd "$WORK/proj" && HOME="$WORK/home" SUPABASE_ACCESS_TOKEN=$t SUPABASE_NO_KEYRING=1 DO_NOT_TRACK=1 "$SUPABASE_CLI" --profile="$WORK/profile.yaml" "$@"); }
   cli "${PAT[ro]}" projects list >"$WORK/cli.out" 2>&1 || { cat "$WORK/cli.out" >&2; fail "CLI projects list as Read-only"; }

@@ -251,12 +251,14 @@ done
 
 log "project: SAML is off until it is enabled in the Auth settings"
 PROFILE="$WORK/profile.yaml"
+# pooler_host is the registrable domain of the pooler host; supavise derives it, as `supavise api profile` does for users.
+POOLER_DOMAIN=$(supavise api profile --format json | json_get 'd["pooler_host"]') || fail "supavise api profile"
 cat >"$PROFILE" <<YAML
 name: supavise-test
 api_url: $ADMIN
 dashboard_url: http://127.0.0.1:1
 project_host: api.$SUPAVISE_DOMAIN
-pooler_host: pooler.$SUPAVISE_DOMAIN
+pooler_host: $POOLER_DOMAIN
 YAML
 CLI=${SUPABASE_CLI:-supabase}
 command -v "$CLI" >/dev/null || fail "the Supabase CLI is needed (SUPABASE_CLI)"

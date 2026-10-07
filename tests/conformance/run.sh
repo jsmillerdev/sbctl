@@ -9,7 +9,7 @@
 # 2. turns auto-confirm on for project A through the Management API (what a customer does in
 #    the dashboard before testing sign-ups);
 # 3. runs the supabase-js suites (js/*.test.mjs) against project A: auth, PostgREST, Realtime,
-#    Storage and Functions, each with the opaque keys and the legacy JWTs;
+#    Storage and Functions, each with the opaque keys and the legacy JWTs, then pg_cron and branches;
 # 4. runs the Supabase CLI (cli.sh) against project B.
 #
 # Every suite runs even when an earlier one failed; the exit status is non-zero when any did.
@@ -141,7 +141,7 @@ record() { # NAME STATUS
   [[ $2 == pass ]] || FAILED=1
 }
 mkdir -p "$LOG_DIR"
-for f in auth postgrest realtime storage functions; do
+for f in auth postgrest realtime storage functions cron branches; do
   log "supabase-js suite: $f"
   if (cd "$JS_DIR" && CONFORMANCE_CONFIG=$WORK/conformance.json node --test --test-force-exit --test-timeout=300000 \
       --test-reporter=spec --test-reporter-destination=stdout \
