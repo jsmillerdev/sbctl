@@ -34,15 +34,21 @@ StartLimitIntervalSec=0
 # module fetched for one upload (a private npm package fetched with the uploader's .npmrc, a URL
 # only that project's code names) would be there for the bundle of any other upload to import. Each
 # instance therefore has its own, /var/cache/sb-edge-bundle/<ref> (CacheDirectory, private to the
-# instance's uid), and the uid differs from instance to instance: DynamicUser derives the user
-# from the unit name, which includes the ref. The unit of another project cannot open the
-# directory: it is mode 0700 under /var/cache/private, which only root may enter, and owned by
+# instance's uid), and the uid differs from instance to instance: User=sb-bundle-%i names the
+# dynamic user after the ref (30 characters, the limit is 31). Without it systemd would name
+# the user after the template, "sb-edge-bundle", for every instance (measured in CI: two
+# projects' instances ran as the same uid), and the mode of the directories would keep nothing out
+# where the kernel has no id-mapped mounts, which are what hides the other projects' cache
+# directories from an instance now. With a uid per project the unit of another project cannot open
+# the directory: it is mode 0700 under /var/cache/private, which only root may enter, and owned by
 # another uid.
+#
 # The directory is emptied before a start when it has passed 512 MiB, and removed when the project
 # is deleted (Systemd.Remove starts sb-edge-bundle-clean@<ref>.service, which runs as root because
 # the sbctl user cannot enter /var/cache/private).
 Type=oneshot
 DynamicUser=yes
+User=sb-bundle-%i
 Slice=sbctl.slice
 EnvironmentFile=/var/lib/sbctl/projects/%i/edge-bundle.env
 CacheDirectory=sb-edge-bundle/%i

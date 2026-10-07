@@ -445,10 +445,19 @@ func TestBundleUnitIsolatesTheBundlerFromTheNode(t *testing.T) {
 			t.Errorf("%s=%q, want %q", k, val(k), v)
 		}
 	}
-	for _, k := range []string{"User", "Group", "SupplementaryGroups"} {
+	for _, k := range []string{"Group", "SupplementaryGroups"} {
 		if val(k) != "" {
-			t.Errorf("%s=%s: the unit must not run as the sbctl user or in its group", k, val(k))
+			t.Errorf("%s=%s: the unit must not run in the sbctl user's group", k, val(k))
 		}
+	}
+	// A dynamic user named after the instance: with no User= systemd names it after the
+	// template, and every project's bundler runs as the same uid (measured in CI), so only
+	// the id-mapped mounts of a recent kernel would keep one project's cache from another's.
+	if val("User") != "sb-bundle-%i" {
+		t.Errorf("User=%q, want a dynamic user per instance (sb-bundle-%%i)", val("User"))
+	}
+	if n := len("sb-bundle-") + len(refA); n > 31 {
+		t.Errorf("the user name sb-bundle-<ref> is %d characters, systemd allows 31", n)
 	}
 	ro := strings.Fields(val("BindReadOnlyPaths"))
 	wantRO := []string{"/var/lib/sbctl/artifacts", "/var/lib/sbctl/projects/%i/edge-bundle.run", "/var/lib/sbctl/system/edge-bundle/work/src"}
