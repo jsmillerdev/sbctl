@@ -112,8 +112,10 @@ migration history (the SQL editor, `execute_sql`) are not in a schema-only branc
 > (the filter is on addresses, not ports). Branches are schema-only by default; `with_data` is opt-in and
 > meant for trusted users and agents. See "What a branch with data can and cannot reach".
 >
-> **Followup (workstream K, part 2):** once roles exist, creating a `with_data` branch should require the
-> Owner or Administrator role. Until then anyone who can create a branch can ask for the data.
+> Creating a `with_data` branch through the Management API needs the Owner or Administrator role (also
+> when the role is scoped to the parent project); Developers keep creating schema-only branches. The API
+> answers 403 with the usual role-denial body. `sbctl branches create` runs on the node as its operator
+> and is not checked.
 
 The cheapest way available is chosen at runtime and recorded as `clone_method`:
 

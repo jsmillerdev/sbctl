@@ -190,6 +190,17 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) error {
 	if err := decode(r, &in); err != nil {
 		return err
 	}
+	// A branch with data is a copy of production data: Owner or Administrator only. Schema-only
+	// branches stay with the route's own rule (Developer and up).
+	if in.WithData != nil && *in.WithData {
+		p, err := s.loadProject(r.Context(), r.PathValue("ref"))
+		if err != nil {
+			return err
+		}
+		if err := s.requireBranchData(r, p); err != nil {
+			return err
+		}
+	}
 	if s.branches == nil {
 		return s.noBranching()
 	}

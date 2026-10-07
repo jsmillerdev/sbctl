@@ -161,6 +161,9 @@ func matrixCases() []routeCase {
 		rc("YYYNYN", "DELETE", p+"/cli/login-role", nil),
 		rc("YYYNYN", "DELETE", p+"/functions/nope", nil),
 		rc("YYYNYN", "POST", p+"/branches", map[string]any{"branch_name": "x"}),
+		// a branch with data copies production data: Owner and Administrator only
+		rc("YYYNYN", "POST", p+"/branches", map[string]any{"branch_name": "x2", "with_data": false}),
+		rc("YYNNNN", "POST", p+"/branches", map[string]any{"branch_name": "x3", "with_data": true}),
 		// project: users, storage
 		rc("YYYYYN", "GET", "/platform/auth/"+testRef+"/users", nil),
 		rc("YYYNYN", "POST", "/platform/auth/"+testRef+"/users", map[string]any{"email": "u@example.test", "password": "pw-pw-pw-pw"}),
@@ -352,6 +355,52 @@ func TestImplementedRoutesOpenToEveryUserAreAllowlisted(t *testing.T) {
 		m, p, _ := strings.Cut(key, " ")
 		if n := routeNeed(m, p); n.kind == needAny && !open.MatchString(p) {
 			t.Errorf("%s is open to every signed-in user; give it a rule in routeRules", key)
+		}
+	}
+}
+
+// A branch with data copies the parent's data, so it needs the Owner or Administrator role;
+// schema-only branches keep the Developer permission. The refusal has the shape of every other
+// role denial, and nothing is created.
+func TestBranchWithDataNeedsOwnerOrAdministrator(t *testing.T) {
+	rf := newRolesFixture(t)
+	path := "/v1/projects/" + testRef + "/branches"
+	list := func() int {
+		rec := rf.as("owner", "GET", path, nil)
+		var bs []map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &bs); err != nil {
+			t.Fatal(err)
+		}
+		return len(bs)
+	}
+	before := list()
+	for _, role := range []string{"dev", "ro", "scoped"} {
+		rec := rf.as(role, "POST", path, map[string]any{"branch_name": "data-" + role, "with_data": true})
+		if rec.Code != 403 {
+			t.Fatalf("%s: with_data answered %d %s, want 403", role, rec.Code, rec.Body)
+		}
+		// Read-only is already refused by the route's own rule; the others reach this check.
+		if msg, _ := jsonField(t, rec, "message").(string); !strings.HasPrefix(msg, "Your role does not allow this action") || (role != "ro" && !strings.Contains(msg, "Owner or Administrator")) {
+			t.Errorf("%s: message %q", role, msg)
+		}
+	}
+	if n := list(); n != before {
+		t.Fatalf("a refused request created a branch (%d before, %d after)", before, n)
+	}
+	// The refusal comes before the body is acted on, whatever else it says.
+	if rec := rf.as("dev", "POST", path, map[string]any{"branch_name": "data-dev", "with_data": true, "persistent": true}); rec.Code != 403 {
+		t.Errorf("dev with_data and persistent: %d", rec.Code)
+	}
+	// Developers still create schema-only branches, with the field absent or false.
+	for i, body := range []map[string]any{{"branch_name": "dev-a"}, {"branch_name": "dev-b", "with_data": false}} {
+		if rec := rf.as("dev", "POST", path, body); rec.Code != 201 {
+			t.Errorf("dev schema-only branch %d: %d %s", i, rec.Code, rec.Body)
+		}
+	}
+	for _, role := range []string{"owner", "admin"} {
+		rec := rf.as(role, "POST", path, map[string]any{"branch_name": "data-" + role, "with_data": true})
+		if rec.Code == 403 {
+			t.Errorf("%s: with_data refused: %s", role, rec.Body)
 		}
 	}
 }

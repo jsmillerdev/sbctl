@@ -203,7 +203,8 @@ Capabilities follow hosted's access-control documentation and the role descripti
 | Restart a project; restore backups | yes | yes | yes | |
 | Project settings (Auth, PostgREST, Realtime, Storage, Postgres); API keys create, update, revoke; function secrets write; any unnamed write | yes | yes | | |
 | Read the service_role key, the JWT secret, the S3 credentials; temporary keys | yes | yes | yes | |
-| Write SQL, apply migrations, change schema (Studio and pg-meta), Auth users, Storage buckets and objects, deploy and delete functions, preview branches | yes | yes | yes | |
+| Write SQL, apply migrations, change schema (Studio and pg-meta), Auth users, Storage buckets and objects, deploy and delete functions, preview branches (schema-only) | yes | yes | yes | |
+| Create a branch with data (`with_data: true`; it copies the parent's data) | yes | yes | | |
 | Read everything else: config, logs, advisors, users, buckets, functions, secrets (digests), `SELECT` SQL, types | yes | yes | yes | yes |
 | Saved SQL snippets: create; change or delete one's own (Owner and Administrator: anyone's shared ones) | yes | yes | yes | yes |
 | Saved reports: same, but Read-only may not create or change them | yes | yes | yes | |
@@ -234,7 +235,10 @@ Developer and a user without a membership through the real handlers.
   its parent project: a role scoped to a project covers the project's branches (`scopeRef`), and a route that names a
   branch by id or ref (`/v1/branches/{branch_id_or_ref}/**`) is resolved to the parent before the check
   (`branchParent`): read needs `read:Read` on `preview_branches`, delete `write:Delete`, the other writes
-  `write:Update`. `GET /v1/branches/{id}` leaves out `db_pass` and `jwt_secret` for a caller who cannot read the
+  `write:Update`. `POST /v1/projects/{ref}/branches` with `with_data: true` also needs the permission to update
+  the project (Owner or Administrator, `requireBranchData`), checked by the handler because the route table cannot
+  see the body; the denial is the usual 403 `{"message": "Your role does not allow this action (...)"}` and nothing
+  is created (`TestBranchWithDataNeedsOwnerOrAdministrator`). `GET /v1/branches/{id}` leaves out `db_pass` and `jwt_secret` for a caller who cannot read the
   project's keys (Read-only). `TestBranchRoutesFollowTheParentsRoles` covers it, and
   `TestImplementedRoutesOpenToEveryUserAreAllowlisted` fails for a hand-written route that is open to every
   signed-in user and is not on the short list.
