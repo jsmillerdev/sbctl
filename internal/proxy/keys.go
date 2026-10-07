@@ -101,23 +101,65 @@ func legacyKey(k *secrets.ProjectKeys, ref, apikey string) (role, jwt string, ok
 	return "", "", false
 }
 
-// disabledLegacyBearer reports whether bearer is exactly the project's anon or service_role
-// key while the legacy keys are disabled. Such a token is what a leaked legacy key looks
-// like on the wire, and the switch exists to make it stop working. Other JWTs signed with the
-// project's secret (users' sessions, which GoTrue signs with it) stay valid in Authorization
-// until the JWT secret is rotated, as on hosted.
-func disabledLegacyBearer(k *secrets.ProjectKeys, bearer string) bool {
-	return k != nil && k.LegacyDisabled && bearer != "" && !strings.HasPrefix(bearer, "sb_") &&
-		(eqConst(bearer, k.AnonKey) || eqConst(bearer, k.ServiceRoleKey))
+// signingInput returns the "<header>.<payload>" part of a JWT-shaped token: the bytes the
+// HMAC covers. ok is false for a token without a dot.
+func signingInput(tok string) (string, bool) {
+	i := strings.IndexByte(tok, '.')
+	if i < 0 {
+		return "", false
+	}
+	if j := strings.IndexByte(tok[i+1:], '.'); j >= 0 {
+		return tok[:i+1+j], true
+	}
+	return tok, true
 }
 
-// refusedLegacy reports whether key is a legacy credential of the project (anon or
-// service_role key, or a JWT signed with the project secret for one of those roles) that the
-// disabled legacy switch turns away. The dashboard's temporary key is spared. Opaque sb_ keys
-// are never legacy.
+// isLegacyKeyToken reports whether tok is the project's anon or service_role key in any
+// encoding the upstream verifiers accept: its header and payload segments (the signing input)
+// equal those of the key. The signature segment is not compared. It can be re-encoded without
+// changing the bytes it stands for (flipped unused low bits of its last character, "="
+// padding), verifiers decode it leniently, and a signature that does not verify gets the token
+// nowhere anyway. Comparing the signing input exactly is what a canonical comparison needs:
+// the HMAC covers those segments as text, so any other spelling of them fails verification.
+func isLegacyKeyToken(k *secrets.ProjectKeys, tok string) bool {
+	if k == nil || tok == "" {
+		return false
+	}
+	in, ok := signingInput(tok)
+	if !ok {
+		return false
+	}
+	var hit bool
+	for _, key := range []string{k.AnonKey, k.ServiceRoleKey} {
+		want, _ := signingInput(key)
+		// No early exit, as in eqConst.
+		if eqConst(in, want) {
+			hit = true
+		}
+	}
+	return hit
+}
+
+// disabledLegacyBearer reports whether bearer is the project's anon or service_role key while
+// the legacy keys are disabled (in any signature encoding, see isLegacyKeyToken). Such a token
+// is what a leaked legacy key looks like on the wire, and the switch exists to make it stop
+// working. Other JWTs signed with the project's secret (users' sessions, which GoTrue signs
+// with it) stay valid in Authorization until the JWT secret is rotated, as on hosted.
+func disabledLegacyBearer(k *secrets.ProjectKeys, bearer string) bool {
+	return k != nil && k.LegacyDisabled && bearer != "" && !strings.HasPrefix(bearer, "sb_") &&
+		isLegacyKeyToken(k, bearer)
+}
+
+// refusedLegacy reports whether key is a legacy credential of the project (the anon or
+// service_role key in any signature encoding, or a JWT signed with the project secret for one
+// of those roles) that the disabled legacy switch turns away. The dashboard's temporary key
+// is spared. Opaque sb_ keys are never legacy.
 func refusedLegacy(k *secrets.ProjectKeys, ref, key string) bool {
 	if k == nil || !k.LegacyDisabled || key == "" || strings.HasPrefix(key, "sb_") {
 		return false
+	}
+	if isLegacyKeyToken(k, key) {
+		return true
 	}
 	if _, _, tmp := temporaryKey(k, ref, key); tmp {
 		return false
@@ -163,6 +205,8 @@ func bearerToken(authz string) string {
 type authResult struct {
 	status int
 	body   string
+	// ctype is the Content-Type of a refusal; empty means text/plain.
+	ctype string
 
 	set      map[string]string // canonical header name -> value
 	del      []string
@@ -183,6 +227,8 @@ func authorize(rt *route, k *secrets.ProjectKeys, ref string, h http.Header, raw
 		return authResult{rawQuery: rawQuery}
 	case keyFunctions:
 		return authorizeFunctions(k, ref, h, rawQuery)
+	case keyS3:
+		return authorizeS3(k, ref, h, rawQuery)
 	}
 
 	queryKey, query := stripAPIKey(rawQuery)
@@ -278,5 +324,55 @@ func authorizeFunctions(k *secrets.ProjectKeys, ref string, h http.Header, rawQu
 		return reject(http.StatusUnauthorized, msgInvalidKey)
 	}
 	res.set = map[string]string{"Sb-Api-Key": jwt}
+	return res
+}
+
+// S3 refusals use Storage's own error document (S3 clients parse it), not plain text.
+const (
+	s3AccessDeniedBody = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>AccessDenied</Code><Message>The legacy API keys are disabled for this project: ` +
+		`use S3 access keys or a user session as the session token</Message></Error>`
+	s3AccessDeniedPostBody = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>AccessDenied</Code><Message>Browser-based POST uploads are not available while the ` +
+		`legacy API keys are disabled for this project</Message></Error>`
+)
+
+func rejectS3(body string) authResult {
+	return authResult{status: http.StatusForbidden, body: body, ctype: "application/xml"}
+}
+
+// authorizeS3 guards Storage's S3 endpoint. The request carries an AWS SigV4 signature that must
+// reach Storage untouched, so nothing is rewritten. Storage accepts, besides its own S3
+// credentials, any JWT of the project sent as the S3 session token (the X-Amz-Security-Token
+// header or presigned query parameter) and acts with that token's claims, so a leaked legacy
+// key would work here as well: with the legacy keys disabled such a session token is refused.
+// A session token that is a user's session, or no session token at all (Storage's S3
+// credentials), passes. The token of a browser POST upload travels in a multipart form field
+// the proxy does not parse, so those uploads are refused while the legacy keys are disabled.
+func authorizeS3(k *secrets.ProjectKeys, ref string, h http.Header, rawQuery string) authResult {
+	res := authResult{rawQuery: rawQuery}
+	if k == nil || !k.LegacyDisabled {
+		return res
+	}
+	if disabledLegacyBearer(k, bearerToken(h.Get("Authorization"))) {
+		return rejectS3(s3AccessDeniedBody)
+	}
+	for _, tok := range h.Values("X-Amz-Security-Token") {
+		if refusedLegacy(k, ref, strings.TrimSpace(tok)) {
+			return rejectS3(s3AccessDeniedBody)
+		}
+	}
+	for _, part := range strings.Split(rawQuery, "&") {
+		name, val, _ := strings.Cut(part, "=")
+		if n, err := url.QueryUnescape(name); err != nil || !strings.EqualFold(n, "X-Amz-Security-Token") {
+			continue
+		}
+		if v, err := url.QueryUnescape(val); err == nil && refusedLegacy(k, ref, strings.TrimSpace(v)) {
+			return rejectS3(s3AccessDeniedBody)
+		}
+	}
+	if ct := h.Get("Content-Type"); strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "multipart/form-data") {
+		return rejectS3(s3AccessDeniedPostBody)
+	}
 	return res
 }

@@ -66,9 +66,12 @@ const (
 	// keyFunctions puts the translated JWT in a raw sb-api-key header and leaves
 	// apikey, Authorization and the query string alone.
 	keyFunctions
-	// keyNone forwards credentials untouched (S3 requests carry an AWS SigV4
-	// Authorization header that must not be rewritten).
+	// keyNone forwards credentials untouched.
 	keyNone
+	// keyS3 forwards credentials untouched (S3 requests carry an AWS SigV4 Authorization header
+	// that must not be rewritten) but refuses a legacy key sent as the S3 session token while
+	// the project's legacy keys are disabled.
+	keyS3
 )
 
 // route is one entry of the project API route table. The table mirrors the
@@ -114,7 +117,7 @@ var projectRoutes = []route{
 	{name: "functions-v1", prefix: "/functions/v1", svc: svcFunctions, access: accessOpen, keys: keyFunctions, fwdPrefix: "/functions/v1/", timeout: functionsTimeout},
 
 	// Storage: no key check (public objects, signed URLs, S3 SigV4).
-	{name: "storage-v1-s3", prefix: "/storage/v1/s3", svc: svcStorage, upstream: "/s3", access: accessOpen, keys: keyNone, fwdPrefix: "/storage/v1", timeout: storageTimeout},
+	{name: "storage-v1-s3", prefix: "/storage/v1/s3", svc: svcStorage, upstream: "/s3", access: accessOpen, keys: keyS3, fwdPrefix: "/storage/v1", timeout: storageTimeout},
 	{name: "storage-v1", prefix: "/storage/v1", svc: svcStorage, access: accessOpen, keys: keyBearer, fwdPrefix: "/storage/v1", timeout: storageTimeout},
 
 	// Protected GoTrue and PostgREST.

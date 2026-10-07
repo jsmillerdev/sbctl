@@ -57,6 +57,9 @@ type table struct {
 	keyGen   map[string]uint64
 	keyEpoch uint64
 	sf       singleflight.Group
+	// onKeysDropped, when set, is told (outside the lock, and it must not block) that the
+	// cached keys of a project, or of all projects (ref ""), were dropped.
+	onKeysDropped func(ref string)
 }
 
 func newTable(cfg *config.Config, reg registry.Registry, keys KeySource, log *slog.Logger) *table {
@@ -161,6 +164,9 @@ func (t *table) reload(ctx context.Context) error {
 	t.custom = t.customRoutes(rs)
 	t.dropAllKeysLocked()
 	t.mu.Unlock()
+	if t.onKeysDropped != nil {
+		t.onKeysDropped("")
+	}
 	t.log.Debug("proxy table reloaded", "projects", len(projects), "routes", len(rs))
 	return nil
 }
@@ -245,6 +251,9 @@ func (t *table) invalidateKeys(ref string) {
 	t.mu.Unlock()
 	// A fetch already in flight may carry the old keys; forget it so the next request refetches.
 	t.sf.Forget(ref)
+	if t.onKeysDropped != nil {
+		t.onKeysDropped(ref)
+	}
 }
 
 // projectKeys returns the project's credentials, cached until a change
