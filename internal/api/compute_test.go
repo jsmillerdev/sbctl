@@ -349,3 +349,20 @@ func TestDiskSizeIsEnforcedOnAnXFSProjectQuotaVolume(t *testing.T) {
 		t.Fatalf("limit after resize = %d", g)
 	}
 }
+
+// The pooler tenant of a project runs with its size's pool and client limit until someone saves others.
+func TestPoolerDefaultsFollowTheSize(t *testing.T) {
+	f := newFixture(t)
+	p := f.projectRow(t)
+	p.Class = "small"
+	_ = f.reg.UpdateProject(t.Context(), p)
+	got := f.body(t, "GET", "/platform/projects/"+testRef+"/config/pgbouncer", nil, 200)
+	if got["default_pool_size"] != float64(35) || got["max_client_conn"] != float64(400) {
+		t.Fatalf("small: %v", got)
+	}
+	f.cfg.Fleet.PoolerMaxClientConn = 300 // the node's ceiling holds the default down
+	got = f.body(t, "GET", "/platform/projects/"+testRef+"/config/pgbouncer", nil, 200)
+	if got["max_client_conn"] != float64(300) {
+		t.Fatalf("under a ceiling of 300: %v", got)
+	}
+}

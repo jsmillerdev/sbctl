@@ -120,6 +120,7 @@ func newEnv(t *testing.T) *env {
 		},
 		Tenants: fleet.Fleet{&fakeTenant{svc: "realtime"}, &fakeTenant{svc: "storage"}},
 		Disk:    func(string) (uint64, uint64, error) { return 60 << 30, 100 << 30, nil },
+		Node:    func() lifecycle.NodeResources { return lifecycle.NodeResources{MemoryBytes: 16 << 30, CPUs: 4} },
 	}
 	return e
 }
@@ -353,6 +354,21 @@ func TestRegistryUnreachableIsDownAndSaysWhy(t *testing.T) {
 	}
 	if len(r.Projects) != 0 {
 		t.Errorf("projects listed without a registry: %+v", r.Projects)
+	}
+}
+
+// The capacity line shows the headroom for creates and resizes, and warns when the sizes already
+// promise more than the budget.
+func TestCapacity(t *testing.T) {
+	e := newEnv(t) // two running Micro projects (1 GB each); the paused one holds nothing
+	comp, ok := e.check().Component("capacity")
+	if !ok || comp.State != OK || !strings.Contains(comp.Detail, "2 GB of 48 GB project memory caps promised to 2 projects (16 GB of memory x 3 overcommit); 4 cores") {
+		t.Fatalf("capacity = %+v %v", comp, ok)
+	}
+	e.deps.Node = func() lifecycle.NodeResources { return lifecycle.NodeResources{MemoryBytes: 512 << 20, CPUs: 1} }
+	comp, _ = e.check().Component("capacity")
+	if comp.State != Warn || !strings.Contains(comp.Detail, "over the budget") {
+		t.Fatalf("over the budget = %+v", comp)
 	}
 }
 

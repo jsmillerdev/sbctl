@@ -261,7 +261,7 @@ func (s *Server) pgbouncerConfig(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	pool, maxClients := poolerValues(st)
+	pool, maxClients := s.poolerValues(p, st)
 	resp := base("GET /platform/projects/{ref}/config/pgbouncer")
 	setAll(resp, map[string]any{
 		"default_pool_size": pool, "max_client_conn": maxClients, "ignore_startup_parameters": poolerIgnoredParams,

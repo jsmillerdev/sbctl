@@ -79,10 +79,19 @@ func (s *Server) poolerPatch(body map[string]any, maxPool float64) (map[string]a
 
 func quoted(v any) string { return fmt.Sprintf("%q", fmt.Sprint(v)) }
 
-// poolerValues reads the effective pool size and client limit of a saved state.
-func poolerValues(st *projectconfig.State) (pool, maxClients int64) {
+// poolerValues reads the effective pool size and client limit of a saved state. A value nobody
+// saved is the project's size's (lifecycle.Class.PoolSize and PoolerMaxClients, the latter held
+// under the node's per-project ceiling), the same the project's pooler tenant runs with.
+func (s *Server) poolerValues(p *registry.Project, st *projectconfig.State) (pool, maxClients int64) {
 	pool, _ = st.Effective.Int("default_pool_size")
 	maxClients, _ = st.Effective.Int("max_client_conn")
+	size := sizeOf(p)
+	if _, saved := st.Set.Int("default_pool_size"); !saved {
+		pool = int64(size.PoolSize)
+	}
+	if _, saved := st.Set.Int("max_client_conn"); !saved {
+		maxClients = int64(min(size.PoolerMaxClients, s.cfg.Fleet.PoolerMaxClients()))
+	}
 	return pool, maxClients
 }
 
@@ -104,7 +113,7 @@ func (s *Server) patchPoolerV1(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	pool, _ := poolerValues(ch.State)
+	pool, _ := s.poolerValues(p, ch.State)
 	resp := base(key)
 	setAll(resp, map[string]any{"default_pool_size": pool, "pool_mode": poolerMode})
 	writeStatusFor(w, key, resp)
@@ -129,7 +138,7 @@ func (s *Server) patchPgbouncer(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	pool, maxClients := poolerValues(ch.State)
+	pool, maxClients := s.poolerValues(p, ch.State)
 	resp := base(key)
 	setAll(resp, map[string]any{
 		"pgbouncer_enabled": true, "pgbouncer_status": "ENABLED", "ignore_startup_parameters": poolerIgnoredParams,

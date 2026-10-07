@@ -171,8 +171,13 @@ func (e *Engine) Capacity(ctx context.Context, exclude string) (Capacity, bool, 
 	if err != nil {
 		return Capacity{}, true, err
 	}
-	n := e.capacity.node()
-	c := Capacity{Node: n, Overcommit: e.cfg.Compute.OvercommitRatio()}
+	return ComputeCapacity(e.cfg, e.capacity.node(), ps, exclude), true, nil
+}
+
+// ComputeCapacity works out the node's room from its resources and its projects, leaving out the
+// project exclude. `supavise status` uses it without an Engine.
+func ComputeCapacity(cfg *config.Config, n NodeResources, ps []registry.Project, exclude string) Capacity {
+	c := Capacity{Node: n, Overcommit: cfg.Compute.OvercommitRatio()}
 	c.BudgetBytes = int64(float64(n.MemoryBytes) * c.Overcommit)
 	for i := range ps {
 		p := &ps[i]
@@ -182,8 +187,21 @@ func (e *Engine) Capacity(ctx context.Context, exclude string) (Capacity, bool, 
 		c.CommittedBytes += projectMemory(p)
 		c.Projects++
 	}
-	return c, true, nil
+	return c
 }
+
+// Summary is the one-line account of the node's room, as `supavise status` shows it.
+func (c Capacity) Summary() string {
+	if c.BudgetBytes == 0 {
+		return fmt.Sprintf("%s of project memory caps promised to %d projects; the node's memory is unknown", sizeText(c.CommittedBytes), c.Projects)
+	}
+	return fmt.Sprintf("%s of %s project memory caps promised to %d projects (%s of memory x %g overcommit); %d cores",
+		sizeText(c.CommittedBytes), sizeText(c.BudgetBytes), c.Projects, sizeText(c.Node.MemoryBytes), c.Overcommit, c.Node.CPUs)
+}
+
+// Over reports whether the caps already promised exceed the budget (sizes were raised by
+// hand, the overcommit ratio was lowered, or the machine shrank).
+func (c Capacity) Over() bool { return c.BudgetBytes > 0 && c.CommittedBytes > c.BudgetBytes }
 
 // Offers lists every size with whether the node can give it to ref now (ref "" is a project
 // that does not exist yet). Sizes below the current one always fit.

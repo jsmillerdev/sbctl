@@ -499,7 +499,7 @@ func (s *Server) v1Pooler(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	pool, maxClients := poolerValues(st)
+	pool, maxClients := s.poolerValues(p, st)
 	size, maxConn := int(pool), int(maxClients)
 	writeJSON(w, http.StatusOK, []v1.SupavisorConfigResponseOutput{{
 		ConnectionString: conn, ConnectionStringSnake: conn, DatabaseType: "PRIMARY",
