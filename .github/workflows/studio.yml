@@ -30,7 +30,7 @@ jobs:
         with:
           node-version: 22
       - name: prepare runner
-        run: sudo studio/ci-prepare.sh
+        run: sudo env SBCTL_CI=1 studio/ci-prepare.sh   # sudo drops GITHUB_ACTIONS from the environment
       - name: build
         run: studio/build.sh ${{ matrix.platform }}
       - uses: actions/upload-artifact@v4
