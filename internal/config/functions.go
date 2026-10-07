@@ -295,6 +295,8 @@ func (p Paths) FunctionsRoot() string {
 	return filepath.Join(p.System(SvcEdgeRuntime), "tenants")
 }
 
-// EdgeBundleDir is the state directory of sb-edge-bundle.service: work/ holds the upload being
-// bundled (the unit sees nothing else of the node) and deno/ its module cache.
+// EdgeBundleDir is the state directory of the bundler units (sb-edge-bundle@<ref>.service):
+// work/ holds the upload being bundled (the unit sees nothing else of the node). The module
+// cache is per project: under systemd it is the unit's own CacheDirectory, and the exec backend
+// keeps it in <state>/projects/<ref>/edge-bundle/deno, which goes with the project.
 func (p Paths) EdgeBundleDir() string { return p.System(SvcEdgeBundle) }

@@ -5,7 +5,7 @@
 # functions with supabase-js and fetch (verify.mjs), redeploys, deletes, and checks the files on
 # disk. Project A's functions are bundled on the machine that runs this script and uploaded as
 # bundles; project B's are uploaded as sources with `supabase functions deploy --use-api`, which
-# the node bundles itself (in the sandbox of sb-edge-bundle.service on Linux).
+# the node bundles itself (in the sandbox of sb-edge-bundle@<ref>.service on Linux).
 #
 # How project A is bundled (DEPLOY_VIA):
 #   cli       `supabase functions deploy`, the default flow of the CLI. It bundles in a Docker

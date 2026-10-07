@@ -67,7 +67,7 @@ type Deps struct {
 	// Now is the clock; empty means time.Now.
 	Now func() time.Time
 	// Supervisor and Artifacts let the Syncer bundle uploaded sources in the sandbox of
-	// sb-edge-bundle.service (lifecycle.Node's Supervisor and Artifacts). Without them, or
+	// sb-edge-bundle@<ref>.service (lifecycle.Node's Supervisor and Artifacts). Without them, or
 	// where the supervisor cannot confine the bundler, source uploads are refused.
 	Supervisor units.Supervisor
 	Artifacts  ArtifactDirs
@@ -129,7 +129,7 @@ func (s *Syncer) BundleSources(ctx context.Context, in api.SourceBundle) (*api.B
 	if s.bundler == nil {
 		return nil, fmt.Errorf("%w (%s)", api.ErrBundlingUnavailable, s.bundlerWhy)
 	}
-	bundle, entry, err := s.bundler.Bundle(ctx, BundleInput{Files: in.Files, Entrypoint: in.Entrypoint, ImportMap: in.ImportMap, Static: in.StaticPatterns})
+	bundle, entry, err := s.bundler.Bundle(ctx, BundleInput{Ref: in.Ref, Files: in.Files, Entrypoint: in.Entrypoint, ImportMap: in.ImportMap, Static: in.StaticPatterns})
 	if err != nil {
 		return nil, err
 	}

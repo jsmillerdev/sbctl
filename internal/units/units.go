@@ -31,7 +31,7 @@ type Spec struct {
 	// unit. GoTrue uses it for "bin/auth migrate".
 	PreStart [][]string
 	// PublicRun makes the launcher script world-readable (0755 instead of 0750), for a unit
-	// that runs under another uid than the sbctl user (sb-edge-bundle.service, a dynamic
+	// that runs under another uid than the sbctl user (sb-edge-bundle@<ref>.service, a dynamic
 	// user). The script holds paths and arguments, never secrets: the environment is in the
 	// 0600 env file, which systemd reads as root.
 	PublicRun bool

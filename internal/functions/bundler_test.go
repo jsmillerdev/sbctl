@@ -113,6 +113,7 @@ func decodeEZBR(t *testing.T, b []byte) string {
 func TestBundlerBundlesUploadedSourcesAndCleansUp(t *testing.T) {
 	r := newBundlerRig(t)
 	in := BundleInput{
+		Ref:        refA,
 		Entrypoint: "supabase/functions/hello/index.ts",
 		ImportMap:  "supabase/functions/import_map.json",
 		Static:     []string{"supabase/functions/hello/*.html"},
@@ -142,10 +143,10 @@ func TestBundlerBundlesUploadedSourcesAndCleansUp(t *testing.T) {
 			t.Errorf("args %q lack %q", args, want)
 		}
 	}
-	if spec.Service != config.SvcEdgeBundle || spec.Unit() != "sb-edge-bundle.service" || spec.Limits.MemoryMax != "1G" {
+	if spec.Service != config.SvcEdgeBundle || spec.Unit() != "sb-edge-bundle@"+refA+".service" || spec.Limits.MemoryMax != "1G" {
 		t.Errorf("spec %+v", spec)
 	}
-	if spec.Env["DENO_NO_PACKAGE_JSON"] != "1" || !strings.HasSuffix(spec.Env["DENO_DIR"], "/system/edge-bundle/deno") {
+	if spec.Env["DENO_NO_PACKAGE_JSON"] != "1" || !strings.HasSuffix(spec.Env["DENO_DIR"], "/projects/"+refA+"/edge-bundle/deno") {
 		t.Errorf("env %v", spec.Env)
 	}
 	// Nothing of the upload stays: it is someone else's code and secrets in its sources.
@@ -161,7 +162,7 @@ func TestBundlerBundlesUploadedSourcesAndCleansUp(t *testing.T) {
 // backend reports any process that has gone as failed, and only the output says how it ended.
 func TestBundlerAcceptsABundlingThatOutlivesTheStartGrace(t *testing.T) {
 	r := newBundlerRig(t)
-	if _, _, err := r.b.Bundle(context.Background(), BundleInput{Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("LATE")}}}); err != nil {
+	if _, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: refA, Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("LATE")}}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -181,13 +182,13 @@ func TestBundleCommandFollowsTheCLI(t *testing.T) {
 		noPkgJSON  bool
 		wantStatic int
 	}{
-		{"plain", BundleInput{Entrypoint: "f/a/index.ts", Files: files("f/a/index.ts")}, false, true, 0},
-		{"import map elsewhere", BundleInput{Entrypoint: "f/a/index.ts", ImportMap: "f/import_map.json", Files: files("f/a/index.ts")}, true, true, 0},
-		{"deno.json beside the entrypoint is found by deno itself", BundleInput{Entrypoint: "f/a/index.ts", ImportMap: "f/a/deno.json", Files: files("f/a/index.ts")}, false, true, 0},
-		{"deno.jsonc elsewhere is passed", BundleInput{Entrypoint: "f/a/index.ts", ImportMap: "f/deno.jsonc", Files: files("f/a/index.ts")}, true, true, 0},
-		{"package.json beside the entrypoint, no import map", BundleInput{Entrypoint: "f/a/index.ts", Files: files("f/a/index.ts", "f/a/package.json")}, false, false, 0},
-		{"package.json with an import map", BundleInput{Entrypoint: "f/a/index.ts", ImportMap: "f/m.json", Files: files("f/a/index.ts", "f/a/package.json")}, true, true, 0},
-		{"static files", BundleInput{Entrypoint: "f/a/index.ts", Static: []string{"f/a/*.txt", "f/b.txt"}, Files: files("f/a/index.ts")}, false, true, 2},
+		{"plain", BundleInput{Ref: refA, Entrypoint: "f/a/index.ts", Files: files("f/a/index.ts")}, false, true, 0},
+		{"import map elsewhere", BundleInput{Ref: refA, Entrypoint: "f/a/index.ts", ImportMap: "f/import_map.json", Files: files("f/a/index.ts")}, true, true, 0},
+		{"deno.json beside the entrypoint is found by deno itself", BundleInput{Ref: refA, Entrypoint: "f/a/index.ts", ImportMap: "f/a/deno.json", Files: files("f/a/index.ts")}, false, true, 0},
+		{"deno.jsonc elsewhere is passed", BundleInput{Ref: refA, Entrypoint: "f/a/index.ts", ImportMap: "f/deno.jsonc", Files: files("f/a/index.ts")}, true, true, 0},
+		{"package.json beside the entrypoint, no import map", BundleInput{Ref: refA, Entrypoint: "f/a/index.ts", Files: files("f/a/index.ts", "f/a/package.json")}, false, false, 0},
+		{"package.json with an import map", BundleInput{Ref: refA, Entrypoint: "f/a/index.ts", ImportMap: "f/m.json", Files: files("f/a/index.ts", "f/a/package.json")}, true, true, 0},
+		{"static files", BundleInput{Ref: refA, Entrypoint: "f/a/index.ts", Static: []string{"f/a/*.txt", "f/b.txt"}, Files: files("f/a/index.ts")}, false, true, 2},
 	} {
 		args, env, err := bundleCommand(c.in, "/s", "/s/../out.eszip")
 		if err != nil {
@@ -205,14 +206,14 @@ func TestBundleCommandFollowsTheCLI(t *testing.T) {
 			t.Errorf("%s: %d --static in %q", c.name, n, joined)
 		}
 	}
-	if _, _, err := bundleCommand(BundleInput{Entrypoint: "a.ts", Static: []string{"../../etc/passwd"}}, "/s", "/o"); err == nil {
+	if _, _, err := bundleCommand(BundleInput{Ref: refA, Entrypoint: "a.ts", Static: []string{"../../etc/passwd"}}, "/s", "/o"); err == nil {
 		t.Error("a static pattern that leaves the sources was accepted")
 	}
 }
 
 func TestBundlerReportsWhatTheBundlerSaid(t *testing.T) {
 	r := newBundlerRig(t)
-	_, _, err := r.b.Bundle(context.Background(), BundleInput{Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("BROKEN")}}})
+	_, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: refA, Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("BROKEN")}}})
 	var be *api.BundleError
 	if !errors.As(err, &be) || !strings.Contains(be.Msg, `Module not found "file:///nowhere/missing.ts"`) {
 		t.Fatalf("err = %v", err)
@@ -221,7 +222,7 @@ func TestBundlerReportsWhatTheBundlerSaid(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.cfg.Paths().EdgeBundleDir(), "work")); !os.IsNotExist(err) {
 		t.Errorf("scratch after failure: %v", err)
 	}
-	if _, _, err := r.b.Bundle(context.Background(), BundleInput{Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("ok")}}}); err != nil {
+	if _, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: refA, Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("ok")}}}); err != nil {
 		t.Fatalf("after a failure: %v", err)
 	}
 }
@@ -229,7 +230,7 @@ func TestBundlerReportsWhatTheBundlerSaid(t *testing.T) {
 func TestBundlerRefusesPathsThatLeaveTheUpload(t *testing.T) {
 	r := newBundlerRig(t)
 	for _, name := range []string{"../escape.ts", "a/../../escape.ts", ""} {
-		_, _, err := r.b.Bundle(context.Background(), BundleInput{Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("ok")}, {Path: name, Content: []byte("x")}}})
+		_, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: refA, Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("ok")}, {Path: name, Content: []byte("x")}}})
 		var be *api.BundleError
 		if !errors.As(err, &be) {
 			t.Errorf("%q: err = %v", name, err)
@@ -239,7 +240,7 @@ func TestBundlerRefusesPathsThatLeaveTheUpload(t *testing.T) {
 		t.Error("a file left the upload")
 	}
 	// A file and a directory of the same name conflict.
-	_, _, err := r.b.Bundle(context.Background(), BundleInput{Entrypoint: "a", Files: []api.FunctionFile{{Path: "a", Content: []byte("x")}, {Path: "a/b", Content: []byte("y")}}})
+	_, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: refA, Entrypoint: "a", Files: []api.FunctionFile{{Path: "a", Content: []byte("x")}, {Path: "a/b", Content: []byte("y")}}})
 	var be *api.BundleError
 	if !errors.As(err, &be) {
 		t.Errorf("conflicting paths: %v", err)
@@ -252,7 +253,7 @@ func TestBundlerTimesOutAndStopsTheUnit(t *testing.T) {
 	defer func() { bundleTimeout = old }()
 	r := newBundlerRig(t)
 	started := time.Now()
-	_, _, err := r.b.Bundle(context.Background(), BundleInput{Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("SLOW")}}})
+	_, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: refA, Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("SLOW")}}})
 	var be *api.BundleError
 	if !errors.As(err, &be) || !strings.Contains(be.Msg, "did not finish") {
 		t.Fatalf("err = %v", err)
@@ -260,7 +261,7 @@ func TestBundlerTimesOutAndStopsTheUnit(t *testing.T) {
 	if time.Since(started) > 10*time.Second {
 		t.Fatalf("took %s", time.Since(started))
 	}
-	st, _ := r.sup.Status(context.Background(), "sb-edge-bundle.service")
+	st, _ := r.sup.Status(context.Background(), "sb-edge-bundle@"+refA+".service")
 	if st.State == units.StateActive {
 		t.Fatalf("the unit still runs: %+v", st)
 	}
@@ -272,7 +273,7 @@ func TestBundlerQueueIsBounded(t *testing.T) {
 	for i := 0; i < cap(r.b.slots); i++ {
 		r.b.slots <- struct{}{}
 	}
-	_, _, err := r.b.Bundle(context.Background(), BundleInput{Entrypoint: "i.ts", Files: []api.FunctionFile{{Path: "i.ts"}}})
+	_, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: refA, Entrypoint: "i.ts", Files: []api.FunctionFile{{Path: "i.ts"}}})
 	if !errors.Is(err, api.ErrBundlingBusy) {
 		t.Fatalf("err = %v", err)
 	}
@@ -363,7 +364,7 @@ func (l *layoutSup) Status(ctx context.Context, unit string) (units.Status, erro
 	return st, err
 }
 
-// The bundler's unit runs under a uid of its own (see sb-edge-bundle.service), so the daemon hands
+// The bundler's unit runs under a uid of its own (see sb-edge-bundle@.service), so the daemon hands
 // it what it needs through the modes of files: readable sources it cannot change, an output
 // directory it cannot create anything in, and two files it can write.
 func TestBundlerHandsTheUnitsUidWhatItNeedsAndNothingElse(t *testing.T) {
@@ -377,7 +378,7 @@ func TestBundlerHandsTheUnitsUidWhatItNeedsAndNothingElse(t *testing.T) {
 	// The daemon's umask hides group and other from everything it creates.
 	old := syscall.Umask(0o027)
 	defer syscall.Umask(old)
-	if _, _, err := b.Bundle(context.Background(), BundleInput{Entrypoint: "a/b/index.ts", Files: []api.FunctionFile{
+	if _, _, err := b.Bundle(context.Background(), BundleInput{Ref: refA, Entrypoint: "a/b/index.ts", Files: []api.FunctionFile{
 		{Path: "a/b/index.ts", Content: []byte("import '../x.ts'")}, {Path: "a/x.ts", Content: []byte("export {}")}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +404,7 @@ func TestBundlerHandsTheUnitsUidWhatItNeedsAndNothingElse(t *testing.T) {
 	if !spec.PublicRun {
 		t.Error("the launcher is not marked public")
 	}
-	if spec.Env["DENO_DIR"] != "/var/cache/sb-edge-bundle/deno" || spec.Env["HOME"] != "/var/cache/sb-edge-bundle" || spec.WorkDir != "/tmp" {
+	if spec.Env["DENO_DIR"] != "/var/cache/sb-edge-bundle/"+refA+"/deno" || spec.Env["HOME"] != "/var/cache/sb-edge-bundle/"+refA || spec.WorkDir != "/tmp" {
 		t.Errorf("a sandboxed bundle must use the unit's own cache and /tmp: %v workdir %q", spec.Env, spec.WorkDir)
 	}
 	// The output files are where the unit binds its one writable directory.
@@ -424,7 +425,7 @@ func TestBundlerHandsTheUnitsUidWhatItNeedsAndNothingElse(t *testing.T) {
 // The unit file and the bundler must agree: a unit that ran as the sbctl user again, or that
 // bound the whole state directory, would reopen the /proc and path escapes.
 func TestBundleUnitIsolatesTheBundlerFromTheNode(t *testing.T) {
-	b, err := systemd.Read("sb-edge-bundle.service")
+	b, err := systemd.Read("sb-edge-bundle@.service")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,16 +451,27 @@ func TestBundleUnitIsolatesTheBundlerFromTheNode(t *testing.T) {
 		}
 	}
 	ro := strings.Fields(val("BindReadOnlyPaths"))
-	wantRO := []string{"/var/lib/sbctl/artifacts", "/var/lib/sbctl/projects/system/edge-bundle.run", "/var/lib/sbctl/system/edge-bundle/work/src"}
+	wantRO := []string{"/var/lib/sbctl/artifacts", "/var/lib/sbctl/projects/%i/edge-bundle.run", "/var/lib/sbctl/system/edge-bundle/work/src"}
 	if strings.Join(ro, " ") != strings.Join(wantRO, " ") {
 		t.Errorf("BindReadOnlyPaths %v, want %v", ro, wantRO)
 	}
 	if rw := strings.Fields(val("BindPaths")); len(rw) != 1 || rw[0] != "/var/lib/sbctl/system/edge-bundle/work/out" || val("ReadWritePaths") != rw[0] {
 		t.Errorf("BindPaths %q ReadWritePaths %q: only the output directory may be writable", val("BindPaths"), val("ReadWritePaths"))
 	}
-	// The cache path the bundler puts in the environment is the unit's CacheDirectory.
-	if sandboxCacheDir != "/var/cache/"+val("CacheDirectory") || !strings.Contains(body, sandboxCacheDir) {
-		t.Errorf("CacheDirectory=%s does not match %s", val("CacheDirectory"), sandboxCacheDir)
+	// The cache path the bundler puts in the environment is the instance's CacheDirectory, one
+	// per project: a shared directory would let one project's upload import what another's
+	// made the bundler download.
+	if "/var/cache/"+strings.ReplaceAll(val("CacheDirectory"), "%i", "<ref>") != sandboxCacheRoot+"/<ref>" {
+		t.Errorf("CacheDirectory=%s does not match %s/<ref>", val("CacheDirectory"), sandboxCacheRoot)
+	}
+	for _, k := range []string{"EnvironmentFile", "ExecStart"} {
+		if !strings.Contains(val(k), "/projects/%i/edge-bundle.") {
+			t.Errorf("%s=%s is not the instance's own file", k, val(k))
+		}
+	}
+	// The size limit applies to the instance's own directory.
+	if !strings.Contains(body, "du -sk /var/cache/sb-edge-bundle/%i ") || strings.Contains(body, "/var/cache/sb-edge-bundle ") {
+		t.Error("ExecStartPre does not trim the instance's own cache directory")
 	}
 	if got := config.Default().Paths().System(config.SvcEdgeBundle); got != "/var/lib/sbctl/system/edge-bundle" {
 		t.Errorf("state directory %s no longer matches the unit's bind paths", got)
@@ -485,6 +497,7 @@ func TestBundlerWithTheRealArtifact(t *testing.T) {
 	// A path with a space and a non-ASCII letter checks the specifier the Bundler predicts.
 	entry := "supabase/functions/hé llo/index.ts"
 	bundle, specifier, err := b.Bundle(context.Background(), BundleInput{
+		Ref:        refA,
 		Entrypoint: entry,
 		Files: []api.FunctionFile{
 			{Path: entry, Content: []byte("import { who } from '../_shared/who.ts'\nDeno.serve(() => new Response(who()))\n")},
@@ -506,11 +519,128 @@ func TestBundlerWithTheRealArtifact(t *testing.T) {
 	}
 	t.Logf("specifier %s, eszip %d bytes", specifier, plain.Len())
 
-	_, _, err = b.Bundle(context.Background(), BundleInput{Entrypoint: "index.ts", Files: []api.FunctionFile{
+	_, _, err = b.Bundle(context.Background(), BundleInput{Ref: refA, Entrypoint: "index.ts", Files: []api.FunctionFile{
 		{Path: "index.ts", Content: []byte("import './missing.ts'\n")}}})
 	var be *api.BundleError
 	if !errors.As(err, &be) || !strings.Contains(be.Msg, "missing.ts") {
 		t.Fatalf("a missing import: %v", err)
 	}
 	t.Logf("bundler said: %s", be.Msg)
+}
+
+// Every project has its own module cache: a module that one project's upload made the bundler
+// download (a private npm package, fetched with that upload's .npmrc) must not be in the cache
+// that another project's upload is bundled with.
+func TestBundlerKeepsOneModuleCachePerProject(t *testing.T) {
+	r := newBundlerRig(t)
+	caches := map[string]string{}
+	for _, ref := range []string{refA, refB} {
+		if _, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: ref, Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("ok")}}}); err != nil {
+			t.Fatal(err)
+		}
+		spec := r.sup.last
+		if spec.Ref != ref || spec.Unit() != "sb-edge-bundle@"+ref+".service" {
+			t.Errorf("%s: spec for %q, unit %s", ref, spec.Ref, spec.Unit())
+		}
+		caches[ref] = spec.Env["DENO_DIR"]
+		// Files of the unit's launcher and environment are the instance's own, too.
+		if f := units.FilesFor(r.cfg, spec); !strings.Contains(f.Env, "/projects/"+ref+"/") || !strings.Contains(f.Run, "/projects/"+ref+"/") {
+			t.Errorf("%s: files %+v", ref, f)
+		}
+	}
+	a, b := caches[refA], caches[refB]
+	if a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/") {
+		t.Fatalf("the projects' caches %q and %q are the same or nested", a, b)
+	}
+	// What A's bundling cached is not under B's cache.
+	if err := os.WriteFile(filepath.Join(a, "marker"), []byte("private-package"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(b, "marker")); err == nil {
+		t.Error("project A's cached module is in project B's cache")
+	}
+	// The next upload of A finds it again, and an upload of B does not change it.
+	if _, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: refB, Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("ok")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(a, "marker")); err != nil || string(got) != "private-package" {
+		t.Errorf("A's cache after B's upload: %q %v", got, err)
+	}
+	// The cache goes with the project (no shared directory is left for it to be deleted from).
+	if err := os.RemoveAll(r.cfg.Paths().Project(refA)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(a); err == nil {
+		t.Error("project A's cache outlived its project directory")
+	}
+	if _, err := os.Stat(b); err != nil {
+		t.Errorf("deleting A removed B's cache: %v", err)
+	}
+	// The cache of earlier versions, shared by all projects, is removed on the next upload.
+	old := filepath.Join(r.cfg.Paths().EdgeBundleDir(), "deno")
+	if err := os.MkdirAll(old, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: refB, Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("ok")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(old); err == nil {
+		t.Error("the shared cache of earlier versions stayed")
+	}
+}
+
+// Under the systemd unit the caches are the instances' CacheDirectory= paths, one per project.
+func TestSandboxedBundlerUsesTheProjectsOwnUnitAndCache(t *testing.T) {
+	r := newBundlerRig(t)
+	r.cfg.Functions.BundleUnsandboxed = false
+	ls := &layoutSup{recordingSup: r.sup, cfg: r.cfg}
+	b, err := NewBundler(r.cfg, ls, dirs{config.SvcEdgeRuntime: r.art}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]string{}
+	for _, ref := range []string{refA, refB} {
+		if _, _, err := b.Bundle(context.Background(), BundleInput{Ref: ref, Entrypoint: "i.ts", Files: []api.FunctionFile{{Path: "i.ts", Content: []byte("ok")}}}); err != nil {
+			t.Fatal(err)
+		}
+		spec := ls.last
+		if spec.Unit() != "sb-edge-bundle@"+ref+".service" {
+			t.Errorf("unit %s for %s", spec.Unit(), ref)
+		}
+		if want := "/var/cache/sb-edge-bundle/" + ref + "/deno"; spec.Env["DENO_DIR"] != want {
+			t.Errorf("DENO_DIR %q, want %q", spec.Env["DENO_DIR"], want)
+		}
+		seen[ref] = spec.Env["DENO_DIR"]
+	}
+	if seen[refA] == seen[refB] {
+		t.Errorf("both projects bundle with %s", seen[refA])
+	}
+}
+
+func TestBundlerNeedsTheProjectOfTheUpload(t *testing.T) {
+	r := newBundlerRig(t)
+	for _, ref := range []string{"", "x", "../../etc", "AAAAAAAAAAAAAAAAAAAA", refA + "a", "system"} {
+		_, _, err := r.b.Bundle(context.Background(), BundleInput{Ref: ref, Entrypoint: "i.ts", Files: []api.FunctionFile{{Path: "i.ts", Content: []byte("ok")}}})
+		if err == nil {
+			t.Errorf("ref %q was accepted", ref)
+		}
+	}
+}
+
+func TestTrimCacheEmptiesOnlyAboveTheLimit(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "deno")
+	if err := os.MkdirAll(filepath.Join(dir, "npm"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "npm", "pkg"), make([]byte, 100), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trimCache(dir, 100)
+	if _, err := os.Stat(filepath.Join(dir, "npm", "pkg")); err != nil {
+		t.Fatalf("a cache at the limit was emptied: %v", err)
+	}
+	trimCache(dir, 99)
+	if _, err := os.Stat(dir); err == nil {
+		t.Fatal("a cache over the limit stayed")
+	}
 }

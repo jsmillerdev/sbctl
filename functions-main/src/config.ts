@@ -9,10 +9,19 @@ export interface MainConfig {
   limits: Limits
   /**
    * The secret the proxy sends in X-Sbctl-Proxy-Token. Without it a request is refused: a
-   * function worker can reach this service's port and write any project reference.
+   * function worker can reach this service's port and write any project reference. It is empty
+   * only when NO_PROXY_TOKEN_ENV says so (development and tests); loadConfig refuses to start
+   * otherwise, so a unit whose environment lost the secret does not serve every caller.
    */
   proxyToken: string
 }
+
+/**
+ * Set to "1" to start without SBCTL_FUNCTIONS_PROXY_TOKEN, which makes the service answer any
+ * caller that can reach its port, a function worker included. For a development machine that
+ * runs the main service by hand; sbctl never sets it.
+ */
+export const NO_PROXY_TOKEN_ENV = 'SBCTL_FUNCTIONS_ALLOW_NO_PROXY_TOKEN'
 
 function intEnv(get: (name: string) => string | undefined, name: string, fallback: number): number {
   const raw = get(name)
@@ -23,8 +32,16 @@ function intEnv(get: (name: string) => string | undefined, name: string, fallbac
 }
 
 export function loadConfig(get: (name: string) => string | undefined): MainConfig {
+  const proxyToken = (get('SBCTL_FUNCTIONS_PROXY_TOKEN') ?? '').trim()
+  if (proxyToken === '' && get(NO_PROXY_TOKEN_ENV) !== '1') {
+    throw new Error(
+      'SBCTL_FUNCTIONS_PROXY_TOKEN is empty: without it the service would answer every caller that ' +
+        `reaches its port, function workers included (set ${NO_PROXY_TOKEN_ENV}=1 on a development ` +
+        'machine to run without it)',
+    )
+  }
   return {
-    proxyToken: (get('SBCTL_FUNCTIONS_PROXY_TOKEN') ?? '').trim(),
+    proxyToken,
     root: (get('SBCTL_FUNCTIONS_ROOT') ?? '/var/lib/sbctl/system/edge-runtime/tenants').replace(
       /\/+$/,
       '',

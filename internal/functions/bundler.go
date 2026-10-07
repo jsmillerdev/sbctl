@@ -30,11 +30,14 @@ import (
 // so the node turns the upload into an eszip first, with the edge-runtime artifact's own
 // `bundle` command, and serves only that. Bundling reads the imports of someone else's
 // code from the disk, which is the same attack as running it, so the command runs in the
-// sandbox of sb-edge-bundle.service: a uid of its own (a dynamic user: the node's other
+// sandbox of sb-edge-bundle@<ref>.service: a uid of its own (a dynamic user: the node's other
 // processes are the sbctl user's, and a mount namespace does not stop a process from opening
 // /proc/<pid>/root of another process of its own uid), a mount namespace that shows nothing of
 // the node but the upload and the artifacts, no loopback services, no instance metadata, a
-// memory limit and a timeout.
+// memory limit and a timeout. The unit is a template with one instance per project, and each
+// instance has its own uid and its own module cache: what one project's upload made the bundler
+// download (a private npm package, fetched with the uploader's .npmrc) is never in reach of
+// another project's upload.
 //
 // The unit's uid is not the daemon's, so what it may touch is handed over through the file
 // system: the sources are world-readable and owned by the daemon (the unit cannot change
@@ -52,14 +55,16 @@ const (
 	bundleMaxEszip = 64 << 20
 	// bundleMaxLog is how much of the bundler's output is shown to the uploader.
 	bundleMaxLog = 4 << 10
-	// bundleCacheMax is the size of the module cache (remote imports) above which it is emptied.
+	// bundleCacheMax is the size of a project's module cache (remote imports) above which it
+	// is emptied.
 	bundleCacheMax = 512 << 20
 	bundleQueueMax = 8
-	// sandboxCacheDir is the module cache of the bundler under the systemd unit
-	// (CacheDirectory=sb-edge-bundle in sb-edge-bundle.service): private to the unit's uid, so
-	// the daemon cannot see it and the unit empties it itself (ExecStartPre) above 512 MiB.
-	// The exec backend, which has no such unit, keeps its cache in the state directory.
-	sandboxCacheDir = "/var/cache/sb-edge-bundle"
+	// sandboxCacheRoot is the parent of the module caches of the bundler under the systemd
+	// unit: the unit of project <ref> has <root>/<ref> (CacheDirectory=sb-edge-bundle/%i in
+	// sb-edge-bundle@.service), private to the instance's uid, so the daemon cannot see it and
+	// the unit empties it itself (ExecStartPre) above 512 MiB. The exec backend, which has no
+	// such unit, keeps the cache in the project's state directory (execCacheDir).
+	sandboxCacheRoot = "/var/cache/sb-edge-bundle"
 	// sandboxWorkDir is the working directory of the bundler under the unit: the one place
 	// besides the cache it may write to (a private /tmp that goes away with the run).
 	sandboxWorkDir = "/tmp"
@@ -73,8 +78,8 @@ type ArtifactDirs interface {
 	Dir(svc string) (string, error)
 }
 
-// Bundler runs `edge-runtime bundle` for uploaded sources, one upload at a time (the unit
-// is a singleton with one scratch directory, and a bundling can use a few hundred MB).
+// Bundler runs `edge-runtime bundle` for uploaded sources, one upload at a time (all the
+// instances share one scratch directory, and a bundling can use a few hundred MB).
 type Bundler struct {
 	cfg       *config.Config
 	sup       units.Supervisor
@@ -106,6 +111,9 @@ func NewBundler(cfg *config.Config, sup units.Supervisor, artifacts ArtifactDirs
 
 // BundleInput is one upload.
 type BundleInput struct {
+	// Ref is the project the upload belongs to: it selects the unit instance and with it the
+	// module cache the bundling may read and fill.
+	Ref string
 	// Files are the uploaded sources, paths relative to the project's working directory.
 	Files []api.FunctionFile
 	// Entrypoint and ImportMap are paths among Files (ImportMap may be empty).
@@ -130,6 +138,9 @@ func (b *Bundler) Bundle(ctx context.Context, in BundleInput) (bundle []byte, en
 		defer func() { <-b.run }()
 	case <-ctx.Done():
 		return nil, "", ctx.Err()
+	}
+	if err := validRef(in.Ref); err != nil {
+		return nil, "", fmt.Errorf("bundling needs the project the upload belongs to: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(ctx, bundleTimeout)
 	defer cancel()
@@ -175,28 +186,30 @@ func (b *Bundler) Bundle(ctx context.Context, in BundleInput) (bundle []byte, en
 	env["NO_COLOR"] = "1"
 	workDir := work
 	if sandboxed {
-		// Under the unit the module cache is the unit's own, and the sources and the output
-		// directory are not writable for it.
-		env["DENO_DIR"] = path.Join(sandboxCacheDir, "deno")
-		env["HOME"] = sandboxCacheDir
+		// Under the unit the module cache is the instance's own (this project's), and the
+		// sources and the output directory are not writable for it.
+		cache := path.Join(sandboxCacheRoot, in.Ref)
+		env["DENO_DIR"] = path.Join(cache, "deno")
+		env["HOME"] = cache
 		workDir = sandboxWorkDir
-		// The cache of an earlier version of the bundler, which ran as the daemon's user.
-		_ = os.RemoveAll(filepath.Join(stateDir, "deno"))
 	} else {
-		cache := filepath.Join(stateDir, "deno")
-		trimCache(cache)
-		if err := os.MkdirAll(cache, 0o750); err != nil {
+		// No unit, no private directory: the project's own state directory holds the cache
+		// (and goes with the project), never one shared with other projects.
+		cache := b.cfg.Paths().ProjectService(in.Ref, config.SvcEdgeBundle)
+		trimCache(filepath.Join(cache, "deno"), bundleCacheMax)
+		if err := os.MkdirAll(filepath.Join(cache, "deno"), 0o750); err != nil {
 			return nil, "", err
 		}
-		if real, err := filepath.EvalSymlinks(stateDir); err == nil {
-			cache = filepath.Join(real, "deno")
-			stateDir = real
+		if real, err := filepath.EvalSymlinks(cache); err == nil {
+			cache = real
 		}
-		env["DENO_DIR"] = cache
-		env["HOME"] = stateDir
+		env["DENO_DIR"] = filepath.Join(cache, "deno")
+		env["HOME"] = cache
 	}
+	// The cache that earlier versions of the bundler shared between all projects.
+	_ = os.RemoveAll(filepath.Join(stateDir, "deno"))
 	spec := units.Spec{
-		Service: config.SvcEdgeBundle, ArtifactDir: art, WorkDir: workDir, Log: logFile,
+		Service: config.SvcEdgeBundle, Ref: in.Ref, ArtifactDir: art, WorkDir: workDir, Log: logFile,
 		Exec: append([]string{"bin/edge-runtime"}, args...), Env: env,
 		Limits:    config.Limits{MemoryMax: "1G", CPUQuota: "100%"},
 		PublicRun: sandboxed,
@@ -387,8 +400,8 @@ func handOver(work, src string, outFiles ...string) error {
 	return nil
 }
 
-// trimCache empties the module cache when it has grown past bundleCacheMax.
-func trimCache(dir string) {
+// trimCache empties the module cache when it has grown past limit bytes.
+func trimCache(dir string, limit int64) {
 	var n int64
 	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
@@ -398,7 +411,7 @@ func trimCache(dir string) {
 		}
 		return nil
 	})
-	if n > bundleCacheMax {
+	if n > limit {
 		_ = os.RemoveAll(dir)
 	}
 }

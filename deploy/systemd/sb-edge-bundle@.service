@@ -1,14 +1,15 @@
 [Unit]
-Description=sbctl one-shot bundler for uploaded Edge Function sources
+Description=sbctl one-shot bundler for uploaded Edge Function sources of project %i
 Documentation=https://github.com/OWNER/sbctl
 After=network.target local-fs.target
 StartLimitIntervalSec=0
 
 [Service]
-# Started by the Management API for one upload at a time (sbctl renders the two files below, and
-# lays the upload out under /var/lib/sbctl/system/edge-bundle/work, before it starts the unit). It
-# runs "edge-runtime bundle", which parses the function's modules and writes one eszip file; it
-# does not run any of the function's code.
+# One instance per project, sb-edge-bundle@<ref>.service, started by the Management API for one
+# upload at a time (sbctl renders the two files below, and lays the upload out under
+# /var/lib/sbctl/system/edge-bundle/work, before it starts the unit; the daemon runs one bundling
+# at a time, whatever the project). It runs "edge-runtime bundle", which parses the function's
+# modules and writes one eszip file; it does not run any of the function's code.
 #
 # The sources are another person's code and their imports are paths: a function can import
 # "../../../<other project>/functions-env.json" or any other file this unit's user can read, and
@@ -27,17 +28,26 @@ StartLimitIntervalSec=0
 # What the unit's uid can read and write is handed over by the daemon (internal/functions/bundler.go):
 # the sources in work/src (world-readable, owned by sbctl, read-only here) and two files it creates
 # in work/out and makes world-writable, the eszip and the log. The uid owns nothing in the state
-# directory, so it cannot make or replace anything there. Its module cache lives in
-# /var/cache/sb-edge-bundle (CacheDirectory, private to the uid) and is emptied before a start
-# when it has passed 512 MiB.
+# directory, so it cannot make or replace anything there.
+#
+# The module cache is per project. A cache is shared by everything that is bundled with it: a
+# module fetched for one upload (a private npm package fetched with the uploader's .npmrc, a URL
+# only that project's code names) would be there for the bundle of any other upload to import. Each
+# instance therefore has its own, /var/cache/sb-edge-bundle/<ref> (CacheDirectory, private to the
+# instance's uid), and the uid differs from instance to instance: DynamicUser derives the user
+# from the unit name, which includes the ref. The unit of another project cannot open the
+# directory: it is mode 0700 under /var/cache/private, which only root may enter, and owned by
+# another uid.
+# The directory is emptied before a start when it has passed 512 MiB, and the daemon has systemd
+# remove it when the project is deleted (Systemd.Remove: CleanUnit with the "cache" mask).
 Type=oneshot
 DynamicUser=yes
 Slice=sbctl.slice
-EnvironmentFile=/var/lib/sbctl/projects/system/edge-bundle.env
-CacheDirectory=sb-edge-bundle
+EnvironmentFile=/var/lib/sbctl/projects/%i/edge-bundle.env
+CacheDirectory=sb-edge-bundle/%i
 CacheDirectoryMode=0700
-ExecStartPre=/bin/sh -c 'test "$$(du -sk /var/cache/sb-edge-bundle | cut -f1)" -le 524288 || find /var/cache/sb-edge-bundle -mindepth 1 -delete'
-ExecStart=/var/lib/sbctl/projects/system/edge-bundle.run
+ExecStartPre=/bin/sh -c 'test "$$(du -sk /var/cache/sb-edge-bundle/%i | cut -f1)" -le 524288 || find /var/cache/sb-edge-bundle/%i -mindepth 1 -delete'
+ExecStart=/var/lib/sbctl/projects/%i/edge-bundle.run
 # A bundle that has not finished in this time is killed; the API's request gives up at about the same time.
 TimeoutStartSec=150s
 # "edge-runtime bundle" exits 1 when the uploaded code does not bundle (a module that does not exist, a
@@ -90,8 +100,8 @@ IPAddressAllow=127.0.0.53 127.0.0.54
 # as a whole.
 InaccessiblePaths=-/etc/sbctl
 TemporaryFileSystem=/var/lib/sbctl:ro
-BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/system/edge-bundle.run /var/lib/sbctl/system/edge-bundle/work/src
+BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/%i/edge-bundle.run /var/lib/sbctl/system/edge-bundle/work/src
 BindPaths=/var/lib/sbctl/system/edge-bundle/work/out
 ReadWritePaths=/var/lib/sbctl/system/edge-bundle/work/out
 
-# Never enabled: the API starts it when someone uploads sources.
+# Never enabled: the API starts an instance when someone uploads sources.

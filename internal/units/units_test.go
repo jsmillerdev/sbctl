@@ -430,7 +430,7 @@ func TestTemplatesContainment(t *testing.T) {
 	}
 }
 
-// A launcher that a unit under another uid executes (sb-edge-bundle.service, a dynamic user) is
+// A launcher that a unit under another uid executes (sb-edge-bundle@<ref>.service, a dynamic user) is
 // world-readable; every other launcher stays private to the sbctl user. The environment file is
 // 0600 either way: systemd reads it as root.
 func TestRenderPublicRunMode(t *testing.T) {

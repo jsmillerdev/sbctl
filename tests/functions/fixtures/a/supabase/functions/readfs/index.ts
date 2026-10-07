@@ -34,5 +34,14 @@ Deno.serve(async (req) => {
   } catch (e) {
     out.envNames = `ERROR: ${(e as Error).name}`
   }
+  // What the runtime tells a worker about its own /tmp: realPathSync('/tmp') answers with the real
+  // directory behind it (a private directory the runtime made for this worker, named .tmpXXXXXX in
+  // the runtime's temp directory, measured with v1.77.4), and every other path outside the module
+  // graph is NotSupported. verify.mjs checks that the answer stays that narrow.
+  try {
+    out.realTmp = `PATH: ${Deno.realPathSync('/tmp')}`
+  } catch (e) {
+    out.realTmp = `ERROR: ${(e as Error).name}`
+  }
   return Response.json(out)
 })

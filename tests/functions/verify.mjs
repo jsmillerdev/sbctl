@@ -215,7 +215,24 @@ async function mainPhase() {
     assert.match(r.json.readDir, /^ERROR: /, `a function listed /proc: ${r.json.readDir}`)
     assert.match(r.json.spawn, /^ERROR: /, `a function ran a child process: ${r.json.spawn}`)
     assert.match(r.json.envNames, /^ERROR: /, `the environment of a worker holds main service variables: ${r.json.envNames}`)
-    ok('a function cannot read the files of the node (/proc included), start a process, or see the environment of the main service')
+    // The one path a worker may resolve is its own /tmp, and the runtime answers with the real
+    // directory behind it. A runtime upgrade could make that answer reveal more (the node's state
+    // directory, a path under another project's tree, the directory of the runtime's own files):
+    // it must stay a private directory the runtime made for this worker, outside the node's state.
+    {
+      const real = r.json.realTmp
+      assert.equal(typeof real, 'string', 'readfs does not report realPathSync(/tmp)')
+      if (real.startsWith('PATH: ')) {
+        const path = real.slice('PATH: '.length)
+        assert.match(path, /(^|\/)\.tmp[A-Za-z0-9]{6}$/, `Deno.realPathSync('/tmp') in a worker is no longer a private .tmpXXXXXX directory: ${path}`)
+        for (const hidden of [cfg.stateDir, 'sbctl', 'tenants', 'functions-env', a.ref, b.ref]) {
+          assert.ok(!path.includes(hidden), `Deno.realPathSync('/tmp') in a worker reveals ${hidden}: ${path}`)
+        }
+      } else {
+        assert.match(real, /^ERROR: /, `Deno.realPathSync('/tmp') in a worker: ${real}`)
+      }
+    }
+    ok('a function cannot read the files of the node (/proc included), start a process, or see the environment of the main service; Deno.realPathSync(/tmp) names a private temp directory only')
   }
 
   // A worker's /tmp is its only writable place and is backed by the node's disk, which holds every

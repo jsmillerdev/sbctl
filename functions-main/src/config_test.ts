@@ -1,10 +1,14 @@
-import { assertEquals, assertThrows } from 'jsr:@std/assert@1'
-import { loadConfig } from './config.ts'
+import { assertEquals, assertStringIncludes, assertThrows } from 'jsr:@std/assert@1'
+import { loadConfig, NO_PROXY_TOKEN_ENV } from './config.ts'
+
+// The defaults of everything but the secret, which has none: sbctl always passes one.
+const withToken = (vars: Record<string, string> = {}) => (n: string) =>
+  ({ SBCTL_FUNCTIONS_PROXY_TOKEN: 'secret', ...vars })[n]
 
 Deno.test('loadConfig applies the defaults', () => {
-  const c = loadConfig(() => undefined)
+  const c = loadConfig(withToken())
   assertEquals(c.root, '/var/lib/sbctl/system/edge-runtime/tenants')
-  assertEquals(c.proxyToken, '')
+  assertEquals(c.proxyToken, 'secret')
   assertEquals(c.limits, {
     memoryLimitMb: 256,
     workerTimeoutMs: 400_000,
@@ -51,14 +55,35 @@ Deno.test('loadConfig reads the variables the unit passes', () => {
   assertEquals(c.limits.cpuTimeHardLimitMs, 2000)
   assertEquals(c.limits.tmpQuotaBytes, 5 * 1024 * 1024)
   // 0 switches the quota off.
-  assertEquals(
-    loadConfig((n) => (n === 'SBCTL_FUNCTIONS_TMP_QUOTA_MB' ? '0' : undefined)).limits
-      .tmpQuotaBytes,
-    0,
-  )
+  assertEquals(loadConfig(withToken({ SBCTL_FUNCTIONS_TMP_QUOTA_MB: '0' })).limits.tmpQuotaBytes, 0)
 })
 
 Deno.test('loadConfig rejects nonsense', () => {
-  assertThrows(() => loadConfig((n) => (n === 'SBCTL_FUNCTIONS_MEMORY_MB' ? 'lots' : undefined)))
-  assertThrows(() => loadConfig((n) => (n === 'SBCTL_FUNCTIONS_MEMORY_MB' ? '-1' : undefined)))
+  assertThrows(() => loadConfig(withToken({ SBCTL_FUNCTIONS_MEMORY_MB: 'lots' })))
+  assertThrows(() => loadConfig(withToken({ SBCTL_FUNCTIONS_MEMORY_MB: '-1' })))
+})
+
+Deno.test('loadConfig refuses to start without the proxy secret unless a dev flag says so', () => {
+  // Missing, empty and blank are all "no secret": the service would serve every caller that
+  // can reach its port, and a function worker can.
+  for (const token of [undefined, '', '  \n']) {
+    const err = assertThrows(
+      () => loadConfig((n) => (n === 'SBCTL_FUNCTIONS_PROXY_TOKEN' ? token : undefined)),
+      Error,
+      'SBCTL_FUNCTIONS_PROXY_TOKEN is empty',
+    )
+    assertStringIncludes(err.message, NO_PROXY_TOKEN_ENV)
+  }
+  // Only the explicit flag, with exactly "1", lets a development machine run without it.
+  for (const flag of ['0', 'true', 'yes', '', ' 1']) {
+    assertThrows(() => loadConfig((n) => (n === NO_PROXY_TOKEN_ENV ? flag : undefined)))
+  }
+  const dev = loadConfig((n) => (n === NO_PROXY_TOKEN_ENV ? '1' : undefined))
+  assertEquals(dev.proxyToken, '')
+  // A secret and the flag together: the secret still counts.
+  assertEquals(
+    loadConfig((n) => ({ SBCTL_FUNCTIONS_PROXY_TOKEN: 'tok', [NO_PROXY_TOKEN_ENV]: '1' })[n])
+      .proxyToken,
+    'tok',
+  )
 })

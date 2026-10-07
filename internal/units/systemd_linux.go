@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -209,12 +210,30 @@ func (s *Systemd) Status(ctx context.Context, unit string) (Status, error) {
 // Remove implements Supervisor: stop the unit, lift its resource limits and delete
 // the files Render wrote.
 func (s *Systemd) Remove(ctx context.Context, unit string) error {
-	files, _, _, err := runFilesFor(s.cfg, unit)
+	files, svc, _, err := runFilesFor(s.cfg, unit)
 	if err != nil {
 		return err
 	}
+	if svc == config.SvcEdgeBundle {
+		// The bundler's instance of a project that never had sources bundled has nothing to
+		// remove, and loading its unit just to find that out would leave a drop-in behind.
+		if _, err := os.Stat(files.Env); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+	}
 	if err := s.Stop(ctx, unit); err != nil {
 		return err
+	}
+	if svc == config.SvcEdgeBundle {
+		// The module cache is private to the instance's dynamic uid (CacheDirectory=), so the
+		// daemon cannot delete it; systemd does, on request. Done before the rendered files go,
+		// so that a failure leaves the unit to try again.
+		if c, err := s.dial(ctx); err == nil {
+			_ = c.ResetFailedUnitContext(ctx, unit)
+		}
+		if err := s.cleanCache(ctx, unit); err != nil {
+			return fmt.Errorf("units: remove the module cache of %s: %w", unit, err)
+		}
 	}
 	c, err := s.dial(ctx)
 	if err != nil {
@@ -225,6 +244,46 @@ func (s *Systemd) Remove(ctx context.Context, unit string) error {
 		s.log.Warn("could not remove unit drop-ins", "unit", unit, "error", err)
 	}
 	return removeFiles(files)
+}
+
+// cleanCache has systemd delete the cache directory of unit (CleanUnit with the "cache" mask,
+// what `systemctl clean --what=cache` does; polkit's manage-units action covers it) and waits
+// until the cleaning, which runs as a unit state of its own, is over. A unit systemd does not
+// know (the template is not installed) has no cache to remove.
+func (s *Systemd) cleanCache(ctx context.Context, unit string) error {
+	bus, err := godbus.ConnectSystemBus()
+	if err != nil {
+		return err
+	}
+	defer bus.Close()
+	mgr := bus.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
+	if err := mgr.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.CleanUnit", 0, unit, []string{"cache"}).Err; err != nil {
+		var de godbus.Error
+		if errors.As(err, &de) && (de.Name == "org.freedesktop.systemd1.NoSuchUnit" || de.Name == "org.freedesktop.systemd1.LoadFailed") {
+			return nil
+		}
+		return err
+	}
+	// While it cleans the unit is in the "maintenance" state (systemd's SERVICE_CLEANING).
+	for {
+		st, err := s.Status(ctx, unit)
+		if err != nil {
+			// A unit with nothing left to hold is unloaded as soon as it is clean.
+			var de godbus.Error
+			if errors.As(err, &de) && de.Name == "org.freedesktop.systemd1.NoSuchUnit" {
+				return nil
+			}
+			return err
+		}
+		if st.State != State("maintenance") {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // revert lifts the limits SetLimits wrote by setting them back to infinity. Removing the

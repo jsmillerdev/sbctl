@@ -3,10 +3,12 @@
 # (Management API and proxy in one process, with sb-edge-runtime started as a unit), then
 # tests/functions/run.sh, which deploys fixtures with the real `supabase functions deploy` (project
 # A bundled by the CLI in Docker, project B uploaded as sources with --use-api and bundled by the
-# node in the sandbox of sb-edge-bundle.service), calls them with supabase-js and checks isolation
-# between the projects. On top of that this script checks what only systemd can show: the unit's
-# user, slice and memory limit, what its mount namespace hides, recovery after `kill -9` of the
-# runtime, and that the runtime-wide worker budget refuses what would not fit.
+# node in the sandbox of sb-edge-bundle@<ref>.service), calls them with supabase-js and checks
+# isolation between the projects. On top of that this script checks what only systemd can show: the
+# unit's user, slice and memory limit, what its mount namespace hides, that the bundler's module
+# cache is per project (an upload of project B cannot import a module that project A's upload made
+# the bundler download) and goes with the project, recovery after `kill -9` of the runtime, and
+# that the runtime-wide worker budget refuses what would not fit.
 #
 #   sudo SBCTL_BIN=/path/to/sbctl-linux-amd64 tests/linux/functions-smoke.sh [--teardown]
 #
@@ -144,8 +146,55 @@ DAEMON_PID=$(pgrep -u "$SBCTL_USER" -f 'sbctl functions dev' | head -1)
 export PROC_ESCAPE_PIDS="$RT_PID $DAEMON_PID"
 "$REPO_ROOT/tests/functions/run.sh" || fail "tests/functions/run.sh"
 
+log "the bundler's module cache is per project"
+# Project A's upload makes the bundler fetch a package; project B's uploads must not be able to
+# import what is now in A's cache, however the path is spelled. The marker is the package.json of
+# the package, a JSON module that an import can name (as the steal checks of run.sh do).
+PAT=$(<"$PAT_FILE")
+API="http://api.$DOMAIN:$P_HTTP"
+CACHE_ROOT=/var/cache/sb-edge-bundle
+deploy_src() { # REF SLUG SOURCE-FILE: upload sources, print "<body>\n<status>"
+  curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $PAT" \
+    -F "metadata={\"entrypoint_path\":\"index.ts\",\"name\":\"$2\"};type=application/json" \
+    -F "file=@$3;filename=index.ts" "$API/v1/projects/$1/functions/deploy?slug=$2"
+}
+delete_fn() { curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $PAT" "$API/v1/projects/$1/functions/$2"; }
+printf 'import postgres from "npm:postgres@3.4.5"\nDeno.serve(() => new Response(typeof postgres))\n' >"$LOG_DIR/cache-mark.ts"
+cache_marker() { # REF: the package.json of the package in REF's cache, as the unit's namespace names it
+  find "$CACHE_ROOT/$1/" -path '*/postgres/3.4.5/package.json' 2>/dev/null | head -1
+}
+for ref in "$REF_A" "$REF_B"; do
+  out=$(deploy_src "$ref" cachemark "$LOG_DIR/cache-mark.ts") || fail "curl: cachemark upload to $ref"
+  [[ $(tail -n1 <<<"$out") =~ ^20[01]$ ]] || fail "the upload that imports npm:postgres to $ref answered: $out"
+  [[ -d $CACHE_ROOT/$ref ]] || fail "the bundler of $ref has no cache directory $CACHE_ROOT/$ref ($(ls -la "$CACHE_ROOT/" /var/cache/private/ 2>&1 | tr '\n' ' '))"
+  [[ $(stat -c %a "$CACHE_ROOT/$ref/") == 700 ]] || fail "$CACHE_ROOT/$ref has mode $(stat -c %a "$CACHE_ROOT/$ref/"), want 700"
+done
+A_MARKER=$(cache_marker "$REF_A"); B_MARKER=$(cache_marker "$REF_B")
+[[ -n $A_MARKER && -n $B_MARKER ]] || fail "no cached postgres package in the caches of A ('$A_MARKER') or B ('$B_MARKER'): $(find "$CACHE_ROOT/$REF_A/" -maxdepth 4 2>&1 | head -20 | tr '\n' ' ')"
+[[ $A_MARKER != "$B_MARKER" && $A_MARKER == "$CACHE_ROOT/$REF_A/"* && $B_MARKER == "$CACHE_ROOT/$REF_B/"* ]] || fail "the caches are not separate directories: $A_MARKER $B_MARKER"
+# Control: a bundling of B can import a module of B's own cache, so the refusals below are about
+# whose cache it is and not about importing a file by path.
+steal_cache() { # NAME IMPORT-PATH EXPECTED-STATUS-REGEX
+  printf 'import marker from "file://%s" with { type: "json" }\nDeno.serve(() => Response.json(marker))\n' "$2" >"$LOG_DIR/cache-steal.ts"
+  local out; out=$(deploy_src "$REF_B" cachesteal "$LOG_DIR/cache-steal.ts") || fail "curl: cache steal upload ($1)"
+  [[ $(tail -n1 <<<"$out") =~ $3 ]] || fail "an upload of B that imports $1 answered: $out"
+  if [[ $3 == '^400$' ]]; then
+    grep -q "Could not bundle" <<<"$out" || fail "the refusal ($1) does not say why: $out"
+    grep -q '"name": *"postgres"' <<<"$out" && fail "the bundler's error ($1) shows the package of A's cache: $out"
+    [[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$API/v1/projects/$REF_B/functions/cachesteal") == 404 ]] || fail "the refused upload ($1) was stored"
+  else
+    delete_fn "$REF_B" cachesteal
+  fi
+}
+steal_cache "its own cache (control)" "$B_MARKER" '^20[01]$'
+steal_cache "A's cache by its path" "$A_MARKER" '^400$'
+steal_cache "A's cache through the private directory" "/var/cache/private/sb-edge-bundle/${A_MARKER#"$CACHE_ROOT"/}" '^400$'
+steal_cache "A's cache through B's own directory" "$CACHE_ROOT/$REF_B/../${A_MARKER#"$CACHE_ROOT"/}" '^400$'
+steal_cache "the shared cache of earlier versions" "$CACHE_ROOT/${A_MARKER#"$CACHE_ROOT/$REF_A/"}" '^400$'
+delete_fn "$REF_A" cachemark; delete_fn "$REF_B" cachemark
+
 log "the bundler unit ran for project B's uploads and is idle now"
-B=sb-edge-bundle.service
+B=sb-edge-bundle@$REF_B.service
 [[ $(unit_state "$B") == inactive ]] || fail "$B is $(unit_state "$B")"
 [[ $(systemctl show -p Result --value "$B") == success ]] || fail "$B: last result $(systemctl show -p Result --value "$B")"
 # Another uid than the sbctl user: the kernel then refuses /proc/<pid>/root and environ of every
@@ -156,11 +205,11 @@ B=sb-edge-bundle.service
 systemctl show -p IPAddressDeny --value "$B" | grep -q . || fail "$B has no IPAddressDeny"
 [[ ! -e $SBCTL_STATE/system/edge-bundle/work ]] || fail "the scratch directory of an upload stayed in $SBCTL_STATE/system/edge-bundle"
 
-log "the bundler's uid cannot read the node's files or the processes of its units"
-# The real unit, with its ExecStart replaced by a probe (a drop-in, removed afterwards), so the
-# probe runs as the bundler does: same uid, namespace, /proc and cache directory. It exits 3 when
-# it could read something it must not, which fails this start (1 is a bad upload, see the unit).
-install -d /run/systemd/system/$B.d
+log "the bundler's uid cannot read the node's files, the processes of its units or another project's cache"
+# The real unit (an instance for A and one for B), with its ExecStart replaced by a probe (a
+# drop-in, removed afterwards), so the probe runs as the bundler does: same uid, namespace, /proc
+# and cache directory. It exits 3 when it could read something it must not, which fails this
+# start (1 is a bad upload, see the unit). It also prints its uid: the two instances must differ.
 cat >/usr/local/sbin/sbctl-bundle-probe <<'PROBE'
 #!/bin/sh
 bad=0
@@ -170,7 +219,15 @@ ok() { echo "probe: ok $*"; }
 # Controls: what the unit may do works, so the refusals below say something.
 cat /proc/self/environ >/dev/null 2>&1 && ok "reads its own /proc/self/environ" || violate "cannot read /proc/self/environ (control)"
 ls /var/lib/sbctl/artifacts >/dev/null 2>&1 && ok "reads the artifacts" || violate "cannot read the artifacts (control)"
-touch /var/cache/sb-edge-bundle/probe 2>/dev/null && ok "writes its cache directory" || violate "cannot write /var/cache/sb-edge-bundle (control)"
+echo "probe: uid=$(id -u)"
+touch "/var/cache/sb-edge-bundle/$PROBE_SELF/probe" 2>/dev/null && ok "writes its own cache directory" || violate "cannot write /var/cache/sb-edge-bundle/$PROBE_SELF (control)"
+cat "$PROBE_SELF_MARKER" >/dev/null 2>&1 && ok "reads a module of its own cache" || violate "cannot read $PROBE_SELF_MARKER (control)"
+# Another project's cache: whatever the namespace shows of it, this uid cannot open it.
+echo "probe: info, visible under /var/cache/sb-edge-bundle: $(ls -A /var/cache/sb-edge-bundle 2>&1 | tr '\n' ' ')"
+ls "/var/cache/sb-edge-bundle/$PROBE_OTHER/" >/dev/null 2>&1 && violate "lists the cache directory of another project"
+ls "/var/cache/private/sb-edge-bundle/$PROBE_OTHER/" >/dev/null 2>&1 && violate "lists the cache directory of another project through /var/cache/private"
+cat "$PROBE_OTHER_MARKER" >/dev/null 2>&1 && violate "reads $PROBE_OTHER_MARKER"
+cat "/var/cache/private/sb-edge-bundle/${PROBE_OTHER_MARKER#/var/cache/sb-edge-bundle/}" >/dev/null 2>&1 && violate "reads another project's cache through /var/cache/private"
 # The two files the daemon creates are writable, and nothing else can be made there.
 echo probe >/var/lib/sbctl/system/edge-bundle/work/out/out.eszip 2>/dev/null && ok "writes the output file" || violate "cannot write the output file (control)"
 touch /var/lib/sbctl/system/edge-bundle/work/out/other 2>/dev/null && violate "creates a file next to the output files"
@@ -198,23 +255,37 @@ chmod 0755 /usr/local/sbin/sbctl-bundle-probe
 install -d -o "$SBCTL_USER" -g "$SBCTL_USER" -m 0755 "$SBCTL_STATE/system/edge-bundle/work/src" "$SBCTL_STATE/system/edge-bundle/work/out"
 install -m 0666 /dev/null "$SBCTL_STATE/system/edge-bundle/work/out/out.eszip"
 chown "$SBCTL_USER:$SBCTL_USER" "$SBCTL_STATE/system/edge-bundle/work/out/out.eszip"
-cat >/run/systemd/system/$B.d/90-probe.conf <<CONF
+declare -A PROBE_UID
+for pair in "$REF_B:$REF_A:$A_MARKER:$B_MARKER" "$REF_A:$REF_B:$B_MARKER:$A_MARKER"; do
+  IFS=: read -r self other other_marker self_marker <<<"$pair"
+  inst=sb-edge-bundle@$self.service
+  install -d /run/systemd/system/$inst.d
+  cat >/run/systemd/system/$inst.d/90-probe.conf <<CONF
 [Service]
 Environment=PROBE_RT_PID=$RT_PID PROBE_DAEMON_PID=$DAEMON_PID PROBE_SBCTL_UID=$(id -u "$SBCTL_USER") PROBE_TENANTS=$SBCTL_STATE/system/edge-runtime/tenants PROBE_REF=$REF_A
+Environment=PROBE_SELF=$self PROBE_OTHER=$other PROBE_SELF_MARKER=$self_marker PROBE_OTHER_MARKER=$other_marker
 ExecStart=
 ExecStart=/usr/local/sbin/sbctl-bundle-probe
 CONF
-systemctl daemon-reload
-# The unit does not run as the daemon would start it (no upload): a sbctl-owned work/src and work/out
-# stand in for what the daemon lays out. A start by root is fine for the probe.
-if ! systemctl start "$B"; then
-  journalctl -u "$B" -n 60 --no-pager -o cat >&2 || true
-  fail "the bundler's uid could read what it must not (see the probe lines above), or the probe did not run"
-fi
-journalctl -u "$B" -n 40 --no-pager -o cat | grep '^probe: ' >&2 || fail "the probe printed nothing"
-rm -rf /run/systemd/system/$B.d /usr/local/sbin/sbctl-bundle-probe "$SBCTL_STATE/system/edge-bundle/work"
-systemctl daemon-reload
-[[ -z $(systemctl show -p DropInPaths --value "$B") ]] || fail "the probe drop-in is still in place"
+  systemctl daemon-reload
+  # The unit does not run as the daemon would start it (no upload): a sbctl-owned work/src and work/out
+  # stand in for what the daemon lays out. A start by root is fine for the probe.
+  if ! systemctl start "$inst"; then
+    journalctl -u "$inst" -n 60 --no-pager -o cat >&2 || true
+    fail "$inst: the bundler's uid could read what it must not (see the probe lines above), or the probe did not run"
+  fi
+  journalctl -u "$inst" -n 60 --no-pager -o cat | grep '^probe: ' >&2 || fail "the probe of $inst printed nothing"
+  PROBE_UID[$self]=$(journalctl -u "$inst" -n 60 --no-pager -o cat | sed -n 's/^probe: uid=\([0-9][0-9]*\)$/\1/p' | tail -1)
+  rm -rf /run/systemd/system/$inst.d
+  systemctl daemon-reload
+  [[ -z $(systemctl show -p DropInPaths --value "$inst") ]] || fail "the probe drop-in of $inst is still in place"
+done
+rm -f /usr/local/sbin/sbctl-bundle-probe
+rm -rf "$SBCTL_STATE/system/edge-bundle/work"
+# Each project's bundler runs under a uid of its own, so that the mode of its cache directory (0700) keeps
+# the others out even where a directory of another project is in reach.
+[[ -n ${PROBE_UID[$REF_A]} && -n ${PROBE_UID[$REF_B]} && ${PROBE_UID[$REF_A]} != "${PROBE_UID[$REF_B]}" ]] || fail "the bundlers of A and B do not run under different uids (A: ${PROBE_UID[$REF_A]:-?}, B: ${PROBE_UID[$REF_B]:-?})"
+[[ ${PROBE_UID[$REF_A]} != "$(id -u "$SBCTL_USER")" && ${PROBE_UID[$REF_B]} != "$(id -u "$SBCTL_USER")" ]] || fail "a bundler runs under the sbctl uid"
 
 log "crash recovery: kill -9 of the runtime"
 open_code() { http_code "http://$REF_A.api.$DOMAIN:$P_HTTP/functions/v1/open"; }
@@ -280,5 +351,19 @@ mem=$(systemctl show -p MemoryCurrent --value "$U")
 log "$U holds 4 workers: MemoryCurrent $((mem / 1048576)) MiB of 1408"
 (( mem < 1476395008 )) || fail "$U uses $mem bytes, over its limit"
 [[ $(systemctl show -p NRestarts --value "$U") == 0 ]] || fail "$U restarted"
+
+log "deleting a project removes the module cache of its bundler"
+# C has its sources bundled once (so its instance of the bundler has a cache directory, private to
+# that instance's uid, which the daemon cannot delete itself), then goes. A's and B's caches stay.
+out=$(deploy_src "$REF_C" cachemark "$LOG_DIR/cache-mark.ts") || fail "curl: cachemark upload to $REF_C"
+[[ $(tail -n1 <<<"$out") =~ ^20[01]$ ]] || fail "the upload that imports npm:postgres to $REF_C answered: $out"
+[[ -d $CACHE_ROOT/$REF_C && -n $(cache_marker "$REF_C") ]] || fail "the bundler of $REF_C has no cached package in $CACHE_ROOT/$REF_C"
+[[ -f $SBCTL_STATE/projects/$REF_C/edge-bundle.env ]] || fail "no rendered files for the bundler of $REF_C"
+sbctl projects delete "$REF_C" --skip-final-backup >/dev/null || fail "projects delete $REF_C"
+for gone in "$CACHE_ROOT/$REF_C" "/var/cache/private/sb-edge-bundle/$REF_C" "$SBCTL_STATE/projects/$REF_C"; do
+  [[ ! -e $gone ]] || fail "$gone is still there after the project was deleted"
+done
+[[ $(unit_state "sb-edge-bundle@$REF_C.service") == inactive ]] || fail "the bundler of the deleted project is $(unit_state "sb-edge-bundle@$REF_C.service")"
+[[ -d $CACHE_ROOT/$REF_A && -d $CACHE_ROOT/$REF_B && -n $(cache_marker "$REF_B") ]] || fail "deleting $REF_C removed the cache of another project"
 
 log "functions smoke test passed"
