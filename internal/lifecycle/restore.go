@@ -12,10 +12,11 @@ import (
 
 // RestoreRequest says what an in-place restore brings back.
 type RestoreRequest struct {
-	// Target is the point in time to restore to. BackupID overrides it.
+	// Target is the point in time to restore to.
 	Target time.Time
-	// BackupID restores exactly the state at the end of that base backup (the backup
-	// service's manifest id).
+	// BackupID is the base backup (the backup service's manifest id) the restore starts from.
+	// Alone, it restores exactly the state at the end of that backup; with Target, it replays
+	// WAL from that backup up to Target.
 	BackupID string
 }
 
@@ -28,7 +29,12 @@ type InPlaceRestorer interface {
 // DatabaseRestorer is the optional Manager capability behind the dashboard's restore and
 // the Management API's restore routes. The Engine has it; the API asks the Manager for it.
 type DatabaseRestorer interface {
-	BeginRestore(ctx context.Context, ref string) (*Restore, error)
+	BeginRestore(ctx context.Context, ref string) (RestoreRun, error)
+}
+
+// RestoreRun is a restore that BeginRestore started: the project is RESTORING until Run returns.
+type RestoreRun interface {
+	Run(ctx context.Context, req RestoreRequest) error
 }
 
 var _ DatabaseRestorer = (*Engine)(nil)
@@ -78,7 +84,7 @@ func (e *Engine) restorer() InPlaceRestorer {
 	return r
 }
 
-// Restore is one in-place restore in progress: the project is RESTORING until Run returns.
+// Restore is the Engine's RestoreRun.
 type Restore struct {
 	e   *Engine
 	ref string
@@ -89,7 +95,7 @@ type Restore struct {
 // already being restored, so two operations never overlap: every other operation checks the
 // status under the same per-project lock. The caller must call Run; until then the project
 // stays RESTORING.
-func (e *Engine) BeginRestore(ctx context.Context, ref string) (*Restore, error) {
+func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, error) {
 	if e.restorer() == nil {
 		return nil, ErrNoRestorer
 	}

@@ -146,7 +146,16 @@ func matrixCases() []routeCase {
 		rd("YYYNYN", "POST", pp+"/restart", nil), // hosted lists Restart for Developers
 		rd("YYYNYN", "POST", p+"/restart", nil),
 		rd("YYYNYN", "POST", pp+"/restart-services", map[string]any{}),
-		rd("YYYNYN", "POST", "/platform/database/"+testRef+"/backups/restore", map[string]any{}),
+		// restoring a backup or a point in time overwrites the data: Owner and Administrator only
+		rc("YYYYYN", "GET", "/platform/database/"+testRef+"/backups", nil),
+		rc("YYYYYN", "GET", p+"/database/backups", nil),
+		rc("YYYYYN", "GET", pp+"/billing/addons", nil),
+		rc("YYYYYN", "GET", p+"/billing/addons", nil),
+		rd("YYNNNN", "POST", "/platform/database/"+testRef+"/backups/restore", map[string]any{"id": 1}),
+		rd("YYNNNN", "POST", "/platform/database/"+testRef+"/backups/restore-physical", map[string]any{"id": 1}),
+		rd("YYNNNN", "POST", "/platform/database/"+testRef+"/backups/pitr", map[string]any{"recovery_time_target_unix": 1}),
+		rd("YYNNNN", "POST", p+"/database/backups/restore", map[string]any{"id": 1}),
+		rd("YYNNNN", "POST", p+"/database/backups/restore-pitr", map[string]any{"recovery_time_target_unix": 1}),
 		rd("YYNNNN", "POST", p+"/restore", nil),
 		rc("YYNNNN", "PATCH", p+"/config/auth", map[string]any{"site_url": "https://app.example.test"}),
 		rc("YYNNNN", "PATCH", pp+"/config/postgrest", map[string]any{"max_rows": 500}),

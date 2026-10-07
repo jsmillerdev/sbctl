@@ -79,12 +79,13 @@ func (s *Service) RestoreWindow(ctx context.Context, ref string, running bool) (
 }
 
 // RestoreInPlace implements lifecycle.InPlaceRestorer: the restore behind the Management
-// API's restore routes, over the running project itself. A BackupID restores the state at the
-// end of that base backup; otherwise Target is the point in time.
+// API's restore routes, over the running project itself. A BackupID alone restores the state at
+// the end of that base backup; with a Target it starts from that backup and replays to the
+// time; without a BackupID the newest usable backup before Target is the base.
 func (s *Service) RestoreInPlace(ctx context.Context, ref string, req lifecycle.RestoreRequest) error {
-	opts := RestoreOptions{Force: true}
-	if req.BackupID != "" {
-		opts.ToBackup, opts.BackupID = true, req.BackupID
+	opts := RestoreOptions{Force: true, BackupID: req.BackupID}
+	if req.BackupID != "" && req.Target.IsZero() {
+		opts.ToBackup = true
 	}
 	_, err := s.RestoreWith(ctx, ref, req.Target, "", opts)
 	return err

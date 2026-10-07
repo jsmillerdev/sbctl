@@ -118,6 +118,9 @@ func TestRestoreInPlaceModes(t *testing.T) {
 			return lifecycle.RestoreRequest{Target: time.Date(2026, 10, 6, 11, 30, 0, 0, time.UTC)}
 		}, "recovery_target_time"},
 		{"backup", func(m Manifest) lifecycle.RestoreRequest { return lifecycle.RestoreRequest{BackupID: m.ID} }, "recovery_target = 'immediate'"},
+		{"backup and time", func(m Manifest) lifecycle.RestoreRequest {
+			return lifecycle.RestoreRequest{BackupID: m.ID, Target: time.Date(2026, 10, 6, 11, 45, 0, 0, time.UTC)}
+		}, "recovery_target_time"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newTestEnv(t)

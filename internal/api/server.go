@@ -68,6 +68,11 @@ type Deps struct {
 	// StudioRefresh re-renders Studio's unit after the dashboard gained its first SSO provider
 	// or lost its last (fleet.Manager.RefreshStudio). Nil: nothing is told.
 	StudioRefresh func(ctx context.Context) error
+	// Backups lists the base backups and the restorable span of a project (the Backups pages of
+	// the dashboard, the Management API's backup list and restores); *backup.Service implements
+	// it. Nil means the node has no backup service: the list is empty, PITR is off and restores
+	// are refused. Restores also need a Manager that is a lifecycle.DatabaseRestorer.
+	Backups BackupSource
 	// CreateWait bounds how long POST /v1/projects waits for the new project to show
 	// up in the registry before answering 201 COMING_UP. Zero means 10 seconds.
 	CreateWait time.Duration
@@ -79,6 +84,7 @@ type Server struct {
 	sec      secrets.Secrets
 	mgr      lifecycle.Manager
 	branches *branching.Service
+	backups  BackupSource
 	cfg      *config.Config
 	log      *slog.Logger
 	store    Store
@@ -195,7 +201,7 @@ func NewServer(d Deps) (*Server, error) {
 		return nil, fmt.Errorf("api: Deps needs Registry, Secrets, Manager and Config")
 	}
 	s := &Server{
-		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, branches: d.Branching, cfg: d.Config, log: d.Logger, store: d.Store,
+		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, branches: d.Branching, backups: d.Backups, cfg: d.Config, log: d.Logger, store: d.Store,
 		hc: d.HTTPClient, now: d.Now, fnHook: d.Functions, pgmetaURL: d.PGMetaURL, upstreamOverride: d.Upstream, createWait: d.CreateWait,
 		pgmetaKeyMu: make(chan struct{}, 1), roEnsured: map[string]readOnlyEnsured{},
 	}
@@ -324,6 +330,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesDatabase(add)
 	s.routesFunctions(add)
 	s.routesPlatformProject(add)
+	s.routesBackups(add)
 	s.routesContent(add)
 	s.routesProxies(add)
 	s.routesLogin(add)

@@ -115,6 +115,9 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		StudioRefresh: fm.RefreshStudio,
 		Logger:        log.With("component", "api"),
 	}
+	if bs := backups(node); bs != nil { // a nil *backup.Service in the interface would not be nil
+		apiDeps.Backups = bs
+	}
 	// Edge Functions: the syncer turns the stored deployments and secrets into the files the
 	// runtime (supavise-edge-runtime, started with the other shared services) serves, and bundles
 	// the sources that `supabase functions deploy --use-api` uploads.

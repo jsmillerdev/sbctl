@@ -93,6 +93,8 @@ func TestRoleCapabilities(t *testing.T) {
 		{ActRead, ResProjects, true, true, true, true},
 		{ActInfraExecute, "reboot", true, true, true, false}, // hosted: Restart is for Developers too
 		{ActInfraExecute, "queue_jobs.projects.pause", true, true, false, false},
+		{ActInfraExecute, "queue_job.walg.prepare_restore", true, true, false, false}, // a point-in-time restore overwrites production data
+		{ActInfraExecute, "queue_job.restore.prepare", true, true, false, false},
 		// settings and keys
 		{ActUpdate, "custom_config_gotrue", true, true, false, false},
 		{ActCreate, ResServiceKeys, true, true, false, false},
