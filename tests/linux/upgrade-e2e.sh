@@ -40,6 +40,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 BINS=${UPGRADE_E2E_BIN_DIR:?run tests/linux/upgrade-e2e-build.sh OUT_DIR first and pass UPGRADE_E2E_BIN_DIR}
 SRV_PORT=38801
 WORK=$(mktemp -d)
+# The supavise user reads the release key (--plan as that user); the private files keep their own modes.
+chmod 0755 "$WORK"
 SRV_PID=""
 cleanup() {
   local rc=$?
