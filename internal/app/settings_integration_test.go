@@ -561,6 +561,55 @@ func TestSettingsIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("postgres setting that needs a restart", func(t *testing.T) {
+		// Without restart_database the value is saved and applies at the next restart.
+		mustAPI("PUT", cfgPath+"/config/database/postgres", map[string]any{"statement_timeout": "45s", "max_connections": 40})
+		if rows := sql("show max_connections"); rows[0]["max_connections"] != "30" {
+			t.Fatalf("max_connections changed without a restart: %v", rows)
+		}
+		var got map[string]any
+		_ = json.Unmarshal(mustAPI("GET", cfgPath+"/config/database/postgres", nil), &got)
+		if got["max_connections"] != float64(40) {
+			t.Fatalf("GET must return what was saved: %v", got["max_connections"])
+		}
+		// With it the whole project restarts (the API units are bound to the cluster) on the saved settings.
+		mustAPI("PUT", cfgPath+"/config/database/postgres", map[string]any{"max_connections": 40, "restart_database": true})
+		waitFor("max_connections applied by the restart", func() (bool, string) {
+			c, err := pgx.Connect(ctx, fmt.Sprintf("postgres://supabase_admin:%s@127.0.0.1:%d/postgres?sslmode=disable", url.QueryEscape(keys.AdminPassword), cfg.PortsFor(p.Ref, p.Seq).Postgres))
+			if err != nil {
+				return false, err.Error()
+			}
+			defer c.Close(ctx)
+			var v string
+			if err := c.QueryRow(ctx, "show max_connections").Scan(&v); err != nil {
+				return false, err.Error()
+			}
+			return v == "40", v
+		})
+		if rows := sql("show statement_timeout"); rows[0]["statement_timeout"] != "45s" {
+			t.Fatalf("statement_timeout lost by the restart: %v", rows)
+		}
+		waitFor("PostgREST and GoTrue back after the restart", func() (bool, string) {
+			a, _, _ := project("GET", "/rest/v1/", nil, "apikey", keys.SecretKey)
+			b, _, _ := project("GET", "/auth/v1/settings", nil, "apikey", keys.PublishableKey)
+			return a == 200 && b == 200, fmt.Sprint(a, b)
+		})
+		// Back to the class's value: the command-line setting goes away and the next restart restores 30.
+		mustAPI("PUT", cfgPath+"/config/database/postgres", map[string]any{"max_connections": nil, "restart_database": true})
+		waitFor("class value back", func() (bool, string) {
+			c, err := pgx.Connect(ctx, fmt.Sprintf("postgres://supabase_admin:%s@127.0.0.1:%d/postgres?sslmode=disable", url.QueryEscape(keys.AdminPassword), cfg.PortsFor(p.Ref, p.Seq).Postgres))
+			if err != nil {
+				return false, err.Error()
+			}
+			defer c.Close(ctx)
+			var v string
+			if err := c.QueryRow(ctx, "show max_connections").Scan(&v); err != nil {
+				return false, err.Error()
+			}
+			return v == "30", v
+		})
+	})
+
 	if hold := os.Getenv("SBCTL_SETTINGS_E2E_HOLD"); hold != "" {
 		info, _ := json.MarshalIndent(map[string]any{
 			"api_url": admin, "proxy_url": proxyURL, "project_host": host, "pat": pat, "ref": p.Ref,

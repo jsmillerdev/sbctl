@@ -387,6 +387,37 @@ func TestRealtimeTenantLifecycle(t *testing.T) {
 	}
 }
 
+func TestRealtimeTenantQuiesce(t *testing.T) {
+	n := newTestNode(t)
+	k := n.project(t, testRef)
+	const apiSecret = "realtime-api-secret-0123456789abcdef"
+	api := newFakeAPI(t, bearerOK(apiSecret), pathTenant("/api/tenants/"), 204)
+	cl, _ := testClient(config.SvcRealtime)
+	tn := &realtimeTenant{cl: cl, store: tenantStore{reg: n.reg, sec: n.sec}, base: api.srv.URL, secret: apiSecret, now: time.Now}
+	_ = k
+	if err := tn.QuiesceTenant(context.Background(), testRef); err != nil {
+		t.Fatal(err)
+	}
+	if c := api.last(); c.Method != "POST" || c.Path != "/api/tenants/"+testRef+"/reload" {
+		t.Fatalf("call %s %s", c.Method, c.Path)
+	}
+	// A tenant the service does not know is quiet already; a server error is reported.
+	api.fail = func(c call, _ int) int { return 404 }
+	if err := tn.QuiesceTenant(context.Background(), testRef); err != nil {
+		t.Fatalf("404: %v", err)
+	}
+	api.fail = func(c call, _ int) int { return 400 }
+	if err := tn.QuiesceTenant(context.Background(), testRef); err == nil {
+		t.Fatal("a refused reload must be reported")
+	}
+	if err := tn.QuiesceTenant(context.Background(), "../x"); err == nil {
+		t.Fatal("a bad ref was accepted")
+	}
+	if err := (Fleet{tn}).QuiesceTenant(context.Background(), testRef); err == nil {
+		t.Fatal("the fleet must report the failure of a tenant")
+	}
+}
+
 func TestStorageTenantLifecycle(t *testing.T) {
 	n := newTestNode(t)
 	k := n.project(t, testRef)

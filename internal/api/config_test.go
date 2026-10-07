@@ -249,6 +249,15 @@ func TestPostgresConfig(t *testing.T) {
 	if got := bodyMap(t, f.mustDo("GET", url, nil, 200)); got["statement_timeout"] != "30s" {
 		t.Fatalf("GET: %v", got)
 	}
+	// Asking for a restart again with nothing new still applies: an earlier save may be waiting for one.
+	f.mustDo("PUT", url, map[string]any{"statement_timeout": "30s", "restart_database": true}, 200)
+	if len(f.mgr.applyOpts) != 2 || !f.mgr.applyOpts[1].RestartDatabase {
+		t.Fatalf("an unchanged save with restart_database must still reach the manager: %+v", f.mgr.applyOpts)
+	}
+	f.mustDo("PUT", url, map[string]any{"statement_timeout": "30s"}, 200)
+	if len(f.mgr.applyOpts) != 2 {
+		t.Fatalf("an unchanged save without restart_database applies nothing: %+v", f.mgr.applyOpts)
+	}
 	// Unsafe or malformed values are rejected before anything is saved.
 	for body, want := range map[string]string{
 		`{"max_connections": 3}`:       "at least 20",

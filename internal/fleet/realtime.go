@@ -147,6 +147,27 @@ func (t *realtimeTenant) EnsureTenant(ctx context.Context, spec TenantSpec) erro
 	return nil
 }
 
+// QuiesceTenant implements Quiescer: POST /api/tenants/<ref>/reload stops the tenant's
+// postgres_cdc_rls processes, shuts its database connection down and disconnects its sockets
+// (the tenant row stays). A tenant Realtime does not know counts as quiet.
+func (t *realtimeTenant) QuiesceTenant(ctx context.Context, ref string) error {
+	if err := validTenantRef(ref); err != nil {
+		return err
+	}
+	h, err := t.headers()
+	if err != nil {
+		return err
+	}
+	res, err := t.cl.do(ctx, "POST", t.tenantURL(ref)+"/reload", h, nil)
+	if err != nil {
+		return err
+	}
+	if !res.ok() && res.Status != 404 {
+		return t.cl.apiError("reload tenant "+ref, res)
+	}
+	return nil
+}
+
 // RemoveTenant implements Tenant: DELETE /api/tenants/<ref> disconnects the tenant's
 // sockets, deletes the row, and stops its replication connections. 404 counts as removed.
 func (t *realtimeTenant) RemoveTenant(ctx context.Context, ref string) error {

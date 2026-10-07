@@ -117,8 +117,11 @@ func (c *cfgPlane) ReconfigureService(_ context.Context, p *registry.Project, _ 
 	c.services = append(c.services, p.Ref+" "+svc)
 	return c.svcErr
 }
-func (c *cfgPlane) ApplyPostgresSettings(_ context.Context, _ *registry.Project, _ *secrets.ProjectKeys, restart bool) (bool, error) {
+func (c *cfgPlane) ApplyPostgresSettings(ctx context.Context, _ *registry.Project, _ *secrets.ProjectKeys, restart bool, before func(context.Context)) (bool, error) {
 	c.pgCalls = append(c.pgCalls, restart)
+	if restart && before != nil {
+		before(ctx)
+	}
 	return c.pending, nil
 }
 func (c *cfgPlane) SetRolePassword(_ context.Context, _ *registry.Project, role, pw string) error {
@@ -129,7 +132,13 @@ func (c *cfgPlane) SetRolePassword(_ context.Context, _ *registry.Project, role,
 type refreshTenant struct {
 	fakeTenant
 	refreshed []string
+	quiesced  []string
 	err       error
+}
+
+func (r *refreshTenant) QuiesceTenant(_ context.Context, ref string) error {
+	r.quiesced = append(r.quiesced, ref)
+	return r.err
 }
 
 func (r *refreshTenant) RefreshTenant(_ context.Context, ref string) error {
@@ -176,6 +185,9 @@ func TestApplyConfigTouchesOnlyTheOwningService(t *testing.T) {
 	res, err := h.e.ApplyConfig(ctx, p.Ref, projectconfig.Postgres, ApplyOptions{RestartDatabase: true})
 	if err != nil || !res.PendingRestart || len(cp.pgCalls) != 1 || !cp.pgCalls[0] {
 		t.Fatalf("postgres: %+v %v %v", res, err, cp.pgCalls)
+	}
+	if len(rt.quiesced) != 1 || rt.quiesced[0] != p.Ref {
+		t.Fatalf("the shared services must be asked to let go of the database before a restart: %v", rt.quiesced)
 	}
 	set.err = errors.New("boom")
 	if _, err := h.e.ApplyConfig(ctx, p.Ref, projectconfig.Realtime, ApplyOptions{}); err == nil {
@@ -251,5 +263,21 @@ func TestTemplateBaseURL(t *testing.T) {
 		if got := TemplateBaseURL(cfg); got != want {
 			t.Errorf("%q: %s, want %s", admin, got, want)
 		}
+	}
+}
+
+func TestPauseQuiescesTheSharedServicesFirst(t *testing.T) {
+	h, _, _, rt := configHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	rt.err = errors.New("realtime down") // a failing quiesce must not stop the pause
+	if err := h.e.Pause(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.quiesced) != 1 || rt.quiesced[0] != p.Ref {
+		t.Fatalf("quiesced: %v", rt.quiesced)
+	}
+	if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusInactive {
+		t.Fatalf("status %s", got.Status)
 	}
 }

@@ -50,8 +50,9 @@ func (pl *PostgresPlane) ReconfigureService(ctx context.Context, p *registry.Pro
 // cluster: settings that overlap the class's command-line sizing are rendered into the
 // unit (they apply at the next restart), every other saved setting is applied with ALTER
 // SYSTEM and a reload, and a setting that is no longer saved is reset. restart restarts the
-// cluster afterwards. It returns true when something still waits for a restart.
-func (pl *PostgresPlane) ApplyPostgresSettings(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, restart bool) (pending bool, err error) {
+// cluster afterwards (beforeRestart, when given, runs first, so that the shared services can
+// let go of their connections). It returns true when something still waits for a restart.
+func (pl *PostgresPlane) ApplyPostgresSettings(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, restart bool, beforeRestart func(context.Context)) (pending bool, err error) {
 	if pl.opts.Settings == nil {
 		return false, nil
 	}
@@ -140,8 +141,17 @@ func (pl *PostgresPlane) ApplyPostgresSettings(ctx context.Context, p *registry.
 		}
 		sleepCtx(ctx, 100)
 	}
+	// pg_settings.pending_restart is true for every command-line setting that the artifact's
+	// postgresql.conf disagrees with, so only the settings that are not on the command line can
+	// be asked; the others are compared with their saved values below.
+	var managed []string
+	for _, f := range projectconfig.PostgresSchema.Fields {
+		if !isCmdline(f.Name) {
+			managed = append(managed, f.Name)
+		}
+	}
 	var restartPending bool
-	if err := c.QueryRow(ctx, `select exists (select 1 from pg_settings where pending_restart)`).Scan(&restartPending); err != nil {
+	if err := c.QueryRow(ctx, `select exists (select 1 from pg_settings where pending_restart and name = any($1))`, managed).Scan(&restartPending); err != nil {
 		return false, err
 	}
 	differs, err := cmdlinePending(ctx, c, cmdline)
@@ -151,6 +161,9 @@ func (pl *PostgresPlane) ApplyPostgresSettings(ctx context.Context, p *registry.
 	pending = restartPending || changedUnit || differs
 	c.Close(context.WithoutCancel(ctx))
 	if restart && pending {
+		if beforeRestart != nil {
+			beforeRestart(ctx)
+		}
 		if err := pl.restartDatabase(ctx, p, keys); err != nil {
 			return true, err
 		}
@@ -234,19 +247,16 @@ func sleepCtx(ctx context.Context, ms int) {
 	}
 }
 
-// restartDatabase restarts the cluster and waits until it answers.
+// restartDatabase restarts the whole project like a pause and a resume does: GoTrue and
+// PostgREST are bound to the cluster's unit, so they stop with it and start again after it.
 func (pl *PostgresPlane) restartDatabase(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error {
-	spec, err := pl.postgresSpec(ctx, p, keys)
-	if err != nil {
+	if err := pl.Stop(ctx, p.Ref); err != nil {
 		return err
 	}
-	if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
-		return err
-	}
-	return pl.StartDatabase(ctx, p, keys)
+	return pl.Start(ctx, p, keys)
 }
 
-// RestartDatabase restarts the project's PostgreSQL on the saved settings.
+// RestartDatabase restarts the project (PostgreSQL, then GoTrue and PostgREST) on the saved settings.
 func (pl *PostgresPlane) RestartDatabase(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error {
 	return pl.restartDatabase(ctx, p, keys)
 }

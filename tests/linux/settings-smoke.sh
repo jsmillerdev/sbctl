@@ -236,14 +236,14 @@ must 400 PUT "$CFG/config/database/postgres" '{"max_connections":3}'
 must 400 PUT "$CFG/config/database/postgres" '{"work_mem":"16"}'
 BEFORE=$(systemctl show -p MainPID --value "sb-postgres@$REF.service")
 must 200 PUT "$CFG/config/database/postgres" '{"max_connections":40,"restart_database":true}'
-for ((i = 0; i < 60; i++)); do
+for ((i = 0; i < 120; i++)); do
   [[ $(sql "show max_connections" 2>/dev/null || true) == 40 ]] && break
   sleep 1
 done
 [[ $(sql "show max_connections") == 40 ]] || fail "max_connections was not applied by the restart"
 [[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") != "$BEFORE" ]] || fail "the cluster was not restarted"
 [[ $(sql "show statement_timeout") == 45s ]] || fail "statement_timeout was lost by the restart"
-for ((i = 0; i < 60; i++)); do
+for ((i = 0; i < 120; i++)); do
   [[ $(pcode GET /rest/v1/ -H "apikey: $SEC") == 200 && $(pcode GET /auth/v1/settings -H "apikey: $PUB") == 200 ]] && break
   sleep 1
 done

@@ -16,7 +16,7 @@ import (
 // configPlane is what ApplyConfig needs of the data plane beyond Plane; PostgresPlane has it.
 type configPlane interface {
 	ReconfigureService(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, svc string) error
-	ApplyPostgresSettings(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, restart bool) (bool, error)
+	ApplyPostgresSettings(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, restart bool, beforeRestart func(context.Context)) (bool, error)
 	SetRolePassword(ctx context.Context, p *registry.Project, role, password string) error
 }
 
@@ -64,7 +64,7 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 			err = e.opts.Fleet.EnsureTenant(ctx, spec)
 		}
 	case projectconfig.Postgres:
-		res.PendingRestart, err = cp.ApplyPostgresSettings(ctx, p, keys, opts.RestartDatabase)
+		res.PendingRestart, err = cp.ApplyPostgresSettings(ctx, p, keys, opts.RestartDatabase, func(ctx context.Context) { e.quiesce(ctx, ref) })
 	default:
 		return ApplyResult{}, fmt.Errorf("lifecycle: unknown settings service %q", svc)
 	}
@@ -127,4 +127,17 @@ func (e *Engine) SetDatabasePassword(ctx context.Context, ref, password string) 
 	}
 	e.event(ctx, ref, "project.db_password_changed", nil)
 	return nil
+}
+
+// quiesce asks the shared services to let go of ref's database before its cluster stops: a
+// logical replication connection of Realtime keeps a fast shutdown from finishing (systemd
+// kills the cluster after its stop timeout, 90 seconds, and the next start recovers from the
+// crash). Failures are logged: the stop goes ahead either way.
+func (e *Engine) quiesce(ctx context.Context, ref string) {
+	if len(e.opts.Fleet) == 0 || ref == config.SystemRef {
+		return
+	}
+	if err := e.opts.Fleet.QuiesceTenant(ctx, ref); err != nil {
+		e.log.Warn("could not ask the shared services to let go of the project's database; its shutdown may be slow", "ref", ref, "error", err)
+	}
 }

@@ -70,6 +70,9 @@ func asValidation(err error) error {
 // a context that outlives the request, like every lifecycle operation: a client that leaves
 // partway must not strand a half-restarted service.
 func (s *Server) saveSettings(ctx context.Context, p *registry.Project, svc projectconfig.Service, patch map[string]any, opts lifecycle.ApplyOptions) (*projectconfig.Change, lifecycle.ApplyResult, error) {
+	// A save that changes nothing is applied only when a restart is asked for: a setting saved
+	// earlier may still wait for one.
+	applyAnyway := opts.RestartDatabase
 	done, err := s.beginOp()
 	if err != nil {
 		return nil, lifecycle.ApplyResult{}, err
@@ -87,7 +90,7 @@ func (s *Server) saveSettings(ctx context.Context, p *registry.Project, svc proj
 	if err != nil {
 		return nil, lifecycle.ApplyResult{}, asValidation(err)
 	}
-	if len(ch.Changed) == 0 {
+	if len(ch.Changed) == 0 && !applyAnyway {
 		return ch, lifecycle.ApplyResult{}, nil
 	}
 	rc, ok := s.mgr.(lifecycle.Reconfigurer)

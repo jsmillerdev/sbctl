@@ -388,6 +388,7 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 		return err
 	}
 	e.stopTimer(ctx, ref)
+	e.quiesce(ctx, ref)
 	if err := e.plane.Stop(ctx, ref); err != nil {
 		_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, registry.StatusActiveUnhealthy)
 		return fmt.Errorf("lifecycle: pause %s: %w", ref, err)
