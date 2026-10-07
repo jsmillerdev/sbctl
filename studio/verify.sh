@@ -62,6 +62,10 @@ files_containing() { # needle -> count of listed files that contain it
   ' "$ROOT" "$1"
 }
 
+# build.sh exports the build-time placeholders as NEXT_PUBLIC_* for next build. Studio must
+# start from a clean slate here, or it would read a placeholder as a configured value.
+while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(NEXT_PUBLIC_|CSP_EXTRA_PROJECT_HOSTS$)' || true)
+
 start() { # api_url gotrue_url site_url hosts
   local port; port="$(free_port)"; PORT_NOW="$port"
   : > "$TMP/studio.log"

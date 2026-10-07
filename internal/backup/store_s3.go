@@ -346,10 +346,30 @@ func (s *S3Store) ListDirs(ctx context.Context, prefix string) ([]string, error)
 			return nil, fmt.Errorf("backup: s3 list %s: %w", p, err)
 		}
 		for _, cp := range page.CommonPrefixes {
-			out = append(out, strings.TrimSuffix(strings.TrimPrefix(aws.ToString(cp.Prefix), p), "/"))
+			// Some S3-compatible stores (SeaweedFS) keep listing a "directory" after its
+			// last object is deleted. Only report prefixes that still hold an object, so
+			// restores and retention see the same tree as on AWS S3.
+			full := aws.ToString(cp.Prefix)
+			ok, err := s.hasObjects(ctx, full)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				out = append(out, strings.TrimSuffix(strings.TrimPrefix(full, p), "/"))
+			}
 		}
 	}
 	return out, nil
+}
+
+// hasObjects reports whether at least one object exists under the full key prefix.
+func (s *S3Store) hasObjects(ctx context.Context, fullPrefix string) (bool, error) {
+	one := int32(1)
+	page, err := s.c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &fullPrefix, MaxKeys: &one})
+	if err != nil {
+		return false, fmt.Errorf("backup: s3 list %s: %w", fullPrefix, err)
+	}
+	return len(page.Contents) > 0, nil
 }
 
 // Delete implements Store.
