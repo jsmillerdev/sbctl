@@ -33,6 +33,7 @@ Options:
   --instance-type TYPE     default t4g.large (Graviton, 8 GiB, about 20 projects); see the README
   --stack-name NAME        default $NAME
   --volume-size GIB        data volume size, default 100 (can grow, never shrink)
+  --daily-snapshots COUNT  daily snapshots of the data volume to keep, default 7; 0 takes none
   --version TAG            $NAME release to install, default latest (for example v1.2.3)
   --access-cidr CIDR       who may reach ports 80, 443, 5432 and 6543, default 0.0.0.0/0
   --ssh-cidr CIDR          open SSH to this range (needs --key-name); default: no SSH,
@@ -45,8 +46,9 @@ Options:
   --template FILE          use this template file
   --profile NAME           AWS CLI profile
   --dry-run                print the aws commands, run nothing
-  --delete                 delete the stack (the backup bucket and a final snapshot of the data
-                           volume stay in your account); asks for confirmation
+  --delete                 stop the instance, then delete the stack (the backup bucket, a final
+                           snapshot of the data volume and any daily snapshots stay in your
+                           account); asks for confirmation
   --yes                    with --delete: do not ask
   -h, --help
 USAGE
@@ -67,7 +69,7 @@ show() { local a out=""; for a in "$@"; do out="$out $(q "$a")"; done; printf '%
 
 # ---- arguments -----------------------------------------------------------------------------
 REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
-EMAIL="" DOMAIN="" ZONE="" ITYPE="" STACK=$NAME VOLSIZE="" VERSION="" ACCESS="" SSH="" KEY=""
+EMAIL="" DOMAIN="" ZONE="" ITYPE="" STACK=$NAME VOLSIZE="" SNAPS="" VERSION="" ACCESS="" SSH="" KEY=""
 SSM="" AMI="" SNAP="" TEMPLATE="" PROFILE="" DRY=0 DELETE=0 YES=0
 
 # An option takes its value from "--opt=value" or from the next argument.
@@ -94,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --instance-type) need "$@"; ITYPE=$val ;;
     --stack-name) need "$@"; STACK=$val ;;
     --volume-size) need "$@"; VOLSIZE=$val ;;
+    --daily-snapshots) need "$@"; SNAPS=$val ;;
     --version) need "$@"; VERSION=$val ;;
     --access-cidr) need "$@"; ACCESS=$val ;;
     --ssh-cidr) need "$@"; SSH=$val ;;
@@ -129,7 +132,7 @@ re_snap='^snap-[0-9a-f]{8,17}$'
 [[ $REGION =~ $re_region ]] || die "--region $REGION is not a region name such as us-east-1"
 [[ $STACK =~ $re_stack ]] || die "--stack-name must start with a letter and hold only letters, digits and hyphens"
 if [[ $DELETE -eq 1 ]]; then
-  [[ -z $EMAIL$DOMAIN$ZONE$ITYPE$VOLSIZE$VERSION$ACCESS$SSH$KEY$SSM$AMI$SNAP$TEMPLATE ]] \
+  [[ -z $EMAIL$DOMAIN$ZONE$ITYPE$VOLSIZE$SNAPS$VERSION$ACCESS$SSH$KEY$SSM$AMI$SNAP$TEMPLATE ]] \
     || die "--delete takes only --region, --stack-name, --profile, --yes and --dry-run"
 else
   [[ $YES -eq 0 ]] || die "--yes belongs to --delete"
@@ -149,6 +152,13 @@ else
     if ! [[ $VOLSIZE =~ ^[0-9]+$ ]] || [[ $VOLSIZE -lt 20 || $VOLSIZE -gt 16384 ]]; then
       die "--volume-size must be a whole number of GiB from 20 to 16384"
     fi
+  fi
+  if [[ -n $SNAPS ]]; then
+    # At most four digits, so the arithmetic below cannot overflow; a leading zero is not octal.
+    if ! [[ $SNAPS =~ ^[0-9]{1,4}$ ]] || [[ $((10#$SNAPS)) -gt 1000 ]]; then
+      die "--daily-snapshots must be a whole number from 0 to 1000"
+    fi
+    SNAPS=$((10#$SNAPS))
   fi
 fi
 
@@ -199,12 +209,24 @@ What stays in your account, and keeps costing money until you delete it yourself
   - the S3 backup bucket (WAL archives and base backups; the stack never deletes it)
   - a final EBS snapshot of the data volume (it holds the master key, the registry and every
     project; encrypted, and restorable with --data-snapshot-id)
+  - the daily snapshots of the data volume that the stack made (nothing deletes old ones once
+    the stack is gone)
+
+A running instance is stopped first, so that Postgres and the other services can shut down in
+order before the final snapshot is taken, which then is not a crash image. The node is offline
+from that moment. (A stack whose first launch failed has no instance; nothing is stopped.)
 WARN
   if [[ $DRY -eq 1 ]]; then
     note "dry run: nothing is sent to AWS"
     note "the commands --delete would run:"
-    note "reads BackupBucket and DataVolumeId from the stack outputs, to name what stays:"
+    note "checks that the stack exists:"
+    show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text
+    note "reads BackupBucket, DataVolumeId and InstanceId from the stack outputs, to name what stays and what to stop:"
     show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "$Q_OUTPUTS" --output text
+    note "stops the instance, so that the final snapshot is taken from a cleanly shut-down node"
+    note "(skipped when the stack has no InstanceId output or is ROLLBACK_COMPLETE, CREATE_FAILED or DELETE_FAILED, as after a failed first launch):"
+    show "${AWS[@]}" ec2 stop-instances --instance-ids "<InstanceId>"
+    show "${AWS[@]}" ec2 wait instance-stopped --instance-ids "<InstanceId>"
     show "${AWS[@]}" cloudformation delete-stack --stack-name "$STACK"
     show "${AWS[@]}" cloudformation wait stack-delete-complete --stack-name "$STACK"
     show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=volume-id,Values=<DataVolumeId>" --query 'Snapshots[].[SnapshotId,StartTime,State]' --output text
@@ -215,24 +237,52 @@ WARN
   outs=$(describe "$Q_OUTPUTS")
   BUCKET=$(pick BackupBucket <<<"$outs")
   VOLUME=$(pick DataVolumeId <<<"$outs")
+  INSTANCE=$(pick InstanceId <<<"$outs")
+  # A stack whose creation failed has no outputs and no instance: there is nothing to stop, and
+  # the delete is the way out (deploy cannot update a ROLLBACK_COMPLETE stack).
+  STOP=1
+  case $status in ROLLBACK_COMPLETE|CREATE_FAILED|DELETE_FAILED) STOP=0 ;; esac
+  [[ $INSTANCE =~ ^i-[0-9a-f]{8,17}$ ]] || STOP=0
   say ""
-  say "Backup bucket:  $BUCKET"
-  say "Data volume:    $VOLUME"
+  [[ -z $BUCKET ]] || say "Backup bucket:  $BUCKET"
+  [[ -z $VOLUME ]] || say "Data volume:    $VOLUME"
+  if [[ $STOP -eq 1 ]]; then
+    say "Instance:       $INSTANCE (stopped first)"
+  else
+    say "Instance:       none to stop (stack status $status)"
+  fi
   if [[ $YES -eq 0 ]]; then
     [[ -t 0 ]] || fail "not a terminal: pass --yes to delete without asking"
     printf 'Type the stack name (%s) to delete it: ' "$STACK"
     read -r answer
     [[ $answer == "$STACK" ]] || fail "not deleted"
   fi
+  # The final snapshot is taken when the volume is deleted. Stopping first lets the services shut
+  # down and the file system flush; a snapshot of a running node is crash-consistent only.
+  if [[ $STOP -eq 1 ]]; then
+    say "Stopping $INSTANCE ..."
+    if ! "${AWS[@]}" ec2 stop-instances --instance-ids "$INSTANCE" >/dev/null \
+      || ! "${AWS[@]}" ec2 wait instance-stopped --instance-ids "$INSTANCE"; then
+      fail "could not stop $INSTANCE, so the stack was not deleted (stop it in the EC2 console and run this again; if the instance no longer exists, delete the stack in the CloudFormation console)"
+    fi
+  fi
   "${AWS[@]}" cloudformation delete-stack --stack-name "$STACK"
   say "Deleting; this takes a few minutes ..."
   "${AWS[@]}" cloudformation wait stack-delete-complete --stack-name "$STACK" \
     || fail "the stack did not delete cleanly; see the Events tab of the stack in the CloudFormation console"
   say ""
+  if [[ -z $BUCKET && -z $VOLUME ]]; then
+    say "Deleted. The stack reported no backup bucket or data volume."
+    exit 0
+  fi
   say "Deleted. Kept for you:"
-  say "  backup bucket  $BUCKET   (empty and delete it yourself when you no longer need the backups)"
-  say "  data snapshot  find it with:"
-  say "    aws ec2 describe-snapshots --region $REGION --owner-ids self --filters Name=volume-id,Values=$VOLUME --query 'Snapshots[].[SnapshotId,StartTime,State]' --output text"
+  if [[ -n $BUCKET ]]; then
+    say "  backup bucket  $BUCKET   (empty and delete it yourself when you no longer need the backups)"
+  fi
+  if [[ -n $VOLUME ]]; then
+    say "  data snapshots (the final one, and the daily ones when the stack made them); find them with:"
+    say "    aws ec2 describe-snapshots --region $REGION --owner-ids self --filters Name=volume-id,Values=$VOLUME --query 'Snapshots[].[SnapshotId,StartTime,State]' --output text"
+  fi
   exit 0
 fi
 
@@ -266,7 +316,7 @@ fi
 [[ $DRY -eq 1 || -f $TEMPLATE ]] || fail "template not found: $TEMPLATE"
 
 # ---- image ---------------------------------------------------------------------------------
-# The image ID is always passed explicitly, so a stack never replaces its instance just because
+# The image ID is always passed explicitly, so an update cannot replace the instance because
 # Canonical published a newer image. A stack that exists keeps the image it runs.
 if [[ -z $AMI ]]; then
   # Graviton families end their generation digit with a g (t4g, m7g, r7g, c7gn ...).
@@ -274,7 +324,14 @@ if [[ -z $AMI ]]; then
   ssm_name=/aws/service/canonical/ubuntu/server/24.04/stable/current/$ARCH/hvm/ebs-gp3/ami-id
   if [[ $DRY -eq 1 ]]; then
     note "image: an existing stack keeps its image; a new stack gets the current Ubuntu 24.04 image"
+    note "does the stack exist?"
+    show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text
+    note "if it does: the image it was given (AmiId parameter) ..."
     show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "$Q_PARAMS" --output text
+    note "... and, when that is empty (a stack made in the console), the image its instance runs:"
+    show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "$Q_OUTPUTS" --output text
+    show "${AWS[@]}" ec2 describe-instances --instance-ids "<InstanceId>" --query 'Reservations[0].Instances[0].ImageId' --output text
+    note "if it does not: the current Canonical image:"
     show "${AWS[@]}" ssm get-parameter --name "$ssm_name" --query Parameter.Value --output text
     AMI="<image-id>"
   else
@@ -299,6 +356,7 @@ fi
 params=("AdminEmail=$EMAIL" "AmiId=$AMI")
 [[ -z $ITYPE ]] || params+=("InstanceType=$ITYPE")
 [[ -z $VOLSIZE ]] || params+=("DataVolumeSize=$VOLSIZE")
+[[ -z $SNAPS ]] || params+=("DailySnapshotsKept=$SNAPS")
 [[ -z $VERSION ]] || params+=("SbctlVersion=$VERSION")
 [[ -z $DOMAIN ]] || params+=("DomainName=$DOMAIN")
 [[ -z $ZONE ]] || params+=("HostedZoneId=$ZONE")
