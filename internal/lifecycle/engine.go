@@ -27,8 +27,37 @@ type Options struct {
 	Fleet fleet.Fleet
 	// Backup takes the final base backup before a project is deleted; nil skips it.
 	Backup BaseBackuper
+	// Timers starts and stops a project's nightly base backup timer as the project
+	// becomes active, pauses and is deleted; nil does nothing (the exec backend).
+	Timers Timers
 	// Now is the clock for key issue times; tests set it.
 	Now func() time.Time
+}
+
+// Timers drives the per-project nightly base backup timer (sb-basebackup@<ref>.timer).
+// Failures are logged by the Engine and never fail the operation: a missing timer is
+// repaired by the next start.
+type Timers interface {
+	StartTimer(ctx context.Context, ref string) error
+	StopTimer(ctx context.Context, ref string) error
+}
+
+func (e *Engine) startTimer(ctx context.Context, ref string) {
+	if e.opts.Timers == nil {
+		return
+	}
+	if err := e.opts.Timers.StartTimer(ctx, ref); err != nil {
+		e.log.Warn("backup timer did not start; nightly base backups will not run until the project is started again", "ref", ref, "error", err)
+	}
+}
+
+func (e *Engine) stopTimer(ctx context.Context, ref string) {
+	if e.opts.Timers == nil {
+		return
+	}
+	if err := e.opts.Timers.StopTimer(ctx, ref); err != nil {
+		e.log.Warn("backup timer did not stop", "ref", ref, "error", err)
+	}
 }
 
 // Engine is the Manager: it owns the order of registry rows, sealed secrets, units,
@@ -284,6 +313,7 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusActiveHealthy); err != nil {
 		return fail("status", err)
 	}
+	e.startTimer(ctx, ref)
 	e.event(ctx, ref, "project.created", map[string]string{"class": class})
 	return e.reg.GetProject(ctx, ref)
 }
@@ -333,6 +363,7 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusPausing); err != nil {
 		return err
 	}
+	e.stopTimer(ctx, ref)
 	if err := e.plane.Stop(ctx, ref); err != nil {
 		_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, registry.StatusActiveUnhealthy)
 		return fmt.Errorf("lifecycle: pause %s: %w", ref, err)
@@ -382,6 +413,7 @@ func (e *Engine) Resume(ctx context.Context, ref string) error {
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusActiveHealthy); err != nil {
 		return err
 	}
+	e.startTimer(ctx, ref)
 	e.event(ctx, ref, "project.resumed", nil)
 	return nil
 }
@@ -440,6 +472,7 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	if err := e.reg.DeleteProject(ctx, ref); err != nil {
 		return err
 	}
+	e.stopTimer(ctx, ref)
 	e.event(ctx, ref, "project.deleted", map[string]any{"final_backup": e.opts.Backup != nil && !o.SkipFinalBackup && !skippedBackup && prev != registry.StatusInitFailed})
 	return nil
 }
@@ -562,6 +595,9 @@ func (e *Engine) startOne(ctx context.Context, p *registry.Project) error {
 	}
 	if want != p.Status {
 		_ = e.reg.SetProjectStatus(ctx, p.Ref, want)
+	}
+	if err == nil {
+		e.startTimer(ctx, p.Ref)
 	}
 	return err
 }

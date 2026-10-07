@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"text/tabwriter"
 
+	"github.com/OWNER/sbctl/internal/app"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 )
@@ -42,8 +43,16 @@ func effectiveConfigPath() string {
 	return p
 }
 
+// appOptions is what every command that drives projects tells the composition: the
+// logger, the config file the children must read, and the fleet.
+func appOptions(cfg *config.Config) app.Options {
+	return app.Options{Log: newLogger(cfg), ConfigPath: effectiveConfigPath(), Version: version, Fleet: newFleet(cfg)}
+}
+
+// openOptions wires the backup service into the lifecycle (archive_command, the final
+// backup on delete, restore); see app.LifecycleOptions.
 func openOptions(cfg *config.Config) lifecycle.OpenOptions {
-	return lifecycle.OpenOptions{Log: newLogger(cfg), ConfigPath: effectiveConfigPath()}
+	return app.LifecycleOptions(cfg, appOptions(cfg))
 }
 
 // openNode loads the config and connects to an initialized node.

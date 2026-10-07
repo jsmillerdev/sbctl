@@ -805,3 +805,38 @@ func TestCreateRegionIsARealRegionCode(t *testing.T) {
 		}
 	}
 }
+
+type fakeTimers struct{ calls []string }
+
+func (f *fakeTimers) StartTimer(_ context.Context, ref string) error {
+	f.calls = append(f.calls, "start "+ref)
+	return nil
+}
+func (f *fakeTimers) StopTimer(_ context.Context, ref string) error {
+	f.calls = append(f.calls, "stop "+ref)
+	return errors.New("not running") // logged, never fatal
+}
+
+func TestBackupTimersFollowTheProject(t *testing.T) {
+	h := newHarness(t)
+	ft := &fakeTimers{}
+	h.e.opts.Timers = ft
+	ctx := context.Background()
+	p := h.create(t)
+	if err := h.e.Pause(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.e.Resume(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if errs := h.e.StartActive(ctx); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if err := h.e.Delete(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"start " + p.Ref, "stop " + p.Ref, "start " + p.Ref, "start " + p.Ref, "stop " + p.Ref}
+	if fmt.Sprint(ft.calls) != fmt.Sprint(want) {
+		t.Errorf("timer calls = %v, want %v", ft.calls, want)
+	}
+}

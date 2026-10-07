@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -61,6 +62,8 @@ type Server struct {
 	upstreamOverride func(p *registry.Project, svc string) string
 	createWait       time.Duration
 
+	loginMu sync.Mutex // serializes device-login session creation
+
 	pgmetaKeyMu    chan struct{} // 1-slot lock around pgmetaKeyCache
 	pgmetaKeyCache string
 
@@ -107,7 +110,12 @@ func NewServer(d Deps) (*Server, error) {
 	if s.hc == nil {
 		// No overall timeout: pg-meta queries and function uploads may be long.
 		// Callers bound work with request contexts.
-		s.hc = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		// postgres-meta (fastify) closes idle keep-alive connections after 5 seconds. A
+		// client that reuses one at that moment gets EOF on a request it cannot safely
+		// replay (a SQL POST), so idle connections are dropped well before that.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.IdleConnTimeout = 2 * time.Second
+		s.hc = &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 	if s.pgmetaURL == "" {
 		s.pgmetaURL = fmt.Sprintf("http://127.0.0.1:%d", d.Config.Ports.PGMeta)
@@ -119,6 +127,10 @@ func NewServer(d Deps) (*Server, error) {
 		if pg, ok := d.Registry.(*registry.Postgres); ok {
 			s.store = NewPGStore(pg.Pool())
 		} else {
+			// Dashboard users, device-login PATs, function sources, sealed function secrets
+			// and saved snippets would all be lost on restart. Wiring code (internal/app)
+			// passes Deps.Store; only tests and the dev mock should land here.
+			s.log.Warn("api: no Store given and the registry is not Postgres; using an in-memory store, state is lost on restart")
 			s.store = NewMemoryStore()
 		}
 	}
@@ -240,6 +252,13 @@ func (s *Server) wrap(kind authKind, h handlerFunc) http.Handler {
 // fail writes err as the error envelope. Unexpected errors are logged with their
 // detail and answered with a generic 500.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+		// The client went away (a browser navigation cancels in-flight queries). Nobody
+		// reads the answer and it is not a server error: 499, as nginx records it.
+		s.log.Debug("api request cancelled by the client", "method", r.Method, "path", r.URL.Path)
+		writeError(w, &Error{Status: 499, Message: "Client closed request"})
+		return
+	}
 	e := asError(err)
 	if e.Status >= 500 {
 		s.log.Error("api request failed", "method", r.Method, "path", r.URL.Path, "status", e.Status, "err", err)

@@ -36,6 +36,17 @@ type fakeManager struct {
 	resumed  []string
 	deleted  []string
 	createFn func(req lifecycle.CreateRequest) (*registry.Project, error)
+	// hook, when set, runs inside Pause, Resume and Delete before they act.
+	hook func(op string, ctx context.Context)
+}
+
+func (m *fakeManager) observe(op string, ctx context.Context) {
+	m.mu.Lock()
+	h := m.hook
+	m.mu.Unlock()
+	if h != nil {
+		h(op, ctx)
+	}
 }
 
 func newFakeManager(reg registry.Registry, sec secrets.Secrets) *fakeManager {
@@ -83,6 +94,7 @@ func (m *fakeManager) Create(ctx context.Context, req lifecycle.CreateRequest) (
 }
 
 func (m *fakeManager) Pause(ctx context.Context, ref string) error {
+	m.observe("pause", ctx)
 	m.mu.Lock()
 	m.paused = append(m.paused, ref)
 	m.mu.Unlock()
@@ -90,6 +102,7 @@ func (m *fakeManager) Pause(ctx context.Context, ref string) error {
 }
 
 func (m *fakeManager) Resume(ctx context.Context, ref string) error {
+	m.observe("resume", ctx)
 	m.mu.Lock()
 	m.resumed = append(m.resumed, ref)
 	m.mu.Unlock()
@@ -97,6 +110,7 @@ func (m *fakeManager) Resume(ctx context.Context, ref string) error {
 }
 
 func (m *fakeManager) Delete(ctx context.Context, ref string) error {
+	m.observe("delete", ctx)
 	m.mu.Lock()
 	m.deleted = append(m.deleted, ref)
 	m.mu.Unlock()

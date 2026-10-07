@@ -210,6 +210,12 @@ func (s *Server) cliLoginCreate(w http.ResponseWriter, r *http.Request) error {
 	}
 	// Tokens of sessions that expired unclaimed, or that this one replaces, would
 	// otherwise stay valid with nobody holding them.
+	// One create at a time: two concurrent requests for the same session_id would each
+	// see an empty session, each mint a PAT, and the second Put would orphan the first
+	// token (valid forever, nobody holding its plaintext). Studio's login page has
+	// fired duplicate creates for one session.
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
 	s.reapLoginSessions(r.Context())
 	if old, err := s.store.TakeLoginSession(r.Context(), in.SessionID); err == nil {
 		s.dropLoginToken(r.Context(), old)

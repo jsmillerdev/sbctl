@@ -9,7 +9,8 @@ Type=simple
 User=sbctl
 Group=sbctl
 Slice=sbctl.slice
-# `sbctl serve` is provided by the API and proxy workstreams.
+# `sbctl serve` runs the Management API, the edge proxy and the lifecycle engine; it
+# starts every active project at boot and stops on SIGTERM (project units keep running).
 ExecStart=/usr/local/bin/sbctl serve
 Restart=always
 RestartSec=2s

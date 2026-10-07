@@ -116,6 +116,8 @@ type OpenOptions struct {
 	// result also has a SetManager(Manager) method, Open hands it the Engine. Ignored
 	// when Backup is set.
 	BackupFactory func(n *Node) (BaseBackuper, error)
+	// Timers replaces the backup timer control (tests); nil means the systemd backend's.
+	Timers Timers
 	// Supervisor replaces the backend chosen by cfg.Supervisor (tests).
 	Supervisor units.Supervisor
 	// Artifacts replaces the artifact store (tests).
@@ -203,8 +205,32 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	po := o.planeOptions()
 	po.Backup = bk
 	node.Plane = NewPostgresPlane(cfg, sup, arts, reg, po)
-	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk})
+	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup)})
 	return node, nil
+}
+
+// supervisorTimers starts and stops sb-basebackup@<ref>.timer through the supervisor
+// (D-Bus StartUnit, which the polkit rule allows for sb-* units). The timers are not
+// enabled for boot: the daemon starts them again for every active project at start.
+type supervisorTimers struct{ sup units.Supervisor }
+
+func (t supervisorTimers) StartTimer(ctx context.Context, ref string) error {
+	return t.sup.Start(ctx, "sb-basebackup@"+ref+".timer")
+}
+func (t supervisorTimers) StopTimer(ctx context.Context, ref string) error {
+	return t.sup.Stop(ctx, "sb-basebackup@"+ref+".timer")
+}
+
+// timers returns the backup timer control for the systemd backend; the exec backend has
+// no timers (backups are taken with `sbctl backups create`).
+func (o *OpenOptions) timers(cfg *config.Config, sup units.Supervisor) Timers {
+	if o.Timers != nil {
+		return o.Timers
+	}
+	if cfg.Supervisor != config.SupervisorSystemd {
+		return nil
+	}
+	return supervisorTimers{sup: sup}
 }
 
 // lateBackup returns o.Backup, or a BaseBackuper that builds itself from BackupFactory on
@@ -379,7 +405,7 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	plane.reg = reg
 	bk := o.lateBackup(node)
 	plane.opts.Backup = bk
-	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk})
+	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup)})
 	node.Engine = eng
 
 	if existing {
@@ -406,6 +432,7 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	if err = reg.SetProjectStatus(ctx, config.SystemRef, registry.StatusActiveHealthy); err != nil {
 		return nil, err
 	}
+	eng.startTimer(ctx, config.SystemRef)
 	eng.event(ctx, config.SystemRef, "system.initialized", map[string]bool{"existing": existing})
 	return node, nil
 }
