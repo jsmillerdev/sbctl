@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -35,12 +36,37 @@ func TestStubsContainNoNulls(t *testing.T) {
 		}
 		checked++
 		var nulls []string
-		findNulls(MinimalValue(o.Response), "$", &nulls)
+		findNulls(StubValue(o), "$", &nulls)
 		if len(nulls) > 0 {
 			t.Errorf("%s: stub has null at %v", o.Key(), nulls)
 		}
 	}
 	if checked < 100 {
 		t.Fatalf("only %d operations checked", checked)
+	}
+}
+
+// Studio's project home shows "Failed to load project usage" for a bare {} from the analytics
+// endpoints and renders zero counts for {"result": []} (research/08 section 9). The stubs
+// of every analytics endpoint must be the latter.
+func TestAnalyticsStubsWrapEmptyRows(t *testing.T) {
+	ops, err := Operations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, o := range ops {
+		if !o.JSON || !strings.Contains(o.Path, "/analytics/endpoints/") {
+			continue
+		}
+		n++
+		m, ok := StubValue(o).(map[string]any)
+		rows, isArr := m["result"].([]any)
+		if !ok || !isArr || len(rows) != 0 {
+			t.Errorf("%s: stub is %v, want {\"result\": []}", o.Key(), StubValue(o))
+		}
+	}
+	if n < 10 {
+		t.Fatalf("only %d analytics operations found", n)
 	}
 }
