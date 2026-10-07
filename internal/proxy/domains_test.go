@@ -200,8 +200,9 @@ func TestCustomHostRouting(t *testing.T) {
 	svc := domains.New(domains.Options{Reg: h.reg, Config: h.cfg, Resolver: dns})
 	const custom = "api.customer.example"
 	activateHostname(t, svc, dns, h.ref, custom)
-	vanity, err := svc.ActivateVanity(ctx, h.ref, "acme")
-	if err != nil {
+	// The service keeps a project to one of the two; the store does not, and the proxy serves both.
+	vanity := svc.VanityHost("acme")
+	if err := h.reg.PutVanitySubdomain(ctx, h.ref, "acme", vanity); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "routes reach the table", func() bool {
