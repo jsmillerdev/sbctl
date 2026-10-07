@@ -21,12 +21,25 @@ type Resizer interface {
 	// carries it out. It refuses with ErrInvalidState while another operation runs on the
 	// project or the project is not running or paused, and with *CapacityError when the node
 	// cannot honor the size. Nothing has changed when it returns an error.
-	BeginResize(ctx context.Context, ref, size string) (*ResizeRun, error)
+	BeginResize(ctx context.Context, ref, size string) (ResizeHandle, error)
 	// Offers lists every size with whether the node can give it to ref (ref "": a new project).
 	Offers(ctx context.Context, ref string) ([]Offer, error)
 }
 
 var _ Resizer = (*Engine)(nil)
+
+// ResizeHandle is a resize that has begun: the project is RESIZING and locked until Run or Close
+// returns. *ResizeRun is the Engine's.
+type ResizeHandle interface {
+	// Run carries the resize out and waits for the project to be healthy on the new size.
+	Run(ctx context.Context) error
+	// Close releases the project without running (or after Run); safe to call twice.
+	Close()
+	// From and To are the names of the sizes; Changed is false when the project already had To.
+	From() string
+	To() string
+	Changed() bool
+}
 
 // Event kinds of a resize.
 const (
@@ -38,17 +51,25 @@ const (
 // ResizeRun is a resize that has begun. The project is RESIZING and its lock is held until Run
 // or Close returns.
 type ResizeRun struct {
-	e        *Engine
-	p        *registry.Project // the project as it was
-	from, to Class
-	prev     registry.Status
-	unlock   func()
-	noop     bool // nothing to restart: the size is unchanged, or the project is paused
-	once     sync.Once
-	// From and To are the names of the sizes; Changed is false when the project already had To.
-	From, To string
-	Changed  bool
+	e                *Engine
+	p                *registry.Project // the project as it was
+	from, to         Class
+	prev             registry.Status
+	unlock           func()
+	noop             bool // nothing to restart: the size is unchanged, or the project is paused
+	once             sync.Once
+	fromName, toName string
+	changed          bool
 }
+
+// From implements ResizeHandle.
+func (r *ResizeRun) From() string { return r.fromName }
+
+// To implements ResizeHandle.
+func (r *ResizeRun) To() string { return r.toName }
+
+// Changed implements ResizeHandle.
+func (r *ResizeRun) Changed() bool { return r.changed }
 
 // Close releases the project without running the resize. It undoes the record BeginResize wrote
 // when Run has not been called; after Run it does nothing.
@@ -64,7 +85,7 @@ func (r *ResizeRun) Close() {
 }
 
 // BeginResize implements Resizer.
-func (e *Engine) BeginResize(ctx context.Context, ref, size string) (*ResizeRun, error) {
+func (e *Engine) BeginResize(ctx context.Context, ref, size string) (ResizeHandle, error) {
 	if ref == config.SystemRef {
 		return nil, fmt.Errorf("%w: the system project has no compute size", ErrInvalidState)
 	}
@@ -101,12 +122,12 @@ func (e *Engine) beginResize(ctx context.Context, ref string, to Class, unlock f
 		// the memory the project holds.
 		from = Class{Name: p.Class, MemoryBytes: projectMemory(p)}
 	}
-	run := &ResizeRun{e: e, p: p, from: from, to: to, prev: p.Status, unlock: unlock, From: from.Name, To: to.Name}
+	run := &ResizeRun{e: e, p: p, from: from, to: to, prev: p.Status, unlock: unlock, fromName: from.Name, toName: to.Name}
 	if ferr == nil && from.Name == to.Name && p.Limits == to.Limits() {
 		run.noop = true
 		return run, nil
 	}
-	run.Changed = true
+	run.changed = true
 
 	// The capacity check and the registry write that makes it true are one step, so two
 	// resizes or creates cannot both take the last room.

@@ -283,6 +283,7 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	po.SystemAuth = systemAuth(cfg, func() registry.Registry { return node.Registry }, sec)
 	node.Plane = NewPostgresPlane(cfg, sup, arts, reg, po)
 	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
+	node.Engine.SetNode(func() NodeResources { return DetectNode(cfg) })
 	return node, nil
 }
 
@@ -529,6 +530,7 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	plane.opts.SystemAuth = systemAuth(cfg, func() registry.Registry { return node.Registry }, sec)
 	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
 	node.Engine = eng
+	eng.SetNode(func() NodeResources { return DetectNode(cfg) })
 
 	if existing {
 		if keys, err = eng.loadKeys(ctx, config.SystemRef); err != nil {

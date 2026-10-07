@@ -384,3 +384,67 @@ func TestPostgresHasDashboardSSO(t *testing.T) {
 		t.Fatal("a provider outlived its organization")
 	}
 }
+
+// TestComputeSizesMigrationRenamesClasses applies every migration before 1250, adds projects the
+// way a node from before compute sizes has them, then applies 1250: the old classes become the
+// sizes they were closest to, default limits follow the size, hand-set limits stay.
+func TestComputeSizesMigrationRenamesClasses(t *testing.T) {
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, tempDatabase(t, dsn, "supavise_sizes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := migrate(ctx, pool, "1250_compute_sizes.sql"); err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct{ ref, class, limits string }{
+		{"aaaaaaaaaaaaaaaaaaaa", "micro", `{"memory_max":"1G","cpu_quota":"100%"}`},
+		{"bbbbbbbbbbbbbbbbbbbb", "default", `{"memory_max":"1G","cpu_quota":"100%"}`},
+		{"cccccccccccccccccccc", "small", `{}`},
+		{"dddddddddddddddddddd", "medium", `{"memory_max":"1G","cpu_quota":"100%"}`},
+		{"eeeeeeeeeeeeeeeeeeee", "large", `{"memory_max":"6G","cpu_quota":"300%"}`}, // set by hand
+		{"system", "system", `{"memory_max":"1G","cpu_quota":"100%"}`},
+	}
+	for i, r := range rows {
+		if _, err := pool.Exec(ctx, `insert into supavise.projects (ref, seq, name, region, engine, class, status, versions, limits)
+			values ($1, $2, $1, 'us-east-1', 'postgres', $3, 'ACTIVE_HEALTHY', '{}', $4::jsonb)`, r.ref, i+1, r.class, r.limits); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	for ref, want := range map[string][3]string{
+		"aaaaaaaaaaaaaaaaaaaa": {"nano", "512M", "100%"},
+		"bbbbbbbbbbbbbbbbbbbb": {"micro", "1G", "100%"},
+		"cccccccccccccccccccc": {"small", "2G", "100%"},
+		"dddddddddddddddddddd": {"medium", "4G", "200%"},
+		"eeeeeeeeeeeeeeeeeeee": {"large", "6G", "300%"},
+		"system":               {"system", "1G", "100%"},
+	} {
+		var class, mem, cpu string
+		if err := pool.QueryRow(ctx, `select class, limits->>'memory_max', limits->>'cpu_quota' from supavise.projects where ref = $1`, ref).Scan(&class, &mem, &cpu); err != nil {
+			t.Fatal(err)
+		}
+		if got := [3]string{class, mem, cpu}; got != want {
+			t.Errorf("%s: %v, want %v", ref, got, want)
+		}
+	}
+	// A project created without a class is a Micro, and applying again changes nothing.
+	if _, err := pool.Exec(ctx, `insert into supavise.projects (ref, seq, name, region, engine, status, versions, limits)
+		values ('ffffffffffffffffffff', 9, 'f', 'us-east-1', 'postgres', 'ACTIVE_HEALTHY', '{}', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	var class string
+	if err := pool.QueryRow(ctx, `select class from supavise.projects where ref = 'ffffffffffffffffffff'`).Scan(&class); err != nil || class != "micro" {
+		t.Fatalf("default class = %q, %v", class, err)
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+}

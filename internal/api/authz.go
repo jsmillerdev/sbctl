@@ -244,6 +244,15 @@ var routeRules = []routeRule{
 	rule("PATCH", "/v1/projects/{ref}/database/password", chk(members.ActUpdate, P)),
 	rule("PATCH", "/platform/projects/{ref}/db-password", chk(members.ActUpdate, P)),
 
+	// ---- projects: compute size and disk ----
+	// Owners and Administrators change a project's size and disk (hosted: update on projects, the
+	// check behind Studio's Compute and Disk page); every role that can see the project reads them.
+	rule("W", "/platform/projects/{ref}/billing/addons/**", chk(members.ActUpdate, P)),
+	rule("W", "/v1/projects/{ref}/billing/addons/**", chk(members.ActUpdate, P)),
+	rule("W", "/platform/projects/{ref}/disk/**", chk(members.ActUpdate, P)),
+	rule("W", "/v1/projects/{ref}/config/disk/**", chk(members.ActUpdate, P)),
+	rule("POST", "/platform/projects/{ref}/resize", chk(members.ActUpdate, P)),
+
 	// ---- projects: settings ----
 	rule("W", "/v1/projects/{ref}/config/auth/**", chk(members.ActUpdate, "custom_config_gotrue")),
 	rule("W", "/platform/auth/{ref}/config/**", chk(members.ActUpdate, "custom_config_gotrue")),
@@ -339,8 +348,6 @@ var routeRules = []routeRule{
 	rule("W", "/v1/projects/{ref}/custom-hostname/**", chk(members.ActUpdate, "custom_domain")),
 	rule("R", "/v1/projects/{ref}/vanity-subdomain", chk(members.ActRead, "vanity_subdomain")),
 	rule("W", "/v1/projects/{ref}/vanity-subdomain/**", chk(members.ActUpdate, "vanity_subdomain")),
-	rule("W", "/v1/projects/{ref}/billing/**", chk(members.ActBillingWrite, "stripe.subscriptions")),
-	rule("W", "/platform/projects/{ref}/billing/**", chk(members.ActBillingWrite, "stripe.subscriptions")),
 }
 
 // routeNeed resolves a route (method and template path) to its need, applying the defaults.

@@ -51,10 +51,11 @@ func (s *Server) platformProject(p *registry.Project, org *registry.Organization
 	if p.Branch != nil {
 		parent = &p.Branch.ParentRef
 	}
+	infra := plat.ProjectDetailResponseOutputInfraComputeSize(infraComputeSize(p))
 	return plat.ProjectDetailResponseOutput{
 		IsBranchEnabled: s.branches != nil, ParentProjectRef: parent,
 		CloudProvider: "AWS", ConnectionString: &conn, DbVersion: &ver, DbHost: s.dbHost(p.Ref),
-		Id: projectNumID(p), InsertedAt: ts(p.CreatedAt), UpdatedAt: ts(p.UpdatedAt),
+		Id: projectNumID(p), InsertedAt: ts(p.CreatedAt), UpdatedAt: ts(p.UpdatedAt), InfraComputeSize: &infra,
 		Name: p.Name, OrganizationId: float32(org.ID), Ref: p.Ref, Region: s.regionOf(p),
 		RestUrl: s.projectURL(p.Ref) + "/rest/v1/", Status: plat.ProjectDetailResponseOutputStatus(p.Status),
 		SubscriptionId: "supavise",
@@ -131,6 +132,7 @@ func (s *Server) platformListProjects(w http.ResponseWriter, r *http.Request) er
 			"cloud_provider": "AWS", "id": projectNumID(p), "inserted_at": ts(p.CreatedAt), "is_branch_enabled": s.branches != nil,
 			"is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID, "organization_slug": org.Slug,
 			"preview_branch_refs": s.branchRefs(all, p.Ref), "ref": p.Ref, "region": s.regionOf(p), "status": string(p.Status), "subscription_id": "supavise",
+			"infra_compute_size": infraComputeSize(p),
 		}))
 	}
 	resp := base("GET /platform/projects")
@@ -225,7 +227,7 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 			item := ops.Response.Value.Properties["projects"].Value.Items.Value.Properties["databases"].Value.Items
 			db, _ = MinimalValue(item).(map[string]any)
 		}
-		setAll(db, map[string]any{"cloud_provider": "AWS", "identifier": p.Ref, "region": s.regionOf(&p), "status": string(p.Status), "type": "PRIMARY"})
+		setAll(db, map[string]any{"cloud_provider": "AWS", "identifier": p.Ref, "region": s.regionOf(&p), "status": string(p.Status), "type": "PRIMARY", "infra_compute_size": infraComputeSize(&p)})
 		setAll(row, map[string]any{
 			"cloud_provider": "AWS", "databases": []any{db}, "inserted_at": ts(p.CreatedAt), "integration_source": nil,
 			"is_branch": false, "name": p.Name, "ref": p.Ref, "region": s.regionOf(&p), "status": string(p.Status),

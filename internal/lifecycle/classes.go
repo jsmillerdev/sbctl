@@ -208,6 +208,18 @@ func (c Class) Limits() config.Limits {
 	return config.Limits{MemoryMax: limitString(c.MemoryBytes), CPUQuota: strconv.Itoa(c.CPUQuotaPercent) + "%"}
 }
 
+// StandardLimits reports whether l is what a project of the named size runs under unless
+// someone set limits by hand: the size's own, nothing, or the 1 GB and 100% that every project
+// had before sizes existed. A restore from a backup manifest keeps hand-set limits and lets
+// the rest follow the size.
+func StandardLimits(class string, l config.Limits) bool {
+	cl, err := ClassFor(class)
+	if err != nil {
+		return false
+	}
+	return l == cl.Limits() || l == (config.Limits{}) || l == (config.Limits{MemoryMax: "1G", CPUQuota: "100%"})
+}
+
 // VCPUs is the number of whole cores the CPU quota asks for.
 func (c Class) VCPUs() int { return (c.CPUQuotaPercent + 99) / 100 }
 

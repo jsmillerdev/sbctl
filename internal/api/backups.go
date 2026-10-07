@@ -404,7 +404,8 @@ func (s *Server) platformAddons(w http.ResponseWriter, r *http.Request) error {
 	}
 	resp := base("GET /platform/projects/{ref}/billing/addons")
 	set(resp, "ref", p.Ref)
-	var selected []any
+	selected, available := s.computeAddons(r.Context(), p, computeVariantPlatform)
+	set(resp, "available_addons", available)
 	if s.backups != nil {
 		days, id, name := s.pitrAddon(p)
 		selected = append(selected, map[string]any{"type": "pitr", "variant": map[string]any{
@@ -429,7 +430,8 @@ func (s *Server) v1Addons(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	resp := base("GET /v1/projects/{ref}/billing/addons")
-	var selected []any
+	selected, available := s.computeAddons(r.Context(), p, computeVariantV1)
+	set(resp, "available_addons", available)
 	if s.backups != nil {
 		days, id, name := s.pitrAddon(p)
 		selected = append(selected, map[string]any{"type": "pitr", "variant": map[string]any{

@@ -81,7 +81,7 @@ func TestResizeToTheSameSizeDoesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Changed {
+	if run.Changed() {
 		t.Fatal("same size reported as a change")
 	}
 	if err := run.Run(context.Background()); err != nil {

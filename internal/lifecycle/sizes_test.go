@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -62,8 +63,8 @@ func TestSizeTableMatchesHosted(t *testing.T) {
 func TestSizeTableDerivedSettings(t *testing.T) {
 	type want struct {
 		sb, ecs, wm, mwm, wal string
-		workers, pool          int
-		mem, cpu               string
+		workers, pool         int
+		mem, cpu              string
 	}
 	for name, w := range map[string]want{
 		"nano":     {"128MB", "384MB", "4MB", "32MB", "128MB", 16, 20, "512M", "100%"},
@@ -166,5 +167,38 @@ func TestCreateGivesTheProjectItsSizeLimits(t *testing.T) {
 	r, err := h.e.Create(context.Background(), CreateRequest{Name: "c", Class: "default"})
 	if err != nil || r.Class != "micro" {
 		t.Fatalf("legacy class: %v %v", r, err)
+	}
+}
+
+// Registry migration 1250 gives renamed projects the limits of their new size; it is SQL, so the
+// numbers are copied by hand and this keeps them honest.
+func TestMigrationLimitsMatchTheSizeTable(t *testing.T) {
+	b, err := os.ReadFile("../registry/migrations/1250_compute_sizes.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(b)
+	for legacy, size := range map[string]string{"micro": "nano", "default": "micro", "small": "small", "medium": "medium", "large": "large"} {
+		c, err := ClassFor(size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l := c.Limits()
+		want := "when '" + legacy + "'"
+		line := ""
+		for _, ln := range strings.Split(sql, "\n") {
+			if strings.Contains(ln, want) && strings.Contains(ln, "memory_max") {
+				line = ln
+			}
+		}
+		if !strings.Contains(line, `"memory_max": "`+l.MemoryMax+`", "cpu_quota": "`+l.CPUQuota+`"`) {
+			t.Errorf("migration limits of %s (now %s) are %q, want %+v", legacy, size, line, l)
+		}
+	}
+	// What the migration calls the new names must be sizes.
+	for _, n := range []string{"nano", "micro", "small", "medium", "large"} {
+		if _, ok := ParseSize(n); !ok {
+			t.Errorf("%s is not a size", n)
+		}
 	}
 }
