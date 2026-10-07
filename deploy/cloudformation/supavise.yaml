@@ -65,7 +65,7 @@ Parameters:
       - r7i.xlarge
     Description: >-
       The node needs about 1.5 GB of RAM plus about 150 MB per idle project (measured, see
-      research/09-footprint.md). The default, t4g.large (Graviton, 8 GiB), holds about 20 projects
+      docs/research/09-footprint.md). The default, t4g.large (Graviton, 8 GiB), holds about 20 projects
       with room for load. t4g.medium (4 GiB) suits a trial of up to about 10. t4g and t3 are
       burstable; pick m7g or m7i (or larger) for sustained load. Graviton (arm64) types cost less;
       x86 types (t3, m7i, r7i) work the same. The image architecture follows the type.

@@ -82,7 +82,7 @@ jobs:
         run: go test -count=1 -v ./deploy/...
 
   functions-main:
-    # The Deno main service of the Edge Runtime (functions-main/): format, lint, type check
+    # The Deno main service of the Edge Runtime (internal/functions/mainservice/): format, lint, type check
     # and unit tests. The Go side embeds these files; internal/fleet tests keep the two in step.
     runs-on: ubuntu-24.04
     steps:
@@ -92,13 +92,13 @@ jobs:
           deno-version: 2.6.8
       - name: fmt
         run: deno fmt --check
-        working-directory: functions-main
+        working-directory: internal/functions/mainservice
       - name: lint
         run: deno lint
-        working-directory: functions-main
+        working-directory: internal/functions/mainservice
       - name: check
         run: deno check index.ts src/*.ts
-        working-directory: functions-main
+        working-directory: internal/functions/mainservice
       - name: test
         run: deno test --allow-read --allow-write --allow-env src/
-        working-directory: functions-main
+        working-directory: internal/functions/mainservice

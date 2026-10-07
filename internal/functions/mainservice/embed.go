@@ -1,8 +1,8 @@
-// Package functionsmain embeds the Deno main service of the Edge Runtime (the TypeScript
+// Package mainservice embeds the Deno main service of the Edge Runtime (the TypeScript
 // next to this file) so the supavise binary and the main service it starts always match.
 // internal/fleet writes the files under <state_dir>/system/edge-runtime/main before it
 // starts supavise-edge-runtime; tests and deno.json stay out of the binary.
-package functionsmain
+package mainservice
 
 import "embed"
 

@@ -63,8 +63,8 @@ for t in curl tar zstd; do command -v "$t" >/dev/null 2>&1 || die "missing tool:
 sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 rand() { local s; s="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$1" || true)"; printf '%s' "$s"; }
 
-# versions.yaml: artifacts.<name>
-tag_of() { awk -v k="$1" '/^artifacts:/{s=1;next} s&&/^[^ ]/{s=0} s&&$1==k":"{print $2; exit}' "$REPO/versions.yaml"; }
+# internal/versions/versions.yaml: artifacts.<name>
+tag_of() { awk -v k="$1" '/^artifacts:/{s=1;next} s&&/^[^ ]/{s=0} s&&$1==k":"{print $2; exit}' "$REPO/internal/versions/versions.yaml"; }
 
 # ---- process management -----------------------------------------------------------------------
 PIDS=(); NAMES=()

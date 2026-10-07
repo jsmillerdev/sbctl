@@ -121,7 +121,7 @@ func (c *Config) WALRelayEnabled() bool {
 type Artifacts struct {
 	// BaseURL is the release download root; an asset URL is <base_url>/<tag>/<tag>-<platform>.tar.zst.
 	BaseURL string `toml:"base_url"`
-	// VersionsFile overrides the versions.yaml embedded in the binary.
+	// VersionsFile overrides the internal/versions/versions.yaml embedded in the binary.
 	VersionsFile string `toml:"versions_file"`
 	// CacheDir holds downloaded archives; defaults to <state_dir>/artifacts/.cache.
 	CacheDir string `toml:"cache_dir"`
@@ -297,7 +297,7 @@ func lookup(environ []string, name string) (string, bool) {
 }
 
 // Regions are the region codes Studio knows: AWS_REGIONS in packages/shared-data/regions.ts
-// at the pinned Studio commit (versions.yaml, studio). Studio resolves a project's region
+// at the pinned Studio commit (internal/versions/versions.yaml, studio). Studio resolves a project's region
 // against this table and its project list breaks on any other code, real AWS region or not
 // (eu-south-1, ap-east-1 and us-gov-west-1 included). Update it when the Studio pin moves.
 var Regions = []string{

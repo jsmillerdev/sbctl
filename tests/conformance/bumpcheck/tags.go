@@ -12,7 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Versions is the part of versions.yaml this command reads.
+// Versions is the part of internal/versions/versions.yaml this command reads.
 type Versions struct {
 	Artifacts map[string]string `yaml:"artifacts"`
 	Studio    struct {

@@ -11,7 +11,7 @@ import (
 // incidentBanner is what Studio's banner code expects when there is no incident. Studio's
 // own /api/incident-banner route asks incident.io, answers 500 without a key, and
 // react-query retries it after 1, 4 and 16 seconds while the sign-in form awaits the query
-// cache reset: sign-in took 22 seconds (research/08 section 9). The proxy answers the route
+// cache reset: sign-in took 22 seconds (docs/research/08 section 9). The proxy answers the route
 // itself, instantly and with no outbound call.
 const incidentBanner = `{"incidents":[]}` + "\n"
 

@@ -71,7 +71,7 @@ done
 
 # A stand-in for Studio: the unit is rendered like the real one (its environment decides whether
 # the sign-in page offers SSO) and answers the health check.
-STAG=$(awk '/^studio:/{f=1;next} f&&/^ *tag:/{print $2;exit}' "$REPO_ROOT/versions.yaml")
+STAG=$(awk '/^studio:/{f=1;next} f&&/^ *tag:/{print $2;exit}' "$REPO_ROOT/internal/versions/versions.yaml")
 SDIR="$SUPAVISE_STATE/artifacts/studio/$STAG"
 install -d -o "$SUPAVISE_USER" -g "$SUPAVISE_USER" "$SDIR/bin"
 cat >"$SDIR/bin/studio" <<'STUB'

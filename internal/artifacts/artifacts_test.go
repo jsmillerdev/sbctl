@@ -237,7 +237,7 @@ func TestFetchStudio(t *testing.T) {
 
 func TestVersionsAndPlatform(t *testing.T) {
 	cfg := config.Default()
-	v, err := LoadVersions(cfg) // embedded versions.yaml
+	v, err := LoadVersions(cfg) // embedded internal/versions/versions.yaml
 	if err != nil {
 		t.Fatal(err)
 	}

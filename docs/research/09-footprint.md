@@ -1,6 +1,6 @@
 # 09 - Footprint: method for the Linux measurement
 
-Status: method written 2026-10-06; **no Linux numbers yet**. `DESIGN.md` section 12 lists
+Status: method written 2026-10-06; **no Linux numbers yet**. `docs/design.md` section 12 lists
 "Linux per-project RSS and cold start with the Supabase preload set at 10, 25 and 50
 projects" as open. `tests/linux/footprint.sh` produces them on an ephemeral Ubuntu 24.04 VM
 in CI; this file says what is measured and why, and holds the table once a run exists.
@@ -57,7 +57,7 @@ sudo SUPAVISE_BIN=./bin/supavise-linux-amd64 tests/linux/footprint.sh --sizes "1
 
 State the VM type with the result (vCPUs, RAM, disk type, kernel). Run it once per class
 that matters (`micro` and `default`) and once per architecture (amd64, arm64). Results
-belong in the table below with the date, the artifact tags from `versions.yaml` and the
+belong in the table below with the date, the artifact tags from `internal/versions/versions.yaml` and the
 supavise commit. The VM needs roughly 4 GB of disk for 50 projects (about 60 MB each after
 the migrations; the first CI run should confirm that number).
 
@@ -91,4 +91,4 @@ A developer Mac (Apple M4, Darwin 25.5, exec backend, darwin-arm64 artifacts,
 macOS `ps` RSS counts shared pages per process and says nothing about Linux cgroup
 accounting, so these figures only show the order of magnitude and that the default class is
 small enough for a laptop. They are not evidence for the 10, 25 and 50 project claims in
-`DESIGN.md`.
+`docs/design.md`.

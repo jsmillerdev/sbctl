@@ -8,7 +8,7 @@
 #     internal/backup/ci-integration.sh
 #
 # The bucket must exist. Set SUPAVISE_TEST_PG_BIN to use an already unpacked artifact
-# instead of downloading the one pinned in versions.yaml.
+# instead of downloading the one pinned in internal/versions/versions.yaml.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -25,8 +25,8 @@ if [[ -z "${SUPAVISE_TEST_PG_BIN:-}" ]]; then
     aarch64 | arm64) platform=linux-arm64 ;;
     *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
   esac
-  tag=$(awk '/^  postgres:/ {print $2; exit}' versions.yaml)
-  [[ -n "$tag" ]] || { echo "no artifacts.postgres in versions.yaml" >&2; exit 1; }
+  tag=$(awk '/^  postgres:/ {print $2; exit}' internal/versions/versions.yaml)
+  [[ -n "$tag" ]] || { echo "no artifacts.postgres in internal/versions/versions.yaml" >&2; exit 1; }
   dir=$(mktemp -d)
   trap 'rm -rf "$dir"' EXIT
   url="https://github.com/supabase/slim-services/releases/download/${tag}/${tag}-${platform}.tar.zst"

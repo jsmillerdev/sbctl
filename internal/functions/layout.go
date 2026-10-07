@@ -10,7 +10,7 @@ import (
 )
 
 // File and directory names under <state>/system/edge-runtime/tenants/<ref>/. The Deno main service reads exactly
-// these (functions-main/src/projects.ts); change both together.
+// these (internal/functions/mainservice/src/projects.ts); change both together.
 const (
 	// EnvFileName holds the project's JWT secret, SUPABASE_* values and secrets (0600).
 	EnvFileName = "functions-env.json"

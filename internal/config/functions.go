@@ -43,7 +43,7 @@ const (
 
 // Functions is the [functions] config section: Edge Functions, served by the
 // edge-runtime artifact (unit supavise-edge-runtime) with supavise's tenant-aware main service
-// from functions-main/. Off in config.Default(); `supavise install` turns it on for a new
+// from internal/functions/mainservice/. Off in config.Default(); `supavise install` turns it on for a new
 // node (--no-functions keeps it off). A node without it does not fetch or start the
 // runtime, and the proxy answers 503 on /functions/v1. The environment overrides are
 // SUPAVISE_FUNCTIONS_*.
@@ -79,7 +79,7 @@ type Functions struct {
 	// MaxWorkers.
 	MaxParallelism int `toml:"max_parallelism"`
 	// MaxWorkers caps the live workers of the whole runtime, all projects together; the
-	// main service enforces it (functions-main/src/limiter.ts) by refusing a request that
+	// main service enforces it (internal/functions/mainservice/src/limiter.ts) by refusing a request that
 	// would need a worker over the cap with 503 PROJECT_AT_CAPACITY. Zero derives it from
 	// memory_max (see Workers), or DefaultFunctionsMaxWorkers when that is unset; negative
 	// means no cap.
@@ -291,7 +291,7 @@ func limitOrOff(v, d int) int {
 // supavise-edge-runtime (system/edge-runtime/tenants), the one directory the unit's mount
 // namespace shows besides the artifacts, so the runtime sees the functions and nothing
 // of the projects' clusters, sockets and unit files. internal/functions writes it,
-// functions-main/ reads it.
+// internal/functions/mainservice/ reads it.
 func (p Paths) FunctionsRoot() string {
 	return filepath.Join(p.System(SvcEdgeRuntime), "tenants")
 }

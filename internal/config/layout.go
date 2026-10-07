@@ -9,7 +9,7 @@ import (
 // SystemRef is the reserved ref of the system project (registry, fleet metadata, dashboard auth).
 const SystemRef = "system"
 
-// Default ports (HANDOFF.md section 1). Everything except Supavisor and the public
+// Default ports (docs/development/build-plan.md section 1). Everything except Supavisor and the public
 // proxy listens on loopback only. All of them can be changed in [ports] so that dev
 // machines and tests can run several nodes side by side.
 const (
@@ -97,7 +97,7 @@ const (
 // ProjectServices are templated per project; the rest are fleet singletons.
 var ProjectServices = []string{SvcPostgres, SvcGoTrue, SvcPostgREST}
 
-// ArtifactName maps a service to its slim-services release name (versions.yaml key).
+// ArtifactName maps a service to its slim-services release name (internal/versions/versions.yaml key).
 func ArtifactName(svc string) string {
 	switch svc {
 	case SvcGoTrue:
@@ -203,7 +203,7 @@ func (c *Config) BaseDomain() string {
 	return ""
 }
 
-// Hostnames (HANDOFF.md section 1).
+// Hostnames (docs/development/build-plan.md section 1).
 func (c *Config) ProjectHost(ref string) string { return ref + ".api." + c.BaseDomain() }
 func (c *Config) StudioHost() string            { return "studio." + c.BaseDomain() }
 func (c *Config) APIHost() string               { return "api." + c.BaseDomain() }
