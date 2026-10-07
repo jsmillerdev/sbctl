@@ -1,0 +1,99 @@
+name: conformance
+
+# Official Supabase clients against a node, unchanged (tests/conformance/README.md): the
+# supabase-js suites and the Supabase CLI against two projects on a node installed with
+# deploy/install.sh, a nightly diff of the Management API specs we generate from, and a
+# check that every pinned upstream release still exists. Linux only: it needs systemd.
+on:
+  push:
+    branches: [main, ws/conformance]
+  pull_request:
+    paths: [versions.yaml, "tests/conformance/**", ".github/workflows/conformance.yml"]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+# bash with -eo pipefail, so a failing command piped into tee fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  suites:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: pinned client versions
+        run: grep -v "^#" tests/conformance/pins.env >> "$GITHUB_ENV"
+      - name: supabase-js (the version in tests/conformance/js/package-lock.json)
+        run: npm ci --no-audit --no-fund --prefix tests/conformance/js
+      - name: Supabase CLI
+        run: |
+          npm install --prefix /tmp/sbcli "supabase@$SUPABASE_CLI_VERSION"
+          /tmp/sbcli/node_modules/.bin/supabase --version
+      - name: build sbctl
+        run: CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/sbctl ./cmd/sbctl
+      - name: conformance suites
+        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/sbctl-conformance-logs SBCTL_BIN=/tmp/sbctl SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase tests/conformance/run.sh
+      - if: always()
+        name: summary
+        run: cat /tmp/sbctl-conformance-logs/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/sbctl-conformance-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ matrix.arch }}
+          path: /tmp/sbctl-conformance-logs
+          if-no-files-found: ignore
+
+  # Fails with a readable list when the Management API specs we generate from have moved. It
+  # reports; a person decides what to take (internal/api/gen/fetch-specs.sh re-pins).
+  specdiff:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref != 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: diff the pinned specs against upstream
+        run: go run ./tests/conformance/specdiff -report "$RUNNER_TEMP/specdiff-report.md"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: specdiff-report
+          path: ${{ runner.temp }}/specdiff-report.md
+          if-no-files-found: ignore
+
+  # Every pin of versions.yaml (and the client pins of the suite) must still exist upstream;
+  # newer releases are listed in the job summary and never fail the run.
+  bump-check:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref != 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: check the pinned releases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: go run ./tests/conformance/bumpcheck

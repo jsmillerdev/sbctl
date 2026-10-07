@@ -1,0 +1,10 @@
+{
+  "name": "sbctl-conformance",
+  "private": true,
+  "type": "module",
+  "description": "supabase-js suites run against a node by tests/conformance/run.sh",
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "@supabase/supabase-js": "2.117.3"
+  }
+}
