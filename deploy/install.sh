@@ -50,7 +50,7 @@ run `sbctl install --help` after installing for the list. Re-running keeps secre
 USAGE
 }
 
-BINARY="" BINARY_SHA="" VERSION="" VERIFY_ONLY=0
+BINARY="" BINARY_SHA="" TAG="" VERIFY_ONLY=0
 PASS=()
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -59,8 +59,8 @@ while [[ $# -gt 0 ]]; do
     --binary=*)      BINARY=${1#*=}; shift ;;
     --binary-sha256) [[ $# -ge 2 ]] || die "--binary-sha256 needs a value"; BINARY_SHA=$2; shift 2 ;;
     --binary-sha256=*) BINARY_SHA=${1#*=}; shift ;;
-    --version)       [[ $# -ge 2 ]] || die "--version needs a tag"; VERSION=$2; shift 2 ;;
-    --version=*)     VERSION=${1#*=}; shift ;;
+    --version)       [[ $# -ge 2 ]] || die "--version needs a tag"; TAG=$2; shift 2 ;;
+    --version=*)     TAG=${1#*=}; shift ;;
     --repo)          [[ $# -ge 2 ]] || die "--repo needs owner/name"; REPO=$2; shift 2 ;;
     --repo=*)        REPO=${1#*=}; shift ;;
     --verify-only)   VERIFY_ONLY=1; shift ;;
@@ -79,12 +79,11 @@ case $(uname -m) in
   *) die "unsupported CPU architecture $(uname -m): amd64 or arm64 is required" ;;
 esac
 
-if [[ -r /etc/os-release ]]; then
-  # shellcheck disable=SC1091
-  . /etc/os-release
-else
-  die "cannot read /etc/os-release"
-fi
+[[ -r /etc/os-release ]] || die "cannot read /etc/os-release"
+# Read it in a subshell: it defines VERSION, PRETTY_NAME and more that must not leak here.
+ID=$(. /etc/os-release; printf '%s' "${ID:-}")
+VERSION_ID=$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")
+PRETTY_NAME=$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-}")
 skip_os=0
 for a in "${PASS[@]+"${PASS[@]}"}"; do [[ $a == --skip-os-check ]] && skip_os=1; done
 os_major=${VERSION_ID:-}; os_major=${os_major%%.*}
@@ -94,7 +93,7 @@ case ${ID:-} in
   *) [[ $skip_os -eq 1 ]] || die "${PRETTY_NAME:-this distribution} is not supported: Ubuntu 22.04+ or Debian 12+ is required (--skip-os-check tries anyway)" ;;
 esac
 
-glibc=$(ldd --version 2>&1 | head -n1 | grep -Eo '[0-9]+\.[0-9]+$' || true)
+glibc=$(ldd --version 2>&1 | sed -n 1p | grep -Eo '[0-9]+\.[0-9]+$' || true)
 [[ -n $glibc ]] || die "cannot read the glibc version (is this a glibc system?)"
 if [[ $(printf '%s\n2.35\n' "$glibc" | sort -V | head -n1) != 2.35 ]]; then
   die "glibc $glibc is too old: 2.35 or later is required (the service artifacts need it)"
@@ -137,14 +136,14 @@ else
   printf '%s' "$RELEASE_PUBKEY_B64" | base64 -d >"$tmp/release.pem" 2>/dev/null || die "the embedded release key is not valid base64"
   openssl pkey -pubin -in "$tmp/release.pem" -noout 2>/dev/null || die "the embedded release key is not a public key"
 
-  if [[ -z $VERSION ]]; then
+  if [[ -z $TAG ]]; then
     # Resolve "latest" to a tag once, so every file below comes from the same release.
     final=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' "$BASE_URL/latest") || die "cannot reach $BASE_URL/latest"
-    VERSION=${final##*/}
-    [[ $VERSION =~ ^v[0-9] ]] || die "could not determine the latest release (got '$VERSION'); pass --version vX.Y.Z"
+    TAG=${final##*/}
+    [[ $TAG =~ ^v[0-9] ]] || die "could not determine the latest release (got '$TAG'); pass --version vX.Y.Z"
   fi
-  rel=$BASE_URL/download/$VERSION
-  log "release $VERSION"
+  rel=$BASE_URL/download/$TAG
+  log "release $TAG"
   fetch() { curl -fsSL --retry 3 --connect-timeout 15 -o "$tmp/$1" "$rel/$1" || die "download $rel/$1 failed"; }
   fetch SHA256SUMS
   fetch SHA256SUMS.sig
@@ -155,7 +154,7 @@ else
   log "signature of SHA256SUMS verified"
   asset=sbctl-linux-$ARCH
   line=$(grep -E "^[0-9a-f]{64} [ *]$asset\$" "$tmp/SHA256SUMS" || true)
-  [[ -n $line ]] || die "release $VERSION lists no $asset"
+  [[ -n $line ]] || die "release $TAG lists no $asset"
   fetch "$asset"
   (cd "$tmp" && printf '%s\n' "$line" | sha256sum -c - >/dev/null) || die "$asset does not match its checksum: refusing to install"
   log "$asset matches its checksum"
@@ -172,10 +171,10 @@ else
     STUDIO_ARGS=(--studio-url "$rel/$studio_name" --studio-sha256 "${studio_line%% *}")
     log "dashboard build: $studio_name"
   elif [[ $studio_given -eq 0 ]]; then
-    warn "release $VERSION has no dashboard (Studio) build for $ARCH; the node will run without it"
+    warn "release $TAG has no dashboard (Studio) build for $ARCH; the node will run without it"
   fi
   if [[ $VERIFY_ONLY -eq 1 ]]; then
-    echo "verified $VERSION $asset $(sha256sum "$SRC" | cut -d' ' -f1)"
+    echo "verified $TAG $asset $(sha256sum "$SRC" | cut -d' ' -f1)"
     exit 0
   fi
 fi
