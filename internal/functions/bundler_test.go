@@ -38,6 +38,7 @@ if grep -q BROKEN "$e"; then
   exit 1
 fi
 if grep -q SLOW "$e"; then sleep 30; fi
+if grep -q LATE "$e"; then sleep 1; fi
 printf 'ESZIP2.3 file://%s' "$e" >"$o"
 `
 
@@ -151,6 +152,15 @@ func TestBundlerBundlesUploadedSourcesAndCleansUp(t *testing.T) {
 	}
 	if st, err := r.sup.Status(context.Background(), spec.Unit()); err != nil || st.State == units.StateActive {
 		t.Errorf("unit after bundling: %+v %v", st, err)
+	}
+}
+
+// A bundling that takes longer than the exec backend's start grace is not a failure: that
+// backend reports any process that has gone as failed, and only the output says how it ended.
+func TestBundlerAcceptsABundlingThatOutlivesTheStartGrace(t *testing.T) {
+	r := newBundlerRig(t)
+	if _, _, err := r.b.Bundle(context.Background(), BundleInput{Entrypoint: "index.ts", Files: []api.FunctionFile{{Path: "index.ts", Content: []byte("LATE")}}}); err != nil {
+		t.Fatal(err)
 	}
 }
 

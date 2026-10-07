@@ -100,6 +100,15 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 		"HOME":               work,
 		mainServiceMarkerEnv: sum,
 	}
+	// User workers do not get a thread each: their isolates are pinned to a pool of OS threads
+	// (EDGE_RUNTIME_WORKER_POOL_SIZE, default the number of CPUs; crates/base_rt/src/lib.rs,
+	// v1.77.4), and an isolate that computes without yielding blocks every other isolate pinned
+	// to its thread, whatever project it belongs to (on Linux until its CPU limit ends it; the
+	// CPU timer does not exist on macOS). One thread per worker the budget allows keeps
+	// tenants off each other's threads.
+	if w := f.Workers(); w > 0 {
+		s.Env["EDGE_RUNTIME_WORKER_POOL_SIZE"] = strconv.Itoa(w * f.Parallelism())
+	}
 	args := []string{"bin/edge-runtime", "start",
 		"--ip", "127.0.0.1",
 		"--port", port,

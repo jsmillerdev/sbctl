@@ -5,8 +5,9 @@ The main service of sbctl's Edge Runtime: one Deno script that every request to 
 ## What a request does
 
 ```
-client -> sbctl proxy -> 127.0.0.1:<edge_runtime>  (X-Sbctl-Project-Ref: <ref>, set by the proxy)
+client -> sbctl proxy -> 127.0.0.1:<edge_runtime>  (X-Sbctl-Project-Ref: <ref> and X-Sbctl-Proxy-Token, set by the proxy)
                           main service (this directory)
+                            0. proxy secret = X-Sbctl-Proxy-Token (else 403)
                             1. project  = X-Sbctl-Project-Ref (20 letters, else 400)
                             2. function = first path segment (else 404 NOT_FOUND)
                             3. project env + function generation read from <root>/<ref>/
@@ -14,7 +15,7 @@ client -> sbctl proxy -> 127.0.0.1:<edge_runtime>  (X-Sbctl-Project-Ref: <ref>, 
                             5. EdgeRuntime.userWorkers.create({... this project's env ...}).fetch(request)
 ```
 
-The proxy strips whatever `X-Sbctl-Project-Ref` and `sb-api-key` a client sent and sets its own (tested in `internal/proxy`, and end to end by `tests/functions/verify.mjs`). The main service trusts the header and nothing else: a request without a valid one is `400`.
+The proxy strips whatever `X-Sbctl-Project-Ref`, `X-Sbctl-Proxy-Token` and `sb-api-key` a client sent and sets its own (tested in `internal/proxy`, and end to end by `tests/functions/verify.mjs`). The runtime listens on loopback, which a function worker can reach too, so the project header alone proves nothing: the main service serves only requests that carry the node's proxy secret (`SBCTL_FUNCTIONS_PROXY_TOKEN`, compared in constant time; `internal/config/functions_token.go` makes it, `internal/fleet` puts it in the unit's environment file and `internal/proxy` sends it) and answers `403` to the rest, whatever name the caller used to reach the port. Workers never see it: their environment is built from the project's file only, and the main service removes both internal headers before the request reaches the function. `/_internal/health` needs no secret (the fleet probes it). A request with the secret and no valid project header is `400`.
 
 ## The files it reads
 
@@ -44,16 +45,27 @@ A request resolves the symlink once (`realPath`) and uses that generation's real
 
 Edge Runtime v1.77.4, user workers, with `permissions` set as in `src/handler.ts` (the runtime's defaults for user workers plus a deny rule):
 
-- **Modules.** A function runs from its eszip only. A function that ran from source files (the `--use-api` upload, which the API now refuses) could import files outside its directory: the module loader follows relative specifiers, static and dynamic, and `allow_read: []` only blocks `Deno.readTextFile`, not module loading, so with the tenants tree on disk `import("../../../../<other ref>/functions-env.json", {with: {type: "json"}})` returned the other project's JWT secret, service_role key, database password and secrets, and `import "../../../../<other ref>/functions/hello/index.ts"` ran its code (measured with v1.77.4; `customModuleRoot` did not stop it). The module URLs inside an eszip are virtual, so absolute paths, file URLs and 14 levels of `../` toward the real tenants files all fail with a module error: `tests/functions/verify.mjs` (function `escape`) asserts it on macOS and on Linux. Remote imports, bundled at deploy time by the CLI, are inside the eszip too.
+- **Modules.** A function runs from its eszip only. A function that ran from source files (an upload of sources, which the node now bundles first) could import files outside its directory: the module loader follows relative specifiers, static and dynamic, and `allow_read: []` only blocks `Deno.readTextFile`, not module loading, so with the tenants tree on disk `import("../../../../<other ref>/functions-env.json", {with: {type: "json"}})` returned the other project's JWT secret, service_role key, database password and secrets, and `import "../../../../<other ref>/functions/hello/index.ts"` ran its code (measured with v1.77.4; `customModuleRoot` did not stop it). The module URLs inside an eszip are virtual, so absolute paths, file URLs and 14 levels of `../` toward the real tenants files all fail with a module error: `tests/functions/verify.mjs` (function `escape`) asserts it on macOS and on Linux. Remote imports, bundled at deploy time by the CLI, are inside the eszip too.
 - **Disk.** `Deno.readTextFile` of `/etc/hosts`, of another project's `functions-env.json` and of the function's own files all fail with `NotFound`: a worker sees its module graph, not the disk. `tests/functions/verify.mjs` asserts this on macOS and on Linux (CI). Its `Deno.env.get` also sees only the variables above.
-- **The runtime's own port.** A worker's `fetch` to `127.0.0.1`, `localhost`, `[::1]`, `0.0.0.0` or `[::]` on the runtime's port fails with `NotCapable` (`deny_net`), so a function cannot call this service with a project reference of its choosing. The rule matches host names as written; a DNS name that points to loopback (or an IPv4-mapped IPv6 literal) is not caught. The remaining exposure is small: a forged reference is still checked against the JWT secret of the project it names, and a project that is not served (paused, going down, removed) has no files on disk (`internal/functions`), so the proxy's status gate cannot be bypassed this way. Authenticating the proxy to the runtime with a shared secret header would close it completely; that needs a change in `internal/proxy` and in the serve wiring.
+- **The runtime's own port.** A worker's `fetch` to `127.0.0.1`, `localhost`, `[::1]`, `0.0.0.0` or `[::]` on the runtime's port fails with `NotCapable` (`deny_net`), but the rule matches host names as written: a name that resolves to loopback (`<x>.127.0.0.1.sslip.io`) and IPv4-mapped IPv6 literals (`[::ffff:127.0.0.1]`) get through to the port. They get `403` there, because the worker does not have the proxy secret; the project header it writes is worthless. `tests/functions/verify.mjs` (function `callout`) tries four ways and asserts that none is served. The same loopback is open to a worker for every other service of the node (the Management API on the admin listener, the proxy's own listeners, Postgres and the project services behind their own credentials); the claim endpoint therefore believes `X-Forwarded-For` from a loopback peer only with the proxy secret when Edge Functions are on (`internal/api/claim.go`).
 - **Fairness.** See the next section.
 - **Other workers' memory and CPU.** Each worker is a V8 isolate with its own heap limit; a crash, a boot failure, a busy loop or an allocation loop in one project's function ended with an error response for that request while the other project answered within milliseconds (`verify.mjs`, "runaway function", "memory limit"). This is V8 isolation, not a VM or a container: a V8 escape would reach the runtime process and, in the systemd unit, everything it can read (see `deploy/systemd/README.md`).
 - **CPU limit.** `cpuTimeHardLimitMs` is enforced by the runtime's CPU timer, which exists on Linux only (`CPU timer: not enabled (need Linux)` on macOS). On macOS a busy loop is ended by the request idle timeout (504) or the wall clock; on Linux by the CPU limit.
 
-## Fairness between projects
+## Fairness between projects, and the memory budget
 
-`--max-parallelism` caps one worker pool for the whole runtime (default 16), and the unit's `MemoryMax` (default: `max_parallelism x memory_mb + 256 MB`, 4352M; config refuses a smaller `memory_max`) is shared by all of it. Without a per-project cap, one project can take every worker slot, make the others wait out the runtime's request-wait timeout, or push the cgroup over its limit, which kills the runtime for every project. `src/limiter.ts` caps, per project, the requests in flight at `[functions] max_per_project` (default `max_parallelism / 2`) and the distinct live workers (pool keys, assumed alive for the worker idle time after their last request) at `max_parallelism - 1`, so a project never holds the whole pool. A request over either cap is answered at once with `503 PROJECT_AT_CAPACITY` and `Retry-After: 1`, before any worker is touched; other projects are not affected. `tests/functions/verify.mjs` floods project A with parallel runaway and memory-hungry calls and asserts that B answers within 3 s throughout and that A's excess is refused fast. This is a cap, not a scheduler: several projects together can still fill the pool, and a node with few resources should lower `max_parallelism` (the unit's memory limit follows it) while a node with many functions per project should raise it.
+One runtime serves every project, and the unit's `MemoryMax` is shared by all of its workers: a runtime that reaches its cgroup limit is killed whole, for every project. edge-runtime's `--max-parallelism` does **not** bound that. In v1.77.4 it is the size of a semaphore that each worker pool key gets for itself (`crates/base/src/worker/pool.rs`: `ActiveWorkerRegistry::new(max_parallelism)` per `worker_pool_key`), and sbctl's pool key is `<ref>:<slug>:<version>:<generation>:<env stamp>`, so the number of projects, functions and generations is the only thing that limits the workers. `--max-parallelism` is therefore set per function (`[functions] max_parallelism`, default 1: the `per_worker` policy sends every request of a function to its one worker, so more than one exists only for a moment during a cold burst), and the budget is enforced here, in `src/limiter.ts`, before a worker is touched:
+
+| Budget | Setting | Default | Over it |
+|---|---|---|---|
+| live workers of the whole runtime, all projects | `max_workers` (or derived from `memory_max`) | 16 | `503 PROJECT_AT_CAPACITY`, "the runtime is running as many functions as it can" |
+| live workers of one project | `max_workers_per_project` | half of `max_workers` | `503 PROJECT_AT_CAPACITY` |
+| requests of one project in flight | `max_per_project` | 128 | `503 PROJECT_AT_CAPACITY` |
+| bundle bytes of one project's functions in flight | `SBCTL_FUNCTIONS_MAX_BUNDLE_MB` | 192 | `503 PROJECT_AT_CAPACITY` |
+
+A pool key counts as live while it has a request in flight and for the worker idle time after the last one (the runtime retires the worker then), so a redeployment, or new secrets, count as an extra worker until the old one idles out. The unit's `MemoryMax` is derived from the same numbers (`internal/config/functions.go`): `max_workers x (memory_mb + 32 MB isolate overhead) x max_parallelism + 256 MB` for the runtime itself, 4864M by default, and config validation refuses a `memory_max` that cannot hold `max_workers` workers (with `max_workers` unset, `memory_max` decides how many fit). A request over a request cap is a cap, not a scheduler: many projects together can use the whole worker budget, and the ones that come later get `503` until a worker idles out; raise `max_workers` (and the memory) on a node with many functions. A worker serves many requests at once, so `max_per_project` is generous and is not what protects memory. `src/limiter_test.ts` and `src/handler_test.ts` ("many projects each warming many functions never exceed the budget", "the runtime-wide worker budget holds across projects") check the budget with several projects and memory-hungry functions, and `tests/linux/functions-smoke.sh` restarts the real unit with `max_workers = 4` and asserts the 503s, the unit's `MemoryMax` of 1408 MiB, and that nothing restarted. `tests/functions/verify.mjs` also floods project A with parallel runaway and memory-hungry calls and asserts that B answers within 3 s and that A's excess is refused fast.
+
+The bundle of the function is read into this service's heap for every request (the runtime takes the bytes with the worker options). Bundles are cached in memory (128 MiB, least recently used first out, a bundle bigger than the cache is read each time), at most 32 MiB decompressed (`internal/functions`; hosted accepts about 20 MB), and the bundle bytes of the functions a project has in flight are charged against its budget above.
 
 ## Errors
 
@@ -61,12 +73,13 @@ Shapes follow the self-hosted main service, so clients that parse them keep work
 
 | Situation | Status | `sb-error-code` |
 |---|---|---|
+| no or wrong proxy secret | 403 | `BAD_REQUEST` |
 | no or malformed project header | 400 | `BAD_REQUEST` |
 | unknown project, function or slug | 404 | `NOT_FOUND` |
 | no / malformed / foreign / expired token | 401 | `UNAUTHORIZED_NO_AUTH_HEADER`, `UNAUTHORIZED_INVALID_JWT_FORMAT`, `UNAUTHORIZED_LEGACY_JWT`, `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM` |
 | unreadable deployment files, worker does not boot | 503 | `BOOT_ERROR` |
 | over the memory or CPU limit, request cancelled | 546 | `WORKER_RESOURCE_LIMIT` |
-| the project is over its `max_per_project` | 503 (`Retry-After: 1`) | `PROJECT_AT_CAPACITY` |
+| over a budget (see above) | 503 (`Retry-After: 1`) | `PROJECT_AT_CAPACITY` |
 | no response within `idle_timeout_seconds` | 504 | `IDLE_TIMEOUT` |
 | worker died or threw while answering | 500 | `WORKER_ERROR`, `EDGE_FUNCTION_ERROR`, `INVALID_RESPONSE_STATUS_CODE` |
 | the function answered 5xx itself | as sent | `EDGE_FUNCTION_ERROR` added |
@@ -85,9 +98,13 @@ The unit passes them in the environment (`internal/fleet/edgeruntime.go`); defau
 | `SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC` | `idle_timeout_seconds` (also passed as `--user-worker-request-idle-timeout`) | 150 |
 | `SBCTL_FUNCTIONS_CPU_SOFT_MS`, `_CPU_HARD_MS` | `cpu_soft_ms`, `cpu_hard_ms` (negative: off) | 1000, 2000 |
 | `SBCTL_FUNCTIONS_WORKER_IDLE_SEC` | none | 60 |
-| `SBCTL_FUNCTIONS_MAX_PER_PROJECT` | `max_per_project` (negative: off) | `max_parallelism / 2` = 8 |
-| `SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT` | none (`max_parallelism - 1`) | 15 |
-| `--max-parallelism` | `max_parallelism` | 16 |
+| `SBCTL_FUNCTIONS_PROXY_TOKEN` | none (`<state_dir>/system/edge-runtime.token`) | empty accepts any caller (tests only; sbctl always sets it) |
+| `SBCTL_FUNCTIONS_MAX_PER_PROJECT` | `max_per_project` (negative: off) | 128 |
+| `SBCTL_FUNCTIONS_MAX_WORKERS` | `max_workers` (negative: off) | 16 |
+| `SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT` | `max_workers_per_project` | 8 |
+| `SBCTL_FUNCTIONS_MAX_BUNDLE_MB` | none | 192 |
+| `SBCTL_FUNCTIONS_WORKER_COST_MB` | none (informational: what one function counts against the budget) | `max_parallelism x (memory_mb + 32)` |
+| `--max-parallelism` | `max_parallelism` (workers one function may have) | 1 |
 | `EDGE_RUNTIME_PORT` | `[ports] edge_runtime` | 9000 |
 
 ## Develop
@@ -104,7 +121,6 @@ go test ./functions-main ./internal/fleet                                 # the 
 
 - Per-project logs: a function's `console.log` goes to the runtime's log without a project tag. An event worker (`--event-worker`) could tag lines with the project of the worker's `servicePath` and write `<ref>/functions.log`; `sbctl functions logs <ref>` would then select it.
 - Asymmetric JWTs (`ES256`, `RS256`, JWKS): not needed while projects sign with HS256.
-- Per-project `DENO_DIR`: decided against for v1 (see "Per project, never shared"). Only eszip bundles run, and their modules are inside the bundle, so workers use the cache for nothing but public remote modules the runtime itself fetches; there is no bundler in sbctl (the CLI bundles on the client), which is where a per-project cache would have mattered.
-- Source uploads (`--use-api`) are refused, so `static_patterns` and static files next to a function do not exist. Supporting sources again needs a sandboxed bundler: copy the upload into a private temp directory, run `edge-runtime bundle` there inside a mount namespace that shows only that directory and the artifacts (for example a transient `systemd-run` unit with `TemporaryFileSystem=`), check that every `file:` specifier lies under the bundle root, and store the eszip as the generation.
-- `supabase functions download` of a function that was uploaded bundled: the stored upload is a compressed eszip, not sources.
+- Per-project `DENO_DIR`: decided against for v1 (see "Per project, never shared"). Only eszip bundles run, and their modules are inside the bundle, so workers use the cache for nothing but public remote modules the runtime itself fetches. The one place a cache matters is the bundler of uploaded sources, which keeps its own (`sb-edge-bundle.service`, see `internal/functions/README.md`).
+- `supabase functions download` of a function that was uploaded already bundled (the CLI's Docker flow): the stored upload is a compressed eszip, not sources. Functions uploaded as sources (`--use-api`, Studio) keep their sources and download as such.
 - Request bodies to functions are not limited by sbctl (the 64 MiB limit is on deployments).

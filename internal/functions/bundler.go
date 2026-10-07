@@ -182,7 +182,7 @@ func (b *Bundler) Bundle(ctx context.Context, in BundleInput) (bundle []byte, en
 	started := time.Now()
 	startErr := b.sup.Start(ctx, unit)
 	if startErr == nil {
-		startErr = b.waitDone(ctx, unit)
+		startErr = b.waitDone(ctx, unit, sandboxed)
 	} else if !sandboxed && strings.Contains(startErr.Error(), "exited right after start") {
 		// The exec backend reports any quick exit as a failure of Start: the output file says.
 		startErr = nil
@@ -221,8 +221,10 @@ func (b *Bundler) Bundle(ctx context.Context, in BundleInput) (bundle []byte, en
 }
 
 // waitDone waits until the unit has stopped (the exec backend returns from Start while the
-// process runs; a systemd one-shot unit returns when it has finished).
-func (b *Bundler) waitDone(ctx context.Context, unit string) error {
+// process runs; a systemd one-shot unit returns when it has finished). The exec backend
+// reports every process that has gone, whatever its exit status, as failed, so there the
+// output file decides and failed is just "finished".
+func (b *Bundler) waitDone(ctx context.Context, unit string, sandboxed bool) error {
 	for {
 		st, err := b.sup.Status(ctx, unit)
 		if err != nil {
@@ -231,6 +233,9 @@ func (b *Bundler) waitDone(ctx context.Context, unit string) error {
 		switch st.State {
 		case units.StateActive, units.StateActivating, units.StateDeactivating:
 		case units.StateFailed:
+			if !sandboxed {
+				return nil
+			}
 			return errors.New("the bundler exited with an error")
 		default:
 			return nil

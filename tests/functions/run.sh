@@ -30,6 +30,9 @@
 #   NODE_DIR        directory with @supabase/supabase-js installed (default: $WORK/node,
 #                   installed with npm)
 #   DEPLOY_VIA      cli or artifact, see above (default: artifact on macOS, cli elsewhere)
+#   DEPLOY_B_VIA    api (default: project B uploads sources with --use-api and the node bundles
+#                   them) or artifact (project B is bundled here too, for a node that cannot
+#                   bundle sources)
 #   EDGE_RUNTIME_BIN  bin/edge-runtime of the artifact, for DEPLOY_VIA=artifact (default: the one
 #                   under $STATE_DIR/artifacts)
 #   MAX_PER_PROJECT  the node's [functions] max_per_project when it was set low (8) so that the flood
@@ -130,7 +133,11 @@ deploy_a() {
 # deploy_b SLUG [--no-verify-jwt]: project B uploads sources; the node bundles them.
 deploy_b() {
   local slug=$1; shift
-  sb "$WORK/work-b" functions deploy "$slug" --use-api --project-ref "$REF_B" "$@" >/dev/null
+  if [[ ${DEPLOY_B_VIA:-api} == artifact ]]; then # a node that cannot bundle sources
+    deploy_artifact "$WORK/work-b" "$REF_B" "$slug" "$@"
+  else
+    sb "$WORK/work-b" functions deploy "$slug" --use-api --project-ref "$REF_B" "$@" >/dev/null
+  fi
 }
 
 if [[ ! -d $NODE_DIR/node_modules/@supabase ]]; then

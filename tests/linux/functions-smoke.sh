@@ -46,11 +46,19 @@ edge_runtime = $P_EDGE
 
 [functions]
 enabled = true
-wall_clock_seconds = 30
+# Longer than the whole run: the runtime retires a worker at its wall clock, and a request that
+# reaches it while it drains (graceful_exit_timeout, 10 s) waits for the idle timeout. That is the
+# runtime's behavior, not what these checks are about, so no worker may reach it mid-run.
+wall_clock_seconds = 600
 idle_timeout_seconds = 10
 reconcile_seconds = 5
 # Low, so that the flood check of verify.mjs can exceed it with a small flood (the default is 128).
 max_per_project = 8
+# The checks of run.sh keep about 15 functions of two projects warm at once (every function of
+# project A and a new worker for each after a secret changes), more than the defaults (16 workers,
+# 8 per project) allow. The budget stage at the end runs with small values.
+max_workers = 24
+max_workers_per_project = 16
 CONF
 
 # Same finding as in fleet-smoke.sh: the Postgres launcher chmods a file inside the artifact
@@ -105,8 +113,8 @@ log "the unit"
 [[ $(unit_state "$U") == active ]] || fail "$U is $(unit_state "$U")"
 [[ $(systemctl show -p User --value "$U") == "$SBCTL_USER" ]] || fail "$U does not run as $SBCTL_USER"
 [[ $(systemctl show -p Slice --value "$U") == sbctl.slice ]] || fail "$U is not in sbctl.slice"
-# 16 workers (max_workers) x (256 MB memory_mb + 32 MB overhead) + 256 MB for the runtime itself.
-[[ $(systemctl show -p MemoryMax --value "$U") == 5100273664 ]] || fail "$U: MemoryMax drop-in not applied ($(systemctl show -p MemoryMax --value "$U"))"
+# 24 workers (max_workers) x (256 MB memory_mb + 32 MB overhead) + 256 MB for the runtime itself.
+[[ $(systemctl show -p MemoryMax --value "$U") == 7516192768 ]] || fail "$U: MemoryMax drop-in not applied ($(systemctl show -p MemoryMax --value "$U"))"
 [[ $(ss -Hltn "sport = :$P_EDGE" | awk '{print $4}') == "127.0.0.1:$P_EDGE" ]] || fail "the runtime does not listen on loopback only: $(ss -Hltn "sport = :$P_EDGE")"
 
 sees() { # PATH: exit 0 if PATH is readable from the unit's namespace as the sbctl user
@@ -159,8 +167,8 @@ log "worker budget: restart with max_workers = 4 and 3 per project"
 # Over-budget requests are refused with 503, nothing is killed, warm functions keep answering.
 kill -TERM "$DEV_PID"; wait "$DEV_PID" 2>/dev/null || true; DEV_PID=""
 for ((i = 0; i < 60; i++)); do [[ $(unit_state "$U") == active ]] || break; sleep 1; done
-sed -i 's/^reconcile_seconds = 5$/&\nmax_workers = 4\nmax_workers_per_project = 3/' "$SBCTL_CONF"
-grep -q '^max_workers = 4$' "$SBCTL_CONF" || fail "could not set max_workers"
+sed -i -e 's/^max_workers = 24$/max_workers = 4/' -e 's/^max_workers_per_project = 16$/max_workers_per_project = 3/' "$SBCTL_CONF"
+grep -q '^max_workers = 4$' "$SBCTL_CONF" && grep -q '^max_workers_per_project = 3$' "$SBCTL_CONF" || fail "could not set max_workers"
 rm -f "$PAT_FILE"
 sudo -u "$SBCTL_USER" -H /usr/local/bin/sbctl functions dev --token-file "$PAT_FILE" >"$LOG_DIR/functions-dev-budget.log" 2>&1 &
 DEV_PID=$!

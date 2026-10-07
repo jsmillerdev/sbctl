@@ -273,9 +273,9 @@ async function mainPhase() {
     assert.ok([500, 546].includes(r.status), `hog: ${r.status} ${r.text}`)
     assert.ok(r.headers.get('sb-error-code'))
     const ha = await invoke(a, 'hello')
-    assert.equal(ha.data?.who, 'project-a')
+    assert.equal(ha.data?.who, 'project-a', `A/hello after hog: ${ha.error?.name}: ${ha.error?.message} ${ha.error?.context?.status}`)
     const hb = await invoke(b, 'hello')
-    assert.equal(hb.data?.who, 'project-b')
+    assert.equal(hb.data?.who, 'project-b', `B/hello after hog: ${hb.error?.name}: ${hb.error?.message}`)
     ok('a function over its memory limit is ended; both projects answer afterwards')
   }
 

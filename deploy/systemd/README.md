@@ -8,6 +8,7 @@ systemd units for sbctl, embedded in the binary (`embed.go`) and installed by
 | `sb-postgres@.service`, `sb-gotrue@.service`, `sb-postgrest@.service` | per-project templates; the instance is the ref |
 | `sb-supavisor`, `sb-realtime`, `sb-storage`, `sb-pgmeta`, `sb-studio` | fleet singletons |
 | `sb-imgproxy`, `sb-edge-runtime` | optional singletons |
+| `sb-edge-bundle` | one-shot, started by the API for each upload of Edge Function sources: runs `edge-runtime bundle` in a sandbox that sees only its scratch directory and the artifacts, with no loopback and no instance metadata (see `internal/functions/README.md`) |
 | `sbctl.slice` | every unit runs in it, so `systemctl status sbctl.slice` shows the total |
 | `sbctl.service` | the daemon (`sbctl serve`: Management API, edge proxy, lifecycle engine; starts active projects at boot) |
 | `50-sbctl.rules` | polkit rule: the `sbctl` user may start, stop and tune `sb-*` units and `sbctl.service` (manage-units only; enabling units and daemon-reload need root, through `install-units`) |
@@ -138,4 +139,8 @@ Storage bug could still reach the credentials, so the AWS template should be pai
 workstream J runs user code in Edge Functions, with a bucket policy or a separate role for
 Storage and with static credentials for the WAL archiver (`--s3-credentials-file`). Workstream
 J: keep `IPAddressDeny=169.254.169.254` on `sb-edge-runtime.service` and on any unit that runs
-tenant code.
+tenant code; `sb-edge-bundle.service` (it reads tenant code's imports) has it too, and in addition
+denies loopback, so a bundler cannot reach the Management API or a database. It cannot be started
+with `systemd-run` by the `sbctl` user: the polkit rule grants `manage-units` only for names that
+start with `sb-`, and polkit receives no unit name for a transient unit, so the sandbox is a fixed
+unit file, not a transient one.
