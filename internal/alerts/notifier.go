@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,6 +46,8 @@ type Notifier struct {
 	http   *http.Client
 	now    func() time.Time
 	st     *store
+	logMu  sync.Mutex
+	logged map[string]time.Time // when each condition was last logged
 	mailer func(ctx context.Context, to []string, subject, text string) error
 }
 
@@ -104,8 +107,10 @@ func (n *Notifier) Notify(ctx context.Context, ev Event) error {
 		ev.Time = n.now()
 	}
 	ev.Severity = ev.severity()
-	n.log.Warn("alert", "kind", ev.Kind, "severity", ev.Severity, "ref", ev.Ref, "title", ev.Title,
-		"detail", ev.Detail, "resolved", ev.Resolved)
+	if n.worthLogging(ev) {
+		n.log.Warn("alert", "kind", ev.Kind, "severity", ev.Severity, "ref", ev.Ref, "title", ev.Title,
+			"detail", ev.Detail, "resolved", ev.Resolved)
+	}
 	if sev, _ := config.SeverityRank(ev.Severity); sev < n.cfg.Severity() || !n.Configured() {
 		return nil
 	}
@@ -171,6 +176,30 @@ func (n *Notifier) Notify(ctx context.Context, ev Event) error {
 		return nil
 	}
 	return err
+}
+
+// worthLogging reports whether ev is news for the log. The checker offers every standing
+// condition at every check so that reminders and retries happen; logging each offer would write
+// the same line fifty times a minute. A condition is logged once per repeat interval, a
+// recovery and an announcement every time.
+func (n *Notifier) worthLogging(ev Event) bool {
+	if ev.Resolved || oneShot(ev.Kind) {
+		n.logMu.Lock()
+		delete(n.logged, ev.key())
+		n.logMu.Unlock()
+		return true
+	}
+	now, key := n.now(), ev.key()
+	n.logMu.Lock()
+	defer n.logMu.Unlock()
+	if at, ok := n.logged[key]; ok && now.Sub(at) < n.cfg.Repeat() {
+		return false
+	}
+	if n.logged == nil {
+		n.logged = map[string]time.Time{}
+	}
+	n.logged[key] = now
+	return true
 }
 
 // errSkip ends a state update without saving: nothing was sent, nothing changed.

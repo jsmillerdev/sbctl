@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -605,3 +606,40 @@ func TestConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+// The checker offers every standing condition at every check; the log must not repeat itself.
+func TestStandingConditionIsLoggedOncePerRepeatInterval(t *testing.T) {
+	var buf strings.Builder
+	var mu sync.Mutex
+	h := slog.NewTextHandler(writerFunc(func(p []byte) (int, error) { mu.Lock(); defer mu.Unlock(); return buf.Write(p) }), nil)
+	clk := newClock()
+	n := New(testCfg(t), Options{Log: slog.New(h), Now: clk.now})
+	ev := Event{Kind: KindDiskLow, Title: "Disk space is low"}
+	for i := 0; i < 30; i++ {
+		_ = n.Notify(context.Background(), ev)
+		clk.add(time.Minute)
+	}
+	mu.Lock()
+	got := strings.Count(buf.String(), "msg=alert")
+	mu.Unlock()
+	if got != 1 {
+		t.Errorf("%d log lines for one standing condition in half an hour", got)
+	}
+	clk.add(13 * time.Hour)
+	_ = n.Notify(context.Background(), ev)
+	rec := ev
+	rec.Resolved = true
+	_ = n.Notify(context.Background(), rec)
+	_ = n.Notify(context.Background(), Event{Kind: KindUpgradeFailed, Title: "x"})
+	_ = n.Notify(context.Background(), Event{Kind: KindUpgradeFailed, Title: "x"})
+	mu.Lock()
+	got = strings.Count(buf.String(), "msg=alert")
+	mu.Unlock()
+	if got != 5 { // the first, the reminder, the recovery, two announcements
+		t.Errorf("%d log lines, want 5", got)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

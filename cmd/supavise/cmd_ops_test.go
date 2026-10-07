@@ -246,3 +246,22 @@ func TestStatusOfANodeThatIsNotRunning(t *testing.T) {
 		t.Errorf("%+v", rep)
 	}
 }
+
+// A user who cannot read the node's files gets told how to run it, not a verdict of "down".
+func TestStatusAsAUserWhoCannotReadTheKey(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every file")
+	}
+	cfg, state := opsConfig(t, "")
+	key := filepath.Join(state, "master.key")
+	if err := os.WriteFile(key, []byte("00"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	configPath = cfg
+	t.Setenv("SUPAVISE_KEY_PATH", key)
+	var out bytes.Buffer
+	_, err := runStatus(context.Background(), &out, false, false)
+	if err == nil || !strings.Contains(err.Error(), "sudo -u supavise supavise status") {
+		t.Errorf("err = %v, out = %q", err, out.String())
+	}
+}

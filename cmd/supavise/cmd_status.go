@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 
@@ -55,8 +58,12 @@ func runStatus(ctx context.Context, w io.Writer, asJSON, verbose bool) (int, err
 	if err != nil {
 		return 0, err
 	}
-	deps, closeNode := statusDeps(ctx, cfg)
+	deps, closeNode, openErr := statusDeps(ctx, cfg)
 	defer closeNode()
+	if errors.Is(openErr, fs.ErrPermission) {
+		// Not a verdict about the node: this user cannot read its files.
+		return 0, fmt.Errorf("%w\nrun it as the user that owns the state directory: sudo -u supavise supavise status", openErr)
+	}
 	rep, err := health.CheckNode(ctx, deps)
 	if err != nil {
 		return 0, err
@@ -72,23 +79,24 @@ func runStatus(ctx context.Context, w io.Writer, asJSON, verbose bool) (int, err
 }
 
 // statusDeps opens the node for the checks and returns the function that closes it. A node
-// that cannot be opened (the system cluster is down, the master key is unreadable by this
-// user) is still checked for everything that does not need the registry, and the report says
-// why the rest was skipped.
-func statusDeps(ctx context.Context, cfg *config.Config) (health.Deps, func()) {
+// that cannot be opened (the system cluster is down, the master key is missing) is still
+// checked for everything that does not need the registry, and the report says why the rest was
+// skipped; the error is returned too, so the caller can tell a user who may not read the node's
+// files from a node that is down.
+func statusDeps(ctx context.Context, cfg *config.Config) (health.Deps, func(), error) {
 	log := newLogger(cfg)
 	node, err := lifecycle.Open(ctx, cfg, openOptions(cfg))
 	if err != nil {
-		return downDeps(cfg, log, err), func() {}
+		return downDeps(cfg, log, err), func() {}, err
 	}
 	lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
 	lz.Bind(node.Registry, node.Secrets)
 	deps, err := health.ForNode(node, health.NodeOptions{Version: version, Log: log, Tenants: lz.Fleet()})
 	if err != nil {
 		node.Close()
-		return downDeps(cfg, log, err), func() {}
+		return downDeps(cfg, log, err), func() {}, err
 	}
-	return deps, node.Close
+	return deps, node.Close, nil
 }
 
 func downDeps(cfg *config.Config, log *slog.Logger, cause error) health.Deps {
