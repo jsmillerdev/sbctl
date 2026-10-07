@@ -161,7 +161,7 @@ allow_norm=$(printf '%s\n' $allow | sed -e 's#/32$##' -e 's#/128$##' | LC_ALL=C 
 check_hidden_paths() { # UNIT: the unit's property and, in its mount namespace, the sockets
   local unit=$1 hidden pid p
   hidden=$(unit_prop InaccessiblePaths "$unit")
-  for p in /run/systemd/resolve/io.systemd.Resolve /run/dbus/system_bus_socket /run/nscd/socket; do
+  for p in /run/systemd/resolve/io.systemd.Resolve /run/dbus /run/nscd/socket; do
     [[ $hidden == *"$p"* ]] || fail "$unit: InaccessiblePaths is '$hidden', want it to hide $p"
   done
   [[ $hidden == */etc/sbctl* ]] || fail "$unit: InaccessiblePaths lost /etc/sbctl (the master key and config): '$hidden'"
