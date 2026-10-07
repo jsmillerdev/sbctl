@@ -126,8 +126,8 @@ GOT=$(rows)
 [[ $GOT == one,two ]] || fail "after the restore to T the rows are '$GOT', want one,two"
 supavise projects health "$REF" || fail "$REF is not healthy after the restore"
 [[ $(unit_state "supavise-postgres@$REF.service") == active ]] || fail "supavise-postgres@$REF is not active after the restore"
-# The new timeline has a base backup at once: the restore takes one (reason post-restore).
-supavise backups list "$REF" | grep -q post-restore || { supavise backups list "$REF" >&2; fail "no post-restore base backup after the restore"; }
+# The new timeline has a base backup at once: the restore takes one (the list's fourth column is the timeline).
+supavise backups list "$REF" | awk '$2 == "completed" && $4 == 2 { found = 1 } END { exit !found }' || { supavise backups list "$REF" >&2; fail "no base backup of timeline 2 after the restore"; }
 LIST=$(papi GET "$CFG/database/backups")
 [[ $(json_get 'len(d["backups"])' <<<"$LIST") -ge 2 ]] || fail "no base backup of the new timeline is listed: $LIST"
 
