@@ -55,7 +55,7 @@ for (const kind of kinds(keys.a)) {
     })
 
     test('a user inserts rows and gets them back', async () => {
-      const { data, error } = await c1.from('conf_todos').insert([{ title: 'a' }, { title: 'b', done: true }, { title: 'c', tags: ['x', 'y'] }]).select()
+      const { data, error } = await c1.from('conf_todos').insert([{ title: 'a' }, { title: 'b', done: true }, { title: 'c', tags: ['x', 'y'] }], { defaultToNull: false }).select()
       assert.ifError(error)
       assert.equal(data.length, 3)
       assert.ok(data.every((r) => r.owner === u1.id), 'owner defaults to auth.uid()')
@@ -167,8 +167,9 @@ for (const kind of kinds(keys.a)) {
         headers: { apikey: kind.anon, Authorization: `Bearer ${kind.anon}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: '{ __typename }' }),
       })
-      assert.equal(r.status, 200, await r.clone().text())
-      assert.equal((await r.json()).data.__typename, 'Query')
+      const text = await r.text()
+      assert.equal(r.status, 200, text)
+      assert.equal(JSON.parse(text).data?.__typename, 'Query', text)
     })
   })
 }

@@ -69,7 +69,8 @@ step projects projects list -o json && has "$LAST" "$REF" "projects list does no
 step link link --project-ref "$REF" --yes
 if [[ $(cat "$PROJ/supabase/.temp/project-ref" 2>/dev/null) != "$REF" ]]; then bad "link did not record the project ref"; fi
 POOLER_URL=$(cat "$PROJ/supabase/.temp/pooler-url" 2>/dev/null || true)
-[[ $POOLER_URL == postgres://postgres."$REF":* ]] || bad "link recorded no pooler URL for $REF (got '${POOLER_URL//:*@/:***@}')"
+# The file holds the user, host and port of the pooler (the CLI drops the password placeholder).
+[[ $POOLER_URL == *"postgres.$REF"*"@pooler."* ]] || bad "link recorded no pooler URL for $REF (got '$POOLER_URL')"
 
 step api-keys projects api-keys --project-ref "$REF" && has "$LAST" "anon" "projects api-keys does not list the anon key"
 

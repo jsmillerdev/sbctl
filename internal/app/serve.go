@@ -17,6 +17,7 @@ import (
 	"github.com/OWNER/sbctl/internal/branching"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/fleet"
+	"github.com/OWNER/sbctl/internal/functions"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/proxy"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -99,18 +100,34 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	if err != nil {
 		return err
 	}
-	apiH, err := api.NewServer(api.Deps{
+	apiDeps := api.Deps{
 		Registry: node.Registry, Secrets: node.Secrets, Manager: node.Engine, Config: cfg, Branching: bsvc,
 		Store:    store,
 		Settings: node.Settings, // the settings the engine renders units and tenants from
 		Logger:   log.With("component", "api"),
-	})
+	}
+	// Edge Functions: the syncer turns the stored deployments and secrets into the files the
+	// runtime (sb-edge-runtime, started with the other shared services) serves, and bundles
+	// the sources that `supabase functions deploy --use-api` uploads.
+	var fnSyncer *functions.Syncer
+	if cfg.Functions.Enabled {
+		fnSyncer, err = functions.New(functions.Deps{
+			Cfg: cfg, Registry: node.Registry, Secrets: node.Secrets, Store: store, Keys: node.Engine.Keys,
+			Log: log.With("component", "functions"), Supervisor: node.Supervisor, Artifacts: node.Artifacts,
+		})
+		if err != nil {
+			return err
+		}
+		apiDeps.Functions = fnSyncer
+	}
+	apiH, err := api.NewServer(apiDeps)
 	if err != nil {
 		return err
 	}
 	edge, err := proxy.New(proxy.Options{
 		Config: cfg, Registry: node.Registry, Keys: node.Engine, APIHandler: apiH,
-		Logger: log.With("component", "proxy"),
+		FunctionsEnabled: cfg.Functions.Enabled,
+		Logger:           log.With("component", "proxy"),
 	})
 	if err != nil {
 		return err
@@ -152,6 +169,12 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		_ = bsvc.Run(gctx) // expiry sweeper; returns when the daemon stops
 		return nil
 	})
+	if fnSyncer != nil {
+		g.Go(func() error {
+			fnSyncer.Run(gctx) // keeps the runtime's files in step with the registry; returns when the daemon stops
+			return nil
+		})
+	}
 	g.Go(func() error {
 		startProjects(gctx, node, recovered, backups(node), log)
 		return nil

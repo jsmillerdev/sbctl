@@ -76,20 +76,7 @@ sbctl functions logs [ref] [-n N] [-f] [--all] the shared runtime log (journalct
 sbctl functions dev [--token-file F]           Management API + proxy + sb-edge-runtime in one process
 ```
 
-`dev` exists because `sbctl serve` (workstream X) wires the API and the proxy and this feature is not in it yet. It forces `[functions] enabled`, starts only the runtime of the fleet, mounts `api.Server` with the hook, runs the reconcile loop and the proxy with `FunctionsEnabled`, and with `--token-file` mints a personal access token for the Supabase CLI: it carries the rights of a node administrator (its stand-in user is Owner of every organization, because the API enforces roles), expires after 12 hours and is deleted, with the file and the user's memberships, when the command ends. `tests/functions/run.sh` and `tests/linux/functions-smoke.sh` use it.
-
-## Wiring into `sbctl serve` (not done here, `cmd/sbctl/cmd_serve.go` belongs to X)
-
-```go
-store := functions.NewStore(n.Registry)                       // or the store already given to api.Deps
-fs, err := functions.New(functions.Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Store: store, Keys: n.Engine.Keys, Log: log,
-    Supervisor: n.Supervisor, Artifacts: n.Artifacts}) // the last two let uploads of sources be bundled
-// api.Deps: add  Store: store, Functions: fs
-// proxy.Options: add  FunctionsEnabled: cfg.Functions.Enabled   (the proxy reads the node's proxy secret itself)
-if cfg.Functions.Enabled { go fs.Run(ctx) }
-// fleet.Setup / fleet.NewManager: nothing to add; with [functions] enabled they start sb-edge-runtime,
-// and `sbctl fleet start` fetches the edge-runtime artifact (fleet.ServicesFor).
-```
+`sbctl serve` runs the feature when `[functions] enabled` is true (`internal/app/serve.go`): it builds the syncer over the API's store, gives it to `api.Deps` (so uploads of sources are bundled and deployments and secrets are materialized at once), runs its reconcile loop, and passes `FunctionsEnabled` to the proxy. The fleet starts `sb-edge-runtime` with the other shared services and `sbctl fleet start` fetches the edge-runtime artifact (`fleet.ServicesFor`). `dev` remains for a machine without the full node: it forces `[functions] enabled`, starts only the runtime of the fleet, mounts `api.Server` with the hook, runs the reconcile loop and the proxy with `FunctionsEnabled`, and with `--token-file` mints a personal access token for the Supabase CLI: it carries the rights of a node administrator (its stand-in user is Owner of every organization, because the API enforces roles), expires after 12 hours and is deleted, with the file and the user's memberships, when the command ends. `tests/functions/run.sh` and `tests/linux/functions-smoke.sh` use it; `tests/conformance` runs against a node installed with `[functions] enabled`.
 
 ## Tests
 

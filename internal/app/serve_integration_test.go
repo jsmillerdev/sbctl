@@ -82,6 +82,7 @@ func TestServeIntegration(t *testing.T) {
 	cfg.Supervisor = config.SupervisorExec
 	cfg.Domain = "sbctl.test"
 	cfg.TLS.Mode = "off"
+	cfg.Functions.Enabled = true // the daemon must route /functions/v1 and run the syncer; no runtime runs here
 	cfg.BinPath = truePath // archive_command succeeds, so WAL does not pile up
 	cfg.Backup.Backend = "file://" + filepath.Join(state, "backups")
 	cfg.Ports.SystemPostgres, cfg.Ports.SystemGoTrue, cfg.Ports.ProjectBase = ports[0], ports[1], 35100 // 35100 + 3n: project ports
@@ -157,6 +158,11 @@ func TestServeIntegration(t *testing.T) {
 	})
 	if code, _ := get(host, "/rest/v1/", "apikey", "sb_publishable_wrong"); code != 401 {
 		t.Errorf("bad key = %d, want 401", code)
+	}
+	// [functions] enabled reaches the proxy: /functions/v1 is routed to the runtime (which is not
+	// running in this test, so the answer is an error, but not the one of a node without Edge Functions).
+	if code, body := get(host, "/functions/v1/nothing", "apikey", keys.PublishableKey); strings.Contains(body, "not enabled on this node") {
+		t.Errorf("/functions/v1 = %d %s: the daemon did not pass [functions] enabled to the proxy", code, body)
 	}
 	// api.<domain> reaches the Management API (401 without credentials, not 503) and the
 	// dashboard GoTrue under /auth/v1.
