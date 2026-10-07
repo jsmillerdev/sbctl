@@ -17,9 +17,13 @@ type TenantSpec struct {
 	DBPassword string
 	// Pooler: the "postgres" role password users log in with as postgres.<ref>.
 	PostgresPassword string
-	JWTSecret        string
-	AnonKey          string
-	ServiceRoleKey   string
+	// StorageAdminPassword is the password of supabase_storage_admin, the role Storage
+	// connects as (upstream's compose does the same). Empty means the Storage tenant
+	// looks it up in the registry by Ref.
+	StorageAdminPassword string
+	JWTSecret            string
+	AnonKey              string
+	ServiceRoleKey       string
 	// Host is the project API host (<ref>.api.<domain>); Storage matches it via x-forwarded-host.
 	Host string
 	// PoolSize and MaxClients for Supavisor; zero means service default.
