@@ -184,12 +184,15 @@ type SPURLs struct {
 }
 
 // URLsFor derives the service-provider endpoints of the GoTrue whose API_EXTERNAL_URL is
-// externalURL (https://<host>/auth/v1): GoTrue serves them under <external>/sso/saml.
+// externalURL (https://<host>/auth/v1): GoTrue serves them under <external>/sso/saml. The
+// metadata address asks for the download form, which GoTrue gives a validity of five years
+// (the plain document is valid for two days, which an identity provider that imports a file
+// takes literally).
 func URLsFor(externalURL string) SPURLs {
 	base := strings.TrimRight(externalURL, "/")
 	return SPURLs{
 		EntityID:    base + "/sso/saml/metadata",
 		ACSURL:      base + "/sso/saml/acs",
-		MetadataURL: base + "/sso/saml/metadata",
+		MetadataURL: base + "/sso/saml/metadata?download=true",
 	}
 }

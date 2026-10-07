@@ -1004,3 +1004,25 @@ func testSignupGrants(t *testing.T, s ClaimStore) {
 		t.Fatalf("the grant twice: %v %v", ok, err)
 	}
 }
+
+// `sbctl users remove` takes a waiting person off the pending list.
+func TestSSOUserRemovalClearsThePendingList(t *testing.T) {
+	f := newSSOFixture(t)
+	id := f.addProvider(acmeIdP, "", "acme.test")
+	f.gt.addUser(ssoUser1, "alice@acme.test", time.Now())
+	if rec := f.doAs(f.ssoToken(ssoUser1, "alice@acme.test", id), "GET", "/platform/profile", nil); rec.Code != 403 {
+		t.Fatalf("pending: %d", rec.Code)
+	}
+	if us, _ := f.srv.sso.Pending(context.Background(), f.org.ID); len(us) != 1 {
+		t.Fatalf("pending: %+v", us)
+	}
+	if _, err := f.srv.accounts.RemoveUser(context.Background(), "alice@acme.test", false); err != nil {
+		t.Fatal(err)
+	}
+	if us, _ := f.srv.sso.Pending(context.Background(), f.org.ID); len(us) != 0 {
+		t.Fatalf("a removed account is still pending: %+v", us)
+	}
+	if rec := f.doAs(f.ssoToken(ssoUser1, "alice@acme.test", id), "GET", "/platform/profile", nil); rec.Code != 401 {
+		t.Fatalf("the removed account's session: %d", rec.Code)
+	}
+}

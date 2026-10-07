@@ -212,7 +212,7 @@ func TestIntegrationDashboardSSO(t *testing.T) {
 	provider := field(b, "id").(string)
 
 	// The browser's walk: GoTrue's /sso, the identity provider's login, the assertion posted back.
-	signIn := func(idpPort int, email string) (token string, redirect string) {
+	signIn := func(gt string, idpPort int, email string) (token string, redirect string) {
 		t.Helper()
 		st, b, _ := call("POST", gt+"/sso", "", map[string]any{"domain": email[strings.Index(email, "@")+1:], "skip_http_redirect": true,
 			"redirect_to": "http://studio.sbctl.test/sign-in-mfa?method=sso"})
@@ -269,7 +269,7 @@ func TestIntegrationDashboardSSO(t *testing.T) {
 	}
 
 	// An allowed domain: the default role on the first sign-in.
-	alice, loc := signIn(idpPort, "alice@acme.test")
+	alice, loc := signIn(gt, idpPort, "alice@acme.test")
 	if alice == "" {
 		t.Fatalf("no session came back: %s", loc)
 	}
@@ -308,7 +308,7 @@ func TestIntegrationDashboardSSO(t *testing.T) {
 		"type": "saml", "metadata_xml": string(md2), "domains": []string{"contractor.test"}}); st != 201 { // no default role
 		t.Fatalf("second provider: %d %s", st, b)
 	}
-	bob, _ := signIn(idp2Port, "bob@contractor.test")
+	bob, _ := signIn(gt, idp2Port, "bob@contractor.test")
 	if bob == "" {
 		t.Fatal("no session for the second provider's user")
 	}
@@ -336,6 +336,70 @@ func TestIntegrationDashboardSSO(t *testing.T) {
 	time.Sleep(ssoCacheTTL + time.Second)
 	if st, _, _ := call("GET", adm+"/platform/profile", alice, nil); st != 403 {
 		t.Fatalf("alice after the provider was removed: %d", st)
+	}
+
+	// A project's own identity providers: SAML is a setting of the project's Auth config (off
+	// until enabled, as on hosted), the project's GoTrue starts with its own signing key, and
+	// the provider is managed through the Management API like on hosted.
+	proj, err := node.Engine.Create(ctx, lifecycle.CreateRequest{Name: "shop", Class: "micro", OrgSlug: "acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pgt := fmt.Sprintf("http://127.0.0.1:%d", cfg.PortsFor(proj.Ref, proj.Seq).GoTrue)
+	pbase := adm + "/v1/projects/" + proj.Ref + "/config/auth/sso/providers"
+	if st, b, _ := call("GET", pbase, owner, nil); st != 404 || !strings.Contains(string(b), "SAML 2.0 support is not enabled") {
+		t.Fatalf("project SSO before SAML is enabled: %d %s", st, b)
+	}
+	if st, _, _ := call("GET", pgt+"/sso/saml/metadata", "", nil); st != 404 {
+		t.Fatalf("a project's SAML metadata while SAML is off: %d", st)
+	}
+	if st, b, _ := call("PATCH", adm+"/v1/projects/"+proj.Ref+"/config/auth", owner, map[string]any{"saml_enabled": true}); st != 200 {
+		t.Fatalf("enabling SAML: %d %s", st, b)
+	}
+	st, pmeta, _ := call("GET", pgt+"/sso/saml/metadata", "", nil)
+	_, smeta, _ := call("GET", gt+"/sso/saml/metadata", "", nil)
+	if st != 200 || !strings.Contains(string(pmeta), "X509Certificate") {
+		t.Fatalf("the project's SAML metadata: %d %s", st, pmeta)
+	}
+	cert := func(b []byte) string {
+		m := regexp.MustCompile(`<(?:\w+:)?X509Certificate[^>]*>([^<]+)<`).FindSubmatch(b)
+		if m == nil {
+			t.Fatalf("no certificate in %s", b)
+		}
+		return string(m[1])
+	}
+	if cert(pmeta) == cert(smeta) {
+		t.Fatal("the project signs with the dashboard's key")
+	}
+	if !strings.Contains(string(pmeta), "http://"+proj.Ref+".api.sbctl.test/auth/v1/sso/saml/metadata") {
+		t.Fatalf("the project's entity id: %s", pmeta)
+	}
+	st, b, _ = call("POST", pbase, owner, map[string]any{"type": "saml", "metadata_xml": string(md1), "domains": []string{"shop.test"},
+		"attribute_mapping": map[string]any{"keys": map[string]any{"email": map[string]any{"name": "email"}}}})
+	if st != 201 {
+		t.Fatalf("create project provider: %d %s", st, b)
+	}
+	pprov := field(b, "id").(string)
+	if st, b, _ := call("GET", pbase, owner, nil); st != 200 || !strings.Contains(string(b), pprov) || !strings.Contains(string(b), "metadata_xml") {
+		t.Fatalf("list project providers: %d %s", st, b)
+	}
+	carol, loc := signIn(pgt, idpPort, "carol@shop.test")
+	if carol == "" {
+		t.Fatalf("no session for the project's end user: %s", loc)
+	}
+	cc := jwtClaims(t, carol)
+	if app, _ := cc["app_metadata"].(map[string]any); app["provider"] != "sso:"+pprov || cc["email"] != "carol@shop.test" {
+		t.Fatalf("project end user claims: %v", cc)
+	}
+	// The project's end users are not dashboard users, and signed in nowhere else.
+	if st, _, _ := call("GET", adm+"/platform/profile", carol, nil); st != 401 {
+		t.Fatalf("a project's end user on the dashboard API: %d", st)
+	}
+	if st, b, _ := call("DELETE", pbase+"/"+pprov, owner, nil); st != 200 {
+		t.Fatalf("delete project provider: %d %s", st, b)
+	}
+	if st, _, _ := call("GET", pbase+"/"+pprov, owner, nil); st != 404 {
+		t.Fatalf("project provider after delete: %d", st)
 	}
 
 	// The hook fails closed: while the daemon does not answer, GoTrue creates nobody.

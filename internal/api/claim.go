@@ -76,6 +76,11 @@ type Accounts struct {
 	// NoMail makes invitations skip the mail even when [mail] is configured (`users invite
 	// --no-mail`): the caller passes the link on.
 	NoMail bool
+	// SSOUsers forgets a removed user's single sign-on record (the pending list must not
+	// keep a person whose account is gone). Set by NewDashboardSSO.
+	SSOUsers interface {
+		DeleteSSOUser(ctx context.Context, userID string) error
+	}
 }
 
 func (a *Accounts) now() time.Time {
@@ -452,6 +457,11 @@ func (a *Accounts) RemoveUser(ctx context.Context, email string, force bool) (to
 			}
 			if err := a.Store.MarkUserRemoved(ctx, u.ID, u.Email); err != nil {
 				return 0, err
+			}
+			if a.SSOUsers != nil {
+				if err := a.SSOUsers.DeleteSSOUser(ctx, u.ID); err != nil {
+					return 0, err
+				}
 			}
 			ts, err := a.Reg.ListAccessTokens(ctx, u.ID)
 			if err != nil {

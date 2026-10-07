@@ -82,6 +82,7 @@ const ssoCacheTTL = 10 * time.Second
 // NewDashboardSSO builds the service from the account service that shares its credentials,
 // members and registry: the CLI's `sbctl sso` uses it, the server builds its own the same way.
 func NewDashboardSSO(a *Accounts, store SSOStore) *DashboardSSO {
+	a.SSOUsers = store
 	return &DashboardSSO{Reg: a.Reg, Store: store, Keys: a.Keys, Config: a.Config, GoTrueURL: a.GoTrueURL, HTTP: a.HTTP,
 		Members: a.Members, Accounts: a, Now: a.Now, Log: a.Log}
 }

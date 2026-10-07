@@ -358,7 +358,7 @@ func TestResolveMetadata(t *testing.T) {
 
 func TestSPURLs(t *testing.T) {
 	sp := URLsFor("https://api.example.com/auth/v1/")
-	if sp.ACSURL != "https://api.example.com/auth/v1/sso/saml/acs" || sp.EntityID != "https://api.example.com/auth/v1/sso/saml/metadata" || sp.MetadataURL != sp.EntityID {
+	if sp.ACSURL != "https://api.example.com/auth/v1/sso/saml/acs" || sp.EntityID != "https://api.example.com/auth/v1/sso/saml/metadata" || sp.MetadataURL != sp.EntityID+"?download=true" {
 		t.Fatalf("%+v", sp)
 	}
 }
