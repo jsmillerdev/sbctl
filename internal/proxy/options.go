@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/domains"
 	"github.com/jsmillerdev/supavise/internal/registry"
 	"github.com/jsmillerdev/supavise/internal/secrets"
 )
@@ -54,7 +55,10 @@ type Options struct {
 	// Empty reads the node's secret (config.LoadFunctionsProxyToken) when the first
 	// /functions/v1 request arrives. Tests set it.
 	FunctionsProxyToken string
-	Logger              *slog.Logger
+	// Resolver answers Studio's custom-domain DNS pre-check (studio_cname.go); nil means the
+	// system resolver.
+	Resolver domains.Resolver
+	Logger   *slog.Logger
 }
 
 func (o *Options) validate() error {

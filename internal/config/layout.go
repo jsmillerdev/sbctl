@@ -210,6 +210,10 @@ func (c *Config) BaseDomain() string {
 
 // Hostnames (docs/development/build-plan.md section 1).
 func (c *Config) ProjectHost(ref string) string { return ref + ".api." + c.BaseDomain() }
+
+// VanityHost is the host of a vanity subdomain: <name>.api.<base domain>, under the wildcard
+// record and certificate of the project hosts.
+func (c *Config) VanityHost(name string) string { return name + ".api." + c.BaseDomain() }
 func (c *Config) StudioHost() string            { return "studio." + c.BaseDomain() }
 func (c *Config) APIHost() string               { return "api." + c.BaseDomain() }
 func (c *Config) PoolerHost() string            { return "pooler." + c.BaseDomain() }
@@ -230,3 +234,9 @@ func (c *Config) RefFromProjectHost(host string) string {
 // RealtimeInternalHost is the Host header supavise sends to Realtime; Realtime resolves
 // the tenant from the first label.
 func RealtimeInternalHost(ref string) string { return ref + ".realtime.internal" }
+
+// StorageClientHostHeader carries the Host a client used into Storage. Storage verifies an S3
+// request's signature against the host the client signed, which with a custom hostname or a
+// vanity subdomain is not the derived host Storage gets in x-forwarded-host to find its tenant;
+// the fleet sets S3_PROTOCOL_NON_CANONICAL_HOST_HEADER to this name and the proxy fills it.
+const StorageClientHostHeader = "X-Supavise-Client-Host"

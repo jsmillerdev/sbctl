@@ -200,19 +200,22 @@ func realtimeEnv(cfg *config.Config, c *creds) map[string]string {
 func storageEnv(cfg *config.Config, c *creds) (map[string]string, error) {
 	l := c.logins[config.SvcStorage]
 	env := map[string]string{
-		"MULTI_TENANT":                       "true",
-		"DATABASE_MULTITENANT_URL":           pgURL(l.User, l.Password, cfg.Ports.SystemPostgres, l.Database),
-		"SERVER_HOST":                        "127.0.0.1",
-		"SERVER_PORT":                        strconv.Itoa(cfg.Ports.Storage),
-		"SERVER_ADMIN_PORT":                  strconv.Itoa(cfg.Ports.StorageAdmin),
-		"SERVER_ADMIN_API_KEYS":              c.storageAdminKey,
-		"AUTH_ENCRYPTION_KEY":                c.storageEncKey,
-		"REQUEST_X_FORWARDED_HOST_REGEXP":    storageHostRegexp(cfg),
-		"REQUEST_ALLOW_X_FORWARDED_PATH":     "true",
-		"UPLOAD_FILE_SIZE_LIMIT":             strconv.FormatInt(cfg.Fleet.FileSizeLimit(), 10),
-		"REGION":                             "local",
-		"LOG_LEVEL":                          "warn",
-		"ADMIN_RETURN_TENANT_SENSITIVE_DATA": "false",
+		"MULTI_TENANT":                    "true",
+		"DATABASE_MULTITENANT_URL":        pgURL(l.User, l.Password, cfg.Ports.SystemPostgres, l.Database),
+		"SERVER_HOST":                     "127.0.0.1",
+		"SERVER_PORT":                     strconv.Itoa(cfg.Ports.Storage),
+		"SERVER_ADMIN_PORT":               strconv.Itoa(cfg.Ports.StorageAdmin),
+		"SERVER_ADMIN_API_KEYS":           c.storageAdminKey,
+		"AUTH_ENCRYPTION_KEY":             c.storageEncKey,
+		"REQUEST_X_FORWARDED_HOST_REGEXP": storageHostRegexp(cfg),
+		"REQUEST_ALLOW_X_FORWARDED_PATH":  "true",
+		// The host an S3 client signed is the one it connected to: a custom hostname or a vanity
+		// subdomain, not the derived host that x-forwarded-host carries for the tenant lookup.
+		"S3_PROTOCOL_NON_CANONICAL_HOST_HEADER": config.StorageClientHostHeader,
+		"UPLOAD_FILE_SIZE_LIMIT":                strconv.FormatInt(cfg.Fleet.FileSizeLimit(), 10),
+		"REGION":                                "local",
+		"LOG_LEVEL":                             "warn",
+		"ADMIN_RETURN_TENANT_SENSITIVE_DATA":    "false",
 	}
 	f := cfg.Fleet
 	switch f.StorageBackend {
