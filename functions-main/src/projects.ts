@@ -20,6 +20,22 @@ export const validSlug = (slug: string): boolean => SLUG_RE.test(slug)
 
 const isNotFound = (e: unknown): boolean => e instanceof Deno.errors.NotFound
 
+/**
+ * Runs op, trying again a couple of times when it fails with anything but "not found":
+ * macOS can fail a path walk through a symlink that a deployment replaces at that very
+ * moment (EINVAL), and a retry then finds the new target. Linux does not need it.
+ */
+async function retrying<T>(op: () => Promise<T>, tries = 3): Promise<T> {
+  for (let i = 1;; i++) {
+    try {
+      return await op()
+    } catch (e) {
+      if (isNotFound(e) || i >= tries) throw e
+      await new Promise((r) => setTimeout(r, 5 * i))
+    }
+  }
+}
+
 /** Joins path elements with "/" (the runtime runs on Linux and macOS only). */
 const join = (...parts: string[]): string => parts.join('/').replace(/\/{2,}/g, '/')
 
@@ -125,7 +141,7 @@ export class ProjectStore {
     const functionsDir = join(this.projectsDir, ref, 'functions')
     let dir: string
     try {
-      dir = await Deno.realPath(join(functionsDir, slug))
+      dir = await retrying(() => Deno.realPath(join(functionsDir, slug)))
     } catch (e) {
       if (isNotFound(e)) return null
       throw e
@@ -141,7 +157,7 @@ export class ProjectStore {
     if (cached) return cached
     let text: string
     try {
-      text = await Deno.readTextFile(join(dir, META_FILE))
+      text = await retrying(() => Deno.readTextFile(join(dir, META_FILE)))
     } catch (e) {
       if (isNotFound(e)) return null
       throw e

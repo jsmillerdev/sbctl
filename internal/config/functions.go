@@ -38,6 +38,11 @@ type Functions struct {
 	// MaxParallelism caps the workers of the whole runtime alive at once. Zero means
 	// DefaultFunctionsMaxParallelism; negative means no cap.
 	MaxParallelism int `toml:"max_parallelism"`
+	// ProjectURLTemplate is SUPABASE_URL as functions see it, with {ref} for the project
+	// ref. Empty derives it from the domain, the TLS mode and the public listen ports
+	// (https://<ref>.api.<domain>). Set it when functions must reach their own project
+	// through another address, for example in a test with a non-default port.
+	ProjectURLTemplate string `toml:"project_url_template"`
 	// ReconcileSeconds is how often the API server compares the stored deployments,
 	// keys and secrets with the files on disk. Zero means DefaultFunctionsReconcileSec.
 	ReconcileSeconds int `toml:"reconcile_seconds"`

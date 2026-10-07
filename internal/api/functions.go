@@ -101,6 +101,9 @@ func (s *Server) deleteFunction(w http.ResponseWriter, r *http.Request) error {
 	if err := s.store.DeleteFunction(r.Context(), p.Ref, f.Slug); err != nil {
 		return mapErr(err)
 	}
+	if err := s.functionsChanged(r.Context(), p.Ref); err != nil {
+		return err
+	}
 	w.WriteHeader(http.StatusOK)
 	return nil
 }
@@ -135,6 +138,9 @@ func (s *Server) updateFunction(w http.ResponseWriter, r *http.Request) error {
 	}
 	f.Ref = p.Ref
 	if err := s.store.UpsertFunction(r.Context(), f, nil); err != nil {
+		return err
+	}
+	if err := s.functionsChanged(r.Context(), p.Ref); err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusOK, fnJSON(f))
@@ -173,6 +179,9 @@ func (s *Server) createFunction(w http.ResponseWriter, r *http.Request) error {
 	f := &Function{Ref: p.Ref, Slug: in.Slug, Name: firstNonEmpty(in.Name, in.Slug), Status: "ACTIVE", VerifyJWT: in.VerifyJWT == nil || *in.VerifyJWT,
 		EntrypointPath: in.Entrypoint, ImportMapPath: in.ImportMap}
 	if err := s.store.UpsertFunction(r.Context(), f, nil); err != nil {
+		return err
+	}
+	if err := s.functionsChanged(r.Context(), p.Ref); err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusCreated, fnJSON(f))
@@ -269,6 +278,9 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 		f.ImportMapPath, _ = cleanFilePath(meta.ImportMapPath)
 	}
 	if err := s.store.UpsertFunction(r.Context(), f, files); err != nil {
+		return err
+	}
+	if err := s.functionsChanged(r.Context(), p.Ref); err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusCreated, fnJSON(f))
