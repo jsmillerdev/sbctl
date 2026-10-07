@@ -190,6 +190,72 @@ func (d *DashboardSSO) checkManage(actor *members.Access, org members.OrgRef, ro
 	return nil
 }
 
+// checkUsers reports whether actor may change who the identity provider vouches for (its metadata,
+// attribute mapping, name id format or availability) or remove it: whoever controls the provider
+// controls the accounts of its users, and removing it ends their sessions. So the actor must be
+// able to grant every role the provider's users hold, in any organization and on any project. A
+// provider with an Owner among its users is the business of an Owner (or the operator) only.
+func (d *DashboardSSO) checkUsers(ctx context.Context, actor *members.Access, org members.OrgRef, providerID string) error {
+	if actor == nil || d.Members == nil {
+		return nil
+	}
+	us, err := d.Store.ListSSOUsers(ctx, "", []string{providerID})
+	if err != nil {
+		return err
+	}
+	for _, u := range us {
+		ms, err := d.Members.Store.MembershipsOf(ctx, u.UserID)
+		if err != nil {
+			return err
+		}
+		prs, err := d.Members.Store.ProjectRolesOf(ctx, u.UserID)
+		if err != nil {
+			return err
+		}
+		roles := map[int64][]int{}
+		for _, m := range ms {
+			roles[m.OrgID] = append(roles[m.OrgID], m.RoleID)
+		}
+		for _, r := range prs {
+			roles[r.OrgID] = append(roles[r.OrgID], r.BaseRoleID)
+		}
+		for orgID, rs := range roles {
+			ref := members.OrgRef{ID: orgID}
+			if orgID == org.ID {
+				ref = org
+			}
+			for _, role := range rs {
+				if !mayGrant(actor, ref, role) {
+					return errf(http.StatusForbidden, "Your role does not allow changing or removing a provider whose users include a member with the %s role", members.RoleName(role))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// ruleConflict refuses to give domains the default role of org when another organization's
+// default-role rule holds one of them, unless actor (nil: the operator) owns that organization:
+// the rule is somebody else's.
+func (d *DashboardSSO) ruleConflict(ctx context.Context, actor *members.Access, org members.OrgRef, domains []string) error {
+	if actor == nil || d.Members == nil {
+		return nil
+	}
+	for _, dm := range domains {
+		r, err := d.Members.Store.GetDomainDefault(ctx, dm)
+		if errors.Is(err, members.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if r.OrgID != org.ID && actor.OrgRole(r.OrgID) != members.RoleOwner {
+			return errf(http.StatusConflict, "The domain %s already has a default role of another organization", dm)
+		}
+	}
+	return nil
+}
+
 // ---- providers ---------------------------------------------------------------
 
 // AddProvider is what `sbctl sso add` and the API give to Add.
@@ -285,6 +351,11 @@ func (d *DashboardSSO) Add(ctx context.Context, actor *members.Access, in AddPro
 	if err := d.domainsTaken(ctx, domains, ""); err != nil {
 		return nil, err
 	}
+	if in.DefaultRole != 0 {
+		if err := d.ruleConflict(ctx, actor, in.Org, domains); err != nil {
+			return nil, err
+		}
+	}
 	c, err := d.clientCtx(ctx)
 	if err != nil {
 		return nil, err
@@ -313,7 +384,9 @@ func (d *DashboardSSO) Add(ctx context.Context, actor *members.Access, in AddPro
 		undo()
 		return nil, err
 	}
-	if err := d.syncRules(ctx, in.Org, nil, domains, 0, in.DefaultRole); err != nil {
+	// The provider is the source of truth: the domains' rules say what it says, and a rule of the
+	// organization that was there before (set by an operator) does not outlive it.
+	if err := d.syncRules(ctx, in.Org, domains, domains, 0, in.DefaultRole); err != nil {
 		undo()
 		return nil, err
 	}
@@ -449,6 +522,11 @@ func (d *DashboardSSO) Update(ctx context.Context, actor *members.Access, id str
 	if err := d.checkManage(actor, org, row, newRole); err != nil {
 		return nil, err
 	}
+	if in.Metadata != nil || in.AttributeMapping != nil || in.NameIDFormat != nil || (in.Disabled != nil && *in.Disabled) {
+		if err := d.checkUsers(ctx, actor, org, id); err != nil {
+			return nil, err
+		}
+	}
 	if in.NameIDFormat != nil {
 		if err := checkNameIDFormat(*in.NameIDFormat); err != nil {
 			return nil, err
@@ -467,6 +545,11 @@ func (d *DashboardSSO) Update(ctx context.Context, actor *members.Access, id str
 			return nil, err
 		}
 		body.Domains = &newDomains
+	}
+	if newRole != 0 {
+		if err := d.ruleConflict(ctx, actor, org, newDomains); err != nil {
+			return nil, err
+		}
 	}
 	if in.Metadata != nil {
 		if in.Metadata.XML != "" {
@@ -521,6 +604,9 @@ func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id str
 			org.Slug = o.Slug
 		}
 		if err := d.checkManage(actor, org, row, 0); err != nil {
+			return nil, err
+		}
+		if err := d.checkUsers(ctx, actor, org, id); err != nil {
 			return nil, err
 		}
 	} else if actor != nil && !actor.IsOwnerAnywhere() {
@@ -850,11 +936,14 @@ func (d *DashboardSSO) firstSight(ctx context.Context, row *SSOProviderRow, user
 	return &u, nil
 }
 
-// grantDefault applies the default role of the email's domain, when the provider vouches for the
-// domain and the rule belongs to the provider's own organization.
+// grantDefault gives a first-time user the provider's default role, when the provider vouches for
+// the email's domain. The provider's own role is the one that counts: the domain's default-role
+// rule (which Add and Update keep in step) only has to belong to the provider's organization, so a
+// rule that was changed on its own, or left behind by an operator, cannot hand out more than the
+// provider's registrant was allowed to give.
 func (d *DashboardSSO) grantDefault(ctx context.Context, row *SSOProviderRow, userID, email string) (*members.Grant, error) {
 	dm := members.DomainOf(email)
-	if dm == "" || !slices.Contains(row.Domains, dm) {
+	if dm == "" || row.DefaultRole == 0 || !slices.Contains(row.Domains, dm) {
 		return nil, nil
 	}
 	rule, err := d.Members.Store.GetDomainDefault(ctx, dm)
@@ -867,7 +956,24 @@ func (d *DashboardSSO) grantDefault(ctx context.Context, row *SSOProviderRow, us
 	if rule.OrgID != row.OrgID {
 		return nil, nil
 	}
-	return d.Members.GrantSSODefault(ctx, userID, email)
+	if rule.RoleID == row.DefaultRole {
+		return d.Members.GrantSSODefault(ctx, userID, email)
+	}
+	var granted bool
+	err = d.Members.Store.Update(ctx, row.OrgID, func(ops members.Ops) error {
+		if _, err := ops.GetMember(ctx, row.OrgID, userID); err == nil {
+			return nil
+		} else if !errors.Is(err, members.ErrNotFound) {
+			return err
+		}
+		granted = true
+		return ops.PutMember(ctx, members.Member{OrgID: row.OrgID, UserID: userID, RoleID: row.DefaultRole})
+	})
+	if err != nil || !granted {
+		return nil, err
+	}
+	d.log().Info("single sign-on user joined with the default role of the provider", "provider", row.ID, "org", row.OrgID, "role", members.RoleName(row.DefaultRole))
+	return &members.Grant{OrgID: row.OrgID, RoleID: row.DefaultRole}, nil
 }
 
 // Find resolves what an operator typed to a provider: a provider id, or an email domain it

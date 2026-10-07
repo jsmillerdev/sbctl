@@ -50,6 +50,11 @@ func (f *fixture) waitBranch(t *testing.T, name, wantStatus string) map[string]a
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		rec := f.do("GET", "/v1/projects/"+testRef+"/branches/"+name, nil)
+		// A reset recreates the branch: for a moment it is not there (404), which is not a failure.
+		if rec.Code == 404 && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
 		if rec.Code != 200 {
 			t.Fatalf("get branch %s: %d %s", name, rec.Code, rec.Body)
 		}

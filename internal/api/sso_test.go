@@ -1096,3 +1096,171 @@ func TestSSOAuditEvents(t *testing.T) {
 		}
 	}
 }
+
+// Whoever controls a provider controls the accounts of its users: an Administrator cannot swap
+// the metadata or attribute mapping of a provider with an Owner among its users, switch it off or
+// remove it, even though its default role is one the Administrator may hand out.
+func TestSSOAdministratorsCannotTakeOverOrLockOutAnOwnerThroughAProvider(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	rec := f.as("admin", "POST", orgSSO+"/providers", map[string]any{"type": "saml", "metadata_xml": testIdPMetadata(acmeIdP), "domains": []string{"acme.test"}, "default_role": "developer"})
+	if rec.Code != 201 {
+		t.Fatalf("add: %d %s", rec.Code, rec.Body)
+	}
+	id := jsonField(t, rec, "id").(string)
+	tok := f.ssoToken(ssoUser1, "alice@acme.test", id)
+	if rec := f.doAs(tok, "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("first sign-in: %d %s", rec.Code, rec.Body)
+	}
+	// While the users are Developers, an Administrator may still swap the metadata.
+	if rec := f.as("admin", "PUT", orgSSO+"/providers/"+id, map[string]any{"metadata_xml": testIdPMetadata(acmeIdP)}); rec.Code != 200 {
+		t.Fatalf("metadata change with Developer users: %d %s", rec.Code, rec.Body)
+	}
+	// The user is promoted to Owner later.
+	org := members.OrgRef{ID: f.org.ID, Slug: f.org.Slug}
+	if err := f.srv.members.SetOrgRole(ctx, nil, org, ssoUser1, members.RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]map[string]any{
+		"metadata":          {"metadata_xml": testIdPMetadata(acmeIdP)},
+		"metadata address":  {"metadata_url": "https://idp.evil.test/metadata"},
+		"attribute mapping": {"attribute_mapping": map[string]any{"keys": map[string]any{"email": map[string]any{"name": "mail"}}}},
+		"name id format":    {"name_id_format": "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"},
+	} {
+		if rec := f.as("admin", "PUT", orgSSO+"/providers/"+id, body); rec.Code != 403 {
+			t.Errorf("an Administrator changing the %s of a provider with an Owner user: %d %s", name, rec.Code, rec.Body)
+		}
+	}
+	// Studio's organization page is the same route to the same provider.
+	if rec := f.as("admin", "PUT", orgSSO, map[string]any{"metadata_xml_file": testIdPMetadata(acmeIdP), "email_mapping": []string{"mail"}}); rec.Code != 403 {
+		t.Errorf("an Administrator through the organization page: %d %s", rec.Code, rec.Body)
+	}
+	if rec := f.as("admin", "PUT", orgSSO, map[string]any{"enabled": false}); rec.Code != 403 {
+		t.Errorf("an Administrator switching the provider off: %d %s", rec.Code, rec.Body)
+	}
+	if rec := f.as("admin", "DELETE", orgSSO+"/providers/"+id, nil); rec.Code != 403 {
+		t.Errorf("an Administrator removing the provider: %d %s", rec.Code, rec.Body)
+	}
+	if rec := f.as("admin", "DELETE", orgSSO, nil); rec.Code != 403 {
+		t.Errorf("an Administrator removing the provider through the organization page: %d %s", rec.Code, rec.Body)
+	}
+	if got := f.gt.sso.ids(); len(got) != 1 {
+		t.Fatalf("the provider is gone from GoTrue: %v", got)
+	}
+	// The Owner's session still works, and an Owner may do all of it.
+	if rec := f.doAs(tok, "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("the Owner's session: %d", rec.Code)
+	}
+	if rec := f.as("owner", "PUT", orgSSO+"/providers/"+id, map[string]any{"metadata_xml": testIdPMetadata(acmeIdP)}); rec.Code != 200 {
+		t.Fatalf("an Owner changing the metadata: %d %s", rec.Code, rec.Body)
+	}
+	if rec := f.as("owner", "DELETE", orgSSO+"/providers/"+id, nil); rec.Code != 200 {
+		t.Fatalf("an Owner removing the provider: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A user who holds an Owner role only on some projects, or in another organization, counts too.
+func TestSSOProviderUsersWithScopedOrOtherOrganizationRoles(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	org := members.OrgRef{ID: f.org.ID, Slug: f.org.Slug}
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	if rec := f.doAs(f.ssoToken(ssoUser1, "alice@acme.test", id), "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("first sign-in: %d", rec.Code)
+	}
+	// Owner of a project in the organization.
+	if err := f.srv.members.AssignProjectRole(ctx, nil, org, ssoUser1, members.RoleOwner, []string{testRef}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := f.as("admin", "PUT", orgSSO+"/providers/"+id, map[string]any{"name_id_format": "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"}); rec.Code != 403 {
+		t.Fatalf("project-scoped Owner: %d %s", rec.Code, rec.Body)
+	}
+	// Owner of another organization the Administrator does not belong to.
+	f.srv.sso.forget(id)
+	bravo, err := f.reg.CreateOrganization(ctx, "bravo", "Bravo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.srv.members.EnsureOwner(ctx, members.OrgRef{ID: bravo.ID, Slug: bravo.Slug}, ssoUser1); err != nil {
+		t.Fatal(err)
+	}
+	if rec := f.as("admin", "DELETE", orgSSO+"/providers/"+id, nil); rec.Code != 403 {
+		t.Fatalf("Owner of another organization: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// The provider's own default role is what a first-time user gets: a rule of the organization that
+// an operator set for the domain before the provider was added cannot hand out more.
+func TestSSOProviderRoleOverridesAnOperatorsRule(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	if err := f.srv.members.SetDomainDefault(ctx, "acme.test", f.org.ID, members.RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	// No default role: the rule goes, and the user waits.
+	rec := f.as("admin", "POST", orgSSO+"/providers", map[string]any{"type": "saml", "metadata_xml": testIdPMetadata(acmeIdP), "domains": []string{"acme.test"}})
+	if rec.Code != 201 {
+		t.Fatalf("add: %d %s", rec.Code, rec.Body)
+	}
+	id := jsonField(t, rec, "id").(string)
+	if _, err := f.srv.members.Store.GetDomainDefault(ctx, "acme.test"); err == nil {
+		t.Fatal("the operator's Owner rule outlived a provider without a default role")
+	}
+	if rec := f.doAs(f.ssoToken(ssoUser1, "alice@acme.test", id), "GET", "/platform/projects", nil); rec.Code != 403 {
+		t.Fatalf("a user of a provider without a default role: %d %s", rec.Code, rec.Body)
+	}
+	if got := f.roleOf(ssoUser1); got != 0 {
+		t.Fatalf("role %d", got)
+	}
+	// A rule changed on its own later does not raise the provider's role.
+	if rec := f.as("owner", "PUT", orgSSO+"/providers/"+id, map[string]any{"default_role": "developer"}); rec.Code != 200 {
+		t.Fatalf("set the role: %d %s", rec.Code, rec.Body)
+	}
+	if err := f.srv.members.SetDomainDefault(ctx, "acme.test", f.org.ID, members.RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	f.srv.sso.forget(id)
+	if rec := f.doAs(f.ssoToken(ssoUser2, "bob@acme.test", id), "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("second user: %d %s", rec.Code, rec.Body)
+	}
+	if got := f.roleOf(ssoUser2); got != members.RoleDeveloper {
+		t.Fatalf("role of a user whose domain rule drifted to Owner: %d, want Developer", got)
+	}
+}
+
+// A domain that another organization's rule holds is not the Administrator's to take.
+func TestSSOProviderCannotOverwriteAnotherOrganizationsRule(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	bravo, err := f.reg.CreateOrganization(ctx, "bravo", "Bravo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.srv.members.SetDomainDefault(ctx, "acme.test", bravo.ID, members.RoleReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	for _, who := range []string{"admin", "owner"} {
+		rec := f.as(who, "POST", orgSSO+"/providers", map[string]any{"type": "saml", "metadata_xml": testIdPMetadata(acmeIdP), "domains": []string{"acme.test"}, "default_role": "developer"})
+		if rec.Code != 409 {
+			t.Fatalf("%s adding a provider for a domain of another organization's rule: %d %s", who, rec.Code, rec.Body)
+		}
+	}
+	if n := len(f.gt.sso.ids()); n != 0 {
+		t.Fatal("the refused provider reached GoTrue")
+	}
+	if r, err := f.srv.members.Store.GetDomainDefault(ctx, "acme.test"); err != nil || r.OrgID != bravo.ID || r.RoleID != members.RoleReadOnly {
+		t.Fatalf("bravo's rule: %+v, %v", r, err)
+	}
+	// Without a role the provider sets no rule, so it does not collide. Raising it later does.
+	rec := f.as("admin", "POST", orgSSO+"/providers", map[string]any{"type": "saml", "metadata_xml": testIdPMetadata(acmeIdP), "domains": []string{"acme.test"}})
+	if rec.Code != 201 {
+		t.Fatalf("add without a role: %d %s", rec.Code, rec.Body)
+	}
+	id := jsonField(t, rec, "id").(string)
+	if r, err := f.srv.members.Store.GetDomainDefault(ctx, "acme.test"); err != nil || r.OrgID != bravo.ID {
+		t.Fatalf("bravo's rule after a provider without a role: %+v, %v", r, err)
+	}
+	if rec := f.as("admin", "PUT", orgSSO+"/providers/"+id, map[string]any{"default_role": "developer"}); rec.Code != 409 {
+		t.Fatalf("raising the role over another organization's rule: %d %s", rec.Code, rec.Body)
+	}
+}

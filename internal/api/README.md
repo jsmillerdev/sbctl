@@ -273,7 +273,11 @@ Developer and a user without a membership through the real handlers.
   it. While it is on, a dashboard session whose JWT does not carry `aal: aal2` is refused in the organization's
   routes (403 `MFA required`), still sees the organization list, profile and permissions, and cannot accept an
   invitation; turning it on needs an aal2 session, so an Owner cannot lock themselves out. `mfa_enabled` of a member
-  is always false (GoTrue's factor list is not queried).
+  is always false (GoTrue's factor list is not queried). **Exemption for SSO:** a dashboard session that came from a
+  registered SSO identity provider is treated as aal2, whatever the provider did (see Single sign-on below). Every
+  registered provider satisfies the requirement, including one an Administrator registered, and the aal2 check on minting
+  personal access tokens as well. An Owner who turns the requirement on and does not trust a provider's authentication
+  should not let that provider's users in (remove it, or keep its default role at none and approve users by hand).
 
 - **Saved content belongs to its owner.** A Developer or Read-only member may create saved items, but change, rename or
   delete only their own (folders included): the permission entries carry the condition `resource.owner_id ==
@@ -359,8 +363,22 @@ like every other `/auth/v1` path.
   request only: a user who later loses every membership waits again and is not given it again. A second provider
   cannot give its users another provider's default role by asserting that provider's domains. A personal access token
   that an SSO user made carries the user's roles like any other; removing a provider revokes the tokens of its users. An SSO
-  session meets an organization's "require MFA" (GoTrue marks it aal1 whatever the provider did, and the provider is where
-  strong authentication is enforced; the switch would otherwise lock out every SSO user).
+  session meets an organization's "require MFA" and the aal2 check on minting personal access tokens (GoTrue marks it aal1
+  whatever the provider did, and the provider is where strong authentication is enforced; the switch would otherwise lock
+  out every SSO user). The exemption is unconditional: sbctl cannot see how strongly a provider authenticated its user,
+  so any registered provider, including one an Administrator registered, satisfies the requirement. There is no
+  per-provider setting yet.
+- **Who may change a provider.** The provider's default role is the role a first-time user gets, taken from the provider's
+  own record (`sso_providers.default_role`) at the moment of the first sign-in; the domain's default-role rule is kept in
+  step by `add` and `update` (a rule of the organization that was there before is replaced, or removed when the role is
+  none) and a rule that has drifted from the provider does not raise the role. A domain that has another organization's
+  rule is refused (409) unless the caller owns that organization (or is the operator). An Administrator cannot register
+  or change a provider so that it hands out Owner. Changing what a provider vouches for (metadata, attribute mapping,
+  name id format, switching it off) and removing it also need the caller to be able to grant every role that the
+  provider's users hold, in any organization and on any project: whoever controls the provider controls the accounts it
+  signs in (GoTrue links an identity provider's user to the existing account by name id or verified email), and removal
+  ends their sessions. A provider with an Owner among its users is the business of an Owner or the operator (403 for
+  an Administrator).
 - **Sign-up stays closed.** GoTrue's own switch (`GOTRUE_DISABLE_SIGNUP`) also stops an SSO user's first sign-in, so
   it is off on `sb-gotrue@system` and its before-user-created hook is on: GoTrue asks `POST
   /internal/hooks/before-user-created` on the loopback admin listener (signed with a secret derived from the master key
