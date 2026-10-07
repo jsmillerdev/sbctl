@@ -23,7 +23,8 @@
 #     intact, a base backup taken for each attempt, eligibility "up to date".
 #  4. The second project goes through `supavise projects upgrade --all --yes` (canary path), and
 #     `supavise projects versions` agrees. `supavise artifacts gc` then removes the old artifacts
-#     nothing runs or keeps, and keeps the previous release's.
+#     nothing runs or keeps, and keeps the previous release's (`projects upgrade` itself runs the
+#     same collection unless --no-gc is given).
 #
 # Without SUPAVISE_BIN the script builds supavise with the go toolchain. It needs network access
 # for the artifact downloads. Not run in development (root, systemd and Linux required); CI runs
@@ -273,7 +274,8 @@ runs "$REF2" gotrue "$OLD_AUTH"
 log "the second project through the CLI: supavise projects upgrade --all --yes"
 OUT=$(supavise projects upgrade --all --dry-run)
 grep -q "$REF2" <<<"$OUT" || { echo "$OUT" >&2; fail "--dry-run does not list $REF2"; }
-supavise projects upgrade --all --yes || fail "supavise projects upgrade --all --yes"
+# --no-gc keeps the old release for the explicit gc checks below; without it the upgrade removes it.
+supavise projects upgrade --all --yes --no-gc || fail "supavise projects upgrade --all --yes"
 wait_status "$REF2" ACTIVE_HEALTHY 180
 [[ $(service_versions "$REF2") == "$NEW_AUTH_V $NEW_REST_V" ]] || fail "service versions of $REF2: $(service_versions "$REF2")"
 runs "$REF2" gotrue "$NEW_AUTH"
