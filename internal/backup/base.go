@@ -23,7 +23,7 @@ const stopTimeout = 15 * time.Minute
 
 // BackupOptions tunes one base backup.
 type BackupOptions struct {
-	// Reason is recorded in the manifest: ReasonManual (default), ReasonScheduled, ReasonFinal or ReasonRestore.
+	// Reason is recorded in the manifest: ReasonManual (default), ReasonScheduled, ReasonFinal, ReasonRestore or ReasonUpgrade.
 	Reason string
 }
 
@@ -46,6 +46,12 @@ func (s *Service) FinalBackup(ctx context.Context, ref string) (*registry.Backup
 		return nil, fmt.Errorf("backup: final backup of the files of %s failed: %w", ref, err)
 	}
 	return s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonFinal})
+}
+
+// UpgradeBackup is the hook of a project upgrade: lifecycle.Engine takes it while the project
+// still serves, before it stops anything, and does not start the upgrade if it fails.
+func (s *Service) UpgradeBackup(ctx context.Context, ref string) (*registry.Backup, error) {
+	return s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonUpgrade})
 }
 
 // BaseBackupWith takes a base backup of ref's running cluster.

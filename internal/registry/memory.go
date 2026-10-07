@@ -20,6 +20,7 @@ type Memory struct {
 	routes   map[string]Route
 	backups  []Backup
 	events   []Event
+	upgrades []Upgrade
 	nextID   int64
 	subs     map[chan Change]struct{}
 }
@@ -289,6 +290,13 @@ func (m *Memory) DeleteProject(_ context.Context, ref string) error {
 	}
 	delete(m.projects, ref)
 	delete(m.secrets, ref)
+	kept := m.upgrades[:0]
+	for _, u := range m.upgrades {
+		if u.Ref != ref {
+			kept = append(kept, u)
+		}
+	}
+	m.upgrades = kept
 	for h, r := range m.routes {
 		if r.Ref == ref {
 			delete(m.routes, h)

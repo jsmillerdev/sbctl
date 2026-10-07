@@ -105,13 +105,20 @@ func (s *Store) Path(svc string) (string, error) {
 
 // Dir returns the unpacked artifact root of svc, or ErrNotFetched.
 func (s *Store) Dir(svc string) (string, error) {
-	dir, err := s.Path(svc)
+	tag, err := s.versions.Tag(svc)
 	if err != nil {
 		return "", err
 	}
+	return s.DirFor(svc, tag)
+}
+
+// DirFor returns the unpacked artifact root of svc at tag, which need not be the pinned one (a
+// project keeps running the versions it was last upgraded to), or ErrNotFetched.
+func (s *Store) DirFor(svc, tag string) (string, error) {
+	dir := s.cfg.Paths().Artifact(svc, tag)
 	if _, err := os.Stat(dir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("%w (%s)", ErrNotFetched, svc)
+			return "", fmt.Errorf("%w (%s %s)", ErrNotFetched, svc, tag)
 		}
 		return "", err
 	}
@@ -149,6 +156,16 @@ func (s *Store) Fetch(ctx context.Context, svc string) (string, error) {
 	tag, err := s.versions.Tag(svc)
 	if err != nil {
 		return "", err
+	}
+	return s.FetchTag(ctx, svc, tag)
+}
+
+// FetchTag is Fetch for an explicit release tag of svc (not Studio) instead of the pinned one: the
+// lifecycle uses it to bring back the artifacts of a project's recorded versions when they are
+// gone from disk.
+func (s *Store) FetchTag(ctx context.Context, svc, tag string) (string, error) {
+	if svc == config.SvcStudio {
+		return "", errors.New("artifacts: Studio is fetched from [studio] artifact_url, not by tag")
 	}
 	final := s.cfg.Paths().Artifact(svc, tag)
 	l := s.lock(final)

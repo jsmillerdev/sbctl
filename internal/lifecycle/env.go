@@ -81,7 +81,7 @@ func (pl *PostgresPlane) archiveTimeout() int {
 //
 // pg_cron runs its jobs in background workers (see cronSettings), not over libpq.
 func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (units.Spec, error) {
-	art, err := pl.arts.Dir(config.SvcPostgres)
+	art, err := pl.artifactDir(p, config.SvcPostgres)
 	if err != nil {
 		return units.Spec{}, err
 	}
@@ -160,7 +160,7 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 	ports := pl.cfg.PortsFor(p.Ref, p.Seq)
 	pgPort := ports.Postgres
 
-	authArt, err := pl.arts.Dir(config.SvcGoTrue)
+	authArt, err := pl.artifactDir(p, config.SvcGoTrue)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +226,7 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 	if !hasPostgREST(p.Ref) {
 		return specs, nil
 	}
-	restArt, err := pl.arts.Dir(config.SvcPostgREST)
+	restArt, err := pl.artifactDir(p, config.SvcPostgREST)
 	if err != nil {
 		return nil, err
 	}

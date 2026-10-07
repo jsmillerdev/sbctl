@@ -184,6 +184,7 @@ func testRegistry(t *testing.T, r Registry) {
 	}
 
 	testBranches(t, r, org.ID)
+	testUpgrades(t, r, org.ID)
 
 	seen := map[string]bool{}
 	timeout := time.After(5 * time.Second)
@@ -382,5 +383,53 @@ func TestPostgresHasDashboardSSO(t *testing.T) {
 	}
 	if ok, _ := r.HasDashboardSSO(ctx); ok {
 		t.Fatal("a provider outlived its organization")
+	}
+}
+
+func testUpgrades(t *testing.T, r Registry, orgID int64) {
+	t.Helper()
+	ctx := context.Background()
+	const ref = "dddddddddddddddddddd"
+	if err := r.CreateProject(ctx, &Project{Ref: ref, OrgID: orgID, Name: "d"}); err != nil {
+		t.Fatal(err)
+	}
+	st := Upgrades(r)
+	if st == nil {
+		t.Fatal("registry has no UpgradeStore")
+	}
+	if _, err := st.LatestUpgrade(ctx, ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("latest before any upgrade: %v, want ErrNotFound", err)
+	}
+	t0 := time.Now().UTC().Truncate(time.Millisecond)
+	first := &Upgrade{TrackingID: "11111111-1111-4111-8111-111111111111", Ref: ref, From: map[string]string{"auth": "a1"}, To: map[string]string{"auth": "a2"},
+		TargetVersion: "17", Progress: "0_requested", InitiatedAt: t0, LatestStatusAt: t0}
+	if err := st.PutUpgrade(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	first.Status, first.Progress, first.BackupID, first.LatestStatusAt = UpgradeDone, "9_completed_upgrade", 7, t0.Add(time.Minute)
+	if err := st.PutUpgrade(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := &Upgrade{TrackingID: "22222222-2222-4222-8222-222222222222", Ref: ref, TargetVersion: "17", Status: UpgradeFailed, Progress: "5_initiated_data_upgrade",
+		Error: "5_data_upgrade_completion_failed", Detail: "gotrue did not start", InitiatedAt: t0.Add(time.Hour), LatestStatusAt: t0.Add(time.Hour)}
+	if err := st.PutUpgrade(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.LatestUpgrade(ctx, ref)
+	if err != nil || got.TrackingID != second.TrackingID || got.Status != UpgradeFailed || got.Error != second.Error || got.Detail != "gotrue did not start" {
+		t.Fatalf("latest = %+v, %v", got, err)
+	}
+	if len(got.From) != 0 || len(got.To) != 0 {
+		t.Fatalf("versions of an upgrade that set none: %v %v", got.From, got.To)
+	}
+	if err := st.PutUpgrade(ctx, &Upgrade{TrackingID: "33333333-3333-4333-8333-333333333333", Ref: "nope", InitiatedAt: t0, LatestStatusAt: t0}); err == nil {
+		t.Fatal("an upgrade of an unknown project was stored")
+	}
+	// A project's upgrades go with it.
+	if err := r.DeleteProject(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.LatestUpgrade(ctx, ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("upgrades survived their project: %v", err)
 	}
 }

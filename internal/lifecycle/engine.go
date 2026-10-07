@@ -78,6 +78,8 @@ type Engine struct {
 	locks sync.Map // ref -> *sync.Mutex
 	// restoring holds the refs whose in-place restore is running in this process (restore.go).
 	restoring sync.Map
+	// upgrading holds the refs whose upgrade is running in this process (upgrade.go).
+	upgrading sync.Map
 	// freeBytes reads the free space of the disk holding a path (-1: unknown); tests replace it.
 	freeBytes func(path string) int64
 }
@@ -552,6 +554,9 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 		// RESTORING with nothing in this map, and that project can still be deleted.
 		return fmt.Errorf("%w: cannot delete %s while a restore is running on it", ErrInvalidState, ref)
 	}
+	if _, busy := e.upgrading.Load(ref); busy {
+		return fmt.Errorf("%w: cannot delete %s while it is being upgraded", ErrInvalidState, ref)
+	}
 	if kids, err := e.branchesOf(ctx, ref); err != nil {
 		return err
 	} else if len(kids) > 0 {
@@ -957,6 +962,10 @@ const StatusDeleted registry.Status = "DELETED"
 //
 //   - PAUSING: the pause is finished (units stopped), status INACTIVE.
 //
+//   - UPGRADING: the units stop, the upgrade is marked failed (its backup id stays in its
+//     events), and the project becomes ACTIVE_UNHEALTHY, so that StartActive starts it on the
+//     versions the registry recorded, the previous ones.
+//
 //   - COMING_UP or RESTARTING with a route: the project was created before and a resume
 //     or restart was cut short; its units are stopped and it becomes INACTIVE, so that
 //     Resume can be run again.
@@ -1005,6 +1014,10 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 			} else {
 				to, note = registry.StatusInitFailed, "the daemon stopped before the project finished creating; delete it and create it again"
 			}
+		case registry.StatusUpgrading:
+			// The units may run versions the registry never recorded: stop them, and
+			// StartActive starts the project on the recorded ones.
+			to, note = registry.StatusActiveUnhealthy, "the daemon stopped during an upgrade; the project starts on its previous versions"
 		case registry.StatusGoingDown:
 			dp := e.deleteProgress(ctx, p.Ref)
 			switch {
@@ -1026,7 +1039,10 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 		}
 		cur, err := e.reg.GetProject(ctx, p.Ref)
 		if err == nil && cur.Status == p.Status {
-			if to == registry.StatusInactive {
+			switch {
+			case p.Status == registry.StatusUpgrading:
+				e.recoverUpgrade(ctx, p.Ref)
+			case to == registry.StatusInactive:
 				if serr := e.plane.Stop(ctx, p.Ref); serr != nil {
 					e.log.Warn("recover: stopping units", "ref", p.Ref, "error", serr)
 				}

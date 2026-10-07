@@ -29,6 +29,7 @@ const (
 	ReasonScheduled = "scheduled"
 	ReasonFinal     = "final"        // taken by project delete
 	ReasonRestore   = "post-restore" // taken right after an in-place restore, so the new timeline has a base
+	ReasonUpgrade   = "pre-upgrade"  // taken before a project's services are upgraded; it is the way back for the data
 )
 
 // Manifest describes one complete base backup. It lives next to the data and is the
