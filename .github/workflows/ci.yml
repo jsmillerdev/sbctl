@@ -39,5 +39,9 @@ jobs:
         run: test -z "$(gofmt -l $(git ls-files '*.go'))"
       - run: go vet ./...
       - run: go test -race -count=1 ./...
+      # The WAL relay's push path reads a network body from a goroutine; a data race there depends
+      # on timing, so the tests that cancel, truncate and replace sockets run many times under -race.
+      - name: relay race regression
+        run: go test -race -count=50 -run 'TestRelayTruncatedPushLeavesNothing|TestRelayCancelledAndTruncatedPushesDoNotRaceTheBody|TestRelayNeverReplacesASocketThatAnswers|TestRelayReconcileFollowsTheProjects|TestPushWALReaderStopsReadingBeforeItReturns' ./internal/backup
       - name: cross-build
         run: make build-linux

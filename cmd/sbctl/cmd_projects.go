@@ -175,7 +175,7 @@ func init() {
 		func(cmd *cobra.Command, n *lifecycle.Node, a []string) error {
 			// The final base backup waits for its WAL to be archived through the daemon's
 			// relay; serve the sockets nobody answers while the daemon is down.
-			_, stopRelay := app.StartWALRelay(cmd.Context(), n.Cfg, newLogger(n.Cfg), true)
+			_, stopRelay := app.StartWALRelay(cmd.Context(), n.Cfg, newLogger(n.Cfg), true, a[0])
 			defer stopRelay()
 			if err := n.Engine.DeleteWith(cmd.Context(), a[0], lifecycle.DeleteOptions{SkipFinalBackup: pSkipBackup}); err != nil {
 				return err

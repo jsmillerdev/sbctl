@@ -106,7 +106,7 @@ func init() {
 			if !validReason(createReason) {
 				return fmt.Errorf("--reason %q is not one of %s", createReason, strings.Join(reasons, ", "))
 			}
-			svc, closeFn, err := openBackupService(cmd.Context(), false)
+			svc, closeFn, err := openBackupService(cmd.Context(), false, []string{args[0]})
 			if err != nil {
 				return err
 			}
@@ -128,7 +128,7 @@ func init() {
 		Short: "List a project's base backups",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, closeFn, err := openBackupService(cmd.Context(), false)
+			svc, closeFn, err := openBackupService(cmd.Context(), false, nil)
 			if err != nil {
 				return err
 			}
@@ -177,7 +177,7 @@ func init() {
 			"kept backup's start. Without <ref> prunes every project.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, closeFn, err := openBackupService(cmd.Context(), false)
+			svc, closeFn, err := openBackupService(cmd.Context(), false, nil)
 			if err != nil {
 				return err
 			}
@@ -234,7 +234,7 @@ func init() {
 			if (restoreAs == "" || restoreAs == args[0]) && !restoreForce {
 				return backup.ErrForceRequired
 			}
-			svc, closeFn, err := openBackupService(cmd.Context(), true)
+			svc, closeFn, err := openBackupService(cmd.Context(), true, restoreRelayRefs(args[0], restoreAs))
 			if err != nil {
 				return err
 			}
@@ -265,7 +265,7 @@ func init() {
 			"promote and removes them. It does nothing harmful on a project that is already done.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, closeFn, err := openBackupService(cmd.Context(), false)
+			svc, closeFn, err := openBackupService(cmd.Context(), false, []string{args[0]})
 			if err != nil {
 				return err
 			}
@@ -287,10 +287,19 @@ var reasons = []string{backup.ReasonManual, backup.ReasonScheduled, backup.Reaso
 
 func validReason(r string) bool { return slices.Contains(reasons, r) }
 
+// restoreRelayRefs lists the projects a restore needs WAL relayed for: the source (its base
+// backup waits for archived WAL) and the clone, when there is one.
+func restoreRelayRefs(source, as string) []string {
+	if as == "" || as == source {
+		return []string{source}
+	}
+	return []string{source, as}
+}
+
 // openBackupService wires a Service from config, the registry and the master key.
 // withManager also builds the lifecycle engine for restore: it opens the whole node
 // (supervisor, artifacts, registry) as the daemon does.
-func openBackupService(ctx context.Context, withManager bool) (*backup.Service, func(), error) {
+func openBackupService(ctx context.Context, withManager bool, relayRefs []string) (*backup.Service, func(), error) {
 	cfg, err := loadConfig()
 	if err != nil {
 		return nil, nil, err
@@ -300,7 +309,12 @@ func openBackupService(ctx context.Context, withManager bool) (*backup.Service, 
 	// A base backup waits until its WAL is archived, and archiving goes through the
 	// daemon's relay: with the daemon down (or between restarts) this process serves
 	// the sockets nobody answers while it runs.
-	relay, stopRelay := app.StartWALRelay(ctx, cfg, opts.Log, true)
+	// Commands that only read the archive (list, prune) pass no refs and start no relay;
+	// the others serve the projects they work on and no others.
+	relay, stopRelay := (*backup.Relay)(nil), func() {}
+	if relayRefs != nil {
+		relay, stopRelay = app.StartWALRelay(ctx, cfg, opts.Log, true, relayRefs...)
+	}
 	if relay != nil {
 		// A restored clone starts in recovery and fetches WAL through its own socket at once:
 		// serve it before the cluster starts, not at the next sweep.

@@ -179,6 +179,19 @@ if inns test -e "$SBCTL_STATE/projects/$B/wal/r.sock"; then fail "$PGU sees the 
 [[ $(inns curl -sS -m 10 -o /dev/null -w '%{http_code}' --unix-socket "$SBCTL_STATE/projects/$A/wal/r.sock" -X POST --data-binary x \
   "http://relay/v1/wal/push?ref=$B&name=000000010000000000000001") == 403 ]] || fail "$A's relay accepted a push for $B"
 
+# The relay also checks who is on the other end (SO_PEERCRED and the peer's cgroup), because
+# another unit can reach this socket through /proc/<pid>/root. A curl moved into $B's postgres cgroup
+# sees $A's socket path (this shell's mount namespace) but is refused; one in $A's cgroup is served.
+relay_ping_from_unit() { # UNIT: prints the HTTP status of a ping to $A's relay from a process in UNIT's cgroup, 000 if refused
+  local cg; cg=$(systemctl show -p ControlGroup --value "$1")
+  [[ -n $cg && -w /sys/fs/cgroup$cg/cgroup.procs ]] || fail "$1: no writable cgroup ($cg)"
+  bash -c 'echo $$ >"$1" && exec curl -sS -m 5 -o /dev/null -w "%{http_code}" --unix-socket "$2" http://relay/v1/ping' _ \
+    "/sys/fs/cgroup$cg/cgroup.procs" "$SBCTL_STATE/projects/$A/wal/r.sock" 2>/dev/null || true
+}
+[[ $(relay_ping_from_unit "$PGU") == 204 ]] || fail "$A's own postgres unit is refused by its relay"
+[[ $(relay_ping_from_unit "sb-postgres@$B.service") != 204 ]] || fail "the relay of $A served a process of $B's postgres unit"
+[[ $(relay_ping_from_unit "sb-postgrest@$A.service") != 204 ]] || fail "the relay of $A served a process of its PostgREST unit"
+
 log "WAL archiving fails closed when the daemon is down, and resumes when it is back"
 systemctl stop sbctl.service
 SEG2=$(switch_wal "$A") || fail "$A: could not switch WAL"
@@ -231,6 +244,14 @@ SEGC=$(switch_wal "$C")
 wait_archived "$C" "$SEGC" 90 || fail "$C: WAL of a project created through the API was not archived"
 papi DELETE "/v1/projects/$C" -o /dev/null -m 900 || fail "$C: delete through the API"
 
+# The units that hold the master key keep a capability in their permitted set, so a tenant unit (no
+# capabilities) fails the kernel's ptrace check on their /proc/<pid>/environ and /proc/<pid>/root.
+for u in sbctl.service "sb-basebackup@$A.service" sb-basebackup-prune.service; do
+  [[ $(systemctl show -p AmbientCapabilities --value "$u") == *cap_net_bind_service* ]] || fail "$u lost the capability that hides its /proc from tenant units"
+done
+for u in "sb-postgres@$A.service" "sb-gotrue@$A.service" "sb-postgrest@$A.service"; do
+  [[ -z $(systemctl show -p AmbientCapabilities --value "$u") ]] || fail "$u holds a capability"
+done
 log "nightly backup: the sb-basebackup@$A service runs as the timer would"
 systemctl start "sb-basebackup@$A.service" || { journalctl --no-pager -u "sb-basebackup@$A" | tail -30 >&2; fail "$A: sb-basebackup service failed"; }
 [[ $(sbctl backups list "$A" | grep -c completed) -ge 1 ]] || { sbctl backups list "$A" >&2 || true; fail "$A: no completed base backup after the backup service ran"; }

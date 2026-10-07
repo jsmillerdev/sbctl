@@ -15,13 +15,14 @@ import (
 //
 // The daemon calls it with cli false. A command-line process that has to wait for WAL to
 // be archived (`sbctl backups create`, a delete's final base backup) calls it with cli
-// true while the daemon may be down: it serves only the sockets that nobody answers, and
-// looks for them more often.
+// true while the daemon may be down: it serves only the sockets that nobody answers (a
+// relay never replaces one that answers) and looks for them more often. refs names the
+// projects the command works on; without refs a CLI relay serves every project.
 //
 // The backend is opened on the first request that needs it and again after a failure, so
 // a bucket that is unreachable at boot keeps neither the daemon from starting nor the
 // relay from recovering.
-func StartWALRelay(ctx context.Context, cfg *config.Config, log *slog.Logger, cli bool) (*backup.Relay, func()) {
+func StartWALRelay(ctx context.Context, cfg *config.Config, log *slog.Logger, cli bool, refs ...string) (*backup.Relay, func()) {
 	if !cfg.WALRelayEnabled() {
 		return nil, func() {}
 	}
@@ -39,7 +40,10 @@ func StartWALRelay(ctx context.Context, cfg *config.Config, log *slog.Logger, cl
 		},
 	}
 	if cli {
-		o.SkipServed, o.Interval = true, time.Second
+		o.Interval = time.Second
+		if len(refs) > 0 {
+			o.Only = refs
+		}
 	}
 	relay := backup.NewRelay(o)
 	rctx, stopRun := context.WithCancel(context.WithoutCancel(ctx))

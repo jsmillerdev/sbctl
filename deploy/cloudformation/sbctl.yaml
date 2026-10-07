@@ -526,7 +526,22 @@ Resources:
               # The volume already holds an install (an instance that was replaced): recreate the user
               # with the uid that owns the files. The installer then runs as a repair and keeps the master key.
               echo "the data volume holds an earlier install (owner uid $OWNER_UID): repairing it, keeping the master key"
-              getent group "$OWNER_GID" >/dev/null || groupadd --system --gid "$OWNER_GID" sbctl
+              # The ids come from the old instance; a package on this image may have taken one of them.
+              # Stop with the reason: units run as User=sbctl Group=sbctl, so a different primary group
+              # or a different uid would leave the volume unreadable. Fix: chown -R the volume to a free
+              # uid and gid, then update the stack again.
+              HOLDER=$(getent group "$OWNER_GID" | cut -d: -f1)
+              if [ -n "$HOLDER" ] && [ "$HOLDER" != sbctl ]; then
+                fail "gid $OWNER_GID of the data volume is taken by group $HOLDER on this image"
+              fi
+              if [ -z "$HOLDER" ]; then
+                getent group sbctl >/dev/null && fail "group sbctl exists with another gid than the volume's $OWNER_GID"
+                groupadd --system --gid "$OWNER_GID" sbctl || fail "cannot create group sbctl with gid $OWNER_GID"
+              fi
+              HOLDER=$(getent passwd "$OWNER_UID" | cut -d: -f1)
+              if [ -n "$HOLDER" ]; then
+                fail "uid $OWNER_UID of the data volume is taken by user $HOLDER on this image"
+              fi
               useradd --system --uid "$OWNER_UID" --gid "$OWNER_GID" --home-dir /var/lib/sbctl --no-create-home \
                 --shell /usr/sbin/nologin sbctl || fail "cannot recreate the sbctl user with uid $OWNER_UID"
             fi

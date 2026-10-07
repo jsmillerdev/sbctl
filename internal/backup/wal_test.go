@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -222,5 +225,50 @@ func TestParseWALName(t *testing.T) {
 	}
 	if _, ok := parseWALName("nonsense"); ok {
 		t.Error("parseWALName accepted nonsense")
+	}
+}
+
+// failPutStore fails every Put at once, without reading.
+type failPutStore struct{ Store }
+
+func (failPutStore) Put(context.Context, string, io.Reader) error { return errors.New("put failed") }
+
+// slowReader blocks in Read until released, and records whether a Read is in progress.
+type slowReader struct {
+	in          atomic.Bool
+	release     chan struct{}
+	interrupted atomic.Bool
+	once        sync.Once
+}
+
+func (r *slowReader) Read(p []byte) (int, error) {
+	r.in.Store(true)
+	defer r.in.Store(false)
+	<-r.release
+	return 0, io.ErrUnexpectedEOF
+}
+
+func (r *slowReader) Interrupt() {
+	r.interrupted.Store(true)
+	r.once.Do(func() { close(r.release) })
+}
+
+// PushWALReader returns only when nothing reads its reader any more, and it interrupts a
+// reader that can be stuck in a Read (the relay's request body).
+func TestPushWALReaderStopsReadingBeforeItReturns(t *testing.T) {
+	e := newTestEnv(t)
+	svc, err := New(Options{Config: e.cfg, Registry: e.reg, Store: failPutStore{e.store}, Secrets: e.sec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &slowReader{release: make(chan struct{})}
+	if err := svc.PushWALReader(context.Background(), testRef, walA, r); err == nil {
+		t.Fatal("push succeeded although the store failed")
+	}
+	if r.in.Load() {
+		t.Fatal("PushWALReader returned while its reader was still being read")
+	}
+	if !r.interrupted.Load() {
+		t.Fatal("a blocked reader was not interrupted")
 	}
 }

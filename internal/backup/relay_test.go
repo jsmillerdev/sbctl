@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -291,22 +292,111 @@ func TestRelayReconcileFollowsTheProjects(t *testing.T) {
 	}
 }
 
-func TestRelaySkipServedLeavesAnotherRelaysSocketAlone(t *testing.T) {
+// A relay never replaces a socket that answers, so the daemon's relay and a CLI relay
+// (which serves while the daemon is down) do not delete each other's socket on every
+// reconcile. The one that listens first keeps the project until it stops.
+func TestRelayNeverReplacesASocketThatAnswers(t *testing.T) {
 	re := newRelayEnv(t, testRef)
 	other := NewRelay(RelayOptions{
-		Config: re.cfg, SkipServed: true,
+		Config:  re.cfg,
 		Service: func(context.Context) (*Service, error) { return re.svc, nil },
 		Refs:    func() []string { return []string{testRef} },
 		Socket:  func(ref string) string { return re.sock(ref) },
 		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	t.Cleanup(other.Close)
-	other.Reconcile()
+	first, ok := socketID(re.sock(testRef))
+	if !ok {
+		t.Fatal("no socket")
+	}
+	for i := range 6 {
+		other.Reconcile()
+		re.relay.Reconcile()
+		if id, ok := socketID(re.sock(testRef)); !ok || id != first {
+			t.Fatalf("the socket was replaced in alternating reconcile %d", i)
+		}
+	}
 	if got := other.Served(); len(got) != 0 {
-		t.Fatalf("a relay that skips served projects took over %v", got)
+		t.Fatalf("a relay took over %v while another one answered", got)
 	}
 	if err := RelayPing(context.Background(), re.sock(testRef)); err != nil {
 		t.Fatalf("the first relay stopped answering: %v", err)
+	}
+	// When the first relay stops, the second serves the project at its next reconcile.
+	re.relay.Close()
+	if _, ok := socketID(re.sock(testRef)); ok {
+		t.Fatal("the stopped relay left its socket behind")
+	}
+	other.Reconcile()
+	if err := RelayPing(context.Background(), re.sock(testRef)); err != nil {
+		t.Fatalf("the second relay did not take over: %v", err)
+	}
+	// A stopped relay's late shutdown must not unlink the socket that now belongs to another.
+	stale := &relayListener{srv: &http.Server{}, path: re.sock(testRef)}
+	stale.shutdown()
+	if err := RelayPing(context.Background(), re.sock(testRef)); err != nil {
+		t.Fatalf("a stale listener removed another relay's socket: %v", err)
+	}
+}
+
+// A CLI relay with Only serves the projects it names and the ones Ensure names, nothing else.
+func TestRelayOnlyServesTheNamedProjects(t *testing.T) {
+	e := newTestEnv(t)
+	dir, _ := os.MkdirTemp("/tmp", "sbr")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	r := NewRelay(RelayOptions{
+		Config:  e.cfg,
+		Service: func(context.Context) (*Service, error) { return e.svc, nil },
+		Refs:    func() []string { return []string{testRef, testRef2} },
+		Only:    []string{testRef},
+		Socket:  func(ref string) string { return filepath.Join(dir, ref[:6]+".sock") },
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	t.Cleanup(r.Close)
+	r.Reconcile()
+	if got := r.Served(); len(got) != 1 || got[0] != testRef {
+		t.Fatalf("served = %v, want only %s", got, testRef)
+	}
+	if err := r.Ensure(testRef2); err != nil {
+		t.Fatal(err)
+	}
+	r.Reconcile()
+	if got := r.Served(); len(got) != 2 {
+		t.Fatalf("a project that Ensure named is dropped by the next reconcile: %v", got)
+	}
+}
+
+// A push that fails or is cancelled while the client is still sending must not leave the
+// handler reading the request body after it answers (run under -race).
+func TestRelayCancelledAndTruncatedPushesDoNotRaceTheBody(t *testing.T) {
+	re := newRelayEnv(t, testRef)
+	for i := range 20 {
+		name := fmt.Sprintf("0000000100000000%08X", i+16)
+		ctx, cancel := context.WithCancel(context.Background())
+		pr, pw := io.Pipe()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://relay"+relayPushPath+"?name="+name+"&ref="+testRef, pr)
+		req.ContentLength = 4 << 20
+		go func() {
+			pw.Write(make([]byte, 64<<10))
+			time.Sleep(time.Duration(i%5) * time.Millisecond)
+			cancel()
+			pw.CloseWithError(io.ErrClosedPipe)
+		}()
+		if resp, err := relayClient(re.sock(testRef)).Do(req); err == nil {
+			resp.Body.Close()
+		}
+		conn, err := net.Dial("unix", re.sock(testRef))
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.WriteString(conn, "POST "+relayPushPath+"?name="+name+" HTTP/1.1\r\nHost: relay\r\nContent-Length: 1048576\r\n\r\n")
+		conn.Write(make([]byte, 1000+i))
+		conn.Close()
+	}
+	time.Sleep(200 * time.Millisecond)
+	ents, _ := re.store.List(context.Background(), walKey(testRef, ""))
+	if len(ents) != 0 {
+		t.Fatalf("cancelled or truncated pushes left %d archived files", len(ents))
 	}
 }
 

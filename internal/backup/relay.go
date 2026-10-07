@@ -52,6 +52,9 @@ const (
 	relayMaxWAL = 1 << 30
 	// relayConcurrency bounds the transfers served at once across every project.
 	relayConcurrency = 16
+	// relayDrainTimeout bounds how long a push handler reads the unread rest of a request
+	// body before it answers.
+	relayDrainTimeout = 5 * time.Second
 	// relayDefaultInterval is how often the daemon looks for projects whose relay it does not serve yet.
 	relayDefaultInterval = 3 * time.Second
 )
@@ -71,10 +74,13 @@ type RelayOptions struct {
 	// Sources returns the other projects whose archive ref may fetch from (the source of
 	// a restore to a new project). Default: the lines of config.Paths.RestoreSources(ref).
 	Sources func(ref string) []string
-	// SkipServed makes the relay leave alone a project whose socket already answers
-	// (another process serves it). A CLI command that needs WAL archived while the daemon
-	// is down starts a relay with it; the daemon never sets it.
-	SkipServed bool
+	// Only restricts the relay to these projects plus any that Ensure names (a CLI command
+	// that needs WAL archived for the projects it works on while the daemon is down). Nil
+	// serves every project Refs lists, as the daemon does.
+	Only []string
+	// PeerCheck decides whether the process on the other end of a connection to ref's
+	// socket may use it. Default: the systemd unit of the peer (relay_peer.go).
+	PeerCheck func(c net.Conn, ref string) error
 	// Interval is how often Run looks for projects to serve (default 3 seconds).
 	Interval time.Duration
 	Log      *slog.Logger
@@ -85,9 +91,14 @@ type Relay struct {
 	opt RelayOptions
 	sem chan struct{}
 
-	mu   sync.Mutex
-	ls   map[string]*relayListener
-	done bool
+	// A relay never replaces a socket that answers: the daemon and a CLI relay (which serves
+	// while the daemon is down) can run at once, and the one that listens first keeps the
+	// project until it stops.
+	mu     sync.Mutex // guards ls, pinned, refMu and done; never held across I/O
+	ls     map[string]*relayListener
+	pinned map[string]bool
+	refMu  map[string]*sync.Mutex
+	done   bool
 
 	// svcMu guards svc and is held while the backend opens (up to the factory's timeout),
 	// which must not block Ensure and Reconcile.
@@ -110,6 +121,9 @@ func NewRelay(o RelayOptions) *Relay {
 	if o.Interval <= 0 {
 		o.Interval = relayDefaultInterval
 	}
+	if o.PeerCheck == nil {
+		o.PeerCheck = checkRelayPeer
+	}
 	if o.Socket == nil && o.Config != nil {
 		o.Socket = o.Config.Paths().WALSocket
 	}
@@ -119,7 +133,7 @@ func NewRelay(o RelayOptions) *Relay {
 	if o.Sources == nil && o.Config != nil {
 		o.Sources = func(ref string) []string { return readRestoreSources(o.Config, ref) }
 	}
-	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), ls: map[string]*relayListener{}}
+	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), ls: map[string]*relayListener{}, pinned: map[string]bool{}, refMu: map[string]*sync.Mutex{}}
 }
 
 // projectsWithWALDir lists the refs that have a WAL directory under projects/.
@@ -178,6 +192,9 @@ func (r *Relay) Run(ctx context.Context) error {
 func (r *Relay) Reconcile() {
 	want := map[string]bool{}
 	for _, ref := range r.opt.Refs() {
+		if r.opt.Only != nil && !slices.Contains(r.opt.Only, ref) && !r.isPinned(ref) {
+			continue
+		}
 		want[ref] = true
 		if err := r.Ensure(ref); err != nil {
 			r.opt.Log.Warn("wal relay: cannot serve project", "ref", ref, "error", err)
@@ -189,6 +206,7 @@ func (r *Relay) Reconcile() {
 		if !want[ref] {
 			gone = append(gone, l)
 			delete(r.ls, ref)
+			delete(r.pinned, ref)
 		}
 	}
 	r.mu.Unlock()
@@ -197,9 +215,16 @@ func (r *Relay) Reconcile() {
 	}
 }
 
+func (r *Relay) isPinned(ref string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pinned[ref]
+}
+
 // Ensure makes ref's socket answer now (the lifecycle engine calls it before a cluster
 // starts, so the first archive_command does not wait for the next Reconcile). It does
-// nothing when the project's WAL directory does not exist.
+// nothing when the project's WAL directory does not exist, and leaves a socket alone that
+// another process already serves.
 func (r *Relay) Ensure(ref string) error {
 	if err := validRef(ref); err != nil {
 		return err
@@ -208,21 +233,39 @@ func (r *Relay) Ensure(ref string) error {
 	if fi, err := os.Stat(filepath.Dir(path)); err != nil || !fi.IsDir() {
 		return nil
 	}
+	// One Ensure per project at a time; the relay-wide lock is held only to read and
+	// change the maps, never across the ping, a shutdown or a listen.
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.done {
+		r.mu.Unlock()
 		return errors.New("relay closed")
 	}
-	if l := r.ls[ref]; l != nil {
+	rl := r.refMu[ref]
+	if rl == nil {
+		rl = &sync.Mutex{}
+		r.refMu[ref] = rl
+	}
+	r.mu.Unlock()
+	rl.Lock()
+	defer rl.Unlock()
+
+	r.mu.Lock()
+	l := r.ls[ref]
+	r.mu.Unlock()
+	if l != nil {
 		if id, ok := socketID(path); ok && id == l.ino {
 			return nil
 		}
 		// The socket file was removed or replaced (the directory was recreated): serve again.
+		r.mu.Lock()
+		if r.ls[ref] == l {
+			delete(r.ls, ref)
+		}
+		r.mu.Unlock()
 		l.shutdown()
-		delete(r.ls, ref)
 	}
-	if r.opt.SkipServed && RelayPing(context.Background(), path) == nil {
-		return nil
+	if RelayPing(context.Background(), path) == nil {
+		return nil // another process serves this project
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
@@ -231,8 +274,13 @@ func (r *Relay) Ensure(ref string) error {
 	if err != nil {
 		return err
 	}
+	// The relay unlinks its socket itself, and only while the path is still its own
+	// (relayListener.shutdown): the runtime's unlink on Close would remove another
+	// process's socket that replaced ours.
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
 	if err := os.Chmod(path, 0o600); err != nil {
 		ln.Close()
+		os.Remove(path)
 		return err
 	}
 	id, _ := socketID(path)
@@ -241,10 +289,23 @@ func (r *Relay) Ensure(ref string) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(r.opt.Log.Handler(), slog.LevelDebug),
 	}
-	l := &relayListener{ln: ln, srv: srv, path: path, ino: id}
-	r.ls[ref] = l
+	nl := &relayListener{ln: ln, srv: srv, path: path, ino: id}
+	r.mu.Lock()
+	if r.done {
+		r.mu.Unlock()
+		nl.shutdown()
+		return errors.New("relay closed")
+	}
+	r.ls[ref] = nl
+	if r.opt.Only != nil {
+		r.pinned[ref] = true
+	}
+	r.mu.Unlock()
 	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		pl := peerListener{Listener: ln,
+			check: func(c net.Conn) error { return r.opt.PeerCheck(c, ref) },
+			deny:  func(err error) { r.opt.Log.Warn("wal relay: connection refused", "ref", ref, "error", err) }}
+		if err := srv.Serve(pl); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			r.opt.Log.Warn("wal relay: listener stopped", "ref", ref, "error", err)
 		}
 	}()
@@ -285,7 +346,8 @@ func (l *relayListener) shutdown() {
 	if err := l.srv.Shutdown(ctx); err != nil {
 		l.srv.Close()
 	}
-	// Close unlinks the socket only if it is still ours; a replacement is left alone.
+	// The listener does not unlink on close (SetUnlinkOnClose(false)): remove the socket
+	// only if the path still names our inode; a replacement is left alone.
 	if id, ok := socketID(l.path); ok && id == l.ino {
 		os.Remove(l.path)
 	}
@@ -363,10 +425,14 @@ func (r *Relay) push(own string, w http.ResponseWriter, req *http.Request) {
 	defer func() { <-r.sem }()
 	// The body is read to its declared length or the push fails: a client that dies
 	// halfway cannot leave a short segment in the archive.
-	body := http.MaxBytesReader(w, req.Body, relayMaxWAL)
+	rc := http.NewResponseController(w)
+	body := &pushBody{r: http.MaxBytesReader(w, req.Body, relayMaxWAL), rc: rc}
 	err = svc.PushWALReader(req.Context(), own, name, body)
-	// Read what is left (a comparison with the archived file stops at the first difference):
-	// a client that is still writing when the answer comes would see a broken pipe, not the answer.
+	// PushWALReader returns only after nothing reads body any more, so this drain cannot
+	// race with it. Read what is left (a comparison with the archived file stops at the
+	// first difference): a client that is still writing when the answer comes would see a
+	// broken pipe, not the answer. A client that stalls gets a few seconds, not the handler.
+	_ = rc.SetReadDeadline(time.Now().Add(relayDrainTimeout))
 	_, _ = io.Copy(io.Discard, body)
 	switch {
 	case err == nil:
@@ -379,6 +445,18 @@ func (r *Relay) push(own string, w http.ResponseWriter, req *http.Request) {
 		relayError(w, http.StatusInternalServerError, err.Error())
 	}
 }
+
+// pushBody is the request body of a push. Interrupt makes a Read that is blocked on a
+// slow or stalled client return, so PushWALReader can stop reading before it returns.
+type pushBody struct {
+	r  io.Reader
+	rc *http.ResponseController
+}
+
+func (b *pushBody) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+// Interrupt fails every pending and later read of the connection until the deadline is set again.
+func (b *pushBody) Interrupt() { _ = b.rc.SetReadDeadline(time.Now()) }
 
 func (r *Relay) fetch(own string, w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()

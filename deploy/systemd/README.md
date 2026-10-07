@@ -64,12 +64,36 @@ share one uid, and the kernel lets a process of a uid open `/proc/<pid>/environ`
 `/proc/<pid>/root` of every other process of that uid. A compromised GoTrue or PostgREST of
 project A can therefore read `/proc/<postgres-pid-of-B>/root/...` (B's data directory) and the
 environment of every other unit: B's JWT secret and database passwords sit in the environment
-of B's GoTrue and PostgREST, and the daemon's `/proc/<pid>/root` shows everything the daemon
-sees (the master key, the config, every backup). A file-read bug in a service reaches the same
+of B's GoTrue and PostgREST. A file-read bug in a service reaches the same
 files (a path traversal can read `/proc/<pid>/environ`). `TemporaryFileSystem`, `BindPaths` and
 `InaccessiblePaths` do not stop any of that, and no unit option available on Ubuntu 22.04,
 24.04 and Debian 12 (systemd 249 to 255) does: `ProtectProc=invisible` hides only other users'
 processes, and `PrivatePIDs=` needs systemd 257.
+
+The processes that hold the master key, the config and the backend credentials are the
+exception, by a kernel rule: `ptrace_may_access` (which guards `/proc/<pid>/environ` and
+`/proc/<pid>/root`) refuses a caller of the same uid when the target holds a permitted
+capability the caller lacks. Every `sb-*` unit that runs tenant code has an empty capability
+set, and `sbctl.service`, `sb-basebackup@.service` and `sb-basebackup-prune.service` hold
+`CAP_NET_BIND_SERVICE` in theirs (`CapabilityBoundingSet=` and `AmbientCapabilities=`), so a
+tenant unit cannot read their environment, their `/proc/<pid>/root` (`/etc/sbctl/master.key`,
+`config.toml`) or their memory. The daemon needs the capability for its listeners on ports 80
+and 443; the backup units carry it only for this check. Do not remove it from these units, and do
+not give it to a unit that runs tenant code. (`tests/linux/systemd-smoke.sh` reads the capability
+sets from systemd; the kernel rule is described in `ptrace(2)`.) The processes that stay readable
+from another unit are therefore the tenant-facing ones: every project's Postgres, GoTrue and
+PostgREST, and the fleet services.
+
+The WAL relay does not rely on the mount namespace alone, because a process of any unit can
+open another project's socket through `/proc/<pid-of-that-postmaster>/root/...`. On every
+connection the relay reads the peer's pid (`SO_PEERCRED`) and its cgroup
+(`/proc/<pid>/cgroup`), and serves only a peer in `sb-postgres@<ref>.service` for the socket of
+`<ref>`, in a `sb-basebackup` unit, or outside every `sb-*` unit (the daemon, an operator's
+shell). Any other `sb-*` unit gets a closed connection, so a tenant cannot push a bogus file under
+a future segment name or read another project's archive. A tenant cannot move itself into another
+unit's cgroup. Where the cgroup cannot be read, the peer is refused. The check is
+`internal/backup/relay_peer.go`; `systemd-smoke.sh` moves a `curl` into other units' cgroups and
+expects it to be refused.
 
 So the controls above close the paths that do not go through `/proc`: plain file reads, the
 metadata service, the backup credentials and the other projects' archives. They do not make a
@@ -106,6 +130,8 @@ the unit gets back only:
 | `sb-postgres@<ref>` | `artifacts/`, `projects/<ref>/postgres.run`, `projects/<ref>/wal/` (the relay socket; connecting needs no write access) | `projects/<ref>/postgres/`, `artifacts/postgres/` (the launcher chmods a script there on first boot) |
 | `sb-gotrue@<ref>`, `sb-postgrest@<ref>` | `artifacts/`, `projects/<ref>/<svc>.run` | `projects/<ref>/<svc>/` |
 | fleet singletons | `artifacts/`, `projects/system/<svc>.run` | `system/<svc>/` (optional: create it first); Studio also `artifacts/studio/` |
+| `sb-basebackup@<ref>` | `projects/system/postgres/sock` (the registry), `projects/<ref>/postgres/` (the data directory it archives) | `projects/<ref>/wal/` (a CLI relay's socket while the daemon is down), `backups/` (the file backend; absent on S3) |
+| `sb-basebackup-prune` | `projects/system/postgres/sock` | `backups/` |
 
 No template binds a project or system directory as a whole, none needs to read an environment file
 (systemd, PID 1, reads `EnvironmentFile=` before it builds the namespace), and none sees `/etc/sbctl`,

@@ -90,8 +90,13 @@ func (s *Service) PushWALReader(ctx context.Context, ref, name string, r io.Read
 		return err
 	}
 
+	// The compressor goroutine is the only reader of r while it runs, and this function
+	// does not return before it has stopped: the caller may read r afterwards (the relay
+	// drains the request body) without racing it.
 	pr, pw := io.Pipe()
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		enc, err := newEncoder(pw, 1)
 		if err == nil {
 			if _, err = io.Copy(enc, ctxReader{ctx, r}); err == nil {
@@ -103,9 +108,19 @@ func (s *Service) PushWALReader(ctx context.Context, ref, name string, r io.Read
 		pw.CloseWithError(err)
 	}()
 	err := st.Put(ctx, key, pr)
-	pr.CloseWithError(err) // unblock the compressor if Put returned early
+	pr.CloseWithError(err) // unblock the compressor's next write if Put returned early
+	if err != nil {
+		if i, ok := r.(readInterrupter); ok {
+			i.Interrupt() // ... and its current read, if r can be stuck in one
+		}
+	}
+	<-done
 	return err
 }
+
+// readInterrupter is implemented by a reader that can be blocked indefinitely (a network
+// body): Interrupt makes the pending Read return.
+type readInterrupter interface{ Interrupt() }
 
 // sameAsArchived reports whether the object at key decompresses to exactly the bytes of r.
 func (s *Service) sameAsArchived(ctx context.Context, key string, r io.Reader) (bool, error) {
