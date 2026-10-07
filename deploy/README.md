@@ -143,7 +143,7 @@ The script runs `aws cloudformation deploy`, waits, then prints the dashboard UR
 
 - `--dry-run` prints the exact `aws` commands, including the lookups it would make first (does the stack exist, which image does it run), and runs none.
 - Running it again with the same `--stack-name` updates the stack. The script passes the image the instance already runs, so an update does not replace the instance when Canonical publishes a newer Ubuntu image.
-- `--delete` stops the instance, then deletes the stack, after a warning and a confirmation (see [Tear down](#tear-down)).
+- `--delete` stops the instance (when the stack has one), then deletes the stack, after a warning and a confirmation (see [Tear down](#tear-down)).
 
 From a checkout, the script is `deploy/aws/deploy.sh` and finds the template by itself.
 
@@ -286,7 +286,7 @@ One Ubuntu 24.04 instance (Graviton by default), an Elastic IP, a data volume fo
 | `AdminEmail` | The only required field. Contact address for the Let's Encrypt account. |
 | `InstanceType` | Default `t4g.large`. See [Sizing](#sizing). |
 | `DataVolumeSize` | GiB for project data (default 100). |
-| `DailySnapshotsKept` | Daily snapshots of the data volume to keep (default 7; `0` takes none and creates no policy). See [Backups and restore](#backups-and-restore). |
+| `DailySnapshotsKept` | Daily snapshots of the data volume to keep, a whole number from 0 to 1000 (default 7; `0` takes none and creates no policy). See [Backups and restore](#backups-and-restore). |
 | `SbctlVersion` | `latest`, or a release tag. The template of a release names that release. |
 | `DomainName`, `HostedZoneId` | See [Domain and DNS](#domain-and-dns). |
 | `AccessCidr` | Who may reach ports 80, 443, 5432 and 6543 (default everyone; port 80 must stay open for HTTP-01 without a hosted zone). |
@@ -357,7 +357,7 @@ Deleting the stack never deletes your data silently:
 | Daily snapshots of the data volume | **Kept, and no longer pruned.** The stack deletes the lifecycle policy, and deleting a policy does not delete the snapshots it made. Delete the ones you do not need (`aws ec2 delete-snapshot`). |
 | Instance, Elastic IP, security group, role, claim-token secret, DNS records, a VPC the stack made | Deleted. |
 
-Stop the instance before you delete the stack. The final snapshot is taken from the volume when the stack deletes it, and a snapshot of a running node is only crash-consistent (see [Backups and restore](#backups-and-restore)). `./sbctl-aws-deploy.sh --region <region> --stack-name sbctl --delete` does it: it prints the bucket, volume and instance, asks you to type the stack name, stops the instance, waits until it is stopped, and only then deletes the stack (it keeps the stack if the instance does not stop). In the console, stop the instance first (EC2, select the instance from the `InstanceId` output, **Instance state**, **Stop instance**; wait for **Stopped**), then in CloudFormation select the stack and choose **Delete**. Afterwards, find the snapshots, the final one and the daily ones:
+Stop the instance before you delete the stack. The final snapshot is taken from the volume when the stack deletes it, and a snapshot of a running node is only crash-consistent (see [Backups and restore](#backups-and-restore)). `./sbctl-aws-deploy.sh --region <region> --stack-name sbctl --delete` does it: it prints the bucket, volume and instance, asks you to type the stack name, stops the instance, waits until it is stopped, and only then deletes the stack (it keeps the stack if the instance does not stop). A stack whose first launch failed (`ROLLBACK_COMPLETE` or `CREATE_FAILED`) has no instance and no outputs: the script says so, stops nothing and deletes the stack; `cloudformation deploy` cannot update such a stack, so deleting it is the way to try again. In the console, stop the instance first (EC2, select the instance from the `InstanceId` output, **Instance state**, **Stop instance**; wait for **Stopped**), then in CloudFormation select the stack and choose **Delete**. Afterwards, find the snapshots, the final one and the daily ones:
 
 ```bash
 aws ec2 describe-snapshots --region <region> --owner-ids self \
@@ -366,7 +366,7 @@ aws ec2 describe-snapshots --region <region> --owner-ids self \
 
 **Bring the node back.** Create a new stack with `DataSnapshotId` set to that snapshot (`--data-snapshot-id snap-...`) and `DataVolumeSize` at least the snapshot's size. User data finds the earlier install on the volume and the installer runs as a repair that keeps the master key, the registry and the projects. The new stack makes a new bucket and a new Elastic IP, so update DNS if you manage it yourself; the new node writes new backups to the new bucket, and the old bucket still holds the older archives.
 
-The existing administrator keeps working: the accounts are in the registry on the volume, so sign in at the new `DashboardUrl` as before. The repair issues no claim token, so the new stack's claim-token secret does not hold one: user data replaces its placeholder with a note, and `ClaimTokenCommand` prints that note. When you need a token (nobody can sign in, or the node was never claimed), open a shell (`ConnectCommand`) and run `sudo -u sbctl sbctl claim token --force` (without `--force` while nobody has claimed); it prints a token, which you enter at `ClaimUrl` as in [First login](#first-login).
+The existing administrator keeps working: the accounts are in the registry on the volume, so sign in at the new `DashboardUrl` as before. The repair issues no claim token when the volume's node is already claimed, so the new stack's claim-token secret does not hold one: user data replaces its placeholder with a note, and `ClaimTokenCommand` prints that note. When the volume's node was never claimed, user data leaves the secret as it is (the placeholder, or the token of an earlier boot of the same stack, which may still be valid), because the secret can hold the only copy of a live token. When you need a token (nobody can sign in, or the node was never claimed), open a shell (`ConnectCommand`) and run `sudo -u sbctl sbctl claim token --force` (without `--force` while nobody has claimed); it prints a token, which you enter at `ClaimUrl` as in [First login](#first-login).
 
 **Delete everything.** After the stack is gone, delete the snapshot (`aws ec2 delete-snapshot`) and empty and delete the bucket (it is versioned: remove all versions, for example with the S3 console's **Empty** button) when you no longer need them.
 

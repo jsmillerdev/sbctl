@@ -479,11 +479,27 @@ func TestDailySnapshotsOfTheDataVolume(t *testing.T) {
 
 	// The knob: 7 by default, 0 turns the policy and its role off.
 	count := get(t, d, "Parameters", "DailySnapshotsKept")
-	if get(t, count, "Type") != "Number" || get(t, count, "Default") != 7 || get(t, count, "MinValue") != 0 {
-		t.Errorf("DailySnapshotsKept must be a Number from 0 with default 7: %v", count)
+	// A String with a pattern, so that the console refuses 7.5 and 00 (a Number would take them
+	// and fail at the policy, and 00 would slip past the comparison with "0").
+	if get(t, count, "Type") != "String" || get(t, count, "Default") != "7" {
+		t.Errorf("DailySnapshotsKept must be a String with default \"7\": %v", count)
 	}
-	if max := get(t, count, "MaxValue"); max != 1000 {
-		t.Errorf("DailySnapshotsKept maximum is %v: a Data Lifecycle Manager schedule keeps at most 1000", max)
+	pat := regexp.MustCompile(fmt.Sprint(get(t, count, "AllowedPattern")))
+	for _, ok := range []string{"0", "1", "7", "99", "100", "999", "1000"} {
+		if !pat.MatchString(ok) {
+			t.Errorf("DailySnapshotsKept must accept %q", ok)
+		}
+	}
+	for _, bad := range []string{"", "00", "01", "7.5", "-1", "1001", "10000", "1e2", " 7", "7 ", "seven"} {
+		if pat.MatchString(bad) {
+			t.Errorf("DailySnapshotsKept must refuse %q (a schedule keeps a whole number from 1 to 1000)", bad)
+		}
+	}
+	if cd, _ := get(t, count, "ConstraintDescription").(string); cd == "" {
+		t.Error("DailySnapshotsKept needs a ConstraintDescription")
+	}
+	if eq := get(t, d, "Conditions", "DailySnapshotsOn", "Fn::Not").([]any)[0].(map[string]any)["Fn::Equals"].([]any); eq[1] != "0" {
+		t.Errorf("DailySnapshotsOn must compare with the string \"0\", got %#v", eq[1])
 	}
 	if got, want := fmt.Sprint(get(t, d, "Conditions", "DailySnapshotsOn")), "map[Fn::Not:[map[Fn::Equals:[map[Ref:DailySnapshotsKept] 0]]]]"; got != want {
 		t.Errorf("DailySnapshotsOn = %s, want %s", got, want)
@@ -666,6 +682,17 @@ func TestUserDataReplacesTheTokenPlaceholderWhenNoneIsIssued(t *testing.T) {
 	tail := ud[strings.Index(ud, "step \"storing the claim token\""):]
 	if !strings.Contains(tail, "No claim token was issued") || !strings.Contains(tail, "sudo -u sbctl sbctl claim token") || !strings.Contains(tail, "--force") {
 		t.Errorf("the note must say no token was issued and how to get one:\n%s", tail)
+	}
+	// The note says an administrator works, so it is written only when the node is claimed. An
+	// unclaimed node keeps its secret: that may be the only copy of a live token (the installer
+	// keeps a hash), for example when the instance of the same stack is replaced.
+	elif := strings.Index(tail, "elif ")
+	note := strings.Index(tail, "No claim token was issued")
+	if elif < 0 || elif > note || !strings.Contains(tail[elif:note], "sbctl claim status") || !strings.Contains(tail[elif:note], "= claimed") {
+		t.Errorf("the note must be gated on `sbctl claim status` reporting claimed:\n%s", tail)
+	}
+	if regexp.MustCompile(`(?m)^\s*else\b`).MatchString(tail[:strings.Index(tail, "rm -f /root/sbctl-install.sh")]) {
+		t.Errorf("an unclaimed node with no new token must leave the secret alone, not take an else branch:\n%s", tail)
 	}
 }
 

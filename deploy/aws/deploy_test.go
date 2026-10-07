@@ -50,12 +50,14 @@ func stubAWS(t *testing.T) (dir, log string) {
 echo "$*" >> "` + log + `"
 case "$*" in
   *"Stacks[0].StackStatus"*)
-    if [ -n "$STACK_EXISTS" ]; then echo CREATE_COMPLETE; exit 0; fi
+    if [ -n "$STACK_EXISTS" ]; then echo "${STACK_STATUS-CREATE_COMPLETE}"; exit 0; fi
     echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id sbctl does not exist" >&2
     exit 254 ;;
   *"Stacks[0].Parameters"*)
     printf 'AdminEmail\ta@b.co\nAmiId\t%s\nInstanceType\tt4g.large\n' "${STACK_AMI-ami-0aaaaaaaaaaaaaaaa}" ;;
   *"Stacks[0].Outputs"*)
+    # A stack whose creation failed has no outputs; the real CLI prints None for the empty list.
+    if [ -n "$NO_OUTPUTS" ]; then echo None; exit 0; fi
     printf 'DashboardUrl\thttps://studio.1.2.3.4.sslip.io\nClaimUrl\thttps://api.1.2.3.4.sslip.io/claim\n'
     printf 'ClaimTokenCommand\taws secretsmanager get-secret-value --region us-east-1 --secret-id arn:aws:secretsmanager:us-east-1:111122223333:secret:x --query SecretString --output text\n'
     printf 'DnsRecordsNeeded\tNot needed (sslip.io resolves the Elastic IP)\n'
@@ -333,6 +335,7 @@ func TestDryRunDelete(t *testing.T) {
 			"aws --region us-east-1 ec2 stop-instances --instance-ids '<InstanceId>'",
 			"aws --region us-east-1 ec2 wait instance-stopped --instance-ids '<InstanceId>'",
 			"daily snapshots of the data volume",
+			"skipped when the stack has no InstanceId output or is ROLLBACK_COMPLETE, CREATE_FAILED or DELETE_FAILED",
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("%s: lacks %q:\n%s", b, want, out)
@@ -468,5 +471,38 @@ func TestRealRunDelete(t *testing.T) {
 	}
 	if re.MatchString(strings.Join(calls(t, log), "\n")) {
 		t.Error("deleted the stack although the instance did not stop")
+	}
+}
+
+// A stack whose creation failed (ROLLBACK_COMPLETE, no outputs, no instance) must still be
+// deletable here: deploy cannot update it, and there is no instance to stop.
+func TestRealRunDeleteOfAFailedLaunch(t *testing.T) {
+	re := regexp.MustCompile(`(?m)^--region us-east-1 cloudformation (delete-stack|wait stack-delete-complete) --stack-name sbctl$`)
+	for _, status := range []string{"ROLLBACK_COMPLETE", "CREATE_FAILED", "DELETE_FAILED"} {
+		dir, log := stubAWS(t)
+		r := run(t, bashes(t)[0], dir, []string{"STACK_EXISTS=1", "STACK_STATUS=" + status, "NO_OUTPUTS=1"}, "--region", "us-east-1", "--delete", "--yes")
+		if r.code != 0 {
+			t.Fatalf("%s: exit %d\n%s\n%s", status, r.code, r.stdout, r.stderr)
+		}
+		joined := strings.Join(calls(t, log), "\n")
+		if got := re.FindAllStringSubmatch(joined, -1); len(got) != 2 {
+			t.Errorf("%s: want delete-stack and wait, got %v", status, calls(t, log))
+		}
+		if strings.Contains(joined, "stop-instances") || strings.Contains(joined, "instance-stopped") {
+			t.Errorf("%s: there is no instance to stop:\n%s", status, joined)
+		}
+		if !strings.Contains(r.stdout, "none to stop (stack status "+status+")") {
+			t.Errorf("%s: stdout does not say that nothing was stopped:\n%s", status, r.stdout)
+		}
+		if strings.Contains(r.stdout, "Backup bucket:") || strings.Contains(r.stdout, "describe-snapshots") {
+			t.Errorf("%s: names a bucket or volume the stack never reported:\n%s", status, r.stdout)
+		}
+	}
+
+	// A healthy status without an InstanceId output has nothing to stop either; the delete goes on.
+	dir, log := stubAWS(t)
+	r := run(t, bashes(t)[0], dir, []string{"STACK_EXISTS=1", "NO_OUTPUTS=1"}, "--region", "us-east-1", "--delete", "--yes")
+	if r.code != 0 || !re.MatchString(strings.Join(calls(t, log), "\n")) {
+		t.Errorf("want a delete without an instance: exit %d\n%s%s", r.code, r.stdout, r.stderr)
 	}
 }

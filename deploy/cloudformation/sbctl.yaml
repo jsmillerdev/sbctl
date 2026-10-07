@@ -80,13 +80,15 @@ Parameters:
       later (update this value, then run xfs_growfs on the instance) but never shrink. When
       restoring from a snapshot it must be at least the snapshot's size.
   DailySnapshotsKept:
-    Type: Number
-    Default: 7
-    MinValue: 0
-    MaxValue: 1000
+    # A string with a pattern, not a Number: the console would accept 7.5 or 00, which the
+    # Data Lifecycle Manager policy rejects (a whole number from 1 to 1000) only at create time.
+    Type: String
+    Default: "7"
+    AllowedPattern: "^(0|[1-9][0-9]{0,2}|1000)$"
+    ConstraintDescription: A whole number from 0 to 1000, without leading zeros.
     Description: >-
-      How many daily snapshots of the data volume to keep (Amazon Data Lifecycle Manager takes
-      one a day at 03:00 UTC and deletes the oldest). They cover what the database backups in S3
+      How many daily snapshots of the data volume to keep, a whole number from 0 to 1000 (Amazon
+      Data Lifecycle Manager takes one a day at 03:00 UTC and deletes the oldest). They cover what the database backups in S3
       do not: Storage files, Edge Function bundles, the configuration and the master key. They
       are crash-consistent. EBS bills snapshot storage (README, "What it costs"). 0 takes none.
   SbctlVersion:
@@ -215,7 +217,7 @@ Conditions:
   HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
   HasAmiId: !Not [!Equals [!Ref AmiId, ""]]
   HasDataSnapshot: !Not [!Equals [!Ref DataSnapshotId, ""]]
-  DailySnapshotsOn: !Not [!Equals [!Ref DailySnapshotsKept, 0]]
+  DailySnapshotsOn: !Not [!Equals [!Ref DailySnapshotsKept, "0"]]
   SessionManagerOn: !Equals [!Ref EnableSessionManager, "true"]
   CreateNetwork: !Equals [!Ref VpcId, ""]
   IsLatest: !Equals [!Ref SbctlVersion, latest]
@@ -721,12 +723,13 @@ Resources:
               aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
                 --secret-string file:///root/claim-token.secret >/dev/null || fail "cannot write the claim token secret"
               shred -u /root/claim-token /root/claim-token.secret 2>/dev/null || rm -f /root/claim-token /root/claim-token.secret
-            else
+            elif [ "$(sudo -u sbctl sbctl claim status 2>/dev/null)" = claimed ]; then
               # No token comes from a repair of a data volume that already holds this node's
-              # administrator (or an unused token, which cannot be shown again). Replace the
-              # placeholder so that the secret does not promise a token that never arrives.
+              # administrator. Replace the placeholder so that the secret does not promise a
+              # token that never arrives. An unclaimed node is left alone: the secret may hold
+              # the only copy of its live token (the installer keeps just a hash).
               aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
-                --secret-string 'No claim token was issued: this node restored an earlier data volume and its administrator still works. To get a token, run on the instance: sudo -u sbctl sbctl claim token (add --force when an administrator exists).' \
+                --secret-string 'No claim token was issued: this node already has an administrator, who still works. To get a token, run on the instance: sudo -u sbctl sbctl claim token (add --force when an administrator exists).' \
                 >/dev/null || echo "could not update the claim token secret"
             fi
             rm -f /root/sbctl-install.sh

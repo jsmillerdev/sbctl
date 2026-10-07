@@ -212,9 +212,9 @@ What stays in your account, and keeps costing money until you delete it yourself
   - the daily snapshots of the data volume that the stack made (nothing deletes old ones once
     the stack is gone)
 
-The instance is stopped first, so that Postgres and the other services can shut down in order
-before the final snapshot is taken, which then is not a crash image. The node is offline from
-that moment.
+A running instance is stopped first, so that Postgres and the other services can shut down in
+order before the final snapshot is taken, which then is not a crash image. The node is offline
+from that moment. (A stack whose first launch failed has no instance; nothing is stopped.)
 WARN
   if [[ $DRY -eq 1 ]]; then
     note "dry run: nothing is sent to AWS"
@@ -223,7 +223,8 @@ WARN
     show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text
     note "reads BackupBucket, DataVolumeId and InstanceId from the stack outputs, to name what stays and what to stop:"
     show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "$Q_OUTPUTS" --output text
-    note "stops the instance, so that the final snapshot is taken from a cleanly shut-down node:"
+    note "stops the instance, so that the final snapshot is taken from a cleanly shut-down node"
+    note "(skipped when the stack has no InstanceId output or is ROLLBACK_COMPLETE, CREATE_FAILED or DELETE_FAILED, as after a failed first launch):"
     show "${AWS[@]}" ec2 stop-instances --instance-ids "<InstanceId>"
     show "${AWS[@]}" ec2 wait instance-stopped --instance-ids "<InstanceId>"
     show "${AWS[@]}" cloudformation delete-stack --stack-name "$STACK"
@@ -237,11 +238,19 @@ WARN
   BUCKET=$(pick BackupBucket <<<"$outs")
   VOLUME=$(pick DataVolumeId <<<"$outs")
   INSTANCE=$(pick InstanceId <<<"$outs")
-  [[ $INSTANCE =~ ^i-[0-9a-f]{8,17}$ ]] || fail "the stack has no InstanceId output (got: ${INSTANCE:-nothing}); stop the instance in the console, then delete the stack there"
+  # A stack whose creation failed has no outputs and no instance: there is nothing to stop, and
+  # the delete is the way out (deploy cannot update a ROLLBACK_COMPLETE stack).
+  STOP=1
+  case $status in ROLLBACK_COMPLETE|CREATE_FAILED|DELETE_FAILED) STOP=0 ;; esac
+  [[ $INSTANCE =~ ^i-[0-9a-f]{8,17}$ ]] || STOP=0
   say ""
-  say "Backup bucket:  $BUCKET"
-  say "Data volume:    $VOLUME"
-  say "Instance:       $INSTANCE (stopped first)"
+  [[ -z $BUCKET ]] || say "Backup bucket:  $BUCKET"
+  [[ -z $VOLUME ]] || say "Data volume:    $VOLUME"
+  if [[ $STOP -eq 1 ]]; then
+    say "Instance:       $INSTANCE (stopped first)"
+  else
+    say "Instance:       none to stop (stack status $status)"
+  fi
   if [[ $YES -eq 0 ]]; then
     [[ -t 0 ]] || fail "not a terminal: pass --yes to delete without asking"
     printf 'Type the stack name (%s) to delete it: ' "$STACK"
@@ -250,20 +259,30 @@ WARN
   fi
   # The final snapshot is taken when the volume is deleted. Stopping first lets the services shut
   # down and the file system flush; a snapshot of a running node is crash-consistent only.
-  say "Stopping $INSTANCE ..."
-  if ! "${AWS[@]}" ec2 stop-instances --instance-ids "$INSTANCE" >/dev/null \
-    || ! "${AWS[@]}" ec2 wait instance-stopped --instance-ids "$INSTANCE"; then
-    fail "could not stop $INSTANCE, so the stack was not deleted (stop it in the EC2 console and run this again; if the instance no longer exists, delete the stack in the CloudFormation console)"
+  if [[ $STOP -eq 1 ]]; then
+    say "Stopping $INSTANCE ..."
+    if ! "${AWS[@]}" ec2 stop-instances --instance-ids "$INSTANCE" >/dev/null \
+      || ! "${AWS[@]}" ec2 wait instance-stopped --instance-ids "$INSTANCE"; then
+      fail "could not stop $INSTANCE, so the stack was not deleted (stop it in the EC2 console and run this again; if the instance no longer exists, delete the stack in the CloudFormation console)"
+    fi
   fi
   "${AWS[@]}" cloudformation delete-stack --stack-name "$STACK"
   say "Deleting; this takes a few minutes ..."
   "${AWS[@]}" cloudformation wait stack-delete-complete --stack-name "$STACK" \
     || fail "the stack did not delete cleanly; see the Events tab of the stack in the CloudFormation console"
   say ""
+  if [[ -z $BUCKET && -z $VOLUME ]]; then
+    say "Deleted. The stack reported no backup bucket or data volume."
+    exit 0
+  fi
   say "Deleted. Kept for you:"
-  say "  backup bucket  $BUCKET   (empty and delete it yourself when you no longer need the backups)"
-  say "  data snapshots (the final one, and the daily ones when the stack made them); find them with:"
-  say "    aws ec2 describe-snapshots --region $REGION --owner-ids self --filters Name=volume-id,Values=$VOLUME --query 'Snapshots[].[SnapshotId,StartTime,State]' --output text"
+  if [[ -n $BUCKET ]]; then
+    say "  backup bucket  $BUCKET   (empty and delete it yourself when you no longer need the backups)"
+  fi
+  if [[ -n $VOLUME ]]; then
+    say "  data snapshots (the final one, and the daily ones when the stack made them); find them with:"
+    say "    aws ec2 describe-snapshots --region $REGION --owner-ids self --filters Name=volume-id,Values=$VOLUME --query 'Snapshots[].[SnapshotId,StartTime,State]' --output text"
+  fi
   exit 0
 fi
 
