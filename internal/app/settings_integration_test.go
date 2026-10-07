@@ -22,6 +22,7 @@ import (
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/fleet"
 	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 	"github.com/OWNER/sbctl/internal/units"
@@ -152,7 +153,21 @@ func TestSettingsIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	pat := secrets.NewPAT()
-	if err := n.Registry.CreateAccessToken(ctx, &registry.AccessToken{UserID: "11111111-2222-4333-8444-555555555555", Name: "e2e", Hash: secrets.HashToken(pat), Prefix: pat[:8]}); err != nil {
+	const user = "11111111-2222-4333-8444-555555555555"
+	if err := n.Registry.CreateAccessToken(ctx, &registry.AccessToken{UserID: user, Name: "e2e", Hash: secrets.HashToken(pat), Prefix: pat[:8]}); err != nil {
+		t.Fatal(err)
+	}
+	// The token's user owns the organization the project is in (roles: a PAT carries its owner's
+	// permissions, and a user without a membership may do nothing).
+	org, err := n.Registry.GetOrganization(ctx, "default")
+	if err != nil {
+		if org, err = n.Registry.CreateOrganization(ctx, "default", "Default"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := members.NewPG(n.Registry.(*registry.Postgres).Pool()).Update(ctx, org.ID, func(ops members.Ops) error {
+		return ops.PutMember(ctx, members.Member{OrgID: org.ID, UserID: user, RoleID: members.RoleOwner})
+	}); err != nil {
 		t.Fatal(err)
 	}
 	n.Close()

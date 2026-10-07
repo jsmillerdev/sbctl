@@ -110,8 +110,10 @@ can obtain a session at all; the gate is defense in depth if that setting is eve
 The email allowlist trusts the JWT's `email` claim: GoTrue's access token carries no claim
 that proves the address was confirmed, so with open signup and autoconfirm an unregistered
 allowlisted address could be claimed. Keep signup disabled; prefer the `sbctl_admin` claim.
-A PAT is not re-checked against the user's admin status on each use: delete a user's tokens
-when you remove their access.
+A PAT is not re-checked against the user's admin status (the claim above) on each use: delete a
+user's tokens when you remove their account. It is checked against its owner's roles at every request
+(Members, roles and permissions, below), so removing the owner from an organization takes the access away at once.
+Authentication only says who the caller is; what the caller may do is the authorization of the next section.
 
 Dashboard users are recorded in `sbctl.api_users` on first sight (profile fields come from
 GoTrue's `user_metadata`; later edits win). What a user may do is decided by their roles, below.
