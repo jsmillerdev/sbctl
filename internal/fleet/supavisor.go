@@ -185,6 +185,28 @@ func (t *supavisorTenant) RemoveTenant(ctx context.Context, ref string) error {
 	return nil
 }
 
+// RefreshTenant implements Refresher: GET /api/tenants/<ref>/terminate stops the tenant's
+// pools and drops its cached credentials, so the next login asks the project's database
+// again (auth_query) and a changed role password takes effect at once. The tenant record
+// stays. Pooled client sessions end; clients reconnect.
+func (t *supavisorTenant) RefreshTenant(ctx context.Context, ref string) error {
+	if err := validTenantRef(ref); err != nil {
+		return err
+	}
+	h, err := t.headers()
+	if err != nil {
+		return err
+	}
+	res, err := t.cl.do(ctx, "GET", t.tenantURL(ref)+"/terminate", h, nil)
+	if err != nil {
+		return err
+	}
+	if !res.ok() && res.Status != 404 {
+		return t.cl.apiError("terminate tenant "+ref, res)
+	}
+	return nil
+}
+
 // setManagerPassword is the default setManager: connect to the project's database as
 // supabase_admin and give pgbouncer its password as a SCRAM verifier (never plaintext, so
 // statement logging cannot capture it).

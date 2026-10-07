@@ -22,7 +22,10 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require github.com/xdg-go/stringprep v1.0.4 // indirect
+require (
+	github.com/gobwas/glob v0.2.3 // indirect
+	github.com/xdg-go/stringprep v1.0.4 // indirect
+)
 
 require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect

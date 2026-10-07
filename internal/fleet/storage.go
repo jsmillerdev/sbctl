@@ -51,6 +51,22 @@ func (t *storageTenant) tenantURL(ref string) string {
 // storageBody is PUT /tenants/<tenant>, the `schema` of src/http/routes/admin/tenants.ts: anonKey,
 // databaseUrl, jwtSecret and serviceKey are required.
 func storageBody(spec TenantSpec, dbURL string, fileSize int64) map[string]any {
+	if spec.Storage.FileSizeLimit > 0 {
+		fileSize = spec.Storage.FileSizeLimit
+	}
+	features := map[string]any{
+		"imageTransformation": map[string]any{"enabled": false},
+		"purgeCache":          map[string]any{"enabled": false},
+		"s3Protocol":          map[string]any{"enabled": true},
+	}
+	for name, v := range spec.Storage.Features {
+		// icebergCatalog and vectorBuckets need services the fleet does not run: they stay off
+		// at the tenant however the settings read.
+		if name == "icebergCatalog" || name == "vectorBuckets" {
+			continue
+		}
+		features[name] = v
+	}
 	return map[string]any{
 		"anonKey":        spec.AnonKey,
 		"serviceKey":     spec.ServiceRoleKey,
@@ -58,11 +74,7 @@ func storageBody(spec TenantSpec, dbURL string, fileSize int64) map[string]any {
 		"databaseUrl":    dbURL,
 		"maxConnections": storageTenantConnections,
 		"fileSizeLimit":  fileSize,
-		"features": map[string]any{
-			"imageTransformation": map[string]any{"enabled": false},
-			"purgeCache":          map[string]any{"enabled": false},
-			"s3Protocol":          map[string]any{"enabled": true},
-		},
+		"features":       features,
 	}
 }
 

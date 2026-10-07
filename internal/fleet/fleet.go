@@ -29,6 +29,48 @@ type TenantSpec struct {
 	// PoolSize and MaxClients for Supavisor; zero means service default.
 	PoolSize   int
 	MaxClients int
+	// Storage and Realtime carry the project's saved settings for those services (the
+	// zero values mean "defaults"). They are part of the tenant fingerprint, so a changed
+	// setting makes EnsureTenant send an update.
+	Storage  StorageSettings
+	Realtime RealtimeSettings
+}
+
+// StorageSettings are the per-project Storage settings: the upload size limit in bytes
+// (0 keeps the node's configured limit) and the feature flags of the tenant API
+// (imageTransformation, s3Protocol, ...), laid over the node's defaults.
+type StorageSettings struct {
+	FileSizeLimit int64
+	Features      map[string]any
+}
+
+// RealtimeSettings are the per-project Realtime settings. Tenant holds the fields of the
+// tenant itself that differ from the server's defaults (max_concurrent_users,
+// max_events_per_second, private_only, suspend, ...); Extension those of its postgres_cdc_rls
+// extension (db_pool, postgres_changes_pool). Both are sent as given.
+type RealtimeSettings struct {
+	Tenant    map[string]any
+	Extension map[string]any
+}
+
+// Refresher is an optional Tenant capability: drop whatever the service cached about a
+// project's database logins (Supavisor's pools and credential cache), after a role password
+// changed. A service that caches nothing does not implement it.
+type Refresher interface {
+	RefreshTenant(ctx context.Context, ref string) error
+}
+
+// RefreshTenant calls RefreshTenant on every tenant that implements Refresher.
+func (f Fleet) RefreshTenant(ctx context.Context, ref string) error {
+	var first error
+	for _, t := range f {
+		if r, ok := t.(Refresher); ok {
+			if err := r.RefreshTenant(ctx, ref); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	return first
 }
 
 // Tenant is one shared service's tenant registry. Both calls are idempotent and

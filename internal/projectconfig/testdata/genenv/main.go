@@ -3,7 +3,7 @@
 // genenv lists the environment variable names GoTrue reads, by walking the Go structs
 // of supabase/auth internal/conf the way kelseyhightower/envconfig does (prefix
 // "GOTRUE", field name or `envconfig` tag, `split_words`, embedded structs flattened,
-// types with a Decode method are leaves). The output is committed as
+// types with a Decode, Set, UnmarshalText or UnmarshalBinary method are leaves). The output is committed as
 // gotrue-env-names.txt and pins the names the renderer may use.
 //
 //	go run testdata/genenv/main.go configuration.go saml.go rate.go > testdata/gotrue-env-names.txt
@@ -50,7 +50,7 @@ func main() {
 					}
 				}
 			case *ast.FuncDecl:
-				if d.Recv != nil && d.Name.Name == "Decode" && len(d.Recv.List) == 1 {
+				if d.Recv != nil && (d.Name.Name == "Decode" || d.Name.Name == "Set" || d.Name.Name == "UnmarshalText" || d.Name.Name == "UnmarshalBinary") && len(d.Recv.List) == 1 {
 					decoders[recvName(d.Recv.List[0].Type)] = true
 				}
 			}
