@@ -24,6 +24,8 @@ func init() {
 		force     bool
 		noRestart bool
 		noUnits   bool
+		apiBase   string
+		keyFile   string
 	)
 	cmd := &cobra.Command{
 		Use:   "self-update",
@@ -43,7 +45,25 @@ not through this command.`,
 			if runtime.GOOS != "linux" {
 				return errors.New("self-update replaces the binary of a Linux server install; build from source elsewhere")
 			}
-			o := selfupdate.Options{Repo: repo, Tag: tag, Current: version, Platform: "linux-" + runtime.GOARCH, Force: force, Out: cmd.OutOrStdout()}
+			// Resolve the path before the update: afterwards /proc/self/exe names the
+			// replaced file as "(deleted)".
+			exe, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			if exe, err = filepath.EvalSymlinks(exe); err != nil {
+				return err
+			}
+			o := selfupdate.Options{ExecPath: exe, Repo: repo, APIBase: apiBase, Tag: tag, Current: version, Platform: "linux-" + runtime.GOARCH, Force: force, Out: cmd.OutOrStdout()}
+			if keyFile != "" {
+				b, err := os.ReadFile(keyFile)
+				if err != nil {
+					return err
+				}
+				if o.Key, err = selfupdate.ParsePublicKey(b); err != nil {
+					return err
+				}
+			}
 			if check {
 				rel, err := selfupdate.Latest(cmd.Context(), o)
 				if err != nil {
@@ -66,8 +86,6 @@ not through this command.`,
 			if !res.Replaced {
 				return nil
 			}
-			exe, _ := os.Executable()
-			exe, _ = filepath.EvalSymlinks(exe)
 			if !noUnits {
 				// The new binary carries the new units; an unchanged set is a no-op.
 				c := exec.CommandContext(cmd.Context(), exe, "system", "install-units")
@@ -101,6 +119,12 @@ not through this command.`,
 	cmd.Flags().BoolVar(&force, "force", false, "install even when the release is not newer")
 	cmd.Flags().BoolVar(&noRestart, "no-restart", false, "do not restart sbctl.service")
 	cmd.Flags().BoolVar(&noUnits, "no-units", false, "do not refresh the systemd units")
+	// For tests against a local release server and a throwaway key; a release build
+	// verifies against the key compiled into the binary.
+	cmd.Flags().StringVar(&apiBase, "api-base", "", "GitHub API root (tests)")
+	cmd.Flags().StringVar(&keyFile, "public-key-file", "", "verify against this PEM public key instead of the built-in release key (tests)")
+	_ = cmd.Flags().MarkHidden("api-base")
+	_ = cmd.Flags().MarkHidden("public-key-file")
 	rootCmd.AddCommand(cmd)
 }
 

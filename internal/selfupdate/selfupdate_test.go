@@ -273,3 +273,27 @@ func TestChecksumFor(t *testing.T) {
 		t.Fatal("missing name accepted")
 	}
 }
+
+// TestVerifiesWhatOpenSSLSigned pins the interoperability the release depends on:
+// deploy/release-assets.sh signs with `openssl pkeyutl -sign -rawin`, install.sh verifies
+// with openssl and `sbctl self-update` verifies with Go's crypto/ed25519. The fixture was
+// made by release-assets.sh with a throwaway key whose private half was discarded.
+func TestVerifiesWhatOpenSSLSigned(t *testing.T) {
+	pemB, _ := os.ReadFile("testdata/openssl-test-key.pub.pem")
+	sums, _ := os.ReadFile("testdata/openssl-SHA256SUMS")
+	sig, _ := os.ReadFile("testdata/openssl-SHA256SUMS.sig")
+	key, err := ParsePublicKey(pemB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifySums(key, sums, sig); err != nil {
+		t.Fatalf("openssl signature rejected: %v", err)
+	}
+	sums[0] ^= 1
+	if err := VerifySums(key, sums, sig); err == nil {
+		t.Fatal("tampered list accepted")
+	}
+	if h, err := ChecksumFor(sums, "sbctl-linux-arm64"); err != nil || len(h) != 64 {
+		t.Fatalf("%q %v", h, err)
+	}
+}

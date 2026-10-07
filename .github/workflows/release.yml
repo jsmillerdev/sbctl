@@ -1,0 +1,136 @@
+name: release
+
+# On a tag v*: build sbctl for linux amd64 and arm64, build the Studio artifact, sign the
+# checksum list with the ed25519 key in the repository secret SBCTL_SIGNING_KEY and publish
+# everything as a GitHub release. Nothing here runs unless someone pushes a tag.
+#
+# One-time setup (deploy/README.md, "Release signing"):
+#   openssl genpkey -algorithm ed25519 -out sbctl-signing.pem
+#   openssl pkey -in sbctl-signing.pem -pubout -out internal/selfupdate/release_key.pem   # commit this file
+#   gh secret set SBCTL_SIGNING_KEY < sbctl-signing.pem                                   # then delete the file
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag looks like a version
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-suffix]"; exit 1; }
+      - name: the release key is committed and the secret is its private half
+        env:
+          SBCTL_SIGNING_KEY: ${{ secrets.SBCTL_SIGNING_KEY }}
+        run: |
+          openssl pkey -pubin -in internal/selfupdate/release_key.pem -noout 2>/dev/null \
+            || { echo "internal/selfupdate/release_key.pem is not a public key: see deploy/README.md, Release signing"; exit 1; }
+          [[ -n "$SBCTL_SIGNING_KEY" ]] || { echo "the repository secret SBCTL_SIGNING_KEY is not set: see deploy/README.md, Release signing"; exit 1; }
+          umask 077
+          printf '%s\n' "$SBCTL_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
+          a=$(openssl pkey -in "$RUNNER_TEMP/sign.pem" -pubout -outform DER | openssl dgst -sha256)
+          b=$(openssl pkey -pubin -in internal/selfupdate/release_key.pem -pubout -outform DER | openssl dgst -sha256)
+          rm -f "$RUNNER_TEMP/sign.pem"
+          [[ "$a" == "$b" ]] || { echo "SBCTL_SIGNING_KEY does not match internal/selfupdate/release_key.pem"; exit 1; }
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
+  binaries:
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "dist/sbctl-linux-$arch" ./cmd/sbctl
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbctl-binaries
+          path: dist/
+          if-no-files-found: error
+
+  studio:
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, platform: linux-amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: prepare runner
+        run: sudo env SBCTL_CI=1 studio/ci-prepare.sh   # sudo drops GITHUB_ACTIONS from the environment
+      - name: build
+        run: studio/build.sh ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: studio-${{ matrix.platform }}
+          path: studio/dist/*.tar.zst
+          if-no-files-found: error
+
+  publish:
+    needs: [binaries, studio]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write   # create the release and attach the assets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: parts
+      - name: collect
+        run: |
+          mkdir -p dist
+          find parts -type f \( -name 'sbctl-linux-*' -o -name 'sbctl-studio-*.tar.zst' \) -exec cp {} dist/ \;
+          ls -l dist
+      - name: sign and stamp (deploy/release-assets.sh)
+        env:
+          SBCTL_SIGNING_KEY: ${{ secrets.SBCTL_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$SBCTL_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
+          deploy/release-assets.sh dist "$RUNNER_TEMP/sign.pem" internal/selfupdate/release_key.pem
+          shred -u "$RUNNER_TEMP/sign.pem" || rm -f "$RUNNER_TEMP/sign.pem"
+          ls -l dist
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=(--verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+          [[ "$GITHUB_REF_NAME" == *-* ]] && flags+=(--prerelease)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
+          fi
