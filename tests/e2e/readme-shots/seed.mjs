@@ -83,12 +83,11 @@ async function seedStorefront(p) {
       category text not null,
       price numeric(10,2) not null check (price >= 0),
       stock integer not null default 0,
-      is_active boolean not null default true,
-      created_at timestamptz not null default now()
+      is_active boolean not null default true
     );
     comment on table public.products is 'The catalog shown in the storefront.';
-    insert into public.products (sku, name, category, price, stock, created_at)
-    values ${PRODUCTS.map(([sku, name, cat, price, stock], i) => `(${q(sku)}, ${q(name)}, ${q(cat)}, ${price}, ${stock}, now() - interval '${60 - i * 4} days')`).join(',\n')};
+    insert into public.products (sku, name, category, price, stock)
+    values ${PRODUCTS.map(([sku, name, cat, price, stock]) => `(${q(sku)}, ${q(name)}, ${q(cat)}, ${price}, ${stock})`).join(',\n')};
     alter table public.products enable row level security;
     create policy "Anyone can read active products" on public.products for select to anon, authenticated using (is_active);
   `)

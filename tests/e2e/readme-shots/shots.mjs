@@ -1,5 +1,5 @@
 // Captures the README screenshots of Supabase Studio (platform mode) running on the node that
-// node.sh installed and seed.mjs filled. 1600x1000 at device scale factor 2, dark theme (THEMES=dark,light adds the light one).
+// node.sh installed and seed.mjs filled. 1640x1025 at device scale factor 2, dark theme (THEMES=dark,light adds the light one).
 //
 //   SHOTS_DIR=/tmp/shots CHROME=/usr/bin/google-chrome node shots.mjs
 //     [THEMES=dark,light] [ONLY=projects,table-editor] [OUT=/tmp/shots/raw]
@@ -22,8 +22,8 @@ const THEMES = (process.env.THEMES ?? 'dark').split(',')
 const ONLY = process.env.ONLY ? process.env.ONLY.split(',') : null
 for (const d of [OUT, DEBUG]) mkdirSync(d, { recursive: true })
 
-const VIEW_W = 1600
-const VIEW_H = 1000
+const VIEW_W = 1640
+const VIEW_H = 1025
 const STUDIO = E.studioUrl
 const store = S.projects.storefront
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a)
