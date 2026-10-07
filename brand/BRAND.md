@@ -27,6 +27,8 @@ brand/
   social/og-image                       1200x630 link preview, .svg + .png
   social/github-social-preview          1280x640 repository social preview, .svg + .png
   social/apple-touch-icon               180x180 iOS home-screen icon, .svg + .png
+  readme/banner-{dark,light}.svg        1280x320 README hero: lockup, tagline, small print
+  readme/architecture-{dark,light}.svg  1200x590 README diagram: clients, one node, backups
 ```
 
 PNGs are rendered from the SVGs with macOS `sips`:
@@ -79,6 +81,41 @@ white          #ffffff   the word on black and dark grounds
 - Avatar: `avatar-teal.png` (ink mark on teal) everywhere: X, LinkedIn, GitHub, Bluesky. Use `avatar-black.png` only on light-only surfaces. The mark is 56% of the side wide, so it survives a circle crop.
 - X header: `x-header-slice.png` is the default, with the oversized mark off the right edge and the zigzag in frame. The lockup stays centered in the middle band because X covers the bottom-left and trims the top and bottom on some screens.
 - GitHub: upload `github-social-preview.png` under the repository settings, Social preview.
+
+## README graphics
+
+`readme/` holds the two images the README embeds, each in a dark and a light variant so `<picture>` can follow the reader's GitHub theme. Both are SVG with no embedded rasters and no webfonts: GitHub shows them through `<img>`, which blocks external references. The lockup is outlined paths; every other word is live text in the system font stack (`-apple-system, Segoe UI, Inter, Helvetica, Arial`), so it matches the surrounding page on each platform.
+
+- Banner: lockup at the left, tagline "Many Supabase projects. One server.", one line of small print that says it is not affiliated with Supabase Inc. The oversized mark off the right edge is a neutral gray watermark, not teal, so the banner stays quiet.
+- Architecture: clients on the left, the Supavise node in the middle, backups on the right. Boxes are neutral grays; teal (dark) or ink (light) marks only the node, the `supavise` binary and the data flow. One stroke width throughout. Text is 12 to 19 px in a 1200 px canvas, which is about 9 to 14 px at GitHub's 880 px README width.
+- Change the diagram in `arch_svg()` in `build.py`, then re-run it. Check it in a browser as well as `sips`: browser system fonts run wider than the fallback `sips` uses, and the narrowest labels ("Edge Runtime", "WAL + base backups") are the ones that touch their boxes first.
+
+Embed from the repository root README:
+
+```html
+<p align="center">
+  <a href="https://supavise.dev">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="brand/readme/banner-dark.svg">
+      <img alt="Supavise: many Supabase projects, one server" src="brand/readme/banner-light.svg" width="100%">
+    </picture>
+  </a>
+</p>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="brand/readme/architecture-dark.svg">
+  <img alt="Supavise architecture: clients reach one node over HTTPS; the supavise binary fronts per-project Postgres, Auth and REST plus shared Supavisor, Realtime, Storage, Edge Runtime and Studio; backups go to S3 or local disk" src="brand/readme/architecture-light.svg" width="100%">
+</picture>
+```
+
+Badges are static shields.io URLs, so no new service and nothing to keep in sync. The message side is neutral dark gray, not teal, because shields prints white text there and white on `#00e0c4` is about 1.3:1. A name that is a shields reserved character is escaped (`--` is a dash, `%7C` is a pipe).
+
+```markdown
+![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-262626?labelColor=0b0b0b)
+![One Go binary](https://img.shields.io/badge/runs_as-one_Go_binary-262626?labelColor=0b0b0b)
+![Ubuntu 24.04+ or Debian 12+](https://img.shields.io/badge/runs_on-Ubuntu_24.04%2B_%7C_Debian_12%2B-262626?labelColor=0b0b0b)
+![amd64 and arm64](https://img.shields.io/badge/arch-amd64_%7C_arm64-262626?labelColor=0b0b0b)
+```
 
 ## Typography
 
