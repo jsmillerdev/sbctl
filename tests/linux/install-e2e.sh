@@ -371,7 +371,15 @@ HZ=$(api GET /healthz)
 [[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a healthy node"
 [[ $HZ != *"$REF"* ]] || fail "/healthz names a project"
 [[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz/detail) == 401 ]] || fail "/healthz/detail answered without credentials"
-DETAIL=$(papi GET /healthz/detail)
+# The daemon shares one report between callers for a few seconds (health.cache), so a report taken
+# before the project existed may still be served right after it was created: ask again until
+# the cache has turned over.
+DETAIL=""
+for ((n = 0; n < 12; n++)); do
+  DETAIL=$(papi GET /healthz/detail)
+  [[ $DETAIL == *"$REF"* ]] && break
+  sleep 5
+done
 [[ $(printf '%s' "$DETAIL" | jq_ 'd["status"]') == healthy && $DETAIL == *"$REF"* ]] || fail "/healthz/detail with the owner's token: $DETAIL"
 
 log "stopping the project's PostgREST degrades the node: exit status 1, the project named, /healthz still 200"
