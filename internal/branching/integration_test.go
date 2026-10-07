@@ -322,10 +322,21 @@ func TestIntegrationBranching(t *testing.T) {
 		t.Fatalf("list = %+v %v", list, err)
 	}
 
-	// --- with data: copy-on-write clone ------------------------------------------------------
+	// --- with data: copy-on-write clone, or the base backup where the disk cannot clone -----------
+	// SBCTL_TEST_EXPECT_METHOD names what this filesystem must do: clonefile, reflink or
+	// base-backup (CI sets it for XFS and for ext4). Unset, a clone is expected.
+	expect := os.Getenv("SBCTL_TEST_EXPECT_METHOD")
+	if expect == MethodBackup {
+		if _, err := st.bk.BaseBackup(ctx, pref); err != nil {
+			t.Fatalf("base backup of the parent: %v", err)
+		}
+	}
 	withData := st.createBranch(pref, "with-data", func(in *CreateInput) { in.WithData = true })
 	t.Logf("with_data branch: method=%s detail=%s", withData.CloneMethod, withData.Detail)
-	if !withData.WithData || (withData.CloneMethod != MethodClonefile && withData.CloneMethod != MethodReflink) {
+	switch {
+	case expect != "" && withData.CloneMethod != expect:
+		t.Fatalf("method = %s, want %s: %+v", withData.CloneMethod, expect, withData)
+	case expect == "" && !withData.WithData, expect == "" && withData.CloneMethod != MethodClonefile && withData.CloneMethod != MethodReflink:
 		t.Fatalf("expected a copy-on-write clone on this filesystem, got %+v", withData)
 	}
 	if n := st.count(withData.Ref, "public.items"); n != 200 {

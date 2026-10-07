@@ -110,3 +110,16 @@ jobs:
           name: fleet-smoke-${{ matrix.arch }}
           path: /tmp/sbctl-fleet-logs
           if-no-files-found: ignore
+
+  # Branch clones on real filesystems: copy-on-write on XFS (a loop file with reflink=1) and
+  # the base-backup fallback on the runner's ext4 root, each with a parent of about 1 GB.
+  branching-xfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: branch clones on XFS and ext4
+        run: tests/linux/branching-xfs.sh
