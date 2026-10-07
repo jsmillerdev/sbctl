@@ -69,7 +69,11 @@ Backups start on their own. Every project archives its write-ahead log (WAL) con
 
 Backups go to local disk by default. To keep them in S3, pass `--s3-bucket` and `--s3-region` at install (see the deploy guide's [flags](../deploy/README.md#flags)). The AWS stack uses its own bucket.
 
-Restore on the server:
+Restore in the dashboard: open **Database > Backups**. The **Point in time** tab shows the span you can restore to, from the end of the oldest base backup up to now (7 days by default). Pick a time and confirm. The project shows RESTORING while it runs, goes offline for the restore, and returns to its normal state when it finishes; everything written after the chosen time is lost. Only Owners and Administrators can restore. Supavise keeps the project's previous data directory on the server, next to the new one, until you delete it. The same restore is one call: `POST /v1/projects/<ref>/database/backups/restore-pitr` with `{"recovery_time_target_unix": <seconds>}`.
+
+While point-in-time recovery is on (always, on Supavise), the **Scheduled backups** tab lists no backups, as on hosted projects with the add-on. To restore the state of one nightly base backup, use `POST /v1/projects/<ref>/database/backups/restore` with `{"id": <id>}` (`GET /v1/projects/<ref>/database/backups` lists the ids), or the command below.
+
+Restore on the server, as a copy under a new project or in place:
 
 ```bash
 sudo -u supavise supavise backups list <ref>
@@ -86,7 +90,7 @@ sudo -u supavise supavise backups restore <ref> --to latest --force             
 | Dashboard | Studio for a single project | Supabase Studio in its hosted, multi-project mode | Supabase Studio |
 | Management API and `supabase link` | Not available | Yes: the parts that Studio, the Supabase CLI and the MCP server call | Yes |
 | Branching | Not available | Yes, schema-only or with data | Yes |
-| Point-in-time restore | Not included; you set up backups yourself | Yes, with `supavise backups restore` on the server | Yes |
+| Point-in-time restore | Not included; you set up backups yourself | Yes, in the dashboard (in place) or with `supavise backups restore` on the server | Yes |
 | Edge Functions | Yes | Yes, on by default | Yes |
 | Team roles and SSO | One shared dashboard login | Owner, Administrator, Developer and Read-only roles; SAML SSO | Yes |
 | High availability | Not built in; you set it up yourself | No: one server, no failover or read replicas | Read replicas available |
@@ -117,7 +121,7 @@ No. Supavise is an independent open-source project and is not affiliated with or
 Not entirely. You get organizations, projects, the dashboard, the CLI, branching and backups on a server you run. The differences:
 
 - One server, so no high availability, failover or read replicas. If the server stops, its projects stop.
-- Backups and point-in-time restore run from the `supavise backups` command, not from the dashboard.
+- The dashboard restores a project in place. "Restore to new project" is missing: restore a copy with `supavise backups restore --as` on the server.
 - Management API operations that Studio, the CLI and the MCP server don't call, such as billing and log drains, answer with empty placeholders.
 
 **Do my apps need to change?**

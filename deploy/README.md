@@ -321,7 +321,7 @@ The data volume holds everything the node needs to come back: the projects, the 
 
 ### Backups and restore
 
-Every project archives its WAL to the backup bucket and takes a nightly base backup; the daemon prunes old ones (`backup.retention_days`, 7 by default). Restore a project to a point in time on the instance (`aws ssm start-session`, then):
+Every project archives its WAL to the backup bucket and takes a nightly base backup; the daemon prunes old ones (`backup.retention_days`, 7 by default). Owners and Administrators restore a project in place from the dashboard (Database > Backups > Point in time) or with the Management API (`POST /v1/projects/<ref>/database/backups/restore-pitr`). The project shows RESTORING until it is back. To restore a copy under a new project, or on any node without the dashboard, work on the instance (`aws ssm start-session`, then):
 
 ```bash
 sudo -u supavise supavise backups list <ref>

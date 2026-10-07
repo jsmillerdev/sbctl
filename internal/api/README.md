@@ -43,7 +43,8 @@ registered in a second mux of a chain, tried in order.
 
 | Area | Routes |
 |---|---|
-| Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (the full branch API, served by `internal/branching`, see below); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`, `restart-services`; `POST /v1/projects/{ref}/restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/database/{ref}/backups` (empty) |
+| Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (the full branch API, served by `internal/branching`, see below); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`, `restart-services`; `POST /v1/projects/{ref}/restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/projects/{ref}/billing/addons` and `/v1/projects/{ref}/billing/addons` (the PITR add-on only) |
+| Backups | `GET /platform/database/{ref}/backups` and `GET /v1/projects/{ref}/database/backups` (the node's base backups and the span a point-in-time restore reaches); `POST /platform/database/{ref}/backups/restore`, `restore-physical` and `/pitr`, `POST /v1/projects/{ref}/database/backups/restore` and `restore-pitr` (restores in place). See Backups and point-in-time restore below |
 | Keys | `/v1/projects/{ref}/api-keys`: list, create (publishable and secret keys with names; the secret is shown in full by the create and by `reveal=true`, masked otherwise), get, patch, delete (a revocation), `api-keys/legacy` get and put (`?enabled=`). See Settings and keys below |
 | Settings | `GET` and `PATCH /v1/projects/{ref}/config/auth` and `/platform/auth/{ref}/config` (+ `/hooks`), `/v1/projects/{ref}/postgrest` and `/platform/projects/{ref}/config/postgrest`, `config/realtime`, `config/storage` (v1 and platform), `GET` and `PUT /v1/projects/{ref}/config/database/postgres`, `GET` and `PATCH /v1/projects/{ref}/config/database/pooler` (and `/platform/projects/{ref}/config/pgbouncer`; `config/supavisor` is the read), `GET /v2/projects/{ref}/config` (the document the CLI diffs), `PATCH /v1/projects/{ref}/database/password` and `/platform/projects/{ref}/db-password` |
 | Database | `database/query`, `database/query/read-only` (rows as JSON; `parameters` supported), `database/migrations` list and apply (`supabase_migrations.schema_migrations`), `types/typescript` (pg-meta generator), `cli/login-role` create and delete, `advisors/*` (no lints yet) |
@@ -135,6 +136,20 @@ is used. PATCH refuses a `status` that differs from the branch's own and accepts
 `reset_on_push` (the spec says it is ignored). Without `Deps.Branching` the list is
 the default branch only and a create answers 400. Organization entitlements already grant
 `branching_limit` and `branching_persistent`, which is what the CLI checks on a failed create.
+
+## Backups and point-in-time restore
+
+`Deps.Backups` (a `*backup.Service`, `internal/backup/README.md`) feeds the Database > Backups pages of Studio and the Management API's backup routes; `internal/app` passes it when the backup backend is configured. Restores run through the lifecycle Engine (`lifecycle.DatabaseRestorer`), which the API finds on its `Manager`. Without a backup service the list is empty, `pitr_enabled` is false and a restore answers 503.
+
+**What is listed.** The node's base backups (`backup.RestoreWindow`): complete ones on the archive's timeline history whose first WAL file is still archived, the ones a restore can use. Each is `isPhysicalBackup: true` (`is_physical_backup` on v1), status `COMPLETED`, with `inserted_at` the end of the backup and `id` the registry row id of its `backups` entry (failed and running attempts are not listed). `pitr_enabled` and `walg_enabled` are true whenever a backup service exists, because every cluster archives its WAL. `physicalBackupData` (`physical_backup_data` on v1) holds the earliest and latest restorable times in Unix seconds, rounded inward: the earliest is the end of the oldest listed backup, the latest is now for a running project (a restore first archives the source's newest WAL, so any time up to now is reachable) and the newest archived object otherwise. They are absent until the first base backup exists, and Studio then shows "No backups yet".
+
+**What Studio shows.** With `pitr_enabled` true Studio's Scheduled backups tab states that PITR is on and hides the list, as it does for a hosted project with the PITR add-on; the Point in time tab holds the picker, bounded by the span above. A listed backup is restorable through the API (`restore`, `restore-physical`) or `supavise backups restore --to backup`. The tab's text "Database changes are logged every 2 minutes" is Studio's and hosted's; here a restore does not depend on it. "Restore to new project" is not offered: `database:restore_to_new_project` is in `disabledFeatures` (`identity.go`) because Studio's clone request carries a new project name and database password that `backups restore --as` cannot take (the restored cluster keeps the source's passwords), so run that from the command line.
+
+**The PITR add-on.** Studio reads the retention it states from `selected_addons` of `GET /platform/projects/{ref}/billing/addons`. A node with a backup service reports one `pitr` add-on with `meta.backup_duration_days` = `backup.retention_days` (with pruning off, 0, the days since the project was created), priced 0 ("Included"), and no available add-ons: nothing is for sale. The spec limits the variant id to `pitr_7`, `pitr_14` and `pitr_28`; the id is the nearest of them and the real number of days is in `meta` and the name.
+
+**Restoring.** `POST .../backups/pitr` and `.../restore-pitr` take `recovery_time_target_unix`; `.../restore` and `.../restore-physical` take a listed backup's `id` (`restore-physical` also accepts `recovery_time_target`, RFC 3339 or Unix seconds, to replay from that backup to a time). A time outside the span answers 400 with the span in the message, as does a backup that is no longer usable; an unknown id is 404; a node without backups 503; a project that is not `ACTIVE_*` (paused, starting, or already RESTORING) 409. Otherwise the answer is 201 with no body and the restore runs in the background on a context detached from the request (4 hours at most; `Drain` waits for it). `Engine.BeginRestore` moves the project to `RESTORING` under the project lock before the answer, so every other operation (pause, restart, a second restore, delete) is refused with 409 for as long as it runs; `backup.Service.RestoreWith` pauses and resumes the project through the same Engine, which keeps the status at `RESTORING` instead of walking it through `PAUSING`, `INACTIVE` and `COMING_UP`. When the restore ends the project is `ACTIVE_HEALTHY`. If it fails the backup service has put the original data back where it could, and the project becomes `ACTIVE_UNHEALTHY` until a health check finds it running again; the error is in the log and in the project's `restore.failed` event. A daemon that stops during a restore leaves the project `RESTORING` (`Engine.Recover` does not touch it, and nothing starts it): `internal/backup/README.md`, "From the dashboard and the Management API", says how an operator settles it. The old data directory is kept as `postgres.pre-restore-<time>` next to the new one and never deleted by the restore.
+
+Not implemented, left as stubs: `restore-point`, `schedule`, `undo`, `download`, `downloadable-backups`, `enable-physical-backups`.
 
 ## Authentication
 
@@ -228,7 +243,8 @@ Capabilities follow hosted's access-control documentation and the role descripti
 | Billing: read | yes | yes | yes | yes |
 | Billing: update; OAuth apps | yes | yes | | |
 | Create, rename, pause, restore and delete projects; database password | yes | yes | | |
-| Restart a project; restore backups | yes | yes | yes | |
+| Restart a project | yes | yes | yes | |
+| Restore a backup or a point in time (it overwrites the project's data) | yes | yes | | |
 | Project settings (Auth, PostgREST, Realtime, Storage, Postgres); API keys create, update, revoke; function secrets write; any unnamed write | yes | yes | | |
 | Read the service_role key, the JWT secret, the S3 credentials; temporary keys | yes | yes | yes | |
 | Write SQL, apply migrations, change schema (Studio and pg-meta), Auth users, Storage buckets and objects, deploy and delete functions, preview branches (schema-only) | yes | yes | yes | |
@@ -316,8 +332,10 @@ Developer and a user without a membership through the real handlers.
   that an Owner later opens and runs as `postgres`. `last_updated_by` records the real editor (migration `0902`).
 - **Judgment calls against hosted's table.** Hosted's access-control page lists Developers under Auth Hooks
   (create, delete); Supavise stores hooks in the Auth settings (`custom_config_gotrue`), which only Owners and
-  Administrators may change, so Developers cannot manage hooks. Developers hold the backup restore and Restart rows
-  as listed. The Read-only role's secret list (service key, JWT secret, S3 credentials) follows the same page.
+  Administrators may change, so Developers cannot manage hooks. Developers hold the Restart row as listed; hosted
+  also lets them restore backups, but a restore overwrites the project's data, so here it needs Owner or Administrator
+  (`queue_job.restore.prepare` and `queue_job.walg.prepare_restore`, the resources Studio checks, so its Restore
+  buttons are disabled for a Developer too). The Read-only role's secret list (service key, JWT secret, S3 credentials) follows the same page.
 - **Residual exposure of Read-only SQL.** The write barrier is table privileges (`pg_read_all_data` only) plus
   `default_transaction_read_only`, which a client can override with `set` or `begin read write`. A Read-only
   member can therefore still call a `SECURITY DEFINER` function that `PUBLIC` may execute (Postgres's default for
@@ -663,7 +681,7 @@ you ran it from, so check its working directory (`lsof -p <pid> | grep cwd`) bef
 
 Delete, pause, restore (resume), restart and create run on a context detached from the HTTP
 request (`context.WithoutCancel`) with a bound: 30 minutes for delete (it includes a final base
-backup), 20 for create, 10 for pause and resume, 20 for restart (pause and resume as one unit). A
+backup), 20 for create, 10 for pause and resume, 20 for restart (pause and resume as one unit), 4 hours for a database restore. A
 client that leaves partway (Ctrl-C on `supabase projects delete`, a closed Studio tab, a proxy
 idle timeout) therefore cannot strand a project half deleted or stopped; the operation finishes
 and its outcome shows in the project's status. Status codes follow the specs: v1 pause, restore

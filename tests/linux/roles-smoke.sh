@@ -202,8 +202,8 @@ def can(action, resource):
     return any(not p["restrictive"] for p in ps)
 want = {
   "owner": {("write:Update", "organizations"): True, ("write:Create", "projects"): True, ("read:Read", "service_api_keys"): True, ("tenant:Sql:Write:Insert", "*"): True},
-  "admin": {("write:Update", "organizations"): False, ("write:Create", "projects"): True, ("read:Read", "service_api_keys"): True, ("tenant:Sql:Write:Insert", "*"): True},
-  "dev": {("write:Update", "organizations"): False, ("write:Create", "projects"): False, ("read:Read", "service_api_keys"): True, ("tenant:Sql:Write:Insert", "*"): True, ("write:Update", "custom_config_gotrue"): False, ("infra:Execute", "reboot"): True},
+  "admin": {("write:Update", "organizations"): False, ("write:Create", "projects"): True, ("read:Read", "service_api_keys"): True, ("tenant:Sql:Write:Insert", "*"): True, ("infra:Execute", "queue_job.walg.prepare_restore"): True, ("infra:Execute", "queue_job.restore.prepare"): True},
+  "dev": {("write:Update", "organizations"): False, ("write:Create", "projects"): False, ("read:Read", "service_api_keys"): True, ("tenant:Sql:Write:Insert", "*"): True, ("write:Update", "custom_config_gotrue"): False, ("infra:Execute", "reboot"): True, ("infra:Execute", "queue_job.walg.prepare_restore"): False, ("infra:Execute", "queue_job.restore.prepare"): False},
   "ro": {("write:Update", "organizations"): False, ("write:Create", "projects"): False, ("read:Read", "service_api_keys"): False, ("tenant:Sql:Write:Insert", "*"): False, ("tenant:Sql:Query", "*"): True, ("read:Read", "organizations"): True, ("infra:Execute", "queue_jobs.projects.pause"): False},
 }[role]
 bad = [f"{a} on {r}: want {w}" for (a, r), w in want.items() if can(a, r) != w]
@@ -242,6 +242,10 @@ expect 403 "${PAT[ro]}" PATCH "$CFG/config/auth" '{"site_url":"https://ro.exampl
 expect 403 "${PAT[ro]}" POST "$CFG/api-keys" '{"type":"publishable","name":"ro_key"}'
 expect 403 "${PAT[ro]}" GET "$CFG/api-keys?reveal=true"
 expect 403 "${PAT[ro]}" POST "$CFG/pause"
+# Backups: Read-only lists them; a restore overwrites production data, so it is for Owners and Administrators.
+expect 200 "${PAT[ro]}" GET "$CFG/database/backups"
+expect 403 "${PAT[ro]}" POST "$CFG/database/backups/restore-pitr" '{"recovery_time_target_unix":1760000000}'
+expect 403 "${PAT[ro]}" POST "$CFG/database/backups/restore" '{"id":1}'
 expect 403 "${PAT[ro]}" DELETE "$CFG"
 expect 403 "${PAT[ro]}" PATCH "$CFG" '{"name":"renamed"}'
 for q in "insert into public.roles_t values (2, 'b')" "update public.roles_t set v = 'x'" "delete from public.roles_t" "drop table public.roles_t" \
@@ -288,6 +292,9 @@ expect 403 "${PAT[dev]}" POST "$CFG/secrets" '[{"name":"DEV_SECRET","value":"x"}
 expect 403 "${PAT[dev]}" PATCH "$CFG/config/auth" '{"site_url":"https://dev.example.com"}'
 expect 403 "${PAT[dev]}" POST "$CFG/api-keys" '{"type":"publishable","name":"dev_key"}'
 expect 403 "${PAT[dev]}" POST "$CFG/pause"
+expect 200 "${PAT[dev]}" GET "$CFG/database/backups"
+expect 403 "${PAT[dev]}" POST "$CFG/database/backups/restore-pitr" '{"recovery_time_target_unix":1760000000}'
+expect 403 "${PAT[dev]}" POST "$CFG/database/backups/restore" '{"id":1}'
 expect 403 "${PAT[dev]}" PATCH "$CFG/database/password" '{"password":"a-new-database-password"}'
 # A branch with data copies production data: Owner and Administrator only (a schema-only branch is the Developer's).
 expect 403 "${PAT[dev]}" POST "$CFG/branches" '{"branch_name":"dev-data","with_data":true}'
@@ -297,6 +304,9 @@ expect 403 "${PAT[ro]}" POST "$CFG/branches" '{"branch_name":"ro-data","with_dat
 expect 403 "${PAT[dev]}" POST "/v1/projects" "{\"name\":\"nope\",\"organization_slug\":\"$ORG\",\"db_pass\":\"correct-horse-battery\"}"
 
 log "Administrator: settings and members, never Owners"
+# An Administrator passes the permission check of a restore; the time is far outside any window, so
+# the request is refused on its merits (400) before the project is touched.
+expect 400 "${PAT[admin]}" POST "$CFG/database/backups/restore-pitr" '{"recovery_time_target_unix":1760000000}'
 expect 201 "${PAT[admin]}" POST "$CFG/secrets" '[{"name":"ADMIN_SECRET","value":"x"}]'
 expect 200 "${PAT[admin]}" PATCH "$CFG/config/auth" '{"site_url":"https://admin.example.com"}'
 expect 201 "${PAT[admin]}" POST "$CFG/api-keys" '{"type":"publishable","name":"admin_key"}'

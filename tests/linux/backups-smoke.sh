@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Backups and point-in-time restore through the Management API, under real systemd units: what
+# the dashboard's Backups pages and `supabase` clients call.
+#
+#   sudo SUPAVISE_BIN=/path/to/supavise-linux-amd64 tests/linux/backups-smoke.sh [--teardown]
+#
+# A project is created through the API and rows are written in it (row 1, a base backup, row 2, a
+# time T, row 3). The backup list then shows the base backup and a restorable span that contains T.
+# A restore to T through POST /v1/projects/{ref}/database/backups/restore-pitr answers 201 with
+# the project RESTORING, refuses a second restore with 409 while it runs, and ends with the project
+# ACTIVE_HEALTHY holding rows 1 and 2 and not row 3. Then the same project is restored from the
+# listed base backup (POST .../backups/restore with its id) and holds row 1 only. Times outside the
+# span are refused with 400 and leave the project untouched.
+#
+# Without SUPAVISE_BIN the script builds supavise with the go toolchain. It needs network access
+# for the artifact downloads. Not run in development (root, systemd and Linux required); CI runs it
+# on an ephemeral Ubuntu 24.04 VM (amd64 and arm64).
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+TEARDOWN=0
+[[ ${1:-} == --teardown ]] && TEARDOWN=1
+trap 'rc=$?; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
+
+ADMIN=http://127.0.0.1:7000
+
+preflight
+install_binary
+setup_node
+
+log "system init, daemon"
+system_init
+wait_active supavise-postgres@system.service 30
+systemctl start supavise.service
+for ((i = 0; i < 60; i++)); do
+  [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
+  sleep 1
+done
+[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+
+log "a project through the Management API"
+claim_and_token
+gen_dbpass
+REF=$(api_create_project backups-smoke)
+CFG="/v1/projects/$REF"
+PSQL=$(ls -d "$SUPAVISE_STATE"/artifacts/postgres/*/bin/psql | head -1)
+PGPORT=$(project_field "$REF" 'd["ports"]["Postgres"]')
+pg_admin() { # SQL: as supabase_admin over the cluster's private socket
+  sudo -u "$SUPAVISE_USER" "$PSQL" "host=$SUPAVISE_STATE/projects/$REF/postgres/sock port=$PGPORT user=supabase_admin dbname=postgres" -Atc "$1" </dev/null
+}
+rows() { pg_admin "select coalesce(string_agg(label, ',' order by id), '') from public.restore_smoke"; }
+status() { papi GET "$CFG" | json_get 'd["status"]'; }
+code() { # METHOD PATH [BODY]: the HTTP status of a Management API call
+  local m=$1 p=$2 b=${3:-}
+  papi "$m" "$p" -o /dev/null -w '%{http_code}' ${b:+-H 'Content-Type: application/json' -d "$b"} || true
+}
+must() { # STATUS METHOD PATH [BODY]
+  local want=$1 got
+  got=$(code "$2" "$3" "${4:-}")
+  [[ $got == "$want" ]] || { log "response: $(papi "$2" "$3" ${4:+-H 'Content-Type: application/json' -d "$4"} | head -c 400)"; fail "$2 $3 answered $got, want $want"; }
+}
+wait_status() { # STATUS SECONDS
+  local want=$1 n=${2:-600} i s=""
+  for ((i = 0; i < n; i++)); do
+    s=$(status 2>/dev/null || true)
+    [[ $s == "$want" ]] && return 0
+    sleep 1
+  done
+  journalctl --no-pager -u supavise.service | tail -40 >&2
+  fail "$REF is $s after ${n}s, want $want"
+}
+
+log "the backup list and the PITR add-on of a new project"
+LIST=$(papi GET "$CFG/database/backups")
+[[ $(json_get 'd["pitr_enabled"]' <<<"$LIST") == True ]] || fail "pitr_enabled is not true: $LIST"
+# /platform routes take the dashboard session, not a personal access token.
+JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
+  -d '{"email":"smoke@example.com","password":"smoke-correct-horse-battery"}' | json_get 'd["access_token"]') || fail "dashboard sign-in"
+japi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H "Authorization: Bearer $JWT" "$@"; }
+ADDONS=$(japi GET "/platform/projects/$REF/billing/addons")
+[[ $(json_get 'd["selected_addons"][0]["type"]' <<<"$ADDONS") == pitr ]] || fail "no PITR add-on: $ADDONS"
+[[ $(json_get 'd["selected_addons"][0]["variant"]["meta"]["backup_duration_days"]' <<<"$ADDONS") == 7 ]] || fail "retention in the add-on: $ADDONS"
+# The nightly timer has not run on a new project, so there is normally nothing to restore from yet.
+if [[ $(json_get 'len(d["backups"])' <<<"$LIST") == 0 ]]; then
+  [[ $(json_get 'len(d["physical_backup_data"])' <<<"$LIST") == 0 ]] || fail "a restorable span before any base backup: $LIST"
+  must 400 POST "$CFG/database/backups/restore-pitr" "{\"recovery_time_target_unix\":$(date +%s)}"
+fi
+
+log "rows 1 and 2 around a base backup, a time T, then row 3"
+pg_admin "create table public.restore_smoke (id int primary key, label text); insert into public.restore_smoke values (1, 'one')" >/dev/null || fail "create table"
+supavise backups create "$REF" || fail "backups create"
+pg_admin "insert into public.restore_smoke values (2, 'two')" >/dev/null
+sleep 3
+T=$(date +%s)
+sleep 3
+pg_admin "insert into public.restore_smoke values (3, 'three')" >/dev/null
+[[ $(rows) == one,two,three ]] || fail "rows before the restore: $(rows)"
+
+log "the list shows the base backup and a span that contains T"
+LIST=$(papi GET "$CFG/database/backups")
+[[ $(json_get 'len(d["backups"])' <<<"$LIST") -ge 1 ]] || fail "no backup listed after one was taken: $LIST"
+[[ $(json_get 'd["backups"][0]["is_physical_backup"]' <<<"$LIST") == True && $(json_get 'd["backups"][0]["status"]' <<<"$LIST") == COMPLETED ]] || fail "backup entry: $LIST"
+FIRST_ID=$(json_get 'min(b["id"] for b in d["backups"])' <<<"$LIST")
+EARLIEST=$(json_get 'd["physical_backup_data"]["earliest_physical_backup_date_unix"]' <<<"$LIST")
+LATEST=$(json_get 'd["physical_backup_data"]["latest_physical_backup_date_unix"]' <<<"$LIST")
+(( EARLIEST <= T && T <= LATEST )) || fail "T=$T is not inside the span $EARLIEST..$LATEST"
+PLAT=$(japi GET "/platform/database/$REF/backups")
+[[ $(json_get 'd["backups"][0]["isPhysicalBackup"]' <<<"$PLAT") == True && $(json_get 'd["pitr_enabled"]' <<<"$PLAT") == True ]] || fail "platform list: $PLAT"
+
+log "refused: a time outside the span, a backup that does not exist"
+must 400 POST "$CFG/database/backups/restore-pitr" "{\"recovery_time_target_unix\":$((EARLIEST - 5))}"
+must 400 POST "$CFG/database/backups/restore-pitr" "{\"recovery_time_target_unix\":$((LATEST + 3600))}"
+must 404 POST "$CFG/database/backups/restore" '{"id":999999}'
+[[ $(status) == ACTIVE_HEALTHY && $(rows) == one,two,three ]] || fail "a refused restore changed the project"
+
+log "restore to T through the API: RESTORING, a second restore refused, ACTIVE_HEALTHY, rows 1 and 2"
+must 201 POST "$CFG/database/backups/restore-pitr" "{\"recovery_time_target_unix\":$T}"
+[[ $(status) == RESTORING ]] || fail "the project is $(status) right after the restore began, want RESTORING"
+must 409 POST "$CFG/database/backups/restore-pitr" "{\"recovery_time_target_unix\":$T}"
+must 409 POST "$CFG/pause"
+wait_status ACTIVE_HEALTHY 900
+GOT=$(rows)
+[[ $GOT == one,two ]] || fail "after the restore to T the rows are '$GOT', want one,two"
+supavise projects health "$REF" || fail "$REF is not healthy after the restore"
+[[ $(unit_state "supavise-postgres@$REF.service") == active ]] || fail "supavise-postgres@$REF is not active after the restore"
+# The new timeline has a base backup at once: the restore takes one (reason post-restore).
+supavise backups list "$REF" | grep -q post-restore || { supavise backups list "$REF" >&2; fail "no post-restore base backup after the restore"; }
+LIST=$(papi GET "$CFG/database/backups")
+[[ $(json_get 'len(d["backups"])' <<<"$LIST") -ge 2 ]] || fail "no base backup of the new timeline is listed: $LIST"
+
+log "restore the state of the first listed base backup (id $FIRST_ID)"
+must 201 POST "$CFG/database/backups/restore" "{\"id\":$FIRST_ID}"
+[[ $(status) == RESTORING ]] || fail "the project is $(status) right after the restore began, want RESTORING"
+wait_status ACTIVE_HEALTHY 900
+GOT=$(rows)
+[[ $GOT == one ]] || fail "after the restore of the first base backup the rows are '$GOT', want one"
+
+supavise projects health "$REF" || fail "$REF is not healthy at the end"
+log "backups smoke passed"

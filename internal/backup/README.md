@@ -84,6 +84,10 @@ Limitation: an in-place restore brings back the database role passwords the back
 
 The `system` cluster cannot be restored with this command: it holds the registry that `restore` reads and writes.
 
+### From the dashboard and the Management API
+
+Studio's Backups pages and the Management API restore a project in place through `Service.RestoreInPlace` (`window.go`, `lifecycle.InPlaceRestorer`): a time (`--to <time> --force`), a listed base backup (`--to backup --backup-id <id> --force`) or a base backup plus a time (`--backup-id <id> --to <time> --force`). `internal/api/README.md`, "Backups and point-in-time restore", has the routes. The lifecycle Engine runs it with the project held `RESTORING` (`internal/lifecycle/README.md`, "In-place restore"). `Service.RestoreWindow` is what the dashboard lists: the base backups a restore can use (complete, on the archive's timeline history, first WAL file archived: the checks of `PlanRestoreWith`), the end of the oldest as the earliest restorable time, and now (a running project, whose newest WAL the restore archives first) or the newest archived object as the latest. It lists the WAL directory once for the timeline history, and a second time for a project that is not running. A restore that the daemon's stop cuts off leaves the project `RESTORING`: the original data directory is `<dir>.pre-restore-<time>` (or already back in place), nothing starts the project, and an operator puts the directories in order and moves the project on by hand (`update supavise.projects set status = 'INACTIVE' where ref = '<ref>'` in the registry, then `supavise projects resume <ref>`); only a delete works without that.
+
 Run `supavise backups` and `supavise wal` as the `supavise` user (`sudo -u supavise supavise backups ...`). As root they refuse to run: the file backend and the restored data directory would be created root-owned, which the timer (`User=supavise`) could no longer read or prune and which Postgres refuses to open.
 
 ### Disaster recovery of the system cluster
@@ -124,6 +128,8 @@ go test ./internal/backup/ ./cmd/supavise/        # everything below that can ru
 | `restore_modes_test.go` | failed recovery is an error (new project and in place, with rollback), data directory check, timeline-aware base backup choice, `latest`/`backup` targets, recovery settings kept until promotion, leftover-archive and `system` refusals | nothing |
 | `TestRestoreInPlaceRollsBackWhenRecoveryCannotReachItsTarget` | an in-place restore to a time no commit reaches: PostgreSQL ends recovery with a fatal error, the original data directory is put back, the project runs on it, the failed attempt is kept in `.failed-restore-*` and the original still backs up | Postgres artifact |
 | `TestRestoreRunningSourceToRecentTime` | a running source restored to a time whose next commit is still unarchived (the restore must archive it first); a target after the last commit must fail with an error | Postgres artifact |
+| `window_test.go` | the restorable span and backup list (timeline history, lost WAL, running or not), `RestoreInPlace` for a time, a backup, and both | nothing |
+| `tests/linux/backups-smoke.sh` | the Management API restore end to end under systemd (CI job `backups-smoke`): backup list, restore to a time between two writes, a second restore refused, `ACTIVE_HEALTHY` and the data of that time, restore from the listed backup | Linux, root, systemd |
 | `store_s3_test.go`, `TestPointInTimeRestoreS3Fake` | the S3 store and the whole scenario over S3 against an in-process fake S3 (gofakes3) | Postgres artifact for the second |
 | `TestS3StoreAgainstRealService`, `TestPointInTimeRestoreS3` | the same against a real S3-compatible service | `SUPAVISE_TEST_S3_ENDPOINT`, `_BUCKET`, `_ACCESS_KEY`, `_SECRET_KEY` (optional `_REGION`); CI only |
 
