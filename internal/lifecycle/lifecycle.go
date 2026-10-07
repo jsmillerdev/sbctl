@@ -21,7 +21,7 @@ type DataSeeder func(ctx context.Context, p *registry.Project, dataDir string) e
 type CreateRequest struct {
 	Name    string
 	OrgSlug string
-	Region  string // informational; default "local"
+	Region  string // a real AWS region code; anything else becomes config.Region
 	Class   string
 	// Ref forces the ref (restore --as, tests); empty generates one.
 	Ref string
@@ -113,6 +113,13 @@ type Plane interface {
 type BaseBackuper interface {
 	BaseBackup(ctx context.Context, ref string) (*registry.Backup, error)
 }
+
+// ErrNoRestorableState is returned (wrapped) by a BaseBackuper for a project whose
+// cluster never became a database a base backup can be taken from: a restore-as-new clone
+// whose recovery failed or has not finished, with no completed base backup of its own.
+// Engine.DeleteWith treats it as "nothing worth backing up" and goes on with the delete;
+// without it such a project could never be removed.
+var ErrNoRestorableState = errors.New("lifecycle: the project has no restorable state to back up")
 
 // ErrNoSnapshot is returned by DataPlane.Snapshot when no BaseBackuper is configured.
 var ErrNoSnapshot = errors.New("lifecycle: no backup engine configured")

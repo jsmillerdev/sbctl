@@ -65,7 +65,7 @@ func (s *Server) v1Project(ctx context.Context, p *registry.Project) (*v1.V1Proj
 	}
 	out := &v1.V1ProjectWithDatabaseResponseOutput{
 		CreatedAt: ts(p.CreatedAt), Id: p.Ref, Name: p.Name, OrganizationId: org.Slug,
-		OrganizationSlug: org.Slug, Ref: p.Ref, Region: regionOf(p),
+		OrganizationSlug: org.Slug, Ref: p.Ref, Region: s.regionOf(p),
 		Status: v1.V1ProjectWithDatabaseResponseOutputStatus(p.Status),
 	}
 	out.Database.Host = s.dbHost(p.Ref)
@@ -75,12 +75,8 @@ func (s *Server) v1Project(ctx context.Context, p *registry.Project) (*v1.V1Proj
 	return out, nil
 }
 
-func regionOf(p *registry.Project) string {
-	if p.Region == "" {
-		return "local"
-	}
-	return p.Region
-}
+// regionOf is the region shown for p: a real AWS region code, never a free-form label.
+func (s *Server) regionOf(p *registry.Project) string { return s.cfg.ProjectRegion(p.Region) }
 
 func (s *Server) v1ListProjects(w http.ResponseWriter, r *http.Request) error {
 	ps, err := s.userProjects(r.Context())
@@ -231,7 +227,7 @@ func (s *Server) v1CreateProject(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeJSON(w, http.StatusCreated, &v1.V1ProjectResponseOutput{
 		CreatedAt: ts(p.CreatedAt), Id: p.Ref, Name: p.Name, OrganizationId: org.Slug,
-		OrganizationSlug: org.Slug, Ref: p.Ref, Region: regionOf(p), Status: v1.V1ProjectResponseOutputStatus(p.Status),
+		OrganizationSlug: org.Slug, Ref: p.Ref, Region: s.regionOf(p), Status: v1.V1ProjectResponseOutputStatus(p.Status),
 	})
 	return nil
 }

@@ -236,10 +236,7 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 	if req.DBPassword != "" {
 		keys.DBPassword = req.DBPassword
 	}
-	region := req.Region
-	if region == "" {
-		region = "local"
-	}
+	region := e.cfg.ProjectRegion(req.Region)
 	name := req.Name
 	if name == "" {
 		name = ref
@@ -413,11 +410,17 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 		return fmt.Errorf("%w: the system project cannot be deleted", ErrInvalidState)
 	}
 	prev := p.Status
+	skippedBackup := false
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusGoingDown); err != nil {
 		return err
 	}
 	if e.opts.Backup != nil && !o.SkipFinalBackup && prev != registry.StatusInitFailed {
-		if err := e.finalBackup(ctx, p, prev); err != nil {
+		switch err := e.finalBackup(ctx, p, prev); {
+		case errors.Is(err, ErrNoRestorableState):
+			e.log.Warn("delete: nothing to back up, deleting without a final backup", "ref", ref, "reason", err)
+			e.event(ctx, ref, "project.final_backup_skipped", map[string]string{"reason": err.Error()})
+			skippedBackup = true
+		case err != nil:
 			_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, prev)
 			return fmt.Errorf("lifecycle: final backup of %s failed, project kept: %w", ref, err)
 		}
@@ -437,7 +440,7 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	if err := e.reg.DeleteProject(ctx, ref); err != nil {
 		return err
 	}
-	e.event(ctx, ref, "project.deleted", map[string]any{"final_backup": e.opts.Backup != nil && !o.SkipFinalBackup && prev != registry.StatusInitFailed})
+	e.event(ctx, ref, "project.deleted", map[string]any{"final_backup": e.opts.Backup != nil && !o.SkipFinalBackup && !skippedBackup && prev != registry.StatusInitFailed})
 	return nil
 }
 
@@ -646,4 +649,85 @@ func FormatHealth(hs []ServiceHealth) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// Recovered describes one project Recover moved out of a transitional status.
+type Recovered struct {
+	Ref  string
+	From registry.Status
+	To   registry.Status
+	Note string
+}
+
+// Recover runs once when the daemon starts, before StartActive. A crash or restart in
+// the middle of an operation leaves the project in a transitional status that nothing
+// else would ever move again: COMING_UP (create or resume), PAUSING and RESTARTING.
+//
+//   - PAUSING: the pause is finished (units stopped), status INACTIVE.
+//   - COMING_UP or RESTARTING with a route: the project was created before and a resume
+//     or restart was cut short; its units are stopped and it becomes INACTIVE, so that
+//     Resume can be run again.
+//   - COMING_UP with no route: the create never finished. INIT_FAILED, with the data
+//     left in place; Delete cleans it up.
+//
+// GOING_DOWN (delete) and RESTORING are not touched: Delete is repeatable from any status
+// and a restore is for its operator to judge.
+func (e *Engine) Recover(ctx context.Context) []Recovered {
+	ps, err := e.reg.ListProjects(ctx)
+	if err != nil {
+		e.log.Error("recover: listing projects", "error", err)
+		return nil
+	}
+	routes := map[string]bool{}
+	if rs, err := e.reg.ListRoutes(ctx); err == nil {
+		for _, r := range rs {
+			routes[r.Ref] = true
+		}
+	}
+	var out []Recovered
+	for i := range ps {
+		p := ps[i]
+		if p.Ref == config.SystemRef {
+			continue
+		}
+		var to registry.Status
+		note := ""
+		switch p.Status {
+		case registry.StatusPausing:
+			to, note = registry.StatusInactive, "the daemon stopped during a pause"
+		case registry.StatusComingUp, registry.StatusRestarting:
+			if routes[p.Ref] {
+				to, note = registry.StatusInactive, "the daemon stopped during a resume or restart"
+			} else {
+				to, note = registry.StatusInitFailed, "the daemon stopped before the project finished creating; delete it and create it again"
+			}
+		case registry.StatusGoingDown:
+			e.log.Warn("recover: project is GOING_DOWN from an interrupted delete; run `sbctl projects delete` again", "ref", p.Ref)
+			continue
+		default:
+			continue
+		}
+		unlock, err := e.lock(ctx, p.Ref)
+		if err != nil {
+			e.log.Warn("recover: lock", "ref", p.Ref, "error", err)
+			continue
+		}
+		cur, err := e.reg.GetProject(ctx, p.Ref)
+		if err == nil && cur.Status == p.Status {
+			if to == registry.StatusInactive {
+				if serr := e.plane.Stop(ctx, p.Ref); serr != nil {
+					e.log.Warn("recover: stopping units", "ref", p.Ref, "error", serr)
+				}
+			}
+			if err := e.reg.SetProjectStatus(ctx, p.Ref, to); err != nil {
+				e.log.Error("recover: set status", "ref", p.Ref, "error", err)
+			} else {
+				e.event(ctx, p.Ref, "project.recovered", map[string]string{"from": string(p.Status), "to": string(to), "note": note})
+				e.log.Warn("recovered project after an interrupted operation", "ref", p.Ref, "from", p.Status, "to", to, "note", note)
+				out = append(out, Recovered{Ref: p.Ref, From: p.Status, To: to, Note: note})
+			}
+		}
+		unlock()
+	}
+	return out
 }

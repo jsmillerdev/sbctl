@@ -64,7 +64,7 @@ check_project() { # REF
   [[ $(http_code -H "Authorization: Bearer not.a.jwt" "http://127.0.0.1:$rt/") == 401 ]] || fail "$ref: postgrest accepted a bad JWT"
   # Sign-up proves GoTrue wrote to the project's auth schema.
   [[ $(http_code -X POST -H "apikey: $anon" -H 'Content-Type: application/json' \
-      -d '{"email":"smoke@example.com","password":"correct-horse-battery-1"}' "http://127.0.0.1:$gt/signup") == 200 ]] || fail "$ref: signup"
+      -d "{\"email\":\"smoke-$RANDOM$RANDOM@example.com\",\"password\":\"correct-horse-battery-1\"}" "http://127.0.0.1:$gt/signup") == 200 ]] || fail "$ref: signup"
   # Passwordless TCP login is refused.
   local psql
   psql=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)

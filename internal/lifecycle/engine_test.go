@@ -191,18 +191,18 @@ func TestCreateRequestOptions(t *testing.T) {
 	}
 	seed := DataSeeder(func(context.Context, *registry.Project, string) error { return nil })
 	lim := config.Limits{MemoryMax: "512M", CPUQuota: "50%"}
-	p, err := h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu"})
+	p, err := h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu-west-2"})
 	if err == nil {
 		t.Fatal("unknown organization must fail")
 	}
 	if _, err := h.reg.CreateOrganization(context.Background(), "acme", "Acme"); err != nil {
 		t.Fatal(err)
 	}
-	p, err = h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu"})
+	p, err = h.e.Create(context.Background(), CreateRequest{Ref: "abcdefghijklmnopqrst", Class: "micro", Keys: k, Seed: seed, Limits: &lim, DBPassword: "pw", OrgSlug: "acme", Region: "eu-west-2"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Ref != "abcdefghijklmnopqrst" || p.Class != "micro" || p.Limits != lim || p.Region != "eu" || p.Name != p.Ref {
+	if p.Ref != "abcdefghijklmnopqrst" || p.Class != "micro" || p.Limits != lim || p.Region != "eu-west-2" || p.Name != p.Ref {
 		t.Fatalf("project = %+v", p)
 	}
 	if !h.plane.seeded || h.plane.keysIn.JWTSecret != k.JWTSecret || h.plane.keysIn.DBPassword != "pw" {
@@ -711,5 +711,97 @@ func TestLockIsCrossProcessWithPostgresRegistry(t *testing.T) {
 	case <-got:
 	case <-time.After(5 * time.Second):
 		t.Fatal("second engine never got the lock")
+	}
+}
+
+func TestDeleteSkipsFinalBackupWhenNothingIsRestorable(t *testing.T) {
+	h := newHarness(t)
+	p := h.create(t)
+	h.backup.err = fmt.Errorf("backup %s: %w (the clone never finished recovery)", p.Ref, ErrNoRestorableState)
+	if err := h.e.Delete(context.Background(), p.Ref); err != nil {
+		t.Fatalf("delete of a project with no restorable state failed: %v", err)
+	}
+	if _, err := h.reg.GetProject(context.Background(), p.Ref); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("project row remains: %v", err)
+	}
+	evs, _ := h.reg.ListEvents(context.Background(), p.Ref, 50)
+	var skipped bool
+	for _, e := range evs {
+		skipped = skipped || e.Kind == "project.final_backup_skipped"
+	}
+	if !skipped {
+		t.Error("the skipped final backup was not recorded as an event")
+	}
+	// Any other backup error still keeps the project.
+	q := h.create(t)
+	h.backup.err = errors.New("disk full")
+	if err := h.e.Delete(context.Background(), q.Ref); err == nil {
+		t.Fatal("a real backup failure must keep the project")
+	}
+	if got, _ := h.reg.GetProject(context.Background(), q.Ref); got == nil || got.Status == registry.StatusGoingDown {
+		t.Fatalf("project not restored to its previous status: %+v", got)
+	}
+}
+
+func TestRecoverMovesInterruptedProjects(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	mk := func(status registry.Status, route bool) string {
+		p := h.create(t)
+		if !route {
+			if err := h.reg.DeleteRoute(ctx, h.cfg.ProjectHost(p.Ref)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := h.reg.SetProjectStatus(ctx, p.Ref, status); err != nil {
+			t.Fatal(err)
+		}
+		return p.Ref
+	}
+	pausing := mk(registry.StatusPausing, true)
+	resuming := mk(registry.StatusComingUp, true)
+	creating := mk(registry.StatusComingUp, false)
+	goingDown := mk(registry.StatusGoingDown, true)
+	healthy := mk(registry.StatusActiveHealthy, true)
+
+	got := h.e.Recover(ctx)
+	want := map[string]registry.Status{pausing: registry.StatusInactive, resuming: registry.StatusInactive, creating: registry.StatusInitFailed}
+	if len(got) != len(want) {
+		t.Fatalf("recovered %+v, want %d projects", got, len(want))
+	}
+	for ref, status := range want {
+		p, _ := h.reg.GetProject(ctx, ref)
+		if p.Status != status {
+			t.Errorf("%s is %s, want %s", ref, p.Status, status)
+		}
+	}
+	for _, ref := range []string{goingDown, healthy} {
+		p, _ := h.reg.GetProject(ctx, ref)
+		wantStatus := registry.StatusActiveHealthy
+		if ref == goingDown {
+			wantStatus = registry.StatusGoingDown
+		}
+		if p.Status != wantStatus {
+			t.Errorf("%s was touched: %s", ref, p.Status)
+		}
+	}
+	if !h.plane.has("Stop "+pausing) || !h.plane.has("Stop "+resuming) || h.plane.has("Stop "+creating) {
+		t.Errorf("units stopped for the wrong projects: %v", h.plane.calls)
+	}
+	if again := h.e.Recover(ctx); len(again) != 0 {
+		t.Errorf("a second pass found work: %+v", again)
+	}
+}
+
+func TestCreateRegionIsARealRegionCode(t *testing.T) {
+	h := newHarness(t)
+	for in, want := range map[string]string{"": "us-east-1", "local": "us-east-1", "eu-central-1": "eu-central-1", "Frankfurt": "us-east-1"} {
+		p, err := h.e.Create(context.Background(), CreateRequest{Name: "r", Region: in})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Region != want {
+			t.Errorf("region %q -> %q, want %q", in, p.Region, want)
+		}
 	}
 }

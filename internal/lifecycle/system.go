@@ -256,7 +256,7 @@ func (l *lateBackuper) BaseBackup(ctx context.Context, ref string) (*registry.Ba
 // systemProject is the registry view of the system cluster.
 func systemProject(cfg *config.Config, versions map[string]string) *registry.Project {
 	return &registry.Project{
-		Ref: config.SystemRef, Seq: 0, Name: "system", Region: "local", Engine: registry.EnginePostgres,
+		Ref: config.SystemRef, Seq: 0, Name: "system", Region: cfg.ProjectRegion(""), Engine: registry.EnginePostgres,
 		Class: ClassSystem, Status: registry.StatusComingUp, Versions: versions, Limits: cfg.Defaults,
 	}
 }

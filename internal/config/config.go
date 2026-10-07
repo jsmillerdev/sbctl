@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,7 @@ const (
 	DefaultKeyPath    = "/etc/sbctl/master.key"
 	DefaultStateDir   = "/var/lib/sbctl"
 	DefaultBinPath    = "/usr/local/bin/sbctl"
+	DefaultRegion     = "us-east-1"
 	EnvPrefix         = "SBCTL_"
 	EnvConfigPath     = "SBCTL_CONFIG"
 	SupervisorSystemd = "systemd"
@@ -41,6 +43,10 @@ type Config struct {
 	// Platform selects the artifact build, for example "linux-amd64". Empty means the running platform.
 	Platform string `toml:"platform"`
 	LogLevel string `toml:"log_level"`
+	// Region is the AWS region code shown for every project (Studio and the Supabase CLI
+	// resolve it against a list of real regions, so a free-form label breaks the project
+	// list). It is only a label here: nothing is placed by it. Default "us-east-1".
+	Region string `toml:"region"`
 
 	Listen    Listen    `toml:"listen"`
 	Ports     Ports     `toml:"ports"`
@@ -120,6 +126,7 @@ func Default() *Config {
 		BinPath:    DefaultBinPath,
 		Supervisor: SupervisorSystemd,
 		LogLevel:   "info",
+		Region:     DefaultRegion,
 		Listen:     Listen{HTTP: ":80", HTTPS: ":443", Admin: "127.0.0.1:7000"},
 		Ports:      DefaultPorts(),
 		TLS:        TLS{Mode: "auto", Credentials: map[string]string{}},
@@ -177,6 +184,12 @@ func (c *Config) Validate() error {
 	}
 	if c.StateDir == "" {
 		return errors.New("config: state_dir is empty")
+	}
+	if c.Region == "" {
+		c.Region = DefaultRegion
+	}
+	if !regionRE.MatchString(c.Region) {
+		return fmt.Errorf("config: region %q is not an AWS region code such as us-east-1", c.Region)
 	}
 	if c.Ports.ProjectBase < 1024 || c.MaxProjectSeq() < 1 {
 		return fmt.Errorf("config: ports.project_base %d out of range", c.Ports.ProjectBase)
@@ -245,4 +258,23 @@ func lookup(environ []string, name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// regionRE matches AWS region codes (us-east-1, eu-central-2, ap-southeast-4, us-gov-west-1).
+var regionRE = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]$`)
+
+// ValidRegion reports whether s looks like an AWS region code.
+func ValidRegion(s string) bool { return regionRE.MatchString(s) }
+
+// ProjectRegion maps a stored or requested project region to the label shown to
+// clients: a real region code is kept, anything else (empty, the old "local") becomes
+// the configured region.
+func (c *Config) ProjectRegion(s string) string {
+	if regionRE.MatchString(s) {
+		return s
+	}
+	if c.Region != "" {
+		return c.Region
+	}
+	return DefaultRegion
 }
