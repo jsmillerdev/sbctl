@@ -57,6 +57,22 @@ type PlaneOptions struct {
 	// Settings supplies the project's saved settings for the units' environment and the
 	// cluster's arguments; nil renders the defaults (tests, the system project).
 	Settings Settings
+	// SystemAuth supplies what sb-gotrue@system needs for dashboard SSO (see SystemAuth); nil
+	// renders it as before: sign-up closed, no SAML.
+	SystemAuth func(ctx context.Context) (*SystemAuth, error)
+}
+
+// SystemAuth is the configuration of sb-gotrue@system for single sign-on. With it the system
+// GoTrue accepts SAML sign-ins and its sign-up is open, which is safe because every user it
+// would create is first checked by the before-user-created hook (internal/sso/hook.go), served
+// by the daemon, which allows registered SSO providers and invited addresses only and refuses
+// everything else, and refuses when it cannot answer.
+type SystemAuth struct {
+	// SigningKey is GOTRUE_SAML_PRIVATE_KEY.
+	SigningKey string
+	// HookURL and HookSecret are the before-user-created hook.
+	HookURL    string
+	HookSecret string
 }
 
 // PostgresPlane is the DataPlane of engine "postgres": one cluster, one GoTrue and one

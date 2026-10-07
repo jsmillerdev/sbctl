@@ -51,9 +51,6 @@ func authView(key string, st *projectconfig.State, upper bool) map[string]any {
 		resp[k] = secretView(f, v)
 	}
 	resp[name("mailer_autoconfirm")] = st.AuthAutoconfirm()
-	if _, ok := resp[name("saml_allow_encrypted_assertions")]; ok {
-		resp[name("saml_allow_encrypted_assertions")] = false
-	}
 	if _, ok := resp[name("custom_oauth_max_providers")]; ok {
 		resp[name("custom_oauth_max_providers")] = 0
 	}

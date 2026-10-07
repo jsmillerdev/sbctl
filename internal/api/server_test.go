@@ -17,6 +17,8 @@ func TestRouteTableBuilds(t *testing.T) {
 			inSpec++
 		case strings.Contains(key, "/platform/storage/"), key == "GET /platform/auth/{ref}/users":
 			// Studio calls these; the platform spec omits them.
+		case strings.Contains(key, "/platform/organizations/{slug}/sso/"):
+			// sbctl's own routes for several identity providers and the users waiting for approval.
 		default:
 			t.Errorf("implemented route %q is neither an operation of the pinned specs nor a known extra", key)
 		}

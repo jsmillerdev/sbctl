@@ -19,6 +19,7 @@ import (
 	"github.com/OWNER/sbctl/internal/projectconfig"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/OWNER/sbctl/internal/sso"
 	"github.com/OWNER/sbctl/internal/units"
 )
 
@@ -164,8 +165,36 @@ func (o *OpenOptions) newSettings(cfg *config.Config, reg *registry.Postgres, se
 	return projectconfig.NewManager(projectconfig.NewPGStore(reg.Pool()), sec, projectconfig.Options{
 		TemplateBaseURL: TemplateBaseURL(cfg),
 		Event:           func(ctx context.Context, ref, kind string, payload any) { _ = reg.AppendEvent(ctx, ref, kind, payload) },
-		Log:             o.log(),
+		SigningKey: func(ctx context.Context, ref string) (string, error) {
+			return sso.EnsureSigningKey(ctx, reg, sec, ref)
+		},
+		Log: o.log(),
 	})
+}
+
+// systemAuth is PlaneOptions.SystemAuth for a node: the system project's SAML signing key
+// (created on first use, sealed in the registry), and the before-user-created hook of the
+// daemon. It returns nil, nil (no SSO configuration) while the registry is not open yet, and
+// for a Secrets that cannot derive the hook's shared secret (test doubles).
+func systemAuth(cfg *config.Config, reg func() registry.Registry, sec secrets.Secrets) func(ctx context.Context) (*SystemAuth, error) {
+	return func(ctx context.Context) (*SystemAuth, error) {
+		r := reg()
+		if r == nil {
+			return nil, nil
+		}
+		secret, err := sso.HookSecret(sec)
+		if errors.Is(err, sso.ErrNoDerivation) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		key, err := sso.EnsureSigningKey(ctx, r, sec, config.SystemRef)
+		if err != nil {
+			return nil, err
+		}
+		return &SystemAuth{SigningKey: key, HookURL: sso.HookURL(cfg), HookSecret: secret}, nil
+	}
 }
 
 // TemplateBaseURL is where a project's GoTrue fetches its email templates: the daemon's
@@ -244,6 +273,7 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	po.Backup = bk
 	node.Settings = o.newSettings(cfg, reg, sec)
 	po.Settings = node.Settings
+	po.SystemAuth = systemAuth(cfg, func() registry.Registry { return node.Registry }, sec)
 	node.Plane = NewPostgresPlane(cfg, sup, arts, reg, po)
 	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
 	return node, nil
@@ -459,6 +489,7 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	plane.opts.Backup = bk
 	node.Settings = o.newSettings(cfg, reg, sec)
 	plane.opts.Settings = node.Settings
+	plane.opts.SystemAuth = systemAuth(cfg, func() registry.Registry { return node.Registry }, sec)
 	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
 	node.Engine = eng
 

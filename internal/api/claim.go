@@ -76,6 +76,14 @@ type Accounts struct {
 	// NoMail makes invitations skip the mail even when [mail] is configured (`users invite
 	// --no-mail`): the caller passes the link on.
 	NoMail bool
+	// SSOUsers forgets a removed user's single sign-on record (the pending list must not
+	// keep a person whose account is gone) and remembers the removal by the address, so that a
+	// new account of the same person does not get the provider's default role. Set by
+	// NewDashboardSSO.
+	SSOUsers interface {
+		DeleteSSOUser(ctx context.Context, userID string) error
+		DenySSOEmail(ctx context.Context, providerID, email string, at time.Time) error
+	}
 }
 
 func (a *Accounts) now() time.Time {
@@ -389,6 +397,13 @@ type DashboardUser struct {
 	LastSignIn  *time.Time `json:"last_sign_in_at,omitempty"`
 	Admin       bool       `json:"admin"`
 	BannedUntil *time.Time `json:"banned_until,omitempty"`
+	// Provider is GoTrue's app_metadata.provider: "email" for an account with a password, "sso:<id>"
+	// for one that an identity provider vouched for.
+	Provider string `json:"provider,omitempty"`
+	// SSOProvider is the id of the identity provider of an account that came from single sign-on
+	// only, "" for every other account. Email addresses are not unique across the two kinds
+	// (GoTrue's uniqueness index skips SSO accounts), so a lookup by address must tell them apart.
+	SSOProvider string `json:"sso_provider,omitempty"`
 }
 
 // ListUsers returns the dashboard users.
@@ -410,7 +425,9 @@ func (a *Accounts) ListUsers(ctx context.Context) ([]DashboardUser, error) {
 		}
 		for _, u := range res.Users {
 			admin, _ := u.AppMetadata[AdminClaim].(bool)
-			out = append(out, DashboardUser{ID: u.ID, Email: u.Email, CreatedAt: u.CreatedAt, LastSignIn: u.LastSignIn, Admin: admin, BannedUntil: u.BannedUntil})
+			provider, _ := u.AppMetadata["provider"].(string)
+			out = append(out, DashboardUser{ID: u.ID, Email: u.Email, CreatedAt: u.CreatedAt, LastSignIn: u.LastSignIn, Admin: admin, BannedUntil: u.BannedUntil,
+				Provider: provider, SSOProvider: ssoProviderOf(map[string]any{"app_metadata": u.AppMetadata})})
 		}
 		if len(res.Users) < 100 {
 			break
@@ -419,8 +436,17 @@ func (a *Accounts) ListUsers(ctx context.Context) ([]DashboardUser, error) {
 	return out, nil
 }
 
-// RemoveUser removes the dashboard user with this email, together with the memberships and
-// roles of the user, and ends the user's access at once. It refuses when the user is the only
+// RemoveUser removes the dashboard user with this email; see RemoveUserBy.
+func (a *Accounts) RemoveUser(ctx context.Context, email string, force bool) (tokens int, err error) {
+	_, tokens, err = a.RemoveUserBy(ctx, email, force, UserSelector{})
+	return tokens, err
+}
+
+// RemoveUserBy removes one dashboard account, together with the memberships and
+// roles of the user, and ends the user's access at once. The account is the one with this email
+// address; when several accounts share it (a password account and one or more single sign-on
+// accounts) the selector says which, and without one the password account is the one (see
+// ResolveUser). It refuses when the user is the only
 // Owner of an organization (members.ErrLastOwner) unless force is set; the refusal comes first
 // and changes nothing. The order after that matters, and a failed step leaves the account
 // findable so that the command can be run again:
@@ -433,43 +459,53 @@ func (a *Accounts) ListUsers(ctx context.Context) ([]DashboardUser, error) {
 //  4. The GoTrue account is deleted, which also deletes the user's sessions and refresh
 //     tokens there, so no new access token can be issued.
 //
-// It returns the number of tokens removed.
-func (a *Accounts) RemoveUser(ctx context.Context, email string, force bool) (tokens int, err error) {
+// It returns the account that was removed and the number of tokens removed.
+func (a *Accounts) RemoveUserBy(ctx context.Context, email string, force bool, sel UserSelector) (removed *DashboardUser, tokens int, err error) {
 	email, err = normalizeEmail(email)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
-	users, err := a.ListUsers(ctx)
+	u, err := a.ResolveUser(ctx, email, sel)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
-	for _, u := range users {
-		if strings.EqualFold(u.Email, email) {
-			if a.Members != nil {
-				if err := a.Members.RemoveUser(ctx, u.ID, force); err != nil {
-					return 0, err
-				}
-			}
-			if err := a.Store.MarkUserRemoved(ctx, u.ID, u.Email); err != nil {
-				return 0, err
-			}
-			ts, err := a.Reg.ListAccessTokens(ctx, u.ID)
-			if err != nil {
-				return 0, err
-			}
-			for _, t := range ts {
-				if err := a.Reg.DeleteAccessToken(ctx, u.ID, t.ID); err != nil {
-					return tokens, err
-				}
-				tokens++
-			}
-			if _, err := a.goTrue(ctx, http.MethodDelete, "/admin/users/"+url.PathEscape(u.ID), nil, nil); err != nil {
-				return tokens, err
-			}
-			return tokens, nil
+	if u == nil {
+		return nil, 0, fmt.Errorf("no dashboard user %s", email)
+	}
+	if a.Members != nil {
+		if err := a.Members.RemoveUser(ctx, u.ID, force); err != nil {
+			return nil, 0, err
 		}
 	}
-	return 0, fmt.Errorf("no dashboard user %s", email)
+	if err := a.Store.MarkUserRemoved(ctx, u.ID, u.Email); err != nil {
+		return nil, 0, err
+	}
+	if a.SSOUsers != nil {
+		// The account is gone, but the person can sign in again and get a new one: the removal
+		// is kept by address, and the provider's default role does not undo it.
+		if u.SSOProvider != "" {
+			if err := a.SSOUsers.DenySSOEmail(ctx, u.SSOProvider, u.Email, a.now()); err != nil {
+				return nil, 0, err
+			}
+		}
+		if err := a.SSOUsers.DeleteSSOUser(ctx, u.ID); err != nil {
+			return nil, 0, err
+		}
+	}
+	ts, err := a.Reg.ListAccessTokens(ctx, u.ID)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, t := range ts {
+		if err := a.Reg.DeleteAccessToken(ctx, u.ID, t.ID); err != nil {
+			return u, tokens, err
+		}
+		tokens++
+	}
+	if _, err := a.goTrue(ctx, http.MethodDelete, "/admin/users/"+url.PathEscape(u.ID), nil, nil); err != nil {
+		return u, tokens, err
+	}
+	return u, tokens, nil
 }
 
 // ---- HTTP -----------------------------------------------------------------

@@ -19,6 +19,7 @@ import (
 	"github.com/OWNER/sbctl/internal/projectconfig"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/OWNER/sbctl/internal/sso"
 )
 
 // Deps are the collaborators of the API server.
@@ -61,6 +62,12 @@ type Deps struct {
 	// Branching serves the branch endpoints. Nil: a project has only its default branch
 	// and creating one is refused.
 	Branching *branching.Service
+	// SSO keeps the dashboard's SAML identity providers and their users. Empty derives it from
+	// Registry like Store.
+	SSO SSOStore
+	// StudioRefresh re-renders Studio's unit after the dashboard gained its first SSO provider
+	// or lost its last (fleet.Manager.RefreshStudio). Nil: nothing is told.
+	StudioRefresh func(ctx context.Context) error
 	// CreateWait bounds how long POST /v1/projects waits for the new project to show
 	// up in the registry before answering 201 COMING_UP. Zero means 10 seconds.
 	CreateWait time.Duration
@@ -85,6 +92,10 @@ type Server struct {
 	accounts *Accounts
 	// members is the roles model: who belongs to which organization, with which permissions.
 	members *members.Service
+	// sso manages the dashboard's SAML identity providers (sso_dashboard.go).
+	sso           *DashboardSSO
+	studioRefresh func(ctx context.Context) error
+	studioMu      sync.Mutex
 
 	fnHook FunctionsHook
 
@@ -252,8 +263,21 @@ func NewServer(d Deps) (*Server, error) {
 	s.accounts.Members = s.members
 	s.accounts.Users = s.store
 	s.accounts.LiveRefs = s.liveRefs
+	ssoStore := d.SSO
+	if ssoStore == nil {
+		if pg, ok := d.Registry.(*registry.Postgres); ok {
+			ssoStore = NewPGSSOStore(pg.Pool())
+		} else {
+			ssoStore = NewMemorySSOStore()
+		}
+	}
+	s.studioRefresh = d.StudioRefresh
+	s.sso = NewDashboardSSO(s.accounts, ssoStore)
+	s.sso.Changed = s.studioChanged
 	s.auth = newAuthenticator(s.reg, s.mgr.Keys, s.store, s.now, s.cfg.API.Admins())
 	s.auth.removed = claims.UserRemoved
+	s.auth.sso = s.sso.Admit
+	s.auth.ssoUser = s.sso.AdmitUser
 	h, err := s.build()
 	if err != nil {
 		return nil, err
@@ -294,6 +318,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesMembers(add)
 	s.routesProjects(add)
 	s.routesBranches(add)
+	s.routesSSO(add)
 	s.routesKeys(add)
 	s.routesConfig(add)
 	s.routesDatabase(add)
@@ -339,6 +364,7 @@ func (s *Server) build() (http.Handler, error) {
 	}
 	s.claimRoutes(mux)
 	mux.handle("GET /internal/templates/{ref}/{name}", s.wrap("", authNone, s.serveTemplate))
+	mux.handle("POST "+sso.HookPath, s.wrap("", authNone, s.serveBeforeUserCreated))
 	mux.fallback = s.wrap("", authAny, s.unknown)
 	return s.middleware(mux), nil
 }

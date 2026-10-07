@@ -99,11 +99,20 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	if err != nil {
 		return err
 	}
+	// Studio shows "Continue with SSO" only while the dashboard has an SSO provider, and reads
+	// that when it starts: the API re-renders its unit when the first provider appears or the
+	// last one goes (fleet.Manager.RefreshStudio).
+	fm, err := fleet.NewManager(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet"), Registry: node.Registry,
+		Secrets: node.Secrets, Supervisor: node.Supervisor, Artifacts: node.Artifacts})
+	if err != nil {
+		return err
+	}
 	apiH, err := api.NewServer(api.Deps{
 		Registry: node.Registry, Secrets: node.Secrets, Manager: node.Engine, Config: cfg, Branching: bsvc,
-		Store:    store,
-		Settings: node.Settings, // the settings the engine renders units and tenants from
-		Logger:   log.With("component", "api"),
+		Store:         store,
+		Settings:      node.Settings, // the settings the engine renders units and tenants from
+		StudioRefresh: fm.RefreshStudio,
+		Logger:        log.With("component", "api"),
 	})
 	if err != nil {
 		return err
@@ -273,6 +282,13 @@ func refreshSystem(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 	}
 	if err := n.Plane.StartDatabase(ctx, p, keys); err != nil {
 		log.Warn("system cluster not refreshed", "error", err)
+		return
+	}
+	// The dashboard's sign-in service gets the same treatment: a node upgraded to a version that
+	// turns on dashboard SSO (SAML key, the sign-up hook) or a changed [mail] section renders
+	// new files, and the unit is restarted only when they differ.
+	if err := n.Plane.RefreshSystemAuth(ctx, p, keys); err != nil {
+		log.Warn("the dashboard's sign-in service is not refreshed; run `sbctl system init` to apply its settings", "error", err)
 	}
 }
 

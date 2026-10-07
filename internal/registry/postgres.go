@@ -301,6 +301,25 @@ func (r *Postgres) PutSecret(ctx context.Context, ref, name string, sealed []byt
 	return mapErr(err)
 }
 
+// PutSecretIfAbsent implements SecretCreator.
+func (r *Postgres) PutSecretIfAbsent(ctx context.Context, ref, name string, sealed []byte) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		insert into sbctl.project_secrets (ref, name, ciphertext) values ($1, $2, $3)
+		on conflict (ref, name) do nothing`, ref, name, sealed)
+	if err != nil {
+		return false, mapErr(err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// HasDashboardSSO reports whether at least one SAML identity provider of the dashboard is
+// registered (migration 1000_sso.sql): Studio shows "Continue with SSO" only then.
+func (r *Postgres) HasDashboardSSO(ctx context.Context) (bool, error) {
+	var ok bool
+	err := r.pool.QueryRow(ctx, `select exists (select 1 from sbctl.sso_providers)`).Scan(&ok)
+	return ok, mapErr(err)
+}
+
 func (r *Postgres) GetSecret(ctx context.Context, ref, name string) ([]byte, error) {
 	var b []byte
 	err := r.pool.QueryRow(ctx, `select ciphertext from sbctl.project_secrets where ref = $1 and name = $2`, ref, name).Scan(&b)

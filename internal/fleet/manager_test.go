@@ -287,3 +287,53 @@ func TestStatusTreatsAnUnrenderedStudioAsOptional(t *testing.T) {
 		}
 	}
 }
+
+// RefreshStudio puts the SSO sign-in on or off by rendering Studio's unit again; a node that
+// never rendered Studio is left alone.
+func TestRefreshStudioFollowsDashboardSSO(t *testing.T) {
+	sso := false
+	r := newManagerRig(t, func(d *Deps) {
+		d.DashboardSSO = func(context.Context) (bool, error) { return sso, nil }
+	})
+	ctx := context.Background()
+	if err := r.m.RefreshStudio(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.sup.log(); got != "" {
+		t.Fatalf("Studio was never rendered on this node, but the supervisor was asked: %s", got)
+	}
+	run := units.FilesFor(r.n.cfg, units.Spec{Service: config.SvcStudio}).Run
+	if err := os.MkdirAll(filepath.Dir(run), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(run, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := func() map[string]string { return r.sup.specs["sb-studio.service"].Env }
+	if _, err := r.m.Specs(ctx); err != nil { // the services' secrets exist on a node that ran Start
+		t.Fatal(err)
+	}
+	if err := r.m.RefreshStudio(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := env()["NEXT_PUBLIC_DISABLED_FEATURES"]; ok {
+		t.Fatalf("no provider yet, but Studio is told %q", v)
+	}
+	sso = true
+	if err := r.m.RefreshStudio(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v := env()["NEXT_PUBLIC_DISABLED_FEATURES"]; v == "" || strings.Contains(v, "sign_in_with_sso") {
+		t.Fatalf("with a provider Studio is told %q", v)
+	}
+	if !strings.Contains(r.sup.log(), "stop sb-studio.service") && r.sup.state["sb-studio.service"] != units.StateActive {
+		t.Fatalf("Studio was not restarted on the changed file: %s", r.sup.log())
+	}
+	sso = false
+	if err := r.m.RefreshStudio(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := env()["NEXT_PUBLIC_DISABLED_FEATURES"]; ok {
+		t.Fatal("the last provider is gone, but Studio still has the SSO sign-in")
+	}
+}

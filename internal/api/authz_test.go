@@ -108,7 +108,18 @@ func matrixCases() []routeCase {
 		rc("YYYYNN", "GET", org+"/billing/subscription", nil),
 		rc("YYNNNN", "PUT", org+"/billing/subscription", map[string]any{}),
 		rc("YYYYNN", "GET", org+"/usage", nil),
-		rc("YNNNNN", "POST", org+"/sso", map[string]any{}),
+		// single sign-on: Owners and Administrators manage it (the domains' default role is
+		// checked against what the caller may grant, see TestSSOAdministratorsCannotMakeOwners)
+		rc("YYNNNN", "POST", org+"/sso", map[string]any{}),
+		rc("YYNNNN", "GET", org+"/sso", nil),
+		rc("YYNNNN", "GET", org+"/sso/providers", nil),
+		rc("YYNNNN", "POST", org+"/sso/providers", map[string]any{}),
+		rc("YYNNNN", "GET", org+"/sso/pending", nil),
+		rc("YYNNNN", "DELETE", org+"/sso/pending/a0000000-0000-4000-8000-000000000009", nil),
+		// a project's own identity providers: read like the project's config, written like its Auth settings
+		rc("YYYYYN", "GET", "/v1/projects/"+testRef+"/config/auth/sso/providers", nil),
+		rc("YYNNNN", "POST", "/v1/projects/"+testRef+"/config/auth/sso/providers", map[string]any{"type": "saml"}),
+		rc("YYNNNN", "DELETE", "/v1/projects/"+testRef+"/config/auth/sso/providers/a0000000-0000-4000-8000-000000000001", nil),
 		rc("YYNNNN", "POST", org+"/oauth/apps", map[string]any{}),
 		rc("YYYYYN", "GET", "/v1/organizations/default/members", nil),
 		rc("YYYYYN", "GET", "/v2/organizations/default/roles", nil),

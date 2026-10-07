@@ -209,6 +209,43 @@ jobs:
           path: /tmp/sbctl-roles-logs
           if-no-files-found: ignore
 
+  # Single sign-on under systemd against a real SAML identity provider (SimpleSAMLphp in a
+  # container; the image is amd64 only): the dashboard's providers and default roles, a person
+  # of an unmapped domain waiting for approval, closed sign-up, Studio's SSO button, and a
+  # project's providers through the real Supabase CLI and an end user's sign-in.
+  sso-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Supabase CLI (the version the API is tested with)
+        run: |
+          npm install --prefix /tmp/sbcli supabase@2.119.0
+          /tmp/sbcli/node_modules/.bin/supabase --version
+      # Pinned by digest (the manifest of the image's last tag, from the Docker Hub registry API): the job runs
+      # it with sudo, so a changed tag must not change what runs. tests/linux/sso-smoke.sh names the same digest.
+      - name: identity provider image
+        run: docker pull kristophjunge/test-saml-idp@sha256:02a6e56c01f94b9ba3f2151f33acedf4606ac9b7eeb62a874c5a6b032c0fa9cc
+      - name: build sbctl
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: sso smoke
+        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/sbctl-sso-logs SBCTL_BIN=/tmp/sbctl SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase tests/linux/sso-smoke.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/sbctl-sso-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sso-smoke
+          path: /tmp/sbctl-sso-logs
+          if-no-files-found: ignore
+
   # The installer on a fresh VM: deploy/install.sh, the claim flow, a project through the
   # Management API with a PAT, REST through the proxy, the pooler, a re-run, self-update.
   install-e2e:

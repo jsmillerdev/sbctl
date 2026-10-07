@@ -204,7 +204,15 @@ func (m *Manager) AuthEnv(ctx context.Context, ref, externalURL string) (map[str
 	if err != nil {
 		return nil, err
 	}
-	return RenderAuth(ref, st.Set, st.Version, m.opts.TemplateBaseURL, externalURL, func(name string) string { return m.TemplateToken(ref, name) }), nil
+	env := RenderAuth(ref, st.Set, st.Version, m.opts.TemplateBaseURL, externalURL, func(name string) string { return m.TemplateToken(ref, name) })
+	if env["GOTRUE_SAML_ENABLED"] == "true" && m.opts.SigningKey != nil {
+		key, err := m.opts.SigningKey(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("projectconfig: SAML signing key of %s: %w", ref, err)
+		}
+		env["GOTRUE_SAML_PRIVATE_KEY"] = key
+	}
+	return env, nil
 }
 
 // PostgRESTEnv is PostgREST's saved settings as environment.

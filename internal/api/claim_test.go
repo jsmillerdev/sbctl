@@ -42,6 +42,10 @@ type fakeGoTrue struct {
 	calls []string
 	// mailFail makes /invite and /magiclink answer 500, as GoTrue does when SMTP is down.
 	mailFail bool
+	// invites records the bodies of the /invite calls.
+	invites []map[string]any
+	// sso is the provider admin API (sso_fake_test.go).
+	sso *ssoFake
 }
 
 func (g *fakeGoTrue) callList() []string {
@@ -58,8 +62,9 @@ func (g *fakeGoTrue) addUser(id, email string, created time.Time) {
 }
 
 func newFakeGoTrue(t testing.TB) *fakeGoTrue {
-	g := &fakeGoTrue{users: map[string]map[string]any{}}
+	g := &fakeGoTrue{users: map[string]map[string]any{}, sso: &ssoFake{}}
 	mux := http.NewServeMux()
+	g.sso.register(mux)
 	mux.HandleFunc("POST /admin/users", func(w http.ResponseWriter, r *http.Request) {
 		g.mu.Lock()
 		defer g.mu.Unlock()
@@ -144,6 +149,7 @@ func newFakeGoTrue(t testing.TB) *fakeGoTrue {
 		}
 		var in map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&in)
+		g.invites = append(g.invites, in)
 		id := fmt.Sprintf("00000000-0000-4000-8000-1%011d", len(g.users))
 		u := map[string]any{"id": id, "email": in["email"], "created_at": time.Now().UTC().Format(time.RFC3339)}
 		g.users[id] = u

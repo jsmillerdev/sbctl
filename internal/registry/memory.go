@@ -296,6 +296,24 @@ func (m *Memory) PutSecret(_ context.Context, ref, name string, sealed []byte) e
 	return nil
 }
 
+// PutSecretIfAbsent implements SecretCreator.
+func (m *Memory) PutSecretIfAbsent(_ context.Context, ref, name string, sealed []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.projects[ref]; !ok {
+		return false, ErrNotFound
+	}
+	if _, ok := m.secrets[ref][name]; ok {
+		return false, nil
+	}
+	if m.secrets[ref] == nil {
+		m.secrets[ref] = map[string][]byte{}
+	}
+	m.secrets[ref][name] = bytes.Clone(sealed)
+	m.notify("project_secrets", "update", ref)
+	return true, nil
+}
+
 func (m *Memory) GetSecret(_ context.Context, ref, name string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

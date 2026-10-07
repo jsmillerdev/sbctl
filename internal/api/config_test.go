@@ -644,7 +644,7 @@ func TestAuthSchemaCoversTheSpecs(t *testing.T) {
 	// Settings the specs list that GoTrue's self-hosted build or sbctl does not take: reported
 	// only (see projectconfig's README).
 	reportOnly := map[string]bool{
-		"custom_oauth_max_providers": true, "nimbus_oauth_email_optional": true, "saml_allow_encrypted_assertions": true,
+		"custom_oauth_max_providers": true, "nimbus_oauth_email_optional": true,
 	}
 	for _, spec := range []struct {
 		file, schema string

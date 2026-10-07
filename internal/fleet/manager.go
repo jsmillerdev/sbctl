@@ -61,6 +61,9 @@ type Deps struct {
 	TenantClient *http.Client
 	// Retry bounds the retries of tenant calls (default: 5 attempts, 500 ms to 8 s backoff).
 	Retry Retry
+	// DashboardSSO reports whether the dashboard has a SAML identity provider (Studio shows
+	// "Continue with SSO" only then). Nil asks the registry (registry.Postgres.HasDashboardSSO).
+	DashboardSSO func(ctx context.Context) (bool, error)
 }
 
 func (d *Deps) log() *slog.Logger {
@@ -446,4 +449,27 @@ func (m *Manager) Status(ctx context.Context) []Health {
 		out = append(out, h)
 	}
 	return out
+}
+
+// RefreshStudio renders Studio's unit again from the current state of the node and restarts it
+// when what it renders changed: adding the dashboard's first SSO provider, or removing its last,
+// changes whether the sign-in page offers "Continue with SSO", which is fixed when Studio
+// starts. It does nothing on a node that never rendered Studio, and leaves a Studio whose
+// files are unchanged running.
+func (m *Manager) RefreshStudio(ctx context.Context) error {
+	if m.d.skipped(config.SvcStudio) || m.neverRendered(config.SvcStudio) {
+		return nil
+	}
+	if m.d.Registry == nil || m.d.Secrets == nil || m.d.Artifacts == nil {
+		return errors.New("fleet: rendering Studio needs Deps.Registry, Secrets and Artifacts")
+	}
+	c, err := loadCreds(ctx, m.d, false)
+	if err != nil {
+		return err
+	}
+	spec, err := m.spec(config.SvcStudio, c)
+	if err != nil {
+		return err
+	}
+	return m.startOne(ctx, spec)
 }

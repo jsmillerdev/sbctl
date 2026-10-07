@@ -92,6 +92,18 @@ sudo -u sbctl sbctl users remove dev@example.com                     # ends thei
 
 An address that has no account gets the claim page with the token filled in: the invitee picks a password and joins with the invited role. An address that already has an account gets the dashboard's invitation page. The Team page of an organization in the dashboard does the same through the Management API. An organization always keeps one owner: `users remove` refuses to delete the only owner unless you add `--force`. Accounts created before roles existed became owners of every organization when the roles were introduced.
 
+### Single sign-on
+
+People can sign in to the dashboard with the company's identity provider (SAML 2.0: Okta, Entra ID, Google Workspace, ...). Register it with its metadata and the email domains it serves:
+
+```bash
+sudo -u sbctl sbctl sso add --metadata-url https://idp.example.com/saml/metadata --domain example.com --default-role developer
+sudo -u sbctl sbctl sso list
+sudo -u sbctl sbctl sso info          # the ACS URL and entity id to configure in the identity provider
+```
+
+`sso add` prints what to enter in the identity provider (the assertion consumer URL `https://api.<domain>/auth/v1/sso/saml/acs`, the entity id, the service provider metadata) and makes the dashboard's sign-in page offer "Continue with SSO". A person signs in with an address of one of the domains and, the first time, joins the organization with the default role. Anyone else who signs in through the provider is refused until an administrator approves them (`sbctl sso pending`, `sbctl sso approve <email> --role developer`, or `sbctl sso deny`). A denied address, and one whose SSO account `sbctl users remove` deleted, stays out: its next sign-in waits for approval and does not get the default role (`sbctl sso allow <email>` lifts that). `sbctl sso remove <id|domain>` removes the provider, ends its users' sessions and revokes their tokens. Owners and Administrators can do the same in the dashboard's organization settings. Projects have identity providers of their own for their end users: enable SAML in the project's Auth settings, then `supabase sso add --project-ref <ref>` with the profile of this node. `internal/api/README.md` ("Single sign-on") has the rules.
+
 ## Update
 
 ```bash
