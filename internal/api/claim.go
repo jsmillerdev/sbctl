@@ -128,15 +128,17 @@ func (a *Accounts) IssueClaimToken(ctx context.Context, ttl time.Duration, force
 	}
 	token = newToken(claimPrefix)
 	expires = a.now().Add(ttl)
-	if _, err = a.Store.CreateClaimToken(ctx, KindClaim, secrets.HashToken(token), "", expires); err != nil {
+	if _, err = a.Store.CreateClaimToken(ctx, KindClaim, secrets.HashToken(token), "", 0, expires); err != nil {
 		return "", time.Time{}, err
 	}
 	return token, expires, nil
 }
 
-// IssueInvite creates an invite token for email and revokes the unused one for the same
-// address.
-func (a *Accounts) IssueInvite(ctx context.Context, email string, ttl time.Duration) (token string, expires time.Time, err error) {
+// IssueInvite creates an invite token for email, bound to the organization invitation
+// invitationID (0: bound to none, so that redeeming it creates the account and accepts nothing).
+// It revokes the unused token of the same address and invitation; the invite tokens of other
+// invitations stay valid. The token dies with its invitation.
+func (a *Accounts) IssueInvite(ctx context.Context, email string, invitationID int64, ttl time.Duration) (token string, expires time.Time, err error) {
 	email, err = normalizeEmail(email)
 	if err != nil {
 		return "", time.Time{}, err
@@ -146,7 +148,7 @@ func (a *Accounts) IssueInvite(ctx context.Context, email string, ttl time.Durat
 	}
 	token = newToken(invitePrefix)
 	expires = a.now().Add(ttl)
-	if _, err = a.Store.CreateClaimToken(ctx, KindInvite, secrets.HashToken(token), email, expires); err != nil {
+	if _, err = a.Store.CreateClaimToken(ctx, KindInvite, secrets.HashToken(token), email, invitationID, expires); err != nil {
 		return "", time.Time{}, err
 	}
 	return token, expires, nil
@@ -207,6 +209,16 @@ func (a *Accounts) Redeem(ctx context.Context, in RedeemRequest) (*RedeemResult,
 			return nil, errf(http.StatusBadRequest, "this invite is for %s", email)
 		}
 	}
+	if tok.Kind == KindInvite && tok.InvitationID != 0 && a.Members != nil {
+		// The invitation this link was issued for must still be pending for this address; a
+		// replaced, revoked or expired invitation leaves a dead link, not an account.
+		if _, err := a.Members.PendingInvitation(ctx, tok.InvitationID, email); err != nil {
+			if errors.Is(err, members.ErrNotFound) {
+				return nil, errBadToken
+			}
+			return nil, err
+		}
+	}
 	tok, err = a.Store.ConsumeClaimToken(ctx, hash, a.now(), email)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -243,14 +255,15 @@ func (a *Accounts) Redeem(ctx context.Context, in RedeemRequest) (*RedeemResult,
 				}
 			}
 		}
-	} else if a.Members != nil {
-		// The invite token proves the address, so the invitations waiting for it are accepted.
+	} else if a.Members != nil && tok.InvitationID != 0 {
+		// The invite token proves the address, so the invitation it was issued for is accepted. Only
+		// that one: the invitations other organizations sent to the same address need their own links.
 		var live func([]string) []string
 		if a.LiveRefs != nil {
 			live = func(refs []string) []string { return a.LiveRefs(ctx, refs) }
 		}
-		if _, err := a.Members.AcceptPending(ctx, userID, email, live); err != nil {
-			a.log().Error("claim: pending invitations not accepted", "error", err)
+		if _, err := a.Members.AcceptInvitationByID(ctx, tok.InvitationID, userID, email, live); err != nil {
+			a.log().Error("claim: the invitation was not accepted", "error", err)
 		}
 	}
 	a.log().Info("dashboard user created", "email", email, "kind", tok.Kind)

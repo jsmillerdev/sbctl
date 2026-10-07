@@ -17,20 +17,25 @@ const (
 
 // ClaimToken is a stored token (never the token itself: only its hash is kept).
 type ClaimToken struct {
-	ID        int64
-	Kind      string
-	Email     string // invites only
-	CreatedAt time.Time
-	ExpiresAt time.Time
-	UsedAt    *time.Time
-	UsedBy    string
+	ID    int64
+	Kind  string
+	Email string // invites only
+	// InvitationID is the organization invitation an invite token was issued for (0: none).
+	// Redeeming the token accepts that invitation and no other.
+	InvitationID int64
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
+	UsedAt       *time.Time
+	UsedBy       string
 }
 
 // ClaimStore keeps claim and invite tokens (registry migration 0600_claim_tokens.sql).
 type ClaimStore interface {
-	// CreateClaimToken stores a token and revokes the unused tokens of the same kind
-	// (and, for invites, the same address), so at most one is live at a time.
-	CreateClaimToken(ctx context.Context, kind string, hash []byte, email string, expiresAt time.Time) (*ClaimToken, error)
+	// CreateClaimToken stores a token and revokes the unused tokens of the same kind (and,
+	// for invites, the same address and invitation), so at most one is live at a time. An
+	// invite for one organization never revokes the invite for another. invitationID is
+	// the invitation the token is bound to (invites only; 0: none).
+	CreateClaimToken(ctx context.Context, kind string, hash []byte, email string, invitationID int64, expiresAt time.Time) (*ClaimToken, error)
 	// LookupClaimToken returns the live token (unused, not expired at now) or ErrNotFound.
 	LookupClaimToken(ctx context.Context, hash []byte, now time.Time) (*ClaimToken, error)
 	// ConsumeClaimToken marks a live token used by usedBy in one atomic step and returns
@@ -49,30 +54,34 @@ type PGClaimStore struct{ pool *pgxpool.Pool }
 // NewPGClaimStore returns a PGClaimStore. The registry migrations must have been applied.
 func NewPGClaimStore(pool *pgxpool.Pool) *PGClaimStore { return &PGClaimStore{pool: pool} }
 
-const claimCols = `id, kind, coalesce(email, ''), created_at, expires_at, used_at, coalesce(used_by, '')`
+const claimCols = `id, kind, coalesce(email, ''), coalesce(invitation_id, 0), created_at, expires_at, used_at, coalesce(used_by, '')`
 
 func scanClaim(row pgx.Row) (*ClaimToken, error) {
 	var t ClaimToken
-	if err := row.Scan(&t.ID, &t.Kind, &t.Email, &t.CreatedAt, &t.ExpiresAt, &t.UsedAt, &t.UsedBy); err != nil {
+	if err := row.Scan(&t.ID, &t.Kind, &t.Email, &t.InvitationID, &t.CreatedAt, &t.ExpiresAt, &t.UsedAt, &t.UsedBy); err != nil {
 		return nil, notFound(err)
 	}
 	return &t, nil
 }
 
-func (s *PGClaimStore) CreateClaimToken(ctx context.Context, kind string, hash []byte, email string, expiresAt time.Time) (*ClaimToken, error) {
+func (s *PGClaimStore) CreateClaimToken(ctx context.Context, kind string, hash []byte, email string, invitationID int64, expiresAt time.Time) (*ClaimToken, error) {
 	var out *ClaimToken
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var mail any
+		var mail, inv any
 		if kind == KindInvite {
 			mail = email
+			if invitationID != 0 {
+				inv = invitationID
+			}
 		}
-		if _, err := tx.Exec(ctx, `delete from sbctl.claim_tokens where kind = $1 and used_at is null and email is not distinct from $2`, kind, mail); err != nil {
+		if _, err := tx.Exec(ctx, `delete from sbctl.claim_tokens where kind = $1 and used_at is null
+			and email is not distinct from $2 and invitation_id is not distinct from $3::bigint`, kind, mail, inv); err != nil {
 			return err
 		}
 		var err error
 		out, err = scanClaim(tx.QueryRow(ctx,
-			`insert into sbctl.claim_tokens (kind, token_hash, email, expires_at) values ($1, $2, $3, $4) returning `+claimCols,
-			kind, hash, mail, expiresAt))
+			`insert into sbctl.claim_tokens (kind, token_hash, email, invitation_id, expires_at) values ($1, $2, $3, $4, $5) returning `+claimCols,
+			kind, hash, mail, inv, expiresAt))
 		return err
 	})
 	return out, err
@@ -115,19 +124,19 @@ type memClaim struct {
 // NewMemoryClaimStore returns an empty MemoryClaimStore.
 func NewMemoryClaimStore() *MemoryClaimStore { return &MemoryClaimStore{tokens: map[int64]*memClaim{}} }
 
-func (m *MemoryClaimStore) CreateClaimToken(_ context.Context, kind string, hash []byte, email string, expiresAt time.Time) (*ClaimToken, error) {
+func (m *MemoryClaimStore) CreateClaimToken(_ context.Context, kind string, hash []byte, email string, invitationID int64, expiresAt time.Time) (*ClaimToken, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if kind != KindInvite {
-		email = ""
+		email, invitationID = "", 0
 	}
 	for id, t := range m.tokens {
-		if t.Kind == kind && t.UsedAt == nil && t.Email == email {
+		if t.Kind == kind && t.UsedAt == nil && t.Email == email && t.InvitationID == invitationID {
 			delete(m.tokens, id)
 		}
 	}
 	m.next++
-	t := &memClaim{ClaimToken: ClaimToken{ID: m.next, Kind: kind, Email: email, CreatedAt: time.Now(), ExpiresAt: expiresAt}, hash: string(hash)}
+	t := &memClaim{ClaimToken: ClaimToken{ID: m.next, Kind: kind, Email: email, InvitationID: invitationID, CreatedAt: time.Now(), ExpiresAt: expiresAt}, hash: string(hash)}
 	m.tokens[t.ID] = t
 	c := t.ClaimToken
 	return &c, nil

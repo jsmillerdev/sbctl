@@ -720,3 +720,182 @@ func newFixtureWithLegacy(t testing.TB) *fixture {
 	f.srv.members.Store.(*members.Memory).Cutoff = time.Now().Add(-time.Hour)
 	return f
 }
+
+// claimLink invites email to org (slug) as role with the API and returns the claim token and
+// address of the link the inviter is given.
+func (rf *rolesFixture) claimLink(as, slug, email string, role int) (token string) {
+	rf.t.Helper()
+	rec := rf.status(201, as, "POST", "/platform/organizations/"+slug+"/members/invitations", map[string]any{"emails": []string{email}, "role_id": role})
+	link := body[map[string]any](rf.t, rec)["invite_links"].([]any)[0].(map[string]any)["url"].(string)
+	u, err := url.Parse(link)
+	if err != nil || u.Path != "/claim" {
+		rf.t.Fatalf("a new address is sent to the account page: %q", link)
+	}
+	frag, _ := url.ParseQuery(u.Fragment)
+	return frag.Get("token")
+}
+
+func (rf *rolesFixture) redeem(token, email string) *httptest.ResponseRecorder {
+	rf.t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/claim", strings.NewReader(`{"token":"`+token+`","email":"`+email+`","password":"correct horse battery"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rf.srv.ServeHTTP(rec, req)
+	return rec
+}
+
+// A claim link carries one invitation: the Administrator of one organization must not be able to
+// use the link they hold to take a seat in an organization they do not belong to, nor to take
+// the Owner seat an Owner later offered the same address.
+func TestAClaimLinkAcceptsOnlyItsOwnInvitation(t *testing.T) {
+	rf := newRolesFixture(t)
+	ctx := context.Background()
+	const victim = "victim@example.test"
+	bravo, err := rf.reg.CreateOrganization(ctx, "bravo", "Bravo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rf.srv.members.EnsureOwner(ctx, members.OrgRef{ID: bravo.ID, Slug: bravo.Slug}, rf.ids["owner"]); err != nil {
+		t.Fatal(err)
+	}
+	// The Owner of bravo invites the address as Owner; the Administrator of default invites it as
+	// Read-only and chooses the password.
+	ownerLink := rf.claimLink("owner", "bravo", victim, members.RoleOwner)
+	adminLink := rf.claimLink("admin", "default", victim, members.RoleReadOnly)
+	if ownerLink == adminLink {
+		t.Fatal("one token for two invitations")
+	}
+	// Issuing the second link left the first one alive: its token is still looked up.
+	if _, err := rf.srv.accounts.Store.LookupClaimToken(ctx, secrets.HashToken(ownerLink), time.Now()); err != nil {
+		t.Fatalf("an invitation of another organization revoked this one's link: %v", err)
+	}
+	rec := rf.redeem(adminLink, victim)
+	if rec.Code != 201 {
+		t.Fatalf("redeem: %d %s", rec.Code, rec.Body)
+	}
+	a, err := rf.srv.members.Access(ctx, body[RedeemResult](t, rec).UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.OrgRole(rf.org.ID) != members.RoleReadOnly {
+		t.Errorf("default: role %d, want Read-only", a.OrgRole(rf.org.ID))
+	}
+	if a.IsMember(bravo.ID) {
+		t.Fatalf("the Administrator's link gave a seat in another organization: %+v", a.Memberships)
+	}
+	// Bravo's invitation is still pending, for the invitee's own sign-in.
+	if l := body[map[string]any](t, rf.status(200, "owner", "GET", "/platform/organizations/bravo/members/invitations", nil))["invitations"].([]any); len(l) != 1 {
+		t.Errorf("bravo's pending invitations: %v", l)
+	}
+}
+
+// Inviting the same address again replaces the pending invitation, and the claim link of the
+// replaced invitation dies with it.
+func TestAReplacedInvitationKillsItsClaimLink(t *testing.T) {
+	rf := newRolesFixture(t)
+	const email = "late@example.test"
+	adminLink := rf.claimLink("admin", "default", email, members.RoleReadOnly)
+	// The Owner replaces it with an Owner invitation. An Administrator may not (below), so the
+	// Owner does.
+	ownerLink := rf.claimLink("owner", "default", email, members.RoleOwner)
+	if rec := rf.redeem(adminLink, email); rec.Code != 403 {
+		t.Fatalf("the replaced invitation's link still works: %d %s", rec.Code, rec.Body)
+	}
+	rec := rf.redeem(ownerLink, email)
+	if rec.Code != 201 {
+		t.Fatalf("redeem: %d %s", rec.Code, rec.Body)
+	}
+	a, err := rf.srv.members.Access(context.Background(), body[RedeemResult](t, rec).UserID)
+	if err != nil || a.OrgRole(rf.org.ID) != members.RoleOwner {
+		t.Fatalf("the Owner's invitation: %+v %v", a, err)
+	}
+}
+
+// An Administrator cannot cancel an Owner's pending invitation by inviting the address again
+// with a lower role.
+func TestAnAdministratorCannotReplaceAnOwnerInvitation(t *testing.T) {
+	rf := newRolesFixture(t)
+	inv := orgBase + "/members/invitations"
+	rf.status(201, "owner", "POST", inv, map[string]any{"emails": []string{"boss@example.test"}, "role_id": members.RoleOwner})
+	rf.status(403, "admin", "POST", inv, map[string]any{"emails": []string{"boss@example.test"}, "role_id": members.RoleReadOnly})
+	list := body[map[string]any](t, rf.status(200, "owner", "GET", inv, nil))["invitations"].([]any)
+	if len(list) != 1 || list[0].(map[string]any)["role_id"] != float64(members.RoleOwner) {
+		t.Errorf("the Owner's invitation did not survive: %v", list)
+	}
+}
+
+// A legacy account that an operator gave a restricted role, and that is later removed, must not
+// come back as Owner of everything through the legacy rule.
+func TestARemovedLegacyAccountStaysRemoved(t *testing.T) {
+	rf := newFixtureWithLegacy(t)
+	old := "eeeeeeee-0000-4000-8000-000000000003"
+	rf.gt.addUser(old, "old3@example.test", time.Now().Add(-48*time.Hour))
+	tok := rf.signJWT(map[string]any{"sub": old, "email": "old3@example.test", "role": "authenticated"})
+	// `sbctl users role`: the operator sets a role before the account's first request.
+	rf.addMember(old, members.RoleReadOnly)
+	if rec := rf.doAs(tok, "PATCH", "/platform/organizations/default", map[string]any{"name": "pwned"}); rec.Code != 403 {
+		t.Fatalf("a Read-only member changed the organization: %d", rec.Code)
+	}
+	if rec := rf.do("DELETE", "/platform/organizations/default/members/"+old, nil); rec.Code != 200 {
+		t.Fatalf("remove: %d %s", rec.Code, rec.Body)
+	}
+	if rec := rf.doAs(tok, "PATCH", "/platform/organizations/default", map[string]any{"name": "pwned"}); rec.Code != 403 {
+		t.Fatalf("a removed account regained access through the legacy rule: %d %s", rec.Code, rec.Body)
+	}
+	orgs := body[[]map[string]any](t, rf.doAs(tok, "GET", "/platform/organizations", nil))
+	if len(orgs) != 0 {
+		t.Errorf("a removed account sees organizations: %v", orgs)
+	}
+}
+
+// An organization that requires MFA must not be reachable with a password alone through a
+// personal access token minted from a session without a second factor.
+func TestMFAEnforcementCoversTokenMinting(t *testing.T) {
+	rf := newRolesFixture(t)
+	aal2 := func(role string) string {
+		return rf.signJWT(map[string]any{"sub": rf.ids[role], "email": role + "@example.test", "role": "authenticated", "aal": "aal2"})
+	}
+	// Before the requirement: minting works.
+	rf.status(201, "admin", "POST", "/platform/profile/access-tokens", map[string]any{"name": "before"})
+	if rec := rf.doAs(aal2("owner"), "PATCH", orgBase+"/members/mfa/enforcement", map[string]any{"enforced": true}); rec.Code != 201 {
+		t.Fatalf("enforce: %d %s", rec.Code, rec.Body)
+	}
+	if rec := rf.status(403, "admin", "POST", "/platform/profile/access-tokens", map[string]any{"name": "after"}); !strings.Contains(rec.Body.String(), "MFA required") {
+		t.Errorf("message: %s", rec.Body)
+	}
+	rf.status(403, "admin", "POST", "/platform/cli/login", map[string]any{
+		"session_id": "6f1a5f0e-7d44-4c0b-9d63-2f5f9b1f3a11", "public_key": strings.Repeat("04", 65), "token_name": "cli"})
+	// With the second factor it works, and a user who belongs to no enforcing organization is
+	// not held to it.
+	if rec := rf.doAs(aal2("admin"), "POST", "/platform/profile/access-tokens", map[string]any{"name": "aal2"}); rec.Code != 201 {
+		t.Errorf("aal2 session: %d %s", rec.Code, rec.Body)
+	}
+	rf.status(201, "stranger", "POST", "/platform/profile/access-tokens", map[string]any{"name": "stranger"})
+}
+
+// An Administrator cannot reach an Owner's permissions through a project-scoped role: a scoped
+// Read-only role on an Owner would strip key access on that project.
+func TestAnAdministratorCannotScopeAnOwner(t *testing.T) {
+	rf := newRolesFixture(t)
+	owner2 := "bbbbbbbb-0000-4000-8000-000000000002"
+	rf.addMember(owner2, members.RoleOwner)
+	m := orgBase + "/members/"
+	rf.status(403, "admin", "PATCH", m+owner2, map[string]any{"role_id": members.RoleReadOnly, "role_scoped_projects": []string{testRef}})
+	rf.status(403, "admin", "PATCH", m+owner2, map[string]any{"role_id": members.RoleDeveloper})
+	// The owner is untouched.
+	a, err := rf.srv.members.Access(context.Background(), owner2)
+	if err != nil || a.OrgRole(rf.org.ID) != members.RoleOwner || len(a.Membership(rf.org.ID).Scoped) != 0 {
+		t.Fatalf("owner changed: %+v %v", a.Memberships, err)
+	}
+	// A scoped member's roles are managed by the same rule: the Administrator may change a
+	// Developer's scope, but not once the member also holds a scoped Owner role.
+	rf.status(200, "admin", "PATCH", m+rf.ids["scoped"], map[string]any{"role_id": members.RoleReadOnly, "role_scoped_projects": []string{testRef}})
+	rf.status(200, "owner", "PATCH", m+rf.ids["scoped"], map[string]any{"role_id": members.RoleOwner, "role_scoped_projects": []string{secondRef}})
+	rf.status(403, "admin", "PATCH", m+rf.ids["scoped"], map[string]any{"role_id": members.RoleReadOnly, "role_scoped_projects": []string{testRef, secondRef}})
+	// An organization-wide role replaces the scoped ones, as in Studio's role panel.
+	rf.status(200, "owner", "PATCH", m+rf.ids["scoped"], map[string]any{"role_id": members.RoleDeveloper})
+	a, _ = rf.srv.members.Access(context.Background(), rf.ids["scoped"])
+	if a.OrgRole(rf.org.ID) != members.RoleDeveloper || len(a.Membership(rf.org.ID).Scoped) != 0 {
+		t.Errorf("an organization-wide role must replace the scoped roles: %+v", a.Memberships)
+	}
+}

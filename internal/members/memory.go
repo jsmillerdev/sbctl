@@ -277,6 +277,7 @@ func (o *memOps) MembershipsOf(_ context.Context, user string) ([]Member, error)
 }
 
 func (o *memOps) PutMember(_ context.Context, m Member) error {
+	o.d.checked[m.UserID] = true // a user with a membership is settled; see Service.Access
 	k := mkey{m.OrgID, m.UserID}
 	if cur, ok := o.d.members[k]; ok {
 		cur.RoleID = m.RoleID

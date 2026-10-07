@@ -391,14 +391,14 @@ func TestClaimReleasedWhenUserCannotBeCreated(t *testing.T) {
 func TestInvite(t *testing.T) {
 	f := newClaimFixture(t)
 	ctx := context.Background()
-	token, _, err := f.acc.IssueInvite(ctx, "Dev@Example.Test", 0)
+	token, _, err := f.acc.IssueInvite(ctx, "Dev@Example.Test", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(token, "sbi_") {
 		t.Fatalf("invite token %q", token)
 	}
-	if _, _, err := f.acc.IssueInvite(ctx, "not an email", 0); err == nil {
+	if _, _, err := f.acc.IssueInvite(ctx, "not an email", 0, 0); err == nil {
 		t.Fatal("invalid address accepted")
 	}
 	if rec := f.post(RedeemRequest{Token: token, Email: "someone-else@example.test", Password: goodPassword}); rec.Code != 400 {
@@ -417,8 +417,8 @@ func TestInvite(t *testing.T) {
 	if ok, _ := f.acc.Claimed(ctx); ok {
 		t.Fatal("an invite counted as the claim")
 	}
-	t1, _, _ := f.acc.IssueInvite(ctx, "x@example.test", 0)
-	t2, _, _ := f.acc.IssueInvite(ctx, "x@example.test", 0)
+	t1, _, _ := f.acc.IssueInvite(ctx, "x@example.test", 0, 0)
+	t2, _, _ := f.acc.IssueInvite(ctx, "x@example.test", 0, 0)
 	if rec := f.post(RedeemRequest{Token: t1, Password: goodPassword}); rec.Code != 403 {
 		t.Fatalf("revoked invite: %d", rec.Code)
 	}
@@ -512,7 +512,7 @@ func TestListAndRemoveUsers(t *testing.T) {
 }
 
 // testClaimStore is the conformance check of every ClaimStore.
-func testClaimStore(t *testing.T, s ClaimStore) {
+func testClaimStore(t *testing.T, s ClaimStore, invitationIDs func() (int64, int64)) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
 	h1, h2, h3 := secrets.HashToken("one"), secrets.HashToken("two"), secrets.HashToken("three")
@@ -520,12 +520,12 @@ func testClaimStore(t *testing.T, s ClaimStore) {
 	if ok, err := s.Claimed(ctx); err != nil || ok {
 		t.Fatalf("Claimed on empty: %v %v", ok, err)
 	}
-	t1, err := s.CreateClaimToken(ctx, KindClaim, h1, "", now.Add(time.Hour))
+	t1, err := s.CreateClaimToken(ctx, KindClaim, h1, "", 0, now.Add(time.Hour))
 	if err != nil || t1.Kind != KindClaim || t1.Email != "" {
 		t.Fatalf("create: %+v %v", t1, err)
 	}
 	// A second claim token revokes the first.
-	if _, err := s.CreateClaimToken(ctx, KindClaim, h2, "", now.Add(time.Hour)); err != nil {
+	if _, err := s.CreateClaimToken(ctx, KindClaim, h2, "", 0, now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.LookupClaimToken(ctx, h1, now); !errors.Is(err, ErrNotFound) {
@@ -555,19 +555,43 @@ func testClaimStore(t *testing.T, s ClaimStore) {
 		t.Fatalf("released token not live: %v", err)
 	}
 	// Invites are per address.
-	if _, err := s.CreateClaimToken(ctx, KindInvite, h3, "x@example.test", now.Add(time.Hour)); err != nil {
+	if _, err := s.CreateClaimToken(ctx, KindInvite, h3, "x@example.test", 0, now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateClaimToken(ctx, KindInvite, secrets.HashToken("four"), "y@example.test", now.Add(time.Hour)); err != nil {
+	if _, err := s.CreateClaimToken(ctx, KindInvite, secrets.HashToken("four"), "y@example.test", 0, now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	inv, err := s.LookupClaimToken(ctx, h3, now)
 	if err != nil || inv.Kind != KindInvite || inv.Email != "x@example.test" {
 		t.Fatalf("invite for x was revoked by the one for y: %+v %v", inv, err)
 	}
+	// Invite tokens are bound to an invitation: the same address invited by two organizations
+	// holds two live tokens, and re-issuing one revokes only the token of its own invitation.
+	i1, i2 := invitationIDs()
+	b1, b2, b3 := secrets.HashToken("b1"), secrets.HashToken("b2"), secrets.HashToken("b3")
+	if _, err := s.CreateClaimToken(ctx, KindInvite, b1, "z@example.test", i1, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateClaimToken(ctx, KindInvite, b2, "z@example.test", i2, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.LookupClaimToken(ctx, b1, now); err != nil || got.InvitationID != i1 {
+		t.Fatalf("the invite of another organization revoked this one: %+v %v", got, err)
+	}
+	if _, err := s.CreateClaimToken(ctx, KindInvite, b3, "z@example.test", i1, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LookupClaimToken(ctx, b1, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("re-issued token's predecessor still live: %v", err)
+	}
+	if got, err := s.LookupClaimToken(ctx, b2, now); err != nil || got.InvitationID != i2 {
+		t.Fatalf("re-issuing for one invitation revoked the other's token: %+v %v", got, err)
+	}
 }
 
-func TestMemoryClaimStore(t *testing.T) { testClaimStore(t, NewMemoryClaimStore()) }
+func TestMemoryClaimStore(t *testing.T) {
+	testClaimStore(t, NewMemoryClaimStore(), func() (int64, int64) { return 101, 102 })
+}
 
 // TestPGClaimStore runs the same checks against a real database (CI provides one).
 func TestPGClaimStore(t *testing.T) {
@@ -587,7 +611,55 @@ func TestPGClaimStore(t *testing.T) {
 	if _, err := r.Pool().Exec(ctx, `truncate sbctl.claim_tokens`); err != nil {
 		t.Fatal(err)
 	}
-	testClaimStore(t, NewPGClaimStore(r.Pool()))
+	// Bound tokens reference real invitations.
+	org, err := r.CreateOrganization(ctx, fmt.Sprintf("claimstore-%d", time.Now().UnixNano()), "Claim store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := members.NewPG(r.Pool())
+	invite := func(email string) int64 {
+		var id int64
+		err := ms.Update(ctx, org.ID, func(ops members.Ops) error {
+			inv, err := ops.CreateInvitation(ctx, members.Invitation{OrgID: org.ID, Email: email, RoleID: members.RoleReadOnly, ExpiresAt: time.Now().Add(time.Hour)}, secrets.HashToken(email))
+			if inv != nil {
+				id = inv.ID
+			}
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	other, err := r.CreateOrganization(ctx, fmt.Sprintf("claimstore2-%d", time.Now().UnixNano()), "Claim store 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inviteOther := func(email string) int64 {
+		var id int64
+		_ = ms.Update(ctx, other.ID, func(ops members.Ops) error {
+			inv, err := ops.CreateInvitation(ctx, members.Invitation{OrgID: other.ID, Email: email, RoleID: members.RoleReadOnly, ExpiresAt: time.Now().Add(time.Hour)}, secrets.HashToken("o"+email))
+			if err == nil {
+				id = inv.ID
+			}
+			return err
+		})
+		return id
+	}
+	cs := NewPGClaimStore(r.Pool())
+	testClaimStore(t, cs, func() (int64, int64) { return invite("z@example.test"), inviteOther("z@example.test") })
+
+	// A token dies with its invitation: replacing the invitation deletes the token.
+	now := time.Now().UTC().Truncate(time.Second)
+	id := invite("w@example.test")
+	h := secrets.HashToken("bound")
+	if _, err := cs.CreateClaimToken(ctx, KindInvite, h, "w@example.test", id, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	invite("w@example.test") // replaces the pending invitation
+	if _, err := cs.LookupClaimToken(ctx, h, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the token of a replaced invitation is still live: %v", err)
+	}
 }
 
 func TestClaimLimiterIsPerClient(t *testing.T) {
@@ -727,7 +799,7 @@ func TestClaimedUserIsOwnerAndTheLastOwnerStays(t *testing.T) {
 		t.Fatalf("the invited user: %+v", a.Memberships)
 	}
 	// An invite token for an address nobody invited to an organization creates an account without access.
-	tok, _, _ := f.acc.IssueInvite(ctx, "bare@example.test", 0)
+	tok, _, _ := f.acc.IssueInvite(ctx, "bare@example.test", 0, 0)
 	rec = f.post(RedeemRequest{Token: tok, Email: "bare@example.test", Password: goodPassword})
 	if rec.Code != 201 {
 		t.Fatal(rec.Code, rec.Body)

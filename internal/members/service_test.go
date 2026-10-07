@@ -373,17 +373,25 @@ func testInvitations(t *testing.T, e *env) {
 	if err := e.svc.AcceptInvitation(ctx, e.a, token6, e.newUser(), "gone@example.test", func([]string) []string { return nil }); !errors.Is(err, ErrInvalid) {
 		t.Errorf("no live project: %v", err)
 	}
-	// Pending invitations are accepted when the account is created from an invite token.
-	_, _, _ = e.svc.Invite(ctx, ownerA, e.a, InviteInput{Email: "fresh@example.test", RoleID: RoleAdministrator})
-	_, _, _ = e.svc.Invite(ctx, e.access(t, e.owner(t, e.b)), e.b, InviteInput{Email: "fresh@example.test", RoleID: RoleReadOnly})
+	// A claim link accepts the one invitation it was issued for and no other of the address.
+	invA, _, _ := e.svc.Invite(ctx, ownerA, e.a, InviteInput{Email: "fresh@example.test", RoleID: RoleAdministrator})
+	invB, _, _ := e.svc.Invite(ctx, e.access(t, e.owner(t, e.b)), e.b, InviteInput{Email: "fresh@example.test", RoleID: RoleReadOnly})
 	fu := e.newUser()
-	joined, err := e.svc.AcceptPending(ctx, fu, "Fresh@example.test", nil)
-	if err != nil || len(joined) != 2 {
-		t.Fatalf("pending: %v %v", joined, err)
+	if _, err := e.svc.AcceptInvitationByID(ctx, invA.ID, fu, "someone-else@example.test", nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("another address: %v", err)
+	}
+	if _, err := e.svc.AcceptInvitationByID(ctx, invA.ID, fu, "Fresh@example.test", nil); err != nil {
+		t.Fatalf("accept by id: %v", err)
 	}
 	fa := e.access(t, fu)
-	if fa.OrgRole(e.a.ID) != RoleAdministrator || fa.OrgRole(e.b.ID) != RoleReadOnly {
-		t.Errorf("roles from pending invitations: %+v", fa.Memberships)
+	if fa.OrgRole(e.a.ID) != RoleAdministrator || fa.IsMember(e.b.ID) {
+		t.Errorf("roles from one invitation: %+v", fa.Memberships)
+	}
+	if _, err := e.svc.PendingInvitation(ctx, invB.ID, "fresh@example.test"); err != nil {
+		t.Errorf("the other invitation was consumed: %v", err)
+	}
+	if _, err := e.svc.AcceptInvitationByID(ctx, invA.ID, fu, "fresh@example.test", nil); !errors.Is(err, ErrNotFound) {
+		t.Errorf("accepted twice: %v", err)
 	}
 	// Revoking.
 	inv7, token7, _ := e.svc.Invite(ctx, ownerA, e.a, InviteInput{Email: "revoked@example.test", RoleID: RoleReadOnly})

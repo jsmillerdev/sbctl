@@ -130,7 +130,7 @@ func (a *Accounts) InviteToOrganization(ctx context.Context, actor *members.Acce
 	mail := a.Config.Mail.Enabled() && !a.NoMail
 	if existing == nil && !mail {
 		// The link that creates the account; accepting is then automatic.
-		ct, _, err := a.IssueInvite(ctx, email, a.Members.InvitationTTL)
+		ct, _, err := a.IssueInvite(ctx, email, inv.ID, a.Members.InvitationTTL)
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +141,7 @@ func (a *Accounts) InviteToOrganization(ctx context.Context, actor *members.Acce
 			res.MailError = err.Error()
 			a.log().Warn("invitation mail not sent; pass the link on", "email", email, "error", err)
 			if existing == nil {
-				if ct, _, cerr := a.IssueInvite(ctx, email, a.Members.InvitationTTL); cerr == nil {
+				if ct, _, cerr := a.IssueInvite(ctx, email, inv.ID, a.Members.InvitationTTL); cerr == nil {
 					res.ClaimURL = a.Config.APIURL() + "/claim#" + url.Values{"token": {ct}, "email": {email}}.Encode()
 				}
 			}

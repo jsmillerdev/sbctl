@@ -34,6 +34,31 @@ func (s *Server) routesLogin(add func(string, handlerFunc)) {
 	add("DELETE /platform/profile/access-tokens/{id}", s.deleteToken)
 }
 
+// requireMintAAL refuses to mint a personal access token (a token is exempt from the MFA
+// requirement) from a dashboard session without a second factor when the caller belongs to any
+// organization that requires MFA: otherwise a stolen password would buy a token that works in
+// the organization without it.
+func (s *Server) requireMintAAL(r *http.Request) error {
+	p := principalFrom(r.Context())
+	if p == nil || p.Via != "jwt" || p.AAL == "aal2" {
+		return nil
+	}
+	a, err := s.accessOf(r.Context(), p)
+	if err != nil {
+		return err
+	}
+	for _, m := range a.Memberships {
+		on, err := s.members.MFAEnforced(r.Context(), m.OrgID)
+		if err != nil {
+			return err
+		}
+		if on {
+			return errMFARequired
+		}
+	}
+	return nil
+}
+
 // newPAT creates and stores a personal access token for u and returns the token
 // (shown once) and its row.
 func (s *Server) newPAT(r *http.Request, u *User, name string, expires *time.Time) (string, *registry.AccessToken, error) {
@@ -77,6 +102,9 @@ func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) createToken(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireMintAAL(r); err != nil {
+		return err
+	}
 	u, err := s.currentUser(r)
 	if err != nil {
 		return err
@@ -160,6 +188,9 @@ func (s *Server) deleteToken(w http.ResponseWriter, r *http.Request) error {
 func (s *Server) cliLoginCreate(w http.ResponseWriter, r *http.Request) error {
 	if s.cfg.API.DisableDeviceLogin {
 		return errf(http.StatusForbidden, "Browser login is disabled; create an access token in the dashboard")
+	}
+	if err := s.requireMintAAL(r); err != nil {
+		return err
 	}
 	u, err := s.currentUser(r)
 	if err != nil {

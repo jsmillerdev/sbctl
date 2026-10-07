@@ -351,6 +351,34 @@ func invalid(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, args...))
 }
 
+// mayManage checks that actor may take away every role the member holds now: changing what a
+// member may do removes what they had, so an Administrator cannot touch an Owner's roles in
+// any direction (hosted: Administrators manage members except Owners). It returns the member's
+// project-scoped roles for the caller's use.
+func mayManage(ctx context.Context, ops Ops, actor *Access, org OrgRef, m *Member) ([]ProjectRole, error) {
+	all, err := ops.ProjectRoles(ctx, org.ID)
+	if err != nil {
+		return nil, err
+	}
+	var mine []ProjectRole
+	for _, r := range all {
+		if r.UserID == m.UserID {
+			mine = append(mine, r)
+		}
+	}
+	if m.RoleID != 0 {
+		if err := need(actor, org, ActDelete, ResSubjectRoles, int64(m.RoleID)); err != nil {
+			return nil, err
+		}
+	}
+	for _, r := range mine {
+		if err := need(actor, org, ActDelete, ResSubjectRoles, r.ID); err != nil {
+			return nil, err
+		}
+	}
+	return mine, nil
+}
+
 // SetOrgRole sets the organization-wide role of a member. A nil actor is the operator (the
 // CLI): no permission check, the Owner rule still holds.
 func (s *Service) SetOrgRole(ctx context.Context, actor *Access, org OrgRef, userID string, roleID int) error {
@@ -362,19 +390,25 @@ func (s *Service) SetOrgRole(ctx context.Context, actor *Access, org OrgRef, use
 		if err != nil {
 			return err
 		}
-		if m.RoleID == roleID {
+		scoped, err := mayManage(ctx, ops, actor, org, m)
+		if err != nil {
+			return err
+		}
+		if m.RoleID == roleID && len(scoped) == 0 {
 			return nil
 		}
 		if err := need(actor, org, ActCreate, ResSubjectRoles, int64(roleID)); err != nil {
 			return err
 		}
-		if m.RoleID != 0 {
-			if err := need(actor, org, ActDelete, ResSubjectRoles, int64(m.RoleID)); err != nil {
+		if m.RoleID == RoleOwner && roleID != RoleOwner {
+			if err := keepOwner(ctx, ops, org.ID); err != nil {
 				return err
 			}
 		}
-		if m.RoleID == RoleOwner {
-			if err := keepOwner(ctx, ops, org.ID); err != nil {
+		// An organization-wide role replaces the member's project-scoped roles: a member is one
+		// or the other, as in Studio's role panel (which assigns the new role and removes the old).
+		for _, r := range scoped {
+			if err := ops.DeleteProjectRole(ctx, org.ID, r.ID); err != nil {
 				return err
 			}
 		}
@@ -406,7 +440,14 @@ func (s *Service) AssignProjectRole(ctx context.Context, actor *Access, org OrgR
 		return invalid("a project-scoped role needs at least one project")
 	}
 	return s.Store.Update(ctx, org.ID, func(ops Ops) error {
-		if _, err := ops.GetMember(ctx, org.ID, userID); err != nil {
+		m, err := ops.GetMember(ctx, org.ID, userID)
+		if err != nil {
+			return err
+		}
+		// The roles the member holds now stay (Studio assigns first and removes the organization-wide
+		// role afterwards), but the actor must be allowed to manage them: a scoped Read-only role
+		// on an Owner would strip the Owner's permissions on those projects.
+		if _, err := mayManage(ctx, ops, actor, org, m); err != nil {
 			return err
 		}
 		if err := need(actor, org, ActCreate, ResSubjectRoles, int64(base)); err != nil {
@@ -467,10 +508,14 @@ func (s *Service) SetProjectRoleRefs(ctx context.Context, actor *Access, org Org
 		if err != nil || r.UserID != userID {
 			return ErrNotFound
 		}
-		if err := need(actor, org, ActCreate, ResSubjectRoles, r.ID); err != nil {
+		m, err := ops.GetMember(ctx, org.ID, userID)
+		if err != nil {
 			return err
 		}
-		if err := need(actor, org, ActDelete, ResSubjectRoles, r.ID); err != nil {
+		if _, err := mayManage(ctx, ops, actor, org, m); err != nil {
+			return err
+		}
+		if err := need(actor, org, ActCreate, ResSubjectRoles, int64(r.BaseRoleID)); err != nil {
 			return err
 		}
 		if len(refs) == 0 {
@@ -670,7 +715,20 @@ func (s *Service) Invite(ctx context.Context, actor *Access, org OrgRef, in Invi
 	}
 	var stored *Invitation
 	err = s.Store.Update(ctx, org.ID, func(ops Ops) error {
-		var err error
+		// Inviting again replaces the pending invitation, which deletes it: the actor needs the
+		// permission to revoke it, or an Administrator could cancel an Owner's invitation by
+		// re-inviting the address with a lower role.
+		pending, err := ops.ListInvitations(ctx, org.ID)
+		if err != nil {
+			return err
+		}
+		for _, p := range pending {
+			if p.Email == email {
+				if err := need(actor, org, ActDelete, ResUserInvites, int64(p.RoleID)); err != nil {
+					return err
+				}
+			}
+		}
 		stored, err = ops.CreateInvitation(ctx, inv, HashToken(token))
 		return err
 	})
@@ -766,9 +824,10 @@ func (s *Service) accept(ctx context.Context, inv *Invitation, userID, email str
 	})
 }
 
-// AcceptPending accepts every pending invitation of an address for a user who just proved
-// control of it (an account created from an invite token). It returns the organizations joined.
-func (s *Service) AcceptPending(ctx context.Context, userID, email string, liveRefs func([]string) []string) ([]int64, error) {
+// PendingInvitation returns the invitation with this id when it is still pending (not
+// accepted, not expired) and addressed to email; ErrNotFound otherwise. It is what a claim link
+// (an account-creation token bound to one invitation) checks before it creates the account.
+func (s *Service) PendingInvitation(ctx context.Context, id int64, email string) (*Invitation, error) {
 	email, err := NormalizeEmail(email)
 	if err != nil {
 		return nil, err
@@ -777,15 +836,27 @@ func (s *Service) AcceptPending(ctx context.Context, userID, email string, liveR
 	if err != nil {
 		return nil, err
 	}
-	var joined []int64
 	for i := range invs {
-		if err := s.accept(ctx, &invs[i], userID, email, liveRefs); err != nil {
-			s.log().Warn("members: pending invitation not accepted", "org", invs[i].OrgID, "error", err)
-			continue
+		if invs[i].ID == id {
+			return &invs[i], nil
 		}
-		joined = append(joined, invs[i].OrgID)
 	}
-	return joined, nil
+	return nil, ErrNotFound
+}
+
+// AcceptInvitationByID accepts one pending invitation for a user who just proved control of
+// its address (an account created from a claim link bound to that invitation). It never
+// accepts any other invitation of the address: each organization's invitation needs its own
+// link, or the invitee's own sign-in.
+func (s *Service) AcceptInvitationByID(ctx context.Context, id int64, userID, email string, liveRefs func([]string) []string) (*Invitation, error) {
+	inv, err := s.PendingInvitation(ctx, id, email)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.accept(ctx, inv, userID, email, liveRefs); err != nil {
+		return nil, err
+	}
+	return inv, nil
 }
 
 // ---- SSO -----------------------------------------------------------------------

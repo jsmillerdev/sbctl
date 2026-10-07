@@ -112,7 +112,12 @@ func (o *pgOps) PutMember(ctx context.Context, m Member) error {
 	_, err := o.q.Exec(ctx, `
 		insert into sbctl.org_members (org_id, user_id, role_id) values ($1, $2::uuid, $3)
 		on conflict (org_id, user_id) do update set role_id = excluded.role_id`, m.OrgID, m.UserID, roleOrNil(m.RoleID))
-	return mapErr(err)
+	if err != nil {
+		return mapErr(err)
+	}
+	// Whoever holds a membership is settled: removing it later must not hand the account to the
+	// legacy rule, which would make an account that predates roles Owner of everything.
+	return o.MarkLegacyChecked(ctx, m.UserID)
 }
 
 func (o *pgOps) DeleteMember(ctx context.Context, org int64, user string) error {

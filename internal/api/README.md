@@ -132,8 +132,12 @@ cannot be created (the address exists, the password is refused) the token is rel
 again. Unknown, used and expired tokens all answer `403`; ten failures in a minute answer `429` for
 the rest of the minute, node-wide. `GET /claim` serves a self-contained page (one inline script
 pinned by hash in the CSP, no third-party requests). Neither route takes credentials: the token is
-the credential. The claimed first user becomes Owner of the organization. Redeeming an invite token also accepts the
-organization invitations that wait for its address (invitations carry the role, below), and records the account in
+the credential. The claimed first user becomes Owner of the organization. An invite token is bound to the one
+organization invitation it was issued for (`claim_tokens.invitation_id`, migration `0901`): redeeming it accepts that
+invitation and no other, so the link an Administrator of one organization holds cannot take a seat in another
+organization that invited the same address, and it dies with its invitation (replaced, revoked, accepted or expired).
+Invitations of other organizations to the address wait for the invitee's own sign-in (`/join`). A token that is
+bound to no invitation creates an account with no membership. Redeeming records the account in
 `sbctl.api_users`; the claim page fills the token and address from the link's `#token=...&email=...` fragment, which a
 browser never sends to a server. `Accounts` (the same type the CLI uses for `sbctl claim token`, `sbctl users invite|list|role|remove`)
 also lists dashboard users and removes one together with its memberships and the personal access tokens it created.
@@ -215,7 +219,9 @@ Developer and a user without a membership through the real handlers.
   the S3 credentials are not listed.
 - **Personal access tokens carry their owner's permissions**, read at each request: demote or remove the member
   and their tokens lose the access at once (`users remove` also deletes the tokens). **Dashboard sessions** are
-  checked the same way. A token is not an interactive session, so the MFA requirement below does not apply to it.
+  checked the same way. A token is not an interactive session, so the MFA requirement below does not apply to it; that is why minting one
+  (`POST /platform/profile/access-tokens`, `POST /platform/cli/login`) needs an aal2 session when the caller belongs to
+  an organization that requires MFA. Tokens minted before the requirement was turned on keep working.
 - **MFA requirement.** `GET` and `PATCH /platform/organizations/{slug}/members/mfa/enforcement` store and report
   it (the answer is 201 on both, as the spec says), and `organization_requires_mfa` in the organization list follows
   it. While it is on, a dashboard session whose JWT does not carry `aal: aal2` is refused in the organization's
@@ -230,7 +236,8 @@ Studio's; or `data[].attributes` with `role` and `projects`) and answers `{succe
 is already a member lands in `failed`, an invalid address is a 400, and a caller who may not invite the role gets a 403.
 sbctl adds `invite_links: [{email, url, emailed}]` to that answer. The token is `sbo_` + 48 hex, stored as its
 SHA-256 (`sbctl.org_invitations`), works once and expires after 7 days (hosted: 24 hours; here the link often travels
-by hand); inviting an address again replaces the pending invitation. Studio's `/join?token=...&slug=...` page uses
+by hand); inviting an address again replaces the pending invitation, which needs the permission to revoke it (an
+Administrator cannot cancel an Owner's invitation by re-inviting the address with a lower role; the answer is 403). Studio's `/join?token=...&slug=...` page uses
 `GET` and `POST .../invitations/{token}`: the signed-in user's email must match (case-insensitively) and joins with the
 invited role, or with the invited project-scoped role on the projects that still exist.
 
@@ -326,7 +333,10 @@ Migrations `internal/registry/migrations/0100_api.sql` and `0101_api_login_failu
 `api_function_files`, `api_function_secrets`, `api_content`, `api_content_folders`. `Store` (`store.go`) has a Postgres and a memory
 implementation behind one conformance suite (`store_test.go`). Members, roles and invitations are in
 `0900_members.sql` (range 0900-0999: `org_members`, `org_project_roles` and `org_project_role_refs`, `org_invitations`,
-`org_mfa`, `sso_default_roles`, and the legacy-account bookkeeping), behind `internal/members` (Postgres and memory
+`org_mfa`, `sso_default_roles`, and the legacy-account bookkeeping; `0901_claim_token_invitation.sql` binds invite claim
+tokens to their invitation). The legacy rule (an account from before roles becomes Owner of every organization
+on its first request) runs once per account: writing any membership for an account settles it, so removing the
+membership later never hands the account back to the rule. Behind `internal/members` (Postgres and memory
 implementations, one service test suite that runs on both).
 
 ## Generated types
