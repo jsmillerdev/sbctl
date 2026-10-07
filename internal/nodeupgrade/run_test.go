@@ -38,7 +38,7 @@ func TestUpgradeHappyPath(t *testing.T) {
 		"inspect", "resolve ", "stage",
 		"prefetch",
 		"backup system,aaaaaaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbbbbbb x3",
-		"install v1.0.0->v1.1.0 schema 1190_custom_domains.sql/applied",
+		"install v1.0.0->v1.1.0 migrations 3/applied",
 		"wait gotrue,realtime,storage,studio",
 		"projects gotrue=v2.195.0-r1 postgres=?",
 		"status",
@@ -58,11 +58,11 @@ func TestUpgradeHappyPath(t *testing.T) {
 // registry as it was when the release ran otherwise.
 func TestUpgradeRecordsTheSchemaOfTheRelease(t *testing.T) {
 	h := newFakeHost()
-	h.node.BinaryInfo = &Info{Version: "v1.0.0", Pins: oldPins(), RegistrySchema: "1100_x.sql"}
+	h.node.BinaryInfo = &Info{Version: "v1.0.0", Pins: oldPins(), RegistryMigrations: migsV1[:2]}
 	if err := Run(context.Background(), h, runOpts(h)); err != nil {
 		t.Fatal(err)
 	}
-	if !h.has("install v1.0.0->v1.1.0 schema 1100_x.sql/binary") {
+	if !h.has("install v1.0.0->v1.1.0 migrations 2/binary") {
 		t.Fatalf("calls: %s", h.order())
 	}
 }
@@ -81,7 +81,7 @@ func TestCheckAndPlanChangeNothing(t *testing.T) {
 
 	h = newFakeHost()
 	h.tag = "v1.0.0"
-	h.node.BinaryInfo = &Info{Version: "v1.0.0", Pins: oldPins(), RegistrySchema: schemaV1}
+	h.node.BinaryInfo = &Info{Version: "v1.0.0", Pins: oldPins(), RegistryMigrations: migsV1}
 	o = runOpts(h)
 	o.Check = true
 	if err := Run(context.Background(), h, o); err != nil {
@@ -104,7 +104,7 @@ func TestCheckAndPlanChangeNothing(t *testing.T) {
 func TestNothingToDo(t *testing.T) {
 	h := newFakeHost()
 	h.tag = "v1.0.0"
-	h.node.BinaryInfo = &Info{Version: "v1.0.0", Pins: oldPins(), RegistrySchema: schemaV1}
+	h.node.BinaryInfo = &Info{Version: "v1.0.0", Pins: oldPins(), RegistryMigrations: migsV1}
 	h.info = h.node.BinaryInfo
 	h.node.Projects = h.node.Projects[:1]
 	if err := Run(context.Background(), h, runOpts(h)); err != nil {
@@ -214,7 +214,7 @@ func TestDaemonThatDoesNotComeUpIsRolledBack(t *testing.T) {
 	if code(t, err) != ExitRolledBack {
 		t.Fatalf("err = %v\n%s", err, h.order())
 	}
-	if !strings.Contains(h.order(), "restore v1.0.0") || h.has("projects") {
+	if !strings.Contains(h.order(), "restore v1.0.0 (from v1.1.0)") || h.has("projects") {
 		t.Fatalf("calls: %s", h.order())
 	}
 	if got := h.marks[len(h.marks)-1]; got != PhaseRolledBack {
@@ -265,7 +265,7 @@ func TestProjectFailureHaltsAndRollsBack(t *testing.T) {
 func TestRollbackRefusedByTheRegistrySchema(t *testing.T) {
 	h := newFakeHost()
 	h.projectsErr = errBoom
-	h.applied = schemaV2 // the new release migrated the registry
+	h.applied = migsV2 // the new release migrated the registry
 	err := Run(context.Background(), h, runOpts(h))
 	if code(t, err) != ExitNeedsOperator {
 		t.Fatalf("err = %v", err)

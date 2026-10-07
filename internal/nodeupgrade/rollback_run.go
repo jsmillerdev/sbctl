@@ -29,9 +29,9 @@ func Rollback(ctx context.Context, h Host, o Options) error {
 	if prev == nil {
 		return refused("no previous release is kept: %s is the oldest this node can go back to", node.Version)
 	}
-	applied, err := h.AppliedSchema(ctx)
+	applied, err := h.AppliedMigrations(ctx)
 	if err != nil {
-		return refused("cannot read the registry schema: %v", err)
+		return refused("cannot read the registry's migrations: %v", err)
 	}
 	if err := CheckRollback(prev, applied); err != nil {
 		return refused("%v", err)

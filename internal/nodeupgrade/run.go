@@ -117,8 +117,8 @@ type Host interface {
 	// Cleanup removes the artifacts and the kept binaries beyond keep releases.
 	Cleanup(ctx context.Context, keep int, current string)
 
-	// AppliedSchema reads the newest registry migration applied.
-	AppliedSchema(ctx context.Context) (string, error)
+	// AppliedMigrations reads the registry migrations applied.
+	AppliedMigrations(ctx context.Context) ([]string, error)
 	// PreviousRelease returns the kept release before current, and the record of current when
 	// the node kept one (nil otherwise); prev is nil when there is nothing to go back to.
 	PreviousRelease(ctx context.Context, current string) (prev, cur *Record, err error)
@@ -127,7 +127,8 @@ type Host interface {
 	// RevertProjects puts projects back on the releases they ran.
 	RevertProjects(ctx context.Context, moves []ProjectMove) error
 	// Restore reinstalls the kept release rec: its binary, its units, the daemon, and waits.
-	Restore(ctx context.Context, rec Record) error
+	// from is the release the node is rolled back from; it is not a target of a later rollback.
+	Restore(ctx context.Context, from string, rec Record) error
 	// Confirm asks the operator; it returns an error when there is nobody to ask.
 	Confirm(question string) (bool, error)
 }
@@ -287,12 +288,15 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 		return r.endRefused(fmt.Errorf("the base backups failed: %w; nothing was stopped or changed", err))
 	}
 
-	prev := Record{Version: node.Version, Platform: node.Platform, Pins: node.Pins, InstalledAt: o.now().UTC()}
-	prev.RegistrySchema, prev.SchemaSource = node.AppliedSchema, SchemaFromApplied
-	if node.BinaryInfo != nil && node.BinaryInfo.RegistrySchema != "" {
-		prev.RegistrySchema, prev.SchemaSource = node.BinaryInfo.RegistrySchema, SchemaFromBinary
+	// The release that runs is kept with the migrations it knows: what its binary says, or, for a
+	// binary built before it could say, the ones the registry holds now (it has run on them). Its
+	// InstalledAt stays what the node's store says, which is "unknown" for a release that was
+	// installed before the first upgrade kept it.
+	prev := Record{Version: node.Version, Platform: node.Platform, Pins: node.Pins, Migrations: node.AppliedMigrations, MigrationsFrom: MigrationsFromApplied}
+	if node.BinaryInfo != nil && len(node.BinaryInfo.RegistryMigrations) > 0 {
+		prev.Migrations, prev.MigrationsFrom = node.BinaryInfo.RegistryMigrations, MigrationsFromBinary
 	}
-	next := Record{Version: plan.To, Platform: staged.Info.Platform, Pins: staged.Info.Pins, RegistrySchema: staged.Info.RegistrySchema, SchemaSource: SchemaFromBinary, InstalledAt: o.now().UTC()}
+	next := Record{Version: plan.To, Platform: staged.Info.Platform, Pins: staged.Info.Pins, Migrations: staged.Info.RegistryMigrations, MigrationsFrom: MigrationsFromBinary, InstalledAt: o.now().UTC()}
 
 	if plan.BinaryChange {
 		r.mark(PhaseSwitching, "installing "+plan.To+" and restarting the daemon")

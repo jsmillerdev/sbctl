@@ -36,8 +36,11 @@ type Info struct {
 	// Pins maps a service (config.Svc*) to the slim-services release tag it runs, Studio's build
 	// tag included under "studio".
 	Pins map[string]string `json:"pins"`
-	// RegistrySchema is the newest registry migration the binary embeds.
-	RegistrySchema string `json:"registry_schema"`
+	// RegistrySchema is the newest registry migration the binary embeds (a label for people);
+	// RegistryMigrations lists all of them: the binary can run on a registry that holds these
+	// and no others.
+	RegistrySchema     string   `json:"registry_schema"`
+	RegistryMigrations []string `json:"registry_migrations"`
 }
 
 // PinsOf maps a versions.yaml to service names.
@@ -69,7 +72,7 @@ func OwnInfo(version string) (*Info, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Info{Version: version, Platform: runtime.GOOS + "-" + runtime.GOARCH, Pins: PinsOf(v), RegistrySchema: registry.SchemaVersion()}, nil
+	return &Info{Version: version, Platform: runtime.GOOS + "-" + runtime.GOARCH, Pins: PinsOf(v), RegistrySchema: registry.SchemaVersion(), RegistryMigrations: registry.MigrationNames()}, nil
 }
 
 // ParseInfo reads the JSON `supavise release-info --json` prints.

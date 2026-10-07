@@ -13,18 +13,22 @@ import (
 var t0 = time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)
 
 const (
-	authOld  = "auth-v2.100.0-r1"
-	authNew  = "auth-v2.195.0-r1"
-	restOld  = "postgrest-v12.0-r0"
-	restNew  = "postgrest-v16.4-r0"
-	pgOld    = "postgres-17.1.0-r1"
-	pgNew    = "postgres-17.11.0.004-r1"
-	rtOld    = "realtime-v2.100.0-r0"
-	rtNew    = "realtime-v2.140.10-r0"
-	stOld    = "storage-v1.70.0-r0"
-	stNew    = "storage-v1.79.36-r0"
-	schemaV1 = "1190_custom_domains.sql"
-	schemaV2 = "1200_next.sql"
+	authOld = "auth-v2.100.0-r1"
+	authNew = "auth-v2.195.0-r1"
+	restOld = "postgrest-v12.0-r0"
+	restNew = "postgrest-v16.4-r0"
+	pgOld   = "postgres-17.1.0-r1"
+	pgNew   = "postgres-17.11.0.004-r1"
+	rtOld   = "realtime-v2.100.0-r0"
+	rtNew   = "realtime-v2.140.10-r0"
+	stOld   = "storage-v1.70.0-r0"
+	stNew   = "storage-v1.79.36-r0"
+)
+
+// The migrations a release knows: v1 is what the node has, v2 adds one (a newer release's).
+var (
+	migsV1 = []string{"0001_init.sql", "1100_project_upgrades.sql", "1190_custom_domains.sql"}
+	migsV2 = []string{"0001_init.sql", "1100_project_upgrades.sql", "1190_custom_domains.sql", "1200_next.sql"}
 )
 
 func oldPins() map[string]string {
@@ -47,7 +51,7 @@ func testNode() *Node {
 		return map[string]string{"gotrue": authOld, "postgrest": restOld, "postgres": pgOld}
 	}
 	return &Node{
-		Version: "v1.0.0", Pins: oldPins(), AppliedSchema: schemaV1, Platform: "linux-amd64",
+		Version: "v1.0.0", Pins: oldPins(), AppliedMigrations: migsV1, Platform: "linux-amd64",
 		Verdict: VerdictHealthy, Summary: "healthy: 2 projects answering, 1 paused",
 		Escrow: Escrow{Known: true, Covered: true}, DiskFree: 100 << 30, DiskPath: "/var/lib/supavise",
 		Projects: []Project{
@@ -60,7 +64,7 @@ func testNode() *Node {
 }
 
 func newInfo() *Info {
-	return &Info{Version: "v1.1.0", Platform: "linux-amd64", Pins: newPins(), RegistrySchema: schemaV1}
+	return &Info{Version: "v1.1.0", Platform: "linux-amd64", Pins: newPins(), RegistrySchema: "1190_custom_domains.sql", RegistryMigrations: migsV1}
 }
 
 // fakeHost records what Run asks of the machine, in order, and fails the calls it is told to.
@@ -84,7 +88,7 @@ type fakeHost struct {
 	moves         []ProjectMove
 	verdicts      []string // successive answers of Status; the last repeats
 	statusErr     error
-	applied       string
+	applied       []string
 	appliedErr    error
 	revertErr     error
 	restoreErr    error
@@ -97,7 +101,7 @@ type fakeHost struct {
 }
 
 func newFakeHost() *fakeHost {
-	return &fakeHost{node: testNode(), info: newInfo(), out: &bytes.Buffer{}, applied: schemaV1, verdicts: []string{VerdictHealthy}, confirm: true}
+	return &fakeHost{node: testNode(), info: newInfo(), out: &bytes.Buffer{}, applied: migsV1, verdicts: []string{VerdictHealthy}, confirm: true}
 }
 
 func (f *fakeHost) rec(format string, a ...any) {
@@ -163,7 +167,7 @@ func (f *fakeHost) Mark(phase, detail string) {
 }
 
 func (f *fakeHost) Install(_ context.Context, _ *Staged, prev, next Record) (bool, error) {
-	f.rec("install %s->%s schema %s/%s", prev.Version, next.Version, prev.RegistrySchema, prev.SchemaSource)
+	f.rec("install %s->%s migrations %d/%s", prev.Version, next.Version, len(prev.Migrations), prev.MigrationsFrom)
 	if f.installErr != nil {
 		return f.installSwaps, f.installErr
 	}
@@ -212,7 +216,9 @@ func (f *fakeHost) Cleanup(_ context.Context, keep int, current string) {
 	f.rec("cleanup keep=%d current=%s", keep, current)
 }
 
-func (f *fakeHost) AppliedSchema(context.Context) (string, error) { return f.applied, f.appliedErr }
+func (f *fakeHost) AppliedMigrations(context.Context) ([]string, error) {
+	return f.applied, f.appliedErr
+}
 
 func (f *fakeHost) PreviousRelease(context.Context, string) (*Record, *Record, error) {
 	return f.prev, f.cur, nil
@@ -231,8 +237,8 @@ func (f *fakeHost) RevertProjects(_ context.Context, moves []ProjectMove) error 
 	return f.revertErr
 }
 
-func (f *fakeHost) Restore(_ context.Context, rec Record) error {
-	f.rec("restore %s", rec.Version)
+func (f *fakeHost) Restore(_ context.Context, from string, rec Record) error {
+	f.rec("restore %s (from %s)", rec.Version, from)
 	f.mu.Lock()
 	f.restored = f.restoreErr == nil
 	f.mu.Unlock()

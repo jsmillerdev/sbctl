@@ -144,17 +144,20 @@ func TestPlanEmptyWhenNothingDiffers(t *testing.T) {
 	}
 }
 
-func TestPlanRegistrySchemaNote(t *testing.T) {
+func TestPlanRegistryMigrationsNote(t *testing.T) {
 	n := testNode()
 	to := newInfo()
-	to.RegistrySchema = schemaV2
+	to.RegistryMigrations = migsV2
 	p := BuildPlan(n, to, PlanOptions{})
-	if p.SchemaFrom != schemaV1 || p.SchemaTo != schemaV2 {
-		t.Fatalf("schema %s -> %s", p.SchemaFrom, p.SchemaTo)
+	if len(p.NewMigrations) != 1 || p.NewMigrations[0] != "1200_next.sql" {
+		t.Fatalf("new migrations = %v", p.NewMigrations)
+	}
+	if q := BuildPlan(n, newInfo(), PlanOptions{}); len(q.NewMigrations) != 0 {
+		t.Fatalf("a release with the node's migrations adds %v", q.NewMigrations)
 	}
 	var out bytes.Buffer
 	p.Render(&out)
-	if !strings.Contains(out.String(), "registry schema moves") || !strings.Contains(out.String(), "pre-upgrade backup of the system project") {
+	if !strings.Contains(out.String(), "adds 1 registry migration(s) (1200_next.sql)") || !strings.Contains(out.String(), "pre-upgrade backup of the system project") {
 		t.Fatalf("plan:\n%s", out.String())
 	}
 }

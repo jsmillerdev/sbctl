@@ -21,3 +21,16 @@ func TestSchemaVersionIsTheNewestEmbeddedMigration(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrationNames(t *testing.T) {
+	names := MigrationNames()
+	files, _ := Migrations()
+	if len(names) == 0 || len(names) != len(files) || names[0] != "0001_init.sql" {
+		t.Fatalf("MigrationNames() = %v", names)
+	}
+	for _, n := range names {
+		if strings.Contains(n, "/") {
+			t.Fatalf("%q is a path", n)
+		}
+	}
+}

@@ -18,10 +18,10 @@ type Node struct {
 	// project, read from what the daemon rendered, completed with BinaryInfo's pins for the
 	// services no unit shows (PostgREST). The projects' releases are in Projects.
 	Pins map[string]string
-	// AppliedSchema is the newest registry migration the registry database has applied.
-	AppliedSchema string
-	Platform      string
-	Projects      []Project
+	// AppliedMigrations are the registry migrations the registry database has applied.
+	AppliedMigrations []string
+	Platform          string
+	Projects          []Project
 
 	// Verdict is the answer of `supavise status`: healthy, degraded, down, or unknown when it
 	// could not be asked. Summary is its first line.

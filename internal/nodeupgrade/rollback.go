@@ -13,21 +13,31 @@ import (
 // expects.
 var ErrRegistryNewer = errors.New("the registry schema is newer than the release to go back to expects")
 
-// CheckRollback applies the one rule that makes a rollback unsafe by itself: registry
-// migrations only go forward, so a binary older than the registry's schema may find tables and
-// columns it does not know, and may write rows the newer release cannot read. The rule refuses
-// then. Restoring the pre-upgrade base backup of the system project (which holds the registry)
-// brings the schema back; after that the same check passes, and nothing else has to be said.
-func CheckRollback(to *Record, applied string) error {
-	switch {
-	case applied == "":
-		return nil // an unmigrated registry has nothing newer
-	case to.RegistrySchema == "":
-		return fmt.Errorf("%w: the kept record of %s does not say which schema it expects (the registry is at %s)", ErrRegistryNewer, to.Version, applied)
-	case applied > to.RegistrySchema:
-		return fmt.Errorf("%w: the registry is at %s and %s expects %s at most (migrations only go forward). Restore the system project's pre-upgrade backup first (`supavise backups restore system`, see the backups documentation), then run the rollback again", ErrRegistryNewer, applied, to.Version, to.RegistrySchema)
+// CheckRollback applies the one rule that makes a rollback unsafe by itself: registry migrations
+// only go forward, so a binary that does not know every migration the registry holds may find
+// tables and columns it does not know, and may write rows the newer release cannot read. The rule
+// refuses then. Restoring the pre-upgrade base backup of the system project (which holds the
+// registry) brings the registry back; after that the same check passes, and nothing else has to be
+// said. It compares sets of migrations, not their newest name: the lanes of the project number
+// their migrations in separate ranges, so the newest name says little.
+func CheckRollback(to *Record, applied []string) error {
+	known := make(map[string]bool, len(to.Migrations))
+	for _, n := range to.Migrations {
+		known[n] = true
 	}
-	return nil
+	var unknown []string
+	for _, n := range applied {
+		if !known[n] {
+			unknown = append(unknown, n)
+		}
+	}
+	switch {
+	case len(unknown) == 0:
+		return nil
+	case len(to.Migrations) == 0:
+		return fmt.Errorf("%w: the kept record of %s does not say which migrations it knows, and the registry holds %d", ErrRegistryNewer, to.Version, len(applied))
+	}
+	return fmt.Errorf("%w: the registry holds %d migration(s) that %s does not know (%s), and migrations only go forward. Restore the system project's pre-upgrade backup first (`supavise backups restore system`, see the backups documentation), then run the rollback again", ErrRegistryNewer, len(unknown), to.Version, refList(unknown))
 }
 
 // ProjectMove is one project an upgrade moved: the releases it ran and the ones it runs.
@@ -69,9 +79,9 @@ type rollbackArgs struct {
 // verdict. It returns nil when the node is back on a.To and healthy, and an error that says what
 // state the node is in otherwise.
 func rollBackTo(ctx context.Context, h Host, o Options, a rollbackArgs) error {
-	applied, err := h.AppliedSchema(ctx)
+	applied, err := h.AppliedMigrations(ctx)
 	if err != nil {
-		return fmt.Errorf("cannot read the registry schema, so the rollback is not safe to start: %v. The node stays on %s; fix the registry connection and run `supavise rollback`", err, a.From)
+		return fmt.Errorf("cannot read the registry's migrations, so the rollback is not safe to start: %v. The node stays on %s; fix the registry connection and run `supavise rollback`", err, a.From)
 	}
 	if err := CheckRollback(a.To, applied); err != nil {
 		return fmt.Errorf("%v. The node stays on %s", err, a.From)
@@ -84,7 +94,7 @@ func rollBackTo(ctx context.Context, h Host, o Options, a rollbackArgs) error {
 		}
 	}
 	a.Mark(PhaseRollingBack, "restoring "+a.To.Version)
-	if err := h.Restore(ctx, *a.To); err != nil {
+	if err := h.Restore(ctx, a.From, *a.To); err != nil {
 		return fmt.Errorf("restoring %s failed: %v. Its binary is kept in the releases directory; install it by hand and restart supavise.service", a.To.Version, err)
 	}
 	var undo []ServiceMove

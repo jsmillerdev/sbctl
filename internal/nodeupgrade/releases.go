@@ -23,20 +23,27 @@ type Record struct {
 	// Pins are the service releases the binary pinned (Info.Pins), or, for a binary too old to
 	// report them, the releases the node's units ran while it was installed.
 	Pins map[string]string `json:"pins"`
-	// RegistrySchema is the newest registry migration the release can run on: the one its binary
-	// embeds, or, for a binary too old to say, the newest migration applied while it ran.
-	// Migrations only go forward, so a registry beyond it cannot be served by this release.
-	RegistrySchema string `json:"registry_schema"`
-	// SchemaSource says where RegistrySchema came from: "binary" or "applied".
-	SchemaSource string    `json:"schema_source,omitempty"`
-	SHA256       string    `json:"sha256"`
-	InstalledAt  time.Time `json:"installed_at"`
+	// Migrations are the registry migrations the release knows: the ones its binary embeds, or,
+	// for a binary too old to say, the ones applied while it ran. Migrations only go forward, so a
+	// registry that holds one this list lacks cannot be served by this release.
+	Migrations []string `json:"registry_migrations"`
+	// MigrationsFrom says where Migrations came from: "binary" or "applied".
+	MigrationsFrom string `json:"migrations_from,omitempty"`
+	// SHA256 is the checksum of the kept binary.
+	SHA256 string `json:"sha256"`
+	// InstalledAt is when the release became the one the node runs; zero for a release that was
+	// running before the first upgrade kept it.
+	InstalledAt time.Time `json:"installed_at"`
+	// Withdrawn marks a release the node was rolled back from: `supavise rollback` does not go
+	// back to it, so that a second rollback keeps stepping backwards. Installing the release
+	// again writes a fresh record.
+	Withdrawn bool `json:"withdrawn,omitempty"`
 }
 
-// Schema sources.
+// Sources of Record.Migrations.
 const (
-	SchemaFromBinary  = "binary"
-	SchemaFromApplied = "applied"
+	MigrationsFromBinary  = "binary"
+	MigrationsFromApplied = "applied"
 )
 
 // Releases is the directory of kept releases, <dir>/<version>/{supavise,release.json}. It lives
@@ -135,13 +142,25 @@ func (r Releases) write(d string, rec Record) error {
 }
 
 // Touch marks version as installed now, which makes it the newest record: a rollback to it
-// makes it the release the node runs.
+// makes it the release the node runs. It clears Withdrawn: a release the node runs is not one
+// it was rolled back from.
 func (r Releases) Touch(version string, at time.Time) error {
 	rec, err := r.Get(version)
 	if err != nil {
 		return err
 	}
-	rec.InstalledAt = at.UTC()
+	rec.InstalledAt, rec.Withdrawn = at.UTC(), false
+	d, _ := r.dir(version)
+	return r.write(d, *rec)
+}
+
+// Withdraw marks version as a release the node was rolled back from.
+func (r Releases) Withdraw(version string) error {
+	rec, err := r.Get(version)
+	if err != nil {
+		return err
+	}
+	rec.Withdrawn = true
 	d, _ := r.dir(version)
 	return r.write(d, *rec)
 }
@@ -208,15 +227,15 @@ func (r Releases) List() ([]Record, error) {
 	return out, nil
 }
 
-// Previous returns the newest record that is not current: the release a rollback goes back to.
-// It is nil when there is none.
+// Previous returns the newest record that is not current and was not rolled back from: the
+// release a rollback goes back to. It is nil when there is none.
 func (r Releases) Previous(current string) (*Record, error) {
 	all, err := r.List()
 	if err != nil {
 		return nil, err
 	}
 	for i := range all {
-		if all[i].Version != current {
+		if all[i].Version != current && !all[i].Withdrawn {
 			return &all[i], nil
 		}
 	}

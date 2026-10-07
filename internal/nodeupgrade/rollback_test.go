@@ -11,19 +11,21 @@ import (
 func TestCheckRollback(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
-		schema   string
-		applied  string
+		known    []string
+		applied  []string
 		wantErr  bool
 		contains string
 	}{
-		{"registry at the schema the release expects", schemaV1, schemaV1, false, ""},
-		{"registry behind the release", schemaV2, schemaV1, false, ""},
-		{"registry never migrated", schemaV1, "", false, ""},
-		{"registry migrated past the release", schemaV1, schemaV2, true, "Restore the system project's pre-upgrade backup"},
-		{"a release that does not say", "", schemaV1, true, "does not say which schema"},
+		{"registry holds what the release knows", migsV1, migsV1, false, ""},
+		{"registry behind the release", migsV2, migsV1, false, ""},
+		{"registry never migrated", migsV1, nil, false, ""},
+		{"registry migrated past the release", migsV1, migsV2, true, "Restore the system project's pre-upgrade backup"},
+		// The newest name does not tell: a lane's migration can number below the newest one.
+		{"a migration numbered below the newest", []string{"0001_init.sql", "1190_custom_domains.sql"}, migsV1, true, "1100_project_upgrades.sql"},
+		{"a release that does not say", nil, migsV1, true, "does not say which migrations"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := CheckRollback(&Record{Version: "v1.0.0", RegistrySchema: tc.schema}, tc.applied)
+			err := CheckRollback(&Record{Version: "v1.0.0", Migrations: tc.known}, tc.applied)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v", err)
 			}
@@ -42,9 +44,9 @@ func TestProjectMoveRevertTargets(t *testing.T) {
 	}
 }
 
-func keptRelease(version, schema string) *Record {
+func keptRelease(version string, migs []string) *Record {
 	p := oldPins()
-	return &Record{Version: version, Pins: p, RegistrySchema: schema, InstalledAt: t0.Add(-24 * time.Hour)}
+	return &Record{Version: version, Pins: p, Migrations: migs, InstalledAt: t0.Add(-24 * time.Hour)}
 }
 
 // rollbackHost is a node on v1.1.0 (the new pins) that kept v1.0.0, with two projects the upgrade moved.
@@ -53,8 +55,8 @@ func rollbackHost() *fakeHost {
 	h.node.Version, h.node.Pins = "v1.1.0", newPins()
 	h.node.Projects[1].Versions = map[string]string{"gotrue": authNew, "postgrest": restNew, "postgres": pgOld}
 	h.node.Projects[2].Versions = map[string]string{"gotrue": authNew, "postgrest": restNew, "postgres": pgOld}
-	h.prev = keptRelease("v1.0.0", schemaV1)
-	h.cur = &Record{Version: "v1.1.0", Pins: newPins(), RegistrySchema: schemaV1, InstalledAt: t0.Add(-time.Hour)}
+	h.prev = keptRelease("v1.0.0", migsV1)
+	h.cur = &Record{Version: "v1.1.0", Pins: newPins(), Migrations: migsV1, InstalledAt: t0.Add(-time.Hour)}
 	move := func(ref string) ProjectMove {
 		return ProjectMove{Ref: ref, From: map[string]string{"gotrue": authOld, "postgrest": restOld, "postgres": pgOld}, To: map[string]string{"gotrue": authNew, "postgrest": restNew, "postgres": pgOld}}
 	}
@@ -67,7 +69,7 @@ func TestRollbackGoesBackToThePreviousRelease(t *testing.T) {
 	if err := Rollback(context.Background(), h, runOpts(h)); err != nil {
 		t.Fatalf("%v\n%s", err, h.out)
 	}
-	want := "inspect | revert a,b | restore v1.0.0 | wait gotrue,realtime,storage,studio | status"
+	want := "inspect | revert a,b | restore v1.0.0 (from v1.1.0) | wait gotrue,realtime,storage,studio | status"
 	if got := h.order(); got != want {
 		t.Fatalf("order:\n got %s\nwant %s", got, want)
 	}
@@ -84,8 +86,8 @@ func TestRollbackRefusals(t *testing.T) {
 		want  string
 	}{
 		"no previous release":       {func(h *fakeHost, o *Options) { h.prev = nil }, "no previous release is kept"},
-		"registry migrated past it": {func(h *fakeHost, o *Options) { h.applied = schemaV2 }, "Restore the system project's pre-upgrade backup"},
-		"registry unreadable":       {func(h *fakeHost, o *Options) { h.appliedErr = errBoom }, "cannot read the registry schema"},
+		"registry migrated past it": {func(h *fakeHost, o *Options) { h.applied = migsV2 }, "Restore the system project's pre-upgrade backup"},
+		"registry unreadable":       {func(h *fakeHost, o *Options) { h.appliedErr = errBoom }, "cannot read the registry's migrations"},
 		"an upgrade is running":     {func(h *fakeHost, o *Options) { h.node.Running = &Running{PID: 9, Phase: "services"} }, "an upgrade is running"},
 		"declined":                  {func(h *fakeHost, o *Options) { o.Yes, h.confirm = false, false }, "nothing was changed"},
 	} {
@@ -108,12 +110,12 @@ func TestRollbackRefusals(t *testing.T) {
 // the same command then goes through.
 func TestRollbackAfterTheBackupWasRestored(t *testing.T) {
 	h := rollbackHost()
-	h.applied = schemaV2
+	h.applied = migsV2
 	if err := Rollback(context.Background(), h, runOpts(h)); code(t, err) != ExitRefused {
 		t.Fatalf("before the restore: %v", err)
 	}
 	h = rollbackHost()
-	h.applied = schemaV1
+	h.applied = migsV1
 	if err := Rollback(context.Background(), h, runOpts(h)); err != nil {
 		t.Fatalf("after the restore: %v", err)
 	}
@@ -154,5 +156,32 @@ func TestRevertableFiltersTheMoves(t *testing.T) {
 	}
 	if _, ok := got[1].From["gotrue"]; ok || got[1].From["postgrest"] != restOld {
 		t.Fatalf("b was upgraded again, so only PostgREST goes back: %+v", got[1])
+	}
+}
+
+// A second rollback keeps stepping backwards: the release the first one left is not a target.
+func TestRollbackStepsBackwards(t *testing.T) {
+	r := Releases{Dir: t.TempDir()}
+	keepRelease(t, r, "v1.0.0", t0)
+	keepRelease(t, r, "v1.1.0", t0.Add(time.Hour))
+	keepRelease(t, r, "v1.2.0", t0.Add(2*time.Hour))
+	prev, _ := r.Previous("v1.2.0")
+	if prev == nil || prev.Version != "v1.1.0" {
+		t.Fatalf("previous of v1.2.0 = %+v", prev)
+	}
+	// Rolled back from v1.2.0 to v1.1.0, which becomes the newest again.
+	if err := r.Touch("v1.1.0", t0.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Withdraw("v1.2.0"); err != nil {
+		t.Fatal(err)
+	}
+	if prev, _ = r.Previous("v1.1.0"); prev == nil || prev.Version != "v1.0.0" {
+		t.Fatalf("after the rollback the previous of v1.1.0 = %+v, want v1.0.0 (not the release rolled back from)", prev)
+	}
+	// Installing it again makes it a target once more.
+	keepRelease(t, r, "v1.2.0", t0.Add(4*time.Hour))
+	if prev, _ = r.Previous("v1.1.0"); prev == nil || prev.Version != "v1.2.0" {
+		t.Fatalf("a reinstalled release is still withdrawn: %+v", prev)
 	}
 }

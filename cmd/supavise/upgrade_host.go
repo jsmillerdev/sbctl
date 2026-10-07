@@ -154,7 +154,7 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	}
 
 	dsn := lifecycle.SystemSocketDSN(h.cfg, "supavise")
-	if n.AppliedSchema, err = registry.AppliedSchema(ctx, dsn); err != nil {
+	if n.AppliedMigrations, err = registry.AppliedMigrations(ctx, dsn); err != nil {
 		return nil, fmt.Errorf("cannot reach the registry (is supavise-postgres@system running? run as root or as the supavise user): %w", err)
 	}
 	reg, err := registry.OpenExisting(ctx, dsn+" pool_max_conns=2")
@@ -540,6 +540,9 @@ func (h *nodeHost) Install(ctx context.Context, s *nodeupgrade.Staged, prev, nex
 	if !h.root {
 		return false, errors.New("run as root: sudo supavise upgrade")
 	}
+	if old, err := h.rel.Get(prev.Version); err == nil {
+		prev.InstalledAt = old.InstalledAt
+	}
 	if _, err := h.rel.Keep(prev, h.binPath); err != nil {
 		return false, fmt.Errorf("keeping the running release: %w", err)
 	}
@@ -568,7 +571,7 @@ func (h *nodeHost) activate(ctx context.Context) error {
 }
 
 // Restore implements nodeupgrade.Host.
-func (h *nodeHost) Restore(ctx context.Context, rec nodeupgrade.Record) error {
+func (h *nodeHost) Restore(ctx context.Context, from string, rec nodeupgrade.Record) error {
 	if !h.root {
 		return errors.New("run as root: sudo supavise rollback")
 	}
@@ -585,7 +588,13 @@ func (h *nodeHost) Restore(ctx context.Context, rec nodeupgrade.Record) error {
 	if err := h.activate(ctx); err != nil {
 		return err
 	}
-	return h.rel.Touch(rec.Version, time.Now())
+	if err := h.rel.Touch(rec.Version, time.Now()); err != nil {
+		return err
+	}
+	if err := h.rel.Withdraw(from); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // replaceFile copies src next to dst and renames it over dst, so a reader sees one or the other.
@@ -781,9 +790,9 @@ func (h *nodeHost) RevertProjects(ctx context.Context, moves []nodeupgrade.Proje
 	return errors.Join(errs...)
 }
 
-// AppliedSchema implements nodeupgrade.Host.
-func (h *nodeHost) AppliedSchema(ctx context.Context) (string, error) {
-	return registry.AppliedSchema(ctx, lifecycle.SystemSocketDSN(h.cfg, "supavise"))
+// AppliedMigrations implements nodeupgrade.Host.
+func (h *nodeHost) AppliedMigrations(ctx context.Context) ([]string, error) {
+	return registry.AppliedMigrations(ctx, lifecycle.SystemSocketDSN(h.cfg, "supavise"))
 }
 
 // PreviousRelease implements nodeupgrade.Host.

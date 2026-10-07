@@ -46,11 +46,11 @@ type Plan struct {
 
 	IncludePostgres bool
 	Canary, Batch   int
-	// SchemaFrom and SchemaTo are set when the release carries registry migrations.
-	SchemaFrom, SchemaTo string
-	Restarts             []string
-	Impact               []string
-	Notes                []string
+	// NewMigrations are the registry migrations the release adds.
+	NewMigrations []string
+	Restarts      []string
+	Impact        []string
+	Notes         []string
 	// Refusal is set when the upgrade must not run; nothing has changed.
 	Refusal string
 
@@ -133,8 +133,8 @@ func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 		p.Upgrade = append(p.Upgrade, pr.Ref)
 	}
 	sort.Strings(p.Upgrade)
-	if to.RegistrySchema != "" && n.AppliedSchema != "" && to.RegistrySchema > n.AppliedSchema {
-		p.SchemaFrom, p.SchemaTo = n.AppliedSchema, to.RegistrySchema
+	if len(to.RegistryMigrations) > 0 {
+		p.NewMigrations = missing(to.RegistryMigrations, n.AppliedMigrations)
 	}
 	p.describe()
 	return p
@@ -217,8 +217,8 @@ func (p *Plan) describe() {
 	if p.HeldBack > 0 {
 		p.Notes = append(p.Notes, fmt.Sprintf("%d project(s) keep their PostgreSQL release (the release pins %s); pass --include-postgres to move them, each restarts PostgreSQL", p.HeldBack, short(config.SvcPostgres, p.HeldTo)))
 	}
-	if p.SchemaTo != "" {
-		p.Notes = append(p.Notes, fmt.Sprintf("the registry schema moves from %s to %s. Migrations only go forward: `supavise rollback` afterwards needs the pre-upgrade backup of the system project restored first", p.SchemaFrom, p.SchemaTo))
+	if len(p.NewMigrations) > 0 {
+		p.Notes = append(p.Notes, fmt.Sprintf("the release adds %d registry migration(s) (%s). Migrations only go forward: `supavise rollback` afterwards needs the pre-upgrade backup of the system project restored first", len(p.NewMigrations), refList(p.NewMigrations)))
 	}
 	for _, s := range p.Skipped {
 		p.Notes = append(p.Notes, fmt.Sprintf("project %s is skipped: %s", s.Ref, s.Why))
@@ -398,4 +398,19 @@ func human(b uint64) string {
 		return fmt.Sprintf("%.1f GiB", float64(b)/g)
 	}
 	return fmt.Sprintf("%d MiB", b>>20)
+}
+
+// missing returns the names in want that have lacks, in want's order.
+func missing(want, have []string) []string {
+	set := make(map[string]bool, len(have))
+	for _, n := range have {
+		set[n] = true
+	}
+	var out []string
+	for _, n := range want {
+		if !set[n] {
+			out = append(out, n)
+		}
+	}
+	return out
 }

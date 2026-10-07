@@ -14,7 +14,7 @@ func keepRelease(t *testing.T, r Releases, version string, at time.Time) Record 
 	if err := os.WriteFile(src, []byte("binary of "+version), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rec, err := r.Keep(Record{Version: version, Pins: map[string]string{"gotrue": "auth-" + version}, RegistrySchema: schemaV1, SchemaSource: SchemaFromBinary, InstalledAt: at}, src)
+	rec, err := r.Keep(Record{Version: version, Pins: map[string]string{"gotrue": "auth-" + version}, Migrations: migsV1, MigrationsFrom: MigrationsFromBinary, InstalledAt: at}, src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestReleasesKeepAndPrevious(t *testing.T) {
 	}
 	// The record carries what a rollback needs, and the binary is what was kept.
 	rec, err := r.Get("v1.0.0")
-	if err != nil || rec.Pins["gotrue"] != "auth-v1.0.0" || rec.RegistrySchema != schemaV1 || rec.SHA256 == "" {
+	if err != nil || rec.Pins["gotrue"] != "auth-v1.0.0" || len(rec.Migrations) != len(migsV1) || rec.SHA256 == "" {
 		t.Fatalf("record = %+v, %v", rec, err)
 	}
 	if err := r.Verify(rec); err != nil {

@@ -239,6 +239,40 @@ jobs:
           path: /tmp/supavise-upgrade-logs
           if-no-files-found: ignore
 
+  # The node upgrade on a node the installer set up from the previous release (origin/main with older
+  # pins): `supavise upgrade --check`, `--plan` and the refusals, the upgrade to a release served by a
+  # local server (binary, shared services, projects with a canary; versions, processes, data, the kept
+  # releases), a release whose daemon dies and one whose PostgREST does not start (rolled back, exit
+  # status 3), and `supavise rollback` with the registry rule. The job's name starts with `upgrade`:
+  # the release gate (deploy/release-gate.sh) requires the jobs of this name.
+  upgrade-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build the previous release and the releases it is upgraded to
+        run: tests/linux/upgrade-e2e-build.sh /tmp/upgrade-bins
+      - name: upgrade end to end
+        run: sudo LOG_DIR=/tmp/supavise-upgrade-e2e-logs UPGRADE_E2E_BIN_DIR=/tmp/upgrade-bins tests/linux/upgrade-e2e.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/supavise-upgrade-e2e-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-e2e-${{ matrix.arch }}
+          path: /tmp/supavise-upgrade-e2e-logs
+          if-no-files-found: ignore
+
   # Members and roles under systemd: users with each role, Studio's permission list, a Read-only
   # PAT refused writes through the API, the real MCP server and Supabase CLI, invitations by mail.
   roles-smoke:
