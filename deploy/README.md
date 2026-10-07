@@ -96,15 +96,19 @@ sudo sbctl self-update --version v1.2.3
 sbctl self-update --check
 ```
 
-`self-update` fetches the release, verifies the ed25519 signature of `SHA256SUMS` against the public key compiled into the binary (`internal/selfupdate/release_key.pem`) and the binary against its checksum, replaces `/usr/local/bin/sbctl` with one rename (the previous binary stays as `sbctl.prev`), refreshes the units with the new binary and restarts `sbctl.service`. Then it waits up to `--wait` (2 minutes) for the daemon to answer on its admin listener, the check the installer uses (a daemon can be `active` to systemd and still crash a moment later). If it does not answer, `self-update` puts the previous binary back, re-renders the units with it and restarts the service. Project units keep running while the daemon restarts. Artifact versions move with `versions.yaml` inside a release, not through this command.
+`self-update` fetches the release, verifies the ed25519 signature of `SHA256SUMS` against the public key compiled into the binary (`internal/selfupdate/release_key.pem`) and the binary against its checksum, replaces `/usr/local/bin/sbctl` with one rename (the previous binary stays as `sbctl.prev`), refreshes the units with the new binary and restarts `sbctl.service`. Then it waits up to `--wait` (5 minutes, as in the installer) for the daemon to answer on its admin listener, the check the installer uses (a daemon can be `active` to systemd and still crash a moment later). If it does not answer, `self-update` puts the previous binary back, re-renders the units with it and restarts the service. Project units keep running while the daemon restarts. Artifact versions move with `versions.yaml` inside a release, not through this command.
 
 A binary built without a committed release key refuses to self-update (it names the missing key).
 
 ## AWS
 
-[Launch the stack](https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?templateURL=https%3A%2F%2Fsbctl-templates.s3.amazonaws.com%2Fsbctl.yaml&stackName=sbctl)
+There is no one-click link yet. CloudFormation accepts templates from S3 only, and the maintainers have not published `sbctl.yaml` to a bucket they own. A link to a bucket nobody owns would let whoever registers that name serve any template to your console, so none is shown here. To publish it, upload the `sbctl.yaml` asset of a release to a bucket you control that allows public reads of that object, then use a Quick-create URL of this form (replace the placeholder):
 
-**This link does not work yet.** CloudFormation accepts templates from S3 only, and the maintainers have not published `sbctl.yaml` to a public bucket. To publish it, upload the `sbctl.yaml` asset of a release to a bucket that allows public reads of that object and replace the host in `templateURL` (the bucket name `sbctl-templates` above is a placeholder). Until then, create the stack from the file: console, Create stack, Upload a template file.
+```
+https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?templateURL=https://<your-template-bucket>.s3.amazonaws.com/sbctl.yaml&stackName=sbctl
+```
+
+A real link goes here once a release job uploads the template to a maintainer-owned bucket. Until then, create the stack from the file: console, Create stack, Upload a template file.
 
 The stack creates one Ubuntu 24.04 instance (arm64 by default), an Elastic IP, a data volume formatted XFS and mounted at `/var/lib/sbctl` (XFS with reflinks is what copy-on-write branching needs later), an S3 bucket for backups (versioned, encrypted, public access blocked, kept when the stack is deleted), a security group for 80, 443, 5432 and 6543, an instance role, and a Secrets Manager secret for the claim token. If you give no VPC it also creates a small VPC with one public subnet.
 
@@ -114,11 +118,12 @@ The stack creates one Ubuntu 24.04 instance (arm64 by default), an Elastic IP, a
 | `Architecture`, `InstanceType` | arm64 with `t4g.medium` by default. About 100 MB of RAM per idle project: 4 GiB fits a handful of small projects, 16 GiB about a hundred. |
 | `DataVolumeSize` | GiB for project data (default 100). |
 | `DomainName`, `HostedZoneId` | Both given: the stack creates the four DNS records and the node issues a wildcard certificate by DNS-01 with the instance role. Only the domain: create the records listed in the `DnsRecordsNeeded` output yourself. Neither: sslip.io on the Elastic IP. |
-| `AccessCidr`, `SshCidr` | Who may reach the four ports (default everyone; port 80 must stay open for HTTP-01 without a hosted zone) and, optionally, SSH. No SSH rule by default: the role includes Session Manager. |
+| `AccessCidr`, `SshCidr` | Who may reach the four ports (default everyone; port 80 must stay open for HTTP-01 without a hosted zone) and, optionally, SSH. No SSH rule by default: Session Manager is the way in. |
+| `EnableSessionManager` | `true` by default: adds a role policy with only the Session Manager actions (`ssm:UpdateInstanceInformation` and the four `ssmmessages` channel actions). The AWS managed policy `AmazonSSMManagedInstanceCore` is not used because it can read every Parameter Store parameter in the account. |
 | `SbctlVersion` | `latest` or a release tag. |
 | `VpcId`, `SubnetId` | An existing VPC and public subnet, both or neither. |
 
-The instance role may write only this bucket, put a value into only the claim-token secret, change records in only the given hosted zone (`ChangeResourceRecordSets`, `ListResourceRecordSets`, and `GetChange` on change IDs), and use Session Manager. User data prepares the volume, runs `install.sh` from the release with the stack's parameters, stores the claim token in the secret, and signals the stack with `cfn-signal` (with a `curl` fallback when the helper package cannot be installed). The stack waits 30 minutes for that signal and fails with the installer's last error when it comes. The installer log is `/var/log/sbctl-bootstrap.log` on the instance.
+The instance role may write only this bucket, put a value into only the claim-token secret, change records in only the given hosted zone (`ChangeResourceRecordSets`, `ListResourceRecordSets`, and `GetChange` on change IDs), and, unless `EnableSessionManager` is `false`, use Session Manager (the minimal policy above, no Run Command). User data prepares the volume, runs `install.sh` from the release with the stack's parameters, stores the claim token in the secret, and signals the stack with `cfn-signal` (with a `curl` fallback when the helper package cannot be installed). The stack waits 30 minutes for that signal and fails with the installer's last error when it comes. The installer log is `/var/log/sbctl-bootstrap.log` on the instance.
 
 When the stack is ready, read the outputs: `DashboardUrl`, `ClaimUrl` and `ClaimTokenSecretArn`. Fetch the token with
 

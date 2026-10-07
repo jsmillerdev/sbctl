@@ -68,6 +68,59 @@ func TestApplyInstallDomainAndDNS(t *testing.T) {
 	}
 }
 
+func TestApplyInstallDNSProviderSwitchReplacesCredentials(t *testing.T) {
+	cfg := config.Default()
+	first := installOptions{DNSProvider: "cloudflare", DNSCredentials: []string{"api_token=cf", "zone=z1"}}
+	if err := applyInstall(cfg, first, changedSet("dns")); err != nil {
+		t.Fatal(err)
+	}
+	second := installOptions{DNSProvider: "route53", DNSCredentials: []string{"access_key_id=AKIA"}}
+	if err := applyInstall(cfg, second, changedSet("dns")); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLS.DNSProvider != "route53" || len(cfg.TLS.Credentials) != 1 || cfg.TLS.Credentials["access_key_id"] != "AKIA" {
+		t.Fatalf("%q %v", cfg.TLS.DNSProvider, cfg.TLS.Credentials)
+	}
+	// Switching with no new credentials (instance role) leaves none behind.
+	if err := applyInstall(cfg, installOptions{DNSProvider: "hetzner"}, changedSet("dns")); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TLS.Credentials) != 0 {
+		t.Fatalf("stale credentials: %v", cfg.TLS.Credentials)
+	}
+	// Re-running with the same provider keeps what is there and merges new keys.
+	_ = applyInstall(cfg, installOptions{DNSProvider: "hetzner", DNSCredentials: []string{"token=a"}}, changedSet("dns"))
+	if err := applyInstall(cfg, installOptions{DNSProvider: "hetzner", DNSCredentials: []string{"extra=b"}}, changedSet("dns")); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLS.Credentials["token"] != "a" || cfg.TLS.Credentials["extra"] != "b" {
+		t.Fatalf("%v", cfg.TLS.Credentials)
+	}
+}
+
+func TestWriteSecretFileTightensAnExistingMode(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "claim")
+	if err := os.WriteFile(p, []byte("old and longer content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSecretFile(p, []byte("tok\n")); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v", st.Mode().Perm())
+	}
+	if b, _ := os.ReadFile(p); string(b) != "tok\n" {
+		t.Fatalf("content %q", b)
+	}
+}
+
 func TestApplyInstallS3(t *testing.T) {
 	cfg := config.Default()
 	o := installOptions{S3Bucket: "my-bucket", S3Prefix: "/nodes/a/", S3Region: "eu-central-1"}

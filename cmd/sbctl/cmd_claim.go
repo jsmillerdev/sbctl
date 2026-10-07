@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -64,7 +63,7 @@ file readable only by its owner.`,
 				return err
 			}
 			if file != "" {
-				if err := os.WriteFile(file, []byte(tok+"\n"), 0o600); err != nil {
+				if err := writeSecretFile(file, []byte(tok+"\n")); err != nil {
 					return err
 				}
 			}

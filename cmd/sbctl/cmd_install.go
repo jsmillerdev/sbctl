@@ -431,6 +431,25 @@ func writeFileAtomic(path string, b []byte, mode os.FileMode, uid, gid int) erro
 	return os.Rename(tmp.Name(), path)
 }
 
+// writeSecretFile writes b to path with mode 0600 even when the file already exists with a wider
+// mode: os.WriteFile applies its permission only when it creates the file, so the mode is set
+// on the open descriptor before the secret goes in.
+func writeSecretFile(path string, b []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 // ensurePolkit installs polkit when the host lacks it: the sbctl user drives systemd over
 // D-Bus, which needs polkit and the rule `system install-units` installs.
 func (in *installer) ensurePolkit() error {
@@ -598,7 +617,7 @@ func (in *installer) claimToken(o installOptions) (token string, claimed bool, e
 	}
 	token = strings.TrimSpace(tok.String())
 	if o.ClaimTokenFile != "" {
-		if err := os.WriteFile(o.ClaimTokenFile, []byte(token+"\n"), 0o600); err != nil {
+		if err := writeSecretFile(o.ClaimTokenFile, []byte(token+"\n")); err != nil {
 			return "", false, err
 		}
 	}

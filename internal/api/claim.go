@@ -422,7 +422,7 @@ type claimWindow struct {
 const (
 	claimFailLimit  = 10
 	claimFailWindow = time.Minute
-	claimMaxClients = 4096 // bounds memory; entries older than a window are dropped first
+	claimMaxClients = 4096 // bounds memory; entries older than a window are dropped first, then unknown clients fail open
 )
 
 // window returns the live window of key (starting a new one when the old expired). Caller holds mu.
@@ -441,11 +441,10 @@ func (l *claimLimiter) window(key string, now time.Time) *claimWindow {
 			}
 		}
 		if len(l.clients) >= claimMaxClients {
-			// Every slot is a live window: share one bucket rather than grow without bound.
-			key = "*overflow*"
-			if w = l.clients[key]; w != nil && now.Sub(w.start) <= claimFailWindow {
-				return w
-			}
+			// Every slot is a live window. Fail open for an unknown client: hand back a window
+			// that is not stored, so its failures count for nothing. A shared overflow bucket
+			// would let a flood of junk clients lock out the first administrator.
+			return &claimWindow{start: now}
 		}
 	}
 	w = &claimWindow{start: now}

@@ -559,17 +559,39 @@ func TestClaimClientKey(t *testing.T) {
 	}
 }
 
-func TestClaimLimiterMemoryIsBounded(t *testing.T) {
+func TestClaimLimiterMemoryIsBoundedAndFailsOpenWhenFull(t *testing.T) {
 	var l claimLimiter
 	now := time.Now()
 	for i := 0; i < claimMaxClients+500; i++ {
 		l.fail(fmt.Sprintf("client-%d", i), now)
 	}
-	if len(l.clients) > claimMaxClients+1 {
+	if len(l.clients) > claimMaxClients {
 		t.Fatalf("%d tracked clients", len(l.clients))
 	}
-	if !l.blocked("*overflow*", now) {
-		t.Fatal("the shared overflow bucket did not collect the clients beyond the bound")
+	// A client the full table cannot track is never blocked, however often it fails: a flood of
+	// junk clients must not lock out the first administrator.
+	for i := 0; i < 3*claimFailLimit; i++ {
+		l.fail("fresh-admin", now)
+	}
+	if l.blocked("fresh-admin", now) {
+		t.Fatal("an unknown client was blocked while the table was full")
+	}
+	if len(l.clients) > claimMaxClients {
+		t.Fatalf("%d tracked clients after the untracked failures", len(l.clients))
+	}
+	// Tracked clients are still limited, and once the windows expire the table takes new clients.
+	for i := 0; i < claimFailLimit; i++ {
+		l.fail("client-0", now)
+	}
+	if !l.blocked("client-0", now) {
+		t.Fatal("a tracked client was not blocked")
+	}
+	later := now.Add(2 * claimFailWindow)
+	for i := 0; i < claimFailLimit; i++ {
+		l.fail("fresh-admin", later)
+	}
+	if !l.blocked("fresh-admin", later) {
+		t.Fatal("a client is not tracked after the old windows expired")
 	}
 }
 

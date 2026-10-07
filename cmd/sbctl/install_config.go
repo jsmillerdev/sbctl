@@ -79,6 +79,11 @@ func applyInstall(cfg *config.Config, o installOptions, changed func(string) boo
 	if changed("dns") {
 		switch o.DNSProvider {
 		case "", "route53", "cloudflare", "hetzner", "digitalocean":
+			if o.DNSProvider != cfg.TLS.DNSProvider {
+				// The old provider's secrets mean nothing to the new one, and a stale key of the
+				// same name could be sent to it: start from the credentials given now.
+				cfg.TLS.Credentials = nil
+			}
 			cfg.TLS.DNSProvider = o.DNSProvider
 		default:
 			return fmt.Errorf("--dns %q: want route53, cloudflare, hetzner or digitalocean", o.DNSProvider)

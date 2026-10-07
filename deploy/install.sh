@@ -122,7 +122,8 @@ main() {
   fi
 
   tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT
+  VERIFY_BIN=$(dirname "$BIN_PATH")/.sbctl.verify
+  trap 'rm -rf "$tmp"; rm -f "$VERIFY_BIN"' EXIT
 
   # ---- obtain the binary ------------------------------------------------------------
   STUDIO_ARGS=()
@@ -164,9 +165,15 @@ main() {
     log "$asset matches its checksum"
     # The signature covers the checksums, not the tag in GitHub's metadata. A binary that does not
     # name the tag it was published under is an older signed release attached to a newer tag.
-    chmod +x "$tmp/$asset"
-    reported=$("$tmp/$asset" --version 2>&1 | head -n1 || true)
-    [[ " $reported " == *" $TAG "* ]] || die "release $TAG ships a binary that reports '${reported:-nothing}': refusing to install (an older signed binary under a newer tag would be a downgrade)"
+    # Run it from next to its destination, not from $tmp: /tmp is often mounted noexec, and
+    # that must not look like a downgrade.
+    install -d -m 0755 "$(dirname "$BIN_PATH")"
+    install -m 0755 "$tmp/$asset" "$VERIFY_BIN"
+    if ! reported=$("$VERIFY_BIN" --version 2>&1 | head -n1) || [[ -z $reported ]]; then
+      die "the downloaded $asset does not run on this host (is $(dirname "$BIN_PATH") mounted noexec?)"
+    fi
+    [[ " $reported " == *" $TAG "* ]] || die "release $TAG ships a binary that reports '$reported': refusing to install (an older signed binary under a newer tag would be a downgrade)"
+    rm -f "$VERIFY_BIN"
     SRC=$tmp/$asset
     # Studio ships as a release asset too; hand its URL and checksum (from the verified
     # list) to `sbctl install` unless the caller chose their own.
@@ -196,7 +203,7 @@ main() {
   "$BIN_PATH" --version >/dev/null || die "the installed binary does not run on this host"
   log "installed $BIN_PATH ($("$BIN_PATH" --version | head -n1))"
 
-  rm -rf "$tmp"; trap - EXIT
+  rm -rf "$tmp"; rm -f "$VERIFY_BIN"; trap - EXIT
   exec "$BIN_PATH" install "${STUDIO_ARGS[@]+"${STUDIO_ARGS[@]}"}" "${PASS[@]+"${PASS[@]}"}"
 }
 

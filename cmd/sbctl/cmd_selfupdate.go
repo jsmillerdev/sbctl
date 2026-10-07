@@ -38,7 +38,7 @@ into this binary, checks the binary against its checksum, replaces /usr/local/bi
 atomically (the previous binary stays beside it as sbctl.prev), refreshes the systemd units
 with the new binary and restarts sbctl.service. Project units are not restarted: they
 belong to systemd and keep running. If the restarted daemon does not answer on its admin
-listener within --wait (default 2 minutes; the installer's readiness check, because systemd
+listener within --wait (default 5 minutes; the installer's readiness check, because systemd
 calls a daemon active the moment it forks), the previous binary is put back, the units are
 rendered again with it and the service is restarted.
 
@@ -123,7 +123,7 @@ not through this command.`,
 	cmd.Flags().BoolVar(&force, "force", false, "install even when the release is not newer")
 	cmd.Flags().BoolVar(&noRestart, "no-restart", false, "do not restart sbctl.service")
 	cmd.Flags().BoolVar(&noUnits, "no-units", false, "do not refresh the systemd units")
-	cmd.Flags().DurationVar(&wait, "wait", 2*time.Minute, "how long the restarted daemon has to answer before the update is rolled back")
+	cmd.Flags().DurationVar(&wait, "wait", 5*time.Minute, "how long the restarted daemon has to answer before the update is rolled back")
 	// For tests against a local release server and a throwaway key; a release build
 	// verifies against the key compiled into the binary.
 	cmd.Flags().StringVar(&apiBase, "api-base", "", "GitHub API root (tests)")
