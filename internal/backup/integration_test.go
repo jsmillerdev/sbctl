@@ -580,6 +580,10 @@ func TestRestoreRunningSourceToRecentTime(t *testing.T) {
 	e.svc.opt.ConfigPath = cfgPath
 	e.svc.opt.RecoveryPoll = 200 * time.Millisecond
 	e.svc.opt.RecoveryFailGrace = 3 * time.Second
+	// A cluster that dies before the first poll is never seen in recovery, and the wait for
+	// it to answer then runs the whole RecoveryTimeout (30 minutes by default): bound it, or
+	// that race (seen once on a fast CI runner) hangs the job until the test timeout.
+	e.svc.opt.RecoveryTimeout = 60 * time.Second
 
 	src := newSourceCluster(t, bin, root, testRef, ArchiveSettings(e.cfg, testRef, cfgPath))
 	src.start()
@@ -679,6 +683,10 @@ func TestRestoreInPlaceRollsBackWhenRecoveryCannotReachItsTarget(t *testing.T) {
 	e.svc.opt.ConfigPath = cfgPath
 	e.svc.opt.RecoveryPoll = 200 * time.Millisecond
 	e.svc.opt.RecoveryFailGrace = 3 * time.Second
+	// A cluster that dies before the first poll is never seen in recovery, and the wait for
+	// it to answer then runs the whole RecoveryTimeout (30 minutes by default): bound it, or
+	// that race (seen once on a fast CI runner) hangs the job until the test timeout.
+	e.svc.opt.RecoveryTimeout = 60 * time.Second
 
 	src := newSourceCluster(t, bin, root, testRef, ArchiveSettings(e.cfg, testRef, cfgPath))
 	src.start()
