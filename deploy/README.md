@@ -94,6 +94,16 @@ sudo -u supavise supavise users remove dev@example.com                     # end
 
 An address that has no account gets the claim page with the token filled in: the invitee picks a password and joins with the invited role. An address that already has an account gets the dashboard's invitation page. The Team page of an organization in the dashboard does the same through the Management API. An organization always keeps one owner: `users remove` refuses to delete the only owner unless you add `--force`. Accounts created before roles existed became owners of every organization when the roles were introduced.
 
+Owners delete an organization from its settings page in the dashboard, or on the server:
+
+```bash
+sudo -u supavise supavise orgs list
+sudo -u supavise supavise orgs delete acme          # lists what it would delete and stops
+sudo -u supavise supavise orgs delete acme --yes    # deletes its projects (each with a final backup), members, invitations and SSO setup
+```
+
+The node's last organization is never deleted.
+
 ### Single sign-on
 
 People can sign in to the dashboard with the company's identity provider (SAML 2.0: Okta, Entra ID, Google Workspace, ...). Register it with its metadata and the email domains it serves:
