@@ -55,6 +55,7 @@ PG_PORT=$((BASE + 1)); AUTH_PORT=$((BASE + 2)); META_PORT=$((BASE + 3)); MOCK_PO
 HOST=127.0.0.1
 mkdir -p "$SPIKE_DIR" "$OUT/logs" "$OUT/screenshots"
 
+[[ "$(id -u)" -ne 0 ]] || die "run as a normal user: postgres refuses to start as root"
 for t in curl tar zstd; do command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"; done
 sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 rand() { local s; s="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$1" || true)"; printf '%s' "$s"; }
