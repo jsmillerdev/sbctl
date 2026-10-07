@@ -110,14 +110,6 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		return
 	}
 
-	if rt.keys == keyRealtime {
-		// A long-poll session opened before the legacy keys were switched off must not go on.
-		if toks := queryValues(r.URL.RawQuery, "token"); len(toks) > 0 && s.lp.seen(p.ref, toks) {
-			refuseRevokedSession(w)
-			return
-		}
-	}
-
 	res := authResult{rawQuery: r.URL.RawQuery}
 	var guardKeys [][]byte
 	if rt.keys != keyNone {
@@ -142,6 +134,12 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 			return
 		}
 		if k != nil {
+			// While the legacy keys are off, Realtime is WebSocket-only (see isRealtimeWebSocket):
+			// nothing else on the route reaches Realtime, whatever it carries.
+			if rt.keys == keyRealtime && k.LegacyDisabled && !isRealtimeWebSocket(r, pth, trailing) {
+				writeJSON(w, http.StatusForbidden, msgRealtimeLongPollOff)
+				return
+			}
 			// Before any route-specific rule: with the legacy keys disabled, a request that carries
 			// one of them anywhere in its headers or query is refused, whatever the route reads.
 			if carriesLegacyKey(k, r.Header, r.URL.RawQuery) {
@@ -207,15 +205,10 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 	tg.dropTenant = rt.svc != svcFunctions
 	if rt.keys == keyRealtime {
 		tg.trackRef = p.ref
-		// A GET without a session token opens a long-poll session (a WebSocket handshake never
-		// answers with one); while the legacy keys are enabled its token is tracked.
-		tg.trackSession = len(guardKeys) == 0 && r.Method == http.MethodGet && !isWebSocketHandshake(r) &&
-			len(queryValues(r.URL.RawQuery, "token")) == 0
 	}
 	if len(guardKeys) > 0 {
-		// Legacy keys are disabled: watch what the client sends into the socket (or the long-poll
-		// body) for a legacy key. A compressing extension would hide the text, so it is not offered
-		// to Realtime.
+		// Legacy keys are disabled: watch what the client sends into the socket for a legacy key. A
+		// compressing extension would hide the text, so it is not offered to Realtime.
 		tg.guardKeys = guardKeys
 		tg.del = append(tg.del[:len(tg.del):len(tg.del)], "Sec-Websocket-Extensions")
 		tg.onGuard = func(reason string) {
@@ -223,6 +216,15 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		}
 	}
 	s.forward(w, r, tg)
+}
+
+// isRealtimeWebSocket reports whether r is the one request a Realtime route accepts while the
+// project's legacy keys are disabled: a real WebSocket handshake to /realtime/v1/websocket, with no
+// body. Long poll (any method, any path under /realtime/v1/longpoll, with or without a session
+// token) and every other subpath are refused, because a long-poll session is a process on the
+// Realtime side that keeps the credentials it connected with and that the proxy cannot inspect.
+func isRealtimeWebSocket(r *http.Request, cleaned string, trailingSlash bool) bool {
+	return cleaned == "/realtime/v1/websocket" && !trailingSlash && isWebSocketHandshake(r) && r.ContentLength == 0
 }
 
 // servable reports whether a project in status st may receive traffic.
@@ -257,37 +259,18 @@ type target struct {
 	// dropTenant removes a client-supplied TenantHeader (only functions sets it).
 	dropTenant bool
 	// guardKeys, when set, are legacy keys that must not travel from the client to the upstream
-	// inside a WebSocket text message or a request body (see wsguard.go); onGuard is told of a hit.
+	// inside a WebSocket text message (see wsguard.go); onGuard is told of a hit.
 	guardKeys [][]byte
 	onGuard   func(reason string)
 	// trackRef, set for a Realtime socket route, is the project whose sockets that were not
 	// inspected (legacy keys enabled) are closed when its legacy keys are switched off.
 	trackRef string
-	// trackSession marks a request that may open a long-poll session whose token is to be tracked.
-	trackSession bool
 }
 
 // forward proxies r to tg, streaming in both directions and passing WebSocket
 // upgrades through.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 	guarded := len(tg.guardKeys) > 0
-	if guarded {
-		// Every guarded request with a body is checked, whatever its headers claim: a request
-		// that is not a WebSocket handshake never becomes a socket, so its body is the only
-		// place a key can travel.
-		if ok, hit := checkBody(w, r, tg.guardKeys); !ok {
-			if hit && tg.onGuard != nil {
-				tg.onGuard("request body")
-			}
-			return
-		}
-		if !isWebSocketHandshake(r) {
-			// ReverseProxy would still pass an Upgrade request (any method, any protocol)
-			// through as a raw tunnel, where nothing inspects the bytes: forward it as the
-			// plain request it is, and let a 101 from upstream fail as an unrequested upgrade.
-			r.Header.Del("Upgrade")
-		}
-	}
 	if isWebSocketHandshake(r) && (guarded || tg.trackRef != "") {
 		w = &guardedWriter{ResponseWriter: w, wrap: func(c net.Conn, brw *bufio.ReadWriter) net.Conn {
 			gc := &wsGuardConn{Conn: c, r: brw.Reader, onBlock: tg.onGuard}
@@ -340,14 +323,8 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 			for name, v := range tg.set {
 				h.Set(name, v)
 			}
-			if tg.trackSession {
-				h.Del("Accept-Encoding") // the answer is read to find the session token
-			}
 		},
 		ModifyResponse: func(res *http.Response) error {
-			if tg.trackSession {
-				s.captureSession(tg.trackRef, res)
-			}
 			if tg.studio {
 				rewriteStudioResponse(res.Header)
 			} else {
