@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -238,16 +237,14 @@ func (s tenantStore) forget(ctx context.Context, ref, service string) {
 	_ = s.put(ctx, ref, service, "")
 }
 
-// ValidRef is whether ref can be a tenant id: 20 lowercase letters. The system project
-// has no tenants.
+// validTenantRef checks that ref can be a tenant id: 20 lowercase letters. The system
+// project has no tenants.
 func validTenantRef(ref string) error {
 	if ref == config.SystemRef || !secrets.ValidRef(ref) {
 		return fmt.Errorf("fleet: %q is not a project ref", ref)
 	}
 	return nil
 }
-
-var errNotFound = errors.New("not found")
 
 // fingerprintOf hashes the JSON form of a tenant request body (map keys are sorted, so the
 // encoding is stable).
