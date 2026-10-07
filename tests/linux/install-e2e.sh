@@ -330,7 +330,8 @@ assert {t["service"] for t in p[0]["tenants"]} >= {"realtime", "storage"}, p[0][
 assert all(t["present"] for t in p[0]["tenants"]), p[0]["tenants"]
 assert d["summary"].startswith("healthy:"), d["summary"]
 PY
-sup status | head -1 | grep -q '^healthy: ' || fail "the first line of supavise status is not the verdict"
+HUMAN=$(sup status) || fail "supavise status exited non-zero on a healthy node"
+[[ ${HUMAN%%$'\n'*} == healthy:* ]] || fail "the first line of supavise status is not the verdict: ${HUMAN%%$'\n'*}"
 
 log "GET /healthz: public, a verdict and nothing else"
 HZ=$(api GET /healthz)
@@ -354,7 +355,8 @@ assert p["state"] == "fail", p
 assert [s for s in p["services"] if s["name"] == "postgrest"][0]["ok"] is False, p["services"]
 assert ref in d["summary"] and d["summary"].startswith("degraded:"), d["summary"]
 PY
-sup status | head -1 | grep -q "^degraded: .*$REF" || fail "the verdict line does not name $REF: $(sup status | head -1)"
+HUMAN=$(sup status) || true # exit status 1 is the point
+[[ ${HUMAN%%$'\n'*} == degraded:*"$REF"* ]] || fail "the verdict line does not name $REF: ${HUMAN%%$'\n'*}"
 # /healthz reuses a report for 20 seconds: wait for the new verdict, and see that it is a 200.
 HZ=""
 for ((i = 0; i < 40; i++)); do
