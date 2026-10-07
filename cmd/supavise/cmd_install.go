@@ -62,6 +62,7 @@ the DNS records the summary lists (a wildcard A record for *.api.<domain> is req
 	f.StringVar(&o.S3AccessKeyID, "s3-access-key-id", "", "static S3 access key id (default: the instance role or the AWS credential chain)")
 	f.StringVar(&o.S3SecretAccessKey, "s3-secret-access-key", "", "static S3 secret access key; prefer --s3-credentials-file")
 	f.StringVar(&o.S3CredFile, "s3-credentials-file", "", "file with access_key_id=... and secret_access_key=... lines")
+	f.StringVar(&o.KeyPassphraseFile, "key-passphrase-file", "", "file with a passphrase (mode 0600, at least 12 characters): the installer then keeps an encrypted copy of the master key and config.toml in the backup backend")
 	f.StringVar(&o.StudioURL, "studio-url", "", "download URL of the Studio build (tar.zst); install.sh sets it from the release")
 	f.StringVar(&o.StudioSHA256, "studio-sha256", "", "SHA-256 of the Studio build")
 	f.BoolVar(&o.NoStudio, "no-studio", false, "run without the dashboard")
@@ -123,11 +124,18 @@ func (in *installer) run(name string, args ...string) error {
 // asSupavise runs the installed binary as the supavise user (the owner of the state directory
 // and the only user the polkit rule lets drive the units).
 func (in *installer) asSupavise(stdout io.Writer, args ...string) error {
+	return in.asSupaviseIn(nil, stdout, args...)
+}
+
+// asSupaviseIn is asSupavise with standard input: a secret goes to the command that way, not
+// through the process list.
+func (in *installer) asSupaviseIn(stdin io.Reader, stdout io.Writer, args ...string) error {
 	if stdout == nil {
 		stdout = in.out
 	}
 	full := append([]string{"-u", installUser, "--", "env", "HOME=" + in.cfg.StateDir, in.cfg.BinPath, "--config", config.DefaultPath}, args...)
 	c := exec.CommandContext(in.ctx, "runuser", full...)
+	c.Stdin = stdin
 	c.Stdout, c.Stderr = stdout, in.err
 	if err := c.Run(); err != nil {
 		return fmt.Errorf("supavise %s: %w", strings.Join(args, " "), err)
@@ -148,6 +156,14 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	in.step("checking the host")
 	if err := preflight(o.SkipOSCheck); err != nil {
 		return err
+	}
+	// A bad passphrase file fails here, before the install changes anything.
+	var keyPass []byte
+	if o.KeyPassphraseFile != "" {
+		var err error
+		if keyPass, err = readPassphrase(o.KeyPassphraseFile, cmd.InOrStdin()); err != nil {
+			return fmt.Errorf("--key-passphrase-file: %w", err)
+		}
 	}
 
 	cfg, existed, err := readConfigFile(config.DefaultPath)
@@ -270,6 +286,19 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	if err := waitDaemon(in.ctx, cfg, 5*time.Minute); err != nil {
 		_ = in.run("journalctl", "-u", "supavise.service", "-n", "40", "--no-pager")
 		return err
+	}
+
+	if keyPass != nil {
+		in.step("keeping an encrypted copy of the master key in the backup backend")
+		if err := in.asSupaviseIn(bytes.NewReader(keyPass), nil, "system", "escrow-key", "--passphrase-file", "-"); err != nil {
+			return err
+		}
+	}
+	// The summary reminds the operator while the backend has no copy of the key. A backend
+	// that cannot be asked counts as having none: the reminder costs a line, silence could
+	// cost the key.
+	if st, err := escrowState(in.ctx, cfg); err == nil && st.covered() {
+		o.KeyEscrowed = true
 	}
 
 	token, claimed, err := in.claimToken(o)
@@ -669,5 +698,9 @@ func printSummary(w io.Writer, cfg *config.Config, ip, token string, claimed boo
 			fmt.Fprintf(w, "Create the first administrator at %s/claim with this token (works once, expires in %s):\n\n  %s\n\n", cfg.APIURL(), o.ClaimTTL, token)
 		}
 		fmt.Fprintln(w, "Need another token later? sudo -u supavise supavise claim token")
+	}
+	if !o.KeyEscrowed {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "IMPORTANT: %s\n", keyReminder)
 	}
 }

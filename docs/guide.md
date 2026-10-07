@@ -124,8 +124,9 @@ Not entirely. You get organizations, projects, the dashboard, the CLI, branching
 No. Apps use the same client libraries and API paths as on supabase.com; only the host name changes, to `<ref>.api.<domain>`.
 
 **Is my data backed up?**
-Your databases are. Every database archives its WAL continuously and takes a nightly base backup, and you can restore to any point in the retention window (7 days by default).
+Yes: databases, Storage files and Edge Functions, unless Storage uses its S3 backend (`[fleet] storage_backend = "s3"`), whose files stay in your own bucket: turn on versioning there. Every database archives its WAL continuously and takes a nightly base backup, and you can restore to any point in the retention window (7 days by default). The nightly run also copies each project's Storage files and Edge Function deployments to the same place, keeping only what changed.
 
 - Backups go to local disk unless you give an S3 bucket. A bucket keeps them off the server.
-- Rebuilding a lost node also needs its master key, `/etc/supavise/master.key`, which is not in the bucket. On your own server, copy it and `/etc/supavise/config.toml` somewhere safe.
-- Database backups cover Postgres only. On AWS, daily snapshots of the data volume also cover Storage files, function bundles and the master key.
+- A restore returns files to the last nightly copy before the time you choose, not to that second. Hosted Supabase's database backups do not include Storage files, so this goes further than hosted.
+- The master key, `/etc/supavise/master.key`, unseals the passwords inside backups and is not in them. Run `sudo -u supavise supavise system export-key` and keep the output offline, or keep an encrypted copy in the bucket with `system escrow-key`. Without the key, a lost server cannot be rebuilt from its backups.
+- On AWS, daily snapshots of the data volume add a whole-node fallback.

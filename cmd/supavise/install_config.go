@@ -48,6 +48,12 @@ type installOptions struct {
 	NoStudio     bool
 	NoFunctions  bool
 
+	// KeyPassphraseFile holds the passphrase that protects an encrypted copy of the master key
+	// in the backup backend. KeyEscrowed is set by the installer when the backend holds such a
+	// copy at the end of the run, so the summary knows whether to remind the operator.
+	KeyPassphraseFile string
+	KeyEscrowed       bool
+
 	// Fresh is set by the caller when no config.toml existed: defaults that differ between a new
 	// install and config.Default() apply only then, so a re-run keeps what the operator chose.
 	Fresh bool

@@ -198,6 +198,21 @@ steal_cache "A's cache through V's own directory" "$CACHE_ROOT/$REF_V/../${A_MAR
 steal_cache "the shared cache of earlier versions" "$CACHE_ROOT/${A_MARKER#"$CACHE_ROOT/$REF_A/"}" '^400$'
 delete_fn "$REF_A" cachemark; delete_fn "$REF_V" cachemark
 
+log "a deployed function is in the backup and comes back after it is deleted"
+printf 'Deno.serve(() => new Response("backed up"))\n' >"$LOG_DIR/backup-fn.ts"
+out=$(deploy_src "$REF_V" backedup "$LOG_DIR/backup-fn.ts") || fail "curl: backedup upload to $REF_V"
+[[ $(tail -n1 <<<"$out") =~ ^20[01]$ ]] || fail "the upload of backedup to $REF_V answered: $out"
+fn_json() { curl -s -H "Authorization: Bearer $PAT" "$API/v1/projects/$REF_V/functions/backedup"; }
+FN_ID=$(fn_json | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') || fail "no id for $REF_V/backedup"
+supavise backups create "$REF_V" --files-only || fail "backups create --files-only $REF_V"
+[[ $(supavise backups list "$REF_V" --files | awk '$2 == "functions" && $5 >= 1' | wc -l) -ge 1 ]] || { supavise backups list "$REF_V" --files >&2 || true; fail "$REF_V: no functions snapshot with the deployment"; }
+delete_fn "$REF_V" backedup
+[[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$API/v1/projects/$REF_V/functions/backedup") == 404 ]] || fail "backedup is still deployed after the delete"
+supavise backups restore-files "$REF_V" --to latest --force || fail "backups restore-files $REF_V"
+[[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$API/v1/projects/$REF_V/functions/backedup") == 200 ]] || fail "backedup did not come back after restore-files"
+[[ $(fn_json | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') == "$FN_ID" ]] || fail "the restored function has another id"
+delete_fn "$REF_V" backedup
+
 log "the bundler unit ran for project V's uploads and is idle now"
 B=supavise-edge-bundle@$REF_V.service
 [[ $(unit_state "$B") == inactive ]] || fail "$B is $(unit_state "$B")"

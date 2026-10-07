@@ -39,6 +39,10 @@ type Store interface {
 	GetFunction(ctx context.Context, ref, slug string) (*Function, error)
 	FunctionFiles(ctx context.Context, ref, slug string) ([]FunctionFile, error)
 	DeleteFunction(ctx context.Context, ref, slug string) error
+	// RestoreFunction stores f as given, with its ID, version and timestamps, replacing the
+	// deployment of that slug and its files (nil files leave none). Backups restore through
+	// it; deploys use UpsertFunction.
+	RestoreFunction(ctx context.Context, f Function, files []FunctionFile) error
 
 	PutFunctionSecrets(ctx context.Context, ref string, sealed map[string][]byte) error
 	ListFunctionSecrets(ctx context.Context, ref string) ([]FunctionSecret, error)

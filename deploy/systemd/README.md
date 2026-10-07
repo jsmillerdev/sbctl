@@ -162,7 +162,7 @@ the unit gets back only:
 | `supavise-postgres@<ref>` | `artifacts/`, `projects/<ref>/postgres.run`, `projects/<ref>/wal/` (the relay socket; connecting needs no write access) | `projects/<ref>/postgres/`, `artifacts/postgres/` (the launcher chmods a script there on first boot) |
 | `supavise-gotrue@<ref>`, `supavise-postgrest@<ref>` | `artifacts/`, `projects/<ref>/<svc>.run` | `projects/<ref>/<svc>/` |
 | fleet singletons | `artifacts/`, `projects/system/<svc>.run` | `system/<svc>/` (optional: create it first); Studio also `artifacts/studio/` |
-| `supavise-basebackup@<ref>` | `projects/system/postgres/sock` (the registry), `projects/<ref>/postgres/` (the data directory it archives) | `projects/<ref>/wal/` (a CLI relay's socket while the daemon is down), `backups/` (the file backend; absent on S3) |
+| `supavise-basebackup@<ref>` | `projects/system/postgres/sock` (the registry), `projects/<ref>/postgres/` (the data directory it archives), `system/storage/objects/stub/<ref>/` (the project's Storage objects, which it copies to the backend; absent for a project without objects) | `projects/<ref>/wal/` (a CLI relay's socket while the daemon is down), `backups/` (the file backend; absent on S3) |
 | `supavise-basebackup-prune` | `projects/system/postgres/sock` | `backups/` |
 
 No template binds a project or system directory as a whole, none needs to read an environment file

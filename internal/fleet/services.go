@@ -19,10 +19,9 @@ const (
 	// realtimeCDCRegion is the region of every Realtime tenant's postgres_cdc_rls extension,
 	// the value upstream's self-host seed uses; the node's own REGION is "local".
 	realtimeCDCRegion = "us-east-1"
-	// storageFileBucket is the first path component under the file backend's directory;
-	// "stub" is what upstream's compose and the dockerless CLI use, so layouts stay
-	// interchangeable.
-	storageFileBucket = "stub"
+	// storageFileBucket is the first path component under the file backend's directory
+	// (see config.StorageFileBucket).
+	storageFileBucket = config.StorageFileBucket
 )
 
 // ecto, pg and the other URL builders keep passwords out of fmt verbs that would mangle

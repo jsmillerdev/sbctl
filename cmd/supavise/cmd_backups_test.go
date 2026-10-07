@@ -28,6 +28,8 @@ func TestBackupsCommandsAreRegistered(t *testing.T) {
 	for _, path := range [][]string{
 		{"wal", "push"}, {"wal", "fetch"},
 		{"backups", "create"}, {"backups", "list"}, {"backups", "prune"}, {"backups", "restore"}, {"backups", "finish-restore"},
+		{"backups", "restore-files"}, {"backups", "status"},
+		{"system", "export-key"}, {"system", "escrow-key"}, {"system", "restore-key"},
 	} {
 		c, _, err := rootCmd.Find(path)
 		if err != nil || c == nil || c.Name() != path[len(path)-1] {
@@ -58,6 +60,26 @@ func TestRestoreValidatesBeforeTouchingAnything(t *testing.T) {
 	}
 	if _, err := runRoot(t, "backups", "restore", ref); err == nil {
 		t.Error("--to is required")
+	}
+}
+
+func TestRestoreFilesValidatesBeforeTouchingAnything(t *testing.T) {
+	const ref = "abcdefghijklmnopqrst"
+	if _, err := runRoot(t, "backups", "restore-files", ref); err == nil || !strings.Contains(err.Error(), "--to") {
+		t.Errorf("no target = %v", err)
+	}
+	if _, err := runRoot(t, "backups", "restore-files", ref, "--to", "yesterday"); err == nil || !strings.Contains(err.Error(), "RFC3339") {
+		t.Errorf("bad --to = %v", err)
+	}
+	// In place replaces the project's files, which needs --force.
+	if _, err := runRoot(t, "backups", "restore-files", ref, "--to", "latest"); !errors.Is(err, backup.ErrForceRequired) {
+		t.Errorf("in place without --force = %v, want ErrForceRequired", err)
+	}
+}
+
+func TestCreateRejectsConflictingFileFlags(t *testing.T) {
+	if _, err := runRoot(t, "backups", "create", "abcdefghijklmnopqrst", "--skip-files", "--files-only"); err == nil || !strings.Contains(err.Error(), "exclude each other") {
+		t.Errorf("err = %v", err)
 	}
 }
 

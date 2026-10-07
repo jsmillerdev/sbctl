@@ -170,6 +170,20 @@ st_proxy -X POST -H 'Content-Type: text/plain' --data-binary 'uploaded through t
 got=$(st_proxy "http://127.0.0.1/storage/v1/object/proxied/hello.txt") || fail "download through the proxy"
 [[ $got == 'uploaded through the proxy' ]] || fail "downloaded '$got'"
 
+# The nightly backup copies the object files; the row that makes an object visible is in the
+# project's database (which the base backup and WAL cover), so losing the files and restoring
+# them in place brings the download back.
+log "Storage objects: back up the upload, lose the files, restore them in place"
+OBJ_DIR="$SUPAVISE_STATE/system/storage/objects/stub/$REF"
+[[ -n $(find "$OBJ_DIR/proxied/hello.txt" -type f 2>/dev/null) ]] || fail "the upload is not a file under $OBJ_DIR/proxied/hello.txt: $(find "$SUPAVISE_STATE/system/storage" -maxdepth 6 2>&1 | head -20 | tr '\n' ' ')"
+supavise backups create "$REF" --files-only || fail "backups create --files-only $REF"
+[[ $(supavise backups list "$REF" --files | awk '$2 == "storage" && $5 >= 1' | wc -l) -ge 1 ]] || { supavise backups list "$REF" --files >&2 || true; fail "$REF: no Storage snapshot with the object"; }
+sudo -u "$SUPAVISE_USER" rm -rf "$OBJ_DIR"
+if st_proxy "http://127.0.0.1/storage/v1/object/proxied/hello.txt" >/dev/null 2>&1; then fail "the object is still served after its files were removed"; fi
+supavise backups restore-files "$REF" --to latest --force || fail "backups restore-files $REF"
+got=$(st_proxy "http://127.0.0.1/storage/v1/object/proxied/hello.txt") || fail "download after restore-files"
+[[ $got == 'uploaded through the proxy' ]] || fail "downloaded '$got' after restore-files"
+
 log "pooler: postgres.$REF through Supavisor with sslmode=require on both ports"
 for port in $P_SESSION $P_TRANSACTION; do
   info=$(PGPASSWORD=$DBPW "$PSQL" "host=127.0.0.1 port=$port user=postgres.$REF dbname=postgres sslmode=require connect_timeout=10" \
