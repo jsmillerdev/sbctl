@@ -794,13 +794,16 @@ func (d *DashboardSSO) Admit(ctx context.Context, userID, email, providerID stri
 		return errSSOPending
 	}
 	d.mu.Lock()
-	if d.admitted == nil {
-		d.admitted = map[string]time.Time{}
+	if d.admitted == nil || len(d.admitted) >= maxAdmitted {
+		d.admitted = map[string]time.Time{} // entries are ten seconds old at most; a reset only costs a lookup
 	}
 	d.admitted[userID] = now
 	d.mu.Unlock()
 	return nil
 }
+
+// maxAdmitted bounds the memory of admitted users.
+const maxAdmitted = 4096
 
 // firstSight records a user seen for the first time and applies the default role of the email's
 // domain. One request at a time, so that the parallel calls Studio makes on its first page do
