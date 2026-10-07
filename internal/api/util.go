@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 )
 
@@ -184,19 +185,75 @@ func (s *Server) orgOf(ctx context.Context, p *registry.Project) (*registry.Orga
 	return s.defaultOrg(ctx)
 }
 
-// userProjects lists the projects shown to users: everything but "system".
+// userProjects lists the projects shown to the caller: everything but "system" that the
+// caller's roles let them see (an organization-wide role sees all projects of the organization,
+// a project-scoped role only its projects). Without a caller in ctx it lists them all.
 func (s *Server) userProjects(ctx context.Context) ([]registry.Project, error) {
 	all, err := s.reg.ListProjects(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := all[:0:0]
-	for _, p := range all {
-		if p.Ref != config.SystemRef {
-			out = append(out, p)
+	var access *members.Access
+	if p := principalFrom(ctx); p != nil {
+		if access, err = s.accessOf(ctx, p); err != nil {
+			return nil, err
 		}
 	}
+	orgs := map[int64]members.OrgRef{}
+	out := all[:0:0]
+	for _, p := range all {
+		if p.Ref == config.SystemRef {
+			continue
+		}
+		if access != nil {
+			org, err := s.orgOf(ctx, &p)
+			if err != nil {
+				return nil, err
+			}
+			ref, ok := orgs[org.ID]
+			if !ok {
+				ref = orgRef(org)
+				orgs[org.ID] = ref
+			}
+			if !access.Can(ref, p.Ref, members.ActRead, members.ResProjects, nil) {
+				continue
+			}
+		}
+		out = append(out, p)
+	}
 	return out, nil
+}
+
+// requireOrgMember refuses a caller who does not belong to the organization.
+func (s *Server) requireOrgMember(r *http.Request, org *registry.Organization) error {
+	a, err := s.callerAccess(r)
+	if err != nil {
+		return err
+	}
+	if !a.IsMember(org.ID) {
+		return errf(http.StatusForbidden, "You are not a member of this organization")
+	}
+	return nil
+}
+
+// defaultCreateOrg is the organization a project is created in when the request names none: the
+// first one the caller may create projects in.
+func (s *Server) defaultCreateOrg(r *http.Request) (*registry.Organization, error) {
+	if _, err := s.defaultOrg(r.Context()); err != nil {
+		return nil, err
+	}
+	orgs, err := s.memberOrgs(r)
+	if err != nil {
+		return nil, err
+	}
+	for i := range orgs {
+		if ok, err := s.can(r, &orgs[i], "", members.ActCreate, members.ResProjects); err != nil {
+			return nil, err
+		} else if ok {
+			return &orgs[i], nil
+		}
+	}
+	return nil, errf(http.StatusForbidden, "Your role does not allow creating projects in any organization")
 }
 
 // orgBySlug resolves an organization slug of a path.

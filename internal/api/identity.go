@@ -7,6 +7,7 @@ import (
 
 	plat "github.com/OWNER/sbctl/internal/api/gen/platform"
 	v1 "github.com/OWNER/sbctl/internal/api/gen/v1"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 )
 
@@ -26,7 +27,6 @@ func (s *Server) routesProfile(add func(string, handlerFunc)) {
 	add("GET /platform/profile", s.platformProfile)
 	add("POST /platform/profile", s.platformProfile)
 	add("PATCH /platform/profile", s.platformUpdateProfile)
-	add("GET /platform/profile/permissions", s.permissions)
 }
 
 // currentUser returns the stored user behind the request's credentials.
@@ -107,37 +107,31 @@ func (s *Server) platformUpdateProfile(w http.ResponseWriter, r *http.Request) e
 	return nil
 }
 
-// permissions grants the signed-in user everything in every organization: members
-// and roles are a later phase, so a dashboard user is an owner.
-func (s *Server) permissions(w http.ResponseWriter, r *http.Request) error {
-	orgs, err := s.allOrgs(r)
-	if err != nil {
-		return err
-	}
-	out := make([]plat.AccessControlPermission, 0, len(orgs))
-	for _, o := range orgs {
-		id := float32(o.ID)
-		out = append(out, plat.AccessControlPermission{
-			Actions: &[]string{"%"}, Resources: &[]string{"%"}, OrganizationId: &id, OrganizationSlug: o.Slug,
-			Restrictive: new(bool),
-		})
-	}
-	writeJSON(w, http.StatusOK, out)
-	return nil
-}
-
+// allOrgs returns the organizations the caller belongs to. A node that has none yet gets the
+// default organization, owned by the caller (the first dashboard user).
 func (s *Server) allOrgs(r *http.Request) ([]registry.Organization, error) {
-	if _, err := s.defaultOrg(r.Context()); err != nil {
+	existing, err := s.reg.ListOrganizations(r.Context())
+	if err != nil {
 		return nil, err
 	}
-	return s.reg.ListOrganizations(r.Context())
+	o, err := s.defaultOrg(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	if len(existing) == 0 {
+		if p := principalFrom(r.Context()); p != nil {
+			if err := s.members.EnsureOwner(r.Context(), orgRef(o), p.UserID); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return s.memberOrgs(r)
 }
 
 func (s *Server) routesOrganizations(add func(string, handlerFunc)) {
 	add("GET /v1/organizations", s.v1Orgs)
 	add("GET /v1/organizations/{slug}", s.v1Org)
 	add("GET /v1/organizations/{slug}/entitlements", s.entitlements("GET /v1/organizations/{slug}/entitlements"))
-	add("GET /v1/organizations/{slug}/members", s.v1Members)
 
 	add("GET /platform/organizations", s.platformOrgs)
 	add("POST /platform/organizations", s.platformCreateOrg)
@@ -145,7 +139,6 @@ func (s *Server) routesOrganizations(add func(string, handlerFunc)) {
 	add("PATCH /platform/organizations/{slug}", s.platformUpdateOrg)
 	add("GET /platform/organizations/{slug}/entitlements", s.entitlements("GET /platform/organizations/{slug}/entitlements"))
 	add("GET /platform/organizations/{slug}/billing/subscription", s.subscription)
-	add("GET /platform/organizations/{slug}/members", s.platformMembers)
 }
 
 func (s *Server) v1Orgs(w http.ResponseWriter, r *http.Request) error {
@@ -174,10 +167,10 @@ func (s *Server) v1Org(w http.ResponseWriter, r *http.Request) error {
 }
 
 // orgEntry is one organization of the platform list.
-func (s *Server) orgEntry(o *registry.Organization) map[string]any {
+func (s *Server) orgEntry(o *registry.Organization, isOwner bool) map[string]any {
 	row := elem("GET /platform/organizations", "")
 	return setAll(row, map[string]any{
-		"id": o.ID, "slug": o.Slug, "name": o.Name, "is_owner": true, "opt_in_tags": []string{},
+		"id": o.ID, "slug": o.Slug, "name": o.Name, "is_owner": isOwner, "opt_in_tags": []string{},
 		"plan": map[string]any{"id": "enterprise", "name": "Self-hosted"}, "usage_billing_enabled": false,
 		"billing_email": nil, "billing_partner": nil, "integration_source": nil, "stripe_customer_id": nil,
 		"subscription_id": nil, "restriction_data": nil, "restriction_status": nil,
@@ -191,9 +184,17 @@ func (s *Server) platformOrgs(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	a, err := s.callerAccess(r)
+	if err != nil {
+		return err
+	}
 	out := make([]map[string]any, 0, len(orgs))
 	for i := range orgs {
-		out = append(out, s.orgEntry(&orgs[i]))
+		e := s.orgEntry(&orgs[i], a.OrgRole(orgs[i].ID) == members.RoleOwner)
+		if on, err := s.members.MFAEnforced(r.Context(), orgs[i].ID); err == nil {
+			e["organization_requires_mfa"] = on
+		}
+		out = append(out, e)
 	}
 	writeJSON(w, http.StatusOK, out)
 	return nil
@@ -235,11 +236,25 @@ func (s *Server) platformCreateOrg(w http.ResponseWriter, r *http.Request) error
 	if strings.TrimSpace(in.Name) == "" {
 		return errf(http.StatusBadRequest, "name is required")
 	}
+	// Organizations are made by Owners (or by anyone on a node that has none yet), and the
+	// creator owns the new one, as on hosted.
+	a, err := s.callerAccess(r)
+	if err != nil {
+		return err
+	}
+	if existing, err := s.reg.ListOrganizations(r.Context()); err != nil {
+		return err
+	} else if len(existing) > 0 && !a.IsOwnerAnywhere() {
+		return errf(http.StatusForbidden, "Only an Owner can create an organization")
+	}
 	o, err := s.reg.CreateOrganization(r.Context(), slugify(in.Name), strings.TrimSpace(in.Name))
 	if err != nil {
 		return mapErr(err)
 	}
-	writeJSON(w, http.StatusCreated, s.orgEntry(o))
+	if err := s.members.EnsureOwner(r.Context(), orgRef(o), principalFrom(r.Context()).UserID); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusCreated, s.orgEntry(o, true))
 	return nil
 }
 
@@ -318,48 +333,3 @@ func (s *Server) subscription(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func (s *Server) memberRows(r *http.Request, key string) ([]map[string]any, error) {
-	users, err := s.store.ListUsers(r.Context())
-	if err != nil {
-		return nil, err
-	}
-	rows := make([]map[string]any, 0, len(users))
-	for _, u := range users {
-		row := elem(key, "")
-		rows = append(rows, setAll(row, map[string]any{
-			"gotrue_id": u.UserID, "primary_email": u.Email, "username": u.Username, "role_ids": []int{1},
-			"mfa_enabled": false, "is_sso_user": false, "metadata": map[string]any{},
-		}))
-	}
-	return rows, nil
-}
-
-func (s *Server) platformMembers(w http.ResponseWriter, r *http.Request) error {
-	if _, err := s.orgBySlug(r.Context(), r.PathValue("slug")); err != nil {
-		return err
-	}
-	rows, err := s.memberRows(r, "GET /platform/organizations/{slug}/members")
-	if err != nil {
-		return err
-	}
-	writeJSON(w, http.StatusOK, rows)
-	return nil
-}
-
-func (s *Server) v1Members(w http.ResponseWriter, r *http.Request) error {
-	if _, err := s.orgBySlug(r.Context(), r.PathValue("slug")); err != nil {
-		return err
-	}
-	rows, err := s.memberRows(r, "GET /v1/organizations/{slug}/members")
-	if err != nil {
-		return err
-	}
-	for _, row := range rows {
-		row["role_name"] = "Owner"
-		row["user_id"] = row["gotrue_id"]
-		row["user_name"] = row["username"]
-		row["email"] = row["primary_email"]
-	}
-	writeJSON(w, http.StatusOK, rows)
-	return nil
-}

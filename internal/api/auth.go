@@ -193,7 +193,8 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 	if !a.isAdmin(claims, email) {
 		return nil, errForbidden
 	}
-	p := &Principal{UserID: sub, Email: email, Via: "jwt"}
+	aal, _ := claims["aal"].(string)
+	p := &Principal{UserID: sub, Email: email, Via: "jwt", AAL: aal}
 	// Record the user on first sight, then at most once a minute: every dashboard
 	// request carries a JWT and none of them should write to the database.
 	now := a.now()

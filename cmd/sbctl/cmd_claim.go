@@ -178,7 +178,7 @@ Sessions already issued by GoTrue expire within an hour.`,
 				return err
 			}
 			defer closeFn()
-			n, err := acc.RemoveUser(cmd.Context(), args[0])
+			n, err := acc.RemoveUser(cmd.Context(), args[0], force)
 			if err != nil {
 				return err
 			}

@@ -192,6 +192,10 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 			"GOTRUE_LOG_LEVEL":          "warn",
 		},
 	}
+	if system {
+		// Outgoing mail of the dashboard (organization invitations): [mail] in config.toml.
+		mergeEnv(auth.Env, pl.cfg.Mail.GoTrueEnv())
+	}
 	if pl.opts.Settings != nil && !system {
 		over, err := pl.opts.Settings.AuthEnv(ctx, p.Ref, pl.authExternalURL(p.Ref))
 		if err != nil {

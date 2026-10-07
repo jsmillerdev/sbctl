@@ -426,7 +426,7 @@ func TestListAndRemoveUsers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	n, err := f.acc.RemoveUser(ctx, "A@example.test")
+	n, err := f.acc.RemoveUser(ctx, "A@example.test", true)
 	if err != nil || n != 2 {
 		t.Fatalf("RemoveUser: %d %v", n, err)
 	}
@@ -436,7 +436,7 @@ func TestListAndRemoveUsers(t *testing.T) {
 	if ts, _ := f.reg.ListAccessTokens(ctx, res.UserID); len(ts) != 0 {
 		t.Fatalf("tokens left: %d", len(ts))
 	}
-	if _, err := f.acc.RemoveUser(ctx, "nobody@example.test"); err == nil {
+	if _, err := f.acc.RemoveUser(ctx, "nobody@example.test", true); err == nil {
 		t.Fatal("removing an unknown user succeeded")
 	}
 }
@@ -605,7 +605,7 @@ func TestRemoveUserDeletesTokensBeforeTheAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.gt.failDelete = true
-	if _, err := f.acc.RemoveUser(ctx, "a@example.test"); err == nil {
+	if _, err := f.acc.RemoveUser(ctx, "a@example.test", true); err == nil {
 		t.Fatal("a failed GoTrue delete was reported as success")
 	}
 	if ts, _ := f.reg.ListAccessTokens(ctx, res.UserID); len(ts) != 0 {
@@ -614,7 +614,7 @@ func TestRemoveUserDeletesTokensBeforeTheAccount(t *testing.T) {
 	if us, _ := f.acc.ListUsers(ctx); len(us) != 1 {
 		t.Fatalf("the account must still be findable to retry: %+v", us)
 	}
-	if _, err := f.acc.RemoveUser(ctx, "a@example.test"); err != nil {
+	if _, err := f.acc.RemoveUser(ctx, "a@example.test", true); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	if us, _ := f.acc.ListUsers(ctx); len(us) != 0 {

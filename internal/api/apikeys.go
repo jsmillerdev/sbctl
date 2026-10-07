@@ -11,6 +11,7 @@ import (
 	"time"
 
 	v1 "github.com/OWNER/sbctl/internal/api/gen/v1"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -146,6 +147,14 @@ func (s *Server) projectKeys(r *http.Request) (*registry.Project, *secrets.Proje
 	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
 	if err != nil {
 		return nil, nil, err
+	}
+	// Secret keys are listed masked; revealing them needs the permission to read them.
+	if truthy(r.URL.Query().Get("reveal")) {
+		if ok, err := s.canReadSecrets(r, p); err != nil {
+			return nil, nil, err
+		} else if !ok {
+			return nil, nil, forbidden(members.ActRead, members.ResServiceKeys)
+		}
 	}
 	k, err := s.mgr.Keys(r.Context(), p.Ref)
 	if err != nil {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/projectconfig"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
@@ -41,6 +42,9 @@ type Deps struct {
 	// storage, database/postgres). Empty derives it from Registry like Store; internal/app
 	// passes the one the lifecycle engine renders from.
 	Settings *projectconfig.Manager
+	// Members holds organization members, roles and invitations. Empty derives it from
+	// Registry like Store: the registry's database for a Postgres registry, memory otherwise.
+	Members *members.Service
 	// HTTPClient is used for every upstream call (pg-meta, GoTrue, Storage).
 	HTTPClient *http.Client
 	// PGMetaURL overrides http://127.0.0.1:<ports.pgmeta>.
@@ -71,6 +75,8 @@ type Server struct {
 	cfgLocks sync.Map
 	// accounts redeems claim and invite tokens (claim.go).
 	accounts *Accounts
+	// members is the roles model: who belongs to which organization, with which permissions.
+	members *members.Service
 
 	pgmetaURL        string
 	upstreamOverride func(p *registry.Project, svc string) string
@@ -229,6 +235,13 @@ func NewServer(d Deps) (*Server, error) {
 	}
 	s.accounts = &Accounts{Reg: s.reg, Store: claims, Keys: s.mgr.Keys, Config: s.cfg, HTTP: s.hc, Now: s.now, Log: s.log,
 		GoTrueURL: s.upstream(&registry.Project{Ref: config.SystemRef}, upGoTrue)}
+	s.members = d.Members
+	if s.members == nil {
+		s.members = NewMembers(d.Registry, s.accounts, s.now, s.log)
+	}
+	s.accounts.Members = s.members
+	s.accounts.Users = s.store
+	s.accounts.LiveRefs = s.liveRefs
 	s.auth = newAuthenticator(s.reg, s.mgr.Keys, s.store, s.now, s.cfg.API.Admins())
 	h, err := s.build()
 	if err != nil {
@@ -263,6 +276,7 @@ func (s *Server) implemented() map[string]route {
 	}
 	s.routesProfile(add)
 	s.routesOrganizations(add)
+	s.routesMembers(add)
 	s.routesProjects(add)
 	s.routesKeys(add)
 	s.routesConfig(add)
@@ -293,23 +307,23 @@ func (s *Server) build() (http.Handler, error) {
 		key := op.Key()
 		inSpec[key] = true
 		if r, ok := impl[key]; ok {
-			mux.handle(key, s.wrap(r.auth, r.h))
+			mux.handle(key, s.wrap(key, r.auth, r.h))
 			continue
 		}
 		stub := stubHandler(op)
-		mux.handle(key, s.wrap(authFor(op.Path), func(w http.ResponseWriter, r *http.Request) error {
+		mux.handle(key, s.wrap(key, authFor(op.Path), func(w http.ResponseWriter, r *http.Request) error {
 			stub(w, r)
 			return nil
 		}))
 	}
 	for key, r := range impl {
 		if !inSpec[key] {
-			mux.handle(key, s.wrap(r.auth, r.h))
+			mux.handle(key, s.wrap(key, r.auth, r.h))
 		}
 	}
 	s.claimRoutes(mux)
-	mux.handle("GET /internal/templates/{ref}/{name}", s.wrap(authNone, s.serveTemplate))
-	mux.fallback = s.wrap(authAny, s.unknown)
+	mux.handle("GET /internal/templates/{ref}/{name}", s.wrap("", authNone, s.serveTemplate))
+	mux.fallback = s.wrap("", authAny, s.unknown)
 	return s.middleware(mux), nil
 }
 
@@ -330,8 +344,9 @@ func (s *Server) unknown(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// wrap authenticates and runs h, turning returned errors into the error envelope.
-func (s *Server) wrap(kind authKind, h handlerFunc) http.Handler {
+// wrap authenticates, authorizes (authz.go) and runs h, turning returned errors into the
+// error envelope. key is the route in "METHOD /template" form (empty for a path no spec lists).
+func (s *Server) wrap(key string, kind authKind, h handlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if kind != authNone {
 			p, err := s.auth.authenticate(r, kind)
@@ -339,7 +354,12 @@ func (s *Server) wrap(kind authKind, h handlerFunc) http.Handler {
 				s.fail(w, r, err)
 				return
 			}
-			r = r.WithContext(withPrincipal(r.Context(), p))
+			ctx, err := s.authorize(r, key, p)
+			if err != nil {
+				s.fail(w, r, err)
+				return
+			}
+			r = r.WithContext(withPrincipal(ctx, p))
 		}
 		if err := h(w, r); err != nil {
 			s.fail(w, r, err)

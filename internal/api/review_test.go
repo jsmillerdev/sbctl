@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"github.com/OWNER/sbctl/internal/members"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -231,6 +232,7 @@ func TestCreateTimeoutAnswersComingUp(t *testing.T) {
 func TestContentAuthorization(t *testing.T) {
 	f := newFixture(t)
 	other := f.signJWT(map[string]any{"sub": "22222222-2222-4333-8444-555555555555", "email": "other@example.test", "role": "authenticated"})
+	f.addMember("22222222-2222-4333-8444-555555555555", members.RoleDeveloper)
 	base := "/platform/projects/" + testRef + "/content"
 	id := "5b3b3d2a-8a51-4f6e-8c7e-0b2f4f6a1a11"
 	if rec := f.do("PUT", base, map[string]any{"id": id, "name": "mine", "type": "sql", "visibility": "user", "content": map[string]any{"sql": "select 1"}}); rec.Code != 200 {

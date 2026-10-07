@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -64,6 +65,13 @@ type Accounts struct {
 	HTTP      *http.Client
 	Now       func() time.Time
 	Log       *slog.Logger
+	// Members assigns roles: the claimed first user becomes Owner, an invited user joins
+	// the organizations that invited the address, and a removed user loses every membership.
+	Members *members.Service
+	// Users records a created dashboard account as soon as it exists.
+	Users Store
+	// LiveRefs filters invited project refs to the projects that still exist.
+	LiveRefs func(ctx context.Context, refs []string) []string
 }
 
 func (a *Accounts) now() time.Time {
@@ -211,6 +219,12 @@ func (a *Accounts) Redeem(ctx context.Context, in RedeemRequest) (*RedeemResult,
 		return nil, err
 	}
 	res := &RedeemResult{Email: email, UserID: userID, DashboardURL: a.Config.DashboardURL()}
+	if a.Users != nil {
+		// Recorded now, so that "first seen" at sign-in only ever means an account from before roles.
+		if _, err := a.Users.UpsertUser(ctx, User{UserID: userID, Email: email, Username: strings.SplitN(email, "@", 2)[0]}); err != nil {
+			a.log().Error("claim: dashboard user not recorded", "error", err)
+		}
+	}
 	if tok.Kind == KindClaim {
 		org, err := a.firstOrg(ctx, in.Organization)
 		if err != nil {
@@ -219,6 +233,21 @@ func (a *Accounts) Redeem(ctx context.Context, in RedeemRequest) (*RedeemResult,
 			a.log().Error("claim: organization not created", "error", err)
 		} else {
 			res.Organization = org.Slug
+			// The claimed first user owns the organization.
+			if a.Members != nil {
+				if err := a.Members.EnsureOwner(ctx, members.OrgRef{ID: org.ID, Slug: org.Slug}, userID); err != nil {
+					a.log().Error("claim: first user not made Owner", "error", err)
+				}
+			}
+		}
+	} else if a.Members != nil {
+		// The invite token proves the address, so the invitations waiting for it are accepted.
+		var live func([]string) []string
+		if a.LiveRefs != nil {
+			live = func(refs []string) []string { return a.LiveRefs(ctx, refs) }
+		}
+		if _, err := a.Members.AcceptPending(ctx, userID, email, live); err != nil {
+			a.log().Error("claim: pending invitations not accepted", "error", err)
 		}
 	}
 	a.log().Info("dashboard user created", "email", email, "kind", tok.Kind)
@@ -366,10 +395,12 @@ func (a *Accounts) ListUsers(ctx context.Context) ([]DashboardUser, error) {
 	return out, nil
 }
 
-// RemoveUser deletes the dashboard user with this email and the personal access tokens
-// the user created, which would otherwise keep working: a token is not re-checked
-// against its owner's account. It returns the number of tokens removed.
-func (a *Accounts) RemoveUser(ctx context.Context, email string) (tokens int, err error) {
+// RemoveUser deletes the dashboard user with this email, the memberships and roles of the
+// user, and the personal access tokens the user created, which would otherwise keep working: a
+// token is not re-checked against its owner's account. It refuses when the user is the only
+// Owner of an organization (members.ErrLastOwner) unless force is set. It returns the number
+// of tokens removed.
+func (a *Accounts) RemoveUser(ctx context.Context, email string, force bool) (tokens int, err error) {
 	email, err = normalizeEmail(email)
 	if err != nil {
 		return 0, err
@@ -380,9 +411,15 @@ func (a *Accounts) RemoveUser(ctx context.Context, email string) (tokens int, er
 	}
 	for _, u := range users {
 		if strings.EqualFold(u.Email, email) {
-			// Tokens first: if the GoTrue delete fails afterwards, the account still exists
-			// and `users remove` can be run again; the other order would leave live tokens
-			// of an account nobody can find.
+			// Memberships first, because that step can refuse (the last Owner). Tokens next: if
+			// the GoTrue delete fails afterwards, the account still exists with no access and
+			// `users remove` can be run again; the other order would leave live tokens of an
+			// account nobody can find.
+			if a.Members != nil {
+				if err := a.Members.RemoveUser(ctx, u.ID, force); err != nil {
+					return 0, err
+				}
+			}
 			ts, err := a.Reg.ListAccessTokens(ctx, u.ID)
 			if err != nil {
 				return 0, err
@@ -496,7 +533,7 @@ func claimClient(r *http.Request) string {
 // admin listener without credentials (the token is the credential).
 func (s *Server) claimRoutes(mux *muxSet) {
 	lim := &claimLimiter{}
-	mux.handle("GET /claim", s.wrap(authNone, func(w http.ResponseWriter, r *http.Request) error {
+	mux.handle("GET /claim", s.wrap("", authNone, func(w http.ResponseWriter, r *http.Request) error {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Security-Policy", claimCSP)
@@ -505,7 +542,7 @@ func (s *Server) claimRoutes(mux *muxSet) {
 		w.Header().Set("X-Frame-Options", "DENY")
 		return claimPage.Execute(w, nil)
 	}))
-	mux.handle("POST /claim", s.wrap(authNone, func(w http.ResponseWriter, r *http.Request) error {
+	mux.handle("POST /claim", s.wrap("", authNone, func(w http.ResponseWriter, r *http.Request) error {
 		now := s.now()
 		client := claimClient(r)
 		if lim.blocked(client, now) {
@@ -529,9 +566,16 @@ func (s *Server) claimRoutes(mux *muxSet) {
 	}))
 }
 
-// claimScript is the page's only script; its hash goes into the CSP.
+// claimScript is the page's only script; its hash goes into the CSP. It has no comments:
+// html/template strips them from the page, and the hash must match what is served. A link from
+// an invitation carries the token and the address in the fragment, which a browser never sends
+// to a server; the script reads them into the form and clears the address bar.
 const claimScript = `
 const f = document.getElementById('f'), out = document.getElementById('out'), btn = document.getElementById('go');
+const hp = new URLSearchParams(location.hash.slice(1));
+if (hp.get('token')) f.elements['token'].value = hp.get('token');
+if (hp.get('email')) f.elements['email'].value = hp.get('email');
+if (location.hash) history.replaceState(null, '', location.pathname);
 f.addEventListener('submit', async (e) => {
   e.preventDefault();
   out.className = ''; out.textContent = '';
