@@ -300,7 +300,12 @@ func openBackupService(ctx context.Context, withManager bool) (*backup.Service, 
 	// A base backup waits until its WAL is archived, and archiving goes through the
 	// daemon's relay: with the daemon down (or between restarts) this process serves
 	// the sockets nobody answers while it runs.
-	_, stopRelay := app.StartWALRelay(ctx, cfg, opts.Log, true)
+	relay, stopRelay := app.StartWALRelay(ctx, cfg, opts.Log, true)
+	if relay != nil {
+		// A restored clone starts in recovery and fetches WAL through its own socket at once:
+		// serve it before the cluster starts, not at the next sweep.
+		opts.ArchiveReady = func(ref string) { _ = relay.Ensure(ref) }
+	}
 	if withManager {
 		// A restore creates a project, so the Engine registers it with the shared services.
 		node, err := lifecycle.Open(ctx, cfg, app.LifecycleOptions(cfg, opts))
