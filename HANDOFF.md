@@ -105,12 +105,15 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 - `sb-edge-runtime` unit (fleet singleton, loopback 9000), `/functions/v1` route enabled in the proxy, the stored deployments from `/v1/projects/{ref}/functions*` (workstream B) materialized into `/var/lib/sbctl/projects/<ref>/functions/`, secrets endpoints wired.
 - Verify with `supabase functions deploy` and `supabase.functions.invoke` from supabase-js, JWT on and off, per-project secrets, two projects with same-named functions, and a function calling its project's database.
 
-### K. Dashboard writes: settings, keys, password, storage actions (v1)
+### K. Dashboard writes: settings, keys, password, storage actions, members and roles (v1)
 - Every settings save that Studio, the CLI and the Management API make becomes real: Auth (`PATCH /v1/projects/{ref}/config/auth` and the `/platform` twins: site URL, redirect allow list, external OAuth providers, SMTP, email templates, rate limits, MFA, captcha, auth hooks, JWT expiry), PostgREST (exposed schemas, extra search path, max rows, pool), Realtime, Storage (upload size limit, features) and Postgres settings (`/v1/projects/{ref}/config/database/postgres`). Settings persist in the registry per project (migration range 0800-0899), are validated against the specs, re-render the unit env, and restart only the affected unit; reads return what was saved.
 - API keys: create, update and revoke publishable and secret keys (`/v1/projects/{ref}/api-keys*`), legacy keys reported as upstream does; the proxy honors revocation immediately through the key cache.
 - Database password reset (`PATCH /v1/projects/{ref}/database/password` and the Studio route): rotates the `postgres` role password and the Supavisor tenant.
 - Storage dashboard actions currently stubbed: public URL, sign multiple, list v2 and any other Storage route Studio's storage explorer calls (research/08).
 - Verify each save end to end: change it in Studio or with the CLI, then observe the behavior change in the running service (e.g. a new redirect URL accepted by GoTrue, a new exposed schema served by PostgREST, a larger upload accepted by Storage).
+
+- Members and roles, matching hosted: organization roles Owner, Administrator, Developer and Read-only, plus project-scoped assignments, with exactly the role and permission shapes of the specs (`/platform/organizations/{slug}/members*`, `/roles`, `/members/invitations*`, `/platform/profile/permissions`). Invitations by email (sent through the system GoTrue's SMTP when configured, otherwise an invite link shown to the admin and printed by `sbctl users invite`). Permissions are enforced by the API server on every `/platform` and `/v1` route, not only hidden in Studio; PATs carry their user's permissions; the claimed first user is Owner, existing users migrate to Owner; an organization always keeps at least one Owner. SSO (workstream L) assigns a configurable default role per email domain.
+- Run as two builders, settings first, then roles; L starts after the roles part because it assigns roles.
 
 ### L. SSO (v1)
 - Dashboard SSO: SAML 2.0 identity providers (Okta, Entra ID, Google Workspace) on `sb-gotrue@system`, managed with `sbctl sso add|list|remove` and an admin API; Studio's "Continue with SSO" enabled only when a provider exists (patch 0002 flag, no new patch). Access is limited to the email domains mapped to a provider; first SSO sign-in creates the dashboard user as a team member (v1 has no roles beyond that). Optional Google/GitHub/Azure OAuth sign-in for the dashboard behind the same allowlist.
@@ -120,7 +123,7 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 ### Phase 2 workstreams (start once A to H are green)
 - Idle sleep in C and D.
 - imgproxy unit and Storage transform flag.
-- Members and RBAC, restore UI.
+- Restore UI.
 
 ## 4. Dependencies between workstreams
 
