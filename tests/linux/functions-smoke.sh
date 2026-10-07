@@ -150,7 +150,7 @@ B=sb-edge-bundle.service
 [[ $(systemctl show -p Result --value "$B") == success ]] || fail "$B: last result $(systemctl show -p Result --value "$B")"
 # Another uid than the sbctl user: the kernel then refuses /proc/<pid>/root and environ of every
 # process of the node (below), and /proc shows none of them.
-[[ $(systemctl show -p DynamicUser --value "$B") == yes && -z $(systemctl show -p User --value "$B") ]] || fail "$B does not run under a uid of its own"
+[[ $(systemctl show -p DynamicUser --value "$B") == yes && $(systemctl show -p User --value "$B") != "$SBCTL_USER" ]] || fail "$B does not run under a uid of its own (DynamicUser=$(systemctl show -p DynamicUser --value "$B"), User=$(systemctl show -p User --value "$B"))"
 [[ $(systemctl show -p ProtectProc --value "$B") == invisible && $(systemctl show -p ProcSubset --value "$B") == pid ]] || fail "$B: ProtectProc/ProcSubset not applied"
 [[ $(systemctl show -p MemoryMax --value "$B") == 1073741824 ]] || fail "$B: MemoryMax $(systemctl show -p MemoryMax --value "$B")"
 systemctl show -p IPAddressDeny --value "$B" | grep -q . || fail "$B has no IPAddressDeny"
