@@ -41,6 +41,7 @@ jget() { python3 -c 'import json,sys; d=json.load(sys.stdin); print('"$1"')'; }
 
 mkdir -p "$WORK"
 PAT=$(<"$PAT_FILE")
+TENANTS=$STATE_DIR/system/edge-runtime/tenants
 export SUPABASE_ACCESS_TOKEN=$PAT SUPABASE_NO_KEYRING=1 DO_NOT_TRACK=1 SUPABASE_DISABLE_UPDATE_CHECK=1
 
 # The CLI reads the API from a profile file; project_host takes no port.
@@ -108,11 +109,11 @@ live=$(sbctl functions list "$REF_A" --json | jget 'sum(1 for r in d if r["live"
 
 log "files on disk"
 for ref in "$REF_A" "$REF_B"; do
-  env_file="$STATE_DIR/projects/$ref/functions-env.json"
+  env_file="$TENANTS/$ref/functions-env.json"
   mode=$(asnode stat -c '%a' "$env_file" 2>/dev/null || asnode stat -f '%Lp' "$env_file")
   [[ $mode == 600 ]] || fail "$env_file has mode $mode, want 600"
 done
-if asnode grep -rlF "$(jget 'd["projects"]["b"]["jwtSecret"]' <"$WORK/config.json")" "$STATE_DIR/projects/$REF_A/functions" "$STATE_DIR/projects/$REF_A/functions-env.json" >/dev/null 2>&1; then
+if asnode grep -rlF "$(jget 'd["projects"]["b"]["jwtSecret"]' <"$WORK/config.json")" "$TENANTS/$REF_A" >/dev/null 2>&1; then
   fail "project A's files hold project B's JWT secret"
 fi
 
@@ -146,10 +147,13 @@ sb "$WORK/work-a" functions deploy hello --project-ref "$REF_A" >/dev/null || fa
 log "a deleted function is gone"
 sb "$WORK/work-a" functions delete hello --project-ref "$REF_A" --yes >/dev/null || fail "delete A/hello"
 (cd "$NODE_DIR" && node verify.mjs "$WORK/config.json" deleted) || fail "verify deleted"
-asnode test ! -e "$STATE_DIR/projects/$REF_A/functions/hello" || fail "the deleted function is still on disk"
+asnode test ! -e "$TENANTS/$REF_A/functions/hello" || fail "the deleted function is still on disk"
 
 log "deleting project B removes everything of it"
 sbctl projects delete "$REF_B" --skip-final-backup >/dev/null || fail "project delete"
+# `sbctl projects delete` removes the tree itself; on a node that runs the API server the
+# reconcile would too.
+asnode test ! -e "$TENANTS/$REF_B" || fail "the functions of $REF_B survived the project delete"
 asnode test ! -e "$STATE_DIR/projects/$REF_B" || fail "projects/$REF_B survived the delete"
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -H "Authorization: Bearer $(jget 'd["projects"]["b"]["anon"]' <"$WORK/config.json")" "${PROJECT_URL//\{ref\}/$REF_B}/functions/v1/hello" || true)
 [[ $code == 404 || $code == 503 ]] || fail "a deleted project answered $code on /functions/v1"

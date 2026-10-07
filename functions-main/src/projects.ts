@@ -1,4 +1,5 @@
-// Reads what internal/functions materialized under <projects dir>/<ref>/:
+// Reads what internal/functions materialized under <root>/<ref>/ (the root is
+// <state>/system/edge-runtime/tenants):
 //
 //   functions-env.json            the project's JWT secret, SUPABASE_* values and secrets
 //   functions/<slug>              a symlink to the current generation of the function
@@ -112,12 +113,12 @@ export class ProjectStore {
   #fns = new Map<string, FunctionInfo>()
   #roots = new Map<string, string>()
 
-  constructor(readonly projectsDir: string) {}
+  constructor(readonly root: string) {}
 
   /** The environment of ref, or null when the project has none (no functions yet). */
   async env(ref: string): Promise<ProjectEnv | null> {
     if (!validRef(ref)) return null
-    const path = join(this.projectsDir, ref, ENV_FILE)
+    const path = join(this.root, ref, ENV_FILE)
     let stat: Deno.FileInfo
     try {
       stat = await Deno.stat(path)
@@ -144,7 +145,7 @@ export class ProjectStore {
    */
   async fn(ref: string, slug: string): Promise<FunctionInfo | null> {
     if (!validRef(ref) || !validSlug(slug)) return null
-    const functionsDir = join(this.projectsDir, ref, 'functions')
+    const functionsDir = join(this.root, ref, 'functions')
     let dir: string
     try {
       dir = await retrying(() => Deno.realPath(join(functionsDir, slug)))
@@ -216,10 +217,10 @@ export class ProjectStore {
     this.#envs.delete(ref)
     this.#roots.delete(ref)
     for (const k of [...this.#fns.keys()]) {
-      if (k.startsWith(join(this.projectsDir, ref) + '/')) this.#fns.delete(k)
+      if (k.startsWith(join(this.root, ref) + '/')) this.#fns.delete(k)
     }
     for (const k of [...this.#eszips.keys()]) {
-      if (k.startsWith(join(this.projectsDir, ref) + '/')) this.#eszips.delete(k)
+      if (k.startsWith(join(this.root, ref) + '/')) this.#eszips.delete(k)
     }
   }
 }

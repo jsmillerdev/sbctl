@@ -139,21 +139,3 @@ workstream J runs user code in Edge Functions, with a bucket policy or a separat
 Storage and with static credentials for the WAL archiver (`--s3-credentials-file`). Workstream
 J: keep `IPAddressDeny=169.254.169.254` on `sb-edge-runtime.service` and on any unit that runs
 tenant code.
-
-## sb-edge-runtime and the projects directory
-
-`sb-edge-runtime` is the one unit that sees more than its own directory: the tenant-aware
-main service reads `projects/<ref>/functions-env.json` and `projects/<ref>/functions/` of
-every project, so the template also binds `/var/lib/sbctl/projects` read-only (the
-allowlist otherwise lets a unit see only the artifacts, its launcher and its own state).
-That makes other projects' data directories and unit environment files visible to the
-runtime process, which runs tenants' code. Three facts bound the exposure. The code of a
-tenant runs in V8 isolates whose file system is the runtime's virtual one, so
-`Deno.readTextFile` of any real path answers "not found" (measured with `edge-runtime`
-v1.77.4, checked on every CI run by `tests/functions/verify.mjs`; `functions-main/README.md`).
-The files the main service must read already hold every project's JWT secret, service
-role key and database password (`SUPABASE_DB_URL`), so a runtime compromise reaches every
-project's database whichever directories are mounted. And, as the section above says, the
-same uid makes the mount no isolation between tenants anyway. Putting the functions where
-the unit can bind exactly them (a tree under `system/edge-runtime`, cleaned by a fleet
-tenant hook on project delete) would shrink the view to those files and is a follow-up.

@@ -9,7 +9,7 @@ client -> sbctl proxy -> 127.0.0.1:<edge_runtime>  (X-Sbctl-Project-Ref: <ref>, 
                           main service (this directory)
                             1. project  = X-Sbctl-Project-Ref (20 letters, else 400)
                             2. function = first path segment (else 404 NOT_FOUND)
-                            3. project env + function generation read from <projects>/<ref>/
+                            3. project env + function generation read from <root>/<ref>/
                             4. verify_jwt: HS256 token against this project's secret (else 401)
                             5. EdgeRuntime.userWorkers.create({... this project's env ...}).fetch(request)
 ```
@@ -18,11 +18,11 @@ The proxy strips whatever `X-Sbctl-Project-Ref` and `sb-api-key` a client sent a
 
 ## The files it reads
 
-Written by `internal/functions`, read here (`src/projects.ts`); change both together.
+Written by `internal/functions`, read here (`src/projects.ts`); change both together. The root is `<state_dir>/system/edge-runtime/tenants`, inside the runtime's own state directory: that is the one directory its systemd unit sees besides the artifacts, so the process that runs tenants' code does not see the projects' data directories, sockets or unit files.
 
 ```
-<SBCTL_PROJECTS_DIR>/<ref>/functions-env.json         {"version":1,"jwt_secret","supabase":{SUPABASE_*},"secrets":{...}}
-<SBCTL_PROJECTS_DIR>/<ref>/functions/<slug>            symlink to .gen/<slug>.<version>.<random>/
+<SBCTL_FUNCTIONS_ROOT>/<ref>/functions-env.json       {"version":1,"jwt_secret","supabase":{SUPABASE_*},"secrets":{...}}
+<SBCTL_FUNCTIONS_ROOT>/<ref>/functions/<slug>          symlink to .gen/<slug>.<version>.<random>/
     .sbctl-function.json                               {slug, version, verify_jwt, kind, entrypoint, import_map, eszip, sha256}
     supabase/functions/<slug>/index.ts ...             kind "source": the uploaded files
     bundle.eszip                                       kind "eszip": the bundle `supabase functions deploy` built
@@ -73,7 +73,7 @@ The unit passes them in the environment (`internal/fleet/edgeruntime.go`); defau
 
 | Variable | `[functions]` key | Default |
 |---|---|---|
-| `SBCTL_PROJECTS_DIR` | none (the state directory's `projects`) | `/var/lib/sbctl/projects` |
+| `SBCTL_FUNCTIONS_ROOT` | none (`<state_dir>/system/edge-runtime/tenants`) | `/var/lib/sbctl/system/edge-runtime/tenants` |
 | `SBCTL_FUNCTIONS_MEMORY_MB` | `memory_mb` | 256 |
 | `SBCTL_FUNCTIONS_WALL_CLOCK_SEC` | `wall_clock_seconds` | 400 |
 | `SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC` | `idle_timeout_seconds` (also passed as `--user-worker-request-idle-timeout`) | 150 |

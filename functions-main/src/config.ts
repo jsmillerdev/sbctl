@@ -4,7 +4,8 @@
 import type { Limits } from './types.ts'
 
 export interface MainConfig {
-  projectsDir: string
+  /** Directory with one subdirectory per project ref (internal/functions writes it). */
+  root: string
   limits: Limits
 }
 
@@ -18,7 +19,10 @@ function intEnv(get: (name: string) => string | undefined, name: string, fallbac
 
 export function loadConfig(get: (name: string) => string | undefined): MainConfig {
   return {
-    projectsDir: (get('SBCTL_PROJECTS_DIR') ?? '/var/lib/sbctl/projects').replace(/\/+$/, ''),
+    root: (get('SBCTL_FUNCTIONS_ROOT') ?? '/var/lib/sbctl/system/edge-runtime/tenants').replace(
+      /\/+$/,
+      '',
+    ),
     limits: {
       memoryLimitMb: intEnv(get, 'SBCTL_FUNCTIONS_MEMORY_MB', 256),
       workerTimeoutMs: intEnv(get, 'SBCTL_FUNCTIONS_WALL_CLOCK_SEC', 400) * 1000,

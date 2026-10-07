@@ -8,11 +8,11 @@ import { edgeRuntime } from './src/runtime.ts'
 
 const config = loadConfig((name) => Deno.env.get(name))
 const handler = makeHandler({
-  store: new ProjectStore(config.projectsDir),
+  store: new ProjectStore(config.root),
   runtime: edgeRuntime(),
   limits: config.limits,
   port: Deno.env.get('EDGE_RUNTIME_PORT') ?? '',
 })
 
-console.log(`sbctl functions main service started (projects in ${config.projectsDir})`)
+console.log(`sbctl functions main service started (functions in ${config.root})`)
 Deno.serve(handler)

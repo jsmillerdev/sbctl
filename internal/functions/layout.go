@@ -2,13 +2,14 @@ package functions
 
 import (
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/OWNER/sbctl/internal/config"
 )
 
-// File and directory names under projects/<ref>/. The Deno main service reads exactly
+// File and directory names under <state>/system/edge-runtime/tenants/<ref>/. The Deno main service reads exactly
 // these (functions-main/src/projects.ts); change both together.
 const (
 	// EnvFileName holds the project's JWT secret, SUPABASE_* values and secrets (0600).
@@ -21,17 +22,22 @@ const (
 	MetaFileName = ".sbctl-function.json"
 )
 
-// FunctionsDir is projects/<ref>/functions.
+// ProjectDir is <tenants>/<ref>: everything this package keeps for one project.
+func ProjectDir(cfg *config.Config, ref string) string {
+	return filepath.Join(cfg.Paths().FunctionsRoot(), ref)
+}
+
+// FunctionsDir is <tenants>/<ref>/functions.
 func FunctionsDir(cfg *config.Config, ref string) string {
-	return filepath.Join(cfg.Paths().Project(ref), FunctionsDirName)
+	return filepath.Join(ProjectDir(cfg, ref), FunctionsDirName)
 }
 
-// EnvPath is projects/<ref>/functions-env.json.
+// EnvPath is <tenants>/<ref>/functions-env.json.
 func EnvPath(cfg *config.Config, ref string) string {
-	return filepath.Join(cfg.Paths().Project(ref), EnvFileName)
+	return filepath.Join(ProjectDir(cfg, ref), EnvFileName)
 }
 
-// FunctionPath is projects/<ref>/functions/<slug>, the symlink to the live generation.
+// FunctionPath is <tenants>/<ref>/functions/<slug>, the symlink to the live generation.
 func FunctionPath(cfg *config.Config, ref, slug string) string {
 	return filepath.Join(FunctionsDir(cfg, ref), slug)
 }
@@ -61,4 +67,13 @@ func ProjectURL(cfg *config.Config, ref string) string {
 func Live(cfg *config.Config, ref, slug string) (version int, ok bool) {
 	m, ok := liveMeta(FunctionPath(cfg, ref, slug))
 	return m.Version, ok
+}
+
+// RemoveFiles deletes everything this package keeps for ref. Deleting a project from the
+// command line calls it; a node that runs the API server also gets it from Reconcile.
+func RemoveFiles(cfg *config.Config, ref string) error {
+	if err := validRef(ref); err != nil {
+		return err
+	}
+	return os.RemoveAll(ProjectDir(cfg, ref))
 }

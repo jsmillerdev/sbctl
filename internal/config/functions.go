@@ -1,5 +1,7 @@
 package config
 
+import "path/filepath"
+
 // Defaults of the [functions] section. They follow the limits of hosted Edge Functions
 // (256 MB per worker, 2 s of CPU time per request, a 400 s wall clock, 150 s without
 // a response) so a function that works on one works on the other.
@@ -96,4 +98,14 @@ func limitOrOff(v, d int) int {
 		return 0
 	}
 	return v
+}
+
+// FunctionsRoot is where Edge Functions live on disk: one directory per project ref, each
+// with functions-env.json and functions/. It sits inside the state directory of
+// sb-edge-runtime (system/edge-runtime/tenants), the one directory the unit's mount
+// namespace shows besides the artifacts, so the runtime sees the functions and nothing
+// of the projects' clusters, sockets and unit files. internal/functions writes it,
+// functions-main/ reads it.
+func (p Paths) FunctionsRoot() string {
+	return filepath.Join(p.System(SvcEdgeRuntime), "tenants")
 }

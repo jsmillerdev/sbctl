@@ -54,8 +54,8 @@ func MainServiceDir(cfg *config.Config) string {
 // edgeRuntimeSpec completes the unit spec of the Edge Runtime. One process serves every
 // project: the main service (functions-main/, embedded in this binary and written to
 // MainServiceDir) picks the project from the X-Sbctl-Project-Ref header the proxy sets,
-// and reads the project's functions and environment from <state>/projects/<ref>/ (written
-// by internal/functions). The runtime listens on loopback only. Flags follow the CLI's
+// and reads the project's functions and environment from <state>/system/edge-runtime/
+// tenants/<ref>/ (written by internal/functions), inside the unit's own state directory. The runtime listens on loopback only. Flags follow the CLI's
 // functions service (packages/stack/src/services/Functions.ts) and the compose file of
 // supabase/supabase; the limits come from [functions].
 func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
@@ -69,10 +69,14 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 	// The runtime cannot load a main service through a symlinked path (on macOS /tmp is
 	// one: "Module not found"), so it is given real paths.
 	mainDir := realPath(MainServiceDir(cfg))
-	projectsDir := realPath(filepath.Dir(cfg.Paths().Project("x")))
+	root := cfg.Paths().FunctionsRoot()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return units.Spec{}, err
+	}
+	root = realPath(root)
 	s.Env = map[string]string{
 		"EDGE_RUNTIME_PORT":                port,
-		"SBCTL_PROJECTS_DIR":               projectsDir,
+		"SBCTL_FUNCTIONS_ROOT":             root,
 		"SBCTL_FUNCTIONS_MEMORY_MB":        strconv.Itoa(f.Memory()),
 		"SBCTL_FUNCTIONS_WALL_CLOCK_SEC":   strconv.Itoa(f.WallClock()),
 		"SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC": strconv.Itoa(f.IdleTimeout()),

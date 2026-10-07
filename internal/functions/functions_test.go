@@ -83,9 +83,6 @@ func (e *env) addProject(ref string, status registry.Status) *registry.Project {
 	e.mu.Lock()
 	e.keys[ref] = k
 	e.mu.Unlock()
-	if err := os.MkdirAll(e.cfg.Paths().Project(ref), 0o750); err != nil {
-		e.t.Fatal(err)
-	}
 	return p
 }
 
@@ -455,8 +452,10 @@ func TestBadUploadsAreRefused(t *testing.T) {
 		if _, err := os.Lstat(FunctionPath(e.cfg, refA, "bad")); err == nil {
 			t.Errorf("%s: a refused upload went live", name)
 		}
-		if _, err := os.Stat(filepath.Join(e.cfg.Paths().Project(refA), "escape.ts")); err == nil {
-			t.Errorf("%s: wrote outside the generation", name)
+		for _, outside := range []string{ProjectDir(e.cfg, refA), FunctionsDir(e.cfg, refA), filepath.Join(FunctionsDir(e.cfg, refA), genDirName)} {
+			if _, err := os.Stat(filepath.Join(outside, "escape.ts")); err == nil {
+				t.Errorf("%s: wrote outside the generation (%s)", name, outside)
+			}
 		}
 		if n := len(gens(t, e.cfg, refA)); n != 0 {
 			t.Errorf("%s: %d generations left behind", name, n)
@@ -555,55 +554,92 @@ func TestAProjectThatDoesNotUseFunctionsGetsNoFiles(t *testing.T) {
 	}
 }
 
-// vanishingStore deletes the project directory while the syncer is reading the store, the way
-// a project delete that runs at the same moment would.
-type vanishingStore struct {
-	Store
-	dir string
+func TestFilesOfProjectsThatAreGoneAreCollected(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.addProject(refA, registry.StatusActiveHealthy)
+	e.addProject(refB, registry.StatusActiveHealthy)
+	for _, ref := range []string{refA, refB} {
+		e.deploy(ref, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+		e.sync(ref)
+	}
+	// Deleted from the registry (what Engine.Delete does last): the files go with the next
+	// sync of that project or the next reconcile.
+	if err := e.reg.DeleteProject(ctx, refA); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ProjectDir(e.cfg, refA)); err == nil {
+		t.Fatal("the tree of a deleted project survived a reconcile")
+	}
+	if _, err := os.Stat(EnvPath(e.cfg, refB)); err != nil {
+		t.Fatalf("another project lost its files: %v", err)
+	}
+	// SyncProject alone does the same, and so does a project that is going down.
+	e.deploy(refB, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "2"})
+	if err := e.reg.SetProjectStatus(ctx, refB, registry.StatusGoingDown); err != nil {
+		t.Fatal(err)
+	}
+	e.sync(refB)
+	if _, err := os.Stat(ProjectDir(e.cfg, refB)); err == nil {
+		t.Fatal("a project that is going down kept its files")
+	}
+	// Junk next to the project trees is left alone.
+	junk := filepath.Join(e.cfg.Paths().FunctionsRoot(), "not-a-ref")
+	if err := os.MkdirAll(junk, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(junk); err != nil {
+		t.Fatal("a directory that is not a project ref was removed")
+	}
 }
 
-func (v vanishingStore) ListFunctionSecrets(ctx context.Context, ref string) ([]api.FunctionSecret, error) {
-	out, err := v.Store.ListFunctionSecrets(ctx, ref)
-	_ = os.RemoveAll(v.dir)
-	return out, err
-}
+// listsNothing hides every project from ListProjects, as a snapshot taken before a project
+// was created would.
+type listsNothing struct{ registry.Registry }
 
-func TestAProjectDeletedDuringASyncIsNotRecreated(t *testing.T) {
+func (listsNothing) ListProjects(context.Context) ([]registry.Project, error) { return nil, nil }
+
+func TestACollectNeverRemovesAProjectCreatedAfterTheListing(t *testing.T) {
 	e := newEnv(t)
 	e.addProject(refA, registry.StatusActiveHealthy)
 	e.deploy(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
-	s, err := New(Deps{Cfg: e.cfg, Registry: e.reg, Secrets: e.sec, Keys: e.s.d.Keys,
-		Store: vanishingStore{Store: e.store, dir: e.cfg.Paths().Project(refA)}})
+	e.sync(refA)
+	s, err := New(Deps{Cfg: e.cfg, Registry: listsNothing{e.reg}, Secrets: e.sec, Store: e.store, Keys: e.s.d.Keys})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SyncProject(context.Background(), refA); err != nil {
-		t.Fatalf("a project that vanished is not an error: %v", err)
+	if err := s.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(e.cfg.Paths().Project(refA)); err == nil {
-		t.Fatal("the project directory was recreated")
+	if _, err := os.Stat(EnvPath(e.cfg, refA)); err != nil {
+		t.Fatalf("a project that exists lost its files: %v", err)
 	}
 }
 
-func TestSyncIgnoresMissingProjectsAndBadRefs(t *testing.T) {
+func TestSyncOfAnUnknownProjectRemovesLeftoversAndBadRefsAreRefused(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
+	if err := os.MkdirAll(FunctionsDir(e.cfg, refA), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := e.s.SyncProject(ctx, refA); err != nil {
 		t.Fatalf("unknown project: %v", err)
 	}
-	e.addProject(refB, registry.StatusActiveHealthy)
-	if err := os.RemoveAll(e.cfg.Paths().Project(refB)); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.s.SyncProject(ctx, refB); err != nil {
-		t.Fatalf("project without a directory: %v", err)
-	}
-	if _, err := os.Stat(e.cfg.Paths().Project(refB)); err == nil {
-		t.Fatal("SyncProject created the project directory")
+	if _, err := os.Stat(ProjectDir(e.cfg, refA)); err == nil {
+		t.Fatal("leftovers of an unknown project were kept")
 	}
 	for _, bad := range []string{"", "system", "../etc", "AAAAAAAAAAAAAAAAAAAA"} {
 		if err := e.s.SyncProject(ctx, bad); err == nil {
 			t.Errorf("ref %q accepted", bad)
+		}
+		if err := RemoveFiles(e.cfg, bad); err == nil {
+			t.Errorf("RemoveFiles accepted %q", bad)
 		}
 	}
 }
@@ -616,13 +652,20 @@ func TestRemoveProject(t *testing.T) {
 	if err := e.s.RemoveProject(refA); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{EnvPath(e.cfg, refA), FunctionsDir(e.cfg, refA)} {
+	for _, p := range []string{EnvPath(e.cfg, refA), FunctionsDir(e.cfg, refA), ProjectDir(e.cfg, refA)} {
 		if _, err := os.Lstat(p); err == nil {
 			t.Fatalf("%s survived", p)
 		}
 	}
-	if _, err := os.Stat(e.cfg.Paths().Project(refA)); err != nil {
-		t.Fatal("the project directory itself is not ours to remove")
+	if _, err := os.Stat(e.cfg.Paths().FunctionsRoot()); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	e.sync(refA)
+	if err := RemoveFiles(e.cfg, refA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ProjectDir(e.cfg, refA)); err == nil {
+		t.Fatal("RemoveFiles left the tree")
 	}
 }
 

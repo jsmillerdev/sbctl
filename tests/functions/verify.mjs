@@ -157,7 +157,8 @@ async function mainPhase() {
   // A worker sees its module graph and nothing of the node's disk or the main service's
   // environment: not the node's files, not another project's keys.
   {
-    const files = ['/etc/hosts', `${cfg.stateDir}/projects/${b.ref}/functions-env.json`, `${cfg.stateDir}/projects/${a.ref}/functions-env.json`]
+    const tenants = `${cfg.stateDir}/system/edge-runtime/tenants`
+    const files = ['/etc/hosts', `${tenants}/${b.ref}/functions-env.json`, `${tenants}/${a.ref}/functions-env.json`]
     const q = files.map((f) => `p=${encodeURIComponent(f)}`).join('&')
     const r = await call(`${fnUrl(a, 'readfs')}?${q}`, { headers: bearer(a.anon) })
     assert.equal(r.status, 200, `readfs: ${r.status} ${r.text}`)

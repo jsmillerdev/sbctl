@@ -3,7 +3,7 @@ import { loadConfig } from './config.ts'
 
 Deno.test('loadConfig applies the defaults', () => {
   const c = loadConfig(() => undefined)
-  assertEquals(c.projectsDir, '/var/lib/sbctl/projects')
+  assertEquals(c.root, '/var/lib/sbctl/system/edge-runtime/tenants')
   assertEquals(c.limits, {
     memoryLimitMb: 256,
     workerTimeoutMs: 400_000,
@@ -16,7 +16,7 @@ Deno.test('loadConfig applies the defaults', () => {
 
 Deno.test('loadConfig reads the variables the unit passes', () => {
   const vars: Record<string, string> = {
-    SBCTL_PROJECTS_DIR: '/x/projects/',
+    SBCTL_FUNCTIONS_ROOT: '/x/tenants/',
     SBCTL_FUNCTIONS_MEMORY_MB: '64',
     SBCTL_FUNCTIONS_WALL_CLOCK_SEC: '10',
     SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC: '5',
@@ -25,7 +25,7 @@ Deno.test('loadConfig reads the variables the unit passes', () => {
     SBCTL_FUNCTIONS_CPU_HARD_MS: '',
   }
   const c = loadConfig((n) => vars[n])
-  assertEquals(c.projectsDir, '/x/projects')
+  assertEquals(c.root, '/x/tenants')
   assertEquals(c.limits.memoryLimitMb, 64)
   assertEquals(c.limits.workerTimeoutMs, 10_000)
   assertEquals(c.limits.requestIdleTimeoutMs, 5000)

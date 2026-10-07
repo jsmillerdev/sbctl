@@ -112,8 +112,11 @@ sees() { # PATH: exit 0 if PATH is readable from the unit's namespace as the sbc
 for hidden in "$SBCTL_STATE/backups" "$SBCTL_STATE/certs" /etc/sbctl; do
   if sees "$hidden"; then fail "$U can read $hidden"; fi
 done
-sees "$SBCTL_STATE/projects/$REF_A" || fail "$U cannot see projects/$REF_A (the main service reads the functions there)"
-if sees "$SBCTL_STATE/projects/system/postgres"; then fail "$U can read the system cluster directory"; fi
+# The runtime sees the tree of functions (its own state directory) and nothing of the projects.
+sees "$SBCTL_STATE/system/edge-runtime/tenants" || fail "$U cannot see its tenants directory"
+for hidden in "$SBCTL_STATE/projects/$REF_A" "$SBCTL_STATE/projects/$REF_A/postgres" "$SBCTL_STATE/projects/system/postgres" "$SBCTL_STATE/projects/system"; do
+  if sees "$hidden"; then fail "$U can read $hidden"; fi
+done
 
 log "tests/functions/run.sh"
 export SBCTL_RUN="sudo -u $SBCTL_USER -H /usr/local/bin/sbctl" AS_SBCTL="sudo -u $SBCTL_USER"

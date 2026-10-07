@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/functions"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
@@ -174,6 +175,11 @@ func init() {
 		func(cmd *cobra.Command, n *lifecycle.Node, a []string) error {
 			if err := n.Engine.DeleteWith(cmd.Context(), a[0], lifecycle.DeleteOptions{SkipFinalBackup: pSkipBackup}); err != nil {
 				return err
+			}
+			// The Edge Functions tree lives in the runtime's state directory, not in the
+			// project's: remove it now rather than at the next reconcile of a running daemon.
+			if err := functions.RemoveFiles(n.Cfg, a[0]); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: removing the Edge Functions files of %s: %v\n", a[0], err)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s deleted\n", a[0])
 			return nil

@@ -4,13 +4,16 @@
 // environment file with the project's keys and secrets. The Deno main service in
 // functions-main/ resolves a request to exactly these files.
 //
-//	projects/<ref>/functions-env.json         jwt secret, SUPABASE_* values, secrets (0600)
-//	projects/<ref>/functions/<slug>           symlink to .gen/<slug>.<version>.<random>
-//	projects/<ref>/functions/.gen/<...>/      the uploaded files and .sbctl-function.json
+//	<state>/system/edge-runtime/tenants/<ref>/functions-env.json    jwt secret, SUPABASE_* values, secrets (0600)
+//	<state>/system/edge-runtime/tenants/<ref>/functions/<slug>      symlink to .gen/<slug>.<version>.<random>
+//	<state>/system/edge-runtime/tenants/<ref>/functions/.gen/<...>/ the uploaded files and .sbctl-function.json
 //
-// A deployment writes a new generation and renames a new symlink over the old one, so a
-// request sees the old function or the new one, never a mixture or a gap. Deleting the
-// project removes projects/<ref> wholesale and with it all of this.
+// The tree lives in the Edge Runtime's own state directory because that is the one place
+// its systemd unit sees; the projects' directories (clusters, sockets, unit files) stay
+// out of its mount namespace. A deployment writes a new generation and renames a new
+// symlink over the old one, so a request sees the old function or the new one, never a
+// mixture or a gap. A project that is deleted loses its tree at the next sync of that
+// project or the next reconcile (RemoveFiles does it at once).
 package functions
 
 import (
@@ -121,7 +124,8 @@ func eligible(p *registry.Project) bool {
 	return true
 }
 
-// Reconcile syncs every project. It is what makes key rotation, restored data and a
+// Reconcile syncs every project (one that is going away loses its files) and removes the
+// files of projects the registry no longer has. It is what makes key rotation, restored data and a
 // deployment whose first attempt failed show up without anyone asking; a failure of one
 // project does not stop the others.
 func (s *Syncer) Reconcile(ctx context.Context) error {
@@ -131,13 +135,16 @@ func (s *Syncer) Reconcile(ctx context.Context) error {
 	}
 	var errs []error
 	for i := range ps {
-		if !eligible(&ps[i]) {
+		if ps[i].Ref == config.SystemRef {
 			continue
 		}
 		if err := s.SyncProject(ctx, ps[i].Ref); err != nil {
 			s.log.Warn("edge functions: reconcile", "ref", ps[i].Ref, "err", err)
 			errs = append(errs, fmt.Errorf("%s: %w", ps[i].Ref, err))
 		}
+	}
+	if err := s.collectGone(ctx); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
@@ -158,54 +165,52 @@ func (s *Syncer) Run(ctx context.Context) {
 }
 
 // SyncProject makes the project's environment file and function generations match the
-// store: it writes what is missing or different, and removes functions that are gone.
-// A project whose directory does not exist (not created yet, or deleted) is left alone.
+// store: it writes what is missing or different, and removes functions that are gone. A
+// project the registry no longer knows, or that is going away, loses its tree; so does
+// one with neither a function nor a secret.
 func (s *Syncer) SyncProject(ctx context.Context, ref string) error {
 	if err := validRef(ref); err != nil {
 		return err
 	}
 	defer s.lock(ref)()
+	return s.syncLocked(ctx, ref)
+}
+
+func (s *Syncer) syncLocked(ctx context.Context, ref string) error {
 	p, err := s.d.Registry.GetProject(ctx, ref)
 	if errors.Is(err, registry.ErrNotFound) {
-		return nil // deleted: projects/<ref> went with it
+		return s.removeFiles(ref)
 	}
 	if err != nil {
 		return err
 	}
 	if !eligible(p) {
-		return nil
+		return s.removeFiles(ref)
 	}
 	cfg := s.d.Cfg
-	if fi, err := os.Stat(cfg.Paths().Project(ref)); err != nil || !fi.IsDir() {
-		return nil
-	}
 	fns, err := s.d.Store.ListFunctions(ctx, ref)
 	if err != nil {
 		return err
 	}
-	secretNames, err := s.d.Store.ListFunctionSecrets(ctx, ref)
+	stored, err := s.d.Store.ListFunctionSecrets(ctx, ref)
 	if err != nil {
 		return err
 	}
-	if len(fns) == 0 && len(secretNames) == 0 {
+	if len(fns) == 0 && len(stored) == 0 {
 		// Nothing to run and nothing to configure: the project's keys are not copied into
 		// a file for a project that does not use Edge Functions.
 		return s.removeFiles(ref)
 	}
-	env, err := s.buildEnv(ctx, p, secretNames)
+	env, err := s.buildEnv(ctx, p, stored)
 	if err != nil {
 		return err
 	}
-	if _, err := writeIfChanged(EnvPath(cfg, ref), env, 0o600); err != nil {
-		return projectGone(err)
-	}
 	dir := FunctionsDir(cfg, ref)
-	// Mkdir, not MkdirAll: a project that is deleted while this runs must not get its
-	// directory back, with a functions tree in it, after the delete removed it.
-	for _, d := range []string{dir, filepath.Join(dir, genDirName)} {
-		if err := os.Mkdir(d, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-			return projectGone(err)
-		}
+	if err := os.MkdirAll(filepath.Join(dir, genDirName), 0o700); err != nil {
+		return err
+	}
+	if _, err := writeIfChanged(EnvPath(cfg, ref), env, 0o600); err != nil {
+		return err
 	}
 	var errs []error
 	want := map[string]bool{}
@@ -222,9 +227,39 @@ func (s *Syncer) SyncProject(ctx context.Context, ref string) error {
 	return errors.Join(errs...)
 }
 
-// RemoveProject deletes everything this package wrote for ref. Deleting the project
-// already does that (it removes projects/<ref>); this is for a node that turns the feature
-// off for one project.
+// collectGone removes the trees of projects the registry no longer has (a project deleted
+// while no sync of it ran, or from the command line). Each candidate is looked up again
+// under its lock, so a project created since the caller listed the registry keeps the
+// files its first deployment just wrote.
+func (s *Syncer) collectGone(ctx context.Context) error {
+	ents, err := os.ReadDir(s.d.Cfg.Paths().FunctionsRoot())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, e := range ents {
+		ref := e.Name()
+		if !e.IsDir() || validRef(ref) != nil {
+			continue
+		}
+		unlock := s.lock(ref)
+		if _, err := s.d.Registry.GetProject(ctx, ref); errors.Is(err, registry.ErrNotFound) {
+			if err := s.removeFiles(ref); err != nil {
+				errs = append(errs, err)
+			} else {
+				s.log.Info("edge functions: removed the files of a project that no longer exists", "ref", ref)
+			}
+		}
+		unlock()
+	}
+	return errors.Join(errs...)
+}
+
+// RemoveProject deletes everything this package keeps for ref. A node that turns the
+// feature off for one project uses it; project deletion needs no call (collectGone).
 func (s *Syncer) RemoveProject(ref string) error {
 	if err := validRef(ref); err != nil {
 		return err
@@ -233,25 +268,8 @@ func (s *Syncer) RemoveProject(ref string) error {
 	return s.removeFiles(ref)
 }
 
-// removeFiles deletes everything this package wrote for ref (the caller holds the lock).
-func (s *Syncer) removeFiles(ref string) error {
-	var first error
-	for _, p := range []string{FunctionsDir(s.d.Cfg, ref), EnvPath(s.d.Cfg, ref)} {
-		if err := os.RemoveAll(p); err != nil && first == nil {
-			first = err
-		}
-	}
-	return first
-}
-
-// projectGone turns "the project directory disappeared" (a delete that ran meanwhile)
-// into success: there is nothing left to write for it.
-func projectGone(err error) error {
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	return err
-}
+// removeFiles deletes the tree of ref (the caller holds the lock).
+func (s *Syncer) removeFiles(ref string) error { return os.RemoveAll(ProjectDir(s.d.Cfg, ref)) }
 
 // envDoc is functions-env.json.
 type envDoc struct {

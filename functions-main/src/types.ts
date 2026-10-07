@@ -1,6 +1,6 @@
 // Types shared by the modules of the sbctl Edge Functions main service.
 
-/** What internal/functions writes to projects/<ref>/functions-env.json. */
+/** What internal/functions writes to <root>/<ref>/functions-env.json. */
 export interface ProjectEnv {
   /** Changes whenever the file does; part of the worker pool key, so new secrets reach new workers. */
   stamp?: string

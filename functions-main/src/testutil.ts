@@ -1,4 +1,4 @@
-// Helpers for the tests: signing JWTs and laying out a projects directory.
+// Helpers for the tests: signing JWTs and laying out a functions root.
 
 import type { FunctionMeta, Runtime, RuntimeErrors, Worker, WorkerOptions } from './types.ts'
 

@@ -55,15 +55,6 @@ ReadWritePaths=-/var/lib/sbctl/system/edge-runtime
 InaccessiblePaths=-/etc/sbctl
 TemporaryFileSystem=/var/lib/sbctl:ro
 BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/system/edge-runtime.run
-# Unlike the other units, this one also reads the files of every project: the main service
-# serves <state>/projects/<ref>/functions/ and reads <ref>/functions-env.json (written by
-# internal/functions). The whole projects directory is therefore visible, read-only,
-# including other projects' data directories and unit environment files. What bounds that
-# is the runtime (a tenant's worker sees its module graph and nothing of the disk), the
-# fact that functions-env.json already holds every project's keys and database password,
-# and the same-uid /proc exposure described in README.md. See "sb-edge-runtime and the
-# projects directory" there.
-BindReadOnlyPaths=/var/lib/sbctl/projects
 BindPaths=-/var/lib/sbctl/system/edge-runtime
 
 # Optional: enable with `systemctl enable sb-edge-runtime.service` when the feature is on.

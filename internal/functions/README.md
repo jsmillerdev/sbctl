@@ -18,10 +18,12 @@ api.New(api.Deps{ /* ... */ Store: store, Functions: syncer }) // api.FunctionsH
 ## What it writes
 
 ```
-projects/<ref>/functions-env.json           0600   jwt secret, SUPABASE_* values, secrets (JSON)
-projects/<ref>/functions/<slug>             symlink  ->  .gen/<slug>.<version>.<random>
-projects/<ref>/functions/.gen/<...>/        0700   one generation: the files and .sbctl-function.json
+<state>/system/edge-runtime/tenants/<ref>/functions-env.json           0600   jwt secret, SUPABASE_* values, secrets (JSON)
+<state>/system/edge-runtime/tenants/<ref>/functions/<slug>             symlink  ->  .gen/<slug>.<version>.<random>
+<state>/system/edge-runtime/tenants/<ref>/functions/.gen/<...>/        0700   one generation: the files and .sbctl-function.json
 ```
+
+The tree is in the Edge Runtime's own state directory (`config.Paths.FunctionsRoot()`), not under `projects/<ref>/` as `HANDOFF.md` 3.J says: since the unit templates became allowlists, `sb-edge-runtime` sees only the artifacts, its launcher and `system/edge-runtime`, and binding `projects/` to it would show it every cluster's data directory and unix socket (a process that sees a socket connects as `supabase_admin`) while it runs tenants' code. Cost: a project's functions are not removed by `Engine.Delete`'s `RemoveAll` of `projects/<ref>`; `sbctl projects delete` calls `RemoveFiles`, and a running API server's reconcile removes the tree of any project the registry no longer has.
 
 - **`functions-env.json`** (`buildEnv`): `SUPABASE_URL` (the project's public origin; see `ProjectURL`, `[functions] project_url_template`), `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL` (`postgres://postgres:<password>@127.0.0.1:<project postgres port>/postgres?sslmode=disable`, straight to the project's cluster, no pooler), `SUPABASE_PUBLISHABLE_KEYS` and `SUPABASE_SECRET_KEYS` (`{"default": "..."}` as the upstream compose file passes them), the project's JWT secret for the main service only, and the function secrets, opened from the sealed store. Rewritten only when its content or mode changes. A project with no function and no secret gets no file (its keys are not copied for a project that does not use Edge Functions), and loses the file and the `functions` directory when it ends up with neither.
 - **A generation** is a function's uploaded files at their uploaded paths (the CLI anchors them at the workdir: `supabase/functions/<slug>/index.ts`, `supabase/functions/_shared/...`), or, for a function the CLI bundled, `bundle.eszip`: the upload is `EZBR` + Brotli of an eszip, and the runtime wants the plain eszip, so it is decompressed here (capped at 512 MiB, must start with `ESZIP`). `.sbctl-function.json` holds slug, version, `verify_jwt`, kind (`source` or `eszip`), entrypoint (a path for sources, the bundle's entry module URL for bundles), import map, and a SHA-256 over the stored files.
@@ -34,10 +36,10 @@ projects/<ref>/functions/.gen/<...>/        0700   one generation: the files and
 | Trigger | What |
 |---|---|
 | API change (hook) | `SyncProject(ref)`: env file, then every function of the project; links of functions the store no longer has are removed |
-| every `reconcile_seconds`, and at start | `Reconcile`: the same for every project that is not `system`, `GOING_DOWN`, `REMOVED` or `INIT_FAILED`; this is what makes key rotation (`sbctl projects rotate-keys`), restored data and a failed first attempt show up |
-| project delete | nothing to do: `lifecycle.Engine.Delete` removes `projects/<ref>` as a whole, with the functions and the env file. `RemoveProject(ref)` removes only this package's files |
+| every `reconcile_seconds`, and at start | `Reconcile`: the same for every project but `system`, then `collectGone`; this is what makes key rotation (`sbctl projects rotate-keys`), restored data and a failed first attempt show up |
+| project delete | `sbctl projects delete` calls `RemoveFiles(cfg, ref)`; otherwise (a delete through the API) the next `SyncProject(ref)` or `Reconcile` finds the project gone and removes its tree (`collectGone` looks the project up again under its lock, so a project created since the listing keeps what its first deployment wrote). A project that is `GOING_DOWN`, `REMOVED` or `INIT_FAILED` loses its tree the same way |
 
-`SyncProject` does nothing for a project the registry does not know and for one whose directory does not exist; it never creates `projects/<ref>` (`os.Mkdir`, not `MkdirAll`), so a project deleted while a sync runs does not get a directory back. Work on one project is serialized by a lock per ref.
+`SyncProject` of a project the registry does not know removes its tree. Work on one project is serialized by a lock per ref, shared with `collectGone`.
 
 ## CLI
 

@@ -9,7 +9,7 @@ Deno.serve(async (req) => {
     }
   }
   try {
-    out.env = `ENV: ${Deno.env.get('SBCTL_PROJECTS_DIR') ?? 'unset'}`
+    out.env = `ENV: ${Deno.env.get('SBCTL_FUNCTIONS_ROOT') ?? 'unset'}`
   } catch (e) {
     out.env = `ERROR: ${(e as Error).name}`
   }
