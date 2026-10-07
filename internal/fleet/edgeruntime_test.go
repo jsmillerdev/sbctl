@@ -31,14 +31,15 @@ func TestServicesForPutsTheEdgeRuntimeBeforeStudioWhenEnabled(t *testing.T) {
 
 func edgeRig(t *testing.T, enabled bool) *managerRig {
 	t.Helper()
+	l := listenLoopback(t, 1)[0]
 	r := newManagerRig(t, func(d *Deps) {
 		d.Cfg.Functions.Enabled = enabled
-		d.Cfg.Ports.EdgeRuntime = freePorts(t, 1)[0]
+		d.Cfg.Ports.EdgeRuntime = portOf(l)
 		a := allArtifacts()
 		a[config.SvcEdgeRuntime] = "/art/edge-runtime"
 		d.Artifacts = a
 	})
-	h := serveHealth(t, r.n.cfg.Ports.EdgeRuntime, edgeRuntimeHealthPath)
+	h := serveHealth(t, l, edgeRuntimeHealthPath)
 	r.health[config.SvcEdgeRuntime] = h
 	r.sup.hooks[unitOf(config.SvcEdgeRuntime)] = func() { h.setUp(true) }
 	return r
