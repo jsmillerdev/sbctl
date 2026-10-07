@@ -36,8 +36,8 @@ type Metadata struct {
 
 func forced() Metadata { return Metadata{Force: true} }
 
-// Banner returns the notices to show at now: the announced maintenance while its banner is
-// active, and an upgrade that is running. It reads two small files and never fails: a notice
+// Banner returns the notices Studio would show at now: the announced maintenance while its
+// banner is active, and an upgrade that is running. BannerJSON does not serve them yet. It reads two small files and never fails: a notice
 // that cannot be read is not shown. An update that is merely available is never here, because
 // the dashboard's users cannot act on it; the operator is told through `supavise status` and
 // the alerts.
@@ -72,13 +72,27 @@ func Banner(p config.Paths, now time.Time) []Incident {
 	return out
 }
 
-// BannerJSON renders the answer of /api/incident-banner for the notices active at now.
-func BannerJSON(p config.Paths, now time.Time) []byte {
+// IncidentsJSON renders the list Banner returns in the shape of Studio's /api/incident-banner.
+// The proxy does not serve it yet: see BannerJSON.
+func IncidentsJSON(p config.Paths, now time.Time) []byte {
 	b, err := json.Marshal(struct {
 		Incidents []Incident `json:"incidents"`
 	}{Banner(p, now)})
 	if err != nil { // unreachable: plain structs
-		return []byte(`{"incidents":[]}`)
+		return []byte(emptyBanner)
 	}
 	return append(b, '\n')
 }
+
+const emptyBanner = `{"incidents":[]}`
+
+// BannerJSON is the answer of /api/incident-banner: no incidents, always.
+//
+// This Studio build draws every incident with the same fixed words ("We are investigating a
+// technical issue") and a link to Supabase's status page, which knows nothing about this node. A
+// maintenance window the operator planned, or an upgrade it started, would read as an unexplained
+// outage. Until Studio shows the operator's own title and message (a Studio patch, or the
+// incident.io status page route behind the incidentIoStatusPage flag, which is how hosted shows
+// maintenance), the notices reach the operator through `supavise status`, /healthz/detail and the
+// alerts instead. IncidentsJSON is the answer to serve once Studio can show it.
+func BannerJSON() []byte { return []byte(emptyBanner + "\n") }

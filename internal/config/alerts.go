@@ -38,8 +38,9 @@ type Alerts struct {
 type AlertWebhook struct {
 	// URL is the endpoint (http or https).
 	URL string `toml:"url"`
-	// Secret, when set, signs the body: the X-Supavise-Signature header carries
-	// "sha256=" and the hex HMAC-SHA256 of the body under this key.
+	// Secret, when set, signs the request: X-Supavise-Timestamp carries the Unix time
+	// and X-Supavise-Signature carries "sha256=" and the hex HMAC-SHA256, under this key, of the
+	// timestamp, a dot and the body.
 	Secret string `toml:"secret"`
 }
 

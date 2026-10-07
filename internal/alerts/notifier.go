@@ -114,6 +114,15 @@ func (n *Notifier) Notify(ctx context.Context, ev Event) error {
 	if sev, _ := config.SeverityRank(ev.Severity); sev < n.cfg.Severity() || !n.Configured() {
 		return nil
 	}
+	// The state is locked while the decision is made and recorded, and not while the message is
+	// delivered, which can take 40 seconds: a slow webhook must not block the daemon's checker and
+	// an upgrade's events on each other. The decision therefore reserves the notification (it is
+	// recorded as sent), so a second process that asks meanwhile sees a duplicate; a delivery that
+	// fails everywhere gives the reservation back.
+	var (
+		res  reservation
+		send bool
+	)
 	err := n.st.update(func(s *state) error {
 		now := n.now()
 		key := ev.key()
@@ -124,7 +133,8 @@ func (n *Notifier) Notify(ctx context.Context, ev Event) error {
 		case !ev.Resolved && !oneShot(ev.Kind) && active && now.Sub(prev.LastSent) < n.cfg.Repeat():
 			return errSkip
 		}
-		// The hourly cap.
+		// The hourly cap. A critical alert and the upgrade's own events are not held back: a
+		// burst of conditions must not swallow the one message that says an upgrade failed.
 		cutoff := now.Add(-time.Hour)
 		kept := s.Sent[:0]
 		for _, t := range s.Sent {
@@ -133,7 +143,7 @@ func (n *Notifier) Notify(ctx context.Context, ev Event) error {
 			}
 		}
 		s.Sent = kept
-		if len(s.Sent) >= n.cfg.HourlyCap() {
+		if len(s.Sent) >= n.cfg.HourlyCap() && !exemptFromCap(ev) {
 			if !slices.Contains(s.Held, key) { // saved: the next notification that goes out says how many were held back
 				s.Held = append(s.Held, key)
 			}
@@ -144,20 +154,8 @@ func (n *Notifier) Notify(ctx context.Context, ev Event) error {
 		if len(s.Held) > 0 {
 			out.Detail = strings.TrimSpace(out.Detail + fmt.Sprintf("\n(%d earlier alert(s) were held back by the limit of %d per hour; see the daemon's log.)", len(s.Held), n.cfg.HourlyCap()))
 		}
-		results := n.deliver(ctx, out)
-		var failed []error
-		ok := 0
-		for _, r := range results {
-			if r.Err != nil {
-				n.log.Warn("alert delivery failed", "destination", r.Destination, "kind", ev.Kind, "error", r.Err)
-				failed = append(failed, fmt.Errorf("%s: %w", r.Destination, r.Err))
-				continue
-			}
-			ok++
-		}
-		if ok == 0 {
-			return errors.Join(failed...) // nothing is recorded: the next try sends it
-		}
+		res = reservation{out: out, key: key, prev: prev, active: active, held: slices.Clone(s.Held), at: now}
+		send = true
 		s.Sent = append(s.Sent, now)
 		s.Held = nil
 		switch {
@@ -175,7 +173,61 @@ func (n *Notifier) Notify(ctx context.Context, ev Event) error {
 	if errors.Is(err, errSkip) {
 		return nil
 	}
-	return err
+	if err != nil || !send {
+		return err
+	}
+	var failed []error
+	ok := 0
+	for _, r := range n.deliver(ctx, res.out) {
+		if r.Err != nil {
+			n.log.Warn("alert delivery failed", "destination", r.Destination, "kind", ev.Kind, "error", r.Err)
+			failed = append(failed, fmt.Errorf("%s: %w", r.Destination, r.Err))
+			continue
+		}
+		ok++
+	}
+	if ok > 0 {
+		return nil
+	}
+	// Nothing arrived: nothing stays recorded, so the next try sends it.
+	rerr := n.st.update(func(s *state) error {
+		res.release(s)
+		return nil
+	})
+	return errors.Join(append(failed, rerr)...)
+}
+
+// reservation is what a decision to send recorded in the state, kept to undo it.
+type reservation struct {
+	out    Event
+	key    string
+	prev   ActiveAlert
+	active bool
+	held   []string
+	at     time.Time
+}
+
+// release removes the reservation from s: the send time, the active entry (restored to what it
+// was) and the held keys (merged with any that others added since).
+func (r reservation) release(s *state) {
+	if i := slices.IndexFunc(s.Sent, r.at.Equal); i >= 0 {
+		s.Sent = slices.Delete(s.Sent, i, i+1)
+	}
+	if r.active {
+		s.Active[r.key] = r.prev
+	} else {
+		delete(s.Active, r.key)
+	}
+	for _, k := range r.held {
+		if !slices.Contains(s.Held, k) {
+			s.Held = append(s.Held, k)
+		}
+	}
+}
+
+// exemptFromCap reports whether ev is sent even when the hourly cap is reached.
+func exemptFromCap(ev Event) bool {
+	return ev.Severity == SeverityCritical || strings.HasPrefix(ev.Kind, "upgrade_")
 }
 
 // worthLogging reports whether ev is news for the log. The checker offers every standing

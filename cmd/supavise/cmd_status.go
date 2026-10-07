@@ -32,6 +32,11 @@ The first line is the verdict: healthy, degraded (the node serves, but something
 attention) or down (the daemon, the edge or the system cluster is not running). Exit status 0
 is healthy, 1 degraded, 2 down. --json prints the whole report.
 
+A failure to check at all (no readable config, a user who may not read the node's files) prints
+an error and also exits 1, as every supavise command does. A script that must tell "degraded"
+from "could not check" reads the "status" field of --json: when there is no report, there is
+no verdict.
+
 Run it as the user that owns the state directory: sudo -u supavise supavise status.
 The public /healthz of the API host carries the same verdict for uptime monitors.`,
 		Args: cobra.NoArgs,

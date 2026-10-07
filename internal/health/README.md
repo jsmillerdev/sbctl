@@ -19,14 +19,16 @@ rep.Verdict.ExitCode() // 0 healthy, 1 degraded, 2 down
 | each project | `PostgresPlane.Health`: Postgres answers a query, GoTrue `/health`, PostgREST `/`, all on loopback; then whether Supavisor, Realtime and Storage hold the project's tenant (`fleet.Fleet.TenantPresence`, one GET each, no retries); then the age of the newest completed base backup | degraded |
 | `system backup` | the same freshness rule for the system project, which holds the registry | degraded |
 | `disk` | free space of the state volume | degraded |
-| `certificates` | the earliest expiry among the certificates under `<state_dir>/certs` | degraded |
+| `certificates` | the earliest expiry among the certificates the node must keep valid: `api.<domain>`, `studio.<domain>` and the `*.api.<domain>` wildcard under `<state_dir>/certs` | degraded |
 | `key escrow` | whether the backup backend holds an encrypted copy of the master key | note |
 | `update` | the record of the daily update check (below) | note |
 | `upgrade`, `maintenance` | the notice files (`internal/notice`) | note |
 
 A project is probed only when it should answer. A paused project (`INACTIVE`) is listed as paused, one being created, restored or deleted as busy, `INIT_FAILED` as a note and `RESTORE_FAILED` as a warning. A removed project is not listed. The checks never write: unlike `Engine.Health` they leave the registry's project status alone.
 
-Projects are probed 16 at a time with 10 seconds for each, so fifty projects take a few seconds. The registry's backup rows (`ListBackups`) give the backup age; the nightly timer makes one every 24 hours, so a backup is stale after 36 hours (`[health] backup_stale_hours`). A project younger than that with no backup yet is "no backup yet", not stale; a project whose newest backup failed after the last good one reports that error.
+Certificates for project hosts and custom hostnames (HTTP-01 on demand) do not judge the node. CertMagic renews them only when someone opens the host, so one for a live host can sit near its end, and one for a deleted project or a removed hostname is never renewed. The report counts the near ones and the retired ones in the `certificates` detail as notes; a node with fifty changing projects therefore stays healthy for `supavise upgrade --unattended`.
+
+Projects are probed 16 at a time with 10 seconds for each, so fifty projects take a few seconds. The registry's backup rows (`ListBackups`) give the backup age; a backup is stale after the period of `[backup] base_backup_on_calendar` plus 12 hours (36 hours for the default nightly timer; a weekly calendar gives 7 days and 12 hours), or after `[health] backup_stale_hours` when that is set. The period is read from the common calendar forms (daily time of day, `hourly`, `weekly`, a weekday list, `monthly`); anything else counts as daily, so set `backup_stale_hours` for an unusual calendar. A project younger than that with no backup yet is "no backup yet", not stale; a project whose newest backup failed after the last good one reports that error.
 
 ## The verdict
 
@@ -62,7 +64,7 @@ The escrow lookup lists the backup backend, which can be slow, so inside the dae
 |---|---|---|
 | `disk_low_percent` | 10 | free space below this percentage of the state volume degrades the node; below half of it is a failure |
 | `disk_low_gb` | 5 | the same as an absolute floor in GiB, for volumes where a percentage says little |
-| `backup_stale_hours` | 36 | age of the newest completed base backup past which a project is stale |
+| `backup_stale_hours` | backup period + 12 | age of the newest completed base backup past which a project is stale (36 for the default nightly timer) |
 | `certificate_warn_days` | 14 | days before expiry at which a certificate is reported (CertMagic renews at 30) |
 | `cache_seconds` | 20 | how long the daemon reuses a report |
 
@@ -72,7 +74,9 @@ The escrow lookup lists the backup backend, which can be slow, so inside the dae
 go test ./internal/health/
 ```
 
-Unit tests with fakes for the registry, the plane, the shared services, the tenants, the disk and the clock: the verdict and exit-code table, the summary, project statuses, backup freshness, tenants missing or unreachable, disk thresholds, real certificates generated in the test, advisories that must not change the verdict, the report's JSON shape, the monitor's cache, single flight and stale-answer rules, the update check against a fake GitHub API, the `[update]` reader's defaults, the escrow lookup against a file backend. `cmd/supavise/cmd_ops_test.go` runs `supavise status` against a node that is not running (exit status 2); the `install-e2e` job runs it on a healthy node, stops one project's PostgREST and expects degraded and exit status 1.
+`supavise status` exits 0, 1 or 2 only for a verdict. An error before there is one (no readable config, a user who may not read the node's files, a cancelled context) exits 1 through the shared error path, the same code as degraded, so a gate such as `supavise upgrade --unattended` reads the report (`CheckNode`, or `--json`'s `status` field), not the exit status alone.
+
+Unit tests with fakes for the registry, the plane, the shared services, the tenants, the disk and the clock: the verdict and exit-code table, the summary, project statuses, backup freshness, tenants missing or unreachable, disk thresholds, real certificates generated in the test (stale on-demand certificates for removed hosts that must not judge the node), advisories that must not change the verdict, the report's JSON shape, the monitor's cache, single flight and stale-answer rules, the update check against a fake GitHub API, the `[update]` reader's defaults, the escrow lookup against a file backend. `cmd/supavise/cmd_ops_test.go` runs `supavise status` against a node that is not running (exit status 2); the `install-e2e` job runs it on a healthy node, stops one project's PostgREST and expects degraded and exit status 1.
 
 ## Not done
 

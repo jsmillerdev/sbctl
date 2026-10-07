@@ -421,6 +421,7 @@ func writeCert(t *testing.T, dir, host string, notAfter time.Time) {
 func TestCertificates(t *testing.T) {
 	e := newEnv(t)
 	e.cfg.TLS.Mode = "auto"
+	e.cfg.Domain = "example.com"
 	if c, _ := e.check().Component("certificates"); c.State != Info || !strings.Contains(c.Detail, "none issued") {
 		t.Errorf("no certificates yet: %+v", c)
 	}
@@ -430,21 +431,60 @@ func TestCertificates(t *testing.T) {
 	if c, _ := e.check().Component("certificates"); c.State != OK || !strings.Contains(c.Detail, "studio.example.com") {
 		t.Errorf("healthy certificates: %+v", c)
 	}
-	writeCert(t, certs, "late.example.com", e.now.Add(5*24*time.Hour))
+	// The wildcard is renewed in the background, so a short one means renewal is failing.
+	writeCert(t, certs, "*.api.example.com", e.now.Add(5*24*time.Hour))
 	r := e.check()
-	if c, _ := r.Component("certificates"); c.State != Warn || !strings.Contains(c.Detail, "late.example.com") {
-		t.Errorf("a certificate near its end: %+v", c)
+	if c, _ := r.Component("certificates"); c.State != Warn || !strings.Contains(c.Detail, "*.api.example.com") {
+		t.Errorf("a managed certificate near its end: %+v", c)
 	}
 	if r.Verdict != Degraded {
 		t.Errorf("verdict %q", r.Verdict)
 	}
-	writeCert(t, certs, "dead.example.com", e.now.Add(-48*time.Hour))
+	writeCert(t, certs, "studio.example.com", e.now.Add(-48*time.Hour))
 	if c, _ := e.check().Component("certificates"); c.State != Fail || !strings.Contains(c.Detail, "expired") {
-		t.Errorf("an expired certificate: %+v", c)
+		t.Errorf("an expired managed certificate: %+v", c)
 	}
 	e.cfg.TLS.Mode = "off"
 	if c, _ := e.check().Component("certificates"); c.State != OK || c.Detail != "TLS is off" {
 		t.Errorf("TLS off: %+v", c)
+	}
+}
+
+// HTTP-01 certificates for project hosts are issued and renewed on demand. One for a host the
+// node no longer serves is never renewed, and neither it nor a live one that nobody opened lately
+// may degrade the node (it would hold back `supavise upgrade --unattended` for good).
+func TestOnDemandCertificatesDoNotJudgeTheNode(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.TLS.Mode = "http01"
+	e.cfg.Domain = "example.com"
+	certs := e.cfg.Paths().Certs()
+	writeCert(t, certs, "api.example.com", e.now.Add(60*24*time.Hour))
+	writeCert(t, certs, "studio.example.com", e.now.Add(60*24*time.Hour))
+	// A removed project's host (expired), a deleted custom hostname, and a live project's host
+	// nobody opened since the last restart.
+	writeCert(t, certs, "removed00000000000000.api.example.com", e.now.Add(-72*time.Hour))
+	writeCert(t, certs, "data.gone.example.org", e.now.Add(3*24*time.Hour))
+	writeCert(t, certs, e.cfg.ProjectHost(refA), e.now.Add(4*24*time.Hour))
+	// A custom hostname of a live project.
+	if err := e.reg.PutRoute(context.Background(), registry.Route{Host: "db.alpha.example.org", Ref: refA, Kind: "custom"}); err != nil {
+		t.Fatal(err)
+	}
+	writeCert(t, certs, "db.alpha.example.org", e.now.Add(2*24*time.Hour))
+
+	r := e.check()
+	c, _ := r.Component("certificates")
+	if c.State != OK || r.Verdict != Healthy {
+		t.Fatalf("on-demand certificates changed the verdict to %q: %+v", r.Verdict, c)
+	}
+	for _, want := range []string{"2 issued", "2 project host certificate(s) are near their end", "2 certificate(s) for hosts this node no longer serves are ignored"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Errorf("detail %q lacks %q", c.Detail, want)
+		}
+	}
+	// Without a registry nothing is known to be live, so every on-demand certificate is ignored.
+	e.deps.Registry = nil
+	if c, _ := e.check().Component("certificates"); c.State != OK || !strings.Contains(c.Detail, "4 certificate(s)") {
+		t.Errorf("no registry: %+v", c)
 	}
 }
 

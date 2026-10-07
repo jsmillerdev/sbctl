@@ -14,14 +14,13 @@ import (
 var maintenanceCmd = &cobra.Command{
 	Use:   "maintenance",
 	Short: "Announce a maintenance window in the dashboard",
-	Long: `An announced window shows a banner to every signed-in dashboard user while it is open
-(and, with --notice, for that long before it opens). It changes nothing else: projects keep
-running, and the alerts stay quiet for the length of the window so planned downtime does not
-page anyone. An upgrade shows its own "upgrade in progress" banner while it runs.
+	Long: `An announced window is shown by 'supavise status' and /healthz/detail while it is
+open, and the alerts stay quiet about the services the window restarts, so planned downtime
+does not page anyone. Projects keep running. An upgrade is shown the same way while it runs.
 
-Studio draws the banner with its own wording ("We are investigating a technical issue");
-the message you give is kept for 'supavise status' and for anything else that reads
-/api/incident-banner.`,
+The dashboard banner stays empty for now: Studio draws any incident as "We are investigating a
+technical issue" with a link to Supabase's status page, which would present planned work as an
+outage. The message you give is kept for 'supavise status' and for the day Studio can show it.`,
 }
 
 func init() {
@@ -54,7 +53,7 @@ A new announcement replaces the old one.`,
 	announce.Flags().StringVar(&at, "at", "", "when the window starts")
 	announce.Flags().StringVar(&until, "until", "", "when the window ends (instead of --duration)")
 	announce.Flags().StringVar(&duration, "duration", "2h", "how long the window lasts")
-	announce.Flags().StringVar(&lead, "notice", "0", "show the banner this long before the window opens (for example 24h)")
+	announce.Flags().StringVar(&lead, "notice", "0", "treat the window as announced this long before it opens (for example 24h)")
 	announce.Flags().StringVar(&message, "message", "", "what the dashboard's users should know")
 	_ = announce.MarkFlagRequired("at")
 	_ = announce.MarkFlagRequired("message")
@@ -106,7 +105,7 @@ A new announcement replaces the old one.`,
 			case m.InProgress(now):
 				state = "in progress"
 			case m.Active(now):
-				state = "announced, banner showing"
+				state = "announced, notice period"
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s [%s]\n", describeMaintenance(m), state)
 			return nil
@@ -171,7 +170,7 @@ func parseWhen(s string, now time.Time) (time.Time, error) {
 func describeMaintenance(m *notice.Maintenance) string {
 	s := fmt.Sprintf("%q from %s to %s", m.Message, m.StartsAt.Format(time.RFC3339), m.EndsAt.Format(time.RFC3339))
 	if m.LeadSeconds > 0 {
-		s += fmt.Sprintf(", banner %s ahead", (time.Duration(m.LeadSeconds) * time.Second).String())
+		s += fmt.Sprintf(", notice %s ahead", (time.Duration(m.LeadSeconds) * time.Second).String())
 	}
 	return s
 }

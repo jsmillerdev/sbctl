@@ -370,14 +370,17 @@ rc=1
 for ((i = 0; i < 30; i++)); do rc=0; sup status --json >"$WORK/status.json" || rc=$?; [[ $rc -eq 0 ]] && break; sleep 2; done
 [[ $rc -eq 0 ]] || fail "the node did not report healthy again after PostgREST was started"
 
-log "a maintenance window shows on the dashboard's incident banner and clears"
+log "a maintenance window shows in status, and the dashboard banner stays empty (Studio would draw it as an outage)"
 STUDIO_HOST=studio.$BASE
 banner() { curl -sS -m 30 -H "Host: $STUDIO_HOST" http://127.0.0.1/api/incident-banner; }
 [[ $(banner) == '{"incidents":[]}' ]] || fail "the banner is not empty on a quiet node: $(banner)"
 sup maintenance announce --at now --duration 10m --message "e2e maintenance" >/dev/null || fail "maintenance announce"
-[[ $(banner | jq_ 'len(d["incidents"])') == 1 && $(banner | jq_ 'd["incidents"][0]["show_banner"]') == force && $(banner) == *"e2e maintenance"* ]] || fail "the announced window is not in the banner: $(banner)"
+sup status --json >"$WORK/status.json" || fail "an announced window made status unhealthy"
+[[ $(jq_ 'len([c for c in d["components"] if c["name"] == "maintenance" and "e2e maintenance" in c["detail"]])' <"$WORK/status.json") == 1 ]] || fail "the announced window is not in status: $(cat "$WORK/status.json")"
+[[ $(banner) == '{"incidents":[]}' ]] || fail "the announced window reached the dashboard banner: $(banner)"
 sup maintenance clear >/dev/null || fail "maintenance clear"
-[[ $(banner) == '{"incidents":[]}' ]] || fail "the banner still shows a cleared window: $(banner)"
+sup status --json >"$WORK/status.json" || fail "status after the window was cleared"
+[[ $(jq_ 'len([c for c in d["components"] if c["name"] == "maintenance"])' <"$WORK/status.json") == 0 ]] || fail "status still shows a cleared window"
 [[ $(sup alerts list) == "no active alerts" ]] || fail "alerts are active on a healthy node: $(sup alerts list)"
 
 # ---- 6. re-run: idempotent, secrets kept -------------------------------------------------

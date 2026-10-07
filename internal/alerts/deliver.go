@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/smtp"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -23,9 +24,13 @@ import (
 	"github.com/jsmillerdev/supavise/internal/config"
 )
 
-// SignatureHeader carries the HMAC of the body of a webhook that has a secret:
-// "sha256=" and the hex HMAC-SHA256 of the request body under the secret.
+// SignatureHeader carries the HMAC of a webhook that has a secret: "sha256=" and the hex
+// HMAC-SHA256, under the secret, of the timestamp, a dot and the request body.
 const SignatureHeader = "X-Supavise-Signature"
+
+// TimestampHeader carries the Unix time in seconds that the signature covers, so a receiver can
+// refuse a captured request that is replayed later. Only a webhook with a secret has it.
+const TimestampHeader = "X-Supavise-Timestamp"
 
 // EventHeader carries the alert's kind, for receivers that route on it.
 const EventHeader = "X-Supavise-Event"
@@ -60,9 +65,10 @@ func (n *Notifier) body(ev Event) webhookBody {
 	}
 }
 
-// Sign returns the SignatureHeader value for body under secret.
-func Sign(secret string, body []byte) string {
+// Sign returns the SignatureHeader value for body sent at the Unix time ts under secret.
+func Sign(secret string, ts int64, body []byte) string {
 	m := hmac.New(sha256.New, []byte(secret))
+	m.Write([]byte(strconv.FormatInt(ts, 10) + "."))
 	m.Write(body)
 	return "sha256=" + hex.EncodeToString(m.Sum(nil))
 }
@@ -84,17 +90,19 @@ func (n *Notifier) postWebhook(ctx context.Context, w config.AlertWebhook, ev Ev
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSpace(w.URL), bytes.NewReader(b))
 		if err != nil {
-			return err
+			return redactErr(err, w.URL)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", "supavise-alerts")
 		req.Header.Set(EventHeader, ev.Kind)
 		if w.Secret != "" {
-			req.Header.Set(SignatureHeader, Sign(w.Secret, b))
+			ts := n.now().Unix()
+			req.Header.Set(TimestampHeader, strconv.FormatInt(ts, 10))
+			req.Header.Set(SignatureHeader, Sign(w.Secret, ts, b))
 		}
 		resp, err := n.http.Do(req)
 		if err != nil {
-			last = err
+			last = redactErr(err, w.URL)
 			continue
 		}
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
@@ -123,6 +131,17 @@ func redactURL(raw string) string {
 		return raw[:i+3] + rest
 	}
 	return "webhook"
+}
+
+// redactErr strips the address from an error of the HTTP client. The client's error text is
+// `Post "<url>": <cause>` with the whole URL, secret path included; this one names the webhook the
+// way redactURL does.
+func redactErr(err error, raw string) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return fmt.Errorf("%s: %w", redactURL(raw), uerr.Err)
+	}
+	return err
 }
 
 // sendMail sends one message through the [mail] relay: STARTTLS when the server offers it

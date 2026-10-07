@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -107,13 +109,22 @@ func TestWebhookBodyAndSignature(t *testing.T) {
 	if head.Get("Content-Type") != "application/json" || head.Get(EventHeader) != "disk_low" {
 		t.Errorf("headers %v", head)
 	}
+	// The signature covers "<timestamp>.<body>", so a captured request cannot be replayed later.
+	ts := head.Get(TimestampHeader)
+	if ts != fmt.Sprint(clk.now().Unix()) {
+		t.Errorf("timestamp %q, want %d", ts, clk.now().Unix())
+	}
 	m := hmac.New(sha256.New, []byte("s3cret"))
+	m.Write([]byte(ts + "."))
 	m.Write(raw)
 	if want := "sha256=" + hex.EncodeToString(m.Sum(nil)); head.Get(SignatureHeader) != want {
 		t.Errorf("signature %q, want %q", head.Get(SignatureHeader), want)
 	}
-	if Sign("s3cret", raw) != head.Get(SignatureHeader) {
+	if Sign("s3cret", clk.now().Unix(), raw) != head.Get(SignatureHeader) {
 		t.Error("Sign disagrees with the header")
+	}
+	if Sign("s3cret", clk.now().Unix()+1, raw) == head.Get(SignatureHeader) {
+		t.Error("the signature does not depend on the timestamp")
 	}
 }
 
@@ -123,8 +134,8 @@ func TestUnsignedWebhookHasNoSignatureHeader(t *testing.T) {
 	if err := n.Notify(context.Background(), Event{Kind: KindDiskLow, Title: "t"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, head, _ := s.last(t); head.Get(SignatureHeader) != "" {
-		t.Errorf("an unsigned webhook carries %q", head.Get(SignatureHeader))
+	if _, head, _ := s.last(t); head.Get(SignatureHeader) != "" || head.Get(TimestampHeader) != "" {
+		t.Errorf("an unsigned webhook carries %q %q", head.Get(SignatureHeader), head.Get(TimestampHeader))
 	}
 }
 
@@ -643,3 +654,182 @@ func TestStandingConditionIsLoggedOncePerRepeatInterval(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// Chat services keep the secret of a webhook in its path or query, and Go's HTTP client puts the
+// whole URL in its error text. None of it may reach a log line, Notify's error, or the results
+// `supavise alerts test` prints.
+func TestAFailedWebhookNeverShowsItsSecretPath(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	hook := dead.URL + "/services/T0000/B0000/SECRETPATHPART?token=SECRETQUERYPART"
+	dead.Close() // nothing listens there any more: the connection is refused
+
+	var buf strings.Builder
+	var mu sync.Mutex
+	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) { mu.Lock(); defer mu.Unlock(); return buf.Write(p) }), nil))
+	n := New(testCfg(t, config.AlertWebhook{URL: hook}), Options{Log: log})
+
+	err := n.Notify(context.Background(), Event{Kind: KindDiskLow, Title: "Disk space is low"})
+	if err == nil {
+		t.Fatal("an unreachable webhook returned no error")
+	}
+	res, terr := n.Test(context.Background())
+	if terr != nil || len(res) != 1 || res[0].Err == nil {
+		t.Fatalf("test results: %+v %v", res, terr)
+	}
+	mu.Lock()
+	logged := buf.String()
+	mu.Unlock()
+	for name, text := range map[string]string{"log": logged, "Notify error": err.Error(), "Test result": res[0].Err.Error()} {
+		if strings.Contains(text, "SECRET") || strings.Contains(text, "/services/") {
+			t.Errorf("the %s shows the secret part of the address: %s", name, text)
+		}
+		if !strings.Contains(text, "connection refused") && !strings.Contains(text, "refused") {
+			t.Errorf("the %s lost the cause: %s", name, text)
+		}
+	}
+
+	// A malformed address fails before any request, with the same care.
+	bad := New(testCfg(t, config.AlertWebhook{URL: "http://exa mple.com/SECRETPATHPART"}), Options{Log: log})
+	if err := bad.Notify(context.Background(), Event{Kind: KindDiskLow, Title: "t"}); err == nil || strings.Contains(err.Error(), "SECRET") {
+		t.Errorf("malformed address: %v", err)
+	}
+}
+
+// The state is locked while the decision is made, not while a slow destination answers: a
+// second process (the daemon's checker beside an upgrade) must neither wait for it nor send the
+// same alert again.
+func TestNotifyDoesNotHoldTheStateWhileDelivering(t *testing.T) {
+	var n2 *Notifier
+	inHandler := make(chan struct{})
+	release := make(chan struct{})
+	var other, duplicate error
+	var calls sync.Mutex
+	count := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Lock()
+		count++
+		first := count == 1
+		calls.Unlock()
+		if first {
+			close(inHandler)
+			<-release
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	cfg := testCfg(t, config.AlertWebhook{URL: srv.URL})
+	n1 := New(cfg, Options{})
+	n2 = New(cfg, Options{}) // another process: its own store, the same files
+
+	done := make(chan error, 1)
+	go func() { done <- n1.Notify(context.Background(), Event{Kind: KindDiskLow, Title: "Disk space is low"}) }()
+	<-inHandler // the first delivery is in flight
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		// A different problem is recorded and sent meanwhile.
+		other = n2.Notify(context.Background(), Event{Kind: KindUpgradeFailed, Title: "Upgrade failed"})
+		// The same problem is a duplicate: the first call has reserved it.
+		duplicate = n2.Notify(context.Background(), Event{Kind: KindDiskLow, Title: "Disk space is low"})
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("a second Notify waited for the first one's delivery")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if other != nil || duplicate != nil {
+		t.Errorf("second process: %v, %v", other, duplicate)
+	}
+	calls.Lock()
+	defer calls.Unlock()
+	if count != 2 {
+		t.Errorf("%d deliveries, want 2 (the disk alert once, the upgrade failure once)", count)
+	}
+	if act, _ := n2.Active(); len(act) != 1 {
+		t.Errorf("active %+v", act)
+	}
+}
+
+// A delivery that fails everywhere gives its reservation back, hourly slot included.
+func TestFailedDeliveryGivesBackTheReservation(t *testing.T) {
+	s := newSink(t)
+	s.setStatus(400)
+	cfg := testCfg(t, config.AlertWebhook{URL: s.srv.URL})
+	cfg.Alerts.MaxPerHour = 1
+	n := New(cfg, Options{})
+	ctx := context.Background()
+	if err := n.Notify(ctx, Event{Kind: KindDiskLow, Title: "t"}); err == nil {
+		t.Fatal("no error")
+	}
+	st, _ := n.st.snapshot()
+	if len(st.Sent) != 0 || len(st.Active) != 0 {
+		t.Fatalf("the failed delivery left %+v", st)
+	}
+	s.setStatus(200)
+	if err := n.Notify(ctx, Event{Kind: KindDiskLow, Title: "t"}); err != nil || s.count() != 2 {
+		t.Errorf("the slot was not given back: %v, %d requests", err, s.count())
+	}
+}
+
+// A burst of conditions must not swallow the message that says an upgrade failed.
+func TestHourlyCapDoesNotHoldBackCriticalAlertsOrTheUpgradesOwnEvents(t *testing.T) {
+	s := newSink(t)
+	cfg := testCfg(t, config.AlertWebhook{URL: s.srv.URL})
+	cfg.Alerts.MaxPerHour = 2
+	n := New(cfg, Options{Now: newClock().now})
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		_ = n.Notify(ctx, Event{Kind: KindBackupFailed, Ref: fmt.Sprint("p", i), Title: "t"})
+	}
+	_ = n.Notify(ctx, Event{Kind: KindBackupFailed, Ref: "p3", Title: "t"}) // held
+	if s.count() != 2 {
+		t.Fatalf("%d sent under a cap of 2", s.count())
+	}
+	_ = n.Notify(ctx, Event{Kind: KindUpgradeFailed, Severity: SeverityCritical, Title: "Upgrade failed"})
+	_ = n.Notify(ctx, Event{Kind: KindUpgradeSucceeded, Severity: SeverityInfo, Title: "Upgraded"})
+	_ = n.Notify(ctx, Event{Kind: KindDiskLow, Severity: SeverityCritical, Title: "Disk"})
+	if s.count() != 5 {
+		t.Errorf("%d sent, want 5: an upgrade event or a critical alert was held back", s.count())
+	}
+}
+
+// `sudo supavise upgrade` raises events as root. The files it creates go to the owner of the
+// state directory, or the daemon would be locked out of the alert state.
+func TestRootHandsTheStateFilesToTheStateOwner(t *testing.T) {
+	var chowned []string
+	oldE, oldC := geteuid, lchown
+	geteuid = func() int { return 0 }
+	lchown = func(path string, uid, gid int) error { chowned = append(chowned, filepath.Base(path)); return nil }
+	defer func() { geteuid, lchown = oldE, oldC }()
+
+	s := newSink(t)
+	cfg := testCfg(t, config.AlertWebhook{URL: s.srv.URL})
+	if err := os.MkdirAll(filepath.Join(cfg.StateDir, "system"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	n := New(cfg, Options{})
+	if err := n.Notify(context.Background(), Event{Kind: KindDiskLow, Title: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	hasLock, hasTemp := false, false
+	for _, c := range chowned {
+		hasLock = hasLock || c == "alerts.json.lock"
+		hasTemp = hasTemp || strings.HasPrefix(c, ".alerts.")
+	}
+	// A test run by an ordinary user owns the directory; root-owned directories are left alone.
+	if os.Getuid() != 0 && (!hasLock || !hasTemp) {
+		t.Errorf("chowned %v: want the lock file and the new state file", chowned)
+	}
+
+	chowned = nil
+	geteuid = func() int { return 1000 }
+	if err := n.Notify(context.Background(), Event{Kind: KindBackupFailed, Title: "t"}); err != nil || len(chowned) != 0 {
+		t.Errorf("an ordinary user chowned %v (%v)", chowned, err)
+	}
+}

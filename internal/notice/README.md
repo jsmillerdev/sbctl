@@ -1,8 +1,8 @@
 # internal/notice
 
-What the operator tells the dashboard's users: a maintenance window announced with `supavise maintenance announce`, and the marker an upgrade writes while it runs. The proxy turns the active ones into the answer of Studio's `/api/incident-banner`; `supavise status` shows them to the operator.
+What the operator tells the dashboard's users: a maintenance window announced with `supavise maintenance announce`, and the marker an upgrade writes while it runs. `supavise status` and `/healthz/detail` show them to the operator; the Studio banner does not (see The banner).
 
-Both live in small JSON files under `<state_dir>/system/` (0644, written atomically), so the answer needs neither the registry nor the daemon's memory, and a file the CLI writes is seen by the next request.
+Both live in small JSON files under `<state_dir>/system/` (0644, written atomically), so a reader needs neither the registry nor the daemon's memory, and a file the CLI writes is seen by the next read.
 
 | File | Writer | Content |
 |---|---|---|
@@ -13,12 +13,12 @@ An upgrade counts as running while `phase` is not a finished one (`done`, `compl
 
 ## The banner
 
-`Banner(paths, now)` returns the notices to show; `BannerJSON` renders `{"incidents":[...]}`. Each incident has the three fields Studio reads at the pinned tag (`apps/studio/data/platform/incident-banner-query.ts`): `id` (what Studio stores when a user dismisses the banner, so every announcement and every upgrade has its own), `show_banner: "force"` and `metadata` with `force: true`, `affected_regions: null` and `affects_project_creation: false`. `force` shows the banner to everyone, including users with no project, whatever their regions. The incident also carries `kind` (`maintenance` or `upgrade`), `title`, `message`, `starts_at` and `ends_at` for anything else that reads the answer.
+`BannerJSON()` is the answer of `/api/incident-banner`, and it is `{"incidents":[]}` always. This Studio build has no feature flags (ConfigCat is not configured), so it draws the legacy banner for any incident: a fixed title ("We are investigating a technical issue", or "Project creation may be impacted in some regions" to a user with no project) and a link to Supabase's status page. It takes no text from the answer. Planned maintenance and an upgrade the operator started would read as an unexplained outage, so they are not sent.
 
-A maintenance window shows while it is open, and from `lead_seconds` before it opens when the operator gave `--notice`. An update that is merely available is never shown here: the dashboard's users cannot act on it, and the operator hears about it through `supavise status` and the alerts.
+Hosted shows maintenance through the incident.io status page (`StatusBanner`, kinds incident, maintenance and upcoming maintenance, with title and times) behind the `incidentIoStatusPage` flag. Showing the operator's own words here needs either a Studio patch that reads `title` and `message` from the incident, or serving that status page route with the flag on. Until one of them exists, the notices reach the operator through `supavise status`, `/healthz/detail` and the alerts.
 
-**Studio draws its own text.** This Studio build has no feature flags (ConfigCat is not configured), so it uses the older banner, which takes only the incident list from the answer and shows a fixed title ("We are investigating a technical issue", or "Project creation may be impacted in some regions" to a user with no project) with a link to Supabase's status page. The announcement's message is in the answer and in `supavise status`, but Studio does not display it. Showing the operator's own words needs a change in Studio: a fourth patch that reads `title` and `message` from the incident, or serving the incident.io status page route together with the `incidentIoStatusPage` flag. That is why `--notice` defaults to 0: a banner that says "technical issue" a day before planned work would mislead.
+`Banner(paths, now)` and `IncidentsJSON` compute what to serve then: the announced maintenance while its banner is active (from `lead_seconds` before it opens when the operator gave `--notice`), and an upgrade that is running. Each incident has the three fields Studio reads at the pinned tag (`apps/studio/data/platform/incident-banner-query.ts`): `id` (what Studio stores when a user dismisses the banner, so every announcement and every upgrade has its own), `show_banner: "force"` and `metadata` with `force: true`, `affected_regions: null` and `affects_project_creation: false`, plus `kind`, `title`, `message`, `starts_at` and `ends_at`. An update that is merely available is never listed: the dashboard's users cannot act on it.
 
 ## Tests
 
-`go test ./internal/notice/ ./internal/proxy/`: validation of an announcement, the window rules, the file round trip, which upgrade phases count as running, tolerant reads, the answer's shape against what Studio reads, an update never appearing, and the proxy answering with the files of its state directory without a restart.
+`go test ./internal/notice/ ./internal/proxy/`: validation of an announcement, the window rules, the file round trip, which upgrade phases count as running, tolerant reads, the shape of the incidents against what Studio reads, an update never appearing, and the proxy's answer staying empty.

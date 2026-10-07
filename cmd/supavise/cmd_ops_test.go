@@ -80,7 +80,7 @@ func TestMaintenanceAnnounceShowClear(t *testing.T) {
 		t.Fatalf("show: %q %v", out, err)
 	}
 	out, err := runRoot(t, "--config", cfg, "maintenance", "announce", "--at", start, "--duration", "90m", "--notice", "24h", "--message", "Database upgrade")
-	if err != nil || !strings.Contains(out, "announced:") || !strings.Contains(out, "banner 24h0m0s ahead") {
+	if err != nil || !strings.Contains(out, "announced:") || !strings.Contains(out, "notice 24h0m0s ahead") {
 		t.Fatalf("announce: %q %v", out, err)
 	}
 	b, err := os.ReadFile(filepath.Join(state, "system", "maintenance.json"))
@@ -99,7 +99,7 @@ func TestMaintenanceAnnounceShowClear(t *testing.T) {
 	if m.Message != "Database upgrade" || m.EndsAt.Sub(m.StartsAt) != 90*time.Minute || m.LeadSeconds != 86400 {
 		t.Errorf("%+v", m)
 	}
-	if out, err := runRoot(t, "--config", cfg, "maintenance", "show"); err != nil || !strings.Contains(out, "banner showing") {
+	if out, err := runRoot(t, "--config", cfg, "maintenance", "show"); err != nil || !strings.Contains(out, "notice period") {
 		t.Errorf("show: %q %v", out, err)
 	}
 	if out, err := runRoot(t, "--config", cfg, "maintenance", "clear"); err != nil || strings.TrimSpace(out) != "cleared" {

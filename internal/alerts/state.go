@@ -3,6 +3,7 @@ package alerts
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -58,6 +59,9 @@ func (s *store) update(fn func(*state) error) error {
 		return err
 	}
 	defer lock.Close()
+	if err := s.handOver(lock.Name()); err != nil {
+		return err
+	}
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
@@ -79,6 +83,35 @@ func (s *store) snapshot() (*state, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.read()
+}
+
+// Replaced by tests.
+var (
+	geteuid = os.Geteuid
+	lchown  = os.Lchown
+)
+
+// handOver gives path to the owner of <state_dir>/system when root made it. `sudo supavise
+// upgrade` raises events as root, and a state or lock file that root creates and keeps would
+// lock the daemon (the supavise user) out of the alert state for good: every later Notify would
+// fail on permissions and no alert would be delivered. A run by the supavise user itself needs
+// nothing.
+func (s *store) handOver(path string) error {
+	if geteuid() != 0 {
+		return nil
+	}
+	fi, err := os.Stat(filepath.Dir(s.path))
+	if err != nil {
+		return nil // no directory to take an owner from
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid == 0 {
+		return nil
+	}
+	if err := lchown(path, int(st.Uid), int(st.Gid)); err != nil {
+		return fmt.Errorf("alerts: cannot give %s to the owner of the state directory: %w", path, err)
+	}
+	return nil
 }
 
 func (s *store) read() (*state, error) {
@@ -111,6 +144,10 @@ func (s *store) write(st *state) error {
 	}
 	defer os.Remove(tmp.Name())
 	if err := tmp.Chmod(0o640); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := s.handOver(tmp.Name()); err != nil {
 		tmp.Close()
 		return err
 	}

@@ -1,7 +1,7 @@
 // Package notice holds what the operator tells the dashboard's users: a maintenance window
 // announced with `supavise maintenance announce`, and the marker an upgrade writes while it
-// runs. The proxy turns the active ones into the answer of Studio's /api/incident-banner;
-// `supavise status` shows them to the operator.
+// runs. `supavise status` and /healthz/detail show them to the operator. They are not sent to
+// Studio's /api/incident-banner yet (see BannerJSON).
 //
 // Both live in small JSON files under <state_dir>/system/, so the answer needs neither the
 // registry nor the daemon's memory, and a file written by the CLI is seen by the next request.

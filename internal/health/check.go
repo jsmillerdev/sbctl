@@ -331,7 +331,7 @@ func (d *Deps) backupFreshness(ctx context.Context, p *registry.Project) *Backup
 	if err != nil {
 		return &BackupResult{Note: "could not read the backup list: " + shorten(err.Error())}
 	}
-	return freshness(rows, p.CreatedAt, d.now(), d.Cfg.Health.BackupStale())
+	return freshness(rows, p.CreatedAt, d.now(), d.Cfg.BackupStale())
 }
 
 // freshness judges rows (newest first) at now.
@@ -384,7 +384,7 @@ func (d *Deps) systemBackup(ctx context.Context, p registry.Project) *Component 
 // checkLocal looks at this machine and the node's own files: disk, certificates, the
 // master key's copy, the update record and the notices.
 func (d *Deps) checkLocal(ctx context.Context) []Component {
-	out := []Component{d.checkDisk(), d.checkCertificates()}
+	out := []Component{d.checkDisk(), d.checkCertificates(ctx)}
 	if c := d.checkEscrow(ctx); c != nil {
 		out = append(out, *c)
 	}

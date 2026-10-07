@@ -263,7 +263,7 @@ func TestManyUnhealthyProjectsAreOneAlert(t *testing.T) {
 	}
 }
 
-func TestNothingIsRaisedOrResolvedDuringAnUpgradeOrAMaintenanceWindow(t *testing.T) {
+func TestProjectsAreNotJudgedDuringAnUpgradeOrAMaintenanceWindow(t *testing.T) {
 	r := newRig(t)
 	r.report.Projects[0].Services = []health.ServiceResult{{Name: "postgres", OK: false, Error: "down"}}
 	up := notice.Upgrade{Phase: "rollout", From: "v1", To: "v2", StartedAt: r.clk.now()}
@@ -447,4 +447,38 @@ func githubAPI(t *testing.T, tag string, status int) *httptest.Server {
 	}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// The disk is most likely to run out while an upgrade takes its fresh backups, and a failed
+// backup matters most then; only what the window restarts is held back.
+func TestDiskAndBackupsAreStillRaisedDuringAnUpgradeAndNotResolvedEarly(t *testing.T) {
+	r := newRig(t)
+	r.report.Projects[0].Services = []health.ServiceResult{{Name: "postgres", OK: false, Error: "down"}}
+	r.report.Projects[1].Backup = &health.BackupResult{LastFailed: "no space left on device"}
+	r.setComponent("disk", health.Warn, "4% free")
+	r.setComponent("system backup", health.Warn, "no completed backup")
+	b, _ := json.Marshal(notice.Upgrade{Phase: "backup", From: "v1", To: "v2", StartedAt: r.clk.now()})
+	if err := os.MkdirAll(filepath.Join(r.cfg.StateDir, "system"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(r.cfg.StateDir, "system", "upgrade.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		r.cycle()
+	}
+	kinds := map[string]int{}
+	for _, w := range r.sent() {
+		kinds[w.Kind]++
+	}
+	if kinds[KindDiskLow] != 1 || kinds[KindBackupFailed] != 2 || kinds[KindProjectUnhealthy] != 0 || len(kinds) != 2 {
+		t.Errorf("during the upgrade: %v", kinds)
+	}
+	// The disk recovers while the upgrade still runs: that is told. The project is not resolved or raised.
+	r.setComponent("disk", health.OK, "40% free")
+	r.cycle()
+	got := r.sent()
+	if last := got[len(got)-1]; last.Kind != KindDiskLow || !last.Resolved {
+		t.Errorf("disk recovery during the upgrade: %+v", last)
+	}
 }

@@ -169,7 +169,7 @@ func decode(t *testing.T, b []byte) []map[string]any {
 
 func TestBannerIsEmptyWhenThereIsNothingToSay(t *testing.T) {
 	p := paths(t)
-	if got := string(BannerJSON(p, t0)); got != `{"incidents":[]}`+"\n" {
+	if got := string(IncidentsJSON(p, t0)); got != `{"incidents":[]}`+"\n" {
 		t.Errorf("%q", got)
 	}
 }
@@ -181,7 +181,7 @@ func TestBannerShapeMatchesWhatStudioReads(t *testing.T) {
 	if _, err := WriteMaintenance(p, Maintenance{Message: "Storage maintenance", StartsAt: t0, EndsAt: t0.Add(time.Hour)}, t0.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	inc := decode(t, BannerJSON(p, t0.Add(time.Minute)))
+	inc := decode(t, IncidentsJSON(p, t0.Add(time.Minute)))
 	if len(inc) != 1 {
 		t.Fatalf("%v", inc)
 	}
@@ -209,21 +209,21 @@ func TestBannerShowsMaintenanceOnlyWhileItsBannerIsActive(t *testing.T) {
 	if _, err := WriteMaintenance(p, Maintenance{Message: "later", StartsAt: t0.Add(48 * time.Hour), EndsAt: t0.Add(50 * time.Hour)}, t0); err != nil {
 		t.Fatal(err)
 	}
-	if got := decode(t, BannerJSON(p, t0)); len(got) != 0 {
+	if got := decode(t, IncidentsJSON(p, t0)); len(got) != 0 {
 		t.Errorf("a window two days away shows a banner by default: %v", got)
 	}
 	// With a notice lead the banner comes early, titled as scheduled.
 	if _, err := WriteMaintenance(p, Maintenance{Message: "later", StartsAt: t0.Add(48 * time.Hour), EndsAt: t0.Add(50 * time.Hour), LeadSeconds: 24 * 3600}, t0); err != nil {
 		t.Fatal(err)
 	}
-	if got := decode(t, BannerJSON(p, t0)); len(got) != 0 {
+	if got := decode(t, IncidentsJSON(p, t0)); len(got) != 0 {
 		t.Errorf("too early: %v", got)
 	}
-	got := decode(t, BannerJSON(p, t0.Add(30*time.Hour)))
+	got := decode(t, IncidentsJSON(p, t0.Add(30*time.Hour)))
 	if len(got) != 1 || got[0]["title"] != "Scheduled maintenance" {
 		t.Errorf("%v", got)
 	}
-	if got := decode(t, BannerJSON(p, t0.Add(51*time.Hour))); len(got) != 0 {
+	if got := decode(t, IncidentsJSON(p, t0.Add(51*time.Hour))); len(got) != 0 {
 		t.Errorf("a finished window still shows: %v", got)
 	}
 }
@@ -231,7 +231,7 @@ func TestBannerShowsMaintenanceOnlyWhileItsBannerIsActive(t *testing.T) {
 func TestBannerShowsARunningUpgradeAndBoth(t *testing.T) {
 	p := paths(t)
 	writeUpgrade(t, p, Upgrade{Phase: "rollout", From: "v1.0.0", To: "v1.1.0", StartedAt: t0})
-	got := decode(t, BannerJSON(p, t0.Add(time.Minute)))
+	got := decode(t, IncidentsJSON(p, t0.Add(time.Minute)))
 	if len(got) != 1 || got[0]["kind"] != "upgrade" || got[0]["title"] != "Upgrade in progress" || !strings.Contains(got[0]["message"].(string), "v1.1.0") {
 		t.Fatalf("%v", got)
 	}
@@ -239,17 +239,17 @@ func TestBannerShowsARunningUpgradeAndBoth(t *testing.T) {
 	if _, err := WriteMaintenance(p, Maintenance{Message: "m", StartsAt: t0, EndsAt: t0.Add(time.Hour)}, t0); err != nil {
 		t.Fatal(err)
 	}
-	both := decode(t, BannerJSON(p, t0.Add(time.Minute)))
+	both := decode(t, IncidentsJSON(p, t0.Add(time.Minute)))
 	if len(both) != 2 || both[0]["id"] == both[1]["id"] {
 		t.Errorf("%v", both)
 	}
 	// A second upgrade is a new banner for a user who dismissed the first.
 	writeUpgrade(t, p, Upgrade{Phase: "rollout", From: "v1.1.0", To: "v1.2.0", StartedAt: t0.Add(24 * time.Hour)})
-	if again := decode(t, BannerJSON(p, t0.Add(24*time.Hour+time.Minute))); again[0]["id"] == idA {
+	if again := decode(t, IncidentsJSON(p, t0.Add(24*time.Hour+time.Minute))); again[0]["id"] == idA {
 		t.Error("two upgrades share a banner ID")
 	}
 	writeUpgrade(t, p, Upgrade{Phase: "done", From: "v1.1.0", To: "v1.2.0", StartedAt: t0.Add(24 * time.Hour)})
-	for _, i := range decode(t, BannerJSON(p, t0.Add(24*time.Hour+time.Minute))) {
+	for _, i := range decode(t, IncidentsJSON(p, t0.Add(24*time.Hour+time.Minute))) {
 		if i["kind"] == "upgrade" {
 			t.Error("a finished upgrade still shows")
 		}
@@ -266,7 +266,23 @@ func TestBannerNeverMentionsAnAvailableUpdate(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(p.Root, "system", "update.json"), []byte(`{"latest":"v9.0.0","available":true}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(BannerJSON(p, t0)); got != `{"incidents":[]}`+"\n" {
+	if got := string(IncidentsJSON(p, t0)); got != `{"incidents":[]}`+"\n" {
 		t.Errorf("an available update reached the dashboard: %s", got)
+	}
+}
+
+// Studio would draw an announced window or a running upgrade as "We are investigating a
+// technical issue" with a link to Supabase's status page, so the served answer stays empty.
+func TestServedBannerStaysEmptyWhileStudioCannotShowOurWords(t *testing.T) {
+	p := paths(t)
+	if _, err := WriteMaintenance(p, Maintenance{Message: "m", StartsAt: t0, EndsAt: t0.Add(time.Hour)}, t0); err != nil {
+		t.Fatal(err)
+	}
+	writeUpgrade(t, p, Upgrade{Phase: "rollout", From: "v1.0.0", To: "v1.1.0", StartedAt: t0})
+	if len(Banner(p, t0.Add(time.Minute))) != 2 {
+		t.Fatal("the notices themselves are still computed")
+	}
+	if got := string(BannerJSON()); got != `{"incidents":[]}`+"\n" {
+		t.Errorf("%q", got)
 	}
 }

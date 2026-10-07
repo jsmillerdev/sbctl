@@ -28,17 +28,19 @@ Other parts of the node raise `upgrade_started`, `upgrade_succeeded` and `upgrad
 
 - A condition has a key (`Event.Key`, by default `Kind/Ref`). The same key is not sent again until `[alerts] repeat_hours` (12) have passed since it was last sent; then it is a reminder.
 - `Event{Resolved: true, Key: ...}` sends a recovery, once, and only for a problem that was sent. The checker sends one when a condition clears, including after a daemon restart (the state is on disk).
-- At most `[alerts] max_per_hour` (20) notifications go out in any hour, whatever their kind. An alert held back by the cap is counted once however often it is asked again, and the next notification that goes out says how many were held back.
+- At most `[alerts] max_per_hour` (20) notifications go out in any hour. A critical alert and the `upgrade_*` events ignore the cap, so a burst of conditions cannot swallow the message that says an upgrade failed. Any other alert held back by the cap is counted once however often it is asked again, and the next notification that goes out says how many were held back.
 - A notification that fails at every destination is not recorded as sent, so the next check sends it. One working destination is enough to count it as sent; the others' failures are logged.
 - `min_severity` drops what is below it (`info`, `warning`, `critical`; default `info`).
 
-The state is `<state_dir>/system/alerts.json`, guarded by a file lock so the daemon and a CLI run never both decide to send the same alert. It is a file and not the registry because the alerts that matter most are about the system cluster that holds the registry.
+The state is `<state_dir>/system/alerts.json`, guarded by a file lock so the daemon and a CLI run never both decide to send the same alert. The lock is held while the decision is recorded and again if a delivery has to be undone, not while the message travels (a webhook retry and SMTP can take 40 seconds): the decision reserves the notification, so a second process that asks meanwhile sees a duplicate, and a delivery that fails everywhere gives the reservation back.
+
+**Root and the supavise user.** `sudo supavise upgrade` raises events as root, and the daemon runs as the `supavise` user. When the effective user is root, the state file and the lock file go to the owner of `<state_dir>/system` (the same rule as `internal/artifacts`), so a root run never leaves files the daemon cannot open. A command that calls `alerts.Configure` and `Notify` needs nothing else; the lead's merge wiring should not hand events to the daemon over another channel. It is a file and not the registry because the alerts that matter most are about the system cluster that holds the registry.
 
 ## The checker
 
 `Checker.Run` runs in the daemon. Thirty seconds after start, then every `[alerts] check_interval_seconds` (60), it takes a fresh `health.Report` and derives the conditions above. A condition has to last `[alerts] unhealthy_after_seconds` (180) before it is sent, so a project that restarts, or a node that is mid-upgrade, pages nobody. More than five unhealthy projects at once are one alert ("Many projects are not healthy") that lists the first ten. A shared service that cannot be reached is reported once, as itself, not once per project.
 
-While an upgrade runs (`<state_dir>/system/upgrade.json`, see `internal/notice`) or an announced maintenance window is open, the checker raises and resolves nothing: the operator caused that downtime, and the upgrade reports its own events. The debounce starts over when the window ends.
+While an upgrade runs (`<state_dir>/system/upgrade.json`, see `internal/notice`) or an announced maintenance window is open, the checker raises and resolves no `project_unhealthy` and no `node_unhealthy`: the operator caused that downtime, and the upgrade reports its own events. It still raises and resolves `disk_low` (an upgrade takes fresh backups, so the disk is most likely to fill then), `backup_failed` and `certificate_expiring`. The debounce of what was held back starts over when the window ends.
 
 **Updates.** Once a day (`[update] check_interval`, read by `internal/health`) the checker calls `health.CheckUpdate`, which records the newest release in `update.json`. A release the operator was not told about raises `update_available` once, with the next step (`supavise upgrade --check`); the record keeps the version so it is not sent twice. With no destination configured nothing is sent and the version stays unannounced until one is. Nothing about an available update reaches the dashboard.
 
@@ -71,14 +73,15 @@ secret = "a long random string"                    # optional: signs the body
  "text":"[warning] example.com: Disk space is low\n8% free ..."}
 ```
 
-`text` is a ready sentence, so Slack, Mattermost and Rocket.Chat incoming webhooks show it as the message. The headers are `Content-Type: application/json`, `X-Supavise-Event: <kind>` and, with a `secret`, `X-Supavise-Signature: sha256=<hex>`, the HMAC-SHA256 of the raw body under the secret. A receiver checks it like this:
+`text` is a ready sentence, so Slack, Mattermost and Rocket.Chat incoming webhooks show it as the message. The headers are `Content-Type: application/json`, `X-Supavise-Event: <kind>` and, with a `secret`, `X-Supavise-Timestamp: <unix seconds>` and `X-Supavise-Signature: sha256=<hex>`, the HMAC-SHA256 under the secret of the timestamp, a dot and the raw body (the scheme Stripe uses). A receiver checks both:
 
 ```python
-expected = "sha256=" + hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
-ok = hmac.compare_digest(expected, request.headers["X-Supavise-Signature"])
+ts = request.headers["X-Supavise-Timestamp"]
+expected = "sha256=" + hmac.new(secret, ts.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(expected, request.headers["X-Supavise-Signature"]) and abs(time.time() - int(ts)) < 300
 ```
 
-`time` is inside the signed body, so a receiver can reject an old replay. A 5xx or 429 answer is retried once after two seconds; any other non-2xx answer is a failure. Logs and errors name a webhook by scheme and host only, because chat services keep their secret in the path.
+The timestamp is signed, so a receiver can refuse a captured request that is replayed outside a tolerance window (five minutes above); a retry after a 5xx carries a fresh timestamp. A 5xx or 429 answer is retried once after two seconds; any other non-2xx answer is a failure. Logs, errors and the results of `supavise alerts test` name a webhook by scheme and host only, because chat services keep their secret in the path or query; the HTTP client's own error text, which carries the whole URL, is rewritten before it is stored.
 
 **Email.** A plain-text message through the `[mail]` relay (STARTTLS when the server offers it, implicit TLS on port 465, PLAIN authentication when `smtp_user` is set). The subject is `[Supavise] <severity>: <node>: <title>`; line breaks in any header value are removed.
 
@@ -95,4 +98,4 @@ supavise alerts list    # the alerts that were sent and are not resolved
 go test ./internal/alerts/
 ```
 
-`httptest` endpoints for the webhook body, headers, signature (checked against an independent HMAC) and retry; a fake SMTP server for the mail path; a clock the tests move for the repeat interval, the hourly cap and the cap's count of held alerts; state shared between two notifiers; recovery after a restart; the checker's debounce, flap handling, grouping, the unreachable-service rule, the quiet period during an upgrade or a maintenance window, and `update_available` once per version against a fake GitHub API.
+`httptest` endpoints for the webhook body, headers, signature (checked against an independent HMAC) and retry; a fake SMTP server for the mail path; a clock the tests move for the repeat interval, the hourly cap (and what it never holds back) and the cap's count of held alerts; a webhook that is unreachable, with a secret path that must appear in no log line or error; a second notifier that must not wait for a slow delivery; root handing the state files to the state owner; state shared between two notifiers; recovery after a restart; the checker's debounce, flap handling, grouping, the unreachable-service rule, the quiet period during an upgrade or a maintenance window, and `update_available` once per version against a fake GitHub API.

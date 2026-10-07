@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,8 +20,10 @@ import (
 // an upgrade must not page anyone), and one that clears is sent as resolved. Once a day it also
 // asks for the newest release and raises update_available once per version.
 //
-// While an upgrade runs or a maintenance window is open the checker raises and resolves
-// nothing: the operator caused that downtime, and the upgrade reports its own events.
+// While an upgrade runs or a maintenance window is open the checker raises and resolves no
+// project_unhealthy or node_unhealthy: the operator caused that downtime, and the upgrade
+// reports its own events. A disk running out (an upgrade takes fresh backups first), a backup
+// that fails and a certificate that does not renew are still raised.
 type Checker struct {
 	Notifier *Notifier
 	// Report returns the current health of the node (health.Monitor.Fresh).
@@ -85,26 +88,30 @@ func owned(kind string) bool {
 	return false
 }
 
+// restartedByWindow are the kinds a window the operator opened is expected to cause.
+func restartedByWindow(kind string) bool {
+	return kind == KindProjectUnhealthy || kind == KindNodeUnhealthy
+}
+
 // Once runs one check: conditions first, then the update check when it is due.
 func (c *Checker) Once(ctx context.Context) {
 	now := c.now()
 	c.checkUpdate(ctx, now)
 
 	paths := c.Cfg.Paths()
-	if _, running := notice.UpgradeRunning(paths, now); running {
-		c.firstSeen = nil
-		return
-	}
-	if m, err := notice.ReadMaintenance(paths); err == nil && m != nil && m.InProgress(now) {
-		c.firstSeen = nil
-		return
-	}
+	_, upgrading := notice.UpgradeRunning(paths, now)
+	m, merr := notice.ReadMaintenance(paths)
+	quiet := upgrading || (merr == nil && m != nil && m.InProgress(now))
 	rep, err := c.Report(ctx)
 	if err != nil {
 		c.log().Warn("alert check: no health report", "error", err)
 		return
 	}
 	conds := conditionsOf(rep)
+	if quiet {
+		// What the window restarts is not judged, and its debounce starts over when it ends.
+		conds = slices.DeleteFunc(conds, func(cd condition) bool { return restartedByWindow(cd.kind) })
+	}
 	debounce := c.Cfg.Alerts.Debounce()
 	if c.firstSeen == nil {
 		c.firstSeen = map[string]time.Time{}
@@ -136,7 +143,7 @@ func (c *Checker) Once(ctx context.Context) {
 		return
 	}
 	for key, a := range active {
-		if !owned(a.Kind) || current[key] {
+		if !owned(a.Kind) || current[key] || (quiet && restartedByWindow(a.Kind)) {
 			continue
 		}
 		ev := Event{Kind: a.Kind, Severity: a.Severity, Ref: a.Ref, Key: key, Title: a.Title, Resolved: true,
