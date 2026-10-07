@@ -153,6 +153,12 @@ func TestInstallTemplates(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(p, "50-sbctl.rules")); err != nil {
 		t.Fatal(err)
 	}
+	// The daemon starts these through D-Bus; a missing file is "Unit not found" at runtime.
+	for _, name := range []string{"sb-basebackup@.timer", "sb-basebackup-prune.timer", "sb-basebackup@.service", "sb-basebackup-prune.service"} {
+		if _, err := os.Stat(filepath.Join(d, name)); err != nil {
+			t.Errorf("install-units does not install %s: %v", name, err)
+		}
+	}
 }
 
 // fakeArtifact writes a launcher script into an artifact dir.

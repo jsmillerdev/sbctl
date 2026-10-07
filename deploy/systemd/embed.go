@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 )
 
-//go:embed *.service *.slice *.rules
+//go:embed *.service *.slice *.rules *.timer
 var files embed.FS
 
 // Names lists the embedded file names.
