@@ -93,8 +93,8 @@ func TestSavedSettingsAreRenderedIntoUnits(t *testing.T) {
 }
 
 func TestSplitPostgresSettings(t *testing.T) {
-	cmd, alter := SplitPostgresSettings([]string{"work_mem=8MB", "max_connections=80", "max_wal_size=2GB", "log_connections=on"})
-	if strings.Join(cmd, ",") != "max_connections=80,max_wal_size=2GB" || strings.Join(alter, ",") != "work_mem=8MB,log_connections=on" {
+	cmd, alter := SplitPostgresSettings([]string{"work_mem=8MB", "max_connections=80", "max_wal_size=2GB", "log_connections=on", "max_worker_processes=12"})
+	if strings.Join(cmd, ",") != "max_connections=80,max_wal_size=2GB,max_worker_processes=12" || strings.Join(alter, ",") != "work_mem=8MB,log_connections=on" {
 		t.Fatalf("%v | %v", cmd, alter)
 	}
 }

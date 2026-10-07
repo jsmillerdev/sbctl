@@ -24,13 +24,13 @@ type Settings interface {
 }
 
 // cmdlineSettings are the settings the class puts on the postmaster's command line (and
-// the replication limits sbctl fixes there). A command-line value beats postgresql.auto.conf
-// and a reload cannot change it, so a saved value for one of these is rendered into the unit
-// after the class's and takes effect at the next restart. Every other saved setting goes
-// through ALTER SYSTEM.
+// the replication limits and the worker count sbctl fixes there). A command-line value beats
+// postgresql.auto.conf and a reload cannot change it, so a saved value for one of these is
+// rendered into the unit after the class's and takes effect at the next restart. Every other
+// saved setting goes through ALTER SYSTEM.
 var cmdlineSettings = []string{
 	"shared_buffers", "effective_cache_size", "maintenance_work_mem", "max_wal_size",
-	"max_connections", "max_wal_senders", "max_replication_slots",
+	"max_connections", "max_wal_senders", "max_replication_slots", "max_worker_processes",
 }
 
 // SplitPostgresSettings divides "name=value" settings into those rendered as server
