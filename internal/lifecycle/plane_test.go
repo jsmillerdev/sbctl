@@ -185,6 +185,19 @@ func TestAPISpecs(t *testing.T) {
 		e["GOTRUE_API_PORT"] != "9999" || e["GOTRUE_DISABLE_SIGNUP"] != "true" || !strings.Contains(e["GOTRUE_DB_DATABASE_URL"], "@127.0.0.1:5433/postgres") {
 		t.Fatalf("system gotrue env = %v", e)
 	}
+	if _, ok := e["GOTRUE_SMTP_HOST"]; ok {
+		t.Fatalf("no [mail], no SMTP in the system gotrue env: %v", e)
+	}
+	// [mail] reaches sb-gotrue@system (invitations by email) and no project's GoTrue.
+	cfg.Mail = config.Mail{SMTPHost: "smtp.example.test", SMTPFrom: "ops@example.test"}
+	withMail, _ := pl.apiSpecs(context.Background(), sys, testKeys(t, config.SystemRef))
+	if withMail[0].Env["GOTRUE_SMTP_HOST"] != "smtp.example.test" || withMail[0].Env["GOTRUE_SMTP_ADMIN_EMAIL"] != "ops@example.test" {
+		t.Fatalf("system gotrue env with mail = %v", withMail[0].Env)
+	}
+	if proj, _ := pl.apiSpecs(context.Background(), p, keys); proj[0].Env["GOTRUE_SMTP_HOST"] != "" {
+		t.Fatal("a project's GoTrue must not get the dashboard's relay")
+	}
+	cfg.Mail = config.Mail{}
 	sysPG, _ := pl.postgresSpec(context.Background(), sys, testKeys(t, config.SystemRef))
 	if !strings.Contains(strings.Join(sysPG.Exec, " "), "-c max_connections=100") || !strings.Contains(strings.Join(sysPG.Exec, " "), "-p 5433") {
 		t.Fatalf("system postgres args = %v", sysPG.Exec)
