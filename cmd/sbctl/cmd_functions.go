@@ -64,6 +64,15 @@ func fnNode(cmd *cobra.Command, run func(n *lifecycle.Node, cfg *config.Config, 
 	return run(n, n.Cfg, functions.NewStore(n.Registry))
 }
 
+// syncFunctions makes the files of the project's Edge Functions match the registry now.
+func syncFunctions(ctx context.Context, n *lifecycle.Node, ref string) error {
+	syncer, err := functions.New(functions.Deps{Cfg: n.Cfg, Registry: n.Registry, Secrets: n.Secrets, Store: functions.NewStore(n.Registry), Keys: n.Engine.Keys, Log: newLogger(n.Cfg)})
+	if err != nil {
+		return err
+	}
+	return syncer.SyncProject(ctx, ref)
+}
+
 func init() {
 	list := &cobra.Command{
 		Use:   "list <ref>",
@@ -185,7 +194,7 @@ runtime on exit.`,
 		Args: cobra.NoArgs,
 		RunE: runFunctionsDev,
 	}
-	dev.Flags().StringVar(&fnTokenFile, "token-file", "", "write a new personal access token for the Supabase CLI to this file (0600)")
+	dev.Flags().StringVar(&fnTokenFile, "token-file", "", "write a new personal access token for the Supabase CLI to this file (0600); it expires after 12 hours and is deleted when this command ends")
 	dev.Flags().BoolVar(&fnNoRuntime, "no-runtime", false, "do not start sb-edge-runtime (it runs already)")
 
 	functionsCmd.AddCommand(list, invoke, logs, dev)
@@ -341,6 +350,9 @@ func showRuntimeLog(cmd *cobra.Command, n *lifecycle.Node, ref string) error {
 	return c.Wait()
 }
 
+// fnTokenTTL is how long the personal access token of `sbctl functions dev --token-file` lives.
+const fnTokenTTL = 12 * time.Hour
+
 // runFunctionsDev serves the API, the proxy and the runtime in this process.
 func runFunctionsDev(cmd *cobra.Command, _ []string) error {
 	cfg, err := loadConfig()
@@ -399,10 +411,25 @@ func runFunctionsDev(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	if fnTokenFile != "" {
+		// A development convenience with the rights of a node administrator: it expires and is
+		// deleted when this process ends (it is also deleted if writing the file fails).
+		const devUser = "00000000-0000-4000-8000-00000000f0f0"
 		tok := secrets.NewPAT()
-		if err := n.Registry.CreateAccessToken(ctx, &registry.AccessToken{UserID: "00000000-0000-4000-8000-00000000f0f0", Name: "functions dev", Hash: secrets.HashToken(tok), Prefix: tok[:8]}); err != nil {
+		hash := secrets.HashToken(tok)
+		expires := time.Now().Add(fnTokenTTL)
+		if err := n.Registry.CreateAccessToken(ctx, &registry.AccessToken{UserID: devUser, Name: "functions dev", Hash: hash, Prefix: tok[:8], ExpiresAt: &expires}); err != nil {
 			return err
 		}
+		defer func() {
+			dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = os.Remove(fnTokenFile)
+			if t, err := n.Registry.GetAccessTokenByHash(dctx, hash); err == nil && t != nil {
+				if err := n.Registry.DeleteAccessToken(dctx, devUser, t.ID); err != nil {
+					log.Warn("functions dev: deleting its access token", "error", err)
+				}
+			}
+		}()
 		if err := os.WriteFile(fnTokenFile, []byte(tok+"\n"), 0o600); err != nil {
 			return err
 		}

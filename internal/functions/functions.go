@@ -482,9 +482,9 @@ const (
 	// EszipFileName is the decompressed bundle inside a generation.
 	EszipFileName = "bundle.eszip"
 	// maxEszipSize bounds a decompressed bundle. Hosted Edge Functions accept bundles of
-	// about 20 MB; the upload itself is limited to 64 MiB compressed, and this keeps a
+	// about 20 MB; the upload itself is limited to 64 MiB compressed, and this (32 MiB) keeps a
 	// compression bomb from filling the disk or the main service's memory.
-	maxEszipSize = 64 << 20
+	maxEszipSize = 32 << 20
 )
 
 // writeBundleFile decompresses an uploaded bundle ("EZBR" and a Brotli stream, as the

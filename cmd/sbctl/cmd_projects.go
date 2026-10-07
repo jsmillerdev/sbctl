@@ -192,6 +192,14 @@ func init() {
 			if err != nil {
 				return err
 			}
+			// Functions check JWTs against the project's secret from a file: write the new one
+			// now instead of at the next reconcile of a running API server (up to
+			// [functions] reconcile_seconds of 401s for the new keys and 200s for the old).
+			if n.Cfg.Functions.Enabled {
+				if err := syncFunctions(cmd.Context(), n, a[0]); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: the Edge Functions of %s still check the old JWT secret until the API server's next reconcile: %v\n", a[0], err)
+				}
+			}
 			if pJSON {
 				return printJSON(cmd.OutOrStdout(), viewKeys(k))
 			}

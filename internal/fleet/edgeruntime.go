@@ -74,7 +74,14 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 		return units.Spec{}, err
 	}
 	root = realPath(root)
+	// The proxy proves itself to the main service with this secret; the file is outside the
+	// unit's namespace, the value reaches the unit through its environment file.
+	token, err := config.LoadFunctionsProxyToken(cfg.Paths())
+	if err != nil {
+		return units.Spec{}, err
+	}
 	s.Env = map[string]string{
+		"SBCTL_FUNCTIONS_PROXY_TOKEN":             token,
 		"EDGE_RUNTIME_PORT":                       port,
 		"SBCTL_FUNCTIONS_ROOT":                    root,
 		"SBCTL_FUNCTIONS_MEMORY_MB":               strconv.Itoa(f.Memory()),

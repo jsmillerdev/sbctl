@@ -50,6 +50,10 @@ type Options struct {
 	// FunctionsEnabled routes /functions/v1 to the edge runtime on Ports.EdgeRuntime.
 	// While false (v1) the route answers 503 {"message": ...}.
 	FunctionsEnabled bool
+	// FunctionsProxyToken is the secret sent to the edge runtime in X-Sbctl-Proxy-Token.
+	// Empty reads the node's secret (config.LoadFunctionsProxyToken) when the first
+	// /functions/v1 request arrives. Tests set it.
+	FunctionsProxyToken string
 	Logger           *slog.Logger
 }
 

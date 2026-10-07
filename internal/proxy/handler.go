@@ -171,6 +171,15 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 			tg.set = map[string]string{}
 		}
 		tg.set[TenantHeader] = p.ref
+		// The runtime's port is reachable from the function workers it runs, so it takes a
+		// tenant only from a caller that knows this secret.
+		tok, err := s.functionsToken()
+		if err != nil {
+			s.log.Error("proxy: edge runtime secret", "err", err)
+			writeJSON(w, http.StatusServiceUnavailable, "Edge Functions are not available")
+			return
+		}
+		tg.set[config.FunctionsProxyTokenHeader] = tok
 	}
 	tg.dropTenant = rt.svc != svcFunctions
 	s.forward(w, r, tg)
@@ -234,6 +243,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 			h.Del("X-Real-Ip")
 			if tg.dropTenant {
 				h.Del(TenantHeader)
+				h.Del(config.FunctionsProxyTokenHeader)
 			}
 			h.Set("X-Forwarded-For", clientIP(pr.In))
 			h.Set("X-Forwarded-Host", tg.fwdHost)
@@ -478,4 +488,26 @@ func (s *Server) dashboardOrigin(origin string) bool {
 		}
 	}
 	return false
+}
+
+// functionsToken returns the secret for the edge runtime, loading (or creating) the node's
+// on first use.
+func (s *Server) functionsToken() (string, error) {
+	s.fnTokenMu.Lock()
+	defer s.fnTokenMu.Unlock()
+	if s.fnToken != "" {
+		return s.fnToken, nil
+	}
+	tok := s.opts.FunctionsProxyToken
+	if tok == "" {
+		if s.cfg.StateDir == "" {
+			return "", errors.New("no state directory to keep the secret in")
+		}
+		var err error
+		if tok, err = config.LoadFunctionsProxyToken(s.cfg.Paths()); err != nil {
+			return "", err
+		}
+	}
+	s.fnToken = tok
+	return tok, nil
 }

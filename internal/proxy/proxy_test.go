@@ -404,8 +404,8 @@ func TestFunctions(t *testing.T) {
 		t.Fatal("disabled functions reached the runtime")
 	}
 
-	h = newHarness(t, func(o *Options) { o.FunctionsEnabled = true })
-	resp, body = h.project("POST", "/functions/v1/hello/world?x=1&apikey=left", "apikey", h.k.PublishableKey, "Authorization", "Bearer user.jwt", "Sb-Api-Key", "forged", TenantHeader, "victim")
+	h = newHarness(t, func(o *Options) { o.FunctionsEnabled = true; o.FunctionsProxyToken = "node-secret" })
+	resp, body = h.project("POST", "/functions/v1/hello/world?x=1&apikey=left", "apikey", h.k.PublishableKey, "Authorization", "Bearer user.jwt", "Sb-Api-Key", "forged", TenantHeader, "victim", config.FunctionsProxyTokenHeader, "forged-secret")
 	if resp.StatusCode != 200 {
 		t.Fatalf("enabled: %d %s", resp.StatusCode, body)
 	}
@@ -418,6 +418,14 @@ func TestFunctions(t *testing.T) {
 	}
 	if got.Header.Get(TenantHeader) != h.ref {
 		t.Errorf("tenant header %q", got.Header.Get(TenantHeader))
+	}
+	if v := got.Header.Values(config.FunctionsProxyTokenHeader); len(v) != 1 || v[0] != "node-secret" {
+		t.Errorf("the runtime got the secret %q, want the proxy's own once", v)
+	}
+	// The secret goes to the edge runtime and nowhere else.
+	h.project("GET", "/rest/v1/t", "apikey", h.k.PublishableKey, config.FunctionsProxyTokenHeader, "node-secret", TenantHeader, "victim")
+	if rest := h.ups[svcRest].last(t); rest.Header.Get(config.FunctionsProxyTokenHeader) != "" || rest.Header.Get(TenantHeader) != "" {
+		t.Errorf("PostgREST got the runtime's headers: %v", rest.Header)
 	}
 	// Anonymous calls pass (verify_jwt is the runtime's business); a bad sb_ key does not.
 	if resp, _ := h.project("GET", "/functions/v1/open"); resp.StatusCode != 200 {

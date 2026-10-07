@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/units"
 )
 
 func TestServicesForPutsTheEdgeRuntimeBeforeStudioWhenEnabled(t *testing.T) {
@@ -47,7 +48,8 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 	r := edgeRig(t, true)
 	cfg := r.n.cfg
 	cfg.Functions.MemoryMB, cfg.Functions.WallClockSeconds, cfg.Functions.IdleTimeoutSeconds = 128, 20, 9
-	cfg.Functions.CPUSoftMs, cfg.Functions.CPUHardMs, cfg.Functions.MaxParallelism = -1, 3000, 4
+	cfg.Functions.CPUSoftMs, cfg.Functions.CPUHardMs, cfg.Functions.MaxParallelism = -1, 3000, 2
+	cfg.Functions.MaxPerProject, cfg.Functions.MaxWorkers, cfg.Functions.MaxWorkersPerProject = 200, 8, 3
 	cfg.Functions.MemoryMax = "3G"
 	specs, err := r.m.Specs(context.Background())
 	if err != nil {
@@ -63,7 +65,7 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 		args := strings.Join(s.Exec, " ")
 		for _, want := range []string{
 			"bin/edge-runtime start", "--ip 127.0.0.1", "--port " + port, "--main-service " + realPath(MainServiceDir(cfg)),
-			"--policy per_worker", "--user-worker-request-idle-timeout 9000", "--max-parallelism 4",
+			"--policy per_worker", "--user-worker-request-idle-timeout 9000", "--max-parallelism 2",
 		} {
 			if !strings.Contains(args, want) {
 				t.Errorf("args %q lack %q", args, want)
@@ -76,12 +78,17 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 		for k, v := range map[string]string{
 			"EDGE_RUNTIME_PORT": port, "SBCTL_FUNCTIONS_ROOT": realPath(cfg.Paths().FunctionsRoot()),
 			"SBCTL_FUNCTIONS_MEMORY_MB": "128", "SBCTL_FUNCTIONS_WALL_CLOCK_SEC": "20", "SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC": "9",
-			"SBCTL_FUNCTIONS_CPU_SOFT_MS": "0", "SBCTL_FUNCTIONS_CPU_HARD_MS": "3000", "SBCTL_FUNCTIONS_MAX_PER_PROJECT": "2", "SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT": "3",
+			"SBCTL_FUNCTIONS_CPU_SOFT_MS": "0", "SBCTL_FUNCTIONS_CPU_HARD_MS": "3000", "SBCTL_FUNCTIONS_MAX_PER_PROJECT": "200", "SBCTL_FUNCTIONS_MAX_WORKERS": "8",
+			"SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT": "3", "SBCTL_FUNCTIONS_WORKER_COST_MB": "320", // 2 per function x (128 + 32)
 			"DENO_DIR": filepath.Join(cfg.Paths().System(config.SvcEdgeRuntime), "deno"),
 		} {
 			if env[k] != v {
 				t.Errorf("%s = %q, want %q", k, env[k], v)
 			}
+		}
+		// The proxy's secret reaches the runtime through the environment, and is the node's.
+		if want, err := config.LoadFunctionsProxyToken(cfg.Paths()); err != nil || len(want) != 64 || env["SBCTL_FUNCTIONS_PROXY_TOKEN"] != want {
+			t.Errorf("proxy token %q (%v)", env["SBCTL_FUNCTIONS_PROXY_TOKEN"], err)
 		}
 		if sum, _ := MainServiceHash(); env[mainServiceMarkerEnv] != sum || sum == "" {
 			t.Errorf("main service marker %q", env[mainServiceMarkerEnv])
@@ -110,15 +117,16 @@ func TestEdgeRuntimeSpecDefaults(t *testing.T) {
 	for _, s := range specs {
 		if s.Service == config.SvcEdgeRuntime {
 			if env := s.Env; env["SBCTL_FUNCTIONS_MEMORY_MB"] != "256" || env["SBCTL_FUNCTIONS_WALL_CLOCK_SEC"] != "400" ||
-				env["SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC"] != "150" || env["SBCTL_FUNCTIONS_CPU_SOFT_MS"] != "1000" || env["SBCTL_FUNCTIONS_CPU_HARD_MS"] != "2000" || env["SBCTL_FUNCTIONS_MAX_PER_PROJECT"] != "8" || env["SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT"] != "15" {
+				env["SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC"] != "150" || env["SBCTL_FUNCTIONS_CPU_SOFT_MS"] != "1000" || env["SBCTL_FUNCTIONS_CPU_HARD_MS"] != "2000" || env["SBCTL_FUNCTIONS_MAX_PER_PROJECT"] != "128" || env["SBCTL_FUNCTIONS_MAX_WORKERS"] != "16" || env["SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT"] != "8" {
 				t.Errorf("env %v", env)
 			}
-			if !strings.Contains(strings.Join(s.Exec, " "), "--max-parallelism 16") {
+			if !strings.Contains(strings.Join(s.Exec, " "), "--max-parallelism 1") {
 				t.Errorf("args %v", s.Exec)
 			}
-			// The unit's memory limit is what 16 workers of 256 MB can use, plus the runtime.
+			// The unit's memory limit is what the 16 workers the main service allows can use
+			// (256 MB heap + 32 MB overhead each), plus the runtime.
 			want := r.n.cfg.Defaults
-			want.MemoryMax = "4352M"
+			want.MemoryMax = "4864M"
 			if s.Limits != want {
 				t.Errorf("limits %+v, want %+v", s.Limits, want)
 			}
@@ -226,5 +234,64 @@ func TestEnsureMainService(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "src", "old-module.ts")); err == nil {
 		t.Error("stale module kept")
+	}
+}
+
+// [functions] enabled turned off after the runtime ran: fleet stop and status still see its
+// unit, and fleet start removes it together with the tenants' secrets.
+func TestTurningFunctionsOffRetiresTheRuntimeAndItsSecrets(t *testing.T) {
+	r := edgeRig(t, true)
+	cfg := r.n.cfg
+	ctx := context.Background()
+	if err := r.m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	run := units.FilesFor(cfg, units.Spec{Service: config.SvcEdgeRuntime}).Run
+	if err := os.MkdirAll(filepath.Dir(run), 0o750); err != nil || os.WriteFile(run, []byte("#!/bin/sh\n"), 0o750) != nil {
+		t.Fatal("could not stub the rendered launcher", err)
+	}
+	secret := filepath.Join(cfg.Paths().FunctionsRoot(), "abcdefghijklmnopqrst", "functions-env.json")
+	if err := os.MkdirAll(filepath.Dir(secret), 0o700); err != nil || os.WriteFile(secret, []byte(`{"jwt_secret":"x"}`), 0o600) != nil {
+		t.Fatal("could not stub a tenant's file", err)
+	}
+
+	cfg.Functions.Enabled = false
+	hs := r.m.Status(ctx)
+	if len(hs) != 6 {
+		t.Fatalf("status rows: %d, want the runtime's unit among them", len(hs))
+	}
+	var seen bool
+	for _, h := range hs {
+		if h.Service == config.SvcEdgeRuntime {
+			seen = true
+			if !h.Optional || h.Healthy || !strings.Contains(h.Error, "still runs") {
+				t.Errorf("a running runtime of an earlier configuration: %+v", h)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("no row for the runtime")
+	}
+	r.sup.mu.Lock()
+	r.sup.calls = nil
+	r.sup.mu.Unlock()
+	if err := r.m.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(r.sup.log(), "stop sb-studio.service\nstop sb-edge-runtime.service\nstop sb-storage.service") {
+		t.Fatalf("fleet stop left the runtime running:\n%s", r.sup.log())
+	}
+
+	if err := r.m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(r.sup.log(), "remove sb-edge-runtime.service") {
+		t.Fatalf("fleet start did not remove the runtime's unit:\n%s", r.sup.log())
+	}
+	if _, err := os.Stat(secret); !os.IsNotExist(err) {
+		t.Fatalf("a tenant's secrets stayed on disk: %v", err)
+	}
+	if _, err := os.Stat(cfg.Paths().FunctionsRoot()); !os.IsNotExist(err) {
+		t.Fatalf("the tenants tree stayed: %v", err)
 	}
 }

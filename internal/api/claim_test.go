@@ -553,9 +553,46 @@ func TestClaimClientKey(t *testing.T) {
 		if tc.xff != "" {
 			r.Header.Set("X-Forwarded-For", tc.xff)
 		}
-		if got := claimClient(r); got != tc.want {
+		if got := claimClient(r, true); got != tc.want {
 			t.Errorf("%s xff %q: %q, want %q", tc.remote, tc.xff, got, tc.want)
 		}
+	}
+}
+
+// With Edge Functions on the node, a function worker can connect from loopback and write any
+// header, so X-Forwarded-For of a loopback peer counts only with the node's proxy secret.
+func TestClaimClientForwardedForNeedsTheProxySecretWhereFunctionsRun(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	s := &Server{cfg: cfg}
+	req := func(secret string) *http.Request {
+		r := httptest.NewRequest("POST", "/claim", nil)
+		r.RemoteAddr = "127.0.0.1:1"
+		r.Header.Set("X-Forwarded-For", "198.51.100.7")
+		if secret != "" {
+			r.Header.Set(config.FunctionsProxyTokenHeader, secret)
+		}
+		return r
+	}
+	if !s.trustForwarded(req("")) {
+		t.Fatal("without Edge Functions a loopback peer is the owner's own proxy")
+	}
+	cfg.Functions.Enabled = true
+	if s.trustForwarded(req("")) || s.trustForwarded(req("guess")) {
+		t.Fatal("a loopback peer without the secret was believed")
+	}
+	if s.trustForwarded(req(strings.Repeat("a", 64))) {
+		t.Fatal("a secret was accepted although the node has none")
+	}
+	tok, err := config.LoadFunctionsProxyToken(cfg.Paths())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.trustForwarded(req(tok)) || s.trustForwarded(req(tok[1:])) {
+		t.Fatal("the node's own secret must be accepted, and nothing else")
+	}
+	if got := claimClient(req(""), s.trustForwarded(req(""))); got != "127.0.0.1" {
+		t.Fatalf("a worker rotating X-Forwarded-For is keyed %q, want its own address", got)
 	}
 }
 
