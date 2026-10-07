@@ -87,8 +87,12 @@ type Relay struct {
 
 	mu   sync.Mutex
 	ls   map[string]*relayListener
-	svc  *Service
 	done bool
+
+	// svcMu guards svc and is held while the backend opens (up to the factory's timeout),
+	// which must not block Ensure and Reconcile.
+	svcMu sync.Mutex
+	svc   *Service
 }
 
 type relayListener struct {
@@ -288,8 +292,8 @@ func (l *relayListener) shutdown() {
 }
 
 func (r *Relay) service(ctx context.Context) (*Service, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.svcMu.Lock()
+	defer r.svcMu.Unlock()
 	if r.svc != nil {
 		return r.svc, nil
 	}

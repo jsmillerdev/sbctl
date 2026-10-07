@@ -83,7 +83,7 @@ Later users come by invitation. sbctl sends no email: it prints a token and you 
 ```bash
 sudo -u sbctl sbctl users invite dev@example.com    # prints sbi_... (valid 7 days, works once)
 sudo -u sbctl sbctl users list
-sudo -u sbctl sbctl users remove dev@example.com    # also deletes the personal access tokens they made
+sudo -u sbctl sbctl users remove dev@example.com    # ends their access at once: sessions and tokens are refused on the next request
 ```
 
 The invitee opens the same claim page, enters the token and a password; the address comes from the invite. Every account is an administrator today (members and roles are a later phase), so invite only people you would give the whole node.

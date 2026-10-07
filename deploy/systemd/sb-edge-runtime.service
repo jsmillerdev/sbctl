@@ -53,7 +53,7 @@ ReadWritePaths=-/var/lib/sbctl/system/edge-runtime
 # launcher script (read-only) and its own state directory. It never needs to read an
 # environment file: systemd reads EnvironmentFile= before it builds the namespace. This
 # does not isolate tenants from a compromised service (same uid, /proc); see README.md.
-InaccessiblePaths=-/etc/sbctl
+InaccessiblePaths=-/etc/sbctl -/run/dbus
 TemporaryFileSystem=/var/lib/sbctl:ro
 BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/system/edge-runtime.run
 BindPaths=-/var/lib/sbctl/system/edge-runtime

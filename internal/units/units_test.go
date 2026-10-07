@@ -434,8 +434,11 @@ func TestTemplatesContainment(t *testing.T) {
 		if strings.Contains(line(body, "InaccessiblePaths"), ".env") {
 			t.Errorf("%s still hides sibling environment files (denylist); use the allowlist", name)
 		}
-		if line(body, "InaccessiblePaths") != "-/etc/sbctl" {
-			t.Errorf("%s must hide all of /etc/sbctl, got %q (archive_command reads no config: it goes through the relay socket)", name, line(body, "InaccessiblePaths"))
+		// All of /etc/sbctl (archive_command reads no config: it goes through the relay socket)
+		// and the system bus: the polkit rule lets the sbctl user stop and tune sb-* units, which
+		// code running inside one unit has no business doing to the others.
+		if line(body, "InaccessiblePaths") != "-/etc/sbctl -/run/dbus" {
+			t.Errorf("%s must hide /etc/sbctl and /run/dbus, got %q", name, line(body, "InaccessiblePaths"))
 		}
 		// No unit sees the backup directory, Postgres included: WAL leaves through the relay.
 		if strings.Contains(body, "/var/lib/sbctl/backups") && !strings.HasPrefix(strings.TrimSpace(body), "#") {

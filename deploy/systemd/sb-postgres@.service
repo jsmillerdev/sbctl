@@ -68,7 +68,7 @@ ReadWritePaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/post
 # (`sbctl wal push|fetch --socket`) read no file of /etc/sbctl. Environment files are read by
 # systemd before the namespace exists. This does not isolate tenants from a compromised
 # cluster (same uid, /proc); see README.md.
-InaccessiblePaths=-/etc/sbctl
+InaccessiblePaths=-/etc/sbctl -/run/dbus
 TemporaryFileSystem=/var/lib/sbctl:ro
 BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/%i/postgres.run -/var/lib/sbctl/projects/%i/wal
 BindPaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/postgres

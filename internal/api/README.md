@@ -97,7 +97,19 @@ again. Unknown, used and expired tokens all answer `403`; ten failures in a minu
 the rest of the minute, node-wide. `GET /claim` serves a self-contained page (one inline script
 pinned by hash in the CSP, no third-party requests). Neither route takes credentials: the token is
 the credential. `Accounts` (the same type the CLI uses for `sbctl claim token`, `sbctl users invite|list|remove`)
-also lists dashboard users and removes one together with the personal access tokens it created.
+also lists dashboard users and removes one, which ends the user's access at once:
+
+1. the user is recorded in `sbctl.removed_users` (migration `0610`), and from then on `authJWT` refuses
+   a session whose `sub` is in it and `authPAT` refuses a token whose owner is in it, on every request
+   and with no cache, whichever process made the removal (a GoTrue access token would otherwise stay
+   valid until it expires, an hour, and could mint a personal access token that never expires);
+2. the personal access tokens the user created are deleted;
+3. the GoTrue account is deleted, which also deletes its sessions and refresh tokens.
+
+A step that fails leaves the account findable, and the first step has already cut the access off, so
+running `users remove` again finishes the job. `claim token --if-none` issues nothing while an unused,
+unexpired claim token exists (the installer uses it, so a re-run does not replace a token handed over
+earlier).
 
 ### `supabase login` (device flow)
 
