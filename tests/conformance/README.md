@@ -8,7 +8,7 @@ programs watch what upstream moves under us.
 | Part | What it does | Where it runs |
 |---|---|---|
 | `run.sh` | Installs a node, claims it, creates two projects through the Management API with a personal access token, then runs the supabase-js suites and the CLI script. | `.github/workflows/conformance.yml`, job `suites` (amd64 and arm64): on pushes to `main` and `ws/conformance`, on pull requests that touch `internal/versions/versions.yaml` or this directory, on `workflow_dispatch`, nightly. |
-| `js/*.test.mjs` | supabase-js suites (Node 22, `node:test`) against project A. | called by `run.sh` |
+| `js/*.test.mjs` | supabase-js suites and the pg_cron and branch checks (Node 22, `node:test`) against project A. | called by `run.sh` |
 | `cli.sh` | The Supabase CLI against project B. | called by `run.sh` |
 | `specdiff/` | Downloads the three Management API OpenAPI documents and diffs them with the pinned copies in `internal/api/gen/specs`. Exit 1 on drift. | job `specdiff`: nightly, on dispatch, and on every push except to `main` |
 | `bumpcheck/` | Checks that every pin of `internal/versions/versions.yaml` (and the client pins below) still exists upstream, with its linux amd64 and arm64 archives, and lists newer releases. | job `bump-check`, same triggers |
