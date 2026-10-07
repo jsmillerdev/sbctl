@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+# bash with -eo pipefail, so a failing command piped into tee fails the step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   systemd-smoke:
     strategy:
@@ -43,25 +48,29 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: start minio
+      - name: start S3 (SeaweedFS; the MinIO image is no longer published)
         run: |
-          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data
-          for i in $(seq 1 60); do curl -fs http://127.0.0.1:9000/minio/health/live && break; sleep 1; done
+          printf '%s' '{"identities":[{"name":"ci","credentials":[{"accessKey":"sbctltest","secretKey":"sbctltestsecret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' > /tmp/s3.json
+          docker run -d --name s3 -p 8333:8333 -v /tmp/s3.json:/etc/s3.json chrislusf/seaweedfs server -s3 -s3.config=/etc/s3.json -dir=/data
+          for i in $(seq 1 90); do curl -s -o /dev/null http://127.0.0.1:8333 && break; sleep 1; done
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - name: create bucket
+        env:
+          AWS_ACCESS_KEY_ID: sbctltest
+          AWS_SECRET_ACCESS_KEY: sbctltestsecret
+          AWS_DEFAULT_REGION: us-east-1
         run: |
-          curl -fsSL -o /tmp/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /tmp/mc
-          /tmp/mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
-          /tmp/mc mb -p local/sbctl-test
+          for i in $(seq 1 30); do aws --endpoint-url http://127.0.0.1:8333 s3 mb s3://sbctl-test && break; sleep 2; done
+          aws --endpoint-url http://127.0.0.1:8333 s3 ls
       - name: backup integration
         env:
-          SBCTL_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          SBCTL_TEST_S3_ENDPOINT: http://127.0.0.1:8333
           SBCTL_TEST_S3_BUCKET: sbctl-test
-          SBCTL_TEST_S3_ACCESS_KEY: minioadmin
-          SBCTL_TEST_S3_SECRET_KEY: minioadmin
+          SBCTL_TEST_S3_ACCESS_KEY: sbctltest
+          SBCTL_TEST_S3_SECRET_KEY: sbctltestsecret
         run: internal/backup/ci-integration.sh
 
   pebble:
