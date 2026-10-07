@@ -59,7 +59,7 @@ when no artifact is installed and [studio] artifact_url is not set.`,
 				if s, ok := n.Artifacts.(interface {
 					Fetch(context.Context, string) (string, error)
 				}); ok {
-					for _, svc := range fleet.Services {
+					for _, svc := range fleet.ServicesFor(cfg) {
 						if contains(skip, svc) || (svc == config.SvcStudio && cfg.Studio.ArtifactURL == "") {
 							continue
 						}

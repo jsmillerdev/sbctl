@@ -38,6 +38,10 @@ type Functions struct {
 	// MaxParallelism caps the workers of the whole runtime alive at once. Zero means
 	// DefaultFunctionsMaxParallelism; negative means no cap.
 	MaxParallelism int `toml:"max_parallelism"`
+	// MemoryMax is the memory limit of sb-edge-runtime (systemd syntax, "2G"); empty
+	// means the [defaults] one. The runtime holds up to MaxParallelism workers of
+	// MemoryMB each, so a node with many busy functions wants more than the default.
+	MemoryMax string `toml:"memory_max"`
 	// ProjectURLTemplate is SUPABASE_URL as functions see it, with {ref} for the project
 	// ref. Empty derives it from the domain, the TLS mode and the public listen ports
 	// (https://<ref>.api.<domain>). Set it when functions must reach their own project

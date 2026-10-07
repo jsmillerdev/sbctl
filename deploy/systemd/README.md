@@ -58,3 +58,14 @@ API and fleet units, while `sbctl.service` and the Postgres units keep access. T
 singleton `system/<svc>` directories are optional (`-` prefix): create one before a service
 needs to write there. `tests/linux/systemd-smoke.sh` checks the hiding on a real systemd;
 it has not been run yet.
+
+`sb-edge-runtime` is the one unit that sees more than its own directory: the tenant-aware
+main service reads `projects/<ref>/functions*` of every project, so the template binds
+`projects/` read-only. That makes other projects' data directories and unit environment
+files readable to the runtime process, which runs tenants' code. The mitigation is in the
+runtime, not the mount: a user worker gets only its module graph (the runtime's virtual
+file system), so `Deno.readTextFile` of any real path answers "not found", measured with
+`edge-runtime` v1.77.4 and described in `functions-main/README.md`. A bug that gives a
+worker the real file system would expose those directories. Putting the functions where the
+unit can bind exactly them (a tree of its own, or one bind per project that is added when
+a project gets its first function) would close that gap and is a follow-up.

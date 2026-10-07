@@ -150,6 +150,8 @@ func Port(cfg *config.Config, svc string) int {
 		return cfg.Ports.PGMeta
 	case config.SvcStudio:
 		return cfg.Ports.Studio
+	case config.SvcEdgeRuntime:
+		return cfg.Ports.EdgeRuntime
 	}
 	return 0
 }
@@ -168,6 +170,8 @@ func healthPath(svc string) string {
 		return "/health"
 	case config.SvcStudio:
 		return "/api/get-utc-time"
+	case config.SvcEdgeRuntime:
+		return edgeRuntimeHealthPath
 	}
 	return "/"
 }
@@ -203,7 +207,7 @@ func (m *Manager) Specs(ctx context.Context) ([]units.Spec, error) {
 	}
 	var specs []units.Spec
 	var errs []error
-	for _, svc := range Services {
+	for _, svc := range m.services() {
 		if m.d.skipped(svc) {
 			continue
 		}
@@ -237,7 +241,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		return err
 	}
 	var errs []error
-	for _, svc := range Services {
+	for _, svc := range m.services() {
 		if m.d.skipped(svc) {
 			continue
 		}
@@ -333,8 +337,9 @@ func (m *Manager) logTail(unit string) string {
 // the data. A unit that does not exist or does not run is not an error.
 func (m *Manager) Stop(ctx context.Context) error {
 	var errs []error
-	for i := len(Services) - 1; i >= 0; i-- {
-		svc := Services[i]
+	svcs := m.services()
+	for i := len(svcs) - 1; i >= 0; i-- {
+		svc := svcs[i]
 		if m.d.skipped(svc) {
 			continue
 		}
@@ -358,7 +363,7 @@ func (m *Manager) neverRendered(svc string) bool {
 // health endpoint.
 func (m *Manager) Status(ctx context.Context) []Health {
 	var out []Health
-	for _, svc := range Services {
+	for _, svc := range m.services() {
 		if m.d.skipped(svc) {
 			continue
 		}

@@ -89,6 +89,8 @@ func (m *Manager) spec(svc string, c *creds) (units.Spec, error) {
 		s.Env = env // the server runs the multi-tenant migrations itself at start
 	case config.SvcStudio:
 		s.Env = studioEnv(cfg)
+	case config.SvcEdgeRuntime:
+		return edgeRuntimeSpec(cfg, s)
 	default:
 		return units.Spec{}, fmt.Errorf("fleet: no unit definition for %q", svc)
 	}

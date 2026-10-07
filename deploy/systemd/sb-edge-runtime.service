@@ -54,6 +54,13 @@ ReadWritePaths=/var/lib/sbctl/projects/system -/var/lib/sbctl/system/edge-runtim
 InaccessiblePaths=-/etc/sbctl -/var/lib/sbctl/projects/system/postgres -/var/lib/sbctl/projects/system/supavisor.env -/var/lib/sbctl/projects/system/realtime.env -/var/lib/sbctl/projects/system/storage.env -/var/lib/sbctl/projects/system/pgmeta.env -/var/lib/sbctl/projects/system/studio.env -/var/lib/sbctl/projects/system/imgproxy.env -/var/lib/sbctl/projects/system/postgres.env -/var/lib/sbctl/projects/system/gotrue.env
 TemporaryFileSystem=/var/lib/sbctl:ro
 BindReadOnlyPaths=/var/lib/sbctl/artifacts
+# The main service reads every project's functions and environment file, which live in
+# <state>/projects/<ref>/ (internal/functions): all of projects/ is visible, read-only,
+# except what InaccessiblePaths hides. That includes other projects' data directories and
+# unit environment files, so the wall between tenants here is the runtime, not the mount:
+# user workers see their module graph and nothing of the disk (functions-main/README.md,
+# "Isolation"). The nested read-write bind of projects/system below stays read-write.
+BindReadOnlyPaths=/var/lib/sbctl/projects
 BindPaths=/var/lib/sbctl/projects/system -/var/lib/sbctl/system/edge-runtime
 
 # Optional: enable with `systemctl enable sb-edge-runtime.service` when the feature is on.
