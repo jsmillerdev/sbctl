@@ -1,0 +1,61 @@
+[Unit]
+Description=sbctl Realtime, the shared multi-tenant websocket server
+Documentation=https://github.com/OWNER/sbctl
+Requires=sb-postgres@system.service
+After=network.target local-fs.target sb-postgres@system.service
+StartLimitIntervalSec=0
+
+[Service]
+# sbctl renders the two files below (units.Supervisor.Render) before it starts the unit.
+Type=exec
+User=sbctl
+Group=sbctl
+Slice=sbctl.slice
+EnvironmentFile=/var/lib/sbctl/projects/system/realtime.env
+ExecStart=/var/lib/sbctl/projects/system/realtime.run
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30
+LimitNOFILE=65536
+# MemoryMax and CPUQuota come from the project record: sbctl applies them over D-Bus
+# as persistent per-unit drop-ins.
+MemoryAccounting=yes
+CPUAccounting=yes
+SyslogIdentifier=sb-realtime
+
+# Hardening. MemoryDenyWriteExecute is deliberately absent: Postgres (JIT), the BEAM
+# and Node all map writable+executable memory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+ReadWritePaths=/var/lib/sbctl/projects/system -/var/lib/sbctl/system/realtime
+# Containment: every unit runs as the sbctl user, so without this a compromised service
+# could read the master key, every project's data (including backups) and the TLS keys.
+# The unit sees only the artifacts (read-only) and its own state. Everything else under
+# /var/lib/sbctl (backups, certs, run, logs, other projects, other services' state) is
+# replaced by an empty tmpfs, /etc/sbctl is hidden, and so are the env files of sibling
+# services and the cluster directory (socket, root key): these services reach Postgres
+# over TCP. The residual risk is documented in deploy/systemd/README.md.
+InaccessiblePaths=-/etc/sbctl -/var/lib/sbctl/projects/system/postgres -/var/lib/sbctl/projects/system/supavisor.env -/var/lib/sbctl/projects/system/storage.env -/var/lib/sbctl/projects/system/pgmeta.env -/var/lib/sbctl/projects/system/studio.env -/var/lib/sbctl/projects/system/imgproxy.env -/var/lib/sbctl/projects/system/edge-runtime.env -/var/lib/sbctl/projects/system/postgres.env -/var/lib/sbctl/projects/system/gotrue.env
+TemporaryFileSystem=/var/lib/sbctl:ro
+BindReadOnlyPaths=/var/lib/sbctl/artifacts
+BindPaths=/var/lib/sbctl/projects/system -/var/lib/sbctl/system/realtime
+
+[Install]
+WantedBy=multi-user.target
