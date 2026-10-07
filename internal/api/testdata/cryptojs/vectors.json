@@ -1,0 +1,17 @@
+[
+  {
+    "key": "SAMPLE_KEY",
+    "plaintext": "postgres://postgres:secret@127.0.0.1:20000/postgres",
+    "encrypted": "U2FsdGVkX1/vMmvecoohGl26o2T6nzIBy63f8E88bDgNQhpOqDIhuEszfVQ0xC7TarEQaT+fh0U6mWzB0nhAjTwWut1tjG1QblUaCkokLns="
+  },
+  {
+    "key": "k3y with spaces & symbols/+=",
+    "plaintext": "postgresql://supabase_admin:p%40ss%2Fw0rd@127.0.0.1:20003/postgres?sslmode=disable",
+    "encrypted": "U2FsdGVkX1+ydu4bzLklEXagBx5qoS3BxEbtG3o3W/XhHOqAPQ5TZTYnXHAd2fgc+hQIT3vFvYw1JzNJudicTqvBcUITn6tUwBnnyC5t/e2GxfrC7rTDeC2tkMpTSIdLfWarOVXcXBjtPipy7J8C8Q=="
+  },
+  {
+    "key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "plaintext": "postgres://postgres:ünïcödé-日本語@127.0.0.1:5433/postgres",
+    "encrypted": "U2FsdGVkX19GrT/2cX6NNzir8r8xVDhnWOEhh8mKZpDZGg2rui9cFF/ZfGS/iYuUtHOpKF81PNXssf9gHB8VyFRqj9egYIKjokx+bIkgR259lkkrwmEvRhMcf7wZ5wNP"
+  }
+]
