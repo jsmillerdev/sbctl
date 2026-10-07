@@ -120,3 +120,26 @@ func TestMissingRelease(t *testing.T) {
 		t.Errorf("rows: %+v", res.Rows)
 	}
 }
+
+// A lookup that fails for a reason other than "no such release" must not read as fine: for a
+// slim-services pin the run fails, for the client pins it only warns.
+func TestUnverifiedPins(t *testing.T) {
+	dir := t.TempDir()
+	vy := write(t, dir, "versions.yaml", "artifacts:\n  postgrest: postgrest-v16.4-r0\ncli:\n  version_tested: \"2.119.0\"\n")
+	c := &Checker{GitHub: "https://gh", NPM: "https://npm", Slim: "o/slim", Versions: vy, Pins: filepath.Join(dir, "none"), PackageJSON: filepath.Join(dir, "none"),
+		Get: func(url string) ([]byte, int, error) {
+			return []byte(`{"message":"rate limit"}`), http.StatusForbidden, nil
+		}}
+	res, err := c.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Missing() != 0 || res.Unverified() != 1 {
+		t.Errorf("missing %d, unverified %d, want 0 and 1 (rows %+v)", res.Missing(), res.Unverified(), res.Rows)
+	}
+	for _, row := range res.Rows {
+		if row.Status != "unknown" {
+			t.Errorf("%s is %q after a 403, want unknown", row.Name, row.Status)
+		}
+	}
+}

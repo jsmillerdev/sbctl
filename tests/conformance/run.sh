@@ -35,7 +35,28 @@ ADMIN_PASSWORD=conformance-correct-horse-battery
 RESULTS=()
 FAILED=0
 
-trap 'rc=$?; collect_logs; mkdir -p "$LOG_DIR/work"; cp -R "$WORK"/cli-out "$WORK"/*.json "$WORK"/profile.yaml "$LOG_DIR/work/" 2>/dev/null || true; rm -rf "$WORK"; exit $rc' EXIT
+# keep_work copies what helps to read a failure (the CLI's step logs and the profile) into the
+# uploaded log directory. conformance.json and claim.json hold the PAT and the database
+# passwords and stay out; a redaction pass over the copy drops any key or password that a
+# CLI log echoed.
+keep_work() {
+  mkdir -p "$LOG_DIR/work"
+  cp -R "$WORK"/cli-out "$WORK"/profile.yaml "$LOG_DIR/work/" 2>/dev/null || return 0
+  local f
+  while IFS= read -r -d '' f; do
+    sed -E -i 's/(sbp_|sb_secret_|sb_publishable_|eyJ)[A-Za-z0-9._-]+/[redacted]/g' "$f" || true
+    for secret in "${DBPASS_A:-}" "${DBPASS_B:-}" "${PAT:-}" "$ADMIN_PASSWORD"; do
+      [[ -n $secret ]] || continue
+      SECRET=$secret python3 - "$f" <<'PY' || true
+import os, sys
+p = sys.argv[1]
+t = open(p, errors="replace").read()
+open(p, "w").write(t.replace(os.environ["SECRET"], "[redacted]"))
+PY
+    done
+  done < <(find "$LOG_DIR/work" -type f -print0)
+}
+trap 'rc=$?; collect_logs; keep_work; rm -rf "$WORK"; exit $rc' EXIT
 
 need_root
 preflight

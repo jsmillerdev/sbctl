@@ -72,7 +72,16 @@ POOLER_URL=$(cat "$PROJ/supabase/.temp/pooler-url" 2>/dev/null || true)
 # The file holds the user, host and port of the pooler (the CLI drops the password placeholder).
 [[ $POOLER_URL == *"postgres.$REF"*"@pooler."* ]] || bad "link recorded no pooler URL for $REF (got '$POOLER_URL')"
 
-step api-keys projects api-keys --project-ref "$REF" && has "$LAST" "anon" "projects api-keys does not list the anon key"
+# The output holds the service_role key and the log directory is uploaded, so this step keeps
+# no log and prints nothing of the output.
+N=$((N + 1))
+log "supabase projects api-keys --project-ref $REF"
+if keys=$(cli projects api-keys --project-ref "$REF" 2>&1); then
+  grep -qF -- "anon" <<<"$keys" || bad "projects api-keys does not list the anon key"
+else
+  bad "supabase projects api-keys exited non-zero"
+fi
+unset keys
 
 # A migration, pushed through the pooler.
 step migration-new migration new conf_widgets

@@ -27,7 +27,7 @@ Run the Go parts anywhere: `go run ./tests/conformance/specdiff`, `go run ./test
 | Node | 22, in the workflow | |
 
 A bump is a pull request; the `suites` job gates it. `bumpcheck` lists newer releases of every pin
-so a bump is noticed (it never fails for a newer release, only for a pin that no longer exists).
+so a bump is noticed (it never fails for a newer release, only for a pin that no longer exists or a slim-services pin it could not check, such as after a rate limit; the client pins only raise a warning annotation).
 
 ## The node under test
 
@@ -81,7 +81,10 @@ supabase-js 2.117.3:
   `SUPABASE_SERVICE_ROLE_KEY` and a database query through REST from inside the function; a
   secret set with `POST /v1/projects/{ref}/secrets` reaches the function and is listed by name
   only; the function is listed as ACTIVE and a redeploy raises its version and serves the new
-  code; a deleted function answers 404.
+  code; a deleted function answers 404. This suite is also the regression gate for `serve`'s
+  Functions wiring (the syncer loop, the Management API hook and the proxy route):
+  `internal/app/serve_integration_test.go` only checks that the setting reaches the proxy, and
+  it skips in `ci.yml` without `SBCTL_TEST_UNPACKED`.
 
 Supabase CLI (`cli.sh`), through a profile file made by `sbctl api profile`:
 

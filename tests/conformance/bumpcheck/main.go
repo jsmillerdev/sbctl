@@ -54,8 +54,18 @@ func main() {
 			f.Close()
 		}
 	}
+	for _, row := range rep.Rows {
+		if row.Status == "unknown" {
+			// A GitHub annotation, so an unverifiable pin shows on the run page.
+			fmt.Printf("::warning title=bumpcheck::%s %s could not be verified: %s\n", row.Name, row.Pinned, row.Details)
+		}
+	}
 	if rep.Missing() > 0 {
 		fmt.Fprintf(os.Stderr, "\nbumpcheck: %d pinned release(s) are gone or incomplete upstream.\n", rep.Missing())
+		os.Exit(1)
+	}
+	if rep.Unverified() > 0 {
+		fmt.Fprintf(os.Stderr, "\nbumpcheck: %d slim-services pin(s) could not be checked (rate limit or upstream error); a pulled release would go unnoticed, so the run fails.\n", rep.Unverified())
 		os.Exit(1)
 	}
 }
@@ -106,6 +116,7 @@ type Row struct {
 	Name    string
 	Pinned  string
 	Status  string // ok, missing, incomplete, unpinned, unknown
+	Install bool   // a slim-services release that installs fetch; an unknown state fails the run
 	Newest  string
 	Newer   bool
 	Details string
@@ -119,6 +130,18 @@ func (r *Result) Missing() int {
 	n := 0
 	for _, row := range r.Rows {
 		if row.Status == "missing" || row.Status == "incomplete" {
+			n++
+		}
+	}
+	return n
+}
+
+// Unverified counts the slim-services pins whose lookup failed for a reason other than the
+// release being absent. Installs download those, so the run must not read them as fine.
+func (r *Result) Unverified() int {
+	n := 0
+	for _, row := range r.Rows {
+		if row.Install && row.Status == "unknown" {
 			n++
 		}
 	}
@@ -192,7 +215,7 @@ func (c *Checker) Run() (*Result, error) {
 }
 
 func (c *Checker) slim(name, svc, tag string) Row {
-	row := Row{Name: name, Pinned: tag}
+	row := Row{Name: name, Pinned: tag, Install: true}
 	body, code, err := c.Get(fmt.Sprintf("%s/repos/%s/releases/tags/%s", c.GitHub, c.Slim, tag))
 	if err != nil {
 		row.Status, row.Details = "unknown", err.Error()
@@ -235,7 +258,7 @@ func (c *Checker) slim(name, svc, tag string) Row {
 
 // studio checks the Studio tag: the slim-services release studio-<tag>-r<N> must exist.
 func (c *Checker) studio(tag string) Row {
-	row := Row{Name: "studio", Pinned: tag}
+	row := Row{Name: "studio", Pinned: tag, Install: true}
 	body, code, err := c.Get(fmt.Sprintf("%s/repos/%s/git/matching-refs/tags/studio-%s", c.GitHub, c.Slim, tag))
 	if err != nil || code != http.StatusOK {
 		row.Status, row.Details = "unknown", fmt.Sprintf("HTTP %d %v", code, err)

@@ -116,3 +116,31 @@ func TestLongDifferencesAreCounted(t *testing.T) {
 		t.Fatalf("change: %+v", c)
 	}
 }
+
+// "description" and "title" are prose as a key of a schema, and field names as a key of its
+// properties. Dropping or retyping such a field changes what a client can send.
+func TestFieldsNamedLikeProseAreDrift(t *testing.T) {
+	const a = `{"components": {"schemas": {"Key": {"type": "object", "description": "prose",
+	  "properties": {"description": {"type": "string"}, "title": {"type": "string"}, "name": {"type": "string", "title": "Name"}}}}}}`
+	const b = `{"components": {"schemas": {"Key": {"type": "object", "description": "reworded",
+	  "properties": {"title": {"type": "integer"}, "name": {"type": "string", "title": "Renamed"}}}}}}`
+	r := Diff(doc(t, a), doc(t, b))
+	if len(r.SchemasChanged) != 1 {
+		t.Fatalf("schemas changed: %+v", r.SchemasChanged)
+	}
+	got := strings.Join(r.SchemasChanged[0].Lines, "\n")
+	for _, want := range []string{"properties.description: removed", "properties.title.type: \"string\" -> \"integer\""} {
+		if !strings.Contains(got, want) {
+			t.Errorf("drift lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "properties.name") || strings.Contains(got, "reworded") {
+		t.Errorf("prose reported as drift:\n%s", got)
+	}
+	// A field called "properties" holds a schema, whose own prose is still ignored.
+	const c = `{"components": {"schemas": {"S": {"properties": {"properties": {"type": "string", "description": "x"}}}}}}`
+	const d = `{"components": {"schemas": {"S": {"properties": {"properties": {"type": "string", "description": "y"}}}}}}`
+	if r := Diff(doc(t, c), doc(t, d)); !r.Empty() {
+		t.Errorf("prose under a field named properties reported as drift: %+v", r)
+	}
+}

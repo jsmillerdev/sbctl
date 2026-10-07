@@ -10,10 +10,17 @@ import (
 var httpMethods = []string{"get", "put", "post", "delete", "options", "head", "patch", "trace"}
 
 // ignoredKeys are prose and examples: a reworded description is not drift in what a client
-// can send or receive.
+// can send or receive. They are ignored only where they hold prose. Inside a map of named
+// members (nameMaps) the same words are field names, and a removed or retyped field called
+// "description" or "title" is drift.
 var ignoredKeys = map[string]bool{
 	"description": true, "summary": true, "title": true, "example": true, "examples": true,
 	"externalDocs": true, "x-codeSamples": true,
+}
+
+// nameMaps are the keywords whose value maps member names to schemas.
+var nameMaps = map[string]bool{
+	"properties": true, "patternProperties": true, "definitions": true, "$defs": true,
 }
 
 // Change is one operation or schema that exists on both sides but differs.
@@ -151,7 +158,11 @@ func compare(name string, a, b any) *Change {
 }
 
 // deepDiff appends a line for every difference between a and b, below path.
-func deepDiff(path string, a, b any, out *[]string) {
+func deepDiff(path string, a, b any, out *[]string) { walk(path, a, b, out, false) }
+
+// walk is deepDiff; names is true when a and b are maps of member names (the value of a
+// "properties" keyword), whose keys are never prose.
+func walk(path string, a, b any, out *[]string, names bool) {
 	switch av := a.(type) {
 	case map[string]any:
 		bv, ok := b.(map[string]any)
@@ -167,7 +178,7 @@ func deepDiff(path string, a, b any, out *[]string) {
 			keys[k] = true
 		}
 		for _, k := range sortedBool(keys) {
-			if ignoredKeys[k] {
+			if !names && ignoredKeys[k] {
 				continue
 			}
 			sub := join(path, k)
@@ -179,7 +190,7 @@ func deepDiff(path string, a, b any, out *[]string) {
 			case !inA && inB:
 				*out = append(*out, fmt.Sprintf("%s: added (%s)", sub, brief(y)))
 			default:
-				deepDiff(sub, x, y, out)
+				walk(sub, x, y, out, !names && nameMaps[k])
 			}
 		}
 	case []any:
@@ -206,7 +217,7 @@ func deepDiff(path string, a, b any, out *[]string) {
 				case !inA && inB:
 					*out = append(*out, fmt.Sprintf("%s: added", sub))
 				default:
-					deepDiff(sub, x, y, out)
+					walk(sub, x, y, out, false)
 				}
 			}
 			return
@@ -234,7 +245,7 @@ func deepDiff(path string, a, b any, out *[]string) {
 			case i >= len(av):
 				*out = append(*out, fmt.Sprintf("%s: added", sub))
 			default:
-				deepDiff(sub, av[i], bv[i], out)
+				walk(sub, av[i], bv[i], out, false)
 			}
 		}
 	default:
