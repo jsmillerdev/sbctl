@@ -82,6 +82,23 @@ GoTrue's `user_metadata`; later edits win). Every authenticated user can see and
 every project and organization: members and roles are a later phase, which is why
 `/platform/profile/permissions` grants `%` on `%` and every PAT carries full access.
 
+### Claim and invite (`GET` and `POST /claim`, `claim.go`)
+
+`sb-gotrue@system` has sign-up disabled, so dashboard accounts come only from here. A claim token
+(`sbc_` + 48 hex) creates the first administrator, an invite token (`sbi_`) creates one user for a
+fixed address. Only the SHA-256 is stored (`sbctl.claim_tokens`, migration `0600`); a token works
+once and expires (claim 72 hours, invite 7 days). `POST /claim {token, email, password,
+organization_name}` consumes the token with one conditional `UPDATE`, creates the user through
+GoTrue's admin API on `sb-gotrue@system` with the system `service_role` key (`email_confirm: true`,
+`app_metadata.sbctl_admin = true`), and for a claim token creates the first organization (or keeps
+the existing one); the answer is `201 {email, user_id, organization, dashboard_url}`. When the user
+cannot be created (the address exists, the password is refused) the token is released and answers
+again. Unknown, used and expired tokens all answer `403`; ten failures in a minute answer `429` for
+the rest of the minute, node-wide. `GET /claim` serves a self-contained page (one inline script
+pinned by hash in the CSP, no third-party requests). Neither route takes credentials: the token is
+the credential. `Accounts` (the same type the CLI uses for `sbctl claim token`, `sbctl users invite|list|remove`)
+also lists dashboard users and removes one together with the personal access tokens it created.
+
 ### `supabase login` (device flow)
 
 Studio's `/cli/login` page calls `POST /platform/cli/login {session_id, public_key,

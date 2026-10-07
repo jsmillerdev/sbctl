@@ -32,6 +32,10 @@ type Deps struct {
 	// Empty derives it from Registry: the registry's database for a Postgres
 	// registry, memory otherwise.
 	Store Store
+	// Claims keeps the claim and invite tokens behind GET and POST /claim. Empty derives
+	// it from Registry like Store: the registry's database for a Postgres registry,
+	// memory otherwise.
+	Claims ClaimStore
 	// HTTPClient is used for every upstream call (pg-meta, GoTrue, Storage).
 	HTTPClient *http.Client
 	// PGMetaURL overrides http://127.0.0.1:<ports.pgmeta>.
@@ -57,6 +61,8 @@ type Server struct {
 	hc    *http.Client
 	now   func() time.Time
 	auth  *authenticator
+	// accounts redeems claim and invite tokens (claim.go).
+	accounts *Accounts
 
 	pgmetaURL        string
 	upstreamOverride func(p *registry.Project, svc string) string
@@ -191,6 +197,16 @@ func NewServer(d Deps) (*Server, error) {
 			s.store = NewMemoryStore()
 		}
 	}
+	claims := d.Claims
+	if claims == nil {
+		if pg, ok := d.Registry.(*registry.Postgres); ok {
+			claims = NewPGClaimStore(pg.Pool())
+		} else {
+			claims = NewMemoryClaimStore()
+		}
+	}
+	s.accounts = &Accounts{Reg: s.reg, Store: claims, Keys: s.mgr.Keys, Config: s.cfg, HTTP: s.hc, Now: s.now, Log: s.log,
+		GoTrueURL: s.upstream(&registry.Project{Ref: config.SystemRef}, upGoTrue)}
 	s.auth = newAuthenticator(s.reg, s.mgr.Keys, s.store, s.now, s.cfg.API.Admins())
 	h, err := s.build()
 	if err != nil {
@@ -268,6 +284,7 @@ func (s *Server) build() (http.Handler, error) {
 			mux.handle(key, s.wrap(r.auth, r.h))
 		}
 	}
+	s.claimRoutes(mux)
 	mux.fallback = s.wrap(authAny, s.unknown)
 	return s.middleware(mux), nil
 }

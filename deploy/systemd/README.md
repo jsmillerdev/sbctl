@@ -125,3 +125,17 @@ user can enter) and requires scram-sha-256 on TCP; the registry is reached throu
 socket, so a process that can enter a cluster's socket directory is a superuser there. The
 allowlist hides every socket directory from the other units, but not from the daemon, which
 needs them.
+
+**Cloud metadata.** On AWS (deploy/cloudformation/sbctl.yaml) the instance role holds write
+access to the whole backup bucket (every project's WAL and base backups) and Route 53 changes,
+and IMDSv2's hop limit of 1 does not stop a process on the instance itself. The tenant-facing
+units (GoTrue, PostgREST, postgres-meta, Realtime, Supavisor, Studio, imgproxy, edge runtime)
+therefore carry `IPAddressDeny=169.254.169.254`. Two exceptions need the role and keep access:
+`sbctl.service` and the backup units, and `sb-postgres@` (its `archive_command` runs
+`sbctl wal push` inside the postmaster, which signs S3 requests with the role), plus
+`sb-storage` when `storage_backend = "s3"` relies on the role. A Postgres extension or a
+Storage bug could still reach the credentials, so the AWS template should be paired, once
+workstream J runs user code in Edge Functions, with a bucket policy or a separate role for
+Storage and with static credentials for the WAL archiver (`--s3-credentials-file`). Workstream
+J: keep `IPAddressDeny=169.254.169.254` on `sb-edge-runtime.service` and on any unit that runs
+tenant code.

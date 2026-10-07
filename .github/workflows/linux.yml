@@ -140,3 +140,36 @@ jobs:
           name: fleet-smoke-${{ matrix.arch }}
           path: /tmp/sbctl-fleet-logs
           if-no-files-found: ignore
+
+  # The installer on a fresh VM: deploy/install.sh, the claim flow, a project through the
+  # Management API with a PAT, REST through the proxy, the pooler, a re-run, self-update.
+  install-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build sbctl v0.0.1, v0.0.2 (installer upgrade) and v0.0.3 (self-update target)
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/sbctl ./cmd/sbctl
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/sbctl-v2 ./cmd/sbctl
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.3" -o /tmp/sbctl-v3 ./cmd/sbctl
+      - name: install end to end
+        run: sudo LOG_DIR=/tmp/sbctl-install-logs SBCTL_BIN=/tmp/sbctl SBCTL_BIN_V2=/tmp/sbctl-v2 SBCTL_BIN_V3=/tmp/sbctl-v3 tests/linux/install-e2e.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/sbctl-install-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-e2e-${{ matrix.arch }}
+          path: /tmp/sbctl-install-logs
+          if-no-files-found: ignore

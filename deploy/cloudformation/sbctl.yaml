@@ -1,4 +1,584 @@
-# Workstream G: one-click AWS stack.
 AWSTemplateFormatVersion: "2010-09-09"
-Description: sbctl node (not implemented)
-Resources: {}
+Description: >-
+  sbctl: multi-project Supabase on one Ubuntu 24.04 instance. Creates the instance, an Elastic IP,
+  an encrypted XFS data volume, a backup bucket, a security group, a role scoped to that bucket
+  and (optionally) one Route 53 zone, and a Secrets Manager secret that holds the one-time claim
+  token. The instance runs the sbctl installer from the GitHub release.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Instance }
+        Parameters: [Architecture, InstanceType, DataVolumeSize, AdminEmail, SbctlVersion]
+      - Label: { default: "Domain (optional; leave empty to use sslip.io on the Elastic IP)" }
+        Parameters: [DomainName, HostedZoneId]
+      - Label: { default: Network }
+        Parameters: [VpcId, SubnetId, AccessCidr, SshCidr, EnableSessionManager]
+    ParameterLabels:
+      Architecture: { default: CPU architecture }
+      InstanceType: { default: Instance type }
+      DataVolumeSize: { default: Data volume size (GiB) }
+      AdminEmail: { default: Admin email }
+      SbctlVersion: { default: sbctl release }
+      DomainName: { default: Domain name }
+      HostedZoneId: { default: Route 53 hosted zone ID }
+      VpcId: { default: Existing VPC (optional) }
+      SubnetId: { default: Existing public subnet (optional) }
+      AccessCidr: { default: "Who may reach the dashboard, API and database ports" }
+      SshCidr: { default: Who may reach SSH (optional) }
+      EnableSessionManager: { default: Allow AWS Systems Manager Session Manager }
+
+Parameters:
+  Architecture:
+    Type: String
+    Default: arm64
+    AllowedValues: [arm64, x86_64]
+    Description: arm64 (Graviton) is the default and the cheaper choice; pick x86_64 only with an x86 instance type.
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedValues:
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+      - t4g.xlarge
+      - m7g.large
+      - m7g.xlarge
+      - m7g.2xlarge
+      - r7g.large
+      - r7g.xlarge
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m7i.large
+      - m7i.xlarge
+      - m7i.2xlarge
+      - r7i.large
+      - r7i.xlarge
+    Description: >-
+      Each project costs about 100 MB of RAM idle, so 4 GiB (t4g.medium) fits a handful of small
+      projects and 16 GiB about a hundred. The type must match the architecture.
+  DataVolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 16384
+    Description: Size in GiB of the encrypted XFS volume mounted at /var/lib/sbctl (project data and the local artifact cache).
+  AdminEmail:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Enter an email address.
+    Description: Contact address for the Let's Encrypt account (expiry notices).
+  SbctlVersion:
+    Type: String
+    Default: latest
+    AllowedPattern: "^(latest|v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?)$"
+    ConstraintDescription: Enter "latest" or a release tag such as v1.2.3.
+    Description: The sbctl release to install.
+  DomainName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
+    ConstraintDescription: Enter a lower-case domain name such as example.com, or leave it empty.
+    Description: >-
+      Base domain, for example example.com. The dashboard becomes studio.example.com. With a hosted
+      zone below, the stack creates the DNS records and issues a wildcard certificate by DNS-01;
+      without one, create the records listed in the stack outputs yourself.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^Z[A-Z0-9]{5,31}$"
+    ConstraintDescription: Enter a Route 53 hosted zone ID such as Z0123456789ABCDEFGHIJ, or leave it empty.
+    Description: Route 53 public hosted zone that contains the domain. Needs a domain name.
+  VpcId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^vpc-[0-9a-f]{8,17}$"
+    Description: Leave empty and the stack creates a small VPC with one public subnet. To use your own, fill in both this and the subnet.
+  SubnetId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^subnet-[0-9a-f]{8,17}$"
+    Description: A public subnet (one that routes to an internet gateway) of that VPC.
+  AccessCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.0/24.
+    Description: >-
+      Source range for ports 80, 443, 5432 and 6543. Port 80 must stay reachable from the internet
+      for HTTP-01 certificates when no hosted zone is given. Narrow this for a private team.
+  SshCidr:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.4/32, or leave it empty.
+    Description: Optional source range for SSH (port 22). Empty opens no SSH port; use Session Manager (EnableSessionManager, on by default).
+  EnableSessionManager:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Add a minimal policy (Session Manager channels only) so you can open a shell without SSH. Set to false to give the instance role no Systems Manager rights.
+  # Resolved by CloudFormation when the stack is created; both are listed so that the
+  # architecture choice can pick one without the template knowing the AMI id.
+  UbuntuArm64Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id
+    Description: Canonical's public SSM parameter for Ubuntu 24.04 arm64. Leave the default.
+  UbuntuAmd64Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Canonical's public SSM parameter for Ubuntu 24.04 amd64. Leave the default.
+
+Rules:
+  ArchitectureMatchesInstanceType:
+    RuleCondition: !Equals [!Ref Architecture, arm64]
+    Assertions:
+      - Assert: !Contains [[t4g.small, t4g.medium, t4g.large, t4g.xlarge, m7g.large, m7g.xlarge, m7g.2xlarge, r7g.large, r7g.xlarge], !Ref InstanceType]
+        AssertDescription: Architecture arm64 needs a Graviton instance type (t4g, m7g, r7g).
+  ArchitectureMatchesInstanceTypeX86:
+    RuleCondition: !Equals [!Ref Architecture, x86_64]
+    Assertions:
+      - Assert: !Contains [[t3.medium, t3.large, t3.xlarge, m7i.large, m7i.xlarge, m7i.2xlarge, r7i.large, r7i.xlarge], !Ref InstanceType]
+        AssertDescription: Architecture x86_64 needs an x86 instance type (t3, m7i, r7i).
+  ZoneNeedsDomain:
+    RuleCondition: !Not [!Equals [!Ref HostedZoneId, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref DomainName, ""]]
+        AssertDescription: A hosted zone needs a domain name.
+  VpcNeedsSubnet:
+    RuleCondition: !Or [!Not [!Equals [!Ref VpcId, ""]], !Not [!Equals [!Ref SubnetId, ""]]]
+    Assertions:
+      - Assert: !And [!Not [!Equals [!Ref VpcId, ""]], !Not [!Equals [!Ref SubnetId, ""]]]
+        AssertDescription: Give both the VPC and the subnet, or neither.
+
+Conditions:
+  IsArm: !Equals [!Ref Architecture, arm64]
+  HasDomain: !Not [!Equals [!Ref DomainName, ""]]
+  HasZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+  HasSsh: !Not [!Equals [!Ref SshCidr, ""]]
+  SessionManagerOn: !Equals [!Ref EnableSessionManager, "true"]
+  CreateNetwork: !Equals [!Ref VpcId, ""]
+  IsLatest: !Equals [!Ref SbctlVersion, latest]
+
+Resources:
+  # ---- network (only when no existing VPC is given) ------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNetwork
+    Properties:
+      CidrBlock: 10.77.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNetwork
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.77.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNetwork
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: sbctl - web, API and database ports (plus SSH when asked for)
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcId]
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AccessCidr, Description: HTTP (certificate challenges and redirect) }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AccessCidr, Description: "HTTPS (dashboard, API and project APIs)" }
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, CidrIp: !Ref AccessCidr, Description: Postgres session pooler }
+        - { IpProtocol: tcp, FromPort: 6543, ToPort: 6543, CidrIp: !Ref AccessCidr, Description: Postgres transaction pooler }
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  SshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSsh
+    Properties:
+      GroupId: !GetAtt SecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshCidr
+      Description: SSH
+
+  # ---- storage -------------------------------------------------------------------------
+  # Backups outlive the stack: deleting the stack keeps the bucket (and its WAL archive).
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt BackupBucket.Arn, !Sub "${BackupBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !GetAtt Instance.AvailabilityZone
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Encrypted: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-data" }]
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref Instance
+      VolumeId: !Ref DataVolume
+      Device: /dev/sdf
+
+  # The claim token is generated on the instance; the instance role may only write this secret.
+  ClaimTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/claim-token"
+      Description: One-time token that creates the first sbctl dashboard administrator at /claim. Single use; replace by running "sudo -u sbctl sbctl claim token" on the instance.
+      SecretString: "pending - the instance writes the token here when the install finishes"
+
+  # ---- identity ------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: backup-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:ListBucket", "s3:GetBucketLocation", "s3:ListBucketMultipartUploads"]
+                Resource: !GetAtt BackupBucket.Arn
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
+                Resource: !Sub "${BackupBucket.Arn}/*"
+        - PolicyName: claim-token-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "secretsmanager:PutSecretValue"
+                Resource: !Ref ClaimTokenSecret
+  # DNS-01 certificates: change records in the one hosted zone and nothing else.
+  DnsPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasZone
+    Properties:
+      PolicyName: route53-dns01
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ["route53:ChangeResourceRecordSets", "route53:ListResourceRecordSets"]
+            Resource: !Sub "arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}"
+          - Effect: Allow
+            Action: "route53:GetChange"
+            Resource: !Sub "arn:${AWS::Partition}:route53:::change/*"
+  # Session Manager, minimally. The managed policy AmazonSSMManagedInstanceCore is not used: it
+  # grants ssm:GetParameter(s) on every parameter in the account, and the instance metadata
+  # credentials are reachable by the database and storage services that run user code.
+  SessionManagerPolicy:
+    Type: AWS::IAM::Policy
+    Condition: SessionManagerOn
+    Properties:
+      PolicyName: session-manager
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "ssm:UpdateInstanceInformation"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Resource: "*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---- the instance --------------------------------------------------------------------
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref Instance
+
+  # The instance signals here when the installer has finished (or failed).
+  InstallHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  InstallWait:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: Instance
+    Properties:
+      Handle: !Ref InstallHandle
+      Timeout: "1800"
+      Count: 1
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      cfn-lint:
+        config:
+          # SubnetId defaults to "" and is only used when VpcId is given (CreateNetwork is false).
+          ignore_checks: [W1030]
+    Properties:
+      ImageId: !If [IsArm, !Ref UbuntuArm64Ami, !Ref UbuntuAmd64Ami]
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !If [CreateNetwork, !Ref Subnet, !Ref SubnetId]
+          GroupSet: [!GetAtt SecurityGroup.GroupId]
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # sbctl first boot: data volume, installer, claim token, signal. Logs: /var/log/sbctl-bootstrap.log
+            # The log is created 0600 before anything is written: it must not be readable by the
+            # tenant-facing services that run on this host. The installer prints no secret when it
+            # is given --claim-token-file, and cloud-init copies this output to the console log.
+            install -m 0600 /dev/null /var/log/sbctl-bootstrap.log
+            exec > >(tee -a /var/log/sbctl-bootstrap.log) 2>&1
+            set -uo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            HANDLE_URL='${InstallHandle}'
+            REGION='${AWS::Region}'
+
+            signal() { # SUCCESS|FAILURE reason
+              local status=$1 reason=$2
+              if command -v cfn-signal >/dev/null; then
+                if [ "$status" = SUCCESS ]; then cfn-signal -s true -r "$reason" "$HANDLE_URL" && return 0
+                else cfn-signal -s false -r "$reason" "$HANDLE_URL" && return 0; fi
+              fi
+              # The signal is a JSON document PUT to the pre-signed handle URL, which is all cfn-signal does.
+              curl -fsS -X PUT -H 'Content-Type:' --data-binary \
+                "{\"Status\":\"$status\",\"Reason\":\"$reason\",\"UniqueId\":\"sbctl\",\"Data\":\"$reason\"}" "$HANDLE_URL"
+            }
+            fail() { echo "FAILED: $*"; signal FAILURE "$* (see /var/log/sbctl-bootstrap.log on the instance)"; exit 1; }
+            step() { echo "==> $*"; }
+
+            step "waiting for the network"
+            for i in $(seq 1 60); do curl -fsS -m 5 -o /dev/null https://checkip.amazonaws.com && break; sleep 5; done
+            # The Elastic IP is attached shortly after launch and replaces the launch address;
+            # carry on only once the instance answers from it.
+            for i in $(seq 1 60); do
+              [ "$(curl -fsS -m 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')" = '${ElasticIp}' ] && break
+              sleep 5
+            done
+
+            step "installing packages"
+            apt-get update -qq || fail "apt-get update"
+            apt-get install -y -qq xfsprogs curl ca-certificates openssl python3-venv || fail "apt-get install"
+            apt-get install -y -qq awscli || snap install aws-cli --classic || fail "cannot install the AWS CLI"
+            if [ ! -x /usr/local/bin/cfn-signal ] && ! command -v cfn-signal >/dev/null; then
+              python3 -m venv /opt/aws-cfn \
+                && /opt/aws-cfn/bin/pip install -q https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz \
+                && ln -sf /opt/aws-cfn/bin/cfn-signal /usr/local/bin/cfn-signal \
+                || echo "cfn-bootstrap not installed; signalling with curl"
+            fi
+
+            step "preparing the data volume (XFS at /var/lib/sbctl)"
+            # The volume is attached after the instance is created and shows up as a second NVMe
+            # disk. The disk that holds / is the root volume; the other EBS disk is the data volume.
+            ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -n1)
+            DEV=""
+            for i in $(seq 1 120); do
+              for link in /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_*; do
+                [ -e "$link" ] || continue
+                case "$link" in *-part*) continue ;; esac
+                d=$(readlink -f "$link")
+                [ "$(basename "$d")" = "$ROOT_DISK" ] && continue
+                DEV=$d
+              done
+              [ -n "$DEV" ] && break
+              sleep 5
+            done
+            [ -n "$DEV" ] || fail "the data volume did not appear"
+            if ! blkid "$DEV" >/dev/null 2>&1; then mkfs.xfs -L sbctl-data "$DEV" || fail "mkfs.xfs"; fi
+            mkdir -p /var/lib/sbctl
+            if ! grep -q ' /var/lib/sbctl ' /etc/fstab; then
+              echo "UUID=$(blkid -s UUID -o value "$DEV") /var/lib/sbctl xfs defaults,nofail 0 2" >> /etc/fstab
+            fi
+            mountpoint -q /var/lib/sbctl || mount /var/lib/sbctl || fail "mount /var/lib/sbctl"
+            # If the volume is missing at a later boot, the daemon and the system Postgres must fail
+            # rather than start against an empty /var/lib/sbctl on the root disk (nofail only keeps
+            # the boot itself going).
+            for u in sbctl.service sb-postgres@.service; do
+              mkdir -p "/etc/systemd/system/$u.d"
+              printf '[Unit]\nRequiresMountsFor=/var/lib/sbctl\n' > "/etc/systemd/system/$u.d/10-sbctl-data-mount.conf"
+            done
+            systemctl daemon-reload
+
+            step "downloading the installer"
+            REL='${ReleaseBase}'
+            curl -fsSL --retry 5 -o /root/sbctl-install.sh "$REL/install.sh" || fail "cannot download $REL/install.sh"
+
+            step "running the installer"
+            set -- --email '${AdminEmail}' --s3-bucket '${BackupBucket}' --s3-region "$REGION" --public-ip '${ElasticIp}' \
+              --claim-token-file /root/claim-token --firewall none
+            case "$REGION" in
+              us-west-1|us-west-2|us-east-1|us-east-2|ca-central-1|eu-west-1|eu-west-2|eu-west-3|eu-central-1|eu-central-2|eu-north-1|ap-south-1|ap-southeast-1|ap-northeast-1|ap-northeast-2|ap-southeast-2|sa-east-1)
+                set -- "$@" --region "$REGION" ;;
+            esac
+            ${DomainArgs}
+            ${VersionArgs}
+            bash /root/sbctl-install.sh "$@" || fail "the sbctl installer failed"
+
+            step "storing the claim token"
+            if [ -s /root/claim-token ]; then
+              # From a file, not argv: command lines are readable by every process on the host.
+              (umask 077; tr -d '[:space:]' < /root/claim-token > /root/claim-token.secret)
+              aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
+                --secret-string file:///root/claim-token.secret >/dev/null || fail "cannot write the claim token secret"
+              shred -u /root/claim-token /root/claim-token.secret 2>/dev/null || rm -f /root/claim-token /root/claim-token.secret
+            fi
+            rm -f /root/sbctl-install.sh
+
+            step "done"
+            signal SUCCESS "sbctl is installed"
+          - ReleaseBase: !If
+              - IsLatest
+              - https://github.com/jsmillerdev/sbctl/releases/latest/download
+              - !Sub "https://github.com/jsmillerdev/sbctl/releases/download/${SbctlVersion}"
+            DomainArgs: !If
+              - HasZone
+              - !Sub "set -- \"$@\" --domain '${DomainName}' --dns route53 --dns-credential 'hosted_zone_id=${HostedZoneId}' --dns-credential \"region=$REGION\""
+              - !If
+                  - HasDomain
+                  - !Sub "set -- \"$@\" --domain '${DomainName}'"
+                  - "true"
+            VersionArgs: !If
+              - IsLatest
+              - "true"
+              - !Sub "set -- \"$@\" --version '${SbctlVersion}'"
+
+  # DNS records, when the stack owns the zone. The wildcard covers every project.
+  DnsRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HasZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Comment: !Sub "sbctl (${AWS::StackName})"
+      RecordSets:
+        - { Name: !Sub "api.${DomainName}.", Type: A, TTL: "300", ResourceRecords: [!Ref ElasticIp] }
+        - { Name: !Sub "studio.${DomainName}.", Type: A, TTL: "300", ResourceRecords: [!Ref ElasticIp] }
+        - { Name: !Sub "pooler.${DomainName}.", Type: A, TTL: "300", ResourceRecords: [!Ref ElasticIp] }
+        - { Name: !Sub "*.api.${DomainName}.", Type: A, TTL: "300", ResourceRecords: [!Ref ElasticIp] }
+
+Outputs:
+  DashboardUrl:
+    Description: Open this, then create the first administrator at ClaimUrl.
+    Value: !If [HasDomain, !Sub "https://studio.${DomainName}", !Sub "https://studio.${ElasticIp}.sslip.io"]
+  ApiUrl:
+    Description: Management API (Supabase CLI --profile api_url, MCP --api-url).
+    Value: !If [HasDomain, !Sub "https://api.${DomainName}", !Sub "https://api.${ElasticIp}.sslip.io"]
+  ClaimUrl:
+    Description: The claim page. Enter the token from ClaimTokenSecretArn there.
+    Value: !If [HasDomain, !Sub "https://api.${DomainName}/claim", !Sub "https://api.${ElasticIp}.sslip.io/claim"]
+  ClaimTokenSecretArn:
+    Description: Secrets Manager secret holding the one-time claim token. Read it with "aws secretsmanager get-secret-value --secret-id <this> --query SecretString --output text".
+    Value: !Ref ClaimTokenSecret
+  PublicIp:
+    Description: The Elastic IP. Point DNS here when the stack does not own the zone.
+    Value: !Ref ElasticIp
+  DnsRecordsNeeded:
+    Description: Records to create yourself (the stack creates them when it is given a hosted zone).
+    Value: !If
+      - HasDomain
+      - !If
+          - HasZone
+          - Created by this stack
+          - !Sub "A api.${DomainName}, studio.${DomainName}, pooler.${DomainName} and *.api.${DomainName} -> ${ElasticIp}"
+      - Not needed (sslip.io resolves the Elastic IP)
+  BackupBucket:
+    Description: S3 bucket for WAL archives and base backups. Kept when the stack is deleted.
+    Value: !Ref BackupBucket
+  InstanceId:
+    Description: Instance ID. Connect with Session Manager; logs are in /var/log/sbctl-bootstrap.log and journalctl -u sbctl.
+    Value: !Ref Instance

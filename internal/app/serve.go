@@ -15,6 +15,7 @@ import (
 	"github.com/OWNER/sbctl/internal/api"
 	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/fleet"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/proxy"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -43,12 +44,24 @@ var registryWait = 2 * time.Minute
 func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	log := o.log()
 	lo := LifecycleOptions(cfg, o)
+	// Without a Fleet from the caller the Engine registers projects with Supavisor,
+	// Realtime and Storage through a Lazy fleet (credentials loaded on first use, a
+	// service this node never rendered skipped), so a project created through the API
+	// reaches the shared services exactly as one created by `sbctl projects create`.
+	var lz *fleet.Lazy
+	if len(o.Fleet) == 0 {
+		lz = fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
+		lo.Fleet = lz.Fleet()
+	}
 	backups := memoizeBackups(&lo)
 	node, err := openNode(ctx, cfg, lo, log)
 	if err != nil {
 		return err
 	}
 	defer node.Close() // after the drain below: Serve returns only when nothing runs any more
+	if lz != nil {
+		lz.Bind(node.Registry, node.Secrets)
+	}
 
 	// Create the shared postgres-meta passphrase now, so the unit that starts pg-meta
 	// reads the same sealed secret the API uses (PGMetaCryptoKey).
@@ -102,6 +115,11 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		budget = StopBudget
 	}
 	superviseStop(g, gctx, budget, edge.Run, apiH.Drain, admin.Shutdown, log)
+	if cfg.Supervisor == config.SupervisorSystemd {
+		// Next to the projects: a shared service that takes minutes to answer (Realtime and
+		// Supavisor run migrations first) must not hold the projects back.
+		g.Go(func() error { startFleet(gctx, node, log); return nil })
+	}
 	g.Go(func() error {
 		startProjects(gctx, node, recovered, backups(node), log)
 		return nil
@@ -142,6 +160,27 @@ func superviseStop(g *errgroup.Group, gctx context.Context, budget time.Duration
 		defer stopEdge()
 		return edgeRun(edgeCtx)
 	})
+}
+
+// startFleet starts the shared services (postgres-meta, Supavisor, Realtime, Storage,
+// Studio) at boot. Their units are not enabled for boot, like every unit of the
+// control plane's own: the daemon starts them, in order, once the registry is up, so a
+// reboot brings the whole node back from one enabled unit (sbctl.service). Already
+// running services whose files are unchanged are left alone. The installer renders and
+// first starts them (`sbctl fleet start`); a service whose artifact was never fetched
+// fails here and is logged, and the rest of the node still comes up.
+func startFleet(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+	m, err := fleet.NewManager(fleet.Deps{Cfg: n.Cfg, Log: log.With("component", "fleet"), Registry: n.Registry,
+		Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts})
+	if err != nil {
+		log.Error("fleet not started", "error", err)
+		return
+	}
+	if err := m.Start(ctx); err != nil {
+		log.Error("shared services did not all start", "error", err)
+		return
+	}
+	log.Info("shared services started")
 }
 
 // startProjects brings the system project's backup timer and every active project up
