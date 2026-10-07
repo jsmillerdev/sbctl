@@ -96,7 +96,7 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 ### I. Branching (starts once B, D and F are merged; DESIGN.md section 9a)
 - Registry: `projects.parent_ref`, `branch_name`, `persistent`, `expires_at` (migration range 0700-0799). A branch is a project; its ref, keys and host are its own.
 - API: `GET/POST /v1/projects/{ref}/branches`, `GET /v1/projects/{ref}/branches/{name}`, `GET/PATCH/DELETE /v1/branches/{id_or_ref}`, `POST /v1/branches/{id_or_ref}/merge|reset|push`, plus the `/platform` twins Studio uses and the entitlement that unlocks branching in the CLI. Shapes from the specs.
-- Create: schema-only by default (parent's `supabase_migrations` history and `seed.sql`); `with_data` clones the parent's data directory copy-on-write (reflink inside `pg_backup_start`/`pg_backup_stop`) on XFS, btrfs or ZFS, else restores the parent's latest base backup plus WAL through F.
+- Create: schema-only by default (parent's `supabase_migrations` history and `seed.sql`); `with_data` clones the parent's data directory copy-on-write (reflink inside `pg_backup_start`/`pg_backup_stop`) on XFS, btrfs or OpenZFS 2.2+ with block cloning (macOS APFS uses clonefile), else restores the parent's latest base backup plus WAL through F.
 - Merge, reset, push as schema operations over migration history; expiry sweeper for `expires_at`.
 - Verify with the Supabase MCP server's branch tools and `supabase branches create|list|delete`; CI measures clone time and disk for a 1 GB parent on XFS and ext4.
 
@@ -137,6 +137,8 @@ B + D + E -----------------> K (dashboard writes), L (SSO) -> H
 ```
 
 A, B, C, D, F can start simultaneously. E needs D's system cluster. G needs a working binary. H needs G.
+
+**I/J integration (open until both are merged).** Branching (I) does not copy Edge Functions yet: workstream J (v1, in progress on `ws/j-functions`) materializes each project's stored deployments and secrets under `projects/<ref>/functions/`. Once J is on main: branch create copies the parent's stored deployments and secrets into the branch (a branch has its own functions directory, so it is a row copy plus a re-materialize, not a file copy); merge carries the branch's function changes back to the parent; `with_data`/`reset` re-copy them; `secrets` in `CreateBranchBody` (refused with 400 until then) becomes the branch's function secrets. Owner of the change: whoever merges second, in `internal/branching/` (create.go, ops.go) with J's hook in the API layer.
 
 ## 5. What a fresh session must not re-decide
 

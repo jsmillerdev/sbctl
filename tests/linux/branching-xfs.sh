@@ -10,7 +10,9 @@
 #    sbctl restores the parent's latest base backup plus WAL (internal/backup) and says so.
 #
 # Both runs also run the full branching scenario (schema-only and with_data branches,
-# isolation in both directions, merge, push, reset, delete, expiry).
+# isolation in both directions, merge, push, reset, delete, expiry), a clone of a parent under
+# write load checked with amcheck (file-clone filesystems only), the isolation of a clone from
+# the parent's subscriptions and cron jobs, and the merge lock.
 #
 # It runs as an unprivileged user (initdb refuses root) and uses sudo only to format and
 # mount the loop file. No Docker, no systemd: the exec supervisor starts the clusters.
@@ -71,7 +73,7 @@ run() { # run <label> <state dir> <expected method>
   (cd internal/branching && \
     SBCTL_TEST_UNPACKED="$unpacked" SBCTL_TEST_STATE_DIR="$state" SBCTL_TEST_EXPECT_METHOD="$expect" \
     SBCTL_TEST_PARENT_MB="$PARENT_MB" SBCTL_TEST_LABEL="$label" \
-    "$work/branching.test" -test.run '^(TestIntegrationBranching|TestIntegrationCloneSize)$' -test.v -test.timeout 35m)
+    "$work/branching.test" -test.run '^(TestIntegrationBranching|TestIntegrationCloneSize|TestIntegrationCloneUnderWriteLoad|TestIntegrationCloneIsolatesTheParentsIntegrations|TestIntegrationApplyRefusesAVersionAlreadyApplied)$' -test.v -test.timeout 35m)
 }
 
 # 1. XFS with reflink.

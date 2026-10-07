@@ -67,7 +67,12 @@ and `GET .../diff`, with the exact spec shapes (`BranchResponse`, `BranchDetailR
 these paths itself; the `/platform` twins are the project fields `is_branch_enabled`,
 `preview_branch_refs` and `parent_project_ref`. Branches are not listed as projects. Merge, reset and
 push answer `201 {workflow_run_id, message: "ok"}` at once and run in the background; the branch's
-`status` follows. `?force=true` on merge and push is our extension. Without `Deps.Branching` the list is
+`status` follows. `?force=true` on merge and push is our extension. `GET /v1/branches/{id}` omits `db_pass` and `jwt_secret` for the default branch (the project's own
+secrets stay in the secret store) and answers without them while a new branch's credentials are not
+stored yet. Create refuses what the node cannot honor with 400: non-empty `secrets`, a `release_channel`
+other than `ga`, a `postgres_engine` other than the parent's; `region` is accepted and the parent's
+is used. PATCH refuses a `status` that differs from the branch's own and accepts the deprecated
+`reset_on_push` (the spec says it is ignored). Without `Deps.Branching` the list is
 the default branch only and a create answers 400. Organization entitlements already grant
 `branching_limit` and `branching_persistent`, which is what the CLI checks on a failed create.
 

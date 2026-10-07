@@ -113,7 +113,7 @@ Laptops are not a target. Supabase's own `supabase start --runtime native` alrea
 Self-hosted Supabase has no branching; hosted gives every branch its own Postgres instance. AI agents need exactly that: a disposable environment each, many in parallel. A branch in `sbctl` is a project with a `parent_ref`, so it gets its own cluster, keys and host for about 100 MB idle. `sbctl` implements the Management API branch endpoints (`/v1/projects/{ref}/branches`, `/v1/branches/{id}`, `merge`, `reset`, `push`), so the stock Supabase MCP server and CLI branch tools work unchanged.
 
 - **Schema-only** (hosted default): new project, then the parent's migrations and `seed.sql`.
-- **With data**: a copy-on-write clone of the parent's data directory (`pg_backup_start`, reflink copy, `pg_backup_stop`) when the data disk is XFS, btrfs or ZFS, so creation time and disk use do not grow with the database; otherwise a restore from the parent's latest base backup plus WAL (workstream F).
+- **With data**: a copy-on-write clone of the parent's data directory (`pg_backup_start`, reflink copy, `pg_backup_stop`) when the data disk is XFS, btrfs or OpenZFS 2.2+ with block cloning (macOS APFS uses clonefile), so creation time and disk use do not grow with the database; otherwise a restore from the parent's latest base backup plus WAL (workstream F).
 - **Merge** applies the branch's new migrations to the parent; **reset** recreates the branch from the parent; **push** (rebase) applies the parent's new migrations to the branch.
 - **Expiry**: branches carry an optional TTL and are deleted when it lapses; with idle sleep, an unused branch costs only disk.
 
