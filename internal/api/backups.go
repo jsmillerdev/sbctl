@@ -66,6 +66,16 @@ func isRunning(p *registry.Project) bool {
 	return p.Status == registry.StatusActiveHealthy || p.Status == registry.StatusActiveUnhealthy
 }
 
+// restorable refuses a restore of a project that is not running with 409, before the request's
+// time or backup is judged: the cluster must be up, and the window of a project that is not running
+// (one that is already RESTORING, for instance) says nothing about what a restore could reach.
+func restorable(p *registry.Project) error {
+	if !isRunning(p) {
+		return errf(http.StatusConflict, "Cannot restore project %s while it is %s", p.Ref, p.Status)
+	}
+	return nil
+}
+
 // backupInfoOf reads the node's restorable backups of p. Without a backup service nothing is
 // restorable and PITR is off.
 func (s *Server) backupInfoOf(ctx context.Context, p *registry.Project) (backupInfo, error) {
@@ -89,6 +99,10 @@ func (s *Server) backupInfoOf(ctx context.Context, p *registry.Project) (backupI
 		bi.earliest = bi.earliest.Add(time.Second)
 	}
 	bi.latest = w.Latest.Truncate(time.Second)
+	if bi.latest.Before(bi.earliest) {
+		// Less than a second since the only backup ended: no whole second is restorable yet.
+		bi.earliest, bi.latest = time.Time{}, time.Time{}
+	}
 	rows, err := s.reg.ListBackups(ctx, p.Ref)
 	if err != nil {
 		return bi, err
@@ -201,6 +215,9 @@ func (s *Server) restoreFromBackup(w http.ResponseWriter, r *http.Request, rawID
 	if err != nil {
 		return err
 	}
+	if err := restorable(p); err != nil {
+		return err
+	}
 	if rawID == nil || *rawID != math.Trunc(*rawID) || *rawID < 1 {
 		return errf(http.StatusBadRequest, "A backup id is required")
 	}
@@ -269,6 +286,9 @@ func (s *Server) restorePITRRoute(w http.ResponseWriter, r *http.Request) error 
 	ctx := r.Context()
 	p, err := s.loadProject(ctx, r.PathValue("ref"))
 	if err != nil {
+		return err
+	}
+	if err := restorable(p); err != nil {
 		return err
 	}
 	if in.Target == nil || *in.Target != math.Trunc(*in.Target) || *in.Target < 1 {

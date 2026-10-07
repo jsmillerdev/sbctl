@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,19 +16,25 @@ import (
 	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
-// fakeBackupSource answers RestoreWindow from a canned window.
+// fakeBackupSource answers RestoreWindow from a canned window. Like the real service, a window of a
+// project that is not running ends with the archive (idleLatest, when set) and not at now.
 type fakeBackupSource struct {
-	mu      sync.Mutex
-	window  backup.RestoreWindow
-	err     error
-	running []bool
+	mu         sync.Mutex
+	window     backup.RestoreWindow
+	idleLatest time.Time
+	err        error
+	running    []bool
 }
 
 func (f *fakeBackupSource) RestoreWindow(_ context.Context, _ string, running bool) (backup.RestoreWindow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.running = append(f.running, running)
-	return f.window, f.err
+	w := f.window
+	if !running && !f.idleLatest.IsZero() {
+		w.Latest = f.idleLatest
+	}
+	return w, f.err
 }
 
 // backupFixture is a fixture whose project has two base backups listed in the registry and in
@@ -421,7 +428,15 @@ func TestRestoreRefusedWhileNotActiveOrWithoutBackends(t *testing.T) {
 	if rec := b.post(path, body); rec.Code != 503 {
 		t.Errorf("no restorer: %d %s", rec.Code, rec.Body)
 	}
+	// The Engine refuses a project that went out of state between the check and the call.
+	b.mgr.beginErr = fmt.Errorf("%w: cannot restore %s while it is RESTORING", lifecycle.ErrInvalidState, testRef)
+	if rec := b.post(path, body); rec.Code != 409 {
+		t.Errorf("the Engine refuses: %d %s", rec.Code, rec.Body)
+	}
 	b.mgr.beginErr = nil
+	// While the project is not running, its time is not judged against a window that ends with the
+	// archive: the answer is 409 (a second restore during RESTORING), not a 400 about the time.
+	b.src.idleLatest = b.old.StopTime.Add(time.Hour)
 	for _, st := range []registry.Status{registry.StatusInactive, registry.StatusRestoring, registry.StatusComingUp} {
 		if err := b.reg.SetProjectStatus(context.Background(), testRef, st); err != nil {
 			t.Fatal(err)
@@ -538,5 +553,24 @@ func TestPitrRetentionDays(t *testing.T) {
 	}
 	if got := f.srv.pitrRetentionDays(&registry.Project{CreatedAt: time.Now()}); got != 1 {
 		t.Errorf("a new project with pruning off: %d, want 1", got)
+	}
+}
+
+// A backup that ended less than a second ago leaves no whole second to restore to: the backup is
+// listed and the span is absent, so the picker is not offered an inverted range.
+func TestBackupListInTheSecondAfterTheFirstBackup(t *testing.T) {
+	b := newBackupFixture(t)
+	base := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	b.old.StopTime = base.Add(600 * time.Millisecond)
+	b.src.window = backup.RestoreWindow{Backups: []backup.Manifest{b.old}, Earliest: b.old.StopTime, Latest: base.Add(900 * time.Millisecond)}
+	rec := b.do("GET", "/v1/projects/"+testRef+"/database/backups", nil)
+	validateAgainstSpec(t, "GET /v1/projects/{ref}/database/backups", rec.Body.Bytes())
+	m := decodeBody(t, rec).(map[string]any)
+	if len(m["backups"].([]any)) != 1 || len(m["physical_backup_data"].(map[string]any)) != 0 {
+		t.Fatalf("%v", m)
+	}
+	rec = b.post("/v1/projects/"+testRef+"/database/backups/restore-pitr", map[string]any{"recovery_time_target_unix": base.Unix()})
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "no backup") {
+		t.Fatalf("pitr in that second: %d %s", rec.Code, rec.Body)
 	}
 }
