@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -19,8 +20,16 @@ import (
 	"github.com/OWNER/sbctl/internal/registry"
 )
 
-// shutdownGrace bounds how long Serve waits for in-flight admin requests at shutdown.
-const shutdownGrace = 15 * time.Second
+// StopBudget is how long Serve, once told to stop, waits for lifecycle operations that
+// are still running (a delete with its final backup, a restart, a create) before it
+// closes the registry. sbctl.service's TimeoutStopSec must be longer (it is 11 minutes);
+// an operation cut off anyway is finished or reverted by Engine.Recover at the next start.
+const StopBudget = 10 * time.Minute
+
+// registryWait bounds how long Serve waits for the system cluster's registry at boot.
+// systemd orders sbctl.service after the start of sb-postgres@system, not its readiness.
+// A variable so that tests can shorten it.
+var registryWait = 2 * time.Minute
 
 // Serve runs the daemon until ctx ends (SIGTERM in production): it opens the node
 // (registry in the system cluster, secrets, engine with the backup service), finishes
@@ -33,19 +42,22 @@ const shutdownGrace = 15 * time.Second
 // Project units are systemd's, not the daemon's: stopping Serve leaves them running.
 func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	log := o.log()
-	node, err := lifecycle.Open(ctx, cfg, LifecycleOptions(cfg, o))
+	lo := LifecycleOptions(cfg, o)
+	backups := memoizeBackups(&lo)
+	node, err := openNode(ctx, cfg, lo, log)
 	if err != nil {
 		return err
 	}
-	defer node.Close()
+	defer node.Close() // after the drain below: Serve returns only when nothing runs any more
 
 	// Create the shared postgres-meta passphrase now, so the unit that starts pg-meta
 	// reads the same sealed secret the API uses (PGMetaCryptoKey).
 	if _, err := PGMetaCryptoKey(ctx, cfg, node.Registry, node.Secrets); err != nil {
 		return err
 	}
-	for _, r := range node.Engine.Recover(ctx) {
-		log.Warn("project recovered", "ref", r.Ref, "from", r.From, "to", r.To)
+	recovered := node.Engine.Recover(ctx)
+	for _, r := range recovered {
+		log.Warn("project recovered", "ref", r.Ref, "from", r.From, "to", r.To, "note", r.Note)
 	}
 
 	pg, ok := node.Registry.(*registry.Postgres)
@@ -85,15 +97,28 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		}
 		return nil
 	})
+	budget := o.StopBudget
+	if budget <= 0 {
+		budget = StopBudget
+	}
 	g.Go(func() error {
 		<-gctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		// Operations the API detached from their requests (and the create goroutines)
+		// must end before the registry closes: a delete cut off after the data plane is
+		// gone, or a restart cut off after the pause, would need Recover at the next start.
+		// New mutations answer 503 from here on; the listener stays up so that clients of
+		// the running ones still get their answers.
+		sctx, cancel := context.WithTimeout(context.Background(), budget)
 		defer cancel()
+		log.Info("stopping: waiting for running lifecycle operations", "budget", budget.String())
+		if err := apiH.Drain(sctx); err != nil {
+			log.Warn("stopping with lifecycle operations unfinished; the next start recovers them", "error", err)
+		}
 		return admin.Shutdown(sctx)
 	})
 	g.Go(func() error { return edge.Run(gctx) })
 	g.Go(func() error {
-		startProjects(gctx, node, log)
+		startProjects(gctx, node, recovered, backups(node), log)
 		return nil
 	})
 	log.Info("sbctl is up", "domain", cfg.BaseDomain(), "api", cfg.APIURL(), "dashboard", cfg.DashboardURL())
@@ -105,14 +130,19 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 // startProjects brings the system project's backup timer and every active project up
 // after a (re)start, one project at a time so that boot does not start a hundred
 // Postgres clusters at once. It runs next to the listeners: the API answers while
-// projects start, and a project that fails is marked ACTIVE_UNHEALTHY.
-func startProjects(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+// projects start, and a project that fails is marked ACTIVE_UNHEALTHY. Projects whose
+// restart the previous process cut off after the pause are resumed first, and restored
+// clones whose recovery outlasted the restore's wait are finished in the background.
+func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle.Recovered, bk *backup.Service, log *slog.Logger) {
 	if n.Cfg.Supervisor == config.SupervisorSystemd {
 		for _, unit := range []string{backup.BackupTimerInstance(config.SystemRef), backup.PruneTimerUnit} {
 			if err := n.Supervisor.Start(ctx, unit); err != nil {
 				log.Warn("backup timer did not start", "unit", unit, "error", err)
 			}
 		}
+	}
+	for ref, err := range n.Engine.ResumeRecovered(ctx, recovered) {
+		log.Error("project did not resume after an interrupted restart", "ref", ref, "error", err)
 	}
 	errs := n.Engine.StartActive(ctx)
 	for ref, err := range errs {
@@ -130,4 +160,93 @@ func startProjects(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 		}
 	}
 	log.Info("projects started", "active", started, "failed", len(errs))
+	if bk != nil {
+		finishRestores(ctx, bk, log)
+	}
+}
+
+// finishRestores runs until ctx ends: restored clones tagged restore.cleanup_pending
+// (recovery outlasted RecoveryTimeout, the restore reported success) get their recovery
+// settings cleared once their cluster has promoted, so a later start never replays the
+// source project's archive. Nothing else would do it unless an operator ran
+// `sbctl backups finish-restore`.
+func finishRestores(ctx context.Context, bk *backup.Service, log *slog.Logger) {
+	for {
+		wait := 5 * time.Minute
+		if len(bk.PendingRestores(ctx)) > 0 {
+			for _, ref := range bk.FinishPendingRestores(ctx) {
+				log.Info("restored project finished recovery", "ref", ref)
+			}
+			wait = time.Minute
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+// openNode is lifecycle.Open with a bounded wait for the registry: systemd starts
+// sbctl.service when sb-postgres@system has started, not when it accepts connections, and
+// a daemon that gave up at once would depend on Restart= staying under the start limit.
+func openNode(ctx context.Context, cfg *config.Config, lo lifecycle.OpenOptions, log *slog.Logger) (*lifecycle.Node, error) {
+	deadline := time.Now().Add(registryWait)
+	delay := 500 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		node, err := lifecycle.Open(ctx, cfg, lo)
+		if err == nil {
+			return node, nil
+		}
+		remaining := time.Until(deadline)
+		if !errors.Is(err, lifecycle.ErrRegistryUnreachable) || ctx.Err() != nil || remaining <= 0 {
+			return nil, err
+		}
+		wait := min(delay, remaining)
+		log.Warn("waiting for the registry", "attempt", attempt, "retry_in", wait.String(), "error", err)
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(wait):
+		}
+		if delay *= 2; delay > 10*time.Second {
+			delay = 10 * time.Second
+		}
+	}
+}
+
+// memoizeBackups makes lo build its backup service once, and returns a getter for that
+// service (nil when the backend is not configured or does not open) so that the daemon
+// can run the restore sweep on the instance the Engine uses.
+func memoizeBackups(lo *lifecycle.OpenOptions) func(*lifecycle.Node) *backup.Service {
+	inner := lo.BackupFactory
+	var mu sync.Mutex
+	var svc *backup.Service
+	build := func(n *lifecycle.Node) (lifecycle.BaseBackuper, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if svc != nil {
+			return svc, nil
+		}
+		b, err := inner(n)
+		if err != nil {
+			return nil, err
+		}
+		if s, ok := b.(*backup.Service); ok {
+			svc = s
+		}
+		return b, nil
+	}
+	lo.BackupFactory = build
+	return func(n *lifecycle.Node) *backup.Service {
+		if _, err := build(n); err != nil {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if svc != nil && n.Engine != nil {
+			svc.SetManager(n.Engine)
+		}
+		return svc
+	}
 }

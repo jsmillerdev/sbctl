@@ -2,11 +2,16 @@ package app
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -63,5 +68,40 @@ func TestPGMetaCryptoKey(t *testing.T) {
 	cfg.API.PGMetaCryptoKey = "configured-key-0123456789"
 	if k, _ := PGMetaCryptoKey(ctx, cfg, reg, sec); k != "configured-key-0123456789" {
 		t.Fatalf("configured key ignored: %q", k)
+	}
+}
+
+// At boot the registry may not accept connections yet. Serve keeps trying (bounded), and
+// only for that error: anything else, such as a missing master key, fails at once.
+func TestOpenNodeWaitsForTheRegistryAndFailsFastOnOtherErrors(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.StateDir = dir
+	cfg.KeyPath = dir + "/master.key"
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	start := time.Now()
+	if _, err := openNode(context.Background(), cfg, lifecycle.OpenOptions{}, log); err == nil || errors.Is(err, lifecycle.ErrRegistryUnreachable) {
+		t.Fatalf("missing master key = %v, want a plain error", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("a configuration error was retried")
+	}
+
+	if _, err := secrets.LoadOrCreate(cfg.KeyPath); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Supervisor = config.SupervisorExec
+	old := registryWait
+	registryWait = 1500 * time.Millisecond
+	defer func() { registryWait = old }()
+	lo := lifecycle.OpenOptions{Artifacts: dirArts{}}
+	start = time.Now()
+	_, err := openNode(context.Background(), cfg, lo, log)
+	if !errors.Is(err, lifecycle.ErrRegistryUnreachable) {
+		t.Fatalf("no registry = %v, want ErrRegistryUnreachable", err)
+	}
+	if time.Since(start) < time.Second {
+		t.Fatalf("gave up after %s, want it to wait for the registry", time.Since(start))
 	}
 }

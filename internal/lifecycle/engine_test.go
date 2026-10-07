@@ -840,3 +840,134 @@ func TestBackupTimersFollowTheProject(t *testing.T) {
 		t.Errorf("timer calls = %v, want %v", ft.calls, want)
 	}
 }
+
+// A delete cut off after its final backup settled is finished by Recover without a
+// second backup; one cut off during the backup returns the project to where it was.
+func TestRecoverFinishesOrRevertsAnInterruptedDelete(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("backup settled: removal finished, no second backup", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		h.plane.failOn["Delete"] = errors.New("daemon stopped")
+		if err := h.e.Delete(ctx, p.Ref); err == nil {
+			t.Fatal("delete should have failed at the data plane")
+		}
+		if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusGoingDown {
+			t.Fatalf("status = %s, want GOING_DOWN", got.Status)
+		}
+		delete(h.plane.failOn, "Delete")
+		h.backup.calls = nil
+		rs := h.e.Recover(ctx)
+		if len(rs) != 1 || rs[0].To != StatusDeleted {
+			t.Fatalf("recovered = %+v", rs)
+		}
+		if _, err := h.reg.GetProject(ctx, p.Ref); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("project row remains: %v", err)
+		}
+		if len(h.backup.calls) != 0 {
+			t.Fatalf("a second final backup ran: %v", h.backup.calls)
+		}
+	})
+
+	t.Run("a retried delete does not back up again", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		h.plane.failOn["Delete"] = errors.New("first attempt cut off")
+		_ = h.e.Delete(ctx, p.Ref)
+		delete(h.plane.failOn, "Delete")
+		h.backup.calls = nil
+		h.backup.err = errors.New("the cluster is gone") // would abort the delete if it ran
+		if err := h.e.Delete(ctx, p.Ref); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		if len(h.backup.calls) != 0 {
+			t.Fatalf("retry ran the backup: %v", h.backup.calls)
+		}
+	})
+
+	t.Run("backup cut off: the paused project is kept and stopped", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		if err := h.e.Pause(ctx, p.Ref); err != nil {
+			t.Fatal(err)
+		}
+		// What DeleteWith leaves when the process dies inside the backup.
+		h.e.event(ctx, p.Ref, EventDeleteStarted, map[string]string{"prev": string(registry.StatusInactive)})
+		if err := h.reg.SetProjectStatus(ctx, p.Ref, registry.StatusGoingDown); err != nil {
+			t.Fatal(err)
+		}
+		h.plane.calls = nil
+		rs := h.e.Recover(ctx)
+		if len(rs) != 1 || rs[0].To != registry.StatusInactive {
+			t.Fatalf("recovered = %+v", rs)
+		}
+		if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusInactive {
+			t.Fatalf("status = %s, want INACTIVE", got.Status)
+		}
+		if !h.plane.has("Stop " + p.Ref) {
+			t.Errorf("the database the backup started was not stopped: %v", h.plane.calls)
+		}
+	})
+
+	t.Run("no record: only logged", func(t *testing.T) {
+		h := newHarness(t)
+		p := h.create(t)
+		_ = h.reg.SetProjectStatus(ctx, p.Ref, registry.StatusGoingDown)
+		if rs := h.e.Recover(ctx); len(rs) != 0 {
+			t.Fatalf("recovered = %+v", rs)
+		}
+	})
+}
+
+// The nightly timer stops as soon as the final backup is settled, even when the rest of
+// the delete fails.
+func TestDeleteStopsTheTimerAfterTheFinalBackup(t *testing.T) {
+	h := newHarness(t)
+	ft := &fakeTimers{}
+	h.e.opts.Timers = ft
+	p := h.create(t)
+	h.plane.failOn["Delete"] = errors.New("units would not go")
+	ft.calls = nil
+	if err := h.e.Delete(context.Background(), p.Ref); err == nil {
+		t.Fatal("expected the data plane failure")
+	}
+	if fmt.Sprint(ft.calls) != fmt.Sprint([]string{"stop " + p.Ref}) {
+		t.Fatalf("timer calls = %v, want a stop", ft.calls)
+	}
+}
+
+// A restart cut off after its pause leaves the project INACTIVE with a request nobody
+// finished: Recover flags it and ResumeRecovered brings it back.
+func TestRecoverResumesAnInterruptedRestart(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	cut := h.create(t)
+	stale := h.create(t)
+	for _, p := range []*registry.Project{cut, stale} {
+		h.e.event(ctx, p.Ref, EventRestartRequested, nil)
+	}
+	if err := h.e.Pause(ctx, cut.Ref); err != nil { // the restart's pause, then the process died
+		t.Fatal(err)
+	}
+	rs := h.e.Recover(ctx)
+	if len(rs) != 1 || rs[0].Ref != cut.Ref || !rs[0].Resume {
+		t.Fatalf("recovered = %+v, want only %s flagged for resume", rs, cut.Ref)
+	}
+	if errs := h.e.ResumeRecovered(ctx, rs); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if got, _ := h.reg.GetProject(ctx, cut.Ref); got.Status != registry.StatusActiveHealthy {
+		t.Fatalf("status = %s, want ACTIVE_HEALTHY", got.Status)
+	}
+	if h.e.restartPending(ctx, cut.Ref) || h.e.restartPending(ctx, stale.Ref) {
+		t.Fatal("restart intents were not closed")
+	}
+	// A manual pause later is not undone by the next start.
+	if err := h.e.Pause(ctx, stale.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if rs := h.e.Recover(ctx); len(rs) != 0 {
+		t.Fatalf("a stale restart intent resumed a deliberately paused project: %+v", rs)
+	}
+}

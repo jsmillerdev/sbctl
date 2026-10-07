@@ -3,6 +3,9 @@ Description=sbctl control plane (Management API, proxy, lifecycle, WAL archiver)
 Documentation=https://github.com/OWNER/sbctl
 After=network-online.target sb-postgres@system.service
 Wants=network-online.target sb-postgres@system.service sb-gotrue@system.service
+# The daemon waits for the registry itself (up to 2 minutes), and Restart= must never
+# end in start-limit-hit: a stopped control plane after a reboot is worse than a loop.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -14,7 +17,11 @@ Slice=sbctl.slice
 ExecStart=/usr/local/bin/sbctl serve
 Restart=always
 RestartSec=2s
-TimeoutStopSec=30
+# On SIGTERM the daemon refuses new lifecycle operations and waits up to 10 minutes
+# (app.StopBudget) for running ones (a delete with its final backup, a restart) before it
+# exits, so `systemctl restart sbctl` and self-update can take that long. An operation cut
+# off anyway is finished or reverted by the next start.
+TimeoutStopSec=660
 LimitNOFILE=65536
 SyslogIdentifier=sbctl
 

@@ -155,7 +155,12 @@ func (s *Server) createProject(ctx context.Context, in createInput) (*registry.P
 	}
 	done := make(chan result, 1)
 	var answeredComingUp atomic.Bool
+	endOp, err := s.beginOp()
+	if err != nil {
+		return nil, err
+	}
 	go func() {
+		defer endOp()
 		// The request may end before provisioning does.
 		bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), createTimeout)
 		defer cancel()
@@ -278,7 +283,10 @@ func (s *Server) deleteProject(r *http.Request) (*registry.Project, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := detach(r, deleteTimeout)
+	ctx, cancel, err := s.detach(r, deleteTimeout)
+	if err != nil {
+		return nil, err
+	}
 	defer cancel()
 	if err := s.mgr.Delete(ctx, p.Ref); err != nil {
 		return nil, mapErr(err)
@@ -292,7 +300,10 @@ func (s *Server) pauseProject(status int) handlerFunc {
 		if err != nil {
 			return err
 		}
-		ctx, cancel := detach(r, lifecycleTimeout)
+		ctx, cancel, err := s.detach(r, lifecycleTimeout)
+		if err != nil {
+			return err
+		}
 		defer cancel()
 		if err := s.mgr.Pause(ctx, p.Ref); err != nil {
 			return mapErr(err)
@@ -308,7 +319,10 @@ func (s *Server) restoreProject(status int) handlerFunc {
 		if err != nil {
 			return err
 		}
-		ctx, cancel := detach(r, lifecycleTimeout)
+		ctx, cancel, err := s.detach(r, lifecycleTimeout)
+		if err != nil {
+			return err
+		}
 		defer cancel()
 		if err := s.mgr.Resume(ctx, p.Ref); err != nil {
 			return mapErr(err)
@@ -327,8 +341,15 @@ func (s *Server) restartProject(status int) handlerFunc {
 		if err != nil {
 			return err
 		}
-		ctx, cancel := detach(r, 2*lifecycleTimeout)
+		ctx, cancel, err := s.detach(r, 2*lifecycleTimeout)
+		if err != nil {
+			return err
+		}
 		defer cancel()
+		// The intent is recorded so that a daemon stop between the two calls does not
+		// leave the project paused: Engine.Recover resumes it (lifecycle.EventRestart*).
+		s.recordEvent(ctx, p.Ref, lifecycle.EventRestartRequested, nil)
+		defer func() { s.recordEvent(ctx, p.Ref, lifecycle.EventRestartFinished, nil) }()
 		if err := s.mgr.Pause(ctx, p.Ref); err != nil {
 			return mapErr(err)
 		}
@@ -351,9 +372,22 @@ const (
 // detach returns a context for a lifecycle mutation that keeps the request's values but
 // not its cancellation: a client that disconnects (Ctrl-C on `supabase projects delete`,
 // a closed Studio tab, a proxy idle timeout) must not stop the operation halfway and
-// leave a project half deleted or stopped. The timeout bounds a stuck operation.
-func detach(r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(r.Context()), timeout)
+// leave a project half deleted or stopped. The timeout bounds a stuck operation. The
+// operation is registered for Drain, and the returned func ends it: a shutdown waits for
+// it, and a server that is already draining refuses it with 503 before anything starts.
+func (s *Server) detach(r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc, error) {
+	end, err := s.beginOp()
+	if err != nil {
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), timeout)
+	return ctx, func() { cancel(); end() }, nil
+}
+
+func (s *Server) recordEvent(ctx context.Context, ref, kind string, payload any) {
+	if err := s.reg.AppendEvent(ctx, ref, kind, payload); err != nil {
+		s.log.Warn("could not record event", "ref", ref, "kind", kind, "err", err)
+	}
 }
 
 // healthName maps service names of the lifecycle manager to the API's.

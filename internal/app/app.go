@@ -36,6 +36,9 @@ type Options struct {
 	// Artifacts replaces the artifact store (tests with unpacked artifacts); nil means the
 	// store under state_dir.
 	Artifacts lifecycle.Artifacts
+	// StopBudget overrides StopBudget, how long Serve waits for running lifecycle
+	// operations when it is told to stop (tests).
+	StopBudget time.Duration
 }
 
 func (o Options) log() *slog.Logger {

@@ -450,3 +450,60 @@ func TestFinalBackupOfAClonethatNeverRecoveredIsNotRestorable(t *testing.T) {
 		e.addProject(t, testRef)
 	}
 }
+
+// A restore-as-new clone tagged restore.cleanup_pending (recovery outlasted
+// RecoveryTimeout, restore reported success) promotes on its own later. The live cluster,
+// not the events, decides: out of recovery it is backed up, still replaying it is not.
+func TestCleanupPendingCloneThatPromotedCanBeBackedUp(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	_ = e.reg.AppendEvent(ctx, testRef, "restore.cleanup_pending", nil)
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+
+	// Still replaying: nothing to back up, and the delete may skip the final backup.
+	e.svc.probe = func(context.Context, string) (bool, error) { return true, nil }
+	e.svc.alter = func(context.Context, string, []string) error {
+		t.Fatal("recovery settings cleared during recovery")
+		return nil
+	}
+	if _, err := e.svc.FinalBackup(ctx, testRef); !errors.Is(err, lifecycle.ErrNoRestorableState) {
+		t.Fatalf("clone still in recovery: FinalBackup = %v, want ErrNoRestorableState", err)
+	}
+
+	// Promoted: the backup is attempted (it fails later, there is no real cluster behind
+	// the fake probe), the settings are cleared and recovery_finished is recorded.
+	var cleared []string
+	e.svc.probe = func(context.Context, string) (bool, error) { return false, nil }
+	e.svc.alter = func(_ context.Context, _ string, g []string) error { cleared = g; return nil }
+	if _, err := e.svc.FinalBackup(ctx, testRef); errors.Is(err, lifecycle.ErrNoRestorableState) {
+		t.Fatalf("promoted clone: FinalBackup = %v, must not skip the final backup", err)
+	}
+	if len(cleared) == 0 {
+		t.Fatal("recovery settings were not cleared on a cluster out of recovery")
+	}
+	if st := e.svc.restoreState(ctx, testRef); st != restoreStateFinished {
+		t.Fatalf("restore state = %q, want finished", st)
+	}
+}
+
+func TestFinishPendingRestores(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	e.svc.opt.RecoveryPoll = time.Millisecond
+	_ = e.reg.AppendEvent(ctx, testRef, "restore.cleanup_pending", nil)
+	if got := e.svc.PendingRestores(ctx); len(got) != 1 || got[0] != testRef {
+		t.Fatalf("PendingRestores = %v", got)
+	}
+	n := 0
+	e.svc.probe = func(context.Context, string) (bool, error) { n++; return n < 3, nil }
+	e.svc.alter = func(context.Context, string, []string) error { return nil }
+	if got := e.svc.FinishPendingRestores(ctx); len(got) != 1 {
+		t.Fatalf("FinishPendingRestores = %v", got)
+	}
+	if got := e.svc.PendingRestores(ctx); len(got) != 0 {
+		t.Fatalf("still pending after finish: %v", got)
+	}
+}

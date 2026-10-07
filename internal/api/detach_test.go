@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/OWNER/sbctl/internal/lifecycle"
 )
 
 // A client that disconnects partway (Ctrl-C on `supabase projects delete`, a closed
@@ -118,5 +121,89 @@ func TestClientCancelIsNot5xx(t *testing.T) {
 	f.srv.ServeHTTP(rec, req)
 	if rec.Code != 499 {
 		t.Fatalf("cancelled request answered %d %s, want 499", rec.Code, rec.Body)
+	}
+}
+
+// A shutdown waits for the lifecycle operations that outlive their request, and refuses
+// new ones with 503 while it waits.
+func TestDrainWaitsForInFlightOperationsAndRefusesNewOnes(t *testing.T) {
+	f := newFixture(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	f.mgr.hook = func(op string, _ context.Context) {
+		if op == "delete" {
+			close(entered)
+			<-release
+		}
+	}
+	served := make(chan int, 1)
+	go func() { served <- f.do("DELETE", "/v1/projects/"+testRef, nil).Code }()
+	<-entered
+
+	drained := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		drained <- f.srv.Drain(ctx)
+	}()
+	// Drain has begun once new mutations are refused.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if rec := f.do("POST", "/v1/projects/"+testRef+"/pause", nil); rec.Code == 503 {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("a mutation during Drain answered %d, want 503", rec.Code)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned (%v) while a delete was running", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-drained; err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if code := <-served; code != 200 {
+		t.Fatalf("the in-flight delete answered %d, want 200", code)
+	}
+	if len(f.mgr.deleted) != 1 {
+		t.Fatalf("deleted = %v", f.mgr.deleted)
+	}
+}
+
+func TestDrainGivesUpAtItsDeadline(t *testing.T) {
+	f := newFixture(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	f.mgr.hook = func(op string, _ context.Context) {
+		if op == "pause" {
+			close(entered)
+			<-release
+		}
+	}
+	go f.do("POST", "/v1/projects/"+testRef+"/pause", nil)
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := f.srv.Drain(ctx)
+	if err == nil || !strings.Contains(err.Error(), "1 lifecycle operation") {
+		t.Fatalf("Drain = %v, want an error naming the operation still running", err)
+	}
+}
+
+// restart records its intent, so a daemon stop between pause and resume can be undone.
+func TestRestartRecordsItsIntent(t *testing.T) {
+	f := newFixture(t)
+	if rec := f.do("POST", "/v1/projects/"+testRef+"/restart", nil); rec.Code != 200 {
+		t.Fatalf("restart: %d %s", rec.Code, rec.Body)
+	}
+	evs, _ := f.reg.ListEvents(context.Background(), testRef, 20)
+	var kinds []string
+	for _, e := range evs { // newest first
+		kinds = append(kinds, e.Kind)
+	}
+	if len(kinds) < 2 || kinds[0] != lifecycle.EventRestartFinished || kinds[len(kinds)-1] != lifecycle.EventRestartRequested {
+		t.Fatalf("events (newest first) = %v, want restart_finished ... restart_requested", kinds)
 	}
 }

@@ -71,7 +71,64 @@ type Server struct {
 	roLocks   map[string]*sync.Mutex     // per-project role setup locks
 	roEnsured map[string]readOnlyEnsured // by project ref
 
+	ops opTracker
+
 	handler http.Handler
+}
+
+// opTracker counts the lifecycle operations that outlive their HTTP request (create,
+// delete, pause, resume, restart) so that a shutdown can wait for them.
+type opTracker struct {
+	mu       sync.Mutex
+	wg       sync.WaitGroup
+	n        int
+	draining bool
+}
+
+// errDraining is what a mutation gets once Drain has begun.
+var errDraining = errf(http.StatusServiceUnavailable, "sbctl is shutting down; try again in a moment")
+
+// beginOp registers one in-flight operation; the returned func ends it. It fails once
+// Drain has begun, so the operation is never started.
+func (s *Server) beginOp() (func(), error) {
+	s.ops.mu.Lock()
+	defer s.ops.mu.Unlock()
+	if s.ops.draining {
+		return nil, errDraining
+	}
+	s.ops.wg.Add(1)
+	s.ops.n++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.ops.mu.Lock()
+			s.ops.n--
+			s.ops.mu.Unlock()
+			s.ops.wg.Done()
+		})
+	}, nil
+}
+
+// Drain stops the server from starting lifecycle operations (they answer 503) and waits
+// until the ones in flight have finished or ctx ends. Call it when shutdown begins and
+// close the registry only after it returns. A nil error means nothing is left running;
+// otherwise the error says how many operations were cut off, and lifecycle.Engine.Recover
+// finishes or reverts them at the next start.
+func (s *Server) Drain(ctx context.Context) error {
+	s.ops.mu.Lock()
+	s.ops.draining = true
+	s.ops.mu.Unlock()
+	done := make(chan struct{})
+	go func() { s.ops.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.ops.mu.Lock()
+		n := s.ops.n
+		s.ops.mu.Unlock()
+		return fmt.Errorf("api: %d lifecycle operation(s) still running at shutdown: %w", n, ctx.Err())
+	}
 }
 
 // route is one served operation.

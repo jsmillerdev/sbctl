@@ -176,6 +176,11 @@ func (o *OpenOptions) artifactStore(cfg *config.Config) (Artifacts, error) {
 	return artifacts.New(cfg, opts...)
 }
 
+// ErrRegistryUnreachable is wrapped by Open when the registry in the system cluster does
+// not answer: the cluster may still be starting (systemd orders sbctl.service after the
+// start of sb-postgres@system, not its readiness), so a daemon retries on it.
+var ErrRegistryUnreachable = errors.New("cannot reach the registry in the system cluster")
+
 // Open connects to an initialized node: it loads the master key, reaches the registry
 // through the system cluster's private unix socket, and builds the Engine. It does not
 // start anything; run `sbctl system init` (or start sb-postgres@system) first.
@@ -198,7 +203,10 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	}
 	reg, err := registry.Open(ctx, RegistryDSN(cfg))
 	if err != nil {
-		return nil, fmt.Errorf("lifecycle: cannot reach the registry in the system cluster (is sb-postgres@system running? run `sbctl system init`): %w", err)
+		if c, ok := sup.(interface{ Close() }); ok {
+			c.Close() // a caller that retries must not leak a bus connection per attempt
+		}
+		return nil, fmt.Errorf("lifecycle: %w (is sb-postgres@system running? run `sbctl system init`): %w", ErrRegistryUnreachable, err)
 	}
 	node := &Node{Cfg: cfg, Secrets: sec, Supervisor: sup, Artifacts: arts, Registry: reg}
 	bk := o.lateBackup(node)
