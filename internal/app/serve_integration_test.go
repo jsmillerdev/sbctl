@@ -83,7 +83,7 @@ func TestServeIntegration(t *testing.T) {
 	cfg.Domain = "sbctl.test"
 	cfg.TLS.Mode = "off"
 	cfg.Functions.Enabled = true // the daemon must route /functions/v1 and run the syncer; no runtime runs here
-	cfg.BinPath = truePath // archive_command succeeds, so WAL does not pile up
+	cfg.BinPath = truePath       // archive_command succeeds, so WAL does not pile up
 	cfg.Backup.Backend = "file://" + filepath.Join(state, "backups")
 	cfg.Ports.SystemPostgres, cfg.Ports.SystemGoTrue, cfg.Ports.ProjectBase = ports[0], ports[1], 35100 // 35100 + 3n: project ports
 	cfg.Listen = config.Listen{HTTP: fmt.Sprintf("127.0.0.1:%d", listen[0]), HTTPS: fmt.Sprintf("127.0.0.1:%d", listen[1]), Admin: fmt.Sprintf("127.0.0.1:%d", listen[2])}
