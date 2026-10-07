@@ -58,6 +58,18 @@ async function newPage(theme) {
     timezoneId: 'UTC',
   })
   await ctx.route(TELEMETRY, (r) => r.abort())
+  // Studio's CSP carries upgrade-insecure-requests, which turns every sub-resource of this plain-HTTP
+  // node into an https request that fails (net::ERR_SSL_PROTOCOL_ERROR). A node with TLS has no
+  // such problem; here the browser is told to skip that one directive.
+  await ctx.route(`${STUDIO}/**`, async (route) => {
+    if (route.request().resourceType() !== 'document') return route.fallback()
+    const res = await route.fetch()
+    const headers = { ...res.headers() }
+    for (const k of ['content-security-policy', 'content-security-policy-report-only']) {
+      if (headers[k]) headers[k] = headers[k].split(';').filter((d) => d.trim() !== 'upgrade-insecure-requests').join(';')
+    }
+    await route.fulfill({ response: res, headers })
+  })
   await ctx.addInitScript((t) => {
     try { localStorage.setItem('theme', t) } catch {}
     // Toasts: keep their text for the checks, never show them in a shot.
