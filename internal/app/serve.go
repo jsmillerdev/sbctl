@@ -207,6 +207,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		startProjects(gctx, node, recovered, backups(node), log)
 		return nil
 	})
+	g.Go(func() error { settleUpgrades(gctx, node, log); return nil })
 	log.Info("Supavise is up", "domain", cfg.BaseDomain(), "api", cfg.APIURL(), "dashboard", cfg.DashboardURL())
 	err = g.Wait()
 	log.Info("Supavise stopped")
@@ -303,6 +304,23 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 	log.Info("projects started", "active", started, "failed", len(errs))
 	if bk != nil {
 		finishRestores(ctx, bk, log)
+	}
+}
+
+// settleUpgrades runs until ctx ends: a project left UPGRADING by an upgrade whose process died
+// (the CLI's, since the daemon's own upgrades end with the daemon and Recover settles those)
+// is started again on its recorded versions, and an upgrade record that never got its final
+// status is closed. An upgrade whose process is alive is left alone.
+func settleUpgrades(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Minute):
+		}
+		for _, r := range n.Engine.SettleUpgrades(ctx) {
+			log.Warn("project recovered", "ref", r.Ref, "from", r.From, "to", r.To, "note", r.Note)
+		}
 	}
 }
 

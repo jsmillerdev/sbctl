@@ -722,12 +722,17 @@ on the General page, not on Infrastructure. Routes and rules (`upgrade.go`, `int
   `target_upgrade_versions` has one entry (`postgres_version` the node's Postgres major version,
   `release_channel` `ga`) when the project can be upgraded and none otherwise, and
   `duration_estimate_hours` is how long the project is offline (the base backup does not count).
-  Every array of the response is present and empty: the hosted ones that describe objects that
-  block `pg_upgrade` (`validation_errors` other than a paused project's `project_hibernating`,
-  `unsupported_extensions`, `legacy_auth_custom_roles`, `warnings`, and `potential_breaking_changes`, which Studio reads
-  and the spec omits) cannot apply to a restart on the same major version. `eligible` is false
+  Every array of the response is present, and mostly empty: the hosted ones that describe objects that
+  block `pg_upgrade` (`legacy_auth_custom_roles`, `warnings`, and `potential_breaking_changes`, which Studio reads
+  and the spec omits) cannot apply to a restart on the same major version. `validation_errors` holds a
+  paused project's `project_hibernating` and, when the node's Postgres release differs from the
+  project's, one `unsupported_extension` (`extension_name`, which Studio lists with a link to the
+  extensions page) per installed extension the new release cannot serve; `unsupported_extensions`
+  repeats their names. `eligible` is false
   when the project is on the node's versions, is not `ACTIVE_HEALTHY`, runs another Postgres major version (no
-  upgrade path), or the node has no backup service.
+  upgrade path), has such an extension, or the node has no backup service. `duration_estimate_hours` is the real estimate
+  in hours, so it is fractional (0.05 when only GoTrue and PostgREST restart, 0.25 with PostgreSQL), and Studio prints it as
+  "offline for up to 0.05 hours" where hosted's whole hours read "1 hour".
 - `POST .../upgrade` with `target_version` (Postgres's major version as Studio posts it, `"17"`; the app version or the
   release tag also work) and an optional `release_channel` (only `ga`): 201 with `tracking_id`, the
   project `UPGRADING`, the upgrade running in the background on a context detached from the request and
@@ -744,6 +749,15 @@ Permissions (`authz.go`): eligibility, status and service-versions are reads (Re
 project included); the upgrade is `infra:Execute` on `queue_jobs.projects.upgrade`, so Owners and Administrators only,
 like hosted (a Developer restarts, `reboot`, but does not upgrade). `POST /platform/projects/{ref}/restart-services`
 restarts the whole project whatever services it names.
+
+Differences from hosted that Studio shows as it does there:
+
+- Studio's note on a paused project in "Service versions" says that restoring it updates Postgres to
+  the newest version. Resume here keeps the versions recorded; the project is upgraded only when its
+  owner asks.
+- Studio's "Your project can be upgraded to the latest version of Postgres" alert appears whenever the
+  eligibility answer is `eligible`, including when only GoTrue or PostgREST differ from the node's
+  pins; the Postgres badge next to it can still read "Latest".
 
 ## Lifecycle calls outlive the request
 

@@ -413,3 +413,24 @@ func newUpgradeFixtureOn(t *testing.T, f *fixture) *upgradeFixture {
 	f.srv.mgr = upgradeManager{f.mgr, eng}
 	return &upgradeFixture{fixture: f, arts: arts, plane: plane, eng: eng}
 }
+
+// An extension the new Postgres release cannot serve reaches Studio as hosted's
+// unsupported_extension validation error, and the deprecated list names it too.
+func TestEligibilityNamesUnsupportedExtensions(t *testing.T) {
+	el := &lifecycle.UpgradeEligibility{
+		Ref: testRef, Current: map[string]string{"postgres": oldPG}, Latest: map[string]string{"postgres": newPG}, Target: map[string]string{"postgres": newPG},
+		CurrentMajor: 17, TargetMajor: 17,
+		Blockers: []lifecycle.UpgradeBlocker{{Type: lifecycle.BlockerExtension, Extension: "wrappers", Message: "extension wrappers 0.5.0 (postgres): gone"}},
+	}
+	body := eligibilityBody(el)
+	if body["eligible"] != false {
+		t.Fatalf("eligible = %v", body["eligible"])
+	}
+	ve, _ := body["validation_errors"].([]any)
+	if len(ve) != 1 || ve[0].(map[string]any)["type"] != "unsupported_extension" || ve[0].(map[string]any)["extension_name"] != "wrappers" {
+		t.Fatalf("validation_errors = %v", body["validation_errors"])
+	}
+	if ue, _ := body["unsupported_extensions"].([]any); len(ue) != 1 || ue[0] != "wrappers" {
+		t.Fatalf("unsupported_extensions = %v", body["unsupported_extensions"])
+	}
+}

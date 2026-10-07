@@ -76,9 +76,10 @@ func (s *Server) upgradeEligibility(w http.ResponseWriter, r *http.Request) erro
 
 // eligibilityBody is the spec's eligibility response. Studio requires every array, so each is
 // present and empty rather than missing or null. The arrays hosted fills from a scan of the
-// database (extensions that do not exist in the next major version, objects that block
-// pg_upgrade) stay empty: the upgrade here keeps the Postgres major version and the data
-// directory, so no object of the database stands in its way.
+// database (objects that block pg_upgrade) stay empty: the upgrade here keeps the Postgres major
+// version and the data directory, so no object of the database stands in its way. The one scan
+// that does apply is the installed extensions against a new Postgres release (an extension the
+// release cannot serve, in the way hosted reports one the next major version lacks).
 func eligibilityBody(el *lifecycle.UpgradeEligibility) map[string]any {
 	pg := config.SvcPostgres
 	targets := []any{}
@@ -88,11 +89,16 @@ func eligibilityBody(el *lifecycle.UpgradeEligibility) map[string]any {
 		})
 	}
 	// Studio draws a title and a link per validation error it knows; one it does not know would
-	// be an empty row. The one that applies to a paused project is hosted's own.
+	// be an empty row. The ones that apply here are hosted's own.
 	validation := []any{}
+	unsupported := []any{}
 	for _, b := range el.Blockers {
-		if b.Type == lifecycle.BlockerHibernating {
+		switch b.Type {
+		case lifecycle.BlockerHibernating:
 			validation = append(validation, map[string]any{"type": "project_hibernating"})
+		case lifecycle.BlockerExtension:
+			validation = append(validation, map[string]any{"type": "unsupported_extension", "extension_name": b.Extension})
+			unsupported = append(unsupported, b.Extension)
 		}
 	}
 	resp := base("GET /v1/projects/{ref}/upgrade/eligibility")
@@ -104,7 +110,7 @@ func eligibilityBody(el *lifecycle.UpgradeEligibility) map[string]any {
 	set(resp, "duration_estimate_hours", el.DowntimeHours)
 	set(resp, "legacy_auth_custom_roles", []any{})
 	set(resp, "objects_to_be_dropped", []any{})
-	set(resp, "unsupported_extensions", []any{})
+	set(resp, "unsupported_extensions", unsupported)
 	set(resp, "user_defined_objects_in_internal_schemas", []any{})
 	set(resp, "validation_errors", validation)
 	set(resp, "warnings", []any{})

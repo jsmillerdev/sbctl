@@ -108,7 +108,9 @@ type Unused struct {
 // KeepSet lists what GC must not remove, as "<name>/<tag>" keys: the pinned versions, those of
 // the last keepReleases entries of the release history (the pinned ones count as the newest),
 // and extra, the tags the projects run (by service name, as registry.Project.Versions holds
-// them).
+// them). The newest recorded release is always kept, whatever keepReleases says: it is what the
+// daemon last started with, and the binary that runs GC (the CLI) may pin other versions than
+// that daemon, which runs the shared services and the system project from its own.
 func (s *Store) KeepSet(keepReleases int, extra []map[string]string) (map[string]bool, error) {
 	keep := map[string]bool{}
 	add := func(name, tag string) {
@@ -122,6 +124,11 @@ func (s *Store) KeepSet(keepReleases int, extra []map[string]string) (map[string
 	rs, err := s.Releases()
 	if err != nil {
 		return nil, err
+	}
+	if n := len(rs); n > 0 {
+		for name, tag := range rs[n-1].Tags {
+			add(name, tag)
+		}
 	}
 	// The pinned versions are the newest release whether or not the daemon recorded them yet.
 	if n := len(rs); keepReleases > 1 && n > 0 {

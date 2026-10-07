@@ -971,9 +971,12 @@ const StatusDeleted registry.Status = "DELETED"
 //
 //   - PAUSING: the pause is finished (units stopped), status INACTIVE.
 //
-//   - UPGRADING: the units stop, the upgrade is marked failed (its backup id stays in its
-//     events), and the project becomes ACTIVE_UNHEALTHY, so that StartActive starts it on the
-//     versions the registry recorded, the previous ones.
+//   - UPGRADING: when nobody holds the project's upgrade (the process that ran it is gone), the
+//     units stop, the upgrade is marked failed (its backup id stays in its events), and the
+//     project becomes ACTIVE_UNHEALTHY, so that StartActive starts it on the versions the
+//     registry recorded, the previous ones. An upgrade that another process (the CLI) still
+//     runs is left alone; SettleUpgrades picks it up if that process dies later. A recorded
+//     upgrade that never got its final status is settled as well (settleUpgradeRows).
 //
 //   - COMING_UP or RESTARTING with a route: the project was created before and a resume
 //     or restart was cut short; its units are stopped and it becomes INACTIVE, so that
@@ -1024,9 +1027,14 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 				to, note = registry.StatusInitFailed, "the daemon stopped before the project finished creating; delete it and create it again"
 			}
 		case registry.StatusUpgrading:
-			// The units may run versions the registry never recorded: stop them, and
-			// StartActive starts the project on the recorded ones.
-			to, note = registry.StatusActiveUnhealthy, "the daemon stopped during an upgrade; the project starts on its previous versions"
+			if e.runnerLive(ctx, p.Ref) {
+				e.log.Info("recover: another process is still upgrading the project; leaving it to that process", "ref", p.Ref)
+				continue
+			}
+			if r, ok := e.settleUpgrading(ctx, p.Ref); ok {
+				out = append(out, r)
+			}
+			continue
 		case registry.StatusGoingDown:
 			dp := e.deleteProgress(ctx, p.Ref)
 			switch {
@@ -1048,10 +1056,7 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 		}
 		cur, err := e.reg.GetProject(ctx, p.Ref)
 		if err == nil && cur.Status == p.Status {
-			switch {
-			case p.Status == registry.StatusUpgrading:
-				e.recoverUpgrade(ctx, p.Ref)
-			case to == registry.StatusInactive:
+			if to == registry.StatusInactive {
 				if serr := e.plane.Stop(ctx, p.Ref); serr != nil {
 					e.log.Warn("recover: stopping units", "ref", p.Ref, "error", serr)
 				}
@@ -1078,6 +1083,7 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 		out = append(out, Recovered{Ref: ref, From: registry.StatusGoingDown, To: StatusDeleted, Note: "the daemon stopped during a delete; the removal was finished"})
 	}
 	out = e.recoverRestarts(ctx, ps, out)
+	e.settleUpgradeRows(ctx, ps)
 	return out
 }
 

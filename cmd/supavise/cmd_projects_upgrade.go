@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -218,6 +220,13 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 		}
 	}
 
+	// An upgrade must outlive the terminal that started it: a dropped SSH session sends SIGHUP,
+	// and a write to the closed terminal can raise SIGPIPE; either would end the process between
+	// its steps and leave projects UPGRADING with services stopped. Ctrl-C and SIGTERM still
+	// cancel it.
+	signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
+	defer signal.Reset(syscall.SIGHUP, syscall.SIGPIPE)
+
 	// The base backup waits for its WAL to be archived through the daemon's relay; serve the
 	// sockets nobody answers while the daemon is down.
 	var relayRefs []string
@@ -413,6 +422,12 @@ releases (PostgreSQL too when its release changes) and every service is health c
 new versions do not start, the previous ones are started again. GoTrue's database migrations run
 when it starts and only go forward: the base backup is the way back for the data
 (supavise backups restore).
+
+When the PostgreSQL release changes, the extensions installed in the project's databases are
+checked against the new release first; a project with an extension it cannot serve is skipped
+with the extension named (run ALTER EXTENSION <name> UPDATE on it, then upgrade). The upgrade
+never updates extensions itself. The command keeps running if the SSH session drops; a project
+left UPGRADING by a killed upgrade is started again on its previous versions by the daemon.
 
 --all upgrades every eligible project: the first [upgrade] canary_projects (default 1, the
 smallest databases) one at a time, then [upgrade] batch_size (default 3) at a time. It stops at

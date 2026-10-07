@@ -114,7 +114,17 @@ func TestGCKeepsPinsReleasesAndProjects(t *testing.T) {
 		}
 	}
 
-	// keep_releases = 1 keeps only the pinned versions and the projects' (v2 goes).
+	// keep_releases = 1 keeps the pinned versions and the projects'. The daemon has not recorded
+	// v3 yet, so the newest recorded release (v2, what it last started with) is kept as well:
+	// this binary may be newer than the daemon whose services still run those artifacts.
+	keep, _ = s.KeepSet(1, proj)
+	if removed, err = s.GC(keep, false); err != nil || len(removed) != 0 {
+		t.Fatalf("GC with keep_releases=1 before the daemon recorded the pins = %+v, %v (want nothing)", removed, err)
+	}
+	// Once the daemon runs v3 (the history ends with it), v2 goes.
+	if ok, err := s.RecordPins(); err != nil || !ok {
+		t.Fatalf("RecordPins(%s) = %v, %v", v3, ok, err)
+	}
 	keep, _ = s.KeepSet(1, proj)
 	removed, err = s.GC(keep, false)
 	if err != nil || len(removed) != 1 || removed[0].Tag != v2 {

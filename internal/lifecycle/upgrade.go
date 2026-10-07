@@ -7,6 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jsmillerdev/supavise/internal/artifacts"
 	"github.com/jsmillerdev/supavise/internal/config"
@@ -28,12 +32,16 @@ import (
 //
 //  1. UPGRADING, a registry row of the upgrade (its tracking id), the artifacts of the target
 //     versions fetched and verified (nothing runs yet, so a failure here changes nothing).
+//     A new Postgres release is also checked against the extensions the project's databases have
+//     installed (extensions.go): one that the release cannot serve refuses the upgrade here.
 //  2. A fresh base backup (reason pre-upgrade) while the project still serves. It fails closed:
 //     without a backup nothing is stopped.
-//  3. Under the project's lock: the backup timer stops; with a new Postgres the shared services
-//     let go of the database and all three units stop, otherwise only GoTrue and PostgREST restart;
-//     the units are rendered from the target versions and started; each answers a real request
-//     (GoTrue runs its schema migrations before it starts). Then a health check of every service.
+//  3. Under the project's lock: the extension check again; the backup timer stops; with a new
+//     Postgres the shared services let go of the database and all three units stop, otherwise
+//     only GoTrue and PostgREST restart; the units are rendered from the target versions and
+//     started; each answers a real request (GoTrue runs its schema migrations before it starts).
+//     Then a health check of every service, and, after a Postgres change, a load check of the
+//     code of every installed extension.
 //  4. The registry records the target versions and ACTIVE_HEALTHY, in one write.
 //
 // Any failure in step 3 renders the previous versions again, starts them and checks them. The
@@ -44,6 +52,13 @@ import (
 // migrated. The base backup of step 2 is the way back for the data (`supavise backups restore`);
 // the upgrade's status, events and error name its id. Recover (a daemon stopped in the middle)
 // stops the project's units and lets StartActive start them on the recorded, previous versions.
+//
+// Whoever runs an upgrade (the daemon for the API, the CLI for `supavise projects upgrade`)
+// holds a session-level advisory lock on the project from BeginUpgrade to the end of Run, the
+// base backup included, and the lock goes when its process does. A project that is UPGRADING with
+// nobody holding the lock lost its runner: Recover (at the daemon's start) and SettleUpgrades
+// (every few minutes) then stop its units, mark the upgrade failed and start it on its recorded
+// versions. While the lock is held they leave the project alone.
 
 // Progress values of the Management API's upgrade status, in the order Studio's upgrade screen
 // draws them. The names are hosted's (they describe a pg_upgrade onto a new instance); the
@@ -96,12 +111,15 @@ const (
 	BlockerNoUpgradePath = "no_upgrade_path"
 	BlockerNoBackup      = "no_backup_service"
 	BlockerSystem        = "system_project"
+	BlockerExtension     = "unsupported_extension"
 )
 
 // UpgradeBlocker is one reason a project cannot be upgraded now.
 type UpgradeBlocker struct {
 	Type    string
 	Message string
+	// Extension names the extension of a BlockerExtension.
+	Extension string
 }
 
 // UpgradeEligibility answers whether a project can move from the versions it runs to target
@@ -123,6 +141,9 @@ type UpgradeEligibility struct {
 	// drops. Otherwise only GoTrue and PostgREST restart and the database stays up.
 	PostgresRestart bool
 	Blockers        []UpgradeBlocker
+	// Extensions are the installed extensions the target Postgres release cannot serve; each is
+	// also a blocker.
+	Extensions []ExtensionProblem
 	// DowntimeHours estimates how long the project is offline; the base backup before it runs
 	// while the project serves and does not count.
 	DowntimeHours float64
@@ -188,11 +209,11 @@ func (e *Engine) UpgradeEligibility(ctx context.Context, ref string) (*UpgradeEl
 	if err != nil {
 		return nil, err
 	}
-	return e.plan(p, nil)
+	return e.plan(ctx, p, nil)
 }
 
 // plan computes the eligibility of p for target (nil: the node's pins).
-func (e *Engine) plan(p *registry.Project, target map[string]string) (*UpgradeEligibility, error) {
+func (e *Engine) plan(ctx context.Context, p *registry.Project, target map[string]string) (*UpgradeEligibility, error) {
 	node, err := e.versions()
 	if err != nil {
 		return nil, err
@@ -233,6 +254,20 @@ func (e *Engine) plan(p *registry.Project, target map[string]string) (*UpgradeEl
 	if e.opts.Backup == nil {
 		block(BlockerNoBackup, "the node has no backup service, and an upgrade is not started without a fresh backup")
 	}
+	if el.PostgresRestart && p.Status == registry.StatusActiveHealthy && len(el.Blockers) == 0 {
+		// Best effort: a release that is not fetched yet, or a cluster that does not answer, is
+		// a note here and a refusal when the upgrade runs.
+		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		probs, err := e.extensionProblems(cctx, p, to)
+		cancel()
+		if err != nil {
+			el.Notes = append(el.Notes, "The installed extensions could not be checked against the new PostgreSQL release yet ("+err.Error()+"); they are checked again before anything stops.")
+		}
+		for _, pr := range probs {
+			el.Extensions = append(el.Extensions, pr)
+			el.Blockers = append(el.Blockers, UpgradeBlocker{Type: BlockerExtension, Extension: pr.Name, Message: "extension " + pr.String()})
+		}
+	}
 	el.Eligible = !el.UpToDate && len(el.Blockers) == 0
 	for _, c := range el.Changes {
 		switch c.Service {
@@ -262,6 +297,18 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 			return nil, fmt.Errorf("%w: %q is not a service a project upgrades", ErrUpgradeUnsupported, svc)
 		}
 	}
+	// The runner's claim comes before the status: a project that is UPGRADING always has a
+	// holder while its upgrade is alive.
+	release, err := e.claimRunner(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	started := false
+	defer func() {
+		if !started {
+			release()
+		}
+	}()
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -277,7 +324,7 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 	if p.Status != registry.StatusActiveHealthy {
 		return nil, invalidState(p, "upgrade")
 	}
-	el, err := e.plan(p, req.Target)
+	el, err := e.plan(ctx, p, req.Target)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +348,78 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 	e.upgrading.Store(ref, struct{}{})
 	e.event(ctx, ref, EventUpgradeStarted, map[string]any{"tracking_id": up.TrackingID, "from": up.From, "to": up.To, "target_version": req.TargetVersion})
 	e.log.Info("upgrade_started", "ref", ref, "tracking_id", up.TrackingID, "changes", describeChanges(el.Changes))
-	return &upgradeRun{e: e, store: store, up: up, prev: p.Status, restarts: el.PostgresRestart}, nil
+	started = true
+	return &upgradeRun{e: e, store: store, up: up, prev: p.Status, restarts: el.PostgresRestart, release: release}, nil
+}
+
+// localRunners holds the upgrades of registries without advisory locks (the in-memory one, which
+// every Engine in a test process shares), keyed by registry and ref.
+var localRunners sync.Map
+
+var errRunnerBusy = errors.New("another process is upgrading it")
+
+func (e *Engine) localRunnerKey(ref string) string { return fmt.Sprintf("%p/%s", e.reg, ref) }
+
+// runnerLockSQL is the advisory lock of the process that runs ref's upgrade. It is not the
+// project's operation lock (lock): that one is taken only for the steps that change the project,
+// and the base backup, which can take long, runs without it.
+const runnerLockSQL = `pg_try_advisory_lock(hashtext('supavise:upgrade:' || $1::text))`
+
+// claimRunner records that the caller runs ref's upgrade, for as long as it has not called the
+// returned release (idempotent). With a Postgres registry it is a session-level advisory lock on
+// a connection of its own, which Postgres drops when the process dies, however it dies.
+func (e *Engine) claimRunner(ctx context.Context, ref string) (func(), error) {
+	busy := fmt.Errorf("%w: cannot upgrade %s: %w", ErrInvalidState, ref, errRunnerBusy)
+	ap, ok := e.reg.(advisoryPool)
+	if !ok || ap.Pool() == nil {
+		key := e.localRunnerKey(ref)
+		if _, taken := localRunners.LoadOrStore(key, struct{}{}); taken {
+			return nil, busy
+		}
+		return sync.OnceFunc(func() { localRunners.Delete(key) }), nil
+	}
+	conn, err := pgx.ConnectConfig(ctx, ap.Pool().Config().ConnConfig)
+	if err != nil {
+		return nil, fmt.Errorf("lifecycle: claim the upgrade of %s: %w", ref, err)
+	}
+	var got bool
+	if err := conn.QueryRow(ctx, "select "+runnerLockSQL, ref).Scan(&got); err != nil || !got {
+		_ = conn.Close(context.WithoutCancel(ctx))
+		if err != nil {
+			return nil, fmt.Errorf("lifecycle: claim the upgrade of %s: %w", ref, err)
+		}
+		return nil, busy
+	}
+	return sync.OnceFunc(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = conn.Close(cctx) // ends the session, which drops the advisory lock
+	}), nil
+}
+
+// runnerLive reports whether a process holds the upgrade of ref (this one included). When it
+// cannot tell it says yes: a project is left UPGRADING rather than stopped under a live backup.
+func (e *Engine) runnerLive(ctx context.Context, ref string) bool {
+	if _, busy := e.upgrading.Load(ref); busy {
+		return true
+	}
+	ap, ok := e.reg.(advisoryPool)
+	if !ok || ap.Pool() == nil {
+		_, live := localRunners.Load(e.localRunnerKey(ref))
+		return live
+	}
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(cctx, ap.Pool().Config().ConnConfig)
+	if err != nil {
+		return true
+	}
+	defer conn.Close(context.WithoutCancel(ctx)) // drops the lock if the probe got it
+	var got bool
+	if err := conn.QueryRow(cctx, "select "+runnerLockSQL, ref).Scan(&got); err != nil {
+		return true
+	}
+	return !got
 }
 
 // UpgradeProject upgrades ref to the target versions (nil: the node's pins) and returns when it
@@ -363,6 +481,8 @@ type upgradeRun struct {
 	prev registry.Status
 	// restarts: PostgreSQL's release changes, so the cluster restarts.
 	restarts bool
+	// release gives up the claim on the project's upgrade (claimRunner).
+	release func()
 }
 
 func (r *upgradeRun) Upgrade() registry.Upgrade {
@@ -383,11 +503,17 @@ func (r *upgradeRun) save(ctx context.Context, progress string) {
 // Run implements UpgradeRun.
 func (r *upgradeRun) Run(ctx context.Context) error {
 	e, ref := r.e, r.up.Ref
+	defer r.release() // last: the status is settled before anyone may take the project over
 	defer e.upgrading.Delete(ref)
 
 	r.save(ctx, ProgressStarted)
 	if err := e.ensureArtifacts(ctx, r.up.From, r.up.To); err != nil {
 		return r.abort(ctx, UpgradeErrArtifacts, "fetching the target artifacts", err)
+	}
+	// The release is on disk now, so the extensions can be checked against it before the
+	// backup spends its time.
+	if err := r.checkExtensions(ctx); err != nil {
+		return r.abort(ctx, UpgradeErrArtifacts, "checking the installed extensions", err)
 	}
 	r.save(ctx, ProgressArtifactsReady)
 
@@ -405,6 +531,34 @@ func (r *upgradeRun) Run(ctx context.Context) error {
 	}
 	defer unlock()
 	return r.swap(ctx)
+}
+
+// checkExtensions refuses the upgrade when an extension installed in one of the project's
+// databases cannot run on the target Postgres release. It runs while the project still serves
+// and nothing has been touched. It fails closed: a cluster it cannot ask is a refusal.
+func (r *upgradeRun) checkExtensions(ctx context.Context) error {
+	if !r.restarts {
+		return nil
+	}
+	p, err := r.e.reg.GetProject(ctx, r.up.Ref)
+	if err != nil {
+		return err
+	}
+	return r.extensionsOK(ctx, p)
+}
+
+func (r *upgradeRun) extensionsOK(ctx context.Context, p *registry.Project) error {
+	if !r.restarts {
+		return nil
+	}
+	probs, err := r.e.extensionProblems(ctx, p, r.up.To)
+	if err != nil {
+		return fmt.Errorf("check the installed extensions against the new PostgreSQL release: %w", err)
+	}
+	if len(probs) > 0 {
+		return fmt.Errorf("%w: the new PostgreSQL release cannot serve the installed extensions: %s", ErrUpgradeUnsupported, describeProblems(probs))
+	}
+	return nil
 }
 
 // ensureArtifacts makes the artifacts of every changed service available before anything is
@@ -468,6 +622,18 @@ func (r *upgradeRun) failed(ctx context.Context, code string, cause error, outco
 	r.e.log.Error("upgrade_failed", "ref", r.up.Ref, "tracking_id", r.up.TrackingID, "stage", code, "backup_id", r.up.BackupID, "outcome", outcome, "error", cause)
 }
 
+// refuse ends an upgrade that has not touched a service, with the project's lock held: the
+// project goes back to the status it had. (abort does the same without the lock.)
+func (r *upgradeRun) refuse(ctx context.Context, code string, cause error) error {
+	cctx, cancel := cleanupCtx(ctx)
+	defer cancel()
+	if err := r.e.reg.SetProjectStatus(cctx, r.up.Ref, r.prev); err != nil {
+		r.e.log.Error("upgrade: could not restore the project's status", "ref", r.up.Ref, "error", err)
+	}
+	r.failed(cctx, code, cause, "nothing was changed")
+	return fmt.Errorf("lifecycle: upgrade of %s failed before any service was touched; the project runs its previous versions: %w", r.up.Ref, cause)
+}
+
 // swap is steps 3 and 4: the project's lock is held.
 func (r *upgradeRun) swap(ctx context.Context) error {
 	e, ref := r.e, r.up.Ref
@@ -484,11 +650,11 @@ func (r *upgradeRun) swap(ctx context.Context) error {
 	}
 	keys, err := e.loadKeys(ctx, ref)
 	if err != nil {
-		cctx, cancel := cleanupCtx(ctx)
-		defer cancel()
-		_ = e.reg.SetProjectStatus(cctx, ref, r.prev)
-		r.failed(cctx, UpgradeErrStart, err, "nothing was changed")
-		return fmt.Errorf("lifecycle: upgrade of %s: %w", ref, err)
+		return r.refuse(ctx, UpgradeErrStart, err)
+	}
+	// The databases may have changed since the check before the backup.
+	if err := r.extensionsOK(ctx, p); err != nil {
+		return r.refuse(ctx, UpgradeErrArtifacts, err)
 	}
 	target := *p
 	target.Versions = mergeVersions(p.Versions, r.up.To)
@@ -500,6 +666,14 @@ func (r *upgradeRun) swap(ctx context.Context) error {
 		r.save(ctx, ProgressHealth)
 		if serr = healthError(e.plane.Health(ctx, &target, keys)); serr != nil {
 			code = UpgradeErrHealth
+		}
+	}
+	if serr == nil && r.restarts {
+		// The cluster answers; the code of the extensions in its databases must load too.
+		if insp, ok := e.plane.(ExtensionInspector); ok {
+			if serr = insp.VerifyExtensions(ctx, &target); serr != nil {
+				code = UpgradeErrHealth
+			}
 		}
 	}
 	if serr == nil {
@@ -573,8 +747,9 @@ func (r *upgradeRun) rollback(ctx context.Context, p *registry.Project, keys *se
 	} else {
 		rerr = e.plane.Reconfigure(cctx, &prev, keys)
 	}
+	hs := e.plane.Health(cctx, &prev, keys)
 	if rerr == nil {
-		rerr = healthError(e.plane.Health(cctx, &prev, keys))
+		rerr = healthError(hs)
 	}
 	status := registry.StatusActiveHealthy
 	if rerr != nil {
@@ -584,13 +759,32 @@ func (r *upgradeRun) rollback(ctx context.Context, p *registry.Project, keys *se
 	if err := e.reg.UpdateProject(cctx, p); err != nil {
 		e.log.Error("upgrade: could not record the previous versions after the rollback", "ref", ref, "error", err)
 	}
-	if rerr == nil {
+	// The nightly backup needs only the cluster: restart its timer whenever PostgreSQL runs, even
+	// if an API unit does not.
+	timerOn := rerr == nil || postgresHealthy(hs)
+	if timerOn {
 		e.startTimer(cctx, ref)
+	}
+	if rerr == nil {
 		r.failed(cctx, code, cause, "rolled back to the previous versions")
 		return fmt.Errorf("lifecycle: upgrade of %s failed and the previous versions are running again (the data was not restored; the pre-upgrade backup is %d): %w", ref, r.up.BackupID, cause)
 	}
-	r.failed(cctx, code, cause, "the rollback failed too: "+rerr.Error())
+	outcome := "the rollback failed too: " + rerr.Error()
+	if !timerOn {
+		outcome += "; the project's scheduled backups stay paused until it is restarted"
+		e.log.Warn("upgrade: the cluster is not running after the rollback, so scheduled backups stay paused", "ref", ref)
+	}
+	r.failed(cctx, code, cause, outcome)
 	return fmt.Errorf("lifecycle: upgrade of %s failed (%v) and the rollback to the previous versions failed too (%v); the project is ACTIVE_UNHEALTHY, and the pre-upgrade backup %d is the way back for the data (`supavise backups restore`)", ref, cause, rerr, r.up.BackupID)
+}
+
+func postgresHealthy(hs []ServiceHealth) bool {
+	for _, h := range hs {
+		if h.Name == config.SvcPostgres && h.Healthy {
+			return true
+		}
+	}
+	return false
 }
 
 func healthError(hs []ServiceHealth) error {
@@ -609,14 +803,119 @@ func healthError(hs []ServiceHealth) error {
 	return nil
 }
 
-// recoverUpgrade settles a project the daemon left UPGRADING: its units stop (they may run the
-// target versions, which the registry never recorded) and its upgrade is marked failed. The
-// caller sets the status; StartActive then starts the project on the versions the registry has.
+// settleUpgrading settles a project that is UPGRADING with no process running its upgrade: its
+// units stop (they may run the target versions, which the registry never recorded), its upgrade
+// is marked failed, and the project becomes ACTIVE_UNHEALTHY, which is what StartActive starts
+// on the versions the registry has. It reports false when the project had moved on by the time
+// the lock was held.
+func (e *Engine) settleUpgrading(ctx context.Context, ref string) (Recovered, bool) {
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		e.log.Warn("recover: lock", "ref", ref, "error", err)
+		return Recovered{}, false
+	}
+	defer unlock()
+	cur, err := e.reg.GetProject(ctx, ref)
+	if err != nil || cur.Status != registry.StatusUpgrading {
+		return Recovered{}, false
+	}
+	e.recoverUpgrade(ctx, ref)
+	const note = "the process that ran the upgrade stopped; the project starts on its previous versions"
+	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusActiveUnhealthy); err != nil {
+		e.log.Error("recover: set status", "ref", ref, "error", err)
+		return Recovered{}, false
+	}
+	e.event(ctx, ref, "project.recovered", map[string]string{"from": string(registry.StatusUpgrading), "to": string(registry.StatusActiveUnhealthy), "note": note})
+	e.log.Warn("recovered project after an interrupted operation", "ref", ref, "from", registry.StatusUpgrading, "to", registry.StatusActiveUnhealthy, "note", note)
+	return Recovered{Ref: ref, From: registry.StatusUpgrading, To: registry.StatusActiveUnhealthy, Note: note}, true
+}
+
+// SettleUpgrades is Recover's UPGRADING step for a daemon that keeps running: an upgrade run by
+// the CLI whose process died (a dropped SSH session that took it along, a kill, the OOM killer)
+// leaves its project UPGRADING with nobody to finish it, and Studio would show the upgrade screen
+// for good. Each such project is stopped, marked ACTIVE_UNHEALTHY and started again on its
+// recorded versions; an upgrade whose process still holds its claim is not touched. The daemon
+// calls it every few minutes.
+func (e *Engine) SettleUpgrades(ctx context.Context) []Recovered {
+	ps, err := e.reg.ListProjects(ctx)
+	if err != nil {
+		e.log.Error("settle upgrades: listing projects", "error", err)
+		return nil
+	}
+	var out []Recovered
+	for i := range ps {
+		p := ps[i]
+		if p.Ref == config.SystemRef || p.Status != registry.StatusUpgrading || e.runnerLive(ctx, p.Ref) {
+			continue
+		}
+		r, ok := e.settleUpgrading(ctx, p.Ref)
+		if !ok {
+			continue
+		}
+		out = append(out, r)
+		cur, err := e.reg.GetProject(ctx, p.Ref)
+		if err != nil {
+			continue
+		}
+		if err := e.startOne(ctx, cur); err != nil {
+			e.log.Error("settle upgrades: the project did not start on its previous versions", "ref", p.Ref, "error", err)
+		}
+	}
+	e.settleUpgradeRows(ctx, ps)
+	return out
+}
+
+// settleUpgradeRows ends the upgrade record of a project that is not UPGRADING while the record
+// still says running: its process stopped between recording the new versions and writing the
+// final progress (or after a rollback), and nothing else would close it. Studio would poll
+// the status for good, and artifact collection would keep the record's versions. The upgrade
+// is done when the project runs its target versions, and failed otherwise.
+func (e *Engine) settleUpgradeRows(ctx context.Context, ps []registry.Project) {
+	store := registry.Upgrades(e.reg)
+	if store == nil {
+		return
+	}
+	for i := range ps {
+		p := &ps[i]
+		if p.Ref == config.SystemRef || p.Status == registry.StatusUpgrading {
+			continue
+		}
+		u, err := store.LatestUpgrade(ctx, p.Ref)
+		if err != nil || u.Status != registry.UpgradeRunning || e.runnerLive(ctx, p.Ref) {
+			continue
+		}
+		now := e.opts.Now().UTC()
+		eff, err := e.EffectiveVersions(p)
+		if err == nil && len(DiffVersions(eff, u.To)) == 0 {
+			u.Status, u.Progress, u.Error, u.LatestStatusAt = registry.UpgradeDone, ProgressCompleted, "", now
+			u.Detail = ""
+			if err := store.PutUpgrade(ctx, u); err != nil {
+				e.log.Warn("settle upgrades: could not close the upgrade record", "ref", p.Ref, "error", err)
+				continue
+			}
+			e.event(ctx, p.Ref, EventUpgradeSucceeded, map[string]any{"tracking_id": u.TrackingID, "from": u.From, "to": u.To,
+				"backup_id": u.BackupID, "outcome": "settled: the project runs the target versions"})
+			e.log.Warn("upgrade_succeeded", "ref", p.Ref, "tracking_id", u.TrackingID, "backup_id", u.BackupID, "outcome", "settled")
+			continue
+		}
+		u.Status, u.Error, u.LatestStatusAt = registry.UpgradeFailed, UpgradeErrHealth, now
+		u.Detail = "the process that ran the upgrade stopped before it finished; the project runs its previous versions"
+		if err := store.PutUpgrade(ctx, u); err != nil {
+			e.log.Warn("settle upgrades: could not close the upgrade record", "ref", p.Ref, "error", err)
+			continue
+		}
+		e.event(ctx, p.Ref, EventUpgradeFailed, map[string]any{"tracking_id": u.TrackingID, "error_code": u.Error, "error": u.Detail,
+			"outcome": "interrupted", "backup_id": u.BackupID, "progress": u.Progress})
+		e.log.Error("upgrade_failed", "ref", p.Ref, "tracking_id", u.TrackingID, "stage", u.Progress, "backup_id", u.BackupID, "outcome", "interrupted")
+	}
+}
+
+// recoverUpgrade ends the running upgrade record of ref as failed and stops the project's units.
 func (e *Engine) recoverUpgrade(ctx context.Context, ref string) {
 	if store := registry.Upgrades(e.reg); store != nil {
 		if u, err := store.LatestUpgrade(ctx, ref); err == nil && u.Status == registry.UpgradeRunning {
 			u.Status, u.Error, u.LatestStatusAt = registry.UpgradeFailed, UpgradeErrHealth, e.opts.Now().UTC()
-			u.Detail = "the daemon stopped during the upgrade; the project starts on its previous versions"
+			u.Detail = "the process that ran the upgrade stopped; the project starts on its previous versions"
 			if err := store.PutUpgrade(ctx, u); err != nil {
 				e.log.Warn("recover: could not mark the upgrade failed", "ref", ref, "error", err)
 			}

@@ -23,6 +23,10 @@ type tagArts struct {
 	pins     map[string]string
 	fetched  []string
 	fetchErr error
+	// dirs maps "<svc> <tag>" to a real directory (a fake artifact); hidden names the ones DirFor
+	// cannot find until FetchTag has fetched them.
+	dirs   map[string]string
+	hidden map[string]bool
 }
 
 func newTagArts() *tagArts {
@@ -38,13 +42,27 @@ func (a *tagArts) Tag(svc string) (string, error) {
 }
 func (a *tagArts) Dir(svc string) (string, error) {
 	t, _ := a.Tag(svc)
-	return "/art/" + svc + "/" + t, nil
+	return a.DirFor(svc, t)
 }
-func (a *tagArts) DirFor(svc, tag string) (string, error) { return "/art/" + svc + "/" + tag, nil }
+func (a *tagArts) DirFor(svc, tag string) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.hidden[svc+" "+tag] {
+		return "", errors.New("not fetched")
+	}
+	if d := a.dirs[svc+" "+tag]; d != "" {
+		return d, nil
+	}
+	return "/art/" + svc + "/" + tag, nil
+}
 func (a *tagArts) FetchTag(_ context.Context, svc, tag string) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.fetched = append(a.fetched, svc+" "+tag)
+	delete(a.hidden, svc+" "+tag)
+	if d := a.dirs[svc+" "+tag]; d != "" {
+		return d, a.fetchErr
+	}
 	return "/art/" + svc + "/" + tag, a.fetchErr
 }
 
@@ -60,6 +78,28 @@ type upPlane struct {
 	failRollback bool
 	failedOnce   bool
 	steps        []string
+	// exts are the extensions the project's databases have installed; extCalls counts listings;
+	// verifyBad is a release whose extension code does not load (VerifyExtensions fails on it).
+	exts      []InstalledExtension
+	extCalls  int
+	verifyBad string
+	// pgHealthy adds a healthy PostgreSQL entry to Health: the cluster runs whatever the API units do.
+	pgHealthy bool
+}
+
+func (u *upPlane) Extensions(context.Context, *registry.Project) ([]InstalledExtension, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.extCalls++
+	return u.exts, nil
+}
+
+func (u *upPlane) VerifyExtensions(_ context.Context, p *registry.Project) error {
+	u.step("VerifyExtensions", p)
+	if u.verifyBad != "" && u.uses(p, u.verifyBad) {
+		return errors.New("extension code does not load on the new release: wrappers in postgres: wrappers_handler: could not find function")
+	}
+	return nil
 }
 
 func (u *upPlane) uses(p *registry.Project, tag string) bool {
@@ -106,7 +146,11 @@ func (u *upPlane) Stop(ctx context.Context, ref string) error {
 }
 func (u *upPlane) Health(_ context.Context, p *registry.Project, _ *secrets.ProjectKeys) []ServiceHealth {
 	ok := !(u.healthBad && u.uses(p, u.bad))
-	return []ServiceHealth{{Name: config.SvcGoTrue, Healthy: ok, Status: "x", Error: "GoTrue /health: status 500"}}
+	hs := []ServiceHealth{{Name: config.SvcGoTrue, Healthy: ok, Status: "x", Error: "GoTrue /health: status 500"}}
+	if u.pgHealthy {
+		hs = append(hs, ServiceHealth{Name: config.SvcPostgres, Healthy: true, Status: "ACTIVE_HEALTHY"})
+	}
+	return hs
 }
 
 func (u *upPlane) log() string { u.mu.Lock(); defer u.mu.Unlock(); return strings.Join(u.steps, ", ") }
@@ -268,7 +312,7 @@ func TestUpgradeRestartsPostgresWhenItsReleaseChanges(t *testing.T) {
 	if _, err := h.e.UpgradeProject(context.Background(), h.ref, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := h.plane.log(), "Stop, StartDatabase v2.195.0-r1, Start v2.195.0-r1"; got != want {
+	if got, want := h.plane.log(), "Stop, StartDatabase v2.195.0-r1, Start v2.195.0-r1, VerifyExtensions v2.195.0-r1"; got != want {
 		t.Fatalf("plane steps = %s, want %s", got, want)
 	}
 	if p := h.project(t); p.Versions[config.SvcPostgres] != "postgres-17.2.0-r1" || p.Status != registry.StatusActiveHealthy {
@@ -525,7 +569,13 @@ func TestUpgradeToAnExplicitTarget(t *testing.T) {
 	}
 }
 
-// A daemon that stopped in the middle of an upgrade: Recover stops the units, ends the
+// daemonOf is a second Engine over the harness's registry and plane: the daemon, next to the
+// CLI process whose Engine (h.e) runs an upgrade.
+func (h *upHarness) daemonOf() *Engine {
+	return NewEngine(h.cfg, h.reg, h.e.sec, h.arts, h.plane, Options{Fleet: fleet.Fleet{&fakeTenant{}}, Backup: h.backup, Timers: h.e.opts.Timers})
+}
+
+// A process that stopped in the middle of an upgrade: Recover stops the units, ends the
 // upgrade, and lets StartActive start the project on the recorded versions.
 func TestRecoverAnInterruptedUpgrade(t *testing.T) {
 	h := newUpHarness(t)
@@ -534,8 +584,18 @@ func TestRecoverAnInterruptedUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.e.upgrading.Delete(h.ref) // the process that ran it is gone
-	rec := h.e.Recover(ctx)
+	daemon := h.daemonOf()
+	// The runner is alive (another process holds the project's upgrade): the daemon's Recover
+	// must not stop units under its backup.
+	if rec := daemon.Recover(ctx); len(rec) != 0 || h.project(t).Status != registry.StatusUpgrading || h.plane.has("Stop "+h.ref) {
+		t.Fatalf("Recover touched an upgrade that is running: %+v, calls %v", rec, h.plane.calls)
+	}
+	if rec := daemon.SettleUpgrades(ctx); len(rec) != 0 || h.project(t).Status != registry.StatusUpgrading {
+		t.Fatalf("SettleUpgrades touched an upgrade that is running: %+v", rec)
+	}
+	run.(*upgradeRun).release() // the process that ran it is gone
+	h.e.upgrading.Delete(h.ref)
+	rec := daemon.Recover(ctx)
 	if len(rec) != 1 || rec[0].From != registry.StatusUpgrading || rec[0].To != registry.StatusActiveUnhealthy {
 		t.Fatalf("recovered = %+v", rec)
 	}
@@ -543,15 +603,88 @@ func TestRecoverAnInterruptedUpgrade(t *testing.T) {
 		t.Fatalf("units were not stopped: %v", h.plane.calls)
 	}
 	st := h.latest(t)
-	if st.TrackingID != run.Upgrade().TrackingID || st.Status != registry.UpgradeFailed || !strings.Contains(st.Detail, "daemon stopped") {
+	if st.TrackingID != run.Upgrade().TrackingID || st.Status != registry.UpgradeFailed || !strings.Contains(st.Detail, "process that ran the upgrade stopped") {
 		t.Fatalf("status row = %+v", st)
 	}
-	if errs := h.e.StartActive(ctx); len(errs) != 0 {
+	if errs := daemon.StartActive(ctx); len(errs) != 0 {
 		t.Fatalf("StartActive: %v", errs)
 	}
 	p := h.project(t)
 	if p.Status != registry.StatusActiveHealthy || p.Versions[config.SvcGoTrue] != oldAuth {
 		t.Fatalf("project = %s %v", p.Status, p.Versions)
+	}
+}
+
+// A CLI upgrade that dies while the daemon runs: the periodic settle starts the project on its
+// previous versions, and a second upgrade of it is accepted afterwards.
+func TestSettleUpgradesStartsAProjectWhoseRunnerDied(t *testing.T) {
+	h := newUpHarness(t)
+	ctx := context.Background()
+	run, err := h.e.BeginUpgrade(ctx, h.ref, UpgradeRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another process cannot start a second upgrade of the same project while this one lives.
+	if _, err := h.daemonOf().BeginUpgrade(ctx, h.ref, UpgradeRequest{}); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("a second runner: %v", err)
+	}
+	run.(*upgradeRun).release()
+	h.e.upgrading.Delete(h.ref)
+	h.plane.steps = nil
+	daemon := h.daemonOf()
+	rec := daemon.SettleUpgrades(ctx)
+	if len(rec) != 1 || rec[0].Ref != h.ref {
+		t.Fatalf("settled = %+v", rec)
+	}
+	if p := h.project(t); p.Status != registry.StatusActiveHealthy || p.Versions[config.SvcGoTrue] != oldAuth {
+		t.Fatalf("project = %s %v", p.Status, p.Versions)
+	}
+	if st := h.latest(t); st.Status != registry.UpgradeFailed {
+		t.Fatalf("status row = %+v", st)
+	}
+	if _, err := daemon.UpgradeProject(ctx, h.ref, nil); err != nil {
+		t.Fatalf("upgrade after the settle: %v", err)
+	}
+}
+
+// A process that died after recording the new versions but before the final progress: the
+// record is closed as done, or as failed when the project never moved.
+func TestSettleUpgradeRowsClosesWhatNoRunnerFinished(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		moved    bool
+		want     registry.UpgradeStatus
+		contains string
+	}{
+		{"versions recorded", true, registry.UpgradeDone, ""},
+		{"versions not recorded", false, registry.UpgradeFailed, "previous versions"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newUpHarness(t)
+			run, err := h.e.BeginUpgrade(ctx, h.ref, UpgradeRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := h.project(t)
+			p.Status = registry.StatusActiveHealthy
+			if tc.moved {
+				p.Versions = mergeVersions(p.Versions, run.Upgrade().To)
+			}
+			if err := h.reg.UpdateProject(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+			run.(*upgradeRun).release()
+			h.e.upgrading.Delete(h.ref)
+			h.daemonOf().SettleUpgrades(ctx)
+			st := h.latest(t)
+			if st.Status != tc.want || !strings.Contains(st.Detail, tc.contains) {
+				t.Fatalf("status row = %+v", st)
+			}
+			if tc.moved && st.Progress != ProgressCompleted {
+				t.Fatalf("progress = %s", st.Progress)
+			}
+		})
 	}
 }
 
