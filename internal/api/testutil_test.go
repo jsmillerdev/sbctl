@@ -59,7 +59,7 @@ func (m *fakeManager) observe(op string, ctx context.Context) {
 }
 
 func newFakeManager(reg registry.Registry, sec secrets.Secrets) *fakeManager {
-	return &fakeManager{reg: reg, sec: sec, dsn: "postgres://postgres:pw@127.0.0.1:5432/postgres", keys: map[string]*secrets.ProjectKeys{}, applyErr: map[projectconfig.Service]error{}, keyCalls: map[string]int{}}
+	return &fakeManager{reg: reg, sec: sec, dsn: "postgres://postgres:pw@127.0.0.1:1/postgres?connect_timeout=1", keys: map[string]*secrets.ProjectKeys{}, applyErr: map[projectconfig.Service]error{}, keyCalls: map[string]int{}}
 }
 
 func (m *fakeManager) addProject(t testing.TB, ref, name string, orgID int64, status registry.Status) *registry.Project {
