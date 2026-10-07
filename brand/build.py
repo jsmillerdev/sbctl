@@ -362,7 +362,7 @@ FEATURES = [
     ("backup", "Backups", "Point-in-time restore from the dashboard, including Storage files"),
     ("team", "Teams", "Organizations, roles, invitations, SAML single sign-on and MFA"),
     ("key", "API keys", "Publishable and secret keys, legacy JWT keys and key rotation"),
-    ("shield", "Operations", "Automatic HTTPS, health checks, alerts and signed updates"),
+    ("shield", "Operations", "Automatic HTTPS, health checks, alerts, security patches and signed updates"),
     ("cloud", "AWS", "A one-field CloudFormation template"),
 ]
 

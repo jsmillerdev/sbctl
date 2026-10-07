@@ -593,7 +593,9 @@ func ensureOSPackages(ctx context.Context, out, errOut io.Writer) error {
 	fmt.Fprintf(out, "installing %s\n", strings.Join(missing, ", "))
 	env := append(os.Environ(), "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_SUSPEND=1")
 	apt := func(args ...string) error {
-		c := exec.CommandContext(ctx, "apt-get", args...)
+		// A fresh cloud VM's first apt-daily run or cloud-init often holds the dpkg lock:
+		// wait for it (apt 1.9.11+, on every supported release) instead of failing.
+		c := exec.CommandContext(ctx, "apt-get", append([]string{"-o", "DPkg::Lock::Timeout=300"}, args...)...)
 		c.Env, c.Stdout, c.Stderr = env, out, errOut
 		return c.Run()
 	}
