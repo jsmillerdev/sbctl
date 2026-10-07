@@ -124,6 +124,13 @@ func UnitName(svc, ref string) string {
 	return "sb-" + svc + ".service"
 }
 
+// EdgeBundleCleanUnit is the one-shot unit (sb-edge-bundle-clean@<ref>.service, run as root)
+// that deletes the module cache of the project's bundler instance, which is private to that
+// instance's dynamic uid. sbctl starts it when it deletes the project.
+func EdgeBundleCleanUnit(ref string) string {
+	return fmt.Sprintf("sb-%s-clean@%s.service", SvcEdgeBundle, ref)
+}
+
 // Slice is the systemd slice every sbctl unit runs in.
 const Slice = "sbctl.slice"
 

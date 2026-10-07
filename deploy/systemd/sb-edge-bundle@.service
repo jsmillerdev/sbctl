@@ -38,8 +38,9 @@ StartLimitIntervalSec=0
 # from the unit name, which includes the ref. The unit of another project cannot open the
 # directory: it is mode 0700 under /var/cache/private, which only root may enter, and owned by
 # another uid.
-# The directory is emptied before a start when it has passed 512 MiB, and the daemon has systemd
-# remove it when the project is deleted (Systemd.Remove: CleanUnit with the "cache" mask).
+# The directory is emptied before a start when it has passed 512 MiB, and removed when the project
+# is deleted (Systemd.Remove starts sb-edge-bundle-clean@<ref>.service, which runs as root because
+# the sbctl user cannot enter /var/cache/private).
 Type=oneshot
 DynamicUser=yes
 Slice=sbctl.slice

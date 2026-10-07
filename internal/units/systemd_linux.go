@@ -225,12 +225,7 @@ func (s *Systemd) Remove(ctx context.Context, unit string) error {
 		return err
 	}
 	if svc == config.SvcEdgeBundle {
-		// The module cache is private to the instance's dynamic uid (CacheDirectory=), so the
-		// daemon cannot delete it; systemd does, on request. Done before the rendered files go,
-		// so that a failure leaves the unit to try again.
-		if c, err := s.dial(ctx); err == nil {
-			_ = c.ResetFailedUnitContext(ctx, unit)
-		}
+		// Done before the rendered files go, so that a failure leaves the unit to try again.
 		if err := s.cleanCache(ctx, unit); err != nil {
 			return fmt.Errorf("units: remove the module cache of %s: %w", unit, err)
 		}
@@ -246,44 +241,17 @@ func (s *Systemd) Remove(ctx context.Context, unit string) error {
 	return removeFiles(files)
 }
 
-// cleanCache has systemd delete the cache directory of unit (CleanUnit with the "cache" mask,
-// what `systemctl clean --what=cache` does; polkit's manage-units action covers it) and waits
-// until the cleaning, which runs as a unit state of its own, is over. A unit systemd does not
-// know (the template is not installed) has no cache to remove.
+// cleanCache removes the module cache of the bundler instance unit, which is private to the
+// instance's dynamic uid (CacheDirectory=), so the daemon cannot delete it. A user other than
+// root cannot ask systemd to do it either (CleanUnit is refused by the D-Bus policy of
+// systemd, before polkit is asked), so a one-shot unit that the polkit rule lets the sbctl user
+// start does the removal as root (deploy/systemd/sb-edge-bundle-clean@.service).
 func (s *Systemd) cleanCache(ctx context.Context, unit string) error {
-	bus, err := godbus.ConnectSystemBus()
+	_, ref, err := ParseUnit(unit)
 	if err != nil {
 		return err
 	}
-	defer bus.Close()
-	mgr := bus.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
-	if err := mgr.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.CleanUnit", 0, unit, []string{"cache"}).Err; err != nil {
-		var de godbus.Error
-		if errors.As(err, &de) && (de.Name == "org.freedesktop.systemd1.NoSuchUnit" || de.Name == "org.freedesktop.systemd1.LoadFailed") {
-			return nil
-		}
-		return err
-	}
-	// While it cleans the unit is in the "maintenance" state (systemd's SERVICE_CLEANING).
-	for {
-		st, err := s.Status(ctx, unit)
-		if err != nil {
-			// A unit with nothing left to hold is unloaded as soon as it is clean.
-			var de godbus.Error
-			if errors.As(err, &de) && de.Name == "org.freedesktop.systemd1.NoSuchUnit" {
-				return nil
-			}
-			return err
-		}
-		if st.State != State("maintenance") {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
+	return s.Start(ctx, config.EdgeBundleCleanUnit(ref))
 }
 
 // revert lifts the limits SetLimits wrote by setting them back to infinity. Removing the

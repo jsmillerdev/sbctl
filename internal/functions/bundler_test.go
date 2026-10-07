@@ -644,3 +644,42 @@ func TestTrimCacheEmptiesOnlyAboveTheLimit(t *testing.T) {
 		t.Fatal("a cache over the limit stayed")
 	}
 }
+
+// The cache of a project's bundler is private to the instance's uid, so a root unit removes it
+// when the project is deleted. That unit takes the ref from its name and can write to the one
+// directory only: a ref that is not lowercase letters ("..", a path) must not reach rm.
+func TestCacheCleanUnitIsNarrow(t *testing.T) {
+	b, err := systemd.Read("sb-edge-bundle-clean@.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	if name := config.EdgeBundleCleanUnit("%i"); name != "sb-edge-bundle-clean@%i.service" {
+		t.Fatalf("unit name %s", name)
+	}
+	for _, want := range []string{
+		"Type=oneshot",
+		`case "$$1" in ""|*[!a-z]*)`,
+		`rm -rf -- "/var/cache/private/sb-edge-bundle/$$1"' sh %i`,
+		"ReadWritePaths=-/var/cache/private/sb-edge-bundle",
+		"ProtectSystem=strict", "NoNewPrivileges=yes", "PrivateNetwork=yes",
+		"CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("sb-edge-bundle-clean@.service lacks %q", want)
+		}
+	}
+	for _, l := range strings.Split(body, "\n") {
+		if strings.HasPrefix(l, "User=") || strings.HasPrefix(l, "ExecStart=") && strings.Count(l, "rm ") != 1 {
+			t.Errorf("unexpected line %q", l)
+		}
+	}
+	// The directory it removes is the one the bundler unit creates.
+	u, err := systemd.Read("sb-edge-bundle@.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(u), "CacheDirectory=sb-edge-bundle/%i") {
+		t.Error("the bundler unit's cache directory is not sb-edge-bundle/%i")
+	}
+}
