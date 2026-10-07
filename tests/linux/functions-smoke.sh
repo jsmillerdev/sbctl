@@ -114,7 +114,8 @@ for hidden in "$SBCTL_STATE/backups" "$SBCTL_STATE/certs" /etc/sbctl; do
 done
 # The runtime sees the tree of functions (its own state directory) and nothing of the projects.
 sees "$SBCTL_STATE/system/edge-runtime/tenants" || fail "$U cannot see its tenants directory"
-for hidden in "$SBCTL_STATE/projects/$REF_A" "$SBCTL_STATE/projects/$REF_A/postgres" "$SBCTL_STATE/projects/system/postgres" "$SBCTL_STATE/projects/system"; do
+# (projects/system exists as the parent of its launcher script, with nothing else in it.)
+for hidden in "$SBCTL_STATE/projects/$REF_A" "$SBCTL_STATE/projects/$REF_A/postgres" "$SBCTL_STATE/projects/system/postgres" "$SBCTL_STATE/projects/system/postgres.env"; do
   if sees "$hidden"; then fail "$U can read $hidden"; fi
 done
 
