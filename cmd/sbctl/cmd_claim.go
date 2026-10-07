@@ -29,6 +29,9 @@ func openAccounts(ctx context.Context) (*api.Accounts, *config.Config, func(), e
 	}
 	acc := &api.Accounts{Reg: n.Registry, Store: api.NewPGClaimStore(pg.Pool()), Keys: n.Engine.Keys, Config: n.Cfg, Log: newLogger(n.Cfg)}
 	acc.EnableMembers(n.Registry, api.NewPGStore(pg.Pool()))
+	// `users remove` forgets an SSO account's record and remembers its removal by address, as the
+	// daemon's does (the daemon gets this from NewDashboardSSO).
+	acc.SSOUsers = api.NewPGSSOStore(pg.Pool())
 	return acc, n.Cfg, n.Close, nil
 }
 
