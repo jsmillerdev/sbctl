@@ -14,7 +14,8 @@
 #      reports egress=denied, its pg_net request to the same address fails and never reaches the
 #      server, its pg_cron job is inactive and recorded, and the parent's job is untouched;
 #   3. the restriction survives a pause and resume, and a reset (which recreates the cluster);
-#   4. a branch created with --allow-egress reaches the server and keeps its cron job active;
+#   4. a branch created with --allow-egress reaches the server and keeps its cron job active, and
+#      the job runs there (pg_cron's background workers) while the denied branch's paused job does not;
 #   5. deleting a branch lifts the restriction from the unit (a later project with the ref gets none);
 #   6. the loopback allow is 127.0.0.1 and ::1 only: from the branch's Postgres a pg_net request to
 #      127.0.0.1 is answered (and the cluster's own clients, GoTrue and PostgREST, stay healthy)
@@ -263,6 +264,17 @@ unconfined "sb-postgres@$C.service" || fail "$C: an opted-out branch has a restr
 row=$(net_request "$C" branch-open)
 [[ $row == "200|" ]] || fail "$C: with --allow-egress a pg_net request answered '$row', want '200|'"
 log "$C: reaches the server as the parent does"
+
+# ---- cron runs where it may -----------------------------------------------------------------
+# pg_cron runs its jobs in background workers of the cluster (cron.use_background_workers). A clone
+# carries the parent's job_run_details, so each count below is taken against what the branch started with.
+log "cron: the parent and the opted-out branch run their job; the denied branch stays paused"
+B_RUNS=$(cron_runs sql "$B" egress-test-job)
+C_RUNS=$(cron_runs sql "$C" egress-test-job succeeded)
+wait_cron_success sql "$A" egress-test-job 150 || fail "$A: the parent's cron job has no succeeded run"
+wait_cron_success sql "$C" egress-test-job 150 "$C_RUNS" || fail "$C: the opted-out branch's cron job did not run"
+[[ $(sql "$B" "select active from cron.job where jobname = 'egress-test-job'") == f ]] || fail "$B: the cron job became active"
+[[ $(cron_runs sql "$B" egress-test-job) -eq "$B_RUNS" ]] || fail "$B: the denied branch ran a cron job while it should stay paused"
 
 # ---- delete lifts the restriction -----------------------------------------------------------
 log "delete the branches"

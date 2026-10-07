@@ -36,6 +36,10 @@ const (
 	// supavisorDefaultPool is Supavisor's own default pool size, sent explicitly because a
 	// user row must carry one.
 	supavisorDefaultPool = 15
+	// supavisorDefaultMaxClients is Supavisor's default_max_clients default. It is sent
+	// explicitly too: a tenant update that omits the field keeps the old value, so a limit that
+	// was saved and then reset would otherwise stay in force.
+	supavisorDefaultMaxClients = 1000
 )
 
 // managerPassword derives the pgbouncer role's password from the project's
@@ -80,6 +84,10 @@ func supavisorBody(spec TenantSpec, managerPW string) map[string]any {
 	if pool <= 0 {
 		pool = supavisorDefaultPool
 	}
+	maxClients := spec.MaxClients
+	if maxClients <= 0 {
+		maxClients = supavisorDefaultMaxClients
+	}
 	host := spec.DBHost
 	if host == "" {
 		host = "127.0.0.1"
@@ -89,14 +97,15 @@ func supavisorBody(spec TenantSpec, managerPW string) map[string]any {
 		db = "postgres"
 	}
 	tenant := map[string]any{
-		"db_host":           host,
-		"db_port":           spec.DBPort,
-		"db_database":       db,
-		"upstream_ssl":      false,
-		"enforce_ssl":       false,
-		"require_user":      false,
-		"auth_query":        supavisorAuthQuery,
-		"default_pool_size": pool,
+		"db_host":             host,
+		"db_port":             spec.DBPort,
+		"db_database":         db,
+		"upstream_ssl":        false,
+		"enforce_ssl":         false,
+		"require_user":        false,
+		"auth_query":          supavisorAuthQuery,
+		"default_pool_size":   pool,
+		"default_max_clients": maxClients,
 		"users": []map[string]any{{
 			"db_user":     supavisorManagerRole,
 			"db_password": managerPW,
@@ -104,9 +113,6 @@ func supavisorBody(spec TenantSpec, managerPW string) map[string]any {
 			"pool_size":   pool,
 			"is_manager":  true,
 		}},
-	}
-	if spec.MaxClients > 0 {
-		tenant["default_max_clients"] = spec.MaxClients
 	}
 	return map[string]any{"tenant": tenant}
 }

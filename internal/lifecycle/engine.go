@@ -227,8 +227,8 @@ func (e *Engine) org(ctx context.Context, slug string) (*registry.Organization, 
 	return o, err
 }
 
-// tenantSpec describes p to the shared services, with its saved Storage and Realtime
-// settings when the Engine has a Settings source.
+// tenantSpec describes p to the shared services, with its saved Storage, Realtime and
+// pooler settings when the Engine has a Settings source.
 func (e *Engine) tenantSpec(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (fleet.TenantSpec, error) {
 	spec := e.baseTenantSpec(p, keys)
 	if e.opts.Settings != nil && p.Ref != config.SystemRef {
@@ -239,6 +239,11 @@ func (e *Engine) tenantSpec(ctx context.Context, p *registry.Project, keys *secr
 		if spec.Realtime, err = e.opts.Settings.RealtimeSettings(ctx, p.Ref); err != nil {
 			return spec, fmt.Errorf("lifecycle: saved realtime settings of %s: %w", p.Ref, err)
 		}
+		pool, err := e.opts.Settings.PoolerSettings(ctx, p.Ref)
+		if err != nil {
+			return spec, fmt.Errorf("lifecycle: saved pooler settings of %s: %w", p.Ref, err)
+		}
+		spec.PoolSize, spec.MaxClients = pool.PoolSize, pool.MaxClients
 	}
 	return spec, nil
 }

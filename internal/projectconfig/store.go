@@ -19,10 +19,11 @@ const (
 	Realtime  Service = "realtime"
 	Storage   Service = "storage"
 	Postgres  Service = "postgres"
+	Pooler    Service = "pooler"
 )
 
 // Services lists every Service.
-var Services = []Service{Auth, PostgREST, Realtime, Storage, Postgres}
+var Services = []Service{Auth, PostgREST, Realtime, Storage, Postgres, Pooler}
 
 var (
 	// ErrNotFound is returned when the project has no row.

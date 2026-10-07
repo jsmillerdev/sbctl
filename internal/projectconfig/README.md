@@ -2,7 +2,7 @@
 
 Per-project service settings: what Studio, the Supabase CLI and the Management API save with
 `PATCH /v1/projects/{ref}/config/auth`, `.../postgrest`, `.../config/storage`, `.../config/realtime`,
-`PUT .../config/database/postgres` and their `/platform` twins. This package stores them,
+`PUT .../config/database/postgres`, `PATCH .../config/database/pooler` and their `/platform` twins. This package stores them,
 validates them against the Management API specs and the services' own rules, and renders them as
 the environment of GoTrue and PostgREST, the server arguments of PostgreSQL and the tenant
 settings of Storage and Realtime. The routes are in `internal/api` (`config_*.go`), applying a
@@ -22,7 +22,7 @@ env, _ := m.AuthEnv(ctx, ref, externalURL)             // GoTrue environment for
 ## What is stored
 
 Migration `0800_project_settings.sql`: one row per project and service (`auth`, `postgrest`,
-`realtime`, `storage`, `postgres`) in `sbctl.project_settings`, deleted with the project. It holds
+`realtime`, `storage`, `postgres`; `pooler` from migration `0801`) in `sbctl.project_settings`, deleted with the project. It holds
 only what was changed: `values` (plain), `sealed` (secrets, base64 of `secrets.Seal`: OAuth client
 secrets, the SMTP password, SMS provider tokens, hook secrets, the captcha secret). A setting with
 no entry has its default, which is what the units render when no row exists, so a project that
@@ -147,6 +147,23 @@ tenant API; Iceberg and vector buckets are saved and reported (the CLI's default
 pushes them) but not sent, because the fleet does not run the services behind them, and
 `capabilities.iceberg_catalog` says so.
 
+### Pooler
+
+`default_pool_size` (1 to 4950, default 15) and `max_client_conn` (1 to 54000, default 1000) are
+the pool size and the client limit of the project's Supavisor tenant: `internal/lifecycle` puts
+them in `fleet.TenantSpec` (`PoolSize`, `MaxClients`) and `EnsureTenant` sends them as
+`default_pool_size` (also as the pool size of the manager user, which is the one Supavisor takes
+the login pools' size from) and `default_max_clients`. The defaults are what the tenant runs with
+nothing saved: Supavisor's own, so a project that never saved anything runs as before. A save is
+applied live (the tenant call ends the tenant's pooled connections; clients reconnect), a save
+while the project is paused when it resumes. A pool size of 0, which the specs allow, would leave
+the tenant without a database connection, so it is refused. Two limits come from outside the settings
+(`CrossContext`, checked in `poolerCross`): the pool size may not exceed the project's `max_connections` minus 10
+(never below the default 15), and `max_client_conn` may not exceed the node's `[fleet] pooler_max_client_conn`
+(default 5000, never below Supavisor's default of 1000). `pool_mode` and the PgBouncer-only
+fields of the platform spec are not settings: the API refuses a value the shared pooler cannot
+honor (`internal/api/config_pooler.go`).
+
 ### Postgres
 
 The settings hosted lets a project change. Sizes and durations need a unit (a bare number means
@@ -154,7 +171,9 @@ a different unit per setting) and are checked against the range Postgres documen
 setting, since an out-of-range value keeps the postmaster from starting at the next restart. The
 whole is checked against the project's memory limit (`shared_buffers` at most 40 percent,
 `work_mem` and `maintenance_work_mem` 25) and against what the project's own services need
-(`max_connections` at least 20, `max_wal_senders` at least 3, `max_replication_slots` at least 2).
+(`max_connections` at least 20, `max_wal_senders` at least 3, `max_replication_slots` at least 2,
+`max_worker_processes` at least 10: pg_cron runs up to 8 jobs in background workers and its launcher and pg_net's
+worker take two more).
 Rendering: settings that overlap the class's command-line sizing (`shared_buffers`,
 `effective_cache_size`, `maintenance_work_mem`, `max_wal_size`, `max_connections`,
 `max_wal_senders`, `max_replication_slots`) become server arguments after the class's and take
@@ -167,7 +186,7 @@ memory) and would leave the project down. What is left is estimated: the lock ta
 (`max_locks_per_transaction` times the backends, about 300 bytes an entry) must stay under 10
 percent of the project's memory limit and the shared memory as a whole (with `shared_buffers`
 and a slot per backend) under 60 percent; with no limit known only a modest table (64 MB, 600
-backends) is accepted. If an apply still fails, the API restores the previous settings and the
+backends) is accepted; a worker count that was not saved is estimated as 16, what the project renders. If an apply still fails, the API restores the previous settings and the
 lifecycle brings the cluster back (`ApplyOptions.Recover`, see internal/lifecycle). `PUT` with `restart_database: true` restarts the
 cluster when something needs it; without it the values are saved, rendered, and flagged
 "pending restart" in the log until the next restart (a pause and resume, for example).

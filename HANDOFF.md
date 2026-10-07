@@ -140,7 +140,7 @@ B + D + E -----------------> K (dashboard writes), L (SSO) -> H
 
 A, B, C, D, F can start simultaneously. E needs D's system cluster. G needs a working binary. H needs G.
 
-**I/J integration (open until both are merged).** Branching (I) does not copy Edge Functions yet: workstream J (v1, in progress on `ws/j-functions`) materializes each project's stored deployments and secrets under `projects/<ref>/functions/`. Once J is on main: branch create copies the parent's stored deployments and secrets into the branch (a branch has its own functions directory, so it is a row copy plus a re-materialize, not a file copy); merge carries the branch's function changes back to the parent; `with_data`/`reset` re-copy them; `secrets` in `CreateBranchBody` (refused with 400 until then) becomes the branch's function secrets. Owner of the change: whoever merges second, in `internal/branching/` (create.go, ops.go) with J's hook in the API layer.
+**I/J integration (decided).** Branching (I) does not copy Edge Functions, function secrets or Storage objects, as on hosted: a branch is a project of its own, its functions come from deploys to its own ref (`supabase functions deploy --project-ref <branch ref>`), its function secrets from `supabase secrets set`, and a `with_data` clone keeps the parent's buckets but drops the `storage.objects` rows, whose files stay with the parent. Merge moves migrations only and names the functions that differ. `secrets` in `CreateBranchBody` is refused with 400. See `internal/branching/README.md`, "What a branch contains".
 
 ## 5. What a fresh session must not re-decide
 

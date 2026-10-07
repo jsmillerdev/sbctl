@@ -74,6 +74,54 @@ var RealtimeSchema = withResetStoresDefault(NewSchema(Realtime, []Field{
 
 func withResetStoresDefault(s *Schema) *Schema { s.ResetStoresDefault = true; return s }
 
+// PoolerSchema is the settings of a project's Supavisor tenant: the fields of the Management
+// API's pooler config (UpdateSupavisorConfigBody, UpdatePgbouncerConfigBody) that the shared
+// pooler can honor. The defaults are what the tenant runs without them: Supavisor's own pool
+// size (15, the default sent when nothing is saved) and its default_max_clients (1000). A pool
+// size of 0, which the specs allow, would leave the pooler with no connection to the database,
+// so the range starts at 1 and null returns the default. The limits are those of the larger
+// platform spec.
+var PoolerSchema = withCross(NewSchema(Pooler, []Field{
+	{Name: "default_pool_size", Kind: Int, Default: int64(poolerDefaultPoolSize), Min: 1, Max: 4950, HasRange: true},
+	{Name: "max_client_conn", Kind: Int, Default: int64(poolerDefaultMaxClients), Min: 1, Max: 54000, HasRange: true},
+}), poolerCross)
+
+func withCross(s *Schema, f func(eff, set Values, cx CrossContext) error) *Schema {
+	s.Cross = f
+	return s
+}
+
+// What a tenant runs with when nothing is saved: Supavisor's own defaults.
+const (
+	poolerDefaultPoolSize   = 15
+	poolerDefaultMaxClients = 1000
+	// poolerReservedConnections is what a pool can never use of the project's max_connections:
+	// superuser_reserved_connections (3) and room for the connections of PostgREST, GoTrue and the
+	// other services of the project, which do not go through the pooler's pool.
+	poolerReservedConnections = 10
+)
+
+// poolerCross bounds the pool by what the project's database can serve and the client limit by
+// what the node allows one tenant, when the caller knows them (CrossContext). The values a
+// tenant runs with when nothing is saved always pass, so a client that saves back what it was
+// shown is not refused on a small class or a low node ceiling.
+func poolerCross(eff, _ Values, cx CrossContext) error {
+	if n, ok := eff.Int("default_pool_size"); ok && cx.MaxConnections > 0 {
+		limit := max(cx.MaxConnections-poolerReservedConnections, poolerDefaultPoolSize)
+		if n > limit {
+			return invalid("default_pool_size %d is more than this project's database can serve: max_connections is %d and %d are kept for superusers and the project's own services, so the pool can be at most %d (raise max_connections first)",
+				n, cx.MaxConnections, poolerReservedConnections, limit)
+		}
+	}
+	if n, ok := eff.Int("max_client_conn"); ok && cx.PoolerMaxClients > 0 {
+		limit := max(cx.PoolerMaxClients, poolerDefaultMaxClients)
+		if n > limit {
+			return invalid("max_client_conn %d is more than this node allows one project: at most %d client connections per project ([fleet] pooler_max_client_conn)", n, limit)
+		}
+	}
+	return nil
+}
+
 // StorageSchema is the settings of a project's Storage tenant (UpdateStorageConfigBody).
 var StorageSchema = buildStorageSchema()
 

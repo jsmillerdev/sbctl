@@ -112,8 +112,52 @@ migration history (the SQL editor, `execute_sql`) are not in a schema-only branc
 > (the filter is on addresses, not ports). Branches are schema-only by default; `with_data` is opt-in and
 > meant for trusted users and agents. See "What a branch with data can and cannot reach".
 >
-> **Followup (workstream K, part 2):** once roles exist, creating a `with_data` branch should require the
-> Owner or Administrator role. Until then anyone who can create a branch can ask for the data.
+> Creating a `with_data` branch through the Management API needs the Owner or Administrator role (also
+> when the role is scoped to the parent project), and so does resetting one (a reset clones the parent's
+> current data again); Developers keep creating and resetting schema-only branches. The API
+> answers 403 with the usual role-denial body. `sbctl branches create` runs on the node as its operator
+> and is not checked.
+
+### What a branch contains
+
+| | Schema-only | With data |
+|---|---|---|
+| Database schema and migration history | the parent's `supabase_migrations` history, replayed, then the seed | everything in the parent's database |
+| Rows | none, except what the migrations and the seed insert | all of them (auth users and identities included; their sessions and one-time tokens are removed) |
+| Storage buckets | those the migrations create | the parent's buckets, with their settings and policies |
+| Storage objects | none | none: the rows of `storage.objects` (and `storage.prefixes`, `storage.s3_multipart_uploads*`) are removed from the clone; the files stay with the parent. Exception: when a table of yours has a foreign key into one of them, the rows stay (see below) |
+| Edge Functions | none | none |
+| Function secrets | none | none |
+| API keys, JWT secret, database password | the branch's own | the branch's own (the parent's are replaced everywhere sbctl finds them) |
+
+Hosted Supabase does not copy Storage objects or Edge Functions into a branch, and neither does sbctl.
+A branch is a project of its own with its own Storage tenant and its own functions, so nothing is shared
+with the parent and nothing is copied half way:
+
+- **Storage.** An object is a file in the project's Storage backend plus a row in `storage.objects`. A
+  clone of the parent's data directory would carry the rows without the files, and every listed object
+  would answer 404. Isolation therefore empties the object metadata tables of a branch with data (counts in
+  the `branch.isolated` event, `storage_rows_deleted`; user triggers do not fire, Storage's `protect_delete`
+  included) and leaves the buckets. Upload what the branch needs to the branch, or script it from the parent.
+  Isolation acts only in a database that has Storage's own tables (`storage.buckets`, `storage.objects` and
+  `storage.migrations`). **Exception:** if a table outside Storage has a foreign key into one of the emptied
+  tables (an `avatar_id uuid references storage.objects(id)` column, say), emptying them would leave rows
+  that point at nothing, and changing your tables is not isolation's job. The wipe is then skipped in that
+  database, as a whole so that the folder tree and the objects stay consistent, and the branch is created
+  anyway: it lists the parent's objects and they answer 404 until you remove or re-upload them. The
+  `branch.isolated` event names the database and the constraints (`storage_wipe_skipped`), and
+  `storage_rows_deleted` is absent. Drop the foreign key (or make it a plain column) in the parent to get the
+  empty object tables.
+- **Edge Functions.** A function exists on a project once someone deploys it: `supabase functions deploy
+  --project-ref <branch ref>`, or the Management API on the branch's ref. Branch create, `reset` and `push`
+  never read the parent's deployments, and `merge` does not carry the branch's functions to the parent (the
+  merge result names the ones that differ). Function secrets are per project as well: set them on the branch
+  with `supabase secrets set --project-ref <branch ref>`. The `secrets` field of the create body is refused
+  with 400 for that reason.
+- **Reset** recreates the branch's database from the parent; it does not touch the branch's functions or
+  function secrets, which belong to the branch. Objects the branch uploaded lose their rows with the
+  database and their files stay in the branch's Storage backend, unreferenced, as the files of any deleted
+  project do (Storage's tenant removal leaves them where the backend keeps them).
 
 The cheapest way available is chosen at runtime and recorded as `clone_method`:
 
@@ -572,24 +616,12 @@ is a full copy; on XFS and APFS it stays flat.
 
 ## Not done, not verified
 
-* **`with_data` is not restricted by role yet.** Until roles exist (workstream K, part 2) anyone who can create a branch can
-  ask for the data; the followup is to require Owner or Administrator for it. The credentials that are not detected are an
-  accepted residual risk (see "What a branch with data can and cannot reach").
+* The credentials that `with_data` does not detect are an accepted residual risk (see "What a branch with data can
+  and cannot reach").
 
-* **Edge Functions are not copied by branching yet.** They are workstream J (v1, in progress on
-  `ws/j-functions`: the `sb-edge-runtime` unit, the tenant-aware main service, and the materializer
-  that writes a project's stored deployments under `projects/<ref>/functions/`). Until J is merged a
-  branch has no functions, and `merge` moves migrations only (hosted also merges functions); when the
-  branch has functions the parent lacks or has in another version (compared by settings and source
-  files through `Deps.Functions`), the merge result says "Edge Functions are NOT merged" and names
-  them, so an agent does not take them as merged. Once J
-  is on main, create copies the parent's stored deployments and secrets into the branch (rows, then
-  re-materialize: a branch has its own functions directory) and merge carries function changes back;
-  `secrets` in the create body is refused until then. This is an open I/J integration item in
-  HANDOFF.md section 4, not a later phase.
-* `with_data` copies the database only: Storage objects (files, with their extended attributes) and
-  function sources are not copied, so `storage.objects` rows of a clone point at files that exist
-  only under the parent's tenant.
+* **Edge Functions and Storage objects are not copied** (see "What a branch contains"); this follows hosted. A
+  branch's functions come from deploys to the branch. There is no command that copies a parent's functions or
+  objects into a branch, and `merge` moves migrations only (functions that differ are named in the result).
 * ZFS without block cloning uses the base-backup path (see With data); no ZFS was available to try
   OpenZFS block cloning through the `reflink` path.
 * Branches are not covered by the nightly base backup timer until something enables

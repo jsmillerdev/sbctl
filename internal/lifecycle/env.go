@@ -78,6 +78,8 @@ func (pl *PostgresPlane) archiveTimeout() int {
 // wal_level stays "logical", the artifact's default and what Realtime's
 // postgres_changes needs; it is a superset of "replica", so archiving and base backups
 // work unchanged.
+//
+// pg_cron runs its jobs in background workers (see cronSettings), not over libpq.
 func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (units.Spec, error) {
 	art, err := pl.arts.Dir(config.SvcPostgres)
 	if err != nil {
@@ -101,7 +103,8 @@ func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, 
 		"max_wal_senders=5",
 		"max_replication_slots=5",
 		"jit=off",
-	}, class.Settings()...)
+	}, cronSettings...)
+	settings = append(settings, class.Settings()...)
 	// The project's saved Postgres settings that a running cluster cannot take over from a
 	// reload (they overlap the class's command-line settings) go last, so they win.
 	if pl.opts.Settings != nil && p.Ref != config.SystemRef {

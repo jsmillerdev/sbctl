@@ -187,6 +187,19 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 	if err := admin.QueryRow(ctx, `select count(*) from auth.refresh_tokens where token = $1`, parentRefresh).Scan(&parentTokens); err != nil || parentTokens != 1 {
 		t.Fatalf("the parent's refresh token is not in its auth.refresh_tokens (%d, %v)", parentTokens, err)
 	}
+	// Storage's object metadata: the buckets stay in a branch, the rows that describe objects do
+	// not (the bytes live in the parent's Storage backend). The tables are Storage's own where its
+	// migrations have run on this cluster and a minimal stand-in otherwise; the trigger plays
+	// Storage's protect_delete and fails any DELETE that does not suppress triggers.
+	must(`create schema if not exists storage`)
+	must(`create table if not exists storage.buckets (id text primary key, name text not null)`)
+	must(`create table if not exists storage.migrations (id int primary key, name text)`) // the marker the wipe looks for
+	must(`create table if not exists storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text references storage.buckets(id), name text)`)
+	must(`create or replace function public.test_protect_delete() returns trigger language plpgsql as $f$ begin raise exception 'Direct deletion from storage tables is not allowed'; end $f$`)
+	must(`drop trigger if exists test_protect_delete on storage.objects`)
+	must(`create trigger test_protect_delete before delete on storage.objects for each statement execute function public.test_protect_delete()`)
+	must(`insert into storage.buckets (id, name) values ('parent-bucket', 'parent-bucket') on conflict do nothing`)
+	must(`insert into storage.objects (bucket_id, name) values ('parent-bucket', 'a.txt'), ('parent-bucket', 'dir/b.txt')`)
 	var parentCronNodes string
 	if cron {
 		if err := admin.QueryRow(ctx, `select string_agg(jobname || '@' || nodename || ':' || coalesce(nodeport::text, '-'), ',' order by jobid) from cron.job`).Scan(&parentCronNodes); err != nil {
@@ -316,6 +329,13 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 				t.Errorf("branch %s: %s cron job(s) still name a node other than the branch (port %d)", b.Name, got, port)
 			}
 		}
+		// The branch has the parent's buckets and none of its objects, with or without the opt-out.
+		if got := str(`select count(*)::text from storage.objects`); got != "0" {
+			t.Errorf("branch %s: %s storage.objects row(s) of the parent remain", b.Name, got)
+		}
+		if got := str(`select count(*)::text from storage.buckets where id = 'parent-bucket'`); got != "1" {
+			t.Errorf("branch %s: the parent's bucket is gone (%s)", b.Name, got)
+		}
 		// The databases that refuse connections or are templates were worked through, and are as they were.
 		if got := str(`select datallowconn::text || ',' || datistemplate::text from pg_database where datname = 'hidden_db'`); got != "false,false" {
 			t.Errorf("branch %s: hidden_db flags = %s, want false,false", b.Name, got)
@@ -379,6 +399,9 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 			if res.AuthRowsDeleted["refresh_tokens"] < 1 || res.AuthRowsDeleted["sessions"] < 1 || res.AuthRowsDeleted["one_time_tokens"] != 1 ||
 				res.AuthRowsDeleted["flow_state"] != 1 || res.AuthRowsCleared["users"] != 1 {
 				t.Errorf("branch %s: isolation event auth counts: %s", b.Name, e.Payload)
+			}
+			if res.StorageRowsDeleted["objects"] != 2 {
+				t.Errorf("branch %s: isolation event storage counts: %s", b.Name, e.Payload)
 			}
 			if len(res.AuthTablesNotReviewed) != 0 {
 				t.Errorf("branch %s: auth tables that isolate_auth.go does not know: %v (a new GoTrue release: classify them)", b.Name, res.AuthTablesNotReviewed)
@@ -496,5 +519,32 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 		if err := admin.QueryRow(ctx, `select command from cron.job where jobname = 'dblink-job'`).Scan(&cmd); err != nil || !strings.Contains(cmd, otherKeys.DBPassword) {
 			t.Errorf("the parent's cron command changed: %q %v", cmd, err)
 		}
+	}
+
+	// A table of the user's with a foreign key into storage.objects: the wipe would leave rows that
+	// point at nothing, so it is skipped (with the reason recorded) and the branch is still created.
+	must(`create table public.user_avatars (id int primary key, object_id uuid references storage.objects(id))`)
+	must(`insert into public.user_avatars select 1, id from storage.objects order by name limit 1`)
+	fk := st.createBranch(pref, "storage-fk", func(in *CreateInput) { in.WithData = true })
+	fkConn := st.conn(fk.Ref, lifecycle.RoleAdmin)
+	var objects, avatars int
+	if err := fkConn.QueryRow(ctx, `select (select count(*) from storage.objects), (select count(*) from public.user_avatars)`).Scan(&objects, &avatars); err != nil || objects != 2 || avatars != 1 {
+		t.Errorf("branch %s: storage.objects has %d rows and user_avatars %d (%v), want the parent's 2 and 1 (the wipe is skipped)", fk.Name, objects, avatars, err)
+	}
+	var skipped bool
+	fkEvs, _ := st.node.Registry.ListEvents(ctx, fk.Ref, 50)
+	for _, e := range fkEvs {
+		if e.Kind != "branch.isolated" {
+			continue
+		}
+		var res IsolateResult
+		if err := json.Unmarshal(e.Payload, &res); err != nil {
+			t.Fatal(err)
+		}
+		skipped = len(res.StorageWipeSkipped) == 1 && strings.Contains(res.StorageWipeSkipped[0], "user_avatars_object_id_fkey") &&
+			strings.Contains(res.StorageWipeSkipped[0], "public.user_avatars -> storage.objects") && len(res.StorageRowsDeleted) == 0
+	}
+	if !skipped {
+		t.Errorf("branch %s: the isolation event does not say that the Storage wipe was skipped: %v", fk.Name, fkEvs)
 	}
 }

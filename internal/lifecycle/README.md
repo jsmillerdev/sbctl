@@ -45,6 +45,21 @@ which on a shared host means every local user. Ours trusts `supabase_admin` on t
 socket only (the directory is private to the `sbctl` user) and requires scram-sha-256 on
 TCP. The socket is how sbctl reaches its own registry before it can decrypt any secret.
 
+`pg_cron` runs its jobs in background workers of the cluster (`cron.use_background_workers=on`,
+`cron.database_name=postgres`, `cron.max_running_jobs=8`, `max_worker_processes=16`; see
+`cronSettings`). Hosted Supabase leaves pg_cron on its default, a libpq connection to localhost
+that its pg_hba.conf trusts; ours does not trust a loopback connection, so a libpq job would fail
+with "connection failed". Workers need no connection, no pg_hba rule and no network, which also
+keeps them working behind a branch's egress filter and independent of the `nodename` and `nodeport`
+stored in `cron.job`. A saved `max_worker_processes` overrides the 16 (it is a command-line setting
+like the class's sizing, applied at the next restart); the Postgres settings save refuses a value below
+10, which is `cron.max_running_jobs` plus two (pg_cron's launcher and pg_net's worker each hold a slot).
+A value of 4 to 9 that was saved before that rule stays in force, and the project then runs fewer
+concurrent jobs: a job that cannot get a worker fails to start. A project that already runs picks the
+settings up the next time the daemon starts (`StartActive` renders the unit again and restarts a
+running cluster whose rendered settings changed), or on resume (a Postgres settings save also renders it and reports a
+pending restart); no migration is needed.
+
 ## Other operations
 
 - `Pause`: the shared services are asked to let go of the project's database (`fleet.Quiescer`), then PostgREST, GoTrue, PostgreSQL stop in that order; `INACTIVE`; route and tenants

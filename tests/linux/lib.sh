@@ -315,3 +315,27 @@ for _ in range(20):
 sys.exit("no reply to phx_join")
 PY
 }
+
+# cron_runs SQLFN REF JOB [STATUS]: how many runs of the pg_cron job JOB cron.job_run_details
+# lists for project REF (with STATUS, when given). SQLFN is the script's "run SQL on REF" function
+# (REF SQL; prints tuples only).
+cron_runs() {
+  local run=$1 ref=$2 job=$3 status=${4:-}
+  "$run" "$ref" "select count(*) from cron.job_run_details d join cron.job j using (jobid) where j.jobname = '$job' ${status:+and d.status = '$status'}"
+}
+
+# wait_cron_success SQLFN REF JOB SECONDS [AFTER]: waits until cron.job_run_details shows more than
+# AFTER (default 0) succeeded runs of JOB; a clone of a project carries its parent's run history,
+# so a branch passes the count it started with. pg_cron on a cluster whose jobs cannot connect (libpq, a pg_hba.conf that trusts no
+# loopback connection) records every run as failed with "connection failed"; the last rows are
+# printed when the wait times out.
+wait_cron_success() {
+  local run=$1 ref=$2 job=$3 n=${4:-120} after=${5:-0} i c
+  for ((i = 0; i < n; i += 2)); do
+    c=$(cron_runs "$run" "$ref" "$job" succeeded 2>/dev/null) || c=0
+    [[ $c =~ ^[0-9]+$ && $c -gt $after ]] && return 0
+    sleep 2
+  done
+  "$run" "$ref" "select d.status, d.return_message from cron.job_run_details d join cron.job j using (jobid) where j.jobname = '$job' order by d.runid desc limit 3" >&2 || true
+  return 1
+}

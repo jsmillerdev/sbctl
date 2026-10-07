@@ -68,6 +68,8 @@ func schemaOf(svc Service) (*Schema, error) {
 		return StorageSchema, nil
 	case Postgres:
 		return PostgresSchema, nil
+	case Pooler:
+		return PoolerSchema, nil
 	}
 	return nil, fmt.Errorf("projectconfig: unknown service %q", svc)
 }

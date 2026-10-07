@@ -78,6 +78,10 @@ func TestPostgresSpec(t *testing.T) {
 		"-c archive_command='/usr/local/bin/sbctl' wal push --ref abcdefghijklmnopqrst %p",
 		"-c shared_buffers=32MB",
 		"-c max_connections=60",
+		"-c cron.use_background_workers=on",
+		"-c cron.database_name=postgres",
+		"-c cron.max_running_jobs=8",
+		"-c max_worker_processes=16",
 	} {
 		if !strings.Contains(args, want) {
 			t.Errorf("args lack %q:\n%s", want, args)
@@ -495,6 +499,49 @@ func TestPostgresSpecDenyEgress(t *testing.T) {
 	for _, s := range specs {
 		if s.DenyEgress {
 			t.Errorf("%s has DenyEgress", s.Unit())
+		}
+	}
+}
+
+// pg_cron connects over libpq unless it runs its jobs in background workers, and the
+// cluster's pg_hba.conf does not trust a loopback connection: without these settings every
+// job fails with "connection failed". The system cluster hosts no jobs of users but is
+// rendered the same way, and a saved max_worker_processes still wins.
+func TestPostgresSpecRunsCronInBackgroundWorkers(t *testing.T) {
+	pl, cfg := testPlane(t)
+	cfg.Backup.WALRelay = "off"
+	for _, ref := range []string{"abcdefghijklmnopqrst", config.SystemRef} {
+		p := testProject(cfg, ref, 2)
+		spec, err := pl.postgresSpec(context.Background(), p, testKeys(t, ref))
+		if err != nil {
+			t.Fatal(err)
+		}
+		args := strings.Join(spec.Exec, " ")
+		for _, want := range []string{"-c cron.use_background_workers=on", "-c cron.max_running_jobs=8", "-c max_worker_processes=16"} {
+			if !strings.Contains(args, want) {
+				t.Errorf("%s: args lack %q:\n%s", ref, want, args)
+			}
+		}
+	}
+
+	pl.opts.Settings = &fakeSettings{pg: []string{"max_worker_processes=24", "work_mem=8MB"}}
+	p := testProject(cfg, "abcdefghijklmnopqrst", 2)
+	spec, err := pl.postgresSpec(context.Background(), p, testKeys(t, p.Ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(spec.Exec, " ")
+	if i, j := strings.LastIndex(args, "max_worker_processes=16"), strings.LastIndex(args, "max_worker_processes=24"); i < 0 || j < i {
+		t.Errorf("a saved max_worker_processes must come after the default:\n%s", args)
+	}
+	if strings.Contains(args, "-c work_mem") {
+		t.Errorf("work_mem goes through ALTER SYSTEM, not the command line:\n%s", args)
+	}
+	// The hba file must keep refusing a passwordless loopback connection: background workers
+	// are the fix, not trust on 127.0.0.1.
+	for _, l := range strings.Split(hbaRules, "\n") {
+		if f := strings.Fields(l); len(f) >= 5 && f[0] == "host" && f[4] == "trust" {
+			t.Errorf("pg_hba.conf trusts a TCP connection: %q", l)
 		}
 	}
 }

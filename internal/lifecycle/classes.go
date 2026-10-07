@@ -67,3 +67,23 @@ func (c Class) Settings() []string {
 		"max_connections=" + strconv.Itoa(c.MaxConnections),
 	}
 }
+
+// cronSettings make pg_cron run its jobs in background workers of the cluster itself.
+// Hosted Supabase leaves pg_cron on its default, a libpq connection to localhost that its
+// pg_hba.conf trusts. Our pg_hba.conf trusts only the private unix socket as supabase_admin
+// (see hbaRules), so a libpq job would fail with "connection failed" for every role. Workers
+// need no connection, no pg_hba rule and no network, so the jobs also run behind the
+// systemd egress filter of a branch, and cron.job's nodename and nodeport play no part in
+// where a job runs.
+//
+// max_worker_processes counts the workers: pg_cron's launcher and pg_net's worker take two,
+// a running job takes one, and parallel queries take what is left. Hosted Supabase documents
+// at most eight concurrent jobs, which is cron.max_running_jobs here; 16 workers leave room
+// for them next to parallel queries and logical replication workers. A saved
+// max_worker_processes goes after these (it is one of cmdlineSettings).
+var cronSettings = []string{
+	"cron.use_background_workers=on",
+	"cron.database_name=postgres",
+	"cron.max_running_jobs=8",
+	"max_worker_processes=16",
+}

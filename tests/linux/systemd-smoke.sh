@@ -2,7 +2,7 @@
 # systemd backend smoke test: system init, two projects, health, containment from inside the
 # unit namespaces, WAL archiving through the daemon's relay (fail-closed with the daemon down), the
 # instance metadata service denied to every unit, a project created through the Management API,
-# a restore through the relay, pause/resume, key rotation, crash recovery and delete, all under
+# a restore through the relay, a pg_cron job that runs (and runs again after a pause and resume), pause/resume, key rotation, crash recovery and delete, all under
 # real systemd units as the sbctl user.
 #
 #   sudo SBCTL_BIN=/path/to/sbctl-linux-amd64 tests/linux/systemd-smoke.sh [--teardown]
@@ -158,6 +158,14 @@ wait_archived() { # REF SEGMENT SECONDS: the segment is in the file backend
   done
   return 1
 }
+
+log "pg_cron: a job scheduled on $A runs (background workers, no libpq connection)"
+pg_admin "$A" "create extension if not exists pg_cron; create table public.cron_smoke (at timestamptz default now());
+  select cron.schedule('smoke-job', '5 seconds', 'insert into public.cron_smoke default values');" >/dev/null || fail "$A: could not schedule a pg_cron job"
+wait_cron_success pg_admin "$A" smoke-job 90 || fail "$A: cron.job_run_details shows no succeeded run of the job (pg_cron cannot connect?)"
+[[ $(pg_admin "$A" "select count(*) from public.cron_smoke") -ge 1 ]] || fail "$A: the cron job reported success but its insert is not in the table"
+[[ $(pg_admin "$A" "select current_setting('cron.use_background_workers')") == on ]] || fail "$A: cron.use_background_workers is not on"
+[[ $(cron_runs pg_admin "$A" smoke-job failed) -eq 0 ]] || fail "$A: a cron run failed: $(pg_admin "$A" "select return_message from cron.job_run_details where status = 'failed' limit 1")"
 
 log "WAL archiving: a switched segment of $A reaches the backend through the daemon's relay, not through the cluster's unit"
 for ref in system "$A" "$B"; do
@@ -332,6 +340,7 @@ done
 sbctl projects health "$A" || fail "$A unhealthy after the daemon restarted"
 
 log "pause and resume $A"
+CRON_BEFORE=$(cron_runs pg_admin "$A" smoke-job succeeded)
 sbctl projects pause "$A"
 for svc in postgres gotrue postgrest; do
   [[ $(unit_state "sb-$svc@$A.service") == inactive ]] || fail "sb-$svc@$A is $(unit_state "sb-$svc@$A.service") after pause"
@@ -342,6 +351,12 @@ done
 sbctl projects resume "$A"
 check_project "$A"
 [[ $(unit_state "sb-basebackup@$A.timer") == active ]] || fail "$A resumed but its nightly backup timer was not started"
+for ((i = 0; i < 45; i++)); do
+  [[ $(cron_runs pg_admin "$A" smoke-job succeeded) -gt $CRON_BEFORE ]] && break
+  sleep 2
+done
+[[ $(cron_runs pg_admin "$A" smoke-job succeeded) -gt $CRON_BEFORE ]] || fail "$A: the cron job did not run again after the pause and resume"
+pg_admin "$A" "select cron.unschedule('smoke-job')" >/dev/null || fail "$A: could not unschedule the cron job"
 
 log "rotate keys of $A"
 OLD=$(project_field "$A" 'd["keys"]["anon_key"]' --show-keys)
@@ -364,6 +379,11 @@ PID=$(systemctl show -p MainPID --value "sb-postgrest@$B.service")
 kill -9 "$PID"
 for ((i = 0; i < 30; i++)); do
   [[ $(unit_state "sb-postgrest@$B.service") == active && $(systemctl show -p MainPID --value "sb-postgrest@$B.service") != "$PID" ]] && break
+  sleep 1
+done
+# The unit is active with a new process before PostgREST answers (it loads its schema cache first).
+for ((i = 0; i < 30; i++)); do
+  sbctl projects health "$B" && break
   sleep 1
 done
 sbctl projects health "$B" || fail "$B did not recover from a PostgREST crash"

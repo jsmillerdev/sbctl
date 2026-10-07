@@ -7,6 +7,10 @@ const (
 	// DefaultStorageFileSizeLimit is Storage's per-object upload limit, in bytes (50 MiB,
 	// the upstream compose default).
 	DefaultStorageFileSizeLimit int64 = 52428800
+	// DefaultPoolerMaxClientConn is the most client connections one project's pooler tenant may
+	// be configured to hold (max_client_conn): the shared Supavisor serves every project, and its
+	// file descriptors and memory are theirs together.
+	DefaultPoolerMaxClientConn = 5000
 )
 
 // Fleet is the [fleet] config section: settings of the shared services (Supavisor,
@@ -38,6 +42,10 @@ type Fleet struct {
 	// StorageFileSizeLimit is the per-object upload limit in bytes; zero means
 	// DefaultStorageFileSizeLimit.
 	StorageFileSizeLimit int64 `toml:"storage_file_size_limit"`
+	// PoolerMaxClientConn is the ceiling a project may set for max_client_conn on its Supavisor
+	// tenant (the Management API refuses more with 400); zero means DefaultPoolerMaxClientConn.
+	// A ceiling below Supavisor's own default (1000) does not lower that default.
+	PoolerMaxClientConn int `toml:"pooler_max_client_conn"`
 }
 
 // SupavisorAPI returns the Supavisor API port with the default applied.
@@ -54,4 +62,12 @@ func (f Fleet) FileSizeLimit() int64 {
 		return f.StorageFileSizeLimit
 	}
 	return DefaultStorageFileSizeLimit
+}
+
+// PoolerMaxClients returns the per-project client connection ceiling with the default applied.
+func (f Fleet) PoolerMaxClients() int {
+	if f.PoolerMaxClientConn > 0 {
+		return f.PoolerMaxClientConn
+	}
+	return DefaultPoolerMaxClientConn
 }

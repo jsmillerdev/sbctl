@@ -11,7 +11,7 @@
 # - GET /platform/profile/permissions answers what each role may do in Studio's own terms;
 # - with a PAT, Read-only reads (SELECT, list, types) and is refused every write (secrets,
 #   migrations, settings, keys, lifecycle; SQL fails in the database), a Developer writes SQL and
-#   migrations but not settings or secrets, an Administrator manages settings and members but not
+#   migrations but not settings or secrets (nor a branch with data), an Administrator manages settings and members but not
 #   Owners, the last Owner cannot be demoted or removed;
 # - the MCP server (apply_migration, execute_sql) and, when SUPABASE_CLI is set, the Supabase CLI
 #   (secrets set) list as Read-only and are refused writes; an Owner's can;
@@ -289,6 +289,11 @@ expect 403 "${PAT[dev]}" PATCH "$CFG/config/auth" '{"site_url":"https://dev.exam
 expect 403 "${PAT[dev]}" POST "$CFG/api-keys" '{"type":"publishable","name":"dev_key"}'
 expect 403 "${PAT[dev]}" POST "$CFG/pause"
 expect 403 "${PAT[dev]}" PATCH "$CFG/database/password" '{"password":"a-new-database-password"}'
+# A branch with data copies production data: Owner and Administrator only (a schema-only branch is the Developer's).
+expect 403 "${PAT[dev]}" POST "$CFG/branches" '{"branch_name":"dev-data","with_data":true}'
+expect 403 "${PAT[ro]}" POST "$CFG/branches" '{"branch_name":"ro-data","with_data":true}'
+# The list has the default branch (the project itself); nothing else may have been made.
+[[ $(body "${PAT[owner]}" GET "$CFG/branches" | json_get 'len([b for b in d if not b.get("is_default")])') == 0 ]] || fail "a refused branch with data was created"
 expect 403 "${PAT[dev]}" POST "/v1/projects" "{\"name\":\"nope\",\"organization_slug\":\"$ORG\",\"db_pass\":\"correct-horse-battery\"}"
 
 log "Administrator: settings and members, never Owners"

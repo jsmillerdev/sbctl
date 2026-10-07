@@ -577,3 +577,21 @@ func (s *Server) canReadSecrets(r *http.Request, p *registry.Project) (bool, err
 	}
 	return s.projectCan(r, p, members.ActRead, members.ResJWTSecret)
 }
+
+// requireBranchData is the second requirement of POST /v1/projects/{ref}/branches and of
+// POST /v1/branches/{id}/reset on a branch with data: such a branch copies the parent's data
+// (every user, every row), which a Developer, who may create schema-only branches and reset
+// them (the routes' own rules), may not read in bulk outside the SQL editor. It needs the
+// permission to update the project's settings, which is what makes an Owner or Administrator
+// (also when the role is scoped to this project). The route table cannot see the body or the
+// branch, so createBranch and branchAction call this once they know a copy of data is asked for.
+func (s *Server) requireBranchData(r *http.Request, p *registry.Project) error {
+	ok, err := s.projectCan(r, p, members.ActUpdate, P)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errf(http.StatusForbidden, "Your role does not allow this action (creating or resetting a branch with data needs the Owner or Administrator role)")
+	}
+	return nil
+}
