@@ -1,0 +1,11 @@
+# BuildKit reads this file for studio/Dockerfile.build (a <Dockerfile>.dockerignore beside the
+# Dockerfile beats a root .dockerignore). The image needs only versions.yaml, LICENSE and studio/;
+# local build state (a fetched or pruned tree, the pnpm store, earlier output) must not enter the
+# context, or build.sh would reuse it.
+*
+!versions.yaml
+!LICENSE
+!studio
+studio/.build-cache
+studio/dist
+**/node_modules

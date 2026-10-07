@@ -192,6 +192,26 @@ func TestRealHandlersCarryTheDocumentedRequiredFields(t *testing.T) {
 	}
 }
 
+// Studio's ServiceStatus only treats ACTIVE_HEALTHY as healthy (the V1ServiceHealthResponse enum is
+// COMING_UP | ACTIVE_HEALTHY | UNHEALTHY); anything else makes it re-poll every 5 s.
+func TestProjectHealthReportsActiveHealthy(t *testing.T) {
+	_, ts, tok := newTestServer(t, "")
+	code, body, _ := do(t, "GET", ts.URL+"/v1/projects/"+refA+"/health", tok, "")
+	var out []struct {
+		Name    string `json:"name"`
+		Healthy bool   `json:"healthy"`
+		Status  string `json:"status"`
+	}
+	if code != 200 || json.Unmarshal(body, &out) != nil || len(out) == 0 {
+		t.Fatalf("health: %d %s", code, body)
+	}
+	for _, e := range out {
+		if !e.Healthy || e.Status != "ACTIVE_HEALTHY" {
+			t.Errorf("service %s: healthy=%v status=%q", e.Name, e.Healthy, e.Status)
+		}
+	}
+}
+
 func TestProjectsListsAndPagination(t *testing.T) {
 	_, ts, tok := newTestServer(t, "")
 	_, body, _ := do(t, "GET", ts.URL+"/platform/organizations/mock-org/projects?limit=1&offset=1&sort=name_asc", tok, "")

@@ -104,7 +104,9 @@ export function resolveValues(spec, env) {
 
   for (const v of spec.values) {
     const given = env[v.env]
-    const isSet = given !== undefined && given !== ''
+    // A required value must be non-empty. An optional one that is set, even to the empty string,
+    // wins over the default, so NEXT_PUBLIC_DISABLED_FEATURES= re-enables every feature.
+    const isSet = v.required ? given !== undefined && given !== '' : given !== undefined
     if (!isSet && v.required) {
       errors.push(`${v.env} is required (${v.doc ?? 'no description'})`)
       continue

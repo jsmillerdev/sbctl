@@ -32,6 +32,9 @@
 #   --keep                 leave the stack running when the browser steps are done (stop with Ctrl-C)
 #   --stack-only           start the stack, print the URLs and wait; no browser (for debugging)
 set -euo pipefail
+# Everything this script writes (mock.json with the JWT secret and database passwords, run.env, logs,
+# the data directory) is private to the running user.
+umask 077
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -131,7 +134,8 @@ rm -rf "$STUDIO_DIR"; mkdir -p "$STUDIO_DIR"
 zstd -dc "$STUDIO_ARCHIVE" | tar -C "$STUDIO_DIR" -xf -
 echo "spike: Studio $(basename "$STUDIO_ARCHIVE") sha256 $(sha256_of "$STUDIO_ARCHIVE")" | tee "$OUT/studio-artifact.txt" >&2
 
-# ---- secrets (fresh per run, never written outside $OUT/run.env which is chmod 600) --------------
+# ---- secrets (fresh per run; only in the environment of the started processes, in $OUT/run.env and in
+# $OUT/mock.json, both mode 600; SQL passwords go through psql's stdin, not argv) ------------------
 PGPW="$(rand 24)"; JWT_SECRET="$(rand 48)"; META_KEY="$(rand 32)"; USER_EMAIL="admin@example.test"; USER_PW="$(rand 20)"
 REF_A=mockprojectalphaaaaa; REF_B=mockprojectbetabbbbb   # 20 lowercase letters, like real refs
 
@@ -147,7 +151,12 @@ for i in $(seq 1 120); do "$PGDIR/bin/pg_isready" -q -h "$HOST" -p "$PG_PORT" &&
 "$PGDIR/bin/pg_isready" -q -h "$HOST" -p "$PG_PORT" || die "postgres did not start (see $OUT/logs/postgres.log)"
 psql_admin() { "$PGDIR/bin/psql" -h "$HOST" -p "$PG_PORT" -U supabase_admin -v ON_ERROR_STOP=1 -Atq "$@"; }
 psql_proj() { PGPASSWORD="$PGPW" "$PGDIR/bin/psql" -h "$HOST" -p "$PG_PORT" -U postgres -v ON_ERROR_STOP=1 -Atq "$@"; }
-psql_admin -d postgres -c "alter role postgres with login password '$PGPW'" -c "alter role supabase_auth_admin with password '$PGPW'"
+# The password reaches psql on stdin (\set, then :'pw'), so it is not in any process's argv.
+psql_admin -d postgres <<SQL
+\set pw '$PGPW'
+alter role postgres with login password :'pw';
+alter role supabase_auth_admin with password :'pw';
+SQL
 # Two projects = two databases cloned from the template the image ships (all Supabase schemas),
 # made before GoTrue connects to `postgres` so the clone is possible.
 for pair in "proj_a:alpha" "proj_b:beta"; do
@@ -177,6 +186,7 @@ for db in proj_a proj_b; do
   GOTRUE_DB_DATABASE_URL="postgres://supabase_auth_admin:$PGPW@$HOST:$PG_PORT/$db" "$AUTHDIR/bin/auth" migrate \
     > "$OUT/logs/gotrue-migrate-$db.log" 2>&1 || die "gotrue migrate on $db failed"
 done
+# GoTrue's CLI takes the password only as an argument; the VM is single-tenant and throwaway.
 "$AUTHDIR/bin/auth" admin createuser "$USER_EMAIL" "$USER_PW" > "$OUT/logs/gotrue-createuser.log" 2>&1 || die "createuser failed"
 # `admin createuser` leaves auth.users.role empty, so the access token would carry "role": "".
 # Hosted dashboard users have role authenticated.

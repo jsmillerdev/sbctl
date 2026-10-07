@@ -9,8 +9,9 @@
 //    page awaits that query while it resets the query cache, so the redirect after sign-in took
 //    21 s in the spike (research/08 section 9). The fixup rewrites the route to a static
 //    `{"incidents": []}`, which is what the banner code expects when there is no incident.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 export const INCIDENT_SOURCE = '/api/incident-banner'
 export const INCIDENT_DESTINATION = '/sbctl/incident-banner.json'
@@ -39,7 +40,11 @@ export function applyFixups(appRoot) {
   writeFileSync(join(dir, 'incident-banner.json'), '{"incidents":[]}\n')
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Node resolves the main module through symlinks and percent-encodes it in import.meta.url, so
+// compare against the real path as a file URL (a plain string compare fails for paths with
+// spaces or a symlinked checkout, and the fixup would then silently do nothing).
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+if (isMain) {
   try {
     applyFixups(process.argv[2])
     console.log('package fixups applied')

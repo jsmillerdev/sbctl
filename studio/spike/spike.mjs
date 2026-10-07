@@ -30,6 +30,7 @@ const consoleErrors = []
 const failedRequests = []
 const pageErrors = []
 const badResponses = []
+const healthRequests = []   // [step, path] of every project health poll, to detect a stuck 5 s refetch
 
 const browser = await chromium.launch({
   headless: true,
@@ -44,6 +45,10 @@ page.on('console', (m) => {
 page.on('pageerror', (e) => pageErrors.push({ step: current, text: String(e).slice(0, 300) }))
 page.on('requestfailed', (r) => {
   failedRequests.push({ step: current, url: r.url().slice(0, 200), reason: r.failure()?.errorText })
+})
+page.on('request', (r) => {
+  const u = new URL(r.url())
+  if (/^\/v1\/projects\/[^/]+\/health$/.test(u.pathname)) healthRequests.push({ step: current, path: u.pathname })
 })
 page.on('response', (r) => {
   if (r.status() >= 400) {
@@ -144,6 +149,12 @@ for (const [i, ref] of REFS.entries()) {
     await goto(`/project/${ref}`)
     await page.getByText(i === 0 ? 'Alpha' : 'Beta', { exact: true }).first().waitFor()
     await page.getByText('Healthy', { exact: true }).first().waitFor()
+    // Studio re-polls /health every 5 s until every service reports ACTIVE_HEALTHY. Wait longer than
+    // one interval; a handler that returns another status makes the count grow.
+    const before = healthRequests.filter((h) => h.path.includes(`/${ref}/`)).length
+    await page.waitForTimeout(7000)
+    const polls = healthRequests.filter((h) => h.path.includes(`/${ref}/`)).length - before
+    if (polls > 0) throw new Error(`/v1/projects/${ref}/health was polled ${polls} more time(s): a service is not ACTIVE_HEALTHY`)
   })
 
   await step(`auth-users-${ref}`, async () => {

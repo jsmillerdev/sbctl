@@ -17,7 +17,8 @@
 #   STUDIO_WORK           scratch directory (default studio/.build-cache/work-<platform>)
 #   STUDIO_CACHE          download cache for node (default studio/.build-cache/dl)
 #   STUDIO_OUT            output directory (default studio/dist)
-#   STUDIO_BUILD_HEAP_MB  V8 heap cap for the Next build processes (default 6144)
+#   STUDIO_BUILD_HEAP_MB  V8 heap cap per Next build process (default 4096)
+#   STUDIO_BUILD_WORKERS  Next static-generation workers (default 1; Next's own default is CPU count - 1)
 #   STUDIO_PREBUILT       an existing apps/studio directory that already holds .next/standalone, .next/static
 #                         and public/: skip fetch, install and build, only package (used by tests)
 #   STUDIO_PREBUILT_PLACEHOLDERS  placeholders.json that matches STUDIO_PREBUILT (default placeholders.json)
@@ -95,7 +96,9 @@ ARTIFACT="sbctl-studio-${TAG}-p${PATCHSET}-${PLATFORM}.tar.zst"
 WORK="${STUDIO_WORK:-$HERE/.build-cache/work-$PLATFORM}"
 CACHE="${STUDIO_CACHE:-$HERE/.build-cache/dl}"
 OUT="${STUDIO_OUT:-$HERE/dist}"
-HEAP_MB="${STUDIO_BUILD_HEAP_MB:-6144}"
+HEAP_MB="${STUDIO_BUILD_HEAP_MB:-4096}"
+WORKERS="${STUDIO_BUILD_WORKERS:-1}"
+[[ "$WORKERS" =~ ^[1-9][0-9]*$ ]] || die "STUDIO_BUILD_WORKERS must be a positive integer, got '$WORKERS'"
 mkdir -p "$WORK" "$CACHE" "$OUT"
 touch "$WORK/.sbctl-studio-work"   # cleanup below only removes a directory carrying this marker
 
@@ -212,17 +215,22 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
   # which auto-grant telemetry consent (research/05 section 4.5).
   export NEXT_PUBLIC_ENVIRONMENT=prod
   export STUDIO_FRAMEWORK=next
-  # Heap cap for the node processes (the next build driver and its prerender workers). Turbopack's
+  # Heap cap for each node process (the next build driver and its prerender workers). Turbopack's
   # own memory is native and not covered by it; peak RSS of the whole build is about 8 GB, which
   # is why ci-prepare.sh adds swap. The cap is a ceiling, not a reservation.
   export NODE_OPTIONS="--max-old-space-size=$HEAP_MB"
+  # Worker count. Next computes experimental.cpus as max(1, (CIRCLE_NODE_TOTAL || os.cpus().length) - 1)
+  # (next@16.3.6 dist/server/config-shared.js), so on a bigger host it would start N-1 workers that
+  # each may grow to the heap cap above. Studio's next.config does not set cpus. CIRCLE_NODE_TOTAL
+  # is Next's own override for this, so WORKERS + 1 yields exactly WORKERS workers on any host.
+  export CIRCLE_NODE_TOTAL=$((WORKERS + 1))
   time_cmd=()
   if [[ -x /usr/bin/time ]] && /usr/bin/time -v true >/dev/null 2>&1; then time_cmd=(/usr/bin/time -v -o "$WORK/next-build.time"); fi
   (cd "$APP" && ${time_cmd[@]+"${time_cmd[@]}"} pnpm --filter studio exec next build)
   if [[ -f "$WORK/next-build.time" ]]; then
     awk -F': ' '/Maximum resident set size|Elapsed \(wall clock\)/ {print "next build: " $0}' "$WORK/next-build.time" >&2
   fi
-  unset NODE_OPTIONS
+  unset NODE_OPTIONS CIRCLE_NODE_TOTAL
 
   PREBUILT="$APP/apps/studio"
   PLACEHOLDERS="$HERE/placeholders.json"

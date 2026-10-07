@@ -149,6 +149,18 @@ test('empty optional values: no captcha, default feature list, no extra CSP host
   }
 })
 
+test('an optional value set to the empty string wins over its default', () => {
+  const { root, app } = packaged()
+  try {
+    applyRuntimeConfig(root, { ...goodEnv, NEXT_PUBLIC_DISABLED_FEATURES: '' })
+    const js = readFileSync(join(app, 'apps/studio/.next/static/chunks/a.js'), 'utf8')
+    assert.match(js, /D="".split/)
+    assert.ok(!js.includes('dashboard_auth:sign_up'))
+  } finally {
+    rmSync(root, { recursive: true })
+  }
+})
+
 test('apply is idempotent and picks up new values on the next start', () => {
   const { root, app } = packaged()
   try {

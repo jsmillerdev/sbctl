@@ -79,7 +79,7 @@ func (s *server) registerReal() {
 	s.handle("GET", "/v1/projects/{ref}/health", s.withProject(func(w *respWriter, r *http.Request, c *reqCtx, p *Project, n int) {
 		var out []map[string]any
 		for _, name := range []string{"auth", "db", "pooler", "realtime", "rest", "storage"} {
-			out = append(out, map[string]any{"name": name, "healthy": true, "status": "HEALTHY"})
+			out = append(out, map[string]any{"name": name, "healthy": true, "status": "ACTIVE_HEALTHY"})
 		}
 		w.json(200, out)
 	}))
