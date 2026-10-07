@@ -171,6 +171,12 @@ the `backups` directory or the certificates. `internal/units` (`TestTemplatesCon
 shape, and `tests/linux/systemd-smoke.sh` and `fleet-smoke.sh` check it from inside the namespaces of
 a real node.
 
+The Postgres template also hides three unix sockets, which are the ways out of the IP filter of a
+branch with denied egress (`IPAddressDeny` does not cover unix sockets): systemd-resolved's
+`/run/systemd/resolve/io.systemd.Resolve` and nscd's socket (in addition to the D-Bus system bus,
+which every template hides). systemd 255 cannot change `InaccessiblePaths` of a running unit over
+D-Bus, so the template hides them for every Postgres unit, which does not need them.
+
 The WAL relay directory `projects/<ref>/wal/` is created by the lifecycle engine before the cluster
 starts (`PostgresPlane.prepare`), and the daemon's `backup.Relay` serves one socket in it per
 project, picking up new projects within three seconds or at once through the engine's hook. The

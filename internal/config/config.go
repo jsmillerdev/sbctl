@@ -57,6 +57,7 @@ type Config struct {
 	API       API       `toml:"api"`
 	Fleet     Fleet     `toml:"fleet"`
 	Functions Functions `toml:"functions"`
+	Branching Branching `toml:"branching"`
 	Defaults  Limits    `toml:"defaults"`
 }
 
@@ -209,6 +210,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Backup.WALRelay == "off" && c.Supervisor == SupervisorSystemd {
 		return errors.New("config: backup.wal_relay = \"off\" cannot work with supervisor = \"systemd\": the Postgres units hide /etc/sbctl and the backups directory, so a direct `sbctl wal push` can read neither the backend settings nor write the archive, and archiving would fail forever; use auto or on")
+	}
+	if err := c.Branching.validate(); err != nil {
+		return err
 	}
 	if c.StateDir == "" {
 		return errors.New("config: state_dir is empty")

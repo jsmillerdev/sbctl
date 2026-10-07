@@ -135,6 +135,9 @@ func (pl *PostgresPlane) postgresSpec(p *registry.Project, keys *secrets.Project
 		Env:         env,
 		Limits:      p.Limits,
 		Exec:        args,
+		// A branch cloned from its parent's data carries the parent's outbound integrations:
+		// once its isolation is done (EgressDenied) its cluster reaches loopback only.
+		DenyEgress: p.Branch != nil && p.Branch.Egress == registry.EgressDenied,
 	}, nil
 }
 

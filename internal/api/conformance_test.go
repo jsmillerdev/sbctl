@@ -156,7 +156,7 @@ func TestImplementedRoutesMatchSpec(t *testing.T) {
 		{key: "GET /v1/projects", check: want("0.ref", testRef)},
 		{key: "GET /v1/projects/{ref}", check: want("database.version", "17.11.0.004")},
 		{key: "GET /v1/projects/{ref}/health", path: "/v1/projects/" + testRef + "/health?services=auth,db,rest", check: want("2.healthy", false)},
-		{key: "GET /v1/projects/{ref}/branches", check: want("", "[]")},
+		{key: "GET /v1/projects/{ref}/branches", check: want("0.name", "main")},
 		{key: "GET /v1/projects/{ref}/config/database/pooler", check: want("0.identifier", testRef)},
 		{key: "GET /platform/projects", check: want("pagination.count", 1)},
 		{key: "GET /platform/projects/{ref}", check: want("connectionString", "postgresql://postgres:[YOUR-PASSWORD]@db.abcdefghijklmnopqrst.api.example.test:5432/postgres")},

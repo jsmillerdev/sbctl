@@ -86,6 +86,17 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
   configured `region` (default `us-east-1`) is stored: Studio and the CLI resolve the project
   region against a list of real regions, and an unknown one breaks the project list.
 
+## Branches
+
+`CreateRequest.Branch` (`*registry.BranchInfo`) makes the new project a branch: the registry row is
+written with it, so a branch is a branch from the moment it exists. `internal/branching` builds on
+that. `DeleteWith` refuses (`ErrInvalidState`, before it stops anything) while the project has branches.
+`DeleteOptions.KeepRecord` removes the fleet tenants, route, units and data but keeps the registry
+row and its sealed secrets, which ends `INIT_FAILED`; `CreateRequest.Recreate` builds a new cluster
+over such a row (same ref, sequence number, name and branch info; the row must be `INIT_FAILED`). A
+branch reset uses the pair so that a failure after the old cluster is gone leaves the branch
+registered instead of gone.
+
 ## System project
 
 `InitSystem` is the same code path with ref `system` on `[ports] system_postgres` and

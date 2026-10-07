@@ -3,7 +3,9 @@
 package units
 
 import (
+	"bytes"
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -443,9 +445,15 @@ func TestTemplatesContainment(t *testing.T) {
 		}
 		// All of /etc/sbctl (archive_command reads no config: it goes through the relay socket)
 		// and the system bus: the polkit rule lets the sbctl user stop and tune sb-* units, which
-		// code running inside one unit has no business doing to the others.
-		if line(body, "InaccessiblePaths") != "-/etc/sbctl -/run/dbus" {
-			t.Errorf("%s must hide /etc/sbctl and /run/dbus, got %q", name, line(body, "InaccessiblePaths"))
+		// code running inside one unit has no business doing to the others. Postgres also hides
+		// the two other unix sockets that are ways out of a branch's IP filter (IPAddressDeny
+		// does not cover AF_UNIX): the resolver's varlink socket and nscd's.
+		wantHidden := "-/etc/sbctl -/run/dbus"
+		if svc == "postgres" {
+			wantHidden += " -/run/systemd/resolve/io.systemd.Resolve -/run/nscd/socket"
+		}
+		if line(body, "InaccessiblePaths") != wantHidden {
+			t.Errorf("%s: InaccessiblePaths = %q, want %q", name, line(body, "InaccessiblePaths"), wantHidden)
 		}
 		// No unit sees the backup directory, Postgres included: WAL leaves through the relay.
 		if strings.Contains(body, "/var/lib/sbctl/backups") && !strings.HasPrefix(strings.TrimSpace(body), "#") {
@@ -479,5 +487,102 @@ func TestRenderPublicRunMode(t *testing.T) {
 				t.Errorf("public=%v %s: %v %v, want %v", public, p, fi, err, w)
 			}
 		}
+	}
+}
+
+// The egress policy is IPAddressDeny=any with IPAddressAllow=127.0.0.1/32 ::1/128, in the shape
+// of the systemd D-Bus a(iayu) type: both families, the two loopback addresses and nothing else
+// (not 127.0.0.0/8: 127.0.0.53 is systemd-resolved's stub, a DNS side channel).
+func TestEgressRanges(t *testing.T) {
+	deny, allow := EgressDeny(), EgressAllow()
+	if len(deny) != 2 || deny[0].Family != 2 || len(deny[0].Addr) != 4 || deny[0].Prefix != 0 ||
+		deny[1].Family != 10 || len(deny[1].Addr) != 16 || deny[1].Prefix != 0 {
+		t.Fatalf("deny = %+v", deny)
+	}
+	for _, r := range deny {
+		for _, b := range r.Addr {
+			if b != 0 {
+				t.Fatalf("deny %+v is not the whole address space", r)
+			}
+		}
+	}
+	if len(allow) != 2 || allow[0].Family != 2 || !bytes.Equal(allow[0].Addr, []byte{127, 0, 0, 1}) || allow[0].Prefix != 32 ||
+		allow[1].Family != 10 || len(allow[1].Addr) != 16 || allow[1].Addr[15] != 1 || allow[1].Prefix != 128 {
+		t.Fatalf("allow = %+v", allow)
+	}
+	for _, b := range allow[1].Addr[:15] {
+		if b != 0 {
+			t.Fatalf("allow %+v is not ::1", allow[1])
+		}
+	}
+}
+
+// A unit is left alone only when its lists are exactly the policy; one confined by an earlier
+// release with the wider 127.0.0.0/8 allow is narrowed by the next Render.
+func TestEgressMatches(t *testing.T) {
+	dbus := func(rs []IPRange) [][]interface{} {
+		out := [][]interface{}{}
+		for _, r := range rs {
+			out = append(out, []interface{}{r.Family, r.Addr, r.Prefix})
+		}
+		return out
+	}
+	policy := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow())}
+	template := map[string]interface{}{"IPAddressDeny": dbus(IMDSDeny())}
+	wide := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus([]IPRange{
+		{Family: 2, Addr: []byte{127, 0, 0, 0}, Prefix: 8}, EgressAllow()[1]})}
+	for _, tc := range []struct {
+		name  string
+		props map[string]interface{}
+		deny  bool
+		want  bool
+	}{
+		{"denied unit, deny wanted", policy, true, true},
+		{"denied unit, lift wanted", policy, false, false},
+		{"template unit (metadata deny only), lift wanted", template, false, true},
+		{"template unit (metadata deny only), deny wanted", template, true, false},
+		{"unit whose metadata deny was lost, lift wanted", map[string]interface{}{}, false, false},
+		{"unit with an allow list but no deny, lift wanted", map[string]interface{}{"IPAddressAllow": dbus(EgressAllow())}, false, false},
+		{"unloaded unit, lift wanted", nil, false, true},
+		{"open unit, deny wanted", map[string]interface{}{}, true, false},
+		{"old wide allow list", wide, true, false},
+		{"unknown shape", map[string]interface{}{"IPAddressDeny": "garbage"}, true, false},
+		{"unknown shape, lift wanted", map[string]interface{}{"IPAddressDeny": "garbage"}, false, false},
+	} {
+		if got := egressMatches(tc.props, tc.deny); got != tc.want {
+			t.Errorf("%s: egressMatches = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The metadata-service list is what the templates carry: the two addresses of the file, in both families.
+func TestIMDSDenyIsTheTemplateList(t *testing.T) {
+	d := IMDSDeny()
+	if len(d) != 2 || d[0].Family != 2 || d[0].Prefix != 32 || net.IP(d[0].Addr).String() != "169.254.169.254" ||
+		d[1].Family != 10 || d[1].Prefix != 128 || net.IP(d[1].Addr).String() != "fd00:ec2::254" {
+		t.Fatalf("IMDSDeny = %+v", d)
+	}
+}
+
+// Only a project's Postgres unit has an egress policy to lift: the other templates own their lists
+// (sb-edge-bundle@ denies localhost and allows the resolver stub).
+func TestEgressManaged(t *testing.T) {
+	for unit, want := range map[string]bool{
+		"sb-postgres@abcdefghijklmnopqrst.service":    true,
+		"sb-edge-bundle@abcdefghijklmnopqrst.service": false,
+		"sb-gotrue@abcdefghijklmnopqrst.service":      false,
+		"sb-edge-runtime.service":                     false,
+	} {
+		if got := egressManaged(unit); got != want {
+			t.Errorf("egressManaged(%s) = %v, want %v", unit, got, want)
+		}
+	}
+}
+
+// The exec backend runs plain child processes: it cannot confine a unit's network and says so.
+func TestExecDoesNotEnforceEgress(t *testing.T) {
+	var s Supervisor = NewExec(config.Default(), nil)
+	if e, ok := s.(EgressEnforcer); ok && e.EnforcesEgress() {
+		t.Fatal("the exec backend claims to enforce egress")
 	}
 }

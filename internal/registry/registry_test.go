@@ -148,6 +148,8 @@ func testRegistry(t *testing.T, r Registry) {
 		t.Fatal("backup must outlive its project")
 	}
 
+	testBranches(t, r, org.ID)
+
 	seen := map[string]bool{}
 	timeout := time.After(5 * time.Second)
 	for !(seen["projects"] && seen["routes"] && seen["project_secrets"]) {
@@ -157,5 +159,87 @@ func testRegistry(t *testing.T, r Registry) {
 		case <-timeout:
 			t.Fatalf("change feed incomplete: %v", seen)
 		}
+	}
+}
+
+func testBranches(t *testing.T, r Registry, orgID int64) {
+	t.Helper()
+	ctx := context.Background()
+	const parent, kid, kid2 = "dddddddddddddddddddd", "eeeeeeeeeeeeeeeeeeee", "ffffffffffffffffffff"
+	if err := r.CreateProject(ctx, &Project{Ref: parent, OrgID: orgID, Name: "parent"}); err != nil {
+		t.Fatal(err)
+	}
+	exp := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	b := &Project{Ref: kid, OrgID: orgID, Name: "feature", Branch: &BranchInfo{
+		ID: "6f9619ff-8b86-4011-b42d-00c04fc964ff", ParentRef: parent, Name: "feature", GitBranch: "feat/x", ExpiresAt: &exp,
+		NotifyURL: "https://example.test/hook", State: BranchCreatingProject, Egress: EgressPending}}
+	if err := r.CreateProject(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.GetProject(ctx, kid)
+	if err != nil || got.Branch == nil || got.Branch.ParentRef != parent || got.Branch.GitBranch != "feat/x" ||
+		got.Branch.State != BranchCreatingProject || got.Branch.Egress != EgressPending || got.Branch.ExpiresAt == nil || !got.Branch.ExpiresAt.Equal(exp) || got.Branch.Persistent {
+		t.Fatalf("branch round trip: %v %+v %+v", err, got, got.Branch)
+	}
+	if p, _ := r.GetProject(ctx, parent); p.Branch != nil {
+		t.Fatal("an ordinary project must not carry branch info")
+	}
+	// Names are unique per parent; ids are unique everywhere.
+	dup := &Project{Ref: kid2, OrgID: orgID, Name: "x", Branch: &BranchInfo{ID: "11111111-8b86-4011-b42d-00c04fc964ff", ParentRef: parent, Name: "feature"}}
+	if err := r.CreateProject(ctx, dup); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate branch name: %v", err)
+	}
+	// A parent with branches cannot be deleted.
+	if err := r.DeleteProject(ctx, parent); !errors.Is(err, ErrConflict) {
+		t.Fatalf("delete parent with branches: %v", err)
+	}
+	got.Branch.State, got.Branch.Detail, got.Branch.CloneMethod, got.Branch.Persistent, got.Branch.ExpiresAt = BranchMigrationsPassed, "ok", "clonefile", true, nil
+	got.Branch.Egress = EgressDenied // UpdateBranch must not write this
+	if err := r.SetProjectStatus(ctx, kid, StatusActiveHealthy); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.UpdateBranch(ctx, kid, got.Branch); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := r.GetProject(ctx, kid)
+	if again.Status != StatusActiveHealthy || again.Branch.State != BranchMigrationsPassed || !again.Branch.Persistent || again.Branch.ExpiresAt != nil || again.Branch.CloneMethod != "clonefile" || again.Branch.ParentRef != parent {
+		t.Fatalf("update branch: %+v %+v", again, again.Branch)
+	}
+	// The egress policy has its own writer: UpdateBranch leaves it alone, so a read-modify-write
+	// of the other fields cannot put a stale policy back.
+	if again.Branch.Egress != EgressPending {
+		t.Fatalf("UpdateBranch wrote the egress policy: %q", again.Branch.Egress)
+	}
+	if err := r.SetBranchEgress(ctx, kid, EgressDenied, EgressAllowed); !errors.Is(err, ErrConflict) {
+		t.Fatalf("SetBranchEgress from the wrong policy: %v", err)
+	}
+	if err := r.SetBranchEgress(ctx, kid, EgressPending, EgressDenied); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetBranchEgress(ctx, kid, EgressPending, EgressDenied); !errors.Is(err, ErrConflict) {
+		t.Fatalf("SetBranchEgress twice from pending: %v", err)
+	}
+	stale := *again.Branch // read before the policy changed, written back after
+	stale.Detail = "stale write"
+	if err := r.UpdateBranch(ctx, kid, &stale); err != nil {
+		t.Fatal(err)
+	}
+	if later, _ := r.GetProject(ctx, kid); later.Branch.Egress != EgressDenied || later.Branch.Detail != "stale write" {
+		t.Fatalf("a stale UpdateBranch changed the policy or lost its own field: %+v", later.Branch)
+	}
+	if err := r.SetBranchEgress(ctx, parent, "", EgressDenied); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetBranchEgress on an ordinary project: %v", err)
+	}
+	if err := r.SetBranchEgress(ctx, "zzzzzzzzzzzzzzzzzzzz", "", EgressDenied); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetBranchEgress on a missing project: %v", err)
+	}
+	if err := r.UpdateBranch(ctx, parent, got.Branch); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("UpdateBranch on an ordinary project: %v", err)
+	}
+	if err := r.DeleteProject(ctx, kid); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DeleteProject(ctx, parent); err != nil {
+		t.Fatal(err)
 	}
 }

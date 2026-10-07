@@ -14,6 +14,7 @@ import (
 
 	"github.com/OWNER/sbctl/internal/api"
 	"github.com/OWNER/sbctl/internal/backup"
+	"github.com/OWNER/sbctl/internal/branching"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/fleet"
 	"github.com/OWNER/sbctl/internal/lifecycle"
@@ -89,9 +90,18 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	if !ok {
 		return fmt.Errorf("serve: the registry is %T, want Postgres", node.Registry)
 	}
+	// Branches: the Management API's branch endpoints and the expiry sweeper (internal/branching).
+	store := api.NewPGStore(pg.Pool()) // explicit: the API's state must survive restarts
+	bsvc, err := branching.New(branching.Deps{
+		Cfg: cfg, Registry: node.Registry, Secrets: node.Secrets, Engine: node.Engine,
+		Backup: backups(node), Functions: api.FunctionDigests(store), Log: log.With("component", "branching"),
+	})
+	if err != nil {
+		return err
+	}
 	apiH, err := api.NewServer(api.Deps{
-		Registry: node.Registry, Secrets: node.Secrets, Manager: node.Engine, Config: cfg,
-		Store:  api.NewPGStore(pg.Pool()), // explicit: the API's state must survive restarts
+		Registry: node.Registry, Secrets: node.Secrets, Manager: node.Engine, Config: cfg, Branching: bsvc,
+		Store:  store,
 		Logger: log.With("component", "api"),
 	})
 	if err != nil {
@@ -126,12 +136,21 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	if budget <= 0 {
 		budget = StopBudget
 	}
-	superviseStop(g, gctx, budget, edge.Run, apiH.Drain, admin.Shutdown, log)
+	drain := func(ctx context.Context) error {
+		err := apiH.Drain(ctx)
+		bsvc.Drain(ctx) // branch operations the API detached; cancelled when the budget ends
+		return err
+	}
+	superviseStop(g, gctx, budget, edge.Run, drain, admin.Shutdown, log)
 	if cfg.Supervisor == config.SupervisorSystemd {
 		// Next to the projects: a shared service that takes minutes to answer (Realtime and
 		// Supavisor run migrations first) must not hold the projects back.
 		g.Go(func() error { startFleet(gctx, node, log); return nil })
 	}
+	g.Go(func() error {
+		_ = bsvc.Run(gctx) // expiry sweeper; returns when the daemon stops
+		return nil
+	})
 	g.Go(func() error {
 		startProjects(gctx, node, recovered, backups(node), log)
 		return nil

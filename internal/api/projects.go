@@ -41,9 +41,6 @@ func (s *Server) routesProjects(add func(string, handlerFunc)) {
 	add("POST /v1/projects/{ref}/restore", s.restoreProject(http.StatusOK))
 	add("POST /v1/projects/{ref}/restart", s.restartProject(http.StatusOK))
 	add("GET /v1/projects/{ref}/health", s.v1Health)
-	add("GET /v1/projects/{ref}/branches", s.noBranches)
-	add("GET /v1/projects/{ref}/branches/{name}", s.branchNotFound)
-	add("GET /v1/branches/{branch_id_or_ref}", s.branchNotFound)
 	add("GET /v1/projects/{ref}/config/database/pooler", s.v1Pooler)
 
 	add("GET /platform/projects", s.platformListProjects)
@@ -452,18 +449,6 @@ func (s *Server) v1Health(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeJSON(w, http.StatusOK, out)
 	return nil
-}
-
-func (s *Server) noBranches(w http.ResponseWriter, r *http.Request) error {
-	if _, err := s.loadProject(r.Context(), r.PathValue("ref")); err != nil {
-		return err
-	}
-	writeJSON(w, http.StatusOK, []any{})
-	return nil
-}
-
-func (s *Server) branchNotFound(w http.ResponseWriter, r *http.Request) error {
-	return errf(http.StatusNotFound, "Branch not found")
 }
 
 // v1Pooler describes the shared Supavisor entry of a project. The password is a

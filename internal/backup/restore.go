@@ -49,6 +49,11 @@ type RestoreOptions struct {
 	// ToBackup restores exactly the state of a base backup (BackupID, default the
 	// newest) and ignores the target time. It needs no WAL beyond the backup's own.
 	ToBackup bool
+	// IntoFailedRow restores as a new project into a registry row that already exists and is
+	// INIT_FAILED (lifecycle.DeleteOptions.KeepRecord), instead of refusing because the ref is
+	// taken. The Manager passed to WithManager must then create with Recreate set. Branch
+	// reset uses it so that a failed reset leaves the branch registered.
+	IntoFailedRow bool
 }
 
 func (o RestoreOptions) mode() (string, error) {
@@ -171,10 +176,14 @@ func (s *Service) RestoreWith(ctx context.Context, ref string, target time.Time,
 		if !secrets.ValidRef(newRef) {
 			return nil, fmt.Errorf("backup: invalid new project ref %q", newRef)
 		}
-		if _, err := s.opt.Registry.GetProject(ctx, newRef); err == nil {
-			return nil, fmt.Errorf("backup: project %s already exists", newRef)
+		if cur, err := s.opt.Registry.GetProject(ctx, newRef); err == nil {
+			if !opts.IntoFailedRow || cur.Status != registry.StatusInitFailed {
+				return nil, fmt.Errorf("backup: project %s already exists", newRef)
+			}
 		} else if !errors.Is(err, registry.ErrNotFound) {
 			return nil, err
+		} else if opts.IntoFailedRow {
+			return nil, fmt.Errorf("backup: project %s does not exist, so there is no failed row to restore into: %w", newRef, err)
 		}
 		// A deleted project keeps its archive. Reusing its ref would mix two histories:
 		// the clone's WAL would collide with the old one and archiving would stall.

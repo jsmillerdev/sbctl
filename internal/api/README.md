@@ -43,7 +43,7 @@ registered in a second mux of a chain, tried in order.
 
 | Area | Routes |
 |---|---|
-| Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (empty list, branch lookups 404); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`, `restart-services`; `POST /v1/projects/{ref}/restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/database/{ref}/backups` (empty) |
+| Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (the full branch API, served by `internal/branching`, see below); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`, `restart-services`; `POST /v1/projects/{ref}/restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/database/{ref}/backups` (empty) |
 | Keys | `/v1/projects/{ref}/api-keys` (legacy `anon`, `service_role`, `sb_publishable_*`, `sb_secret_*`; secrets masked unless `reveal=true`), `api-keys/{id}`, `api-keys/legacy` |
 | Database | `database/query`, `database/query/read-only` (rows as JSON; `parameters` supported), `database/migrations` list and apply (`supabase_migrations.schema_migrations`), `types/typescript` (pg-meta generator), `cli/login-role` create and delete, `advisors/*` (no lints yet) |
 | Functions and secrets | `functions` list, create, deploy (multipart), get, patch, delete, `body`; `secrets` list (digests), create, delete. Sources, bundles and sealed secrets are stored. Uploads: multipart sources (`POST .../functions/deploy`, `supabase functions deploy --use-api`, the CLI when Docker is not running, Studio's editor; where `Deps.Functions` is set the runtime serves bundles only, because a function run from source files could import other projects' files, so the hook's `api.SourceBundler` bundles the sources in a sandbox and they are stored together with the bundle (`.sbctl-bundle.ezbr`, `.sbctl-bundle.json`; answers: 400 with the bundler's output for broken code, 501 where the node cannot bundle, 429 when the queue is full); the sources stay readable through `.../body`) and bundles (`POST` create and `PATCH` update with `Content-Type: application/vnd.denoland.eszip` and a body of `EZBR` + Brotli, which is what plain `supabase functions deploy` sends; metadata in the query, `ezbr_sha256` checked, stored as the file `.sbctl-bundle.ezbr`; `functions_bundle.go`). `Deps.Functions` (`api.FunctionsHook`, `functions_hook.go`) is told after each change so `internal/functions` can put the files where the Edge Runtime reads them |
@@ -57,6 +57,24 @@ registered in a second mux of a chain, tried in order.
 Everything else (billing, integrations, replication, log drains, network restrictions,
 auth/storage/realtime *config* PATCHes, ...) is a stub: it answers a valid empty value and
 changes nothing.
+
+## Branches
+
+`Deps.Branching` (a `*branching.Service`, `internal/branching/README.md`) serves `GET/POST/DELETE
+/v1/projects/{ref}/branches`, `GET /v1/projects/{ref}/branches/{name}`, `GET/PATCH/DELETE
+/v1/branches/{id_or_ref}` (`force=false` schedules the deletion), `POST .../merge|reset|push|restore`
+and `GET .../diff`, with the exact spec shapes (`BranchResponse`, `BranchDetailResponse`, ...). Studio calls
+these paths itself; the `/platform` twins are the project fields `is_branch_enabled`,
+`preview_branch_refs` and `parent_project_ref`. Branches are not listed as projects. Merge, reset and
+push answer `201 {workflow_run_id, message: "ok"}` at once and run in the background; the branch's
+`status` follows. `?force=true` on merge and push is our extension. `GET /v1/branches/{id}` omits `db_pass` and `jwt_secret` for the default branch (the project's own
+secrets stay in the secret store) and answers without them while a new branch's credentials are not
+stored yet. Create refuses what the node cannot honor with 400: non-empty `secrets`, a `release_channel`
+other than `ga`, a `postgres_engine` other than the parent's; `region` is accepted and the parent's
+is used. PATCH refuses a `status` that differs from the branch's own and accepts the deprecated
+`reset_on_push` (the spec says it is ignored). Without `Deps.Branching` the list is
+the default branch only and a create answers 400. Organization entitlements already grant
+`branching_limit` and `branching_persistent`, which is what the CLI checks on a failed create.
 
 ## Authentication
 
@@ -292,7 +310,7 @@ region code (`config.Region`, default `us-east-1`).
   the driver's values, which can differ from Postgres's JSON for exotic types.
 - `database/query` for `parameters` and for pg-meta SQL return rows as Postgres/pg-meta
   serialize them; `bigint` columns can differ between the two paths (number vs string).
-- Advisors return no lints; function bodies are stored and, with `[functions] enabled`, run by the Edge Runtime (`internal/functions`); branches are always empty;
+- Advisors return no lints; function bodies are stored and, with `[functions] enabled`, run by the Edge Runtime (`internal/functions`);
   `PATCH` on auth, storage, realtime and postgrest *config* is a stub; `PATCH
   /v1/projects/{ref}/database/password` is a stub.
 - Not checked against a running Studio: that is workstream A. Region and cloud provider

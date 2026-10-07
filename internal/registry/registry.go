@@ -65,7 +65,62 @@ type Project struct {
 	Limits    config.Limits
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	// Branch is set when the project is a branch of another project (workstream I).
+	Branch *BranchInfo
 }
+
+// BranchState is the (deprecated but still decoded) status of the Management API's branch
+// object: it tracks the last long operation, while the project's own Status tracks its units.
+type BranchState string
+
+const (
+	BranchCreatingProject  BranchState = "CREATING_PROJECT"
+	BranchRunningMigration BranchState = "RUNNING_MIGRATIONS"
+	BranchMigrationsPassed BranchState = "MIGRATIONS_PASSED"
+	BranchMigrationsFailed BranchState = "MIGRATIONS_FAILED"
+)
+
+// BranchInfo is what makes a project a branch.
+type BranchInfo struct {
+	ID         string // UUID, stable across reset
+	ParentRef  string // immutable
+	Name       string // unique per parent
+	GitBranch  string
+	Persistent bool
+	WithData   bool
+	// ExpiresAt is when the sweeper deletes a non-persistent branch; nil never.
+	ExpiresAt *time.Time
+	// DeletionScheduledAt is a soft delete: the sweeper removes the branch after it,
+	// whatever Persistent says, and restore clears it.
+	DeletionScheduledAt *time.Time
+	NotifyURL           string
+	State               BranchState
+	// Detail is the outcome of the last long operation (an error text on failure).
+	Detail string
+	// CloneMethod records how the data was obtained: "schema", "clonefile", "reflink",
+	// or "base-backup".
+	CloneMethod       string
+	ReviewRequestedAt *time.Time
+	// Egress is the branch's outbound network policy (the Egress* constants). It is chosen
+	// when the branch is created and kept through reset; empty on a schema-only branch.
+	Egress string
+}
+
+// Outbound network policy of a branch cloned from its parent's data. The clone carries
+// every outbound integration of the parent (webhooks, pg_net, pg_cron, foreign servers), so
+// by default the branch's Postgres unit may reach loopback only.
+const (
+	// EgressPending: deny non-loopback egress once the first-start isolation is done. The
+	// first start (a base-backup restore may fetch WAL from the backup backend) runs open
+	// because the first-start settings already silence the integrations.
+	EgressPending = "pending"
+	// EgressDenied: the unit is rendered with every non-loopback address denied.
+	EgressDenied = "denied"
+	// EgressAllowed: the branch was created with the explicit opt-out.
+	EgressAllowed = "allowed"
+	// EgressUnenforced: denial was wanted but the supervisor cannot enforce it (exec backend).
+	EgressUnenforced = "unenforced"
+)
 
 type AccessToken struct {
 	ID         int64
@@ -142,6 +197,18 @@ type Registry interface {
 	// UpdateProject writes name, region, class, status, versions and limits.
 	UpdateProject(ctx context.Context, p *Project) error
 	SetProjectStatus(ctx context.Context, ref string, s Status) error
+	// UpdateBranch writes the mutable fields of b (name, git branch, persistence, expiry,
+	// notify URL, state, detail, clone method) of the branch project ref and nothing else,
+	// so it cannot overwrite a status change made at the same time. It never writes the
+	// egress policy: a caller that read the branch, changed a field and wrote it back (a PATCH,
+	// a restore) would otherwise put a stale policy over one set meanwhile. ErrNotFound when
+	// ref is not a branch; ErrConflict when the name is taken under the same parent.
+	UpdateBranch(ctx context.Context, ref string, b *BranchInfo) error
+	// SetBranchEgress is the only writer of a branch's egress policy after creation (the
+	// policy of a new branch is part of its row): a compare-and-set from the policy the caller
+	// saw to the new one. ErrConflict when the policy is not from any more, ErrNotFound when ref
+	// is not a branch.
+	SetBranchEgress(ctx context.Context, ref, from, to string) error
 	// DeleteProject removes the project, its secrets and routes (cascade).
 	DeleteProject(ctx context.Context, ref string) error
 

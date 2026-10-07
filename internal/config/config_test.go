@@ -160,3 +160,29 @@ func TestWALRelayOffNeedsExecSupervisor(t *testing.T) {
 		}
 	}
 }
+
+func TestBranchingDiskReserve(t *testing.T) {
+	var b Branching
+	if got := b.DiskReserve(); got != 2<<30 {
+		t.Fatalf("default reserve = %d, want 2 GiB", got)
+	}
+	b.DiskReserveMB = 512
+	if got := b.DiskReserve(); got != 512<<20 {
+		t.Fatalf("reserve = %d", got)
+	}
+	p := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(p, []byte("[branching]\ndisk_reserve_mb = -1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "disk_reserve_mb") {
+		t.Fatalf("a negative reserve was accepted: %v", err)
+	}
+	t.Setenv("SBCTL_BRANCHING_DISK_RESERVE_MB", "100")
+	if err := os.WriteFile(p, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(p)
+	if err != nil || c.Branching.DiskReserveMB != 100 {
+		t.Fatalf("env override: %v %+v", err, c.Branching)
+	}
+}

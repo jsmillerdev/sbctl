@@ -68,7 +68,13 @@ ReadWritePaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/post
 # (`sbctl wal push|fetch --socket`) read no file of /etc/sbctl. Environment files are read by
 # systemd before the namespace exists. This does not isolate tenants from a compromised
 # cluster (same uid, /proc); see README.md.
-InaccessiblePaths=-/etc/sbctl -/run/dbus
+# Besides /etc/sbctl and the system bus (the polkit rule would let a confined unit lift its own
+# filter), two unix sockets that the IP filter of a branch with denied egress (IPAddressDeny,
+# set per unit over D-Bus) cannot cover and that systemd 255 does not let a running unit's
+# InaccessiblePaths change over D-Bus, so every Postgres unit hides them: the resolver's
+# varlink socket (glibc's nss-resolve; a Postgres without it falls back to /etc/resolv.conf)
+# and nscd's socket.
+InaccessiblePaths=-/etc/sbctl -/run/dbus -/run/systemd/resolve/io.systemd.Resolve -/run/nscd/socket
 TemporaryFileSystem=/var/lib/sbctl:ro
 BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/%i/postgres.run -/var/lib/sbctl/projects/%i/wal
 BindPaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/postgres

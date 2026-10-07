@@ -46,7 +46,12 @@ func (s *Server) connectionPlaceholder(p *registry.Project) string {
 func (s *Server) platformProject(p *registry.Project, org *registry.Organization) plat.ProjectDetailResponseOutput {
 	conn := s.connectionPlaceholder(p)
 	ver := pgVersion(p)
+	var parent *string
+	if p.Branch != nil {
+		parent = &p.Branch.ParentRef
+	}
 	return plat.ProjectDetailResponseOutput{
+		IsBranchEnabled: s.branches != nil, ParentProjectRef: parent,
 		CloudProvider: "AWS", ConnectionString: &conn, DbVersion: &ver, DbHost: s.dbHost(p.Ref),
 		Id: projectNumID(p), InsertedAt: ts(p.CreatedAt), UpdatedAt: ts(p.UpdatedAt),
 		Name: p.Name, OrganizationId: float32(org.ID), Ref: p.Ref, Region: s.regionOf(p),
@@ -100,6 +105,10 @@ func (s *Server) platformListProjects(w http.ResponseWriter, r *http.Request) er
 	if err != nil {
 		return err
 	}
+	all, err := s.reg.ListProjects(r.Context())
+	if err != nil {
+		return err
+	}
 	limit, offset := queryInt(r, "limit", 100), queryInt(r, "offset", 0)
 	if search := r.URL.Query().Get("search"); search != "" {
 		ps = filterProjects(ps, search)
@@ -118,9 +127,9 @@ func (s *Server) platformListProjects(w http.ResponseWriter, r *http.Request) er
 		}
 		row := elem("GET /platform/projects", "projects")
 		rows = append(rows, setAll(row, map[string]any{
-			"cloud_provider": "AWS", "id": projectNumID(p), "inserted_at": ts(p.CreatedAt), "is_branch_enabled": false,
+			"cloud_provider": "AWS", "id": projectNumID(p), "inserted_at": ts(p.CreatedAt), "is_branch_enabled": s.branches != nil,
 			"is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID, "organization_slug": org.Slug,
-			"preview_branch_refs": []string{}, "ref": p.Ref, "region": s.regionOf(p), "status": string(p.Status), "subscription_id": "sbctl",
+			"preview_branch_refs": s.branchRefs(all, p.Ref), "ref": p.Ref, "region": s.regionOf(p), "status": string(p.Status), "subscription_id": "sbctl",
 		}))
 	}
 	resp := base("GET /platform/projects")
@@ -163,7 +172,7 @@ func (s *Server) platformCreateProject(w http.ResponseWriter, r *http.Request) e
 	resp := base("POST /platform/projects")
 	setAll(resp, map[string]any{
 		"cloud_provider": "AWS", "endpoint": s.projectURL(p.Ref), "id": projectNumID(p), "inserted_at": ts(p.CreatedAt),
-		"is_branch_enabled": false, "is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID,
+		"is_branch_enabled": s.branches != nil, "is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID,
 		"organization_slug": org.Slug, "preview_branch_refs": []string{}, "ref": p.Ref, "region": s.regionOf(p),
 		"status": string(p.Status), "subscription_id": "sbctl",
 	})

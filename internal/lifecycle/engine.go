@@ -275,12 +275,48 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 		Ref: ref, OrgID: org.ID, Name: name, Region: region, Engine: registry.EnginePostgres,
 		Class: class, Status: registry.StatusComingUp, Versions: versions, Limits: limits,
 	}
-	if err := e.reg.CreateProject(ctx, p); err != nil {
+	if req.Branch != nil {
+		b := *req.Branch
+		p.Branch = &b
+	}
+	if req.Recreate {
+		cur, err := e.reg.GetProject(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("lifecycle: recreate %s: %w", ref, err)
+		}
+		if cur.Status != registry.StatusInitFailed {
+			return nil, invalidState(cur, "recreate")
+		}
+		// The row keeps its identity (name, sequence number, branch info); the rest is renewed.
+		cur.Region, cur.Class, cur.Versions, cur.Limits, cur.Status = region, class, versions, limits, registry.StatusComingUp
+		if err := e.reg.UpdateProject(ctx, cur); err != nil {
+			return nil, fmt.Errorf("lifecycle: recreate project %s: %w", ref, err)
+		}
+		p = cur
+	} else if err := e.reg.CreateProject(ctx, p); err != nil {
 		return nil, fmt.Errorf("lifecycle: create project %s: %w", ref, err)
+	} else if p.Branch != nil {
+		// The branch row exists now. A delete of the parent holds the parent's lock, not this
+		// ref's: it sets GOING_DOWN and only then looks for branches, so either it sees this row
+		// or this check sees GOING_DOWN. A branch must not be left on a parent that goes away.
+		if par, perr := e.reg.GetProject(ctx, p.Branch.ParentRef); perr != nil || par.Status == registry.StatusGoingDown {
+			if derr := e.reg.DeleteProject(context.WithoutCancel(ctx), ref); derr != nil {
+				e.log.Warn("create: could not remove the row of a branch whose parent is going away", "ref", ref, "err", derr)
+			}
+			return nil, fmt.Errorf("%w: parent project %s is being deleted or gone", ErrInvalidState, p.Branch.ParentRef)
+		}
 	}
 	fail := func(stage string, cause error) (*registry.Project, error) {
 		cctx, cancel := cleanupCtx(ctx)
 		defer cancel()
+		if errors.Is(cause, ErrClusterExists) && req.Recreate {
+			// Foreign data under a row that was meant to be empty: leave it, keep the row failed.
+			e.cleanup(cctx, p, true)
+			if err := e.reg.SetProjectStatus(cctx, ref, registry.StatusInitFailed); err != nil {
+				e.log.Error("could not mark project INIT_FAILED", "ref", ref, "error", err)
+			}
+			return nil, fmt.Errorf("lifecycle: recreate %s refused, existing data left untouched (move %s away): %w", ref, e.cfg.Paths().Project(ref), cause)
+		}
 		if errors.Is(cause, ErrClusterExists) {
 			// The data belongs to someone else (an orphan, or a restore target that was
 			// not cleared): leave it alone and forget the row this call just made.
@@ -442,6 +478,13 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	if ref == config.SystemRef {
 		return fmt.Errorf("%w: the system project cannot be deleted", ErrInvalidState)
 	}
+	if kids, err := e.branchesOf(ctx, ref); err != nil {
+		return err
+	} else if len(kids) > 0 {
+		// Refuse before anything is stopped: the registry would reject the last step and
+		// leave a parent without data.
+		return fmt.Errorf("%w: %s still has branches (%s); delete them first", ErrInvalidState, ref, strings.Join(kids, ", "))
+	}
 	prev := p.Status
 	backupDone, tookBackup := false, false
 	if prev == registry.StatusGoingDown {
@@ -454,6 +497,17 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	}
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusGoingDown); err != nil {
 		return err
+	}
+	// A branch created after the first look has inserted its row by now or will see GOING_DOWN
+	// (Create): look again, and back out if one landed in between.
+	if prev != registry.StatusGoingDown {
+		if kids, err := e.branchesOf(ctx, ref); err != nil || len(kids) > 0 {
+			_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, prev)
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: %s still has branches (%s); delete them first", ErrInvalidState, ref, strings.Join(kids, ", "))
+		}
 	}
 	if !backupDone {
 		if e.opts.Backup != nil && !o.SkipFinalBackup && prev != registry.StatusInitFailed {
@@ -490,11 +544,33 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	if err := e.plane.Delete(ctx, ref); err != nil {
 		return fmt.Errorf("lifecycle: delete %s: %w", ref, err)
 	}
+	if o.KeepRecord {
+		if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusInitFailed); err != nil {
+			return err
+		}
+		e.event(ctx, ref, "project.data_removed", map[string]any{"final_backup": tookBackup})
+		return nil
+	}
 	if err := e.reg.DeleteProject(ctx, ref); err != nil {
 		return err
 	}
 	e.event(ctx, ref, "project.deleted", map[string]any{"final_backup": tookBackup})
 	return nil
+}
+
+// branchesOf lists the refs of the branches whose parent is ref.
+func (e *Engine) branchesOf(ctx context.Context, ref string) ([]string, error) {
+	ps, err := e.reg.ListProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var kids []string
+	for _, q := range ps {
+		if q.Branch != nil && q.Branch.ParentRef == ref {
+			kids = append(kids, q.Ref)
+		}
+	}
+	return kids, nil
 }
 
 // Events that make an operation resumable after a daemon stop.

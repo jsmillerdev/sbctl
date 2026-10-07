@@ -444,3 +444,44 @@ func TestPlaneDeleteRemovesTheBundlersInstanceOfTheProject(t *testing.T) {
 		t.Errorf("the bundler's instance was not removed: %v", sup.removed)
 	}
 }
+
+// A branch's Postgres unit is rendered with egress denied only once its isolation set the
+// policy to denied: pending (first start), allowed (opt-out), unenforced, ordinary projects
+// and schema-only branches are all rendered open.
+func TestPostgresSpecDenyEgress(t *testing.T) {
+	pl, cfg := testPlane(t)
+	keys := testKeys(t, "abcdefghijklmnopqrst")
+	for _, tc := range []struct {
+		branch *registry.BranchInfo
+		deny   bool
+	}{
+		{nil, false},
+		{&registry.BranchInfo{ParentRef: "p"}, false},
+		{&registry.BranchInfo{ParentRef: "p", Egress: registry.EgressPending}, false},
+		{&registry.BranchInfo{ParentRef: "p", Egress: registry.EgressAllowed}, false},
+		{&registry.BranchInfo{ParentRef: "p", Egress: registry.EgressUnenforced}, false},
+		{&registry.BranchInfo{ParentRef: "p", Egress: registry.EgressDenied}, true},
+	} {
+		p := testProject(cfg, "abcdefghijklmnopqrst", 2)
+		p.Branch = tc.branch
+		spec, err := pl.postgresSpec(p, keys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if spec.DenyEgress != tc.deny {
+			t.Errorf("branch %+v: DenyEgress = %v, want %v", tc.branch, spec.DenyEgress, tc.deny)
+		}
+	}
+	// The API units never carry the restriction: only the cluster's own outbound calls matter.
+	p := testProject(cfg, "abcdefghijklmnopqrst", 2)
+	p.Branch = &registry.BranchInfo{ParentRef: "p", Egress: registry.EgressDenied}
+	specs, err := pl.apiSpecs(p, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range specs {
+		if s.DenyEgress {
+			t.Errorf("%s has DenyEgress", s.Unit())
+		}
+	}
+}
