@@ -189,6 +189,13 @@ type ProjectKeys struct {
 	StorageAdminPassword  string
 	ReplicationPassword   string
 	PGSodiumRootKey       string
+
+	// Records are the stored opaque-key records (see apikeys.go; a pointer, so the struct
+	// stays comparable) and LegacyDisabled is true when the anon and service_role JWTs are
+	// switched off. Both come from KeysFromMap and are not part of Map: the Management API
+	// owns them.
+	Records        *RecordSet `json:"-"`
+	LegacyDisabled bool       `json:"-"`
 }
 
 // NewProjectKeys generates a complete credential set for ref.
@@ -231,11 +238,13 @@ func (k *ProjectKeys) Map() map[string]string {
 
 // KeysFromMap is the inverse of Map. Missing names stay empty.
 func KeysFromMap(m map[string]string) *ProjectKeys {
-	return &ProjectKeys{
+	k := &ProjectKeys{
 		JWTSecret: m[NameJWTSecret], AnonKey: m[NameAnonKey], ServiceRoleKey: m[NameServiceRoleKey],
 		PublishableKey: m[NamePublishableKey], SecretKey: m[NameSecretKey], DBPassword: m[NameDBPassword],
 		AdminPassword: m[NameAdminPassword], AuthenticatorPassword: m[NameAuthenticatorPassword],
 		AuthAdminPassword: m[NameAuthAdminPassword], StorageAdminPassword: m[NameStorageAdminPassword],
 		ReplicationPassword: m[NameReplicationPassword], PGSodiumRootKey: m[NamePGSodiumRootKey],
 	}
+	k.loadKeyRecords(m)
+	return k
 }

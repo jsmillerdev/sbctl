@@ -43,8 +43,21 @@ func classify(k *secrets.ProjectKeys, ref, apikey string) (role, jwt string, ok 
 		return "", "", false
 	}
 	if strings.HasPrefix(apikey, "sb_") {
-		// Evaluate both comparisons so timing does not reveal which prefix matched.
-		pub, sec := eqConst(apikey, k.PublishableKey), eqConst(apikey, k.SecretKey)
+		// Compare against every active key, without stopping at the first match, so timing
+		// reveals neither which key nor which prefix matched. A revoked key is simply not in
+		// the list: the key cache is dropped when its record changes.
+		var pub, sec bool
+		for _, ok := range k.OpaqueKeys(ref) {
+			if !eqConst(apikey, ok.Key) {
+				continue
+			}
+			switch ok.Type {
+			case secrets.KeyTypePublishable:
+				pub = true
+			case secrets.KeyTypeSecret:
+				sec = true
+			}
+		}
 		switch {
 		case pub && k.AnonKey != "":
 			return secrets.RoleAnon, k.AnonKey, true
@@ -52,6 +65,9 @@ func classify(k *secrets.ProjectKeys, ref, apikey string) (role, jwt string, ok 
 			return secrets.RoleServiceRole, k.ServiceRoleKey, true
 		}
 		return "", "", false
+	}
+	if k.LegacyDisabled {
+		return temporaryKey(k, ref, apikey)
 	}
 	anon, svc := eqConst(apikey, k.AnonKey), eqConst(apikey, k.ServiceRoleKey)
 	switch {
@@ -74,6 +90,29 @@ func classify(k *secrets.ProjectKeys, ref, apikey string) (role, jwt string, ok 
 	}
 	switch r, _ := claims["role"].(string); r {
 	case secrets.RoleAnon, secrets.RoleServiceRole:
+		return r, apikey, true
+	}
+	return "", "", false
+}
+
+// temporaryKey accepts, while the legacy keys are disabled, the short-lived service_role
+// JWT the Management API issues for the dashboard's own calls (api-keys/temporary): it
+// is signed with the project secret and carries the secrets.TemporaryClaim.
+func temporaryKey(k *secrets.ProjectKeys, ref, apikey string) (role, jwt string, ok bool) {
+	if k.JWTSecret == "" || strings.Count(apikey, ".") != 2 {
+		return "", "", false
+	}
+	claims, err := secrets.ParseHS256(apikey, k.JWTSecret)
+	if err != nil {
+		return "", "", false
+	}
+	if tmp, _ := claims[secrets.TemporaryClaim].(bool); !tmp {
+		return "", "", false
+	}
+	if r, _ := claims["ref"].(string); r != ref {
+		return "", "", false
+	}
+	if r, _ := claims["role"].(string); r == secrets.RoleServiceRole {
 		return r, apikey, true
 	}
 	return "", "", false
