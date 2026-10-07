@@ -361,6 +361,36 @@ func (l *lateBackuper) BaseBackup(ctx context.Context, ref string) (*registry.Ba
 	return b.BaseBackup(ctx, ref)
 }
 
+// restorer returns the backup service's in-place restore, or an error that wraps
+// ErrNoRestorer when the service cannot be built or cannot restore.
+func (l *lateBackuper) restorer() (InPlaceRestorer, error) {
+	b, err := l.get()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNoRestorer, err)
+	}
+	r, ok := b.(InPlaceRestorer)
+	if !ok {
+		return nil, ErrNoRestorer
+	}
+	return r, nil
+}
+
+// CanRestore implements restoreChecker: BeginRestore asks before it moves a project to
+// RESTORING, so a node without a working backup backend refuses the request at once.
+func (l *lateBackuper) CanRestore() error {
+	_, err := l.restorer()
+	return err
+}
+
+// RestoreInPlace implements InPlaceRestorer.
+func (l *lateBackuper) RestoreInPlace(ctx context.Context, ref string, req RestoreRequest) error {
+	r, err := l.restorer()
+	if err != nil {
+		return err
+	}
+	return r.RestoreInPlace(ctx, ref, req)
+}
+
 // systemProject is the registry view of the system cluster.
 func systemProject(cfg *config.Config, versions map[string]string) *registry.Project {
 	return &registry.Project{
