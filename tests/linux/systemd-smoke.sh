@@ -260,14 +260,15 @@ done
 log "a running CLI command is not dumpable: a tenant unit cannot read its /proc/<pid>/root"
 DUMPDIR=$(mktemp -d); chown "$SBCTL_USER" "$DUMPDIR"
 mkfifo "$DUMPDIR/000000010000000000000099"; chown "$SBCTL_USER" "$DUMPDIR/000000010000000000000099"
-sudo -u "$SBCTL_USER" sleep 120 & SLEEPER=$!   # control: an ordinary same-uid process is dumpable
+sudo -u "$SBCTL_USER" sleep 120 & SLEEPER=$!   # control: an ordinary same-uid process stays dumpable
 sudo -u "$SBCTL_USER" -H /usr/local/bin/sbctl wal push --ref "$A" --socket "$SBCTL_STATE/projects/$A/wal/r.sock" \
   "$DUMPDIR/000000010000000000000099" >"$DUMPDIR/cli.log" 2>&1 & CLIWAIT=$!
 CLIPID=""
 for ((i = 0; i < 30; i++)); do
   CLIPID=$(pgrep -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' | head -1 || true)
-  # Non-dumpable processes have their /proc/<pid> directory owned by root.
-  [[ -n $CLIPID && $(stat -c %U "/proc/$CLIPID" 2>/dev/null) == root ]] && break
+  # A non-dumpable process has its /proc/<pid>/environ owned by root (the /proc/<pid> directory
+  # itself is always world-readable and keeps the process's owner).
+  [[ -n $CLIPID && $(stat -c %U "/proc/$CLIPID/environ" 2>/dev/null) == root ]] && break
   CLIPID=""; sleep 1
 done
 SLEEPPID=$(pgrep -u "$SBCTL_USER" -x sleep | head -1 || true)
@@ -282,7 +283,7 @@ if [[ -n $CLIPID && -n $SLEEPPID ]]; then
 else
   ps -u "$SBCTL_USER" -o pid,user,stat,args >&2 || true
   cat "$DUMPDIR/cli.log" >&2 || true
-  ls -ld /proc/[0-9]* 2>/dev/null | grep " $SBCTL_USER " | head -5 >&2 || true
+  for pid in $(pgrep -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push') $(pgrep -u "$SBCTL_USER" -x sleep); do ls -l "/proc/$pid/environ" >&2 || true; done
   fail "the CLI command did not become non-dumpable (cli pid '${CLIPID}', control pid '${SLEEPPID}')"
 fi
 pkill -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true
