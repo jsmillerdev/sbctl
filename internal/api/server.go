@@ -14,6 +14,7 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/branching"
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/domains"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/members"
 	"github.com/jsmillerdev/supavise/internal/projectconfig"
@@ -73,6 +74,9 @@ type Deps struct {
 	// it. Nil means the node has no backup service: the list is empty, PITR is off and restores
 	// are refused. Restores also need a Manager that is a lifecycle.DatabaseRestorer.
 	Backups BackupSource
+	// DNSResolver is what custom hostnames are verified with (the node's own resolver when
+	// empty); tests pass a fake.
+	DNSResolver domains.Resolver
 	// CreateWait bounds how long POST /v1/projects waits for the new project to show
 	// up in the registry before answering 201 COMING_UP. Zero means 10 seconds.
 	CreateWait time.Duration
@@ -100,6 +104,9 @@ type Server struct {
 	members *members.Service
 	// sso manages the dashboard's SAML identity providers (sso_dashboard.go).
 	sso *DashboardSSO
+	// domains holds the custom hostname and vanity subdomain rules (domains.go); nil when the
+	// registry has no domain store.
+	domains *domains.Service
 	// orgs deletes organizations (org_delete.go).
 	orgs          *OrgDeleter
 	studioRefresh func(ctx context.Context) error
@@ -242,6 +249,7 @@ func NewServer(d Deps) (*Server, error) {
 			s.store = NewMemoryStore()
 		}
 	}
+	s.domains = domains.New(domains.Options{Reg: d.Registry, Config: d.Config, Resolver: d.DNSResolver})
 	s.settings = d.Settings
 	if s.settings == nil {
 		opts := projectconfig.Options{
@@ -337,6 +345,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesPlatformProject(add)
 	s.routesBackups(add)
 	s.routesUpgrade(add)
+	s.routesDomains(add)
 	s.routesContent(add)
 	s.routesProxies(add)
 	s.routesLogin(add)

@@ -581,7 +581,8 @@ func TestProjectAddonsReportPITR(t *testing.T) {
 	}{{7, "pitr_7"}, {10, "pitr_7"}, {14, "pitr_14"}, {21, "pitr_14"}, {28, "pitr_28"}, {90, "pitr_28"}} {
 		b.cfg.Backup.RetentionDays = tc.days
 		sel := plat()["selected_addons"].([]any)
-		if len(sel) != 1 {
+		// PITR first, then the custom domain entry Studio looks for.
+		if len(sel) != 2 || sel[1].(map[string]any)["type"] != "custom_domain" {
 			t.Fatalf("%d days: selected_addons = %v", tc.days, sel)
 		}
 		a := sel[0].(map[string]any)
@@ -602,8 +603,10 @@ func TestProjectAddonsReportPITR(t *testing.T) {
 
 	// Without a backup service there is no PITR.
 	b.srv.backups = nil
-	if len(plat()["selected_addons"].([]any)) != 0 || len(v1()["selected_addons"].([]any)) != 0 {
-		t.Error("an add-on is reported on a node without backups")
+	for _, sel := range [][]any{plat()["selected_addons"].([]any), v1()["selected_addons"].([]any)} {
+		if len(sel) != 1 || sel[0].(map[string]any)["type"] != "custom_domain" {
+			t.Errorf("add-ons on a node without backups: %v", sel)
+		}
 	}
 }
 

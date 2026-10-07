@@ -404,13 +404,21 @@ func (s *Server) platformAddons(w http.ResponseWriter, r *http.Request) error {
 	}
 	resp := base("GET /platform/projects/{ref}/billing/addons")
 	set(resp, "ref", p.Ref)
+	var selected []any
 	if s.backups != nil {
 		days, id, name := s.pitrAddon(p)
-		set(resp, "selected_addons", []any{map[string]any{"type": "pitr", "variant": map[string]any{
+		selected = append(selected, map[string]any{"type": "pitr", "variant": map[string]any{
 			"identifier": id, "name": name, "price": 0, "price_description": "Included", "price_type": "fixed",
 			"price_interval": "monthly", "meta": map[string]any{"backup_duration_days": days},
-		}}})
+		}})
 	}
+	// Custom domains need no add-on here; the entry is what Studio looks for before it shows
+	// the Custom Domains page.
+	selected = append(selected, map[string]any{"type": "custom_domain", "variant": map[string]any{
+		"identifier": "cd_default", "name": "Custom domain", "price": 0, "price_description": "Included", "price_type": "fixed",
+		"price_interval": "monthly",
+	}})
+	set(resp, "selected_addons", selected)
 	writeJSON(w, http.StatusOK, resp)
 	return nil
 }
@@ -421,13 +429,19 @@ func (s *Server) v1Addons(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	resp := base("GET /v1/projects/{ref}/billing/addons")
+	var selected []any
 	if s.backups != nil {
 		days, id, name := s.pitrAddon(p)
-		set(resp, "selected_addons", []any{map[string]any{"type": "pitr", "variant": map[string]any{
+		selected = append(selected, map[string]any{"type": "pitr", "variant": map[string]any{
 			"id": id, "name": name, "meta": map[string]any{"backup_duration_days": days},
 			"price": map[string]any{"description": "Included", "type": "fixed", "interval": "monthly", "amount": 0},
-		}}})
+		}})
 	}
+	selected = append(selected, map[string]any{"type": "custom_domain", "variant": map[string]any{
+		"id": "cd_default", "name": "Custom domain",
+		"price": map[string]any{"description": "Included", "type": "fixed", "interval": "monthly", "amount": 0},
+	}})
+	set(resp, "selected_addons", selected)
 	writeJSON(w, http.StatusOK, resp)
 	return nil
 }

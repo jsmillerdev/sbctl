@@ -111,7 +111,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: internal/proxy/pebble-test.sh
+      # Real ACME against Pebble: the node's own hosts, and a customer's custom hostname taken from
+      # initialize to activation (DNS stub: pebble-challtestsrv), fetched over its certificate.
+      - name: pebble ACME issuance and custom hostnames
+        run: internal/proxy/pebble-test.sh
 
   fleet-smoke:
     strategy:

@@ -11,6 +11,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/domains"
 	"github.com/jsmillerdev/supavise/internal/registry"
 	"github.com/jsmillerdev/supavise/internal/secrets"
 )
@@ -50,6 +51,7 @@ type table struct {
 	mu       sync.RWMutex
 	projects map[string]project // by ref
 	custom   map[string]string  // registry routes (any kind): host -> ref
+	kinds    map[string]string  // route kind of a host of custom: "custom" or "vanity"
 	keyCache map[string]keyEntry
 	// keyGen counts invalidations per ref and keyEpoch counts full reloads. A key
 	// fetch caches its result only if neither moved while it ran, so a fetch that
@@ -60,12 +62,53 @@ type table struct {
 	// onKeysDropped, when set, is told (outside the lock, and it must not block) that the
 	// cached keys of a project, or of all projects (ref ""), were dropped.
 	onKeysDropped func(ref string)
+	// onRoutesChanged, when set, is told (outside the lock, and it must not block) of the hosts
+	// that registry routes started to serve and stopped serving: custom hostnames and vanity
+	// subdomains.
+	onRoutesChanged func(added, removed []string)
+}
+
+// setRoutesChanged installs the callback of changed hosts.
+func (t *table) setRoutesChanged(fn func(added, removed []string)) {
+	t.mu.Lock()
+	t.onRoutesChanged = fn
+	t.mu.Unlock()
+}
+
+// routesChange is what swapRoutesLocked reports for the caller to deliver after unlocking.
+type routesChange struct {
+	added, removed []string
+	fn             func(added, removed []string)
+}
+
+func (c routesChange) deliver() {
+	if c.fn != nil && (len(c.added) > 0 || len(c.removed) > 0) {
+		c.fn(c.added, c.removed)
+	}
+}
+
+// swapRoutesLocked installs a new route index and returns the hosts it adds and removes. t.mu
+// must be held.
+func (t *table) swapRoutesLocked(custom, kinds map[string]string) routesChange {
+	c := routesChange{fn: t.onRoutesChanged}
+	for h := range custom {
+		if _, had := t.custom[h]; !had {
+			c.added = append(c.added, h)
+		}
+	}
+	for h := range t.custom {
+		if _, has := custom[h]; !has {
+			c.removed = append(c.removed, h)
+		}
+	}
+	t.custom, t.kinds = custom, kinds
+	return c
 }
 
 func newTable(cfg *config.Config, reg registry.Registry, keys KeySource, log *slog.Logger) *table {
 	return &table{
 		cfg: cfg, reg: reg, keys: keys, log: log, now: time.Now, retry: time.Second,
-		projects: map[string]project{}, custom: map[string]string{}, keyCache: map[string]keyEntry{},
+		projects: map[string]project{}, custom: map[string]string{}, kinds: map[string]string{}, keyCache: map[string]keyEntry{},
 		keyGen: map[string]uint64{},
 	}
 }
@@ -85,15 +128,18 @@ func normalizeHost(h string) string {
 }
 
 // lookup resolves a request host to a project: either the derived
-// <ref>.api.<domain> host of a known project, or a registry route.
+// <ref>.api.<domain> host of a known project, or a registry route (a custom hostname, or a
+// vanity subdomain, which is <name>.api.<domain> and so has the shape of a derived host).
 func (t *table) lookup(host string) (project, bool) {
 	host = normalizeHost(host)
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	// A derived project host always belongs to its own project; routes cannot take it over.
+	// A derived project host always belongs to its own project; routes cannot take it over
+	// (customRoutes lets a vanity route claim only a name that cannot be a ref).
 	if ref := t.cfg.RefFromProjectHost(host); ref != "" {
-		p, ok := t.projects[ref]
-		return p, ok
+		if p, ok := t.projects[ref]; ok {
+			return p, true
+		}
 	}
 	if ref, ok := t.custom[host]; ok {
 		p, ok := t.projects[ref]
@@ -102,26 +148,15 @@ func (t *table) lookup(host string) (project, bool) {
 	return project{}, false
 }
 
-// routeKind reports how host reaches a project: "derived", "custom" or "".
+// routeKind reports how host reaches a project: "derived", "vanity", "custom" or "".
 func (t *table) routeKind(host string) string {
-	host = normalizeHost(host)
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if ref := t.cfg.RefFromProjectHost(host); ref != "" {
-		if _, ok := t.projects[ref]; ok {
-			return "derived"
-		}
-	}
-	if ref, ok := t.custom[host]; ok {
-		if _, ok := t.projects[ref]; ok {
-			return "custom"
-		}
-	}
-	return ""
+	_, kind := t.hostProject(host)
+	return kind
 }
 
-// hostProject returns the project a derived or custom host reaches, with "derived" or
-// "custom" ("" when none).
+// hostProject returns the project a host reaches, with how: "derived" (<ref>.api.<domain>),
+// "vanity" (<name>.api.<domain>, covered by the same wildcard) or "custom" (a customer's own
+// hostname); "" when none.
 func (t *table) hostProject(host string) (project, string) {
 	host = normalizeHost(host)
 	t.mu.RLock()
@@ -133,6 +168,9 @@ func (t *table) hostProject(host string) (project, string) {
 	}
 	if ref, ok := t.custom[host]; ok {
 		if p, ok := t.projects[ref]; ok {
+			if t.kinds[host] == registry.RouteVanity {
+				return p, "vanity"
+			}
 			return p, "custom"
 		}
 	}
@@ -161,9 +199,10 @@ func (t *table) reload(ctx context.Context) error {
 	}
 	t.mu.Lock()
 	t.projects = projects
-	t.custom = t.customRoutes(rs)
+	change := t.swapRoutesLocked(t.customRoutes(rs))
 	t.dropAllKeysLocked()
 	t.mu.Unlock()
+	change.deliver()
 	if t.onKeysDropped != nil {
 		t.onKeysDropped("")
 	}
@@ -171,14 +210,23 @@ func (t *table) reload(ctx context.Context) error {
 	return nil
 }
 
-// customRoutes indexes registry routes by host. Rows for a host the proxy owns
-// itself (a derived project host, api.<domain>, studio.<domain>) are ignored: no
-// route may take over another project's host or the control-plane hosts.
-func (t *table) customRoutes(rs []registry.Route) map[string]string {
+// customRoutes indexes registry routes by host, with each host's route kind. Rows for a host
+// the proxy owns itself (a derived project host, api.<domain>, studio.<domain>) are ignored: no
+// route may take over another project's host or the control-plane hosts. The one exception is a
+// vanity row (written by the domain store) for <name>.api.<domain> where name is a valid vanity
+// name, which cannot have the shape of a ref or be one of the reserved names.
+func (t *table) customRoutes(rs []registry.Route) (map[string]string, map[string]string) {
 	m := make(map[string]string, len(rs))
+	kinds := make(map[string]string, len(rs))
 	for _, r := range rs {
 		h := normalizeHost(r.Host)
 		if own := t.cfg.RefFromProjectHost(h); own != "" || h == t.cfg.APIHost() || h == t.cfg.StudioHost() {
+			if r.Kind == registry.RouteVanity && own != "" {
+				if n, err := domains.ValidateVanityName(own); err == nil && n == own {
+					m[h], kinds[h] = r.Ref, registry.RouteVanity
+					continue
+				}
+			}
 			// The lifecycle engine writes exactly such a row for every project (Kind "api",
 			// the derived host); it is redundant, not wrong. Only a row that points a
 			// derived or control-plane host at something else deserves a warning.
@@ -187,9 +235,9 @@ func (t *table) customRoutes(rs []registry.Route) map[string]string {
 			}
 			continue
 		}
-		m[h] = r.Ref
+		m[h], kinds[h] = r.Ref, r.Kind
 	}
-	return m
+	return m, kinds
 }
 
 // apply updates the table for one registry change.
@@ -225,8 +273,9 @@ func (t *table) apply(ctx context.Context, c registry.Change) {
 			return
 		}
 		t.mu.Lock()
-		t.custom = t.customRoutes(rs)
+		change := t.swapRoutesLocked(t.customRoutes(rs))
 		t.mu.Unlock()
+		change.deliver()
 	case "project_secrets":
 		t.invalidateKeys(c.Key)
 	}

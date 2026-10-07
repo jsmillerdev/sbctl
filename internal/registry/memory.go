@@ -18,11 +18,14 @@ type Memory struct {
 	secrets  map[string]map[string][]byte
 	tokens   []AccessToken
 	routes   map[string]Route
-	backups  []Backup
-	events   []Event
-	upgrades []Upgrade
-	nextID   int64
-	subs     map[chan Change]struct{}
+	// hostnames and vanity are the domain store (domains_mem.go), by project ref.
+	hostnames map[string]CustomHostname
+	vanity    map[string]VanitySubdomain
+	backups   []Backup
+	events    []Event
+	upgrades  []Upgrade
+	nextID    int64
+	subs      map[chan Change]struct{}
 }
 
 func NewMemory() *Memory {
@@ -297,6 +300,8 @@ func (m *Memory) DeleteProject(_ context.Context, ref string) error {
 		}
 	}
 	m.upgrades = kept
+	delete(m.hostnames, ref)
+	delete(m.vanity, ref)
 	for h, r := range m.routes {
 		if r.Ref == ref {
 			delete(m.routes, h)

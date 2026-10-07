@@ -79,7 +79,7 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveStudio(w http.ResponseWriter, r *http.Request) {
-	if answerStudioLocally(w, r) {
+	if s.answerCNAMECheck(w, r) || answerStudioLocally(w, r) {
 		return
 	}
 	s.forward(w, r, &target{
@@ -194,8 +194,17 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		// Realtime resolves the tenant from the first label of Host.
 		tg.host = config.RealtimeInternalHost(p.ref)
 	case svcStorage:
-		// Storage (MULTI_TENANT) resolves the tenant from x-forwarded-host only.
+		// Storage (MULTI_TENANT) resolves the tenant from x-forwarded-host only, so it always
+		// gets the project's derived host, whichever host the client used (a custom hostname
+		// or a vanity subdomain has no ref in it).
 		tg.fwdHost = s.cfg.ProjectHost(p.ref)
+		// An S3 client signs the host it connected to, and Storage checks that signature
+		// against x-forwarded-host unless S3_PROTOCOL_NON_CANONICAL_HOST_HEADER names another
+		// header (fleet sets it to config.StorageClientHostHeader): the client's own Host goes there.
+		if tg.set == nil {
+			tg.set = map[string]string{}
+		}
+		tg.set[config.StorageClientHostHeader] = r.Host
 	case svcFunctions:
 		if tg.set == nil {
 			tg.set = map[string]string{}
