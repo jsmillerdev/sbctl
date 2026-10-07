@@ -369,3 +369,46 @@ func TestRedactIsStable(t *testing.T) {
 		t.Fatal("Redact is the hex SHA-256")
 	}
 }
+
+func TestRenderEdgeCases(t *testing.T) {
+	m, _ := newManager(t)
+	patch(t, m, Auth, map[string]any{
+		"db_max_pool_size": float64(10), "db_max_pool_size_unit": "percent",
+		"sessions_timebox": float64(0), "sessions_inactivity_timeout": 1.5,
+		"api_max_request_duration": float64(30), "password_required_characters": "",
+		"external_x_enabled": true, "external_x_client_id": "xid", "external_x_secret": "xs",
+		"mfa_phone_max_frequency": float64(45),
+	})
+	env, _ := m.AuthEnv(context.Background(), ref, "https://abc.api.example.com/auth/v1/")
+	want := map[string]string{
+		"GOTRUE_DB_CONN_PERCENTAGE": "10", "GOTRUE_DB_MAX_POOL_SIZE": "", // "" removes the unit's own value
+		"GOTRUE_SESSIONS_INACTIVITY_TIMEOUT": "1.5h", "GOTRUE_API_MAX_REQUEST_DURATION": "30s",
+		"GOTRUE_EXTERNAL_X_ENABLED": "true", "GOTRUE_EXTERNAL_X_CLIENT_ID": "xid", "GOTRUE_MFA_PHONE_MAX_FREQUENCY": "45s",
+		"GOTRUE_EXTERNAL_X_REDIRECT_URI": "https://abc.api.example.com/auth/v1/callback",
+	}
+	for k, v := range want {
+		if got, ok := env[k]; !ok || got != v {
+			t.Errorf("%s = %q (present %v), want %q", k, got, ok, v)
+		}
+	}
+	if _, ok := env["GOTRUE_SESSIONS_TIMEBOX"]; ok {
+		t.Error("a zero timebox must not render: GoTrue refuses it")
+	}
+}
+
+func TestSecretsAreNeverRenderedForOtherServices(t *testing.T) {
+	m, _ := newManager(t)
+	patch(t, m, Auth, map[string]any{"external_github_enabled": true, "external_github_client_id": "id", "external_github_secret": "very-secret"})
+	rest, _ := m.PostgRESTEnv(context.Background(), ref)
+	pg, _ := m.PostgresSettings(context.Background(), ref)
+	for _, v := range rest {
+		if strings.Contains(v, "very-secret") {
+			t.Fatal("a secret leaked into PostgREST's environment")
+		}
+	}
+	for _, s := range pg {
+		if strings.Contains(s, "very-secret") {
+			t.Fatal("a secret leaked into the server arguments")
+		}
+	}
+}

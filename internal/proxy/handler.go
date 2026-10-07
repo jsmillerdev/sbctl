@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -65,6 +66,12 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.opts.APIHandler == nil {
 		writeJSON(w, http.StatusServiceUnavailable, "Management API is not available")
+		return
+	}
+	// /internal/ is for the loopback listener (a project's GoTrue fetching its mail
+	// templates); nothing that arrives through the edge may reach it, whoever the client is.
+	if c := path.Clean("/" + r.URL.Path); c == "/internal" || strings.HasPrefix(c, "/internal/") {
+		writeJSON(w, http.StatusNotFound, "Not Found")
 		return
 	}
 	s.opts.APIHandler.ServeHTTP(w, r)

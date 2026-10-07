@@ -202,6 +202,25 @@ func TestAPIAndStudioHosts(t *testing.T) {
 	}
 }
 
+// The loopback-only /internal/ routes of the Management API (mail templates for GoTrue) are
+// not reachable through the edge, even for a client on the node itself.
+func TestInternalRoutesAreNotServedThroughTheEdge(t *testing.T) {
+	h := newHarness(t)
+	for _, p := range []string{"/internal/templates/x/y", "/internal", "/internal/", "/v1/../internal/templates/x/y"} {
+		if resp, _ := h.req("GET", "api."+testDomain, p); resp.StatusCode != 404 {
+			t.Errorf("GET %s: %d, want 404", p, resp.StatusCode)
+		}
+		select {
+		case hit := <-h.apiHit:
+			t.Errorf("GET %s reached the Management API (%s)", p, hit)
+		default:
+		}
+	}
+	if resp, _ := h.req("GET", "api."+testDomain, "/v1/projects"); resp.StatusCode != http.StatusTeapot {
+		t.Errorf("an ordinary API path must still reach the handler: %d", resp.StatusCode)
+	}
+}
+
 func TestCORS(t *testing.T) {
 	h := newHarness(t)
 	// Preflight is answered by the proxy, without a key and without reaching the upstream.
