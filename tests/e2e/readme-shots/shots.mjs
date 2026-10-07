@@ -79,6 +79,12 @@ async function newPage(theme) {
   page.setDefaultTimeout(30_000)
   page.__bad = []
   page.__console = []
+  page.__net = []
+  page.on('requestfailed', (r) => page.__net.push(`FAILED ${r.method()} ${r.url().slice(0, 160)} ${r.failure()?.errorText}`))
+  page.on('response', (r) => {
+    page.__net.push(`${r.status()} ${r.request().method()} ${r.url().slice(0, 160)}`)
+    if (r.request().resourceType() === 'document') page.__net.push(`  csp: ${(r.headers()['content-security-policy'] ?? '').slice(0, 1500)}`)
+  })
   page.on('response', (r) => { if (r.status() >= 400 && !/\/(_next|api\/(incident-banner|get-utc-time))/.test(r.url())) page.__bad.push(`${r.status()} ${r.request().method()} ${new URL(r.url()).pathname}`) })
   page.on('console', (m) => m.type() === 'error' && page.__console.push(m.text().slice(0, 200)))
   return { ctx, page }
@@ -110,6 +116,7 @@ async function capture(page, shot, theme) {
   const tag = `${shot.name}-${theme}`
   page.__bad.length = 0
   page.__console.length = 0
+  page.__net.length = 0
   const problems = []
   try {
     await page.goto(`${STUDIO}${shot.path}`, { waitUntil: 'domcontentloaded' })
@@ -136,7 +143,7 @@ async function capture(page, shot, theme) {
     writeFileSync(join(DEBUG, `${tag}.txt`), [
       `url: ${page.url()}`, `problems: ${problems.join('; ') || 'none'}`, `toasts: ${JSON.stringify(toasts)}`,
       `bad responses: ${[...new Set(page.__bad)].slice(0, 20).join(' ; ')}`, `console errors: ${[...new Set(page.__console)].slice(0, 10).join(' ; ')}`,
-      '--- text ---', text.slice(0, 4000),
+      '--- text ---', text.slice(0, 4000), '--- network ---', ...page.__net.slice(-150),
     ].join('\n'))
     results.push({ shot: tag, ok: !problems.length, problems })
     log(problems.length ? `FAIL ${tag}: ${problems.join('; ')}` : `ok   ${tag}`)
@@ -152,6 +159,7 @@ for (const theme of THEMES) {
   const { ctx, page } = await newPage(theme)
   try {
     await signIn(page)
+    writeFileSync(join(DEBUG, `sign-in-${theme}.txt`), [`url: ${page.url()}`, ...page.__net.slice(-100)].join('\n'))
   } catch (e) {
     await page.screenshot({ path: join(DEBUG, `ERROR-sign-in-${theme}.png`) }).catch(() => {})
     log(`sign-in failed (${theme}): ${e.message.split('\n')[0]}`)
