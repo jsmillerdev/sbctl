@@ -1048,3 +1048,19 @@ func TestSSOSessionsMeetTheMFARequirement(t *testing.T) {
 		t.Fatalf("a password session without a second factor: %d", rec.Code)
 	}
 }
+
+// Studio's form may send the metadata address and the document: the address wins.
+func TestOrgSSOCreateTakesTheAddressWhenBothAreSent(t *testing.T) {
+	f := newSSOFixture(t)
+	rec := f.as("owner", "POST", orgSSO, map[string]any{
+		"enabled": true, "metadata_xml_url": "https://idp.acme.test/metadata.xml", "metadata_xml_file": testIdPMetadata(otherIdP),
+		"domains": []string{"acme.test"}, "email_mapping": []string{"email"}, "join_org_on_signup_enabled": false,
+	})
+	if rec.Code != 201 || jsonField(t, rec, "metadata_xml_url") != "https://idp.acme.test/metadata.xml" {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	got, err := f.srv.sso.List(context.Background(), f.org.ID)
+	if err != nil || len(got) != 1 || got[0].SAML.EntityID != "https://idp.acme.test" {
+		t.Fatalf("GoTrue registered the document instead of the address: %+v %v", got, err)
+	}
+}

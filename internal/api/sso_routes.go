@@ -222,8 +222,12 @@ func (s *Server) orgSSOCreate(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	md := sso.Metadata{URL: in.MetadataXMLURL, XML: in.MetadataXMLFile}
+	if md.URL != "" {
+		md.XML = "" // the address wins when the page sends both: GoTrue refreshes it
+	}
 	p, err := s.sso.Add(r.Context(), actor, AddProvider{
-		Org: orgRef(org), Metadata: sso.Metadata{URL: in.MetadataXMLURL, XML: in.MetadataXMLFile},
+		Org: orgRef(org), Metadata: md,
 		Domains: in.Domains, DefaultRole: role, AttributeMapping: in.attributeMapping(), CreatedBy: principalFrom(r.Context()).UserID,
 		Disabled: in.Enabled != nil && !*in.Enabled,
 	})
