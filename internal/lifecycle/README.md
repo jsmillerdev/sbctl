@@ -98,6 +98,7 @@ pending restart); no migration is needed.
   the pause is flagged `Recovered.Resume`, and `ResumeRecovered` brings the project back; a stale
   request on a project that is not paused is cleared. `RESTORING` is not touched. Each move is a
   `project.recovered` event.
+- In-place restore (`restore.go`): `Engine.BeginRestore` (the optional `DatabaseRestorer` capability of the Manager; the Management API's backup routes use it) moves an `ACTIVE_*` or `RESTORE_FAILED` project to `RESTORING` under the project lock and returns a handle whose `Run` calls the backup service's `RestoreInPlace` (`InPlaceRestorer`, found through `Options.Backup`; the late backuper checks beforehand that the backend opens, `ErrNoRestorer` otherwise). The service pauses and resumes the project through this Engine with a context marked as a restore, and `Pause` and `Resume` then accept `RESTORING` and leave the status alone, so the project stays `RESTORING` from the first call to the end. `BeginRestore` first checks that the disk can hold the restored copy next to the current data (`ErrInsufficientDisk`, 409 through the API; skipped when the free space cannot be read). After a restore that worked, `Run` sets the cluster's role passwords to the registry's again (`rolePasswordPlane`, which `PostgresPlane` implements; a failure is logged and recorded as `restore.passwords_failed`, the restore stands) and prunes the leftovers of earlier restores (`restore_space.go`): the newest `data.pre-restore-*` stays, older ones and all `data.failed-restore-*` go; after a failure only older `data.failed-restore-*` go. `Run` settles it: `ACTIVE_HEALTHY` after a restore, `RESTORE_FAILED` after a failure, whether or not the original data is running again (a status that went back to `ACTIVE_HEALTHY` would look like a restore that worked to Studio's restore screen and to API clients). `Health` leaves `RESTORE_FAILED` alone; another restore, `Pause` (then `Resume`, which is what a restart does) and `Delete` move the project on, and a `Pause` that fails keeps the status. Every other operation refuses a `RESTORING` project (`ErrInvalidState`), and `Delete` also refuses one whose restore runs in this process; a project left `RESTORING` by a stopped daemon can be deleted. `restore.requested` is the event.
 - Backup timers: with the systemd backend the Engine starts `supavise-basebackup@<ref>.timer` when
   a project becomes active (create, resume, start) and stops it on pause and delete
   (`Options.Timers`; failures are logged, never fatal). The timers are not enabled for boot;
@@ -214,8 +215,10 @@ removed on exit.
 
 ## Not done
 
-- `Recover` does not finish an interrupted restore (`RESTORING`), and a delete interrupted by a
-  version that recorded no events (`GOING_DOWN` with no `project.delete_started`) is only logged.
+- `Recover` does not finish an interrupted restore (`RESTORING`): the project stays `RESTORING`, the data
+  directory the restore moved aside is `<dir>.pre-restore-<time>`, and an operator decides
+  (`internal/backup/README.md`, "Restore"). A delete interrupted by a version that recorded no events
+  (`GOING_DOWN` with no `project.delete_started`) is only logged.
 - `pg_hba.conf` is rewritten on start but a changed file is not reloaded in a running cluster.
 - Fleet tenant calls are a hook (`Options.Fleet`); the services themselves are the fleet
   workstream's.

@@ -172,6 +172,37 @@ jobs:
           path: /tmp/supavise-settings-logs
           if-no-files-found: ignore
 
+  # Backups and point-in-time restore through the Management API under systemd: the backup list
+  # and the PITR add-on, a restore to a time between two writes (RESTORING, a second restore refused,
+  # ACTIVE_HEALTHY, the data of that time), then a restore from the listed base backup.
+  backups-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
+      - name: backups smoke
+        run: sudo LOG_DIR=/tmp/supavise-backups-logs SUPAVISE_BIN=/tmp/supavise tests/linux/backups-smoke.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/supavise-backups-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backups-smoke-${{ matrix.arch }}
+          path: /tmp/supavise-backups-logs
+          if-no-files-found: ignore
+
   # Members and roles under systemd: users with each role, Studio's permission list, a Read-only
   # PAT refused writes through the API, the real MCP server and Supabase CLI, invitations by mail.
   roles-smoke:

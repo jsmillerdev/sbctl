@@ -76,6 +76,10 @@ type Engine struct {
 	log   *slog.Logger
 
 	locks sync.Map // ref -> *sync.Mutex
+	// restoring holds the refs whose in-place restore is running in this process (restore.go).
+	restoring sync.Map
+	// freeBytes reads the free space of the disk holding a path (-1: unknown); tests replace it.
+	freeBytes func(path string) int64
 }
 
 var _ Manager = (*Engine)(nil)
@@ -88,7 +92,7 @@ func NewEngine(cfg *config.Config, reg registry.Registry, sec secrets.Secrets, a
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	return &Engine{cfg: cfg, reg: reg, sec: sec, arts: arts, plane: plane, opts: opts, log: opts.Log}
+	return &Engine{cfg: cfg, reg: reg, sec: sec, arts: arts, plane: plane, opts: opts, log: opts.Log, freeBytes: diskFree}
 }
 
 // advisoryPool is implemented by the Postgres registry; the in-memory one has no
@@ -451,19 +455,25 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	if ref == config.SystemRef || !active(p.Status) {
+	// A project whose restore failed can be paused, and resumed after: the way back to ACTIVE_HEALTHY
+	// when the original data is intact.
+	if ref == config.SystemRef || !(active(p.Status) || p.Status == registry.StatusRestoreFailed || inRestore(ctx, p)) {
 		return invalidState(p, "pause")
 	}
-	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusPausing); err != nil {
+	if err := e.setStatus(ctx, ref, registry.StatusPausing); err != nil {
 		return err
 	}
 	e.stopTimer(ctx, ref)
 	e.quiesce(ctx, ref)
 	if err := e.plane.Stop(ctx, ref); err != nil {
-		_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, registry.StatusActiveUnhealthy)
+		back := registry.StatusActiveUnhealthy
+		if p.Status == registry.StatusRestoreFailed {
+			back = p.Status
+		}
+		_ = e.setStatus(context.WithoutCancel(ctx), ref, back)
 		return fmt.Errorf("lifecycle: pause %s: %w", ref, err)
 	}
-	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusInactive); err != nil {
+	if err := e.setStatus(ctx, ref, registry.StatusInactive); err != nil {
 		return err
 	}
 	e.event(ctx, ref, "project.paused", nil)
@@ -482,14 +492,14 @@ func (e *Engine) Resume(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	if ref == config.SystemRef || p.Status != registry.StatusInactive {
+	if ref == config.SystemRef || !(p.Status == registry.StatusInactive || inRestore(ctx, p)) {
 		return invalidState(p, "resume")
 	}
 	keys, err := e.loadKeys(ctx, ref)
 	if err != nil {
 		return err
 	}
-	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusComingUp); err != nil {
+	if err := e.setStatus(ctx, ref, registry.StatusComingUp); err != nil {
 		return err
 	}
 	if err := e.plane.Start(ctx, p, keys); err != nil {
@@ -498,7 +508,7 @@ func (e *Engine) Resume(ctx context.Context, ref string) error {
 		if serr := e.plane.Stop(cctx, ref); serr != nil {
 			e.log.Warn("resume: stop after failed start", "ref", ref, "error", serr)
 		}
-		_ = e.reg.SetProjectStatus(cctx, ref, registry.StatusInactive)
+		_ = e.setStatus(cctx, ref, registry.StatusInactive)
 		e.event(cctx, ref, "project.resume_failed", map[string]string{"error": err.Error()})
 		return fmt.Errorf("lifecycle: resume %s: %w", ref, err)
 	}
@@ -506,7 +516,7 @@ func (e *Engine) Resume(ctx context.Context, ref string) error {
 	if err := e.reg.PutRoute(ctx, registry.Route{Host: e.cfg.ProjectHost(ref), Ref: ref, Kind: "api"}); err != nil {
 		e.log.Warn("resume: route", "ref", ref, "error", err)
 	}
-	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusActiveHealthy); err != nil {
+	if err := e.setStatus(ctx, ref, registry.StatusActiveHealthy); err != nil {
 		return err
 	}
 	e.startTimer(ctx, ref)
@@ -536,6 +546,11 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	}
 	if ref == config.SystemRef {
 		return fmt.Errorf("%w: the system project cannot be deleted", ErrInvalidState)
+	}
+	if _, busy := e.restoring.Load(ref); busy {
+		// A restore that is not running here (the daemon died during one) leaves the status
+		// RESTORING with nothing in this map, and that project can still be deleted.
+		return fmt.Errorf("%w: cannot delete %s while a restore is running on it", ErrInvalidState, ref)
 	}
 	if kids, err := e.branchesOf(ctx, ref); err != nil {
 		return err

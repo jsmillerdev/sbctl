@@ -36,6 +36,7 @@ const (
 	StatusPausing         Status = "PAUSING"
 	StatusInactive        Status = "INACTIVE" // paused
 	StatusRestoring       Status = "RESTORING"
+	StatusRestoreFailed   Status = "RESTORE_FAILED" // an in-place restore failed; see lifecycle.Restore
 	StatusRestarting      Status = "RESTARTING"
 	StatusUpgrading       Status = "UPGRADING"
 	StatusGoingDown       Status = "GOING_DOWN"

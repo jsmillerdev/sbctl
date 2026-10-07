@@ -68,6 +68,11 @@ type Deps struct {
 	// StudioRefresh re-renders Studio's unit after the dashboard gained its first SSO provider
 	// or lost its last (fleet.Manager.RefreshStudio). Nil: nothing is told.
 	StudioRefresh func(ctx context.Context) error
+	// Backups lists the base backups and the restorable span of a project (the Backups pages of
+	// the dashboard, the Management API's backup list and restores); *backup.Service implements
+	// it. Nil means the node has no backup service: the list is empty, PITR is off and restores
+	// are refused. Restores also need a Manager that is a lifecycle.DatabaseRestorer.
+	Backups BackupSource
 	// CreateWait bounds how long POST /v1/projects waits for the new project to show
 	// up in the registry before answering 201 COMING_UP. Zero means 10 seconds.
 	CreateWait time.Duration
@@ -79,6 +84,7 @@ type Server struct {
 	sec      secrets.Secrets
 	mgr      lifecycle.Manager
 	branches *branching.Service
+	backups  BackupSource
 	cfg      *config.Config
 	log      *slog.Logger
 	store    Store
@@ -155,8 +161,10 @@ func (s *Server) beginOp() (func(), error) {
 // Drain stops the server from starting lifecycle operations (they answer 503) and waits
 // until the ones in flight have finished or ctx ends. Call it when shutdown begins and
 // close the registry only after it returns. A nil error means nothing is left running;
-// otherwise the error says how many operations were cut off, and lifecycle.Engine.Recover
-// finishes or reverts them at the next start.
+// otherwise the error says how many operations were cut off. lifecycle.Engine.Recover
+// finishes or reverts most of them at the next start, but not a restore: that project stays
+// RESTORING until an operator settles it (internal/backup/README.md), so a restart during
+// one is to be avoided.
 func (s *Server) Drain(ctx context.Context) error {
 	s.ops.mu.Lock()
 	s.ops.draining = true
@@ -197,7 +205,7 @@ func NewServer(d Deps) (*Server, error) {
 		return nil, fmt.Errorf("api: Deps needs Registry, Secrets, Manager and Config")
 	}
 	s := &Server{
-		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, branches: d.Branching, cfg: d.Config, log: d.Logger, store: d.Store,
+		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, branches: d.Branching, backups: d.Backups, cfg: d.Config, log: d.Logger, store: d.Store,
 		hc: d.HTTPClient, now: d.Now, fnHook: d.Functions, pgmetaURL: d.PGMetaURL, upstreamOverride: d.Upstream, createWait: d.CreateWait,
 		pgmetaKeyMu: make(chan struct{}, 1), roEnsured: map[string]readOnlyEnsured{},
 	}
@@ -327,6 +335,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesDatabase(add)
 	s.routesFunctions(add)
 	s.routesPlatformProject(add)
+	s.routesBackups(add)
 	s.routesContent(add)
 	s.routesProxies(add)
 	s.routesLogin(add)

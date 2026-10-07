@@ -91,9 +91,11 @@ var contentActions = []string{
 
 var writeActions = []string{ActCreate, ActUpdate, ActDelete}
 
-// developerInfra are the infra:Execute resources a Developer holds: restarting the project and
-// restoring backups.
-var developerInfra = []string{"reboot", "queue_job.walg.prepare_restore", "queue_job.restore.prepare"}
+// developerInfra are the infra:Execute resources a Developer holds: restarting the project.
+// Restoring a backup or a point in time (queue_job.restore.prepare and
+// queue_job.walg.prepare_restore, which Studio checks before it offers the buttons) stays with
+// Owners and Administrators, because it overwrites the production data.
+var developerInfra = []string{"reboot"}
 
 // ownContent conditions a write on saved content to the caller's own items, the check Studio
 // makes by passing the item's owner_id and the signed-in profile id as subject.id. extra, when
@@ -151,8 +153,10 @@ func roleEntries(role int, ownerRoleIDs []int64) []Permission {
 			perm([]string{ActCreate}, []string{ResUserContent}, false),
 			ownContent(perm([]string{ActUpdate, ActDelete}, []string{ResUserContent}, false), nil),
 			perm(writeActions, []string{ResPreviewBranches}, false),
-			// Hosted lists Restart and the backup restores for Developers; Pause, Restore and
-			// Delete stay with Administrators.
+			// Hosted lists Restart for Developers; Pause, Restore and Delete stay with
+			// Administrators. Hosted also lists the backup restores for Developers; Supavise
+			// keeps them for Owners and Administrators on purpose, because a restore
+			// overwrites the project's data.
 			perm([]string{ActInfraExecute}, developerInfra, false),
 		}
 	case RoleReadOnly:

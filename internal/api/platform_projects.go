@@ -242,7 +242,6 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 func (s *Server) routesPlatformProject(add func(string, handlerFunc)) {
 	add("GET /platform/projects/{ref}/settings", s.platformSettings)
 	add("POST /platform/projects/{ref}/api-keys/temporary", s.temporaryKey)
-	add("GET /platform/database/{ref}/backups", s.platformBackups)
 	add("GET /platform/projects/{ref}/config/pgbouncer", s.pgbouncerConfig)
 	add("PATCH /platform/projects/{ref}/config/pgbouncer", s.patchPgbouncer)
 	add("GET /platform/projects/{ref}/config/supavisor", s.v1Pooler)
@@ -326,19 +325,5 @@ func (s *Server) temporaryKey(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	writeJSON(w, http.StatusCreated, &plat.TemporaryApiKeyResponseOutput{ApiKey: tok})
-	return nil
-}
-
-// platformBackups reports no backups: base backups are managed by supavise itself and
-// have no dashboard representation yet.
-func (s *Server) platformBackups(w http.ResponseWriter, r *http.Request) error {
-	if _, err := s.loadProject(r.Context(), r.PathValue("ref")); err != nil {
-		return err
-	}
-	resp := base("GET /platform/database/{ref}/backups")
-	set(resp, "backups", []any{})
-	set(resp, "pitr_enabled", false)
-	set(resp, "walg_enabled", false)
-	writeJSON(w, http.StatusOK, resp)
 	return nil
 }

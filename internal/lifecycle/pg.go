@@ -49,7 +49,7 @@ func pathsFor(cfg *config.Config, ref string, port int) pgPaths {
 	dir := cfg.Paths().ProjectService(ref, config.SvcPostgres)
 	p := pgPaths{
 		Dir:     dir,
-		Data:    dir + "/data",
+		Data:    cfg.Paths().PostgresData(ref),
 		Sock:    dir + "/sock",
 		HBA:     dir + "/pg_hba.conf",
 		RootKey: dir + "/pgsodium_root.key",

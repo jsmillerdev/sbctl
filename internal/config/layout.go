@@ -154,6 +154,11 @@ func (p Paths) Project(ref string) string { return filepath.Join(p.Root, "projec
 func (p Paths) ProjectService(ref, svc string) string {
 	return filepath.Join(p.Root, "projects", ref, svc)
 }
+
+// PostgresData is a project's PGDATA: the data directory a restore replaces.
+func (p Paths) PostgresData(ref string) string {
+	return filepath.Join(p.ProjectService(ref, SvcPostgres), "data")
+}
 func (p Paths) EnvFile(ref, svc string) string {
 	return filepath.Join(p.Root, "projects", ref, svc+".env")
 }

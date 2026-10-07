@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -49,6 +50,20 @@ type fakeManager struct {
 	pwErr     error
 	// hook, when set, runs inside Pause, Resume and Delete before they act.
 	hook func(op string, ctx context.Context)
+	// restores receives one record per finished restore; gate, when set, holds Run until it is
+	// closed or sent to; restoreErr is what Run returns, beginErr what BeginRestore returns.
+	restores   chan restoreRecord
+	gate       chan struct{}
+	restoreErr error
+	beginErr   error
+}
+
+// restoreRecord is one restore the fakeManager ran.
+type restoreRecord struct {
+	ref string
+	req lifecycle.RestoreRequest
+	// deadline is whether the context Run got carried a deadline.
+	deadline bool
 }
 
 func (m *fakeManager) observe(op string, ctx context.Context) {
@@ -125,6 +140,53 @@ func (m *fakeManager) Resume(ctx context.Context, ref string) error {
 	m.resumed = append(m.resumed, ref)
 	m.mu.Unlock()
 	return m.reg.SetProjectStatus(ctx, ref, registry.StatusActiveHealthy)
+}
+
+// BeginRestore makes fakeManager a lifecycle.DatabaseRestorer: like the Engine it refuses a
+// project that is not active, and holds it RESTORING until Run ends.
+func (m *fakeManager) BeginRestore(ctx context.Context, ref string) (lifecycle.RestoreRun, error) {
+	m.mu.Lock()
+	err := m.beginErr
+	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	p, err := m.reg.GetProject(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy && p.Status != registry.StatusRestoreFailed {
+		return nil, fmt.Errorf("%w: cannot restore %s while it is %s", lifecycle.ErrInvalidState, ref, p.Status)
+	}
+	if err := m.reg.SetProjectStatus(ctx, ref, registry.StatusRestoring); err != nil {
+		return nil, err
+	}
+	return &fakeRestore{m: m, ref: ref}, nil
+}
+
+type fakeRestore struct {
+	m   *fakeManager
+	ref string
+}
+
+func (r *fakeRestore) Run(ctx context.Context, req lifecycle.RestoreRequest) error {
+	m := r.m
+	m.mu.Lock()
+	gate, err, out := m.gate, m.restoreErr, m.restores
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	status := registry.StatusActiveHealthy
+	if err != nil {
+		status = registry.StatusRestoreFailed
+	}
+	_ = m.reg.SetProjectStatus(context.WithoutCancel(ctx), r.ref, status)
+	if out != nil {
+		_, hasDeadline := ctx.Deadline()
+		out <- restoreRecord{ref: r.ref, req: req, deadline: hasDeadline}
+	}
+	return err
 }
 
 func (m *fakeManager) Delete(ctx context.Context, ref string) error {

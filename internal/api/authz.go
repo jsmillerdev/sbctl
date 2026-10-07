@@ -211,6 +211,11 @@ var routeRules = []routeRule{
 	rule("POST", "/v1/projects/{ref}/restart", chk(members.ActInfraExecute, "reboot")),
 	rule("POST", "/platform/projects/{ref}/restart", chk(members.ActInfraExecute, "reboot")),
 	rule("POST", "/platform/projects/{ref}/restart-services", chk(members.ActInfraExecute, "reboot")),
+	// Restores overwrite production data: Owners and Administrators (the resources Studio checks
+	// before it offers the Restore button of a listed backup and the point-in-time form).
+	rule("POST", "/platform/database/{ref}/backups/restore", chk(members.ActInfraExecute, "queue_job.restore.prepare")),
+	rule("POST", "/platform/database/{ref}/backups/restore-physical", chk(members.ActInfraExecute, "queue_job.restore.prepare")),
+	rule("POST", "/v1/projects/{ref}/database/backups/restore", chk(members.ActInfraExecute, "queue_job.restore.prepare")),
 	rule("W", "/platform/database/{ref}/backups/**", chk(members.ActInfraExecute, "queue_job.walg.prepare_restore")),
 	rule("W", "/v1/projects/{ref}/database/backups/**", chk(members.ActInfraExecute, "queue_job.walg.prepare_restore")),
 	rule("W", "/v1/projects/{ref}/restore/**", chk(members.ActInfraExecute, "queue_job.restore.prepare")),
