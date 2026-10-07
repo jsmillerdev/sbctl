@@ -58,6 +58,9 @@ must() { # STATUS METHOD PATH [BODY]
   got=$(code "$2" "$3" "${4:-}")
   [[ $got == "$want" ]] || { log "response: $(papi "$2" "$3" ${4:+-H 'Content-Type: application/json' -d "$4"} | head -c 400)"; fail "$2 $3 answered $got, want $want"; }
 }
+# restore_failed prints the daemon's log line of a restore that failed (the project then returns to
+# ACTIVE_HEALTHY on its original data, so the status alone does not tell).
+restore_failed() { journalctl --no-pager -u supavise.service 2>/dev/null | grep 'msg="restore failed"' | tail -1 || true; }
 wait_status() { # STATUS SECONDS
   local want=$1 n=${2:-600} i s=""
   for ((i = 0; i < n; i++)); do
@@ -118,6 +121,7 @@ must 201 POST "$CFG/database/backups/restore-pitr" "{\"recovery_time_target_unix
 must 409 POST "$CFG/database/backups/restore-pitr" "{\"recovery_time_target_unix\":$T}"
 must 409 POST "$CFG/pause"
 wait_status ACTIVE_HEALTHY 900
+[[ -z $(restore_failed) ]] || fail "the restore failed: $(restore_failed)"
 GOT=$(rows)
 [[ $GOT == one,two ]] || fail "after the restore to T the rows are '$GOT', want one,two"
 supavise projects health "$REF" || fail "$REF is not healthy after the restore"
@@ -131,6 +135,7 @@ log "restore the state of the first listed base backup (id $FIRST_ID)"
 must 201 POST "$CFG/database/backups/restore" "{\"id\":$FIRST_ID}"
 [[ $(status) == RESTORING ]] || fail "the project is $(status) right after the restore began, want RESTORING"
 wait_status ACTIVE_HEALTHY 900
+[[ -z $(restore_failed) ]] || fail "the restore failed: $(restore_failed)"
 GOT=$(rows)
 [[ $GOT == one ]] || fail "after the restore of the first base backup the rows are '$GOT', want one"
 
