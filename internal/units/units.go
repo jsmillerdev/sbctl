@@ -5,7 +5,6 @@ package units
 import (
 	"bytes"
 	"context"
-	"strings"
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
@@ -67,51 +66,9 @@ func EgressAllow() []IPRange {
 	return []IPRange{{Family: 2, Addr: []byte{127, 0, 0, 1}, Prefix: 32}, {Family: 10, Addr: v6, Prefix: 128}}
 }
 
-// EgressHiddenPaths are the unix sockets and directories a unit with a denied egress policy
-// cannot open, as InaccessiblePaths= entries (a leading "-" skips a path the host does not
-// have). The IP filter does not cover AF_UNIX, and these are the ways out of it on a host: the
-// resolver's varlink socket under /run/systemd/resolve (glibc reaches it through nss-resolve and
-// resolves names for the unit, the default on Fedora and Arch), the D-Bus system bus (a polkit
-// rule of sbctl's would let the unit lift its own IPAddressDeny) and nscd's socket. It is added
-// to the unit's own InaccessiblePaths (the master key), and takes effect when the unit starts.
-// A unit that also needs /etc/resolv.conf's target (a symlink into /run/systemd/resolve on
-// Ubuntu) gets no name resolution, which a unit without egress does not need.
-func EgressHiddenPaths() []string {
-	return []string{"-/run/systemd/resolve", "-/run/dbus", "-/run/nscd"}
-}
-
-// postgresInaccessible is what deploy/systemd/sb-postgres@.service hides itself
-// (TestTemplatesContainment keeps the two equal). Lifting the egress paths means resetting
-// the property, which drops the unit file's own entries too, so they are set again.
-func postgresInaccessible() []string { return []string{"-/etc/sbctl/master.key"} }
-
-// pathKey is a path as the D-Bus property shows it, without the "-" (ignore) and "+" prefixes.
-func pathKey(p string) string { return strings.TrimLeft(p, "-+") }
-
-// hidesPaths reports whether the InaccessiblePaths value of a loaded unit lists every one of
-// want (all=true) or at least one of them (all=false).
-func hidesPaths(v interface{}, want []string, all bool) bool {
-	have := map[string]bool{}
-	if l, ok := v.([]string); ok {
-		for _, p := range l {
-			have[pathKey(p)] = true
-		}
-	}
-	found := false
-	for _, w := range want {
-		if have[pathKey(w)] {
-			found = true
-		} else if all {
-			return false
-		}
-	}
-	return found || all
-}
-
 // egressMatches reports whether props (the Service-type properties of a loaded unit, as the D-Bus
 // client returns them) already carry exactly the egress policy deny asks for: IPAddressDeny and
-// IPAddressAllow equal to EgressDeny and EgressAllow and InaccessiblePaths listing EgressHiddenPaths, or none
-// of that when deny is false. A unit
+// IPAddressAllow equal to EgressDeny and EgressAllow, or both empty when deny is false. A unit
 // that was confined by an earlier release with the wider 127.0.0.0/8 allow does not match, so
 // the next Render narrows it. A value of a shape it does not know counts as not matching:
 // setting the properties again is harmless.
@@ -120,13 +77,7 @@ func egressMatches(props map[string]interface{}, deny bool) bool {
 	if deny {
 		wantDeny, wantAllow = EgressDeny(), EgressAllow()
 	}
-	if !sameRanges(decodeRanges(props["IPAddressDeny"]), wantDeny) || !sameRanges(decodeRanges(props["IPAddressAllow"]), wantAllow) {
-		return false
-	}
-	if deny {
-		return hidesPaths(props["InaccessiblePaths"], EgressHiddenPaths(), true)
-	}
-	return !hidesPaths(props["InaccessiblePaths"], EgressHiddenPaths(), false)
+	return sameRanges(decodeRanges(props["IPAddressDeny"]), wantDeny) && sameRanges(decodeRanges(props["IPAddressAllow"]), wantAllow)
 }
 
 // decodeRanges reads an a(iayu) property: a list of [family, address bytes, prefix].

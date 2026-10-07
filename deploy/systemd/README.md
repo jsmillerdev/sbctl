@@ -73,7 +73,11 @@ directory with an empty tmpfs, and the unit gets back only:
 
 No template binds a project or system directory as a whole, and none needs to read an
 environment file: systemd (PID 1) reads `EnvironmentFile=` before it builds the namespace.
-The Postgres template hides only `/etc/sbctl/master.key`, because `archive_command`
+The Postgres template hides `/etc/sbctl/master.key` and three unix sockets (systemd-resolved's
+`/run/systemd/resolve/io.systemd.Resolve`, the D-Bus system bus and nscd's socket), which are the
+ways out of the IP filter of a branch with denied egress (`IPAddressDeny` does not cover unix
+sockets; systemd 255 cannot change `InaccessiblePaths` of a unit over D-Bus, so the template hides them for every
+Postgres unit, which does not need them). It does not hide `/etc/sbctl` as a whole, because `archive_command`
 (`sbctl wal push`) reads `config.toml` for the backend. **That makes `/etc/sbctl/config.toml`
 readable by every project's Postgres, and with it whatever secrets it holds:
 `backup.s3_secret_access_key` (and the access key id) and the DNS-01 provider credentials in

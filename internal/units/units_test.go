@@ -418,11 +418,10 @@ func TestTemplatesContainment(t *testing.T) {
 		if strings.Contains(line(body, "InaccessiblePaths"), ".env") {
 			t.Errorf("%s still hides sibling environment files (denylist); use the allowlist", name)
 		}
-		if svc == "postgres" && line(body, "InaccessiblePaths") != "-/etc/sbctl/master.key" {
-			t.Errorf("%s must hide the master key only (config.toml is read by archive_command)", name)
-		}
-		if svc == "postgres" && strings.Join(postgresInaccessible(), " ") != line(body, "InaccessiblePaths") {
-			t.Errorf("%s: postgresInaccessible() = %v differs from the unit file; lifting an egress policy would change what the unit hides", name, postgresInaccessible())
+		// The master key but not config.toml (archive_command reads it), and the three unix sockets
+		// that are the ways out of a branch's IP filter (IPAddressDeny does not cover AF_UNIX).
+		if svc == "postgres" && line(body, "InaccessiblePaths") != "-/etc/sbctl/master.key -/run/systemd/resolve/io.systemd.Resolve -/run/dbus/system_bus_socket -/run/nscd/socket" {
+			t.Errorf("%s: InaccessiblePaths = %q", name, line(body, "InaccessiblePaths"))
 		}
 	}
 }
@@ -464,13 +463,7 @@ func TestEgressMatches(t *testing.T) {
 		}
 		return out
 	}
-	policy := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow()),
-		"InaccessiblePaths": append([]string{"-/etc/sbctl/master.key"}, EgressHiddenPaths()...)}
-	ipOnly := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow()),
-		"InaccessiblePaths": []string{"-/etc/sbctl/master.key"}}
-	// systemd may print the paths without the ignore prefix.
-	bare := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow()),
-		"InaccessiblePaths": []string{"/etc/sbctl/master.key", "/run/systemd/resolve", "/run/dbus", "/run/nscd"}}
+	policy := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow())}
 	wide := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus([]IPRange{
 		{Family: 2, Addr: []byte{127, 0, 0, 0}, Prefix: 8}, EgressAllow()[1]})}
 	for _, tc := range []struct {
@@ -481,9 +474,6 @@ func TestEgressMatches(t *testing.T) {
 	}{
 		{"denied unit, deny wanted", policy, true, true},
 		{"denied unit, lift wanted", policy, false, false},
-		{"denied unit without the hidden paths (an earlier release)", ipOnly, true, false},
-		{"denied unit, paths shown without the prefix", bare, true, true},
-		{"only the master key hidden, lift wanted", map[string]interface{}{"InaccessiblePaths": []string{"-/etc/sbctl/master.key"}}, false, true},
 		{"open unit, lift wanted", map[string]interface{}{}, false, true},
 		{"unloaded unit, lift wanted", nil, false, true},
 		{"open unit, deny wanted", map[string]interface{}{}, true, false},

@@ -19,8 +19,8 @@
 #   6. the loopback allow is 127.0.0.1 and ::1 only: from the branch's Postgres a pg_net request to
 #      127.0.0.1 is answered (and the cluster's own clients, GoTrue and PostgREST, stay healthy)
 #      and one to 127.0.0.2 (the rest of 127.0.0.0/8, where systemd-resolved's stub lives) is dropped;
-#      The unit also hides the resolver socket, the D-Bus system bus and nscd (InaccessiblePaths, which
-#      the IP filter does not cover), still hides the master key, and the paths come back when the branch is deleted.
+#      The unit also hides the resolver socket, the D-Bus system bus and nscd (InaccessiblePaths in the unit
+#      template, which the IP filter does not cover) and still hides the master key.
 #      Cron jobs cloned from the parent name the branch's own port.
 #   7. a parent with a loopback postgres_fdw server to another project and a Vault secret that holds
 #      its own service key: in the branch the foreign table cannot write (the server is disabled and
@@ -64,17 +64,6 @@ setup_node
 log "system init (downloads artifacts)"
 system_init
 wait_active sb-postgres@system.service 30
-
-# PROBE (temporary): which exec properties can SetUnitProperties set on this systemd?
-log "PROBE $(systemctl --version | head -1)"
-systemd-run --unit=sbprobe --quiet sleep 600
-sleep 1
-for p in "InaccessiblePaths=-/run/dbus" "InaccessiblePaths=" "InaccessiblePaths=-/etc/sbctl/master.key" "TemporaryFileSystem=/run/dbus:ro" "ReadOnlyPaths=-/run/dbus" "BindReadOnlyPaths=-/dev/null:/run/nscd" "TemporaryFileSystem="; do
-  if out=$(systemctl set-property sbprobe.service "$p" 2>&1); then log "PROBE ok: $p"; else log "PROBE fail: $p: $out"; fi
-  log "PROBE after $p: InaccessiblePaths='$(systemctl show -p InaccessiblePaths --value sbprobe.service)' TemporaryFileSystem='$(systemctl show -p TemporaryFileSystem --value sbprobe.service)'"
-done
-systemctl stop sbprobe.service || true
-exit 0
 
 # ---- the "external host": the runner's own address, which is not loopback -------------------
 HOSTIP=$(hostname -I | awk '{print $1}')
@@ -159,24 +148,26 @@ deny=$(unit_prop IPAddressDeny "$PGB") allow=$(unit_prop IPAddressAllow "$PGB")
 allow_norm=$(printf '%s\n' $allow | sed -e 's#/32$##' -e 's#/128$##' | LC_ALL=C sort | tr '\n' ' ')
 [[ $allow_norm == "127.0.0.1 ::1 " ]] || fail "$PGB: IPAddressAllow is '$allow', want exactly 127.0.0.1 and ::1 (not 127.0.0.0/8: 127.0.0.53 is the DNS stub)"
 # The IP filter does not cover unix sockets: the resolver's varlink socket, the D-Bus system bus and
-# nscd are hidden from the unit (InaccessiblePaths), and the unit keeps hiding the master key.
-check_hidden_paths() { # UNIT: the denied unit's property and, in its mount namespace, the sockets
+# nscd's socket are hidden from the Postgres unit (InaccessiblePaths in the unit template: systemd 255
+# cannot change that property of a unit over D-Bus), and the unit still hides the master key.
+check_hidden_paths() { # UNIT: the unit's property and, in its mount namespace, the sockets
   local unit=$1 hidden pid p
   hidden=$(unit_prop InaccessiblePaths "$unit")
-  for p in /run/systemd/resolve /run/dbus /run/nscd; do
+  for p in /run/systemd/resolve/io.systemd.Resolve /run/dbus/system_bus_socket /run/nscd/socket; do
     [[ $hidden == *"$p"* ]] || fail "$unit: InaccessiblePaths is '$hidden', want it to hide $p"
   done
   [[ $hidden == *master.key* ]] || fail "$unit: InaccessiblePaths lost the master key: '$hidden'"
   pid=$(unit_prop MainPID "$unit")
   [[ $pid -gt 0 ]] || fail "$unit: no main pid"
-  if [[ -d /run/systemd/resolve && -n $(ls -A /run/systemd/resolve) ]]; then
-    [[ -z $(ls -A "/proc/$pid/root/run/systemd/resolve" 2>/dev/null) ]] || fail "$unit: /run/systemd/resolve is visible inside the unit"
-  fi
   if [[ -S /run/dbus/system_bus_socket ]]; then
     [[ ! -S /proc/$pid/root/run/dbus/system_bus_socket ]] || fail "$unit: the D-Bus system bus socket is visible inside the unit"
   fi
+  if [[ -S /run/systemd/resolve/io.systemd.Resolve ]]; then
+    [[ ! -S /proc/$pid/root/run/systemd/resolve/io.systemd.Resolve ]] || fail "$unit: the resolver socket is visible inside the unit"
+  fi
 }
 check_hidden_paths "$PGB"
+check_hidden_paths "sb-postgres@$A.service" # in the template, so the parent has it too
 BPORT=$(project_field "$B" 'd["ports"]["Postgres"]')
 for svc in gotrue postgrest; do
   [[ -z $(unit_prop IPAddressDeny "sb-$svc@$B.service") ]] || fail "sb-$svc@$B has an egress restriction (only the cluster's Postgres should)"
@@ -257,7 +248,6 @@ log "branch with --allow-egress"
 C=$(create_branch egress-open --allow-egress)
 [[ $(branch_json "$C" 'd.get("egress", "")') == allowed ]] || fail "$C: egress is '$(branch_json "$C" 'd.get("egress", "")')', want allowed"
 [[ -z $(unit_prop IPAddressDeny "sb-postgres@$C.service") ]] || fail "$C: an opted-out branch has a restriction"
-[[ $(unit_prop InaccessiblePaths "sb-postgres@$C.service") != *run/dbus* ]] || fail "$C: an opted-out branch hides the D-Bus socket"
 [[ $(sql "$C" "select count(*) from cron.job where nodeport <> $(project_field "$C" 'd["ports"]["Postgres"]')") == 0 ]] || fail "$C: the opted-out branch's cron jobs name the parent's port"
 [[ $(sql "$C" "select active from cron.job where jobname = 'egress-test-job'") == t ]] || fail "$C: the opt-out did not keep the cron job active"
 row=$(net_request "$C" branch-open)
@@ -269,9 +259,6 @@ log "delete the branches"
 sbctl branches delete "$B"
 sbctl branches delete "$C"
 [[ -z $(unit_prop IPAddressDeny "$PGB") ]] || fail "$PGB: the restriction remains after the branch was deleted (a later project with the ref would inherit it)"
-hidden=$(unit_prop InaccessiblePaths "$PGB")
-[[ $hidden != *run/dbus* && $hidden != *run/systemd/resolve* ]] || fail "$PGB: the hidden paths remain after the branch was deleted: '$hidden'"
-[[ $hidden == *master.key* ]] || fail "$PGB: the master key is no longer hidden after the branch was deleted: '$hidden'"
 [[ $(unit_state "$PGB") == inactive ]] || fail "$PGB is $(unit_state "$PGB") after delete"
 
 log "OK"

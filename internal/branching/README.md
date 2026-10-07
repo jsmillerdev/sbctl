@@ -273,11 +273,14 @@ with data has these defaults:
    would be a DNS side channel out of a confined unit. Every client of a project's Postgres uses 127.0.0.1 (the cluster
    listens on `127.0.0.1` only; GoTrue, PostgREST, the pooler and the fleet connect to it) or the unix socket, which a
    filter on IP addresses does not touch. An earlier release allowed 127.0.0.0/8: the next render of a unit narrows it.
-   The IP filter does not touch unix sockets, so the unit's `InaccessiblePaths` also hides `/run/systemd/resolve`
-   (systemd-resolved's varlink socket, which glibc uses for lookups through `nss-resolve`), `/run/dbus` (the system bus,
-   where a polkit rule could let the unit lift its own filter) and `/run/nscd`, in addition to the master key
-   (`units.EgressHiddenPaths`, applied with the filter, in force when the unit starts; the delete drops them again). Names then
-   resolve only through `/etc/hosts` or a resolver on 127.0.0.1:53 (dnsmasq, unbound), which the loopback allow still reaches.
+   The IP filter does not touch unix sockets, so the Postgres unit template (`deploy/systemd/sb-postgres@.service`) hides
+   three of them with `InaccessiblePaths`, next to the master key: systemd-resolved's varlink socket
+   (`/run/systemd/resolve/io.systemd.Resolve`, which glibc uses for lookups through `nss-resolve`), the D-Bus system bus
+   (`/run/dbus/system_bus_socket`, where a polkit rule could let the unit lift its own filter) and nscd's socket. They are hidden
+   for every project's Postgres, not only for a branch's: systemd 255 does not let `InaccessiblePaths` of a unit change over D-Bus
+   (checked on Ubuntu 24.04), so it cannot depend on the policy, and a Postgres needs none of them. Names then resolve only through
+   `/etc/hosts` or a resolver on 127.0.0.1:53 (dnsmasq, unbound), which the loopback allow still reaches. A node installed before
+   this needs the new unit template (the installer and self-update install it).
    The filter is a cgroup BPF program on the unit, so it covers every process of the cluster (backends, the pg_net
    and pg_cron workers, `COPY ... PROGRAM`) and it survives restarts and reboots. The unit
    still talks to its own GoTrue and PostgREST and to the pooler over loopback and unix sockets.
@@ -500,7 +503,7 @@ plus a parent and at most two branches, class micro):
   and signs the user in again, the parent's token still works afterwards; cron jobs name the branch's port and the parent's are
   unchanged; a database with `datallowconn = false` (and one that is a template) has its foreign servers disabled and its Vault
   secret rewritten and keeps its flags. Under systemd `tests/linux/branching-egress.sh` checks that the denied unit hides the resolver
-  socket, D-Bus and nscd inside its mount namespace and still hides the master key, and that the paths are gone from the drop-in after delete.
+  socket and D-Bus inside its mount namespace and still hides the master key.
 * Outbound isolation: `TestIntegrationCloneIsolatesTheParentsIntegrations` also checks, on the exec backend, that the
   branch reports `egress: unenforced` with a detail that says "egress NOT blocked", that the paused cron job is
   recorded in `sbctl_branch.paused_cron_jobs` (and the table is absent with `keep_cron_jobs`), and that

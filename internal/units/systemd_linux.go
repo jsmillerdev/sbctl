@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -141,29 +140,10 @@ func (s *Systemd) setEgress(ctx context.Context, c *sddbus.Conn, unit string, de
 		}
 	}
 	// An empty list resets the property, which lifts the restriction.
-	props := []sddbus.Property{
-		{Name: "IPAddressAllow", Value: godbus.MakeVariant(allowed)},
-		{Name: "IPAddressDeny", Value: godbus.MakeVariant(denied)},
-	}
-	postgres := strings.HasPrefix(unit, "sb-"+config.SvcPostgres+"@")
-	if deny && postgres {
-		// Appended to the unit file's own InaccessiblePaths; it applies at the next start.
-		props = append(props, sddbus.Property{Name: "InaccessiblePaths", Value: godbus.MakeVariant(EgressHiddenPaths())})
-	}
-	if err := c.SetUnitPropertiesContext(ctx, unit, false, props...); err != nil {
-		return err
-	}
-	if !deny && postgres {
-		// Lifting: a list property only gets shorter by being reset, and a reset drops the unit
-		// file's entries as well, so those are set again right after.
-		if err := c.SetUnitPropertiesContext(ctx, unit, false,
-			sddbus.Property{Name: "InaccessiblePaths", Value: godbus.MakeVariant([]string{})}); err != nil {
-			return err
-		}
-		return c.SetUnitPropertiesContext(ctx, unit, false,
-			sddbus.Property{Name: "InaccessiblePaths", Value: godbus.MakeVariant(postgresInaccessible())})
-	}
-	return nil
+	return c.SetUnitPropertiesContext(ctx, unit, false,
+		sddbus.Property{Name: "IPAddressAllow", Value: godbus.MakeVariant(allowed)},
+		sddbus.Property{Name: "IPAddressDeny", Value: godbus.MakeVariant(denied)},
+	)
 }
 
 // dbusIPAddr is the a(iayu) element of IPAddressAllow and IPAddressDeny; godbus encodes a Go
