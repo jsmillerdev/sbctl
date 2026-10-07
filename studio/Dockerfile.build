@@ -1,1 +1,32 @@
-# Workstream A: build environment for platform-mode Studio.
+# Reproducible build of the platform-mode Studio artifact. Same steps as running studio/build.sh
+# on a CI runner; the image only provides a clean Ubuntu with the tools build.sh needs.
+#
+#   docker buildx build --platform linux/amd64 -f studio/Dockerfile.build --target artifact \
+#       --output type=local,dest=studio/dist .
+#
+# The build context is the repository root; studio/Dockerfile.build.dockerignore keeps local build
+# state (studio/.build-cache, studio/dist, node_modules) out of it. The output directory receives
+# sbctl-studio-<tag>-p<N>-linux-<arch>.tar.zst and SHA256SUMS. The build needs about 8 GB of RAM
+# (give the Docker VM 10 GB or more) and 9 GB of disk. build.sh limits the Next build to one worker
+# and a 4 GB V8 heap per node process whatever the CPU count (STUDIO_BUILD_WORKERS, STUDIO_BUILD_HEAP_MB).
+# ubuntu:24.04 (multi-arch index covering amd64 and arm64), pinned by digest; bump it on purpose.
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl git python3 build-essential zstd xz-utils procps && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /sbctl
+COPY versions.yaml LICENSE ./
+COPY studio ./studio
+
+# build.sh names the artifact after the host architecture (no cross builds), so the container's
+# architecture decides the platform.
+RUN set -eux; \
+    case "$(uname -m)" in x86_64) platform=linux-amd64 ;; aarch64) platform=linux-arm64 ;; *) exit 1 ;; esac; \
+    STUDIO_OUT=/out studio/build.sh "$platform"
+
+FROM scratch AS artifact
+COPY --from=build /out/ /

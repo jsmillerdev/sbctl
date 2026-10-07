@@ -1,0 +1,53 @@
+{
+  "$comment": "Per-install values baked into the Studio build as unique placeholders and substituted at start by runtime/sbctl-runtime-config.mjs. build.sh exports each placeholder as the build-time value of `env`, and fails if one does not survive into the build output. `kind`: url (http or https URL, trailing slash dropped), url-platform (same, and a missing /platform suffix is added), string, csp-hosts (list of host sources for the CSP). `origin` is the placeholder origin that appears alone in the CSP; it is replaced by the origin of the real URL.",
+  "version": 1,
+  "values": [
+    {
+      "env": "NEXT_PUBLIC_API_URL",
+      "kind": "url-platform",
+      "placeholder": "https://sbctl-placeholder-api.invalid/platform",
+      "origin": "https://sbctl-placeholder-api.invalid",
+      "required": true,
+      "doc": "Management API as the browser reaches it, for example https://api.example.com/platform."
+    },
+    {
+      "env": "NEXT_PUBLIC_GOTRUE_URL",
+      "kind": "url",
+      "placeholder": "https://sbctl-placeholder-gotrue.invalid/sbctl-path",
+      "origin": "https://sbctl-placeholder-gotrue.invalid",
+      "required": true,
+      "doc": "Dashboard GoTrue (sb-gotrue@system) as the browser reaches it, including its path, for example https://api.example.com/auth/v1."
+    },
+    {
+      "env": "NEXT_PUBLIC_SITE_URL",
+      "kind": "url",
+      "placeholder": "https://sbctl-placeholder-site.invalid",
+      "required": true,
+      "doc": "Public URL of the dashboard itself, for example https://studio.example.com. Used for redirect URLs."
+    },
+    {
+      "env": "NEXT_PUBLIC_HCAPTCHA_SITE_KEY",
+      "kind": "string",
+      "placeholder": "sbctl-placeholder-hcaptcha-site-key",
+      "required": false,
+      "default": "",
+      "doc": "hCaptcha site key. Empty (the default) renders no captcha widget (patch 0001)."
+    },
+    {
+      "env": "NEXT_PUBLIC_DISABLED_FEATURES",
+      "kind": "string",
+      "placeholder": "sbctl-placeholder-disabled-features",
+      "required": false,
+      "default": "dashboard_auth:sign_up,dashboard_auth:sign_in_with_github,dashboard_auth:sign_in_with_chatgpt,dashboard_auth:sign_in_with_sso,dashboard_auth:show_testimonial,dashboard_auth:show_tos",
+      "doc": "Comma-separated feature keys to disable before login (patch 0002)."
+    },
+    {
+      "env": "CSP_EXTRA_PROJECT_HOSTS",
+      "kind": "csp-hosts",
+      "placeholder": "sbctl-placeholder-projects.invalid",
+      "required": false,
+      "default": "",
+      "doc": "Host sources that serve project APIs, for example *.api.example.com (patch 0003). Each is allowed over https and wss."
+    }
+  ]
+}

@@ -1,0 +1,115 @@
+From 32a7ba472608434bc18907353aa828717e2781ed Mon Sep 17 00:00:00 2001
+From: sbctl <sbctl@users.noreply.invalid>
+Date: Tue, 6 Oct 2026 11:25:09 -0700
+Subject: [PATCH 2/3] feat(common): allow disabling feature flags through
+ NEXT_PUBLIC_DISABLED_FEATURES
+
+The ENABLED_FEATURES_* runtime override does nothing when IS_PLATFORM is
+true, and profile.disabled_features only exists after login. A platform
+build served by a self-operated control plane therefore cannot hide the
+dashboard_auth:* options (sign-up, GitHub, SSO, testimonial, terms) on
+the sign-in page.
+
+Add a comma-separated NEXT_PUBLIC_DISABLED_FEATURES list that is merged
+into the static disabled set. The variable already exists for
+self-hosted profiles; this makes it available to isFeatureEnabled in
+every mode.
+---
+ packages/common/enabled-features/README.md    | 10 ++++++
+ .../common/enabled-features/index.test.ts     | 34 +++++++++++++++++++
+ packages/common/enabled-features/index.ts     | 17 ++++++++--
+ 3 files changed, 58 insertions(+), 3 deletions(-)
+ create mode 100644 packages/common/enabled-features/index.test.ts
+
+diff --git a/packages/common/enabled-features/README.md b/packages/common/enabled-features/README.md
+index cf3f334..38b7c6a 100644
+--- a/packages/common/enabled-features/README.md
++++ b/packages/common/enabled-features/README.md
+@@ -61,6 +61,16 @@ Env vars prefixed with `ENABLED_FEATURES_` that don't match a known feature are
+ - **Brief flash of unstyled flags.** Before the override fetch resolves, flags default to their JSON value. For features gated as "enabled in JSON, disabled by runtime override", there's a brief window where the UI shows the feature before it's hidden.
+ - **`Support.constants.ts` call site is build-time only.** `apps/studio/components/interfaces/Support/Support.constants.ts` calls `isFeatureEnabled('billing:all')` at module load to build `CATEGORY_OPTIONS`, which is then spread into Zod form schemas. That one call site resolves from the static JSON and cannot be runtime-overridden without a larger refactor.
+ 
++## Build-time override (all builds, including platform)
++
++`NEXT_PUBLIC_DISABLED_FEATURES` takes a comma-separated list of feature keys that are disabled in addition to the JSON file:
++
++```bash
++NEXT_PUBLIC_DISABLED_FEATURES=dashboard_auth:sign_up,dashboard_auth:sign_in_with_github
++```
++
++Unlike the runtime override above, this works when `IS_PLATFORM` is true and before login, so pages such as `/sign-in` can hide sign-up and social sign-in without `profile.disabled_features`. Next.js inlines the value into the bundle, so it is fixed when Studio is built (or when a build-time placeholder is substituted at deploy time). Unknown keys are ignored.
++
+ ## Disable everything (for tooling)
+ 
+ `ENABLED_FEATURES_OVERRIDE_DISABLE_ALL=true` forces every flag to `false`. Used by the docs embeddings pipeline to produce a filtered index. This is a server-only env (no `NEXT_PUBLIC_` prefix) and short-circuits over everything else.
+diff --git a/packages/common/enabled-features/index.test.ts b/packages/common/enabled-features/index.test.ts
+new file mode 100644
+index 0000000..59eab83
+--- /dev/null
++++ b/packages/common/enabled-features/index.test.ts
+@@ -0,0 +1,34 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++async function load() {
++  vi.resetModules()
++  return (await import('./index')).isFeatureEnabled
++}
++
++describe('NEXT_PUBLIC_DISABLED_FEATURES', () => {
++  afterEach(() => {
++    vi.unstubAllEnvs()
++  })
++
++  it('leaves features enabled when unset', async () => {
++    const isFeatureEnabled = await load()
++    expect(isFeatureEnabled('dashboard_auth:sign_up')).toBe(true)
++  })
++
++  it('disables the listed features and trims whitespace', async () => {
++    vi.stubEnv(
++      'NEXT_PUBLIC_DISABLED_FEATURES',
++      ' dashboard_auth:sign_up, dashboard_auth:sign_in_with_github ,,'
++    )
++    const isFeatureEnabled = await load()
++    expect(isFeatureEnabled('dashboard_auth:sign_up')).toBe(false)
++    expect(isFeatureEnabled('dashboard_auth:sign_in_with_github')).toBe(false)
++    expect(isFeatureEnabled('dashboard_auth:sign_in_with_email')).toBe(true)
++  })
++
++  it('ignores unknown keys', async () => {
++    vi.stubEnv('NEXT_PUBLIC_DISABLED_FEATURES', 'not:a-feature')
++    const isFeatureEnabled = await load()
++    expect(isFeatureEnabled('dashboard_auth:sign_up')).toBe(true)
++  })
++})
+diff --git a/packages/common/enabled-features/index.ts b/packages/common/enabled-features/index.ts
+index 812a99d..d288715 100644
+--- a/packages/common/enabled-features/index.ts
++++ b/packages/common/enabled-features/index.ts
+@@ -23,9 +23,20 @@ type RuntimeFeature =
+ 
+ export type Feature = RuntimeFeature | keyof typeof enabledFeaturesStaticObj
+ 
+-const disabledFeaturesStaticArray = Object.entries(enabledFeaturesStaticObj)
+-  .filter(([_, value]) => !value)
+-  .map(([key]) => key as Feature)
++// Features disabled through a comma-separated NEXT_PUBLIC_DISABLED_FEATURES list.
++// Like the JSON file this is resolved at build time (the value is inlined into the bundle),
++// so it also applies before login, when `profile.disabled_features` is not available yet.
++const disabledFeaturesFromEnv = (process.env.NEXT_PUBLIC_DISABLED_FEATURES ?? '')
++  .split(',')
++  .map((key) => key.trim())
++  .filter(Boolean) as Feature[]
++
++const disabledFeaturesStaticArray = [
++  ...Object.entries(enabledFeaturesStaticObj)
++    .filter(([_, value]) => !value)
++    .map(([key]) => key as Feature),
++  ...disabledFeaturesFromEnv,
++]
+ 
+ function checkFeature(feature: Feature, features: Set<Feature>) {
+   return !features.has(feature)
+-- 
+2.50.1 (Apple Git-155)
+
