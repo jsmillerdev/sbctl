@@ -136,8 +136,13 @@ PUB_A=$(project_field "$A" 'd["keys"]["publishable_key"]' --show-keys)
 [[ $(http_code -H "Host: $A.api.$SBCTL_DOMAIN" -H "apikey: sb_publishable_wrong" http://127.0.0.1/rest/v1/) == 401 ]] || fail "$A: a wrong key was not a 401"
 # Studio's sign-in goes to api.<domain>/auth/v1; the Studio host answers its banner route itself.
 [[ $(http_code -H "Host: studio.$SBCTL_DOMAIN" http://127.0.0.1/api/incident-banner) == 200 ]] || fail "the proxy does not answer /api/incident-banner"
+# The daemon starts the timers next to its listeners, so give it a moment after the API answers.
 for t in "sb-basebackup@$A.timer" "sb-basebackup@system.timer" sb-basebackup-prune.timer; do
-  [[ $(unit_state "$t") == active ]] || fail "$t was not started by the daemon"
+  for ((i = 0; i < 30; i++)); do
+    [[ $(unit_state "$t") == active ]] && break
+    sleep 1
+  done
+  [[ $(unit_state "$t") == active ]] || { journalctl --no-pager -u sbctl.service | tail -20 >&2; fail "$t was not started by the daemon"; }
 done
 
 log "nightly backup: the sb-basebackup@$A service runs as the timer would"
