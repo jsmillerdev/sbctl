@@ -445,3 +445,6 @@ func autoconfirm(eff, set Values) bool {
 	}
 	return eff.Str("smtp_host") == ""
 }
+
+// AuthAutoconfirm is the mailer_autoconfirm of an auth State as GoTrue runs it.
+func (st *State) AuthAutoconfirm() bool { return autoconfirm(st.Effective, st.Set) }

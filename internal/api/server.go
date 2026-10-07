@@ -14,6 +14,7 @@ import (
 
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/OWNER/sbctl/internal/projectconfig"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -36,6 +37,10 @@ type Deps struct {
 	// it from Registry like Store: the registry's database for a Postgres registry,
 	// memory otherwise.
 	Claims ClaimStore
+	// Settings holds the projects' saved settings (config/auth, postgrest, realtime,
+	// storage, database/postgres). Empty derives it from Registry like Store; internal/app
+	// passes the one the lifecycle engine renders from.
+	Settings *projectconfig.Manager
 	// HTTPClient is used for every upstream call (pg-meta, GoTrue, Storage).
 	HTTPClient *http.Client
 	// PGMetaURL overrides http://127.0.0.1:<ports.pgmeta>.
@@ -61,6 +66,9 @@ type Server struct {
 	hc    *http.Client
 	now   func() time.Time
 	auth  *authenticator
+	// settings are the saved per-project settings; cfgLocks serialize save and apply.
+	settings *projectconfig.Manager
+	cfgLocks sync.Map
 	// accounts redeems claim and invite tokens (claim.go).
 	accounts *Accounts
 
@@ -197,6 +205,20 @@ func NewServer(d Deps) (*Server, error) {
 			s.store = NewMemoryStore()
 		}
 	}
+	s.settings = d.Settings
+	if s.settings == nil {
+		opts := projectconfig.Options{
+			TemplateBaseURL: lifecycle.TemplateBaseURL(d.Config), Log: s.log,
+			Event: func(ctx context.Context, ref, kind string, payload any) {
+				_ = d.Registry.AppendEvent(ctx, ref, kind, payload)
+			},
+		}
+		if pg, ok := d.Registry.(*registry.Postgres); ok {
+			s.settings = projectconfig.NewManager(projectconfig.NewPGStore(pg.Pool()), d.Secrets, opts)
+		} else {
+			s.settings = projectconfig.NewManager(projectconfig.NewMemory(), d.Secrets, opts)
+		}
+	}
 	claims := d.Claims
 	if claims == nil {
 		if pg, ok := d.Registry.(*registry.Postgres); ok {
@@ -243,6 +265,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesOrganizations(add)
 	s.routesProjects(add)
 	s.routesKeys(add)
+	s.routesConfig(add)
 	s.routesDatabase(add)
 	s.routesFunctions(add)
 	s.routesPlatformProject(add)
@@ -285,6 +308,7 @@ func (s *Server) build() (http.Handler, error) {
 		}
 	}
 	s.claimRoutes(mux)
+	mux.handle("GET /internal/templates/{ref}/{name}", s.wrap(authNone, s.serveTemplate))
 	mux.fallback = s.wrap(authAny, s.unknown)
 	return s.middleware(mux), nil
 }

@@ -258,6 +258,42 @@ func mergeObjects(base, patch map[string]any) map[string]any {
 	return out
 }
 
+// Restore writes prior back as the settings of svc (an undo: the Management API calls it when
+// applying a saved change to the running service failed). The version still moves forward.
+func (m *Manager) Restore(ctx context.Context, ref string, svc Service, prior *State) error {
+	sch, err := schemaOf(svc)
+	if err != nil {
+		return err
+	}
+	for attempt := 0; ; attempt++ {
+		rec, err := m.store.Get(ctx, ref, svc)
+		if err != nil {
+			return err
+		}
+		out := &Record{Ref: ref, Service: svc, Values: map[string]any{}, Sealed: map[string][]byte{}}
+		for name, v := range prior.Set {
+			f, ok := sch.Field(name)
+			if !ok {
+				continue
+			}
+			if !f.Secret {
+				out.Values[name] = v
+				continue
+			}
+			sealed, err := m.sec.Seal([]byte(v.(string)))
+			if err != nil {
+				return err
+			}
+			out.Sealed[name] = sealed
+		}
+		_, err = m.store.Put(ctx, out, rec.Version)
+		if errors.Is(err, ErrConflict) && attempt < 5 {
+			continue
+		}
+		return err
+	}
+}
+
 func cloneValues(v Values) Values {
 	out := make(Values, len(v))
 	for k, x := range v {

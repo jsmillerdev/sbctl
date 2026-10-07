@@ -79,8 +79,9 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	}
 	apiH, err := api.NewServer(api.Deps{
 		Registry: node.Registry, Secrets: node.Secrets, Manager: node.Engine, Config: cfg,
-		Store:  api.NewPGStore(pg.Pool()), // explicit: the API's state must survive restarts
-		Logger: log.With("component", "api"),
+		Store:    api.NewPGStore(pg.Pool()), // explicit: the API's state must survive restarts
+		Settings: node.Settings,             // the settings the engine renders units and tenants from
+		Logger:   log.With("component", "api"),
 	})
 	if err != nil {
 		return err

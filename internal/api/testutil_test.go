@@ -17,6 +17,7 @@ import (
 	"github.com/OWNER/sbctl/internal/api/cryptojs"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/OWNER/sbctl/internal/projectconfig"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -36,6 +37,14 @@ type fakeManager struct {
 	resumed  []string
 	deleted  []string
 	createFn func(req lifecycle.CreateRequest) (*registry.Project, error)
+	// Settings and password calls.
+	applied   []string
+	applyOpts []lifecycle.ApplyOptions
+	applyErr  map[projectconfig.Service]error
+	applyHook func(projectconfig.Service) error
+	pending   bool
+	passwords []string
+	pwErr     error
 	// hook, when set, runs inside Pause, Resume and Delete before they act.
 	hook func(op string, ctx context.Context)
 }
@@ -50,7 +59,7 @@ func (m *fakeManager) observe(op string, ctx context.Context) {
 }
 
 func newFakeManager(reg registry.Registry, sec secrets.Secrets) *fakeManager {
-	return &fakeManager{reg: reg, sec: sec, dsn: "postgres://postgres:pw@127.0.0.1:5432/postgres", keys: map[string]*secrets.ProjectKeys{}, keyCalls: map[string]int{}}
+	return &fakeManager{reg: reg, sec: sec, dsn: "postgres://postgres:pw@127.0.0.1:5432/postgres", keys: map[string]*secrets.ProjectKeys{}, applyErr: map[projectconfig.Service]error{}, keyCalls: map[string]int{}}
 }
 
 func (m *fakeManager) addProject(t testing.TB, ref, name string, orgID int64, status registry.Status) *registry.Project {
@@ -126,9 +135,57 @@ func (m *fakeManager) Keys(_ context.Context, ref string) (*secrets.ProjectKeys,
 	defer m.mu.Unlock()
 	m.keyCalls[ref]++
 	if k, ok := m.keys[ref]; ok {
-		return k, nil
+		// Like the real Engine, report the key records and the legacy switch stored in the
+		// registry (the API writes them there).
+		sealed, err := m.reg.GetSecrets(context.Background(), ref)
+		if err != nil {
+			return nil, err
+		}
+		extra := map[string]string{}
+		for name, blob := range sealed {
+			if strings.HasPrefix(name, secrets.NamePrefixAPIKey) || name == secrets.NameLegacyKeys {
+				pt, err := m.sec.Open(blob)
+				if err != nil {
+					return nil, err
+				}
+				extra[name] = string(pt)
+			}
+		}
+		kk := *k
+		loaded := secrets.KeysFromMap(extra)
+		kk.Records, kk.LegacyDisabled = loaded.Records, loaded.LegacyDisabled
+		return &kk, nil
 	}
 	return nil, registry.ErrNotFound
+}
+
+// ApplyConfig and SetDatabasePassword make fakeManager a lifecycle.Reconfigurer.
+func (m *fakeManager) ApplyConfig(_ context.Context, ref string, svc projectconfig.Service, opts lifecycle.ApplyOptions) (lifecycle.ApplyResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.applied = append(m.applied, ref+" "+string(svc))
+	m.applyOpts = append(m.applyOpts, opts)
+	if m.applyHook != nil {
+		if err := m.applyHook(svc); err != nil {
+			return lifecycle.ApplyResult{}, err
+		}
+	} else if err := m.applyErr[svc]; err != nil {
+		return lifecycle.ApplyResult{}, err
+	}
+	return lifecycle.ApplyResult{Applied: true, PendingRestart: m.pending}, nil
+}
+
+func (m *fakeManager) SetDatabasePassword(_ context.Context, ref, password string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pwErr != nil {
+		return m.pwErr
+	}
+	m.passwords = append(m.passwords, ref+":"+password)
+	if k, ok := m.keys[ref]; ok {
+		k.DBPassword = password
+	}
+	return nil
 }
 
 func (m *fakeManager) Health(context.Context, string) ([]lifecycle.ServiceHealth, error) {

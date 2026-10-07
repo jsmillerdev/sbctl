@@ -72,8 +72,8 @@ func DefaultStorageFeatures() map[string]any {
 		"imageTransformation": map[string]any{"enabled": false},
 		"s3Protocol":          map[string]any{"enabled": true},
 		"purgeCache":          map[string]any{"enabled": false},
-		"icebergCatalog":      map[string]any{"enabled": false},
-		"vectorBuckets":       map[string]any{"enabled": false},
+		"icebergCatalog":      map[string]any{"enabled": false, "maxNamespaces": 10, "maxTables": 10, "maxCatalogs": 2},
+		"vectorBuckets":       map[string]any{"enabled": false, "maxBuckets": 10, "maxIndexes": 5},
 	}
 }
 
@@ -183,4 +183,23 @@ func buildPostgresSchema() *Schema {
 		size("shared_buffers"), dur("statement_timeout"), boolean("track_commit_timestamp"), size("wal_keep_size"),
 		dur("wal_sender_timeout"), size("work_mem"), dur("checkpoint_timeout"), boolean("hot_standby_feedback"),
 	})
+}
+
+// StorageFeatures is the features object of a storage State: the defaults with the saved
+// features laid over them.
+func (st *State) StorageFeatures() map[string]any {
+	out := DefaultStorageFeatures()
+	if saved, ok := st.Set["features"].(map[string]any); ok {
+		return mergeObjects(out, saved)
+	}
+	return out
+}
+
+// StorageExternal is the external object of a storage State.
+func (st *State) StorageExternal() map[string]any {
+	out := map[string]any{"upstreamTarget": "main"}
+	if saved, ok := st.Set["external"].(map[string]any); ok {
+		return mergeObjects(out, saved)
+	}
+	return out
 }
