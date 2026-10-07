@@ -18,7 +18,7 @@ func TestRouteNeedsDump(t *testing.T) {
 	var lines []string
 	for _, op := range ops {
 		n := routeNeed(op.Method, op.Path)
-		kind := map[needKind]string{needCheck: "check", needAny: "any", needSelf: "self", needOwner: "owner"}[n.kind]
+		kind := map[needKind]string{needCheck: "check", needAny: "any", needSelf: "self", needOwner: "owner", needOperator: "operator"}[n.kind]
 		res := n.resource
 		if n.resourceFn != nil {
 			res = "<fn>"

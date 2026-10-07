@@ -96,6 +96,8 @@ func matrixCases() []routeCase {
 		rc("YYYYYY", "GET", "/platform/organizations", nil),
 		rc("YYYYYY", "GET", "/platform/projects", nil),
 		rc("YYYYYY", "POST", "/platform/telemetry/event", map[string]any{}),
+		// the node's health in detail: Owners and Administrators
+		rc("YYNNNN", "GET", "/healthz/detail", nil),
 		// organization
 		rc("YYYYYN", "GET", org, nil),
 		rc("YNNNNN", "PATCH", org, map[string]any{"name": "Renamed"}),

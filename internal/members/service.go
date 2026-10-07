@@ -226,6 +226,18 @@ func (a *Access) IsOwnerAnywhere() bool {
 	return false
 }
 
+// IsOperatorAnywhere reports whether the user holds the Owner or Administrator role
+// organization-wide in some organization: the people who run projects, and so the ones who
+// may see how the node that hosts them is doing.
+func (a *Access) IsOperatorAnywhere() bool {
+	for _, m := range a.Memberships {
+		if m.RoleID == RoleOwner || m.RoleID == RoleAdministrator {
+			return true
+		}
+	}
+	return false
+}
+
 // Permissions returns the permission entries of the user for the given organizations, the
 // list GET /platform/profile/permissions serves.
 func (a *Access) Permissions(orgs []OrgRef) []Permission {

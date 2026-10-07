@@ -79,7 +79,7 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveStudio(w http.ResponseWriter, r *http.Request) {
-	if s.answerCNAMECheck(w, r) || answerStudioLocally(w, r) {
+	if s.answerCNAMECheck(w, r) || s.answerStudioLocally(w, r) {
 		return
 	}
 	s.forward(w, r, &target{

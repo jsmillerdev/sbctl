@@ -12,12 +12,14 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/jsmillerdev/supavise/internal/alerts"
 	"github.com/jsmillerdev/supavise/internal/api"
 	"github.com/jsmillerdev/supavise/internal/backup"
 	"github.com/jsmillerdev/supavise/internal/branching"
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/fleet"
 	"github.com/jsmillerdev/supavise/internal/functions"
+	"github.com/jsmillerdev/supavise/internal/health"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/proxy"
 	"github.com/jsmillerdev/supavise/internal/registry"
@@ -108,7 +110,26 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	if err != nil {
 		return err
 	}
+	// The node's health: one probe shared by /healthz, the operator's detailed view and the
+	// alert checker below (internal/health, internal/alerts).
+	hz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
+	hz.Bind(node.Registry, node.Secrets)
+	hdeps, err := health.ForNode(node, health.NodeOptions{Version: o.Version, Log: log.With("component", "health"), InDaemon: true, Tenants: hz.Fleet()})
+	if err != nil {
+		return err
+	}
+	monitor := health.NewMonitor(func(ctx context.Context) (*health.Report, error) { return health.CheckNode(ctx, hdeps) }, cfg.Health.Cache())
+	notifier := alerts.New(cfg, alerts.Options{Log: log.With("component", "alerts")})
+	alerts.SetDefault(notifier) // what the rest of the node raises through alerts.Notify
+	checker := &alerts.Checker{Notifier: notifier, Report: monitor.Fresh, Cfg: cfg, Log: log.With("component", "alerts")}
+	if us := health.ReadUpdateSettings(o.ConfigPath); !us.Off {
+		checker.UpdateInterval = us.CheckInterval
+		checker.CheckUpdate = func(ctx context.Context, now time.Time) (*health.UpdateRecord, error) {
+			return health.CheckUpdate(ctx, cfg, o.Version, health.UpdateSource{}, now)
+		}
+	}
 	apiDeps := api.Deps{
+		Health:   monitor,
 		Registry: node.Registry, Secrets: node.Secrets, Manager: node.Engine, Config: cfg, Branching: bsvc,
 		Store:         store,
 		Settings:      node.Settings, // the settings the engine renders units and tenants from
@@ -186,6 +207,10 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	}
 	g.Go(func() error {
 		_ = bsvc.Run(gctx) // expiry sweeper; returns when the daemon stops
+		return nil
+	})
+	g.Go(func() error {
+		checker.Run(gctx) // alerts on what the health report finds, and the daily update check
 		return nil
 	})
 	if fnSyncer != nil {
