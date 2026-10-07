@@ -12,10 +12,10 @@
 </p>
 
 <p align="center">
-  <img alt="license: Apache-2.0" src="brand/readme/badge-license.svg">
-  <img alt="runs on: Ubuntu 24.04+ | Debian 12+" src="brand/readme/badge-platform.svg">
-  <img alt="arch: amd64 | arm64" src="brand/readme/badge-arch.svg">
-  <img alt="runs as: systemd units, no Docker" src="brand/readme/badge-docker.svg">
+  <a href="LICENSE"><img alt="license: Apache-2.0" src="brand/readme/badge-license.svg"></a>
+  <a href="deploy/README.md#install-on-a-server"><img alt="runs on: Ubuntu 24.04+ | Debian 12+" src="brand/readme/badge-platform.svg"></a>
+  <a href="deploy/README.md#install-on-a-server"><img alt="arch: amd64 | arm64" src="brand/readme/badge-arch.svg"></a>
+  <a href="DESIGN.md"><img alt="runs as: systemd units, no Docker" src="brand/readme/badge-docker.svg"></a>
 </p>
 
 <p align="center">
