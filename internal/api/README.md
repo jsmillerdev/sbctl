@@ -43,7 +43,7 @@ registered in a second mux of a chain, tried in order.
 
 | Area | Routes |
 |---|---|
-| Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (empty list, branch lookups 404); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/database/{ref}/backups` (empty) |
+| Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (the full branch API, served by `internal/branching`, see below); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/database/{ref}/backups` (empty) |
 | Keys | `/v1/projects/{ref}/api-keys` (legacy `anon`, `service_role`, `sb_publishable_*`, `sb_secret_*`; secrets masked unless `reveal=true`), `api-keys/{id}`, `api-keys/legacy` |
 | Database | `database/query`, `database/query/read-only` (rows as JSON; `parameters` supported), `database/migrations` list and apply (`supabase_migrations.schema_migrations`), `types/typescript` (pg-meta generator), `cli/login-role` create and delete, `advisors/*` (no lints yet) |
 | Functions and secrets | `functions` list, create, deploy (multipart), get, patch, delete, `body`; `secrets` list (digests), create, delete. Sources and sealed secrets are stored; there is no runtime yet (phase 2) |
@@ -57,6 +57,19 @@ registered in a second mux of a chain, tried in order.
 Everything else (billing, integrations, replication, log drains, network restrictions,
 auth/storage/realtime *config* PATCHes, ...) is a stub: it answers a valid empty value and
 changes nothing.
+
+## Branches
+
+`Deps.Branching` (a `*branching.Service`, `internal/branching/README.md`) serves `GET/POST/DELETE
+/v1/projects/{ref}/branches`, `GET /v1/projects/{ref}/branches/{name}`, `GET/PATCH/DELETE
+/v1/branches/{id_or_ref}` (`force=false` schedules the deletion), `POST .../merge|reset|push|restore`
+and `GET .../diff`, with the exact spec shapes (`BranchResponse`, `BranchDetailResponse`, ...). Studio calls
+these paths itself; the `/platform` twins are the project fields `is_branch_enabled`,
+`preview_branch_refs` and `parent_project_ref`. Branches are not listed as projects. Merge, reset and
+push answer `201 {workflow_run_id, message: "ok"}` at once and run in the background; the branch's
+`status` follows. `?force=true` on merge and push is our extension. Without `Deps.Branching` the list is
+the default branch only and a create answers 400. Organization entitlements already grant
+`branching_limit` and `branching_persistent`, which is what the CLI checks on a failed create.
 
 ## Authentication
 
@@ -244,7 +257,7 @@ you ran it from, so check its working directory (`lsof -p <pid> | grep cwd`) bef
   the driver's values, which can differ from Postgres's JSON for exotic types.
 - `database/query` for `parameters` and for pg-meta SQL return rows as Postgres/pg-meta
   serialize them; `bigint` columns can differ between the two paths (number vs string).
-- Advisors return no lints; function bodies are stored but not run; branches are always empty;
+- Advisors return no lints; function bodies are stored but not run;
   `PATCH` on auth, storage, realtime and postgrest *config* is a stub; `PATCH
   /v1/projects/{ref}/database/password` is a stub.
 - Not checked against a running Studio: that is workstream A. Region and cloud provider

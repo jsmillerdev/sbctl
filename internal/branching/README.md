@@ -208,13 +208,16 @@ Clone timings (APFS, darwin-arm64, exec backend, `TestIntegrationCloneSize`):
 |---|---|---|---|---|---|
 | 42 MB (the test parent) | clonefile | not recorded | 316 ms | 3.0 s | 312 KiB |
 | 167 MB (150 MB of 100 KB rows) | clonefile | 108 ms | 282 ms | 3.0 s | 264 KiB for the clone, 17.9 MiB for the whole creation |
+| 1.1 GiB (CI, XFS `reflink=1` on a loop file) | reflink | 100 ms | 147 ms | 3.0 s | 1.2 MiB for the clone, 19.7 MiB for the whole creation |
+| 1.1 GiB (CI, ext4) | base-backup | not applicable | not applicable | 7.0 s (the parent's base backup took 5.7 s beforehand) | 1.19 GB |
 
 "Whole branch creation" is dominated by starting the new project (PostgreSQL, GoTrue migrations,
 PostgREST) and rotating its credentials, not by the clone. New disk is the drop in free space of the
 state directory's filesystem, so it includes whatever else wrote meanwhile; it is read as an order of
-magnitude, not a byte count. The 1 GB measurement on XFS (reflink) and on ext4 (base backup) is CI's
-job `branching-xfs` in `.github/workflows/linux.yml` (`tests/linux/branching-xfs.sh`); its
-numbers are in the job summary.
+magnitude, not a byte count. The 1 GB rows are CI's job `branching-xfs` in `.github/workflows/linux.yml`
+(`tests/linux/branching-xfs.sh`, ubuntu-24.04, also the whole branching scenario on each filesystem; its numbers are
+in the job summary). On ext4 the clone is a restore, so its cost grows with the database and the new disk
+is a full copy; on XFS and APFS it stays flat.
 
 ## Not done, not verified
 
@@ -233,7 +236,7 @@ numbers are in the job summary.
 * Branches are not covered by the nightly base backup timer until something enables
   `sb-basebackup@<ref>.timer` for them (the lifecycle does not enable timers yet); a persistent
   branch is backed up on delete only.
-* `clonefile` was run on APFS, `reflink` and the ext4 base-backup path only in CI (see the job).
+* `reflink` (XFS) and the ext4 base-backup path ran in CI only, on a loop-file XFS; btrfs and ZFS were not run.
 * No idle sleep: an unused branch costs its idle memory (about 130 MB with GoTrue and PostgREST).
 * Branches share the parent's pgsodium root key (see Credentials). `reset` of a branch made by the
   base-backup path gets new credentials.

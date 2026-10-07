@@ -60,6 +60,12 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
   `ACTIVE_HEALTHY` and `ACTIVE_UNHEALTHY` to match.
 - `StartActive`: starts every active project (after a reboot or `sbctl system stop`).
 
+## Branches
+
+`CreateRequest.Branch` (`*registry.BranchInfo`) makes the new project a branch: the registry row is
+written with it, so a branch is a branch from the moment it exists. `internal/branching` builds on
+that. `DeleteWith` refuses (`ErrInvalidState`, before it stops anything) while the project has branches.
+
 ## System project
 
 `InitSystem` is the same code path with ref `system` on `[ports] system_postgres` and
