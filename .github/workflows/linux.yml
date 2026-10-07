@@ -152,6 +152,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # The test clusters use ports 39000-39999, which lie inside Linux's ephemeral range: a client
+      # socket (a database or HTTP connection of the test, or of a service) that the kernel gives
+      # one of those ports stops a cluster started later from binding it ("address already in
+      # use"). Reserving the range keeps the allocator off it; binding to it explicitly still works.
+      - name: keep the test ports out of the ephemeral range
+        run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=39000-39999
       - name: branch clones on XFS and ext4
         run: tests/linux/branching-xfs.sh
       # A branch with data cannot reach the outside world: IPAddressDeny on its Postgres unit,
