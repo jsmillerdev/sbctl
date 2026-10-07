@@ -10,8 +10,9 @@
 # for the artifact downloads. Exit status is non-zero on the first failure; logs (journal,
 # unit list, host facts, per-unit memory) stay in $LOG_DIR (default /tmp/sbctl-linux-logs).
 #
-# Studio is skipped here: its artifact is our own build (studio.yml), not a slim-services
-# release, so a node without [studio] artifact_url has none to start.
+# Studio is not started here: its artifact is our own build (studio.yml), not a slim-services
+# release. Without [studio] artifact_url, `fleet start` skips it and `fleet status` does not
+# count it.
 #
 # Not run in development: it needs root, systemd and Linux. CI runs it on an ephemeral
 # Ubuntu 24.04 VM (amd64 and arm64).
@@ -74,7 +75,7 @@ system_init
 wait_active sb-postgres@system.service 30
 
 log "fleet start (downloads pooler, realtime, storage and pgmeta)"
-sbctl fleet start --skip studio || fail "fleet start"
+sbctl fleet start || fail "fleet start"   # no Studio artifact configured: skipped with a note
 for svc in pgmeta supavisor realtime storage; do
   u="sb-$svc.service"
   [[ $(unit_state "$u") == active ]] || fail "$u is $(unit_state "$u")"
@@ -82,11 +83,11 @@ for svc in pgmeta supavisor realtime storage; do
   [[ $(systemctl show -p Slice --value "$u") == sbctl.slice ]] || fail "$u is not in sbctl.slice"
   [[ $(systemctl show -p MemoryMax --value "$u") == 1073741824 ]] || fail "$u: MemoryMax drop-in not applied"
 done
-sbctl fleet status --skip studio || fail "fleet status"
+sbctl fleet status || fail "fleet status"   # an absent Studio does not count
 # A second start changes nothing: no unit restarts.
 declare -A PIDS
 for svc in pgmeta supavisor realtime storage; do PIDS[$svc]=$(systemctl show -p MainPID --value "sb-$svc.service"); done
-sbctl fleet start --skip studio --no-fetch || fail "second fleet start"
+sbctl fleet start --no-fetch || fail "second fleet start"
 for svc in pgmeta supavisor realtime storage; do
   [[ ${PIDS[$svc]} == "$(systemctl show -p MainPID --value "sb-$svc.service")" ]] || fail "sb-$svc was restarted by an unchanged fleet start"
 done
@@ -230,7 +231,7 @@ for svc in supavisor realtime storage pgmeta; do
   for ((i = 0; i < 90; i++)); do
     sleep 1
     new=$(systemctl show -p MainPID --value "$u")
-    if [[ $new -gt 0 && $new != "$pid" && $(unit_state "$u") == active ]] && sbctl fleet status --skip studio >/dev/null 2>&1; then ok=1; break; fi
+    if [[ $new -gt 0 && $new != "$pid" && $(unit_state "$u") == active ]] && sbctl fleet status >/dev/null 2>&1; then ok=1; break; fi
   done
   [[ $ok -eq 1 ]] || fail "$u did not come back healthy after kill -9"
   log "$u recovered"

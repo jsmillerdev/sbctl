@@ -82,6 +82,21 @@ type Health struct {
 	// Status is ACTIVE_HEALTHY, COMING_UP, UNHEALTHY or STOPPED.
 	Status string
 	Error  string
+	// Optional marks a service that is allowed to be absent: Studio, which needs our own
+	// artifact, on a node that never rendered its unit. Callers should not call the fleet
+	// unhealthy because of it.
+	Optional bool
+}
+
+// AllHealthy reports whether every service that is supposed to run is healthy; an
+// Optional service that is absent does not count.
+func AllHealthy(hs []Health) bool {
+	for _, h := range hs {
+		if !h.Healthy && !h.Optional {
+			return false
+		}
+	}
+	return len(hs) > 0
 }
 
 // Manager renders, starts, stops and checks the units of the shared services.
@@ -310,6 +325,15 @@ func (m *Manager) Stop(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// neverRendered reports whether svc is Studio and no unit was ever rendered for it.
+func (m *Manager) neverRendered(svc string) bool {
+	if svc != config.SvcStudio {
+		return false
+	}
+	_, err := os.Stat(units.FilesFor(m.cfg(), units.Spec{Service: svc}).Run)
+	return err != nil
+}
+
 // Status checks every service (except Deps.Skip): unit state plus a request to its
 // health endpoint.
 func (m *Manager) Status(ctx context.Context) []Health {
@@ -324,10 +348,14 @@ func (m *Manager) Status(ctx context.Context) []Health {
 		switch {
 		case err != nil:
 			h.Status, h.Error = "STOPPED", err.Error()
+			h.Optional = m.neverRendered(svc)
 		case st.State == units.StateActivating:
 			h.Status, h.Error = "COMING_UP", fmt.Sprintf("unit is %s/%s", st.State, st.SubState)
 		case st.State != units.StateActive:
 			h.Status, h.Error = "STOPPED", fmt.Sprintf("unit is %s/%s", st.State, st.SubState)
+			if h.Optional = m.neverRendered(svc); h.Optional {
+				h.Error = "never started on this node"
+			}
 		default:
 			if err := m.probe(ctx, svc); err != nil {
 				h.Status, h.Error = "UNHEALTHY", err.Error()

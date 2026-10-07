@@ -3,6 +3,8 @@ package fleet
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -208,5 +210,48 @@ func TestNewManagerValidates(t *testing.T) {
 	m, _ := NewManager(Deps{Cfg: n.cfg, Supervisor: newFakeSupervisor()})
 	if err := m.Start(context.Background()); err == nil {
 		t.Fatal("Start without registry accepted")
+	}
+}
+
+func TestStatusTreatsAnUnrenderedStudioAsOptional(t *testing.T) {
+	// A fresh node, nothing rendered: only Studio may be absent, so the fleet is still
+	// unhealthy (the four core services are stopped).
+	n := newTestNode(t)
+	d := n.deps()
+	d.Supervisor = newFakeSupervisor()
+	m, err := NewManager(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := m.Status(context.Background())
+	for _, h := range hs {
+		if want := h.Service == config.SvcStudio; h.Optional != want {
+			t.Errorf("%s: optional = %v", h.Service, h.Optional)
+		}
+	}
+	if AllHealthy(hs) {
+		t.Fatal("a stopped fleet is not healthy")
+	}
+	// Core services healthy, Studio never rendered: healthy.
+	for i := range hs {
+		if hs[i].Service != config.SvcStudio {
+			hs[i].Healthy = true
+		}
+	}
+	if !AllHealthy(hs) {
+		t.Fatal("an unrendered Studio must not make the fleet unhealthy")
+	}
+	// Once Studio's files exist it is expected to run.
+	run := units.FilesFor(n.cfg, units.Spec{Service: config.SvcStudio}).Run
+	if err := os.MkdirAll(filepath.Dir(run), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(run, []byte("#!/bin/sh\n"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range m.Status(context.Background()) {
+		if h.Service == config.SvcStudio && (h.Optional || h.Healthy) {
+			t.Errorf("a stopped Studio that was started before is a problem: %+v", h)
+		}
 	}
 }

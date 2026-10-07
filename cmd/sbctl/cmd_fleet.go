@@ -117,10 +117,8 @@ when no artifact is installed and [studio] artifact_url is not set.`,
 			defer closeFn()
 			hs := m.Status(cmd.Context())
 			fleetTable(cmd.OutOrStdout(), hs)
-			for _, h := range hs {
-				if !h.Healthy {
-					return errors.New("the shared services are not all healthy")
-				}
+			if !fleet.AllHealthy(hs) {
+				return errors.New("the shared services are not all healthy")
 			}
 			return nil
 		},
