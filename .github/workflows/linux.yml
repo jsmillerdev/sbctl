@@ -110,3 +110,31 @@ jobs:
           name: fleet-smoke-${{ matrix.arch }}
           path: /tmp/sbctl-fleet-logs
           if-no-files-found: ignore
+
+  functions-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build sbctl
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: functions smoke
+        run: sudo LOG_DIR=/tmp/sbctl-functions-logs SBCTL_BIN=/tmp/sbctl tests/linux/functions-smoke.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/sbctl-functions-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: functions-smoke-${{ matrix.arch }}
+          path: /tmp/sbctl-functions-logs
+          if-no-files-found: ignore
