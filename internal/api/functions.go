@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -127,6 +128,13 @@ func (s *Server) updateFunction(w http.ResponseWriter, r *http.Request) error {
 	if err := decode(r, &in); err != nil {
 		return err
 	}
+	if s.fnHook != nil && (in.Entrypoint != nil && *in.Entrypoint != f.EntrypointPath || in.ImportMap != nil && *in.ImportMap != f.ImportMapPath) {
+		// What the runtime serves is the bundle made at deploy time, which a change of these
+		// two paths would not touch: refuse instead of recording something that is not true.
+		if files, err := s.store.FunctionFiles(r.Context(), p.Ref, f.Slug); err == nil && len(storedSources(files)) != len(files) {
+			return errf(http.StatusBadRequest, "The entrypoint and the import map of a function are fixed when it is deployed, because this node bundles the uploaded sources then. Deploy the function again to change them.")
+		}
+	}
 	if in.Name != nil {
 		f.Name = *in.Name
 	}
@@ -227,11 +235,6 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if s.fnHook != nil {
-		// A node that runs Edge Functions serves bundles only (see internal/functions: a
-		// function run from source files could import other projects' files).
-		return errf(http.StatusBadRequest, "This node runs Edge Functions from bundles and does not accept source uploads (supabase functions deploy --use-api). Run `supabase functions deploy` without --use-api, which bundles the function and uploads the bundle.")
-	}
 	mr, err := r.MultipartReader()
 	if err != nil {
 		return errf(http.StatusBadRequest, "Expected multipart/form-data")
@@ -241,6 +244,8 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 		ImportMapPath  string `json:"import_map_path"`
 		VerifyJWT      *bool  `json:"verify_jwt"`
 		Name           string `json:"name"`
+		// StaticPatterns are the files to embed in the bundle (config.toml static_files).
+		StaticPatterns []string `json:"static_patterns"`
 	}
 	var files []FunctionFile
 	var total int64
@@ -274,6 +279,9 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 			if !ok {
 				return errf(http.StatusBadRequest, "Invalid file name %q", raw)
 			}
+			if name == BundleFileName || name == BundleInfoFileName {
+				return errf(http.StatusBadRequest, "The file name %q is reserved", raw)
+			}
 			files = append(files, FunctionFile{Path: name, Content: data})
 		}
 	}
@@ -293,6 +301,26 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 	if meta.ImportMapPath != "" {
 		f.ImportMapPath, _ = cleanFilePath(meta.ImportMapPath)
 	}
+	if s.fnHook != nil {
+		// A node that runs Edge Functions serves bundles only (see internal/functions: a
+		// function run from source files could import other projects' files), so the sources
+		// are bundled in a sandbox first and stored together with the bundle.
+		if !hasFile(files, entry) {
+			return errf(http.StatusBadRequest, "The entrypoint %q is not among the uploaded files", entry)
+		}
+		var static []string
+		for _, sp := range meta.StaticPatterns {
+			if clean, ok := cleanFilePath(sp); ok {
+				static = append(static, clean)
+			}
+		}
+		bundled, err := s.bundleSources(r.Context(), SourceBundle{Ref: p.Ref, Slug: slug, Files: files,
+			Entrypoint: entry, ImportMap: f.ImportMapPath, StaticPatterns: static})
+		if err != nil {
+			return err
+		}
+		files = bundleStoredFiles(files, bundled)
+	}
 	if err := s.store.UpsertFunction(r.Context(), f, files); err != nil {
 		return err
 	}
@@ -301,6 +329,41 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeJSON(w, http.StatusCreated, fnJSON(f))
 	return nil
+}
+
+func hasFile(files []FunctionFile, p string) bool {
+	for _, f := range files {
+		if f.Path == p {
+			return true
+		}
+	}
+	return false
+}
+
+// bundleSources has the node's hook bundle an upload of sources and turns its failures into
+// the API's answers.
+func (s *Server) bundleSources(ctx context.Context, in SourceBundle) (*BundledSource, error) {
+	const hint = " Deploy a bundle instead: run `supabase functions deploy` with Docker running, which bundles the function on your machine and uploads the bundle."
+	b, ok := s.fnHook.(SourceBundler)
+	if !ok {
+		return nil, errf(http.StatusNotImplemented, "This node cannot bundle uploaded sources."+hint)
+	}
+	res, err := b.BundleSources(ctx, in)
+	var be *BundleError
+	switch {
+	case err == nil:
+		return res, nil
+	case errors.As(err, &be):
+		return nil, errf(http.StatusBadRequest, "Could not bundle the function: %s", be.Msg)
+	case errors.Is(err, ErrBundlingUnavailable):
+		return nil, errf(http.StatusNotImplemented, "%v."+hint, err)
+	case errors.Is(err, ErrBundlingBusy):
+		return nil, errf(http.StatusTooManyRequests, "%v; try again in a minute", err)
+	case ctx.Err() != nil:
+		return nil, ctx.Err()
+	}
+	s.log.Error("edge functions: bundling uploaded sources", "ref", in.Ref, "slug", in.Slug, "err", err)
+	return nil, errf(http.StatusInternalServerError, "Bundling failed on this node: %v", err)
 }
 
 // partFileName returns the filename parameter of a part's Content-Disposition as sent.
@@ -329,7 +392,7 @@ func (s *Server) functionBody(w http.ResponseWriter, r *http.Request) error {
 	}
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	for _, file := range files {
+	for _, file := range storedSources(files) {
 		h := textproto.MIMEHeader{}
 		h.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": file.Path}))
 		h.Set("Content-Type", "application/octet-stream")

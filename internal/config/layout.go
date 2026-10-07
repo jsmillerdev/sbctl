@@ -88,6 +88,9 @@ const (
 	SvcStudio      = "studio"
 	SvcImgproxy    = "imgproxy"
 	SvcEdgeRuntime = "edge-runtime"
+	// SvcEdgeBundle is the one-shot unit (sb-edge-bundle.service) that bundles uploaded Edge
+	// Function sources inside a sandbox; it runs the edge-runtime artifact's "bundle" command.
+	SvcEdgeBundle = "edge-bundle"
 )
 
 // ProjectServices are templated per project; the rest are fleet singletons.

@@ -245,6 +245,9 @@ func (s *Systemd) revert(ctx context.Context, unit string) error {
 
 var _ Enabler = (*Systemd)(nil)
 
+// Sandboxed implements Sandboxer: the unit files confine their services.
+func (*Systemd) Sandboxed() bool { return true }
+
 // Enable makes units start at boot (systemctl enable). Template instances such as
 // "sb-postgres@system.service" are accepted.
 func (s *Systemd) Enable(ctx context.Context, units ...string) error {

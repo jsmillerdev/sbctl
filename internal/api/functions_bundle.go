@@ -2,8 +2,11 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
@@ -18,8 +21,86 @@ const (
 	// BundleFileName is the stored name of an uploaded bundle among a function's files. The
 	// body is kept as the CLI sent it: the bytes "EZBR" and a Brotli-compressed eszip.
 	BundleFileName = ".sbctl-bundle.ezbr"
-	bundleMagic    = "EZBR"
+	// BundleInfoFileName is stored next to a bundle that the node made from uploaded sources
+	// (the sources are stored too, so they can be read and downloaded again); it holds the
+	// module specifier of the entrypoint inside the bundle, see SourceBundleInfo.
+	BundleInfoFileName = ".sbctl-bundle.json"
+	bundleMagic        = "EZBR"
 )
+
+// SourceBundleInfo is the content of the BundleInfoFileName file.
+type SourceBundleInfo struct {
+	// Entrypoint is the module specifier of the entrypoint inside the bundle.
+	Entrypoint string `json:"entrypoint"`
+}
+
+// SourceBundle is an upload of source files that the node has to bundle.
+type SourceBundle struct {
+	Ref, Slug string
+	// Files are the sources, paths relative to the project's working directory.
+	Files []FunctionFile
+	// Entrypoint and ImportMap are paths among Files (ImportMap may be empty).
+	Entrypoint, ImportMap string
+	// StaticPatterns are the patterns of files to embed.
+	StaticPatterns []string
+}
+
+// BundledSource is the result of bundling: the upload as the CLI would have sent it.
+type BundledSource struct {
+	// Bundle is "EZBR" and the Brotli stream of the eszip.
+	Bundle []byte
+	// Entrypoint is the module specifier of the entrypoint inside the bundle.
+	Entrypoint string
+}
+
+// SourceBundler is implemented by a FunctionsHook that can bundle uploaded sources in a
+// sandbox (internal/functions). A node that runs Edge Functions never serves source files,
+// so without one its API refuses source uploads.
+type SourceBundler interface {
+	BundleSources(ctx context.Context, in SourceBundle) (*BundledSource, error)
+}
+
+// BundleError is a failure of the uploaded code or files (a module that does not exist, a
+// syntax error): the message is shown to the uploader.
+type BundleError struct{ Msg string }
+
+func (e *BundleError) Error() string { return e.Msg }
+
+var (
+	// ErrBundlingUnavailable means this node cannot bundle sources at all.
+	ErrBundlingUnavailable = errors.New("this node cannot bundle uploaded sources")
+	// ErrBundlingBusy means too many uploads are waiting to be bundled.
+	ErrBundlingBusy = errors.New("the bundler is busy")
+)
+
+// bundleStoredFiles is what is stored for sources that were bundled: the sources, the
+// bundle, and the entrypoint inside it.
+func bundleStoredFiles(files []FunctionFile, b *BundledSource) []FunctionFile {
+	info, _ := json.Marshal(SourceBundleInfo{Entrypoint: b.Entrypoint})
+	out := append([]FunctionFile(nil), files...)
+	return append(out, FunctionFile{Path: BundleFileName, Content: b.Bundle}, FunctionFile{Path: BundleInfoFileName, Content: info})
+}
+
+// storedSources returns the files of a function that the user uploaded, leaving out what the
+// node added.
+func storedSources(files []FunctionFile) []FunctionFile {
+	var out []FunctionFile
+	hasSources := false
+	for _, f := range files {
+		if f.Path != BundleFileName && f.Path != BundleInfoFileName {
+			hasSources = true
+		}
+	}
+	if !hasSources {
+		return files // an uploaded bundle: the bundle is all there is
+	}
+	for _, f := range files {
+		if f.Path != BundleFileName && f.Path != BundleInfoFileName {
+			out = append(out, f)
+		}
+	}
+	return out
+}
 
 // isBundleUpload reports whether the request carries a bundled function.
 func isBundleUpload(r *http.Request) bool {

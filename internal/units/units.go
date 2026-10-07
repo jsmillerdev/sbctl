@@ -22,6 +22,10 @@ type Spec struct {
 	// Exec overrides the artifact launcher (path relative to ArtifactDir, plus args).
 	// Empty means the service's standard launcher (StandardExec) without arguments.
 	Exec []string
+	// Log, when set, is a file the launcher script redirects its stdout and stderr to, for a
+	// one-shot unit whose caller wants the output (the exec backend's own log is not shared
+	// with systemd's journal). The path must be writable inside the unit.
+	Log string
 	// PreStart lists one-shot commands (path relative to ArtifactDir, plus args) run
 	// in order before Exec, with the same environment; a failing command stops the
 	// unit. GoTrue uses it for "bin/auth migrate".
@@ -63,6 +67,11 @@ type Supervisor interface {
 	// Remove stops the unit and deletes everything Render wrote for it.
 	Remove(ctx context.Context, unit string) error
 }
+
+// Sandboxer is implemented by a Supervisor to say whether the units it runs are confined by
+// their unit files (mount namespace, address filters). The exec backend runs plain child
+// processes and is not.
+type Sandboxer interface{ Sandboxed() bool }
 
 // ChangeRenderer is implemented by both backends. RenderChanged is Render that also
 // reports whether the env file or run script differed from what was on disk, which tells

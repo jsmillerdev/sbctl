@@ -85,6 +85,12 @@ type Functions struct {
 	// that hits its cgroup limit is killed whole, for every project. When max_workers is
 	// zero, memory_max sets it.
 	MemoryMax string `toml:"memory_max"`
+	// BundleUnsandboxed lets a node whose supervisor cannot sandbox (the exec backend of
+	// development machines) bundle uploaded sources anyway. The bundler reads imports from
+	// the disk, so without the sandbox of sb-edge-bundle.service an upload can import any
+	// file the sbctl user can read, other projects' files included. Never set it on a node
+	// that serves other people's projects. Ignored where the sandbox exists.
+	BundleUnsandboxed bool `toml:"bundle_unsandboxed"`
 	// ProjectURLTemplate is SUPABASE_URL as functions see it, with {ref} for the project
 	// ref. Empty derives it from the domain, the TLS mode and the public listen ports
 	// (https://<ref>.api.<domain>). Set it when functions must reach their own project
@@ -273,3 +279,7 @@ func limitOrOff(v, d int) int {
 func (p Paths) FunctionsRoot() string {
 	return filepath.Join(p.System(SvcEdgeRuntime), "tenants")
 }
+
+// EdgeBundleDir is the state directory of sb-edge-bundle.service: work/ holds the upload being
+// bundled (the unit sees nothing else of the node) and deno/ its module cache.
+func (p Paths) EdgeBundleDir() string { return p.System(SvcEdgeBundle) }

@@ -401,7 +401,7 @@ func runFunctionsDev(cmd *cobra.Command, _ []string) error {
 	}
 
 	store := functions.NewStore(n.Registry)
-	syncer, err := functions.New(functions.Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Store: store, Keys: n.Engine.Keys, Log: log})
+	syncer, err := functions.New(functions.Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Store: store, Keys: n.Engine.Keys, Log: log, Supervisor: n.Supervisor, Artifacts: n.Artifacts})
 	if err != nil {
 		return err
 	}

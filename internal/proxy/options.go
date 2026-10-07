@@ -54,7 +54,7 @@ type Options struct {
 	// Empty reads the node's secret (config.LoadFunctionsProxyToken) when the first
 	// /functions/v1 request arrives. Tests set it.
 	FunctionsProxyToken string
-	Logger           *slog.Logger
+	Logger              *slog.Logger
 }
 
 func (o *Options) validate() error {

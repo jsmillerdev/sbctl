@@ -55,6 +55,13 @@ func TestFormatRun(t *testing.T) {
 	if !strings.Contains(string(b), want) {
 		t.Fatalf("run script:\n%s\nwant to contain:\n%s", b, want)
 	}
+	b, err = FormatRun(Spec{Service: config.SvcEdgeBundle, ArtifactDir: "/art/edge", WorkDir: "/w", Log: "/w/it's.log", Exec: []string{"bin/edge-runtime", "bundle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "cd '/w'\nexec >'/w/it'\\''s.log' 2>&1\nexec '/art/edge/bin/edge-runtime' 'bundle'\n"; !strings.Contains(string(b), want) {
+		t.Fatalf("run script with a log:\n%s\nwant to contain:\n%s", b, want)
+	}
 	if _, err := FormatRun(Spec{Service: "postgres", ArtifactDir: "/a", Exec: []string{"/bin/sh"}}); err == nil {
 		t.Error("absolute command must be rejected")
 	}

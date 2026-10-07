@@ -147,6 +147,9 @@ func FormatRun(s Spec) ([]byte, error) {
 	if s.WorkDir != "" {
 		fmt.Fprintf(&b, "cd %s\n", shellQuote(s.WorkDir))
 	}
+	if s.Log != "" {
+		fmt.Fprintf(&b, "exec >%s 2>&1\n", shellQuote(s.Log))
+	}
 	for _, p := range s.PreStart {
 		l, err := line(p)
 		if err != nil {

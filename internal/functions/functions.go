@@ -44,6 +44,7 @@ import (
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/OWNER/sbctl/internal/units"
 )
 
 // Store is the part of api.Store the syncer reads.
@@ -65,6 +66,11 @@ type Deps struct {
 	Log  *slog.Logger
 	// Now is the clock; empty means time.Now.
 	Now func() time.Time
+	// Supervisor and Artifacts let the Syncer bundle uploaded sources in the sandbox of
+	// sb-edge-bundle.service (lifecycle.Node's Supervisor and Artifacts). Without them, or
+	// where the supervisor cannot confine the bundler, source uploads are refused.
+	Supervisor units.Supervisor
+	Artifacts  ArtifactDirs
 }
 
 // Syncer keeps the files of the runtime equal to the store. It implements api.FunctionsHook.
@@ -81,9 +87,17 @@ type Syncer struct {
 	// bundle). Reconcile skips it without loading the files again until the stored
 	// deployment changes, so a large or hostile upload costs one load, not one per cycle.
 	settled map[string]string
+
+	// bundler turns uploaded sources into a bundle; nil, with bundlerWhy saying why, when this
+	// node cannot.
+	bundler    *Bundler
+	bundlerWhy string
 }
 
-var _ api.FunctionsHook = (*Syncer)(nil)
+var (
+	_ api.FunctionsHook = (*Syncer)(nil)
+	_ api.SourceBundler = (*Syncer)(nil)
+)
 
 // New returns a Syncer.
 func New(d Deps) (*Syncer, error) {
@@ -97,7 +111,29 @@ func New(d Deps) (*Syncer, error) {
 	if s.now == nil {
 		s.now = time.Now
 	}
+	switch {
+	case d.Supervisor == nil || d.Artifacts == nil:
+		s.bundlerWhy = "the API server was not given a supervisor and an artifact store to run the bundler with"
+	default:
+		b, err := NewBundler(d.Cfg, d.Supervisor, d.Artifacts, s.log)
+		if err != nil {
+			s.bundlerWhy = err.Error()
+		}
+		s.bundler = b
+	}
 	return s, nil
+}
+
+// BundleSources implements api.SourceBundler.
+func (s *Syncer) BundleSources(ctx context.Context, in api.SourceBundle) (*api.BundledSource, error) {
+	if s.bundler == nil {
+		return nil, fmt.Errorf("%w (%s)", api.ErrBundlingUnavailable, s.bundlerWhy)
+	}
+	bundle, entry, err := s.bundler.Bundle(ctx, BundleInput{Files: in.Files, Entrypoint: in.Entrypoint, ImportMap: in.ImportMap, Static: in.StaticPatterns})
+	if err != nil {
+		return nil, err
+	}
+	return &api.BundledSource{Bundle: bundle, Entrypoint: entry}, nil
 }
 
 func (s *Syncer) lock(ref string) func() {
@@ -390,8 +426,7 @@ func fnStamp(f *api.Function) string {
 
 // current reports whether the generation m describes is the one the store holds for f.
 func (m meta) current(f *api.Function) bool {
-	return m.Kind == kindEszip && m.Stamp == fnStamp(f) && m.Slug == f.Slug &&
-		m.VerifyJWT == f.VerifyJWT && m.Entrypoint == f.EntrypointPath
+	return m.Kind == kindEszip && m.Stamp == fnStamp(f) && m.Slug == f.Slug && m.VerifyJWT == f.VerifyJWT
 }
 
 func filesHash(files []api.FunctionFile) string {
@@ -427,24 +462,44 @@ func (s *Syncer) syncFunction(ctx context.Context, dir string, f *api.Function) 
 	if err != nil {
 		return err
 	}
+	bundle := -1
+	for i, file := range files {
+		if file.Path == api.BundleFileName {
+			bundle = i
+		}
+	}
 	switch {
 	case len(files) == 0:
 		// Created without sources (the legacy JSON create): nothing to serve.
 		s.settle(key, stamp)
 		return removeLink(link, dir, f.Slug, "")
-	case len(files) != 1 || files[0].Path != api.BundleFileName:
-		// Sources, stored before the API refused them or while no runtime was configured.
+	case bundle < 0:
+		// Sources with no bundle: stored before the API bundled uploads or while no runtime
+		// was configured.
 		s.settle(key, stamp)
-		s.log.Warn("edge functions: a function stored as source files is not served; deploy it again with `supabase functions deploy` (without --use-api)",
+		s.log.Warn("edge functions: a function stored as source files without a bundle is not served; deploy it again",
 			"ref", f.Ref, "slug", f.Slug, "version", f.Version)
 		return removeLink(link, dir, f.Slug, "")
 	}
-	if f.EntrypointPath == "" {
+	// An uploaded bundle names its entrypoint in the function record; sources the node
+	// bundled itself record the entrypoint inside the bundle next to it.
+	entry := f.EntrypointPath
+	for _, file := range files {
+		if file.Path == api.BundleInfoFileName {
+			var info api.SourceBundleInfo
+			if err := json.Unmarshal(file.Content, &info); err != nil || info.Entrypoint == "" {
+				s.settle(key, stamp)
+				return fmt.Errorf("the stored bundle info is unusable: %v", err)
+			}
+			entry = info.Entrypoint
+		}
+	}
+	if entry == "" {
 		s.settle(key, stamp)
 		return errors.New("a bundled function needs its entrypoint")
 	}
 	m := meta{Slug: f.Slug, Version: f.Version, VerifyJWT: f.VerifyJWT, Kind: kindEszip,
-		Entrypoint: f.EntrypointPath, Eszip: EszipFileName, Stamp: stamp, SHA256: filesHash(files)}
+		Entrypoint: entry, Eszip: EszipFileName, Stamp: stamp, SHA256: filesHash(files)}
 	gen, err := os.MkdirTemp(filepath.Join(dir, genDirName), fmt.Sprintf("%s.%d.", f.Slug, f.Version))
 	if err != nil {
 		return err
@@ -455,7 +510,7 @@ func (s *Syncer) syncFunction(ctx context.Context, dir string, f *api.Function) 
 			_ = os.RemoveAll(gen)
 		}
 	}()
-	if err := writeBundleFile(filepath.Join(gen, EszipFileName), files[0].Content); err != nil {
+	if err := writeBundleFile(filepath.Join(gen, EszipFileName), files[bundle].Content); err != nil {
 		var p permanent
 		if errors.As(err, &p) {
 			s.settle(key, stamp)

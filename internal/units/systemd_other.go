@@ -28,3 +28,5 @@ func (*Systemd) Start(context.Context, string) error               { return errN
 func (*Systemd) Stop(context.Context, string) error                { return errNoSystemd }
 func (*Systemd) Remove(context.Context, string) error              { return errNoSystemd }
 func (*Systemd) Status(context.Context, string) (Status, error)    { return Status{}, errNoSystemd }
+
+func (*Systemd) Sandboxed() bool { return true }

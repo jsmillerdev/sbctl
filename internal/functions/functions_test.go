@@ -940,16 +940,41 @@ func TestBadBundlesAreRefused(t *testing.T) {
 	if n := len(gens(t, e.cfg, refA)); n != 0 {
 		t.Errorf("%d generations left behind", n)
 	}
-	// A bundle next to another file is not a bundle upload: it is treated as sources.
-	files := []api.FunctionFile{{Path: api.BundleFileName, Content: helloBundle(t)}, {Path: "index.ts", Content: []byte("x")}}
+	// Sources without a bundle are not served, whatever else is stored with them.
+	files := []api.FunctionFile{{Path: "index.ts", Content: []byte("x")}, {Path: api.BundleInfoFileName, Content: []byte(`{"entrypoint":"file:///x/index.ts"}`)}}
 	if err := e.store.UpsertFunction(ctx, f, files); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.s.SyncProject(ctx, refA); err != nil {
-		t.Errorf("extra file: %v", err)
+		t.Errorf("sources without a bundle: %v", err)
 	}
 	if _, err := os.Lstat(FunctionPath(e.cfg, refA, "bad")); err == nil {
-		t.Error("extra file: went live")
+		t.Error("sources without a bundle: went live")
+	}
+	// Sources the node bundled itself: the bundle is served, with the entrypoint recorded next
+	// to it (the function's own entrypoint_path is the path of the source file).
+	files = []api.FunctionFile{{Path: "index.ts", Content: []byte("x")}, {Path: api.BundleFileName, Content: helloBundle(t)},
+		{Path: api.BundleInfoFileName, Content: []byte(`{"entrypoint":"file:///scratch/src/index.ts"}`)}}
+	f.EntrypointPath = "supabase/functions/bad/index.ts"
+	if err := e.store.UpsertFunction(ctx, f, files); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.SyncProject(ctx, refA); err != nil {
+		t.Fatalf("bundled sources: %v", err)
+	}
+	if m, ok := liveMeta(FunctionPath(e.cfg, refA, "bad")); !ok || m.Entrypoint != "file:///scratch/src/index.ts" || m.Kind != "eszip" {
+		t.Fatalf("bundled sources: meta %+v ok=%v", m, ok)
+	}
+	if _, err := os.Stat(filepath.Join(FunctionPath(e.cfg, refA, "bad"), "index.ts")); err == nil {
+		t.Fatal("a source file was written to the generation")
+	}
+	// Unusable entrypoint info is an error, not a function that cannot boot.
+	files[2].Content = []byte("nope")
+	if err := e.store.UpsertFunction(ctx, f, files); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.SyncProject(ctx, refA); err == nil || !strings.Contains(err.Error(), "bundle info") {
+		t.Fatalf("bad bundle info: %v", err)
 	}
 	// A bundle without an entrypoint cannot start.
 	f.EntrypointPath = ""

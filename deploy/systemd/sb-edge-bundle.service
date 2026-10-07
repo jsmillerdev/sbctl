@@ -1,0 +1,67 @@
+[Unit]
+Description=sbctl one-shot bundler for uploaded Edge Function sources
+Documentation=https://github.com/OWNER/sbctl
+After=network.target local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+# Started by the Management API for one upload at a time (sbctl renders the two files below, and
+# the upload under /var/lib/sbctl/system/edge-bundle/work, before it starts the unit). It runs
+# "edge-runtime bundle", which parses the function's modules and writes one eszip file; it does
+# not run any of the function's code.
+#
+# The sources are another person's code and their imports are paths: a function can import
+# "../../../<other project>/functions-env.json" or any other file the sbctl user can read, and
+# the bundle would carry it out to the uploader. So this unit sees nothing of the node but its
+# own scratch directory and the artifacts.
+Type=oneshot
+User=sbctl
+Group=sbctl
+Slice=sbctl.slice
+EnvironmentFile=/var/lib/sbctl/projects/system/edge-bundle.env
+ExecStart=/var/lib/sbctl/projects/system/edge-bundle.run
+# A bundle that has not finished in this time is killed; the API's request gives up at about the same time.
+TimeoutStartSec=150s
+MemoryAccounting=yes
+CPUAccounting=yes
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=512
+LimitNOFILE=4096
+SyslogIdentifier=sb-edge-bundle
+
+# Hardening, as sb-edge-runtime.service.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+# The bundler fetches remote imports (https:, npm:), so it keeps the network, minus the
+# instance metadata service (the EC2 role) and every loopback service of the node (the
+# Management API, Postgres and the other services listen there). Allow wins over deny: the
+# stub resolver of systemd-resolved stays reachable for DNS.
+IPAddressDeny=169.254.169.254 localhost
+IPAddressAllow=127.0.0.53 127.0.0.54
+# Containment (allowlist), as sb-edge-runtime.service: an empty tmpfs where /var/lib/sbctl is,
+# the artifacts and the launcher read-only, and the one directory this unit works in.
+InaccessiblePaths=-/etc/sbctl
+TemporaryFileSystem=/var/lib/sbctl:ro
+BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/system/edge-bundle.run
+BindPaths=/var/lib/sbctl/system/edge-bundle
+ReadWritePaths=/var/lib/sbctl/system/edge-bundle
+
+# Never enabled: the API starts it when someone uploads sources.

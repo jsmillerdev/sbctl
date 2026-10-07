@@ -112,9 +112,30 @@ func TestFunctionsHookFailureSaysTheChangeIsStored(t *testing.T) {
 	}
 }
 
-// A node that runs functions serves bundles only; a source upload would run from real
-// files, where relative imports can reach other projects' files.
-func TestSourceUploadsAreRefusedWhereFunctionsRun(t *testing.T) {
+// bundlingHook is a hook that can bundle: it records what it was given and answers with a
+// canned bundle or error.
+type bundlingHook struct {
+	recordingHook
+	in     []SourceBundle
+	result *BundledSource
+	fail   error
+}
+
+func (h *bundlingHook) BundleSources(_ context.Context, in SourceBundle) (*BundledSource, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.in = append(h.in, in)
+	if h.fail != nil {
+		return nil, h.fail
+	}
+	return h.result, nil
+}
+
+// A node that runs functions serves bundles only (a function that ran from real source
+// files could import other projects' files through its relative imports), so an upload of
+// sources is bundled first, by a hook that confines the bundler; a node that cannot bundle
+// says so and what to do instead.
+func TestSourceUploadsAreBundledWhereFunctionsRun(t *testing.T) {
 	f := newFixture(t)
 	body, ctype := functionUpload(t, "index.ts", "console.log(1)")
 	url := "/v1/projects/" + testRef + "/functions/deploy?slug=hello"
@@ -122,20 +143,87 @@ func TestSourceUploadsAreRefusedWhereFunctionsRun(t *testing.T) {
 	if rec := f.do("POST", url, body, "Content-Type", ctype); rec.Code != 201 {
 		t.Fatalf("deploy without a runtime: %d %s", rec.Code, rec.Body)
 	}
-	h := &recordingHook{}
-	withHook(t, f, h)
+
+	// A hook that cannot bundle: refused, with the way out.
+	plain := &recordingHook{}
+	withHook(t, f, plain)
 	rec := f.do("POST", url+"2", body, "Content-Type", ctype)
-	if rec.Code != 400 {
-		t.Fatalf("source deploy with a runtime: %d %s", rec.Code, rec.Body)
+	if rec.Code != 501 {
+		t.Fatalf("source deploy with a runtime that cannot bundle: %d %s", rec.Code, rec.Body)
 	}
-	if msg, _ := jsonField(t, rec, "message").(string); !strings.Contains(msg, "without --use-api") {
+	if msg, _ := jsonField(t, rec, "message").(string); !strings.Contains(msg, "supabase functions deploy") || !strings.Contains(msg, "Docker") {
 		t.Fatalf("message %q does not say what to do", msg)
 	}
-	if h.count() != 0 {
+	if plain.count() != 0 {
 		t.Fatal("a refused upload reached the hook")
 	}
 	if _, err := f.srv.store.GetFunction(context.Background(), testRef, "hello2"); err == nil {
 		t.Fatal("a refused upload was stored")
+	}
+
+	// A hook that bundles: the sources are stored with the bundle and the entrypoint in it.
+	h := &bundlingHook{result: &BundledSource{Bundle: []byte("EZBRxyz"), Entrypoint: "file:///scratch/src/index.ts"}}
+	withHook(t, f, h)
+	rec = f.do("POST", url+"3", body, "Content-Type", ctype)
+	if rec.Code != 201 {
+		t.Fatalf("source deploy with a bundling runtime: %d %s", rec.Code, rec.Body)
+	}
+	if len(h.in) != 1 || h.in[0].Ref != testRef || h.in[0].Slug != "hello3" || h.in[0].Entrypoint != "index.ts" || len(h.in[0].Files) != 1 || string(h.in[0].Files[0].Content) != "console.log(1)" {
+		t.Fatalf("the hook was given %+v", h.in)
+	}
+	if h.count() != 1 {
+		t.Fatalf("%d calls of FunctionsChanged, want 1", h.count())
+	}
+	files, err := f.srv.store.FunctionFiles(context.Background(), testRef, "hello3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, file := range files {
+		got[file.Path] = string(file.Content)
+	}
+	if len(got) != 3 || got["index.ts"] != "console.log(1)" || got[BundleFileName] != "EZBRxyz" || !strings.Contains(got[BundleInfoFileName], "file:///scratch/src/index.ts") {
+		t.Fatalf("stored %v", got)
+	}
+	// The sources can be read back; the node's own files are not part of them.
+	rec = f.do("GET", "/v1/projects/"+testRef+"/functions/hello3/body", nil)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "console.log(1)") || strings.Contains(rec.Body.String(), "EZBRxyz") || strings.Contains(rec.Body.String(), BundleFileName) {
+		t.Fatalf("body: %d %s", rec.Code, rec.Body)
+	}
+
+	// A broken upload is the uploader's error, with the bundler's words.
+	h.fail = &BundleError{Msg: "Module not found \"file:///x/missing.ts\""}
+	rec = f.do("POST", url+"4", body, "Content-Type", ctype)
+	if msg, _ := jsonField(t, rec, "message").(string); rec.Code != 400 || !strings.Contains(msg, "Module not found") {
+		t.Fatalf("bundle error: %d %s", rec.Code, rec.Body)
+	}
+	if _, err := f.srv.store.GetFunction(context.Background(), testRef, "hello4"); err == nil {
+		t.Fatal("an upload that failed to bundle was stored")
+	}
+	for err, want := range map[error]int{ErrBundlingBusy: 429, ErrBundlingUnavailable: 501, errors.New("unit did not run"): 500} {
+		h.fail = err
+		if rec := f.do("POST", url+"5", body, "Content-Type", ctype); rec.Code != want {
+			t.Fatalf("%v: %d %s, want %d", err, rec.Code, rec.Body, want)
+		}
+	}
+	// An entrypoint that is not among the files is a 400 before any bundling.
+	h.fail, h.in = nil, nil
+	bad, ctype2 := functionUpload(t, "index.ts", "x")
+	bad = []byte(strings.Replace(string(bad), `"entrypoint_path":"index.ts"`, `"entrypoint_path":"other.ts"`, 1))
+	if rec := f.do("POST", url+"6", bad, "Content-Type", ctype2); rec.Code != 400 || len(h.in) != 0 {
+		t.Fatalf("entrypoint missing: %d %s (%d calls)", rec.Code, rec.Body, len(h.in))
+	}
+	// The names the node stores its own files under cannot be uploaded.
+	reserved, ctype3 := functionUpload(t, BundleFileName, "x")
+	if rec := f.do("POST", url+"7", reserved, "Content-Type", ctype3); rec.Code != 400 {
+		t.Fatalf("reserved name: %d %s", rec.Code, rec.Body)
+	}
+	// The entrypoint and import map of a bundled-from-sources function are fixed at deploy.
+	if rec := f.do("PATCH", "/v1/projects/"+testRef+"/functions/hello3", map[string]any{"entrypoint_path": "other.ts"}); rec.Code != 400 {
+		t.Fatalf("patching the entrypoint: %d %s", rec.Code, rec.Body)
+	}
+	if rec := f.do("PATCH", "/v1/projects/"+testRef+"/functions/hello3", map[string]any{"verify_jwt": false}); rec.Code != 200 {
+		t.Fatalf("patching verify_jwt: %d %s", rec.Code, rec.Body)
 	}
 }
 
