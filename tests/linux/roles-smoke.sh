@@ -220,7 +220,9 @@ done
 [[ $(curl -sS -m 30 -H "Authorization: Bearer ${JWT[ro]}" "$ADMIN/platform/organizations/$ORG/members" | json_get 'len(d)') == 5 ]] || fail "members"
 
 log "Read-only: reads work, every write is refused"
-sql "create table if not exists public.roles_t (id int primary key, v text); insert into public.roles_t values (1, 'a') on conflict do nothing" >/dev/null
+# The table is made through the API (as the project's postgres role, like every role's SQL), so
+# that the Developer's writes below meet the privileges they will have in real use.
+expect 201 "${PAT[owner]}" POST "$CFG/database/query" '{"query":"create table if not exists public.roles_t (id int primary key, v text); insert into public.roles_t values (1, '"'"'a'"'"') on conflict do nothing"}'
 for r in ro dev admin owner; do
   expect 200 "${PAT[$r]}" GET /v1/projects
   expect 200 "${PAT[$r]}" GET "/v1/organizations/$ORG/members"
