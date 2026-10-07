@@ -196,9 +196,31 @@ for ((i = 0; i < 30; i++)); do
 done
 sbctl projects health "$B" || fail "$B did not recover from a PostgREST crash"
 
-log "delete both projects"
+# mint_dashboard_jwt SECRET: a dashboard session as GoTrue issues it (HS256 with the system
+# project's secret, aud "authenticated", app_metadata.sbctl_admin), for the Management API.
+mint_dashboard_jwt() {
+  python3 - "$1" <<'PY'
+import base64, hashlib, hmac, json, sys, time
+def b64(x): return base64.urlsafe_b64encode(x).rstrip(b"=")
+head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+body = b64(json.dumps({"aud": "authenticated", "sub": "00000000-0000-4000-8000-000000000001",
+                       "email": "smoke@example.test", "role": "", "app_metadata": {"sbctl_admin": True},
+                       "exp": int(time.time()) + 1800}).encode())
+sig = b64(hmac.new(sys.argv[1].encode(), head + b"." + body, hashlib.sha256).digest())
+print((head + b"." + body + b"." + sig).decode())
+PY
+}
+JWT=$(mint_dashboard_jwt "$(project_field system 'd["keys"]["jwt_secret"]' --show-keys)")
+[[ $(http_code -H "Authorization: Bearer $JWT" http://127.0.0.1:7000/v1/projects) == 200 ]] || fail "a dashboard session is not accepted by the Management API"
+
+log "delete both projects: $A through the Management API (the daemon's own sandbox), $B with the CLI"
 for ref in "$A" "$B"; do
-  sbctl projects delete "$ref"
+  if [[ $ref == "$A" ]]; then
+    code=$(curl -s -o "${LOG_DIR:-/tmp}/api-delete.json" -w '%{http_code}' --max-time 900 -X DELETE -H "Authorization: Bearer $JWT" "http://127.0.0.1:7000/v1/projects/$ref" || true)
+    [[ $code == 200 ]] || { cat "${LOG_DIR:-/tmp}/api-delete.json" >&2 || true; journalctl --no-pager -u sbctl.service | tail -30 >&2; fail "$ref: API delete answered $code"; }
+  else
+    sbctl projects delete "$ref"
+  fi
   for svc in postgres gotrue postgrest; do
     [[ $(unit_state "sb-$svc@$ref.service") == inactive ]] || fail "sb-$svc@$ref still $(unit_state "sb-$svc@$ref.service")"
   done

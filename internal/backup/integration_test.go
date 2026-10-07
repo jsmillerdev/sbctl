@@ -253,6 +253,9 @@ func (m *pgManager) Pause(_ context.Context, ref string) error {
 }
 
 func (m *pgManager) Resume(_ context.Context, ref string) error {
+	if m.failStart {
+		return m.insts[ref].tryStart() // a cluster that dies in recovery is an error, not a failed test
+	}
 	m.insts[ref].start()
 	return nil
 }
@@ -646,5 +649,94 @@ func TestRestoreRunningSourceToRecentTime(t *testing.T) {
 		if ev.Kind == "restore.completed" && strings.Contains(string(ev.Payload), "cdefghijklmnopqrstuv") {
 			t.Fatal("a failed restore was recorded as completed")
 		}
+	}
+}
+
+// An in-place restore whose recovery cannot reach its target (a time in the future: no
+// commit in the archive satisfies it) makes PostgreSQL end recovery with a fatal error and
+// shut down, usually before the manager's readiness check passes. The restore must put
+// the original data back and leave the project running on it, with the failed attempt
+// kept for inspection. A fake manager covers the branches
+// (TestRestoreInPlaceRollsBackWhenResumeFails); this is the real fatal path.
+func TestRestoreInPlaceRollsBackWhenRecoveryCannotReachItsTarget(t *testing.T) {
+	bin := pgBinDir(t)
+	sbctl := sbctlBinary(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	archiveDir := filepath.Join(root, "archive")
+	st, err := NewFileStore(archiveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newTestEnv(t)
+	e.now = time.Now()
+	e.svc.opt.Now = time.Now
+	cfgPath := filepath.Join(root, "sbctl.toml")
+	writeFile(t, cfgPath, []byte(fmt.Sprintf("state_dir = %q\nbin_path = %q\n\n[backup]\nbackend = %q\nretention_days = 7\n",
+		filepath.Join(root, "state"), sbctl, "file://"+archiveDir)))
+	e.cfg.BinPath = sbctl
+	e.svc.opt.Store, e.store = st, nil
+	e.svc.opt.ConfigPath = cfgPath
+	e.svc.opt.RecoveryPoll = 200 * time.Millisecond
+	e.svc.opt.RecoveryFailGrace = 3 * time.Second
+
+	src := newSourceCluster(t, bin, root, testRef, ArchiveSettings(e.cfg, testRef, cfgPath))
+	src.start()
+	e.addProject(t, testRef)
+	access := &portAccess{ports: map[string]int{testRef: src.port}}
+	mgr := &pgManager{t: t, e: e, bin: bin, root: root, access: access, insts: map[string]*pgInstance{testRef: src}, failStart: true}
+	e.svc.opt.Access, e.svc.opt.Manager = access, mgr
+	e.svc.opt.DataDir = func(string) string { return src.dir }
+
+	c := src.connect(ctx)
+	for _, sql := range []string{"create table public.t (id int primary key)", "insert into public.t values (1)"} {
+		if _, err := c.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if _, err := e.svc.BaseBackup(ctx, testRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec(ctx, "insert into public.t values (2)"); err != nil {
+		t.Fatal(err)
+	}
+	c.Close(ctx)
+
+	_, err = e.svc.RestoreWith(ctx, testRef, time.Now().Add(time.Hour), "", RestoreOptions{Force: true})
+	if err == nil {
+		t.Fatal("an in-place restore to a time no commit reaches succeeded")
+	}
+	if !strings.Contains(err.Error(), "original data is back in place") {
+		t.Fatalf("restore error does not say the original is back: %v", err)
+	}
+	t.Logf("restore failed as it must: %v", err)
+
+	// The original cluster runs again, on its own data, on the original timeline.
+	c2 := src.connect(ctx)
+	if ids := queryIDs(t, ctx, c2); idsString(ids) != "[1 2]" {
+		t.Fatalf("rows after the rolled-back restore = %v, want the original [1 2]", ids)
+	}
+	var inRec bool
+	if err := c2.QueryRow(ctx, "select pg_is_in_recovery()").Scan(&inRec); err != nil || inRec {
+		t.Fatalf("original cluster in recovery = %v, %v", inRec, err)
+	}
+	if _, err := os.Stat(filepath.Join(src.dir, "recovery.signal")); err == nil {
+		t.Error("recovery.signal came back with the original data directory")
+	}
+	if failed, _ := filepath.Glob(src.dir + ".failed-restore-*"); len(failed) != 1 {
+		t.Errorf("failed restore not kept for inspection: %v", failed)
+	}
+	if aside, _ := filepath.Glob(src.dir + ".pre-restore-*"); len(aside) != 0 {
+		t.Errorf("the moved-aside directory is still there: %v", aside)
+	}
+	evs, _ := e.reg.ListEvents(ctx, testRef, 50)
+	for _, ev := range evs {
+		if ev.Kind == "restore.completed" {
+			t.Error("a failed restore was recorded as completed")
+		}
+	}
+	// And it can still be backed up.
+	if _, err := e.svc.BaseBackup(ctx, testRef); err != nil {
+		t.Fatalf("base backup after the rolled-back restore: %v", err)
 	}
 }

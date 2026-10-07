@@ -74,9 +74,29 @@ directory with an empty tmpfs, and the unit gets back only:
 No template binds a project or system directory as a whole, and none needs to read an
 environment file: systemd (PID 1) reads `EnvironmentFile=` before it builds the namespace.
 The Postgres template hides only `/etc/sbctl/master.key`, because `archive_command`
-(`sbctl wal push`) reads `config.toml` for the backend. `internal/units`
+(`sbctl wal push`) reads `config.toml` for the backend. **That makes `/etc/sbctl/config.toml`
+readable by every project's Postgres, and with it whatever secrets it holds:
+`backup.s3_secret_access_key` (and the access key id) and the DNS-01 provider credentials in
+`tls.credentials`.** A tenant that can run code in its cluster can read them, so anyone who
+runs untrusted SQL extensions or hands out `postgres`-role access should keep S3 and DNS
+credentials out of `config.toml`: use an instance profile or a bucket policy scoped to the
+backup prefix for S3, and the HTTP-01 challenge instead of DNS-01. (A backup-only file that the
+Postgres units can read, with `config.toml` hidden from them, is the fix; it is not done.) `internal/units`
 (`TestTemplatesContainment`) pins this shape, and `tests/linux/systemd-smoke.sh` checks it
 from inside the namespaces of a real node (CI, amd64 and arm64).
+
+**The writable artifact directory is a persistence path.** `artifacts/postgres/` is writable
+in every project's Postgres namespace and shared by all clusters, the system cluster that holds
+the registry included, and `artifacts` unpacks owned by the `sbctl` user (`artifacts.handOver`).
+One cluster can replace the Postgres binaries that every other cluster, and the control
+plane's own database, run at their next restart. The only reason it is writable is the
+launcher's one `chmod +x` of `share/supabase-cli/config/pgsodium_getkey.sh` under `set -e`,
+which fails on a read-only or foreign-owned tree even when the bit is already set. Fix
+(recorded, not done, because it needs iteration on Linux): keep the artifact tree root-owned
+and read-only, give each cluster a private writable copy of only `share/supabase-cli/config`
+(a per-project `BindPaths=` rendered into the unit's drop-in by the plane, since the template
+cannot know the artifact tag), drop `handOver`, and send the upstream change that makes the
+chmod conditional. This is part of the same trust model as above: one trust domain per node.
 
 Two limits of the file backend follow from the allowlist: it must live under
 `/var/lib/sbctl/backups` for the systemd backend (a backend elsewhere needs a drop-in that

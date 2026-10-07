@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
-	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -188,8 +188,8 @@ func (c *Config) Validate() error {
 	if c.Region == "" {
 		c.Region = DefaultRegion
 	}
-	if !regionRE.MatchString(c.Region) {
-		return fmt.Errorf("config: region %q is not an AWS region code such as us-east-1", c.Region)
+	if !ValidRegion(c.Region) {
+		return fmt.Errorf("config: region %q is not one of the regions Studio knows (%s; the list is AWS_REGIONS in Studio's packages/shared-data/regions.ts)", c.Region, strings.Join(Regions, ", "))
 	}
 	if c.Ports.ProjectBase < 1024 || c.MaxProjectSeq() < 1 {
 		return fmt.Errorf("config: ports.project_base %d out of range", c.Ports.ProjectBase)
@@ -260,17 +260,25 @@ func lookup(environ []string, name string) (string, bool) {
 	return "", false
 }
 
-// regionRE matches AWS region codes (us-east-1, eu-central-2, ap-southeast-4, us-gov-west-1).
-var regionRE = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]$`)
+// Regions are the region codes Studio knows: AWS_REGIONS in packages/shared-data/regions.ts
+// at the pinned Studio commit (versions.yaml, studio). Studio resolves a project's region
+// against this table and its project list breaks on any other code, real AWS region or not
+// (eu-south-1, ap-east-1 and us-gov-west-1 included). Update it when the Studio pin moves.
+var Regions = []string{
+	"us-west-1", "us-west-2", "us-east-1", "us-east-2", "ca-central-1",
+	"eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-central-2", "eu-north-1",
+	"ap-south-1", "ap-southeast-1", "ap-northeast-1", "ap-northeast-2", "ap-southeast-2",
+	"sa-east-1",
+}
 
-// ValidRegion reports whether s looks like an AWS region code.
-func ValidRegion(s string) bool { return regionRE.MatchString(s) }
+// ValidRegion reports whether s is one of Regions.
+func ValidRegion(s string) bool { return slices.Contains(Regions, s) }
 
 // ProjectRegion maps a stored or requested project region to the label shown to
-// clients: a real region code is kept, anything else (empty, the old "local") becomes
-// the configured region.
+// clients: a code in Regions is kept, anything else (empty, the old "local") becomes the
+// configured region.
 func (c *Config) ProjectRegion(s string) string {
-	if regionRE.MatchString(s) {
+	if ValidRegion(s) {
 		return s
 	}
 	if c.Region != "" {
