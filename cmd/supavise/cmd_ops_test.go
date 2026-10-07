@@ -40,6 +40,26 @@ func opsConfig(t *testing.T, extra string) (cfgPath, state string) {
 	return cfgPath, state
 }
 
+// resetFlags puts the flags of a command back to their defaults: the commands are package
+// variables, so a flag one run set would otherwise still be set for the next.
+func resetFlags(t *testing.T, path []string, names ...string) {
+	t.Helper()
+	c, _, err := rootCmd.Find(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		f := c.Flags().Lookup(n)
+		if f == nil {
+			t.Fatalf("no flag %s", n)
+		}
+		_ = f.Value.Set(f.DefValue)
+		f.Changed = false
+	}
+}
+
+var announceFlags = []string{"at", "until", "duration", "notice", "message"}
+
 func TestOpsCommandsAreRegistered(t *testing.T) {
 	for _, path := range [][]string{
 		{"status"}, {"alerts", "test"}, {"alerts", "list"},
@@ -54,6 +74,7 @@ func TestOpsCommandsAreRegistered(t *testing.T) {
 func TestMaintenanceAnnounceShowClear(t *testing.T) {
 	cfg, state := opsConfig(t, "")
 	start := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	resetFlags(t, []string{"maintenance", "announce"}, announceFlags...)
 
 	if out, err := runRoot(t, "--config", cfg, "maintenance", "show"); err != nil || !strings.Contains(out, "no maintenance window is announced") {
 		t.Fatalf("show: %q %v", out, err)
@@ -107,6 +128,7 @@ func TestMaintenanceAnnounceRefusesBadInput(t *testing.T) {
 		"empty message":    {"--at", future, "--message", "   "},
 		"a very long text": {"--at", future, "--message", strings.Repeat("x", 600)},
 	} {
+		resetFlags(t, []string{"maintenance", "announce"}, announceFlags...)
 		if _, err := runRoot(t, append([]string{"--config", cfg, "maintenance", "announce"}, args...)...); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
