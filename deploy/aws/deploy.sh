@@ -146,7 +146,9 @@ else
   [[ -z $AMI || $AMI =~ $re_ami ]] || die "--ami-id must look like ami-0123456789abcdef0"
   [[ -z $SNAP || $SNAP =~ $re_snap ]] || die "--data-snapshot-id must look like snap-0123456789abcdef0"
   if [[ -n $VOLSIZE ]]; then
-    [[ $VOLSIZE =~ ^[0-9]+$ ]] && [[ $VOLSIZE -ge 20 && $VOLSIZE -le 16384 ]] || die "--volume-size must be a whole number of GiB from 20 to 16384"
+    if ! [[ $VOLSIZE =~ ^[0-9]+$ ]] || [[ $VOLSIZE -lt 20 || $VOLSIZE -gt 16384 ]]; then
+      die "--volume-size must be a whole number of GiB from 20 to 16384"
+    fi
   fi
 fi
 
