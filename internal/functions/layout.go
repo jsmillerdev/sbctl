@@ -56,3 +56,9 @@ func ProjectURL(cfg *config.Config, ref string) string {
 	}
 	return scheme + "://" + host
 }
+
+// Live reports the version of the function that is on disk and served for slug in ref.
+func Live(cfg *config.Config, ref, slug string) (version int, ok bool) {
+	m, ok := liveMeta(FunctionPath(cfg, ref, slug))
+	return m.Version, ok
+}

@@ -89,14 +89,20 @@ export function parseMeta(text: string): FunctionMeta | null {
   if (
     typeof raw.slug !== 'string' || typeof raw.version !== 'number' ||
     typeof raw.verify_jwt !== 'boolean' || typeof raw.entrypoint !== 'string' ||
-    (raw.import_map !== undefined && typeof raw.import_map !== 'string')
+    (raw.import_map !== undefined && typeof raw.import_map !== 'string') ||
+    (raw.eszip !== undefined && typeof raw.eszip !== 'string') ||
+    (raw.kind !== undefined && raw.kind !== 'source' && raw.kind !== 'eszip')
   ) return null
+  const kind = (raw.kind as 'source' | 'eszip' | undefined) ?? 'source'
+  if (kind === 'eszip' && !raw.eszip) return null
   return {
     slug: raw.slug,
     version: raw.version,
     verifyJwt: raw.verify_jwt,
+    kind,
     entrypoint: raw.entrypoint,
     importMap: (raw.import_map as string | undefined) ?? '',
+    eszip: (raw.eszip as string | undefined) ?? '',
   }
 }
 
@@ -164,19 +170,45 @@ export class ProjectStore {
     }
     const meta = parseMeta(text)
     if (!meta || meta.slug !== slug) return null
-    const entrypointPath = containedPath(dir, meta.entrypoint)
-    if (!entrypointPath) return null
-    let importMapPath = ''
-    if (meta.importMap) {
-      const p = containedPath(dir, meta.importMap)
-      if (!p) return null
-      importMapPath = p
+    let info: FunctionInfo
+    if (meta.kind === 'eszip') {
+      // The entrypoint is a module of the bundle, not a file; the bundle file is checked.
+      const eszipPath = containedPath(dir, meta.eszip)
+      if (!eszipPath || !meta.entrypoint) return null
+      info = { ...meta, dir, entrypointPath: meta.entrypoint, importMapPath: '', eszipPath }
+    } else {
+      const entrypointPath = containedPath(dir, meta.entrypoint)
+      if (!entrypointPath) return null
+      let importMapPath = ''
+      if (meta.importMap) {
+        const p = containedPath(dir, meta.importMap)
+        if (!p) return null
+        importMapPath = p
+      }
+      info = { ...meta, dir, entrypointPath, importMapPath, eszipPath: '' }
     }
-    const info: FunctionInfo = { ...meta, dir, entrypointPath, importMapPath }
     // Generations never change once written, so the real path is a stable cache key.
     if (this.#fns.size >= 2048) this.#fns.clear()
     this.#fns.set(dir, info)
     return info
+  }
+
+  #eszips = new Map<string, Uint8Array>()
+  #eszipBytes = 0
+
+  /** The bytes of a bundled function's eszip, kept in memory (generations never change). */
+  async eszip(info: FunctionInfo): Promise<Uint8Array> {
+    const hit = this.#eszips.get(info.dir)
+    if (hit) return hit
+    const bytes = await retrying(() => Deno.readFile(info.eszipPath))
+    // Bounded: a node serves a handful of bundles of a few megabytes each.
+    if (this.#eszipBytes + bytes.length > 256 * 1024 * 1024) {
+      this.#eszips.clear()
+      this.#eszipBytes = 0
+    }
+    this.#eszips.set(info.dir, bytes)
+    this.#eszipBytes += bytes.length
+    return bytes
   }
 
   /** Forgets everything cached about ref (tests, and a project that was removed). */
@@ -185,6 +217,9 @@ export class ProjectStore {
     this.#roots.delete(ref)
     for (const k of [...this.#fns.keys()]) {
       if (k.startsWith(join(this.projectsDir, ref) + '/')) this.#fns.delete(k)
+    }
+    for (const k of [...this.#eszips.keys()]) {
+      if (k.startsWith(join(this.projectsDir, ref) + '/')) this.#eszips.delete(k)
     }
   }
 }

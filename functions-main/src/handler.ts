@@ -99,13 +99,24 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
     // The body must be saved before the first attempt reads it; a retry replays it.
     const spare = retries > 0 ? req.clone() : null
     try {
+      // A function the CLI bundled runs from its bundle; a source function from its files.
+      const code: Pick<WorkerOptions, 'servicePath' | 'maybeEntrypoint' | 'maybeEszip'> =
+        info.kind === 'eszip'
+          ? {
+            servicePath: info.dir,
+            maybeEntrypoint: info.entrypoint,
+            maybeEszip: await store.eszip(info),
+          }
+          : {
+            servicePath: info.entrypointPath.slice(0, info.entrypointPath.lastIndexOf('/')),
+            maybeEntrypoint: new URL(`file://${encodeURI(info.entrypointPath)}`).href,
+          }
       const worker: Worker = await runtime.createWorker({
         // One worker pool per project, function and generation: the key keeps projects
         // apart even if two of them were ever to share a path, and a new deployment
         // or new secrets get new workers while the old ones idle out.
         poolKey: `${ref}:${slug}:${info.version}:${info.dir.split('/').pop()}:${env.stamp ?? ''}`,
-        servicePath: info.entrypointPath.slice(0, info.entrypointPath.lastIndexOf('/')),
-        maybeEntrypoint: new URL(`file://${encodeURI(info.entrypointPath)}`).href,
+        ...code,
         envVars: workerEnv(slug, env),
         memoryLimitMb: limits.memoryLimitMb,
         workerTimeoutMs: limits.workerTimeoutMs,

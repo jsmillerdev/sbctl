@@ -66,9 +66,13 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 	f := cfg.Functions
 	port := strconv.Itoa(cfg.Ports.EdgeRuntime)
 	work := cfg.Paths().System(config.SvcEdgeRuntime)
+	// The runtime cannot load a main service through a symlinked path (on macOS /tmp is
+	// one: "Module not found"), so it is given real paths.
+	mainDir := realPath(MainServiceDir(cfg))
+	projectsDir := realPath(filepath.Dir(cfg.Paths().Project("x")))
 	s.Env = map[string]string{
 		"EDGE_RUNTIME_PORT":                port,
-		"SBCTL_PROJECTS_DIR":               filepath.Dir(cfg.Paths().Project("x")),
+		"SBCTL_PROJECTS_DIR":               projectsDir,
 		"SBCTL_FUNCTIONS_MEMORY_MB":        strconv.Itoa(f.Memory()),
 		"SBCTL_FUNCTIONS_WALL_CLOCK_SEC":   strconv.Itoa(f.WallClock()),
 		"SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC": strconv.Itoa(f.IdleTimeout()),
@@ -84,7 +88,7 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 	args := []string{"bin/edge-runtime", "start",
 		"--ip", "127.0.0.1",
 		"--port", port,
-		"--main-service", MainServiceDir(cfg),
+		"--main-service", mainDir,
 		"--policy", "per_worker",
 		"--user-worker-request-idle-timeout", strconv.Itoa(f.IdleTimeout() * 1000),
 		"--graceful-exit-timeout", "10",
@@ -97,6 +101,14 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 		s.Limits.MemoryMax = f.MemoryMax
 	}
 	return s, nil
+}
+
+// realPath resolves symlinks in p, or returns p when that is not possible.
+func realPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
 }
 
 // mainFiles returns the embedded main service as path to content, paths slash-separated.

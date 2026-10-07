@@ -7,7 +7,7 @@ import {
   validRef,
   validSlug,
 } from './projects.ts'
-import { REF_A, REF_B, writeFunction, writeProject } from './testutil.ts'
+import { REF_A, REF_B, writeBundle, writeFunction, writeProject } from './testutil.ts'
 
 async function tmp(): Promise<string> {
   return await Deno.realPath(await Deno.makeTempDir({ prefix: 'sbctl-main-test-' }))
@@ -47,9 +47,16 @@ Deno.test('parseProjectEnv and parseMeta check their shape', () => {
     slug: 'a',
     version: 2,
     verifyJwt: false,
+    kind: 'source',
     entrypoint: 'i.ts',
     importMap: '',
+    eszip: '',
   })
+  const bundle =
+    '{"slug":"a","version":1,"verify_jwt":true,"kind":"eszip","entrypoint":"file:///src/i.ts","eszip":"bundle.eszip"}'
+  assertEquals(parseMeta(bundle)?.kind, 'eszip')
+  assertEquals(parseMeta(bundle.replace(',"eszip":"bundle.eszip"', '')), null)
+  assertEquals(parseMeta(meta.replace('"entrypoint"', '"kind":"wasm","entrypoint"')), null)
   assertEquals(parseMeta('{"slug":"a"}'), null)
 })
 
@@ -137,6 +144,38 @@ Deno.test('ProjectStore.fn refuses an entrypoint outside the generation', async 
       }),
     )
     assertEquals(await new ProjectStore(root).fn(REF_A, 'evil'), null)
+  } finally {
+    await Deno.remove(root, { recursive: true })
+  }
+})
+
+Deno.test('ProjectStore resolves a bundled function and caches its eszip', async () => {
+  const root = await tmp()
+  try {
+    await writeProject(root, REF_A, 's')
+    const gen = await writeBundle(root, REF_A, 'bundled', new TextEncoder().encode('ESZIP2.3 fake'))
+    const store = new ProjectStore(root)
+    const info = await store.fn(REF_A, 'bundled')
+    assertEquals(info?.kind, 'eszip')
+    assertEquals(info?.dir, gen)
+    assertEquals(info?.entrypoint, 'file:///src/bundled/index.ts')
+    assertEquals(info?.eszipPath, `${gen}/bundle.eszip`)
+    const bytes = await store.eszip(info!)
+    assertEquals(new TextDecoder().decode(bytes), 'ESZIP2.3 fake')
+    assertEquals(await store.eszip(info!), bytes) // the same array: cached
+    // A bundle name that leaves the generation is refused.
+    await Deno.writeTextFile(
+      `${gen}/.sbctl-function.json`,
+      JSON.stringify({
+        slug: 'bundled',
+        version: 1,
+        verify_jwt: true,
+        kind: 'eszip',
+        entrypoint: 'file:///x',
+        eszip: '../x',
+      }),
+    )
+    assertEquals(await new ProjectStore(root).fn(REF_A, 'bundled'), null)
   } finally {
     await Deno.remove(root, { recursive: true })
   }

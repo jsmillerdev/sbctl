@@ -8,6 +8,7 @@ import {
   REF_B,
   signJWT,
   silent,
+  writeBundle,
   writeFunction,
   writeProject,
 } from './testutil.ts'
@@ -367,6 +368,26 @@ Deno.test('a broken deployment file is a boot error, not a crash', async () => {
     // Project A is not affected.
     const a = await f.handle(req('/hello', REF_A, { authorization: `Bearer ${f.anonA}` }))
     assertEquals(a.status, 200)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+Deno.test('a bundled function runs from its eszip, a source function from its files', async () => {
+  const f = await fixture()
+  try {
+    await writeBundle(f.root, REF_A, 'bundled', new TextEncoder().encode('ESZIP2.3 bytes'), {
+      verifyJwt: false,
+    })
+    assertEquals((await f.handle(req('/bundled', REF_A))).status, 200)
+    const w = f.rt.created[0]
+    assertEquals(new TextDecoder().decode(w.maybeEszip), 'ESZIP2.3 bytes')
+    assertEquals(w.maybeEntrypoint, 'file:///src/bundled/index.ts')
+    assertEquals(w.context.importMapPath, undefined)
+    assert(w.servicePath.includes(`/${REF_A}/functions/.gen/`))
+    // A source function carries no bundle.
+    await f.handle(req('/open', REF_A))
+    assertEquals(f.rt.created[1].maybeEszip, undefined)
   } finally {
     await f.cleanup()
   }

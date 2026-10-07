@@ -125,3 +125,35 @@ export class FakeError extends Error {
 }
 
 export const silent = { log() {}, warn() {}, error() {} }
+
+/** Writes a bundled (eszip) function and points functions/<slug> at it. */
+export async function writeBundle(
+  root: string,
+  ref: string,
+  slug: string,
+  eszip: Uint8Array,
+  opts: Partial<{ verifyJwt: boolean; version: number }> = {},
+): Promise<string> {
+  const version = opts.version ?? 1
+  const gen = `${root}/${ref}/functions/.gen/${slug}-${version}-bundle`
+  await Deno.mkdir(gen, { recursive: true })
+  await Deno.writeFile(`${gen}/bundle.eszip`, eszip)
+  await Deno.writeTextFile(
+    `${gen}/.sbctl-function.json`,
+    JSON.stringify({
+      slug,
+      version,
+      verify_jwt: opts.verifyJwt ?? true,
+      kind: 'eszip',
+      entrypoint: `file:///src/${slug}/index.ts`,
+      eszip: 'bundle.eszip',
+    }),
+  )
+  const link = `${root}/${ref}/functions/${slug}`
+  try {
+    await Deno.remove(`${link}.tmp`)
+  } catch { /* none */ }
+  await Deno.symlink(gen, `${link}.tmp`)
+  await Deno.rename(`${link}.tmp`, link)
+  return gen
+}

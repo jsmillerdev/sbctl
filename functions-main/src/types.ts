@@ -17,17 +17,27 @@ export interface FunctionMeta {
   slug: string
   version: number
   verifyJwt: boolean
-  /** Path of the entrypoint relative to the generation directory. */
+  /** "source": the generation holds the files; "eszip": it holds a bundle the CLI built. */
+  kind: 'source' | 'eszip'
+  /**
+   * Source functions: the path of the entrypoint relative to the generation directory.
+   * Bundles: the module specifier of the entrypoint inside the bundle (a file URL).
+   */
   entrypoint: string
-  /** Path of the import map relative to the generation directory, or "". */
+  /** Path of the import map relative to the generation directory, or "" (source only). */
   importMap: string
+  /** Path of the bundle relative to the generation directory (bundles only). */
+  eszip: string
 }
 
 /** A function resolved on disk: absolute, symlink-free paths. */
 export interface FunctionInfo extends FunctionMeta {
   dir: string
+  /** Source functions: the entrypoint file. Bundles: the same as entrypoint, a URL. */
   entrypointPath: string
   importMapPath: string
+  /** Bundles: the eszip file. */
+  eszipPath: string
 }
 
 /** The limits every worker gets (from the node's [functions] config). */
@@ -48,6 +58,8 @@ export interface WorkerOptions {
   poolKey: string
   servicePath: string
   maybeEntrypoint: string
+  /** The bundle of a function the CLI bundled (plain eszip bytes). */
+  maybeEszip?: Uint8Array
   envVars: [string, string][]
   memoryLimitMb: number
   workerTimeoutMs: number

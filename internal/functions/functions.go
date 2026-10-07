@@ -35,6 +35,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andybalholm/brotli"
+
 	"github.com/OWNER/sbctl/internal/api"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -281,11 +283,18 @@ func jsonObject(m map[string]string) string {
 
 // meta is .sbctl-function.json inside a generation.
 type meta struct {
-	Slug       string `json:"slug"`
-	Version    int    `json:"version"`
-	VerifyJWT  bool   `json:"verify_jwt"`
+	Slug      string `json:"slug"`
+	Version   int    `json:"version"`
+	VerifyJWT bool   `json:"verify_jwt"`
+	// Kind is "source" (files, run from the generation directory; the default) or "eszip"
+	// (a bundle the CLI built, run from Eszip).
+	Kind string `json:"kind,omitempty"`
+	// Entrypoint is a path inside the generation for source functions and the module
+	// specifier inside the bundle (a file URL) for eszip functions.
 	Entrypoint string `json:"entrypoint"`
 	ImportMap  string `json:"import_map,omitempty"`
+	// Eszip is the file of an eszip function, relative to the generation.
+	Eszip string `json:"eszip,omitempty"`
 	// SHA256 covers the uploaded files (paths and contents).
 	SHA256 string `json:"sha256"`
 }
@@ -326,30 +335,19 @@ func (s *Syncer) syncFunction(ctx context.Context, dir string, f *api.Function) 
 		return removeLink(link, dir, f.Slug, "")
 	}
 	m := meta{Slug: f.Slug, Version: f.Version, VerifyJWT: f.VerifyJWT, SHA256: filesHash(files)}
-	if m.Entrypoint, err = cleanRel(f.EntrypointPath); err != nil {
-		return fmt.Errorf("entrypoint: %w", err)
-	}
-	if f.ImportMapPath != "" {
-		if m.ImportMap, err = cleanRel(f.ImportMapPath); err != nil {
-			return fmt.Errorf("import map: %w", err)
-		}
-	}
-	paths := make(map[string]bool, len(files))
-	for _, file := range files {
-		c, err := cleanRel(file.Path)
-		if err != nil {
+	var eszip []byte
+	if len(files) == 1 && files[0].Path == api.BundleFileName {
+		if eszip, err = decodeBundle(files[0].Content); err != nil {
 			return err
 		}
-		if c == MetaFileName {
-			return fmt.Errorf("a function cannot contain a file named %s", MetaFileName)
+		if f.EntrypointPath == "" {
+			return errors.New("a bundled function needs its entrypoint")
 		}
-		paths[c] = true
-	}
-	if !paths[m.Entrypoint] {
-		return fmt.Errorf("entrypoint %s is not among the uploaded files", m.Entrypoint)
-	}
-	if m.ImportMap != "" && !paths[m.ImportMap] {
-		return fmt.Errorf("import map %s is not among the uploaded files", m.ImportMap)
+		m.Kind, m.Entrypoint, m.ImportMap, m.Eszip = kindEszip, f.EntrypointPath, f.ImportMapPath, EszipFileName
+	} else {
+		if err := checkSourceFiles(&m, f, files); err != nil {
+			return err
+		}
 	}
 	if cur, ok := liveMeta(link); ok && cur == m {
 		return nil
@@ -364,14 +362,20 @@ func (s *Syncer) syncFunction(ctx context.Context, dir string, f *api.Function) 
 			_ = os.RemoveAll(gen)
 		}
 	}()
-	for _, file := range files {
-		c, _ := cleanRel(file.Path)
-		dst := filepath.Join(gen, filepath.FromSlash(c))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	if eszip != nil {
+		if err := os.WriteFile(filepath.Join(gen, EszipFileName), eszip, 0o600); err != nil {
 			return err
 		}
-		if err := os.WriteFile(dst, file.Content, 0o600); err != nil {
-			return err
+	} else {
+		for _, file := range files {
+			c, _ := cleanRel(file.Path)
+			dst := filepath.Join(gen, filepath.FromSlash(c))
+			if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+				return err
+			}
+			if err := os.WriteFile(dst, file.Content, 0o600); err != nil {
+				return err
+			}
 		}
 	}
 	body, err := json.Marshal(m)
@@ -387,6 +391,65 @@ func (s *Syncer) syncFunction(ctx context.Context, dir string, f *api.Function) 
 	ok = true
 	s.collect(dir, f.Slug, filepath.Base(gen))
 	return nil
+}
+
+const (
+	kindEszip = "eszip"
+	// EszipFileName is the decompressed bundle inside the generation of an eszip function.
+	EszipFileName = "bundle.eszip"
+	// maxEszipSize bounds a decompressed bundle (the upload itself is limited to 64 MiB).
+	maxEszipSize = 512 << 20
+)
+
+// checkSourceFiles validates the files of a source function and fills m's entrypoint and
+// import map from f.
+func checkSourceFiles(m *meta, f *api.Function, files []api.FunctionFile) (err error) {
+	if m.Entrypoint, err = cleanRel(f.EntrypointPath); err != nil {
+		return fmt.Errorf("entrypoint: %w", err)
+	}
+	if f.ImportMapPath != "" {
+		if m.ImportMap, err = cleanRel(f.ImportMapPath); err != nil {
+			return fmt.Errorf("import map: %w", err)
+		}
+	}
+	paths := make(map[string]bool, len(files))
+	for _, file := range files {
+		c, err := cleanRel(file.Path)
+		if err != nil {
+			return err
+		}
+		if c == MetaFileName || c == api.BundleFileName {
+			return fmt.Errorf("a function cannot contain a file named %s", c)
+		}
+		paths[c] = true
+	}
+	if !paths[m.Entrypoint] {
+		return fmt.Errorf("entrypoint %s is not among the uploaded files", m.Entrypoint)
+	}
+	if m.ImportMap != "" && !paths[m.ImportMap] {
+		return fmt.Errorf("import map %s is not among the uploaded files", m.ImportMap)
+	}
+	return nil
+}
+
+// decodeBundle turns an uploaded bundle ("EZBR" and a Brotli stream, as the Supabase CLI
+// sends it) into the plain eszip the runtime loads.
+func decodeBundle(body []byte) ([]byte, error) {
+	rest, ok := bytes.CutPrefix(body, []byte("EZBR"))
+	if !ok {
+		return nil, errors.New("the stored bundle does not start with EZBR")
+	}
+	out, err := io.ReadAll(io.LimitReader(brotli.NewReader(bytes.NewReader(rest)), maxEszipSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("decompressing the bundle: %w", err)
+	}
+	if len(out) > maxEszipSize {
+		return nil, errors.New("the bundle is too large once decompressed")
+	}
+	if !bytes.HasPrefix(out, []byte("ESZIP")) {
+		return nil, errors.New("the bundle is not an eszip")
+	}
+	return out, nil
 }
 
 // liveMeta reads the metadata of the generation link points at.

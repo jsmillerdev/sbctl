@@ -1,6 +1,7 @@
 package functions
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/andybalholm/brotli"
 
 	"github.com/OWNER/sbctl/internal/api"
 	"github.com/OWNER/sbctl/internal/config"
@@ -587,5 +590,119 @@ func TestProjectURL(t *testing.T) {
 func TestNewNeedsItsDependencies(t *testing.T) {
 	if _, err := New(Deps{}); err == nil {
 		t.Fatal("New accepted empty Deps")
+	}
+}
+
+// testdata/hello.ezbr is the body `supabase functions deploy` (CLI 2.119.0) sent for a
+// one-file function: "EZBR" and a Brotli-compressed eszip.
+func helloBundle(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile("testdata/hello.ezbr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestDecodeBundle(t *testing.T) {
+	out, err := decodeBundle(helloBundle(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(out), "ESZIP2") || len(out) < 1000 {
+		t.Fatalf("decoded %d bytes starting %q", len(out), out[:8])
+	}
+	for name, in := range map[string][]byte{
+		"no magic":   []byte("ESZIP2.3 plain"),
+		"not brotli": append([]byte("EZBR"), []byte("this is not a brotli stream at all, surely")...),
+		"not eszip":  nil,
+	} {
+		if name == "not eszip" {
+			// a valid Brotli stream whose content is not an eszip
+			var buf bytes.Buffer
+			w := brotli.NewWriter(&buf)
+			_, _ = w.Write([]byte("hello world"))
+			_ = w.Close()
+			in = append([]byte("EZBR"), buf.Bytes()...)
+		}
+		if _, err := decodeBundle(in); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestSyncMaterializesABundledFunction(t *testing.T) {
+	e := newEnv(t)
+	e.addProject(refA, registry.StatusActiveHealthy)
+	entry := "file:///private/tmp/work/supabase/functions/hello/index.ts"
+	f := &api.Function{Ref: refA, Slug: "hello", Name: "hello", Status: "ACTIVE", VerifyJWT: false, EntrypointPath: entry, ImportMapPath: "file:///x/deno.json"}
+	files := []api.FunctionFile{{Path: api.BundleFileName, Content: helloBundle(t)}}
+	if err := e.store.UpsertFunction(context.Background(), f, files); err != nil {
+		t.Fatal(err)
+	}
+	e.sync(refA)
+	link := FunctionPath(e.cfg, refA, "hello")
+	m, ok := liveMeta(link)
+	if !ok || m.Kind != "eszip" || m.Entrypoint != entry || m.Eszip != EszipFileName || m.VerifyJWT || m.Version != 1 {
+		t.Fatalf("meta %+v", m)
+	}
+	b := readFile(t, filepath.Join(link, EszipFileName))
+	if !strings.HasPrefix(b, "ESZIP2") {
+		t.Fatalf("bundle.eszip starts with %q", b[:8])
+	}
+	// The compressed upload is not kept in the generation, and nothing else is written.
+	ents, _ := os.ReadDir(link)
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	if strings.Join(names, ",") != ".sbctl-function.json,bundle.eszip" {
+		t.Fatalf("generation holds %v", names)
+	}
+	first, _ := os.Readlink(link)
+	e.sync(refA)
+	if again, _ := os.Readlink(link); again != first {
+		t.Fatal("an unchanged bundle got a new generation")
+	}
+	// Redeploying as source files replaces the bundle.
+	e.deploy(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "x"})
+	e.sync(refA)
+	m, _ = liveMeta(link)
+	if m.Kind != "" || m.Eszip != "" {
+		t.Fatalf("meta after a source deploy: %+v", m)
+	}
+	if _, err := os.Stat(filepath.Join(link, EszipFileName)); err == nil {
+		t.Fatal("the old bundle is still served")
+	}
+}
+
+func TestBadBundlesAreRefused(t *testing.T) {
+	e := newEnv(t)
+	e.addProject(refA, registry.StatusActiveHealthy)
+	ctx := context.Background()
+	f := &api.Function{Ref: refA, Slug: "bad", Name: "bad", Status: "ACTIVE", VerifyJWT: true, EntrypointPath: "file:///x/index.ts"}
+	cases := map[string][]api.FunctionFile{
+		"garbage":    {{Path: api.BundleFileName, Content: []byte("EZBRgarbage garbage garbage")}},
+		"extra file": {{Path: api.BundleFileName, Content: helloBundle(t)}, {Path: "index.ts", Content: []byte("x")}},
+	}
+	for name, files := range cases {
+		if err := e.store.UpsertFunction(ctx, f, files); err != nil {
+			t.Fatal(err)
+		}
+		err := e.s.SyncProject(ctx, refA)
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		if _, err := os.Lstat(FunctionPath(e.cfg, refA, "bad")); err == nil {
+			t.Errorf("%s: went live", name)
+		}
+	}
+	// A bundle without an entrypoint cannot start.
+	f.EntrypointPath = ""
+	if err := e.store.UpsertFunction(ctx, f, []api.FunctionFile{{Path: api.BundleFileName, Content: helloBundle(t)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.SyncProject(ctx, refA); err == nil || !strings.Contains(err.Error(), "entrypoint") {
+		t.Fatalf("bundle without entrypoint: %v", err)
 	}
 }

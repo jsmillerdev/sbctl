@@ -115,6 +115,9 @@ func (s *Server) updateFunction(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if isBundleUpload(r) {
+		return s.updateFunctionBundle(w, r, p.Ref, f)
+	}
 	var in struct {
 		Name       *string `json:"name"`
 		VerifyJWT  *bool   `json:"verify_jwt"`
@@ -168,17 +171,25 @@ func (s *Server) createFunction(w http.ResponseWriter, r *http.Request) error {
 	} else {
 		in.Slug = r.URL.Query().Get("slug")
 		in.Name = r.URL.Query().Get("name")
-		if v := r.URL.Query().Get("verify_jwt"); v != "" {
-			b := v != "false"
-			in.VerifyJWT = &b
-		}
+		in.Entrypoint = r.URL.Query().Get("entrypoint_path")
+		in.ImportMap = r.URL.Query().Get("import_map_path")
+		in.VerifyJWT = queryVerifyJWT(r)
 	}
 	if !slugRe.MatchString(in.Slug) {
 		return errf(http.StatusBadRequest, "Invalid function slug")
 	}
 	f := &Function{Ref: p.Ref, Slug: in.Slug, Name: firstNonEmpty(in.Name, in.Slug), Status: "ACTIVE", VerifyJWT: in.VerifyJWT == nil || *in.VerifyJWT,
 		EntrypointPath: in.Entrypoint, ImportMapPath: in.ImportMap}
-	if err := s.store.UpsertFunction(r.Context(), f, nil); err != nil {
+	var files []FunctionFile
+	if isBundleUpload(r) {
+		if in.Entrypoint == "" {
+			return errf(http.StatusBadRequest, "entrypoint_path is required for a bundle")
+		}
+		if files, err = readBundle(r); err != nil {
+			return err
+		}
+	}
+	if err := s.store.UpsertFunction(r.Context(), f, files); err != nil {
 		return err
 	}
 	if err := s.functionsChanged(r.Context(), p.Ref); err != nil {

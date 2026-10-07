@@ -62,7 +62,7 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 		port := strconv.Itoa(cfg.Ports.EdgeRuntime)
 		args := strings.Join(s.Exec, " ")
 		for _, want := range []string{
-			"bin/edge-runtime start", "--ip 127.0.0.1", "--port " + port, "--main-service " + MainServiceDir(cfg),
+			"bin/edge-runtime start", "--ip 127.0.0.1", "--port " + port, "--main-service " + realPath(MainServiceDir(cfg)),
 			"--policy per_worker", "--user-worker-request-idle-timeout 9000", "--max-parallelism 4",
 		} {
 			if !strings.Contains(args, want) {
@@ -74,7 +74,7 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 		}
 		env := s.Env
 		for k, v := range map[string]string{
-			"EDGE_RUNTIME_PORT": port, "SBCTL_PROJECTS_DIR": filepath.Join(cfg.StateDir, "projects"),
+			"EDGE_RUNTIME_PORT": port, "SBCTL_PROJECTS_DIR": realPath(filepath.Join(cfg.StateDir, "projects")),
 			"SBCTL_FUNCTIONS_MEMORY_MB": "128", "SBCTL_FUNCTIONS_WALL_CLOCK_SEC": "20", "SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC": "9",
 			"SBCTL_FUNCTIONS_CPU_SOFT_MS": "0", "SBCTL_FUNCTIONS_CPU_HARD_MS": "3000",
 			"DENO_DIR": filepath.Join(cfg.Paths().System(config.SvcEdgeRuntime), "deno"),
