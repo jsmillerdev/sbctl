@@ -113,6 +113,9 @@ func TestSupavisorEnv(t *testing.T) {
 			t.Errorf("%s = %q, want %q", k, env[k], v)
 		}
 	}
+	if env["RELEASE_TMP"] != n.cfg.Paths().System("supavisor")+"/tmp" {
+		t.Errorf("RELEASE_TMP = %q", env["RELEASE_TMP"])
+	}
 	if _, ok := env["CLUSTER_POSTGRES"]; ok {
 		t.Error("CLUSTER_POSTGRES needs a region and is for multi-node setups")
 	}
@@ -145,6 +148,9 @@ func TestRealtimeEnv(t *testing.T) {
 		if env[k] != v {
 			t.Errorf("%s = %q, want %q", k, env[k], v)
 		}
+	}
+	if env["RELEASE_TMP"] != n.cfg.Paths().System("realtime")+"/tmp" {
+		t.Errorf("RELEASE_TMP = %q", env["RELEASE_TMP"])
 	}
 	if _, seeded := env["SEED_SELF_HOST"]; seeded {
 		t.Error("a multi-tenant Realtime must not seed the self-host tenant")

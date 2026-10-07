@@ -101,6 +101,9 @@ func pgmetaEnv(cfg *config.Config, c *creds) map[string]string {
 	}
 }
 
+// RELEASE_TMP, set for both Elixir services, is where an Elixir release writes its
+// runtime files if it needs any (the artifact directory is read-only under systemd).
+//
 // supavisorEnv follows the dockerless CLI's recipe (supabase/cli packages/stack
 // services/Pooler.ts), the upstream compose file, and config/runtime.exs at the pinned
 // version. Supavisor has no bind-address variable: its API port and the pooler ports
@@ -118,6 +121,7 @@ func supavisorEnv(cfg *config.Config, c *creds) map[string]string {
 		"PROXY_PORT":              "0",
 		"SESSION_PROXY_PORTS":     "0",
 		"TRANSACTION_PROXY_PORTS": "0",
+		"RELEASE_TMP":             filepath.Join(cfg.Paths().System(config.SvcSupavisor), "tmp"),
 		"API_JWT_SECRET":          c.supavisorAPIJWT,
 		"METRICS_JWT_SECRET":      c.supavisorMetricsJWT,
 		"SECRET_KEY_BASE":         c.supavisorSecretBase,
@@ -140,6 +144,7 @@ func realtimeEnv(cfg *config.Config, c *creds) map[string]string {
 	l := c.logins[config.SvcRealtime]
 	return map[string]string{
 		"PORT":                        strconv.Itoa(cfg.Ports.Realtime),
+		"RELEASE_TMP":                 filepath.Join(cfg.Paths().System(config.SvcRealtime), "tmp"),
 		"PHX_HTTP_IP":                 "127.0.0.1",
 		"APP_NAME":                    RealtimeAppName,
 		"DB_HOST":                     "127.0.0.1",
