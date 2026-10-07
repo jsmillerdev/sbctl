@@ -1,5 +1,5 @@
 // Captures the README screenshots of Supabase Studio (platform mode) running on the node that
-// node.sh installed and seed.mjs filled. 1440x900 at device scale factor 2, dark and light theme.
+// node.sh installed and seed.mjs filled. 1440x900 at device scale factor 2, dark theme (THEMES=dark,light adds the light one).
 //
 //   SHOTS_DIR=/tmp/shots CHROME=/usr/bin/google-chrome node shots.mjs
 //     [THEMES=dark,light] [ONLY=projects,table-editor] [OUT=/tmp/shots/raw]
@@ -18,7 +18,7 @@ const E = JSON.parse(readFileSync(join(DIR, 'env.json'), 'utf8'))
 const S = JSON.parse(readFileSync(join(DIR, 'seed.json'), 'utf8'))
 const OUT = process.env.OUT ?? join(DIR, 'raw')
 const DEBUG = join(DIR, 'debug')
-const THEMES = (process.env.THEMES ?? 'dark,light').split(',')
+const THEMES = (process.env.THEMES ?? 'dark').split(',')
 const ONLY = process.env.ONLY ? process.env.ONLY.split(',') : null
 for (const d of [OUT, DEBUG]) mkdirSync(d, { recursive: true })
 
@@ -30,49 +30,12 @@ const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a)
 // expect: texts that must be visible. prepare: what a person does after the page loads.
 const SHOTS = [
   { name: 'projects', path: `/org/${S.org}`, expect: ['storefront', 'analytics', 'agent-sandbox'] },
-  { name: 'project-home', path: `/project/${store}`, expect: ['storefront'] },
   {
     name: 'table-editor', path: `/project/${store}/editor`, expect: ['Ceramic Pour-Over Set', 'Walnut Cutting Board', 'Carbon-Steel Chef Knife'],
     async prepare(page) {
       await page.getByText('products', { exact: true }).first().click()
     },
   },
-  {
-    name: 'sql-editor', path: `/project/${store}/sql/new`, expect: ['units_in_stock', 'Kitchen', 'Stationery'],
-    async prepare(page) {
-      const sql = [
-        'select',
-        '  category,',
-        '  count(*) as products,',
-        '  sum(stock) as units_in_stock,',
-        '  round(avg(price), 2) as avg_price',
-        'from public.products',
-        'where is_active',
-        'group by category',
-        'order by units_in_stock desc;',
-      ].join('\n')
-      const editor = page.locator('.monaco-editor').first()
-      await editor.waitFor()
-      for (let i = 0; i < 10; i++) {
-        await editor.locator('.view-lines').click()
-        await page.keyboard.press('ControlOrMeta+a')
-        await page.keyboard.insertText(sql)
-        await page.waitForTimeout(400)
-        if ((await editor.innerText()).includes('units_in_stock')) break
-      }
-      await page.keyboard.press('Escape')
-      await page.getByRole('button', { name: /^Run/ }).first().click()
-      await page.getByText('units_in_stock', { exact: true }).first().waitFor()
-    },
-  },
-  { name: 'auth-users', path: `/project/${store}/auth/users`, expect: ['maya.chen@example.com', 'priya.nair@example.com', 'amara.okafor@example.com'] },
-  { name: 'auth-policies', path: `/project/${store}/auth/policies`, expect: ['Anyone can read active products'] },
-  { name: 'storage', path: `/project/${store}/storage/files/buckets/product-images`, expect: ['ceramic-pour-over-set.png', 'walnut-cutting-board.png'] },
-  { name: 'edge-functions', path: `/project/${store}/functions`, expect: ['hello', 'send-receipt'] },
-  { name: 'branches', path: `/project/${store}/branches`, expect: ['feature-checkout', 'fix-inventory-sync'] },
-  { name: 'api-keys', path: `/project/${store}/settings/api-keys`, expect: [/publishable/i, /secret/i] },
-  { name: 'database-settings', path: `/project/${store}/database/settings`, expect: [/connection pooling/i] },
-  { name: 'database-schema', path: `/project/${store}/database/schemas`, expect: ['order_items'] },
 ]
 
 // ---- browser ----------------------------------------------------------------------------
