@@ -360,9 +360,10 @@ assert_os_updates() { # on|off
     grep -q '^APT::Periodic::Unattended-Upgrade "1";' <<<"$cfg" || fail "unattended upgrades are not switched on"
     # What the program itself reads from that configuration.
     # The distribution's own apt-daily timers (enabled by the step above) may hold the apt lock for a
-    # while, and unattended-upgrade then says nothing about origins: look again for up to two minutes.
+    # while, and unattended-upgrade then says nothing about origins: look again for up to six minutes (enabling the timers makes
+    # apt-daily-upgrade run at once on a runner whose last run was long ago).
     local run="" n
-    for ((n = 0; n < 12; n++)); do
+    for ((n = 0; n < 36; n++)); do
       run=$(timeout 240 unattended-upgrade --dry-run --debug 2>&1 || true)
       origins=$(grep -m1 'Allowed origins are' <<<"$run" || true)
       [[ -n $origins ]] && break
