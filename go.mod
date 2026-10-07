@@ -10,6 +10,7 @@ require (
 	github.com/aws/smithy-go v1.28.1
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/getkin/kin-openapi v0.149.0
+	github.com/gobwas/glob v0.2.3
 	github.com/godbus/dbus/v5 v5.1.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jackc/pgx/v5 v5.11.0
@@ -18,13 +19,9 @@ require (
 	github.com/oapi-codegen/runtime v1.7.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/spf13/cobra v1.10.2
+	github.com/xdg-go/stringprep v1.0.4
 	golang.org/x/sync v0.23.0
 	gopkg.in/yaml.v3 v3.0.1
-)
-
-require (
-	github.com/gobwas/glob v0.2.3 // indirect
-	github.com/xdg-go/stringprep v1.0.4 // indirect
 )
 
 require (
