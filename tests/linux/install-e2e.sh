@@ -131,6 +131,9 @@ fi
 if out=$(deploy/install.sh --version v0.0.1 --verify-only 2>&1); then fail "the repository copy of install.sh (no release key) downloaded a release"; fi
 [[ $out == *"no release signing key"* ]] || fail "unstamped install.sh message: $out"
 installer deploy/install.sh --version v0.0.1 --verify-only >/dev/null || fail "restored release no longer verifies"
+# Through a pipe, the way the documented one-liner runs it.
+out=$(cat deploy/install.sh | installer bash -s -- --version v0.0.1 --verify-only 2>&1) || fail "install.sh through a pipe: $out"
+[[ $out == *"verified v0.0.1"* ]] || fail "install.sh through a pipe: $out"
 bash -n "$D/install.sh"
 grep -q __SBCTL_RELEASE_PUBKEY_B64__ "$D/install.sh" && fail "the stamped install.sh still has the key marker"
 
@@ -280,7 +283,10 @@ KEY_SUM=$(sha256sum /etc/sbctl/master.key)
 CFG_SUM=$(sha256sum /etc/sbctl/config.toml)
 ENTER=$(systemctl show -p ActiveEnterTimestampMonotonic --value sbctl.service)
 PG_PID=$(systemctl show -p MainPID --value "sb-postgres@$REF.service")
-deploy/install.sh --binary "$SBCTL_BIN" 2>&1 | tee "$WORK/install2.log"
+fleet_pids() { for u in sb-pgmeta sb-supavisor sb-realtime sb-storage sb-postgres@system sb-gotrue@system; do systemctl show -p MainPID --value "$u.service"; done | tr '\n' ' '; }
+FLEET_PIDS=$(fleet_pids)
+# Through a pipe, the way the documented one-liner runs it.
+cat deploy/install.sh | bash -s -- --binary "$SBCTL_BIN" 2>&1 | tee "$WORK/install2.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "second install.sh run failed"
 [[ $(sha256sum /etc/sbctl/master.key) == "$KEY_SUM" ]] || fail "the master key changed"
 [[ $(sha256sum /etc/sbctl/config.toml) == "$CFG_SUM" ]] || fail "config.toml changed on a no-flag re-run"
@@ -288,6 +294,7 @@ grep -q "already exists" "$WORK/install2.log" || fail "the re-run did not say th
 grep -q "$TOKEN" "$WORK/install2.log" && fail "the re-run printed the spent claim token"
 [[ $(systemctl show -p ActiveEnterTimestampMonotonic --value sbctl.service) == "$ENTER" ]] || fail "a no-change re-run restarted sbctl.service"
 [[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") == "$PG_PID" ]] || fail "the re-run restarted the project's Postgres"
+[[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "the re-run restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
 [[ $(papi GET "/v1/projects/$REF" | jq_ 'd["status"]') == ACTIVE_HEALTHY ]] || fail "project unhealthy after the re-run"
 log "re-running with one flag changes only that setting"
 deploy/install.sh --binary "$SBCTL_BIN" --email changed@example.com >/dev/null 2>&1 || fail "re-run with --email failed"
@@ -296,6 +303,7 @@ grep -q "public_ip = '127.0.0.1'" /etc/sbctl/config.toml || fail "--email droppe
 [[ $(sha256sum /etc/sbctl/master.key) == "$KEY_SUM" ]] || fail "the master key changed on the second re-run"
 wait_active sbctl.service 120
 for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
+[[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "a config change restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
 
 # ---- 7. self-update ----------------------------------------------------------------------
 V2=${SBCTL_BIN_V2:-}
@@ -324,6 +332,7 @@ if [[ -n $V2 ]]; then
   [[ -x /usr/local/bin/sbctl.prev ]] || fail "the previous binary was not kept"
   wait_active sbctl.service 120
   [[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") == "$PG_PID" ]] || fail "self-update restarted the project's Postgres"
+  [[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "self-update restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
   for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
   [[ $(papi GET "/v1/projects/$REF" | jq_ 'd["status"]') == ACTIVE_HEALTHY ]] || fail "project not healthy after self-update"
   n=$(rest -H "apikey: $PUB" "http://127.0.0.1/rest/v1/e2e_items?select=id" | jq_ 'len(d)') || true
