@@ -175,6 +175,8 @@ var routeRules = []routeRule{
 	rule("POST", "/platform/organizations/{slug}/members/invitations", nSelf),
 	rule("DELETE", "/platform/organizations/{slug}/members/invitations/{id}", nSelf),
 	rule("PATCH", "/platform/organizations/{slug}/members/mfa/enforcement", chk(members.ActUpdate, O)),
+	// Single sign-on of the dashboard: every method, reads included, needs the right to manage it.
+	rule("", "/platform/organizations/{slug}/sso/**", chk(members.ActUpdate, members.ResSSO)),
 	rule("W", "/platform/organizations/{slug}/members/**", nSelf),
 	rule("W", "/v2/organizations/{slug}/members/**", nSelf),
 	rule("R", "/platform/organizations/{slug}/members/**", chk(members.ActRead, O)),

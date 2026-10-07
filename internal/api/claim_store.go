@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,12 @@ type ClaimStore interface {
 	MarkUserRemoved(ctx context.Context, userID, email string) error
 	// UserRemoved reports whether the dashboard user was removed.
 	UserRemoved(ctx context.Context, userID string) (bool, error)
+	// CreateSignupGrant stores the hash of the one-time token that lets GoTrue create the
+	// user of one invited address (migration 1000_sso.sql); ConsumeSignupGrant spends it: true
+	// when a grant for exactly this address and token exists and has not expired at now. It
+	// also drops the expired grants.
+	CreateSignupGrant(ctx context.Context, email string, hash []byte, expiresAt time.Time) error
+	ConsumeSignupGrant(ctx context.Context, email string, hash []byte, now time.Time) (bool, error)
 }
 
 // PGClaimStore is the Postgres ClaimStore over the registry's pool.
@@ -133,12 +140,30 @@ func (s *PGClaimStore) UserRemoved(ctx context.Context, userID string) (bool, er
 	return ok, err
 }
 
+func (s *PGClaimStore) CreateSignupGrant(ctx context.Context, email string, hash []byte, expiresAt time.Time) error {
+	_, err := s.pool.Exec(ctx, `insert into sbctl.signup_grants (token_hash, email, expires_at) values ($1, lower($2), $3)
+		on conflict (token_hash) do nothing`, hash, email, expiresAt)
+	return err
+}
+
+func (s *PGClaimStore) ConsumeSignupGrant(ctx context.Context, email string, hash []byte, now time.Time) (bool, error) {
+	if _, err := s.pool.Exec(ctx, `delete from sbctl.signup_grants where expires_at <= $1`, now); err != nil {
+		return false, err
+	}
+	tag, err := s.pool.Exec(ctx, `delete from sbctl.signup_grants where token_hash = $1 and email = lower($2) and expires_at > $3`, hash, email, now)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // MemoryClaimStore is the in-memory ClaimStore for tests.
 type MemoryClaimStore struct {
 	mu      sync.Mutex
 	next    int64
 	tokens  map[int64]*memClaim
 	removed map[string]bool
+	grants  map[string]memGrant
 }
 
 func (m *MemoryClaimStore) HasLiveClaimToken(_ context.Context, kind string, now time.Time) (bool, error) {
@@ -166,6 +191,37 @@ func (m *MemoryClaimStore) UserRemoved(_ context.Context, userID string) (bool, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.removed[userID], nil
+}
+
+type memGrant struct {
+	email   string
+	expires time.Time
+}
+
+func (m *MemoryClaimStore) CreateSignupGrant(_ context.Context, email string, hash []byte, expiresAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.grants == nil {
+		m.grants = map[string]memGrant{}
+	}
+	m.grants[string(hash)] = memGrant{email: strings.ToLower(email), expires: expiresAt}
+	return nil
+}
+
+func (m *MemoryClaimStore) ConsumeSignupGrant(_ context.Context, email string, hash []byte, now time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, g := range m.grants {
+		if !g.expires.After(now) {
+			delete(m.grants, k)
+		}
+	}
+	g, ok := m.grants[string(hash)]
+	if !ok || g.email != strings.ToLower(email) {
+		return false, nil
+	}
+	delete(m.grants, string(hash))
+	return true, nil
 }
 
 type memClaim struct {

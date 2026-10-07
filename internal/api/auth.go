@@ -43,8 +43,10 @@ const jwtRefreshEvery = 5 * time.Second
 
 // AdminClaim is the app_metadata key that marks a dashboard user as allowed to use
 // the Management API. sbctl sets it (to true) on every user it creates in
-// sb-gotrue@system; sb-gotrue@system runs with signup disabled, so nobody else can
-// obtain a session. The gate is defense in depth against an open signup.
+// sb-gotrue@system, and sb-gotrue@system creates no other users but the ones its
+// before-user-created hook allows (registered SSO providers, invited addresses; the daemon
+// answers it), so nobody else can obtain a session. The gate is defense in depth. A user whose
+// account came from SSO has no such claim and is admitted by DashboardSSO.Admit instead.
 const AdminClaim = "sbctl_admin"
 
 // touchEvery limits last_used_at writes per token.
@@ -61,6 +63,9 @@ type authenticator struct {
 	// (nil: nobody is). It is asked on every request, with no cache, so that a removal
 	// ends the user's sessions and tokens at once, whichever process made it.
 	removed func(ctx context.Context, userID string) (bool, error)
+	// sso admits the session of a user whose account came from SAML single sign-on (see
+	// DashboardSSO.Admit). Nil: no SSO session is accepted.
+	sso func(ctx context.Context, userID, email, providerID string) error
 
 	mu        sync.Mutex
 	secret    string
@@ -207,7 +212,17 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 		return nil, errUnauthorized
 	}
 	email, _ := claims["email"].(string)
-	if !a.isAdmin(claims, email) {
+	if prov := ssoProviderOf(claims); prov != "" {
+		// A user who signed in through an identity provider has no sbctl_admin claim: the
+		// provider being registered and the user belonging to an organization (or getting the
+		// default role of their email domain on this first request) is what admits them.
+		if a.sso == nil {
+			return nil, errForbidden
+		}
+		if err := a.sso(ctx, sub, email, prov); err != nil {
+			return nil, err
+		}
+	} else if !a.isAdmin(claims, email) {
 		return nil, errForbidden
 	}
 	aal, _ := claims["aal"].(string)

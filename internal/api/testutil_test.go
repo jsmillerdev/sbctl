@@ -304,6 +304,8 @@ type fixture struct {
 	jwt     string
 	// gt is the stand-in for sb-gotrue@system the server's account calls go to.
 	gt *fakeGoTrue
+	// pgt, when a test sets it, is the GoTrue of the project testRef.
+	pgt *fakeGoTrue
 }
 
 const testRef = "abcdefghijklmnopqrst"
@@ -340,6 +342,9 @@ func newFixture(t testing.TB) *fixture {
 		Upstream: func(p *registry.Project, svc string) string {
 			if p.Ref == config.SystemRef && svc == upGoTrue {
 				return f.gt.URL
+			}
+			if p.Ref == testRef && svc == upGoTrue && f.pgt != nil {
+				return f.pgt.URL
 			}
 			// Nothing of ours listens here, whatever else this machine runs on its default ports
 			// (macOS answers on 5000).

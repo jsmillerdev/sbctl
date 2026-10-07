@@ -51,6 +51,12 @@ const (
 	ResUserInvites  = "user_invites"
 	ResOrg          = "organizations"
 	ResProjects     = "projects"
+	// ResSSO is an organization's single sign-on: its identity providers, their domains and
+	// default roles, and the users waiting for approval. Owners and Administrators manage it
+	// (reading it too: the domains and roles are configuration, not something every member
+	// needs); the default role a provider hands out is checked against the caller's own right to
+	// add members with that role, so an Administrator cannot make Owners through it.
+	ResSSO = "organizations.sso"
 	// ResProjectTransfer is moving a project to another organization: Owners only.
 	ResProjectTransfer = "projects.transfer"
 	ResUserContent     = "user_content"

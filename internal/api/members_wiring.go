@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/OWNER/sbctl/internal/sso"
 )
 
 // NewMembers builds the roles service over the registry: Postgres for a Postgres registry
@@ -168,10 +170,17 @@ func (a *Accounts) sendInvitation(ctx context.Context, email string, existing *D
 		_, err := a.goTrueAnon(ctx, http.MethodPost, "/magiclink"+redirect, map[string]any{"email": email})
 		return err
 	}
+	// GoTrue creates the user, which its before-user-created hook allows only with this
+	// one-time grant, issued for this address (sso.GrantKey, serveBeforeUserCreated).
+	grant := newToken("sbg_")
+	gh := sha256.Sum256([]byte(grant))
+	if err := a.Store.CreateSignupGrant(ctx, email, gh[:], a.now().Add(10*time.Minute)); err != nil {
+		return err
+	}
 	var u struct {
 		ID string `json:"id"`
 	}
-	if _, err := a.goTrue(ctx, http.MethodPost, "/invite"+redirect, map[string]any{"email": email}, &u); err != nil {
+	if _, err := a.goTrue(ctx, http.MethodPost, "/invite"+redirect, map[string]any{"email": email, "data": map[string]any{sso.GrantKey: grant}}, &u); err != nil {
 		return err
 	}
 	if u.ID == "" {

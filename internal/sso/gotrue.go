@@ -79,6 +79,9 @@ type Provider struct {
 	Domains   []Domain `json:"domains"`
 	CreatedAt string   `json:"created_at,omitempty"`
 	UpdatedAt string   `json:"updated_at,omitempty"`
+	// Disabled is GoTrue's own flag: it refuses to start a sign-in through a disabled provider.
+	// The Management API does not show it.
+	Disabled *bool `json:"disabled,omitempty"`
 }
 
 // DomainNames lists the domains of p, lower case.
@@ -116,6 +119,7 @@ type CreateBody struct {
 	Domains          []string          `json:"domains,omitempty"`
 	AttributeMapping *AttributeMapping `json:"attribute_mapping,omitempty"`
 	NameIDFormat     string            `json:"name_id_format,omitempty"`
+	Disabled         *bool             `json:"disabled,omitempty"`
 }
 
 // UpdateBody is the body of PUT /admin/sso/providers/{id}. A nil Domains leaves the domains
@@ -126,6 +130,7 @@ type UpdateBody struct {
 	Domains          *[]string         `json:"domains,omitempty"`
 	AttributeMapping *AttributeMapping `json:"attribute_mapping,omitempty"`
 	NameIDFormat     *string           `json:"name_id_format,omitempty"`
+	Disabled         *bool             `json:"disabled,omitempty"`
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
