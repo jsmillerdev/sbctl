@@ -47,7 +47,8 @@ done
 files=(supavise-linux-amd64 supavise-linux-arm64)
 for f in supavise-studio-*-linux-*.tar.zst; do [[ -e $f ]] && files+=("$f"); done
 if [[ -n $tag ]]; then
-  min=$(grep -v '^[[:space:]]*#' "$here/MIN_UPGRADE_FROM" | tr -d '[:space:]')
+  # SUPAVISE_MIN_UPGRADE_FROM overrides the file (the install-e2e job tests a release with a floor).
+  min=${SUPAVISE_MIN_UPGRADE_FROM:-$(grep -v '^[[:space:]]*#' "$here/MIN_UPGRADE_FROM" | tr -d '[:space:]')}
   rm -f supavise-release.json
   if [[ -n ${SUPAVISE_RELEASETOOL:-} ]]; then
     "$SUPAVISE_RELEASETOOL" manifest -version "$tag" -min-upgrade-from "$min" -versions "$here/../internal/versions/versions.yaml" -out supavise-release.json

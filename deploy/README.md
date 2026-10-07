@@ -5,7 +5,10 @@ How a Supavise node gets installed, claimed, updated and released.
 | Path | What |
 |---|---|
 | `install.sh` | The bootstrap for any Ubuntu 24.04+ or Debian 12+ server: host checks, release download with signature and checksum verification, then `supavise install`. |
-| `release-assets.sh` | Signs a release (`SHA256SUMS`, `SHA256SUMS.sig`), stamps the public key into `install.sh`. Used by the release workflow and by the `install-e2e` job. |
+| `release-assets.sh` | Writes the release manifest, signs a release (`SHA256SUMS` covers the manifest; `SHA256SUMS.sig`), stamps the public key into `install.sh`. Used by the release workflow and by the `install-e2e` job. |
+| `release-gate.sh` | The first job of the release workflow: refuses a tag whose commit has not passed ci, linux (the upgrade test) and conformance. |
+| `releasetool/` | Writes the manifest, the release notes and the pin edits of the nightly bump proposals (`go run ./deploy/releasetool`). |
+| `MIN_UPGRADE_FROM` | The oldest version that upgrades straight to the release being built (goes into the manifest). |
 | `cloudformation/supavise.yaml` | One-instance AWS stack: one required field, one file, nothing retained silently. |
 | `aws/deploy.sh` | One-command AWS deploy (`aws cloudformation deploy`, `--dry-run`, `--delete`). Attached to releases as `supavise-aws-deploy.sh`. |
 | `systemd/` | The unit templates the binary embeds (`systemd/README.md`). |
@@ -52,6 +55,9 @@ Run `supavise install --help` for the full list. The ones most installs need:
 | `--s3-bucket B --s3-region R` | Keep WAL archives and base backups in S3. Without static keys the AWS credential chain applies (instance role). `--s3-endpoint`, `--s3-path-style`, `--s3-credentials-file` for S3-compatible stores. |
 | `--key-passphrase-file F` | Keep an encrypted copy of the master key and `config.toml` in the backup backend, protected by the passphrase in `F` (mode 0600, at least 12 characters; nothing on the server stores it). Without it the summary reminds you to run `supavise system export-key` and keep the output offline. |
 | `--public-ip` | Detected from the EC2 metadata service or `checkip.amazonaws.com` when omitted. |
+| `--auto-upgrade` | Install new releases by itself inside the maintenance window ([Update](#update)). Without it the node only logs that a release exists. `--auto-upgrade=false` switches back. |
+| `--maintenance-window "Sun 03:00-05:00"` | The weekly window, in the node's time zone. Default `Sun 04:00-06:00`. |
+| `--no-os-updates` | Do not set up unattended OS security updates. A new install does (Ubuntu and Debian); a re-run keeps the value in `config.toml`. `--os-reboot never` stops the node from rebooting itself for them. |
 | `--no-functions` | Run without Edge Functions. A new install turns them on; a re-run keeps the value in `config.toml`. |
 | `--tls off` | Plain HTTP on 80 and 443, for tests or behind a TLS terminator. |
 | `--set path=value` | Any `config.toml` setting, for example `--set ports.project_base=38000`. |
@@ -118,13 +124,69 @@ sudo -u supavise supavise sso info          # the ACS URL and entity id to confi
 
 ## Update
 
+Hosted Supabase updates its platform for you. Here you own the node, so Supavise tells you that a release exists and changes nothing until you ask, or until you opt in to automatic upgrades inside a maintenance window. One Supavise release is a tested bundle: the binary and the Supabase service versions it installs (`internal/versions/versions.yaml`). You track one version.
+
+```bash
+supavise update status               # settings, next window, latest release seen, last unattended upgrade
+sudo supavise update config --mode auto --window "Sun 03:00-05:00"   # opt in
+sudo supavise update config --mode notify                            # opt out again
+sudo supavise self-update            # replace the binary only (below)
+```
+
+### Settings
+
+The `[update]` section of `config.toml`. `supavise update config` changes it (it writes `config.toml`, rewrites the timer and applies the change, with no daemon restart), the installer's flags set the same keys, and a re-run of the installer keeps what is there.
+
+| Key | Values | Meaning |
+|---|---|---|
+| `mode` | `notify` (default), `auto` | `notify` logs `update_available` once per release and changes nothing. `auto` runs `supavise upgrade --unattended` inside the window, and only there. |
+| `window` | `"Sun 04:00-06:00"` (default) | Weekly maintenance window in the node's time zone ([format](#the-window-format)). |
+| `channel` | `stable` | The only channel: GitHub's latest release that is not a pre-release. |
+| `check_interval` | `6h` (default), `15m` to `168h`, `off` | How often the node asks GitHub for the latest release. `off` stops the check; `auto` mode still upgrades in the window, because the upgrade command looks for itself. |
+| `os_security_updates` | `true` on a new install | Unattended OS security updates ([below](#operating-system-updates)). An existing node keeps `false` until you turn it on. |
+| `os_reboot` | `window` (default), `never` | Reboot the node inside the window when an OS patch needs it. Only applies when `os_security_updates` is on. |
+
+### How it runs
+
+`supavise-upgrade.timer` starts `supavise-upgrade.service` (`supavise update run`, as root). It is enabled by `supavise system install-units` (the installer and `self-update` run it) when the node has something for it to do: the release check, auto mode, or the reboot in the window. The timer wakes the service 15 minutes after boot and then every `check_interval`, and when the window opens; in auto mode, and for the OS reboot, it also wakes every 15 minutes until the window closes (at most 16 times, so a long window gets a wider step). That is how a refused upgrade gets another try in the same window. The service decides what each wake-up does:
+
+- It checks for a release when `check_interval` has passed, and logs `update_available` (installed and latest version, the next window) once per release. A failed check logs `update_check_failed` and nothing else happens.
+- Only when `mode = "auto"` and the window is open, it runs `supavise upgrade --unattended`: once per window. The exit status decides what comes next: `0` (upgraded, or nothing to do) ends the window's attempt; `2` (a pre-check refused, nothing changed) is tried again at the next wake-up in the window; `3` (failed and rolled back) ends the attempt, fails the service unit so that `systemctl --failed` shows it, and the next window tries again; `4` (failed, needs the operator) or any other result **pauses automatic upgrades** until you have looked and run `sudo supavise update resume`. Every attempt logs `unattended_upgrade_started` and `unattended_upgrade_result` (the exit status and what it means) to the journal (`journalctl -u supavise-upgrade`), where the alerting and health tooling can pick the stable message keys up. The service never starts an upgrade outside the window, and notify mode never starts one. An upgrade that starts in the window runs to its end, whatever the clock says. A window the node slept through is skipped, not made up.
+- With `os_security_updates` and `os_reboot = "window"` it reboots the node when an OS update needs it, once per window, after the upgrade and not at all if the upgrade failed.
+
+`supavise upgrade --unattended` refuses (exit 2) unless `supavise status` is healthy and every project has a backup newer than 24 hours; it takes fresh backups anyway. The upgrade engine owns that; this section covers only when it is called.
+
+### The window format
+
+`[DAYS ]HH:MM-HH:MM`, 24-hour, in the node's time zone (the zone of `/etc/localtime`, which is UTC on most cloud images: `timedatectl` shows it, `timedatectl set-timezone` changes it).
+
+| Example | Meaning |
+|---|---|
+| `Sun 03:00-05:00` | Sundays, 03:00 to 05:00 |
+| `Sat,Sun 02:00-04:00` | a list of days |
+| `Mon-Fri 01:30-03:30` | a range of days (`Fri-Mon` wraps around the weekend) |
+| `daily 03:00-04:00`, `03:00-04:00` | every day |
+| `Sun 23:00-01:00` | a window that ends after midnight belongs to the day it opens on: Sunday 23:00 to Monday 01:00 |
+
+Days are `Mon Tue Wed Thu Fri Sat Sun` in any case (full names work). The default sits after the nightly 03:00 base backups. A window must close after it opens; `supavise update config --window` refuses anything else.
+
+### Operating system updates
+
+A new install turns on unattended-upgrades for **security updates only**, on Ubuntu 24.04+ and Debian 12+ (`--no-os-updates` skips it; an existing node is not changed). `supavise install` (and `supavise system os-updates`) installs `unattended-upgrades` and `needrestart` when they are missing and writes `/etc/apt/apt.conf.d/52supavise-unattended-upgrades`, which refreshes the package lists and installs updates daily from the security origins only (Ubuntu's `-security` pocket and its ESM pockets; Debian's `-security` archive, not its point-release updates), by replacing the origin lists of the distribution's own `50unattended-upgrades`. `apt-config dump` and `unattended-upgrade --dry-run --debug` show what it reads; the `os-updates` job (Ubuntu 24.04, Debian 12 and 13) and `install-e2e` check both. `--no-os-updates` on a re-run, or `supavise update config --os-security-updates=false`, removes the files Supavise wrote and leaves the packages.
+
+Reboots are not left to unattended-upgrades. Its `Automatic-Reboot` option picks a time of day, not a day of the week, so it could not honor a window such as "Sun 04:00-06:00"; the file sets it to `false`. With `os_reboot = "window"` the service above reboots the node inside the window when a reboot is due, once per window. It finds out from `/run/reboot-required` (Ubuntu writes it) and from `needrestart -b -k` (kernel status 2 or 3; Debian does not write the marker file), so the same rule serves both distributions. `needrestart` would otherwise restart services whose libraries an update replaced, and on a Supavise node that includes a project's Postgres in the middle of the day: `/etc/needrestart/conf.d/50-supavise.conf` tells it to leave every `supavise-*` unit alone, and the unit picks the new library up at the next reboot or Supavise upgrade. That file is written and its syntax is the documented `override_rc` form, but no test restarts a service through `needrestart` to see it honored.
+
+**Expected reboot impact.** A reboot stops every project, then `supavise.service` starts them one at a time. `docs/research/09-footprint.md` measured `supavise system start` on idle projects (GitHub `ubuntu-24.04`, 4 vCPU, 16 GB): 5 s at 10 projects, 12 s at 25, 24 s at 50, the same on arm64. The machine's own shutdown and boot come on top (not measured), and a node with large databases or WAL to replay takes longer than idle projects. `supavise.service` waits up to 10 minutes for running lifecycle operations before it stops, and Postgres shuts down with a fast shutdown. Plan the window for the whole gap, and set `os_reboot = "never"` if a person must choose the moment (`supavise update status` then says "a reboot is waiting").
+
+### Replacing the binary by hand: self-update
+
 ```bash
 sudo supavise self-update            # the latest release
 sudo supavise self-update --version v1.2.3
 supavise self-update --check
 ```
 
-`self-update` fetches the release, verifies the ed25519 signature of `SHA256SUMS` against the public key compiled into the binary (`internal/selfupdate/release_key.pem`) and the binary against its checksum, replaces `/usr/local/bin/supavise` with one rename (the previous binary stays as `supavise.prev`), refreshes the units with the new binary and restarts `supavise.service`. Then it waits up to `--wait` (5 minutes, as in the installer) for the daemon to answer on its admin listener, the check the installer uses (a daemon can be `active` to systemd and still crash a moment later). If it does not answer, `self-update` puts the previous binary back, re-renders the units with it and restarts the service. Project units keep running while the daemon restarts. Artifact versions move with `internal/versions/versions.yaml` inside a release, not through this command.
+`self-update` fetches the release, verifies the ed25519 signature of `SHA256SUMS` against the public keys compiled into the binary (`internal/selfupdate/release_key.pem`, and `release_key_next.pem` while a [key rotation](#rotating-the-release-signing-key) is under way), checks the signed release manifest (below) and the binary against their checksums, and refuses a release that needs an older version than you run to go first (`min_upgrade_from`). It replaces `/usr/local/bin/supavise` with one rename (the previous binary stays as `supavise.prev`), refreshes the units with the new binary and restarts `supavise.service`. Then it waits up to `--wait` (5 minutes, as in the installer) for the daemon to answer on its admin listener, the check the installer uses (a daemon can be `active` to systemd and still crash a moment later). If it does not answer, `self-update` puts the previous binary back, re-renders the units with it and restarts the service. Project units keep running while the daemon restarts. Artifact versions move with `internal/versions/versions.yaml` inside a release, not through this command.
 
 A binary built without a committed release key refuses to self-update (it names the missing key).
 
@@ -408,11 +470,58 @@ openssl pkey -in supavise-signing.pem -pubout -out internal/selfupdate/release_k
 gh secret set SUPAVISE_SIGNING_KEY --env release < supavise-signing.pem                     # then delete supavise-signing.pem
 ```
 
-The key goes into a GitHub Environment named `release`, not into a repository secret. A repository secret can be read by any workflow run that someone with write access starts from any branch, and this key is the root of trust for self-update and `install.sh` on every node. Create the Environment in the repository settings (Settings, Environments) with a deployment rule that admits only the tags `v*`, and optionally a required reviewer; `release.yml` names it (`environment: release`) in the two jobs that read the key. The environment is created on the first run when it does not exist, but then it has no rule, so create it first.
+The key goes into a GitHub Environment named `release`, not into a repository secret. A repository secret can be read by any workflow run that someone with write access starts from any branch, and this key is the root of trust for self-update and `install.sh` on every node. Create the Environment in the repository settings (Settings, Environments) with a deployment rule that admits only the tags `v*`, and optionally a required reviewer; `release.yml` names it (`environment: release`) in the jobs that read the key. The environment is created on the first run when it does not exist, but then it has no rule, so create it first.
 
-`.github/workflows/release.yml` runs on a pushed tag `vMAJOR.MINOR.PATCH[-suffix]`. It stops early if the committed key is still the placeholder, if the secret (of the `release` environment) is missing or if the secret is not the private half of the committed public key. Then it runs `go vet` and `go test`, builds `supavise-linux-amd64` and `supavise-linux-arm64` (`CGO_ENABLED=0`, `-trimpath`, `-X main.version=<tag>`), builds Studio for both architectures with `studio/build.sh`, and `deploy/release-assets.sh` writes `SHA256SUMS`, signs it (`openssl pkeyutl -sign -rawin`, a raw 64-byte signature), stamps the public key into `install.sh`, copies `supavise.yaml` with the tag as its default `SupaviseVersion` and copies `aws/deploy.sh` as `supavise-aws-deploy.sh`. The job creates the release (a tag with a suffix becomes a pre-release) and attaches `supavise-linux-*`, the Studio archives, `SHA256SUMS`, `SHA256SUMS.sig`, `install.sh`, `supavise.yaml` and `supavise-aws-deploy.sh`. The template and the deploy script are not in `SHA256SUMS`: they are fetched over TLS from the release, like `install.sh`. When the repository variables `AWS_TEMPLATE_BUCKET` and `AWS_RELEASE_ROLE_ARN` exist, a last job uploads the template to the public bucket and prints the Launch Stack link ([AWS](#c-launch-stack-button)); without them it is skipped.
+`.github/workflows/release.yml` runs on a pushed tag `vMAJOR.MINOR.PATCH[-suffix]`:
 
-To rotate the key: generate a new pair, commit the new public file, replace the secret, tag a release. Binaries from before the rotation verify only against the old key, so they cannot self-update to a release signed with the new one; a rotation needs a manual reinstall with the new `install.sh`. Nothing has been tagged or released from this repository by the tooling.
+1. **The tests must have passed on the tagged commit.** The `gate` job runs `deploy/release-gate.sh`, which reads the workflow runs on that commit through the GitHub API and goes on only when the newest run of `ci.yml`, `linux.yml` and `conformance.yml` succeeded, and the conformance suite (the `suites` jobs of `conformance.yml`, amd64 and arm64) and the upgrade test (the jobs of `linux.yml` whose names start with `upgrade`) are among them. It waits for runs still in progress, and fails when a workflow has no run on the commit (push the commit to `main`, or `gh workflow run <file> --ref <branch>`, then tag). It reads runs; it starts none. It fails closed: if the upgrade test's job is renamed, the gate says it found no such job, and `REQUIRED` in the script is where the new name goes. `binaries` and `studio` wait for it, so a failed gate builds and publishes nothing.
+2. `check` stops early if the committed key is still the placeholder, if the secret (of the `release` environment) is missing or if the secret is not the private half of the committed public key, and validates `release_key_next.pem` when it holds a key. Then it runs `go vet` and `go test`.
+3. `binaries` builds `supavise-linux-amd64` and `supavise-linux-arm64` (`CGO_ENABLED=0`, `-trimpath`, `-X main.version=<tag>`), `studio` builds Studio for both architectures with `studio/build.sh`.
+4. `publish` runs `deploy/release-assets.sh`: it writes `supavise-release.json` (the release manifest, below), writes `SHA256SUMS` over the binaries, the Studio archives and the manifest, signs it (`openssl pkeyutl -sign -rawin`, a raw 64-byte signature) with the current key, stamps the public key into `install.sh`, copies `supavise.yaml` with the tag as its default `SupaviseVersion` and copies `aws/deploy.sh` as `supavise-aws-deploy.sh`. It generates the release notes (below) and creates the release (a tag with a suffix becomes a pre-release) with `supavise-linux-*`, the Studio archives, `SHA256SUMS`, `SHA256SUMS.sig`, `supavise-release.json`, `install.sh`, `supavise.yaml` and `supavise-aws-deploy.sh`. The template and the deploy script are not in `SHA256SUMS`: they are fetched over TLS from the release, like `install.sh`.
+5. When the repository variables `AWS_TEMPLATE_BUCKET` and `AWS_RELEASE_ROLE_ARN` exist, a last job uploads the template to the public bucket and prints the Launch Stack link ([AWS](#c-launch-stack-button)); without them it is skipped.
+
+### The release manifest
+
+`supavise-release.json` is listed in `SHA256SUMS`, so the one signature covers it. `supavise self-update` and `supavise upgrade` read it through `selfupdate.Fetch` (`internal/selfupdate`), which downloads `SHA256SUMS` and its signature, verifies the signature against the embedded keys, checks the manifest against the checksum the signed list holds for it, and refuses a manifest whose `version` is not the release tag. Format, schema 1:
+
+```json
+{
+  "schema": 1,
+  "version": "v1.4.0",
+  "min_upgrade_from": "v1.2.0",
+  "artifacts": {"auth": "auth-v2.195.0-r1", "postgres": "postgres-17.11.0.004-r1"},
+  "studio": "2026.10.05-sha-94b8b06"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `schema` | The format number. A binary refuses a higher one and says to update with the release's installer. Adding a field keeps the number; changing the meaning of a field raises it. Readers ignore fields they do not know. |
+| `version` | The release tag, `vMAJOR.MINOR.PATCH[-suffix]`. |
+| `min_upgrade_from` | The oldest installed version that may upgrade straight to this release (`vMAJOR.MINOR.PATCH`, not newer than `version`). A node on an older version installs `min_upgrade_from` first; `Manifest.CheckUpgradeFrom(current)` returns the refusal that says so. A running version that is not a release (`dev`) passes, and a suffix is ignored, as in `Newer`. It comes from `deploy/MIN_UPGRADE_FROM`: raise it in the commit that makes a release depend on something earlier ones did not do (a registry migration that is not backward compatible, a changed on-disk layout). |
+| `artifacts` | The slim-services release of each Supabase service this release installs, from its `internal/versions/versions.yaml`. A plan can show what an upgrade changes before it downloads the binary. |
+| `studio` | The Studio build tag of that file. |
+
+### Release notes
+
+The workflow generates the notes with `deploy/releasetool notes`: what Supavise changed since the previous tag (commit subjects, capped at 100, with a compare link), then a table of the Supabase service versions that moved, from the difference between `internal/versions/versions.yaml` at the previous tag and at this one. Each changed row links the new version's upstream release (and a compare link between the two) and the slim-services release that packages it. A stable release compares with the previous stable tag, a pre-release with the previous tag of any kind, and the first release lists every pin.
+
+### Rotating the release signing key
+
+Every binary embeds the key that verifies its updates, so a rotation has to reach the nodes through a release that they accept. The binary therefore embeds two keys, `release_key.pem` (current) and `release_key_next.pem` (optional), and accepts a signature by either. `deploy/release-assets.sh` always signs with the current key, the one whose public half is `release_key.pem`. A rotation takes two releases and no reinstall:
+
+1. Generate the new pair: `openssl genpkey -algorithm ed25519 -out next.pem` and `openssl pkey -in next.pem -pubout`. Commit the public half as `internal/selfupdate/release_key_next.pem`. Keep the private half (`next.pem`) offline for now. `release.yml` checks that the file is a valid public key and not the current one.
+2. Tag release N. It is signed with the old key, which the nodes trust, and its binary carries both keys. Wait until every node runs N (`supavise update status` on each, or `self-update --check`). Nodes with the update mode `auto` get N in their next window.
+3. Put the private half of the new key into the secret (`gh secret set SUPAVISE_SIGNING_KEY --env release < next.pem`), copy the public half over `release_key.pem` and replace `release_key_next.pem` with the placeholder text (or with the public half of the following key). Commit and tag release N+1. It is signed with the new key, which N's binaries accept as their next key, and it embeds the new key as its current key. `install.sh` of N+1 is stamped with the new key, so new installs trust it from the start.
+4. Delete the old private key.
+
+A node that missed release N cannot verify N+1 and must be updated through N first (or reinstalled with the new `install.sh`). A binary built before the second key existed (none has been released) has no overlap and needs the reinstall too. If the old key was stolen, the overlap does not help: whoever holds it can sign a release that nodes accept, so rotate immediately, tell the operators to reinstall with the new `install.sh` from a source they trust, and treat releases signed since the theft as suspect. `internal/selfupdate` tests the whole sequence (`TestKeyRotationNeedsNoReinstall`): the old binary refuses the second release, the dual-key one installs it.
+
+### Proposals for new Supabase releases
+
+`.github/workflows/bump-proposals.yml` runs every night, and on demand, on `main`. It runs the bump check (`tests/conformance/bumpcheck`) and, for each Supabase service (a slim-services artifact, or Studio) whose newest release is newer than its pin in `internal/versions/versions.yaml`, opens one pull request that moves that pin, from the branch `bump/<service>`, or updates the open one when a still newer release has appeared (`tests/conformance/propose-bumps.sh`). It skips pre-releases, a version whose pull request is already open and one whose pull request was closed without merging. **It never merges anything**: a person reads the upstream release notes the pull request links and merges it. The conformance suite and the upgrade test gate the merge: a push made with a workflow's `GITHUB_TOKEN` starts no workflows, so the proposal starts `ci.yml`, `conformance.yml` and `linux.yml` (and `studio.yml` for Studio) on its branch with `workflow_dispatch`, and their runs appear as the branch's checks. The workflow has `contents: write` (push the branch), `pull-requests: write` and `actions: write` (start those runs), and one repository setting only an administrator can change: *Allow GitHub Actions to create and approve pull requests* (Settings, Actions, General). Without it opening the pull request fails with a message that says so. To see what it would do, run it by hand with `dry_run`, or `DRY_RUN=1 tests/conformance/propose-bumps.sh`.
+
+Nothing has been tagged or released from this repository by the tooling.
 
 ## Tests
 
@@ -428,7 +537,11 @@ To rotate the key: generate a new pair, commit the new public file, replace the 
 - `supavise self-update` against a local release server: refuses a tampered binary, a wrong key and an older signed binary under a newer tag, installs v0.0.3, restarts the daemon, leaves the project's Postgres running; then a release whose daemon exits on `serve` is rolled back to v0.0.3, whose daemon answers again;
 - the claim token stays out of the installer's output when `--claim-token-file` is used.
 
-Go unit tests: `internal/selfupdate` (signature, checksum, atomic replace, refusals, an OpenSSL-made signature fixture), `internal/api/claim_test.go` (the endpoint, single use, expiry, rate limit, concurrent redemption, invites, user removal; the Postgres store runs when `SUPAVISE_TEST_DATABASE_URL` is set), `cmd/supavise/cmd_install_test.go` (flag to config mapping, minimal config rendering, `--set`, OS and glibc checks, EC2 metadata).
+- the release manifest (the version and the pinned Postgres release in it, listed in the signed `SHA256SUMS`); `supavise update config` and the installer flags: notify by default, the timer enabled with one wake-up per window, auto mode writing a tick every 15 minutes through the window, settings kept by a re-run, bad windows and modes refused, `update run` outside the window upgrades nothing; unattended OS security updates on a new install (apt-config and `unattended-upgrade --debug` read only security origins, no automatic reboot, the needrestart drop-in), switched off by `--no-os-updates` and on again; `self-update` verifying with a second key and refusing a release whose `min_upgrade_from` is newer than the node.
+
+The `os-updates` job (`tests/linux/os-updates.sh`, containers: Ubuntu 24.04, Debian 12, Debian 13) runs `supavise system os-updates` on a bare image and asks apt and `unattended-upgrade` what they read, then repeats the step (no change), turns it off (the packages stay) and checks that a foreign file is left alone.
+
+Go unit tests: `internal/config` (the maintenance window: parsing, inside-window logic across midnight, time zones and daylight saving time, timer ticks; the `[update]` section), `internal/update` (one pass of `update run` against a fake clock: notify never upgrades, auto only inside the window and once per window, refusal retried, rollback and operator failures, the pause and `resume`, the release announced once, the reboot only inside the window and once; the timer rendering, kept in step with `deploy/systemd/supavise-upgrade.timer`; the apt and needrestart files), `cmd/supavise` (install flags and persistence of the `[update]` settings, the status report), `internal/selfupdate` (signature, checksum, atomic replace, refusals, an OpenSSL-made signature fixture, manifest signing and verification with throwaway keys, `min_upgrade_from`, dual-key acceptance and rejection, the rotation), `deploy/releasetool` (release notes from two `versions.yaml` files, the pin edit, the manifest, the release gate against a stub `gh`, the nightly proposals against a bare repository and a stub `gh`), `internal/api/claim_test.go` (the endpoint, single use, expiry, rate limit, concurrent redemption, invites, user removal; the Postgres store runs when `SUPAVISE_TEST_DATABASE_URL` is set), `cmd/supavise/cmd_install_test.go` (flag to config mapping, minimal config rendering, `--set`, OS and glibc checks, EC2 metadata).
 
 ## Not done
 

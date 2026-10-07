@@ -4,6 +4,9 @@ on:
   push:
     branches: [main, "ws/**"]
   pull_request:
+  # The nightly bump proposals start this workflow on their branches: a push made with a
+  # workflow's GITHUB_TOKEN does not (.github/workflows/bump-proposals.yml).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -77,9 +80,20 @@ jobs:
           "$RUNNER_TEMP/checkov/bin/pip" install --quiet checkov==3.3.25
           "$RUNNER_TEMP/checkov/bin/checkov" -f deploy/cloudformation/supavise.yaml --framework cloudformation --compact --quiet
       - name: shellcheck
-        run: shellcheck deploy/aws/deploy.sh deploy/release-assets.sh
+        run: shellcheck deploy/aws/deploy.sh deploy/release-assets.sh deploy/release-gate.sh tests/conformance/propose-bumps.sh
       - name: template, deploy.sh and release assets
         run: go test -count=1 -v ./deploy/...
+
+  # The workflow files themselves. actionlint is pinned; its own shellcheck pass is off because the
+  # run: blocks of the older workflows carry findings that are not about this change.
+  actionlint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck=
 
   functions-main:
     # The Deno main service of the Edge Runtime (internal/functions/mainservice/): format, lint, type check

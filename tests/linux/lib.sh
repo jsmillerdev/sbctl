@@ -339,3 +339,31 @@ wait_cron_success() {
   "$run" "$ref" "select d.status, d.return_message from cron.job_run_details d join cron.job j using (jobid) where j.jobname = '$job' order by d.runid desc limit 3" >&2 || true
   return 1
 }
+
+# assert_os_updates on|off: what `supavise system os-updates` leaves on a Ubuntu or Debian host.
+# On: unattended-upgrades is installed and reads only the security origins (checked through
+# apt-config and through the program's own "Allowed origins" line), never reboots by itself, and
+# needrestart is told to leave supavise-* units alone. Off: Supavise's files are gone.
+assert_os_updates() { # on|off
+  if [[ $1 == on ]]; then
+    [[ -f /etc/apt/apt.conf.d/52supavise-unattended-upgrades ]] || fail "the apt configuration for unattended security updates is missing"
+    dpkg -s unattended-upgrades >/dev/null 2>&1 || fail "unattended-upgrades is not installed"
+    local cfg pats origins l
+    cfg=$(apt-config dump)
+    # Only security origins, whichever list the distribution's own file used (we clear both).
+    [[ -z $(grep '^Unattended-Upgrade::Allowed-Origins::' <<<"$cfg") ]] || fail "Allowed-Origins still lists origins: $(grep '^Unattended-Upgrade::Allowed-Origins::' <<<"$cfg")"
+    pats=$(grep '^Unattended-Upgrade::Origins-Pattern::' <<<"$cfg") || fail "no Origins-Pattern entries: $cfg"
+    while IFS= read -r l; do [[ $l == *security* ]] || fail "an origin that is not a security origin: $l"; done <<<"$pats"
+    grep -q '^Unattended-Upgrade::Automatic-Reboot "false";' <<<"$cfg" || fail "unattended-upgrades may reboot by itself"
+    grep -q '^APT::Periodic::Unattended-Upgrade "1";' <<<"$cfg" || fail "unattended upgrades are not switched on"
+    # What the program itself reads from that configuration.
+    origins=$(unattended-upgrade --dry-run --debug 2>&1 || true)
+    origins=$(grep -m1 'Allowed origins are' <<<"$origins") || fail "unattended-upgrade printed no allowed origins"
+    [[ $origins == *security* && $origins != *-updates* && $origins != *backports* ]] || fail "unattended-upgrade would take more than security updates: $origins"
+    [[ ! -d /etc/needrestart/conf.d || -f /etc/needrestart/conf.d/50-supavise.conf ]] || fail "needrestart may restart supavise units"
+  else
+    [[ ! -e /etc/apt/apt.conf.d/52supavise-unattended-upgrades ]] || fail "the apt configuration is still there"
+    [[ ! -e /etc/needrestart/conf.d/50-supavise.conf ]] || fail "the needrestart drop-in is still there"
+  fi
+}
+
