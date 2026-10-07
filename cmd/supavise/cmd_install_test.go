@@ -486,3 +486,28 @@ func TestFirewallAutoWithActiveUFWOpensThePublicPorts(t *testing.T) {
 		t.Fatalf("output = %q", out.String())
 	}
 }
+
+func TestInstallTurnsFunctionsOnForANewNode(t *testing.T) {
+	cfg := config.Default()
+	if err := applyInstall(cfg, installOptions{Fresh: true}, changedSet()); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Functions.Enabled {
+		t.Fatal("a new install must turn Edge Functions on")
+	}
+	// A re-run keeps the operator's choice: off stays off without --no-functions.
+	cfg.Functions.Enabled = false
+	if err := applyInstall(cfg, installOptions{}, changedSet()); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Functions.Enabled {
+		t.Fatal("a re-run turned Edge Functions back on")
+	}
+	cfg = config.Default()
+	if err := applyInstall(cfg, installOptions{Fresh: true, NoFunctions: true}, changedSet()); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Functions.Enabled {
+		t.Fatal("--no-functions left Edge Functions on")
+	}
+}

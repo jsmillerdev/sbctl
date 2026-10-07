@@ -46,6 +46,11 @@ type installOptions struct {
 	StudioURL    string
 	StudioSHA256 string
 	NoStudio     bool
+	NoFunctions  bool
+
+	// Fresh is set by the caller when no config.toml existed: defaults that differ between a new
+	// install and config.Default() apply only then, so a re-run keeps what the operator chose.
+	Fresh bool
 
 	Sets           []string
 	ClaimTTL       time.Duration
@@ -167,6 +172,13 @@ func applyInstall(cfg *config.Config, o installOptions, changed func(string) boo
 	}
 	if o.NoStudio {
 		cfg.Studio.ArtifactURL, cfg.Studio.ArtifactSHA256 = "", ""
+	}
+	// Edge Functions are on for a new install, as on hosted Supabase; --no-functions turns them
+	// off, and a re-run without either keeps the value in config.toml.
+	if o.NoFunctions {
+		cfg.Functions.Enabled = false
+	} else if o.Fresh {
+		cfg.Functions.Enabled = true
 	}
 	for _, kv := range o.Sets {
 		k, v, ok := strings.Cut(kv, "=")

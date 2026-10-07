@@ -65,6 +65,7 @@ the DNS records the summary lists (a wildcard A record for *.api.<domain> is req
 	f.StringVar(&o.StudioURL, "studio-url", "", "download URL of the Studio build (tar.zst); install.sh sets it from the release")
 	f.StringVar(&o.StudioSHA256, "studio-sha256", "", "SHA-256 of the Studio build")
 	f.BoolVar(&o.NoStudio, "no-studio", false, "run without the dashboard")
+	f.BoolVar(&o.NoFunctions, "no-functions", false, "run without Edge Functions (a new install turns them on)")
 	f.StringArrayVar(&o.Sets, "set", nil, "set any config.toml path, repeatable, for example ports.project_base=38000")
 	f.DurationVar(&o.ClaimTTL, "claim-ttl", api.DefaultClaimTTL, "how long the claim token stays valid")
 	f.StringVar(&o.ClaimTokenFile, "claim-token-file", "", "also write the claim token to this file (mode 0600)")
@@ -81,10 +82,11 @@ the DNS records the summary lists (a wildcard A record for *.api.<domain> is req
 }
 
 func printInstallConfig(cmd *cobra.Command, o installOptions) error {
-	cfg, _, err := readConfigFile(config.DefaultPath)
+	cfg, existed, err := readConfigFile(config.DefaultPath)
 	if err != nil {
 		return err
 	}
+	o.Fresh = !existed
 	if err := applyInstall(cfg, o, cmd.Flags().Changed); err != nil {
 		return err
 	}
@@ -152,6 +154,7 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	if err != nil {
 		return err
 	}
+	o.Fresh = !existed
 	if err := applyInstall(cfg, o, changed); err != nil {
 		return err
 	}

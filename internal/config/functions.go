@@ -43,9 +43,10 @@ const (
 
 // Functions is the [functions] config section: Edge Functions, served by the
 // edge-runtime artifact (unit supavise-edge-runtime) with supavise's tenant-aware main service
-// from functions-main/. Off by default: a node without it does not fetch or start
-// the runtime, and the proxy answers 503 on /functions/v1. The environment overrides
-// are SUPAVISE_FUNCTIONS_*.
+// from functions-main/. Off in config.Default(); `supavise install` turns it on for a new
+// node (--no-functions keeps it off). A node without it does not fetch or start the
+// runtime, and the proxy answers 503 on /functions/v1. The environment overrides are
+// SUPAVISE_FUNCTIONS_*.
 type Functions struct {
 	// Enabled turns the feature on: the fleet starts supavise-edge-runtime, the proxy routes
 	// /functions/v1 to it and the API materializes deployments on disk.

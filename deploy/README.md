@@ -51,6 +51,7 @@ Run `supavise install --help` for the full list. The ones most installs need:
 | `--email you@example.com` | ACME account contact. |
 | `--s3-bucket B --s3-region R` | Keep WAL archives and base backups in S3. Without static keys the AWS credential chain applies (instance role). `--s3-endpoint`, `--s3-path-style`, `--s3-credentials-file` for S3-compatible stores. |
 | `--public-ip` | Detected from the EC2 metadata service or `checkip.amazonaws.com` when omitted. |
+| `--no-functions` | Run without Edge Functions. A new install turns them on; a re-run keeps the value in `config.toml`. |
 | `--tls off` | Plain HTTP on 80 and 443, for tests or behind a TLS terminator. |
 | `--set path=value` | Any `config.toml` setting, for example `--set ports.project_base=38000`. |
 | `--claim-token-file PATH` | Write the token to a file (0600) and do not print it; the summary names the file. For unattended installs whose output is logged (the CloudFormation user data uses it). |
