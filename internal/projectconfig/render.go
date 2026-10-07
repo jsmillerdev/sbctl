@@ -18,8 +18,10 @@ var (
 // to put in the unit's environment, or "" to remove the variable the unit would otherwise
 // carry. version is appended to template URLs so a changed template is never served from
 // GoTrue's template cache; templateBase is where the daemon serves them
-// (<base>/<ref>/<name>); externalURL is the project's API_EXTERNAL_URL.
-func RenderAuth(ref string, set Values, version int64, templateBase, externalURL string) map[string]string {
+// (<base>/<ref>/<name>); externalURL is the project's API_EXTERNAL_URL. sign, when given,
+// returns the access token appended to the URL of the template name (see
+// Manager.TemplateToken).
+func RenderAuth(ref string, set Values, version int64, templateBase, externalURL string, sign func(name string) string) map[string]string {
 	env := map[string]string{}
 	for i := range AuthSchema.Fields {
 		f := &AuthSchema.Fields[i]
@@ -31,7 +33,13 @@ func RenderAuth(ref string, set Values, version int64, templateBase, externalURL
 		case strings.HasPrefix(f.Name, "mailer_templates_") && strings.HasSuffix(f.Name, "_content"):
 			if s, _ := v.(string); s != "" && templateBase != "" {
 				name := strings.TrimSuffix(strings.TrimPrefix(f.Name, "mailer_templates_"), "_content")
-				env[f.Env] = fmt.Sprintf("%s/%s/%s?v=%d", strings.TrimRight(templateBase, "/"), ref, name, version)
+				u := fmt.Sprintf("%s/%s/%s?v=%d", strings.TrimRight(templateBase, "/"), ref, name, version)
+				if sign != nil {
+					if t := sign(name); t != "" {
+						u += "&t=" + t
+					}
+				}
+				env[f.Env] = u
 			}
 		case authSeconds[f.Name]:
 			n, _ := set.Int(f.Name)
@@ -196,7 +204,7 @@ func (m *Manager) AuthEnv(ctx context.Context, ref, externalURL string) (map[str
 	if err != nil {
 		return nil, err
 	}
-	return RenderAuth(ref, st.Set, st.Version, m.opts.TemplateBaseURL, externalURL), nil
+	return RenderAuth(ref, st.Set, st.Version, m.opts.TemplateBaseURL, externalURL, func(name string) string { return m.TemplateToken(ref, name) }), nil
 }
 
 // PostgRESTEnv is PostgREST's saved settings as environment.

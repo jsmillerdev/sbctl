@@ -127,7 +127,7 @@ func TestAuthPatchRendersAndReadsBack(t *testing.T) {
 		"GOTRUE_SESSIONS_TIMEBOX":             "24h",
 		"GOTRUE_SMTP_MAX_FREQUENCY":           "90s",
 		"GOTRUE_SMS_TEST_OTP":                 "15551234567:123456,15557654321:654321",
-		"GOTRUE_MAILER_TEMPLATES_INVITE":      "http://127.0.0.1:7000/internal/templates/" + ref + "/invite?v=1",
+		"GOTRUE_MAILER_TEMPLATES_INVITE":      "http://127.0.0.1:7000/internal/templates/" + ref + "/invite?v=1&t=" + m.TemplateToken(ref, "invite"),
 	}
 	for k, v := range want {
 		if env[k] != v {
@@ -137,7 +137,7 @@ func TestAuthPatchRendersAndReadsBack(t *testing.T) {
 	// A second save bumps the version, which changes the template URL.
 	patch(t, m, Auth, map[string]any{"jwt_exp": float64(3600)})
 	env, _ = m.AuthEnv(context.Background(), ref, "")
-	if !strings.HasSuffix(env["GOTRUE_MAILER_TEMPLATES_INVITE"], "?v=2") {
+	if !strings.Contains(env["GOTRUE_MAILER_TEMPLATES_INVITE"], "?v=2&t=") {
 		t.Errorf("template URL kept its version: %s", env["GOTRUE_MAILER_TEMPLATES_INVITE"])
 	}
 	body, ok, _ := m.Template(context.Background(), ref, "invite")

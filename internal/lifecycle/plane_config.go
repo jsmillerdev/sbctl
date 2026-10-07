@@ -2,7 +2,11 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -254,6 +258,94 @@ func (pl *PostgresPlane) restartDatabase(ctx context.Context, p *registry.Projec
 		return err
 	}
 	return pl.Start(ctx, p, keys)
+}
+
+// RecoverPostgres brings p's cluster back after an apply of Postgres settings that left it
+// down: a restart that failed on a value Postgres accepted in ALTER SYSTEM and cannot start
+// with. A cluster that answers is left alone (ApplyPostgresSettings resets what is stale
+// through SQL). A cluster that does not is stopped, every setting of the schema is removed
+// from postgresql.auto.conf offline (the saved settings are the truth: command-line ones
+// are rendered into the unit, the others are written again by the ApplyPostgresSettings that
+// follows), and the project starts on the saved settings.
+func (pl *PostgresPlane) RecoverPostgres(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error {
+	pp := pl.paths(p)
+	if err := ping(ctx, pp); err == nil {
+		return nil
+	}
+	pl.log.Warn("the cluster does not answer after a settings change; clearing the managed settings from postgresql.auto.conf and starting it on the saved ones", "ref", p.Ref)
+	if err := pl.Stop(ctx, p.Ref); err != nil {
+		return err
+	}
+	if err := clearManagedAutoConf(pp.Data); err != nil {
+		return err
+	}
+	return pl.Start(ctx, p, keys)
+}
+
+// clearManagedAutoConf removes the settings of projectconfig.PostgresSchema from the
+// postgresql.auto.conf of a stopped cluster, keeping every other line.
+func clearManagedAutoConf(dataDir string) error {
+	path := filepath.Join(dataDir, "postgresql.auto.conf")
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	out, changed := stripManagedSettings(string(b))
+	if !changed {
+		return nil
+	}
+	_, err = writeFile(path, []byte(out), 0o600)
+	return err
+}
+
+// stripManagedSettings drops the lines of the schema's settings from the body of a
+// postgresql.auto.conf. Names compare case-insensitively, as Postgres reads them.
+func stripManagedSettings(body string) (string, bool) {
+	var kept []string
+	changed := false
+	for _, line := range strings.Split(body, "\n") {
+		t := strings.TrimSpace(line)
+		if t != "" && !strings.HasPrefix(t, "#") {
+			name, _, _ := strings.Cut(t, "=")
+			name = strings.ToLower(strings.TrimSpace(name))
+			if _, managed := projectconfig.PostgresSchema.Field(name); managed {
+				changed = true
+				continue
+			}
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n"), changed
+}
+
+// CheckRender renders the units of svc from the saved settings without touching anything
+// that runs: an environment the supervisor cannot write (a line break in a value) or server
+// arguments it cannot quote fail here, at the save, and not when the project resumes.
+func (pl *PostgresPlane) CheckRender(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, svc projectconfig.Service) error {
+	switch svc {
+	case projectconfig.Auth, projectconfig.PostgREST:
+		specs, err := pl.apiSpecs(ctx, p, keys)
+		if err != nil {
+			return err
+		}
+		for _, sp := range specs {
+			if _, err := units.FormatEnv(sp.Env); err != nil {
+				return err
+			}
+		}
+	case projectconfig.Postgres:
+		spec, err := pl.postgresSpec(ctx, p, keys)
+		if err != nil {
+			return err
+		}
+		if _, err := units.FormatRun(spec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RestartDatabase restarts the project (PostgreSQL, then GoTrue and PostgREST) on the saved settings.

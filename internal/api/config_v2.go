@@ -57,7 +57,7 @@ func (s *Server) v2Config(w http.ResponseWriter, r *http.Request) error {
 	fillView(rt, rtSt, projectconfig.RealtimeSchema)
 	set(resp, "data.attributes.realtime", rt)
 
-	n, _ := stSt.Effective.Int("fileSizeLimit")
+	n := s.storageFileSizeLimit(stSt)
 	feats := stSt.StorageFeatures()
 	snake := map[string]any{}
 	for k, v := range feats {

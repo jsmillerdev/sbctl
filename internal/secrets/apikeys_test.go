@@ -51,3 +51,42 @@ func TestOpaqueKeysFromStoredRecords(t *testing.T) {
 		t.Error("Record lost the tombstone")
 	}
 }
+
+func TestReviveDefaultsLeavesTheCopyAlone(t *testing.T) {
+	const ref = "abcdefghijklmnopqrst"
+	k := &ProjectKeys{PublishableKey: NewPublishableKey(), SecretKey: NewSecretKey()}
+	pubID, secID := KeyID(ref, DefaultKeyName, KeyTypePublishable), KeyID(ref, DefaultKeyName, KeyTypeSecret)
+	k.SetRecord(APIKeyRecord{ID: secID, Name: DefaultKeyName, Type: KeyTypeSecret, Default: true, Revoked: true})
+	k.SetRecord(APIKeyRecord{ID: pubID, Name: "renamed", Type: KeyTypePublishable, Default: true})
+	k.SetRecord(APIKeyRecord{ID: "other", Name: "ci", Type: KeyTypeSecret, Key: NewSecretKey(), Revoked: true})
+	before := *k
+	nk := before
+	got := nk.ReviveDefaults(ref, time.Unix(100, 0))
+	if len(got) != 1 || got[0].ID != secID || got[0].Revoked {
+		t.Fatalf("revived: %+v", got)
+	}
+	if r, _ := nk.Record(secID); r.Revoked {
+		t.Fatal("the secret default is still revoked")
+	}
+	if r, _ := nk.Record("other"); !r.Revoked {
+		t.Fatal("only the defaults are revived")
+	}
+	if r, _ := before.Record(secID); !r.Revoked {
+		t.Fatal("the copy taken before must keep its records")
+	}
+	if n := len(nk.OpaqueKeys(ref)); n != 2 {
+		t.Fatalf("active keys: %d", n)
+	}
+	var none ProjectKeys
+	if none.ReviveDefaults(ref, time.Now()) != nil {
+		t.Fatal("nothing to revive")
+	}
+}
+
+func TestDeriveIsBoundToTheMasterKeyAndTheLabel(t *testing.T) {
+	a, _ := New(make([]byte, 32))
+	b, _ := New([]byte("0123456789abcdef0123456789abcdef"))
+	if string(a.Derive("x")) != string(a.Derive("x")) || string(a.Derive("x")) == string(a.Derive("y")) || string(a.Derive("x")) == string(b.Derive("x")) || len(a.Derive("x")) != 32 {
+		t.Fatal("Derive must be deterministic, per label and per key")
+	}
+}

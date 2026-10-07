@@ -204,6 +204,12 @@ func TestPostgRESTRealtimeStorageConfig(t *testing.T) {
 		t.Fatalf("realtime: %v", got)
 	}
 	f.mustDo("PATCH", "/v1/projects/"+testRef+"/config/realtime", map[string]any{"max_events_per_second": 0}, 400)
+	// A null returns a setting to its default, and the tenant is told the default.
+	f.mustDo("PATCH", rt, map[string]any{"private_only": nil, "max_concurrent_users": nil}, 204)
+	got = bodyMap(t, f.mustDo("GET", rt, nil, 200))
+	if got["private_only"] != false || got["max_concurrent_users"] != float64(200) || got["connection_pool"] != float64(3) {
+		t.Fatalf("realtime after a reset: %v", got)
+	}
 
 	st := "/platform/projects/" + testRef + "/config/storage"
 	got = bodyMap(t, f.mustDo("GET", st, nil, 200))
@@ -466,7 +472,8 @@ func TestEmailTemplatesAreServedToLoopbackOnly(t *testing.T) {
 		f.srv.ServeHTTP(rec, req)
 		return rec
 	}
-	url := "/internal/templates/" + testRef + "/recovery"
+	bare := "/internal/templates/" + testRef + "/recovery"
+	url := bare + "?v=1&t=" + f.srv.settings.TemplateToken(testRef, "recovery")
 	if rec := get(url, "127.0.0.1:5555"); rec.Code != 200 || rec.Body.String() != "<h1>Reset</h1>" || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") {
 		t.Fatalf("loopback: %d %q %v", rec.Code, rec.Body.String(), rec.Header())
 	}
@@ -478,6 +485,9 @@ func TestEmailTemplatesAreServedToLoopbackOnly(t *testing.T) {
 		hdr          []string
 	}{
 		{url, "203.0.113.9:4444", nil},
+		{bare, "127.0.0.1:5555", nil},                                   // no token: another process of the node
+		{bare + "?t=" + strings.Repeat("0", 64), "127.0.0.1:5555", nil}, // wrong token
+		{"/internal/templates/" + testRef + "/invite?t=" + f.srv.settings.TemplateToken(testRef, "recovery"), "127.0.0.1:5555", nil}, // another template's token
 		{url, "127.0.0.1:5555", []string{"X-Forwarded-For", "203.0.113.9"}},
 		{"/internal/templates/" + testRef + "/invite", "127.0.0.1:1", nil},        // nothing saved
 		{"/internal/templates/" + testRef + "/nope", "127.0.0.1:1", nil},          // not a template
@@ -669,4 +679,58 @@ func TestAuthSchemaCoversTheSpecs(t *testing.T) {
 var platformOnly = map[string]bool{
 	"audit_log_disable_postgres": true, "index_worker_ensure_user_search_indexes_exist": true,
 	"mailer_subjects_custom_contents": true, "mailer_templates_custom_contents": true, "mfa_allow_low_aal": true,
+}
+
+// A rollback after a failed apply must bring the database back on the restored settings
+// (Recover) and carry the restart request over, so a restart that left the cluster down is
+// undone, and the original request still gets its error.
+func TestFailedPostgresApplyRecoversTheCluster(t *testing.T) {
+	f := newFixture(t)
+	url := "/v1/projects/" + testRef + "/config/database/postgres"
+	f.project.Limits.MemoryMax = "1G"
+	if err := f.reg.UpdateProject(context.Background(), f.project); err != nil {
+		t.Fatal(err)
+	}
+	f.mustDo("PUT", url, map[string]any{"statement_timeout": "30s"}, 200)
+	f.mgr.applyOpts = nil
+	n := 0
+	f.mgr.applyHook = func(projectconfig.Service) error {
+		n++
+		if n == 1 {
+			return errors.New("postgres did not start")
+		}
+		return nil
+	}
+	rec := f.do("PUT", url, map[string]any{"statement_timeout": "60s", "restart_database": true})
+	if rec.Code != 502 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if len(f.mgr.applyOpts) != 2 || f.mgr.applyOpts[0].Recover || !f.mgr.applyOpts[0].RestartDatabase {
+		t.Fatalf("the failing apply: %+v", f.mgr.applyOpts)
+	}
+	if r := f.mgr.applyOpts[1]; !r.Recover || !r.RestartDatabase {
+		t.Fatalf("the restoring apply must recover the cluster and restart it: %+v", r)
+	}
+	if got := bodyMap(t, f.mustDo("GET", url, nil, 200)); got["statement_timeout"] != "30s" {
+		t.Fatalf("settings after the rollback: %v", got["statement_timeout"])
+	}
+}
+
+// The storage limit shown before anything is saved is the node's configured one, the same
+// value the tenant is given.
+func TestStorageDefaultLimitIsTheNodes(t *testing.T) {
+	f := newFixture(t)
+	f.srv.cfg.Fleet.StorageFileSizeLimit = 123 << 20
+	url := "/v1/projects/" + testRef + "/config/storage"
+	if got := bodyMap(t, f.mustDo("GET", url, nil, 200)); got["fileSizeLimit"] != float64(123<<20) {
+		t.Fatalf("GET before a save: %v", got["fileSizeLimit"])
+	}
+	f.mustDo("PATCH", url, map[string]any{"fileSizeLimit": 1 << 20}, 200)
+	if got := bodyMap(t, f.mustDo("GET", url, nil, 200)); got["fileSizeLimit"] != float64(1<<20) {
+		t.Fatalf("GET after a save: %v", got["fileSizeLimit"])
+	}
+	f.mustDo("PATCH", url, map[string]any{"fileSizeLimit": nil}, 200)
+	if got := bodyMap(t, f.mustDo("GET", url, nil, 200)); got["fileSizeLimit"] != float64(123<<20) {
+		t.Fatalf("GET after a reset: %v", got["fileSizeLimit"])
+	}
 }

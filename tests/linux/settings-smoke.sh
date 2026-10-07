@@ -179,10 +179,15 @@ done
 FLAT=$(sed -e ':a;N;$!ba;s/=\r\?\n//g' -e 's/=3D/=/g' "$WORK/mails.txt")
 grep -q 'Reset for a@example.com' <<<"$FLAT" || fail "the mail does not carry the saved template"
 grep -q 'Subject: Acme password reset' <<<"$FLAT" || fail "the mail does not carry the saved subject"
-# The template is served to the loopback only.
-[[ $(http_code "$ADMIN/internal/templates/$REF/recovery") == 200 ]] || fail "the daemon does not serve the template to the loopback"
-[[ $(http_code -H "X-Forwarded-For: 203.0.113.9" "$ADMIN/internal/templates/$REF/recovery") == 404 ]] || fail "the template route answered a proxied request"
-[[ $(http_code -H "Host: api.$SBCTL_DOMAIN" "http://127.0.0.1/internal/templates/$REF/recovery") == 404 ]] || fail "the template is reachable through the public proxy"
+# The template is served to the loopback only, to a caller that holds the project's token: the
+# URL GoTrue was given carries it.
+TURL=$(sudo grep '^GOTRUE_MAILER_TEMPLATES_RECOVERY=' "$SBCTL_STATE/projects/$REF/gotrue.env" | sed -e 's/^[^=]*="//' -e 's/"$//')
+[[ $TURL == "$ADMIN/internal/templates/$REF/recovery?v="*"&t="* ]] || fail "GoTrue's template URL has no token: ${TURL%%&t=*}"
+[[ $(http_code "$TURL") == 200 ]] || fail "the daemon does not serve the template to the loopback"
+[[ $(http_code "$ADMIN/internal/templates/$REF/recovery") == 404 ]] || fail "the template route answered without the project's token"
+[[ $(http_code "$ADMIN/internal/templates/$REF/recovery?t=$(printf '0%.0s' {1..64})") == 404 ]] || fail "the template route answered a wrong token"
+[[ $(http_code -H "X-Forwarded-For: 203.0.113.9" "$TURL") == 404 ]] || fail "the template route answered a proxied request"
+[[ $(http_code -H "Host: api.$SBCTL_DOMAIN" "http://127.0.0.1/internal/templates/$REF/recovery?${TURL#*\?}") == 404 ]] || fail "the template is reachable through the public proxy"
 must 200 PATCH "$CFG/config/auth" '{"disable_signup":true}'
 
 log "postgrest: a newly exposed schema"
@@ -226,7 +231,7 @@ ROW=$(sysql _realtime "select max_concurrent_users || ',' || private_only::text 
 [[ $ROW == "123,true" ]] || fail "the Realtime tenant row did not take the settings (got '$ROW')"
 if ws_join "$P_REALTIME" "$REF.realtime.internal" "$ANON" >/dev/null 2>&1; then fail "a public channel was joined with private_only on"; fi
 [[ $(api GET "$CFG/config/realtime" | json_get 'd["private_only"]') == True ]] || fail "GET config/realtime does not return private_only"
-api PATCH "$CFG/config/realtime" -o /dev/null -d '{"private_only":false}'
+api PATCH "$CFG/config/realtime" -o /dev/null -d '{"private_only":null}'
 ws_join "$P_REALTIME" "$REF.realtime.internal" "$ANON" || fail "realtime join after private_only was switched off"
 
 log "postgres: ALTER SYSTEM settings, an unsafe value, a setting that needs a restart"
@@ -234,6 +239,8 @@ must 200 PUT "$CFG/config/database/postgres" '{"statement_timeout":"45s","work_m
 [[ $(sql "show statement_timeout") == 45s && $(sql "show work_mem") == 8MB ]] || fail "the cluster did not take the settings"
 must 400 PUT "$CFG/config/database/postgres" '{"max_connections":3}'
 must 400 PUT "$CFG/config/database/postgres" '{"work_mem":"16"}'
+# Values Postgres takes in ALTER SYSTEM and cannot start with are refused before anything is saved.
+must 400 PUT "$CFG/config/database/postgres" '{"max_locks_per_transaction":2147483640,"restart_database":true}'
 BEFORE=$(systemctl show -p MainPID --value "sb-postgres@$REF.service")
 must 200 PUT "$CFG/config/database/postgres" '{"max_connections":40,"restart_database":true}'
 for ((i = 0; i < 120; i++)); do

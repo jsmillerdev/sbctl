@@ -51,6 +51,10 @@ func SplitPostgresSettings(all []string) (cmdline, alter []string) {
 type ApplyOptions struct {
 	// RestartDatabase restarts PostgreSQL when a saved Postgres setting needs it.
 	RestartDatabase bool
+	// Recover applies the settings of a rollback: an earlier apply may have left the Postgres
+	// cluster down (a restart that failed on the new values), so a cluster that does not answer
+	// is started again on the saved settings before they are applied.
+	Recover bool
 }
 
 // ApplyResult is the outcome of ApplyConfig.

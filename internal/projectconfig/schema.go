@@ -48,6 +48,10 @@ type Field struct {
 	// Env is the environment variable the setting renders to; empty means the setting is
 	// stored and reported but not rendered by the generic renderer.
 	Env string
+	// Multiline allows line breaks in a String that Env does not carry verbatim (a template
+	// body is served by URL). Every other rendered string is an environment value, which
+	// cannot hold one.
+	Multiline bool
 	// Check validates a value that passed the type checks.
 	Check func(v any) error
 	// Normalize rewrites a valid value into its stored form (trimmed lists, for example).
@@ -65,6 +69,10 @@ type Schema struct {
 	// Cross validates the settings as a whole: eff is the effective view, set the changed
 	// settings only.
 	Cross func(eff, set Values, cx CrossContext) error
+	// ResetStoresDefault makes a null save the field's default as an explicit value instead
+	// of removing the setting, for services that apply only the values they are sent (a
+	// Realtime tenant keeps the old value of a field the update omits).
+	ResetStoresDefault bool
 }
 
 // CrossContext carries what whole-settings validation needs from the project.
@@ -142,6 +150,9 @@ func (f *Field) Coerce(v any) (any, error) {
 		}
 		if strings.ContainsRune(s, 0) {
 			return nil, invalid("%s must not contain a NUL byte", f.Name)
+		}
+		if f.Env != "" && !f.Multiline && strings.ContainsAny(s, "\r\n") {
+			return nil, invalid("%s must not contain a line break (it is passed to the service as an environment variable)", f.Name)
 		}
 		max := f.MaxLen
 		if max == 0 {

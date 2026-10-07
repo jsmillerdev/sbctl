@@ -216,5 +216,60 @@ func postgresCross(eff, _ Values, cx CrossContext) error {
 	} else if n, ok := eff.Int("max_connections"); ok && n > 1000 {
 		return invalid("max_connections above 1000 needs a memory limit on the project")
 	}
+	return postmasterMemory(eff, cx)
+}
+
+// Per-entry and per-backend shared memory the postmaster allocates at start, rounded up:
+// a lock table entry (LOCK and PROCLOCK with their hash overhead) and a backend's share of
+// the process array, semaphores and fixed-size queues.
+const (
+	lockEntryBytes   = 300
+	backendSlotBytes = 128 * kB
+	// With no memory limit to compare against, what the postmaster allocates for locks and
+	// backend slots stays under what any node running a project can spare.
+	unlimitedLockBytes = 64 * mB
+	unlimitedBackends  = 600
+)
+
+// postmasterMemory rejects a combination of postmaster-context settings whose shared memory
+// the project cannot allocate. Postgres accepts such a value in ALTER SYSTEM and fails to
+// start with it ("out of memory" while creating shared memory), which leaves the project's
+// database down at its next restart, and a paused or rebooted project would not come back.
+func postmasterMemory(eff Values, cx CrossContext) error {
+	intOr := func(name string, def int64) int64 {
+		if n, ok := eff.Int(name); ok {
+			return n
+		}
+		return def
+	}
+	// Postgres' defaults stand in for settings that were not saved (the class's sizing is
+	// not known here and is smaller).
+	conns := intOr("max_connections", 100)
+	workers := intOr("max_worker_processes", 8)
+	senders := intOr("max_wal_senders", 10)
+	backends := conns + workers + senders + 3 /* autovacuum workers */ + 1
+	if backends > 0x3FFFF {
+		return invalid("max_connections + max_worker_processes + max_wal_senders must stay below %d", 0x3FFFF)
+	}
+	locks := intOr("max_locks_per_transaction", 64)
+	lockBytes := float64(locks) * float64(backends) * lockEntryBytes
+	slotBytes := float64(backends) * backendSlotBytes
+	shared := lockBytes + slotBytes
+	if b, err := ParseSize(eff.Str("shared_buffers")); err == nil && b > 0 {
+		shared += b
+	}
+	if cx.MemoryLimit > 0 {
+		lim := float64(cx.MemoryLimit)
+		if lockBytes > lim*0.10 {
+			return invalid("max_locks_per_transaction %d with %d backends needs about %s of shared memory for the lock table, more than 10%% of the project's memory limit (%s)", locks, backends, humanBytes(lockBytes), humanBytes(lim))
+		}
+		if shared > lim*0.60 {
+			return invalid("the shared memory these settings ask for (about %s) is more than 60%% of the project's memory limit (%s)", humanBytes(shared), humanBytes(lim))
+		}
+		return nil
+	}
+	if lockBytes > unlimitedLockBytes || backends > unlimitedBackends {
+		return invalid("max_locks_per_transaction %d with %d backends (max_connections, max_worker_processes and max_wal_senders together) needs a memory limit on the project", locks, backends)
+	}
 	return nil
 }

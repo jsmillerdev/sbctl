@@ -169,7 +169,11 @@ func (m *Manager) Patch(ctx context.Context, ref string, svc Service, patch map[
 				continue
 			}
 			if raw == nil || (f.Secret && raw == "") {
-				delete(set, name)
+				if sch.ResetStoresDefault && f.Default != nil {
+					set[name] = f.Default
+				} else {
+					delete(set, name)
+				}
 				touched[name] = true
 				continue
 			}
@@ -199,6 +203,9 @@ func (m *Manager) Patch(ctx context.Context, ref string, svc Service, patch map[
 			if err := sch.Cross(eff, set, cx); err != nil {
 				return nil, err
 			}
+		}
+		if err := m.checkRenders(ref, svc, set, rec.Version+1); err != nil {
+			return nil, err
 		}
 		changed := diff(before, set)
 		sort.Strings(ignored)

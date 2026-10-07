@@ -158,6 +158,35 @@ func (e *Engine) storeKeys(ctx context.Context, ref string, keys *secrets.Projec
 	return nil
 }
 
+// putRecords stores key records as the sealed secrets the proxy and the API read.
+func (e *Engine) putRecords(ctx context.Context, ref string, recs []secrets.APIKeyRecord) error {
+	for _, r := range recs {
+		b, err := secrets.MarshalRecord(r)
+		if err != nil {
+			return err
+		}
+		sealed, err := e.sec.Seal(b)
+		if err != nil {
+			return err
+		}
+		if err := e.reg.PutSecret(ctx, ref, secrets.RecordSecretName(r.ID), sealed); err != nil {
+			return fmt.Errorf("lifecycle: store key record %s: %w", r.ID, err)
+		}
+	}
+	return nil
+}
+
+// storeRecords writes back the records of old that revived replaced.
+func (e *Engine) storeRecords(ctx context.Context, ref string, old *secrets.ProjectKeys, revived []secrets.APIKeyRecord) error {
+	var prior []secrets.APIKeyRecord
+	for _, r := range revived {
+		if o, ok := old.Record(r.ID); ok {
+			prior = append(prior, o)
+		}
+	}
+	return e.putRecords(ctx, ref, prior)
+}
+
 func (e *Engine) loadKeys(ctx context.Context, ref string) (*secrets.ProjectKeys, error) {
 	sealed, err := e.reg.GetSecrets(ctx, ref)
 	if err != nil {
@@ -627,11 +656,15 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 	if err := nk.ResignLegacy(ref, e.opts.Now()); err != nil {
 		return nil, err
 	}
+	// The new default keys are not the ones that were revoked.
+	revived := nk.ReviveDefaults(ref, e.opts.Now())
 	rollback := func(cause error) (*secrets.ProjectKeys, error) {
 		cctx, cancel := cleanupCtx(ctx)
 		defer cancel()
 		if err := e.storeKeys(cctx, ref, old); err != nil {
 			e.log.Error("rotate-keys: could not restore previous keys", "ref", ref, "error", err)
+		} else if err := e.storeRecords(cctx, ref, old, revived); err != nil {
+			e.log.Error("rotate-keys: could not restore the previous key records", "ref", ref, "error", err)
 		} else if active(p.Status) {
 			if err := e.plane.Reconfigure(cctx, p, old); err != nil {
 				e.log.Error("rotate-keys: could not restart on previous keys", "ref", ref, "error", err)
@@ -640,6 +673,9 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 		return nil, fmt.Errorf("lifecycle: rotate keys of %s (previous keys restored): %w", ref, cause)
 	}
 	if err := e.storeKeys(ctx, ref, &nk); err != nil {
+		return rollback(err)
+	}
+	if err := e.putRecords(ctx, ref, revived); err != nil {
 		return rollback(err)
 	}
 	if active(p.Status) {

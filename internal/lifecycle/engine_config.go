@@ -20,6 +20,18 @@ type configPlane interface {
 	SetRolePassword(ctx context.Context, p *registry.Project, role, password string) error
 }
 
+// recoverPlane is what ApplyConfig needs of a data plane to honor ApplyOptions.Recover;
+// PostgresPlane has it.
+type recoverPlane interface {
+	RecoverPostgres(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error
+}
+
+// renderChecker renders a service's units from the saved settings without starting anything;
+// PostgresPlane has it.
+type renderChecker interface {
+	CheckRender(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, svc projectconfig.Service) error
+}
+
 var _ Reconfigurer = (*Engine)(nil)
 
 // ErrNotSupported is returned by ApplyConfig for a data plane that cannot reconfigure
@@ -27,7 +39,9 @@ var _ Reconfigurer = (*Engine)(nil)
 var ErrNotSupported = errors.New("lifecycle: this data plane cannot apply settings")
 
 // ApplyConfig implements Reconfigurer. A paused project is not touched (the settings are
-// rendered when it starts); a project in a transitional state is refused.
+// rendered when it starts) but they are rendered once without starting, so a value that
+// cannot be written into a unit fails the save and not the resume; a project in a
+// transitional state is refused.
 func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.Service, opts ApplyOptions) (ApplyResult, error) {
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
@@ -39,6 +53,15 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 		return ApplyResult{}, err
 	}
 	if p.Status == registry.StatusInactive {
+		if rc, ok := e.plane.(renderChecker); ok {
+			keys, err := e.loadKeys(ctx, ref)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if err := rc.CheckRender(ctx, p, keys, svc); err != nil {
+				return ApplyResult{}, fmt.Errorf("lifecycle: render %s settings of %s: %w", svc, ref, err)
+			}
+		}
 		return ApplyResult{}, nil
 	}
 	if !active(p.Status) {
@@ -64,6 +87,13 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 			err = e.opts.Fleet.EnsureTenant(ctx, spec)
 		}
 	case projectconfig.Postgres:
+		if opts.Recover {
+			if rp, ok := cp.(recoverPlane); ok {
+				if err = rp.RecoverPostgres(ctx, p, keys); err != nil {
+					return ApplyResult{}, fmt.Errorf("lifecycle: recover the database of %s: %w", ref, err)
+				}
+			}
+		}
 		res.PendingRestart, err = cp.ApplyPostgresSettings(ctx, p, keys, opts.RestartDatabase, func(ctx context.Context) { e.quiesce(ctx, ref) })
 	default:
 		return ApplyResult{}, fmt.Errorf("lifecycle: unknown settings service %q", svc)

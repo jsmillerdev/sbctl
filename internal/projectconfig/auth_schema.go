@@ -152,6 +152,7 @@ func buildAuthSchema() *Schema {
 	for _, t := range authTemplates {
 		c := fStr("mailer_templates_"+t+"_content", "GOTRUE_MAILER_TEMPLATES_"+strings.ToUpper(t))
 		c.MaxLen = 1_000_000 // GoTrue's template_max_size default
+		c.Multiline = true   // served by URL, not carried in the environment
 		add(c)
 	}
 	for _, t := range authNotifications {

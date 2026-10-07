@@ -57,7 +57,7 @@ func buildPostgRESTSchema() *Schema {
 
 // RealtimeSchema is the settings of a project's Realtime tenant (UpdateRealtimeConfigBody).
 // Defaults are the server's own TENANT_MAX_* defaults (config/runtime.exs of v2.140.10).
-var RealtimeSchema = NewSchema(Realtime, []Field{
+var RealtimeSchema = withResetStoresDefault(NewSchema(Realtime, []Field{
 	{Name: "private_only", Kind: Bool, Default: false},
 	{Name: "connection_pool", Kind: Int, Default: int64(1), Min: 1, Max: 100, HasRange: true},
 	{Name: "postgres_changes_pool", Kind: Int, Default: int64(4), Min: 1, Max: 100, HasRange: true},
@@ -70,7 +70,9 @@ var RealtimeSchema = NewSchema(Realtime, []Field{
 	{Name: "max_payload_size_in_kb", Kind: Int, Default: int64(3000), Min: 1, Max: 10000, HasRange: true},
 	{Name: "suspend", Kind: Bool, Default: false},
 	{Name: "presence_enabled", Kind: Bool, Default: false},
-})
+}))
+
+func withResetStoresDefault(s *Schema) *Schema { s.ResetStoresDefault = true; return s }
 
 // StorageSchema is the settings of a project's Storage tenant (UpdateStorageConfigBody).
 var StorageSchema = buildStorageSchema()
@@ -177,7 +179,11 @@ func buildStorageSchema() *Schema {
 
 // PostgresSchema is the settings hosted lets a project change (UpdatePostgresConfigBody),
 // rendered as server arguments after the project class's sizing. Values are Postgres
-// settings in the form the API uses (sizes and durations as strings with units).
+// settings in the form the API uses (sizes and durations as strings with units). The counts
+// that size shared memory at start (locks per transaction, worker processes, WAL senders,
+// replication slots and workers) are capped far below what Postgres accepts in ALTER SYSTEM:
+// Postgres cannot start with an oversized one, and postgresCross checks what is left against
+// the project's memory.
 var PostgresSchema = buildPostgresSchema()
 
 var (
@@ -212,13 +218,13 @@ func buildPostgresSchema() *Schema {
 		boolean("log_disconnections"), boolean("log_duration"), boolean("log_lock_waits"),
 		boolean("log_recovery_conflict_waits"), boolean("log_replication_commands"), dur("log_startup_progress_interval"),
 		size("log_temp_files"), size("maintenance_work_mem"), size("track_activity_query_size"),
-		num("max_connections", 1, 262143), num("max_locks_per_transaction", 10, 2147483640),
-		num("max_logical_replication_workers", 0, 262143), num("max_parallel_maintenance_workers", 0, 1024),
-		num("max_parallel_workers", 0, 1024), num("max_parallel_workers_per_gather", 0, 1024),
-		num("max_replication_slots", 0, 262143), size("max_slot_wal_keep_size"),
+		num("max_connections", 1, 262143), num("max_locks_per_transaction", 10, 1024),
+		num("max_logical_replication_workers", 0, 64), num("max_parallel_maintenance_workers", 0, 1024),
+		num("max_parallel_workers", 0, 256), num("max_parallel_workers_per_gather", 0, 1024),
+		num("max_replication_slots", 0, 256), size("max_slot_wal_keep_size"),
 		dur("max_standby_archive_delay"), dur("max_standby_streaming_delay"),
-		num("max_sync_workers_per_subscription", 0, 262143), size("max_wal_size"), num("max_wal_senders", 0, 262143),
-		num("max_worker_processes", 0, 262143),
+		num("max_sync_workers_per_subscription", 0, 64), size("max_wal_size"), num("max_wal_senders", 0, 256),
+		num("max_worker_processes", 0, 256),
 		{Name: "session_replication_role", Kind: Enum, Enum: []string{"origin", "replica", "local"}},
 		size("shared_buffers"), dur("statement_timeout"), boolean("track_commit_timestamp"), size("wal_keep_size"),
 		dur("wal_sender_timeout"), size("work_mem"), dur("checkpoint_timeout"), boolean("hot_standby_feedback"),

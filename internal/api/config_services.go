@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/projectconfig"
 )
@@ -144,9 +145,20 @@ func (s *Server) patchRealtime(key, viewKey string) handlerFunc {
 // catalogs (they need a service sbctl does not run) and object versioning no.
 var storageCapabilities = map[string]any{"iceberg_catalog": false, "list_v2": true, "object_versioning": false}
 
-func storageView(key string, st *projectconfig.State) map[string]any {
+// storageFileSizeLimit is the upload limit of the project's Storage: the saved value, else
+// the node's configured one (what the tenant is given when nothing is saved).
+func (s *Server) storageFileSizeLimit(st *projectconfig.State) int64 {
+	if n, ok := st.Set.Int("fileSizeLimit"); ok {
+		return n
+	}
+	if s.cfg != nil {
+		return s.cfg.Fleet.FileSizeLimit()
+	}
+	return config.DefaultStorageFileSizeLimit
+}
+
+func storageView(key string, st *projectconfig.State, n int64) map[string]any {
 	resp := base(key)
-	n, _ := st.Effective.Int("fileSizeLimit")
 	setAll(resp, map[string]any{
 		"fileSizeLimit": n, "features": st.StorageFeatures(), "external": st.StorageExternal(),
 		"capabilities": storageCapabilities, "migrationVersion": nil,
@@ -164,7 +176,7 @@ func (s *Server) getStorage(key string) handlerFunc {
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, storageView(key, st))
+		writeJSON(w, http.StatusOK, storageView(key, st, s.storageFileSizeLimit(st)))
 		return nil
 	}
 }
@@ -188,7 +200,7 @@ func (s *Server) patchStorage(key, viewKey string) handlerFunc {
 			w.WriteHeader(http.StatusOK)
 			return nil
 		}
-		writeJSON(w, http.StatusOK, storageView(viewKey, ch.State))
+		writeJSON(w, http.StatusOK, storageView(viewKey, ch.State, s.storageFileSizeLimit(ch.State)))
 		return nil
 	}
 }

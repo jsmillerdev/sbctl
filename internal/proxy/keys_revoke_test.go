@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -140,4 +141,62 @@ func TestRevocationTakesEffectThroughTheRegistry(t *testing.T) {
 	waitStatus(h.k.PublishableKey, 200)
 	put(secrets.NameLegacyKeys, secrets.MarshalLegacyState(true))
 	waitStatus(h.k.AnonKey, 200)
+}
+
+// With the legacy keys disabled, a legacy key must not get through on the functions route
+// (the runtime would accept it) nor as the exact bearer of a protected route beside a valid
+// opaque key. A user's session JWT, the temporary dashboard key and the opaque keys still do.
+func TestLegacyDisabledOnFunctionsAndBearer(t *testing.T) {
+	k := testKeys(t, testRef)
+	k.LegacyDisabled = true
+	exp := time.Now().Add(time.Hour).Unix()
+	resigned := signJWT(t, k.JWTSecret, jwt.MapClaims{"role": "anon", "ref": testRef, "exp": exp})
+	tmp := signJWT(t, k.JWTSecret, jwt.MapClaims{"role": "service_role", "ref": testRef, "exp": exp, secrets.TemporaryClaim: true})
+	user := signJWT(t, k.JWTSecret, jwt.MapClaims{"role": "authenticated", "sub": "u1", "ref": testRef, "exp": exp})
+
+	fn := matchRoute("/functions/v1/hello")
+	for name, h := range map[string]http.Header{
+		"anon in apikey":            hdr("apikey", k.AnonKey),
+		"service_role in apikey":    hdr("apikey", k.ServiceRoleKey),
+		"re-signed anon in apikey":  hdr("apikey", resigned),
+		"anon as bearer":            hdr("Authorization", "Bearer "+k.AnonKey),
+		"service_role bearer":       hdr("apikey", k.PublishableKey, "Authorization", "Bearer "+k.ServiceRoleKey),
+		"anon apikey, user bearer":  hdr("apikey", k.AnonKey, "Authorization", "Bearer "+user),
+		"legacy beside secret key":  hdr("apikey", k.SecretKey, "Authorization", "Bearer "+k.AnonKey),
+		"resigned anon, no bearer":  hdr("apikey", resigned),
+		"service_role w/o sb_ only": hdr("apikey", k.ServiceRoleKey, "Authorization", "Bearer "+k.ServiceRoleKey),
+	} {
+		if res := authorize(fn, k, testRef, h, ""); res.status != http.StatusUnauthorized {
+			t.Errorf("functions, %s: status %d, want 401", name, res.status)
+		}
+	}
+	for name, h := range map[string]http.Header{
+		"publishable":                hdr("apikey", k.PublishableKey),
+		"publishable, user session":  hdr("apikey", k.PublishableKey, "Authorization", "Bearer "+user),
+		"secret":                     hdr("apikey", k.SecretKey),
+		"temporary dashboard key":    hdr("apikey", tmp),
+		"no credentials":             hdr(),
+		"user session only":          hdr("Authorization", "Bearer "+user),
+		"publishable, temporary key": hdr("apikey", k.PublishableKey, "Authorization", "Bearer "+tmp),
+	} {
+		if res := authorize(fn, k, testRef, h, ""); res.status != 0 {
+			t.Errorf("functions, %s: refused (%d %s)", name, res.status, res.body)
+		}
+	}
+
+	rest := matchRoute("/rest/v1/items")
+	if res := authorize(rest, k, testRef, hdr("apikey", k.PublishableKey, "Authorization", "Bearer "+k.ServiceRoleKey), ""); res.status != http.StatusUnauthorized {
+		t.Errorf("rest: the exact legacy service_role key as bearer: status %d, want 401", res.status)
+	}
+	if res := authorize(rest, k, testRef, hdr("apikey", k.PublishableKey, "Authorization", "Bearer "+user), ""); res.status != 0 {
+		t.Errorf("rest: a user session must keep working: %d", res.status)
+	}
+	// Enabled again, nothing changes for the legacy keys.
+	k.LegacyDisabled = false
+	if res := authorize(fn, k, testRef, hdr("apikey", k.AnonKey), ""); res.status != 0 {
+		t.Errorf("functions with legacy keys enabled: %d", res.status)
+	}
+	if res := authorize(rest, k, testRef, hdr("apikey", k.PublishableKey, "Authorization", "Bearer "+k.ServiceRoleKey), ""); res.status != 0 {
+		t.Errorf("rest with legacy keys enabled: %d", res.status)
+	}
 }

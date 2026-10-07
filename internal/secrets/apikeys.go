@@ -146,6 +146,32 @@ func (k *ProjectKeys) OpaqueKeys(ref string) []OpaqueKey {
 	return out
 }
 
+// ReviveDefaults un-revokes the records of the two default keys and returns the changed
+// records, to be stored. Key rotation replaces the values of both default keys, so a
+// revocation of the old values must not hide the new ones. The records of this copy are
+// replaced, not edited in place: a ProjectKeys copied before the call (a rollback copy)
+// keeps the old ones.
+func (k *ProjectKeys) ReviveDefaults(ref string, now time.Time) []APIKeyRecord {
+	if k.Records == nil {
+		return nil
+	}
+	fresh := &RecordSet{ByID: make(map[string]APIKeyRecord, len(k.Records.ByID))}
+	for id, r := range k.Records.ByID {
+		fresh.ByID[id] = r
+	}
+	var out []APIKeyRecord
+	for _, typ := range []string{KeyTypePublishable, KeyTypeSecret} {
+		id := KeyID(ref, DefaultKeyName, typ)
+		if r, ok := fresh.ByID[id]; ok && r.Revoked {
+			r.Revoked, r.UpdatedAt = false, now
+			fresh.ByID[id] = r
+			out = append(out, r)
+		}
+	}
+	k.Records = fresh
+	return out
+}
+
 // MarshalRecord is the plaintext stored (then sealed) for r.
 func MarshalRecord(r APIKeyRecord) ([]byte, error) { return json.Marshal(r) }
 

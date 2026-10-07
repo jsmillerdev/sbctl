@@ -74,9 +74,21 @@ set it turns off unless saved explicitly.
 
 **Email templates.** GoTrue loads a template from a URL. The body is saved as
 `mailer_templates_<name>_content`; the unit gets
-`http://<admin listener>/internal/templates/<ref>/<name>?v=<version>`, served by the daemon
-(`internal/api/templates.go`) to loopback clients that did not come through the edge proxy. The
-version in the URL keeps GoTrue's template cache from serving an old body.
+`http://<admin listener>/internal/templates/<ref>/<name>?v=<version>&t=<token>`, served by the
+daemon (`internal/api/templates.go`) to loopback clients that did not come through the edge
+proxy. The version in the URL keeps GoTrue's template cache from serving an old body. The token
+is an HMAC of the project and template under a key derived from the node's master key
+(`Manager.TemplateToken`, `secrets.AESGCM.Derive`), so a process of the node that merely reaches
+the loopback port (user code in an Edge Function, another project's service) cannot read a
+project's templates; a request without the token is answered `404`. Secrets that cannot derive a
+key (test doubles) leave the route open.
+
+**Line breaks.** A setting that renders to an environment variable (everything with an `Env`
+except the template bodies) refuses `\r` and `\n`, because a unit's environment file cannot carry
+them. The save is a 400 instead of a resume that fails. `Manager.Patch` also renders the service's
+environment before it saves and refuses any value with a line break or NUL, which covers a secret
+that was stored before the check existed. A multi-line SMS template therefore cannot be saved;
+GoTrue reads `GOTRUE_SMS_TEMPLATE` from the environment only.
 
 **External providers.** Every provider of the Management API that GoTrue supports (`apple` to
 `zoom`, including Azure, GitLab, Keycloak and WorkOS with their `url`, Google and Apple with
@@ -116,7 +128,10 @@ them, so only a change sends an update). Realtime: `max_concurrent_users`, `max_
 `presence_enabled` are fields of the tenant; `connection_pool` is the extension setting `db_pool`
 (the pool Realtime's `realtime_connect` connection uses), `postgres_changes_pool` is translated by
 its controller to `subcriber_pool_size`. Only changed settings are sent; the defaults reported
-are the server's own `TENANT_MAX_*`. Storage: `fileSizeLimit` and `features`
+are the server's own `TENANT_MAX_*`. The tenant API applies only the fields it receives, so a
+`null` (return to default) stores the default as an explicit value, and the tenant is sent it
+(`Schema.ResetStoresDefault`); without that Realtime would keep the old value while GET said
+default. Storage: `fileSizeLimit` and `features`
 (`imageTransformation`, `s3Protocol`, `purgeCache`, `icebergCatalog`, `vectorBuckets`) of the
 tenant API; Iceberg and vector buckets are saved and reported (the CLI's default `config.toml`
 pushes them) but not sent, because the fleet does not run the services behind them, and
@@ -134,7 +149,16 @@ Rendering: settings that overlap the class's command-line sizing (`shared_buffer
 `effective_cache_size`, `maintenance_work_mem`, `max_wal_size`, `max_connections`,
 `max_wal_senders`, `max_replication_slots`) become server arguments after the class's and take
 effect at the next restart; every other one is applied with `ALTER SYSTEM` and a reload, so it
-survives restarts in `postgresql.auto.conf`. `PUT` with `restart_database: true` restarts the
+survives restarts in `postgresql.auto.conf`. The counts that size shared memory at start are
+capped far below what Postgres accepts in `ALTER SYSTEM` (`max_locks_per_transaction` 1024,
+`max_worker_processes` and `max_wal_senders` 256, `max_logical_replication_workers` 64, ...),
+because Postgres cannot start with an oversized one ("out of memory" while creating shared
+memory) and would leave the project down. What is left is estimated: the lock table
+(`max_locks_per_transaction` times the backends, about 300 bytes an entry) must stay under 10
+percent of the project's memory limit and the shared memory as a whole (with `shared_buffers`
+and a slot per backend) under 60 percent; with no limit known only a modest table (64 MB, 600
+backends) is accepted. If an apply still fails, the API restores the previous settings and the
+lifecycle brings the cluster back (`ApplyOptions.Recover`, see internal/lifecycle). `PUT` with `restart_database: true` restarts the
 cluster when something needs it; without it the values are saved, rendered, and flagged
 "pending restart" in the log until the next restart (a pause and resume, for example).
 

@@ -105,7 +105,12 @@ func (s *Server) saveSettings(ctx context.Context, p *registry.Project, svc proj
 	s.log.Error("applying settings failed; restoring the previous ones", "ref", p.Ref, "service", svc, "err", err)
 	if rerr := s.settings.Restore(ctx, p.Ref, svc, prior); rerr != nil {
 		s.log.Error("could not restore the previous settings", "ref", p.Ref, "service", svc, "err", rerr)
-	} else if _, aerr := rc.ApplyConfig(ctx, p.Ref, svc, lifecycle.ApplyOptions{}); aerr != nil {
+	} else if _, aerr := rc.ApplyConfig(ctx, p.Ref, svc, lifecycle.ApplyOptions{
+		// The failed apply may have restarted the cluster into a state it cannot start in:
+		// Recover brings it back on the restored settings, and the restart option carries over
+		// so a cluster that came up on the new values goes back to the old ones.
+		RestartDatabase: opts.RestartDatabase, Recover: true,
+	}); aerr != nil {
 		s.log.Error("could not apply the restored settings", "ref", p.Ref, "service", svc, "err", aerr)
 	}
 	var inv *Error

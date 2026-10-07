@@ -61,7 +61,9 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
   nightly timer stops right after it. A failure after the backup leaves `GOING_DOWN`, and a
   repeated delete resumes from the recorded step without a second backup.
 - `RotateKeys`: new JWT secret, legacy and opaque keys; database passwords unchanged;
-  GoTrue and PostgREST restart, fleet tenants update; previous keys are restored on error.
+  GoTrue and PostgREST restart, fleet tenants update; previous keys are restored on error. A revoked
+  default key comes back as the new default key (the rotation replaced its value), so rotating
+  never leaves a project without a usable default pair.
 - `Health`: unit state plus SQL ping, GoTrue `/health`, PostgREST `/`; moves
   `ACTIVE_HEALTHY` and `ACTIVE_UNHEALTHY` to match.
 - `StartActive`: starts every active project (after a reboot or `sbctl system stop`).
@@ -104,7 +106,15 @@ Realtime and Storage get `EnsureTenant`; Postgres goes through `ApplyPostgresSet
 a resume, because the GoTrue and PostgREST units are bound to the cluster's, after the shared
 services were asked to let go of its database; `pg_settings.pending_restart` and a diff of
 the command-line settings against the running ones say whether one is pending). A paused project
-is not touched, a project in a transitional status is refused (`ErrInvalidState`).
+is not started, but its units are rendered once from the saved settings (`CheckRender`), so a value
+a unit cannot carry fails the save and not the resume; a project in a transitional status is
+refused (`ErrInvalidState`).
+
+`ApplyOptions.Recover` is what the API sets on the apply that undoes a failed one. For Postgres,
+`RecoverPostgres` first checks that the cluster answers. A cluster that does not (a restart that
+failed on a value Postgres accepted in `ALTER SYSTEM` and cannot start with) is stopped, every
+setting of the schema is removed from `postgresql.auto.conf` offline, and the project starts on
+the restored settings; the apply that follows writes them again with `ALTER SYSTEM`.
 
 `Engine.SetDatabasePassword(ref, password)` sets the `postgres` role's password over the unix
 socket as a SCRAM verifier, seals it, and calls `fleet.RefreshTenant` (Supavisor's terminate,
