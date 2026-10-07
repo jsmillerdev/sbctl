@@ -262,7 +262,7 @@ DUMPDIR=$(mktemp -d); chown "$SBCTL_USER" "$DUMPDIR"
 mkfifo "$DUMPDIR/000000010000000000000099"; chown "$SBCTL_USER" "$DUMPDIR/000000010000000000000099"
 sudo -u "$SBCTL_USER" sleep 120 & SLEEPER=$!   # control: an ordinary same-uid process is dumpable
 sudo -u "$SBCTL_USER" -H /usr/local/bin/sbctl wal push --ref "$A" --socket "$SBCTL_STATE/projects/$A/wal/r.sock" \
-  "$DUMPDIR/000000010000000000000099" >/dev/null 2>&1 & CLIWAIT=$!
+  "$DUMPDIR/000000010000000000000099" >"$DUMPDIR/cli.log" 2>&1 & CLIWAIT=$!
 CLIPID=""
 for ((i = 0; i < 30; i++)); do
   CLIPID=$(pgrep -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' | head -1 || true)
@@ -280,6 +280,9 @@ if [[ -n $CLIPID && -n $SLEEPPID ]]; then
   tenant_ls "$SLEEPPID" || { kill "$SLEEPER" "$CLIWAIT" 2>/dev/null || true; fail "control: a tenant unit cannot read an ordinary process's /proc/<pid>/root, so the check below proves nothing"; }
   tenant_ls "$CLIPID" && { pkill -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true; fail "a tenant unit read the /proc/<pid>/root of a running CLI command"; }
 else
+  ps -u "$SBCTL_USER" -o pid,user,stat,args >&2 || true
+  cat "$DUMPDIR/cli.log" >&2 || true
+  ls -ld /proc/[0-9]* 2>/dev/null | grep " $SBCTL_USER " | head -5 >&2 || true
   fail "the CLI command did not become non-dumpable (cli pid '${CLIPID}', control pid '${SLEEPPID}')"
 fi
 pkill -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true
