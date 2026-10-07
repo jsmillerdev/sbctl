@@ -1,0 +1,75 @@
+name: linux
+
+# Linux-only verification that cannot run on a developer Mac: the systemd backend end to
+# end, backups against a real Linux Postgres and S3 (MinIO), and ACME issuance (Pebble).
+on:
+  push:
+    branches: [main, "ws/**", "integrate/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  systemd-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build sbctl
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: systemd smoke
+        run: sudo LOG_DIR=/tmp/sbctl-linux-logs SBCTL_BIN=/tmp/sbctl tests/linux/systemd-smoke.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/sbctl-linux-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: systemd-smoke-${{ matrix.arch }}
+          path: /tmp/sbctl-linux-logs
+          if-no-files-found: ignore
+
+  backup-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: start minio
+        run: |
+          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data
+          for i in $(seq 1 60); do curl -fs http://127.0.0.1:9000/minio/health/live && break; sleep 1; done
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: create bucket
+        run: |
+          curl -fsSL -o /tmp/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /tmp/mc
+          /tmp/mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+          /tmp/mc mb -p local/sbctl-test
+      - name: backup integration
+        env:
+          SBCTL_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          SBCTL_TEST_S3_BUCKET: sbctl-test
+          SBCTL_TEST_S3_ACCESS_KEY: minioadmin
+          SBCTL_TEST_S3_SECRET_KEY: minioadmin
+        run: internal/backup/ci-integration.sh
+
+  pebble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: internal/proxy/pebble-test.sh

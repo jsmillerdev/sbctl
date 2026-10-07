@@ -1,0 +1,47 @@
+name: studio
+
+# Builds platform-mode Studio (studio/build.sh) and runs the headless spike against it.
+# Public-repo runners have 4 vCPU and 16 GB RAM; ci-prepare.sh adds swap and frees disk.
+on:
+  push:
+    branches: [main, "ws/**", "integrate/**"]
+    paths: ["studio/**", "versions.yaml", ".github/workflows/studio.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, platform: linux-amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: prepare runner
+        run: sudo studio/ci-prepare.sh
+      - name: build
+        run: studio/build.sh ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: studio-${{ matrix.platform }}
+          path: studio/dist/
+      - name: spike
+        run: studio/spike.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-spike-${{ matrix.platform }}
+          path: studio/.build-cache/spike/out
+          if-no-files-found: ignore
