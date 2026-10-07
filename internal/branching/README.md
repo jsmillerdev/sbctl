@@ -446,7 +446,15 @@ plus a parent and at most two branches, class micro):
   `IPAddressDeny` for both families and `IPAddressAllow` for loopback (GoTrue and PostgREST do not), its pg_net request
   fails after pg_net's 5 s timeout (packets are dropped, not refused) and the test server never sees it, the cron job is
   inactive and recorded, the restriction holds after pause/resume and reset, `--allow-egress` reaches the server, and a
-  delete lifts the restriction from the unit.
+  delete lifts the restriction from the unit. The same script now also checks that the allow list is exactly 127.0.0.1 and
+  ::1 (a pg_net request from the branch to 127.0.0.1 is answered and one to 127.0.0.2 is dropped and never reaches the server;
+  GoTrue and PostgREST stay healthy behind the filter), and, with a parent that has a loopback `postgres_fdw` server to
+  another project and a Vault secret holding its own service key, that in the branch (also after a reset) the server has the
+  disabled host and no password, an insert through the foreign table fails, the other project is not written to, the Vault secret
+  holds the branch's service key and is recorded by name, and that the parent's own foreign table and secret still work and are unchanged.
+  `TestIntegrationCloneNeutralizesForeignServersAndParentCredentials` runs in the same CI job on XFS (reflink) and on ext4 (base-backup restore).
+  pg_cron jobs were not used as a check that clients keep working behind the filter: in that job a pg_cron job fails with
+  "connection failed" on the unconfined parent too, so it says nothing about the filter.
 * `TestIntegrationCloneNeutralizesForeignServersAndParentCredentials` (darwin-arm64, exec backend, ~27 s): a parent with a
   loopback `postgres_fdw` server to another project (with a user mapping password and a foreign table), a `dblink_fdw` server, two cron
   jobs (one with a dblink connection string, one with the service key in its command), Vault secrets (the service key, `Bearer <anon key>`,

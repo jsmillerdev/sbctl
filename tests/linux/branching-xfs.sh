@@ -73,7 +73,7 @@ run() { # run <label> <state dir> <expected method>
   (cd internal/branching && \
     SBCTL_TEST_UNPACKED="$unpacked" SBCTL_TEST_STATE_DIR="$state" SBCTL_TEST_EXPECT_METHOD="$expect" \
     SBCTL_TEST_PARENT_MB="$PARENT_MB" SBCTL_TEST_LABEL="$label" \
-    "$work/branching.test" -test.run '^(TestIntegrationBranching|TestIntegrationCloneSize|TestIntegrationCloneUnderWriteLoad|TestIntegrationCloneIsolatesTheParentsIntegrations|TestIntegrationApplyRefusesAVersionAlreadyApplied)$' -test.v -test.timeout 35m)
+    "$work/branching.test" -test.run '^(TestIntegrationBranching|TestIntegrationCloneSize|TestIntegrationCloneUnderWriteLoad|TestIntegrationCloneIsolatesTheParentsIntegrations|TestIntegrationCloneNeutralizesForeignServersAndParentCredentials|TestIntegrationApplyRefusesAVersionAlreadyApplied)$' -test.v -test.timeout 35m)
 }
 
 # 1. XFS with reflink.

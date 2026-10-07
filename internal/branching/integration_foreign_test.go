@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -81,6 +82,18 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 	}
 	must(`alter database postgres set "app.settings.service_role_key" to '` + pk.ServiceRoleKey + `'`)
 	must(`alter database postgres set "app.settings.unrelated" to 'keep me too'`)
+
+	if _, err := admin.Exec(ctx, `checkpoint`); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("SBCTL_TEST_EXPECT_METHOD") == MethodBackup {
+		// Whatever the filesystem can do, take the base-backup path (a restore of the parent's
+		// base backup and WAL), as TestIntegrationCloneIsolatesTheParentsIntegrations does.
+		st.cfg.Branching.Clone = "backup"
+		if _, err := st.bk.BaseBackup(ctx, pref); err != nil {
+			t.Fatalf("base backup of the parent: %v", err)
+		}
+	}
 
 	branchCheck := func(b *Branch, optOut bool) {
 		t.Helper()
