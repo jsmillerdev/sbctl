@@ -3,6 +3,7 @@ package branching
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,14 +47,55 @@ func quarantineLines() string {
 	return b.String()
 }
 
+// quarantineSaved is the file next to postgresql.auto.conf that remembers the lines the
+// parent had for the quarantined settings, so that clearQuarantine can put them back.
+const quarantineSaved = "sbctl-branch-quarantine.json"
+
+// confKey is the setting name of a postgresql.auto.conf line ("" for comments and blanks).
+func confKey(line string) string {
+	l := strings.TrimSpace(line)
+	if l == "" || strings.HasPrefix(l, "#") {
+		return ""
+	}
+	k, _, ok := strings.Cut(l, "=")
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(k))
+}
+
+func quarantined(key string) bool {
+	for _, q := range quarantineSettings {
+		if q.key == key {
+			return true
+		}
+	}
+	return false
+}
+
 // writeQuarantine appends the quarantine settings to the data directory's postgresql.auto.conf
 // (created when missing). Later entries win, so an entry the parent had for the same key is
-// overridden, and survives the removal.
+// overridden. The parent's own lines for these keys are saved first: ALTER SYSTEM (a restore
+// runs ALTER SYSTEM RESET after recovery) rewrites the whole file and drops comments and
+// duplicates, so the lines cannot be told apart by a marker afterwards.
 func writeQuarantine(dataDir string) error {
 	p := filepath.Join(dataDir, "postgresql.auto.conf")
 	cur, err := os.ReadFile(p)
 	if err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	saved := map[string]string{}
+	for _, l := range strings.Split(string(cur), "\n") {
+		if k := confKey(l); quarantined(k) && !strings.Contains(l, quarantineMark) {
+			saved[k] = l // the last one wins, as in PostgreSQL
+		}
+	}
+	sp := filepath.Join(dataDir, quarantineSaved)
+	if _, err := os.Stat(sp); os.IsNotExist(err) {
+		b, _ := json.Marshal(saved)
+		if err := writeFileSync(sp, b, 0o600); err != nil {
+			return err
+		}
 	}
 	if len(cur) > 0 && !bytes.HasSuffix(cur, []byte("\n")) {
 		cur = append(cur, '\n')
@@ -61,27 +103,47 @@ func writeQuarantine(dataDir string) error {
 	return writeFileSync(p, append(cur, quarantineLines()...), 0o600)
 }
 
-// clearQuarantine removes the lines writeQuarantine added.
+// clearQuarantine removes the quarantine settings from postgresql.auto.conf, however the file
+// was rewritten since (marker or not, quoted or not), and puts back the lines the parent had.
 func clearQuarantine(dataDir string) error {
 	p := filepath.Join(dataDir, "postgresql.auto.conf")
-	cur, err := os.ReadFile(p)
-	if os.IsNotExist(err) {
-		return nil
+	sp := filepath.Join(dataDir, quarantineSaved)
+	var saved map[string]string
+	if b, err := os.ReadFile(sp); err == nil {
+		_ = json.Unmarshal(b, &saved)
 	}
-	if err != nil {
+	cur, err := os.ReadFile(p)
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	var keep []string
-	for _, l := range strings.SplitAfter(string(cur), "\n") {
-		if !strings.Contains(l, quarantineMark) {
-			keep = append(keep, l)
+	if err == nil {
+		var keep []string
+		for _, l := range strings.SplitAfter(string(cur), "\n") {
+			if !strings.Contains(l, quarantineMark) && !quarantined(confKey(l)) {
+				keep = append(keep, l)
+			}
+		}
+		out := strings.Join(keep, "")
+		if len(out) > 0 && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		for _, q := range quarantineSettings { // a stable order
+			if l, ok := saved[q.key]; ok {
+				out += l + "\n"
+			}
+		}
+		tmp := p + ".sbctl-tmp"
+		if err := writeFileSync(tmp, []byte(out), 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, p); err != nil {
+			return err
 		}
 	}
-	tmp := p + ".sbctl-tmp"
-	if err := writeFileSync(tmp, []byte(strings.Join(keep, "")), 0o600); err != nil {
+	if err := os.Remove(sp); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return os.Rename(tmp, p)
+	return nil
 }
 
 // IsolateResult says what isolateCluster changed (recorded in the branch's events).

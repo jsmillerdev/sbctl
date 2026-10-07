@@ -801,6 +801,9 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	if os.Getenv("SBCTL_TEST_EXPECT_METHOD") == MethodBackup {
+		// Whatever the filesystem can do, take the base-backup path: its restore rewrites
+		// postgresql.auto.conf with ALTER SYSTEM, which the first-start settings must survive.
+		st.cfg.Branching.Clone = "backup"
 		if _, err := st.bk.BaseBackup(ctx, pref); err != nil {
 			t.Fatalf("base backup of the parent: %v", err)
 		}
@@ -837,8 +840,15 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 				t.Errorf("branch %s: cron.launch_active_jobs = %q (%v)", b.Name, launch, err)
 			}
 		}
-		if conf, _ := os.ReadFile(filepath.Join(st.cfg.Paths().ProjectService(b.Ref, config.SvcPostgres), "data", "postgresql.auto.conf")); strings.Contains(string(conf), quarantineMark) {
-			t.Errorf("branch %s: first-start settings left in postgresql.auto.conf:\n%s", b.Name, conf)
+		data := filepath.Join(st.cfg.Paths().ProjectService(b.Ref, config.SvcPostgres), "data")
+		conf, _ := os.ReadFile(filepath.Join(data, "postgresql.auto.conf"))
+		for _, q := range quarantineSettings {
+			if strings.Contains(string(conf), q.key) {
+				t.Errorf("branch %s: first-start setting %s left in postgresql.auto.conf:\n%s", b.Name, q.key, conf)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(data, quarantineSaved)); !os.IsNotExist(err) {
+			t.Errorf("branch %s: the saved first-start lines are left behind (%v)", b.Name, err)
 		}
 		// The parent is untouched.
 		var penabled bool

@@ -141,7 +141,7 @@ marked `# sbctl-branch-quarantine`). Over the private socket, in every database,
 is disabled and detached from its slot (`ALTER SUBSCRIPTION ... DISABLE`, then `SET (slot_name =
 NONE)`, so the publisher's slot is not dropped either), `cron.job` rows are set inactive (unless
 `[branching] keep_cron_jobs = true`) and `net.http_request_queue` is emptied. Then the marked lines
-are removed, the cluster restarts on the node's ordinary settings, and the credentials rotate. The
+are removed (the parent's own lines for those three settings, saved beside the file, are put back; a restore rewrites the file with ALTER SYSTEM, so a marker alone would not survive), the cluster restarts on the node's ordinary settings, and the credentials rotate. The
 event `branch.isolated` records the counts. If any step fails the branch is stopped (`MIGRATIONS_FAILED`,
 like a failed rotation). Anything else in the data that talks to the outside is the parent's:
 a `postgres_fdw` or `dblink` server keeps its credentials and connects when queried, and an
