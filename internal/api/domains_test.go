@@ -303,8 +303,8 @@ func TestVanitySubdomainAPI(t *testing.T) {
 	}
 }
 
-// With an active custom domain the vanity subdomain is reported as unused by the platform:
-// "custom-domain-used", and changing it does not restart Auth, which already presents the domain.
+// A custom domain and a vanity subdomain are mutually exclusive: the platform reports
+// "custom-domain-used" and refuses a vanity subdomain while a custom domain is active.
 func TestVanityWithCustomDomain(t *testing.T) {
 	f := newFixture(t)
 	dns := f.withDNS()
@@ -319,14 +319,15 @@ func TestVanityWithCustomDomain(t *testing.T) {
 		t.Fatalf("activate: %d %s", rec.Code, rec.Body)
 	}
 	applied := len(f.mgr.applied)
-	if rec := f.do("POST", "/v1/projects/"+testRef+"/vanity-subdomain/activate", map[string]any{"vanity_subdomain": "acme"}); rec.Code != 201 {
-		t.Fatalf("vanity activate: %d %s", rec.Code, rec.Body)
+	if rec := f.do("POST", "/v1/projects/"+testRef+"/vanity-subdomain/activate", map[string]any{"vanity_subdomain": "acme"}); rec.Code != 409 {
+		t.Fatalf("vanity activate next to a custom domain: %d %s", rec.Code, rec.Body)
 	}
 	if len(f.mgr.applied) != applied {
-		t.Fatalf("Auth restarted although its external URL did not change: %v", f.mgr.applied)
+		t.Fatalf("Auth restarted by a refused request: %v", f.mgr.applied)
 	}
 	rec := f.do("GET", "/v1/projects/"+testRef+"/vanity-subdomain", nil)
 	body := decodeBody(t, rec)
+	validateAgainstSpec(t, "GET /v1/projects/{ref}/vanity-subdomain", rec.Body.Bytes())
 	if mapAt(t, body, "status") != "custom-domain-used" || mapAt(t, body, "custom_domain") != "docs.example.org" {
 		t.Fatalf("GET: %s", rec.Body)
 	}

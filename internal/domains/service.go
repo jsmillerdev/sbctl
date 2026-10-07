@@ -296,6 +296,11 @@ func (s *Service) Activate(ctx context.Context, ref string) (st *State, changed 
 	if h.Status != registry.HostnameOriginReady {
 		return nil, false, state("The custom hostname is not verified yet: create the DNS records and verify them first")
 	}
+	if _, err := s.store.GetVanitySubdomain(ctx, ref); err == nil {
+		return nil, false, state("The project has a vanity subdomain; a custom domain and a vanity subdomain are mutually exclusive, so delete the vanity subdomain first")
+	} else if !errors.Is(err, registry.ErrNotFound) {
+		return nil, false, err
+	}
 	act, err := s.store.ActivateCustomHostname(ctx, ref)
 	if err != nil {
 		if errors.Is(err, registry.ErrConflict) {
@@ -340,8 +345,11 @@ type VanityState struct {
 // VanityHost is the host of a vanity subdomain: <name>.api.<domain>, under the wildcard.
 func (s *Service) VanityHost(name string) string { return s.cfg.VanityHost(name) }
 
-// Vanity reports the project's vanity subdomain. An active custom hostname wins, as it does for
-// GoTrue's external URL: the vanity host keeps serving, but the project presents its own domain.
+// Vanity reports the project's vanity subdomain. A project with an active custom hostname reports
+// "custom-domain-used": the two are mutually exclusive, as on hosted (the CLI's reference says
+// so), so a vanity subdomain cannot be activated next to it, and a custom hostname cannot be
+// activated next to a vanity subdomain. Should both exist anyway, the custom hostname wins here and
+// in GoTrue's external URL.
 func (s *Service) Vanity(ctx context.Context, ref string) (*VanityState, error) {
 	if _, err := s.project(ctx, ref); err != nil {
 		return nil, err
@@ -396,6 +404,9 @@ func (s *Service) ActivateVanity(ctx context.Context, ref, name string) (host st
 	n, err := ValidateVanityName(name)
 	if err != nil {
 		return "", err
+	}
+	if h, herr := s.store.GetCustomHostname(ctx, ref); herr == nil && h.Status == registry.HostnameActive {
+		return "", state("The project uses a custom domain; a custom domain and a vanity subdomain are mutually exclusive, so delete the custom domain first")
 	}
 	host = s.VanityHost(n)
 	if err := s.store.PutVanitySubdomain(ctx, ref, n, host); err != nil {

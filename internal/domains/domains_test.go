@@ -463,23 +463,33 @@ func TestVanity(t *testing.T) {
 		t.Error("the released name is not available")
 	}
 
-	// An active custom hostname takes precedence for the project's identity.
+	// A custom domain and a vanity subdomain are mutually exclusive, as on hosted.
 	e.dns.host["docs.example.org"] = []string{"203.0.113.7"}
 	st, _ := e.svc.Initialize(ctx, refA, "docs.example.org")
 	e.dns.txt[st.TXTName] = []string{st.TXTValue}
 	if _, err := e.svc.Reverify(ctx, refA); err != nil {
 		t.Fatal(err)
 	}
+	if _, _, err := e.svc.Activate(ctx, refA); kindOf(t, err) != KindState || !strings.Contains(err.Error(), "vanity subdomain") {
+		t.Fatalf("activating a custom hostname next to a vanity subdomain: %v", err)
+	}
+	if err := e.svc.DeleteVanity(ctx, refA); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := e.svc.Activate(ctx, refA); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := e.svc.ActivateVanity(ctx, refA, "acme"); kindOf(t, err) != KindState || !strings.Contains(err.Error(), "custom domain") {
+		t.Fatalf("activating a vanity subdomain next to a custom hostname: %v", err)
 	}
 	if v, _ := e.svc.Vanity(ctx, refA); v.Status != VanityCustomDomainUsed || v.CustomDomain != "docs.example.org" {
 		t.Fatalf("with a custom domain: %+v", v)
 	}
-	if h, _ := ExternalHost(ctx, e.reg, e.cfg, refA); h != "docs.example.org" {
-		t.Fatalf("external host with both: %q", h)
-	}
 	if _, err := e.svc.Delete(ctx, refA); err != nil {
+		t.Fatal(err)
+	}
+	// Both rows can exist only through the store directly; the custom hostname would win.
+	if err := e.reg.PutVanitySubdomain(ctx, refA, "acme-two", "acme-two.api.example.com"); err != nil {
 		t.Fatal(err)
 	}
 	if h, _ := ExternalHost(ctx, e.reg, e.cfg, refA); h != "acme-two.api.example.com" {
