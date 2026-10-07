@@ -65,25 +65,25 @@ The same branch is one call to `POST /v1/projects/<ref>/branches` with `{"branch
 
 ## Back up and restore
 
-Backups start on their own. Every project archives its write-ahead log (WAL) continuously and takes a nightly base backup.
+Backups start on their own. Every project archives its write-ahead log (WAL) continuously and takes a nightly base backup, and the same nightly run copies its Storage files and Edge Functions.
 
-Backups go to local disk by default. To keep them in S3, pass `--s3-bucket` and `--s3-region` at install (see the deploy guide's [flags](../deploy/README.md#flags)). The AWS stack uses its own bucket.
+Backups go to local disk by default. To keep them off the server, pass `--s3-bucket` and `--s3-region` at install (see the deploy guide's [flags](../deploy/README.md#flags)). The AWS stack uses its own bucket.
 
-Restore in the dashboard: open **Database > Backups**. The **Point in time** tab shows the span you can restore to, from the end of the oldest base backup up to now (7 days by default). Pick a time and confirm. The project shows RESTORING while it runs, goes offline for the restore, and returns to ACTIVE_HEALTHY when it finishes; everything written after the chosen time is lost. If the restore fails, the project shows RESTORE_FAILED (Studio shows "Something went wrong while restoring your project") instead of returning to normal. Supavise puts the original data back where it can, so the project's data is the data it had before the restore, or the project is down if that did not work; the Supavise log and the project's `restore.failed` event say why. Studio's failed screen offers only a delete. To move on, restore again (the Management API accepts a restore for a project in this state), pause and resume it with `supavise projects pause <ref>` and `supavise projects resume <ref>`, or delete it. Only Owners and Administrators can restore. The same restore is one call: `POST /v1/projects/<ref>/database/backups/restore-pitr` with `{"recovery_time_target_unix": <seconds>}`.
+**Restore from the dashboard.** Open **Database > Backups > Point in time**, pick a time within the retention window (7 days by default) and confirm. The project shows RESTORING, then returns to normal; anything written after that time is lost. Only Owners and Administrators can restore. The API equivalent is `POST /v1/projects/<ref>/database/backups/restore-pitr`.
 
-Before a restore starts, Supavise checks that the server's disk has room for a second copy of the project's data and refuses the restore with a 409 if it does not. Supavise keeps the project's previous data directory on the server, next to the new one (`projects/<ref>/postgres/data.pre-restore-<time>` in the state directory). Only the server's administrator can open or delete it; the project's next restore that works removes it once it has set aside a newer one, so at most one stays. A restore that fails leaves its attempt in `data.failed-restore-<time>` for the administrator to read, and the next restore that works removes it. After a restore, Supavise sets the database role passwords back to the ones it holds, so a database password you reset after the chosen time keeps working.
-
-A restore runs inside the Supavise service. Do not restart `supavise` while a project shows RESTORING (the service waits about 11 minutes for work in flight, and a restore can take longer). A restart that cuts a restore off leaves the project RESTORING until the administrator settles it by hand: see "From the dashboard and the Management API" in `internal/backup/README.md`.
-
-While point-in-time recovery is on (always, on Supavise), the **Scheduled backups** tab lists no backups, as on hosted projects with the add-on. To restore the state of one nightly base backup, use `POST /v1/projects/<ref>/database/backups/restore` with `{"id": <id>}` (`GET /v1/projects/<ref>/database/backups` lists the ids), or the command below.
-
-Restore on the server, as a copy under a new project or in place:
+**Restore on the server**, in place or as a copy under a new project:
 
 ```bash
 sudo -u supavise supavise backups list <ref>
 sudo -u supavise supavise backups restore <ref> --to 2026-10-06T14:30:00Z --as <newref>   # a copy at that time
 sudo -u supavise supavise backups restore <ref> --to latest --force                      # in place
 ```
+
+Good to know:
+
+- Don't restart `supavise` while a project shows RESTORING.
+- A restore needs free disk for a second copy of the project's data. The previous data stays on the server until the project's next successful restore.
+- If a restore fails, the project shows RESTORE_FAILED and keeps its original data where possible. Restore again, or pause and resume the project. The [backup docs](../internal/backup/README.md) cover the details.
 
 ## How Supavise compares
 
