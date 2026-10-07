@@ -7,6 +7,7 @@ package backup
 // skipped, as they are with -short or SUPAVISE_TEST_PG=0. Ports come from 35000-35999.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -372,6 +373,52 @@ func runPointInTimeRestore(t *testing.T, root string, st Store, backupToml strin
 	mustExec("create table public.t (id int primary key)")
 	mustExec("insert into public.t values (1)")
 
+	// The files the project owns outside its database: a Storage object (placed the way the
+	// Storage service lays it out, with its content type) and a deployed Edge Function, backed
+	// up before the restore target below.
+	fns := newFakeFunctions()
+	e.svc.opt.Functions = fns
+	const objRel = "avatars/me.png/9a7ab3a0-5c1e-4a5c-8d3e-0123456789ab"
+	objBytes := randBytes(t, 3<<20+5)
+	objPath := e.putObject(t, testRef, objRel, objBytes, time.Now().Add(-time.Hour))
+	typeOK := setContentType(t, objPath, "image/png")
+	fns.deploy(testRef, fnRec("hello", 2, time.Now()), FunctionFile{Path: "index.ts", Content: []byte("export default () => new Response('hi')")})
+	fns.secrets[testRef] = map[string][]byte{"API_KEY": []byte("sealed")}
+	if _, err := e.svc.BackupFiles(ctx, testRef, FilesOptions{Reason: ReasonScheduled}); err != nil {
+		t.Fatal(err)
+	}
+	loseFiles := func() {
+		t.Helper()
+		if err := os.RemoveAll(e.objectsDir(testRef)); err != nil {
+			t.Fatal(err)
+		}
+		delete(fns.recs, testRef)
+		delete(fns.files, testRef)
+		delete(fns.secrets, testRef)
+	}
+	assertFiles := func(ref string) {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(e.objectsDir(ref), filepath.FromSlash(objRel)))
+		if err != nil || !bytes.Equal(b, objBytes) {
+			t.Fatalf("object of %s after the restore: %d bytes, %v", ref, len(b), err)
+		}
+		if typeOK {
+			if a, err := readStorageAttrs(filepath.Join(e.objectsDir(ref), filepath.FromSlash(objRel))); err != nil || string(a[contentTypeAttr()]) != "image/png" {
+				t.Fatalf("content type of the object of %s = %q, %v", ref, a[contentTypeAttr()], err)
+			}
+		}
+		got, err := fns.ListFunctions(ctx, ref)
+		if err != nil || len(got) != 1 || got[0].Slug != "hello" || got[0].Version != 2 {
+			t.Fatalf("functions of %s after the restore = %+v, %v", ref, got, err)
+		}
+		if f, _ := fns.FunctionFiles(ctx, ref, "hello"); len(f) != 1 || !strings.Contains(string(f[0].Content), "new Response") {
+			t.Fatalf("function files of %s = %+v", ref, f)
+		}
+		if sec, _ := fns.ListFunctionSecrets(ctx, ref); len(sec) != 1 {
+			t.Fatalf("function secrets of %s = %+v", ref, sec)
+		}
+	}
+
 	// Base backup of the running cluster.
 	rec, err := e.svc.BaseBackup(ctx, testRef)
 	if err != nil {
@@ -413,7 +460,10 @@ func runPointInTimeRestore(t *testing.T, root string, st Store, backupToml strin
 		t.Fatal("the table should be gone before the restore")
 	}
 
-	// Restore to the noted time as a new project: the source stays as it is.
+	// The project's files are lost along with its database. Restore to the noted time as a
+	// new project: the source stays as it is, and the objects and functions come back from
+	// the backup taken before the target.
+	loseFiles()
 	p, err := e.svc.Restore(ctx, testRef, target, testRef2)
 	if err != nil {
 		t.Fatal(err)
@@ -421,6 +471,7 @@ func runPointInTimeRestore(t *testing.T, root string, st Store, backupToml strin
 	if p.Ref != testRef2 {
 		t.Fatalf("restored project = %+v", p)
 	}
+	assertFiles(testRef2)
 	clone := mgr.insts[testRef2]
 	rc := clone.connect(ctx)
 	if ids := queryIDs(t, ctx, rc); idsString(ids) != "[1 2]" {
@@ -464,9 +515,11 @@ func runPointInTimeRestore(t *testing.T, root string, st Store, backupToml strin
 		t.Fatalf("in-place restore without force = %v", err)
 	}
 	c.Close(ctx)
+	loseFiles()
 	if _, err := e.svc.RestoreWith(ctx, testRef, target, "", RestoreOptions{Force: true}); err != nil {
 		t.Fatal(err)
 	}
+	assertFiles(testRef)
 	c2 := src.connect(ctx)
 	if ids := queryIDs(t, ctx, c2); idsString(ids) != "[1 2]" {
 		t.Fatalf("rows after in-place restore = %v, want [1 2]", ids)
@@ -515,9 +568,17 @@ func runPointInTimeRestore(t *testing.T, root string, st Store, backupToml strin
 	if _, err := c2.Exec(ctx, "insert into public.t values (3)"); err != nil {
 		t.Fatal(err)
 	}
+	// An object stored since the nightly copy is in the latest state too: the source's files
+	// are snapshotted first, like its newest WAL is archived.
+	late := e.putObject(t, testRef, "avatars/late.png/9a7ab3a0-5c1e-4a5c-8d3e-0123456789ac", []byte("late"), time.Now())
+	_ = late
 	p3, err := e.svc.RestoreWith(ctx, testRef, time.Time{}, testRef3, RestoreOptions{Latest: true})
 	if err != nil {
 		t.Fatal(err)
+	}
+	assertFiles(testRef3)
+	if b, err := os.ReadFile(filepath.Join(e.objectsDir(testRef3), "avatars", "late.png", "9a7ab3a0-5c1e-4a5c-8d3e-0123456789ac")); err != nil || string(b) != "late" {
+		t.Fatalf("the object stored after the nightly copy is missing from the latest restore: %q, %v", b, err)
 	}
 	clone3 := mgr.insts[p3.Ref]
 	if ids := queryIDs(t, ctx, clone3.connect(ctx)); idsString(ids) != "[1 2 3]" {

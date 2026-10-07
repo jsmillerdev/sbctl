@@ -459,3 +459,95 @@ func blobList(t *testing.T, e *testEnv, ref, kind string) []ObjectInfo {
 }
 
 func sum256(b []byte) [32]byte { return sha256.Sum256(b) }
+
+// A restore brings the project's files back from the newest backup at or before the target,
+// as a new project and in place, unless SkipFiles says otherwise.
+func TestRestoreBringsFilesBack(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	src := e.addProject(t, testRef)
+	e.storeBase(t, testRef, fakeDataDir(t), e.now.Add(-time.Hour), src)
+	fns := newFakeFunctions()
+	e.svc.opt.Functions = fns
+	fm := &fakeManager{e: e, dataDir: filepath.Join(t.TempDir(), "restored")}
+	e.svc.opt.Manager = fm
+
+	e.putObject(t, testRef, "b/o/v1", []byte("object"), e.now.Add(-2*time.Hour))
+	fns.deploy(testRef, fnRec("hello", 1, e.now.Add(-2*time.Hour)), FunctionFile{Path: "index.ts", Content: []byte("x")})
+	if _, err := e.svc.BackupFiles(ctx, testRef, FilesOptions{Reason: ReasonScheduled}); err != nil {
+		t.Fatal(err)
+	}
+	// Changes after the backup are not in what the restore brings back.
+	e.now = e.now.Add(time.Hour)
+	e.putObject(t, testRef, "b/newer/v1", []byte("stored after the nightly copy"), e.now)
+	target := e.now.Add(-time.Minute)
+
+	var progress []string
+	p, err := e.svc.RestoreWith(ctx, testRef, target, testRef2, RestoreOptions{Progress: func(m string) { progress = append(progress, m) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readTree(t, e.objectsDir(p.Ref)); len(got) != 1 || string(got["b/o/v1"]) != "object" {
+		t.Fatalf("restored objects = %v", got)
+	}
+	if cur, _ := fns.ListFunctions(ctx, p.Ref); len(cur) != 1 {
+		t.Fatalf("restored functions = %+v", cur)
+	}
+	if len(progress) != 2 || !strings.Contains(progress[0], "objects: 1 files") || !strings.Contains(progress[1], "functions: 1 deployments") {
+		t.Fatalf("progress = %q", progress)
+	}
+	evs, _ := e.reg.ListEvents(ctx, testRef, 10)
+	var completed bool
+	for _, ev := range evs {
+		completed = completed || ev.Kind == "restore.completed"
+	}
+	if !completed {
+		t.Fatalf("events = %+v", evs)
+	}
+
+	// SkipFiles leaves the new project without files.
+	fm.dataDir = filepath.Join(t.TempDir(), "restored2")
+	if _, err := e.svc.RestoreWith(ctx, testRef, target, testRef3, RestoreOptions{SkipFiles: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(e.objectsDir(testRef3)); err == nil {
+		t.Error("SkipFiles restored objects")
+	}
+	if cur, _ := fns.ListFunctions(ctx, testRef3); len(cur) != 0 {
+		t.Errorf("SkipFiles restored functions: %+v", cur)
+	}
+}
+
+// Files that cannot be restored do not undo the database restore, and the error says so.
+func TestRestoreReportsFilesThatFailAfterTheDatabaseCameBack(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	src := e.addProject(t, testRef)
+	e.storeBase(t, testRef, fakeDataDir(t), e.now.Add(-time.Hour), src)
+	e.svc.opt.Manager = &fakeManager{e: e, dataDir: filepath.Join(t.TempDir(), "restored")}
+	e.putObject(t, testRef, "b/o/v1", []byte("object"), e.now.Add(-2*time.Hour))
+	snap, err := e.svc.backupStorage(ctx, testRef, ReasonScheduled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Remove the blob the snapshot needs.
+	var hash string
+	if err := e.svc.readEntries(ctx, snap.Dir()+"/"+entriesName, func(en fileEntry) error { hash = en.Hash; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.Delete(ctx, blobKey(testRef, KindStorage, hash)); err != nil {
+		t.Fatal(err)
+	}
+	p, err := e.svc.RestoreWith(ctx, testRef, e.now, testRef2, RestoreOptions{})
+	if err == nil || p == nil || !strings.Contains(err.Error(), "was restored as "+testRef2) || !strings.Contains(err.Error(), "restore-files") {
+		t.Fatalf("restore = %v, %v", p, err)
+	}
+	evs, _ := e.reg.ListEvents(ctx, testRef, 10)
+	var failed bool
+	for _, ev := range evs {
+		failed = failed || ev.Kind == "restore.files_failed"
+	}
+	if !failed {
+		t.Fatalf("no restore.files_failed event: %+v", evs)
+	}
+}

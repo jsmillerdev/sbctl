@@ -188,8 +188,9 @@ const StorageFileBucket = "stub"
 func (p Paths) StorageObjects(ref string) string {
 	return filepath.Join(p.System(SvcStorage), "objects", StorageFileBucket, ref)
 }
-func (p Paths) Certs() string            { return filepath.Join(p.Root, "certs") }
-func (p Paths) Backups() string          { return filepath.Join(p.Root, "backups") }
+
+func (p Paths) Certs() string   { return filepath.Join(p.Root, "certs") }
+func (p Paths) Backups() string { return filepath.Join(p.Root, "backups") }
 
 // BaseDomain is Domain, or "<public_ip>.sslip.io" when no domain is configured.
 func (c *Config) BaseDomain() string {

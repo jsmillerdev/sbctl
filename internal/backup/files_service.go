@@ -92,6 +92,9 @@ type FilesRestoreOptions struct {
 	// SnapshotID restores exactly this snapshot (of whichever kind has it) and leaves the
 	// other kind alone. It is the way to bring back a pre-restore snapshot.
 	SnapshotID string
+	// RequireProject refuses a target project the registry does not know. Restoring into an
+	// existing project by hand sets it; a restore that has just created the project does not.
+	RequireProject bool
 	// Progress receives one line per notable step (default: dropped).
 	Progress func(msg string)
 }
@@ -131,6 +134,11 @@ func (s *Service) RestoreFiles(ctx context.Context, ref, into string, o FilesRes
 		return nil, err
 	}
 	replace := into == ref
+	if o.RequireProject && s.opt.Registry != nil {
+		if _, err := s.opt.Registry.GetProject(ctx, into); err != nil {
+			return nil, fmt.Errorf("backup: project %s: %w (restore into a project that exists; `supavise backups restore --as` creates one)", into, err)
+		}
+	}
 	res := &FilesRestoreResult{}
 	stamp := s.opt.Now().UTC().Format("20060102T150405Z")
 	var errs []error

@@ -90,11 +90,12 @@ ProtectHome=yes
 # set (supavise.service does the same); the supavise-* units that run tenant code have none (deploy/systemd/README.md).
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-# Mount allowlist: the unit sees the registry's socket, this project's data directory (read-only)
-# and WAL socket directory, and the file backend's directory (no effect on S3), not other projects'
-# data directories, environment files or functions.
+# Mount allowlist: the unit sees the registry's socket, this project's data directory and Storage
+# objects (both read-only; the backup copies the objects to the backend), this project's WAL socket
+# directory, and the file backend's directory (no effect on S3), not other projects' data directories
+# or objects, environment files or functions.
 TemporaryFileSystem=/var/lib/supavise:ro
-BindReadOnlyPaths=/var/lib/supavise/projects/system/postgres/sock /var/lib/supavise/projects/%%i/postgres
+BindReadOnlyPaths=/var/lib/supavise/projects/system/postgres/sock /var/lib/supavise/projects/%%i/postgres -/var/lib/supavise/system/storage/objects/stub/%%i
 BindPaths=-/var/lib/supavise/projects/%%i/wal -/var/lib/supavise/backups
 `, config.Slice, EnvFile, bin, bin)
 }
