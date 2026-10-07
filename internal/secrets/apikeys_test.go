@@ -36,7 +36,7 @@ func TestOpaqueKeysFromStoredRecords(t *testing.T) {
 	if len(keys) != 3 {
 		t.Fatalf("want default publishable, two extras and no revoked default secret, got %+v", keys)
 	}
-	if keys[0].Key != older.Key || keys[2].Key != extra.Key && keys[1].Key != extra.Key {
+	if keys[0].Key != k.PublishableKey || keys[1].Key != older.Key || keys[2].Key != extra.Key {
 		t.Errorf("order or values wrong: %+v", keys)
 	}
 	for _, o := range keys {
