@@ -361,7 +361,7 @@ assert_os_updates() { # on|off
     # while, and unattended-upgrade then says nothing about origins: look again for up to two minutes.
     local run="" n
     for ((n = 0; n < 12; n++)); do
-      run=$(unattended-upgrade --dry-run --debug 2>&1 || true)
+      run=$(timeout 240 unattended-upgrade --dry-run --debug 2>&1 || true)
       origins=$(grep -m1 'Allowed origins are' <<<"$run" || true)
       [[ -n $origins ]] && break
       sleep 10

@@ -377,7 +377,7 @@ deploy/install.sh --binary "$SUPAVISE_BIN" >/dev/null 2>&1 || fail "re-run after
 [[ $(sha256sum /etc/supavise/config.toml) == "$CFG_AUTO" ]] || fail "a no-flag re-run changed the update settings"
 [[ $($SV update config | grep -E '^(mode|window)' | tr '\n' ' ') == 'mode = "auto" window = "Mon-Fri 01:00-02:00" ' ]] || fail "a re-run lost the update settings: $($SV update config)"
 # Outside the window an auto-mode node does not upgrade (Wednesday 12:00 UTC); the check failing (no release exists) is not an error.
-out=$($SV update run --at 2026-10-07T12:00:00Z 2>&1) || fail "update run outside the window failed: $out"
+out=$(timeout 120 $SV update run --at 2026-10-07T12:00:00Z 2>&1) || fail "update run outside the window failed: $out"
 [[ $out != *unattended_upgrade_started* ]] || fail "an upgrade started outside the window: $out"
 # The installer flags set the same keys.
 deploy/install.sh --binary "$SUPAVISE_BIN" --auto-upgrade=false --maintenance-window "Sun 04:00-06:00" >/dev/null 2>&1 || fail "re-run with --auto-upgrade=false"

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"time"
@@ -52,6 +53,11 @@ func HostReboot(ctx context.Context) error {
 // LatestStable asks GitHub for the tag of the newest stable release of o's repository.
 func LatestStable(ctx context.Context, o selfupdate.Options) (string, error) {
 	o.Tag = ""
+	if o.HTTP == nil {
+		// A release check that cannot reach GitHub fails in half a minute; the service is not
+		// kept waiting for the library's ten minutes, which suit a binary download.
+		o.HTTP = &http.Client{Timeout: 30 * time.Second}
+	}
 	rel, err := selfupdate.Latest(ctx, o)
 	if err != nil {
 		return "", err
