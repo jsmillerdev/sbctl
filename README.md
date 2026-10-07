@@ -169,12 +169,11 @@ supabase --profile ./supavise-profile.yaml functions deploy --use-api
 A branch is a full project with its own database, keys and URL. Create one with data copied from the parent:
 
 ```bash
-supabase --profile ./supavise-profile.yaml branches create agent-task-42 \
-  --project-ref <ref> --with-data --experimental
-supabase --profile ./supavise-profile.yaml branches get agent-task-42 --project-ref <ref> --experimental
+supabase --profile ./supavise-profile.yaml branches create agent-task-42 --project-ref <ref> --with-data
+supabase --profile ./supavise-profile.yaml branches get agent-task-42 --project-ref <ref>
 ```
 
-`branches get` prints the branch's connection strings and keys. The same branch is one call to `POST /v1/projects/<ref>/branches` with `{"branch_name": "agent-task-42", "with_data": true}`, and the Supabase MCP server's branch tools work when you start it with `--api-url https://api.<domain>`.
+`branches get` prints the branch's connection details. The same branch is one call to `POST /v1/projects/<ref>/branches` with `{"branch_name": "agent-task-42", "with_data": true}`, and the Supabase MCP server's branch tools work when you start it with `--api-url https://api.<domain>`.
 
 ### 7. Back up and restore
 
