@@ -326,6 +326,17 @@ plus a parent and at most two branches, class micro):
   nothing) and a pg_cron job; the branch has the subscription disabled with no slot, the job inactive
   (active with `keep_cron_jobs`), the node's `max_logical_replication_workers` and
   `cron.launch_active_jobs` back, no marked lines left, and the parent unchanged.
+* Outbound isolation: `TestIntegrationCloneIsolatesTheParentsIntegrations` also checks, on the exec backend, that the
+  branch reports `egress: unenforced` with a detail that says "egress NOT blocked", that the paused cron job is
+  recorded in `sbctl_branch.paused_cron_jobs` (and the table is absent with `keep_cron_jobs`), and that
+  `allow_egress` reports `allowed` and keeps the job. Unit tests cover the policy per supervisor, reset keeping it, the
+  free-disk refusals (create, reset, the base-backup path, schema-only exempt) and the API's 409. Under systemd,
+  `tests/linux/branching-egress.sh` (CI job `branching-xfs`, ubuntu-24.04, a loop-file XFS state directory) passed: the
+  parent's pg_net request to the runner's non-loopback address is answered, the default branch's Postgres unit has
+  `IPAddressDeny` for both families and `IPAddressAllow` for loopback (GoTrue and PostgREST do not), its pg_net request
+  fails after pg_net's 5 s timeout (packets are dropped, not refused) and the test server never sees it, the cron job is
+  inactive and recorded, the restriction holds after pause/resume and reset, `--allow-egress` reaches the server, and a
+  delete lifts the restriction from the unit.
 * `TestIntegrationApplyRefusesAVersionAlreadyApplied`: a version already recorded is refused with
   `ErrDiverged` before its statements run, and of two concurrent applies of one new version one wins.
 * Unit tests (fake engine): a reset refused before anything is removed (data path gone, no base
