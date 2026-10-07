@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"strings"
 	"testing"
@@ -14,11 +15,18 @@ import (
 // staticDNS answers the checks of a verified custom hostname: the TXT token and an A record
 // at the node's address.
 type staticDNS struct {
-	txt  map[string][]string
-	host map[string][]string
+	txt   map[string][]string
+	host  map[string][]string
+	cname map[string]string
 }
 
 func (d *staticDNS) LookupCNAME(_ context.Context, h string) (string, error) {
+	if c, ok := d.cname[h]; ok {
+		return c + ".", nil
+	}
+	if _, ok := d.host[h]; ok {
+		return h + ".", nil // no CNAME: the resolver answers with the name itself
+	}
 	return "", &net.DNSError{Err: "no such host", IsNotFound: true}
 }
 func (d *staticDNS) LookupTXT(_ context.Context, n string) ([]string, error) {
@@ -28,6 +36,9 @@ func (d *staticDNS) LookupTXT(_ context.Context, n string) ([]string, error) {
 	return nil, &net.DNSError{Err: "no such host", IsNotFound: true}
 }
 func (d *staticDNS) LookupHost(_ context.Context, h string) ([]string, error) {
+	if c, ok := d.cname[h]; ok {
+		h = c
+	}
 	if v, ok := d.host[h]; ok {
 		return v, nil
 	}
@@ -312,5 +323,59 @@ func TestVanityCannotShadowAProject(t *testing.T) {
 	eventually(t, "routes reach the table", func() bool { return h.srv.table.routeKind("marker.customer.example") == "custom" })
 	if p, ok := h.srv.table.lookup(h.host(other)); !ok || p.ref != other {
 		t.Fatalf("project host resolved to %q (ok=%v), want %q", p.ref, ok, other)
+	}
+}
+
+// TestStudioCNAMECheckIsAnsweredByTheNode: Studio's pre-check route is answered from the node's
+// resolver in DNS-over-HTTPS JSON, so no domain goes to Cloudflare.
+func TestStudioCNAMECheckIsAnsweredByTheNode(t *testing.T) {
+	dns := &staticDNS{txt: map[string][]string{}, host: map[string][]string{"node.example.net": {"203.0.113.7"}, "a.customer.example": {"203.0.113.7"}},
+		cname: map[string]string{"alias.customer.example": "node.example.net"}}
+	h := newHarness(t, func(o *Options) { o.Resolver = dns })
+	before := h.ups[svcStudio].count()
+	get := func(domain string) (int, map[string]any) {
+		t.Helper()
+		resp, body := h.req("GET", "studio."+testDomain, "/api/check-cname?domain="+domain)
+		var out map[string]any
+		_ = json.Unmarshal([]byte(body), &out)
+		return resp.StatusCode, out
+	}
+	code, out := get("alias.customer.example")
+	ans, _ := out["Answer"].([]any)
+	if code != 200 || len(ans) != 1 || ans[0].(map[string]any)["type"] != float64(5) || ans[0].(map[string]any)["data"] != "node.example.net." {
+		t.Fatalf("CNAME: %d %v", code, out)
+	}
+	// An A record is an answer too: Studio only needs to see that the name resolves.
+	code, out = get("a.customer.example")
+	ans, _ = out["Answer"].([]any)
+	if code != 200 || len(ans) != 1 || ans[0].(map[string]any)["type"] != float64(1) {
+		t.Fatalf("A: %d %v", code, out)
+	}
+	// Nothing there: no Answer, which Studio reports as "cannot be found".
+	code, out = get("none.customer.example")
+	if _, has := out["Answer"]; code != 200 || has || out["Status"] != float64(3) {
+		t.Fatalf("NXDOMAIN: %d %v", code, out)
+	}
+	for _, bad := range []string{"", "10.0.0.1", "api." + testDomain, "x"} {
+		if code, _ := get(bad); code != 400 {
+			t.Errorf("domain %q: %d, want 400", bad, code)
+		}
+	}
+	if h.ups[svcStudio].count() != before {
+		t.Error("a check reached Studio")
+	}
+	// Other methods and the project host are not answered.
+	if resp, _ := h.project("GET", "/api/check-cname?domain=a.customer.example"); resp.StatusCode != 404 {
+		t.Errorf("project host: %d", resp.StatusCode)
+	}
+	// The route is limited.
+	limited := false
+	for i := 0; i < cnameCheckPerMinute+2; i++ {
+		if code, _ := get("a.customer.example"); code == 429 {
+			limited = true
+		}
+	}
+	if !limited {
+		t.Error("no rate limit")
 	}
 }

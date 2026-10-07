@@ -13,6 +13,7 @@ import (
 	"github.com/caddyserver/certmagic"
 
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/domains"
 )
 
 // Server is supavise's public edge. Create it with New, then call Run (or Serve with
@@ -40,6 +41,10 @@ type Server struct {
 	mu         sync.Mutex
 	transports map[time.Duration]*http.Transport
 
+	// resolver and cnameLimit serve Studio's custom-domain DNS pre-check (studio_cname.go).
+	resolver   domains.Resolver
+	cnameLimit cnameLimiter
+
 	// fnToken is the secret the edge runtime's main service demands (functionsToken).
 	fnTokenMu sync.Mutex
 	fnToken   string
@@ -57,6 +62,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if s.log == nil {
 		s.log = slog.Default()
+	}
+	if s.resolver = opts.Resolver; s.resolver == nil {
+		s.resolver = net.DefaultResolver
 	}
 	if s.waker == nil {
 		s.waker = noopWaker{}
