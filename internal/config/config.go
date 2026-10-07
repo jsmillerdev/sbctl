@@ -206,6 +206,9 @@ func (c *Config) Validate() error {
 	default:
 		return errors.New("config: backup.wal_relay must be auto, on or off")
 	}
+	if c.Backup.WALRelay == "off" && c.Supervisor == SupervisorSystemd {
+		return errors.New("config: backup.wal_relay = \"off\" cannot work with supervisor = \"systemd\": the Postgres units hide /etc/sbctl and the backups directory, so a direct `sbctl wal push` can read neither the backend settings nor write the archive, and archiving would fail forever; use auto or on")
+	}
 	if c.StateDir == "" {
 		return errors.New("config: state_dir is empty")
 	}

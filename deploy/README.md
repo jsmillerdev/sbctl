@@ -149,7 +149,7 @@ aws secretsmanager get-secret-value --secret-id <ClaimTokenSecretArn> --query Se
 
 and use it on `ClaimUrl`. Creating the stack needs the "I acknowledge that CloudFormation might create IAM resources" box.
 
-Checked: `cfn-lint` passed on the template before the Route 53 conditions, the `AmiId` parameter and the `/etc/sbctl` bind mount were added; those changes were not linted again (cfn-lint was not available where they were made), and the user-data script was last checked with `bash -n` before them too. **Not deployed:** nothing here has run in an AWS account, so the first launch is the first test of the data-volume discovery, the `awscli` package on Ubuntu 24.04, the Secrets Manager write and the signal.
+Checked: `cfn-lint` passes on the template as it is now (the `cfn-lint` job of `.github/workflows/ci.yml` runs it on every push), and the user-data script was last checked with `bash -n` before the Route 53 conditions, the `AmiId` parameter and the `/etc/sbctl` bind mount were added. **Not deployed:** nothing here has run in an AWS account, so the first launch is the first test of the data-volume discovery, the stop-and-swap replacement of the instance over an existing data volume, the `awscli` package on Ubuntu 24.04, the Secrets Manager write and the signal.
 
 ## Release signing
 

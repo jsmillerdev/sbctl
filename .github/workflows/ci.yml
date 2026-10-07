@@ -45,3 +45,15 @@ jobs:
         run: go test -race -count=50 -run 'TestRelayTruncatedPushLeavesNothing|TestRelayCancelledAndTruncatedPushesDoNotRaceTheBody|TestRelayNeverReplacesASocketThatAnswers|TestRelayReconcileFollowsTheProjects|TestPushWALReaderStopsReadingBeforeItReturns' ./internal/backup
       - name: cross-build
         run: make build-linux
+
+  # The CloudFormation template runs nowhere else in CI: this catches invalid properties,
+  # condition keys and intrinsic functions before a stack is created from it.
+  cfn-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: cfn-lint
+        run: |
+          python3 -m venv "$RUNNER_TEMP/cfn"
+          "$RUNNER_TEMP/cfn/bin/pip" install --quiet cfn-lint
+          "$RUNNER_TEMP/cfn/bin/cfn-lint" deploy/cloudformation/sbctl.yaml

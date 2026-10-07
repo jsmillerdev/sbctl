@@ -10,6 +10,7 @@ import (
 )
 
 func main() {
+	hardenProcess()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := rootCmd.ExecuteContext(ctx); err != nil {

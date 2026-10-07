@@ -434,3 +434,84 @@ func TestWALRelayAutoFollowsTheSupervisor(t *testing.T) {
 		t.Fatal("auto must be off under the exec backend")
 	}
 }
+
+// stalledPush opens a push that declares size bytes, sends a few and then stops, so the
+// relay holds its slots until the body deadline or until the connection closes.
+func stalledPush(t *testing.T, sock, name string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(conn, "POST "+relayPushPath+"?name="+name+" HTTP/1.1\r\nHost: relay\r\nContent-Length: 1048576\r\n\r\n")
+	conn.Write(make([]byte, 100))
+	return conn
+}
+
+// One project cannot take the relay's transfer slots away from the others: its own limit
+// stops it at relayPerRef, and a push for another project still goes through.
+func TestRelayPerProjectLimitLeavesOtherProjectsServed(t *testing.T) {
+	re := newRelayEnv(t, testRef, testRef2)
+	var stalled []net.Conn
+	for i := range relayPerRef {
+		stalled = append(stalled, stalledPush(t, re.sock(testRef), fmt.Sprintf("0000000100000000%08X", i+1)))
+	}
+	t.Cleanup(func() {
+		for _, c := range stalled {
+			c.Close()
+		}
+	})
+	time.Sleep(200 * time.Millisecond) // both handlers hold their slots now
+
+	// Another push for the same project queues behind them.
+	blocked := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { blocked <- RelayPush(ctx, re.sock(testRef), testRef, writeWAL(t, walA, 1<<10, 1)) }()
+	select {
+	case err := <-blocked:
+		t.Fatalf("a push beyond the project's limit was served: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// The other project is not affected.
+	if err := RelayPush(context.Background(), re.sock(testRef2), testRef2, writeWAL(t, walB, 1<<10, 2)); err != nil {
+		t.Fatalf("another project's push was held up: %v", err)
+	}
+
+	// The queued push runs when a slot frees up.
+	stalled[0].Close()
+	select {
+	case err := <-blocked:
+		if err != nil {
+			t.Fatalf("queued push: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the queued push did not run after a slot was freed")
+	}
+}
+
+// A push that trickles its body is cut off at the deadline and its slots are free again.
+func TestRelayPushBodyDeadline(t *testing.T) {
+	re := newRelayEnv(t, testRef)
+	re.relay.pushAllowance = 200 * time.Millisecond
+	re.relay.pushMinRate = 1 << 20 // 1 MiB declared: about 1.2 s in all
+	conn := stalledPush(t, re.sock(testRef), walA)
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	start := time.Now()
+	resp, _ := io.ReadAll(conn) // the relay answers and closes once the deadline has passed
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("the relay held a stalled push for %v", d)
+	}
+	if !strings.Contains(string(resp), "500") {
+		t.Fatalf("response to the stalled push: %q", resp)
+	}
+	if _, err := re.store.Stat(context.Background(), walKey(testRef, walA)); err == nil {
+		t.Fatal("a stalled push produced an archived WAL file")
+	}
+	// Its slot is free: a normal push succeeds at once.
+	if err := RelayPush(context.Background(), re.sock(testRef), testRef, writeWAL(t, walB, 1<<10, 3)); err != nil {
+		t.Fatal(err)
+	}
+}

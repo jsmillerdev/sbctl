@@ -80,8 +80,19 @@ tenant unit cannot read their environment, their `/proc/<pid>/root` (`/etc/sbctl
 `config.toml`) or their memory. The daemon needs the capability for its listeners on ports 80
 and 443; the backup units carry it only for this check. Do not remove it from these units, and do
 not give it to a unit that runs tenant code. (`tests/linux/systemd-smoke.sh` reads the capability
-sets from systemd; the kernel rule is described in `ptrace(2)`.) The processes that stay readable
-from another unit are therefore the tenant-facing ones: every project's Postgres, GoTrue and
+sets from systemd; the kernel rule is described in `ptrace(2)`.)
+
+The CLI is the other case. A command an operator runs (`sudo -u sbctl sbctl ...`: `claim token`,
+`backups`, `projects`) runs in the host mount namespace, so its `/proc/<pid>/root` shows
+`/etc/sbctl/master.key`, `config.toml` and the backups directory, and it holds no capability.
+Every `sbctl` process therefore calls `prctl(PR_SET_DUMPABLE, 0)` first thing in `main`
+(`cmd/sbctl/harden_linux.go`). A non-dumpable process refuses `PTRACE_MODE_READ` to a same-uid
+caller without `CAP_SYS_PTRACE`, and that covers `/proc/<pid>/root`, `environ` and `mem` for the
+whole run of the command, with or without a capability; `exec` resets the flag, so the children
+a command starts (`psql`, `pg_basebackup`) are unaffected. `systemd-smoke.sh` keeps a CLI command
+alive and expects `ls /proc/<pid>/root/etc/sbctl` from inside a tenant unit's cgroup to fail, with
+an ordinary same-uid process as the control that it works. The processes that stay readable from
+another unit are therefore the tenant-facing ones: every project's Postgres, GoTrue and
 PostgREST, and the fleet services.
 
 The WAL relay does not rely on the mount namespace alone, because a process of any unit can
@@ -91,7 +102,12 @@ connection the relay reads the peer's pid (`SO_PEERCRED`) and its cgroup
 `<ref>`, in a `sb-basebackup` unit, or outside every `sb-*` unit (the daemon, an operator's
 shell). Any other `sb-*` unit gets a closed connection, so a tenant cannot push a bogus file under
 a future segment name or read another project's archive. A tenant cannot move itself into another
-unit's cgroup. Where the cgroup cannot be read, the peer is refused. The check is
+unit's cgroup. Where the cgroup cannot be read, the peer is refused. The pid could be reused
+between the connection and the read of its cgroup file; on Linux 6.5 and later the check takes a
+pidfd of the peer (`SO_PEERPIDFD`) and refuses when that process is gone after the read. Older
+kernels (Debian 12 has 6.1) lack the option, and there the check compares the process's start
+time before and after the read, which closes only the window of the read itself; exploiting what
+remains needs code execution in a unit plus a pid race. The check is
 `internal/backup/relay_peer.go`; `systemd-smoke.sh` moves a `curl` into other units' cgroups and
 expects it to be refused.
 

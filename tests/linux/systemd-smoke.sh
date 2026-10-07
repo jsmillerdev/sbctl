@@ -252,6 +252,41 @@ done
 for u in "sb-postgres@$A.service" "sb-gotrue@$A.service" "sb-postgrest@$A.service"; do
   [[ -z $(systemctl show -p AmbientCapabilities --value "$u") ]] || fail "$u holds a capability"
 done
+
+# A CLI command an operator runs (`sudo -u sbctl sbctl ...`) holds no capability. It marks itself
+# non-dumpable at startup, so the kernel refuses its /proc/<pid>/root (the host view, with
+# /etc/sbctl) to a same-uid process of a tenant unit. `sbctl wal push` blocks opening a FIFO
+# that stands in for the WAL file, which keeps a CLI process alive without side effects.
+log "a running CLI command is not dumpable: a tenant unit cannot read its /proc/<pid>/root"
+DUMPDIR=$(mktemp -d); chown "$SBCTL_USER" "$DUMPDIR"
+mkfifo "$DUMPDIR/000000010000000000000099"; chown "$SBCTL_USER" "$DUMPDIR/000000010000000000000099"
+sudo -u "$SBCTL_USER" sleep 120 & SLEEPER=$!   # control: an ordinary same-uid process is dumpable
+sudo -u "$SBCTL_USER" -H /usr/local/bin/sbctl wal push --ref "$A" --socket "$SBCTL_STATE/projects/$A/wal/r.sock" \
+  "$DUMPDIR/000000010000000000000099" >/dev/null 2>&1 & CLIWAIT=$!
+CLIPID=""
+for ((i = 0; i < 30; i++)); do
+  CLIPID=$(pgrep -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' | head -1 || true)
+  # Non-dumpable processes have their /proc/<pid> directory owned by root.
+  [[ -n $CLIPID && $(stat -c %U "/proc/$CLIPID" 2>/dev/null) == root ]] && break
+  CLIPID=""; sleep 1
+done
+SLEEPPID=$(pgrep -u "$SBCTL_USER" -x sleep | head -1 || true)
+tenant_ls() { # PID: `ls /proc/PID/root/etc/sbctl` as the sbctl user from inside the cgroup of A's PostgREST unit
+  local cg; cg=$(systemctl show -p ControlGroup --value "sb-postgrest@$A.service")
+  [[ -n $cg && -w /sys/fs/cgroup$cg/cgroup.procs ]] || fail "sb-postgrest@$A: no writable cgroup ($cg)"
+  bash -c 'echo $$ >"$1" && exec runuser -u "$2" -- ls "/proc/$3/root/etc/sbctl"' _ "/sys/fs/cgroup$cg/cgroup.procs" "$SBCTL_USER" "$1" >/dev/null 2>&1
+}
+if [[ -n $CLIPID && -n $SLEEPPID ]]; then
+  tenant_ls "$SLEEPPID" || { kill "$SLEEPER" "$CLIWAIT" 2>/dev/null || true; fail "control: a tenant unit cannot read an ordinary process's /proc/<pid>/root, so the check below proves nothing"; }
+  tenant_ls "$CLIPID" && { pkill -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true; fail "a tenant unit read the /proc/<pid>/root of a running CLI command"; }
+else
+  fail "the CLI command did not become non-dumpable (cli pid '${CLIPID}', control pid '${SLEEPPID}')"
+fi
+pkill -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true
+kill "$SLEEPER" 2>/dev/null || true
+wait "$CLIWAIT" "$SLEEPER" 2>/dev/null || true
+rm -rf "$DUMPDIR"
+
 log "nightly backup: the sb-basebackup@$A service runs as the timer would"
 systemctl start "sb-basebackup@$A.service" || { journalctl --no-pager -u "sb-basebackup@$A" | tail -30 >&2; fail "$A: sb-basebackup service failed"; }
 [[ $(sbctl backups list "$A" | grep -c completed) -ge 1 ]] || { sbctl backups list "$A" >&2 || true; fail "$A: no completed base backup after the backup service ran"; }

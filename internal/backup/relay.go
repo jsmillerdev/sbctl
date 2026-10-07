@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
@@ -52,6 +53,16 @@ const (
 	relayMaxWAL = 1 << 30
 	// relayConcurrency bounds the transfers served at once across every project.
 	relayConcurrency = 16
+	// relayPerRef bounds the transfers one project's socket serves at once. Postgres
+	// archives and restores one file at a time, so two leave room for a retry that overlaps
+	// its predecessor. Without it one project's postmaster side could hold every slot of
+	// relayConcurrency and stall the archiving of all the others.
+	relayPerRef = 2
+	// A push must deliver its declared Content-Length within relayPushAllowance plus
+	// Content-Length at relayPushMinRate bytes per second, or it is cut off and its slots
+	// are freed. A WAL segment (16 MB) gets about 76 seconds.
+	relayPushAllowance = 60 * time.Second
+	relayPushMinRate   = 1 << 20
 	// relayDrainTimeout bounds how long a push handler reads the unread rest of a request
 	// body before it answers.
 	relayDrainTimeout = 5 * time.Second
@@ -90,6 +101,9 @@ type RelayOptions struct {
 type Relay struct {
 	opt RelayOptions
 	sem chan struct{}
+
+	pushAllowance time.Duration // relayPushAllowance; tests shorten it
+	pushMinRate   int64         // relayPushMinRate
 
 	// A relay never replaces a socket that answers: the daemon and a CLI relay (which serves
 	// while the daemon is down) can run at once, and the one that listens first keeps the
@@ -133,7 +147,7 @@ func NewRelay(o RelayOptions) *Relay {
 	if o.Sources == nil && o.Config != nil {
 		o.Sources = func(ref string) []string { return readRestoreSources(o.Config, ref) }
 	}
-	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), ls: map[string]*relayListener{}, pinned: map[string]bool{}, refMu: map[string]*sync.Mutex{}}
+	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), pushAllowance: relayPushAllowance, pushMinRate: relayPushMinRate, ls: map[string]*relayListener{}, pinned: map[string]bool{}, refMu: map[string]*sync.Mutex{}}
 }
 
 // projectsWithWALDir lists the refs that have a WAL directory under projects/.
@@ -372,10 +386,11 @@ func (r *Relay) service(ctx context.Context) (*Service, error) {
 
 // handler serves one project's socket.
 func (r *Relay) handler(own string) http.Handler {
+	slots := make(chan struct{}, relayPerRef) // this project's share of r.sem
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+relayPingPath, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	mux.HandleFunc("POST "+relayPushPath, func(w http.ResponseWriter, req *http.Request) { r.push(own, w, req) })
-	mux.HandleFunc("GET "+relayFetchPath, func(w http.ResponseWriter, req *http.Request) { r.fetch(own, w, req) })
+	mux.HandleFunc("POST "+relayPushPath, func(w http.ResponseWriter, req *http.Request) { r.push(own, slots, w, req) })
+	mux.HandleFunc("GET "+relayFetchPath, func(w http.ResponseWriter, req *http.Request) { r.fetch(own, slots, w, req) })
 	return mux
 }
 
@@ -385,16 +400,25 @@ func relayError(w http.ResponseWriter, code int, msg string) {
 	io.WriteString(w, msg+"\n")
 }
 
-func (r *Relay) acquire(ctx context.Context) bool {
+// acquire takes one of the project's slots and then one of the relay-wide ones, and returns
+// the function that gives both back. The project's slot comes first, so a project that holds
+// all of its own slots waits alone and never queues for the shared ones.
+func (r *Relay) acquire(ctx context.Context, slots chan struct{}) (release func(), ok bool) {
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, false
+	}
 	select {
 	case r.sem <- struct{}{}:
-		return true
+		return func() { <-r.sem; <-slots }, true
 	case <-ctx.Done():
-		return false
+		<-slots
+		return nil, false
 	}
 }
 
-func (r *Relay) push(own string, w http.ResponseWriter, req *http.Request) {
+func (r *Relay) push(own string, slots chan struct{}, w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	name := q.Get("name")
 	if ref := q.Get("ref"); ref != "" && ref != own {
@@ -419,21 +443,26 @@ func (r *Relay) push(own string, w http.ResponseWriter, req *http.Request) {
 		relayError(w, http.StatusServiceUnavailable, "backup backend unavailable: "+err.Error())
 		return
 	}
-	if !r.acquire(req.Context()) {
+	release, ok := r.acquire(req.Context(), slots)
+	if !ok {
 		return
 	}
-	defer func() { <-r.sem }()
+	defer release()
 	// The body is read to its declared length or the push fails: a client that dies
-	// halfway cannot leave a short segment in the archive.
+	// halfway cannot leave a short segment in the archive. A client that trickles it is
+	// cut off at a deadline that scales with the declared length.
 	rc := http.NewResponseController(w)
 	body := &pushBody{r: http.MaxBytesReader(w, req.Body, relayMaxWAL), rc: rc}
+	_ = rc.SetReadDeadline(time.Now().Add(r.pushAllowance + time.Duration(req.ContentLength)*time.Second/time.Duration(max(r.pushMinRate, 1))))
 	err = svc.PushWALReader(req.Context(), own, name, body)
 	// PushWALReader returns only after nothing reads body any more, so this drain cannot
 	// race with it. Read what is left (a comparison with the archived file stops at the
 	// first difference): a client that is still writing when the answer comes would see a
 	// broken pipe, not the answer. A client that stalls gets a few seconds, not the handler.
-	_ = rc.SetReadDeadline(time.Now().Add(relayDrainTimeout))
-	_, _ = io.Copy(io.Discard, body)
+	if !body.timedOut.Load() { // a client that already missed the deadline gets no second chance
+		_ = rc.SetReadDeadline(time.Now().Add(relayDrainTimeout))
+		_, _ = io.Copy(io.Discard, body)
+	}
 	switch {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
@@ -449,16 +478,27 @@ func (r *Relay) push(own string, w http.ResponseWriter, req *http.Request) {
 // pushBody is the request body of a push. Interrupt makes a Read that is blocked on a
 // slow or stalled client return, so PushWALReader can stop reading before it returns.
 type pushBody struct {
-	r  io.Reader
-	rc *http.ResponseController
+	r        io.Reader
+	rc       *http.ResponseController
+	timedOut atomic.Bool // a read hit the push deadline: the client is too slow
+	stopped  atomic.Bool // Interrupt was called: deadline errors after it are ours
 }
 
-func (b *pushBody) Read(p []byte) (int, error) { return b.r.Read(p) }
+func (b *pushBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if errors.Is(err, os.ErrDeadlineExceeded) && !b.stopped.Load() {
+		b.timedOut.Store(true)
+	}
+	return n, err
+}
 
 // Interrupt fails every pending and later read of the connection until the deadline is set again.
-func (b *pushBody) Interrupt() { _ = b.rc.SetReadDeadline(time.Now()) }
+func (b *pushBody) Interrupt() {
+	b.stopped.Store(true)
+	_ = b.rc.SetReadDeadline(time.Now())
+}
 
-func (r *Relay) fetch(own string, w http.ResponseWriter, req *http.Request) {
+func (r *Relay) fetch(own string, slots chan struct{}, w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	ref, name := q.Get("ref"), q.Get("name")
 	if ref == "" {
@@ -482,10 +522,11 @@ func (r *Relay) fetch(own string, w http.ResponseWriter, req *http.Request) {
 		relayError(w, http.StatusServiceUnavailable, "backup backend unavailable: "+err.Error())
 		return
 	}
-	if !r.acquire(req.Context()) {
+	release, ok := r.acquire(req.Context(), slots)
+	if !ok {
 		return
 	}
-	defer func() { <-r.sem }()
+	defer release()
 	rc, err := svc.OpenWAL(req.Context(), ref, name)
 	if errors.Is(err, ErrNoWAL) {
 		relayError(w, http.StatusNotFound, err.Error())

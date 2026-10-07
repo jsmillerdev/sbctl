@@ -98,16 +98,21 @@ for svc in supavisor realtime storage pgmeta; do
     if sees "sb-$svc.service" "$hidden"; then fail "sb-$svc can read $hidden"; fi
   done
 done
-# Known gap (batch 1 open item, workstream D): `InaccessiblePaths=-<sibling>` only hides
-# files that exist when the unit starts, and the fleet renders each unit's environment file
-# just before it starts that unit, so earlier units see later siblings' files. Reported, not
-# fatal, until the templates switch to an allowlist (TemporaryFileSystem plus BindPaths of
-# the unit's own files); then change this to fail.
-for other in realtime storage pgmeta; do
-  if sees sb-supavisor.service "$SBCTL_STATE/projects/system/$other.env"; then
-    log "WARNING (known, deploy/systemd): sb-supavisor can read $other's environment file"
-  fi
-done
+# The units are allowlists (TemporaryFileSystem=/var/lib/sbctl plus BindPaths of the unit's own
+# run directory), so no shared unit sees any environment file under projects/, its own
+# included (systemd reads EnvironmentFile= before it builds the namespace), nor a sibling's.
+no_env_visible() { # every shared service against every environment file that exists now
+  local svc f n=0
+  for svc in supavisor realtime storage pgmeta; do
+    for f in "$SBCTL_STATE"/projects/*/*.env; do
+      [[ -e $f ]] || continue
+      n=$((n + 1))
+      if sees "sb-$svc.service" "$f"; then fail "sb-$svc can read $f"; fi
+    done
+  done
+  [[ $n -gt 0 ]] || fail "containment check found no environment file to test"
+}
+no_env_visible
 
 log "instance metadata: denied to every shared service, from inside its unit"
 imds_up
@@ -149,9 +154,12 @@ SVC=$(project_field "$REF" 'd["keys"]["service_role_key"]' --show-keys)
 ANON=$(project_field "$REF" 'd["keys"]["anon_key"]' --show-keys)
 HOST="$REF.api.$SBCTL_DOMAIN"
 PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
-sbctl fleet ensure-tenant "$REF" || fail "ensure-tenant (the tenants the daemon registered must make this a no-op)"
+no_env_visible   # now also covers the project's own environment files
 
-log "REST through the proxy with the publishable key"
+# No `sbctl fleet ensure-tenant` anywhere below until the CLI step near the end: every check
+# runs on the tenants the daemon's engine registered when it created the project, and the
+# rotation and the delete are the engine's too.
+log "REST through the proxy with the publishable key (tenants registered by the daemon only)"
 rest_through_proxy "$REF" "$PUB" api
 
 log "Storage through the proxy: bucket, upload and read-back with the secret key"
@@ -262,15 +270,57 @@ if ws_join "$P_REALTIME" "abcdefghijklmnopqrst.realtime.internal" "$ANON" >/dev/
   fail "realtime accepted a token for an unknown tenant"
 fi
 
-log "key rotation reaches the services after ensure-tenant"
+# Helpers shared by the rotation, CLI and delete steps. The pooler login uses sslmode=require.
+pooler_login() { # PORT [STDERR_VAR]: logs in as postgres.$REF with the project's password
+  PGPASSWORD=$DBPW "$PSQL" "host=127.0.0.1 port=$1 user=postgres.$REF dbname=postgres sslmode=require connect_timeout=10" -Atc 'select 1' </dev/null 2>&1
+}
+storage_code() { # KEY: status of GET /bucket on the Storage port for the project's tenant
+  http_code -H "x-forwarded-host: $HOST" -H "Authorization: Bearer $1" "http://127.0.0.1:$P_STORAGE/bucket"
+}
+# tenant_served KEY ANON: the pooler (both ports), Storage and Realtime all serve the tenant.
+tenant_served() {
+  local port
+  for port in $P_SESSION $P_TRANSACTION; do pooler_login "$port" >/dev/null || return 1; done
+  [[ $(storage_code "$1") == 200 ]] || return 1
+  ws_join "$P_REALTIME" "$REF.realtime.internal" "$2" >/dev/null 2>&1
+}
+# tenant_gone KEY ANON: the pooler says the tenant is unknown, Storage and Realtime refuse it.
+tenant_gone() {
+  local port out
+  for port in $P_SESSION $P_TRANSACTION; do
+    out=$(pooler_login "$port") && { log "pooler port $port still serves $REF"; return 1; }
+    grep -qi 'not found' <<<"$out" || { log "pooler port $port refused $REF for another reason: $out"; return 1; }
+  done
+  [[ $(storage_code "$1") != 200 ]] || { log "storage still serves $REF"; return 1; }
+  if ws_join "$P_REALTIME" "$REF.realtime.internal" "$2" >/dev/null 2>&1; then log "realtime still serves $REF"; return 1; fi
+}
+wait_for() { # SECONDS CMD...: retries CMD every second
+  local n=$1 i; shift
+  for ((i = 0; i < n; i++)); do "$@" && return 0; sleep 1; done
+  "$@"
+}
+
+log "key rotation through the engine: the tenants follow without ensure-tenant"
+# The Management API has no rotation endpoint; `sbctl projects rotate-keys` runs the same Engine
+# with the same lazily built fleet as the daemon does for a project create and delete.
+OLDSEC=$SEC
 sbctl projects rotate-keys "$REF" >/dev/null || fail "rotate-keys"
 NEWSVC=$(project_field "$REF" 'd["keys"]["service_role_key"]' --show-keys)
 NEWANON=$(project_field "$REF" 'd["keys"]["anon_key"]' --show-keys)
 [[ $NEWSVC != "$SVC" ]] || fail "rotate-keys changed nothing"
-sbctl fleet ensure-tenant "$REF" || fail "ensure-tenant after rotation"
-[[ $(http_code -H "x-forwarded-host: $HOST" -H "Authorization: Bearer $SVC" "http://127.0.0.1:$P_STORAGE/bucket") != 200 ]] || fail "storage accepts the old service key"
-[[ $(http_code -H "x-forwarded-host: $HOST" -H "Authorization: Bearer $NEWSVC" "http://127.0.0.1:$P_STORAGE/bucket") == 200 ]] || fail "storage rejects the new service key"
+[[ $(storage_code "$SVC") != 200 ]] || fail "storage accepts the old service key"
+[[ $(storage_code "$NEWSVC") == 200 ]] || fail "storage rejects the new service key"
+if ws_join "$P_REALTIME" "$REF.realtime.internal" "$ANON" >/dev/null 2>&1; then fail "realtime accepts the old anon key"; fi
 ws_join "$P_REALTIME" "$REF.realtime.internal" "$NEWANON" || fail "realtime join with the new key"
+for port in $P_SESSION $P_TRANSACTION; do
+  pooler_login "$port" >/dev/null || fail "pooler port $port: login failed after the rotation"
+done
+# The daemon serves the rotated keys through the Management API and the proxy.
+project_keys "$REF"
+[[ $SEC != "$OLDSEC" ]] || fail "the API still lists the old secret key"
+rotated_proxy() { curl -fsS -m 30 -H "Host: $HOST" -H "apikey: $SEC" -H "Authorization: Bearer $SEC" "http://127.0.0.1/storage/v1/bucket" >/dev/null 2>&1; }
+wait_for 20 rotated_proxy || fail "the proxy refuses the new secret key"
+[[ $(http_code -H "Host: $HOST" -H "apikey: $OLDSEC" -H "Authorization: Bearer $OLDSEC" "http://127.0.0.1/storage/v1/bucket") != 200 ]] || fail "the proxy accepts the old secret key"
 
 log "crash recovery: kill -9 each shared service"
 for svc in supavisor realtime storage pgmeta; do
@@ -288,24 +338,23 @@ for svc in supavisor realtime storage pgmeta; do
   log "$u recovered"
 done
 # The tenants live in the services' databases, so they survive the restarts.
-for port in $P_SESSION $P_TRANSACTION; do
-  PGPASSWORD=$DBPW "$PSQL" "host=127.0.0.1 port=$port user=postgres.$REF dbname=postgres sslmode=disable connect_timeout=10" -Atc 'select 1' </dev/null >/dev/null \
-    || fail "pooler port $port: tenant lost after the restart"
-done
-[[ $(http_code -H "x-forwarded-host: $HOST" -H "Authorization: Bearer $NEWSVC" "http://127.0.0.1:$P_STORAGE/bucket") == 200 ]] || fail "storage tenant lost after the restart"
-ws_join "$P_REALTIME" "$REF.realtime.internal" "$NEWANON" || fail "realtime tenant lost after the restart"
+wait_for 30 tenant_served "$NEWSVC" "$NEWANON" || fail "the tenant was lost in the restarts"
 
 fleet_memory "one project registered, after the crash recovery"
-log "remove the tenants, then delete the project through the API"
+
+log "CLI tenant commands, a separate step: remove-tenant, then ensure-tenant again"
 sbctl fleet remove-tenant "$REF" || fail "remove-tenant"
-[[ $(http_code -H "x-forwarded-host: $HOST" -H "Authorization: Bearer $NEWSVC" "http://127.0.0.1:$P_STORAGE/bucket") != 200 ]] || fail "storage still serves a removed tenant"
-if PGPASSWORD=$DBPW "$PSQL" "host=127.0.0.1 port=$P_SESSION user=postgres.$REF dbname=postgres sslmode=disable connect_timeout=10" -Atc 'select 1' </dev/null >/dev/null 2>&1; then
-  fail "pooler still serves a removed tenant"
-fi
+wait_for 20 tenant_gone "$NEWSVC" "$NEWANON" || fail "remove-tenant left the tenant in a service"
+sbctl fleet ensure-tenant "$REF" || fail "ensure-tenant"
+wait_for 30 tenant_served "$NEWSVC" "$NEWANON" || fail "ensure-tenant did not register the tenant again"
+
+log "delete through the Management API: the daemon's engine removes the tenants (no remove-tenant before)"
 papi DELETE "/v1/projects/$REF" -o /dev/null -m 900 || fail "project delete through the API"
 for svc in postgres gotrue postgrest; do
   [[ $(unit_state "sb-$svc@$REF.service") == inactive ]] || fail "sb-$svc@$REF is $(unit_state "sb-$svc@$REF.service") after the delete"
 done
+wait_for 20 tenant_gone "$NEWSVC" "$NEWANON" || fail "the project delete left the tenant in a service"
+sbctl fleet remove-tenant "$REF" || fail "remove-tenant of a deleted project must be a no-op"
 
 log "fleet stop"
 systemctl stop sbctl.service
