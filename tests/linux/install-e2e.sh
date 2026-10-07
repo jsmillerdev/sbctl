@@ -241,8 +241,21 @@ INVITE=$(sbctl users invite invitee@example.com 2>/dev/null)
 [[ $INVITE =~ ^sbi_[0-9a-f]{48}$ ]] || fail "invite token: $INVITE"
 [[ $(api POST /claim -H 'Content-Type: application/json' -d "{\"token\":\"$INVITE\",\"password\":\"$ADMIN_PASSWORD\"}" -o "$WORK/inv.json" -w '%{http_code}') == 201 ]] || { cat "$WORK/inv.json" >&2; fail "redeeming the invite"; }
 sbctl users list | grep invitee@example.com >/dev/null || fail "the invited user is not listed"
+# The invitee signs in and makes a personal access token; `users remove` must end both at once.
+INV_JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
+  -d "{\"email\":\"invitee@example.com\",\"password\":\"$ADMIN_PASSWORD\"}" | jq_ 'd["access_token"]') || fail "the invitee cannot sign in"
+INV_PAT=$(api POST /platform/profile/access-tokens -H "Authorization: Bearer $INV_JWT" -H 'Content-Type: application/json' -d '{"name":"invitee"}' | jq_ 'd["token"]') \
+  || fail "the invitee cannot create a personal access token"
+[[ $(api GET /platform/profile -H "Authorization: Bearer $INV_JWT" -o /dev/null -w '%{http_code}') == 200 ]] || fail "the invitee's session is refused before the removal"
+[[ $(api GET /v1/organizations -H "Authorization: Bearer $INV_PAT" -o /dev/null -w '%{http_code}') == 200 ]] || fail "the invitee's token is refused before the removal"
 sbctl users remove invitee@example.com | grep removed >/dev/null || fail "users remove"
 if sbctl users list | grep invitee@example.com >/dev/null; then fail "the removed user is still listed"; fi
+[[ $(api GET /platform/profile -H "Authorization: Bearer $INV_JWT" -o /dev/null -w '%{http_code}') == 401 ]] || fail "the removed user's session still works (it is valid for an hour)"
+[[ $(api GET /v1/organizations -H "Authorization: Bearer $INV_PAT" -o /dev/null -w '%{http_code}') == 401 ]] || fail "the removed user's personal access token still works"
+[[ $(api POST /platform/profile/access-tokens -H "Authorization: Bearer $INV_JWT" -H 'Content-Type: application/json' -d '{"name":"after"}' -o /dev/null -w '%{http_code}') == 401 ]] \
+  || fail "the removed user's session can still mint a personal access token"
+[[ $(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
+  -d "{\"email\":\"invitee@example.com\",\"password\":\"$ADMIN_PASSWORD\"}" -o /dev/null -w '%{http_code}') =~ ^4 ]] || fail "the removed user can still sign in at GoTrue"
 
 # ---- 5. a project through the API with a PAT ---------------------------------------------
 log "personal access token"
