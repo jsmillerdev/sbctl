@@ -263,8 +263,10 @@ must 200 PATCH "$CFG/config/database/pooler" '{"default_pool_size":null,"max_cli
 pooler_login "$DBPW" || fail "pooler login after the pooler settings were reset"
 
 log "postgres: ALTER SYSTEM settings, an unsafe value, a setting that needs a restart"
-must 200 PUT "$CFG/config/database/postgres" '{"statement_timeout":"45s","work_mem":"8MB"}'
-[[ $(sql "show statement_timeout") == 45s && $(sql "show work_mem") == 8MB ]] || fail "the cluster did not take the settings"
+# (work_mem is part of the project's size and on the command line with the other sizing settings, so a
+# saved one takes effect at the next restart; the settings applied with ALTER SYSTEM show at once.)
+must 200 PUT "$CFG/config/database/postgres" '{"statement_timeout":"45s","log_checkpoints":false}'
+[[ $(sql "show statement_timeout") == 45s && $(sql "show log_checkpoints") == off ]] || fail "the cluster did not take the settings"
 must 400 PUT "$CFG/config/database/postgres" '{"max_connections":3}'
 must 400 PUT "$CFG/config/database/postgres" '{"work_mem":"16"}'
 # Values Postgres takes in ALTER SYSTEM and cannot start with are refused before anything is saved.
