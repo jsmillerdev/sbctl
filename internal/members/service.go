@@ -187,6 +187,17 @@ func (a *Access) membership(org int64) *Membership {
 	return nil
 }
 
+// Membership returns the user's standing in org (a zero Membership when not a member).
+func (a *Access) Membership(org int64) Membership {
+	if m := a.membership(org); m != nil {
+		return *m
+	}
+	return Membership{OrgID: org}
+}
+
+// PermissionsOfRole returns the entries of a base role without organization or project scope.
+func PermissionsOfRole(role int) []Permission { return roleEntries(role, nil) }
+
 // IsMember reports whether the user belongs to the organization.
 func (a *Access) IsMember(org int64) bool { return a.membership(org) != nil }
 

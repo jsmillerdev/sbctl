@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/OWNER/sbctl/internal/api"
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 )
 
@@ -26,6 +28,7 @@ func openAccounts(ctx context.Context) (*api.Accounts, *config.Config, func(), e
 		return nil, nil, nil, fmt.Errorf("the registry is %T, want Postgres", n.Registry)
 	}
 	acc := &api.Accounts{Reg: n.Registry, Store: api.NewPGClaimStore(pg.Pool()), Keys: n.Engine.Keys, Config: n.Cfg, Log: newLogger(n.Cfg)}
+	acc.EnableMembers(n.Registry, api.NewPGStore(pg.Pool()))
 	return acc, n.Cfg, n.Close, nil
 }
 
@@ -36,7 +39,7 @@ func init() {
 		Long: `sb-gotrue@system has public sign-up disabled. The first administrator is created
 with a claim token (single use, expires), on the claim page at https://api.<domain>/claim.
 The installer prints one; ` + "`sbctl claim token`" + ` issues another while nobody has claimed yet.
-Later users come by invitation: ` + "`sbctl users invite <email>`" + `.`,
+Later users come by invitation: ` + "`sbctl users invite <email> --role developer`" + `.`,
 	}
 
 	var (
@@ -103,40 +106,76 @@ file readable only by its owner.`,
 
 	users := &cobra.Command{
 		Use:   "users",
-		Short: "Dashboard users",
-		Long: `The accounts that can sign in to the dashboard and use the Management API. Every
-account is an administrator: members and roles are a later phase.`,
+		Short: "Dashboard users, their roles and invitations",
+		Long: `The accounts that can sign in to the dashboard and use the Management API, and what each
+may do. A member has a role in an organization, as on hosted Supabase:
+
+  owner          everything, including other owners and deleting the organization
+  administrator  everything except organization settings, owners and project transfer
+  developer      project content (data, schema, users, files, functions), no settings or keys
+  read-only      read, and SELECT-only SQL; no service key or JWT secret
+
+A role can also be limited to projects (` + "`--project`" + `). An organization always keeps one owner.
+The dashboard's Team page and the Management API change the same roles.`,
 	}
-	var inviteTTL time.Duration
+	var (
+		inviteTTL     time.Duration
+		inviteRole    string
+		inviteOrg     string
+		inviteProject []string
+	)
 	invite := &cobra.Command{
 		Use:   "invite <email>",
-		Short: "Create an invite token for an address",
-		Long: `Prints an invite token on stdout. The invitee opens https://api.<domain>/claim, enters the
-token and picks a password; the account is created then, with that address. The token
-works once and expires. Inviting the same address again revokes the earlier invite.
-sbctl sends no email: pass the token on yourself.`,
+		Short: "Invite an address to an organization with a role; prints the link",
+		Long: `Invites an address to an organization with a role (default developer) and prints the link to
+give the invitee on stdout. A new address gets the account page: the invitee picks a password
+there and joins with the invited role at once. An address that already has an account gets the
+dashboard's invitation page: sign in and accept. The link works once and expires after seven
+days. Inviting the same address again replaces the earlier invitation.
+
+When [mail] is set in config.toml, sb-gotrue@system also emails the invitation (the link is
+printed either way). Without it sbctl sends no email: pass the link on yourself.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			acc, cfg, closeFn, err := openAccounts(cmd.Context())
+			acc, _, closeFn, err := openAccounts(cmd.Context())
 			if err != nil {
 				return err
 			}
 			defer closeFn()
-			tok, exp, err := acc.IssueInvite(cmd.Context(), args[0], inviteTTL)
+			if inviteTTL > 0 {
+				acc.Members.InvitationTTL = inviteTTL
+			}
+			res, org, err := acc.InviteByEmail(cmd.Context(), args[0], inviteOrg, inviteRole, inviteProject)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), tok)
-			fmt.Fprintf(cmd.ErrOrStderr(), "Claim page: %s/claim\nThe invite works once and expires %s.\n", cfg.APIURL(), exp.Local().Format(time.RFC1123))
+			fmt.Fprintln(cmd.OutOrStdout(), res.Link())
+			scope := ""
+			if len(inviteProject) > 0 {
+				scope = " on " + strings.Join(inviteProject, ", ")
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "Invited %s to %s as %s%s; the link works once and expires %s.\n",
+				res.Invitation.Email, org.Slug, inviteRole, scope, res.Invitation.ExpiresAt.Local().Format(time.RFC1123))
+			if res.Emailed {
+				fmt.Fprintln(cmd.ErrOrStderr(), "The invitation was also sent by email.")
+			} else if res.MailError != "" {
+				fmt.Fprintln(cmd.ErrOrStderr(), "The email could not be sent ("+res.MailError+"); give the invitee the link.")
+			}
+			if res.ClaimURL != "" {
+				fmt.Fprintln(cmd.ErrOrStderr(), "This address has no account yet: the link creates it and accepts the invitation.")
+			}
 			return nil
 		},
 	}
-	invite.Flags().DurationVar(&inviteTTL, "ttl", api.DefaultInviteTTL, "how long the invite stays valid")
+	invite.Flags().StringVar(&inviteRole, "role", "developer", "owner, administrator, developer or read-only")
+	invite.Flags().StringVar(&inviteOrg, "org", "", "organization slug (not needed when there is one)")
+	invite.Flags().StringSliceVar(&inviteProject, "project", nil, "limit the role to these project refs")
+	invite.Flags().DurationVar(&inviteTTL, "ttl", members.DefaultInvitationTTL, "how long the invitation stays valid")
 
 	var asJSON bool
 	list := &cobra.Command{
 		Use:   "list",
-		Short: "List dashboard users",
+		Short: "List dashboard users and their roles",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			acc, _, closeFn, err := openAccounts(cmd.Context())
@@ -148,29 +187,74 @@ sbctl sends no email: pass the token on yourself.`,
 			if err != nil {
 				return err
 			}
+			type row struct {
+				api.DashboardUser
+				Roles []string `json:"roles"`
+			}
+			rows := make([]row, 0, len(us))
+			for _, u := range us {
+				roles, err := acc.UserRoles(cmd.Context(), u.ID)
+				if err != nil {
+					return err
+				}
+				rows = append(rows, row{u, roles})
+			}
 			if asJSON {
-				return printJSON(cmd.OutOrStdout(), us)
+				return printJSON(cmd.OutOrStdout(), rows)
 			}
 			t := newTable(cmd.OutOrStdout())
-			fmt.Fprintln(t, "EMAIL\tADMIN\tCREATED\tLAST SIGN-IN")
-			for _, u := range us {
+			fmt.Fprintln(t, "EMAIL\tROLES\tCREATED\tLAST SIGN-IN")
+			for _, u := range rows {
 				last := "never"
 				if u.LastSignIn != nil {
 					last = u.LastSignIn.Local().Format("2006-01-02 15:04")
 				}
-				fmt.Fprintf(t, "%s\t%v\t%s\t%s\n", u.Email, u.Admin, u.CreatedAt.Local().Format("2006-01-02"), last)
+				roles := strings.Join(u.Roles, ", ")
+				if roles == "" {
+					roles = "none"
+				}
+				fmt.Fprintf(t, "%s\t%s\t%s\t%s\n", u.Email, roles, u.CreatedAt.Local().Format("2006-01-02"), last)
 			}
 			return t.Flush()
 		},
 	}
 	list.Flags().BoolVar(&asJSON, "json", false, "print JSON")
 
+	var roleOrg string
+	role := &cobra.Command{
+		Use:   "role <email> <role>",
+		Short: "Set the organization-wide role of a dashboard user",
+		Long: `Sets a user's role in an organization (owner, administrator, developer or read-only) and adds
+the user to the organization when they are not a member. It is how to give an organization an
+owner again after the last one was removed with --force. The last owner of an organization cannot
+be demoted.`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			acc, _, closeFn, err := openAccounts(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer closeFn()
+			org, err := acc.SetRole(cmd.Context(), args[0], roleOrg, args[1])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s is now %s in %s\n", args[0], args[1], org.Slug)
+			return nil
+		},
+	}
+	role.Flags().StringVar(&roleOrg, "org", "", "organization slug (not needed when there is one)")
+
+	var forceRemove bool
 	remove := &cobra.Command{
 		Use:   "remove <email>",
-		Short: "Delete a dashboard user and the access tokens they created",
-		Long: `Deletes the account from sb-gotrue@system and every personal access token it created
-(a token is not re-checked against its owner's account, so it would keep working).
-Sessions already issued by GoTrue expire within an hour.`,
+		Short: "Delete a dashboard user, their memberships and the access tokens they created",
+		Long: `Deletes the account from sb-gotrue@system, the user's memberships and roles, and every
+personal access token it created (a token is not re-checked against its owner's account, so it
+would keep working). Sessions already issued by GoTrue expire within an hour.
+
+An organization always keeps an owner: removing the only owner of an organization is refused
+unless --force is given.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			acc, _, closeFn, err := openAccounts(cmd.Context())
@@ -178,7 +262,7 @@ Sessions already issued by GoTrue expire within an hour.`,
 				return err
 			}
 			defer closeFn()
-			n, err := acc.RemoveUser(cmd.Context(), args[0], force)
+			n, err := acc.RemoveUser(cmd.Context(), args[0], forceRemove)
 			if err != nil {
 				return err
 			}
@@ -186,6 +270,75 @@ Sessions already issued by GoTrue expire within an hour.`,
 			return nil
 		},
 	}
-	users.AddCommand(invite, list, remove)
+	remove.Flags().BoolVar(&forceRemove, "force", false, "also remove the only owner of an organization")
+
+	defaults := &cobra.Command{
+		Use:   "default-role",
+		Short: "The role a user gets on the first SSO sign-in, by email domain",
+		Long: `When single sign-on is set up, a user who signs in for the first time becomes a member of the
+organization and role that their email domain maps to here. A domain without a rule gets no
+access until an administrator invites them.`,
+	}
+	var defOrg string
+	defSet := &cobra.Command{
+		Use:   "set <domain> <role>",
+		Short: "Map an email domain to a role",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			acc, _, closeFn, err := openAccounts(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer closeFn()
+			org, err := acc.SetDomainDefault(cmd.Context(), args[0], defOrg, args[1])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s signs in as %s in %s\n", args[0], args[1], org.Slug)
+			return nil
+		},
+	}
+	defSet.Flags().StringVar(&defOrg, "org", "", "organization slug (not needed when there is one)")
+	defList := &cobra.Command{
+		Use:   "list",
+		Short: "List the rules",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			acc, _, closeFn, err := openAccounts(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer closeFn()
+			rules, err := acc.Members.DomainDefaults(cmd.Context())
+			if err != nil {
+				return err
+			}
+			t := newTable(cmd.OutOrStdout())
+			fmt.Fprintln(t, "DOMAIN\tORGANIZATION\tROLE")
+			for _, r := range rules {
+				slug := fmt.Sprint(r.OrgID)
+				if o, err := acc.Reg.GetOrganizationByID(cmd.Context(), r.OrgID); err == nil {
+					slug = o.Slug
+				}
+				fmt.Fprintf(t, "%s\t%s\t%s\n", r.Domain, slug, strings.ToLower(members.RoleName(r.RoleID)))
+			}
+			return t.Flush()
+		},
+	}
+	defRemove := &cobra.Command{
+		Use:   "remove <domain>",
+		Short: "Delete a rule",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			acc, _, closeFn, err := openAccounts(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer closeFn()
+			return acc.Members.RemoveDomainDefault(cmd.Context(), args[0])
+		},
+	}
+	defaults.AddCommand(defSet, defList, defRemove)
+	users.AddCommand(invite, list, role, remove, defaults)
 	rootCmd.AddCommand(users)
 }

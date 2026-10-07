@@ -45,13 +45,7 @@ func NewMembers(reg registry.Registry, accounts *Accounts, now func() time.Time,
 
 // liveRefs keeps the refs of projects that exist, for invitations that name projects.
 func (s *Server) liveRefs(ctx context.Context, refs []string) []string {
-	var out []string
-	for _, ref := range refs {
-		if p, err := s.reg.GetProject(ctx, ref); err == nil && p.Ref != config.SystemRef {
-			out = append(out, ref)
-		}
-	}
-	return out
+	return liveRefs(ctx, s.reg, refs)
 }
 
 // UserCreatedAt returns when the dashboard account was created, from sb-gotrue@system.
@@ -197,4 +191,149 @@ func (a *Accounts) sendInvitation(ctx context.Context, email string, existing *D
 // goTrueAnon calls a public GoTrue endpoint (no service key).
 func (a *Accounts) goTrueAnon(ctx context.Context, method, path string, body any) (int, error) {
 	return a.goTrue(ctx, method, path, body, nil)
+}
+
+// EnableMembers gives accounts (built outside the server, as the CLI does) the roles service
+// and the user store, so that inviting, listing and removing users work with roles.
+func (a *Accounts) EnableMembers(reg registry.Registry, users Store) {
+	a.Users = users
+	a.Members = NewMembers(reg, a, a.Now, a.Log)
+	a.LiveRefs = func(ctx context.Context, refs []string) []string { return liveRefs(ctx, reg, refs) }
+}
+
+func liveRefs(ctx context.Context, reg registry.Registry, refs []string) []string {
+	var out []string
+	for _, ref := range refs {
+		if p, err := reg.GetProject(ctx, ref); err == nil && p.Ref != config.SystemRef {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
+// orgBySlugOrOnly resolves --org: the slug, or the only organization when slug is empty.
+func (a *Accounts) orgBySlugOrOnly(ctx context.Context, slug string) (members.OrgRef, error) {
+	if slug != "" {
+		o, err := a.Reg.GetOrganization(ctx, slug)
+		if err != nil {
+			return members.OrgRef{}, fmt.Errorf("no organization %q", slug)
+		}
+		return members.OrgRef{ID: o.ID, Slug: o.Slug}, nil
+	}
+	orgs, err := a.Reg.ListOrganizations(ctx)
+	if err != nil {
+		return members.OrgRef{}, err
+	}
+	switch len(orgs) {
+	case 0:
+		return members.OrgRef{}, errors.New("there is no organization yet; claim the node first (`sbctl claim token`)")
+	case 1:
+		return members.OrgRef{ID: orgs[0].ID, Slug: orgs[0].Slug}, nil
+	}
+	var slugs []string
+	for _, o := range orgs {
+		slugs = append(slugs, o.Slug)
+	}
+	return members.OrgRef{}, fmt.Errorf("there are several organizations (%s); name one with --org", strings.Join(slugs, ", "))
+}
+
+// InviteByEmail is `sbctl users invite`: the operator invites an address to an organization.
+func (a *Accounts) InviteByEmail(ctx context.Context, email, orgSlug, role string, projectRefs []string) (*InviteResult, members.OrgRef, error) {
+	ro, err := members.ParseRole(role)
+	if err != nil {
+		return nil, members.OrgRef{}, err
+	}
+	org, err := a.orgBySlugOrOnly(ctx, orgSlug)
+	if err != nil {
+		return nil, org, err
+	}
+	for _, ref := range projectRefs {
+		p, err := a.Reg.GetProject(ctx, ref)
+		if err != nil || p.OrgID != org.ID {
+			return nil, org, fmt.Errorf("project %s is not in organization %s", ref, org.Slug)
+		}
+	}
+	res, err := a.InviteToOrganization(ctx, nil, org, members.InviteInput{Email: email, RoleID: ro.ID, Refs: projectRefs})
+	if errors.Is(err, members.ErrAlreadyMember) {
+		return nil, org, fmt.Errorf("%s is already a member of %s; change the role with `sbctl users role`", email, org.Slug)
+	}
+	return res, org, err
+}
+
+// SetRole is `sbctl users role`: the operator sets the organization-wide role of an account,
+// adding the account to the organization when it is not a member. It is how an organization
+// that lost every Owner gets one back. The last Owner still cannot be demoted.
+func (a *Accounts) SetRole(ctx context.Context, email, orgSlug, role string) (members.OrgRef, error) {
+	ro, err := members.ParseRole(role)
+	if err != nil {
+		return members.OrgRef{}, err
+	}
+	org, err := a.orgBySlugOrOnly(ctx, orgSlug)
+	if err != nil {
+		return org, err
+	}
+	email, err = normalizeEmail(email)
+	if err != nil {
+		return org, err
+	}
+	u, err := a.findUser(ctx, email)
+	if err != nil {
+		return org, err
+	}
+	if u == nil {
+		return org, fmt.Errorf("no dashboard user %s", email)
+	}
+	if _, err := a.Members.Store.GetMember(ctx, org.ID, u.ID); errors.Is(err, members.ErrNotFound) {
+		return org, a.Members.Store.Update(ctx, org.ID, func(ops members.Ops) error {
+			return ops.PutMember(ctx, members.Member{OrgID: org.ID, UserID: u.ID, RoleID: ro.ID})
+		})
+	} else if err != nil {
+		return org, err
+	}
+	return org, a.Members.SetOrgRole(ctx, nil, org, u.ID, ro.ID)
+}
+
+// UserRoles describes where a dashboard user belongs, for `sbctl users list`: one entry per
+// organization, "acme:owner" or "acme:developer(2 projects)".
+func (a *Accounts) UserRoles(ctx context.Context, userID string) ([]string, error) {
+	ms, err := a.Members.Store.MembershipsOf(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	prs, err := a.Members.Store.ProjectRolesOf(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, m := range ms {
+		o, err := a.Reg.GetOrganizationByID(ctx, m.OrgID)
+		if err != nil {
+			continue
+		}
+		parts := []string{}
+		if m.RoleID != 0 {
+			parts = append(parts, strings.ToLower(members.RoleName(m.RoleID)))
+		}
+		for _, r := range prs {
+			if r.OrgID == m.OrgID {
+				parts = append(parts, fmt.Sprintf("%s(%d project%s)", strings.ToLower(members.RoleName(r.BaseRoleID)), len(r.Refs), map[bool]string{true: "", false: "s"}[len(r.Refs) == 1]))
+			}
+		}
+		out = append(out, o.Slug+":"+strings.Join(parts, "+"))
+	}
+	return out, nil
+}
+
+// SetDomainDefault is `sbctl users default-role set`: the organization and role an SSO user
+// gets on a first sign-in from this email domain.
+func (a *Accounts) SetDomainDefault(ctx context.Context, domain, orgSlug, role string) (members.OrgRef, error) {
+	ro, err := members.ParseRole(role)
+	if err != nil {
+		return members.OrgRef{}, err
+	}
+	org, err := a.orgBySlugOrOnly(ctx, orgSlug)
+	if err != nil {
+		return org, err
+	}
+	return org, a.Members.SetDomainDefault(ctx, domain, org.ID, ro.ID)
 }

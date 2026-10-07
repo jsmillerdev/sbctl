@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -34,6 +35,7 @@ func (s *Server) routesMembers(add func(string, handlerFunc)) {
 	add("PATCH /platform/organizations/{slug}/members/mfa/enforcement", s.setMFA)
 	add("GET /platform/organizations/{slug}/roles", s.platformRoles)
 	add("GET /platform/profile/permissions", s.permissions)
+	add("GET /platform/profile/permissions/v2", s.permissionsV2)
 	add("GET /platform/projects/{ref}/members", s.projectMembers)
 
 	add("GET /v1/organizations/{slug}/members", s.v1Members)
@@ -382,6 +384,72 @@ func (s *Server) permissions(w http.ResponseWriter, r *http.Request) error {
 		refs[i] = orgRef(&orgs[i])
 	}
 	writeJSON(w, http.StatusOK, s.permissionRows(r.Context(), a.Permissions(refs)))
+	return nil
+}
+
+// roleLabel is the role name of the v2 permission summary.
+func roleLabel(base int) string {
+	switch base {
+	case members.RoleOwner:
+		return "owner"
+	case members.RoleAdministrator:
+		return "administrator"
+	case members.RoleDeveloper:
+		return "developer"
+	case members.RoleReadOnly:
+		return "readonly"
+	}
+	return "member"
+}
+
+// allowedActions lists the actions the entries grant, for the v2 summary.
+func allowedActions(perms []members.Permission) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, p := range perms {
+		if p.Restrictive {
+			continue
+		}
+		for _, a := range p.Actions {
+			if !seen[a] {
+				seen[a] = true
+				out = append(out, a)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// permissionsV2 summarizes the caller's role per organization and per project.
+func (s *Server) permissionsV2(w http.ResponseWriter, r *http.Request) error {
+	a, err := s.callerAccess(r)
+	if err != nil {
+		return err
+	}
+	orgs, err := s.memberOrgs(r)
+	if err != nil {
+		return err
+	}
+	list := []any{}
+	for i := range orgs {
+		ref := orgRef(&orgs[i])
+		m := a.Membership(orgs[i].ID)
+		entry := map[string]any{"slug": orgs[i].Slug, "role": roleLabel(m.RoleID), "projects": []any{},
+			"permissions": allowedActions(a.Permissions([]members.OrgRef{ref}))}
+		var projects []any
+		for _, sr := range m.Scoped {
+			for _, pref := range sr.Refs {
+				projects = append(projects, map[string]any{"ref": pref, "role": roleLabel(sr.BaseRoleID),
+					"permissions": allowedActions(members.PermissionsOfRole(sr.BaseRoleID))})
+			}
+		}
+		if projects != nil {
+			entry["projects"] = projects
+		}
+		list = append(list, entry)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"organizations": list})
 	return nil
 }
 

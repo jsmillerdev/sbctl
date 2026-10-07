@@ -433,6 +433,18 @@ func TestMemberAndRoleRoutesFollowTheSpecs(t *testing.T) {
 	rf.status(403, "scoped", "POST", "/v1/projects/"+secondRef+"/secrets", []any{})
 	rf.status(200, "owner", "DELETE", m+"/"+rf.ids["scoped"]+"/roles/"+itoa(int64(roID)), nil)
 	rf.status(403, "scoped", "GET", "/platform/projects/"+secondRef, nil)
+	// The role summary per organization and project.
+	for role, want := range map[string]string{"owner": "owner", "admin": "administrator", "dev": "developer", "ro": "readonly", "scoped": "member"} {
+		rec := rf.status(200, role, "GET", "/platform/profile/permissions/v2", nil)
+		validateAgainstSpec(t, "GET /platform/profile/permissions/v2", rec.Body.Bytes())
+		orgs := body[map[string]any](t, rec)["organizations"].([]any)
+		if len(orgs) != 1 || orgs[0].(map[string]any)["role"] != want {
+			t.Errorf("%s: %v", role, orgs)
+		}
+	}
+	if rec := rf.status(200, "scoped", "GET", "/platform/profile/permissions/v2", nil); !strings.Contains(rec.Body.String(), `"role":"developer"`) {
+		t.Errorf("the scoped member's project role is listed: %s", rec.Body)
+	}
 	// Bad input.
 	rf.status(400, "owner", "PATCH", m+"/"+rf.ids["dev"], map[string]any{"role_id": 99})
 	rf.status(400, "owner", "PATCH", m+"/"+rf.ids["dev"], map[string]any{"role_id": 3, "role_scoped_projects": []string{"zzzzzzzzzzzzzzzzzzzz"}})
