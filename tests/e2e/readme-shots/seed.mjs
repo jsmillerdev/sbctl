@@ -275,7 +275,7 @@ async function createBranch(p, name) {
   await waitFor(`branch ${name}`, async () => {
     const s = (await api('GET', `/v1/branches/${b.id}`)).status
     if (/FAILED/.test(s)) throw new Error(`branch ${name} is ${s}`)
-    return s === 'FUNCTIONS_DEPLOYED'
+    return s === 'MIGRATIONS_PASSED' || s === 'FUNCTIONS_DEPLOYED'
   })
   return b
 }
