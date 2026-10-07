@@ -6,7 +6,9 @@
 # proxy, a Storage upload through the proxy, pooler logins (session and transaction mode, plain and
 # sslmode=require), a Storage bucket, upload and signed-URL download, a Realtime channel join, key
 # rotation, crash recovery of the services, the instance metadata service denied to every shared
-# service, tenant removal with the project's delete through the API.
+# service, a backup of an object (uploaded through the real Storage API) and of an Edge Function
+# (deployed through the Management API) that are deleted and then come back through a restore, as the
+# real services show them, tenant removal with the project's delete through the API.
 #
 #   sudo SUPAVISE_BIN=/path/to/supavise-linux-amd64 tests/linux/fleet-smoke.sh [--teardown]
 #
@@ -43,7 +45,7 @@ fleet_memory() {
 
 # Ports away from anything the runner may already listen on (Postgres on 5432, Node on
 # 3000, ...). The pooler ports are public in production; here they are only loopback traffic.
-P_SESSION=15432 P_TRANSACTION=16543 P_REALTIME=14000 P_STORAGE=15000 P_STORAGE_ADMIN=15001 P_PGMETA=18080 P_API=14001 P_STUDIO=13000
+P_SESSION=15432 P_TRANSACTION=16543 P_REALTIME=14000 P_STORAGE=15000 P_STORAGE_ADMIN=15001 P_PGMETA=18080 P_API=14001 P_STUDIO=13000 P_EDGE=19000
 
 preflight
 install_binary
@@ -58,9 +60,15 @@ storage = $P_STORAGE
 storage_admin = $P_STORAGE_ADMIN
 pgmeta = $P_PGMETA
 studio = $P_STUDIO
+edge_runtime = $P_EDGE
 
 [fleet]
 supavisor_api_port = $P_API
+
+# The Edge Runtime is one of the shared services, so that the backup check can deploy a function.
+[functions]
+enabled = true
+reconcile_seconds = 5
 CONF
 
 log "system init (downloads artifacts)"
@@ -308,6 +316,55 @@ supavise fleet remove-tenant "$REF" || fail "remove-tenant"
 wait_for 20 tenant_gone "$NEWSVC" "$NEWANON" || fail "remove-tenant left the tenant in a service"
 supavise fleet ensure-tenant "$REF" || fail "ensure-tenant"
 wait_for 30 tenant_served "$NEWSVC" "$NEWANON" || fail "ensure-tenant did not register the tenant again"
+
+# What a customer relies on a backup for: an object uploaded through the real Storage API and a function
+# deployed through the Management API are copied by the backup, deleted through the same APIs, and come
+# back through a restore to a time between the backup and the deletes, which the real services then
+# serve. (The restore of the files alone is checked above, with the files lost from the disk.)
+log "backup and restore: an object (Storage API) and a function (Management API)"
+FN_SLUG=restore-check
+FN_BODY='hello from the restored function'
+FN_SRC=$(mktemp)
+printf 'Deno.serve(() => new Response("%s"))\n' "$FN_BODY" >"$FN_SRC"
+[[ $(papi POST "/v1/projects/$REF/functions/deploy?slug=$FN_SLUG" -o /dev/null -w '%{http_code}' \
+  -F "metadata={\"entrypoint_path\":\"index.ts\",\"name\":\"$FN_SLUG\",\"verify_jwt\":false};type=application/json" \
+  -F "file=@$FN_SRC;filename=index.ts") =~ ^20[01]$ ]] || fail "deploying a function through the Management API"
+rm -f "$FN_SRC"
+fn_body() { curl -fsS -m 30 -H "Host: $HOST" "http://127.0.0.1/functions/v1/$FN_SLUG" 2>/dev/null; }
+obj_body() { st_proxy "http://127.0.0.1/storage/v1/object/proxied/restore-check.txt" 2>/dev/null; }
+fn_served() { [[ $(fn_body || true) == "$FN_BODY" ]]; }
+obj_served() { [[ $(obj_body || true) == "an object that a restore brings back" ]]; }
+st_proxy -X POST -H 'Content-Type: text/plain' --data-binary 'an object that a restore brings back' \
+  "http://127.0.0.1/storage/v1/object/proxied/restore-check.txt" >/dev/null || fail "upload through the real Storage API"
+wait_for 90 fn_served || { journalctl --no-pager -u supavise-edge-runtime.service | tail -20 >&2; fail "the deployed function is not served through the proxy"; }
+obj_served || fail "the uploaded object is not served"
+
+supavise backups create "$REF" || fail "backups create $REF"
+[[ $(supavise backups list "$REF" --files | awk '$2 == "functions" && $5 >= 1' | wc -l) -ge 1 ]] || { supavise backups list "$REF" --files >&2 || true; fail "$REF: no function snapshot"; }
+sleep 3
+RESTORE_T=$(date +%s)
+sleep 3
+
+log "delete the object and the function through the APIs"
+st_proxy -X DELETE "http://127.0.0.1/storage/v1/object/proxied/restore-check.txt" >/dev/null || fail "delete the object through the Storage API"
+[[ $(papi DELETE "/v1/projects/$REF/functions/$FN_SLUG" -o /dev/null -w '%{http_code}') == 200 ]] || fail "delete the function through the Management API"
+[[ $(papi GET "/v1/projects/$REF/functions/$FN_SLUG" -o /dev/null -w '%{http_code}') == 404 ]] || fail "the deleted function is still listed"
+! obj_served || fail "the deleted object is still served"
+gone() { ! fn_served; }
+wait_for 60 gone || fail "the deleted function is still served"
+
+log "restore to a time before the deletes through the Management API"
+[[ $(papi POST "/v1/projects/$REF/database/backups/restore-pitr" -H 'Content-Type: application/json' -d "{\"recovery_time_target_unix\":$RESTORE_T}" \
+  -o "$LOG_DIR/restore-pitr.json" -w '%{http_code}') == 201 ]] || { cat "$LOG_DIR/restore-pitr.json" >&2; fail "restore-pitr was refused"; }
+restored() { [[ $(papi GET "/v1/projects/$REF" | json_get 'd["status"]' 2>/dev/null || true) == ACTIVE_HEALTHY ]]; }
+wait_for 900 restored || { journalctl --no-pager -u supavise.service | grep -i restore | tail -20 >&2; fail "$REF is not ACTIVE_HEALTHY after the restore"; }
+[[ -z $(journalctl --no-pager -u supavise.service 2>/dev/null | grep 'msg="restore failed"' | tail -1) ]] || fail "the restore failed"
+
+log "the real services serve the object and the function again"
+wait_for 120 obj_served || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the object did not come back through the Storage API after the restore"; }
+[[ $(papi GET "/v1/projects/$REF/functions/$FN_SLUG" -o /dev/null -w '%{http_code}') == 200 ]] || fail "the function is not listed after the restore"
+wait_for 120 fn_served || { journalctl --no-pager -u supavise-edge-runtime.service | tail -20 >&2; fail "the function did not come back through the Edge Runtime after the restore"; }
+supavise projects health "$REF" || fail "$REF is not healthy after the restore"
 
 log "delete through the Management API: the daemon's engine removes the tenants (no remove-tenant before)"
 papi DELETE "/v1/projects/$REF" -o /dev/null -m 900 || fail "project delete through the API"

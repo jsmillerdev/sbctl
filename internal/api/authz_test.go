@@ -170,6 +170,16 @@ func matrixCases() []routeCase {
 		rc("YYNNNN", "DELETE", p+"/secrets", []any{"FOO"}),
 		rc("YYNNNN", "POST", p+"/api-keys", map[string]any{"type": "publishable", "name": "matrix_key"}),
 		rc("YYNNNN", "PUT", p+"/api-keys/legacy?enabled=true", nil),
+		// custom domains: every role reads them; Owners and Administrators change them
+		rc("YYYYYN", "GET", p+"/custom-hostname", nil),
+		rc("YYYYYN", "GET", p+"/vanity-subdomain", nil),
+		rc("YYYYYN", "POST", p+"/vanity-subdomain/check-availability", map[string]any{"vanity_subdomain": "acme"}),
+		rd("YYNNNN", "POST", p+"/custom-hostname/initialize", map[string]any{"custom_hostname": "docs.example.org"}),
+		rd("YYNNNN", "POST", p+"/custom-hostname/reverify", nil),
+		rd("YYNNNN", "POST", p+"/custom-hostname/activate", nil),
+		rd("YYNNNN", "DELETE", p+"/custom-hostname", nil),
+		rd("YYNNNN", "POST", p+"/vanity-subdomain/activate", map[string]any{"vanity_subdomain": "acme"}),
+		rd("YYNNNN", "DELETE", p+"/vanity-subdomain", nil),
 		// project: database content (Owner, Administrator, Developer)
 		rc("YYYYYN", "POST", p+"/database/query", sql),
 		rc("YYYYYN", "POST", p+"/database/query/read-only", sql),

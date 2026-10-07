@@ -71,7 +71,7 @@ pending restart); no migration is needed.
 - `Delete`/`DeleteWith`: final base backup through `BaseBackuper` (the `FinalBackuper` method
   when it has one, so the manifest says "final"; skipped when nil, for `INIT_FAILED` projects
   and with `SkipFinalBackup`; a paused project's database is started just for it), tenants,
-  route, units, data, registry row. A failed backup keeps the project, except one that wraps
+  route, units, data, the project's Storage objects directory (`<state>/system/storage/objects/stub/<ref>`, removed after the data and only when the record goes too), registry row. A failed backup keeps the project, except one that wraps
   `ErrNoRestorableState` (a restore-as-new clone whose recovery failed or never finished and
   that has no base backup): there is nothing to back up, the delete records
   `project.final_backup_skipped` and goes on. A delete records `project.delete_started` (with
@@ -191,6 +191,10 @@ Choices worth knowing:
   dockerless CLI set it. GoTrue resolves its mailer paths against that URL with an absolute
   path, which would drop `/auth/v1`, so `GOTRUE_MAILER_URLPATHS_{INVITE,CONFIRMATION,
   RECOVERY,EMAIL_CHANGE}` are set to `<API_EXTERNAL_URL>/verify`, as the dockerless CLI does.
+  Once the project has an active custom hostname, or else a vanity subdomain (`internal/domains`), the
+  host is that one instead (`presentedAuthURL`), which also moves the OAuth redirect URIs and the SAML
+  endpoints, as on hosted when a custom domain is activated. `GOTRUE_JWT_ISSUER`, `GOTRUE_SITE_URL` and
+  PostgREST's OpenAPI URI keep the derived values, so adding or removing a domain invalidates no session.
 - `GOTRUE_MAILER_AUTOCONFIRM=true` until SMTP is configured; nobody could confirm an
   address otherwise.
 - The seeder contract: `DataSeeder` fills `<project>/postgres/data`; `postmaster.opts` is

@@ -88,6 +88,7 @@ Shapes follow the self-hosted main service, so clients that parse them keep work
 | no response within `idle_timeout_seconds` | 504 | `IDLE_TIMEOUT` |
 | worker died or threw while answering | 500 | `WORKER_ERROR`, `EDGE_FUNCTION_ERROR`, `INVALID_RESPONSE_STATUS_CODE` |
 | the function answered 5xx itself | as sent | `EDGE_FUNCTION_ERROR` added |
+| the runtime ended the worker (CPU limit) and cancelled the connection before the response above went back | 503, empty body, `x-served-by` header | none (the runtime's own server answers, not this service) |
 
 `OPTIONS` requests skip the token check (browsers send them without credentials). A retired worker is retried up to three times before the request fails. JWT verification is HS256 only (WebCrypto, no remote module, so the main service starts without network access): projects sign with their HS256 secret, and an `ES256` or `RS256` token is `401`. `Authorization: Bearer sb_publishable_...` and `apikey: sb_secret_...` work because the proxy replaces them with the project's JWT in `sb-api-key`, which this service reads.
 

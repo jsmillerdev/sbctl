@@ -33,6 +33,8 @@ const supabase = createClient('https://<ref>.api.<domain>', '<publishable key>')
 
 `<ref>` is the project ID, shown in the dashboard URL and in **Project Settings**. The URL is the only part that differs from supabase.com. Auth, REST, Realtime, Storage and Edge Functions all answer on it.
 
+To serve a project on your own hostname or a short `<name>.api.<domain>` address, use **Project Settings**, **Custom Domains**, or `supabase domains` (see the deploy guide's [custom domains](../deploy/README.md#custom-domains-and-vanity-subdomains)).
+
 ## Use the Supabase CLI
 
 The Supabase CLI reaches a node through a profile file. Print the profile on the node, then save the output as `supavise-profile.yaml` on your machine:

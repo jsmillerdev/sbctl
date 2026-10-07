@@ -73,14 +73,18 @@ PAT=$(<"$PAT_FILE")
 TENANTS=$STATE_DIR/system/edge-runtime/tenants
 export SUPABASE_ACCESS_TOKEN=$PAT SUPABASE_NO_KEYRING=1 DO_NOT_TRACK=1 SUPABASE_DISABLE_UPDATE_CHECK=1
 
-# The CLI reads the API from a profile file; project_host takes no port.
+# The CLI reads the API from a profile file; project_host takes no port. pooler_host is the registrable
+# domain of the pooler host (the CLI compares it with the effective TLD plus one of the pooler URL's
+# host), which only supavise knows how to derive: ask it, as a user would with `supavise api profile`.
 API_HOST=${API_URL#*://}; API_HOST=${API_HOST%%:*}
+POOLER_DOMAIN=$(supavise api profile --format json | jget 'd["pooler_host"]') || fail "supavise api profile"
+[[ -n $POOLER_DOMAIN ]] || fail "supavise api profile printed no pooler_host"
 cat >"$WORK/profile.yaml" <<EOF
 name: supavise-functions-test
 api_url: $API_URL
 dashboard_url: http://127.0.0.1:1
 project_host: $API_HOST
-pooler_host: pooler.${API_HOST#api.}
+pooler_host: $POOLER_DOMAIN
 EOF
 sb() { local dir=$1; shift; (cd "$dir" && supabase --profile="$WORK/profile.yaml" "$@" 2> >(grep -v 'new version\|recommend updating' >&2)); }
 

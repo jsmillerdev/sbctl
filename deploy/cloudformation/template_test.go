@@ -150,7 +150,7 @@ func strList(t *testing.T, v any) []string {
 func TestParametersAreMinimal(t *testing.T) {
 	params := get(t, load(t), "Parameters").(doc)
 	want := []string{"AccessCidr", "AdminEmail", "AmiId", "DailySnapshotsKept", "DataSnapshotId", "DataVolumeSize", "DomainName", "EnableSessionManager",
-		"HostedZoneId", "InstanceType", "KeyName", "SshCidr", "SubnetId", "SupaviseVersion", "VpcId"}
+		"HostedZoneId", "InstanceType", "KeyEscrowPassphrase", "KeyName", "SshCidr", "SubnetId", "SupaviseVersion", "VpcId"}
 	if got := keys(params); !reflect.DeepEqual(got, want) {
 		t.Fatalf("parameters changed (update the README table and this list together):\n got %v\nwant %v", got, want)
 	}
@@ -397,7 +397,7 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 		collect(name, get(t, res, "Properties", "PolicyDocument"))
 	}
 	sort.Strings(policyNames)
-	if want := []string{"DnsPolicy", "SessionManagerPolicy"}; !reflect.DeepEqual(policyNames, want) {
+	if want := []string{"DnsPolicy", "KeyEscrowPolicy", "SessionManagerPolicy"}; !reflect.DeepEqual(policyNames, want) {
 		t.Errorf("IAM policy resources are %v, want %v", policyNames, want)
 	}
 	for _, name := range policyNames {
@@ -411,8 +411,8 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 		"s3:ListBucket": true, "s3:GetBucketLocation": true, "s3:ListBucketMultipartUploads": true,
 		"s3:GetObject": true, "s3:PutObject": true, "s3:DeleteObject": true,
 		"s3:AbortMultipartUpload": true, "s3:ListMultipartUploadParts": true,
-		// the claim token
-		"secretsmanager:PutSecretValue": true,
+		// the claim token (write) and the key escrow passphrase (read once, replace once)
+		"secretsmanager:PutSecretValue": true, "secretsmanager:GetSecretValue": true,
 		// DNS-01 certificates
 		"route53:ChangeResourceRecordSets": true, "route53:ListResourceRecordSets": true, "route53:GetChange": true,
 		// Session Manager channels
@@ -445,8 +445,17 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 					t.Errorf("%s: %s must be scoped to BackupBucket, got %s", s.where, a, s.res)
 				}
 			case strings.HasPrefix(a, "secretsmanager:"):
-				if !strings.Contains(s.res, "ClaimTokenSecret") || a != "secretsmanager:PutSecretValue" {
-					t.Errorf("%s: %s must be PutSecretValue on ClaimTokenSecret only, got %s", s.where, a, s.res)
+				switch {
+				case strings.Contains(s.res, "ClaimTokenSecret"):
+					if a != "secretsmanager:PutSecretValue" {
+						t.Errorf("%s: %s on ClaimTokenSecret: the instance may only write it", s.where, a)
+					}
+				case strings.Contains(s.res, "KeyEscrowSecret"):
+					if a != "secretsmanager:GetSecretValue" && a != "secretsmanager:PutSecretValue" {
+						t.Errorf("%s: %s on KeyEscrowSecret: only Get and Put", s.where, a)
+					}
+				default:
+					t.Errorf("%s: %s must name ClaimTokenSecret (put) or KeyEscrowSecret (get, put), got %s", s.where, a, s.res)
 				}
 			case a == "route53:ChangeResourceRecordSets":
 				if !strings.Contains(s.res, "hostedzone/") || !strings.Contains(s.res, "HostedZoneId") {
@@ -696,6 +705,149 @@ func TestUserDataReplacesTheTokenPlaceholderWhenNoneIsIssued(t *testing.T) {
 	}
 	if regexp.MustCompile(`(?m)^\s*else\b`).MatchString(tail[:strings.Index(tail, "rm -f /root/supavise-install.sh")]) {
 		t.Errorf("an unclaimed node with no new token must leave the secret alone, not take an else branch:\n%s", tail)
+	}
+}
+
+// userDataWithKeyEscrow returns the user data as it reads when KeyEscrowPassphrase is given: the
+// template's own pieces for the passphrase (the map values of the Fn::Sub) are put in place of
+// ${KeyEscrowFetch} and ${KeyEscrowDone}, and the resource references inside them become words.
+func userDataWithKeyEscrow(t *testing.T) string {
+	t.Helper()
+	sub := get(t, resources(t, load(t))["Instance"], "Properties", "UserData", "Fn::Base64", "Fn::Sub").([]any)
+	script := strings.ReplaceAll(sub[0].(string), "${!", "${")
+	vars := sub[1].(doc)
+	for _, name := range []string{"KeyEscrowFetch", "KeyEscrowDone"} {
+		branches := get(t, vars[name], "Fn::If").([]any)
+		if branches[0] != "HasKeyEscrow" {
+			t.Fatalf("%s must depend on HasKeyEscrow, got %v", name, branches[0])
+		}
+		script = strings.ReplaceAll(script, "${"+name+"}", get(t, branches[1], "Fn::Sub").(string))
+	}
+	return regexp.MustCompile(`\$\{[^}]+\}`).ReplaceAllString(script, "X")
+}
+
+// The key escrow passphrase reaches the installer unattended and nowhere else: not user data (which
+// anyone who may describe the instance can read), not a command line (every process on the host
+// reads those), not the bootstrap log.
+func TestKeyEscrowPassphrase(t *testing.T) {
+	d := load(t)
+	r := resources(t, d)
+
+	p := get(t, d, "Parameters", "KeyEscrowPassphrase")
+	if get(t, p, "NoEcho") != true {
+		t.Error("KeyEscrowPassphrase must be NoEcho")
+	}
+	if get(t, p, "Default") != "" {
+		t.Error("KeyEscrowPassphrase is optional: its default is empty")
+	}
+	// The installer refuses fewer than 12 characters; the form should refuse them first.
+	pat := regexp.MustCompile(get(t, p, "AllowedPattern").(string))
+	for _, c := range []struct {
+		in string
+		ok bool
+	}{{"", true}, {"short", false}, {"elevenchars", false}, {"twelve chars", true}, {strings.Repeat("x", 128), true}, {strings.Repeat("x", 129), false}} {
+		if pat.MatchString(c.in) != c.ok {
+			t.Errorf("AllowedPattern on %q (%d characters): got %v, want %v", c.in, len(c.in), !c.ok, c.ok)
+		}
+	}
+
+	// Everything that exists for it is conditional, and the secret has a generated name.
+	for _, name := range []string{"KeyEscrowSecret", "KeyEscrowPolicy"} {
+		if get(t, r[name], "Condition") != "HasKeyEscrow" {
+			t.Errorf("%s must exist only when a passphrase is given", name)
+		}
+	}
+	if has(r["KeyEscrowSecret"], "Properties", "Name") {
+		t.Error("KeyEscrowSecret must have a generated name (a deleted secret's name is reserved for 30 days)")
+	}
+	if ref := get(t, r["KeyEscrowSecret"], "Properties", "SecretString"); !reflect.DeepEqual(ref, doc{"Ref": "KeyEscrowPassphrase"}) {
+		t.Errorf("KeyEscrowSecret holds %v, want the parameter", ref)
+	}
+	// The role may read and replace this secret and nothing else of it.
+	pol := get(t, r["KeyEscrowPolicy"], "Properties", "PolicyDocument")
+	sts := statements(t, pol)
+	if len(sts) != 1 {
+		t.Fatalf("KeyEscrowPolicy has %d statements, want 1", len(sts))
+	}
+	if got := strList(t, get(t, sts[0], "Action")); !reflect.DeepEqual(got, []string{"secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"}) {
+		t.Errorf("KeyEscrowPolicy actions: %v", got)
+	}
+	if res := get(t, sts[0], "Resource"); !reflect.DeepEqual(res, doc{"Ref": "KeyEscrowSecret"}) {
+		t.Errorf("KeyEscrowPolicy resource: %v, want only KeyEscrowSecret", res)
+	}
+
+	// The user data never names the parameter: not in the script, not in the pieces for it.
+	raw, err := os.ReadFile("supavise.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ud := get(t, r["Instance"], "Properties", "UserData")
+	if strings.Contains(fmt.Sprint(ud), "map[Ref:KeyEscrowPassphrase]") || strings.Contains(fmt.Sprint(ud), "${KeyEscrowPassphrase}") {
+		t.Errorf("the user data refers to the KeyEscrowPassphrase parameter, which would put the passphrase in it: %v", ud)
+	}
+	// The one place the parameter is used is the secret.
+	uses := regexp.MustCompile(`!Ref KeyEscrowPassphrase`).FindAllIndex(raw, -1)
+	if len(uses) != 2 { // the Equals of HasKeyEscrow and the SecretString
+		t.Errorf("KeyEscrowPassphrase is referenced %d times, want 2 (HasKeyEscrow, KeyEscrowSecret)", len(uses))
+	}
+
+	// What the script does with it.
+	for _, name := range []string{"without a passphrase", "with a passphrase"} {
+		script := userData(t)
+		if name == "with a passphrase" {
+			script = userDataWithKeyEscrow(t)
+		}
+		if regexp.MustCompile(`(?m)^\s*set\s+-[a-z]*x|xtrace`).MatchString(script) {
+			t.Errorf("%s: the script must not trace its commands (the passphrase would reach the log)", name)
+		}
+		if strings.Contains(script, "--key-passphrase ") || strings.Contains(script, "--passphrase ") {
+			t.Errorf("%s: the passphrase must go in a file, not on a command line", name)
+		}
+	}
+	if strings.Contains(userData(t), "key-passphrase-file") {
+		t.Error("without a passphrase the installer must not be given --key-passphrase-file")
+	}
+	ud2 := userDataWithKeyEscrow(t)
+	for _, want := range []string{
+		"umask 077",              // the file is created root-only
+		"> /root/key-passphrase", // stdout of the read goes to the file, not to the log
+		"--key-passphrase-file /root/key-passphrase", // the installer reads the file
+		"ESCROWED:", // a replaced instance does not escrow under the note
+		"shred -u /root/key-passphrase",
+	} {
+		if !strings.Contains(ud2, want) {
+			t.Errorf("the user data with a passphrase lacks %q", want)
+		}
+	}
+	// The read comes before the installer, the replacement after it, and the file is also removed
+	// when the script ends any other way.
+	read := strings.Index(ud2, "get-secret-value")
+	install := strings.Index(ud2, `bash /root/supavise-install.sh "$@"`)
+	replace := strings.Index(ud2, "--secret-string 'ESCROWED:")
+	if read < 0 || install < read || replace < install {
+		t.Errorf("order wrong: read %d, install %d, replace %d", read, install, replace)
+	}
+	if !regexp.MustCompile(`(?m)^trap '[^']*shred -u /root/key-passphrase[^']*' EXIT$`).MatchString(ud2) {
+		t.Error("the passphrase file must be removed by an EXIT trap too")
+	}
+	// The read prints the secret to the file only: never to the log, which tee copies to the console.
+	for _, line := range strings.Split(ud2, "\n") {
+		if strings.Contains(line, "get-secret-value") && strings.Contains(line, "key-passphrase") && !strings.Contains(line, "> /root/key-passphrase") {
+			t.Errorf("a read of the passphrase that is not sent to the file: %s", line)
+		}
+	}
+	// The note that replaces the passphrase carries no part of it, and says what happened.
+	if !strings.Contains(ud2, "nothing on the node keeps it") && !strings.Contains(ud2, "which nothing on the node keeps") {
+		t.Error("the replacement note should say that nothing on the node keeps the passphrase")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	cmd := exec.Command(bash, "-n")
+	cmd.Stdin = strings.NewReader(ud2)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the user data with a passphrase does not parse as bash: %v\n%s", err, out)
 	}
 }
 
