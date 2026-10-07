@@ -18,7 +18,7 @@ import (
 // branch keeps users and identities (they sign in to the branch again with their passwords) and
 // loses every row that is a bearer secret of the parent's GoTrue.
 //
-// The two lists below cover the auth schema of the GoTrue release pinned in versions.yaml
+// The two lists below cover the auth schema of the GoTrue release pinned in internal/versions/versions.yaml
 // (auth-v2.195.0). A table in neither list is reported in the isolation event
 // (auth_tables_not_reviewed), and the integration test fails on it, so a GoTrue upgrade that adds
 // a table gets looked at.

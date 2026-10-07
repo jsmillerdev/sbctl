@@ -8,11 +8,11 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	supavise "github.com/jsmillerdev/supavise"
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/versions"
 )
 
-// Versions is the parsed versions.yaml: the slim-services release tag of every
+// Versions is the parsed internal/versions/versions.yaml: the slim-services release tag of every
 // artifact, the Studio build tag and the CLI version the conformance suite tested.
 type Versions struct {
 	// Artifacts maps the slim-services release name (config.ArtifactName) to its tag,
@@ -26,7 +26,7 @@ type Versions struct {
 	} `yaml:"cli"`
 }
 
-// ParseVersions parses a versions.yaml document.
+// ParseVersions parses a internal/versions/versions.yaml document.
 func ParseVersions(b []byte) (*Versions, error) {
 	var v Versions
 	if err := yaml.Unmarshal(b, &v); err != nil {
@@ -38,7 +38,7 @@ func ParseVersions(b []byte) (*Versions, error) {
 	return &v, nil
 }
 
-// LoadVersions returns the versions.yaml named by cfg.Artifacts.VersionsFile, or the
+// LoadVersions returns the internal/versions/versions.yaml named by cfg.Artifacts.VersionsFile, or the
 // copy embedded in the binary when that is empty.
 func LoadVersions(cfg *config.Config) (*Versions, error) {
 	if f := cfg.Artifacts.VersionsFile; f != "" {
@@ -48,7 +48,7 @@ func LoadVersions(cfg *config.Config) (*Versions, error) {
 		}
 		return ParseVersions(b)
 	}
-	return ParseVersions(supavise.VersionsYAML)
+	return ParseVersions(versions.VersionsYAML)
 }
 
 // Tag returns the pinned release tag of service svc (a config.Svc* name).

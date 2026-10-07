@@ -140,7 +140,7 @@ the default branch only and a create answers 400. Organization entitlements alre
 
 | Route family | Credentials |
 |---|---|
-| `/platform/*` | GoTrue session JWT from `supavise-gotrue@system`: HS256, signed with the system project's JWT secret (`Manager.Keys("system")`; re-read when a signature fails, at most once every 5 seconds, so a rotation takes effect and garbage tokens cost nothing), audience `authenticated`, an `exp` claim, not anonymous, **and an admin** (below). The session is identified by audience and signature, not by the `role` claim: users created through GoTrue's admin API have an empty `auth.users.role`, so their tokens carry `role: ""` (research/08 section 9); tokens with role `anon` or `service_role` are refused |
+| `/platform/*` | GoTrue session JWT from `supavise-gotrue@system`: HS256, signed with the system project's JWT secret (`Manager.Keys("system")`; re-read when a signature fails, at most once every 5 seconds, so a rotation takes effect and garbage tokens cost nothing), audience `authenticated`, an `exp` claim, not anonymous, **and an admin** (below). The session is identified by audience and signature, not by the `role` claim: users created through GoTrue's admin API have an empty `auth.users.role`, so their tokens carry `role: ""` (docs/research/08 section 9); tokens with role `anon` or `service_role` are refused |
 | `/v1/*`, `/v2/*` | `sbp_` personal access token (`sbp_` + 40 hex, also `sbp_v0_`, `sbp_oauth_`; looked up by `secrets.HashToken`, expiry honored, `last_used_at` touched at most once a minute) **or** a dashboard JWT |
 | `GET /platform/cli/login/{session_id}` | none (the CLI has no token yet); guarded by the verification code |
 
@@ -697,7 +697,7 @@ region code (`config.Region`, default `us-east-1`).
   custom profile it prints a `supabase.com` link; `login --token` works, and the device
   endpoints work when the link is opened on the right host (`cli-login.py` does that).
 - The MCP server derives `get_project_url` from the API host (`*.supabase.red`); the URL it
-  returns is wrong for any custom domain. Upstream fix proposed in `research/05`.
+  returns is wrong for any custom domain. Upstream fix proposed in `docs/research/05`.
 - Parameterized queries are wrapped in a CTE so Postgres serializes the rows (trailing
   semicolons and comments are stripped first). Statements that cannot sit in a CTE (DDL,
   INSERT without RETURNING, SHOW, EXPLAIN) run unwrapped and their rows are marshaled from

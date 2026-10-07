@@ -15,7 +15,7 @@
   <a href="LICENSE"><img alt="license: Apache-2.0" src="brand/readme/badge-license.svg"></a>
   <a href="deploy/README.md#install-on-a-server"><img alt="runs on: Ubuntu 24.04+ | Debian 12+" src="brand/readme/badge-platform.svg"></a>
   <a href="deploy/README.md#install-on-a-server"><img alt="arch: amd64 | arm64" src="brand/readme/badge-arch.svg"></a>
-  <a href="DESIGN.md"><img alt="runs as: systemd units, no Docker" src="brand/readme/badge-docker.svg"></a>
+  <a href="docs/design.md"><img alt="runs as: systemd units, no Docker" src="brand/readme/badge-docker.svg"></a>
 </p>
 
 <p align="center">
@@ -80,7 +80,7 @@ Either way, open the claim URL, enter the token to create your admin account, an
   <img alt="Supavise architecture: Supabase Studio, the Supabase CLI, the MCP server and your apps reach one node over HTTPS; the supavise binary fronts per-project Postgres, Auth and REST plus shared Supavisor, Realtime, Storage, Edge Runtime and Studio; backups go to S3 or local disk" src="brand/readme/architecture-light.svg" width="100%">
 </picture>
 
-One Go program installs Supabase's open-source services and adds what self-hosting lacks: HTTPS, multiple projects, the API that the dashboard and CLI need, and backups. See [how Supavise compares](docs/guide.md#how-supavise-compares) to self-hosted and hosted Supabase, or read the [design](DESIGN.md).
+One Go program installs Supabase's open-source services and adds what self-hosting lacks: HTTPS, multiple projects, the API that the dashboard and CLI need, and backups. See [how Supavise compares](docs/guide.md#how-supavise-compares) to self-hosted and hosted Supabase, or read the [design](docs/design.md).
 
 ## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>License
 

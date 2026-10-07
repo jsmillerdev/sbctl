@@ -9,7 +9,7 @@
 # (shared_buffers, the loaded libraries) fairly between the processes that map them; it
 # is the number to use for sizing. "RSS" sums Rss and counts shared pages once per
 # process, so it overstates a Postgres cluster. memory.current includes page cache and is
-# shown for the slice only. See research/09-footprint.md for the method.
+# shown for the slice only. See docs/research/09-footprint.md for the method.
 #
 # Not run in development. CI runs it on an ephemeral Ubuntu 24.04 VM sized like the target
 # (state the instance type in the results).

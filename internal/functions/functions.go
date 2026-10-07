@@ -2,7 +2,7 @@
 // sources, sealed secrets) where the runtime reads it: for each project, a generation
 // directory per deployed function, a symlink that makes one generation live, and one
 // environment file with the project's keys and secrets. The Deno main service in
-// functions-main/ resolves a request to exactly these files.
+// internal/functions/mainservice/ resolves a request to exactly these files.
 //
 //	<state>/system/edge-runtime/tenants/<ref>/functions-env.json    jwt secret, SUPABASE_* values, secrets (0600)
 //	<state>/system/edge-runtime/tenants/<ref>/functions/<slug>      symlink to .gen/<slug>.<version>.<random>
@@ -405,7 +405,7 @@ type meta struct {
 	Version   int    `json:"version"`
 	VerifyJWT bool   `json:"verify_jwt"`
 	// Kind is "eszip", the only kind there is (main services of older supavise versions also
-	// wrote "source", which functions-main refuses).
+	// wrote "source", which the main service refuses).
 	Kind string `json:"kind"`
 	// Entrypoint is the module specifier inside the bundle (a file URL).
 	Entrypoint string `json:"entrypoint"`

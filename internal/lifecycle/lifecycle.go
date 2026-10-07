@@ -81,7 +81,7 @@ type Usage struct {
 	MemoryBytes uint64
 }
 
-// DataPlane is the per-engine half of Manager (HANDOFF.md section 1). The Postgres
+// DataPlane is the per-engine half of Manager (docs/development/build-plan.md section 1). The Postgres
 // engine runs one cluster plus GoTrue and PostgREST per project.
 type DataPlane interface {
 	Create(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, seed DataSeeder) error

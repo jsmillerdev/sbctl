@@ -5,7 +5,7 @@ name: studio
 on:
   push:
     branches: [main, "ws/**", "integrate/**"]
-    paths: ["studio/**", "versions.yaml", ".github/workflows/studio.yml"]
+    paths: ["studio/**", "internal/versions/versions.yaml", ".github/workflows/studio.yml"]
   workflow_dispatch:
 
 permissions:

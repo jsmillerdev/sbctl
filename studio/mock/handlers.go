@@ -7,7 +7,7 @@ import (
 )
 
 // registerReal adds the hand-written handlers: everything on the P0 flows of
-// research/08-studio-platform-calls.md and what project pages read on open.
+// docs/research/08-studio-platform-calls.md and what project pages read on open.
 func (s *server) registerReal() {
 	s.handle("GET", "/platform/profile", func(w *respWriter, r *http.Request, c *reqCtx) { w.json(200, s.profile(c.user)) })
 	s.handle("POST", "/platform/profile", func(w *respWriter, r *http.Request, c *reqCtx) { w.json(201, s.profile(c.user)) })

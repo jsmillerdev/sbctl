@@ -13,12 +13,12 @@ import (
 	"sort"
 	"strconv"
 
-	functionsmain "github.com/jsmillerdev/supavise/functions-main"
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/functions/mainservice"
 	"github.com/jsmillerdev/supavise/internal/units"
 )
 
-// edgeRuntimeHealthPath is answered by the main service itself (functions-main/src/handler.ts),
+// edgeRuntimeHealthPath is answered by the main service itself (internal/functions/mainservice/src/handler.ts),
 // the same path the Supabase CLI's own functions service probes.
 const edgeRuntimeHealthPath = "/_internal/health"
 
@@ -52,7 +52,7 @@ func MainServiceDir(cfg *config.Config) string {
 }
 
 // edgeRuntimeSpec completes the unit spec of the Edge Runtime. One process serves every
-// project: the main service (functions-main/, embedded in this binary and written to
+// project: the main service (internal/functions/mainservice/, embedded in this binary and written to
 // MainServiceDir) picks the project from the X-Supavise-Project-Ref header the proxy sets,
 // and reads the project's functions and environment from <state>/system/edge-runtime/
 // tenants/<ref>/ (written by internal/functions), inside the unit's own state directory. The runtime listens on loopback only. Flags follow the CLI's
@@ -142,11 +142,11 @@ func realPath(p string) string {
 // mainFiles returns the embedded main service as path to content, paths slash-separated.
 func mainFiles() (map[string][]byte, error) {
 	out := map[string][]byte{}
-	err := fs.WalkDir(functionsmain.Files, ".", func(p string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(mainservice.Files, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
-		b, err := fs.ReadFile(functionsmain.Files, p)
+		b, err := fs.ReadFile(mainservice.Files, p)
 		out[p] = b
 		return err
 	})

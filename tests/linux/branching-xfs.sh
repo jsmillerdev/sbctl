@@ -16,7 +16,7 @@
 #
 # It runs as an unprivileged user (initdb refuses root) and uses sudo only to format and
 # mount the loop file. No Docker, no systemd: the exec supervisor starts the clusters.
-# Linux artifacts come from the releases pinned in versions.yaml, checked against the
+# Linux artifacts come from the releases pinned in internal/versions/versions.yaml, checked against the
 # release's SHA256SUMS.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -45,8 +45,8 @@ trap cleanup EXIT
 
 fetch() { # fetch <artifact> : unpack the pinned release into $unpacked/<tag>-<platform>
   local name=$1 tag
-  tag=$(awk -v re="^  $name:" '$0 ~ re {print $2; exit}' versions.yaml)
-  [[ -n "$tag" ]] || { echo "no artifacts.$name in versions.yaml" >&2; exit 1; }
+  tag=$(awk -v re="^  $name:" '$0 ~ re {print $2; exit}' internal/versions/versions.yaml)
+  [[ -n "$tag" ]] || { echo "no artifacts.$name in internal/versions/versions.yaml" >&2; exit 1; }
   local base="https://github.com/supabase/slim-services/releases/download/${tag}"
   curl -fsSL "$base/${tag}-${platform}.tar.zst" -o "$work/$name.tar.zst"
   curl -fsSL "$base/SHA256SUMS" -o "$work/$name.sums"

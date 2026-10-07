@@ -13,7 +13,7 @@
 # SHA256SUMS next to it.
 #
 # Environment (all optional):
-#   STUDIO_COMMIT         full upstream commit to build (default: the pin below, checked against versions.yaml)
+#   STUDIO_COMMIT         full upstream commit to build (default: the pin below, checked against internal/versions/versions.yaml)
 #   STUDIO_WORK           scratch directory (default studio/.build-cache/work-<platform>)
 #   STUDIO_CACHE          download cache for node (default studio/.build-cache/dl)
 #   STUDIO_OUT            output directory (default studio/dist)
@@ -32,7 +32,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 
 # ---- pins -------------------------------------------------------------------------------------
-# Full commit of the upstream tag in versions.yaml (studio.tag = 2026.10.05-sha-94b8b06). The short
+# Full commit of the upstream tag in internal/versions/versions.yaml (studio.tag = 2026.10.05-sha-94b8b06). The short
 # sha in the tag must be a prefix of this value; bump both together.
 PINNED_COMMIT=94b8b06eb294cf6b217c68d30357566cc8f146d9
 # Build and runtime toolchain. NODE_VERSION is the latest 22.x at the time of writing; the slim
@@ -85,11 +85,11 @@ host_arch() {
 for tool in tar zstd curl; do command -v "$tool" >/dev/null 2>&1 || die "missing tool: $tool"; done
 [[ -n "${STUDIO_PREBUILT:-}" ]] || for tool in git python3; do command -v "$tool" >/dev/null 2>&1 || die "missing tool: $tool"; done
 
-TAG="$(awk '/^studio:/{s=1;next} s&&/^[^ ]/{s=0} s&&/^[ ]+tag:/{print $2; exit}' "$REPO/versions.yaml")"
-[[ -n "$TAG" ]] || die "studio.tag not found in versions.yaml"
+TAG="$(awk '/^studio:/{s=1;next} s&&/^[^ ]/{s=0} s&&/^[ ]+tag:/{print $2; exit}' "$REPO/internal/versions/versions.yaml")"
+[[ -n "$TAG" ]] || die "studio.tag not found in internal/versions/versions.yaml"
 SHORT_SHA="${TAG##*-sha-}"
 COMMIT="${STUDIO_COMMIT:-$PINNED_COMMIT}"
-case "$COMMIT" in "$SHORT_SHA"*) ;; *) die "commit $COMMIT does not match versions.yaml studio.tag $TAG; update PINNED_COMMIT in studio/build.sh" ;; esac
+case "$COMMIT" in "$SHORT_SHA"*) ;; *) die "commit $COMMIT does not match internal/versions/versions.yaml studio.tag $TAG; update PINNED_COMMIT in studio/build.sh" ;; esac
 PATCHSET="$(tr -d '[:space:]' < "$HERE/PATCHSET")"
 ARTIFACT="supavise-studio-${TAG}-p${PATCHSET}-${PLATFORM}.tar.zst"
 
@@ -215,7 +215,7 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
     ' "$HERE/placeholders.json")
   export NEXT_PUBLIC_IS_PLATFORM=true
   # prod: hides internal-only UI and keeps consent-gated telemetry off. Never local or staging,
-  # which auto-grant telemetry consent (research/05 section 4.5).
+  # which auto-grant telemetry consent (docs/research/05 section 4.5).
   export NEXT_PUBLIC_ENVIRONMENT=prod
   export STUDIO_FRAMEWORK=next
   # Heap cap for each node process (the next build driver and its prerender workers). Turbopack's

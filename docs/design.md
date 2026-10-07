@@ -1,6 +1,6 @@
 # Multi-tenant self-hosted Supabase: final design
 
-Status: v1.0, 2026-10-06. Supersedes v0.1 (topology) and v0.2 (thin edition). Evidence lives in `research/` (00 synthesis, 01 to 04 landscape and component audit, 05 to 07 verification). Marked *analysis* where a claim is ours rather than sourced.
+Status: v1.0, 2026-10-06. Supersedes v0.1 (topology) and v0.2 (thin edition). Evidence lives in `docs/research/` (00 synthesis, 01 to 04 landscape and component audit, 05 to 07 verification). Marked *analysis* where a claim is ours rather than sourced.
 
 ## 1. In one paragraph
 
@@ -41,10 +41,10 @@ supavise
 ├── api/         /v1, /v2, /platform  (types generated from Supabase's OpenAPI specs)
 ├── proxy/       HTTPS :443 + ACME (CertMagic); host -> ref; apikey and sb_* key handling;
 │                /rest /auth /graphql -> project units; /realtime /storage /functions -> fleet
-├── units/       renders systemd template units + env files from versions.yaml; MemoryMax/CPUQuota
+├── units/       renders systemd template units + env files from internal/versions/versions.yaml; MemoryMax/CPUQuota
 ├── lifecycle/   create, pause, resume, delete, rotate-keys, upgrade; tenant calls to fleet APIs
 ├── backup/      archive_command and restore_command are `supavise wal push|fetch`; nightly basebackup
-├── artifacts/   fetch + verify slim-services tar.zst per versions.yaml
+├── artifacts/   fetch + verify slim-services tar.zst per internal/versions/versions.yaml
 └── cli/         supavise install | projects | backups | self-update
 ```
 
@@ -89,13 +89,13 @@ Management API subset: `/v1` projects, api-keys, `database/query`, migrations, `
 curl -fsSL https://get.<name>.dev | sudo bash -s -- --domain example.com --dns cloudflare
 ```
 
-The installer verifies checksums, creates the `supavise` user, writes `/etc/supavise/config.toml`, installs the units, starts `supavise`, and prints the dashboard URL and claim token. Re-running is idempotent and keeps secrets. `supavise self-update` upgrades the binary; artifacts upgrade through `versions.yaml`.
+The installer verifies checksums, creates the `supavise` user, writes `/etc/supavise/config.toml`, installs the units, starts `supavise`, and prints the dashboard URL and claim token. Re-running is idempotent and keeps secrets. `supavise self-update` upgrades the binary; artifacts upgrade through `internal/versions/versions.yaml`.
 
 Laptops are not a target. Supabase's own `supabase start --runtime native` already covers local development with the same artifacts, and a project exported from it restores into `supavise`.
 
 ## 8. Staying in sync
 
-1. `versions.yaml` pins every artifact release and the Studio tag. A bot opens a bump PR per upstream self-hosted release.
+1. `internal/versions/versions.yaml` pins every artifact release and the Studio tag. A bot opens a bump PR per upstream self-hosted release.
 2. The conformance suite stands up a node, creates two projects, and runs the upstream client test suites and Studio smoke tests against both. Green merges.
 3. The three Studio patches rebase in CI on each tag and are proposed upstream.
 4. Nightly diff of the `v1`, `v2` and `platform` OpenAPI specs against our server.
@@ -134,7 +134,7 @@ Self-hosted Supabase has no branching; hosted gives every branch its own Postgre
 
 ## 11. Phases
 
-Ordering only, no dates. The workstream split and shared conventions for parallel agents are in `HANDOFF.md`.
+Ordering only, no dates. The workstream split and shared conventions for parallel agents are in `docs/development/build-plan.md`.
 
 0. **Spike.** Build platform-mode Studio with the three patches. Generate a mock `/platform` and `/v1` from the specs. Sign in, list two projects, open the table editor on each, run SQL, `supabase link`, MCP `list_tables`. Exit: the captured list of endpoints Studio calls and which tolerate stubs.
 1. **Single-node v1.** `supavise` proxy, ACME, units, artifact fetch, lifecycle, fleet tenant calls, P0 API subset, WAL archiving and restore, installer, conformance suite. Exit: Auth, REST, Realtime, Storage and Studio at parity on Ubuntu 24.04; measured Linux footprint at 10, 25 and 50 projects.
