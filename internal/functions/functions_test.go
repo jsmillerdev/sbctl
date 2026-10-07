@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -37,6 +38,18 @@ type env struct {
 	mu   sync.Mutex
 	keys map[string]*secrets.ProjectKeys
 	now  time.Time
+	// loads counts FunctionFiles calls: loading the files of a function is the expensive step.
+	loads atomic.Int64
+}
+
+type countingStore struct {
+	Store
+	n *atomic.Int64
+}
+
+func (c countingStore) FunctionFiles(ctx context.Context, ref, slug string) ([]api.FunctionFile, error) {
+	c.n.Add(1)
+	return c.Store.FunctionFiles(ctx, ref, slug)
 }
 
 func newEnv(t *testing.T) *env {
@@ -51,7 +64,7 @@ func newEnv(t *testing.T) *env {
 	cfg.TLS.Mode = "off"
 	e := &env{t: t, cfg: cfg, reg: registry.NewMemory(), store: api.NewMemoryStore(), sec: sec,
 		keys: map[string]*secrets.ProjectKeys{}, now: time.Now()}
-	s, err := New(Deps{Cfg: cfg, Registry: e.reg, Secrets: sec, Store: e.store, Now: func() time.Time {
+	s, err := New(Deps{Cfg: cfg, Registry: e.reg, Secrets: sec, Store: countingStore{e.store, &e.loads}, Now: func() time.Time {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		return e.now
@@ -86,7 +99,33 @@ func (e *env) addProject(ref string, status registry.Status) *registry.Project {
 	return p
 }
 
-func (e *env) deploy(ref, slug string, verify bool, files map[string]string) *api.Function {
+// eszipOf is the plain "eszip" these tests store for a function whose code is code.
+func eszipOf(code string) string { return "ESZIP2.3 " + code }
+
+// bundleOf is what the CLI uploads for it: "EZBR" and a Brotli stream.
+func bundleOf(code string) []byte {
+	var buf bytes.Buffer
+	w := brotli.NewWriter(&buf)
+	_, _ = w.Write([]byte(eszipOf(code)))
+	_ = w.Close()
+	return append([]byte("EZBR"), buf.Bytes()...)
+}
+
+func entryOf(slug string) string { return "file:///src/" + slug + "/index.ts" }
+
+// deploy stores a bundled function (what `supabase functions deploy` uploads).
+func (e *env) deploy(ref, slug string, verify bool, code string) *api.Function {
+	e.t.Helper()
+	f := &api.Function{Ref: ref, Slug: slug, Name: slug, Status: "ACTIVE", VerifyJWT: verify, EntrypointPath: entryOf(slug)}
+	files := []api.FunctionFile{{Path: api.BundleFileName, Content: bundleOf(code)}}
+	if err := e.store.UpsertFunction(context.Background(), f, files); err != nil {
+		e.t.Fatal(err)
+	}
+	return f
+}
+
+// deploySource stores source files (what `supabase functions deploy --use-api` uploads).
+func (e *env) deploySource(ref, slug string, verify bool, files map[string]string) *api.Function {
 	e.t.Helper()
 	f := &api.Function{Ref: ref, Slug: slug, Name: slug, Status: "ACTIVE", VerifyJWT: verify, EntrypointPath: "supabase/functions/" + slug + "/index.ts"}
 	var ff []api.FunctionFile
@@ -190,8 +229,8 @@ func itoa(n int) string { b, _ := json.Marshal(n); return string(b) }
 func TestSyncMaterializesAFunctionAndSwapsGenerations(t *testing.T) {
 	e := newEnv(t)
 	e.addProject(refA, registry.StatusActiveHealthy)
-	code := "supabase/functions/hello/index.ts"
-	e.deploy(refA, "hello", true, map[string]string{code: "v1", "supabase/functions/_shared/cors.ts": "export {}"})
+	code := EszipFileName
+	e.deploy(refA, "hello", true, "v1")
 	e.sync(refA)
 
 	link := FunctionPath(e.cfg, refA, "hello")
@@ -199,34 +238,35 @@ func TestSyncMaterializesAFunctionAndSwapsGenerations(t *testing.T) {
 	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("function path is not a symlink: %v %v", fi, err)
 	}
-	if got := readFile(t, filepath.Join(link, code)); got != "v1" {
-		t.Fatalf("source %q", got)
-	}
-	if got := readFile(t, filepath.Join(link, "supabase/functions/_shared/cors.ts")); got != "export {}" {
-		t.Fatalf("shared file %q", got)
+	if got := readFile(t, filepath.Join(link, code)); got != eszipOf("v1") {
+		t.Fatalf("bundle %q", got)
 	}
 	m, ok := liveMeta(link)
-	if !ok || m.Slug != "hello" || m.Version != 1 || !m.VerifyJWT || m.Entrypoint != code || m.SHA256 == "" {
+	if !ok || m.Slug != "hello" || m.Version != 1 || !m.VerifyJWT || m.Kind != "eszip" || m.Entrypoint != entryOf("hello") || m.SHA256 == "" || m.Stamp == "" {
 		t.Fatalf("meta %+v", m)
 	}
 	first, _ := os.Readlink(link)
 
-	// Unchanged: nothing is rewritten.
+	// Unchanged: nothing is rewritten, and the stored files are not even loaded again.
+	loads := e.loads.Load()
 	e.sync(refA)
 	if again, _ := os.Readlink(link); again != first {
 		t.Fatal("an unchanged function got a new generation")
 	}
+	if n := e.loads.Load(); n != loads {
+		t.Fatalf("an unchanged function loaded its files again (%d loads)", n-loads)
+	}
 
 	// A new deployment is a new generation behind the same path; the old one stays for
 	// workers that are still answering from it.
-	e.deploy(refA, "hello", false, map[string]string{code: "v2"})
+	e.deploy(refA, "hello", false, "v2")
 	e.sync(refA)
 	second, _ := os.Readlink(link)
 	if second == first {
 		t.Fatal("the link was not swapped")
 	}
-	if got := readFile(t, filepath.Join(link, code)); got != "v2" {
-		t.Fatalf("source after redeploy %q", got)
+	if got := readFile(t, filepath.Join(link, code)); got != eszipOf("v2") {
+		t.Fatalf("bundle after redeploy %q", got)
 	}
 	if m, _ := liveMeta(link); m.Version != 2 || m.VerifyJWT {
 		t.Fatalf("meta after redeploy %+v", m)
@@ -234,12 +274,12 @@ func TestSyncMaterializesAFunctionAndSwapsGenerations(t *testing.T) {
 	if n := len(gens(t, e.cfg, refA)); n != 2 {
 		t.Fatalf("generations after one redeploy: %d, want 2", n)
 	}
-	if got := readFile(t, filepath.Join(FunctionsDir(e.cfg, refA), first, code)); got != "v1" {
+	if got := readFile(t, filepath.Join(FunctionsDir(e.cfg, refA), first, code)); got != eszipOf("v1") {
 		t.Fatalf("previous generation: %q", got)
 	}
 
 	// A third one drops the first.
-	e.deploy(refA, "hello", true, map[string]string{code: "v3"})
+	e.deploy(refA, "hello", true, "v3")
 	e.sync(refA)
 	if n := len(gens(t, e.cfg, refA)); n != 2 {
 		t.Fatalf("generations after two redeploys: %d, want 2", n)
@@ -260,11 +300,64 @@ func TestSyncMaterializesAFunctionAndSwapsGenerations(t *testing.T) {
 	}
 }
 
+func TestReconcileLoadsNothingForUnchangedFunctions(t *testing.T) {
+	e := newEnv(t)
+	e.addProject(refA, registry.StatusActiveHealthy)
+	e.addProject(refB, registry.StatusActiveHealthy)
+	e.deploy(refA, "hello", true, "v1")
+	e.deploy(refB, "hello", true, "v1")
+	// Functions with nothing to serve are looked at once, too.
+	e.deploySource(refA, "legacy", true, map[string]string{"supabase/functions/legacy/index.ts": "x"})
+	if err := e.s.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.loads.Load(); n != 3 {
+		t.Fatalf("first reconcile loaded files %d times, want 3", n)
+	}
+	for i := 0; i < 3; i++ {
+		if err := e.s.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := e.loads.Load(); n != 3 {
+		t.Fatalf("later reconciles loaded files again: %d", n)
+	}
+	// A change loads exactly the changed function.
+	e.deploy(refB, "hello", true, "v2")
+	if err := e.s.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.loads.Load(); n != 4 {
+		t.Fatalf("a redeploy loaded files %d times in total, want 4", n)
+	}
+	if got := readFile(t, filepath.Join(FunctionPath(e.cfg, refB, "hello"), EszipFileName)); got != eszipOf("v2") {
+		t.Fatalf("redeploy not live: %q", got)
+	}
+}
+
+func TestSettledFunctionsAreForgottenWithTheirProject(t *testing.T) {
+	e := newEnv(t)
+	e.addProject(refA, registry.StatusActiveHealthy)
+	e.deploySource(refA, "legacy", true, map[string]string{"supabase/functions/legacy/index.ts": "x"})
+	e.sync(refA)
+	e.sync(refA)
+	if n := e.loads.Load(); n != 1 {
+		t.Fatalf("loads %d, want 1", n)
+	}
+	if err := e.s.RemoveProject(refA); err != nil {
+		t.Fatal(err)
+	}
+	e.sync(refA)
+	if n := e.loads.Load(); n != 2 {
+		t.Fatalf("after RemoveProject the function must be looked at again: %d loads", n)
+	}
+}
+
 func TestSwapIsAtomicForReaders(t *testing.T) {
 	e := newEnv(t)
 	e.addProject(refA, registry.StatusActiveHealthy)
-	code := "supabase/functions/hello/index.ts"
-	e.deploy(refA, "hello", true, map[string]string{code: "version-1"})
+	code := EszipFileName
+	e.deploy(refA, "hello", true, "version-1")
 	e.sync(refA)
 	link := FunctionPath(e.cfg, refA, "hello")
 
@@ -287,7 +380,7 @@ func TestSwapIsAtomicForReaders(t *testing.T) {
 					// very moment (EINVAL, never ENOENT); the Deno main service retries.
 					continue
 				}
-				if err != nil || !strings.HasPrefix(string(b), "version-") {
+				if err != nil || !strings.HasPrefix(string(b), eszipOf("version-")) {
 					select {
 					case bad <- "reader saw " + string(b) + " / " + errString(err):
 					default:
@@ -298,7 +391,7 @@ func TestSwapIsAtomicForReaders(t *testing.T) {
 		}()
 	}
 	for v := 2; v <= 30; v++ {
-		e.deploy(refA, "hello", true, map[string]string{code: "version-" + itoa(v)})
+		e.deploy(refA, "hello", true, "version-"+itoa(v))
 		e.sync(refA)
 	}
 	close(stop)
@@ -321,9 +414,9 @@ func TestTwoProjectsKeepTheirOwnFunctionsAndSecrets(t *testing.T) {
 	e := newEnv(t)
 	e.addProject(refA, registry.StatusActiveHealthy)
 	e.addProject(refB, registry.StatusActiveHealthy)
-	code := "supabase/functions/hello/index.ts"
-	e.deploy(refA, "hello", true, map[string]string{code: "code of A"})
-	e.deploy(refB, "hello", true, map[string]string{code: "code of B"})
+	code := EszipFileName
+	e.deploy(refA, "hello", true, "code of A")
+	e.deploy(refB, "hello", true, "code of B")
 	sa, _ := e.sec.Seal([]byte("secret of A"))
 	sb, _ := e.sec.Seal([]byte("secret of B"))
 	_ = e.store.PutFunctionSecrets(context.Background(), refA, map[string][]byte{"TOKEN": sa})
@@ -331,8 +424,8 @@ func TestTwoProjectsKeepTheirOwnFunctionsAndSecrets(t *testing.T) {
 	if err := e.s.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if readFile(t, filepath.Join(FunctionPath(e.cfg, refA, "hello"), code)) != "code of A" ||
-		readFile(t, filepath.Join(FunctionPath(e.cfg, refB, "hello"), code)) != "code of B" {
+	if readFile(t, filepath.Join(FunctionPath(e.cfg, refA, "hello"), code)) != eszipOf("code of A") ||
+		readFile(t, filepath.Join(FunctionPath(e.cfg, refB, "hello"), code)) != eszipOf("code of B") {
 		t.Fatal("projects share code")
 	}
 	da, db := readEnvDoc(t, e.cfg, refA), readEnvDoc(t, e.cfg, refB)
@@ -364,11 +457,10 @@ func TestTwoProjectsKeepTheirOwnFunctionsAndSecrets(t *testing.T) {
 func TestDeleteRemovesTheFunctionAndItsGenerations(t *testing.T) {
 	e := newEnv(t)
 	e.addProject(refA, registry.StatusActiveHealthy)
-	code := "supabase/functions/hello/index.ts"
-	e.deploy(refA, "hello", true, map[string]string{code: "1"})
-	e.deploy(refA, "hello-2", true, map[string]string{"supabase/functions/hello-2/index.ts": "other"})
+	e.deploy(refA, "hello", true, "1")
+	e.deploy(refA, "hello-2", true, "other")
 	e.sync(refA)
-	e.deploy(refA, "hello", true, map[string]string{code: "2"})
+	e.deploy(refA, "hello", true, "2")
 	e.sync(refA)
 	if err := e.store.DeleteFunction(context.Background(), refA, "hello"); err != nil {
 		t.Fatal(err)
@@ -381,7 +473,7 @@ func TestDeleteRemovesTheFunctionAndItsGenerations(t *testing.T) {
 	if len(left) != 1 || !strings.HasPrefix(left[0], "hello-2.") {
 		t.Fatalf("generations left: %v (the generations of hello-2 must survive deleting hello)", left)
 	}
-	if got := readFile(t, filepath.Join(FunctionPath(e.cfg, refA, "hello-2"), "supabase/functions/hello-2/index.ts")); got != "other" {
+	if got := readFile(t, filepath.Join(FunctionPath(e.cfg, refA, "hello-2"), EszipFileName)); got != eszipOf("other") {
 		t.Fatalf("hello-2 damaged: %q", got)
 	}
 }
@@ -389,7 +481,7 @@ func TestDeleteRemovesTheFunctionAndItsGenerations(t *testing.T) {
 func TestOrphansAndInterruptedSwapsAreCleanedUp(t *testing.T) {
 	e := newEnv(t)
 	e.addProject(refA, registry.StatusActiveHealthy)
-	e.deploy(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+	e.deploy(refA, "hello", true, "1")
 	e.sync(refA)
 	dir := FunctionsDir(e.cfg, refA)
 	orphan := filepath.Join(dir, genDirName, "gone.7.abc")
@@ -416,58 +508,59 @@ func TestOrphansAndInterruptedSwapsAreCleanedUp(t *testing.T) {
 	if _, err := os.Lstat(partial); err == nil {
 		t.Fatal("a leftover of an interrupted swap was kept")
 	}
-	if _, err := os.Stat(filepath.Join(FunctionPath(e.cfg, refA, "hello"), "supabase/functions/hello/index.ts")); err != nil {
+	if _, err := os.Stat(filepath.Join(FunctionPath(e.cfg, refA, "hello"), EszipFileName)); err != nil {
 		t.Fatalf("the live function was damaged: %v", err)
 	}
 }
 
-func TestBadUploadsAreRefused(t *testing.T) {
+// Source functions are never served: a function that runs from real files can import
+// files outside its directory (relative specifiers), and in the shared tenants tree
+// those are other projects' environment files and code.
+func TestSourceFunctionsAreNotMaterialized(t *testing.T) {
 	e := newEnv(t)
+	e.addProject(refB, registry.StatusActiveHealthy)
 	e.addProject(refA, registry.StatusActiveHealthy)
+	e.deploy(refB, "hello", true, "code of B")
+	e.sync(refB)
 	ctx := context.Background()
-	cases := map[string]struct {
-		entry string
-		files map[string]string
-		want  string
-	}{
-		"traversal":      {"index.ts", map[string]string{"index.ts": "x", "../escape.ts": "y"}, "invalid file path"},
-		"absolute":       {"index.ts", map[string]string{"index.ts": "x", "/etc/passwd": "y"}, "invalid file path"},
-		"meta file name": {"index.ts", map[string]string{"index.ts": "x", MetaFileName: "{}"}, "cannot contain"},
-		"no entrypoint":  {"main.ts", map[string]string{"index.ts": "x"}, "not among the uploaded files"},
-		"bad entrypoint": {"../x.ts", map[string]string{"index.ts": "x"}, "entrypoint"},
+	hostile := map[string]string{
+		"supabase/functions/steal/index.ts": `import env from "../../../../../../../` + refB + `/functions-env.json" with { type: "json" }`,
+		"../escape.ts":                      "x",
 	}
-	for name, c := range cases {
-		f := &api.Function{Ref: refA, Slug: "bad", Name: "bad", Status: "ACTIVE", VerifyJWT: true, EntrypointPath: c.entry}
-		var ff []api.FunctionFile
-		for p, content := range c.files {
-			ff = append(ff, api.FunctionFile{Path: p, Content: []byte(content)})
-		}
-		if err := e.store.UpsertFunction(ctx, f, ff); err != nil {
-			t.Fatal(err)
-		}
-		err := e.s.SyncProject(ctx, refA)
-		if err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s: error %v, want one containing %q", name, err, c.want)
-		}
-		if _, err := os.Lstat(FunctionPath(e.cfg, refA, "bad")); err == nil {
-			t.Errorf("%s: a refused upload went live", name)
-		}
-		for _, outside := range []string{ProjectDir(e.cfg, refA), FunctionsDir(e.cfg, refA), filepath.Join(FunctionsDir(e.cfg, refA), genDirName)} {
-			if _, err := os.Stat(filepath.Join(outside, "escape.ts")); err == nil {
-				t.Errorf("%s: wrote outside the generation (%s)", name, outside)
-			}
-		}
-		if n := len(gens(t, e.cfg, refA)); n != 0 {
-			t.Errorf("%s: %d generations left behind", name, n)
-		}
+	f := e.deploySource(refA, "steal", true, hostile)
+	if err := e.s.SyncProject(ctx, refA); err != nil {
+		t.Fatalf("a stored source function must be skipped, not fail the project: %v", err)
 	}
-	// One broken function does not keep the others from going live.
-	e.deploy(refA, "fine", true, map[string]string{"supabase/functions/fine/index.ts": "ok"})
-	if err := e.s.SyncProject(ctx, refA); err == nil {
-		t.Fatal("expected the bad function to be reported")
+	if _, err := os.Lstat(FunctionPath(e.cfg, refA, "steal")); err == nil {
+		t.Fatal("a source function went live")
 	}
-	if _, err := os.Stat(filepath.Join(FunctionPath(e.cfg, refA, "fine"), "supabase/functions/fine/index.ts")); err != nil {
-		t.Fatalf("the good function is not live: %v", err)
+	if n := len(gens(t, e.cfg, refA)); n != 0 {
+		t.Fatalf("%d generations written for a source function", n)
+	}
+	var found []string
+	_ = filepath.WalkDir(e.cfg.Paths().FunctionsRoot(), func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.Contains(p, "escape.ts") || strings.HasSuffix(p, "steal/index.ts") {
+			found = append(found, p)
+		}
+		return nil
+	})
+	if len(found) != 0 {
+		t.Fatalf("source files were written: %v", found)
+	}
+	// A bundle deployed over it goes live.
+	f.EntrypointPath = entryOf("steal")
+	if err := e.store.UpsertFunction(ctx, f, []api.FunctionFile{{Path: api.BundleFileName, Content: bundleOf("bundled")}}); err != nil {
+		t.Fatal(err)
+	}
+	e.sync(refA)
+	if got := readFile(t, filepath.Join(FunctionPath(e.cfg, refA, "steal"), EszipFileName)); got != eszipOf("bundled") {
+		t.Fatalf("bundle %q", got)
+	}
+	// And a source deploy over a live bundle takes it out of service.
+	e.deploySource(refA, "steal", true, hostile)
+	e.sync(refA)
+	if _, err := os.Lstat(FunctionPath(e.cfg, refA, "steal")); err == nil {
+		t.Fatal("a source redeploy left the old bundle live")
 	}
 }
 
@@ -489,10 +582,10 @@ func TestReconcileFollowsKeyRotationAndSkipsWhatIsNotAProject(t *testing.T) {
 	const failed, paused = "cccccccccccccccccccc", "dddddddddddddddddddd"
 	e.addProject(refA, registry.StatusActiveHealthy)
 	e.addProject(failed, registry.StatusInitFailed)
-	e.addProject(paused, registry.StatusInactive) // paused: still gets its files
+	e.addProject(paused, registry.StatusInactive) // paused: the proxy does not serve it, so no files
 	e.addProject(config.SystemRef, registry.StatusActiveHealthy)
 	for _, ref := range []string{refA, failed, paused} {
-		e.deploy(ref, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+		e.deploy(ref, "hello", true, "1")
 	}
 	if err := e.s.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
@@ -503,8 +596,24 @@ func TestReconcileFollowsKeyRotationAndSkipsWhatIsNotAProject(t *testing.T) {
 	if _, err := os.Stat(EnvPath(e.cfg, config.SystemRef)); err == nil {
 		t.Error("the system project got files")
 	}
+	if _, err := os.Stat(EnvPath(e.cfg, paused)); err == nil {
+		t.Error("a paused project got files")
+	}
+	// Resuming brings them back.
+	if err := e.reg.SetProjectStatus(context.Background(), paused, registry.StatusActiveHealthy); err != nil {
+		t.Fatal(err)
+	}
+	e.sync(paused)
 	if _, err := os.Stat(EnvPath(e.cfg, paused)); err != nil {
-		t.Error("a paused project got no files")
+		t.Error("a resumed project got no files")
+	}
+	// Pausing takes them away again, the keys included.
+	if err := e.reg.SetProjectStatus(context.Background(), paused, registry.StatusPausing); err != nil {
+		t.Fatal(err)
+	}
+	e.sync(paused)
+	if _, err := os.Stat(ProjectDir(e.cfg, paused)); err == nil {
+		t.Error("a pausing project kept its files")
 	}
 	before := readEnvDoc(t, e.cfg, refA)
 	k, err := secrets.NewProjectKeys(refA, time.Now())
@@ -542,7 +651,7 @@ func TestAProjectThatDoesNotUseFunctionsGetsNoFiles(t *testing.T) {
 		t.Fatal("secret missing")
 	}
 	// Removing the last function and the last secret removes the files again.
-	e.deploy(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+	e.deploy(refA, "hello", true, "1")
 	e.sync(refA)
 	_ = e.store.DeleteFunction(context.Background(), refA, "hello")
 	_ = e.store.DeleteFunctionSecrets(context.Background(), refA, []string{"K"})
@@ -560,7 +669,7 @@ func TestFilesOfProjectsThatAreGoneAreCollected(t *testing.T) {
 	e.addProject(refA, registry.StatusActiveHealthy)
 	e.addProject(refB, registry.StatusActiveHealthy)
 	for _, ref := range []string{refA, refB} {
-		e.deploy(ref, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+		e.deploy(ref, "hello", true, "1")
 		e.sync(ref)
 	}
 	// Deleted from the registry (what Engine.Delete does last): the files go with the next
@@ -578,7 +687,7 @@ func TestFilesOfProjectsThatAreGoneAreCollected(t *testing.T) {
 		t.Fatalf("another project lost its files: %v", err)
 	}
 	// SyncProject alone does the same, and so does a project that is going down.
-	e.deploy(refB, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "2"})
+	e.deploy(refB, "hello", true, "2")
 	if err := e.reg.SetProjectStatus(ctx, refB, registry.StatusGoingDown); err != nil {
 		t.Fatal(err)
 	}
@@ -608,7 +717,7 @@ func (listsNothing) ListProjects(context.Context) ([]registry.Project, error) { 
 func TestACollectNeverRemovesAProjectCreatedAfterTheListing(t *testing.T) {
 	e := newEnv(t)
 	e.addProject(refA, registry.StatusActiveHealthy)
-	e.deploy(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+	e.deploy(refA, "hello", true, "1")
 	e.sync(refA)
 	s, err := New(Deps{Cfg: e.cfg, Registry: listsNothing{e.reg}, Secrets: e.sec, Store: e.store, Keys: e.s.d.Keys})
 	if err != nil {
@@ -647,7 +756,7 @@ func TestSyncOfAnUnknownProjectRemovesLeftoversAndBadRefsAreRefused(t *testing.T
 func TestRemoveProject(t *testing.T) {
 	e := newEnv(t)
 	e.addProject(refA, registry.StatusActiveHealthy)
-	e.deploy(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "1"})
+	e.deploy(refA, "hello", true, "1")
 	e.sync(refA)
 	if err := e.s.RemoveProject(refA); err != nil {
 		t.Fatal(err)
@@ -713,29 +822,54 @@ func helloBundle(t *testing.T) []byte {
 }
 
 func TestDecodeBundle(t *testing.T) {
-	out, err := decodeBundle(helloBundle(t))
-	if err != nil {
+	var out bytes.Buffer
+	if err := decodeBundle(&out, bytes.TrimPrefix(helloBundle(t), []byte("EZBR"))); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(out), "ESZIP2") || len(out) < 1000 {
-		t.Fatalf("decoded %d bytes starting %q", len(out), out[:8])
+	if !strings.HasPrefix(out.String(), "ESZIP2") || out.Len() < 1000 {
+		t.Fatalf("decoded %d bytes starting %q", out.Len(), out.Bytes()[:8])
+	}
+	brotliOf := func(b []byte) []byte {
+		var buf bytes.Buffer
+		w := brotli.NewWriter(&buf)
+		_, _ = w.Write(b)
+		_ = w.Close()
+		return buf.Bytes()
 	}
 	for name, in := range map[string][]byte{
-		"no magic":   []byte("ESZIP2.3 plain"),
-		"not brotli": append([]byte("EZBR"), []byte("this is not a brotli stream at all, surely")...),
-		"not eszip":  nil,
+		"not brotli": []byte("this is not a brotli stream at all, surely"),
+		"not eszip":  brotliOf([]byte("hello world")),
+		"empty":      brotliOf(nil),
 	} {
-		if name == "not eszip" {
-			// a valid Brotli stream whose content is not an eszip
-			var buf bytes.Buffer
-			w := brotli.NewWriter(&buf)
-			_, _ = w.Write([]byte("hello world"))
-			_ = w.Close()
-			in = append([]byte("EZBR"), buf.Bytes()...)
+		var sink bytes.Buffer
+		err := decodeBundle(&sink, in)
+		var p permanent
+		if err == nil || !errors.As(err, &p) {
+			t.Errorf("%s: %v, want a permanent error", name, err)
 		}
-		if _, err := decodeBundle(in); err == nil {
-			t.Errorf("%s: accepted", name)
-		}
+	}
+}
+
+// A bomb: a small upload that expands past the cap is stopped while it streams to disk.
+func TestDecodeBundleStopsAtTheSizeCap(t *testing.T) {
+	var plain bytes.Buffer
+	plain.WriteString("ESZIP2.3")
+	plain.Write(make([]byte, maxEszipSize))
+	var buf bytes.Buffer
+	w := brotli.NewWriterLevel(&buf, 1)
+	_, _ = w.Write(plain.Bytes())
+	_ = w.Close()
+	if buf.Len() > 1<<20 {
+		t.Fatalf("the test bomb is %d bytes; it should compress to almost nothing", buf.Len())
+	}
+	path := filepath.Join(t.TempDir(), "bundle.eszip")
+	err := writeBundleFile(path, append([]byte("EZBR"), buf.Bytes()...))
+	var p permanent
+	if err == nil || !errors.As(err, &p) || !strings.Contains(err.Error(), "once decompressed") {
+		t.Fatalf("bomb: %v", err)
+	}
+	if fi, _ := os.Stat(path); fi != nil && fi.Size() > maxEszipSize+1 {
+		t.Fatalf("wrote %d bytes of a bomb", fi.Size())
 	}
 }
 
@@ -772,15 +906,11 @@ func TestSyncMaterializesABundledFunction(t *testing.T) {
 	if again, _ := os.Readlink(link); again != first {
 		t.Fatal("an unchanged bundle got a new generation")
 	}
-	// Redeploying as source files replaces the bundle.
-	e.deploy(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "x"})
+	// Redeploying as source files takes it out of service.
+	e.deploySource(refA, "hello", true, map[string]string{"supabase/functions/hello/index.ts": "x"})
 	e.sync(refA)
-	m, _ = liveMeta(link)
-	if m.Kind != "" || m.Eszip != "" {
-		t.Fatalf("meta after a source deploy: %+v", m)
-	}
-	if _, err := os.Stat(filepath.Join(link, EszipFileName)); err == nil {
-		t.Fatal("the old bundle is still served")
+	if _, err := os.Lstat(link); err == nil {
+		t.Fatal("the old bundle is still served after a source deploy")
 	}
 }
 
@@ -789,21 +919,37 @@ func TestBadBundlesAreRefused(t *testing.T) {
 	e.addProject(refA, registry.StatusActiveHealthy)
 	ctx := context.Background()
 	f := &api.Function{Ref: refA, Slug: "bad", Name: "bad", Status: "ACTIVE", VerifyJWT: true, EntrypointPath: "file:///x/index.ts"}
-	cases := map[string][]api.FunctionFile{
-		"garbage":    {{Path: api.BundleFileName, Content: []byte("EZBRgarbage garbage garbage")}},
-		"extra file": {{Path: api.BundleFileName, Content: helloBundle(t)}, {Path: "index.ts", Content: []byte("x")}},
+	// A bundle that cannot be decoded is reported once, when it is first looked at (the
+	// deploy that stored it gets the error); later syncs of the same deployment skip it.
+	if err := e.store.UpsertFunction(ctx, f, []api.FunctionFile{{Path: api.BundleFileName, Content: []byte("EZBRgarbage garbage garbage")}}); err != nil {
+		t.Fatal(err)
 	}
-	for name, files := range cases {
-		if err := e.store.UpsertFunction(ctx, f, files); err != nil {
-			t.Fatal(err)
-		}
-		err := e.s.SyncProject(ctx, refA)
-		if err == nil {
-			t.Errorf("%s: accepted", name)
-		}
-		if _, err := os.Lstat(FunctionPath(e.cfg, refA, "bad")); err == nil {
-			t.Errorf("%s: went live", name)
-		}
+	if err := e.s.SyncProject(ctx, refA); err == nil {
+		t.Error("garbage: accepted")
+	}
+	loads := e.loads.Load()
+	if err := e.s.SyncProject(ctx, refA); err != nil {
+		t.Errorf("garbage, second sync: %v", err)
+	}
+	if e.loads.Load() != loads {
+		t.Error("a refused bundle was loaded again")
+	}
+	if _, err := os.Lstat(FunctionPath(e.cfg, refA, "bad")); err == nil {
+		t.Error("garbage: went live")
+	}
+	if n := len(gens(t, e.cfg, refA)); n != 0 {
+		t.Errorf("%d generations left behind", n)
+	}
+	// A bundle next to another file is not a bundle upload: it is treated as sources.
+	files := []api.FunctionFile{{Path: api.BundleFileName, Content: helloBundle(t)}, {Path: "index.ts", Content: []byte("x")}}
+	if err := e.store.UpsertFunction(ctx, f, files); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.SyncProject(ctx, refA); err != nil {
+		t.Errorf("extra file: %v", err)
+	}
+	if _, err := os.Lstat(FunctionPath(e.cfg, refA, "bad")); err == nil {
+		t.Error("extra file: went live")
 	}
 	// A bundle without an entrypoint cannot start.
 	f.EntrypointPath = ""
@@ -812,5 +958,13 @@ func TestBadBundlesAreRefused(t *testing.T) {
 	}
 	if err := e.s.SyncProject(ctx, refA); err == nil || !strings.Contains(err.Error(), "entrypoint") {
 		t.Fatalf("bundle without entrypoint: %v", err)
+	}
+	// One broken function does not keep the others from going live.
+	e.deploy(refA, "fine", true, "ok")
+	if err := e.s.SyncProject(ctx, refA); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(FunctionPath(e.cfg, refA, "fine"), EszipFileName)); got != eszipOf("ok") {
+		t.Fatalf("the good function is not live: %q", got)
 	}
 }

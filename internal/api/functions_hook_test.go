@@ -49,8 +49,8 @@ func TestFunctionsHookIsCalledAfterEveryChange(t *testing.T) {
 	withHook(t, f, h)
 	base := "/v1/projects/" + testRef
 
-	body, ctype := functionUpload(t, "index.ts", "console.log(1)")
-	if rec := f.do("POST", base+"/functions/deploy?slug=hello", body, "Content-Type", ctype); rec.Code != 201 {
+	body := bundleBody("compressed eszip")
+	if rec := f.do("POST", base+"/functions?slug=hello&entrypoint_path=file:///x/index.ts", body, "Content-Type", EszipMediaType); rec.Code != 201 {
 		t.Fatalf("deploy: %d %s", rec.Code, rec.Body)
 	}
 	steps := []struct {
@@ -98,8 +98,8 @@ func TestFunctionsHookFailureSaysTheChangeIsStored(t *testing.T) {
 	f := newFixture(t)
 	h := &recordingHook{err: errors.New("disk full")}
 	withHook(t, f, h)
-	body, ctype := functionUpload(t, "index.ts", "console.log(1)")
-	rec := f.do("POST", "/v1/projects/"+testRef+"/functions/deploy?slug=hello", body, "Content-Type", ctype)
+	body := bundleBody("compressed eszip")
+	rec := f.do("POST", "/v1/projects/"+testRef+"/functions?slug=hello&entrypoint_path=file:///x/index.ts", body, "Content-Type", EszipMediaType)
 	if rec.Code != 500 {
 		t.Fatalf("deploy with a failing hook: %d %s", rec.Code, rec.Body)
 	}
@@ -109,5 +109,54 @@ func TestFunctionsHookFailureSaysTheChangeIsStored(t *testing.T) {
 	// The deployment is stored all the same; the hook's reconcile applies it later.
 	if rec := f.do("GET", "/v1/projects/"+testRef+"/functions/hello", nil); rec.Code != 200 {
 		t.Fatalf("stored function: %d", rec.Code)
+	}
+}
+
+// A node that runs functions serves bundles only; a source upload would run from real
+// files, where relative imports can reach other projects' files.
+func TestSourceUploadsAreRefusedWhereFunctionsRun(t *testing.T) {
+	f := newFixture(t)
+	body, ctype := functionUpload(t, "index.ts", "console.log(1)")
+	url := "/v1/projects/" + testRef + "/functions/deploy?slug=hello"
+	// Without a runtime nothing runs the files, and the API keeps storing them.
+	if rec := f.do("POST", url, body, "Content-Type", ctype); rec.Code != 201 {
+		t.Fatalf("deploy without a runtime: %d %s", rec.Code, rec.Body)
+	}
+	h := &recordingHook{}
+	withHook(t, f, h)
+	rec := f.do("POST", url+"2", body, "Content-Type", ctype)
+	if rec.Code != 400 {
+		t.Fatalf("source deploy with a runtime: %d %s", rec.Code, rec.Body)
+	}
+	if msg, _ := jsonField(t, rec, "message").(string); !strings.Contains(msg, "without --use-api") {
+		t.Fatalf("message %q does not say what to do", msg)
+	}
+	if h.count() != 0 {
+		t.Fatal("a refused upload reached the hook")
+	}
+	if _, err := f.srv.store.GetFunction(context.Background(), testRef, "hello2"); err == nil {
+		t.Fatal("a refused upload was stored")
+	}
+}
+
+func TestFunctionsHookHearsAboutPauseResumeAndDelete(t *testing.T) {
+	f := newFixture(t)
+	h := &recordingHook{}
+	withHook(t, f, h)
+	base := "/v1/projects/" + testRef
+	for _, step := range []struct{ method, path string }{{"POST", "/pause"}, {"POST", "/restore"}, {"DELETE", ""}} {
+		before := h.count()
+		if rec := f.do(step.method, base+step.path, nil); rec.Code != 200 {
+			t.Fatalf("%s %s: %d %s", step.method, step.path, rec.Code, rec.Body)
+		}
+		if h.count() != before+1 {
+			t.Fatalf("%s %s: %d hook calls, want %d", step.method, step.path, h.count(), before+1)
+		}
+	}
+	// A failing hook does not fail a lifecycle change that succeeded.
+	g := newFixture(t)
+	withHook(t, g, &recordingHook{err: errors.New("disk full")})
+	if rec := g.do("POST", base+"/pause", nil); rec.Code != 200 {
+		t.Fatalf("pause with a failing hook: %d %s", rec.Code, rec.Body)
 	}
 }

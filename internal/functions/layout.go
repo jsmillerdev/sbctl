@@ -66,7 +66,7 @@ func ProjectURL(cfg *config.Config, ref string) string {
 // Live reports the version of the function that is on disk and served for slug in ref.
 func Live(cfg *config.Config, ref, slug string) (version int, ok bool) {
 	m, ok := liveMeta(FunctionPath(cfg, ref, slug))
-	return m.Version, ok
+	return m.Version, ok && m.Kind == kindEszip
 }
 
 // RemoveFiles deletes everything this package keeps for ref. Deleting a project from the

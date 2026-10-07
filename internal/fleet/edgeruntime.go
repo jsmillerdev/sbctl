@@ -75,13 +75,15 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 	}
 	root = realPath(root)
 	s.Env = map[string]string{
-		"EDGE_RUNTIME_PORT":                port,
-		"SBCTL_FUNCTIONS_ROOT":             root,
-		"SBCTL_FUNCTIONS_MEMORY_MB":        strconv.Itoa(f.Memory()),
-		"SBCTL_FUNCTIONS_WALL_CLOCK_SEC":   strconv.Itoa(f.WallClock()),
-		"SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC": strconv.Itoa(f.IdleTimeout()),
-		"SBCTL_FUNCTIONS_CPU_SOFT_MS":      strconv.Itoa(f.CPUSoft()),
-		"SBCTL_FUNCTIONS_CPU_HARD_MS":      strconv.Itoa(f.CPUHard()),
+		"EDGE_RUNTIME_PORT":                       port,
+		"SBCTL_FUNCTIONS_ROOT":                    root,
+		"SBCTL_FUNCTIONS_MEMORY_MB":               strconv.Itoa(f.Memory()),
+		"SBCTL_FUNCTIONS_WALL_CLOCK_SEC":          strconv.Itoa(f.WallClock()),
+		"SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC":        strconv.Itoa(f.IdleTimeout()),
+		"SBCTL_FUNCTIONS_MAX_PER_PROJECT":         strconv.Itoa(f.PerProject()),
+		"SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT": strconv.Itoa(f.WorkersPerProject()),
+		"SBCTL_FUNCTIONS_CPU_SOFT_MS":             strconv.Itoa(f.CPUSoft()),
+		"SBCTL_FUNCTIONS_CPU_HARD_MS":             strconv.Itoa(f.CPUHard()),
 		// The runtime keeps one module cache for the whole process (it reads DENO_DIR once,
 		// and a worker cannot change it), so remote imports of all projects share this
 		// directory. The cache is content-addressed by URL and holds public modules only.
@@ -101,8 +103,10 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 		args = append(args, "--max-parallelism", strconv.Itoa(n))
 	}
 	s.Exec = args
-	if f.MemoryMax != "" {
-		s.Limits.MemoryMax = f.MemoryMax
+	// The workers of one runtime share its memory limit: the default is what all of them
+	// can use together (config validates an explicit value against that).
+	if m := f.RuntimeMemoryMax(); m != "" {
+		s.Limits.MemoryMax = m
 	}
 	return s, nil
 }

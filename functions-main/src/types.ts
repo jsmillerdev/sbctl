@@ -12,31 +12,26 @@ export interface ProjectEnv {
   secrets: Record<string, string>
 }
 
-/** The metadata file inside a function generation (.sbctl-function.json). */
+/**
+ * The metadata file inside a function generation (.sbctl-function.json). Only bundles
+ * are served: the generation holds the eszip the Supabase CLI built, whose module
+ * specifiers are virtual, so a function cannot import files of the node (see README).
+ */
 export interface FunctionMeta {
   slug: string
   version: number
   verifyJwt: boolean
-  /** "source": the generation holds the files; "eszip": it holds a bundle the CLI built. */
-  kind: 'source' | 'eszip'
-  /**
-   * Source functions: the path of the entrypoint relative to the generation directory.
-   * Bundles: the module specifier of the entrypoint inside the bundle (a file URL).
-   */
+  kind: 'eszip'
+  /** The module specifier of the entrypoint inside the bundle (a file URL). */
   entrypoint: string
-  /** Path of the import map relative to the generation directory, or "" (source only). */
-  importMap: string
-  /** Path of the bundle relative to the generation directory (bundles only). */
+  /** Path of the bundle relative to the generation directory. */
   eszip: string
 }
 
 /** A function resolved on disk: absolute, symlink-free paths. */
 export interface FunctionInfo extends FunctionMeta {
   dir: string
-  /** Source functions: the entrypoint file. Bundles: the same as entrypoint, a URL. */
-  entrypointPath: string
-  importMapPath: string
-  /** Bundles: the eszip file. */
+  /** The bundle file. */
   eszipPath: string
 }
 
@@ -49,6 +44,14 @@ export interface Limits {
   requestIdleTimeoutMs: number
   /** A worker that has had no request for this long is retired. */
   requestAbsentTimeoutMs: number
+  /**
+   * How many requests one project may have in flight at once (0: no cap). The runtime's
+   * worker pool and memory are shared by all projects; this keeps one project's flood of
+   * slow requests from taking them.
+   */
+  maxPerProject: number
+  /** How many distinct live workers (functions) one project may have (0: no cap), so it never holds every pool slot. */
+  maxWorkersPerProject: number
   cpuTimeSoftLimitMs: number
   cpuTimeHardLimitMs: number
 }
@@ -58,8 +61,8 @@ export interface WorkerOptions {
   poolKey: string
   servicePath: string
   maybeEntrypoint: string
-  /** The bundle of a function the CLI bundled (plain eszip bytes). */
-  maybeEszip?: Uint8Array
+  /** The bundle of the function (plain eszip bytes). */
+  maybeEszip: Uint8Array
   envVars: [string, string][]
   memoryLimitMb: number
   workerTimeoutMs: number
@@ -69,7 +72,6 @@ export interface WorkerOptions {
   forceCreate: boolean
   context: {
     projectRef: string
-    importMapPath?: string
     supervisor: { requestAbsentTimeoutMs: number }
   }
   permissions?: Record<string, string[] | boolean>

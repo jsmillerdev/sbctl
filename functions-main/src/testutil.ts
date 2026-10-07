@@ -51,37 +51,6 @@ export async function writeProject(
   )
 }
 
-/** Writes one generation of a function and points functions/<slug> at it. */
-export async function writeFunction(
-  root: string,
-  ref: string,
-  slug: string,
-  opts: Partial<{ verifyJwt: boolean; version: number; importMap: string; entrypoint: string }> =
-    {},
-): Promise<string> {
-  const version = opts.version ?? 1
-  const gen = `${root}/${ref}/functions/.gen/${slug}-${version}-x`
-  const entrypoint = opts.entrypoint ?? `supabase/functions/${slug}/index.ts`
-  await Deno.mkdir(`${gen}/${entrypoint.split('/').slice(0, -1).join('/')}`, { recursive: true })
-  await Deno.writeTextFile(`${gen}/${entrypoint}`, 'Deno.serve(() => new Response("ok"))')
-  const meta = {
-    slug,
-    version,
-    verify_jwt: opts.verifyJwt ?? true,
-    entrypoint,
-    import_map: opts.importMap ?? '',
-  } satisfies Record<string, unknown>
-  await Deno.writeTextFile(`${gen}/.sbctl-function.json`, JSON.stringify(meta))
-  const link = `${root}/${ref}/functions/${slug}`
-  const tmp = `${link}.tmp`
-  try {
-    await Deno.remove(tmp)
-  } catch { /* none */ }
-  await Deno.symlink(gen, tmp)
-  await Deno.rename(tmp, link)
-  return gen
-}
-
 export type { FunctionMeta }
 
 /** A runtime that records what it was asked and answers with a canned worker. */
@@ -156,4 +125,14 @@ export async function writeBundle(
   await Deno.symlink(gen, `${link}.tmp`)
   await Deno.rename(`${link}.tmp`, link)
   return gen
+}
+
+/** Writes a bundled function with placeholder eszip bytes (the fake runtime never reads them). */
+export function writeFunction(
+  root: string,
+  ref: string,
+  slug: string,
+  opts: Partial<{ verifyJwt: boolean; version: number }> = {},
+): Promise<string> {
+  return writeBundle(root, ref, slug, new TextEncoder().encode('ESZIP2.3 placeholder'), opts)
 }

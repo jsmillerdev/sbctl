@@ -3,7 +3,7 @@
 //
 //   functions-env.json            the project's JWT secret, SUPABASE_* values and secrets
 //   functions/<slug>              a symlink to the current generation of the function
-//   functions/.gen/<slug>-<n>/    the files of one generation plus .sbctl-function.json
+//   functions/.gen/<slug>.<n>.<r>/  bundle.eszip of one generation plus .sbctl-function.json
 //
 // A deployment is a new generation and a rename of the symlink, so one request sees one
 // generation: the request resolves the symlink once and uses the real path from then on.
@@ -18,6 +18,9 @@ const SLUG_RE = /^[A-Za-z][A-Za-z0-9_-]*$/
 
 export const validRef = (ref: string): boolean => REF_RE.test(ref)
 export const validSlug = (slug: string): boolean => SLUG_RE.test(slug)
+
+/** Memory the main service spends on cached bundles. */
+export const ESZIP_CACHE_BYTES = 128 * 1024 * 1024
 
 const isNotFound = (e: unknown): boolean => e instanceof Deno.errors.NotFound
 
@@ -79,6 +82,12 @@ export function parseProjectEnv(text: string): ProjectEnv | null {
   return { jwtSecret: raw.jwt_secret, supabase, secrets }
 }
 
+/**
+ * Parses a generation's metadata. Only bundles (kind "eszip") are accepted: a generation
+ * of an older sbctl that holds source files is not served, because a source function
+ * runs from real paths and its module loader can follow relative imports out of the
+ * function's directory into other projects' files.
+ */
 export function parseMeta(text: string): FunctionMeta | null {
   let raw: Record<string, unknown>
   try {
@@ -90,20 +99,15 @@ export function parseMeta(text: string): FunctionMeta | null {
   if (
     typeof raw.slug !== 'string' || typeof raw.version !== 'number' ||
     typeof raw.verify_jwt !== 'boolean' || typeof raw.entrypoint !== 'string' ||
-    (raw.import_map !== undefined && typeof raw.import_map !== 'string') ||
-    (raw.eszip !== undefined && typeof raw.eszip !== 'string') ||
-    (raw.kind !== undefined && raw.kind !== 'source' && raw.kind !== 'eszip')
+    raw.kind !== 'eszip' || typeof raw.eszip !== 'string' || !raw.eszip || !raw.entrypoint
   ) return null
-  const kind = (raw.kind as 'source' | 'eszip' | undefined) ?? 'source'
-  if (kind === 'eszip' && !raw.eszip) return null
   return {
     slug: raw.slug,
     version: raw.version,
     verifyJwt: raw.verify_jwt,
-    kind,
+    kind: 'eszip',
     entrypoint: raw.entrypoint,
-    importMap: (raw.import_map as string | undefined) ?? '',
-    eszip: (raw.eszip as string | undefined) ?? '',
+    eszip: raw.eszip,
   }
 }
 
@@ -171,23 +175,10 @@ export class ProjectStore {
     }
     const meta = parseMeta(text)
     if (!meta || meta.slug !== slug) return null
-    let info: FunctionInfo
-    if (meta.kind === 'eszip') {
-      // The entrypoint is a module of the bundle, not a file; the bundle file is checked.
-      const eszipPath = containedPath(dir, meta.eszip)
-      if (!eszipPath || !meta.entrypoint) return null
-      info = { ...meta, dir, entrypointPath: meta.entrypoint, importMapPath: '', eszipPath }
-    } else {
-      const entrypointPath = containedPath(dir, meta.entrypoint)
-      if (!entrypointPath) return null
-      let importMapPath = ''
-      if (meta.importMap) {
-        const p = containedPath(dir, meta.importMap)
-        if (!p) return null
-        importMapPath = p
-      }
-      info = { ...meta, dir, entrypointPath, importMapPath, eszipPath: '' }
-    }
+    // The entrypoint is a module of the bundle, not a file; the bundle file is checked.
+    const eszipPath = containedPath(dir, meta.eszip)
+    if (!eszipPath) return null
+    const info: FunctionInfo = { ...meta, dir, eszipPath }
     // Generations never change once written, so the real path is a stable cache key.
     if (this.#fns.size >= 2048) this.#fns.clear()
     this.#fns.set(dir, info)
@@ -197,13 +188,17 @@ export class ProjectStore {
   #eszips = new Map<string, Uint8Array>()
   #eszipBytes = 0
 
-  /** The bytes of a bundled function's eszip, kept in memory (generations never change). */
+  /**
+   * The bytes of a function's eszip, kept in memory (generations never change) while the
+   * cache stays under its budget; a bundle that alone exceeds the budget is read on every
+   * call and never cached.
+   */
   async eszip(info: FunctionInfo): Promise<Uint8Array> {
     const hit = this.#eszips.get(info.dir)
     if (hit) return hit
     const bytes = await retrying(() => Deno.readFile(info.eszipPath))
-    // Bounded: a node serves a handful of bundles of a few megabytes each.
-    if (this.#eszipBytes + bytes.length > 256 * 1024 * 1024) {
+    if (bytes.length > ESZIP_CACHE_BYTES) return bytes
+    if (this.#eszipBytes + bytes.length > ESZIP_CACHE_BYTES) {
       this.#eszips.clear()
       this.#eszipBytes = 0
     }
@@ -219,8 +214,11 @@ export class ProjectStore {
     for (const k of [...this.#fns.keys()]) {
       if (k.startsWith(join(this.root, ref) + '/')) this.#fns.delete(k)
     }
-    for (const k of [...this.#eszips.keys()]) {
-      if (k.startsWith(join(this.root, ref) + '/')) this.#eszips.delete(k)
+    for (const [k, v] of [...this.#eszips]) {
+      if (k.startsWith(join(this.root, ref) + '/')) {
+        this.#eszips.delete(k)
+        this.#eszipBytes -= v.length
+      }
     }
   }
 }

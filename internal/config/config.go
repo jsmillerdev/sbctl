@@ -193,6 +193,9 @@ func (c *Config) Validate() error {
 	if !ValidRegion(c.Region) {
 		return fmt.Errorf("config: region %q is not one of the regions Studio knows (%s; the list is AWS_REGIONS in Studio's packages/shared-data/regions.ts)", c.Region, strings.Join(Regions, ", "))
 	}
+	if err := c.Functions.Validate(); err != nil {
+		return err
+	}
 	if c.Ports.ProjectBase < 1024 || c.MaxProjectSeq() < 1 {
 		return fmt.Errorf("config: ports.project_base %d out of range", c.Ports.ProjectBase)
 	}

@@ -8,5 +8,5 @@ import "embed"
 
 // Files holds index.ts and the modules it imports, nothing else.
 //
-//go:embed index.ts src/auth.ts src/config.ts src/handler.ts src/projects.ts src/runtime.ts src/types.ts
+//go:embed index.ts src/auth.ts src/config.ts src/handler.ts src/limiter.ts src/projects.ts src/runtime.ts src/types.ts
 var Files embed.FS

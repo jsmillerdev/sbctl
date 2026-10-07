@@ -3,6 +3,7 @@
 // header that sbctl's proxy sets (and overwrites when a client sends one).
 
 import { authErrorResponse, ErrorCode, ErrorCodes, extractToken, verifyJWT } from './auth.ts'
+import { ProjectLimiter } from './limiter.ts'
 import { ProjectStore, validRef, validSlug } from './projects.ts'
 import type {
   FunctionInfo,
@@ -21,16 +22,27 @@ export interface HandlerDeps {
   store: ProjectStore
   runtime: Runtime
   limits: Limits
+  /** Per-project caps; built from limits when absent. */
+  limiter?: ProjectLimiter
   /** Port of this runtime, denied to workers (see workerPermissions). */
   port?: string
   log?: Logger
   now?: () => number
 }
 
-function failure(code: ErrorCode, message: string, status: number): Response {
+function failure(
+  code: ErrorCode,
+  message: string,
+  status: number,
+  extra: Record<string, string> = {},
+): Response {
   return Response.json({ code, message }, {
     status,
-    headers: { 'sb-error-code': code, 'Access-Control-Expose-Headers': 'sb-error-code' },
+    headers: {
+      'sb-error-code': code,
+      'Access-Control-Expose-Headers': 'sb-error-code',
+      ...extra,
+    },
   })
 }
 
@@ -84,9 +96,24 @@ export function workerPermissions(port: string): WorkerOptions['permissions'] {
   return p
 }
 
+/**
+ * One worker pool per project, function and generation: the key keeps projects apart
+ * even if two of them were ever to share a path, and a new deployment or new secrets get
+ * new workers while the old ones idle out.
+ */
+function poolKey(ref: string, slug: string, info: FunctionInfo, env: ProjectEnv): string {
+  return `${ref}:${slug}:${info.version}:${info.dir.split('/').pop()}:${env.stamp ?? ''}`
+}
+
 export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Response> {
   const { store, runtime, limits } = deps
   const log: Logger = deps.log ?? console
+  const limiter = deps.limiter ??
+    new ProjectLimiter({
+      maxRequests: limits.maxPerProject,
+      maxWorkers: limits.maxWorkersPerProject,
+      workerTtlMs: limits.requestAbsentTimeoutMs + 5_000,
+    })
 
   async function callWorker(
     req: Request,
@@ -99,24 +126,14 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
     // The body must be saved before the first attempt reads it; a retry replays it.
     const spare = retries > 0 ? req.clone() : null
     try {
-      // A function the CLI bundled runs from its bundle; a source function from its files.
-      const code: Pick<WorkerOptions, 'servicePath' | 'maybeEntrypoint' | 'maybeEszip'> =
-        info.kind === 'eszip'
-          ? {
-            servicePath: info.dir,
-            maybeEntrypoint: info.entrypoint,
-            maybeEszip: await store.eszip(info),
-          }
-          : {
-            servicePath: info.entrypointPath.slice(0, info.entrypointPath.lastIndexOf('/')),
-            maybeEntrypoint: new URL(`file://${encodeURI(info.entrypointPath)}`).href,
-          }
       const worker: Worker = await runtime.createWorker({
-        // One worker pool per project, function and generation: the key keeps projects
-        // apart even if two of them were ever to share a path, and a new deployment
-        // or new secrets get new workers while the old ones idle out.
-        poolKey: `${ref}:${slug}:${info.version}:${info.dir.split('/').pop()}:${env.stamp ?? ''}`,
-        ...code,
+        poolKey: poolKey(ref, slug, info, env),
+        // The function runs from its bundle only: the module specifiers inside an eszip
+        // are virtual, so it cannot import files of the node (other projects' included).
+        // servicePath is the generation directory, which holds nothing but that bundle.
+        servicePath: info.dir,
+        maybeEntrypoint: info.entrypoint,
+        maybeEszip: await store.eszip(info),
         envVars: workerEnv(slug, env),
         memoryLimitMb: limits.memoryLimitMb,
         workerTimeoutMs: limits.workerTimeoutMs,
@@ -127,7 +144,6 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
         permissions: workerPermissions(deps.port ?? ''),
         context: {
           projectRef: ref,
-          ...(info.importMapPath ? { importMapPath: info.importMapPath } : {}),
           supervisor: { requestAbsentTimeoutMs: limits.requestAbsentTimeoutMs },
         },
       })
@@ -218,6 +234,21 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
       const bad = await verifyJWT(token, env.jwtSecret, deps.now?.())
       if (bad) return authErrorResponse(bad)
     }
-    return await callWorker(req, ref, slug, info, env)
+    const admission = limiter.acquire(ref, poolKey(ref, slug, info, env))
+    if ('refused' in admission) {
+      log.warn(`${ref}/${slug}: refused, the project is at its limit of ${admission.refused}`)
+      return failure(
+        ErrorCodes.ProjectAtCapacity,
+        'This project has too many functions running at once; try again shortly',
+        503,
+        { 'Retry-After': '1' },
+      )
+    }
+    const { release } = admission
+    try {
+      return await callWorker(req, ref, slug, info, env)
+    } finally {
+      release()
+    }
   }
 }

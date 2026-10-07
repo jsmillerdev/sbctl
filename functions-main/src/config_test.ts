@@ -9,6 +9,8 @@ Deno.test('loadConfig applies the defaults', () => {
     workerTimeoutMs: 400_000,
     requestIdleTimeoutMs: 150_000,
     requestAbsentTimeoutMs: 60_000,
+    maxPerProject: 8,
+    maxWorkersPerProject: 15,
     cpuTimeSoftLimitMs: 1000,
     cpuTimeHardLimitMs: 2000,
   })
@@ -21,6 +23,8 @@ Deno.test('loadConfig reads the variables the unit passes', () => {
     SBCTL_FUNCTIONS_WALL_CLOCK_SEC: '10',
     SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC: '5',
     SBCTL_FUNCTIONS_WORKER_IDLE_SEC: '2',
+    SBCTL_FUNCTIONS_MAX_PER_PROJECT: '0',
+    SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT: '3',
     SBCTL_FUNCTIONS_CPU_SOFT_MS: '0',
     SBCTL_FUNCTIONS_CPU_HARD_MS: '',
   }
@@ -30,6 +34,8 @@ Deno.test('loadConfig reads the variables the unit passes', () => {
   assertEquals(c.limits.workerTimeoutMs, 10_000)
   assertEquals(c.limits.requestIdleTimeoutMs, 5000)
   assertEquals(c.limits.requestAbsentTimeoutMs, 2000)
+  assertEquals(c.limits.maxPerProject, 0)
+  assertEquals(c.limits.maxWorkersPerProject, 3)
   assertEquals(c.limits.cpuTimeSoftLimitMs, 0)
   assertEquals(c.limits.cpuTimeHardLimitMs, 2000)
 })

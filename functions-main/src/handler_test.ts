@@ -19,6 +19,8 @@ const LIMITS: Limits = {
   workerTimeoutMs: 5000,
   requestIdleTimeoutMs: 7000,
   requestAbsentTimeoutMs: 3000,
+  maxPerProject: 0,
+  maxWorkersPerProject: 0,
   cpuTimeSoftLimitMs: 100,
   cpuTimeHardLimitMs: 200,
 }
@@ -34,7 +36,7 @@ interface Fixture {
   cleanup: () => Promise<void>
 }
 
-async function fixture(): Promise<Fixture> {
+async function fixture(limits: Partial<Limits> = {}): Promise<Fixture> {
   const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'sbctl-handler-test-' }))
   await writeProject(root, REF_A, SECRET_A, { MY_SECRET: 'a-secret', SUPABASE_URL: 'evil' }, {
     SUPABASE_ANON_KEY: 'anon-a',
@@ -51,7 +53,7 @@ async function fixture(): Promise<Fixture> {
   const handle = makeHandler({
     store: new ProjectStore(root),
     runtime: rt,
-    limits: LIMITS,
+    limits: { ...LIMITS, ...limits },
     port: '9000',
     log: silent,
   })
@@ -193,7 +195,7 @@ Deno.test("each worker gets its own project's environment and nothing of the mai
     assert(b.servicePath.includes(`/${REF_B}/`) && !b.servicePath.includes(REF_A))
     assertEquals(a.context.projectRef, REF_A)
     assertEquals(b.context.projectRef, REF_B)
-    assertEquals(a.maybeEntrypoint, `file://${a.servicePath}/index.ts`)
+    assertEquals(a.maybeEntrypoint, 'file:///src/hello/index.ts')
   } finally {
     Deno.env.delete('SBCTL_TEST_MAIN_ONLY')
     await f.cleanup()
@@ -373,7 +375,7 @@ Deno.test('a broken deployment file is a boot error, not a crash', async () => {
   }
 })
 
-Deno.test('a bundled function runs from its eszip, a source function from its files', async () => {
+Deno.test('a function runs from its bundle, in its own generation directory', async () => {
   const f = await fixture()
   try {
     await writeBundle(f.root, REF_A, 'bundled', new TextEncoder().encode('ESZIP2.3 bytes'), {
@@ -383,11 +385,83 @@ Deno.test('a bundled function runs from its eszip, a source function from its fi
     const w = f.rt.created[0]
     assertEquals(new TextDecoder().decode(w.maybeEszip), 'ESZIP2.3 bytes')
     assertEquals(w.maybeEntrypoint, 'file:///src/bundled/index.ts')
-    assertEquals(w.context.importMapPath, undefined)
     assert(w.servicePath.includes(`/${REF_A}/functions/.gen/`))
-    // A source function carries no bundle.
-    await f.handle(req('/open', REF_A))
-    assertEquals(f.rt.created[1].maybeEszip, undefined)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+Deno.test('a function that was stored as sources is not served (it could read other projects)', async () => {
+  const f = await fixture()
+  try {
+    const gen = `${f.root}/${REF_A}/functions/.gen/src-1-x`
+    await Deno.mkdir(gen, { recursive: true })
+    await Deno.writeTextFile(`${gen}/index.ts`, 'Deno.serve(() => new Response("x"))')
+    await Deno.writeTextFile(
+      `${gen}/.sbctl-function.json`,
+      JSON.stringify({ slug: 'src', version: 1, verify_jwt: false, entrypoint: 'index.ts' }),
+    )
+    await Deno.symlink(gen, `${f.root}/${REF_A}/functions/src`)
+    const res = await f.handle(req('/src', REF_A))
+    assertEquals(res.status, 404)
+    assertEquals(f.rt.created.length, 0)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+Deno.test('a project over its cap is refused at once and the other project is not affected', async () => {
+  const f = await fixture({ maxPerProject: 2, maxWorkersPerProject: 3 })
+  try {
+    let open!: () => void
+    const gate = new Promise<void>((r) => open = r)
+    f.rt.respond = async () => {
+      await gate
+      return new Response('slow')
+    }
+    const slow = [1, 2].map(() =>
+      f.handle(req('/hello', REF_A, { authorization: `Bearer ${f.anonA}` }))
+    )
+    await new Promise((r) => setTimeout(r, 20))
+    const refused = await f.handle(req('/open', REF_A))
+    assertEquals(refused.status, 503)
+    assertEquals(refused.headers.get('sb-error-code'), 'PROJECT_AT_CAPACITY')
+    assertEquals(refused.headers.get('retry-after'), '1')
+    // Project B has its own budget.
+    f.rt.respond = () => new Response('fast')
+    const b = await f.handle(req('/hello', REF_B, { authorization: `Bearer ${f.anonB}` }))
+    assertEquals(b.status, 200)
+    open()
+    for (const r of await Promise.all(slow)) assertEquals(r.status, 200)
+    // The slots are free again once the requests ended.
+    assertEquals(
+      (await f.handle(req('/hello', REF_A, { authorization: `Bearer ${f.anonA}` }))).status,
+      200,
+    )
+  } finally {
+    await f.cleanup()
+  }
+})
+
+Deno.test('a project cannot hold more live workers than its cap, and another project is unaffected', async () => {
+  const f = await fixture({ maxWorkersPerProject: 1 })
+  try {
+    assertEquals(
+      (await f.handle(req('/hello', REF_A, { authorization: `Bearer ${f.anonA}` }))).status,
+      200,
+    )
+    // The same function again reuses its worker; a second function would need another.
+    assertEquals(
+      (await f.handle(req('/hello', REF_A, { authorization: `Bearer ${f.anonA}` }))).status,
+      200,
+    )
+    const refused = await f.handle(req('/open', REF_A))
+    assertEquals(refused.status, 503)
+    assertEquals(refused.headers.get('sb-error-code'), 'PROJECT_AT_CAPACITY')
+    assertEquals(
+      (await f.handle(req('/hello', REF_B, { authorization: `Bearer ${f.anonB}` }))).status,
+      200,
+    )
   } finally {
     await f.cleanup()
   }

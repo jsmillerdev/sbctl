@@ -1,6 +1,12 @@
-import { assertEquals, assertRejects } from 'jsr:@std/assert@1'
+import {
+  assertEquals,
+  assertNotStrictEquals,
+  assertRejects,
+  assertStrictEquals,
+} from 'jsr:@std/assert@1'
 import {
   containedPath,
+  ESZIP_CACHE_BYTES,
   parseMeta,
   parseProjectEnv,
   ProjectStore,
@@ -42,21 +48,22 @@ Deno.test('parseProjectEnv and parseMeta check their shape', () => {
   assertEquals(parseProjectEnv('{"supabase":{}}'), null)
   assertEquals(parseProjectEnv('{"jwt_secret":"s","secrets":{"B":2}}'), null)
   assertEquals(parseProjectEnv('nope'), null)
-  const meta = '{"slug":"a","version":2,"verify_jwt":false,"entrypoint":"i.ts"}'
-  assertEquals(parseMeta(meta), {
-    slug: 'a',
-    version: 2,
-    verifyJwt: false,
-    kind: 'source',
-    entrypoint: 'i.ts',
-    importMap: '',
-    eszip: '',
-  })
   const bundle =
     '{"slug":"a","version":1,"verify_jwt":true,"kind":"eszip","entrypoint":"file:///src/i.ts","eszip":"bundle.eszip"}'
-  assertEquals(parseMeta(bundle)?.kind, 'eszip')
+  assertEquals(parseMeta(bundle), {
+    slug: 'a',
+    version: 1,
+    verifyJwt: true,
+    kind: 'eszip',
+    entrypoint: 'file:///src/i.ts',
+    eszip: 'bundle.eszip',
+  })
   assertEquals(parseMeta(bundle.replace(',"eszip":"bundle.eszip"', '')), null)
-  assertEquals(parseMeta(meta.replace('"entrypoint"', '"kind":"wasm","entrypoint"')), null)
+  assertEquals(parseMeta(bundle.replace('"eszip"', '"wasm"')), null)
+  // Sources are not served: no kind (what an older sbctl wrote) or kind "source".
+  const source = '{"slug":"a","version":2,"verify_jwt":false,"entrypoint":"i.ts"}'
+  assertEquals(parseMeta(source), null)
+  assertEquals(parseMeta(source.replace('"entrypoint"', '"kind":"source","entrypoint"')), null)
   assertEquals(parseMeta('{"slug":"a"}'), null)
 })
 
@@ -90,16 +97,11 @@ Deno.test('ProjectStore.fn resolves one generation and follows a new deployment'
     const one = await store.fn(REF_A, 'hello')
     assertEquals(one?.dir, gen1)
     assertEquals(one?.verifyJwt, false)
-    assertEquals(one?.entrypointPath, `${gen1}/supabase/functions/hello/index.ts`)
-    assertEquals(one?.importMapPath, '')
-    const gen2 = await writeFunction(root, REF_A, 'hello', {
-      version: 2,
-      importMap: 'supabase/functions/hello/deno.json',
-    })
+    assertEquals(one?.eszipPath, `${gen1}/bundle.eszip`)
+    const gen2 = await writeFunction(root, REF_A, 'hello', { version: 2 })
     const two = await store.fn(REF_A, 'hello')
     assertEquals(two?.dir, gen2)
     assertEquals(two?.version, 2)
-    assertEquals(two?.importMapPath, `${gen2}/supabase/functions/hello/deno.json`)
     // The other project has no such function.
     await writeProject(root, REF_B, 's')
     assertEquals(await store.fn(REF_B, 'hello'), null)
@@ -124,26 +126,6 @@ Deno.test('ProjectStore.fn never follows a link out of the project', async () =>
     const other = await writeFunction(root, REF_A, 'other')
     await Deno.symlink(other, `${root}/${REF_A}/functions/alias`)
     assertEquals(await store.fn(REF_A, 'alias'), null)
-  } finally {
-    await Deno.remove(root, { recursive: true })
-  }
-})
-
-Deno.test('ProjectStore.fn refuses an entrypoint outside the generation', async () => {
-  const root = await tmp()
-  try {
-    await writeProject(root, REF_A, 's')
-    const gen = await writeFunction(root, REF_A, 'evil')
-    await Deno.writeTextFile(
-      `${gen}/.sbctl-function.json`,
-      JSON.stringify({
-        slug: 'evil',
-        version: 1,
-        verify_jwt: true,
-        entrypoint: '../../../../etc/passwd',
-      }),
-    )
-    assertEquals(await new ProjectStore(root).fn(REF_A, 'evil'), null)
   } finally {
     await Deno.remove(root, { recursive: true })
   }
@@ -176,6 +158,29 @@ Deno.test('ProjectStore resolves a bundled function and caches its eszip', async
       }),
     )
     assertEquals(await new ProjectStore(root).fn(REF_A, 'bundled'), null)
+  } finally {
+    await Deno.remove(root, { recursive: true })
+  }
+})
+
+Deno.test('a bundle larger than the cache budget is read each time and never cached', async () => {
+  const root = await tmp()
+  try {
+    await writeProject(root, REF_A, 's')
+    const big = new Uint8Array(ESZIP_CACHE_BYTES + 1)
+    const small = new TextEncoder().encode('ESZIP2.3 small')
+    await writeBundle(root, REF_A, 'big', big)
+    await writeBundle(root, REF_A, 'small', small)
+    const store = new ProjectStore(root)
+    const bigInfo = (await store.fn(REF_A, 'big'))!
+    const first = await store.eszip(bigInfo)
+    assertEquals(first.length, big.length)
+    assertNotStrictEquals(await store.eszip(bigInfo), first)
+    // It did not evict the small one either.
+    const smallInfo = (await store.fn(REF_A, 'small'))!
+    const cached = await store.eszip(smallInfo)
+    await store.eszip(bigInfo)
+    assertStrictEquals(await store.eszip(smallInfo), cached)
   } finally {
     await Deno.remove(root, { recursive: true })
   }

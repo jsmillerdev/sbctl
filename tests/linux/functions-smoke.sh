@@ -101,7 +101,8 @@ log "the unit"
 [[ $(unit_state "$U") == active ]] || fail "$U is $(unit_state "$U")"
 [[ $(systemctl show -p User --value "$U") == "$SBCTL_USER" ]] || fail "$U does not run as $SBCTL_USER"
 [[ $(systemctl show -p Slice --value "$U") == sbctl.slice ]] || fail "$U is not in sbctl.slice"
-[[ $(systemctl show -p MemoryMax --value "$U") == 1073741824 ]] || fail "$U: MemoryMax drop-in not applied ($(systemctl show -p MemoryMax --value "$U"))"
+# 16 workers (max_parallelism) x 256 MB (memory_mb) + 256 MB for the runtime itself.
+[[ $(systemctl show -p MemoryMax --value "$U") == 4563402752 ]] || fail "$U: MemoryMax drop-in not applied ($(systemctl show -p MemoryMax --value "$U"))"
 [[ $(ss -Hltn "sport = :$P_EDGE" | awk '{print $4}') == "127.0.0.1:$P_EDGE" ]] || fail "the runtime does not listen on loopback only: $(ss -Hltn "sport = :$P_EDGE")"
 
 sees() { # PATH: exit 0 if PATH is readable from the unit's namespace as the sbctl user

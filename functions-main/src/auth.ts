@@ -19,6 +19,7 @@ export const ErrorCodes = {
   WorkerError: 'WORKER_ERROR',
   InvalidResponseStatusCode: 'INVALID_RESPONSE_STATUS_CODE',
   BadRequest: 'BAD_REQUEST',
+  ProjectAtCapacity: 'PROJECT_AT_CAPACITY',
 } as const
 
 export type ErrorCode = typeof ErrorCodes[keyof typeof ErrorCodes]

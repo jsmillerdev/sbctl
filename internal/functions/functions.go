@@ -17,6 +17,7 @@
 package functions
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -30,7 +31,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -76,6 +76,11 @@ type Syncer struct {
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
+	// settled remembers, per "<ref>/<slug>", the version stamp of a deployment that was
+	// looked at and found to have nothing to serve (no files, sources, an unusable
+	// bundle). Reconcile skips it without loading the files again until the stored
+	// deployment changes, so a large or hostile upload costs one load, not one per cycle.
+	settled map[string]string
 }
 
 var _ api.FunctionsHook = (*Syncer)(nil)
@@ -85,7 +90,7 @@ func New(d Deps) (*Syncer, error) {
 	if d.Cfg == nil || d.Registry == nil || d.Secrets == nil || d.Store == nil || d.Keys == nil {
 		return nil, errors.New("functions: Deps needs Cfg, Registry, Secrets, Store and Keys")
 	}
-	s := &Syncer{d: d, log: d.Log, now: d.Now, locks: map[string]*sync.Mutex{}}
+	s := &Syncer{d: d, log: d.Log, now: d.Now, locks: map[string]*sync.Mutex{}, settled: map[string]string{}}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
@@ -112,13 +117,17 @@ func (s *Syncer) FunctionsChanged(ctx context.Context, ref string) error {
 	return s.SyncProject(ctx, ref)
 }
 
-// eligible reports whether files should exist for a project in this status.
+// eligible reports whether files should exist for a project in this status: the statuses
+// the proxy serves (internal/proxy servable). A paused or pausing project keeps nothing
+// on disk, so a request that reaches the runtime without passing the proxy's status check
+// finds no function and no keys; resuming rebuilds the files from the store.
 func eligible(p *registry.Project) bool {
 	if p.Ref == config.SystemRef {
 		return false
 	}
 	switch p.Status {
-	case registry.StatusGoingDown, registry.StatusRemoved, registry.StatusInitFailed:
+	case registry.StatusInactive, registry.StatusPausing, registry.StatusGoingDown,
+		registry.StatusRemoved, registry.StatusInitFailed:
 		return false
 	}
 	return true
@@ -221,6 +230,7 @@ func (s *Syncer) syncLocked(ctx context.Context, ref string) error {
 			errs = append(errs, fmt.Errorf("function %s: %w", f.Slug, err))
 		}
 	}
+	s.forgetSettled(ref, want)
 	if err := s.removeStale(dir, want); err != nil {
 		errs = append(errs, err)
 	}
@@ -269,7 +279,34 @@ func (s *Syncer) RemoveProject(ref string) error {
 }
 
 // removeFiles deletes the tree of ref (the caller holds the lock).
-func (s *Syncer) removeFiles(ref string) error { return os.RemoveAll(ProjectDir(s.d.Cfg, ref)) }
+func (s *Syncer) removeFiles(ref string) error {
+	s.forgetSettled(ref, nil)
+	return os.RemoveAll(ProjectDir(s.d.Cfg, ref))
+}
+
+func (s *Syncer) isSettled(key, stamp string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settled[key] == stamp
+}
+
+func (s *Syncer) settle(key, stamp string) {
+	s.mu.Lock()
+	s.settled[key] = stamp
+	s.mu.Unlock()
+}
+
+// forgetSettled drops the entries of ref whose slug is not in keep (all of them when keep is nil).
+func (s *Syncer) forgetSettled(ref string, keep map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.settled {
+		r, slug, _ := strings.Cut(k, "/")
+		if r == ref && !keep[slug] {
+			delete(s.settled, k)
+		}
+	}
+}
 
 // envDoc is functions-env.json.
 type envDoc struct {
@@ -322,22 +359,39 @@ func jsonObject(m map[string]string) string {
 	return string(b)
 }
 
-// meta is .sbctl-function.json inside a generation.
+// meta is .sbctl-function.json inside a generation. Only bundles are served: a function
+// that runs from real source files can import files outside its own directory through
+// relative specifiers (the module loader follows them), which in a tree shared by every
+// project would reach other projects' environment files and code. The module specifiers
+// inside an eszip are virtual, so a bundled function has nothing of the node to import.
 type meta struct {
 	Slug      string `json:"slug"`
 	Version   int    `json:"version"`
 	VerifyJWT bool   `json:"verify_jwt"`
-	// Kind is "source" (files, run from the generation directory; the default) or "eszip"
-	// (a bundle the CLI built, run from Eszip).
-	Kind string `json:"kind,omitempty"`
-	// Entrypoint is a path inside the generation for source functions and the module
-	// specifier inside the bundle (a file URL) for eszip functions.
+	// Kind is "eszip", the only kind there is (main services of older sbctl versions also
+	// wrote "source", which functions-main refuses).
+	Kind string `json:"kind"`
+	// Entrypoint is the module specifier inside the bundle (a file URL).
 	Entrypoint string `json:"entrypoint"`
-	ImportMap  string `json:"import_map,omitempty"`
-	// Eszip is the file of an eszip function, relative to the generation.
-	Eszip string `json:"eszip,omitempty"`
-	// SHA256 covers the uploaded files (paths and contents).
+	// Eszip is the bundle file, relative to the generation.
+	Eszip string `json:"eszip"`
+	// Stamp identifies the stored deployment this generation was made from (see fnStamp).
+	Stamp string `json:"stamp"`
+	// SHA256 covers the upload as stored.
 	SHA256 string `json:"sha256"`
+}
+
+// fnStamp identifies one stored deployment of f. Every store write of a function (deploy,
+// patch, secrets excluded) bumps the version and the update time, so an equal stamp means
+// equal files and metadata and the generation on disk needs no work.
+func fnStamp(f *api.Function) string {
+	return fmt.Sprintf("%d:%d", f.Version, f.UpdatedAt.UnixNano())
+}
+
+// current reports whether the generation m describes is the one the store holds for f.
+func (m meta) current(f *api.Function) bool {
+	return m.Kind == kindEszip && m.Stamp == fnStamp(f) && m.Slug == f.Slug &&
+		m.VerifyJWT == f.VerifyJWT && m.Entrypoint == f.EntrypointPath
 }
 
 func filesHash(files []api.FunctionFile) string {
@@ -351,48 +405,46 @@ func filesHash(files []api.FunctionFile) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// cleanRel validates a stored file path again: the API checked it on upload, but this
-// package writes with it, so it does not rely on that.
-func cleanRel(p string) (string, error) {
-	if p == "" || strings.ContainsAny(p, "\\\x00") || path.IsAbs(p) {
-		return "", fmt.Errorf("invalid file path %q", p)
-	}
-	c := path.Clean(p)
-	if c == "." || c == ".." || strings.HasPrefix(c, "../") {
-		return "", fmt.Errorf("invalid file path %q", p)
-	}
-	return c, nil
-}
+// permanent marks an error that loading the same stored deployment again cannot fix.
+type permanent struct{ error }
 
-// syncFunction makes the generation behind <dir>/<slug> the one the store describes.
+func (p permanent) Unwrap() error { return p.error }
+
+// syncFunction makes the generation behind <dir>/<slug> the one the store describes. It
+// decides from the function's version stamp whether anything must happen before it loads
+// a single file: the files of a deployment can be large, and Reconcile visits every
+// function of every project every few seconds.
 func (s *Syncer) syncFunction(ctx context.Context, dir string, f *api.Function) error {
+	link := filepath.Join(dir, f.Slug)
+	key, stamp := f.Ref+"/"+f.Slug, fnStamp(f)
+	if s.isSettled(key, stamp) {
+		return nil
+	}
+	if cur, ok := liveMeta(link); ok && cur.current(f) {
+		return nil
+	}
 	files, err := s.d.Store.FunctionFiles(ctx, f.Ref, f.Slug)
 	if err != nil {
 		return err
 	}
-	link := filepath.Join(dir, f.Slug)
-	if len(files) == 0 {
+	switch {
+	case len(files) == 0:
 		// Created without sources (the legacy JSON create): nothing to serve.
+		s.settle(key, stamp)
+		return removeLink(link, dir, f.Slug, "")
+	case len(files) != 1 || files[0].Path != api.BundleFileName:
+		// Sources, stored before the API refused them or while no runtime was configured.
+		s.settle(key, stamp)
+		s.log.Warn("edge functions: a function stored as source files is not served; deploy it again with `supabase functions deploy` (without --use-api)",
+			"ref", f.Ref, "slug", f.Slug, "version", f.Version)
 		return removeLink(link, dir, f.Slug, "")
 	}
-	m := meta{Slug: f.Slug, Version: f.Version, VerifyJWT: f.VerifyJWT, SHA256: filesHash(files)}
-	var eszip []byte
-	if len(files) == 1 && files[0].Path == api.BundleFileName {
-		if eszip, err = decodeBundle(files[0].Content); err != nil {
-			return err
-		}
-		if f.EntrypointPath == "" {
-			return errors.New("a bundled function needs its entrypoint")
-		}
-		m.Kind, m.Entrypoint, m.ImportMap, m.Eszip = kindEszip, f.EntrypointPath, f.ImportMapPath, EszipFileName
-	} else {
-		if err := checkSourceFiles(&m, f, files); err != nil {
-			return err
-		}
+	if f.EntrypointPath == "" {
+		s.settle(key, stamp)
+		return errors.New("a bundled function needs its entrypoint")
 	}
-	if cur, ok := liveMeta(link); ok && cur == m {
-		return nil
-	}
+	m := meta{Slug: f.Slug, Version: f.Version, VerifyJWT: f.VerifyJWT, Kind: kindEszip,
+		Entrypoint: f.EntrypointPath, Eszip: EszipFileName, Stamp: stamp, SHA256: filesHash(files)}
 	gen, err := os.MkdirTemp(filepath.Join(dir, genDirName), fmt.Sprintf("%s.%d.", f.Slug, f.Version))
 	if err != nil {
 		return err
@@ -403,21 +455,12 @@ func (s *Syncer) syncFunction(ctx context.Context, dir string, f *api.Function) 
 			_ = os.RemoveAll(gen)
 		}
 	}()
-	if eszip != nil {
-		if err := os.WriteFile(filepath.Join(gen, EszipFileName), eszip, 0o600); err != nil {
-			return err
+	if err := writeBundleFile(filepath.Join(gen, EszipFileName), files[0].Content); err != nil {
+		var p permanent
+		if errors.As(err, &p) {
+			s.settle(key, stamp)
 		}
-	} else {
-		for _, file := range files {
-			c, _ := cleanRel(file.Path)
-			dst := filepath.Join(gen, filepath.FromSlash(c))
-			if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-				return err
-			}
-			if err := os.WriteFile(dst, file.Content, 0o600); err != nil {
-				return err
-			}
-		}
+		return err
 	}
 	body, err := json.Marshal(m)
 	if err != nil {
@@ -436,61 +479,49 @@ func (s *Syncer) syncFunction(ctx context.Context, dir string, f *api.Function) 
 
 const (
 	kindEszip = "eszip"
-	// EszipFileName is the decompressed bundle inside the generation of an eszip function.
+	// EszipFileName is the decompressed bundle inside a generation.
 	EszipFileName = "bundle.eszip"
-	// maxEszipSize bounds a decompressed bundle (the upload itself is limited to 64 MiB).
-	maxEszipSize = 512 << 20
+	// maxEszipSize bounds a decompressed bundle. Hosted Edge Functions accept bundles of
+	// about 20 MB; the upload itself is limited to 64 MiB compressed, and this keeps a
+	// compression bomb from filling the disk or the main service's memory.
+	maxEszipSize = 64 << 20
 )
 
-// checkSourceFiles validates the files of a source function and fills m's entrypoint and
-// import map from f.
-func checkSourceFiles(m *meta, f *api.Function, files []api.FunctionFile) (err error) {
-	if m.Entrypoint, err = cleanRel(f.EntrypointPath); err != nil {
-		return fmt.Errorf("entrypoint: %w", err)
-	}
-	if f.ImportMapPath != "" {
-		if m.ImportMap, err = cleanRel(f.ImportMapPath); err != nil {
-			return fmt.Errorf("import map: %w", err)
-		}
-	}
-	paths := make(map[string]bool, len(files))
-	for _, file := range files {
-		c, err := cleanRel(file.Path)
-		if err != nil {
-			return err
-		}
-		if c == MetaFileName || c == api.BundleFileName {
-			return fmt.Errorf("a function cannot contain a file named %s", c)
-		}
-		paths[c] = true
-	}
-	if !paths[m.Entrypoint] {
-		return fmt.Errorf("entrypoint %s is not among the uploaded files", m.Entrypoint)
-	}
-	if m.ImportMap != "" && !paths[m.ImportMap] {
-		return fmt.Errorf("import map %s is not among the uploaded files", m.ImportMap)
-	}
-	return nil
-}
-
-// decodeBundle turns an uploaded bundle ("EZBR" and a Brotli stream, as the Supabase CLI
-// sends it) into the plain eszip the runtime loads.
-func decodeBundle(body []byte) ([]byte, error) {
+// writeBundleFile decompresses an uploaded bundle ("EZBR" and a Brotli stream, as the
+// Supabase CLI sends it) into path, streaming, so memory stays small however large the
+// result would be. Failures that depend on the upload alone are permanent.
+func writeBundleFile(path string, body []byte) (err error) {
 	rest, ok := bytes.CutPrefix(body, []byte("EZBR"))
 	if !ok {
-		return nil, errors.New("the stored bundle does not start with EZBR")
+		return permanent{errors.New("the stored bundle does not start with EZBR")}
 	}
-	out, err := io.ReadAll(io.LimitReader(brotli.NewReader(bytes.NewReader(rest)), maxEszipSize+1))
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("decompressing the bundle: %w", err)
+		return err
 	}
-	if len(out) > maxEszipSize {
-		return nil, errors.New("the bundle is too large once decompressed")
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	return decodeBundle(f, rest)
+}
+
+// decodeBundle copies the plain eszip out of a Brotli stream (without the EZBR prefix)
+// to w, refusing anything that is not an eszip or exceeds maxEszipSize.
+func decodeBundle(w io.Writer, compressed []byte) error {
+	br := bufio.NewReader(brotli.NewReader(bytes.NewReader(compressed)))
+	if head, err := br.Peek(len("ESZIP")); err != nil || string(head) != "ESZIP" {
+		return permanent{errors.New("the bundle is not an eszip")}
 	}
-	if !bytes.HasPrefix(out, []byte("ESZIP")) {
-		return nil, errors.New("the bundle is not an eszip")
+	n, err := io.Copy(w, io.LimitReader(br, maxEszipSize+1))
+	if err != nil {
+		return permanent{fmt.Errorf("decompressing the bundle: %w", err)}
 	}
-	return out, nil
+	if n > maxEszipSize {
+		return permanent{fmt.Errorf("the bundle is larger than %d MiB once decompressed", maxEszipSize>>20)}
+	}
+	return nil
 }
 
 // liveMeta reads the metadata of the generation link points at.

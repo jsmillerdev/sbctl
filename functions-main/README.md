@@ -23,12 +23,11 @@ Written by `internal/functions`, read here (`src/projects.ts`); change both toge
 ```
 <SBCTL_FUNCTIONS_ROOT>/<ref>/functions-env.json       {"version":1,"jwt_secret","supabase":{SUPABASE_*},"secrets":{...}}
 <SBCTL_FUNCTIONS_ROOT>/<ref>/functions/<slug>          symlink to .gen/<slug>.<version>.<random>/
-    .sbctl-function.json                               {slug, version, verify_jwt, kind, entrypoint, import_map, eszip, sha256}
-    supabase/functions/<slug>/index.ts ...             kind "source": the uploaded files
-    bundle.eszip                                       kind "eszip": the bundle `supabase functions deploy` built
+    .sbctl-function.json                               {slug, version, verify_jwt, kind: "eszip", entrypoint, eszip, stamp, sha256}
+    bundle.eszip                                       the bundle `supabase functions deploy` built
 ```
 
-A request resolves the symlink once (`realPath`) and uses that generation's real paths from then on, so one request never mixes two deployments. A link that resolves outside the project's `functions` directory is never followed, an entrypoint or bundle name that leaves the generation is refused, and the metadata's `slug` must equal the requested one.
+A request resolves the symlink once (`realPath`) and uses that generation's real paths from then on, so one request never mixes two deployments. A link that resolves outside the project's `functions` directory is never followed, a bundle name that leaves the generation is refused, and the metadata's `slug` must equal the requested one. **Only bundles (`kind: "eszip"`) are served**; a generation without that kind (written by an older sbctl) is `404`.
 
 ## Per project, never shared
 
@@ -37,7 +36,7 @@ A request resolves the symlink once (`realPath`) and uses that generation's real
 | Environment of a worker | built from that project's file only: its secrets (never named `SUPABASE_*`), then its `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`, `SUPABASE_PUBLISHABLE_KEYS`, `SUPABASE_SECRET_KEYS`, `SUPABASE_FUNCTION_SLUG`. The main service's own environment (`PATH`, `HOME`, its settings) is not copied, unlike the upstream sample. The JWT secret never reaches a worker. |
 | JWT check | the secret of the project in the header; another project's valid token is `401` |
 | Worker pool | `poolKey = <ref>:<slug>:<version>:<generation>:<env stamp>`, so two projects never share a worker, a new deployment or new secrets get new workers and the old ones idle out |
-| Code | `servicePath` is the project's own generation directory (source) or its bundle |
+| Code | the function's own bundle (`maybeEszip`); `servicePath` is its generation directory, which holds nothing else |
 | Limits | `memoryLimitMb`, `workerTimeoutMs`, CPU soft and hard limits, `requestAbsentTimeoutMs` from `[functions]` in `config.toml`, the same for every worker |
 | Module cache | **one** `DENO_DIR` for the whole runtime (`<state_dir>/system/edge-runtime/deno`), not one per project: the runtime reads `DENO_DIR` once from its process environment, and the main worker cannot change it (`Deno.env.set` throws `NotSupported`, measured with v1.77.4). The cache is keyed by URL and holds public modules; remote imports of all projects share it. |
 
@@ -45,10 +44,16 @@ A request resolves the symlink once (`realPath`) and uses that generation's real
 
 Edge Runtime v1.77.4, user workers, with `permissions` set as in `src/handler.ts` (the runtime's defaults for user workers plus a deny rule):
 
+- **Modules.** A function runs from its eszip only. A function that ran from source files (the `--use-api` upload, which the API now refuses) could import files outside its directory: the module loader follows relative specifiers, static and dynamic, and `allow_read: []` only blocks `Deno.readTextFile`, not module loading, so with the tenants tree on disk `import("../../../../<other ref>/functions-env.json", {with: {type: "json"}})` returned the other project's JWT secret, service_role key, database password and secrets, and `import "../../../../<other ref>/functions/hello/index.ts"` ran its code (measured with v1.77.4; `customModuleRoot` did not stop it). The module URLs inside an eszip are virtual, so absolute paths, file URLs and 14 levels of `../` toward the real tenants files all fail with a module error: `tests/functions/verify.mjs` (function `escape`) asserts it on macOS and on Linux. Remote imports, bundled at deploy time by the CLI, are inside the eszip too.
 - **Disk.** `Deno.readTextFile` of `/etc/hosts`, of another project's `functions-env.json` and of the function's own files all fail with `NotFound`: a worker sees its module graph, not the disk. `tests/functions/verify.mjs` asserts this on macOS and on Linux (CI). Its `Deno.env.get` also sees only the variables above.
-- **The runtime's own port.** A worker's `fetch` to `127.0.0.1`, `localhost`, `[::1]`, `0.0.0.0` or `[::]` on the runtime's port fails with `NotCapable` (`deny_net`), so a function cannot call this service with a project reference of its choosing. The rule matches host names as written; a DNS name that points to loopback is not caught. The remaining exposure is small: a forged reference reaches only what the proxy serves to anyone, behind the function's own JWT check.
+- **The runtime's own port.** A worker's `fetch` to `127.0.0.1`, `localhost`, `[::1]`, `0.0.0.0` or `[::]` on the runtime's port fails with `NotCapable` (`deny_net`), so a function cannot call this service with a project reference of its choosing. The rule matches host names as written; a DNS name that points to loopback (or an IPv4-mapped IPv6 literal) is not caught. The remaining exposure is small: a forged reference is still checked against the JWT secret of the project it names, and a project that is not served (paused, going down, removed) has no files on disk (`internal/functions`), so the proxy's status gate cannot be bypassed this way. Authenticating the proxy to the runtime with a shared secret header would close it completely; that needs a change in `internal/proxy` and in the serve wiring.
+- **Fairness.** See the next section.
 - **Other workers' memory and CPU.** Each worker is a V8 isolate with its own heap limit; a crash, a boot failure, a busy loop or an allocation loop in one project's function ended with an error response for that request while the other project answered within milliseconds (`verify.mjs`, "runaway function", "memory limit"). This is V8 isolation, not a VM or a container: a V8 escape would reach the runtime process and, in the systemd unit, everything it can read (see `deploy/systemd/README.md`).
 - **CPU limit.** `cpuTimeHardLimitMs` is enforced by the runtime's CPU timer, which exists on Linux only (`CPU timer: not enabled (need Linux)` on macOS). On macOS a busy loop is ended by the request idle timeout (504) or the wall clock; on Linux by the CPU limit.
+
+## Fairness between projects
+
+`--max-parallelism` caps one worker pool for the whole runtime (default 16), and the unit's `MemoryMax` (default: `max_parallelism x memory_mb + 256 MB`, 4352M; config refuses a smaller `memory_max`) is shared by all of it. Without a per-project cap, one project can take every worker slot, make the others wait out the runtime's request-wait timeout, or push the cgroup over its limit, which kills the runtime for every project. `src/limiter.ts` caps, per project, the requests in flight at `[functions] max_per_project` (default `max_parallelism / 2`) and the distinct live workers (pool keys, assumed alive for the worker idle time after their last request) at `max_parallelism - 1`, so a project never holds the whole pool. A request over either cap is answered at once with `503 PROJECT_AT_CAPACITY` and `Retry-After: 1`, before any worker is touched; other projects are not affected. `tests/functions/verify.mjs` floods project A with parallel runaway and memory-hungry calls and asserts that B answers within 3 s throughout and that A's excess is refused fast. This is a cap, not a scheduler: several projects together can still fill the pool, and a node with few resources should lower `max_parallelism` (the unit's memory limit follows it) while a node with many functions per project should raise it.
 
 ## Errors
 
@@ -61,6 +66,7 @@ Shapes follow the self-hosted main service, so clients that parse them keep work
 | no / malformed / foreign / expired token | 401 | `UNAUTHORIZED_NO_AUTH_HEADER`, `UNAUTHORIZED_INVALID_JWT_FORMAT`, `UNAUTHORIZED_LEGACY_JWT`, `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM` |
 | unreadable deployment files, worker does not boot | 503 | `BOOT_ERROR` |
 | over the memory or CPU limit, request cancelled | 546 | `WORKER_RESOURCE_LIMIT` |
+| the project is over its `max_per_project` | 503 (`Retry-After: 1`) | `PROJECT_AT_CAPACITY` |
 | no response within `idle_timeout_seconds` | 504 | `IDLE_TIMEOUT` |
 | worker died or threw while answering | 500 | `WORKER_ERROR`, `EDGE_FUNCTION_ERROR`, `INVALID_RESPONSE_STATUS_CODE` |
 | the function answered 5xx itself | as sent | `EDGE_FUNCTION_ERROR` added |
@@ -79,6 +85,9 @@ The unit passes them in the environment (`internal/fleet/edgeruntime.go`); defau
 | `SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC` | `idle_timeout_seconds` (also passed as `--user-worker-request-idle-timeout`) | 150 |
 | `SBCTL_FUNCTIONS_CPU_SOFT_MS`, `_CPU_HARD_MS` | `cpu_soft_ms`, `cpu_hard_ms` (negative: off) | 1000, 2000 |
 | `SBCTL_FUNCTIONS_WORKER_IDLE_SEC` | none | 60 |
+| `SBCTL_FUNCTIONS_MAX_PER_PROJECT` | `max_per_project` (negative: off) | `max_parallelism / 2` = 8 |
+| `SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT` | none (`max_parallelism - 1`) | 15 |
+| `--max-parallelism` | `max_parallelism` | 16 |
 | `EDGE_RUNTIME_PORT` | `[ports] edge_runtime` | 9000 |
 
 ## Develop
@@ -95,7 +104,7 @@ go test ./functions-main ./internal/fleet                                 # the 
 
 - Per-project logs: a function's `console.log` goes to the runtime's log without a project tag. An event worker (`--event-worker`) could tag lines with the project of the worker's `servicePath` and write `<ref>/functions.log`; `sbctl functions logs <ref>` would then select it.
 - Asymmetric JWTs (`ES256`, `RS256`, JWKS): not needed while projects sign with HS256.
-- Per-project `DENO_DIR` (see above).
-- `static_patterns` of the CLI's `--use-api` metadata are not stored. Every uploaded file is on disk next to the function, but the runtime's virtual file system, not the real one, serves reads from a worker, and reading a static file from a function was not tested.
+- Per-project `DENO_DIR`: decided against for v1 (see "Per project, never shared"). Only eszip bundles run, and their modules are inside the bundle, so workers use the cache for nothing but public remote modules the runtime itself fetches; there is no bundler in sbctl (the CLI bundles on the client), which is where a per-project cache would have mattered.
+- Source uploads (`--use-api`) are refused, so `static_patterns` and static files next to a function do not exist. Supporting sources again needs a sandboxed bundler: copy the upload into a private temp directory, run `edge-runtime bundle` there inside a mount namespace that shows only that directory and the artifacts (for example a transient `systemd-run` unit with `TemporaryFileSystem=`), check that every `file:` specifier lies under the bundle root, and store the eszip as the generation.
 - `supabase functions download` of a function that was uploaded bundled: the stored upload is a compressed eszip, not sources.
 - Request bodies to functions are not limited by sbctl (the 64 MiB limit is on deployments).

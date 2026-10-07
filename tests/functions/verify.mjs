@@ -6,7 +6,7 @@
 // The config names both projects, their keys and the URL each is served at. Every check
 // prints "ok <name>" or throws; the exit status is non-zero on the first failure.
 import { createHmac } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import { createClient } from '@supabase/supabase-js'
 
@@ -167,6 +167,30 @@ async function mainPhase() {
     ok('a function cannot read the files of the node or the environment of the main service')
   }
 
+  // A bundled function cannot import files of the node either. A function that ran from
+  // source files could: the module loader follows relative specifiers out of its directory,
+  // which reached other projects' environment files and code (the reason sources are refused).
+  {
+    const roots = new Set([`${cfg.stateDir}/system/edge-runtime/tenants`])
+    try {
+      roots.add(`${realpathSync(cfg.stateDir)}/system/edge-runtime/tenants`)
+    } catch { /* not readable from here */ }
+    const targets = []
+    for (const t of roots) {
+      targets.push(`${t}/${b.ref}/functions-env.json`, `${t}/${b.ref}/functions/hello/.sbctl-function.json`, `${t}/${a.ref}/functions-env.json`)
+    }
+    if (existsSync(targets[0])) ok('(the paths the function is asked to import exist)')
+    const q = targets.map((t) => `t=${encodeURIComponent(t.replace(/^\//, ''))}`).join('&')
+    const r = await call(`${fnUrl(a, 'escape')}?${q}`, { headers: bearer(a.anon), timeoutMs: 90_000 })
+    assert.equal(r.status, 200, `escape: ${r.status} ${r.text}`)
+    assert.match(r.json.control, /^IMPORTED: /, `the control import (a data: URL) failed, so the test proves nothing: ${r.json.control}`)
+    const tried = Object.entries(r.json).filter(([spec]) => spec !== 'control')
+    assert.ok(tried.length >= targets.length * 16, `only ${tried.length} imports were tried`)
+    for (const [spec, res] of tried) assert.match(res, /^ERROR: /, `a function imported ${spec}: ${res}`)
+    assert.ok(!r.text.includes(b.jwtSecret) && !r.text.includes(a.jwtSecret), 'a JWT secret reached a function response')
+    ok('a function cannot import the environment files or code of any project, its own included')
+  }
+
   // 6. A function reaches its own project's database.
   // run.sh created public.fn_probe in both databases and asked PostgREST to reload.
   await sleep(2000)
@@ -216,6 +240,37 @@ async function mainPhase() {
     const hb = await invoke(b, 'hello')
     assert.equal(hb.data?.who, 'project-b')
     ok('a function over its memory limit is ended; both projects answer afterwards')
+  }
+
+  // 8. One project cannot take the shared runtime. Requests over the per-project cap
+  // (max_per_project, 8 by default) are refused at once with 503 PROJECT_AT_CAPACITY, and the
+  // other project keeps answering while project A is flooded with runaway and memory-hungry calls.
+  {
+    const flood = [
+      ...Array.from({ length: 12 }, () => call(fnUrl(a, 'spin'), { headers: bearer(a.anon), timeoutMs: 90_000 })),
+      ...Array.from({ length: 2 }, () => call(fnUrl(a, 'hog'), { headers: bearer(a.anon), timeoutMs: 90_000 })),
+    ]
+    await sleep(1000)
+    const during = []
+    for (let i = 0; i < 6; i++) {
+      during.push(await call(fnUrl(b, 'hello'), { headers: bearer(b.anon) }))
+      during.push(await call(fnUrl(b, 'open')))
+      await sleep(200)
+    }
+    for (const r of during) assert.equal(r.status, 200, `project B during the flood: ${r.status} ${r.text}`)
+    assert.ok(Math.max(...during.map((r) => r.ms)) < 3000, `project B was slow during the flood: ${during.map((r) => r.ms)}`)
+    const results = await Promise.all(flood)
+    const refused = results.filter((r) => r.status === 503 && r.headers.get('sb-error-code') === 'PROJECT_AT_CAPACITY')
+    assert.ok(refused.length >= 3, `expected the flood to be refused beyond the cap: ${results.map((r) => r.status)}`)
+    for (const r of refused) {
+      assert.ok(r.ms < 3000, `a refusal took ${r.ms} ms`)
+      assert.equal(r.headers.get('retry-after'), '1')
+    }
+    await sleep(500)
+    assert.equal((await invoke(a, 'hello')).data?.who, 'project-a', 'project A did not recover after the flood')
+    assert.equal((await invoke(b, 'hello')).data?.who, 'project-b')
+    console.log(`   (flood: ${results.map((r) => r.status).join(' ')})`)
+    ok('a flood from one project is refused beyond its cap; the other project answers within bounds')
   }
 }
 

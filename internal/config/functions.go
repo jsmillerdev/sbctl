@@ -1,6 +1,11 @@
 package config
 
-import "path/filepath"
+import (
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"strings"
+)
 
 // Defaults of the [functions] section. They follow the limits of hosted Edge Functions
 // (256 MB per worker, 2 s of CPU time per request, a 400 s wall clock, 150 s without
@@ -12,7 +17,12 @@ const (
 	DefaultFunctionsCPUSoftMs      = 1000
 	DefaultFunctionsCPUHardMs      = 2000
 	DefaultFunctionsMaxParallelism = 16
-	DefaultFunctionsReconcileSec   = 30
+	// DefaultFunctionsMaxPerProject applies when the runtime-wide cap is off.
+	DefaultFunctionsMaxPerProject = 4
+	// FunctionsRuntimeOverheadMB is what the runtime process needs besides its workers'
+	// heaps (the Deno main service, the V8 and Tokio runtimes).
+	FunctionsRuntimeOverheadMB   = 256
+	DefaultFunctionsReconcileSec = 30
 )
 
 // Functions is the [functions] config section: Edge Functions, served by the
@@ -40,9 +50,16 @@ type Functions struct {
 	// MaxParallelism caps the workers of the whole runtime alive at once. Zero means
 	// DefaultFunctionsMaxParallelism; negative means no cap.
 	MaxParallelism int `toml:"max_parallelism"`
-	// MemoryMax is the memory limit of sb-edge-runtime (systemd syntax, "2G"); empty
-	// means the [defaults] one. The runtime holds up to MaxParallelism workers of
-	// MemoryMB each, so a node with many busy functions wants more than the default.
+	// MaxPerProject caps the requests of one project in flight at once in the shared
+	// runtime; a request over it is answered 503 PROJECT_AT_CAPACITY. Zero means half of
+	// MaxParallelism (at least 1); negative means no cap. Independently of it, a project
+	// may have at most WorkersPerProject distinct live workers (MaxParallelism - 1), so it
+	// can never hold every slot of the pool.
+	MaxPerProject int `toml:"max_per_project"`
+	// MemoryMax is the memory limit of sb-edge-runtime (systemd syntax, "2G"). Empty means
+	// MaxParallelism x MemoryMB plus FunctionsRuntimeOverheadMB, the most the workers can
+	// use together; a value below that fails validation, because a runtime that hits its
+	// cgroup limit is killed whole, for every project.
 	MemoryMax string `toml:"memory_max"`
 	// ProjectURLTemplate is SUPABASE_URL as functions see it, with {ref} for the project
 	// ref. Empty derives it from the domain, the TLS mode and the public listen ports
@@ -83,6 +100,88 @@ func (f Functions) CPUHard() int { return limitOrOff(f.CPUHardMs, DefaultFunctio
 // Parallelism returns the worker cap; 0 means no cap.
 func (f Functions) Parallelism() int {
 	return limitOrOff(f.MaxParallelism, DefaultFunctionsMaxParallelism)
+}
+
+// PerProject returns the cap on one project's requests and workers; 0 means no cap.
+func (f Functions) PerProject() int {
+	switch n := f.MaxPerProject; {
+	case n < 0:
+		return 0
+	case n > 0:
+		return n
+	}
+	if p := f.Parallelism(); p > 0 {
+		return max(1, p/2)
+	}
+	return DefaultFunctionsMaxPerProject
+}
+
+// WorkersPerProject returns how many distinct live workers (functions) one project may
+// have: one less than the runtime-wide cap, so a project never holds every slot. 0 means
+// no cap (the runtime-wide cap is off).
+func (f Functions) WorkersPerProject() int {
+	if p := f.Parallelism(); p > 0 {
+		return max(1, p-1)
+	}
+	return 0
+}
+
+// RuntimeMemoryMax returns the MemoryMax of sb-edge-runtime: the configured value, or when
+// workers are capped the most they can use together plus the runtime's own needs. Empty
+// means the [defaults] limit applies (workers are uncapped and no value was set).
+func (f Functions) RuntimeMemoryMax() string {
+	if f.MemoryMax != "" {
+		return f.MemoryMax
+	}
+	if p := f.Parallelism(); p > 0 {
+		return strconv.Itoa(p*f.Memory()+FunctionsRuntimeOverheadMB) + "M"
+	}
+	return ""
+}
+
+// Validate checks that the limits agree: the workers the runtime may hold at once must
+// fit into its memory limit.
+func (f Functions) Validate() error {
+	if !f.Enabled || f.MemoryMax == "" || f.Parallelism() == 0 {
+		return nil
+	}
+	limit, finite, err := parseSystemdSize(f.MemoryMax)
+	if err != nil {
+		return fmt.Errorf("config: functions.memory_max: %w", err)
+	}
+	need := uint64(f.Parallelism()*f.Memory()+FunctionsRuntimeOverheadMB) << 20
+	if finite && limit < need {
+		return fmt.Errorf("config: functions.memory_max %s is below max_parallelism (%d) x memory_mb (%d) + %d MB = %d MB: the runtime would be killed for every project when its workers use their heaps; raise memory_max or lower max_parallelism or memory_mb",
+			f.MemoryMax, f.Parallelism(), f.Memory(), FunctionsRuntimeOverheadMB, need>>20)
+	}
+	return nil
+}
+
+// parseSystemdSize reads a size in systemd's syntax: a number with an optional K, M, G or
+// T suffix (powers of 1024), or "infinity" (finite false).
+func parseSystemdSize(s string) (n uint64, finite bool, err error) {
+	s = strings.TrimSpace(s)
+	if s == "infinity" {
+		return 0, false, nil
+	}
+	mult := uint64(1)
+	if s != "" {
+		switch s[len(s)-1] {
+		case 'K', 'k':
+			mult, s = 1<<10, s[:len(s)-1]
+		case 'M', 'm':
+			mult, s = 1<<20, s[:len(s)-1]
+		case 'G', 'g':
+			mult, s = 1<<30, s[:len(s)-1]
+		case 'T', 't':
+			mult, s = 1<<40, s[:len(s)-1]
+		}
+	}
+	v, perr := strconv.ParseUint(s, 10, 64)
+	if perr != nil {
+		return 0, false, fmt.Errorf("invalid size %q (use a number with K, M, G or T, or infinity)", s)
+	}
+	return v * mult, true, nil
 }
 
 // Reconcile returns the reconcile interval in seconds with the default applied.

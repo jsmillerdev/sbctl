@@ -29,3 +29,16 @@ func (s *Server) functionsChanged(ctx context.Context, ref string) error {
 	}
 	return nil
 }
+
+// functionsGone tells the hook that a project's status changed in a way that takes its
+// functions in or out of service (deleted, paused, resumed), so its keys and secrets leave
+// the disk now instead of at the next reconcile. The lifecycle operation has succeeded, so a
+// failure here is logged, not returned: the reconcile repeats it.
+func (s *Server) functionsGone(ctx context.Context, ref string) {
+	if s.fnHook == nil {
+		return
+	}
+	if err := s.fnHook.FunctionsChanged(ctx, ref); err != nil {
+		s.log.Warn("edge functions: applying a project status change", "ref", ref, "err", err)
+	}
+}

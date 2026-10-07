@@ -76,7 +76,7 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 		for k, v := range map[string]string{
 			"EDGE_RUNTIME_PORT": port, "SBCTL_FUNCTIONS_ROOT": realPath(cfg.Paths().FunctionsRoot()),
 			"SBCTL_FUNCTIONS_MEMORY_MB": "128", "SBCTL_FUNCTIONS_WALL_CLOCK_SEC": "20", "SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC": "9",
-			"SBCTL_FUNCTIONS_CPU_SOFT_MS": "0", "SBCTL_FUNCTIONS_CPU_HARD_MS": "3000",
+			"SBCTL_FUNCTIONS_CPU_SOFT_MS": "0", "SBCTL_FUNCTIONS_CPU_HARD_MS": "3000", "SBCTL_FUNCTIONS_MAX_PER_PROJECT": "2", "SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT": "3",
 			"DENO_DIR": filepath.Join(cfg.Paths().System(config.SvcEdgeRuntime), "deno"),
 		} {
 			if env[k] != v {
@@ -110,14 +110,17 @@ func TestEdgeRuntimeSpecDefaults(t *testing.T) {
 	for _, s := range specs {
 		if s.Service == config.SvcEdgeRuntime {
 			if env := s.Env; env["SBCTL_FUNCTIONS_MEMORY_MB"] != "256" || env["SBCTL_FUNCTIONS_WALL_CLOCK_SEC"] != "400" ||
-				env["SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC"] != "150" || env["SBCTL_FUNCTIONS_CPU_SOFT_MS"] != "1000" || env["SBCTL_FUNCTIONS_CPU_HARD_MS"] != "2000" {
+				env["SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC"] != "150" || env["SBCTL_FUNCTIONS_CPU_SOFT_MS"] != "1000" || env["SBCTL_FUNCTIONS_CPU_HARD_MS"] != "2000" || env["SBCTL_FUNCTIONS_MAX_PER_PROJECT"] != "8" || env["SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT"] != "15" {
 				t.Errorf("env %v", env)
 			}
 			if !strings.Contains(strings.Join(s.Exec, " "), "--max-parallelism 16") {
 				t.Errorf("args %v", s.Exec)
 			}
-			if s.Limits != r.n.cfg.Defaults {
-				t.Errorf("limits %+v", s.Limits)
+			// The unit's memory limit is what 16 workers of 256 MB can use, plus the runtime.
+			want := r.n.cfg.Defaults
+			want.MemoryMax = "4352M"
+			if s.Limits != want {
+				t.Errorf("limits %+v, want %+v", s.Limits, want)
 			}
 		}
 	}

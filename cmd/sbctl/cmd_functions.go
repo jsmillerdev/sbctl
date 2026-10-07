@@ -299,6 +299,11 @@ func invokeFunction(cmd *cobra.Command, n *lifecycle.Node, cfg *config.Config, r
 }
 
 func showRuntimeLog(cmd *cobra.Command, n *lifecycle.Node, ref string) error {
+	if ref != "" {
+		// The runtime has one log for all projects and a function's console output is not
+		// tagged with its project, so a project's own output cannot be selected yet.
+		fmt.Fprintf(cmd.ErrOrStderr(), "showing the lines that mention %s; function console output is not tagged by project, add --all to see the whole runtime log (it holds every project's output)\n", ref)
+	}
 	unit := units.Spec{Service: config.SvcEdgeRuntime}.Unit()
 	out := cmd.OutOrStdout()
 	keep := func(line string) bool { return ref == "" || strings.Contains(line, ref) }

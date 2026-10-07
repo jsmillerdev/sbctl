@@ -227,6 +227,11 @@ func (s *Server) deployFunction(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if s.fnHook != nil {
+		// A node that runs Edge Functions serves bundles only (see internal/functions: a
+		// function run from source files could import other projects' files).
+		return errf(http.StatusBadRequest, "This node runs Edge Functions from bundles and does not accept source uploads (supabase functions deploy --use-api). Run `supabase functions deploy` without --use-api, which bundles the function and uploads the bundle.")
+	}
 	mr, err := r.MultipartReader()
 	if err != nil {
 		return errf(http.StatusBadRequest, "Expected multipart/form-data")

@@ -2,8 +2,8 @@
 # Edge Functions end to end, against a node that is already up: the Management API and the
 # proxy reachable at $API_URL, sb-edge-runtime running, and two projects. It deploys the
 # fixtures in tests/functions/fixtures with the real `supabase functions deploy` (the
-# default flow, which bundles and uploads an eszip, and --use-api, which uploads sources),
-# sets secrets with `supabase secrets set`, calls the functions with supabase-js and fetch
+# default flow, which bundles and uploads an eszip; --use-api, which uploads sources, must be
+# refused), sets secrets with `supabase secrets set`, calls the functions with supabase-js and fetch
 # (verify.mjs), redeploys, deletes, and checks the files on disk.
 #
 # Environment (all required unless a default is shown):
@@ -84,11 +84,21 @@ json.dump({"apiUrl": api, "pat": pat, "runtimeUrl": rt or None, "stateDir": sys.
 PY
 chmod 600 "$WORK/config.json"
 
-log "deploying project A: bundled (default flow) and from sources (--use-api)"
-for slug in hello onlya dbcheck crash spin hog readfs; do
+log "deploying project A (bundled, the default flow)"
+for slug in hello onlya dbcheck crash spin hog readfs escape; do
   sb "$WORK/work-a" functions deploy "$slug" --project-ref "$REF_A" >/dev/null || fail "deploy A/$slug"
 done
-sb "$WORK/work-a" functions deploy open --no-verify-jwt --use-api --project-ref "$REF_A" >/dev/null || fail "deploy A/open (--use-api)"
+sb "$WORK/work-a" functions deploy open --no-verify-jwt --project-ref "$REF_A" >/dev/null || fail "deploy A/open"
+log "a source upload (--use-api) is refused: a function that runs from files could import other projects' files"
+if sb "$WORK/work-a" functions deploy hello --use-api --project-ref "$REF_A" >/dev/null 2>&1; then
+  fail "supabase functions deploy --use-api was accepted"
+fi
+printf 'Deno.serve(() => new Response("from source"))\n' >"$WORK/source-index.ts"
+out=$(curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $PAT" \
+  -F 'metadata={"entrypoint_path":"index.ts","name":"hello"};type=application/json' \
+  -F "file=@$WORK/source-index.ts;filename=index.ts" "$API_URL/v1/projects/$REF_A/functions/deploy?slug=hello") || fail "curl: source upload"
+[[ $(tail -n1 <<<"$out") == 400 ]] || fail "a multipart source upload answered: $out"
+grep -q "does not accept source uploads" <<<"$out" || fail "the refusal does not say why: $out"
 log "deploying project B: the same slugs with different code"
 for slug in hello dbcheck; do
   sb "$WORK/work-b" functions deploy "$slug" --project-ref "$REF_B" >/dev/null || fail "deploy B/$slug"
@@ -105,7 +115,7 @@ log "functions list (CLI) and sbctl functions list"
 # Text on a terminal or in CI, JSON for agents: ask for JSON, the one format a script can read.
 sb "$WORK/work-a" functions list --project-ref "$REF_A" --output-format json | grep -q '"slug":"hello"' || fail "supabase functions list lacks hello"
 live=$(sbctl functions list "$REF_A" --json | jget 'sum(1 for r in d if r["live"])')
-[[ $live -eq 8 ]] || fail "sbctl functions list: $live of 8 functions live"
+[[ $live -eq 9 ]] || fail "sbctl functions list: $live of 9 functions live"
 
 log "files on disk"
 for ref in "$REF_A" "$REF_B"; do
@@ -148,6 +158,20 @@ log "a deleted function is gone"
 sb "$WORK/work-a" functions delete hello --project-ref "$REF_A" --yes >/dev/null || fail "delete A/hello"
 (cd "$NODE_DIR" && node verify.mjs "$WORK/config.json" deleted) || fail "verify deleted"
 asnode test ! -e "$TENANTS/$REF_A/functions/hello" || fail "the deleted function is still on disk"
+
+log "pausing a project takes its keys and functions off the disk at once; resuming brings them back"
+api_post() { curl -s -o /dev/null -w '%{http_code}' --max-time 300 -X POST -H "Authorization: Bearer $PAT" "$API_URL/v1/projects/$1/$2"; }
+[[ $(api_post "$REF_B" pause) == 200 ]] || fail "pause $REF_B"
+asnode test ! -e "$TENANTS/$REF_B" || fail "a paused project's files are still on disk"
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${PROJECT_URL//\{ref\}/$REF_B}/functions/v1/open" || true)
+[[ $code == 503 ]] || fail "a paused project answered $code on /functions/v1"
+[[ $(api_post "$REF_B" restore) == 200 ]] || fail "restore $REF_B"
+asnode test -f "$TENANTS/$REF_B/functions-env.json" || fail "a resumed project's environment file is not back"
+for ((i = 0; i < 60; i++)); do
+  [[ $(curl -s --max-time 20 "${PROJECT_URL//\{ref\}/$REF_B}/functions/v1/open" || true) == open-b ]] && break
+  sleep 1
+done
+[[ $(curl -s --max-time 20 "${PROJECT_URL//\{ref\}/$REF_B}/functions/v1/open") == open-b ]] || fail "a resumed project does not serve its functions"
 
 log "deleting project B removes everything of it"
 sbctl projects delete "$REF_B" --skip-final-backup >/dev/null || fail "project delete"
