@@ -43,7 +43,14 @@ const browser = await chromium.launch({
   headless: true,
   ...(process.env.CHROME ? { executablePath: process.env.CHROME } : {}),
   // The node serves plain HTTP on a made-up domain: do not let Chrome try HTTPS first.
-  args: ['--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable', '--font-render-hinting=none'],
+  args: [
+    // The document is rewritten by route.fulfill below, which leaves it without a network address; Chrome then
+    // treats the node's loopback sub-resources as private-network requests from a public page and blocks them
+    // (ERR_FAILED, "blocked by CORS policy: The request client is not a secure context ..."). Switch those checks off.
+    '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights,PrivateNetworkAccessRespectPreflightResults,PrivateNetworkAccessForNavigations,PrivateNetworkAccessForWorkers,LocalNetworkAccessChecks',
+    `--unsafely-treat-insecure-origin-as-secure=${STUDIO},${E.apiUrl}`,
+    '--font-render-hinting=none',
+  ],
 })
 
 const TELEMETRY = /posthog|sentry|usercentrics|consent|google-analytics|googletagmanager|gravatar|intercom|hcaptcha|stripe|incident\.io|statsig|api\.supabase\.com|segment|datadog|vercel-insights|vercel\/insights/i
@@ -98,7 +105,7 @@ async function newPage(theme) {
     if (r.request().resourceType() === 'document') page.__net.push(`  csp: ${(r.headers()['content-security-policy'] ?? '').slice(0, 1500)}`)
   })
   page.on('response', (r) => { if (r.status() >= 400 && !/\/(_next|api\/(incident-banner|get-utc-time))/.test(r.url())) page.__bad.push(`${r.status()} ${r.request().method()} ${new URL(r.url()).pathname}`) })
-  page.on('console', (m) => m.type() === 'error' && page.__console.push(m.text().slice(0, 200)))
+  page.on('console', (m) => m.type() === 'error' && page.__console.push(m.text().slice(0, 700)))
   return { ctx, page }
 }
 
@@ -175,7 +182,7 @@ for (const theme of THEMES) {
   } catch (e) {
     await page.screenshot({ path: join(DEBUG, `ERROR-sign-in-${theme}.png`) }).catch(() => {})
     const body = await page.evaluate(() => document.body.innerText).catch(() => '')
-    writeFileSync(join(DEBUG, `sign-in-${theme}.txt`), [`url: ${page.url()}`, `console: ${[...new Set(page.__console)].join(' ; ')}`, `text: ${body.slice(0, 1500)}`, ...page.__net.slice(-200)].join('\n'))
+    writeFileSync(join(DEBUG, `sign-in-${theme}.txt`), [`url: ${page.url()}`, `console: ${[...new Set(page.__console)].slice(0, 6).join(' ; ')}`, `text: ${body.slice(0, 1500)}`, ...page.__net.slice(-200)].join('\n'))
     log(`sign-in failed (${theme}): ${e.message.split('\n')[0]}`)
     results.push({ shot: `sign-in-${theme}`, ok: false, problems: [e.message.split('\n')[0]] })
     await ctx.close()
