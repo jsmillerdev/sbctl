@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/OWNER/sbctl/internal/api"
 	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/fleet"
@@ -32,6 +33,9 @@ type Options struct {
 	Version string
 	// Fleet registers projects with the shared services (Supavisor, Realtime, Storage).
 	Fleet fleet.Fleet
+	// Artifacts replaces the artifact store (tests with unpacked artifacts); nil means the
+	// store under state_dir.
+	Artifacts lifecycle.Artifacts
 }
 
 func (o Options) log() *slog.Logger {
@@ -55,6 +59,7 @@ func LifecycleOptions(cfg *config.Config, o Options) lifecycle.OpenOptions {
 		Log:               o.log(),
 		ConfigPath:        o.ConfigPath,
 		Fleet:             o.Fleet,
+		Artifacts:         o.Artifacts,
 		ArchiveCommandFor: func(ref string) string { return backup.ArchiveCommand(cfg.BinPath, ref, o.ConfigPath) },
 		ArchiveTimeout:    timeout,
 		BackupFactory: func(n *lifecycle.Node) (lifecycle.BaseBackuper, error) {
@@ -81,4 +86,16 @@ func NewBackupService(ctx context.Context, cfg *config.Config, reg registry.Regi
 		Access:     backup.AccessFromRegistry(cfg, reg, sec),
 		ConfigPath: o.ConfigPath, Version: o.Version, Log: o.log(),
 	})
+}
+
+// PGMetaCryptoKey is the passphrase shared with sb-pgmeta (its CRYPTO_KEY variable) and the
+// Management API (the x-connection-encrypted header): [api] pgmeta_crypto_key when set,
+// else the random key kept sealed in the registry as the system secret pgmeta_crypto_key,
+// created on first use. Whoever renders the sb-pgmeta unit must pass exactly this value;
+// a mismatch makes every pg-meta call fail.
+func PGMetaCryptoKey(ctx context.Context, cfg *config.Config, reg registry.Registry, sec secrets.Secrets) (string, error) {
+	if k := cfg.API.PGMetaCryptoKey; k != "" {
+		return k, nil
+	}
+	return api.EnsurePGMetaCryptoKey(ctx, reg, sec)
 }

@@ -39,12 +39,10 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	}
 	defer node.Close()
 
-	if cfg.API.PGMetaCryptoKey == "" {
-		// Create the shared postgres-meta passphrase now, so the unit that starts pg-meta
-		// reads the same sealed secret the API uses (api.EnsurePGMetaCryptoKey).
-		if _, err := api.EnsurePGMetaCryptoKey(ctx, node.Registry, node.Secrets); err != nil {
-			return err
-		}
+	// Create the shared postgres-meta passphrase now, so the unit that starts pg-meta
+	// reads the same sealed secret the API uses (PGMetaCryptoKey).
+	if _, err := PGMetaCryptoKey(ctx, cfg, node.Registry, node.Secrets); err != nil {
+		return err
 	}
 	for _, r := range node.Engine.Recover(ctx) {
 		log.Warn("project recovered", "ref", r.Ref, "from", r.From, "to", r.To)
