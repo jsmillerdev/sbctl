@@ -5,7 +5,8 @@
 // A custom hostname goes through initialize (claim it, get a TXT token and the CNAME target),
 // reverify (the node resolves the hostname and the TXT record itself) and activate (route it,
 // let GoTrue use it). A vanity subdomain is <name>.api.<domain>, which the wildcard DNS record
-// and the wildcard certificate of the node already cover. The proxy serves both from the
+// already covers (and the wildcard certificate, on a node with a DNS-01 provider; otherwise the
+// name gets a certificate of its own, so changes are limited). The proxy serves both from the
 // registry's routes table and gates certificate issuance on it (internal/proxy).
 package domains
 
@@ -45,6 +46,18 @@ type Options struct {
 	// of ten times that stops many projects from using the node as a DNS query generator.
 	Attempts int
 	Refill   time.Duration
+	// ClaimTTL is how long a verified but not activated custom hostname holds its name after its
+	// last successful DNS check; zero means 24 hours. After that another project may claim it.
+	ClaimTTL time.Duration
+	// Activations that lead to a certificate order (a custom hostname activated, a vanity subdomain
+	// changed) are limited so that one project cannot use up the certificate authority's limits for
+	// the whole node: IssuancePerProject in IssuanceProjectWindow for a project, and
+	// IssuancePerNode in IssuanceNodeWindow for the node (counted only where the name needs a
+	// certificate of its own). Zero means 5 per 24 hours and 25 per 7 days.
+	IssuancePerProject    int
+	IssuanceProjectWindow time.Duration
+	IssuancePerNode       int
+	IssuanceNodeWindow    time.Duration
 }
 
 // Service holds the domain rules. It is safe for concurrent use.
@@ -55,6 +68,8 @@ type Service struct {
 	res   Resolver
 	now   func() time.Time
 	lim   *limiter
+	issue *windowLimiter
+	ttl   time.Duration
 }
 
 // New returns a Service. It returns nil when the registry has no domain store.
@@ -81,6 +96,24 @@ func New(o Options) *Service {
 		refill = 15 * time.Second
 	}
 	s.lim = newLimiter(n, refill, s.now)
+	s.ttl = o.ClaimTTL
+	if s.ttl <= 0 {
+		s.ttl = 24 * time.Hour
+	}
+	pn, pw, nn, nw := o.IssuancePerProject, o.IssuanceProjectWindow, o.IssuancePerNode, o.IssuanceNodeWindow
+	if pn <= 0 {
+		pn = 5
+	}
+	if pw <= 0 {
+		pw = 24 * time.Hour
+	}
+	if nn <= 0 {
+		nn = 25
+	}
+	if nw <= 0 {
+		nw = 7 * 24 * time.Hour
+	}
+	s.issue = newWindowLimiter(pn, pw, nn, nw, s.now)
 	return s
 }
 
@@ -160,7 +193,11 @@ func (s *Service) Initialize(ctx context.Context, ref, hostname string) (*State,
 		return nil, err
 	}
 	h := &registry.CustomHostname{Ref: ref, Hostname: host, Status: registry.HostnameInitiated, Token: token}
-	if err := s.store.PutCustomHostname(ctx, h); err != nil {
+	err = s.store.PutCustomHostname(ctx, h)
+	if errors.Is(err, registry.ErrConflict) && s.releaseStale(ctx, host) {
+		err = s.store.PutCustomHostname(ctx, h)
+	}
+	if err != nil {
 		return nil, s.mapStoreErr(err)
 	}
 	stored, err := s.store.GetCustomHostname(ctx, ref)
@@ -175,6 +212,14 @@ func (s *Service) mapStoreErr(err error) error {
 		return conflict("That hostname is already in use by another project")
 	}
 	return err
+}
+
+// releaseStale lets verified claims on hostname that were last proven more than the claim TTL ago
+// stop holding it, and reports whether it released any. A claim nobody activates or re-verifies
+// would otherwise keep the name from its current owner for good.
+func (s *Service) releaseStale(ctx context.Context, hostname string) bool {
+	n, err := s.store.ReleaseStaleClaims(ctx, hostname, s.now().Add(-s.ttl))
+	return err == nil && n > 0
 }
 
 func newToken() (string, error) {
@@ -200,7 +245,13 @@ func (s *Service) Reverify(ctx context.Context, ref string) (*State, error) {
 	if h.Status == registry.HostnameActive {
 		return s.state(h), nil
 	}
-	if wait := s.lim.take(ref); wait > 0 {
+	return s.verify(ctx, h)
+}
+
+// verify is one rate limited DNS check of the claim h, written back to the store. A success at
+// status 4 renews the claim's hold on the name (VerifiedAt is the time of the last proof).
+func (s *Service) verify(ctx context.Context, h *registry.CustomHostname) (*State, error) {
+	if wait := s.lim.take(h.Ref); wait > 0 {
 		return nil, &Error{Kind: KindRateLimited, Msg: "Rate limit exceeded: too many verification attempts, try again shortly", RetryAfter: wait}
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -211,19 +262,21 @@ func (s *Service) Reverify(ctx context.Context, ref string) (*State, error) {
 	switch {
 	case next.TXTOK && next.CNAMEOK:
 		next.Status = registry.HostnameOriginReady
-		if next.VerifiedAt == nil {
-			now := s.now()
-			next.VerifiedAt = &now
-		}
+		now := s.now()
+		next.VerifiedAt = &now
 	case next.TXTOK:
 		next.Status, next.VerifiedAt = registry.HostnameChallengeVerified, nil
 	default:
 		next.Status, next.VerifiedAt = registry.HostnameInitiated, nil
 	}
-	if err := s.store.UpdateCustomHostname(ctx, &next); err != nil {
+	err := s.store.UpdateCustomHostname(ctx, &next)
+	if errors.Is(err, registry.ErrConflict) && next.Status == registry.HostnameOriginReady && s.releaseStale(ctx, h.Hostname) {
+		err = s.store.UpdateCustomHostname(ctx, &next)
+	}
+	if err != nil {
 		return nil, s.mapStoreErr(err)
 	}
-	stored, err := s.store.GetCustomHostname(ctx, ref)
+	stored, err := s.store.GetCustomHostname(ctx, h.Ref)
 	if err != nil {
 		return nil, err
 	}
@@ -278,8 +331,9 @@ func (s *Service) checkOrigin(ctx context.Context, h *registry.CustomHostname) b
 
 func trimDot(s string) string { return strings.TrimSuffix(strings.ToLower(s), ".") }
 
-// Activate turns a verified hostname on: it gets its route (and so its certificate) and
-// ActivateCustomHostname's status "5_services_reconfigured". Calling it on an active hostname
+// Activate turns a verified hostname on: it checks the DNS records again, then gives the hostname
+// its route (and so its certificate) and the status "5_services_reconfigured". Orders of certificates
+// are limited per project and per node. Calling it on an active hostname
 // succeeds and changes nothing, so a caller whose reconfiguration of GoTrue failed can run it
 // again. changed is false in that case.
 func (s *Service) Activate(ctx context.Context, ref string) (st *State, changed bool, err error) {
@@ -300,6 +354,18 @@ func (s *Service) Activate(ctx context.Context, ref string) (st *State, changed 
 		return nil, false, state("The project has a vanity subdomain; a custom domain and a vanity subdomain are mutually exclusive, so delete the vanity subdomain first")
 	} else if !errors.Is(err, registry.ErrNotFound) {
 		return nil, false, err
+	}
+	// The records may have gone or moved since the last verification: check them again now (this
+	// spends a verification attempt), because activating orders a certificate for the name.
+	fresh, err := s.verify(ctx, h)
+	if err != nil {
+		return nil, false, err
+	}
+	if fresh.Status != registry.HostnameOriginReady {
+		return nil, false, state("The custom hostname's DNS records no longer verify (" + strings.Join(fresh.Errors, ", ") + "): fix them and verify again")
+	}
+	if e := s.takeIssuance(ref, true); e != nil {
+		return nil, false, e
 	}
 	act, err := s.store.ActivateCustomHostname(ctx, ref)
 	if err != nil {
@@ -409,6 +475,25 @@ func (s *Service) ActivateVanity(ctx context.Context, ref, name string) (host st
 		return "", state("The project uses a custom domain; a custom domain and a vanity subdomain are mutually exclusive, so delete the custom domain first")
 	}
 	host = s.VanityHost(n)
+	// Changing the name orders a new certificate on nodes without a wildcard, and the old one is
+	// dropped, so changes are limited. Activating the name the project has already costs nothing
+	// (and is how a caller retries a failed Auth restart); a name another project holds is refused
+	// before it can spend an attempt.
+	cur, err := s.store.GetVanitySubdomain(ctx, ref)
+	switch {
+	case err == nil && cur.Name == n:
+	case err != nil && !errors.Is(err, registry.ErrNotFound):
+		return "", err
+	default:
+		if owner, oerr := s.store.VanitySubdomainOwner(ctx, n); oerr == nil && owner != ref {
+			return "", conflict("That vanity subdomain is already taken")
+		} else if oerr != nil && !errors.Is(oerr, registry.ErrNotFound) {
+			return "", oerr
+		}
+		if e := s.takeIssuance(ref, s.vanityNeedsCertificate()); e != nil {
+			return "", e
+		}
+	}
 	if err := s.store.PutVanitySubdomain(ctx, ref, n, host); err != nil {
 		if errors.Is(err, registry.ErrConflict) {
 			return "", conflict("That vanity subdomain is already taken")
@@ -416,6 +501,33 @@ func (s *Service) ActivateVanity(ctx context.Context, ref, name string) (host st
 		return "", err
 	}
 	return host, nil
+}
+
+// vanityNeedsCertificate reports whether a vanity host gets a certificate of its own: not with
+// the wildcard of a DNS-01 setup, and not where the node terminates no TLS.
+func (s *Service) vanityNeedsCertificate() bool {
+	t := s.cfg.TLS
+	switch {
+	case t.Mode == "off", t.Mode == "dns01":
+		return false
+	case t.Mode != "http01" && t.DNSProvider != "" && s.cfg.Domain != "":
+		return false
+	}
+	return true
+}
+
+// takeIssuance spends one certificate-ordering change of the project, and of the node when the name
+// needs a certificate of its own; it returns the 429 error when a limit is used up.
+func (s *Service) takeIssuance(ref string, node bool) error {
+	wait, nodeWide := s.issue.take(ref, node)
+	if wait <= 0 {
+		return nil
+	}
+	msg := "Rate limit exceeded: this project has changed its domains too often, try again later"
+	if nodeWide {
+		msg = "Rate limit exceeded: this node has reached its limit of domain changes that need a new certificate, try again later"
+	}
+	return &Error{Kind: KindRateLimited, Msg: msg, RetryAfter: wait}
 }
 
 // DeleteVanity removes the project's vanity subdomain; a *Error of KindNotConfigured when it has none.
@@ -515,4 +627,61 @@ func (l *limiter) take(key string) time.Duration {
 	b.tokens--
 	l.node.tokens--
 	return 0
+}
+
+// windowLimiter counts events in a sliding window per key and for the node.
+type windowLimiter struct {
+	mu      sync.Mutex
+	now     func() time.Time
+	perMax  int
+	perWin  time.Duration
+	nodeMax int
+	nodeWin time.Duration
+	per     map[string][]time.Time
+	node    []time.Time
+}
+
+func newWindowLimiter(perMax int, perWin time.Duration, nodeMax int, nodeWin time.Duration, now func() time.Time) *windowLimiter {
+	return &windowLimiter{now: now, perMax: perMax, perWin: perWin, nodeMax: nodeMax, nodeWin: nodeWin, per: map[string][]time.Time{}}
+}
+
+// within keeps the timestamps newer than cutoff.
+func within(ts []time.Time, cutoff time.Time) []time.Time {
+	i := 0
+	for i < len(ts) && !ts[i].After(cutoff) {
+		i++
+	}
+	return ts[i:]
+}
+
+// take records one event of key (and of the node when node is true) and returns 0, or, when a limit
+// is used up, how long until the oldest event leaves its window and whether that was the node's limit.
+// A refused call records nothing.
+func (l *windowLimiter) take(key string, node bool) (wait time.Duration, nodeWide bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	ts := within(l.per[key], now.Add(-l.perWin))
+	l.node = within(l.node, now.Add(-l.nodeWin))
+	if len(ts) >= l.perMax {
+		wait = ts[0].Add(l.perWin).Sub(now)
+	}
+	if node && len(l.node) >= l.nodeMax {
+		if w := l.node[0].Add(l.nodeWin).Sub(now); w > wait {
+			wait, nodeWide = w, true
+		}
+	}
+	if wait > 0 {
+		if len(ts) == 0 {
+			delete(l.per, key)
+		} else {
+			l.per[key] = ts
+		}
+		return wait, nodeWide
+	}
+	l.per[key] = append(ts, now)
+	if node {
+		l.node = append(l.node, now)
+	}
+	return 0, false
 }

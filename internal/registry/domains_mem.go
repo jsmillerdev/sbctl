@@ -122,6 +122,20 @@ func (m *Memory) ListCustomHostnames(context.Context) ([]CustomHostname, error) 
 	return out, nil
 }
 
+func (m *Memory) ReleaseStaleClaims(_ context.Context, hostname string, cutoff time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for ref, h := range m.hostnames {
+		if h.Hostname == hostname && h.Status == HostnameOriginReady && (h.VerifiedAt == nil || h.VerifiedAt.Before(cutoff)) {
+			h.Status, h.CNAMEOK, h.TXTOK, h.VerifiedAt, h.UpdatedAt = HostnameInitiated, false, false, nil, time.Now()
+			m.hostnames[ref] = h
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (m *Memory) GetVanitySubdomain(_ context.Context, ref string) (*VanitySubdomain, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

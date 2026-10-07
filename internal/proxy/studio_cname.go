@@ -20,24 +20,37 @@ import (
 // to Cloudflare. Studio only needs an Answer (it does not look at what the records are), so an
 // A or AAAA record passes as well as a CNAME, the same as the node's own verification.
 
-// cnameCheckPerMinute bounds the lookups this route makes for anyone who can reach the dashboard
-// host; the route is unauthenticated, like Studio's own.
-const cnameCheckPerMinute = 30
+// The route is unauthenticated, like Studio's own: the browser calls it without the dashboard's
+// token, so the node cannot tell a signed-in user from anyone else who reaches the Studio host. It is
+// limited per client address, so that one client cannot use up the budget of the others, and by a
+// higher ceiling for the whole node, which bounds the lookups it makes for a crowd of clients.
+const (
+	cnameCheckPerIPMinute = 20
+	cnameCheckPerMinute   = 300
+)
 
 type cnameLimiter struct {
 	mu     sync.Mutex
 	window time.Time
 	n      int
+	perIP  map[string]int
 }
 
-func (l *cnameLimiter) allow(now time.Time) bool {
+// allow counts one request of ip in the current minute. A refusal because of ip's own count does
+// not use the node's budget, and the table only grows with allowed requests, so it holds at most
+// cnameCheckPerMinute addresses.
+func (l *cnameLimiter) allow(now time.Time, ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if now.Sub(l.window) >= time.Minute {
-		l.window, l.n = now, 0
+	if l.perIP == nil || now.Sub(l.window) >= time.Minute {
+		l.window, l.n, l.perIP = now, 0, map[string]int{}
 	}
+	if l.perIP[ip] >= cnameCheckPerIPMinute || l.n >= cnameCheckPerMinute {
+		return false
+	}
+	l.perIP[ip]++
 	l.n++
-	return l.n <= cnameCheckPerMinute
+	return true
 }
 
 // dohRecord is one record of a DNS-over-HTTPS JSON answer.
@@ -61,7 +74,7 @@ func (s *Server) answerCNAMECheck(w http.ResponseWriter, r *http.Request) bool {
 		_ = json.NewEncoder(w).Encode(map[string]string{"message": msg})
 		return true
 	}
-	if !s.cnameLimit.allow(time.Now()) {
+	if !s.cnameLimit.allow(time.Now(), clientIP(r)) {
 		w.Header().Set("Retry-After", "60")
 		return fail(http.StatusTooManyRequests, "Rate limit exceeded")
 	}

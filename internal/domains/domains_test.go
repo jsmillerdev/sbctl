@@ -533,3 +533,227 @@ func TestProjectDeleteCleansUp(t *testing.T) {
 		t.Fatal("the vanity name was not released")
 	}
 }
+
+// verified claims ref's host and makes the fake DNS prove it, leaving the claim at status 4.
+func (e *env) verified(t *testing.T, ref, host string) *State {
+	t.Helper()
+	ctx := context.Background()
+	st, err := e.svc.Initialize(ctx, ref, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.dns.txt[st.TXTName] = []string{st.TXTValue}
+	e.dns.host[host] = []string{"203.0.113.7"}
+	e.now = e.now.Add(time.Minute)
+	if st, err = e.svc.Reverify(ctx, ref); err != nil || st.Status != registry.HostnameOriginReady {
+		t.Fatalf("verify %s: %+v %v", host, st, err)
+	}
+	return st
+}
+
+// Activation looks at the DNS again: a claim verified earlier whose records are gone is not
+// activated, and drops back to what the records now show.
+func TestActivateChecksDNSAgain(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+	st := e.verified(t, refA, "docs.example.org")
+
+	delete(e.dns.txt, st.TXTName)
+	e.now = e.now.Add(time.Minute)
+	if _, _, err := e.svc.Activate(ctx, refA); kindOf(t, err) != KindState {
+		t.Fatalf("activate with the TXT record gone: %v", err)
+	}
+	if got, _ := e.svc.Hostname(ctx, refA); got.Status != registry.HostnameInitiated {
+		t.Fatalf("status after the failed activation: %+v", got)
+	}
+	if routes, _ := e.reg.ListRoutes(ctx); len(routes) != 0 {
+		t.Fatalf("routed: %+v", routes)
+	}
+
+	// The CNAME/A record moved away.
+	e.dns.txt[st.TXTName] = []string{st.TXTValue}
+	e.now = e.now.Add(time.Minute)
+	if got, err := e.svc.Reverify(ctx, refA); err != nil || got.Status != registry.HostnameOriginReady {
+		t.Fatalf("verify again: %+v %v", got, err)
+	}
+	e.dns.host["docs.example.org"] = []string{"198.51.100.9"}
+	e.now = e.now.Add(time.Minute)
+	if _, _, err := e.svc.Activate(ctx, refA); kindOf(t, err) != KindState {
+		t.Fatalf("activate with the hostname elsewhere: %v", err)
+	}
+	if got, _ := e.svc.Hostname(ctx, refA); got.Status != registry.HostnameChallengeVerified {
+		t.Fatalf("status: %+v", got)
+	}
+
+	// Back in place: it activates.
+	e.dns.host["docs.example.org"] = []string{"203.0.113.7"}
+	e.now = e.now.Add(time.Minute)
+	if _, err := e.svc.Reverify(ctx, refA); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := e.svc.Activate(ctx, refA); err != nil || !changed {
+		t.Fatalf("activate: %v %v", changed, err)
+	}
+
+	// The check spends a verification attempt like Reverify does.
+	e2 := newEnv(t, nil)
+	e2.verified(t, refA, "docs.example.org")
+	for i := 0; i < 4; i++ { // the attempt of verified() and these four use the burst of five
+		if _, err := e2.svc.Reverify(ctx, refA); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+	e2.dns.calls = 0
+	if _, _, err := e2.svc.Activate(ctx, refA); kindOf(t, err) != KindRateLimited || e2.dns.calls != 0 {
+		t.Fatalf("activate over the limit: %v (%d lookups)", err, e2.dns.calls)
+	}
+}
+
+// A verified claim that nobody activates or verifies again stops holding the hostname after the
+// claim TTL, so a former DNS controller cannot park a name for good.
+func TestStaleVerifiedClaimReleasesHostname(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+	e.verified(t, refA, "shop.example.org")
+
+	if _, err := e.svc.Initialize(ctx, refB, "shop.example.org"); kindOf(t, err) != KindConflict {
+		t.Fatalf("claiming a freshly verified hostname: %v", err)
+	}
+	e.now = e.now.Add(23 * time.Hour)
+	if _, err := e.svc.Initialize(ctx, refB, "shop.example.org"); kindOf(t, err) != KindConflict {
+		t.Fatalf("claiming it inside the TTL: %v", err)
+	}
+
+	// B, whose claim is pending, proves the name after the TTL: A's stale hold goes.
+	e.now = e.now.Add(2 * time.Hour)
+	b, err := e.svc.Initialize(ctx, refB, "shop.example.org")
+	if err != nil {
+		t.Fatalf("claiming it after the TTL: %v", err)
+	}
+	if a, _ := e.svc.Hostname(ctx, refA); a.Status != registry.HostnameInitiated || a.TXTOK || a.CNAMEOK {
+		t.Fatalf("A's claim after the release: %+v", a)
+	}
+	e.dns.txt[b.TXTName] = []string{b.TXTValue}
+	if st, err := e.svc.Reverify(ctx, refB); err != nil || st.Status != registry.HostnameOriginReady {
+		t.Fatalf("B verifying: %+v %v", st, err)
+	}
+
+	// The same through Reverify: B pending first, A verified, A stale, B verifies.
+	e2 := newEnv(t, nil)
+	e2.verified(t, refA, "shop.example.org")
+	b2, err := e2.svc.Initialize(ctx, refB, "shop.example.org")
+	if err == nil {
+		t.Fatalf("B claimed a held name: %+v", b2)
+	}
+	// A's last proof is renewed by each successful verification.
+	e2.now = e2.now.Add(20 * time.Hour)
+	if _, err := e2.svc.Reverify(ctx, refA); err != nil {
+		t.Fatal(err)
+	}
+	e2.now = e2.now.Add(20 * time.Hour)
+	if _, err := e2.svc.Initialize(ctx, refB, "shop.example.org"); kindOf(t, err) != KindConflict {
+		t.Fatalf("a renewed claim lost its hold: %v", err)
+	}
+	// An active hostname never expires.
+	if _, _, err := e2.svc.Activate(ctx, refA); err != nil {
+		t.Fatal(err)
+	}
+	e2.now = e2.now.Add(30 * 24 * time.Hour)
+	if _, err := e2.svc.Initialize(ctx, refB, "shop.example.org"); kindOf(t, err) != KindConflict {
+		t.Fatalf("claiming an active hostname: %v", err)
+	}
+}
+
+// Activations that order certificates are limited per project and per node, and the limit comes back
+// when the window has passed.
+func TestIssuanceLimits(t *testing.T) {
+	ctx := context.Background()
+	rebuild := func(e *env, o Options) {
+		o.Reg, o.Config, o.Resolver = e.reg, e.cfg, e.dns
+		o.Now = func() time.Time { return e.now }
+		e.svc = New(o)
+	}
+
+	t.Run("custom hostname per project", func(t *testing.T) {
+		e := newEnv(t, nil)
+		rebuild(e, Options{IssuancePerProject: 2, IssuanceProjectWindow: time.Hour, Attempts: 100})
+		for i := 0; i < 2; i++ {
+			e.verified(t, refA, "docs.example.org")
+			if _, _, err := e.svc.Activate(ctx, refA); err != nil {
+				t.Fatalf("activation %d: %v", i, err)
+			}
+			if _, err := e.svc.Delete(ctx, refA); err != nil {
+				t.Fatal(err)
+			}
+		}
+		e.verified(t, refA, "docs.example.org")
+		_, _, err := e.svc.Activate(ctx, refA)
+		var de *Error
+		if !errors.As(err, &de) || de.Kind != KindRateLimited || de.RetryAfter <= 0 || de.RetryAfter > time.Hour {
+			t.Fatalf("third activation: %v", err)
+		}
+		if routes, _ := e.reg.ListRoutes(ctx); len(routes) != 0 {
+			t.Fatalf("a refused activation was routed: %+v", routes)
+		}
+		// Activating an active hostname again is free.
+		e.now = e.now.Add(time.Hour + time.Minute)
+		if _, _, err := e.svc.Activate(ctx, refA); err != nil {
+			t.Fatalf("after the window: %v", err)
+		}
+		if _, changed, err := e.svc.Activate(ctx, refA); err != nil || changed {
+			t.Fatalf("repeat: %v %v", changed, err)
+		}
+	})
+
+	t.Run("vanity per project", func(t *testing.T) {
+		e := newEnv(t, nil)
+		rebuild(e, Options{IssuancePerProject: 2, IssuanceProjectWindow: time.Hour})
+		for _, n := range []string{"one", "two"} {
+			if _, err := e.svc.ActivateVanity(ctx, refA, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The name the project has costs nothing; a taken name is refused as taken, not as a limit.
+		if _, err := e.svc.ActivateVanity(ctx, refA, "two"); err != nil {
+			t.Fatalf("same name again: %v", err)
+		}
+		if _, err := e.svc.ActivateVanity(ctx, refB, "two"); kindOf(t, err) != KindConflict {
+			t.Fatalf("taken name: %v", err)
+		}
+		if _, err := e.svc.ActivateVanity(ctx, refA, "three"); kindOf(t, err) != KindRateLimited {
+			t.Fatalf("third name: %v", err)
+		}
+		if v, _ := e.svc.Vanity(ctx, refA); v.Name != "two" {
+			t.Fatalf("a refused change was applied: %+v", v)
+		}
+		e.now = e.now.Add(61 * time.Minute)
+		if _, err := e.svc.ActivateVanity(ctx, refA, "three"); err != nil {
+			t.Fatalf("after the window: %v", err)
+		}
+	})
+
+	t.Run("node", func(t *testing.T) {
+		e := newEnv(t, nil)
+		rebuild(e, Options{IssuancePerProject: 10, IssuancePerNode: 3, IssuanceNodeWindow: 24 * time.Hour})
+		for _, c := range []struct{ ref, name string }{{refA, "a1"}, {refA, "a2"}, {refB, "b1"}} {
+			if _, err := e.svc.ActivateVanity(ctx, c.ref, c.name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, err := e.svc.ActivateVanity(ctx, refB, "b2")
+		var de *Error
+		if !errors.As(err, &de) || de.Kind != KindRateLimited || !strings.Contains(de.Msg, "node") {
+			t.Fatalf("fourth change on the node: %v", err)
+		}
+	})
+
+	t.Run("a wildcard certificate covers vanity names", func(t *testing.T) {
+		e := newEnv(t, func(c *config.Config) { c.TLS.DNSProvider = "route53" })
+		rebuild(e, Options{IssuancePerProject: 10, IssuancePerNode: 1})
+		for _, c := range []struct{ ref, name string }{{refA, "a1"}, {refA, "a2"}, {refB, "b1"}} {
+			if _, err := e.svc.ActivateVanity(ctx, c.ref, c.name); err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+		}
+	})
+}

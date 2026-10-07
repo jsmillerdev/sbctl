@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -374,13 +375,49 @@ func TestStudioCNAMECheckIsAnsweredByTheNode(t *testing.T) {
 	}
 	// The route is limited.
 	limited := false
-	for i := 0; i < cnameCheckPerMinute+2; i++ {
+	for i := 0; i < cnameCheckPerIPMinute+2; i++ {
 		if code, _ := get("a.customer.example"); code == 429 {
 			limited = true
 		}
 	}
 	if !limited {
 		t.Error("no rate limit")
+	}
+}
+
+// TestCNAMECheckLimiter: one client draining its own allowance does not stop the others, and the
+// node as a whole has a ceiling.
+func TestCNAMECheckLimiter(t *testing.T) {
+	var l cnameLimiter
+	now := time.Unix(1_700_000_000, 0)
+	for i := 0; i < cnameCheckPerIPMinute; i++ {
+		if !l.allow(now, "198.51.100.1") {
+			t.Fatalf("request %d of one client refused", i)
+		}
+	}
+	if l.allow(now, "198.51.100.1") {
+		t.Fatal("a client over its allowance was served")
+	}
+	if !l.allow(now, "198.51.100.2") {
+		t.Fatal("another client was refused because of the first")
+	}
+	// Refused requests do not use the node's budget.
+	if l.n != cnameCheckPerIPMinute+1 {
+		t.Fatalf("node count %d", l.n)
+	}
+	if !l.allow(now.Add(time.Minute), "198.51.100.1") {
+		t.Fatal("the allowance did not come back")
+	}
+	// Many clients reach the node's ceiling.
+	var m cnameLimiter
+	served := 0
+	for i := 0; i < cnameCheckPerMinute+50; i++ {
+		if m.allow(now, fmt.Sprintf("10.%d.%d.1", i/250, i%250)) {
+			served++
+		}
+	}
+	if served != cnameCheckPerMinute {
+		t.Fatalf("served %d, want %d", served, cnameCheckPerMinute)
 	}
 }
 

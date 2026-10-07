@@ -342,3 +342,88 @@ func TestCustomDomainsAddon(t *testing.T) {
 		}
 	}
 }
+
+// A change that failed at Auth after it was stored can be repeated: deleting again (and activating
+// the same vanity name again) restarts Auth, though the store has nothing left to change.
+func TestDomainDeleteRetriesAuth(t *testing.T) {
+	f := newFixture(t)
+	dns := f.withDNS()
+	ctx := context.Background()
+	st, _ := f.srv.domains.Initialize(ctx, testRef, "docs.example.org")
+	dns.txt[st.TXTName] = []string{st.TXTValue}
+	dns.host["docs.example.org"] = []string{"203.0.113.7"}
+	if _, err := f.srv.domains.Reverify(ctx, testRef); err != nil {
+		t.Fatal(err)
+	}
+	if rec := f.do("POST", "/v1/projects/"+testRef+"/custom-hostname/activate", nil); rec.Code != 201 {
+		t.Fatalf("activate: %d %s", rec.Code, rec.Body)
+	}
+	fail := true
+	f.mgr.applyHook = func(projectconfig.Service) error {
+		if fail {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	const hp = "/v1/projects/" + testRef + "/custom-hostname"
+	if rec := f.do("DELETE", hp, nil); rec.Code != 500 || !strings.Contains(rec.Body.String(), "repeat the request") {
+		t.Fatalf("delete with a failing Auth restart: %d %s", rec.Code, rec.Body)
+	}
+	fail = false
+	applied := len(f.mgr.applied)
+	if rec := f.do("DELETE", hp, nil); rec.Code != 400 {
+		t.Fatalf("repeated delete: %d %s", rec.Code, rec.Body)
+	}
+	if len(f.mgr.applied) != applied+1 {
+		t.Fatalf("the repeated delete did not restart Auth: %v", f.mgr.applied)
+	}
+
+	const vp = "/v1/projects/" + testRef + "/vanity-subdomain"
+	fail = true
+	if rec := f.do("POST", vp+"/activate", map[string]any{"vanity_subdomain": "acme"}); rec.Code != 500 {
+		t.Fatalf("vanity activate with a failing Auth restart: %d %s", rec.Code, rec.Body)
+	}
+	fail = false
+	applied = len(f.mgr.applied)
+	if rec := f.do("POST", vp+"/activate", map[string]any{"vanity_subdomain": "acme"}); rec.Code != 201 {
+		t.Fatalf("repeated vanity activate: %d %s", rec.Code, rec.Body)
+	}
+	if len(f.mgr.applied) != applied+1 {
+		t.Fatalf("the repeated activate did not restart Auth: %v", f.mgr.applied)
+	}
+	fail = true
+	if rec := f.do("DELETE", vp, nil); rec.Code != 500 {
+		t.Fatalf("vanity delete with a failing Auth restart: %d %s", rec.Code, rec.Body)
+	}
+	fail = false
+	applied = len(f.mgr.applied)
+	if rec := f.do("DELETE", vp, nil); rec.Code != 400 {
+		t.Fatalf("repeated vanity delete: %d %s", rec.Code, rec.Body)
+	}
+	if len(f.mgr.applied) != applied+1 {
+		t.Fatalf("the repeated vanity delete did not restart Auth: %v", f.mgr.applied)
+	}
+}
+
+// Changes that order a certificate are limited per project: the sixth different vanity name in a
+// day answers 429 with Retry-After, and the name the project has already costs nothing.
+func TestVanityChangesAreRateLimited(t *testing.T) {
+	f := newFixture(t)
+	f.withDNS()
+	const p = "/v1/projects/" + testRef + "/vanity-subdomain/activate"
+	for _, n := range []string{"one", "two", "three", "four", "five"} {
+		if rec := f.do("POST", p, map[string]any{"vanity_subdomain": n}); rec.Code != 201 {
+			t.Fatalf("activate %s: %d %s", n, rec.Code, rec.Body)
+		}
+	}
+	if rec := f.do("POST", p, map[string]any{"vanity_subdomain": "five"}); rec.Code != 201 {
+		t.Fatalf("activating the current name again: %d %s", rec.Code, rec.Body)
+	}
+	rec := f.do("POST", p, map[string]any{"vanity_subdomain": "six"})
+	if rec.Code != 429 || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("sixth name: %d %v %s", rec.Code, rec.Header(), rec.Body)
+	}
+	if f.routeFor("six.api.example.test") != nil {
+		t.Fatal("a refused change was routed")
+	}
+}

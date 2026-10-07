@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -134,6 +135,18 @@ func (r *Postgres) ListCustomHostnames(ctx context.Context) ([]CustomHostname, e
 		}
 		return *h, nil
 	})
+}
+
+func (r *Postgres) ReleaseStaleClaims(ctx context.Context, hostname string, cutoff time.Time) (int, error) {
+	tag, err := r.pool.Exec(ctx, `
+		update supavise.custom_hostnames
+		   set status = $2, cname_ok = false, txt_ok = false, verified_at = null, updated_at = now()
+		 where hostname = $1 and status = $3 and (verified_at is null or verified_at < $4)`,
+		hostname, HostnameInitiated, HostnameOriginReady, cutoff)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 func (r *Postgres) GetVanitySubdomain(ctx context.Context, ref string) (*VanitySubdomain, error) {

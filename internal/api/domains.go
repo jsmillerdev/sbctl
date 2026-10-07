@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -202,14 +201,19 @@ func (s *Server) deleteCustomHostname(w http.ResponseWriter, r *http.Request) er
 		return err
 	}
 	defer done()
-	wasActive, err := svc.Delete(r.Context(), p.Ref)
+	_, err = svc.Delete(r.Context(), p.Ref)
 	if err != nil {
+		// Also when there is nothing left to delete: a first attempt may have failed at Auth, and
+		// deleting again is how the user retries it. The refusal is still answered.
+		if e, ok := domains.AsError(err); ok && e.Kind == domains.KindNotConfigured {
+			if aerr := s.applyDomainChange(r, p.Ref); aerr != nil {
+				return aerr
+			}
+		}
 		return domainError(w, err)
 	}
-	if wasActive {
-		if err := s.applyDomainChange(r, p.Ref); err != nil {
-			return err
-		}
+	if err := s.applyDomainChange(r, p.Ref); err != nil {
+		return err
 	}
 	w.WriteHeader(http.StatusOK)
 	return nil
@@ -232,11 +236,6 @@ func (s *Server) applyDomainChange(r *http.Request, ref string) error {
 		return errf(http.StatusInternalServerError, "The domain change is saved but Auth could not be restarted on it; repeat the request to try again")
 	}
 	return nil
-}
-
-// externalHost is the host GoTrue presents for ref, "" for the derived one.
-func (s *Server) externalHost(ctx context.Context, ref string) (string, error) {
-	return domains.ExternalHost(ctx, s.reg, s.cfg, ref)
 }
 
 type vanityBody struct {
@@ -308,20 +307,14 @@ func (s *Server) activateVanity(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	defer done()
-	before, err := s.externalHost(r.Context(), p.Ref)
-	if err != nil {
-		return err
-	}
 	host, err := svc.ActivateVanity(r.Context(), p.Ref, in.Name)
 	if err != nil {
 		return domainError(w, err)
 	}
-	if after, err := s.externalHost(r.Context(), p.Ref); err != nil {
+	// Always, as for a custom hostname: activating the name the project has already is how a
+	// caller retries an Auth restart that failed after the change was stored.
+	if err := s.applyDomainChange(r, p.Ref); err != nil {
 		return err
-	} else if after != before {
-		if err := s.applyDomainChange(r, p.Ref); err != nil {
-			return err
-		}
 	}
 	resp := base("POST /v1/projects/{ref}/vanity-subdomain/activate")
 	resp["custom_domain"] = host
@@ -343,19 +336,18 @@ func (s *Server) deleteVanity(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	defer done()
-	before, err := s.externalHost(r.Context(), p.Ref)
-	if err != nil {
-		return err
-	}
 	if err := svc.DeleteVanity(r.Context(), p.Ref); err != nil {
+		// Also when there is nothing left to delete, so that a delete whose Auth restart failed can
+		// be repeated; the refusal is still answered.
+		if e, ok := domains.AsError(err); ok && e.Kind == domains.KindNotConfigured {
+			if aerr := s.applyDomainChange(r, p.Ref); aerr != nil {
+				return aerr
+			}
+		}
 		return domainError(w, err)
 	}
-	if after, err := s.externalHost(r.Context(), p.Ref); err != nil {
+	if err := s.applyDomainChange(r, p.Ref); err != nil {
 		return err
-	} else if after != before {
-		if err := s.applyDomainChange(r, p.Ref); err != nil {
-			return err
-		}
 	}
 	w.WriteHeader(http.StatusOK)
 	return nil

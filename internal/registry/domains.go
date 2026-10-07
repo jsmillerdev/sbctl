@@ -64,6 +64,10 @@ type DomainStore interface {
 	// DeleteCustomHostname removes the claim and, when it was active, its route.
 	DeleteCustomHostname(ctx context.Context, ref string) error
 	ListCustomHostnames(ctx context.Context) ([]CustomHostname, error)
+	// ReleaseStaleClaims sets every verified but not active claim on hostname whose last proof
+	// (VerifiedAt) is before cutoff back to HostnameInitiated, so that it stops holding the
+	// name, and returns how many it released. Active claims are never touched.
+	ReleaseStaleClaims(ctx context.Context, hostname string, cutoff time.Time) (int, error)
 
 	GetVanitySubdomain(ctx context.Context, ref string) (*VanitySubdomain, error)
 	// VanitySubdomainOwner returns the ref that holds name; ErrNotFound when it is free.

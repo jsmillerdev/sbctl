@@ -89,6 +89,22 @@ func testDomains(t *testing.T, r Registry) {
 	if err := d.PutCustomHostname(ctx, &CustomHostname{Ref: b, Hostname: "docs.example.org", Status: HostnameInitiated, Token: "tok-b2"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("claiming a held name: %v", err)
 	}
+	// A verified claim whose proof is old stops holding the name; a fresh one keeps it.
+	if n, err := d.ReleaseStaleClaims(ctx, "docs.example.org", now.Add(-time.Hour)); err != nil || n != 0 {
+		t.Fatalf("releasing a fresh claim: %d %v", n, err)
+	}
+	if n, err := d.ReleaseStaleClaims(ctx, "elsewhere.example.org", now.Add(time.Hour)); err != nil || n != 0 {
+		t.Fatalf("releasing another hostname: %d %v", n, err)
+	}
+	if n, err := d.ReleaseStaleClaims(ctx, "docs.example.org", now.Add(time.Hour)); err != nil || n != 1 {
+		t.Fatalf("releasing a stale claim: %d %v", n, err)
+	}
+	if rel, err := d.GetCustomHostname(ctx, a); err != nil || rel.Status != HostnameInitiated || rel.CNAMEOK || rel.TXTOK || rel.VerifiedAt != nil {
+		t.Fatalf("released claim: %+v %v", rel, err)
+	}
+	if err := d.UpdateCustomHostname(ctx, got); err != nil { // a proves it again
+		t.Fatalf("verifying again: %v", err)
+	}
 	// A stale writer (the claim was replaced meanwhile) is refused.
 	stale := *got
 	stale.Hostname = "elsewhere.example.org"

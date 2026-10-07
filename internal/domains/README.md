@@ -38,7 +38,7 @@ The ones of hosted's API, which Studio's page switches on:
 | `5_services_reconfigured` | active: routed, certificate requested, Auth presents it |
 
 `Reverify` recomputes the status from DNS every time (a hostname whose DNS moved away goes back), except for an active
-one, which it reports without a lookup.
+one, which it reports without a lookup. `Activate` does the same check first and refuses a claim that no longer reaches 4.
 
 ## DNS checks
 
@@ -53,6 +53,14 @@ Studio process, is answered by the proxy from the same resolver (`internal/proxy
 - A hostname is held by one project: a claim in status 4 or 5 holds it (a partial unique index in the registry, enforced
   again when a claim reaches 4), and `Initialize` refuses a hostname another project holds. Pending claims do not hold it, so
   nobody can lock a name they do not control; none can pass the TXT check without the DNS.
+- A verified claim holds the name only while its proof is fresh: `Options.ClaimTTL` (24 hours) after the last successful DNS
+  check, another project's `Initialize` or `Reverify` releases it (`DomainStore.ReleaseStaleClaims`). Each successful
+  verification renews the hold, and `Activate` checks the DNS again before it routes anything.
+- Certificate orders: `Activate` of a custom hostname and a change of the vanity name take from a per-project sliding window
+  (`Options.IssuancePerProject` in `IssuanceProjectWindow`: 5 in 24 hours) and from a node-wide one
+  (`IssuancePerNode` in `IssuanceNodeWindow`: 25 in 7 days, only for names that need a certificate of their own, so not for
+  vanity names under a DNS-01 wildcard). A refusal is a 429 with `Retry-After` and records nothing. Activating the current
+  vanity name again is free. The counters live in memory.
 - Verification attempts: five per project in a burst, one more every 15 seconds, and fifty for the node in a burst with one
   more every 1.5 seconds (`Options.Attempts`, `Options.Refill`). A refused attempt makes no DNS query.
 - Names: `ValidateHostname` refuses IP addresses, wildcards, single labels, bad labels, reserved zones and the node's own
