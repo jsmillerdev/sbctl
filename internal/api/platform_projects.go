@@ -9,6 +9,7 @@ import (
 
 	plat "github.com/OWNER/sbctl/internal/api/gen/platform"
 	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/OWNER/sbctl/internal/secrets"
 )
 
 // elem returns a minimal valid element of the array at property prop of the object
@@ -240,28 +241,10 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 
 func (s *Server) routesPlatformProject(add func(string, handlerFunc)) {
 	add("GET /platform/projects/{ref}/settings", s.platformSettings)
-	add("GET /platform/projects/{ref}/config/postgrest", s.platformPostgrestConfig)
 	add("POST /platform/projects/{ref}/api-keys/temporary", s.temporaryKey)
-	add("GET /v2/projects/{ref}/config", s.v2Config)
 	add("GET /platform/database/{ref}/backups", s.platformBackups)
-	add("GET /platform/projects/{ref}/config/storage", s.storageConfig("GET /platform/projects/{ref}/config/storage"))
-	add("GET /v1/projects/{ref}/config/storage", s.storageConfig("GET /v1/projects/{ref}/config/storage"))
 	add("GET /platform/projects/{ref}/config/pgbouncer", s.pgbouncerConfig)
 	add("GET /platform/projects/{ref}/config/supavisor", s.v1Pooler)
-}
-
-// storageConfig reports Storage's defaults. Per-project storage settings are not
-// stored yet, so PATCH keeps answering with a stub.
-func (s *Server) storageConfig(key string) handlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) error {
-		if _, err := s.loadProject(r.Context(), r.PathValue("ref")); err != nil {
-			return err
-		}
-		resp := base(key)
-		set(resp, "fileSizeLimit", 50*1024*1024) // Storage's FILE_SIZE_LIMIT default
-		writeJSON(w, http.StatusOK, resp)
-		return nil
-	}
 }
 
 // pgbouncerConfig describes the shared pooler entry (Supavisor) in the shape the
@@ -311,22 +294,6 @@ func (s *Server) platformSettings(w http.ResponseWriter, r *http.Request) error 
 	return nil
 }
 
-func (s *Server) platformPostgrestConfig(w http.ResponseWriter, r *http.Request) error {
-	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
-	if err != nil {
-		return err
-	}
-	keys, err := s.mgr.Keys(r.Context(), p.Ref)
-	if err != nil {
-		return err
-	}
-	writeJSON(w, http.StatusOK, &plat.GetPostgrestConfigResponseOutput{
-		DbAnonRole: "anon", DbExtraSearchPath: "public, extensions", DbSchema: "public, storage, graphql_public",
-		JwtSecret: keys.JWTSecret, MaxRows: 1000, RoleClaimKey: ".role",
-	})
-	return nil
-}
-
 // temporaryKey issues a short-lived service_role JWT for the dashboard's own calls.
 func (s *Server) temporaryKey(w http.ResponseWriter, r *http.Request) error {
 	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
@@ -340,33 +307,12 @@ func (s *Server) temporaryKey(w http.ResponseWriter, r *http.Request) error {
 	now := s.now()
 	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"iss": "supabase", "ref": p.Ref, "role": "service_role", "iat": now.Unix(), "exp": now.Add(10 * time.Minute).Unix(),
+		secrets.TemporaryClaim: true,
 	}).SignedString([]byte(keys.JWTSecret))
 	if err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusCreated, &plat.TemporaryApiKeyResponseOutput{ApiKey: tok})
-	return nil
-}
-
-func (s *Server) v2Config(w http.ResponseWriter, r *http.Request) error {
-	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
-	if err != nil {
-		return err
-	}
-	resp := base("GET /v2/projects/{ref}/config")
-	setAll(resp, map[string]any{
-		"data.id":                       p.Ref,
-		"data.attributes.api.db_schema": "public, storage, graphql_public",
-		"data.attributes.api.db_extra_search_path":         "public, extensions",
-		"data.attributes.api.max_rows":                     1000,
-		"data.attributes.database.major_version":           pgMajor(p),
-		"data.attributes.database.ssl_enforced":            false,
-		"data.attributes.pooler.default_pool_size":         15,
-		"data.attributes.pooler.max_client_conn":           200,
-		"data.attributes.pooler.pool_mode":                 "transaction",
-		"data.attributes.pooler.ignore_startup_parameters": "extra_float_digits",
-	})
-	writeJSON(w, http.StatusOK, resp)
 	return nil
 }
 

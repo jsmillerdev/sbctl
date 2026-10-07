@@ -5,7 +5,9 @@ package secrets
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -31,7 +33,10 @@ const (
 var ErrCorrupt = errors.New("secrets: ciphertext is corrupt or was sealed with a different key")
 
 // AESGCM is Secrets over AES-256-GCM. Sealed format: 0x01 || nonce(12) || ciphertext+tag.
-type AESGCM struct{ aead cipher.AEAD }
+type AESGCM struct {
+	aead cipher.AEAD
+	key  []byte
+}
 
 // New builds an AESGCM from a 32-byte key.
 func New(key []byte) (*AESGCM, error) {
@@ -46,7 +51,7 @@ func New(key []byte) (*AESGCM, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &AESGCM{aead: aead}, nil
+	return &AESGCM{aead: aead, key: append([]byte(nil), key...)}, nil
 }
 
 // LoadOrCreate reads the hex-encoded master key at path, creating it (0600) if missing.
@@ -86,6 +91,17 @@ func Load(body []byte) (*AESGCM, error) {
 		return nil, fmt.Errorf("secrets: master key is not hex: %w", err)
 	}
 	return New(key)
+}
+
+// Derive returns a key for label that is bound to the master key: HMAC-SHA256 of the label
+// under a purpose-separated subkey, so the value reveals nothing about the master key and
+// differs per label. Callers use it to sign URLs and tokens that must survive a restart.
+func (s *AESGCM) Derive(label string) []byte {
+	sub := hmac.New(sha256.New, s.key)
+	sub.Write([]byte("sbctl/derive/v1"))
+	m := hmac.New(sha256.New, sub.Sum(nil))
+	m.Write([]byte(label))
+	return m.Sum(nil)
 }
 
 func (s *AESGCM) Seal(plaintext []byte) ([]byte, error) {

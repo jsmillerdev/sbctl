@@ -2,7 +2,11 @@
 // (Supavisor, Realtime, Storage) through their admin APIs.
 package fleet
 
-import "context"
+import (
+	"context"
+
+	"github.com/OWNER/sbctl/internal/projectconfig"
+)
 
 // TenantSpec is what a shared service needs to serve one project.
 type TenantSpec struct {
@@ -29,6 +33,53 @@ type TenantSpec struct {
 	// PoolSize and MaxClients for Supavisor; zero means service default.
 	PoolSize   int
 	MaxClients int
+	// Storage and Realtime carry the project's saved settings for those services (the
+	// zero values mean "defaults"). They are part of the tenant fingerprint, so a changed
+	// setting makes EnsureTenant send an update.
+	Storage  projectconfig.StorageSettings
+	Realtime projectconfig.RealtimeSettings
+}
+
+// Quiescer is an optional Tenant capability: let go of everything the service holds open in a
+// project's database (Realtime's replication connections and pool) and disconnect its clients,
+// so that the project's PostgreSQL can stop. A logical walsender that stays connected keeps a
+// fast shutdown from finishing until systemd kills the cluster. The service reconnects when a
+// client next asks for the tenant.
+type Quiescer interface {
+	QuiesceTenant(ctx context.Context, ref string) error
+}
+
+// QuiesceTenant calls QuiesceTenant on every tenant that implements Quiescer.
+func (f Fleet) QuiesceTenant(ctx context.Context, ref string) error {
+	var first error
+	for _, t := range f {
+		if q, ok := t.(Quiescer); ok {
+			if err := q.QuiesceTenant(ctx, ref); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	return first
+}
+
+// Refresher is an optional Tenant capability: drop whatever the service cached about a
+// project's database logins (Supavisor's pools and credential cache), after a role password
+// changed. A service that caches nothing does not implement it.
+type Refresher interface {
+	RefreshTenant(ctx context.Context, ref string) error
+}
+
+// RefreshTenant calls RefreshTenant on every tenant that implements Refresher.
+func (f Fleet) RefreshTenant(ctx context.Context, ref string) error {
+	var first error
+	for _, t := range f {
+		if r, ok := t.(Refresher); ok {
+			if err := r.RefreshTenant(ctx, ref); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	return first
 }
 
 // Tenant is one shared service's tenant registry. Both calls are idempotent and

@@ -32,6 +32,11 @@ type Server struct {
 	// upstreamFn overrides the upstream address resolution (tests).
 	upstreamFn func(service, project) string
 
+	// sockets are the Realtime sockets opened without inspection (see wsguard.go).
+	sockets socketSet
+	// recheckWait is the delay before a failed key lookup is retried (tests); zero is the default.
+	recheckWait time.Duration
+
 	mu         sync.Mutex
 	transports map[time.Duration]*http.Transport
 
@@ -70,6 +75,11 @@ func New(opts Options) (*Server, error) {
 		}
 	}
 	s.table = newTable(s.cfg, opts.Registry, opts.Keys, s.log)
+	s.table.onKeysDropped = func(ref string) {
+		if len(s.sockets.refs(ref)) > 0 {
+			go s.recheckRealtime(ref)
+		}
+	}
 	if err := s.table.reload(context.Background()); err != nil {
 		return nil, fmt.Errorf("proxy: loading routes: %w", err)
 	}

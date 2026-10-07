@@ -101,8 +101,9 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	}
 	apiH, err := api.NewServer(api.Deps{
 		Registry: node.Registry, Secrets: node.Secrets, Manager: node.Engine, Config: cfg, Branching: bsvc,
-		Store:  store,
-		Logger: log.With("component", "api"),
+		Store:    store,
+		Settings: node.Settings, // the settings the engine renders units and tenants from
+		Logger:   log.With("component", "api"),
 	})
 	if err != nil {
 		return err

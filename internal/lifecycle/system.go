@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +16,7 @@ import (
 	"github.com/OWNER/sbctl/internal/artifacts"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/fleet"
+	"github.com/OWNER/sbctl/internal/projectconfig"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 	"github.com/OWNER/sbctl/internal/units"
@@ -151,6 +153,32 @@ type Node struct {
 	Registry   registry.Registry
 	Plane      *PostgresPlane
 	Engine     *Engine
+	// Settings holds the projects' saved settings: the units, the cluster arguments and
+	// the Storage and Realtime tenants of every Plane and Engine operation are rendered
+	// from it.
+	Settings *projectconfig.Manager
+}
+
+// newSettings is the saved-settings manager over the registry's database.
+func (o *OpenOptions) newSettings(cfg *config.Config, reg *registry.Postgres, sec secrets.Secrets) *projectconfig.Manager {
+	return projectconfig.NewManager(projectconfig.NewPGStore(reg.Pool()), sec, projectconfig.Options{
+		TemplateBaseURL: TemplateBaseURL(cfg),
+		Event:           func(ctx context.Context, ref, kind string, payload any) { _ = reg.AppendEvent(ctx, ref, kind, payload) },
+		Log:             o.log(),
+	})
+}
+
+// TemplateBaseURL is where a project's GoTrue fetches its email templates: the daemon's
+// loopback admin listener (internal/api serves /internal/templates/<ref>/<name>).
+func TemplateBaseURL(cfg *config.Config) string {
+	host, port, err := net.SplitHostPort(cfg.Listen.Admin)
+	if err != nil {
+		return "http://127.0.0.1:7000/internal/templates"
+	}
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/internal/templates"
 }
 
 // Close releases the registry pool and the supervisor connection.
@@ -214,8 +242,10 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	bk := o.lateBackup(node)
 	po := o.planeOptions()
 	po.Backup = bk
+	node.Settings = o.newSettings(cfg, reg, sec)
+	po.Settings = node.Settings
 	node.Plane = NewPostgresPlane(cfg, sup, arts, reg, po)
-	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup)})
+	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
 	return node, nil
 }
 
@@ -427,7 +457,9 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	plane.reg = reg
 	bk := o.lateBackup(node)
 	plane.opts.Backup = bk
-	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup)})
+	node.Settings = o.newSettings(cfg, reg, sec)
+	plane.opts.Settings = node.Settings
+	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
 	node.Engine = eng
 
 	if existing {

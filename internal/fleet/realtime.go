@@ -64,7 +64,27 @@ func realtimeBody(spec TenantSpec) map[string]any {
 	if user == "" {
 		user = "supabase_admin"
 	}
-	return map[string]any{"tenant": map[string]any{
+	settings := map[string]any{
+		"region":                realtimeCDCRegion,
+		"db_host":               host,
+		"db_port":               strconv.Itoa(spec.DBPort),
+		"db_name":               db,
+		"db_user":               user,
+		"db_password":           spec.DBPassword,
+		"slot_name":             realtimeSlotName,
+		"publication":           realtimePublication,
+		"poll_interval_ms":      100,
+		"poll_max_changes":      100,
+		"poll_max_record_bytes": 1048576,
+		"ssl_enforced":          false,
+	}
+	// Saved settings: the tenant's pools go to the extension (db_pool is the size of the
+	// pool realtime_connect uses; postgres_changes_pool is translated by the controller to
+	// subcriber_pool_size), the rest to the tenant row.
+	for k, v := range spec.Realtime.Extension {
+		settings[k] = v
+	}
+	tenant := map[string]any{
 		"external_id":          spec.Ref,
 		"name":                 spec.Ref,
 		"jwt_secret":           spec.JWTSecret,
@@ -72,22 +92,13 @@ func realtimeBody(spec TenantSpec) map[string]any {
 		"extensions": []map[string]any{{
 			"type":               "postgres_cdc_rls",
 			"tenant_external_id": spec.Ref,
-			"settings": map[string]any{
-				"region":                realtimeCDCRegion,
-				"db_host":               host,
-				"db_port":               strconv.Itoa(spec.DBPort),
-				"db_name":               db,
-				"db_user":               user,
-				"db_password":           spec.DBPassword,
-				"slot_name":             realtimeSlotName,
-				"publication":           realtimePublication,
-				"poll_interval_ms":      100,
-				"poll_max_changes":      100,
-				"poll_max_record_bytes": 1048576,
-				"ssl_enforced":          false,
-			},
+			"settings":           settings,
 		}},
-	}}
+	}
+	for k, v := range spec.Realtime.Tenant {
+		tenant[k] = v
+	}
+	return map[string]any{"tenant": tenant}
 }
 
 // EnsureTenant implements Tenant.
@@ -132,6 +143,27 @@ func (t *realtimeTenant) EnsureTenant(ctx context.Context, spec TenantSpec) erro
 	}
 	if err := t.store.put(ctx, spec.Ref, config.SvcRealtime, fp); err != nil {
 		t.cl.log.Warn("fleet: could not record the realtime tenant fingerprint", "ref", spec.Ref, "error", err)
+	}
+	return nil
+}
+
+// QuiesceTenant implements Quiescer: POST /api/tenants/<ref>/reload stops the tenant's
+// postgres_cdc_rls processes, shuts its database connection down and disconnects its sockets
+// (the tenant row stays). A tenant Realtime does not know counts as quiet.
+func (t *realtimeTenant) QuiesceTenant(ctx context.Context, ref string) error {
+	if err := validTenantRef(ref); err != nil {
+		return err
+	}
+	h, err := t.headers()
+	if err != nil {
+		return err
+	}
+	res, err := t.cl.do(ctx, "POST", t.tenantURL(ref)+"/reload", h, nil)
+	if err != nil {
+		return err
+	}
+	if !res.ok() && res.Status != 404 {
+		return t.cl.apiError("reload tenant "+ref, res)
 	}
 	return nil
 }

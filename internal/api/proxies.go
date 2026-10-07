@@ -15,6 +15,8 @@ import (
 const (
 	upGoTrue  = "gotrue"
 	upStorage = "storage"
+	// upStorageAdmin is Storage's admin API (the port with the tenant and S3 credential routes).
+	upStorageAdmin = "storage-admin"
 )
 
 // upstream returns the loopback base URL of a service of p (GoTrue is per project;
@@ -30,6 +32,8 @@ func (s *Server) upstream(p *registry.Project, svc string) string {
 		return "http://127.0.0.1:" + itoa(int64(s.cfg.PortsFor(p.Ref, p.Seq).GoTrue))
 	case upStorage:
 		return "http://127.0.0.1:" + itoa(int64(s.cfg.Ports.Storage))
+	case upStorageAdmin:
+		return "http://127.0.0.1:" + itoa(int64(s.cfg.Ports.StorageAdmin))
 	}
 	return ""
 }
@@ -114,6 +118,41 @@ var storageMap = map[string]proxyRoute{
 		}
 		out, _ := json.Marshal(map[string]string{"signedUrl": s.projectURL(p.Ref) + "/storage/v1" + in.SignedURL})
 		return out
+	}},
+	// Studio's explorer lists with the v2 route (capabilities.list_v2): the body is Storage's own
+	// (prefix, cursor, limit, with_delimiter, sortBy, ...), and so is the answer.
+	"POST /platform/storage/{ref}/buckets/{id}/objects/list-v2": {method: http.MethodPost, path: "/object/list-v2/{id}"},
+	// Signing several objects: {path: [...], expiresIn} becomes Storage's {paths, expiresIn} and
+	// each {signedURL: "/object/sign/..."} the full URL.
+	"POST /platform/storage/{ref}/buckets/{id}/objects/sign-multi": {method: http.MethodPost, path: "/object/sign/{id}", req: func(_ *http.Request, id string, in map[string]any) (string, map[string]any) {
+		var paths []string
+		if list, ok := in["path"].([]any); ok {
+			for _, p := range list {
+				if s, ok := p.(string); ok {
+					paths = append(paths, strings.TrimPrefix(s, "/"))
+				}
+			}
+		}
+		return "/object/sign/" + url.PathEscape(id), map[string]any{"expiresIn": in["expiresIn"], "paths": paths}
+	}, resp: func(s *Server, p *registry.Project, body []byte) []byte {
+		var in []struct {
+			Error     *string `json:"error"`
+			Path      string  `json:"path"`
+			SignedURL *string `json:"signedURL"`
+		}
+		if json.Unmarshal(body, &in) != nil {
+			return body
+		}
+		out := make([]map[string]any, 0, len(in))
+		for _, e := range in {
+			item := map[string]any{"path": e.Path, "error": e.Error, "signedUrl": nil}
+			if e.SignedURL != nil {
+				item["signedUrl"] = s.projectURL(p.Ref) + "/storage/v1" + *e.SignedURL
+			}
+			out = append(out, item)
+		}
+		b, _ := json.Marshal(out)
+		return b
 	}},
 }
 

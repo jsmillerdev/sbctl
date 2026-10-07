@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +69,12 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, "Management API is not available")
 		return
 	}
+	// /internal/ is for the loopback listener (a project's GoTrue fetching its mail
+	// templates); nothing that arrives through the edge may reach it, whoever the client is.
+	if c := path.Clean("/" + r.URL.Path); c == "/internal" || strings.HasPrefix(c, "/internal/") {
+		writeJSON(w, http.StatusNotFound, "Not Found")
+		return
+	}
 	s.opts.APIHandler.ServeHTTP(w, r)
 }
 
@@ -103,6 +111,7 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 	}
 
 	res := authResult{rawQuery: r.URL.RawQuery}
+	var guardKeys [][]byte
 	if rt.keys != keyNone {
 		k, err := s.table.projectKeys(r.Context(), p.ref)
 		switch {
@@ -125,8 +134,29 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 			return
 		}
 		if k != nil {
+			// While the legacy keys are off, Realtime is WebSocket-only (see isRealtimeWebSocket):
+			// nothing else on the route reaches Realtime, whatever it carries.
+			if rt.keys == keyRealtime && k.LegacyDisabled && !isRealtimeWebSocket(r, pth, trailing) {
+				writeJSON(w, http.StatusForbidden, msgRealtimeLongPollOff)
+				return
+			}
+			// Before any route-specific rule: with the legacy keys disabled, a request that carries
+			// one of them anywhere in its headers or query is refused, whatever the route reads.
+			if carriesLegacyKey(k, r.Header, r.URL.RawQuery) {
+				refuseLegacy(w, rt)
+				return
+			}
+			if rt.keys == keyRealtime {
+				guardKeys = legacyNeedles(k)
+			}
 			res = authorize(rt, k, p.ref, r.Header, r.URL.RawQuery)
 			if res.status != 0 {
+				if res.ctype != "" {
+					w.Header().Set("Content-Type", res.ctype)
+					w.WriteHeader(res.status)
+					_, _ = w.Write([]byte(res.body))
+					return
+				}
 				writeText(w, res.status, res.body)
 				return
 			}
@@ -182,7 +212,28 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		tg.set[config.FunctionsProxyTokenHeader] = tok
 	}
 	tg.dropTenant = rt.svc != svcFunctions
+	if rt.keys == keyRealtime {
+		tg.trackRef = p.ref
+	}
+	if len(guardKeys) > 0 {
+		// Legacy keys are disabled: watch what the client sends into the socket for a legacy key. A
+		// compressing extension would hide the text, so it is not offered to Realtime.
+		tg.guardKeys = guardKeys
+		tg.del = append(tg.del[:len(tg.del):len(tg.del)], "Sec-Websocket-Extensions")
+		tg.onGuard = func(reason string) {
+			s.log.Warn("proxy: closed a Realtime connection that carried a legacy API key", "ref", p.ref, "reason", reason)
+		}
+	}
 	s.forward(w, r, tg)
+}
+
+// isRealtimeWebSocket reports whether r is the one request a Realtime route accepts while the
+// project's legacy keys are disabled: a real WebSocket handshake to /realtime/v1/websocket, with no
+// body. Long poll (any method, any path under /realtime/v1/longpoll, with or without a session
+// token) and every other subpath are refused, because a long-poll session is a process on the
+// Realtime side that keeps the credentials it connected with and that the proxy cannot inspect.
+func isRealtimeWebSocket(r *http.Request, cleaned string, trailingSlash bool) bool {
+	return cleaned == "/realtime/v1/websocket" && !trailingSlash && isWebSocketHandshake(r) && r.ContentLength == 0
 }
 
 // servable reports whether a project in status st may receive traffic.
@@ -216,11 +267,35 @@ type target struct {
 	dashboardAuth bool
 	// dropTenant removes a client-supplied TenantHeader (only functions sets it).
 	dropTenant bool
+	// guardKeys, when set, are legacy keys that must not travel from the client to the upstream
+	// inside a WebSocket text message (see wsguard.go); onGuard is told of a hit.
+	guardKeys [][]byte
+	onGuard   func(reason string)
+	// trackRef, set for a Realtime socket route, is the project whose sockets that were not
+	// inspected (legacy keys enabled) are closed when its legacy keys are switched off.
+	trackRef string
 }
 
 // forward proxies r to tg, streaming in both directions and passing WebSocket
 // upgrades through.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
+	guarded := len(tg.guardKeys) > 0
+	if isWebSocketHandshake(r) && (guarded || tg.trackRef != "") {
+		w = &guardedWriter{ResponseWriter: w, wrap: func(c net.Conn, brw *bufio.ReadWriter) net.Conn {
+			gc := &wsGuardConn{Conn: c, r: brw.Reader, onBlock: tg.onGuard}
+			if guarded {
+				gc.insp = newWSInspector(tg.guardKeys)
+				return gc
+			}
+			// Opened while the legacy keys are enabled: not inspected, but closed when they are
+			// switched off. The keys may have changed between the check above and now, so look again.
+			ref := tg.trackRef
+			s.sockets.add(ref, gc)
+			gc.onClose = func() { s.sockets.remove(ref, gc) }
+			go s.recheckRealtime(ref)
+			return gc
+		}}
+	}
 	rp := &httputil.ReverseProxy{
 		Transport:     s.transport(tg.timeout),
 		FlushInterval: -1,

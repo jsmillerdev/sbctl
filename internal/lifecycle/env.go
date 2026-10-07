@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -77,7 +78,7 @@ func (pl *PostgresPlane) archiveTimeout() int {
 // wal_level stays "logical", the artifact's default and what Realtime's
 // postgres_changes needs; it is a superset of "replica", so archiving and base backups
 // work unchanged.
-func (pl *PostgresPlane) postgresSpec(p *registry.Project, keys *secrets.ProjectKeys) (units.Spec, error) {
+func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (units.Spec, error) {
 	art, err := pl.arts.Dir(config.SvcPostgres)
 	if err != nil {
 		return units.Spec{}, err
@@ -101,6 +102,16 @@ func (pl *PostgresPlane) postgresSpec(p *registry.Project, keys *secrets.Project
 		"max_replication_slots=5",
 		"jit=off",
 	}, class.Settings()...)
+	// The project's saved Postgres settings that a running cluster cannot take over from a
+	// reload (they overlap the class's command-line settings) go last, so they win.
+	if pl.opts.Settings != nil && p.Ref != config.SystemRef {
+		saved, err := pl.opts.Settings.PostgresSettings(ctx, p.Ref)
+		if err != nil {
+			return units.Spec{}, fmt.Errorf("lifecycle: saved postgres settings of %s: %w", p.Ref, err)
+		}
+		cmdline, _ := SplitPostgresSettings(saved)
+		settings = append(settings, cmdline...)
+	}
 	if pl.archiveCommand(p.Ref) == "off" {
 		settings = append(settings, "archive_mode=off")
 	} else {
@@ -142,7 +153,7 @@ func (pl *PostgresPlane) postgresSpec(p *registry.Project, keys *secrets.Project
 }
 
 // apiSpecs returns the GoTrue spec and, for user projects, the PostgREST spec.
-func (pl *PostgresPlane) apiSpecs(p *registry.Project, keys *secrets.ProjectKeys) ([]units.Spec, error) {
+func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) ([]units.Spec, error) {
 	ports := pl.cfg.PortsFor(p.Ref, p.Seq)
 	pgPort := ports.Postgres
 
@@ -190,6 +201,13 @@ func (pl *PostgresPlane) apiSpecs(p *registry.Project, keys *secrets.ProjectKeys
 			"GOTRUE_LOG_LEVEL":          "warn",
 		},
 	}
+	if pl.opts.Settings != nil && !system {
+		over, err := pl.opts.Settings.AuthEnv(ctx, p.Ref, pl.authExternalURL(p.Ref))
+		if err != nil {
+			return nil, fmt.Errorf("lifecycle: saved auth settings of %s: %w", p.Ref, err)
+		}
+		mergeEnv(auth.Env, over)
+	}
 	specs := []units.Spec{auth}
 	if !hasPostgREST(p.Ref) {
 		return specs, nil
@@ -223,7 +241,26 @@ func (pl *PostgresPlane) apiSpecs(p *registry.Project, keys *secrets.ProjectKeys
 			"PGRST_OPENAPI_SERVER_PROXY_URI": pl.scheme() + "://" + pl.cfg.ProjectHost(p.Ref) + "/rest/v1",
 		},
 	}
+	if pl.opts.Settings != nil {
+		over, err := pl.opts.Settings.PostgRESTEnv(ctx, p.Ref)
+		if err != nil {
+			return nil, fmt.Errorf("lifecycle: saved postgrest settings of %s: %w", p.Ref, err)
+		}
+		mergeEnv(rest.Env, over)
+	}
 	return append(specs, rest), nil
+}
+
+// mergeEnv lays the saved settings over a unit's base environment; an empty value removes
+// the variable.
+func mergeEnv(base, over map[string]string) {
+	for k, v := range over {
+		if v == "" {
+			delete(base, k)
+		} else {
+			base[k] = v
+		}
+	}
 }
 
 // bootstrapPending reports whether the launcher still has first-boot work to do in

@@ -33,6 +33,9 @@ type Options struct {
 	Timers Timers
 	// Now is the clock for key issue times; tests set it.
 	Now func() time.Time
+	// Settings supplies the saved per-project settings for Storage and Realtime tenants
+	// (and, through the plane, for units); nil means defaults.
+	Settings Settings
 }
 
 // Timers drives the per-project nightly base backup timer (sb-basebackup@<ref>.timer).
@@ -155,6 +158,35 @@ func (e *Engine) storeKeys(ctx context.Context, ref string, keys *secrets.Projec
 	return nil
 }
 
+// putRecords stores key records as the sealed secrets the proxy and the API read.
+func (e *Engine) putRecords(ctx context.Context, ref string, recs []secrets.APIKeyRecord) error {
+	for _, r := range recs {
+		b, err := secrets.MarshalRecord(r)
+		if err != nil {
+			return err
+		}
+		sealed, err := e.sec.Seal(b)
+		if err != nil {
+			return err
+		}
+		if err := e.reg.PutSecret(ctx, ref, secrets.RecordSecretName(r.ID), sealed); err != nil {
+			return fmt.Errorf("lifecycle: store key record %s: %w", r.ID, err)
+		}
+	}
+	return nil
+}
+
+// storeRecords writes back the records of old that revived replaced.
+func (e *Engine) storeRecords(ctx context.Context, ref string, old *secrets.ProjectKeys, revived []secrets.APIKeyRecord) error {
+	var prior []secrets.APIKeyRecord
+	for _, r := range revived {
+		if o, ok := old.Record(r.ID); ok {
+			prior = append(prior, o)
+		}
+	}
+	return e.putRecords(ctx, ref, prior)
+}
+
 func (e *Engine) loadKeys(ctx context.Context, ref string) (*secrets.ProjectKeys, error) {
 	sealed, err := e.reg.GetSecrets(ctx, ref)
 	if err != nil {
@@ -195,7 +227,23 @@ func (e *Engine) org(ctx context.Context, slug string) (*registry.Organization, 
 	return o, err
 }
 
-func (e *Engine) tenantSpec(p *registry.Project, keys *secrets.ProjectKeys) fleet.TenantSpec {
+// tenantSpec describes p to the shared services, with its saved Storage and Realtime
+// settings when the Engine has a Settings source.
+func (e *Engine) tenantSpec(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (fleet.TenantSpec, error) {
+	spec := e.baseTenantSpec(p, keys)
+	if e.opts.Settings != nil && p.Ref != config.SystemRef {
+		var err error
+		if spec.Storage, err = e.opts.Settings.StorageSettings(ctx, p.Ref); err != nil {
+			return spec, fmt.Errorf("lifecycle: saved storage settings of %s: %w", p.Ref, err)
+		}
+		if spec.Realtime, err = e.opts.Settings.RealtimeSettings(ctx, p.Ref); err != nil {
+			return spec, fmt.Errorf("lifecycle: saved realtime settings of %s: %w", p.Ref, err)
+		}
+	}
+	return spec, nil
+}
+
+func (e *Engine) baseTenantSpec(p *registry.Project, keys *secrets.ProjectKeys) fleet.TenantSpec {
 	ports := e.cfg.PortsFor(p.Ref, p.Seq)
 	return fleet.TenantSpec{
 		Ref: p.Ref, DBHost: "127.0.0.1", DBPort: ports.Postgres, DBName: "postgres",
@@ -340,7 +388,11 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 		return fail("data plane", err)
 	}
 	if len(e.opts.Fleet) > 0 {
-		if err := e.opts.Fleet.EnsureTenant(ctx, e.tenantSpec(p, keys)); err != nil {
+		spec, err := e.tenantSpec(ctx, p, keys)
+		if err != nil {
+			return fail("fleet tenants", err)
+		}
+		if err := e.opts.Fleet.EnsureTenant(ctx, spec); err != nil {
 			return fail("fleet tenants", err)
 		}
 	}
@@ -401,6 +453,7 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 		return err
 	}
 	e.stopTimer(ctx, ref)
+	e.quiesce(ctx, ref)
 	if err := e.plane.Stop(ctx, ref); err != nil {
 		_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, registry.StatusActiveUnhealthy)
 		return fmt.Errorf("lifecycle: pause %s: %w", ref, err)
@@ -444,6 +497,7 @@ func (e *Engine) Resume(ctx context.Context, ref string) error {
 		e.event(cctx, ref, "project.resume_failed", map[string]string{"error": err.Error()})
 		return fmt.Errorf("lifecycle: resume %s: %w", ref, err)
 	}
+	e.applySavedSettings(ctx, p, keys)
 	if err := e.reg.PutRoute(ctx, registry.Route{Host: e.cfg.ProjectHost(ref), Ref: ref, Kind: "api"}); err != nil {
 		e.log.Warn("resume: route", "ref", ref, "error", err)
 	}
@@ -679,11 +733,15 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 	if err := nk.ResignLegacy(ref, e.opts.Now()); err != nil {
 		return nil, err
 	}
+	// The new default keys are not the ones that were revoked.
+	revived := nk.ReviveDefaults(ref, e.opts.Now())
 	rollback := func(cause error) (*secrets.ProjectKeys, error) {
 		cctx, cancel := cleanupCtx(ctx)
 		defer cancel()
 		if err := e.storeKeys(cctx, ref, old); err != nil {
 			e.log.Error("rotate-keys: could not restore previous keys", "ref", ref, "error", err)
+		} else if err := e.storeRecords(cctx, ref, old, revived); err != nil {
+			e.log.Error("rotate-keys: could not restore the previous key records", "ref", ref, "error", err)
 		} else if active(p.Status) {
 			if err := e.plane.Reconfigure(cctx, p, old); err != nil {
 				e.log.Error("rotate-keys: could not restart on previous keys", "ref", ref, "error", err)
@@ -694,12 +752,19 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 	if err := e.storeKeys(ctx, ref, &nk); err != nil {
 		return rollback(err)
 	}
+	if err := e.putRecords(ctx, ref, revived); err != nil {
+		return rollback(err)
+	}
 	if active(p.Status) {
 		if err := e.plane.Reconfigure(ctx, p, &nk); err != nil {
 			return rollback(err)
 		}
 		if len(e.opts.Fleet) > 0 && ref != config.SystemRef {
-			if err := e.opts.Fleet.EnsureTenant(ctx, e.tenantSpec(p, &nk)); err != nil {
+			spec, err := e.tenantSpec(ctx, p, &nk)
+			if err == nil {
+				err = e.opts.Fleet.EnsureTenant(ctx, spec)
+			}
+			if err != nil {
 				return rollback(fmt.Errorf("update fleet tenants: %w", err))
 			}
 		}

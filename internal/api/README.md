@@ -19,8 +19,8 @@ h := api.New(api.Deps{
 The three OpenAPI documents are pinned in `gen/specs/` (v1, v2, platform) and embedded.
 Every operation of the three is served:
 
-- 115 operations have a handler here (the table below).
-- The other 500 answer with a **stub derived from the spec**: the smallest instance of the
+- The operations in the table below have a handler here.
+- The others answer with a **stub derived from the spec**: the smallest instance of the
   operation's success schema (required fields only, empty arrays, enums at their first
   member, `204` where the spec says so), with header `X-Sbctl-Stub: true`.
   `TestStubsMatchSpec` calls every stub and validates it against its schema.
@@ -44,7 +44,8 @@ registered in a second mux of a chain, tried in order.
 | Area | Routes |
 |---|---|
 | Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (the full branch API, served by `internal/branching`, see below); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`, `restart-services`; `POST /v1/projects/{ref}/restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/database/{ref}/backups` (empty) |
-| Keys | `/v1/projects/{ref}/api-keys` (legacy `anon`, `service_role`, `sb_publishable_*`, `sb_secret_*`; secrets masked unless `reveal=true`), `api-keys/{id}`, `api-keys/legacy` |
+| Keys | `/v1/projects/{ref}/api-keys`: list, create (publishable and secret keys with names; the secret is shown in full by the create and by `reveal=true`, masked otherwise), get, patch, delete (a revocation), `api-keys/legacy` get and put (`?enabled=`). See Settings and keys below |
+| Settings | `GET` and `PATCH /v1/projects/{ref}/config/auth` and `/platform/auth/{ref}/config` (+ `/hooks`), `/v1/projects/{ref}/postgrest` and `/platform/projects/{ref}/config/postgrest`, `config/realtime`, `config/storage` (v1 and platform), `GET` and `PUT /v1/projects/{ref}/config/database/postgres`, `GET /v2/projects/{ref}/config` (the document the CLI diffs), `PATCH /v1/projects/{ref}/database/password` and `/platform/projects/{ref}/db-password` |
 | Database | `database/query`, `database/query/read-only` (rows as JSON; `parameters` supported), `database/migrations` list and apply (`supabase_migrations.schema_migrations`), `types/typescript` (pg-meta generator), `cli/login-role` create and delete, `advisors/*` (no lints yet) |
 | Functions and secrets | `functions` list, create, deploy (multipart), get, patch, delete, `body`; `secrets` list (digests), create, delete. Sources, bundles and sealed secrets are stored. Uploads: multipart sources (`POST .../functions/deploy`, `supabase functions deploy --use-api`, the CLI when Docker is not running, Studio's editor; where `Deps.Functions` is set the runtime serves bundles only, because a function run from source files could import other projects' files, so the hook's `api.SourceBundler` bundles the sources in a sandbox and they are stored together with the bundle (`.sbctl-bundle.ezbr`, `.sbctl-bundle.json`; answers: 400 with the bundler's output for broken code, 501 where the node cannot bundle, 429 when the queue is full); the sources stay readable through `.../body`) and bundles (`POST` create and `PATCH` update with `Content-Type: application/vnd.denoland.eszip` and a body of `EZBR` + Brotli, which is what plain `supabase functions deploy` sends; metadata in the query, `ezbr_sha256` checked, stored as the file `.sbctl-bundle.ezbr`; `functions_bundle.go`). `Deps.Functions` (`api.FunctionsHook`, `functions_hook.go`) is told after each change so `internal/functions` can put the files where the Edge Runtime reads them |
 | Identity | `/v1/profile`, `/platform/profile` (get, post, patch), `profile/permissions` (owner on every organization), `profile/access-tokens` (list, create, get, delete), `/platform/cli/login` and `/platform/cli/login/{session_id}` (device login) |
@@ -52,11 +53,45 @@ registered in a second mux of a chain, tried in order.
 | Studio data | `/platform/projects/{ref}/content` (saved SQL snippets, reports; upsert, list, get, count, delete) and `content/folders` |
 | pg-meta | every `/platform/pg-meta/{ref}/*` operation of the spec, proxied to sb-pgmeta |
 | Auth admin | `/platform/auth/{ref}/users` (list, create, patch, delete), `invite`, `magiclink`, `otp`, `recover`, proxied to the project's GoTrue admin API with its `service_role` key |
-| Storage admin | `/platform/storage/{ref}/buckets` (list, create, get, patch, delete, empty) and `objects` (list, move, copy, delete, sign), proxied to Storage with `x-forwarded-host: <ref>.api.<domain>` |
+| Storage admin | `/platform/storage/{ref}/buckets` (list, create, get, patch, delete, empty) and `objects` (list, list-v2, move, copy, delete, sign, sign-multi), proxied to Storage with `x-forwarded-host: <ref>.api.<domain>`; `objects/public-url` (built here, after checking that the bucket is public); `credentials` (the project's S3 access keys, through Storage's admin API) |
 
 Everything else (billing, integrations, replication, log drains, network restrictions,
-auth/storage/realtime *config* PATCHes, ...) is a stub: it answers a valid empty value and
-changes nothing.
+Supavisor pool settings, ...) is a stub: it answers a valid empty value and changes nothing.
+
+## Settings and keys
+
+Saving a setting (`config_*.go`) validates it (`internal/projectconfig`), stores it, applies it to
+what runs (`lifecycle.Reconfigurer.ApplyConfig`: only GoTrue's or PostgREST's unit restarts; the
+Realtime and Storage tenants are updated; Postgres settings go through `ALTER SYSTEM`) and answers
+with what was saved. If applying fails (GoTrue does not come back on the new environment, a
+tenant refuses it) the previous settings are saved and applied again and the caller gets a 502, so
+a rejected save leaves the project as it was. Saves of one service of one project are serialized,
+run on a context that outlives the request, and are counted by the shutdown drain like every
+lifecycle operation. A paused project accepts a save, which applies when it resumes. Secrets in
+responses are SHA-256 hashes (`projectconfig.Redact`), never the value. The details of every
+setting are in `internal/projectconfig/README.md`.
+
+`GET /internal/templates/{ref}/{name}` serves a project's saved email template to its GoTrue
+(no credentials; loopback clients that did not come through the edge proxy only).
+
+API keys: opaque keys are stored as sealed `project_secrets` records (`internal/secrets/apikeys.go`),
+so the proxy's key cache, which already drops a project's keys on every `project_secrets` change,
+sees a created or revoked key on its next request. The two `default` keys live where rotation
+puts them; revoking or renaming one writes a record next to it. Names are lowercase letters,
+digits and underscores, unique per project; at most 50 active keys. Only
+`secret_jwt_template: {"role": "service_role"}` is supported. `PUT .../api-keys/legacy?enabled=false`
+makes the proxy refuse the anon and service_role JWTs (and JWTs signed with the project secret) as
+`apikey`, on Functions too, refuse the exact legacy keys as a bearer, as Storage's S3 session token
+(`403` XML `AccessDenied`) and inside a Realtime socket (the proxy closes it with `1008`; sockets
+opened before the switch reconnect first); it is refused while no
+publishable and secret key exist to fall back on. JWTs signed with the legacy secret stay valid in
+`Authorization` until the JWT secret is rotated, as on hosted. Rotating the keys makes a revoked
+default key usable again with its new value.
+
+The database password reset (`SetDatabasePassword`) changes the `postgres` role in the cluster
+(as a SCRAM verifier), then the sealed secret the API connects with, then makes Supavisor drop the
+tenant's pools and cached logins; a failure to store the secret puts the old password back.
+Passwords need 8 to 128 characters.
 
 ## Branches
 
@@ -310,9 +345,7 @@ region code (`config.Region`, default `us-east-1`).
   the driver's values, which can differ from Postgres's JSON for exotic types.
 - `database/query` for `parameters` and for pg-meta SQL return rows as Postgres/pg-meta
   serialize them; `bigint` columns can differ between the two paths (number vs string).
-- Advisors return no lints; function bodies are stored and, with `[functions] enabled`, run by the Edge Runtime (`internal/functions`);
-  `PATCH` on auth, storage, realtime and postgrest *config* is a stub; `PATCH
-  /v1/projects/{ref}/database/password` is a stub.
+- Advisors return no lints; function bodies are stored and, with `[functions] enabled`, run by the Edge Runtime (`internal/functions`).
 - Not checked against a running Studio: that is workstream A. Region and cloud provider
   are reported as the configured AWS region code (`region`, default `us-east-1`) and `AWS`.
 - The direct database host reported to clients is `db.<ref>.api.<domain>`, which a

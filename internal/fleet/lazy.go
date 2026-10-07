@@ -109,3 +109,28 @@ func (t lazyTenant) RemoveTenant(ctx context.Context, ref string) error {
 	}
 	return r.RemoveTenant(ctx, ref)
 }
+
+// RefreshTenant implements Refresher for the Supavisor entry; the other two tenants cache
+// nothing about logins.
+func (t lazyTenant) RefreshTenant(ctx context.Context, ref string) error {
+	r, err := t.l.tenant(ctx, t.svc)
+	if err != nil || r == nil {
+		return err
+	}
+	if rf, ok := r.(Refresher); ok {
+		return rf.RefreshTenant(ctx, ref)
+	}
+	return nil
+}
+
+// QuiesceTenant implements Quiescer for the Realtime entry.
+func (t lazyTenant) QuiesceTenant(ctx context.Context, ref string) error {
+	r, err := t.l.tenant(ctx, t.svc)
+	if err != nil || r == nil {
+		return err
+	}
+	if q, ok := r.(Quiescer); ok {
+		return q.QuiesceTenant(ctx, ref)
+	}
+	return nil
+}
