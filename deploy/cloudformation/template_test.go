@@ -6,6 +6,9 @@
 package cloudformation_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -906,16 +909,40 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 	if d := len(tpl) - len(orig); d != len("v9.8.7-rc.1")-len("latest") {
 		t.Errorf("stamping changed more than the default: size differs by %d", d)
 	}
-	for _, f := range []string{"supavise-aws-deploy.sh", "install.sh", "SHA256SUMS", "SHA256SUMS.sig"} {
+	for _, f := range []string{"supavise-aws-deploy.sh", "install.sh", "SHA256SUMS", "SHA256SUMS.sig", "supavise-release.json"} {
 		if _, err := os.Stat(filepath.Join(dist, f)); err != nil {
 			t.Errorf("release asset %s missing: %v", f, err)
 		}
 	}
+	// The manifest names the tag and the oldest version that upgrades to it, and the signed list
+	// covers it: the signature check on SHA256SUMS is then a check on the manifest.
+	manifest, err := os.ReadFile(filepath.Join(dist, "supavise-release.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mf struct {
+		Schema         int               `json:"schema"`
+		Version        string            `json:"version"`
+		MinUpgradeFrom string            `json:"min_upgrade_from"`
+		Artifacts      map[string]string `json:"artifacts"`
+	}
+	if err := json.Unmarshal(manifest, &mf); err != nil {
+		t.Fatalf("manifest: %v\n%s", err, manifest)
+	}
+	if mf.Schema != 1 || mf.Version != "v9.8.7-rc.1" || mf.MinUpgradeFrom == "" || mf.Artifacts["postgres"] == "" {
+		t.Errorf("manifest: %+v", mf)
+	}
+	sums, _ := os.ReadFile(filepath.Join(dist, "SHA256SUMS"))
+	sum := sha256.Sum256(manifest)
+	if !strings.Contains(string(sums), hex.EncodeToString(sum[:])+"  supavise-release.json") {
+		t.Errorf("SHA256SUMS does not list the manifest:\n%s", sums)
+	}
+	run(ssl, "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", "pub.pem", "-sigfile", filepath.Join(dist, "SHA256SUMS.sig"), "-in", filepath.Join(dist, "SHA256SUMS"))
 	if fi, err := os.Stat(filepath.Join(dist, "supavise-aws-deploy.sh")); err == nil && fi.Mode()&0o111 == 0 {
 		t.Error("supavise-aws-deploy.sh must be executable")
 	}
 
-	// Without a tag the template is attached as it is.
+	// Without a tag the template is attached as it is, and there is no manifest to name a version.
 	cmd = exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
 	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SUPAVISE_RELEASE_TAG=")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -924,6 +951,9 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 	tpl, _ = os.ReadFile(filepath.Join(dist, "supavise.yaml"))
 	if string(tpl) != string(orig) {
 		t.Error("without SUPAVISE_RELEASE_TAG the template must be copied unchanged")
+	}
+	if _, err := os.Stat(filepath.Join(dist, "supavise-release.json")); err == nil {
+		t.Error("a run without a tag left a manifest of an earlier run in the release directory")
 	}
 
 	// A tag that is not a version is refused: it would end up in a parameter default.
