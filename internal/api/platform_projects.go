@@ -233,7 +233,6 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 func (s *Server) routesPlatformProject(add func(string, handlerFunc)) {
 	add("GET /platform/projects/{ref}/settings", s.platformSettings)
 	add("POST /platform/projects/{ref}/api-keys/temporary", s.temporaryKey)
-	add("GET /v2/projects/{ref}/config", s.v2Config)
 	add("GET /platform/database/{ref}/backups", s.platformBackups)
 	add("GET /platform/projects/{ref}/config/pgbouncer", s.pgbouncerConfig)
 	add("GET /platform/projects/{ref}/config/supavisor", s.v1Pooler)
@@ -305,28 +304,6 @@ func (s *Server) temporaryKey(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	writeJSON(w, http.StatusCreated, &plat.TemporaryApiKeyResponseOutput{ApiKey: tok})
-	return nil
-}
-
-func (s *Server) v2Config(w http.ResponseWriter, r *http.Request) error {
-	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
-	if err != nil {
-		return err
-	}
-	resp := base("GET /v2/projects/{ref}/config")
-	setAll(resp, map[string]any{
-		"data.id":                       p.Ref,
-		"data.attributes.api.db_schema": "public, storage, graphql_public",
-		"data.attributes.api.db_extra_search_path":         "public, extensions",
-		"data.attributes.api.max_rows":                     1000,
-		"data.attributes.database.major_version":           pgMajor(p),
-		"data.attributes.database.ssl_enforced":            false,
-		"data.attributes.pooler.default_pool_size":         15,
-		"data.attributes.pooler.max_client_conn":           200,
-		"data.attributes.pooler.pool_mode":                 "transaction",
-		"data.attributes.pooler.ignore_startup_parameters": "extra_float_digits",
-	})
-	writeJSON(w, http.StatusOK, resp)
 	return nil
 }
 

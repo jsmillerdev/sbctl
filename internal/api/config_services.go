@@ -14,6 +14,7 @@ import (
 
 func (s *Server) routesConfig(add func(string, handlerFunc)) {
 	s.routesConfigAuth(add)
+	add("GET /v2/projects/{ref}/config", s.v2Config)
 	s.routesDatabasePassword(add)
 	s.routesStorageActions(add)
 
