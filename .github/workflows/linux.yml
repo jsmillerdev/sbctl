@@ -142,7 +142,8 @@ jobs:
           if-no-files-found: ignore
 
   # Branch clones on real filesystems: copy-on-write on XFS (a loop file with reflink=1) and
-  # the base-backup fallback on the runner's ext4 root, each with a parent of about 1 GB.
+  # the base-backup fallback on the runner's ext4 root, each with a parent of about 1 GB; then
+  # the egress isolation of a branch with data under real systemd units.
   branching-xfs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -153,3 +154,18 @@ jobs:
           go-version-file: go.mod
       - name: branch clones on XFS and ext4
         run: tests/linux/branching-xfs.sh
+      # A branch with data cannot reach the outside world: IPAddressDeny on its Postgres unit,
+      # pg_cron jobs paused, a pg_net request to a non-loopback address fails (needs systemd).
+      - name: branch egress isolation under systemd
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+          sudo LOG_DIR=/tmp/sbctl-egress-logs SBCTL_BIN=/tmp/sbctl tests/linux/branching-egress.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/sbctl-egress-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: branching-egress
+          path: /tmp/sbctl-egress-logs
+          if-no-files-found: ignore

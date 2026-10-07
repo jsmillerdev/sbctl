@@ -111,7 +111,8 @@ var _ EgressEnforcer = (*Systemd)(nil)
 // applyEgress makes the unit's IPAddressDeny and IPAddressAllow what spec.DenyEgress says.
 // Like the limits it is a persistent drop-in written by systemd itself, so it survives
 // restarts and reboots, and a running unit has it at once (the cgroup's BPF filter changes).
-// A unit that never had a restriction and wants none is not touched.
+// A unit that never had a restriction and wants none is not touched (a unit that systemd does not
+// have loaded counts as having none; Remove clears the drop-in explicitly).
 func (s *Systemd) applyEgress(ctx context.Context, unit string, deny bool) error {
 	c, err := s.dial(ctx)
 	if err != nil {
@@ -296,9 +297,10 @@ func (s *Systemd) revert(ctx context.Context, unit string) error {
 	); err != nil {
 		return err
 	}
-	// A branch's Postgres unit may carry an egress restriction; a later project that reuses
-	// the ref (a reset keeps it) must not inherit it.
-	return s.applyEgress(ctx, unit, false)
+	// A branch's Postgres unit may carry an egress restriction, and the drop-in stays on disk
+	// after the unit stops; a later project that reuses the ref (a reset keeps it) must not
+	// inherit it. The unit may be unloaded by now, so its properties cannot tell: clear it.
+	return s.setEgress(ctx, c, unit, false)
 }
 
 var _ Enabler = (*Systemd)(nil)
