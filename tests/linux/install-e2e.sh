@@ -229,10 +229,12 @@ JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: applicatio
 [[ $(api GET /platform/profile -H "Authorization: Bearer $JWT" -o /dev/null -w '%{http_code}') == 200 ]] || fail "/platform/profile with the session"
 
 log "invite a second user, redeem the invite, list, remove"
-INVITE=$(sbctl users invite invitee@example.com 2>/dev/null)
+INVITE_LINK=$(sbctl users invite invitee@example.com --role developer --no-mail 2>/dev/null)
+[[ $INVITE_LINK == */claim#* ]] || fail "invite link: $INVITE_LINK"
+INVITE=$(python3 -c 'import sys,urllib.parse as u; print(u.parse_qs(u.urlparse(sys.argv[1]).fragment)["token"][0])' "$INVITE_LINK")
 [[ $INVITE =~ ^sbi_[0-9a-f]{48}$ ]] || fail "invite token: $INVITE"
 [[ $(api POST /claim -H 'Content-Type: application/json' -d "{\"token\":\"$INVITE\",\"password\":\"$ADMIN_PASSWORD\"}" -o "$WORK/inv.json" -w '%{http_code}') == 201 ]] || { cat "$WORK/inv.json" >&2; fail "redeeming the invite"; }
-sbctl users list | grep invitee@example.com >/dev/null || fail "the invited user is not listed"
+sbctl users list | grep "invitee@example.com.*:developer" >/dev/null || fail "the invited user is not listed as a developer"
 sbctl users remove invitee@example.com | grep removed >/dev/null || fail "users remove"
 if sbctl users list | grep invitee@example.com >/dev/null; then fail "the removed user is still listed"; fi
 
