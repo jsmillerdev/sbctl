@@ -11,17 +11,16 @@ systemd units for sbctl, embedded in the binary (`embed.go`) and installed by
 | `sbctl.slice` | every unit runs in it, so `systemctl status sbctl.slice` shows the total |
 | `sbctl.service` | the daemon (`sbctl serve`: Management API, edge proxy, lifecycle engine; starts active projects at boot) |
 | `50-sbctl.rules` | polkit rule: the `sbctl` user may start, stop and tune `sb-*` units and `sbctl.service` (manage-units only; enabling units and daemon-reload need root, through `install-units`) |
-| `sb-basebackup*` | owned by the backup workstream |
+| `sb-basebackup@.service` and `.timer`, `sb-basebackup-prune.service` and `.timer` | nightly base backup per project and the node-wide retention prune. The daemon and the lifecycle engine start the timer instances over D-Bus (they are not enabled for boot); `install-units` writes `sb-basebackup@.timer` with `backup.base_backup_on_calendar` |
 
 Every service unit runs as `User=sbctl`, reads `/var/lib/sbctl/projects/<ref>/<svc>.env`
-(0600) and executes `<svc>.run`; both are written by `units.Supervisor.Render`, so the
-templates never change per project. `MemoryMax` and `CPUQuota` are per-unit drop-ins applied
+(0600, by systemd, before the unit's mount namespace exists) and executes `<svc>.run`; both are
+written by `units.Supervisor.Render`, so the templates never change per project. `MemoryMax` and `CPUQuota` are per-unit drop-ins applied
 over D-Bus. Logs go to journald, selected by unit name (`SyslogIdentifier` equals the
 unit).
 
 Hardening: `NoNewPrivileges`, `ProtectSystem=strict` with a `ReadWritePaths` of the
-project's own directory (the Postgres template also `-/var/lib/sbctl/backups` for the file
-backup backend), `ProtectHome`, `PrivateTmp`, `PrivateDevices` (`/dev/shm` stays
+unit's own state directory only (the allowlist below), `ProtectHome`, `PrivateTmp`, `PrivateDevices` (`/dev/shm` stays
 available), kernel protections, empty capability set, `RestrictAddressFamilies`,
 `UMask=0027`. `MemoryDenyWriteExecute` is left off for the artifacts (Postgres JIT, the BEAM
 and Node map writable and executable memory); `sbctl.service` sets it. Postgres stops on
