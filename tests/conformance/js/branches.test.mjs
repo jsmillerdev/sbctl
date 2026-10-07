@@ -38,12 +38,21 @@ describe('branches', () => {
     assert.equal(branch.with_data, false)
     assert.equal(branch.is_default, false)
     assert.match(branch.project_ref, /^[a-z]{20}$/)
+    // The branch's status (BranchResponse) is read from the project's branch list; the detail of a branch
+    // (GET /v1/branches/{id}) reports the branch project's own status instead.
     branch = await waitFor('the branch to finish its migrations', async () => {
-      const g = await mgmt('GET', `/v1/branches/${branch.id}`)
+      const g = await mgmt('GET', `/v1/projects/${p.ref}/branches/${name}`)
       assert.equal(g.status, 200, JSON.stringify(g.body))
       assert.notEqual(g.body.status, 'MIGRATIONS_FAILED', JSON.stringify(g.body))
-      return g.body.status === 'MIGRATIONS_PASSED' ? { ...branch, ...g.body } : null
-    }, { timeout: 300_000, interval: 3000 })
+      return g.body.status === 'MIGRATIONS_PASSED' ? g.body : null
+    }, { timeout: 200_000, interval: 3000 })
+    const detail = await waitFor('the branch project to be ACTIVE_HEALTHY', async () => {
+      const g = await mgmt('GET', `/v1/branches/${branch.id}`)
+      assert.equal(g.status, 200, JSON.stringify(g.body))
+      return g.body.status === 'ACTIVE_HEALTHY' ? g : null
+    }, { timeout: 60_000, interval: 2000 })
+    assert.equal(detail.body.ref, branch.project_ref)
+    assert.ok(detail.body.db_host && detail.body.db_port, 'the detail names the database host and port')
   })
 
   test('the branch is listed next to the default branch, and found by name', async () => {
