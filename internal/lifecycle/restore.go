@@ -113,6 +113,9 @@ func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, erro
 	if ref == config.SystemRef {
 		return nil, fmt.Errorf("%w: the system project holds the registry and cannot be restored this way", ErrInvalidState)
 	}
+	if err := e.upgradeBusy(ref, "restore"); err != nil {
+		return nil, err
+	}
 	// The data directory is measured before the lock, so a large one does not hold up the
 	// project's other operations; the status checks below still come first in the answer.
 	spaceErr := e.checkRestoreSpace(ref)

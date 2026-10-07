@@ -254,6 +254,9 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 	if store == nil {
 		return nil, errors.New("lifecycle: the registry cannot record upgrades")
 	}
+	if err := e.upgradeBusy(ref, "upgrade"); err != nil {
+		return nil, err
+	}
 	for svc := range req.Target {
 		if !isProjectService(svc) {
 			return nil, fmt.Errorf("%w: %q is not a service a project upgrades", ErrUpgradeUnsupported, svc)
@@ -309,6 +312,17 @@ func (e *Engine) UpgradeProject(ctx context.Context, ref string, target map[stri
 	err = run.Run(ctx)
 	u := run.Upgrade()
 	return &u, err
+}
+
+// upgradeBusy refuses an operation on ref while an upgrade runs in this process. The upgrade
+// holds the project's lock through its disruptive step, and an operation that waited for the
+// lock would then run on a project it was never asked about in this state; refusing at once
+// is what the status UPGRADING promises. (Another process sees the status after it has the lock.)
+func (e *Engine) upgradeBusy(ref, op string) error {
+	if _, busy := e.upgrading.Load(ref); busy {
+		return fmt.Errorf("%w: cannot %s %s while it is being upgraded", ErrInvalidState, op, ref)
+	}
+	return nil
 }
 
 func isProjectService(svc string) bool {

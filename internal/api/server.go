@@ -336,6 +336,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesFunctions(add)
 	s.routesPlatformProject(add)
 	s.routesBackups(add)
+	s.routesUpgrade(add)
 	s.routesContent(add)
 	s.routesProxies(add)
 	s.routesLogin(add)

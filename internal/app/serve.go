@@ -82,6 +82,15 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	if _, err := PGMetaCryptoKey(ctx, cfg, node.Registry, node.Secrets); err != nil {
 		return err
 	}
+	// The artifact versions this release pins join the node's release history, which
+	// `supavise artifacts gc` reads to keep the artifacts of the previous release.
+	if rs, ok := node.Artifacts.(interface{ RecordPins() (bool, error) }); ok {
+		if added, err := rs.RecordPins(); err != nil {
+			log.Warn("could not record the release's artifact pins", "error", err)
+		} else if added {
+			log.Info("release's artifact pins recorded")
+		}
+	}
 	recovered := node.Engine.Recover(ctx)
 	for _, r := range recovered {
 		log.Warn("project recovered", "ref", r.Ref, "from", r.From, "to", r.To, "note", r.Note)

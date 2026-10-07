@@ -448,6 +448,9 @@ func invalidState(p *registry.Project, op string) error {
 // Pause implements Manager: GoTrue, PostgREST and PostgreSQL stop, in that order, and
 // the project becomes INACTIVE. Its route and fleet tenants stay; the data stays.
 func (e *Engine) Pause(ctx context.Context, ref string) error {
+	if err := e.upgradeBusy(ref, "pause"); err != nil {
+		return err
+	}
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return err
@@ -485,6 +488,9 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 // Resume implements Manager: the reverse of Pause. If a unit does not come up, what
 // started is stopped again and the project stays INACTIVE, so Resume can be retried.
 func (e *Engine) Resume(ctx context.Context, ref string) error {
+	if err := e.upgradeBusy(ref, "resume"); err != nil {
+		return err
+	}
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return err
@@ -537,6 +543,9 @@ func (e *Engine) Delete(ctx context.Context, ref string) error {
 // leaves the project GOING_DOWN so that Delete can be run again. A project that failed
 // to initialize has nothing worth backing up and skips the backup.
 func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) error {
+	if err := e.upgradeBusy(ref, "delete"); err != nil {
+		return err
+	}
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return err
@@ -553,9 +562,6 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 		// A restore that is not running here (the daemon died during one) leaves the status
 		// RESTORING with nothing in this map, and that project can still be deleted.
 		return fmt.Errorf("%w: cannot delete %s while a restore is running on it", ErrInvalidState, ref)
-	}
-	if _, busy := e.upgrading.Load(ref); busy {
-		return fmt.Errorf("%w: cannot delete %s while it is being upgraded", ErrInvalidState, ref)
 	}
 	if kids, err := e.branchesOf(ctx, ref); err != nil {
 		return err
@@ -735,6 +741,9 @@ func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev regi
 // gets new stored keys; its env files are rewritten when it resumes. If applying the
 // keys fails, the previous keys are restored.
 func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKeys, error) {
+	if err := e.upgradeBusy(ref, "rotate keys of"); err != nil {
+		return nil, err
+	}
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return nil, err

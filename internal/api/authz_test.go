@@ -166,6 +166,10 @@ func matrixCases() []routeCase {
 		rd("YYNNNN", "PATCH", p+"/database/password", map[string]any{"password": "a-new-database-password"}),
 		rc("YYNNNN", "POST", pp+"/disk", map[string]any{}), // a stub: unnamed project writes need the settings permission
 		rc("YYNNNN", "POST", p+"/upgrade", map[string]any{}),
+		// upgrade state is readable by every member; only Owners and Administrators upgrade
+		rc("YYYYYN", "GET", p+"/upgrade/eligibility", nil),
+		rc("YYYYYN", "GET", p+"/upgrade/status", nil),
+		rc("YYYYYN", "GET", pp+"/service-versions", nil),
 		rc("YYNNNN", "POST", p+"/secrets", []any{map[string]any{"name": "FOO", "value": "bar"}}),
 		rc("YYNNNN", "DELETE", p+"/secrets", []any{"FOO"}),
 		rc("YYNNNN", "POST", p+"/api-keys", map[string]any{"type": "publishable", "name": "matrix_key"}),

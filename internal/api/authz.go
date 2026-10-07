@@ -211,6 +211,12 @@ var routeRules = []routeRule{
 	rule("POST", "/v1/projects/{ref}/restart", chk(members.ActInfraExecute, "reboot")),
 	rule("POST", "/platform/projects/{ref}/restart", chk(members.ActInfraExecute, "reboot")),
 	rule("POST", "/platform/projects/{ref}/restart-services", chk(members.ActInfraExecute, "reboot")),
+	// Upgrading a project's services restarts them on other releases: Owners and Administrators,
+	// like hosted (FGA project_admin_write). Eligibility, status and the running versions are
+	// reads (Read-only and up).
+	rule("POST", "/v1/projects/{ref}/upgrade", chk(members.ActInfraExecute, "queue_jobs.projects.upgrade")),
+	rule("R", "/v1/projects/{ref}/upgrade/**", chk(members.ActRead, P)),
+	rule("R", "/platform/projects/{ref}/service-versions", chk(members.ActRead, P)),
 	// Restores overwrite production data: Owners and Administrators (the resources Studio checks
 	// before it offers the Restore button of a listed backup and the point-in-time form).
 	rule("POST", "/platform/database/{ref}/backups/restore", chk(members.ActInfraExecute, "queue_job.restore.prepare")),

@@ -43,6 +43,9 @@ var ErrNotSupported = errors.New("lifecycle: this data plane cannot apply settin
 // cannot be written into a unit fails the save and not the resume; a project in a
 // transitional state is refused.
 func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.Service, opts ApplyOptions) (ApplyResult, error) {
+	if err := e.upgradeBusy(ref, "apply settings to"); err != nil {
+		return ApplyResult{}, err
+	}
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return ApplyResult{}, err
