@@ -92,7 +92,8 @@ func IsRelease(v string) bool { return releaseVersion.MatchString(strings.TrimSp
 // UpdateSettings are the parts of the [update] section the check reads. The section belongs to
 // the release tooling (config.toml: mode, window, channel, check_interval, ...); this reads it
 // on its own with defaults, so the check works whether or not that section exists, and ignores
-// what it does not need.
+// what it does not need. The interval's grammar is config.ParseCheckInterval, the one the
+// config validator uses.
 type UpdateSettings struct {
 	// CheckInterval is the pause between checks: 24 hours unless [update] check_interval says
 	// otherwise, and never under an hour (an unauthenticated client may ask GitHub 60 times an hour).
@@ -102,18 +103,15 @@ type UpdateSettings struct {
 	Off bool
 }
 
-const (
-	defaultUpdateInterval = 24 * time.Hour
-	minUpdateInterval     = time.Hour
-	// EnvUpdateInterval overrides [update] check_interval, like every config key.
-	EnvUpdateInterval = config.EnvPrefix + "UPDATE_CHECK_INTERVAL"
-)
+// EnvUpdateInterval overrides [update] check_interval, like every config key.
+const EnvUpdateInterval = config.EnvPrefix + "UPDATE_CHECK_INTERVAL"
 
 // ReadUpdateSettings reads [update] from the config file at path (empty: none) and the
 // environment. A missing file, a missing section and a value it cannot read all give the
-// default; the check never fails the daemon for a setting. "off" turns the check off.
+// default; the check never fails the daemon for a setting (the config validator is what
+// reports a bad value). "off" turns the check off.
 func ReadUpdateSettings(path string) UpdateSettings {
-	s := UpdateSettings{CheckInterval: defaultUpdateInterval}
+	s := UpdateSettings{CheckInterval: config.DefaultCheckInterval}
 	var raw string
 	if path != "" {
 		if b, err := os.ReadFile(path); err == nil {
@@ -126,11 +124,8 @@ func ReadUpdateSettings(path string) UpdateSettings {
 				switch v := doc.Update.CheckInterval.(type) {
 				case string:
 					raw = v
-				case int64:
-					raw = strconv.FormatInt(v, 10) + "s" // a bare number is seconds, and 0 is off
-					if v == 0 {
-						raw = "0"
-					}
+				case int64: // a bare number is seconds, and 0 is off
+					raw = strconv.FormatInt(v, 10)
 				}
 			}
 		}
@@ -138,29 +133,15 @@ func ReadUpdateSettings(path string) UpdateSettings {
 	if v := os.Getenv(EnvUpdateInterval); v != "" {
 		raw = v
 	}
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "off", "never", "0":
+	d, on, err := config.ParseCheckInterval(raw)
+	switch {
+	case err != nil:
+	case !on:
 		s.Off = true
-		return s
-	}
-	if d, ok := parseInterval(raw); ok {
-		s.CheckInterval = max(d, minUpdateInterval)
+	default:
+		s.CheckInterval = d
 	}
 	return s
-}
-
-// parseInterval reads a Go duration ("24h") or whole days ("1d").
-func parseInterval(s string) (time.Duration, bool) {
-	s = strings.ToLower(strings.TrimSpace(s))
-	if s == "" {
-		return 0, false
-	}
-	if days, ok := strings.CutSuffix(s, "d"); ok {
-		n, err := strconv.Atoi(days)
-		return time.Duration(n) * 24 * time.Hour, err == nil && n > 0
-	}
-	d, err := time.ParseDuration(s)
-	return d, err == nil && d > 0
 }
 
 // UpdateSource says where releases are published; the zero value is the project's GitHub

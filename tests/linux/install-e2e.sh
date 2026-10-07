@@ -76,13 +76,21 @@ openssl pkey -in "$KEYS/sign.pem" -pubout -out "$KEYS/pub.pem"
 openssl genpkey -algorithm ed25519 -out "$KEYS/other.pem"
 openssl pkey -in "$KEYS/other.pem" -pubout -out "$KEYS/other.pub"
 
+# deploy/release-assets.sh writes the signed manifest with deploy/releasetool: a built one from the
+# caller (the job builds it before sudo, where the Go toolchain is on the PATH), else built here.
+RELEASETOOL=${SUPAVISE_RELEASETOOL:-}
+if [[ -z $RELEASETOOL ]]; then
+  command -v go >/dev/null || fail "no SUPAVISE_RELEASETOOL and no go toolchain"
+  RELEASETOOL=$WORK/releasetool
+  go build -o "$RELEASETOOL" ./deploy/releasetool
+fi
 make_release() { # TAG BINARY-FILE [nolatest]: builds $WORK/srv/download/TAG and the fake GitHub API files for repo o/r
   local tag=$1 bin=$2 latest=${3:-latest} d=$WORK/srv/download/$1
   rm -rf "$d"; mkdir -p "$d"
   cp "$bin" "$d/supavise-linux-$ARCH"
   if [[ $ARCH == amd64 ]]; then echo other-arch >"$d/supavise-linux-arm64"; else echo other-arch >"$d/supavise-linux-amd64"; fi
   echo "not a real studio build" >"$d/supavise-studio-test-p1-linux-$ARCH.tar.zst"
-  deploy/release-assets.sh "$d" "$KEYS/sign.pem" "$KEYS/pub.pem" >/dev/null
+  SUPAVISE_RELEASE_TAG=$tag SUPAVISE_RELEASETOOL=$RELEASETOOL deploy/release-assets.sh "$d" "$KEYS/sign.pem" "$KEYS/pub.pem" >/dev/null
   mkdir -p "$WORK/srv/repos/o/r/releases/tags"
   python3 - "$tag" "$d" "$SRV_PORT" "$WORK/srv/repos/o/r/releases" "$latest" <<'PY'
 import json, os, sys
@@ -98,6 +106,12 @@ make_release v0.0.1 "$SUPAVISE_BIN"
 (cd "$WORK/srv" && exec python3 -m http.server "$SRV_PORT" --bind 127.0.0.1 >"$WORK/http.log" 2>&1) &
 SRV_PID=$!
 for ((i = 0; i < 20; i++)); do [[ $(code "http://127.0.0.1:$SRV_PORT/download/v0.0.1/SHA256SUMS") == 200 ]] && break; sleep 0.5; done
+
+log "the release carries a manifest that the signed checksum list covers"
+M=$WORK/srv/download/v0.0.1/supavise-release.json
+[[ $(jq_ 'd["version"]' <"$M") == v0.0.1 && $(jq_ 'd["min_upgrade_from"]' <"$M") == v0.0.0 && $(jq_ 'd["schema"]' <"$M") == 1 ]] || fail "manifest: $(cat "$M")"
+[[ $(jq_ 'd["artifacts"]["postgres"]' <"$M") == $(awk '/^  postgres:/{print $2}' internal/versions/versions.yaml) ]] || fail "the manifest does not carry the pinned Postgres release"
+grep -q "$(sha256sum "$M" | awk '{print $1}')  supavise-release.json" "$WORK/srv/download/v0.0.1/SHA256SUMS" || fail "SHA256SUMS does not list the manifest"
 
 installer() { # extra env is set by the caller
   SUPAVISE_INSTALL_BASE_URL="http://127.0.0.1:$SRV_PORT" SUPAVISE_INSTALL_PUBKEY_B64=$(base64 -w0 "$KEYS/pub.pem") "$@"
@@ -193,6 +207,24 @@ for p in 80 443 5432 6543; do ss -ltnH "sport = :$p" | grep -q . || fail "nothin
 for p in 7000 5433 9999; do
   ss -ltnH "sport = :$p" | awk '{print $4}' | grep -q "^127.0.0.1:$p$" || fail "port $p is not loopback only"
 done
+
+log "update settings: notify by default, the upgrade timer, unattended OS security updates (a new install turns them on)"
+SV=/usr/local/bin/supavise
+[[ $($SV update config | grep '^mode') == 'mode = "notify"' ]] || fail "a new install is not in notify mode: $($SV update config)"
+[[ $($SV update config | grep '^os_security_updates') == 'os_security_updates = true' ]] || fail "a new install did not turn OS security updates on"
+[[ $(systemctl is-enabled supavise-upgrade.timer) == enabled ]] || fail "supavise-upgrade.timer is not enabled"
+[[ $(systemctl is-active supavise-upgrade.timer) == active ]] || fail "supavise-upgrade.timer is not active"
+grep -q '^OnCalendar=Sun \*-\*-\* 04:00:00$' /etc/systemd/system/supavise-upgrade.timer || fail "the timer does not open at the default window: $(cat /etc/systemd/system/supavise-upgrade.timer)"
+# A new install reboots inside the window for OS patches, so the timer ticks every quarter hour through the two-hour window.
+[[ $(grep -c '^OnCalendar=' /etc/systemd/system/supavise-upgrade.timer) == 8 ]] || fail "a new install (OS reboot in the window) wants 8 ticks in a two-hour window: $(cat /etc/systemd/system/supavise-upgrade.timer)"
+[[ -n $(systemctl list-timers supavise-upgrade.timer --no-legend) ]] || fail "systemd has no next run for supavise-upgrade.timer"
+# The daemon checks for releases; the timer holds the window and nothing else.
+! grep -q '^OnBootSec=\|^OnUnitActiveSec=' /etc/systemd/system/supavise-upgrade.timer || fail "the timer carries a release check: $(cat /etc/systemd/system/supavise-upgrade.timer)"
+# An upgrade the service is stopped in the middle of gets SIGTERM and time to end, not a start timeout or a SIGKILL.
+[[ $(systemctl show -p KillMode --value supavise-upgrade.service) == mixed ]] || fail "supavise-upgrade.service: KillMode $(systemctl show -p KillMode --value supavise-upgrade.service), want mixed"
+[[ $(systemctl show -p TimeoutStartUSec --value supavise-upgrade.service) == infinity ]] || fail "supavise-upgrade.service has a start timeout: $(systemctl show -p TimeoutStartUSec --value supavise-upgrade.service)"
+$SV update status | tee "$WORK/update-status.txt" | grep -q 'Mode        notify' || fail "update status: $(cat "$WORK/update-status.txt")"
+assert_os_updates on
 
 log "re-running the installer before anyone has claimed keeps the claim token (it would otherwise be revoked behind the back of whatever stored it)"
 deploy/install.sh --binary "$SUPAVISE_BIN" --claim-token-file "$WORK/claim-token-rerun" 2>&1 | tee "$WORK/install-preclaim.log"
@@ -339,7 +371,15 @@ HZ=$(api GET /healthz)
 [[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a healthy node"
 [[ $HZ != *"$REF"* ]] || fail "/healthz names a project"
 [[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz/detail) == 401 ]] || fail "/healthz/detail answered without credentials"
-DETAIL=$(papi GET /healthz/detail)
+# The daemon shares one report between callers for a few seconds (health.cache), so a report taken
+# before the project existed may still be served right after it was created: ask again until
+# the cache has turned over.
+DETAIL=""
+for ((n = 0; n < 12; n++)); do
+  DETAIL=$(papi GET /healthz/detail)
+  [[ $DETAIL == *"$REF"* ]] && break
+  sleep 5
+done
 [[ $(printf '%s' "$DETAIL" | jq_ 'd["status"]') == healthy && $DETAIL == *"$REF"* ]] || fail "/healthz/detail with the owner's token: $DETAIL"
 
 log "stopping the project's PostgREST degrades the node: exit status 1, the project named, /healthz still 200"
@@ -411,6 +451,54 @@ wait_active supavise.service 120
 for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
 [[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "a config change restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
 
+log "supavise update config: auto mode and a window write the timer, and a re-run of the installer keeps them"
+$SV update config --mode auto --window "Mon-Fri 01:00-02:00" >/dev/null || fail "update config --mode auto"
+[[ $($SV update config | grep '^mode') == 'mode = "auto"' ]] || fail "update config did not persist the mode"
+T=/etc/systemd/system/supavise-upgrade.timer
+for t in 01:00:00 01:15:00 01:30:00 01:45:00; do grep -q "^OnCalendar=Mon,Tue,Wed,Thu,Fri \*-\*-\* $t\$" "$T" || fail "auto mode: no tick at $t in $(cat "$T")"; done
+[[ $(grep -c '^OnCalendar=' "$T") == 4 ]] || fail "auto mode: want 4 ticks in a one-hour window, got $(grep -c '^OnCalendar=' "$T")"
+[[ $(systemctl is-active supavise-upgrade.timer) == active ]] || fail "the timer stopped after update config"
+if $SV update config --window "someday" >/dev/null 2>&1; then fail "update config accepted a bad window"; fi
+if $SV update config --mode yolo >/dev/null 2>&1; then fail "update config accepted a bad mode"; fi
+CFG_AUTO=$(sha256sum /etc/supavise/config.toml)
+deploy/install.sh --binary "$SUPAVISE_BIN" >/dev/null 2>&1 || fail "re-run after update config failed"
+[[ $(sha256sum /etc/supavise/config.toml) == "$CFG_AUTO" ]] || fail "a no-flag re-run changed the update settings"
+[[ $($SV update config | grep -E '^(mode|window)' | tr '\n' ' ') == 'mode = "auto" window = "Mon-Fri 01:00-02:00" ' ]] || fail "a re-run lost the update settings: $($SV update config)"
+# Outside the window an auto-mode node does not upgrade (Wednesday 12:00 UTC); the check failing (no release exists) is not an error.
+out=$(timeout 120 $SV update run --at 2026-10-07T12:00:00Z 2>&1) || fail "update run outside the window failed: $out"
+[[ $out != *unattended_upgrade_started* ]] || fail "an upgrade started outside the window: $out"
+# --dry-run (and --at, which implies it) says what a pass inside the window would do and changes nothing: no upgrade, no reboot, no record.
+STATE_SUM=$(sha256sum /var/lib/supavise-upgrade/state.json 2>/dev/null || echo none)
+out=$(timeout 120 $SV update run --dry-run --at 2026-10-05T01:30:00Z 2>&1) || fail "update run --dry-run inside the window failed: $out"
+[[ $out == *unattended_upgrade_started* && $out == *dry_run* ]] || fail "update run --dry-run inside the window did not say it would upgrade: $out"
+[[ $(sha256sum /var/lib/supavise-upgrade/state.json 2>/dev/null || echo none) == "$STATE_SUM" ]] || fail "update run --dry-run changed the record"
+[[ $(/usr/local/bin/supavise --version) == *v0.0.1* ]] || fail "update run --dry-run changed the binary"
+# The service keeps its memory in a root-owned directory of its own, not in the state directory that the supavise user can write.
+[[ $(systemctl show -p StateDirectory --value supavise-upgrade.service) == supavise-upgrade ]] || fail "supavise-upgrade.service has no StateDirectory of its own"
+[[ ! -e /var/lib/supavise/update ]] || fail "update state sits in the supavise-writable state directory"
+[[ ! -d /var/lib/supavise-upgrade ]] || [[ $(stat -c %U /var/lib/supavise-upgrade) == root ]] || fail "/var/lib/supavise-upgrade is not owned by root"
+# The installer flags set the same keys.
+deploy/install.sh --binary "$SUPAVISE_BIN" --auto-upgrade=false --maintenance-window "Sun 04:00-06:00" >/dev/null 2>&1 || fail "re-run with --auto-upgrade=false"
+[[ $($SV update config | grep -E '^(mode|window)' | tr '\n' ' ') == 'mode = "notify" window = "Sun 04:00-06:00" ' ]] || fail "the installer flags did not set the update settings: $($SV update config)"
+[[ $(grep -c '^OnCalendar=' "$T") == 8 ]] || fail "back in notify mode with OS updates on, the timer still ticks for the reboot"
+log "OS security updates can be switched off and on, and a re-run keeps the choice"
+$SV update config --os-security-updates=false >/dev/null || fail "update config --os-security-updates=false"
+assert_os_updates off
+[[ $(grep -c '^OnCalendar=' "$T") == 1 ]] || fail "notify mode with no OS reboot should wake once per window"
+# Nothing waits for the window (notify mode, no managed reboot), so the timer is off: the daemon does the release check.
+[[ $(systemctl is-enabled supavise-upgrade.timer 2>/dev/null || true) != enabled ]] || fail "notify mode with no managed reboot still has supavise-upgrade.timer enabled"
+deploy/install.sh --binary "$SUPAVISE_BIN" >/dev/null 2>&1 || fail "re-run with OS updates off"
+assert_os_updates off
+$SV update config --os-security-updates=true >/dev/null || fail "update config --os-security-updates=true"
+assert_os_updates on
+deploy/install.sh --binary "$SUPAVISE_BIN" --no-os-updates >/dev/null 2>&1 || fail "re-run with --no-os-updates"
+assert_os_updates off
+[[ $($SV update config | grep '^os_security_updates') == 'os_security_updates = false' ]] || fail "--no-os-updates did not persist"
+$SV update config --os-security-updates=true >/dev/null || fail "turning OS updates back on"
+assert_os_updates on
+wait_active supavise.service 120
+[[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "changing the update settings restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
+
 # ---- 6b. re-running install.sh with a newer binary restarts the daemon onto it ------------
 build_version() { # VERSION OUT [GIVEN-PATH]
   local v=$1 out=$2 given=${3:-}
@@ -440,7 +528,8 @@ for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w
 if [[ -n $V3 ]]; then
   log "self-update: sign v0.0.3 and update from the local release server"
   make_release v0.0.3 "$V3"
-  SU=(/usr/local/bin/supavise self-update --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" --public-key-file "$KEYS/pub.pem")
+  # Two keys, as a binary has during a key rotation: the release is signed by the second one.
+  SU=(/usr/local/bin/supavise self-update --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" --public-key-file "$KEYS/other.pub" --public-key-file "$KEYS/pub.pem")
   [[ $("${SU[@]}" --check) == *"update available"* ]] || fail "self-update --check did not see v0.0.3: $("${SU[@]}" --check)"
   D2=$WORK/srv/download/v0.0.3
   cp "$D2/supavise-linux-$ARCH" "$WORK/good-v3"
@@ -456,6 +545,7 @@ if [[ -n $V3 ]]; then
   [[ $out == *"does not verify"* ]] || fail "self-update wrong-key message: $out"
   "${SU[@]}" 2>&1 | tee "$WORK/selfupdate.log"
   [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "self-update failed"
+  grep -q "signature verified (next key" "$WORK/selfupdate.log" || fail "self-update did not report which key verified the release: $(cat "$WORK/selfupdate.log")"
   [[ $(/usr/local/bin/supavise --version) == *v0.0.3* ]] || fail "the binary is not v0.0.3 after self-update"
   [[ $(daemon_version) == *v0.0.3* ]] || fail "the daemon does not run v0.0.3 after self-update: $(daemon_version)"
   [[ -x /usr/local/bin/supavise.prev ]] || fail "the previous binary was not kept"
@@ -467,6 +557,13 @@ if [[ -n $V3 ]]; then
   n=$(rest -H "apikey: $PUB" "http://127.0.0.1/rest/v1/e2e_items?select=id" | jq_ 'len(d)') || true
   [[ $n == 2 ]] || fail "REST after self-update returned '$n' rows"
   [[ $("${SU[@]}" 2>&1) == *"already up to date"* ]] || fail "a second self-update did not report up to date"
+
+  # A release states the oldest version it upgrades from; self-update does not skip past it.
+  log "self-update: a release with min_upgrade_from v0.0.5 is refused on v0.0.3"
+  SUPAVISE_MIN_UPGRADE_FROM=v0.0.5 make_release v0.0.6 "$V3" nolatest
+  if out=$("${SU[@]}" --version v0.0.6 2>&1); then fail "self-update skipped past min_upgrade_from"; fi
+  [[ $out == *"upgrades from v0.0.5 or later"* ]] || fail "min_upgrade_from message: $out"
+  [[ $(/usr/local/bin/supavise --version) == *v0.0.3* ]] || fail "the binary changed although min_upgrade_from refused the release"
 
   # A release whose daemon dies after it forks: systemd reports the unit active, so only the
   # readiness probe notices. self-update must put v0.0.3 back and re-render its units.

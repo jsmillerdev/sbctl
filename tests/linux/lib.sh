@@ -339,3 +339,42 @@ wait_cron_success() {
   "$run" "$ref" "select d.status, d.return_message from cron.job_run_details d join cron.job j using (jobid) where j.jobname = '$job' order by d.runid desc limit 3" >&2 || true
   return 1
 }
+
+# assert_os_updates on|off: what `supavise system os-updates` leaves on a Ubuntu or Debian host.
+# On: unattended-upgrades is installed and reads only the security origins (checked through
+# apt-config and through the program's own "Allowed origins" line), never reboots by itself, and
+# needrestart is told to leave supavise-* units alone. Off: the apt configuration is gone; the
+# needrestart setting stays wherever needrestart is installed, because it protects the projects
+# from a manual apt upgrade too.
+assert_os_updates() { # on|off
+  if [[ $1 == on ]]; then
+    [[ -f /etc/apt/apt.conf.d/52supavise-unattended-upgrades ]] || fail "the apt configuration for unattended security updates is missing"
+    dpkg -s unattended-upgrades >/dev/null 2>&1 || fail "unattended-upgrades is not installed"
+    local cfg pats origins l
+    cfg=$(apt-config dump)
+    # Only security origins, whichever list the distribution's own file used (we clear both).
+    [[ -z $(grep '^Unattended-Upgrade::Allowed-Origins::' <<<"$cfg") ]] || fail "Allowed-Origins still lists origins: $(grep '^Unattended-Upgrade::Allowed-Origins::' <<<"$cfg")"
+    pats=$(grep '^Unattended-Upgrade::Origins-Pattern::' <<<"$cfg") || fail "no Origins-Pattern entries: $cfg"
+    while IFS= read -r l; do [[ $l == *security* ]] || fail "an origin that is not a security origin: $l"; done <<<"$pats"
+    grep -q '^Unattended-Upgrade::Automatic-Reboot "false";' <<<"$cfg" || fail "unattended-upgrades may reboot by itself"
+    grep -q '^APT::Periodic::Unattended-Upgrade "1";' <<<"$cfg" || fail "unattended upgrades are not switched on"
+    # What the program itself reads from that configuration.
+    # The distribution's own apt-daily timers (enabled by the step above) may hold the apt lock for a
+    # while, and unattended-upgrade then says nothing about origins: look again for up to six minutes (enabling the timers makes
+    # apt-daily-upgrade run at once on a runner whose last run was long ago).
+    local run="" n
+    for ((n = 0; n < 36; n++)); do
+      run=$(timeout 240 unattended-upgrade --dry-run --debug 2>&1 || true)
+      origins=$(grep -m1 'Allowed origins are' <<<"$run" || true)
+      [[ -n $origins ]] && break
+      sleep 10
+    done
+    [[ -n $origins ]] || fail "unattended-upgrade printed no allowed origins: $(tail -15 <<<"$run")"
+    [[ $origins == *security* && $origins != *-updates* && $origins != *backports* ]] || fail "unattended-upgrade would take more than security updates: $origins"
+    [[ ! -d /etc/needrestart/conf.d || -f /etc/needrestart/conf.d/50-supavise.conf ]] || fail "needrestart may restart supavise units"
+  else
+    [[ ! -e /etc/apt/apt.conf.d/52supavise-unattended-upgrades ]] || fail "the apt configuration is still there"
+    [[ ! -d /etc/needrestart/conf.d || -f /etc/needrestart/conf.d/50-supavise.conf ]] || fail "needrestart may restart supavise units after the opt-out"
+  fi
+}
+

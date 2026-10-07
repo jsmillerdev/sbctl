@@ -1,0 +1,10 @@
+[Unit]
+Description=Supavise maintenance window
+
+[Timer]
+# Maintenance window Sun 04:00-06:00 (the node's time zone): 1 run(s) while it is open.
+OnCalendar=Sun *-*-* 04:00:00
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

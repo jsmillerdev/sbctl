@@ -15,6 +15,7 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/jsmillerdev/supavise/internal/update"
 )
 
 func init() {
@@ -27,14 +28,15 @@ func init() {
 		noUnits   bool
 		wait      time.Duration
 		apiBase   string
-		keyFile   string
+		keyFiles  []string
 	)
 	cmd := &cobra.Command{
 		Use:   "self-update",
 		Short: "Replace this binary with the latest release (or --version), after verifying its signature",
 		Long: `Fetches the latest release of the Supavise repository on GitHub (or the one named by
 --version), verifies the ed25519 signature of its SHA256SUMS against the public key built
-into this binary, checks the binary against its checksum, replaces /usr/local/bin/supavise
+into this binary (the current one, or the next one while a key rotation is under way), checks
+the signed release manifest and the binary against their checksums, replaces /usr/local/bin/supavise
 atomically (the previous binary stays beside it as supavise.prev), refreshes the systemd units
 with the new binary and restarts supavise.service. Project units are not restarted: they
 belong to systemd and keep running. If the restarted daemon does not answer on its admin
@@ -43,7 +45,8 @@ calls a daemon active the moment it forks), the previous binary is put back, the
 rendered again with it and the service is restarted.
 
 Needs root (the binary's directory is root's). Artifacts upgrade through versions.yaml,
-not through this command.`,
+not through this command. A release states the oldest version it upgrades from
+(min_upgrade_from in its manifest); self-update refuses to skip past it.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if runtime.GOOS != "linux" {
@@ -59,14 +62,16 @@ not through this command.`,
 				return err
 			}
 			o := selfupdate.Options{ExecPath: exe, Repo: repo, APIBase: apiBase, Tag: tag, Current: version, Platform: "linux-" + runtime.GOARCH, Force: force, Out: cmd.OutOrStdout()}
-			if keyFile != "" {
-				b, err := os.ReadFile(keyFile)
+			for _, f := range keyFiles {
+				b, err := os.ReadFile(f)
 				if err != nil {
 					return err
 				}
-				if o.Key, err = selfupdate.ParsePublicKey(b); err != nil {
+				k, err := selfupdate.ParsePublicKey(b)
+				if err != nil {
 					return err
 				}
+				o.Keys = append(o.Keys, k)
 			}
 			if check {
 				rel, err := selfupdate.Latest(cmd.Context(), o)
@@ -83,6 +88,19 @@ not through this command.`,
 			if os.Geteuid() != 0 {
 				return errors.New("run as root: sudo supavise self-update")
 			}
+			// Read the config before anything changes: a file the installer cannot read
+			// must not leave a swapped binary beside the old daemon.
+			cfg, _, err := readConfigFile(selfUpdateConfigPath())
+			if err != nil {
+				return err
+			}
+			// The OS reboot in the maintenance window waits on this lock, so it never lands
+			// between the swap and the verified restart.
+			unlock, err := update.LockHost(update.HostLockPath)
+			if err != nil {
+				return err
+			}
+			defer unlock()
 			res, err := selfupdate.Update(cmd.Context(), o)
 			if err != nil {
 				return err
@@ -103,10 +121,6 @@ not through this command.`,
 				return nil
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "restarting supavise.service (a restart waits for running operations, up to 10 minutes)")
-			cfg, _, cerr := readConfigFile(selfUpdateConfigPath())
-			if cerr != nil {
-				return cerr
-			}
 			if err := restartAndWait(cmd.Context(), cfg, wait); err != nil {
 				if res.Previous != "" {
 					return rollback(cmd, exe, res.Previous, cfg, wait, err, noUnits)
@@ -127,7 +141,7 @@ not through this command.`,
 	// For tests against a local release server and a throwaway key; a release build
 	// verifies against the key compiled into the binary.
 	cmd.Flags().StringVar(&apiBase, "api-base", "", "GitHub API root (tests)")
-	cmd.Flags().StringVar(&keyFile, "public-key-file", "", "verify against this PEM public key instead of the built-in release key (tests)")
+	cmd.Flags().StringArrayVar(&keyFiles, "public-key-file", nil, "verify against this PEM public key instead of the built-in release keys; repeat for a second key (tests)")
 	_ = cmd.Flags().MarkHidden("api-base")
 	_ = cmd.Flags().MarkHidden("public-key-file")
 	rootCmd.AddCommand(cmd)
