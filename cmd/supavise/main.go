@@ -3,10 +3,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
 )
 
 func main() {
@@ -15,6 +18,11 @@ func main() {
 	defer stop()
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "supavise:", err)
+		// `supavise upgrade` and `supavise rollback` have their own exit statuses (2, 3 and 4).
+		var f *nodeupgrade.Failure
+		if errors.As(err, &f) {
+			os.Exit(f.Code)
+		}
 		os.Exit(1)
 	}
 }
