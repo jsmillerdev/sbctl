@@ -65,6 +65,17 @@ log "system init (downloads artifacts)"
 system_init
 wait_active sb-postgres@system.service 30
 
+# PROBE (temporary): which exec properties can SetUnitProperties set on this systemd?
+log "PROBE $(systemctl --version | head -1)"
+systemd-run --unit=sbprobe --quiet sleep 600
+sleep 1
+for p in "InaccessiblePaths=-/run/dbus" "InaccessiblePaths=" "InaccessiblePaths=-/etc/sbctl/master.key" "TemporaryFileSystem=/run/dbus:ro" "ReadOnlyPaths=-/run/dbus" "BindReadOnlyPaths=-/dev/null:/run/nscd" "TemporaryFileSystem="; do
+  if out=$(systemctl set-property sbprobe.service "$p" 2>&1); then log "PROBE ok: $p"; else log "PROBE fail: $p: $out"; fi
+  log "PROBE after $p: InaccessiblePaths='$(systemctl show -p InaccessiblePaths --value sbprobe.service)' TemporaryFileSystem='$(systemctl show -p TemporaryFileSystem --value sbprobe.service)'"
+done
+systemctl stop sbprobe.service || true
+exit 0
+
 # ---- the "external host": the runner's own address, which is not loopback -------------------
 HOSTIP=$(hostname -I | awk '{print $1}')
 [[ -n "$HOSTIP" && "$HOSTIP" != 127.* ]] || fail "no non-loopback address on this runner (hostname -I: '$(hostname -I)')"
