@@ -182,18 +182,20 @@ func TestStorageEnvFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]string{
-		"MULTI_TENANT":                       "true",
-		"DATABASE_MULTITENANT_URL":           "postgres://supavise_storage:pw-storage@127.0.0.1:37001/_storage",
-		"SERVER_HOST":                        "127.0.0.1",
-		"SERVER_PORT":                        "37030",
-		"SERVER_ADMIN_PORT":                  "37031",
-		"SERVER_ADMIN_API_KEYS":              c.storageAdminKey,
-		"AUTH_ENCRYPTION_KEY":                c.storageEncKey,
-		"REQUEST_ALLOW_X_FORWARDED_PATH":     "true",
-		"STORAGE_BACKEND":                    "file",
-		"STORAGE_FILE_BACKEND_PATH":          n.cfg.Paths().System("storage") + "/objects",
-		"UPLOAD_FILE_SIZE_LIMIT":             "52428800",
-		"ADMIN_RETURN_TENANT_SENSITIVE_DATA": "false",
+		"MULTI_TENANT":                   "true",
+		"DATABASE_MULTITENANT_URL":       "postgres://supavise_storage:pw-storage@127.0.0.1:37001/_storage",
+		"SERVER_HOST":                    "127.0.0.1",
+		"SERVER_PORT":                    "37030",
+		"SERVER_ADMIN_PORT":              "37031",
+		"SERVER_ADMIN_API_KEYS":          c.storageAdminKey,
+		"AUTH_ENCRYPTION_KEY":            c.storageEncKey,
+		"REQUEST_ALLOW_X_FORWARDED_PATH": "true",
+		// The host an S3 client signed (a custom hostname has no ref in it) comes in this header.
+		"S3_PROTOCOL_NON_CANONICAL_HOST_HEADER": config.StorageClientHostHeader,
+		"STORAGE_BACKEND":                       "file",
+		"STORAGE_FILE_BACKEND_PATH":             n.cfg.Paths().System("storage") + "/objects",
+		"UPLOAD_FILE_SIZE_LIMIT":                "52428800",
+		"ADMIN_RETURN_TENANT_SENSITIVE_DATA":    "false",
 	}
 	for k, v := range want {
 		if env[k] != v {
