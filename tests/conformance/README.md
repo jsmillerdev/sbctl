@@ -23,7 +23,7 @@ Run the Go parts anywhere: `go run ./tests/conformance/specdiff`, `go run ./test
 | Client | Pin | Bump |
 |---|---|---|
 | supabase-js | `js/package.json` and `js/package-lock.json` | edit both with `npm install --save-exact @supabase/supabase-js@X --prefix tests/conformance/js` |
-| Supabase CLI | `pins.env` (`SUPABASE_CLI_VERSION`) | edit the file |
+| Supabase CLI | `pins.env` (`SUPABASE_CLI_VERSION`), mirrored by `cli.version_tested` in `versions.yaml` | edit both |
 | Node | 22, in the workflow | |
 
 A bump is a pull request; the `suites` job gates it. `bumpcheck` lists newer releases of every pin
