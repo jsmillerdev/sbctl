@@ -48,8 +48,9 @@ registered in a second mux of a chain, tried in order.
 | Settings | `GET` and `PATCH /v1/projects/{ref}/config/auth` and `/platform/auth/{ref}/config` (+ `/hooks`), `/v1/projects/{ref}/postgrest` and `/platform/projects/{ref}/config/postgrest`, `config/realtime`, `config/storage` (v1 and platform), `GET` and `PUT /v1/projects/{ref}/config/database/postgres`, `GET /v2/projects/{ref}/config` (the document the CLI diffs), `PATCH /v1/projects/{ref}/database/password` and `/platform/projects/{ref}/db-password` |
 | Database | `database/query`, `database/query/read-only` (rows as JSON; `parameters` supported), `database/migrations` list and apply (`supabase_migrations.schema_migrations`), `types/typescript` (pg-meta generator), `cli/login-role` create and delete, `advisors/*` (no lints yet) |
 | Functions and secrets | `functions` list, create, deploy (multipart), get, patch, delete, `body`; `secrets` list (digests), create, delete. Sources and sealed secrets are stored; there is no runtime yet (phase 2) |
-| Identity | `/v1/profile`, `/platform/profile` (get, post, patch), `profile/permissions` (owner on every organization), `profile/access-tokens` (list, create, get, delete), `/platform/cli/login` and `/platform/cli/login/{session_id}` (device login) |
-| Organizations | `/v1/organizations` list, get, `entitlements`, `members`; `/platform/organizations` list, create, get, patch, `entitlements` (every feature of the spec's key enum granted), `billing/subscription` (plan stub), `members`, `projects` |
+| Identity | `/v1/profile`, `/platform/profile` (get, post, patch), `profile/permissions` and `permissions/v2` (computed from the caller's roles), `profile/access-tokens` (list, create, get, delete), `/platform/cli/login` and `/platform/cli/login/{session_id}` (device login) |
+| Organizations | `/v1/organizations` list, get, `entitlements`, `members`; `/platform/organizations` list, create, get, patch, `entitlements` (every feature of the spec's key enum granted), `billing/subscription` (plan stub), `projects` |
+| Members and roles | `/platform/organizations/{slug}/members` (list; `PATCH` and `DELETE .../{gotrue_id}`; `PUT` and `DELETE .../{gotrue_id}/roles/{role_id}`), `members/invitations` (list, create, delete by id, get and accept by token), `members/mfa/enforcement`, `roles`, `members/reached-free-project-limit`; `/platform/projects/{ref}/members`; `/v2/organizations/{slug}/members`, `roles`, `PATCH .../members/{user_id}/roles`, `POST` and `DELETE .../members/invitations`. See Members, roles and permissions below |
 | Studio data | `/platform/projects/{ref}/content` (saved SQL snippets, reports; upsert, list, get, count, delete) and `content/folders` |
 | pg-meta | every `/platform/pg-meta/{ref}/*` operation of the spec, proxied to sb-pgmeta |
 | Auth admin | `/platform/auth/{ref}/users` (list, create, patch, delete), `invite`, `magiclink`, `otp`, `recover`, proxied to the project's GoTrue admin API with its `service_role` key |
@@ -111,9 +112,7 @@ A PAT is not re-checked against the user's admin status on each use: delete a us
 when you remove their access.
 
 Dashboard users are recorded in `sbctl.api_users` on first sight (profile fields come from
-GoTrue's `user_metadata`; later edits win). Every authenticated user can see and change
-every project and organization: members and roles are a later phase, which is why
-`/platform/profile/permissions` grants `%` on `%` and every PAT carries full access.
+GoTrue's `user_metadata`; later edits win). What a user may do is decided by their roles, below.
 
 ### Claim and invite (`GET` and `POST /claim`, `claim.go`)
 
@@ -129,8 +128,11 @@ cannot be created (the address exists, the password is refused) the token is rel
 again. Unknown, used and expired tokens all answer `403`; ten failures in a minute answer `429` for
 the rest of the minute, node-wide. `GET /claim` serves a self-contained page (one inline script
 pinned by hash in the CSP, no third-party requests). Neither route takes credentials: the token is
-the credential. `Accounts` (the same type the CLI uses for `sbctl claim token`, `sbctl users invite|list|remove`)
-also lists dashboard users and removes one together with the personal access tokens it created.
+the credential. The claimed first user becomes Owner of the organization. Redeeming an invite token also accepts the
+organization invitations that wait for its address (invitations carry the role, below), and records the account in
+`sbctl.api_users`; the claim page fills the token and address from the link's `#token=...&email=...` fragment, which a
+browser never sends to a server. `Accounts` (the same type the CLI uses for `sbctl claim token`, `sbctl users invite|list|role|remove`)
+also lists dashboard users and removes one together with its memberships and the personal access tokens it created.
 
 ### `supabase login` (device flow)
 
@@ -146,6 +148,114 @@ with it (reaped on the next login request or claim attempt). Protocol read from 
 `ensure-login.ts`) and Studio (`pages/cli/login.tsx`). Set `[api] disable_device_login` to
 turn it off.
 
+## Members, roles and permissions
+
+Roles are hosted's four, with hosted's ids kept in code (`internal/members/roles.go`): **Owner** (1),
+**Administrator** (2), **Developer** (3) and **Read-only** (4), organization-wide or limited to projects.
+Capabilities follow hosted's access-control documentation and the role descriptions in Studio's Team page:
+
+| | Owner | Administrator | Developer | Read-only |
+|---|---|---|---|---|
+| Organization settings, delete the organization, project transfer, SSO, MFA requirement | yes | | | |
+| Add or remove Owners (also project-scoped Owner roles) | yes | | | |
+| Add, change, remove and invite Administrators, Developers and Read-only members | yes | yes | | |
+| Billing: read | yes | yes | yes | yes |
+| Billing: update; OAuth apps | yes | yes | | |
+| Create, rename, pause, restart, restore and delete projects; database password; backups restore | yes | yes | | |
+| Project settings (Auth, PostgREST, Realtime, Storage, Postgres); API keys create, update, revoke; function secrets write; any unnamed write | yes | yes | | |
+| Read the service_role key, the JWT secret, the S3 credentials; temporary keys | yes | yes | yes | |
+| Write SQL, apply migrations, change schema (Studio and pg-meta), Auth users, Storage buckets and objects, deploy and delete functions, preview branches | yes | yes | yes | |
+| Read everything else: config, logs, advisors, users, buckets, functions, secrets (digests), `SELECT` SQL, types | yes | yes | yes | yes |
+| Saved SQL snippets, reports | yes | yes | yes | yes |
+
+A **project-scoped role** is a base role held on a set of projects. The member sees only those projects (lists
+filter, the other projects answer 403) and has the base role's permissions on them; on the organization itself the
+member can read it and its members, nothing else. Each project holds one role per member: giving a member another
+scoped role on a project takes the project out of the first. A member with no organization-wide role and no project
+has no access (the "no-access" state). **An organization always keeps one Owner**: demoting, removing or leaving as
+the last Owner answers 400 (`ErrLastOwner`), concurrent changes included (the check runs in a transaction that locks
+the organization). Members may always leave. `POST /platform/organizations` needs an Owner role somewhere (or an
+empty node); the creator owns the new organization.
+
+### Enforcement
+
+`authz.go` holds the route table: every operation of the three specs, and every extra route sbctl serves, resolves
+to an action and a resource of hosted's `PermissionAction` model (`tenant:Sql:Admin:Write` on `migrations`,
+`write:Update` on `custom_config_gotrue`, `infra:Execute` on `reboot`, ...), checked against the caller's effective
+permissions before the handler runs. A row of the table is `method, path template, need`; `TestRouteTableCoversTheSpecs`
+fails for a rule that no route reaches. The defaults are deny: a write no rule names needs `write:Update` on the
+project (Owner, Administrator) or on the organization (Owner), and a write outside any organization or project
+needs the Owner role somewhere. Routes about the caller's own account (profile, tokens, notifications, telemetry)
+and the invitation the caller holds the token of are open to every signed-in user. `TestRoleMatrix` drives about a
+hundred representative routes as an Owner, an Administrator, a Developer, a Read-only member, a project-scoped
+Developer and a user without a membership through the real handlers.
+
+- **The same list serves Studio.** `GET /platform/profile/permissions` returns the caller's entries
+  (`actions`, `resources`, `condition`, `organization_slug`, `project_refs`, `restrictive`), and the server evaluates
+  them with the semantics of Studio's `doPermissionsCheck` (`internal/members/permission.go`): `%` wildcards, a
+  matching restrictive entry beats any grant, entries scoped to a project take over for that project, an empty list
+  denies. `TestPermissionsEndpointMatchesEnforcement` decodes the JSON and checks that Studio's rule and the
+  server's agree for every role. Owners get `%` on `%`; Administrators the same minus restrictive entries for
+  organization settings, project transfer and role changes of Owners (a json-logic condition on
+  `resource.role_id`, listing the Owner role and every project-scoped Owner role); Developer and Read-only are
+  allow lists.
+- **Read-only SQL is read-only in the database.** Whoever lacks `tenant:Sql:Write:Insert` has their SQL run as
+  the `sbctl_read_only` role on every path: `POST /v1/projects/{ref}/database/query` (the MCP server's `execute_sql`),
+  Studio's `POST /platform/pg-meta/{ref}/query` and the other pg-meta reads, and `cli/login-role` hands such a caller
+  the read-only login role (`sbctl_cli_ro_*`) whatever `read_only` says. `TestIntegrationRoles` runs inserts,
+  updates, deletes, DDL, `begin read write`, `set session characteristics` and `reset role` against a real
+  Postgres through both routes.
+- **Secrets stay with the roles that may read them.** For a caller without `read:Read` on `service_api_keys`,
+  `field.jwt_secret` and `storage.s3_credentials` (Read-only), `GET .../settings` omits the JWT secret and the
+  service_role key, `config/postgrest` blanks `jwt_secret`, `api-keys?reveal=true` and the temporary key answer 403 and
+  the S3 credentials are not listed.
+- **Personal access tokens carry their owner's permissions**, read at each request: demote or remove the member
+  and their tokens lose the access at once (`users remove` also deletes the tokens). **Dashboard sessions** are
+  checked the same way. A token is not an interactive session, so the MFA requirement below does not apply to it.
+- **MFA requirement.** `GET` and `PATCH /platform/organizations/{slug}/members/mfa/enforcement` store and report
+  it (the answer is 201 on both, as the spec says), and `organization_requires_mfa` in the organization list follows
+  it. While it is on, a dashboard session whose JWT does not carry `aal: aal2` is refused in the organization's
+  routes (403 `MFA required`), still sees the organization list, profile and permissions, and cannot accept an
+  invitation; turning it on needs an aal2 session, so an Owner cannot lock themselves out. `mfa_enabled` of a member
+  is always false (GoTrue's factor list is not queried).
+
+### Invitations
+
+`POST .../members/invitations` takes both body shapes of the spec (`emails` + `role_id` + `role_scoped_projects`,
+Studio's; or `data[].attributes` with `role` and `projects`) and answers `{succeeded, failed}`; an address that
+is already a member lands in `failed`, an invalid address is a 400, and a caller who may not invite the role gets a 403.
+sbctl adds `invite_links: [{email, url, emailed}]` to that answer. The token is `sbo_` + 48 hex, stored as its
+SHA-256 (`sbctl.org_invitations`), works once and expires after 7 days (hosted: 24 hours; here the link often travels
+by hand); inviting an address again replaces the pending invitation. Studio's `/join?token=...&slug=...` page uses
+`GET` and `POST .../invitations/{token}`: the signed-in user's email must match (case-insensitively) and joins with the
+invited role, or with the invited project-scoped role on the projects that still exist.
+
+How the invitee is told:
+
+- With **`[mail]` configured** (an SMTP relay for `sb-gotrue@system`, rendered into its `GOTRUE_SMTP_*`), sb-gotrue sends
+  the message: GoTrue's admin invite for an address without an account (the account is created confirmed and gets
+  `sbctl_admin`; the link signs the person in and lands on the invitation), a sign-in link (`/magiclink`) that lands on
+  the invitation for an existing account. If the relay fails the invitation stays and the caller gets the link.
+- **Without mail**, the answer carries the link and the server logs it at info level: the invitation page for an
+  existing account, the claim page (token and address prefilled) for a new address, where the invitee picks a password
+  and joins with the invited role in one step. `sbctl users invite <email> --role <role> [--org <slug>] [--project <ref>]...`
+  prints that link on stdout.
+
+### Bootstrap, SSO and the CLI
+
+- The claimed first user is Owner. Dashboard accounts that existed before roles keep full access: migration `0900`
+  makes every user the API had seen Owner of every organization, and any other account created before the migration
+  became Owner of every organization on its first request (the account's creation time comes from `sb-gotrue@system`;
+  a failed lookup denies and retries after a minute; each account is looked at once, so removing it from an
+  organization sticks). Accounts created afterwards have no access until they are invited, claimed or granted a role.
+- `members.Service.GrantSSODefault(ctx, userID, email)` is what the SSO workstream calls for a first-time SSO sign-in:
+  the email domain's rule (`sbctl users default-role set <domain> <role> [--org]`, table `sbctl.sso_default_roles`)
+  makes the user a member of its organization with its role. A domain without a rule grants nothing; an existing
+  membership is never changed.
+- `sbctl users invite|list|role|remove|default-role` (see `sbctl users --help`): `role` sets an organization-wide role
+  as the operator and also adds a user to an organization, which is how an organization without an Owner gets one
+  back; `remove` refuses to delete the only Owner of an organization unless `--force`.
+
 ## Configuration (`[api]` in config.toml, or `SBCTL_API_*`)
 
 | Key | Meaning |
@@ -155,6 +265,11 @@ turn it off.
 | `public_url`, `dashboard_url` | override the derived `https://api.<domain>` and `https://studio.<domain>` |
 | `disable_device_login` | turn off the browser login flow |
 | `admin_emails` | comma-separated emails allowed to use the API without the `sbctl_admin` claim |
+
+`[mail]` (or `SBCTL_MAIL_*`) is the SMTP relay `sb-gotrue@system` sends the dashboard's mail through, used for
+organization invitations: `smtp_host`, `smtp_port` (587), `smtp_user`, `smtp_pass`, `smtp_from`, `smtp_name`. It
+needs a host and a sender; without it no mail is sent. The password sits in `config.toml` in plain text, so keep the
+file mode 0600. Changing it renders the system GoTrue's environment again; restart `sb-gotrue@system` for it to apply.
 
 ## What this package needs from the rest of the system
 
@@ -205,7 +320,10 @@ turn it off.
 Migrations `internal/registry/migrations/0100_api.sql` and `0101_api_login_failures.sql`
 (range 0100-0199): `api_users`, `api_cli_login_sessions`, `api_functions`,
 `api_function_files`, `api_function_secrets`, `api_content`, `api_content_folders`. `Store` (`store.go`) has a Postgres and a memory
-implementation behind one conformance suite (`store_test.go`).
+implementation behind one conformance suite (`store_test.go`). Members, roles and invitations are in
+`0900_members.sql` (range 0900-0999: `org_members`, `org_project_roles` and `org_project_role_refs`, `org_invitations`,
+`org_mfa`, `sso_default_roles`, and the legacy-account bookkeeping), behind `internal/members` (Postgres and memory
+implementations, one service test suite that runs on both).
 
 ## Generated types
 
@@ -231,17 +349,20 @@ project gateway, matching `<ref>.api.<domain>`) and `db.<ref>.<project_host>`.
 ## Testing
 
 ```sh
-# unit tests, no processes
-scripts/guard.sh -- go test ./internal/api ./cmd/sbctl
+# unit tests, no processes (the role matrix, permissions, members, invitations, mail, MFA)
+scripts/guard.sh -- go test ./internal/api ./internal/members ./cmd/sbctl
+# with a Postgres (SBCTL_TEST_DATABASE_URL) the members tests also run against it, in a throwaway database
 
-# integration: real Postgres + real sb-pgmeta from the darwin artifacts (~3 s, two processes)
+# integration: real Postgres + real sb-pgmeta from the darwin artifacts (~3 s, two processes);
+# TestIntegrationRoles proves a Read-only member cannot write through any route
+# (SBCTL_API_IT_PORT_BASE moves the 900 ports it uses off 32100-32999)
 SBCTL_API_INTEGRATION=1 \
 SBCTL_PG_BIN=$HOME/.cache/sbctl/unpacked/postgres-17.11.0.004-r1-darwin-arm64/bin \
 SBCTL_PGMETA_BIN=$HOME/.cache/sbctl/unpacked/pgmeta-v0.100.0-r0-darwin-arm64/bin/pgmeta \
 scripts/guard.sh -- go test ./internal/api -run Integration -v
 ```
 
-Real clients against the integration stack (Postgres on `127.0.0.1:32100-32999`, nothing on
+Real clients against the integration stack (Postgres on `127.0.0.1:32100-32999`, or from `SBCTL_API_IT_PORT_BASE`, nothing on
 a default port; delete the JSON file to stop everything):
 
 ```sh
@@ -251,6 +372,12 @@ API=$(jq -r .api_url /path/stack.json); PAT=$(jq -r .pat /path/stack.json)
 # MCP server over stdio: list_tables, execute_sql, migrations, types, advisors, projects ...
 # (the token goes in the environment, never in argv)
 SUPABASE_ACCESS_TOKEN=$PAT scripts/guard.sh -- node internal/api/testdata/mcp-smoke.mjs $API abcdefghijklmnopqrst
+
+# The MCP server as a Read-only member and as an Owner (the stack file has a PAT per role):
+SUPABASE_ACCESS_TOKEN=$(jq -r .pats.ro /path/stack.json) \
+  scripts/guard.sh --no-lock -- node internal/api/testdata/mcp-roles.mjs $API abcdefghijklmnopqrst read-only
+SUPABASE_ACCESS_TOKEN=$(jq -r .pats.owner /path/stack.json) \
+  scripts/guard.sh --no-lock -- node internal/api/testdata/mcp-roles.mjs $API abcdefghijklmnopqrst owner
 
 # Supabase CLI
 cat > profile.yaml <<EOF
@@ -297,6 +424,15 @@ deletes its token instead of orphaning it. The project region shown to clients i
 region code (`config.Region`, default `us-east-1`).
 
 ## Not done / known limits
+
+- **Roles.** Hosted's `no-access` invitation role is refused; the plan limits on Read-only and project-scoped roles
+  do not exist here. `mfa_enabled` of a member is always false and the MFA requirement is enforced for dashboard
+  sessions only, from the `aal` claim of GoTrue's JWT. A member's access follows the roles at every request, but a
+  dashboard session keeps working for its remaining lifetime (up to an hour) for the routes that only need the user
+  to exist (profile); everything else re-reads the roles. Studio's pages gate buttons on the permission list it reads
+  once every five minutes, so a changed role shows in the UI after a reload while the API refuses at once. Function
+  secrets are an Administrator right here (Developers deploy functions but do not set their secrets); hosted's
+  documentation does not say. The Developer role cannot read or change anything the table above reserves for settings.
 
 - **No `db push --linked` end to end here.** The CLI dials `db.<ref>.<project_host>:5432` and
   the pooler on 5432; both ports are hard-coded and this development machine may not use
