@@ -149,9 +149,45 @@ async function mainPhase() {
     ok('a client-supplied tenant header or sb-api-key changes nothing')
   }
   if (cfg.runtimeUrl) {
+    // The runtime listens on loopback, which a function worker can reach too: it serves only a
+    // caller that has the proxy's secret, whatever project it names.
     const r = await call(`${cfg.runtimeUrl}/hello`, { headers: bearer(a.anon) })
-    assert.equal(r.status, 400, `the runtime answered ${r.status} without a project header`)
-    ok('the runtime itself refuses a request without a project reference')
+    assert.equal(r.status, 403, `the runtime answered ${r.status} without the proxy secret`)
+    const r2 = await call(`${cfg.runtimeUrl}/hello`, {
+      headers: { ...bearer(a.anon), 'x-sbctl-project-ref': a.ref },
+    })
+    assert.equal(r2.status, 403, `the runtime served a project reference without the proxy secret: ${r2.status}`)
+    const r3 = await call(`${cfg.runtimeUrl}/hello`, {
+      headers: { ...bearer(a.anon), 'x-sbctl-project-ref': a.ref, 'x-sbctl-proxy-token': 'guess' },
+    })
+    assert.equal(r3.status, 403, `the runtime accepted a wrong secret: ${r3.status}`)
+    if (cfg.proxyToken) {
+      const t = { 'x-sbctl-proxy-token': cfg.proxyToken }
+      const r4 = await call(`${cfg.runtimeUrl}/hello`, { headers: { ...bearer(a.anon), ...t } })
+      assert.equal(r4.status, 400, `no project reference, with the secret: ${r4.status}`)
+      const r5 = await call(`${cfg.runtimeUrl}/hello`, {
+        headers: { ...bearer(a.anon), ...t, 'x-sbctl-project-ref': a.ref },
+      })
+      assert.equal(r5.json?.who, 'project-a', `with the secret: ${r5.status} ${r5.text}`)
+    }
+    ok('the runtime itself serves only callers that have the proxy secret')
+
+    // A worker that reaches the runtime port under another name, claiming to be project B.
+    const port = new URL(cfg.runtimeUrl).port
+    const targets = [
+      `http://127.0.0.1:${port}/hello`,
+      `http://worker.127.0.0.1.sslip.io:${port}/hello`,
+      `http://[::ffff:127.0.0.1]:${port}/hello`,
+      `http://[::ffff:7f00:1]:${port}/hello`,
+    ]
+    const q = targets.map((u) => `u=${encodeURIComponent(u)}`).join('&')
+    const c = await call(`${fnUrl(a, 'callout')}?ref=${b.ref}&${q}`, { headers: bearer(a.anon), timeoutMs: 60_000 })
+    assert.equal(c.status, 200, `callout: ${c.status} ${c.text}`)
+    for (const u of targets) {
+      assert.ok(/^(403 |ERROR: )/.test(c.json[u]), `a worker reached the runtime as another project through ${u}: ${c.json[u]}`)
+      assert.ok(!/project-b/.test(c.json[u]), `a worker got project B's function through ${u}`)
+    }
+    ok(`a function cannot call the runtime as another project, however it names the address (${targets.length} ways tried)`)
   }
 
   // A worker sees its module graph and nothing of the node's disk or the main service's
@@ -169,7 +205,8 @@ async function mainPhase() {
 
   // A bundled function cannot import files of the node either. A function that ran from
   // source files could: the module loader follows relative specifiers out of its directory,
-  // which reached other projects' environment files and code (the reason sources are refused).
+  // which reached other projects' environment files and code (the reason the node bundles
+  // uploaded sources in a sandbox and serves only bundles).
   {
     const roots = new Set([`${cfg.stateDir}/system/edge-runtime/tenants`])
     try {
@@ -243,11 +280,13 @@ async function mainPhase() {
   }
 
   // 8. One project cannot take the shared runtime. Requests over the per-project cap
-  // (max_per_project, 8 by default) are refused at once with 503 PROJECT_AT_CAPACITY, and the
-  // other project keeps answering while project A is flooded with runaway and memory-hungry calls.
+  // (max_per_project; the node under test sets cfg.maxPerProject, 8, to make a small flood
+  // enough: the default is 128) are refused at once with 503 PROJECT_AT_CAPACITY, and the other
+  // project keeps answering while project A is flooded with runaway and memory-hungry calls.
   {
+    const cap = cfg.maxPerProject ?? 0
     const flood = [
-      ...Array.from({ length: 12 }, () => call(fnUrl(a, 'spin'), { headers: bearer(a.anon), timeoutMs: 90_000 })),
+      ...Array.from({ length: cap > 0 ? cap + 4 : 12 }, () => call(fnUrl(a, 'spin'), { headers: bearer(a.anon), timeoutMs: 90_000 })),
       ...Array.from({ length: 2 }, () => call(fnUrl(a, 'hog'), { headers: bearer(a.anon), timeoutMs: 90_000 })),
     ]
     await sleep(1000)
@@ -261,7 +300,7 @@ async function mainPhase() {
     assert.ok(Math.max(...during.map((r) => r.ms)) < 3000, `project B was slow during the flood: ${during.map((r) => r.ms)}`)
     const results = await Promise.all(flood)
     const refused = results.filter((r) => r.status === 503 && r.headers.get('sb-error-code') === 'PROJECT_AT_CAPACITY')
-    assert.ok(refused.length >= 3, `expected the flood to be refused beyond the cap: ${results.map((r) => r.status)}`)
+    if (cap > 0) assert.ok(refused.length >= 3, `expected the flood to be refused beyond the cap: ${results.map((r) => r.status)}`)
     for (const r of refused) {
       assert.ok(r.ms < 3000, `a refusal took ${r.ms} ms`)
       assert.equal(r.headers.get('retry-after'), '1')

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Edge Functions under real systemd units: system init, two projects, `sbctl functions dev`
 # (Management API and proxy in one process, with sb-edge-runtime started as a unit), then
-# tests/functions/run.sh, which deploys fixtures with the real `supabase functions deploy`,
-# calls them with supabase-js and checks isolation between the projects. On top of that this
-# script checks what only systemd can show: the unit's user, slice and memory limit, what its
-# mount namespace hides, and recovery after `kill -9` of the runtime.
+# tests/functions/run.sh, which deploys fixtures with the real `supabase functions deploy` (project
+# A bundled by the CLI in Docker, project B uploaded as sources with --use-api and bundled by the
+# node in the sandbox of sb-edge-bundle.service), calls them with supabase-js and checks isolation
+# between the projects. On top of that this script checks what only systemd can show: the unit's
+# user, slice and memory limit, what its mount namespace hides, recovery after `kill -9` of the
+# runtime, and that the runtime-wide worker budget refuses what would not fit.
 #
 #   sudo SBCTL_BIN=/path/to/sbctl-linux-amd64 tests/linux/functions-smoke.sh [--teardown]
 #
@@ -47,6 +49,8 @@ enabled = true
 wall_clock_seconds = 30
 idle_timeout_seconds = 10
 reconcile_seconds = 5
+# Low, so that the flood check of verify.mjs can exceed it with a small flood (the default is 128).
+max_per_project = 8
 CONF
 
 # Same finding as in fleet-smoke.sh: the Postgres launcher chmods a file inside the artifact
@@ -101,8 +105,8 @@ log "the unit"
 [[ $(unit_state "$U") == active ]] || fail "$U is $(unit_state "$U")"
 [[ $(systemctl show -p User --value "$U") == "$SBCTL_USER" ]] || fail "$U does not run as $SBCTL_USER"
 [[ $(systemctl show -p Slice --value "$U") == sbctl.slice ]] || fail "$U is not in sbctl.slice"
-# 16 workers (max_parallelism) x 256 MB (memory_mb) + 256 MB for the runtime itself.
-[[ $(systemctl show -p MemoryMax --value "$U") == 4563402752 ]] || fail "$U: MemoryMax drop-in not applied ($(systemctl show -p MemoryMax --value "$U"))"
+# 16 workers (max_workers) x (256 MB memory_mb + 32 MB overhead) + 256 MB for the runtime itself.
+[[ $(systemctl show -p MemoryMax --value "$U") == 5100273664 ]] || fail "$U: MemoryMax drop-in not applied ($(systemctl show -p MemoryMax --value "$U"))"
 [[ $(ss -Hltn "sport = :$P_EDGE" | awk '{print $4}') == "127.0.0.1:$P_EDGE" ]] || fail "the runtime does not listen on loopback only: $(ss -Hltn "sport = :$P_EDGE")"
 
 sees() { # PATH: exit 0 if PATH is readable from the unit's namespace as the sbctl user
@@ -123,8 +127,17 @@ done
 log "tests/functions/run.sh"
 export SBCTL_RUN="sudo -u $SBCTL_USER -H /usr/local/bin/sbctl" AS_SBCTL="sudo -u $SBCTL_USER"
 export API_URL="http://api.$DOMAIN:$P_HTTP" PAT_FILE PROJECT_URL="http://{ref}.api.$DOMAIN:$P_HTTP"
-export REF_A REF_B STATE_DIR=$SBCTL_STATE RUNTIME_URL="http://127.0.0.1:$P_EDGE" WORK="$LOG_DIR/functions-work"
+export REF_A REF_B STATE_DIR=$SBCTL_STATE RUNTIME_URL="http://127.0.0.1:$P_EDGE" WORK="$LOG_DIR/functions-work" SANDBOXED_BUNDLER=1 MAX_PER_PROJECT=8
 "$REPO_ROOT/tests/functions/run.sh" || fail "tests/functions/run.sh"
+
+log "the bundler unit ran for project B's uploads and is idle now"
+B=sb-edge-bundle.service
+[[ $(unit_state "$B") == inactive ]] || fail "$B is $(unit_state "$B")"
+[[ $(systemctl show -p Result --value "$B") == success ]] || fail "$B: last result $(systemctl show -p Result --value "$B")"
+[[ $(systemctl show -p User --value "$B") == "$SBCTL_USER" ]] || fail "$B does not run as $SBCTL_USER"
+[[ $(systemctl show -p MemoryMax --value "$B") == 1073741824 ]] || fail "$B: MemoryMax $(systemctl show -p MemoryMax --value "$B")"
+systemctl show -p IPAddressDeny --value "$B" | grep -q . || fail "$B has no IPAddressDeny"
+[[ ! -e $SBCTL_STATE/system/edge-bundle/work ]] || fail "the scratch directory of an upload stayed in $SBCTL_STATE/system/edge-bundle"
 
 log "crash recovery: kill -9 of the runtime"
 open_code() { http_code "http://$REF_A.api.$DOMAIN:$P_HTTP/functions/v1/open"; }
@@ -139,5 +152,56 @@ for ((i = 0; i < 60; i++)); do
 done
 [[ $ok -eq 1 ]] || fail "$U did not come back and serve after kill -9"
 log "$U recovered (MemoryCurrent $(( $(systemctl show -p MemoryCurrent --value "$U") / 1048576 )) MiB)"
+
+log "worker budget: restart with max_workers = 4 and 3 per project"
+# One runtime serves every project and sbctl-main enforces what fits into its memory limit:
+# at most 4 live workers (4 x 288 MB + 256 MB = the unit's MemoryMax), at most 3 of one project.
+# Over-budget requests are refused with 503, nothing is killed, warm functions keep answering.
+kill -TERM "$DEV_PID"; wait "$DEV_PID" 2>/dev/null || true; DEV_PID=""
+for ((i = 0; i < 60; i++)); do [[ $(unit_state "$U") == active ]] || break; sleep 1; done
+sed -i 's/^reconcile_seconds = 5$/&\nmax_workers = 4\nmax_workers_per_project = 3/' "$SBCTL_CONF"
+grep -q '^max_workers = 4$' "$SBCTL_CONF" || fail "could not set max_workers"
+rm -f "$PAT_FILE"
+sudo -u "$SBCTL_USER" -H /usr/local/bin/sbctl functions dev --token-file "$PAT_FILE" >"$LOG_DIR/functions-dev-budget.log" 2>&1 &
+DEV_PID=$!
+for ((i = 0; i < 180; i++)); do
+  kill -0 "$DEV_PID" 2>/dev/null || { tail -30 "$LOG_DIR/functions-dev-budget.log" >&2; fail "sbctl functions dev exited"; }
+  [[ $(http_code "http://127.0.0.1:$P_EDGE/_internal/health") == 200 && -s $PAT_FILE ]] && break
+  sleep 1
+done
+[[ $(http_code "http://127.0.0.1:$P_EDGE/_internal/health") == 200 ]] || fail "the edge runtime did not come back with the budget"
+[[ $(systemctl show -p MemoryMax --value "$U") == 1476395008 ]] || fail "$U: MemoryMax for 4 workers is $(systemctl show -p MemoryMax --value "$U"), want 1476395008 (4 x 288 + 256 MiB)"
+
+REF_C=$(create_project fn-c micro)
+PAT=$(<"$PAT_FILE")
+API_URL="http://api.$DOMAIN:$P_HTTP"
+# One real bundle (project A's own `open`, as the node materialized it), uploaded as many slugs as needed.
+node -e '
+  const z = require("node:zlib"), fs = require("node:fs")
+  const raw = fs.readFileSync(process.argv[1])
+  fs.writeFileSync(process.argv[2], Buffer.concat([Buffer.from("EZBR"), z.brotliCompressSync(raw)]))' \
+  "$SBCTL_STATE/system/edge-runtime/tenants/$REF_A/functions/open/bundle.eszip" "$LOG_DIR/budget.ezbr" || fail "could not make the bundle"
+entry=$(curl -s -H "Authorization: Bearer $PAT" "$API_URL/v1/projects/$REF_A/functions/open" | python3 -c 'import json,sys; print(json.load(sys.stdin)["entrypoint_path"])')
+[[ -n $entry ]] || fail "no entrypoint_path for A/open"
+entry_q=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$entry")
+upload() { # REF SLUG
+  [[ $(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $PAT" -H 'Content-Type: application/vnd.denoland.eszip' \
+    --data-binary "@$LOG_DIR/budget.ezbr" "$API_URL/v1/projects/$1/functions?slug=$2&name=$2&verify_jwt=false&entrypoint_path=$entry_q") == 201 ]] || fail "upload $1/$2"
+}
+for s in b1 b2 b3 b4; do upload "$REF_A" "$s"; done
+for s in c1 c2; do upload "$REF_C" "$s"; done
+fn_code() { http_code --max-time 30 "http://$1.api.$DOMAIN:$P_HTTP/functions/v1/$2"; }
+fn_err() { curl -s -D - -o /dev/null --max-time 30 "http://$1.api.$DOMAIN:$P_HTTP/functions/v1/$2" | tr -d '\r' | awk -F': ' 'tolower($1)=="sb-error-code" {print $2}'; }
+for s in b1 b2 b3; do [[ $(fn_code "$REF_A" "$s") == 200 ]] || fail "A/$s did not answer 200 within the budget: $(fn_code "$REF_A" "$s")"; done
+[[ $(fn_code "$REF_A" b4) == 503 && $(fn_err "$REF_A" b4) == PROJECT_AT_CAPACITY ]] || fail "A/b4 (a 4th function of one project) was not refused: $(fn_code "$REF_A" b4)"
+[[ $(fn_code "$REF_C" c1) == 200 ]] || fail "C/c1 (the 4th worker of the runtime) answered $(fn_code "$REF_C" c1)"
+[[ $(fn_code "$REF_C" c2) == 503 && $(fn_err "$REF_C" c2) == PROJECT_AT_CAPACITY ]] || fail "C/c2 (a 5th worker for the runtime) was not refused: $(fn_code "$REF_C" c2)"
+for s in b1 b2 b3; do [[ $(fn_code "$REF_A" "$s") == 200 ]] || fail "warm A/$s stopped answering"; done
+[[ $(fn_code "$REF_C" c1) == 200 ]] || fail "warm C/c1 stopped answering"
+[[ $(unit_state "$U") == active ]] || fail "$U is $(unit_state "$U") after the budget was spent"
+mem=$(systemctl show -p MemoryCurrent --value "$U")
+log "$U holds 4 workers: MemoryCurrent $((mem / 1048576)) MiB of 1408"
+(( mem < 1476395008 )) || fail "$U uses $mem bytes, over its limit"
+[[ $(systemctl show -p NRestarts --value "$U") == 0 ]] || fail "$U restarted"
 
 log "functions smoke test passed"

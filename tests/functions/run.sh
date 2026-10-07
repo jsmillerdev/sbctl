@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # Edge Functions end to end, against a node that is already up: the Management API and the
 # proxy reachable at $API_URL, sb-edge-runtime running, and two projects. It deploys the
-# fixtures in tests/functions/fixtures with the real `supabase functions deploy` (the
-# default flow, which bundles and uploads an eszip; --use-api, which uploads sources, must be
-# refused), sets secrets with `supabase secrets set`, calls the functions with supabase-js and fetch
-# (verify.mjs), redeploys, deletes, and checks the files on disk.
+# fixtures in tests/functions/fixtures, sets secrets with `supabase secrets set`, calls the
+# functions with supabase-js and fetch (verify.mjs), redeploys, deletes, and checks the files on
+# disk. Project A's functions are bundled on the machine that runs this script and uploaded as
+# bundles; project B's are uploaded as sources with `supabase functions deploy --use-api`, which
+# the node bundles itself (in the sandbox of sb-edge-bundle.service on Linux).
+#
+# How project A is bundled (DEPLOY_VIA):
+#   cli       `supabase functions deploy`, the default flow of the CLI. It bundles in a Docker
+#             container when Docker runs, so this is the Linux CI default, where the VM is
+#             ephemeral. On macOS the script refuses it while Docker is up: it would start
+#             containers on a machine that has other people's.
+#   artifact  the edge-runtime artifact's own `edge-runtime bundle`, then curl with the exact
+#             query and Content-Type the CLI uses. No Docker. The macOS default.
 #
 # Environment (all required unless a default is shown):
 #   SBCTL_RUN       how to run sbctl, for example "/usr/local/bin/sbctl" or
@@ -20,6 +29,15 @@
 #   WORK            scratch directory (default: a new temporary one)
 #   NODE_DIR        directory with @supabase/supabase-js installed (default: $WORK/node,
 #                   installed with npm)
+#   DEPLOY_VIA      cli or artifact, see above (default: artifact on macOS, cli elsewhere)
+#   EDGE_RUNTIME_BIN  bin/edge-runtime of the artifact, for DEPLOY_VIA=artifact (default: the one
+#                   under $STATE_DIR/artifacts)
+#   MAX_PER_PROJECT  the node's [functions] max_per_project when it was set low (8) so that the flood
+#                   check can exceed it; unset skips the "refused beyond the cap" assertion
+#   SANDBOXED_BUNDLER  1 when the node's bundler runs in its systemd sandbox: the script then
+#                   also checks that an upload cannot import another project's files
+#   PROXY_TOKEN_FILE  file with the node's proxy secret, for checks that call the runtime
+#                   directly (default: $STATE_DIR/system/edge-runtime.token)
 #
 # Needs: supabase CLI, node and npm, python3, curl, network access (npm packages that the
 # fixtures import, supabase-js).
@@ -29,6 +47,11 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 : "${SBCTL_RUN:?}" "${API_URL:?}" "${PAT_FILE:?}" "${PROJECT_URL:?}" "${REF_A:?}" "${REF_B:?}"
 AS_SBCTL=${AS_SBCTL:-}
 STATE_DIR=${STATE_DIR:-/var/lib/sbctl}
+if [[ -z ${DEPLOY_VIA:-} ]]; then
+  if [[ $(uname -s) == Darwin ]]; then DEPLOY_VIA=artifact; else DEPLOY_VIA=cli; fi
+fi
+SANDBOXED_BUNDLER=${SANDBOXED_BUNDLER:-0}
+PROXY_TOKEN_FILE=${PROXY_TOKEN_FILE:-$STATE_DIR/system/edge-runtime.token}
 WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/sbctl-functions-XXXXXX")}
 NODE_DIR=${NODE_DIR:-$WORK/node}
 SUPABASE_JS=2.117.2
@@ -55,6 +78,61 @@ pooler_host: pooler.${API_HOST#api.}
 EOF
 sb() { local dir=$1; shift; (cd "$dir" && supabase --profile="$WORK/profile.yaml" "$@" 2> >(grep -v 'new version\|recommend updating' >&2)); }
 
+case $DEPLOY_VIA in
+  cli)
+    if [[ $(uname -s) == Darwin ]] && command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+      fail "DEPLOY_VIA=cli would bundle in Docker containers, and Docker is running on this machine; use DEPLOY_VIA=artifact"
+    fi ;;
+  artifact)
+    EDGE_RUNTIME_BIN=${EDGE_RUNTIME_BIN:-$(ls -d "$STATE_DIR"/artifacts/edge-runtime/*/bin/edge-runtime 2>/dev/null | head -1)}
+    [[ -x ${EDGE_RUNTIME_BIN:-} ]] || fail "DEPLOY_VIA=artifact needs the edge-runtime artifact: set EDGE_RUNTIME_BIN" ;;
+  *) fail "DEPLOY_VIA must be cli or artifact, not $DEPLOY_VIA" ;;
+esac
+
+urlenc() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+
+# deploy_artifact DIR REF SLUG [--no-verify-jwt]: what `supabase functions deploy` does with Docker,
+# without Docker: bundle with the artifact's `edge-runtime bundle` (DENO_NO_PACKAGE_JSON=1 and the
+# entrypoint as an absolute path, as the CLI passes them), compress as the CLI does ("EZBR" and
+# Brotli, quality 6), and upload with the CLI's request: POST /v1/projects/{ref}/functions (create)
+# or PATCH .../functions/{slug} (update), Content-Type application/vnd.denoland.eszip, query
+# verify_jwt, entrypoint_path, ezbr_sha256 (and slug, name on create).
+deploy_artifact() {
+  local dir=$1 ref=$2 slug=$3 verify=true; shift 3
+  [[ ${1:-} == --no-verify-jwt ]] && verify=false
+  local entry="$dir/supabase/functions/$slug/index.ts" raw="$WORK/$slug.eszip" ezbr="$WORK/$slug.ezbr" sha code
+  (cd "$dir" && DENO_NO_PACKAGE_JSON=1 DENO_DIR="$WORK/deno" "$EDGE_RUNTIME_BIN" bundle --entrypoint "$entry" --output "$raw" --quiet) || return 1
+  sha=$(node -e '
+    const z = require("node:zlib"), fs = require("node:fs"), c = require("node:crypto")
+    const out = Buffer.concat([Buffer.from("EZBR"), z.brotliCompressSync(fs.readFileSync(process.argv[1]), { params: { [z.constants.BROTLI_PARAM_QUALITY]: 6 } })])
+    fs.writeFileSync(process.argv[2], out)
+    console.log(c.createHash("sha256").update(out).digest("hex"))' "$raw" "$ezbr") || return 1
+  local q="verify_jwt=$verify&entrypoint_path=$(urlenc "file://$entry")&ezbr_sha256=$sha" method=POST url="$API_URL/v1/projects/$ref/functions"
+  if [[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$url/$slug") == 200 ]]; then
+    method=PATCH url="$url/$slug"
+  else
+    q="slug=$slug&name=$slug&$q"
+  fi
+  code=$(curl -s -o "$WORK/deploy-response.json" -w '%{http_code}' -X "$method" -H "Authorization: Bearer $PAT" \
+    -H 'Content-Type: application/vnd.denoland.eszip' --data-binary "@$ezbr" "$url?$q") || return 1
+  [[ $code == 200 || $code == 201 ]] || { log "$method $url answered $code: $(cat "$WORK/deploy-response.json")"; return 1; }
+}
+
+# deploy_a SLUG [--no-verify-jwt]: project A is bundled here (see DEPLOY_VIA).
+deploy_a() {
+  local slug=$1; shift
+  if [[ $DEPLOY_VIA == cli ]]; then
+    sb "$WORK/work-a" functions deploy "$slug" --project-ref "$REF_A" "$@" >/dev/null
+  else
+    deploy_artifact "$WORK/work-a" "$REF_A" "$slug" "$@"
+  fi
+}
+# deploy_b SLUG [--no-verify-jwt]: project B uploads sources; the node bundles them.
+deploy_b() {
+  local slug=$1; shift
+  sb "$WORK/work-b" functions deploy "$slug" --use-api --project-ref "$REF_B" "$@" >/dev/null
+}
+
 if [[ ! -d $NODE_DIR/node_modules/@supabase ]]; then
   log "installing supabase-js $SUPABASE_JS"
   mkdir -p "$NODE_DIR"
@@ -77,33 +155,41 @@ d = json.load(sys.stdin); k = d["keys"]
 print(json.dumps({"ref": ref, "name": name, "url": tpl.replace("{ref}", ref), "anon": k["anon_key"], "service": k["service_role_key"],
   "publishable": k["publishable_key"], "secret": k["secret_key"], "jwtSecret": k["jwt_secret"]}))' "$1" "$2" "$PROJECT_URL"
 }
-python3 - "$WORK/config.json" "$API_URL" "$PAT" "${RUNTIME_URL:-}" "$(keys "$REF_A" a)" "$(keys "$REF_B" b)" "$STATE_DIR" <<'PY'
+proxy_token=$(asnode cat "$PROXY_TOKEN_FILE" 2>/dev/null || true)
+python3 - "$WORK/config.json" "$API_URL" "$PAT" "${RUNTIME_URL:-}" "$(keys "$REF_A" a)" "$(keys "$REF_B" b)" "$STATE_DIR" "$proxy_token" "${MAX_PER_PROJECT:-0}" <<'PY'
 import json, sys
-out, api, pat, rt, a, b, _ = sys.argv[1:8]
-json.dump({"apiUrl": api, "pat": pat, "runtimeUrl": rt or None, "stateDir": sys.argv[7], "projects": {"a": json.loads(a), "b": json.loads(b)}}, open(out, "w"))
+out, api, pat, rt, a, b, _, tok, cap = sys.argv[1:10]
+json.dump({"apiUrl": api, "pat": pat, "runtimeUrl": rt or None, "stateDir": sys.argv[7], "proxyToken": tok or None,
+  "maxPerProject": int(cap) or None, "projects": {"a": json.loads(a), "b": json.loads(b)}}, open(out, "w"))
 PY
 chmod 600 "$WORK/config.json"
 
-log "deploying project A (bundled, the default flow)"
-for slug in hello onlya dbcheck crash spin hog readfs escape; do
-  sb "$WORK/work-a" functions deploy "$slug" --project-ref "$REF_A" >/dev/null || fail "deploy A/$slug"
+log "deploying project A (bundled here, DEPLOY_VIA=$DEPLOY_VIA)"
+for slug in hello onlya dbcheck crash spin hog readfs escape callout; do
+  deploy_a "$slug" || fail "deploy A/$slug"
 done
-sb "$WORK/work-a" functions deploy open --no-verify-jwt --project-ref "$REF_A" >/dev/null || fail "deploy A/open"
-log "a source upload (--use-api) is refused: a function that runs from files could import other projects' files"
-if sb "$WORK/work-a" functions deploy hello --use-api --project-ref "$REF_A" >/dev/null 2>&1; then
-  fail "supabase functions deploy --use-api was accepted"
-fi
-printf 'Deno.serve(() => new Response("from source"))\n' >"$WORK/source-index.ts"
-out=$(curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $PAT" \
-  -F 'metadata={"entrypoint_path":"index.ts","name":"hello"};type=application/json' \
-  -F "file=@$WORK/source-index.ts;filename=index.ts" "$API_URL/v1/projects/$REF_A/functions/deploy?slug=hello") || fail "curl: source upload"
-[[ $(tail -n1 <<<"$out") == 400 ]] || fail "a multipart source upload answered: $out"
-grep -q "does not accept source uploads" <<<"$out" || fail "the refusal does not say why: $out"
-log "deploying project B: the same slugs with different code"
+deploy_a open --no-verify-jwt || fail "deploy A/open"
+log "deploying project B (sources uploaded with --use-api, bundled by the node): the same slugs with different code"
 for slug in hello dbcheck; do
-  sb "$WORK/work-b" functions deploy "$slug" --project-ref "$REF_B" >/dev/null || fail "deploy B/$slug"
+  deploy_b "$slug" || fail "deploy B/$slug"
 done
-sb "$WORK/work-b" functions deploy open --no-verify-jwt --project-ref "$REF_B" >/dev/null || fail "deploy B/open"
+deploy_b open --no-verify-jwt || fail "deploy B/open"
+if [[ $SANDBOXED_BUNDLER == 1 ]]; then
+  log "the node's bundler cannot import another project's files"
+  # A relative import that climbs out of the upload. Bundled outside the sandbox it would resolve
+  # to project A's environment file (JWT secret, service key, database password) and the bundle
+  # would carry it out; inside, the file does not exist.
+  rel="../../../../../../../../../..$TENANTS/$REF_A/functions-env.json"
+  printf 'import secret from "%s" with { type: "json" }\nDeno.serve(() => Response.json(secret))\n' "$rel" >"$WORK/steal-index.ts"
+  out=$(curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $PAT" \
+    -F 'metadata={"entrypoint_path":"index.ts","name":"steal"};type=application/json' \
+    -F "file=@$WORK/steal-index.ts;filename=index.ts" "$API_URL/v1/projects/$REF_B/functions/deploy?slug=steal") || fail "curl: steal upload"
+  [[ $(tail -n1 <<<"$out") == 400 ]] || fail "an upload that imports another project's file answered: $out"
+  grep -q "Could not bundle" <<<"$out" || fail "the refusal does not say why: $out"
+  jwt_a=$(jget 'd["projects"]["a"]["jwtSecret"]' <"$WORK/config.json")
+  if grep -qF "$jwt_a" <<<"$out"; then fail "the bundler's error shows project A's JWT secret"; fi
+  [[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$API_URL/v1/projects/$REF_B/functions/steal") == 404 ]] || fail "the refused upload was stored"
+fi
 
 log "setting secrets with the CLI"
 sb "$WORK/work-a" secrets set MY_SECRET=secret-for-a --project-ref "$REF_A" >/dev/null || fail "secrets set A"
@@ -115,7 +201,7 @@ log "functions list (CLI) and sbctl functions list"
 # Text on a terminal or in CI, JSON for agents: ask for JSON, the one format a script can read.
 sb "$WORK/work-a" functions list --project-ref "$REF_A" --output-format json | grep -q '"slug":"hello"' || fail "supabase functions list lacks hello"
 live=$(sbctl functions list "$REF_A" --json | jget 'sum(1 for r in d if r["live"])')
-[[ $live -eq 9 ]] || fail "sbctl functions list: $live of 9 functions live"
+[[ $live -eq 10 ]] || fail "sbctl functions list: $live of 10 functions live"
 
 log "files on disk"
 for ref in "$REF_A" "$REF_B"; do
@@ -151,7 +237,7 @@ sb "$WORK/work-a" secrets set MY_SECRET=rotated-secret-for-a --project-ref "$REF
 log "a redeploy replaces the code"
 sed -i.bak "s/code: 'A1'/code: 'A2'/" "$WORK/work-a/supabase/functions/hello/index.ts" && rm -f "$WORK/work-a/supabase/functions/hello/index.ts.bak"
 grep -q "code: 'A2'" "$WORK/work-a/supabase/functions/hello/index.ts" || fail "could not edit the fixture"
-sb "$WORK/work-a" functions deploy hello --project-ref "$REF_A" >/dev/null || fail "redeploy A/hello"
+deploy_a hello || fail "redeploy A/hello"
 (cd "$NODE_DIR" && node verify.mjs "$WORK/config.json" redeploy) || fail "verify redeploy"
 
 log "a deleted function is gone"
