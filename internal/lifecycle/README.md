@@ -253,6 +253,19 @@ is checked; `Open` and `InitSystem` set it. `Engine.Offers` lists every size wit
 5. A paused project only gets the new size in its record; `Resume` renders the units from it. A resize to the size the
    project has changes nothing.
 
+**What Studio calls** (the pinned tag, `components/interfaces/DiskManagement`, which the Compute and Disk page renders):
+the project's size from `infra_compute_size` of `GET /platform/projects/{ref}`; the cards from `available_addons`
+(type `compute_instance`) of `GET /platform/projects/{ref}/billing/addons`; the change as `POST` of
+`{addon_type, addon_variant}` to the same path (it then sets the project's status to `RESIZING` itself and polls); disk
+from `GET /platform/projects/{ref}/disk`, `/disk/util` and `/disk/custom-config`, and `POST` of `/disk` and
+`/disk/custom-config`; `POST /platform/projects/{ref}/resize` is the older volume-size call. The page reads the
+permission to update projects and the entitlement `instances.compute_update_available_sizes` (granted: supavise
+has no plans). Two things Studio decides on its own: it adds a Nano card when the API lists none, and it locks that
+card on any plan but free unless the project is Nano already (supavise reports the plan `enterprise`), so going down
+to Nano is a CLI or API step (`supavise projects resize <ref> --size nano`, or removing the add-on). Its cards have no
+disabled state of their own, so the sizes the node cannot give are left out of the list instead of shown disabled;
+`supavise projects sizes` has them with the reason.
+
 `Recover` (run at daemon start) finds a project left `RESIZING` by a stopped daemon, stops its units, sets
 `INACTIVE` and flags it for `ResumeRecovered`, which starts it on the size the registry holds (the size the resize was
 going to, because the record is written first).
