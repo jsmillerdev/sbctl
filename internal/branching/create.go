@@ -183,6 +183,8 @@ type createJob struct {
 	keys *secrets.ProjectKeys
 	// upTo limits the migrations replayed into a schema-only branch (reset to a version).
 	upTo string
+	// keepExpiry leaves expires_at alone when the branch is ready (a reset keeps the lifetime).
+	keepExpiry bool
 }
 
 // doCreate is the body of a branch creation. It returns the detail recorded on success.
@@ -258,7 +260,7 @@ func (s *Service) doCreate(ctx context.Context, j *createJob) (string, error) {
 		detail = fmt.Sprintf("data cloned by %s in %d ms (%d files, %s apparent, %s of new disk, %d WAL segments)",
 			method, stats.TotalMillis, stats.Files, humanBytes(stats.Bytes), humanBytes(stats.ExtraDiskByte), stats.WALSegments)
 	}
-	if !j.in.Persistent {
+	if !j.in.Persistent && !j.keepExpiry {
 		// The expiry clock starts when the branch is usable, not when the request came in.
 		s.setState(ctx, j.ref, registry.BranchRunningMigration, detail, func(b *registry.BranchInfo) { b.ExpiresAt = s.expiry(j.in.TTL) })
 	}

@@ -370,7 +370,7 @@ func TestPush(t *testing.T) {
 
 func TestResetSchemaOnlyKeepsRefIDAndKeys(t *testing.T) {
 	h := newHarness(t, nil)
-	b := h.create("feat", func(in *CreateInput) { in.GitBranch = "g" })
+	b := h.create("feat", func(in *CreateInput) { in.GitBranch = "g"; in.TTL = 5 * time.Hour })
 	oldKeys, _ := h.eng.Keys(context.Background(), b.Ref)
 	// The parent got a new migration since.
 	h.db.migs[parentRef] = append(h.db.migs[parentRef], mig("20260105000000", "new", "select 1"))
@@ -387,6 +387,9 @@ func TestResetSchemaOnlyKeepsRefIDAndKeys(t *testing.T) {
 	}
 	if h.eng.skipped[b.Ref] != true {
 		t.Fatal("reset must not take a final backup")
+	}
+	if got.ExpiresAt == nil || !got.ExpiresAt.Equal(*b.ExpiresAt) {
+		t.Fatalf("a reset keeps the branch's lifetime: %v -> %v", b.ExpiresAt, got.ExpiresAt)
 	}
 	nk, _ := h.eng.Keys(context.Background(), b.Ref)
 	if nk.JWTSecret != oldKeys.JWTSecret || nk.PublishableKey != oldKeys.PublishableKey {

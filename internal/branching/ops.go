@@ -22,6 +22,9 @@ type ActionInput struct {
 	Force bool
 }
 
+// resetMinLife is the shortest remaining lifetime of a non-persistent branch after a reset.
+const resetMinLife = 15 * time.Minute
+
 // mergeLockTimeout bounds how long a merge waits for a lock on the parent: DDL that queues
 // behind traffic would block the traffic behind it.
 const mergeLockTimeout = 30 * time.Second
@@ -251,7 +254,11 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 		info := *old.Branch
 		info.State, info.Detail, info.CloneMethod = registry.BranchCreatingProject, "recreating the project", ""
 		if !info.Persistent {
-			info.ExpiresAt = s.expiry(0)
+			// The branch keeps the lifetime it was given, but a reset never leaves it less than
+			// resetMinLife: it would otherwise expire while the agent starts using it again.
+			if floor := s.now().Add(resetMinLife).UTC(); info.ExpiresAt == nil || info.ExpiresAt.Before(floor) {
+				info.ExpiresAt = &floor
+			}
 		}
 		info.DeletionScheduledAt = nil
 		j := &createJob{
@@ -262,6 +269,7 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 			j.keys = keys
 		}
 		j.upTo = in.MigrationVersion
+		j.keepExpiry = true
 		return s.doCreate(ctx, j)
 	})
 	return r.id, nil

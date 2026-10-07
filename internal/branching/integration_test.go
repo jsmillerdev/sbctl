@@ -8,11 +8,13 @@ package branching
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,7 +81,8 @@ func sbctlBinary(t *testing.T) string {
 		}
 		builtBin = filepath.Join(dir, "sbctl")
 		cmd := exec.Command("go", "build", "-o", builtBin, "./cmd/sbctl")
-		cmd.Dir = filepath.Join("..", "..")
+		_, thisFile, _, _ := runtime.Caller(0)
+		cmd.Dir = filepath.Join(filepath.Dir(thisFile), "..", "..")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			buildErr = fmt.Errorf("go build ./cmd/sbctl: %v\n%s", err, out)
 		}
@@ -489,4 +492,115 @@ func TestIntegrationBranching(t *testing.T) {
 		t.Fatalf("list after disable = %+v", list)
 	}
 	_ = strconv.Itoa
+}
+
+// TestIntegrationCloneSize measures a with_data branch of a parent of SBCTL_TEST_PARENT_MB
+// megabytes (skipped when unset; CI uses 1024, a laptop run stays under 200). It reports the
+// clone method, the wall time of the whole branch creation, the clone's own time, the
+// parent's size and the disk the clone used, as one line "BRANCH_CLONE_RESULT {json}" and,
+// in CI, as a table in the job summary. SBCTL_TEST_EXPECT_METHOD (reflink, clonefile,
+// base-backup) makes the test fail when another method was used.
+func TestIntegrationCloneSize(t *testing.T) {
+	mb, _ := strconv.Atoi(os.Getenv("SBCTL_TEST_PARENT_MB"))
+	if mb <= 0 {
+		t.Skip("SBCTL_TEST_PARENT_MB not set")
+	}
+	st := newStack(t)
+	ctx := context.Background()
+	eng := st.node.Engine
+	parent, err := eng.Create(ctx, lifecycle.CreateRequest{Name: "big parent", Class: "small"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pref := parent.Ref
+	c := st.conn(pref, "postgres")
+	if _, err := c.Exec(ctx, `create table public.big (id int primary key, payload text);
+		alter table public.big alter column payload set storage external`); err != nil {
+		t.Fatal(err)
+	}
+	// 100 KB rows, stored uncompressed: the table is as big on disk as it looks.
+	const rowKB = 100
+	rows := mb * 1024 / rowKB
+	loadStart := time.Now()
+	for done := 0; done < rows; {
+		n := min(1000, rows-done)
+		if _, err := c.Exec(ctx, fmt.Sprintf(`insert into public.big select g, repeat(md5(g::text), 3200) from generate_series(%d, %d) g`, done+1, done+n)); err != nil {
+			t.Fatal(err)
+		}
+		done += n
+	}
+	if _, err := st.conn(pref, lifecycle.RoleAdmin).Exec(ctx, `checkpoint`); err != nil {
+		t.Fatal(err)
+	}
+	var size int64
+	if err := c.QueryRow(ctx, `select pg_database_size('postgres')`).Scan(&size); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("parent: %d rows, %s database, loaded in %s", rows, humanBytes(size), time.Since(loadStart).Round(time.Second))
+
+	method := os.Getenv("SBCTL_TEST_EXPECT_METHOD")
+	if method == MethodBackup {
+		// The base-backup path restores the parent's latest base backup plus WAL.
+		bstart := time.Now()
+		if _, err := st.bk.BaseBackup(ctx, pref); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("parent base backup: %s", time.Since(bstart).Round(time.Millisecond))
+	}
+	free0 := freeBytes(st.cfg.StateDir)
+	start := time.Now()
+	b := st.createBranch(pref, "size-test", func(in *CreateInput) { in.WithData = true })
+	total := time.Since(start)
+	free1 := freeBytes(st.cfg.StateDir)
+	if method != "" && b.CloneMethod != method {
+		t.Fatalf("clone method = %s, want %s (%s)", b.CloneMethod, method, b.Detail)
+	}
+	var n int
+	if err := st.conn(b.Ref, "postgres").QueryRow(ctx, `select count(*) from public.big`).Scan(&n); err != nil || n != rows {
+		t.Fatalf("branch has %d rows, want %d (%v)", n, rows, err)
+	}
+	// Writing to the branch does not touch the parent.
+	st.exec(b.Ref, `delete from public.big where id <= 100`)
+	var pn int
+	if err := c.QueryRow(ctx, `select count(*) from public.big`).Scan(&pn); err != nil || pn != rows {
+		t.Fatalf("parent has %d rows after a delete on the branch, want %d", pn, rows)
+	}
+
+	res := map[string]any{
+		"method": b.CloneMethod, "filesystem": fsName(st.cfg.StateDir), "parent_db_bytes": size, "parent_rows": rows,
+		"create_total_ms": total.Milliseconds(), "extra_disk_bytes": max(free0-free1, 0), "detail": b.Detail,
+	}
+	evs, _ := st.node.Registry.ListEvents(ctx, pref, 50)
+	for _, e := range evs {
+		if e.Kind == "branch.created" {
+			var pl struct {
+				Clone *CloneStats `json:"clone"`
+			}
+			if json.Unmarshal(e.Payload, &pl) == nil && pl.Clone != nil {
+				res["clone"] = pl.Clone
+			}
+			break
+		}
+	}
+	line, _ := json.Marshal(res)
+	t.Logf("BRANCH_CLONE_RESULT %s", line)
+	fmt.Printf("BRANCH_CLONE_RESULT %s\n", line)
+	if f := os.Getenv("GITHUB_STEP_SUMMARY"); f != "" {
+		out, err := os.OpenFile(f, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+		if err == nil {
+			defer out.Close()
+			fmt.Fprintf(out, "\n#### Branch clone on %s (%s)\n\n| method | parent database | whole branch creation | clone copy | extra disk |\n|---|---|---|---|---|\n| %s | %s | %d ms | %s | %s |\n",
+				fsName(st.cfg.StateDir), os.Getenv("SBCTL_TEST_LABEL"), b.CloneMethod, humanBytes(size), total.Milliseconds(), cloneMS(res), humanBytes(max(free0-free1, 0)))
+		}
+	}
+	if _, err := st.svc.Delete(ctx, b.Ref, DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func cloneMS(res map[string]any) string {
+	if c, ok := res["clone"].(*CloneStats); ok {
+		return fmt.Sprintf("%d ms (%d files, %d WAL segments)", c.CopyMillis, c.Files, c.WALSegments)
+	}
+	return "n/a (base backup restore)"
 }
