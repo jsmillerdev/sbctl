@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -62,17 +63,27 @@ func itLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// freePort returns a free TCP port in the private range 32100-32999.
+// portBase is the first port of the 900 the stack picks from: 32100 unless
+// SBCTL_API_IT_PORT_BASE says otherwise (a machine that reserves another range).
+func portBase() int {
+	if v, err := strconv.Atoi(os.Getenv("SBCTL_API_IT_PORT_BASE")); err == nil && v > 1024 && v < 64000 {
+		return v
+	}
+	return 32100
+}
+
+// freePort returns a free TCP port in portBase()..portBase()+899.
 func freePort(t testing.TB) int {
 	t.Helper()
-	for p := 32100 + int(time.Now().UnixNano()%400); p < 33000; p++ {
+	base := portBase()
+	for p := base + int(time.Now().UnixNano()%400); p < base+900; p++ {
 		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
 		if err == nil {
 			l.Close()
 			return p
 		}
 	}
-	t.Fatal("no free port in 32100-32999")
+	t.Fatal("no free port in the integration range")
 	return 0
 }
 
