@@ -210,7 +210,8 @@ ELIG=$(papi GET "/v1/projects/$REF/upgrade/eligibility")
 [[ $(json_get 'len(d["target_upgrade_versions"])' <<<"$ELIG") == 1 && $(json_get 'd["target_upgrade_versions"][0]["postgres_version"]' <<<"$ELIG") == 17 ]] || fail "target versions: $ELIG"
 [[ $(json_get 'd["current_app_version"] == d["latest_app_version"]' <<<"$ELIG") == True ]] || fail "only GoTrue and PostgREST differ, so the Postgres app versions are equal: $ELIG"
 [[ $(json_get 'len(d["validation_errors"]) + len(d["warnings"])' <<<"$ELIG") == 0 ]] || fail "unexpected blockers: $ELIG"
-supavise projects versions | grep -q "available" || { supavise projects versions >&2; fail "projects versions does not show the available upgrade"; }
+OUT=$(supavise projects versions)
+grep -q "available" <<<"$OUT" || { echo "$OUT" >&2; fail "projects versions does not show the available upgrade"; }
 intact "$REF"
 PG_PID=$(pg_pid "$REF")
 
@@ -241,7 +242,8 @@ runs "$REF" postgrest "$OLD_REST"
 [[ $(pg_pid "$REF") == "$PG_PID" ]] || fail "PostgreSQL was restarted by an upgrade that only changes GoTrue and PostgREST"
 intact "$REF"
 [[ $(papi GET "/v1/projects/$REF/database/backups" | json_get 'len(d["backups"])') -ge 1 ]] || fail "no base backup was taken before the failed upgrade"
-journalctl --no-pager -u supavise.service | grep -q 'msg=upgrade_failed' || fail "no upgrade_failed log line"
+JOURNAL=$(journalctl --no-pager -u supavise.service)
+grep -q 'msg=upgrade_failed' <<<"$JOURNAL" || fail "no upgrade_failed log line"
 
 log "release 4, the good one: the upgrade through the API"
 use_pins new
@@ -269,7 +271,8 @@ must 400 POST "/v1/projects/$REF/upgrade" '{"target_version":"17"}'
 runs "$REF2" gotrue "$OLD_AUTH"
 
 log "the second project through the CLI: supavise projects upgrade --all --yes"
-supavise projects upgrade --all --dry-run | grep -q "$REF2" || fail "--dry-run does not list $REF2"
+OUT=$(supavise projects upgrade --all --dry-run)
+grep -q "$REF2" <<<"$OUT" || { echo "$OUT" >&2; fail "--dry-run does not list $REF2"; }
 supavise projects upgrade --all --yes || fail "supavise projects upgrade --all --yes"
 wait_status "$REF2" ACTIVE_HEALTHY 180
 [[ $(service_versions "$REF2") == "$NEW_AUTH_V $NEW_REST_V" ]] || fail "service versions of $REF2: $(service_versions "$REF2")"
@@ -277,9 +280,11 @@ runs "$REF2" gotrue "$NEW_AUTH"
 runs "$REF2" postgrest "$NEW_REST"
 intact "$REF2"
 [[ $(upgrade_status "$REF2" 'd["databaseUpgradeStatus"]["status"]') == 1 ]] || fail "the CLI's upgrade left status $(upgrade_status "$REF2" 'd["databaseUpgradeStatus"]')"
-supavise projects versions "$REF2" | grep -q "up to date" || { supavise projects versions "$REF2" >&2; fail "projects versions $REF2 does not say up to date"; }
+OUT=$(supavise projects versions "$REF2")
+grep -q "up to date" <<<"$OUT" || { echo "$OUT" >&2; fail "projects versions $REF2 does not say up to date"; }
 [[ $(supavise projects versions --json | json_get 'sum(1 for p in d if p["upgrade"]["up_to_date"])') == 2 ]] || fail "projects versions --json"
-supavise projects upgrade --all --yes | grep -q "nothing to upgrade" || fail "a second --all upgrades something"
+OUT=$(supavise projects upgrade --all --yes)
+grep -q "nothing to upgrade" <<<"$OUT" || { echo "$OUT" >&2; fail "a second --all upgrades something"; }
 
 log "artifact garbage collection: the old release goes, the previous one stays"
 GC=$(supavise artifacts gc --dry-run)
