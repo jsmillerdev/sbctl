@@ -86,6 +86,7 @@ type Service struct {
 type run struct {
 	id, op string
 	done   chan struct{}
+	once   sync.Once
 }
 
 // New builds the service. It connects to nothing.
@@ -308,7 +309,7 @@ func (s *Service) end(ref string, r *run) {
 		delete(s.runs, ref)
 	}
 	s.mu.Unlock()
-	close(r.done)
+	r.once.Do(func() { close(r.done) })
 }
 
 // running reports the operation in progress on ref in this process.
@@ -394,7 +395,7 @@ func (s *Service) spawn(r *run, ref, parentRef string, fn func(ctx context.Conte
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		defer s.end(ref, r)
+		defer s.end(ref, r) // a panic must not leave the branch busy forever
 		ctx, cancel := context.WithTimeout(s.base, s.opTimeout)
 		defer cancel()
 		started := s.now()
@@ -405,20 +406,23 @@ func (s *Service) spawn(r *run, ref, parentRef string, fn func(ctx context.Conte
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer rcancel()
 		payload["ms"] = s.now().Sub(started).Milliseconds()
+		state, status := registry.BranchMigrationsPassed, "MIGRATIONS_PASSED"
 		if err != nil {
-			payload["error"] = err.Error()
+			state, status, detail = registry.BranchMigrationsFailed, "MIGRATIONS_FAILED", err.Error()
+			payload["error"] = detail
 			s.log.Error("branch operation failed", "op", r.op, "ref", ref, "run", r.id, "err", err)
-			s.setState(rctx, ref, registry.BranchMigrationsFailed, err.Error(), nil)
-			s.event(rctx, ref, "branch."+r.op+".failed", payload)
-			s.event(rctx, parentRef, "branch."+r.op+".failed", payload)
-			s.notify(rctx, ref, r.op, "MIGRATIONS_FAILED", err.Error())
-			return
+		} else {
+			payload["detail"] = detail
 		}
-		payload["detail"] = detail
-		s.setState(rctx, ref, registry.BranchMigrationsPassed, detail, nil)
-		s.event(rctx, ref, "branch."+r.op+".succeeded", payload)
-		s.event(rctx, parentRef, "branch."+r.op+".succeeded", payload)
-		s.notify(rctx, ref, r.op, "MIGRATIONS_PASSED", detail)
+		kind := "branch." + r.op + map[bool]string{true: ".failed", false: ".succeeded"}[err != nil]
+		s.event(rctx, ref, kind, payload)
+		s.event(rctx, parentRef, kind, payload)
+		// The state is the last thing a client can see change, so it comes after the events,
+		// and the branch stops being busy the moment it shows: a client that sees the new
+		// state may start the next operation at once.
+		s.setState(rctx, ref, state, detail, nil)
+		s.end(ref, r)
+		s.notify(rctx, ref, r.op, status, detail)
 	}()
 }
 

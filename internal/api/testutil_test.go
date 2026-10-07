@@ -15,6 +15,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/OWNER/sbctl/internal/api/cryptojs"
+	"github.com/OWNER/sbctl/internal/branching"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -67,11 +68,18 @@ func (m *fakeManager) Create(ctx context.Context, req lifecycle.CreateRequest) (
 	if fn != nil {
 		return fn(req)
 	}
+	if req.OrgSlug == "" {
+		req.OrgSlug = "default"
+	}
 	org, err := m.reg.GetOrganization(ctx, req.OrgSlug)
 	if err != nil {
 		return nil, err
 	}
 	p := &registry.Project{Ref: req.Ref, OrgID: org.ID, Name: req.Name, Region: req.Region, Status: registry.StatusActiveHealthy, Engine: registry.EnginePostgres}
+	if req.Branch != nil {
+		b := *req.Branch
+		p.Branch = &b
+	}
 	if err := m.reg.CreateProject(ctx, p); err != nil {
 		return nil, err
 	}
@@ -215,6 +223,7 @@ type fixture struct {
 	reg     *registry.Memory
 	mgr     *fakeManager
 	meta    *fakePGMeta
+	bdb     *fakeBranchDB
 	cfg     *config.Config
 	org     *registry.Organization
 	project *registry.Project
@@ -244,8 +253,14 @@ func newFixture(t testing.TB) *fixture {
 	mgr.addProject(t, config.SystemRef, "system", 0, registry.StatusActiveHealthy)
 	f.system, _ = mgr.Keys(ctx, config.SystemRef)
 	f.project = mgr.addProject(t, testRef, "First project", f.org.ID, registry.StatusActiveHealthy)
+	f.bdb = newFakeBranchDB()
+	bsvc, err := branching.New(branching.Deps{Cfg: cfg, Registry: reg, Secrets: sec, Engine: branchEngine{mgr}, DB: f.bdb, CreateWait: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { bsvc.Drain(context.Background()) })
 	f.srv, err = NewServer(Deps{
-		Registry: reg, Secrets: sec, Manager: mgr, Config: cfg, PGMetaURL: f.meta.URL,
+		Registry: reg, Secrets: sec, Manager: mgr, Config: cfg, PGMetaURL: f.meta.URL, Branching: bsvc,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CreateWait: 2 * time.Second,
 	})
 	if err != nil {

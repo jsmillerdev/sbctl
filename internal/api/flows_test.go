@@ -413,8 +413,6 @@ func TestMiscRoutes(t *testing.T) {
 	f := newFixture(t)
 	f.run(t, []step{
 		{key: "POST /platform/organizations", body: map[string]any{"name": "Second Team"}, status: 201, check: want("slug", "second-team")},
-		{key: "GET /v1/projects/{ref}/branches/{name}", path: "/v1/projects/" + testRef + "/branches/main", status: 404},
-		{key: "GET /v1/branches/{branch_id_or_ref}", path: "/v1/branches/abc", status: 404},
 		{key: "PUT /v1/projects/{ref}/api-keys/legacy", path: "/v1/projects/" + testRef + "/api-keys/legacy?enabled=true"},
 		{key: "POST /v1/projects/{ref}/functions", body: map[string]any{"slug": "legacy", "name": "Legacy", "verify_jwt": false}, status: 201, check: want("verify_jwt", false)},
 	})

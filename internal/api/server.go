@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OWNER/sbctl/internal/branching"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -40,6 +41,9 @@ type Deps struct {
 	Upstream func(p *registry.Project, svc string) string
 	// Now is the clock; empty means time.Now.
 	Now func() time.Time
+	// Branching serves the branch endpoints. Nil: a project has only its default branch
+	// and creating one is refused.
+	Branching *branching.Service
 	// CreateWait bounds how long POST /v1/projects waits for the new project to show
 	// up in the registry before answering 201 COMING_UP. Zero means 10 seconds.
 	CreateWait time.Duration
@@ -47,15 +51,16 @@ type Deps struct {
 
 // Server is the Management API. It implements http.Handler.
 type Server struct {
-	reg   registry.Registry
-	sec   secrets.Secrets
-	mgr   lifecycle.Manager
-	cfg   *config.Config
-	log   *slog.Logger
-	store Store
-	hc    *http.Client
-	now   func() time.Time
-	auth  *authenticator
+	reg      registry.Registry
+	sec      secrets.Secrets
+	mgr      lifecycle.Manager
+	branches *branching.Service
+	cfg      *config.Config
+	log      *slog.Logger
+	store    Store
+	hc       *http.Client
+	now      func() time.Time
+	auth     *authenticator
 
 	pgmetaURL        string
 	upstreamOverride func(p *registry.Project, svc string) string
@@ -94,7 +99,7 @@ func NewServer(d Deps) (*Server, error) {
 		return nil, fmt.Errorf("api: Deps needs Registry, Secrets, Manager and Config")
 	}
 	s := &Server{
-		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, cfg: d.Config, log: d.Logger, store: d.Store,
+		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, branches: d.Branching, cfg: d.Config, log: d.Logger, store: d.Store,
 		hc: d.HTTPClient, now: d.Now, pgmetaURL: d.PGMetaURL, upstreamOverride: d.Upstream, createWait: d.CreateWait,
 		pgmetaKeyMu: make(chan struct{}, 1), roEnsured: map[string]readOnlyEnsured{},
 	}
@@ -157,6 +162,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesProfile(add)
 	s.routesOrganizations(add)
 	s.routesProjects(add)
+	s.routesBranches(add)
 	s.routesKeys(add)
 	s.routesDatabase(add)
 	s.routesFunctions(add)

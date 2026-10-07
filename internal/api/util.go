@@ -184,7 +184,8 @@ func (s *Server) orgOf(ctx context.Context, p *registry.Project) (*registry.Orga
 	return s.defaultOrg(ctx)
 }
 
-// userProjects lists the projects shown to users: everything but "system".
+// userProjects lists the projects shown to users: everything but "system" and the branches
+// (a branch is listed under its parent and opened by its ref, as on hosted Supabase).
 func (s *Server) userProjects(ctx context.Context) ([]registry.Project, error) {
 	all, err := s.reg.ListProjects(ctx)
 	if err != nil {
@@ -192,7 +193,7 @@ func (s *Server) userProjects(ctx context.Context) ([]registry.Project, error) {
 	}
 	out := all[:0:0]
 	for _, p := range all {
-		if p.Ref != config.SystemRef {
+		if p.Ref != config.SystemRef && p.Branch == nil {
 			out = append(out, p)
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -262,3 +263,5 @@ func (h *harness) mustState(b *Branch, want registry.BranchState) {
 }
 
 var _ = fmt.Sprint
+
+func slogDiscard() *slog.Logger { return slog.New(slog.DiscardHandler) }
