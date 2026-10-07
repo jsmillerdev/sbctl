@@ -228,8 +228,10 @@ jobs:
         run: |
           npm install --prefix /tmp/sbcli supabase@2.119.0
           /tmp/sbcli/node_modules/.bin/supabase --version
+      # Pinned by digest (the manifest of the image's last tag, from the Docker Hub registry API): the job runs
+      # it with sudo, so a changed tag must not change what runs. tests/linux/sso-smoke.sh names the same digest.
       - name: identity provider image
-        run: docker pull kristophjunge/test-saml-idp
+        run: docker pull kristophjunge/test-saml-idp@sha256:02a6e56c01f94b9ba3f2151f33acedf4606ac9b7eeb62a874c5a6b032c0fa9cc
       - name: build sbctl
         run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
       - name: sso smoke

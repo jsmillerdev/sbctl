@@ -36,7 +36,11 @@ import (
 //     administrator approves the user (`sbctl sso approve`, or the pending list in the API) or
 //     invites or promotes them the usual way;
 //   - the default role is for that first request only: a user who later loses every
-//     membership becomes pending, and is not given the role again.
+//     membership becomes pending, and is not given the role again;
+//   - an address that an administrator denied or removed (Deny, `sbctl users remove` of an SSO
+//     account) is remembered by provider and address: the person's next sign-in creates a new
+//     GoTrue account, which is pending like any other and does not get the default role, until
+//     an administrator approves it (Approve) or clears the refusal (Allow, `sbctl sso allow`).
 //
 // Sign-up is closed to everyone else: sb-gotrue@system asks the daemon before it creates a
 // user (before-user-created hook, serveBeforeUserCreated) and the daemon allows registered
@@ -578,11 +582,11 @@ func (d *DashboardSSO) Update(ctx context.Context, actor *members.Access, id str
 	return d.view(ctx, p, row), nil
 }
 
-// Remove deletes a provider: sbctl stops accepting its users at once, their memberships and
-// roles are removed, their personal access tokens are revoked (a token would otherwise outlive the identity provider that vouched for
-// its owner), and the provider goes from GoTrue. It finishes a removal that stopped halfway:
-// a provider that only GoTrue still has can be removed too. orgID limits the removal to that
-// organization (0: any).
+// Remove deletes a provider: the memberships and roles of its users are removed, the provider goes
+// from GoTrue, the personal access tokens of its users are revoked (a token would otherwise outlive
+// the identity provider that vouched for its owner), and sbctl's record of it goes last, so a
+// removal that stopped halfway can be run again and finishes. A provider that only GoTrue still
+// has can be removed too. orgID limits the removal to that organization (0: any).
 func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id string, orgID int64) (*DashboardProvider, error) {
 	row, err := d.Store.GetProvider(ctx, id)
 	if err != nil && !errors.Is(err, ErrNotFound) {
@@ -618,27 +622,35 @@ func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id str
 		if err := d.removeMemberships(ctx, id); err != nil {
 			return nil, err
 		}
-		users, err := d.Store.DeleteProvider(ctx, id)
-		if err != nil && !errors.Is(err, ErrNotFound) {
+	}
+	// GoTrue goes before sbctl's own record, so that a removal that stops at GoTrue (it is down,
+	// it refuses) can be run again: the record is still there for the retry to find. A provider
+	// that GoTrue no longer has is as good as deleted.
+	p, err := c.Delete(ctx, id)
+	if err != nil {
+		var ae *sso.APIError
+		if errors.As(err, &ae) && ae.Status == http.StatusNotFound && row != nil {
+			p = (&sso.Provider{ID: id, SAML: &sso.SAML{EntityID: row.EntityID}}).Normalize()
+		} else {
+			return nil, ssoError(err)
+		}
+	}
+	if row != nil {
+		users, err := d.Store.ListSSOUsers(ctx, "", []string{id})
+		if err != nil {
 			return nil, err
 		}
-		d.forget(id)
 		if err := d.syncRules(ctx, org, row.Domains, nil, row.DefaultRole, 0); err != nil {
 			return nil, err
 		}
 		for _, u := range users {
 			d.revokeTokens(ctx, u.UserID)
 		}
-	}
-	p, err := c.Delete(ctx, id)
-	if err != nil {
-		var ae *sso.APIError
-		if errors.As(err, &ae) && ae.Status == http.StatusNotFound && row != nil {
-			// Registered here but already gone from GoTrue: the removal is done.
-			p = (&sso.Provider{ID: id, SAML: &sso.SAML{EntityID: row.EntityID}}).Normalize()
-		} else {
-			return nil, ssoError(err)
+		// The record goes last: it is what a retry needs when a step above failed.
+		if _, err := d.Store.DeleteProvider(ctx, id); err != nil && !errors.Is(err, ErrNotFound) {
+			return nil, err
 		}
+		d.forget(id)
 	}
 	d.event(ctx, "sso.provider.removed", map[string]any{"provider": id})
 	d.changed(ctx)
@@ -765,10 +777,11 @@ func (d *DashboardSSO) Approve(ctx context.Context, actor *members.Access, org m
 	if !mayGrant(actor, org, roleID) {
 		return errf(http.StatusForbidden, "Your role does not allow adding members with the %s role", members.RoleName(roleID))
 	}
-	if _, err := d.pendingOf(ctx, org, userID); err != nil {
+	pu, err := d.pendingOf(ctx, org, userID)
+	if err != nil {
 		return err
 	}
-	err := d.Members.Store.Update(ctx, org.ID, func(ops members.Ops) error {
+	err = d.Members.Store.Update(ctx, org.ID, func(ops members.Ops) error {
 		if _, err := ops.GetMember(ctx, org.ID, userID); err == nil {
 			return nil // already a member: the approval only settles the state
 		} else if !errors.Is(err, members.ErrNotFound) {
@@ -782,18 +795,31 @@ func (d *DashboardSSO) Approve(ctx context.Context, actor *members.Access, org m
 	if err := d.Store.SetSSOUserState(ctx, userID, SSOActive, d.now()); err != nil {
 		return err
 	}
+	// An approval is the administrator's decision about this address, and it replaces an earlier
+	// refusal of it: the person is let in, and a later removal records a new one.
+	cleared, err := d.Store.AllowSSOEmail(ctx, pu.ProviderID, pu.Email)
+	if err != nil {
+		return err
+	}
 	d.mu.Lock()
 	delete(d.admitted, userID)
 	d.mu.Unlock()
-	d.event(ctx, "sso.user.approved", map[string]any{"user": userID, "org": org.Slug, "role": members.RoleName(roleID)})
+	payload := map[string]any{"user": userID, "org": org.Slug, "role": members.RoleName(roleID)}
+	if cleared {
+		payload["denial_cleared"] = true
+	}
+	d.event(ctx, "sso.user.approved", payload)
 	d.log().Info("single sign-on user approved", "user", userID, "org", org.Slug, "role", members.RoleName(roleID))
 	return nil
 }
 
 // Deny refuses a pending user for good: the account is deleted from sb-gotrue@system and the
-// user's sessions end. Signing in again creates a new account, which waits again. A user who has
-// become a member since the last request is not denied (409): the stored state is refreshed
-// only when the user makes a request, and the account may carry access elsewhere.
+// user's sessions end. The refusal is kept by provider and email address, because signing in
+// again creates a new GoTrue account with a new user id: that account waits for approval again,
+// and does not get the provider's default role (see firstSight), until an administrator approves
+// it (Approve) or clears the refusal (Allow). A user who has become a member since the last
+// request is not denied (409): the stored state is refreshed only when the user makes a request,
+// and the account may carry access elsewhere.
 func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org members.OrgRef, userID string) error {
 	u, err := d.pendingOf(ctx, org, userID)
 	if err != nil {
@@ -812,6 +838,11 @@ func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org memb
 		d.mu.Unlock()
 		return errf(http.StatusConflict, "This user is a member of an organization now and is not waiting for approval; remove the member instead")
 	}
+	// Recorded first, and durably: a step below that fails leaves the denial standing, and Deny can
+	// be run again.
+	if err := d.Store.DenySSOEmail(ctx, u.ProviderID, u.Email, d.now()); err != nil {
+		return err
+	}
 	if d.Accounts != nil {
 		if err := d.Accounts.Store.MarkUserRemoved(ctx, u.UserID, u.Email); err != nil {
 			return err
@@ -829,6 +860,40 @@ func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org memb
 	d.mu.Unlock()
 	d.event(ctx, "sso.user.denied", map[string]any{"user": userID, "org": org.Slug})
 	return d.Store.DeleteSSOUser(ctx, userID)
+}
+
+// Allow clears the refusal of an address at a provider (left by Deny, or by the removal of its
+// SSO account), so that the person's next sign-in is treated like a first one: with the
+// provider's default role, if the provider has one. It is `sbctl sso allow`; approving the
+// person's waiting account clears it too. An account of the address that is waiting already
+// (the person signed in again after the refusal) is forgotten, so that its next request is the
+// first sight that applies the default role.
+func (d *DashboardSSO) Allow(ctx context.Context, providerID, email string) error {
+	email = strings.ToLower(strings.TrimSpace(email))
+	ok, err := d.Store.AllowSSOEmail(ctx, strings.ToLower(providerID), email)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errf(http.StatusNotFound, "No refusal is recorded for %s at this provider", email)
+	}
+	waiting, err := d.Store.ListSSOUsers(ctx, SSOPending, []string{strings.ToLower(providerID)})
+	if err != nil {
+		return err
+	}
+	for _, u := range waiting {
+		if strings.EqualFold(u.Email, email) {
+			if err := d.Store.DeleteSSOUser(ctx, u.UserID); err != nil {
+				return err
+			}
+		}
+	}
+	d.mu.Lock()
+	d.admitted = nil
+	d.mu.Unlock()
+	d.event(ctx, "sso.user.allowed", map[string]any{"provider": providerID, "email_domain": members.DomainOf(email)})
+	d.log().Info("a single sign-on refusal was cleared", "provider", providerID, "email", email)
+	return nil
 }
 
 // ---- admission ---------------------------------------------------------------
@@ -945,6 +1010,27 @@ func (d *DashboardSSO) Admit(ctx context.Context, userID, email, providerID stri
 	return nil
 }
 
+// AdmitUser applies Admit to a user that is known as an SSO user, by what sbctl recorded of the
+// account: a personal access token carries no session claims, so the provider and the address come
+// from the record. A user with no record is not an SSO user (the account of a denied or removed
+// one is gone, and so are its tokens), and passes.
+func (d *DashboardSSO) AdmitUser(ctx context.Context, userID string) error {
+	d.mu.Lock()
+	at, ok := d.admitted[userID]
+	d.mu.Unlock()
+	if ok && d.now().Sub(at) < ssoCacheTTL {
+		return nil
+	}
+	u, err := d.Store.GetSSOUser(ctx, userID)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return d.Admit(ctx, userID, u.Email, u.ProviderID)
+}
+
 // maxAdmitted bounds the memory of admitted users.
 const maxAdmitted = 4096
 
@@ -965,17 +1051,33 @@ func (d *DashboardSSO) firstSight(ctx context.Context, row *SSOProviderRow, user
 	if err != nil {
 		return nil, err
 	}
-	if member {
-		u.State = SSOActive
-	} else if g, err := d.grantDefault(ctx, row, userID, email); err != nil {
+	denied, err := d.Store.SSOEmailDenied(ctx, row.ID, u.Email)
+	if err != nil {
 		return nil, err
-	} else if g != nil {
+	}
+	switch {
+	case member:
 		u.State = SSOActive
+	case denied:
+		// An administrator refused this address before (denied it, or removed its account): the
+		// new account waits for approval and gets no default role. "First sign-in" is about the
+		// person, not about the GoTrue user id.
+	default:
+		g, err := d.grantDefault(ctx, row, userID, email)
+		if err != nil {
+			return nil, err
+		}
+		if g != nil {
+			u.State = SSOActive
+		}
 	}
 	if _, err := d.Store.InsertSSOUser(ctx, u); err != nil {
 		return nil, err
 	}
 	payload := map[string]any{"user": userID, "provider": row.ID, "state": u.State}
+	if denied && !member {
+		payload["default_role_withheld"] = "this address was denied or removed by an administrator"
+	}
 	// An identity provider can vouch for an address that already has a password account; the two
 	// stay separate accounts (GoTrue keeps SSO accounts out of its email uniqueness). Say so in the
 	// audit trail: the operator's commands never take the SSO account for the password account.

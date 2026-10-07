@@ -77,9 +77,12 @@ type Accounts struct {
 	// --no-mail`): the caller passes the link on.
 	NoMail bool
 	// SSOUsers forgets a removed user's single sign-on record (the pending list must not
-	// keep a person whose account is gone). Set by NewDashboardSSO.
+	// keep a person whose account is gone) and remembers the removal by the address, so that a
+	// new account of the same person does not get the provider's default role. Set by
+	// NewDashboardSSO.
 	SSOUsers interface {
 		DeleteSSOUser(ctx context.Context, userID string) error
+		DenySSOEmail(ctx context.Context, providerID, email string, at time.Time) error
 	}
 }
 
@@ -478,6 +481,13 @@ func (a *Accounts) RemoveUserBy(ctx context.Context, email string, force bool, s
 		return nil, 0, err
 	}
 	if a.SSOUsers != nil {
+		// The account is gone, but the person can sign in again and get a new one: the removal
+		// is kept by address, and the provider's default role does not undo it.
+		if u.SSOProvider != "" {
+			if err := a.SSOUsers.DenySSOEmail(ctx, u.SSOProvider, u.Email, a.now()); err != nil {
+				return nil, 0, err
+			}
+		}
 		if err := a.SSOUsers.DeleteSSOUser(ctx, u.ID); err != nil {
 			return nil, 0, err
 		}

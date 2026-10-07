@@ -277,6 +277,7 @@ func NewServer(d Deps) (*Server, error) {
 	s.auth = newAuthenticator(s.reg, s.mgr.Keys, s.store, s.now, s.cfg.API.Admins())
 	s.auth.removed = claims.UserRemoved
 	s.auth.sso = s.sso.Admit
+	s.auth.ssoUser = s.sso.AdmitUser
 	h, err := s.build()
 	if err != nil {
 		return nil, err

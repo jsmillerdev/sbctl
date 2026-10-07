@@ -360,9 +360,13 @@ like every other `/auth/v1` path.
   Any other user is recorded as pending and refused on every `/platform` and `/v1` route with `403` until an
   administrator approves them (`sbctl sso approve`, `POST .../sso/pending/{user_id}` with a role) or invites or promotes
   them the usual way; denying (`sbctl sso deny`, `DELETE`) deletes the account. The default role is for the first
-  request only: a user who later loses every membership waits again and is not given it again. A second provider
+  sign-in only: a user who later loses every membership waits again and is not given it again, and neither is a person
+  whose address an administrator denied or removed (next bullet), whose new GoTrue account is a first sight of a
+  new user id but not a first sign-in of the person. A second provider
   cannot give its users another provider's default role by asserting that provider's domains. A personal access token
-  that an SSO user made carries the user's roles like any other; removing a provider revokes the tokens of its users. An SSO
+  that an SSO user made carries the user's roles like any other, and is held to the same gate: while the user waits for
+  approval (they lost every membership, or were denied) the token is refused (403) as the session is. Removing a
+  provider revokes the tokens of its users. An SSO
   session meets an organization's "require MFA" and the aal2 check on minting personal access tokens (GoTrue marks it aal1
   whatever the provider did, and the provider is where strong authentication is enforced; the switch would otherwise lock
   out every SSO user). The exemption is unconditional: sbctl cannot see how strongly a provider authenticated its user,
@@ -392,10 +396,20 @@ like every other `/auth/v1` path.
   has a password account is logged and recorded in the `sso.user.first_sign_in` event (`shares_email_with`); the
   SSO account gets the provider's default role like any other, and nothing of the password account.
 - **Denying and removing.** `deny` re-checks the memberships first: a user who became a member since the last request
-  (invited, `sbctl users role`) is not denied (409) and the account stays. Removing a provider removes the memberships
+  (invited, `sbctl users role`) is not denied (409) and the account stays. Deleting the GoTrue account does not keep the
+  person out: signing in through the identity provider again creates a new account with a new user id. So `deny`, and
+  `sbctl users remove` of an SSO account, also record the refusal by provider and lower-cased email address
+  (`sso_denied`), before anything is deleted. A refused address that signs in again gets a new account that is pending,
+  without the default role (the `sso.user.first_sign_in` event says `default_role_withheld`), and is refused on every
+  route until an administrator approves it (`sbctl sso approve`, `POST .../sso/pending/{user_id}`; the approval clears
+  the refusal) or runs `sbctl sso allow <email>` (a waiting account of the address is forgotten, so its next request is a first sight again, default role included).
+  Inviting or promoting the person the usual way lets them in too, and leaves the refusal in place for a later removal
+  to renew. The refusal belongs to the provider: removing the provider drops it. Removing a provider removes the memberships
   and project roles of the users that signed in through it, in every organization (the accounts cannot sign in again),
   before anything else changes; when one of them is the only Owner of an organization the removal is refused (409)
-  until another Owner exists, as `sbctl users remove` refuses it.
+  until another Owner exists, as `sbctl users remove` refuses it. The provider is deleted from GoTrue (a 404 there counts
+  as done) before sbctl's own record goes, and the record goes last, so a removal that stopped at GoTrue is finished by
+  running it again.
 - **Domains are claimed node-wide.** GoTrue finds the provider by the email domain, across the whole node, and sbctl
   does not verify that the registrant controls the domain: the first provider to register a domain gets it (a second
   one is refused, 409). A provider is also refused for a domain that another organization's default-role rule holds,
@@ -424,7 +438,7 @@ like every other `/auth/v1` path.
   and the pending list are sbctl's own routes.
 
 Provider changes, a user's first sign-in, approvals and denials are events of the system project in the registry
-(`sso.provider.added|updated|removed`, `sso.user.first_sign_in|approved|denied`; ids, domains and role names only).
+(`sso.provider.added|updated|removed`, `sso.user.first_sign_in|approved|denied|allowed`; ids, domains and role names only).
 
 **Projects.** `/v1/projects/{ref}/config/auth/sso/providers` (create, list, get, update, delete) is a proxy to the
 project's GoTrue admin SSO API with the exact shapes of the spec (the list carries each provider's metadata document,
@@ -517,7 +531,8 @@ membership later never hands the account back to the rule. Behind `internal/memb
 implementations, one service test suite that runs on both).
 
 Single sign-on is in `1000_sso.sql` (range 1000-1099): `sso_providers` (the providers sbctl registered in
-`sb-gotrue@system`: organization, domains, default role), `sso_users` (who signed in through one, `pending` or `active`)
+`sb-gotrue@system`: organization, domains, default role), `sso_users` (who signed in through one, `pending` or `active`),
+`1001_sso_denied.sql`'s `sso_denied` (addresses an administrator denied or removed, per provider)
 and `signup_grants` (one-time grants that let GoTrue create an invited address). Behind `SSOStore` (`sso_store.go`, a
 Postgres and a memory implementation, one conformance suite) and `ClaimStore`.
 

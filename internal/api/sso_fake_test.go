@@ -243,6 +243,9 @@ func (f *ssoFake) register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /admin/sso/providers/{id}", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if f.fail(w) {
+			return
+		}
 		p := load(w, r)
 		if p == nil {
 			return

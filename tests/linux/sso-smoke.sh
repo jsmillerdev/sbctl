@@ -13,7 +13,8 @@
 #   allowed domain signs in and is a Developer (the domain's default role) and may do what a
 #   Developer may; a person the identity provider vouches for with an address of any other domain is
 #   refused on every route, listed by `sbctl sso pending` and let in by `sbctl sso approve`; a
-#   domain without a provider cannot start a sign-in; nobody can sign up any other way (GoTrue's
+#   Developer removed with `sbctl users remove` who signs in again gets a new account that waits
+#   for approval (no default role the second time); a domain without a provider cannot start a sign-in; nobody can sign up any other way (GoTrue's
 #   sign-up is open and the daemon's hook refuses it); Studio's unit offers "Continue with SSO"
 #   only while a provider exists; removing the provider ends the session;
 # - a project: SAML is off until it is enabled in the project's Auth settings (the specs' 404),
@@ -144,10 +145,12 @@ $config = array(
 PHP
 chmod 0644 "$SPS" "$WORK/authsources.php"
 docker rm -f "$IDP_NAME" >/dev/null 2>&1 || true
+# By digest, like the CI job's pull (.github/workflows/linux.yml): a tag can move.
+IDP_IMAGE=${IDP_IMAGE:-kristophjunge/test-saml-idp@sha256:02a6e56c01f94b9ba3f2151f33acedf4606ac9b7eeb62a874c5a6b032c0fa9cc}
 docker run -d --name "$IDP_NAME" -p "127.0.0.1:$P_IDP:8080" \
   -v "$WORK/authsources.php:/var/www/simplesamlphp/config/authsources.php" \
   -v "$SPS:/var/www/simplesamlphp/metadata/saml20-sp-remote.php" \
-  kristophjunge/test-saml-idp >/dev/null || fail "the identity provider container did not start"
+  "$IDP_IMAGE" >/dev/null || fail "the identity provider container did not start"
 IDP_META="http://127.0.0.1:$P_IDP/simplesaml/saml2/idp/metadata.php"
 for ((i = 0; i < 60; i++)); do
   [[ $(http_code "$IDP_META") == 200 ]] && break
@@ -218,6 +221,22 @@ log "dashboard: the Management API answers the same (Studio's organization page 
 code=$(dash_code "/platform/organizations/$ORG/sso" -H "Authorization: Bearer $OWNER_JWT"); [[ $code == 200 ]] || fail "GET organization SSO: $code"
 [[ $(curl -sS -m 30 -H "Authorization: Bearer $OWNER_JWT" "$ADMIN/platform/organizations/$ORG/sso" | json_get 'd["join_org_on_signup_role"]') == Developer ]] || fail "the organization page shows another default role"
 [[ $(dash_code "/platform/organizations/$ORG/sso/providers" -H "Authorization: Bearer $ALICE") == 403 ]] || fail "a Developer reads the SSO providers"
+
+log "dashboard: a removed user with a default role stays out when signing in again (the refusal is kept by address)"
+sbctl users remove alice@acme.test >/dev/null || fail "sbctl users remove alice"
+[[ $(profile_code "$ALICE") == 401 ]] || fail "alice's session after her removal: $(profile_code "$ALICE")"
+walk "api.$SBCTL_DOMAIN" alice@acme.test alice alicepass >"$WORK/alice2.json" || { cat "$WORK/alice2.json" >&2; fail "alice's second sign-in did not reach the ACS"; }
+ALICE2=$(walk_token <"$WORK/alice2.json")
+[[ -n $ALICE2 ]] || fail "no session came back for alice's new account: $(head -c 600 "$WORK/alice2.json")"
+for p in /platform/profile /platform/projects /v1/projects; do
+  [[ $(dash_code "$p" -H "Authorization: Bearer $ALICE2") == 403 ]] || fail "alice's new account got $(dash_code "$p" -H "Authorization: Bearer $ALICE2") on $p, it should wait for approval"
+done
+sbctl sso pending | grep -q "alice@acme.test" || fail "alice's new account is not listed as pending"
+sbctl users list | grep "alice@acme.test" | grep -q "$ORG:" && fail "alice got a role again by the default role"
+sbctl sso approve alice@acme.test --role developer >/dev/null || fail "sbctl sso approve alice"
+[[ $(profile_code "$ALICE2") == 200 ]] || fail "alice after the approval: $(profile_code "$ALICE2")"
+ALICE=$ALICE2
+APAT=$(curl -sS -m 30 -X POST -H "Authorization: Bearer $ALICE" -H 'Content-Type: application/json' -d '{"name":"alice2"}' "$ADMIN/platform/profile/access-tokens" | json_get 'd["token"]') || fail "alice's second token"
 
 log "dashboard: removing the provider ends the session; Studio loses the button"
 sbctl sso remove acme.test >/dev/null || fail "sbctl sso remove"

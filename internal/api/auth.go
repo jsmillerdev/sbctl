@@ -66,6 +66,9 @@ type authenticator struct {
 	// sso admits the session of a user whose account came from SAML single sign-on (see
 	// DashboardSSO.Admit). Nil: no SSO session is accepted.
 	sso func(ctx context.Context, userID, email, providerID string) error
+	// ssoUser is the same check for a personal access token, which carries no session: it looks
+	// the owner up among the SSO users and admits them (DashboardSSO.AdmitUser). Nil: no check.
+	ssoUser func(ctx context.Context, userID string) error
 
 	mu        sync.Mutex
 	secret    string
@@ -143,6 +146,13 @@ func (a *authenticator) authPAT(ctx context.Context, token string) (*Principal, 
 		return nil, err
 	} else if gone {
 		return nil, errUnauthorized
+	}
+	// The owner of a token who signed in through SSO is held to the same rule as their session: a
+	// user who waits for approval (their access ended, or they never had any) is refused.
+	if a.ssoUser != nil {
+		if err := a.ssoUser(ctx, t.UserID); err != nil {
+			return nil, err
+		}
 	}
 	a.touch(ctx, t.ID)
 	p := &Principal{UserID: t.UserID, Via: "pat", TokenID: t.ID}

@@ -935,7 +935,34 @@ func testSSOStore(t *testing.T, s SSOStore, org int64) {
 	if _, err := s.GetSSOUser(ctx, u3); err != ErrNotFound {
 		t.Fatalf("deleted user: %v", err)
 	}
-	// Deleting a provider returns and forgets its users.
+	// Refusals are kept by provider and lower-cased address; an unregistered provider keeps none.
+	const nobody = "a0000000-0000-4000-8000-0000000000ee"
+	for _, p := range []string{a, b, nobody} {
+		if err := s.DenySSOEmail(ctx, p, "Alice@A.test", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		provider, email string
+		want            bool
+	}{{a, "alice@a.test", true}, {a, "ALICE@a.test", true}, {b, "alice@a.test", true}, {a, "bob@a.test", false}, {nobody, "alice@a.test", false}} {
+		if got, err := s.SSOEmailDenied(ctx, c.provider, c.email); err != nil || got != c.want {
+			t.Fatalf("denied(%s, %s) = %v, %v; want %v", c.provider[len(c.provider)-1:], c.email, got, err, c.want)
+		}
+	}
+	if err := s.DenySSOEmail(ctx, a, "alice@a.test", now); err != nil {
+		t.Fatalf("denying twice: %v", err)
+	}
+	if ok, err := s.AllowSSOEmail(ctx, b, "alice@A.test"); err != nil || !ok {
+		t.Fatalf("allow: %v, %v", ok, err)
+	}
+	if ok, err := s.AllowSSOEmail(ctx, b, "alice@a.test"); err != nil || ok {
+		t.Fatalf("allow twice: %v, %v", ok, err)
+	}
+	if ok, err := s.AllowSSOEmail(ctx, "nope", "alice@a.test"); err != nil || ok {
+		t.Fatalf("allow at a malformed provider: %v, %v", ok, err)
+	}
+	// Deleting a provider returns and forgets its users, and its refusals.
 	gone, err := s.DeleteProvider(ctx, a)
 	if err != nil || len(gone) != 2 {
 		t.Fatalf("delete provider: %v, %v", gone, err)
@@ -945,6 +972,9 @@ func testSSOStore(t *testing.T, s SSOStore, org int64) {
 	}
 	if _, err := s.DeleteProvider(ctx, a); err != ErrNotFound {
 		t.Fatalf("delete twice: %v", err)
+	}
+	if got, err := s.SSOEmailDenied(ctx, a, "alice@a.test"); err != nil || got {
+		t.Fatalf("a deleted provider keeps a refusal: %v, %v", got, err)
 	}
 	if _, err := s.DeleteProvider(ctx, b); err != nil {
 		t.Fatal(err)
@@ -1523,5 +1553,197 @@ func TestSSORemovingAProviderRemovesItsUsersMemberships(t *testing.T) {
 	}
 	if n, _ := f.srv.members.Store.CountOwners(ctx, f.org.ID); n != 1 {
 		t.Errorf("the organization has %d Owners, want the one password Owner", n)
+	}
+}
+
+// ---- refusals are kept by address -----------------------------------------------
+
+// ssoRefusedSignIn is a person who had the default role, was refused (by afterwards), and signs in
+// again with the address under a new GoTrue account: the new account waits and has no role.
+func ssoRefusedSignIn(t *testing.T, f *ssoFixture, refuse func(id string), newUser string) (providerID string) {
+	t.Helper()
+	ctx := context.Background()
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	f.gt.addSSOAccount(ssoUser1, "alice@acme.test", id, time.Now())
+	if rec := f.doAs(f.ssoToken(ssoUser1, "alice@acme.test", id), "GET", "/platform/projects", nil); rec.Code != 200 || f.roleOf(ssoUser1) != members.RoleDeveloper {
+		t.Fatalf("first sign-in: %d %s, role %d", rec.Code, rec.Body, f.roleOf(ssoUser1))
+	}
+	refuse(id)
+	if f.gt.has(ssoUser1) {
+		t.Fatal("the account is still in GoTrue")
+	}
+	// The identity provider vouches for the address again; GoTrue makes a new account.
+	f.gt.addSSOAccount(newUser, "Alice@Acme.Test", id, time.Now())
+	tok := f.ssoToken(newUser, "Alice@Acme.Test", id)
+	for _, path := range []string{"/platform/projects", "/v1/projects"} {
+		if rec := f.doAs(tok, "GET", path, nil); rec.Code != 403 {
+			t.Fatalf("GET %s of the refused address's new account: %d %s, want 403", path, rec.Code, rec.Body)
+		}
+	}
+	if got := f.roleOf(newUser); got != 0 {
+		t.Fatalf("the refused address got the default role again: %d", got)
+	}
+	u, err := f.srv.sso.Store.GetSSOUser(ctx, newUser)
+	if err != nil || u.State != SSOPending {
+		t.Fatalf("new account %+v, %v", u, err)
+	}
+	evs, err := f.reg.ListEvents(ctx, config.SystemRef, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range evs {
+		if e.Kind == "sso.user.first_sign_in" && strings.Contains(string(e.Payload), newUser) && strings.Contains(string(e.Payload), "default_role_withheld") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the first-sight event does not say why the default role was withheld: %+v", evs)
+	}
+	return id
+}
+
+// An active default-role user who is denied (once waiting) and signs in again under a new GoTrue
+// user id stays pending; approving the new account lets them in.
+func TestSSODeniedUserWithADefaultRoleStaysOutAfterSigningInAgain(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	org := members.OrgRef{ID: f.org.ID, Slug: f.org.Slug}
+	id := ssoRefusedSignIn(t, f, func(id string) {
+		// An administrator takes the membership away; the user waits, and is denied.
+		if err := f.srv.members.RemoveMember(ctx, nil, org, ssoUser1); err != nil {
+			t.Fatal(err)
+		}
+		f.srv.sso.forget(id)
+		if rec := f.doAs(f.ssoToken(ssoUser1, "alice@acme.test", id), "GET", "/platform/projects", nil); rec.Code != 403 {
+			t.Fatalf("after losing the membership: %d", rec.Code)
+		}
+		if rec := f.as("owner", "DELETE", orgSSO+"/pending/"+ssoUser1, nil); rec.Code != 200 {
+			t.Fatalf("deny: %d %s", rec.Code, rec.Body)
+		}
+	}, ssoUser2)
+	// The new account is listed, and approving it lets the person in (and lifts the refusal).
+	if us, _ := f.srv.sso.Pending(ctx, f.org.ID); len(us) != 1 || us[0].UserID != ssoUser2 {
+		t.Fatalf("pending: %+v", us)
+	}
+	if rec := f.as("owner", "POST", orgSSO+"/pending/"+ssoUser2, map[string]any{"role": "read-only"}); rec.Code != 200 {
+		t.Fatalf("approve: %d %s", rec.Code, rec.Body)
+	}
+	if rec := f.doAs(f.ssoToken(ssoUser2, "alice@acme.test", id), "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("after the approval: %d %s", rec.Code, rec.Body)
+	}
+	if denied, _ := f.srv.sso.Store.SSOEmailDenied(ctx, id, "alice@acme.test"); denied {
+		t.Fatal("the approval left the refusal in place")
+	}
+}
+
+// The same for removal with `sbctl users remove`, and the operator's `sso allow` lifts it.
+func TestSSORemovedUserWithADefaultRoleStaysOutAfterSigningInAgain(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	id := ssoRefusedSignIn(t, f, func(string) {
+		if _, err := f.srv.accounts.RemoveUser(ctx, "alice@acme.test", false); err != nil {
+			t.Fatal(err)
+		}
+	}, ssoUser2)
+	// Nothing to lift for an address that was never refused.
+	if err := f.srv.sso.Allow(ctx, id, "nobody@acme.test"); err == nil {
+		t.Fatal("allowing an address that was not refused succeeded")
+	}
+	if err := f.srv.sso.Allow(ctx, id, "ALICE@acme.test"); err != nil {
+		t.Fatalf("allow: %v", err)
+	}
+	// The waiting account is forgotten, so its next request is a first sight again.
+	f.srv.sso.forget(id)
+	if rec := f.doAs(f.ssoToken(ssoUser2, "Alice@Acme.Test", id), "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("after allow: %d %s", rec.Code, rec.Body)
+	}
+	if got := f.roleOf(ssoUser2); got != members.RoleDeveloper {
+		t.Fatalf("role after allow: %d, want the default role", got)
+	}
+}
+
+// A refusal is by address and provider: another address of the domain still gets the default role.
+func TestSSORefusalOfOneAddressDoesNotTouchOthers(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	if err := f.srv.sso.Store.DenySSOEmail(ctx, id, "alice@acme.test", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if rec := f.doAs(f.ssoToken(ssoUser3, "bob@acme.test", id), "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("another address: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A personal access token of an SSO user who waits for approval is refused, like the session.
+func TestSSOPendingUsersPersonalAccessTokenIsRefused(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	tok := f.ssoToken(ssoUser1, "alice@acme.test", id)
+	rec := f.doAs(tok, "POST", "/platform/profile/access-tokens", map[string]any{"name": "ci"})
+	if rec.Code != 201 && rec.Code != 200 {
+		t.Fatalf("minting a token: %d %s", rec.Code, rec.Body)
+	}
+	pat := jsonField(t, rec, "token").(string)
+	if r := f.doAs(pat, "GET", "/v1/projects", nil); r.Code != 200 {
+		t.Fatalf("the token of a member: %d", r.Code)
+	}
+	if err := f.srv.members.RemoveMember(ctx, nil, members.OrgRef{ID: f.org.ID, Slug: f.org.Slug}, ssoUser1); err != nil {
+		t.Fatal(err)
+	}
+	f.srv.sso.forget(id)
+	if r := f.doAs(pat, "GET", "/v1/projects", nil); r.Code != 403 {
+		t.Fatalf("the token of a user who waits: %d %s, want 403", r.Code, r.Body)
+	}
+	// Approved again, the token works again; a token of a password account never asks.
+	if rec := f.as("owner", "POST", orgSSO+"/pending/"+ssoUser1, map[string]any{"role": "developer"}); rec.Code != 200 {
+		t.Fatalf("approve: %d %s", rec.Code, rec.Body)
+	}
+	if r := f.doAs(pat, "GET", "/v1/projects", nil); r.Code != 200 {
+		t.Fatalf("the token after the approval: %d %s", r.Code, r.Body)
+	}
+}
+
+// A provider removal that stops at GoTrue can be run again: sbctl's record is still there. A
+// provider that GoTrue has lost already is as good as removed.
+func TestSSORemovingAProviderThatGoTrueRefusedCanBeRetried(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	if rec := f.doAs(f.ssoToken(ssoUser1, "alice@acme.test", id), "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("first sign-in: %d", rec.Code)
+	}
+	f.gt.sso.failNext = 500
+	if rec := f.as("owner", "DELETE", orgSSO+"/providers/"+id, nil); rec.Code != 502 {
+		t.Fatalf("removal while GoTrue fails: %d %s, want 502", rec.Code, rec.Body)
+	}
+	if _, err := f.srv.sso.Store.GetProvider(ctx, id); err != nil {
+		t.Fatalf("sbctl's record went with a removal that failed at GoTrue: %v", err)
+	}
+	if rec := f.as("owner", "DELETE", orgSSO+"/providers/"+id, nil); rec.Code != 200 {
+		t.Fatalf("retry: %d %s", rec.Code, rec.Body)
+	}
+	if got := f.gt.sso.ids(); len(got) != 0 {
+		t.Fatalf("GoTrue still has %v", got)
+	}
+	if _, err := f.srv.sso.Store.GetProvider(ctx, id); err == nil {
+		t.Fatal("the record is still there after the retry")
+	}
+	if rule, err := f.srv.members.Store.GetDomainDefault(ctx, "acme.test"); err == nil {
+		t.Fatalf("the domain's rule outlived the provider: %+v", rule)
+	}
+
+	// GoTrue lost the provider (an earlier removal got that far): the removal finishes.
+	id = f.addProvider(otherIdP, "", "other.test")
+	f.gt.sso.mu.Lock()
+	delete(f.gt.sso.providers, id)
+	f.gt.sso.mu.Unlock()
+	if rec := f.as("owner", "DELETE", orgSSO+"/providers/"+id, nil); rec.Code != 200 {
+		t.Fatalf("removal of a provider GoTrue no longer has: %d %s", rec.Code, rec.Body)
+	}
+	if _, err := f.srv.sso.Store.GetProvider(ctx, id); err == nil {
+		t.Fatal("the record is still there")
 	}
 }

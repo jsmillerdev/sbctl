@@ -81,7 +81,10 @@ SSO". A person signs in with an email address of one of the provider's domains. 
 sign-in they become a member of the provider's organization with the default role, and only the
 domains that a provider vouches for can do that. Anyone else who signs in through a registered
 provider is refused on every route and listed by ` + "`sbctl sso pending`" + `, until an administrator
-approves them (` + "`sbctl sso approve`" + `) or deletes the account (` + "`sbctl sso deny`" + `).
+approves them (` + "`sbctl sso approve`" + `) or deletes the account (` + "`sbctl sso deny`" + `). A denial, and
+` + "`sbctl users remove`" + ` of an SSO account, are remembered by email address: the person's next sign-in
+creates a new account that waits for approval and does not get the default role again, until an
+administrator approves it or runs ` + "`sbctl sso allow`" + `.
 
 Projects have identity providers of their own for their end users: use the Supabase CLI,
 ` + "`supabase sso add --project-ref <ref>`" + `, with the profile of this node.`,
@@ -338,7 +341,10 @@ and memberships stay (` + "`sbctl users remove <email>`" + ` deletes one). The r
 	deny := &cobra.Command{
 		Use:   "deny <email|user id>",
 		Short: "Refuse a waiting person: the account is deleted",
-		Args:  cobra.ExactArgs(1),
+		Long: `Deletes the account of a waiting person and ends their sessions. The refusal is kept by email
+address: signing in again creates a new account, which waits for approval again and does not get the
+provider's default role. Approving that account (sbctl sso approve), or sbctl sso allow, lifts it.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			d, _, _, closeFn, err := openSSO(cmd)
 			if err != nil {
@@ -357,6 +363,43 @@ and memberships stay (` + "`sbctl users remove <email>`" + ` deletes one). The r
 		},
 	}
 
-	ssoCmd.AddCommand(add, list, info, remove, pending, approve, deny)
+	var allowProvider string
+	allow := &cobra.Command{
+		Use:   "allow <email>",
+		Short: "Lift the refusal of an address: the default role applies again",
+		Long: `Forgets that an administrator denied an address (sbctl sso deny) or removed its SSO account
+(sbctl users remove), so that the person's next request gets the provider's default role, if it has
+one (an account of theirs that is waiting is treated as new). The provider is the one that serves the address's domain; --provider names it by id when the
+domain has changed hands. Approving the person's waiting account (sbctl sso approve) lifts the
+refusal too.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			d, _, _, closeFn, err := openSSO(cmd)
+			if err != nil {
+				return err
+			}
+			defer closeFn()
+			who := allowProvider
+			if who == "" {
+				at := strings.LastIndex(args[0], "@")
+				if at < 0 {
+					return fmt.Errorf("%q is not an email address", args[0])
+				}
+				who = args[0][at+1:]
+			}
+			p, err := d.Find(cmd.Context(), who)
+			if err != nil {
+				return err
+			}
+			if err := d.Allow(cmd.Context(), p.ID, args[0]); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s is no longer refused at %s\n", strings.ToLower(args[0]), p.ID)
+			return nil
+		},
+	}
+	allow.Flags().StringVar(&allowProvider, "provider", "", "the identity provider (id or domain) instead of the address's domain")
+
+	ssoCmd.AddCommand(add, list, info, remove, pending, approve, deny, allow)
 	rootCmd.AddCommand(ssoCmd)
 }

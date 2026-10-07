@@ -58,6 +58,15 @@ type SSOStore interface {
 	// for every provider), oldest first.
 	ListSSOUsers(ctx context.Context, state string, providers []string) ([]SSOUser, error)
 	DeleteSSOUser(ctx context.Context, userID string) error
+
+	// DenySSOEmail records that an administrator refused the address at the provider (a denial, or
+	// the removal of the account): the provider's default role is not given to it again. It
+	// records nothing for a provider that is not registered, and is idempotent.
+	DenySSOEmail(ctx context.Context, providerID, email string, at time.Time) error
+	// AllowSSOEmail forgets the refusal; it reports whether there was one.
+	AllowSSOEmail(ctx context.Context, providerID, email string) (bool, error)
+	// SSOEmailDenied reports whether the address was refused at the provider.
+	SSOEmailDenied(ctx context.Context, providerID, email string) (bool, error)
 }
 
 // PGSSOStore is the Postgres SSOStore over the registry's pool.
@@ -217,6 +226,32 @@ func (s *PGSSOStore) DeleteSSOUser(ctx context.Context, userID string) error {
 	return err
 }
 
+func (s *PGSSOStore) DenySSOEmail(ctx context.Context, providerID, email string, at time.Time) error {
+	if !validUUID(providerID) {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `insert into sbctl.sso_denied (provider_id, email, denied_at)
+		select id, lower($2::text), $3::timestamptz from sbctl.sso_providers where id = $1 on conflict do nothing`, providerID, email, at)
+	return err
+}
+
+func (s *PGSSOStore) AllowSSOEmail(ctx context.Context, providerID, email string) (bool, error) {
+	if !validUUID(providerID) {
+		return false, nil
+	}
+	tag, err := s.pool.Exec(ctx, `delete from sbctl.sso_denied where provider_id = $1 and email = lower($2::text)`, providerID, email)
+	return tag.RowsAffected() > 0, err
+}
+
+func (s *PGSSOStore) SSOEmailDenied(ctx context.Context, providerID, email string) (bool, error) {
+	if !validUUID(providerID) {
+		return false, nil
+	}
+	var ok bool
+	err := s.pool.QueryRow(ctx, `select exists (select 1 from sbctl.sso_denied where provider_id = $1 and email = lower($2::text))`, providerID, email).Scan(&ok)
+	return ok, err
+}
+
 // validUUID reports whether s is a UUID, so that a malformed id from a request is a miss and
 // not a Postgres error.
 func validUUID(s string) bool {
@@ -242,11 +277,12 @@ type MemorySSOStore struct {
 	mu        sync.Mutex
 	providers map[string]SSOProviderRow
 	users     map[string]SSOUser
+	denied    map[string]bool // provider id + "\x00" + lower-case email
 }
 
 // NewMemorySSOStore returns an empty MemorySSOStore.
 func NewMemorySSOStore() *MemorySSOStore {
-	return &MemorySSOStore{providers: map[string]SSOProviderRow{}, users: map[string]SSOUser{}}
+	return &MemorySSOStore{providers: map[string]SSOProviderRow{}, users: map[string]SSOUser{}, denied: map[string]bool{}}
 }
 
 func (m *MemorySSOStore) PutProvider(_ context.Context, p SSOProviderRow) error {
@@ -297,6 +333,11 @@ func (m *MemorySSOStore) DeleteProvider(_ context.Context, id string) ([]SSOUser
 		return nil, ErrNotFound
 	}
 	delete(m.providers, id)
+	for k := range m.denied {
+		if strings.HasPrefix(k, id+"\x00") {
+			delete(m.denied, k)
+		}
+	}
 	var gone []SSOUser
 	for k, u := range m.users {
 		if u.ProviderID == id {
@@ -364,4 +405,32 @@ func (m *MemorySSOStore) DeleteSSOUser(_ context.Context, userID string) error {
 	defer m.mu.Unlock()
 	delete(m.users, userID)
 	return nil
+}
+
+func deniedKey(providerID, email string) string {
+	return strings.ToLower(providerID) + "\x00" + strings.ToLower(email)
+}
+
+func (m *MemorySSOStore) DenySSOEmail(_ context.Context, providerID, email string, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.providers[strings.ToLower(providerID)]; ok {
+		m.denied[deniedKey(providerID, email)] = true
+	}
+	return nil
+}
+
+func (m *MemorySSOStore) AllowSSOEmail(_ context.Context, providerID, email string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := deniedKey(providerID, email)
+	was := m.denied[k]
+	delete(m.denied, k)
+	return was, nil
+}
+
+func (m *MemorySSOStore) SSOEmailDenied(_ context.Context, providerID, email string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.denied[deniedKey(providerID, email)], nil
 }
