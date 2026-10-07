@@ -12,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/spf13/pflag"
 
 	"github.com/jsmillerdev/supavise/internal/registry"
 )
@@ -77,17 +76,17 @@ func orgsNode(t *testing.T) (cfgPath string, reg *registry.Postgres) {
 // first.
 func runOrgs(t *testing.T, cfg string, args ...string) (string, error) {
 	t.Helper()
-	for _, sub := range []string{"list", "delete"} {
+	for sub, flag := range map[string]string{"list": "json", "delete": "yes"} {
 		c, _, err := rootCmd.Find([]string{"orgs", sub})
 		if err != nil {
 			t.Fatal(err)
 		}
-		c.Flags().VisitAll(func(f *pflag.Flag) {
-			if f.Value.Type() == "bool" {
-				_ = f.Value.Set("false")
-				f.Changed = false
-			}
-		})
+		f := c.Flags().Lookup(flag)
+		if f == nil {
+			t.Fatalf("orgs %s has no --%s", sub, flag)
+		}
+		_ = f.Value.Set("false")
+		f.Changed = false
 	}
 	return runRoot(t, append([]string{"--config", cfg, "orgs"}, args...)...)
 }
