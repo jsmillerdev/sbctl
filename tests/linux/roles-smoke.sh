@@ -292,7 +292,8 @@ expect 403 "${PAT[dev]}" PATCH "$CFG/database/password" '{"password":"a-new-data
 # A branch with data copies production data: Owner and Administrator only (a schema-only branch is the Developer's).
 expect 403 "${PAT[dev]}" POST "$CFG/branches" '{"branch_name":"dev-data","with_data":true}'
 expect 403 "${PAT[ro]}" POST "$CFG/branches" '{"branch_name":"ro-data","with_data":true}'
-[[ $(body "${PAT[owner]}" GET "$CFG/branches" | json_get 'len(d)') == 0 ]] || fail "a refused branch with data was created"
+# The list has the default branch (the project itself); nothing else may have been made.
+[[ $(body "${PAT[owner]}" GET "$CFG/branches" | json_get 'len([b for b in d if not b.get("is_default")])') == 0 ]] || fail "a refused branch with data was created"
 expect 403 "${PAT[dev]}" POST "/v1/projects" "{\"name\":\"nope\",\"organization_slug\":\"$ORG\",\"db_pass\":\"correct-horse-battery\"}"
 
 log "Administrator: settings and members, never Owners"
