@@ -46,6 +46,13 @@ type Options struct {
 	// DataDir returns a project's Postgres data directory, used by in-place restore.
 	// Default: config.Paths.ProjectService(ref, "postgres").
 	DataDir func(ref string) string
+	// StorageDir returns the directory holding a project's Storage objects, or "" when the
+	// node keeps none on disk. Default: config.Paths.StorageObjects(ref), or "" when
+	// [fleet] storage_backend is "s3".
+	StorageDir func(ref string) string
+	// Functions is the registry's Edge Function store. Without it Edge Functions are
+	// neither backed up nor restored.
+	Functions Functions
 	// Version is recorded in backup manifests.
 	Version string
 	Now     func() time.Time

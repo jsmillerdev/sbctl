@@ -403,7 +403,7 @@ func (s *Service) cloneParent(ctx context.Context, parentRef, method, dstData st
 func (s *Service) createFromBackup(ctx context.Context, j *createJob) error {
 	// The restore creates its project through this Manager, which stamps it as a branch.
 	bs := s.bk.WithManager(stampManager{Manager: s.eng, info: j.info, class: j.class, recreate: j.recreate})
-	if _, err := bs.RestoreWith(ctx, j.parent.Ref, s.now(), j.ref, backup.RestoreOptions{Latest: true, IntoFailedRow: j.recreate}); err != nil {
+	if _, err := bs.RestoreWith(ctx, j.parent.Ref, s.now(), j.ref, backup.RestoreOptions{Latest: true, IntoFailedRow: j.recreate, SkipFiles: true}); err != nil {
 		return fmt.Errorf("restore the parent's base backup: %w", err)
 	}
 	p, err := s.reg.GetProject(ctx, j.ref)

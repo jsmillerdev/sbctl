@@ -54,6 +54,12 @@ type RestoreOptions struct {
 	// taken. The Manager passed to WithManager must then create with Recreate set. Branch
 	// reset uses it so that a failed reset leaves the branch registered.
 	IntoFailedRow bool
+	// SkipFiles restores the database only. By default the project's Storage objects and
+	// function deployments come back too, from the newest snapshot at or before the
+	// target (RestoreFiles). Branching passes it: a branch does not copy its parent's files.
+	SkipFiles bool
+	// Progress receives one line per notable step of the file restore (default: dropped).
+	Progress func(msg string)
 }
 
 func (o RestoreOptions) mode() (string, error) {
@@ -201,6 +207,9 @@ func (s *Service) RestoreWith(ctx context.Context, ref string, target time.Time,
 	if mode != RestoreToBackup {
 		s.flushArchive(ctx, ref)
 	}
+	if mode == RestoreToLatest && !opts.SkipFiles {
+		s.refreshFiles(ctx, ref)
+	}
 	plan, err := s.PlanRestoreWith(ctx, ref, target, opts)
 	if err != nil {
 		return nil, err
@@ -221,8 +230,42 @@ func (s *Service) RestoreWith(ctx context.Context, ref string, target time.Time,
 		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.failed", map[string]any{"mode": mode, "target": target, "as": newRef, "error": err.Error()})
 		return nil, err
 	}
-	_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.completed", map[string]any{"mode": mode, "target": target, "as": p.Ref, "backup": plan.Manifest.ID})
+	ev := map[string]any{"mode": mode, "target": target, "as": p.Ref, "backup": plan.Manifest.ID}
+	var ferr error
+	if !opts.SkipFiles {
+		fo := FilesRestoreOptions{Progress: opts.Progress}
+		switch mode {
+		case RestoreToLatest:
+			fo.Latest = true
+		case RestoreToBackup:
+			fo.At = plan.Manifest.StopTime
+		default:
+			fo.At = target
+		}
+		var fres *FilesRestoreResult
+		fres, ferr = s.RestoreFiles(ctx, ref, p.Ref, fo)
+		if fres != nil {
+			ev["files"] = fres.Notes
+		}
+	}
+	_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.completed", ev)
+	if ferr != nil {
+		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.files_failed", map[string]any{"as": p.Ref, "error": ferr.Error()})
+		return p, fmt.Errorf("backup: the database of %s was restored as %s, but its Storage objects or functions were not (fix the cause and run `supavise backups restore-files`): %w", ref, p.Ref, ferr)
+	}
 	return p, nil
+}
+
+// refreshFiles snapshots the files of a registered source before a restore to "latest", so
+// that "latest" means the state of its objects now, like it does for its database. A
+// failure is logged and the restore goes on with the newest snapshot there is.
+func (s *Service) refreshFiles(ctx context.Context, ref string) {
+	if _, err := s.opt.Registry.GetProject(ctx, ref); err != nil {
+		return // a deleted project: its final backup holds the last state
+	}
+	if _, err := s.BackupFiles(ctx, ref, FilesOptions{Reason: ReasonManual}); err != nil {
+		s.opt.Log.Warn("could not snapshot the source's files before restoring to latest; using the newest snapshot", "ref", ref, "err", err)
+	}
 }
 
 func (s *Service) restoreAsNew(ctx context.Context, plan *RestorePlan, src *secrets.ProjectKeys) (*registry.Project, error) {

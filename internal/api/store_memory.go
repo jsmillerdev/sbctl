@@ -182,6 +182,16 @@ func (m *MemoryStore) UpsertFunction(_ context.Context, f *Function, files []Fun
 	return nil
 }
 
+func (m *MemoryStore) RestoreFunction(_ context.Context, f Function, files []FunctionFile) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := fkey(f.Ref, f.Slug)
+	cp := f
+	m.functions[k] = &cp
+	m.files[k] = append([]FunctionFile(nil), files...)
+	return nil
+}
+
 func (m *MemoryStore) ListFunctions(_ context.Context, ref string) ([]Function, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

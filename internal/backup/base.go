@@ -35,8 +35,18 @@ func (s *Service) BaseBackup(ctx context.Context, ref string) (*registry.Backup,
 // FinalBackup is the delete-time hook: lifecycle.Manager.Delete calls it while the
 // project's cluster is still running and aborts the delete if it fails. It also
 // satisfies lifecycle.DataPlane.Snapshot's shape.
+//
+// The project's Storage objects and function deployments are snapshotted too (BackupFiles):
+// the delete removes them with everything else, and a restore of the final state wants them back.
 func (s *Service) FinalBackup(ctx context.Context, ref string) (*registry.Backup, error) {
-	return s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonFinal})
+	rec, err := s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonFinal})
+	if err != nil {
+		return rec, err
+	}
+	if _, err := s.BackupFiles(ctx, ref, FilesOptions{Reason: ReasonFinal}); err != nil {
+		return rec, fmt.Errorf("backup: final backup of the files of %s failed: %w", ref, err)
+	}
+	return rec, nil
 }
 
 // BaseBackupWith takes a base backup of ref's running cluster.

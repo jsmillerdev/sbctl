@@ -169,6 +169,30 @@ func (s *PGStore) UpsertFunction(ctx context.Context, f *Function, files []Funct
 	})
 }
 
+func (s *PGStore) RestoreFunction(ctx context.Context, f Function, files []FunctionFile) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			insert into supavise.api_functions (ref, slug, id, name, version, status, verify_jwt, entrypoint_path, import_map_path, created_at, updated_at)
+			values ($1, $2, $3::uuid, $4, $5, $6, $7, nullif($8,''), nullif($9,''), $10, $11)
+			on conflict (ref, slug) do update set id = excluded.id, name = excluded.name, version = excluded.version,
+			  status = excluded.status, verify_jwt = excluded.verify_jwt, entrypoint_path = excluded.entrypoint_path,
+			  import_map_path = excluded.import_map_path, created_at = excluded.created_at, updated_at = excluded.updated_at`,
+			f.Ref, f.Slug, f.ID, f.Name, f.Version, f.Status, f.VerifyJWT, f.EntrypointPath, f.ImportMapPath, f.CreatedAt, f.UpdatedAt); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `delete from supavise.api_function_files where ref = $1 and slug = $2`, f.Ref, f.Slug); err != nil {
+			return err
+		}
+		for _, file := range files {
+			if _, err := tx.Exec(ctx, `insert into supavise.api_function_files (ref, slug, path, content) values ($1,$2,$3,$4)`,
+				f.Ref, f.Slug, file.Path, file.Content); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (s *PGStore) ListFunctions(ctx context.Context, ref string) ([]Function, error) {
 	rows, err := s.pool.Query(ctx, `select `+fnCols+` from supavise.api_functions where ref = $1 order by slug`, ref)
 	if err != nil {

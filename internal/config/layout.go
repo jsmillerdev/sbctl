@@ -175,6 +175,19 @@ func (p Paths) RestoreSources(ref string) string {
 }
 
 func (p Paths) System(svc string) string { return filepath.Join(p.Root, "system", svc) }
+
+// StorageFileBucket is the first path component under the Storage file backend's directory
+// (STORAGE_S3_BUCKET). "stub" is what upstream's compose and the dockerless CLI use, so
+// layouts stay interchangeable.
+const StorageFileBucket = "stub"
+
+// StorageObjects is the directory holding one project's Storage objects when the file
+// backend is in use (<state>/system/storage/objects/stub/<ref>): Storage writes every
+// object of its tenant ref below it as <bucket>/<name>/<version>, and keeps the content
+// type and cache headers in extended attributes of those files.
+func (p Paths) StorageObjects(ref string) string {
+	return filepath.Join(p.System(SvcStorage), "objects", StorageFileBucket, ref)
+}
 func (p Paths) Certs() string            { return filepath.Join(p.Root, "certs") }
 func (p Paths) Backups() string          { return filepath.Join(p.Root, "backups") }
 

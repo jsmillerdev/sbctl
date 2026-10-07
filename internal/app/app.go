@@ -17,6 +17,7 @@ import (
 	"github.com/jsmillerdev/supavise/internal/backup"
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/functions"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/registry"
 	"github.com/jsmillerdev/supavise/internal/secrets"
@@ -93,9 +94,16 @@ func NewBackupService(ctx context.Context, cfg *config.Config, reg registry.Regi
 	if err != nil {
 		return nil, err
 	}
+	// Edge Function deployments live in the registry's database; only a Postgres registry
+	// has them.
+	var fns backup.Functions
+	if pg, ok := reg.(*registry.Postgres); ok {
+		fns = functions.BackupStore(api.NewPGStore(pg.Pool()))
+	}
 	return backup.New(backup.Options{
 		Config: cfg, Registry: reg, Store: store, Secrets: sec,
 		Access:     backup.AccessFromRegistry(cfg, reg, sec),
+		Functions:  fns,
 		ConfigPath: o.ConfigPath, Version: o.Version, Log: o.log(),
 	})
 }

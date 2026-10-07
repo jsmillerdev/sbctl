@@ -21,6 +21,10 @@ type PruneResult struct {
 	DeletedBackups []string
 	DeletedWAL     int
 	DeletedOrphans int
+	// DeletedFileSnapshots and DeletedBlobs count the Storage and function snapshots outside
+	// the window and the file contents no kept snapshot lists (files.go).
+	DeletedFileSnapshots int
+	DeletedBlobs         int
 }
 
 // retainedBackups applies the retention rule to backups (oldest first). A backup is
@@ -87,7 +91,8 @@ func walNeeded(name string, retained []Manifest) bool {
 // Prune applies config.Backup.RetentionDays to ref: it deletes base backups outside
 // the window (always keeping at least one, see retainedBackups), the WAL no kept
 // backup needs, and abandoned uploads, and drops the matching registry rows. With
-// no base backup at all it deletes nothing, because WAL alone restores nothing.
+// no base backup at all it deletes nothing, because WAL alone restores nothing. The
+// Storage and function snapshots follow the same window (pruneFiles).
 func (s *Service) Prune(ctx context.Context, ref string) (*PruneResult, error) {
 	if err := validRef(ref); err != nil {
 		return nil, err
@@ -95,6 +100,15 @@ func (s *Service) Prune(ctx context.Context, ref string) (*PruneResult, error) {
 	if err := s.need("config", s.opt.Config != nil); err != nil {
 		return nil, err
 	}
+	res, err := s.pruneBase(ctx, ref)
+	if err != nil {
+		return res, err
+	}
+	return res, s.pruneFiles(ctx, ref, res)
+}
+
+// pruneBase is Prune for base backups and WAL.
+func (s *Service) pruneBase(ctx context.Context, ref string) (*PruneResult, error) {
 	res := &PruneResult{Ref: ref}
 	days := s.opt.Config.Backup.RetentionDays
 	if days <= 0 {
