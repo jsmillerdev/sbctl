@@ -11,6 +11,7 @@ import (
 
 	"github.com/OWNER/sbctl/internal/branching"
 	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/OWNER/sbctl/internal/registry"
 )
 
 // branchEngine adds DeleteWith to the fake manager.
@@ -210,6 +211,70 @@ func TestBranches(t *testing.T) {
 	if rec := f.do("POST", "/v1/projects/"+testRef+"/branches", map[string]any{"branch_name": "main"}); rec.Code != 400 || jsonField(t, rec, "message") == "" {
 		t.Fatalf("reserved name: %d %s", rec.Code, rec.Body)
 	}
+}
+
+func TestBranchRequestsThatCannotBeHonoredAreRefused(t *testing.T) {
+	f := newFixture(t)
+	create := func(body map[string]any) *httptest.ResponseRecorder {
+		body["branch_name"] = "x"
+		return f.do("POST", "/v1/projects/"+testRef+"/branches", body)
+	}
+	for name, body := range map[string]map[string]any{
+		"secrets":         {"secrets": map[string]string{"A": "b"}},
+		"release channel": {"release_channel": "preview"},
+		"postgres engine": {"postgres_engine": "15"},
+	} {
+		if rec := create(body); rec.Code != 400 {
+			t.Errorf("%s: %d %s", name, rec.Code, rec.Body)
+		}
+	}
+	if rec := f.do("GET", "/v1/projects/"+testRef+"/branches", nil); len(decodeBody(t, rec).([]any)) != 1 {
+		t.Fatalf("a refused create left a branch: %s", rec.Body)
+	}
+	// Empty secrets, the node's own engine and the ga channel are fine.
+	if rec := create(map[string]any{"secrets": map[string]string{}, "release_channel": "ga", "postgres_engine": "17"}); rec.Code != 201 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	br := f.waitBranch(t, "x", "MIGRATIONS_PASSED")
+	id := br["id"].(string)
+	if rec := f.do("PATCH", "/v1/branches/"+id, map[string]any{"status": "CREATING_PROJECT"}); rec.Code != 400 {
+		t.Errorf("setting the status: %d %s", rec.Code, rec.Body)
+	}
+	if rec := f.do("PATCH", "/v1/branches/"+id, map[string]any{"status": "MIGRATIONS_PASSED", "reset_on_push": true, "persistent": true}); rec.Code != 200 {
+		t.Errorf("an unchanged status and the deprecated reset_on_push are accepted: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// with_data on a node that cannot clone and has no backup is something the user can fix: 400.
+func TestBranchWithDataWithoutAWayIs400(t *testing.T) {
+	f := newFixture(t)
+	f.cfg.Branching.Clone = "backup"
+	rec := f.do("POST", "/v1/projects/"+testRef+"/branches", map[string]any{"branch_name": "d", "with_data": true})
+	if rec.Code != 400 || !strings.Contains(jsonField(t, rec, "message").(string), "with_data is not possible") {
+		t.Fatalf("with_data: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// The detail of the default branch does not hand out the project's secrets, and a branch whose
+// credentials are not stored yet answers without them instead of failing.
+func TestBranchDetailSecrets(t *testing.T) {
+	f := newFixture(t)
+	rec := f.do("GET", "/v1/branches/"+testRef, nil)
+	if rec.Code != 200 || jsonField(t, rec, "ref") != testRef || jsonField(t, rec, "db_pass") != nil || jsonField(t, rec, "jwt_secret") != nil {
+		t.Fatalf("default branch detail: %d %s", rec.Code, rec.Body)
+	}
+	validateAgainstSpec(t, "GET /v1/branches/{branch_id_or_ref}", rec.Body.Bytes())
+
+	const ref = "wwwwwwwwwwwwwwwwwwww"
+	if err := f.reg.CreateProject(context.Background(), &registry.Project{Ref: ref, Name: "w", Status: registry.StatusComingUp,
+		Branch: &registry.BranchInfo{ID: "6f9619ff-8b86-4011-b42d-00c04fc964ff", ParentRef: testRef, Name: "w", State: registry.BranchCreatingProject}}); err != nil {
+		t.Fatal(err)
+	}
+	rec = f.do("GET", "/v1/branches/"+ref, nil)
+	if rec.Code != 200 || jsonField(t, rec, "ref") != ref || jsonField(t, rec, "db_pass") != nil {
+		t.Fatalf("branch without credentials yet: %d %s", rec.Code, rec.Body)
+	}
+	validateAgainstSpec(t, "GET /v1/branches/{branch_id_or_ref}", rec.Body.Bytes())
 }
 
 func TestBranchesWithoutService(t *testing.T) {

@@ -21,11 +21,10 @@ var errNoClone = errors.New("branching: copy-on-write cloning is not supported h
 
 // Copy-on-write methods, as recorded on the branch (registry.BranchInfo.CloneMethod).
 const (
-	MethodSchema    = "schema"       // empty cluster plus the parent's migrations
-	MethodClonefile = "clonefile"    // APFS clonefile(2)
-	MethodReflink   = "reflink"      // FICLONE on XFS, btrfs, OpenZFS 2.2+
-	MethodZFS       = "zfs-snapshot" // zfs snapshot of the dataset, copied from the snapshot
-	MethodBackup    = "base-backup"  // restore of the parent's latest base backup plus WAL
+	MethodSchema    = "schema"      // empty cluster plus the parent's migrations
+	MethodClonefile = "clonefile"   // APFS clonefile(2)
+	MethodReflink   = "reflink"     // FICLONE on XFS, btrfs, OpenZFS 2.2+
+	MethodBackup    = "base-backup" // restore of the parent's latest base backup plus WAL
 )
 
 // CloneStats reports one copy-on-write clone of a data directory.

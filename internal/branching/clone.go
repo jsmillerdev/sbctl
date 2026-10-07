@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -41,8 +39,7 @@ type cloneSource struct {
 // no archive is needed, so it works on a node without a backup backend. Nothing in the
 // clone points at the parent's archive; the plane gives the clone its own archive_command.
 type cloner struct {
-	method string // MethodClonefile, MethodReflink or MethodZFS
-	zfs    zfsRunner
+	method string // MethodClonefile or MethodReflink
 	log    *slog.Logger
 	// attempts bounds retries after a recycled WAL segment (default 3).
 	attempts int
@@ -127,18 +124,9 @@ func (c *cloner) once(ctx context.Context, src cloneSource, dstData string) (*Cl
 		return nil, err
 	}
 
-	srcRoot := f.DataDir
 	cp := &copier{ctx: ctx, clone: cloneFile, byteCopy: true, stats: st}
-	if c.method == MethodZFS {
-		snapRoot, cleanup, err := c.zfsSnapshot(ctx, f.DataDir)
-		if err != nil {
-			return nil, err
-		}
-		defer cleanup()
-		srcRoot = snapRoot
-	}
 	copyStart := time.Now()
-	if err := cp.copyDataDir(srcRoot, dstData); err != nil {
+	if err := cp.copyDataDir(f.DataDir, dstData); err != nil {
 		return nil, err
 	}
 	st.CopyMillis = time.Since(copyStart).Milliseconds()
@@ -250,59 +238,10 @@ func walRange(first, last string, segSize int64) ([]string, error) {
 	}
 }
 
-// zfsRunner runs the zfs command; tests replace it.
-type zfsRunner interface {
-	Run(ctx context.Context, args ...string) (string, error)
-}
-
-type execZFS struct{}
-
-func (execZFS) Run(ctx context.Context, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, "zfs", args...).CombinedOutput()
-	return strings.TrimSpace(string(out)), err
-}
-
-// zfsSnapshot snapshots the dataset that holds dataDir and returns the path of dataDir
-// inside the snapshot (<mountpoint>/.zfs/snapshot/<name>/<relative path>), plus a cleanup
-// that destroys the snapshot. The snapshot is atomic, so the copy from it is a consistent
-// image of the moment it was taken, which lies between pg_backup_start and pg_backup_stop.
-// Needs the sbctl user to hold snapshot and destroy rights on the dataset (zfs allow).
-func (c *cloner) zfsSnapshot(ctx context.Context, dataDir string) (string, func(), error) {
-	real, err := filepath.EvalSymlinks(dataDir)
-	if err != nil {
-		return "", nil, err
-	}
-	out, err := c.zfs.Run(ctx, "list", "-H", "-o", "name,mountpoint", real)
-	if err != nil {
-		return "", nil, fmt.Errorf("zfs list %s: %w: %s", real, err, out)
-	}
-	fields := strings.Fields(out)
-	if len(fields) != 2 {
-		return "", nil, fmt.Errorf("zfs list %s: unexpected output %q", real, out)
-	}
-	dataset, mount := fields[0], fields[1]
-	rel, err := filepath.Rel(mount, real)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return "", nil, fmt.Errorf("data directory %s is not under the mountpoint %s of %s", real, mount, dataset)
-	}
-	snap := "sbctl-branch-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	if out, err := c.zfs.Run(ctx, "snapshot", dataset+"@"+snap); err != nil {
-		return "", nil, fmt.Errorf("zfs snapshot %s@%s: %w: %s", dataset, snap, err, out)
-	}
-	cleanup := func() {
-		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		if out, err := c.zfs.Run(cctx, "destroy", dataset+"@"+snap); err != nil {
-			c.log.Warn("could not destroy the clone snapshot", "snapshot", dataset+"@"+snap, "err", err, "output", out)
-		}
-	}
-	return filepath.Join(mount, ".zfs", "snapshot", snap, rel), cleanup, nil
-}
-
 // detectClone decides how a clone of the data directory srcData into a directory under
 // dstParent can be made. method is "" when copy-on-write is not available, with reason
 // saying why (it ends up in the branch's detail).
-func detectClone(srcData, dstParent string, zfs zfsRunner) (method, fsys, reason string) {
+func detectClone(srcData, dstParent string) (method, fsys, reason string) {
 	fsys = fsName(srcData)
 	if err := os.MkdirAll(dstParent, 0o700); err != nil {
 		return "", fsys, err.Error()
@@ -320,12 +259,11 @@ func detectClone(srcData, dstParent string, zfs zfsRunner) (method, fsys, reason
 	if !errors.Is(err, errNoClone) {
 		reason = fmt.Sprintf("file clone probe on %s failed: %v", fsys, err)
 	}
-	if fsys == "zfs" && zfs != nil {
-		if _, lerr := zfs.Run(context.Background(), "list", "-H", "-o", "name", srcData); lerr == nil {
-			return MethodZFS, fsys, ""
-		} else {
-			reason += "; zfs is not usable: " + lerr.Error()
-		}
+	if fsys == "zfs" {
+		// A snapshot of the dataset would still be copied byte by byte, and a zfs clone needs one
+		// dataset per project, which the state directory does not have. Only block cloning (the
+		// FICLONE probe above) gives a copy that does not grow with the database.
+		reason += " (OpenZFS block cloning needs release 2.2 or later with the block_cloning feature active and cloning enabled; a snapshot copy would not be copy-on-write)"
 	}
 	return "", fsys, reason
 }

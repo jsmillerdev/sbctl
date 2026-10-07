@@ -72,9 +72,10 @@ type Service struct {
 
 	// Seams for tests.
 	detect func(srcData, dstParent string) (method, fsys, reason string)
-	zfs    zfsRunner
 	rotate func(ctx context.Context, ref string) error
-	clone  func(ctx context.Context, parentRef, method, dstData string) (*CloneStats, error)
+	// isolate switches off the integrations a cloned cluster inherited (isolateBranch).
+	isolate func(ctx context.Context, ref string) error
+	clone   func(ctx context.Context, parentRef, method, dstData string) (*CloneStats, error)
 
 	mu   sync.Mutex
 	runs map[string]*run // by branch ref
@@ -101,7 +102,7 @@ func New(d Deps) (*Service, error) {
 	s := &Service{
 		cfg: d.Cfg, reg: d.Registry, sec: d.Secrets, eng: d.Engine, bk: d.Backup, db: d.DB, log: d.Log, now: d.Now,
 		http: d.HTTPClient, createWait: d.CreateWait, opTimeout: d.OpTimeout, staleAfter: d.StaleAfter,
-		detect: nil, zfs: execZFS{}, runs: map[string]*run{},
+		detect: nil, runs: map[string]*run{},
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
@@ -127,9 +128,10 @@ func New(d Deps) (*Service, error) {
 		s.http = newNotifyClient(d.Cfg.Branching.AllowPrivateNotifyURLs)
 	}
 	s.detect = func(srcData, dstParent string) (string, string, string) {
-		return detectClone(srcData, dstParent, s.zfs)
+		return detectClone(srcData, dstParent)
 	}
 	s.rotate = s.rotateCredentials
+	s.isolate = s.isolateBranch
 	s.clone = s.cloneParent
 	s.base, s.stop = context.WithCancel(context.Background())
 	return s, nil

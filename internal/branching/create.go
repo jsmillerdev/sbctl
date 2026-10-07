@@ -185,12 +185,15 @@ type createJob struct {
 	upTo string
 	// keepExpiry leaves expires_at alone when the branch is ready (a reset keeps the lifetime).
 	keepExpiry bool
+	// recreate builds the cluster over the branch's existing registry row, which a reset keeps
+	// (lifecycle.DeleteOptions.KeepRecord), so that a failure leaves the branch registered.
+	recreate bool
 }
 
 // doCreate is the body of a branch creation. It returns the detail recorded on success.
 func (s *Service) doCreate(ctx context.Context, j *createJob) (string, error) {
 	req := lifecycle.CreateRequest{
-		Name: j.in.Name, OrgSlug: j.org, Region: j.parent.Region, Class: j.class, Ref: j.ref, Branch: j.info,
+		Name: j.in.Name, OrgSlug: j.org, Region: j.parent.Region, Class: j.class, Ref: j.ref, Branch: j.info, Recreate: j.recreate,
 	}
 	method := MethodSchema
 	var stats *CloneStats
@@ -200,7 +203,7 @@ func (s *Service) doCreate(ctx context.Context, j *createJob) (string, error) {
 		if method == MethodSchema {
 			// Fail before anything exists rather than hand over an empty database that was
 			// asked to hold data.
-			return "", fmt.Errorf("with_data is not possible: %s", reason)
+			return "", invalid("with_data is not possible: %s", reason)
 		}
 	}
 	started := s.now()
@@ -234,8 +237,8 @@ func (s *Service) doCreate(ctx context.Context, j *createJob) (string, error) {
 		if _, err := s.eng.Create(ctx, req); err != nil {
 			return "", err
 		}
-		if err := s.rotate(ctx, j.ref); err != nil {
-			return "", s.quarantine(ctx, j.ref, fmt.Errorf("rotate the credentials of the clone: %w", err))
+		if err := s.detach(ctx, j.ref); err != nil {
+			return "", err
 		}
 	}
 	// Record how the data was made before the migrations run: a failure below still tells it.
@@ -317,7 +320,7 @@ func (s *Service) cloneParent(ctx context.Context, parentRef, method, dstData st
 	if err != nil {
 		return nil, err
 	}
-	c := &cloner{method: method, zfs: s.zfs, log: s.log}
+	c := &cloner{method: method, log: s.log}
 	return c.Clone(ctx, cloneSource{DSN: dsn}, dstData)
 }
 
@@ -325,8 +328,8 @@ func (s *Service) cloneParent(ctx context.Context, parentRef, method, dstData st
 // plus all archived WAL as a new project (internal/backup), then make it a branch.
 func (s *Service) createFromBackup(ctx context.Context, j *createJob) error {
 	// The restore creates its project through this Manager, which stamps it as a branch.
-	bs := s.bk.WithManager(stampManager{Manager: s.eng, info: j.info, class: j.class})
-	if _, err := bs.RestoreWith(ctx, j.parent.Ref, s.now(), j.ref, backup.RestoreOptions{Latest: true}); err != nil {
+	bs := s.bk.WithManager(stampManager{Manager: s.eng, info: j.info, class: j.class, recreate: j.recreate})
+	if _, err := bs.RestoreWith(ctx, j.parent.Ref, s.now(), j.ref, backup.RestoreOptions{Latest: true, IntoFailedRow: j.recreate}); err != nil {
 		return fmt.Errorf("restore the parent's base backup: %w", err)
 	}
 	p, err := s.reg.GetProject(ctx, j.ref)
@@ -337,8 +340,19 @@ func (s *Service) createFromBackup(ctx context.Context, j *createJob) error {
 		p.Name = j.in.Name
 		_ = s.reg.UpdateProject(ctx, p)
 	}
-	if err := s.rotate(ctx, j.ref); err != nil {
-		return s.quarantine(ctx, j.ref, fmt.Errorf("rotate the credentials of the restored branch: %w", err))
+	return s.detach(ctx, j.ref)
+}
+
+// detach makes a branch whose cluster came from the parent's data independent of the parent:
+// its outbound integrations are neutralized (isolateBranch), then its credentials rotate. A
+// failure stops the branch (quarantine): it would otherwise run with the parent's passwords
+// or with the parent's subscriptions and jobs.
+func (s *Service) detach(ctx context.Context, ref string) error {
+	if err := s.isolate(ctx, ref); err != nil {
+		return s.quarantine(ctx, ref, fmt.Errorf("isolate the branch from the parent's integrations: %w", err))
+	}
+	if err := s.rotate(ctx, ref); err != nil {
+		return s.quarantine(ctx, ref, fmt.Errorf("rotate the credentials of the branch: %w", err))
 	}
 	return nil
 }
@@ -347,25 +361,43 @@ func (s *Service) createFromBackup(ctx context.Context, j *createJob) error {
 // rotation failed, so that nobody holding the parent's credentials can open it, and returns
 // err with that said. The branch stays registered (MIGRATIONS_FAILED) for inspection, reset or delete.
 func (s *Service) quarantine(ctx context.Context, ref string, err error) error {
-	if perr := s.eng.Pause(context.WithoutCancel(ctx), ref); perr != nil {
+	perr := s.eng.Pause(context.WithoutCancel(ctx), ref)
+	if perr != nil {
+		// Already stopped (a restart that failed between its stop and its start) is what is wanted.
+		if p, gerr := s.reg.GetProject(ctx, ref); gerr == nil && p.Status == registry.StatusInactive {
+			perr = nil
+		}
+	}
+	if perr != nil {
 		s.log.Error("could not stop a branch that kept the parent's credentials", "ref", ref, "err", perr)
 		return fmt.Errorf("%w (the branch could not be stopped either: %v; delete it)", err, perr)
 	}
 	return fmt.Errorf("%w (the branch was stopped; delete it or reset it)", err)
 }
 
-// stampManager makes the projects a backup restore creates into branches, and sizes them.
+// stampManager makes the projects a backup restore creates into branches, sizes them, and has
+// the restored cluster start with the parent's integrations switched off (quarantineSettings).
 type stampManager struct {
 	lifecycle.Manager
-	info  *registry.BranchInfo
-	class string
+	info     *registry.BranchInfo
+	class    string
+	recreate bool
 }
 
 func (m stampManager) Create(ctx context.Context, req lifecycle.CreateRequest) (*registry.Project, error) {
 	b := *m.info
 	req.Branch = &b
+	req.Recreate = m.recreate
 	if m.class != "" {
 		req.Class = m.class
+	}
+	if seed := req.Seed; seed != nil {
+		req.Seed = func(ctx context.Context, p *registry.Project, dataDir string) error {
+			if err := seed(ctx, p, dataDir); err != nil {
+				return err
+			}
+			return writeQuarantine(dataDir)
+		}
 	}
 	return m.Manager.Create(ctx, req)
 }

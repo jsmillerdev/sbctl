@@ -28,27 +28,48 @@ type fakeEngine struct {
 	creates []lifecycle.CreateRequest
 	deletes []string
 	skipped map[string]bool // ref -> SkipFinalBackup of the last delete
-	rotated []string
-	paused  map[string]int
+	// keptRecord marks refs whose last delete kept the registry row.
+	keptRecord map[string]bool
+	rotated    []string
+	paused     map[string]int
 
 	createErr error
-	hold      chan struct{} // when set, Create waits for it to close (after the row exists)
+	// keysFailAfter, when > 0, makes Keys(parentRef) fail after that many successful calls.
+	keysFailAfter int
+	keyCalls      int
+	// failBeforeRow makes Create fail before it writes or touches the registry row.
+	failBeforeRow error
+	hold          chan struct{} // when set, Create waits for it to close (after the row exists)
 }
 
 func newFakeEngine(reg registry.Registry, sec secrets.Secrets) *fakeEngine {
-	return &fakeEngine{reg: reg, sec: sec, keys: map[string]*secrets.ProjectKeys{}, skipped: map[string]bool{}}
+	return &fakeEngine{reg: reg, sec: sec, keys: map[string]*secrets.ProjectKeys{}, skipped: map[string]bool{}, keptRecord: map[string]bool{}}
 }
 
 func (f *fakeEngine) Create(ctx context.Context, req lifecycle.CreateRequest) (*registry.Project, error) {
 	f.mu.Lock()
 	f.creates = append(f.creates, req)
 	f.mu.Unlock()
+	if f.failBeforeRow != nil {
+		return nil, f.failBeforeRow
+	}
 	p := &registry.Project{Ref: req.Ref, Name: req.Name, Class: req.Class, Status: registry.StatusComingUp}
 	if req.Branch != nil {
 		b := *req.Branch
 		p.Branch = &b
 	}
-	if err := f.reg.CreateProject(ctx, p); err != nil {
+	if req.Recreate {
+		cur, err := f.reg.GetProject(ctx, req.Ref)
+		if err != nil {
+			return nil, err
+		}
+		if cur.Status != registry.StatusInitFailed {
+			return nil, lifecycle.ErrInvalidState
+		}
+		if err := f.reg.SetProjectStatus(ctx, req.Ref, registry.StatusComingUp); err != nil {
+			return nil, err
+		}
+	} else if err := f.reg.CreateProject(ctx, p); err != nil {
 		return nil, err
 	}
 	if f.hold != nil {
@@ -78,7 +99,11 @@ func (f *fakeEngine) DeleteWith(ctx context.Context, ref string, o lifecycle.Del
 	f.mu.Lock()
 	f.deletes = append(f.deletes, ref)
 	f.skipped[ref] = o.SkipFinalBackup
+	f.keptRecord[ref] = o.KeepRecord
 	f.mu.Unlock()
+	if o.KeepRecord {
+		return f.reg.SetProjectStatus(ctx, ref, registry.StatusInitFailed)
+	}
 	return f.reg.DeleteProject(ctx, ref)
 }
 
@@ -104,6 +129,11 @@ func (f *fakeEngine) RotateKeys(_ context.Context, ref string) (*secrets.Project
 func (f *fakeEngine) Keys(_ context.Context, ref string) (*secrets.ProjectKeys, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if ref == parentRef && f.keysFailAfter > 0 {
+		if f.keyCalls++; f.keyCalls > f.keysFailAfter {
+			return nil, errors.New("secret store unavailable")
+		}
+	}
 	k, ok := f.keys[ref]
 	if !ok {
 		return nil, registry.ErrNotFound
@@ -183,6 +213,9 @@ type harness struct {
 	cfg *config.Config
 	now time.Time
 	mu  sync.Mutex
+	// isolated lists the branches the service isolated from the parent's integrations.
+	isolated   []string
+	isolateErr error
 }
 
 func (h *harness) clock() time.Time {
@@ -233,6 +266,12 @@ func newHarness(t *testing.T, mut func(*config.Config)) *harness {
 	svc.rotate = func(_ context.Context, ref string) error {
 		_, err := h.eng.RotateKeys(context.Background(), ref)
 		return err
+	}
+	svc.isolate = func(_ context.Context, ref string) error {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.isolated = append(h.isolated, ref)
+		return h.isolateErr
 	}
 	h.svc = svc
 	t.Cleanup(func() { svc.Drain(context.Background()) })

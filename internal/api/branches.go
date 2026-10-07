@@ -150,6 +150,24 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) error {
 	if s.branches == nil {
 		return s.noBranching()
 	}
+	// Fields this node cannot honor are refused instead of silently dropped: the client would
+	// believe it got what it asked for. The CLI and the MCP server never send them.
+	if in.Secrets != nil && len(*in.Secrets) > 0 {
+		return errf(http.StatusBadRequest, "Branch secrets are not supported on this node")
+	}
+	if in.ReleaseChannel != nil && *in.ReleaseChannel != "ga" {
+		return errf(http.StatusBadRequest, "release_channel %q is not available on this node (only ga)", string(*in.ReleaseChannel))
+	}
+	if in.PostgresEngine != nil {
+		// A branch is a clone of its parent's cluster, so it runs the parent's Postgres.
+		p, err := s.loadProject(r.Context(), r.PathValue("ref"))
+		if err != nil {
+			return err
+		}
+		if want := pgEngine(p); string(*in.PostgresEngine) != want {
+			return errf(http.StatusBadRequest, "postgres_engine %q is not available: a branch runs its parent's Postgres %s", string(*in.PostgresEngine), want)
+		}
+	}
 	ci := branching.CreateInput{Name: in.BranchName}
 	if in.GitBranch != nil {
 		ci.GitBranch = *in.GitBranch
@@ -220,16 +238,26 @@ func (s *Server) getBranch(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return errf(http.StatusNotFound, "Branch not found")
 	}
-	keys, err := s.mgr.Keys(r.Context(), b.Ref)
-	if err != nil {
-		return err
-	}
 	user := "postgres." + b.Ref
 	out := &v1.BranchDetailResponseOutput{
 		Ref: b.Ref, PostgresVersion: pgVersion(p), PostgresEngine: pgEngine(p), ReleaseChannel: "ga",
 		Status: v1.BranchDetailResponseOutputStatus(p.Status),
 		// The pooler is the one public Postgres endpoint; it routes on the user name.
-		DbHost: s.cfg.PoolerHost(), DbPort: s.cfg.Ports.SupavisorSession, DbUser: &user, DbPass: &keys.DBPassword, JwtSecret: &keys.JWTSecret,
+		DbHost: s.cfg.PoolerHost(), DbPort: s.cfg.Ports.SupavisorSession, DbUser: &user,
+	}
+	// The password and JWT secret of a branch belong to the branch. The default branch is the
+	// project itself: its secrets stay in the secret store, as they do for the pooler route.
+	if !b.IsDefault {
+		keys, err := s.mgr.Keys(r.Context(), b.Ref)
+		switch {
+		case err == nil:
+			out.DbPass, out.JwtSecret = &keys.DBPassword, &keys.JWTSecret
+		case p.Status == registry.StatusComingUp || b.State == registry.BranchCreatingProject:
+			// The row exists a moment before its credentials are stored: answer without them;
+			// the next read has them.
+		default:
+			return err
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 	return nil
@@ -250,6 +278,17 @@ func (s *Server) updateBranch(w http.ResponseWriter, r *http.Request) error {
 	if s.branches == nil {
 		return errf(http.StatusNotFound, "Branch not found")
 	}
+	if in.Status != nil {
+		// The status follows the branch's operations; it cannot be set.
+		cur, err := s.branches.Resolve(r.Context(), r.PathValue("branch_id_or_ref"))
+		if err != nil {
+			return mapBranchErr(err)
+		}
+		if string(*in.Status) != string(cur.State) {
+			return errf(http.StatusBadRequest, "status cannot be set: it follows the branch's operations")
+		}
+	}
+	// reset_on_push is deprecated and "ignored" by the spec itself.
 	b, err := s.branches.Update(r.Context(), r.PathValue("branch_id_or_ref"), branching.UpdateInput{
 		Name: in.BranchName, GitBranch: in.GitBranch, Persistent: in.Persistent, NotifyURL: in.NotifyUrl, RequestReview: in.RequestReview,
 	})

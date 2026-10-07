@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
@@ -208,7 +209,13 @@ func (s *Service) Diff(ctx context.Context, idOrRef string) (string, error) {
 // migrations (up to MigrationVersion when set) and seed, a with_data branch a fresh copy of
 // the parent's data. The branch keeps its id, name, ref and settings. A schema-only branch
 // also keeps its credentials; a with_data branch gets new ones, as at creation. Anything
-// written to the branch is gone.
+// written to the branch is gone, and so is the archive of a persistent branch (its WAL and
+// base backups: the recreated cluster reuses the ref, and its WAL would collide with the old).
+//
+// Everything that can fail without touching the branch is checked first (the parent is
+// running, a with_data branch has a way to get its data). The old cluster is then removed but
+// the branch's registry row is kept, so a failure later leaves the branch registered as
+// MIGRATIONS_FAILED: it can be reset again or deleted.
 func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (string, error) {
 	b, err := s.resolveBranch(ctx, idOrRef, "reset")
 	if err != nil {
@@ -236,6 +243,9 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 		}
 		org = o.Slug
 	}
+	if err := s.preflightReset(ctx, b, parent); err != nil {
+		return "", err
+	}
 	var keys *secrets.ProjectKeys
 	if !b.WithData {
 		// A branch whose creation failed may have no credentials worth keeping.
@@ -249,7 +259,7 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 	}
 	s.setState(ctx, b.Ref, registry.BranchCreatingProject, "resetting from "+parent.Ref, nil)
 	s.spawn(r, b.Ref, parent.Ref, func(ctx context.Context) (string, error) {
-		if err := s.removeBranch(ctx, b, false); err != nil {
+		if err := s.removeBranch(ctx, b, removeOptions{keepRecord: true}); err != nil {
 			return "", fmt.Errorf("remove the old cluster: %w", err)
 		}
 		info := *old.Branch
@@ -262,8 +272,12 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 			}
 		}
 		info.DeletionScheduledAt = nil
+		// The row is still there: record the lifetime and the cleared method on it now.
+		s.setState(ctx, b.Ref, info.State, info.Detail, func(bi *registry.BranchInfo) {
+			bi.CloneMethod, bi.ExpiresAt, bi.DeletionScheduledAt = info.CloneMethod, info.ExpiresAt, nil
+		})
 		j := &createJob{
-			parent: parent, ref: b.Ref, info: &info, class: old.Class, org: org,
+			parent: parent, ref: b.Ref, info: &info, class: old.Class, org: org, recreate: true,
 			in: CreateInput{Name: b.Name, GitBranch: b.GitBranch, Persistent: b.Persistent, WithData: b.WithData, NotifyURL: b.NotifyURL},
 		}
 		if keys != nil {
@@ -274,6 +288,29 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 		return s.doCreate(ctx, j)
 	})
 	return r.id, nil
+}
+
+// preflightReset checks what a reset needs before the old cluster is removed: the same way
+// of getting data that creation would use, and for the base-backup way a base backup to
+// restore.
+func (s *Service) preflightReset(ctx context.Context, b *Branch, parent *registry.Project) error {
+	if !b.WithData {
+		return nil
+	}
+	method, _, reason := s.planData(parent.Ref, b.Ref)
+	switch method {
+	case MethodSchema:
+		return invalid("with_data is not possible: %s", reason)
+	case MethodBackup:
+		if _, err := s.bk.PlanRestoreWith(ctx, parent.Ref, s.now(), backup.RestoreOptions{Latest: true}); err != nil {
+			return conflict("cannot reset %s from the base backup of %s: %v", b.Name, parent.Ref, err)
+		}
+	default:
+		if _, err := s.eng.Keys(ctx, parent.Ref); err != nil {
+			return fmt.Errorf("read the parent's credentials: %w", err)
+		}
+	}
+	return nil
 }
 
 // Update is PATCH /v1/branches/{id}.
@@ -389,7 +426,7 @@ func (s *Service) deleteNow(ctx context.Context, b *Branch, by string) error {
 	defer s.end(b.Ref, r)
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
-	if err := s.removeBranch(ctx, b, true); err != nil {
+	if err := s.removeBranch(ctx, b, removeOptions{final: true}); err != nil {
 		return err
 	}
 	payload := map[string]any{"branch": b.Ref, "name": b.Name, "by": by}
@@ -397,16 +434,25 @@ func (s *Service) deleteNow(ctx context.Context, b *Branch, by string) error {
 	return nil
 }
 
-// removeBranch deletes the branch's project. forget also removes the registry row's
-// history of events; reset keeps nothing but the row is recreated by the caller.
-func (s *Service) removeBranch(ctx context.Context, b *Branch, final bool) error {
-	keepBackup := b.Persistent && final
-	if err := s.eng.DeleteWith(ctx, b.Ref, lifecycle.DeleteOptions{SkipFinalBackup: !keepBackup}); err != nil {
+type removeOptions struct {
+	// final lets a persistent branch keep its final base backup and its archive (a delete);
+	// a reset removes the archive whatever the branch is.
+	final bool
+	// keepRecord keeps the registry row (lifecycle.DeleteOptions.KeepRecord).
+	keepRecord bool
+}
+
+// removeBranch removes the branch's fleet tenants, units and data, and its registry row
+// unless keepRecord is set. An ephemeral branch takes no final backup and leaves nothing in
+// the archive.
+func (s *Service) removeBranch(ctx context.Context, b *Branch, o removeOptions) error {
+	keepBackup := b.Persistent && o.final
+	if err := s.eng.DeleteWith(ctx, b.Ref, lifecycle.DeleteOptions{SkipFinalBackup: !keepBackup, KeepRecord: o.keepRecord}); err != nil {
 		return err
 	}
 	if !keepBackup {
-		// An ephemeral branch leaves nothing in the archive: its WAL and base backups are
-		// worthless, cost storage, and a reset reuses the ref (its WAL would collide).
+		// An ephemeral branch's WAL and base backups are worthless and cost storage, and a
+		// reset reuses the ref, so its WAL would collide with the old one.
 		if err := s.purgeArchive(ctx, b.Ref); err != nil {
 			s.log.Warn("could not remove the branch's archive", "ref", b.Ref, "err", err)
 		}

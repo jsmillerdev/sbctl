@@ -32,7 +32,7 @@ type Branch struct {
 	State registry.BranchState
 	// ProjectStatus is the status of the branch's project (its units).
 	ProjectStatus registry.Status
-	// CloneMethod is how the data was obtained: schema, clonefile, reflink, zfs-snapshot or base-backup.
+	// CloneMethod is how the data was obtained: schema, clonefile, reflink or base-backup.
 	CloneMethod string
 	// Detail is the outcome of the last operation, an error text after a failure.
 	Detail string

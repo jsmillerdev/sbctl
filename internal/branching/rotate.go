@@ -53,10 +53,7 @@ func (s *Service) rotateCredentials(ctx context.Context, ref string) error {
 			return err
 		}
 	}
-	sock := filepath.Join(s.cfg.Paths().ProjectService(ref, config.SvcPostgres), "sock")
-	dsn := fmt.Sprintf("host=%s port=%d user=%s dbname=postgres sslmode=disable connect_timeout=5 application_name=sbctl-branching",
-		kvQuote(sock), s.cfg.PortsFor(ref, p.Seq).Postgres, lifecycle.RoleAdmin)
-	if err := setRolePasswords(ctx, dsn, map[string]string{
+	if err := setRolePasswords(ctx, s.adminSocketDSN(ref, p.Seq), map[string]string{
 		lifecycle.RolePostgres: nk.DBPassword, lifecycle.RoleAdmin: nk.AdminPassword, lifecycle.RoleAuthn: nk.AuthenticatorPassword,
 		lifecycle.RoleAuthAdmin: nk.AuthAdminPassword, lifecycle.RoleStorage: nk.StorageAdminPassword, lifecycle.RoleReplication: nk.ReplicationPassword,
 	}); err != nil {
@@ -66,6 +63,14 @@ func (s *Service) rotateCredentials(ctx context.Context, ref string) error {
 		return err
 	}
 	return nil
+}
+
+// adminSocketDSN connects as supabase_admin over the cluster's private unix socket, which
+// needs no password and cannot be reached from outside the node.
+func (s *Service) adminSocketDSN(ref string, seq int) string {
+	sock := filepath.Join(s.cfg.Paths().ProjectService(ref, config.SvcPostgres), "sock")
+	return fmt.Sprintf("host=%s port=%d user=%s dbname=postgres sslmode=disable connect_timeout=5 application_name=sbctl-branching",
+		kvQuote(sock), s.cfg.PortsFor(ref, seq).Postgres, lifecycle.RoleAdmin)
 }
 
 func kvQuote(v string) string {

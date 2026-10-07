@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -216,7 +217,7 @@ func TestCopyRefusesUnsupportedTrees(t *testing.T) {
 
 func TestDetectCloneOnThisFilesystem(t *testing.T) {
 	src := fakePGData(t)
-	method, fsys, reason := detectClone(src, filepath.Join(filepath.Dir(src), "branch"), nil)
+	method, fsys, reason := detectClone(src, filepath.Join(filepath.Dir(src), "branch"))
 	t.Logf("detectClone: method=%q fs=%s reason=%q", method, fsys, reason)
 	if method == "" && reason == "" {
 		t.Fatal("no method and no reason")
@@ -228,46 +229,6 @@ func TestDetectCloneOnThisFilesystem(t *testing.T) {
 	if ents, _ := os.ReadDir(filepath.Join(filepath.Dir(src), "branch")); len(ents) != 0 {
 		t.Fatalf("probe left %v", ents)
 	}
-}
-
-func TestZFSSnapshotCommands(t *testing.T) {
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The dataset is mounted at root: the data dir is root/projects/x/postgres/data.
-	data := filepath.Join(root, "projects", "x", "postgres", "data")
-	if err := os.MkdirAll(data, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	z := &zfsListMount{mount: root}
-	c := &cloner{zfs: z, log: slogDiscard()}
-	snapRoot, cleanup, err := c.zfsSnapshot(context.Background(), data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := filepath.Join(root, ".zfs", "snapshot")
-	if !strings.HasPrefix(snapRoot, want+string(filepath.Separator)) || !strings.HasSuffix(snapRoot, filepath.Join("projects", "x", "postgres", "data")) {
-		t.Fatalf("snapshot path = %s", snapRoot)
-	}
-	cleanup()
-	if len(z.calls) != 3 || !strings.HasPrefix(z.calls[1], "snapshot tank/sbctl@sbctl-branch-") || !strings.HasPrefix(z.calls[2], "destroy tank/sbctl@sbctl-branch-") {
-		t.Fatalf("zfs calls = %v", z.calls)
-	}
-}
-
-// zfsListMount answers `zfs list` with a dataset mounted at mount.
-type zfsListMount struct {
-	mount string
-	calls []string
-}
-
-func (f *zfsListMount) Run(_ context.Context, args ...string) (string, error) {
-	f.calls = append(f.calls, strings.Join(args, " "))
-	if args[0] == "list" {
-		return "tank/sbctl\t" + f.mount, nil
-	}
-	return "", nil
 }
 
 func TestNotifyRefusesPrivateAddressesByDefault(t *testing.T) {
@@ -287,6 +248,20 @@ func TestNotifyRefusesPrivateAddressesByDefault(t *testing.T) {
 	h2.mustState(b2, registry.BranchMigrationsPassed)
 	if hits.Load() != 1 {
 		t.Fatalf("hits = %d, want 1 (allowed)", hits.Load())
+	}
+}
+
+func TestInternalAddr(t *testing.T) {
+	for _, a := range []string{"127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "::1", "fd00::1", "fe80::1", "0.0.0.0",
+		"100.64.0.1", "100.100.100.200", "100.127.255.255", "198.18.0.1", "198.19.255.255", "192.0.0.8", "240.0.0.1", "255.255.255.254", "64:ff9b::a00:1", "::ffff:100.100.100.200"} {
+		if !internalAddr(netip.MustParseAddr(a).Unmap()) {
+			t.Errorf("%s should be refused", a)
+		}
+	}
+	for _, a := range []string{"8.8.8.8", "100.63.255.255", "100.128.0.1", "198.17.255.255", "198.20.0.1", "192.0.2.1", "2606:4700::1111"} {
+		if internalAddr(netip.MustParseAddr(a).Unmap()) {
+			t.Errorf("%s should be allowed", a)
+		}
 	}
 }
 

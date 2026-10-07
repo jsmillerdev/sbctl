@@ -37,6 +37,11 @@ type CreateRequest struct {
 	// Branch makes the new project a branch of another one (workstream I): the registry row
 	// is written with it, so the branch is a branch from the moment it exists.
 	Branch *registry.BranchInfo
+	// Recreate builds the project over an existing registry row that DeleteWith kept
+	// (DeleteOptions.KeepRecord): same ref, id, sequence number, name and branch info, a new
+	// cluster. The row must be INIT_FAILED. A reset of a branch uses it, so that a failure
+	// leaves the branch registered instead of gone.
+	Recreate bool
 }
 
 type ServiceHealth struct {
@@ -138,4 +143,8 @@ type DeleteOptions struct {
 	// SkipFinalBackup deletes without the final base backup. Use it only for projects
 	// that are broken or disposable: the data is gone afterwards.
 	SkipFinalBackup bool
+	// KeepRecord removes the fleet tenants, route, units and data but keeps the registry row
+	// (and the sealed secrets), which ends INIT_FAILED: nothing runs and nothing is stored.
+	// CreateRequest.Recreate builds a new cluster over it; Delete removes it for good.
+	KeepRecord bool
 }

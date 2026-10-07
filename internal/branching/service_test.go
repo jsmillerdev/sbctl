@@ -3,10 +3,13 @@ package branching
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -206,6 +209,10 @@ func TestWithDataNeedsAWay(t *testing.T) {
 	_, err := h.svc.Create(context.Background(), parentRef, CreateInput{Name: "d", WithData: true})
 	if err == nil || !strings.Contains(err.Error(), "ext4 does not support file cloning") || !strings.Contains(err.Error(), "no backup backend") {
 		t.Fatalf("err = %v", err)
+	}
+	// The user can fix it (pick a filesystem, configure a backup backend): a 400, not a 500.
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("with_data without a way is not ErrInvalid: %v", err)
 	}
 	if ps, _ := h.reg.ListProjects(context.Background()); len(ps) != 1 {
 		t.Fatalf("a failed with_data left projects behind: %+v", ps)
@@ -636,5 +643,204 @@ func TestSeedStore(t *testing.T) {
 	h.mustState(f, registry.BranchMigrationsFailed)
 	if !strings.Contains(f.Detail, "seed") {
 		t.Fatalf("detail = %q", f.Detail)
+	}
+}
+
+// cloneHarness is a harness whose with_data branches take the (faked) copy-on-write path.
+func cloneHarness(t *testing.T) *harness {
+	t.Helper()
+	h := newHarness(t, nil)
+	h.svc.detect = func(string, string) (string, string, string) { return MethodReflink, "xfs", "" }
+	h.svc.clone = func(_ context.Context, _, method, _ string) (*CloneStats, error) {
+		return &CloneStats{Method: method}, nil
+	}
+	return h
+}
+
+func TestResetRefusesBeforeRemovingAnything(t *testing.T) {
+	h := cloneHarness(t)
+	b := h.create("data", func(in *CreateInput) { in.WithData = true })
+	// The data disk lost its clone support since the branch was made.
+	h.svc.detect = func(string, string) (string, string, string) { return "", "ext4", "ext4 does not support file cloning" }
+	if _, err := h.svc.Reset(context.Background(), b.Ref, ActionInput{}); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "ext4") {
+		t.Fatalf("reset = %v", err)
+	}
+	if len(h.eng.deletes) != 0 {
+		t.Fatalf("the refused reset removed %v", h.eng.deletes)
+	}
+	got, err := h.svc.Resolve(context.Background(), b.ID)
+	if err != nil || got.State != registry.BranchMigrationsPassed || got.ProjectStatus != registry.StatusActiveHealthy {
+		t.Fatalf("branch after the refused reset: %+v %v", got, err)
+	}
+}
+
+func TestResetWithoutABaseBackupIsRefusedFirst(t *testing.T) {
+	h := cloneHarness(t)
+	b := h.create("data", func(in *CreateInput) { in.WithData = true })
+	store, err := backup.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.svc.bk, err = backup.New(backup.Options{Store: store, Registry: h.reg, Config: h.cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.svc.detect = func(string, string) (string, string, string) { return "", "ext4", "ext4 does not support file cloning" }
+	// A base-backup reset is planned, but the parent has no base backup to restore.
+	if _, err := h.svc.Reset(context.Background(), b.Ref, ActionInput{}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reset = %v", err)
+	}
+	if len(h.eng.deletes) != 0 {
+		t.Fatalf("the refused reset removed %v", h.eng.deletes)
+	}
+	if got, err := h.svc.Resolve(context.Background(), b.ID); err != nil || got.State != registry.BranchMigrationsPassed {
+		t.Fatalf("branch after the refused reset: %+v %v", got, err)
+	}
+}
+
+// A reset that fails after the old cluster is gone leaves the branch registered, failed, with
+// its id, so that the client sees MIGRATIONS_FAILED and can reset again or delete it.
+func TestFailedResetLeavesTheBranchRegistered(t *testing.T) {
+	cases := map[string]func(h *harness){
+		"the engine fails after the row is touched":  func(h *harness) { h.eng.createErr = errors.New("units did not start") },
+		"the engine fails before it touches the row": func(h *harness) { h.eng.failBeforeRow = errors.New("lifecycle lock timeout") },
+		"the parent's credentials cannot be read":    func(h *harness) { h.eng.keysFailAfter = h.eng.keyCalls + 1 },
+	}
+	for name, breakIt := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := cloneHarness(t)
+			ctx := context.Background()
+			b := h.create("data", func(in *CreateInput) { in.WithData = true })
+			breakIt(h)
+			if _, err := h.svc.Reset(ctx, b.ID, ActionInput{}); err != nil {
+				t.Fatal(err)
+			}
+			got := h.wait(b.Ref)
+			h.mustState(got, registry.BranchMigrationsFailed)
+			byID, err := h.svc.Resolve(ctx, b.ID)
+			if err != nil || byID.Ref != b.Ref || byID.ProjectStatus != registry.StatusInitFailed {
+				t.Fatalf("the branch after a failed reset: %+v %v", byID, err)
+			}
+			if h.eng.deletes[len(h.eng.deletes)-1] != b.Ref || h.eng.keptRecord[b.Ref] != true {
+				t.Fatalf("the reset must keep the row: deletes=%v kept=%v", h.eng.deletes, h.eng.keptRecord)
+			}
+			// Repaired, it can be reset again (state INIT_FAILED, MIGRATIONS_FAILED), and keeps its identity.
+			h.eng.createErr, h.eng.failBeforeRow, h.eng.keysFailAfter = nil, nil, 0
+			if _, err := h.svc.Reset(ctx, b.ID, ActionInput{}); err != nil {
+				t.Fatal(err)
+			}
+			again := h.wait(b.Ref)
+			h.mustState(again, registry.BranchMigrationsPassed)
+			if again.ID != b.ID || again.Ref != b.Ref || again.ProjectStatus != registry.StatusActiveHealthy {
+				t.Fatalf("after the second reset: %+v", again)
+			}
+			if last := h.eng.creates[len(h.eng.creates)-1]; !last.Recreate {
+				t.Fatalf("a reset must recreate over the kept row: %+v", last)
+			}
+		})
+	}
+	// And a branch left like that can be deleted.
+	h := cloneHarness(t)
+	b := h.create("data", func(in *CreateInput) { in.WithData = true })
+	h.eng.createErr = errors.New("units did not start")
+	if _, err := h.svc.Reset(context.Background(), b.Ref, ActionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	h.wait(b.Ref)
+	if _, err := h.svc.Delete(context.Background(), b.Ref, DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.Resolve(context.Background(), b.Ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after delete: %v", err)
+	}
+}
+
+func TestClonedBranchIsIsolatedBeforeItsCredentialsRotate(t *testing.T) {
+	h := cloneHarness(t)
+	b := h.create("data", func(in *CreateInput) { in.WithData = true })
+	h.mustState(b, registry.BranchMigrationsPassed)
+	if len(h.isolated) != 1 || h.isolated[0] != b.Ref {
+		t.Fatalf("isolated = %v", h.isolated)
+	}
+	// A schema-only branch holds none of the parent's integrations.
+	s := h.create("schema", nil)
+	if len(h.isolated) != 1 {
+		t.Fatalf("a schema-only branch was isolated: %v (%s)", h.isolated, s.Ref)
+	}
+	// When the isolation fails the branch is stopped, not left with the parent's subscriptions.
+	h.isolateErr = errors.New("cannot reach the cluster")
+	f := h.create("leaky", func(in *CreateInput) { in.WithData = true })
+	h.mustState(f, registry.BranchMigrationsFailed)
+	if !strings.Contains(f.Detail, "cannot reach the cluster") || h.eng.paused[f.Ref] != 1 {
+		t.Fatalf("detail = %q paused = %v", f.Detail, h.eng.paused)
+	}
+}
+
+func TestStampManagerRecreatesAndQuarantinesTheRestoredCluster(t *testing.T) {
+	h := newHarness(t, nil)
+	var seeded string
+	seed := func(_ context.Context, _ *registry.Project, dir string) error {
+		seeded = dir
+		return os.WriteFile(filepath.Join(dir, "postgresql.auto.conf"), []byte("restore_command = 'x'\n"), 0o600)
+	}
+	dir := t.TempDir()
+	m := stampManager{Manager: h.eng, info: &registry.BranchInfo{ID: newUUID(), ParentRef: parentRef, Name: "r"}, class: "micro", recreate: true}
+	if _, err := h.eng.reg.GetProject(context.Background(), parentRef); err != nil {
+		t.Fatal(err)
+	}
+	// Recreate needs an INIT_FAILED row.
+	const ref = "rrrrrrrrrrrrrrrrrrrr"
+	if err := h.reg.CreateProject(context.Background(), &registry.Project{Ref: ref, Name: "r", Status: registry.StatusInitFailed, Branch: &registry.BranchInfo{ID: "x", ParentRef: parentRef, Name: "r"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Create(context.Background(), lifecycle.CreateRequest{Ref: ref, Class: "default", Seed: func(ctx context.Context, p *registry.Project, d string) error { return seed(ctx, p, d) }}); err != nil {
+		t.Fatal(err)
+	}
+	req := h.eng.creates[len(h.eng.creates)-1]
+	if !req.Recreate || req.Class != "micro" || req.Branch == nil || req.Seed == nil {
+		t.Fatalf("request = %+v", req)
+	}
+	if err := req.Seed(context.Background(), nil, dir); err != nil || seeded != dir {
+		t.Fatalf("seed: %v %q", err, seeded)
+	}
+	conf, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
+	for _, want := range []string{"restore_command = 'x'", "max_logical_replication_workers = 0", "cron.launch_active_jobs = off", "pg_net.database_name"} {
+		if !strings.Contains(string(conf), want) {
+			t.Errorf("auto.conf lacks %q:\n%s", want, conf)
+		}
+	}
+}
+
+func TestQuarantineSettingsComeAndGo(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "postgresql.auto.conf")
+	// The parent's own entries (even for the same key, and without a final newline) survive.
+	if err := os.WriteFile(conf, []byte("# Do not edit this file manually!\nmax_logical_replication_workers = '8'\nwork_mem = '8MB'"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeQuarantine(dir); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(conf)
+	if i, j := strings.LastIndex(string(got), "max_logical_replication_workers = 8"), strings.LastIndex(string(got), "max_logical_replication_workers = 0"); j < i {
+		t.Fatalf("the quarantine value must come last:\n%s", got)
+	}
+	if err := clearQuarantine(dir); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = os.ReadFile(conf)
+	if want := "# Do not edit this file manually!\nmax_logical_replication_workers = '8'\nwork_mem = '8MB'\n"; string(got) != want {
+		t.Fatalf("after clearing:\n%q\nwant\n%q", got, want)
+	}
+	// No auto.conf at all is fine.
+	empty := t.TempDir()
+	if err := clearQuarantine(empty); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeQuarantine(empty); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(empty, "postgresql.auto.conf")); !strings.Contains(string(b), "cron.launch_active_jobs") {
+		t.Fatalf("written: %q", b)
 	}
 }

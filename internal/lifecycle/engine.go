@@ -279,12 +279,34 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 		b := *req.Branch
 		p.Branch = &b
 	}
-	if err := e.reg.CreateProject(ctx, p); err != nil {
+	if req.Recreate {
+		cur, err := e.reg.GetProject(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("lifecycle: recreate %s: %w", ref, err)
+		}
+		if cur.Status != registry.StatusInitFailed {
+			return nil, invalidState(cur, "recreate")
+		}
+		// The row keeps its identity (name, sequence number, branch info); the rest is renewed.
+		cur.Region, cur.Class, cur.Versions, cur.Limits, cur.Status = region, class, versions, limits, registry.StatusComingUp
+		if err := e.reg.UpdateProject(ctx, cur); err != nil {
+			return nil, fmt.Errorf("lifecycle: recreate project %s: %w", ref, err)
+		}
+		p = cur
+	} else if err := e.reg.CreateProject(ctx, p); err != nil {
 		return nil, fmt.Errorf("lifecycle: create project %s: %w", ref, err)
 	}
 	fail := func(stage string, cause error) (*registry.Project, error) {
 		cctx, cancel := cleanupCtx(ctx)
 		defer cancel()
+		if errors.Is(cause, ErrClusterExists) && req.Recreate {
+			// Foreign data under a row that was meant to be empty: leave it, keep the row failed.
+			e.cleanup(cctx, p, true)
+			if err := e.reg.SetProjectStatus(cctx, ref, registry.StatusInitFailed); err != nil {
+				e.log.Error("could not mark project INIT_FAILED", "ref", ref, "error", err)
+			}
+			return nil, fmt.Errorf("lifecycle: recreate %s refused, existing data left untouched (move %s away): %w", ref, e.cfg.Paths().Project(ref), cause)
+		}
 		if errors.Is(cause, ErrClusterExists) {
 			// The data belongs to someone else (an orphan, or a restore target that was
 			// not cleared): leave it alone and forget the row this call just made.
@@ -500,6 +522,13 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	}
 	if err := e.plane.Delete(ctx, ref); err != nil {
 		return fmt.Errorf("lifecycle: delete %s: %w", ref, err)
+	}
+	if o.KeepRecord {
+		if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusInitFailed); err != nil {
+			return err
+		}
+		e.event(ctx, ref, "project.data_removed", map[string]any{"final_backup": tookBackup})
+		return nil
 	}
 	if err := e.reg.DeleteProject(ctx, ref); err != nil {
 		return err

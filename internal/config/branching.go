@@ -31,6 +31,11 @@ type Branching struct {
 	// link-local addresses. Off by default: the daemon would otherwise be a way to reach
 	// the instance metadata service or other internal endpoints.
 	AllowPrivateNotifyURLs bool `toml:"allow_private_notify_urls"`
+	// KeepCronJobs leaves the parent's pg_cron jobs active in a branch that was cloned from the
+	// parent's data. Off by default: a job that calls an external service (pg_net, an HTTP
+	// extension, a function URL) would otherwise run twice, once from the parent and once
+	// from every branch.
+	KeepCronJobs bool `toml:"keep_cron_jobs"`
 }
 
 const (

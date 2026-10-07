@@ -98,7 +98,7 @@ type BranchInfo struct {
 	// Detail is the outcome of the last long operation (an error text on failure).
 	Detail string
 	// CloneMethod records how the data was obtained: "schema", "clonefile", "reflink",
-	// "zfs-snapshot" or "base-backup".
+	// or "base-backup".
 	CloneMethod       string
 	ReviewRequestedAt *time.Time
 }

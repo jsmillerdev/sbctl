@@ -23,6 +23,33 @@ func validNotifyURL(raw string) error {
 	return nil
 }
 
+// reservedPrefixes are ranges netip's predicates do not cover that still reach internal
+// services: shared address space (RFC 6598, where some clouds put their metadata service,
+// for example 100.100.100.200), the benchmarking range, IETF protocol assignments, the
+// reserved class E block, and the NAT64 prefix (which translates to IPv4, private addresses
+// included).
+var reservedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+}
+
+// internalAddr reports whether ip (already unmapped from IPv4-in-IPv6) is an address a
+// notify_url must not reach.
+func internalAddr(ip netip.Addr) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	for _, p := range reservedPrefixes {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // newNotifyClient returns the client for notify_url calls. Unless allowPrivate is set it
 // refuses to connect to loopback, private, link-local and unspecified addresses, which would
 // make the daemon a way into the instance metadata service and the node's own admin ports.
@@ -38,9 +65,8 @@ func newNotifyClient(allowPrivate bool) *http.Client {
 			if err != nil {
 				return err
 			}
-			ip = ip.Unmap()
-			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
-				return fmt.Errorf("branching: notify_url resolves to %s, a private address ([branching] allow_private_notify_urls)", ip)
+			if ip = ip.Unmap(); internalAddr(ip) {
+				return fmt.Errorf("branching: notify_url resolves to %s, a private or reserved address ([branching] allow_private_notify_urls)", ip)
 			}
 			return nil
 		}
