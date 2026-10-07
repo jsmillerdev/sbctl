@@ -41,7 +41,8 @@ VERSIONS_SRC=$REPO_ROOT/internal/versions/versions.yaml
 # amd64 and arm64 archives: GoTrue 2.195.0 in two packaging revisions and two PostgREST releases.
 OLD_AUTH=auth-v2.195.0-r0 NEW_AUTH=auth-v2.195.0-r1
 OLD_REST=postgrest-v16.2-r0 NEW_REST=postgrest-v16.4-r0
-BAD_REST=postgrest-v0.0.0-broken-r0
+# A release number above any real one (a project is never moved to an older release), whose binary exits at once.
+BAD_REST=postgrest-v99.0.0-r0
 OLD_AUTH_V=v2.195.0-r0 NEW_AUTH_V=v2.195.0-r1 OLD_REST_V=v16.2-r0 NEW_REST_V=v16.4-r0
 USER_EMAIL=upgrade-smoke@example.com USER_PASSWORD=upgrade-correct-horse-battery
 
