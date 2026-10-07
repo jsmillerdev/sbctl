@@ -215,7 +215,8 @@ SV=/usr/local/bin/supavise
 [[ $(systemctl is-enabled supavise-upgrade.timer) == enabled ]] || fail "supavise-upgrade.timer is not enabled"
 [[ $(systemctl is-active supavise-upgrade.timer) == active ]] || fail "supavise-upgrade.timer is not active"
 grep -q '^OnCalendar=Sun \*-\*-\* 04:00:00$' /etc/systemd/system/supavise-upgrade.timer || fail "the timer does not open at the default window: $(cat /etc/systemd/system/supavise-upgrade.timer)"
-[[ $(grep -c '^OnCalendar=' /etc/systemd/system/supavise-upgrade.timer) == 1 ]] || fail "notify mode needs one wake-up per window, not a tick every quarter hour"
+# A new install reboots inside the window for OS patches, so the timer ticks every quarter hour through the two-hour window.
+[[ $(grep -c '^OnCalendar=' /etc/systemd/system/supavise-upgrade.timer) == 8 ]] || fail "a new install (OS reboot in the window) wants 8 ticks in a two-hour window: $(cat /etc/systemd/system/supavise-upgrade.timer)"
 [[ -n $(systemctl list-timers supavise-upgrade.timer --no-legend) ]] || fail "systemd has no next run for supavise-upgrade.timer"
 $SV update status | tee "$WORK/update-status.txt" | grep -q 'Mode        notify' || fail "update status: $(cat "$WORK/update-status.txt")"
 assert_os_updates on
@@ -381,10 +382,11 @@ out=$($SV update run --at 2026-10-07T12:00:00Z 2>&1) || fail "update run outside
 # The installer flags set the same keys.
 deploy/install.sh --binary "$SUPAVISE_BIN" --auto-upgrade=false --maintenance-window "Sun 04:00-06:00" >/dev/null 2>&1 || fail "re-run with --auto-upgrade=false"
 [[ $($SV update config | grep -E '^(mode|window)' | tr '\n' ' ') == 'mode = "notify" window = "Sun 04:00-06:00" ' ]] || fail "the installer flags did not set the update settings: $($SV update config)"
-[[ $(grep -c '^OnCalendar=' "$T") == 1 ]] || fail "back in notify mode the timer should wake once per window"
+[[ $(grep -c '^OnCalendar=' "$T") == 8 ]] || fail "back in notify mode with OS updates on, the timer still ticks for the reboot"
 log "OS security updates can be switched off and on, and a re-run keeps the choice"
 $SV update config --os-security-updates=false >/dev/null || fail "update config --os-security-updates=false"
 assert_os_updates off
+[[ $(grep -c '^OnCalendar=' "$T") == 1 ]] || fail "notify mode with no OS reboot should wake once per window"
 deploy/install.sh --binary "$SUPAVISE_BIN" >/dev/null 2>&1 || fail "re-run with OS updates off"
 assert_os_updates off
 $SV update config --os-security-updates=true >/dev/null || fail "update config --os-security-updates=true"
