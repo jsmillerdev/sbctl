@@ -137,6 +137,7 @@ func (s *Server) routesOrganizations(add func(string, handlerFunc)) {
 	add("POST /platform/organizations", s.platformCreateOrg)
 	add("GET /platform/organizations/{slug}", s.platformOrg)
 	add("PATCH /platform/organizations/{slug}", s.platformUpdateOrg)
+	add("DELETE /platform/organizations/{slug}", s.platformDeleteOrg)
 	add("GET /platform/organizations/{slug}/entitlements", s.entitlements("GET /platform/organizations/{slug}/entitlements"))
 	add("GET /platform/organizations/{slug}/billing/subscription", s.subscription)
 }

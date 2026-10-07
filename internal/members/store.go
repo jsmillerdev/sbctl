@@ -85,7 +85,8 @@ type Ops interface {
 	PutMember(ctx context.Context, m Member) error
 	// DeleteMember removes the membership and, with it, the member's project-scoped roles.
 	DeleteMember(ctx context.Context, org int64, user string) error
-	// CountOwners counts the members whose organization-wide role is Owner.
+	// CountOwners counts the members whose organization-wide role is Owner, not counting the
+	// stand-in of `functions dev` (StandInOwnerID).
 	CountOwners(ctx context.Context, org int64) (int, error)
 
 	// ProjectRoles returns the project-scoped roles of an organization (all members).
@@ -141,4 +142,11 @@ type Store interface {
 	// concurrent changes cannot both pass a check (the last-owner rule) that either alone
 	// would pass. A returned error rolls the changes back.
 	Update(ctx context.Context, org int64, fn func(Ops) error) error
+	// DeleteOrganization removes everything the model keeps for org: memberships,
+	// project-scoped roles, invitations (accepted ones too), the MFA setting and the
+	// default-role rules. It returns the ids of the invitations it removed, whose invite
+	// tokens the caller removes. The Postgres store's tables all cascade from the
+	// organization row, so after the row is gone this finds nothing; it exists for stores
+	// without foreign keys. Unknown organizations are not an error.
+	DeleteOrganization(ctx context.Context, org int64) ([]int64, error)
 }

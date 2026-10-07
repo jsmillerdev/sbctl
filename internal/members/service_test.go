@@ -76,6 +76,9 @@ func testService(t *testing.T, mk func(*testing.T) *env) {
 	t.Run("concurrent demotions", func(t *testing.T) { testConcurrentOwners(t, mk(t)) })
 	t.Run("legacy accounts", func(t *testing.T) { testLegacyAccounts(t, mk) })
 	t.Run("scoped owner invitations", func(t *testing.T) { testScopedOwnerInvitations(t, mk(t)) })
+	t.Run("stand-in owner", func(t *testing.T) { testStandInOwner(t, mk(t)) })
+	t.Run("remove user except", func(t *testing.T) { testRemoveUserExcept(t, mk(t)) })
+	t.Run("delete organization", func(t *testing.T) { testDeleteOrganization(t, mk(t)) })
 }
 
 func TestServiceMemory(t *testing.T) { testService(t, newMemEnv) }
@@ -611,5 +614,182 @@ func TestParseRole(t *testing.T) {
 	}
 	if DomainOf("A@Example.TEST") != "example.test" || DomainOf("nope") != "" {
 		t.Error("DomainOf")
+	}
+}
+
+// The stand-in of `functions dev` holds Owner seats but is never an Owner for the last-owner rule:
+// a seat that a crash left behind cannot stand in for the last real Owner.
+func testStandInOwner(t *testing.T, e *env) {
+	ctx := context.Background()
+	real := e.owner(t, e.a)
+	if err := e.svc.EnsureOwner(ctx, e.a, StandInOwnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.EnsureOwner(ctx, e.b, StandInOwnerID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := e.svc.Store.CountOwners(ctx, e.a.ID); err != nil || n != 1 {
+		t.Fatalf("owners of a with the stand-in: %d, %v; want 1", n, err)
+	}
+	// Without a real Owner the organization has none, whoever else holds the seat.
+	if n, err := e.svc.Store.CountOwners(ctx, e.b.ID); err != nil || n != 0 {
+		t.Fatalf("owners of b with only the stand-in: %d, %v; want 0", n, err)
+	}
+	if err := e.svc.RemoveUser(ctx, real, false); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("removing the last real Owner next to a stand-in: %v, want ErrLastOwner", err)
+	}
+	if err := e.svc.SetOrgRole(ctx, nil, e.a, real, RoleDeveloper); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("demoting the last real Owner next to a stand-in: %v, want ErrLastOwner", err)
+	}
+	if err := e.svc.RemoveMember(ctx, nil, e.a, real); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("removing the last real Owner as a member next to a stand-in: %v, want ErrLastOwner", err)
+	}
+	// The stand-in itself always goes, whatever the count says.
+	if err := e.svc.RemoveUser(ctx, StandInOwnerID, false); err != nil {
+		t.Fatalf("removing the stand-in: %v", err)
+	}
+	if ms, _ := e.svc.Store.MembershipsOf(ctx, StandInOwnerID); len(ms) != 0 {
+		t.Fatalf("stand-in memberships left: %+v", ms)
+	}
+	if n, _ := e.svc.Store.CountOwners(ctx, e.a.ID); n != 1 {
+		t.Fatalf("the real Owner was counted wrong after the sweep: %d", n)
+	}
+}
+
+// RemoveUserExcept skips the last-owner rule for the organization that is being deleted, and for
+// that one only.
+func testRemoveUserExcept(t *testing.T, e *env) {
+	ctx := context.Background()
+	u := e.owner(t, e.a)
+	if err := e.svc.EnsureOwner(ctx, e.b, u); err != nil {
+		t.Fatal(err)
+	}
+	e.owner(t, e.b) // b has a second Owner, a does not
+	if err := e.svc.RemoveUser(ctx, u, false); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("the only Owner of a: %v, want ErrLastOwner", err)
+	}
+	if err := e.svc.RemoveUserExcept(ctx, u, false, e.a.ID); err != nil {
+		t.Fatalf("with a being deleted: %v", err)
+	}
+	if ms, _ := e.svc.Store.MembershipsOf(ctx, u); len(ms) != 0 {
+		t.Fatalf("memberships left: %+v", ms)
+	}
+	// Another organization's rule still holds.
+	v := e.owner(t, e.a)
+	if err := e.svc.EnsureOwner(ctx, e.b, v); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.Store.Update(ctx, e.b.ID, func(ops Ops) error { // v becomes the only Owner of b
+		for _, m := range mustList(t, ops, e.b.ID) {
+			if m.UserID != v && m.RoleID == RoleOwner {
+				_ = ops.PutMember(ctx, Member{OrgID: e.b.ID, UserID: m.UserID, RoleID: RoleDeveloper})
+			}
+		}
+		return nil
+	})
+	if err := e.svc.RemoveUserExcept(ctx, v, false, e.a.ID); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("the only Owner of b while a is deleted: %v, want ErrLastOwner", err)
+	}
+}
+
+func mustList(t *testing.T, ops Ops, org int64) []Member {
+	t.Helper()
+	ms, err := ops.ListMembers(context.Background(), org)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ms
+}
+
+// DeleteOrganization removes everything the model keeps for one organization and nothing of the
+// other.
+func testDeleteOrganization(t *testing.T, e *env) {
+	ctx := context.Background()
+	o := e.owner(t, e.a)
+	dev := e.member(t, e.a, RoleDeveloper)
+	scoped := e.member(t, e.a, 0)
+	if err := e.svc.AssignProjectRole(ctx, nil, e.a, scoped, RoleDeveloper, []string{e.refs[0]}); err != nil {
+		t.Fatal(err)
+	}
+	inv, _, err := e.svc.Invite(ctx, nil, e.a, InviteInput{Email: "new@example.test", RoleID: RoleReadOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.SetMFAEnforced(ctx, e.a.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.SetDomainDefault(ctx, "acme.example.test", e.a.ID, RoleDeveloper); err != nil {
+		t.Fatal(err)
+	}
+	// Organization b keeps all of the same.
+	ob := e.owner(t, e.b)
+	if err := e.svc.EnsureOwner(ctx, e.b, dev); err != nil {
+		t.Fatal(err)
+	}
+	invB, _, err := e.svc.Invite(ctx, nil, e.b, InviteInput{Email: "new@example.test", RoleID: RoleReadOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.SetMFAEnforced(ctx, e.b.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.SetDomainDefault(ctx, "beta.example.test", e.b.ID, RoleReadOnly); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := e.svc.DeleteOrganization(ctx, e.a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != inv.ID {
+		t.Fatalf("removed invitations %v, want [%d]", ids, inv.ID)
+	}
+	if ms, _ := e.svc.Store.ListMembers(ctx, e.a.ID); len(ms) != 0 {
+		t.Fatalf("members left: %+v", ms)
+	}
+	if rs, _ := e.svc.Store.ProjectRoles(ctx, e.a.ID); len(rs) != 0 {
+		t.Fatalf("project roles left: %+v", rs)
+	}
+	if rs, _ := e.svc.Store.ProjectRolesOf(ctx, scoped); len(rs) != 0 {
+		t.Fatalf("project roles of the scoped member left: %+v", rs)
+	}
+	if is, _ := e.svc.Store.ListInvitations(ctx, e.a.ID); len(is) != 0 {
+		t.Fatalf("invitations left: %+v", is)
+	}
+	if on, _ := e.svc.Store.MFAEnforced(ctx, e.a.ID); on {
+		t.Fatal("the MFA requirement is left")
+	}
+	if _, err := e.svc.Store.GetDomainDefault(ctx, "acme.example.test"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the default-role rule is left: %v", err)
+	}
+	for _, u := range []string{o, dev, scoped} {
+		if ms, _ := e.svc.Store.MembershipsOf(ctx, u); func() bool {
+			for _, m := range ms {
+				if m.OrgID == e.a.ID {
+					return true
+				}
+			}
+			return false
+		}() {
+			t.Fatalf("user %s is still a member of the deleted organization", u)
+		}
+	}
+	// Organization b is whole.
+	if ms, _ := e.svc.Store.ListMembers(ctx, e.b.ID); len(ms) != 2 {
+		t.Fatalf("members of b: %+v", ms)
+	}
+	if is, _ := e.svc.Store.ListInvitations(ctx, e.b.ID); len(is) != 1 || is[0].ID != invB.ID {
+		t.Fatalf("invitations of b: %+v", is)
+	}
+	if on, _ := e.svc.Store.MFAEnforced(ctx, e.b.ID); !on {
+		t.Fatal("b lost its MFA requirement")
+	}
+	if _, err := e.svc.Store.GetDomainDefault(ctx, "beta.example.test"); err != nil {
+		t.Fatalf("b lost its default-role rule: %v", err)
+	}
+	_ = ob
+	// Deleting again, or an organization that never existed, is not an error.
+	if ids, err := e.svc.DeleteOrganization(ctx, e.a.ID); err != nil || len(ids) != 0 {
+		t.Fatalf("second delete: %v, %v", ids, err)
 	}
 }

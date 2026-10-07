@@ -61,6 +61,38 @@ func (m *Memory) Update(ctx context.Context, org int64, fn func(Ops) error) erro
 	return nil
 }
 
+// DeleteOrganization implements Store.
+func (m *Memory) DeleteOrganization(_ context.Context, org int64) ([]int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d := m.d
+	for k := range d.members {
+		if k.org == org {
+			delete(d.members, k)
+		}
+	}
+	for id, r := range d.roles {
+		if r.OrgID == org {
+			delete(d.roles, id)
+		}
+	}
+	var ids []int64
+	for id, inv := range d.invites {
+		if inv.OrgID == org {
+			ids = append(ids, id)
+			delete(d.invites, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	delete(d.mfa, org)
+	for dom, rule := range d.domains {
+		if rule.OrgID == org {
+			delete(d.domains, dom)
+		}
+	}
+	return ids, nil
+}
+
 func (d *memData) clone() *memData {
 	c := &memData{nextRole: d.nextRole, nextInvite: d.nextInvite, members: map[mkey]*Member{}, roles: map[int64]*ProjectRole{},
 		invites: map[int64]*invRow{}, mfa: map[int64]bool{}, domains: map[string]DomainDefault{}, checked: map[string]bool{}, cutoff: d.cutoff}
@@ -307,7 +339,7 @@ func (o *memOps) DeleteMember(_ context.Context, org int64, user string) error {
 func (o *memOps) CountOwners(_ context.Context, org int64) (int, error) {
 	n := 0
 	for k, m := range o.d.members {
-		if k.org == org && m.RoleID == RoleOwner {
+		if k.org == org && m.RoleID == RoleOwner && k.user != StandInOwnerID {
 			n++
 		}
 	}

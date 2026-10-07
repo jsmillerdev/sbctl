@@ -100,6 +100,23 @@ func (m *Memory) UpdateOrganization(_ context.Context, o *Organization) error {
 	return ErrNotFound
 }
 
+func (m *Memory) DeleteOrganization(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.projects {
+		if p.OrgID == id {
+			return fmt.Errorf("%w: projects_org_id_fkey", ErrConflict)
+		}
+	}
+	for i := range m.orgs {
+		if m.orgs[i].ID == id {
+			m.orgs = append(m.orgs[:i], m.orgs[i+1:]...)
+			return nil
+		}
+	}
+	return ErrNotFound
+}
+
 func cloneProject(p Project) Project {
 	v := make(map[string]string, len(p.Versions))
 	for k, s := range p.Versions {

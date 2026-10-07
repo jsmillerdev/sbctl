@@ -414,10 +414,30 @@ func runFunctionsDev(cmd *cobra.Command, _ []string) error {
 	if fnTokenFile != "" {
 		// A development convenience with the rights of a node administrator: it expires and is
 		// deleted when this process ends (it is also deleted if writing the file fails).
-		const devUser = "00000000-0000-4000-8000-00000000f0f0"
+		devUser := members.StandInOwnerID
 		tok := secrets.NewPAT()
 		hash := secrets.HashToken(tok)
 		expires := time.Now().Add(fnTokenTTL)
+		// Registered before anything is granted, so that a failure halfway cleans up what was.
+		defer func() {
+			dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = os.Remove(fnTokenFile)
+			if err := apiSrv.Members().RemoveUser(dctx, devUser, true); err != nil {
+				log.Warn("functions dev: removing its memberships", "error", err)
+			}
+			if t, err := n.Registry.GetAccessTokenByHash(dctx, hash); err == nil && t != nil {
+				if err := n.Registry.DeleteAccessToken(dctx, devUser, t.ID); err != nil {
+					log.Warn("functions dev: deleting its access token", "error", err)
+				}
+			}
+		}()
+		// A run that was killed leaves its seats and token behind: clear them first.
+		if m, t, err := api.SweepStandIn(ctx, n.Registry, apiSrv.Members()); err != nil {
+			log.Warn("functions dev: sweeping what an earlier run left behind", "error", err)
+		} else if m+t > 0 {
+			log.Info("functions dev: removed what an earlier run left behind", "memberships", m, "tokens", t)
+		}
 		if err := n.Registry.CreateAccessToken(ctx, &registry.AccessToken{UserID: devUser, Name: "functions dev", Hash: hash, Prefix: tok[:8], ExpiresAt: &expires}); err != nil {
 			return err
 		}
@@ -432,19 +452,6 @@ func runFunctionsDev(cmd *cobra.Command, _ []string) error {
 				return err
 			}
 		}
-		defer func() {
-			dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			_ = os.Remove(fnTokenFile)
-			if err := apiSrv.Members().RemoveUser(dctx, devUser, true); err != nil {
-				log.Warn("functions dev: removing its memberships", "error", err)
-			}
-			if t, err := n.Registry.GetAccessTokenByHash(dctx, hash); err == nil && t != nil {
-				if err := n.Registry.DeleteAccessToken(dctx, devUser, t.ID); err != nil {
-					log.Warn("functions dev: deleting its access token", "error", err)
-				}
-			}
-		}()
 		if err := os.WriteFile(fnTokenFile, []byte(tok+"\n"), 0o600); err != nil {
 			return err
 		}

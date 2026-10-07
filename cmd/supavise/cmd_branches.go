@@ -14,6 +14,8 @@ import (
 	"github.com/jsmillerdev/supavise/internal/app"
 	"github.com/jsmillerdev/supavise/internal/backup"
 	"github.com/jsmillerdev/supavise/internal/branching"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
@@ -25,12 +27,23 @@ func openBranching(ctx context.Context) (*branching.Service, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	log := newLogger(cfg)
 	n, err := openNode(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+	svc, err := newBranching(ctx, cfg, n)
+	if err != nil {
+		n.Close()
+		return nil, nil, err
+	}
+	return svc, func() { svc.Drain(context.Background()); n.Close() }, nil
+}
+
+// newBranching builds the branching service over an open node.
+func newBranching(ctx context.Context, cfg *config.Config, n *lifecycle.Node) (*branching.Service, error) {
+	log := newLogger(cfg)
 	var bk *backup.Service
+	var err error
 	if bk, err = app.NewBackupService(ctx, cfg, n.Registry, n.Secrets, appOptions(cfg)); err != nil {
 		log.Warn("no usable backup backend: with_data needs a copy-on-write filesystem here", "err", err)
 		bk = nil
@@ -41,12 +54,7 @@ func openBranching(ctx context.Context) (*branching.Service, func(), error) {
 	if pg, ok := n.Registry.(*registry.Postgres); ok {
 		deps.Functions = api.FunctionDigests(api.NewPGStore(pg.Pool()))
 	}
-	svc, err := branching.New(deps)
-	if err != nil {
-		n.Close()
-		return nil, nil, err
-	}
-	return svc, func() { svc.Drain(context.Background()); n.Close() }, nil
+	return branching.New(deps)
 }
 
 type branchView struct {

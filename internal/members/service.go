@@ -407,7 +407,7 @@ func (s *Service) SetOrgRole(ctx context.Context, actor *Access, org OrgRef, use
 			return err
 		}
 		if m.RoleID == RoleOwner && roleID != RoleOwner {
-			if err := keepOwner(ctx, ops, org.ID); err != nil {
+			if err := keepOwner(ctx, ops, org.ID, userID); err != nil {
 				return err
 			}
 		}
@@ -422,8 +422,17 @@ func (s *Service) SetOrgRole(ctx context.Context, actor *Access, org OrgRef, use
 	})
 }
 
-// keepOwner refuses the change when the member being changed is the last Owner.
-func keepOwner(ctx context.Context, ops Ops, org int64) error {
+// StandInOwnerID is the dashboard user that `supavise functions dev --token-file` makes Owner of
+// every organization for as long as the command runs. The seat is a development convenience,
+// not an Owner: CountOwners leaves it out, so a seat that a crash left behind cannot stand in
+// for the last real Owner, and changes to it never meet the last-owner rule.
+const StandInOwnerID = "00000000-0000-4000-8000-00000000f0f0"
+
+// keepOwner refuses the change when the member being changed (user) is the last Owner.
+func keepOwner(ctx context.Context, ops Ops, org int64, user string) error {
+	if user == StandInOwnerID {
+		return nil
+	}
 	n, err := ops.CountOwners(ctx, org)
 	if err != nil {
 		return err
@@ -553,7 +562,7 @@ func (s *Service) RemoveRole(ctx context.Context, actor *Access, org OrgRef, use
 			return ErrNotFound
 		}
 		if m.RoleID == RoleOwner {
-			if err := keepOwner(ctx, ops, org.ID); err != nil {
+			if err := keepOwner(ctx, ops, org.ID, userID); err != nil {
 				return err
 			}
 		}
@@ -595,7 +604,7 @@ func (s *Service) RemoveMember(ctx context.Context, actor *Access, org OrgRef, u
 			}
 		}
 		if m.RoleID == RoleOwner {
-			if err := keepOwner(ctx, ops, org.ID); err != nil {
+			if err := keepOwner(ctx, ops, org.ID, userID); err != nil {
 				return err
 			}
 		}
@@ -622,13 +631,21 @@ func (e *LastOwnerError) Is(target error) bool { return target == ErrLastOwner }
 // RemoveUser removes every membership of a user (the account is being deleted). It refuses
 // when the user is the only Owner of an organization, unless force is set.
 func (s *Service) RemoveUser(ctx context.Context, userID string, force bool) error {
+	return s.RemoveUserExcept(ctx, userID, force, 0)
+}
+
+// RemoveUserExcept is RemoveUser while organization except is being deleted: the last-owner
+// rule does not apply to that organization, which is going away with its Owners (0: none).
+func (s *Service) RemoveUserExcept(ctx context.Context, userID string, force bool, except int64) error {
 	ms, err := s.Store.MembershipsOf(ctx, userID)
 	if err != nil {
 		return err
 	}
-	if !force {
+	// The stand-in of `functions dev` is not an Owner for the rule, so removing it never refuses.
+	checked := !force && userID != StandInOwnerID
+	if checked {
 		for _, m := range ms {
-			if m.RoleID != RoleOwner {
+			if m.RoleID != RoleOwner || m.OrgID == except {
 				continue
 			}
 			if n, err := s.Store.CountOwners(ctx, m.OrgID); err != nil {
@@ -647,8 +664,8 @@ func (s *Service) RemoveUser(ctx context.Context, userID string, force bool) err
 			if err != nil {
 				return err
 			}
-			if cur.RoleID == RoleOwner && !force {
-				if err := keepOwner(ctx, ops, m.OrgID); err != nil {
+			if cur.RoleID == RoleOwner && checked && m.OrgID != except {
+				if err := keepOwner(ctx, ops, m.OrgID, userID); err != nil {
 					return &LastOwnerError{OrgID: m.OrgID}
 				}
 			}
@@ -659,6 +676,12 @@ func (s *Service) RemoveUser(ctx context.Context, userID string, force bool) err
 		}
 	}
 	return nil
+}
+
+// DeleteOrganization removes everything the model keeps for an organization that is being
+// deleted (see Store.DeleteOrganization) and returns the ids of its invitations.
+func (s *Service) DeleteOrganization(ctx context.Context, org int64) ([]int64, error) {
+	return s.Store.DeleteOrganization(ctx, org)
 }
 
 // ---- MFA -----------------------------------------------------------------------

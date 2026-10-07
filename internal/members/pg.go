@@ -41,6 +41,31 @@ func (s *PG) Update(ctx context.Context, org int64, fn func(Ops) error) error {
 	})
 }
 
+// DeleteOrganization implements Store with explicit deletes, children first, in one transaction.
+func (s *PG) DeleteOrganization(ctx context.Context, org int64) ([]int64, error) {
+	var ids []int64
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		for _, q := range []string{
+			`delete from supavise.org_project_role_refs where role_id in (select id from supavise.org_project_roles where org_id = $1)`,
+			`delete from supavise.org_project_roles where org_id = $1`,
+			`delete from supavise.org_members where org_id = $1`,
+			`delete from supavise.org_mfa where org_id = $1`,
+			`delete from supavise.sso_default_roles where org_id = $1`,
+		} {
+			if _, err := tx.Exec(ctx, q, org); err != nil {
+				return err
+			}
+		}
+		rows, err := tx.Query(ctx, `delete from supavise.org_invitations where org_id = $1 returning id`, org)
+		if err != nil {
+			return err
+		}
+		ids, err = pgx.CollectRows(rows, pgx.RowTo[int64])
+		return err
+	})
+	return ids, err
+}
+
 type pgOps struct{ q querier }
 
 func mapErr(err error) error {
@@ -133,7 +158,8 @@ func (o *pgOps) DeleteMember(ctx context.Context, org int64, user string) error 
 
 func (o *pgOps) CountOwners(ctx context.Context, org int64) (int, error) {
 	var n int
-	err := o.q.QueryRow(ctx, `select count(*) from supavise.org_members where org_id = $1 and role_id = 1`, org).Scan(&n)
+	err := o.q.QueryRow(ctx, `select count(*) from supavise.org_members where org_id = $1 and role_id = 1 and user_id <> $2::uuid`,
+		org, StandInOwnerID).Scan(&n)
 	return n, err
 }
 

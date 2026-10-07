@@ -93,7 +93,9 @@ type Server struct {
 	// members is the roles model: who belongs to which organization, with which permissions.
 	members *members.Service
 	// sso manages the dashboard's SAML identity providers (sso_dashboard.go).
-	sso           *DashboardSSO
+	sso *DashboardSSO
+	// orgs deletes organizations (org_delete.go).
+	orgs          *OrgDeleter
 	studioRefresh func(ctx context.Context) error
 	studioMu      sync.Mutex
 
@@ -274,6 +276,7 @@ func NewServer(d Deps) (*Server, error) {
 	s.studioRefresh = d.StudioRefresh
 	s.sso = NewDashboardSSO(s.accounts, ssoStore)
 	s.sso.Changed = s.studioChanged
+	s.orgs = &OrgDeleter{Reg: s.reg, Members: s.members, SSO: s.sso, Claims: claims, DeleteProject: s.removeProject, Log: s.log}
 	s.auth = newAuthenticator(s.reg, s.mgr.Keys, s.store, s.now, s.cfg.API.Admins())
 	s.auth.removed = claims.UserRemoved
 	s.auth.sso = s.sso.Admit
