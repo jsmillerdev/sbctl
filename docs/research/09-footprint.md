@@ -7,9 +7,14 @@ in CI; this file says what is measured and why, and holds the table once a run e
 
 ## What is measured
 
-One node, one `supavise` binary, real artifacts, the systemd backend, `micro` or `default`
-project class (the class is part of the result: `micro` is 16 MB `shared_buffers` and 30
-connections, `default` is 32 MB and 60). Each project runs `supavise-postgres@`, `supavise-gotrue@` and
+One node, one `supavise` binary, real artifacts, the systemd backend, a project class (the class
+is part of the result). The table below was measured before compute sizes, with the classes of that
+time: `default` was 32 MB `shared_buffers` and 60 connections, `micro` 16 MB and 30. Since then a
+project has a hosted-style size (`internal/lifecycle/README.md`, Compute sizes): the default is Micro
+(256 MB `shared_buffers`, 60 connections, a 1 GB cap), which the registry migration 1250 maps `default`
+to; `--class default` still means Micro. Idle memory is what the cluster touches, not what
+`shared_buffers` reserves, so the numbers should hold; a run at the sizes of today is still to be
+recorded. Each project runs `supavise-postgres@`, `supavise-gotrue@` and
 `supavise-postgrest@`. The system project (`supavise-postgres@system`, `supavise-gotrue@system`) is measured
 separately because it exists once. The shared fleet (Supavisor, Realtime, Storage, pgmeta,
 Studio) is not started by this script; it belongs to the fleet workstream and is added as
