@@ -83,6 +83,13 @@ func TestLayout(t *testing.T) {
 	if u := UnitName(SvcRealtime, ""); u != "sb-realtime.service" {
 		t.Fatal(u)
 	}
+	if u := EdgeBundleCleanUnit("abc"); u != "sb-edge-bundle-clean@abc.service" {
+		t.Fatal(u)
+	}
+	// The bundler has an instance (and a module cache) per project.
+	if u := UnitName(SvcEdgeBundle, "abc"); u != "sb-edge-bundle@abc.service" {
+		t.Fatal(u)
+	}
 	c := Default()
 	c.PublicIP = "203.0.113.7"
 	if c.StudioHost() != "studio.203.0.113.7.sslip.io" {

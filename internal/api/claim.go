@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -480,16 +481,33 @@ func (l *claimLimiter) fail(key string, now time.Time) {
 	l.window(key, now).fails++
 }
 
-// claimClient names the caller for rate limiting. Requests reach the API through sbctl's own
-// reverse proxy on loopback, which replaces X-Forwarded-For with the real client address; a
-// request that did not come through loopback is keyed by its own address. IPv6 clients are
+// trustForwarded reports whether X-Forwarded-For of a request from a loopback peer may be
+// believed. On a node without Edge Functions only local processes the node's owner runs
+// connect from loopback. With the runtime on the node, a function worker can reach this
+// listener too and write any header, so a loopback peer is believed only when it carries the
+// node's proxy secret (config.FunctionsProxyTokenHeader), which workers never see.
+func (s *Server) trustForwarded(r *http.Request) bool {
+	if s.cfg == nil || !s.cfg.Functions.Enabled {
+		return true
+	}
+	got := r.Header.Get(config.FunctionsProxyTokenHeader)
+	if got == "" || s.cfg.StateDir == "" {
+		return false
+	}
+	want, err := config.ReadFunctionsProxyToken(s.cfg.Paths())
+	return err == nil && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// claimClient names the caller for rate limiting. A loopback peer that trustForwarded
+// accepts is a reverse proxy, which replaces X-Forwarded-For with the real client address;
+// a request that did not come through loopback is keyed by its own address. IPv6 clients are
 // grouped by /64, the smallest block a single subscriber controls.
-func claimClient(r *http.Request) string {
+func claimClient(r *http.Request, trustForwarded bool) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+	if ip := net.ParseIP(host); trustForwarded && ip != nil && ip.IsLoopback() {
 		if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
 			// Take the last entry: whatever precedes it was supplied by the caller.
 			if i := strings.LastIndex(xff, ","); i >= 0 {
@@ -523,7 +541,7 @@ func (s *Server) claimRoutes(mux *muxSet) {
 	}))
 	mux.handle("POST /claim", s.wrap(authNone, func(w http.ResponseWriter, r *http.Request) error {
 		now := s.now()
-		client := claimClient(r)
+		client := claimClient(r, s.trustForwarded(r))
 		if lim.blocked(client, now) {
 			w.Header().Set("Retry-After", "60")
 			return errf(http.StatusTooManyRequests, "Too many failed attempts; wait a minute")

@@ -147,6 +147,9 @@ func FormatRun(s Spec) ([]byte, error) {
 	if s.WorkDir != "" {
 		fmt.Fprintf(&b, "cd %s\n", shellQuote(s.WorkDir))
 	}
+	if s.Log != "" {
+		fmt.Fprintf(&b, "exec >%s 2>&1\n", shellQuote(s.Log))
+	}
 	for _, p := range s.PreStart {
 		l, err := line(p)
 		if err != nil {
@@ -210,7 +213,11 @@ func renderFiles(cfg *config.Config, s Spec) (changed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	b, err := writeIfChanged(f.Run, run, 0o750)
+	runMode := os.FileMode(0o750)
+	if s.PublicRun {
+		runMode = 0o755
+	}
+	b, err := writeIfChanged(f.Run, run, runMode)
 	if err != nil {
 		return false, err
 	}

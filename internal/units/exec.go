@@ -44,6 +44,9 @@ type Exec struct {
 
 var _ Supervisor = (*Exec)(nil)
 
+// Sandboxed implements Sandboxer: child processes are not confined.
+func (*Exec) Sandboxed() bool { return false }
+
 // NewExec returns the exec backend for cfg.
 func NewExec(cfg *config.Config, log *slog.Logger) *Exec {
 	if log == nil {

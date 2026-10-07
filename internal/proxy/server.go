@@ -34,6 +34,10 @@ type Server struct {
 
 	mu         sync.Mutex
 	transports map[time.Duration]*http.Transport
+
+	// fnToken is the secret the edge runtime's main service demands (functionsToken).
+	fnTokenMu sync.Mutex
+	fnToken   string
 }
 
 // New validates opts, resolves the TLS strategy and loads the host table once, so

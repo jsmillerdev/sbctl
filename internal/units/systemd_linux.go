@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -209,12 +210,25 @@ func (s *Systemd) Status(ctx context.Context, unit string) (Status, error) {
 // Remove implements Supervisor: stop the unit, lift its resource limits and delete
 // the files Render wrote.
 func (s *Systemd) Remove(ctx context.Context, unit string) error {
-	files, _, _, err := runFilesFor(s.cfg, unit)
+	files, svc, _, err := runFilesFor(s.cfg, unit)
 	if err != nil {
 		return err
 	}
+	if svc == config.SvcEdgeBundle {
+		// The bundler's instance of a project that never had sources bundled has nothing to
+		// remove, and loading its unit just to find that out would leave a drop-in behind.
+		if _, err := os.Stat(files.Env); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+	}
 	if err := s.Stop(ctx, unit); err != nil {
 		return err
+	}
+	if svc == config.SvcEdgeBundle {
+		// Done before the rendered files go, so that a failure leaves the unit to try again.
+		if err := s.cleanCache(ctx, unit); err != nil {
+			return fmt.Errorf("units: remove the module cache of %s: %w", unit, err)
+		}
 	}
 	c, err := s.dial(ctx)
 	if err != nil {
@@ -225,6 +239,19 @@ func (s *Systemd) Remove(ctx context.Context, unit string) error {
 		s.log.Warn("could not remove unit drop-ins", "unit", unit, "error", err)
 	}
 	return removeFiles(files)
+}
+
+// cleanCache removes the module cache of the bundler instance unit, which is private to the
+// instance's dynamic uid (CacheDirectory=), so the daemon cannot delete it. A user other than
+// root cannot ask systemd to do it either (CleanUnit is refused by the D-Bus policy of
+// systemd, before polkit is asked), so a one-shot unit that the polkit rule lets the sbctl user
+// start does the removal as root (deploy/systemd/sb-edge-bundle-clean@.service).
+func (s *Systemd) cleanCache(ctx context.Context, unit string) error {
+	_, ref, err := ParseUnit(unit)
+	if err != nil {
+		return err
+	}
+	return s.Start(ctx, config.EdgeBundleCleanUnit(ref))
 }
 
 // revert lifts the limits SetLimits wrote by setting them back to infinity. Removing the
@@ -244,6 +271,9 @@ func (s *Systemd) revert(ctx context.Context, unit string) error {
 }
 
 var _ Enabler = (*Systemd)(nil)
+
+// Sandboxed implements Sandboxer: the unit files confine their services.
+func (*Systemd) Sandboxed() bool { return true }
 
 // Enable makes units start at boot (systemctl enable). Template instances such as
 // "sb-postgres@system.service" are accepted.

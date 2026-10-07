@@ -55,6 +55,13 @@ func TestFormatRun(t *testing.T) {
 	if !strings.Contains(string(b), want) {
 		t.Fatalf("run script:\n%s\nwant to contain:\n%s", b, want)
 	}
+	b, err = FormatRun(Spec{Service: config.SvcEdgeBundle, ArtifactDir: "/art/edge", WorkDir: "/w", Log: "/w/it's.log", Exec: []string{"bin/edge-runtime", "bundle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "cd '/w'\nexec >'/w/it'\\''s.log' 2>&1\nexec '/art/edge/bin/edge-runtime' 'bundle'\n"; !strings.Contains(string(b), want) {
+		t.Fatalf("run script with a log:\n%s\nwant to contain:\n%s", b, want)
+	}
 	if _, err := FormatRun(Spec{Service: "postgres", ArtifactDir: "/a", Exec: []string{"/bin/sh"}}); err == nil {
 		t.Error("absolute command must be rejected")
 	}
@@ -446,6 +453,30 @@ func TestTemplatesContainment(t *testing.T) {
 				if !strings.HasPrefix(strings.TrimSpace(l), "#") && strings.Contains(l, "/var/lib/sbctl/backups") {
 					t.Errorf("%s still mounts or writes the backup directory: %s", name, l)
 				}
+			}
+		}
+	}
+}
+
+// A launcher that a unit under another uid executes (sb-edge-bundle@<ref>.service, a dynamic user) is
+// world-readable; every other launcher stays private to the sbctl user. The environment file is
+// 0600 either way: systemd reads it as root.
+func TestRenderPublicRunMode(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	for _, public := range []bool{false, true} {
+		spec := Spec{Service: config.SvcEdgeBundle, ArtifactDir: "/art", Exec: []string{"bin/edge-runtime", "bundle"}, Env: map[string]string{"K": "secret"}, PublicRun: public}
+		if _, err := renderFiles(cfg, spec); err != nil {
+			t.Fatal(err)
+		}
+		f := FilesFor(cfg, spec)
+		want := os.FileMode(0o750)
+		if public {
+			want = 0o755
+		}
+		for p, w := range map[string]os.FileMode{f.Run: want, f.Env: 0o600} {
+			if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != w {
+				t.Errorf("public=%v %s: %v %v, want %v", public, p, fi, err, w)
 			}
 		}
 	}

@@ -1,0 +1,116 @@
+# internal/functions
+
+Puts what the Management API stores for Edge Functions where the runtime reads it. The API (`internal/api`, workstream B) stores deployments (bundles, and for uploads of sources the sources together with the bundle the node made from them) and sealed secrets in the registry's database; the Edge Runtime's main service (`functions-main/`) reads files. This package is the step between them.
+
+```go
+syncer, err := functions.New(functions.Deps{
+    Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets,
+    Store: functions.NewStore(n.Registry), // or the api.Store the API server uses
+    Keys:  n.Engine.Keys,                  // lifecycle.Manager.Keys
+    Log:   log,
+    Supervisor: n.Supervisor, Artifacts: n.Artifacts, // to bundle uploaded sources (see below); without them such uploads answer 501
+})
+go syncer.Run(ctx)                         // reconcile now and every [functions] reconcile_seconds
+api.New(api.Deps{ /* ... */ Store: store, Functions: syncer }) // api.FunctionsHook
+```
+
+`*Syncer` implements `api.FunctionsHook`: the API calls `FunctionsChanged(ctx, ref)` after every create, deploy, patch and delete of a function, after secrets are set or removed, and after a project is deleted, paused or resumed. The call returns once the files match the store; if it fails, the API answers 500 "The change was stored but could not be applied", the deployment is not lost, and the periodic reconcile retries it. A node without the runtime leaves `Deps.Functions` empty and nothing here runs.
+
+## What it writes
+
+```
+<state>/system/edge-runtime/tenants/<ref>/functions-env.json           0600   jwt secret, SUPABASE_* values, secrets (JSON)
+<state>/system/edge-runtime/tenants/<ref>/functions/<slug>             symlink  ->  .gen/<slug>.<version>.<random>
+<state>/system/edge-runtime/tenants/<ref>/functions/.gen/<...>/        0700   one generation: bundle.eszip and .sbctl-function.json
+```
+
+The tree is in the Edge Runtime's own state directory (`config.Paths.FunctionsRoot()`), not under `projects/<ref>/` as `HANDOFF.md` 3.J says: since the unit templates became allowlists, `sb-edge-runtime` sees only the artifacts, its launcher and `system/edge-runtime`, and binding `projects/` to it would show it every cluster's data directory and unix socket (a process that sees a socket connects as `supabase_admin`) while it runs tenants' code. Cost: a project's functions are not removed by `Engine.Delete`'s `RemoveAll` of `projects/<ref>`; `sbctl projects delete` calls `RemoveFiles`, and a running API server's reconcile removes the tree of any project the registry no longer has.
+
+- **`functions-env.json`** (`buildEnv`): `SUPABASE_URL` (the project's public origin; see `ProjectURL`, `[functions] project_url_template`), `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL` (`postgres://postgres:<password>@127.0.0.1:<project postgres port>/postgres?sslmode=disable`, straight to the project's cluster, no pooler), `SUPABASE_PUBLISHABLE_KEYS` and `SUPABASE_SECRET_KEYS` (`{"default": "..."}` as the upstream compose file passes them), the project's JWT secret for the main service only, and the function secrets, opened from the sealed store. Rewritten only when its content or mode changes. A project with no function and no secret gets no file (its keys are not copied for a project that does not use Edge Functions), and loses the file and the `functions` directory when it ends up with neither.
+- **A generation** is `bundle.eszip` and `.sbctl-function.json`. The upload is `EZBR` + Brotli of an eszip and the runtime wants the plain eszip, so it is decompressed here, streaming into the file, capped at 64 MiB (a bomb stops at the cap; hosted functions are limited to about 20 MB) and required to start with `ESZIP`. `.sbctl-function.json` holds slug, version, `verify_jwt`, kind (`eszip`), the bundle's entry module URL, a `stamp` (the stored deployment's version and update time) and a SHA-256 over the stored upload.
+- **Only bundles are served.** A function that runs from source files runs from real paths, and the runtime's module loader follows relative imports (static and dynamic) out of the function's directory: a source function of one project could import `../../../../<other ref>/functions-env.json` (the other project's JWT secret, service_role key, database password and secrets) or another project's code. The module specifiers inside an eszip are virtual, so a bundled function has nothing of the node to import (`tests/functions/verify.mjs`, function `escape`). Uploads of sources (`supabase functions deploy --use-api`, the CLI when Docker is not running, Studio's function editor, `POST .../functions/deploy`) are therefore bundled by the node first, in a sandbox, see "Bundling uploaded sources". A function stored as sources without a bundle (before this existed, or while no runtime was configured) is skipped with one warning per stored version and no files.
+- **A deployment** writes a new generation in `.gen/` and renames a new symlink over `functions/<slug>`, which is atomic: a reader gets the old function or the new one, never a gap or a mixture (`TestSwapIsAtomicForReaders`). The previous generation stays, because workers of the old deployment may still read from it; older ones are removed, as are generations nothing points at after 15 minutes and leftovers of an interrupted swap. Generation names use a dot as separator (`hello-2.1.x` belongs to `hello-2`, never to `hello`).
+- **Unchanged functions cost nothing.** `Reconcile` visits every function of every project every few seconds, and the stored files can be large, so a function is looked at in this order: its stamp (store version and update time; every store write bumps both) against the live generation's; only when they differ are its files loaded, decoded and written. A deployment that has nothing to serve (no files, sources, a bundle that cannot be decoded or has no entrypoint) is remembered in memory by its stamp, so a large or hostile upload is loaded once per version, not once per cycle; the error of a bad bundle is returned the first time (the deploy that stored it gets the 500) and later syncs skip it silently. `TestReconcileLoadsNothingForUnchangedFunctions` counts the loads.
+- **Refused, with the generation removed and nothing live**: a bundle that is not `EZBR`+Brotli+eszip or is over the cap; a bundle without an entrypoint. One broken function does not keep the others from going live (the errors are joined).
+- **A function without files** (created with the legacy JSON create, no body) is not served.
+
+## Bundling uploaded sources
+
+`Bundler` (`bundler.go`, wired through `Syncer.BundleSources`, which implements `api.SourceBundler`; the API calls it from `POST /v1/projects/{ref}/functions/deploy`) turns an upload of source files into the eszip that is served, with the artifact's own `edge-runtime bundle`, the command the Supabase CLI runs in its Docker image:
+
+1. The files are written under `<state>/system/edge-bundle/work/src/` (paths as uploaded, relative to the project's working directory; `..`, duplicates and file/directory conflicts are refused) and `edge-runtime bundle --entrypoint <src>/<entrypoint_path> --output <work>/out/out.eszip [--import-map <src>/<import_map_path>] [--static <pattern>]... --timeout 100` runs as the one-shot unit **`sb-edge-bundle@<ref>.service`**, an instance of a template for the project the upload belongs to. Arguments and environment follow the CLI (`apps/cli/src/shared/functions/deploy.ts`, `bundleFunctionWithDocker`): the import map is passed unless it is the `deno.json` next to the entrypoint, `DENO_NO_PACKAGE_JSON=1` unless the entrypoint's directory has a `package.json` and there is no import map.
+2. Bundling reads the imports of someone else's code from the disk, which is the same attack as running it (a relative import that climbs out of the upload resolves to any file the unit's user can read, and the bundle carries the content out to the uploader). So the unit (`deploy/systemd/sb-edge-bundle@.service`) has **a uid of its own** (`DynamicUser=yes` with `User=sb-bundle-%i`: the name is the project's, so each instance has its own uid; without `User=` systemd names the dynamic user after the template and all instances run as one uid, which CI showed) and sees nothing of the node but the sources and the artifacts. Both parts are needed. The mount namespace (`TemporaryFileSystem=/var/lib/sbctl:ro`, the same containment as `sb-edge-runtime`) hides paths, but every other unit and the daemon run as the `sbctl` user, and a process may open `/proc/<pid>/root` and `/proc/<pid>/environ` of every process with its own uid: an upload that imports `/proc/<pid of sb-edge-runtime>/root/var/lib/sbctl/system/edge-runtime/tenants/<ref>/functions-env.json` would have carried the JWT secret, service key and database password of every project out in its bundle. With another uid the kernel refuses that (`ptrace_may_access`), and `ProtectProc=invisible` with `ProcSubset=pid` take effect and hide the processes of the node from `/proc` altogether. The unit also has no access to loopback services (`IPAddressDeny=localhost`, with the stub resolver of systemd-resolved allowed) or the instance metadata service, `MemoryMax=1G`, `CPUQuota=100%`, `TasksMax=512` and `TimeoutStartSec=150s`. It needs the network for remote imports (`https:`, `npm:`). It does not run the function's code.
+
+   What the unit's uid may touch is handed over through modes, by the daemon, per upload (`Bundler.Bundle`, `handOver`): `work/src` is owned by the daemon and world-readable, mounted read-only in the unit (it cannot change the sources); `work/out` is owned by the daemon, not writable by the unit, and holds two files the daemon creates empty and makes world-writable, `out.eszip` and `bundle.log`. The unit can fill those two and create or replace nothing else, so the daemon can always delete the whole scratch directory afterwards. The launcher script (`edge-bundle.run`) is world-readable for the same reason (`units.Spec.PublicRun`; the environment file stays 0600, systemd reads it as root). **The module cache is per project.** Each instance has its own, `/var/cache/sb-edge-bundle/<ref>` (`CacheDirectory=sb-edge-bundle/%i`, mode 0700, private to that instance's dynamic uid, under `/var/cache/private` which only root enters), and the unit empties its own directory before a start when it has passed 512 MiB. A cache shared by all projects would let an upload of project B bundle what an upload of project A made the bundler download: a private npm package fetched with the `.npmrc` that A uploaded, or a URL only A's code names; B would import it by its path in the cache and the bundle would carry the content out to B's uploader. With one cache and one uid per project that import finds nothing it may open (`tests/linux/functions-smoke.sh` plants a package through A's upload and tries to import it from B's, by four spellings of the path, with an import of B's own cache as the control). Two uploads of one project share a cache, which is the point of a cache; what it costs is that a project downloads a module again that another project has already fetched. The cache is removed with the project: `PostgresPlane.Delete` removes the project's instance, and `units.Systemd.Remove` starts `sb-edge-bundle-clean@<ref>.service` (a one-shot unit that runs as root, because the directory is private to the instance's uid under `/var/cache/private`, and that takes the ref from its own name, accepts lowercase letters only and may write nowhere but under `/var/cache/private/sb-edge-bundle`; the polkit `manage-units` rule the node already has lets the sbctl user start it; `CleanUnit` would do the same removal, but systemd's D-Bus policy refuses it to every user but root) before it deletes the rendered files, so a failure keeps them and a retry of the delete cleans again. The bundler's cache of earlier versions in `system/edge-bundle/deno` is removed on the next upload. A bundler compromised by a hostile module could poison its own project's cache for later bundles of that project only; it can no longer reach files of the node or another project's cache.
+
+   The checks: `TestBundleUnitIsolatesTheBundlerFromTheNode` and `TestBundlerHandsTheUnitsUidWhatItNeedsAndNothingElse` (Go; the unit file and the modes), `tests/functions/run.sh` (on Linux, uploads that import project A's `functions-env.json` by a relative path and through `/proc/<pid>/root` and `/proc/<pid>/environ` of the runtime and the daemon are refused with 400, nothing is stored, no secret appears in the error) and `tests/linux/functions-smoke.sh`, which replaces the unit's `ExecStart` with a probe through a drop-in and runs it as the bundler runs (same uid, namespace, `/proc` and cache): another uid than `sbctl`, `/proc/<pid>` of the runtime and the daemon invisible, `/proc/<pid>/environ` and `/proc/<pid>/root` unreadable, the tenants files unreadable by path and through `/proc/<pid>/root`, the sources read-only, `/proc/meminfo` absent.
+3. The bundler's output is read (at most 64 MiB, must start with `ESZIP`), compressed to the form the CLI uploads (`EZBR` + Brotli, quality 6) and stored by the API **next to the sources**: `.sbctl-bundle.ezbr` and `.sbctl-bundle.json` (`{"entrypoint": ...}`, the file URL of the entrypoint where it was bundled; edge-runtime v1.77.4 starts from the entrypoint key recorded inside the eszip and uses this URL only as a fallback). The sources stay readable for `supabase functions download` and Studio's editor (the node's two files are left out of the download); the materializer serves the bundle and ignores the sources. The names `.sbctl-bundle.*` cannot be uploaded.
+4. One bundling at a time (all instances share one scratch directory), up to eight uploads waiting, then `429`. The scratch directory is deleted afterwards, whatever happened. The exec backend (a development machine, `bundle_unsandboxed`) has no unit: it keeps the module cache of each project in `projects/<ref>/edge-bundle/deno` (it goes with the project), emptied when it passes 512 MiB, and the files keep the same modes.
+
+Errors reach the uploader: a failure of the code (`Module not found ...`, a syntax error) is `400 Could not bundle the function: <the bundler's output>` (with the scratch path removed), a node that cannot bundle (no supervisor, artifact not fetched, no sandbox) is `501` with what to do instead (`supabase functions deploy` with Docker running, which bundles on the client), a full queue `429`.
+
+**A node whose supervisor cannot sandbox does not bundle uploads.** Only systemd units are confined (`units.Sandboxer`); on the exec backend (macOS and development machines) uploads of sources answer `501`, and the bundler is created only with `[functions] bundle_unsandboxed = true` (or `SBCTL_FUNCTIONS_BUNDLE_UNSANDBOXED=true`), which is for a development machine that serves nobody else's projects. Without it, on such a node deploy a bundle: `supabase functions deploy` with Docker running, or `tests/functions/run.sh` with `DEPLOY_VIA=artifact` (the artifact's own `edge-runtime bundle` and curl).
+
+**Without Docker, the CLI falls back to the API.** `supabase functions deploy` uses Docker to bundle when Docker runs and otherwise uploads the sources (`useLocalBundler = !flags.useApi && ...` then "Docker is not running" falls back to `deployWithApi`, CLI v2.119.0), so on a machine without Docker the plain command, `--use-api` and Studio all depend on this.
+
+## When it runs
+
+| Trigger | What |
+|---|---|
+| API change (hook) | `SyncProject(ref)`: env file, then every function of the project; links of functions the store no longer has are removed |
+| `sbctl projects rotate-keys` | the command calls `SyncProject(ref)` itself after the keys changed (`cmd/sbctl/cmd_projects.go`), so functions check the new JWT secret at once instead of at the next reconcile of a running API server |
+| every `reconcile_seconds`, and at start | `Reconcile`: the same for every project but `system`, then `collectGone`; this is what makes restored data and a failed first attempt show up (and key rotation, for a rotation made by another route) |
+| project delete, pause, resume | the API tells the hook after each (`functionsGone`), so a deleted or paused project's keys and secrets leave the disk at once; `sbctl projects delete` calls `RemoveFiles(cfg, ref)`; any other deletion is found by the next `SyncProject(ref)` or `Reconcile` (`collectGone` looks the project up again under its lock, so a project created since the listing keeps what its first deployment wrote). A project in a status the proxy does not serve (`INACTIVE`, `PAUSING`, `GOING_DOWN`, `REMOVED`, `INIT_FAILED`) has no files: a request that reaches the runtime without passing the proxy's status check finds nothing to run, and resuming rebuilds the files from the store |
+
+`SyncProject` of a project the registry does not know removes its tree. Work on one project is serialized by a lock per ref, shared with `collectGone`.
+
+## CLI
+
+`cmd/sbctl/cmd_functions.go`:
+
+```
+sbctl functions list <ref> [--json]            what is deployed, and whether the disk has that version ("live")
+sbctl functions invoke <ref> <slug> [subpath]  one request through the node's own proxy, with the project's anon key
+                                               (-X, -d, -H, --service-role, --jwt, --no-auth)
+sbctl functions logs [ref] [-n N] [-f] [--all] the shared runtime log (journalctl, or the exec backend's file)
+sbctl functions dev [--token-file F]           Management API + proxy + sb-edge-runtime in one process
+```
+
+`dev` exists because `sbctl serve` (workstream X) wires the API and the proxy and this feature is not in it yet. It forces `[functions] enabled`, starts only the runtime of the fleet, mounts `api.Server` with the hook, runs the reconcile loop and the proxy with `FunctionsEnabled`, and with `--token-file` mints a personal access token for the Supabase CLI: it carries the rights of a node administrator, expires after 12 hours and is deleted, with the file, when the command ends. `tests/functions/run.sh` and `tests/linux/functions-smoke.sh` use it.
+
+## Wiring into `sbctl serve` (not done here, `cmd/sbctl/cmd_serve.go` belongs to X)
+
+```go
+store := functions.NewStore(n.Registry)                       // or the store already given to api.Deps
+fs, err := functions.New(functions.Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Store: store, Keys: n.Engine.Keys, Log: log,
+    Supervisor: n.Supervisor, Artifacts: n.Artifacts}) // the last two let uploads of sources be bundled
+// api.Deps: add  Store: store, Functions: fs
+// proxy.Options: add  FunctionsEnabled: cfg.Functions.Enabled   (the proxy reads the node's proxy secret itself)
+if cfg.Functions.Enabled { go fs.Run(ctx) }
+// fleet.Setup / fleet.NewManager: nothing to add; with [functions] enabled they start sb-edge-runtime,
+// and `sbctl fleet start` fetches the edge-runtime artifact (fleet.ServicesFor).
+```
+
+## Tests
+
+```
+go test ./internal/functions        # unit tests over the memory registry and memory store, no processes
+tests/functions/run.sh              # the real thing against a running node, see its header
+```
+
+Unit tests cover the env file (mode, content, multi-line secrets, nothing of another project), generation swap and garbage collection, atomic swaps under concurrent readers, two projects with the same slug, delete, orphans, source functions that are not materialized, bundles (a real CLI 2.119.0 upload is `testdata/hello.ezbr`) including a compression bomb, loads avoided for unchanged functions, reconcile, key rotation and pausing, project URLs.
+
+## Verified
+
+On darwin-arm64 with the slim-services artifacts under the exec backend (`sbctl functions dev`, `[functions] bundle_unsandboxed = true`), the real `supabase` CLI 2.119.0 and supabase-js 2.117.2, **without Docker** (`tests/functions/run.sh`, `DEPLOY_VIA=artifact`): two projects, the same slugs with different code; project A bundled on the client with the artifact's own `edge-runtime bundle` and uploaded with the CLI's request, project B uploaded as sources with `supabase functions deploy --use-api` and bundled by the node (`Bundler`, the real artifact, npm imports and a relative `_shared` import included); `secrets set`; invoked through `internal/proxy`; per-project code, secrets and `SUPABASE_URL`; `verify_jwt` on (anon, service_role, publishable and secret keys accepted; no, bad, expired, foreign tokens `401`) and off (`--no-verify-jwt`); a function that queries its own database through `SUPABASE_DB_URL` and through supabase-js with the service key; the runtime's port refusing callers without the proxy secret, and a function that tries it under four names claiming to be the other project; a function that does not boot, one that never returns and one that allocates without end, none of which affected the other project; a flood over `max_per_project`; changed secrets and a redeploy visible on the next request; delete of a function; pause and resume; delete of a project removing its files. `TestBundlerWithTheRealArtifact` (`SBCTL_TEST_EDGE_RUNTIME=<artifact dir>`) bundles with the real artifact, including a path with a space and a non-ASCII letter, and shows the error for a missing import.
+
+The Linux checks of the sandbox (an upload that imports another project's files is refused; the unit's user, limits and idle state; the worker budget with the real unit and its `MemoryMax`) run only in CI: `tests/linux/functions-smoke.sh`, job `functions-smoke`.
+
+## Not done, not verified
+
+- Linux and systemd: `tests/linux/functions-smoke.sh` (CI job `functions-smoke`, amd64 and arm64) runs the same steps under the real unit; see `.github/workflows/linux.yml` for its result.
+- A runtime process per project is not an option here; isolation is the runtime's (see `functions-main/README.md`).
+- Per-project function logs and `supabase functions download` of functions uploaded already bundled (`functions-main/README.md`, "Not done").
+- Metrics and rate limits. Per-project concurrency and the worker budget are enforced in the main service (`functions-main/README.md`, "Fairness between projects, and the memory budget").
+- Docker was not used on the development machine for any of this; the CLI's own Docker bundling is exercised only on the CI VM, where it is the default flow (project A in `functions-smoke`).
+- The sandbox of `sb-edge-bundle@<ref>.service` (the dynamic uid, the per-project cache, `ProtectProc`, `ProcSubset`, the read-only sources and the output files the daemon hands over) is verified only in CI. The loopback deny with the resolver stub allowed assumes systemd-resolved (Ubuntu); on a node whose resolver is another loopback address, bundling fails to resolve remote imports until `IPAddressAllow=` lists it (a drop-in).

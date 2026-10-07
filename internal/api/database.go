@@ -376,6 +376,9 @@ func (s *Server) createSecrets(w http.ResponseWriter, r *http.Request) error {
 	if err := s.store.PutFunctionSecrets(r.Context(), p.Ref, sealed); err != nil {
 		return err
 	}
+	if err := s.functionsChanged(r.Context(), p.Ref); err != nil {
+		return err
+	}
 	w.WriteHeader(http.StatusCreated)
 	return nil
 }
@@ -390,6 +393,9 @@ func (s *Server) deleteSecrets(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if err := s.store.DeleteFunctionSecrets(r.Context(), p.Ref, names); err != nil {
+		return err
+	}
+	if err := s.functionsChanged(r.Context(), p.Ref); err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusOK)

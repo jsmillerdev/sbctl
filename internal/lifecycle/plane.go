@@ -486,7 +486,10 @@ func (pl *PostgresPlane) Delete(ctx context.Context, ref string) error {
 		return fmt.Errorf("lifecycle: refusing to delete %q: not a project ref", ref)
 	}
 	var first error
-	us := pl.unitsOf(ref)
+	// The bundler's instance for the project (sb-edge-bundle@<ref>.service) holds the module
+	// cache of its uploads, which nothing else may delete: removing the unit removes the
+	// cache. It does nothing for a project whose sources were never bundled.
+	us := append(pl.unitsOf(ref), config.UnitName(config.SvcEdgeBundle, ref))
 	for i := len(us) - 1; i >= 0; i-- {
 		if err := pl.sup.Remove(ctx, us[i]); err != nil && first == nil {
 			first = err

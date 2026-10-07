@@ -1,0 +1,44 @@
+[Unit]
+Description=sbctl removal of the Edge Function bundler's module cache of project %i
+Documentation=https://github.com/OWNER/sbctl
+
+[Service]
+# Started by sbctl when it deletes project <ref> (units.Systemd.Remove), after it has stopped
+# sb-edge-bundle@<ref>.service. The module cache of that unit (CacheDirectory=sb-edge-bundle/%i)
+# is private to its dynamic uid under /var/cache/private, which only root may enter, so the
+# sbctl user cannot delete it. systemd can ("systemctl clean --what=cache"), but the D-Bus
+# policy of systemd does not let a user other than root call CleanUnit, so this unit does the
+# same removal as root and is as narrow as it can be: it takes the project ref from its own name,
+# refuses anything but lowercase letters (no "..", no "/"), and may write nowhere but under
+# /var/cache/private/sb-edge-bundle. The polkit rule of sbctl (manage-units on sb-* units) is
+# what lets the sbctl user start it. It reads nothing from the project and runs no tenant code.
+Type=oneshot
+Slice=sbctl.slice
+ExecStart=/bin/sh -c 'case "$$1" in ""|*[!a-z]*) echo "not a project ref: $$1" >&2; exit 2;; esac; rm -rf -- "/var/cache/private/sb-edge-bundle/$$1"' sh %i
+TimeoutStartSec=120s
+SyslogIdentifier=sb-edge-bundle-clean
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+# Root needs to open and delete files that belong to another uid, and nothing else.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=-/var/cache/private/sb-edge-bundle
+
+# Never enabled: sbctl starts an instance when it deletes a project.

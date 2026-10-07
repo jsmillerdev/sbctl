@@ -57,3 +57,25 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/cfn"
           "$RUNNER_TEMP/cfn/bin/pip" install --quiet cfn-lint
           "$RUNNER_TEMP/cfn/bin/cfn-lint" deploy/cloudformation/sbctl.yaml
+
+  functions-main:
+    # The Deno main service of the Edge Runtime (functions-main/): format, lint, type check
+    # and unit tests. The Go side embeds these files; internal/fleet tests keep the two in step.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: 2.6.8
+      - name: fmt
+        run: deno fmt --check
+        working-directory: functions-main
+      - name: lint
+        run: deno lint
+        working-directory: functions-main
+      - name: check
+        run: deno check index.ts src/*.ts
+        working-directory: functions-main
+      - name: test
+        run: deno test --allow-read --allow-write --allow-env src/
+        working-directory: functions-main

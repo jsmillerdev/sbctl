@@ -45,6 +45,9 @@ type Deps struct {
 	Upstream func(p *registry.Project, svc string) string
 	// Now is the clock; empty means time.Now.
 	Now func() time.Time
+	// Functions is told when a project's Edge Functions or their secrets change (see
+	// FunctionsHook). Empty means nothing runs them on this node.
+	Functions FunctionsHook
 	// CreateWait bounds how long POST /v1/projects waits for the new project to show
 	// up in the registry before answering 201 COMING_UP. Zero means 10 seconds.
 	CreateWait time.Duration
@@ -63,6 +66,8 @@ type Server struct {
 	auth  *authenticator
 	// accounts redeems claim and invite tokens (claim.go).
 	accounts *Accounts
+
+	fnHook FunctionsHook
 
 	pgmetaURL        string
 	upstreamOverride func(p *registry.Project, svc string) string
@@ -161,7 +166,7 @@ func NewServer(d Deps) (*Server, error) {
 	}
 	s := &Server{
 		reg: d.Registry, sec: d.Secrets, mgr: d.Manager, cfg: d.Config, log: d.Logger, store: d.Store,
-		hc: d.HTTPClient, now: d.Now, pgmetaURL: d.PGMetaURL, upstreamOverride: d.Upstream, createWait: d.CreateWait,
+		hc: d.HTTPClient, now: d.Now, fnHook: d.Functions, pgmetaURL: d.PGMetaURL, upstreamOverride: d.Upstream, createWait: d.CreateWait,
 		pgmetaKeyMu: make(chan struct{}, 1), roEnsured: map[string]readOnlyEnsured{},
 	}
 	if s.log == nil {

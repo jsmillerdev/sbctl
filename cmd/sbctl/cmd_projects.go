@@ -8,6 +8,7 @@ import (
 
 	"github.com/OWNER/sbctl/internal/app"
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/functions"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
@@ -180,6 +181,11 @@ func init() {
 			if err := n.Engine.DeleteWith(cmd.Context(), a[0], lifecycle.DeleteOptions{SkipFinalBackup: pSkipBackup}); err != nil {
 				return err
 			}
+			// The Edge Functions tree lives in the runtime's state directory, not in the
+			// project's: remove it now rather than at the next reconcile of a running daemon.
+			if err := functions.RemoveFiles(n.Cfg, a[0]); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: removing the Edge Functions files of %s: %v\n", a[0], err)
+			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s deleted\n", a[0])
 			return nil
 		})
@@ -190,6 +196,14 @@ func init() {
 			k, err := n.Engine.RotateKeys(cmd.Context(), a[0])
 			if err != nil {
 				return err
+			}
+			// Functions check JWTs against the project's secret from a file: write the new one
+			// now instead of at the next reconcile of a running API server (up to
+			// [functions] reconcile_seconds of 401s for the new keys and 200s for the old).
+			if n.Cfg.Functions.Enabled {
+				if err := syncFunctions(cmd.Context(), n, a[0]); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: the Edge Functions of %s still check the old JWT secret until the API server's next reconcile: %v\n", a[0], err)
+				}
 			}
 			if pJSON {
 				return printJSON(cmd.OutOrStdout(), viewKeys(k))

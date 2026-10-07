@@ -291,6 +291,7 @@ func (s *Server) deleteProject(r *http.Request) (*registry.Project, error) {
 	if err := s.mgr.Delete(ctx, p.Ref); err != nil {
 		return nil, mapErr(err)
 	}
+	s.functionsGone(ctx, p.Ref)
 	return p, nil
 }
 
@@ -308,6 +309,7 @@ func (s *Server) pauseProject(status int) handlerFunc {
 		if err := s.mgr.Pause(ctx, p.Ref); err != nil {
 			return mapErr(err)
 		}
+		s.functionsGone(ctx, p.Ref)
 		w.WriteHeader(status)
 		return nil
 	}
@@ -327,6 +329,7 @@ func (s *Server) restoreProject(status int) handlerFunc {
 		if err := s.mgr.Resume(ctx, p.Ref); err != nil {
 			return mapErr(err)
 		}
+		s.functionsGone(ctx, p.Ref)
 		w.WriteHeader(status)
 		return nil
 	}
@@ -356,6 +359,7 @@ func (s *Server) restartProject(status int) handlerFunc {
 		if err := s.mgr.Resume(ctx, p.Ref); err != nil {
 			return mapErr(err)
 		}
+		s.functionsGone(ctx, p.Ref)
 		w.WriteHeader(status)
 		return nil
 	}

@@ -150,6 +150,8 @@ func Port(cfg *config.Config, svc string) int {
 		return cfg.Ports.PGMeta
 	case config.SvcStudio:
 		return cfg.Ports.Studio
+	case config.SvcEdgeRuntime:
+		return cfg.Ports.EdgeRuntime
 	}
 	return 0
 }
@@ -168,6 +170,8 @@ func healthPath(svc string) string {
 		return "/health"
 	case config.SvcStudio:
 		return "/api/get-utc-time"
+	case config.SvcEdgeRuntime:
+		return edgeRuntimeHealthPath
 	}
 	return "/"
 }
@@ -203,7 +207,7 @@ func (m *Manager) Specs(ctx context.Context) ([]units.Spec, error) {
 	}
 	var specs []units.Spec
 	var errs []error
-	for _, svc := range Services {
+	for _, svc := range m.services() {
 		if m.d.skipped(svc) {
 			continue
 		}
@@ -237,7 +241,11 @@ func (m *Manager) Start(ctx context.Context) error {
 		return err
 	}
 	var errs []error
-	for _, svc := range Services {
+	if err := m.retireEdgeRuntime(ctx); err != nil {
+		m.log.Error("edge functions are off but the runtime of an earlier configuration could not be removed", "error", err)
+		errs = append(errs, fmt.Errorf("%s: %w", config.SvcEdgeRuntime, err))
+	}
+	for _, svc := range m.services() {
 		if m.d.skipped(svc) {
 			continue
 		}
@@ -333,14 +341,55 @@ func (m *Manager) logTail(unit string) string {
 // the data. A unit that does not exist or does not run is not an error.
 func (m *Manager) Stop(ctx context.Context) error {
 	var errs []error
-	for i := len(Services) - 1; i >= 0; i-- {
-		svc := Services[i]
+	svcs := m.lifecycleServices()
+	for i := len(svcs) - 1; i >= 0; i-- {
+		svc := svcs[i]
 		if m.d.skipped(svc) {
 			continue
 		}
 		if err := m.d.Supervisor.Stop(ctx, unitOf(svc)); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", svc, err))
 		}
+	}
+	return errors.Join(errs...)
+}
+
+// edgeRuntimeRendered reports whether a unit was rendered for the Edge Runtime.
+func (m *Manager) edgeRuntimeRendered() bool {
+	_, err := os.Stat(units.FilesFor(m.cfg(), units.Spec{Service: config.SvcEdgeRuntime}).Run)
+	return err == nil
+}
+
+// lifecycleServices is the services Stop and Status deal with: services(), and the Edge
+// Runtime too when [functions] enabled was turned off after the unit had been rendered.
+// Without that, `fleet stop` would leave the runtime running and `fleet status` would not
+// show it.
+func (m *Manager) lifecycleServices() []string {
+	svcs := m.services()
+	if m.cfg().Functions.Enabled || !m.edgeRuntimeRendered() {
+		return svcs
+	}
+	forced := *m.cfg()
+	forced.Functions.Enabled = true
+	return ServicesFor(&forced)
+}
+
+// retireEdgeRuntime takes the Edge Runtime off a node that no longer enables it: the unit
+// is stopped and its rendered files removed, and the tree of every project's functions
+// goes too. That tree holds each project's JWT secret, service key, database password and
+// function secrets, which must not stay on disk for a feature that is off.
+func (m *Manager) retireEdgeRuntime(ctx context.Context) error {
+	if m.cfg().Functions.Enabled || m.d.skipped(config.SvcEdgeRuntime) {
+		return nil
+	}
+	var errs []error
+	if m.edgeRuntimeRendered() {
+		if err := m.d.Supervisor.Remove(ctx, unitOf(config.SvcEdgeRuntime)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := os.RemoveAll(m.cfg().Paths().FunctionsRoot()); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
@@ -358,7 +407,7 @@ func (m *Manager) neverRendered(svc string) bool {
 // health endpoint.
 func (m *Manager) Status(ctx context.Context) []Health {
 	var out []Health
-	for _, svc := range Services {
+	for _, svc := range m.lifecycleServices() {
 		if m.d.skipped(svc) {
 			continue
 		}
@@ -366,6 +415,14 @@ func (m *Manager) Status(ctx context.Context) []Health {
 		h := Health{Service: svc, Unit: unit}
 		st, err := m.d.Supervisor.Status(ctx, unit)
 		switch {
+		case svc == config.SvcEdgeRuntime && !m.cfg().Functions.Enabled:
+			// Left over from a configuration that had [functions] enabled: shown so that a
+			// runtime that still runs is not invisible, and never a failure.
+			h.Optional = true
+			h.Status, h.Error = "STOPPED", "Edge Functions are off in the configuration; the unit of an earlier configuration is still rendered"
+			if err == nil && (st.State == units.StateActive || st.State == units.StateActivating) {
+				h.Status, h.Error = "UNHEALTHY", "Edge Functions are off in the configuration but this unit still runs (sbctl fleet start removes it)"
+			}
 		case err != nil:
 			h.Status, h.Error = "STOPPED", err.Error()
 			h.Optional = m.neverRendered(svc)

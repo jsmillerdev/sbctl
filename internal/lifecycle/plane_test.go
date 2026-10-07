@@ -409,3 +409,38 @@ func TestStartDatabaseAppliesChangedSettings(t *testing.T) {
 		})
 	}
 }
+
+// Deleting a project also removes the bundler's unit instance of the project: the module
+// cache of its uploads is private to that unit and goes with it.
+type namedRemoveSup struct {
+	recSup
+	removed []string
+}
+
+func (n *namedRemoveSup) Remove(_ context.Context, unit string) error {
+	n.removed = append(n.removed, unit)
+	return nil
+}
+
+func TestPlaneDeleteRemovesTheBundlersInstanceOfTheProject(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	sup := &namedRemoveSup{}
+	pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{})
+	const ref = "abcdefghijklmnopqrst"
+	if err := pl.Delete(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, u := range sup.removed {
+		if u == "sb-edge-bundle@"+ref+".service" {
+			found = true
+		}
+		if strings.Contains(u, "edge-bundle") && !strings.HasSuffix(u, "@"+ref+".service") {
+			t.Errorf("removed %s, another project's or the singleton's unit", u)
+		}
+	}
+	if !found {
+		t.Errorf("the bundler's instance was not removed: %v", sup.removed)
+	}
+}

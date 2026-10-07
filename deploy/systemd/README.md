@@ -8,12 +8,13 @@ systemd units for sbctl, embedded in the binary (`embed.go`) and installed by
 | `sb-postgres@.service`, `sb-gotrue@.service`, `sb-postgrest@.service` | per-project templates; the instance is the ref |
 | `sb-supavisor`, `sb-realtime`, `sb-storage`, `sb-pgmeta`, `sb-studio` | fleet singletons |
 | `sb-imgproxy`, `sb-edge-runtime` | optional singletons |
+| `sb-edge-bundle@<ref>` | one-shot, started by the API for each upload of Edge Function sources (one instance per project, so each has **its own uid and its own module cache**, `/var/cache/sb-edge-bundle/<ref>`, which `sbctl projects delete` removes): runs `edge-runtime bundle` under **a uid of its own** (`DynamicUser=yes`, the one exception to `User=sbctl`) in a sandbox that sees only the upload's sources (read-only), one output directory and the artifacts, with no loopback, no instance metadata and no other process in `/proc` (see `internal/functions/README.md`) |
 | `sbctl.slice` | every unit runs in it, so `systemctl status sbctl.slice` shows the total |
 | `sbctl.service` | the daemon (`sbctl serve`: Management API, edge proxy, lifecycle engine; starts active projects at boot) |
 | `50-sbctl.rules` | polkit rule: the `sbctl` user may start, stop and tune `sb-*` units and `sbctl.service` (manage-units only; enabling units and daemon-reload need root, through `install-units`) |
 | `sb-basebackup@.service` and `.timer`, `sb-basebackup-prune.service` and `.timer` | nightly base backup per project and the node-wide retention prune. The daemon and the lifecycle engine start the timer instances over D-Bus (they are not enabled for boot); `install-units` writes `sb-basebackup@.timer` with `backup.base_backup_on_calendar` |
 
-Every service unit runs as `User=sbctl`, reads `/var/lib/sbctl/projects/<ref>/<svc>.env`
+Every service unit but `sb-edge-bundle` runs as `User=sbctl`, reads `/var/lib/sbctl/projects/<ref>/<svc>.env`
 (0600, by systemd, before the unit's mount namespace exists) and executes `<svc>.run`; both are
 written by `units.Supervisor.Render`, so the templates never change per project. `MemoryMax` and `CPUQuota` are per-unit drop-ins applied
 over D-Bus. Logs go to journald, selected by unit name (`SyslogIdentifier` equals the
@@ -51,6 +52,21 @@ agent with `execute_sql`, a compromised app).
 | Code in a project's Postgres reads or overwrites another project's WAL or base backups, or its own | The Postgres unit has no backup directory and no backend credentials. `archive_command` and `restore_command` are `sbctl wal push\|fetch --socket <projects/<ref>/wal/r.sock>`: the daemon (the only holder of the credentials) does the storage I/O over a unix socket that only that project's unit can see. The socket serves exactly one project: it refuses a push for another ref and a fetch of another ref's archive unless the daemon recorded it as the source of this project's restore | `relay_test.go` (the socket contract), `systemd-smoke.sh` (the unit sees only its own socket directory, read-only; the relay answers 403 for a foreign ref) |
 | Code reaches the cloud instance credentials (EC2 role: the whole backup bucket, Route 53) | `IPAddressDeny=169.254.169.254 fd00:ec2::254` on every `sb-*` unit: Postgres, GoTrue, PostgREST, postgres-meta, Realtime, Supavisor, Storage, Studio, imgproxy, the edge runtime. Only `sbctl.service` (and the `sb-basebackup` units, which run `sbctl`) keep access | `systemd-smoke.sh` and `fleet-smoke.sh`: a mock listens on both metadata addresses; a curl placed in the unit's cgroup fails, the same curl outside reaches it, and `COPY ... TO PROGRAM 'curl ...'` inside the project's Postgres fails (see "Checking the metadata rule" below) |
 | A crashed or stopped daemon makes WAL pile up somewhere insecure | There is no other path: with the daemon down `archive_command` fails and Postgres retries it (the segment stays in `pg_wal`, nothing is buffered elsewhere); `restore_command` exits 126, which aborts recovery instead of ending it early | `systemd-smoke.sh` (archiving stops, then resumes), `cli_test.go` (exit statuses) |
+
+**The exception, and why it is one.** `sb-edge-bundle@<ref>.service` runs another person's source code through a bundler that opens whatever paths the code names, so it is the one unit whose input chooses file paths, and a mount namespace is not enough for it: under the `sbctl` uid an upload could import `/proc/<pid>/root/...` of any other unit and carry that unit's files, every project's `functions-env.json` included, out in its bundle. It therefore runs under a dynamic uid, with `ProtectProc=invisible` and `ProcSubset=pid` (they hide only other users' processes, so they work for it and not for the `sbctl` units), reading the sources the daemon hands over and writing two files the daemon prepares. `tests/linux/functions-smoke.sh` probes it in the real unit. The unit is a template with one instance per project (`sb-edge-bundle@<ref>.service`, `CacheDirectory=sb-edge-bundle/%i`), because a module cache is shared by everything bundled with it: with one cache for the node, an upload of project B could import what an upload of project A had made the bundler download (a private npm package fetched with A's `.npmrc`). Each instance's cache is private to its own uid and is deleted with the project (by the root one-shot `sb-edge-bundle-clean@<ref>.service`, the one other unit this adds: it accepts a lowercase ref and removes `/var/cache/private/sb-edge-bundle/<ref>`, nothing else); the smoke test plants a package through A's upload and checks that B's upload cannot import it. **The Edge Runtime does not need the same treatment against its user workers**: they are isolates inside its process, with no path to name under `/proc` (see `functions-main/README.md`, "Isolation, as measured"); the runtime stays in the one trust domain of the node, and a compromise of the runtime itself (a V8 escape) is the case the future one-uid-per-project hardening below addresses.
+
+**What it does buy.** The allowlist below keeps a service from reading, by plain path, what it
+has no business with: the master key and config (`/etc/sbctl`), TLS keys, other projects' data
+and backups, and sibling units' environment files. That stops accidents, a service that wanders
+through the file system, and exploit classes that reach only paths and not `/proc`. It is
+defense in depth, not a boundary, and the documentation must not promise tenant isolation on
+a single node: **treat every project on a node as sharing a trust domain with every other
+project and with the control plane.** Postgres is the most exposed process (reachable through
+Supavisor, runs C extensions), which is why it gets the same allowlist, and why
+`POSTGRES_PASSWORD` (the `supabase_admin` superuser password, read only on the first boot) is
+rendered into `postgres.env` only until the cluster is initialized, then removed and the
+cluster restarted, so it is not in the postmaster's environment for the life of the cluster.
+The other passwords cannot be removed from the environments of the units that need them.
 
 The relay keeps the `archive_command` contract exactly: success only after the compressed file is
 durable in the backend, an identical re-push succeeds, a different file under the same name fails,
@@ -228,3 +244,5 @@ Every `sb-*` unit therefore denies the metadata addresses. Two things follow:
   objects bucket under systemd; `fleet.Setup` refuses to render the unit without one and says why.
   The key sits in `config.toml` (0600, owned by `sbctl`, hidden from every unit) and in the unit's own
   0600 environment file.
+
+`sb-edge-bundle@<ref>.service` (it reads tenant code's imports) also denies loopback, so a bundler cannot reach the Management API or a database, and runs under its own uid. It cannot be started with `systemd-run` by the `sbctl` user: the polkit rule grants `manage-units` only for names that start with `sb-`, and polkit receives no unit name for a transient unit, so the sandbox is a fixed unit file, not a transient one.
