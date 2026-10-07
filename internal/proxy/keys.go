@@ -163,6 +163,8 @@ func bearerToken(authz string) string {
 type authResult struct {
 	status int
 	body   string
+	// ctype is the Content-Type of a refusal; empty means text/plain.
+	ctype string
 
 	set      map[string]string // canonical header name -> value
 	del      []string
@@ -183,6 +185,8 @@ func authorize(rt *route, k *secrets.ProjectKeys, ref string, h http.Header, raw
 		return authResult{rawQuery: rawQuery}
 	case keyFunctions:
 		return authorizeFunctions(k, ref, h, rawQuery)
+	case keyS3:
+		return authorizeS3(k, ref, h, rawQuery)
 	}
 
 	queryKey, query := stripAPIKey(rawQuery)
@@ -278,5 +282,55 @@ func authorizeFunctions(k *secrets.ProjectKeys, ref string, h http.Header, rawQu
 		return reject(http.StatusUnauthorized, msgInvalidKey)
 	}
 	res.set = map[string]string{"Sb-Api-Key": jwt}
+	return res
+}
+
+// S3 refusals use Storage's own error document (S3 clients parse it), not plain text.
+const (
+	s3AccessDeniedBody = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>AccessDenied</Code><Message>The legacy API keys are disabled for this project: ` +
+		`use S3 access keys or a user session as the session token</Message></Error>`
+	s3AccessDeniedPostBody = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>AccessDenied</Code><Message>Browser-based POST uploads are not available while the ` +
+		`legacy API keys are disabled for this project</Message></Error>`
+)
+
+func rejectS3(body string) authResult {
+	return authResult{status: http.StatusForbidden, body: body, ctype: "application/xml"}
+}
+
+// authorizeS3 guards Storage's S3 endpoint. The request carries an AWS SigV4 signature that must
+// reach Storage untouched, so nothing is rewritten. Storage accepts, besides its own S3
+// credentials, any JWT of the project sent as the S3 session token (the X-Amz-Security-Token
+// header or presigned query parameter) and acts with that token's claims, so a leaked legacy
+// key would work here as well: with the legacy keys disabled such a session token is refused.
+// A session token that is a user's session, or no session token at all (Storage's S3
+// credentials), passes. The token of a browser POST upload travels in a multipart form field
+// the proxy does not parse, so those uploads are refused while the legacy keys are disabled.
+func authorizeS3(k *secrets.ProjectKeys, ref string, h http.Header, rawQuery string) authResult {
+	res := authResult{rawQuery: rawQuery}
+	if k == nil || !k.LegacyDisabled {
+		return res
+	}
+	if disabledLegacyBearer(k, bearerToken(h.Get("Authorization"))) {
+		return rejectS3(s3AccessDeniedBody)
+	}
+	for _, tok := range h.Values("X-Amz-Security-Token") {
+		if refusedLegacy(k, ref, strings.TrimSpace(tok)) {
+			return rejectS3(s3AccessDeniedBody)
+		}
+	}
+	for _, part := range strings.Split(rawQuery, "&") {
+		name, val, _ := strings.Cut(part, "=")
+		if n, err := url.QueryUnescape(name); err != nil || !strings.EqualFold(n, "X-Amz-Security-Token") {
+			continue
+		}
+		if v, err := url.QueryUnescape(val); err == nil && refusedLegacy(k, ref, strings.TrimSpace(v)) {
+			return rejectS3(s3AccessDeniedBody)
+		}
+	}
+	if ct := h.Get("Content-Type"); strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "multipart/form-data") {
+		return rejectS3(s3AccessDeniedPostBody)
+	}
 	return res
 }

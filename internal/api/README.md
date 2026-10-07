@@ -81,7 +81,9 @@ puts them; revoking or renaming one writes a record next to it. Names are lowerc
 digits and underscores, unique per project; at most 50 active keys. Only
 `secret_jwt_template: {"role": "service_role"}` is supported. `PUT .../api-keys/legacy?enabled=false`
 makes the proxy refuse the anon and service_role JWTs (and JWTs signed with the project secret) as
-`apikey`, on Functions too, and refuse the exact legacy keys as a bearer; it is refused while no
+`apikey`, on Functions too, refuse the exact legacy keys as a bearer, as Storage's S3 session token
+(`403` XML `AccessDenied`) and inside a Realtime socket (the proxy closes it with `1008`; sockets
+opened before the switch reconnect first); it is refused while no
 publishable and secret key exist to fall back on. JWTs signed with the legacy secret stay valid in
 `Authorization` until the JWT secret is rotated, as on hosted. Rotating the keys makes a revoked
 default key usable again with its new value.

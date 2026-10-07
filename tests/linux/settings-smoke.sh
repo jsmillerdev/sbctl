@@ -265,6 +265,65 @@ done
 [[ $(pcode GET /rest/v1/ -H "apikey: $SEC") == 200 ]] || fail "PostgREST did not recover after the database restart"
 [[ $(api GET "$CFG/config/database/postgres" | json_get 'd["max_connections"]') == 40 ]] || fail "GET returns another max_connections"
 
+# ws_probe APIKEY TOKEN: join a Realtime channel through the proxy on :80 (WebSocket upgrade with
+# the project's Host and APIKEY), sending TOKEN as the channel's access_token. Prints "joined" when
+# Realtime answers the join with status ok, "closed <code> <reason>" when the proxy ends the
+# connection with a close frame, and "refused ..." or "failed ..." otherwise.
+ws_probe() {
+  python3 - "$HOST" "$@" <<'PY'
+import base64, json, os, socket, struct, sys
+host, apikey, token = sys.argv[1:4]
+s = socket.create_connection(("127.0.0.1", int(os.environ.get("WS_PROBE_PORT", "80"))), timeout=20)
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall((f"GET /realtime/v1/websocket?apikey={apikey}&vsn=1.0.0 HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+buf = b""
+while b"\r\n\r\n" not in buf:
+    chunk = s.recv(4096)
+    if not chunk:
+        print("failed: closed during the handshake"); sys.exit(0)
+    buf += chunk
+head, rest = buf.split(b"\r\n\r\n", 1)
+if b" 101 " not in head.split(b"\r\n")[0]:
+    print("refused: " + head.split(b"\r\n")[0].decode()); sys.exit(0)
+text = json.dumps({"topic": "realtime:smoke", "event": "phx_join", "ref": "1", "join_ref": "1", "payload": {
+    "config": {"broadcast": {"self": False, "ack": False}, "presence": {"key": ""}, "postgres_changes": [], "private": False},
+    "access_token": token}}).encode()
+mask = os.urandom(4)
+s.sendall(bytes([0x81, 0x80 | 126]) + struct.pack(">H", len(text)) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(text)))
+def need(n):
+    global rest
+    while len(rest) < n:
+        chunk = s.recv(4096)
+        if not chunk:
+            raise EOFError
+        rest += chunk
+    out, rest = rest[:n], rest[n:]
+    return out
+try:
+    for _ in range(20):
+        b0, b1 = need(2)
+        n = b1 & 0x7F
+        if n == 126: n = struct.unpack(">H", need(2))[0]
+        elif n == 127: n = struct.unpack(">Q", need(8))[0]
+        payload = need(n)
+        op = b0 & 0x0F
+        if op == 8:
+            code = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else 0
+            print("closed %d %s" % (code, payload[2:].decode(errors="replace"))); sys.exit(0)
+        if op != 1:
+            continue
+        msg = json.loads(payload)
+        if msg.get("event") == "phx_reply" and msg.get("ref") == "1":
+            print("joined" if msg["payload"].get("status") == "ok" else "failed: " + payload.decode()); sys.exit(0)
+    print("failed: no reply to phx_join")
+except EOFError:
+    print("failed: connection closed without a close frame")
+PY
+}
+# s3_probe QUERY [curl args]: a SigV4-signed S3 request through the proxy; prints the body and " [status]".
+s3_probe() { local q=$1; shift; proj GET "/storage/v1/s3/files$q" --aws-sigv4 'aws:amz:local:s3' --user "$REF:$REF" -w ' [%{http_code}]' "$@" || true; }
+
 log "api keys: a revoked secret key and the legacy switch"
 NEW=$(api POST "$CFG/api-keys" -d '{"type":"secret","name":"ci"}')
 KEY=$(json_get 'd["api_key"]' <<<"$NEW")
@@ -285,9 +344,26 @@ storage_code() { pcode GET /storage/v1/bucket "$@"; }
 [[ $(storage_code -H "apikey: $PUB" -H "Authorization: Bearer $SVC") == 401 ]] || fail "the legacy service_role key as bearer beside a publishable key reaches Storage while disabled"
 [[ $(storage_code -H "apikey: $SEC" -H "Authorization: Bearer $SEC") == 200 ]] || fail "the secret key stopped working on Storage with the legacy keys off"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SEC") == 200 ]] || fail "the secret key stopped working with the legacy keys off"
+# Storage's S3 endpoint takes any JWT of the project as the session token: a legacy key must be refused there (403, an
+# S3 error document), as a header and as a presigned query parameter, before Storage sees the request.
+for tok in "$SVC" "$ANON"; do
+  OUT=$(s3_probe "" -H "x-amz-security-token: $tok")
+  [[ $OUT == *"<Code>AccessDenied</Code>"*"legacy API keys are disabled"*"[403]" ]] || fail "a legacy key as the S3 session token header reaches Storage while disabled: $OUT"
+  OUT=$(s3_probe "?X-Amz-Security-Token=$tok")
+  [[ $OUT == *"legacy API keys are disabled"*"[403]" ]] || fail "a legacy key as the presigned S3 session token reaches Storage while disabled: $OUT"
+done
+# Realtime takes a JWT inside the socket too: the join with the publishable key's own token stays fine, a legacy key
+# in the join's access_token ends the connection with a close frame.
+[[ $(ws_probe "$PUB" "$PUB") == joined ]] || fail "a Realtime join with the publishable key failed with the legacy keys off"
+[[ $(ws_probe "$PUB" "$SVC") == "closed 1008 legacy API keys are disabled for this project" ]] || fail "a legacy key inside the Realtime socket was not refused: $(ws_probe "$PUB" "$SVC")"
+[[ $(ws_probe "$PUB" "$ANON") == "closed 1008 "* ]] || fail "the legacy anon key inside the Realtime socket was not refused"
 must 200 PUT "$CFG/api-keys/legacy?enabled=true"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SVC") == 200 ]] || fail "the legacy keys did not come back"
 [[ $(storage_code -H "apikey: $SVC" -H "Authorization: Bearer $SVC") == 200 ]] || fail "the legacy keys did not come back on Storage"
+# Back on, the proxy no longer refuses a legacy session token on S3 (what Storage answers is its business) or in the socket.
+OUT=$(s3_probe "" -H "x-amz-security-token: $SVC")
+[[ $OUT != *"legacy API keys are disabled"* ]] || fail "the S3 session token is still refused with the legacy keys back on: $OUT"
+[[ $(ws_probe "$PUB" "$SVC") == joined ]] || fail "a Realtime join with a legacy key failed after the legacy keys came back: $(ws_probe "$PUB" "$SVC")"
 
 log "database password reset"
 NEWPW='a-brand-new-password-42'

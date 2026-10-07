@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -110,6 +111,7 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 	}
 
 	res := authResult{rawQuery: r.URL.RawQuery}
+	var guardKeys [][]byte
 	if rt.keys != keyNone {
 		k, err := s.table.projectKeys(r.Context(), p.ref)
 		switch {
@@ -132,8 +134,17 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 			return
 		}
 		if k != nil {
+			if rt.keys == keyRealtime {
+				guardKeys = legacyNeedles(k)
+			}
 			res = authorize(rt, k, p.ref, r.Header, r.URL.RawQuery)
 			if res.status != 0 {
+				if res.ctype != "" {
+					w.Header().Set("Content-Type", res.ctype)
+					w.WriteHeader(res.status)
+					_, _ = w.Write([]byte(res.body))
+					return
+				}
 				writeText(w, res.status, res.body)
 				return
 			}
@@ -180,6 +191,16 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		tg.set[TenantHeader] = p.ref
 	}
 	tg.dropTenant = rt.svc != svcFunctions
+	if len(guardKeys) > 0 {
+		// Legacy keys are disabled: watch what the client sends into the socket (or the long-poll
+		// body) for a legacy key. A compressing extension would hide the text, so it is not offered
+		// to Realtime.
+		tg.guardKeys = guardKeys
+		tg.del = append(tg.del[:len(tg.del):len(tg.del)], "Sec-Websocket-Extensions")
+		tg.onGuard = func(reason string) {
+			s.log.Warn("proxy: closed a Realtime connection that carried a legacy API key", "ref", p.ref, "reason", reason)
+		}
+	}
 	s.forward(w, r, tg)
 }
 
@@ -214,11 +235,27 @@ type target struct {
 	dashboardAuth bool
 	// dropTenant removes a client-supplied TenantHeader (only functions sets it).
 	dropTenant bool
+	// guardKeys, when set, are legacy keys that must not travel from the client to the upstream
+	// inside a WebSocket text message or a request body (see wsguard.go); onGuard is told of a hit.
+	guardKeys [][]byte
+	onGuard   func(reason string)
 }
 
 // forward proxies r to tg, streaming in both directions and passing WebSocket
 // upgrades through.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
+	if len(tg.guardKeys) > 0 {
+		if r.Header.Get("Upgrade") != "" {
+			w = &guardedWriter{ResponseWriter: w, wrap: func(c net.Conn, brw *bufio.ReadWriter) net.Conn {
+				return &wsGuardConn{Conn: c, r: brw.Reader, insp: newWSInspector(tg.guardKeys), onBlock: tg.onGuard}
+			}}
+		} else if ok, hit := checkBody(w, r, tg.guardKeys); !ok {
+			if hit && tg.onGuard != nil {
+				tg.onGuard("request body")
+			}
+			return
+		}
+	}
 	rp := &httputil.ReverseProxy{
 		Transport:     s.transport(tg.timeout),
 		FlushInterval: -1,
