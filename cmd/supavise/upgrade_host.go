@@ -285,7 +285,7 @@ func (h *nodeHost) Status(ctx context.Context) (string, string, error) {
 
 // resolved is what Resolve hands to Stage.
 type resolved struct {
-	res  *selfupdate.Resolved
+	ver  *selfupdate.Verified
 	opts selfupdate.Options
 }
 
@@ -293,12 +293,19 @@ type resolved struct {
 func (h *nodeHost) Resolve(ctx context.Context, tag string, n *nodeupgrade.Node) (*nodeupgrade.Candidate, error) {
 	o := h.selfOpts
 	o.Tag, o.Current, o.Platform, o.ExecPath = tag, n.Version, n.Platform, h.binPath
-	res, err := selfupdate.Resolve(ctx, o)
+	ver, err := selfupdate.Fetch(ctx, o)
 	if err != nil {
 		return nil, err
 	}
-	h.to = res.Release.Tag
-	return &nodeupgrade.Candidate{Tag: res.Release.Tag, Data: &resolved{res: res, opts: o}}, nil
+	// The release states the oldest version it upgrades from; a jump over a release it needs is
+	// refused before anything else is downloaded. Going back is not an upgrade and is not held to it.
+	if selfupdate.Newer(ver.Release.Tag, n.Version) {
+		if err := ver.Manifest.CheckUpgradeFrom(n.Version); err != nil {
+			return nil, err
+		}
+	}
+	h.to = ver.Release.Tag
+	return &nodeupgrade.Candidate{Tag: ver.Release.Tag, Data: &resolved{ver: ver, opts: o}}, nil
 }
 
 // staged is what Stage hands to the other methods.
@@ -322,7 +329,7 @@ func (h *nodeHost) Stage(ctx context.Context, c *nodeupgrade.Candidate) (*nodeup
 		}
 		o.StageDir, h.stageDir, h.tmpStage = d, d, true
 	}
-	st, err := r.res.Stage(ctx, o)
+	st, err := r.ver.Stage(ctx, o)
 	if err != nil {
 		return nil, err
 	}
@@ -335,8 +342,15 @@ func (h *nodeHost) Stage(ctx context.Context, c *nodeupgrade.Candidate) (*nodeup
 		st.Discard()
 		return nil, fmt.Errorf("release %s ships a binary that describes itself as %s", c.Tag, info.Version)
 	}
+	// The signed manifest lists the pins of the release as the release tool read them from
+	// versions.yaml; the binary reports the ones built into it. They are the same file, so a
+	// difference means the binary is not the one the manifest describes.
+	if err := nodeupgrade.CheckManifestPins(info, r.ver.Manifest.Artifacts, r.ver.Manifest.Studio); err != nil {
+		st.Discard()
+		return nil, err
+	}
 	s := &staged{st: st}
-	s.studio.name, s.studio.url, s.studio.sha, _ = r.res.Studio()
+	s.studio.name, s.studio.url, s.studio.sha, _ = r.ver.Studio(o.Platform)
 	return &nodeupgrade.Staged{Info: info, Data: s}, nil
 }
 

@@ -10,8 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-
-	"github.com/pelletier/go-toml/v2"
 )
 
 const (
@@ -56,6 +54,7 @@ type Config struct {
 	Studio    Studio    `toml:"studio"`
 	API       API       `toml:"api"`
 	Mail      Mail      `toml:"mail"`
+	Update    Update    `toml:"update"`
 	Fleet     Fleet     `toml:"fleet"`
 	Functions Functions `toml:"functions"`
 	Branching Branching `toml:"branching"`
@@ -161,6 +160,7 @@ func Default() *Config {
 			BaseBackupOnCalendar: "*-*-* 03:00:00",
 		},
 		Artifacts: Artifacts{BaseURL: "https://github.com/supabase/slim-services/releases/download"},
+		Update:    DefaultUpdate(),
 		Defaults:  Limits{MemoryMax: "1G", CPUQuota: "100%"},
 	}
 }
@@ -178,7 +178,7 @@ func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	switch {
 	case err == nil:
-		if err := toml.Unmarshal(b, c); err != nil {
+		if err := DecodeTOML(b, c); err != nil {
 			return nil, fmt.Errorf("config %s: %w", path, err)
 		}
 	case errors.Is(err, os.ErrNotExist):
@@ -219,6 +219,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.Upgrade.validate(); err != nil {
+		return err
+	}
+	if err := c.Update.validate(); err != nil {
 		return err
 	}
 	if err := c.Health.validate(); err != nil {

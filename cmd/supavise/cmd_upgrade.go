@@ -14,6 +14,7 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
 	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/jsmillerdev/supavise/internal/update"
 )
 
 func init() {
@@ -84,6 +85,13 @@ rolled back; 4 failed and the node needs the operator. While it runs, the state 
 				return err
 			}
 			if apply {
+				// The OS reboot in the maintenance window waits on this lock, so it never lands
+				// between the swap and the verified restart; a second upgrade does not start either.
+				unlock, err := update.LockHost(update.HostLockPath)
+				if err != nil {
+					return &nodeupgrade.Failure{Code: nodeupgrade.ExitRefused, Err: err}
+				}
+				defer unlock()
 				// An upgrade must outlive the terminal that started it; Ctrl-C and SIGTERM still stop it,
 				// and a stop after the binary was swapped rolls back.
 				signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
@@ -143,6 +151,11 @@ status 4. Needs root.`,
 			if err != nil {
 				return err
 			}
+			unlock, err := update.LockHost(update.HostLockPath)
+			if err != nil {
+				return &nodeupgrade.Failure{Code: nodeupgrade.ExitRefused, Err: err}
+			}
+			defer unlock()
 			signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 			defer signal.Reset(syscall.SIGHUP, syscall.SIGPIPE)
 			return nodeupgrade.Rollback(cmd.Context(), h, nodeupgrade.Options{Yes: rollYes, Out: cmd.OutOrStdout(), Log: newLogger(cfg)})

@@ -148,3 +148,21 @@ func TestReleasesGC(t *testing.T) {
 		t.Fatalf("removed %v, kept %s", removed, versionsOf(t, r))
 	}
 }
+
+func TestCheckManifestPins(t *testing.T) {
+	info := &Info{Version: "v1.1.0", Pins: newPins()}
+	good := map[string]string{"auth": authNew, "postgrest": restNew, "pooler": "pooler-v2.9.13-r1", "postgres": pgOld}
+	if err := CheckManifestPins(info, good, "2026.10.05-sha-94b8b06"); err != nil {
+		t.Fatalf("matching pins: %v", err)
+	}
+	if err := CheckManifestPins(info, nil, ""); err != nil {
+		t.Fatalf("a manifest with no pins: %v", err)
+	}
+	bad := map[string]string{"auth": "auth-v2.196.0-r0"}
+	if err := CheckManifestPins(info, bad, ""); err == nil || !strings.Contains(err.Error(), "not the one the signed manifest describes") {
+		t.Fatalf("a binary with other pins: %v", err)
+	}
+	if err := CheckManifestPins(info, nil, "2026.11.01-sha-bbbbbbb"); err == nil {
+		t.Fatal("a binary with another Studio build")
+	}
+}

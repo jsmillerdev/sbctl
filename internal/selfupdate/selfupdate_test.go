@@ -26,22 +26,32 @@ type releaseServer struct {
 	bin  []byte
 	// tamper hooks
 	sums, sig []byte
+	manifest  []byte
 	omit      map[string]bool
 	calls     map[string]int
-	// manifest, when set, is served as release.json; signed puts its checksum in the signed list.
-	manifest []byte
-	signed   bool
 }
 
-// withManifest serves body as release.json and, when signed, lists its checksum under the signature.
-func (r *releaseServer) withManifest(body string, signed bool) *releaseServer {
-	r.manifest, r.signed = []byte(body), signed
-	if signed {
-		sum := sha256.Sum256(r.manifest)
-		r.sums = append(r.sums, []byte(hex.EncodeToString(sum[:])+"  release.json\n")...)
-		r.sig = ed25519.Sign(r.priv, r.sums)
+// rebuild writes the manifest for the server's tag (unless a test set its own) and signs a fresh
+// checksum list over the binary and the manifest with the server's key.
+func (r *releaseServer) rebuild(t *testing.T) {
+	t.Helper()
+	if r.manifest == nil {
+		m := &Manifest{Schema: ManifestSchema, Version: r.tag, MinUpgradeFrom: "v0.0.0", Studio: "2026.10.05-sha-94b8b06",
+			Artifacts: map[string]string{"auth": "auth-v2.195.0-r1"}}
+		b, err := m.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.manifest = b
 	}
-	return r
+	r.sums = r.sumsFor(r.bin, r.manifest)
+	r.sig = ed25519.Sign(r.priv, r.sums)
+}
+
+func (r *releaseServer) sumsFor(bin, manifest []byte) []byte {
+	sum, msum := sha256.Sum256(bin), sha256.Sum256(manifest)
+	return []byte(fmt.Sprintf("%s  supavise-linux-amd64\n%s  supavise-linux-arm64\n%s  studio-x.tar.zst\n%s  supavise-release.json\n",
+		hex.EncodeToString(sum[:]), strings.Repeat("a", 64), strings.Repeat("b", 64), hex.EncodeToString(msum[:])))
 }
 
 func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
@@ -50,10 +60,7 @@ func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
 		t.Fatal(err)
 	}
 	r := &releaseServer{pub: pub, priv: priv, tag: tag, bin: []byte(binary), omit: map[string]bool{}, calls: map[string]int{}}
-	sum := sha256.Sum256(r.bin)
-	r.sums = []byte(fmt.Sprintf("%s  supavise-linux-amd64\n%s  supavise-linux-arm64\n%s  studio-x.tar.zst\n",
-		hex.EncodeToString(sum[:]), strings.Repeat("a", 64), strings.Repeat("b", 64)))
-	r.sig = ed25519.Sign(priv, r.sums)
+	r.rebuild(t)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/o/r/releases/", func(w http.ResponseWriter, req *http.Request) {
 		r.calls["meta"]++
@@ -63,11 +70,7 @@ func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
 			return
 		}
 		assets := []map[string]string{}
-		names := []string{"SHA256SUMS", "SHA256SUMS.sig", "supavise-linux-amd64", "supavise-linux-arm64"}
-		if r.manifest != nil {
-			names = append(names, "release.json")
-		}
-		for _, n := range names {
+		for _, n := range []string{"SHA256SUMS", "SHA256SUMS.sig", "supavise-release.json", "supavise-linux-amd64", "supavise-linux-arm64"} {
 			if !r.omit[n] {
 				assets = append(assets, map[string]string{"name": n, "browser_download_url": r.URL + "/dl/" + n})
 			}
@@ -82,10 +85,10 @@ func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
 			_, _ = w.Write(r.sums)
 		case "SHA256SUMS.sig":
 			_, _ = w.Write(r.sig)
+		case "supavise-release.json":
+			_, _ = w.Write(r.manifest)
 		case "supavise-linux-amd64":
 			_, _ = w.Write(r.bin)
-		case "release.json":
-			_, _ = w.Write(r.manifest)
 		default:
 			http.NotFound(w, req)
 		}
@@ -166,11 +169,24 @@ func TestUpdateRefusals(t *testing.T) {
 			r.sig = ed25519.Sign(other, r.sums)
 		}, "does not verify"},
 		"sums tampered after signing": {func(r *releaseServer) { r.sums = append([]byte("# x\n"), r.sums...) }, "does not verify"},
+		"no manifest asset":           {func(r *releaseServer) { r.omit["supavise-release.json"] = true }, "no asset supavise-release.json"},
 		"short signature":             {func(r *releaseServer) { r.sig = r.sig[:10] }, "ed25519 signature"},
 		"binary tampered":             {func(r *releaseServer) { r.bin = []byte("evil binary") }, "does not match its checksum"},
-		"no signature asset":          {func(r *releaseServer) { r.omit["SHA256SUMS.sig"] = true }, "no asset SHA256SUMS.sig"},
-		"no sums asset":               {func(r *releaseServer) { r.omit["SHA256SUMS"] = true }, "no asset SHA256SUMS"},
-		"no binary":                   {func(r *releaseServer) { r.omit["supavise-linux-amd64"] = true }, "no asset supavise-linux-amd64"},
+		"manifest tampered": {func(r *releaseServer) {
+			r.manifest = []byte(strings.Replace(string(r.manifest), `"v0.0.0"`, `"v0.0.1"`, 1))
+		}, "supavise-release.json does not match its checksum"},
+		"manifest of another release": {func(t *releaseServer) {
+			t.manifest = []byte(strings.Replace(string(t.manifest), `"version": "v1.2.0"`, `"version": "v1.0.0"`, 1))
+			t.sums = t.sumsFor(t.bin, t.manifest)
+			t.sig = ed25519.Sign(t.priv, t.sums)
+		}, "carries the signed manifest of v1.0.0"},
+		"manifest not in the signed list": {func(r *releaseServer) {
+			r.sums = []byte(strings.Repeat("a", 64) + "  supavise-linux-amd64\n")
+			r.sig = ed25519.Sign(r.priv, r.sums)
+		}, "lists no checksum for supavise-release.json"},
+		"no signature asset": {func(r *releaseServer) { r.omit["SHA256SUMS.sig"] = true }, "no asset SHA256SUMS.sig"},
+		"no sums asset":      {func(r *releaseServer) { r.omit["SHA256SUMS"] = true }, "no asset SHA256SUMS"},
+		"no binary":          {func(r *releaseServer) { r.omit["supavise-linux-amd64"] = true }, "no asset supavise-linux-amd64"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newReleaseServer(t, "v1.2.0", "new binary")
@@ -193,7 +209,8 @@ func TestUpdateRefusals(t *testing.T) {
 
 func TestUpdateChecksumListWithoutThePlatform(t *testing.T) {
 	r := newReleaseServer(t, "v1.2.0", "new binary")
-	r.sums = []byte(strings.Repeat("a", 64) + "  supavise-linux-arm64\n")
+	msum := sha256.Sum256(r.manifest)
+	r.sums = []byte(strings.Repeat("a", 64) + "  supavise-linux-arm64\n" + hex.EncodeToString(msum[:]) + "  supavise-release.json\n")
 	r.sig = ed25519.Sign(r.priv, r.sums)
 	o, _ := r.opts(t, "v1.0.0")
 	if _, err := Update(context.Background(), o); err == nil || !strings.Contains(err.Error(), "no checksum for supavise-linux-amd64") {

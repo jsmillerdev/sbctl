@@ -1,13 +1,15 @@
 // Package selfupdate replaces the supavise binary with a release from GitHub after checking
 // it against an ed25519 signature.
 //
-// A release carries four kinds of asset: the binaries `supavise-linux-amd64` and
-// `supavise-linux-arm64`, `SHA256SUMS` (one line per asset, as sha256sum prints them) and
-// `SHA256SUMS.sig`, the raw 64-byte ed25519 signature of the SHA256SUMS file. The public
-// key is compiled into the binary (release_key.pem). Update refuses a release whose
-// signature does not verify, whose checksum list lacks the binary, or whose binary does
-// not match its checksum, and it never touches the installed binary before all three
-// pass. The replacement is one rename in the binary's own directory, so a crash leaves
+// A release carries five kinds of asset: the binaries `supavise-linux-amd64` and
+// `supavise-linux-arm64`, `SHA256SUMS` (one line per asset, as sha256sum prints them),
+// `SHA256SUMS.sig`, the raw 64-byte ed25519 signature of the SHA256SUMS file, and the manifest
+// `supavise-release.json` (manifest.go), which the list covers. The public keys are compiled into
+// the binary: release_key.pem, and release_key_next.pem while a key rotation is under way
+// (keys.go). Update refuses a release whose signature does not verify against either, whose
+// manifest does not match the signed list or names another version than the release tag, whose
+// checksum list lacks the binary, or whose binary does not match its checksum, and it never
+// touches the installed binary before all of those pass. The replacement is one rename in the binary's own directory, so a crash leaves
 // either the old or the new file, and the previous binary stays next to it as
 // `<name>.prev` for a manual rollback.
 package selfupdate
@@ -72,7 +74,6 @@ const (
 	SigAsset     = "SHA256SUMS.sig"
 	maxSumsBytes = 1 << 20
 	maxBinary    = 300 << 20
-	maxManifest  = 64 << 10
 )
 
 // BinaryAsset is the asset name of the supavise binary for a platform such as "linux-amd64".
@@ -92,8 +93,10 @@ type Options struct {
 	Current string
 	// ExecPath is the binary to replace; empty means the running executable.
 	ExecPath string
-	// Key verifies SHA256SUMS; nil means the embedded key.
+	// Key verifies SHA256SUMS. Keys, when set, replaces it with a list: the signature
+	// is valid if any of them verifies it. With neither set the embedded keys apply.
 	Key  ed25519.PublicKey
+	Keys []ed25519.PublicKey
 	HTTP *http.Client
 	// Force installs the release even when it is not newer than Current.
 	Force bool
@@ -237,7 +240,7 @@ type Result struct {
 
 // Update installs the selected release over ExecPath, or reports that it is current.
 func Update(ctx context.Context, o Options) (*Result, error) {
-	key, err := o.key()
+	keys, err := o.keys()
 	if err != nil {
 		return nil, err
 	}
@@ -257,124 +260,34 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 		o.say("already running %s", o.Current)
 		return &Result{Tag: rel.Tag}, nil
 	}
-	res, err := o.verify(ctx, key, rel)
+	asset := BinaryAsset(o.Platform)
+	if rel.Assets[asset] == "" {
+		return nil, fmt.Errorf("release %s has no asset %s", rel.Tag, asset)
+	}
+	ver, err := o.verify(ctx, rel, keys)
 	if err != nil {
 		return nil, err
 	}
-	st, err := res.Stage(ctx, o)
+	// A release states the oldest version it upgrades from. --force installs anyway; a downgrade
+	// is not an upgrade and is not held to it.
+	if !o.Force && Newer(rel.Tag, o.Current) {
+		if err := ver.Manifest.CheckUpgradeFrom(o.Current); err != nil {
+			return nil, err
+		}
+	}
+	st, err := ver.Stage(ctx, o)
 	if err != nil {
 		return nil, err
 	}
 	return st.Install()
 }
 
-func (o *Options) key() (ed25519.PublicKey, error) {
-	if o.Key != nil {
-		return o.Key, nil
-	}
-	return EmbeddedKey()
-}
-
-// Resolved is a release whose checksum list has been verified against the key: everything
-// listed in it can be trusted, the binary and the manifest included.
-type Resolved struct {
-	Release *Release
-	// Sums is the signed checksum list.
-	Sums []byte
-	// Manifest is the release's signed manifest, or nil when it ships none.
-	Manifest *Manifest
-	platform string
-}
-
-// Resolve fetches the release o selects, verifies the signature of its checksum list, reads its
-// manifest and refuses it when its manifest says Current may not install it (a jump that skips
-// a release the manifest requires, or a manifest of another version). It downloads no binary and
-// changes nothing; `supavise upgrade --check` and the plan use it. Unlike Update it does not
-// stop when the release is not newer: the caller decides what that means.
-func Resolve(ctx context.Context, o Options) (*Resolved, error) {
-	key, err := o.key()
-	if err != nil {
-		return nil, err
-	}
-	if o.Platform == "" {
-		return nil, errors.New("selfupdate: Options.Platform is required")
-	}
-	rel, err := Latest(ctx, o)
-	if err != nil {
-		return nil, err
-	}
-	return o.verify(ctx, key, rel)
-}
-
-func (o *Options) verify(ctx context.Context, key ed25519.PublicKey, rel *Release) (*Resolved, error) {
-	asset := BinaryAsset(o.Platform)
-	for _, need := range []string{SumsAsset, SigAsset, asset} {
-		if rel.Assets[need] == "" {
-			return nil, fmt.Errorf("release %s has no asset %s", rel.Tag, need)
-		}
-	}
-	sums, err := o.fetch(ctx, rel.Assets[SumsAsset], maxSumsBytes)
-	if err != nil {
-		return nil, fmt.Errorf("download %s: %w", SumsAsset, err)
-	}
-	sig, err := o.fetch(ctx, rel.Assets[SigAsset], 1024)
-	if err != nil {
-		return nil, fmt.Errorf("download %s: %w", SigAsset, err)
-	}
-	if err := VerifySums(key, sums, sig); err != nil {
-		return nil, err
-	}
-	if _, err := ChecksumFor(sums, asset); err != nil {
-		return nil, fmt.Errorf("release %s: %w", rel.Tag, err)
-	}
-	res := &Resolved{Release: rel, Sums: sums, platform: o.Platform}
-	if url := rel.Assets[ManifestAsset]; url != "" {
-		want, err := ChecksumFor(sums, ManifestAsset)
-		if err != nil {
-			// An asset the signature does not cover could say anything, including that every
-			// old version may jump to it.
-			return nil, fmt.Errorf("release %s ships %s, but the signed checksum list does not cover it: refusing to trust it", rel.Tag, ManifestAsset)
-		}
-		body, err := o.fetch(ctx, url, maxManifest)
-		if err != nil {
-			return nil, fmt.Errorf("download %s: %w", ManifestAsset, err)
-		}
-		if got := sha256.Sum256(body); hex.EncodeToString(got[:]) != want {
-			return nil, fmt.Errorf("%s does not match its checksum in the signed list", ManifestAsset)
-		}
-		if res.Manifest, err = ParseManifest(body); err != nil {
-			return nil, fmt.Errorf("release %s: %w", rel.Tag, err)
-		}
-		if err := res.Manifest.Check(rel.Tag, o.Current); err != nil {
-			return nil, err
-		}
-	}
-	return res, nil
-}
-
-// Studio returns the dashboard build the release ships for its platform, as the signed list
-// names it: the asset name, its download URL and its SHA-256. ok is false when there is none.
-func (r *Resolved) Studio() (name, url, sha string, ok bool) {
-	suffix := "-" + r.platform + ".tar.zst"
-	sc := bufio.NewScanner(bytes.NewReader(r.Sums))
-	for sc.Scan() {
-		f := strings.Fields(sc.Text())
-		if len(f) != 2 || len(f[0]) != 64 {
-			continue
-		}
-		n := strings.TrimPrefix(f[1], "*")
-		if strings.HasPrefix(n, "supavise-studio-") && strings.HasSuffix(n, suffix) && r.Release.Assets[n] != "" {
-			return n, r.Release.Assets[n], strings.ToLower(f[0]), true
-		}
-	}
-	return "", "", "", false
-}
-
 // Staged is a release binary that has been downloaded, checked against the signed list and run
-// with --version, and that sits next to the file it will replace. Install swaps it in;
-// Discard throws it away.
+// with --version, and that sits next to the file it will replace. Install swaps it in; Discard
+// throws it away. `supavise upgrade` stages the binary first, reads its pins, and installs it only
+// after the node has been backed up.
 type Staged struct {
-	*Resolved
+	*Verified
 	// Path is the verified binary.
 	Path string
 	// Reported is what it printed for --version.
@@ -384,17 +297,22 @@ type Staged struct {
 	o   Options
 }
 
-// Stage downloads the binary of the release, verifies it against the checksum in the signed
-// list, and checks that it starts and reports the tag it was published under. Nothing that is
-// installed changes. The file is created in StageDir, or in the directory of ExecPath, so that
-// Install is one rename.
-func (r *Resolved) Stage(ctx context.Context, o Options) (*Staged, error) {
+// Stage downloads the binary of the verified release for o.Platform, checks it against the checksum
+// in the signed list, and checks that it starts and reports the tag it was published under.
+// Nothing that is installed changes. The file is created in StageDir, or in the directory of
+// ExecPath, so that Install is one rename.
+func (ver *Verified) Stage(ctx context.Context, o Options) (*Staged, error) {
+	rel := ver.Release
 	asset := BinaryAsset(o.Platform)
-	want, err := ChecksumFor(r.Sums, asset)
-	if err != nil {
-		return nil, fmt.Errorf("release %s: %w", r.Release.Tag, err)
+	if rel.Assets[asset] == "" {
+		return nil, fmt.Errorf("release %s has no asset %s", rel.Tag, asset)
 	}
-	o.say("signature verified; downloading %s", asset)
+	want, err := ChecksumFor(ver.Sums, asset)
+	if err != nil {
+		return nil, fmt.Errorf("release %s: %w", rel.Tag, err)
+	}
+	o.say("signature verified (%s); downloading %s", keyName(ver.Key), asset)
+
 	exe := o.ExecPath
 	if exe == "" {
 		if exe, err = os.Executable(); err != nil {
@@ -415,7 +333,7 @@ func (r *Resolved) Stage(ctx context.Context, o Options) (*Staged, error) {
 	tmpPath := tmp.Name()
 	cleanup := func() { tmp.Close(); os.Remove(tmpPath) }
 	h := sha256.New()
-	if err := o.stream(ctx, r.Release.Assets[asset], io.MultiWriter(tmp, h)); err != nil {
+	if err := o.stream(ctx, rel.Assets[asset], io.MultiWriter(tmp, h)); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("download %s: %w", asset, err)
 	}
@@ -443,11 +361,11 @@ func (r *Resolved) Stage(ctx context.Context, o Options) (*Staged, error) {
 	// The signature covers the checksums, not the release tag, which comes from unsigned
 	// GitHub metadata. A binary that does not name the tag it was published under is an
 	// older (validly signed) release attached to a newer tag: a downgrade.
-	if !ReportsVersion(reported, r.Release.Tag) {
+	if !ReportsVersion(reported, rel.Tag) {
 		os.Remove(tmpPath)
-		return nil, fmt.Errorf("release %s ships a binary that reports %q: refusing to install (an older signed binary under a newer tag would be a downgrade)", r.Release.Tag, strings.TrimSpace(reported))
+		return nil, fmt.Errorf("release %s ships a binary that reports %q: refusing to install (an older signed binary under a newer tag would be a downgrade)", rel.Tag, strings.TrimSpace(reported))
 	}
-	return &Staged{Resolved: r, Path: tmpPath, Reported: reported, exe: exe, o: o}, nil
+	return &Staged{Verified: ver, Path: tmpPath, Reported: reported, exe: exe, o: o}, nil
 }
 
 // Discard removes the staged file.
@@ -467,6 +385,43 @@ func (s *Staged) Install() (*Result, error) {
 	}
 	s.o.say("installed %s at %s", s.Release.Tag, s.exe)
 	return &Result{Tag: s.Release.Tag, Replaced: true, Previous: prev}, nil
+}
+
+// Studio returns the dashboard build the release ships for platform, as the signed list names it:
+// the asset name, its download URL and its SHA-256. ok is false when there is none.
+func (ver *Verified) Studio(platform string) (name, url, sha string, ok bool) {
+	suffix := "-" + platform + ".tar.zst"
+	sc := bufio.NewScanner(bytes.NewReader(ver.Sums))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) != 2 || len(f[0]) != 64 {
+			continue
+		}
+		n := strings.TrimPrefix(f[1], "*")
+		if strings.HasPrefix(n, "supavise-studio-") && strings.HasSuffix(n, suffix) && ver.Release.Assets[n] != "" {
+			return n, ver.Release.Assets[n], strings.ToLower(f[0]), true
+		}
+	}
+	return "", "", "", false
+}
+
+// Compare orders two release tags: negative when a is older than b, positive when it is newer. ok
+// is false when either is not a release version. A suffix ("-rc1", "-4-gabcdef") is dropped.
+func Compare(a, b string) (c int, ok bool) {
+	x, ok1 := parseVersion(a)
+	y, ok2 := parseVersion(b)
+	if !ok1 || !ok2 {
+		return 0, false
+	}
+	for i := range x {
+		if x[i] != y[i] {
+			if x[i] < y[i] {
+				return -1, true
+			}
+			return 1, true
+		}
+	}
+	return 0, true
 }
 
 func runVersion(ctx context.Context, path string) (string, error) {

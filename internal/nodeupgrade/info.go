@@ -139,5 +139,20 @@ func DiffPins(from, to map[string]string) []ServiceMove {
 	return out
 }
 
+// CheckManifestPins compares the pins a binary reports with those in the signed release manifest
+// (artifacts by release name, as versions.yaml keys them, and Studio's tag). A manifest that lists
+// none (an older manifest) has nothing to compare.
+func CheckManifestPins(info *Info, artifacts map[string]string, studio string) error {
+	for name, tag := range artifacts {
+		if got := info.Pins[serviceOfArtifact(name)]; got != tag {
+			return fmt.Errorf("the release manifest pins %s %s and the binary of %s pins %q: refusing a binary that is not the one the signed manifest describes", name, tag, info.Version, got)
+		}
+	}
+	if studio != "" && info.Pins[config.SvcStudio] != studio {
+		return fmt.Errorf("the release manifest pins Studio %s and the binary of %s pins %q: refusing a binary that is not the one the signed manifest describes", studio, info.Version, info.Pins[config.SvcStudio])
+	}
+	return nil
+}
+
 // compareVersion orders two release tags ("v1.2.0"); ok is false when either is not one.
 func compareVersion(a, b string) (int, bool) { return selfupdate.Compare(a, b) }

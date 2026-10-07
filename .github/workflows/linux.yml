@@ -334,8 +334,10 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
           CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/supavise-v2 ./cmd/supavise
           CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.3" -o /tmp/supavise-v3 ./cmd/supavise
+          # deploy/release-assets.sh writes the signed release manifest with this (root has no Go toolchain).
+          go build -o /tmp/releasetool ./deploy/releasetool
       - name: install end to end
-        run: sudo LOG_DIR=/tmp/supavise-install-logs SUPAVISE_BIN=/tmp/supavise SUPAVISE_BIN_V2=/tmp/supavise-v2 SUPAVISE_BIN_V3=/tmp/supavise-v3 tests/linux/install-e2e.sh
+        run: sudo LOG_DIR=/tmp/supavise-install-logs SUPAVISE_BIN=/tmp/supavise SUPAVISE_BIN_V2=/tmp/supavise-v2 SUPAVISE_BIN_V3=/tmp/supavise-v3 SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/install-e2e.sh
       - if: always()
         name: collect logs
         run: sudo chmod -R a+rX /tmp/supavise-install-logs || true
@@ -345,6 +347,27 @@ jobs:
           name: install-e2e-${{ matrix.arch }}
           path: /tmp/supavise-install-logs
           if-no-files-found: ignore
+
+  # Unattended OS security updates on the distributions we support: the apt configuration that
+  # `supavise system os-updates` writes, read back through apt-config and through unattended-upgrade
+  # itself, on Ubuntu 24.04 and Debian 12 and 13 (containers; the install-e2e job covers the
+  # timers and the installer on a VM).
+  os-updates:
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "debian:12", "debian:13"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
+      - name: os-updates in ${{ matrix.image }}
+        run: docker run --rm -v /tmp/supavise:/supavise:ro -v "$PWD":/repo:ro "${{ matrix.image }}" bash /repo/tests/linux/os-updates.sh
 
   functions-smoke:
     strategy:

@@ -1,8 +1,10 @@
 name: release
 
-# On a tag v*: build supavise for linux amd64 and arm64, build the Studio artifact, sign the
-# checksum list with the ed25519 key in the repository secret SUPAVISE_SIGNING_KEY and publish
-# everything as a GitHub release. Nothing here runs unless someone pushes a tag.
+# On a tag v*: require that the tagged commit has already passed its tests (the conformance suite
+# and the upgrade test among them), build supavise for linux amd64 and arm64, build the Studio
+# artifact, write the release manifest, sign the checksum list (which covers the manifest) with the
+# ed25519 key in the repository secret SUPAVISE_SIGNING_KEY and publish everything as a GitHub
+# release with generated notes. Nothing here runs unless someone pushes a tag.
 #
 # One-time setup (deploy/README.md, "Release signing"):
 #   openssl genpkey -algorithm ed25519 -out supavise-signing.pem
@@ -26,6 +28,23 @@ defaults:
     shell: bash
 
 jobs:
+  # The tagged commit must have passed ci.yml, linux.yml (which holds the upgrade test) and
+  # conformance.yml on this very commit. The gate reads those runs; it does not start them, so a
+  # tag on a commit that never ran them fails here (deploy/release-gate.sh says what to do) and
+  # nothing is built or published. It holds no secrets and uses no environment.
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: tests passed on the tagged commit
+        run: deploy/release-gate.sh "$GITHUB_SHA"
+
   check:
     runs-on: ubuntu-24.04
     environment: release
@@ -48,6 +67,23 @@ jobs:
           b=$(openssl pkey -pubin -in internal/selfupdate/release_key.pem -pubout -outform DER | openssl dgst -sha256)
           rm -f "$RUNNER_TEMP/sign.pem"
           [[ "$a" == "$b" ]] || { echo "SUPAVISE_SIGNING_KEY does not match internal/selfupdate/release_key.pem"; exit 1; }
+      - name: the next key, if there is one, is a valid second key
+        run: |
+          # internal/selfupdate/release_key_next.pem is empty outside a key rotation. When it holds a
+          # key, that key must parse and must not be the current one (deploy/README.md, "Rotating the
+          # release signing key").
+          next=internal/selfupdate/release_key_next.pem
+          for f in internal/selfupdate/release_key.pem "$next"; do
+            if grep -q -e 'PRIVATE KEY' "$f"; then echo "$f contains a private key: remove it and treat that key as leaked"; exit 1; fi
+            if grep -- '^-----BEGIN ' "$f" | grep -qv -e '-----BEGIN PUBLIC KEY-----'; then echo "$f holds a PEM block that is not a PUBLIC KEY"; exit 1; fi
+          done
+          if grep -q -- '-----BEGIN PUBLIC KEY-----' "$next"; then
+            openssl pkey -pubin -in "$next" -noout 2>/dev/null || { echo "$next holds a PEM block that is not a public key"; exit 1; }
+            a=$(openssl pkey -pubin -in "$next" -pubout -outform DER | openssl dgst -sha256)
+            b=$(openssl pkey -pubin -in internal/selfupdate/release_key.pem -pubout -outform DER | openssl dgst -sha256)
+            [[ "$a" != "$b" ]] || { echo "$next is the current key: a rotation needs a new key"; exit 1; }
+            echo "key rotation under way: this release's binaries accept the current and the next key"
+          fi
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -55,7 +91,7 @@ jobs:
       - run: go test ./...
 
   binaries:
-    needs: check
+    needs: [check, gate]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -78,7 +114,7 @@ jobs:
           if-no-files-found: error
 
   studio:
-    needs: check
+    needs: [check, gate]
     strategy:
       fail-fast: true
       matrix:
@@ -114,6 +150,11 @@ jobs:
       contents: write   # create the release and attach the assets
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the release notes read the history since the previous tag
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - uses: actions/download-artifact@v4
         with:
           path: parts
@@ -122,11 +163,16 @@ jobs:
           mkdir -p dist
           find parts -type f \( -name 'supavise-linux-*' -o -name 'supavise-studio-*.tar.zst' \) -exec cp {} dist/ \;
           ls -l dist
+      - name: release tool (manifest, notes)
+        run: go build -o "$RUNNER_TEMP/releasetool" ./deploy/releasetool
       - name: sign and stamp (deploy/release-assets.sh)
         env:
           SUPAVISE_SIGNING_KEY: ${{ secrets.SUPAVISE_SIGNING_KEY }}
           # The template of this release names this tag as its default supavise release.
           SUPAVISE_RELEASE_TAG: ${{ github.ref_name }}
+          # Writes supavise-release.json (version, min_upgrade_from, the pinned Supabase releases) and
+          # lists it in SHA256SUMS, so the signature below covers it.
+          SUPAVISE_RELEASETOOL: ${{ runner.temp }}/releasetool
         run: |
           umask 077
           printf '%s\n' "$SUPAVISE_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
@@ -134,12 +180,37 @@ jobs:
           shred -u "$RUNNER_TEMP/sign.pem" || rm -f "$RUNNER_TEMP/sign.pem"
           ls -l dist
           # The install path for AWS users: the template (console upload) and the deploy script.
-          for f in supavise.yaml supavise-aws-deploy.sh; do [[ -s "dist/$f" ]] || { echo "dist/$f is missing"; exit 1; }; done
+          for f in supavise.yaml supavise-aws-deploy.sh supavise-release.json; do [[ -s "dist/$f" ]] || { echo "dist/$f is missing"; exit 1; }; done
+      - name: release notes
+        run: |
+          # What Supavise changed since the previous tag, and a table of the Supabase service
+          # versions that moved (internal/versions/versions.yaml at the two tags), each linked to
+          # its upstream release. A stable release compares with the previous stable tag; a
+          # pre-release with the previous tag of any kind.
+          prev=""
+          while read -r t; do
+            [[ "$t" == "$GITHUB_REF_NAME" ]] && continue
+            [[ "$GITHUB_REF_NAME" != *-* && "$t" == *-* ]] && continue
+            prev=$t; break
+          done < <(git tag --list 'v[0-9]*' --merged "$GITHUB_SHA" --sort=-creatordate)
+          args=(notes -tag "$GITHUB_REF_NAME" -repo "$GITHUB_REPOSITORY" -new internal/versions/versions.yaml
+                -min-upgrade-from "$(grep -v '^[[:space:]]*#' deploy/MIN_UPGRADE_FROM | tr -d '[:space:]')")
+          if [[ -n "$prev" ]]; then
+            git show "$prev:internal/versions/versions.yaml" > "$RUNNER_TEMP/old-versions.yaml"
+            git log --no-merges --pretty=format:'%H%x09%s' "$prev..$GITHUB_SHA" > "$RUNNER_TEMP/log.txt"
+            args+=(-prev-tag "$prev" -old "$RUNNER_TEMP/old-versions.yaml" -log "$RUNNER_TEMP/log.txt")
+          else
+            git log --no-merges -n 50 --pretty=format:'%H%x09%s' "$GITHUB_SHA" > "$RUNNER_TEMP/log.txt"
+            args+=(-log "$RUNNER_TEMP/log.txt")
+          fi
+          "$RUNNER_TEMP/releasetool" "${args[@]}" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
       - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=(--verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+          flags=(--verify-tag --notes-file "$RUNNER_TEMP/notes.md" --title "$GITHUB_REF_NAME")
           [[ "$GITHUB_REF_NAME" == *-* ]] && flags+=(--prerelease)
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber

@@ -2,142 +2,156 @@ package selfupdate
 
 import (
 	"context"
-	"errors"
-	"os"
-	"path/filepath"
+	"crypto/ed25519"
+	"crypto/rand"
 	"strings"
 	"testing"
 )
 
-func TestManifestCheck(t *testing.T) {
-	for _, tc := range []struct {
-		name, body, tag, current string
-		want                     string // substring of the refusal; empty means allowed
-	}{
-		{"no limit", `{"version":"v1.4.0"}`, "v1.4.0", "v0.1.0", ""},
-		{"at the minimum", `{"min_upgrade_from":"v1.2.0"}`, "v1.4.0", "v1.2.0", ""},
-		{"above the minimum", `{"min_upgrade_from":"v1.2.0"}`, "v1.4.0", "v1.3.5-2-gabc", ""},
-		{"below the minimum", `{"min_upgrade_from":"v1.2.0"}`, "v1.4.0", "v1.1.9", "can be installed from v1.2.0"},
-		{"a development build is let through", `{"min_upgrade_from":"v1.2.0"}`, "v1.4.0", "dev", ""},
-		{"a manifest of another version", `{"version":"v1.3.0"}`, "v1.4.0", "v1.3.9", "ships a manifest for v1.3.0"},
-		{"unknown fields are ignored", `{"min_upgrade_from":"v1.0.0","notes":"x"}`, "v1.4.0", "v1.0.0", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			m, err := ParseManifest([]byte(tc.body))
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = m.Check(tc.tag, tc.current)
-			if tc.want == "" {
-				if err != nil {
-					t.Fatalf("refused: %v", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("err = %v, want %q", err, tc.want)
-			}
-		})
+func TestManifestMarshalIsDeterministicAndRoundTrips(t *testing.T) {
+	m := &Manifest{Schema: 1, Version: "v1.4.0", MinUpgradeFrom: "v1.2.0",
+		Artifacts: map[string]string{"postgres": "postgres-17.11.0.004-r1", "auth": "auth-v2.195.0-r1"}, Studio: "2026.10.05-sha-94b8b06"}
+	a, err := m.Marshal()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := ParseManifest([]byte(`{"min_upgrade_from":"soon"}`)); err == nil {
-		t.Fatal("a minimum that is not a version was accepted")
+	b, _ := m.Marshal()
+	if string(a) != string(b) {
+		t.Fatal("the same manifest marshaled to different bytes")
 	}
-	if _, err := ParseManifest([]byte(`not json`)); err == nil {
-		t.Fatal("garbage was accepted")
+	if !strings.HasSuffix(string(a), "}\n") || strings.Index(string(a), `"auth"`) > strings.Index(string(a), `"postgres"`) {
+		t.Errorf("want sorted keys and a trailing newline:\n%s", a)
+	}
+	got, err := ParseManifest(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != "v1.4.0" || got.MinUpgradeFrom != "v1.2.0" || got.Artifacts["auth"] != "auth-v2.195.0-r1" || got.Studio != m.Studio {
+		t.Errorf("round trip: %+v", got)
 	}
 }
 
-func TestResolveEnforcesTheSignedManifest(t *testing.T) {
-	ctx := context.Background()
-
-	// A release below the node's minimum is refused by Update as well as by Resolve, and the
-	// installed binary is left alone.
-	r := newReleaseServer(t, "v1.4.0", "new binary").withManifest(`{"version":"v1.4.0","min_upgrade_from":"v1.2.0"}`, true)
-	o, exe := r.opts(t, "v1.1.0")
-	if _, err := Resolve(ctx, o); !errors.Is(err, ErrUnsupportedJump) {
-		t.Fatalf("Resolve below the minimum: %v", err)
+func TestParseManifestRefusals(t *testing.T) {
+	good := `{"schema":1,"version":"v1.4.0","min_upgrade_from":"v1.2.0"}`
+	if _, err := ParseManifest([]byte(good)); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := Update(ctx, o); !errors.Is(err, ErrUnsupportedJump) {
-		t.Fatalf("Update below the minimum: %v", err)
+	// An unknown field is ignored: a later release may add one under the same schema.
+	if _, err := ParseManifest([]byte(`{"schema":1,"version":"v1.4.0","min_upgrade_from":"v1.2.0","new_field":true}`)); err != nil {
+		t.Errorf("unknown field: %v", err)
+	}
+	for name, body := range map[string]string{
+		"not json":           `{`,
+		"no schema":          `{"version":"v1.4.0","min_upgrade_from":"v1.2.0"}`,
+		"future schema":      `{"schema":2,"version":"v1.4.0","min_upgrade_from":"v1.2.0"}`,
+		"no version":         `{"schema":1,"min_upgrade_from":"v1.2.0"}`,
+		"bad version":        `{"schema":1,"version":"latest","min_upgrade_from":"v1.2.0"}`,
+		"no min":             `{"schema":1,"version":"v1.4.0"}`,
+		"bad min":            `{"schema":1,"version":"v1.4.0","min_upgrade_from":"1.2"}`,
+		"min newer":          `{"schema":1,"version":"v1.4.0","min_upgrade_from":"v1.5.0"}`,
+		"min newer in patch": `{"schema":1,"version":"v1.4.0","min_upgrade_from":"v1.4.1"}`,
+	} {
+		if _, err := ParseManifest([]byte(body)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// min_upgrade_from equal to the version, and a suffix, are fine.
+	if _, err := ParseManifest([]byte(`{"schema":1,"version":"v1.4.0-rc.1","min_upgrade_from":"v1.4.0"}`)); err != nil {
+		t.Errorf("equal core versions: %v", err)
+	}
+	if _, err := ParseManifest([]byte(`{"schema":2,"version":"v1.4.0","min_upgrade_from":"v1.2.0"}`)); err == nil ||
+		!strings.Contains(err.Error(), "update with the installer") {
+		t.Errorf("a future schema must say what to do: %v", err)
+	}
+}
+
+func TestCheckUpgradeFrom(t *testing.T) {
+	m := &Manifest{Schema: 1, Version: "v2.0.0", MinUpgradeFrom: "v1.2.0"}
+	for _, c := range []struct {
+		current string
+		ok      bool
+	}{
+		{"v1.2.0", true},
+		{"v1.9.9", true},
+		{"v1.2.0-3-gabcdef", true}, // a build after the tag counts as the tag
+		{"v1.1.9", false},
+		{"v1.0.0", false},
+		{"v0.9.0", false},
+		{"dev", true}, // cannot be judged
+		{"", true},
+	} {
+		err := m.CheckUpgradeFrom(c.current)
+		if (err == nil) != c.ok {
+			t.Errorf("CheckUpgradeFrom(%q) = %v, want ok=%v", c.current, err, c.ok)
+		}
+		if err != nil && !strings.Contains(err.Error(), "v1.2.0 first") {
+			t.Errorf("the refusal must name the version to go through: %v", err)
+		}
+	}
+}
+
+func TestFetchReturnsTheSignedManifest(t *testing.T) {
+	r := newReleaseServer(t, "v1.2.0", "new binary")
+	o, _ := r.opts(t, "v1.0.0")
+	v, err := Fetch(context.Background(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Release.Tag != "v1.2.0" || v.Manifest.Version != "v1.2.0" || v.Manifest.Artifacts["auth"] != "auth-v2.195.0-r1" || v.Key != CurrentKey {
+		t.Errorf("%+v %+v", v.Release, v.Manifest)
+	}
+	// Nothing but the three small files was downloaded.
+	if r.calls["supavise-linux-amd64"] != 0 {
+		t.Error("Fetch downloaded the binary")
+	}
+	// Without any key it does not go to the network.
+	o.Key = nil
+	if _, err := Fetch(context.Background(), o); err != ErrNoKey {
+		t.Errorf("Fetch with no key: %v", err)
+	}
+}
+
+func TestUpdateHonorsMinUpgradeFrom(t *testing.T) {
+	setMin := func(r *releaseServer, min string) {
+		m := &Manifest{Schema: 1, Version: r.tag, MinUpgradeFrom: min}
+		b, _ := m.Marshal()
+		r.manifest = b
+		r.rebuild(t)
+	}
+	r := newReleaseServer(t, "v2.0.0", "new binary")
+	setMin(r, "v1.5.0")
+	o, exe := r.opts(t, "v1.2.0")
+	_, err := Update(context.Background(), o)
+	if err == nil || !strings.Contains(err.Error(), "upgrades from v1.5.0 or later") {
+		t.Fatalf("%v", err)
 	}
 	if read(t, exe) != "old binary" || r.calls["supavise-linux-amd64"] != 0 {
-		t.Fatal("a refused jump downloaded or replaced the binary")
+		t.Fatal("went on to download and install a release the node cannot upgrade to")
 	}
-	o.Current = "v1.2.0"
-	res, err := Resolve(ctx, o)
-	if err != nil || res.Manifest == nil || res.Manifest.MinUpgradeFrom != "v1.2.0" {
-		t.Fatalf("Resolve at the minimum: %+v %v", res, err)
+	// From the minimum itself it works.
+	o, _ = r.opts(t, "v1.5.0")
+	if res, err := Update(context.Background(), o); err != nil || !res.Replaced {
+		t.Fatalf("%+v %v", res, err)
 	}
-
-	// A manifest the signature does not cover could say anything.
-	r = newReleaseServer(t, "v1.4.0", "new binary").withManifest(`{"min_upgrade_from":"v0.0.1"}`, false)
-	o, _ = r.opts(t, "v1.1.0")
-	if _, err := Resolve(ctx, o); err == nil || !strings.Contains(err.Error(), "does not cover it") {
-		t.Fatalf("unsigned manifest: %v", err)
-	}
-
-	// A manifest that was changed after signing does not match its listed checksum.
-	r = newReleaseServer(t, "v1.4.0", "new binary").withManifest(`{"min_upgrade_from":"v1.2.0"}`, true)
-	r.manifest = []byte(`{"min_upgrade_from":"v0.0.1"}`)
-	o, _ = r.opts(t, "v1.1.0")
-	if _, err := Resolve(ctx, o); err == nil || !strings.Contains(err.Error(), "does not match its checksum") {
-		t.Fatalf("tampered manifest: %v", err)
-	}
-
-	// A release with no manifest has no limit.
-	r = newReleaseServer(t, "v1.4.0", "new binary")
-	o, _ = r.opts(t, "v0.0.1")
-	if res, err := Resolve(ctx, o); err != nil || res.Manifest != nil {
-		t.Fatalf("no manifest: %+v %v", res, err)
+	// --force skips the check, like it skips the "newer" check.
+	o, _ = r.opts(t, "v1.2.0")
+	o.Force = true
+	if res, err := Update(context.Background(), o); err != nil || !res.Replaced {
+		t.Fatalf("forced: %+v %v", res, err)
 	}
 }
 
-func TestStageThenInstallOrDiscard(t *testing.T) {
-	ctx := context.Background()
+func TestManifestIsSignedByTheSameKeyAsTheChecksums(t *testing.T) {
+	// A manifest swapped for another one signed by another key: the list it is checked against
+	// is not the attacker's to sign.
 	r := newReleaseServer(t, "v1.2.0", "new binary")
-	o, exe := r.opts(t, "v1.1.0")
-	stage := t.TempDir()
-	o.StageDir = stage
-	res, err := Resolve(ctx, o)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st, err := res.Stage(ctx, o)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if filepath.Dir(st.Path) != stage || read(t, st.Path) != "new binary" || read(t, exe) != "old binary" {
-		t.Fatalf("staged at %s, installed binary %q", st.Path, read(t, exe))
-	}
-	st.Discard()
-	if _, err := os.Stat(st.Path); !os.IsNotExist(err) {
-		t.Fatalf("Discard left %s", st.Path)
-	}
-}
-
-func TestStudioIsTakenFromTheSignedList(t *testing.T) {
-	r := newReleaseServer(t, "v1.2.0", "new binary")
-	r.sums = append(r.sums, []byte(strings.Repeat("c", 64)+"  supavise-studio-2026.10.05-linux-amd64.tar.zst\n"+strings.Repeat("d", 64)+"  supavise-studio-2026.10.05-linux-arm64.tar.zst\n")...)
-	o, _ := r.opts(t, "v1.1.0")
-	res := &Resolved{Release: &Release{Tag: "v1.2.0", Assets: map[string]string{"supavise-studio-2026.10.05-linux-amd64.tar.zst": "http://x/amd64"}}, Sums: r.sums, platform: o.Platform}
-	name, url, sha, ok := res.Studio()
-	if !ok || name != "supavise-studio-2026.10.05-linux-amd64.tar.zst" || url != "http://x/amd64" || sha != strings.Repeat("c", 64) {
-		t.Fatalf("Studio() = %q %q %q %v", name, url, sha, ok)
-	}
-	res.Release.Assets = map[string]string{}
-	if _, _, _, ok := res.Studio(); ok {
-		t.Fatal("a Studio line without an asset to download was offered")
-	}
-}
-
-func TestCompare(t *testing.T) {
-	if c, ok := Compare("v1.2.0", "v1.10.0"); !ok || c >= 0 {
-		t.Fatalf("v1.2.0 vs v1.10.0 = %d %v", c, ok)
-	}
-	if c, ok := Compare("v1.2.0-rc1", "v1.2.0"); !ok || c != 0 {
-		t.Fatalf("a suffix counts as the tag: %d %v", c, ok)
-	}
-	if _, ok := Compare("dev", "v1.0.0"); ok {
-		t.Fatal("dev was placed")
+	_, evil, _ := ed25519.GenerateKey(rand.Reader)
+	m := &Manifest{Schema: 1, Version: "v1.2.0", MinUpgradeFrom: "v0.0.0", Studio: "evil"}
+	r.manifest, _ = m.Marshal()
+	r.sums = r.sumsFor(r.bin, r.manifest)
+	r.sig = ed25519.Sign(evil, r.sums)
+	o, _ := r.opts(t, "v1.0.0")
+	if _, err := Fetch(context.Background(), o); err == nil || !strings.Contains(err.Error(), "does not verify") {
+		t.Fatalf("%v", err)
 	}
 }
