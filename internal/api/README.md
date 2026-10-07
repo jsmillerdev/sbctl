@@ -103,7 +103,7 @@ and `GET .../diff`, with the exact spec shapes (`BranchResponse`, `BranchDetailR
 these paths itself; the `/platform` twins are the project fields `is_branch_enabled`,
 `preview_branch_refs` and `parent_project_ref`. Branches are not listed as projects. Merge, reset and
 push answer `201 {workflow_run_id, message: "ok"}` at once and run in the background; the branch's
-`status` follows. `?force=true` on merge and push is our extension. `GET /v1/branches/{id}` omits `db_pass` and `jwt_secret` for the default branch (the project's own
+`status` follows. `?force=true` on merge and push is our extension. A branch has none of the parent's Storage objects and none of its Edge Functions or function secrets, with or without `with_data`, as on hosted (`internal/branching/README.md`, "What a branch contains"): a `with_data` clone keeps the parent's buckets and drops the rows that describe objects, functions come from deploys to the branch's own ref, and the `secrets` field of the create body is refused with 400. `GET /v1/branches/{id}` omits `db_pass` and `jwt_secret` for the default branch (the project's own
 secrets stay in the secret store) and answers without them while a new branch's credentials are not
 stored yet. Create refuses what the node cannot honor with 400: non-empty `secrets`, a `release_channel`
 other than `ga`, a `postgres_engine` other than the parent's; `region` is accepted and the parent's

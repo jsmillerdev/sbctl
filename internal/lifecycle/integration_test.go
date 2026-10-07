@@ -218,6 +218,30 @@ func TestIntegrationSystemAndProject(t *testing.T) {
 	}
 	rc.Close(ctx)
 
+	// pg_cron runs its jobs in the cluster's background workers: over libpq it would fail with
+	// "connection failed" (nothing trusts a loopback connection) and the job would never succeed.
+	cc, err := connect(ctx, socketDSN(pathsFor(cfg, p.Ref, ports.Postgres), "postgres"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`create extension if not exists pg_cron`, `select cron.schedule('it-job', '1 seconds', 'select 1')`} {
+		if _, err := cc.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	var cronStatus, cronMsg string
+	for i := 0; i < 60; i++ {
+		err := cc.QueryRow(ctx, `select status, coalesce(return_message, '') from cron.job_run_details order by runid desc limit 1`).Scan(&cronStatus, &cronMsg)
+		if err == nil && cronStatus == "succeeded" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if cronStatus != "succeeded" {
+		t.Fatalf("pg_cron job: status %q (%s), want succeeded", cronStatus, cronMsg)
+	}
+	cc.Close(ctx)
+
 	// Pause stops everything; resume brings it back.
 	if err := n.Engine.Pause(ctx, p.Ref); err != nil {
 		t.Fatal(err)

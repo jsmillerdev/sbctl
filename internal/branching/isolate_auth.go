@@ -111,7 +111,7 @@ func wipeAuthSessions(ctx context.Context, c *pgx.Conn, res *IsolateResult) erro
 	if _, err := tx.Exec(ctx, `set local session_replication_role = replica`); err != nil {
 		return fmt.Errorf("suppress triggers for the session wipe: %w", err)
 	}
-	if err := checkWipeClosure(ctx, tx); err != nil {
+	if err := checkWipeClosure(ctx, tx, "auth", authWipedTables); err != nil {
 		return err
 	}
 	if res.AuthRowsDeleted == nil {
@@ -186,18 +186,18 @@ func appendUnique(l []string, s string) []string {
 	return append(l, s)
 }
 
-// checkWipeClosure fails when a table that is kept has a foreign key into a wiped table: with
-// foreign-key actions suppressed, wiping the referenced table would leave dangling rows.
-func checkWipeClosure(ctx context.Context, tx pgx.Tx) error {
+// checkWipeClosure fails when a table that is kept has a foreign key into a wiped table of
+// schema: with foreign-key actions suppressed, wiping the referenced table would leave dangling rows.
+func checkWipeClosure(ctx context.Context, tx pgx.Tx, schema string, wiped []string) error {
 	rows, err := tx.Query(ctx, `
 		select con.conname, src.relname, dst.relname
 		from pg_constraint con
 		join pg_class src on src.oid = con.conrelid
 		join pg_class dst on dst.oid = con.confrelid
 		where con.contype = 'f'
-		  and dst.relnamespace = 'auth'::regnamespace
+		  and dst.relnamespace = $2::text::regnamespace
 		  and dst.relname = any($1)
-		  and not (src.relnamespace = 'auth'::regnamespace and src.relname = any($1))`, authWipedTables)
+		  and not (src.relnamespace = $2::text::regnamespace and src.relname = any($1))`, wiped, schema)
 	if err != nil {
 		return err
 	}
@@ -213,9 +213,9 @@ func checkWipeClosure(ctx context.Context, tx pgx.Tx) error {
 	if len(bad) > 0 {
 		var l []string
 		for _, f := range bad {
-			l = append(l, fmt.Sprintf("%s (%s -> auth.%s)", f.name, f.from, f.to))
+			l = append(l, fmt.Sprintf("%s (%s -> %s.%s)", f.name, f.from, schema, f.to))
 		}
-		return fmt.Errorf("a kept table references a session table, so the wipe would leave dangling rows: %s", strings.Join(l, ", "))
+		return fmt.Errorf("a kept table references a wiped table, so the wipe would leave dangling rows: %s", strings.Join(l, ", "))
 	}
 	return nil
 }

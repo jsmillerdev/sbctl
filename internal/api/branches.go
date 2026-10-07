@@ -207,7 +207,7 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) error {
 	// Fields this node cannot honor are refused instead of silently dropped: the client would
 	// believe it got what it asked for. The CLI and the MCP server never send them.
 	if in.Secrets != nil && len(*in.Secrets) > 0 {
-		return errf(http.StatusBadRequest, "Branch secrets are not supported on this node")
+		return errf(http.StatusBadRequest, "Branch secrets are not supported on this node: set function secrets on the branch once it exists (supabase secrets set --project-ref <branch ref>)")
 	}
 	if in.ReleaseChannel != nil && *in.ReleaseChannel != "ga" {
 		return errf(http.StatusBadRequest, "release_channel %q is not available on this node (only ga)", string(*in.ReleaseChannel))
