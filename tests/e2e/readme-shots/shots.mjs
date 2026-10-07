@@ -174,6 +174,8 @@ for (const theme of THEMES) {
     writeFileSync(join(DEBUG, `sign-in-${theme}.txt`), [`url: ${page.url()}`, ...page.__net.slice(-100)].join('\n'))
   } catch (e) {
     await page.screenshot({ path: join(DEBUG, `ERROR-sign-in-${theme}.png`) }).catch(() => {})
+    const body = await page.evaluate(() => document.body.innerText).catch(() => '')
+    writeFileSync(join(DEBUG, `sign-in-${theme}.txt`), [`url: ${page.url()}`, `console: ${[...new Set(page.__console)].join(' ; ')}`, `text: ${body.slice(0, 1500)}`, ...page.__net.slice(-200)].join('\n'))
     log(`sign-in failed (${theme}): ${e.message.split('\n')[0]}`)
     results.push({ shot: `sign-in-${theme}`, ok: false, problems: [e.message.split('\n')[0]] })
     await ctx.close()
