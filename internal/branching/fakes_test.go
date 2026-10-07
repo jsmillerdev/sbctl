@@ -227,6 +227,9 @@ type harness struct {
 	// isolated lists the branches the service isolated from the parent's integrations.
 	isolated   []string
 	isolateErr error
+	// rewritten lists the branches whose data had the parent's credentials replaced.
+	rewritten  []string
+	rewriteErr error
 }
 
 func (h *harness) clock() time.Time {
@@ -285,6 +288,12 @@ func newHarness(t *testing.T, mut func(*config.Config)) *harness {
 		defer h.mu.Unlock()
 		h.isolated = append(h.isolated, ref)
 		return h.isolateErr
+	}
+	svc.rewrite = func(_ context.Context, ref string) error {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.rewritten = append(h.rewritten, ref)
+		return h.rewriteErr
 	}
 	h.svc = svc
 	t.Cleanup(func() { svc.Drain(context.Background()) })

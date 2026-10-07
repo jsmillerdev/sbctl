@@ -111,19 +111,19 @@ var _ EgressEnforcer = (*Systemd)(nil)
 // applyEgress makes the unit's IPAddressDeny and IPAddressAllow what spec.DenyEgress says.
 // Like the limits it is a persistent drop-in written by systemd itself, so it survives
 // restarts and reboots, and a running unit has it at once (the cgroup's BPF filter changes).
-// A unit that never had a restriction and wants none is not touched (a unit that systemd does not
-// have loaded counts as having none; Remove clears the drop-in explicitly).
+// A unit whose lists already are what the policy says (including one that never had a restriction and
+// wants none) is not touched; one confined by an earlier release with a wider allow list is narrowed (a
+// unit that systemd does not have loaded counts as having none; Remove clears the drop-in explicitly).
 func (s *Systemd) applyEgress(ctx context.Context, unit string, deny bool) error {
 	c, err := s.dial(ctx)
 	if err != nil {
 		return err
 	}
-	has := false
-	if cur, err := c.GetUnitTypePropertiesContext(ctx, unit, "Service"); err == nil {
-		d, _ := cur["IPAddressDeny"].([][]interface{})
-		has = len(d) > 0
+	cur, err := c.GetUnitTypePropertiesContext(ctx, unit, "Service")
+	if err != nil {
+		cur = nil // not loaded: it has no restriction
 	}
-	if has == deny {
+	if egressMatches(cur, deny) {
 		return nil
 	}
 	return s.setEgress(ctx, c, unit, deny)

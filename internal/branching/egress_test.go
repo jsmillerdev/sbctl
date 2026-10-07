@@ -197,7 +197,9 @@ func TestResetKeepsTheEgressPolicy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := cloneHarness(t)
 			b := h.create("data", func(in *CreateInput) { in.WithData = true })
-			h.svc.setState(ctx, b.Ref, registry.BranchMigrationsPassed, "ok", func(bi *registry.BranchInfo) { bi.Egress = tc.before })
+			if err := h.reg.SetBranchEgress(ctx, b.Ref, registry.EgressPending, tc.before); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := h.svc.Reset(ctx, b.Ref, ActionInput{}); err != nil {
 				t.Fatal(err)
 			}

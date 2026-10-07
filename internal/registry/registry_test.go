@@ -194,7 +194,7 @@ func testBranches(t *testing.T, r Registry, orgID int64) {
 		t.Fatalf("delete parent with branches: %v", err)
 	}
 	got.Branch.State, got.Branch.Detail, got.Branch.CloneMethod, got.Branch.Persistent, got.Branch.ExpiresAt = BranchMigrationsPassed, "ok", "clonefile", true, nil
-	got.Branch.Egress = EgressDenied
+	got.Branch.Egress = EgressDenied // UpdateBranch must not write this
 	if err := r.SetProjectStatus(ctx, kid, StatusActiveHealthy); err != nil {
 		t.Fatal(err)
 	}
@@ -202,8 +202,36 @@ func testBranches(t *testing.T, r Registry, orgID int64) {
 		t.Fatal(err)
 	}
 	again, _ := r.GetProject(ctx, kid)
-	if again.Status != StatusActiveHealthy || again.Branch.State != BranchMigrationsPassed || !again.Branch.Persistent || again.Branch.ExpiresAt != nil || again.Branch.CloneMethod != "clonefile" || again.Branch.Egress != EgressDenied || again.Branch.ParentRef != parent {
+	if again.Status != StatusActiveHealthy || again.Branch.State != BranchMigrationsPassed || !again.Branch.Persistent || again.Branch.ExpiresAt != nil || again.Branch.CloneMethod != "clonefile" || again.Branch.ParentRef != parent {
 		t.Fatalf("update branch: %+v %+v", again, again.Branch)
+	}
+	// The egress policy has its own writer: UpdateBranch leaves it alone, so a read-modify-write
+	// of the other fields cannot put a stale policy back.
+	if again.Branch.Egress != EgressPending {
+		t.Fatalf("UpdateBranch wrote the egress policy: %q", again.Branch.Egress)
+	}
+	if err := r.SetBranchEgress(ctx, kid, EgressDenied, EgressAllowed); !errors.Is(err, ErrConflict) {
+		t.Fatalf("SetBranchEgress from the wrong policy: %v", err)
+	}
+	if err := r.SetBranchEgress(ctx, kid, EgressPending, EgressDenied); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetBranchEgress(ctx, kid, EgressPending, EgressDenied); !errors.Is(err, ErrConflict) {
+		t.Fatalf("SetBranchEgress twice from pending: %v", err)
+	}
+	stale := *again.Branch // read before the policy changed, written back after
+	stale.Detail = "stale write"
+	if err := r.UpdateBranch(ctx, kid, &stale); err != nil {
+		t.Fatal(err)
+	}
+	if later, _ := r.GetProject(ctx, kid); later.Branch.Egress != EgressDenied || later.Branch.Detail != "stale write" {
+		t.Fatalf("a stale UpdateBranch changed the policy or lost its own field: %+v", later.Branch)
+	}
+	if err := r.SetBranchEgress(ctx, parent, "", EgressDenied); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetBranchEgress on an ordinary project: %v", err)
+	}
+	if err := r.SetBranchEgress(ctx, "zzzzzzzzzzzzzzzzzzzz", "", EgressDenied); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetBranchEgress on a missing project: %v", err)
 	}
 	if err := r.UpdateBranch(ctx, parent, got.Branch); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("UpdateBranch on an ordinary project: %v", err)

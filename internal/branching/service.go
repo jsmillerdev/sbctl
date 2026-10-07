@@ -96,6 +96,9 @@ type Service struct {
 	rotate func(ctx context.Context, ref string) error
 	// isolate switches off the integrations a cloned cluster inherited (isolateBranch).
 	isolate func(ctx context.Context, ref string) error
+	// rewrite replaces the parent's credentials inside a cloned cluster's data with the
+	// branch's own (rewriteBranchCredentials); it runs after rotate.
+	rewrite func(ctx context.Context, ref string) error
 	clone   func(ctx context.Context, parentRef, method, dstData string) (*CloneStats, error)
 	// freeBytes is the free space of the disk holding a path (-1: unknown).
 	freeBytes func(path string) int64
@@ -157,6 +160,7 @@ func New(d Deps) (*Service, error) {
 	s.host, _ = os.Hostname()
 	s.rotate = s.rotateCredentials
 	s.isolate = s.isolateBranch
+	s.rewrite = s.rewriteBranchCredentials
 	s.clone = s.cloneParent
 	s.freeBytes = freeBytes
 	s.base, s.stop = context.WithCancel(context.Background())

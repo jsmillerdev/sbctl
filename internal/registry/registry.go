@@ -199,9 +199,16 @@ type Registry interface {
 	SetProjectStatus(ctx context.Context, ref string, s Status) error
 	// UpdateBranch writes the mutable fields of b (name, git branch, persistence, expiry,
 	// notify URL, state, detail, clone method) of the branch project ref and nothing else,
-	// so it cannot overwrite a status change made at the same time. ErrNotFound when ref is
-	// not a branch; ErrConflict when the name is taken under the same parent.
+	// so it cannot overwrite a status change made at the same time. It never writes the
+	// egress policy: a caller that read the branch, changed a field and wrote it back (a PATCH,
+	// a restore) would otherwise put a stale policy over one set meanwhile. ErrNotFound when
+	// ref is not a branch; ErrConflict when the name is taken under the same parent.
 	UpdateBranch(ctx context.Context, ref string, b *BranchInfo) error
+	// SetBranchEgress is the only writer of a branch's egress policy after creation (the
+	// policy of a new branch is part of its row): a compare-and-set from the policy the caller
+	// saw to the new one. ErrConflict when the policy is not from any more, ErrNotFound when ref
+	// is not a branch.
+	SetBranchEgress(ctx context.Context, ref, from, to string) error
 	// DeleteProject removes the project, its secrets and routes (cascade).
 	DeleteProject(ctx context.Context, ref string) error
 

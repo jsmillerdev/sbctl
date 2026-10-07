@@ -225,10 +225,32 @@ func (r *Postgres) UpdateBranch(ctx context.Context, ref string, b *BranchInfo) 
 	return affected(r.pool.Exec(ctx, `
 		update sbctl.projects set branch_name = $2, git_branch = $3, persistent = $4, with_data = $5, expires_at = $6,
 			deletion_scheduled_at = $7, notify_url = $8, branch_state = $9, branch_detail = $10, clone_method = $11,
-			review_requested_at = $12, branch_egress = $13, updated_at = now()
+			review_requested_at = $12, updated_at = now()
 		where ref = $1 and parent_ref is not null`,
 		ref, nullStr(b.Name), nullStr(b.GitBranch), b.Persistent, b.WithData, b.ExpiresAt, b.DeletionScheduledAt,
-		nullStr(b.NotifyURL), nullStr(string(b.State)), nullStr(b.Detail), nullStr(b.CloneMethod), b.ReviewRequestedAt, nullStr(b.Egress)))
+		nullStr(b.NotifyURL), nullStr(string(b.State)), nullStr(b.Detail), nullStr(b.CloneMethod), b.ReviewRequestedAt))
+}
+
+// SetBranchEgress implements Registry: a compare-and-set on branch_egress alone.
+func (r *Postgres) SetBranchEgress(ctx context.Context, ref, from, to string) error {
+	tag, err := r.pool.Exec(ctx, `
+		update sbctl.projects set branch_egress = $3, updated_at = now()
+		where ref = $1 and parent_ref is not null and coalesce(branch_egress, '') = $2`,
+		ref, from, nullStr(to))
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	var isBranch bool
+	if err := r.pool.QueryRow(ctx, `select parent_ref is not null from sbctl.projects where ref = $1`, ref).Scan(&isBranch); err != nil {
+		return mapErr(err)
+	}
+	if !isBranch {
+		return ErrNotFound
+	}
+	return fmt.Errorf("%w: the egress policy of %s is no longer %q", ErrConflict, ref, from)
 }
 
 func (r *Postgres) GetProject(ctx context.Context, ref string) (*Project, error) {

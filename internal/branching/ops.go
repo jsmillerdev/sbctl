@@ -314,15 +314,24 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 			}
 		}
 		info.DeletionScheduledAt = nil
-		if info.WithData {
-			// The new cluster gets the same outbound policy, applied again after its first
-			// start; an opt-out stays an opt-out, and what could not be enforced is tried again.
-			info.Egress = s.egressPolicy(info.Egress == registry.EgressAllowed)
-		}
-		// The row is still there: record the lifetime, the cleared method and the policy on it now.
+		// With data, the new cluster gets the same outbound policy, applied again after its first
+		// start (set below); an opt-out stays an opt-out, and what could not be enforced is tried again.
+		// The row is still there: record the lifetime and the cleared method on it now. The policy
+		// has its own writer (UpdateBranch never writes it), a compare-and-set from the value the
+		// row has right now, so that nothing racing with the reset puts a stale policy back.
 		s.setState(ctx, b.Ref, info.State, info.Detail, func(bi *registry.BranchInfo) {
-			bi.CloneMethod, bi.ExpiresAt, bi.DeletionScheduledAt, bi.Egress = info.CloneMethod, info.ExpiresAt, nil, info.Egress
+			bi.CloneMethod, bi.ExpiresAt, bi.DeletionScheduledAt = info.CloneMethod, info.ExpiresAt, nil
 		})
+		if info.WithData {
+			cur, err := s.reg.GetProject(ctx, b.Ref)
+			if err != nil || cur.Branch == nil {
+				return "", fmt.Errorf("read the branch before its policy is set: %v", err)
+			}
+			info.Egress = s.egressPolicy(cur.Branch.Egress == registry.EgressAllowed)
+			if err := s.reg.SetBranchEgress(ctx, b.Ref, cur.Branch.Egress, info.Egress); err != nil {
+				return "", fmt.Errorf("record the branch's egress policy: %w", err)
+			}
+		}
 		j := &createJob{
 			parent: parent, ref: b.Ref, info: &info, class: old.Class, org: org, recreate: true,
 			in: CreateInput{Name: b.Name, GitBranch: b.GitBranch, Persistent: b.Persistent, WithData: b.WithData, NotifyURL: b.NotifyURL},

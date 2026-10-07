@@ -158,14 +158,34 @@ type IsolateResult struct {
 	NetQueue      int  `json:"net_requests_dropped"`
 	// Egress is the branch's outbound network policy once isolation is done (registry.Egress*).
 	Egress string `json:"egress,omitempty"`
+	// ForeignServers is the number of foreign servers (postgres_fdw, dblink, ...) made unusable,
+	// MappingPasswords the number of user mappings that lost a password and CronCommands the
+	// number of pg_cron commands that had a connection string replaced (see foreign.go).
+	// ForeignKept is true when the branch has the egress opt-out and they were left as they were.
+	ForeignServers   int  `json:"foreign_servers_disabled"`
+	MappingPasswords int  `json:"user_mapping_passwords_dropped"`
+	CronCommands     int  `json:"cron_commands_neutralized"`
+	ForeignKept      bool `json:"foreign_servers_kept"`
+	// ForeignNotNeutralized names foreign servers of another wrapper than postgres_fdw and
+	// dblink_fdw whose options the wrapper's validator would not let isolation change.
+	ForeignNotNeutralized []string `json:"foreign_servers_not_neutralized,omitempty"`
+}
+
+// isolateOptions say what isolateCluster leaves alone: the opt-outs of a branch.
+type isolateOptions struct {
+	// KeepCron leaves the parent's pg_cron jobs active ([branching] keep_cron_jobs, or allow_egress).
+	KeepCron bool
+	// KeepForeign leaves foreign servers, user mappings and the connection strings in cron
+	// commands as the parent had them (allow_egress: the branch is meant to act on the outside).
+	KeepForeign bool
 }
 
 // isolateCluster neutralizes the parent's outbound integrations in every database of the
 // cluster reachable at dsn (a superuser on the cluster's private socket). It is safe to run
 // twice.
-func isolateCluster(ctx context.Context, dsn string, keepCron bool) (IsolateResult, error) {
+func isolateCluster(ctx context.Context, dsn string, opt isolateOptions) (IsolateResult, error) {
 	var res IsolateResult
-	res.CronKept = keepCron
+	res.CronKept, res.ForeignKept = opt.KeepCron, opt.KeepForeign
 	c, err := connect(ctx, dsn, "")
 	if err != nil {
 		return res, err
@@ -180,14 +200,14 @@ func isolateCluster(ctx context.Context, dsn string, keepCron bool) (IsolateResu
 		return res, err
 	}
 	for _, db := range dbs {
-		if err := isolateDatabase(ctx, dsn, db, keepCron, &res); err != nil {
+		if err := isolateDatabase(ctx, dsn, db, opt, &res); err != nil {
 			return res, fmt.Errorf("database %s: %w", db, err)
 		}
 	}
 	return res, nil
 }
 
-func isolateDatabase(ctx context.Context, dsn, db string, keepCron bool, res *IsolateResult) error {
+func isolateDatabase(ctx context.Context, dsn, db string, opt isolateOptions, res *IsolateResult) error {
 	c, err := connect(ctx, dsn, db)
 	if err != nil {
 		return err
@@ -214,17 +234,29 @@ func isolateDatabase(ctx context.Context, dsn, db string, keepCron bool, res *Is
 		}
 		res.Subscriptions++
 	}
-	if !keepCron {
-		var has bool
-		if err := c.QueryRow(ctx, `select to_regclass('cron.job') is not null`).Scan(&has); err != nil {
-			return err
+	var hasCron bool
+	if err := c.QueryRow(ctx, `select to_regclass('cron.job') is not null`).Scan(&hasCron); err != nil {
+		return err
+	}
+	if hasCron && !opt.KeepCron {
+		n, err := pauseCronJobs(ctx, c)
+		if err != nil {
+			return fmt.Errorf("pause cron jobs: %w", err)
 		}
-		if has {
-			n, err := pauseCronJobs(ctx, c)
+		res.CronJobs += n
+	}
+	if !opt.KeepForeign {
+		// Cron jobs that stay active (keep_cron_jobs) would otherwise reach other projects through
+		// a dblink string in their command; paused ones too, for whoever activates them.
+		if hasCron {
+			n, err := neutralizeCronCommands(ctx, c)
 			if err != nil {
-				return fmt.Errorf("pause cron jobs: %w", err)
+				return fmt.Errorf("neutralize cron commands: %w", err)
 			}
-			res.CronJobs += n
+			res.CronCommands += n
+		}
+		if err := neutralizeForeign(ctx, c, res); err != nil {
+			return fmt.Errorf("neutralize foreign servers: %w", err)
 		}
 	}
 	var hasQueue bool
@@ -247,6 +279,14 @@ func isolateDatabase(ctx context.Context, dsn, db string, keepCron bool, res *Is
 // egress open too):
 //
 //	update cron.job set active = true where jobid in (select jobid from sbctl_branch.paused_cron_jobs);
+//
+// Two things about the commands of those jobs changed when the branch was made, and the jobs
+// will not behave as in the parent until the owner redoes them: a connection string written
+// as a literal in a command (dblink('host=... password=...', ...)) was replaced by a disabled
+// one (the jobs are listed in NeutralizedCronTable; the original is not kept, it may hold a
+// password), and a parent credential in a command (an API key, a JWT secret, a database
+// password) was replaced by the branch's own (RewriteTable). A job that reaches a foreign
+// server by name needs that server turned on again (PausedForeignTable).
 const PausedCronTable = "sbctl_branch.paused_cron_jobs"
 
 // pauseCronJobs records the active jobs of cron.job in PausedCronTable and deactivates them,
@@ -306,7 +346,9 @@ func (s *Service) isolateBranch(ctx context.Context, ref string) error {
 	if p.Branch != nil {
 		egress = p.Branch.Egress
 	}
-	res, err := isolateCluster(ctx, s.adminSocketDSN(ref, p.Seq), s.keepsCron(egress))
+	res, err := isolateCluster(ctx, s.adminSocketDSN(ref, p.Seq), isolateOptions{
+		KeepCron: s.keepsCron(egress), KeepForeign: egress == registry.EgressAllowed,
+	})
 	if err != nil {
 		return err
 	}
@@ -336,7 +378,10 @@ func (s *Service) isolateBranch(ctx context.Context, ref string) error {
 	return nil
 }
 
-// denyEgress records registry.EgressDenied on a branch whose policy was pending.
+// denyEgress records registry.EgressDenied on a branch whose policy was pending. It is a
+// compare-and-set (SetBranchEgress), not a write of the whole branch row: a PATCH, a delete or a
+// restore running at the same moment cannot put a stale policy back, and this cannot undo a
+// reset that already replaced the policy. A branch that is denied already stays so.
 func (s *Service) denyEgress(ctx context.Context, ref string) error {
 	p, err := s.reg.GetProject(ctx, ref)
 	if err != nil {
@@ -345,7 +390,8 @@ func (s *Service) denyEgress(ctx context.Context, ref string) error {
 	if p.Branch == nil {
 		return fmt.Errorf("%s is not a branch", ref)
 	}
-	b := *p.Branch
-	b.Egress = registry.EgressDenied
-	return s.reg.UpdateBranch(ctx, ref, &b)
+	if p.Branch.Egress == registry.EgressDenied {
+		return nil
+	}
+	return s.reg.SetBranchEgress(ctx, ref, p.Branch.Egress, registry.EgressDenied)
 }

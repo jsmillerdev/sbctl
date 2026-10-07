@@ -220,7 +220,26 @@ func (m *Memory) UpdateBranch(_ context.Context, ref string, b *BranchInfo) erro
 	}
 	nb := *cur.Branch
 	nb.Name, nb.GitBranch, nb.Persistent, nb.WithData, nb.ExpiresAt, nb.DeletionScheduledAt = b.Name, b.GitBranch, b.Persistent, b.WithData, b.ExpiresAt, b.DeletionScheduledAt
-	nb.NotifyURL, nb.State, nb.Detail, nb.CloneMethod, nb.ReviewRequestedAt, nb.Egress = b.NotifyURL, b.State, b.Detail, b.CloneMethod, b.ReviewRequestedAt, b.Egress
+	nb.NotifyURL, nb.State, nb.Detail, nb.CloneMethod, nb.ReviewRequestedAt = b.NotifyURL, b.State, b.Detail, b.CloneMethod, b.ReviewRequestedAt
+	cur.Branch, cur.UpdatedAt = &nb, time.Now()
+	m.projects[ref] = cloneProject(cur)
+	m.notify("projects", "update", ref)
+	return nil
+}
+
+// SetBranchEgress implements Registry.
+func (m *Memory) SetBranchEgress(_ context.Context, ref, from, to string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.projects[ref]
+	if !ok || cur.Branch == nil {
+		return ErrNotFound
+	}
+	if cur.Branch.Egress != from {
+		return fmt.Errorf("%w: the egress policy of %s is no longer %q", ErrConflict, ref, from)
+	}
+	nb := *cur.Branch
+	nb.Egress = to
 	cur.Branch, cur.UpdatedAt = &nb, time.Now()
 	m.projects[ref] = cloneProject(cur)
 	m.notify("projects", "update", ref)

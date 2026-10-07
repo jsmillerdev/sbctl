@@ -3,6 +3,7 @@
 package units
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -423,8 +424,9 @@ func TestTemplatesContainment(t *testing.T) {
 	}
 }
 
-// The egress policy is IPAddressDeny=any with IPAddressAllow=localhost, in the shape of the
-// systemd D-Bus a(iayu) type: both families, loopback only.
+// The egress policy is IPAddressDeny=any with IPAddressAllow=127.0.0.1/32 ::1/128, in the shape
+// of the systemd D-Bus a(iayu) type: both families, the two loopback addresses and nothing else
+// (not 127.0.0.0/8: 127.0.0.53 is systemd-resolved's stub, a DNS side channel).
 func TestEgressRanges(t *testing.T) {
 	deny, allow := EgressDeny(), EgressAllow()
 	if len(deny) != 2 || deny[0].Family != 2 || len(deny[0].Addr) != 4 || deny[0].Prefix != 0 ||
@@ -438,9 +440,48 @@ func TestEgressRanges(t *testing.T) {
 			}
 		}
 	}
-	if len(allow) != 2 || allow[0].Family != 2 || allow[0].Addr[0] != 127 || allow[0].Prefix != 8 ||
-		allow[1].Family != 10 || allow[1].Addr[15] != 1 || allow[1].Prefix != 128 {
+	if len(allow) != 2 || allow[0].Family != 2 || !bytes.Equal(allow[0].Addr, []byte{127, 0, 0, 1}) || allow[0].Prefix != 32 ||
+		allow[1].Family != 10 || len(allow[1].Addr) != 16 || allow[1].Addr[15] != 1 || allow[1].Prefix != 128 {
 		t.Fatalf("allow = %+v", allow)
+	}
+	for _, b := range allow[1].Addr[:15] {
+		if b != 0 {
+			t.Fatalf("allow %+v is not ::1", allow[1])
+		}
+	}
+}
+
+// A unit is left alone only when its lists are exactly the policy; one confined by an earlier
+// release with the wider 127.0.0.0/8 allow is narrowed by the next Render.
+func TestEgressMatches(t *testing.T) {
+	dbus := func(rs []IPRange) [][]interface{} {
+		out := [][]interface{}{}
+		for _, r := range rs {
+			out = append(out, []interface{}{r.Family, r.Addr, r.Prefix})
+		}
+		return out
+	}
+	policy := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow())}
+	wide := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus([]IPRange{
+		{Family: 2, Addr: []byte{127, 0, 0, 0}, Prefix: 8}, EgressAllow()[1]})}
+	for _, tc := range []struct {
+		name  string
+		props map[string]interface{}
+		deny  bool
+		want  bool
+	}{
+		{"denied unit, deny wanted", policy, true, true},
+		{"denied unit, lift wanted", policy, false, false},
+		{"open unit, lift wanted", map[string]interface{}{}, false, true},
+		{"unloaded unit, lift wanted", nil, false, true},
+		{"open unit, deny wanted", map[string]interface{}{}, true, false},
+		{"old wide allow list", wide, true, false},
+		{"unknown shape", map[string]interface{}{"IPAddressDeny": "garbage"}, true, false},
+		{"unknown shape, lift wanted", map[string]interface{}{"IPAddressDeny": "garbage"}, false, false},
+	} {
+		if got := egressMatches(tc.props, tc.deny); got != tc.want {
+			t.Errorf("%s: egressMatches = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

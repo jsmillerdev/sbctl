@@ -855,6 +855,36 @@ func TestClonedBranchIsIsolatedBeforeItsCredentialsRotate(t *testing.T) {
 	}
 }
 
+// The parent's credentials inside the data are replaced after the branch has its own, for a
+// branch with data only; when the rewrite fails the branch is stopped, not left with a key to the parent.
+func TestClonedBranchHasTheParentsCredentialsReplacedInItsData(t *testing.T) {
+	h := cloneHarness(t)
+	b := h.create("data", func(in *CreateInput) { in.WithData = true })
+	h.mustState(b, registry.BranchMigrationsPassed)
+	if len(h.rewritten) != 1 || h.rewritten[0] != b.Ref {
+		t.Fatalf("rewritten = %v", h.rewritten)
+	}
+	h.create("schema", nil)
+	if len(h.rewritten) != 1 {
+		t.Fatalf("a schema-only branch had its data rewritten: %v", h.rewritten)
+	}
+	h.rewriteErr = errors.New("vault is unreadable")
+	f := h.create("leaky", func(in *CreateInput) { in.WithData = true })
+	h.mustState(f, registry.BranchMigrationsFailed)
+	if !strings.Contains(f.Detail, "vault is unreadable") || h.eng.paused[f.Ref] != 1 {
+		t.Fatalf("detail = %q paused = %v", f.Detail, h.eng.paused)
+	}
+	// It runs after the rotation, so that the branch's final keys are the ones written.
+	h2 := cloneHarness(t)
+	var order []string
+	h2.svc.rotate = func(context.Context, string) error { order = append(order, "rotate"); return nil }
+	h2.svc.rewrite = func(context.Context, string) error { order = append(order, "rewrite"); return nil }
+	h2.create("ordered", func(in *CreateInput) { in.WithData = true })
+	if strings.Join(order, ",") != "rotate,rewrite" {
+		t.Fatalf("order = %v", order)
+	}
+}
+
 func TestStampManagerRecreatesAndQuarantinesTheRestoredCluster(t *testing.T) {
 	h := newHarness(t, nil)
 	var seeded string

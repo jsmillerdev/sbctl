@@ -3,6 +3,7 @@
 package units
 
 import (
+	"bytes"
 	"context"
 	"time"
 
@@ -27,7 +28,7 @@ type Spec struct {
 	// unit. GoTrue uses it for "bin/auth migrate".
 	PreStart [][]string
 	// DenyEgress confines the unit's network traffic to loopback (systemd: IPAddressDeny=any
-	// with IPAddressAllow=localhost, applied as a persistent per-unit drop-in). A Spec without
+	// with IPAddressAllow=127.0.0.1/32 ::1/128, applied as a persistent per-unit drop-in). A Spec without
 	// it lifts a restriction an earlier Render of the same unit set. Only the systemd backend
 	// can enforce it: the exec backend (development and tests) runs plain child processes and
 	// ignores the field, which EgressEnforcer lets a caller ask about.
@@ -53,11 +54,74 @@ func EgressDeny() []IPRange {
 	return []IPRange{{Family: 2, Addr: make([]byte, 4)}, {Family: 10, Addr: make([]byte, 16)}}
 }
 
-// EgressAllow is IPAddressAllow=localhost: 127.0.0.0/8 and ::1.
+// EgressAllow is IPAddressAllow=127.0.0.1/32 ::1/128: the two loopback addresses every client of
+// a project's Postgres uses (listen_addresses is 127.0.0.1; the supervised services and the
+// pooler connect to 127.0.0.1 or the unix socket). It is deliberately not systemd's "localhost"
+// (all of 127.0.0.0/8): the rest of that block holds addresses that something on the host
+// answers on, systemd-resolved's stub resolver at 127.0.0.53 first among them, which forwards
+// queries upstream and so is a DNS side channel out of a confined unit.
 func EgressAllow() []IPRange {
 	v6 := make([]byte, 16)
 	v6[15] = 1
-	return []IPRange{{Family: 2, Addr: []byte{127, 0, 0, 0}, Prefix: 8}, {Family: 10, Addr: v6, Prefix: 128}}
+	return []IPRange{{Family: 2, Addr: []byte{127, 0, 0, 1}, Prefix: 32}, {Family: 10, Addr: v6, Prefix: 128}}
+}
+
+// egressMatches reports whether props (the Service-type properties of a loaded unit, as the D-Bus
+// client returns them) already carry exactly the egress policy deny asks for: IPAddressDeny and
+// IPAddressAllow equal to EgressDeny and EgressAllow, or both empty when deny is false. A unit
+// that was confined by an earlier release with the wider 127.0.0.0/8 allow does not match, so
+// the next Render narrows it. A value of a shape it does not know counts as not matching:
+// setting the properties again is harmless.
+func egressMatches(props map[string]interface{}, deny bool) bool {
+	var wantDeny, wantAllow []IPRange
+	if deny {
+		wantDeny, wantAllow = EgressDeny(), EgressAllow()
+	}
+	return sameRanges(decodeRanges(props["IPAddressDeny"]), wantDeny) && sameRanges(decodeRanges(props["IPAddressAllow"]), wantAllow)
+}
+
+// decodeRanges reads an a(iayu) property: a list of [family, address bytes, prefix].
+func decodeRanges(v interface{}) []IPRange {
+	if v == nil {
+		return nil
+	}
+	list, ok := v.([][]interface{})
+	if !ok {
+		return []IPRange{{Family: -1}}
+	}
+	out := make([]IPRange, 0, len(list))
+	for _, e := range list {
+		if len(e) != 3 {
+			return []IPRange{{Family: -1}} // never equal to a wanted list
+		}
+		f, ok1 := e[0].(int32)
+		a, ok2 := e[1].([]byte)
+		p, ok3 := e[2].(uint32)
+		if !ok1 || !ok2 || !ok3 {
+			return []IPRange{{Family: -1}}
+		}
+		out = append(out, IPRange{Family: f, Addr: a, Prefix: p})
+	}
+	return out
+}
+
+func sameRanges(a, b []IPRange) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, x := range a {
+		found := false
+		for _, y := range b {
+			if x.Family == y.Family && x.Prefix == y.Prefix && bytes.Equal(x.Addr, y.Addr) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // Unit returns the systemd unit name for the spec.

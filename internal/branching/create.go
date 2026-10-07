@@ -414,15 +414,20 @@ func (s *Service) createFromBackup(ctx context.Context, j *createJob) error {
 }
 
 // detach makes a branch whose cluster came from the parent's data independent of the parent:
-// its outbound integrations are neutralized (isolateBranch), then its credentials rotate. A
-// failure stops the branch (quarantine): it would otherwise run with the parent's passwords
-// or with the parent's subscriptions and jobs.
+// its outbound integrations are neutralized (isolateBranch), then its credentials rotate, then
+// the parent's credentials inside the data are replaced by the new ones (rewriteBranchCredentials).
+// A failure stops the branch (quarantine): it would otherwise run with the parent's passwords,
+// with the parent's subscriptions, foreign servers and jobs, or with a key to the parent in its data.
 func (s *Service) detach(ctx context.Context, ref string) error {
 	if err := s.isolate(ctx, ref); err != nil {
 		return s.quarantine(ctx, ref, fmt.Errorf("isolate the branch from the parent's integrations: %w", err))
 	}
 	if err := s.rotate(ctx, ref); err != nil {
 		return s.quarantine(ctx, ref, fmt.Errorf("rotate the credentials of the branch: %w", err))
+	}
+	// The branch has credentials of its own now: put them where the data holds the parent's.
+	if err := s.rewrite(ctx, ref); err != nil {
+		return s.quarantine(ctx, ref, fmt.Errorf("replace the parent's credentials in the branch's data: %w", err))
 	}
 	return nil
 }
