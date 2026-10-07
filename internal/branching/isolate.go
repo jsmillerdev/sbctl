@@ -344,9 +344,6 @@ func isolateDatabase(ctx context.Context, dsn, db string, opt isolateOptions, re
 		}
 		res.CronNodesReset += n
 	}
-	if err := wipeAuthSessions(ctx, c, res); err != nil {
-		return fmt.Errorf("remove the parent's GoTrue sessions: %w", err)
-	}
 	if hasCron && !opt.KeepCron {
 		n, err := pauseCronJobs(ctx, c)
 		if err != nil {
@@ -367,6 +364,12 @@ func isolateDatabase(ctx context.Context, dsn, db string, opt isolateOptions, re
 		if err := neutralizeForeign(ctx, c, res); err != nil {
 			return fmt.Errorf("neutralize foreign servers: %w", err)
 		}
+	}
+	// The session wipe runs after the parent's outbound integrations (cron commands, foreign
+	// servers) are neutralized, and with user triggers suppressed (see wipeAuthSessions), so a
+	// trigger on the auth tables cannot act on production while the branch still has network.
+	if err := wipeAuthSessions(ctx, c, res); err != nil {
+		return fmt.Errorf("remove the parent's GoTrue sessions: %w", err)
 	}
 	var hasQueue bool
 	if err := c.QueryRow(ctx, `select to_regclass('net.http_request_queue') is not null`).Scan(&hasQueue); err != nil {
