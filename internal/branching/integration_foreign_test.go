@@ -16,6 +16,11 @@ import (
 	"github.com/OWNER/sbctl/internal/lifecycle"
 )
 
+// authClient does not keep connections open: the test ports (39000-39999) lie inside Linux's
+// ephemeral range, and a kept-alive client socket on one of them would stop a Postgres that is
+// started later from binding it.
+var authClient = &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+
 // authCall posts a JSON body to a project's GoTrue on loopback and returns the status and the
 // decoded JSON object. GoTrue answers sign-in requests without an apikey; the proxy in front of it
 // is what asks for one.
@@ -24,7 +29,7 @@ func authCall(t *testing.T, port int, path string, body map[string]any) (int, ma
 	b, _ := json.Marshal(body)
 	var lastErr error
 	for i := 0; i < 40; i++ {
-		resp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d%s", port, path), "application/json", bytes.NewReader(b))
+		resp, err := authClient.Post(fmt.Sprintf("http://127.0.0.1:%d%s", port, path), "application/json", bytes.NewReader(b))
 		if err != nil {
 			lastErr = err
 			time.Sleep(500 * time.Millisecond)
@@ -332,6 +337,7 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 				}()
 			}
 			c := connDB(b.Ref, db)
+			defer c.Close(ctx) // a socket held open here could sit on a port a later cluster needs
 			var v *string
 			if err := c.QueryRow(ctx, q, args...).Scan(&v); err != nil {
 				t.Fatalf("%s/%s: %s: %v", b.Name, db, q, err)
