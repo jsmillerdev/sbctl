@@ -1064,3 +1064,35 @@ func TestOrgSSOCreateTakesTheAddressWhenBothAreSent(t *testing.T) {
 		t.Fatalf("GoTrue registered the document instead of the address: %+v %v", got, err)
 	}
 }
+
+// The registry's event log says who did what to the dashboard's identity providers and which
+// users came through them.
+func TestSSOAuditEvents(t *testing.T) {
+	f := newSSOFixture(t)
+	id := f.addProvider(acmeIdP, "", "acme.test")
+	tok := f.ssoToken(ssoUser1, "alice@acme.test", id)
+	f.doAs(tok, "GET", "/platform/profile", nil) // pending
+	if rec := f.as("owner", "POST", orgSSO+"/pending/"+ssoUser1, map[string]any{"role": "developer"}); rec.Code != 200 {
+		t.Fatal(rec.Body)
+	}
+	if rec := f.as("owner", "DELETE", orgSSO+"/providers/"+id, nil); rec.Code != 200 {
+		t.Fatal(rec.Body)
+	}
+	evs, err := f.reg.ListEvents(context.Background(), "system", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []string
+	for _, e := range evs {
+		kinds = append(kinds, e.Kind)
+		if strings.Contains(string(e.Payload), "idp.acme.test") && !strings.Contains(e.Kind, "added") {
+			t.Errorf("%s carries more than ids: %s", e.Kind, e.Payload)
+		}
+	}
+	got := strings.Join(kinds, ",")
+	for _, want := range []string{"sso.provider.added", "sso.user.first_sign_in", "sso.user.approved", "sso.provider.removed"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %s event: %s", want, got)
+		}
+	}
+}

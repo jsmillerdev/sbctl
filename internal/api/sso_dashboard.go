@@ -94,6 +94,14 @@ func (d *DashboardSSO) now() time.Time {
 	return time.Now()
 }
 
+// event records an audit event of the dashboard's single sign-on under the system project (never
+// a secret: ids, domains and role names).
+func (d *DashboardSSO) event(ctx context.Context, kind string, payload map[string]any) {
+	if err := d.Reg.AppendEvent(context.WithoutCancel(ctx), config.SystemRef, kind, payload); err != nil {
+		d.log().Warn("an SSO audit event was not recorded", "kind", kind, "error", err)
+	}
+}
+
 func (d *DashboardSSO) log() *slog.Logger {
 	if d.Log != nil {
 		return d.Log
@@ -310,6 +318,7 @@ func (d *DashboardSSO) Add(ctx context.Context, actor *members.Access, in AddPro
 		return nil, err
 	}
 	d.forget(p.ID)
+	d.event(ctx, "sso.provider.added", map[string]any{"provider": p.ID, "org": in.Org.Slug, "domains": domains, "default_role": members.RoleName(in.DefaultRole), "by": in.CreatedBy})
 	d.changed(ctx)
 	d.log().Info("dashboard SSO provider added", "provider", p.ID, "org", in.Org.Slug, "domains", domains, "default_role", members.RoleName(in.DefaultRole))
 	return d.view(ctx, p, &row), nil
@@ -484,6 +493,7 @@ func (d *DashboardSSO) Update(ctx context.Context, actor *members.Access, id str
 		return nil, err
 	}
 	d.forget(id)
+	d.event(ctx, "sso.provider.updated", map[string]any{"provider": id, "org": org.Slug, "domains": newDomains, "default_role": members.RoleName(newRole)})
 	return d.view(ctx, p, row), nil
 }
 
@@ -539,6 +549,7 @@ func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id str
 			return nil, ssoError(err)
 		}
 	}
+	d.event(ctx, "sso.provider.removed", map[string]any{"provider": id})
 	d.changed(ctx)
 	d.log().Info("dashboard SSO provider removed", "provider", id)
 	return d.view(ctx, p, row), nil
@@ -659,6 +670,7 @@ func (d *DashboardSSO) Approve(ctx context.Context, actor *members.Access, org m
 	d.mu.Lock()
 	delete(d.admitted, userID)
 	d.mu.Unlock()
+	d.event(ctx, "sso.user.approved", map[string]any{"user": userID, "org": org.Slug, "role": members.RoleName(roleID)})
 	d.log().Info("single sign-on user approved", "user", userID, "org", org.Slug, "role", members.RoleName(roleID))
 	return nil
 }
@@ -685,6 +697,7 @@ func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org memb
 	d.mu.Lock()
 	delete(d.admitted, userID)
 	d.mu.Unlock()
+	d.event(ctx, "sso.user.denied", map[string]any{"user": userID, "org": org.Slug})
 	return d.Store.DeleteSSOUser(ctx, userID)
 }
 
@@ -832,6 +845,7 @@ func (d *DashboardSSO) firstSight(ctx context.Context, row *SSOProviderRow, user
 	if _, err := d.Store.InsertSSOUser(ctx, u); err != nil {
 		return nil, err
 	}
+	d.event(ctx, "sso.user.first_sign_in", map[string]any{"user": userID, "provider": row.ID, "state": u.State})
 	d.log().Info("single sign-on user seen for the first time", "user", userID, "email", u.Email, "provider", row.ID, "state", u.State)
 	return &u, nil
 }

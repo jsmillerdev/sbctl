@@ -381,6 +381,9 @@ like every other `/auth/v1` path.
   disabled flag; before one exists the page gets the 404 it reads as "not set up". Several providers per organization
   and the pending list are sbctl's own routes.
 
+Provider changes, a user's first sign-in, approvals and denials are events of the system project in the registry
+(`sso.provider.added|updated|removed`, `sso.user.first_sign_in|approved|denied`; ids, domains and role names only).
+
 **Projects.** `/v1/projects/{ref}/config/auth/sso/providers` (create, list, get, update, delete) is a proxy to the
 project's GoTrue admin SSO API with the exact shapes of the spec (the list carries each provider's metadata document,
 which GoTrue's own list leaves out). As on hosted, it answers `404` ("SAML 2.0 support is not enabled for this
