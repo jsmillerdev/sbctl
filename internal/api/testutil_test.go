@@ -14,14 +14,14 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/OWNER/sbctl/internal/api/cryptojs"
-	"github.com/OWNER/sbctl/internal/branching"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/api/cryptojs"
+	"github.com/jsmillerdev/supavise/internal/branching"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // fakeManager is a lifecycle.Manager over a registry: projects are created
@@ -207,7 +207,7 @@ func (m *fakeManager) Health(context.Context, string) ([]lifecycle.ServiceHealth
 
 func (m *fakeManager) ConnString(context.Context, string, string) (string, error) { return m.dsn, nil }
 
-// fakePGMeta is an httptest stand-in for sb-pgmeta: it decrypts the connection
+// fakePGMeta is an httptest stand-in for supavise-pgmeta: it decrypts the connection
 // header like the real one, records requests and answers from canned rules.
 type fakePGMeta struct {
 	*httptest.Server
@@ -302,7 +302,7 @@ type fixture struct {
 	system  *secrets.ProjectKeys
 	userID  string
 	jwt     string
-	// gt is the stand-in for sb-gotrue@system the server's account calls go to.
+	// gt is the stand-in for supavise-gotrue@system the server's account calls go to.
 	gt *fakeGoTrue
 	// pgt, when a test sets it, is the GoTrue of the project testRef.
 	pgt *fakeGoTrue
@@ -366,7 +366,7 @@ func newFixture(t testing.TB) *fixture {
 
 func (f *fixture) signJWT(claims map[string]any) string {
 	f.t.Helper()
-	// Like the users sbctl creates in sb-gotrue@system, sessions carry the admin claim.
+	// Like the users supavise creates in supavise-gotrue@system, sessions carry the admin claim.
 	c := jwt.MapClaims{"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "aud": "authenticated",
 		"app_metadata": map[string]any{AdminClaim: true}}
 	for k, v := range claims {

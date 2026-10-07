@@ -9,10 +9,10 @@ import (
 )
 
 // TestRouteNeedsDump prints the requirement of every operation of the three specs
-// (SBCTL_DUMP_NEEDS=1 go test ./internal/api -run RouteNeedsDump -v), for review.
+// (SUPAVISE_DUMP_NEEDS=1 go test ./internal/api -run RouteNeedsDump -v), for review.
 func TestRouteNeedsDump(t *testing.T) {
-	if os.Getenv("SBCTL_DUMP_NEEDS") == "" {
-		t.Skip("set SBCTL_DUMP_NEEDS=1")
+	if os.Getenv("SUPAVISE_DUMP_NEEDS") == "" {
+		t.Skip("set SUPAVISE_DUMP_NEEDS=1")
 	}
 	ops, _ := Operations()
 	var lines []string

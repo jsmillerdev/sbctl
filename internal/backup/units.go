@@ -6,36 +6,36 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // The nightly base backup is a systemd template pair. deploy/systemd/ holds the files
 // rendered with the defaults (a test keeps them in sync); lifecycle renders them with
 // the node's config when a project is created: RenderBackupService once per node,
 // RenderBackupTimer once per node (OnCalendar comes from config), then
-// `systemctl enable --now sb-basebackup@<ref>.timer` per project.
+// `systemctl enable --now supavise-basebackup@<ref>.timer` per project.
 
 // BackupServiceUnit and BackupTimerUnit are the template unit names; instantiate with
-// the project ref, e.g. sb-basebackup@<ref>.timer.
+// the project ref, e.g. supavise-basebackup@<ref>.timer.
 const (
-	BackupServiceUnit = "sb-basebackup@.service"
-	BackupTimerUnit   = "sb-basebackup@.timer"
+	BackupServiceUnit = "supavise-basebackup@.service"
+	BackupTimerUnit   = "supavise-basebackup@.timer"
 )
 
-// EnvFile is the optional environment file the backup service reads. `sbctl backups`
-// runs outside the daemon and finds the registry through SBCTL_REGISTRY_DSN, which
+// EnvFile is the optional environment file the backup service reads. `supavise backups`
+// runs outside the daemon and finds the registry through SUPAVISE_REGISTRY_DSN, which
 // the installer or lifecycle writes here. The DSN contains the registry password, so
-// the file must be mode 0600 and owned by the sbctl user (HANDOFF section 1); `sbctl
+// the file must be mode 0600 and owned by the supavise user (HANDOFF section 1); `supavise
 // backups` warns when it is readable by group or others.
-const EnvFile = "/etc/sbctl/sbctl.env"
+const EnvFile = "/etc/supavise/supavise.env"
 
 // The node-wide prune pair covers what the per-project timers cannot: a deleted project's
 // timer is gone, but its final backup and WAL stay in the backend and must still age out.
-// It runs `sbctl backups prune` without a ref, which prunes every ref in the registry and
-// in the backend. Enable it once per node: systemctl enable --now sb-basebackup-prune.timer.
+// It runs `supavise backups prune` without a ref, which prunes every ref in the registry and
+// in the backend. Enable it once per node: systemctl enable --now supavise-basebackup-prune.timer.
 const (
-	PruneServiceUnit = "sb-basebackup-prune.service"
-	PruneTimerUnit   = "sb-basebackup-prune.timer"
+	PruneServiceUnit = "supavise-basebackup-prune.service"
+	PruneTimerUnit   = "supavise-basebackup-prune.timer"
 	// PruneOnCalendar is when the node-wide prune runs: after the nightly base backups.
 	PruneOnCalendar = "*-*-* 05:00:00"
 )
@@ -56,23 +56,23 @@ func ValidateOnCalendar(s string) error {
 }
 
 // BackupTimerInstance is the timer instance to enable for ref.
-func BackupTimerInstance(ref string) string { return "sb-basebackup@" + ref + ".timer" }
+func BackupTimerInstance(ref string) string { return "supavise-basebackup@" + ref + ".timer" }
 
-// RenderBackupService renders sb-basebackup@.service for the sbctl binary at binPath.
+// RenderBackupService renders supavise-basebackup@.service for the supavise binary at binPath.
 // The two ExecStart lines run in order and the second is skipped if the first fails,
 // so retention never runs after a failed backup.
 func RenderBackupService(binPath string) string {
 	bin := unitExec(binPath)
 	return fmt.Sprintf(`[Unit]
-Description=sbctl base backup and retention for project %%i
-After=sb-postgres@%%i.service
+Description=Supavise base backup and retention for project %%i
+After=supavise-postgres@%%i.service
 
 [Service]
 Type=oneshot
-User=sbctl
-Group=sbctl
+User=supavise
+Group=supavise
 Slice=%s
-# SBCTL_REGISTRY_DSN (and any other SBCTL_* override) for processes outside the daemon.
+# SUPAVISE_REGISTRY_DSN (and any other SUPAVISE_* override) for processes outside the daemon.
 EnvironmentFile=-%s
 Nice=10
 # Not "idle": an idle-class backup can be starved indefinitely on a busy disk while
@@ -87,19 +87,19 @@ ProtectHome=yes
 # The same uid runs every unit, and a process may read /proc/<pid>/environ and /proc/<pid>/root of
 # another process of its uid unless that process has capabilities the reader lacks. These units read
 # the master key and the backend credentials, so they hold one harmless capability in their permitted
-# set (sbctl.service does the same); the sb-* units that run tenant code have none (deploy/systemd/README.md).
+# set (supavise.service does the same); the supavise-* units that run tenant code have none (deploy/systemd/README.md).
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 # Mount allowlist: the unit sees the registry's socket, this project's data directory (read-only)
 # and WAL socket directory, and the file backend's directory (no effect on S3), not other projects'
 # data directories, environment files or functions.
-TemporaryFileSystem=/var/lib/sbctl:ro
-BindReadOnlyPaths=/var/lib/sbctl/projects/system/postgres/sock /var/lib/sbctl/projects/%%i/postgres
-BindPaths=-/var/lib/sbctl/projects/%%i/wal -/var/lib/sbctl/backups
+TemporaryFileSystem=/var/lib/supavise:ro
+BindReadOnlyPaths=/var/lib/supavise/projects/system/postgres/sock /var/lib/supavise/projects/%%i/postgres
+BindPaths=-/var/lib/supavise/projects/%%i/wal -/var/lib/supavise/backups
 `, config.Slice, EnvFile, bin, bin)
 }
 
-// RenderBackupTimer renders sb-basebackup@.timer. onCalendar is a systemd OnCalendar
+// RenderBackupTimer renders supavise-basebackup@.timer. onCalendar is a systemd OnCalendar
 // expression (config.Backup.BaseBackupOnCalendar). The randomized delay spreads many
 // projects over a quarter of an hour instead of starting them in the same second.
 //
@@ -120,7 +120,7 @@ func RenderBackupTimerChecked(onCalendar string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf(`[Unit]
-Description=Nightly sbctl base backup of project %%i
+Description=Nightly Supavise base backup of project %%i
 
 [Timer]
 OnCalendar=%s
@@ -132,15 +132,15 @@ WantedBy=timers.target
 `, onCalendar), nil
 }
 
-// RenderPruneService renders sb-basebackup-prune.service for the sbctl binary at binPath.
+// RenderPruneService renders supavise-basebackup-prune.service for the supavise binary at binPath.
 func RenderPruneService(binPath string) string {
 	return fmt.Sprintf(`[Unit]
-Description=sbctl backup retention for every project and every deleted project's archive
+Description=Supavise backup retention for every project and every deleted project's archive
 
 [Service]
 Type=oneshot
-User=sbctl
-Group=sbctl
+User=supavise
+Group=supavise
 Slice=%s
 EnvironmentFile=-%s
 Nice=10
@@ -153,20 +153,20 @@ ProtectHome=yes
 # The same uid runs every unit, and a process may read /proc/<pid>/environ and /proc/<pid>/root of
 # another process of its uid unless that process has capabilities the reader lacks. These units read
 # the master key and the backend credentials, so they hold one harmless capability in their permitted
-# set (sbctl.service does the same); the sb-* units that run tenant code have none (deploy/systemd/README.md).
+# set (supavise.service does the same); the supavise-* units that run tenant code have none (deploy/systemd/README.md).
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 # Mount allowlist: the registry's socket and the file backend's directory, no project directory.
-TemporaryFileSystem=/var/lib/sbctl:ro
-BindReadOnlyPaths=/var/lib/sbctl/projects/system/postgres/sock
-BindPaths=-/var/lib/sbctl/backups
+TemporaryFileSystem=/var/lib/supavise:ro
+BindReadOnlyPaths=/var/lib/supavise/projects/system/postgres/sock
+BindPaths=-/var/lib/supavise/backups
 `, config.Slice, EnvFile, unitExec(binPath))
 }
 
-// RenderPruneTimer renders sb-basebackup-prune.timer.
+// RenderPruneTimer renders supavise-basebackup-prune.timer.
 func RenderPruneTimer() string {
 	return fmt.Sprintf(`[Unit]
-Description=Daily sbctl backup retention
+Description=Daily Supavise backup retention
 
 [Timer]
 OnCalendar=%s

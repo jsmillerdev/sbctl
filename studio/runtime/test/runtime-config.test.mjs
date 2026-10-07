@@ -14,7 +14,7 @@ import {
   prepare,
   readPlaceholders,
   resolveValues,
-} from '../sbctl-runtime-config.mjs'
+} from '../supavise-runtime-config.mjs'
 
 const placeholdersPath = fileURLToPath(new URL('../../placeholders.json', import.meta.url))
 const spec = readPlaceholders(placeholdersPath)
@@ -29,7 +29,7 @@ const goodEnv = {
 // A tree that looks like the Next output: a client chunk, a server chunk, prerendered HTML,
 // the routes manifest with the CSP, and a file without placeholders.
 function makeApp() {
-  const root = mkdtempSync(join(tmpdir(), 'sbctl-studio-test-'))
+  const root = mkdtempSync(join(tmpdir(), 'supavise-studio-test-'))
   const app = join(root, 'app')
   mkdirSync(join(app, 'apps/studio/.next/static/chunks'), { recursive: true })
   mkdirSync(join(app, 'apps/studio/.next/server/pages'), { recursive: true })
@@ -58,9 +58,9 @@ function makeApp() {
 function packaged() {
   const { root, app } = makeApp()
   const files = prepare(app, spec)
-  mkdirSync(join(root, 'share/sbctl'), { recursive: true })
+  mkdirSync(join(root, 'share/supavise'), { recursive: true })
   writeFileSync(
-    join(root, 'share/sbctl/runtime-config.json'),
+    join(root, 'share/supavise/runtime-config.json'),
     JSON.stringify({ version: 1, values: spec.values, files })
   )
   return { root, app, files }
@@ -228,11 +228,11 @@ test('read-only tree gives an actionable error', { skip: process.getuid?.() === 
   }
 })
 
-test('SBCTL_STUDIO_SKIP_RUNTIME_CONFIG skips everything', () => {
+test('SUPAVISE_STUDIO_SKIP_RUNTIME_CONFIG skips everything', () => {
   const { root, app } = packaged()
   try {
-    applyRuntimeConfig(root, { SBCTL_STUDIO_SKIP_RUNTIME_CONFIG: '1' })
-    assert.ok(readFileSync(join(app, 'apps/studio/.next/static/chunks/a.js'), 'utf8').includes('sbctl-placeholder'))
+    applyRuntimeConfig(root, { SUPAVISE_STUDIO_SKIP_RUNTIME_CONFIG: '1' })
+    assert.ok(readFileSync(join(app, 'apps/studio/.next/static/chunks/a.js'), 'utf8').includes('supavise-placeholder'))
   } finally {
     rmSync(root, { recursive: true })
   }

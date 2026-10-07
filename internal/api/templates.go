@@ -5,9 +5,9 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // serveTemplate serves the saved body of a project's email template to its GoTrue, which is

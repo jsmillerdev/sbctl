@@ -14,8 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // dirArts serves unpacked artifact directories picked by glob; Tag is only a label.
@@ -56,13 +56,13 @@ func freePortBase(t *testing.T, n int) int {
 
 // TestIntegrationSystemAndProject runs the real artifacts under the exec backend:
 // system init, one project, health, SQL, pause, resume, key rotation, delete, stop.
-// It needs SBCTL_TEST_UNPACKED to name a directory holding unpacked slim-services
+// It needs SUPAVISE_TEST_UNPACKED to name a directory holding unpacked slim-services
 // artifacts (postgres-*, auth-*, postgrest-*) for this platform, for example
 // ~/.cache/sbctl/unpacked. It starts two PostgreSQL clusters (a few tens of MB each).
 func TestIntegrationSystemAndProject(t *testing.T) {
-	root := os.Getenv("SBCTL_TEST_UNPACKED")
+	root := os.Getenv("SUPAVISE_TEST_UNPACKED")
 	if root == "" {
-		t.Skip("SBCTL_TEST_UNPACKED not set")
+		t.Skip("SUPAVISE_TEST_UNPACKED not set")
 	}
 	arts := dirArts{}
 	for svc, glob := range map[string]string{config.SvcPostgres: "postgres-17*", config.SvcGoTrue: "auth-*", config.SvcPostgREST: "postgrest-*"} {
@@ -82,7 +82,7 @@ func TestIntegrationSystemAndProject(t *testing.T) {
 	cfg.StateDir = shortTempDir(t)
 	cfg.KeyPath = filepath.Join(cfg.StateDir, "master.key")
 	cfg.Supervisor = config.SupervisorExec
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	cfg.TLS.Mode = "off"
 	cfg.BinPath = truePath // archive_command succeeds, so WAL does not pile up
 	cfg.Ports.SystemPostgres, cfg.Ports.SystemGoTrue, cfg.Ports.ProjectBase = base, base+1, base+2
@@ -137,7 +137,7 @@ func TestIntegrationSystemAndProject(t *testing.T) {
 			t.Fatalf("%s into %s: %v", fc.Role, fc.Database, err)
 		}
 		own.Close(ctx)
-		for _, other := range []string{"sbctl", "_supavisor", "_realtime", "_storage"} {
+		for _, other := range []string{"supavise", "_supavisor", "_realtime", "_storage"} {
 			if other == fc.Database {
 				continue
 			}
@@ -340,9 +340,9 @@ func allHealthy(hs []ServiceHealth) bool {
 // TestIntegrationInitFailureCleansUp makes PostgreSQL fail to bind and checks that
 // Create leaves INIT_FAILED with nothing running or on disk.
 func TestIntegrationInitFailureCleansUp(t *testing.T) {
-	root := os.Getenv("SBCTL_TEST_UNPACKED")
+	root := os.Getenv("SUPAVISE_TEST_UNPACKED")
 	if root == "" {
-		t.Skip("SBCTL_TEST_UNPACKED not set")
+		t.Skip("SUPAVISE_TEST_UNPACKED not set")
 	}
 	arts := dirArts{}
 	for svc, glob := range map[string]string{config.SvcPostgres: "postgres-17*", config.SvcGoTrue: "auth-*", config.SvcPostgREST: "postgrest-*"} {
@@ -358,7 +358,7 @@ func TestIntegrationInitFailureCleansUp(t *testing.T) {
 	cfg.StateDir = shortTempDir(t)
 	cfg.KeyPath = filepath.Join(cfg.StateDir, "master.key")
 	cfg.Supervisor = config.SupervisorExec
-	cfg.Domain, cfg.BinPath = "sbctl.test", truePath
+	cfg.Domain, cfg.BinPath = "supavise.test", truePath
 	cfg.TLS.Mode = "off"
 	cfg.Ports.SystemPostgres, cfg.Ports.SystemGoTrue, cfg.Ports.ProjectBase = base, base+1, base+2
 

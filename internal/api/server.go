@@ -12,14 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/branching"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/sso"
+	"github.com/jsmillerdev/supavise/internal/branching"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/sso"
 )
 
 // Deps are the collaborators of the API server.
@@ -127,7 +127,7 @@ type opTracker struct {
 }
 
 // errDraining is what a mutation gets once Drain has begun.
-var errDraining = errf(http.StatusServiceUnavailable, "sbctl is shutting down; try again in a moment")
+var errDraining = errf(http.StatusServiceUnavailable, "Supavise is shutting down; try again in a moment")
 
 // beginOp registers one in-flight operation; the returned func ends it. It fails once
 // Drain has begun, so the operation is never started.
@@ -377,7 +377,7 @@ func (s *Server) unknown(w http.ResponseWriter, r *http.Request) error {
 	if !strings.HasPrefix(r.URL.Path, "/platform/") {
 		return errf(http.StatusNotFound, "Not Found")
 	}
-	w.Header().Set("X-Sbctl-Stub", "true")
+	w.Header().Set("X-Supavise-Stub", "true")
 	if r.Method == http.MethodGet {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return nil

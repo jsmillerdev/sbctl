@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
 )
 
 // The auth settings of a project are served three ways: the public Management API

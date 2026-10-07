@@ -9,7 +9,7 @@ Deno.serve(async (req) => {
   for (const target of q.getAll('u')) {
     try {
       const r = await fetch(target, {
-        headers: { 'x-sbctl-project-ref': q.get('ref') ?? '', 'x-sbctl-proxy-token': 'guess' },
+        headers: { 'x-supavise-project-ref': q.get('ref') ?? '', 'x-supavise-proxy-token': 'guess' },
       })
       out[target] = `${r.status} ${(await r.text()).slice(0, 100)}`
     } catch (e) {

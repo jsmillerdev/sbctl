@@ -281,7 +281,7 @@ func (f *ssoFake) called(call string) int {
 	return n
 }
 
-// add puts a provider in the fake behind sbctl's back (one that exists in GoTrue only).
+// add puts a provider in the fake behind supavise's back (one that exists in GoTrue only).
 func (f *ssoFake) add(entityID string, domains ...string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

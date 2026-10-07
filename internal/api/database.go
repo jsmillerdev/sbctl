@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/OWNER/sbctl/internal/api/gen/v1"
-	"github.com/OWNER/sbctl/internal/secrets"
+	v1 "github.com/jsmillerdev/supavise/internal/api/gen/v1"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 func (s *Server) routesDatabase(add func(string, handlerFunc)) {
@@ -168,7 +168,7 @@ func (s *Server) applyMigration(w http.ResponseWriter, r *http.Request) error {
 	// migrations, and the version is picked in the same transaction as the insert, so
 	// two migrations in the same second still get distinct, increasing versions.
 	var b strings.Builder
-	b.WriteString(`select pg_advisory_xact_lock(hashtext('sbctl.apply_migration'));
+	b.WriteString(`select pg_advisory_xact_lock(hashtext('supavise.apply_migration'));
 create schema if not exists supabase_migrations;
 create table if not exists ` + tbl + ` (version text not null primary key, statements text[], name text);
 alter table ` + tbl + ` add column if not exists created_by text;
@@ -244,7 +244,7 @@ func (s *Server) typescriptTypes(w http.ResponseWriter, r *http.Request) error {
 // Login role name prefixes: read-write roles must start with cli_login_ for the CLI.
 const (
 	loginRolePrefix         = "cli_login_"
-	readOnlyLoginRolePrefix = "sbctl_cli_ro_"
+	readOnlyLoginRolePrefix = "supavise_cli_ro_"
 )
 
 // loginRoleTTL is how long a temporary CLI login role stays valid.
@@ -306,11 +306,11 @@ func (s *Server) createLoginRole(w http.ResponseWriter, r *http.Request) error {
 // an object because a migration ran `reset role` before a CREATE, or holds a privilege)
 // must not fail the batch, and with it the CREATE ROLE that follows.
 const dropExpiredLoginRoles = `do $$ declare r record; begin
-  for r in select rolname from pg_roles where (rolname like 'cli\_login\_%' or rolname like 'sbctl\_cli\_ro\_%') and rolvaliduntil < now() loop
+  for r in select rolname from pg_roles where (rolname like 'cli\_login\_%' or rolname like 'supavise\_cli\_ro\_%') and rolvaliduntil < now() loop
     begin
       execute format('drop role %I', r.rolname);
     exception when others then
-      raise warning 'sbctl: could not drop expired login role %: %', r.rolname, sqlerrm;
+      raise warning 'supavise: could not drop expired login role %: %', r.rolname, sqlerrm;
     end;
   end loop;
 end $$;
@@ -322,11 +322,11 @@ func (s *Server) deleteLoginRoles(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 	q := `do $$ declare r record; begin
-  for r in select rolname from pg_roles where rolname like 'cli\_login\_%' or rolname like 'sbctl\_cli\_ro\_%' loop
+  for r in select rolname from pg_roles where rolname like 'cli\_login\_%' or rolname like 'supavise\_cli\_ro\_%' loop
     begin
       execute format('drop role %I', r.rolname);
     exception when others then
-      raise warning 'sbctl: could not drop login role %: %', r.rolname, sqlerrm;
+      raise warning 'supavise: could not drop login role %: %', r.rolname, sqlerrm;
     end;
   end loop;
 end $$;`
@@ -338,7 +338,7 @@ end $$;`
 }
 
 // advisors reports no lints: the security and performance advisors of the hosted
-// platform run Supabase's splinter queries, which sbctl does not run yet.
+// platform run Supabase's splinter queries, which supavise does not run yet.
 func (s *Server) advisors(w http.ResponseWriter, r *http.Request) error {
 	if _, err := s.loadProject(r.Context(), r.PathValue("ref")); err != nil {
 		return err

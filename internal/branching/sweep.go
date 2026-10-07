@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // purgeArchive removes everything the backup store holds for ref (WAL and base backups).

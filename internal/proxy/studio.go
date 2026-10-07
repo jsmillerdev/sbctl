@@ -15,7 +15,7 @@ import (
 // itself, instantly and with no outbound call.
 const incidentBanner = `{"incidents":[]}` + "\n"
 
-// answerStudioLocally serves the routes sbctl answers instead of Studio. It reports
+// answerStudioLocally serves the routes supavise answers instead of Studio. It reports
 // whether it wrote a response.
 func answerStudioLocally(w http.ResponseWriter, r *http.Request) bool {
 	if r.URL.Path != "/api/incident-banner" || (r.Method != http.MethodGet && r.Method != http.MethodHead) {

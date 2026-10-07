@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 
-	"github.com/OWNER/sbctl/internal/members"
+	"github.com/jsmillerdev/supavise/internal/members"
 )
 
 type ctxKey int

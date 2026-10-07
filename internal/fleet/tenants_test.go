@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // call is one request a fake service received.
@@ -149,7 +149,7 @@ func testSpec(k *secrets.ProjectKeys, port int) TenantSpec {
 	return TenantSpec{
 		Ref: testRef, DBHost: "127.0.0.1", DBPort: port, DBName: "postgres", DBUser: "supabase_admin", DBPassword: k.AdminPassword,
 		PostgresPassword: k.DBPassword, JWTSecret: k.JWTSecret, AnonKey: k.AnonKey, ServiceRoleKey: k.ServiceRoleKey,
-		Host: testRef + ".api.sbctl.test",
+		Host: testRef + ".api.supavise.test",
 	}
 }
 
@@ -622,7 +622,7 @@ func TestLoadTenantSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.DBPort != 30003 || spec.DBPassword != k.AdminPassword || spec.StorageAdminPassword != k.StorageAdminPassword || spec.Host != testRef+".api.sbctl.test" || spec.JWTSecret != k.JWTSecret {
+	if spec.DBPort != 30003 || spec.DBPassword != k.AdminPassword || spec.StorageAdminPassword != k.StorageAdminPassword || spec.Host != testRef+".api.supavise.test" || spec.JWTSecret != k.JWTSecret {
 		t.Fatalf("spec = %+v", spec)
 	}
 	if _, err := LoadTenantSpec(context.Background(), n.deps(), "system"); err == nil {

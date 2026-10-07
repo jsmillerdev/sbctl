@@ -16,9 +16,9 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // Retry bounds the retries of a tenant call. The calls retry only what can heal: a refused
@@ -173,7 +173,7 @@ func (c *apiClient) apiError(what string, r *response) error {
 // the paths that insist on it.
 func signToken(secret string, now time.Time) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss": "sbctl", "role": "service_role", "iat": now.Unix(), "exp": now.Add(10 * time.Minute).Unix(),
+		"iss": "supavise", "role": "service_role", "iat": now.Unix(), "exp": now.Add(10 * time.Minute).Unix(),
 	}).SignedString([]byte(secret))
 }
 

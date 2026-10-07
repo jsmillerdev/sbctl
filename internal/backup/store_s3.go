@@ -441,7 +441,7 @@ func withContentMD5(o *s3.Options) {
 
 type contentMD5Middleware struct{}
 
-func (contentMD5Middleware) ID() string { return "sbctlContentMD5" }
+func (contentMD5Middleware) ID() string { return "supaviseContentMD5" }
 
 func (contentMD5Middleware) HandleBuild(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
 	req, ok := in.Request.(*smithyhttp.Request)

@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 func TestPickBackup(t *testing.T) {
@@ -202,8 +202,8 @@ func (e *testEnv) storeBase(t *testing.T, ref, src string, stop time.Time, keys 
 func TestSeederWritesRecoveryFiles(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()
-	e.cfg.BinPath = "/opt/sbctl/bin/sbctl"
-	e.svc.opt.ConfigPath = "/etc/sbctl/other.toml"
+	e.cfg.BinPath = "/opt/supavise/bin/supavise"
+	e.svc.opt.ConfigPath = "/etc/supavise/other.toml"
 	stop := e.now.Add(-time.Hour)
 	m := e.storeBase(t, testRef, fakeDataDir(t), stop, nil)
 
@@ -229,8 +229,8 @@ func TestSeederWritesRecoveryFiles(t *testing.T) {
 	conf, _ := os.ReadFile(filepath.Join(dd, "postgresql.auto.conf"))
 	for _, want := range []string{
 		"# auto\n", // the source's own content is kept; ours is appended
-		"restore_command = '/opt/sbctl/bin/sbctl --config /etc/sbctl/other.toml wal fetch --ref " + testRef + " %f %p'",
-		"archive_command = '/opt/sbctl/bin/sbctl --config /etc/sbctl/other.toml wal push --ref " + testRef2 + " %p'",
+		"restore_command = '/opt/supavise/bin/supavise --config /etc/supavise/other.toml wal fetch --ref " + testRef + " %f %p'",
+		"archive_command = '/opt/supavise/bin/supavise --config /etc/supavise/other.toml wal push --ref " + testRef2 + " %p'",
 		"recovery_target_time = '" + target.UTC().Format("2006-01-02 15:04:05") + "+00'",
 		"recovery_target_action = 'promote'",
 		"recovery_target_timeline = 'latest'",

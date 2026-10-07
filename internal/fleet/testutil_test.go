@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 const testRef = "abcdefghijklmnopqrst"
@@ -44,7 +44,7 @@ func newTestNode(t *testing.T) *testNode {
 	cfg := config.Default()
 	cfg.StateDir = t.TempDir()
 	cfg.Supervisor = config.SupervisorExec
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	cfg.TLS.Mode = "off"
 	n := &testNode{cfg: cfg, reg: registry.NewMemory(), sec: testSecrets(t)}
 	ctx := context.Background()
@@ -116,7 +116,7 @@ type fakeSupervisor struct {
 	state   map[string]units.State
 	changed bool // what RenderChanged reports
 	hooks   map[string]func()
-	failOn  map[string]error // "start sb-x.service"
+	failOn  map[string]error // "start supavise-x.service"
 }
 
 func newFakeSupervisor() *fakeSupervisor {

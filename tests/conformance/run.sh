@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Conformance suite: official Supabase clients against a node, unchanged.
 #
-#   sudo env "PATH=$PATH" SBCTL_BIN=/path/to/sbctl-linux-amd64 SUPABASE_CLI=/path/to/supabase \
+#   sudo env "PATH=$PATH" SUPAVISE_BIN=/path/to/supavise-linux-amd64 SUPABASE_CLI=/path/to/supabase \
 #     tests/conformance/run.sh
 #
 # 1. installs a node the way a customer does (deploy/install.sh), claims it, makes a personal
@@ -15,21 +15,21 @@
 # Every suite runs even when an earlier one failed; the exit status is non-zero when any did.
 # Needs root, systemd, cgroup v2, node 22+ with `npm ci` done in tests/conformance/js, the
 # Supabase CLI binary in SUPABASE_CLI, and network access (artifact and npm downloads).
-# Do not run it on a machine you care about: it creates the sbctl user, writes /etc/sbctl and
+# Do not run it on a machine you care about: it creates the supavise user, writes /etc/supavise and
 # /etc/hosts, installs units and starts real clusters.
 #
 # Names: the node's domain is conformance.test. /etc/hosts maps api., pooler., studio. and each
 # project's host to 127.0.0.1, so nothing needs DNS and, on purpose, db.<ref>.api.conformance.test
 # does not resolve: the CLI then reaches the database through the pooler, as it does on any
 # network without a direct route. The proxy listens on port 80 (tls.mode off).
-export SBCTL_DOMAIN=conformance.test
+export SUPAVISE_DOMAIN=conformance.test
 # shellcheck source=../linux/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../linux/lib.sh"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 JS_DIR=$HERE/js
 WORK=$(mktemp -d)
-DOMAIN=$SBCTL_DOMAIN
+DOMAIN=$SUPAVISE_DOMAIN
 ADMIN_EMAIL=conformance@example.com
 ADMIN_PASSWORD=conformance-correct-horse-battery
 RESULTS=()
@@ -69,10 +69,10 @@ command -v node >/dev/null || fail "missing node"
 [[ -d $JS_DIR/node_modules/@supabase/supabase-js ]] || fail "run npm ci in $JS_DIR first"
 cd "$REPO_ROOT" || exit 1
 
-if [[ -z $SBCTL_BIN ]]; then
-  command -v go >/dev/null || fail "no SBCTL_BIN and no go toolchain"
-  SBCTL_BIN=$WORK/sbctl
-  CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o "$SBCTL_BIN" ./cmd/sbctl
+if [[ -z $SUPAVISE_BIN ]]; then
+  command -v go >/dev/null || fail "no SUPAVISE_BIN and no go toolchain"
+  SUPAVISE_BIN=$WORK/supavise
+  CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o "$SUPAVISE_BIN" ./cmd/supavise
 fi
 
 # ---- 1. the node ------------------------------------------------------------------------
@@ -84,10 +84,10 @@ done
 printf '127.0.0.1 api.%s studio.%s pooler.%s\n' "$DOMAIN" "$DOMAIN" "$DOMAIN" >>/etc/hosts
 
 log "install.sh (a fresh node, Edge Functions on)"
-deploy/install.sh --binary "$SBCTL_BIN" --domain "$DOMAIN" --public-ip 127.0.0.1 --tls off --email ci@example.com \
+deploy/install.sh --binary "$SUPAVISE_BIN" --domain "$DOMAIN" --public-ip 127.0.0.1 --tls off --email ci@example.com \
   --firewall none --no-studio --set functions.enabled=true --claim-token-file "$WORK/claim-token" 2>&1 | tee "$WORK/install.log"
-grep -q "sbctl is running" "$WORK/install.log" || fail "install.sh did not report success"
-for u in sbctl.service sb-postgres@system.service sb-gotrue@system.service sb-pgmeta.service sb-supavisor.service sb-realtime.service sb-storage.service sb-edge-runtime.service; do
+grep -q "Supavise is running" "$WORK/install.log" || fail "install.sh did not report success"
+for u in supavise.service supavise-postgres@system.service supavise-gotrue@system.service supavise-pgmeta.service supavise-supavisor.service supavise-realtime.service supavise-storage.service supavise-edge-runtime.service; do
   wait_active "$u" 120
 done
 
@@ -154,7 +154,7 @@ done
 
 # ---- 4. the Supabase CLI --------------------------------------------------------------------
 log "Supabase CLI"
-sbctl api profile --format yaml >"$WORK/profile.yaml" || fail "sbctl api profile"
+supavise api profile --format yaml >"$WORK/profile.yaml" || fail "supavise api profile"
 cat "$WORK/profile.yaml" >&2
 if SUPABASE_CLI=$SUPABASE_CLI SUPABASE_CLI_VERSION=$SUPABASE_CLI_VERSION PROFILE=$WORK/profile.yaml API_URL=http://api.$DOMAIN PAT=$PAT \
     REF=$REF_B DBPASS=$DBPASS_B PROJECT_URL=http://$REF_B.api.$DOMAIN WORK=$WORK "$HERE/cli.sh" 2>&1 | tee "$LOG_DIR/suite-cli.log"; then

@@ -5,7 +5,7 @@ package fleet
 import (
 	"context"
 
-	"github.com/OWNER/sbctl/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
 )
 
 // TenantSpec is what a shared service needs to serve one project.

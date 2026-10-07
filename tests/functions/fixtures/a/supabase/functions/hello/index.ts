@@ -12,7 +12,7 @@ Deno.serve((req) => {
     path: url.pathname,
     hasServiceKey: Boolean(Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')),
     hasDbUrl: Boolean(Deno.env.get('SUPABASE_DB_URL')),
-    sawTenantHeader: req.headers.has('x-sbctl-project-ref'),
+    sawTenantHeader: req.headers.has('x-supavise-project-ref'),
     sawSbApiKey: req.headers.has('sb-api-key'),
     otherSecret: Deno.env.get('SECRET_OF_THE_OTHER_PROJECT') ?? null,
     pathEnv: Deno.env.get('PATH') ?? null,

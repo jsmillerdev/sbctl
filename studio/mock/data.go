@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 const (

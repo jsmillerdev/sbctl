@@ -7,11 +7,11 @@ import (
 	"errors"
 	"log/slog"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // Systemd is only available on Linux; elsewhere NewSystemd fails and the exec
-// backend (supervisor = "exec") is the way to run sbctl for development.
+// backend (supervisor = "exec") is the way to run supavise for development.
 type Systemd struct{}
 
 var _ Supervisor = (*Systemd)(nil)

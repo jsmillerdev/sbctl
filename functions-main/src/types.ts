@@ -1,4 +1,4 @@
-// Types shared by the modules of the sbctl Edge Functions main service.
+// Types shared by the modules of the supavise Edge Functions main service.
 
 /** What internal/functions writes to <root>/<ref>/functions-env.json. */
 export interface ProjectEnv {
@@ -13,7 +13,7 @@ export interface ProjectEnv {
 }
 
 /**
- * The metadata file inside a function generation (.sbctl-function.json). Only bundles
+ * The metadata file inside a function generation (.supavise-function.json). Only bundles
  * are served: the generation holds the eszip the Supabase CLI built, whose module
  * specifiers are virtual, so a function cannot import files of the node (see README).
  */

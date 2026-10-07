@@ -7,8 +7,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)

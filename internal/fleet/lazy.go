@@ -7,10 +7,10 @@ import (
 	"os"
 	"sync"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // Lazy is a Fleet whose tenants load their credentials on first use. It removes the

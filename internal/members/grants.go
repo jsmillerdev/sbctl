@@ -42,7 +42,7 @@ const (
 
 // Resources the roles distinguish. Studio's own names are kept where it checks them
 // (organizations, projects, user_content, auth.subject_roles, user_invites, service_api_keys,
-// field.jwt_secret, preview_branches, ...); the others are sbctl's, for routes Studio does not
+// field.jwt_secret, preview_branches, ...); the others are supavise's, for routes Studio does not
 // gate by name.
 const (
 	// ResSubjectRoles and ResUserInvites guard member and invitation management; their

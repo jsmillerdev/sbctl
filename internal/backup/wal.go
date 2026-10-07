@@ -18,7 +18,7 @@ import (
 // history file ("00000002.history").
 var walNameRE = regexp.MustCompile(`^(?:[0-9A-F]{24}(?:\.partial|\.[0-9A-F]{8}\.backup)?|[0-9A-F]{8}\.history)$`)
 
-// WALExitFatal is the exit status of `sbctl wal fetch` when the archive could not be
+// WALExitFatal is the exit status of `supavise wal fetch` when the archive could not be
 // read. PostgreSQL treats a restore_command exit status above 125 (or a signal) as
 // fatal and aborts recovery; every other non-zero status means "file not in the
 // archive" and ends recovery at that point. A storage outage must not look like the

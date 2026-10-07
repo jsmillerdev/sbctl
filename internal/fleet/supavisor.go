@@ -15,7 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // Supavisor pools every project's Postgres behind one pair of ports and routes on the
@@ -47,7 +47,7 @@ const (
 // EnsureTenant calls and key rotations (which never change database passwords).
 func managerPassword(adminPassword string) string {
 	m := hmac.New(sha256.New, []byte(adminPassword))
-	m.Write([]byte("sbctl supavisor manager"))
+	m.Write([]byte("supavise supavisor manager"))
 	return hex.EncodeToString(m.Sum(nil))
 }
 

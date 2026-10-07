@@ -22,7 +22,7 @@ Every operation of the three is served:
 - The operations in the table below have a handler here.
 - The others answer with a **stub derived from the spec**: the smallest instance of the
   operation's success schema (required fields only, empty arrays, enums at their first
-  member, `204` where the spec says so), with header `X-Sbctl-Stub: true`.
+  member, `204` where the spec says so), with header `X-Supavise-Stub: true`.
   `TestStubsMatchSpec` calls every stub and validates it against its schema.
 - A request to a path that is in no spec answers `404 {"message":"Not Found"}`, except
   authenticated `/platform/*` paths (Studio calls a few the platform spec omits): `GET`
@@ -47,13 +47,13 @@ registered in a second mux of a chain, tried in order.
 | Keys | `/v1/projects/{ref}/api-keys`: list, create (publishable and secret keys with names; the secret is shown in full by the create and by `reveal=true`, masked otherwise), get, patch, delete (a revocation), `api-keys/legacy` get and put (`?enabled=`). See Settings and keys below |
 | Settings | `GET` and `PATCH /v1/projects/{ref}/config/auth` and `/platform/auth/{ref}/config` (+ `/hooks`), `/v1/projects/{ref}/postgrest` and `/platform/projects/{ref}/config/postgrest`, `config/realtime`, `config/storage` (v1 and platform), `GET` and `PUT /v1/projects/{ref}/config/database/postgres`, `GET` and `PATCH /v1/projects/{ref}/config/database/pooler` (and `/platform/projects/{ref}/config/pgbouncer`; `config/supavisor` is the read), `GET /v2/projects/{ref}/config` (the document the CLI diffs), `PATCH /v1/projects/{ref}/database/password` and `/platform/projects/{ref}/db-password` |
 | Database | `database/query`, `database/query/read-only` (rows as JSON; `parameters` supported), `database/migrations` list and apply (`supabase_migrations.schema_migrations`), `types/typescript` (pg-meta generator), `cli/login-role` create and delete, `advisors/*` (no lints yet) |
-| Functions and secrets | `functions` list, create, deploy (multipart), get, patch, delete, `body`; `secrets` list (digests), create, delete. Sources, bundles and sealed secrets are stored. Uploads: multipart sources (`POST .../functions/deploy`, `supabase functions deploy --use-api`, the CLI when Docker is not running, Studio's editor; where `Deps.Functions` is set the runtime serves bundles only, because a function run from source files could import other projects' files, so the hook's `api.SourceBundler` bundles the sources in a sandbox and they are stored together with the bundle (`.sbctl-bundle.ezbr`, `.sbctl-bundle.json`; answers: 400 with the bundler's output for broken code, 501 where the node cannot bundle, 429 when the queue is full); the sources stay readable through `.../body`) and bundles (`POST` create and `PATCH` update with `Content-Type: application/vnd.denoland.eszip` and a body of `EZBR` + Brotli, which is what plain `supabase functions deploy` sends; metadata in the query, `ezbr_sha256` checked, stored as the file `.sbctl-bundle.ezbr`; `functions_bundle.go`). `Deps.Functions` (`api.FunctionsHook`, `functions_hook.go`) is told after each change so `internal/functions` can put the files where the Edge Runtime reads them |
+| Functions and secrets | `functions` list, create, deploy (multipart), get, patch, delete, `body`; `secrets` list (digests), create, delete. Sources, bundles and sealed secrets are stored. Uploads: multipart sources (`POST .../functions/deploy`, `supabase functions deploy --use-api`, the CLI when Docker is not running, Studio's editor; where `Deps.Functions` is set the runtime serves bundles only, because a function run from source files could import other projects' files, so the hook's `api.SourceBundler` bundles the sources in a sandbox and they are stored together with the bundle (`.supavise-bundle.ezbr`, `.supavise-bundle.json`; answers: 400 with the bundler's output for broken code, 501 where the node cannot bundle, 429 when the queue is full); the sources stay readable through `.../body`) and bundles (`POST` create and `PATCH` update with `Content-Type: application/vnd.denoland.eszip` and a body of `EZBR` + Brotli, which is what plain `supabase functions deploy` sends; metadata in the query, `ezbr_sha256` checked, stored as the file `.supavise-bundle.ezbr`; `functions_bundle.go`). `Deps.Functions` (`api.FunctionsHook`, `functions_hook.go`) is told after each change so `internal/functions` can put the files where the Edge Runtime reads them |
 | Identity | `/v1/profile`, `/platform/profile` (get, post, patch), `profile/permissions` and `permissions/v2` (computed from the caller's roles), `profile/access-tokens` (list, create, get, delete), `/platform/cli/login` and `/platform/cli/login/{session_id}` (device login) |
 | Organizations | `/v1/organizations` list, get, `entitlements`, `members`; `/platform/organizations` list, create, get, patch, `entitlements` (every feature of the spec's key enum granted), `billing/subscription` (plan stub), `projects` |
 | Members and roles | `/platform/organizations/{slug}/members` (list; `PATCH` and `DELETE .../{gotrue_id}`; `PUT` and `DELETE .../{gotrue_id}/roles/{role_id}`), `members/invitations` (list, create, delete by id, get and accept by token), `members/mfa/enforcement`, `roles`, `members/reached-free-project-limit`; `/platform/projects/{ref}/members`; `/v2/organizations/{slug}/members`, `roles`, `PATCH .../members/{user_id}/roles`, `POST` and `DELETE .../members/invitations`. See Members, roles and permissions below |
-| Single sign-on | `/platform/organizations/{slug}/sso` (get, post, put, delete: Studio's organization page, one provider), sbctl's `.../sso/providers` (list, create, get, update, delete), `.../sso/pending` (list; `POST` approves and `DELETE` denies `.../pending/{user_id}`); `/v1/projects/{ref}/config/auth/sso/providers` (create, list, get, update, delete: a project's own identity providers, proxied to its GoTrue). See Single sign-on below |
+| Single sign-on | `/platform/organizations/{slug}/sso` (get, post, put, delete: Studio's organization page, one provider), Supavise's `.../sso/providers` (list, create, get, update, delete), `.../sso/pending` (list; `POST` approves and `DELETE` denies `.../pending/{user_id}`); `/v1/projects/{ref}/config/auth/sso/providers` (create, list, get, update, delete: a project's own identity providers, proxied to its GoTrue). See Single sign-on below |
 | Studio data | `/platform/projects/{ref}/content` (saved SQL snippets, reports; upsert, list, get, count, delete) and `content/folders` |
-| pg-meta | every `/platform/pg-meta/{ref}/*` operation of the spec, proxied to sb-pgmeta |
+| pg-meta | every `/platform/pg-meta/{ref}/*` operation of the spec, proxied to supavise-pgmeta |
 | Auth admin | `/platform/auth/{ref}/users` (list, create, patch, delete), `invite`, `magiclink`, `otp`, `recover`, proxied to the project's GoTrue admin API with its `service_role` key |
 | Storage admin | `/platform/storage/{ref}/buckets` (list, create, get, patch, delete, empty) and `objects` (list, list-v2, move, copy, delete, sign, sign-multi), proxied to Storage with `x-forwarded-host: <ref>.api.<domain>`; `objects/public-url` (built here, after checking that the bucket is public); `credentials` (the project's S3 access keys, through Storage's admin API) |
 
@@ -140,38 +140,38 @@ the default branch only and a create answers 400. Organization entitlements alre
 
 | Route family | Credentials |
 |---|---|
-| `/platform/*` | GoTrue session JWT from `sb-gotrue@system`: HS256, signed with the system project's JWT secret (`Manager.Keys("system")`; re-read when a signature fails, at most once every 5 seconds, so a rotation takes effect and garbage tokens cost nothing), audience `authenticated`, an `exp` claim, not anonymous, **and an admin** (below). The session is identified by audience and signature, not by the `role` claim: users created through GoTrue's admin API have an empty `auth.users.role`, so their tokens carry `role: ""` (research/08 section 9); tokens with role `anon` or `service_role` are refused |
+| `/platform/*` | GoTrue session JWT from `supavise-gotrue@system`: HS256, signed with the system project's JWT secret (`Manager.Keys("system")`; re-read when a signature fails, at most once every 5 seconds, so a rotation takes effect and garbage tokens cost nothing), audience `authenticated`, an `exp` claim, not anonymous, **and an admin** (below). The session is identified by audience and signature, not by the `role` claim: users created through GoTrue's admin API have an empty `auth.users.role`, so their tokens carry `role: ""` (research/08 section 9); tokens with role `anon` or `service_role` are refused |
 | `/v1/*`, `/v2/*` | `sbp_` personal access token (`sbp_` + 40 hex, also `sbp_v0_`, `sbp_oauth_`; looked up by `secrets.HashToken`, expiry honored, `last_used_at` touched at most once a minute) **or** a dashboard JWT |
 | `GET /platform/cli/login/{session_id}` | none (the CLI has no token yet); guarded by the verification code |
 
-**Admin gate.** A valid session is not enough: the user needs `app_metadata.sbctl_admin = true`
+**Admin gate.** A valid session is not enough: the user needs `app_metadata.supavise_admin = true`
 (`api.AdminClaim`; GoTrue lets users edit `user_metadata` but not `app_metadata`) or an email in
-`[api] admin_emails`, otherwise the answer is `403`. sbctl sets the claim on every dashboard user
-it creates, and `sb-gotrue@system` creates no other user: its sign-up is open to GoTrue (an SSO
+`[api] admin_emails`, otherwise the answer is `403`. Supavise sets the claim on every dashboard user
+it creates, and `supavise-gotrue@system` creates no other user: its sign-up is open to GoTrue (an SSO
 user is created by signing up) and closed by the **before-user-created hook**, which the daemon
 answers and which allows registered SSO providers and invited addresses only (Single sign-on,
 below); the gate is defense in depth if that is ever lost. A user whose account came from SSO has
 no claim and is admitted by the SSO rules instead.
 The email allowlist trusts the JWT's `email` claim: GoTrue's access token carries no claim
 that proves the address was confirmed, so a registered SSO provider that vouches for an
-allowlisted address would be believed. Prefer the `sbctl_admin` claim and roles.
+allowlisted address would be believed. Prefer the `supavise_admin` claim and roles.
 A PAT is not re-checked against the user's admin status (the claim above) on each use: delete a
 user's tokens when you remove their account. It is checked against its owner's roles at every request
 (Members, roles and permissions, below), so removing the owner from an organization takes the access away at once.
 Authentication only says who the caller is; what the caller may do is the authorization of the next section.
 
-Dashboard users are recorded in `sbctl.api_users` on first sight (profile fields come from
+Dashboard users are recorded in `supavise.api_users` on first sight (profile fields come from
 GoTrue's `user_metadata`; later edits win). What a user may do is decided by their roles, below.
 
 ### Claim and invite (`GET` and `POST /claim`, `claim.go`)
 
-`sb-gotrue@system` has sign-up disabled, so dashboard accounts come only from here. A claim token
+`supavise-gotrue@system` has sign-up disabled, so dashboard accounts come only from here. A claim token
 (`sbc_` + 48 hex) creates the first administrator, an invite token (`sbi_`) creates one user for a
-fixed address. Only the SHA-256 is stored (`sbctl.claim_tokens`, migration `0600`); a token works
+fixed address. Only the SHA-256 is stored (`supavise.claim_tokens`, migration `0600`); a token works
 once and expires (claim 72 hours, invite 7 days). `POST /claim {token, email, password,
 organization_name}` consumes the token with one conditional `UPDATE`, creates the user through
-GoTrue's admin API on `sb-gotrue@system` with the system `service_role` key (`email_confirm: true`,
-`app_metadata.sbctl_admin = true`), and for a claim token creates the first organization (or keeps
+GoTrue's admin API on `supavise-gotrue@system` with the system `service_role` key (`email_confirm: true`,
+`app_metadata.supavise_admin = true`), and for a claim token creates the first organization (or keeps
 the existing one); the answer is `201 {email, user_id, organization, dashboard_url}`. When the user
 cannot be created (the address exists, the password is refused) the token is released and answers
 again. Unknown, used and expired tokens all answer `403`; ten failures in a minute answer `429` for
@@ -183,11 +183,11 @@ invitation and no other, so the link an Administrator of one organization holds 
 organization that invited the same address, and it dies with its invitation (replaced, revoked, accepted or expired).
 Invitations of other organizations to the address wait for the invitee's own sign-in (`/join`). A token that is
 bound to no invitation creates an account with no membership. Redeeming records the account in
-`sbctl.api_users`; the claim page fills the token and address from the link's `#token=...&email=...` fragment, which a
-browser never sends to a server. `Accounts` (the same type the CLI uses for `sbctl claim token`, `sbctl users invite|list|role|remove`)
+`supavise.api_users`; the claim page fills the token and address from the link's `#token=...&email=...` fragment, which a
+browser never sends to a server. `Accounts` (the same type the CLI uses for `supavise claim token`, `supavise users invite|list|role|remove`)
 also lists dashboard users and removes one, which ends the user's access at once and takes the user's seats away:
 
-1. the user is recorded in `sbctl.removed_users` (migration `0610`), and from then on `authJWT` refuses
+1. the user is recorded in `supavise.removed_users` (migration `0610`), and from then on `authJWT` refuses
    a session whose `sub` is in it and `authPAT` refuses a token whose owner is in it, on every request
    and with no cache, whichever process made the removal (a GoTrue access token would otherwise stay
    valid until it expires, an hour, and could mint a personal access token that never expires);
@@ -248,7 +248,7 @@ empty node); the creator owns the new organization.
 
 ### Enforcement
 
-`authz.go` holds the route table: every operation of the three specs, and every extra route sbctl serves, resolves
+`authz.go` holds the route table: every operation of the three specs, and every extra route Supavise serves, resolves
 to an action and a resource of hosted's `PermissionAction` model (`tenant:Sql:Admin:Write` on `migrations`,
 `write:Update` on `custom_config_gotrue`, `infra:Execute` on `reboot`, ...), checked against the caller's effective
 permissions before the handler runs. A row of the table is `method, path template, need`; `TestRouteTableCoversTheSpecs`
@@ -284,9 +284,9 @@ Developer and a user without a membership through the real handlers.
   `resource.role_id`, listing the Owner role and every project-scoped Owner role); Developer and Read-only are
   allow lists.
 - **Read-only SQL is read-only in the database.** Whoever lacks `tenant:Sql:Write:Insert` has their SQL run as
-  the `sbctl_read_only` role on every path: `POST /v1/projects/{ref}/database/query` (the MCP server's `execute_sql`),
+  the `supavise_read_only` role on every path: `POST /v1/projects/{ref}/database/query` (the MCP server's `execute_sql`),
   Studio's `POST /platform/pg-meta/{ref}/query` and the other pg-meta reads, and `cli/login-role` hands such a caller
-  the read-only login role (`sbctl_cli_ro_*`) whatever `read_only` says. `TestIntegrationRoles` runs inserts,
+  the read-only login role (`supavise_cli_ro_*`) whatever `read_only` says. `TestIntegrationRoles` runs inserts,
   updates, deletes, DDL, `begin read write`, `set session characteristics` and `reset role` against a real
   Postgres through both routes.
 - **Secrets stay with the roles that may read them.** For a caller without `read:Read` on `service_api_keys`,
@@ -315,7 +315,7 @@ Developer and a user without a membership through the real handlers.
   (the route table only checks the member's own item, `chkOwn`). Otherwise a member could rewrite a shared snippet
   that an Owner later opens and runs as `postgres`. `last_updated_by` records the real editor (migration `0902`).
 - **Judgment calls against hosted's table.** Hosted's access-control page lists Developers under Auth Hooks
-  (create, delete); sbctl stores hooks in the Auth settings (`custom_config_gotrue`), which only Owners and
+  (create, delete); Supavise stores hooks in the Auth settings (`custom_config_gotrue`), which only Owners and
   Administrators may change, so Developers cannot manage hooks. Developers hold the backup restore and Restart rows
   as listed. The Read-only role's secret list (service key, JWT secret, S3 credentials) follows the same page.
 - **Residual exposure of Read-only SQL.** The write barrier is table privileges (`pg_read_all_data` only) plus
@@ -329,8 +329,8 @@ Developer and a user without a membership through the real handlers.
 `POST .../members/invitations` takes both body shapes of the spec (`emails` + `role_id` + `role_scoped_projects`,
 Studio's; or `data[].attributes` with `role` and `projects`) and answers `{succeeded, failed}`; an address that
 is already a member lands in `failed`, an invalid address is a 400, and a caller who may not invite the role gets a 403.
-sbctl adds `invite_links: [{email, url, emailed}]` to that answer. The token is `sbo_` + 48 hex, stored as its
-SHA-256 (`sbctl.org_invitations`), works once and expires after 7 days (hosted: 24 hours; here the link often travels
+Supavise adds `invite_links: [{email, url, emailed}]` to that answer. The token is `sbo_` + 48 hex, stored as its
+SHA-256 (`supavise.org_invitations`), works once and expires after 7 days (hosted: 24 hours; here the link often travels
 by hand); inviting an address again replaces the pending invitation, which needs the permission to revoke it (an
 Administrator cannot cancel an Owner's invitation by re-inviting the address with a lower role; the answer is 403). Studio's `/join?token=...&slug=...` page uses
 `GET` and `POST .../invitations/{token}`: the signed-in user's email must match (case-insensitively) and joins with the
@@ -338,58 +338,58 @@ invited role, or with the invited project-scoped role on the projects that still
 
 How the invitee is told:
 
-- With **`[mail]` configured** (an SMTP relay for `sb-gotrue@system`, rendered into its `GOTRUE_SMTP_*`), sb-gotrue sends
+- With **`[mail]` configured** (an SMTP relay for `supavise-gotrue@system`, rendered into its `GOTRUE_SMTP_*`), supavise-gotrue sends
   the message: GoTrue's admin invite for an address without an account (the account is created confirmed and gets
-  `sbctl_admin`; the link signs the person in and lands on the invitation), a sign-in link (`/magiclink`) that lands on
+  `supavise_admin`; the link signs the person in and lands on the invitation), a sign-in link (`/magiclink`) that lands on
   the invitation for an existing account. If the relay fails the invitation stays and the caller gets the link.
 - **Without mail**, the answer carries the link and the server does not log it (the claim URL is a credential; the log
   records the address, organization and invitation id only): the invitation page for an
   existing account, the claim page (token and address prefilled) for a new address, where the invitee picks a password
-  and joins with the invited role in one step. `sbctl users invite <email> --role <role> [--org <slug>] [--project <ref>]...`
+  and joins with the invited role in one step. `supavise users invite <email> --role <role> [--org <slug>] [--project <ref>]...`
   prints that link on stdout.
 
 ### Bootstrap, SSO and the CLI
 
 - The claimed first user is Owner. Dashboard accounts that existed before roles keep full access: migration `0900`
   makes every user the API had seen Owner of every organization, and any other account created before the migration
-  became Owner of every organization on its first request (the account's creation time comes from `sb-gotrue@system`;
+  became Owner of every organization on its first request (the account's creation time comes from `supavise-gotrue@system`;
   a failed lookup denies and retries after a minute; each account is looked at once, so removing it from an
   organization sticks). Accounts created afterwards have no access until they are invited, claimed or granted a role.
 - `members.Service.GrantSSODefault(ctx, userID, email)` is what the SSO rules call for a first-time SSO sign-in
-  (`DashboardSSO.Admit`): the email domain's rule (`sbctl sso add --domain ... --default-role ...`, or by hand
-  `sbctl users default-role set <domain> <role> [--org]`, table `sbctl.sso_default_roles`) makes the user a member of its
+  (`DashboardSSO.Admit`): the email domain's rule (`supavise sso add --domain ... --default-role ...`, or by hand
+  `supavise users default-role set <domain> <role> [--org]`, table `supavise.sso_default_roles`) makes the user a member of its
   organization with its role, provided a registered identity provider that vouches for the domain is the one the user
   signed in through. A domain without a rule grants nothing; an existing membership is never changed.
-- `sbctl users invite|list|role|remove|default-role` (see `sbctl users --help`): `role` sets an organization-wide role
+- `supavise users invite|list|role|remove|default-role` (see `supavise users --help`): `role` sets an organization-wide role
   as the operator and also adds a user to an organization, which is how an organization without an Owner gets one
   back; `remove` refuses to delete the only Owner of an organization unless `--force`.
 
 ## Single sign-on
 
 Dashboard sign-in with SAML 2.0 (Okta, Entra ID, Google Workspace, anything that speaks it), and the same for the end
-users of a project. Implemented by `sso_dashboard.go` (the service, shared with `sbctl sso`), `sso_routes.go` (the
+users of a project. Implemented by `sso_dashboard.go` (the service, shared with `supavise sso`), `sso_routes.go` (the
 routes), `sso_hook.go` (the sign-up hook) and `internal/sso` (the GoTrue admin client, metadata checks, signing keys,
 the hook's signature). `internal/sso/README.md` has the building blocks.
 
-**Dashboard.** `sb-gotrue@system` runs with SAML on and a signing key of its own (RSA 2048, sealed as the system secret
-`saml_private_key`). An Owner or Administrator registers a provider (`sbctl sso add`, `POST .../sso/providers`, or
-Studio's organization SSO page): GoTrue gets the provider and its email domains through its admin SSO API, sbctl
+**Dashboard.** `supavise-gotrue@system` runs with SAML on and a signing key of its own (RSA 2048, sealed as the system secret
+`saml_private_key`). An Owner or Administrator registers a provider (`supavise sso add`, `POST .../sso/providers`, or
+Studio's organization SSO page): GoTrue gets the provider and its email domains through its admin SSO API, Supavise
 records the organization, the domains and the role a first-time user gets (`--default-role`; none means the user waits
 for approval), and the default-role rule of each domain is set. The identity provider is configured with
 `https://api.<domain>/auth/v1/sso/saml/acs` (assertion consumer service) and
 `.../sso/saml/metadata` (entity id; `?download=true` gives a long-lived metadata file). Studio's sign-in page asks for an
 email address, GoTrue's `POST /auth/v1/sso` finds the provider by the domain, and the browser goes through the identity
-provider and back to `/auth/v1/sso/saml/acs`, which the proxy's dashboard-auth route forwards to `sb-gotrue@system`
+provider and back to `/auth/v1/sso/saml/acs`, which the proxy's dashboard-auth route forwards to `supavise-gotrue@system`
 like every other `/auth/v1` path.
 
 - **Who gets in** (`DashboardSSO.Admit`, on every request of an SSO session): the session's
-  `app_metadata.provider` is `sso:<provider id>`; the provider must be registered with sbctl (a provider created in
-  GoTrue behind sbctl's back opens nothing, and a removed one ends its sessions within ten seconds); the user must belong
+  `app_metadata.provider` is `sso:<provider id>`; the provider must be registered with Supavise (a provider created in
+  GoTrue behind Supavise's back opens nothing, and a removed one ends its sessions within ten seconds); the user must belong
   to an organization. On the user's first request the email's domain decides: a registered provider that vouches for
   the domain, and a default-role rule of the provider's organization for it, make the user a member with that role.
   Any other user is recorded as pending and refused on every `/platform` and `/v1` route with `403` until an
-  administrator approves them (`sbctl sso approve`, `POST .../sso/pending/{user_id}` with a role) or invites or promotes
-  them the usual way; denying (`sbctl sso deny`, `DELETE`) deletes the account. The default role is for the first
+  administrator approves them (`supavise sso approve`, `POST .../sso/pending/{user_id}` with a role) or invites or promotes
+  them the usual way; denying (`supavise sso deny`, `DELETE`) deletes the account. The default role is for the first
   sign-in only: a user who later loses every membership waits again and is not given it again, and neither is a person
   whose address an administrator denied or removed (next bullet), whose new GoTrue account is a first sight of a
   new user id but not a first sign-in of the person. A second provider
@@ -399,7 +399,7 @@ like every other `/auth/v1` path.
   provider revokes the tokens of its users. An SSO
   session meets an organization's "require MFA" and the aal2 check on minting personal access tokens (GoTrue marks it aal1
   whatever the provider did, and the provider is where strong authentication is enforced; the switch would otherwise lock
-  out every SSO user). The exemption is unconditional: sbctl cannot see how strongly a provider authenticated its user,
+  out every SSO user). The exemption is unconditional: Supavise cannot see how strongly a provider authenticated its user,
   so any registered provider, including one an Administrator registered, satisfies the requirement. There is no
   per-provider setting yet.
 - **Who may change a provider.** The provider's default role is the role a first-time user gets, taken from the provider's
@@ -418,54 +418,54 @@ like every other `/auth/v1` path.
   are separate accounts, and the SSO one is the newer, so it comes first in GoTrue's list. Nothing that acts on an
   address takes the first match. `Accounts.ResolveUser` resolves an address to the password account when there is
   exactly one, and to the only account when a single one exists; with several SSO accounts and no password account, or
-  with a selector that matches none, it refuses (`AmbiguousUserError`, listing ids and providers). `sbctl users role`
-  and `sbctl users remove` take `--user-id` and `--provider` (`email`, or an identity provider id) to name another
-  account and print when the account they changed is an SSO one; `sbctl users list` shows how each account signs in
+  with a selector that matches none, it refuses (`AmbiguousUserError`, listing ids and providers). `supavise users role`
+  and `supavise users remove` take `--user-id` and `--provider` (`email`, or an identity provider id) to name another
+  account and print when the account they changed is an SSO one; `supavise users list` shows how each account signs in
   and its id. Invitations (`users invite`, the Team page) look at password accounts only: an address that only an
   identity provider has an account for gets the link that creates a password account. A first sign-in whose address
   has a password account is logged and recorded in the `sso.user.first_sign_in` event (`shares_email_with`); the
   SSO account gets the provider's default role like any other, and nothing of the password account.
 - **Denying and removing.** `deny` re-checks the memberships first: a user who became a member since the last request
-  (invited, `sbctl users role`) is not denied (409) and the account stays. Deleting the GoTrue account does not keep the
+  (invited, `supavise users role`) is not denied (409) and the account stays. Deleting the GoTrue account does not keep the
   person out: signing in through the identity provider again creates a new account with a new user id. So `deny`, and
-  `sbctl users remove` of an SSO account, also record the refusal by provider and lower-cased email address
+  `supavise users remove` of an SSO account, also record the refusal by provider and lower-cased email address
   (`sso_denied`), before anything is deleted. A refused address that signs in again gets a new account that is pending,
   without the default role (the `sso.user.first_sign_in` event says `default_role_withheld`), and is refused on every
-  route until an administrator approves it (`sbctl sso approve`, `POST .../sso/pending/{user_id}`; the approval clears
-  the refusal) or runs `sbctl sso allow <email>` (a waiting account of the address is forgotten, so its next request is a first sight again, default role included).
+  route until an administrator approves it (`supavise sso approve`, `POST .../sso/pending/{user_id}`; the approval clears
+  the refusal) or runs `supavise sso allow <email>` (a waiting account of the address is forgotten, so its next request is a first sight again, default role included).
   Inviting or promoting the person the usual way lets them in too, and leaves the refusal in place for a later removal
   to renew. The refusal belongs to the provider: removing the provider drops it. Removing a provider removes the memberships
   and project roles of the users that signed in through it, in every organization (the accounts cannot sign in again),
   before anything else changes; when one of them is the only Owner of an organization the removal is refused (409)
-  until another Owner exists, as `sbctl users remove` refuses it. The provider is deleted from GoTrue (a 404 there counts
-  as done) before sbctl's own record goes, and the record goes last, so a removal that stopped at GoTrue is finished by
+  until another Owner exists, as `supavise users remove` refuses it. The provider is deleted from GoTrue (a 404 there counts
+  as done) before Supavise's own record goes, and the record goes last, so a removal that stopped at GoTrue is finished by
   running it again.
-- **Domains are claimed node-wide.** GoTrue finds the provider by the email domain, across the whole node, and sbctl
+- **Domains are claimed node-wide.** GoTrue finds the provider by the email domain, across the whole node, and Supavise
   does not verify that the registrant controls the domain: the first provider to register a domain gets it (a second
   one is refused, 409). A provider is also refused for a domain that another organization's default-role rule holds,
   with or without a default role, unless the caller owns that organization (the operator may). An organization that
   registers a provider for a domain that another organization's members use, before that organization did, takes over
   the "Continue with SSO" sign-in for those addresses, so on a node with several organizations the Owners should
-  register their domains early and `sbctl sso list` shows who holds which. There is no DNS verification yet.
+  register their domains early and `supavise sso list` shows who holds which. There is no DNS verification yet.
 - **Sign-up stays closed.** GoTrue's own switch (`GOTRUE_DISABLE_SIGNUP`) also stops an SSO user's first sign-in, so
-  it is off on `sb-gotrue@system` and its before-user-created hook is on: GoTrue asks `POST
+  it is off on `supavise-gotrue@system` and its before-user-created hook is on: GoTrue asks `POST
   /internal/hooks/before-user-created` on the loopback admin listener (signed with a secret derived from the master key
   as Standard Webhooks specify; a request that came through the edge proxy or whose signature is wrong is refused) before
   it creates any user, and the daemon allows exactly a user of a registered SSO provider and an address that an
-  administrator invited by mail (the invite carries a one-time `sbctl_grant` in its metadata that the daemon issued for
+  administrator invited by mail (the invite carries a one-time `supavise_grant` in its metadata that the daemon issued for
   that address and spends in its answer; a person who merely knows the address cannot sign up with it first).
   Everything else is refused (`403`, "Sign-up is closed on this dashboard"), and while the daemon does not answer GoTrue
-  creates nobody. Users `sbctl` creates itself (the claim page, `users invite` without mail) go through GoTrue's admin
+  creates nobody. Users `supavise` creates itself (the claim page, `users invite` without mail) go through GoTrue's admin
   API, which has no hook.
 - **Studio's button.** Studio shows "Continue with SSO" only while the feature `dashboard_auth:sign_in_with_sso` is
   enabled, which its build disables by default (`NEXT_PUBLIC_DISABLED_FEATURES`, patch 0002, no new patch). While the
   dashboard has a provider, `fleet` starts Studio with that list minus the SSO entry; the API re-renders and restarts
   Studio's unit (`Deps.StudioRefresh`, in the background) when the first provider appears and when the last one goes,
-  and `sbctl sso add|remove` does the same before it returns.
+  and `supavise sso add|remove` does the same before it returns.
 - **Studio's organization page** (`/platform/organizations/{slug}/sso`) is served for real: one provider per
   organization, `join_org_on_signup_enabled` and `join_org_on_signup_role` are the default role, `enabled` is GoTrue's
   disabled flag; before one exists the page gets the 404 it reads as "not set up". Several providers per organization
-  and the pending list are sbctl's own routes.
+  and the pending list are Supavise's own routes.
 
 Provider changes, a user's first sign-in, approvals and denials are events of the system project in the registry
 (`sso.provider.added|updated|removed`, `sso.user.first_sign_in|approved|denied|allowed`; ids, domains and role names only).
@@ -480,27 +480,27 @@ settings (Administrator, Owner), reads the right to see the project. `saml_exter
 `saml_allow_encrypted_assertions` are settings too. `supabase sso add|list|show|update|remove --project-ref` work with
 `--profile` unchanged (Supabase CLI 2.119.0, `tests/linux/sso-smoke.sh`).
 
-**Limits.** Dashboard providers take SAML metadata as an https address (GoTrue fetches and refreshes it) or as a document; `sbctl sso add` also
+**Limits.** Dashboard providers take SAML metadata as an https address (GoTrue fetches and refreshes it) or as a document; `supavise sso add` also
 fetches a plain-http address on this machine (a development provider) and passes the document, which GoTrue does not
 refresh. There is no OIDC provider and no SCIM. A cloned or restored project starts with SAML off like every other
 setting. A user with a pending invitation who signs in through a provider without a membership is refused until
 the invitation is dealt with another way: `/join` is behind the same gate. Dashboard OAuth sign-in (Google, GitHub,
 Azure) behind the same allowlist is not built.
 
-## Configuration (`[api]` in config.toml, or `SBCTL_API_*`)
+## Configuration (`[api]` in config.toml, or `SUPAVISE_API_*`)
 
 | Key | Meaning |
 |---|---|
 | `allowed_origins` | extra CORS origins besides the Studio URL (`*` is not accepted: Studio sends credentials) |
-| `pgmeta_crypto_key` | passphrase shared with sb-pgmeta (`CRYPTO_KEY`). Empty: a random key kept sealed in the registry as system secret `pgmeta_crypto_key`, created by `api.EnsurePGMetaCryptoKey(ctx, reg, sec)`. The unit renderer for sb-pgmeta must call that function before it renders the unit; the API calls it on first use and fails (no ephemeral key) when the registry cannot store the key |
+| `pgmeta_crypto_key` | passphrase shared with supavise-pgmeta (`CRYPTO_KEY`). Empty: a random key kept sealed in the registry as system secret `pgmeta_crypto_key`, created by `api.EnsurePGMetaCryptoKey(ctx, reg, sec)`. The unit renderer for supavise-pgmeta must call that function before it renders the unit; the API calls it on first use and fails (no ephemeral key) when the registry cannot store the key |
 | `public_url`, `dashboard_url` | override the derived `https://api.<domain>` and `https://studio.<domain>` |
 | `disable_device_login` | turn off the browser login flow |
-| `admin_emails` | comma-separated emails allowed to use the API without the `sbctl_admin` claim |
+| `admin_emails` | comma-separated emails allowed to use the API without the `supavise_admin` claim |
 
-`[mail]` (or `SBCTL_MAIL_*`) is the SMTP relay `sb-gotrue@system` sends the dashboard's mail through, used for
+`[mail]` (or `SUPAVISE_MAIL_*`) is the SMTP relay `supavise-gotrue@system` sends the dashboard's mail through, used for
 organization invitations: `smtp_host`, `smtp_port` (587), `smtp_user`, `smtp_pass`, `smtp_from`, `smtp_name`. It
 needs a host and a sender; without it no mail is sent. The password sits in `config.toml` in plain text, so keep the
-file mode 0600. Changing it renders the system GoTrue's environment again; restart `sb-gotrue@system` for it to apply.
+file mode 0600. Changing it renders the system GoTrue's environment again; restart `supavise-gotrue@system` for it to apply.
 
 ## What this package needs from the rest of the system
 
@@ -513,7 +513,7 @@ file mode 0600. Changing it renders the system GoTrue's environment again; resta
   Studio does: objects made in the SQL editor then belong to the role the CLI and
   migrations use and can be altered or dropped by them. A feature that needs a superuser
   would fail with a permission error; that is the trade-off taken.
-- **Read-only SQL runs as the role `sbctl_read_only`**: `login`, `bypassrls` (as upstream's
+- **Read-only SQL runs as the role `supavise_read_only`**: `login`, `bypassrls` (as upstream's
   `supabase_read_only_user`: `pg_read_all_data` alone does not bypass row level security, so
   RLS tables would read as empty) and member of `pg_read_all_data`, `default_transaction_read_only = on`
   as a second layer. The API creates it on demand (as `supabase_admin`; a cheap catalog check
@@ -524,15 +524,15 @@ file mode 0600. Changing it renders the system GoTrue's environment again; resta
   `database/query/read-only` and `database/query` with `read_only: true`, which the MCP
   server's `--read-only` mode relies on.
 - **CLI login roles**: `cli_login_<rand>` (member of `postgres`, `set role = postgres`) for
-  read-write; read-only requests get `sbctl_cli_ro_<rand>` (`bypassrls`, member of `pg_read_all_data`;
+  read-write; read-only requests get `supavise_cli_ro_<rand>` (`bypassrls`, member of `pg_read_all_data`;
   `pg_dump` runs with `row_security = off` and needs it on RLS tables),
   because the CLI runs `SET SESSION ROLE postgres` after connecting as any `cli_login_*`
   user (cli-go `internal/utils/connect.go`) and a read-only role cannot do that. Both expire
   after an hour, are dropped by the next create or by `DELETE .../cli/login-role` (which needs the right to change database roles: it drops every member's), and are
   created with a SCRAM verifier. The CLI's `db dump --role-only` skips only `cli_login_*`, so
-  it lists `sbctl_read_only` and any live `sbctl_cli_ro_*` role; a read-only role cannot use
+  it lists `supavise_read_only` and any live `supavise_cli_ro_*` role; a read-only role cannot use
   the `cli_login_` name (see above), so this stays a known limit.
-- **sb-pgmeta** at `127.0.0.1:<ports.pgmeta>` with `CRYPTO_KEY` equal to the key above. The
+- **supavise-pgmeta** at `127.0.0.1:<ports.pgmeta>` with `CRYPTO_KEY` equal to the key above. The
   `x-connection-encrypted` header is built in `cryptojs/` (crypto-js passphrase AES, checked
   against vectors from the real library in `testdata/cryptojs/`). pg-meta also listens on
   `port+1` for its admin app.
@@ -543,9 +543,9 @@ file mode 0600. Changing it renders the system GoTrue's environment again; resta
   allocated ref (never a 504, which would invite a retry that creates a second project;
   clients poll `GET .../projects/{ref}`, which answers 404 until the row exists). Better
   for clients: have `Manager.Create` insert the registry row before it does anything slow.
-- **`sb-gotrue@system`** with SAML on, its before-user-created hook pointing at this daemon's loopback listener
-  (`lifecycle.SystemAuth`, rendered by `sbctl system init` and, at every daemon start, by `RefreshSystemAuth`), and
-  `app_metadata.sbctl_admin = true` on each password account sbctl creates (see Authentication).
+- **`supavise-gotrue@system`** with SAML on, its before-user-created hook pointing at this daemon's loopback listener
+  (`lifecycle.SystemAuth`, rendered by `supavise system init` and, at every daemon start, by `RefreshSystemAuth`), and
+  `app_metadata.supavise_admin = true` on each password account Supavise creates (see Authentication).
 
 ## State
 
@@ -560,8 +560,8 @@ from before roles becomes Owner of every organization that existed when roles be
 membership later never hands the account back to the rule. Behind `internal/members` (Postgres and memory
 implementations, one service test suite that runs on both).
 
-Single sign-on is in `1000_sso.sql` (range 1000-1099): `sso_providers` (the providers sbctl registered in
-`sb-gotrue@system`: organization, domains, default role), `sso_users` (who signed in through one, `pending` or `active`),
+Single sign-on is in `1000_sso.sql` (range 1000-1099): `sso_providers` (the providers Supavise registered in
+`supavise-gotrue@system`: organization, domains, default role), `sso_users` (who signed in through one, `pending` or `active`),
 `1001_sso_denied.sql`'s `sso_denied` (addresses an administrator denied or removed, per provider)
 and `signup_grants` (one-time grants that let GoTrue create an invited address). Behind `SSOStore` (`sso_store.go`, a
 Postgres and a memory implementation, one conformance suite) and `ClaimStore`.
@@ -573,15 +573,15 @@ offline on the committed `gen/specs/*.json`. Re-pinning the specs is a separate,
 step: `sh internal/api/gen/fetch-specs.sh` (a `make specs` target should call it), review
 the diff, then generate.
 
-## `sbctl api profile`
+## `supavise api profile`
 
 Prints the file the Supabase CLI reads with `--profile` (api_url, dashboard_url,
 project_host, pooler_host):
 
 ```sh
-sbctl api profile --format yaml > sbctl-profile.yaml     # the CLI picks its parser by extension
-supabase --profile=./sbctl-profile.yaml login --token sbp_...
-supabase --profile=./sbctl-profile.yaml projects list
+supavise api profile --format yaml > supavise-profile.yaml     # the CLI picks its parser by extension
+supabase --profile=./supavise-profile.yaml login --token sbp_...
+supabase --profile=./supavise-profile.yaml projects list
 ```
 
 `project_host` is `api.<domain>`: the CLI derives `https://<ref>.<project_host>` (the
@@ -595,29 +595,29 @@ route when `db.<ref>.<project_host>` does not answer.
 
 ```sh
 # unit tests, no processes (the role matrix, permissions, members, invitations, mail, MFA)
-scripts/guard.sh -- go test ./internal/api ./internal/members ./cmd/sbctl
-# with a Postgres (SBCTL_TEST_DATABASE_URL) the members tests also run against it, in a throwaway database
+scripts/guard.sh -- go test ./internal/api ./internal/members ./cmd/supavise
+# with a Postgres (SUPAVISE_TEST_DATABASE_URL) the members tests also run against it, in a throwaway database
 
-# integration: real Postgres + real sb-pgmeta from the darwin artifacts (~3 s, two processes);
+# integration: real Postgres + real supavise-pgmeta from the darwin artifacts (~3 s, two processes);
 # TestIntegrationRoles proves a Read-only member cannot write through any route
-# (SBCTL_API_IT_PORT_BASE moves the 900 ports it uses off 32100-32999)
-SBCTL_API_INTEGRATION=1 \
-SBCTL_PG_BIN=$HOME/.cache/sbctl/unpacked/postgres-17.11.0.004-r1-darwin-arm64/bin \
-SBCTL_PGMETA_BIN=$HOME/.cache/sbctl/unpacked/pgmeta-v0.100.0-r0-darwin-arm64/bin/pgmeta \
+# (SUPAVISE_API_IT_PORT_BASE moves the 900 ports it uses off 32100-32999)
+SUPAVISE_API_INTEGRATION=1 \
+SUPAVISE_PG_BIN=$HOME/.cache/sbctl/unpacked/postgres-17.11.0.004-r1-darwin-arm64/bin \
+SUPAVISE_PGMETA_BIN=$HOME/.cache/sbctl/unpacked/pgmeta-v0.100.0-r0-darwin-arm64/bin/pgmeta \
 scripts/guard.sh -- go test ./internal/api -run Integration -v
 ```
 
-The dashboard's single sign-on end to end on this machine (a real `sb-gotrue@system` with SAML and the sign-up hook
+The dashboard's single sign-on end to end on this machine (a real `supavise-gotrue@system` with SAML and the sign-up hook
 pointing at an in-process API, a real project, and `testdata/saml-idp.py`, a SAML identity provider for tests that
 needs `pip install signxml`; about 25 seconds):
 
 ```sh
 python3 -m venv /tmp/idp-venv && /tmp/idp-venv/bin/pip install signxml
-SBCTL_SSO_INTEGRATION=1 SBCTL_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked SBCTL_SSO_PYTHON=/tmp/idp-venv/bin/python \
-  SBCTL_API_IT_PORT_BASE=44100 scripts/guard.sh -- go test ./internal/api -run IntegrationDashboardSSO -v
+SUPAVISE_SSO_INTEGRATION=1 SUPAVISE_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked SUPAVISE_SSO_PYTHON=/tmp/idp-venv/bin/python \
+  SUPAVISE_API_IT_PORT_BASE=44100 scripts/guard.sh -- go test ./internal/api -run IntegrationDashboardSSO -v
 ```
 
-Real clients against the integration stack (Postgres on `127.0.0.1:32100-32999`, or from `SBCTL_API_IT_PORT_BASE`, nothing on
+Real clients against the integration stack (Postgres on `127.0.0.1:32100-32999`, or from `SUPAVISE_API_IT_PORT_BASE`, nothing on
 a default port; delete the JSON file to stop everything):
 
 ```sh
@@ -636,11 +636,11 @@ SUPABASE_ACCESS_TOKEN=$(jq -r .pats.owner /path/stack.json) \
 
 # Supabase CLI
 cat > profile.yaml <<EOF
-name: sbctl-test
+name: supavise-test
 api_url: $API
 dashboard_url: http://127.0.0.1:1
-project_host: api.sbctl.test
-pooler_host: sbctl.test
+project_host: api.supavise.test
+pooler_host: supavise.test
 EOF
 export SUPABASE_ACCESS_TOKEN=$PAT SUPABASE_NO_KEYRING=1 DO_NOT_TRACK=1
 supabase --profile=./profile.yaml projects list

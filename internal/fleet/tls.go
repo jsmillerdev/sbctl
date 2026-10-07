@@ -16,7 +16,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 const (
@@ -63,7 +63,7 @@ func ensureDownstreamCert(cfg *config.Config, now time.Time) (string, error) {
 	}
 	tpl := &x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: host, Organization: []string{"sbctl"}},
+		Subject:      pkix.Name{CommonName: host, Organization: []string{"supavise"}},
 		NotBefore:    now.Add(-time.Hour),
 		NotAfter:     now.Add(downstreamCertValidity),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,

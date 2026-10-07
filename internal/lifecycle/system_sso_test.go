@@ -10,11 +10,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/sso"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/sso"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 func testAESGCM(t *testing.T) *secrets.AESGCM {
@@ -26,7 +26,7 @@ func testAESGCM(t *testing.T) *secrets.AESGCM {
 	return s
 }
 
-// With SystemAuth, sb-gotrue@system speaks SAML with the node's own key and asks the daemon
+// With SystemAuth, supavise-gotrue@system speaks SAML with the node's own key and asks the daemon
 // before it creates a user; sign-up is open to GoTrue and closed by the hook. A project's GoTrue
 // gets none of it from here (its SAML is a saved setting), and without SystemAuth nothing changes.
 func TestSystemGoTrueGetsDashboardSSO(t *testing.T) {
@@ -148,7 +148,7 @@ func (c *changeSup) calls() string {
 	return strings.Join(c.log, ",")
 }
 
-// The daemon renders sb-gotrue@system at every start; the unit restarts only when the files
+// The daemon renders supavise-gotrue@system at every start; the unit restarts only when the files
 // differ from the ones it runs on, and a unit that is not running is not started by it.
 func TestRefreshSystemAuthRestartsOnlyOnAChange(t *testing.T) {
 	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
@@ -167,7 +167,7 @@ func TestRefreshSystemAuthRestartsOnlyOnAChange(t *testing.T) {
 	if err := pl.RefreshSystemAuth(ctx, sys, keys); err != nil {
 		t.Fatal(err)
 	}
-	if got := sup.calls(); got != "render sb-gotrue@system.service" {
+	if got := sup.calls(); got != "render supavise-gotrue@system.service" {
 		t.Fatalf("unchanged files: %s", got)
 	}
 	sup.changed = true
@@ -175,14 +175,14 @@ func TestRefreshSystemAuthRestartsOnlyOnAChange(t *testing.T) {
 	if err := pl.RefreshSystemAuth(ctx, sys, keys); err != nil {
 		t.Fatal(err)
 	}
-	if got := sup.calls(); got != "render sb-gotrue@system.service,stop sb-gotrue@system.service,start sb-gotrue@system.service" {
+	if got := sup.calls(); got != "render supavise-gotrue@system.service,stop supavise-gotrue@system.service,start supavise-gotrue@system.service" {
 		t.Fatalf("changed files: %s", got)
 	}
 	sup.state, sup.log = units.StateInactive, nil
 	if err := pl.RefreshSystemAuth(ctx, sys, keys); err != nil {
 		t.Fatal(err)
 	}
-	if got := sup.calls(); got != "render sb-gotrue@system.service" {
+	if got := sup.calls(); got != "render supavise-gotrue@system.service" {
 		t.Fatalf("a unit that is not running: %s", got)
 	}
 }

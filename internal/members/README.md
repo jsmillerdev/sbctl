@@ -3,7 +3,7 @@
 Who belongs to which organization with which role, project-scoped roles, invitations, and the
 permissions those roles grant, in the shape Studio and the Management API use (hosted's
 `PermissionAction` model). The API server (`internal/api`, `authz.go` and `members_api.go`) enforces
-them on every `/platform` and `/v1` route and serves them to Studio; `sbctl users` (`cmd/sbctl`) and
+them on every `/platform` and `/v1` route and serves them to Studio; `supavise users` (`cmd/supavise`) and
 the SSO workstream use the same `Service`. The route table, the capability table and the HTTP
 behavior are documented in `internal/api/README.md` (Members, roles and permissions).
 
@@ -25,6 +25,6 @@ grant, _ := svc.GrantSSODefault(ctx, userID, email) // nil when the domain has n
 ```
 
 `go test ./internal/members` runs the service tests on the memory store, and on Postgres too when
-`SBCTL_TEST_DATABASE_URL` is set (each run uses a throwaway database next to it): role changes by every
+`SUPAVISE_TEST_DATABASE_URL` is set (each run uses a throwaway database next to it): role changes by every
 role, the last Owner under concurrent demotions, project-scoped roles, invitations (expiry, single use, a
 failed acceptance does not consume the invitation), the legacy rule, SSO defaults, removal of a project.

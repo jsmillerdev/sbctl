@@ -1,0 +1,83 @@
+[Unit]
+Description=Supavise Postgres for project %i
+Documentation=https://github.com/jsmillerdev/supavise
+After=network.target local-fs.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+# Enabled for boot before the project exists (system project): skip until rendered.
+ConditionPathExists=/var/lib/supavise/projects/%i/postgres.run
+
+[Service]
+# supavise renders the two files below (units.Supervisor.Render) before it starts the unit.
+Type=exec
+User=supavise
+Group=supavise
+Slice=supavise.slice
+EnvironmentFile=/var/lib/supavise/projects/%i/postgres.env
+ExecStart=/var/lib/supavise/projects/%i/postgres.run
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=90
+LimitNOFILE=16384
+OOMScoreAdjust=-500
+# MemoryMax and CPUQuota come from the project record: supavise applies them over D-Bus
+# as persistent per-unit drop-ins.
+MemoryAccounting=yes
+CPUAccounting=yes
+SyslogIdentifier=supavise-postgres@%i
+# SIGINT is Postgres's fast shutdown: abort open transactions, checkpoint, exit.
+# systemd sends it to the postmaster only, and SIGKILL to what is left on timeout.
+KillMode=mixed
+KillSignal=SIGINT
+
+# Hardening. MemoryDenyWriteExecute is deliberately absent: Postgres (JIT), the BEAM
+# and Node all map writable+executable memory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Postgres runs tenant code (SQL, pg_net and http, an agent with execute_sql). The EC2
+# instance role (the whole backup bucket, DNS) must not be one HTTP request away from it:
+# IMDS is denied here, and WAL archiving does not need it, because archive_command talks to
+# the daemon over the unix socket below and the daemon holds the credentials.
+IPAddressDeny=169.254.169.254 fd00:ec2::254
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+# The launcher chmods a script inside the postgres artifact on first boot, so that one
+# artifact directory is writable. The backup directory is not: WAL leaves through the relay.
+ReadWritePaths=/var/lib/supavise/projects/%i/postgres /var/lib/supavise/artifacts/postgres
+# Containment (allowlist). Every unit runs as the supavise user, so the mount namespace is
+# what keeps this cluster away from the master key, the config file (backup credentials),
+# other projects' data and every project's backups. The unit sees an empty tmpfs where
+# /var/lib/supavise is, plus the artifacts (read-only, the postgres one writable), its launcher
+# script, its own cluster directory and the WAL relay directory (read-only: connecting to the
+# socket in it needs no write access). archive_command and restore_command
+# (`supavise wal push|fetch --socket`) read no file of /etc/supavise. Environment files are read by
+# systemd before the namespace exists. This does not isolate tenants from a compromised
+# cluster (same uid, /proc); see README.md.
+# Besides /etc/supavise and the system bus (the polkit rule would let a confined unit lift its own
+# filter), two unix sockets that the IP filter of a branch with denied egress (IPAddressDeny,
+# set per unit over D-Bus) cannot cover and that systemd 255 does not let a running unit's
+# InaccessiblePaths change over D-Bus, so every Postgres unit hides them: the resolver's
+# varlink socket (glibc's nss-resolve; a Postgres without it falls back to /etc/resolv.conf)
+# and nscd's socket.
+InaccessiblePaths=-/etc/supavise -/run/dbus -/run/systemd/resolve/io.systemd.Resolve -/run/nscd/socket
+TemporaryFileSystem=/var/lib/supavise:ro
+BindReadOnlyPaths=/var/lib/supavise/artifacts /var/lib/supavise/projects/%i/postgres.run -/var/lib/supavise/projects/%i/wal
+BindPaths=/var/lib/supavise/projects/%i/postgres /var/lib/supavise/artifacts/postgres
+
+[Install]
+WantedBy=multi-user.target

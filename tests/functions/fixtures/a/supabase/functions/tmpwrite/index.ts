@@ -3,7 +3,7 @@
 Deno.serve(async (req) => {
   const mb = Number(new URL(req.url).searchParams.get('mb') ?? '1')
   const chunk = new Uint8Array(1024 * 1024).fill(97)
-  const path = '/tmp/sbctl-tmpwrite'
+  const path = '/tmp/supavise-tmpwrite'
   try {
     const f = await Deno.open(path, { create: true, write: true, truncate: true })
     try {

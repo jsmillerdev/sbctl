@@ -9,11 +9,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 func TestStripManagedSettings(t *testing.T) {
@@ -71,7 +71,7 @@ func TestRecoverPostgresClearsAutoConfAndStartsTheCluster(t *testing.T) {
 	cfg := config.Default()
 	cfg.StateDir = shortTempDir(t)
 	cfg.Domain = "example.test"
-	cfg.BinPath = "/usr/local/bin/sbctl"
+	cfg.BinPath = "/usr/local/bin/supavise"
 	sup := &fakeSup{}
 	pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{})
 	p := testProject(cfg, "abcdefghijklmnopqrst", 2)

@@ -9,7 +9,7 @@ type API struct {
 	// API with credentials (CORS), in addition to https://<studio host>. "*" is not
 	// accepted: Studio sends Authorization headers, so origins are listed explicitly.
 	AllowedOrigins string `toml:"allowed_origins"`
-	// PGMetaCryptoKey is the passphrase shared with sb-pgmeta (its CRYPTO_KEY
+	// PGMetaCryptoKey is the passphrase shared with supavise-pgmeta (its CRYPTO_KEY
 	// variable) for the x-connection-encrypted header. Empty means a random key kept
 	// sealed in the registry (system project secret "pgmeta_crypto_key").
 	PGMetaCryptoKey string `toml:"pgmeta_crypto_key"`
@@ -24,7 +24,7 @@ type API struct {
 	DisableDeviceLogin bool `toml:"disable_device_login"`
 	// AdminEmails is a comma-separated allowlist of dashboard users (matched on the
 	// session's email, case-insensitively) who may use the API even without the
-	// app_metadata.sbctl_admin claim that sbctl sets on the users it creates.
+	// app_metadata.supavise_admin claim that supavise sets on the users it creates.
 	AdminEmails string `toml:"admin_emails"`
 }
 
@@ -50,7 +50,7 @@ func (a API) Origins() []string {
 	return out
 }
 
-// scheme is the URL scheme sbctl's public listeners speak.
+// scheme is the URL scheme supavise's public listeners speak.
 func (c *Config) scheme() string {
 	if c.TLS.Mode == "off" {
 		return "http"

@@ -13,7 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
 )
 
 // authClient does not keep connections open: the test ports (39000-39999) lie inside Linux's
@@ -210,7 +210,7 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 	if _, err := admin.Exec(ctx, `checkpoint`); err != nil {
 		t.Fatal(err)
 	}
-	if os.Getenv("SBCTL_TEST_EXPECT_METHOD") == MethodBackup {
+	if os.Getenv("SUPAVISE_TEST_EXPECT_METHOD") == MethodBackup {
 		// Whatever the filesystem can do, take the base-backup path (a restore of the parent's
 		// base backup and WAL), as TestIntegrationCloneIsolatesTheParentsIntegrations does.
 		st.cfg.Branching.Clone = "backup"
@@ -445,7 +445,7 @@ func TestIntegrationCloneNeutralizesForeignServersAndParentCredentials(t *testin
 		if _, err := ba.Exec(ctx, `insert into public.victim_ft values (3, 'written by the branch')`); err == nil {
 			t.Errorf("branch %s: the foreign table accepted a write", b.Name)
 		}
-		if _, err := ba.Exec(ctx, `select dblink_connect('sbctl_c', 'other_dl')`); err == nil {
+		if _, err := ba.Exec(ctx, `select dblink_connect('supavise_c', 'other_dl')`); err == nil {
 			t.Errorf("branch %s: dblink connected through the named server", b.Name)
 		}
 		// Recorded: server, wrapper, the original host, port and database, who lost a password; never the password.

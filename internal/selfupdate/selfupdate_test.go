@@ -37,7 +37,7 @@ func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
 	}
 	r := &releaseServer{pub: pub, priv: priv, tag: tag, bin: []byte(binary), omit: map[string]bool{}, calls: map[string]int{}}
 	sum := sha256.Sum256(r.bin)
-	r.sums = []byte(fmt.Sprintf("%s  sbctl-linux-amd64\n%s  sbctl-linux-arm64\n%s  studio-x.tar.zst\n",
+	r.sums = []byte(fmt.Sprintf("%s  supavise-linux-amd64\n%s  supavise-linux-arm64\n%s  studio-x.tar.zst\n",
 		hex.EncodeToString(sum[:]), strings.Repeat("a", 64), strings.Repeat("b", 64)))
 	r.sig = ed25519.Sign(priv, r.sums)
 	mux := http.NewServeMux()
@@ -49,7 +49,7 @@ func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
 			return
 		}
 		assets := []map[string]string{}
-		for _, n := range []string{"SHA256SUMS", "SHA256SUMS.sig", "sbctl-linux-amd64", "sbctl-linux-arm64"} {
+		for _, n := range []string{"SHA256SUMS", "SHA256SUMS.sig", "supavise-linux-amd64", "supavise-linux-arm64"} {
 			if !r.omit[n] {
 				assets = append(assets, map[string]string{"name": n, "browser_download_url": r.URL + "/dl/" + n})
 			}
@@ -64,7 +64,7 @@ func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
 			_, _ = w.Write(r.sums)
 		case "SHA256SUMS.sig":
 			_, _ = w.Write(r.sig)
-		case "sbctl-linux-amd64":
+		case "supavise-linux-amd64":
 			_, _ = w.Write(r.bin)
 		default:
 			http.NotFound(w, req)
@@ -76,12 +76,12 @@ func newReleaseServer(t *testing.T, tag, binary string) *releaseServer {
 }
 
 func (r *releaseServer) opts(t *testing.T, current string) (Options, string) {
-	exe := filepath.Join(t.TempDir(), "sbctl")
+	exe := filepath.Join(t.TempDir(), "supavise")
 	if err := os.WriteFile(exe, []byte("old binary"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return Options{Repo: "o/r", APIBase: r.URL, Platform: "linux-amd64", Current: current, ExecPath: exe, Key: r.pub,
-		Probe: func(context.Context, string) (string, error) { return "sbctl version " + r.tag, nil }}, exe
+		Probe: func(context.Context, string) (string, error) { return "supavise version " + r.tag, nil }}, exe
 }
 
 func read(t *testing.T, p string) string {
@@ -126,7 +126,7 @@ func TestUpdateUpToDate(t *testing.T) {
 	if err != nil || res.Replaced {
 		t.Fatalf("%+v %v", res, err)
 	}
-	if read(t, exe) != "old binary" || r.calls["sbctl-linux-amd64"] != 0 {
+	if read(t, exe) != "old binary" || r.calls["supavise-linux-amd64"] != 0 {
 		t.Fatal("downloaded or replaced although current")
 	}
 	o.Force = true
@@ -150,7 +150,7 @@ func TestUpdateRefusals(t *testing.T) {
 		"binary tampered":             {func(r *releaseServer) { r.bin = []byte("evil binary") }, "does not match its checksum"},
 		"no signature asset":          {func(r *releaseServer) { r.omit["SHA256SUMS.sig"] = true }, "no asset SHA256SUMS.sig"},
 		"no sums asset":               {func(r *releaseServer) { r.omit["SHA256SUMS"] = true }, "no asset SHA256SUMS"},
-		"no binary":                   {func(r *releaseServer) { r.omit["sbctl-linux-amd64"] = true }, "no asset sbctl-linux-amd64"},
+		"no binary":                   {func(r *releaseServer) { r.omit["supavise-linux-amd64"] = true }, "no asset supavise-linux-amd64"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newReleaseServer(t, "v1.2.0", "new binary")
@@ -173,10 +173,10 @@ func TestUpdateRefusals(t *testing.T) {
 
 func TestUpdateChecksumListWithoutThePlatform(t *testing.T) {
 	r := newReleaseServer(t, "v1.2.0", "new binary")
-	r.sums = []byte(strings.Repeat("a", 64) + "  sbctl-linux-arm64\n")
+	r.sums = []byte(strings.Repeat("a", 64) + "  supavise-linux-arm64\n")
 	r.sig = ed25519.Sign(r.priv, r.sums)
 	o, _ := r.opts(t, "v1.0.0")
-	if _, err := Update(context.Background(), o); err == nil || !strings.Contains(err.Error(), "no checksum for sbctl-linux-amd64") {
+	if _, err := Update(context.Background(), o); err == nil || !strings.Contains(err.Error(), "no checksum for supavise-linux-amd64") {
 		t.Fatalf("%v", err)
 	}
 }
@@ -276,7 +276,7 @@ func TestChecksumFor(t *testing.T) {
 
 // TestVerifiesWhatOpenSSLSigned pins the interoperability the release depends on:
 // deploy/release-assets.sh signs with `openssl pkeyutl -sign -rawin`, install.sh verifies
-// with openssl and `sbctl self-update` verifies with Go's crypto/ed25519. The fixture was
+// with openssl and `supavise self-update` verifies with Go's crypto/ed25519. The fixture was
 // made by release-assets.sh with a throwaway key whose private half was discarded.
 func TestVerifiesWhatOpenSSLSigned(t *testing.T) {
 	pemB, _ := os.ReadFile("testdata/openssl-test-key.pub.pem")
@@ -293,6 +293,7 @@ func TestVerifiesWhatOpenSSLSigned(t *testing.T) {
 	if err := VerifySums(key, sums, sig); err == nil {
 		t.Fatal("tampered list accepted")
 	}
+	// The fixture is signed, so its asset names stay the names it was signed with.
 	if h, err := ChecksumFor(sums, "sbctl-linux-arm64"); err != nil || len(h) != 64 {
 		t.Fatalf("%q %v", h, err)
 	}
@@ -302,7 +303,7 @@ func TestUpdateRefusesAnOlderBinaryUnderANewerTag(t *testing.T) {
 	// An attacker who can publish a release attaches the signed assets of v1.0.0 to v9.0.0.
 	r := newReleaseServer(t, "v9.0.0", "old signed binary")
 	o, exe := r.opts(t, "v1.1.0")
-	o.Probe = func(context.Context, string) (string, error) { return "sbctl version v1.0.0\n", nil }
+	o.Probe = func(context.Context, string) (string, error) { return "supavise version v1.0.0\n", nil }
 	_, err := Update(context.Background(), o)
 	if err == nil || !strings.Contains(err.Error(), "refusing to install") || !strings.Contains(err.Error(), "downgrade") {
 		t.Fatalf("%v", err)
@@ -310,7 +311,7 @@ func TestUpdateRefusesAnOlderBinaryUnderANewerTag(t *testing.T) {
 	if read(t, exe) != "old binary" {
 		t.Fatal("the installed binary was replaced")
 	}
-	if entries, _ := filepath.Glob(filepath.Join(filepath.Dir(exe), ".sbctl.new-*")); len(entries) != 0 {
+	if entries, _ := filepath.Glob(filepath.Join(filepath.Dir(exe), ".supavise.new-*")); len(entries) != 0 {
 		t.Fatalf("temporary file left behind: %v", entries)
 	}
 }
@@ -320,9 +321,9 @@ func TestReportsVersion(t *testing.T) {
 		out, tag string
 		ok       bool
 	}{
-		{"sbctl version v1.2.3\n", "v1.2.3", true},
-		{"sbctl version v1.2.30", "v1.2.3", false},
-		{"sbctl version dev", "v1.2.3", false},
+		{"supavise version v1.2.3\n", "v1.2.3", true},
+		{"supavise version v1.2.30", "v1.2.3", false},
+		{"supavise version dev", "v1.2.3", false},
 		{"", "v1.2.3", false},
 	} {
 		if got := ReportsVersion(tc.out, tc.tag); got != tc.ok {

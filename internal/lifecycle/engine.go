@@ -14,10 +14,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // Options configure an Engine.
@@ -38,7 +38,7 @@ type Options struct {
 	Settings Settings
 }
 
-// Timers drives the per-project nightly base backup timer (sb-basebackup@<ref>.timer).
+// Timers drives the per-project nightly base backup timer (supavise-basebackup@<ref>.timer).
 // Failures are logged by the Engine and never fail the operation: a missing timer is
 // repaired by the next start.
 type Timers interface {
@@ -114,7 +114,7 @@ func (e *Engine) lock(ctx context.Context, ref string) (func(), error) {
 		mu.Unlock()
 		return nil, fmt.Errorf("lifecycle: lock %s: %w", ref, err)
 	}
-	if _, err := conn.Exec(ctx, `select pg_advisory_lock(hashtext('sbctl:' || $1::text))`, ref); err != nil {
+	if _, err := conn.Exec(ctx, `select pg_advisory_lock(hashtext('supavise:' || $1::text))`, ref); err != nil {
 		_ = conn.Close(context.WithoutCancel(ctx))
 		mu.Unlock()
 		return nil, fmt.Errorf("lifecycle: lock %s: %w", ref, err)
@@ -384,7 +384,7 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 			e.log.Error("could not mark project INIT_FAILED", "ref", ref, "error", err)
 		}
 		e.event(cctx, ref, "project.init_failed", map[string]string{"stage": stage, "error": cause.Error()})
-		return nil, fmt.Errorf("lifecycle: create %s failed at %s (project left INIT_FAILED, nothing running; remove it with `sbctl projects delete %s --skip-final-backup`): %w", ref, stage, ref, cause)
+		return nil, fmt.Errorf("lifecycle: create %s failed at %s (project left INIT_FAILED, nothing running; remove it with `supavise projects delete %s --skip-final-backup`): %w", ref, stage, ref, cause)
 	}
 	if err := e.storeKeys(ctx, ref, keys); err != nil {
 		return fail("store secrets", err)
@@ -779,7 +779,7 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 }
 
 // StartActive starts every project the registry lists as ACTIVE (after a reboot, or
-// after `sbctl system stop`), one at a time, and returns the errors by ref. A project
+// after `supavise system stop`), one at a time, and returns the errors by ref. A project
 // that fails to start is marked ACTIVE_UNHEALTHY; paused projects are left alone.
 func (e *Engine) StartActive(ctx context.Context) map[string]error {
 	errs := map[string]error{}
@@ -806,7 +806,7 @@ func (e *Engine) startOne(ctx context.Context, listed *registry.Project) error {
 		return err
 	}
 	defer unlock()
-	// StartActive listed the projects before this lock, and sbctl serve runs it next to the
+	// StartActive listed the projects before this lock, and supavise serve runs it next to the
 	// API: a pause or delete that landed in between must not be undone (the units started
 	// again, the backup timer running, while the registry says INACTIVE). Decide on the row
 	// as it is now.
@@ -953,7 +953,7 @@ const StatusDeleted registry.Status = "DELETED"
 //     say so), the removal is finished now with no second backup. If the backup was cut
 //     off, the project returns to the status it had and is kept (a paused project's
 //     database is stopped again). A delete from a version that recorded no events is only
-//     logged: run `sbctl projects delete <ref> --skip-final-backup` if its data is gone.
+//     logged: run `supavise projects delete <ref> --skip-final-backup` if its data is gone.
 //
 //   - A restart (the API's pause then resume) cut after the pause is recorded as an
 //     intent; the project is INACTIVE and Recovered.Resume is set, so ResumeRecovered
@@ -994,7 +994,7 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 			dp := e.deleteProgress(ctx, p.Ref)
 			switch {
 			case !dp.known:
-				e.log.Warn("recover: project is GOING_DOWN from an interrupted delete that left no record; run `sbctl projects delete "+p.Ref+"` again, with --skip-final-backup if its data is already gone", "ref", p.Ref)
+				e.log.Warn("recover: project is GOING_DOWN from an interrupted delete that left no record; run `supavise projects delete "+p.Ref+"` again, with --skip-final-backup if its data is already gone", "ref", p.Ref)
 				continue
 			case dp.backupDone:
 				finishDelete = append(finishDelete, p.Ref)
@@ -1031,7 +1031,7 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 		err := e.Delete(dctx, ref)
 		cancel()
 		if err != nil {
-			e.log.Error("recover: could not finish an interrupted delete; run `sbctl projects delete "+ref+"` again", "ref", ref, "error", err)
+			e.log.Error("recover: could not finish an interrupted delete; run `supavise projects delete "+ref+"` again", "ref", ref, "error", err)
 			continue
 		}
 		e.log.Warn("finished a delete the daemon had interrupted", "ref", ref)

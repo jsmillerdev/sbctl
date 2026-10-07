@@ -88,13 +88,13 @@ func (s *PGClaimStore) CreateClaimToken(ctx context.Context, kind string, hash [
 				inv = invitationID
 			}
 		}
-		if _, err := tx.Exec(ctx, `delete from sbctl.claim_tokens where kind = $1 and used_at is null
+		if _, err := tx.Exec(ctx, `delete from supavise.claim_tokens where kind = $1 and used_at is null
 			and email is not distinct from $2 and invitation_id is not distinct from $3::bigint`, kind, mail, inv); err != nil {
 			return err
 		}
 		var err error
 		out, err = scanClaim(tx.QueryRow(ctx,
-			`insert into sbctl.claim_tokens (kind, token_hash, email, invitation_id, expires_at) values ($1, $2, $3, $4, $5) returning `+claimCols,
+			`insert into supavise.claim_tokens (kind, token_hash, email, invitation_id, expires_at) values ($1, $2, $3, $4, $5) returning `+claimCols,
 			kind, hash, mail, inv, expiresAt))
 		return err
 	})
@@ -103,54 +103,54 @@ func (s *PGClaimStore) CreateClaimToken(ctx context.Context, kind string, hash [
 
 func (s *PGClaimStore) LookupClaimToken(ctx context.Context, hash []byte, now time.Time) (*ClaimToken, error) {
 	return scanClaim(s.pool.QueryRow(ctx,
-		`select `+claimCols+` from sbctl.claim_tokens where token_hash = $1 and used_at is null and expires_at > $2`, hash, now))
+		`select `+claimCols+` from supavise.claim_tokens where token_hash = $1 and used_at is null and expires_at > $2`, hash, now))
 }
 
 func (s *PGClaimStore) ConsumeClaimToken(ctx context.Context, hash []byte, now time.Time, usedBy string) (*ClaimToken, error) {
 	return scanClaim(s.pool.QueryRow(ctx,
-		`update sbctl.claim_tokens set used_at = $2, used_by = $3
+		`update supavise.claim_tokens set used_at = $2, used_by = $3
 		  where token_hash = $1 and used_at is null and expires_at > $2 returning `+claimCols, hash, now, usedBy))
 }
 
 func (s *PGClaimStore) ReleaseClaimToken(ctx context.Context, id int64) error {
-	_, err := s.pool.Exec(ctx, `update sbctl.claim_tokens set used_at = null, used_by = null where id = $1`, id)
+	_, err := s.pool.Exec(ctx, `update supavise.claim_tokens set used_at = null, used_by = null where id = $1`, id)
 	return err
 }
 
 func (s *PGClaimStore) Claimed(ctx context.Context) (bool, error) {
 	var ok bool
-	err := s.pool.QueryRow(ctx, `select exists (select 1 from sbctl.claim_tokens where kind = 'claim' and used_at is not null)`).Scan(&ok)
+	err := s.pool.QueryRow(ctx, `select exists (select 1 from supavise.claim_tokens where kind = 'claim' and used_at is not null)`).Scan(&ok)
 	return ok, err
 }
 
 func (s *PGClaimStore) HasLiveClaimToken(ctx context.Context, kind string, now time.Time) (bool, error) {
 	var ok bool
-	err := s.pool.QueryRow(ctx, `select exists (select 1 from sbctl.claim_tokens where kind = $1 and used_at is null and expires_at > $2)`, kind, now).Scan(&ok)
+	err := s.pool.QueryRow(ctx, `select exists (select 1 from supavise.claim_tokens where kind = $1 and used_at is null and expires_at > $2)`, kind, now).Scan(&ok)
 	return ok, err
 }
 
 func (s *PGClaimStore) MarkUserRemoved(ctx context.Context, userID, email string) error {
-	_, err := s.pool.Exec(ctx, `insert into sbctl.removed_users (user_id, email) values ($1, $2) on conflict (user_id) do nothing`, userID, email)
+	_, err := s.pool.Exec(ctx, `insert into supavise.removed_users (user_id, email) values ($1, $2) on conflict (user_id) do nothing`, userID, email)
 	return err
 }
 
 func (s *PGClaimStore) UserRemoved(ctx context.Context, userID string) (bool, error) {
 	var ok bool
-	err := s.pool.QueryRow(ctx, `select exists (select 1 from sbctl.removed_users where user_id = $1)`, userID).Scan(&ok)
+	err := s.pool.QueryRow(ctx, `select exists (select 1 from supavise.removed_users where user_id = $1)`, userID).Scan(&ok)
 	return ok, err
 }
 
 func (s *PGClaimStore) CreateSignupGrant(ctx context.Context, email string, hash []byte, expiresAt time.Time) error {
-	_, err := s.pool.Exec(ctx, `insert into sbctl.signup_grants (token_hash, email, expires_at) values ($1, lower($2), $3)
+	_, err := s.pool.Exec(ctx, `insert into supavise.signup_grants (token_hash, email, expires_at) values ($1, lower($2), $3)
 		on conflict (token_hash) do nothing`, hash, email, expiresAt)
 	return err
 }
 
 func (s *PGClaimStore) ConsumeSignupGrant(ctx context.Context, email string, hash []byte, now time.Time) (bool, error) {
-	if _, err := s.pool.Exec(ctx, `delete from sbctl.signup_grants where expires_at <= $1`, now); err != nil {
+	if _, err := s.pool.Exec(ctx, `delete from supavise.signup_grants where expires_at <= $1`, now); err != nil {
 		return false, err
 	}
-	tag, err := s.pool.Exec(ctx, `delete from sbctl.signup_grants where token_hash = $1 and email = lower($2) and expires_at > $3`, hash, email, now)
+	tag, err := s.pool.Exec(ctx, `delete from supavise.signup_grants where token_hash = $1 and email = lower($2) and expires_at > $3`, hash, email, now)
 	if err != nil {
 		return false, err
 	}

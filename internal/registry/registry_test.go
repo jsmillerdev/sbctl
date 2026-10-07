@@ -15,12 +15,12 @@ import (
 // TestMemory runs the shared conformance checks against the in-memory registry.
 func TestMemory(t *testing.T) { testRegistry(t, NewMemory()) }
 
-// TestPostgres runs them against a real database when SBCTL_TEST_DATABASE_URL points
-// at an empty database (it creates schema sbctl).
+// TestPostgres runs them against a real database when SUPAVISE_TEST_DATABASE_URL points
+// at an empty database (it creates schema supavise).
 func TestPostgres(t *testing.T) {
-	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	r, err := Open(ctx, dsn)
@@ -28,7 +28,7 @@ func TestPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if _, err := r.Pool().Exec(ctx, `truncate sbctl.projects, sbctl.organizations, sbctl.access_tokens, sbctl.backups, sbctl.events cascade`); err != nil {
+	if _, err := r.Pool().Exec(ctx, `truncate supavise.projects, supavise.organizations, supavise.access_tokens, supavise.backups, supavise.events cascade`); err != nil {
 		t.Fatal(err)
 	}
 	if err := Migrate(ctx, r.Pool()); err != nil { // idempotent
@@ -293,12 +293,12 @@ func tempDatabase(t *testing.T, dsn, prefix string) string {
 // organization and dashboard users the way a node from before roles has them, then applies
 // 0900: every known user must be Owner of every organization and be marked as checked.
 func TestMembersMigrationKeepsExistingUsersOwners(t *testing.T) {
-	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, tempDatabase(t, dsn, "sbctl_mig"))
+	pool, err := pgxpool.New(ctx, tempDatabase(t, dsn, "supavise_mig"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,8 +307,8 @@ func TestMembersMigrationKeepsExistingUsersOwners(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, q := range []string{
-		`insert into sbctl.organizations (slug, name) values ('one', 'One'), ('two', 'Two')`,
-		`insert into sbctl.api_users (user_id, email) values ('11111111-1111-4111-8111-111111111111', 'a@example.test'), ('22222222-2222-4222-8222-222222222222', 'b@example.test')`,
+		`insert into supavise.organizations (slug, name) values ('one', 'One'), ('two', 'Two')`,
+		`insert into supavise.api_users (user_id, email) values ('11111111-1111-4111-8111-111111111111', 'a@example.test'), ('22222222-2222-4222-8222-222222222222', 'b@example.test')`,
 	} {
 		if _, err := pool.Exec(ctx, q); err != nil {
 			t.Fatal(err)
@@ -319,11 +319,11 @@ func TestMembersMigrationKeepsExistingUsersOwners(t *testing.T) {
 	}
 	var owners, checked int
 	var cutoff time.Time
-	if err := pool.QueryRow(ctx, `select count(*) from sbctl.org_members where role_id = 1`).Scan(&owners); err != nil {
+	if err := pool.QueryRow(ctx, `select count(*) from supavise.org_members where role_id = 1`).Scan(&owners); err != nil {
 		t.Fatal(err)
 	}
-	_ = pool.QueryRow(ctx, `select count(*) from sbctl.member_legacy_checked`).Scan(&checked)
-	_ = pool.QueryRow(ctx, `select at from sbctl.member_meta where key = 'legacy_cutoff'`).Scan(&cutoff)
+	_ = pool.QueryRow(ctx, `select count(*) from supavise.member_legacy_checked`).Scan(&checked)
+	_ = pool.QueryRow(ctx, `select at from supavise.member_meta where key = 'legacy_cutoff'`).Scan(&cutoff)
 	if owners != 4 || checked != 2 || cutoff.IsZero() {
 		t.Fatalf("owners=%d (want 2 users x 2 orgs) checked=%d cutoff=%v", owners, checked, cutoff)
 	}
@@ -333,14 +333,14 @@ func TestMembersMigrationKeepsExistingUsersOwners(t *testing.T) {
 	}
 }
 
-// HasDashboardSSO follows the rows of sbctl.sso_providers.
+// HasDashboardSSO follows the rows of supavise.sso_providers.
 func TestPostgresHasDashboardSSO(t *testing.T) {
-	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
-	r, err := Open(ctx, tempDatabase(t, dsn, "sbctl_sso"))
+	r, err := Open(ctx, tempDatabase(t, dsn, "supavise_sso"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,14 +352,14 @@ func TestPostgresHasDashboardSSO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Pool().Exec(ctx, `insert into sbctl.sso_providers (id, org_id, entity_id) values ('a0000000-0000-4000-8000-000000000001', $1, 'e')`, org.ID); err != nil {
+	if _, err := r.Pool().Exec(ctx, `insert into supavise.sso_providers (id, org_id, entity_id) values ('a0000000-0000-4000-8000-000000000001', $1, 'e')`, org.ID); err != nil {
 		t.Fatal(err)
 	}
 	if ok, err := r.HasDashboardSSO(ctx); err != nil || !ok {
 		t.Fatalf("with a provider: %v %v", ok, err)
 	}
 	// The organization takes its providers and their users with it.
-	if _, err := r.Pool().Exec(ctx, `delete from sbctl.organizations where id = $1`, org.ID); err != nil {
+	if _, err := r.Pool().Exec(ctx, `delete from supavise.organizations where id = $1`, org.ID); err != nil {
 		t.Fatal(err)
 	}
 	if ok, _ := r.HasDashboardSSO(ctx); ok {

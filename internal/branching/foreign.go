@@ -27,22 +27,22 @@ import (
 //   - connection strings written as literals in the commands of pg_cron jobs are replaced by a
 //     disabled one (cron jobs may also be inactive: the jobs are neutralized either way).
 //
-// What was done is recorded in sbctl_branch.paused_foreign_servers: names, the host, port and
+// What was done is recorded in supavise_branch.paused_foreign_servers: names, the host, port and
 // plain database name the server had, and the roles whose mapping lost a password. The
 // passwords themselves are NOT recorded anywhere: they are credentials, and the branch's
 // owner, who can read the table, may be an untrusted agent. Turning a server back on means
 // setting its options again and re-entering the password in the user mapping. Original cron
 // commands are not recorded either (they may hold a password); the jobs whose command was
-// changed are listed in sbctl_branch.neutralized_cron_commands.
+// changed are listed in supavise_branch.neutralized_cron_commands.
 
 // disabledHost is a libpq host that cannot connect: a unix socket directory that does not exist.
-const disabledHost = "/nonexistent/sbctl-branch-disabled"
+const disabledHost = "/nonexistent/supavise-branch-disabled"
 
 // PausedForeignTable lists the foreign servers that were disabled for the branch.
-const PausedForeignTable = "sbctl_branch.paused_foreign_servers"
+const PausedForeignTable = "supavise_branch.paused_foreign_servers"
 
 // NeutralizedCronTable lists the pg_cron jobs whose command had a connection string replaced.
-const NeutralizedCronTable = "sbctl_branch.neutralized_cron_commands"
+const NeutralizedCronTable = "supavise_branch.neutralized_cron_commands"
 
 var passwordOptions = map[string]bool{"password": true, "sslpassword": true, "passwd": true}
 
@@ -219,7 +219,7 @@ func neutralizeForeign(ctx context.Context, c *pgx.Conn, res *IsolateResult) err
 		}
 		if !tableReady {
 			for _, stmt := range []string{
-				`create schema if not exists sbctl_branch`,
+				`create schema if not exists supavise_branch`,
 				`create table if not exists ` + PausedForeignTable + ` (
 					server_name text primary key,
 					fdw_name text not null,
@@ -319,7 +319,7 @@ func neutralizeCronCommands(ctx context.Context, c *pgx.Conn) (int, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	for _, stmt := range []string{
-		`create schema if not exists sbctl_branch`,
+		`create schema if not exists supavise_branch`,
 		`create table if not exists ` + NeutralizedCronTable + ` (
 			jobid bigint primary key,
 			jobname text,

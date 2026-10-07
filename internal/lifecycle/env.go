@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // scheme is the public URL scheme: https unless TLS is switched off (dev and tests).
@@ -139,7 +139,7 @@ func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, 
 		env["POSTGRES_PASSWORD"] = keys.AdminPassword
 	}
 	if pl.opts.ConfigPath != "" && !pl.cfg.WALRelayEnabled() {
-		env["SBCTL_CONFIG"] = pl.opts.ConfigPath
+		env["SUPAVISE_CONFIG"] = pl.opts.ConfigPath
 	}
 	return units.Spec{
 		Service:     config.SvcPostgres,
@@ -265,7 +265,7 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 	return append(specs, rest), nil
 }
 
-// systemSSOEnv is what turns on single sign-on in sb-gotrue@system: SAML with the node's own
+// systemSSOEnv is what turns on single sign-on in supavise-gotrue@system: SAML with the node's own
 // signing key, and a sign-up that is open to GoTrue but closed to everyone the hook does not
 // vouch for (see SystemAuth). GOTRUE_DISABLE_SIGNUP cannot stay on: it also stops the first
 // sign-in of an SSO user, whose account is created by that sign-in.

@@ -8,6 +8,7 @@
 set -uo pipefail
 DISK_GB=${JANITOR_DISK_GB:-10}
 AGE_MIN=${JANITOR_AGE_MIN:-30}
+# The lock, pid and cache paths keep their old names (/tmp/sbctl-guard.lock, ~/.cache/sbctl) because other checkouts on this machine still share them.
 LOG=${JANITOR_LOG:-$HOME/.cache/sbctl/janitor.log}
 CACHE=$(go env GOCACHE 2>/dev/null || echo "$HOME/Library/Caches/go-build")
 while true; do

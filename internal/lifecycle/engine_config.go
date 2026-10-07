@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // configPlane is what ApplyConfig needs of the data plane beyond Plane; PostgresPlane has it.

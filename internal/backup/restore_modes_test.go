@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // putHistory stores a timeline history file the way PushWAL does (zstd).

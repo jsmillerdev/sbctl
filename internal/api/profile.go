@@ -7,7 +7,7 @@ import (
 
 	"golang.org/x/net/publicsuffix"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // CLIProfile is the file the Supabase CLI reads with --profile (or
@@ -31,7 +31,7 @@ type CLIProfile struct {
 // NewCLIProfile derives the profile of this installation from its config.
 func NewCLIProfile(c *config.Config, name string) CLIProfile {
 	if name == "" {
-		name = "sbctl"
+		name = "supavise"
 	}
 	return CLIProfile{
 		Name: name, APIURL: c.APIURL(), DashboardURL: c.DashboardURL(),

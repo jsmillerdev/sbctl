@@ -16,17 +16,17 @@ func TestRelayPeerUnits(t *testing.T) {
 		name, cgroup, ref string
 		want              bool
 	}{
-		{"own postgres", "0::/system.slice/sb-postgres@" + a + ".service\n", a, true},
-		{"own postgres, sub-cgroup", "0::/system.slice/sb-postgres@" + a + ".service/postmaster\n", a, true},
-		{"other project's postgres", "0::/system.slice/sb-postgres@" + b + ".service\n", a, false},
-		{"gotrue of the same project", "0::/system.slice/sb-gotrue@" + a + ".service\n", a, false},
-		{"edge runtime", "0::/system.slice/sb-edge-runtime.service\n", a, false},
-		{"studio", "0::/system.slice/sb-studio.service\n", a, false},
-		{"daemon", "0::/system.slice/sbctl.service\n", a, true},
-		{"base backup", "0::/system.slice/system-sb\\x2dbasebackup.slice/sb-basebackup@" + b + ".service\n", a, true},
+		{"own postgres", "0::/system.slice/supavise-postgres@" + a + ".service\n", a, true},
+		{"own postgres, sub-cgroup", "0::/system.slice/supavise-postgres@" + a + ".service/postmaster\n", a, true},
+		{"other project's postgres", "0::/system.slice/supavise-postgres@" + b + ".service\n", a, false},
+		{"gotrue of the same project", "0::/system.slice/supavise-gotrue@" + a + ".service\n", a, false},
+		{"edge runtime", "0::/system.slice/supavise-edge-runtime.service\n", a, false},
+		{"studio", "0::/system.slice/supavise-studio.service\n", a, false},
+		{"daemon", "0::/system.slice/supavise.service\n", a, true},
+		{"base backup", "0::/system.slice/system-sb\\x2dbasebackup.slice/supavise-basebackup@" + b + ".service\n", a, true},
 		{"operator session", "0::/user.slice/user-1000.slice/session-3.scope\n", a, true},
 		{"no unit", "0::/\n", a, true},
-		{"cgroup v1", "12:cpu:/x\n1:name=systemd:/system.slice/sb-storage.service\n", a, false},
+		{"cgroup v1", "12:cpu:/x\n1:name=systemd:/system.slice/supavise-storage.service\n", a, false},
 	} {
 		unit, err := peerUnit(tc.cgroup)
 		if err != nil {

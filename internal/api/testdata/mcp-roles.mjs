@@ -47,7 +47,7 @@ async function call(name, args, want, check = () => true) {
 }
 
 try {
-  const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "sbctl-roles", version: "0" } });
+  const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "supavise-roles", version: "0" } });
   if (init.error) { console.error(JSON.stringify(init.error)); process.exit(1); }
   send({ jsonrpc: "2.0", method: "notifications/initialized" });
   const write = readOnly ? "refused" : "ok";

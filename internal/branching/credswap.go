@@ -9,7 +9,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // The data of a branch is a copy of the parent's, and the parent's credentials come with it where
@@ -32,19 +32,19 @@ import (
 // Management API, each mapped to the branch's default key of its type), the JWT secret, and the parent's six database
 // passwords. A value is rewritten when it contains one (a "Bearer <key>" header, a connection
 // string), not only when it equals one, except that a credential shorter than
-// minSubstringLen (none that sbctl generates) is matched whole.
+// minSubstringLen (none that supavise generates) is matched whole.
 //
 // Not detected: a credential in anything else, such as an arbitrary user table, a function body,
 // a trigger's arguments (a database webhook's headers), a foreign table option or a Storage
 // object, and a credential of the parent that is not one of those above (a third party's API key
 // is not the branch's to replace; with denied egress it cannot leave the node). What was
-// rewritten is recorded by name, never by value, in sbctl_branch.rewritten_credentials and in the
+// rewritten is recorded by name, never by value, in supavise_branch.rewritten_credentials and in the
 // branch.credentials_rewritten event.
 
 const minSubstringLen = 20
 
 // RewriteTable lists the credentials of the parent that were replaced in a database.
-const RewriteTable = "sbctl_branch.rewritten_credentials"
+const RewriteTable = "supavise_branch.rewritten_credentials"
 
 type keyPair struct{ label, old, new string }
 
@@ -413,7 +413,7 @@ func recordRewrites(ctx context.Context, c *pgx.Conn, items []RewrittenCredentia
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	for _, stmt := range []string{
-		`create schema if not exists sbctl_branch`,
+		`create schema if not exists supavise_branch`,
 		`create table if not exists ` + RewriteTable + ` (
 			kind text not null,
 			name text not null,

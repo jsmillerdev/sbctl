@@ -5,6 +5,6 @@
 --
 -- Tokens issued before this column existed stay unbound: they create the account and accept
 -- nothing.
-alter table sbctl.claim_tokens
-  add column invitation_id bigint references sbctl.org_invitations (id) on delete cascade;
-create index claim_tokens_invitation_idx on sbctl.claim_tokens (invitation_id) where invitation_id is not null;
+alter table supavise.claim_tokens
+  add column invitation_id bigint references supavise.org_invitations (id) on delete cascade;
+create index claim_tokens_invitation_idx on supavise.claim_tokens (invitation_id) where invitation_id is not null;

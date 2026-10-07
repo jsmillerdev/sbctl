@@ -1,5 +1,5 @@
 {
-  "name": "sbctl-conformance",
+  "name": "supavise-conformance",
   "private": true,
   "type": "module",
   "description": "supabase-js suites run against a node by tests/conformance/run.sh",

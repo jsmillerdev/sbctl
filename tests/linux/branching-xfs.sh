@@ -7,7 +7,7 @@
 #    it. A parent of about 1 GB is created, a with_data branch is cloned with FICLONE, and
 #    the clone time and the extra disk are reported (also in the job summary).
 # 2. ext4 (the runner's root): the same parent size, but the filesystem cannot clone files, so
-#    sbctl restores the parent's latest base backup plus WAL (internal/backup) and says so.
+#    supavise restores the parent's latest base backup plus WAL (internal/backup) and says so.
 #
 # Both runs also run the full branching scenario (schema-only and with_data branches,
 # isolation in both directions, merge, push, reset, delete, expiry), a clone of a parent under
@@ -37,7 +37,7 @@ work=$(mktemp -d)
 unpacked=$work/unpacked
 mkdir -p "$unpacked"
 cleanup() {
-  mountpoint -q /mnt/sbctl-xfs 2>/dev/null && sudo umount /mnt/sbctl-xfs || true
+  mountpoint -q /mnt/supavise-xfs 2>/dev/null && sudo umount /mnt/supavise-xfs || true
   sudo losetup -j "$work/xfs.img" 2>/dev/null | cut -d: -f1 | xargs -r sudo losetup -d || true
   rm -rf "$work"
 }
@@ -61,7 +61,7 @@ fetch() { # fetch <artifact> : unpack the pinned release into $unpacked/<tag>-<p
 for a in postgres auth postgrest; do fetch "$a"; done
 ls "$unpacked"
 
-# Build the test binary once; both runs use it. The sbctl binary the tests build for
+# Build the test binary once; both runs use it. The supavise binary the tests build for
 # archive_command is built by the tests themselves.
 CGO_ENABLED=0 go test -c -o "$work/branching.test" ./internal/branching
 
@@ -71,24 +71,24 @@ run() { # run <label> <state dir> <expected method>
   df -hT "$state" | tail -n 2
   # The package directory is the working directory of a test run.
   (cd internal/branching && \
-    SBCTL_TEST_UNPACKED="$unpacked" SBCTL_TEST_STATE_DIR="$state" SBCTL_TEST_EXPECT_METHOD="$expect" \
-    SBCTL_TEST_PARENT_MB="$PARENT_MB" SBCTL_TEST_LABEL="$label" \
+    SUPAVISE_TEST_UNPACKED="$unpacked" SUPAVISE_TEST_STATE_DIR="$state" SUPAVISE_TEST_EXPECT_METHOD="$expect" \
+    SUPAVISE_TEST_PARENT_MB="$PARENT_MB" SUPAVISE_TEST_LABEL="$label" \
     "$work/branching.test" -test.run '^(TestIntegrationBranching|TestIntegrationCloneSize|TestIntegrationCloneUnderWriteLoad|TestIntegrationCloneIsolatesTheParentsIntegrations|TestIntegrationCloneNeutralizesForeignServersAndParentCredentials|TestIntegrationApplyRefusesAVersionAlreadyApplied)$' -test.v -test.timeout 35m)
 }
 
 # 1. XFS with reflink.
 sudo apt-get install -y --no-install-recommends xfsprogs >/dev/null
-sudo mkdir -p /mnt/sbctl-xfs
+sudo mkdir -p /mnt/supavise-xfs
 truncate -s 8G "$work/xfs.img"
 loop=$(sudo losetup --find --show "$work/xfs.img")
 sudo mkfs.xfs -q -m reflink=1 "$loop"
-sudo mount "$loop" /mnt/sbctl-xfs
-sudo chown "$(id -u):$(id -g)" /mnt/sbctl-xfs
-xfs_info /mnt/sbctl-xfs | grep -o 'reflink=[01]'
-run "XFS (reflink=1) on a loop file" /mnt/sbctl-xfs reflink
+sudo mount "$loop" /mnt/supavise-xfs
+sudo chown "$(id -u):$(id -g)" /mnt/supavise-xfs
+xfs_info /mnt/supavise-xfs | grep -o 'reflink=[01]'
+run "XFS (reflink=1) on a loop file" /mnt/supavise-xfs reflink
 
 # 2. ext4 on the runner's root (no file cloning).
-ext4=/var/tmp/sbctl-ext4
+ext4=/var/tmp/supavise-ext4
 sudo mkdir -p "$ext4"
 sudo chown "$(id -u):$(id -g)" "$ext4"
 findmnt -no FSTYPE -T "$ext4"

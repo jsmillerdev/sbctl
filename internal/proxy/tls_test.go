@@ -28,8 +28,8 @@ import (
 	hetzner "github.com/libdns/hetzner/v2"
 	"github.com/libdns/route53"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -113,7 +113,7 @@ func TestNewDNSProvider(t *testing.T) {
 		t.Errorf("cloudflare options: %+v", c)
 	}
 	for _, name := range []string{"cloudflare", "hetzner", "digitalocean"} {
-		if _, err := newDNSProvider(name, map[string]string{"api_token": "  "}); err == nil || !strings.Contains(err.Error(), "SBCTL_TLS_CREDENTIALS_API_TOKEN") {
+		if _, err := newDNSProvider(name, map[string]string{"api_token": "  "}); err == nil || !strings.Contains(err.Error(), "SUPAVISE_TLS_CREDENTIALS_API_TOKEN") {
 			t.Errorf("%s without a token: %v", name, err)
 		}
 	}
@@ -460,7 +460,7 @@ func selfSignedPEM(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	tpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "sbctl test root"},
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "supavise test root"},
 		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
 		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
 	}

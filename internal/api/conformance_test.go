@@ -67,7 +67,7 @@ func (f *fixture) run(t *testing.T, steps []step) {
 			if rec.Code != want {
 				t.Fatalf("status %d, want %d: %s", rec.Code, want, truncate(rec.Body.String(), 400))
 			}
-			if rec.Header().Get("X-Sbctl-Stub") != "" {
+			if rec.Header().Get("X-Supavise-Stub") != "" {
 				t.Errorf("%s is served by a stub but is expected to be implemented", st.key)
 			}
 			if rec.Body.Len() > 0 && rec.Code < 300 {
@@ -261,7 +261,7 @@ func TestStubsMatchSpec(t *testing.T) {
 			return "x1"
 		})
 		rec := f.do(op.Method, path, nil)
-		if rec.Header().Get("X-Sbctl-Stub") == "" {
+		if rec.Header().Get("X-Supavise-Stub") == "" {
 			continue // a more specific implemented route (or an ambiguous pair) answered
 		}
 		n++

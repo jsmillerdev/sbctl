@@ -84,9 +84,9 @@ supabase-js 2.117.3:
   code; a deleted function answers 404. This suite is also the regression gate for `serve`'s
   Functions wiring (the syncer loop, the Management API hook and the proxy route):
   `internal/app/serve_integration_test.go` only checks that the setting reaches the proxy, and
-  it skips in `ci.yml` without `SBCTL_TEST_UNPACKED`.
+  it skips in `ci.yml` without `SUPAVISE_TEST_UNPACKED`.
 
-Supabase CLI (`cli.sh`), through a profile file made by `sbctl api profile`:
+Supabase CLI (`cli.sh`), through a profile file made by `supavise api profile`:
 
 - `--version`, `init`, `projects list`, `link` (and the pooler URL it records), `projects api-keys`;
 - `migration new`, `migration list` (local only before the push, on both sides after),
@@ -101,10 +101,10 @@ Supabase CLI (`cli.sh`), through a profile file made by `sbctl api profile`:
 The CLI has no flag or environment variable for the Management API URL (`SUPABASE_API_URL` is
 ignored by commands). The supported way is a profile file: `--profile <file>` or
 `SUPABASE_PROFILE=<file>` with `name`, `api_url`, `dashboard_url`, `project_host` and
-`pooler_host` (`sbctl api profile --format yaml` prints it; `research/05` has the evidence).
+`pooler_host` (`supavise api profile --format yaml` prints it; `research/05` has the evidence).
 `pooler_host` must be the registrable domain of the pooler host, not the host: the CLI compares the
 effective TLD plus one of the pooler URL's host with it before it uses the pooler. This suite found
-`sbctl api profile` printing `pooler.<domain>`, which makes that comparison fail; the profile now
+`supavise api profile` printing `pooler.<domain>`, which makes that comparison fail; the profile now
 prints the registrable domain (`internal/api/profile.go`).
 
 ## Where hosted Supabase and this suite differ, on purpose

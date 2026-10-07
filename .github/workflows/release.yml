@@ -1,13 +1,13 @@
 name: release
 
-# On a tag v*: build sbctl for linux amd64 and arm64, build the Studio artifact, sign the
-# checksum list with the ed25519 key in the repository secret SBCTL_SIGNING_KEY and publish
+# On a tag v*: build supavise for linux amd64 and arm64, build the Studio artifact, sign the
+# checksum list with the ed25519 key in the repository secret SUPAVISE_SIGNING_KEY and publish
 # everything as a GitHub release. Nothing here runs unless someone pushes a tag.
 #
 # One-time setup (deploy/README.md, "Release signing"):
-#   openssl genpkey -algorithm ed25519 -out sbctl-signing.pem
-#   openssl pkey -in sbctl-signing.pem -pubout -out internal/selfupdate/release_key.pem   # commit this file
-#   gh secret set SBCTL_SIGNING_KEY --env release < sbctl-signing.pem                     # then delete the file
+#   openssl genpkey -algorithm ed25519 -out supavise-signing.pem
+#   openssl pkey -in supavise-signing.pem -pubout -out internal/selfupdate/release_key.pem   # commit this file
+#   gh secret set SUPAVISE_SIGNING_KEY --env release < supavise-signing.pem                     # then delete the file
 #
 # The key lives in an Environment, not in a repository secret: a repository secret is readable by
 # any workflow run that someone with write access starts from any branch, and this key is the
@@ -37,17 +37,17 @@ jobs:
           [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-suffix]"; exit 1; }
       - name: the release key is committed and the secret is its private half
         env:
-          SBCTL_SIGNING_KEY: ${{ secrets.SBCTL_SIGNING_KEY }}
+          SUPAVISE_SIGNING_KEY: ${{ secrets.SUPAVISE_SIGNING_KEY }}
         run: |
           openssl pkey -pubin -in internal/selfupdate/release_key.pem -noout 2>/dev/null \
             || { echo "internal/selfupdate/release_key.pem is not a public key: see deploy/README.md, Release signing"; exit 1; }
-          [[ -n "$SBCTL_SIGNING_KEY" ]] || { echo "the secret SBCTL_SIGNING_KEY of the Environment release is not set: see deploy/README.md, Release signing"; exit 1; }
+          [[ -n "$SUPAVISE_SIGNING_KEY" ]] || { echo "the secret SUPAVISE_SIGNING_KEY of the Environment release is not set: see deploy/README.md, Release signing"; exit 1; }
           umask 077
-          printf '%s\n' "$SBCTL_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
+          printf '%s\n' "$SUPAVISE_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
           a=$(openssl pkey -in "$RUNNER_TEMP/sign.pem" -pubout -outform DER | openssl dgst -sha256)
           b=$(openssl pkey -pubin -in internal/selfupdate/release_key.pem -pubout -outform DER | openssl dgst -sha256)
           rm -f "$RUNNER_TEMP/sign.pem"
-          [[ "$a" == "$b" ]] || { echo "SBCTL_SIGNING_KEY does not match internal/selfupdate/release_key.pem"; exit 1; }
+          [[ "$a" == "$b" ]] || { echo "SUPAVISE_SIGNING_KEY does not match internal/selfupdate/release_key.pem"; exit 1; }
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -68,12 +68,12 @@ jobs:
           mkdir -p dist
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
-              -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "dist/sbctl-linux-$arch" ./cmd/sbctl
+              -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "dist/supavise-linux-$arch" ./cmd/supavise
           done
           ls -l dist
       - uses: actions/upload-artifact@v4
         with:
-          name: sbctl-binaries
+          name: supavise-binaries
           path: dist/
           if-no-files-found: error
 
@@ -96,7 +96,7 @@ jobs:
         with:
           node-version: 22
       - name: prepare runner
-        run: sudo env SBCTL_CI=1 studio/ci-prepare.sh   # sudo drops GITHUB_ACTIONS from the environment
+        run: sudo env SUPAVISE_CI=1 studio/ci-prepare.sh   # sudo drops GITHUB_ACTIONS from the environment
       - name: build
         run: studio/build.sh ${{ matrix.platform }}
       - uses: actions/upload-artifact@v4
@@ -120,21 +120,21 @@ jobs:
       - name: collect
         run: |
           mkdir -p dist
-          find parts -type f \( -name 'sbctl-linux-*' -o -name 'sbctl-studio-*.tar.zst' \) -exec cp {} dist/ \;
+          find parts -type f \( -name 'supavise-linux-*' -o -name 'supavise-studio-*.tar.zst' \) -exec cp {} dist/ \;
           ls -l dist
       - name: sign and stamp (deploy/release-assets.sh)
         env:
-          SBCTL_SIGNING_KEY: ${{ secrets.SBCTL_SIGNING_KEY }}
-          # The template of this release names this tag as its default sbctl release.
-          SBCTL_RELEASE_TAG: ${{ github.ref_name }}
+          SUPAVISE_SIGNING_KEY: ${{ secrets.SUPAVISE_SIGNING_KEY }}
+          # The template of this release names this tag as its default supavise release.
+          SUPAVISE_RELEASE_TAG: ${{ github.ref_name }}
         run: |
           umask 077
-          printf '%s\n' "$SBCTL_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
+          printf '%s\n' "$SUPAVISE_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
           deploy/release-assets.sh dist "$RUNNER_TEMP/sign.pem" internal/selfupdate/release_key.pem
           shred -u "$RUNNER_TEMP/sign.pem" || rm -f "$RUNNER_TEMP/sign.pem"
           ls -l dist
           # The install path for AWS users: the template (console upload) and the deploy script.
-          for f in sbctl.yaml sbctl-aws-deploy.sh; do [[ -s "dist/$f" ]] || { echo "dist/$f is missing"; exit 1; }; done
+          for f in supavise.yaml supavise-aws-deploy.sh; do [[ -s "dist/$f" ]] || { echo "dist/$f is missing"; exit 1; }; done
       - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -150,7 +150,7 @@ jobs:
   # Optional: copy the release's CloudFormation template to a public S3 object, so the "Launch
   # Stack" link of deploy/README.md works, and print that link. It runs only when the repository
   # variables AWS_TEMPLATE_BUCKET and AWS_RELEASE_ROLE_ARN exist; without them the job is skipped
-  # and the release is complete (the template and sbctl-aws-deploy.sh are attached to it either
+  # and the release is complete (the template and supavise-aws-deploy.sh are attached to it either
   # way). AWS_RELEASE_ROLE_ARN is an IAM role that trusts this repository's GitHub OIDC token for
   # the Environment "release" and may only s3:PutObject under templates/ of the bucket; the bucket
   # allows public reads of templates/ (CloudFormation fetches the template anonymously). The
@@ -174,17 +174,17 @@ jobs:
       - name: download the template that the release carries
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern sbctl.yaml --dir "$RUNNER_TEMP/t"
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern supavise.yaml --dir "$RUNNER_TEMP/t"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_RELEASE_ROLE_ARN }}
           aws-region: ${{ env.REGION }}
       - name: upload and print the Launch Stack link
         run: |
-          src="$RUNNER_TEMP/t/sbctl.yaml"
-          keys=("templates/sbctl-$GITHUB_REF_NAME.yaml")
-          # sbctl-latest.yaml is what the README button names: only stable releases move it.
-          [[ "$GITHUB_REF_NAME" == *-* ]] || keys+=("templates/sbctl-latest.yaml")
+          src="$RUNNER_TEMP/t/supavise.yaml"
+          keys=("templates/supavise-$GITHUB_REF_NAME.yaml")
+          # supavise-latest.yaml is what the README button names: only stable releases move it.
+          [[ "$GITHUB_REF_NAME" == *-* ]] || keys+=("templates/supavise-latest.yaml")
           for key in "${keys[@]}"; do
             aws s3 cp "$src" "s3://$BUCKET/$key" --content-type application/x-yaml --cache-control 'max-age=300'
             url="https://$BUCKET.s3.$REGION.amazonaws.com/$key"
@@ -193,7 +193,7 @@ jobs:
               || { echo "::error::$url is not publicly readable: see deploy/README.md, Launch Stack button (bucket policy)"; exit 1; }
             cmp "$src" "$RUNNER_TEMP/t/check.yaml" || { echo "::error::the public object differs from the release's template"; exit 1; }
             enc=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$url")
-            launch="https://$REGION.console.aws.amazon.com/cloudformation/home?region=$REGION#/stacks/create/review?templateURL=$enc&stackName=sbctl"
+            launch="https://$REGION.console.aws.amazon.com/cloudformation/home?region=$REGION#/stacks/create/review?templateURL=$enc&stackName=supavise"
             echo "Launch Stack ($key): $launch"
             {
               echo "### Launch Stack: \`$key\`"

@@ -6,7 +6,7 @@
 #
 # The build context is the repository root; studio/Dockerfile.build.dockerignore keeps local build
 # state (studio/.build-cache, studio/dist, node_modules) out of it. The output directory receives
-# sbctl-studio-<tag>-p<N>-linux-<arch>.tar.zst and SHA256SUMS. The build needs about 8 GB of RAM
+# supavise-studio-<tag>-p<N>-linux-<arch>.tar.zst and SHA256SUMS. The build needs about 8 GB of RAM
 # (give the Docker VM 10 GB or more) and 9 GB of disk. build.sh limits the Next build to one worker
 # and a 4 GB V8 heap per node process whatever the CPU count (STUDIO_BUILD_WORKERS, STUDIO_BUILD_HEAP_MB).
 # ubuntu:24.04 (multi-arch index covering amd64 and arm64), pinned by digest; bump it on purpose.
@@ -18,7 +18,7 @@ RUN apt-get update -qq && \
       ca-certificates curl git python3 build-essential zstd xz-utils procps && \
     rm -rf /var/lib/apt/lists/*
 
-WORKDIR /sbctl
+WORKDIR /supavise
 COPY versions.yaml LICENSE ./
 COPY studio ./studio
 

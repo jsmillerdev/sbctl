@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Walks a browser through SAML single sign-on against a GoTrue behind sbctl's proxy.
+"""Walks a browser through SAML single sign-on against a GoTrue behind supavise's proxy.
 
-    saml_walk.py --api-base http://127.0.0.1 --api-host api.sbctl.test --email alice@acme.test \
+    saml_walk.py --api-base http://127.0.0.1 --api-host api.supavise.test --email alice@acme.test \
                  --user alice --password alicepass [--apikey KEY] [--redirect-to URL]
 
 What a browser does when somebody clicks "Continue with SSO" (Studio, or supabase-js for a

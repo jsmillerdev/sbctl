@@ -11,24 +11,24 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
-// newPGEnv returns an env over a throwaway database next to the one SBCTL_TEST_DATABASE_URL
+// newPGEnv returns an env over a throwaway database next to the one SUPAVISE_TEST_DATABASE_URL
 // names (CI provides one): other packages' tests truncate the registry tables of the shared
 // database, so this one gets its own. The registry migrations run as in production.
 func newPGEnv(t *testing.T) *env {
 	t.Helper()
-	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	name := fmt.Sprintf("sbctl_members_%d_%d", os.Getpid(), time.Now().UnixNano()%1e9)
+	name := fmt.Sprintf("supavise_members_%d_%d", os.Getpid(), time.Now().UnixNano()%1e9)
 	if _, err := admin.Exec(ctx, `create database `+name); err != nil {
 		admin.Close()
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func newPGEnv(t *testing.T) *env {
 	e.svc = &Service{Store: NewPG(reg.Pool()), Now: func() time.Time { return *e.now },
 		Orgs: func(context.Context) ([]OrgRef, error) { return []OrgRef{e.a, e.b}, nil }}
 	e.setCutoff = func(c time.Time) {
-		if _, err := reg.Pool().Exec(ctx, `update sbctl.member_meta set at = $1 where key = 'legacy_cutoff'`, c); err != nil {
+		if _, err := reg.Pool().Exec(ctx, `update supavise.member_meta set at = $1 where key = 'legacy_cutoff'`, c); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -97,14 +97,14 @@ func TestProjectDeletionDropsScopedRoles(t *testing.T) {
 		t.Fatal(err)
 	}
 	pg := e.svc.Store.(*PG)
-	if _, err := pg.pool.Exec(ctx, `delete from sbctl.projects where ref = $1`, e.refs[0]); err != nil {
+	if _, err := pg.pool.Exec(ctx, `delete from supavise.projects where ref = $1`, e.refs[0]); err != nil {
 		t.Fatal(err)
 	}
 	rs, _ := e.svc.Store.ProjectRolesOf(ctx, u)
 	if len(rs) != 1 || len(rs[0].Refs) != 1 || rs[0].Refs[0] != e.refs[1] {
 		t.Fatalf("roles after deleting a project: %+v", rs)
 	}
-	if _, err := pg.pool.Exec(ctx, `delete from sbctl.projects where ref = $1`, e.refs[1]); err != nil {
+	if _, err := pg.pool.Exec(ctx, `delete from supavise.projects where ref = $1`, e.refs[1]); err != nil {
 		t.Fatal(err)
 	}
 	if rs, _ := e.svc.Store.ProjectRolesOf(ctx, u); len(rs) != 0 {

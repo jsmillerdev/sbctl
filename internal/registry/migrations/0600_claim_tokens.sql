@@ -4,7 +4,7 @@
 -- user for a fixed email address. Only the SHA-256 of a token is stored, a token works once
 -- (used_at) and expires (expires_at). Types follow the supabase-postgres-best-practices
 -- skill: text, timestamptz, identity keys, an index on every lookup column.
-create table sbctl.claim_tokens (
+create table supavise.claim_tokens (
   id         bigint generated always as identity primary key,
   kind       text not null check (kind in ('claim', 'invite')),
   token_hash bytea not null unique,
@@ -19,4 +19,4 @@ create table sbctl.claim_tokens (
 );
 -- Issuing a token revokes the unused ones of its kind (and address); redeeming looks the
 -- hash up through the unique index.
-create index claim_tokens_unused_idx on sbctl.claim_tokens (kind, email) where used_at is null;
+create index claim_tokens_unused_idx on supavise.claim_tokens (kind, email) where used_at is null;

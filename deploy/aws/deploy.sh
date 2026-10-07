@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# One-command deploy of an sbctl node to AWS with the CloudFormation template.
+# One-command deploy of a Supavise node to AWS with the CloudFormation template.
 #
 #   deploy.sh --region us-east-1 --email you@example.com
 #   deploy.sh --region us-east-1 --email you@example.com --domain example.com --hosted-zone-id Z0123456789ABCDEFGHIJ
-#   deploy.sh --region us-east-1 --stack-name sbctl --delete
+#   deploy.sh --region us-east-1 --stack-name supavise --delete
 #
 # Needs the AWS CLI (v2) with credentials that may create CloudFormation, EC2, IAM, S3, Route 53
 # and Secrets Manager resources. --dry-run prints every aws command it would run and runs none.
 # Runs on bash 3.2 (macOS) and later.
 #
-# Where the template comes from: --template FILE, else sbctl.yaml next to this script (a release
-# download), else ../cloudformation/sbctl.yaml (a checkout), else the release asset of the version.
+# Where the template comes from: --template FILE, else supavise.yaml next to this script (a release
+# download), else ../cloudformation/supavise.yaml (a checkout), else the release asset of the version.
 set -euo pipefail
 
-NAME=sbctl
-REPO=jsmillerdev/sbctl
+NAME=supavise
+REPO=jsmillerdev/supavise
 SELF=$(basename "$0")
 
 usage() {
@@ -291,23 +291,23 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CLEANUP=""
 trap '[[ -z $CLEANUP ]] || rm -rf "$CLEANUP"' EXIT
 if [[ -z $TEMPLATE ]]; then
-  if [[ -f $here/sbctl.yaml ]]; then
-    TEMPLATE=$here/sbctl.yaml
-  elif [[ -f $here/../cloudformation/sbctl.yaml ]]; then
-    TEMPLATE=$here/../cloudformation/sbctl.yaml
+  if [[ -f $here/supavise.yaml ]]; then
+    TEMPLATE=$here/supavise.yaml
+  elif [[ -f $here/../cloudformation/supavise.yaml ]]; then
+    TEMPLATE=$here/../cloudformation/supavise.yaml
   else
     if [[ -z $VERSION || $VERSION == latest ]]; then
-      url=https://github.com/$REPO/releases/latest/download/sbctl.yaml
+      url=https://github.com/$REPO/releases/latest/download/supavise.yaml
     else
-      url=https://github.com/$REPO/releases/download/$VERSION/sbctl.yaml
+      url=https://github.com/$REPO/releases/download/$VERSION/supavise.yaml
     fi
     if [[ $DRY -eq 1 ]]; then
-      TEMPLATE=${TMPDIR:-/tmp}/sbctl.yaml
+      TEMPLATE=${TMPDIR:-/tmp}/supavise.yaml
       note "no template next to this script: download it from the release"
       show curl -fsSL -o "$TEMPLATE" "$url"
     else
       CLEANUP=$(mktemp -d)
-      TEMPLATE=$CLEANUP/sbctl.yaml
+      TEMPLATE=$CLEANUP/supavise.yaml
       say "Downloading $url"
       curl -fsSL -o "$TEMPLATE" "$url" || fail "cannot download the template; pass --template FILE"
     fi
@@ -357,7 +357,7 @@ params=("AdminEmail=$EMAIL" "AmiId=$AMI")
 [[ -z $ITYPE ]] || params+=("InstanceType=$ITYPE")
 [[ -z $VOLSIZE ]] || params+=("DataVolumeSize=$VOLSIZE")
 [[ -z $SNAPS ]] || params+=("DailySnapshotsKept=$SNAPS")
-[[ -z $VERSION ]] || params+=("SbctlVersion=$VERSION")
+[[ -z $VERSION ]] || params+=("SupaviseVersion=$VERSION")
 [[ -z $DOMAIN ]] || params+=("DomainName=$DOMAIN")
 [[ -z $ZONE ]] || params+=("HostedZoneId=$ZONE")
 [[ -z $ACCESS ]] || params+=("AccessCidr=$ACCESS")

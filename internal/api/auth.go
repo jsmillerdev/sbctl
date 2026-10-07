@@ -11,9 +11,9 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // authKind says which credentials a route accepts.
@@ -42,12 +42,12 @@ const jwtSecretTTL = 30 * time.Second
 const jwtRefreshEvery = 5 * time.Second
 
 // AdminClaim is the app_metadata key that marks a dashboard user as allowed to use
-// the Management API. sbctl sets it (to true) on every user it creates in
-// sb-gotrue@system, and sb-gotrue@system creates no other users but the ones its
+// the Management API. supavise sets it (to true) on every user it creates in
+// supavise-gotrue@system, and supavise-gotrue@system creates no other users but the ones its
 // before-user-created hook allows (registered SSO providers, invited addresses; the daemon
 // answers it), so nobody else can obtain a session. The gate is defense in depth. A user whose
 // account came from SSO has no such claim and is admitted by DashboardSSO.Admit instead.
-const AdminClaim = "sbctl_admin"
+const AdminClaim = "supavise_admin"
 
 // touchEvery limits last_used_at writes per token.
 const touchEvery = time.Minute
@@ -59,7 +59,7 @@ type authenticator struct {
 	now   func() time.Time
 	// admins is the [api] admin_emails allowlist, lower-cased.
 	admins []string
-	// removed reports whether a dashboard user was removed with `sbctl users remove`
+	// removed reports whether a dashboard user was removed with `supavise users remove`
 	// (nil: nobody is). It is asked on every request, with no cache, so that a removal
 	// ends the user's sessions and tokens at once, whichever process made it.
 	removed func(ctx context.Context, userID string) (bool, error)
@@ -82,7 +82,7 @@ func newAuthenticator(reg registry.Registry, keys func(context.Context, string) 
 	return &authenticator{reg: reg, keys: keys, store: store, now: now, admins: admins, touchedAt: map[int64]time.Time{}, seenAt: map[string]time.Time{}}
 }
 
-// systemSecret returns the HS256 secret of sb-gotrue@system, cached briefly.
+// systemSecret returns the HS256 secret of supavise-gotrue@system, cached briefly.
 func (a *authenticator) systemSecret(ctx context.Context, fresh bool) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -199,7 +199,7 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 	// system project's secret and issued for the audience "authenticated". The role
 	// claim is not checked: users created through GoTrue's admin API have an empty
 	// auth.users.role, so their tokens carry role "" (research/08 section 9). The
-	// sbctl-minted system keys (role anon or service_role) have no audience and fail
+	// supavise-minted system keys (role anon or service_role) have no audience and fail
 	// here, API keys of projects are signed with other secrets, and anonymous sign-ins
 	// are not users.
 	if !hasAudience(claims["aud"], "authenticated") {
@@ -224,7 +224,7 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 	email, _ := claims["email"].(string)
 	sso := false
 	if prov := ssoProviderOf(claims); prov != "" {
-		// A user who signed in through an identity provider has no sbctl_admin claim: the
+		// A user who signed in through an identity provider has no supavise_admin claim: the
 		// provider being registered and the user belonging to an organization (or getting the
 		// default role of their email domain on this first request) is what admits them.
 		if a.sso == nil {
@@ -272,7 +272,7 @@ func (a *authenticator) isRemoved(ctx context.Context, userID string) (bool, err
 }
 
 // isAdmin reports whether a verified dashboard session may use the API: the user
-// carries app_metadata.sbctl_admin = true, or the email is on the [api]
+// carries app_metadata.supavise_admin = true, or the email is on the [api]
 // admin_emails allowlist. GoTrue lets users edit user_metadata but not app_metadata.
 func (a *authenticator) isAdmin(claims map[string]any, email string) bool {
 	if app, _ := claims["app_metadata"].(map[string]any); app != nil {

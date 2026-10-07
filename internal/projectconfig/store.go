@@ -11,7 +11,7 @@ import (
 // Service names the settings groups stored per project.
 type Service string
 
-// The services whose settings sbctl stores. The names are the values the
+// The services whose settings supavise stores. The names are the values the
 // project_settings.service column allows.
 const (
 	Auth      Service = "auth"

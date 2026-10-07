@@ -6,10 +6,10 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
 )
 
-// Password limits: the Management API's own check is strength, which sbctl cannot judge;
+// Password limits: the Management API's own check is strength, which supavise cannot judge;
 // a minimum length and a bound that keeps the SCRAM computation cheap are enforced.
 const (
 	minDBPassword = 8

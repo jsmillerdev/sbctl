@@ -13,7 +13,7 @@ import (
 )
 
 // storeContract is the behavior every Store must have. TestFileStore runs it
-// locally; the S3 tests (gated on SBCTL_TEST_S3_*) run the same function.
+// locally; the S3 tests (gated on SUPAVISE_TEST_S3_*) run the same function.
 func storeContract(t *testing.T, st Store) {
 	t.Helper()
 	ctx := context.Background()

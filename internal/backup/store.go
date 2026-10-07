@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // ErrNotFound is returned by Store.Get and Store.Stat for a missing key.

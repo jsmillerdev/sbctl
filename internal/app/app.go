@@ -1,7 +1,7 @@
 // Package app composes the merged pieces into one working product: it wires the backup
 // service into the lifecycle engine (and the engine into the backup service's restore),
 // the archive command and settings into every cluster the engine renders, and runs the
-// daemon (`sbctl serve`): Management API, edge proxy, project start at boot and
+// daemon (`supavise serve`): Management API, edge proxy, project start at boot and
 // graceful shutdown. The packages it joins cannot import each other (backup needs the
 // lifecycle Manager, lifecycle needs a base backuper), so the wiring lives here.
 package app
@@ -13,20 +13,20 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/api"
-	"github.com/OWNER/sbctl/internal/backup"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // Options are what the binary tells the composition about itself.
 type Options struct {
 	Log *slog.Logger
 	// ConfigPath is the config file this process loaded ("" when there is none). It is
-	// exported to every Postgres unit as SBCTL_CONFIG and put into archive_command and
+	// exported to every Postgres unit as SUPAVISE_CONFIG and put into archive_command and
 	// restore_command, so the children read the same backend settings.
 	ConfigPath string
 	// Version is recorded in backup manifests.
@@ -56,7 +56,7 @@ func (o Options) log() *slog.Logger {
 }
 
 // LifecycleOptions is lifecycle.OpenOptions with the backup package wired in: every
-// cluster archives WAL through `sbctl wal push` (backup.ArchiveCommandFor: through the
+// cluster archives WAL through `supavise wal push` (backup.ArchiveCommandFor: through the
 // daemon's relay socket on a systemd node, directly otherwise; and the
 // configured archive_timeout), deleting a project takes a final base backup through the
 // backup service, and a restore reaches the Engine. The backup service is built on first
@@ -100,10 +100,10 @@ func NewBackupService(ctx context.Context, cfg *config.Config, reg registry.Regi
 	})
 }
 
-// PGMetaCryptoKey is the passphrase shared with sb-pgmeta (its CRYPTO_KEY variable) and the
+// PGMetaCryptoKey is the passphrase shared with supavise-pgmeta (its CRYPTO_KEY variable) and the
 // Management API (the x-connection-encrypted header): [api] pgmeta_crypto_key when set,
 // else the random key kept sealed in the registry as the system secret pgmeta_crypto_key,
-// created on first use. Whoever renders the sb-pgmeta unit must pass exactly this value;
+// created on first use. Whoever renders the supavise-pgmeta unit must pass exactly this value;
 // a mismatch makes every pg-meta call fail.
 func PGMetaCryptoKey(ctx context.Context, cfg *config.Config, reg registry.Registry, sec secrets.Secrets) (string, error) {
 	if k := cfg.API.PGMetaCryptoKey; k != "" {

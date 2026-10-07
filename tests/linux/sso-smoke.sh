@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Single sign-on under real systemd units, against a real SAML 2.0 identity provider.
 #
-#   sudo env "PATH=$PATH" SBCTL_BIN=/path/to/sbctl-linux-amd64 [SUPABASE_CLI=/path/to/supabase] \
+#   sudo env "PATH=$PATH" SUPAVISE_BIN=/path/to/supavise-linux-amd64 [SUPABASE_CLI=/path/to/supabase] \
 #     tests/linux/sso-smoke.sh [--teardown]
 #
 # The identity provider is SimpleSAMLphp in a container (kristophjunge/test-saml-idp, which
@@ -9,11 +9,11 @@
 # (the dashboard's and one project's) as its known SPs. "A person" is tests/linux/sso/saml_walk.py:
 # what a browser does at "Continue with SSO", through the node's own proxy.
 #
-# - the dashboard: `sbctl sso add` registers the provider from its metadata URL; a person of the
+# - the dashboard: `supavise sso add` registers the provider from its metadata URL; a person of the
 #   allowed domain signs in and is a Developer (the domain's default role) and may do what a
 #   Developer may; a person the identity provider vouches for with an address of any other domain is
-#   refused on every route, listed by `sbctl sso pending` and let in by `sbctl sso approve`; a
-#   Developer removed with `sbctl users remove` who signs in again gets a new account that waits
+#   refused on every route, listed by `supavise sso pending` and let in by `supavise sso approve`; a
+#   Developer removed with `supavise users remove` who signs in again gets a new account that waits
 #   for approval (no default role the second time); a domain without a provider cannot start a sign-in; nobody can sign up any other way (GoTrue's
 #   sign-up is open and the daemon's hook refuses it); Studio's unit offers "Continue with SSO"
 #   only while a provider exists; removing the provider ends the session;
@@ -21,7 +21,7 @@
 #   then the real Supabase CLI adds, lists, shows, updates and removes an identity provider, and
 #   an end user of the project signs in through it.
 #
-# Without SBCTL_BIN the script builds sbctl with the go toolchain. It needs network access for
+# Without SUPAVISE_BIN the script builds supavise with the go toolchain. It needs network access for
 # the artifact downloads and the container image. Not run in development (root, systemd, docker
 # and Linux required); CI runs it on an ephemeral Ubuntu 24.04 VM.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -29,7 +29,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 TEARDOWN=0
 [[ ${1:-} == --teardown ]] && TEARDOWN=1
 WORK=$(mktemp -d)
-IDP_NAME=sbctl-saml-idp
+IDP_NAME=supavise-saml-idp
 P_IDP=8080
 P_STUDIO=13000
 ADMIN=http://127.0.0.1:7000
@@ -41,7 +41,7 @@ mkdir -p "$LOG_DIR"
 preflight
 install_binary
 setup_node
-cat >>"$SBCTL_CONF" <<CONF
+cat >>"$SUPAVISE_CONF" <<CONF
 
 [ports]
 studio = $P_STUDIO
@@ -49,21 +49,21 @@ CONF
 
 # Same VM-local workaround as settings-smoke.sh: the Postgres launcher writes into the artifact
 # directory on its first boot, which ProtectSystem=strict forbids.
-install -d /etc/systemd/system/sb-postgres@.service.d
-cat >/etc/systemd/system/sb-postgres@.service.d/10-sso-smoke.conf <<'CONF'
+install -d /etc/systemd/system/supavise-postgres@.service.d
+cat >/etc/systemd/system/supavise-postgres@.service.d/10-sso-smoke.conf <<'CONF'
 [Service]
-ReadWritePaths=/var/lib/sbctl/artifacts
+ReadWritePaths=/var/lib/supavise/artifacts
 CONF
 systemctl daemon-reload
 
 log "system init, one project"
 system_init
-wait_active sb-postgres@system.service 30
-wait_active sb-gotrue@system.service 30
+wait_active supavise-postgres@system.service 30
+wait_active supavise-gotrue@system.service 30
 REF=$(create_project shop micro)
 [[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
 log "the system GoTrue runs SAML with a sealed key and asks the daemon about every sign-up"
-ENVF="$SBCTL_STATE/projects/system/gotrue.env"
+ENVF="$SUPAVISE_STATE/projects/system/gotrue.env"
 for k in GOTRUE_SAML_ENABLED GOTRUE_SAML_PRIVATE_KEY GOTRUE_HOOK_BEFORE_USER_CREATED_ENABLED GOTRUE_HOOK_BEFORE_USER_CREATED_URI; do
   sudo grep -q "^$k=" "$ENVF" || fail "$ENVF has no $k"
 done
@@ -72,8 +72,8 @@ done
 # A stand-in for Studio: the unit is rendered like the real one (its environment decides whether
 # the sign-in page offers SSO) and answers the health check.
 STAG=$(awk '/^studio:/{f=1;next} f&&/^ *tag:/{print $2;exit}' "$REPO_ROOT/versions.yaml")
-SDIR="$SBCTL_STATE/artifacts/studio/$STAG"
-install -d -o "$SBCTL_USER" -g "$SBCTL_USER" "$SDIR/bin"
+SDIR="$SUPAVISE_STATE/artifacts/studio/$STAG"
+install -d -o "$SUPAVISE_USER" -g "$SUPAVISE_USER" "$SDIR/bin"
 cat >"$SDIR/bin/studio" <<'STUB'
 #!/bin/sh
 exec python3 -c "
@@ -85,19 +85,19 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(('127.0.0.1', int(os.environ['PORT'])), H).serve_forever()
 "
 STUB
-chmod 0755 "$SDIR/bin/studio"; chown "$SBCTL_USER:$SBCTL_USER" "$SDIR/bin/studio"
-sbctl fleet start --no-fetch --skip pgmeta,supavisor,realtime,storage || fail "fleet start (Studio only)"
-STUDIO_ENV="$SBCTL_STATE/projects/system/studio.env"
+chmod 0755 "$SDIR/bin/studio"; chown "$SUPAVISE_USER:$SUPAVISE_USER" "$SDIR/bin/studio"
+supavise fleet start --no-fetch --skip pgmeta,supavisor,realtime,storage || fail "fleet start (Studio only)"
+STUDIO_ENV="$SUPAVISE_STATE/projects/system/studio.env"
 sudo test -f "$STUDIO_ENV" || fail "no Studio environment at $STUDIO_ENV"
 ! sudo grep -q '^NEXT_PUBLIC_DISABLED_FEATURES=' "$STUDIO_ENV" || fail "Studio is configured before any provider exists"
 
-log "daemon: sbctl.service"
-systemctl start sbctl.service
+log "daemon: supavise.service"
+systemctl start supavise.service
 for ((i = 0; i < 60; i++)); do
   [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
   sleep 1
 done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u sbctl.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
 
 claim_and_token   # sets PAT and ORG (the first project's organization)
 [[ $ORG == default ]] || fail "the claim made organization '$ORG', want 'default'"
@@ -110,16 +110,16 @@ SIGNUP=$(api POST /auth/v1/signup -H 'Content-Type: application/json' -d '{"emai
 grep -q "Sign-up is closed" <<<"$SIGNUP" || fail "the sign-up was not refused by the hook: $SIGNUP"
 OTP=$(api POST /auth/v1/otp -H 'Content-Type: application/json' -d '{"email":"intruder@acme.test","create_user":true}' -o /dev/null -w '%{http_code}')
 [[ $OTP =~ ^4 ]] || fail "a sign-up by one-time code answered $OTP"
-! sbctl users list | grep -q intruder || fail "a refused sign-up left an account"
+! supavise users list | grep -q intruder || fail "a refused sign-up left an account"
 # Only the daemon's own loopback caller gets an answer from the hook route.
 [[ $(http_code -X POST -H 'Content-Type: application/json' -d '{}' "$ADMIN/internal/hooks/before-user-created") == 401 ]] || fail "the hook route answered an unsigned call"
-[[ $(http_code -X POST -H "Host: api.$SBCTL_DOMAIN" -d '{}' "http://127.0.0.1/internal/hooks/before-user-created") != 200 ]] || fail "the hook route is reachable through the public proxy"
+[[ $(http_code -X POST -H "Host: api.$SUPAVISE_DOMAIN" -d '{}' "http://127.0.0.1/internal/hooks/before-user-created") != 200 ]] || fail "the hook route is reachable through the public proxy"
 
 log "the identity provider (SimpleSAMLphp in a container)"
 SPS="$WORK/saml20-sp-remote.php"
 {
   echo '<?php'
-  for h in "api.$SBCTL_DOMAIN" "$REF.api.$SBCTL_DOMAIN"; do
+  for h in "api.$SUPAVISE_DOMAIN" "$REF.api.$SUPAVISE_DOMAIN"; do
     cat <<PHP
 \$metadata['http://$h/auth/v1/sso/saml/metadata'] = array(
     'AssertionConsumerService' => 'http://$h/auth/v1/sso/saml/acs',
@@ -170,14 +170,14 @@ profile_code() { dash_code /platform/profile -H "Authorization: Bearer $1"; }
 log "dashboard: a domain without a provider cannot start a sign-in"
 [[ $(api POST /auth/v1/sso -H 'Content-Type: application/json' -d '{"domain":"acme.test","skip_http_redirect":true}' -o /dev/null -w '%{http_code}') == 404 ]] || fail "SSO for a domain without a provider did not answer 404"
 
-log "dashboard: sbctl sso add from the identity provider's metadata URL"
-sbctl sso add --metadata-url "$IDP_META" --domain acme.test --default-role developer >"$WORK/add.out" 2>"$WORK/add.err" || { cat "$WORK/add.err" >&2; fail "sbctl sso add"; }
+log "dashboard: supavise sso add from the identity provider's metadata URL"
+supavise sso add --metadata-url "$IDP_META" --domain acme.test --default-role developer >"$WORK/add.out" 2>"$WORK/add.err" || { cat "$WORK/add.err" >&2; fail "supavise sso add"; }
 PROV=$(head -1 "$WORK/add.out")
-[[ $PROV =~ ^[0-9a-f-]{36}$ ]] || fail "sbctl sso add printed '$PROV'"
-grep -q "ACS URL.*http://api.$SBCTL_DOMAIN/auth/v1/sso/saml/acs" "$WORK/add.err" || { cat "$WORK/add.err" >&2; fail "sbctl sso add does not say where the identity provider posts the assertion"; }
-sbctl sso list >"$WORK/list.txt"
-grep -q "$PROV.*$ORG.*acme.test.*developer" "$WORK/list.txt" || { cat "$WORK/list.txt" >&2; fail "sbctl sso list"; }
-[[ $(sbctl sso list --json | json_get 'len(d)') == 1 ]] || fail "sbctl sso list --json"
+[[ $PROV =~ ^[0-9a-f-]{36}$ ]] || fail "supavise sso add printed '$PROV'"
+grep -q "ACS URL.*http://api.$SUPAVISE_DOMAIN/auth/v1/sso/saml/acs" "$WORK/add.err" || { cat "$WORK/add.err" >&2; fail "supavise sso add does not say where the identity provider posts the assertion"; }
+supavise sso list >"$WORK/list.txt"
+grep -q "$PROV.*$ORG.*acme.test.*developer" "$WORK/list.txt" || { cat "$WORK/list.txt" >&2; fail "supavise sso list"; }
+[[ $(supavise sso list --json | json_get 'len(d)') == 1 ]] || fail "supavise sso list --json"
 log "Studio's sign-in page offers SSO now (the unit was rendered again)"
 sudo grep -q '^NEXT_PUBLIC_DISABLED_FEATURES=' "$STUDIO_ENV" || fail "Studio was not re-rendered after the first provider"
 ! sudo grep '^NEXT_PUBLIC_DISABLED_FEATURES=' "$STUDIO_ENV" | grep -q sign_in_with_sso || fail "Studio still hides the SSO sign-in: $(sudo grep '^NEXT_PUBLIC_DISABLED_FEATURES=' "$STUDIO_ENV")"
@@ -185,16 +185,16 @@ sudo grep '^NEXT_PUBLIC_DISABLED_FEATURES=' "$STUDIO_ENV" | grep -q dashboard_au
 
 log "dashboard: SP metadata through the proxy"
 META=$(api GET /auth/v1/sso/saml/metadata)
-grep -q "entityID=\"http://api.$SBCTL_DOMAIN/auth/v1/sso/saml/metadata\"" <<<"$META" || fail "the dashboard's SP metadata has another entity id: ${META:0:300}"
+grep -q "entityID=\"http://api.$SUPAVISE_DOMAIN/auth/v1/sso/saml/metadata\"" <<<"$META" || fail "the dashboard's SP metadata has another entity id: ${META:0:300}"
 
 log "dashboard: alice (acme.test) signs in through the identity provider and is a Developer"
-walk "api.$SBCTL_DOMAIN" alice@acme.test alice alicepass --redirect-to "http://studio.$SBCTL_DOMAIN/sign-in-mfa?method=sso" >"$WORK/alice.json" \
+walk "api.$SUPAVISE_DOMAIN" alice@acme.test alice alicepass --redirect-to "http://studio.$SUPAVISE_DOMAIN/sign-in-mfa?method=sso" >"$WORK/alice.json" \
   || { cat "$WORK/alice.json" >&2; docker logs "$IDP_NAME" 2>&1 | tail -20 >&2; fail "alice's sign-in did not reach the ACS"; }
 ALICE=$(walk_token <"$WORK/alice.json")
-[[ -n $ALICE ]] || { sed -e 's/access_token": "[^"]*/access_token": "…/' "$WORK/alice.json" >&2; journalctl --no-pager -u sb-gotrue@system -n 20 >&2; fail "no session came back for alice"; }
-[[ $(python3 -c 'import json,sys; print(json.load(sys.stdin)["location"].split("#")[0])' <"$WORK/alice.json") == "http://studio.$SBCTL_DOMAIN/sign-in-mfa?method=sso" ]] || fail "alice is sent to $(python3 -c 'import json,sys; print(json.load(sys.stdin)["location"].split("#")[0])' <"$WORK/alice.json")"
+[[ -n $ALICE ]] || { sed -e 's/access_token": "[^"]*/access_token": "…/' "$WORK/alice.json" >&2; journalctl --no-pager -u supavise-gotrue@system -n 20 >&2; fail "no session came back for alice"; }
+[[ $(python3 -c 'import json,sys; print(json.load(sys.stdin)["location"].split("#")[0])' <"$WORK/alice.json") == "http://studio.$SUPAVISE_DOMAIN/sign-in-mfa?method=sso" ]] || fail "alice is sent to $(python3 -c 'import json,sys; print(json.load(sys.stdin)["location"].split("#")[0])' <"$WORK/alice.json")"
 [[ $(profile_code "$ALICE") == 200 ]] || fail "alice's first request: $(profile_code "$ALICE")"
-sbctl users list >"$WORK/users.txt"
+supavise users list >"$WORK/users.txt"
 grep -q "alice@acme.test.*$ORG:developer" "$WORK/users.txt" || { cat "$WORK/users.txt" >&2; fail "alice is not a Developer"; }
 [[ $(dash_code "/v1/projects/$REF/config/auth" -X PATCH -H "Authorization: Bearer $ALICE" -H 'Content-Type: application/json' -d '{"site_url":"https://x.test"}') == 403 ]] || fail "a Developer saved Auth settings"
 [[ $(dash_code "/v1/projects/$REF/api-keys?reveal=true" -H "Authorization: Bearer $ALICE") == 200 ]] || fail "a Developer cannot read the project's keys"
@@ -203,45 +203,45 @@ APAT=$(curl -sS -m 30 -X POST -H "Authorization: Bearer $ALICE" -H 'Content-Type
 [[ $(dash_code "/v1/projects/$REF/secrets" -X POST -H "Authorization: Bearer $APAT" -H 'Content-Type: application/json' -d '[{"name":"A","value":"b"}]') == 403 ]] || fail "alice's token wrote secrets"
 
 log "dashboard: an address the provider vouches for, of a domain nobody mapped, waits for approval"
-walk "api.$SBCTL_DOMAIN" alice@acme.test bob bobpass >"$WORK/bob.json" || { cat "$WORK/bob.json" >&2; fail "bob's sign-in did not reach the ACS"; }
+walk "api.$SUPAVISE_DOMAIN" alice@acme.test bob bobpass >"$WORK/bob.json" || { cat "$WORK/bob.json" >&2; fail "bob's sign-in did not reach the ACS"; }
 BOB=$(walk_token <"$WORK/bob.json")
 [[ -n $BOB ]] || fail "no session came back for bob: $(cat "$WORK/bob.json" | head -c 600)"
 for p in /platform/profile /platform/projects /v1/projects /platform/organizations; do
   [[ $(dash_code "$p" -H "Authorization: Bearer $BOB") == 403 ]] || fail "a user waiting for approval got $(dash_code "$p" -H "Authorization: Bearer $BOB") on $p"
 done
-sbctl sso pending >"$WORK/pending.txt"
+supavise sso pending >"$WORK/pending.txt"
 grep -q "bob@contractor.test" "$WORK/pending.txt" || { cat "$WORK/pending.txt" >&2; fail "bob is not listed as pending"; }
-sbctl sso approve bob@contractor.test --role read-only >/dev/null || fail "sbctl sso approve"
+supavise sso approve bob@contractor.test --role read-only >/dev/null || fail "supavise sso approve"
 [[ $(profile_code "$BOB") == 200 ]] || fail "bob after the approval: $(profile_code "$BOB")"
 [[ $(dash_code "/v1/projects/$REF/secrets" -X POST -H "Authorization: Bearer $BOB" -H 'Content-Type: application/json' -d '[{"name":"A","value":"b"}]') == 403 ]] || fail "a Read-only member wrote secrets"
 [[ $(dash_code "/v1/projects/$REF/api-keys?reveal=true" -H "Authorization: Bearer $BOB") == 403 ]] || fail "a Read-only member revealed the project's keys"
-sbctl users list | grep -q "bob@contractor.test.*$ORG:read-only" || fail "bob is not Read-only"
+supavise users list | grep -q "bob@contractor.test.*$ORG:read-only" || fail "bob is not Read-only"
 
-log "dashboard: the Management API answers the same (Studio's organization page and sbctl's routes)"
+log "dashboard: the Management API answers the same (Studio's organization page and supavise's routes)"
 code=$(dash_code "/platform/organizations/$ORG/sso" -H "Authorization: Bearer $OWNER_JWT"); [[ $code == 200 ]] || fail "GET organization SSO: $code"
 [[ $(curl -sS -m 30 -H "Authorization: Bearer $OWNER_JWT" "$ADMIN/platform/organizations/$ORG/sso" | json_get 'd["join_org_on_signup_role"]') == Developer ]] || fail "the organization page shows another default role"
 [[ $(dash_code "/platform/organizations/$ORG/sso/providers" -H "Authorization: Bearer $ALICE") == 403 ]] || fail "a Developer reads the SSO providers"
 
 log "dashboard: a removed user with a default role stays out when signing in again (the refusal is kept by address)"
-sbctl users remove alice@acme.test >/dev/null || fail "sbctl users remove alice"
+supavise users remove alice@acme.test >/dev/null || fail "supavise users remove alice"
 [[ $(profile_code "$ALICE") == 401 ]] || fail "alice's session after her removal: $(profile_code "$ALICE")"
-walk "api.$SBCTL_DOMAIN" alice@acme.test alice alicepass >"$WORK/alice2.json" || { cat "$WORK/alice2.json" >&2; fail "alice's second sign-in did not reach the ACS"; }
+walk "api.$SUPAVISE_DOMAIN" alice@acme.test alice alicepass >"$WORK/alice2.json" || { cat "$WORK/alice2.json" >&2; fail "alice's second sign-in did not reach the ACS"; }
 ALICE2=$(walk_token <"$WORK/alice2.json")
 [[ -n $ALICE2 ]] || fail "no session came back for alice's new account: $(head -c 600 "$WORK/alice2.json")"
 for p in /platform/profile /platform/projects /v1/projects; do
   [[ $(dash_code "$p" -H "Authorization: Bearer $ALICE2") == 403 ]] || fail "alice's new account got $(dash_code "$p" -H "Authorization: Bearer $ALICE2") on $p, it should wait for approval"
 done
-sbctl sso pending | grep -q "alice@acme.test" || fail "alice's new account is not listed as pending"
-sbctl users list | grep "alice@acme.test" | grep -q "$ORG:" && fail "alice got a role again by the default role"
-sbctl sso approve alice@acme.test --role developer >/dev/null || fail "sbctl sso approve alice"
+supavise sso pending | grep -q "alice@acme.test" || fail "alice's new account is not listed as pending"
+supavise users list | grep "alice@acme.test" | grep -q "$ORG:" && fail "alice got a role again by the default role"
+supavise sso approve alice@acme.test --role developer >/dev/null || fail "supavise sso approve alice"
 [[ $(profile_code "$ALICE2") == 200 ]] || fail "alice after the approval: $(profile_code "$ALICE2")"
 ALICE=$ALICE2
 APAT=$(curl -sS -m 30 -X POST -H "Authorization: Bearer $ALICE" -H 'Content-Type: application/json' -d '{"name":"alice2"}' "$ADMIN/platform/profile/access-tokens" | json_get 'd["token"]') || fail "alice's second token"
 
 log "dashboard: removing the provider ends the session; Studio loses the button"
-sbctl sso remove acme.test >/dev/null || fail "sbctl sso remove"
+supavise sso remove acme.test >/dev/null || fail "supavise sso remove"
 ! sudo grep -q '^NEXT_PUBLIC_DISABLED_FEATURES=' "$STUDIO_ENV" || fail "Studio still offers SSO without a provider"
-[[ $(sbctl sso list --json | json_get 'len(d)') == 0 ]] || fail "the provider is still listed"
+[[ $(supavise sso list --json | json_get 'len(d)') == 0 ]] || fail "the provider is still listed"
 for ((i = 0; i < 20; i++)); do
   [[ $(profile_code "$ALICE") == 403 ]] && break
   sleep 1
@@ -252,11 +252,11 @@ done
 log "project: SAML is off until it is enabled in the Auth settings"
 PROFILE="$WORK/profile.yaml"
 cat >"$PROFILE" <<YAML
-name: sbctl-test
+name: supavise-test
 api_url: $ADMIN
 dashboard_url: http://127.0.0.1:1
-project_host: api.$SBCTL_DOMAIN
-pooler_host: pooler.$SBCTL_DOMAIN
+project_host: api.$SUPAVISE_DOMAIN
+pooler_host: pooler.$SUPAVISE_DOMAIN
 YAML
 CLI=${SUPABASE_CLI:-supabase}
 command -v "$CLI" >/dev/null || fail "the Supabase CLI is needed (SUPABASE_CLI)"
@@ -266,11 +266,11 @@ OUT=$(sb sso add --project-ref "$REF" --type saml --metadata-file "$WORK/idp-met
 grep -q "SAML 2.0 support is not enabled" <<<"$OUT" || fail "supabase sso add with SAML off: $OUT"
 [[ $(papi GET "/v1/projects/$REF/config/auth/sso/providers" -o /dev/null -w '%{http_code}') == 404 ]] || fail "the project's providers answer without SAML"
 [[ $(papi PATCH "/v1/projects/$REF/config/auth" -H 'Content-Type: application/json' -d '{"saml_enabled":true}' -o /dev/null -w '%{http_code}') == 200 ]] || fail "enabling SAML for the project"
-PENV="$SBCTL_STATE/projects/$REF/gotrue.env"
+PENV="$SUPAVISE_STATE/projects/$REF/gotrue.env"
 sudo grep -q '^GOTRUE_SAML_ENABLED="\?true' "$PENV" || fail "the project's GoTrue is not told to run SAML"
 sudo grep -q '^GOTRUE_SAML_PRIVATE_KEY=' "$PENV" || fail "the project's GoTrue has no signing key"
 [[ $(sudo grep '^GOTRUE_SAML_PRIVATE_KEY=' "$PENV") != $(sudo grep '^GOTRUE_SAML_PRIVATE_KEY=' "$ENVF") ]] || fail "the project signs with the dashboard's key"
-PHOST="$REF.api.$SBCTL_DOMAIN"
+PHOST="$REF.api.$SUPAVISE_DOMAIN"
 project_keys "$REF"   # PUB, SEC
 for ((i = 0; i < 30; i++)); do
   [[ $(curl -s -o /dev/null -w '%{http_code}' -m 10 -H "Host: $PHOST" "http://127.0.0.1/auth/v1/sso/saml/metadata") == 200 ]] && break

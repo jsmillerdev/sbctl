@@ -15,10 +15,10 @@ import (
 
 	"github.com/andybalholm/brotli"
 
-	"github.com/OWNER/sbctl/deploy/systemd"
-	"github.com/OWNER/sbctl/internal/api"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/deploy/systemd"
+	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // fakeEdgeRuntime is a stand-in for bin/edge-runtime: "bundle" writes an eszip-looking file that
@@ -143,7 +143,7 @@ func TestBundlerBundlesUploadedSourcesAndCleansUp(t *testing.T) {
 			t.Errorf("args %q lack %q", args, want)
 		}
 	}
-	if spec.Service != config.SvcEdgeBundle || spec.Unit() != "sb-edge-bundle@"+refA+".service" || spec.Limits.MemoryMax != "1G" {
+	if spec.Service != config.SvcEdgeBundle || spec.Unit() != "supavise-edge-bundle@"+refA+".service" || spec.Limits.MemoryMax != "1G" {
 		t.Errorf("spec %+v", spec)
 	}
 	if spec.Env["DENO_NO_PACKAGE_JSON"] != "1" || !strings.HasSuffix(spec.Env["DENO_DIR"], "/projects/"+refA+"/edge-bundle/deno") {
@@ -261,7 +261,7 @@ func TestBundlerTimesOutAndStopsTheUnit(t *testing.T) {
 	if time.Since(started) > 10*time.Second {
 		t.Fatalf("took %s", time.Since(started))
 	}
-	st, _ := r.sup.Status(context.Background(), "sb-edge-bundle@"+refA+".service")
+	st, _ := r.sup.Status(context.Background(), "supavise-edge-bundle@"+refA+".service")
 	if st.State == units.StateActive {
 		t.Fatalf("the unit still runs: %+v", st)
 	}
@@ -364,7 +364,7 @@ func (l *layoutSup) Status(ctx context.Context, unit string) (units.Status, erro
 	return st, err
 }
 
-// The bundler's unit runs under a uid of its own (see sb-edge-bundle@.service), so the daemon hands
+// The bundler's unit runs under a uid of its own (see supavise-edge-bundle@.service), so the daemon hands
 // it what it needs through the modes of files: readable sources it cannot change, an output
 // directory it cannot create anything in, and two files it can write.
 func TestBundlerHandsTheUnitsUidWhatItNeedsAndNothingElse(t *testing.T) {
@@ -404,7 +404,7 @@ func TestBundlerHandsTheUnitsUidWhatItNeedsAndNothingElse(t *testing.T) {
 	if !spec.PublicRun {
 		t.Error("the launcher is not marked public")
 	}
-	if spec.Env["DENO_DIR"] != "/var/cache/sb-edge-bundle/"+refA+"/deno" || spec.Env["HOME"] != "/var/cache/sb-edge-bundle/"+refA || spec.WorkDir != "/tmp" {
+	if spec.Env["DENO_DIR"] != "/var/cache/supavise-edge-bundle/"+refA+"/deno" || spec.Env["HOME"] != "/var/cache/supavise-edge-bundle/"+refA || spec.WorkDir != "/tmp" {
 		t.Errorf("a sandboxed bundle must use the unit's own cache and /tmp: %v workdir %q", spec.Env, spec.WorkDir)
 	}
 	// The output files are where the unit binds its one writable directory.
@@ -422,10 +422,10 @@ func TestBundlerHandsTheUnitsUidWhatItNeedsAndNothingElse(t *testing.T) {
 	}
 }
 
-// The unit file and the bundler must agree: a unit that ran as the sbctl user again, or that
+// The unit file and the bundler must agree: a unit that ran as the supavise user again, or that
 // bound the whole state directory, would reopen the /proc and path escapes.
 func TestBundleUnitIsolatesTheBundlerFromTheNode(t *testing.T) {
-	b, err := systemd.Read("sb-edge-bundle@.service")
+	b, err := systemd.Read("supavise-edge-bundle@.service")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,33 +438,33 @@ func TestBundleUnitIsolatesTheBundlerFromTheNode(t *testing.T) {
 		}
 		return ""
 	}
-	// Another uid than the sbctl user's: the kernel refuses /proc/<pid>/root and environ of the
-	// processes of sbctl's units and the daemon, and /proc shows none of them.
-	for k, v := range map[string]string{"DynamicUser": "yes", "ProtectProc": "invisible", "ProcSubset": "pid", "NoNewPrivileges": "yes", "TemporaryFileSystem": "/var/lib/sbctl:ro"} {
+	// Another uid than the supavise user's: the kernel refuses /proc/<pid>/root and environ of the
+	// processes of supavise's units and the daemon, and /proc shows none of them.
+	for k, v := range map[string]string{"DynamicUser": "yes", "ProtectProc": "invisible", "ProcSubset": "pid", "NoNewPrivileges": "yes", "TemporaryFileSystem": "/var/lib/supavise:ro"} {
 		if val(k) != v {
 			t.Errorf("%s=%q, want %q", k, val(k), v)
 		}
 	}
 	for _, k := range []string{"Group", "SupplementaryGroups"} {
 		if val(k) != "" {
-			t.Errorf("%s=%s: the unit must not run in the sbctl user's group", k, val(k))
+			t.Errorf("%s=%s: the unit must not run in the supavise user's group", k, val(k))
 		}
 	}
 	// A dynamic user named after the instance: with no User= systemd names it after the
 	// template, and every project's bundler runs as the same uid (measured in CI), so only
 	// the id-mapped mounts of a recent kernel would keep one project's cache from another's.
-	if val("User") != "sb-bundle-%i" {
-		t.Errorf("User=%q, want a dynamic user per instance (sb-bundle-%%i)", val("User"))
+	if val("User") != "sv-bundle-%i" {
+		t.Errorf("User=%q, want a dynamic user per instance (sv-bundle-%%i)", val("User"))
 	}
-	if n := len("sb-bundle-") + len(refA); n > 31 {
-		t.Errorf("the user name sb-bundle-<ref> is %d characters, systemd allows 31", n)
+	if n := len("sv-bundle-") + len(refA); n > 31 {
+		t.Errorf("the user name sv-bundle-<ref> is %d characters, systemd allows 31", n)
 	}
 	ro := strings.Fields(val("BindReadOnlyPaths"))
-	wantRO := []string{"/var/lib/sbctl/artifacts", "/var/lib/sbctl/projects/%i/edge-bundle.run", "/var/lib/sbctl/system/edge-bundle/work/src"}
+	wantRO := []string{"/var/lib/supavise/artifacts", "/var/lib/supavise/projects/%i/edge-bundle.run", "/var/lib/supavise/system/edge-bundle/work/src"}
 	if strings.Join(ro, " ") != strings.Join(wantRO, " ") {
 		t.Errorf("BindReadOnlyPaths %v, want %v", ro, wantRO)
 	}
-	if rw := strings.Fields(val("BindPaths")); len(rw) != 1 || rw[0] != "/var/lib/sbctl/system/edge-bundle/work/out" || val("ReadWritePaths") != rw[0] {
+	if rw := strings.Fields(val("BindPaths")); len(rw) != 1 || rw[0] != "/var/lib/supavise/system/edge-bundle/work/out" || val("ReadWritePaths") != rw[0] {
 		t.Errorf("BindPaths %q ReadWritePaths %q: only the output directory may be writable", val("BindPaths"), val("ReadWritePaths"))
 	}
 	// The cache path the bundler puts in the environment is the instance's CacheDirectory, one
@@ -479,21 +479,21 @@ func TestBundleUnitIsolatesTheBundlerFromTheNode(t *testing.T) {
 		}
 	}
 	// The size limit applies to the instance's own directory.
-	if !strings.Contains(body, "du -sk /var/cache/sb-edge-bundle/%i ") || strings.Contains(body, "/var/cache/sb-edge-bundle ") {
+	if !strings.Contains(body, "du -sk /var/cache/supavise-edge-bundle/%i ") || strings.Contains(body, "/var/cache/supavise-edge-bundle ") {
 		t.Error("ExecStartPre does not trim the instance's own cache directory")
 	}
-	if got := config.Default().Paths().System(config.SvcEdgeBundle); got != "/var/lib/sbctl/system/edge-bundle" {
+	if got := config.Default().Paths().System(config.SvcEdgeBundle); got != "/var/lib/supavise/system/edge-bundle" {
 		t.Errorf("state directory %s no longer matches the unit's bind paths", got)
 	}
 }
 
-// With SBCTL_TEST_EDGE_RUNTIME=<unpacked edge-runtime artifact> the real `edge-runtime bundle`
+// With SUPAVISE_TEST_EDGE_RUNTIME=<unpacked edge-runtime artifact> the real `edge-runtime bundle`
 // runs (unsandboxed, as the exec backend does): the bundle must include the relative import, be accepted by the
 // materializer's decoder, and a missing import must be reported.
 func TestBundlerWithTheRealArtifact(t *testing.T) {
-	art := os.Getenv("SBCTL_TEST_EDGE_RUNTIME")
+	art := os.Getenv("SUPAVISE_TEST_EDGE_RUNTIME")
 	if art == "" {
-		t.Skip("SBCTL_TEST_EDGE_RUNTIME is not set")
+		t.Skip("SUPAVISE_TEST_EDGE_RUNTIME is not set")
 	}
 	cfg := config.Default()
 	cfg.StateDir = t.TempDir()
@@ -548,7 +548,7 @@ func TestBundlerKeepsOneModuleCachePerProject(t *testing.T) {
 			t.Fatal(err)
 		}
 		spec := r.sup.last
-		if spec.Ref != ref || spec.Unit() != "sb-edge-bundle@"+ref+".service" {
+		if spec.Ref != ref || spec.Unit() != "supavise-edge-bundle@"+ref+".service" {
 			t.Errorf("%s: spec for %q, unit %s", ref, spec.Ref, spec.Unit())
 		}
 		caches[ref] = spec.Env["DENO_DIR"]
@@ -613,10 +613,10 @@ func TestSandboxedBundlerUsesTheProjectsOwnUnitAndCache(t *testing.T) {
 			t.Fatal(err)
 		}
 		spec := ls.last
-		if spec.Unit() != "sb-edge-bundle@"+ref+".service" {
+		if spec.Unit() != "supavise-edge-bundle@"+ref+".service" {
 			t.Errorf("unit %s for %s", spec.Unit(), ref)
 		}
-		if want := "/var/cache/sb-edge-bundle/" + ref + "/deno"; spec.Env["DENO_DIR"] != want {
+		if want := "/var/cache/supavise-edge-bundle/" + ref + "/deno"; spec.Env["DENO_DIR"] != want {
 			t.Errorf("DENO_DIR %q, want %q", spec.Env["DENO_DIR"], want)
 		}
 		seen[ref] = spec.Env["DENO_DIR"]
@@ -658,24 +658,24 @@ func TestTrimCacheEmptiesOnlyAboveTheLimit(t *testing.T) {
 // when the project is deleted. That unit takes the ref from its name and can write to the one
 // directory only: a ref that is not lowercase letters ("..", a path) must not reach rm.
 func TestCacheCleanUnitIsNarrow(t *testing.T) {
-	b, err := systemd.Read("sb-edge-bundle-clean@.service")
+	b, err := systemd.Read("supavise-edge-bundle-clean@.service")
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := string(b)
-	if name := config.EdgeBundleCleanUnit("%i"); name != "sb-edge-bundle-clean@%i.service" {
+	if name := config.EdgeBundleCleanUnit("%i"); name != "supavise-edge-bundle-clean@%i.service" {
 		t.Fatalf("unit name %s", name)
 	}
 	for _, want := range []string{
 		"Type=oneshot",
 		`case "$$1" in ""|*[!a-z]*)`,
-		`rm -rf -- "/var/cache/private/sb-edge-bundle/$$1"' sh %i`,
-		"ReadWritePaths=-/var/cache/private/sb-edge-bundle",
+		`rm -rf -- "/var/cache/private/supavise-edge-bundle/$$1"' sh %i`,
+		"ReadWritePaths=-/var/cache/private/supavise-edge-bundle",
 		"ProtectSystem=strict", "NoNewPrivileges=yes", "PrivateNetwork=yes",
 		"CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH",
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("sb-edge-bundle-clean@.service lacks %q", want)
+			t.Errorf("supavise-edge-bundle-clean@.service lacks %q", want)
 		}
 	}
 	for _, l := range strings.Split(body, "\n") {
@@ -684,11 +684,11 @@ func TestCacheCleanUnitIsNarrow(t *testing.T) {
 		}
 	}
 	// The directory it removes is the one the bundler unit creates.
-	u, err := systemd.Read("sb-edge-bundle@.service")
+	u, err := systemd.Read("supavise-edge-bundle@.service")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(u), "CacheDirectory=sb-edge-bundle/%i") {
-		t.Error("the bundler unit's cache directory is not sb-edge-bundle/%i")
+	if !strings.Contains(string(u), "CacheDirectory=supavise-edge-bundle/%i") {
+		t.Error("the bundler unit's cache directory is not supavise-edge-bundle/%i")
 	}
 }

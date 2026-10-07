@@ -41,6 +41,6 @@ wait_for https://localhost:14000/dir
 wait_for -X POST -d '{}' http://127.0.0.1:8055/clear-request-history
 
 cd "$root"
-SBCTL_TEST_PEBBLE_URL=https://localhost:14000/dir \
-SBCTL_TEST_PEBBLE_CA="$work/pebble/test/certs/pebble.minica.pem" \
+SUPAVISE_TEST_PEBBLE_URL=https://localhost:14000/dir \
+SUPAVISE_TEST_PEBBLE_CA="$work/pebble/test/certs/pebble.minica.pem" \
   go test -count=1 -v -run TestPebbleIssuance ./internal/proxy/

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Packaging helper for build.sh: node prepare-cli.mjs <placeholders.json> <app-root> <runtime-config.json>
-// Stores a pristine `.sbctl-tpl` copy of every file that carries a placeholder and writes the list
+// Stores a pristine `.supavise-tpl` copy of every file that carries a placeholder and writes the list
 // the launcher uses at start. Exits non-zero if a placeholder is missing from the build output.
 import { writeFileSync } from 'node:fs'
 
-import { prepare, readPlaceholders } from './sbctl-runtime-config.mjs'
+import { prepare, readPlaceholders } from './supavise-runtime-config.mjs'
 
 const [placeholders, appRoot, out] = process.argv.slice(2)
 if (!placeholders || !appRoot || !out) {

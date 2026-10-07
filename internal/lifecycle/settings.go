@@ -5,7 +5,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
 )
 
 // Settings is the project's saved configuration as the lifecycle renders it: the
@@ -27,7 +27,7 @@ type Settings interface {
 }
 
 // cmdlineSettings are the settings the class puts on the postmaster's command line (and
-// the replication limits and the worker count sbctl fixes there). A command-line value beats
+// the replication limits and the worker count supavise fixes there). A command-line value beats
 // postgresql.auto.conf and a reload cannot change it, so a saved value for one of these is
 // rendered into the unit after the class's and takes effect at the next restart. Every other
 // saved setting goes through ALTER SYSTEM.

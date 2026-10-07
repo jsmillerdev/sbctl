@@ -13,7 +13,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // ---- S3 ----

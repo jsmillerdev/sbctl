@@ -21,10 +21,10 @@ retention_days = 3
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SBCTL_BACKUP_RETENTION_DAYS", "9")
-	t.Setenv("SBCTL_BACKUP_S3_FORCE_PATH_STYLE", "true")
-	t.Setenv("SBCTL_TLS_CREDENTIALS_API_TOKEN", "tok")
-	t.Setenv("SBCTL_SUPERVISOR", "exec")
+	t.Setenv("SUPAVISE_BACKUP_RETENTION_DAYS", "9")
+	t.Setenv("SUPAVISE_BACKUP_S3_FORCE_PATH_STYLE", "true")
+	t.Setenv("SUPAVISE_TLS_CREDENTIALS_API_TOKEN", "tok")
+	t.Setenv("SUPAVISE_SUPERVISOR", "exec")
 	c, err := Load(p)
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +54,7 @@ func TestMissingFileAndValidation(t *testing.T) {
 	if !reflect.DeepEqual(c.Defaults, Limits{MemoryMax: "1G", CPUQuota: "100%"}) {
 		t.Fatal(c.Defaults)
 	}
-	t.Setenv("SBCTL_SUPERVISOR", "docker")
+	t.Setenv("SUPAVISE_SUPERVISOR", "docker")
 	if _, err := Load(filepath.Join(t.TempDir(), "absent.toml")); err == nil {
 		t.Fatal("want validation error")
 	}
@@ -68,8 +68,8 @@ func TestLayout(t *testing.T) {
 	if p := d.PortsFor(SystemRef, 0); p.Postgres != 5433 || p.GoTrue != 9999 || p.PostgREST != 0 {
 		t.Fatal(p)
 	}
-	t.Setenv("SBCTL_PORTS_PROJECT_BASE", "34000")
-	t.Setenv("SBCTL_PORTS_SYSTEM_POSTGRES", "34999")
+	t.Setenv("SUPAVISE_PORTS_PROJECT_BASE", "34000")
+	t.Setenv("SUPAVISE_PORTS_SYSTEM_POSTGRES", "34999")
 	c2, err := Load(filepath.Join(t.TempDir(), "absent.toml"))
 	if err != nil {
 		t.Fatal(err)
@@ -77,17 +77,17 @@ func TestLayout(t *testing.T) {
 	if p := c2.PortsFor("abcdefghijklmnopqrst", 1); p.Postgres != 34003 || c2.PortsFor(SystemRef, 0).Postgres != 34999 {
 		t.Fatal(p)
 	}
-	if u := UnitName(SvcPostgres, "abc"); u != "sb-postgres@abc.service" {
+	if u := UnitName(SvcPostgres, "abc"); u != "supavise-postgres@abc.service" {
 		t.Fatal(u)
 	}
-	if u := UnitName(SvcRealtime, ""); u != "sb-realtime.service" {
+	if u := UnitName(SvcRealtime, ""); u != "supavise-realtime.service" {
 		t.Fatal(u)
 	}
-	if u := EdgeBundleCleanUnit("abc"); u != "sb-edge-bundle-clean@abc.service" {
+	if u := EdgeBundleCleanUnit("abc"); u != "supavise-edge-bundle-clean@abc.service" {
 		t.Fatal(u)
 	}
 	// The bundler has an instance (and a module cache) per project.
-	if u := UnitName(SvcEdgeBundle, "abc"); u != "sb-edge-bundle@abc.service" {
+	if u := UnitName(SvcEdgeBundle, "abc"); u != "supavise-edge-bundle@abc.service" {
 		t.Fatal(u)
 	}
 	c := Default()
@@ -95,7 +95,7 @@ func TestLayout(t *testing.T) {
 	if c.StudioHost() != "studio.203.0.113.7.sslip.io" {
 		t.Fatal(c.StudioHost())
 	}
-	if got := c.Paths().Artifact(SvcGoTrue, "auth-v2"); got != "/var/lib/sbctl/artifacts/auth/auth-v2" {
+	if got := c.Paths().Artifact(SvcGoTrue, "auth-v2"); got != "/var/lib/supavise/artifacts/auth/auth-v2" {
 		t.Fatal(got)
 	}
 }
@@ -135,7 +135,7 @@ func TestRegion(t *testing.T) {
 	}
 }
 
-// A direct `sbctl wal push` cannot work inside a systemd Postgres unit (no /etc/sbctl, no
+// A direct `supavise wal push` cannot work inside a systemd Postgres unit (no /etc/supavise, no
 // backups directory), so wal_relay = "off" is refused there and still allowed under exec.
 func TestWALRelayOffNeedsExecSupervisor(t *testing.T) {
 	for _, tc := range []struct {
@@ -149,8 +149,8 @@ func TestWALRelayOffNeedsExecSupervisor(t *testing.T) {
 		{SupervisorExec, "off", true},
 		{SupervisorExec, "on", true},
 	} {
-		t.Setenv("SBCTL_SUPERVISOR", tc.supervisor)
-		t.Setenv("SBCTL_BACKUP_WAL_RELAY", tc.relay)
+		t.Setenv("SUPAVISE_SUPERVISOR", tc.supervisor)
+		t.Setenv("SUPAVISE_BACKUP_WAL_RELAY", tc.relay)
 		_, err := Load(filepath.Join(t.TempDir(), "absent.toml"))
 		if tc.ok && err != nil {
 			t.Errorf("%s/%q: %v", tc.supervisor, tc.relay, err)
@@ -177,7 +177,7 @@ func TestBranchingDiskReserve(t *testing.T) {
 	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "disk_reserve_mb") {
 		t.Fatalf("a negative reserve was accepted: %v", err)
 	}
-	t.Setenv("SBCTL_BRANCHING_DISK_RESERVE_MB", "100")
+	t.Setenv("SUPAVISE_BRANCHING_DISK_RESERVE_MB", "100")
 	if err := os.WriteFile(p, []byte(""), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -202,9 +202,9 @@ func TestMailEnv(t *testing.T) {
 	if _, ok := (Mail{SMTPHost: "h", SMTPFrom: "a@b.test"}).GoTrueEnv()["GOTRUE_SMTP_USER"]; ok {
 		t.Fatal("no user, no credentials")
 	}
-	t.Setenv("SBCTL_MAIL_SMTP_HOST", "relay.example.test")
-	t.Setenv("SBCTL_MAIL_SMTP_FROM", "x@example.test")
-	t.Setenv("SBCTL_CONFIG", "/nonexistent/sbctl.toml")
+	t.Setenv("SUPAVISE_MAIL_SMTP_HOST", "relay.example.test")
+	t.Setenv("SUPAVISE_MAIL_SMTP_FROM", "x@example.test")
+	t.Setenv("SUPAVISE_CONFIG", "/nonexistent/supavise.toml")
 	c, err := Load("")
 	if err != nil || !c.Mail.Enabled() || c.Mail.SMTPHost != "relay.example.test" {
 		t.Fatalf("env override: %+v %v", c.Mail, err)

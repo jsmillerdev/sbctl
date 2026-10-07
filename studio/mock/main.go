@@ -1,4 +1,4 @@
-// Command mock is a stand-in for the sbctl Management API, for the Studio spike. It serves the
+// Command mock is a stand-in for the supavise Management API, for the Studio spike. It serves the
 // /platform, /v1 and /v2 routes Studio calls, with two projects, logs every request as JSON
 // lines, validates the dashboard's GoTrue access tokens, proxies pg-meta queries to a real
 // postgres-meta, and answers every other documented route with an empty value of the shape the
@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // Config is the JSON file read by `mock serve -config`.

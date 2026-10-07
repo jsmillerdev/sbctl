@@ -51,7 +51,7 @@ echo "$*" >> "` + log + `"
 case "$*" in
   *"Stacks[0].StackStatus"*)
     if [ -n "$STACK_EXISTS" ]; then echo "${STACK_STATUS-CREATE_COMPLETE}"; exit 0; fi
-    echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id sbctl does not exist" >&2
+    echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id supavise does not exist" >&2
     exit 254 ;;
   *"Stacks[0].Parameters"*)
     printf 'AdminEmail\ta@b.co\nAmiId\t%s\nInstanceType\tt4g.large\n' "${STACK_AMI-ami-0aaaaaaaaaaaaaaaa}" ;;
@@ -62,7 +62,7 @@ case "$*" in
     printf 'ClaimTokenCommand\taws secretsmanager get-secret-value --region us-east-1 --secret-id arn:aws:secretsmanager:us-east-1:111122223333:secret:x --query SecretString --output text\n'
     printf 'DnsRecordsNeeded\tNot needed (sslip.io resolves the Elastic IP)\n'
     printf 'ConnectCommand\taws ssm start-session --region us-east-1 --target i-0abc\n'
-    printf 'InstanceId\ti-0123456789abcdef0\nBackupBucket\tsbctl-backupbucket-xyz\nDataVolumeId\tvol-0123456789abcdef0\n' ;;
+    printf 'InstanceId\ti-0123456789abcdef0\nBackupBucket\tsupavise-backupbucket-xyz\nDataVolumeId\tvol-0123456789abcdef0\n' ;;
   *"ssm get-parameter"*) echo ami-0123456789abcdef0 ;;
   *"ec2 describe-instances"*) echo ami-0bbbbbbbbbbbbbbbb ;;
   *"ec2 stop-instances"*)
@@ -185,15 +185,15 @@ func TestDryRunMinimal(t *testing.T) {
 		out := dryRun(t, b, nil, "--region", "us-east-1", "--email", "you@example.com")
 		for _, want := range []string{
 			"# dry run: nothing is sent to AWS",
-			"aws --region us-east-1 cloudformation deploy --stack-name sbctl --template-file ",
-			"/cloudformation/sbctl.yaml --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset --tags Application=sbctl --parameter-overrides AdminEmail=you@example.com 'AmiId=<image-id>'",
+			"aws --region us-east-1 cloudformation deploy --stack-name supavise --template-file ",
+			"/cloudformation/supavise.yaml --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset --tags Application=supavise --parameter-overrides AdminEmail=you@example.com 'AmiId=<image-id>'",
 			// The default instance type is Graviton, so the lookup asks for arm64.
 			"aws --region us-east-1 ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text",
-			"aws --region us-east-1 cloudformation describe-stacks --stack-name sbctl --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text",
+			"aws --region us-east-1 cloudformation describe-stacks --stack-name supavise --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text",
 			// The lookups the real run makes are printed too: does the stack exist, which image
 			// does it hold and, when AmiId is empty, which image its instance runs.
-			"aws --region us-east-1 cloudformation describe-stacks --stack-name sbctl --query 'Stacks[0].StackStatus' --output text",
-			"aws --region us-east-1 cloudformation describe-stacks --stack-name sbctl --query 'Stacks[0].Parameters[].[ParameterKey,ParameterValue]' --output text",
+			"aws --region us-east-1 cloudformation describe-stacks --stack-name supavise --query 'Stacks[0].StackStatus' --output text",
+			"aws --region us-east-1 cloudformation describe-stacks --stack-name supavise --query 'Stacks[0].Parameters[].[ParameterKey,ParameterValue]' --output text",
 			"aws --region us-east-1 ec2 describe-instances --instance-ids '<InstanceId>' --query 'Reservations[0].Instances[0].ImageId' --output text",
 		} {
 			if !strings.Contains(out, want) {
@@ -212,12 +212,12 @@ func TestDryRunAllOptions(t *testing.T) {
 	for _, b := range bashes(t) {
 		out := dryRun(t, b, nil,
 			"--region=eu-west-1", "--email", "you@example.com", "--domain", "example.com", "--hosted-zone-id", "Z0123456789ABCDEFGHIJ",
-			"--instance-type", "m7i.large", "--stack-name", "my-sbctl", "--volume-size", "200", "--version", "v1.2.3",
+			"--instance-type", "m7i.large", "--stack-name", "my-supavise", "--volume-size", "200", "--version", "v1.2.3",
 			"--access-cidr", "203.0.113.0/24", "--ssh-cidr", "203.0.113.4/32", "--key-name", "mykey", "--no-session-manager",
 			"--data-snapshot-id", "snap-0123456789abcdef0", "--daily-snapshots", "014", "--profile", "work")
 		for _, want := range []string{
-			"aws --region eu-west-1 --profile work cloudformation deploy --stack-name my-sbctl",
-			"AdminEmail=you@example.com", "InstanceType=m7i.large", "DataVolumeSize=200", "DailySnapshotsKept=14", "SbctlVersion=v1.2.3",
+			"aws --region eu-west-1 --profile work cloudformation deploy --stack-name my-supavise",
+			"AdminEmail=you@example.com", "InstanceType=m7i.large", "DataVolumeSize=200", "DailySnapshotsKept=14", "SupaviseVersion=v1.2.3",
 			"DomainName=example.com", "HostedZoneId=Z0123456789ABCDEFGHIJ", "AccessCidr=203.0.113.0/24",
 			"SshCidr=203.0.113.4/32", "KeyName=mykey", "EnableSessionManager=false", "DataSnapshotId=snap-0123456789abcdef0",
 			// An x86 type looks up the amd64 image.
@@ -246,7 +246,7 @@ func TestDryRunRegionFromEnvironment(t *testing.T) {
 
 // Every parameter deploy.sh passes must exist in the template, or the deploy would fail late.
 func TestParameterNamesExistInTemplate(t *testing.T) {
-	raw, err := os.ReadFile("../cloudformation/sbctl.yaml")
+	raw, err := os.ReadFile("../cloudformation/supavise.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,8 +294,8 @@ func TestDryRunDownloadsTheReleaseTemplateWhenNoneIsNearby(t *testing.T) {
 		args []string
 		url  string
 	}{
-		{nil, "https://github.com/jsmillerdev/sbctl/releases/latest/download/sbctl.yaml"},
-		{[]string{"--version", "v1.2.3"}, "https://github.com/jsmillerdev/sbctl/releases/download/v1.2.3/sbctl.yaml"},
+		{nil, "https://github.com/jsmillerdev/supavise/releases/latest/download/supavise.yaml"},
+		{[]string{"--version", "v1.2.3"}, "https://github.com/jsmillerdev/supavise/releases/download/v1.2.3/supavise.yaml"},
 	} {
 		dir, log := stubAWS(t)
 		cmd := exec.Command(bashes(t)[0], append([]string{filepath.Join(lone, "deploy.sh"), "--region", "us-east-1", "--email", "a@b.co", "--dry-run"}, c.args...)...)
@@ -323,15 +323,15 @@ func TestDryRunDownloadsTheReleaseTemplateWhenNoneIsNearby(t *testing.T) {
 
 func TestDryRunDelete(t *testing.T) {
 	for _, b := range bashes(t) {
-		out := dryRun(t, b, nil, "--region", "us-east-1", "--stack-name", "sbctl", "--delete")
+		out := dryRun(t, b, nil, "--region", "us-east-1", "--stack-name", "supavise", "--delete")
 		for _, want := range []string{
-			"About to delete the CloudFormation stack \"sbctl\" in us-east-1.",
+			"About to delete the CloudFormation stack \"supavise\" in us-east-1.",
 			"the S3 backup bucket", "final EBS snapshot of the data volume",
-			"aws --region us-east-1 cloudformation delete-stack --stack-name sbctl",
-			"aws --region us-east-1 cloudformation wait stack-delete-complete --stack-name sbctl",
+			"aws --region us-east-1 cloudformation delete-stack --stack-name supavise",
+			"aws --region us-east-1 cloudformation wait stack-delete-complete --stack-name supavise",
 			"ec2 describe-snapshots --owner-ids self",
 			// The delete path stops the instance first, and the dry run shows its lookups.
-			"aws --region us-east-1 cloudformation describe-stacks --stack-name sbctl --query 'Stacks[0].StackStatus' --output text",
+			"aws --region us-east-1 cloudformation describe-stacks --stack-name supavise --query 'Stacks[0].StackStatus' --output text",
 			"aws --region us-east-1 ec2 stop-instances --instance-ids '<InstanceId>'",
 			"aws --region us-east-1 ec2 wait instance-stopped --instance-ids '<InstanceId>'",
 			"daily snapshots of the data volume",
@@ -417,7 +417,7 @@ func TestRealRunExistingStackKeepsItsImage(t *testing.T) {
 }
 
 func TestRealRunDelete(t *testing.T) {
-	re := regexp.MustCompile(`(?m)^--region us-east-1 cloudformation (delete-stack|wait stack-delete-complete) --stack-name sbctl$`)
+	re := regexp.MustCompile(`(?m)^--region us-east-1 cloudformation (delete-stack|wait stack-delete-complete) --stack-name supavise$`)
 	// Not a terminal and no --yes: refuse, delete nothing.
 	dir, log := stubAWS(t)
 	r := run(t, bashes(t)[0], dir, []string{"STACK_EXISTS=1"}, "--region", "us-east-1", "--delete")
@@ -430,7 +430,7 @@ func TestRealRunDelete(t *testing.T) {
 	// A stack that does not exist.
 	dir, _ = stubAWS(t)
 	r = run(t, bashes(t)[0], dir, nil, "--region", "us-east-1", "--delete", "--yes")
-	if r.code == 0 || !strings.Contains(r.stderr, "no stack named sbctl") {
+	if r.code == 0 || !strings.Contains(r.stderr, "no stack named supavise") {
 		t.Errorf("want 'no stack named': exit %d\n%s", r.code, r.stderr)
 	}
 	// Confirmed.
@@ -456,7 +456,7 @@ func TestRealRunDelete(t *testing.T) {
 	if !(0 <= stop && stop < wait && wait < del) {
 		t.Errorf("want stop-instances, wait instance-stopped, delete-stack in that order, got %v", calls(t, log))
 	}
-	for _, want := range []string{"Backup bucket:  sbctl-backupbucket-xyz", "Data volume:    vol-0123456789abcdef0", "Instance:       i-0123456789abcdef0 (stopped first)", "volume-id,Values=vol-0123456789abcdef0"} {
+	for _, want := range []string{"Backup bucket:  supavise-backupbucket-xyz", "Data volume:    vol-0123456789abcdef0", "Instance:       i-0123456789abcdef0 (stopped first)", "volume-id,Values=vol-0123456789abcdef0"} {
 		if !strings.Contains(r.stdout, want) {
 			t.Errorf("stdout lacks %q:\n%s", want, r.stdout)
 		}
@@ -477,7 +477,7 @@ func TestRealRunDelete(t *testing.T) {
 // A stack whose creation failed (ROLLBACK_COMPLETE, no outputs, no instance) must still be
 // deletable here: deploy cannot update it, and there is no instance to stop.
 func TestRealRunDeleteOfAFailedLaunch(t *testing.T) {
-	re := regexp.MustCompile(`(?m)^--region us-east-1 cloudformation (delete-stack|wait stack-delete-complete) --stack-name sbctl$`)
+	re := regexp.MustCompile(`(?m)^--region us-east-1 cloudformation (delete-stack|wait stack-delete-complete) --stack-name supavise$`)
 	for _, status := range []string{"ROLLBACK_COMPLETE", "CREATE_FAILED", "DELETE_FAILED"} {
 		dir, log := stubAWS(t)
 		r := run(t, bashes(t)[0], dir, []string{"STACK_EXISTS=1", "STACK_STATUS=" + status, "NO_OUTPUTS=1"}, "--region", "us-east-1", "--delete", "--yes")

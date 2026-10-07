@@ -12,10 +12,10 @@ import (
 
 	"github.com/caddyserver/certmagic"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
-// Server is sbctl's public edge. Create it with New, then call Run (or Serve with
+// Server is supavise's public edge. Create it with New, then call Run (or Serve with
 // listeners you own). Handler exposes the routing without any listener, for tests.
 type Server struct {
 	opts  Options

@@ -21,8 +21,8 @@ func TestFunctionsDefaultsAndRoot(t *testing.T) {
 	if f.Parallelism() != 1 || f.Workers() != 16 || f.WorkersPerProject() != 8 || f.PerProject() != 128 || f.RuntimeMemoryMax() != "4864M" {
 		t.Fatalf("budget: %d %d %d %d %s", f.Parallelism(), f.Workers(), f.WorkersPerProject(), f.PerProject(), f.RuntimeMemoryMax())
 	}
-	c.StateDir = "/var/lib/sbctl"
-	if got := c.Paths().FunctionsRoot(); got != "/var/lib/sbctl/system/edge-runtime/tenants" {
+	c.StateDir = "/var/lib/supavise"
+	if got := c.Paths().FunctionsRoot(); got != "/var/lib/supavise/system/edge-runtime/tenants" {
 		t.Fatalf("root %q", got)
 	}
 }
@@ -58,8 +58,8 @@ func TestFunctionsSectionLoadsFromTOMLAndEnvironment(t *testing.T) {
 	if err := os.WriteFile(p, []byte("[functions]\nenabled = true\nmemory_mb = 128\nwall_clock_seconds = 30\nproject_url_template = \"http://{ref}.x.test\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SBCTL_FUNCTIONS_IDLE_TIMEOUT_SECONDS", "9")
-	t.Setenv("SBCTL_FUNCTIONS_MEMORY_MAX", "3G")
+	t.Setenv("SUPAVISE_FUNCTIONS_IDLE_TIMEOUT_SECONDS", "9")
+	t.Setenv("SUPAVISE_FUNCTIONS_MEMORY_MAX", "3G")
 	c, err := Load(p)
 	if err != nil {
 		t.Fatal(err)

@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/OWNER/sbctl/internal/api/gen/v1"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	v1 "github.com/jsmillerdev/supavise/internal/api/gen/v1"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // API keys of a project (/v1/projects/{ref}/api-keys*). A project has the legacy keys (the

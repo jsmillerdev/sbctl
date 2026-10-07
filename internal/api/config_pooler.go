@@ -6,9 +6,9 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // The pooler config of a project: the pool size and client limit of its Supavisor tenant. The

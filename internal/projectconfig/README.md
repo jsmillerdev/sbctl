@@ -22,7 +22,7 @@ env, _ := m.AuthEnv(ctx, ref, externalURL)             // GoTrue environment for
 ## What is stored
 
 Migration `0800_project_settings.sql`: one row per project and service (`auth`, `postgrest`,
-`realtime`, `storage`, `postgres`; `pooler` from migration `0801`) in `sbctl.project_settings`, deleted with the project. It holds
+`realtime`, `storage`, `postgres`; `pooler` from migration `0801`) in `supavise.project_settings`, deleted with the project. It holds
 only what was changed: `values` (plain), `sealed` (secrets, base64 of `secrets.Seal`: OAuth client
 secrets, the SMTP password, SMS provider tokens, hook secrets, the captcha secret). A setting with
 no entry has its default, which is what the units render when no row exists, so a project that

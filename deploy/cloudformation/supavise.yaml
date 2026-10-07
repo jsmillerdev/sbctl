@@ -1,0 +1,811 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Supavise: multi-project Supabase on one Ubuntu 24.04 instance. Only an admin email is required.
+  Creates the instance, an Elastic IP, an encrypted XFS data volume, a backup bucket, a security
+  group, a least-privilege instance role and a Secrets Manager secret that holds the one-time
+  claim token. A daily snapshot of the data volume (7 kept by default) protects the node's files
+  between database backups. A domain with a Route 53 hosted zone is optional. Deleting the stack
+  keeps the backup bucket and a final snapshot of the data volume.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Required" }
+        Parameters: [AdminEmail]
+      - Label: { default: "Size, storage and version (the defaults hold about 20 projects)" }
+        Parameters: [InstanceType, DataVolumeSize, DailySnapshotsKept, SupaviseVersion]
+      - Label: { default: "Domain (optional; leave empty to use sslip.io on the Elastic IP)" }
+        Parameters: [DomainName, HostedZoneId]
+      - Label: { default: "Access (optional)" }
+        Parameters: [AccessCidr, EnableSessionManager, SshCidr, KeyName]
+      - Label: { default: "Advanced (leave empty unless you know you need them)" }
+        Parameters: [VpcId, SubnetId, AmiId, DataSnapshotId]
+    ParameterLabels:
+      AdminEmail: { default: Admin email }
+      InstanceType: { default: Instance type }
+      DataVolumeSize: { default: Data volume size (GiB) }
+      DailySnapshotsKept: { default: Daily data volume snapshots to keep (0 = none) }
+      SupaviseVersion: { default: Supavise release }
+      DomainName: { default: Domain name }
+      HostedZoneId: { default: Route 53 hosted zone ID }
+      AccessCidr: { default: "Who may reach the dashboard, API and database ports" }
+      EnableSessionManager: { default: Allow AWS Systems Manager Session Manager }
+      SshCidr: { default: Who may reach SSH (empty = nobody) }
+      KeyName: { default: EC2 key pair for SSH }
+      VpcId: { default: Existing VPC }
+      SubnetId: { default: Existing public subnet }
+      AmiId: { default: Ubuntu 24.04 image ID }
+      DataSnapshotId: { default: Snapshot to restore the data volume from }
+
+Parameters:
+  AdminEmail:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Enter an email address.
+    Description: Contact address for the Let's Encrypt account (expiry notices). The only required field.
+  InstanceType:
+    Type: String
+    Default: t4g.large
+    AllowedValues:
+      - t4g.medium
+      - t4g.large
+      - t4g.xlarge
+      - m7g.large
+      - m7g.xlarge
+      - m7g.2xlarge
+      - r7g.large
+      - r7g.xlarge
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m7i.large
+      - m7i.xlarge
+      - m7i.2xlarge
+      - r7i.large
+      - r7i.xlarge
+    Description: >-
+      The node needs about 1.5 GB of RAM plus about 150 MB per idle project (measured, see
+      research/09-footprint.md). The default, t4g.large (Graviton, 8 GiB), holds about 20 projects
+      with room for load. t4g.medium (4 GiB) suits a trial of up to about 10. t4g and t3 are
+      burstable; pick m7g or m7i (or larger) for sustained load. Graviton (arm64) types cost less;
+      x86 types (t3, m7i, r7i) work the same. The image architecture follows the type.
+  DataVolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 16384
+    Description: >-
+      Size in GiB of the encrypted XFS volume mounted at /var/lib/supavise (project data and the
+      local artifact cache; about 75 MB per new project plus what the project stores). It can grow
+      later (update this value, then run xfs_growfs on the instance) but never shrink. When
+      restoring from a snapshot it must be at least the snapshot's size.
+  DailySnapshotsKept:
+    # A string with a pattern, not a Number: the console would accept 7.5 or 00, which the
+    # Data Lifecycle Manager policy rejects (a whole number from 1 to 1000) only at create time.
+    Type: String
+    Default: "7"
+    AllowedPattern: "^(0|[1-9][0-9]{0,2}|1000)$"
+    ConstraintDescription: A whole number from 0 to 1000, without leading zeros.
+    Description: >-
+      How many daily snapshots of the data volume to keep, a whole number from 0 to 1000 (Amazon
+      Data Lifecycle Manager takes one a day at 03:00 UTC and deletes the oldest). They cover what the database backups in S3
+      do not: Storage files, Edge Function bundles, the configuration and the master key. They
+      are crash-consistent. EBS bills snapshot storage (README, "What it costs"). 0 takes none.
+  SupaviseVersion:
+    Type: String
+    Default: latest
+    AllowedPattern: "^(latest|v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?)$"
+    ConstraintDescription: Enter "latest" or a release tag such as v1.2.3.
+    Description: The Supavise release to install. The template of a release names that release here.
+  DomainName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
+    ConstraintDescription: Enter a lower-case domain name such as example.com, or leave it empty.
+    Description: >-
+      Base domain, for example example.com. The dashboard becomes studio.example.com. With a hosted
+      zone below, the stack creates the DNS records and issues a wildcard certificate by DNS-01;
+      without one, create the records listed in the stack outputs yourself. Empty: the node uses
+      <Elastic IP>.sslip.io names and needs no DNS.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^Z[A-Z0-9]{5,31}$"
+    ConstraintDescription: Enter a Route 53 hosted zone ID such as Z0123456789ABCDEFGHIJ, or leave it empty.
+    Description: >-
+      Route 53 public hosted zone that contains the domain. Needs a domain name. The zone must not
+      already hold api., studio. or pooler. records for the domain, or *.api.<domain>.
+  AccessCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.0/24.
+    Description: >-
+      Source range for ports 80, 443, 5432 and 6543. Port 80 must stay reachable from the internet
+      for HTTP-01 certificates when no hosted zone is given. Narrow this for a private team.
+  EnableSessionManager:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Add a minimal policy (Session Manager channels only) so you can open a shell without SSH. Set to false to give the instance role no Systems Manager rights.
+  SshCidr:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.4/32, or leave it empty.
+    Description: Optional source range for SSH (port 22). Empty opens no SSH port; use Session Manager instead. SSH also needs KeyName.
+  KeyName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[\\x20-\\x7E]{1,255}$"
+    Description: Optional name of an existing EC2 key pair in this region, for SSH as the user ubuntu. Leave empty to use Session Manager only.
+  VpcId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^vpc-[0-9a-f]{8,17}$"
+    Description: Leave empty and the stack creates a small VPC with one public subnet. To use your own, fill in both this and the subnet.
+  SubnetId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^subnet-[0-9a-f]{8,17}$"
+    Description: A public subnet (one that routes to an internet gateway) of that VPC.
+  # Empty means: the newest Canonical Ubuntu 24.04 image of the instance's architecture, looked up
+  # by CloudFormation through the public SSM parameter. CloudFormation may look it up again on an
+  # update (this has not been checked in AWS); if it does and Canonical has published a newer
+  # image, the instance would be replaced, and a replacement cannot attach the data volume while
+  # the old instance holds it. deploy/aws/deploy.sh therefore always passes the image ID it used;
+  # in the console, give the same ID on later updates (README, "Replacing the instance").
+  AmiId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^ami-[0-9a-f]{8,17}$"
+    ConstraintDescription: Enter an image ID such as ami-0123456789abcdef0, or leave it empty.
+    Description: >-
+      Ubuntu 24.04 image of the stack's region and of the instance type's architecture. Leave it
+      empty on the first launch to get the current Canonical image. On later updates enter the ID
+      the instance runs (EC2 console, instance details), or an update may try to replace the
+      instance. Changing it replaces the instance: see the README first.
+  # A volume made from a snapshot cannot be swapped on a live stack (an update would replace the
+  # volume), so this is for creating a stack. The replaced volume keeps a snapshot either way.
+  DataSnapshotId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^snap-[0-9a-f]{8,17}$"
+    ConstraintDescription: Enter a snapshot ID such as snap-0123456789abcdef0, or leave it empty.
+    Description: >-
+      Restore the data volume from the final snapshot of an earlier stack (its master key,
+      registry and projects come back). Leave empty for a new node. Set it only when creating a
+      stack, and keep it on later updates. DataVolumeSize must be at least the snapshot's size.
+
+Rules:
+  ZoneNeedsDomain:
+    RuleCondition: !Not [!Equals [!Ref HostedZoneId, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref DomainName, ""]]
+        AssertDescription: A hosted zone needs a domain name.
+  VpcNeedsSubnet:
+    RuleCondition: !Or [!Not [!Equals [!Ref VpcId, ""]], !Not [!Equals [!Ref SubnetId, ""]]]
+    Assertions:
+      - Assert: !And [!Not [!Equals [!Ref VpcId, ""]], !Not [!Equals [!Ref SubnetId, ""]]]
+        AssertDescription: Give both the VPC and the subnet, or neither.
+
+# The image architecture follows the instance type, so there is no separate architecture choice
+# to get wrong. The value is the directory name in Canonical's public SSM parameter path.
+Mappings:
+  InstanceTypes:
+    t4g.medium: { Ubuntu: arm64 }
+    t4g.large: { Ubuntu: arm64 }
+    t4g.xlarge: { Ubuntu: arm64 }
+    m7g.large: { Ubuntu: arm64 }
+    m7g.xlarge: { Ubuntu: arm64 }
+    m7g.2xlarge: { Ubuntu: arm64 }
+    r7g.large: { Ubuntu: arm64 }
+    r7g.xlarge: { Ubuntu: arm64 }
+    t3.medium: { Ubuntu: amd64 }
+    t3.large: { Ubuntu: amd64 }
+    t3.xlarge: { Ubuntu: amd64 }
+    m7i.large: { Ubuntu: amd64 }
+    m7i.xlarge: { Ubuntu: amd64 }
+    m7i.2xlarge: { Ubuntu: amd64 }
+    r7i.large: { Ubuntu: amd64 }
+    r7i.xlarge: { Ubuntu: amd64 }
+
+Conditions:
+  HasDomain: !Not [!Equals [!Ref DomainName, ""]]
+  HasZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+  HasSsh: !Not [!Equals [!Ref SshCidr, ""]]
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+  HasAmiId: !Not [!Equals [!Ref AmiId, ""]]
+  HasDataSnapshot: !Not [!Equals [!Ref DataSnapshotId, ""]]
+  DailySnapshotsOn: !Not [!Equals [!Ref DailySnapshotsKept, "0"]]
+  SessionManagerOn: !Equals [!Ref EnableSessionManager, "true"]
+  CreateNetwork: !Equals [!Ref VpcId, ""]
+  IsLatest: !Equals [!Ref SupaviseVersion, latest]
+
+Resources:
+  # ---- network (only when no existing VPC is given) ------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNetwork
+    Properties:
+      CidrBlock: 10.77.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNetwork
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.77.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNetwork
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_260
+            comment: Port 80 serves the HTTP-01 certificate challenge and the redirect to HTTPS. AccessCidr narrows it.
+    Properties:
+      GroupDescription: Supavise - web, API and database ports (plus SSH when asked for)
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcId]
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AccessCidr, Description: HTTP (certificate challenges and redirect) }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AccessCidr, Description: "HTTPS (dashboard, API and project APIs)" }
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, CidrIp: !Ref AccessCidr, Description: Postgres session pooler }
+        - { IpProtocol: tcp, FromPort: 6543, ToPort: 6543, CidrIp: !Ref AccessCidr, Description: Postgres transaction pooler }
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  SshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSsh
+    Properties:
+      GroupId: !GetAtt SecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshCidr
+      Description: SSH
+
+  # ---- storage -------------------------------------------------------------------------
+  # Backups outlive the stack: deleting the stack keeps the bucket (and its WAL archive).
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: No log bucket exists; CloudTrail data events cover object access when wanted.
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt BackupBucket.Arn, !Sub "${BackupBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # Holds the master key, the registry and every project. Deleting the stack, or replacing this
+  # volume, takes a final snapshot first (EBS bills it until you delete it). The snapshot carries
+  # the volume's Name tag and can be passed back as DataSnapshotId. The supavise:stack tag is what
+  # DataSnapshotPolicy selects on; the stack ID is unique to this stack, so the policy cannot
+  # reach another stack's volume.
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !GetAtt Instance.AvailabilityZone
+      Size: !Ref DataVolumeSize
+      SnapshotId: !If [HasDataSnapshot, !Ref DataSnapshotId, !Ref "AWS::NoValue"]
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-data" }
+        - { Key: "supavise:stack", Value: !Ref "AWS::StackId" }
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref Instance
+      VolumeId: !Ref DataVolume
+      Device: /dev/sdf
+
+  # Daily snapshots of the data volume, kept DailySnapshotsKept deep (0 creates neither the policy
+  # nor its role). The database has its own point-in-time backups in the S3 bucket; these cover
+  # the rest of the volume (Storage objects, Edge Function bundles, config, the master key).
+  # They are crash-consistent: Postgres replays its WAL when it starts from one, which is the
+  # same recovery a power cut needs. CopyTags puts the volume's Name tag on every snapshot, so a
+  # snapshot can be passed back as DataSnapshotId. Deleting the stack deletes the policy but not
+  # the snapshots it made: they stay, unpruned, until you delete them (README, "Tear down").
+  DataSnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Condition: DailySnapshotsOn
+    Properties:
+      Description: !Sub "Supavise daily snapshots of ${AWS::StackName}"
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt DataSnapshotRole.Arn
+      PolicyDetails:
+        PolicyType: EBS_SNAPSHOT_MANAGEMENT
+        ResourceTypes: [VOLUME]
+        TargetTags: [{ Key: "supavise:stack", Value: !Ref "AWS::StackId" }]
+        Schedules:
+          - Name: daily
+            CreateRule: { Interval: 24, IntervalUnit: HOURS, Times: ["03:00"] }
+            RetainRule: { Count: !Ref DailySnapshotsKept }
+            CopyTags: true
+            TagsToAdd: [{ Key: "supavise:snapshot", Value: daily }]
+  # The role Data Lifecycle Manager assumes. It carries the AWS managed policy that AWS documents
+  # for this service (the one behind its default role), not a hand-written subset: a subset that
+  # misses an action would stop the snapshots without any visible error until the first run, and
+  # this stack cannot be tried in AWS here. Only the dlm service can assume it, and only for a
+  # policy of this account and region (the confused deputy conditions AWS recommends). The
+  # instance cannot assume it and holds no EC2 rights (the tests pin both).
+  DataSnapshotRole:
+    Type: AWS::IAM::Role
+    Condition: DailySnapshotsOn
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: dlm.amazonaws.com }
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:dlm:${AWS::Region}:${AWS::AccountId}:policy/*" }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
+
+  # The claim token is generated on the instance; the instance role may only write this secret.
+  # No fixed name: Secrets Manager keeps a deleted secret's name reserved for its recovery window,
+  # so a stack of the same name could not be created again for 30 days.
+  ClaimTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_149
+            comment: A one-time token that is useless once claimed; the AWS managed key (aws/secretsmanager) is enough and needs no key policy.
+    Properties:
+      Description: One-time token that creates the first Supavise dashboard administrator at /claim. Single use; replace by running "sudo -u supavise supavise claim token" on the instance.
+      SecretString: "pending - the instance writes the token here when the install finishes"
+
+  # ---- identity ------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: backup-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:ListBucket", "s3:GetBucketLocation", "s3:ListBucketMultipartUploads"]
+                Resource: !GetAtt BackupBucket.Arn
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
+                Resource: !Sub "${BackupBucket.Arn}/*"
+        - PolicyName: claim-token-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "secretsmanager:PutSecretValue"
+                Resource: !Ref ClaimTokenSecret
+  # DNS-01 certificates: change TXT records named _acme-challenge.<something under the domain>
+  # in the one hosted zone and nothing else. The A records are the stack's own (DnsRecords). The
+  # instance role is also what an attacker who reaches the instance metadata service would hold,
+  # so it must not be able to repoint api.<domain> or any other name of the zone.
+  DnsPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasZone
+    Properties:
+      PolicyName: route53-dns01
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "route53:ChangeResourceRecordSets"
+            Resource: !Sub "arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}"
+            Condition:
+              ForAllValues:StringEquals:
+                "route53:ChangeResourceRecordSetsRecordTypes": [TXT]
+              ForAllValues:StringLike:
+                "route53:ChangeResourceRecordSetsNormalizedRecordNames":
+                  - !Sub "_acme-challenge.${DomainName}"
+                  - !Sub "_acme-challenge.*.${DomainName}"
+          - Effect: Allow
+            Action: "route53:ListResourceRecordSets"
+            Resource: !Sub "arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}"
+          - Effect: Allow
+            Action: "route53:GetChange"
+            Resource: !Sub "arn:${AWS::Partition}:route53:::change/*"
+  # Session Manager, minimally. The managed policy AmazonSSMManagedInstanceCore is not used: it
+  # grants ssm:GetParameter(s) on every parameter in the account, and the instance metadata
+  # credentials are reachable by the database and storage services that run user code.
+  SessionManagerPolicy:
+    Type: AWS::IAM::Policy
+    Condition: SessionManagerOn
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: These actions accept no resource ARN narrower than *. The policy holds only the Session Manager channel actions.
+    Properties:
+      PolicyName: session-manager
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "ssm:UpdateInstanceInformation"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Resource: "*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---- the instance --------------------------------------------------------------------
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref Instance
+
+  # The instance signals here when the installer has finished (or failed).
+  InstallHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  InstallWait:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: Instance
+    Properties:
+      Handle: !Ref InstallHandle
+      Timeout: "1800"
+      Count: 1
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      cfn-lint:
+        config:
+          # SubnetId defaults to "" and is only used when VpcId is given (CreateNetwork is false).
+          ignore_checks: [W1030]
+      checkov:
+        skip:
+          - id: CKV_AWS_88
+            comment: The node serves the dashboard, the API and the Postgres poolers to the internet (narrow it with AccessCidr), through an Elastic IP.
+          - id: CKV_AWS_46
+            comment: False positive. User data holds no secret; the claim token is generated on the instance and written to Secrets Manager.
+    Properties:
+      ImageId: !If
+        - HasAmiId
+        - !Ref AmiId
+        - !Sub
+          - "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/${Arch}/hvm/ebs-gp3/ami-id}}"
+          - Arch: !FindInMap [InstanceTypes, !Ref InstanceType, Ubuntu]
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !If [CreateNetwork, !Ref Subnet, !Ref SubnetId]
+          GroupSet: [!GetAtt SecurityGroup.GroupId]
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # supavise first boot: data volume, installer, claim token, signal. Logs: /var/log/supavise-bootstrap.log
+            # The log is created 0600 before anything is written: it must not be readable by the
+            # tenant-facing services that run on this host. The installer prints no secret when it
+            # is given --claim-token-file, and cloud-init copies this output to the console log.
+            install -m 0600 /dev/null /var/log/supavise-bootstrap.log
+            exec > >(tee -a /var/log/supavise-bootstrap.log) 2>&1
+            set -uo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            # The snap fallback below installs the AWS CLI to /snap/bin, which cloud-init's PATH lacks.
+            export PATH="$PATH:/snap/bin"
+            HANDLE_URL='${InstallHandle}'
+            REGION='${AWS::Region}'
+
+            signal() { # SUCCESS|FAILURE reason
+              local status=$1 reason=$2
+              if command -v cfn-signal >/dev/null; then
+                if [ "$status" = SUCCESS ]; then cfn-signal -s true -r "$reason" "$HANDLE_URL" && return 0
+                else cfn-signal -s false -r "$reason" "$HANDLE_URL" && return 0; fi
+              fi
+              # The signal is a JSON document PUT to the pre-signed handle URL, which is all cfn-signal does.
+              curl -fsS -X PUT -H 'Content-Type:' --data-binary \
+                "{\"Status\":\"$status\",\"Reason\":\"$reason\",\"UniqueId\":\"supavise\",\"Data\":\"$reason\"}" "$HANDLE_URL"
+            }
+            fail() { echo "FAILED: $*"; signal FAILURE "$* (see /var/log/supavise-bootstrap.log on the instance)"; exit 1; }
+            step() { echo "==> $*"; }
+
+            step "waiting for the network"
+            for i in $(seq 1 60); do curl -fsS -m 5 -o /dev/null https://checkip.amazonaws.com && break; sleep 5; done
+            # The Elastic IP is attached shortly after launch and replaces the launch address;
+            # carry on only once the instance answers from it.
+            for i in $(seq 1 60); do
+              [ "$(curl -fsS -m 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')" = '${ElasticIp}' ] && break
+              sleep 5
+            done
+
+            step "installing packages"
+            apt-get update -qq || fail "apt-get update"
+            apt-get install -y -qq xfsprogs curl ca-certificates openssl python3-venv || fail "apt-get install"
+            apt-get install -y -qq awscli || snap install aws-cli --classic || fail "cannot install the AWS CLI"
+            if [ ! -x /usr/local/bin/cfn-signal ] && ! command -v cfn-signal >/dev/null; then
+              python3 -m venv /opt/aws-cfn \
+                && /opt/aws-cfn/bin/pip install -q https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz \
+                && ln -sf /opt/aws-cfn/bin/cfn-signal /usr/local/bin/cfn-signal \
+                || echo "cfn-bootstrap not installed; signalling with curl"
+            fi
+
+            step "preparing the data volume (XFS at /var/lib/supavise)"
+            # The volume is attached after the instance is created and shows up as a second NVMe
+            # disk. The disk that holds / is the root volume; the other EBS disk is the data volume.
+            ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -n1)
+            DEV=""
+            for i in $(seq 1 120); do
+              for link in /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_*; do
+                [ -e "$link" ] || continue
+                case "$link" in *-part*) continue ;; esac
+                d=$(readlink -f "$link")
+                [ "$(basename "$d")" = "$ROOT_DISK" ] && continue
+                DEV=$d
+              done
+              [ -n "$DEV" ] && break
+              sleep 5
+            done
+            [ -n "$DEV" ] || fail "the data volume did not appear"
+            if ! blkid "$DEV" >/dev/null 2>&1; then mkfs.xfs -L supavise "$DEV" || fail "mkfs.xfs"; fi
+            mkdir -p /var/lib/supavise
+            if ! grep -q ' /var/lib/supavise ' /etc/fstab; then
+              echo "UUID=$(blkid -s UUID -o value "$DEV") /var/lib/supavise xfs defaults,nofail 0 2" >> /etc/fstab
+            fi
+            mountpoint -q /var/lib/supavise || mount /var/lib/supavise || fail "mount /var/lib/supavise"
+            # A volume restored from a smaller snapshot comes up with the snapshot's file system size.
+            xfs_growfs /var/lib/supavise >/dev/null 2>&1 || echo "xfs_growfs skipped"
+            # If the volume is missing at a later boot, the daemon and the system Postgres must fail
+            # rather than start against an empty /var/lib/supavise on the root disk (nofail only keeps
+            # the boot itself going).
+            for u in supavise.service supavise-postgres@.service; do
+              mkdir -p "/etc/systemd/system/$u.d"
+              printf '[Unit]\nRequiresMountsFor=/var/lib/supavise\n' > "/etc/systemd/system/$u.d/10-supavise-data-mount.conf"
+            done
+            systemctl daemon-reload
+
+            step "keeping the node's state on the data volume"
+            # /etc/supavise holds the master key (it unseals every secret in the registry) and
+            # config.toml. On the root volume they would be lost with the instance, and the
+            # data volume's secrets with them. Bind /etc/supavise to the data volume before the
+            # installer writes anything, and give a replacement instance the same owner uid
+            # so that the files on the volume stay readable.
+            mkdir -p /var/lib/supavise/etc /etc/supavise
+            mountpoint -q /etc/supavise || mount --bind /var/lib/supavise/etc /etc/supavise || fail "bind-mount /etc/supavise"
+            grep -q ' /etc/supavise ' /etc/fstab \
+              || echo '/var/lib/supavise/etc /etc/supavise none bind,nofail,x-systemd.requires-mounts-for=/var/lib/supavise 0 0' >> /etc/fstab
+            OWNER_UID=$(stat -c %u /var/lib/supavise); OWNER_GID=$(stat -c %g /var/lib/supavise)
+            if [ "$OWNER_UID" != 0 ] && ! id supavise >/dev/null 2>&1; then
+              # The volume already holds an install (an instance that was replaced): recreate the user
+              # with the uid that owns the files. The installer then runs as a repair and keeps the master key.
+              echo "the data volume holds an earlier install (owner uid $OWNER_UID): repairing it, keeping the master key"
+              # The ids come from the old instance; a package on this image may have taken one of them.
+              # Stop with the reason: units run as User=supavise Group=supavise, so a different primary group
+              # or a different uid would leave the volume unreadable. Fix: chown -R the volume to a free
+              # uid and gid, then update the stack again.
+              HOLDER=$(getent group "$OWNER_GID" | cut -d: -f1)
+              if [ -n "$HOLDER" ] && [ "$HOLDER" != supavise ]; then
+                fail "gid $OWNER_GID of the data volume is taken by group $HOLDER on this image"
+              fi
+              if [ -z "$HOLDER" ]; then
+                getent group supavise >/dev/null && fail "group supavise exists with another gid than the volume's $OWNER_GID"
+                groupadd --system --gid "$OWNER_GID" supavise || fail "cannot create group supavise with gid $OWNER_GID"
+              fi
+              HOLDER=$(getent passwd "$OWNER_UID" | cut -d: -f1)
+              if [ -n "$HOLDER" ]; then
+                fail "uid $OWNER_UID of the data volume is taken by user $HOLDER on this image"
+              fi
+              useradd --system --uid "$OWNER_UID" --gid "$OWNER_GID" --home-dir /var/lib/supavise --no-create-home \
+                --shell /usr/sbin/nologin supavise || fail "cannot recreate the supavise user with uid $OWNER_UID"
+            fi
+            for u in supavise.service supavise-postgres@.service; do
+              printf '[Unit]\nRequiresMountsFor=/etc/supavise\n' > "/etc/systemd/system/$u.d/20-supavise-etc-mount.conf"
+            done
+            systemctl daemon-reload
+
+            step "downloading the installer"
+            REL='${ReleaseBase}'
+            curl -fsSL --retry 5 -o /root/supavise-install.sh "$REL/install.sh" || fail "cannot download $REL/install.sh"
+
+            step "running the installer"
+            set -- --email '${AdminEmail}' --s3-bucket '${BackupBucket}' --s3-region "$REGION" --public-ip '${ElasticIp}' \
+              --claim-token-file /root/claim-token --firewall none
+            case "$REGION" in
+              us-west-1|us-west-2|us-east-1|us-east-2|ca-central-1|eu-west-1|eu-west-2|eu-west-3|eu-central-1|eu-central-2|eu-north-1|ap-south-1|ap-southeast-1|ap-northeast-1|ap-northeast-2|ap-southeast-2|sa-east-1)
+                set -- "$@" --region "$REGION" ;;
+            esac
+            ${DomainArgs}
+            ${VersionArgs}
+            bash /root/supavise-install.sh "$@" || fail "the supavise installer failed"
+
+            step "storing the claim token"
+            if [ -s /root/claim-token ]; then
+              # From a file, not argv: command lines are readable by every process on the host.
+              (umask 077; tr -d '[:space:]' < /root/claim-token > /root/claim-token.secret)
+              aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
+                --secret-string file:///root/claim-token.secret >/dev/null || fail "cannot write the claim token secret"
+              shred -u /root/claim-token /root/claim-token.secret 2>/dev/null || rm -f /root/claim-token /root/claim-token.secret
+            elif [ "$(sudo -u supavise supavise claim status 2>/dev/null)" = claimed ]; then
+              # No token comes from a repair of a data volume that already holds this node's
+              # administrator. Replace the placeholder so that the secret does not promise a
+              # token that never arrives. An unclaimed node is left alone: the secret may hold
+              # the only copy of its live token (the installer keeps just a hash).
+              aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
+                --secret-string 'No claim token was issued: this node already has an administrator, who still works. To get a token, run on the instance: sudo -u supavise supavise claim token (add --force when an administrator exists).' \
+                >/dev/null || echo "could not update the claim token secret"
+            fi
+            rm -f /root/supavise-install.sh
+
+            step "done"
+            signal SUCCESS "supavise is installed"
+          - ReleaseBase: !If
+              - IsLatest
+              - https://github.com/jsmillerdev/supavise/releases/latest/download
+              - !Sub "https://github.com/jsmillerdev/supavise/releases/download/${SupaviseVersion}"
+            DomainArgs: !If
+              - HasZone
+              - !Sub "set -- \"$@\" --domain '${DomainName}' --dns route53 --dns-credential 'hosted_zone_id=${HostedZoneId}' --dns-credential \"region=$REGION\""
+              - !If
+                  - HasDomain
+                  - !Sub "set -- \"$@\" --domain '${DomainName}'"
+                  - "true"
+            VersionArgs: !If
+              - IsLatest
+              - "true"
+              - !Sub "set -- \"$@\" --version '${SupaviseVersion}'"
+
+  # DNS records, when the stack owns the zone. The wildcard covers every project.
+  DnsRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HasZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Comment: !Sub "Supavise (${AWS::StackName})"
+      RecordSets:
+        - { Name: !Sub "api.${DomainName}.", Type: A, TTL: "300", ResourceRecords: [!Ref ElasticIp] }
+        - { Name: !Sub "studio.${DomainName}.", Type: A, TTL: "300", ResourceRecords: [!Ref ElasticIp] }
+        - { Name: !Sub "pooler.${DomainName}.", Type: A, TTL: "300", ResourceRecords: [!Ref ElasticIp] }
+        - { Name: !Sub "*.api.${DomainName}.", Type: A, TTL: "300", ResourceRecords: [!Ref ElasticIp] }
+
+Outputs:
+  DashboardUrl:
+    Description: Open this, then create the first administrator at ClaimUrl.
+    Value: !If [HasDomain, !Sub "https://studio.${DomainName}", !Sub "https://studio.${ElasticIp}.sslip.io"]
+  ApiUrl:
+    Description: Management API (Supabase CLI --profile api_url, MCP --api-url).
+    Value: !If [HasDomain, !Sub "https://api.${DomainName}", !Sub "https://api.${ElasticIp}.sslip.io"]
+  ClaimUrl:
+    Description: The claim page. Enter the token from ClaimTokenCommand there.
+    Value: !If [HasDomain, !Sub "https://api.${DomainName}/claim", !Sub "https://api.${ElasticIp}.sslip.io/claim"]
+  ClaimTokenCommand:
+    Description: Run this once to print the one-time claim token (needs the AWS CLI and read access to the secret).
+    Value: !Sub "aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${ClaimTokenSecret} --query SecretString --output text"
+  ClaimTokenSecretArn:
+    Description: Secrets Manager secret that holds the claim token.
+    Value: !Ref ClaimTokenSecret
+  InstanceId:
+    Description: Instance ID. The installer log is /var/log/supavise-bootstrap.log; the daemon log is journalctl -u supavise.
+    Value: !Ref Instance
+  ConnectCommand:
+    Description: Open a shell on the instance with Session Manager (needs the AWS CLI and its Session Manager plugin).
+    Value: !Sub "aws ssm start-session --region ${AWS::Region} --target ${Instance}"
+  BackupBucket:
+    Description: S3 bucket for WAL archives and base backups. Kept when the stack is deleted.
+    Value: !Ref BackupBucket
+  DataVolumeId:
+    Description: EBS data volume (master key, registry, projects). A final snapshot is kept when the stack is deleted; find it with this volume ID.
+    Value: !Ref DataVolume
+  DataSnapshotsCommand:
+    Condition: DailySnapshotsOn
+    Description: Lists the daily snapshots of the data volume. Pass one as DataSnapshotId to restore (README, "Backups and restore").
+    Value: !Sub "aws ec2 describe-snapshots --region ${AWS::Region} --owner-ids self --filters Name=volume-id,Values=${DataVolume} --query 'Snapshots[].[SnapshotId,StartTime,State]' --output text"
+  PublicIp:
+    Description: The Elastic IP. Point DNS here when the stack does not own the zone.
+    Value: !Ref ElasticIp
+  DnsRecordsNeeded:
+    Description: Records to create yourself (the stack creates them when it is given a hosted zone).
+    Value: !If
+      - HasDomain
+      - !If
+          - HasZone
+          - Created by this stack
+          - !Sub "A api.${DomainName}, studio.${DomainName}, pooler.${DomainName} and *.api.${DomainName} -> ${ElasticIp}"
+      - Not needed (sslip.io resolves the Elastic IP)

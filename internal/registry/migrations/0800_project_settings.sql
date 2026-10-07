@@ -8,8 +8,8 @@
 -- what the unit renderer produces without any row. "version" counts the writes of the row;
 -- a writer passes the version it read and the update applies only if it still matches, so
 -- two concurrent saves cannot silently overwrite each other.
-create table sbctl.project_settings (
-  ref        text   not null references sbctl.projects (ref) on delete cascade,
+create table supavise.project_settings (
+  ref        text   not null references supavise.projects (ref) on delete cascade,
   service    text   not null check (service in ('auth', 'postgrest', 'realtime', 'storage', 'postgres')),
   version    bigint not null default 1 check (version > 0),
   "values"   jsonb  not null default '{}'::jsonb check (jsonb_typeof("values") = 'object'),

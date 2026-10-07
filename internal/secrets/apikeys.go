@@ -184,7 +184,7 @@ func MarshalLegacyState(enabled bool) []byte {
 // TemporaryClaim marks the short-lived service_role JWTs the Management API issues for
 // the dashboard's own calls (api-keys/temporary). The proxy keeps accepting them while
 // the legacy keys are disabled.
-const TemporaryClaim = "sbctl_tmp"
+const TemporaryClaim = "supavise_tmp"
 
 func (k *ProjectKeys) allRecords() []APIKeyRecord {
 	if k.Records == nil {

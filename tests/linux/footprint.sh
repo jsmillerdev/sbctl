@@ -2,9 +2,9 @@
 # Footprint and cold-start measurement: create projects up to each size, then record
 # memory per project and in total, cold start times and disk use as a markdown table.
 #
-#   sudo SBCTL_BIN=... tests/linux/footprint.sh [--sizes "10 25 50"] [--class default] [--teardown]
+#   sudo SUPAVISE_BIN=... tests/linux/footprint.sh [--sizes "10 25 50"] [--class default] [--teardown]
 #
-# Memory is read from cgroup v2 (sbctl.slice and each unit). "PSS" sums
+# Memory is read from cgroup v2 (supavise.slice and each unit). "PSS" sums
 # /proc/<pid>/smaps_rollup Pss over every process of a unit, which splits shared pages
 # (shared_buffers, the loaded libraries) fairly between the processes that map them; it
 # is the number to use for sizing. "RSS" sums Rss and counts shared pages once per
@@ -33,7 +33,7 @@ trap 'rc=$?; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
 now() { date +%s.%N; }
 elapsed() { python3 -c "print(round($(now) - $1, 2))"; }
 
-unit_pids() { cat "/sys/fs/cgroup/sbctl.slice/$1/cgroup.procs" 2>/dev/null || true; }
+unit_pids() { cat "/sys/fs/cgroup/supavise.slice/$1/cgroup.procs" 2>/dev/null || true; }
 
 # unit_mem UNIT FIELD: sum of Pss or Rss (kB) over the unit's processes.
 unit_mem() {
@@ -48,7 +48,7 @@ unit_mem() {
 project_mem_kb() { # REF FIELD
   local t=0 v
   for s in postgres gotrue postgrest; do
-    v=$(unit_mem "sb-$s@$1.service" "$2")
+    v=$(unit_mem "supavise-$s@$1.service" "$2")
     t=$((t + v))
   done
   echo "$t"
@@ -66,7 +66,7 @@ system_init
 REFS=()
 RESULTS="$LOG_DIR/footprint.md"
 {
-  echo "| projects | create avg (s) | PSS per project, median (MB) | RSS per project, median (MB) | system project PSS (MB) | sbctl.slice memory.current (MB) | disk per project (MB) | resume avg (s) | node cold start (s) |"
+  echo "| projects | create avg (s) | PSS per project, median (MB) | RSS per project, median (MB) | system project PSS (MB) | supavise.slice memory.current (MB) | disk per project (MB) | resume avg (s) | node cold start (s) |"
   echo "|---|---|---|---|---|---|---|---|---|"
 } >"$RESULTS"
 
@@ -92,27 +92,27 @@ for target in $SIZES; do
   done
   pss_med=$(printf '%s\n' "${pss[@]}" | median)
   rss_med=$(printf '%s\n' "${rss[@]}" | median)
-  sys_pss=$(( $(unit_mem sb-postgres@system.service Pss) + $(unit_mem sb-gotrue@system.service Pss) ))
-  slice_cur=$(( $(cat /sys/fs/cgroup/sbctl.slice/memory.current) / 1024 ))
-  disk_kb=$(du -sk "$SBCTL_STATE/projects/${REFS[0]}" | cut -f1)
+  sys_pss=$(( $(unit_mem supavise-postgres@system.service Pss) + $(unit_mem supavise-gotrue@system.service Pss) ))
+  slice_cur=$(( $(cat /sys/fs/cgroup/supavise.slice/memory.current) / 1024 ))
+  disk_kb=$(du -sk "$SUPAVISE_STATE/projects/${REFS[0]}" | cut -f1)
 
   # Resume time: pause five projects, then resume them one at a time.
   sample=("${REFS[@]:0:5}")
-  for ref in "${sample[@]}"; do sbctl projects pause "$ref"; done
+  for ref in "${sample[@]}"; do supavise projects pause "$ref"; done
   t_resume=0
   for ref in "${sample[@]}"; do
     t0=$(now)
-    sbctl projects resume "$ref"
+    supavise projects resume "$ref"
     t_resume=$(python3 -c "print($t_resume + $(now) - $t0)")
   done
   resume_avg=$(python3 -c "print(round($t_resume / ${#sample[@]}, 2))")
 
   # Whole-node cold start: stop everything, then start the system project and every
   # active project the way the daemon does after a boot.
-  systemctl stop 'sb-*'
+  systemctl stop 'supavise-*'
   sleep 2
   t0=$(now)
-  sbctl system start
+  supavise system start
   cold=$(elapsed "$t0")
 
   printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \

@@ -30,18 +30,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: build sbctl
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
       - name: systemd smoke
-        run: sudo LOG_DIR=/tmp/sbctl-linux-logs SBCTL_BIN=/tmp/sbctl tests/linux/systemd-smoke.sh
+        run: sudo LOG_DIR=/tmp/supavise-linux-logs SUPAVISE_BIN=/tmp/supavise tests/linux/systemd-smoke.sh
       - if: always()
         name: collect logs
-        run: sudo chmod -R a+rX /tmp/sbctl-linux-logs || true
+        run: sudo chmod -R a+rX /tmp/supavise-linux-logs || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: systemd-smoke-${{ matrix.arch }}
-          path: /tmp/sbctl-linux-logs
+          path: /tmp/supavise-linux-logs
           if-no-files-found: ignore
 
   backup-integration:
@@ -67,7 +67,7 @@ jobs:
           api_bind_addr = "127.0.0.1:9000"
           [admin]
           api_bind_addr = "127.0.0.1:3903"
-          admin_token = "sbctl-ci-admin-token"
+          admin_token = "supavise-ci-admin-token"
           TOML
           docker run -d --name garage --network host \
             -v /tmp/garage/garage.toml:/etc/garage.toml \
@@ -81,8 +81,8 @@ jobs:
           docker exec garage /garage layout assign -z dc1 -c 1G "$ID"
           docker exec garage /garage layout apply --version 1
           docker exec garage /garage key import --yes -n ci GK0123456789abcdef01234567 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-          docker exec garage /garage bucket create sbctl-test
-          docker exec garage /garage bucket allow --read --write --owner sbctl-test --key ci
+          docker exec garage /garage bucket create supavise-test
+          docker exec garage /garage bucket allow --read --write --owner supavise-test --key ci
           for i in $(seq 1 30); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ || true)
             [ "$code" != "000" ] && break
@@ -95,10 +95,10 @@ jobs:
           go-version-file: go.mod
       - name: backup integration
         env:
-          SBCTL_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-          SBCTL_TEST_S3_BUCKET: sbctl-test
-          SBCTL_TEST_S3_ACCESS_KEY: GK0123456789abcdef01234567
-          SBCTL_TEST_S3_SECRET_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          SUPAVISE_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          SUPAVISE_TEST_S3_BUCKET: supavise-test
+          SUPAVISE_TEST_S3_ACCESS_KEY: GK0123456789abcdef01234567
+          SUPAVISE_TEST_S3_SECRET_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
         run: internal/backup/ci-integration.sh
       - if: failure()
         run: docker logs garage | tail -50
@@ -127,18 +127,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: build sbctl
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
       - name: fleet smoke
-        run: sudo LOG_DIR=/tmp/sbctl-fleet-logs SBCTL_BIN=/tmp/sbctl tests/linux/fleet-smoke.sh
+        run: sudo LOG_DIR=/tmp/supavise-fleet-logs SUPAVISE_BIN=/tmp/supavise tests/linux/fleet-smoke.sh
       - if: always()
         name: collect logs
-        run: sudo chmod -R a+rX /tmp/sbctl-fleet-logs || true
+        run: sudo chmod -R a+rX /tmp/supavise-fleet-logs || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fleet-smoke-${{ matrix.arch }}
-          path: /tmp/sbctl-fleet-logs
+          path: /tmp/supavise-fleet-logs
           if-no-files-found: ignore
 
   # Dashboard writes under systemd: settings saved through the Management API change the
@@ -158,18 +158,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: build sbctl
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
       - name: settings smoke
-        run: sudo LOG_DIR=/tmp/sbctl-settings-logs SBCTL_BIN=/tmp/sbctl tests/linux/settings-smoke.sh
+        run: sudo LOG_DIR=/tmp/supavise-settings-logs SUPAVISE_BIN=/tmp/supavise tests/linux/settings-smoke.sh
       - if: always()
         name: collect logs
-        run: sudo chmod -R a+rX /tmp/sbctl-settings-logs || true
+        run: sudo chmod -R a+rX /tmp/supavise-settings-logs || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: settings-smoke-${{ matrix.arch }}
-          path: /tmp/sbctl-settings-logs
+          path: /tmp/supavise-settings-logs
           if-no-files-found: ignore
 
   # Members and roles under systemd: users with each role, Studio's permission list, a Read-only
@@ -195,18 +195,18 @@ jobs:
         run: |
           npm install --prefix /tmp/sbcli supabase@2.119.0
           /tmp/sbcli/node_modules/.bin/supabase --version
-      - name: build sbctl
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
       - name: roles smoke
-        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/sbctl-roles-logs SBCTL_BIN=/tmp/sbctl SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase REQUIRE_CLIENTS=1 tests/linux/roles-smoke.sh
+        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-roles-logs SUPAVISE_BIN=/tmp/supavise SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase REQUIRE_CLIENTS=1 tests/linux/roles-smoke.sh
       - if: always()
         name: collect logs
-        run: sudo chmod -R a+rX /tmp/sbctl-roles-logs || true
+        run: sudo chmod -R a+rX /tmp/supavise-roles-logs || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: roles-smoke-${{ matrix.arch }}
-          path: /tmp/sbctl-roles-logs
+          path: /tmp/supavise-roles-logs
           if-no-files-found: ignore
 
   # Single sign-on under systemd against a real SAML identity provider (SimpleSAMLphp in a
@@ -232,18 +232,18 @@ jobs:
       # it with sudo, so a changed tag must not change what runs. tests/linux/sso-smoke.sh names the same digest.
       - name: identity provider image
         run: docker pull kristophjunge/test-saml-idp@sha256:02a6e56c01f94b9ba3f2151f33acedf4606ac9b7eeb62a874c5a6b032c0fa9cc
-      - name: build sbctl
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
       - name: sso smoke
-        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/sbctl-sso-logs SBCTL_BIN=/tmp/sbctl SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase tests/linux/sso-smoke.sh
+        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-sso-logs SUPAVISE_BIN=/tmp/supavise SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase tests/linux/sso-smoke.sh
       - if: always()
         name: collect logs
-        run: sudo chmod -R a+rX /tmp/sbctl-sso-logs || true
+        run: sudo chmod -R a+rX /tmp/supavise-sso-logs || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sso-smoke
-          path: /tmp/sbctl-sso-logs
+          path: /tmp/supavise-sso-logs
           if-no-files-found: ignore
 
   # The installer on a fresh VM: deploy/install.sh, the claim flow, a project through the
@@ -262,21 +262,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: build sbctl v0.0.1, v0.0.2 (installer upgrade) and v0.0.3 (self-update target)
+      - name: build supavise v0.0.1, v0.0.2 (installer upgrade) and v0.0.3 (self-update target)
         run: |
-          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/sbctl ./cmd/sbctl
-          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/sbctl-v2 ./cmd/sbctl
-          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.3" -o /tmp/sbctl-v3 ./cmd/sbctl
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/supavise-v2 ./cmd/supavise
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.3" -o /tmp/supavise-v3 ./cmd/supavise
       - name: install end to end
-        run: sudo LOG_DIR=/tmp/sbctl-install-logs SBCTL_BIN=/tmp/sbctl SBCTL_BIN_V2=/tmp/sbctl-v2 SBCTL_BIN_V3=/tmp/sbctl-v3 tests/linux/install-e2e.sh
+        run: sudo LOG_DIR=/tmp/supavise-install-logs SUPAVISE_BIN=/tmp/supavise SUPAVISE_BIN_V2=/tmp/supavise-v2 SUPAVISE_BIN_V3=/tmp/supavise-v3 tests/linux/install-e2e.sh
       - if: always()
         name: collect logs
-        run: sudo chmod -R a+rX /tmp/sbctl-install-logs || true
+        run: sudo chmod -R a+rX /tmp/supavise-install-logs || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: install-e2e-${{ matrix.arch }}
-          path: /tmp/sbctl-install-logs
+          path: /tmp/supavise-install-logs
           if-no-files-found: ignore
 
   functions-smoke:
@@ -293,18 +293,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: build sbctl
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
       - name: functions smoke
-        run: sudo LOG_DIR=/tmp/sbctl-functions-logs SBCTL_BIN=/tmp/sbctl tests/linux/functions-smoke.sh
+        run: sudo LOG_DIR=/tmp/supavise-functions-logs SUPAVISE_BIN=/tmp/supavise tests/linux/functions-smoke.sh
       - if: always()
         name: collect logs
-        run: sudo chmod -R a+rX /tmp/sbctl-functions-logs || true
+        run: sudo chmod -R a+rX /tmp/supavise-functions-logs || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: functions-smoke-${{ matrix.arch }}
-          path: /tmp/sbctl-functions-logs
+          path: /tmp/supavise-functions-logs
           if-no-files-found: ignore
 
   # Branch clones on real filesystems: copy-on-write on XFS (a loop file with reflink=1) and
@@ -330,14 +330,14 @@ jobs:
       # pg_cron jobs paused, a pg_net request to a non-loopback address fails (needs systemd).
       - name: branch egress isolation under systemd
         run: |
-          CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
-          sudo LOG_DIR=/tmp/sbctl-egress-logs SBCTL_BIN=/tmp/sbctl tests/linux/branching-egress.sh
+          CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
+          sudo LOG_DIR=/tmp/supavise-egress-logs SUPAVISE_BIN=/tmp/supavise tests/linux/branching-egress.sh
       - if: always()
         name: collect logs
-        run: sudo chmod -R a+rX /tmp/sbctl-egress-logs || true
+        run: sudo chmod -R a+rX /tmp/supavise-egress-logs || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: branching-egress
-          path: /tmp/sbctl-egress-logs
+          path: /tmp/supavise-egress-logs
           if-no-files-found: ignore

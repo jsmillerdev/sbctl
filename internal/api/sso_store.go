@@ -12,8 +12,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// SSOProviderRow is what sbctl records about a SAML identity provider it registered in
-// sb-gotrue@system (registry migration 1000_sso.sql); GoTrue's own tables hold the metadata.
+// SSOProviderRow is what supavise records about a SAML identity provider it registered in
+// supavise-gotrue@system (registry migration 1000_sso.sql); GoTrue's own tables hold the metadata.
 type SSOProviderRow struct {
 	ID       string // GoTrue's provider id
 	OrgID    int64
@@ -98,7 +98,7 @@ func (s *PGSSOStore) PutProvider(ctx context.Context, p SSOProviderRow) error {
 		domains = []string{}
 	}
 	_, err := s.pool.Exec(ctx, `
-		insert into sbctl.sso_providers (id, org_id, entity_id, domains, default_role, created_by)
+		insert into supavise.sso_providers (id, org_id, entity_id, domains, default_role, created_by)
 		values ($1, $2, $3, $4, $5, $6)
 		on conflict (id) do update set org_id = excluded.org_id, entity_id = excluded.entity_id,
 			domains = excluded.domains, default_role = excluded.default_role`,
@@ -110,11 +110,11 @@ func (s *PGSSOStore) GetProvider(ctx context.Context, id string) (*SSOProviderRo
 	if !validUUID(id) {
 		return nil, ErrNotFound
 	}
-	return scanSSOProvider(s.pool.QueryRow(ctx, `select `+ssoProviderCols+` from sbctl.sso_providers where id = $1`, id))
+	return scanSSOProvider(s.pool.QueryRow(ctx, `select `+ssoProviderCols+` from supavise.sso_providers where id = $1`, id))
 }
 
 func (s *PGSSOStore) ListProviders(ctx context.Context) ([]SSOProviderRow, error) {
-	rows, err := s.pool.Query(ctx, `select `+ssoProviderCols+` from sbctl.sso_providers order by created_at, id`)
+	rows, err := s.pool.Query(ctx, `select `+ssoProviderCols+` from supavise.sso_providers order by created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -136,14 +136,14 @@ func (s *PGSSOStore) DeleteProvider(ctx context.Context, id string) ([]SSOUser, 
 	}
 	var users []SSOUser
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `delete from sbctl.sso_providers where id = $1`, id)
+		tag, err := tx.Exec(ctx, `delete from supavise.sso_providers where id = $1`, id)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
 			return ErrNotFound
 		}
-		rows, err := tx.Query(ctx, `delete from sbctl.sso_users where provider_id = $1
+		rows, err := tx.Query(ctx, `delete from supavise.sso_users where provider_id = $1
 			returning user_id::text, provider_id::text, email, state, first_seen, last_seen`, id)
 		if err != nil {
 			return err
@@ -172,11 +172,11 @@ func (s *PGSSOStore) GetSSOUser(ctx context.Context, userID string) (*SSOUser, e
 	if !validUUID(userID) {
 		return nil, ErrNotFound
 	}
-	return scanSSOUser(s.pool.QueryRow(ctx, `select `+ssoUserCols+` from sbctl.sso_users where user_id = $1`, userID))
+	return scanSSOUser(s.pool.QueryRow(ctx, `select `+ssoUserCols+` from supavise.sso_users where user_id = $1`, userID))
 }
 
 func (s *PGSSOStore) InsertSSOUser(ctx context.Context, u SSOUser) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `insert into sbctl.sso_users (user_id, provider_id, email, state, first_seen, last_seen)
+	tag, err := s.pool.Exec(ctx, `insert into supavise.sso_users (user_id, provider_id, email, state, first_seen, last_seen)
 		values ($1, $2, $3, $4, $5, $5) on conflict (user_id) do nothing`, u.UserID, u.ProviderID, u.Email, u.State, u.FirstSeen)
 	if err != nil {
 		return false, err
@@ -185,7 +185,7 @@ func (s *PGSSOStore) InsertSSOUser(ctx context.Context, u SSOUser) (bool, error)
 }
 
 func (s *PGSSOStore) SetSSOUserState(ctx context.Context, userID, state string, at time.Time) error {
-	tag, err := s.pool.Exec(ctx, `update sbctl.sso_users set state = $2, last_seen = $3 where user_id = $1`, userID, state, at)
+	tag, err := s.pool.Exec(ctx, `update supavise.sso_users set state = $2, last_seen = $3 where user_id = $1`, userID, state, at)
 	if err != nil {
 		return err
 	}
@@ -196,7 +196,7 @@ func (s *PGSSOStore) SetSSOUserState(ctx context.Context, userID, state string, 
 }
 
 func (s *PGSSOStore) ListSSOUsers(ctx context.Context, state string, providers []string) ([]SSOUser, error) {
-	q := `select ` + ssoUserCols + ` from sbctl.sso_users where ($1 = '' or state = $1)`
+	q := `select ` + ssoUserCols + ` from supavise.sso_users where ($1 = '' or state = $1)`
 	args := []any{state}
 	if providers != nil {
 		q += ` and provider_id = any($2::uuid[])`
@@ -222,7 +222,7 @@ func (s *PGSSOStore) DeleteSSOUser(ctx context.Context, userID string) error {
 	if !validUUID(userID) {
 		return nil
 	}
-	_, err := s.pool.Exec(ctx, `delete from sbctl.sso_users where user_id = $1`, userID)
+	_, err := s.pool.Exec(ctx, `delete from supavise.sso_users where user_id = $1`, userID)
 	return err
 }
 
@@ -230,8 +230,8 @@ func (s *PGSSOStore) DenySSOEmail(ctx context.Context, providerID, email string,
 	if !validUUID(providerID) {
 		return nil
 	}
-	_, err := s.pool.Exec(ctx, `insert into sbctl.sso_denied (provider_id, email, denied_at)
-		select id, lower($2::text), $3::timestamptz from sbctl.sso_providers where id = $1 on conflict do nothing`, providerID, email, at)
+	_, err := s.pool.Exec(ctx, `insert into supavise.sso_denied (provider_id, email, denied_at)
+		select id, lower($2::text), $3::timestamptz from supavise.sso_providers where id = $1 on conflict do nothing`, providerID, email, at)
 	return err
 }
 
@@ -239,7 +239,7 @@ func (s *PGSSOStore) AllowSSOEmail(ctx context.Context, providerID, email string
 	if !validUUID(providerID) {
 		return false, nil
 	}
-	tag, err := s.pool.Exec(ctx, `delete from sbctl.sso_denied where provider_id = $1 and email = lower($2::text)`, providerID, email)
+	tag, err := s.pool.Exec(ctx, `delete from supavise.sso_denied where provider_id = $1 and email = lower($2::text)`, providerID, email)
 	return tag.RowsAffected() > 0, err
 }
 
@@ -248,7 +248,7 @@ func (s *PGSSOStore) SSOEmailDenied(ctx context.Context, providerID, email strin
 		return false, nil
 	}
 	var ok bool
-	err := s.pool.QueryRow(ctx, `select exists (select 1 from sbctl.sso_denied where provider_id = $1 and email = lower($2::text))`, providerID, email).Scan(&ok)
+	err := s.pool.QueryRow(ctx, `select exists (select 1 from supavise.sso_denied where provider_id = $1 and email = lower($2::text))`, providerID, email).Scan(&ok)
 	return ok, err
 }
 

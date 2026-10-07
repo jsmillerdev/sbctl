@@ -15,6 +15,7 @@
 # GUARD_WAIT_SECS (900), GUARD_SLOTS (2), GUARD_LOCK (/tmp/sbctl-guard.lock), GUARD_LOG (~/.cache/sbctl/guard.log).
 set -uo pipefail
 
+# The lock, pid and cache paths keep their old names (/tmp/sbctl-guard.lock, ~/.cache/sbctl) because other checkouts on this machine still share them.
 MIN_FREE_PCT=${GUARD_MIN_FREE_PCT:-25}
 MIN_DISK_GB=${GUARD_MIN_DISK_GB:-6}
 MAX_SWAP_GROWTH_MB=${GUARD_MAX_SWAP_GROWTH_MB:-1500}

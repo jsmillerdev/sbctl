@@ -1,12 +1,12 @@
 package api
 
-// Integration tests against a real Postgres and a real sb-pgmeta, both unpacked
+// Integration tests against a real Postgres and a real supavise-pgmeta, both unpacked
 // from the slim-services darwin-arm64 artifacts. They are gated: they start two
 // processes and cost a few hundred MB.
 //
-//	SBCTL_API_INTEGRATION=1 \
-//	SBCTL_PG_BIN=$HOME/.cache/sbctl/unpacked/postgres-17.11.0.004-r1-darwin-arm64/bin \
-//	SBCTL_PGMETA_BIN=$HOME/.cache/sbctl/unpacked/pgmeta-v0.100.0-r0-darwin-arm64/bin/pgmeta \
+//	SUPAVISE_API_INTEGRATION=1 \
+//	SUPAVISE_PG_BIN=$HOME/.cache/sbctl/unpacked/postgres-17.11.0.004-r1-darwin-arm64/bin \
+//	SUPAVISE_PGMETA_BIN=$HOME/.cache/sbctl/unpacked/pgmeta-v0.100.0-r0-darwin-arm64/bin/pgmeta \
 //	scripts/guard.sh -- go test ./internal/api -run Integration -v
 //
 // Everything listens on 127.0.0.1 in 32100-32999 and is stopped by test cleanup.
@@ -31,10 +31,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 type stack struct {
@@ -55,18 +55,18 @@ type stack struct {
 	Server  *Server
 }
 
-// itLogger discards the server's logs unless SBCTL_API_IT_LOG is set.
+// itLogger discards the server's logs unless SUPAVISE_API_IT_LOG is set.
 func itLogger() *slog.Logger {
-	if os.Getenv("SBCTL_API_IT_LOG") != "" {
+	if os.Getenv("SUPAVISE_API_IT_LOG") != "" {
 		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // portBase is the first port of the 900 the stack picks from: 32100 unless
-// SBCTL_API_IT_PORT_BASE says otherwise (a machine that reserves another range).
+// SUPAVISE_API_IT_PORT_BASE says otherwise (a machine that reserves another range).
 func portBase() int {
-	if v, err := strconv.Atoi(os.Getenv("SBCTL_API_IT_PORT_BASE")); err == nil && v > 1024 && v < 64000 {
+	if v, err := strconv.Atoi(os.Getenv("SUPAVISE_API_IT_PORT_BASE")); err == nil && v > 1024 && v < 64000 {
 		return v
 	}
 	return 32100
@@ -108,17 +108,17 @@ func waitHTTP(t testing.TB, url string) {
 	t.Fatalf("%s did not come up", url)
 }
 
-// startStack starts Postgres (one instance, small), sb-pgmeta and the API server.
+// startStack starts Postgres (one instance, small), supavise-pgmeta and the API server.
 func startStack(t testing.TB) *stack {
 	t.Helper()
-	if os.Getenv("SBCTL_API_INTEGRATION") == "" {
-		t.Skip("set SBCTL_API_INTEGRATION=1 (see integration_test.go)")
+	if os.Getenv("SUPAVISE_API_INTEGRATION") == "" {
+		t.Skip("set SUPAVISE_API_INTEGRATION=1 (see integration_test.go)")
 	}
-	pgBin, pgmetaBin := os.Getenv("SBCTL_PG_BIN"), os.Getenv("SBCTL_PGMETA_BIN")
+	pgBin, pgmetaBin := os.Getenv("SUPAVISE_PG_BIN"), os.Getenv("SUPAVISE_PGMETA_BIN")
 	if pgBin == "" || pgmetaBin == "" {
-		t.Skip("set SBCTL_PG_BIN and SBCTL_PGMETA_BIN to the unpacked artifacts")
+		t.Skip("set SUPAVISE_PG_BIN and SUPAVISE_PGMETA_BIN to the unpacked artifacts")
 	}
-	dir, err := os.MkdirTemp("", "sbctl-api-it-")
+	dir, err := os.MkdirTemp("", "supavise-api-it-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func startStack(t testing.TB) *stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rules := "host all sbctl_read_only 127.0.0.1/32 scram-sha-256\nhost all /^(cli_login_|sbctl_cli_ro_).*$ 127.0.0.1/32 scram-sha-256\n"
+	rules := "host all supavise_read_only 127.0.0.1/32 scram-sha-256\nhost all /^(cli_login_|supavise_cli_ro_).*$ 127.0.0.1/32 scram-sha-256\n"
 	if err := os.WriteFile(hba, append([]byte(rules), old...), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -149,12 +149,12 @@ func startStack(t testing.TB) *stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.Exec(ctx, `create database sbctl`); err != nil {
+	if _, err := conn.Exec(ctx, `create database supavise`); err != nil {
 		t.Fatal(err)
 	}
 	conn.Close(ctx)
 
-	reg, err := registry.Open(ctx, fmt.Sprintf("postgres://postgres@127.0.0.1:%d/sbctl?sslmode=disable&pool_max_conns=4", pgPort))
+	reg, err := registry.Open(ctx, fmt.Sprintf("postgres://postgres@127.0.0.1:%d/supavise?sslmode=disable&pool_max_conns=4", pgPort))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func startStack(t testing.TB) *stack {
 
 	sec, _ := secrets.New(make([]byte, 32))
 	cfg := config.Default()
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	cfg.TLS.Mode = "off"
 	cfg.Ports.PGMeta = metaPort
 	cfg.API.PGMetaCryptoKey = cryptoKey
@@ -474,7 +474,7 @@ func TestIntegrationDatabase(t *testing.T) {
 	}
 	conn.Close(ctx)
 	mustStatus(200, "DELETE", p+"/cli/login-role", nil)
-	b = mustStatus(201, "POST", p+"/database/query", map[string]any{"query": "select count(*) as n from pg_roles where rolname like 'cli\\_login\\_%' or rolname like 'sbctl\\_cli\\_ro\\_%'"})
+	b = mustStatus(201, "POST", p+"/database/query", map[string]any{"query": "select count(*) as n from pg_roles where rolname like 'cli\\_login\\_%' or rolname like 'supavise\\_cli\\_ro\\_%'"})
 	if !strings.Contains(string(b), `"n":0`) {
 		t.Fatalf("login roles not removed: %s", b)
 	}
@@ -518,13 +518,13 @@ func mustJSON2(v any) []byte { b, _ := json.Marshal(v); return b }
 // TestIntegrationServe starts the stack and keeps it up so real clients (the
 // Supabase CLI, the MCP server) can be pointed at it from a shell:
 //
-//	SBCTL_API_SERVE_FILE=$PWD/stack.json ... go test ./internal/api -run IntegrationServe
+//	SUPAVISE_API_SERVE_FILE=$PWD/stack.json ... go test ./internal/api -run IntegrationServe
 //
 // It writes connection details to the file as JSON and runs until the file is deleted.
 func TestIntegrationServe(t *testing.T) {
-	path := os.Getenv("SBCTL_API_SERVE_FILE")
+	path := os.Getenv("SUPAVISE_API_SERVE_FILE")
 	if path == "" {
-		t.Skip("set SBCTL_API_SERVE_FILE to serve the stack for manual client runs")
+		t.Skip("set SUPAVISE_API_SERVE_FILE to serve the stack for manual client runs")
 	}
 	s := startStack(t)
 	info, _ := json.MarshalIndent(map[string]any{
@@ -645,7 +645,7 @@ func TestIntegrationRoles(t *testing.T) {
 	}
 	// The CLI's login role for a Read-only member cannot write either.
 	code, b := callAs("ro", "POST", p+"/cli/login-role", map[string]any{"read_only": false})
-	if code != 201 || !strings.Contains(b, "sbctl_cli_ro_") {
+	if code != 201 || !strings.Contains(b, "supavise_cli_ro_") {
 		t.Fatalf("read-only login role: %d %s", code, b)
 	}
 	var lr struct {

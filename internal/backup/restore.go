@@ -17,10 +17,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // ErrForceRequired is returned when a restore would replace a project's own data and
@@ -248,7 +248,7 @@ func (s *Service) restoreAsNew(ctx context.Context, plan *RestorePlan, src *secr
 		return nil, fmt.Errorf("backup: create restored project %s: %w", plan.TargetRef, err)
 	}
 	if _, err := s.resetRecoverySettings(ctx, plan.TargetRef); err != nil {
-		return nil, fmt.Errorf("backup: project %s was created but its recovery did not finish, so it holds no usable data (it is registered so that its postgres log can be read; `sbctl projects delete` removes it without a final backup, since there is nothing to back up): %w", plan.TargetRef, err)
+		return nil, fmt.Errorf("backup: project %s was created but its recovery did not finish, so it holds no usable data (it is registered so that its postgres log can be read; `supavise projects delete` removes it without a final backup, since there is nothing to back up): %w", plan.TargetRef, err)
 	}
 	return p, nil
 }
@@ -312,7 +312,7 @@ func (s *Service) restoreInPlace(ctx context.Context, plan *RestorePlan) (*regis
 		// The new timeline has no base backup yet, and the ones of the old timeline taken
 		// after the fork are unusable for it. Take one now rather than at the next timer run.
 		if _, err := s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonRestore}); err != nil {
-			s.opt.Log.Warn("base backup after in-place restore failed; run `sbctl backups create`", "ref", ref, "err", err)
+			s.opt.Log.Warn("base backup after in-place restore failed; run `supavise backups create`", "ref", ref, "err", err)
 			_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.backup_pending", map[string]any{"error": err.Error()})
 		}
 	} else {
@@ -436,7 +436,7 @@ func (s *Service) resetRecoverySettings(ctx context.Context, ref string) (bool, 
 		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.recovery_failed", map[string]any{"error": err.Error()})
 		return false, err
 	case errors.Is(err, errStillRecovering):
-		s.opt.Log.Warn("restored cluster is still in recovery; recovery settings left in place (run `sbctl backups finish-restore`)", "ref", ref, "err", err)
+		s.opt.Log.Warn("restored cluster is still in recovery; recovery settings left in place (run `supavise backups finish-restore`)", "ref", ref, "err", err)
 		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.cleanup_pending", map[string]any{"error": err.Error()})
 	default:
 		s.opt.Log.Warn("could not clear recovery settings after restore", "ref", ref, "err", err)
@@ -710,7 +710,7 @@ func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) e
 
 	// The Supabase launcher refuses an existing cluster without a non-empty
 	// postmaster.opts, and pg_basebackup-style backups omit it. Postgres rewrites it.
-	if err := writeSyncFile(filepath.Join(dataDir, "postmaster.opts"), []byte("# recreated by sbctl restore\n"), 0o600); err != nil {
+	if err := writeSyncFile(filepath.Join(dataDir, "postmaster.opts"), []byte("# recreated by supavise restore\n"), 0o600); err != nil {
 		return err
 	}
 	conf, err := os.OpenFile(filepath.Join(dataDir, "postgresql.auto.conf"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
@@ -765,11 +765,11 @@ func (s *Service) recoveryConf(plan *RestorePlan) string {
 	var b strings.Builder
 	switch plan.Mode {
 	case RestoreToLatest:
-		fmt.Fprintf(&b, "\n# --- sbctl restore of %s (backup %s) to the end of the archive ---\n", plan.Source, plan.Manifest.ID)
+		fmt.Fprintf(&b, "\n# --- supavise restore of %s (backup %s) to the end of the archive ---\n", plan.Source, plan.Manifest.ID)
 	case RestoreToBackup:
-		fmt.Fprintf(&b, "\n# --- sbctl restore of %s to the end of backup %s ---\n", plan.Source, plan.Manifest.ID)
+		fmt.Fprintf(&b, "\n# --- supavise restore of %s to the end of backup %s ---\n", plan.Source, plan.Manifest.ID)
 	default:
-		fmt.Fprintf(&b, "\n# --- sbctl restore of %s (backup %s) to %s ---\n", plan.Source, plan.Manifest.ID, plan.Target.UTC().Format(time.RFC3339))
+		fmt.Fprintf(&b, "\n# --- supavise restore of %s (backup %s) to %s ---\n", plan.Source, plan.Manifest.ID, plan.Target.UTC().Format(time.RFC3339))
 	}
 	fmt.Fprintf(&b, "archive_mode = on\narchive_command = %s\n", confString(ArchiveCommandFor(c, plan.TargetRef, cfgPath)))
 	fmt.Fprintf(&b, "restore_command = %s\n", confString(RestoreCommandFor(c, plan.Source, plan.TargetRef, cfgPath)))

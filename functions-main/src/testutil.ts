@@ -108,7 +108,7 @@ export async function writeBundle(
   await Deno.mkdir(gen, { recursive: true })
   await Deno.writeFile(`${gen}/bundle.eszip`, eszip)
   await Deno.writeTextFile(
-    `${gen}/.sbctl-function.json`,
+    `${gen}/.supavise-function.json`,
     JSON.stringify({
       slug,
       version,

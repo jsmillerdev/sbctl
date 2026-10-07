@@ -12,7 +12,7 @@ project's PostgreSQL, GoTrue and PostgREST as units of a `units.Supervisor`.
    PGDATA (0600), then `bin/supabase-postgres-start` with these server arguments:
    `-p <port>`, `listen_addresses=127.0.0.1`, `unix_socket_directories=<project>/postgres/sock`
    (mode 0700), `hba_file`, `wal_level=logical`, `archive_mode=on`,
-   `archive_command` and `archive_timeout`, `PlaneOptions.ArchiveCommandFor` and `ArchiveTimeout`: `internal/app` passes `backup.ArchiveCommandFor(cfg, ref, config file)` (shell-quoted, `%` doubled; the relay form `--socket <state>/projects/<ref>/wal/r.sock` under systemd, otherwise `--config` when the daemon loaded a non-default file; the relay form also drops `SBCTL_CONFIG` from the unit's environment) and `[backup] archive_timeout_seconds` (default 300); without them the plane falls back to a built-in quoting of `bin_path` and 900 s,
+   `archive_command` and `archive_timeout`, `PlaneOptions.ArchiveCommandFor` and `ArchiveTimeout`: `internal/app` passes `backup.ArchiveCommandFor(cfg, ref, config file)` (shell-quoted, `%` doubled; the relay form `--socket <state>/projects/<ref>/wal/r.sock` under systemd, otherwise `--config` when the daemon loaded a non-default file; the relay form also drops `SUPAVISE_CONFIG` from the unit's environment) and `[backup] archive_timeout_seconds` (default 300); without them the plane falls back to a built-in quoting of `bin_path` and 900 s,
    `max_wal_senders=5`, and `shared_buffers`, `effective_cache_size`,
    `maintenance_work_mem`, `max_wal_size`, `max_connections` from the project class
    (`micro`, `default`/`small`, `medium`, `large`; default is 32MB and 60 connections).
@@ -42,8 +42,8 @@ and the daemon cannot run, say, delete and resume on the same project at once.
 
 `pg_hba.conf` is ours, not the artifact's: the artifact trusts all loopback connections,
 which on a shared host means every local user. Ours trusts `supabase_admin` on the unix
-socket only (the directory is private to the `sbctl` user) and requires scram-sha-256 on
-TCP. The socket is how sbctl reaches its own registry before it can decrypt any secret.
+socket only (the directory is private to the `supavise` user) and requires scram-sha-256 on
+TCP. The socket is how Supavise reaches its own registry before it can decrypt any secret.
 
 `pg_cron` runs its jobs in background workers of the cluster (`cron.use_background_workers=on`,
 `cron.database_name=postgres`, `cron.max_running_jobs=8`, `max_worker_processes=16`; see
@@ -84,7 +84,7 @@ pending restart); no migration is needed.
   never leaves a project without a usable default pair.
 - `Health`: unit state plus SQL ping, GoTrue `/health`, PostgREST `/`; moves
   `ACTIVE_HEALTHY` and `ACTIVE_UNHEALTHY` to match.
-- `StartActive`: starts every active project (after a reboot or `sbctl system stop`). It lists the projects first and starts them one at a time; each start re-reads the project after taking its lock, so a pause or delete that landed in between is not undone.
+- `StartActive`: starts every active project (after a reboot or `supavise system stop`). It lists the projects first and starts them one at a time; each start re-reads the project after taking its lock, so a pause or delete that landed in between is not undone.
 - `PostgresPlane.prepare` also creates `projects/<ref>/wal/` (the relay directory the Postgres unit bind-mounts read-only) and calls `PlaneOptions.ArchiveReady(ref)` so the daemon serves that project's WAL relay socket before the cluster starts.
 - `Recover`: run once by the daemon before `StartActive`. A crash in the middle of an
   operation leaves a project in a status nothing else would move: `PAUSING` becomes
@@ -98,10 +98,10 @@ pending restart); no migration is needed.
   the pause is flagged `Recovered.Resume`, and `ResumeRecovered` brings the project back; a stale
   request on a project that is not paused is cleared. `RESTORING` is not touched. Each move is a
   `project.recovered` event.
-- Backup timers: with the systemd backend the Engine starts `sb-basebackup@<ref>.timer` when
+- Backup timers: with the systemd backend the Engine starts `supavise-basebackup@<ref>.timer` when
   a project becomes active (create, resume, start) and stops it on pause and delete
   (`Options.Timers`; failures are logged, never fatal). The timers are not enabled for boot;
-  `sbctl serve` starts the system project's timer and the prune timer at boot.
+  `supavise serve` starts the system project's timer and the prune timer at boot.
 - Region: `CreateRequest.Region` is kept when it is an AWS region code, otherwise the
   configured `region` (default `us-east-1`) is stored: Studio and the CLI resolve the project
   region against a list of real regions, and an unknown one breaks the project list.
@@ -155,9 +155,9 @@ fails and only warns when the pooler cannot be reached.
 
 `InitSystem` is the same code path with ref `system` on `[ports] system_postgres` and
 `system_gotrue`, class `system`, and no PostgREST. It creates the master key, starts the
-cluster, creates databases `sbctl`, `_supavisor`, `_realtime` and `_storage`. Each of the
-last three belongs to its own login role (`FleetRoles`: `sbctl_supavisor`,
-`sbctl_realtime`, `sbctl_storage`), which owns the database and the same-named schema,
+cluster, creates databases `supavise`, `_supavisor`, `_realtime` and `_storage`. Each of the
+last three belongs to its own login role (`FleetRoles`: `supavise_supavisor`,
+`supavise_realtime`, `supavise_storage`), which owns the database and the same-named schema,
 has no other access, and whose password is sealed in the registry
 (`Engine.FleetCredentials`); fleet services connect with those, not as `supabase_admin`.
 `supabase_storage_admin` may also use `_storage`. It applies the registry migrations, records the system project and its
@@ -172,7 +172,7 @@ says how to recover.
 packages use to reach the registry.
 
 **Dashboard SSO in the system GoTrue.** With `PlaneOptions.SystemAuth` (set by `Open` and `InitSystem`;
-`systemAuth` in `system.go`) `sb-gotrue@system` gets `GOTRUE_SAML_ENABLED=true` and a signing key of its own (the
+`systemAuth` in `system.go`) `supavise-gotrue@system` gets `GOTRUE_SAML_ENABLED=true` and a signing key of its own (the
 system secret `saml_private_key`, created on first use), and its before-user-created hook points at the daemon's
 loopback listener (`sso.HookURL`, signed with a secret derived from the master key). `GOTRUE_DISABLE_SIGNUP` is `false`
 there: GoTrue creates an SSO user by signing them up, so it cannot stay on. Sign-up stays closed because the hook
@@ -180,7 +180,7 @@ refuses everything the daemon does not vouch for (internal/api, Single sign-on),
 daemon does not answer. Without `SystemAuth` (tests, a Secrets that cannot derive keys) the unit is rendered as before,
 with sign-up closed. `PostgresPlane.RefreshSystemAuth` renders the unit again and restarts it only when the files
 changed; the daemon calls it at every start, so a node that is upgraded, or whose `[mail]` changed, picks the new
-environment up without `sbctl system init`.
+environment up without `supavise system init`.
 
 Choices worth knowing:
 
@@ -202,7 +202,7 @@ Choices worth knowing:
 
 ```
 go test ./internal/lifecycle/                       # fakes: state machine, specs, failure paths
-SBCTL_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked \
+SUPAVISE_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked \
   go test -run Integration -v ./internal/lifecycle/ # real artifacts, exec backend
 ```
 

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 func testCreds(t *testing.T, n *testNode) *creds {
@@ -46,7 +46,7 @@ func TestSpecsCoverEveryService(t *testing.T) {
 		if s.Limits != n.cfg.Defaults {
 			t.Errorf("%s: limits %+v", s.Service, s.Limits)
 		}
-		if got := s.Unit(); got != "sb-"+s.Service+".service" {
+		if got := s.Unit(); got != "supavise-"+s.Service+".service" {
 			t.Errorf("unit %q", got)
 		}
 		// Every service must render a runnable launcher script.
@@ -98,7 +98,7 @@ func TestSupavisorEnv(t *testing.T) {
 	c := testCreds(t, n)
 	env := supavisorEnv(n.cfg, c)
 	want := map[string]string{
-		"DATABASE_URL":            "ecto://sbctl_supavisor:pw-supavisor@127.0.0.1:37001/_supavisor",
+		"DATABASE_URL":            "ecto://supavise_supavisor:pw-supavisor@127.0.0.1:37001/_supavisor",
 		"PORT":                    "37012",
 		"PROXY_PORT_SESSION":      "37010",
 		"PROXY_PORT_TRANSACTION":  "37011",
@@ -141,10 +141,10 @@ func TestRealtimeEnv(t *testing.T) {
 	want := map[string]string{
 		"PORT":                    "37020",
 		"PHX_HTTP_IP":             "127.0.0.1",
-		"APP_NAME":                "sbctl",
+		"APP_NAME":                "supavise",
 		"DB_HOST":                 "127.0.0.1",
 		"DB_PORT":                 "37001",
-		"DB_USER":                 "sbctl_realtime",
+		"DB_USER":                 "supavise_realtime",
 		"DB_PASSWORD":             "pw-realtime",
 		"DB_NAME":                 "_realtime",
 		"DB_AFTER_CONNECT_QUERY":  "SET search_path TO _realtime",
@@ -183,7 +183,7 @@ func TestStorageEnvFile(t *testing.T) {
 	}
 	want := map[string]string{
 		"MULTI_TENANT":                       "true",
-		"DATABASE_MULTITENANT_URL":           "postgres://sbctl_storage:pw-storage@127.0.0.1:37001/_storage",
+		"DATABASE_MULTITENANT_URL":           "postgres://supavise_storage:pw-storage@127.0.0.1:37001/_storage",
 		"SERVER_HOST":                        "127.0.0.1",
 		"SERVER_PORT":                        "37030",
 		"SERVER_ADMIN_PORT":                  "37031",
@@ -255,7 +255,7 @@ func TestStorageEnvS3AndValidation(t *testing.T) {
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok || env["STORAGE_S3_REGION"] != "eu-west-1" {
 		t.Errorf("env = %v", env)
 	}
-	// ... but not under systemd, where sb-storage cannot reach the instance role: static
+	// ... but not under systemd, where supavise-storage cannot reach the instance role: static
 	// keys are required, and the error says why.
 	n.cfg.Supervisor = config.SupervisorSystemd
 	if _, err := storageEnv(n.cfg, c); err == nil || !strings.Contains(err.Error(), "IMDS") {

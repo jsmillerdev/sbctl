@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // ArchiveCommand is the archive_command for ref's cluster. Postgres runs it from the
@@ -32,7 +32,7 @@ func RestoreCommandRelay(binPath, source, socket string) string {
 }
 
 // ArchiveCommandFor is the archive_command of ref's cluster under c: through the relay
-// when c.WALRelayEnabled, else `sbctl wal push` reading the config file at configPath.
+// when c.WALRelayEnabled, else `supavise wal push` reading the config file at configPath.
 func ArchiveCommandFor(c *config.Config, ref, configPath string) string {
 	if c.WALRelayEnabled() {
 		return ArchiveCommandRelay(c.BinPath, ref, c.Paths().WALSocket(ref))

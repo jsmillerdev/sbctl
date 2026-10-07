@@ -163,7 +163,7 @@ func (d *pgDatabase) conn(ctx context.Context, ref string) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	cc.RuntimeParams["application_name"] = "sbctl-branching"
+	cc.RuntimeParams["application_name"] = "supavise-branching"
 	return pgx.ConnectConfig(ctx, cc)
 }
 
@@ -261,7 +261,7 @@ func (d *pgDatabase) Apply(ctx context.Context, ref string, ms []Migration, o Ap
 		// released when the connection closes. The decision to apply was made before the lock
 		// was held: look again, so that a version another merge just applied is not run twice, and let
 		// the caller check its whole plan (divergence included) against the history as it is now.
-		if _, err := c.Exec(ctx, `select pg_advisory_lock(hashtext('sbctl.branching.apply'))`); err != nil {
+		if _, err := c.Exec(ctx, `select pg_advisory_lock(hashtext('supavise.branching.apply'))`); err != nil {
 			return res, fmt.Errorf("wait for other migrations on %s: %w", ref, err)
 		}
 		current, err := readMigrations(ctx, c)

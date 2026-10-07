@@ -15,20 +15,20 @@ import (
 	sddbus "github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // Systemd is the production Supervisor. It drives systemd over D-Bus (pure Go, no
 // systemctl) and relies on the static templates installed from deploy/systemd:
 // each template runs <state_dir>/projects/<ref>/<svc>.run and reads
-// <state_dir>/projects/<ref>/<svc>.env, which Render writes as the sbctl user. Per-unit
+// <state_dir>/projects/<ref>/<svc>.env, which Render writes as the supavise user. Per-unit
 // MemoryMax and CPUQuota are persistent drop-ins that systemd writes itself
 // (SetUnitProperties with runtime=false, under /etc/systemd/system.control), so
 // Render never needs a daemon-reload. Reload is only needed after the templates
-// change, which only root does (sbctl system install-units).
+// change, which only root does (supavise system install-units).
 //
-// Running as a non-root user needs the polkit rule in deploy/systemd/50-sbctl.rules,
-// which grants manage-units on sb-* units and nothing else.
+// Running as a non-root user needs the polkit rule in deploy/systemd/50-supavise.rules,
+// which grants manage-units on supavise-* units and nothing else.
 type Systemd struct {
 	cfg *config.Config
 	log *slog.Logger
@@ -313,8 +313,8 @@ func (s *Systemd) Remove(ctx context.Context, unit string) error {
 // cleanCache removes the module cache of the bundler instance unit, which is private to the
 // instance's dynamic uid (CacheDirectory=), so the daemon cannot delete it. A user other than
 // root cannot ask systemd to do it either (CleanUnit is refused by the D-Bus policy of
-// systemd, before polkit is asked), so a one-shot unit that the polkit rule lets the sbctl user
-// start does the removal as root (deploy/systemd/sb-edge-bundle-clean@.service).
+// systemd, before polkit is asked), so a one-shot unit that the polkit rule lets the supavise user
+// start does the removal as root (deploy/systemd/supavise-edge-bundle-clean@.service).
 func (s *Systemd) cleanCache(ctx context.Context, unit string) error {
 	_, ref, err := ParseUnit(unit)
 	if err != nil {
@@ -325,7 +325,7 @@ func (s *Systemd) cleanCache(ctx context.Context, unit string) error {
 
 // revert lifts the limits SetLimits wrote by setting them back to infinity. Removing the
 // drop-in files (RevertUnitFiles) would need the manage-unit-files polkit action, which
-// the sbctl user must not hold; the inert drop-in that remains is harmless and a later
+// the supavise user must not hold; the inert drop-in that remains is harmless and a later
 // project with the same ref overwrites it.
 func (s *Systemd) revert(ctx context.Context, unit string) error {
 	c, err := s.dial(ctx)
@@ -354,7 +354,7 @@ var _ Enabler = (*Systemd)(nil)
 func (*Systemd) Sandboxed() bool { return true }
 
 // Enable makes units start at boot (systemctl enable). Template instances such as
-// "sb-postgres@system.service" are accepted.
+// "supavise-postgres@system.service" are accepted.
 func (s *Systemd) Enable(ctx context.Context, units ...string) error {
 	c, err := s.dial(ctx)
 	if err != nil {

@@ -16,10 +16,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/xdg-go/stringprep"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
-// Roles whose passwords sbctl sets after the cluster exists, keyed by the role name.
+// Roles whose passwords supavise sets after the cluster exists, keyed by the role name.
 // They all exist after the artifact's init migrations.
 const (
 	RoleAdmin       = "supabase_admin"
@@ -66,17 +66,17 @@ func kvQuote(s string) string {
 
 // socketDSN is a libpq connection string to the cluster's unix socket as
 // supabase_admin, which pg_hba trusts on the socket (the directory is private to the
-// sbctl user). No password is needed, which is what lets sbctl read its own registry
+// supavise user). No password is needed, which is what lets supavise read its own registry
 // before it can decrypt any secret.
 func socketDSN(p pgPaths, db string) string {
-	return fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable connect_timeout=5 application_name=sbctl",
+	return fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable connect_timeout=5 application_name=supavise",
 		kvQuote(p.Sock), p.Port, RoleAdmin, db)
 }
 
-// RegistryDSN is the DSN of the "sbctl" registry database in the system cluster.
+// RegistryDSN is the DSN of the "supavise" registry database in the system cluster.
 func RegistryDSN(cfg *config.Config) string {
 	p := pathsFor(cfg, config.SystemRef, cfg.Ports.SystemPostgres)
-	return socketDSN(p, "sbctl") + " pool_max_conns=6"
+	return socketDSN(p, "supavise") + " pool_max_conns=6"
 }
 
 // SystemSocketDSN connects to database db of the system cluster as supabase_admin.
@@ -114,7 +114,7 @@ const scramIterations = 4096
 // password goes through SASLprep first, as Postgres (pg_be_scram_build_secret) and libpq
 // do, so a user-supplied password with characters SASLprep normalizes (a non-breaking
 // space, a full-width digit) still matches what a client sends. It is the identity for the
-// ASCII passwords sbctl generates.
+// ASCII passwords supavise generates.
 func ScramVerifier(password string) (string, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {

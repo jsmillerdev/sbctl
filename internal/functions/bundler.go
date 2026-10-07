@@ -17,9 +17,9 @@ import (
 
 	"github.com/andybalholm/brotli"
 
-	"github.com/OWNER/sbctl/internal/api"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // Server-side bundling.
@@ -30,8 +30,8 @@ import (
 // so the node turns the upload into an eszip first, with the edge-runtime artifact's own
 // `bundle` command, and serves only that. Bundling reads the imports of someone else's
 // code from the disk, which is the same attack as running it, so the command runs in the
-// sandbox of sb-edge-bundle@<ref>.service: a uid of its own (a dynamic user: the node's other
-// processes are the sbctl user's, and a mount namespace does not stop a process from opening
+// sandbox of supavise-edge-bundle@<ref>.service: a uid of its own (a dynamic user: the node's other
+// processes are the supavise user's, and a mount namespace does not stop a process from opening
 // /proc/<pid>/root of another process of its own uid), a mount namespace that shows nothing of
 // the node but the upload and the artifacts, no loopback services, no instance metadata, a
 // memory limit and a timeout. The unit is a template with one instance per project, and each
@@ -60,11 +60,11 @@ const (
 	bundleCacheMax = 512 << 20
 	bundleQueueMax = 8
 	// sandboxCacheRoot is the parent of the module caches of the bundler under the systemd
-	// unit: the unit of project <ref> has <root>/<ref> (CacheDirectory=sb-edge-bundle/%i in
-	// sb-edge-bundle@.service), private to the instance's uid, so the daemon cannot see it and
+	// unit: the unit of project <ref> has <root>/<ref> (CacheDirectory=supavise-edge-bundle/%i in
+	// supavise-edge-bundle@.service), private to the instance's uid, so the daemon cannot see it and
 	// the unit empties it itself (ExecStartPre) above 512 MiB. The exec backend, which has no
 	// such unit, keeps the cache in the project's state directory (execCacheDir).
-	sandboxCacheRoot = "/var/cache/sb-edge-bundle"
+	sandboxCacheRoot = "/var/cache/supavise-edge-bundle"
 	// sandboxWorkDir is the working directory of the bundler under the unit: the one place
 	// besides the cache it may write to (a private /tmp that goes away with the run).
 	sandboxWorkDir = "/tmp"

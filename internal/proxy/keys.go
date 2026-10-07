@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // Bodies of the gateway's own error responses, identical to the self-hosted Envoy

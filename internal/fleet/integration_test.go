@@ -18,10 +18,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 type globArts map[string]string
@@ -72,13 +72,13 @@ func freeRange(t *testing.T, n int, extra func(base int) []int) int {
 // TestIntegrationFleetTenants runs the real artifacts under the exec backend: the system
 // project, Supavisor, Realtime, Storage and postgres-meta, then one project that the
 // Engine registers with all three services on create, re-registers on key rotation and
-// removes on delete. It needs SBCTL_TEST_UNPACKED to name a directory with unpacked
+// removes on delete. It needs SUPAVISE_TEST_UNPACKED to name a directory with unpacked
 // slim-services artifacts for this platform (postgres-17*, auth-*, postgrest-*, pooler-*,
 // realtime-*, storage-*, pgmeta-*) and about 1 GB of RAM.
 func TestIntegrationFleetTenants(t *testing.T) {
-	root := os.Getenv("SBCTL_TEST_UNPACKED")
+	root := os.Getenv("SUPAVISE_TEST_UNPACKED")
 	if root == "" {
-		t.Skip("SBCTL_TEST_UNPACKED not set")
+		t.Skip("SUPAVISE_TEST_UNPACKED not set")
 	}
 	arts := globArts{}
 	for svc, glob := range map[string]string{
@@ -104,7 +104,7 @@ func TestIntegrationFleetTenants(t *testing.T) {
 	cfg.StateDir = d
 	cfg.KeyPath = filepath.Join(d, "master.key")
 	cfg.Supervisor = config.SupervisorExec
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	cfg.TLS.Mode = "off"
 	cfg.BinPath = "/usr/bin/true"
 	cfg.Ports.SystemPostgres, cfg.Ports.SystemGoTrue, cfg.Ports.ProjectBase = base, base+1, base+97 // project 1: base+100..102

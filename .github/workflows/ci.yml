@@ -29,7 +29,7 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 2s --health-retries 30
     env:
-      SBCTL_TEST_DATABASE_URL: postgres://postgres:pw@127.0.0.1:5432/postgres?sslmode=disable
+      SUPAVISE_TEST_DATABASE_URL: postgres://postgres:pw@127.0.0.1:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -56,9 +56,9 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/cfn"
           "$RUNNER_TEMP/cfn/bin/pip" install --quiet cfn-lint
-          "$RUNNER_TEMP/cfn/bin/cfn-lint" deploy/cloudformation/sbctl.yaml
+          "$RUNNER_TEMP/cfn/bin/cfn-lint" deploy/cloudformation/supavise.yaml
 
-  # The drop-in AWS path (deploy/cloudformation/sbctl.yaml, deploy/aws/deploy.sh, the release
+  # The drop-in AWS path (deploy/cloudformation/supavise.yaml, deploy/aws/deploy.sh, the release
   # assets). Nothing here calls AWS. checkov's generic rules run on the template; the few it
   # reports and we accept are skipped inline in the template, each with a reason. The Go tests
   # (deploy/cloudformation, deploy/aws) assert the parameter interface, the outputs, the retain
@@ -75,7 +75,7 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/checkov"
           "$RUNNER_TEMP/checkov/bin/pip" install --quiet checkov==3.3.25
-          "$RUNNER_TEMP/checkov/bin/checkov" -f deploy/cloudformation/sbctl.yaml --framework cloudformation --compact --quiet
+          "$RUNNER_TEMP/checkov/bin/checkov" -f deploy/cloudformation/supavise.yaml --framework cloudformation --compact --quiet
       - name: shellcheck
         run: shellcheck deploy/aws/deploy.sh deploy/release-assets.sh
       - name: template, deploy.sh and release assets

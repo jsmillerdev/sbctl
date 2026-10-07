@@ -1,8 +1,8 @@
 package functions
 
 import (
-	"github.com/OWNER/sbctl/internal/api"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // NewStore returns the API store of reg: the registry's own database for a Postgres

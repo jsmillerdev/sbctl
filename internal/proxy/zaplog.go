@@ -9,7 +9,7 @@ import (
 )
 
 // zapToSlog returns a zap logger that writes to l, so CertMagic's certificate
-// operations show up in the same journald stream as the rest of sbctl.
+// operations show up in the same journald stream as the rest of supavise.
 func zapToSlog(l *slog.Logger) *zap.Logger { return zap.New(&slogCore{l: l}) }
 
 type slogCore struct {

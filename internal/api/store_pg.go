@@ -35,23 +35,23 @@ func scanUser(row pgx.Row) (*User, error) {
 
 func (s *PGStore) UpsertUser(ctx context.Context, u User) (*User, error) {
 	return scanUser(s.pool.QueryRow(ctx, `
-		insert into sbctl.api_users (user_id, email, username, first_name, last_name)
+		insert into supavise.api_users (user_id, email, username, first_name, last_name)
 		values ($1::uuid, $2, $3, $4, $5)
 		on conflict (user_id) do update
-		   set last_seen_at = now(), email = case when sbctl.api_users.email = '' then excluded.email else sbctl.api_users.email end
+		   set last_seen_at = now(), email = case when supavise.api_users.email = '' then excluded.email else supavise.api_users.email end
 		returning `+userCols, u.UserID, u.Email, u.Username, u.FirstName, u.LastName))
 }
 
 func (s *PGStore) GetUser(ctx context.Context, userID string) (*User, error) {
-	return scanUser(s.pool.QueryRow(ctx, `select `+userCols+` from sbctl.api_users where user_id = $1::uuid`, userID))
+	return scanUser(s.pool.QueryRow(ctx, `select `+userCols+` from supavise.api_users where user_id = $1::uuid`, userID))
 }
 
 func (s *PGStore) GetUserByID(ctx context.Context, id int64) (*User, error) {
-	return scanUser(s.pool.QueryRow(ctx, `select `+userCols+` from sbctl.api_users where id = $1`, id))
+	return scanUser(s.pool.QueryRow(ctx, `select `+userCols+` from supavise.api_users where id = $1`, id))
 }
 
 func (s *PGStore) UpdateUser(ctx context.Context, u *User) error {
-	tag, err := s.pool.Exec(ctx, `update sbctl.api_users set username=$2, first_name=$3, last_name=$4 where user_id=$1::uuid`,
+	tag, err := s.pool.Exec(ctx, `update supavise.api_users set username=$2, first_name=$3, last_name=$4 where user_id=$1::uuid`,
 		u.UserID, u.Username, u.FirstName, u.LastName)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
@@ -60,9 +60,9 @@ func (s *PGStore) UpdateUser(ctx context.Context, u *User) error {
 }
 
 func (s *PGStore) ListUsers(ctx context.Context) ([]User, error) {
-	// A removed user (sbctl users remove) is no longer a member, though the profile row stays.
-	rows, err := s.pool.Query(ctx, `select `+userCols+` from sbctl.api_users u
-		 where not exists (select 1 from sbctl.removed_users r where r.user_id = u.user_id::text) order by id`)
+	// A removed user (supavise users remove) is no longer a member, though the profile row stays.
+	rows, err := s.pool.Query(ctx, `select `+userCols+` from supavise.api_users u
+		 where not exists (select 1 from supavise.removed_users r where r.user_id = u.user_id::text) order by id`)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func (s *PGStore) ListUsers(ctx context.Context) ([]User, error) {
 
 func (s *PGStore) PutLoginSession(ctx context.Context, l LoginSession) error {
 	_, err := s.pool.Exec(ctx, `
-		insert into sbctl.api_cli_login_sessions (session_id, user_id, token_id, server_public_key, nonce, ciphertext, expires_at)
+		insert into supavise.api_cli_login_sessions (session_id, user_id, token_id, server_public_key, nonce, ciphertext, expires_at)
 		values ($1::uuid, $2::uuid, nullif($3::bigint, 0), $4, $5, $6, $7)
 		on conflict (session_id) do update set user_id = excluded.user_id, token_id = excluded.token_id,
 		  server_public_key = excluded.server_public_key, nonce = excluded.nonce, ciphertext = excluded.ciphertext,
@@ -100,21 +100,21 @@ func scanLogin(row pgx.Row) (*LoginSession, error) {
 }
 
 func (s *PGStore) GetLoginSession(ctx context.Context, id string) (*LoginSession, error) {
-	return scanLogin(s.pool.QueryRow(ctx, `select `+loginCols+` from sbctl.api_cli_login_sessions where session_id = $1::uuid`, id))
+	return scanLogin(s.pool.QueryRow(ctx, `select `+loginCols+` from supavise.api_cli_login_sessions where session_id = $1::uuid`, id))
 }
 
 func (s *PGStore) FailLoginSession(ctx context.Context, id string) (int, error) {
 	var n int
-	err := s.pool.QueryRow(ctx, `update sbctl.api_cli_login_sessions set failures = failures + 1 where session_id = $1::uuid returning failures`, id).Scan(&n)
+	err := s.pool.QueryRow(ctx, `update supavise.api_cli_login_sessions set failures = failures + 1 where session_id = $1::uuid returning failures`, id).Scan(&n)
 	return n, notFound(err)
 }
 
 func (s *PGStore) TakeLoginSession(ctx context.Context, id string) (*LoginSession, error) {
-	return scanLogin(s.pool.QueryRow(ctx, `delete from sbctl.api_cli_login_sessions where session_id = $1::uuid returning `+loginCols, id))
+	return scanLogin(s.pool.QueryRow(ctx, `delete from supavise.api_cli_login_sessions where session_id = $1::uuid returning `+loginCols, id))
 }
 
 func (s *PGStore) ReapLoginSessions(ctx context.Context) ([]LoginSession, error) {
-	rows, err := s.pool.Query(ctx, `delete from sbctl.api_cli_login_sessions where expires_at < now() returning `+loginCols)
+	rows, err := s.pool.Query(ctx, `delete from supavise.api_cli_login_sessions where expires_at < now() returning `+loginCols)
 	if err != nil {
 		return nil, err
 	}
@@ -143,11 +143,11 @@ func scanFn(row pgx.Row) (*Function, error) {
 func (s *PGStore) UpsertFunction(ctx context.Context, f *Function, files []FunctionFile) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		got, err := scanFn(tx.QueryRow(ctx, `
-			insert into sbctl.api_functions (ref, slug, name, status, verify_jwt, entrypoint_path, import_map_path)
+			insert into supavise.api_functions (ref, slug, name, status, verify_jwt, entrypoint_path, import_map_path)
 			values ($1, $2, $3, $4, $5, nullif($6,''), nullif($7,''))
 			on conflict (ref, slug) do update set name = excluded.name, status = excluded.status,
 			  verify_jwt = excluded.verify_jwt, entrypoint_path = excluded.entrypoint_path,
-			  import_map_path = excluded.import_map_path, version = sbctl.api_functions.version + 1, updated_at = now()
+			  import_map_path = excluded.import_map_path, version = supavise.api_functions.version + 1, updated_at = now()
 			returning `+fnCols, f.Ref, f.Slug, f.Name, f.Status, f.VerifyJWT, f.EntrypointPath, f.ImportMapPath))
 		if err != nil {
 			return err
@@ -156,11 +156,11 @@ func (s *PGStore) UpsertFunction(ctx context.Context, f *Function, files []Funct
 		if files == nil {
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `delete from sbctl.api_function_files where ref = $1 and slug = $2`, f.Ref, f.Slug); err != nil {
+		if _, err := tx.Exec(ctx, `delete from supavise.api_function_files where ref = $1 and slug = $2`, f.Ref, f.Slug); err != nil {
 			return err
 		}
 		for _, file := range files {
-			if _, err := tx.Exec(ctx, `insert into sbctl.api_function_files (ref, slug, path, content) values ($1,$2,$3,$4)`,
+			if _, err := tx.Exec(ctx, `insert into supavise.api_function_files (ref, slug, path, content) values ($1,$2,$3,$4)`,
 				f.Ref, f.Slug, file.Path, file.Content); err != nil {
 				return err
 			}
@@ -170,7 +170,7 @@ func (s *PGStore) UpsertFunction(ctx context.Context, f *Function, files []Funct
 }
 
 func (s *PGStore) ListFunctions(ctx context.Context, ref string) ([]Function, error) {
-	rows, err := s.pool.Query(ctx, `select `+fnCols+` from sbctl.api_functions where ref = $1 order by slug`, ref)
+	rows, err := s.pool.Query(ctx, `select `+fnCols+` from supavise.api_functions where ref = $1 order by slug`, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -187,14 +187,14 @@ func (s *PGStore) ListFunctions(ctx context.Context, ref string) ([]Function, er
 }
 
 func (s *PGStore) GetFunction(ctx context.Context, ref, slug string) (*Function, error) {
-	return scanFn(s.pool.QueryRow(ctx, `select `+fnCols+` from sbctl.api_functions where ref = $1 and slug = $2`, ref, slug))
+	return scanFn(s.pool.QueryRow(ctx, `select `+fnCols+` from supavise.api_functions where ref = $1 and slug = $2`, ref, slug))
 }
 
 func (s *PGStore) FunctionFiles(ctx context.Context, ref, slug string) ([]FunctionFile, error) {
 	if _, err := s.GetFunction(ctx, ref, slug); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `select path, content from sbctl.api_function_files where ref = $1 and slug = $2 order by path`, ref, slug)
+	rows, err := s.pool.Query(ctx, `select path, content from supavise.api_function_files where ref = $1 and slug = $2 order by path`, ref, slug)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +211,7 @@ func (s *PGStore) FunctionFiles(ctx context.Context, ref, slug string) ([]Functi
 }
 
 func (s *PGStore) DeleteFunction(ctx context.Context, ref, slug string) error {
-	tag, err := s.pool.Exec(ctx, `delete from sbctl.api_functions where ref = $1 and slug = $2`, ref, slug)
+	tag, err := s.pool.Exec(ctx, `delete from supavise.api_functions where ref = $1 and slug = $2`, ref, slug)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
@@ -222,7 +222,7 @@ func (s *PGStore) PutFunctionSecrets(ctx context.Context, ref string, sealed map
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		for n, b := range sealed {
 			if _, err := tx.Exec(ctx, `
-				insert into sbctl.api_function_secrets (ref, name, ciphertext) values ($1,$2,$3)
+				insert into supavise.api_function_secrets (ref, name, ciphertext) values ($1,$2,$3)
 				on conflict (ref, name) do update set ciphertext = excluded.ciphertext, updated_at = now()`, ref, n, b); err != nil {
 				return err
 			}
@@ -232,7 +232,7 @@ func (s *PGStore) PutFunctionSecrets(ctx context.Context, ref string, sealed map
 }
 
 func (s *PGStore) ListFunctionSecrets(ctx context.Context, ref string) ([]FunctionSecret, error) {
-	rows, err := s.pool.Query(ctx, `select name, ciphertext, updated_at from sbctl.api_function_secrets where ref = $1 order by name`, ref)
+	rows, err := s.pool.Query(ctx, `select name, ciphertext, updated_at from supavise.api_function_secrets where ref = $1 order by name`, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +249,7 @@ func (s *PGStore) ListFunctionSecrets(ctx context.Context, ref string) ([]Functi
 }
 
 func (s *PGStore) DeleteFunctionSecrets(ctx context.Context, ref string, names []string) error {
-	_, err := s.pool.Exec(ctx, `delete from sbctl.api_function_secrets where ref = $1 and name = any($2)`, ref, names)
+	_, err := s.pool.Exec(ctx, `delete from supavise.api_function_secrets where ref = $1 and name = any($2)`, ref, names)
 	return err
 }
 
@@ -266,7 +266,7 @@ func scanContent(row pgx.Row) (*Content, error) {
 }
 
 func (s *PGStore) ListContent(ctx context.Context, ref string, q ContentQuery) ([]Content, error) {
-	sql := `select ` + contentCols + ` from sbctl.api_content where ref = $1
+	sql := `select ` + contentCols + ` from supavise.api_content where ref = $1
 	  and ($2 = '' or type = $2) and ($3 = '' or visibility = $3) and ($4::bigint = 0 or owner_id = $4)
 	  and (not $5 or favorite) and ($6 = '' or name ilike '%' || $6 || '%')
 	  and (not $7 or folder_id is null) and ($8::uuid is null or folder_id = $8::uuid)
@@ -291,7 +291,7 @@ func (s *PGStore) ListContent(ctx context.Context, ref string, q ContentQuery) (
 }
 
 func (s *PGStore) GetContent(ctx context.Context, ref, id string) (*Content, error) {
-	c, err := scanContent(s.pool.QueryRow(ctx, `select `+contentCols+` from sbctl.api_content where ref = $1 and id = $2::uuid`, ref, id))
+	c, err := scanContent(s.pool.QueryRow(ctx, `select `+contentCols+` from supavise.api_content where ref = $1 and id = $2::uuid`, ref, id))
 	return c, err
 }
 
@@ -305,11 +305,11 @@ func (s *PGStore) UpsertContent(ctx context.Context, c *Content) error {
 		id = c.ID
 	}
 	got, err := scanContent(s.pool.QueryRow(ctx, `
-		insert into sbctl.api_content (id, ref, folder_id, owner_id, type, name, description, visibility, favorite, content, updated_by)
+		insert into supavise.api_content (id, ref, folder_id, owner_id, type, name, description, visibility, favorite, content, updated_by)
 		values (coalesce($1::uuid, gen_random_uuid()), $2, $3::uuid, $4, $5, $6, $7, $8, $9, $10::jsonb, nullif($11::bigint, 0))
 		on conflict (id) do update set updated_by = excluded.updated_by, folder_id = excluded.folder_id, name = excluded.name, description = excluded.description,
 		  visibility = excluded.visibility, favorite = excluded.favorite, content = excluded.content, type = excluded.type, updated_at = now()
-		  where sbctl.api_content.ref = excluded.ref
+		  where supavise.api_content.ref = excluded.ref
 		returning `+contentCols, id, c.Ref, c.FolderID, c.OwnerID, c.Type, c.Name, c.Description, c.Visibility, c.Favorite, body, c.UpdatedBy))
 	if err != nil {
 		return err
@@ -319,7 +319,7 @@ func (s *PGStore) UpsertContent(ctx context.Context, c *Content) error {
 }
 
 func (s *PGStore) DeleteContent(ctx context.Context, ref string, ownerID int64, ids []string) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `delete from sbctl.api_content where ref = $1 and id = any($2::uuid[]) and (visibility <> 'user' or owner_id = $3) returning id::text`, ref, ids, ownerID)
+	rows, err := s.pool.Query(ctx, `delete from supavise.api_content where ref = $1 and id = any($2::uuid[]) and (visibility <> 'user' or owner_id = $3) returning id::text`, ref, ids, ownerID)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +341,7 @@ func (s *PGStore) CountContent(ctx context.Context, ref string, ownerID int64) (
 		select count(*) filter (where owner_id = $2 and visibility = 'user'),
 		       count(*) filter (where visibility <> 'user'),
 		       count(*) filter (where owner_id = $2 and favorite)
-		  from sbctl.api_content where ref = $1`, ref, ownerID).Scan(&n.Private, &n.Shared, &n.Favorites)
+		  from supavise.api_content where ref = $1`, ref, ownerID).Scan(&n.Private, &n.Shared, &n.Favorites)
 	return n, err
 }
 
@@ -356,11 +356,11 @@ func scanFolder(row pgx.Row) (*ContentFolder, error) {
 const folderCols = `id::text, ref, parent_id::text, owner_id, name, created_at, updated_at`
 
 func (s *PGStore) GetFolder(ctx context.Context, ref, id string) (*ContentFolder, error) {
-	return scanFolder(s.pool.QueryRow(ctx, `select `+folderCols+` from sbctl.api_content_folders where ref = $1 and id = $2::uuid`, ref, id))
+	return scanFolder(s.pool.QueryRow(ctx, `select `+folderCols+` from supavise.api_content_folders where ref = $1 and id = $2::uuid`, ref, id))
 }
 
 func (s *PGStore) ListFolders(ctx context.Context, ref string, parentID *string) ([]ContentFolder, error) {
-	rows, err := s.pool.Query(ctx, `select `+folderCols+` from sbctl.api_content_folders
+	rows, err := s.pool.Query(ctx, `select `+folderCols+` from supavise.api_content_folders
 		where ref = $1 and parent_id is not distinct from $2::uuid order by name`, ref, parentID)
 	if err != nil {
 		return nil, err
@@ -379,7 +379,7 @@ func (s *PGStore) ListFolders(ctx context.Context, ref string, parentID *string)
 
 func (s *PGStore) CreateFolder(ctx context.Context, f *ContentFolder) error {
 	got, err := scanFolder(s.pool.QueryRow(ctx, `
-		insert into sbctl.api_content_folders (ref, parent_id, owner_id, name) values ($1, $2::uuid, $3, $4)
+		insert into supavise.api_content_folders (ref, parent_id, owner_id, name) values ($1, $2::uuid, $3, $4)
 		returning `+folderCols, f.Ref, f.ParentID, f.OwnerID, f.Name))
 	if err != nil {
 		return err
@@ -389,7 +389,7 @@ func (s *PGStore) CreateFolder(ctx context.Context, f *ContentFolder) error {
 }
 
 func (s *PGStore) RenameFolder(ctx context.Context, ref, id, name string) error {
-	tag, err := s.pool.Exec(ctx, `update sbctl.api_content_folders set name = $3, updated_at = now() where ref = $1 and id = $2::uuid`, ref, id, name)
+	tag, err := s.pool.Exec(ctx, `update supavise.api_content_folders set name = $3, updated_at = now() where ref = $1 and id = $2::uuid`, ref, id, name)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
@@ -397,6 +397,6 @@ func (s *PGStore) RenameFolder(ctx context.Context, ref, id, name string) error 
 }
 
 func (s *PGStore) DeleteFolders(ctx context.Context, ref string, ids []string) error {
-	_, err := s.pool.Exec(ctx, `delete from sbctl.api_content_folders where ref = $1 and id = any($2::uuid[])`, ref, ids)
+	_, err := s.pool.Exec(ctx, `delete from supavise.api_content_folders where ref = $1 and id = any($2::uuid[])`, ref, ids)
 	return err
 }

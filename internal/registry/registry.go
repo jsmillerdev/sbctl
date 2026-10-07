@@ -1,6 +1,6 @@
-// Package registry is sbctl's control-plane state: organizations, projects, sealed
+// Package registry is supavise's control-plane state: organizations, projects, sealed
 // project secrets, access tokens, host routes, backups and events. It lives in the
-// "sbctl" schema of the "sbctl" database in the system cluster (Postgres), with an
+// "supavise" schema of the "supavise" database in the system cluster (Postgres), with an
 // in-memory implementation for tests.
 package registry
 
@@ -10,7 +10,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 var (
@@ -124,7 +124,7 @@ const (
 
 type AccessToken struct {
 	ID         int64
-	UserID     string // GoTrue user id in sb-gotrue@system
+	UserID     string // GoTrue user id in supavise-gotrue@system
 	Name       string
 	Hash       []byte // secrets.HashToken(token)
 	Prefix     string // first characters shown in listings, e.g. "sbp_1a2b"

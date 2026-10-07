@@ -1,6 +1,6 @@
 // The request handler of the main service: one Edge Runtime instance serves every
-// project, so every decision here is made per project, from the X-Sbctl-Project-Ref
-// header that sbctl's proxy sets (and overwrites when a client sends one).
+// project, so every decision here is made per project, from the X-Supavise-Project-Ref
+// header that supavise's proxy sets (and overwrites when a client sends one).
 
 import { authErrorResponse, ErrorCode, ErrorCodes, extractToken, verifyJWT } from './auth.ts'
 import { releaseWhenDone } from './body.ts'
@@ -16,9 +16,9 @@ import type {
   WorkerOptions,
 } from './types.ts'
 
-export const TENANT_HEADER = 'x-sbctl-project-ref'
-/** The secret the proxy sends with every request (SBCTL_FUNCTIONS_PROXY_TOKEN). */
-export const PROXY_TOKEN_HEADER = 'x-sbctl-proxy-token'
+export const TENANT_HEADER = 'x-supavise-project-ref'
+/** The secret the proxy sends with every request (SUPAVISE_FUNCTIONS_PROXY_TOKEN). */
+export const PROXY_TOKEN_HEADER = 'x-supavise-proxy-token'
 export const MAX_WORKER_RETRIES = 3
 /** How long past the worker's wall clock a response may hold its place in the budget. */
 export const HOLD_GRACE_MS = 5_000
@@ -32,8 +32,8 @@ export interface HandlerDeps {
   /** Port of this runtime, denied to workers (see workerPermissions). */
   port?: string
   /**
-   * The secret every request must carry in X-Sbctl-Proxy-Token; empty accepts requests
-   * without one (tests only: sbctl always sets it).
+   * The secret every request must carry in X-Supavise-Proxy-Token; empty accepts requests
+   * without one (tests only: supavise always sets it).
    */
   proxyToken?: string
   log?: Logger
@@ -99,7 +99,7 @@ export function workerEnv(slug: string, env: ProjectEnv): [string, string][] {
  * rule matches host names as written (a name that resolves to loopback, such as
  * <x>.127.0.0.1.sslip.io, or an IPv4-mapped IPv6 literal, is not covered), so it is only a
  * first line: the guard is the proxy's secret. This service refuses every request that
- * lacks X-Sbctl-Proxy-Token, so a worker that reaches the port by any name cannot choose
+ * lacks X-Supavise-Proxy-Token, so a worker that reaches the port by any name cannot choose
  * a project reference. Files are not listed: a user worker sees only its module graph,
  * not the disk (verified, see the README).
  */

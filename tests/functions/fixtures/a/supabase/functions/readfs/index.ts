@@ -9,7 +9,7 @@ Deno.serve(async (req) => {
     }
   }
   try {
-    out.env = `ENV: ${Deno.env.get('SBCTL_FUNCTIONS_ROOT') ?? 'unset'}`
+    out.env = `ENV: ${Deno.env.get('SUPAVISE_FUNCTIONS_ROOT') ?? 'unset'}`
   } catch (e) {
     out.env = `ERROR: ${(e as Error).name}`
   }
@@ -28,7 +28,7 @@ Deno.serve(async (req) => {
   }
   try {
     const names = Object.keys(Deno.env.toObject())
-    out.envNames = names.some((n) => n.startsWith('SBCTL_') || n === 'EDGE_RUNTIME_PORT')
+    out.envNames = names.some((n) => n.startsWith('SUPAVISE_') || n === 'EDGE_RUNTIME_PORT')
       ? `ENV: ${names.join(',')}`
       : 'ERROR: none of the main service variables'
   } catch (e) {

@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # install end to end: deploy/install.sh on a fresh Linux VM, then the dashboard claim flow, a
 # project through the Management API with a personal access token, a REST call through the
-# proxy, the pooler, a re-run of the installer and `sbctl self-update`.
+# proxy, the pooler, a re-run of the installer and `supavise self-update`.
 #
-#   sudo SBCTL_BIN=/path/to/sbctl tests/linux/install-e2e.sh
+#   sudo SUPAVISE_BIN=/path/to/supavise tests/linux/install-e2e.sh
 #
-# SBCTL_BIN is a Linux build of this checkout with -X main.version=v0.0.1, SBCTL_BIN_V2 one
-# with v0.0.2 (the installer upgrade target) and SBCTL_BIN_V3 one with v0.0.3 (the self-update
+# SUPAVISE_BIN is a Linux build of this checkout with -X main.version=v0.0.1, SUPAVISE_BIN_V2 one
+# with v0.0.2 (the installer upgrade target) and SUPAVISE_BIN_V3 one with v0.0.3 (the self-update
 # target); without them the script builds them with go. Needs
 # root, systemd, cgroup v2 and network access (artifact downloads). The node is configured with `--tls off --public-ip 127.0.0.1`, so every name is
 # <something>.127.0.0.1.sslip.io and the script reaches the proxy on 127.0.0.1 with Host
 # headers; nothing needs DNS. E2E_STUDIO=0 skips the dashboard build (a stand-in: the slim
 # Studio artifact of the pinned upstream version, not our platform build).
 #
-# Do not run it on a machine you care about: it creates the sbctl user, writes /etc/sbctl,
+# Do not run it on a machine you care about: it creates the supavise user, writes /etc/supavise,
 # installs units and starts real clusters. Exit status is non-zero on the first failure.
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -40,12 +40,12 @@ preflight
 ARCH=$(dpkg --print-architecture)
 cd "$REPO_ROOT" || exit 1
 
-if [[ -z $SBCTL_BIN ]]; then
-  command -v go >/dev/null || fail "no SBCTL_BIN and no go toolchain"
-  SBCTL_BIN=$WORK/sbctl
-  CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o "$SBCTL_BIN" ./cmd/sbctl
+if [[ -z $SUPAVISE_BIN ]]; then
+  command -v go >/dev/null || fail "no SUPAVISE_BIN and no go toolchain"
+  SUPAVISE_BIN=$WORK/supavise
+  CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o "$SUPAVISE_BIN" ./cmd/supavise
 fi
-[[ $("$SBCTL_BIN" --version) == *v0.0.1* ]] || fail "SBCTL_BIN must be built with -X main.version=v0.0.1 (the self-update step updates from it): $("$SBCTL_BIN" --version)"
+[[ $("$SUPAVISE_BIN" --version) == *v0.0.1* ]] || fail "SUPAVISE_BIN must be built with -X main.version=v0.0.1 (the self-update step updates from it): $("$SUPAVISE_BIN" --version)"
 
 # curl helpers: the proxy on :80 with a Host header.
 api() { # METHOD PATH [curl args...]  (Host api.<base>)
@@ -65,8 +65,8 @@ if command -v shellcheck >/dev/null; then
 else
   log "shellcheck is not installed; skipped"
 fi
-"$SBCTL_BIN" install --help >/dev/null
-"$SBCTL_BIN" self-update --help >/dev/null
+"$SUPAVISE_BIN" install --help >/dev/null
+"$SUPAVISE_BIN" self-update --help >/dev/null
 
 # ---- 2. the release path of install.sh: signature and checksum checks --------------------
 log "release assets signed with a throwaway key (deploy/release-assets.sh)"
@@ -79,9 +79,9 @@ openssl pkey -in "$KEYS/other.pem" -pubout -out "$KEYS/other.pub"
 make_release() { # TAG BINARY-FILE [nolatest]: builds $WORK/srv/download/TAG and the fake GitHub API files for repo o/r
   local tag=$1 bin=$2 latest=${3:-latest} d=$WORK/srv/download/$1
   rm -rf "$d"; mkdir -p "$d"
-  cp "$bin" "$d/sbctl-linux-$ARCH"
-  if [[ $ARCH == amd64 ]]; then echo other-arch >"$d/sbctl-linux-arm64"; else echo other-arch >"$d/sbctl-linux-amd64"; fi
-  echo "not a real studio build" >"$d/sbctl-studio-test-p1-linux-$ARCH.tar.zst"
+  cp "$bin" "$d/supavise-linux-$ARCH"
+  if [[ $ARCH == amd64 ]]; then echo other-arch >"$d/supavise-linux-arm64"; else echo other-arch >"$d/supavise-linux-amd64"; fi
+  echo "not a real studio build" >"$d/supavise-studio-test-p1-linux-$ARCH.tar.zst"
   deploy/release-assets.sh "$d" "$KEYS/sign.pem" "$KEYS/pub.pem" >/dev/null
   mkdir -p "$WORK/srv/repos/o/r/releases/tags"
   python3 - "$tag" "$d" "$SRV_PORT" "$WORK/srv/repos/o/r/releases" "$latest" <<'PY'
@@ -94,31 +94,31 @@ for name in (("latest",) if latest == "latest" else ()) + (f"tags/{tag}",):
 PY
 }
 mkdir -p "$WORK/srv"
-make_release v0.0.1 "$SBCTL_BIN"
+make_release v0.0.1 "$SUPAVISE_BIN"
 (cd "$WORK/srv" && exec python3 -m http.server "$SRV_PORT" --bind 127.0.0.1 >"$WORK/http.log" 2>&1) &
 SRV_PID=$!
 for ((i = 0; i < 20; i++)); do [[ $(code "http://127.0.0.1:$SRV_PORT/download/v0.0.1/SHA256SUMS") == 200 ]] && break; sleep 0.5; done
 
 installer() { # extra env is set by the caller
-  SBCTL_INSTALL_BASE_URL="http://127.0.0.1:$SRV_PORT" SBCTL_INSTALL_PUBKEY_B64=$(base64 -w0 "$KEYS/pub.pem") "$@"
+  SUPAVISE_INSTALL_BASE_URL="http://127.0.0.1:$SRV_PORT" SUPAVISE_INSTALL_PUBKEY_B64=$(base64 -w0 "$KEYS/pub.pem") "$@"
 }
 log "install.sh --verify-only accepts the signed release"
 out=$(installer deploy/install.sh --version v0.0.1 --verify-only) || fail "verify-only failed on a good release: $out"
-[[ $out == *"verified v0.0.1 sbctl-linux-$ARCH"* ]] || fail "unexpected verify-only output: $out"
-[[ $out == *"dashboard build: sbctl-studio-test-p1-linux-$ARCH.tar.zst"* ]] || fail "install.sh did not pick the Studio asset out of the signed list: $out"
+[[ $out == *"verified v0.0.1 supavise-linux-$ARCH"* ]] || fail "unexpected verify-only output: $out"
+[[ $out == *"dashboard build: supavise-studio-test-p1-linux-$ARCH.tar.zst"* ]] || fail "install.sh did not pick the Studio asset out of the signed list: $out"
 
 expect_refusal() { # DESCRIPTION EXPECTED-TEXT env... -- the command runs with the caller's mutation in place
   local what=$1 text=$2 out
   if out=$(installer deploy/install.sh --version v0.0.1 --verify-only 2>&1); then fail "install.sh accepted $what"; fi
   [[ $out == *"$text"* ]] || fail "install.sh refused $what with the wrong message: $out"
-  [[ ! -e /usr/local/bin/sbctl ]] || fail "install.sh installed a binary despite refusing $what"
+  [[ ! -e /usr/local/bin/supavise ]] || fail "install.sh installed a binary despite refusing $what"
   log "refused $what"
 }
 D=$WORK/srv/download/v0.0.1
-cp "$D/sbctl-linux-$ARCH" "$WORK/good-binary"
-echo tampered >>"$D/sbctl-linux-$ARCH"
+cp "$D/supavise-linux-$ARCH" "$WORK/good-binary"
+echo tampered >>"$D/supavise-linux-$ARCH"
 expect_refusal "a binary that does not match the signed checksum" "does not match its checksum"
-cp "$WORK/good-binary" "$D/sbctl-linux-$ARCH"
+cp "$WORK/good-binary" "$D/supavise-linux-$ARCH"
 cp "$D/SHA256SUMS" "$WORK/good-sums"
 echo "0000000000000000000000000000000000000000000000000000000000000000  evil" >>"$D/SHA256SUMS"
 expect_refusal "a checksum list changed after signing" "signature of SHA256SUMS does not verify"
@@ -127,7 +127,7 @@ cp "$D/SHA256SUMS.sig" "$WORK/good-sig"
 printf 'x%.0s' $(seq 1 64) >"$D/SHA256SUMS.sig"
 expect_refusal "a bad signature" "does not verify"
 cp "$WORK/good-sig" "$D/SHA256SUMS.sig"
-if out=$(SBCTL_INSTALL_BASE_URL="http://127.0.0.1:$SRV_PORT" SBCTL_INSTALL_PUBKEY_B64=$(base64 -w0 "$KEYS/other.pub") deploy/install.sh --version v0.0.1 --verify-only 2>&1); then
+if out=$(SUPAVISE_INSTALL_BASE_URL="http://127.0.0.1:$SRV_PORT" SUPAVISE_INSTALL_PUBKEY_B64=$(base64 -w0 "$KEYS/other.pub") deploy/install.sh --version v0.0.1 --verify-only 2>&1); then
   fail "install.sh accepted a release signed by another key"
 fi
 [[ $out == *"does not verify"* ]] || fail "wrong-key refusal message: $out"
@@ -138,12 +138,12 @@ installer deploy/install.sh --version v0.0.1 --verify-only >/dev/null || fail "r
 out=$(cat deploy/install.sh | installer bash -s -- --version v0.0.1 --verify-only 2>&1) || fail "install.sh through a pipe: $out"
 [[ $out == *"verified v0.0.1"* ]] || fail "install.sh through a pipe: $out"
 # An older signed binary attached to a newer tag (the signature covers the checksums, not the tag).
-make_release v0.0.9 "$SBCTL_BIN" nolatest
+make_release v0.0.9 "$SUPAVISE_BIN" nolatest
 if out=$(installer deploy/install.sh --version v0.0.9 --verify-only 2>&1); then fail "install.sh accepted v0.0.1's binary under the tag v0.0.9"; fi
 [[ $out == *"ships a binary that reports"* ]] || fail "install.sh downgrade refusal message: $out"
 log "refused a signed older binary under a newer tag"
 bash -n "$D/install.sh"
-grep -q __SBCTL_RELEASE_PUBKEY_B64__ "$D/install.sh" && fail "the stamped install.sh still has the key marker"
+grep -q __SUPAVISE_RELEASE_PUBKEY_B64__ "$D/install.sh" && fail "the stamped install.sh still has the key marker"
 
 # ---- 3. install ------------------------------------------------------------------------
 # A runner image may ship services on our ports.
@@ -167,10 +167,10 @@ if [[ $E2E_STUDIO == 1 ]]; then
 fi
 
 log "install.sh --binary (fresh node)"
-deploy/install.sh --binary "$SBCTL_BIN" --public-ip 127.0.0.1 --tls off --email ci@example.com --firewall none \
+deploy/install.sh --binary "$SUPAVISE_BIN" --public-ip 127.0.0.1 --tls off --email ci@example.com --firewall none \
   --claim-token-file "$WORK/claim-token" "${STUDIO_ARGS[@]}" 2>&1 | tee "$WORK/install.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "install.sh failed"
-grep -q "sbctl is running" "$WORK/install.log" || fail "install.sh did not report success"
+grep -q "Supavise is running" "$WORK/install.log" || fail "install.sh did not report success"
 grep -q "Dashboard   http://studio.$BASE" "$WORK/install.log" || fail "install.sh printed no dashboard URL"
 TOKEN=$(tr -d '[:space:]' <"$WORK/claim-token")
 [[ $TOKEN =~ ^sbc_[0-9a-f]{48}$ ]] || fail "the claim token file does not hold a claim token"
@@ -179,23 +179,23 @@ grep -q "$WORK/claim-token" "$WORK/install.log" || fail "install.sh did not say 
 [[ $(stat -c '%a' "$WORK/claim-token") == 600 ]] || fail "the claim token file is not 0600"
 
 log "host state"
-[[ $(stat -c '%U:%a' /etc/sbctl/config.toml) == sbctl:600 ]] || fail "config.toml is $(stat -c '%U:%a' /etc/sbctl/config.toml), want sbctl:600"
-[[ $(stat -c '%U:%a' /etc/sbctl/master.key) == sbctl:600 ]] || fail "master.key is $(stat -c '%U:%a' /etc/sbctl/master.key), want sbctl:600"
-grep -q "public_ip = '127.0.0.1'" /etc/sbctl/config.toml || fail "config.toml lacks the public IP"
-grep -q "mode = 'off'" /etc/sbctl/config.toml || fail "config.toml lacks tls mode off"
-[[ $(systemctl is-enabled sbctl.service) == enabled ]] || fail "sbctl.service is not enabled for boot"
-UNITS=(sbctl.service sb-postgres@system.service sb-gotrue@system.service sb-pgmeta.service sb-supavisor.service sb-realtime.service sb-storage.service)
-[[ $E2E_STUDIO == 1 ]] && UNITS+=(sb-studio.service)
+[[ $(stat -c '%U:%a' /etc/supavise/config.toml) == supavise:600 ]] || fail "config.toml is $(stat -c '%U:%a' /etc/supavise/config.toml), want supavise:600"
+[[ $(stat -c '%U:%a' /etc/supavise/master.key) == supavise:600 ]] || fail "master.key is $(stat -c '%U:%a' /etc/supavise/master.key), want supavise:600"
+grep -q "public_ip = '127.0.0.1'" /etc/supavise/config.toml || fail "config.toml lacks the public IP"
+grep -q "mode = 'off'" /etc/supavise/config.toml || fail "config.toml lacks tls mode off"
+[[ $(systemctl is-enabled supavise.service) == enabled ]] || fail "supavise.service is not enabled for boot"
+UNITS=(supavise.service supavise-postgres@system.service supavise-gotrue@system.service supavise-pgmeta.service supavise-supavisor.service supavise-realtime.service supavise-storage.service)
+[[ $E2E_STUDIO == 1 ]] && UNITS+=(supavise-studio.service)
 for u in "${UNITS[@]}"; do wait_active "$u" 60; done
-[[ $(systemctl show -p User --value sbctl.service) == sbctl ]] || fail "sbctl.service does not run as sbctl"
-[[ $(systemctl show -p MainPID --value sb-postgres@system.service) -gt 0 ]] || fail "no system Postgres"
+[[ $(systemctl show -p User --value supavise.service) == supavise ]] || fail "supavise.service does not run as supavise"
+[[ $(systemctl show -p MainPID --value supavise-postgres@system.service) -gt 0 ]] || fail "no system Postgres"
 for p in 80 443 5432 6543; do ss -ltnH "sport = :$p" | grep -q . || fail "nothing listens on public port $p"; done
 for p in 7000 5433 9999; do
   ss -ltnH "sport = :$p" | awk '{print $4}' | grep -q "^127.0.0.1:$p$" || fail "port $p is not loopback only"
 done
 
 log "re-running the installer before anyone has claimed keeps the claim token (it would otherwise be revoked behind the back of whatever stored it)"
-deploy/install.sh --binary "$SBCTL_BIN" --claim-token-file "$WORK/claim-token-rerun" 2>&1 | tee "$WORK/install-preclaim.log"
+deploy/install.sh --binary "$SUPAVISE_BIN" --claim-token-file "$WORK/claim-token-rerun" 2>&1 | tee "$WORK/install-preclaim.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "the re-run before the claim failed"
 [[ ! -s "$WORK/claim-token-rerun" ]] || fail "the re-run before the claim issued a second claim token"
 grep -q "claim token from an earlier run is still valid" "$WORK/install-preclaim.log" || fail "the re-run did not say that the earlier claim token is still valid"
@@ -208,7 +208,7 @@ if [[ $E2E_STUDIO == 1 ]]; then
     [[ $(code -H "Host: studio.$BASE" http://127.0.0.1/api/get-utc-time) == 200 ]] && break
     sleep 2
   done
-  [[ $(code -H "Host: studio.$BASE" http://127.0.0.1/api/get-utc-time) == 200 ]] || { journalctl --no-pager -u sb-studio -n 40 >&2; fail "Studio is not served through studio.<domain>"; }
+  [[ $(code -H "Host: studio.$BASE" http://127.0.0.1/api/get-utc-time) == 200 ]] || { journalctl --no-pager -u supavise-studio -n 40 >&2; fail "Studio is not served through studio.<domain>"; }
   [[ $(code -H "Host: studio.$BASE" http://127.0.0.1/) =~ ^(200|307|308)$ ]] || fail "Studio's front page does not answer through the proxy"
 fi
 [[ $(code -H "Host: nothing.$BASE" http://127.0.0.1/) == 404 ]] || fail "an unknown host did not get a 404"
@@ -223,8 +223,8 @@ claim_body() { printf '{"token":"%s","email":"%s","password":"%s","organization_
 [[ $(api POST /claim -H 'Content-Type: application/json' -d "$(claim_body "$TOKEN")" -o "$WORK/claim.json" -w '%{http_code}') == 201 ]] || { cat "$WORK/claim.json" >&2; fail "claiming with the install token failed"; }
 [[ $(jq_ 'd["email"]' <"$WORK/claim.json") == "$ADMIN_EMAIL" ]] || fail "claim answer: $(cat "$WORK/claim.json")"
 [[ $(api POST /claim -H 'Content-Type: application/json' -d "$(claim_body "$TOKEN")" -o /dev/null -w '%{http_code}') == 403 ]] || fail "the claim token worked twice"
-[[ $(sbctl claim status) == claimed ]] || fail "claim status after the claim"
-if sbctl claim token >/dev/null 2>&1; then fail "a second claim token was issued after the claim"; fi
+[[ $(supavise claim status) == claimed ]] || fail "claim status after the claim"
+if supavise claim token >/dev/null 2>&1; then fail "a second claim token was issued after the claim"; fi
 
 log "public sign-up is disabled"
 st=$(api POST /auth/v1/signup -H 'Content-Type: application/json' -d '{"email":"stranger@example.com","password":"stranger-password-1"}' -o /dev/null -w '%{http_code}')
@@ -237,12 +237,12 @@ JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: applicatio
 [[ $(api GET /platform/profile -H "Authorization: Bearer $JWT" -o /dev/null -w '%{http_code}') == 200 ]] || fail "/platform/profile with the session"
 
 log "invite a second user, redeem the invite, list, remove"
-INVITE_LINK=$(sbctl users invite invitee@example.com --role developer --no-mail 2>/dev/null)
+INVITE_LINK=$(supavise users invite invitee@example.com --role developer --no-mail 2>/dev/null)
 [[ $INVITE_LINK == */claim#* ]] || fail "invite link: $INVITE_LINK"
 INVITE=$(python3 -c 'import sys,urllib.parse as u; print(u.parse_qs(u.urlparse(sys.argv[1]).fragment)["token"][0])' "$INVITE_LINK")
 [[ $INVITE =~ ^sbi_[0-9a-f]{48}$ ]] || fail "invite token: $INVITE"
 [[ $(api POST /claim -H 'Content-Type: application/json' -d "{\"token\":\"$INVITE\",\"password\":\"$ADMIN_PASSWORD\"}" -o "$WORK/inv.json" -w '%{http_code}') == 201 ]] || { cat "$WORK/inv.json" >&2; fail "redeeming the invite"; }
-sbctl users list | grep "invitee@example.com.*:developer" >/dev/null || fail "the invited user is not listed as a developer"
+supavise users list | grep "invitee@example.com.*:developer" >/dev/null || fail "the invited user is not listed as a developer"
 # The invitee signs in and makes a personal access token; `users remove` must end both at once.
 INV_JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' \
   -d "{\"email\":\"invitee@example.com\",\"password\":\"$ADMIN_PASSWORD\"}" | jq_ 'd["access_token"]') || fail "the invitee cannot sign in"
@@ -250,8 +250,8 @@ INV_PAT=$(api POST /platform/profile/access-tokens -H "Authorization: Bearer $IN
   || fail "the invitee cannot create a personal access token"
 [[ $(api GET /platform/profile -H "Authorization: Bearer $INV_JWT" -o /dev/null -w '%{http_code}') == 200 ]] || fail "the invitee's session is refused before the removal"
 [[ $(api GET /v1/organizations -H "Authorization: Bearer $INV_PAT" -o /dev/null -w '%{http_code}') == 200 ]] || fail "the invitee's token is refused before the removal"
-sbctl users remove invitee@example.com | grep removed >/dev/null || fail "users remove"
-if sbctl users list | grep invitee@example.com >/dev/null; then fail "the removed user is still listed"; fi
+supavise users remove invitee@example.com | grep removed >/dev/null || fail "users remove"
+if supavise users list | grep invitee@example.com >/dev/null; then fail "the removed user is still listed"; fi
 [[ $(api GET /platform/profile -H "Authorization: Bearer $INV_JWT" -o /dev/null -w '%{http_code}') == 401 ]] || fail "the removed user's session still works (it is valid for an hour)"
 [[ $(api GET /v1/organizations -H "Authorization: Bearer $INV_PAT" -o /dev/null -w '%{http_code}') == 401 ]] || fail "the removed user's personal access token still works"
 [[ $(api POST /platform/profile/access-tokens -H "Authorization: Bearer $INV_JWT" -H 'Content-Type: application/json' -d '{"name":"after"}' -o /dev/null -w '%{http_code}') == 401 ]] \
@@ -278,7 +278,7 @@ for ((i = 0; i < 180; i++)); do
   [[ $status == ACTIVE_HEALTHY || $status == INIT_FAILED ]] && break
   sleep 3
 done
-if [[ $status != ACTIVE_HEALTHY ]]; then journalctl --no-pager -u sbctl.service -n 60 >&2; fail "project is $status"; fi
+if [[ $status != ACTIVE_HEALTHY ]]; then journalctl --no-pager -u supavise.service -n 60 >&2; fail "project is $status"; fi
 log "project $REF is ACTIVE_HEALTHY"
 KEYS_JSON=$(papi GET "/v1/projects/$REF/api-keys?reveal=true")
 PUB=$(printf '%s' "$KEYS_JSON" | jq_ '[k["api_key"] for k in d if str(k.get("api_key","")).startswith("sb_publishable_")][0]') || fail "no publishable key in $KEYS_JSON"
@@ -301,7 +301,7 @@ done
 [[ $(code -H "Host: $REF.api.$BASE" -H "apikey: $SEC" http://127.0.0.1/storage/v1/bucket) == 200 ]] || fail "Storage tenant: GET /storage/v1/bucket with the secret key (the daemon did not register the project with Storage)"
 
 log "pooler login as postgres.$REF on both ports"
-PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
+PSQL=$(ls -d "$SUPAVISE_STATE"/artifacts/postgres/*/bin/psql | head -1)
 for port in 5432 6543; do
   got=$(PGPASSWORD=$DBPASS "$PSQL" "host=127.0.0.1 port=$port user=postgres.$REF dbname=postgres sslmode=disable connect_timeout=10" -Atc 'select count(*) from public.e2e_items' </dev/null) \
     || fail "pooler login on $port"
@@ -310,29 +310,29 @@ done
 
 # ---- 6. re-run: idempotent, secrets kept -------------------------------------------------
 log "re-running install.sh keeps everything"
-KEY_SUM=$(sha256sum /etc/sbctl/master.key)
-CFG_SUM=$(sha256sum /etc/sbctl/config.toml)
-ENTER=$(systemctl show -p ActiveEnterTimestampMonotonic --value sbctl.service)
-PG_PID=$(systemctl show -p MainPID --value "sb-postgres@$REF.service")
-fleet_pids() { for u in sb-pgmeta sb-supavisor sb-realtime sb-storage sb-postgres@system sb-gotrue@system; do systemctl show -p MainPID --value "$u.service"; done | tr '\n' ' '; }
+KEY_SUM=$(sha256sum /etc/supavise/master.key)
+CFG_SUM=$(sha256sum /etc/supavise/config.toml)
+ENTER=$(systemctl show -p ActiveEnterTimestampMonotonic --value supavise.service)
+PG_PID=$(systemctl show -p MainPID --value "supavise-postgres@$REF.service")
+fleet_pids() { for u in supavise-pgmeta supavise-supavisor supavise-realtime supavise-storage supavise-postgres@system supavise-gotrue@system; do systemctl show -p MainPID --value "$u.service"; done | tr '\n' ' '; }
 FLEET_PIDS=$(fleet_pids)
 # Through a pipe, the way the documented one-liner runs it.
-cat deploy/install.sh | bash -s -- --binary "$SBCTL_BIN" 2>&1 | tee "$WORK/install2.log"
+cat deploy/install.sh | bash -s -- --binary "$SUPAVISE_BIN" 2>&1 | tee "$WORK/install2.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "second install.sh run failed"
-[[ $(sha256sum /etc/sbctl/master.key) == "$KEY_SUM" ]] || fail "the master key changed"
-[[ $(sha256sum /etc/sbctl/config.toml) == "$CFG_SUM" ]] || fail "config.toml changed on a no-flag re-run"
+[[ $(sha256sum /etc/supavise/master.key) == "$KEY_SUM" ]] || fail "the master key changed"
+[[ $(sha256sum /etc/supavise/config.toml) == "$CFG_SUM" ]] || fail "config.toml changed on a no-flag re-run"
 grep -q "already exists" "$WORK/install2.log" || fail "the re-run did not say the first administrator exists"
 grep -q "$TOKEN" "$WORK/install2.log" && fail "the re-run printed the spent claim token"
-[[ $(systemctl show -p ActiveEnterTimestampMonotonic --value sbctl.service) == "$ENTER" ]] || fail "a no-change re-run restarted sbctl.service"
-[[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") == "$PG_PID" ]] || fail "the re-run restarted the project's Postgres"
+[[ $(systemctl show -p ActiveEnterTimestampMonotonic --value supavise.service) == "$ENTER" ]] || fail "a no-change re-run restarted supavise.service"
+[[ $(systemctl show -p MainPID --value "supavise-postgres@$REF.service") == "$PG_PID" ]] || fail "the re-run restarted the project's Postgres"
 [[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "the re-run restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
 [[ $(papi GET "/v1/projects/$REF" | jq_ 'd["status"]') == ACTIVE_HEALTHY ]] || fail "project unhealthy after the re-run"
 log "re-running with one flag changes only that setting"
-deploy/install.sh --binary "$SBCTL_BIN" --email changed@example.com >/dev/null 2>&1 || fail "re-run with --email failed"
-grep -q "email = 'changed@example.com'" /etc/sbctl/config.toml || fail "--email did not change config.toml"
-grep -q "public_ip = '127.0.0.1'" /etc/sbctl/config.toml || fail "--email dropped the public IP"
-[[ $(sha256sum /etc/sbctl/master.key) == "$KEY_SUM" ]] || fail "the master key changed on the second re-run"
-wait_active sbctl.service 120
+deploy/install.sh --binary "$SUPAVISE_BIN" --email changed@example.com >/dev/null 2>&1 || fail "re-run with --email failed"
+grep -q "email = 'changed@example.com'" /etc/supavise/config.toml || fail "--email did not change config.toml"
+grep -q "public_ip = '127.0.0.1'" /etc/supavise/config.toml || fail "--email dropped the public IP"
+[[ $(sha256sum /etc/supavise/master.key) == "$KEY_SUM" ]] || fail "the master key changed on the second re-run"
+wait_active supavise.service 120
 for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
 [[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "a config change restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
 
@@ -340,24 +340,24 @@ for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w
 build_version() { # VERSION OUT [GIVEN-PATH]
   local v=$1 out=$2 given=${3:-}
   if [[ -n $given ]]; then cp "$given" "$out"
-  elif command -v go >/dev/null; then CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$v" -o "$out" ./cmd/sbctl
-  else fail "no SBCTL_BIN for $v and no go toolchain"; fi
+  elif command -v go >/dev/null; then CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$v" -o "$out" ./cmd/supavise
+  else fail "no SUPAVISE_BIN for $v and no go toolchain"; fi
   [[ $("$out" --version) == *"$v"* ]] || fail "the $v binary reports: $("$out" --version)"
 }
-V2=$WORK/sbctl-v2; build_version v0.0.2 "$V2" "${SBCTL_BIN_V2:-}"
-V3=$WORK/sbctl-v3; build_version v0.0.3 "$V3" "${SBCTL_BIN_V3:-}"
-daemon_version() { "/proc/$(systemctl show -p MainPID --value sbctl.service)/exe" --version; }
+V2=$WORK/supavise-v2; build_version v0.0.2 "$V2" "${SUPAVISE_BIN_V2:-}"
+V3=$WORK/supavise-v3; build_version v0.0.3 "$V3" "${SUPAVISE_BIN_V3:-}"
+daemon_version() { "/proc/$(systemctl show -p MainPID --value supavise.service)/exe" --version; }
 [[ $(daemon_version) == *v0.0.1* ]] || fail "the daemon does not run v0.0.1 before the upgrade: $(daemon_version)"
 log "re-running install.sh with the v0.0.2 binary moves the daemon onto it"
-ENTER=$(systemctl show -p ActiveEnterTimestampMonotonic --value sbctl.service)
+ENTER=$(systemctl show -p ActiveEnterTimestampMonotonic --value supavise.service)
 deploy/install.sh --binary "$V2" 2>&1 | tee "$WORK/install3.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "install.sh with the v0.0.2 binary failed"
-[[ $(/usr/local/bin/sbctl --version) == *v0.0.2* ]] || fail "install.sh did not install the v0.0.2 binary"
-wait_active sbctl.service 120
-[[ $(systemctl show -p ActiveEnterTimestampMonotonic --value sbctl.service) != "$ENTER" ]] || fail "install.sh left the daemon running the old binary"
+[[ $(/usr/local/bin/supavise --version) == *v0.0.2* ]] || fail "install.sh did not install the v0.0.2 binary"
+wait_active supavise.service 120
+[[ $(systemctl show -p ActiveEnterTimestampMonotonic --value supavise.service) != "$ENTER" ]] || fail "install.sh left the daemon running the old binary"
 [[ $(daemon_version) == *v0.0.2* ]] || fail "the daemon still reports $(daemon_version) after install.sh installed v0.0.2"
 [[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "the binary upgrade restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
-[[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") == "$PG_PID" ]] || fail "the binary upgrade restarted the project's Postgres"
+[[ $(systemctl show -p MainPID --value "supavise-postgres@$REF.service") == "$PG_PID" ]] || fail "the binary upgrade restarted the project's Postgres"
 for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
 [[ $(papi GET "/v1/projects/$REF" | jq_ 'd["status"]') == ACTIVE_HEALTHY ]] || fail "project unhealthy after the binary upgrade"
 
@@ -365,27 +365,27 @@ for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w
 if [[ -n $V3 ]]; then
   log "self-update: sign v0.0.3 and update from the local release server"
   make_release v0.0.3 "$V3"
-  SU=(/usr/local/bin/sbctl self-update --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" --public-key-file "$KEYS/pub.pem")
+  SU=(/usr/local/bin/supavise self-update --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" --public-key-file "$KEYS/pub.pem")
   [[ $("${SU[@]}" --check) == *"update available"* ]] || fail "self-update --check did not see v0.0.3: $("${SU[@]}" --check)"
   D2=$WORK/srv/download/v0.0.3
-  cp "$D2/sbctl-linux-$ARCH" "$WORK/good-v3"
-  echo tampered >>"$D2/sbctl-linux-$ARCH"
+  cp "$D2/supavise-linux-$ARCH" "$WORK/good-v3"
+  echo tampered >>"$D2/supavise-linux-$ARCH"
   if out=$("${SU[@]}" 2>&1); then fail "self-update installed a tampered binary"; fi
   [[ $out == *"does not match its checksum"* ]] || fail "self-update tamper message: $out"
-  [[ $(/usr/local/bin/sbctl --version) == *v0.0.2* ]] || fail "the binary changed although the update was refused"
-  cp "$WORK/good-v3" "$D2/sbctl-linux-$ARCH"
+  [[ $(/usr/local/bin/supavise --version) == *v0.0.2* ]] || fail "the binary changed although the update was refused"
+  cp "$WORK/good-v3" "$D2/supavise-linux-$ARCH"
   if out=$("${SU[@]}" --version v0.0.9 --force 2>&1); then fail "self-update installed an older signed binary under the newer tag v0.0.9"; fi
   [[ $out == *"refusing to install"* ]] || fail "self-update downgrade message: $out"
-  [[ $(/usr/local/bin/sbctl --version) == *v0.0.2* ]] || fail "the binary changed although the downgrade was refused"
-  if out=$(/usr/local/bin/sbctl self-update --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" --public-key-file "$KEYS/other.pub" 2>&1); then fail "self-update accepted a release signed by another key"; fi
+  [[ $(/usr/local/bin/supavise --version) == *v0.0.2* ]] || fail "the binary changed although the downgrade was refused"
+  if out=$(/usr/local/bin/supavise self-update --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" --public-key-file "$KEYS/other.pub" 2>&1); then fail "self-update accepted a release signed by another key"; fi
   [[ $out == *"does not verify"* ]] || fail "self-update wrong-key message: $out"
   "${SU[@]}" 2>&1 | tee "$WORK/selfupdate.log"
   [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "self-update failed"
-  [[ $(/usr/local/bin/sbctl --version) == *v0.0.3* ]] || fail "the binary is not v0.0.3 after self-update"
+  [[ $(/usr/local/bin/supavise --version) == *v0.0.3* ]] || fail "the binary is not v0.0.3 after self-update"
   [[ $(daemon_version) == *v0.0.3* ]] || fail "the daemon does not run v0.0.3 after self-update: $(daemon_version)"
-  [[ -x /usr/local/bin/sbctl.prev ]] || fail "the previous binary was not kept"
-  wait_active sbctl.service 120
-  [[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") == "$PG_PID" ]] || fail "self-update restarted the project's Postgres"
+  [[ -x /usr/local/bin/supavise.prev ]] || fail "the previous binary was not kept"
+  wait_active supavise.service 120
+  [[ $(systemctl show -p MainPID --value "supavise-postgres@$REF.service") == "$PG_PID" ]] || fail "self-update restarted the project's Postgres"
   [[ $(fleet_pids) == "$FLEET_PIDS" ]] || fail "self-update restarted a shared service or the system project: $FLEET_PIDS -> $(fleet_pids)"
   for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
   [[ $(papi GET "/v1/projects/$REF" | jq_ 'd["status"]') == ACTIVE_HEALTHY ]] || fail "project not healthy after self-update"
@@ -396,19 +396,19 @@ if [[ -n $V3 ]]; then
   # A release whose daemon dies after it forks: systemd reports the unit active, so only the
   # readiness probe notices. self-update must put v0.0.3 back and re-render its units.
   log "self-update rollback: v0.0.4 starts but its daemon exits"
-  BAD=$WORK/sbctl-bad
-  printf '%s\n' '#!/bin/sh' 'case "$1" in' '  --version) echo "sbctl version v0.0.4" ;;' \
+  BAD=$WORK/supavise-bad
+  printf '%s\n' '#!/bin/sh' 'case "$1" in' '  --version) echo "supavise version v0.0.4" ;;' \
     '  serve) echo "simulated crash" >&2; exit 1 ;;' '  *) exit 0 ;;' 'esac' >"$BAD"
   chmod 755 "$BAD"
   make_release v0.0.4 "$BAD"
   if out=$("${SU[@]}" --wait 20s 2>&1); then fail "self-update reported success for a daemon that exits"; fi
   [[ $out == *"rolled back to the previous binary, which is running"* ]] || fail "self-update rollback message: $out"
-  [[ $(/usr/local/bin/sbctl --version) == *v0.0.3* ]] || fail "the binary was not rolled back: $(/usr/local/bin/sbctl --version)"
-  wait_active sbctl.service 120
+  [[ $(/usr/local/bin/supavise --version) == *v0.0.3* ]] || fail "the binary was not rolled back: $(/usr/local/bin/supavise --version)"
+  wait_active supavise.service 120
   [[ $(daemon_version) == *v0.0.3* ]] || fail "the daemon does not run the restored binary: $(daemon_version)"
   for ((i = 0; i < 60; i++)); do [[ $(papi GET "/v1/projects/$REF" -o /dev/null -w '%{http_code}') == 200 ]] && break; sleep 2; done
   [[ $(papi GET "/v1/projects/$REF" | jq_ 'd["status"]') == ACTIVE_HEALTHY ]] || fail "project not healthy after the rollback"
-  [[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") == "$PG_PID" ]] || fail "the rollback restarted the project's Postgres"
+  [[ $(systemctl show -p MainPID --value "supavise-postgres@$REF.service") == "$PG_PID" ]] || fail "the rollback restarted the project's Postgres"
 else
   fail "no v0.0.3 binary: the self-update step cannot run"
 fi

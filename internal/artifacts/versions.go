@@ -8,8 +8,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	sbctl "github.com/OWNER/sbctl"
-	"github.com/OWNER/sbctl/internal/config"
+	supavise "github.com/jsmillerdev/supavise"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // Versions is the parsed versions.yaml: the slim-services release tag of every
@@ -48,7 +48,7 @@ func LoadVersions(cfg *config.Config) (*Versions, error) {
 		}
 		return ParseVersions(b)
 	}
-	return ParseVersions(sbctl.VersionsYAML)
+	return ParseVersions(supavise.VersionsYAML)
 }
 
 // Tag returns the pinned release tag of service svc (a config.Svc* name).

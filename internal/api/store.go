@@ -62,7 +62,7 @@ type Store interface {
 // ErrNotFound is returned by Store lookups that find nothing.
 var ErrNotFound = errors.New("api: not found")
 
-// User is a dashboard user (a GoTrue identity from sb-gotrue@system).
+// User is a dashboard user (a GoTrue identity from supavise-gotrue@system).
 type User struct {
 	ID         int64  // numeric id Studio's types carry
 	UserID     string // GoTrue uuid

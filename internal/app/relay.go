@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/backup"
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // StartWALRelay starts the WAL relay over the configured backend (nil and a no-op stop
@@ -14,7 +14,7 @@ import (
 // outlives ctx: stop ends it, so a caller can keep archiving available while it drains.
 //
 // The daemon calls it with cli false. A command-line process that has to wait for WAL to
-// be archived (`sbctl backups create`, a delete's final base backup) calls it with cli
+// be archived (`supavise backups create`, a delete's final base backup) calls it with cli
 // true while the daemon may be down: it serves only the sockets that nobody answers (a
 // relay never replaces one that answers) and looks for them more often. refs names the
 // projects the command works on; without refs a CLI relay serves every project.

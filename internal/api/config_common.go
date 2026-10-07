@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // applyTimeout bounds applying a saved setting to the running service: restarting GoTrue or

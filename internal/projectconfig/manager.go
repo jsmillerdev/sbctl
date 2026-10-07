@@ -8,7 +8,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // Options configure a Manager.

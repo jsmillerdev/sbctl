@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // Artifacts is the part of the artifact store the fleet needs.
@@ -424,7 +424,7 @@ func (m *Manager) Status(ctx context.Context) []Health {
 			h.Optional = true
 			h.Status, h.Error = "STOPPED", "Edge Functions are off in the configuration; the unit of an earlier configuration is still rendered"
 			if err == nil && (st.State == units.StateActive || st.State == units.StateActivating) {
-				h.Status, h.Error = "UNHEALTHY", "Edge Functions are off in the configuration but this unit still runs (sbctl fleet start removes it)"
+				h.Status, h.Error = "UNHEALTHY", "Edge Functions are off in the configuration but this unit still runs (supavise fleet start removes it)"
 			}
 		case err != nil:
 			h.Status, h.Error = "STOPPED", err.Error()

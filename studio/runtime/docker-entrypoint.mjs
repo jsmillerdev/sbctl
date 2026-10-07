@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-// Entrypoint of the sbctl platform-mode Studio artifact. Same contract as the slim-services
+// Entrypoint of the supavise platform-mode Studio artifact. Same contract as the slim-services
 // studio artifact (bin/studio runs this file with cwd = app/): read the *_FILE secrets, start
 // apps/studio/server.js, forward SIGTERM and SIGINT, mirror the exit status. The one addition is
-// that the per-install values are substituted into the build first (see sbctl-runtime-config.mjs).
+// that the per-install values are substituted into the build first (see supavise-runtime-config.mjs).
 
 import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { constants as osConstants } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
-import { applyRuntimeConfig } from './sbctl-runtime-config.mjs'
+import { applyRuntimeConfig } from './supavise-runtime-config.mjs'
 
 function fileEnv(name, defaultValue = '') {
   const value = process.env[name]
@@ -40,7 +40,7 @@ const root = fileURLToPath(new URL('../../..', import.meta.url))
 try {
   Object.assign(process.env, applyRuntimeConfig(root, process.env))
 } catch (err) {
-  console.error(`sbctl-studio: ${err.message}`)
+  console.error(`supavise-studio: ${err.message}`)
   // 78 = EX_CONFIG: bad operator input, systemd should not restart-loop on it quickly.
   process.exit(err.configError ? 78 : 1)
 }

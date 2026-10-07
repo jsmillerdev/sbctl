@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Starts a packaged sbctl Studio build on a loopback port and checks that it is a platform-mode
+# Starts a packaged supavise Studio build on a loopback port and checks that it is a platform-mode
 # build whose placeholders are replaced, twice with different values, and that missing required
 # values stop it with exit code 78.
 #
-#   studio/verify.sh <sbctl-studio-*.tar.zst | extracted directory>
+#   studio/verify.sh <supavise-studio-*.tar.zst | extracted directory>
 #
 # A directory is copied first (the check rewrites files). Needs curl, tar and zstd (for archives).
 # Used by build.sh before it writes the artifact, and by studio/spike.sh.
@@ -12,7 +12,7 @@ set -euo pipefail
 SRC="${1:-}"
 [[ -n "$SRC" ]] || { echo "usage: verify.sh <archive|dir>" >&2; exit 2; }
 
-TMP="$(mktemp -d "${STUDIO_VERIFY_TMP:-${TMPDIR:-/tmp}}/sbctl-studio-verify.XXXXXX")"
+TMP="$(mktemp -d "${STUDIO_VERIFY_TMP:-${TMPDIR:-/tmp}}/supavise-studio-verify.XXXXXX")"
 PID=""
 cleanup() {
   if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi
@@ -31,18 +31,18 @@ if [[ -d "$SRC" ]]; then
 else
   zstd -dc "$SRC" | tar -C "$ROOT" -xf -
 fi
-for f in bin/studio node/bin/node app/apps/studio/server.js app/apps/studio/docker-entrypoint.mjs share/sbctl/runtime-config.json; do
+for f in bin/studio node/bin/node app/apps/studio/server.js app/apps/studio/docker-entrypoint.mjs share/supavise/runtime-config.json; do
   [[ -e "$ROOT/$f" ]] || fail "artifact is missing $f"
 done
 NODE="$ROOT/node/bin/node"
 
 free_port() { "$NODE" -e 'const s=require("net").createServer().listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})'; }
 
-# placeholders still present in any listed file (the .sbctl-tpl copies are expected to keep them)
+# placeholders still present in any listed file (the .supavise-tpl copies are expected to keep them)
 leftover_placeholders() {
   "$NODE" -e '
     const fs = require("fs"), path = require("path");
-    const cfg = JSON.parse(fs.readFileSync(process.argv[1] + "/share/sbctl/runtime-config.json", "utf8"));
+    const cfg = JSON.parse(fs.readFileSync(process.argv[1] + "/share/supavise/runtime-config.json", "utf8"));
     const needles = cfg.values.flatMap((v) => [v.placeholder, v.origin].filter(Boolean));
     let bad = 0;
     for (const f of cfg.files) {
@@ -55,7 +55,7 @@ leftover_placeholders() {
 files_containing() { # needle -> count of listed files that contain it
   "$NODE" -e '
     const fs = require("fs"), path = require("path");
-    const cfg = JSON.parse(fs.readFileSync(process.argv[1] + "/share/sbctl/runtime-config.json", "utf8"));
+    const cfg = JSON.parse(fs.readFileSync(process.argv[1] + "/share/supavise/runtime-config.json", "utf8"));
     let n = 0;
     for (const f of cfg.files) if (fs.readFileSync(path.join(process.argv[1], "app", f), "utf8").includes(process.argv[2])) n++;
     console.log(n);
@@ -96,7 +96,7 @@ check_round() { # api origin, hosts-regex-literal
   echo "$headers" | grep -qi '^content-security-policy:' || fail "no CSP header (not a platform build?)"
   echo "$headers" | grep -i '^content-security-policy:' | grep -qF "$api" || fail "CSP does not allow $api"
   echo "$headers" | grep -i '^content-security-policy:' | grep -qF "wss://$host_a" || fail "CSP does not allow wss://$host_a"
-  if echo "$headers" | grep -qi 'sbctl-placeholder'; then fail "CSP still has a placeholder"; fi
+  if echo "$headers" | grep -qi 'supavise-placeholder'; then fail "CSP still has a placeholder"; fi
   # CSP source expressions with a path match that exact path only, so the API origin must appear
   # as a bare origin token (an entry like https://host/platform would block /platform/profile).
   echo "$headers" | grep -i '^content-security-policy:' | tr ' ;' '\n\n' | grep -qxF "$api" || fail "CSP has no bare $api token"
@@ -110,7 +110,7 @@ check_round() { # api origin, hosts-regex-literal
   [[ "$code" == 200 ]] || fail "/api/get-utc-time returned $code, want 200"
   ok "platform mode: /api/platform/* is 404, allowlisted routes work"
 
-  # /api/incident-banner answers 500 here (no incident.io key); sbctl's proxy answers it
+  # /api/incident-banner answers 500 here (no incident.io key); supavise's proxy answers it
   # itself on studio.<domain> (internal/proxy), so the artifact carries no fixup for it.
 
   leftover_placeholders || fail "placeholders left in rewritten files"

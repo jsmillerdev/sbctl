@@ -1,0 +1,64 @@
+[Unit]
+Description=Supavise Storage, the shared multi-tenant object store
+Documentation=https://github.com/jsmillerdev/supavise
+Requires=supavise-postgres@system.service
+After=network.target local-fs.target supavise-postgres@system.service
+StartLimitIntervalSec=0
+
+[Service]
+# supavise renders the two files below (units.Supervisor.Render) before it starts the unit.
+Type=exec
+User=supavise
+Group=supavise
+Slice=supavise.slice
+EnvironmentFile=/var/lib/supavise/projects/system/storage.env
+ExecStart=/var/lib/supavise/projects/system/storage.run
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30
+LimitNOFILE=65536
+# MemoryMax and CPUQuota come from the project record: supavise applies them over D-Bus
+# as persistent per-unit drop-ins.
+MemoryAccounting=yes
+CPUAccounting=yes
+SyslogIdentifier=supavise-storage
+
+# Hardening. MemoryDenyWriteExecute is deliberately absent: Postgres (JIT), the BEAM
+# and Node all map writable+executable memory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# The EC2 instance role (backup bucket, DNS) must not reach tenant-facing code through the
+# instance metadata service (IPv4 and IPv6 addresses). The S3 backend of Storage takes a
+# static key from config.toml (rendered into the 0600 env file); the instance role is not available to it.
+IPAddressDeny=169.254.169.254 fd00:ec2::254
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+ReadWritePaths=-/var/lib/supavise/system/storage
+# Containment (allowlist). Every unit runs as the supavise user, so the mount namespace is
+# what keeps a service away from the master key, other projects' data and the backups. The
+# unit sees an empty tmpfs where /var/lib/supavise is, plus the artifacts (read-only), its own
+# launcher script (read-only) and its own state directory. It never needs to read an
+# environment file: systemd reads EnvironmentFile= before it builds the namespace. This
+# does not isolate tenants from a compromised service (same uid, /proc); see README.md.
+InaccessiblePaths=-/etc/supavise -/run/dbus
+TemporaryFileSystem=/var/lib/supavise:ro
+BindReadOnlyPaths=/var/lib/supavise/artifacts /var/lib/supavise/projects/system/storage.run
+BindPaths=-/var/lib/supavise/system/storage
+
+[Install]
+WantedBy=multi-user.target

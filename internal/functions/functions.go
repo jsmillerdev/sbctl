@@ -6,7 +6,7 @@
 //
 //	<state>/system/edge-runtime/tenants/<ref>/functions-env.json    jwt secret, SUPABASE_* values, secrets (0600)
 //	<state>/system/edge-runtime/tenants/<ref>/functions/<slug>      symlink to .gen/<slug>.<version>.<random>
-//	<state>/system/edge-runtime/tenants/<ref>/functions/.gen/<...>/ the uploaded files and .sbctl-function.json
+//	<state>/system/edge-runtime/tenants/<ref>/functions/.gen/<...>/ the uploaded files and .supavise-function.json
 //
 // The tree lives in the Edge Runtime's own state directory because that is the one place
 // its systemd unit sees; the projects' directories (clusters, sockets, unit files) stay
@@ -40,11 +40,11 @@ import (
 
 	"github.com/andybalholm/brotli"
 
-	"github.com/OWNER/sbctl/internal/api"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // Store is the part of api.Store the syncer reads.
@@ -67,7 +67,7 @@ type Deps struct {
 	// Now is the clock; empty means time.Now.
 	Now func() time.Time
 	// Supervisor and Artifacts let the Syncer bundle uploaded sources in the sandbox of
-	// sb-edge-bundle@<ref>.service (lifecycle.Node's Supervisor and Artifacts). Without them, or
+	// supavise-edge-bundle@<ref>.service (lifecycle.Node's Supervisor and Artifacts). Without them, or
 	// where the supervisor cannot confine the bundler, source uploads are refused.
 	Supervisor units.Supervisor
 	Artifacts  ArtifactDirs
@@ -395,7 +395,7 @@ func jsonObject(m map[string]string) string {
 	return string(b)
 }
 
-// meta is .sbctl-function.json inside a generation. Only bundles are served: a function
+// meta is .supavise-function.json inside a generation. Only bundles are served: a function
 // that runs from real source files can import files outside its own directory through
 // relative specifiers (the module loader follows them), which in a tree shared by every
 // project would reach other projects' environment files and code. The module specifiers
@@ -404,7 +404,7 @@ type meta struct {
 	Slug      string `json:"slug"`
 	Version   int    `json:"version"`
 	VerifyJWT bool   `json:"verify_jwt"`
-	// Kind is "eszip", the only kind there is (main services of older sbctl versions also
+	// Kind is "eszip", the only kind there is (main services of older supavise versions also
 	// wrote "source", which functions-main refuses).
 	Kind string `json:"kind"`
 	// Entrypoint is the module specifier inside the bundle (a file URL).

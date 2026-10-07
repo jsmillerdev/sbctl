@@ -1,4 +1,4 @@
-# sbctl
+# Supavise
 
 One static Go binary that turns a Linux machine into a multi-project Supabase for a team. It runs Supabase's own native service artifacts as systemd units and is itself the edge proxy (automatic TLS), the Management API that Studio, the Supabase CLI and the Supabase MCP server talk to, the project lifecycle engine and the WAL archiver.
 
@@ -10,16 +10,16 @@ One static Go binary that turns a Linux machine into a multi-project Supabase fo
 
 | Path | What |
 |---|---|
-| `cmd/sbctl` | the binary; each area registers its subcommands in `cmd_<area>.go` |
-| `internal/config` | `/etc/sbctl/config.toml`, `SBCTL_*` overrides, paths, ports, hostnames |
+| `cmd/supavise` | the binary; each area registers its subcommands in `cmd_<area>.go` |
+| `internal/config` | `/etc/supavise/config.toml`, `SUPAVISE_*` overrides, paths, ports, hostnames |
 | `internal/secrets` | master-key sealing and every generated credential |
-| `internal/registry` | control-plane store (system Postgres, schema `sbctl`) |
-| `internal/app` | composition: `sbctl serve` (the daemon), backup wired into lifecycle |
+| `internal/registry` | control-plane store (system Postgres, schema `supavise`) |
+| `internal/app` | composition: `supavise serve` (the daemon), backup wired into lifecycle |
 | `internal/api` | Management API (`/v1`, `/v2`, `/platform`) |
 | `internal/proxy` | HTTPS/WebSocket edge, CertMagic, apikey handling |
 | `internal/artifacts`, `internal/units`, `internal/lifecycle` | artifact fetch, systemd units, project lifecycle |
 | `internal/fleet` | Supavisor, Realtime and Storage tenant registration |
-| `internal/backup` | `sbctl wal push|fetch`, base backups, point-in-time restore |
+| `internal/backup` | `supavise wal push|fetch`, base backups, point-in-time restore |
 | `studio/` | platform-mode Studio build and its three patches |
 | `deploy/` | installer, systemd templates, CloudFormation |
 | `tests/conformance` | end-to-end suite against a running node |
@@ -35,17 +35,17 @@ commit; `config.Regions` copies it): Studio resolves it against that table and t
 on anything else, including real AWS regions such as `eu-south-1` (a project created with another
 label gets this value).
 
-No project's units read `/etc/sbctl` or the backups: a cluster's `archive_command` and
+No project's units read `/etc/supavise` or the backups: a cluster's `archive_command` and
 `restore_command` talk to the daemon over a unix socket in the project's own directory
-(`[backup] wal_relay`, on under systemd), and the daemon holds the backup credentials; every `sb-*`
+(`[backup] wal_relay`, on under systemd), and the daemon holds the backup credentials; every `supavise-*`
 unit is denied the cloud instance metadata service, so the EC2 instance role is out of reach of SQL,
 `pg_net` and the like. What the per-unit sandbox does and does not isolate (same uid, `/proc`) is
 spelled out in `deploy/systemd/README.md`; do not take it for a boundary against code execution
 inside a unit.
 
-`sbctl serve` is the daemon that `sbctl.service` runs. On SIGTERM it refuses new lifecycle
+`supavise serve` is the daemon that `supavise.service` runs. On SIGTERM it refuses new lifecycle
 operations (503) and waits up to 10 minutes for running ones (a delete with its final backup, a
-restart) before it exits; `sbctl.service` allows 11 minutes to stop. An operation cut off anyway
+restart) before it exits; `supavise.service` allows 11 minutes to stop. An operation cut off anyway
 is finished or reverted at the next start. At boot it waits up to 2 minutes for the registry.
 
 ## Develop
@@ -54,8 +54,10 @@ is finished or reverted at the next start. At boot it waits up to 2 minutes for 
 make test
 ```
 
-Registry tests against Postgres run when `SBCTL_TEST_DATABASE_URL` points at an empty database.
+Registry tests against Postgres run when `SUPAVISE_TEST_DATABASE_URL` points at an empty database.
 
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+Supavise is not affiliated with or endorsed by Supabase Inc.

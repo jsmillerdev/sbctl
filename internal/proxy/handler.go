@@ -15,15 +15,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 const requestIDHeader = "X-Request-Id"
 
 // TenantHeader tells the edge runtime's main service which project a /functions/v1
 // request belongs to. It is always overwritten by the proxy.
-const TenantHeader = "X-Sbctl-Project-Ref"
+const TenantHeader = "X-Supavise-Project-Ref"
 
 // ServeHTTP is the whole edge: it dispatches on the Host header to the Management
 // API, Studio, or a project's API.

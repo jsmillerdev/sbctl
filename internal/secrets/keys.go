@@ -12,7 +12,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// Names of the per-project secrets stored (sealed) in sbctl.project_secrets.
+// Names of the per-project secrets stored (sealed) in supavise.project_secrets.
 const (
 	NameJWTSecret      = "jwt_secret"       // HS256 secret shared by GoTrue, PostgREST, Realtime, Storage
 	NameAnonKey        = "anon_key"         // legacy anon JWT
@@ -20,7 +20,7 @@ const (
 	NamePublishableKey = "publishable_key"  // sb_publishable_..., maps to anon
 	NameSecretKey      = "secret_key"       // sb_secret_..., maps to service_role
 	NameDBPassword     = "db_password"      // password of the "postgres" role
-	// NameAdminPassword is the password of supabase_admin, used by sbctl, pgmeta and the fleet.
+	// NameAdminPassword is the password of supabase_admin, used by supavise, pgmeta and the fleet.
 	NameAdminPassword = "admin_password"
 	// NameAuthenticatorPassword etc. are the passwords of the service login roles.
 	NameAuthenticatorPassword = "authenticator_password"

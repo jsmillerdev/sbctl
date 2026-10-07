@@ -13,20 +13,20 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/artifacts"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/sso"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/artifacts"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/sso"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // SystemDatabases are created in the system cluster next to "postgres" (GoTrue's
-// dashboard auth schema) and "sbctl" (the registry, used by supabase_admin). Each of the
+// dashboard auth schema) and "supavise" (the registry, used by supabase_admin). Each of the
 // others belongs to one fleet service: see FleetRoles.
-var SystemDatabases = []string{"sbctl", "_supavisor", "_realtime", "_storage"}
+var SystemDatabases = []string{"supavise", "_supavisor", "_realtime", "_storage"}
 
 // FleetRole is the login role one fleet service uses for its own database in the
 // system cluster. It owns that database and the same-named schema and nothing else, and
@@ -41,9 +41,9 @@ type FleetRole struct {
 // FleetRoles lists the fleet services' roles. Their passwords are sealed in the
 // registry under the system project (see Engine.FleetCredentials).
 var FleetRoles = []FleetRole{
-	{Service: "supavisor", Database: "_supavisor", Role: "sbctl_supavisor"},
-	{Service: "realtime", Database: "_realtime", Role: "sbctl_realtime"},
-	{Service: "storage", Database: "_storage", Role: "sbctl_storage"},
+	{Service: "supavisor", Database: "_supavisor", Role: "supavise_supavisor"},
+	{Service: "realtime", Database: "_realtime", Role: "supavise_realtime"},
+	{Service: "storage", Database: "_storage", Role: "supavise_storage"},
 }
 
 func fleetSecretName(service string) string { return "fleet_" + service + "_password" }
@@ -61,7 +61,7 @@ func (e *Engine) FleetCredentials(ctx context.Context) ([]FleetCredential, error
 	for _, fr := range FleetRoles {
 		sealed, err := e.reg.GetSecret(ctx, config.SystemRef, fleetSecretName(fr.Service))
 		if err != nil {
-			return nil, fmt.Errorf("lifecycle: credentials of %s: %w (run `sbctl system init`)", fr.Role, err)
+			return nil, fmt.Errorf("lifecycle: credentials of %s: %w (run `supavise system init`)", fr.Role, err)
 		}
 		pt, err := e.sec.Open(sealed)
 		if err != nil {
@@ -236,17 +236,17 @@ func (o *OpenOptions) artifactStore(cfg *config.Config) (Artifacts, error) {
 }
 
 // ErrRegistryUnreachable is wrapped by Open when the registry in the system cluster does
-// not answer: the cluster may still be starting (systemd orders sbctl.service after the
-// start of sb-postgres@system, not its readiness), so a daemon retries on it.
+// not answer: the cluster may still be starting (systemd orders supavise.service after the
+// start of supavise-postgres@system, not its readiness), so a daemon retries on it.
 var ErrRegistryUnreachable = errors.New("cannot reach the registry in the system cluster")
 
 // Open connects to an initialized node: it loads the master key, reaches the registry
 // through the system cluster's private unix socket, and builds the Engine. It does not
-// start anything; run `sbctl system init` (or start sb-postgres@system) first.
+// start anything; run `supavise system init` (or start supavise-postgres@system) first.
 func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error) {
 	kb, err := os.ReadFile(cfg.KeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("lifecycle: master key: %w (run `sbctl system init`)", err)
+		return nil, fmt.Errorf("lifecycle: master key: %w (run `supavise system init`)", err)
 	}
 	sec, err := secrets.Load(kb)
 	if err != nil {
@@ -265,7 +265,7 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 		if c, ok := sup.(interface{ Close() }); ok {
 			c.Close() // a caller that retries must not leak a bus connection per attempt
 		}
-		return nil, fmt.Errorf("lifecycle: %w (is sb-postgres@system running? run `sbctl system init`): %w", ErrRegistryUnreachable, err)
+		return nil, fmt.Errorf("lifecycle: %w (is supavise-postgres@system running? run `supavise system init`): %w", ErrRegistryUnreachable, err)
 	}
 	node := &Node{Cfg: cfg, Secrets: sec, Supervisor: sup, Artifacts: arts, Registry: reg}
 	bk := o.lateBackup(node)
@@ -279,20 +279,20 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	return node, nil
 }
 
-// supervisorTimers starts and stops sb-basebackup@<ref>.timer through the supervisor
-// (D-Bus StartUnit, which the polkit rule allows for sb-* units). The timers are not
+// supervisorTimers starts and stops supavise-basebackup@<ref>.timer through the supervisor
+// (D-Bus StartUnit, which the polkit rule allows for supavise-* units). The timers are not
 // enabled for boot: the daemon starts them again for every active project at start.
 type supervisorTimers struct{ sup units.Supervisor }
 
 func (t supervisorTimers) StartTimer(ctx context.Context, ref string) error {
-	return t.sup.Start(ctx, "sb-basebackup@"+ref+".timer")
+	return t.sup.Start(ctx, "supavise-basebackup@"+ref+".timer")
 }
 func (t supervisorTimers) StopTimer(ctx context.Context, ref string) error {
-	return t.sup.Stop(ctx, "sb-basebackup@"+ref+".timer")
+	return t.sup.Stop(ctx, "supavise-basebackup@"+ref+".timer")
 }
 
 // timers returns the backup timer control for the systemd backend; the exec backend has
-// no timers (backups are taken with `sbctl backups create`).
+// no timers (backups are taken with `supavise backups create`).
 func (o *OpenOptions) timers(cfg *config.Config, sup units.Supervisor) Timers {
 	if o.Timers != nil {
 		return o.Timers
@@ -374,7 +374,7 @@ func systemProject(cfg *config.Config, versions map[string]string) *registry.Pro
 //
 //  1. master key, artifacts (postgres, auth, postgrest)
 //  2. cluster initialized and started, role passwords set
-//  3. databases sbctl, _supavisor, _realtime, _storage; registry migrations
+//  3. databases supavise, _supavisor, _realtime, _storage; registry migrations
 //  4. the system project row and its sealed credentials
 //  5. GoTrue configured for Studio sign-in (site URL https://studio.<domain>)
 //
@@ -538,7 +538,7 @@ func (pl *PostgresPlane) staleSystem(ctx context.Context, p *registry.Project, p
 	}
 	dir := pl.cfg.Paths().Project(config.SystemRef)
 	if err := pl.startRendered(ctx, p); err != nil {
-		return false, "", fmt.Errorf("%w; if %s holds nothing you need (a failed first init), stop the units, remove that directory and run `sbctl system init` again", err, dir)
+		return false, "", fmt.Errorf("%w; if %s holds nothing you need (a failed first init), stop the units, remove that directory and run `supavise system init` again", err, dir)
 	}
 	pp := pl.paths(p)
 	c, err := connect(ctx, socketDSN(pp, "postgres"))
@@ -546,29 +546,29 @@ func (pl *PostgresPlane) staleSystem(ctx context.Context, p *registry.Project, p
 		return false, "", err
 	}
 	var hasDB bool
-	err = c.QueryRow(ctx, `select exists (select 1 from pg_database where datname = 'sbctl')`).Scan(&hasDB)
+	err = c.QueryRow(ctx, `select exists (select 1 from pg_database where datname = 'supavise')`).Scan(&hasDB)
 	c.Close(context.WithoutCancel(ctx))
 	if err != nil {
 		return false, "", err
 	}
 	if !hasDB {
-		return true, "the sbctl registry database was never created", nil
+		return true, "the Supavise registry database was never created", nil
 	}
-	rc, err := connect(ctx, socketDSN(pp, "sbctl"))
+	rc, err := connect(ctx, socketDSN(pp, "supavise"))
 	if err != nil {
 		return false, "", err
 	}
 	defer rc.Close(context.WithoutCancel(ctx))
 	var hasTables bool
-	if err := rc.QueryRow(ctx, `select to_regclass('sbctl.project_secrets') is not null and to_regclass('sbctl.projects') is not null`).Scan(&hasTables); err != nil {
+	if err := rc.QueryRow(ctx, `select to_regclass('supavise.project_secrets') is not null and to_regclass('supavise.projects') is not null`).Scan(&hasTables); err != nil {
 		return false, "", err
 	}
 	if !hasTables {
 		return true, "the registry schema was never created", nil
 	}
 	var secretRows, others int
-	if err := rc.QueryRow(ctx, `select (select count(*) from sbctl.project_secrets where ref = 'system'),
-	                                    (select count(*) from sbctl.projects where ref <> 'system')`).Scan(&secretRows, &others); err != nil {
+	if err := rc.QueryRow(ctx, `select (select count(*) from supavise.project_secrets where ref = 'system'),
+	                                    (select count(*) from supavise.projects where ref <> 'system')`).Scan(&secretRows, &others); err != nil {
 		return false, "", err
 	}
 	switch {
@@ -577,7 +577,7 @@ func (pl *PostgresPlane) staleSystem(ctx context.Context, p *registry.Project, p
 	case others == 0:
 		return true, "the registry holds no system credentials and no projects", nil
 	default:
-		return false, "", fmt.Errorf("lifecycle: the registry in %s has %d project(s) but no system credentials; restore the system secrets from a registry backup, or, to give up on the data, stop the sb-* units, remove %s and run `sbctl system init` (existing projects stay on disk but are no longer registered)", dir, others, dir)
+		return false, "", fmt.Errorf("lifecycle: the registry in %s has %d project(s) but no system credentials; restore the system secrets from a registry backup, or, to give up on the data, stop the supavise-* units, remove %s and run `supavise system init` (existing projects stay on disk but are no longer registered)", dir, others, dir)
 	}
 }
 
@@ -643,7 +643,7 @@ func createSystemDatabases(ctx context.Context, pp pgPaths) error {
 		if err := exec(`select format('revoke all on database %I from public', $1::text)`, db); err != nil {
 			return err
 		}
-		if db == "sbctl" {
+		if db == "supavise" {
 			continue // the registry creates its own schema
 		}
 		if err := ensureSchema(ctx, pp, db, owner); err != nil {
@@ -724,7 +724,7 @@ func StopAll(ctx context.Context, cfg *config.Config, o OpenOptions) error {
 
 // UnitInstaller returns a function that makes systemd re-read unit files when reload
 // is set and enables the system project's units for boot. It needs root: the polkit rule
-// deliberately does not grant daemon-reload or unit-file management to the sbctl user.
+// deliberately does not grant daemon-reload or unit-file management to the supavise user.
 // It returns an error when the configured supervisor has no systemd (the exec backend,
 // or a non-Linux build).
 func (o OpenOptions) UnitInstaller(cfg *config.Config) (func(ctx context.Context, reload bool) error, error) {

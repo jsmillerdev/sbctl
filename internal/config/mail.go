@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// Mail is the [mail] config section: the SMTP server sb-gotrue@system sends the
+// Mail is the [mail] config section: the SMTP server supavise-gotrue@system sends the
 // dashboard's mail through (organization invitations). Without a host no mail leaves the
 // node: an invitation then yields a link for the administrator to pass on.
 type Mail struct {
@@ -26,7 +26,7 @@ func (m Mail) Enabled() bool {
 	return strings.TrimSpace(m.SMTPHost) != "" && strings.TrimSpace(m.SMTPFrom) != ""
 }
 
-// GoTrueEnv returns the GoTrue variables that make sb-gotrue@system send mail through the
+// GoTrueEnv returns the GoTrue variables that make supavise-gotrue@system send mail through the
 // relay; empty when mail is not configured.
 func (m Mail) GoTrueEnv() map[string]string {
 	if !m.Enabled() {
@@ -38,7 +38,7 @@ func (m Mail) GoTrueEnv() map[string]string {
 	}
 	name := m.SMTPName
 	if name == "" {
-		name = "sbctl"
+		name = "supavise"
 	}
 	env := map[string]string{
 		"GOTRUE_SMTP_HOST":        strings.TrimSpace(m.SMTPHost),

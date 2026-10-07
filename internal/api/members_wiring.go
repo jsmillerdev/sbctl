@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/sso"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/sso"
 )
 
 // NewMembers builds the roles service over the registry: Postgres for a Postgres registry
@@ -50,7 +50,7 @@ func (s *Server) liveRefs(ctx context.Context, refs []string) []string {
 	return liveRefs(ctx, s.reg, refs)
 }
 
-// UserCreatedAt returns when the dashboard account was created, from sb-gotrue@system.
+// UserCreatedAt returns when the dashboard account was created, from supavise-gotrue@system.
 func (a *Accounts) UserCreatedAt(ctx context.Context, userID string) (time.Time, error) {
 	var u struct {
 		CreatedAt time.Time `json:"created_at"`
@@ -65,7 +65,7 @@ func (a *Accounts) UserCreatedAt(ctx context.Context, userID string) (time.Time,
 // addresses unique among password accounts only, so an identity provider that vouches for an
 // address creates a second account with it; the operator's commands name which one they mean.
 type UserSelector struct {
-	// UserID is the account's id (see `sbctl users list --json`).
+	// UserID is the account's id (see `supavise users list --json`).
 	UserID string
 	// Provider is "email" (or "password") for the password account, or the id of a single
 	// sign-on identity provider, with or without the "sso:" prefix.
@@ -105,7 +105,7 @@ func (u DashboardUser) kind() string {
 // So an address is never resolved by taking the first match. With a selector, the account it names
 // is the one (an error when none matches). Without one, the password account is the one when there
 // is exactly one: an account that an identity provider created never takes the place of the account
-// sbctl created for the address, and it is reached only by naming it. An address that only
+// supavise created for the address, and it is reached only by naming it. An address that only
 // single sign-on accounts have resolves to its account when there is just one. Anything else is an
 // AmbiguousUserError.
 func (a *Accounts) ResolveUser(ctx context.Context, email string, sel UserSelector) (*DashboardUser, error) {
@@ -161,7 +161,7 @@ func (a *Accounts) ResolveUser(ctx context.Context, email string, sel UserSelect
 	return nil, &AmbiguousUserError{Email: email, Matches: matches}
 }
 
-// passwordAccount returns the account sbctl created for an address (one that signs in with a
+// passwordAccount returns the account supavise created for an address (one that signs in with a
 // password or a magic link), nil when there is none. Accounts of identity providers do not count:
 // an invitation goes to the person who owns the address, not to whoever an identity provider says
 // has it.
@@ -186,7 +186,7 @@ type InviteResult struct {
 	// ClaimURL creates the dashboard account of an address that has none; the invitation is
 	// accepted when the account is created. Empty when the address already has an account.
 	ClaimURL string
-	// Emailed is true when sb-gotrue@system sent the invitation through the configured SMTP
+	// Emailed is true when supavise-gotrue@system sent the invitation through the configured SMTP
 	// relay; otherwise the administrator passes Link on.
 	Emailed bool
 	// MailError says why a configured relay did not send.
@@ -263,7 +263,7 @@ func (a *Accounts) InviteToOrganization(ctx context.Context, actor *members.Acce
 	return res, nil
 }
 
-// sendInvitation has sb-gotrue@system mail the invitee. A new address gets GoTrue's invite
+// sendInvitation has supavise-gotrue@system mail the invitee. A new address gets GoTrue's invite
 // (the account is created, confirmed and marked as a dashboard user at once, the link signs the
 // person in and lands on the invitation); an existing account gets a sign-in link that lands
 // on it.
@@ -289,7 +289,7 @@ func (a *Accounts) sendInvitation(ctx context.Context, email string, existing *D
 	if u.ID == "" {
 		return errors.New("gotrue did not return the invited user")
 	}
-	// The invited user needs the dashboard claim like any account sbctl creates.
+	// The invited user needs the dashboard claim like any account supavise creates.
 	if _, err := a.goTrue(ctx, http.MethodPut, "/admin/users/"+url.PathEscape(u.ID), map[string]any{
 		"app_metadata": map[string]any{AdminClaim: true, "provider": "email", "providers": []string{"email"}},
 	}, nil); err != nil {
@@ -339,7 +339,7 @@ func (a *Accounts) orgBySlugOrOnly(ctx context.Context, slug string) (members.Or
 	}
 	switch len(orgs) {
 	case 0:
-		return members.OrgRef{}, errors.New("there is no organization yet; claim the node first (`sbctl claim token`)")
+		return members.OrgRef{}, errors.New("there is no organization yet; claim the node first (`supavise claim token`)")
 	case 1:
 		return members.OrgRef{ID: orgs[0].ID, Slug: orgs[0].Slug}, nil
 	}
@@ -355,7 +355,7 @@ func (a *Accounts) Org(ctx context.Context, slug string) (members.OrgRef, error)
 	return a.orgBySlugOrOnly(ctx, slug)
 }
 
-// InviteByEmail is `sbctl users invite`: the operator invites an address to an organization.
+// InviteByEmail is `supavise users invite`: the operator invites an address to an organization.
 func (a *Accounts) InviteByEmail(ctx context.Context, email, orgSlug, role string, projectRefs []string) (*InviteResult, members.OrgRef, error) {
 	ro, err := members.ParseRole(role)
 	if err != nil {
@@ -373,7 +373,7 @@ func (a *Accounts) InviteByEmail(ctx context.Context, email, orgSlug, role strin
 	}
 	res, err := a.InviteToOrganization(ctx, nil, org, members.InviteInput{Email: email, RoleID: ro.ID, Refs: projectRefs})
 	if errors.Is(err, members.ErrAlreadyMember) {
-		return nil, org, fmt.Errorf("%s is already a member of %s; change the role with `sbctl users role`", email, org.Slug)
+		return nil, org, fmt.Errorf("%s is already a member of %s; change the role with `supavise users role`", email, org.Slug)
 	}
 	return res, org, err
 }
@@ -384,7 +384,7 @@ func (a *Accounts) SetRole(ctx context.Context, email, orgSlug, role string) (me
 	return org, err
 }
 
-// SetRoleOf is `sbctl users role`: the operator sets the organization-wide role of an account,
+// SetRoleOf is `supavise users role`: the operator sets the organization-wide role of an account,
 // adding the account to the organization when it is not a member. It is how an organization
 // that lost every Owner gets one back. The last Owner still cannot be demoted. When the address
 // belongs to several accounts the selector names one (ResolveUser); the account that got the role
@@ -419,7 +419,7 @@ func (a *Accounts) SetRoleOf(ctx context.Context, email, orgSlug, role string, s
 	return org, u, a.Members.SetOrgRole(ctx, nil, org, u.ID, ro.ID)
 }
 
-// UserRoles describes where a dashboard user belongs, for `sbctl users list`: one entry per
+// UserRoles describes where a dashboard user belongs, for `supavise users list`: one entry per
 // organization, "acme:owner" or "acme:developer(2 projects)".
 func (a *Accounts) UserRoles(ctx context.Context, userID string) ([]string, error) {
 	ms, err := a.Members.Store.MembershipsOf(ctx, userID)
@@ -450,7 +450,7 @@ func (a *Accounts) UserRoles(ctx context.Context, userID string) ([]string, erro
 	return out, nil
 }
 
-// SetDomainDefault is `sbctl users default-role set`: the organization and role an SSO user
+// SetDomainDefault is `supavise users default-role set`: the organization and role an SSO user
 // gets on a first sign-in from this email domain.
 func (a *Accounts) SetDomainDefault(ctx context.Context, domain, orgSlug, role string) (members.OrgRef, error) {
 	ro, err := members.ParseRole(role)

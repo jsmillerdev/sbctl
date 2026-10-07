@@ -13,10 +13,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // ReconfigureService re-renders the env files of p's API units from the saved settings and
@@ -50,7 +50,7 @@ func (pl *PostgresPlane) ReconfigureService(ctx context.Context, p *registry.Pro
 	return pl.wait(ctx, target.Unit(), svc, pl.opts.ServiceReadyTimeout, func(ctx context.Context) error { return pl.checkHTTP(ctx, p, svc) })
 }
 
-// RefreshSystemAuth renders sb-gotrue@system again and restarts it when what it renders
+// RefreshSystemAuth renders supavise-gotrue@system again and restarts it when what it renders
 // changed: a node upgraded to a version that turns on dashboard SSO, or a changed [mail]
 // section. A unit whose files are unchanged is left alone (the daemon calls this at every
 // start). It does nothing for a unit that is not running: whoever starts it renders it first.

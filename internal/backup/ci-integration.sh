@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # CI only: run the backup tests that need a real Linux Postgres artifact and, when the
-# SBCTL_TEST_S3_* variables are set, a real S3-compatible service (a MinIO service
+# SUPAVISE_TEST_S3_* variables are set, a real S3-compatible service (a MinIO service
 # container in CI). Not meant for the shared dev Mac: it downloads ~85 MB.
 #
-#   SBCTL_TEST_S3_ENDPOINT=http://127.0.0.1:9000 SBCTL_TEST_S3_BUCKET=sbctl-test \
-#   SBCTL_TEST_S3_ACCESS_KEY=minioadmin SBCTL_TEST_S3_SECRET_KEY=minioadmin \
+#   SUPAVISE_TEST_S3_ENDPOINT=http://127.0.0.1:9000 SUPAVISE_TEST_S3_BUCKET=supavise-test \
+#   SUPAVISE_TEST_S3_ACCESS_KEY=minioadmin SUPAVISE_TEST_S3_SECRET_KEY=minioadmin \
 #     internal/backup/ci-integration.sh
 #
-# The bucket must exist. Set SBCTL_TEST_PG_BIN to use an already unpacked artifact
+# The bucket must exist. Set SUPAVISE_TEST_PG_BIN to use an already unpacked artifact
 # instead of downloading the one pinned in versions.yaml.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -19,7 +19,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
   exit 1
 fi
 
-if [[ -z "${SBCTL_TEST_PG_BIN:-}" ]]; then
+if [[ -z "${SUPAVISE_TEST_PG_BIN:-}" ]]; then
   case "$(uname -m)" in
     x86_64) platform=linux-amd64 ;;
     aarch64 | arm64) platform=linux-arm64 ;;
@@ -38,7 +38,7 @@ if [[ -z "${SBCTL_TEST_PG_BIN:-}" ]]; then
   echo "${want}  $dir/pg.tar.zst" | sha256sum -c -
   mkdir "$dir/pg"
   zstd -dc "$dir/pg.tar.zst" | tar -x -C "$dir/pg"
-  export SBCTL_TEST_PG_BIN="$dir/pg/bin"
+  export SUPAVISE_TEST_PG_BIN="$dir/pg/bin"
 fi
 
 go test -race -count=1 -timeout 15m -v \

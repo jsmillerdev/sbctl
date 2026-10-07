@@ -9,10 +9,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 func (s *Server) routesConfig(add func(string, handlerFunc)) {
@@ -200,7 +200,7 @@ func (s *Server) patchRealtime(key, viewKey string) handlerFunc {
 // ---- Storage ---------------------------------------------------------------------
 
 // storageCapabilities are what the fleet's Storage serves: the v2 object listing yes, Iceberg
-// catalogs (they need a service sbctl does not run) and object versioning no.
+// catalogs (they need a service supavise does not run) and object versioning no.
 var storageCapabilities = map[string]any{"iceberg_catalog": false, "list_v2": true, "object_versioning": false}
 
 // storageFileSizeLimit is the upload limit of the project's Storage: the saved value, else

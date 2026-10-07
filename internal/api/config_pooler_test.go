@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 var errPoolerDown = errors.New("supavisor: connection refused")

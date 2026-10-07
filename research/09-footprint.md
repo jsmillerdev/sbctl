@@ -7,10 +7,10 @@ in CI; this file says what is measured and why, and holds the table once a run e
 
 ## What is measured
 
-One node, one `sbctl` binary, real artifacts, the systemd backend, `micro` or `default`
+One node, one `supavise` binary, real artifacts, the systemd backend, `micro` or `default`
 project class (the class is part of the result: `micro` is 16 MB `shared_buffers` and 30
-connections, `default` is 32 MB and 60). Each project runs `sb-postgres@`, `sb-gotrue@` and
-`sb-postgrest@`. The system project (`sb-postgres@system`, `sb-gotrue@system`) is measured
+connections, `default` is 32 MB and 60). Each project runs `supavise-postgres@`, `supavise-gotrue@` and
+`supavise-postgrest@`. The system project (`supavise-postgres@system`, `supavise-gotrue@system`) is measured
 separately because it exists once. The shared fleet (Supavisor, Realtime, Storage, pgmeta,
 Studio) is not started by this script; it belongs to the fleet workstream and is added as
 a fixed cost when it exists.
@@ -20,14 +20,14 @@ idle, then records:
 
 | Column | How |
 |---|---|
-| create avg (s) | wall time of `sbctl projects create` (initdb, the artifact's roles and migrations, role passwords, GoTrue migration, health checks), averaged over the projects added for this size |
-| PSS per project, median (MB) | for each project, sum `Pss` from `/proc/<pid>/smaps_rollup` over every process in the cgroups of its three units (`/sys/fs/cgroup/sbctl.slice/<unit>/cgroup.procs`); median over projects |
+| create avg (s) | wall time of `supavise projects create` (initdb, the artifact's roles and migrations, role passwords, GoTrue migration, health checks), averaged over the projects added for this size |
+| PSS per project, median (MB) | for each project, sum `Pss` from `/proc/<pid>/smaps_rollup` over every process in the cgroups of its three units (`/sys/fs/cgroup/supavise.slice/<unit>/cgroup.procs`); median over projects |
 | RSS per project, median (MB) | the same with `Rss` |
-| system project PSS (MB) | the same for `sb-postgres@system` and `sb-gotrue@system` |
-| sbctl.slice memory.current (MB) | cgroup v2 `memory.current` of the slice: everything sbctl runs, including page cache |
+| system project PSS (MB) | the same for `supavise-postgres@system` and `supavise-gotrue@system` |
+| supavise.slice memory.current (MB) | cgroup v2 `memory.current` of the slice: everything supavise runs, including page cache |
 | disk per project (MB) | `du -sk` of one project directory (cluster, WAL, env files) |
-| resume avg (s) | five projects are paused, then resumed one at a time through `sbctl projects resume`; wall time includes the Postgres start, GoTrue migration and the health checks, so it is the time to a usable project |
-| node cold start (s) | all `sb-*` units stopped, then `sbctl system start` (system project first, then every active project one by one, each waited until healthy) |
+| resume avg (s) | five projects are paused, then resumed one at a time through `supavise projects resume`; wall time includes the Postgres start, GoTrue migration and the health checks, so it is the time to a usable project |
+| node cold start (s) | all `supavise-*` units stopped, then `supavise system start` (system project first, then every active project one by one, each waited until healthy) |
 
 ### Why PSS
 
@@ -52,20 +52,20 @@ since it includes reclaimable page cache and would make a small project look lar
 ## How to run
 
 ```
-sudo SBCTL_BIN=./bin/sbctl-linux-amd64 tests/linux/footprint.sh --sizes "10 25 50" --class default --teardown
+sudo SUPAVISE_BIN=./bin/supavise-linux-amd64 tests/linux/footprint.sh --sizes "10 25 50" --class default --teardown
 ```
 
 State the VM type with the result (vCPUs, RAM, disk type, kernel). Run it once per class
 that matters (`micro` and `default`) and once per architecture (amd64, arm64). Results
 belong in the table below with the date, the artifact tags from `versions.yaml` and the
-sbctl commit. The VM needs roughly 4 GB of disk for 50 projects (about 60 MB each after
+supavise commit. The VM needs roughly 4 GB of disk for 50 projects (about 60 MB each after
 the migrations; the first CI run should confirm that number).
 
 ## Results
 
 | Run | Host | Class | Projects | create avg (s) | PSS/project (MB) | RSS/project (MB) | system PSS (MB) | slice (MB) | disk/project (MB) | resume avg (s) | node cold start (s) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| [37573996289](https://github.com/jsmillerdev/sbctl/actions/runs/37573996289) | GitHub ubuntu-24.04, x86_64, 4 vCPU, 16 GB | default | 10 | 2.59 | 70.3 | 230.7 | 58.2 | 1547.5 | 56.5 | 0.50 | 5.01 |
+| [37573996289](https://github.com/jsmillerdev/supavise/actions/runs/37573996289) | GitHub ubuntu-24.04, x86_64, 4 vCPU, 16 GB | default | 10 | 2.59 | 70.3 | 230.7 | 58.2 | 1547.5 | 56.5 | 0.50 | 5.01 |
 | same | same | default | 25 | 2.48 | 66.5 | 230.5 | 55.9 | 3784.1 | 72.7 | 0.51 | 12.06 |
 | same | same | default | 50 | 2.48 | 65.2 | 230.3 | 55.0 | 7451.2 | 72.7 | 0.50 | 23.70 |
 | same | GitHub ubuntu-24.04-arm, aarch64, 4 vCPU, 16 GB | default | 10 | 2.69 | 68.4 | 236.4 | 56.6 | 1519.2 | 56.4 | 0.49 | 4.99 |
@@ -85,7 +85,7 @@ A developer Mac (Apple M4, Darwin 25.5, exec backend, darwin-arm64 artifacts,
   GoTrue v2.195.0): about 65 MB summed `ps` RSS.
 - adding one project (Postgres 32 MB `shared_buffers`, GoTrue, PostgREST): the total went to
   about 124 MB, so about 59 MB summed RSS for the project.
-- `sbctl projects create` returned a healthy project in about 6 s, `pause` in 0.2 s, `resume`
+- `supavise projects create` returned a healthy project in about 6 s, `pause` in 0.2 s, `resume`
   in about 2 s, `system init` on an empty state directory in about 14 s.
 
 macOS `ps` RSS counts shared pages per process and says nothing about Linux cgroup

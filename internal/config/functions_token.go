@@ -15,11 +15,11 @@ import (
 // Runtime's main service (and, on the Management API, marks a request from a trusted
 // forwarder). The runtime listens on loopback, which a function worker can reach too, so
 // the main service refuses every request without it.
-const FunctionsProxyTokenHeader = "X-Sbctl-Proxy-Token"
+const FunctionsProxyTokenHeader = "X-Supavise-Proxy-Token"
 
-// FunctionsProxyTokenFile is the node's proxy secret: 0600, owned by the sbctl user, in
+// FunctionsProxyTokenFile is the node's proxy secret: 0600, owned by the supavise user, in
 // system/ itself, outside every unit's state directory, so no unit's mount namespace shows it
-// (sb-edge-runtime gets the value in its environment file instead).
+// (supavise-edge-runtime gets the value in its environment file instead).
 func (p Paths) FunctionsProxyTokenFile() string {
 	return filepath.Join(p.Root, "system", "edge-runtime.token")
 }

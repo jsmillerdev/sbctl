@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/sso"
+	"github.com/jsmillerdev/supavise/internal/sso"
 )
 
-// serveBeforeUserCreated answers sb-gotrue@system before it creates a user (its
+// serveBeforeUserCreated answers supavise-gotrue@system before it creates a user (its
 // before-user-created hook, HTTP, signed with a secret derived from the master key). It allows
 // exactly two kinds of new user:
 //
@@ -69,7 +69,7 @@ func (s *Server) userCreationVerdict(ctx context.Context, ev *sso.HookEvent) (st
 			return "", err
 		}
 		if row == nil {
-			return "This identity provider is not registered with sbctl.", nil
+			return "This identity provider is not registered with supavise.", nil
 		}
 		return "", nil
 	}
@@ -106,7 +106,7 @@ func (s *Server) studioChanged(ctx context.Context) {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
 		defer cancel()
 		if err := s.studioRefresh(rctx); err != nil {
-			s.log.Warn("Studio's sign-in page was not updated for the change of SSO providers; run `sbctl fleet start`", "error", err)
+			s.log.Warn("Studio's sign-in page was not updated for the change of SSO providers; run `supavise fleet start`", "error", err)
 		}
 	}()
 }

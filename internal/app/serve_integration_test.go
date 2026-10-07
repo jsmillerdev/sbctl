@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 type dirArts map[string]string
@@ -46,15 +46,15 @@ func freePorts(t *testing.T, from, n int) []int {
 	return out
 }
 
-// TestServeIntegration runs the daemon the way sbctl.service does, on the real artifacts
+// TestServeIntegration runs the daemon the way supavise.service does, on the real artifacts
 // under the exec backend: system init, a project created before the daemon starts, the
 // daemon bringing it up again at boot, requests through the proxy and the admin listener,
-// and a graceful stop on context cancel. It needs SBCTL_TEST_UNPACKED (see the lifecycle
+// and a graceful stop on context cancel. It needs SUPAVISE_TEST_UNPACKED (see the lifecycle
 // package); it starts two PostgreSQL clusters, GoTrue and PostgREST.
 func TestServeIntegration(t *testing.T) {
-	root := os.Getenv("SBCTL_TEST_UNPACKED")
+	root := os.Getenv("SUPAVISE_TEST_UNPACKED")
 	if root == "" {
-		t.Skip("SBCTL_TEST_UNPACKED not set")
+		t.Skip("SUPAVISE_TEST_UNPACKED not set")
 	}
 	arts := dirArts{}
 	for svc, glob := range map[string]string{config.SvcPostgres: "postgres-17*", config.SvcGoTrue: "auth-*", config.SvcPostgREST: "postgrest-*"} {
@@ -80,7 +80,7 @@ func TestServeIntegration(t *testing.T) {
 	cfg.StateDir = state
 	cfg.KeyPath = filepath.Join(state, "master.key")
 	cfg.Supervisor = config.SupervisorExec
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	cfg.TLS.Mode = "off"
 	cfg.Functions.Enabled = true // the daemon must route /functions/v1 and run the syncer; no runtime runs here
 	cfg.BinPath = truePath       // archive_command succeeds, so WAL does not pile up

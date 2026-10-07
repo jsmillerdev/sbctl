@@ -1,4 +1,4 @@
-// Package members is sbctl's organization membership model: who belongs to which
+// Package members is supavise's organization membership model: who belongs to which
 // organization with which role, project-scoped role assignments, invitations, and the
 // permissions those roles grant, in the shape Studio and the Management API use (hosted's
 // PermissionAction model). The API server evaluates the permissions on every /platform and
@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-// The four organization roles of hosted Supabase. The ids are sbctl's own (the specs only
+// The four organization roles of hosted Supabase. The ids are supavise's own (the specs only
 // say "number") and are stable: they are stored in the registry.
 const (
 	RoleOwner         = 1

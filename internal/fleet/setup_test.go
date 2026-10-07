@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // touchRunFile marks svc's unit as rendered on this node.
@@ -44,7 +44,7 @@ func tenantServices(f Fleet) string {
 // leave the daemon without tenants.
 func TestSetupReturnsTheTenantsWhenStudioFails(t *testing.T) {
 	r := newManagerRig(t, nil)
-	r.sup.failOn["start sb-studio.service"] = errors.New("read-only file system")
+	r.sup.failOn["start supavise-studio.service"] = errors.New("read-only file system")
 	f, err := Setup(context.Background(), startingDeps(r))
 	if err != nil {
 		t.Fatalf("Setup failed because of Studio: %v", err)
@@ -57,7 +57,7 @@ func TestSetupReturnsTheTenantsWhenStudioFails(t *testing.T) {
 // When a core service fails, Setup reports it and still returns the usable Fleet.
 func TestSetupReturnsTheTenantsWithTheStartError(t *testing.T) {
 	r := newManagerRig(t, nil)
-	r.sup.failOn["start sb-realtime.service"] = errors.New("exec format error")
+	r.sup.failOn["start supavise-realtime.service"] = errors.New("exec format error")
 	f, err := Setup(context.Background(), startingDeps(r))
 	if err == nil || !strings.Contains(err.Error(), "realtime") {
 		t.Fatalf("err = %v", err)
@@ -65,7 +65,7 @@ func TestSetupReturnsTheTenantsWithTheStartError(t *testing.T) {
 	if got := tenantServices(f); got != "supavisor,realtime,storage" {
 		t.Fatalf("the Fleet must be usable when a service did not start; tenants = %q", got)
 	}
-	if !strings.Contains(r.sup.log(), "start sb-storage.service") {
+	if !strings.Contains(r.sup.log(), "start supavise-storage.service") {
 		t.Fatal("the services after the failed one must still start")
 	}
 }

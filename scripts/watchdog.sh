@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# watchdog.sh: machine-wide safety net while agents build and test sbctl on a shared Mac.
+# watchdog.sh: machine-wide safety net while agents build and test supavise on a shared Mac.
 # Every few seconds it checks free memory and disk. Below the floor it kills, in order:
 # guard.sh-managed jobs, then any process started from this repo's worktrees or the
-# sbctl cache (test Postgres, artifacts, Studio builds), Go compiler/test processes,
-# and Docker containers named sbctl-*. It never touches other processes.
+# supavise cache (test Postgres, artifacts, Studio builds), Go compiler/test processes,
+# and Docker containers named supavise-*. It never touches other processes.
 #
 # Tunables (env): WATCHDOG_MIN_FREE_PCT (18), WATCHDOG_MIN_DISK_GB (5), WATCHDOG_INTERVAL (3),
 # WATCHDOG_LOG (~/.cache/sbctl/watchdog.log).
@@ -11,6 +11,7 @@ set -uo pipefail
 MIN_FREE_PCT=${WATCHDOG_MIN_FREE_PCT:-18}
 MIN_DISK_GB=${WATCHDOG_MIN_DISK_GB:-5}
 INTERVAL=${WATCHDOG_INTERVAL:-3}
+# The lock, pid and cache paths keep their old names (/tmp/sbctl-guard.lock, ~/.cache/sbctl) because other checkouts on this machine still share them.
 LOG=${WATCHDOG_LOG:-$HOME/.cache/sbctl/watchdog.log}
 PIDDIR=/tmp/sbctl-guard.pids
 OURS='/Repos/supabase-selfhost/\.worktrees/|/\.cache/sbctl/|/go-build[0-9]+/.+\.test|/pkg/tool/[a-z0-9_]+/(compile|link|asm|vet|cgo)'
@@ -38,7 +39,7 @@ kill_ours() {
   [[ -n "$pids" ]] && { log "KILL ours: $(echo $pids)"; kill -KILL $pids 2>/dev/null; }
 }
 kill_containers() {
-  local ids; ids=$(docker ps -q --filter name=sbctl- 2>/dev/null || true)
+  local ids; ids=$(docker ps -q --filter name=supavise- 2>/dev/null || true)
   [[ -n "$ids" ]] && { log "kill containers: $(echo $ids)"; docker kill $ids >/dev/null 2>&1; }
 }
 

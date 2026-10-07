@@ -8,9 +8,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // rotateCredentials gives a branch whose cluster came from the parent (a clone or a
@@ -25,7 +25,7 @@ import (
 //     new environment, and the fleet tenants (Supavisor, Realtime, Storage) are updated
 //
 // The temporary login roles the parent issued for `supabase db push|pull|dump` (cli_login_*,
-// sbctl_cli_ro_*) came along with their password verifiers; step 2 also disables them
+// supavise_cli_ro_*) came along with their password verifiers; step 2 also disables them
 // (NOLOGIN, no password, already expired), so that a parent's CLI password does not open the
 // branch. The API drops them with the next expired-role sweep.
 //
@@ -84,7 +84,7 @@ func disableLoginRoles(ctx context.Context, dsn string) error {
 	}
 	defer closeConn(c)
 	_, err = c.Exec(ctx, `do $$ declare r record; begin
-  for r in select rolname from pg_roles where rolname like 'cli\_login\_%' or rolname like 'sbctl\_cli\_ro\_%' loop
+  for r in select rolname from pg_roles where rolname like 'cli\_login\_%' or rolname like 'supavise\_cli\_ro\_%' loop
     execute format('alter role %I nologin password null valid until %L', r.rolname, '1970-01-01 00:00:00+00');
   end loop;
 end $$`)
@@ -98,7 +98,7 @@ end $$`)
 // needs no password and cannot be reached from outside the node.
 func (s *Service) adminSocketDSN(ref string, seq int) string {
 	sock := filepath.Join(s.cfg.Paths().ProjectService(ref, config.SvcPostgres), "sock")
-	return fmt.Sprintf("host=%s port=%d user=%s dbname=postgres sslmode=disable connect_timeout=5 application_name=sbctl-branching",
+	return fmt.Sprintf("host=%s port=%d user=%s dbname=postgres sslmode=disable connect_timeout=5 application_name=supavise-branching",
 		kvQuote(sock), s.cfg.PortsFor(ref, seq).Postgres, lifecycle.RoleAdmin)
 }
 

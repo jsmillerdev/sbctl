@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // fakePlane records calls and fails on demand; it stands in for PostgresPlane.
@@ -671,9 +671,9 @@ func TestCreateOverExistingClusterLeavesDataAlone(t *testing.T) {
 // With the Postgres registry, a second Engine (another process) waits for the first
 // one's operation on the same ref, and different refs do not block each other.
 func TestLockIsCrossProcessWithPostgresRegistry(t *testing.T) {
-	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	reg, err := registry.Open(ctx, dsn)

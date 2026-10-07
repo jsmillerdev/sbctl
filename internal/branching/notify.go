@@ -94,7 +94,7 @@ func (s *Service) notify(ctx context.Context, ref, op, status, detail string) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "sbctl-branching")
+	req.Header.Set("User-Agent", "supavise-branching")
 	resp, err := s.http.Do(req)
 	if err != nil {
 		s.log.Warn("branch notification failed", "ref", ref, "err", err)

@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 func body[T any](t testing.TB, rec *httptest.ResponseRecorder) T {
@@ -84,7 +84,7 @@ func TestReadOnlyRunsAsReadOnlyDatabaseRole(t *testing.T) {
 		return ""
 	}
 	rf.status(201, "ro", "POST", "/v1/projects/"+testRef+"/cli/login-role", map[string]any{"read_only": false})
-	if q := loginRoleSQL(); !strings.Contains(q, "sbctl_cli_ro_") || !strings.Contains(q, "pg_read_all_data") || strings.Contains(q, "in role postgres") {
+	if q := loginRoleSQL(); !strings.Contains(q, "supavise_cli_ro_") || !strings.Contains(q, "pg_read_all_data") || strings.Contains(q, "in role postgres") {
 		t.Errorf("a Read-only member got a read-write login role: %s", q)
 	}
 	rf.status(201, "dev", "POST", "/v1/projects/"+testRef+"/cli/login-role", map[string]any{"read_only": false})
@@ -626,7 +626,7 @@ func TestAnInviteForANewAddressCreatesTheAccountAndJoins(t *testing.T) {
 
 func TestInvitationMail(t *testing.T) {
 	rf := newRolesFixture(t)
-	rf.cfg.Mail = config.Mail{SMTPHost: "smtp.example.test", SMTPPort: 587, SMTPFrom: "sbctl@example.test"}
+	rf.cfg.Mail = config.Mail{SMTPHost: "smtp.example.test", SMTPPort: 587, SMTPFrom: "supavise@example.test"}
 	inv := orgBase + "/members/invitations"
 	existing := "dddddddd-0000-4000-8000-000000000001"
 	rf.gt.addUser(existing, "have@example.test", time.Now())
@@ -832,7 +832,7 @@ func TestARemovedLegacyAccountStaysRemoved(t *testing.T) {
 	old := "eeeeeeee-0000-4000-8000-000000000003"
 	rf.gt.addUser(old, "old3@example.test", time.Now().Add(-48*time.Hour))
 	tok := rf.signJWT(map[string]any{"sub": old, "email": "old3@example.test", "role": "authenticated"})
-	// `sbctl users role`: the operator sets a role before the account's first request.
+	// `supavise users role`: the operator sets a role before the account's first request.
 	rf.addMember(old, members.RoleReadOnly)
 	if rec := rf.doAs(tok, "PATCH", "/platform/organizations/default", map[string]any{"name": "pwned"}); rec.Code != 403 {
 		t.Fatalf("a Read-only member changed the organization: %d", rec.Code)

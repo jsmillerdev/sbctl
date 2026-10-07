@@ -21,18 +21,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
-// Dashboard onboarding. sb-gotrue@system runs with public sign-up disabled, so the only
-// way to get a dashboard account is through sbctl: the installer prints a claim token
+// Dashboard onboarding. supavise-gotrue@system runs with public sign-up disabled, so the only
+// way to get a dashboard account is through supavise: the installer prints a claim token
 // that creates the first administrator, and an administrator invites later users with
-// `sbctl users invite <email>`, which prints an invite token for that address. A token is
+// `supavise users invite <email>`, which prints an invite token for that address. A token is
 // stored as its SHA-256, works once and expires. Redeeming one creates the user in
-// sb-gotrue@system through GoTrue's admin API (with the sbctl_admin claim the Management
+// supavise-gotrue@system through GoTrue's admin API (with the supavise_admin claim the Management
 // API requires) and, for the claim token, the first organization.
 
 const (
@@ -49,11 +49,11 @@ const (
 
 // ErrClaimed is returned when a claim token is requested on a node whose first
 // administrator already exists.
-var ErrClaimed = errors.New("this node already has its first administrator; invite more users with `sbctl users invite`")
+var ErrClaimed = errors.New("this node already has its first administrator; invite more users with `supavise users invite`")
 
 // Accounts issues and redeems claim and invite tokens and manages the dashboard users
-// of sb-gotrue@system. The daemon builds it for the HTTP endpoints and the CLI for
-// `sbctl claim` and `sbctl users`.
+// of supavise-gotrue@system. The daemon builds it for the HTTP endpoints and the CLI for
+// `supavise claim` and `supavise users`.
 type Accounts struct {
 	Reg   registry.Registry
 	Store ClaimStore
@@ -307,7 +307,7 @@ func (a *Accounts) firstOrg(ctx context.Context, name string) (*registry.Organiz
 	return o, err
 }
 
-// goTrue calls the admin API of sb-gotrue@system.
+// goTrue calls the admin API of supavise-gotrue@system.
 func (a *Accounts) goTrue(ctx context.Context, method, path string, body any, out any) (int, error) {
 	k, err := a.Keys(ctx, config.SystemRef)
 	if err != nil {
@@ -332,7 +332,7 @@ func (a *Accounts) goTrue(ctx context.Context, method, path string, body any, ou
 	}
 	resp, err := a.client().Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("the dashboard sign-in service (sb-gotrue@system) is not reachable: %w", err)
+		return 0, fmt.Errorf("the dashboard sign-in service (supavise-gotrue@system) is not reachable: %w", err)
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
@@ -389,7 +389,7 @@ func (a *Accounts) createUser(ctx context.Context, email, password string) (stri
 	return u.ID, nil
 }
 
-// DashboardUser is one account of sb-gotrue@system.
+// DashboardUser is one account of supavise-gotrue@system.
 type DashboardUser struct {
 	ID          string     `json:"id"`
 	Email       string     `json:"email"`

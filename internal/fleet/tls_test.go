@@ -25,7 +25,7 @@ func TestDownstreamCertIsCreatedPrivateAndReused(t *testing.T) {
 		t.Fatal(err)
 	}
 	leaf, _ := x509.ParseCertificate(pair.Certificate[0])
-	if err := leaf.VerifyHostname("pooler.sbctl.test"); err != nil {
+	if err := leaf.VerifyHostname("pooler.supavise.test"); err != nil {
 		t.Errorf("the certificate must list the pooler host: %v", err)
 	}
 	if again, err := ensureDownstreamCert(n.cfg, now.Add(24*time.Hour)); err != nil || again != sum {

@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // Members, roles, invitations and permissions: /platform/organizations/{slug}/members*,
@@ -679,7 +679,7 @@ func (s *Server) createInvitations(w http.ResponseWriter, r *http.Request) error
 	if forbiddenAll && len(outs) > 0 {
 		return errf(http.StatusForbidden, "%s", outs[0].err)
 	}
-	// invite_links is sbctl's addition for an installation without mail: the links to give
+	// invite_links is supavise's addition for an installation without mail: the links to give
 	// the invitees (the specification's fields are untouched).
 	writeJSON(w, http.StatusCreated, map[string]any{"succeeded": succeeded, "failed": failed, "invite_links": links})
 	return nil

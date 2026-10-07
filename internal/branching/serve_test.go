@@ -1,10 +1,10 @@
 package branching_test
 
 // TestServe starts a node on real clusters, a parent project with a table, rows and
-// migrations, the Management API with the branching service, the sweeper and sb-pgmeta,
+// migrations, the Management API with the branching service, the sweeper and supavise-pgmeta,
 // and keeps them up so the real Supabase CLI and MCP server can be pointed at it:
 //
-//	SBCTL_BRANCH_SERVE_FILE=$PWD/stack.json SBCTL_TEST_UNPACKED=~/.cache/sbctl/unpacked \
+//	SUPAVISE_BRANCH_SERVE_FILE=$PWD/stack.json SUPAVISE_TEST_UNPACKED=~/.cache/sbctl/unpacked \
 //	  go test ./internal/branching -run TestServe -timeout 60m
 //
 // The file gets {api_url, pat, parent_ref, state_dir}; delete it to stop everything.
@@ -26,13 +26,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/pelletier/go-toml/v2"
 
-	"github.com/OWNER/sbctl/internal/api"
-	"github.com/OWNER/sbctl/internal/backup"
-	"github.com/OWNER/sbctl/internal/branching"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/jsmillerdev/supavise/internal/branching"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 type dirArts map[string]string
@@ -46,10 +46,10 @@ func (d dirArts) Dir(svc string) (string, error) {
 func (d dirArts) Tag(svc string) (string, error) { return filepath.Base(d[svc]), nil }
 
 func TestServe(t *testing.T) {
-	out := os.Getenv("SBCTL_BRANCH_SERVE_FILE")
-	root := os.Getenv("SBCTL_TEST_UNPACKED")
+	out := os.Getenv("SUPAVISE_BRANCH_SERVE_FILE")
+	root := os.Getenv("SUPAVISE_TEST_UNPACKED")
 	if out == "" || root == "" {
-		t.Skip("set SBCTL_BRANCH_SERVE_FILE and SBCTL_TEST_UNPACKED to serve the stack for manual client runs")
+		t.Skip("set SUPAVISE_BRANCH_SERVE_FILE and SUPAVISE_TEST_UNPACKED to serve the stack for manual client runs")
 	}
 	arts := dirArts{}
 	for svc, glob := range map[string]string{config.SvcPostgres: "postgres-17*", config.SvcGoTrue: "auth-*", config.SvcPostgREST: "postgrest-*"} {
@@ -69,8 +69,8 @@ func TestServe(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(state) })
 
-	bin := filepath.Join(state, "sbctl")
-	build := exec.Command("go", "build", "-o", bin, "./cmd/sbctl")
+	bin := filepath.Join(state, "supavise")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/supavise")
 	_, thisFile, _, _ := runtime.Caller(0)
 	build.Dir = filepath.Join(filepath.Dir(thisFile), "..", "..")
 	if b, err := build.CombinedOutput(); err != nil {
@@ -82,7 +82,7 @@ func TestServe(t *testing.T) {
 	cfg.StateDir = filepath.Join(state, "s")
 	cfg.KeyPath = filepath.Join(state, "master.key")
 	cfg.Supervisor = config.SupervisorExec
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	cfg.TLS.Mode = "off"
 	cfg.BinPath = bin
 	cfg.Backup.Backend = "file://" + filepath.Join(state, "backups")
@@ -96,7 +96,7 @@ func TestServe(t *testing.T) {
 	if err := os.WriteFile(cfgPath, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SBCTL_CONFIG", cfgPath)
+	t.Setenv("SUPAVISE_CONFIG", cfgPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -12,18 +12,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/sso"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/sso"
 )
 
-// Dashboard SSO. The dashboard's users sign in through sb-gotrue@system, which speaks SAML 2.0
+// Dashboard SSO. The dashboard's users sign in through supavise-gotrue@system, which speaks SAML 2.0
 // to the identity providers (Okta, Entra ID, Google Workspace, ...) that an Owner or
-// Administrator registers here. GoTrue keeps each provider's metadata and email domains; sbctl
+// Administrator registers here. GoTrue keeps each provider's metadata and email domains; supavise
 // keeps what GoTrue has no place for: the organization a provider belongs to and the role its
-// users get on a first sign-in (sbctl.sso_providers, sbctl.sso_default_roles).
+// users get on a first sign-in (supavise.sso_providers, supavise.sso_default_roles).
 //
 // Who gets in. A dashboard session of a user whose GoTrue account came from SSO carries
 // app_metadata.provider = "sso:<provider id>". It is accepted only when the provider is one
@@ -33,21 +33,21 @@ import (
 //     member of the provider's organization, provided the signing-in provider is one that
 //     vouches for that domain (a second identity provider cannot claim another's domains);
 //   - otherwise the user is recorded as pending and refused on every route (403) until an
-//     administrator approves the user (`sbctl sso approve`, or the pending list in the API) or
+//     administrator approves the user (`supavise sso approve`, or the pending list in the API) or
 //     invites or promotes them the usual way;
 //   - the default role is for that first request only: a user who later loses every
 //     membership becomes pending, and is not given the role again;
-//   - an address that an administrator denied or removed (Deny, `sbctl users remove` of an SSO
+//   - an address that an administrator denied or removed (Deny, `supavise users remove` of an SSO
 //     account) is remembered by provider and address: the person's next sign-in creates a new
 //     GoTrue account, which is pending like any other and does not get the default role, until
-//     an administrator approves it (Approve) or clears the refusal (Allow, `sbctl sso allow`).
+//     an administrator approves it (Approve) or clears the refusal (Allow, `supavise sso allow`).
 //
-// Sign-up is closed to everyone else: sb-gotrue@system asks the daemon before it creates a
+// Sign-up is closed to everyone else: supavise-gotrue@system asks the daemon before it creates a
 // user (before-user-created hook, serveBeforeUserCreated) and the daemon allows registered
 // SSO providers and invited addresses only.
 
 // DashboardSSO manages the SAML providers of the dashboard. The daemon builds it for the HTTP
-// routes, the CLI for `sbctl sso`.
+// routes, the CLI for `supavise sso`.
 type DashboardSSO struct {
 	Reg   registry.Registry
 	Store SSOStore
@@ -84,7 +84,7 @@ type cachedProvider struct {
 const ssoCacheTTL = 10 * time.Second
 
 // NewDashboardSSO builds the service from the account service that shares its credentials,
-// members and registry: the CLI's `sbctl sso` uses it, the server builds its own the same way.
+// members and registry: the CLI's `supavise sso` uses it, the server builds its own the same way.
 func NewDashboardSSO(a *Accounts, store SSOStore) *DashboardSSO {
 	a.SSOUsers = store
 	return &DashboardSSO{Reg: a.Reg, Store: store, Keys: a.Keys, Config: a.Config, GoTrueURL: a.GoTrueURL, HTTP: a.HTTP,
@@ -137,8 +137,8 @@ type DashboardProvider struct {
 	OrgSlug string
 	// DefaultRole is the role of a first-time user (members role id, 0: none).
 	DefaultRole int
-	// Registered is false for a provider that exists in GoTrue but that sbctl did not register:
-	// its users are refused. `sbctl sso remove` deletes it.
+	// Registered is false for a provider that exists in GoTrue but that Supavise did not register:
+	// its users are refused. `supavise sso remove` deletes it.
 	Registered bool
 }
 
@@ -168,8 +168,8 @@ func ssoError(err error) error {
 }
 
 var (
-	errSSOUnknownProvider = errf(http.StatusForbidden, "This identity provider is not registered with sbctl, so its users cannot use the dashboard.")
-	errSSOPending         = errf(http.StatusForbidden, "Your single sign-on account has no access yet. Ask an administrator to approve it (sbctl sso approve <email>).")
+	errSSOUnknownProvider = errf(http.StatusForbidden, "This identity provider is not registered with Supavise, so its users cannot use the dashboard.")
+	errSSOPending         = errf(http.StatusForbidden, "Your single sign-on account has no access yet. Ask an administrator to approve it (supavise sso approve <email>).")
 )
 
 // ---- rights ------------------------------------------------------------------
@@ -264,7 +264,7 @@ func (d *DashboardSSO) ruleConflict(ctx context.Context, actor *members.Access, 
 
 // ---- providers ---------------------------------------------------------------
 
-// AddProvider is what `sbctl sso add` and the API give to Add.
+// AddProvider is what `supavise sso add` and the API give to Add.
 type AddProvider struct {
 	Org      members.OrgRef
 	Metadata sso.Metadata
@@ -325,7 +325,7 @@ func checkNameIDFormat(f string) error {
 	return errf(http.StatusBadRequest, "name_id_format must be one of %s", strings.Join(nameIDFormats, ", "))
 }
 
-// Add registers an identity provider in sb-gotrue@system and records it for the organization.
+// Add registers an identity provider in supavise-gotrue@system and records it for the organization.
 func (d *DashboardSSO) Add(ctx context.Context, actor *members.Access, in AddProvider) (*DashboardProvider, error) {
 	if in.DefaultRole != 0 && !members.ValidRoleID(in.DefaultRole) {
 		return nil, errf(http.StatusBadRequest, "unknown role %d", in.DefaultRole)
@@ -429,7 +429,7 @@ func (d *DashboardSSO) syncRules(ctx context.Context, org members.OrgRef, oldDom
 	return nil
 }
 
-// registeredRow returns the sbctl record of a provider, errNoProvider when there is none.
+// registeredRow returns the supavise record of a provider, errNoProvider when there is none.
 func (d *DashboardSSO) registeredRow(ctx context.Context, id string) (*SSOProviderRow, error) {
 	row, err := d.Store.GetProvider(ctx, id)
 	if errors.Is(err, ErrNotFound) {
@@ -584,7 +584,7 @@ func (d *DashboardSSO) Update(ctx context.Context, actor *members.Access, id str
 
 // Remove deletes a provider: the memberships and roles of its users are removed, the provider goes
 // from GoTrue, the personal access tokens of its users are revoked (a token would otherwise outlive
-// the identity provider that vouched for its owner), and sbctl's record of it goes last, so a
+// the identity provider that vouched for its owner), and supavise's record of it goes last, so a
 // removal that stopped halfway can be run again and finishes. A provider that only GoTrue still
 // has can be removed too. orgID limits the removal to that organization (0: any).
 func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id string, orgID int64) (*DashboardProvider, error) {
@@ -612,18 +612,18 @@ func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id str
 			return nil, err
 		}
 	} else if actor != nil && !actor.IsOwnerAnywhere() {
-		return nil, errf(http.StatusForbidden, "Your role does not allow removing a provider that sbctl did not register")
+		return nil, errf(http.StatusForbidden, "Your role does not allow removing a provider that Supavise did not register")
 	}
 	if row != nil {
 		// The users are unreachable once the provider is gone, and the rows that name them go with
 		// it, so their memberships go first: otherwise they would stay in the member lists and
 		// count as Owners for the last-owner rule. Removing the only Owner of an organization is
-		// refused (nothing of the provider changes then), as `sbctl users remove` refuses it.
+		// refused (nothing of the provider changes then), as `supavise users remove` refuses it.
 		if err := d.removeMemberships(ctx, id); err != nil {
 			return nil, err
 		}
 	}
-	// GoTrue goes before sbctl's own record, so that a removal that stops at GoTrue (it is down,
+	// GoTrue goes before supavise's own record, so that a removal that stops at GoTrue (it is down,
 	// it refuses) can be run again: the record is still there for the retry to find. A provider
 	// that GoTrue no longer has is as good as deleted.
 	p, err := c.Delete(ctx, id)
@@ -813,7 +813,7 @@ func (d *DashboardSSO) Approve(ctx context.Context, actor *members.Access, org m
 	return nil
 }
 
-// Deny refuses a pending user for good: the account is deleted from sb-gotrue@system and the
+// Deny refuses a pending user for good: the account is deleted from supavise-gotrue@system and the
 // user's sessions end. The refusal is kept by provider and email address, because signing in
 // again creates a new GoTrue account with a new user id: that account waits for approval again,
 // and does not get the provider's default role (see firstSight), until an administrator approves
@@ -826,7 +826,7 @@ func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org memb
 		return err
 	}
 	// The stored state is as old as the user's last request: a user who joined an organization
-	// since (invited, `sbctl users role`) is a member, and deleting the account would end that access too.
+	// since (invited, `supavise users role`) is a member, and deleting the account would end that access too.
 	if member, err := d.isMember(ctx, userID); err != nil {
 		return err
 	} else if member {
@@ -864,7 +864,7 @@ func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org memb
 
 // Allow clears the refusal of an address at a provider (left by Deny, or by the removal of its
 // SSO account), so that the person's next sign-in is treated like a first one: with the
-// provider's default role, if the provider has one. It is `sbctl sso allow`; approving the
+// provider's default role, if the provider has one. It is `supavise sso allow`; approving the
 // person's waiting account clears it too. An account of the address that is waiting already
 // (the person signed in again after the refusal) is forgotten, so that its next request is the
 // first sight that applies the default role.
@@ -988,7 +988,7 @@ func (d *DashboardSSO) Admit(ctx context.Context, userID, email, providerID stri
 	switch {
 	case member && u.State == SSOActive:
 	case member:
-		// Approved by other means (an invitation accepted, `sbctl users role`).
+		// Approved by other means (an invitation accepted, `supavise users role`).
 		if err := d.Store.SetSSOUserState(ctx, userID, SSOActive, now); err != nil {
 			return err
 		}
@@ -1010,7 +1010,7 @@ func (d *DashboardSSO) Admit(ctx context.Context, userID, email, providerID stri
 	return nil
 }
 
-// AdmitUser applies Admit to a user that is known as an SSO user, by what sbctl recorded of the
+// AdmitUser applies Admit to a user that is known as an SSO user, by what supavise recorded of the
 // account: a personal access token carries no session claims, so the provider and the address come
 // from the record. A user with no record is not an SSO user (the account of a denied or removed
 // one is gone, and so are its tokens), and passes.
@@ -1135,7 +1135,7 @@ func (d *DashboardSSO) grantDefault(ctx context.Context, row *SSOProviderRow, us
 }
 
 // Find resolves what an operator typed to a provider: a provider id, or an email domain it
-// serves. It sees the providers GoTrue holds that sbctl did not register, too.
+// serves. It sees the providers GoTrue holds that Supavise did not register, too.
 func (d *DashboardSSO) Find(ctx context.Context, who string) (*DashboardProvider, error) {
 	all, err := d.List(ctx, 0)
 	if err != nil {
@@ -1147,7 +1147,7 @@ func (d *DashboardSSO) Find(ctx context.Context, who string) (*DashboardProvider
 			return p, nil
 		}
 	}
-	return nil, errf(http.StatusNotFound, "No identity provider with the id or domain %q (see `sbctl sso list`)", who)
+	return nil, errf(http.StatusNotFound, "No identity provider with the id or domain %q (see `supavise sso list`)", who)
 }
 
 // FindPending resolves an email address or user id to a user waiting in org (0: any).

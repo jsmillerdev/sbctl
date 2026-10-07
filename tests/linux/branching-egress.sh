@@ -2,9 +2,9 @@
 # CI only: a branch with data cannot act on the outside world (workstream I, README "Outbound
 # isolation"), under real systemd units.
 #
-#   sudo SBCTL_BIN=/path/to/sbctl-linux-amd64 tests/linux/branching-egress.sh
+#   sudo SUPAVISE_BIN=/path/to/supavise-linux-amd64 tests/linux/branching-egress.sh
 #
-# The state directory (/var/lib/sbctl, where the unit templates look for it) is put on a loop-file
+# The state directory (/var/lib/supavise, where the unit templates look for it) is put on a loop-file
 # XFS with reflink=1, so that `branches create --with-data` clones the parent's files and needs no
 # base backup. A parent project gets pg_net, pg_cron, a cron job and data. A small HTTP server on
 # the runner's own non-loopback address stands in for "an external host":
@@ -21,29 +21,29 @@
 #      127.0.0.1 is answered (and the cluster's own clients, GoTrue and PostgREST, stay healthy)
 #      and one to 127.0.0.2 (the rest of 127.0.0.0/8, where systemd-resolved's stub lives) is dropped;
 #      The unit also hides the resolver socket, the D-Bus system bus and nscd (InaccessiblePaths in the unit
-#      template, which the IP filter does not cover) and still hides /etc/sbctl (the master key, the config).
+#      template, which the IP filter does not cover) and still hides /etc/supavise (the master key, the config).
 #      Cron jobs cloned from the parent name the branch's own port.
 #   7. a parent with a loopback postgres_fdw server to another project and a Vault secret that holds
 #      its own service key: in the branch the foreign table cannot write (the server is disabled and
-#      its password dropped, recorded in sbctl_branch.paused_foreign_servers), the Vault secret holds
+#      its password dropped, recorded in supavise_branch.paused_foreign_servers), the Vault secret holds
 #      the branch's service key, the other project is not written to, and the parent's own foreign
 #      table and secret are untouched. The same holds after a reset.
 #
 # Runs as root on an ephemeral Ubuntu 24.04 VM with systemd. No Docker. Artifacts come from the
-# releases pinned in versions.yaml (sbctl system init).
+# releases pinned in versions.yaml (supavise system init).
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 HTTP_PORT=18080
 HTTP_PID=
-IMG=/mnt/sbctl-egress-xfs.img
-[[ -d /mnt ]] || IMG=/var/tmp/sbctl-egress-xfs.img
+IMG=/mnt/supavise-egress-xfs.img
+[[ -d /mnt ]] || IMG=/var/tmp/supavise-egress-xfs.img
 
 cleanup() {
   rc=$?
   collect_logs
   [[ -n "$HTTP_PID" ]] && kill "$HTTP_PID" 2>/dev/null || true
   teardown
-  if mountpoint -q "$SBCTL_STATE"; then umount "$SBCTL_STATE" || umount -l "$SBCTL_STATE" || true; fi
+  if mountpoint -q "$SUPAVISE_STATE"; then umount "$SUPAVISE_STATE" || umount -l "$SUPAVISE_STATE" || true; fi
   losetup -j "$IMG" 2>/dev/null | cut -d: -f1 | xargs -r losetup -d || true
   rm -f "$IMG"
   exit $rc
@@ -53,18 +53,18 @@ trap cleanup EXIT
 preflight
 export DEBIAN_FRONTEND=noninteractive
 apt-get install -y --no-install-recommends xfsprogs >/dev/null || fail "xfsprogs could not be installed"
-mkdir -p "$SBCTL_STATE"
+mkdir -p "$SUPAVISE_STATE"
 truncate -s 16G "$IMG"
 LOOP=$(losetup --find --show "$IMG")
 mkfs.xfs -q -m reflink=1 "$LOOP"
-mount "$LOOP" "$SBCTL_STATE"
-xfs_info "$SBCTL_STATE" | grep -o 'reflink=[01]' | grep -q 'reflink=1' || fail "the state directory is not XFS with reflink=1"
+mount "$LOOP" "$SUPAVISE_STATE"
+xfs_info "$SUPAVISE_STATE" | grep -o 'reflink=[01]' | grep -q 'reflink=1' || fail "the state directory is not XFS with reflink=1"
 
 install_binary
 setup_node
 log "system init (downloads artifacts)"
 system_init
-wait_active sb-postgres@system.service 30
+wait_active supavise-postgres@system.service 30
 
 # ---- the "external host": the runner's own address, which is not loopback -------------------
 HOSTIP=$(hostname -I | awk '{print $1}')
@@ -80,11 +80,11 @@ done
 [[ $(http_code "http://$HOSTIP:$HTTP_PORT/?who=probe") == 200 ]] || fail "the test HTTP server does not answer on $HOSTIP:$HTTP_PORT"
 log "test server on $HOSTIP:$HTTP_PORT"
 
-PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
+PSQL=$(ls -d "$SUPAVISE_STATE"/artifacts/postgres/*/bin/psql | head -1)
 sql() { # REF SQL: run SQL as the superuser over the cluster's own socket, print tuples only
   local ref=$1 port
   port=$(project_field "$ref" 'd["ports"]["Postgres"]')
-  sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$ref/postgres/sock port=$port user=supabase_admin dbname=postgres" \
+  sudo -u "$SUPAVISE_USER" "$PSQL" "host=$SUPAVISE_STATE/projects/$ref/postgres/sock port=$port user=supabase_admin dbname=postgres" \
     -qAtX -v ON_ERROR_STOP=1 -c "$2" </dev/null
 }
 net_request() { # REF TAG [HOST]: pg_net GET to the test server; prints "<status>|<error>" once the response row exists
@@ -101,7 +101,7 @@ net_request() { # REF TAG [HOST]: pg_net GET to the test server; prints "<status
 served() { grep -c "who=$1 " "$SRV/access.log" || true; } # requests the test server saw with this tag
 
 unit_prop() { systemctl show -p "$1" --value "$2"; } # PROPERTY UNIT
-# No branch restriction: no IPAddressAllow and no deny of the whole address space. Every sb-* unit
+# No branch restriction: no IPAddressAllow and no deny of the whole address space. Every supavise-* unit
 # keeps the template's metadata-service deny (169.254.169.254, fd00:ec2::254), and a lifted branch
 # restriction must restore it, not leave the list empty.
 unconfined() { # UNIT
@@ -139,10 +139,10 @@ row=$(net_request "$A" parent)
 [[ $(served parent) -ge 1 ]] || fail "control: the test server never saw the parent's request"
 log "control ok: the parent reaches $HOSTIP:$HTTP_PORT"
 
-branch_json() { sbctl branches get "$1" --json | json_get "$2"; }
+branch_json() { supavise branches get "$1" --json | json_get "$2"; }
 create_branch() { # NAME [extra flags]: prints the branch's project ref
   local name=$1; shift
-  sbctl branches create "$A" "$name" --with-data --json "$@" | json_get 'd["project_ref"]'
+  supavise branches create "$A" "$name" --with-data --json "$@" | json_get 'd["project_ref"]'
 }
 
 # ---- default: egress denied -----------------------------------------------------------------
@@ -150,7 +150,7 @@ log "branch with data, default isolation"
 B=$(create_branch egress-denied)
 [[ $(branch_json "$B" 'd.get("egress", "")') == denied ]] || fail "$B: egress is '$(branch_json "$B" 'd.get("egress", "")')', want denied"
 [[ $(branch_json "$B" 'd["clone_method"]') == reflink ]] || fail "$B: clone_method is $(branch_json "$B" 'd["clone_method"]'), want reflink"
-PGB="sb-postgres@$B.service"
+PGB="supavise-postgres@$B.service"
 deny=$(unit_prop IPAddressDeny "$PGB") allow=$(unit_prop IPAddressAllow "$PGB")
 [[ $deny == *0.0.0.0/0* && $deny == *::/0* ]] || fail "$PGB: IPAddressDeny is '$deny', want the whole address space"
 # systemd prints a full-length prefix without it: 127.0.0.1/32 as 127.0.0.1, ::1/128 as ::1.
@@ -158,14 +158,14 @@ allow_norm=$(printf '%s\n' $allow | sed -e 's#/32$##' -e 's#/128$##' | LC_ALL=C 
 [[ $allow_norm == "127.0.0.1 ::1 " ]] || fail "$PGB: IPAddressAllow is '$allow', want exactly 127.0.0.1 and ::1 (not 127.0.0.0/8: 127.0.0.53 is the DNS stub)"
 # The IP filter does not cover unix sockets: the resolver's varlink socket, the D-Bus system bus and
 # nscd's socket are hidden from the Postgres unit (InaccessiblePaths in the unit template: systemd 255
-# cannot change that property of a unit over D-Bus), and the unit still hides /etc/sbctl.
+# cannot change that property of a unit over D-Bus), and the unit still hides /etc/supavise.
 check_hidden_paths() { # UNIT: the unit's property and, in its mount namespace, the sockets
   local unit=$1 hidden pid p
   hidden=$(unit_prop InaccessiblePaths "$unit")
   for p in /run/systemd/resolve/io.systemd.Resolve /run/dbus /run/nscd/socket; do
     [[ $hidden == *"$p"* ]] || fail "$unit: InaccessiblePaths is '$hidden', want it to hide $p"
   done
-  [[ $hidden == */etc/sbctl* ]] || fail "$unit: InaccessiblePaths lost /etc/sbctl (the master key and config): '$hidden'"
+  [[ $hidden == */etc/supavise* ]] || fail "$unit: InaccessiblePaths lost /etc/supavise (the master key and config): '$hidden'"
   pid=$(unit_prop MainPID "$unit")
   [[ $pid -gt 0 ]] || fail "$unit: no main pid"
   # InaccessiblePaths puts an inaccessible node of the same type (a socket, mode 000) over the path;
@@ -178,18 +178,18 @@ check_hidden_paths() { # UNIT: the unit's property and, in its mount namespace, 
   done
 }
 check_hidden_paths "$PGB"
-check_hidden_paths "sb-postgres@$A.service" # in the template, so the parent has it too
+check_hidden_paths "supavise-postgres@$A.service" # in the template, so the parent has it too
 BPORT=$(project_field "$B" 'd["ports"]["Postgres"]')
 for svc in gotrue postgrest; do
-  unconfined "sb-$svc@$B.service" || fail "sb-$svc@$B has an egress restriction (only the cluster's Postgres should)"
+  unconfined "supavise-$svc@$B.service" || fail "supavise-$svc@$B has an egress restriction (only the cluster's Postgres should)"
 done
-unconfined "sb-postgres@$A.service" || fail "the parent's Postgres has an egress restriction"
-sbctl projects health "$B" || fail "$B: unhealthy behind the egress filter"
+unconfined "supavise-postgres@$A.service" || fail "the parent's Postgres has an egress restriction"
+supavise projects health "$B" || fail "$B: unhealthy behind the egress filter"
 [[ $(sql "$B" "select count(*) from public.items") == 100 ]] || fail "$B: the clone lost data"
 
 [[ $(sql "$B" "select active from cron.job where jobname = 'egress-test-job'") == f ]] || fail "$B: the parent's cron job is still active in the branch"
-[[ $(sql "$B" "select count(*) from sbctl_branch.paused_cron_jobs p join cron.job j using (jobid) where j.jobname = 'egress-test-job'") == 1 ]] \
-  || fail "$B: the paused cron job is not recorded in sbctl_branch.paused_cron_jobs"
+[[ $(sql "$B" "select count(*) from supavise_branch.paused_cron_jobs p join cron.job j using (jobid) where j.jobname = 'egress-test-job'") == 1 ]] \
+  || fail "$B: the paused cron job is not recorded in supavise_branch.paused_cron_jobs"
 [[ $(sql "$A" "select active from cron.job where jobname = 'egress-test-job'") == t ]] || fail "the parent's cron job was touched"
 # pg_cron stamps the parent's port into a job: in the branch the jobs name the branch's own cluster.
 [[ $(sql "$B" "select count(*) from cron.job where nodeport <> $BPORT or nodename <> '127.0.0.1'") == 0 ]] || fail "$B: a cron job still names a node other than the branch ($BPORT)"
@@ -210,22 +210,22 @@ log "$B: 127.0.0.1 is reachable, 127.0.0.2 is not"
 check_isolated_data() { # BRANCH: the foreign server is disabled, the Vault secret is the branch's own, the other project is untouched
   local b=$1 host passwords secret bsvc
   host=$(sql "$b" "select (select split_part(o, '=', 2) from unnest(srvoptions) o where o like 'host=%') from pg_foreign_server where srvname = 'other_pg'")
-  [[ $host == /nonexistent/sbctl-branch-disabled ]] || fail "$b: the foreign server other_pg has host '$host', want it disabled"
+  [[ $host == /nonexistent/supavise-branch-disabled ]] || fail "$b: the foreign server other_pg has host '$host', want it disabled"
   passwords=$(sql "$b" "select count(*) from pg_user_mappings m, unnest(m.umoptions) o where m.srvname = 'other_pg' and o like 'password=%'")
   [[ $passwords == 0 ]] || fail "$b: $passwords user mapping password(s) of other_pg remain"
   if sql "$b" "insert into public.victim_ft values (3, 'written by the branch')" >/dev/null 2>&1; then
     fail "$b: the foreign table accepted a write"
   fi
   [[ $(sql "$D" "select count(*) from public.victim") == 2 ]] || fail "$b: the other project $D was written to"
-  [[ $(sql "$b" "select original_host || ':' || original_port || ' ' || passwords_dropped_for::text from sbctl_branch.paused_foreign_servers where server_name = 'other_pg'") == "127.0.0.1:$DPORT {public}" ]] \
-    || fail "$b: other_pg is not recorded in sbctl_branch.paused_foreign_servers"
-  [[ $(sql "$b" "select count(*) from sbctl_branch.paused_foreign_servers t where t::text like '%$DPW%'") == 0 ]] || fail "$b: the stored password is in sbctl_branch.paused_foreign_servers"
+  [[ $(sql "$b" "select original_host || ':' || original_port || ' ' || passwords_dropped_for::text from supavise_branch.paused_foreign_servers where server_name = 'other_pg'") == "127.0.0.1:$DPORT {public}" ]] \
+    || fail "$b: other_pg is not recorded in supavise_branch.paused_foreign_servers"
+  [[ $(sql "$b" "select count(*) from supavise_branch.paused_foreign_servers t where t::text like '%$DPW%'") == 0 ]] || fail "$b: the stored password is in supavise_branch.paused_foreign_servers"
   bsvc=$(project_field "$b" 'd["keys"]["service_role_key"]' --show-keys)
   secret=$(sql "$b" "select decrypted_secret from vault.decrypted_secrets where name = 'parent_service_key'")
   [[ $bsvc != "$A_SERVICE" && -n $bsvc ]] || fail "$b: the branch has the parent's service key"
   [[ $secret == "$bsvc" ]] || fail "$b: the Vault secret is not the branch's service key (it is the parent's: $([[ $secret == "$A_SERVICE" ]] && echo yes || echo no))"
-  [[ $(sql "$b" "select count(*) from sbctl_branch.rewritten_credentials where kind = 'vault_secret' and name = 'parent_service_key'") == 1 ]] || fail "$b: the rewritten secret is not recorded by name"
-  [[ $(sql "$b" "select count(*) from sbctl_branch.rewritten_credentials t where t::text like '%$A_SERVICE%' or t::text like '%$bsvc%'") == 0 ]] || fail "$b: sbctl_branch.rewritten_credentials holds a key"
+  [[ $(sql "$b" "select count(*) from supavise_branch.rewritten_credentials where kind = 'vault_secret' and name = 'parent_service_key'") == 1 ]] || fail "$b: the rewritten secret is not recorded by name"
+  [[ $(sql "$b" "select count(*) from supavise_branch.rewritten_credentials t where t::text like '%$A_SERVICE%' or t::text like '%$bsvc%'") == 0 ]] || fail "$b: supavise_branch.rewritten_credentials holds a key"
 }
 check_isolated_data "$B"
 # The parent is untouched: its foreign table still writes, its secret is still its own key.
@@ -236,16 +236,16 @@ sql "$D" "delete from public.victim where id = 4" >/dev/null
 log "$B: foreign server disabled, Vault secret is the branch's own, the parent's fdw and secret are untouched"
 
 log "the restriction survives a pause and resume"
-sbctl projects pause "$B"
-sbctl projects resume "$B"
-sbctl projects health "$B" || fail "$B: unhealthy after resume"
+supavise projects pause "$B"
+supavise projects resume "$B"
+supavise projects health "$B" || fail "$B: unhealthy after resume"
 [[ $(unit_prop IPAddressDeny "$PGB") == *0.0.0.0/0* ]] || fail "$PGB: the restriction is gone after resume"
 check_hidden_paths "$PGB"
 row=$(net_request "$B" branch-denied-after-resume)
 [[ $row == '|'?* && $(served branch-denied-after-resume) -eq 0 ]] || fail "$B: after resume a pg_net request answered '$row' or reached the server"
 
 log "a reset recreates the cluster and denies again"
-sbctl branches reset "$B"
+supavise branches reset "$B"
 [[ $(branch_json "$B" 'd.get("egress", "")') == denied ]] || fail "$B: egress after reset is '$(branch_json "$B" 'd.get("egress", "")')', want denied"
 [[ $(unit_prop IPAddressDeny "$PGB") == *0.0.0.0/0* ]] || fail "$PGB: no restriction after reset"
 check_hidden_paths "$PGB"
@@ -258,7 +258,7 @@ row=$(net_request "$B" branch-denied-after-reset)
 log "branch with --allow-egress"
 C=$(create_branch egress-open --allow-egress)
 [[ $(branch_json "$C" 'd.get("egress", "")') == allowed ]] || fail "$C: egress is '$(branch_json "$C" 'd.get("egress", "")')', want allowed"
-unconfined "sb-postgres@$C.service" || fail "$C: an opted-out branch has a restriction"
+unconfined "supavise-postgres@$C.service" || fail "$C: an opted-out branch has a restriction"
 [[ $(sql "$C" "select count(*) from cron.job where nodeport <> $(project_field "$C" 'd["ports"]["Postgres"]')") == 0 ]] || fail "$C: the opted-out branch's cron jobs name the parent's port"
 [[ $(sql "$C" "select active from cron.job where jobname = 'egress-test-job'") == t ]] || fail "$C: the opt-out did not keep the cron job active"
 row=$(net_request "$C" branch-open)
@@ -278,8 +278,8 @@ wait_cron_success sql "$C" egress-test-job 150 "$C_RUNS" || fail "$C: the opted-
 
 # ---- delete lifts the restriction -----------------------------------------------------------
 log "delete the branches"
-sbctl branches delete "$B"
-sbctl branches delete "$C"
+supavise branches delete "$B"
+supavise branches delete "$C"
 unconfined "$PGB" || fail "$PGB: the restriction remains after the branch was deleted (a later project with the ref would inherit it)"
 [[ $(unit_state "$PGB") == inactive ]] || fail "$PGB is $(unit_state "$PGB") after delete"
 

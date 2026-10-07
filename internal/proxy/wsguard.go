@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // With the legacy keys disabled, the anon and service_role JWTs must stop working on

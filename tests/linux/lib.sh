@@ -8,12 +8,12 @@
 set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
-SBCTL_BIN=${SBCTL_BIN:-}            # a linux sbctl binary; built from REPO_ROOT when empty
-SBCTL_USER=sbctl
-SBCTL_STATE=/var/lib/sbctl
-SBCTL_CONF=/etc/sbctl/config.toml
-SBCTL_DOMAIN=${SBCTL_DOMAIN:-sbctl.test}
-LOG_DIR=${LOG_DIR:-/tmp/sbctl-linux-logs}
+SUPAVISE_BIN=${SUPAVISE_BIN:-}            # a linux supavise binary; built from REPO_ROOT when empty
+SUPAVISE_USER=supavise
+SUPAVISE_STATE=/var/lib/supavise
+SUPAVISE_CONF=/etc/supavise/config.toml
+SUPAVISE_DOMAIN=${SUPAVISE_DOMAIN:-supavise.test}
+LOG_DIR=${LOG_DIR:-/tmp/supavise-linux-logs}
 
 log()  { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 fail() { log "FAIL: $*"; exit 1; }
@@ -37,22 +37,22 @@ preflight() {
   } | tee "$LOG_DIR/host.txt" >&2
 }
 
-# install_binary: put sbctl at /usr/local/bin/sbctl (build it when SBCTL_BIN is not set).
+# install_binary: put supavise at /usr/local/bin/supavise (build it when SUPAVISE_BIN is not set).
 install_binary() {
-  if [[ -z "$SBCTL_BIN" ]]; then
-    command -v go >/dev/null || fail "no SBCTL_BIN and no go toolchain to build one"
-    log "building sbctl"
-    (cd "$REPO_ROOT" && CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl-linux-test ./cmd/sbctl)
-    SBCTL_BIN=/tmp/sbctl-linux-test
+  if [[ -z "$SUPAVISE_BIN" ]]; then
+    command -v go >/dev/null || fail "no SUPAVISE_BIN and no go toolchain to build one"
+    log "building supavise"
+    (cd "$REPO_ROOT" && CGO_ENABLED=0 go build -trimpath -o /tmp/supavise-linux-test ./cmd/supavise)
+    SUPAVISE_BIN=/tmp/supavise-linux-test
   fi
-  install -m 0755 "$SBCTL_BIN" /usr/local/bin/sbctl
-  /usr/local/bin/sbctl --version >&2 || true
+  install -m 0755 "$SUPAVISE_BIN" /usr/local/bin/supavise
+  /usr/local/bin/supavise --version >&2 || true
 }
 
 # setup_node: user, directories, config, units. Safe to run twice.
 setup_node() {
-  # The sbctl user drives systemd over D-Bus; that needs polkit and the rule that
-  # `sbctl system install-units` installs.
+  # The supavise user drives systemd over D-Bus; that needs polkit and the rule that
+  # `supavise system install-units` installs.
   if ! command -v pkaction >/dev/null; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq || log "apt-get update failed; trying the install anyway"
@@ -60,42 +60,42 @@ setup_node() {
       || apt-get install -y policykit-1 \
       || fail "polkit is not installed and could not be installed"
   fi
-  id "$SBCTL_USER" >/dev/null 2>&1 || useradd --system --home-dir "$SBCTL_STATE" --shell /usr/sbin/nologin "$SBCTL_USER"
-  install -d -o "$SBCTL_USER" -g "$SBCTL_USER" -m 0750 "$SBCTL_STATE" /etc/sbctl
-  cat >"$SBCTL_CONF" <<CONF
-domain = "$SBCTL_DOMAIN"
+  id "$SUPAVISE_USER" >/dev/null 2>&1 || useradd --system --home-dir "$SUPAVISE_STATE" --shell /usr/sbin/nologin "$SUPAVISE_USER"
+  install -d -o "$SUPAVISE_USER" -g "$SUPAVISE_USER" -m 0750 "$SUPAVISE_STATE" /etc/supavise
+  cat >"$SUPAVISE_CONF" <<CONF
+domain = "$SUPAVISE_DOMAIN"
 supervisor = "systemd"
 log_level = "info"
-bin_path = "/usr/local/bin/sbctl"
+bin_path = "/usr/local/bin/supavise"
 
 [tls]
 mode = "off"
 CONF
-  chown "$SBCTL_USER:$SBCTL_USER" "$SBCTL_CONF"
-  chmod 0640 "$SBCTL_CONF"
-  /usr/local/bin/sbctl system install-units
+  chown "$SUPAVISE_USER:$SUPAVISE_USER" "$SUPAVISE_CONF"
+  chmod 0640 "$SUPAVISE_CONF"
+  /usr/local/bin/supavise system install-units
   systemctl daemon-reload
 }
 
-# sbctl: run the CLI as the sbctl user, which owns the state directory and is the only
-# user the polkit rule lets manage the sb-* units.
-sbctl() { sudo -u "$SBCTL_USER" -H /usr/local/bin/sbctl "$@"; }
+# supavise: run the CLI as the supavise user, which owns the state directory and is the only
+# user the polkit rule lets manage the supavise-* units.
+supavise() { sudo -u "$SUPAVISE_USER" -H /usr/local/bin/supavise "$@"; }
 
 # system_init: fetch artifacts and create the system project.
-system_init() { sbctl system init; }
+system_init() { supavise system init; }
 
 # json_get FILE_OR_STDIN PYEXPR: evaluate a Python expression over the parsed JSON "d".
 json_get() { python3 -c 'import json,sys; d=json.load(sys.stdin); print('"$1"')'; }
 
 # create_project NAME CLASS: prints the ref.
 create_project() {
-  sbctl projects create --name "$1" --class "${2:-default}" --json | json_get 'd["ref"]'
+  supavise projects create --name "$1" --class "${2:-default}" --json | json_get 'd["ref"]'
 }
 
 # project_field REF PYEXPR [--show-keys]
 project_field() {
   local ref=$1 expr=$2; shift 2
-  sbctl projects get "$ref" --json "$@" | json_get "$expr"
+  supavise projects get "$ref" --json "$@" | json_get "$expr"
 }
 
 unit_state() { systemctl show -p ActiveState --value "$1"; }
@@ -113,7 +113,7 @@ http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" || true; 
 
 # ---- the daemon's Management API ------------------------------------------------------
 # The proxy listens on 127.0.0.1:80 (config tls.mode off); every name is reached with a Host header.
-API_HOST="api.$SBCTL_DOMAIN"
+API_HOST="api.$SUPAVISE_DOMAIN"
 api() { # METHOD PATH [curl args...]: the Management API through the proxy
   local m=$1 p=$2; shift 2
   curl -sS -m 120 -X "$m" -H "Host: $API_HOST" "$@" "http://127.0.0.1$p"
@@ -123,7 +123,7 @@ api() { # METHOD PATH [curl args...]: the Management API through the proxy
 # signs in and creates a personal access token. Sets PAT and ORG for papi.
 claim_and_token() {
   local tok jwt
-  tok=$(sbctl claim token 2>/dev/null) || fail "sbctl claim token"
+  tok=$(supavise claim token 2>/dev/null) || fail "supavise claim token"
   [[ $(api POST /claim -H 'Content-Type: application/json' \
       -d "{\"token\":\"$tok\",\"email\":\"smoke@example.com\",\"password\":\"smoke-correct-horse-battery\",\"organization_name\":\"Smoke\"}" \
       -o /dev/null -w '%{http_code}') == 201 ]] || fail "claim with the token failed"
@@ -152,7 +152,7 @@ api_create_project() {
     [[ $status == ACTIVE_HEALTHY || $status == INIT_FAILED ]] && break
     sleep 3
   done
-  [[ $status == ACTIVE_HEALTHY ]] || { journalctl --no-pager -u sbctl.service -n 60 >&2; fail "project $ref is $status"; }
+  [[ $status == ACTIVE_HEALTHY ]] || { journalctl --no-pager -u supavise.service -n 60 >&2; fail "project $ref is $status"; }
   echo "$ref"
 }
 
@@ -177,7 +177,7 @@ rest_through_proxy() {
       -d "$(python3 -c 'import json,sys; print(json.dumps({"query": sys.argv[1]}))' "$SMOKE_TABLE_SQL")" >/dev/null || fail "$ref: create table through database/query"
   fi
   for ((i = 0; i < 30; i++)); do
-    body=$(curl -sS -m 30 -H "Host: $ref.api.$SBCTL_DOMAIN" -H "apikey: $pub" "http://127.0.0.1/rest/v1/smoke_items?select=id" || true)
+    body=$(curl -sS -m 30 -H "Host: $ref.api.$SUPAVISE_DOMAIN" -H "apikey: $pub" "http://127.0.0.1/rest/v1/smoke_items?select=id" || true)
     n=$(printf '%s' "$body" | json_get 'len(d) if isinstance(d, list) else -1' 2>/dev/null || true)
     [[ $n == 2 ]] && return 0
     sleep 2
@@ -192,7 +192,7 @@ rest_through_proxy() {
 # imds_blocked_in tests the real unit: it moves a curl into the unit's cgroup, where the BPF
 # program of IPAddressDeny applies, and the same curl outside the unit must reach the mock.
 IMDS_PORT=38169
-IMDS_DIR=/tmp/sbctl-imds-mock
+IMDS_DIR=/tmp/supavise-imds-mock
 imds_up() {
   mkdir -p "$IMDS_DIR"; echo imds-role-credentials >"$IMDS_DIR/index.html"
   ip addr add 169.254.169.254/32 dev lo 2>/dev/null || true
@@ -232,14 +232,14 @@ imds_denied_by_unit() { # UNIT: the unit file denies both metadata addresses
 }
 
 # mint_dashboard_jwt SECRET: a dashboard session as GoTrue issues it (HS256 with the system
-# project's secret, aud "authenticated", app_metadata.sbctl_admin), for the Management API.
+# project's secret, aud "authenticated", app_metadata.supavise_admin), for the Management API.
 mint_dashboard_jwt() {
   python3 - "$1" <<'PY'
 import base64, hashlib, hmac, json, sys, time
 def b64(x): return base64.urlsafe_b64encode(x).rstrip(b"=")
 head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
 body = b64(json.dumps({"aud": "authenticated", "sub": "00000000-0000-4000-8000-000000000001",
-                       "email": "smoke@example.test", "role": "", "app_metadata": {"sbctl_admin": True},
+                       "email": "smoke@example.test", "role": "", "app_metadata": {"supavise_admin": True},
                        "exp": int(time.time()) + 1800}).encode())
 sig = b64(hmac.new(sys.argv[1].encode(), head + b"." + body, hashlib.sha256).digest())
 print((head + b"." + body + b"." + sig).decode())
@@ -248,16 +248,16 @@ PY
 
 collect_logs() {
   mkdir -p "$LOG_DIR"
-  journalctl --no-pager -o short-iso -u 'sb-*' -u sbctl.service >"$LOG_DIR/journal.log" 2>&1 || true
-  systemctl list-units --all --no-pager 'sb-*' 'sbctl*' >"$LOG_DIR/units.txt" 2>&1 || true
-  systemctl status --no-pager sbctl.slice >"$LOG_DIR/slice.txt" 2>&1 || true
+  journalctl --no-pager -o short-iso -u 'supavise-*' -u supavise.service >"$LOG_DIR/journal.log" 2>&1 || true
+  systemctl list-units --all --no-pager 'supavise-*' 'supavise*' >"$LOG_DIR/units.txt" 2>&1 || true
+  systemctl status --no-pager supavise.slice >"$LOG_DIR/slice.txt" 2>&1 || true
   df -h /var/lib >"$LOG_DIR/df.txt" 2>&1 || true
   log "logs in $LOG_DIR"
 }
 
 teardown() {
   imds_down 2>/dev/null || true
-  systemctl stop 'sb-*' 2>/dev/null || true
+  systemctl stop 'supavise-*' 2>/dev/null || true
 }
 
 # ws_join PORT HOST ANON: join a Realtime channel over a WebSocket (tenant from the Host header,

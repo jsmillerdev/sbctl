@@ -128,7 +128,7 @@ var StorageSchema = buildStorageSchema()
 // DefaultStorageFeatures is what Storage reports before any change: the features the
 // self-hosted fleet runs (the S3 protocol endpoint) and the ones it does not (image
 // transformation needs imgproxy, which is optional; Iceberg and vector buckets need
-// services sbctl does not run).
+// services supavise does not run).
 func DefaultStorageFeatures() map[string]any {
 	return map[string]any{
 		"imageTransformation": map[string]any{"enabled": false},

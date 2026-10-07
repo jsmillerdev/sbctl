@@ -2,7 +2,7 @@
 # The Supabase CLI against a node, as a customer uses it: link, migrations, db push through the
 # pooler, gen types, functions deploy, secrets. Run by run.sh; it needs a node that is up.
 #
-# The CLI reaches a node through a profile file (--profile), which `sbctl api profile` prints:
+# The CLI reaches a node through a profile file (--profile), which `supavise api profile` prints:
 # the Management API URL, the project host and the pooler's registrable domain. That is the
 # documented way to point the CLI at a self-hosted Management API, and it is what a node's
 # owner is told to do. (The CLI also reads SUPABASE_PROFILE, with the same value.) No Docker:

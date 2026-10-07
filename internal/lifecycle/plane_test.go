@@ -12,10 +12,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 var testNow = time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)
@@ -37,7 +37,7 @@ func testPlane(t *testing.T) (*PostgresPlane, *config.Config) {
 	cfg := config.Default()
 	cfg.StateDir = shortTempDir(t)
 	cfg.Domain = "example.test"
-	cfg.BinPath = "/usr/local/bin/sbctl"
+	cfg.BinPath = "/usr/local/bin/supavise"
 	return NewPostgresPlane(cfg, nil, fakeArts{}, registry.NewMemory(), PlaneOptions{}), cfg
 }
 
@@ -63,7 +63,7 @@ func TestPostgresSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Service != config.SvcPostgres || spec.Unit() != "sb-postgres@abcdefghijklmnopqrst.service" || spec.ArtifactDir != "/art/postgres" {
+	if spec.Service != config.SvcPostgres || spec.Unit() != "supavise-postgres@abcdefghijklmnopqrst.service" || spec.ArtifactDir != "/art/postgres" {
 		t.Fatalf("spec = %+v", spec)
 	}
 	args := strings.Join(spec.Exec, " ")
@@ -75,7 +75,7 @@ func TestPostgresSpec(t *testing.T) {
 		"-c hba_file=" + pp.HBA,
 		"-c wal_level=logical",
 		"-c archive_mode=on",
-		"-c archive_command='/usr/local/bin/sbctl' wal push --ref abcdefghijklmnopqrst %p",
+		"-c archive_command='/usr/local/bin/supavise' wal push --ref abcdefghijklmnopqrst %p",
 		"-c shared_buffers=32MB",
 		"-c max_connections=60",
 		"-c cron.use_background_workers=on",
@@ -90,27 +90,27 @@ func TestPostgresSpec(t *testing.T) {
 	if spec.Env["PGDATA"] != pp.Data || spec.Env["PGSODIUM_KEY_FILE"] != pp.RootKey || spec.Env["POSTGRES_USER"] != RoleAdmin || spec.Env["POSTGRES_PASSWORD"] != keys.AdminPassword {
 		t.Fatalf("env = %v", spec.Env)
 	}
-	if _, ok := spec.Env["SBCTL_CONFIG"]; ok {
-		t.Fatal("SBCTL_CONFIG set without a config path")
+	if _, ok := spec.Env["SUPAVISE_CONFIG"]; ok {
+		t.Fatal("SUPAVISE_CONFIG set without a config path")
 	}
 	// The run script must survive shell quoting of the archive command.
 	run, err := units.FormatRun(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(run), `'archive_command='\''/usr/local/bin/sbctl'\'' wal push --ref abcdefghijklmnopqrst %p'`) {
+	if !strings.Contains(string(run), `'archive_command='\''/usr/local/bin/supavise'\'' wal push --ref abcdefghijklmnopqrst %p'`) {
 		t.Fatalf("run script quoting:\n%s", run)
 	}
 
 	// Class and overrides.
 	p.Class = "micro"
-	pl.opts.ArchiveCommand, pl.opts.ConfigPath = "off", "/etc/sbctl/config.toml"
+	pl.opts.ArchiveCommand, pl.opts.ConfigPath = "off", "/etc/supavise/config.toml"
 	spec, _ = pl.postgresSpec(context.Background(), p, keys)
 	args = strings.Join(spec.Exec, " ")
 	if !strings.Contains(args, "-c shared_buffers=16MB") || !strings.Contains(args, "-c max_connections=30") || !strings.Contains(args, "-c archive_mode=off") || strings.Contains(args, "archive_command") {
 		t.Fatalf("micro/off args:\n%s", args)
 	}
-	if spec.Env["SBCTL_CONFIG"] != "/etc/sbctl/config.toml" {
+	if spec.Env["SUPAVISE_CONFIG"] != "/etc/supavise/config.toml" {
 		t.Fatalf("env = %v", spec.Env)
 	}
 	p.Class = "bogus"
@@ -120,23 +120,23 @@ func TestPostgresSpec(t *testing.T) {
 }
 
 // On a systemd node the cluster archives through the daemon's relay socket and its unit gets
-// neither the config file nor SBCTL_CONFIG.
+// neither the config file nor SUPAVISE_CONFIG.
 func TestPostgresSpecArchivesThroughTheRelay(t *testing.T) {
 	pl, cfg := testPlane(t)
 	cfg.Backup.WALRelay = "on"
-	pl.opts.ConfigPath = "/etc/sbctl/config.toml"
+	pl.opts.ConfigPath = "/etc/supavise/config.toml"
 	p := testProject(cfg, "abcdefghijklmnopqrst", 2)
 	spec, err := pl.postgresSpec(context.Background(), p, testKeys(t, p.Ref))
 	if err != nil {
 		t.Fatal(err)
 	}
 	args := strings.Join(spec.Exec, " ")
-	want := "archive_command='/usr/local/bin/sbctl' wal push --ref abcdefghijklmnopqrst --socket '" + cfg.Paths().WALSocket(p.Ref) + "' %p"
+	want := "archive_command='/usr/local/bin/supavise' wal push --ref abcdefghijklmnopqrst --socket '" + cfg.Paths().WALSocket(p.Ref) + "' %p"
 	if !strings.Contains(args, want) {
 		t.Fatalf("args lack %q:\n%s", want, args)
 	}
-	if _, ok := spec.Env["SBCTL_CONFIG"]; ok {
-		t.Fatal("SBCTL_CONFIG is exported although the cluster archives through the relay and cannot read the config")
+	if _, ok := spec.Env["SUPAVISE_CONFIG"]; ok {
+		t.Fatal("SUPAVISE_CONFIG is exported although the cluster archives through the relay and cannot read the config")
 	}
 	// prepare creates the relay directory before the cluster starts, and tells the daemon.
 	var ready []string
@@ -226,7 +226,7 @@ func TestAPISpecs(t *testing.T) {
 	if _, ok := e["GOTRUE_SMTP_HOST"]; ok {
 		t.Fatalf("no [mail], no SMTP in the system gotrue env: %v", e)
 	}
-	// [mail] reaches sb-gotrue@system (invitations by email) and no project's GoTrue.
+	// [mail] reaches supavise-gotrue@system (invitations by email) and no project's GoTrue.
 	cfg.Mail = config.Mail{SMTPHost: "smtp.example.test", SMTPFrom: "ops@example.test"}
 	withMail, _ := pl.apiSpecs(context.Background(), sys, testKeys(t, config.SystemRef))
 	if withMail[0].Env["GOTRUE_SMTP_HOST"] != "smtp.example.test" || withMail[0].Env["GOTRUE_SMTP_ADMIN_EMAIL"] != "ops@example.test" {
@@ -330,7 +330,7 @@ func TestSocketDSNParses(t *testing.T) {
 		t.Fatal(err)
 	}
 	cc := pc.ConnConfig
-	if cc.Host != "/tmp/it's a dir/projects/system/postgres/sock" || cc.Port != 5433 || cc.User != RoleAdmin || cc.Database != "sbctl" || cc.Password != "" || pc.MaxConns != 6 {
+	if cc.Host != "/tmp/it's a dir/projects/system/postgres/sock" || cc.Port != 5433 || cc.User != RoleAdmin || cc.Database != "supavise" || cc.Password != "" || pc.MaxConns != 6 {
 		t.Fatalf("parsed = %+v max=%d", cc, pc.MaxConns)
 	}
 	cc2, err := pgx.ParseConfig(SystemSocketDSN(cfg, "_realtime"))
@@ -413,7 +413,7 @@ func TestStartDatabaseAppliesChangedSettings(t *testing.T) {
 			cfg := config.Default()
 			cfg.StateDir = shortTempDir(t)
 			cfg.Domain = "example.test"
-			cfg.BinPath = "/usr/local/bin/sbctl"
+			cfg.BinPath = "/usr/local/bin/supavise"
 			sup := &recSup{state: tc.state, changed: tc.changed}
 			// The cluster never answers, so the wait after Start fails fast; only the
 			// call order before it matters here.
@@ -450,7 +450,7 @@ func TestPlaneDeleteRemovesTheBundlersInstanceOfTheProject(t *testing.T) {
 	}
 	found := false
 	for _, u := range sup.removed {
-		if u == "sb-edge-bundle@"+ref+".service" {
+		if u == "supavise-edge-bundle@"+ref+".service" {
 			found = true
 		}
 		if strings.Contains(u, "edge-bundle") && !strings.HasSuffix(u, "@"+ref+".service") {

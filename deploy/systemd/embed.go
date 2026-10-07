@@ -1,5 +1,5 @@
 // Package systemd embeds the unit templates, the slice and the polkit rule so the
-// binary can install them (sbctl system install-units) without the repository.
+// binary can install them (supavise system install-units) without the repository.
 package systemd
 
 import (

@@ -1,4 +1,4 @@
-// Short browser check of Studio through sbctl's edge against the real Management API:
+// Short browser check of Studio through supavise's edge against the real Management API:
 // sign in, project list, table editor and SQL editor of every project given.
 //
 //   STUDIO_URL=http://studio.127.0.0.1.sslip.io:36080 STUDIO_EMAIL=... STUDIO_PASSWORD=... \
@@ -87,15 +87,15 @@ for (const [ref, name] of PROJECTS) {
     await goto(`/project/${ref}/sql/new`)
     const editor = page.locator('.monaco-editor').first()
     await editor.waitFor()
-    const sql = `select count(*) as sbctl_rows from public.${TABLE};`
+    const sql = `select count(*) as supavise_rows from public.${TABLE};`
     for (let i = 0; i < 10; i++) {
       await editor.locator('.view-lines').click()
       await page.keyboard.type(sql, { delay: 20 })
-      if ((await editor.innerText()).includes('sbctl_rows')) break
+      if ((await editor.innerText()).includes('supavise_rows')) break
       await page.waitForTimeout(500)
     }
     await page.getByRole('button', { name: /^Run/ }).first().click()
-    await page.getByText('sbctl_rows', { exact: true }).first().waitFor()
+    await page.getByText('supavise_rows', { exact: true }).first().waitFor()
   })
 }
 

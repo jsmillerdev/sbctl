@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/backup"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // CreateInput is the body of POST /v1/projects/{ref}/branches, plus the lifetime.
@@ -35,7 +35,7 @@ type CreateInput struct {
 	Seed string
 	// IsDefault is accepted so that the request body decodes, and refused when true.
 	IsDefault bool
-	// AllowEgress is the opt-out of the isolation a branch with data gets by default (sbctl
+	// AllowEgress is the opt-out of the isolation a branch with data gets by default (supavise
 	// only: the Management API's create body has no such field, the API takes it as the query
 	// parameter allow_egress=true). Without it, the branch's Postgres unit may reach loopback
 	// only (systemd's IPAddressDeny, where the supervisor can enforce it) and the parent's
@@ -69,7 +69,7 @@ func (s *Service) keepsCron(egress string) bool {
 // egressDetail is the sentence a branch's detail carries about its outbound network, so that
 // the state a client reads says what the branch can reach.
 func (s *Service) egressDetail(egress string) string {
-	cron := "pg_cron jobs paused (the ones that were active are in sbctl_branch.paused_cron_jobs)"
+	cron := "pg_cron jobs paused (the ones that were active are in supavise_branch.paused_cron_jobs)"
 	if s.keepsCron(egress) {
 		cron = "pg_cron jobs left active"
 	}
@@ -84,7 +84,7 @@ func (s *Service) egressDetail(egress string) string {
 
 // withDataNotice is in the detail of every branch with data, the one place the Management API
 // shows a client (the spec's create body has no field for it) what such a branch is.
-const withDataNotice = "a with_data branch is a copy of production: users' sessions are removed, but credentials users stored in their own tables, function bodies or Vault entries (other than sbctl's keys) are not detected and loopback is open on every port, so give it to trusted users and agents only"
+const withDataNotice = "a with_data branch is a copy of production: users' sessions are removed, but credentials users stored in their own tables, function bodies or Vault entries (other than supavise's keys) are not detected and loopback is open on every port, so give it to trusted users and agents only"
 
 // Create starts a new branch of the project ref belongs to and returns it as soon as its
 // project exists (state CREATING_PROJECT). The work continues in the background; poll Get

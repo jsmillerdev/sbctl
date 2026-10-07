@@ -1,34 +1,34 @@
 # functions-main
 
-The main service of sbctl's Edge Runtime: one Deno script that every request to `/functions/v1` enters, for every project on the node. The `sb-edge-runtime` unit starts `edge-runtime start --main-service <dir>` with it (`internal/fleet/edgeruntime.go`). The TypeScript here is embedded in the `sbctl` binary (`embed.go`) and written to `<state_dir>/system/edge-runtime/main` before the unit starts, so binary and main service always match. Apache-2.0; written from the Edge Runtime's public API and the self-hosted main service of `supabase/supabase` (`docker/volumes/functions/main/index.ts`) as references.
+The main service of Supavise's Edge Runtime: one Deno script that every request to `/functions/v1` enters, for every project on the node. The `supavise-edge-runtime` unit starts `edge-runtime start --main-service <dir>` with it (`internal/fleet/edgeruntime.go`). The TypeScript here is embedded in the `supavise` binary (`embed.go`) and written to `<state_dir>/system/edge-runtime/main` before the unit starts, so binary and main service always match. Apache-2.0; written from the Edge Runtime's public API and the self-hosted main service of `supabase/supabase` (`docker/volumes/functions/main/index.ts`) as references.
 
 ## What a request does
 
 ```
-client -> sbctl proxy -> 127.0.0.1:<edge_runtime>  (X-Sbctl-Project-Ref: <ref> and X-Sbctl-Proxy-Token, set by the proxy)
+client -> supavise proxy -> 127.0.0.1:<edge_runtime>  (X-Supavise-Project-Ref: <ref> and X-Supavise-Proxy-Token, set by the proxy)
                           main service (this directory)
-                            0. proxy secret = X-Sbctl-Proxy-Token (else 403)
-                            1. project  = X-Sbctl-Project-Ref (20 letters, else 400)
+                            0. proxy secret = X-Supavise-Proxy-Token (else 403)
+                            1. project  = X-Supavise-Project-Ref (20 letters, else 400)
                             2. function = first path segment (else 404 NOT_FOUND)
                             3. project env + function generation read from <root>/<ref>/
                             4. verify_jwt: HS256 token against this project's secret (else 401)
                             5. EdgeRuntime.userWorkers.create({... this project's env ...}).fetch(request)
 ```
 
-The proxy strips whatever `X-Sbctl-Project-Ref`, `X-Sbctl-Proxy-Token` and `sb-api-key` a client sent and sets its own (tested in `internal/proxy`, and end to end by `tests/functions/verify.mjs`). The runtime listens on loopback, which a function worker can reach too, so the project header alone proves nothing: the main service serves only requests that carry the node's proxy secret (`SBCTL_FUNCTIONS_PROXY_TOKEN`, compared in constant time; `internal/config/functions_token.go` makes it, `internal/fleet` puts it in the unit's environment file and `internal/proxy` sends it) and answers `403` to the rest, whatever name the caller used to reach the port. Workers never see it: their environment is built from the project's file only, and the main service removes both internal headers before the request reaches the function. `/_internal/health` needs no secret (the fleet probes it). A request with the secret and no valid project header is `400`.
+The proxy strips whatever `X-Supavise-Project-Ref`, `X-Supavise-Proxy-Token` and `sb-api-key` a client sent and sets its own (tested in `internal/proxy`, and end to end by `tests/functions/verify.mjs`). The runtime listens on loopback, which a function worker can reach too, so the project header alone proves nothing: the main service serves only requests that carry the node's proxy secret (`SUPAVISE_FUNCTIONS_PROXY_TOKEN`, compared in constant time; `internal/config/functions_token.go` makes it, `internal/fleet` puts it in the unit's environment file and `internal/proxy` sends it) and answers `403` to the rest, whatever name the caller used to reach the port. Workers never see it: their environment is built from the project's file only, and the main service removes both internal headers before the request reaches the function. `/_internal/health` needs no secret (the fleet probes it). A request with the secret and no valid project header is `400`.
 
 ## The files it reads
 
 Written by `internal/functions`, read here (`src/projects.ts`); change both together. The root is `<state_dir>/system/edge-runtime/tenants`, inside the runtime's own state directory: that is the one directory its systemd unit sees besides the artifacts, so the process that runs tenants' code does not see the projects' data directories, sockets or unit files.
 
 ```
-<SBCTL_FUNCTIONS_ROOT>/<ref>/functions-env.json       {"version":1,"jwt_secret","supabase":{SUPABASE_*},"secrets":{...}}
-<SBCTL_FUNCTIONS_ROOT>/<ref>/functions/<slug>          symlink to .gen/<slug>.<version>.<random>/
-    .sbctl-function.json                               {slug, version, verify_jwt, kind: "eszip", entrypoint, eszip, stamp, sha256}
+<SUPAVISE_FUNCTIONS_ROOT>/<ref>/functions-env.json       {"version":1,"jwt_secret","supabase":{SUPABASE_*},"secrets":{...}}
+<SUPAVISE_FUNCTIONS_ROOT>/<ref>/functions/<slug>          symlink to .gen/<slug>.<version>.<random>/
+    .supavise-function.json                               {slug, version, verify_jwt, kind: "eszip", entrypoint, eszip, stamp, sha256}
     bundle.eszip                                       the bundle `supabase functions deploy` built
 ```
 
-A request resolves the symlink once (`realPath`) and uses that generation's real paths from then on, so one request never mixes two deployments. A link that resolves outside the project's `functions` directory is never followed, a bundle name that leaves the generation is refused, and the metadata's `slug` must equal the requested one. **Only bundles (`kind: "eszip"`) are served**; a generation without that kind (written by an older sbctl) is `404`.
+A request resolves the symlink once (`realPath`) and uses that generation's real paths from then on, so one request never mixes two deployments. A link that resolves outside the project's `functions` directory is never followed, a bundle name that leaves the generation is refused, and the metadata's `slug` must equal the requested one. **Only bundles (`kind: "eszip"`) are served**; a generation without that kind (written by an older Supavise) is `404`.
 
 ## Per project, never shared
 
@@ -47,7 +47,7 @@ Edge Runtime v1.77.4, user workers, with `permissions` set as in `src/handler.ts
 
 - **Modules.** A function runs from its eszip only. A function that ran from source files (an upload of sources, which the node now bundles first) could import files outside its directory: the module loader follows relative specifiers, static and dynamic, and `allow_read: []` only blocks `Deno.readTextFile`, not module loading, so with the tenants tree on disk `import("../../../../<other ref>/functions-env.json", {with: {type: "json"}})` returned the other project's JWT secret, service_role key, database password and secrets, and `import "../../../../<other ref>/functions/hello/index.ts"` ran its code (measured with v1.77.4; `customModuleRoot` did not stop it). The module URLs inside an eszip are virtual, so absolute paths, file URLs and 14 levels of `../` toward the real tenants files all fail with a module error: `tests/functions/verify.mjs` (function `escape`) asserts it on macOS and on Linux. Remote imports, bundled at deploy time by the CLI, are inside the eszip too.
 - **Disk.** `Deno.readTextFile` of `/etc/hosts`, of another project's `functions-env.json` and of the function's own files all fail with `NotFound`: a worker sees its module graph, not the disk. `tests/functions/verify.mjs` asserts this on macOS and on Linux (CI). Its `Deno.env.get` also sees only the variables above.
-- **`/proc`, processes, and whether the runtime needs a uid of its own against its workers.** It does not. The bundler needed one because it is a separate process that opens paths an uploader names (a process may open `/proc/<pid>/root` and `/proc/<pid>/environ` of every process with its own uid, and that walks around a mount namespace). A user worker is an isolate inside the runtime process: its file system is its module graph plus its own `/tmp`, its `Deno.readDir('/proc')` is `PermissionDenied`, `/proc/self/environ`, `/proc/self/root/...` and `/proc/1/environ` are `NotFound`, and `Deno.Command` does not run a child (measured with v1.77.4 on macOS, asserted on Linux by `verify.mjs`, function `readfs`), so tenant code has no way to name a path under `/proc`, and no process of its own to name it from. What a different uid for the runtime would add is protection only after a V8 or runtime escape, and then the attacker is inside the one process that holds every project's `functions-env.json` in its heap (the main service reads them), so the boundary is lost with the escape whatever uid the runtime has. The runtime shares the `sbctl` uid with the other units like every other service (`deploy/systemd/README.md`, "Trust model"); one uid per project, and the runtime as its own, stays under "Future hardening" there.
+- **`/proc`, processes, and whether the runtime needs a uid of its own against its workers.** It does not. The bundler needed one because it is a separate process that opens paths an uploader names (a process may open `/proc/<pid>/root` and `/proc/<pid>/environ` of every process with its own uid, and that walks around a mount namespace). A user worker is an isolate inside the runtime process: its file system is its module graph plus its own `/tmp`, its `Deno.readDir('/proc')` is `PermissionDenied`, `/proc/self/environ`, `/proc/self/root/...` and `/proc/1/environ` are `NotFound`, and `Deno.Command` does not run a child (measured with v1.77.4 on macOS, asserted on Linux by `verify.mjs`, function `readfs`), so tenant code has no way to name a path under `/proc`, and no process of its own to name it from. What a different uid for the runtime would add is protection only after a V8 or runtime escape, and then the attacker is inside the one process that holds every project's `functions-env.json` in its heap (the main service reads them), so the boundary is lost with the escape whatever uid the runtime has. The runtime shares the `supavise` uid with the other units like every other service (`deploy/systemd/README.md`, "Trust model"); one uid per project, and the runtime as its own, stays under "Future hardening" there.
 - **Disk quota of `/tmp`.** A worker's `/tmp` is its one writable place, and the runtime backs it with real files on the node's disk, which holds every project's database and WAL (measured: a worker wrote 40 MiB with no limit). Every worker therefore gets `tmpFsConfig: { quota }` from `[functions] tmp_quota_mb` (default 64; the quota is in bytes in the runtime, `crates/fs/impl/tmp_fs.rs`). A write past it throws `filesystem quota exceeded` inside that function; the other functions, the other projects and the runtime are not affected (`verify.mjs`, function `tmpwrite`, and a local run against the real runtime). At most `max_workers x tmp_quota_mb` is in use at once (1 GiB by default): the config does not check it against the free space of the disk, so a node with a small disk lowers one of the two.
 
 - **`Deno.realPathSync('/tmp')` tells a worker where its `/tmp` is.** It answers with the real directory behind the worker's `/tmp`, a private directory the runtime created for that worker (`.tmpXXXXXX` in the runtime's temp directory; with the unit's `PrivateTmp=yes` that is `/tmp/.tmpXXXXXX` inside the unit's own `/tmp`). That says little (a random directory name, no path of the node's state), and every other path outside the module graph is `NotSupported` in `realPathSync` (measured with v1.77.4: `/`, `/etc/hosts`, `/var`, `/private/tmp`; `makeTempDirSync` and `statSync('/tmp')` are `PermissionDenied`). It is accepted as it is, and `tests/functions/verify.mjs` (function `readfs`, key `realTmp`) fails when a runtime upgrade makes the answer anything but a `.tmpXXXXXX` directory outside the node's state directory, the project refs and the tenants tree.
@@ -59,14 +59,14 @@ Edge Runtime v1.77.4, user workers, with `permissions` set as in `src/handler.ts
 
 ## Fairness between projects, and the memory budget
 
-One runtime serves every project, and the unit's `MemoryMax` is shared by all of its workers: a runtime that reaches its cgroup limit is killed whole, for every project. edge-runtime's `--max-parallelism` does **not** bound that. In v1.77.4 it is the size of a semaphore that each worker pool key gets for itself (`crates/base/src/worker/pool.rs`: `ActiveWorkerRegistry::new(max_parallelism)` per `worker_pool_key`), and sbctl's pool key is `<ref>:<slug>:<version>:<generation>:<env stamp>`, so the number of projects, functions and generations is the only thing that limits the workers. `--max-parallelism` is therefore set per function (`[functions] max_parallelism`, default 1: the `per_worker` policy sends every request of a function to its one worker, so more than one exists only for a moment during a cold burst), and the budget is enforced here, in `src/limiter.ts`, before a worker is touched:
+One runtime serves every project, and the unit's `MemoryMax` is shared by all of its workers: a runtime that reaches its cgroup limit is killed whole, for every project. edge-runtime's `--max-parallelism` does **not** bound that. In v1.77.4 it is the size of a semaphore that each worker pool key gets for itself (`crates/base/src/worker/pool.rs`: `ActiveWorkerRegistry::new(max_parallelism)` per `worker_pool_key`), and Supavise's pool key is `<ref>:<slug>:<version>:<generation>:<env stamp>`, so the number of projects, functions and generations is the only thing that limits the workers. `--max-parallelism` is therefore set per function (`[functions] max_parallelism`, default 1: the `per_worker` policy sends every request of a function to its one worker, so more than one exists only for a moment during a cold burst), and the budget is enforced here, in `src/limiter.ts`, before a worker is touched:
 
 | Budget | Setting | Default | Over it |
 |---|---|---|---|
 | live workers of the whole runtime, all projects | `max_workers` (or derived from `memory_max`) | 16 | `503 PROJECT_AT_CAPACITY`, "the runtime is running as many functions as it can" |
 | live workers of one project | `max_workers_per_project` | half of `max_workers` | `503 PROJECT_AT_CAPACITY` |
 | requests of one project in flight | `max_per_project` | 128 | `503 PROJECT_AT_CAPACITY` |
-| bundle bytes of one project's functions in flight | `SBCTL_FUNCTIONS_MAX_BUNDLE_MB` | 192 | `503 PROJECT_AT_CAPACITY` |
+| bundle bytes of one project's functions in flight | `SUPAVISE_FUNCTIONS_MAX_BUNDLE_MB` | 192 | `503 PROJECT_AT_CAPACITY` |
 
 A pool key counts as live while it has a request in flight and for the worker idle time after the last one (the runtime retires the worker then), so a redeployment, or new secrets, count as an extra worker until the old one idles out. **A request is in flight until its response body has ended**, not until the headers are back (`src/body.ts`): a function that streams (server-sent events, token streams) keeps its worker busy for as long as the stream runs, up to the wall clock, so the body is wrapped and the place in the budgets is given back when it completes, fails (the worker was retired) or is cancelled (the client left). A response without a body (HEAD, 204, a WebSocket upgrade, whose socket the main service does not see) releases at once. (A property of the runtime that streams make visible: with `--max-parallelism 1` the creation of a worker for a function that has none is serialized, so concurrent first requests to a function whose first request is long wait for it, and fail with `503 BOOT_ERROR` after the idle timeout ("worker did not respond in time"); once the worker is warm, requests run concurrently. Measured with v1.77.4. Not changed here.) A consumer that neither reads nor cancels is let go at the worker's wall clock plus 5 s, when the runtime has retired the worker anyway. The unit's `MemoryMax` is derived from the same numbers (`internal/config/functions.go`): `max_workers x (memory_mb + 32 MB isolate overhead) x max_parallelism + 256 MB` for the runtime itself, 4864M by default, and config validation refuses a `memory_max` that cannot hold `max_workers` workers (with `max_workers` unset, `memory_max` decides how many fit). A request over a request cap is a cap, not a scheduler: many projects together can use the whole worker budget, and the ones that come later get `503` until a worker idles out; raise `max_workers` (and the memory) on a node with many functions. A worker serves many requests at once, so `max_per_project` is generous and is not what protects memory. `src/limiter_test.ts` and `src/handler_test.ts` ("many projects each warming many functions never exceed the budget", "the runtime-wide worker budget holds across projects") check the budget with several projects and memory-hungry functions, and `tests/linux/functions-smoke.sh` restarts the real unit with `max_workers = 4` and asserts the 503s, the unit's `MemoryMax` of 1408 MiB, and that nothing restarted. `tests/functions/verify.mjs` also floods project A with parallel runaway and memory-hungry calls and asserts that B answers within 3 s and that A's excess is refused fast.
 
@@ -97,19 +97,19 @@ The unit passes them in the environment (`internal/fleet/edgeruntime.go`); defau
 
 | Variable | `[functions]` key | Default |
 |---|---|---|
-| `SBCTL_FUNCTIONS_ROOT` | none (`<state_dir>/system/edge-runtime/tenants`) | `/var/lib/sbctl/system/edge-runtime/tenants` |
-| `SBCTL_FUNCTIONS_MEMORY_MB` | `memory_mb` | 256 |
-| `SBCTL_FUNCTIONS_WALL_CLOCK_SEC` | `wall_clock_seconds` | 400 |
-| `SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC` | `idle_timeout_seconds` (also passed as `--user-worker-request-idle-timeout`) | 150 |
-| `SBCTL_FUNCTIONS_CPU_SOFT_MS`, `_CPU_HARD_MS` | `cpu_soft_ms`, `cpu_hard_ms` (negative: off) | 1000, 2000 |
-| `SBCTL_FUNCTIONS_TMP_QUOTA_MB` | `tmp_quota_mb` (negative: off; the variable takes 0 for off) | 64 |
-| `SBCTL_FUNCTIONS_WORKER_IDLE_SEC` | none | 60 |
-| `SBCTL_FUNCTIONS_PROXY_TOKEN` | none (`<state_dir>/system/edge-runtime.token`) | none: the service **refuses to start** without it (sbctl always sets it), unless `SBCTL_FUNCTIONS_ALLOW_NO_PROXY_TOKEN=1`, the development flag that lets it run and answer every caller |
-| `SBCTL_FUNCTIONS_MAX_PER_PROJECT` | `max_per_project` (negative: off) | 128 |
-| `SBCTL_FUNCTIONS_MAX_WORKERS` | `max_workers` (negative: off) | 16 |
-| `SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT` | `max_workers_per_project` | 8 |
-| `SBCTL_FUNCTIONS_MAX_BUNDLE_MB` | none | 192 |
-| `SBCTL_FUNCTIONS_WORKER_COST_MB` | none (informational: what one function counts against the budget) | `max_parallelism x (memory_mb + 32)` |
+| `SUPAVISE_FUNCTIONS_ROOT` | none (`<state_dir>/system/edge-runtime/tenants`) | `/var/lib/supavise/system/edge-runtime/tenants` |
+| `SUPAVISE_FUNCTIONS_MEMORY_MB` | `memory_mb` | 256 |
+| `SUPAVISE_FUNCTIONS_WALL_CLOCK_SEC` | `wall_clock_seconds` | 400 |
+| `SUPAVISE_FUNCTIONS_IDLE_TIMEOUT_SEC` | `idle_timeout_seconds` (also passed as `--user-worker-request-idle-timeout`) | 150 |
+| `SUPAVISE_FUNCTIONS_CPU_SOFT_MS`, `_CPU_HARD_MS` | `cpu_soft_ms`, `cpu_hard_ms` (negative: off) | 1000, 2000 |
+| `SUPAVISE_FUNCTIONS_TMP_QUOTA_MB` | `tmp_quota_mb` (negative: off; the variable takes 0 for off) | 64 |
+| `SUPAVISE_FUNCTIONS_WORKER_IDLE_SEC` | none | 60 |
+| `SUPAVISE_FUNCTIONS_PROXY_TOKEN` | none (`<state_dir>/system/edge-runtime.token`) | none: the service **refuses to start** without it (Supavise always sets it), unless `SUPAVISE_FUNCTIONS_ALLOW_NO_PROXY_TOKEN=1`, the development flag that lets it run and answer every caller |
+| `SUPAVISE_FUNCTIONS_MAX_PER_PROJECT` | `max_per_project` (negative: off) | 128 |
+| `SUPAVISE_FUNCTIONS_MAX_WORKERS` | `max_workers` (negative: off) | 16 |
+| `SUPAVISE_FUNCTIONS_MAX_WORKERS_PER_PROJECT` | `max_workers_per_project` | 8 |
+| `SUPAVISE_FUNCTIONS_MAX_BUNDLE_MB` | none | 192 |
+| `SUPAVISE_FUNCTIONS_WORKER_COST_MB` | none (informational: what one function counts against the budget) | `max_parallelism x (memory_mb + 32)` |
 | `--max-parallelism` | `max_parallelism` (workers one function may have) | 1 |
 | `EDGE_RUNTIME_PORT` | `[ports] edge_runtime` | 9000 |
 
@@ -125,8 +125,8 @@ go test ./functions-main ./internal/fleet                                 # the 
 
 ## Not done
 
-- Per-project logs: a function's `console.log` goes to the runtime's log without a project tag. An event worker (`--event-worker`) could tag lines with the project of the worker's `servicePath` and write `<ref>/functions.log`; `sbctl functions logs <ref>` would then select it.
+- Per-project logs: a function's `console.log` goes to the runtime's log without a project tag. An event worker (`--event-worker`) could tag lines with the project of the worker's `servicePath` and write `<ref>/functions.log`; `supavise functions logs <ref>` would then select it.
 - Asymmetric JWTs (`ES256`, `RS256`, JWKS): not needed while projects sign with HS256.
-- Per-project `DENO_DIR`: decided against for v1 (see "Per project, never shared"). Only eszip bundles run, and their modules are inside the bundle, so workers use the cache for nothing but public remote modules the runtime itself fetches. The one place a cache matters is the bundler of uploaded sources, which keeps its own (`sb-edge-bundle@<ref>.service`, see `internal/functions/README.md`).
+- Per-project `DENO_DIR`: decided against for v1 (see "Per project, never shared"). Only eszip bundles run, and their modules are inside the bundle, so workers use the cache for nothing but public remote modules the runtime itself fetches. The one place a cache matters is the bundler of uploaded sources, which keeps its own (`supavise-edge-bundle@<ref>.service`, see `internal/functions/README.md`).
 - `supabase functions download` of a function that was uploaded already bundled (the CLI's Docker flow): the stored upload is a compressed eszip, not sources. Functions uploaded as sources (`--use-api`, Studio) keep their sources and download as such.
-- Request bodies to functions are not limited by sbctl (the 64 MiB limit is on deployments).
+- Request bodies to functions are not limited by Supavise (the 64 MiB limit is on deployments).

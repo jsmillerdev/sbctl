@@ -1,5 +1,5 @@
 From af35e1fd8ee34d7052d7decda1db2bb4dffbd520 Mon Sep 17 00:00:00 2001
-From: sbctl <sbctl@users.noreply.invalid>
+From: supavise <supavise@users.noreply.invalid>
 Date: Tue, 6 Oct 2026 11:25:27 -0700
 Subject: [PATCH 3/3] feat(studio): allow extra project hosts in the platform
  CSP

@@ -21,7 +21,7 @@
 # libraries are missing (playwright install --with-deps).
 #
 # Environment (all optional):
-#   SPIKE_STUDIO_ARCHIVE   sbctl-studio-*.tar.zst to test (default: the newest in studio/dist)
+#   SPIKE_STUDIO_ARCHIVE   supavise-studio-*.tar.zst to test (default: the newest in studio/dist)
 #   SPIKE_DIR              working directory (default studio/.build-cache/spike)
 #   SPIKE_OUT              results directory (default $SPIKE_DIR/out)
 #   SPIKE_PORT_BASE        ports are base+1..base+6 (default 31000)
@@ -127,7 +127,7 @@ log "artifacts ($PLATFORM)"
 PGDIR="$(fetch_artifact POSTGRES "$(tag_of postgres)")"
 AUTHDIR="$(fetch_artifact AUTH "$(tag_of auth)")"
 METADIR="$(fetch_artifact PGMETA "$(tag_of pgmeta)")"
-STUDIO_ARCHIVE="${SPIKE_STUDIO_ARCHIVE:-$(ls -t "$HERE"/dist/sbctl-studio-*-"$PLATFORM".tar.zst 2>/dev/null | head -n 1 || true)}"
+STUDIO_ARCHIVE="${SPIKE_STUDIO_ARCHIVE:-$(ls -t "$HERE"/dist/supavise-studio-*-"$PLATFORM".tar.zst 2>/dev/null | head -n 1 || true)}"
 [[ -f "$STUDIO_ARCHIVE" ]] || die "no Studio archive (set SPIKE_STUDIO_ARCHIVE or run studio/build.sh $PLATFORM first)"
 STUDIO_DIR="$SPIKE_DIR/studio-run"
 rm -rf "$STUDIO_DIR"; mkdir -p "$STUDIO_DIR"

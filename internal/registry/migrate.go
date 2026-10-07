@@ -27,9 +27,9 @@ func Migrations() ([]string, error) {
 	return names, nil
 }
 
-// Migrate creates schema sbctl if needed and applies every embedded migration not yet
-// recorded in sbctl.schema_migrations, each in its own transaction. The pool must be
-// connected to the "sbctl" database as its owner.
+// Migrate creates schema supavise if needed and applies every embedded migration not yet
+// recorded in supavise.schema_migrations, each in its own transaction. The pool must be
+// connected to the "supavise" database as its owner.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error { return migrate(ctx, pool, "") }
 
 // migrate is Migrate that stops before the migration named stopBefore ("" applies all);
@@ -46,8 +46,8 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, stopBefore string) error {
 	defer conn.Exec(context.Background(), `select pg_advisory_unlock($1)`, migrationLockID) //nolint:errcheck
 
 	if _, err := conn.Exec(ctx, `
-		create schema if not exists sbctl;
-		create table if not exists sbctl.schema_migrations (
+		create schema if not exists supavise;
+		create table if not exists supavise.schema_migrations (
 			version    text primary key,
 			applied_at timestamptz not null default now()
 		)`); err != nil {
@@ -62,7 +62,7 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, stopBefore string) error {
 			break
 		}
 		var done bool
-		if err := conn.QueryRow(ctx, `select exists (select 1 from sbctl.schema_migrations where version = $1)`, name).Scan(&done); err != nil {
+		if err := conn.QueryRow(ctx, `select exists (select 1 from supavise.schema_migrations where version = $1)`, name).Scan(&done); err != nil {
 			return err
 		}
 		if done {
@@ -76,7 +76,7 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, stopBefore string) error {
 			if _, err := tx.Exec(ctx, string(body)); err != nil {
 				return err
 			}
-			_, err := tx.Exec(ctx, `insert into sbctl.schema_migrations (version) values ($1)`, name)
+			_, err := tx.Exec(ctx, `insert into supavise.schema_migrations (version) values ($1)`, name)
 			return err
 		}); err != nil {
 			return fmt.Errorf("registry: migration %s: %w", name, err)

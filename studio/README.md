@@ -1,13 +1,13 @@
 # studio
 
-Platform-mode Studio for `sbctl`: a build of upstream Studio with `NEXT_PUBLIC_IS_PLATFORM=true` and three small patches, packaged like the slim-services `studio` artifact so the systemd unit does not change. Also the mock Management API and the browser spike that tested it, and the endpoint list Workstream B builds against (`research/08-studio-platform-calls.md`).
+Platform-mode Studio for `supavise`: a build of upstream Studio with `NEXT_PUBLIC_IS_PLATFORM=true` and three small patches, packaged like the slim-services `studio` artifact so the systemd unit does not change. Also the mock Management API and the browser spike that tested it, and the endpoint list Workstream B builds against (`research/08-studio-platform-calls.md`).
 
 | Path | What |
 |---|---|
 | `patches/` | The three patches, one `git format-patch` file each, made against `supabase/supabase@94b8b06eb294cf6b217c68d30357566cc8f146d9` (`versions.yaml` `studio.tag`). |
-| `build.sh <platform>` | Fetch, patch, install, build, package, verify. Writes `dist/sbctl-studio-<tag>-p<N>-<platform>.tar.zst` and a line in `dist/SHA256SUMS`. |
+| `build.sh <platform>` | Fetch, patch, install, build, package, verify. Writes `dist/supavise-studio-<tag>-p<N>-<platform>.tar.zst` and a line in `dist/SHA256SUMS`. |
 | `Dockerfile.build` | The same build in a clean Ubuntu 24.04 image (`docker buildx build --target artifact --output type=local,dest=studio/dist`). |
-| `ci-prepare.sh` | For a GitHub-hosted runner (needs `SBCTL_CI=1` or `GITHUB_ACTIONS` in the environment, which `sudo` drops: `sudo env SBCTL_CI=1 studio/ci-prepare.sh`): frees disk, adds 6 GB swap, installs zstd, curl, git, python3 and build-essential when missing. |
+| `ci-prepare.sh` | For a GitHub-hosted runner (needs `SUPAVISE_CI=1` or `GITHUB_ACTIONS` in the environment, which `sudo` drops: `sudo env SUPAVISE_CI=1 studio/ci-prepare.sh`): frees disk, adds 6 GB swap, installs zstd, curl, git, python3 and build-essential when missing. |
 | `verify.sh` | Starts a packaged build on a loopback port and checks it (also run by `build.sh` before it writes the artifact). |
 | `runtime/` | What goes into the artifact: launcher, entrypoint, runtime substitution and its tests. |
 | `placeholders.json` | The per-install values baked into the build as placeholders. |
@@ -24,8 +24,8 @@ bin/studio              POSIX sh launcher; sources bin/.runtime-env.sh; cd app/;
 bin/.runtime-env.sh     NODE_OPTIONS default (--max-old-space-size=384), NEXT_TELEMETRY_DISABLED=1; a set variable wins
 node/bin/node           Node 22.23.3 from nodejs.org (checksum pinned in build.sh)
 app/                    Next standalone output (apps/studio/server.js, .next, node_modules/.pnpm), plus .next/static and public/
-share/licenses/         Studio (Apache-2.0), Node, sbctl
-share/sbctl/            build-info.json, runtime-config.json (placeholders and the list of files that carry them), the patches
+share/licenses/         Studio (Apache-2.0), Node, supavise
+share/supavise/            build-info.json, runtime-config.json (placeholders and the list of files that carry them), the patches
 ```
 
 The upstream dotenv file is not shipped; configuration is environment only, as in the slim artifact's `bin/studio`.
@@ -41,13 +41,13 @@ The upstream dotenv file is not shipped; configuration is environment only, as i
 | `NEXT_PUBLIC_HCAPTCHA_SITE_KEY` | no | Empty by default: no captcha widget (patch 0001). Maps from `[studio] hcaptcha_site_key`. |
 | `NEXT_PUBLIC_DISABLED_FEATURES` | no | Comma-separated feature keys hidden before login. Default hides sign-up, GitHub, ChatGPT and SSO sign-in, the testimonial and the terms text (patch 0002). |
 | `CSP_EXTRA_PROJECT_HOSTS` | no | Host sources serving project APIs, e.g. `*.api.example.com` (patch 0003); each is allowed over `https` and `wss`. |
-| `SBCTL_STUDIO_SKIP_RUNTIME_CONFIG=1` | no | Start without substitution (debugging). |
+| `SUPAVISE_STUDIO_SKIP_RUNTIME_CONFIG=1` | no | Start without substitution (debugging). |
 
 A missing required value or an unsafe one exits with status 78 and a message naming it. Values may only contain `A-Za-z0-9._~:/@%+,*=-`, so they cannot break out of a JS string, a JSON string or an HTML attribute.
 
 ### How the substitution works
 
-Next inlines `NEXT_PUBLIC_*` and evaluates the CSP at build time, so `build.sh` builds with unique placeholder strings (`https://sbctl-placeholder-api.invalid/platform`, ...). At packaging time `runtime/sbctl-runtime-config.mjs prepare` finds every file that contains one (about 280 files, 7 MB: client and server chunks, prerendered HTML, `routes-manifest.json` with the CSP), keeps a pristine copy as `<file>.sbctl-tpl` and fails the build if a placeholder did not survive the bundler. At every start the entrypoint rewrites those files from the `.sbctl-tpl` copies, in one regex pass, with a temp file and a rename per file. It never reads its own output, so starting again with other values works. The API and GoTrue placeholders carry a marker path so the bare origin used in the CSP is replaced by the bare origin of the real URL (a CSP source with a path only matches that exact path).
+Next inlines `NEXT_PUBLIC_*` and evaluates the CSP at build time, so `build.sh` builds with unique placeholder strings (`https://supavise-placeholder-api.invalid/platform`, ...). At packaging time `runtime/supavise-runtime-config.mjs prepare` finds every file that contains one (about 280 files, 7 MB: client and server chunks, prerendered HTML, `routes-manifest.json` with the CSP), keeps a pristine copy as `<file>.supavise-tpl` and fails the build if a placeholder did not survive the bundler. At every start the entrypoint rewrites those files from the `.supavise-tpl` copies, in one regex pass, with a temp file and a rename per file. It never reads its own output, so starting again with other values works. The API and GoTrue placeholders carry a marker path so the bare origin used in the CSP is replaced by the bare origin of the real URL (a CSP source with a path only matches that exact path).
 
 **Requirement for unit D:** the artifact directory (`app/`) must be writable by the service user at start, for example `ReadWritePaths=` on the artifact directory under `ProtectSystem=strict`. Next also writes `app/apps/studio/.next/cache` at runtime (image cache).
 
@@ -57,7 +57,7 @@ Next inlines `NEXT_PUBLIC_*` and evaluates the CSP at build time, so `build.sh` 
 
 ### Studio's own routes the proxy answers
 
-Studio asks its own `/api/incident-banner` route for incident.io banners on every page. Without an incident.io key it answers 500, react-query retries it after 1, 4 and 16 s, and the sign-in form awaits that query, so the redirect after sign-in took 22 s in the spike (research/08 section 9). The artifact is not changed for this: sbctl's proxy answers `GET studio.<domain>/api/incident-banner` itself with `{"incidents":[]}` (`internal/proxy`), so Studio keeps exactly the three patches. Running the artifact without the proxy (`verify.sh`) shows the 500; the spike's browser script answers the route itself for the same reason.
+Studio asks its own `/api/incident-banner` route for incident.io banners on every page. Without an incident.io key it answers 500, react-query retries it after 1, 4 and 16 s, and the sign-in form awaits that query, so the redirect after sign-in took 22 s in the spike (research/08 section 9). The artifact is not changed for this: Supavise's proxy answers `GET studio.<domain>/api/incident-banner` itself with `{"incidents":[]}` (`internal/proxy`), so Studio keeps exactly the three patches. Running the artifact without the proxy (`verify.sh`) shows the 500; the spike's browser script answers the route itself for the same reason.
 
 The proxy also rewrites the Content-Security-Policy that Studio sends so that the browser cannot reach `usercentrics.eu`, the consent-banner vendor Studio calls on every page load (`internal/proxy`, `studio.go`).
 
@@ -66,7 +66,7 @@ The proxy also rewrites the Content-Security-Policy that Studio sends so that th
 Applied with `git am --3way` onto a fresh sparse checkout of the pinned commit: all three apply cleanly. The new tests (`csp.test.ts`, `enabled-features/index.test.ts`, 7 cases) pass with vitest 5 in a scratch directory (Studio's full vitest setup was not installed).
 
 - **0001 hCaptcha only with a site key.** Covers the sign-in path (`SignInForm`, `ForgotPasswordWizard`) and the other pages that mount the widget with the build-time key (`SignInSSOForm`, `SignUpForm`, `ChangeEmailAddress`, `/new`), through a module-level `HCAPTCHA_SITE_KEY` that each page checks before rendering the widget. Seen working: with an empty key the sign-in page renders no widget and sign-in succeeds (spike, with the first two forms patched; the other four use the same guard and were checked by applying the patch, not by running them). Not touched: the four billing dialogs (`CreditCodeRedemption`, `CreditTopUp`, `PaymentMethodSelection`, `AddNewPaymentMethodModal`), which need Stripe and are not reachable without billing. The patch-set number (`PATCHSET`) went from 1 to 2 with this change.
-- **0002 feature flags through `NEXT_PUBLIC_DISABLED_FEATURES`.** Upstream resolves `dashboard_auth:*` through `useIsFeatureEnabled`, which layers `profile.disabled_features` (unavailable before login) and the `ENABLED_FEATURES_*` override (a no-op when `IS_PLATFORM` is true) on the static JSON. The patch merges a build-time list into the static set, so it covers the six `dashboard_auth:*` flags before login. The bundle contains the placeholder (checked in the built chunks) and the launcher substitutes it. Seen working in the spike: the sign-in page shows e-mail sign-in only, no sign-up link, no GitHub or SSO button, no testimonial, no terms text. The SSO button is the one flag a node turns on at run time: while the dashboard has a SAML identity provider (workstream L, `sbctl sso add`), `internal/fleet` starts Studio with the default list minus `dashboard_auth:sign_in_with_sso`, and starts it again when the first provider is added or the last one removed (no new patch; the list is read at start, which is why).
+- **0002 feature flags through `NEXT_PUBLIC_DISABLED_FEATURES`.** Upstream resolves `dashboard_auth:*` through `useIsFeatureEnabled`, which layers `profile.disabled_features` (unavailable before login) and the `ENABLED_FEATURES_*` override (a no-op when `IS_PLATFORM` is true) on the static JSON. The patch merges a build-time list into the static set, so it covers the six `dashboard_auth:*` flags before login. The bundle contains the placeholder (checked in the built chunks) and the launcher substitutes it. Seen working in the spike: the sign-in page shows e-mail sign-in only, no sign-up link, no GitHub or SSO button, no testimonial, no terms text. The SSO button is the one flag a node turns on at run time: while the dashboard has a SAML identity provider (workstream L, `supavise sso add`), `internal/fleet` starts Studio with the default list minus `dashboard_auth:sign_in_with_sso`, and starts it again when the first provider is added or the last one removed (no new patch; the list is read at start, which is why).
 - **0003 extra project hosts in the platform CSP.** `CSP_EXTRA_PROJECT_HOSTS`, hosts validated against a strict pattern. It is read when `next.config.ts` computes the headers, which is build time, hence the placeholder. `verify.sh` checks that the substituted CSP contains the hosts over `https` and `wss`, the bare API origin, and no placeholder.
 
 ## Build on CI

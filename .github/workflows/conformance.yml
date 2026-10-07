@@ -47,21 +47,21 @@ jobs:
         run: |
           npm install --prefix /tmp/sbcli "supabase@$SUPABASE_CLI_VERSION"
           /tmp/sbcli/node_modules/.bin/supabase --version
-      - name: build sbctl
-        run: CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/sbctl ./cmd/sbctl
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
       - name: conformance suites
-        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/sbctl-conformance-logs SBCTL_BIN=/tmp/sbctl SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase tests/conformance/run.sh
+        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-conformance-logs SUPAVISE_BIN=/tmp/supavise SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase tests/conformance/run.sh
       - if: always()
         name: summary
-        run: cat /tmp/sbctl-conformance-logs/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+        run: cat /tmp/supavise-conformance-logs/summary.md >> "$GITHUB_STEP_SUMMARY" || true
       - if: always()
         name: collect logs
-        run: sudo chmod -R a+rX /tmp/sbctl-conformance-logs || true
+        run: sudo chmod -R a+rX /tmp/supavise-conformance-logs || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: conformance-${{ matrix.arch }}
-          path: /tmp/sbctl-conformance-logs
+          path: /tmp/supavise-conformance-logs
           if-no-files-found: ignore
 
   # Fails with a readable list when the Management API specs we generate from have moved. It

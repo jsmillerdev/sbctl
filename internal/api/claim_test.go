@@ -20,13 +20,13 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
-// fakeGoTrue is the part of sb-gotrue@system's admin API the claim flow calls.
+// fakeGoTrue is the part of supavise-gotrue@system's admin API the claim flow calls.
 type fakeGoTrue struct {
 	*httptest.Server
 	mu      sync.Mutex
@@ -631,9 +631,9 @@ func TestMemoryClaimStore(t *testing.T) {
 
 // TestPGClaimStore runs the same checks against a real database (CI provides one).
 func TestPGClaimStore(t *testing.T) {
-	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	r, err := registry.Open(ctx, dsn)
@@ -644,7 +644,7 @@ func TestPGClaimStore(t *testing.T) {
 	if err := registry.Migrate(ctx, r.Pool()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Pool().Exec(ctx, `truncate sbctl.claim_tokens`); err != nil {
+	if _, err := r.Pool().Exec(ctx, `truncate supavise.claim_tokens`); err != nil {
 		t.Fatal(err)
 	}
 	// Bound tokens reference real invitations.
@@ -837,7 +837,7 @@ func TestRemoveUserDeletesTokensBeforeTheAccount(t *testing.T) {
 	}
 }
 
-// `sbctl users remove` must end the user's access at once: the GoTrue access token the
+// `supavise users remove` must end the user's access at once: the GoTrue access token the
 // user holds keeps verifying until it expires, and a personal access token is never
 // checked against its owner's account.
 func TestRemovedUserIsRefusedImmediately(t *testing.T) {
@@ -926,7 +926,7 @@ func TestRemoveUserFailedGoTrueDeleteStillRevokes(t *testing.T) {
 	}
 }
 
-// signSession signs a dashboard session the way sb-gotrue@system does.
+// signSession signs a dashboard session the way supavise-gotrue@system does.
 func signSession(t *testing.T, secret, sub, email string) string {
 	t.Helper()
 	s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{

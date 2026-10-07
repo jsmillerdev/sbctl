@@ -9,10 +9,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // tenantTimeout is the HTTP timeout of one tenant call. Creating a Realtime or Storage
@@ -136,7 +136,7 @@ func LoadTenantSpec(ctx context.Context, d Deps, ref string) (TenantSpec, error)
 		return TenantSpec{}, fmt.Errorf("fleet: project %s has no stored credentials", ref)
 	}
 	spec := TenantSpecFor(d.Cfg, p, k)
-	// The saved Storage and Realtime settings belong to the tenant: `sbctl fleet
+	// The saved Storage and Realtime settings belong to the tenant: `supavise fleet
 	// ensure-tenant` must not send the defaults over them.
 	if pg, ok := d.Registry.(interface{ Pool() *pgxpool.Pool }); ok && ref != config.SystemRef {
 		m := projectconfig.NewManager(projectconfig.NewPGStore(pg.Pool()), d.Secrets, projectconfig.Options{})

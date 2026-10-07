@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Edge Functions end to end, against a node that is already up: the Management API and the
-# proxy reachable at $API_URL, sb-edge-runtime running, and two projects. It deploys the
+# proxy reachable at $API_URL, supavise-edge-runtime running, and two projects. It deploys the
 # fixtures in tests/functions/fixtures, sets secrets with `supabase secrets set`, calls the
 # functions with supabase-js and fetch (verify.mjs), redeploys, deletes, and checks the files on
 # disk. Project A's functions are bundled on the machine that runs this script and uploaded as
 # bundles; project B's are uploaded as sources with `supabase functions deploy --use-api`, which
-# the node bundles itself (in the sandbox of sb-edge-bundle@<ref>.service on Linux).
+# the node bundles itself (in the sandbox of supavise-edge-bundle@<ref>.service on Linux).
 #
 # How project A is bundled (DEPLOY_VIA):
 #   cli       `supabase functions deploy`, the default flow of the CLI. It bundles in a Docker
@@ -16,15 +16,15 @@
 #             query and Content-Type the CLI uses. No Docker. The macOS default.
 #
 # Environment (all required unless a default is shown):
-#   SBCTL_RUN       how to run sbctl, for example "/usr/local/bin/sbctl" or
-#                   "sudo -u sbctl -H /usr/local/bin/sbctl" (config comes with it)
-#   AS_SBCTL        prefix for commands that read the node's files, "" when the caller
-#                   owns them, "sudo -u sbctl" when sbctl does
+#   SUPAVISE_RUN       how to run supavise, for example "/usr/local/bin/supavise" or
+#                   "sudo -u supavise -H /usr/local/bin/supavise" (config comes with it)
+#   AS_SUPAVISE        prefix for commands that read the node's files, "" when the caller
+#                   owns them, "sudo -u supavise" when supavise does
 #   API_URL         Management API origin, e.g. http://api.127.0.0.1.sslip.io:40080
 #   PAT_FILE        file with a personal access token for the API
 #   PROJECT_URL     project origin with {ref}, e.g. http://{ref}.api.127.0.0.1.sslip.io:40080
 #   REF_A, REF_B    the two projects
-#   STATE_DIR       the node's state directory (default /var/lib/sbctl)
+#   STATE_DIR       the node's state directory (default /var/lib/supavise)
 #   RUNTIME_URL     optional: http://127.0.0.1:<edge runtime port>, checked directly
 #   WORK            scratch directory (default: a new temporary one)
 #   NODE_DIR        directory with @supabase/supabase-js installed (default: $WORK/node,
@@ -50,22 +50,22 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-: "${SBCTL_RUN:?}" "${API_URL:?}" "${PAT_FILE:?}" "${PROJECT_URL:?}" "${REF_A:?}" "${REF_B:?}"
-AS_SBCTL=${AS_SBCTL:-}
-STATE_DIR=${STATE_DIR:-/var/lib/sbctl}
+: "${SUPAVISE_RUN:?}" "${API_URL:?}" "${PAT_FILE:?}" "${PROJECT_URL:?}" "${REF_A:?}" "${REF_B:?}"
+AS_SUPAVISE=${AS_SUPAVISE:-}
+STATE_DIR=${STATE_DIR:-/var/lib/supavise}
 if [[ -z ${DEPLOY_VIA:-} ]]; then
   if [[ $(uname -s) == Darwin ]]; then DEPLOY_VIA=artifact; else DEPLOY_VIA=cli; fi
 fi
 SANDBOXED_BUNDLER=${SANDBOXED_BUNDLER:-0}
 PROXY_TOKEN_FILE=${PROXY_TOKEN_FILE:-$STATE_DIR/system/edge-runtime.token}
-WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/sbctl-functions-XXXXXX")}
+WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/supavise-functions-XXXXXX")}
 NODE_DIR=${NODE_DIR:-$WORK/node}
 SUPABASE_JS=2.117.2
 
 log()  { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 fail() { log "FAIL: $*"; exit 1; }
-sbctl() { $SBCTL_RUN "$@"; }
-asnode() { if [[ -n $AS_SBCTL ]]; then $AS_SBCTL "$@"; else "$@"; fi; }
+supavise() { $SUPAVISE_RUN "$@"; }
+asnode() { if [[ -n $AS_SUPAVISE ]]; then $AS_SUPAVISE "$@"; else "$@"; fi; }
 jget() { python3 -c 'import json,sys; d=json.load(sys.stdin); print('"$1"')'; }
 
 mkdir -p "$WORK"
@@ -76,7 +76,7 @@ export SUPABASE_ACCESS_TOKEN=$PAT SUPABASE_NO_KEYRING=1 DO_NOT_TRACK=1 SUPABASE_
 # The CLI reads the API from a profile file; project_host takes no port.
 API_HOST=${API_URL#*://}; API_HOST=${API_HOST%%:*}
 cat >"$WORK/profile.yaml" <<EOF
-name: sbctl-functions-test
+name: supavise-functions-test
 api_url: $API_URL
 dashboard_url: http://127.0.0.1:1
 project_host: $API_HOST
@@ -158,7 +158,7 @@ done
 
 log "collecting the keys of both projects"
 keys() { # REF NAME -> JSON object for the verify config
-  sbctl projects get "$1" --json --show-keys | python3 -c '
+  supavise projects get "$1" --json --show-keys | python3 -c '
 import json, sys
 ref, name, tpl = sys.argv[1:4]
 d = json.load(sys.stdin); k = d["keys"]
@@ -198,7 +198,7 @@ if [[ $SANDBOXED_BUNDLER == 1 ]]; then
     [[ $(tail -n1 <<<"$out") == 400 ]] || fail "an upload that imports another project's file ($1) answered: $out"
     grep -q "Could not bundle" <<<"$out" || fail "the refusal ($1) does not say why: $out"
     if grep -qF "$jwt_a" <<<"$out"; then fail "the bundler's error ($1) shows project A's JWT secret"; fi
-    if grep -q "SBCTL_FUNCTIONS_\|EDGE_RUNTIME_PORT" <<<"$out"; then fail "the bundler's error ($1) shows the environment of the runtime: $out"; fi
+    if grep -q "SUPAVISE_FUNCTIONS_\|EDGE_RUNTIME_PORT" <<<"$out"; then fail "the bundler's error ($1) shows the environment of the runtime: $out"; fi
     [[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$API_URL/v1/projects/$REF_B/functions/steal") == 404 ]] || fail "the refused upload ($1) was stored"
   }
   try_steal "a relative path" "../../../../../../../../../..$TENANTS/$REF_A/functions-env.json"
@@ -218,11 +218,11 @@ sb "$WORK/work-b" secrets set MY_SECRET=secret-for-b --project-ref "$REF_B" >/de
 names=$(sb "$WORK/work-a" secrets list --project-ref "$REF_A" --output-format json 2>/dev/null) || fail "secrets list"
 grep -q MY_SECRET <<<"$names" || fail "secrets list does not show MY_SECRET: $names"
 
-log "functions list (CLI) and sbctl functions list"
+log "functions list (CLI) and supavise functions list"
 # Text on a terminal or in CI, JSON for agents: ask for JSON, the one format a script can read.
 sb "$WORK/work-a" functions list --project-ref "$REF_A" --output-format json | grep -q '"slug":"hello"' || fail "supabase functions list lacks hello"
-live=$(sbctl functions list "$REF_A" --json | jget 'sum(1 for r in d if r["live"])')
-[[ $live -eq 12 ]] || fail "sbctl functions list: $live of 12 functions live"
+live=$(supavise functions list "$REF_A" --json | jget 'sum(1 for r in d if r["live"])')
+[[ $live -eq 12 ]] || fail "supavise functions list: $live of 12 functions live"
 
 log "files on disk"
 for ref in "$REF_A" "$REF_B"; do
@@ -238,7 +238,7 @@ log "seeding a table in each project's database (psql over loopback)"
 PSQL=$(ls -d "$STATE_DIR"/artifacts/postgres/*/bin/psql | head -1)
 for pair in "$REF_A:a" "$REF_B:b"; do
   ref=${pair%%:*}; name=${pair##*:}
-  view=$(sbctl projects get "$ref" --json --show-keys)
+  view=$(supavise projects get "$ref" --json --show-keys)
   pw=$(jget 'd["keys"]["db_password"]' <<<"$view"); port=$(jget 'd["ports"]["Postgres"]' <<<"$view")
   PGPASSWORD=$pw "$PSQL" "host=127.0.0.1 port=$port user=postgres dbname=postgres sslmode=disable connect_timeout=10" -v ON_ERROR_STOP=1 -q <<SQL || fail "seeding $ref"
 create table if not exists public.fn_probe (id int primary key, who text);
@@ -281,8 +281,8 @@ done
 [[ $(curl -s --max-time 20 "${PROJECT_URL//\{ref\}/$REF_B}/functions/v1/open") == open-b ]] || fail "a resumed project does not serve its functions"
 
 log "deleting project B removes everything of it"
-sbctl projects delete "$REF_B" --skip-final-backup >/dev/null || fail "project delete"
-# `sbctl projects delete` removes the tree itself; on a node that runs the API server the
+supavise projects delete "$REF_B" --skip-final-backup >/dev/null || fail "project delete"
+# `supavise projects delete` removes the tree itself; on a node that runs the API server the
 # reconcile would too.
 asnode test ! -e "$TENANTS/$REF_B" || fail "the functions of $REF_B survived the project delete"
 asnode test ! -e "$STATE_DIR/projects/$REF_B" || fail "projects/$REF_B survived the delete"

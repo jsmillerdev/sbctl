@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/sso"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/sso"
 )
 
 func (s *Server) routesSSO(add func(string, handlerFunc)) {
@@ -20,7 +20,7 @@ func (s *Server) routesSSO(add func(string, handlerFunc)) {
 	add("POST /platform/organizations/{slug}/sso", s.orgSSOCreate)
 	add("PUT /platform/organizations/{slug}/sso", s.orgSSOUpdate)
 	add("DELETE /platform/organizations/{slug}/sso", s.orgSSODelete)
-	// sbctl's own routes: several providers per organization, and the people waiting to be let in.
+	// supavise's own routes: several providers per organization, and the people waiting to be let in.
 	add("GET /platform/organizations/{slug}/sso/providers", s.orgSSOProviders)
 	add("POST /platform/organizations/{slug}/sso/providers", s.orgSSOProviderCreate)
 	add("GET /platform/organizations/{slug}/sso/providers/{provider_id}", s.orgSSOProviderGet)
@@ -40,7 +40,7 @@ func (s *Server) routesSSO(add func(string, handlerFunc)) {
 
 // ---- bodies ------------------------------------------------------------------
 
-// ssoProviderBody is the body of sbctl's provider routes: the Management API's
+// ssoProviderBody is the body of supavise's provider routes: the Management API's
 // CreateProviderBody and UpdateProviderBody, and the role a first-time user gets.
 type ssoProviderBody struct {
 	Type             string                `json:"type"`
@@ -66,7 +66,7 @@ func parseDefaultRole(s string) (int, error) {
 	return r.ID, nil
 }
 
-// providerJSON is how sbctl's routes show a provider: the Management API's provider object plus
+// providerJSON is how supavise's routes show a provider: the Management API's provider object plus
 // where it belongs and what its first-time users get.
 func providerJSON(p *DashboardProvider) map[string]any {
 	out := map[string]any{
@@ -320,7 +320,7 @@ func (s *Server) orgSSODelete(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// ---- sbctl's organization routes ---------------------------------------------
+// ---- supavise's organization routes ---------------------------------------------
 
 func (s *Server) orgSSOProviders(w http.ResponseWriter, r *http.Request) error {
 	org, err := s.orgBySlug(r.Context(), r.PathValue("slug"))

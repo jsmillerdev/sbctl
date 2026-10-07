@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Dashboard writes under real systemd units: every kind of project setting is saved through
-# the Management API of the daemon (sbctl.service) with a personal access token, and the
+# the Management API of the daemon (supavise.service) with a personal access token, and the
 # behavior of the running service is observed to change.
 #
-#   sudo SBCTL_BIN=/path/to/sbctl-linux-amd64 tests/linux/settings-smoke.sh [--teardown]
+#   sudo SUPAVISE_BIN=/path/to/supavise-linux-amd64 tests/linux/settings-smoke.sh [--teardown]
 #
 # Auth (a redirect URL the allow list accepts, a refused sign-up, SMTP and a custom mail
 # template reaching a mail server, a provider's client id), PostgREST (a newly exposed
@@ -15,7 +15,7 @@
 # persistence: a pause and resume keeps every saved setting and applies the Postgres and
 # Storage settings saved while paused.
 #
-# Without SBCTL_BIN the script builds sbctl with the go toolchain. It needs network access
+# Without SUPAVISE_BIN the script builds supavise with the go toolchain. It needs network access
 # for the artifact downloads. Not run in development (root, systemd and Linux required); CI
 # runs it on an ephemeral Ubuntu 24.04 VM (amd64 and arm64).
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -36,7 +36,7 @@ ADMIN_PASSWORD=settings-correct-horse-battery
 preflight
 install_binary
 setup_node
-cat >>"$SBCTL_CONF" <<CONF
+cat >>"$SUPAVISE_CONF" <<CONF
 
 [ports]
 supavisor_session = $P_SESSION
@@ -53,47 +53,47 @@ CONF
 
 # Same VM-local workaround as fleet-smoke.sh: the Postgres launcher writes into the artifact
 # directory on its first boot, which ProtectSystem=strict forbids.
-install -d /etc/systemd/system/sb-postgres@.service.d
-cat >/etc/systemd/system/sb-postgres@.service.d/10-settings-smoke.conf <<'CONF'
+install -d /etc/systemd/system/supavise-postgres@.service.d
+cat >/etc/systemd/system/supavise-postgres@.service.d/10-settings-smoke.conf <<'CONF'
 [Service]
-ReadWritePaths=/var/lib/sbctl/artifacts
+ReadWritePaths=/var/lib/supavise/artifacts
 CONF
 systemctl daemon-reload
 
 log "system init, fleet, one project"
 system_init
-wait_active sb-postgres@system.service 30
-sbctl fleet start || fail "fleet start"
+wait_active supavise-postgres@system.service 30
+supavise fleet start || fail "fleet start"
 REF=$(create_project settings micro)
 [[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
-sbctl fleet ensure-tenant "$REF" || fail "ensure-tenant"
-HOST="$REF.api.$SBCTL_DOMAIN"
+supavise fleet ensure-tenant "$REF" || fail "ensure-tenant"
+HOST="$REF.api.$SUPAVISE_DOMAIN"
 PGPORT=$(project_field "$REF" 'd["ports"]["Postgres"]')
-PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
+PSQL=$(ls -d "$SUPAVISE_STATE"/artifacts/postgres/*/bin/psql | head -1)
 PUB=$(project_field "$REF" 'd["keys"]["publishable_key"]' --show-keys)
 SEC=$(project_field "$REF" 'd["keys"]["secret_key"]' --show-keys)
 ANON=$(project_field "$REF" 'd["keys"]["anon_key"]' --show-keys)
 SVC=$(project_field "$REF" 'd["keys"]["service_role_key"]' --show-keys)
 DBPW=$(project_field "$REF" 'd["keys"]["db_password"]' --show-keys)
 
-# sql SQL: as supabase_admin over the project's unix socket (trusted, only the sbctl user reaches it).
-sql() { sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$REF/postgres/sock port=$PGPORT user=supabase_admin dbname=postgres" -Atc "$1" </dev/null; }
+# sql SQL: as supabase_admin over the project's unix socket (trusted, only the supavise user reaches it).
+sql() { sudo -u "$SUPAVISE_USER" "$PSQL" "host=$SUPAVISE_STATE/projects/$REF/postgres/sock port=$PGPORT user=supabase_admin dbname=postgres" -Atc "$1" </dev/null; }
 # sysql DB SQL: the same on the system cluster (Realtime's tenant table lives there).
-sysql() { sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/system/postgres/sock port=5433 user=supabase_admin dbname=$1" -Atc "$2" </dev/null; }
+sysql() { sudo -u "$SUPAVISE_USER" "$PSQL" "host=$SUPAVISE_STATE/projects/system/postgres/sock port=5433 user=supabase_admin dbname=$1" -Atc "$2" </dev/null; }
 direct_login() { PGPASSWORD=$1 "$PSQL" "host=127.0.0.1 port=$PGPORT user=postgres dbname=postgres sslmode=disable connect_timeout=10" -Atc 'select 1' </dev/null >/dev/null 2>&1; }
 pooler_login() { PGPASSWORD=$1 "$PSQL" "host=127.0.0.1 port=$P_SESSION user=postgres.$REF dbname=postgres sslmode=disable connect_timeout=10" -Atc 'select 1' </dev/null >/dev/null 2>&1; }
 
-log "daemon: sbctl.service"
-systemctl start sbctl.service
+log "daemon: supavise.service"
+systemctl start supavise.service
 for ((i = 0; i < 60; i++)); do
   [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
   sleep 1
 done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u sbctl.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
 
 # A personal access token through the claim flow, as the installer's users get one.
-dash() { curl -sS -m 60 -X "$1" -H "Host: api.$SBCTL_DOMAIN" "${@:3}" "http://127.0.0.1$2"; }
-TOKEN=$(sbctl claim token | tr -d '[:space:]')
+dash() { curl -sS -m 60 -X "$1" -H "Host: api.$SUPAVISE_DOMAIN" "${@:3}" "http://127.0.0.1$2"; }
+TOKEN=$(supavise claim token | tr -d '[:space:]')
 [[ $TOKEN =~ ^sbc_[0-9a-f]{48}$ ]] || fail "claim token '$TOKEN'"
 [[ $(dash POST /claim -H 'Content-Type: application/json' -o /dev/null -w '%{http_code}' \
   -d "{\"token\":\"$TOKEN\",\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\",\"organization_name\":\"Settings\"}") == 201 ]] || fail "claim"
@@ -183,13 +183,13 @@ grep -q 'Reset for a@example.com' <<<"$FLAT" || fail "the mail does not carry th
 grep -q 'Subject: Acme password reset' <<<"$FLAT" || fail "the mail does not carry the saved subject"
 # The template is served to the loopback only, to a caller that holds the project's token: the
 # URL GoTrue was given carries it.
-TURL=$(sudo grep '^GOTRUE_MAILER_TEMPLATES_RECOVERY=' "$SBCTL_STATE/projects/$REF/gotrue.env" | sed -e 's/^[^=]*="//' -e 's/"$//')
+TURL=$(sudo grep '^GOTRUE_MAILER_TEMPLATES_RECOVERY=' "$SUPAVISE_STATE/projects/$REF/gotrue.env" | sed -e 's/^[^=]*="//' -e 's/"$//')
 [[ $TURL == "$ADMIN/internal/templates/$REF/recovery?v="*"&t="* ]] || fail "GoTrue's template URL has no token: ${TURL%%&t=*}"
 [[ $(http_code "$TURL") == 200 ]] || fail "the daemon does not serve the template to the loopback"
 [[ $(http_code "$ADMIN/internal/templates/$REF/recovery") == 404 ]] || fail "the template route answered without the project's token"
 [[ $(http_code "$ADMIN/internal/templates/$REF/recovery?t=$(printf '0%.0s' {1..64})") == 404 ]] || fail "the template route answered a wrong token"
 [[ $(http_code -H "X-Forwarded-For: 203.0.113.9" "$TURL") == 404 ]] || fail "the template route answered a proxied request"
-[[ $(http_code -H "Host: api.$SBCTL_DOMAIN" "http://127.0.0.1/internal/templates/$REF/recovery?${TURL#*\?}") == 404 ]] || fail "the template is reachable through the public proxy"
+[[ $(http_code -H "Host: api.$SUPAVISE_DOMAIN" "http://127.0.0.1/internal/templates/$REF/recovery?${TURL#*\?}") == 404 ]] || fail "the template is reachable through the public proxy"
 must 200 PATCH "$CFG/config/auth" '{"disable_signup":true}'
 
 log "postgrest: a newly exposed schema"
@@ -269,14 +269,14 @@ must 400 PUT "$CFG/config/database/postgres" '{"max_connections":3}'
 must 400 PUT "$CFG/config/database/postgres" '{"work_mem":"16"}'
 # Values Postgres takes in ALTER SYSTEM and cannot start with are refused before anything is saved.
 must 400 PUT "$CFG/config/database/postgres" '{"max_locks_per_transaction":2147483640,"restart_database":true}'
-BEFORE=$(systemctl show -p MainPID --value "sb-postgres@$REF.service")
+BEFORE=$(systemctl show -p MainPID --value "supavise-postgres@$REF.service")
 must 200 PUT "$CFG/config/database/postgres" '{"max_connections":40,"restart_database":true}'
 for ((i = 0; i < 120; i++)); do
   [[ $(sql "show max_connections" 2>/dev/null || true) == 40 ]] && break
   sleep 1
 done
 [[ $(sql "show max_connections") == 40 ]] || fail "max_connections was not applied by the restart"
-[[ $(systemctl show -p MainPID --value "sb-postgres@$REF.service") != "$BEFORE" ]] || fail "the cluster was not restarted"
+[[ $(systemctl show -p MainPID --value "supavise-postgres@$REF.service") != "$BEFORE" ]] || fail "the cluster was not restarted"
 [[ $(sql "show statement_timeout") == 45s ]] || fail "statement_timeout was lost by the restart"
 for ((i = 0; i < 120; i++)); do
   [[ $(pcode GET /rest/v1/ -H "apikey: $SEC") == 200 && $(pcode GET /auth/v1/settings -H "apikey: $PUB") == 200 ]] && break

@@ -8,14 +8,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // Values the services are configured with that are not secrets.
 const (
 	// RealtimeAppName is Realtime's APP_NAME (the production config refuses an empty one).
-	RealtimeAppName = "sbctl"
+	RealtimeAppName = "supavise"
 	// realtimeCDCRegion is the region of every Realtime tenant's postgres_cdc_rls extension,
 	// the value upstream's self-host seed uses; the node's own REGION is "local".
 	realtimeCDCRegion = "us-east-1"
@@ -116,7 +116,7 @@ func pgmetaEnv(cfg *config.Config, c *creds) map[string]string {
 // downstreamCertMarkerEnv carries the hash of the pooler certificate. Supavisor ignores it;
 // it makes the rendered environment change, and so Start restart the unit, when the
 // certificate is replaced.
-const downstreamCertMarkerEnv = "SBCTL_DOWNSTREAM_CERT_SHA256"
+const downstreamCertMarkerEnv = "SUPAVISE_DOWNSTREAM_CERT_SHA256"
 
 // supavisorEnv follows the dockerless CLI's recipe (supabase/cli packages/stack
 // services/Pooler.ts), the upstream compose file, and config/runtime.exs at the pinned
@@ -125,7 +125,7 @@ const downstreamCertMarkerEnv = "SBCTL_DOWNSTREAM_CERT_SHA256"
 // address) is not set: the API port and the ephemeral shard listeners (PROXY_PORT,
 // SESSION_PROXY_PORTS, TRANSACTION_PROXY_PORTS, which take ephemeral ports) listen on
 // every interface, and the host firewall must close them (see the README). The API needs
-// a JWT only sbctl can sign. The metadata database is _supavisor of the system cluster,
+// a JWT only supavise can sign. The metadata database is _supavisor of the system cluster,
 // as its own owner role. Metrics are unreachable: their JWT secret is random and never
 // shown to anyone. Clients that connect with TLS (the Supabase CLI requires it for a
 // remote database) are served from the node's own certificate (see ensureDownstreamCert).
@@ -227,10 +227,10 @@ func storageEnv(cfg *config.Config, c *creds) (map[string]string, error) {
 			return nil, fmt.Errorf("fleet: [fleet] storage_backend = \"s3\" needs storage_s3_bucket")
 		}
 		if cfg.Supervisor == config.SupervisorSystemd && (f.StorageS3AccessKeyID == "" || f.StorageS3SecretAccessKey == "") {
-			// sb-storage denies the instance metadata service (deploy/systemd/README.md), so
+			// supavise-storage denies the instance metadata service (deploy/systemd/README.md), so
 			// the instance role is out of reach by design: Storage holds the objects of every
 			// project and runs on user input, and the role also covers the backups.
-			return nil, fmt.Errorf("fleet: [fleet] storage_backend = \"s3\" needs storage_s3_access_key_id and storage_s3_secret_access_key under systemd: sb-storage cannot reach the instance role (IMDS is denied to it), so give it a key scoped to the objects bucket")
+			return nil, fmt.Errorf("fleet: [fleet] storage_backend = \"s3\" needs storage_s3_access_key_id and storage_s3_secret_access_key under systemd: supavise-storage cannot reach the instance role (IMDS is denied to it), so give it a key scoped to the objects bucket")
 		}
 		env["STORAGE_BACKEND"] = "s3"
 		env["STORAGE_S3_BUCKET"] = f.StorageS3Bucket

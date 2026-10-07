@@ -18,7 +18,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 type entry struct {
@@ -174,7 +174,7 @@ func TestFetchVerifiesUnpacksAndCaches(t *testing.T) {
 		t.Fatalf("marker = %+v, %v", m, err)
 	}
 	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o755 {
-		t.Fatalf("artifact root mode = %v, %v; the sbctl user must be able to traverse a root-fetched artifact", fi, err)
+		t.Fatalf("artifact root mode = %v, %v; the supavise user must be able to traverse a root-fetched artifact", fi, err)
 	}
 	// Second fetch is a no-op.
 	if _, err := s.Fetch(context.Background(), config.SvcGoTrue); err != nil || downloads.Load() != 1 {
@@ -282,12 +282,12 @@ func TestParseSHA256SUMS(t *testing.T) {
 	}
 }
 
-// TestRealArchive unpacks a real slim-services archive from SBCTL_TEST_ARCHIVE
+// TestRealArchive unpacks a real slim-services archive from SUPAVISE_TEST_ARCHIVE
 // (for example ~/.cache/sbctl/archives/auth-v2.195.0-r1-darwin-arm64.tar.zst).
 func TestRealArchive(t *testing.T) {
-	p := os.Getenv("SBCTL_TEST_ARCHIVE")
+	p := os.Getenv("SUPAVISE_TEST_ARCHIVE")
 	if p == "" {
-		t.Skip("set SBCTL_TEST_ARCHIVE to a slim-services .tar.zst")
+		t.Skip("set SUPAVISE_TEST_ARCHIVE to a slim-services .tar.zst")
 	}
 	f, err := os.Open(p)
 	if err != nil {

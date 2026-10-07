@@ -26,11 +26,11 @@ import (
 // Environment of the real-S3 variant (CI runs it against a MinIO service container;
 // any S3-compatible endpoint works). All of the first four are required to enable it.
 const (
-	envS3Endpoint  = "SBCTL_TEST_S3_ENDPOINT"
-	envS3Bucket    = "SBCTL_TEST_S3_BUCKET"
-	envS3AccessKey = "SBCTL_TEST_S3_ACCESS_KEY"
-	envS3SecretKey = "SBCTL_TEST_S3_SECRET_KEY"
-	envS3Region    = "SBCTL_TEST_S3_REGION" // optional, default us-east-1
+	envS3Endpoint  = "SUPAVISE_TEST_S3_ENDPOINT"
+	envS3Bucket    = "SUPAVISE_TEST_S3_BUCKET"
+	envS3AccessKey = "SUPAVISE_TEST_S3_ACCESS_KEY"
+	envS3SecretKey = "SUPAVISE_TEST_S3_SECRET_KEY"
+	envS3Region    = "SUPAVISE_TEST_S3_REGION" // optional, default us-east-1
 )
 
 // fakeS3 starts an in-process S3 server (gofakes3) with one bucket and returns options
@@ -39,16 +39,16 @@ const (
 func fakeS3(t *testing.T) S3Options {
 	t.Helper()
 	backend := s3mem.New()
-	if err := backend.CreateBucket("sbctl-test"); err != nil {
+	if err := backend.CreateBucket("supavise-test"); err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(gofakes3.New(backend).Server())
 	t.Cleanup(srv.Close)
-	return S3Options{Bucket: "sbctl-test", Prefix: "backups/node1", Endpoint: srv.URL, Region: "us-east-1",
+	return S3Options{Bucket: "supavise-test", Prefix: "backups/node1", Endpoint: srv.URL, Region: "us-east-1",
 		ForcePathStyle: true, AccessKeyID: "test", SecretKey: "test", PartSize: 5 << 20}
 }
 
-// s3FromEnv returns options for the real service named by SBCTL_TEST_S3_*, with a
+// s3FromEnv returns options for the real service named by SUPAVISE_TEST_S3_*, with a
 // unique prefix so concurrent runs do not collide, or skips.
 func s3FromEnv(t *testing.T) S3Options {
 	t.Helper()
@@ -60,7 +60,7 @@ func s3FromEnv(t *testing.T) S3Options {
 	if region == "" {
 		region = "us-east-1"
 	}
-	return S3Options{Bucket: bucket, Prefix: fmt.Sprintf("sbctl-test/%d-%d", time.Now().Unix(), os.Getpid()), Endpoint: ep,
+	return S3Options{Bucket: bucket, Prefix: fmt.Sprintf("supavise-test/%d-%d", time.Now().Unix(), os.Getpid()), Endpoint: ep,
 		Region: region, ForcePathStyle: true, AccessKeyID: ak, SecretKey: sk, PartSize: 5 << 20}
 }
 
@@ -169,7 +169,7 @@ func runS3Suite(t *testing.T, opts S3Options) {
 func TestS3StoreAgainstFakeServer(t *testing.T) { runS3Suite(t, fakeS3(t)) }
 
 // TestS3StoreAgainstRealService is the CI-only variant: it needs a real S3-compatible
-// endpoint (a MinIO service container in CI) and is skipped without SBCTL_TEST_S3_*.
+// endpoint (a MinIO service container in CI) and is skipped without SUPAVISE_TEST_S3_*.
 func TestS3StoreAgainstRealService(t *testing.T) { runS3Suite(t, s3FromEnv(t)) }
 
 // A 403 on a key lookup is what S3 answers for a missing key when the caller lacks

@@ -20,11 +20,11 @@ const (
 	EszipMediaType = "application/vnd.denoland.eszip"
 	// BundleFileName is the stored name of an uploaded bundle among a function's files. The
 	// body is kept as the CLI sent it: the bytes "EZBR" and a Brotli-compressed eszip.
-	BundleFileName = ".sbctl-bundle.ezbr"
+	BundleFileName = ".supavise-bundle.ezbr"
 	// BundleInfoFileName is stored next to a bundle that the node made from uploaded sources
 	// (the sources are stored too, so they can be read and downloaded again); it holds the
 	// module specifier of the entrypoint inside the bundle, see SourceBundleInfo.
-	BundleInfoFileName = ".sbctl-bundle.json"
+	BundleInfoFileName = ".supavise-bundle.json"
 	bundleMagic        = "EZBR"
 )
 

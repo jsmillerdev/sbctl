@@ -19,13 +19,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // Exec is the development and test Supervisor: it runs each unit's launcher as a
 // detached child process (own session and process group), logs to
 // <state_dir>/logs/<unit>.log and keeps a pid file in <state_dir>/run/ so that a later
-// sbctl invocation can find, query and stop what an earlier one started. It does not
+// supavise invocation can find, query and stop what an earlier one started. It does not
 // enforce resource limits, restart crashed units or start anything at boot; use the
 // systemd backend on servers.
 type Exec struct {
@@ -128,7 +128,7 @@ func (e *Exec) Start(ctx context.Context, unit string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(logf, "--- sbctl exec backend: starting %s at %s\n", unit, time.Now().Format(time.RFC3339))
+	fmt.Fprintf(logf, "--- supavise exec backend: starting %s at %s\n", unit, time.Now().Format(time.RFC3339))
 
 	cmd := exec.Command(files.Run)
 	cmd.Env = append(baseEnv(), flatten(env)...)

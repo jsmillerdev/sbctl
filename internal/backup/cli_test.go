@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// cliEnv runs the real sbctl binary against a file backend, as Postgres does.
+// cliEnv runs the real supavise binary against a file backend, as Postgres does.
 type cliEnv struct {
 	t       *testing.T
 	bin     string
@@ -25,7 +25,7 @@ type cliEnv struct {
 func newCLIEnv(t *testing.T) *cliEnv {
 	t.Helper()
 	root := t.TempDir()
-	c := &cliEnv{t: t, bin: sbctlBinary(t), root: root, archive: filepath.Join(root, "archive"), cfg: filepath.Join(root, "sbctl.toml")}
+	c := &cliEnv{t: t, bin: supaviseBinary(t), root: root, archive: filepath.Join(root, "archive"), cfg: filepath.Join(root, "supavise.toml")}
 	writeFile(t, c.cfg, []byte(fmt.Sprintf("state_dir = %q\n\n[backup]\nbackend = %q\n", filepath.Join(root, "state"), "file://"+c.archive)))
 	return c
 }
@@ -47,7 +47,7 @@ func (c *cliEnv) run(dir string, args ...string) (int, string, time.Duration) {
 	case errors.As(err, &ee):
 		return ee.ExitCode(), stderr.String(), took
 	}
-	c.t.Fatalf("running sbctl: %v", err)
+	c.t.Fatalf("running supavise: %v", err)
 	return -1, "", 0
 }
 

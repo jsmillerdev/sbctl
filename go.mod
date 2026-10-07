@@ -1,4 +1,4 @@
-module github.com/OWNER/sbctl
+module github.com/jsmillerdev/supavise
 
 go 1.26.0
 

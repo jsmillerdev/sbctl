@@ -1,4 +1,4 @@
-// Package config loads /etc/sbctl/config.toml with SBCTL_* environment overrides
+// Package config loads /etc/supavise/config.toml with SUPAVISE_* environment overrides
 // and defines the fixed filesystem, port and hostname layout every package shares.
 package config
 
@@ -15,28 +15,28 @@ import (
 )
 
 const (
-	DefaultPath       = "/etc/sbctl/config.toml"
-	DefaultKeyPath    = "/etc/sbctl/master.key"
-	DefaultStateDir   = "/var/lib/sbctl"
-	DefaultBinPath    = "/usr/local/bin/sbctl"
+	DefaultPath       = "/etc/supavise/config.toml"
+	DefaultKeyPath    = "/etc/supavise/master.key"
+	DefaultStateDir   = "/var/lib/supavise"
+	DefaultBinPath    = "/usr/local/bin/supavise"
 	DefaultRegion     = "us-east-1"
-	EnvPrefix         = "SBCTL_"
-	EnvConfigPath     = "SBCTL_CONFIG"
+	EnvPrefix         = "SUPAVISE_"
+	EnvConfigPath     = "SUPAVISE_CONFIG"
 	SupervisorSystemd = "systemd"
 	SupervisorExec    = "exec"
 )
 
 // Config is the whole node configuration. Every field can be overridden by an
-// environment variable named SBCTL_ plus the upper-cased TOML path joined by "_",
-// for example SBCTL_TLS_DNS_PROVIDER or SBCTL_BACKUP_S3_ENDPOINT. Map fields take
-// one variable per key: SBCTL_TLS_CREDENTIALS_CF_API_TOKEN sets credentials["cf_api_token"].
+// environment variable named SUPAVISE_ plus the upper-cased TOML path joined by "_",
+// for example SUPAVISE_TLS_DNS_PROVIDER or SUPAVISE_BACKUP_S3_ENDPOINT. Map fields take
+// one variable per key: SUPAVISE_TLS_CREDENTIALS_CF_API_TOKEN sets credentials["cf_api_token"].
 type Config struct {
 	// Domain is the base domain. Empty means "<public_ip>.sslip.io".
 	Domain   string `toml:"domain"`
 	PublicIP string `toml:"public_ip"`
 	StateDir string `toml:"state_dir"`
 	KeyPath  string `toml:"key_path"`
-	// BinPath is the absolute path of the sbctl binary, used in archive_command.
+	// BinPath is the absolute path of the supavise binary, used in archive_command.
 	BinPath string `toml:"bin_path"`
 	// Supervisor is "systemd" (production) or "exec" (development and tests: child processes).
 	Supervisor string `toml:"supervisor"`
@@ -79,7 +79,7 @@ type TLS struct {
 }
 
 type Backup struct {
-	// Backend is "file:///var/lib/sbctl/backups" or "s3://bucket/prefix".
+	// Backend is "file:///var/lib/supavise/backups" or "s3://bucket/prefix".
 	Backend          string `toml:"backend"`
 	S3Endpoint       string `toml:"s3_endpoint"` // empty = AWS
 	S3Region         string `toml:"s3_region"`
@@ -91,7 +91,7 @@ type Backup struct {
 	// backend. When empty the AWS default chain applies (environment, shared config,
 	// instance role), which is what the CloudFormation install uses. The secret key sits in
 	// config.toml in plain text: with it set, config.toml must be mode 0600 and owned by
-	// the sbctl user (sbctl backups warns otherwise).
+	// the supavise user (supavise backups warns otherwise).
 	S3AccessKeyID     string `toml:"s3_access_key_id"`
 	S3SecretAccessKey string `toml:"s3_secret_access_key"`
 	// ArchiveTimeoutSeconds is PostgreSQL's archive_timeout for project clusters: the
@@ -101,7 +101,7 @@ type Backup struct {
 	// WALRelay chooses how a cluster's archive_command and restore_command reach the
 	// backend: "on" through the daemon, over a unix socket inside the project's own
 	// directory (the Postgres unit holds no backend credentials and has no access to the
-	// backups); "off" by running `sbctl wal push` itself, which reads this file's backend
+	// backups); "off" by running `supavise wal push` itself, which reads this file's backend
 	// settings; "auto" (the default) is "on" under systemd, where units have a mount
 	// sandbox, and "off" under the exec backend of development and tests.
 	WALRelay string `toml:"wal_relay"`
@@ -162,8 +162,8 @@ func Default() *Config {
 	}
 }
 
-// Load reads the file at path (DefaultPath, or $SBCTL_CONFIG, when path is empty),
-// applies SBCTL_* overrides and validates. A missing file is not an error.
+// Load reads the file at path (DefaultPath, or $SUPAVISE_CONFIG, when path is empty),
+// applies SUPAVISE_* overrides and validates. A missing file is not an error.
 func Load(path string) (*Config, error) {
 	if path == "" {
 		path = os.Getenv(EnvConfigPath)
@@ -210,7 +210,7 @@ func (c *Config) Validate() error {
 		return errors.New("config: backup.wal_relay must be auto, on or off")
 	}
 	if c.Backup.WALRelay == "off" && c.Supervisor == SupervisorSystemd {
-		return errors.New("config: backup.wal_relay = \"off\" cannot work with supervisor = \"systemd\": the Postgres units hide /etc/sbctl and the backups directory, so a direct `sbctl wal push` can read neither the backend settings nor write the archive, and archiving would fail forever; use auto or on")
+		return errors.New("config: backup.wal_relay = \"off\" cannot work with supervisor = \"systemd\": the Postgres units hide /etc/supavise and the backups directory, so a direct `supavise wal push` can read neither the backend settings nor write the archive, and archiving would fail forever; use auto or on")
 	}
 	if err := c.Branching.validate(); err != nil {
 		return err

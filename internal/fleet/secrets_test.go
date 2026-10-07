@@ -6,8 +6,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 func TestLoadCredsGeneratesOnceAndKeepsThem(t *testing.T) {
@@ -53,7 +53,7 @@ func TestLoadCredsGeneratesOnceAndKeepsThem(t *testing.T) {
 		}
 		seen[v] = name
 	}
-	if got := a.logins[config.SvcStorage]; got.User != "sbctl_storage" || got.Database != "_storage" || got.Password != "pw-storage" {
+	if got := a.logins[config.SvcStorage]; got.User != "supavise_storage" || got.Database != "_storage" || got.Password != "pw-storage" {
 		t.Fatalf("storage login = %+v", got)
 	}
 }

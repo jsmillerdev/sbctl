@@ -1,0 +1,21 @@
+// polkit rule: lets the supavise user start, stop and tune supavise-* units over D-Bus without root.
+// Install as /etc/polkit-1/rules.d/50-supavise.rules (supavise system install-units does).
+//
+// Only manage-units is granted. manage-unit-files and reload-daemon are deliberately
+// not: polkit receives no unit name for them, so a grant would let any process running
+// as supavise link an arbitrary unit file and start it as root. Enabling units at boot and
+// daemon-reload are done by `supavise system install-units`, which runs as root.
+polkit.addRule(function(action, subject) {
+  if (subject.user !== "supavise") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  if (action.id !== "org.freedesktop.systemd1.manage-units") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  // manage-units always names the unit; restrict it to ours.
+  var unit = action.lookup("unit") || "";
+  if (unit.indexOf("supavise-") !== 0 && unit !== "supavise.service") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  return polkit.Result.YES;
+});

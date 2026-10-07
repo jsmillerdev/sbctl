@@ -12,9 +12,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // stopTimeout bounds pg_backup_stop, which waits for the WAL of the backup to reach
@@ -44,7 +44,7 @@ func (s *Service) FinalBackup(ctx context.Context, ref string) (*registry.Backup
 // Method: pg_backup_start() on a superuser connection, a copy of the data directory
 // straight into a tar.zst object in the backend, then pg_backup_stop(), which waits
 // until the WAL covering the backup is archived. Files are read directly because
-// sbctl runs on the same host as the cluster; no replication connection, HBA entry
+// supavise runs on the same host as the cluster; no replication connection, HBA entry
 // or max_wal_senders is needed (the Supabase Postgres artifact ships none of them
 // ready, and has no pg_basebackup binary). The manifest is written last and marks
 // the backup complete; a failed backup leaves no manifest and its objects are removed.
@@ -164,7 +164,7 @@ func (s *Service) runBase(ctx context.Context, proj *registry.Project, id string
 	}
 
 	var locked bool
-	if err := conn.QueryRow(ctx, `select pg_try_advisory_lock(hashtext('sbctl.basebackup'))`).Scan(&locked); err != nil {
+	if err := conn.QueryRow(ctx, `select pg_try_advisory_lock(hashtext('supavise.basebackup'))`).Scan(&locked); err != nil {
 		return nil, err
 	}
 	if !locked {
@@ -173,7 +173,7 @@ func (s *Service) runBase(ctx context.Context, proj *registry.Project, id string
 
 	var startLSN, startWAL string
 	var timeline int
-	if err := conn.QueryRow(ctx, `select pg_backup_start($1, true)::text`, "sbctl "+id).Scan(&startLSN); err != nil {
+	if err := conn.QueryRow(ctx, `select pg_backup_start($1, true)::text`, "supavise "+id).Scan(&startLSN); err != nil {
 		return nil, fmt.Errorf("pg_backup_start: %w", err)
 	}
 	if err := conn.QueryRow(ctx, `select pg_walfile_name($1::pg_lsn), (select timeline_id from pg_control_checkpoint())`, startLSN).Scan(&startWAL, &timeline); err != nil {
@@ -216,7 +216,7 @@ func (s *Service) runBase(ctx context.Context, proj *registry.Project, id string
 		StartTime: started, StopTime: stopTime.UTC(),
 		PGVersionNum: f.VersionNum, WALSegmentSize: f.WALSegmentSize,
 		Data: dataName, SizeBytes: stats.Bytes, StoredBytes: stored, Files: stats.Files,
-		SBCtlVersion: s.opt.Version,
+		SupaviseVersion: s.opt.Version,
 	}
 	if m.Project, err = s.projectMeta(ctx, proj); err != nil {
 		return nil, err
@@ -420,7 +420,7 @@ func (s *Service) PendingRestores(ctx context.Context) []string {
 // restore.cleanup_pending: it waits (up to RecoveryTimeout each) for the cluster to leave
 // recovery, clears the recovery settings and records restore.recovery_finished. The
 // daemon runs it after it starts the projects and repeats it while any stays pending, so
-// a slow restore-as-new does not depend on someone running `sbctl backups
+// a slow restore-as-new does not depend on someone running `supavise backups
 // finish-restore`. It returns the refs it finished.
 func (s *Service) FinishPendingRestores(ctx context.Context) []string {
 	if s.opt.Access == nil {

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 func TestServicesForPutsTheEdgeRuntimeBeforeStudioWhenEnabled(t *testing.T) {
@@ -78,12 +78,12 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 		}
 		env := s.Env
 		for k, v := range map[string]string{
-			"EDGE_RUNTIME_PORT": port, "SBCTL_FUNCTIONS_ROOT": realPath(cfg.Paths().FunctionsRoot()),
-			"SBCTL_FUNCTIONS_MEMORY_MB": "128", "SBCTL_FUNCTIONS_WALL_CLOCK_SEC": "20", "SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC": "9",
-			"SBCTL_FUNCTIONS_CPU_SOFT_MS": "0", "SBCTL_FUNCTIONS_CPU_HARD_MS": "3000", "SBCTL_FUNCTIONS_MAX_PER_PROJECT": "200", "SBCTL_FUNCTIONS_MAX_WORKERS": "8",
-			"SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT": "3", "SBCTL_FUNCTIONS_WORKER_COST_MB": "320", // 2 per function x (128 + 32)
-			"SBCTL_FUNCTIONS_TMP_QUOTA_MB": "100",
-			"DENO_DIR":                     filepath.Join(cfg.Paths().System(config.SvcEdgeRuntime), "deno"),
+			"EDGE_RUNTIME_PORT": port, "SUPAVISE_FUNCTIONS_ROOT": realPath(cfg.Paths().FunctionsRoot()),
+			"SUPAVISE_FUNCTIONS_MEMORY_MB": "128", "SUPAVISE_FUNCTIONS_WALL_CLOCK_SEC": "20", "SUPAVISE_FUNCTIONS_IDLE_TIMEOUT_SEC": "9",
+			"SUPAVISE_FUNCTIONS_CPU_SOFT_MS": "0", "SUPAVISE_FUNCTIONS_CPU_HARD_MS": "3000", "SUPAVISE_FUNCTIONS_MAX_PER_PROJECT": "200", "SUPAVISE_FUNCTIONS_MAX_WORKERS": "8",
+			"SUPAVISE_FUNCTIONS_MAX_WORKERS_PER_PROJECT": "3", "SUPAVISE_FUNCTIONS_WORKER_COST_MB": "320", // 2 per function x (128 + 32)
+			"SUPAVISE_FUNCTIONS_TMP_QUOTA_MB": "100",
+			"DENO_DIR":                        filepath.Join(cfg.Paths().System(config.SvcEdgeRuntime), "deno"),
 			// 8 workers x 2 per function: one thread for each isolate the budget allows.
 			"EDGE_RUNTIME_WORKER_POOL_SIZE": "16",
 		} {
@@ -92,8 +92,8 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 			}
 		}
 		// The proxy's secret reaches the runtime through the environment, and is the node's.
-		if want, err := config.LoadFunctionsProxyToken(cfg.Paths()); err != nil || len(want) != 64 || env["SBCTL_FUNCTIONS_PROXY_TOKEN"] != want {
-			t.Errorf("proxy token %q (%v)", env["SBCTL_FUNCTIONS_PROXY_TOKEN"], err)
+		if want, err := config.LoadFunctionsProxyToken(cfg.Paths()); err != nil || len(want) != 64 || env["SUPAVISE_FUNCTIONS_PROXY_TOKEN"] != want {
+			t.Errorf("proxy token %q (%v)", env["SUPAVISE_FUNCTIONS_PROXY_TOKEN"], err)
 		}
 		if sum, _ := MainServiceHash(); env[mainServiceMarkerEnv] != sum || sum == "" {
 			t.Errorf("main service marker %q", env[mainServiceMarkerEnv])
@@ -121,8 +121,8 @@ func TestEdgeRuntimeSpecDefaults(t *testing.T) {
 	}
 	for _, s := range specs {
 		if s.Service == config.SvcEdgeRuntime {
-			if env := s.Env; env["SBCTL_FUNCTIONS_MEMORY_MB"] != "256" || env["SBCTL_FUNCTIONS_WALL_CLOCK_SEC"] != "400" ||
-				env["SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC"] != "150" || env["SBCTL_FUNCTIONS_CPU_SOFT_MS"] != "1000" || env["SBCTL_FUNCTIONS_CPU_HARD_MS"] != "2000" || env["SBCTL_FUNCTIONS_MAX_PER_PROJECT"] != "128" || env["SBCTL_FUNCTIONS_MAX_WORKERS"] != "16" || env["SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT"] != "8" || env["EDGE_RUNTIME_WORKER_POOL_SIZE"] != "16" || env["SBCTL_FUNCTIONS_TMP_QUOTA_MB"] != "64" {
+			if env := s.Env; env["SUPAVISE_FUNCTIONS_MEMORY_MB"] != "256" || env["SUPAVISE_FUNCTIONS_WALL_CLOCK_SEC"] != "400" ||
+				env["SUPAVISE_FUNCTIONS_IDLE_TIMEOUT_SEC"] != "150" || env["SUPAVISE_FUNCTIONS_CPU_SOFT_MS"] != "1000" || env["SUPAVISE_FUNCTIONS_CPU_HARD_MS"] != "2000" || env["SUPAVISE_FUNCTIONS_MAX_PER_PROJECT"] != "128" || env["SUPAVISE_FUNCTIONS_MAX_WORKERS"] != "16" || env["SUPAVISE_FUNCTIONS_MAX_WORKERS_PER_PROJECT"] != "8" || env["EDGE_RUNTIME_WORKER_POOL_SIZE"] != "16" || env["SUPAVISE_FUNCTIONS_TMP_QUOTA_MB"] != "64" {
 				t.Errorf("env %v", env)
 			}
 			if !strings.Contains(strings.Join(s.Exec, " "), "--max-parallelism 1") {
@@ -145,7 +145,7 @@ func TestManagerStartsTheEdgeRuntimeOnlyWhenEnabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := on.sup.log()
-	if !strings.Contains(log, "start sb-storage.service\nrender sb-edge-runtime.service\nstart sb-edge-runtime.service\nrender sb-studio.service") {
+	if !strings.Contains(log, "start supavise-storage.service\nrender supavise-edge-runtime.service\nstart supavise-edge-runtime.service\nrender supavise-studio.service") {
 		t.Fatalf("start order:\n%s", log)
 	}
 	if !dirExists(on.n.cfg.Paths().System(config.SvcEdgeRuntime)) {
@@ -174,19 +174,19 @@ func TestManagerStartsTheEdgeRuntimeOnlyWhenEnabled(t *testing.T) {
 	if err := on.m.Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(on.sup.log(), "stop sb-studio.service\nstop sb-edge-runtime.service\nstop sb-storage.service") {
+	if !strings.Contains(on.sup.log(), "stop supavise-studio.service\nstop supavise-edge-runtime.service\nstop supavise-storage.service") {
 		t.Fatalf("stop order:\n%s", on.sup.log())
 	}
 }
 
 func TestManagerReportsAnEdgeRuntimeThatDoesNotStart(t *testing.T) {
 	r := edgeRig(t, true)
-	r.sup.failOn["start sb-edge-runtime.service"] = os.ErrPermission
+	r.sup.failOn["start supavise-edge-runtime.service"] = os.ErrPermission
 	err := r.m.Start(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "edge-runtime") {
 		t.Fatalf("err = %v", err)
 	}
-	if !strings.Contains(r.sup.log(), "start sb-studio.service") {
+	if !strings.Contains(r.sup.log(), "start supavise-studio.service") {
 		t.Fatal("a failing runtime stopped Studio from starting")
 	}
 }
@@ -283,14 +283,14 @@ func TestTurningFunctionsOffRetiresTheRuntimeAndItsSecrets(t *testing.T) {
 	if err := r.m.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(r.sup.log(), "stop sb-studio.service\nstop sb-edge-runtime.service\nstop sb-storage.service") {
+	if !strings.Contains(r.sup.log(), "stop supavise-studio.service\nstop supavise-edge-runtime.service\nstop supavise-storage.service") {
 		t.Fatalf("fleet stop left the runtime running:\n%s", r.sup.log())
 	}
 
 	if err := r.m.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(r.sup.log(), "remove sb-edge-runtime.service") {
+	if !strings.Contains(r.sup.log(), "remove supavise-edge-runtime.service") {
 		t.Fatalf("fleet start did not remove the runtime's unit:\n%s", r.sup.log())
 	}
 	if _, err := os.Stat(secret); !os.IsNotExist(err) {

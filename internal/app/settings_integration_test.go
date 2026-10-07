@@ -19,13 +19,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // freeBase finds a base port in 42000-42899 where base..base+40 and the project's ports
@@ -72,14 +72,14 @@ func seq(from, n int) []int {
 // does not. It starts the system cluster, one micro project, Supavisor and Storage (no
 // Realtime, no pg-meta, no Studio): under 1 GB.
 //
-// Needs SBCTL_TEST_UNPACKED (unpacked slim-services artifacts) and SBCTL_SETTINGS_E2E=1.
-// With SBCTL_SETTINGS_E2E_HOLD=<file> the stack stays up afterwards and the file receives
+// Needs SUPAVISE_TEST_UNPACKED (unpacked slim-services artifacts) and SUPAVISE_SETTINGS_E2E=1.
+// With SUPAVISE_SETTINGS_E2E_HOLD=<file> the stack stays up afterwards and the file receives
 // the connection details of the stack (api_url, proxy_url, pat, ref, keys, ports) as JSON for
 // real clients (the Supabase CLI); delete the file to stop everything.
 func TestSettingsIntegration(t *testing.T) {
-	root := os.Getenv("SBCTL_TEST_UNPACKED")
-	if root == "" || os.Getenv("SBCTL_SETTINGS_E2E") == "" {
-		t.Skip("SBCTL_TEST_UNPACKED and SBCTL_SETTINGS_E2E not set")
+	root := os.Getenv("SUPAVISE_TEST_UNPACKED")
+	if root == "" || os.Getenv("SUPAVISE_SETTINGS_E2E") == "" {
+		t.Skip("SUPAVISE_TEST_UNPACKED and SUPAVISE_SETTINGS_E2E not set")
 	}
 	arts := dirArts{}
 	for svc, glob := range map[string]string{
@@ -102,7 +102,7 @@ func TestSettingsIntegration(t *testing.T) {
 	cfg.StateDir = state
 	cfg.KeyPath = filepath.Join(state, "master.key")
 	cfg.Supervisor = config.SupervisorExec
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	cfg.TLS.Mode = "off"
 	cfg.BinPath = "/usr/bin/true"
 	cfg.Backup.Backend = "file://" + filepath.Join(state, "backups")
@@ -749,7 +749,7 @@ func TestSettingsIntegration(t *testing.T) {
 		})
 	})
 
-	if hold := os.Getenv("SBCTL_SETTINGS_E2E_HOLD"); hold != "" {
+	if hold := os.Getenv("SUPAVISE_SETTINGS_E2E_HOLD"); hold != "" {
 		info, _ := json.MarshalIndent(map[string]any{
 			"api_url": admin, "proxy_url": proxyURL, "project_host": host, "pat": pat, "ref": p.Ref,
 			"anon_key": keys.AnonKey, "service_key": keys.ServiceRoleKey, "publishable_key": keys.PublishableKey, "secret_key": keys.SecretKey,

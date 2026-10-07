@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // Upstream names accepted by Server.upstream.

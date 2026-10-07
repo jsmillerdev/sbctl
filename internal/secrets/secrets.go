@@ -1,5 +1,5 @@
 // Package secrets seals values stored in the registry with the node master key and
-// generates every credential sbctl hands out (JWT secrets, API keys, PATs, passwords).
+// generates every credential supavise hands out (JWT secrets, API keys, PATs, passwords).
 package secrets
 
 import (
@@ -98,7 +98,7 @@ func Load(body []byte) (*AESGCM, error) {
 // differs per label. Callers use it to sign URLs and tokens that must survive a restart.
 func (s *AESGCM) Derive(label string) []byte {
 	sub := hmac.New(sha256.New, s.key)
-	sub.Write([]byte("sbctl/derive/v1"))
+	sub.Write([]byte("supavise/derive/v1"))
 	m := hmac.New(sha256.New, sub.Sum(nil))
 	m.Write([]byte(label))
 	return m.Sum(nil)

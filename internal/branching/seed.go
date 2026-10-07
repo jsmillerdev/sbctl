@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // seedSecret is the name, among the parent's sealed project secrets, of its branch seed.

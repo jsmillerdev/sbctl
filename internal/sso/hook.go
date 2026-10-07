@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
-// HookPath is where the daemon answers sb-gotrue@system's before-user-created hook: GoTrue asks
+// HookPath is where the daemon answers supavise-gotrue@system's before-user-created hook: GoTrue asks
 // it before it creates any user, and the daemon allows exactly the users the dashboard accepts
 // (a user signing in through a registered SAML provider, a person an administrator invited by
 // mail) and refuses every other sign-up. GoTrue's own switch for that (GOTRUE_DISABLE_SIGNUP)
@@ -24,7 +24,7 @@ import (
 // exist.
 const HookPath = "/internal/hooks/before-user-created"
 
-// HookURL is the address sb-gotrue@system calls: the daemon's loopback admin listener.
+// HookURL is the address supavise-gotrue@system calls: the daemon's loopback admin listener.
 func HookURL(cfg *config.Config) string {
 	host, port, err := net.SplitHostPort(cfg.Listen.Admin)
 	if err != nil {
@@ -146,7 +146,7 @@ func (e *HookEvent) GrantToken() string {
 }
 
 // GrantKey is the user_metadata key that carries the one-time sign-up grant of an invitation.
-const GrantKey = "sbctl_grant"
+const GrantKey = "supavise_grant"
 
 // HookRefusal is the answer that stops GoTrue from creating the user.
 func HookRefusal(message string) map[string]any {

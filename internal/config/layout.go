@@ -88,7 +88,7 @@ const (
 	SvcStudio      = "studio"
 	SvcImgproxy    = "imgproxy"
 	SvcEdgeRuntime = "edge-runtime"
-	// SvcEdgeBundle is the one-shot unit (sb-edge-bundle@<ref>.service, one instance per
+	// SvcEdgeBundle is the one-shot unit (supavise-edge-bundle@<ref>.service, one instance per
 	// project, so each has its own module cache) that bundles uploaded Edge Function sources
 	// inside a sandbox; it runs the edge-runtime artifact's "bundle" command.
 	SvcEdgeBundle = "edge-bundle"
@@ -109,30 +109,30 @@ func ArtifactName(svc string) string {
 }
 
 // UnitName returns the systemd unit for a service. Project services are template
-// instances (sb-postgres@<ref>.service); fleet services are singletons (sb-realtime.service).
+// instances (supavise-postgres@<ref>.service); fleet services are singletons (supavise-realtime.service).
 // The bundler is a template instance per project too, but only for the projects it bundles
 // for, so it is not among ProjectServices (a project's lifecycle does not start it).
 func UnitName(svc, ref string) string {
 	if svc == SvcEdgeBundle && ref != "" {
-		return fmt.Sprintf("sb-%s@%s.service", svc, ref)
+		return fmt.Sprintf("supavise-%s@%s.service", svc, ref)
 	}
 	for _, s := range ProjectServices {
 		if s == svc {
-			return fmt.Sprintf("sb-%s@%s.service", svc, ref)
+			return fmt.Sprintf("supavise-%s@%s.service", svc, ref)
 		}
 	}
-	return "sb-" + svc + ".service"
+	return "supavise-" + svc + ".service"
 }
 
-// EdgeBundleCleanUnit is the one-shot unit (sb-edge-bundle-clean@<ref>.service, run as root)
+// EdgeBundleCleanUnit is the one-shot unit (supavise-edge-bundle-clean@<ref>.service, run as root)
 // that deletes the module cache of the project's bundler instance, which is private to that
-// instance's dynamic uid. sbctl starts it when it deletes the project.
+// instance's dynamic uid. supavise starts it when it deletes the project.
 func EdgeBundleCleanUnit(ref string) string {
-	return fmt.Sprintf("sb-%s-clean@%s.service", SvcEdgeBundle, ref)
+	return fmt.Sprintf("supavise-%s-clean@%s.service", SvcEdgeBundle, ref)
 }
 
-// Slice is the systemd slice every sbctl unit runs in.
-const Slice = "sbctl.slice"
+// Slice is the systemd slice every supavise unit runs in.
+const Slice = "supavise.slice"
 
 // Paths is the state-directory layout under StateDir:
 //
@@ -208,6 +208,6 @@ func (c *Config) RefFromProjectHost(host string) string {
 	return strings.TrimSuffix(host, suffix)
 }
 
-// RealtimeInternalHost is the Host header sbctl sends to Realtime; Realtime resolves
+// RealtimeInternalHost is the Host header supavise sends to Realtime; Realtime resolves
 // the tenant from the first label.
 func RealtimeInternalHost(ref string) string { return ref + ".realtime.internal" }

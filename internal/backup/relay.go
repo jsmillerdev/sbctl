@@ -18,8 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // The WAL relay
@@ -38,7 +38,7 @@ import (
 // restore (config.Paths.RestoreSources, a file outside every unit's view).
 //
 // The contract of archive_command is unchanged: a push answers success only after the
-// compressed file is durable in the backend (the same PushWALReader that `sbctl wal push`
+// compressed file is durable in the backend (the same PushWALReader that `supavise wal push`
 // uses), and fetch distinguishes "not in the archive" (404, exit 1) from "cannot read the
 // archive" (anything else, exit 126). When the daemon is down the socket does not answer:
 // archive_command fails and Postgres retries it, which is the correct behavior, because
@@ -558,7 +558,7 @@ func (r *Relay) fetch(own string, slots chan struct{}, w http.ResponseWriter, re
 
 // ErrRelayDown means nothing answered on the relay socket (the daemon is not running, or
 // the project's relay is not set up). archive_command fails and Postgres retries it.
-var ErrRelayDown = errors.New("backup: the WAL relay does not answer (is sbctl.service running?)")
+var ErrRelayDown = errors.New("backup: the WAL relay does not answer (is supavise.service running?)")
 
 func relayClient(socket string) *http.Client {
 	return &http.Client{Transport: &http.Transport{

@@ -13,9 +13,9 @@ import (
 	"sort"
 	"strconv"
 
-	functionsmain "github.com/OWNER/sbctl/functions-main"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/units"
+	functionsmain "github.com/jsmillerdev/supavise/functions-main"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // edgeRuntimeHealthPath is answered by the main service itself (functions-main/src/handler.ts),
@@ -25,7 +25,7 @@ const edgeRuntimeHealthPath = "/_internal/health"
 // mainServiceMarkerEnv carries the hash of the main service's files. The runtime ignores
 // it; it makes the rendered environment change, and so Start restart the unit, when the
 // binary brings a new main service.
-const mainServiceMarkerEnv = "SBCTL_FUNCTIONS_MAIN_SHA256"
+const mainServiceMarkerEnv = "SUPAVISE_FUNCTIONS_MAIN_SHA256"
 
 // ServicesFor lists the shared services of a node in start order: Services, plus the Edge
 // Runtime (before Studio, which stays last) when [functions] enabled is set. Callers that
@@ -53,7 +53,7 @@ func MainServiceDir(cfg *config.Config) string {
 
 // edgeRuntimeSpec completes the unit spec of the Edge Runtime. One process serves every
 // project: the main service (functions-main/, embedded in this binary and written to
-// MainServiceDir) picks the project from the X-Sbctl-Project-Ref header the proxy sets,
+// MainServiceDir) picks the project from the X-Supavise-Project-Ref header the proxy sets,
 // and reads the project's functions and environment from <state>/system/edge-runtime/
 // tenants/<ref>/ (written by internal/functions), inside the unit's own state directory. The runtime listens on loopback only. Flags follow the CLI's
 // functions service (packages/stack/src/services/Functions.ts) and the compose file of
@@ -81,19 +81,19 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 		return units.Spec{}, err
 	}
 	s.Env = map[string]string{
-		"SBCTL_FUNCTIONS_PROXY_TOKEN":             token,
-		"EDGE_RUNTIME_PORT":                       port,
-		"SBCTL_FUNCTIONS_ROOT":                    root,
-		"SBCTL_FUNCTIONS_MEMORY_MB":               strconv.Itoa(f.Memory()),
-		"SBCTL_FUNCTIONS_WALL_CLOCK_SEC":          strconv.Itoa(f.WallClock()),
-		"SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC":        strconv.Itoa(f.IdleTimeout()),
-		"SBCTL_FUNCTIONS_MAX_PER_PROJECT":         strconv.Itoa(f.PerProject()),
-		"SBCTL_FUNCTIONS_MAX_WORKERS":             strconv.Itoa(f.Workers()),
-		"SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT": strconv.Itoa(f.WorkersPerProject()),
-		"SBCTL_FUNCTIONS_WORKER_COST_MB":          strconv.Itoa(f.WorkerCostMB()),
-		"SBCTL_FUNCTIONS_CPU_SOFT_MS":             strconv.Itoa(f.CPUSoft()),
-		"SBCTL_FUNCTIONS_CPU_HARD_MS":             strconv.Itoa(f.CPUHard()),
-		"SBCTL_FUNCTIONS_TMP_QUOTA_MB":            strconv.Itoa(f.TmpQuota()),
+		"SUPAVISE_FUNCTIONS_PROXY_TOKEN":             token,
+		"EDGE_RUNTIME_PORT":                          port,
+		"SUPAVISE_FUNCTIONS_ROOT":                    root,
+		"SUPAVISE_FUNCTIONS_MEMORY_MB":               strconv.Itoa(f.Memory()),
+		"SUPAVISE_FUNCTIONS_WALL_CLOCK_SEC":          strconv.Itoa(f.WallClock()),
+		"SUPAVISE_FUNCTIONS_IDLE_TIMEOUT_SEC":        strconv.Itoa(f.IdleTimeout()),
+		"SUPAVISE_FUNCTIONS_MAX_PER_PROJECT":         strconv.Itoa(f.PerProject()),
+		"SUPAVISE_FUNCTIONS_MAX_WORKERS":             strconv.Itoa(f.Workers()),
+		"SUPAVISE_FUNCTIONS_MAX_WORKERS_PER_PROJECT": strconv.Itoa(f.WorkersPerProject()),
+		"SUPAVISE_FUNCTIONS_WORKER_COST_MB":          strconv.Itoa(f.WorkerCostMB()),
+		"SUPAVISE_FUNCTIONS_CPU_SOFT_MS":             strconv.Itoa(f.CPUSoft()),
+		"SUPAVISE_FUNCTIONS_CPU_HARD_MS":             strconv.Itoa(f.CPUHard()),
+		"SUPAVISE_FUNCTIONS_TMP_QUOTA_MB":            strconv.Itoa(f.TmpQuota()),
 		// The runtime keeps one module cache for the whole process (it reads DENO_DIR once,
 		// and a worker cannot change it), so remote imports of all projects share this
 		// directory. The cache is content-addressed by URL and holds public modules only.
@@ -119,7 +119,7 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 		"--graceful-exit-timeout", "10",
 	}
 	// --max-parallelism is a semaphore per pool key (one function), not a limit on the
-	// runtime: the cap on all workers together is the main service's (SBCTL_FUNCTIONS_
+	// runtime: the cap on all workers together is the main service's (SUPAVISE_FUNCTIONS_
 	// MAX_WORKERS), derived from the same budget as the memory limit below.
 	args = append(args, "--max-parallelism", strconv.Itoa(f.Parallelism()))
 	s.Exec = args

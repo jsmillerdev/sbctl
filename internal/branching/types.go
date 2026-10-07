@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // DefaultBranchName is the name the Management API gives the branch that is the project
@@ -104,7 +104,7 @@ func newUUID() string {
 // defaultBranchID derives the stable id of a project's default branch (a version 5 style
 // UUID over the ref), so that repeated listings agree.
 func defaultBranchID(ref string) string {
-	h := sha1.Sum([]byte("sbctl-default-branch:" + ref))
+	h := sha1.Sum([]byte("supavise-default-branch:" + ref))
 	var b [16]byte
 	copy(b[:], h[:16])
 	b[6] = b[6]&0x0f | 0x50

@@ -17,7 +17,7 @@ import {
 import { REF_A, REF_B, writeBundle, writeFunction, writeProject } from './testutil.ts'
 
 async function tmp(): Promise<string> {
-  return await Deno.realPath(await Deno.makeTempDir({ prefix: 'sbctl-main-test-' }))
+  return await Deno.realPath(await Deno.makeTempDir({ prefix: 'supavise-main-test-' }))
 }
 
 Deno.test('refs and slugs are validated', () => {
@@ -26,7 +26,7 @@ Deno.test('refs and slugs are validated', () => {
     assertEquals(validRef(bad), false, bad)
   }
   assertEquals(validSlug('hello-world_2'), true)
-  for (const bad of ['', '1abc', '-x', 'a/b', '..', 'a.b', '.sbctl']) {
+  for (const bad of ['', '1abc', '-x', 'a/b', '..', 'a.b', '.supavise']) {
     assertEquals(validSlug(bad), false, bad)
   }
 })
@@ -61,7 +61,7 @@ Deno.test('parseProjectEnv and parseMeta check their shape', () => {
   })
   assertEquals(parseMeta(bundle.replace(',"eszip":"bundle.eszip"', '')), null)
   assertEquals(parseMeta(bundle.replace('"eszip"', '"wasm"')), null)
-  // Sources are not served: no kind (what an older sbctl wrote) or kind "source".
+  // Sources are not served: no kind (what an older supavise wrote) or kind "source".
   const source = '{"slug":"a","version":2,"verify_jwt":false,"entrypoint":"i.ts"}'
   assertEquals(parseMeta(source), null)
   assertEquals(parseMeta(source.replace('"entrypoint"', '"kind":"source","entrypoint"')), null)
@@ -148,7 +148,7 @@ Deno.test('ProjectStore resolves a bundled function and caches its eszip', async
     assertEquals(await store.eszip(info!), bytes) // the same array: cached
     // A bundle name that leaves the generation is refused.
     await Deno.writeTextFile(
-      `${gen}/.sbctl-function.json`,
+      `${gen}/.supavise-function.json`,
       JSON.stringify({
         slug: 'bundled',
         version: 1,

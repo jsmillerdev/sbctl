@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 var (
@@ -103,7 +103,7 @@ func pgMajor(p *registry.Project) int {
 	return n
 }
 
-// publicScheme is the scheme of sbctl's public listeners.
+// publicScheme is the scheme of supavise's public listeners.
 func (s *Server) publicScheme() string {
 	if s.cfg.TLS.Mode == "off" {
 		return "http"

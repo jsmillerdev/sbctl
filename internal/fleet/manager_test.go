@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // managerRig is a Manager over a fake supervisor whose units bring a health endpoint up
@@ -56,16 +56,16 @@ func TestManagerStartRendersStartsAndWaitsInOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"render sb-pgmeta.service", "start sb-pgmeta.service",
-		"render sb-supavisor.service", "start sb-supavisor.service",
-		"render sb-realtime.service", "start sb-realtime.service",
-		"render sb-storage.service", "start sb-storage.service",
-		"render sb-studio.service", "start sb-studio.service",
+		"render supavise-pgmeta.service", "start supavise-pgmeta.service",
+		"render supavise-supavisor.service", "start supavise-supavisor.service",
+		"render supavise-realtime.service", "start supavise-realtime.service",
+		"render supavise-storage.service", "start supavise-storage.service",
+		"render supavise-studio.service", "start supavise-studio.service",
 	}
 	if got := strings.Split(r.sup.log(), "\n"); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("calls:\n%s", r.sup.log())
 	}
-	if env := r.sup.specs["sb-storage.service"].Env; env["MULTI_TENANT"] != "true" {
+	if env := r.sup.specs["supavise-storage.service"].Env; env["MULTI_TENANT"] != "true" {
 		t.Errorf("storage env = %v", env)
 	}
 	for _, h := range r.m.Status(context.Background()) {
@@ -111,12 +111,12 @@ func TestManagerStartRestartsOnlyWhenTheFilesChanged(t *testing.T) {
 
 func TestManagerOneFailureDoesNotBlockTheRest(t *testing.T) {
 	r := newManagerRig(t, nil)
-	r.sup.failOn["start sb-realtime.service"] = errors.New("exec format error")
+	r.sup.failOn["start supavise-realtime.service"] = errors.New("exec format error")
 	err := r.m.Start(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "realtime") || !strings.Contains(err.Error(), "exec format error") {
 		t.Fatalf("err = %v", err)
 	}
-	if !strings.Contains(r.sup.log(), "start sb-storage.service") || !strings.Contains(r.sup.log(), "start sb-studio.service") {
+	if !strings.Contains(r.sup.log(), "start supavise-storage.service") || !strings.Contains(r.sup.log(), "start supavise-studio.service") {
 		t.Fatalf("later services were skipped:\n%s", r.sup.log())
 	}
 }
@@ -128,7 +128,7 @@ func TestManagerMissingStudioArtifactIsNotFatal(t *testing.T) {
 	if err := r.m.Start(context.Background()); err != nil {
 		t.Fatalf("a Studio without an artifact must not fail Start: %v", err)
 	}
-	if !strings.Contains(r.sup.log(), "start sb-storage.service") {
+	if !strings.Contains(r.sup.log(), "start supavise-storage.service") {
 		t.Fatal("the other services must still start")
 	}
 	var studio *Health
@@ -153,14 +153,14 @@ func TestManagerMissingArtifactIsReportedPerService(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "storage") || strings.Contains(err.Error(), "realtime") {
 		t.Fatalf("err = %v", err)
 	}
-	if !strings.Contains(r.sup.log(), "start sb-studio.service") {
+	if !strings.Contains(r.sup.log(), "start supavise-studio.service") {
 		t.Fatal("the other services must still start")
 	}
 }
 
 func TestManagerStudioUnitFailureIsNotFatal(t *testing.T) {
 	r := newManagerRig(t, nil)
-	r.sup.failOn["start sb-studio.service"] = errors.New("read-only file system")
+	r.sup.failOn["start supavise-studio.service"] = errors.New("read-only file system")
 	if err := r.m.Start(context.Background()); err != nil {
 		t.Fatalf("a Studio unit that fails must not fail Start: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestManagerStartFailsFastWhenTheUnitDies(t *testing.T) {
 	}
 	began := time.Now()
 	err := r.m.Start(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "sb-storage.service is failed") {
+	if err == nil || !strings.Contains(err.Error(), "supavise-storage.service is failed") {
 		t.Fatalf("err = %v", err)
 	}
 	if time.Since(began) > 3*time.Second {
@@ -218,7 +218,7 @@ func TestManagerStopReverseOrderAndStatus(t *testing.T) {
 	if err := r.m.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	want := "stop sb-studio.service|stop sb-storage.service|stop sb-realtime.service|stop sb-supavisor.service|stop sb-pgmeta.service"
+	want := "stop supavise-studio.service|stop supavise-storage.service|stop supavise-realtime.service|stop supavise-supavisor.service|stop supavise-pgmeta.service"
 	if got := strings.ReplaceAll(r.sup.log(), "\n", "|"); got != want {
 		t.Fatalf("calls = %s", got)
 	}
@@ -314,7 +314,7 @@ func TestRefreshStudioFollowsDashboardSSO(t *testing.T) {
 	if err := os.WriteFile(run, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	env := func() map[string]string { return r.sup.specs["sb-studio.service"].Env }
+	env := func() map[string]string { return r.sup.specs["supavise-studio.service"].Env }
 	if _, err := r.m.Specs(ctx); err != nil { // the services' secrets exist on a node that ran Start
 		t.Fatal(err)
 	}
@@ -331,7 +331,7 @@ func TestRefreshStudioFollowsDashboardSSO(t *testing.T) {
 	if v := env()["NEXT_PUBLIC_DISABLED_FEATURES"]; v == "" || strings.Contains(v, "sign_in_with_sso") {
 		t.Fatalf("with a provider Studio is told %q", v)
 	}
-	if !strings.Contains(r.sup.log(), "stop sb-studio.service") && r.sup.state["sb-studio.service"] != units.StateActive {
+	if !strings.Contains(r.sup.log(), "stop supavise-studio.service") && r.sup.state["supavise-studio.service"] != units.StateActive {
 		t.Fatalf("Studio was not restarted on the changed file: %s", r.sup.log())
 	}
 	sso = false

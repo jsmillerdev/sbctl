@@ -25,13 +25,13 @@ type OrgRef struct {
 }
 
 // DefaultInvitationTTL is how long an invitation stays valid. Hosted keeps one for 24 hours;
-// sbctl keeps it for a week because without a mail server the link travels by hand.
+// supavise keeps it for a week because without a mail server the link travels by hand.
 const DefaultInvitationTTL = 7 * 24 * time.Hour
 
 // InvitationPrefix starts every invitation token.
 const InvitationPrefix = "sbo_"
 
-// Service applies the membership rules over a Store. The API server, the sbctl CLI and the
+// Service applies the membership rules over a Store. The API server, the supavise CLI and the
 // SSO workstream share it.
 type Service struct {
 	Store Store

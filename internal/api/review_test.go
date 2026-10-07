@@ -6,7 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"github.com/OWNER/sbctl/internal/members"
+	"github.com/jsmillerdev/supavise/internal/members"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -14,12 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
-// The dashboard session of anyone who signs in to sb-gotrue@system is not enough:
-// the user needs the sbctl_admin claim or a place on the allowlist.
+// The dashboard session of anyone who signs in to supavise-gotrue@system is not enough:
+// the user needs the supavise_admin claim or a place on the allowlist.
 func TestAuthAdminGate(t *testing.T) {
 	f := newFixture(t)
 	f.cfg.API.AdminEmails = " Ops@Example.test , other@example.test"

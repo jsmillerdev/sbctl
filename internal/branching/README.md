@@ -6,17 +6,17 @@ creates one per task, merges what worked and deletes the rest. A non-persistent 
 itself when its lifetime ends.
 
 `branching.Service` is the library. The Management API's branch endpoints
-(`internal/api/branches.go`) and `sbctl branches` (`cmd/sbctl/cmd_branches.go`) are thin
+(`internal/api/branches.go`) and `supavise branches` (`cmd/supavise/cmd_branches.go`) are thin
 wrappers over it, so the stock Supabase CLI (`supabase branches ...`) and the Supabase MCP
 server's branch tools work unchanged (verified, below).
 
 ## Wiring
 
-`sbctl serve` (`internal/app/serve.go`) builds the service, hands it to the API as
+`supavise serve` (`internal/app/serve.go`) builds the service, hands it to the API as
 `Deps.Branching`, runs the expiry sweeper (`svc.Run(gctx)`) and drains running branch operations
 with the API's drain at shutdown (a cut-off operation ends `MIGRATIONS_FAILED`; nothing else is
 left half-done that the lifecycle's own recovery does not handle). That wiring compiles and is
-covered by the API tests, but it was not exercised by a running `sbctl serve`: `TestServeIntegration`
+covered by the API tests, but it was not exercised by a running `supavise serve`: `TestServeIntegration`
 in `internal/app` uses ports outside the range this workstream was allowed, and the real clients below
 ran against `internal/branching`'s own harness (`TestServe`), which mounts the same API and service.
 
@@ -40,7 +40,7 @@ branch and refuses to create one.
 
 ## Data model
 
-Migration `0700_branching.sql` adds nullable columns to `sbctl.projects`: `branch_id` (UUID,
+Migration `0700_branching.sql` adds nullable columns to `supavise.projects`: `branch_id` (UUID,
 stable across reset), `parent_ref` (foreign key, `on delete restrict`), `branch_name` (unique per
 parent), `git_branch`, `persistent`, `with_data`, `expires_at`, `deletion_scheduled_at`,
 `notify_url`, `branch_state`, `branch_detail`, `clone_method`, `review_requested_at`.
@@ -72,7 +72,7 @@ Create, merge, reset and push run detached from the request. The API answers at 
 (`201`, with the new branch in `CREATING_PROJECT` for a create, or `{workflow_run_id,
 message: "ok"}` for the others) and the branch's `status` follows: `CREATING_PROJECT`,
 `RUNNING_MIGRATIONS`, then `MIGRATIONS_PASSED` or `MIGRATIONS_FAILED` with the cause in
-`branch_detail` (`sbctl branches get`). `preview_project_status` is the project's own status.
+`branch_detail` (`supavise branches get`). `preview_project_status` is the project's own status.
 A branch that is busy refuses another operation with `409`. Events `branch.<op>.started`,
 `.succeeded` and `.failed` (with the run id) go to both the branch's and the parent's event
 log; a `notify_url` gets a POST when the operation ends. The sweeper marks an operation that
@@ -98,24 +98,24 @@ every larger size to `large`); without one a branch is `[branching] default_clas
 (`supabase_migrations.schema_migrations`: versions, names and statements, each migration in its own
 transaction, or outside one when a statement refuses to run in a transaction block), then the
 seed. The Management API has no seed field, so the seed is stored per parent:
-`sbctl branches seed set <parent-ref> --file seed.sql` (sealed like a project secret under the name
-`branch_seed`), or `sbctl branches create ... --seed-file` for one branch. A failing migration or seed
+`supavise branches seed set <parent-ref> --file seed.sql` (sealed like a project secret under the name
+`branch_seed`), or `supavise branches create ... --seed-file` for one branch. A failing migration or seed
 leaves the branch in `MIGRATIONS_FAILED` for inspection. Objects the parent got outside the
 migration history (the SQL editor, `execute_sql`) are not in a schema-only branch: use `with_data`.
 
 **With data**
 
 > **A `with_data` branch is a copy of production.** Whoever can run SQL in it can read all of the parent's
-> data. sbctl replaces the credentials it knows about and cuts the branch off from the outside (below), but
+> data. Supavise replaces the credentials it knows about and cuts the branch off from the outside (below), but
 > it does not detect node-local credentials that users put in their own tables, in function bodies, in Vault
-> entries other than the keys sbctl issued, or in settings, and a branch can reach every port on loopback
+> entries other than the keys Supavise issued, or in settings, and a branch can reach every port on loopback
 > (the filter is on addresses, not ports). Branches are schema-only by default; `with_data` is opt-in and
 > meant for trusted users and agents. See "What a branch with data can and cannot reach".
 >
 > Creating a `with_data` branch through the Management API needs the Owner or Administrator role (also
 > when the role is scoped to the parent project), and so does resetting one (a reset clones the parent's
 > current data again); Developers keep creating and resetting schema-only branches. The API
-> answers 403 with the usual role-denial body. `sbctl branches create` runs on the node as its operator
+> answers 403 with the usual role-denial body. `supavise branches create` runs on the node as its operator
 > and is not checked.
 
 ### What a branch contains
@@ -128,9 +128,9 @@ migration history (the SQL editor, `execute_sql`) are not in a schema-only branc
 | Storage objects | none | none: the rows of `storage.objects` (and `storage.prefixes`, `storage.s3_multipart_uploads*`) are removed from the clone; the files stay with the parent. Exception: when a table of yours has a foreign key into one of them, the rows stay (see below) |
 | Edge Functions | none | none |
 | Function secrets | none | none |
-| API keys, JWT secret, database password | the branch's own | the branch's own (the parent's are replaced everywhere sbctl finds them) |
+| API keys, JWT secret, database password | the branch's own | the branch's own (the parent's are replaced everywhere Supavise finds them) |
 
-Hosted Supabase does not copy Storage objects or Edge Functions into a branch, and neither does sbctl.
+Hosted Supabase does not copy Storage objects or Edge Functions into a branch, and neither does Supavise.
 A branch is a project of its own with its own Storage tenant and its own functions, so nothing is shared
 with the parent and nothing is copied half way:
 
@@ -190,7 +190,7 @@ is up the service seals new passwords for all six service roles, sets them over 
 private unix socket as SCRAM verifiers (never plaintext, with statement logging off), and calls
 `Manager.RotateKeys`: new JWT secret and API keys, GoTrue and PostgREST restart, fleet tenants are
 updated. The parent's database password does not open the branch (tested). The temporary CLI login
-roles the parent issued (`cli_login_*`, `sbctl_cli_ro_*`) are copied with their password verifiers;
+roles the parent issued (`cli_login_*`, `supavise_cli_ro_*`) are copied with their password verifiers;
 the rotation sets them `NOLOGIN` with no password and an expired validity (the API's expired-role
 sweep drops them), so a parent's `supabase db push` password does not open the branch either
 (tested). The pgsodium root key
@@ -213,8 +213,8 @@ legacy anon and service_role JWTs, any other anon or service_role JWT that verif
 parent's JWT secret (an older key, expired or not), the `sb_publishable_` and `sb_secret_` keys,
 the JWT secret, and the parent's six database passwords. A value is rewritten when it contains one
 (`Bearer <key>`, a connection string), not only when it equals one; a credential shorter than 20
-characters (sbctl generates none) is matched whole. What was replaced is recorded by name, never
-by value: the event `branch.credentials_rewritten` and the table `sbctl_branch.rewritten_credentials`
+characters (Supavise generates none) is matched whole. What was replaced is recorded by name, never
+by value: the event `branch.credentials_rewritten` and the table `supavise_branch.rewritten_credentials`
 (kind, name, which credentials). A failure stops the branch like a failed rotation. Not detected:
 see "What a branch with data can and cannot reach".
 
@@ -247,7 +247,7 @@ never receives. pg_cron jobs, pg_net calls included, would run on both. Requests
 would be sent twice. So both with_data paths start the cluster the first time with
 `max_logical_replication_workers = 0`, `cron.launch_active_jobs = off` and `pg_net.database_name`
 pointing at a database that does not exist (written to `postgresql.auto.conf` by the data seeder,
-marked `# sbctl-branch-quarantine`: by the copy-on-write seeder right after the clone, and by the
+marked `# supavise-branch-quarantine`: by the copy-on-write seeder right after the clone, and by the
 restore's seeder on the base-backup path, in both cases before the first postmaster starts; unit tests
 cover both seeders, and the integration test asks the first postmaster for its settings and its
 replication processes before isolation runs). Over the private socket, in every database, every subscription
@@ -256,10 +256,10 @@ NONE)`, so the publisher's slot is not dropped either), `cron.job` rows are set 
 `[branching] keep_cron_jobs = true`) and `net.http_request_queue` is emptied. Then the marked lines
 are removed (the parent's own lines for those three settings, saved beside the file, are put back; a restore rewrites the file with ALTER SYSTEM, so a marker alone would not survive), the cluster restarts on the node's ordinary settings, and the credentials rotate. The
 event `branch.isolated` records the counts. If any step fails the branch is stopped (`MIGRATIONS_FAILED`,
-like a failed rotation). A pg_cron job that was paused is recorded in `sbctl_branch.paused_cron_jobs` in the
+like a failed rotation). A pg_cron job that was paused is recorded in `supavise_branch.paused_cron_jobs` in the
 database that holds `cron.job` (`jobid`, `jobname`, `schedule`, `database`, `username`, `paused_at`), so that
 whoever owns the branch can opt in later:
-`update cron.job set active = true where jobid in (select jobid from sbctl_branch.paused_cron_jobs);`.
+`update cron.job set active = true where jobid in (select jobid from supavise_branch.paused_cron_jobs);`.
 pg_cron stamps the parent's port into each job (`cron.job.nodename`, `nodeport`) when it is scheduled, so
 isolation sets every job's `nodename` and `nodeport` to the branch's own cluster (`127.0.0.1` and its port,
 whether or not the job is paused); a job re-activated later cannot connect to the parent as its user
@@ -269,13 +269,13 @@ and databases with `datallowconn = false` included: such a database is opened fo
 `ALTER DATABASE ... ALLOW_CONNECTIONS true` as the superuser and closed again afterwards (named in the event as
 `databases_opened`; the flags are as the parent had them). The owner of such a database could otherwise allow
 connections again in the branch and find its foreign servers and Vault secrets as the parent had them. If
-sbctl stops between the two statements the flag stays open, and the branch did not finish creating, so it
+Supavise stops between the two statements the flag stays open, and the branch did not finish creating, so it
 ends up failed.
 Re-activating a job is not enough to make it behave as in the parent, because two things inside
 its command were changed: a connection string written as a literal (`dblink('host=... password=...', ...)`)
-was replaced by a disabled one (the jobs are in `sbctl_branch.neutralized_cron_commands`; the original
+was replaced by a disabled one (the jobs are in `supavise_branch.neutralized_cron_commands`; the original
 is not kept, it may hold a password), and a parent credential (an API key, a JWT secret, a database
-password) was replaced by the branch's own (`sbctl_branch.rewritten_credentials`). A job that reaches a
+password) was replaced by the branch's own (`supavise_branch.rewritten_credentials`). A job that reaches a
 foreign server by name needs that server turned on again (next paragraph).
 Tested on real clusters (`TestIntegrationCloneIsolatesTheParentsIntegrations`).
 
@@ -286,12 +286,12 @@ database of a branch that does not have the egress opt-out, **every** foreign se
 Postgres protocol is disabled, loopback or not: `postgres_fdw` and `dblink_fdw` servers, and any server
 that carries a libpq option (`host`, `hostaddr`, `port`, `dbname`, `service`), which `dblink_connect`
 accepts by name. Its `host` becomes a unix socket path that does not exist
-(`/nonexistent/sbctl-branch-disabled`: no network, no DNS) and `hostaddr` and `service` are dropped.
+(`/nonexistent/supavise-branch-disabled`: no network, no DNS) and `hostaddr` and `service` are dropped.
 Every user mapping of any wrapper with a `password`, `sslpassword` or `passwd` option loses it.
 Another wrapper whose validator refuses the change is left as it was and
 named in the `branch.isolated` event (`foreign_servers_not_neutralized`) and in the table. This is
 `neutralizeForeign` (`foreign.go`), in one transaction per database, safe to run twice.
-What was done is recorded in `sbctl_branch.paused_foreign_servers` (server, wrapper, the host,
+What was done is recorded in `supavise_branch.paused_foreign_servers` (server, wrapper, the host,
 hostaddr, port and plain database name it had, the roles whose mapping lost a password, a note).
 **The passwords are not recorded anywhere**: they are credentials, the table is readable by whoever
 owns the branch (maybe an untrusted agent), and a copy encrypted with a key the node holds would be
@@ -317,8 +317,8 @@ with data has these defaults:
    would be a DNS side channel out of a confined unit. Every client of a project's Postgres uses 127.0.0.1 (the cluster
    listens on `127.0.0.1` only; GoTrue, PostgREST, the pooler and the fleet connect to it) or the unix socket, which a
    filter on IP addresses does not touch. An earlier release allowed 127.0.0.0/8: the next render of a unit narrows it.
-   The IP filter does not touch unix sockets, so the Postgres unit template (`deploy/systemd/sb-postgres@.service`) hides
-   them with `InaccessiblePaths`: all of `/etc/sbctl` (master key and config) and `/run/dbus` (the system bus, where a
+   The IP filter does not touch unix sockets, so the Postgres unit template (`deploy/systemd/supavise-postgres@.service`) hides
+   them with `InaccessiblePaths`: all of `/etc/supavise` (master key and config) and `/run/dbus` (the system bus, where a
    polkit rule could let the unit lift its own filter), plus systemd-resolved's varlink socket
    (`/run/systemd/resolve/io.systemd.Resolve`, which glibc uses for lookups through `nss-resolve`) and nscd's socket. They are hidden
    for every project's Postgres, not only for a branch's: systemd 255 does not let `InaccessiblePaths` of a unit change over D-Bus
@@ -337,11 +337,11 @@ with data has these defaults:
 The filter is applied after the first start, not before: the first postmaster already runs with the
 first-start settings, and a base-backup restore may need the backup backend to finish recovery.
 The branch's `egress` field says where it stands: `pending` (until isolation finishes), `denied`, `allowed`
-or `unenforced`. It is in `sbctl branches get --json` (`egress`), in the branch JSON of the API (`sbctl_egress`, an extra field next to the
+or `unenforced`. It is in `supavise branches get --json` (`egress`), in the branch JSON of the API (`supavise_egress`, an extra field next to the
 spec's; clients that decode the spec ignore it), and the branch's `detail` says in words what the branch can reach.
 A reset keeps the policy: the new cluster is created open, then denied again after its first start.
 
-**Opt-out**: `sbctl branches create ... --with-data --allow-egress`, or `POST /v1/projects/{ref}/branches?allow_egress=true`
+**Opt-out**: `supavise branches create ... --with-data --allow-egress`, or `POST /v1/projects/{ref}/branches?allow_egress=true`
 (the query parameter is ours, like `force` on merge: the spec's create body is unchanged, so the stock CLI and the
 MCP server cannot set it and always get the default). With it the branch keeps the parent's outbound side effects: no egress block, the
 cron jobs stay active (as they do with `[branching] keep_cron_jobs`, the node-wide setting, which keeps
@@ -385,9 +385,9 @@ are named under Verified.
   in a cron command is replaced, and the cron jobs are paused.
 * Use the parent's API keys, JWT secret or database passwords where the parent's setup kept them
   (Vault secrets, cron commands, database and role settings): they are the branch's own keys now (above). This covers the keys
-  sbctl issued and only those; see the first item under "Residual risk".
+  Supavise issued and only those; see the first item under "Residual risk".
 * Open another project's Postgres through its unix socket or read its files: the unit sees an empty
-  `/var/lib/sbctl` with only its own cluster directory (the mount namespace in `sb-postgres@.service`; read from the unit file, not tested here).
+  `/var/lib/supavise` with only its own cluster directory (the mount namespace in `supavise-postgres@.service`; read from the unit file, not tested here).
 * Keep the parent's subscriptions, queued pg_net requests or active cron jobs (above), or the sessions of the parent's
   users (refresh tokens, one-time tokens, flow state; above).
 
@@ -395,7 +395,7 @@ are named under Verified.
 
 * Reach **any port on 127.0.0.1 and ::1**. The filter is on addresses, not ports, so from the branch's Postgres
   the parent's Postgres and every other project's (their ports follow from the project's sequence number), the
-  proxy, sbctl's admin API (`127.0.0.1:7000` by default) and the fleet services are connectable. What stands between the branch and
+  proxy, Supavise's admin API (`127.0.0.1:7000` by default) and the fleet services are connectable. What stands between the branch and
   those is their own authentication, which is why the parent's credentials are replaced. pg_net, `COPY ... PROGRAM` (superuser only),
   untrusted procedural languages and a `dblink` connection string typed into a query all connect from there.
 * Use any credential of the parent that the branch's data holds in a place that is **not** rewritten, or that someone brings in.
@@ -403,9 +403,9 @@ are named under Verified.
 **Residual risk, not covered**:
 
 * **Accepted by design: node-local credentials that users stored themselves are not detected.** A `with_data` branch is
-  a copy of production, and sbctl cannot tell which strings in it are secrets. Credentials in arbitrary user tables, in function
+  a copy of production, and Supavise cannot tell which strings in it are secrets. Credentials in arbitrary user tables, in function
   bodies, in trigger arguments (the headers of a database webhook), in the options of foreign tables or of other wrappers' servers,
-  in Storage objects, in a Vault secret's name or description, in Vault entries other than the keys sbctl issued, in settings other
+  in Storage objects, in a Vault secret's name or description, in Vault entries other than the keys Supavise issued, in settings other
   than the ones rewritten, in encoded or split form, or set with `ALTER SYSTEM`, stay as they were. That includes a connection string
   or key for **another project on this node or for a custom login role of the parent**, an `sbp_` personal access token for the
   admin API, and a JWT with a role other than `anon` or `service_role`. Whoever can run SQL in the branch can read them and use them
@@ -479,8 +479,8 @@ like any deleted project's. `?force=false` schedules the deletion after `soft_de
 project.
 
 `expires_at` is set when a non-persistent branch becomes ready, `now + [branching] default_ttl`
-(7 days; `sbctl branches create --ttl 6h`; `off` disables). `Service.Run(ctx)` sweeps every
-`sweep_interval_seconds` (60), at start too; `sbctl branches sweep [--dry-run]` does one pass by
+(7 days; `supavise branches create --ttl 6h`; `off` disables). `Service.Run(ctx)` sweeps every
+`sweep_interval_seconds` (60), at start too; `supavise branches sweep [--dry-run]` does one pass by
 hand. `PATCH` with `persistent: true` clears the expiry, `false` starts the default lifetime.
 
 ## Limits and guards
@@ -491,7 +491,7 @@ http(s) and the call refuses loopback, private, link-local, shared (100.64.0.0/1
 put their metadata service), benchmarking (198.18.0.0/15), IETF-reserved (192.0.0.0/24, 240.0.0.0/4)
 and NAT64 (64:ff9b::/96) addresses at connect time unless `allow_private_notify_urls` is set.
 
-## Configuration (`[branching]`, or `SBCTL_BRANCHING_*`)
+## Configuration (`[branching]`, or `SUPAVISE_BRANCHING_*`)
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -508,17 +508,17 @@ and NAT64 (64:ff9b::/96) addresses at connect time unless `allow_private_notify_
 ## CLI
 
 ```
-sbctl branches list <project-ref> [--json]
-sbctl branches create <project-ref> <name> [--with-data [--allow-egress]] [--persistent] [--ttl 6h|off] [--size micro]
+supavise branches list <project-ref> [--json]
+supavise branches create <project-ref> <name> [--with-data [--allow-egress]] [--persistent] [--ttl 6h|off] [--size micro]
                       [--git-branch b] [--seed-file f] [--notify-url u] [--no-wait] [--json]
-sbctl branches get|delete|restore|diff <id|ref|name --project <ref>>   # delete --schedule
-sbctl branches merge|reset|push <id|ref|name> [--project <ref>] [--migration-version v] [--force] [--no-wait]
-sbctl branches sweep [--dry-run]
-sbctl branches seed set|get|clear <project-ref> [--file seed.sql]
+supavise branches get|delete|restore|diff <id|ref|name --project <ref>>   # delete --schedule
+supavise branches merge|reset|push <id|ref|name> [--project <ref>] [--migration-version v] [--force] [--no-wait]
+supavise branches sweep [--dry-run]
+supavise branches seed set|get|clear <project-ref> [--file seed.sql]
 ```
 
-Like `sbctl projects`, these open the node in the calling process (system cluster running, run as
-the `sbctl` user).
+Like `supavise projects`, these open the node in the calling process (system cluster running, run as
+the `supavise` user).
 
 ## Verified
 
@@ -547,10 +547,10 @@ plus a parent and at most two branches, class micro):
   and signs the user in again, the parent's token still works afterwards; cron jobs name the branch's port and the parent's are
   unchanged; a database with `datallowconn = false` (and one that is a template) has its foreign servers disabled and its Vault
   secret rewritten and keeps its flags. Under systemd `tests/linux/branching-egress.sh` checks that the denied unit hides the resolver
-  socket, nscd's socket, `/run/dbus` and `/etc/sbctl` inside its mount namespace.
+  socket, nscd's socket, `/run/dbus` and `/etc/supavise` inside its mount namespace.
 * Outbound isolation: `TestIntegrationCloneIsolatesTheParentsIntegrations` also checks, on the exec backend, that the
   branch reports `egress: unenforced` with a detail that says "egress NOT blocked", that the paused cron job is
-  recorded in `sbctl_branch.paused_cron_jobs` (and the table is absent with `keep_cron_jobs`), and that
+  recorded in `supavise_branch.paused_cron_jobs` (and the table is absent with `keep_cron_jobs`), and that
   `allow_egress` reports `allowed` and keeps the job. Unit tests cover the policy per supervisor, reset keeping it, the
   free-disk refusals (create, reset, the base-backup path, schema-only exempt) and the API's 409. Under systemd,
   `tests/linux/branching-egress.sh` (CI job `branching-xfs`, ubuntu-24.04, a loop-file XFS state directory) passed: the
@@ -573,7 +573,7 @@ plus a parent and at most two branches, class micro):
   an unrelated one) and database settings holding the service key. In the branch both servers have the disabled host and no password,
   an insert through the foreign table and `dblink_connect` fail and the other project is not written to, the table names the servers and
   holds no password, the cron command keeps its SQL but not its connection string, the Vault secrets, the cron command and the setting
-  hold the branch's keys and the unrelated ones are unchanged, the names (not values) are in `sbctl_branch.rewritten_credentials` and in
+  hold the branch's keys and the unrelated ones are unchanged, the names (not values) are in `supavise_branch.rewritten_credentials` and in
   the events; the parent's foreign table, vault and cron commands are unchanged. A branch with `allow_egress` keeps the foreign server
   and its password and still gets its credentials replaced. Unit tests cover the credential matching (current and older keys, expired
   keys, other roles, keys of another project, short secrets), the connection-string scanner, the order (rotate, then rewrite), the failure
@@ -594,7 +594,7 @@ plus a parent and at most two branches, class micro):
 * **Supabase CLI 2.119.0** with `--profile`: `branches create --with-data`, `list`, `get`, `update
   --persistent`, `delete` all decode (the CLI is strict) and work; `get` prints the branch's pooler
   URLs and keys. The CLI needs `--experimental` for these commands.
-* `sbctl branches create --with-data`, `reset`, `merge`, `push`, `diff`, `delete`, `sweep` against a
+* `supavise branches create --with-data`, `reset`, `merge`, `push`, `diff`, `delete`, `sweep` against a
   running node, and the daemon sweeper deleting a branch whose `--ttl 8s` ran out.
 
 Clone timings (APFS, darwin-arm64, exec backend, `TestIntegrationCloneSize`):
@@ -625,7 +625,7 @@ is a full copy; on XFS and APFS it stays flat.
 * ZFS without block cloning uses the base-backup path (see With data); no ZFS was available to try
   OpenZFS block cloning through the `reflink` path.
 * Branches are not covered by the nightly base backup timer until something enables
-  `sb-basebackup@<ref>.timer` for them (the lifecycle does not enable timers yet); a persistent
+  `supavise-basebackup@<ref>.timer` for them (the lifecycle does not enable timers yet); a persistent
   branch is backed up on delete only.
 * `reflink` (XFS) and the ext4 base-backup path ran in CI only, on a loop-file XFS; btrfs and ZFS were not run.
 * Egress is blocked only where the supervisor can do it (systemd); on the exec backend a branch with data reports
@@ -633,7 +633,7 @@ is a full copy; on XFS and APFS it stays flat.
   it blocks WAL archiving to an `s3://` backup backend; a schema-only branch is not isolated at all. Loopback is open on every port
   (see "What a branch with data can and cannot reach", which also lists what the credential replacement does not find).
 * The paused pg_cron jobs, the disabled foreign servers and their passwords are restored by hand (the SQL under Isolation and Foreign
-  servers); there is no `sbctl` command for it. The passwords are not kept, so the owner enters them again.
+  servers); there is no `supavise` command for it. The passwords are not kept, so the owner enters them again.
 * The base-backup reset path is tested end to end on APFS (`TestIntegrationBranching`); the unit tests
   fake the failure after the old cluster is removed, because a failing restore needs a real archive.
 * No idle sleep: an unused branch costs its idle memory (about 130 MB with GoTrue and PostgREST).
@@ -644,7 +644,7 @@ is a full copy; on XFS and APFS it stays flat.
 * The Management API's action-run endpoints (`/v1/projects/{ref}/actions`, used by Studio's branch
   pages) are stubs; progress is the branch's status and `branch_detail`.
 * `GET /v1/branches/{id}` reports the pooler (`pooler.<domain>`, session port, user
-  `postgres.<ref>`) as the database address: sbctl has no direct database host.
+  `postgres.<ref>`) as the database address: Supavise has no direct database host.
 * Cross-process exclusion of two operations on one branch relies on the registry state (and the
   in-process table), not on a lock: two processes starting an operation in the same instant can both
   proceed. Lifecycle operations are serialized by the lifecycle's own advisory lock.

@@ -3,10 +3,10 @@
 # Studio's permission list says about them, what the Management API lets them do through
 # personal access tokens, and the real Supabase CLI and MCP server with a Read-only user's token.
 #
-#   sudo env "PATH=$PATH" SBCTL_BIN=/path/to/sbctl-linux-amd64 [SUPABASE_CLI=/path/to/supabase] [REQUIRE_CLIENTS=1] \
+#   sudo env "PATH=$PATH" SUPAVISE_BIN=/path/to/supavise-linux-amd64 [SUPABASE_CLI=/path/to/supabase] [REQUIRE_CLIENTS=1] \
 #     tests/linux/roles-smoke.sh [--teardown]
 #
-# - the claimed first user is Owner; `sbctl users invite --role` makes an Administrator, a
+# - the claimed first user is Owner; `supavise users invite --role` makes an Administrator, a
 #   Developer and a Read-only member through the claim page (the link carries the token);
 # - GET /platform/profile/permissions answers what each role may do in Studio's own terms;
 # - with a PAT, Read-only reads (SELECT, list, types) and is refused every write (secrets,
@@ -15,11 +15,11 @@
 #   Owners, the last Owner cannot be demoted or removed;
 # - the MCP server (apply_migration, execute_sql) and, when SUPABASE_CLI is set, the Supabase CLI
 #   (secrets set) list as Read-only and are refused writes; an Owner's can;
-# - [mail] reaches sb-gotrue@system: an invitation to a new address (GoTrue invite) and to an
+# - [mail] reaches supavise-gotrue@system: an invitation to a new address (GoTrue invite) and to an
 #   existing account (sign-in link) arrive at a mail sink, and following each link signs the person
 #   in on the invitation, which they accept and join with the invited role.
 #
-# Without SBCTL_BIN the script builds sbctl with the go toolchain. It needs network access for the
+# Without SUPAVISE_BIN the script builds supavise with the go toolchain. It needs network access for the
 # artifact downloads and, for the MCP server, npm. Not run in development (root, systemd and Linux
 # required); CI runs it on an ephemeral Ubuntu 24.04 VM (amd64 and arm64).
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -40,7 +40,7 @@ ORG=default   # the claim keeps the organization the first project created
 preflight
 install_binary
 setup_node
-cat >>"$SBCTL_CONF" <<CONF
+cat >>"$SUPAVISE_CONF" <<CONF
 
 [ports]
 supavisor_session = $P_SESSION
@@ -54,19 +54,19 @@ studio = $P_STUDIO
 [fleet]
 supavisor_api_port = $P_API
 
-# sb-gotrue@system sends the dashboard's mail through this relay (a sink started below).
+# supavise-gotrue@system sends the dashboard's mail through this relay (a sink started below).
 [mail]
 smtp_host = "127.0.0.1"
 smtp_port = $P_SMTP
-smtp_from = "sbctl@example.com"
+smtp_from = "supavise@example.com"
 smtp_name = "Roles smoke"
 CONF
 
 # Same VM-local workaround as settings-smoke.sh.
-install -d /etc/systemd/system/sb-postgres@.service.d
-cat >/etc/systemd/system/sb-postgres@.service.d/10-roles-smoke.conf <<'CONF'
+install -d /etc/systemd/system/supavise-postgres@.service.d
+cat >/etc/systemd/system/supavise-postgres@.service.d/10-roles-smoke.conf <<'CONF'
 [Service]
-ReadWritePaths=/var/lib/sbctl/artifacts
+ReadWritePaths=/var/lib/supavise/artifacts
 CONF
 systemctl daemon-reload
 
@@ -103,25 +103,25 @@ SMTP_PID=$!
 
 log "system init, fleet, one project"
 system_init
-wait_active sb-postgres@system.service 30
-sbctl fleet start || fail "fleet start"
+wait_active supavise-postgres@system.service 30
+supavise fleet start || fail "fleet start"
 REF=$(create_project roles micro)
 [[ $REF =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF'"
-sbctl fleet ensure-tenant "$REF" || fail "ensure-tenant"
+supavise fleet ensure-tenant "$REF" || fail "ensure-tenant"
 CFG="/v1/projects/$REF"
 PGPORT=$(project_field "$REF" 'd["ports"]["Postgres"]')
-PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
-sql() { sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$REF/postgres/sock port=$PGPORT user=supabase_admin dbname=postgres" -Atc "$1" </dev/null; }
+PSQL=$(ls -d "$SUPAVISE_STATE"/artifacts/postgres/*/bin/psql | head -1)
+sql() { sudo -u "$SUPAVISE_USER" "$PSQL" "host=$SUPAVISE_STATE/projects/$REF/postgres/sock port=$PGPORT user=supabase_admin dbname=postgres" -Atc "$1" </dev/null; }
 
-log "daemon: sbctl.service"
-systemctl start sbctl.service
+log "daemon: supavise.service"
+systemctl start supavise.service
 for ((i = 0; i < 60; i++)); do
   [[ $(http_code "$ADMIN/v1/projects") == 401 ]] && break
   sleep 1
 done
-[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u sbctl.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
+[[ $(http_code "$ADMIN/v1/projects") == 401 ]] || { journalctl --no-pager -u supavise.service | tail -30 >&2; fail "the Management API does not answer on the admin listener"; }
 
-dash() { curl -sS -m 60 -X "$1" -H "Host: api.$SBCTL_DOMAIN" "${@:3}" "http://127.0.0.1$2"; }
+dash() { curl -sS -m 60 -X "$1" -H "Host: api.$SUPAVISE_DOMAIN" "${@:3}" "http://127.0.0.1$2"; }
 sign_in() { dash POST '/auth/v1/token?grant_type=password' -H 'Content-Type: application/json' -d "{\"email\":\"$1\",\"password\":\"$PASSWORD\"}" | json_get 'd["access_token"]'; }
 jwt_sub() { python3 -c 'import base64,json,sys; p=sys.argv[1].split(".")[1]; print(json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4)))["sub"])' "$1"; }
 declare -A JWT PAT UID_OF
@@ -150,7 +150,7 @@ papi() { # JWT METHOD PATH [BODY]: a /platform call with a dashboard session; th
 }
 
 log "the first user is the Owner"
-CLAIM=$(sbctl claim token | tr -d '[:space:]')
+CLAIM=$(supavise claim token | tr -d '[:space:]')
 [[ $CLAIM =~ ^sbc_[0-9a-f]{48}$ ]] || fail "claim token '$CLAIM'"
 [[ $(dash POST /claim -H 'Content-Type: application/json' -o /dev/null -w '%{http_code}' \
   -d "{\"token\":\"$CLAIM\",\"email\":\"owner@example.com\",\"password\":\"$PASSWORD\",\"organization_name\":\"Roles\"}") == 201 ]] || fail "claim"
@@ -162,14 +162,14 @@ mkauth() { # NAME: JWT, PAT and id of the signed-in user NAME
   [[ ${PAT[$n]} =~ ^sbp_[0-9a-f]{40}$ ]] || fail "PAT $n '${PAT[$n]}'"
 }
 mkauth owner
-sbctl users list >"$WORK/users.txt"
+supavise users list >"$WORK/users.txt"
 grep -q "owner@example.com.*$ORG:owner" "$WORK/users.txt" || { cat "$WORK/users.txt" >&2; fail "users list does not show the owner"; }
 [[ $(body "${PAT[owner]}" GET "/v1/organizations/$ORG/members" | json_get 'd[0]["role_name"]') == Owner ]] || fail "the first user is not Owner"
 
 log "invite an Administrator, a Developer and a Read-only member (the claim page; --no-mail keeps the link local)"
 mkuser() { # NAME ROLE
   local n=$1 role=$2 link tok
-  link=$(sbctl users invite "$n@example.com" --role "$role" --org "$ORG" --no-mail 2>"$WORK/invite.err") || { cat "$WORK/invite.err" >&2; fail "invite $n"; }
+  link=$(supavise users invite "$n@example.com" --role "$role" --org "$ORG" --no-mail 2>"$WORK/invite.err") || { cat "$WORK/invite.err" >&2; fail "invite $n"; }
   [[ $link == */claim#* ]] || fail "invite link for a new address is not the claim page: $link"
   tok=$(python3 -c 'import sys,urllib.parse as u; print(u.parse_qs(u.urlparse(sys.argv[1]).fragment)["token"][0])' "$link")
   [[ $tok =~ ^sbi_[0-9a-f]{48}$ ]] || fail "invite token '$tok'"
@@ -181,12 +181,12 @@ mkuser admin administrator
 mkuser dev developer
 mkuser ro read-only
 mkuser outsider read-only
-sbctl users list >"$WORK/users.txt"
+supavise users list >"$WORK/users.txt"
 for pair in "admin administrator" "dev developer" "ro read-only"; do
   set -- $pair
   grep -q "$1@example.com.*$ORG:$2" "$WORK/users.txt" || { cat "$WORK/users.txt" >&2; fail "users list: $1 is not $2"; }
 done
-sbctl users invite dev@example.com --role developer --org "$ORG" --no-mail >"$WORK/again.out" 2>&1 && fail "inviting a member again was not refused"
+supavise users invite dev@example.com --role developer --org "$ORG" --no-mail >"$WORK/again.out" 2>&1 && fail "inviting a member again was not refused"
 grep -q "already a member" "$WORK/again.out" || { cat "$WORK/again.out" >&2; fail "inviting a member again: unexpected message"; }
 
 log "Studio: what the permission list says (Studio's own matching rule)"
@@ -253,7 +253,7 @@ done
 [[ $(sql "select to_regclass('public.ro_migration') is null") == t ]] || fail "a read-only migration ran"
 # The login role the CLI uses for `db dump` is the read-only one, even when read-write is asked.
 LR=$(body "${PAT[ro]}" POST "$CFG/cli/login-role" '{"read_only":false}')
-[[ $(json_get 'd["role"].startswith("sbctl_cli_ro_")' <<<"$LR") == True ]] || fail "read-only member got a read-write login role: $LR"
+[[ $(json_get 'd["role"].startswith("supavise_cli_ro_")' <<<"$LR") == True ]] || fail "read-only member got a read-write login role: $LR"
 # Dropping the project's login roles would break every member's CLI session.
 expect 403 "${PAT[ro]}" DELETE "$CFG/cli/login-role"
 # Shared saved items belong to their owner: a Read-only member cannot rewrite the snippet an Owner shares.
@@ -314,7 +314,7 @@ M="/platform/organizations/$ORG/members"
 log "the organization keeps its last Owner"
 [[ $(papi "${JWT[owner]}" PATCH "$M/${UID_OF[owner]}" '{"role_id":2}') == 400 ]] || fail "the last owner was demoted"
 [[ $(papi "${JWT[owner]}" DELETE "$M/${UID_OF[owner]}") == 400 ]] || fail "the last owner left"
-if sbctl users remove owner@example.com >"$WORK/rm.out" 2>&1; then fail "users remove deleted the only owner"; fi
+if supavise users remove owner@example.com >"$WORK/rm.out" 2>&1; then fail "users remove deleted the only owner"; fi
 grep -q "only Owner" "$WORK/rm.out" || { cat "$WORK/rm.out" >&2; fail "users remove: unexpected refusal"; }
 
 log "a project-scoped role: only that project's rights"
@@ -341,11 +341,11 @@ log "the real Supabase CLI: Read-only lists and is refused secrets set, Owner se
 if [[ -n ${SUPABASE_CLI:-} ]]; then
   mkdir -p "$WORK/proj" "$WORK/home"
   cat >"$WORK/profile.yaml" <<PROFILE
-name: sbctl-roles
+name: supavise-roles
 api_url: $ADMIN
 dashboard_url: http://127.0.0.1:1
-project_host: api.$SBCTL_DOMAIN
-pooler_host: pooler.$SBCTL_DOMAIN
+project_host: api.$SUPAVISE_DOMAIN
+pooler_host: pooler.$SUPAVISE_DOMAIN
 PROFILE
   cli() { local t=$1; shift; (cd "$WORK/proj" && HOME="$WORK/home" SUPABASE_ACCESS_TOKEN=$t SUPABASE_NO_KEYRING=1 DO_NOT_TRACK=1 "$SUPABASE_CLI" --profile="$WORK/profile.yaml" "$@"); }
   cli "${PAT[ro]}" projects list >"$WORK/cli.out" 2>&1 || { cat "$WORK/cli.out" >&2; fail "CLI projects list as Read-only"; }
@@ -393,8 +393,8 @@ python3 "$WORK/links.py" "$WORK/mails.txt" >"$WORK/mails.json"
 accept_from_mail() { # ADDRESS: follow the mailed link, accept the invitation, check the role
   local addr=$1 link loc jwt tok sub
   link=$(json_get '[l for m in d if "'"$addr"'" in (m["to"] or "") for l in m["links"] if "/verify" in l][0]' <"$WORK/mails.json") || fail "no link mailed to $addr"
-  loc=$(curl -s -o /dev/null -D - -m 30 --resolve "api.$SBCTL_DOMAIN:80:127.0.0.1" "$link" | tr -d '\r' | awk 'tolower($1)=="location:" {print $2}')
-  [[ $loc == http://studio.$SBCTL_DOMAIN/join\?* ]] || fail "the mailed link for $addr does not lead to the invitation page: $loc"
+  loc=$(curl -s -o /dev/null -D - -m 30 --resolve "api.$SUPAVISE_DOMAIN:80:127.0.0.1" "$link" | tr -d '\r' | awk 'tolower($1)=="location:" {print $2}')
+  [[ $loc == http://studio.$SUPAVISE_DOMAIN/join\?* ]] || fail "the mailed link for $addr does not lead to the invitation page: $loc"
   jwt=$(python3 -c 'import sys,urllib.parse as u; f=u.parse_qs(u.urlparse(sys.argv[1]).fragment); print(f["access_token"][0])' "$loc") || fail "the link for $addr carries no session: $loc"
   tok=$(python3 -c 'import sys,urllib.parse as u; print(u.parse_qs(u.urlparse(sys.argv[1]).query)["token"][0])' "$loc")
   [[ $tok =~ ^sbo_ ]] || fail "invitation token '$tok'"
@@ -408,13 +408,13 @@ accept_from_mail() { # ADDRESS: follow the mailed link, accept the invitation, c
 }
 accept_from_mail outsider2@example.com
 accept_from_mail newhire@example.com
-sbctl users list >"$WORK/users.txt"
+supavise users list >"$WORK/users.txt"
 grep -q "newhire@example.com.*$ORG:developer" "$WORK/users.txt" || { cat "$WORK/users.txt" >&2; fail "users list does not show the invited user"; }
 
 log "SSO default role rule"
-sbctl users default-role set corp.example.com developer --org "$ORG" >/dev/null || fail "default-role set"
-sbctl users default-role list >"$WORK/rules.txt"
+supavise users default-role set corp.example.com developer --org "$ORG" >/dev/null || fail "default-role set"
+supavise users default-role list >"$WORK/rules.txt"
 grep -q "corp.example.com.*$ORG.*developer" "$WORK/rules.txt" || { cat "$WORK/rules.txt" >&2; fail "default-role list"; }
-sbctl users default-role remove corp.example.com || fail "default-role remove"
+supavise users default-role remove corp.example.com || fail "default-role remove"
 
 log "roles smoke passed"

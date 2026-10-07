@@ -1,5 +1,5 @@
-// Package sbctl embeds repository-level data files into the binary.
-package sbctl
+// Package supavise embeds repository-level data files into the binary.
+package supavise
 
 import _ "embed"
 

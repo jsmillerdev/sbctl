@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 const (
@@ -59,8 +59,8 @@ type Manifest struct {
 	StoredBytes int64  `json:"stored_bytes"`
 	Files       int    `json:"files"`
 
-	Project      *ManifestProject `json:"project,omitempty"`
-	SBCtlVersion string           `json:"sbctl_version,omitempty"`
+	Project         *ManifestProject `json:"project,omitempty"`
+	SupaviseVersion string           `json:"supavise_version,omitempty"`
 }
 
 // ManifestProject is the project metadata a restore needs when the registry row is gone.

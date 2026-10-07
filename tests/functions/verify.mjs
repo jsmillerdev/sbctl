@@ -127,7 +127,7 @@ async function mainPhase() {
 
   // 4. Existence is per project.
   assert.equal((await call(fnUrl(a, 'onlya'), { headers: bearer(a.anon) })).text, 'only-a')
-  for (const [p, slug] of [[b, 'onlya'], [a, 'nope'], [b, 'nope'], [a, '1bad'], [a, '.sbctl-function.json'], [a, '..']]) {
+  for (const [p, slug] of [[b, 'onlya'], [a, 'nope'], [b, 'nope'], [a, '1bad'], [a, '.supavise-function.json'], [a, '..']]) {
     const r = await call(fnUrl(p, slug), { headers: bearer(p.anon) })
     assert.equal(r.status, 404, `${p.name}/${slug}: ${r.status} ${r.text}`)
   }
@@ -140,9 +140,9 @@ async function mainPhase() {
 
   // 5. The tenant is the proxy's, not the client's.
   {
-    const r = await call(fnUrl(a, 'hello'), { headers: { ...bearer(a.anon), 'x-sbctl-project-ref': b.ref } })
+    const r = await call(fnUrl(a, 'hello'), { headers: { ...bearer(a.anon), 'x-supavise-project-ref': b.ref } })
     assert.equal(r.json?.who, 'project-a', 'a forged project header changed the tenant')
-    const r2 = await call(fnUrl(b, 'onlya'), { headers: { ...bearer(b.anon), 'X-SBCTL-PROJECT-REF': a.ref } })
+    const r2 = await call(fnUrl(b, 'onlya'), { headers: { ...bearer(b.anon), 'X-SUPAVISE-PROJECT-REF': a.ref } })
     assert.equal(r2.status, 404, 'a forged project header reached another project\'s function')
     const r3 = await call(fnUrl(a, 'hello'), { headers: { ...bearer(a.anon), 'sb-api-key': b.anon } })
     assert.equal(r3.json?.who, 'project-a')
@@ -154,19 +154,19 @@ async function mainPhase() {
     const r = await call(`${cfg.runtimeUrl}/hello`, { headers: bearer(a.anon) })
     assert.equal(r.status, 403, `the runtime answered ${r.status} without the proxy secret`)
     const r2 = await call(`${cfg.runtimeUrl}/hello`, {
-      headers: { ...bearer(a.anon), 'x-sbctl-project-ref': a.ref },
+      headers: { ...bearer(a.anon), 'x-supavise-project-ref': a.ref },
     })
     assert.equal(r2.status, 403, `the runtime served a project reference without the proxy secret: ${r2.status}`)
     const r3 = await call(`${cfg.runtimeUrl}/hello`, {
-      headers: { ...bearer(a.anon), 'x-sbctl-project-ref': a.ref, 'x-sbctl-proxy-token': 'guess' },
+      headers: { ...bearer(a.anon), 'x-supavise-project-ref': a.ref, 'x-supavise-proxy-token': 'guess' },
     })
     assert.equal(r3.status, 403, `the runtime accepted a wrong secret: ${r3.status}`)
     if (cfg.proxyToken) {
-      const t = { 'x-sbctl-proxy-token': cfg.proxyToken }
+      const t = { 'x-supavise-proxy-token': cfg.proxyToken }
       const r4 = await call(`${cfg.runtimeUrl}/hello`, { headers: { ...bearer(a.anon), ...t } })
       assert.equal(r4.status, 400, `no project reference, with the secret: ${r4.status}`)
       const r5 = await call(`${cfg.runtimeUrl}/hello`, {
-        headers: { ...bearer(a.anon), ...t, 'x-sbctl-project-ref': a.ref },
+        headers: { ...bearer(a.anon), ...t, 'x-supavise-project-ref': a.ref },
       })
       assert.equal(r5.json?.who, 'project-a', `with the secret: ${r5.status} ${r5.text}`)
     }
@@ -225,7 +225,7 @@ async function mainPhase() {
       if (real.startsWith('PATH: ')) {
         const path = real.slice('PATH: '.length)
         assert.match(path, /(^|\/)\.tmp[A-Za-z0-9]{6}$/, `Deno.realPathSync('/tmp') in a worker is no longer a private .tmpXXXXXX directory: ${path}`)
-        for (const hidden of [cfg.stateDir, 'sbctl', 'tenants', 'functions-env', a.ref, b.ref]) {
+        for (const hidden of [cfg.stateDir, 'supavise', 'tenants', 'functions-env', a.ref, b.ref]) {
           assert.ok(!path.includes(hidden), `Deno.realPathSync('/tmp') in a worker reveals ${hidden}: ${path}`)
         }
       } else {
@@ -266,7 +266,7 @@ async function mainPhase() {
     } catch { /* not readable from here */ }
     const targets = []
     for (const t of roots) {
-      targets.push(`${t}/${b.ref}/functions-env.json`, `${t}/${b.ref}/functions/hello/.sbctl-function.json`, `${t}/${a.ref}/functions-env.json`)
+      targets.push(`${t}/${b.ref}/functions-env.json`, `${t}/${b.ref}/functions/hello/.supavise-function.json`, `${t}/${a.ref}/functions-env.json`)
     }
     if (existsSync(targets[0])) ok('(the paths the function is asked to import exist)')
     const q = targets.map((t) => `t=${encodeURIComponent(t.replace(/^\//, ''))}`).join('&')

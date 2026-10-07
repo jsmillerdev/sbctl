@@ -78,7 +78,7 @@ func evpBytesToKey(pass, salt []byte, keyLen, ivLen int) (key, iv []byte) {
 // never put the database password, encrypted or not, in a response every dashboard user
 // reads (research/08 section 2). The mock answers an opaque, secret-free token; the
 // encrypted connection is built per request in pgMetaQuery, as the real API does.
-func (s *server) connectionString(p *Project) string { return "sbctl-mock-connection-" + p.Ref }
+func (s *server) connectionString(p *Project) string { return "supavise-mock-connection-" + p.Ref }
 
 // encryptedConnection is the x-connection-encrypted header for postgres-meta: the project's
 // DB URL encrypted with the shared key.

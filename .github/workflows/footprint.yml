@@ -34,11 +34,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
       - name: host facts
         run: nproc; free -m; df -h /; uname -a
       - name: measure
-        run: sudo SBCTL_BIN=/tmp/sbctl tests/linux/footprint.sh --sizes "${{ inputs.sizes }}" --class "${{ inputs.class }}" | tee /tmp/footprint.md
+        run: sudo SUPAVISE_BIN=/tmp/supavise tests/linux/footprint.sh --sizes "${{ inputs.sizes }}" --class "${{ inputs.class }}" | tee /tmp/footprint.md
       - if: always()
         uses: actions/upload-artifact@v4
         with:

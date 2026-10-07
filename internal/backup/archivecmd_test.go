@@ -5,26 +5,26 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 func TestArchiveAndRestoreCommand(t *testing.T) {
-	if got, want := ArchiveCommand("/usr/local/bin/sbctl", testRef, ""), "/usr/local/bin/sbctl wal push --ref "+testRef+" %p"; got != want {
+	if got, want := ArchiveCommand("/usr/local/bin/supavise", testRef, ""), "/usr/local/bin/supavise wal push --ref "+testRef+" %p"; got != want {
 		t.Errorf("ArchiveCommand = %q, want %q", got, want)
 	}
-	if got, want := RestoreCommand("/usr/local/bin/sbctl", testRef, ""), "/usr/local/bin/sbctl wal fetch --ref "+testRef+" %f %p"; got != want {
+	if got, want := RestoreCommand("/usr/local/bin/supavise", testRef, ""), "/usr/local/bin/supavise wal fetch --ref "+testRef+" %f %p"; got != want {
 		t.Errorf("RestoreCommand = %q, want %q", got, want)
 	}
-	if got := ArchiveCommand("/usr/local/bin/sbctl", testRef, config.DefaultPath); strings.Contains(got, "--config") {
+	if got := ArchiveCommand("/usr/local/bin/supavise", testRef, config.DefaultPath); strings.Contains(got, "--config") {
 		t.Errorf("default config path must not be embedded: %q", got)
 	}
-	got := ArchiveCommand("/opt/my sbctl/sbctl", testRef, "/tmp/it's here/c.toml")
-	want := `'/opt/my sbctl/sbctl' --config '/tmp/it'\''s here/c.toml' wal push --ref ` + testRef + ` %p`
+	got := ArchiveCommand("/opt/my supavise/supavise", testRef, "/tmp/it's here/c.toml")
+	want := `'/opt/my supavise/supavise' --config '/tmp/it'\''s here/c.toml' wal push --ref ` + testRef + ` %p`
 	if got != want {
 		t.Errorf("ArchiveCommand with quoting = %q, want %q", got, want)
 	}
 	// A literal % in a path is doubled, because Postgres expands %-sequences before sh runs.
-	if got := ArchiveCommand("/opt/100%/sbctl", testRef, ""); !strings.HasPrefix(got, "'/opt/100%%/sbctl'") {
+	if got := ArchiveCommand("/opt/100%/supavise", testRef, ""); !strings.HasPrefix(got, "'/opt/100%%/supavise'") {
 		t.Errorf("percent not doubled: %q", got)
 	}
 }
@@ -46,12 +46,12 @@ func TestArchiveCommandSurvivesShell(t *testing.T) {
 
 func TestArchiveSettings(t *testing.T) {
 	c := config.Default()
-	c.BinPath = "/usr/local/bin/sbctl"
+	c.BinPath = "/usr/local/bin/supavise"
 	c.Backup.WALRelay = "off"
 	got := ArchiveSettings(c, testRef, "")
 	for _, want := range []string{
 		"archive_mode = on\n",
-		"archive_command = '/usr/local/bin/sbctl wal push --ref " + testRef + " %p'\n",
+		"archive_command = '/usr/local/bin/supavise wal push --ref " + testRef + " %p'\n",
 		"archive_timeout = 300s\n",
 	} {
 		if !strings.Contains(got, want) {
@@ -63,7 +63,7 @@ func TestArchiveSettings(t *testing.T) {
 		t.Errorf("archive_timeout not configurable:\n%s", got)
 	}
 	c.Backup.WALRelay = "on"
-	if got := ArchiveSettings(c, testRef, ""); !strings.Contains(got, "archive_command = '/usr/local/bin/sbctl wal push --ref "+testRef+" --socket "+c.Paths().WALSocket(testRef)+" %p'\n") {
+	if got := ArchiveSettings(c, testRef, ""); !strings.Contains(got, "archive_command = '/usr/local/bin/supavise wal push --ref "+testRef+" --socket "+c.Paths().WALSocket(testRef)+" %p'\n") {
 		t.Errorf("relay form missing:\n%s", got)
 	}
 	if got := confString("it's"); got != "'it''s'" {

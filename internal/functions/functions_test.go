@@ -16,10 +16,10 @@ import (
 
 	"github.com/andybalholm/brotli"
 
-	"github.com/OWNER/sbctl/internal/api"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 const (
@@ -898,7 +898,7 @@ func TestSyncMaterializesABundledFunction(t *testing.T) {
 	for _, e := range ents {
 		names = append(names, e.Name())
 	}
-	if strings.Join(names, ",") != ".sbctl-function.json,bundle.eszip" {
+	if strings.Join(names, ",") != ".supavise-function.json,bundle.eszip" {
 		t.Fatalf("generation holds %v", names)
 	}
 	first, _ := os.Readlink(link)

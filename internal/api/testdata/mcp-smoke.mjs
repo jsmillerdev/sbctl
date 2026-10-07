@@ -6,7 +6,7 @@
 // read it from the process list.
 //
 // Starts @supabase/mcp-server-supabase with --api-url, speaks newline-delimited
-// JSON-RPC to it and calls the tools sbctl's API must serve. Exits non-zero when a
+// JSON-RPC to it and calls the tools supavise's API must serve. Exits non-zero when a
 // call fails. No dependencies: the MCP stdio transport is one JSON message per line.
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -49,7 +49,7 @@ async function session(label, projectRef, fn) {
   const init = await rpc("initialize", {
     protocolVersion: "2025-06-18",
     capabilities: {},
-    clientInfo: { name: "sbctl-smoke", version: "0" },
+    clientInfo: { name: "supavise-smoke", version: "0" },
   });
   if (init.error) { console.error(JSON.stringify(init.error)); process.exit(1); }
   send({ jsonrpc: "2.0", method: "notifications/initialized" });

@@ -9,26 +9,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/backup"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 func TestLifecycleOptionsWireTheArchiveCommand(t *testing.T) {
 	cfg := config.Default()
-	cfg.BinPath = "/opt/my sbctl/bin/sbctl"
+	cfg.BinPath = "/opt/my supavise/bin/supavise"
 	cfg.Backup.ArchiveTimeoutSeconds = 120
 	cfg.Backup.WALRelay = "off" // the relay form is checked below
-	oo := LifecycleOptions(cfg, Options{ConfigPath: "/etc/sbctl/other.toml"})
+	oo := LifecycleOptions(cfg, Options{ConfigPath: "/etc/supavise/other.toml"})
 	const ref = "abcdefghijklmnopqrst"
 	got := oo.ArchiveCommandFor(ref)
-	if want := backup.ArchiveCommand(cfg.BinPath, ref, "/etc/sbctl/other.toml"); got != want {
+	if want := backup.ArchiveCommand(cfg.BinPath, ref, "/etc/supavise/other.toml"); got != want {
 		t.Fatalf("archive_command = %q, want the backup package's %q", got, want)
 	}
 	// A path with a space is quoted, % is doubled, and the config file the daemon loaded is passed on.
-	if !strings.Contains(got, "'/opt/my sbctl/bin/sbctl'") || !strings.Contains(got, "--config /etc/sbctl/other.toml") || !strings.HasSuffix(got, "%p") {
+	if !strings.Contains(got, "'/opt/my supavise/bin/supavise'") || !strings.Contains(got, "--config /etc/supavise/other.toml") || !strings.HasSuffix(got, "%p") {
 		t.Errorf("archive_command = %q", got)
 	}
 	if oo.ArchiveTimeout != 120 {
@@ -50,7 +50,7 @@ func TestLifecycleOptionsWireTheArchiveCommand(t *testing.T) {
 	// the command names no config file: the unit cannot read it.
 	relay := config.Default()
 	relay.Backup.WALRelay = "on"
-	rc := LifecycleOptions(relay, Options{ConfigPath: "/etc/sbctl/other.toml"}).ArchiveCommandFor(ref)
+	rc := LifecycleOptions(relay, Options{ConfigPath: "/etc/supavise/other.toml"}).ArchiveCommandFor(ref)
 	if want := backup.ArchiveCommandRelay(relay.BinPath, ref, relay.Paths().WALSocket(ref)); rc != want || strings.Contains(rc, "--config") {
 		t.Errorf("relay archive_command = %q, want %q", rc, want)
 	}
@@ -85,7 +85,7 @@ func TestPGMetaCryptoKey(t *testing.T) {
 	if k2, _ := PGMetaCryptoKey(ctx, cfg, reg, sec); k2 != k1 {
 		t.Fatal("the key changed between calls")
 	}
-	// A configured key wins, and is what sb-pgmeta must run with.
+	// A configured key wins, and is what supavise-pgmeta must run with.
 	cfg.API.PGMetaCryptoKey = "configured-key-0123456789"
 	if k, _ := PGMetaCryptoKey(ctx, cfg, reg, sec); k != "configured-key-0123456789" {
 		t.Fatalf("configured key ignored: %q", k)

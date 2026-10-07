@@ -8,18 +8,18 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
-// Names of the sealed secrets the shared services share with sbctl. All of them belong
-// to the system project (ref "system") in sbctl.project_secrets and are generated once:
+// Names of the sealed secrets the shared services share with supavise. All of them belong
+// to the system project (ref "system") in supavise.project_secrets and are generated once:
 // a service reads them from its env file on every start, and some of them encrypt data
 // at rest (Supavisor's vault key, Realtime's tenant encryption keys, Storage's
 // encryption key), so replacing one would make the stored tenants unreadable.
 const (
-	// SecretPGMetaCryptoKey is the passphrase shared with sb-pgmeta (its CRYPTO_KEY). The
+	// SecretPGMetaCryptoKey is the passphrase shared with supavise-pgmeta (its CRYPTO_KEY). The
 	// Management API builds x-connection-encrypted with it, under the same name
 	// (api.SecretPGMetaCryptoKey; a test checks that the two agree).
 	SecretPGMetaCryptoKey = "pgmeta_crypto_key"
@@ -51,9 +51,9 @@ type Login struct {
 // fleet_<service>_password. fleet cannot import lifecycle (lifecycle imports fleet), so the
 // names are repeated here and a test in package fleet_test checks them against lifecycle.
 var loginDefs = []struct{ Service, User, Database string }{
-	{config.SvcSupavisor, "sbctl_supavisor", "_supavisor"},
-	{config.SvcRealtime, "sbctl_realtime", "_realtime"},
-	{config.SvcStorage, "sbctl_storage", "_storage"},
+	{config.SvcSupavisor, "supavise_supavisor", "_supavisor"},
+	{config.SvcRealtime, "supavise_realtime", "_realtime"},
+	{config.SvcStorage, "supavise_storage", "_storage"},
 }
 
 func loginSecretName(service string) string { return "fleet_" + service + "_password" }
@@ -102,13 +102,13 @@ func ensureSecret(ctx context.Context, reg registry.Registry, sec secrets.Secret
 		return "", err
 	}
 	if pg, ok := reg.(interface{ Pool() *pgxpool.Pool }); ok && pg.Pool() != nil {
-		_, err = pg.Pool().Exec(ctx, `insert into sbctl.project_secrets (ref, name, ciphertext) values ($1, $2, $3) on conflict (ref, name) do nothing`,
+		_, err = pg.Pool().Exec(ctx, `insert into supavise.project_secrets (ref, name, ciphertext) values ($1, $2, $3) on conflict (ref, name) do nothing`,
 			config.SystemRef, name, sealed)
 	} else {
 		err = reg.PutSecret(ctx, config.SystemRef, name, sealed)
 	}
 	if err != nil {
-		return "", fmt.Errorf("fleet: store secret %s: %w (is the system project initialized? run `sbctl system init`)", name, err)
+		return "", fmt.Errorf("fleet: store secret %s: %w (is the system project initialized? run `supavise system init`)", name, err)
 	}
 	return read()
 }
@@ -162,7 +162,7 @@ func loadCreds(ctx context.Context, d Deps, create bool) (*creds, error) {
 	for _, ld := range loginDefs {
 		pw, err := readSecret(ctx, d.Registry, d.Secrets, loginSecretName(ld.Service))
 		if err != nil {
-			return nil, fmt.Errorf("fleet: login of %s: %w (run `sbctl system init`)", ld.User, err)
+			return nil, fmt.Errorf("fleet: login of %s: %w (run `supavise system init`)", ld.User, err)
 		}
 		c.logins[ld.Service] = Login{User: ld.User, Password: pw, Database: ld.Database}
 	}

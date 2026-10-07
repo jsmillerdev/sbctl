@@ -5,14 +5,14 @@ import (
 	"regexp"
 	"strings"
 
-	plat "github.com/OWNER/sbctl/internal/api/gen/platform"
-	v1 "github.com/OWNER/sbctl/internal/api/gen/v1"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
+	plat "github.com/jsmillerdev/supavise/internal/api/gen/platform"
+	v1 "github.com/jsmillerdev/supavise/internal/api/gen/v1"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // disabledFeatures are the dashboard features hidden through profile.disabled_features:
-// billing, and the hosted-only infrastructure and integrations sbctl does not offer.
+// billing, and the hosted-only infrastructure and integrations supavise does not offer.
 // Keys are Studio's enabled-features keys (packages/common/enabled-features).
 var disabledFeatures = []string{
 	"billing:all", "database:replication", "database:restore_to_new_project", "database:network_restrictions",
@@ -295,7 +295,7 @@ func entitlementKind(key string) string {
 	return "boolean"
 }
 
-// entitlements grants every feature of the spec's key enum: sbctl has no plans.
+// entitlements grants every feature of the spec's key enum: supavise has no plans.
 func (s *Server) entitlements(key string) handlerFunc {
 	op := operationByKey(key)
 	keys := op.Response.Value.Properties["entitlements"].Value.Items.Value.Properties["feature"].Value.Properties["key"].Value.Enum

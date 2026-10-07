@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Edge Functions under real systemd units: system init, two projects, `sbctl functions dev`
-# (Management API and proxy in one process, with sb-edge-runtime started as a unit), then
+# Edge Functions under real systemd units: system init, two projects, `supavise functions dev`
+# (Management API and proxy in one process, with supavise-edge-runtime started as a unit), then
 # tests/functions/run.sh, which deploys fixtures with the real `supabase functions deploy` (project
 # A bundled by the CLI in Docker, project B uploaded as sources with --use-api and bundled by the
-# node in the sandbox of sb-edge-bundle@<ref>.service), calls them with supabase-js and checks
+# node in the sandbox of supavise-edge-bundle@<ref>.service), calls them with supabase-js and checks
 # isolation between the projects. On top of that this script checks what only systemd can show: the
 # unit's user, slice and memory limit, what its mount namespace hides, that the bundler's module
 # cache is per project (an upload of one project cannot import a module that another project's upload made
 # the bundler download) and goes with the project, recovery after `kill -9` of the runtime, and
 # that the runtime-wide worker budget refuses what would not fit.
 #
-#   sudo SBCTL_BIN=/path/to/sbctl-linux-amd64 tests/linux/functions-smoke.sh [--teardown]
+#   sudo SUPAVISE_BIN=/path/to/supavise-linux-amd64 tests/linux/functions-smoke.sh [--teardown]
 #
 # Needs network access (artifacts, the Supabase CLI release, npm, and DNS for
 # *.127.0.0.1.sslip.io, which the functions use to reach their own project). Logs stay in
-# $LOG_DIR (default /tmp/sbctl-linux-logs).
+# $LOG_DIR (default /tmp/supavise-linux-logs).
 #
 # Not run in development: it needs root, systemd and Linux. CI runs it on an ephemeral Ubuntu
 # 24.04 VM (amd64 and arm64).
@@ -30,13 +30,13 @@ DOMAIN=127.0.0.1.sslip.io
 P_HTTP=18080 P_HTTPS=18443 P_ADMIN=18082 P_EDGE=19000
 SUPABASE_CLI_VERSION=${SUPABASE_CLI_VERSION:-2.119.0}
 
-SBCTL_DOMAIN=$DOMAIN
+SUPAVISE_DOMAIN=$DOMAIN
 preflight
 getent hosts "probe.$DOMAIN" >/dev/null || fail "DNS for *.$DOMAIN does not resolve here (sslip.io); the functions reach their own project through it"
 for c in node npm; do command -v "$c" >/dev/null || fail "missing $c"; done
 install_binary
 setup_node
-cat >>"$SBCTL_CONF" <<CONF
+cat >>"$SUPAVISE_CONF" <<CONF
 
 [listen]
 http = "127.0.0.1:$P_HTTP"
@@ -65,11 +65,11 @@ CONF
 
 # Same finding as in fleet-smoke.sh: the Postgres launcher chmods a file inside the artifact
 # on its first boot, which ProtectSystem=strict forbids. VM-local drop-in, to be removed once
-# sb-postgres@.service handles it.
-install -d /etc/systemd/system/sb-postgres@.service.d
-cat >/etc/systemd/system/sb-postgres@.service.d/10-functions-smoke.conf <<'CONF'
+# supavise-postgres@.service handles it.
+install -d /etc/systemd/system/supavise-postgres@.service.d
+cat >/etc/systemd/system/supavise-postgres@.service.d/10-functions-smoke.conf <<'CONF'
 [Service]
-ReadWritePaths=/var/lib/sbctl/artifacts
+ReadWritePaths=/var/lib/supavise/artifacts
 CONF
 systemctl daemon-reload
 
@@ -91,57 +91,57 @@ install_supabase_cli
 
 log "system init (downloads artifacts)"
 system_init
-wait_active sb-postgres@system.service 30
+wait_active supavise-postgres@system.service 30
 
 log "two projects"
 REF_A=$(create_project fn-a micro)
 REF_B=$(create_project fn-b micro)
 [[ $REF_A =~ ^[a-z]{20}$ && $REF_B =~ ^[a-z]{20}$ ]] || fail "bad refs '$REF_A' '$REF_B'"
 
-log "sbctl functions dev (API, proxy, and sb-edge-runtime as a unit)"
+log "supavise functions dev (API, proxy, and supavise-edge-runtime as a unit)"
 mkdir -p "$LOG_DIR"
-PAT_FILE=$SBCTL_STATE/functions-dev.pat
-sudo -u "$SBCTL_USER" -H /usr/local/bin/sbctl functions dev --token-file "$PAT_FILE" >"$LOG_DIR/functions-dev.log" 2>&1 &
+PAT_FILE=$SUPAVISE_STATE/functions-dev.pat
+sudo -u "$SUPAVISE_USER" -H /usr/local/bin/supavise functions dev --token-file "$PAT_FILE" >"$LOG_DIR/functions-dev.log" 2>&1 &
 DEV_PID=$!
 for ((i = 0; i < 180; i++)); do
-  kill -0 "$DEV_PID" 2>/dev/null || { tail -30 "$LOG_DIR/functions-dev.log" >&2; fail "sbctl functions dev exited"; }
+  kill -0 "$DEV_PID" 2>/dev/null || { tail -30 "$LOG_DIR/functions-dev.log" >&2; fail "supavise functions dev exited"; }
   [[ $(http_code "http://127.0.0.1:$P_EDGE/_internal/health") == 200 && -s $PAT_FILE ]] && break
   sleep 1
 done
 [[ $(http_code "http://127.0.0.1:$P_EDGE/_internal/health") == 200 ]] || { tail -30 "$LOG_DIR/functions-dev.log" >&2; fail "the edge runtime did not come up"; }
 
-U=sb-edge-runtime.service
+U=supavise-edge-runtime.service
 log "the unit"
 [[ $(unit_state "$U") == active ]] || fail "$U is $(unit_state "$U")"
-[[ $(systemctl show -p User --value "$U") == "$SBCTL_USER" ]] || fail "$U does not run as $SBCTL_USER"
-[[ $(systemctl show -p Slice --value "$U") == sbctl.slice ]] || fail "$U is not in sbctl.slice"
+[[ $(systemctl show -p User --value "$U") == "$SUPAVISE_USER" ]] || fail "$U does not run as $SUPAVISE_USER"
+[[ $(systemctl show -p Slice --value "$U") == supavise.slice ]] || fail "$U is not in supavise.slice"
 # 24 workers (max_workers) x (256 MB memory_mb + 32 MB overhead) + 256 MB for the runtime itself.
 [[ $(systemctl show -p MemoryMax --value "$U") == 7516192768 ]] || fail "$U: MemoryMax drop-in not applied ($(systemctl show -p MemoryMax --value "$U"))"
 [[ $(ss -Hltn "sport = :$P_EDGE" | awk '{print $4}') == "127.0.0.1:$P_EDGE" ]] || fail "the runtime does not listen on loopback only: $(ss -Hltn "sport = :$P_EDGE")"
 
-sees() { # PATH: exit 0 if PATH is readable from the unit's namespace as the sbctl user
+sees() { # PATH: exit 0 if PATH is readable from the unit's namespace as the supavise user
   local pid; pid=$(systemctl show -p MainPID --value "$U")
   [[ $pid -gt 0 ]] || fail "$U has no main pid"
-  nsenter -t "$pid" -m -- runuser -u "$SBCTL_USER" -- test -r "$1" 2>/dev/null
+  nsenter -t "$pid" -m -- runuser -u "$SUPAVISE_USER" -- test -r "$1" 2>/dev/null
 }
-for hidden in "$SBCTL_STATE/backups" "$SBCTL_STATE/certs" /etc/sbctl; do
+for hidden in "$SUPAVISE_STATE/backups" "$SUPAVISE_STATE/certs" /etc/supavise; do
   if sees "$hidden"; then fail "$U can read $hidden"; fi
 done
 # The runtime sees the tree of functions (its own state directory) and nothing of the projects.
-sees "$SBCTL_STATE/system/edge-runtime/tenants" || fail "$U cannot see its tenants directory"
+sees "$SUPAVISE_STATE/system/edge-runtime/tenants" || fail "$U cannot see its tenants directory"
 # (projects/system exists as the parent of its launcher script, with nothing else in it.)
-for hidden in "$SBCTL_STATE/projects/$REF_A" "$SBCTL_STATE/projects/$REF_A/postgres" "$SBCTL_STATE/projects/system/postgres" "$SBCTL_STATE/projects/system/postgres.env"; do
+for hidden in "$SUPAVISE_STATE/projects/$REF_A" "$SUPAVISE_STATE/projects/$REF_A/postgres" "$SUPAVISE_STATE/projects/system/postgres" "$SUPAVISE_STATE/projects/system/postgres.env"; do
   if sees "$hidden"; then fail "$U can read $hidden"; fi
 done
 
 log "tests/functions/run.sh"
-export SBCTL_RUN="sudo -u $SBCTL_USER -H /usr/local/bin/sbctl" AS_SBCTL="sudo -u $SBCTL_USER"
+export SUPAVISE_RUN="sudo -u $SUPAVISE_USER -H /usr/local/bin/supavise" AS_SUPAVISE="sudo -u $SUPAVISE_USER"
 export API_URL="http://api.$DOMAIN:$P_HTTP" PAT_FILE PROJECT_URL="http://{ref}.api.$DOMAIN:$P_HTTP"
-export REF_A REF_B STATE_DIR=$SBCTL_STATE RUNTIME_URL="http://127.0.0.1:$P_EDGE" WORK="$LOG_DIR/functions-work" SANDBOXED_BUNDLER=1 MAX_PER_PROJECT=8
+export REF_A REF_B STATE_DIR=$SUPAVISE_STATE RUNTIME_URL="http://127.0.0.1:$P_EDGE" WORK="$LOG_DIR/functions-work" SANDBOXED_BUNDLER=1 MAX_PER_PROJECT=8
 # Processes of the node whose /proc/<pid>/root and environ an uploaded source tries to import: the
-# runtime (it holds every project's environment) and the daemon, both of the sbctl user.
+# runtime (it holds every project's environment) and the daemon, both of the supavise user.
 RT_PID=$(systemctl show -p MainPID --value "$U")
-DAEMON_PID=$(pgrep -u "$SBCTL_USER" -f 'sbctl functions dev' | head -1)
+DAEMON_PID=$(pgrep -u "$SUPAVISE_USER" -f 'supavise functions dev' | head -1)
 [[ $RT_PID -gt 0 && -n $DAEMON_PID ]] || fail "no pid for the runtime ($RT_PID) or the daemon ($DAEMON_PID)"
 export PROC_ESCAPE_PIDS="$RT_PID $DAEMON_PID"
 "$REPO_ROOT/tests/functions/run.sh" || fail "tests/functions/run.sh"
@@ -149,7 +149,7 @@ export PROC_ESCAPE_PIDS="$RT_PID $DAEMON_PID"
 log "the bundler's module cache is per project"
 # run.sh deleted project B at its end (and with it B's bundler cache: the check follows), so a
 # third project, V, plays the part of the victim whose uploads try to import A's cache.
-[[ ! -e /var/cache/private/sb-edge-bundle/$REF_B && ! -e /var/cache/sb-edge-bundle/$REF_B ]] || fail "the module cache of the deleted project $REF_B is still there"
+[[ ! -e /var/cache/private/supavise-edge-bundle/$REF_B && ! -e /var/cache/supavise-edge-bundle/$REF_B ]] || fail "the module cache of the deleted project $REF_B is still there"
 REF_V=$(create_project fn-v micro)
 [[ $REF_V =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF_V'"
 # Project A's upload makes the bundler fetch a package; project V's uploads must not be able to
@@ -157,7 +157,7 @@ REF_V=$(create_project fn-v micro)
 # the package, a JSON module that an import can name (as the steal checks of run.sh do).
 PAT=$(<"$PAT_FILE")
 API="http://api.$DOMAIN:$P_HTTP"
-CACHE_ROOT=/var/cache/sb-edge-bundle
+CACHE_ROOT=/var/cache/supavise-edge-bundle
 deploy_src() { # REF SLUG SOURCE-FILE: upload sources, print "<body>\n<status>"
   curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $PAT" \
     -F "metadata={\"entrypoint_path\":\"index.ts\",\"name\":\"$2\"};type=application/json" \
@@ -193,51 +193,51 @@ steal_cache() { # NAME IMPORT-PATH EXPECTED-STATUS-REGEX
 }
 steal_cache "its own cache (control)" "$V_MARKER" '^20[01]$'
 steal_cache "A's cache by its path" "$A_MARKER" '^400$'
-steal_cache "A's cache through the private directory" "/var/cache/private/sb-edge-bundle/${A_MARKER#"$CACHE_ROOT"/}" '^400$'
+steal_cache "A's cache through the private directory" "/var/cache/private/supavise-edge-bundle/${A_MARKER#"$CACHE_ROOT"/}" '^400$'
 steal_cache "A's cache through V's own directory" "$CACHE_ROOT/$REF_V/../${A_MARKER#"$CACHE_ROOT"/}" '^400$'
 steal_cache "the shared cache of earlier versions" "$CACHE_ROOT/${A_MARKER#"$CACHE_ROOT/$REF_A/"}" '^400$'
 delete_fn "$REF_A" cachemark; delete_fn "$REF_V" cachemark
 
 log "the bundler unit ran for project V's uploads and is idle now"
-B=sb-edge-bundle@$REF_V.service
+B=supavise-edge-bundle@$REF_V.service
 [[ $(unit_state "$B") == inactive ]] || fail "$B is $(unit_state "$B")"
 [[ $(systemctl show -p Result --value "$B") == success ]] || fail "$B: last result $(systemctl show -p Result --value "$B")"
-# Another uid than the sbctl user: the kernel then refuses /proc/<pid>/root and environ of every
+# Another uid than the supavise user: the kernel then refuses /proc/<pid>/root and environ of every
 # process of the node (below), and /proc shows none of them.
-[[ $(systemctl show -p DynamicUser --value "$B") == yes && $(systemctl show -p User --value "$B") != "$SBCTL_USER" ]] || fail "$B does not run under a uid of its own (DynamicUser=$(systemctl show -p DynamicUser --value "$B"), User=$(systemctl show -p User --value "$B"))"
+[[ $(systemctl show -p DynamicUser --value "$B") == yes && $(systemctl show -p User --value "$B") != "$SUPAVISE_USER" ]] || fail "$B does not run under a uid of its own (DynamicUser=$(systemctl show -p DynamicUser --value "$B"), User=$(systemctl show -p User --value "$B"))"
 [[ $(systemctl show -p ProtectProc --value "$B") == invisible && $(systemctl show -p ProcSubset --value "$B") == pid ]] || fail "$B: ProtectProc/ProcSubset not applied"
 [[ $(systemctl show -p MemoryMax --value "$B") == 1073741824 ]] || fail "$B: MemoryMax $(systemctl show -p MemoryMax --value "$B")"
 systemctl show -p IPAddressDeny --value "$B" | grep -q . || fail "$B has no IPAddressDeny"
-[[ ! -e $SBCTL_STATE/system/edge-bundle/work ]] || fail "the scratch directory of an upload stayed in $SBCTL_STATE/system/edge-bundle"
+[[ ! -e $SUPAVISE_STATE/system/edge-bundle/work ]] || fail "the scratch directory of an upload stayed in $SUPAVISE_STATE/system/edge-bundle"
 
 log "the bundler's uid cannot read the node's files, the processes of its units or another project's cache"
 # The real unit (an instance for A and one for B), with its ExecStart replaced by a probe (a
 # drop-in, removed afterwards), so the probe runs as the bundler does: same uid, namespace, /proc
 # and cache directory. It exits 3 when it could read something it must not, which fails this
 # start (1 is a bad upload, see the unit). It also prints its uid: the two instances must differ.
-cat >/usr/local/sbin/sbctl-bundle-probe <<'PROBE'
+cat >/usr/local/sbin/supavise-bundle-probe <<'PROBE'
 #!/bin/sh
 bad=0
 violate() { echo "probe: VIOLATION: $*"; bad=1; }
 ok() { echo "probe: ok $*"; }
-[ "$(id -u)" != "$PROBE_SBCTL_UID" ] && ok "runs under uid $(id -u), not the sbctl user's $PROBE_SBCTL_UID" || violate "runs as the sbctl uid"
+[ "$(id -u)" != "$PROBE_SUPAVISE_UID" ] && ok "runs under uid $(id -u), not the supavise user's $PROBE_SUPAVISE_UID" || violate "runs as the supavise uid"
 # Controls: what the unit may do works, so the refusals below say something.
 cat /proc/self/environ >/dev/null 2>&1 && ok "reads its own /proc/self/environ" || violate "cannot read /proc/self/environ (control)"
-ls /var/lib/sbctl/artifacts >/dev/null 2>&1 && ok "reads the artifacts" || violate "cannot read the artifacts (control)"
+ls /var/lib/supavise/artifacts >/dev/null 2>&1 && ok "reads the artifacts" || violate "cannot read the artifacts (control)"
 echo "probe: uid=$(id -u)"
-touch "/var/cache/sb-edge-bundle/$PROBE_SELF/probe" 2>/dev/null && ok "writes its own cache directory" || violate "cannot write /var/cache/sb-edge-bundle/$PROBE_SELF (control)"
+touch "/var/cache/supavise-edge-bundle/$PROBE_SELF/probe" 2>/dev/null && ok "writes its own cache directory" || violate "cannot write /var/cache/supavise-edge-bundle/$PROBE_SELF (control)"
 cat "$PROBE_SELF_MARKER" >/dev/null 2>&1 && ok "reads a module of its own cache" || violate "cannot read $PROBE_SELF_MARKER (control)"
 # Another project's cache: whatever the namespace shows of it, this uid cannot open it.
-echo "probe: info, visible under /var/cache/sb-edge-bundle: $(ls -A /var/cache/sb-edge-bundle 2>&1 | tr '\n' ' ')"
-ls "/var/cache/sb-edge-bundle/$PROBE_OTHER/" >/dev/null 2>&1 && violate "lists the cache directory of another project"
-ls "/var/cache/private/sb-edge-bundle/$PROBE_OTHER/" >/dev/null 2>&1 && violate "lists the cache directory of another project through /var/cache/private"
+echo "probe: info, visible under /var/cache/supavise-edge-bundle: $(ls -A /var/cache/supavise-edge-bundle 2>&1 | tr '\n' ' ')"
+ls "/var/cache/supavise-edge-bundle/$PROBE_OTHER/" >/dev/null 2>&1 && violate "lists the cache directory of another project"
+ls "/var/cache/private/supavise-edge-bundle/$PROBE_OTHER/" >/dev/null 2>&1 && violate "lists the cache directory of another project through /var/cache/private"
 cat "$PROBE_OTHER_MARKER" >/dev/null 2>&1 && violate "reads $PROBE_OTHER_MARKER"
-cat "/var/cache/private/sb-edge-bundle/${PROBE_OTHER_MARKER#/var/cache/sb-edge-bundle/}" >/dev/null 2>&1 && violate "reads another project's cache through /var/cache/private"
+cat "/var/cache/private/supavise-edge-bundle/${PROBE_OTHER_MARKER#/var/cache/supavise-edge-bundle/}" >/dev/null 2>&1 && violate "reads another project's cache through /var/cache/private"
 # The two files the daemon creates are writable, and nothing else can be made there.
-echo probe >/var/lib/sbctl/system/edge-bundle/work/out/out.eszip 2>/dev/null && ok "writes the output file" || violate "cannot write the output file (control)"
-touch /var/lib/sbctl/system/edge-bundle/work/out/other 2>/dev/null && violate "creates a file next to the output files"
-touch /var/lib/sbctl/system/edge-bundle/work/src/probe 2>/dev/null && violate "writes the sources"
-rm -f /var/lib/sbctl/system/edge-bundle/work/out/out.eszip 2>/dev/null && violate "deletes the output file"
+echo probe >/var/lib/supavise/system/edge-bundle/work/out/out.eszip 2>/dev/null && ok "writes the output file" || violate "cannot write the output file (control)"
+touch /var/lib/supavise/system/edge-bundle/work/out/other 2>/dev/null && violate "creates a file next to the output files"
+touch /var/lib/supavise/system/edge-bundle/work/src/probe 2>/dev/null && violate "writes the sources"
+rm -f /var/lib/supavise/system/edge-bundle/work/out/out.eszip 2>/dev/null && violate "deletes the output file"
 # What it must not do.
 env_file="$PROBE_TENANTS/$PROBE_REF/functions-env.json"
 cat "$env_file" >/dev/null 2>&1 && violate "reads $env_file"
@@ -251,29 +251,29 @@ done
 [ -e /proc/meminfo ] && violate "/proc/meminfo is visible (ProcSubset=pid)"
 n=$(ls /proc | grep -c '^[0-9][0-9]*$')
 [ "$n" -le 8 ] && ok "/proc lists $n processes, all of them this unit's" || violate "/proc lists $n processes"
-for d in /var/lib/sbctl/backups /var/lib/sbctl/certs /var/lib/sbctl/projects/system/edge-runtime.env /var/lib/sbctl/system/edge-runtime /etc/sbctl/master.key; do
+for d in /var/lib/supavise/backups /var/lib/supavise/certs /var/lib/supavise/projects/system/edge-runtime.env /var/lib/supavise/system/edge-runtime /etc/supavise/master.key; do
   [ -e "$d" ] && violate "sees $d"
 done
 [ "$bad" = 0 ] && exit 0 || exit 3
 PROBE
-chmod 0755 /usr/local/sbin/sbctl-bundle-probe
-install -d -o "$SBCTL_USER" -g "$SBCTL_USER" -m 0755 "$SBCTL_STATE/system/edge-bundle/work/src" "$SBCTL_STATE/system/edge-bundle/work/out"
-install -m 0666 /dev/null "$SBCTL_STATE/system/edge-bundle/work/out/out.eszip"
-chown "$SBCTL_USER:$SBCTL_USER" "$SBCTL_STATE/system/edge-bundle/work/out/out.eszip"
+chmod 0755 /usr/local/sbin/supavise-bundle-probe
+install -d -o "$SUPAVISE_USER" -g "$SUPAVISE_USER" -m 0755 "$SUPAVISE_STATE/system/edge-bundle/work/src" "$SUPAVISE_STATE/system/edge-bundle/work/out"
+install -m 0666 /dev/null "$SUPAVISE_STATE/system/edge-bundle/work/out/out.eszip"
+chown "$SUPAVISE_USER:$SUPAVISE_USER" "$SUPAVISE_STATE/system/edge-bundle/work/out/out.eszip"
 declare -A PROBE_UID
 for pair in "$REF_V:$REF_A:$A_MARKER:$V_MARKER" "$REF_A:$REF_V:$V_MARKER:$A_MARKER"; do
   IFS=: read -r self other other_marker self_marker <<<"$pair"
-  inst=sb-edge-bundle@$self.service
+  inst=supavise-edge-bundle@$self.service
   install -d /run/systemd/system/$inst.d
   cat >/run/systemd/system/$inst.d/90-probe.conf <<CONF
 [Service]
-Environment=PROBE_RT_PID=$RT_PID PROBE_DAEMON_PID=$DAEMON_PID PROBE_SBCTL_UID=$(id -u "$SBCTL_USER") PROBE_TENANTS=$SBCTL_STATE/system/edge-runtime/tenants PROBE_REF=$REF_A
+Environment=PROBE_RT_PID=$RT_PID PROBE_DAEMON_PID=$DAEMON_PID PROBE_SUPAVISE_UID=$(id -u "$SUPAVISE_USER") PROBE_TENANTS=$SUPAVISE_STATE/system/edge-runtime/tenants PROBE_REF=$REF_A
 Environment=PROBE_SELF=$self PROBE_OTHER=$other PROBE_SELF_MARKER=$self_marker PROBE_OTHER_MARKER=$other_marker
 ExecStart=
-ExecStart=/usr/local/sbin/sbctl-bundle-probe
+ExecStart=/usr/local/sbin/supavise-bundle-probe
 CONF
   systemctl daemon-reload
-  # The unit does not run as the daemon would start it (no upload): a sbctl-owned work/src and work/out
+  # The unit does not run as the daemon would start it (no upload): a supavise-owned work/src and work/out
   # stand in for what the daemon lays out. A start by root is fine for the probe.
   if ! systemctl start "$inst"; then
     journalctl -u "$inst" -n 60 --no-pager -o cat >&2 || true
@@ -285,12 +285,12 @@ CONF
   systemctl daemon-reload
   [[ -z $(systemctl show -p DropInPaths --value "$inst") ]] || fail "the probe drop-in of $inst is still in place"
 done
-rm -f /usr/local/sbin/sbctl-bundle-probe
-rm -rf "$SBCTL_STATE/system/edge-bundle/work"
+rm -f /usr/local/sbin/supavise-bundle-probe
+rm -rf "$SUPAVISE_STATE/system/edge-bundle/work"
 # Each project's bundler runs under a uid of its own, so that the mode of its cache directory (0700) keeps
 # the others out even where a directory of another project is in reach.
 [[ -n ${PROBE_UID[$REF_A]} && -n ${PROBE_UID[$REF_V]} && ${PROBE_UID[$REF_A]} != "${PROBE_UID[$REF_V]}" ]] || fail "the bundlers of A and V do not run under different uids (A: ${PROBE_UID[$REF_A]:-?}, V: ${PROBE_UID[$REF_V]:-?})"
-[[ ${PROBE_UID[$REF_A]} != "$(id -u "$SBCTL_USER")" && ${PROBE_UID[$REF_V]} != "$(id -u "$SBCTL_USER")" ]] || fail "a bundler runs under the sbctl uid"
+[[ ${PROBE_UID[$REF_A]} != "$(id -u "$SUPAVISE_USER")" && ${PROBE_UID[$REF_V]} != "$(id -u "$SUPAVISE_USER")" ]] || fail "a bundler runs under the supavise uid"
 
 log "crash recovery: kill -9 of the runtime"
 open_code() { http_code "http://$REF_A.api.$DOMAIN:$P_HTTP/functions/v1/open"; }
@@ -307,18 +307,18 @@ done
 log "$U recovered (MemoryCurrent $(( $(systemctl show -p MemoryCurrent --value "$U") / 1048576 )) MiB)"
 
 log "worker budget: restart with max_workers = 4 and 3 per project"
-# One runtime serves every project and sbctl-main enforces what fits into its memory limit:
+# One runtime serves every project and supavise-main enforces what fits into its memory limit:
 # at most 4 live workers (4 x 288 MB + 256 MB = the unit's MemoryMax), at most 3 of one project.
 # Over-budget requests are refused with 503, nothing is killed, warm functions keep answering.
 kill -TERM "$DEV_PID"; wait "$DEV_PID" 2>/dev/null || true; DEV_PID=""
 for ((i = 0; i < 60; i++)); do [[ $(unit_state "$U") == active ]] || break; sleep 1; done
-sed -i -e 's/^max_workers = 24$/max_workers = 4/' -e 's/^max_workers_per_project = 16$/max_workers_per_project = 3/' "$SBCTL_CONF"
-grep -q '^max_workers = 4$' "$SBCTL_CONF" && grep -q '^max_workers_per_project = 3$' "$SBCTL_CONF" || fail "could not set max_workers"
+sed -i -e 's/^max_workers = 24$/max_workers = 4/' -e 's/^max_workers_per_project = 16$/max_workers_per_project = 3/' "$SUPAVISE_CONF"
+grep -q '^max_workers = 4$' "$SUPAVISE_CONF" && grep -q '^max_workers_per_project = 3$' "$SUPAVISE_CONF" || fail "could not set max_workers"
 rm -f "$PAT_FILE"
-sudo -u "$SBCTL_USER" -H /usr/local/bin/sbctl functions dev --token-file "$PAT_FILE" >"$LOG_DIR/functions-dev-budget.log" 2>&1 &
+sudo -u "$SUPAVISE_USER" -H /usr/local/bin/supavise functions dev --token-file "$PAT_FILE" >"$LOG_DIR/functions-dev-budget.log" 2>&1 &
 DEV_PID=$!
 for ((i = 0; i < 180; i++)); do
-  kill -0 "$DEV_PID" 2>/dev/null || { tail -30 "$LOG_DIR/functions-dev-budget.log" >&2; fail "sbctl functions dev exited"; }
+  kill -0 "$DEV_PID" 2>/dev/null || { tail -30 "$LOG_DIR/functions-dev-budget.log" >&2; fail "supavise functions dev exited"; }
   [[ $(http_code "http://127.0.0.1:$P_EDGE/_internal/health") == 200 && -s $PAT_FILE ]] && break
   sleep 1
 done
@@ -333,7 +333,7 @@ node -e '
   const z = require("node:zlib"), fs = require("node:fs")
   const raw = fs.readFileSync(process.argv[1])
   fs.writeFileSync(process.argv[2], Buffer.concat([Buffer.from("EZBR"), z.brotliCompressSync(raw)]))' \
-  "$SBCTL_STATE/system/edge-runtime/tenants/$REF_A/functions/open/bundle.eszip" "$LOG_DIR/budget.ezbr" || fail "could not make the bundle"
+  "$SUPAVISE_STATE/system/edge-runtime/tenants/$REF_A/functions/open/bundle.eszip" "$LOG_DIR/budget.ezbr" || fail "could not make the bundle"
 entry=$(curl -s -H "Authorization: Bearer $PAT" "$API_URL/v1/projects/$REF_A/functions/open" | python3 -c 'import json,sys; print(json.load(sys.stdin)["entrypoint_path"])')
 [[ -n $entry ]] || fail "no entrypoint_path for A/open"
 entry_q=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$entry")
@@ -363,12 +363,12 @@ log "deleting a project removes the module cache of its bundler"
 out=$(deploy_src "$REF_V" cachemark "$LOG_DIR/cache-mark.ts") || fail "curl: cachemark upload to $REF_V"
 [[ $(tail -n1 <<<"$out") =~ ^20[01]$ ]] || fail "the upload that imports npm:postgres to $REF_V answered: $out"
 [[ -d $CACHE_ROOT/$REF_V && -n $(cache_marker "$REF_V") ]] || fail "the bundler of $REF_V has no cached package in $CACHE_ROOT/$REF_V"
-[[ -f $SBCTL_STATE/projects/$REF_V/edge-bundle.env ]] || fail "no rendered files for the bundler of $REF_V"
-sbctl projects delete "$REF_V" --skip-final-backup >/dev/null || fail "projects delete $REF_V"
-for gone in "$CACHE_ROOT/$REF_V" "/var/cache/private/sb-edge-bundle/$REF_V" "$SBCTL_STATE/projects/$REF_V"; do
+[[ -f $SUPAVISE_STATE/projects/$REF_V/edge-bundle.env ]] || fail "no rendered files for the bundler of $REF_V"
+supavise projects delete "$REF_V" --skip-final-backup >/dev/null || fail "projects delete $REF_V"
+for gone in "$CACHE_ROOT/$REF_V" "/var/cache/private/supavise-edge-bundle/$REF_V" "$SUPAVISE_STATE/projects/$REF_V"; do
   [[ ! -e $gone ]] || fail "$gone is still there after the project was deleted"
 done
-[[ $(unit_state "sb-edge-bundle@$REF_V.service") == inactive ]] || fail "the bundler of the deleted project is $(unit_state "sb-edge-bundle@$REF_V.service")"
+[[ $(unit_state "supavise-edge-bundle@$REF_V.service") == inactive ]] || fail "the bundler of the deleted project is $(unit_state "supavise-edge-bundle@$REF_V.service")"
 [[ -d $CACHE_ROOT/$REF_A && -n $(cache_marker "$REF_A") ]] || fail "deleting $REF_V removed the cache of project A"
 
 log "functions smoke test passed"

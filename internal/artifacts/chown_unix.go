@@ -11,8 +11,8 @@ import (
 
 // handOver gives a freshly unpacked tree to the owner of the state directory when root
 // fetched it. The Postgres launcher chmods a script inside its artifact on first boot,
-// which only the file's owner may do, and the services run as that owner (the sbctl
-// user), not as root. A fetch by the sbctl user itself needs nothing.
+// which only the file's owner may do, and the services run as that owner (the supavise
+// user), not as root. A fetch by the supavise user itself needs nothing.
 func handOver(tree, stateDir string) error {
 	if os.Geteuid() != 0 {
 		return nil

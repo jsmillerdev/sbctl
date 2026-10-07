@@ -42,12 +42,12 @@ const (
 )
 
 // Functions is the [functions] config section: Edge Functions, served by the
-// edge-runtime artifact (unit sb-edge-runtime) with sbctl's tenant-aware main service
+// edge-runtime artifact (unit supavise-edge-runtime) with supavise's tenant-aware main service
 // from functions-main/. Off by default: a node without it does not fetch or start
 // the runtime, and the proxy answers 503 on /functions/v1. The environment overrides
-// are SBCTL_FUNCTIONS_*.
+// are SUPAVISE_FUNCTIONS_*.
 type Functions struct {
-	// Enabled turns the feature on: the fleet starts sb-edge-runtime, the proxy routes
+	// Enabled turns the feature on: the fleet starts supavise-edge-runtime, the proxy routes
 	// /functions/v1 to it and the API materializes deployments on disk.
 	Enabled bool `toml:"enabled"`
 	// MemoryMB is the heap limit of one worker. Zero means DefaultFunctionsMemoryMB.
@@ -91,7 +91,7 @@ type Functions struct {
 	// is answered 503 PROJECT_AT_CAPACITY. Zero means DefaultFunctionsMaxPerProject;
 	// negative means no cap.
 	MaxPerProject int `toml:"max_per_project"`
-	// MemoryMax is the memory limit of sb-edge-runtime (systemd syntax, "2G"). Empty means
+	// MemoryMax is the memory limit of supavise-edge-runtime (systemd syntax, "2G"). Empty means
 	// Workers x worker cost plus FunctionsRuntimeOverheadMB, the most the workers can use
 	// together. A value below what max_workers needs fails validation, because a runtime
 	// that hits its cgroup limit is killed whole, for every project. When max_workers is
@@ -99,8 +99,8 @@ type Functions struct {
 	MemoryMax string `toml:"memory_max"`
 	// BundleUnsandboxed lets a node whose supervisor cannot sandbox (the exec backend of
 	// development machines) bundle uploaded sources anyway. The bundler reads imports from
-	// the disk, so without the sandbox of sb-edge-bundle.service an upload can import any
-	// file the sbctl user can read, other projects' files included. Never set it on a node
+	// the disk, so without the sandbox of supavise-edge-bundle.service an upload can import any
+	// file the supavise user can read, other projects' files included. Never set it on a node
 	// that serves other people's projects. Ignored where the sandbox exists.
 	BundleUnsandboxed bool `toml:"bundle_unsandboxed"`
 	// ProjectURLTemplate is SUPABASE_URL as functions see it, with {ref} for the project
@@ -202,7 +202,7 @@ func (f Functions) WorkersPerProject() int {
 	return max(1, total/2)
 }
 
-// RuntimeMemoryMax returns the MemoryMax of sb-edge-runtime: the configured value, or when
+// RuntimeMemoryMax returns the MemoryMax of supavise-edge-runtime: the configured value, or when
 // workers are capped the most they can use together plus the runtime's own needs. Empty
 // means the [defaults] limit applies (workers are uncapped and no value was set).
 func (f Functions) RuntimeMemoryMax() string {
@@ -287,7 +287,7 @@ func limitOrOff(v, d int) int {
 
 // FunctionsRoot is where Edge Functions live on disk: one directory per project ref, each
 // with functions-env.json and functions/. It sits inside the state directory of
-// sb-edge-runtime (system/edge-runtime/tenants), the one directory the unit's mount
+// supavise-edge-runtime (system/edge-runtime/tenants), the one directory the unit's mount
 // namespace shows besides the artifacts, so the runtime sees the functions and nothing
 // of the projects' clusters, sockets and unit files. internal/functions writes it,
 // functions-main/ reads it.
@@ -295,7 +295,7 @@ func (p Paths) FunctionsRoot() string {
 	return filepath.Join(p.System(SvcEdgeRuntime), "tenants")
 }
 
-// EdgeBundleDir is the state directory of the bundler units (sb-edge-bundle@<ref>.service):
+// EdgeBundleDir is the state directory of the bundler units (supavise-edge-bundle@<ref>.service):
 // work/ holds the upload being bundled (the unit sees nothing else of the node). The module
 // cache is per project: under systemd it is the unit's own CacheDirectory, and the exec backend
 // keeps it in <state>/projects/<ref>/edge-bundle/deno, which goes with the project.

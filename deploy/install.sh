@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# sbctl installer: checks the host, downloads the sbctl release binary, verifies its
+# Supavise installer: checks the host, downloads the Supavise release binary, verifies its
 # SHA-256 and the ed25519 signature of the release's checksum list, installs it and runs
-# `sbctl install`, which does the rest (user, config, units, firewall, system project,
-# shared services, sbctl.service) and prints the dashboard URL and the claim token.
+# `supavise install`, which does the rest (user, config, units, firewall, system project,
+# shared services, supavise.service) and prints the dashboard URL and the claim token.
 #
-#   curl -fsSL https://github.com/jsmillerdev/sbctl/releases/latest/download/install.sh | sudo bash -s -- \
+#   curl -fsSL https://github.com/jsmillerdev/supavise/releases/latest/download/install.sh | sudo bash -s -- \
 #       --domain example.com --dns cloudflare --dns-credentials-file /root/cf.env --email you@example.com
 #
 # Idempotent: re-running keeps the master key, the registry and every project, and a flag
-# you leave out keeps its value in /etc/sbctl/config.toml. Flags this script does not know
-# are passed to `sbctl install` (run `sbctl install --help` for them).
+# you leave out keeps its value in /etc/supavise/config.toml. Flags this script does not know
+# are passed to `supavise install` (run `supavise install --help` for them).
 #
 # Own flags:
-#   --binary PATH    install this sbctl binary instead of downloading one (no verification:
+#   --binary PATH    install this supavise binary instead of downloading one (no verification:
 #                    you supply the file); --binary-sha256 HEX checks it
 #   --version TAG    install this release (default: the latest)
 #   --repo OWNER/NAME  GitHub repository to download from (default below)
 #   --verify-only    download and verify the release, print what it holds, install nothing
 #   -h, --help
 #
-# Test hooks (environment): SBCTL_INSTALL_BASE_URL replaces https://github.com/<repo>/releases
-# and SBCTL_INSTALL_PUBKEY_B64 replaces the embedded release key (base64 of its PEM).
+# Test hooks (environment): SUPAVISE_INSTALL_BASE_URL replaces https://github.com/<repo>/releases
+# and SUPAVISE_INSTALL_PUBKEY_B64 replaces the embedded release key (base64 of its PEM).
 set -euo pipefail
 
-REPO=${SBCTL_INSTALL_REPO:-jsmillerdev/sbctl}
+REPO=${SUPAVISE_INSTALL_REPO:-jsmillerdev/supavise}
 # The release workflow replaces this marker with the base64 of the release public key
 # (internal/selfupdate/release_key.pem) in the install.sh it attaches to each release.
-RELEASE_PUBKEY_B64=${SBCTL_INSTALL_PUBKEY_B64:-__SBCTL_RELEASE_PUBKEY_B64__}
-BIN_PATH=/usr/local/bin/sbctl
+RELEASE_PUBKEY_B64=${SUPAVISE_INSTALL_PUBKEY_B64:-__SUPAVISE_RELEASE_PUBKEY_B64__}
+BIN_PATH=/usr/local/bin/supavise
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -35,18 +35,18 @@ die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh [own flags] [flags for `sbctl install`]
+Usage: install.sh [own flags] [flags for `supavise install`]
 
 Own flags:
-  --binary PATH      install this sbctl binary instead of downloading one (not verified:
+  --binary PATH      install this supavise binary instead of downloading one (not verified:
                      you supply the file); --binary-sha256 HEX checks it
   --version TAG      install this release (default: the latest)
   --repo OWNER/NAME  GitHub repository to download from
   --verify-only      download and verify the release, print what it holds, install nothing
   -h, --help
 
-Everything else goes to `sbctl install` (--domain, --dns, --email, --s3-bucket, ...);
-run `sbctl install --help` after installing for the list. Re-running keeps secrets.
+Everything else goes to `supavise install` (--domain, --dns, --email, --s3-bucket, ...);
+run `supavise install --help` after installing for the list. Re-running keeps secrets.
 USAGE
 }
 
@@ -71,7 +71,7 @@ main() {
       *) PASS+=("$1"); shift ;;
     esac
   done
-  BASE_URL=${SBCTL_INSTALL_BASE_URL:-https://github.com/$REPO/releases}
+  BASE_URL=${SUPAVISE_INSTALL_BASE_URL:-https://github.com/$REPO/releases}
 
   [[ $(id -u) -eq 0 ]] || die "run as root: curl -fsSL <url>/install.sh | sudo bash -s -- <flags>"
   [[ $(uname -s) == Linux ]] || die "this installs a Linux server; $(uname -s) is not supported"
@@ -92,7 +92,7 @@ main() {
   for a in "${PASS[@]+"${PASS[@]}"}"; do [[ $a == --skip-os-check ]] && skip_os=1; done
   os_major=${VERSION_ID:-}; os_major=${os_major%%.*}
   case ${ID:-} in
-    ubuntu) [[ ${os_major:-0} =~ ^[0-9]+$ && $os_major -ge 24 ]] || [[ $skip_os -eq 1 ]] || die "Ubuntu ${VERSION_ID:-?} is too old: 24.04 or later is required (22.04 ships a polkit that ignores the rule sbctl needs)" ;;
+    ubuntu) [[ ${os_major:-0} =~ ^[0-9]+$ && $os_major -ge 24 ]] || [[ $skip_os -eq 1 ]] || die "Ubuntu ${VERSION_ID:-?} is too old: 24.04 or later is required (22.04 ships a polkit that ignores the rule supavise needs)" ;;
     debian) [[ ${os_major:-0} =~ ^[0-9]+$ && $os_major -ge 12 ]] || [[ $skip_os -eq 1 ]] || die "Debian ${VERSION_ID:-?} is too old: 12 or later is required" ;;
     *) [[ $skip_os -eq 1 ]] || die "${PRETTY_NAME:-this distribution} is not supported: Ubuntu 24.04+ or Debian 12+ is required (--skip-os-check tries anyway)" ;;
   esac
@@ -122,7 +122,7 @@ main() {
   fi
 
   tmp=$(mktemp -d)
-  VERIFY_BIN=$(dirname "$BIN_PATH")/.sbctl.verify
+  VERIFY_BIN=$(dirname "$BIN_PATH")/.supavise.verify
   trap 'rm -rf "$tmp"; rm -f "$VERIFY_BIN"' EXIT
 
   # ---- obtain the binary ------------------------------------------------------------
@@ -157,7 +157,7 @@ main() {
       die "the signature of SHA256SUMS does not verify against the release key: refusing to install"
     fi
     log "signature of SHA256SUMS verified"
-    asset=sbctl-linux-$ARCH
+    asset=supavise-linux-$ARCH
     line=$(grep -E "^[0-9a-f]{64} [ *]$asset\$" "$tmp/SHA256SUMS" || true)
     [[ -n $line ]] || die "release $TAG lists no $asset"
     fetch "$asset"
@@ -176,12 +176,12 @@ main() {
     rm -f "$VERIFY_BIN"
     SRC=$tmp/$asset
     # Studio ships as a release asset too; hand its URL and checksum (from the verified
-    # list) to `sbctl install` unless the caller chose their own.
+    # list) to `supavise install` unless the caller chose their own.
     studio_given=0
     for a in "${PASS[@]+"${PASS[@]}"}"; do
       case $a in --studio-url|--studio-url=*|--no-studio) studio_given=1 ;; esac
     done
-    studio_line=$(grep -E "^[0-9a-f]{64} [ *]sbctl-studio-.*-linux-$ARCH\.tar\.zst\$" "$tmp/SHA256SUMS" | head -n1 || true)
+    studio_line=$(grep -E "^[0-9a-f]{64} [ *]supavise-studio-.*-linux-$ARCH\.tar\.zst\$" "$tmp/SHA256SUMS" | head -n1 || true)
     if [[ $studio_given -eq 0 && -n $studio_line ]]; then
       studio_name=${studio_line##* }; studio_name=${studio_name#\*}
       STUDIO_ARGS=(--studio-url "$rel/$studio_name" --studio-sha256 "${studio_line%% *}")
@@ -196,7 +196,7 @@ main() {
   fi
 
   # ---- install and hand over --------------------------------------------------------
-  # Replace the binary atomically: a running sbctl.service keeps its old inode until restarted.
+  # Replace the binary atomically: a running supavise.service keeps its old inode until restarted.
   install -d -m 0755 "$(dirname "$BIN_PATH")"
   install -m 0755 "$SRC" "$BIN_PATH.new"
   mv -f "$BIN_PATH.new" "$BIN_PATH"

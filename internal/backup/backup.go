@@ -1,5 +1,5 @@
-// Package backup is sbctl's WAL archiver and base-backup engine: archive_command is
-// `sbctl wal push`, restore_command is `sbctl wal fetch`, and a nightly timer takes a
+// Package backup is supavise's WAL archiver and base-backup engine: archive_command is
+// `supavise wal push`, restore_command is `supavise wal fetch`, and a nightly timer takes a
 // base backup per project. Backends: file:// and s3:// (any S3-compatible endpoint).
 //
 // Layout under the backend root, one tree per project ref:
@@ -20,14 +20,14 @@ import (
 	"errors"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // ErrNoWAL is returned by FetchWAL when the segment is not in the archive; the CLI
 // then exits non-zero, which Postgres's restore_command treats as end of archive.
 var ErrNoWAL = errors.New("backup: WAL file not in archive")
 
-// Backup is the contract the rest of sbctl programs against. Service implements it.
+// Backup is the contract the rest of supavise programs against. Service implements it.
 type Backup interface {
 	// PushWAL archives the file at path (absolute, or relative to the cluster's data dir
 	// as %p is) under ref. It must not return success unless the file is durable.

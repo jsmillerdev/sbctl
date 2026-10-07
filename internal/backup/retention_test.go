@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // fakeBackup stores a manifest, a data object and a registry row for a base backup

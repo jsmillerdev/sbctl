@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/branching"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/branching"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // branchEngine adds DeleteWith to the fake manager.
@@ -381,14 +381,14 @@ func TestBranchJSONCarriesTheEgressPolicy(t *testing.T) {
 	if err := json.Unmarshal(body, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m["sbctl_egress"] != "denied" || m["with_data"] != true || m["project_ref"] != "abcdefghijklmnopqrst" || m["status"] != "MIGRATIONS_PASSED" {
+	if m["supavise_egress"] != "denied" || m["with_data"] != true || m["project_ref"] != "abcdefghijklmnopqrst" || m["status"] != "MIGRATIONS_PASSED" {
 		t.Fatalf("branch JSON = %s", body)
 	}
 	validateAgainstSpec(t, "GET /v1/projects/{ref}/branches/{name}", body)
 	// Schema-only and default branches have none.
 	b.Egress = ""
 	body, _ = json.Marshal(mustBranchJSON(t, b))
-	if strings.Contains(string(body), "sbctl_egress") {
+	if strings.Contains(string(body), "supavise_egress") {
 		t.Fatalf("branch without a policy reports one: %s", body)
 	}
 }

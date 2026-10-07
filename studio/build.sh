@@ -9,7 +9,7 @@
 # checks together with STUDIO_PREBUILT; the real build needs ~8 GB RAM and is meant for CI
 # (see studio/ci-prepare.sh and studio/README.md).
 #
-# Output: $STUDIO_OUT (default studio/dist)/sbctl-studio-<tag>-p<N>-<platform>.tar.zst plus a line in
+# Output: $STUDIO_OUT (default studio/dist)/supavise-studio-<tag>-p<N>-<platform>.tar.zst plus a line in
 # SHA256SUMS next to it.
 #
 # Environment (all optional):
@@ -91,7 +91,7 @@ SHORT_SHA="${TAG##*-sha-}"
 COMMIT="${STUDIO_COMMIT:-$PINNED_COMMIT}"
 case "$COMMIT" in "$SHORT_SHA"*) ;; *) die "commit $COMMIT does not match versions.yaml studio.tag $TAG; update PINNED_COMMIT in studio/build.sh" ;; esac
 PATCHSET="$(tr -d '[:space:]' < "$HERE/PATCHSET")"
-ARTIFACT="sbctl-studio-${TAG}-p${PATCHSET}-${PLATFORM}.tar.zst"
+ARTIFACT="supavise-studio-${TAG}-p${PATCHSET}-${PLATFORM}.tar.zst"
 
 WORK="${STUDIO_WORK:-$HERE/.build-cache/work-$PLATFORM}"
 CACHE="${STUDIO_CACHE:-$HERE/.build-cache/dl}"
@@ -100,7 +100,7 @@ HEAP_MB="${STUDIO_BUILD_HEAP_MB:-4096}"
 WORKERS="${STUDIO_BUILD_WORKERS:-1}"
 [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]] || die "STUDIO_BUILD_WORKERS must be a positive integer, got '$WORKERS'"
 mkdir -p "$WORK" "$CACHE" "$OUT"
-touch "$WORK/.sbctl-studio-work"   # cleanup below only removes a directory carrying this marker
+touch "$WORK/.supavise-studio-work"   # cleanup below only removes a directory carrying this marker
 
 free_gb() { df -Pk "$1" | awk 'NR==2 {printf "%d", $4/1048576}'; }
 if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
@@ -157,13 +157,13 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
   APP="$WORK/prune"
   # Fetch when the marker is missing or stale, or when the source tree was consumed by an earlier
   # "turbo prune" (apps/ and packages/ are deleted afterwards) and the pruned copy is gone too.
-  if [[ ! -f "$SRC/.sbctl-fetched" || "$(cat "$SRC/.sbctl-fetched")" != "$COMMIT+p$PATCHSET" \
+  if [[ ! -f "$SRC/.supavise-fetched" || "$(cat "$SRC/.supavise-fetched")" != "$COMMIT+p$PATCHSET" \
         || ( ! -d "$SRC/apps/studio" && ! -d "$APP/apps/studio" ) ]]; then
     log "sparse fetch of $COMMIT"
     rm -rf "$SRC" "$APP"; mkdir -p "$SRC"   # a pruned copy of an older fetch would be stale
     git -C "$SRC" init -q
     git -C "$SRC" remote add origin https://github.com/supabase/supabase.git
-    git -C "$SRC" config user.name sbctl; git -C "$SRC" config user.email sbctl@users.noreply.invalid
+    git -C "$SRC" config user.name supavise; git -C "$SRC" config user.email supavise@users.noreply.invalid
     # Only what Studio's dependency graph needs: root manifests and lockfile, patches/, every
     # package (small, internal deps of studio), studio itself and the manifests of the other
     # workspace projects so the frozen lockfile still matches.
@@ -177,7 +177,7 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
 
     log "applying patches"
     git -C "$SRC" am --3way "$HERE"/patches/*.patch
-    echo "$COMMIT+p$PATCHSET" > "$SRC/.sbctl-fetched"
+    echo "$COMMIT+p$PATCHSET" > "$SRC/.supavise-fetched"
   fi
 
   # The platform build must not inherit the self-hosted defaults that upstream keeps in a dotenv
@@ -236,7 +236,7 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
   unset NODE_OPTIONS CIRCLE_NODE_TOTAL
   # The verify step starts Studio from this shell. The build-time placeholders must not leak into
   # it as if they were configuration (CI run: NEXT_PUBLIC_DISABLED_FEATURES was still
-  # "sbctl-placeholder-disabled-features" and the entrypoint refused it).
+  # "supavise-placeholder-disabled-features" and the entrypoint refused it).
   for v in $(compgen -e | grep -E '^(NEXT_PUBLIC_|CSP_)' || true); do unset "$v"; done
   unset STUDIO_FRAMEWORK
 
@@ -253,7 +253,7 @@ fi
 # ---- package ----------------------------------------------------------------------------------
 log "packaging"
 STAGE="$WORK/stage"
-rm -rf "$STAGE"; mkdir -p "$STAGE/app" "$STAGE/bin" "$STAGE/node/bin" "$STAGE/share/licenses/app" "$STAGE/share/sbctl"
+rm -rf "$STAGE"; mkdir -p "$STAGE/app" "$STAGE/bin" "$STAGE/node/bin" "$STAGE/share/licenses/app" "$STAGE/share/supavise"
 
 # app/: Next's standalone output is the app root; static assets and public/ go alongside it.
 # (Same assembly as upstream's apps/studio/Dockerfile.) cp -R keeps the symlinks pnpm and Next use.
@@ -273,29 +273,29 @@ if [[ -f "$NODE_DIR/LICENSE" ]]; then cp "$NODE_DIR/LICENSE" "$STAGE/share/licen
 cp "$HERE/runtime/bin-studio.sh" "$STAGE/bin/studio"
 cp "$HERE/runtime/runtime-env.sh" "$STAGE/bin/.runtime-env.sh"
 chmod 755 "$STAGE/bin/studio" "$STAGE/node/bin/node"
-cp "$HERE/runtime/docker-entrypoint.mjs" "$HERE/runtime/sbctl-runtime-config.mjs" "$STAGE/app/apps/studio/"
+cp "$HERE/runtime/docker-entrypoint.mjs" "$HERE/runtime/supavise-runtime-config.mjs" "$STAGE/app/apps/studio/"
 chmod 755 "$STAGE/app/apps/studio/docker-entrypoint.mjs"
 
 # Runtime substitution: find every file that holds a placeholder, keep a pristine copy of each,
 # and record the list. Fails if a placeholder did not survive the build.
 log "placeholder scan"
-node "$HERE/runtime/prepare-cli.mjs" "$PLACEHOLDERS" "$STAGE/app" "$STAGE/share/sbctl/runtime-config.json"
+node "$HERE/runtime/prepare-cli.mjs" "$PLACEHOLDERS" "$STAGE/app" "$STAGE/share/supavise/runtime-config.json"
 
 # share/: licenses and build info.
 if [[ -n "$LICENSE_FILE" && -f "$LICENSE_FILE" ]]; then cp "$LICENSE_FILE" "$STAGE/share/licenses/UPSTREAM-LICENSE"; fi
-if [[ -f "$REPO/LICENSE" ]]; then cp "$REPO/LICENSE" "$STAGE/share/licenses/SBCTL-LICENSE"; fi
-mkdir -p "$STAGE/share/sbctl/patches"; cp "$HERE"/patches/*.patch "$STAGE/share/sbctl/patches/"
+if [[ -f "$REPO/LICENSE" ]]; then cp "$REPO/LICENSE" "$STAGE/share/licenses/SUPAVISE-LICENSE"; fi
+mkdir -p "$STAGE/share/supavise/patches"; cp "$HERE"/patches/*.patch "$STAGE/share/supavise/patches/"
 node -e '
   const fs = require("fs");
   const [out, tag, commit, patchset, platform, nodev, pnpmv] = process.argv.slice(1);
   fs.writeFileSync(out, JSON.stringify({
-    service: "sbctl-studio", upstream_tag: tag, upstream_commit: commit, upstream_repository: "https://github.com/supabase/supabase",
+    service: "supavise-studio", upstream_tag: tag, upstream_commit: commit, upstream_repository: "https://github.com/supabase/supabase",
     patchset: Number(patchset), platform, node_version: nodev, pnpm_version: pnpmv,
     framework: "next", env: { NEXT_PUBLIC_IS_PLATFORM: "true", NEXT_PUBLIC_ENVIRONMENT: "prod" },
     entrypoint: "bin/studio", cmd: ["node/bin/node", "apps/studio/server.js"],
-    runtime_config: "share/sbctl/runtime-config.json"
+    runtime_config: "share/supavise/runtime-config.json"
   }, null, 1) + "\n");
-' "$STAGE/share/sbctl/build-info.json" "$TAG" "$COMMIT" "$PATCHSET" "$PLATFORM" "$(node --version)" "$PNPM_VERSION"
+' "$STAGE/share/supavise/build-info.json" "$TAG" "$COMMIT" "$PATCHSET" "$PLATFORM" "$(node --version)" "$PNPM_VERSION"
 
 # ---- archive, verify the archive, publish ------------------------------------------------------
 log "archive"
@@ -320,6 +320,6 @@ grep -v " $ARTIFACT\$" "$OUT/SHA256SUMS" > "$OUT/SHA256SUMS.new" || true
 printf '%s  %s\n' "$sum" "$ARTIFACT" >> "$OUT/SHA256SUMS.new"
 mv "$OUT/SHA256SUMS.new" "$OUT/SHA256SUMS"
 
-if [[ "${STUDIO_KEEP_WORK:-}" != "1" && -f "$WORK/.sbctl-studio-work" ]]; then rm -rf "$WORK"; fi
+if [[ "${STUDIO_KEEP_WORK:-}" != "1" && -f "$WORK/.supavise-studio-work" ]]; then rm -rf "$WORK"; fi
 log "done: $OUT/$ARTIFACT ($(du -h "$OUT/$ARTIFACT" | awk '{print $1}'))"
 echo "$sum  $ARTIFACT"

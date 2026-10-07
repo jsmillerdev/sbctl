@@ -13,8 +13,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // A branch cloned from the parent's data (copy-on-write or base backup) carries everything
@@ -36,7 +36,7 @@ import (
 // (the Postgres unit is rendered behind systemd's IPAddressDeny from then on) and the cluster
 // restarts normally.
 
-const quarantineMark = "# sbctl-branch-quarantine"
+const quarantineMark = "# supavise-branch-quarantine"
 
 // cronNodeName is the nodename of a branch's pg_cron jobs: the address its cluster listens on.
 const cronNodeName = "127.0.0.1"
@@ -45,7 +45,7 @@ const cronNodeName = "127.0.0.1"
 var quarantineSettings = []struct{ key, value string }{
 	{"max_logical_replication_workers", "0"},
 	{"cron.launch_active_jobs", "off"},
-	{"pg_net.database_name", "'sbctl_quarantine_no_such_database'"},
+	{"pg_net.database_name", "'supavise_quarantine_no_such_database'"},
 }
 
 func quarantineLines() string {
@@ -58,7 +58,7 @@ func quarantineLines() string {
 
 // quarantineSaved is the file next to postgresql.auto.conf that remembers the lines the
 // parent had for the quarantined settings, so that clearQuarantine can put them back.
-const quarantineSaved = "sbctl-branch-quarantine.json"
+const quarantineSaved = "supavise-branch-quarantine.json"
 
 // confKey is the setting name of a postgresql.auto.conf line ("" for comments and blanks).
 func confKey(line string) string {
@@ -141,7 +141,7 @@ func clearQuarantine(dataDir string) error {
 				out += l + "\n"
 			}
 		}
-		tmp := p + ".sbctl-tmp"
+		tmp := p + ".supavise-tmp"
 		if err := writeFileSync(tmp, []byte(out), 0o600); err != nil {
 			return err
 		}
@@ -240,7 +240,7 @@ func isolateCluster(ctx context.Context, dsn string, opt isolateOptions) (res Is
 // that refuses connections can allow them again in the branch, and what it holds (foreign
 // servers, Vault secrets, cron jobs) is as much a copy of the parent as the rest, so such a
 // database is opened for the duration with ALTER DATABASE ... ALLOW_CONNECTIONS true as the
-// superuser; restore puts the flag back. opened names the databases it opened. If sbctl dies
+// superuser; restore puts the flag back. opened names the databases it opened. If supavise dies
 // between the two the branch stays open, and the branch it belongs to has not finished
 // creating (isolation did not complete), so it ends up failed, not in use.
 func openDatabases(ctx context.Context, dsn string) (dbs, opened []string, restore func() error, err error) {
@@ -399,7 +399,7 @@ func isolateDatabase(ctx context.Context, dsn, db string, opt isolateOptions, re
 // explicit decision of whoever owns the branch (a job that calls out needs the branch's
 // egress open too):
 //
-//	update cron.job set active = true where jobid in (select jobid from sbctl_branch.paused_cron_jobs);
+//	update cron.job set active = true where jobid in (select jobid from supavise_branch.paused_cron_jobs);
 //
 // Two things about the commands of those jobs changed when the branch was made, and the jobs
 // will not behave as in the parent until the owner redoes them: a connection string written
@@ -408,7 +408,7 @@ func isolateDatabase(ctx context.Context, dsn, db string, opt isolateOptions, re
 // password), and a parent credential in a command (an API key, a JWT secret, a database
 // password) was replaced by the branch's own (RewriteTable). A job that reaches a foreign
 // server by name needs that server turned on again (PausedForeignTable).
-const PausedCronTable = "sbctl_branch.paused_cron_jobs"
+const PausedCronTable = "supavise_branch.paused_cron_jobs"
 
 // pauseCronJobs records the active jobs of cron.job in PausedCronTable and deactivates them,
 // in one transaction, and returns how many it paused. Running it again pauses nothing new and
@@ -420,7 +420,7 @@ func pauseCronJobs(ctx context.Context, c *pgx.Conn) (int, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	for _, stmt := range []string{
-		`create schema if not exists sbctl_branch`,
+		`create schema if not exists supavise_branch`,
 		`create table if not exists ` + PausedCronTable + ` (
 			jobid     bigint primary key,
 			jobname   text,

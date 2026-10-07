@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // File and directory names under <state>/system/edge-runtime/tenants/<ref>/. The Deno main service reads exactly
@@ -19,7 +19,7 @@ const (
 	FunctionsDirName = "functions"
 	genDirName       = ".gen"
 	// MetaFileName is the metadata file inside a generation.
-	MetaFileName = ".sbctl-function.json"
+	MetaFileName = ".supavise-function.json"
 )
 
 // ProjectDir is <tenants>/<ref>: everything this package keeps for one project.

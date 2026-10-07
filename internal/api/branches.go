@@ -11,9 +11,9 @@ import (
 
 	openapi_types "github.com/oapi-codegen/runtime/types"
 
-	v1 "github.com/OWNER/sbctl/internal/api/gen/v1"
-	"github.com/OWNER/sbctl/internal/branching"
-	"github.com/OWNER/sbctl/internal/registry"
+	v1 "github.com/jsmillerdev/supavise/internal/api/gen/v1"
+	"github.com/jsmillerdev/supavise/internal/branching"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // routesBranches serves the branch endpoints of the Management API (v1). Studio calls them
@@ -97,12 +97,12 @@ func (s *Server) noBranching() error {
 	return errf(http.StatusBadRequest, "Branching is not enabled on this node")
 }
 
-// branchOut is the spec's branch response plus sbctl's own field: the branch's outbound
+// branchOut is the spec's branch response plus supavise's own field: the branch's outbound
 // network policy (denied, pending, allowed or unenforced), so a client can see whether a
 // branch with data can reach the outside world. Clients that decode the spec's shape ignore it.
 type branchOut struct {
 	*v1.BranchResponseOutput
-	SbctlEgress string `json:"sbctl_egress,omitempty"`
+	SupaviseEgress string `json:"supavise_egress,omitempty"`
 }
 
 func branchJSON(b *branching.Branch) (*branchOut, error) {
@@ -135,7 +135,7 @@ func branchJSON(b *branching.Branch) (*branchOut, error) {
 		t := b.ReviewRequestedAt.UTC()
 		out.ReviewRequestedAt = &t
 	}
-	return &branchOut{BranchResponseOutput: out, SbctlEgress: b.Egress}, nil
+	return &branchOut{BranchResponseOutput: out, SupaviseEgress: b.Egress}, nil
 }
 
 func (s *Server) writeBranch(w http.ResponseWriter, status int, b *branching.Branch) error {
@@ -232,7 +232,7 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) error {
 	if in.Persistent != nil {
 		ci.Persistent = *in.Persistent
 	}
-	// with_data makes the branch a copy of production: users' sessions are removed and the keys sbctl
+	// with_data makes the branch a copy of production: users' sessions are removed and the keys supavise
 	// issued are replaced, but node-local credentials users stored in their own tables, function
 	// bodies or Vault entries are not detected and loopback is open on every port. It is for trusted
 	// users and agents (branches are schema-only by default); the branch's detail says so.

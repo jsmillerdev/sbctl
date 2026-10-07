@@ -16,25 +16,25 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/OWNER/sbctl/internal/api/cryptojs"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/api/cryptojs"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // SecretPGMetaCryptoKey is the name of the system-project secret that holds the
-// passphrase shared with sb-pgmeta (its CRYPTO_KEY) when [api] pgmeta_crypto_key is
-// not configured. The unit renderer must give sb-pgmeta the same value.
+// passphrase shared with supavise-pgmeta (its CRYPTO_KEY) when [api] pgmeta_crypto_key is
+// not configured. The unit renderer must give supavise-pgmeta the same value.
 const SecretPGMetaCryptoKey = "pgmeta_crypto_key"
 
 // ensureKeyMu serializes EnsurePGMetaCryptoKey within a process.
 var ensureKeyMu sync.Mutex
 
-// EnsurePGMetaCryptoKey returns the passphrase shared with sb-pgmeta (its CRYPTO_KEY),
+// EnsurePGMetaCryptoKey returns the passphrase shared with supavise-pgmeta (its CRYPTO_KEY),
 // creating it when absent: a random value sealed in the registry as system project
 // secret SecretPGMetaCryptoKey. Insert-if-absent, then read back, so concurrent
 // callers (the unit renderer and the API, possibly in different processes) agree on
-// one key. The unit renderer must call this before it renders sb-pgmeta, and the
+// one key. The unit renderer must call this before it renders supavise-pgmeta, and the
 // API calls it on first use. It never falls back to an ephemeral key: when the
 // registry cannot hold the key it returns an error.
 func EnsurePGMetaCryptoKey(ctx context.Context, reg registry.Registry, sec secrets.Secrets) (string, error) {
@@ -60,7 +60,7 @@ func EnsurePGMetaCryptoKey(ctx context.Context, reg registry.Registry, sec secre
 		return "", err
 	}
 	if pg, ok := reg.(interface{ Pool() *pgxpool.Pool }); ok {
-		_, err = pg.Pool().Exec(ctx, `insert into sbctl.project_secrets (ref, name, ciphertext) values ($1, $2, $3) on conflict (ref, name) do nothing`,
+		_, err = pg.Pool().Exec(ctx, `insert into supavise.project_secrets (ref, name, ciphertext) values ($1, $2, $3) on conflict (ref, name) do nothing`,
 			config.SystemRef, SecretPGMetaCryptoKey, sealed)
 	} else {
 		err = reg.PutSecret(ctx, config.SystemRef, SecretPGMetaCryptoKey, sealed)
@@ -105,7 +105,7 @@ func (s *Server) pgmetaConn(ctx context.Context, ref, role string, readOnly bool
 	return cryptojs.Encrypt(dsn, key)
 }
 
-// pgmetaDo sends one request to sb-pgmeta against ref's database.
+// pgmetaDo sends one request to supavise-pgmeta against ref's database.
 func (s *Server) pgmetaDo(ctx context.Context, ref, role string, readOnly bool, method, path, rawQuery string, body io.Reader, hdr http.Header) (*http.Response, error) {
 	conn, err := s.pgmetaConn(ctx, ref, role, readOnly)
 	if err != nil {
@@ -182,7 +182,7 @@ func (s *Server) sqlRows(ctx context.Context, ref, role string, readOnly bool, q
 	return b, nil
 }
 
-// pgmetaProxy forwards /platform/pg-meta/{ref}/<path> to sb-pgmeta, replacing the
+// pgmetaProxy forwards /platform/pg-meta/{ref}/<path> to supavise-pgmeta, replacing the
 // connection header Studio sends with one built here, and relays the answer
 // verbatim: Studio reads pg-meta's own error format.
 //
@@ -247,7 +247,7 @@ func (s *Server) sqlParams(ctx context.Context, ref, role string, readOnly bool,
 	}
 	var out string
 	// A trailing semicolon or comment would end the CTE early (syntax error).
-	wrapped := "with sbctl_q as (" + trimStatementEnd(query) + "\n) select coalesce(json_agg(sbctl_q), '[]'::json)::text from sbctl_q"
+	wrapped := "with supavise_q as (" + trimStatementEnd(query) + "\n) select coalesce(json_agg(supavise_q), '[]'::json)::text from supavise_q"
 	err = conn.QueryRow(ctx, wrapped, args...).Scan(&out)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && (pgErr.Code == "42601" || pgErr.Code == "0A000") { // not a row-returning statement

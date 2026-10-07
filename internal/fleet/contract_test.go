@@ -5,13 +5,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/OWNER/sbctl/internal/api"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
-	"github.com/OWNER/sbctl/internal/units"
+	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/units"
 )
 
 // These tests pin what package fleet repeats from packages that import it (lifecycle) or
@@ -37,7 +37,7 @@ func node(t *testing.T) (*config.Config, *registry.Memory, secrets.Secrets) {
 	}
 	cfg := config.Default()
 	cfg.StateDir = t.TempDir()
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	reg := registry.NewMemory()
 	if err := reg.CreateProject(context.Background(), &registry.Project{Ref: config.SystemRef, Name: "system", Class: "system"}); err != nil {
 		t.Fatal(err)
@@ -81,7 +81,7 @@ func TestPGMetaKeyIsTheOneTheAPIUses(t *testing.T) {
 	for _, s := range specs {
 		if s.Service == config.SvcPGMeta {
 			if got := s.Env["CRYPTO_KEY"]; got != want {
-				t.Fatalf("sb-pgmeta CRYPTO_KEY = %q, the API encrypts with %q", got, want)
+				t.Fatalf("supavise-pgmeta CRYPTO_KEY = %q, the API encrypts with %q", got, want)
 			}
 			return
 		}

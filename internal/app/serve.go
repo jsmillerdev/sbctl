@@ -12,25 +12,25 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/OWNER/sbctl/internal/api"
-	"github.com/OWNER/sbctl/internal/backup"
-	"github.com/OWNER/sbctl/internal/branching"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/functions"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/proxy"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/jsmillerdev/supavise/internal/branching"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/functions"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/proxy"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // StopBudget is how long Serve, once told to stop, waits for lifecycle operations that
 // are still running (a delete with its final backup, a restart, a create) before it
-// closes the registry. sbctl.service's TimeoutStopSec must be longer (it is 11 minutes);
+// closes the registry. supavise.service's TimeoutStopSec must be longer (it is 11 minutes);
 // an operation cut off anyway is finished or reverted by Engine.Recover at the next start.
 const StopBudget = 10 * time.Minute
 
 // registryWait bounds how long Serve waits for the system cluster's registry at boot.
-// systemd orders sbctl.service after the start of sb-postgres@system, not its readiness.
+// systemd orders supavise.service after the start of supavise-postgres@system, not its readiness.
 // A variable so that tests can shorten it.
 var registryWait = 2 * time.Minute
 
@@ -38,9 +38,9 @@ var registryWait = 2 * time.Minute
 // (registry in the system cluster, secrets, engine with the backup service), finishes
 // operations a crash interrupted, serves the Management API on the loopback admin
 // listener and, through the proxy, at api.<domain>, runs the edge proxy, and starts
-// every project that should be running. The system project's units (sb-postgres@system,
-// sb-gotrue@system) must already exist: `sbctl system init` creates them and systemd
-// starts them at boot, which sbctl.service waits for.
+// every project that should be running. The system project's units (supavise-postgres@system,
+// supavise-gotrue@system) must already exist: `supavise system init` creates them and systemd
+// starts them at boot, which supavise.service waits for.
 //
 // Project units are systemd's, not the daemon's: stopping Serve leaves them running.
 func Serve(ctx context.Context, cfg *config.Config, o Options) error {
@@ -61,7 +61,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	// Without a Fleet from the caller the Engine registers projects with Supavisor,
 	// Realtime and Storage through a Lazy fleet (credentials loaded on first use, a
 	// service this node never rendered skipped), so a project created through the API
-	// reaches the shared services exactly as one created by `sbctl projects create`.
+	// reaches the shared services exactly as one created by `supavise projects create`.
 	bindFleet := o.BindFleet
 	if len(o.Fleet) == 0 {
 		lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
@@ -116,7 +116,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		Logger:        log.With("component", "api"),
 	}
 	// Edge Functions: the syncer turns the stored deployments and secrets into the files the
-	// runtime (sb-edge-runtime, started with the other shared services) serves, and bundles
+	// runtime (supavise-edge-runtime, started with the other shared services) serves, and bundles
 	// the sources that `supabase functions deploy --use-api` uploads.
 	var fnSyncer *functions.Syncer
 	if cfg.Functions.Enabled {
@@ -188,9 +188,9 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		startProjects(gctx, node, recovered, backups(node), log)
 		return nil
 	})
-	log.Info("sbctl is up", "domain", cfg.BaseDomain(), "api", cfg.APIURL(), "dashboard", cfg.DashboardURL())
+	log.Info("Supavise is up", "domain", cfg.BaseDomain(), "api", cfg.APIURL(), "dashboard", cfg.DashboardURL())
 	err = g.Wait()
-	log.Info("sbctl stopped")
+	log.Info("Supavise stopped")
 	return err
 }
 
@@ -229,9 +229,9 @@ func superviseStop(g *errgroup.Group, gctx context.Context, budget time.Duration
 // startFleet starts the shared services (postgres-meta, Supavisor, Realtime, Storage,
 // Studio) at boot. Their units are not enabled for boot, like every unit of the
 // control plane's own: the daemon starts them, in order, once the registry is up, so a
-// reboot brings the whole node back from one enabled unit (sbctl.service). Already
+// reboot brings the whole node back from one enabled unit (supavise.service). Already
 // running services whose files are unchanged are left alone. The installer renders and
-// first starts them (`sbctl fleet start`); a service whose artifact was never fetched
+// first starts them (`supavise fleet start`); a service whose artifact was never fetched
 // fails here and is logged, and the rest of the node still comes up.
 func startFleet(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 	// fleet.Setup generates the services' sealed secrets on first use, renders and starts
@@ -288,7 +288,7 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 }
 
 // refreshSystem re-renders the system cluster with the current settings. StartActive covers
-// the user projects, but sb-postgres@system is started by systemd at boot from the files an
+// the user projects, but supavise-postgres@system is started by systemd at boot from the files an
 // earlier run rendered: after an upgrade that changes how clusters archive (the relay, whose
 // unit no longer reads the config) its run script would still hold the old archive_command and
 // archiving would fail silently. Nothing is restarted when the files are unchanged.
@@ -311,7 +311,7 @@ func refreshSystem(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 	// turns on dashboard SSO (SAML key, the sign-up hook) or a changed [mail] section renders
 	// new files, and the unit is restarted only when they differ.
 	if err := n.Plane.RefreshSystemAuth(ctx, p, keys); err != nil {
-		log.Warn("the dashboard's sign-in service is not refreshed; run `sbctl system init` to apply its settings", "error", err)
+		log.Warn("the dashboard's sign-in service is not refreshed; run `supavise system init` to apply its settings", "error", err)
 	}
 }
 
@@ -319,7 +319,7 @@ func refreshSystem(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 // (recovery outlasted RecoveryTimeout, the restore reported success) get their recovery
 // settings cleared once their cluster has promoted, so a later start never replays the
 // source project's archive. Nothing else would do it unless an operator ran
-// `sbctl backups finish-restore`.
+// `supavise backups finish-restore`.
 func finishRestores(ctx context.Context, bk *backup.Service, log *slog.Logger) {
 	for {
 		wait := 5 * time.Minute
@@ -338,7 +338,7 @@ func finishRestores(ctx context.Context, bk *backup.Service, log *slog.Logger) {
 }
 
 // openNode is lifecycle.Open with a bounded wait for the registry: systemd starts
-// sbctl.service when sb-postgres@system has started, not when it accepts connections, and
+// supavise.service when supavise-postgres@system has started, not when it accepts connections, and
 // a daemon that gave up at once would depend on Restart= staying under the start limit.
 func openNode(ctx context.Context, cfg *config.Config, lo lifecycle.OpenOptions, log *slog.Logger) (*lifecycle.Node, error) {
 	deadline := time.Now().Add(registryWait)

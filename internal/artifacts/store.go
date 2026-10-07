@@ -16,14 +16,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // ErrNotFetched is returned by Dir when the artifact is not unpacked yet.
-var ErrNotFetched = errors.New("artifacts: not fetched; run `sbctl artifacts fetch`")
+var ErrNotFetched = errors.New("artifacts: not fetched; run `supavise artifacts fetch`")
 
 // markerFile is written at the root of every unpacked artifact.
-const markerFile = ".sbctl-artifact.json"
+const markerFile = ".supavise-artifact.json"
 
 // Marker records where an unpacked artifact came from.
 type Marker struct {
@@ -351,7 +351,7 @@ func (s *Store) install(archive, final string, m Marker) error {
 	if err := os.WriteFile(filepath.Join(tmp, markerFile), append(mb, '\n'), 0o644); err != nil {
 		return err
 	}
-	// MkdirTemp creates 0700; artifacts are public software that the sbctl user runs even
+	// MkdirTemp creates 0700; artifacts are public software that the supavise user runs even
 	// when root fetched them, so the root of the tree must be traversable.
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		return err

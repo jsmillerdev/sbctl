@@ -207,7 +207,7 @@ func stubHandler(op *Operation) http.HandlerFunc {
 		status = http.StatusOK
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Sbctl-Stub", "true")
+		w.Header().Set("X-Supavise-Stub", "true")
 		if body == nil {
 			w.WriteHeader(status)
 			return

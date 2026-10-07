@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
 )
 
 // itArts serves unpacked artifact directories; Tag is only a label.
@@ -38,23 +38,23 @@ var inputRe = regexp.MustCompile(`<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"`
 var formActionRe = regexp.MustCompile(`<form[^>]*action="([^"]*)"`)
 
 // TestIntegrationDashboardSSO runs the dashboard's single sign-on end to end on this machine,
-// with the real sb-gotrue@system (SAML on, the before-user-created hook pointing at this
+// with the real supavise-gotrue@system (SAML on, the before-user-created hook pointing at this
 // process's Management API) and a SAML identity provider written for tests
 // (testdata/saml-idp.py): a person of an allowed domain signs in and gets the domain's default
 // role, a person of any other domain is let through GoTrue and refused by the API until an
 // administrator approves them, and nobody can sign up any other way.
 //
-//	SBCTL_SSO_INTEGRATION=1 SBCTL_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked SBCTL_SSO_PYTHON=/path/to/python-with-signxml \
-//	  SBCTL_API_IT_PORT_BASE=44100 scripts/guard.sh -- go test ./internal/api -run IntegrationDashboardSSO -v
+//	SUPAVISE_SSO_INTEGRATION=1 SUPAVISE_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked SUPAVISE_SSO_PYTHON=/path/to/python-with-signxml \
+//	  SUPAVISE_API_IT_PORT_BASE=44100 scripts/guard.sh -- go test ./internal/api -run IntegrationDashboardSSO -v
 //
 // It starts a PostgreSQL cluster, GoTrue and a Python process, and stops them again.
 func TestIntegrationDashboardSSO(t *testing.T) {
-	if os.Getenv("SBCTL_SSO_INTEGRATION") == "" {
-		t.Skip("SBCTL_SSO_INTEGRATION not set")
+	if os.Getenv("SUPAVISE_SSO_INTEGRATION") == "" {
+		t.Skip("SUPAVISE_SSO_INTEGRATION not set")
 	}
-	root, python := os.Getenv("SBCTL_TEST_UNPACKED"), os.Getenv("SBCTL_SSO_PYTHON")
+	root, python := os.Getenv("SUPAVISE_TEST_UNPACKED"), os.Getenv("SUPAVISE_SSO_PYTHON")
 	if root == "" || python == "" {
-		t.Skip("SBCTL_TEST_UNPACKED and SBCTL_SSO_PYTHON are needed")
+		t.Skip("SUPAVISE_TEST_UNPACKED and SUPAVISE_SSO_PYTHON are needed")
 	}
 	arts := itArts{}
 	for svc, glob := range map[string]string{config.SvcPostgres: "postgres-17*", config.SvcGoTrue: "auth-*", config.SvcPostgREST: "postgrest-*"} {
@@ -76,7 +76,7 @@ func TestIntegrationDashboardSSO(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(cfg.StateDir) })
 	cfg.KeyPath = filepath.Join(cfg.StateDir, "master.key")
 	cfg.Supervisor = config.SupervisorExec
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	cfg.TLS.Mode = "off"
 	cfg.BinPath = truePath
 	cfg.Ports.SystemPostgres, cfg.Ports.SystemGoTrue, cfg.Ports.ProjectBase = pgPort, gtPort, pgPort+2
@@ -185,7 +185,7 @@ func TestIntegrationDashboardSSO(t *testing.T) {
 
 	// GoTrue serves its SAML service provider metadata, with the node's own key.
 	st, b, _ = call("GET", gt+"/sso/saml/metadata", "", nil)
-	if st != 200 || !strings.Contains(string(b), `entityID="http://api.sbctl.test/auth/v1/sso/saml/metadata"`) || !strings.Contains(string(b), "X509Certificate") {
+	if st != 200 || !strings.Contains(string(b), `entityID="http://api.supavise.test/auth/v1/sso/saml/metadata"`) || !strings.Contains(string(b), "X509Certificate") {
 		t.Fatalf("SP metadata: %d %s", st, b)
 	}
 
@@ -215,7 +215,7 @@ func TestIntegrationDashboardSSO(t *testing.T) {
 	signIn := func(gt string, idpPort int, email string) (token string, redirect string) {
 		t.Helper()
 		st, b, _ := call("POST", gt+"/sso", "", map[string]any{"domain": email[strings.Index(email, "@")+1:], "skip_http_redirect": true,
-			"redirect_to": "http://studio.sbctl.test/sign-in-mfa?method=sso"})
+			"redirect_to": "http://studio.supavise.test/sign-in-mfa?method=sso"})
 		if st != 200 {
 			t.Fatalf("sso: %d %s", st, b)
 		}
@@ -371,7 +371,7 @@ func TestIntegrationDashboardSSO(t *testing.T) {
 	if cert(pmeta) == cert(smeta) {
 		t.Fatal("the project signs with the dashboard's key")
 	}
-	if !strings.Contains(string(pmeta), "http://"+proj.Ref+".api.sbctl.test/auth/v1/sso/saml/metadata") {
+	if !strings.Contains(string(pmeta), "http://"+proj.Ref+".api.supavise.test/auth/v1/sso/saml/metadata") {
 		t.Fatalf("the project's entity id: %s", pmeta)
 	}
 	st, b, _ = call("POST", pbase, owner, map[string]any{"type": "saml", "metadata_xml": string(md1), "domains": []string{"shop.test"},

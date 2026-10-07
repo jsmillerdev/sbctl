@@ -20,7 +20,7 @@ var (
 	_ Registry = (*Memory)(nil)
 )
 
-// Open connects to dsn (the "sbctl" database of the system cluster) and applies migrations.
+// Open connects to dsn (the "supavise" database of the system cluster) and applies migrations.
 func Open(ctx context.Context, dsn string) (*Postgres, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -77,19 +77,19 @@ func scanOrg(row pgx.Row) (*Organization, error) {
 
 func (r *Postgres) CreateOrganization(ctx context.Context, slug, name string) (*Organization, error) {
 	return scanOrg(r.pool.QueryRow(ctx,
-		`insert into sbctl.organizations (slug, name) values ($1, $2) returning `+orgCols, slug, name))
+		`insert into supavise.organizations (slug, name) values ($1, $2) returning `+orgCols, slug, name))
 }
 
 func (r *Postgres) GetOrganization(ctx context.Context, slug string) (*Organization, error) {
-	return scanOrg(r.pool.QueryRow(ctx, `select `+orgCols+` from sbctl.organizations where slug = $1`, slug))
+	return scanOrg(r.pool.QueryRow(ctx, `select `+orgCols+` from supavise.organizations where slug = $1`, slug))
 }
 
 func (r *Postgres) GetOrganizationByID(ctx context.Context, id int64) (*Organization, error) {
-	return scanOrg(r.pool.QueryRow(ctx, `select `+orgCols+` from sbctl.organizations where id = $1`, id))
+	return scanOrg(r.pool.QueryRow(ctx, `select `+orgCols+` from supavise.organizations where id = $1`, id))
 }
 
 func (r *Postgres) ListOrganizations(ctx context.Context) ([]Organization, error) {
-	rows, err := r.pool.Query(ctx, `select `+orgCols+` from sbctl.organizations order by id`)
+	rows, err := r.pool.Query(ctx, `select `+orgCols+` from supavise.organizations order by id`)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +103,7 @@ func (r *Postgres) ListOrganizations(ctx context.Context) ([]Organization, error
 }
 
 func (r *Postgres) UpdateOrganization(ctx context.Context, o *Organization) error {
-	return affected(r.pool.Exec(ctx, `update sbctl.organizations set slug = $2, name = $3 where id = $1`, o.ID, o.Slug, o.Name))
+	return affected(r.pool.Exec(ctx, `update supavise.organizations set slug = $2, name = $3 where id = $1`, o.ID, o.Slug, o.Name))
 }
 
 // Projects
@@ -175,19 +175,19 @@ func (r *Postgres) CreateProject(ctx context.Context, p *Project) error {
 	limits, _ := json.Marshal(p.Limits)
 	return pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		// Serialize seq allocation.
-		if _, err := tx.Exec(ctx, `lock table sbctl.projects in share row exclusive mode`); err != nil {
+		if _, err := tx.Exec(ctx, `lock table supavise.projects in share row exclusive mode`); err != nil {
 			return err
 		}
 		seq := p.Seq
 		if seq == 0 && p.Ref != "system" {
 			if err := tx.QueryRow(ctx, `
-				select coalesce(min(s), 1) from generate_series(1, (select coalesce(max(seq), 0) + 1 from sbctl.projects)) s
-				where s not in (select seq from sbctl.projects)`).Scan(&seq); err != nil {
+				select coalesce(min(s), 1) from generate_series(1, (select coalesce(max(seq), 0) + 1 from supavise.projects)) s
+				where s not in (select seq from supavise.projects)`).Scan(&seq); err != nil {
 				return err
 			}
 		}
 		got, err := scanProject(tx.QueryRow(ctx, `
-			insert into sbctl.projects (ref, org_id, seq, name, region, engine, class, status, versions, limits,
+			insert into supavise.projects (ref, org_id, seq, name, region, engine, class, status, versions, limits,
 				branch_id, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
 				notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress)
 			values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
@@ -223,7 +223,7 @@ func branchArgs(b *BranchInfo) []any {
 // UpdateBranch implements Registry.
 func (r *Postgres) UpdateBranch(ctx context.Context, ref string, b *BranchInfo) error {
 	return affected(r.pool.Exec(ctx, `
-		update sbctl.projects set branch_name = $2, git_branch = $3, persistent = $4, with_data = $5, expires_at = $6,
+		update supavise.projects set branch_name = $2, git_branch = $3, persistent = $4, with_data = $5, expires_at = $6,
 			deletion_scheduled_at = $7, notify_url = $8, branch_state = $9, branch_detail = $10, clone_method = $11,
 			review_requested_at = $12, updated_at = now()
 		where ref = $1 and parent_ref is not null`,
@@ -234,7 +234,7 @@ func (r *Postgres) UpdateBranch(ctx context.Context, ref string, b *BranchInfo) 
 // SetBranchEgress implements Registry: a compare-and-set on branch_egress alone.
 func (r *Postgres) SetBranchEgress(ctx context.Context, ref, from, to string) error {
 	tag, err := r.pool.Exec(ctx, `
-		update sbctl.projects set branch_egress = $3, updated_at = now()
+		update supavise.projects set branch_egress = $3, updated_at = now()
 		where ref = $1 and parent_ref is not null and coalesce(branch_egress, '') = $2`,
 		ref, from, nullStr(to))
 	if err != nil {
@@ -244,7 +244,7 @@ func (r *Postgres) SetBranchEgress(ctx context.Context, ref, from, to string) er
 		return nil
 	}
 	var isBranch bool
-	if err := r.pool.QueryRow(ctx, `select parent_ref is not null from sbctl.projects where ref = $1`, ref).Scan(&isBranch); err != nil {
+	if err := r.pool.QueryRow(ctx, `select parent_ref is not null from supavise.projects where ref = $1`, ref).Scan(&isBranch); err != nil {
 		return mapErr(err)
 	}
 	if !isBranch {
@@ -254,11 +254,11 @@ func (r *Postgres) SetBranchEgress(ctx context.Context, ref, from, to string) er
 }
 
 func (r *Postgres) GetProject(ctx context.Context, ref string) (*Project, error) {
-	return scanProject(r.pool.QueryRow(ctx, `select `+projectCols+` from sbctl.projects where ref = $1`, ref))
+	return scanProject(r.pool.QueryRow(ctx, `select `+projectCols+` from supavise.projects where ref = $1`, ref))
 }
 
 func (r *Postgres) ListProjects(ctx context.Context) ([]Project, error) {
-	rows, err := r.pool.Query(ctx, `select `+projectCols+` from sbctl.projects order by seq`)
+	rows, err := r.pool.Query(ctx, `select `+projectCols+` from supavise.projects order by seq`)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +275,7 @@ func (r *Postgres) UpdateProject(ctx context.Context, p *Project) error {
 	versions, _ := json.Marshal(p.Versions)
 	limits, _ := json.Marshal(p.Limits)
 	got, err := scanProject(r.pool.QueryRow(ctx, `
-		update sbctl.projects set name = $2, region = $3, class = $4, status = $5, versions = $6, limits = $7, updated_at = now()
+		update supavise.projects set name = $2, region = $3, class = $4, status = $5, versions = $6, limits = $7, updated_at = now()
 		where ref = $1 returning `+projectCols, p.Ref, p.Name, p.Region, p.Class, p.Status, versions, limits))
 	if err != nil {
 		return err
@@ -285,18 +285,18 @@ func (r *Postgres) UpdateProject(ctx context.Context, p *Project) error {
 }
 
 func (r *Postgres) SetProjectStatus(ctx context.Context, ref string, s Status) error {
-	return affected(r.pool.Exec(ctx, `update sbctl.projects set status = $2, updated_at = now() where ref = $1`, ref, s))
+	return affected(r.pool.Exec(ctx, `update supavise.projects set status = $2, updated_at = now() where ref = $1`, ref, s))
 }
 
 func (r *Postgres) DeleteProject(ctx context.Context, ref string) error {
-	return affected(r.pool.Exec(ctx, `delete from sbctl.projects where ref = $1`, ref))
+	return affected(r.pool.Exec(ctx, `delete from supavise.projects where ref = $1`, ref))
 }
 
 // Secrets
 
 func (r *Postgres) PutSecret(ctx context.Context, ref, name string, sealed []byte) error {
 	_, err := r.pool.Exec(ctx, `
-		insert into sbctl.project_secrets (ref, name, ciphertext) values ($1, $2, $3)
+		insert into supavise.project_secrets (ref, name, ciphertext) values ($1, $2, $3)
 		on conflict (ref, name) do update set ciphertext = excluded.ciphertext, created_at = now()`, ref, name, sealed)
 	return mapErr(err)
 }
@@ -304,7 +304,7 @@ func (r *Postgres) PutSecret(ctx context.Context, ref, name string, sealed []byt
 // PutSecretIfAbsent implements SecretCreator.
 func (r *Postgres) PutSecretIfAbsent(ctx context.Context, ref, name string, sealed []byte) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
-		insert into sbctl.project_secrets (ref, name, ciphertext) values ($1, $2, $3)
+		insert into supavise.project_secrets (ref, name, ciphertext) values ($1, $2, $3)
 		on conflict (ref, name) do nothing`, ref, name, sealed)
 	if err != nil {
 		return false, mapErr(err)
@@ -316,18 +316,18 @@ func (r *Postgres) PutSecretIfAbsent(ctx context.Context, ref, name string, seal
 // registered (migration 1000_sso.sql): Studio shows "Continue with SSO" only then.
 func (r *Postgres) HasDashboardSSO(ctx context.Context) (bool, error) {
 	var ok bool
-	err := r.pool.QueryRow(ctx, `select exists (select 1 from sbctl.sso_providers)`).Scan(&ok)
+	err := r.pool.QueryRow(ctx, `select exists (select 1 from supavise.sso_providers)`).Scan(&ok)
 	return ok, mapErr(err)
 }
 
 func (r *Postgres) GetSecret(ctx context.Context, ref, name string) ([]byte, error) {
 	var b []byte
-	err := r.pool.QueryRow(ctx, `select ciphertext from sbctl.project_secrets where ref = $1 and name = $2`, ref, name).Scan(&b)
+	err := r.pool.QueryRow(ctx, `select ciphertext from supavise.project_secrets where ref = $1 and name = $2`, ref, name).Scan(&b)
 	return b, mapErr(err)
 }
 
 func (r *Postgres) GetSecrets(ctx context.Context, ref string) (map[string][]byte, error) {
-	rows, err := r.pool.Query(ctx, `select name, ciphertext from sbctl.project_secrets where ref = $1`, ref)
+	rows, err := r.pool.Query(ctx, `select name, ciphertext from supavise.project_secrets where ref = $1`, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -358,7 +358,7 @@ func scanToken(row pgx.Row) (*AccessToken, error) {
 
 func (r *Postgres) CreateAccessToken(ctx context.Context, t *AccessToken) error {
 	got, err := scanToken(r.pool.QueryRow(ctx, `
-		insert into sbctl.access_tokens (user_id, name, token_hash, token_prefix, expires_at)
+		insert into supavise.access_tokens (user_id, name, token_hash, token_prefix, expires_at)
 		values ($1, $2, $3, $4, $5) returning `+tokenCols, t.UserID, t.Name, t.Hash, t.Prefix, t.ExpiresAt))
 	if err != nil {
 		return err
@@ -368,11 +368,11 @@ func (r *Postgres) CreateAccessToken(ctx context.Context, t *AccessToken) error 
 }
 
 func (r *Postgres) GetAccessTokenByHash(ctx context.Context, hash []byte) (*AccessToken, error) {
-	return scanToken(r.pool.QueryRow(ctx, `select `+tokenCols+` from sbctl.access_tokens where token_hash = $1`, hash))
+	return scanToken(r.pool.QueryRow(ctx, `select `+tokenCols+` from supavise.access_tokens where token_hash = $1`, hash))
 }
 
 func (r *Postgres) ListAccessTokens(ctx context.Context, userID string) ([]AccessToken, error) {
-	rows, err := r.pool.Query(ctx, `select `+tokenCols+` from sbctl.access_tokens where user_id = $1 order by id`, userID)
+	rows, err := r.pool.Query(ctx, `select `+tokenCols+` from supavise.access_tokens where user_id = $1 order by id`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -386,11 +386,11 @@ func (r *Postgres) ListAccessTokens(ctx context.Context, userID string) ([]Acces
 }
 
 func (r *Postgres) TouchAccessToken(ctx context.Context, id int64, at time.Time) error {
-	return affected(r.pool.Exec(ctx, `update sbctl.access_tokens set last_used_at = $2 where id = $1`, id, at))
+	return affected(r.pool.Exec(ctx, `update supavise.access_tokens set last_used_at = $2 where id = $1`, id, at))
 }
 
 func (r *Postgres) DeleteAccessToken(ctx context.Context, userID string, id int64) error {
-	return affected(r.pool.Exec(ctx, `delete from sbctl.access_tokens where id = $1 and user_id = $2`, id, userID))
+	return affected(r.pool.Exec(ctx, `delete from supavise.access_tokens where id = $1 and user_id = $2`, id, userID))
 }
 
 // Routes
@@ -400,17 +400,17 @@ func (r *Postgres) PutRoute(ctx context.Context, rt Route) error {
 		rt.Kind = "api"
 	}
 	_, err := r.pool.Exec(ctx, `
-		insert into sbctl.routes (host, ref, kind) values ($1, $2, $3)
+		insert into supavise.routes (host, ref, kind) values ($1, $2, $3)
 		on conflict (host) do update set ref = excluded.ref, kind = excluded.kind`, rt.Host, rt.Ref, rt.Kind)
 	return mapErr(err)
 }
 
 func (r *Postgres) DeleteRoute(ctx context.Context, host string) error {
-	return affected(r.pool.Exec(ctx, `delete from sbctl.routes where host = $1`, host))
+	return affected(r.pool.Exec(ctx, `delete from supavise.routes where host = $1`, host))
 }
 
 func (r *Postgres) ListRoutes(ctx context.Context) ([]Route, error) {
-	rows, err := r.pool.Query(ctx, `select host, ref, kind, created_at from sbctl.routes order by host`)
+	rows, err := r.pool.Query(ctx, `select host, ref, kind, created_at from supavise.routes order by host`)
 	if err != nil {
 		return nil, err
 	}
@@ -445,7 +445,7 @@ func (r *Postgres) CreateBackup(ctx context.Context, b *Backup) error {
 		b.StartedAt = time.Now()
 	}
 	got, err := scanBackup(r.pool.QueryRow(ctx, `
-		insert into sbctl.backups (ref, kind, status, location, timeline, start_lsn, stop_lsn, size_bytes, error, started_at, finished_at)
+		insert into supavise.backups (ref, kind, status, location, timeline, start_lsn, stop_lsn, size_bytes, error, started_at, finished_at)
 		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning `+backupCols,
 		b.Ref, b.Kind, b.Status, b.Location, b.Timeline, b.StartLSN, b.StopLSN, b.SizeBytes, b.Error, b.StartedAt, b.FinishedAt))
 	if err != nil {
@@ -457,13 +457,13 @@ func (r *Postgres) CreateBackup(ctx context.Context, b *Backup) error {
 
 func (r *Postgres) UpdateBackup(ctx context.Context, b *Backup) error {
 	return affected(r.pool.Exec(ctx, `
-		update sbctl.backups set status = $2, location = $3, timeline = $4, start_lsn = $5, stop_lsn = $6,
+		update supavise.backups set status = $2, location = $3, timeline = $4, start_lsn = $5, stop_lsn = $6,
 		size_bytes = $7, error = $8, finished_at = $9 where id = $1`,
 		b.ID, b.Status, b.Location, b.Timeline, b.StartLSN, b.StopLSN, b.SizeBytes, b.Error, b.FinishedAt))
 }
 
 func (r *Postgres) ListBackups(ctx context.Context, ref string) ([]Backup, error) {
-	rows, err := r.pool.Query(ctx, `select `+backupCols+` from sbctl.backups where ref = $1 order by started_at desc, id desc`, ref)
+	rows, err := r.pool.Query(ctx, `select `+backupCols+` from supavise.backups where ref = $1 order by started_at desc, id desc`, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -477,7 +477,7 @@ func (r *Postgres) ListBackups(ctx context.Context, ref string) ([]Backup, error
 }
 
 func (r *Postgres) DeleteBackup(ctx context.Context, id int64) error {
-	return affected(r.pool.Exec(ctx, `delete from sbctl.backups where id = $1`, id))
+	return affected(r.pool.Exec(ctx, `delete from supavise.backups where id = $1`, id))
 }
 
 // Events
@@ -494,7 +494,7 @@ func (r *Postgres) AppendEvent(ctx context.Context, ref, kind string, payload an
 	if ref != "" {
 		refArg = ref
 	}
-	_, err := r.pool.Exec(ctx, `insert into sbctl.events (ref, kind, payload) values ($1, $2, $3)`, refArg, kind, b)
+	_, err := r.pool.Exec(ctx, `insert into supavise.events (ref, kind, payload) values ($1, $2, $3)`, refArg, kind, b)
 	return err
 }
 
@@ -503,7 +503,7 @@ func (r *Postgres) ListEvents(ctx context.Context, ref string, limit int) ([]Eve
 		limit = 100
 	}
 	rows, err := r.pool.Query(ctx, `
-		select id, coalesce(ref, ''), kind, payload, created_at from sbctl.events
+		select id, coalesce(ref, ''), kind, payload, created_at from supavise.events
 		where $1 = '' or ref = $1 order by id desc limit $2`, ref, limit)
 	if err != nil {
 		return nil, err
@@ -517,14 +517,14 @@ func (r *Postgres) ListEvents(ctx context.Context, ref string, limit int) ([]Eve
 	})
 }
 
-// Subscribe LISTENs on sbctl_changes with a dedicated connection. The channel closes
+// Subscribe LISTENs on supavise_changes with a dedicated connection. The channel closes
 // when ctx ends or the connection drops; consumers then resubscribe and reload.
 func (r *Postgres) Subscribe(ctx context.Context) (<-chan Change, error) {
 	conn, err := r.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := conn.Exec(ctx, `listen sbctl_changes`); err != nil {
+	if _, err := conn.Exec(ctx, `listen supavise_changes`); err != nil {
 		conn.Release()
 		return nil, err
 	}
@@ -532,7 +532,7 @@ func (r *Postgres) Subscribe(ctx context.Context) (<-chan Change, error) {
 	go func() {
 		defer close(ch)
 		defer conn.Release()
-		defer conn.Exec(context.Background(), `unlisten sbctl_changes`) //nolint:errcheck
+		defer conn.Exec(context.Background(), `unlisten supavise_changes`) //nolint:errcheck
 		for {
 			n, err := conn.Conn().WaitForNotification(ctx)
 			if err != nil {

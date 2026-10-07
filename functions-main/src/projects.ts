@@ -3,7 +3,7 @@
 //
 //   functions-env.json            the project's JWT secret, SUPABASE_* values and secrets
 //   functions/<slug>              a symlink to the current generation of the function
-//   functions/.gen/<slug>.<n>.<r>/  bundle.eszip of one generation plus .sbctl-function.json
+//   functions/.gen/<slug>.<n>.<r>/  bundle.eszip of one generation plus .supavise-function.json
 //
 // A deployment is a new generation and a rename of the symlink, so one request sees one
 // generation: the request resolves the symlink once and uses the real path from then on.
@@ -11,7 +11,7 @@
 import type { FunctionInfo, FunctionMeta, ProjectEnv } from './types.ts'
 
 export const ENV_FILE = 'functions-env.json'
-export const META_FILE = '.sbctl-function.json'
+export const META_FILE = '.supavise-function.json'
 
 const REF_RE = /^[a-z]{20}$/
 const SLUG_RE = /^[A-Za-z][A-Za-z0-9_-]*$/
@@ -84,7 +84,7 @@ export function parseProjectEnv(text: string): ProjectEnv | null {
 
 /**
  * Parses a generation's metadata. Only bundles (kind "eszip") are accepted: a generation
- * of an older sbctl that holds source files is not served, because a source function
+ * of an older supavise that holds source files is not served, because a source function
  * runs from real paths and its module loader can follow relative imports out of the
  * function's directory into other projects' files.
  */

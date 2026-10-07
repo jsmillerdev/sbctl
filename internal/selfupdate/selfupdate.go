@@ -1,8 +1,8 @@
-// Package selfupdate replaces the sbctl binary with a release from GitHub after checking
+// Package selfupdate replaces the supavise binary with a release from GitHub after checking
 // it against an ed25519 signature.
 //
-// A release carries four kinds of asset: the binaries `sbctl-linux-amd64` and
-// `sbctl-linux-arm64`, `SHA256SUMS` (one line per asset, as sha256sum prints them) and
+// A release carries four kinds of asset: the binaries `supavise-linux-amd64` and
+// `supavise-linux-arm64`, `SHA256SUMS` (one line per asset, as sha256sum prints them) and
 // `SHA256SUMS.sig`, the raw 64-byte ed25519 signature of the SHA256SUMS file. The public
 // key is compiled into the binary (release_key.pem). Update refuses a release whose
 // signature does not verify, whose checksum list lacks the binary, or whose binary does
@@ -37,8 +37,8 @@ import (
 )
 
 // DefaultRepo is the GitHub repository releases come from. Variable so that a fork can
-// set it at build time (-ldflags "-X github.com/OWNER/sbctl/internal/selfupdate.DefaultRepo=owner/name").
-var DefaultRepo = "jsmillerdev/sbctl"
+// set it at build time (-ldflags "-X github.com/jsmillerdev/supavise/internal/selfupdate.DefaultRepo=owner/name").
+var DefaultRepo = "jsmillerdev/supavise"
 
 //go:embed release_key.pem
 var releaseKeyPEM []byte
@@ -74,8 +74,8 @@ const (
 	maxBinary    = 300 << 20
 )
 
-// BinaryAsset is the asset name of the sbctl binary for a platform such as "linux-amd64".
-func BinaryAsset(platform string) string { return "sbctl-" + platform }
+// BinaryAsset is the asset name of the supavise binary for a platform such as "linux-amd64".
+func BinaryAsset(platform string) string { return "supavise-" + platform }
 
 // Options configure Check and Update.
 type Options struct {
@@ -148,7 +148,7 @@ func Latest(ctx context.Context, o Options) (*Release, error) {
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("User-Agent", "sbctl-self-update")
+	req.Header.Set("User-Agent", "supavise-self-update")
 	resp, err := o.client().Do(req)
 	if err != nil {
 		return nil, err
@@ -352,7 +352,7 @@ func runVersion(ctx context.Context, path string) (string, error) {
 	return string(out), nil
 }
 
-// ReportsVersion reports whether the output of `sbctl --version` ("sbctl version v1.2.3")
+// ReportsVersion reports whether the output of `supavise --version` ("supavise version v1.2.3")
 // names tag as one of its words.
 func ReportsVersion(output, tag string) bool {
 	for _, f := range strings.Fields(output) {
@@ -412,7 +412,7 @@ func (o *Options) streamLimit(ctx context.Context, u string, w io.Writer, limit 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "sbctl-self-update")
+	req.Header.Set("User-Agent", "supavise-self-update")
 	resp, err := o.client().Do(req)
 	if err != nil {
 		return err

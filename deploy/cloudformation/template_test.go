@@ -21,17 +21,17 @@ import (
 
 type doc = map[string]any
 
-// load parses sbctl.yaml. CloudFormation's short forms (!Ref, !Sub, !If ...) become the long
+// load parses supavise.yaml. CloudFormation's short forms (!Ref, !Sub, !If ...) become the long
 // forms ({"Ref": ...}, {"Fn::Sub": ...}), so the assertions read like the JSON of the template.
 func load(t *testing.T) doc {
 	t.Helper()
-	raw, err := os.ReadFile("sbctl.yaml")
+	raw, err := os.ReadFile("supavise.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var root yaml.Node
 	if err := yaml.Unmarshal(raw, &root); err != nil {
-		t.Fatalf("sbctl.yaml does not parse: %v", err)
+		t.Fatalf("supavise.yaml does not parse: %v", err)
 	}
 	return convert(t, &root).(doc)
 }
@@ -147,7 +147,7 @@ func strList(t *testing.T, v any) []string {
 func TestParametersAreMinimal(t *testing.T) {
 	params := get(t, load(t), "Parameters").(doc)
 	want := []string{"AccessCidr", "AdminEmail", "AmiId", "DailySnapshotsKept", "DataSnapshotId", "DataVolumeSize", "DomainName", "EnableSessionManager",
-		"HostedZoneId", "InstanceType", "KeyName", "SbctlVersion", "SshCidr", "SubnetId", "VpcId"}
+		"HostedZoneId", "InstanceType", "KeyName", "SshCidr", "SubnetId", "SupaviseVersion", "VpcId"}
 	if got := keys(params); !reflect.DeepEqual(got, want) {
 		t.Fatalf("parameters changed (update the README table and this list together):\n got %v\nwant %v", got, want)
 	}
@@ -199,8 +199,8 @@ func TestDefaultsAreGravitonAndSized(t *testing.T) {
 			t.Errorf("%s is too small for the fixed footprint", ty)
 		}
 	}
-	if v := get(t, d, "Parameters", "SbctlVersion", "Default"); v != "latest" {
-		t.Errorf("the repository template defaults SbctlVersion to latest (release-assets.sh stamps the tag), got %v", v)
+	if v := get(t, d, "Parameters", "SupaviseVersion", "Default"); v != "latest" {
+		t.Errorf("the repository template defaults SupaviseVersion to latest (release-assets.sh stamps the tag), got %v", v)
 	}
 }
 
@@ -680,7 +680,7 @@ func TestUserDataReplacesTheTokenPlaceholderWhenNoneIsIssued(t *testing.T) {
 		t.Fatalf("want two writes of the claim secret (the token, or the note that none was issued), got %d", n)
 	}
 	tail := ud[strings.Index(ud, "step \"storing the claim token\""):]
-	if !strings.Contains(tail, "No claim token was issued") || !strings.Contains(tail, "sudo -u sbctl sbctl claim token") || !strings.Contains(tail, "--force") {
+	if !strings.Contains(tail, "No claim token was issued") || !strings.Contains(tail, "sudo -u supavise supavise claim token") || !strings.Contains(tail, "--force") {
 		t.Errorf("the note must say no token was issued and how to get one:\n%s", tail)
 	}
 	// The note says an administrator works, so it is written only when the node is claimed. An
@@ -688,10 +688,10 @@ func TestUserDataReplacesTheTokenPlaceholderWhenNoneIsIssued(t *testing.T) {
 	// keeps a hash), for example when the instance of the same stack is replaced.
 	elif := strings.Index(tail, "elif ")
 	note := strings.Index(tail, "No claim token was issued")
-	if elif < 0 || elif > note || !strings.Contains(tail[elif:note], "sbctl claim status") || !strings.Contains(tail[elif:note], "= claimed") {
-		t.Errorf("the note must be gated on `sbctl claim status` reporting claimed:\n%s", tail)
+	if elif < 0 || elif > note || !strings.Contains(tail[elif:note], "supavise claim status") || !strings.Contains(tail[elif:note], "= claimed") {
+		t.Errorf("the note must be gated on `supavise claim status` reporting claimed:\n%s", tail)
 	}
-	if regexp.MustCompile(`(?m)^\s*else\b`).MatchString(tail[:strings.Index(tail, "rm -f /root/sbctl-install.sh")]) {
+	if regexp.MustCompile(`(?m)^\s*else\b`).MatchString(tail[:strings.Index(tail, "rm -f /root/supavise-install.sh")]) {
 		t.Errorf("an unclaimed node with no new token must leave the secret alone, not take an else branch:\n%s", tail)
 	}
 }
@@ -713,7 +713,7 @@ func TestReadmeStatesWhatIsNotChecked(t *testing.T) {
 	}
 	for _, want := range []string{
 		"crash-consistent", "AWSDataLifecycleManagerServiceRole", "DailySnapshotsKept",
-		"https://aws.amazon.com/ebs/pricing/", "sbctl claim token --force", "Stop the instance",
+		"https://aws.amazon.com/ebs/pricing/", "supavise claim token --force", "Stop the instance",
 	} {
 		if !strings.Contains(readme, want) {
 			t.Errorf("the README lacks %q", want)
@@ -779,14 +779,14 @@ func TestNetworkAndInstanceHardening(t *testing.T) {
 }
 
 func TestTemplateIsSelfContained(t *testing.T) {
-	raw, err := os.ReadFile("sbctl.yaml")
+	raw, err := os.ReadFile("supavise.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// aws cloudformation deploy sends the file in the request when it is below 51,200 bytes and
 	// needs a bucket above it. deploy.sh does not ask for one.
 	if len(raw) > 48000 {
-		t.Errorf("sbctl.yaml is %d bytes; deploy.sh needs it under 51,200 (keep a margin)", len(raw))
+		t.Errorf("supavise.yaml is %d bytes; deploy.sh needs it under 51,200 (keep a margin)", len(raw))
 	}
 	d := load(t)
 	for name, res := range resources(t, d) {
@@ -801,8 +801,8 @@ func TestTemplateIsSelfContained(t *testing.T) {
 	if strings.Contains(string(raw), "TemplateURL") {
 		t.Error("no TemplateURL: no nested stacks")
 	}
-	// Outside the user data, a statically known place for jsmillerdev/sbctl is the release download.
-	if !strings.Contains(string(raw), "https://github.com/jsmillerdev/sbctl/releases/") {
+	// Outside the user data, a statically known place for jsmillerdev/supavise is the release download.
+	if !strings.Contains(string(raw), "https://github.com/jsmillerdev/supavise/releases/") {
 		t.Error("user data downloads install.sh from the GitHub release")
 	}
 }
@@ -825,7 +825,7 @@ func TestCheckovSkipsAreExplained(t *testing.T) {
 func TestRulesAndConditionsStayInStep(t *testing.T) {
 	d := load(t)
 	conds := get(t, d, "Conditions").(doc)
-	raw, _ := os.ReadFile("sbctl.yaml")
+	raw, _ := os.ReadFile("supavise.yaml")
 	for name := range conds {
 		// Each condition is used at least once outside its own definition.
 		if n := len(regexp.MustCompile(`\b`+name+`\b`).FindAllString(string(raw), -1)); n < 2 {
@@ -879,18 +879,18 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 	if err := os.MkdirAll(dist, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"sbctl-linux-amd64", "sbctl-linux-arm64"} {
+	for _, f := range []string{"supavise-linux-amd64", "supavise-linux-arm64"} {
 		if err := os.WriteFile(filepath.Join(dist, f), []byte("not a binary"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	script, _ := filepath.Abs("../release-assets.sh")
 	cmd := exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
-	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SBCTL_RELEASE_TAG=v9.8.7-rc.1")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SUPAVISE_RELEASE_TAG=v9.8.7-rc.1")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("release-assets.sh: %v\n%s", err, out)
 	}
-	tpl, err := os.ReadFile(filepath.Join(dist, "sbctl.yaml"))
+	tpl, err := os.ReadFile(filepath.Join(dist, "supavise.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -898,37 +898,37 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 	if err := yaml.Unmarshal(tpl, &root); err != nil {
 		t.Fatalf("the stamped template does not parse: %v", err)
 	}
-	stamped := get(t, convert(t, &root), "Parameters", "SbctlVersion", "Default")
+	stamped := get(t, convert(t, &root), "Parameters", "SupaviseVersion", "Default")
 	if stamped != "v9.8.7-rc.1" {
 		t.Errorf("stamped default is %v, want the tag", stamped)
 	}
-	orig, _ := os.ReadFile("sbctl.yaml")
+	orig, _ := os.ReadFile("supavise.yaml")
 	if d := len(tpl) - len(orig); d != len("v9.8.7-rc.1")-len("latest") {
 		t.Errorf("stamping changed more than the default: size differs by %d", d)
 	}
-	for _, f := range []string{"sbctl-aws-deploy.sh", "install.sh", "SHA256SUMS", "SHA256SUMS.sig"} {
+	for _, f := range []string{"supavise-aws-deploy.sh", "install.sh", "SHA256SUMS", "SHA256SUMS.sig"} {
 		if _, err := os.Stat(filepath.Join(dist, f)); err != nil {
 			t.Errorf("release asset %s missing: %v", f, err)
 		}
 	}
-	if fi, err := os.Stat(filepath.Join(dist, "sbctl-aws-deploy.sh")); err == nil && fi.Mode()&0o111 == 0 {
-		t.Error("sbctl-aws-deploy.sh must be executable")
+	if fi, err := os.Stat(filepath.Join(dist, "supavise-aws-deploy.sh")); err == nil && fi.Mode()&0o111 == 0 {
+		t.Error("supavise-aws-deploy.sh must be executable")
 	}
 
 	// Without a tag the template is attached as it is.
 	cmd = exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
-	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SBCTL_RELEASE_TAG=")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SUPAVISE_RELEASE_TAG=")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("release-assets.sh without a tag: %v\n%s", err, out)
 	}
-	tpl, _ = os.ReadFile(filepath.Join(dist, "sbctl.yaml"))
+	tpl, _ = os.ReadFile(filepath.Join(dist, "supavise.yaml"))
 	if string(tpl) != string(orig) {
-		t.Error("without SBCTL_RELEASE_TAG the template must be copied unchanged")
+		t.Error("without SUPAVISE_RELEASE_TAG the template must be copied unchanged")
 	}
 
 	// A tag that is not a version is refused: it would end up in a parameter default.
 	cmd = exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
-	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SBCTL_RELEASE_TAG=latest; echo hi")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SUPAVISE_RELEASE_TAG=latest; echo hi")
 	if out, err := cmd.CombinedOutput(); err == nil {
 		t.Errorf("a bad tag must fail, got success:\n%s", out)
 	}

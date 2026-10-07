@@ -1,0 +1,12 @@
+[Unit]
+Description=supavise projects and shared services
+Documentation=https://github.com/jsmillerdev/supavise
+Before=slices.target
+
+[Slice]
+# Every supavise unit runs here. Limits are set per unit (MemoryMax, CPUQuota) from the
+# project record, not on the slice, so one project cannot starve another and the slice
+# stays a single place to read total usage: systemctl status supavise.slice
+MemoryAccounting=yes
+CPUAccounting=yes
+TasksAccounting=yes

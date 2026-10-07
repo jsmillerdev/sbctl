@@ -1,0 +1,26 @@
+[Unit]
+Description=Supavise backup retention for every project and every deleted project's archive
+
+[Service]
+Type=oneshot
+User=supavise
+Group=supavise
+Slice=supavise.slice
+EnvironmentFile=-/etc/supavise/supavise.env
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=/usr/local/bin/supavise backups prune
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+# The same uid runs every unit, and a process may read /proc/<pid>/environ and /proc/<pid>/root of
+# another process of its uid unless that process has capabilities the reader lacks. These units read
+# the master key and the backend credentials, so they hold one harmless capability in their permitted
+# set (supavise.service does the same); the supavise-* units that run tenant code have none (deploy/systemd/README.md).
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Mount allowlist: the registry's socket and the file backend's directory, no project directory.
+TemporaryFileSystem=/var/lib/supavise:ro
+BindReadOnlyPaths=/var/lib/supavise/projects/system/postgres/sock
+BindPaths=-/var/lib/supavise/backups

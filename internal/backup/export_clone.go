@@ -1,6 +1,6 @@
 package backup
 
-import "github.com/OWNER/sbctl/internal/lifecycle"
+import "github.com/jsmillerdev/supavise/internal/lifecycle"
 
 // Exports for the branching package, which copies a running cluster's data directory
 // copy-on-write instead of streaming it into a tar. It must leave out exactly what a base

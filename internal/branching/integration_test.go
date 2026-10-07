@@ -1,9 +1,9 @@
 package branching
 
 // Integration tests on real Postgres clusters (the slim-services artifacts, exec backend).
-// They need SBCTL_TEST_UNPACKED to name a directory with unpacked postgres-17*, auth-* and
+// They need SUPAVISE_TEST_UNPACKED to name a directory with unpacked postgres-17*, auth-* and
 // postgrest-* artifacts for this platform, for example ~/.cache/sbctl/unpacked. The state
-// directory is a short directory under /tmp, or SBCTL_TEST_STATE_DIR (CI points it at an
+// directory is a short directory under /tmp, or SUPAVISE_TEST_STATE_DIR (CI points it at an
 // XFS mount). Ports come from 39000-39999.
 
 import (
@@ -25,10 +25,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/pelletier/go-toml/v2"
 
-	"github.com/OWNER/sbctl/internal/backup"
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 type dirArts map[string]string
@@ -71,21 +71,21 @@ var (
 	buildErr  error
 )
 
-// sbctlBinary builds cmd/sbctl once: it is every cluster's archive_command.
-func sbctlBinary(t *testing.T) string {
+// supaviseBinary builds cmd/supavise once: it is every cluster's archive_command.
+func supaviseBinary(t *testing.T) string {
 	t.Helper()
 	buildOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "sbctl-branch-bin-")
+		dir, err := os.MkdirTemp("", "supavise-branch-bin-")
 		if err != nil {
 			buildErr = err
 			return
 		}
-		builtBin = filepath.Join(dir, "sbctl")
-		cmd := exec.Command("go", "build", "-o", builtBin, "./cmd/sbctl")
+		builtBin = filepath.Join(dir, "supavise")
+		cmd := exec.Command("go", "build", "-o", builtBin, "./cmd/supavise")
 		_, thisFile, _, _ := runtime.Caller(0)
 		cmd.Dir = filepath.Join(filepath.Dir(thisFile), "..", "..")
 		if out, err := cmd.CombinedOutput(); err != nil {
-			buildErr = fmt.Errorf("go build ./cmd/sbctl: %v\n%s", err, out)
+			buildErr = fmt.Errorf("go build ./cmd/supavise: %v\n%s", err, out)
 		}
 	})
 	if buildErr != nil {
@@ -114,9 +114,9 @@ type stack struct {
 
 func newStack(t *testing.T) *stack {
 	t.Helper()
-	root := os.Getenv("SBCTL_TEST_UNPACKED")
+	root := os.Getenv("SUPAVISE_TEST_UNPACKED")
 	if root == "" || testing.Short() {
-		t.Skip("SBCTL_TEST_UNPACKED not set")
+		t.Skip("SUPAVISE_TEST_UNPACKED not set")
 	}
 	arts := dirArts{}
 	for svc, glob := range map[string]string{config.SvcPostgres: "postgres-17*", config.SvcGoTrue: "auth-*", config.SvcPostgREST: "postgrest-*"} {
@@ -126,7 +126,7 @@ func newStack(t *testing.T) *stack {
 		}
 		arts[svc] = m[len(m)-1]
 	}
-	state := os.Getenv("SBCTL_TEST_STATE_DIR")
+	state := os.Getenv("SUPAVISE_TEST_STATE_DIR")
 	if state == "" {
 		d, err := os.MkdirTemp("/tmp", "sbtb")
 		if err != nil {
@@ -146,9 +146,9 @@ func newStack(t *testing.T) *stack {
 	cfg.StateDir = state
 	cfg.KeyPath = filepath.Join(state, "master.key")
 	cfg.Supervisor = config.SupervisorExec
-	cfg.Domain = "sbctl.test"
+	cfg.Domain = "supavise.test"
 	cfg.TLS.Mode = "off"
-	cfg.BinPath = sbctlBinary(t)
+	cfg.BinPath = supaviseBinary(t)
 	cfg.Backup.Backend = "file://" + filepath.Join(state, "backups")
 	cfg.Backup.ArchiveTimeoutSeconds = 30
 	// The free-disk check runs on the real disk here; CI's 8 GB loop file and a developer's
@@ -164,7 +164,7 @@ func newStack(t *testing.T) *stack {
 	if err := os.WriteFile(cfgPath, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SBCTL_CONFIG", cfgPath)
+	t.Setenv("SUPAVISE_CONFIG", cfgPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	t.Cleanup(cancel)
@@ -327,9 +327,9 @@ func TestIntegrationBranching(t *testing.T) {
 	}
 
 	// --- with data: copy-on-write clone, or the base backup where the disk cannot clone -----------
-	// SBCTL_TEST_EXPECT_METHOD names what this filesystem must do: clonefile, reflink or
+	// SUPAVISE_TEST_EXPECT_METHOD names what this filesystem must do: clonefile, reflink or
 	// base-backup (CI sets it for XFS and for ext4). Unset, a clone is expected.
-	expect := os.Getenv("SBCTL_TEST_EXPECT_METHOD")
+	expect := os.Getenv("SUPAVISE_TEST_EXPECT_METHOD")
 	if expect == MethodBackup {
 		if _, err := st.bk.BaseBackup(ctx, pref); err != nil {
 			t.Fatalf("base backup of the parent: %v", err)
@@ -533,16 +533,16 @@ func TestIntegrationBranching(t *testing.T) {
 	_ = strconv.Itoa
 }
 
-// TestIntegrationCloneSize measures a with_data branch of a parent of SBCTL_TEST_PARENT_MB
+// TestIntegrationCloneSize measures a with_data branch of a parent of SUPAVISE_TEST_PARENT_MB
 // megabytes (skipped when unset; CI uses 1024, a laptop run stays under 200). It reports the
 // clone method, the wall time of the whole branch creation, the clone's own time, the
 // parent's size and the disk the clone used, as one line "BRANCH_CLONE_RESULT {json}" and,
-// in CI, as a table in the job summary. SBCTL_TEST_EXPECT_METHOD (reflink, clonefile,
+// in CI, as a table in the job summary. SUPAVISE_TEST_EXPECT_METHOD (reflink, clonefile,
 // base-backup) makes the test fail when another method was used.
 func TestIntegrationCloneSize(t *testing.T) {
-	mb, _ := strconv.Atoi(os.Getenv("SBCTL_TEST_PARENT_MB"))
+	mb, _ := strconv.Atoi(os.Getenv("SUPAVISE_TEST_PARENT_MB"))
 	if mb <= 0 {
-		t.Skip("SBCTL_TEST_PARENT_MB not set")
+		t.Skip("SUPAVISE_TEST_PARENT_MB not set")
 	}
 	st := newStack(t)
 	ctx := context.Background()
@@ -577,7 +577,7 @@ func TestIntegrationCloneSize(t *testing.T) {
 	}
 	t.Logf("parent: %d rows, %s database, loaded in %s", rows, humanBytes(size), time.Since(loadStart).Round(time.Second))
 
-	method := os.Getenv("SBCTL_TEST_EXPECT_METHOD")
+	method := os.Getenv("SUPAVISE_TEST_EXPECT_METHOD")
 	if method == MethodBackup {
 		// The base-backup path restores the parent's latest base backup plus WAL.
 		bstart := time.Now()
@@ -629,7 +629,7 @@ func TestIntegrationCloneSize(t *testing.T) {
 		if err == nil {
 			defer out.Close()
 			fmt.Fprintf(out, "\n#### Branch clone on %s (%s)\n\n| method | parent database | whole branch creation | clone copy | extra disk |\n|---|---|---|---|---|\n| %s | %s | %d ms | %s | %s |\n",
-				fsName(st.cfg.StateDir), os.Getenv("SBCTL_TEST_LABEL"), b.CloneMethod, humanBytes(size), total.Milliseconds(), cloneMS(res), humanBytes(max(free0-free1, 0)))
+				fsName(st.cfg.StateDir), os.Getenv("SUPAVISE_TEST_LABEL"), b.CloneMethod, humanBytes(size), total.Milliseconds(), cloneMS(res), humanBytes(max(free0-free1, 0)))
 		}
 	}
 	if _, err := st.svc.Delete(ctx, b.Ref, DeleteOptions{}); err != nil {
@@ -651,7 +651,7 @@ func cloneMS(res map[string]any) string {
 func TestIntegrationCloneUnderWriteLoad(t *testing.T) {
 	st := newStack(t)
 	ctx := context.Background()
-	if m := os.Getenv("SBCTL_TEST_EXPECT_METHOD"); m == MethodBackup {
+	if m := os.Getenv("SUPAVISE_TEST_EXPECT_METHOD"); m == MethodBackup {
 		t.Skip("this filesystem uses the base-backup path; the write-load test covers the file-clone path")
 	}
 	parent, err := st.node.Engine.Create(ctx, lifecycle.CreateRequest{Name: "busy parent", Class: "small"})
@@ -786,9 +786,9 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 		// connect = false makes the subscription without contacting a publisher; it is then given
 		// a slot name and enabled, which is what a live subscription looks like in the data
 		// directory (subenabled, subslotname, subconninfo).
-		`create subscription sbctl_dummy connection 'host=127.0.0.1 port=1 dbname=nowhere user=nobody' publication nothing with (connect = false)`,
-		`alter subscription sbctl_dummy set (slot_name = 'sbctl_dummy_slot')`,
-		`alter subscription sbctl_dummy enable`,
+		`create subscription supavise_dummy connection 'host=127.0.0.1 port=1 dbname=nowhere user=nobody' publication nothing with (connect = false)`,
+		`alter subscription supavise_dummy set (slot_name = 'supavise_dummy_slot')`,
+		`alter subscription supavise_dummy enable`,
 	} {
 		if _, err := admin.Exec(ctx, q); err != nil {
 			t.Fatalf("%s: %v", q, err)
@@ -798,12 +798,12 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 	if _, err := admin.Exec(ctx, `create extension if not exists pg_cron`); err != nil {
 		t.Logf("pg_cron is not usable on this cluster, the cron assertions are skipped: %v", err)
 		cron = false
-	} else if _, err := admin.Exec(ctx, `select cron.schedule('sbctl-test-job', '* * * * *', 'select 1')`); err != nil {
+	} else if _, err := admin.Exec(ctx, `select cron.schedule('supavise-test-job', '* * * * *', 'select 1')`); err != nil {
 		t.Logf("cannot schedule a pg_cron job, the cron assertions are skipped: %v", err)
 		cron = false
 	}
 	var enabled bool
-	if err := admin.QueryRow(ctx, `select subenabled from pg_subscription where subname = 'sbctl_dummy'`).Scan(&enabled); err != nil || !enabled {
+	if err := admin.QueryRow(ctx, `select subenabled from pg_subscription where subname = 'supavise_dummy'`).Scan(&enabled); err != nil || !enabled {
 		t.Fatalf("the parent's subscription: enabled=%v err=%v", enabled, err)
 	}
 	var parentWorkers string
@@ -813,7 +813,7 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 	if _, err := admin.Exec(ctx, `checkpoint`); err != nil {
 		t.Fatal(err)
 	}
-	if os.Getenv("SBCTL_TEST_EXPECT_METHOD") == MethodBackup {
+	if os.Getenv("SUPAVISE_TEST_EXPECT_METHOD") == MethodBackup {
 		// Whatever the filesystem can do, take the base-backup path: its restore rewrites
 		// postgresql.auto.conf with ALTER SYSTEM, which the first-start settings must survive.
 		st.cfg.Branching.Clone = "backup"
@@ -877,7 +877,7 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 		var subs int
 		var slot *string
 		var on bool
-		if err := ba.QueryRow(ctx, `select count(*), bool_or(subenabled), max(subslotname) from pg_subscription where subname = 'sbctl_dummy'`).Scan(&subs, &on, &slot); err != nil {
+		if err := ba.QueryRow(ctx, `select count(*), bool_or(subenabled), max(subslotname) from pg_subscription where subname = 'supavise_dummy'`).Scan(&subs, &on, &slot); err != nil {
 			t.Fatal(err)
 		}
 		if subs != 1 || on || slot != nil {
@@ -885,7 +885,7 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 		}
 		if cron {
 			var active bool
-			if err := ba.QueryRow(ctx, `select active from cron.job where jobname = 'sbctl-test-job'`).Scan(&active); err != nil {
+			if err := ba.QueryRow(ctx, `select active from cron.job where jobname = 'supavise-test-job'`).Scan(&active); err != nil {
 				t.Fatal(err)
 			}
 			if active != keepJobs {
@@ -898,7 +898,7 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 				t.Fatal(err)
 			}
 			if hasTable {
-				if err := ba.QueryRow(ctx, `select count(*) from `+PausedCronTable+` p join cron.job j using (jobid) where j.jobname = 'sbctl-test-job'`).Scan(&recorded); err != nil {
+				if err := ba.QueryRow(ctx, `select count(*) from `+PausedCronTable+` p join cron.job j using (jobid) where j.jobname = 'supavise-test-job'`).Scan(&recorded); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -928,7 +928,7 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 		}
 		// The parent is untouched.
 		var penabled bool
-		if err := admin.QueryRow(ctx, `select subenabled from pg_subscription where subname = 'sbctl_dummy'`).Scan(&penabled); err != nil || !penabled {
+		if err := admin.QueryRow(ctx, `select subenabled from pg_subscription where subname = 'supavise_dummy'`).Scan(&penabled); err != nil || !penabled {
 			t.Errorf("the parent's subscription changed: enabled=%v err=%v", penabled, err)
 		}
 		if n := st.count(b.Ref, "public.t"); n != 2 {

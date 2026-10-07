@@ -7,9 +7,9 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	plat "github.com/OWNER/sbctl/internal/api/gen/platform"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	plat "github.com/jsmillerdev/supavise/internal/api/gen/platform"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // elem returns a minimal valid element of the array at property prop of the object
@@ -57,7 +57,7 @@ func (s *Server) platformProject(p *registry.Project, org *registry.Organization
 		Id: projectNumID(p), InsertedAt: ts(p.CreatedAt), UpdatedAt: ts(p.UpdatedAt),
 		Name: p.Name, OrganizationId: float32(org.ID), Ref: p.Ref, Region: s.regionOf(p),
 		RestUrl: s.projectURL(p.Ref) + "/rest/v1/", Status: plat.ProjectDetailResponseOutputStatus(p.Status),
-		SubscriptionId: "sbctl",
+		SubscriptionId: "supavise",
 	}
 }
 
@@ -130,7 +130,7 @@ func (s *Server) platformListProjects(w http.ResponseWriter, r *http.Request) er
 		rows = append(rows, setAll(row, map[string]any{
 			"cloud_provider": "AWS", "id": projectNumID(p), "inserted_at": ts(p.CreatedAt), "is_branch_enabled": s.branches != nil,
 			"is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID, "organization_slug": org.Slug,
-			"preview_branch_refs": s.branchRefs(all, p.Ref), "ref": p.Ref, "region": s.regionOf(p), "status": string(p.Status), "subscription_id": "sbctl",
+			"preview_branch_refs": s.branchRefs(all, p.Ref), "ref": p.Ref, "region": s.regionOf(p), "status": string(p.Status), "subscription_id": "supavise",
 		}))
 	}
 	resp := base("GET /platform/projects")
@@ -175,7 +175,7 @@ func (s *Server) platformCreateProject(w http.ResponseWriter, r *http.Request) e
 		"cloud_provider": "AWS", "endpoint": s.projectURL(p.Ref), "id": projectNumID(p), "inserted_at": ts(p.CreatedAt),
 		"is_branch_enabled": s.branches != nil, "is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID,
 		"organization_slug": org.Slug, "preview_branch_refs": []string{}, "ref": p.Ref, "region": s.regionOf(p),
-		"status": string(p.Status), "subscription_id": "sbctl",
+		"status": string(p.Status), "subscription_id": "supavise",
 	})
 	if keys != nil {
 		set(resp, "anon_key", keys.AnonKey)
@@ -329,7 +329,7 @@ func (s *Server) temporaryKey(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// platformBackups reports no backups: base backups are managed by sbctl itself and
+// platformBackups reports no backups: base backups are managed by supavise itself and
 // have no dashboard representation yet.
 func (s *Server) platformBackups(w http.ResponseWriter, r *http.Request) error {
 	if _, err := s.loadProject(r.Context(), r.PathValue("ref")); err != nil {

@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/OWNER/sbctl/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
 )
 
 // v2Config is GET /v2/projects/{ref}/config, the one document of every service's settings that

@@ -10,31 +10,31 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // TestPebbleIssuance obtains real certificates from a Pebble ACME test server
 // over HTTP-01 and TLS-ALPN-01, through our own listeners. It is CI only: see
 // internal/proxy/pebble-test.sh. Required environment:
 //
-//	SBCTL_TEST_PEBBLE_URL        ACME directory, e.g. https://localhost:14000/dir
-//	SBCTL_TEST_PEBBLE_CA         PEM root that signs Pebble's own HTTPS certificate
-//	SBCTL_TEST_PEBBLE_HTTP_PORT  Pebble's httpPort (default 5002)
-//	SBCTL_TEST_PEBBLE_TLS_PORT   Pebble's tlsPort (default 5001)
+//	SUPAVISE_TEST_PEBBLE_URL        ACME directory, e.g. https://localhost:14000/dir
+//	SUPAVISE_TEST_PEBBLE_CA         PEM root that signs Pebble's own HTTPS certificate
+//	SUPAVISE_TEST_PEBBLE_HTTP_PORT  Pebble's httpPort (default 5002)
+//	SUPAVISE_TEST_PEBBLE_TLS_PORT   Pebble's tlsPort (default 5001)
 //
 // Pebble must resolve every name under example.test to 127.0.0.1 (pebble-challtestsrv
 // with -defaultIPv4 127.0.0.1, or pebble -dnsserver).
 func TestPebbleIssuance(t *testing.T) {
-	dir := os.Getenv("SBCTL_TEST_PEBBLE_URL")
+	dir := os.Getenv("SUPAVISE_TEST_PEBBLE_URL")
 	if dir == "" {
-		t.Skip("SBCTL_TEST_PEBBLE_URL not set (CI-only test, see internal/proxy/pebble-test.sh)")
+		t.Skip("SUPAVISE_TEST_PEBBLE_URL not set (CI-only test, see internal/proxy/pebble-test.sh)")
 	}
-	httpPort := envPort(t, "SBCTL_TEST_PEBBLE_HTTP_PORT", 5002)
-	tlsPort := envPort(t, "SBCTL_TEST_PEBBLE_TLS_PORT", 5001)
+	httpPort := envPort(t, "SUPAVISE_TEST_PEBBLE_HTTP_PORT", 5002)
+	tlsPort := envPort(t, "SUPAVISE_TEST_PEBBLE_TLS_PORT", 5001)
 
 	s := tlsServer(t, func(c *config.Config) {
 		c.Domain, c.TLS.Mode = "example.test", "http01"
-		c.TLS.CA, c.TLS.CACert, c.TLS.Email = dir, os.Getenv("SBCTL_TEST_PEBBLE_CA"), "ci@example.test"
+		c.TLS.CA, c.TLS.CACert, c.TLS.Email = dir, os.Getenv("SUPAVISE_TEST_PEBBLE_CA"), "ci@example.test"
 	})
 	httpLn, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(httpPort))
 	if err != nil {

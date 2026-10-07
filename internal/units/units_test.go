@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/deploy/systemd"
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/deploy/systemd"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 func TestEnvRoundTrip(t *testing.T) {
@@ -76,16 +76,16 @@ func TestFormatRun(t *testing.T) {
 }
 
 func TestParseUnitAndLimits(t *testing.T) {
-	svc, ref, err := ParseUnit("sb-edge-runtime.service")
+	svc, ref, err := ParseUnit("supavise-edge-runtime.service")
 	if err != nil || svc != "edge-runtime" || ref != "" {
 		t.Fatal(svc, ref, err)
 	}
-	svc, ref, err = ParseUnit("sb-postgres@abcdefghijklmnopqrst.service")
+	svc, ref, err = ParseUnit("supavise-postgres@abcdefghijklmnopqrst.service")
 	if err != nil || svc != "postgres" || ref != "abcdefghijklmnopqrst" {
 		t.Fatal(svc, ref, err)
 	}
 	if _, _, err := ParseUnit("nginx.service"); err == nil {
-		t.Fatal("non-sbctl unit")
+		t.Fatal("non-supavise unit")
 	}
 	if n, _ := ParseBytes("1G"); n != 1<<30 {
 		t.Fatal(n)
@@ -110,7 +110,7 @@ func TestParseUnitAndLimits(t *testing.T) {
 // Every embedded template must run the files FilesFor renders, so the systemd and exec
 // backends agree on layout.
 func TestTemplatesMatchLayout(t *testing.T) {
-	cfg := config.Default() // state_dir /var/lib/sbctl, the path the templates hard-code
+	cfg := config.Default() // state_dir /var/lib/supavise, the path the templates hard-code
 	check := func(name, svc, ref string) {
 		t.Helper()
 		b, err := systemd.Read(name)
@@ -133,17 +133,17 @@ func TestTemplatesMatchLayout(t *testing.T) {
 				t.Errorf("%s lacks %q", name, line)
 			}
 		}
-		if !strings.Contains(string(b), "User=sbctl") || !strings.Contains(string(b), "Slice=sbctl.slice") {
-			t.Errorf("%s must run as sbctl in sbctl.slice", name)
+		if !strings.Contains(string(b), "User=supavise") || !strings.Contains(string(b), "Slice=supavise.slice") {
+			t.Errorf("%s must run as supavise in supavise.slice", name)
 		}
 	}
-	check("sb-postgres@.service", config.SvcPostgres, "abcdefghijklmnopqrst")
-	check("sb-gotrue@.service", config.SvcGoTrue, "abcdefghijklmnopqrst")
-	check("sb-postgrest@.service", config.SvcPostgREST, "abcdefghijklmnopqrst")
+	check("supavise-postgres@.service", config.SvcPostgres, "abcdefghijklmnopqrst")
+	check("supavise-gotrue@.service", config.SvcGoTrue, "abcdefghijklmnopqrst")
+	check("supavise-postgrest@.service", config.SvcPostgREST, "abcdefghijklmnopqrst")
 	for _, s := range []string{"supavisor", "realtime", "storage", "pgmeta", "studio", "imgproxy", "edge-runtime"} {
-		check("sb-"+s+".service", s, "")
+		check("supavise-"+s+".service", s, "")
 	}
-	for _, name := range []string{"sbctl.slice", "sbctl.service", "50-sbctl.rules"} {
+	for _, name := range []string{"supavise.slice", "supavise.service", "50-supavise.rules"} {
 		if _, err := systemd.Read(name); err != nil {
 			t.Error(err)
 		}
@@ -159,11 +159,11 @@ func TestInstallTemplates(t *testing.T) {
 	if changed, err := systemd.Install(d, p); err != nil || len(changed) != 0 {
 		t.Fatalf("second install must be a no-op: %v %v", err, changed)
 	}
-	if _, err := os.Stat(filepath.Join(p, "50-sbctl.rules")); err != nil {
+	if _, err := os.Stat(filepath.Join(p, "50-supavise.rules")); err != nil {
 		t.Fatal(err)
 	}
 	// The daemon starts these through D-Bus; a missing file is "Unit not found" at runtime.
-	for _, name := range []string{"sb-basebackup@.timer", "sb-basebackup-prune.timer", "sb-basebackup@.service", "sb-basebackup-prune.service"} {
+	for _, name := range []string{"supavise-basebackup@.timer", "supavise-basebackup-prune.timer", "supavise-basebackup@.service", "supavise-basebackup-prune.service"} {
 		if _, err := os.Stat(filepath.Join(d, name)); err != nil {
 			t.Errorf("install-units does not install %s: %v", name, err)
 		}
@@ -356,7 +356,7 @@ func TestExecDetectsCrash(t *testing.T) {
 	e.Stop(ctx, spec.Unit())
 }
 
-// A second Exec instance (another sbctl invocation) can stop what the first started.
+// A second Exec instance (another supavise invocation) can stop what the first started.
 func TestExecAcrossProcesses(t *testing.T) {
 	e1, cfg := execBackend(t)
 	ctx := context.Background()
@@ -376,17 +376,17 @@ func TestExecAcrossProcesses(t *testing.T) {
 	}
 }
 
-// Every template, Postgres included, must replace /var/lib/sbctl with an empty tmpfs and
+// Every template, Postgres included, must replace /var/lib/supavise with an empty tmpfs and
 // bring back only the artifacts, its own launcher script and its own state directory
 // (an allowlist). Binding a project or system directory as a whole would expose the
 // siblings' environment files and cluster directories.
 func TestTemplatesContainment(t *testing.T) {
 	var names []string
 	for _, s := range []string{"postgres@", "gotrue@", "postgrest@"} {
-		names = append(names, "sb-"+s+".service")
+		names = append(names, "supavise-"+s+".service")
 	}
 	for _, s := range []string{"supavisor", "realtime", "storage", "pgmeta", "studio", "imgproxy", "edge-runtime"} {
-		names = append(names, "sb-"+s+".service")
+		names = append(names, "supavise-"+s+".service")
 	}
 	line := func(body, key string) string {
 		for _, l := range strings.Split(body, "\n") {
@@ -402,22 +402,22 @@ func TestTemplatesContainment(t *testing.T) {
 			t.Fatal(err)
 		}
 		body := string(b)
-		svc := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(name, ".service"), "sb-"), "@")
-		if !strings.Contains(body, "TemporaryFileSystem=/var/lib/sbctl:ro\n") {
-			t.Errorf("%s lacks the tmpfs over /var/lib/sbctl", name)
+		svc := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(name, ".service"), "supavise-"), "@")
+		if !strings.Contains(body, "TemporaryFileSystem=/var/lib/supavise:ro\n") {
+			t.Errorf("%s lacks the tmpfs over /var/lib/supavise", name)
 		}
-		if !strings.Contains(body, "InaccessiblePaths=-/etc/sbctl") {
-			t.Errorf("%s does not hide /etc/sbctl or the master key", name)
+		if !strings.Contains(body, "InaccessiblePaths=-/etc/supavise") {
+			t.Errorf("%s does not hide /etc/supavise or the master key", name)
 		}
 		ro := strings.Fields(line(body, "BindReadOnlyPaths"))
-		if len(ro) < 2 || ro[0] != "/var/lib/sbctl/artifacts" || !strings.HasSuffix(ro[1], "/"+svc+".run") {
+		if len(ro) < 2 || ro[0] != "/var/lib/supavise/artifacts" || !strings.HasSuffix(ro[1], "/"+svc+".run") {
 			t.Errorf("%s: BindReadOnlyPaths must be the artifacts and its own launcher script, got %v", name, ro)
 		}
 		wantRO := 2
 		if svc == "postgres" {
 			// Plus the WAL relay directory of its own project, read-only (optional: created at the first start).
 			wantRO = 3
-			if len(ro) != 3 || ro[2] != "-/var/lib/sbctl/projects/%i/wal" {
+			if len(ro) != 3 || ro[2] != "-/var/lib/supavise/projects/%i/wal" {
 				t.Errorf("%s: BindReadOnlyPaths must end with its own WAL relay directory, got %v", name, ro)
 			}
 		}
@@ -432,23 +432,23 @@ func TestTemplatesContainment(t *testing.T) {
 		}
 		for _, p := range strings.Fields(line(body, "BindPaths")) {
 			switch strings.TrimPrefix(p, "-") {
-			case "/var/lib/sbctl/projects/%i", "/var/lib/sbctl/projects/system", "/var/lib/sbctl/projects", "/var/lib/sbctl/backups",
-				"/var/lib/sbctl/certs", "/var/lib/sbctl/system", "/var/lib/sbctl":
+			case "/var/lib/supavise/projects/%i", "/var/lib/supavise/projects/system", "/var/lib/supavise/projects", "/var/lib/supavise/backups",
+				"/var/lib/supavise/certs", "/var/lib/supavise/system", "/var/lib/supavise":
 				t.Errorf("%s binds %s as a whole", name, p)
 			}
 		}
-		if strings.Contains(body, "/var/lib/sbctl/certs") {
+		if strings.Contains(body, "/var/lib/supavise/certs") {
 			t.Errorf("%s must not mention the certificate directory", name)
 		}
 		if strings.Contains(line(body, "InaccessiblePaths"), ".env") {
 			t.Errorf("%s still hides sibling environment files (denylist); use the allowlist", name)
 		}
-		// All of /etc/sbctl (archive_command reads no config: it goes through the relay socket)
-		// and the system bus: the polkit rule lets the sbctl user stop and tune sb-* units, which
+		// All of /etc/supavise (archive_command reads no config: it goes through the relay socket)
+		// and the system bus: the polkit rule lets the supavise user stop and tune supavise-* units, which
 		// code running inside one unit has no business doing to the others. Postgres also hides
 		// the two other unix sockets that are ways out of a branch's IP filter (IPAddressDeny
 		// does not cover AF_UNIX): the resolver's varlink socket and nscd's.
-		wantHidden := "-/etc/sbctl -/run/dbus"
+		wantHidden := "-/etc/supavise -/run/dbus"
 		if svc == "postgres" {
 			wantHidden += " -/run/systemd/resolve/io.systemd.Resolve -/run/nscd/socket"
 		}
@@ -456,9 +456,9 @@ func TestTemplatesContainment(t *testing.T) {
 			t.Errorf("%s: InaccessiblePaths = %q, want %q", name, line(body, "InaccessiblePaths"), wantHidden)
 		}
 		// No unit sees the backup directory, Postgres included: WAL leaves through the relay.
-		if strings.Contains(body, "/var/lib/sbctl/backups") && !strings.HasPrefix(strings.TrimSpace(body), "#") {
+		if strings.Contains(body, "/var/lib/supavise/backups") && !strings.HasPrefix(strings.TrimSpace(body), "#") {
 			for _, l := range strings.Split(body, "\n") {
-				if !strings.HasPrefix(strings.TrimSpace(l), "#") && strings.Contains(l, "/var/lib/sbctl/backups") {
+				if !strings.HasPrefix(strings.TrimSpace(l), "#") && strings.Contains(l, "/var/lib/supavise/backups") {
 					t.Errorf("%s still mounts or writes the backup directory: %s", name, l)
 				}
 			}
@@ -466,8 +466,8 @@ func TestTemplatesContainment(t *testing.T) {
 	}
 }
 
-// A launcher that a unit under another uid executes (sb-edge-bundle@<ref>.service, a dynamic user) is
-// world-readable; every other launcher stays private to the sbctl user. The environment file is
+// A launcher that a unit under another uid executes (supavise-edge-bundle@<ref>.service, a dynamic user) is
+// world-readable; every other launcher stays private to the supavise user. The environment file is
 // 0600 either way: systemd reads it as root.
 func TestRenderPublicRunMode(t *testing.T) {
 	cfg := config.Default()
@@ -565,13 +565,13 @@ func TestIMDSDenyIsTheTemplateList(t *testing.T) {
 }
 
 // Only a project's Postgres unit has an egress policy to lift: the other templates own their lists
-// (sb-edge-bundle@ denies localhost and allows the resolver stub).
+// (supavise-edge-bundle@ denies localhost and allows the resolver stub).
 func TestEgressManaged(t *testing.T) {
 	for unit, want := range map[string]bool{
-		"sb-postgres@abcdefghijklmnopqrst.service":    true,
-		"sb-edge-bundle@abcdefghijklmnopqrst.service": false,
-		"sb-gotrue@abcdefghijklmnopqrst.service":      false,
-		"sb-edge-runtime.service":                     false,
+		"supavise-postgres@abcdefghijklmnopqrst.service":    true,
+		"supavise-edge-bundle@abcdefghijklmnopqrst.service": false,
+		"supavise-gotrue@abcdefghijklmnopqrst.service":      false,
+		"supavise-edge-runtime.service":                     false,
 	} {
 		if got := egressManaged(unit); got != want {
 			t.Errorf("egressManaged(%s) = %v, want %v", unit, got, want)

@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // KeySource returns the decrypted credentials of a project. lifecycle.Manager
@@ -50,7 +50,7 @@ type Options struct {
 	// FunctionsEnabled routes /functions/v1 to the edge runtime on Ports.EdgeRuntime.
 	// While false (v1) the route answers 503 {"message": ...}.
 	FunctionsEnabled bool
-	// FunctionsProxyToken is the secret sent to the edge runtime in X-Sbctl-Proxy-Token.
+	// FunctionsProxyToken is the secret sent to the edge runtime in X-Supavise-Proxy-Token.
 	// Empty reads the node's secret (config.LoadFunctionsProxyToken) when the first
 	// /functions/v1 request arrives. Tests set it.
 	FunctionsProxyToken string

@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck shell=sh
 
-# Launcher of the sbctl platform-mode Studio artifact. Identical contract to bin/studio of the
+# Launcher of the supavise platform-mode Studio artifact. Identical contract to bin/studio of the
 # slim-services studio artifact: a POSIX shell script that sources the profile next to it, then
 # runs the bundled node on apps/studio/docker-entrypoint.mjs with cwd = app/. Configuration is
 # environment only (PORT, HOSTNAME, and the per-install values listed in placeholders.json).

@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
 )
 
 // roleReadOnly is the login role behind read-only SQL (POST .../database/query
@@ -23,7 +23,7 @@ import (
 // client sends, `begin read write` and `reset role` included, can change data.
 // default_transaction_read_only is set on top as a second layer, which a client may
 // override but which grants nothing.
-const roleReadOnly = "sbctl_read_only"
+const roleReadOnly = "supavise_read_only"
 
 // readOnlyEnsureTTL is how long a successful ensureReadOnlyRole is trusted. The role
 // lives in the project's database, so a restore or a rebuilt data directory can
@@ -43,7 +43,7 @@ func (s *Server) readOnlyPassword(ctx context.Context, ref string) (string, erro
 		return "", err
 	}
 	mac := hmac.New(sha256.New, []byte(k.AdminPassword))
-	mac.Write([]byte("sbctl-api-read-only-role"))
+	mac.Write([]byte("supavise-api-read-only-role"))
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
@@ -68,7 +68,7 @@ func (s *Server) roleLock(ref string) *sync.Mutex {
 // state check below can compare verifiers.
 func readOnlySalt(pw string) []byte {
 	mac := hmac.New(sha256.New, []byte(pw))
-	mac.Write([]byte("sbctl-api-read-only-salt"))
+	mac.Write([]byte("supavise-api-read-only-salt"))
 	return mac.Sum(nil)[:16]
 }
 

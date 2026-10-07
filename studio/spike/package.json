@@ -1,5 +1,5 @@
 {
-  "name": "sbctl-studio-spike",
+  "name": "supavise-studio-spike",
   "private": true,
   "type": "module",
   "description": "Playwright driver for studio/spike.sh; playwright-core is installed by the script."

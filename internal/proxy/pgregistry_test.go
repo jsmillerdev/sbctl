@@ -14,20 +14,20 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 // TestPostgresRegistry runs the proxy over the real Postgres registry and real
 // LISTEN/NOTIFY, with keys opened from sealed project_secrets (RegistryKeys). It
-// needs SBCTL_TEST_DATABASE_URL, a role that may create databases in a throwaway
+// needs SUPAVISE_TEST_DATABASE_URL, a role that may create databases in a throwaway
 // cluster; it runs in a database of its own, so it cannot collide with other
 // packages' tests that use the same DSN.
 func TestPostgresRegistry(t *testing.T) {
-	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	reg, err := registry.Open(ctx, privateDatabase(t, dsn))
@@ -96,7 +96,7 @@ func TestPostgresRegistry(t *testing.T) {
 
 	// Kill the LISTEN connection: the proxy resubscribes and reloads.
 	if _, err := reg.Pool().Exec(ctx, `select pg_terminate_backend(pid) from pg_stat_activity
-		where pid <> pg_backend_pid() and datname = current_database() and query ilike 'listen sbctl_changes%'`); err != nil {
+		where pid <> pg_backend_pid() and datname = current_database() and query ilike 'listen supavise_changes%'`); err != nil {
 		t.Fatal(err)
 	}
 	const ref2 = "mmmmmmmmmmnnnnnnnnnn"
@@ -115,7 +115,7 @@ func TestPostgresRegistry(t *testing.T) {
 
 // privateDatabase creates a database that only this test uses, drops it when the
 // test ends, and returns its DSN. Other packages' tests truncate tables in the
-// database named by SBCTL_TEST_DATABASE_URL while their binaries run in parallel.
+// database named by SUPAVISE_TEST_DATABASE_URL while their binaries run in parallel.
 func privateDatabase(t *testing.T, dsn string) string {
 	t.Helper()
 	ctx := context.Background()
@@ -123,7 +123,7 @@ func privateDatabase(t *testing.T, dsn string) string {
 	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatal(err)
 	}
-	name := "sbctl_proxy_test_" + hex.EncodeToString(b[:])
+	name := "supavise_proxy_test_" + hex.EncodeToString(b[:])
 	admin, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)

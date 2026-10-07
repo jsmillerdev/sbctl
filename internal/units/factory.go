@@ -4,7 +4,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // New returns the backend cfg.Supervisor selects: "systemd" (D-Bus) or "exec".

@@ -1,0 +1,114 @@
+[Unit]
+Description=Supavise one-shot bundler for uploaded Edge Function sources of project %i
+Documentation=https://github.com/jsmillerdev/supavise
+After=network.target local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+# One instance per project, supavise-edge-bundle@<ref>.service, started by the Management API for one
+# upload at a time (supavise renders the two files below, and lays the upload out under
+# /var/lib/supavise/system/edge-bundle/work, before it starts the unit; the daemon runs one bundling
+# at a time, whatever the project). It runs "edge-runtime bundle", which parses the function's
+# modules and writes one eszip file; it does not run any of the function's code.
+#
+# The sources are another person's code and their imports are paths: a function can import
+# "../../../<other project>/functions-env.json" or any other file this unit's user can read, and
+# the bundle would carry it out to the uploader. Two things keep that from working:
+#
+#  1. The mount namespace shows nothing of the node but the upload and the artifacts
+#     (TemporaryFileSystem, below).
+#  2. The unit runs under a uid of its own (DynamicUser), not the supavise user. Every other unit and
+#     the daemon run as supavise, and a process may open /proc/<pid>/root and /proc/<pid>/environ of
+#     every process with its own uid, which walks straight around a mount namespace (an upload
+#     could import /proc/<pid of supavise-edge-runtime>/root/var/lib/supavise/system/edge-runtime/tenants/
+#     <ref>/functions-env.json and the bundle would carry the keys of every project out). With
+#     another uid the kernel refuses (ptrace_may_access), and ProtectProc=invisible with
+#     ProcSubset=pid hide the processes of the node from /proc altogether.
+#
+# What the unit's uid can read and write is handed over by the daemon (internal/functions/bundler.go):
+# the sources in work/src (world-readable, owned by supavise, read-only here) and two files it creates
+# in work/out and makes world-writable, the eszip and the log. The uid owns nothing in the state
+# directory, so it cannot make or replace anything there.
+#
+# The module cache is per project. A cache is shared by everything that is bundled with it: a
+# module fetched for one upload (a private npm package fetched with the uploader's .npmrc, a URL
+# only that project's code names) would be there for the bundle of any other upload to import. Each
+# instance therefore has its own, /var/cache/supavise-edge-bundle/<ref> (CacheDirectory, private to the
+# instance's uid), and the uid differs from instance to instance: User=sv-bundle-%i names the
+# dynamic user after the ref (30 characters, the limit is 31). Without it systemd would name
+# the user after the template, "supavise-edge-bundle", for every instance (measured in CI: two
+# projects' instances ran as the same uid), and the mode of the directories would keep nothing out
+# where the kernel has no id-mapped mounts, which are what hides the other projects' cache
+# directories from an instance now. With a uid per project the unit of another project cannot open
+# the directory: it is mode 0700 under /var/cache/private, which only root may enter, and owned by
+# another uid.
+#
+# The directory is emptied before a start when it has passed 512 MiB, and removed when the project
+# is deleted (Systemd.Remove starts supavise-edge-bundle-clean@<ref>.service, which runs as root because
+# the supavise user cannot enter /var/cache/private).
+Type=oneshot
+DynamicUser=yes
+User=sv-bundle-%i
+Slice=supavise.slice
+EnvironmentFile=/var/lib/supavise/projects/%i/edge-bundle.env
+CacheDirectory=supavise-edge-bundle/%i
+CacheDirectoryMode=0700
+ExecStartPre=/bin/sh -c 'test "$$(du -sk /var/cache/supavise-edge-bundle/%i | cut -f1)" -le 524288 || find /var/cache/supavise-edge-bundle/%i -mindepth 1 -delete'
+ExecStart=/var/lib/supavise/projects/%i/edge-bundle.run
+# A bundle that has not finished in this time is killed; the API's request gives up at about the same time.
+TimeoutStartSec=150s
+# "edge-runtime bundle" exits 1 when the uploaded code does not bundle (a module that does not exist, a
+# syntax error): that is the uploader's mistake, not a failure of the unit, so it must not leave the unit
+# in the failed state (systemctl --failed, alerts) for every bad upload. The API decides by the output file
+# and shows the bundler's own log; a kill by the timeout or the memory limit stays a failure.
+SuccessExitStatus=1
+MemoryAccounting=yes
+CPUAccounting=yes
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=512
+LimitNOFILE=4096
+SyslogIdentifier=supavise-edge-bundle
+
+# Hardening, as supavise-edge-runtime.service (DynamicUser implies ProtectSystem=strict, PrivateTmp,
+# NoNewPrivileges, RestrictSUIDSGID and RemoveIPC).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+# Only this unit's own processes are visible in /proc (the processes of supavise's units are not
+# listed and cannot be opened by number), and /proc has only the per-process directories.
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+# The bundler fetches remote imports (https:, npm:), so it keeps the network, minus the
+# instance metadata service (the EC2 role) and every loopback service of the node (the
+# Management API, Postgres and the other services listen there). Allow wins over deny: the
+# stub resolver of systemd-resolved stays reachable for DNS.
+IPAddressDeny=169.254.169.254 fd00:ec2::254 localhost
+IPAddressAllow=127.0.0.53 127.0.0.54
+# Containment (allowlist), as supavise-edge-runtime.service: an empty tmpfs where /var/lib/supavise is,
+# the artifacts and the launcher read-only, the sources read-only and the one directory the
+# result goes to. The state directory of the unit itself (system/edge-bundle) is not bound
+# as a whole.
+InaccessiblePaths=-/etc/supavise
+TemporaryFileSystem=/var/lib/supavise:ro
+BindReadOnlyPaths=/var/lib/supavise/artifacts /var/lib/supavise/projects/%i/edge-bundle.run /var/lib/supavise/system/edge-bundle/work/src
+BindPaths=/var/lib/supavise/system/edge-bundle/work/out
+ReadWritePaths=/var/lib/supavise/system/edge-bundle/work/out
+
+# Never enabled: the API starts an instance when someone uploads sources.

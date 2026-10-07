@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // Spec is everything needed to render one unit instance: the env file at
@@ -34,7 +34,7 @@ type Spec struct {
 	// unit. GoTrue uses it for "bin/auth migrate".
 	PreStart [][]string
 	// PublicRun makes the launcher script world-readable (0755 instead of 0750), for a unit
-	// that runs under another uid than the sbctl user (sb-edge-bundle@<ref>.service, a dynamic
+	// that runs under another uid than the supavise user (supavise-edge-bundle@<ref>.service, a dynamic
 	// user). The script holds paths and arguments, never secrets: the environment is in the
 	// 0600 env file, which systemd reads as root.
 	PublicRun bool
@@ -77,7 +77,7 @@ func EgressAllow() []IPRange {
 	return []IPRange{{Family: 2, Addr: []byte{127, 0, 0, 1}, Prefix: 32}, {Family: 10, Addr: v6, Prefix: 128}}
 }
 
-// IMDSDeny is IPAddressDeny=169.254.169.254 fd00:ec2::254, which every sb-* template carries
+// IMDSDeny is IPAddressDeny=169.254.169.254 fd00:ec2::254, which every supavise-* template carries
 // (the cloud metadata service holds the instance role): the baseline of a Postgres unit that is
 // not egress-confined. Lifting a branch's restriction must restore this list, not empty it.
 func IMDSDeny() []IPRange {
@@ -85,11 +85,11 @@ func IMDSDeny() []IPRange {
 	return []IPRange{{Family: 2, Addr: []byte{169, 254, 169, 254}, Prefix: 32}, {Family: 10, Addr: v6, Prefix: 128}}
 }
 
-// egressManaged reports whether the unit's IP lists are sbctl's to set: a project's Postgres unit
+// egressManaged reports whether the unit's IP lists are supavise's to set: a project's Postgres unit
 // (the only one a branch's egress policy applies to). The other templates own their lists, which
-// differ (sb-edge-bundle@ also denies localhost and allows the resolver stub) and which a lift
+// differ (supavise-edge-bundle@ also denies localhost and allows the resolver stub) and which a lift
 // must not overwrite.
-func egressManaged(unit string) bool { return strings.HasPrefix(unit, "sb-postgres@") }
+func egressManaged(unit string) bool { return strings.HasPrefix(unit, "supavise-postgres@") }
 
 // egressMatches reports whether props (the Service-type properties of a loaded unit, as the D-Bus
 // client returns them) already carry exactly the egress policy deny asks for: IPAddressDeny and

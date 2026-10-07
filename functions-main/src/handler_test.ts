@@ -58,7 +58,7 @@ interface Fixture {
 }
 
 async function fixture(limits: Partial<Limits> = {}): Promise<Fixture> {
-  const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'sbctl-handler-test-' }))
+  const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'supavise-handler-test-' }))
   await writeProject(root, REF_A, SECRET_A, { MY_SECRET: 'a-secret', SUPABASE_URL: 'evil' }, {
     SUPABASE_ANON_KEY: 'anon-a',
     SUPABASE_DB_URL: 'postgres://a',
@@ -132,7 +132,7 @@ Deno.test('a request without a valid project reference is refused', async () => 
 Deno.test('unknown functions and projects are 404 with the upstream error shape', async () => {
   const f = await fixture()
   try {
-    for (const path of ['/', '/nope', '/.sbctl-function.json', '/..', '/1abc']) {
+    for (const path of ['/', '/nope', '/.supavise-function.json', '/..', '/1abc']) {
       const res = await f.handle(req(path, REF_A, { authorization: `Bearer ${f.anonA}` }))
       assertEquals(res.status, 404, path)
       assertEquals(res.headers.get('sb-error-code'), 'NOT_FOUND')
@@ -192,7 +192,7 @@ Deno.test('a function deployed without verify_jwt takes any caller, and OPTIONS 
 
 Deno.test("each worker gets its own project's environment and nothing of the main service", async () => {
   const f = await fixture()
-  Deno.env.set('SBCTL_TEST_MAIN_ONLY', 'must-not-leak')
+  Deno.env.set('SUPAVISE_TEST_MAIN_ONLY', 'must-not-leak')
   try {
     await f.handle(req('/hello', REF_A, { authorization: `Bearer ${f.anonA}` }))
     await f.handle(req('/hello', REF_B, { authorization: `Bearer ${f.anonB}` }))
@@ -206,7 +206,7 @@ Deno.test("each worker gets its own project's environment and nothing of the mai
     assertEquals(envA.SUPABASE_URL, `http://${REF_A}.api.test`) // not the secret named SUPABASE_URL
     assertEquals(envA.SUPABASE_FUNCTION_SLUG, 'hello')
     for (const vars of [envA, envB]) {
-      assertFalse('SBCTL_TEST_MAIN_ONLY' in vars)
+      assertFalse('SUPAVISE_TEST_MAIN_ONLY' in vars)
       assertFalse('PATH' in vars)
       assertFalse('HOME' in vars)
       assertFalse(
@@ -224,7 +224,7 @@ Deno.test("each worker gets its own project's environment and nothing of the mai
     assertEquals(b.context.projectRef, REF_B)
     assertEquals(a.maybeEntrypoint, 'file:///src/hello/index.ts')
   } finally {
-    Deno.env.delete('SBCTL_TEST_MAIN_ONLY')
+    Deno.env.delete('SUPAVISE_TEST_MAIN_ONLY')
     await f.cleanup()
   }
 })
@@ -425,7 +425,7 @@ Deno.test('a function that was stored as sources is not served (it could read ot
     await Deno.mkdir(gen, { recursive: true })
     await Deno.writeTextFile(`${gen}/index.ts`, 'Deno.serve(() => new Response("x"))')
     await Deno.writeTextFile(
-      `${gen}/.sbctl-function.json`,
+      `${gen}/.supavise-function.json`,
       JSON.stringify({ slug: 'src', version: 1, verify_jwt: false, entrypoint: 'index.ts' }),
     )
     await Deno.symlink(gen, `${f.root}/${REF_A}/functions/src`)
@@ -559,7 +559,7 @@ Deno.test('the runtime-wide worker budget holds across projects: over-budget req
 
 Deno.test('a redeployment counts as a new worker until the old one has idled out', async () => {
   let t = 0
-  const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'sbctl-handler-test-' }))
+  const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'supavise-handler-test-' }))
   try {
     await writeProject(root, REF_A, SECRET_A)
     await writeFunction(root, REF_A, 'a', { verifyJwt: false })
@@ -715,7 +715,7 @@ Deno.test('streams keep their workers in the budgets: max_workers_per_project an
 
 Deno.test('a worker with a stream open is still live after its idle time; it is forgotten after the stream ends and the idle time passes', async () => {
   let t = 0
-  const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'sbctl-handler-test-' }))
+  const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'supavise-handler-test-' }))
   try {
     await writeProject(root, REF_A, SECRET_A)
     await writeFunction(root, REF_A, 'a', { verifyJwt: false })

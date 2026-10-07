@@ -37,7 +37,7 @@ func TestPidfdAlive(t *testing.T) {
 	}
 }
 
-// The peer of a connection from this test process is in no sb-* unit, so it is accepted,
+// The peer of a connection from this test process is in no supavise-* unit, so it is accepted,
 // whichever of the pidfd and start-time paths the kernel offers.
 func TestCheckRelayPeerAcceptsAnOrdinaryProcess(t *testing.T) {
 	dir, err := os.MkdirTemp("/tmp", "sbp")

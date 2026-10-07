@@ -8,7 +8,7 @@ set -euo pipefail
 
 SWAP_GB="${1:-6}"
 [[ "$(id -u)" -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
-[[ -n "${GITHUB_ACTIONS:-}${SBCTL_CI:-}" ]] || { echo "refusing to run outside CI (set SBCTL_CI=1 to override)" >&2; exit 1; }
+[[ -n "${GITHUB_ACTIONS:-}${SUPAVISE_CI:-}" ]] || { echo "refusing to run outside CI (set SUPAVISE_CI=1 to override)" >&2; exit 1; }
 
 echo "before:"; df -h / | tail -1; free -m | sed -n 1,2p
 
@@ -22,10 +22,10 @@ apt-get clean
 # disk and shrink the swap to what is left over 9 GB. The build wants RAM + swap of at least 11 GB.
 free_gb() { df -Pk "$1" | awk 'NR==2 {printf "%d", $4/1048576}'; }
 ram_gb=$(awk '/^MemTotal:/ {printf "%d", $2/1048576}' /proc/meminfo)
-SWAPFILE=/sbctl-swap
+SWAPFILE=/supavise-swap
 if [[ -d /mnt && "$(df -Pk /mnt | awk 'NR==2 {print $1}')" != "$(df -Pk / | awk 'NR==2 {print $1}')" \
       && "$(free_gb /mnt)" -ge "$((SWAP_GB + 1))" ]]; then
-  SWAPFILE=/mnt/sbctl-swap
+  SWAPFILE=/mnt/supavise-swap
 else
   room=$(( $(free_gb /) - 9 ))
   if [[ "$room" -lt "$SWAP_GB" ]]; then SWAP_GB="$room"; fi

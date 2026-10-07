@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // The deploy/ files are the default renderings; regenerate them with
@@ -13,10 +13,10 @@ import (
 func TestDeployUnits(t *testing.T) {
 	d := config.Default()
 	files := map[string]string{
-		"../../deploy/systemd/sb-basebackup@.service":      RenderBackupService(d.BinPath),
-		"../../deploy/systemd/sb-basebackup@.timer":        RenderBackupTimer(d.Backup.BaseBackupOnCalendar),
-		"../../deploy/systemd/sb-basebackup-prune.service": RenderPruneService(d.BinPath),
-		"../../deploy/systemd/sb-basebackup-prune.timer":   RenderPruneTimer(),
+		"../../deploy/systemd/supavise-basebackup@.service":      RenderBackupService(d.BinPath),
+		"../../deploy/systemd/supavise-basebackup@.timer":        RenderBackupTimer(d.Backup.BaseBackupOnCalendar),
+		"../../deploy/systemd/supavise-basebackup-prune.service": RenderPruneService(d.BinPath),
+		"../../deploy/systemd/supavise-basebackup-prune.timer":   RenderPruneTimer(),
 	}
 	for path, want := range files {
 		if os.Getenv("UPDATE_DEPLOY") != "" {
@@ -35,13 +35,13 @@ func TestDeployUnits(t *testing.T) {
 }
 
 func TestRenderBackupServiceOrdersBackupBeforePrune(t *testing.T) {
-	s := RenderBackupService("/opt/my sbctl/sbctl")
-	create := strings.Index(s, `"/opt/my sbctl/sbctl" backups create %i`)
-	prune := strings.Index(s, `"/opt/my sbctl/sbctl" backups prune %i`)
+	s := RenderBackupService("/opt/my supavise/supavise")
+	create := strings.Index(s, `"/opt/my supavise/supavise" backups create %i`)
+	prune := strings.Index(s, `"/opt/my supavise/supavise" backups prune %i`)
 	if create < 0 || prune < 0 || create > prune {
 		t.Fatalf("unexpected unit:\n%s", s)
 	}
-	if !strings.Contains(s, "Type=oneshot") || !strings.Contains(s, "User=sbctl") {
+	if !strings.Contains(s, "Type=oneshot") || !strings.Contains(s, "User=supavise") {
 		t.Fatalf("unit missing oneshot/user:\n%s", s)
 	}
 }
@@ -66,12 +66,12 @@ func TestOnCalendarIsValidatedBeforeItReachesAUnit(t *testing.T) {
 }
 
 func TestBackupServiceDoesNotStarveOnIdleIO(t *testing.T) {
-	for name, s := range map[string]string{"backup": RenderBackupService("/x/sbctl"), "prune": RenderPruneService("/x/sbctl")} {
+	for name, s := range map[string]string{"backup": RenderBackupService("/x/supavise"), "prune": RenderPruneService("/x/supavise")} {
 		if strings.Contains(s, "IOSchedulingClass=idle") || !strings.Contains(s, "IOSchedulingClass=best-effort") || !strings.Contains(s, "IOSchedulingPriority=7") {
 			t.Errorf("%s unit I/O class:\n%s", name, s)
 		}
 	}
-	if p := RenderPruneService("/x/sbctl"); !strings.Contains(p, "ExecStart=/x/sbctl backups prune\n") {
+	if p := RenderPruneService("/x/supavise"); !strings.Contains(p, "ExecStart=/x/supavise backups prune\n") {
 		t.Errorf("prune unit must prune every ref (no argument):\n%s", p)
 	}
 }

@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 func testSecrets(t testing.TB) *secrets.AESGCM {
@@ -218,7 +218,7 @@ func TestWebhookSignatures(t *testing.T) {
 
 func TestHookEvent(t *testing.T) {
 	var ev HookEvent
-	if err := json.Unmarshal([]byte(`{"metadata":{"ip_address":"1.2.3.4"},"user":{"email":"a@b.test","app_metadata":{"provider":"sso:A0000000-0000-4000-8000-000000000001"},"user_metadata":{"sbctl_grant":"sbg_x"}}}`), &ev); err != nil {
+	if err := json.Unmarshal([]byte(`{"metadata":{"ip_address":"1.2.3.4"},"user":{"email":"a@b.test","app_metadata":{"provider":"sso:A0000000-0000-4000-8000-000000000001"},"user_metadata":{"supavise_grant":"sbg_x"}}}`), &ev); err != nil {
 		t.Fatal(err)
 	}
 	if ev.Provider() != "a0000000-0000-4000-8000-000000000001" || ev.GrantToken() != "sbg_x" {

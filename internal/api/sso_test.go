@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/members"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/sso"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/sso"
 )
 
 const (
@@ -90,7 +90,7 @@ const (
 	ssoUser3 = "bbbbbbbb-0000-4000-8000-000000000003"
 )
 
-// An Owner registers a provider through the API: GoTrue has it, sbctl records its organization,
+// An Owner registers a provider through the API: GoTrue has it, supavise records its organization,
 // domains and default role, the domains' default-role rules exist, and Studio is told that the
 // sign-in page now has an SSO button. Removing it undoes all of it.
 func TestSSOProviderLifecycleThroughTheAPI(t *testing.T) {
@@ -362,11 +362,11 @@ func TestSSODenyingAPendingUser(t *testing.T) {
 	}
 }
 
-// An SSO session of a provider that sbctl did not register is refused, whatever its claims say.
+// An SSO session of a provider that Supavise did not register is refused, whatever its claims say.
 func TestSSOSessionOfAnUnregisteredProviderIsRefused(t *testing.T) {
 	f := newSSOFixture(t)
 	f.addProvider(acmeIdP, "developer", "acme.test")
-	stray := f.gt.sso.add("https://idp.stray.test/saml", "stray.test") // in GoTrue, never registered with sbctl
+	stray := f.gt.sso.add("https://idp.stray.test/saml", "stray.test") // in GoTrue, never registered with Supavise
 	for _, id := range []string{stray, "a0000000-0000-4000-8000-0000000000ff"} {
 		tok := f.ssoToken(ssoUser1, "alice@acme.test", id)
 		if rec := f.doAs(tok, "GET", "/platform/profile", nil); rec.Code != 403 {
@@ -394,7 +394,7 @@ func TestSSOSessionOfAnUnregisteredProviderIsRefused(t *testing.T) {
 	if unreg != 1 {
 		t.Fatalf("%d unregistered providers listed, want 1", unreg)
 	}
-	// The operator removes it; sbctl never recorded it.
+	// The operator removes it; supavise never recorded it.
 	if _, err := f.srv.sso.Remove(context.Background(), nil, stray, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -452,7 +452,7 @@ func TestSSOUserWhoLosesEveryMembershipWaitsAgain(t *testing.T) {
 	}
 }
 
-// Someone who is made a member by other means (invited, `sbctl users role`) is let in at once.
+// Someone who is made a member by other means (invited, `supavise users role`) is let in at once.
 func TestSSOUserWhoIsInvitedIsLetIn(t *testing.T) {
 	f := newSSOFixture(t)
 	id := f.addProvider(acmeIdP, "", "acme.test")
@@ -516,7 +516,7 @@ func TestSSOProviderOfClaims(t *testing.T) {
 }
 
 // A session whose claims say "sso" but whose account is a password account gets nothing from
-// the claim: users edit user_metadata, not app_metadata, and an sbctl_admin user who is not an
+// the claim: users edit user_metadata, not app_metadata, and an supavise_admin user who is not an
 // SSO user is admitted the old way.
 func TestSSOClaimsInUserMetadataDoNotAdmit(t *testing.T) {
 	f := newSSOFixture(t)
@@ -651,7 +651,7 @@ func TestBeforeUserCreatedHookRefusesStrangers(t *testing.T) {
 // grant the daemon put in the invite: once, and for that address only.
 func TestInvitationMailCarriesAOneTimeSignupGrant(t *testing.T) {
 	f := newSSOFixture(t)
-	f.cfg.Mail = config.Mail{SMTPHost: "smtp.example.test", SMTPPort: 587, SMTPFrom: "sbctl@example.test"}
+	f.cfg.Mail = config.Mail{SMTPHost: "smtp.example.test", SMTPPort: 587, SMTPFrom: "supavise@example.test"}
 	if rec := f.as("owner", "POST", "/platform/organizations/default/members/invitations", map[string]any{"emails": []string{"New@Example.Test"}, "role_id": members.RoleDeveloper}); rec.Code != 201 {
 		t.Fatalf("invite: %d %s", rec.Code, rec.Body)
 	}
@@ -825,9 +825,9 @@ func TestMemorySSOStore(t *testing.T) { testSSOStore(t, NewMemorySSOStore(), 1) 
 
 // TestPGSSOStore runs the same checks against a real database (CI provides one).
 func TestPGSSOStore(t *testing.T) {
-	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	r, err := registry.Open(ctx, dsn)
@@ -844,7 +844,7 @@ func TestPGSSOStore(t *testing.T) {
 	}
 	testSSOStore(t, NewPGSSOStore(r.Pool()), org.ID)
 	// Deleting the organization takes its providers and their users along.
-	if _, err := r.Pool().Exec(ctx, `delete from sbctl.organizations where id = $1`, org.ID); err != nil {
+	if _, err := r.Pool().Exec(ctx, `delete from supavise.organizations where id = $1`, org.ID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -984,9 +984,9 @@ func testSSOStore(t *testing.T, s SSOStore, org int64) {
 func TestMemorySignupGrants(t *testing.T) { testSignupGrants(t, NewMemoryClaimStore()) }
 
 func TestPGSignupGrants(t *testing.T) {
-	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	r, err := registry.Open(ctx, dsn)
@@ -1036,7 +1036,7 @@ func testSignupGrants(t *testing.T, s ClaimStore) {
 	}
 }
 
-// `sbctl users remove` takes a waiting person off the pending list.
+// `supavise users remove` takes a waiting person off the pending list.
 func TestSSOUserRemovalClearsThePendingList(t *testing.T) {
 	f := newSSOFixture(t)
 	id := f.addProvider(acmeIdP, "", "acme.test")
@@ -1486,7 +1486,7 @@ func TestSSODenyRefusesAUserWhoIsAMemberNow(t *testing.T) {
 	if rec := f.doAs(tok, "GET", "/platform/profile", nil); rec.Code != 403 {
 		t.Fatalf("pending: %d", rec.Code)
 	}
-	// Made a member by other means (`sbctl users role`) before the user's next request.
+	// Made a member by other means (`supavise users role`) before the user's next request.
 	f.addMember(ssoUser1, members.RoleDeveloper)
 	if rec := f.as("owner", "DELETE", orgSSO+"/pending/"+ssoUser1, nil); rec.Code != 409 {
 		t.Fatalf("deny a member: %d %s", rec.Code, rec.Body)
@@ -1637,7 +1637,7 @@ func TestSSODeniedUserWithADefaultRoleStaysOutAfterSigningInAgain(t *testing.T) 
 	}
 }
 
-// The same for removal with `sbctl users remove`, and the operator's `sso allow` lifts it.
+// The same for removal with `supavise users remove`, and the operator's `sso allow` lifts it.
 func TestSSORemovedUserWithADefaultRoleStaysOutAfterSigningInAgain(t *testing.T) {
 	f := newSSOFixture(t)
 	ctx := context.Background()
@@ -1706,7 +1706,7 @@ func TestSSOPendingUsersPersonalAccessTokenIsRefused(t *testing.T) {
 	}
 }
 
-// A provider removal that stops at GoTrue can be run again: sbctl's record is still there. A
+// A provider removal that stops at GoTrue can be run again: supavise's record is still there. A
 // provider that GoTrue has lost already is as good as removed.
 func TestSSORemovingAProviderThatGoTrueRefusedCanBeRetried(t *testing.T) {
 	f := newSSOFixture(t)
@@ -1720,7 +1720,7 @@ func TestSSORemovingAProviderThatGoTrueRefusedCanBeRetried(t *testing.T) {
 		t.Fatalf("removal while GoTrue fails: %d %s, want 502", rec.Code, rec.Body)
 	}
 	if _, err := f.srv.sso.Store.GetProvider(ctx, id); err != nil {
-		t.Fatalf("sbctl's record went with a removal that failed at GoTrue: %v", err)
+		t.Fatalf("supavise's record went with a removal that failed at GoTrue: %v", err)
 	}
 	if rec := f.as("owner", "DELETE", orgSSO+"/providers/"+id, nil); rec.Code != 200 {
 		t.Fatalf("retry: %d %s", rec.Code, rec.Body)

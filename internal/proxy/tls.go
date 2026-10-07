@@ -16,7 +16,7 @@ import (
 
 	"github.com/caddyserver/certmagic"
 
-	"github.com/OWNER/sbctl/internal/config"
+	"github.com/jsmillerdev/supavise/internal/config"
 )
 
 // TLS modes after resolving tls.mode against the rest of the configuration.
@@ -115,7 +115,7 @@ func newCertManager(o certOptions) (*certManager, error) {
 	tmpl := certmagic.ACMEIssuer{
 		CA:     cfg.TLS.CA,
 		Email:  cfg.TLS.Email,
-		Agreed: true, // running sbctl with TLS enabled accepts the CA's subscriber agreement
+		Agreed: true, // running supavise with TLS enabled accepts the CA's subscriber agreement
 		// Our own listeners are the challenge listeners; CertMagic must not bind :80 itself.
 		AltHTTPPort:    o.httpPort,
 		AltTLSALPNPort: o.httpsPort,
@@ -255,7 +255,7 @@ func (cm *certManager) close() {
 }
 
 // allowHost is the on-demand issuance gate: a certificate is only ever requested
-// for a host sbctl serves. In DNS-01 modes the derived project hosts are covered by
+// for a host supavise serves. In DNS-01 modes the derived project hosts are covered by
 // the wildcard and are refused here so a broken DNS setup cannot quietly burn
 // per-host HTTP-01 certificates against the CA's rate limits.
 func (s *Server) allowHost(_ context.Context, name string) error {

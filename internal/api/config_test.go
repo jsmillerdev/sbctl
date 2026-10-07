@@ -11,8 +11,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/OWNER/sbctl/internal/projectconfig"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 func bodyMap(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
@@ -641,7 +641,7 @@ func TestAuthSchemaCoversTheSpecs(t *testing.T) {
 	for _, f := range projectconfig.AuthSchema.Fields {
 		covered[f.Name] = true
 	}
-	// Settings the specs list that GoTrue's self-hosted build or sbctl does not take: reported
+	// Settings the specs list that GoTrue's self-hosted build or supavise does not take: reported
 	// only (see projectconfig's README).
 	reportOnly := map[string]bool{
 		"custom_oauth_max_providers": true, "nimbus_oauth_email_optional": true,

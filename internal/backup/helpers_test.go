@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OWNER/sbctl/internal/config"
-	"github.com/OWNER/sbctl/internal/registry"
-	"github.com/OWNER/sbctl/internal/secrets"
+	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 )
 
 const (
@@ -40,7 +40,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 	cfg := config.Default()
 	cfg.StateDir = filepath.Join(root, "state")
-	cfg.BinPath = "/usr/local/bin/sbctl"
+	cfg.BinPath = "/usr/local/bin/supavise"
 	cfg.Backup.WALRelay = "off" // relay_test.go covers the relay forms
 	sec, err := secrets.New(make([]byte, 32))
 	if err != nil {

@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// PGStore is the Store over the registry's pool (table sbctl.project_settings, migration
+// PGStore is the Store over the registry's pool (table supavise.project_settings, migration
 // 0800_project_settings.sql).
 type PGStore struct{ pool *pgxpool.Pool }
 
@@ -26,7 +26,7 @@ func (s *PGStore) Get(ctx context.Context, ref string, svc Service) (*Record, er
 		values, sealed []byte
 		rec            = &Record{Ref: ref, Service: svc, Values: map[string]any{}, Sealed: map[string][]byte{}}
 	)
-	err := s.pool.QueryRow(ctx, `select version, "values", sealed, updated_at from sbctl.project_settings where ref = $1 and service = $2`,
+	err := s.pool.QueryRow(ctx, `select version, "values", sealed, updated_at from supavise.project_settings where ref = $1 and service = $2`,
 		ref, string(svc)).Scan(&version, &values, &sealed, &rec.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return rec, nil
@@ -68,7 +68,7 @@ func (s *PGStore) Put(ctx context.Context, rec *Record, expected int64) (*Record
 	out.Values, out.Sealed = rec.Values, rec.Sealed
 	if expected == 0 {
 		err = s.pool.QueryRow(ctx, `
-			insert into sbctl.project_settings (ref, service, version, "values", sealed)
+			insert into supavise.project_settings (ref, service, version, "values", sealed)
 			values ($1, $2, 1, $3, $4)
 			returning version, updated_at`, rec.Ref, string(rec.Service), values, sealed).Scan(&out.Version, &out.UpdatedAt)
 		var pe *pgconn.PgError
@@ -84,7 +84,7 @@ func (s *PGStore) Put(ctx context.Context, rec *Record, expected int64) (*Record
 		return &out, nil
 	}
 	err = s.pool.QueryRow(ctx, `
-		update sbctl.project_settings
+		update supavise.project_settings
 		   set version = version + 1, "values" = $3, sealed = $4, updated_at = now()
 		 where ref = $1 and service = $2 and version = $5
 		returning version, updated_at`, rec.Ref, string(rec.Service), values, sealed, expected).Scan(&out.Version, &out.UpdatedAt)

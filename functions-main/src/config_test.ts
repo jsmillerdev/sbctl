@@ -1,13 +1,13 @@
 import { assertEquals, assertStringIncludes, assertThrows } from 'jsr:@std/assert@1'
 import { loadConfig, NO_PROXY_TOKEN_ENV } from './config.ts'
 
-// The defaults of everything but the secret, which has none: sbctl always passes one.
+// The defaults of everything but the secret, which has none: supavise always passes one.
 const withToken = (vars: Record<string, string> = {}) => (n: string) =>
-  ({ SBCTL_FUNCTIONS_PROXY_TOKEN: 'secret', ...vars })[n]
+  ({ SUPAVISE_FUNCTIONS_PROXY_TOKEN: 'secret', ...vars })[n]
 
 Deno.test('loadConfig applies the defaults', () => {
   const c = loadConfig(withToken())
-  assertEquals(c.root, '/var/lib/sbctl/system/edge-runtime/tenants')
+  assertEquals(c.root, '/var/lib/supavise/system/edge-runtime/tenants')
   assertEquals(c.proxyToken, 'secret')
   assertEquals(c.limits, {
     memoryLimitMb: 256,
@@ -26,19 +26,19 @@ Deno.test('loadConfig applies the defaults', () => {
 
 Deno.test('loadConfig reads the variables the unit passes', () => {
   const vars: Record<string, string> = {
-    SBCTL_FUNCTIONS_ROOT: '/x/tenants/',
-    SBCTL_FUNCTIONS_MEMORY_MB: '64',
-    SBCTL_FUNCTIONS_WALL_CLOCK_SEC: '10',
-    SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC: '5',
-    SBCTL_FUNCTIONS_WORKER_IDLE_SEC: '2',
-    SBCTL_FUNCTIONS_MAX_PER_PROJECT: '0',
-    SBCTL_FUNCTIONS_MAX_WORKERS: '6',
-    SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT: '3',
-    SBCTL_FUNCTIONS_MAX_BUNDLE_MB: '10',
-    SBCTL_FUNCTIONS_PROXY_TOKEN: ' tok\n',
-    SBCTL_FUNCTIONS_CPU_SOFT_MS: '0',
-    SBCTL_FUNCTIONS_CPU_HARD_MS: '',
-    SBCTL_FUNCTIONS_TMP_QUOTA_MB: '5',
+    SUPAVISE_FUNCTIONS_ROOT: '/x/tenants/',
+    SUPAVISE_FUNCTIONS_MEMORY_MB: '64',
+    SUPAVISE_FUNCTIONS_WALL_CLOCK_SEC: '10',
+    SUPAVISE_FUNCTIONS_IDLE_TIMEOUT_SEC: '5',
+    SUPAVISE_FUNCTIONS_WORKER_IDLE_SEC: '2',
+    SUPAVISE_FUNCTIONS_MAX_PER_PROJECT: '0',
+    SUPAVISE_FUNCTIONS_MAX_WORKERS: '6',
+    SUPAVISE_FUNCTIONS_MAX_WORKERS_PER_PROJECT: '3',
+    SUPAVISE_FUNCTIONS_MAX_BUNDLE_MB: '10',
+    SUPAVISE_FUNCTIONS_PROXY_TOKEN: ' tok\n',
+    SUPAVISE_FUNCTIONS_CPU_SOFT_MS: '0',
+    SUPAVISE_FUNCTIONS_CPU_HARD_MS: '',
+    SUPAVISE_FUNCTIONS_TMP_QUOTA_MB: '5',
   }
   const c = loadConfig((n) => vars[n])
   assertEquals(c.root, '/x/tenants')
@@ -55,12 +55,15 @@ Deno.test('loadConfig reads the variables the unit passes', () => {
   assertEquals(c.limits.cpuTimeHardLimitMs, 2000)
   assertEquals(c.limits.tmpQuotaBytes, 5 * 1024 * 1024)
   // 0 switches the quota off.
-  assertEquals(loadConfig(withToken({ SBCTL_FUNCTIONS_TMP_QUOTA_MB: '0' })).limits.tmpQuotaBytes, 0)
+  assertEquals(
+    loadConfig(withToken({ SUPAVISE_FUNCTIONS_TMP_QUOTA_MB: '0' })).limits.tmpQuotaBytes,
+    0,
+  )
 })
 
 Deno.test('loadConfig rejects nonsense', () => {
-  assertThrows(() => loadConfig(withToken({ SBCTL_FUNCTIONS_MEMORY_MB: 'lots' })))
-  assertThrows(() => loadConfig(withToken({ SBCTL_FUNCTIONS_MEMORY_MB: '-1' })))
+  assertThrows(() => loadConfig(withToken({ SUPAVISE_FUNCTIONS_MEMORY_MB: 'lots' })))
+  assertThrows(() => loadConfig(withToken({ SUPAVISE_FUNCTIONS_MEMORY_MB: '-1' })))
 })
 
 Deno.test('loadConfig refuses to start without the proxy secret unless a dev flag says so', () => {
@@ -68,9 +71,9 @@ Deno.test('loadConfig refuses to start without the proxy secret unless a dev fla
   // can reach its port, and a function worker can.
   for (const token of [undefined, '', '  \n']) {
     const err = assertThrows(
-      () => loadConfig((n) => (n === 'SBCTL_FUNCTIONS_PROXY_TOKEN' ? token : undefined)),
+      () => loadConfig((n) => (n === 'SUPAVISE_FUNCTIONS_PROXY_TOKEN' ? token : undefined)),
       Error,
-      'SBCTL_FUNCTIONS_PROXY_TOKEN is empty',
+      'SUPAVISE_FUNCTIONS_PROXY_TOKEN is empty',
     )
     assertStringIncludes(err.message, NO_PROXY_TOKEN_ENV)
   }
@@ -82,7 +85,7 @@ Deno.test('loadConfig refuses to start without the proxy secret unless a dev fla
   assertEquals(dev.proxyToken, '')
   // A secret and the flag together: the secret still counts.
   assertEquals(
-    loadConfig((n) => ({ SBCTL_FUNCTIONS_PROXY_TOKEN: 'tok', [NO_PROXY_TOKEN_ENV]: '1' })[n])
+    loadConfig((n) => ({ SUPAVISE_FUNCTIONS_PROXY_TOKEN: 'tok', [NO_PROXY_TOKEN_ENV]: '1' })[n])
       .proxyToken,
     'tok',
   )

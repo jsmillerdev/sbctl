@@ -1,4 +1,4 @@
-// sbctl's main service for the Edge Runtime: the one script every request enters.
+// supavise's main service for the Edge Runtime: the one script every request enters.
 // It serves all projects of a node; see README.md.
 
 import { loadConfig } from './src/config.ts'
@@ -15,5 +15,5 @@ const handler = makeHandler({
   proxyToken: config.proxyToken,
 })
 
-console.log(`sbctl functions main service started (functions in ${config.root})`)
+console.log(`supavise functions main service started (functions in ${config.root})`)
 Deno.serve(handler)

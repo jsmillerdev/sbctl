@@ -5,25 +5,25 @@ Read `DESIGN.md` first; it is the contract. `research/` is evidence, not instruc
 ## 0. Repo state and first actions
 
 - This directory is **not its own git repository** (the enclosing repo root is the home directory). First action in a fresh session: `git init` here, commit `DESIGN.md`, `HANDOFF.md`, `research/`, then create the skeleton in section 2.
-- Language: **Go** (single static binary, `CGO_ENABLED=0`). Module path placeholder `github.com/OWNER/sbctl` until the product is named. The name must not contain "Supabase".
+- Language: **Go** (single static binary, `CGO_ENABLED=0`). Module path placeholder `github.com/jsmillerdev/supavise` until the product is named. The name must not contain "Supabase".
 - License: **Apache-2.0** for everything we write. Studio patches carry upstream's Apache-2.0.
-- Target OS for v1: Ubuntu 24.04, Debian 12 (Ubuntu 22.04 is out: its polkit 0.105 ignores the JavaScript rule that lets sbctl manage units), amd64 and arm64. glibc 2.35 floor comes from the artifacts.
+- Target OS for v1: Ubuntu 24.04, Debian 12 (Ubuntu 22.04 is out: its polkit 0.105 ignores the JavaScript rule that lets Supavise manage units), amd64 and arm64. glibc 2.35 floor comes from the artifacts.
 - Do not vendor or copy code from `kmhari/supastack` (AGPL). Reading it for evidence is fine.
 
 ## 1. Shared conventions (every workstream obeys these)
 
 | Thing | Convention |
 |---|---|
-| Binary and service user | `sbctl`, runs as system user `sbctl`; Postgres units run as `sbctl` too (artifacts are relocatable, no root needed after install) |
-| Config | `/etc/sbctl/config.toml`; env `SBCTL_*` overrides; secrets key at `/etc/sbctl/master.key` (0600) |
-| State root | `/var/lib/sbctl/` with `artifacts/<service>/<version>/`, `projects/<ref>/{postgres,gotrue,postgrest}/`, `system/`, `certs/`, `backups/` (local backend) |
+| Binary and service user | `supavise`, runs as system user `supavise`; Postgres units run as `supavise` too (artifacts are relocatable, no root needed after install) |
+| Config | `/etc/supavise/config.toml`; env `SUPAVISE_*` overrides; secrets key at `/etc/supavise/master.key` (0600) |
+| State root | `/var/lib/supavise/` with `artifacts/<service>/<version>/`, `projects/<ref>/{postgres,gotrue,postgrest}/`, `system/`, `certs/`, `backups/` (local backend) |
 | Logs | journald only; unit names are the log selector |
-| systemd units | templates `sb-postgres@.service`, `sb-gotrue@.service`, `sb-postgrest@.service`; singletons `sb-supavisor`, `sb-realtime`, `sb-storage`, `sb-pgmeta`, `sb-studio`, optional `sb-imgproxy`, `sb-edge-runtime`; all in slice `sbctl.slice`; per-project `MemoryMax` and `CPUQuota` from the project record; env files at `/var/lib/sbctl/projects/<ref>/<svc>.env` (0600) |
+| systemd units | templates `supavise-postgres@.service`, `supavise-gotrue@.service`, `supavise-postgrest@.service`; singletons `supavise-supavisor`, `supavise-realtime`, `supavise-storage`, `supavise-pgmeta`, `supavise-studio`, optional `supavise-imgproxy`, `supavise-edge-runtime`; all in slice `supavise.slice`; per-project `MemoryMax` and `CPUQuota` from the project record; env files at `/var/lib/supavise/projects/<ref>/<svc>.env` (0600) |
 | Ref | 20 lowercase ASCII letters, `system` reserved |
-| Ports | loopback only for project services. Postgres `20000 + 3n`, GoTrue `20001 + 3n`, PostgREST `20002 + 3n` where `n` is the project's registry sequence. Fleet: Supavisor 5432 (session) and 6543 (transaction) public; Realtime 4000, Storage 5000 and admin 5001, pgmeta 8080, Studio 3000, system Postgres 5433, system GoTrue 9999, imgproxy 5002, edge-runtime 9000, all loopback. `sbctl` 80 and 443 public, 7000 loopback admin |
+| Ports | loopback only for project services. Postgres `20000 + 3n`, GoTrue `20001 + 3n`, PostgREST `20002 + 3n` where `n` is the project's registry sequence. Fleet: Supavisor 5432 (session) and 6543 (transaction) public; Realtime 4000, Storage 5000 and admin 5001, pgmeta 8080, Studio 3000, system Postgres 5433, system GoTrue 9999, imgproxy 5002, edge-runtime 9000, all loopback. `supavise` 80 and 443 public, 7000 loopback admin |
 | Hostnames | project API `<ref>.api.<domain>`; dashboard `studio.<domain>`; API server `api.<domain>`; pooler `pooler.<domain>`; Realtime internal host `<ref>.realtime.internal`; Storage tenant via `x-forwarded-host: <ref>.api.<domain>` |
 | Keys | per project: HS256 JWT secret (40 bytes), legacy `anon` and `service_role` JWTs, `sb_publishable_<base58>` and `sb_secret_<base58>` opaque keys mapped to the legacy JWTs by the proxy; PATs `sbp_` + 40 lowercase hex |
-| Registry schema | Postgres database `sbctl` in the system cluster, schema `sbctl`: `organizations`, `projects` (ref, org_id, seq, engine, class, status, versions jsonb, limits jsonb, created_at), `project_secrets` (encrypted blobs), `access_tokens`, `routes`, `backups`, `events`. Migrations embedded in the binary |
+| Registry schema | Postgres database `supavise` in the system cluster, schema `supavise`: `organizations`, `projects` (ref, org_id, seq, engine, class, status, versions jsonb, limits jsonb, created_at), `project_secrets` (encrypted blobs), `access_tokens`, `routes`, `backups`, `events`. Migrations embedded in the binary |
 | Versions | `versions.yaml` at repo root: `artifacts.<service>: <slim-services release tag>`, `studio.tag`, `cli.version_tested`. Agents fetch current tags from `github.com/supabase/slim-services/releases`; never guess |
 | API types | generated from `https://api.supabase.com/api/v1-json`, `v2-json`, `platform-json` into `internal/api/gen/`; never hand-write response structs |
 | Internal interfaces | `DataPlane` (`Create`, `Delete`, `Snapshot`, `Route`, `Usage`), `Fleet` (`EnsureTenant`, `RemoveTenant` per service), `Supervisor` (`Render`, `Start`, `Stop`, `Status`), `Secrets` (`Seal`, `Open`), `Backup` (`PushWAL`, `FetchWAL`, `BaseBackup`, `Restore`) |
@@ -33,12 +33,12 @@ Read `DESIGN.md` first; it is the contract. `research/` is evidence, not instruc
 ## 2. Repo skeleton to create first
 
 ```
-cmd/sbctl/main.go
+cmd/supavise/main.go
 internal/{api,proxy,units,lifecycle,backup,artifacts,fleet,registry,secrets,config}/
 internal/api/gen/            # generated from the three OpenAPI specs
 studio/{patches/,build.sh,Dockerfile.build}   # build only; the output is a tar.zst artifact
 functions-main/              # Deno main service for edge-runtime (workstream J, v1)
-deploy/{install.sh,systemd/,cloudformation/sbctl.yaml}
+deploy/{install.sh,systemd/,cloudformation/supavise.yaml}
 tests/conformance/
 versions.yaml
 ```
@@ -55,8 +55,8 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 
 ### B. Management API server
 - Generate types from the three specs. Implement the P0 subset in `DESIGN.md` section 6 over the registry. Stub everything else with empty 200/204 and log unknown routes at debug.
-- Auth: GoTrue JWT from `sb-gotrue@system` on `/platform/*`; `sbp_` PATs on `/v1/*`; device-code login endpoints for `supabase login`.
-- `pg-meta/{ref}/query` proxies to `sb-pgmeta` with `x-connection-encrypted` built from the project's connection string.
+- Auth: GoTrue JWT from `supavise-gotrue@system` on `/platform/*`; `sbp_` PATs on `/v1/*`; device-code login endpoints for `supabase login`.
+- `pg-meta/{ref}/query` proxies to `supavise-pgmeta` with `x-connection-encrypted` built from the project's connection string.
 - Verify with the real `supabase` CLI (`--profile`) for `projects list`, `link`, `db push`, `gen types`, `functions deploy`, and the MCP server (`--api-url`) for `list_tables` and `execute_sql`. CLI decodes strictly; a missing required field is a test failure.
 
 ### C. Proxy and TLS
@@ -78,16 +78,16 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 - Verify with supabase-js: realtime broadcast and postgres_changes, storage upload and signed URL, pooler connect as `postgres.<ref>` in both modes.
 
 ### F. Backups
-- `sbctl wal push <path>` and `sbctl wal fetch <name> <dest>` for `archive_command` and `restore_command`, backends `file://` and `s3://` (AWS SDK v2, works with any S3-compatible endpoint).
+- `supavise wal push <path>` and `supavise wal fetch <name> <dest>` for `archive_command` and `restore_command`, backends `file://` and `s3://` (AWS SDK v2, works with any S3-compatible endpoint).
 - Nightly `pg_basebackup` per project via a systemd timer; retention policy in config.
-- `sbctl backups restore <ref> --to <timestamp> [--as <newref>]` builds a new project from base plus WAL.
+- `supavise backups restore <ref> --to <timestamp> [--as <newref>]` builds a new project from base plus WAL.
 - Test: write, back up, destroy, restore to a point before the destroy, assert row.
 
 ### G. Installer and AWS
 - `deploy/install.sh`: OS and glibc check, user, checksum-verified download, config, units, firewall (80, 443, 5432, 6543), start, print URL and claim token. Idempotent.
-- Claim flow in `sbctl`: first admin created only with the token printed at install.
-- `deploy/cloudformation/sbctl.yaml`: one Ubuntu 24.04 instance, instance role with Route 53 change rights scoped to the hosted zone and S3 rights scoped to the bucket, security group, S3 bucket, Secrets Manager secret for the claim token, user data calling `install.sh`, `cfn-signal`, outputs. Quick-create link in the README.
-- `sbctl self-update` with signature check.
+- Claim flow in `supavise`: first admin created only with the token printed at install.
+- `deploy/cloudformation/supavise.yaml`: one Ubuntu 24.04 instance, instance role with Route 53 change rights scoped to the hosted zone and S3 rights scoped to the bucket, security group, S3 bucket, Secrets Manager secret for the claim token, user data calling `install.sh`, `cfn-signal`, outputs. Quick-create link in the README.
+- `supavise self-update` with signature check.
 
 ### H. Conformance suite
 - `tests/conformance/`: given a running node, create two projects and run the upstream `supabase-js` test suites for auth, postgrest, realtime, storage against each, plus Playwright smoke on Studio (sign in, switch project, table editor, SQL editor). Nightly and on every `versions.yaml` bump.
@@ -101,10 +101,10 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 - Verify with the Supabase MCP server's branch tools and `supabase branches create|list|delete`; CI measures clone time and disk for a 1 GB parent on XFS and ext4.
 
 ### J. Edge Functions (v1; starts when a build lane frees up)
-- Tenant-aware main service in `functions-main/` (Deno, runs inside the `edge-runtime` artifact): routes each request by the proxy's `X-Sbctl-Project-Ref` header to that project's functions directory, verifies the JWT with that project's secret unless the function opts out, injects the project's secrets and `SUPABASE_URL`/keys as env, and isolates workers per project.
-- `sb-edge-runtime` unit (fleet singleton, loopback 9000), `/functions/v1` route enabled in the proxy, the stored deployments from `/v1/projects/{ref}/functions*` (workstream B) materialized into `/var/lib/sbctl/projects/<ref>/functions/`, secrets endpoints wired.
+- Tenant-aware main service in `functions-main/` (Deno, runs inside the `edge-runtime` artifact): routes each request by the proxy's `X-Supavise-Project-Ref` header to that project's functions directory, verifies the JWT with that project's secret unless the function opts out, injects the project's secrets and `SUPABASE_URL`/keys as env, and isolates workers per project.
+- `supavise-edge-runtime` unit (fleet singleton, loopback 9000), `/functions/v1` route enabled in the proxy, the stored deployments from `/v1/projects/{ref}/functions*` (workstream B) materialized into `/var/lib/supavise/projects/<ref>/functions/`, secrets endpoints wired.
 - Verify with `supabase functions deploy` and `supabase.functions.invoke` from supabase-js, JWT on and off, per-project secrets, two projects with same-named functions, and a function calling its project's database.
-- Decided in implementation: only bundles (eszip) are served, because a source function's module loader can follow relative imports into other projects' files in the shared tenants tree. Uploads of sources (`--use-api`, the CLI when Docker is not running, Studio's editor) are bundled by the node in the sandbox of the one-shot `sb-edge-bundle@<ref>.service` (under a dynamic uid of its own, since a mount namespace does not stop a same-uid process from opening `/proc/<pid>/root` of another unit; the daemon hands it read-only sources and two output files) and stored with their bundle (the node refuses them with 501 only where it cannot confine the bundler: the exec backend, unless `[functions] bundle_unsandboxed`). One `DENO_DIR` for the runtime (the runtime reads it once; workers run from eszips, which need no per-project cache). The tree lives in `system/edge-runtime/tenants/<ref>/` (the unit's own state directory), not `projects/<ref>/functions/`. edge-runtime's `--max-parallelism` is a semaphore per function, not a limit on the runtime, so the worker budget (`[functions] max_workers`, at most `max_workers_per_project` of one project, `max_per_project` requests in flight) is enforced by the main service (a request counts until its response body has ended, so streams hold their place) and the unit's `MemoryMax` is derived from it; each worker's `/tmp` has a quota (`tmp_quota_mb`). The runtime port is reachable from the workers, so the main service serves only callers that carry the node's proxy secret (`X-Sbctl-Proxy-Token`).
+- Decided in implementation: only bundles (eszip) are served, because a source function's module loader can follow relative imports into other projects' files in the shared tenants tree. Uploads of sources (`--use-api`, the CLI when Docker is not running, Studio's editor) are bundled by the node in the sandbox of the one-shot `supavise-edge-bundle@<ref>.service` (under a dynamic uid of its own, since a mount namespace does not stop a same-uid process from opening `/proc/<pid>/root` of another unit; the daemon hands it read-only sources and two output files) and stored with their bundle (the node refuses them with 501 only where it cannot confine the bundler: the exec backend, unless `[functions] bundle_unsandboxed`). One `DENO_DIR` for the runtime (the runtime reads it once; workers run from eszips, which need no per-project cache). The tree lives in `system/edge-runtime/tenants/<ref>/` (the unit's own state directory), not `projects/<ref>/functions/`. edge-runtime's `--max-parallelism` is a semaphore per function, not a limit on the runtime, so the worker budget (`[functions] max_workers`, at most `max_workers_per_project` of one project, `max_per_project` requests in flight) is enforced by the main service (a request counts until its response body has ended, so streams hold their place) and the unit's `MemoryMax` is derived from it; each worker's `/tmp` has a quota (`tmp_quota_mb`). The runtime port is reachable from the workers, so the main service serves only callers that carry the node's proxy secret (`X-Supavise-Proxy-Token`).
 
 ### K. Dashboard writes: settings, keys, password, storage actions, members and roles (v1)
 - Every settings save that Studio, the CLI and the Management API make becomes real: Auth (`PATCH /v1/projects/{ref}/config/auth` and the `/platform` twins: site URL, redirect allow list, external OAuth providers, SMTP, email templates, rate limits, MFA, captcha, auth hooks, JWT expiry), PostgREST (exposed schemas, extra search path, max rows, pool), Realtime, Storage (upload size limit, features) and Postgres settings (`/v1/projects/{ref}/config/database/postgres`). Settings persist in the registry per project (migration range 0800-0899), are validated against the specs, re-render the unit env, and restart only the affected unit; reads return what was saved.
@@ -113,14 +113,14 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 - Storage dashboard actions currently stubbed: public URL, sign multiple, list v2 and any other Storage route Studio's storage explorer calls (research/08).
 - Verify each save end to end: change it in Studio or with the CLI, then observe the behavior change in the running service (e.g. a new redirect URL accepted by GoTrue, a new exposed schema served by PostgREST, a larger upload accepted by Storage).
 
-- Members and roles, matching hosted: organization roles Owner, Administrator, Developer and Read-only, plus project-scoped assignments, with exactly the role and permission shapes of the specs (`/platform/organizations/{slug}/members*`, `/roles`, `/members/invitations*`, `/platform/profile/permissions`). Invitations by email (sent through the system GoTrue's SMTP when configured, otherwise an invite link shown to the admin and printed by `sbctl users invite`). Permissions are enforced by the API server on every `/platform` and `/v1` route, not only hidden in Studio; PATs carry their user's permissions; the claimed first user is Owner, existing users migrate to Owner; an organization always keeps at least one Owner. SSO (workstream L) assigns a configurable default role per email domain.
+- Members and roles, matching hosted: organization roles Owner, Administrator, Developer and Read-only, plus project-scoped assignments, with exactly the role and permission shapes of the specs (`/platform/organizations/{slug}/members*`, `/roles`, `/members/invitations*`, `/platform/profile/permissions`). Invitations by email (sent through the system GoTrue's SMTP when configured, otherwise an invite link shown to the admin and printed by `supavise users invite`). Permissions are enforced by the API server on every `/platform` and `/v1` route, not only hidden in Studio; PATs carry their user's permissions; the claimed first user is Owner, existing users migrate to Owner; an organization always keeps at least one Owner. SSO (workstream L) assigns a configurable default role per email domain.
 - Run as two builders, settings first, then roles; L starts after the roles part because it assigns roles.
 
 ### L. SSO (v1)
-- Dashboard SSO: SAML 2.0 identity providers (Okta, Entra ID, Google Workspace) on `sb-gotrue@system`, managed with `sbctl sso add|list|remove` and an admin API; Studio's "Continue with SSO" enabled only when a provider exists (patch 0002 flag, no new patch). Access is limited to the email domains mapped to a provider; first SSO sign-in creates the dashboard user as a team member (v1 has no roles beyond that). Optional Google/GitHub/Azure OAuth sign-in for the dashboard behind the same allowlist.
+- Dashboard SSO: SAML 2.0 identity providers (Okta, Entra ID, Google Workspace) on `supavise-gotrue@system`, managed with `supavise sso add|list|remove` and an admin API; Studio's "Continue with SSO" enabled only when a provider exists (patch 0002 flag, no new patch). Access is limited to the email domains mapped to a provider; first SSO sign-in creates the dashboard user as a team member (v1 has no roles beyond that). Optional Google/GitHub/Azure OAuth sign-in for the dashboard behind the same allowlist.
 - Project SSO: `/v1/projects/{ref}/config/auth/sso/providers*` (create, list, get, update, delete) proxied to the project's GoTrue admin SSO API, SAML enabled per project with its own signing key (sealed secret); `supabase sso add|list|update|remove` works unchanged.
 - Verify in CI against a real SAML IdP in a container (e.g. SimpleSAMLphp or Keycloak): dashboard sign-in through the IdP, a disallowed domain refused, and a project's end user signing in through SAML.
-- Decided in implementation: GoTrue's own sign-up switch also refuses the first sign-in of an SSO user, so `sb-gotrue@system` runs with sign-up on and an HTTP before-user-created hook that the daemon answers (registered SSO providers and one-time grants for invited addresses only; fails closed). SSO users carry no `sbctl_admin` claim: they are admitted by `DashboardSSO.Admit` (registered provider, a membership; the first request applies the default role of the email's domain when the signing-in provider vouches for it, anyone else waits for approval and is refused on every route). Owners and Administrators manage providers (an Administrator cannot hand out a role they cannot grant). Studio's button is `NEXT_PUBLIC_DISABLED_FEATURES` rendered by the fleet; adding the first provider or removing the last re-renders Studio's unit. Project SAML is the `saml_enabled` Auth setting (404 on the SSO routes until it is on, as hosted), with a per-project sealed signing key. Dashboard OAuth (Google, GitHub, Azure) is not built. See `internal/api/README.md`, "Single sign-on".
+- Decided in implementation: GoTrue's own sign-up switch also refuses the first sign-in of an SSO user, so `supavise-gotrue@system` runs with sign-up on and an HTTP before-user-created hook that the daemon answers (registered SSO providers and one-time grants for invited addresses only; fails closed). SSO users carry no `supavise_admin` claim: they are admitted by `DashboardSSO.Admit` (registered provider, a membership; the first request applies the default role of the email's domain when the signing-in provider vouches for it, anyone else waits for approval and is refused on every route). Owners and Administrators manage providers (an Administrator cannot hand out a role they cannot grant). Studio's button is `NEXT_PUBLIC_DISABLED_FEATURES` rendered by the fleet; adding the first provider or removing the last re-renders Studio's unit. Project SAML is the `saml_enabled` Auth setting (404 on the SSO routes until it is on, as hosted), with a per-project sealed signing key. Dashboard OAuth (Google, GitHub, Azure) is not built. See `internal/api/README.md`, "Single sign-on".
 
 ### Phase 2 workstreams (start once A to H are green)
 - Idle sleep in C and D.
@@ -145,3 +145,5 @@ A, B, C, D, F can start simultaneously. E needs D's system cluster. G needs a wo
 ## 5. What a fresh session must not re-decide
 
 Cluster per project. Native artifacts, no Docker. Proxy inside the binary, no Envoy. Supavisor as the only Postgres entry point. WAL archiving via the binary, no wal-g. Wildcard DNS required. Studio platform build with exactly the three patches. Management API types generated from the specs. Apache-2.0. Name without "Supabase". Everything else in `DESIGN.md` section 10 was cut deliberately; do not reintroduce it without a written reason in that table.
+
+Supavise is not affiliated with or endorsed by Supabase Inc.

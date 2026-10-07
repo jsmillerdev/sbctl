@@ -75,7 +75,7 @@ func TestRelayPushAndFetchRoundTrip(t *testing.T) {
 	if err := RelayPush(ctx, re.sock(testRef), testRef, src); err != nil {
 		t.Fatal(err)
 	}
-	// Durable in the backend when push returned: the same object `sbctl wal push` writes.
+	// Durable in the backend when push returned: the same object `supavise wal push` writes.
 	if _, err := re.store.Stat(ctx, walKey(testRef, walA)); err != nil {
 		t.Fatalf("pushed file is not in the backend: %v", err)
 	}
@@ -403,8 +403,8 @@ func TestRelayCancelledAndTruncatedPushesDoNotRaceTheBody(t *testing.T) {
 func TestRelayCommandsCarrySocketAndNoConfig(t *testing.T) {
 	e := newTestEnv(t)
 	e.cfg.Backup.WALRelay = "on"
-	got := ArchiveCommandFor(e.cfg, testRef, "/etc/sbctl/other.toml")
-	want := "/usr/local/bin/sbctl wal push --ref " + testRef + " --socket " + e.cfg.Paths().WALSocket(testRef) + " %p"
+	got := ArchiveCommandFor(e.cfg, testRef, "/etc/supavise/other.toml")
+	want := "/usr/local/bin/supavise wal push --ref " + testRef + " --socket " + e.cfg.Paths().WALSocket(testRef) + " %p"
 	if got != want {
 		t.Fatalf("archive_command = %q\nwant %q", got, want)
 	}
@@ -412,12 +412,12 @@ func TestRelayCommandsCarrySocketAndNoConfig(t *testing.T) {
 		t.Fatal("the relay form must not name a config file: the unit cannot read it")
 	}
 	rc := RestoreCommandFor(e.cfg, testRef2, testRef, "")
-	wantRC := "/usr/local/bin/sbctl wal fetch --ref " + testRef2 + " --socket " + e.cfg.Paths().WALSocket(testRef) + " %f %p"
+	wantRC := "/usr/local/bin/supavise wal fetch --ref " + testRef2 + " --socket " + e.cfg.Paths().WALSocket(testRef) + " %f %p"
 	if rc != wantRC {
 		t.Fatalf("restore_command = %q\nwant %q", rc, wantRC)
 	}
 	e.cfg.Backup.WALRelay = "off"
-	if got := ArchiveCommandFor(e.cfg, testRef, "/etc/sbctl/other.toml"); !strings.Contains(got, "--config /etc/sbctl/other.toml") || strings.Contains(got, "--socket") {
+	if got := ArchiveCommandFor(e.cfg, testRef, "/etc/supavise/other.toml"); !strings.Contains(got, "--config /etc/supavise/other.toml") || strings.Contains(got, "--socket") {
 		t.Fatalf("direct form = %q", got)
 	}
 }

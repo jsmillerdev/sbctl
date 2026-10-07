@@ -1,5 +1,5 @@
 From 32a7ba472608434bc18907353aa828717e2781ed Mon Sep 17 00:00:00 2001
-From: sbctl <sbctl@users.noreply.invalid>
+From: supavise <supavise@users.noreply.invalid>
 Date: Tue, 6 Oct 2026 11:25:09 -0700
 Subject: [PATCH 2/3] feat(common): allow disabling feature flags through
  NEXT_PUBLIC_DISABLED_FEATURES

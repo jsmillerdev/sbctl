@@ -3,15 +3,15 @@
 #
 #   deploy/release-assets.sh DIST_DIR PRIVATE_KEY.pem PUBLIC_KEY.pem
 #
-# DIST_DIR holds sbctl-linux-amd64, sbctl-linux-arm64 and any sbctl-studio-*-linux-*.tar.zst.
+# DIST_DIR holds supavise-linux-amd64, supavise-linux-arm64 and any supavise-studio-*-linux-*.tar.zst.
 # The script writes into DIST_DIR:
 #   SHA256SUMS       sha256sum of every file above
-#   SHA256SUMS.sig   raw ed25519 signature of SHA256SUMS (what install.sh and `sbctl self-update` verify)
+#   SHA256SUMS.sig   raw ed25519 signature of SHA256SUMS (what install.sh and `supavise self-update` verify)
 #   install.sh       deploy/install.sh with the public key stamped in
-#   sbctl.yaml       the CloudFormation template; with SBCTL_RELEASE_TAG set (v1.2.3), its
-#                    SbctlVersion default names that tag instead of "latest", so the template
+#   supavise.yaml       the CloudFormation template; with SUPAVISE_RELEASE_TAG set (v1.2.3), its
+#                    SupaviseVersion default names that tag instead of "latest", so the template
 #                    of a release installs that release
-#   sbctl-aws-deploy.sh  deploy/aws/deploy.sh, the one-command deploy for people with the AWS CLI
+#   supavise-aws-deploy.sh  deploy/aws/deploy.sh, the one-command deploy for people with the AWS CLI
 # It refuses when the private key is not the one the public key names, and it verifies its own
 # signature before it returns. The release workflow runs it with the repository secret; the
 # install-e2e job runs it with a throwaway key so that the same code is tested.
@@ -29,11 +29,11 @@ openssl pkey -pubin -in "$pub" -noout 2>/dev/null || { echo "$pub is not a PEM p
   || { echo "the signing key does not belong to the public key $pub" >&2; exit 1; }
 
 cd "$dist"
-for f in sbctl-linux-amd64 sbctl-linux-arm64; do
+for f in supavise-linux-amd64 supavise-linux-arm64; do
   [[ -s $f ]] || { echo "missing $f in $dist" >&2; exit 1; }
 done
-files=(sbctl-linux-amd64 sbctl-linux-arm64)
-for f in sbctl-studio-*-linux-*.tar.zst; do [[ -e $f ]] && files+=("$f"); done
+files=(supavise-linux-amd64 supavise-linux-arm64)
+for f in supavise-studio-*-linux-*.tar.zst; do [[ -e $f ]] && files+=("$f"); done
 sha256sum "${files[@]}" >SHA256SUMS
 openssl pkeyutl -sign -rawin -inkey "$priv" -in SHA256SUMS -out SHA256SUMS.sig
 [[ $(wc -c <SHA256SUMS.sig | tr -d ' ') -eq 64 ]] || { echo "unexpected signature size" >&2; exit 1; }
@@ -41,17 +41,17 @@ openssl pkeyutl -verify -rawin -pubin -inkey "$pub" -sigfile SHA256SUMS.sig -in 
   || { echo "the new signature does not verify" >&2; exit 1; }
 
 b64=$(base64 <"$pub" | tr -d '\n')
-sed "s|__SBCTL_RELEASE_PUBKEY_B64__|$b64|" "$here/install.sh" >install.sh
+sed "s|__SUPAVISE_RELEASE_PUBKEY_B64__|$b64|" "$here/install.sh" >install.sh
 chmod 0755 install.sh
-if grep -q '__SBCTL_RELEASE_PUBKEY_B64__' install.sh; then echo "the key marker is still in install.sh" >&2; exit 1; fi
-cp "$here/cloudformation/sbctl.yaml" sbctl.yaml
-tag=${SBCTL_RELEASE_TAG:-}
+if grep -q '__SUPAVISE_RELEASE_PUBKEY_B64__' install.sh; then echo "the key marker is still in install.sh" >&2; exit 1; fi
+cp "$here/cloudformation/supavise.yaml" supavise.yaml
+tag=${SUPAVISE_RELEASE_TAG:-}
 if [[ -n $tag ]]; then
-  [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "SBCTL_RELEASE_TAG $tag is not vMAJOR.MINOR.PATCH[-suffix]" >&2; exit 1; }
-  # The SbctlVersion parameter is the only place the template says "Default: latest".
-  sed "s|^    Default: latest\$|    Default: $tag|" sbctl.yaml >sbctl.yaml.new && mv sbctl.yaml.new sbctl.yaml
-  [[ $(grep -c "^    Default: $tag\$" sbctl.yaml) -eq 1 ]] || { echo "could not stamp $tag into sbctl.yaml" >&2; exit 1; }
+  [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "SUPAVISE_RELEASE_TAG $tag is not vMAJOR.MINOR.PATCH[-suffix]" >&2; exit 1; }
+  # The SupaviseVersion parameter is the only place the template says "Default: latest".
+  sed "s|^    Default: latest\$|    Default: $tag|" supavise.yaml >supavise.yaml.new && mv supavise.yaml.new supavise.yaml
+  [[ $(grep -c "^    Default: $tag\$" supavise.yaml) -eq 1 ]] || { echo "could not stamp $tag into supavise.yaml" >&2; exit 1; }
 fi
-cp "$here/aws/deploy.sh" sbctl-aws-deploy.sh
-chmod 0755 sbctl-aws-deploy.sh
+cp "$here/aws/deploy.sh" supavise-aws-deploy.sh
+chmod 0755 supavise-aws-deploy.sh
 echo "signed ${#files[@]} files; key sha256 $(der "$pub")"

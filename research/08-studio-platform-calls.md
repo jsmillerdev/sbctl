@@ -27,7 +27,7 @@ Source: `apps/studio/data/fetchers.ts`, `packages/common/{helpers,telemetry,feat
 
 ## 3. GoTrue (dashboard sign-in), `NEXT_PUBLIC_GOTRUE_URL`
 
-`packages/common/gotrue.ts` builds one `@supabase/auth-js` client against that URL (storage key `supabase.dashboard.auth.token`, `localStorage`, session detection in the URL on). These calls go to `sb-gotrue@system` through whatever fronts it, not to the Management API. They carry no `apikey` header, so a front that insists on one would break them. GoTrue answers CORS itself.
+`packages/common/gotrue.ts` builds one `@supabase/auth-js` client against that URL (storage key `supabase.dashboard.auth.token`, `localStorage`, session detection in the URL on). These calls go to `supavise-gotrue@system` through whatever fronts it, not to the Management API. They carry no `apikey` header, so a front that insists on one would break them. GoTrue answers CORS itself.
 
 | Prio | Call | Used for | Source |
 |---|---|---|---|
@@ -37,7 +37,7 @@ Source: `apps/studio/data/fetchers.ts`, `packages/common/{helpers,telemetry,feat
 | P0 | `POST /logout` | sign-out (`signOut`) | `lib/auth.tsx` |
 | P1 | `GET /.well-known/jwks.json` | `getClaims` when the project signs with an asymmetric key | auth-js |
 | P2 | `POST /recover`, `PUT /user` | forgot password, account preferences (`resetPasswordForEmail`, `updateUser`) | `SignIn/ForgotPasswordWizard.tsx`, `Account/*` |
-| P2 | `POST /signup`, `/otp`, `/verify`, `/sso`, `/authorize`, `/token?grant_type=id_token` | sign-up, magic link, SSO, GitHub and ChatGPT sign-in: hidden by the `dashboard_auth:*` flags in the sbctl build, so not reachable from the UI | `SignIn/*` |
+| P2 | `POST /signup`, `/otp`, `/verify`, `/sso`, `/authorize`, `/token?grant_type=id_token` | sign-up, magic link, SSO, GitHub and ChatGPT sign-in: hidden by the `dashboard_auth:*` flags in the supavise build, so not reachable from the UI | `SignIn/*` |
 | P2 | `GET/POST /factors`, `POST /factors/{id}/challenge`, `/verify`, `DELETE /factors/{id}` | MFA enrollment in account settings | `Account/*`, `data/profile/*` |
 
 The access token comes from `getSession()`, which refreshes it when it is close to expiry (so `POST /token?grant_type=refresh_token` runs in the background). After sign-in `GET /platform/profile` must accept the GoTrue access token (a 401 signs the user out again).
@@ -475,7 +475,7 @@ Counts: stub column `yes` 177, `defaults` 94, `no` 115.
 | Route | What it does | Needs outside access? |
 |---|---|---|
 | `/api/get-utc-time`, `/api/get-ip-address`, `/api/get-deployment-commit` | clock, caller IP, build commit | no (`get-utc-time` answered 200 in `studio/verify.sh`) |
-| `/api/incident-banner` | incident.io banner list, requested on every page | yes: incident.io. Observed: answers 500 without a key, react-query retries after 1, 4 and 16 s, and the sign-in redirect waits for it (21 s). sbctl's proxy answers it itself with a static `{"incidents": []}` on the Studio host (section 9, resolved) |
+| `/api/incident-banner` | incident.io banner list, requested on every page | yes: incident.io. Observed: answers 500 without a key, react-query retries after 1, 4 and 16 s, and the sign-in redirect waits for it (21 s). supavise's proxy answers it itself with a static `{"incidents": []}` on the Studio host (section 9, resolved) |
 | `/api/incident-status`, `/api/status-page`, `/api/status-override` | status banner and incident pages | yes: statuspage.io, incident.io; not requested on the visited pages; failure behavior unverified |
 | `/api/ai/*` (sql generate, policy, title, filter, docs, onboarding, feedback) | AI assistant | yes: needs `OPENAI_API_KEY` (server env); absent key disables the assistant (reading, unverified) |
 | `/api/check-cname`, `/api/edge-functions/test`, `/api/edge-functions/body`, `/api/generate-attachment-url`, `/api/content/graphql`, `/api/parse-query`, `/api/scoped-access-token-permissions`, `/api/integrations/stripe-sync` | custom domains, edge function tester, support attachments, docs search, SQL parsing, token scopes, Stripe | mixed; none is on the four P0 flows |
@@ -508,7 +508,7 @@ This is a dry run of `studio/spike.sh` on the maintainer's Mac, not the CI run. 
 
 Findings, in order of importance:
 
-1. **Sign-in took 22 s.** After the token call Studio waited for `GET /api/incident-banner` (Studio's own route) to finish: it answers 500 without an incident.io key, react-query retries it after 1 s, 4 s and 16 s, and the sign-in form awaits the query cache reset. Resolved: sbctl's proxy answers `GET studio.<domain>/api/incident-banner` with a static `{"incidents": []}` (`internal/proxy/studio.go`), so the artifact keeps exactly the three patches and carries no fixup; sign-in then takes about 1 s (1.06 s measured through the proxy against the real API, `tests/e2e/studio-smoke.mjs`).
+1. **Sign-in took 22 s.** After the token call Studio waited for `GET /api/incident-banner` (Studio's own route) to finish: it answers 500 without an incident.io key, react-query retries it after 1 s, 4 s and 16 s, and the sign-in form awaits the query cache reset. Resolved: supavise's proxy answers `GET studio.<domain>/api/incident-banner` with a static `{"incidents": []}` (`internal/proxy/studio.go`), so the artifact keeps exactly the three patches and carries no fixup; sign-in then takes about 1 s (1.06 s measured through the proxy against the real API, `tests/e2e/studio-smoke.mjs`).
 2. **A stub with `null` for an array crashes a page.** `GET /v1/projects/{ref}/upgrade/eligibility` with `validation_errors: null` threw in Settings/General. Stubs must return `[]` for array fields, not `null`; the mock's generator now derives that from the spec.
 3. **Studio calls a third party on every page load**: `GET https://api.usercentrics.eu/settings//latest/languages.json` (18 calls, 403, empty settings id) although `NEXT_PUBLIC_USERCENTRICS_RULESET_ID` is unset. It fails soft but it is an outbound request from the browser. Resolved without a fourth patch: Studio's CSP allows the host by default, so the proxy removes every `usercentrics.eu` source from the `Content-Security-Policy` it forwards; the browser now refuses the request (a CSP violation line in the console, no outbound call). A real fix is a patch that skips initialization when `NEXT_PUBLIC_USERCENTRICS_RULESET_ID` is unset, to be proposed upstream.
 4. Values the P0 handlers must get right beyond the required fields: `/v1/projects/{ref}/health` entries use `status: "ACTIVE_HEALTHY"` (enum `COMING_UP | ACTIVE_HEALTHY | UNHEALTHY`; `ServiceStatus.tsx` shows "Healthy" and stops its 5 s refetch only for `ACTIVE_HEALTHY`); `GET /platform/projects/{ref}/databases` must return the primary database; the project `region` must be a real AWS region code; the project database needs GoTrue's migrated `auth` schema or the Users page reports `column users.banned_until does not exist`.
@@ -578,9 +578,9 @@ To refresh this section from a CI run: `studio/spike.sh` writes `request-log.jso
 
 <!-- SPIKE-LOG:END -->
 
-### 9.3 Local run through `sbctl serve` against the real Management API (2026-10-06, darwin-arm64)
+### 9.3 Local run through `supavise serve` against the real Management API (2026-10-06, darwin-arm64)
 
-Same machine and Studio build as 9.1, with the mock replaced by workstream B's API inside `sbctl serve`: the exec backend, TLS off, base domain `127.0.0.1.sslip.io`, the edge on one loopback port, two projects created by `sbctl projects create`, a dashboard user created through the system GoTrue admin API (`app_metadata.sbctl_admin = true`), postgres-meta started by hand with the `[api] pgmeta_crypto_key`, and the cached Next build repackaged by `studio/build.sh` (`STUDIO_PREBUILT`, placeholders of the older build rewritten to the current set in a clone of the output; nothing was built). `tests/e2e/studio-smoke.mjs` (headless Chrome, Playwright):
+Same machine and Studio build as 9.1, with the mock replaced by workstream B's API inside `supavise serve`: the exec backend, TLS off, base domain `127.0.0.1.sslip.io`, the edge on one loopback port, two projects created by `supavise projects create`, a dashboard user created through the system GoTrue admin API (`app_metadata.supavise_admin = true`), postgres-meta started by hand with the `[api] pgmeta_crypto_key`, and the cached Next build repackaged by `studio/build.sh` (`STUDIO_PREBUILT`, placeholders of the older build rewritten to the current set in a clone of the output; nothing was built). `tests/e2e/studio-smoke.mjs` (headless Chrome, Playwright):
 
 | Step | Result |
 |---|---|
@@ -590,4 +590,4 @@ Same machine and Studio build as 9.1, with the mock replaced by workstream B's A
 | SQL editor, each project (`select count(*) from public.todos`) | pass |
 | any API or pg-meta call answering 5xx | none |
 
-Console: Usercentrics refused by the CSP (the proxy removes the host; no outbound call), one 401 from `telemetry/feature-flags` before the session exists. The dashboard session token carried `aud: authenticated` and was accepted by audience and signature. Not run: Realtime, Edge Functions, Logs, Advisors, Integrations and the other pages of 9.1's list. Resident memory was not measured per service; `ps` showed `sbctl serve` at 75 MB and postgres-meta at 121 MB RSS.
+Console: Usercentrics refused by the CSP (the proxy removes the host; no outbound call), one 401 from `telemetry/feature-flags` before the session exists. The dashboard session token carried `aud: authenticated` and was accepted by audience and signature. Not run: Realtime, Edge Functions, Logs, Advisors, Integrations and the other pages of 9.1's list. Resident memory was not measured per service; `ps` showed `supavise serve` at 75 MB and postgres-meta at 121 MB RSS.

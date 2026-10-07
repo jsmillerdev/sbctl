@@ -12,7 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/backup"
+	"github.com/jsmillerdev/supavise/internal/backup"
 )
 
 // errWALGone means a WAL segment the backup needs was recycled before it could be copied.
@@ -115,7 +115,7 @@ func (c *cloner) once(ctx context.Context, src cloneSource, dstData string) (*Cl
 	free0 := freeBytes(dstParent)
 
 	var startLSN string
-	if err := conn.QueryRow(ctx, `select pg_backup_start($1, true)::text`, "sbctl branch "+filepath.Base(filepath.Dir(filepath.Dir(dstData)))).Scan(&startLSN); err != nil {
+	if err := conn.QueryRow(ctx, `select pg_backup_start($1, true)::text`, "supavise branch "+filepath.Base(filepath.Dir(filepath.Dir(dstData)))).Scan(&startLSN); err != nil {
 		return nil, fmt.Errorf("pg_backup_start: %w", err)
 	}
 	st.StartLSN = startLSN
@@ -249,7 +249,7 @@ func detectClone(srcData, dstParent string) (method, fsys, reason string) {
 	if !sameDevice(srcData, dstParent) {
 		return "", fsys, fmt.Sprintf("the parent's data directory and %s are on different filesystems", dstParent)
 	}
-	probe := filepath.Join(dstParent, fmt.Sprintf(".sbctl-clone-probe-%d", time.Now().UnixNano()))
+	probe := filepath.Join(dstParent, fmt.Sprintf(".supavise-clone-probe-%d", time.Now().UnixNano()))
 	err := cloneFile(filepath.Join(srcData, "PG_VERSION"), probe)
 	_ = os.Remove(probe)
 	if err == nil {

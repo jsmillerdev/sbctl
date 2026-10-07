@@ -1,10 +1,10 @@
 package backup
 
-// Integration tests that run a real PostgreSQL and the real sbctl binary as its
+// Integration tests that run a real PostgreSQL and the real supavise binary as its
 // archive_command and restore_command. They need the Postgres artifact's bin
-// directory: SBCTL_TEST_PG_BIN, or the unpacked artifact under
+// directory: SUPAVISE_TEST_PG_BIN, or the unpacked artifact under
 // ~/.cache/sbctl/unpacked for this OS and architecture. Without one they are
-// skipped, as they are with -short or SBCTL_TEST_PG=0. Ports come from 35000-35999.
+// skipped, as they are with -short or SUPAVISE_TEST_PG=0. Ports come from 35000-35999.
 
 import (
 	"context"
@@ -22,23 +22,23 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/OWNER/sbctl/internal/lifecycle"
-	"github.com/OWNER/sbctl/internal/registry"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
 // pgBinDir returns the directory holding initdb, pg_ctl and postgres, or skips.
 func pgBinDir(t *testing.T) string {
 	t.Helper()
-	if testing.Short() || os.Getenv("SBCTL_TEST_PG") == "0" {
+	if testing.Short() || os.Getenv("SUPAVISE_TEST_PG") == "0" {
 		t.Skip("PostgreSQL integration test disabled")
 	}
-	if d := os.Getenv("SBCTL_TEST_PG_BIN"); d != "" {
+	if d := os.Getenv("SUPAVISE_TEST_PG_BIN"); d != "" {
 		return d
 	}
 	home, _ := os.UserHomeDir()
 	m, _ := filepath.Glob(filepath.Join(home, ".cache", "sbctl", "unpacked", "postgres-*-"+runtime.GOOS+"-"+runtime.GOARCH, "bin"))
 	if len(m) == 0 {
-		t.Skip("no Postgres artifact: set SBCTL_TEST_PG_BIN to its bin directory")
+		t.Skip("no Postgres artifact: set SUPAVISE_TEST_PG_BIN to its bin directory")
 	}
 	return m[len(m)-1]
 }
@@ -49,20 +49,20 @@ var (
 	buildErr  error
 )
 
-// sbctlBinary builds cmd/sbctl once per test run.
-func sbctlBinary(t *testing.T) string {
+// supaviseBinary builds cmd/supavise once per test run.
+func supaviseBinary(t *testing.T) string {
 	t.Helper()
 	buildOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "sbctl-test-bin-")
+		dir, err := os.MkdirTemp("", "supavise-test-bin-")
 		if err != nil {
 			buildErr = err
 			return
 		}
-		builtBin = filepath.Join(dir, "sbctl")
-		cmd := exec.Command("go", "build", "-o", builtBin, "./cmd/sbctl")
+		builtBin = filepath.Join(dir, "supavise")
+		cmd := exec.Command("go", "build", "-o", builtBin, "./cmd/supavise")
 		cmd.Dir = filepath.Join("..", "..")
 		if out, err := cmd.CombinedOutput(); err != nil {
-			buildErr = fmt.Errorf("go build ./cmd/sbctl: %v\n%s", err, out)
+			buildErr = fmt.Errorf("go build ./cmd/supavise: %v\n%s", err, out)
 		}
 	})
 	if buildErr != nil {
@@ -158,7 +158,7 @@ func tail(b []byte, n int) string {
 }
 
 // newSourceCluster runs initdb and writes the settings a project cluster gets:
-// WAL archiving through the sbctl binary, small memory, 1 MiB WAL segments so a
+// WAL archiving through the supavise binary, small memory, 1 MiB WAL segments so a
 // switch is cheap, TCP only on the given port.
 func newSourceCluster(t *testing.T, bin, root, ref, archiveSettings string) *pgInstance {
 	t.Helper()
@@ -300,7 +300,7 @@ func idsString(ids []int) string { return fmt.Sprint(ids) }
 
 // TestPointInTimeRestore is the workstream's required test: write, back up, write,
 // note a time, destroy, then restore to the noted time (as a new project and in
-// place) from a base backup plus WAL fetched through the real sbctl binary. The
+// place) from a base backup plus WAL fetched through the real supavise binary. The
 // backend is a local directory.
 func TestPointInTimeRestore(t *testing.T) {
 	root := t.TempDir()
@@ -313,14 +313,14 @@ func TestPointInTimeRestore(t *testing.T) {
 }
 
 // TestPointInTimeRestoreS3Fake runs the scenario over the S3 backend against an
-// in-process fake S3 server (gofakes3), which the sbctl children reach over loopback.
+// in-process fake S3 server (gofakes3), which the supavise children reach over loopback.
 func TestPointInTimeRestoreS3Fake(t *testing.T) {
 	pgBinDir(t)
 	runPointInTimeRestoreS3(t, fakeS3(t))
 }
 
 // TestPointInTimeRestoreS3 is the same test over a real S3-compatible service: CI
-// only, skipped without SBCTL_TEST_S3_* (see store_s3_test.go).
+// only, skipped without SUPAVISE_TEST_S3_* (see store_s3_test.go).
 func TestPointInTimeRestoreS3(t *testing.T) {
 	pgBinDir(t)
 	runPointInTimeRestoreS3(t, s3FromEnv(t))
@@ -338,18 +338,18 @@ func runPointInTimeRestoreS3(t *testing.T, o S3Options) {
 }
 
 // runPointInTimeRestore runs the scenario with store as the backend and backupToml as
-// the [backup] section the sbctl children (archive_command, restore_command) read.
+// the [backup] section the supavise children (archive_command, restore_command) read.
 func runPointInTimeRestore(t *testing.T, root string, st Store, backupToml string) {
 	bin := pgBinDir(t)
-	sbctl := sbctlBinary(t)
+	supavise := supaviseBinary(t)
 	ctx := context.Background()
 	e := newTestEnv(t)
 	e.now = time.Now() // base backups and restores run on the real clock here
 	e.svc.opt.Now = time.Now
 
-	cfgPath := filepath.Join(root, "sbctl.toml")
-	writeFile(t, cfgPath, []byte(fmt.Sprintf("state_dir = %q\nbin_path = %q\n\n%s", filepath.Join(root, "state"), sbctl, backupToml)))
-	e.cfg.BinPath = sbctl
+	cfgPath := filepath.Join(root, "supavise.toml")
+	writeFile(t, cfgPath, []byte(fmt.Sprintf("state_dir = %q\nbin_path = %q\n\n%s", filepath.Join(root, "state"), supavise, backupToml)))
+	e.cfg.BinPath = supavise
 	e.svc.opt.Store, e.store = st, nil
 	e.svc.opt.ConfigPath = cfgPath
 
@@ -561,7 +561,7 @@ func TestBaseBackupRefusals(t *testing.T) {
 // future still cannot be reached, and that must be an error, not a registered corpse.
 func TestRestoreRunningSourceToRecentTime(t *testing.T) {
 	bin := pgBinDir(t)
-	sbctl := sbctlBinary(t)
+	supavise := supaviseBinary(t)
 	ctx := context.Background()
 	root := t.TempDir()
 	archiveDir := filepath.Join(root, "archive")
@@ -572,10 +572,10 @@ func TestRestoreRunningSourceToRecentTime(t *testing.T) {
 	e := newTestEnv(t)
 	e.now = time.Now()
 	e.svc.opt.Now = time.Now
-	cfgPath := filepath.Join(root, "sbctl.toml")
+	cfgPath := filepath.Join(root, "supavise.toml")
 	writeFile(t, cfgPath, []byte(fmt.Sprintf("state_dir = %q\nbin_path = %q\n\n[backup]\nbackend = %q\nretention_days = 7\n",
-		filepath.Join(root, "state"), sbctl, "file://"+archiveDir)))
-	e.cfg.BinPath = sbctl
+		filepath.Join(root, "state"), supavise, "file://"+archiveDir)))
+	e.cfg.BinPath = supavise
 	e.svc.opt.Store, e.store = st, nil
 	e.svc.opt.ConfigPath = cfgPath
 	e.svc.opt.RecoveryPoll = 200 * time.Millisecond
@@ -664,7 +664,7 @@ func TestRestoreRunningSourceToRecentTime(t *testing.T) {
 // (TestRestoreInPlaceRollsBackWhenResumeFails); this is the real fatal path.
 func TestRestoreInPlaceRollsBackWhenRecoveryCannotReachItsTarget(t *testing.T) {
 	bin := pgBinDir(t)
-	sbctl := sbctlBinary(t)
+	supavise := supaviseBinary(t)
 	ctx := context.Background()
 	root := t.TempDir()
 	archiveDir := filepath.Join(root, "archive")
@@ -675,10 +675,10 @@ func TestRestoreInPlaceRollsBackWhenRecoveryCannotReachItsTarget(t *testing.T) {
 	e := newTestEnv(t)
 	e.now = time.Now()
 	e.svc.opt.Now = time.Now
-	cfgPath := filepath.Join(root, "sbctl.toml")
+	cfgPath := filepath.Join(root, "supavise.toml")
 	writeFile(t, cfgPath, []byte(fmt.Sprintf("state_dir = %q\nbin_path = %q\n\n[backup]\nbackend = %q\nretention_days = 7\n",
-		filepath.Join(root, "state"), sbctl, "file://"+archiveDir)))
-	e.cfg.BinPath = sbctl
+		filepath.Join(root, "state"), supavise, "file://"+archiveDir)))
+	e.cfg.BinPath = supavise
 	e.svc.opt.Store, e.store = st, nil
 	e.svc.opt.ConfigPath = cfgPath
 	e.svc.opt.RecoveryPoll = 200 * time.Millisecond

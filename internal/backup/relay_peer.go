@@ -15,10 +15,10 @@ import (
 // /proc/<pid>/cgroup. A tenant cannot move itself into another unit's cgroup (the cgroup
 // tree is not writable from a unit and the polkit rule gives no access to the system bus).
 //
-// The check is a deny rule for the units that run tenant code: every sb-* unit is refused
-// except sb-postgres@<ref>.service for the socket of <ref> (whose archive_command and
-// restore_command are the clients) and the sb-basebackup units (the sbctl binary, which runs
-// without tenant code). A process outside every sb-* unit (the daemon, sbctl.service, a
+// The check is a deny rule for the units that run tenant code: every supavise-* unit is refused
+// except supavise-postgres@<ref>.service for the socket of <ref> (whose archive_command and
+// restore_command are the clients) and the supavise-basebackup units (the supavise binary, which runs
+// without tenant code). A process outside every supavise-* unit (the daemon, supavise.service, a
 // root or operator shell, a CLI command) is accepted: it can already read the backup
 // credentials or the archive directly. Where the cgroup cannot be read the peer is refused.
 // On other platforms there are no such units and the check accepts every peer.
@@ -54,11 +54,11 @@ func peerUnit(cgroup string) (string, error) {
 // socket of ref.
 func relayPeerUnitAllowed(unit, ref string) bool {
 	switch {
-	case unit == "sb-postgres@"+ref+".service":
+	case unit == "supavise-postgres@"+ref+".service":
 		return true
-	case strings.HasPrefix(unit, "sb-basebackup@"), unit == "sb-basebackup-prune.service":
+	case strings.HasPrefix(unit, "supavise-basebackup@"), unit == "supavise-basebackup-prune.service":
 		return true
-	case strings.HasPrefix(unit, "sb-"):
+	case strings.HasPrefix(unit, "supavise-"):
 		return false
 	}
 	return true

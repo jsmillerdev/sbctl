@@ -15,7 +15,7 @@ import (
 var DNSProviders = []string{"route53", "cloudflare", "hetzner", "digitalocean"}
 
 // newDNSProvider builds the libdns provider for DNS-01 from [tls] credentials
-// (config keys or SBCTL_TLS_CREDENTIALS_<KEY> variables):
+// (config keys or SUPAVISE_TLS_CREDENTIALS_<KEY> variables):
 //
 //	route53       none needed on AWS (instance role / default credential chain);
 //	              optional access_key_id, secret_access_key, session_token, region,
@@ -28,7 +28,7 @@ func newDNSProvider(name string, cred map[string]string) (certmagic.DNSProvider,
 	need := func(key string) (string, error) {
 		v := strings.TrimSpace(cred[key])
 		if v == "" {
-			return "", fmt.Errorf("tls: dns_provider %q needs credential %q (set tls.credentials.%s or SBCTL_TLS_CREDENTIALS_%s)",
+			return "", fmt.Errorf("tls: dns_provider %q needs credential %q (set tls.credentials.%s or SUPAVISE_TLS_CREDENTIALS_%s)",
 				name, key, key, strings.ToUpper(key))
 		}
 		return v, nil

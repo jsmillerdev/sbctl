@@ -12,7 +12,7 @@ import (
 
 const (
 	soPeerPidfd       = 77  // SO_PEERPIDFD (Linux 6.5): a pidfd of the process that connected
-	sysPidfdSendSgnal = 424 // pidfd_send_signal(2): the same number on every architecture sbctl builds for
+	sysPidfdSendSgnal = 424 // pidfd_send_signal(2): the same number on every architecture supavise builds for
 )
 
 // checkRelayPeer accepts a connection to ref's socket only from a process whose systemd unit
