@@ -53,7 +53,7 @@ case "$*" in
     echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id sbctl does not exist" >&2
     exit 254 ;;
   *"Stacks[0].Parameters"*)
-    printf 'AdminEmail\ta@b.co\nAmiId\t%s\nInstanceType\tt4g.large\n' "${STACK_AMI:-ami-0aaaaaaaaaaaaaaaa}" ;;
+    printf 'AdminEmail\ta@b.co\nAmiId\t%s\nInstanceType\tt4g.large\n' "${STACK_AMI-ami-0aaaaaaaaaaaaaaaa}" ;;
   *"Stacks[0].Outputs"*)
     printf 'DashboardUrl\thttps://studio.1.2.3.4.sslip.io\nClaimUrl\thttps://api.1.2.3.4.sslip.io/claim\n'
     printf 'ClaimTokenCommand\taws secretsmanager get-secret-value --region us-east-1 --secret-id arn:aws:secretsmanager:us-east-1:111122223333:secret:x --query SecretString --output text\n'

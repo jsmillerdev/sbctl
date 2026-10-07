@@ -73,7 +73,7 @@ SSM="" AMI="" SNAP="" TEMPLATE="" PROFILE="" DRY=0 DELETE=0 YES=0
 # An option takes its value from "--opt=value" or from the next argument.
 need() { # called as: need "$@"  (the option is $1)
   if [[ $has_val -eq 0 ]]; then
-    [[ $# -ge 2 ]] || die "$opt needs a value"
+    [[ $# -ge 2 && $2 != --* ]] || die "$opt needs a value"
     val=$2
     shift_extra=1
   fi

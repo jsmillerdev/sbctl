@@ -558,10 +558,10 @@ func TestTemplateIsSelfContained(t *testing.T) {
 func TestCheckovSkipsAreExplained(t *testing.T) {
 	d := load(t)
 	for name, res := range resources(t, d) {
-		skips, ok := res.(doc)["Metadata"].(doc)["checkov"].(doc)["skip"].([]any)
-		if !ok {
+		if !has(res, "Metadata", "checkov", "skip") {
 			continue
 		}
+		skips := get(t, res, "Metadata", "checkov", "skip").([]any)
 		for _, s := range skips {
 			if c, _ := get(t, s, "comment").(string); len(c) < 20 {
 				t.Errorf("%s: checkov skip %v needs a real comment", name, get(t, s, "id"))
@@ -591,9 +591,24 @@ func TestRulesAndConditionsStayInStep(t *testing.T) {
 // checks what a release attaches: the template carries the tag as its default release and the
 // AWS deploy script travels with it.
 func TestReleaseAssetsStampTheTag(t *testing.T) {
-	if _, err := exec.LookPath("openssl"); err != nil {
-		t.Skip("openssl not installed")
+	// release-assets.sh signs with ed25519, which macOS's own LibreSSL lacks; use an OpenSSL 3 when
+	// there is one (Homebrew), else skip. CI runs on Ubuntu, where it always runs.
+	pathEnv := os.Getenv("PATH")
+	ssl := ""
+	for _, c := range []string{"openssl", "/opt/homebrew/opt/openssl@3/bin/openssl", "/usr/local/opt/openssl@3/bin/openssl"} {
+		p, err := exec.LookPath(c)
+		if err != nil {
+			continue
+		}
+		if exec.Command(p, "genpkey", "-algorithm", "ed25519", "-out", filepath.Join(t.TempDir(), "k.pem")).Run() == nil {
+			ssl = p
+			break
+		}
 	}
+	if ssl == "" {
+		t.Skip("no openssl with ed25519 support")
+	}
+	pathEnv = filepath.Dir(ssl) + ":" + pathEnv
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not installed")
 	}
@@ -606,8 +621,8 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
 		}
 	}
-	run("openssl", "genpkey", "-algorithm", "ed25519", "-out", "priv.pem")
-	run("openssl", "pkey", "-in", "priv.pem", "-pubout", "-out", "pub.pem")
+	run(ssl, "genpkey", "-algorithm", "ed25519", "-out", "priv.pem")
+	run(ssl, "pkey", "-in", "priv.pem", "-pubout", "-out", "pub.pem")
 	dist := filepath.Join(tmp, "dist")
 	if err := os.MkdirAll(dist, 0o755); err != nil {
 		t.Fatal(err)
@@ -619,7 +634,7 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 	}
 	script, _ := filepath.Abs("../release-assets.sh")
 	cmd := exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
-	cmd.Env = append(os.Environ(), "SBCTL_RELEASE_TAG=v9.8.7-rc.1")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SBCTL_RELEASE_TAG=v9.8.7-rc.1")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("release-assets.sh: %v\n%s", err, out)
 	}
@@ -650,7 +665,7 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 
 	// Without a tag the template is attached as it is.
 	cmd = exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
-	cmd.Env = append(os.Environ(), "SBCTL_RELEASE_TAG=")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SBCTL_RELEASE_TAG=")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("release-assets.sh without a tag: %v\n%s", err, out)
 	}
@@ -661,7 +676,7 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 
 	// A tag that is not a version is refused: it would end up in a parameter default.
 	cmd = exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
-	cmd.Env = append(os.Environ(), "SBCTL_RELEASE_TAG=latest; rm -rf /")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SBCTL_RELEASE_TAG=latest; echo hi")
 	if out, err := cmd.CombinedOutput(); err == nil {
 		t.Errorf("a bad tag must fail, got success:\n%s", out)
 	}
