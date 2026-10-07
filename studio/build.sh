@@ -17,7 +17,7 @@
 #   STUDIO_WORK           scratch directory (default studio/.build-cache/work-<platform>)
 #   STUDIO_CACHE          download cache for node (default studio/.build-cache/dl)
 #   STUDIO_OUT            output directory (default studio/dist)
-#   STUDIO_BUILD_HEAP_MB  V8 heap cap for the Next build processes (default 4096)
+#   STUDIO_BUILD_HEAP_MB  V8 heap cap for the Next build processes (default 6144)
 #   STUDIO_PREBUILT       an existing apps/studio directory that already holds .next/standalone, .next/static
 #                         and public/: skip fetch, install and build, only package (used by tests)
 #   STUDIO_PREBUILT_PLACEHOLDERS  placeholders.json that matches STUDIO_PREBUILT (default placeholders.json)
@@ -95,7 +95,7 @@ ARTIFACT="sbctl-studio-${TAG}-p${PATCHSET}-${PLATFORM}.tar.zst"
 WORK="${STUDIO_WORK:-$HERE/.build-cache/work-$PLATFORM}"
 CACHE="${STUDIO_CACHE:-$HERE/.build-cache/dl}"
 OUT="${STUDIO_OUT:-$HERE/dist}"
-HEAP_MB="${STUDIO_BUILD_HEAP_MB:-4096}"
+HEAP_MB="${STUDIO_BUILD_HEAP_MB:-6144}"
 mkdir -p "$WORK" "$CACHE" "$OUT"
 touch "$WORK/.sbctl-studio-work"   # cleanup below only removes a directory carrying this marker
 
@@ -198,8 +198,10 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
   (cd "$APP" && pnpm install --frozen-lockfile --filter 'studio...' \
       --store-dir "$WORK/pnpm-store" --network-concurrency 8 --child-concurrency 2 --reporter=append-only)
 
-  # Placeholder build-time values from placeholders.json, then the fixed platform settings.
+  # Placeholder build-time values from placeholders.json, then the fixed platform settings. The
+  # build must not pick up anything from the runner's environment that Studio would inline.
   log "next build (platform mode)"
+  for v in $(compgen -e | grep -E '^(NEXT_PUBLIC_|SUPABASE_|VERCEL|SENTRY_|CSP_|NIMBUS_|NEXT_RUNTIME|MAINTENANCE_MODE|ANALYZE|FORCE_ASSET_CDN)' || true); do unset "$v"; done
   while IFS='=' read -r key value; do export "$key=$value"; done < <(
     node -e '
       const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
@@ -209,11 +211,17 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
   # prod: hides internal-only UI and keeps consent-gated telemetry off. Never local or staging,
   # which auto-grant telemetry consent (research/05 section 4.5).
   export NEXT_PUBLIC_ENVIRONMENT=prod
-  export NEXT_PUBLIC_BASE_PATH= SUPABASE_URL= NEXT_PUBLIC_SUPABASE_URL= NEXT_PUBLIC_SUPABASE_ANON_KEY=
   export STUDIO_FRAMEWORK=next
-  # Heap cap for the node processes; turbopack's native memory is outside it. Peak RSS is about 8 GB.
+  # Heap cap for the node processes (the next build driver and its prerender workers). Turbopack's
+  # own memory is native and not covered by it; peak RSS of the whole build is about 8 GB, which
+  # is why ci-prepare.sh adds swap. The cap is a ceiling, not a reservation.
   export NODE_OPTIONS="--max-old-space-size=$HEAP_MB"
-  (cd "$APP" && pnpm --filter studio exec next build)
+  time_cmd=()
+  if [[ -x /usr/bin/time ]] && /usr/bin/time -v true >/dev/null 2>&1; then time_cmd=(/usr/bin/time -v -o "$WORK/next-build.time"); fi
+  (cd "$APP" && ${time_cmd[@]+"${time_cmd[@]}"} pnpm --filter studio exec next build)
+  if [[ -f "$WORK/next-build.time" ]]; then
+    awk -F': ' '/Maximum resident set size|Elapsed \(wall clock\)/ {print "next build: " $0}' "$WORK/next-build.time" >&2
+  fi
   unset NODE_OPTIONS
 
   PREBUILT="$APP/apps/studio"
