@@ -415,7 +415,11 @@ supabase --profile=./sbctl-profile.yaml projects list
 ```
 
 `project_host` is `api.<domain>`: the CLI derives `https://<ref>.<project_host>` (the
-project gateway, matching `<ref>.api.<domain>`) and `db.<ref>.<project_host>`.
+project gateway, matching `<ref>.api.<domain>`) and `db.<ref>.<project_host>`. `pooler_host` is
+the registrable domain of `pooler.<domain>` (`example.com` for `pooler.example.com`): the CLI
+connects through the pooler URL a linked project records only when the URL's host has exactly
+that effective TLD plus one, so a profile that names the host itself leaves `db push` without a
+route when `db.<ref>.<project_host>` does not answer.
 
 ## Testing
 
@@ -456,7 +460,7 @@ name: sbctl-test
 api_url: $API
 dashboard_url: http://127.0.0.1:1
 project_host: api.sbctl.test
-pooler_host: pooler.sbctl.test
+pooler_host: sbctl.test
 EOF
 export SUPABASE_ACCESS_TOKEN=$PAT SUPABASE_NO_KEYRING=1 DO_NOT_TRACK=1
 supabase --profile=./profile.yaml projects list

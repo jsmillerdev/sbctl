@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"golang.org/x/net/publicsuffix"
+
 	"github.com/OWNER/sbctl/internal/config"
 )
 
@@ -19,7 +21,10 @@ type CLIProfile struct {
 	// ProjectHost is the base of project hosts: https://<ref>.<project_host> is the
 	// project's API gateway and db.<ref>.<project_host> its direct database host.
 	ProjectHost string `json:"project_host"`
-	// PoolerHost is the domain of the shared pooler.
+	// PoolerHost is the registrable domain of the shared pooler's host (example.com for
+	// pooler.example.com), not the host itself: before it connects through the pooler URL a
+	// project records, the CLI checks that the URL's host ends in this domain by comparing it
+	// with the host's effective TLD plus one.
 	PoolerHost string `json:"pooler_host"`
 }
 
@@ -30,8 +35,19 @@ func NewCLIProfile(c *config.Config, name string) CLIProfile {
 	}
 	return CLIProfile{
 		Name: name, APIURL: c.APIURL(), DashboardURL: c.DashboardURL(),
-		ProjectHost: c.APIHost(), PoolerHost: c.PoolerHost(),
+		ProjectHost: c.APIHost(), PoolerHost: poolerDomain(c.PoolerHost()),
 	}
+}
+
+// poolerDomain is the effective TLD plus one of host, which is what the CLI compares the
+// pooler host with (apps/cli-go/internal/utils/connect.go, assertDomainInProfile). A host
+// that has no such domain (it is itself a public suffix) is returned unchanged.
+func poolerDomain(host string) string {
+	d, err := publicsuffix.EffectiveTLDPlusOne(host)
+	if err != nil {
+		return host
+	}
+	return d
 }
 
 // Render writes the profile as "yaml", "toml" or "json". The CLI picks its parser
