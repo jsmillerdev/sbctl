@@ -1,45 +1,50 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  sbctl: multi-project Supabase on one Ubuntu 24.04 instance. Creates the instance, an Elastic IP,
-  an encrypted XFS data volume, a backup bucket, a security group, a role scoped to that bucket
-  and (optionally) one Route 53 zone, and a Secrets Manager secret that holds the one-time claim
-  token. The instance runs the sbctl installer from the GitHub release.
+  sbctl: multi-project Supabase on one Ubuntu 24.04 instance. Only an admin email is required.
+  Creates the instance, an Elastic IP, an encrypted XFS data volume, a backup bucket, a security
+  group, a least-privilege instance role and a Secrets Manager secret that holds the one-time
+  claim token. A domain with a Route 53 hosted zone is optional. Deleting the stack keeps the
+  backup bucket and a final snapshot of the data volume.
 
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
-      - Label: { default: Instance }
-        Parameters: [Architecture, AmiId, InstanceType, DataVolumeSize, AdminEmail, SbctlVersion]
+      - Label: { default: "Required" }
+        Parameters: [AdminEmail]
+      - Label: { default: "Size and version (the defaults hold about 20 projects)" }
+        Parameters: [InstanceType, DataVolumeSize, SbctlVersion]
       - Label: { default: "Domain (optional; leave empty to use sslip.io on the Elastic IP)" }
         Parameters: [DomainName, HostedZoneId]
-      - Label: { default: Network }
-        Parameters: [VpcId, SubnetId, AccessCidr, SshCidr, EnableSessionManager]
+      - Label: { default: "Access (optional)" }
+        Parameters: [AccessCidr, EnableSessionManager, SshCidr, KeyName]
+      - Label: { default: "Advanced (leave empty unless you know you need them)" }
+        Parameters: [VpcId, SubnetId, AmiId, DataSnapshotId]
     ParameterLabels:
-      Architecture: { default: CPU architecture }
-      AmiId: { default: "Ubuntu 24.04 image ID (look it up once, see the description)" }
+      AdminEmail: { default: Admin email }
       InstanceType: { default: Instance type }
       DataVolumeSize: { default: Data volume size (GiB) }
-      AdminEmail: { default: Admin email }
       SbctlVersion: { default: sbctl release }
       DomainName: { default: Domain name }
       HostedZoneId: { default: Route 53 hosted zone ID }
-      VpcId: { default: Existing VPC (optional) }
-      SubnetId: { default: Existing public subnet (optional) }
       AccessCidr: { default: "Who may reach the dashboard, API and database ports" }
-      SshCidr: { default: Who may reach SSH (optional) }
       EnableSessionManager: { default: Allow AWS Systems Manager Session Manager }
+      SshCidr: { default: Who may reach SSH (empty = nobody) }
+      KeyName: { default: EC2 key pair for SSH }
+      VpcId: { default: Existing VPC }
+      SubnetId: { default: Existing public subnet }
+      AmiId: { default: Ubuntu 24.04 image ID }
+      DataSnapshotId: { default: Snapshot to restore the data volume from }
 
 Parameters:
-  Architecture:
+  AdminEmail:
     Type: String
-    Default: arm64
-    AllowedValues: [arm64, x86_64]
-    Description: arm64 (Graviton) is the default and the cheaper choice; pick x86_64 only with an x86 instance type.
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Enter an email address.
+    Description: Contact address for the Let's Encrypt account (expiry notices). The only required field.
   InstanceType:
     Type: String
-    Default: t4g.medium
+    Default: t4g.large
     AllowedValues:
-      - t4g.small
       - t4g.medium
       - t4g.large
       - t4g.xlarge
@@ -57,25 +62,27 @@ Parameters:
       - r7i.large
       - r7i.xlarge
     Description: >-
-      Each project costs about 100 MB of RAM idle, so 4 GiB (t4g.medium) fits a handful of small
-      projects and 16 GiB about a hundred. The type must match the architecture.
+      The node needs about 1.5 GB of RAM plus about 150 MB per idle project (measured, see
+      research/09-footprint.md). The default, t4g.large (Graviton, 8 GiB), holds about 20 projects
+      with room for load. t4g.medium (4 GiB) suits a trial of up to about 10. t4g and t3 are
+      burstable; pick m7g or m7i (or larger) for sustained load. Graviton (arm64) types cost less;
+      x86 types (t3, m7i, r7i) work the same. The image architecture follows the type.
   DataVolumeSize:
     Type: Number
     Default: 100
     MinValue: 20
     MaxValue: 16384
-    Description: Size in GiB of the encrypted XFS volume mounted at /var/lib/sbctl (project data and the local artifact cache).
-  AdminEmail:
-    Type: String
-    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
-    ConstraintDescription: Enter an email address.
-    Description: Contact address for the Let's Encrypt account (expiry notices).
+    Description: >-
+      Size in GiB of the encrypted XFS volume mounted at /var/lib/sbctl (project data and the
+      local artifact cache; about 75 MB per new project plus what the project stores). It can grow
+      later (update this value, then run xfs_growfs on the instance) but never shrink. When
+      restoring from a snapshot it must be at least the snapshot's size.
   SbctlVersion:
     Type: String
     Default: latest
     AllowedPattern: "^(latest|v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?)$"
     ConstraintDescription: Enter "latest" or a release tag such as v1.2.3.
-    Description: The sbctl release to install.
+    Description: The sbctl release to install. The template of a release names that release here.
   DomainName:
     Type: String
     Default: ""
@@ -84,13 +91,40 @@ Parameters:
     Description: >-
       Base domain, for example example.com. The dashboard becomes studio.example.com. With a hosted
       zone below, the stack creates the DNS records and issues a wildcard certificate by DNS-01;
-      without one, create the records listed in the stack outputs yourself.
+      without one, create the records listed in the stack outputs yourself. Empty: the node uses
+      <Elastic IP>.sslip.io names and needs no DNS.
   HostedZoneId:
     Type: String
     Default: ""
     AllowedPattern: "^$|^Z[A-Z0-9]{5,31}$"
     ConstraintDescription: Enter a Route 53 hosted zone ID such as Z0123456789ABCDEFGHIJ, or leave it empty.
-    Description: Route 53 public hosted zone that contains the domain. Needs a domain name.
+    Description: >-
+      Route 53 public hosted zone that contains the domain. Needs a domain name. The zone must not
+      already hold api., studio. or pooler. records for the domain, or *.api.<domain>.
+  AccessCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.0/24.
+    Description: >-
+      Source range for ports 80, 443, 5432 and 6543. Port 80 must stay reachable from the internet
+      for HTTP-01 certificates when no hosted zone is given. Narrow this for a private team.
+  EnableSessionManager:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Add a minimal policy (Session Manager channels only) so you can open a shell without SSH. Set to false to give the instance role no Systems Manager rights.
+  SshCidr:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.4/32, or leave it empty.
+    Description: Optional source range for SSH (port 22). Empty opens no SSH port; use Session Manager instead. SSH also needs KeyName.
+  KeyName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[\\x20-\\x7E]{1,255}$"
+    Description: Optional name of an existing EC2 key pair in this region, for SSH as the user ubuntu. Leave empty to use Session Manager only.
   VpcId:
     Type: String
     Default: ""
@@ -101,50 +135,35 @@ Parameters:
     Default: ""
     AllowedPattern: "^$|^subnet-[0-9a-f]{8,17}$"
     Description: A public subnet (one that routes to an internet gateway) of that VPC.
-  AccessCidr:
-    Type: String
-    Default: 0.0.0.0/0
-    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
-    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.0/24.
-    Description: >-
-      Source range for ports 80, 443, 5432 and 6543. Port 80 must stay reachable from the internet
-      for HTTP-01 certificates when no hosted zone is given. Narrow this for a private team.
-  SshCidr:
+  # Empty means: the newest Canonical Ubuntu 24.04 image of the instance's architecture, looked up
+  # once by CloudFormation through the public SSM parameter. CloudFormation looks it up again on
+  # every update, so a stack created with an empty value would try to replace the instance as soon
+  # as Canonical publishes a newer image, and a replacement cannot attach the data volume while
+  # the old instance holds it. deploy/aws/deploy.sh therefore always passes the image ID it used;
+  # in the console, give the same ID on later updates (README, "Replacing the instance").
+  AmiId:
     Type: String
     Default: ""
-    AllowedPattern: "^$|^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
-    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.4/32, or leave it empty.
-    Description: Optional source range for SSH (port 22). Empty opens no SSH port; use Session Manager (EnableSessionManager, on by default).
-  EnableSessionManager:
-    Type: String
-    Default: "true"
-    AllowedValues: ["true", "false"]
-    Description: Add a minimal policy (Session Manager channels only) so you can open a shell without SSH. Set to false to give the instance role no Systems Manager rights.
-  # A plain image ID, not an SSM-typed parameter: CloudFormation resolves an SSM-typed
-  # parameter again on every stack update, so as soon as Canonical published a newer Ubuntu image
-  # any update (even a changed AccessCidr) replaced the instance. A replacement cannot attach the
-  # data volume while the old instance holds it. With a plain ID the image changes only when you
-  # change this parameter on purpose (README, "Replacing the instance").
-  AmiId:
-    Type: AWS::EC2::Image::Id
+    AllowedPattern: "^$|^ami-[0-9a-f]{8,17}$"
+    ConstraintDescription: Enter an image ID such as ami-0123456789abcdef0, or leave it empty.
     Description: >-
-      Ubuntu 24.04 image of the stack's region and architecture. Look it up once, when you create
-      the stack: aws ssm get-parameter --region <region> --query Parameter.Value --output text
-      --name /aws/service/canonical/ubuntu/server/24.04/stable/current/<arm64|amd64>/hvm/ebs-gp3/ami-id
-      (arm64 for the default Architecture, amd64 for x86_64). Keep the same value on later
-      updates: changing it replaces the instance, which needs the procedure in the README.
+      Ubuntu 24.04 image of the stack's region and of the instance type's architecture. Leave it
+      empty on the first launch to get the current Canonical image. On later updates enter the ID
+      the instance runs (EC2 console, instance details), or an update may try to replace the
+      instance. Changing it replaces the instance: see the README first.
+  # A volume made from a snapshot cannot be swapped on a live stack (an update would replace the
+  # volume), so this is for creating a stack. The replaced volume keeps a snapshot either way.
+  DataSnapshotId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^snap-[0-9a-f]{8,17}$"
+    ConstraintDescription: Enter a snapshot ID such as snap-0123456789abcdef0, or leave it empty.
+    Description: >-
+      Restore the data volume from the final snapshot of an earlier stack (its master key,
+      registry and projects come back). Leave empty for a new node. Set it only when creating a
+      stack, and keep it on later updates. DataVolumeSize must be at least the snapshot's size.
 
 Rules:
-  ArchitectureMatchesInstanceType:
-    RuleCondition: !Equals [!Ref Architecture, arm64]
-    Assertions:
-      - Assert: !Contains [[t4g.small, t4g.medium, t4g.large, t4g.xlarge, m7g.large, m7g.xlarge, m7g.2xlarge, r7g.large, r7g.xlarge], !Ref InstanceType]
-        AssertDescription: Architecture arm64 needs a Graviton instance type (t4g, m7g, r7g).
-  ArchitectureMatchesInstanceTypeX86:
-    RuleCondition: !Equals [!Ref Architecture, x86_64]
-    Assertions:
-      - Assert: !Contains [[t3.medium, t3.large, t3.xlarge, m7i.large, m7i.xlarge, m7i.2xlarge, r7i.large, r7i.xlarge], !Ref InstanceType]
-        AssertDescription: Architecture x86_64 needs an x86 instance type (t3, m7i, r7i).
   ZoneNeedsDomain:
     RuleCondition: !Not [!Equals [!Ref HostedZoneId, ""]]
     Assertions:
@@ -156,10 +175,34 @@ Rules:
       - Assert: !And [!Not [!Equals [!Ref VpcId, ""]], !Not [!Equals [!Ref SubnetId, ""]]]
         AssertDescription: Give both the VPC and the subnet, or neither.
 
+# The image architecture follows the instance type, so there is no separate architecture choice
+# to get wrong. The value is the directory name in Canonical's public SSM parameter path.
+Mappings:
+  InstanceTypes:
+    t4g.medium: { Ubuntu: arm64 }
+    t4g.large: { Ubuntu: arm64 }
+    t4g.xlarge: { Ubuntu: arm64 }
+    m7g.large: { Ubuntu: arm64 }
+    m7g.xlarge: { Ubuntu: arm64 }
+    m7g.2xlarge: { Ubuntu: arm64 }
+    r7g.large: { Ubuntu: arm64 }
+    r7g.xlarge: { Ubuntu: arm64 }
+    t3.medium: { Ubuntu: amd64 }
+    t3.large: { Ubuntu: amd64 }
+    t3.xlarge: { Ubuntu: amd64 }
+    m7i.large: { Ubuntu: amd64 }
+    m7i.xlarge: { Ubuntu: amd64 }
+    m7i.2xlarge: { Ubuntu: amd64 }
+    r7i.large: { Ubuntu: amd64 }
+    r7i.xlarge: { Ubuntu: amd64 }
+
 Conditions:
   HasDomain: !Not [!Equals [!Ref DomainName, ""]]
   HasZone: !Not [!Equals [!Ref HostedZoneId, ""]]
   HasSsh: !Not [!Equals [!Ref SshCidr, ""]]
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+  HasAmiId: !Not [!Equals [!Ref AmiId, ""]]
+  HasDataSnapshot: !Not [!Equals [!Ref DataSnapshotId, ""]]
   SessionManagerOn: !Equals [!Ref EnableSessionManager, "true"]
   CreateNetwork: !Equals [!Ref VpcId, ""]
   IsLatest: !Equals [!Ref SbctlVersion, latest]
@@ -216,6 +259,11 @@ Resources:
 
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_260
+            comment: Port 80 serves the HTTP-01 certificate challenge and the redirect to HTTPS. AccessCidr narrows it.
     Properties:
       GroupDescription: sbctl - web, API and database ports (plus SSH when asked for)
       VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcId]
@@ -242,6 +290,11 @@ Resources:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: No log bucket exists; CloudTrail data events cover object access when wanted.
     Properties:
       VersioningConfiguration: { Status: Enabled }
       BucketEncryption:
@@ -265,6 +318,8 @@ Resources:
             NoncurrentVersionExpiration: { NoncurrentDays: 30 }
   BackupBucketPolicy:
     Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Bucket: !Ref BackupBucket
       PolicyDocument:
@@ -277,6 +332,9 @@ Resources:
             Resource: [!GetAtt BackupBucket.Arn, !Sub "${BackupBucket.Arn}/*"]
             Condition: { Bool: { "aws:SecureTransport": "false" } }
 
+  # Holds the master key, the registry and every project. Deleting the stack, or replacing this
+  # volume, takes a final snapshot first (EBS bills it until you delete it). The snapshot carries
+  # the volume's Name tag and can be passed back as DataSnapshotId.
   DataVolume:
     Type: AWS::EC2::Volume
     DeletionPolicy: Snapshot
@@ -284,6 +342,7 @@ Resources:
     Properties:
       AvailabilityZone: !GetAtt Instance.AvailabilityZone
       Size: !Ref DataVolumeSize
+      SnapshotId: !If [HasDataSnapshot, !Ref DataSnapshotId, !Ref "AWS::NoValue"]
       VolumeType: gp3
       Encrypted: true
       Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-data" }]
@@ -295,10 +354,16 @@ Resources:
       Device: /dev/sdf
 
   # The claim token is generated on the instance; the instance role may only write this secret.
+  # No fixed name: Secrets Manager keeps a deleted secret's name reserved for its recovery window,
+  # so a stack of the same name could not be created again for 30 days.
   ClaimTokenSecret:
     Type: AWS::SecretsManager::Secret
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_149
+            comment: A one-time token that is useless once claimed; the AWS managed key (aws/secretsmanager) is enough and needs no key policy.
     Properties:
-      Name: !Sub "${AWS::StackName}/claim-token"
       Description: One-time token that creates the first sbctl dashboard administrator at /claim. Single use; replace by running "sudo -u sbctl sbctl claim token" on the instance.
       SecretString: "pending - the instance writes the token here when the install finishes"
 
@@ -363,6 +428,11 @@ Resources:
   SessionManagerPolicy:
     Type: AWS::IAM::Policy
     Condition: SessionManagerOn
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: These actions accept no resource ARN narrower than *. The policy holds only the Session Manager channel actions.
     Properties:
       PolicyName: session-manager
       Roles: [!Ref InstanceRole]
@@ -414,8 +484,20 @@ Resources:
         config:
           # SubnetId defaults to "" and is only used when VpcId is given (CreateNetwork is false).
           ignore_checks: [W1030]
+      checkov:
+        skip:
+          - id: CKV_AWS_88
+            comment: The node serves the dashboard, the API and the Postgres poolers to the internet (narrow it with AccessCidr), through an Elastic IP.
+          - id: CKV_AWS_46
+            comment: False positive. User data holds no secret; the claim token is generated on the instance and written to Secrets Manager.
     Properties:
-      ImageId: !Ref AmiId
+      ImageId: !If
+        - HasAmiId
+        - !Ref AmiId
+        - !Sub
+          - "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/${Arch}/hvm/ebs-gp3/ami-id}}"
+          - Arch: !FindInMap [InstanceTypes, !Ref InstanceType, Ubuntu]
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
       InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref InstanceProfile
       NetworkInterfaces:
@@ -502,6 +584,8 @@ Resources:
               echo "UUID=$(blkid -s UUID -o value "$DEV") /var/lib/sbctl xfs defaults,nofail 0 2" >> /etc/fstab
             fi
             mountpoint -q /var/lib/sbctl || mount /var/lib/sbctl || fail "mount /var/lib/sbctl"
+            # A volume restored from a smaller snapshot comes up with the snapshot's file system size.
+            xfs_growfs /var/lib/sbctl >/dev/null 2>&1 || echo "xfs_growfs skipped"
             # If the volume is missing at a later boot, the daemon and the system Postgres must fail
             # rather than start against an empty /var/lib/sbctl on the root disk (nofail only keeps
             # the boot itself going).
@@ -614,11 +698,26 @@ Outputs:
     Description: Management API (Supabase CLI --profile api_url, MCP --api-url).
     Value: !If [HasDomain, !Sub "https://api.${DomainName}", !Sub "https://api.${ElasticIp}.sslip.io"]
   ClaimUrl:
-    Description: The claim page. Enter the token from ClaimTokenSecretArn there.
+    Description: The claim page. Enter the token from ClaimTokenCommand there.
     Value: !If [HasDomain, !Sub "https://api.${DomainName}/claim", !Sub "https://api.${ElasticIp}.sslip.io/claim"]
+  ClaimTokenCommand:
+    Description: Run this once to print the one-time claim token (needs the AWS CLI and read access to the secret).
+    Value: !Sub "aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${ClaimTokenSecret} --query SecretString --output text"
   ClaimTokenSecretArn:
-    Description: Secrets Manager secret holding the one-time claim token. Read it with "aws secretsmanager get-secret-value --secret-id <this> --query SecretString --output text".
+    Description: Secrets Manager secret that holds the claim token.
     Value: !Ref ClaimTokenSecret
+  InstanceId:
+    Description: Instance ID. The installer log is /var/log/sbctl-bootstrap.log; the daemon log is journalctl -u sbctl.
+    Value: !Ref Instance
+  ConnectCommand:
+    Description: Open a shell on the instance with Session Manager (needs the AWS CLI and its Session Manager plugin).
+    Value: !Sub "aws ssm start-session --region ${AWS::Region} --target ${Instance}"
+  BackupBucket:
+    Description: S3 bucket for WAL archives and base backups. Kept when the stack is deleted.
+    Value: !Ref BackupBucket
+  DataVolumeId:
+    Description: EBS data volume (master key, registry, projects). A final snapshot is kept when the stack is deleted; find it with this volume ID.
+    Value: !Ref DataVolume
   PublicIp:
     Description: The Elastic IP. Point DNS here when the stack does not own the zone.
     Value: !Ref ElasticIp
@@ -631,9 +730,3 @@ Outputs:
           - Created by this stack
           - !Sub "A api.${DomainName}, studio.${DomainName}, pooler.${DomainName} and *.api.${DomainName} -> ${ElasticIp}"
       - Not needed (sslip.io resolves the Elastic IP)
-  BackupBucket:
-    Description: S3 bucket for WAL archives and base backups. Kept when the stack is deleted.
-    Value: !Ref BackupBucket
-  InstanceId:
-    Description: Instance ID. Connect with Session Manager; logs are in /var/log/sbctl-bootstrap.log and journalctl -u sbctl.
-    Value: !Ref Instance

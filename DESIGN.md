@@ -81,7 +81,7 @@ Management API subset: `/v1` projects, api-keys, `database/query`, migrations, `
 
 ## 7. Install
 
-**AWS.** Click the Launch Stack link. Fill in instance size, admin email, optional domain and hosted zone. CloudFormation creates one Ubuntu 24.04 instance, an IAM role, a security group and an S3 bucket; user data runs the installer; the stack outputs the dashboard URL and a one-time claim token. First project in under ten minutes.
+**AWS.** Click the Launch Stack link, upload the release's template in the console, or run `deploy/aws/deploy.sh`. Fill in the admin email; instance size (Graviton, 8 GiB by default), domain and hosted zone are optional. CloudFormation creates one Ubuntu 24.04 instance, a data volume, an IAM role, a security group and an S3 bucket; user data runs the installer; the stack outputs the dashboard URL and the command that fetches the one-time claim token. Deleting the stack keeps the bucket and a final snapshot of the data volume. First project in under ten minutes.
 
 **Any Linux server.** Ubuntu 24.04+ or Debian 12+ (glibc 2.35 floor for the artifacts; polkit 121+ for the unit-management rule, so Ubuntu 22.04 is out). Two DNS records, then:
 

@@ -125,12 +125,16 @@ jobs:
       - name: sign and stamp (deploy/release-assets.sh)
         env:
           SBCTL_SIGNING_KEY: ${{ secrets.SBCTL_SIGNING_KEY }}
+          # The template of this release names this tag as its default sbctl release.
+          SBCTL_RELEASE_TAG: ${{ github.ref_name }}
         run: |
           umask 077
           printf '%s\n' "$SBCTL_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
           deploy/release-assets.sh dist "$RUNNER_TEMP/sign.pem" internal/selfupdate/release_key.pem
           shred -u "$RUNNER_TEMP/sign.pem" || rm -f "$RUNNER_TEMP/sign.pem"
           ls -l dist
+          # The install path for AWS users: the template (console upload) and the deploy script.
+          for f in sbctl.yaml sbctl-aws-deploy.sh; do [[ -s "dist/$f" ]] || { echo "dist/$f is missing"; exit 1; }; done
       - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -143,29 +147,60 @@ jobs:
             gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
           fi
 
-  # Optional: copy the CloudFormation template to a public S3 object so the Quick-create link in
-  # deploy/README.md works. Runs only when the repository variables SBCTL_TEMPLATE_BUCKET and
-  # SBCTL_TEMPLATE_ROLE_ARN exist (an IAM role that trusts this repository's OIDC tokens and may
-  # s3:PutObject on the bucket). The bucket must allow public reads of its objects: CloudFormation
-  # fetches the template anonymously. Nothing is created by this workflow itself.
+  # Optional: copy the release's CloudFormation template to a public S3 object, so the "Launch
+  # Stack" link of deploy/README.md works, and print that link. It runs only when the repository
+  # variables AWS_TEMPLATE_BUCKET and AWS_RELEASE_ROLE_ARN exist; without them the job is skipped
+  # and the release is complete (the template and sbctl-aws-deploy.sh are attached to it either
+  # way). AWS_RELEASE_ROLE_ARN is an IAM role that trusts this repository's GitHub OIDC token for
+  # the Environment "release" and may only s3:PutObject under templates/ of the bucket; the bucket
+  # allows public reads of templates/ (CloudFormation fetches the template anonymously). The
+  # optional variable AWS_TEMPLATE_REGION is the bucket's region (default us-east-1). The
+  # commands that create the bucket, the policy and the role are in deploy/README.md, "Launch
+  # Stack button". This workflow creates nothing in AWS.
   publish-template:
     needs: publish
-    if: ${{ vars.SBCTL_TEMPLATE_BUCKET != '' && vars.SBCTL_TEMPLATE_ROLE_ARN != '' }}
+    if: ${{ vars.AWS_TEMPLATE_BUCKET != '' && vars.AWS_RELEASE_ROLE_ARN != '' }}
     runs-on: ubuntu-24.04
+    # The Environment is what the role's trust policy names (its tag rule admits only v* tags).
+    environment: release
     timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
+    env:
+      BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
+      REGION: ${{ vars.AWS_TEMPLATE_REGION || 'us-east-1' }}
     steps:
-      - uses: actions/checkout@v4
+      - name: download the template that the release carries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern sbctl.yaml --dir "$RUNNER_TEMP/t"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.SBCTL_TEMPLATE_ROLE_ARN }}
-          aws-region: ${{ vars.SBCTL_TEMPLATE_REGION || 'us-east-1' }}
-      - name: upload sbctl.yaml
-        env:
-          BUCKET: ${{ vars.SBCTL_TEMPLATE_BUCKET }}
+          role-to-assume: ${{ vars.AWS_RELEASE_ROLE_ARN }}
+          aws-region: ${{ env.REGION }}
+      - name: upload and print the Launch Stack link
         run: |
-          aws s3 cp deploy/cloudformation/sbctl.yaml "s3://$BUCKET/$GITHUB_REF_NAME/sbctl.yaml"
-          # `sbctl.yaml` at the top is what the README link names: only stable releases move it.
-          [[ "$GITHUB_REF_NAME" == *-* ]] || aws s3 cp deploy/cloudformation/sbctl.yaml "s3://$BUCKET/sbctl.yaml"
+          src="$RUNNER_TEMP/t/sbctl.yaml"
+          keys=("templates/sbctl-$GITHUB_REF_NAME.yaml")
+          # sbctl-latest.yaml is what the README button names: only stable releases move it.
+          [[ "$GITHUB_REF_NAME" == *-* ]] || keys+=("templates/sbctl-latest.yaml")
+          for key in "${keys[@]}"; do
+            aws s3 cp "$src" "s3://$BUCKET/$key" --content-type application/x-yaml --cache-control 'max-age=300'
+            url="https://$BUCKET.s3.$REGION.amazonaws.com/$key"
+            # CloudFormation reads the template without credentials: check that it can.
+            curl -fsSL -o "$RUNNER_TEMP/t/check.yaml" "$url" \
+              || { echo "::error::$url is not publicly readable: see deploy/README.md, Launch Stack button (bucket policy)"; exit 1; }
+            cmp "$src" "$RUNNER_TEMP/t/check.yaml" || { echo "::error::the public object differs from the release's template"; exit 1; }
+            enc=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$url")
+            launch="https://$REGION.console.aws.amazon.com/cloudformation/home?region=$REGION#/stacks/create/review?templateURL=$enc&stackName=sbctl"
+            echo "Launch Stack ($key): $launch"
+            {
+              echo "### Launch Stack: \`$key\`"
+              echo
+              echo "[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)]($launch)"
+              echo
+              echo "The link creates the stack in $REGION. For another region use the console upload or deploy/aws/deploy.sh."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
