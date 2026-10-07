@@ -24,6 +24,7 @@ import (
 	"github.com/OWNER/sbctl/internal/fleet"
 	"github.com/OWNER/sbctl/internal/functions"
 	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/proxy"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
@@ -420,10 +421,24 @@ func runFunctionsDev(cmd *cobra.Command, _ []string) error {
 		if err := n.Registry.CreateAccessToken(ctx, &registry.AccessToken{UserID: devUser, Name: "functions dev", Hash: hash, Prefix: tok[:8], ExpiresAt: &expires}); err != nil {
 			return err
 		}
+		// The API enforces roles: the stand-in user is Owner of every organization for as long as
+		// this command runs, and its memberships go with the token.
+		orgs, err := n.Registry.ListOrganizations(ctx)
+		if err != nil {
+			return err
+		}
+		for _, o := range orgs {
+			if err := apiSrv.Members().EnsureOwner(ctx, members.OrgRef{ID: o.ID, Slug: o.Slug}, devUser); err != nil {
+				return err
+			}
+		}
 		defer func() {
 			dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			_ = os.Remove(fnTokenFile)
+			if err := apiSrv.Members().RemoveUser(dctx, devUser, true); err != nil {
+				log.Warn("functions dev: removing its memberships", "error", err)
+			}
 			if t, err := n.Registry.GetAccessTokenByHash(dctx, hash); err == nil && t != nil {
 				if err := n.Registry.DeleteAccessToken(dctx, devUser, t.ID); err != nil {
 					log.Warn("functions dev: deleting its access token", "error", err)

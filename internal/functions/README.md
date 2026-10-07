@@ -76,7 +76,7 @@ sbctl functions logs [ref] [-n N] [-f] [--all] the shared runtime log (journalct
 sbctl functions dev [--token-file F]           Management API + proxy + sb-edge-runtime in one process
 ```
 
-`dev` exists because `sbctl serve` (workstream X) wires the API and the proxy and this feature is not in it yet. It forces `[functions] enabled`, starts only the runtime of the fleet, mounts `api.Server` with the hook, runs the reconcile loop and the proxy with `FunctionsEnabled`, and with `--token-file` mints a personal access token for the Supabase CLI: it carries the rights of a node administrator, expires after 12 hours and is deleted, with the file, when the command ends. `tests/functions/run.sh` and `tests/linux/functions-smoke.sh` use it.
+`dev` exists because `sbctl serve` (workstream X) wires the API and the proxy and this feature is not in it yet. It forces `[functions] enabled`, starts only the runtime of the fleet, mounts `api.Server` with the hook, runs the reconcile loop and the proxy with `FunctionsEnabled`, and with `--token-file` mints a personal access token for the Supabase CLI: it carries the rights of a node administrator (its stand-in user is Owner of every organization, because the API enforces roles), expires after 12 hours and is deleted, with the file and the user's memberships, when the command ends. `tests/functions/run.sh` and `tests/linux/functions-smoke.sh` use it.
 
 ## Wiring into `sbctl serve` (not done here, `cmd/sbctl/cmd_serve.go` belongs to X)
 
