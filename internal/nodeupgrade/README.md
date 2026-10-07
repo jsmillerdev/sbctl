@@ -1,0 +1,66 @@
+# internal/nodeupgrade
+
+`supavise upgrade` and `supavise rollback`: they move a whole node, the binary, the shared services and the projects, onto a newer release of Supavise, and back. A release is a tested bundle of a binary and the Supabase service versions pinned in its `versions.yaml`; the operator tracks one version. `deploy/README.md`, "Upgrading the node", is the operator's view; this is the code's.
+
+The package holds the parts that decide things and talks to the machine through one interface, `Host`, so the order of the steps and every failure path run in unit tests without a server. `cmd/supavise/upgrade_host.go` implements `Host` for a Linux node.
+
+| File | What |
+|---|---|
+| `info.go` | `Info`: the release a binary is (`supavise release-info`): its version, the service versions it pins, the registry migrations it embeds. `DiffPins`, `CheckManifestPins` |
+| `node.go` | `Node`: what `Host.Inspect` learns before anything changes (installed version, the releases the node's units run, projects, status verdict, key escrow, disk) |
+| `plan.go` | `BuildPlan` (what changes, what restarts, the impact, which projects move or are skipped), `CheckGates` (the refusals), `DiskNeeded` |
+| `run.go` | `Run`: the upgrade in order, `Failure` and the exit statuses, the marker phases, the automatic rollback |
+| `rollback.go`, `rollback_run.go` | `CheckRollback` (the registry rule), `rollBackTo`, `Rollback` (`supavise rollback`) |
+| `releases.go` | `Releases`: the kept binaries and their records, `GC` for `keep_releases` |
+
+## The order
+
+1. **Check.** `Host.Resolve` finds the newest release (or `--version`) through `selfupdate.Fetch`: the signature of `SHA256SUMS` against the embedded keys, the signed manifest against its checksum, the manifest's version against the tag. The manifest's `min_upgrade_from` refuses a jump over a release it needs (exit 2). A release older than the installed one is refused; `supavise rollback` goes back.
+2. **Plan.** `Host.Stage` downloads the new binary next to the installed one, verifies it against the signed list and runs `release-info` on it; its pins must equal the manifest's. `BuildPlan` diffs them against what the node runs: the shared services and the system project (read from the launcher scripts the daemon rendered, `fleet.RenderedTag`), and the projects' recorded versions. A project's PostgreSQL moves only with `--include-postgres`. A shared service the node never rendered (no dashboard installed) has no unit to move and is left out. `--check` and `--plan` stop here and change nothing.
+3. **Gates**, all exit 2 with nothing changed: the node is down; the disk cannot hold the new artifacts (and a compressed copy of every project when the backups are local); another upgrade runs; the new release moves PostgreSQL to another major version. With `--unattended` also: the node is not healthy, a running project has no backup newer than 24 hours, or the master key has no copy in the backup backend. Interactively the escrow state is a warning, and the plan asks for a yes unless `--yes` is given.
+4. **Prepare**, still changing nothing that runs: the staged binary fetches every artifact that moves (`artifacts fetch`, as the supavise user; it opens no registry, so it migrates nothing), then a base backup of the system project and of every running project, three at a time, as the supavise user on the installed binary. A failure of either is exit 2.
+5. **Apply.** The running release and the new one are kept (`Releases`), the binary is swapped in with one rename, `system install-units` renders the units with it and `supavise.service` restarts and is waited for. The new daemon rolls the shared services itself, one at a time and each waited for (`fleet.Manager.Start` restarts a service whose files changed); while the marker says an upgrade runs, the first failure ends the roll. `Host.WaitShared` watches: each service in order must be set to run its new release, have restarted since the swap and answer. Then `projects upgrade --all --to gotrue=... --to postgrest=...` on the new binary moves the projects, `[upgrade] canary_projects` first, then `batch_size` at a time, stopping at the first failure; each project reuses the backup this run took (`--reuse-backup-since`).
+6. **Verify.** `supavise status` must be no worse than before, polled for up to five minutes (services say COMING_UP for a while after a restart). Then `artifacts gc` and the kept-release `GC` run.
+
+A failure from the swap on rolls back (`rollBackTo`): the registry rule first (below), then the projects this run moved go back to the releases they ran (`projects upgrade --allow-older --to ...`, on the new binary, which still runs), then the kept binary is installed again, the units rendered, the daemon restarted, the shared services waited for on their old releases, the verdict checked. Exit 3 when the node is back and as healthy as before; exit 4 when it is not, or when the rule refuses.
+
+## Exit statuses
+
+| Status | Meaning |
+|---|---|
+| 0 | upgraded, or nothing to do |
+| 2 | refused by a check, or the prepare step failed: nothing that runs was changed |
+| 3 | failed and rolled back |
+| 4 | failed and the node needs the operator: the rollback was refused or did not finish; the message says what state the node is in |
+
+`main` turns a `*Failure` into the process's status. `internal/update` reads these statuses.
+
+## The registry rule
+
+Registry migrations only go forward. `CheckRollback` compares sets: the registry may hold only migrations the release to go back to knows. It does not compare the newest name, because the lanes of the project number their migrations in separate ranges (an upgrade lane migration is numbered below a custom-domains one). A kept record carries the migrations its binary embeds (`release-info`), or, for a binary built before it could say, the ones the registry held when the upgrade kept it. A rollback that the rule refuses before it starts is exit 2 and says to restore the system project's pre-upgrade backup (`supavise backups restore system`); after that the same command goes through. An automatic rollback that the rule stops is exit 4.
+
+## Files
+
+- `<state_dir>/system/upgrade.json`, written at each phase change and every ten minutes (so a long rollout does not look dead): `phase`, `from`, `to`, `started_at`, `pid`, `detail`. It is the `notice.Upgrade` marker that `supavise status` and the alert checker read. Phases: `preparing`, `switching`, `services`, `projects`, `verifying`, `rolling_back` while it runs; `done`, `rolled_back`, `failed`, `refused` when it ends (the file stays, so status can say how the last one went). A second `supavise upgrade` refuses while the marker is fresh and its `pid` is alive.
+- `/usr/local/lib/supavise/releases/<version>/{supavise,release.json}` (beside the binary: `<prefix>/lib/supavise/releases` for a binary in `<prefix>/bin`), owned by root. The supavise user can write the state directory, and a rollback runs the kept binary as root, so the copies are not kept there. `release.json` holds the pins, the migrations, the SHA-256 of the binary (checked before a rollback installs it) and `installed_at`. `[upgrade] keep_releases` (default 3) counts the current release. A release the node was rolled back from is marked `withdrawn`, so a second rollback keeps stepping backwards; installing it again clears that.
+- `/run/supavise-maintenance.lock`: the host lock (`update.LockHost`), held from before the first change until the end, so the OS reboot in the maintenance window never lands in the middle.
+
+## Who runs what
+
+`supavise upgrade` runs as root, because the binary and the unit files are root's. Everything that touches the node's data runs as the supavise user through `runuser`, the way the installer does: the backups, the artifact fetch, `status`, the project upgrades. What root itself does is read the registry (over the system cluster's private socket, without migrating it: `registry.OpenExisting`), read the launcher scripts, replace the binary, render the units and restart the daemon. Before the swap the workers run on the installed binary, not on the one that runs the upgrade, so a newer driver does not migrate the registry before the backups are taken.
+
+## Tests
+
+```
+go test ./internal/nodeupgrade/
+```
+
+Unit tests over a fake `Host`: the plan and the diff (order of the moves, PostgreSQL held back or included, projects skipped and why, a node without a dashboard, a release that moves nothing), the gates (down, degraded, stale backups, escrow, disk, unattended against attended), the sequence of a good upgrade, `--check` and `--plan` changing nothing, every refusal changing nothing, a failed prefetch or backup, a daemon that does not come up, a shared service that does not, a halted rollout with the moved projects reverted before the binary, the registry rule stopping a rollback, a rollback that fails, the verdict after the upgrade, `supavise rollback` and its refusals, and the release store (kept, previous, withdrawn, tampered binary, unsafe names, `keep_releases`). `tests/linux/upgrade-e2e.sh` (CI job `upgrade-e2e`) runs it on a real node.
+
+## Not done
+
+- No zero-downtime daemon restart: the proxy lives in the daemon, so HTTPS fails for a few seconds. WAL archiving also pauses while the daemon restarts.
+- A project's PostgreSQL is not upgraded across a major version.
+- A killed `supavise upgrade` is not resumed; run it again, it converges (the binary is installed, the services are brought onto the release, the remaining projects move). A project left `UPGRADING` is settled by the daemon.
+- The rollback of a project puts GoTrue back on the release it ran; GoTrue's migrations went forward and stay, and the older GoTrue runs on the newer schema.
+- Events are log lines (`upgrade_started`, `upgrade_succeeded`, `upgrade_failed`, `upgrade_rolled_back`, `upgrade_refused`, `upgrade_needs_operator`, `rollback_started`, `rollback_succeeded`, `rollback_failed`); sending them anywhere is the alerting package's job.

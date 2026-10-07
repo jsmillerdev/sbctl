@@ -24,7 +24,6 @@ import (
 	"github.com/jsmillerdev/supavise/internal/backup"
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/health"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
 	"github.com/jsmillerdev/supavise/internal/notice"
@@ -185,10 +184,7 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	}
 	h.nodePins(n)
 
-	n.Verdict, n.Summary = h.status(ctx)
-	if e, err := health.EscrowCheck(h.cfg, time.Minute, false)(ctx); err == nil && e != nil {
-		n.Escrow = nodeupgrade.Escrow{Known: true, Covered: e.Covered, Detail: e.Detail}
-	}
+	n.Verdict, n.Summary, n.Escrow = h.statusReport(ctx)
 	n.DiskPath = h.cfg.StateDir
 	n.DiskFree = freeBytes(h.cfg.StateDir)
 	n.LocalBackups = strings.HasPrefix(h.cfg.Backup.Backend, "file://")
@@ -261,25 +257,49 @@ func dirBytes(root string) int64 {
 	return total
 }
 
-// status runs `supavise status --json` as the supavise user on the installed binary and returns the
-// verdict and the first line of the summary.
-func (h *nodeHost) status(ctx context.Context) (verdict, summary string) {
+// statusReport runs `supavise status --json` as the supavise user on the installed binary and
+// returns the verdict, the first line of the summary and what the report says about the master
+// key's copy in the backup backend. The report is the one place that asks the backend, and it asks
+// as the user that owns the backups: root opening a file backend that does not exist yet would
+// create it root's.
+func (h *nodeHost) statusReport(ctx context.Context) (verdict, summary string, esc nodeupgrade.Escrow) {
 	var buf bytes.Buffer
 	// Exit status 1 and 2 are verdicts; the JSON is on stdout either way.
 	_ = h.asSupavise(ctx, &buf, nil, h.binPath, "status", "--json")
+	return parseStatusReport(buf.Bytes())
+}
+
+// parseStatusReport reads the JSON `supavise status --json` prints.
+func parseStatusReport(b []byte) (verdict, summary string, esc nodeupgrade.Escrow) {
 	var rep struct {
-		Status  string `json:"status"`
-		Summary string `json:"summary"`
+		Status     string `json:"status"`
+		Summary    string `json:"summary"`
+		Components []struct {
+			Name   string `json:"name"`
+			State  string `json:"state"`
+			Detail string `json:"detail"`
+		} `json:"components"`
 	}
-	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil || rep.Status == "" {
-		return nodeupgrade.VerdictUnknown, "status printed no verdict"
+	if err := json.Unmarshal(b, &rep); err != nil || rep.Status == "" {
+		return nodeupgrade.VerdictUnknown, "status printed no verdict", esc
 	}
-	return rep.Status, rep.Summary
+	for _, c := range rep.Components {
+		if c.Name != "key escrow" {
+			continue
+		}
+		switch {
+		case c.State == "ok":
+			esc = nodeupgrade.Escrow{Known: true, Covered: true, Detail: c.Detail}
+		case strings.Contains(c.Detail, "not in the backups"):
+			esc = nodeupgrade.Escrow{Known: true, Covered: false, Detail: c.Detail}
+		}
+	}
+	return rep.Status, rep.Summary, esc
 }
 
 // Status implements nodeupgrade.Host.
 func (h *nodeHost) Status(ctx context.Context) (string, string, error) {
-	v, s := h.status(ctx)
+	v, s, _ := h.statusReport(ctx)
 	if v == nodeupgrade.VerdictUnknown {
 		return v, s, errors.New(s)
 	}

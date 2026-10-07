@@ -151,6 +151,9 @@ Hosted Supabase updates its platform for you. Here you own the node, so Supavise
 supavise update status               # settings, next window, latest release seen, last unattended upgrade
 sudo supavise update config --mode auto --window "Sun 03:00-05:00"   # opt in
 sudo supavise update config --mode notify                            # opt out again
+supavise upgrade --plan              # what a newer release would change (read-only, no root)
+sudo supavise upgrade                # move the whole node onto it (below)
+sudo supavise rollback               # and back to the previous release
 sudo supavise self-update            # replace the binary only (below)
 ```
 
@@ -206,6 +209,44 @@ Reboots are not left to unattended-upgrades. Its `Automatic-Reboot` option picks
 
 **Expected reboot impact.** A reboot stops every project, then `supavise.service` starts them one at a time. `docs/research/09-footprint.md` measured `supavise system start` on idle projects (GitHub `ubuntu-24.04`, 4 vCPU, 16 GB): 5 s at 10 projects, 12 s at 25, 24 s at 50, the same on arm64. The machine's own shutdown and boot come on top (not measured), and a node with large databases or WAL to replay takes longer than idle projects. `supavise.service` waits up to 10 minutes for running lifecycle operations before it stops, and Postgres shuts down with a fast shutdown. The units of a project are not ordered after `supavise.service`, so systemd stops them at the same time as the drain; that is why the service reboots only a quiet node (above) and does not count on the drain. Plan the window for the whole gap, and set `os_reboot = "never"` if a person must choose the moment (`supavise update status` then says "a reboot is waiting").
 
+### Upgrading the node: `supavise upgrade`
+
+```bash
+supavise upgrade --check                     # is there a newer release? (no root, changes nothing)
+supavise upgrade --plan                      # what would change and restart (no root, changes nothing)
+sudo supavise upgrade                        # shows the plan, asks, upgrades
+sudo supavise upgrade --yes --version v1.4.0
+sudo supavise upgrade --yes --include-postgres   # also move the projects' PostgreSQL
+sudo supavise upgrade --unattended           # what the maintenance window runs; never asks
+sudo supavise rollback                       # back to the previous kept release
+```
+
+A release is a tested bundle: the binary and the Supabase service versions pinned in it. `supavise upgrade` moves the node onto one, the way hosted Supabase moves its platform: the node's own services come first, and each project's GoTrue and PostgREST follow in a rollout. Hosted lets a project's owner decide when its Postgres is upgraded; so does this: a project's PostgreSQL release moves only with `--include-postgres` (or later, per project, from Studio or `supavise projects upgrade`), and each move restarts that PostgreSQL.
+
+What it does, in order (`--check` and `--plan` stop after the plan):
+
+1. **Check.** It finds the newest release (or `--version`), verifies the signature and the signed manifest, and refuses a jump the manifest does not allow (`min_upgrade_from`: upgrade to the version it names first).
+2. **Plan.** It downloads the new binary next to the installed one, verifies it, asks it which service versions it pins, and prints the binary change, every service that changes version, what restarts, the expected impact and the projects it will move or skip. For a release that moves GoTrue, Realtime and Storage the impact reads: the daemon restarts (HTTPS fails for a few seconds), Realtime restarts (every websocket drops), Storage restarts (uploads in flight fail), each project's GoTrue and PostgREST restart (a minute or two offline each), Supavisor restarts only when the release moves it (every pooled connection drops).
+3. **Prepare**, with nothing stopped: it fetches every artifact that moves, checks the disk, and takes a base backup of the system project (the registry) and of every running project, three at a time. If anything fails here it exits with status 2 and the node is as it was. A paused project is not backed up; its data does not change.
+4. **Apply.** It keeps the running binary and the new one, swaps the binary in, restarts the daemon and waits until it answers. The new daemon moves the shared services one at a time, each waited for; the upgrade watches each one come up on its new release. Then the projects: `[upgrade] canary_projects` (default 1, the smallest database) first, then `batch_size` (default 5) at a time, stopping at the first failure. A project that cannot be upgraded (paused, unhealthy, an extension the new PostgreSQL cannot serve, already newer than the release) is skipped and listed.
+5. **Verify.** `supavise status` must be no worse than before. Then unused artifacts and kept releases beyond `[upgrade] keep_releases` (default 3, the current one counts) are removed.
+
+If the new daemon does not answer, a shared service does not come up on its release, a project fails or the node is worse afterwards, the upgrade rolls back by itself: the projects it moved go back to the releases they ran, the previous binary is installed again with its units, and the services and the status are checked. Exit status: `0` upgraded or nothing to do; `2` refused by a check, nothing changed; `3` failed and rolled back; `4` failed and the node needs you (the message says what state it is in). `internal/update` (the maintenance window) acts on these.
+
+`--unattended` implies `--yes` and refuses (status 2) unless `supavise status` says healthy, every running project has a backup newer than 24 hours (fresh ones are taken anyway) and the master key has an encrypted copy in the backup backend (`supavise system escrow-key`). Run by hand without `--unattended`, a missing copy of the key is a warning in the plan.
+
+While it runs, `<state_dir>/system/upgrade.json` holds `phase` (`preparing`, `switching`, `services`, `projects`, `verifying`, `rolling_back`), `from`, `to`, `started_at`, `pid` and `detail`; `supavise status` shows it, and it stays with a final phase (`done`, `rolled_back`, `failed`, `refused`) when the upgrade ends. A second upgrade refuses while the first lives. The command holds the host lock, so the OS reboot of the maintenance window never lands in the middle of it.
+
+`supavise rollback` goes back to the previous kept release: its binary and units, its service versions, and the projects the last upgrade moved on the releases they ran. The binaries are kept in `/usr/local/lib/supavise/releases/<version>/`, owned by root (the supavise user can write the state directory, and a rollback runs the kept binary as root), with a record of each release's pins and registry migrations. Registry migrations only go forward, so the rollback refuses (status 2) when the registry holds a migration the old release does not know: restore the system project's pre-upgrade backup (`supavise backups restore system`), then run it again. GoTrue's migrations also stay applied; the older GoTrue runs on the newer schema, and the pre-upgrade backup is the way back for the data.
+
+| Key in `[upgrade]` | Default | Meaning |
+|---|---|---|
+| `canary_projects` | 1 | projects upgraded one at a time first; a failure stops the rollout. `-1` for none |
+| `batch_size` | 5 | projects upgraded at once after the canaries |
+| `keep_releases` | 3 | releases whose binary and artifacts stay on disk, for `supavise rollback` |
+
+Details and the code's rules: `internal/nodeupgrade/README.md`. A new `supavise` binary is also a plain `self-update` away (below); `supavise upgrade` is what brings the services and projects along.
+
 ### Replacing the binary by hand: self-update
 
 ```bash
@@ -220,7 +261,7 @@ A binary built without a committed release key refuses to self-update (it names 
 
 ### Project versions
 
-A release pins the Postgres, GoTrue and PostgREST versions that new projects get. Existing projects keep the versions they run until their Owner or Administrator upgrades them, the way hosted Supabase lets a project owner decide when to upgrade: in Studio under Settings > General, "Service versions" (the "Upgrade project" button appears when the node pins newer versions than the project runs), with `POST /v1/projects/{ref}/upgrade`, or on the node:
+`supavise upgrade` (above) moves the projects' GoTrue and PostgREST for you. A release pins the Postgres, GoTrue and PostgREST versions that new projects get. Existing projects keep the versions they run until their Owner or Administrator upgrades them, the way hosted Supabase lets a project owner decide when to upgrade: in Studio under Settings > General, "Service versions" (the "Upgrade project" button appears when the node pins newer versions than the project runs), with `POST /v1/projects/{ref}/upgrade`, or on the node:
 
 ```bash
 supavise projects versions                 # what every project runs and whether an upgrade is available
@@ -608,6 +649,8 @@ Nothing has been tagged or released from this repository by the tooling.
 - `supavise self-update` against a local release server: refuses a tampered binary, a wrong key and an older signed binary under a newer tag, installs v0.0.3, restarts the daemon, leaves the project's Postgres running; then a release whose daemon exits on `serve` is rolled back to v0.0.3, whose daemon answers again;
 - the claim token stays out of the installer's output when `--claim-token-file` is used;
 - `supavise status --json` on the healthy node reports every check and exits 0; with the project's PostgREST stopped it exits 1, names the project and `/healthz` stays a 200 that says degraded; `/healthz/detail` needs a token; an announced maintenance window shows in `supavise status` and clears, while the Studio host's `/api/incident-banner` stays empty.
+
+`tests/linux/upgrade-e2e.sh` (the `upgrade-e2e` job, `tests/linux/upgrade-e2e-build.sh` builds its binaries) installs the previous release (origin/main with older GoTrue, PostgREST, postgres-meta and Storage pins) and covers the node upgrade: `--check` and `--plan` change nothing, refusals (a release that does not exist, `min_upgrade_from`, a tampered binary, `--unattended` without escrow and backups, an artifact that cannot be fetched) exit with status 2 and leave the node as it was, the upgrade itself (versions in the registry and in the running processes, PostgreSQL untouched, data and an auth user intact, the kept releases, the marker, `supavise status`, a second run with nothing to do), a release whose daemon dies and one whose PostgREST does not start (status 3, the rollout stops at the first project, back on the previous release), and `supavise rollback` (refused while the registry holds a migration the previous release does not know, then the projects and the binary go back).
 
 `tests/linux/upgrade-smoke.sh` (the `upgrade-smoke` job) covers project upgrades under systemd: projects on older GoTrue and PostgREST releases than the node's pins, kept on them by a node update, an upgrade onto a release that does not start (rolled back), the upgrade that works through the Management API (versions, the running processes, the data and an auth user intact), `supavise projects upgrade --all --yes` and `supavise artifacts gc` (`tests/linux/README.md`).
 

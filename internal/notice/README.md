@@ -7,7 +7,9 @@ Both live in small JSON files under `<state_dir>/system/` (0644, written atomica
 | File | Writer | Content |
 |---|---|---|
 | `maintenance.json` | `supavise maintenance announce` / `clear` | `id`, `message`, `starts_at`, `ends_at`, `lead_seconds`, `announced_at` |
-| `upgrade.json` | the upgrade (`supavise upgrade`) | `phase`, `from`, `to`, `started_at` |
+| `upgrade.json` | the upgrade (`supavise upgrade`, `supavise rollback`) | `phase`, `from`, `to`, `started_at`, `pid`, `detail` |
+
+`supavise upgrade` writes the file at every phase change and every ten minutes while it runs. Its phases are `preparing`, `switching`, `services`, `projects`, `verifying` and `rolling_back`; it ends with `done`, `rolled_back`, `failed` or `refused`, and the file stays. `pid` is the process that runs it: another upgrade refuses to start while a fresh marker's process is alive. The daemon reads the marker too: while an upgrade runs, its start of the shared services stops at the first failure (`fleet.Deps.HaltOnFailure`).
 
 An upgrade counts as running while `phase` is not a finished one (`done`, `complete`, `succeeded`, `failed`, `rolled_back`, `aborted`, `refused`, empty) and its last sign of life is under two hours old, so a marker left by a process that died stops counting soon. The last sign of life is `started_at` or the file's modification time, whichever is later (`Upgrade.Heartbeat`); a marker with neither does not count. The upgrade should rewrite the file at each phase change, which keeps it alive, and remove it or set a finished phase when it ends. An unreadable file reads as "no upgrade".
 

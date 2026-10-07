@@ -189,6 +189,12 @@ the project runs the row's target versions, `failed` otherwise. An operator need
 beyond waiting for the next pass or restarting the daemon; with no daemon, `supavise serve` settles
 the project when it starts. The pre-upgrade backup id stays in the events and the status row.
 
+### What a node upgrade adds
+
+`supavise upgrade` (`internal/nodeupgrade`) drives `Engine.UpgradeProject` through the CLI: `projects upgrade --all --to <service>=<tag>...` moves a project only to the releases named (a service it does not name stays; `--include-postgres` is how the node upgrade names PostgreSQL), and three more request fields serve it. `UpgradeRequest.Target` and `UpgradeEligibilityFor(ref, request)` plan for a target other than the node's pins. `AllowOlder` (`--allow-older`) lets the target be older than what the project runs: the one move to an older release that is allowed, used by `supavise rollback` to put the projects an upgrade moved back on the releases they ran (tags that cannot be ordered stay refused). `ReuseBackupSince` (`--reuse-backup-since`, hidden) lets the upgrade take as its pre-upgrade backup a completed base backup of the project that finished after that time instead of taking another: the node upgrade backs everything up first, and a base backup plus the archived WAL after it restores a project to any moment up to the upgrade.
+
+Two changes make a release take effect on units that are already running. `startAPI` (a project's GoTrue and PostgREST, at every start) renders the units and stops a running one whose files changed, so that the `Start` after it runs the new files (it used to leave the old process running: `Start` on a running unit is a no-op); an unchanged unit is left alone. And `Engine.EnsureTenants` registers every active project with Supavisor, Realtime and Storage again, one at a time; the tenants' fingerprints include the release tag of Storage and Realtime (`internal/fleet`), so after a release moved either of them the call sends each project's tenant once more, which is what runs the new release's tenant migrations in every project's database (Storage on the tenant update, Realtime on the tenant create). The daemon calls it once the shared services and the projects have started; with nothing changed it asks each service and sends nothing.
+
 ### Extensions
 
 A Postgres upgrade swaps the binaries under the same data directory, and the extensions created in

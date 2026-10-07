@@ -124,3 +124,9 @@ On darwin-arm64 with the slim-services artifacts under the exec backend, through
 ## Tenant presence
 
 `TenantChecker.HasTenant(ctx, ref)` asks a service whether it holds a project's tenant: one GET of the tenant record, 2xx is present, 404 absent, anything else (and a service that cannot be reached) an error, with no retries so that a health check never waits out `EnsureTenant`'s backoff. Supavisor, Realtime and Storage implement it; `Fleet.TenantPresence(ctx, ref)` asks all of them at once and keeps the fleet's order. The lazy tenants skip a service the node never rendered and answer "present". `internal/health` uses it for the per-project check.
+
+## Releases and upgrades
+
+- `Manager.Start` restarts a running service whose rendered files changed, one at a time and each waited for. `Deps.HaltOnFailure` makes it stop at the first service that does not start; the daemon sets it while a `supavise upgrade` is running (`notice.UpgradeRunning`), so that a release whose Realtime does not come up does not also restart Storage, and the upgrade rolls back with the later services still on the old release.
+- `RenderedTag(cfg, svc)` reads the release a service's launcher script is set to run (the artifact directory in `<state_dir>/projects/system/<svc>.run`). `supavise upgrade` uses it to learn what release a node runs without asking the binary that rendered it, and to see that a service moved.
+- The Storage and Realtime tenants fold the release tag of their service into the fingerprint they keep per project (`withRelease`), so a Supavise release that moves either one sends every tenant once more through `Engine.EnsureTenants`: Storage runs its tenant migrations when the tenant is updated, Realtime when it is created. A node that cannot say which release it runs keeps the old fingerprint. Supavisor's tenants are not sent again: that would drop its pools, and a new Supavisor needs nothing in a tenant.

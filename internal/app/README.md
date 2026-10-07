@@ -41,7 +41,12 @@ is the daemon that `supavise.service` runs.
   (`cmd/supavise/serve_fleet.go`: a `fleet.Lazy`, bound to the registry and master key right after
   `lifecycle.Open`, `Options.BindFleet`), so the daemon and the CLI register tenants the same way.
   A service whose artifact was never fetched fails at boot and is logged; the rest of the node
-  comes up. The installer fetches the artifacts with `supavise fleet start` first.
+  comes up. The installer fetches the artifacts with `supavise fleet start` first. A service whose
+  files changed (a release moved its pin) is restarted, one at a time, each waited for; while a
+  `supavise upgrade` runs the first failure ends the roll (`fleet.Deps.HaltOnFailure`). When the
+  services and `startProjects` are both done, `ensureTenants` registers every active project with
+  the shared services again (`Engine.EnsureTenants`), which runs a new Storage or Realtime
+  release's tenant migrations; with nothing changed it sends nothing.
 - **The WAL relay.** With `[backup] wal_relay` on (the default under systemd) `Serve` starts
   `app.StartWALRelay` before it opens the registry and stops it after the lifecycle drain; it serves
   one unix socket per project through which the clusters archive and restore WAL without holding

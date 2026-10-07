@@ -121,3 +121,29 @@ func TestFailureReachesMainWithItsStatus(t *testing.T) {
 		t.Fatal("not a Failure with status 3")
 	}
 }
+
+func TestParseStatusReport(t *testing.T) {
+	report := func(escrowState, escrowDetail string) []byte {
+		b, _ := json.Marshal(map[string]any{"status": "healthy", "summary": "healthy: 2 projects answering",
+			"components": []map[string]string{{"name": "disk", "state": "ok"}, {"name": "key escrow", "state": escrowState, "detail": escrowDetail}}})
+		return b
+	}
+	v, s, e := parseStatusReport(report("ok", "an encrypted copy of this node's key is in the backup backend"))
+	if v != "healthy" || !strings.HasPrefix(s, "healthy:") || !e.Known || !e.Covered {
+		t.Fatalf("covered: %q %q %+v", v, s, e)
+	}
+	_, _, e = parseStatusReport(report("info", "the master key is not in the backups: run `supavise system escrow-key`"))
+	if !e.Known || e.Covered {
+		t.Fatalf("not covered: %+v", e)
+	}
+	_, _, e = parseStatusReport(report("info", "could not check the backup backend: timeout"))
+	if e.Known {
+		t.Fatalf("an unreachable backend is not an answer: %+v", e)
+	}
+	if v, _, _ := parseStatusReport([]byte("not json")); v != nodeupgrade.VerdictUnknown {
+		t.Fatalf("garbage reads as %q", v)
+	}
+	if v, _, _ := parseStatusReport([]byte(`{"summary":"x"}`)); v != nodeupgrade.VerdictUnknown {
+		t.Fatalf("a report with no verdict reads as %q", v)
+	}
+}
