@@ -216,8 +216,8 @@ Clone timings (APFS, darwin-arm64, exec backend, `TestIntegrationCloneSize`):
 |---|---|---|---|---|---|
 | 42 MB (the test parent) | clonefile | not recorded | 316 ms | 3.0 s | 312 KiB |
 | 167 MB (150 MB of 100 KB rows) | clonefile | 108 ms | 282 ms | 3.0 s | 264 KiB for the clone, 17.9 MiB for the whole creation |
-| 1.1 GiB (CI, XFS `reflink=1` on a loop file) | reflink | 100 ms | 147 ms | 3.0 s | 1.2 MiB for the clone, 19.7 MiB for the whole creation |
-| 1.1 GiB (CI, ext4) | base-backup | not applicable | not applicable | 7.0 s (the parent's base backup took 5.7 s beforehand) | 1.19 GB |
+| 1.1 GiB (CI, XFS `reflink=1` on a loop file; two runs) | reflink | 47 to 100 ms | 147 to 226 ms | 3.0 to 4.3 s | 0.2 to 1.2 MiB for the clone, about 20 MiB for the whole creation |
+| 1.1 GiB (CI, ext4; two runs) | base-backup | not applicable | not applicable | 7.0 to 12.2 s (the parent's base backup took 5.7 s beforehand in the first run) | 1.19 to 1.21 GB |
 
 "Whole branch creation" is dominated by starting the new project (PostgreSQL, GoTrue migrations,
 PostgREST) and rotating its credentials, not by the clone. New disk is the drop in free space of the
