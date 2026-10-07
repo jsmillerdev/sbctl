@@ -6,7 +6,7 @@
 # node in the sandbox of sb-edge-bundle@<ref>.service), calls them with supabase-js and checks
 # isolation between the projects. On top of that this script checks what only systemd can show: the
 # unit's user, slice and memory limit, what its mount namespace hides, that the bundler's module
-# cache is per project (an upload of project B cannot import a module that project A's upload made
+# cache is per project (an upload of one project cannot import a module that another project's upload made
 # the bundler download) and goes with the project, recovery after `kill -9` of the runtime, and
 # that the runtime-wide worker budget refuses what would not fit.
 #
@@ -147,7 +147,12 @@ export PROC_ESCAPE_PIDS="$RT_PID $DAEMON_PID"
 "$REPO_ROOT/tests/functions/run.sh" || fail "tests/functions/run.sh"
 
 log "the bundler's module cache is per project"
-# Project A's upload makes the bundler fetch a package; project B's uploads must not be able to
+# run.sh deleted project B at its end (and with it B's bundler cache: the check follows), so a
+# third project, V, plays the part of the victim whose uploads try to import A's cache.
+[[ ! -e /var/cache/private/sb-edge-bundle/$REF_B && ! -e /var/cache/sb-edge-bundle/$REF_B ]] || fail "the module cache of the deleted project $REF_B is still there"
+REF_V=$(create_project fn-v micro)
+[[ $REF_V =~ ^[a-z]{20}$ ]] || fail "bad ref '$REF_V'"
+# Project A's upload makes the bundler fetch a package; project V's uploads must not be able to
 # import what is now in A's cache, however the path is spelled. The marker is the package.json of
 # the package, a JSON module that an import can name (as the steal checks of run.sh do).
 PAT=$(<"$PAT_FILE")
@@ -163,38 +168,38 @@ printf 'import postgres from "npm:postgres@3.4.5"\nDeno.serve(() => new Response
 cache_marker() { # REF: the package.json of the package in REF's cache, as the unit's namespace names it
   find "$CACHE_ROOT/$1/" -path '*/postgres/3.4.5/package.json' 2>/dev/null | head -1
 }
-for ref in "$REF_A" "$REF_B"; do
+for ref in "$REF_A" "$REF_V"; do
   out=$(deploy_src "$ref" cachemark "$LOG_DIR/cache-mark.ts") || fail "curl: cachemark upload to $ref"
   [[ $(tail -n1 <<<"$out") =~ ^20[01]$ ]] || fail "the upload that imports npm:postgres to $ref answered: $out"
   [[ -d $CACHE_ROOT/$ref ]] || fail "the bundler of $ref has no cache directory $CACHE_ROOT/$ref ($(ls -la "$CACHE_ROOT/" /var/cache/private/ 2>&1 | tr '\n' ' '))"
   [[ $(stat -c %a "$CACHE_ROOT/$ref/") == 700 ]] || fail "$CACHE_ROOT/$ref has mode $(stat -c %a "$CACHE_ROOT/$ref/"), want 700"
 done
-A_MARKER=$(cache_marker "$REF_A"); B_MARKER=$(cache_marker "$REF_B")
-[[ -n $A_MARKER && -n $B_MARKER ]] || fail "no cached postgres package in the caches of A ('$A_MARKER') or B ('$B_MARKER'): $(find "$CACHE_ROOT/$REF_A/" -maxdepth 4 2>&1 | head -20 | tr '\n' ' ')"
-[[ $A_MARKER != "$B_MARKER" && $A_MARKER == "$CACHE_ROOT/$REF_A/"* && $B_MARKER == "$CACHE_ROOT/$REF_B/"* ]] || fail "the caches are not separate directories: $A_MARKER $B_MARKER"
-# Control: a bundling of B can import a module of B's own cache, so the refusals below are about
+A_MARKER=$(cache_marker "$REF_A"); V_MARKER=$(cache_marker "$REF_V")
+[[ -n $A_MARKER && -n $V_MARKER ]] || fail "no cached postgres package in the caches of A ('$A_MARKER') or V ('$V_MARKER'): $(find "$CACHE_ROOT/$REF_A/" -maxdepth 4 2>&1 | head -20 | tr '\n' ' ')"
+[[ $A_MARKER != "$V_MARKER" && $A_MARKER == "$CACHE_ROOT/$REF_A/"* && $V_MARKER == "$CACHE_ROOT/$REF_V/"* ]] || fail "the caches are not separate directories: $A_MARKER $V_MARKER"
+# Control: a bundling of V can import a module of V's own cache, so the refusals below are about
 # whose cache it is and not about importing a file by path.
 steal_cache() { # NAME IMPORT-PATH EXPECTED-STATUS-REGEX
   printf 'import marker from "file://%s" with { type: "json" }\nDeno.serve(() => Response.json(marker))\n' "$2" >"$LOG_DIR/cache-steal.ts"
-  local out; out=$(deploy_src "$REF_B" cachesteal "$LOG_DIR/cache-steal.ts") || fail "curl: cache steal upload ($1)"
-  [[ $(tail -n1 <<<"$out") =~ $3 ]] || fail "an upload of B that imports $1 answered: $out"
+  local out; out=$(deploy_src "$REF_V" cachesteal "$LOG_DIR/cache-steal.ts") || fail "curl: cache steal upload ($1)"
+  [[ $(tail -n1 <<<"$out") =~ $3 ]] || fail "an upload of V that imports $1 answered: $out"
   if [[ $3 == '^400$' ]]; then
     grep -q "Could not bundle" <<<"$out" || fail "the refusal ($1) does not say why: $out"
     grep -q '"name": *"postgres"' <<<"$out" && fail "the bundler's error ($1) shows the package of A's cache: $out"
-    [[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$API/v1/projects/$REF_B/functions/cachesteal") == 404 ]] || fail "the refused upload ($1) was stored"
+    [[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$API/v1/projects/$REF_V/functions/cachesteal") == 404 ]] || fail "the refused upload ($1) was stored"
   else
-    delete_fn "$REF_B" cachesteal
+    delete_fn "$REF_V" cachesteal
   fi
 }
-steal_cache "its own cache (control)" "$B_MARKER" '^20[01]$'
+steal_cache "its own cache (control)" "$V_MARKER" '^20[01]$'
 steal_cache "A's cache by its path" "$A_MARKER" '^400$'
 steal_cache "A's cache through the private directory" "/var/cache/private/sb-edge-bundle/${A_MARKER#"$CACHE_ROOT"/}" '^400$'
-steal_cache "A's cache through B's own directory" "$CACHE_ROOT/$REF_B/../${A_MARKER#"$CACHE_ROOT"/}" '^400$'
+steal_cache "A's cache through V's own directory" "$CACHE_ROOT/$REF_V/../${A_MARKER#"$CACHE_ROOT"/}" '^400$'
 steal_cache "the shared cache of earlier versions" "$CACHE_ROOT/${A_MARKER#"$CACHE_ROOT/$REF_A/"}" '^400$'
-delete_fn "$REF_A" cachemark; delete_fn "$REF_B" cachemark
+delete_fn "$REF_A" cachemark; delete_fn "$REF_V" cachemark
 
-log "the bundler unit ran for project B's uploads and is idle now"
-B=sb-edge-bundle@$REF_B.service
+log "the bundler unit ran for project V's uploads and is idle now"
+B=sb-edge-bundle@$REF_V.service
 [[ $(unit_state "$B") == inactive ]] || fail "$B is $(unit_state "$B")"
 [[ $(systemctl show -p Result --value "$B") == success ]] || fail "$B: last result $(systemctl show -p Result --value "$B")"
 # Another uid than the sbctl user: the kernel then refuses /proc/<pid>/root and environ of every
@@ -256,7 +261,7 @@ install -d -o "$SBCTL_USER" -g "$SBCTL_USER" -m 0755 "$SBCTL_STATE/system/edge-b
 install -m 0666 /dev/null "$SBCTL_STATE/system/edge-bundle/work/out/out.eszip"
 chown "$SBCTL_USER:$SBCTL_USER" "$SBCTL_STATE/system/edge-bundle/work/out/out.eszip"
 declare -A PROBE_UID
-for pair in "$REF_B:$REF_A:$A_MARKER:$B_MARKER" "$REF_A:$REF_B:$B_MARKER:$A_MARKER"; do
+for pair in "$REF_V:$REF_A:$A_MARKER:$V_MARKER" "$REF_A:$REF_V:$V_MARKER:$A_MARKER"; do
   IFS=: read -r self other other_marker self_marker <<<"$pair"
   inst=sb-edge-bundle@$self.service
   install -d /run/systemd/system/$inst.d
@@ -284,8 +289,8 @@ rm -f /usr/local/sbin/sbctl-bundle-probe
 rm -rf "$SBCTL_STATE/system/edge-bundle/work"
 # Each project's bundler runs under a uid of its own, so that the mode of its cache directory (0700) keeps
 # the others out even where a directory of another project is in reach.
-[[ -n ${PROBE_UID[$REF_A]} && -n ${PROBE_UID[$REF_B]} && ${PROBE_UID[$REF_A]} != "${PROBE_UID[$REF_B]}" ]] || fail "the bundlers of A and B do not run under different uids (A: ${PROBE_UID[$REF_A]:-?}, B: ${PROBE_UID[$REF_B]:-?})"
-[[ ${PROBE_UID[$REF_A]} != "$(id -u "$SBCTL_USER")" && ${PROBE_UID[$REF_B]} != "$(id -u "$SBCTL_USER")" ]] || fail "a bundler runs under the sbctl uid"
+[[ -n ${PROBE_UID[$REF_A]} && -n ${PROBE_UID[$REF_V]} && ${PROBE_UID[$REF_A]} != "${PROBE_UID[$REF_V]}" ]] || fail "the bundlers of A and V do not run under different uids (A: ${PROBE_UID[$REF_A]:-?}, V: ${PROBE_UID[$REF_V]:-?})"
+[[ ${PROBE_UID[$REF_A]} != "$(id -u "$SBCTL_USER")" && ${PROBE_UID[$REF_V]} != "$(id -u "$SBCTL_USER")" ]] || fail "a bundler runs under the sbctl uid"
 
 log "crash recovery: kill -9 of the runtime"
 open_code() { http_code "http://$REF_A.api.$DOMAIN:$P_HTTP/functions/v1/open"; }
@@ -353,17 +358,17 @@ log "$U holds 4 workers: MemoryCurrent $((mem / 1048576)) MiB of 1408"
 [[ $(systemctl show -p NRestarts --value "$U") == 0 ]] || fail "$U restarted"
 
 log "deleting a project removes the module cache of its bundler"
-# C has its sources bundled once (so its instance of the bundler has a cache directory, private to
-# that instance's uid, which the daemon cannot delete itself), then goes. A's and B's caches stay.
-out=$(deploy_src "$REF_C" cachemark "$LOG_DIR/cache-mark.ts") || fail "curl: cachemark upload to $REF_C"
-[[ $(tail -n1 <<<"$out") =~ ^20[01]$ ]] || fail "the upload that imports npm:postgres to $REF_C answered: $out"
-[[ -d $CACHE_ROOT/$REF_C && -n $(cache_marker "$REF_C") ]] || fail "the bundler of $REF_C has no cached package in $CACHE_ROOT/$REF_C"
-[[ -f $SBCTL_STATE/projects/$REF_C/edge-bundle.env ]] || fail "no rendered files for the bundler of $REF_C"
-sbctl projects delete "$REF_C" --skip-final-backup >/dev/null || fail "projects delete $REF_C"
-for gone in "$CACHE_ROOT/$REF_C" "/var/cache/private/sb-edge-bundle/$REF_C" "$SBCTL_STATE/projects/$REF_C"; do
+# V's bundler has a cache directory (above), private to that instance's uid, which the daemon cannot
+# delete itself; V goes, A's cache stays.
+out=$(deploy_src "$REF_V" cachemark "$LOG_DIR/cache-mark.ts") || fail "curl: cachemark upload to $REF_V"
+[[ $(tail -n1 <<<"$out") =~ ^20[01]$ ]] || fail "the upload that imports npm:postgres to $REF_V answered: $out"
+[[ -d $CACHE_ROOT/$REF_V && -n $(cache_marker "$REF_V") ]] || fail "the bundler of $REF_V has no cached package in $CACHE_ROOT/$REF_V"
+[[ -f $SBCTL_STATE/projects/$REF_V/edge-bundle.env ]] || fail "no rendered files for the bundler of $REF_V"
+sbctl projects delete "$REF_V" --skip-final-backup >/dev/null || fail "projects delete $REF_V"
+for gone in "$CACHE_ROOT/$REF_V" "/var/cache/private/sb-edge-bundle/$REF_V" "$SBCTL_STATE/projects/$REF_V"; do
   [[ ! -e $gone ]] || fail "$gone is still there after the project was deleted"
 done
-[[ $(unit_state "sb-edge-bundle@$REF_C.service") == inactive ]] || fail "the bundler of the deleted project is $(unit_state "sb-edge-bundle@$REF_C.service")"
-[[ -d $CACHE_ROOT/$REF_A && -d $CACHE_ROOT/$REF_B && -n $(cache_marker "$REF_B") ]] || fail "deleting $REF_C removed the cache of another project"
+[[ $(unit_state "sb-edge-bundle@$REF_V.service") == inactive ]] || fail "the bundler of the deleted project is $(unit_state "sb-edge-bundle@$REF_V.service")"
+[[ -d $CACHE_ROOT/$REF_A && -n $(cache_marker "$REF_A") ]] || fail "deleting $REF_V removed the cache of project A"
 
 log "functions smoke test passed"
