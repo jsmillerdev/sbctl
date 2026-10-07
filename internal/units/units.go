@@ -26,6 +26,38 @@ type Spec struct {
 	// in order before Exec, with the same environment; a failing command stops the
 	// unit. GoTrue uses it for "bin/auth migrate".
 	PreStart [][]string
+	// DenyEgress confines the unit's network traffic to loopback (systemd: IPAddressDeny=any
+	// with IPAddressAllow=localhost, applied as a persistent per-unit drop-in). A Spec without
+	// it lifts a restriction an earlier Render of the same unit set. Only the systemd backend
+	// can enforce it: the exec backend (development and tests) runs plain child processes and
+	// ignores the field, which EgressEnforcer lets a caller ask about.
+	DenyEgress bool
+}
+
+// EgressEnforcer is implemented by the supervisors that apply Spec.DenyEgress.
+type EgressEnforcer interface {
+	EnforcesEgress() bool
+}
+
+// IPRange is one entry of systemd's IPAddressAllow= and IPAddressDeny= lists as the D-Bus
+// API takes it (a(iayu)): the address family (AF_INET 2, AF_INET6 10), the address bytes and
+// the prefix length.
+type IPRange struct {
+	Family int32
+	Addr   []byte
+	Prefix uint32
+}
+
+// EgressDeny is IPAddressDeny=any: every IPv4 and IPv6 address.
+func EgressDeny() []IPRange {
+	return []IPRange{{Family: 2, Addr: make([]byte, 4)}, {Family: 10, Addr: make([]byte, 16)}}
+}
+
+// EgressAllow is IPAddressAllow=localhost: 127.0.0.0/8 and ::1.
+func EgressAllow() []IPRange {
+	v6 := make([]byte, 16)
+	v6[15] = 1
+	return []IPRange{{Family: 2, Addr: []byte{127, 0, 0, 0}, Prefix: 8}, {Family: 10, Addr: v6, Prefix: 128}}
 }
 
 // Unit returns the systemd unit name for the spec.

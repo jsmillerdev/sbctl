@@ -35,6 +35,51 @@ type CreateInput struct {
 	Seed string
 	// IsDefault is accepted so that the request body decodes, and refused when true.
 	IsDefault bool
+	// AllowEgress is the opt-out of the isolation a branch with data gets by default (sbctl
+	// only: the Management API's create body has no such field, the API takes it as the query
+	// parameter allow_egress=true). Without it, the branch's Postgres unit may reach loopback
+	// only (systemd's IPAddressDeny, where the supervisor can enforce it) and the parent's
+	// pg_cron jobs are paused. With it, the branch keeps the parent's outbound side effects:
+	// its webhooks, pg_net calls, cron jobs and foreign servers act on the outside world as
+	// the parent's do. Logical replication subscriptions are detached either way. Ignored
+	// without WithData: a schema-only branch inherits no data.
+	AllowEgress bool
+}
+
+// egressEnforced reports whether the supervisor can confine a unit's network traffic: the
+// systemd backend can, the exec backend (development and tests) runs plain child processes.
+func (s *Service) egressEnforced() bool { return s.cfg.Supervisor != config.SupervisorExec }
+
+// egressPolicy is the registry.BranchInfo.Egress a branch with data starts with.
+func (s *Service) egressPolicy(allow bool) string {
+	switch {
+	case allow:
+		return registry.EgressAllowed
+	case !s.egressEnforced():
+		return registry.EgressUnenforced
+	}
+	return registry.EgressPending
+}
+
+// keepsCron reports whether the cron jobs of a branch with this policy stay active.
+func (s *Service) keepsCron(egress string) bool {
+	return s.cfg.Branching.KeepCronJobs || egress == registry.EgressAllowed
+}
+
+// egressDetail is the sentence a branch's detail carries about its outbound network, so that
+// the state a client reads says what the branch can reach.
+func (s *Service) egressDetail(egress string) string {
+	cron := "pg_cron jobs paused (the ones that were active are in sbctl_branch.paused_cron_jobs)"
+	if s.keepsCron(egress) {
+		cron = "pg_cron jobs left active"
+	}
+	switch egress {
+	case registry.EgressAllowed:
+		return "egress NOT blocked (created with allow_egress): webhooks, pg_net, foreign servers and cron jobs act on the outside world as the parent's do; " + cron
+	case registry.EgressUnenforced:
+		return "egress NOT blocked: the exec supervisor cannot confine a unit's network, so webhooks, pg_net and foreign servers of the parent's data can reach the outside world; " + cron
+	}
+	return "egress denied (the branch's Postgres reaches loopback only); " + cron
 }
 
 // Create starts a new branch of the project ref belongs to and returns it as soon as its
@@ -72,6 +117,12 @@ func (s *Service) Create(ctx context.Context, ref string, in CreateInput) (*Bran
 	if err := s.checkLimits(ctx, p.Ref, in.Name); err != nil {
 		return nil, err
 	}
+	if in.WithData {
+		// Before anything exists: a clone that fills the disk takes the whole node down.
+		if err := s.checkDisk(p.Ref, 0); err != nil {
+			return nil, err
+		}
+	}
 	org := ""
 	if p.OrgID != 0 {
 		o, err := s.reg.GetOrganizationByID(ctx, p.OrgID)
@@ -84,6 +135,9 @@ func (s *Service) Create(ctx context.Context, ref string, in CreateInput) (*Bran
 	info := &registry.BranchInfo{
 		ID: newUUID(), ParentRef: p.Ref, Name: in.Name, GitBranch: in.GitBranch, Persistent: in.Persistent, WithData: in.WithData,
 		NotifyURL: in.NotifyURL, State: registry.BranchCreatingProject, Detail: "creating the project",
+	}
+	if in.WithData {
+		info.Egress = s.egressPolicy(in.AllowEgress)
 	}
 	if !in.Persistent {
 		info.ExpiresAt = s.expiry(in.TTL)
@@ -263,6 +317,13 @@ func (s *Service) doCreate(ctx context.Context, j *createJob) (string, error) {
 		detail = fmt.Sprintf("data cloned by %s in %d ms (%d files, %s apparent, %s of new disk, %d WAL segments)",
 			method, stats.TotalMillis, stats.Files, humanBytes(stats.Bytes), humanBytes(stats.ExtraDiskByte), stats.WALSegments)
 	}
+	egress := ""
+	if j.in.WithData && method != MethodSchema {
+		if p, err := s.reg.GetProject(ctx, j.ref); err == nil && p.Branch != nil {
+			egress = p.Branch.Egress
+			detail += "; " + s.egressDetail(egress)
+		}
+	}
 	if !j.in.Persistent && !j.keepExpiry {
 		// The expiry clock starts when the branch is usable, not when the request came in.
 		s.setState(ctx, j.ref, registry.BranchRunningMigration, detail, func(b *registry.BranchInfo) { b.ExpiresAt = s.expiry(j.in.TTL) })
@@ -273,6 +334,9 @@ func (s *Service) doCreate(ctx context.Context, j *createJob) (string, error) {
 	}
 	if reason != "" {
 		payload["fallback_reason"] = reason
+	}
+	if egress != "" {
+		payload["egress"] = egress
 	}
 	s.event(ctx, j.parent.Ref, "branch.created", payload)
 	s.event(ctx, j.ref, "branch.created", payload)

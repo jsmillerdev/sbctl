@@ -37,7 +37,7 @@ cmd/sbctl/main.go
 internal/{api,proxy,units,lifecycle,backup,artifacts,fleet,registry,secrets,config}/
 internal/api/gen/            # generated from the three OpenAPI specs
 studio/{patches/,build.sh,Dockerfile.build}   # build only; the output is a tar.zst artifact
-functions-main/              # Deno main service for edge-runtime (phase 2)
+functions-main/              # Deno main service for edge-runtime (workstream J, v1)
 deploy/{install.sh,systemd/,cloudformation/sbctl.yaml}
 tests/conformance/
 versions.yaml

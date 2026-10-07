@@ -278,6 +278,8 @@ func newHarness(t *testing.T, mut func(*config.Config)) *harness {
 		_, err := h.eng.RotateKeys(context.Background(), ref)
 		return err
 	}
+	// The test disk is never the limit unless a test says so.
+	svc.freeBytes = func(string) int64 { return 1 << 50 }
 	svc.isolate = func(_ context.Context, ref string) error {
 		h.mu.Lock()
 		defer h.mu.Unlock()

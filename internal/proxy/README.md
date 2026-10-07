@@ -75,7 +75,7 @@ The unit tests cover every route and rewrite against `httptest` upstreams, the k
 ## Not done
 
 - Idle sleep: only the `Waker.Start(ctx, ref)` call exists; it runs after authorization and before forwarding.
-- Edge Functions: the route and tenant header exist, the runtime does not (phase 2).
+- Edge Functions: the route and tenant header exist; the runtime is workstream J (v1, on `ws/j-functions`, not merged into this tree), so `/functions/v1` answers 503 until it is.
 - DNS-01 against a real provider and HTTP-01 against a real CA have not been run; the Pebble test covers HTTP-01 and TLS-ALPN-01 in CI only.
 - The `/pg/` (postgres-meta) and `/mcp` routes of the self-hosted gateway are not exposed; Studio reaches pg-meta through the Management API.
 - No rate limiting, request size limits or access log persistence beyond slog.

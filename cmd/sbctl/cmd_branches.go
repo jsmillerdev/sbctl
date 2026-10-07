@@ -61,6 +61,7 @@ type branchView struct {
 	State       string     `json:"state"`
 	Project     string     `json:"project_status"`
 	CloneMethod string     `json:"clone_method,omitempty"`
+	Egress      string     `json:"egress,omitempty"`
 	Detail      string     `json:"detail,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
@@ -70,7 +71,7 @@ type branchView struct {
 func viewBranch(b *branching.Branch) branchView {
 	return branchView{
 		ID: b.ID, Name: b.Name, Ref: b.Ref, Parent: b.ParentRef, Default: b.IsDefault, GitBranch: b.GitBranch, Persistent: b.Persistent,
-		WithData: b.WithData, State: string(b.State), Project: string(b.ProjectStatus), CloneMethod: b.CloneMethod, Detail: b.Detail,
+		WithData: b.WithData, State: string(b.State), Project: string(b.ProjectStatus), CloneMethod: b.CloneMethod, Egress: b.Egress, Detail: b.Detail,
 		CreatedAt: b.CreatedAt, ExpiresAt: b.ExpiresAt, DeleteAt: b.DeletionScheduledAt,
 	}
 }
@@ -82,6 +83,9 @@ func printBranch(w io.Writer, b *branching.Branch) {
 		return
 	}
 	fmt.Fprintf(w, "data:     %s\npersist:  %v\n", orDash(v.CloneMethod), v.Persistent)
+	if v.WithData {
+		fmt.Fprintf(w, "egress:   %s\n", orDash(v.Egress))
+	}
 	if v.ExpiresAt != nil {
 		fmt.Fprintf(w, "expires:  %s\n", v.ExpiresAt.Local().Format(time.RFC3339))
 	}
@@ -122,10 +126,10 @@ func waitDone(ctx context.Context, svc *branching.Service, ref string) (*branchi
 
 func init() {
 	var (
-		asJSON, noWait, withData, persistent bool
-		gitBranch, size, notifyURL, ttl      string
-		seedFile, project, version           string
-		force, schedule, dryRun              bool
+		asJSON, noWait, withData, allowEgress, persistent bool
+		gitBranch, size, notifyURL, ttl                   string
+		seedFile, project, version                        string
+		force, schedule, dryRun                           bool
 	)
 	cmd := &cobra.Command{
 		Use:   "branches",
@@ -175,7 +179,7 @@ CLI and MCP server.`,
 	list.Flags().BoolVar(&asJSON, "json", false, "print JSON")
 
 	create := run("create <project-ref> <name>", "Create a branch and wait until it is ready", cobra.ExactArgs(2), func(ctx context.Context, cmd *cobra.Command, svc *branching.Service, a []string) error {
-		in := branching.CreateInput{Name: a[1], GitBranch: gitBranch, Persistent: persistent, WithData: withData, DesiredInstanceSize: size, NotifyURL: notifyURL}
+		in := branching.CreateInput{Name: a[1], GitBranch: gitBranch, Persistent: persistent, WithData: withData, AllowEgress: allowEgress, DesiredInstanceSize: size, NotifyURL: notifyURL}
 		if ttl != "" {
 			if ttl == "off" || ttl == "never" {
 				in.TTL = -1
@@ -211,6 +215,7 @@ CLI and MCP server.`,
 		return nil
 	})
 	create.Flags().BoolVar(&withData, "with-data", false, "clone the parent's data (copy-on-write when the disk supports it, else from its latest base backup)")
+	create.Flags().BoolVar(&allowEgress, "allow-egress", false, "with --with-data: keep the parent's outbound side effects (no egress block, pg_cron jobs stay active); by default the branch's Postgres reaches loopback only and the cron jobs are paused")
 	create.Flags().BoolVar(&persistent, "persistent", false, "never expire; take a final backup when deleted")
 	create.Flags().StringVar(&gitBranch, "git-branch", "", "git branch the branch tracks")
 	create.Flags().StringVar(&size, "size", "", "instance size (default: [branching] default_class)")

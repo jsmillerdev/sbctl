@@ -84,7 +84,9 @@ desired_instance_size, persistent, with_data, notify_url}`. `region` is accepted
 used (a branch lives on the parent's node). `secrets` (non-empty), a `release_channel` other than `ga`
 and a `postgres_engine` other than the parent's are refused with 400 rather than dropped. The parent
 must be running.
-`desired_instance_size` maps to a class (`pico`/`nano`/`micro` to `micro`, `small`, `medium`,
+A `with_data` create is also refused with `409` before anything is created when the state disk
+cannot hold the clone (see Free disk), and its outbound side effects are blocked unless the request
+opts out (see Outbound isolation). `desired_instance_size` maps to a class (`pico`/`nano`/`micro` to `micro`, `small`, `medium`,
 every larger size to `large`); without one a branch is `[branching] default_class`, `micro`.
 
 **Schema only** (the default, as on hosted): a new project, then the parent's migration history
@@ -156,10 +158,69 @@ NONE)`, so the publisher's slot is not dropped either), `cron.job` rows are set 
 `[branching] keep_cron_jobs = true`) and `net.http_request_queue` is emptied. Then the marked lines
 are removed (the parent's own lines for those three settings, saved beside the file, are put back; a restore rewrites the file with ALTER SYSTEM, so a marker alone would not survive), the cluster restarts on the node's ordinary settings, and the credentials rotate. The
 event `branch.isolated` records the counts. If any step fails the branch is stopped (`MIGRATIONS_FAILED`,
-like a failed rotation). Anything else in the data that talks to the outside is the parent's:
-a `postgres_fdw` or `dblink` server keeps its credentials and connects when queried, and an
-external system that polls or pushes to the parent's database address does not know the branch.
+like a failed rotation). A pg_cron job that was paused is recorded in `sbctl_branch.paused_cron_jobs` in the
+database that holds `cron.job` (`jobid`, `jobname`, `schedule`, `database`, `username`, `paused_at`), so that
+whoever owns the branch can opt in later:
+`update cron.job set active = true where jobid in (select jobid from sbctl_branch.paused_cron_jobs);`.
 Tested on real clusters (`TestIntegrationCloneIsolatesTheParentsIntegrations`).
+
+**Outbound isolation (egress)**: subscriptions, cron and the pg_net queue are what the isolation step
+neutralizes in the data. Everything else the parent's data can do toward the outside world is
+outbound traffic from the branch's Postgres: database webhooks and triggers that call `pg_net`, cron jobs
+that make HTTP calls, foreign servers (`postgres_fdw`, `dblink`, Wrappers), any other extension that
+connects out. A branch must not act on production's systems as if it were production, so a branch
+with data has three defaults:
+
+1. **Its Postgres unit may reach loopback only.** Under systemd the unit is given `IPAddressDeny=any` and
+   `IPAddressAllow=localhost` (127.0.0.0/8 and ::1) through the per-unit drop-in, the same persistent
+   drop-in mechanism as `MemoryMax` (`SetUnitProperties` over D-Bus with `runtime=false`, `units.Spec.DenyEgress`).
+   The filter is a cgroup BPF program on the unit, so it covers every process of the cluster (backends, the pg_net
+   and pg_cron workers, `COPY ... PROGRAM`) and it survives restarts and reboots. The unit
+   still talks to its own GoTrue and PostgREST and to the pooler over loopback and unix sockets.
+2. **The parent's pg_cron jobs are paused** (above), whatever the supervisor.
+3. **Subscriptions are detached and the pg_net queue is emptied** (above), whatever the supervisor.
+
+The filter is applied after the first start, not before: the first postmaster already runs with the
+first-start settings, and a base-backup restore may need the backup backend to finish recovery.
+The branch's `egress` field says where it stands: `pending` (until isolation finishes), `denied`, `allowed`
+or `unenforced`. It is in `sbctl branches get --json` (`egress`), in the branch JSON of the API (`sbctl_egress`, an extra field next to the
+spec's; clients that decode the spec ignore it), and the branch's `detail` says in words what the branch can reach.
+A reset keeps the policy: the new cluster is created open, then denied again after its first start.
+
+**Opt-out**: `sbctl branches create ... --with-data --allow-egress`, or `POST /v1/projects/{ref}/branches?allow_egress=true`
+(the query parameter is ours, like `force` on merge: the spec's create body is unchanged, so the stock CLI and the
+MCP server cannot set it and always get the default). With it the branch keeps the parent's outbound side effects: no egress block, and the
+cron jobs stay active, as they do with `[branching] keep_cron_jobs` (the node-wide setting, which keeps
+only the cron jobs and leaves egress denied). `egress` is `allowed`. Subscriptions are detached either way.
+Use it for a branch that must call a real service, for example a sandbox or staging API.
+
+**On the exec backend egress cannot be blocked.** `supervisor = "exec"` (development and tests) runs the
+units as plain child processes, with no cgroup to attach a filter to. A branch with data created there reports
+`egress: unenforced` and its detail starts the egress sentence with "egress NOT blocked", so the state does not
+claim an isolation that is not there. The cron jobs are still paused, subscriptions are still detached and the queue is still emptied,
+so a webhook or foreign server in the data can still reach the outside world from such a branch: do not clone a production database
+through the exec backend. Verified under systemd by `tests/linux/branching-egress.sh` (CI job `branching-xfs`): a with-data branch's pg_net request to an
+external host fails while the parent's succeeds, the unit carries the deny and allow lists, the cron jobs are inactive and
+recorded, and a branch created with `--allow-egress` reaches the host.
+
+Limits of the egress block: a **remote backup backend** (`s3://`) is outbound traffic too, so WAL archiving (`archive_command`)
+of a branch with denied egress cannot reach it; with the default `file://` backend it works (the unit still sees its
+own `backups/<ref>`). Until archiving for such branches goes through the daemon instead of the unit, `archive_command` of a with-data
+branch on an S3 node keeps failing and its WAL piles up in `pg_wal` (expected from how archiving works; not
+tested against S3): give a persistent or write-heavy branch there `--allow-egress`, or delete it when its work is done. A schema-only branch replays the parent's migrations and may therefore schedule its own cron
+jobs or install triggers that call out: it is not isolated, because it inherits no data (the check is on
+`with_data` branches). The Realtime, Storage and pooler tenants of a branch are not confined; only its Postgres unit is.
+
+### Free disk
+
+A `with_data` create or reset refuses to start when the state directory's disk (`statfs` of the parent's
+cluster directory) has less free space than **1.2 times the parent's data (the apparent size of its PGDATA, pg_wal included)
+plus a reserve**, `[branching] disk_reserve_mb`, default 2048. The answer is `409` in the API's message envelope ("not enough free disk: the
+disk of the state directory has 1.3 GiB free and cloning project ... needs about 3.0 GiB ...") and nothing has been created or removed. The
+check is the same for `clonefile`, `reflink` and `base-backup`: a copy-on-write clone costs little
+at first but diverges as either side writes, so the check is conservative on purpose. A reset of a base-backup branch counts the
+space of its old private copy, which the reset removes first; a copy-on-write branch's does not count. A free-space figure that cannot be read
+skips the check with a log warning. Schema-only branches copy nothing and are not checked.
 
 ### Merge, push, reset
 
@@ -226,13 +287,14 @@ and NAT64 (64:ff9b::/96) addresses at connect time unless `allow_private_notify_
 | `clone` | `auto` | `backup` always restores from the base backup |
 | `soft_delete_grace_minutes` | 60 | |
 | `allow_private_notify_urls` | false | |
-| `keep_cron_jobs` | false | keep the parent's pg_cron jobs active in a branch with data |
+| `keep_cron_jobs` | false | keep the parent's pg_cron jobs active in a branch with data (egress stays denied); `--allow-egress` keeps them per branch and opens egress |
+| `disk_reserve_mb` | 2048 | free disk that must remain after a with_data create or reset, on top of 1.2 times the parent's data |
 
 ## CLI
 
 ```
 sbctl branches list <project-ref> [--json]
-sbctl branches create <project-ref> <name> [--with-data] [--persistent] [--ttl 6h|off] [--size micro]
+sbctl branches create <project-ref> <name> [--with-data [--allow-egress]] [--persistent] [--ttl 6h|off] [--size micro]
                       [--git-branch b] [--seed-file f] [--notify-url u] [--no-wait] [--json]
 sbctl branches get|delete|restore|diff <id|ref|name --project <ref>>   # delete --schedule
 sbctl branches merge|reset|push <id|ref|name> [--project <ref>] [--migration-version v] [--force] [--no-wait]
@@ -322,8 +384,10 @@ is a full copy; on XFS and APFS it stays flat.
   `sb-basebackup@<ref>.timer` for them (the lifecycle does not enable timers yet); a persistent
   branch is backed up on delete only.
 * `reflink` (XFS) and the ext4 base-backup path ran in CI only, on a loop-file XFS; btrfs and ZFS were not run.
-* A `postgres_fdw`/`dblink` server in the parent's data, and anything else outside the three integrations
-  listed under Isolation, is carried into a branch with data unchanged.
+* Egress is blocked only where the supervisor can do it (systemd); on the exec backend a branch with data reports
+  `egress: unenforced` (see Outbound isolation). The block covers the branch's Postgres unit, not its other services, and
+  it blocks WAL archiving to an `s3://` backup backend; a schema-only branch is not isolated at all.
+* The paused pg_cron jobs are restored by hand (the SQL under Isolation); there is no `sbctl` command for it.
 * The base-backup reset path is tested end to end on APFS (`TestIntegrationBranching`); the unit tests
   fake the failure after the old cluster is removed, because a failing restore needs a real archive.
 * No idle sleep: an unused branch costs its idle memory (about 130 MB with GoTrue and PostgREST).

@@ -110,20 +110,20 @@ func (r *Postgres) UpdateOrganization(ctx context.Context, o *Organization) erro
 
 const projectCols = `ref, coalesce(org_id, 0), seq, name, region, engine, class, status, versions, limits, created_at, updated_at,
 	branch_id::text, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
-	notify_url, branch_state, branch_detail, clone_method, review_requested_at`
+	notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress`
 
 func scanProject(row pgx.Row) (*Project, error) {
 	var p Project
 	var versions, limits []byte
 	var (
-		bID, bParent, bName, bGit, bNotify, bState, bDetail, bMethod *string
-		bPersistent, bData                                           bool
-		bExpires, bDeletion, bReview                                 *time.Time
+		bID, bParent, bName, bGit, bNotify, bState, bDetail, bMethod, bEgress *string
+		bPersistent, bData                                                    bool
+		bExpires, bDeletion, bReview                                          *time.Time
 	)
 	if err := row.Scan(&p.Ref, &p.OrgID, &p.Seq, &p.Name, &p.Region, &p.Engine, &p.Class, &p.Status,
 		&versions, &limits, &p.CreatedAt, &p.UpdatedAt,
 		&bID, &bParent, &bName, &bGit, &bPersistent, &bData, &bExpires, &bDeletion,
-		&bNotify, &bState, &bDetail, &bMethod, &bReview); err != nil {
+		&bNotify, &bState, &bDetail, &bMethod, &bReview, &bEgress); err != nil {
 		return nil, mapErr(err)
 	}
 	if bParent != nil {
@@ -136,7 +136,7 @@ func scanProject(row pgx.Row) (*Project, error) {
 		p.Branch = &BranchInfo{
 			ID: str(bID), ParentRef: *bParent, Name: str(bName), GitBranch: str(bGit), Persistent: bPersistent, WithData: bData,
 			ExpiresAt: bExpires, DeletionScheduledAt: bDeletion, NotifyURL: str(bNotify), State: BranchState(str(bState)),
-			Detail: str(bDetail), CloneMethod: str(bMethod), ReviewRequestedAt: bReview,
+			Detail: str(bDetail), CloneMethod: str(bMethod), ReviewRequestedAt: bReview, Egress: str(bEgress),
 		}
 	}
 	if err := json.Unmarshal(versions, &p.Versions); err != nil {
@@ -189,9 +189,9 @@ func (r *Postgres) CreateProject(ctx context.Context, p *Project) error {
 		got, err := scanProject(tx.QueryRow(ctx, `
 			insert into sbctl.projects (ref, org_id, seq, name, region, engine, class, status, versions, limits,
 				branch_id, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
-				notify_url, branch_state, branch_detail, clone_method, review_requested_at)
+				notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress)
 			values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-				$11::text::uuid, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) returning `+projectCols,
+				$11::text::uuid, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) returning `+projectCols,
 			append([]any{p.Ref, nullOrg(p.OrgID), seq, p.Name, p.Region, p.Engine, p.Class, p.Status, versions, limits}, branchArgs(p.Branch)...)...))
 		if err != nil {
 			return err
@@ -209,15 +209,15 @@ func nullStr(s string) any {
 	return s
 }
 
-// branchArgs are the 13 branch columns of an insert, in column order.
+// branchArgs are the 14 branch columns of an insert, in column order.
 func branchArgs(b *BranchInfo) []any {
 	if b == nil {
-		a := make([]any, 13)
+		a := make([]any, 14)
 		a[4], a[5] = false, false // persistent, with_data
 		return a
 	}
 	return []any{nullStr(b.ID), nullStr(b.ParentRef), nullStr(b.Name), nullStr(b.GitBranch), b.Persistent, b.WithData,
-		b.ExpiresAt, b.DeletionScheduledAt, nullStr(b.NotifyURL), nullStr(string(b.State)), nullStr(b.Detail), nullStr(b.CloneMethod), b.ReviewRequestedAt}
+		b.ExpiresAt, b.DeletionScheduledAt, nullStr(b.NotifyURL), nullStr(string(b.State)), nullStr(b.Detail), nullStr(b.CloneMethod), b.ReviewRequestedAt, nullStr(b.Egress)}
 }
 
 // UpdateBranch implements Registry.
@@ -225,10 +225,10 @@ func (r *Postgres) UpdateBranch(ctx context.Context, ref string, b *BranchInfo) 
 	return affected(r.pool.Exec(ctx, `
 		update sbctl.projects set branch_name = $2, git_branch = $3, persistent = $4, with_data = $5, expires_at = $6,
 			deletion_scheduled_at = $7, notify_url = $8, branch_state = $9, branch_detail = $10, clone_method = $11,
-			review_requested_at = $12, updated_at = now()
+			review_requested_at = $12, branch_egress = $13, updated_at = now()
 		where ref = $1 and parent_ref is not null`,
 		ref, nullStr(b.Name), nullStr(b.GitBranch), b.Persistent, b.WithData, b.ExpiresAt, b.DeletionScheduledAt,
-		nullStr(b.NotifyURL), nullStr(string(b.State)), nullStr(b.Detail), nullStr(b.CloneMethod), b.ReviewRequestedAt))
+		nullStr(b.NotifyURL), nullStr(string(b.State)), nullStr(b.Detail), nullStr(b.CloneMethod), b.ReviewRequestedAt, nullStr(b.Egress)))
 }
 
 func (r *Postgres) GetProject(ctx context.Context, ref string) (*Project, error) {

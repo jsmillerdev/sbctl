@@ -97,7 +97,60 @@ func (s *Systemd) RenderChanged(ctx context.Context, spec Spec) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return changed, s.applyLimits(ctx, spec.Unit(), spec.Limits)
+	if err := s.applyLimits(ctx, spec.Unit(), spec.Limits); err != nil {
+		return changed, err
+	}
+	return changed, s.applyEgress(ctx, spec.Unit(), spec.DenyEgress)
+}
+
+// EnforcesEgress implements EgressEnforcer.
+func (s *Systemd) EnforcesEgress() bool { return true }
+
+var _ EgressEnforcer = (*Systemd)(nil)
+
+// applyEgress makes the unit's IPAddressDeny and IPAddressAllow what spec.DenyEgress says.
+// Like the limits it is a persistent drop-in written by systemd itself, so it survives
+// restarts and reboots, and a running unit has it at once (the cgroup's BPF filter changes).
+// A unit that never had a restriction and wants none is not touched.
+func (s *Systemd) applyEgress(ctx context.Context, unit string, deny bool) error {
+	c, err := s.dial(ctx)
+	if err != nil {
+		return err
+	}
+	has := false
+	if cur, err := c.GetUnitTypePropertiesContext(ctx, unit, "Service"); err == nil {
+		d, _ := cur["IPAddressDeny"].([][]interface{})
+		has = len(d) > 0
+	}
+	if has == deny {
+		return nil
+	}
+	return s.setEgress(ctx, c, unit, deny)
+}
+
+func (s *Systemd) setEgress(ctx context.Context, c *sddbus.Conn, unit string, deny bool) error {
+	denied, allowed := []dbusIPAddr{}, []dbusIPAddr{}
+	if deny {
+		for _, r := range EgressDeny() {
+			denied = append(denied, dbusIPAddr(r))
+		}
+		for _, r := range EgressAllow() {
+			allowed = append(allowed, dbusIPAddr(r))
+		}
+	}
+	// An empty list resets the property, which lifts the restriction.
+	return c.SetUnitPropertiesContext(ctx, unit, false,
+		sddbus.Property{Name: "IPAddressAllow", Value: godbus.MakeVariant(allowed)},
+		sddbus.Property{Name: "IPAddressDeny", Value: godbus.MakeVariant(denied)},
+	)
+}
+
+// dbusIPAddr is the a(iayu) element of IPAddressAllow and IPAddressDeny; godbus encodes a Go
+// struct as a D-Bus struct of its fields in order.
+type dbusIPAddr struct {
+	Family int32
+	Addr   []byte
+	Prefix uint32
 }
 
 func (s *Systemd) applyLimits(ctx context.Context, unit string, l config.Limits) error {
@@ -237,10 +290,15 @@ func (s *Systemd) revert(ctx context.Context, unit string) error {
 		return err
 	}
 	inf := ^uint64(0)
-	return c.SetUnitPropertiesContext(ctx, unit, false,
+	if err := c.SetUnitPropertiesContext(ctx, unit, false,
 		sddbus.Property{Name: "MemoryMax", Value: godbus.MakeVariant(inf)},
 		sddbus.Property{Name: "CPUQuotaPerSecUSec", Value: godbus.MakeVariant(inf)},
-	)
+	); err != nil {
+		return err
+	}
+	// A branch's Postgres unit may carry an egress restriction; a later project that reuses
+	// the ref (a reset keeps it) must not inherit it.
+	return s.applyEgress(ctx, unit, false)
 }
 
 var _ Enabler = (*Systemd)(nil)

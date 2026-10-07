@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/registry"
 )
 
 // A branch cloned from the parent's data (copy-on-write or base backup) carries everything
@@ -27,8 +28,11 @@ import (
 // So the first start of such a branch runs with the background workers that act on these
 // disabled (quarantineSettings, written to postgresql.auto.conf before the first start). Over
 // the cluster's private socket isolateCluster then disables every subscription and detaches it
-// from its slot, deactivates the cron jobs (unless [branching] keep_cron_jobs) and empties the
-// pg_net queue; then the settings are removed and the cluster restarts normally.
+// from its slot, pauses the cron jobs (recording which were active, unless [branching]
+// keep_cron_jobs or the branch was created with allow_egress) and empties the pg_net queue;
+// then the settings are removed, the branch's outbound network policy is recorded as denied
+// (the Postgres unit is rendered behind systemd's IPAddressDeny from then on) and the cluster
+// restarts normally.
 
 const quarantineMark = "# sbctl-branch-quarantine"
 
@@ -152,6 +156,8 @@ type IsolateResult struct {
 	CronJobs      int  `json:"cron_jobs_deactivated"`
 	CronKept      bool `json:"cron_jobs_kept"`
 	NetQueue      int  `json:"net_requests_dropped"`
+	// Egress is the branch's outbound network policy once isolation is done (registry.Egress*).
+	Egress string `json:"egress,omitempty"`
 }
 
 // isolateCluster neutralizes the parent's outbound integrations in every database of the
@@ -214,11 +220,11 @@ func isolateDatabase(ctx context.Context, dsn, db string, keepCron bool, res *Is
 			return err
 		}
 		if has {
-			tag, err := c.Exec(ctx, `update cron.job set active = false where active`)
+			n, err := pauseCronJobs(ctx, c)
 			if err != nil {
-				return fmt.Errorf("deactivate cron jobs: %w", err)
+				return fmt.Errorf("pause cron jobs: %w", err)
 			}
-			res.CronJobs += int(tag.RowsAffected())
+			res.CronJobs += n
 		}
 	}
 	var hasQueue bool
@@ -233,6 +239,47 @@ func isolateDatabase(ctx context.Context, dsn, db string, keepCron bool, res *Is
 		res.NetQueue += int(tag.RowsAffected())
 	}
 	return nil
+}
+
+// PausedCronTable is the table in a branch's cron database that lists the pg_cron jobs that
+// were active in the parent's data and were paused for the branch. Re-activating them is an
+// explicit decision of whoever owns the branch (a job that calls out needs the branch's
+// egress open too):
+//
+//	update cron.job set active = true where jobid in (select jobid from sbctl_branch.paused_cron_jobs);
+const PausedCronTable = "sbctl_branch.paused_cron_jobs"
+
+// pauseCronJobs records the active jobs of cron.job in PausedCronTable and deactivates them,
+// in one transaction, and returns how many it paused. Running it again pauses nothing new and
+// keeps the record.
+func pauseCronJobs(ctx context.Context, c *pgx.Conn) (int, error) {
+	tx, err := c.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, stmt := range []string{
+		`create schema if not exists sbctl_branch`,
+		`create table if not exists ` + PausedCronTable + ` (
+			jobid     bigint primary key,
+			jobname   text,
+			schedule  text not null,
+			database  text,
+			username  text,
+			paused_at timestamptz not null default now())`,
+		`insert into ` + PausedCronTable + ` (jobid, jobname, schedule, database, username)
+			select jobid, jobname, schedule, database, username from cron.job where active
+			on conflict (jobid) do nothing`,
+	} {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return 0, err
+		}
+	}
+	tag, err := tx.Exec(ctx, `update cron.job set active = false where active`)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), tx.Commit(ctx)
 }
 
 // connect opens a connection to dsn, to database db when it is not empty.
@@ -255,13 +302,28 @@ func (s *Service) isolateBranch(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	res, err := isolateCluster(ctx, s.adminSocketDSN(ref, p.Seq), s.cfg.Branching.KeepCronJobs)
+	egress := ""
+	if p.Branch != nil {
+		egress = p.Branch.Egress
+	}
+	res, err := isolateCluster(ctx, s.adminSocketDSN(ref, p.Seq), s.keepsCron(egress))
 	if err != nil {
 		return err
 	}
 	if err := clearQuarantine(filepath.Join(s.cfg.Paths().ProjectService(ref, config.SvcPostgres), "data")); err != nil {
 		return fmt.Errorf("remove the first-start settings: %w", err)
 	}
+	if egress == registry.EgressPending {
+		// From here on every render of the Postgres unit denies non-loopback traffic, so the
+		// restart below brings the cluster up behind the filter. The cluster ran the first start
+		// open, with the integrations silenced by the first-start settings instead: a base
+		// backup restore may need the backup backend to finish recovery.
+		if err := s.denyEgress(ctx, ref); err != nil {
+			return fmt.Errorf("record the branch's egress policy: %w", err)
+		}
+		egress = registry.EgressDenied
+	}
+	res.Egress = egress
 	// logical replication workers and the pg_net database are postmaster settings: only a
 	// restart brings the branch back to the node's settings (new subscriptions work again).
 	if err := s.eng.Pause(ctx, ref); err != nil {
@@ -272,4 +334,18 @@ func (s *Service) isolateBranch(ctx context.Context, ref string) error {
 	}
 	s.event(ctx, ref, "branch.isolated", res)
 	return nil
+}
+
+// denyEgress records registry.EgressDenied on a branch whose policy was pending.
+func (s *Service) denyEgress(ctx context.Context, ref string) error {
+	p, err := s.reg.GetProject(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if p.Branch == nil {
+		return fmt.Errorf("%s is not a branch", ref)
+	}
+	b := *p.Branch
+	b.Egress = registry.EgressDenied
+	return s.reg.UpdateBranch(ctx, ref, &b)
 }

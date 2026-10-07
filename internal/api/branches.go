@@ -97,7 +97,15 @@ func (s *Server) noBranching() error {
 	return errf(http.StatusBadRequest, "Branching is not enabled on this node")
 }
 
-func branchJSON(b *branching.Branch) (*v1.BranchResponseOutput, error) {
+// branchOut is the spec's branch response plus sbctl's own field: the branch's outbound
+// network policy (denied, pending, allowed or unenforced), so a client can see whether a
+// branch with data can reach the outside world. Clients that decode the spec's shape ignore it.
+type branchOut struct {
+	*v1.BranchResponseOutput
+	SbctlEgress string `json:"sbctl_egress,omitempty"`
+}
+
+func branchJSON(b *branching.Branch) (*branchOut, error) {
 	var id openapi_types.UUID
 	if err := id.UnmarshalText([]byte(b.ID)); err != nil {
 		return nil, err
@@ -127,7 +135,7 @@ func branchJSON(b *branching.Branch) (*v1.BranchResponseOutput, error) {
 		t := b.ReviewRequestedAt.UTC()
 		out.ReviewRequestedAt = &t
 	}
-	return out, nil
+	return &branchOut{BranchResponseOutput: out, SbctlEgress: b.Egress}, nil
 }
 
 func (s *Server) writeBranch(w http.ResponseWriter, status int, b *branching.Branch) error {
@@ -151,7 +159,7 @@ func (s *Server) listBranches(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return s.branchProjectErr(err)
 	}
-	out := make([]*v1.BranchResponseOutput, 0, len(list))
+	out := make([]*branchOut, 0, len(list))
 	for i := range list {
 		j, err := branchJSON(&list[i])
 		if err != nil {
@@ -219,6 +227,8 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) error {
 	if in.NotifyUrl != nil {
 		ci.NotifyURL = *in.NotifyUrl
 	}
+	// The Management API has no field for this; the query parameter is ours (like force on merge).
+	ci.AllowEgress = r.URL.Query().Get("allow_egress") == "true"
 	if in.DesiredInstanceSize != nil {
 		ci.DesiredInstanceSize = string(*in.DesiredInstanceSize)
 	}

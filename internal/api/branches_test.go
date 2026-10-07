@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -332,4 +333,65 @@ func TestFunctionDigests(t *testing.T) {
 	if _, ok := p["other"]; ok || b["other"] == "" {
 		t.Errorf("other: parent %q branch %q", p["other"], b["other"])
 	}
+}
+
+// A with_data create that the state disk cannot hold is refused before anything exists: 409 in
+// the API's message envelope, whatever allow_egress says.
+func TestBranchWithDataWithoutFreeDiskIs409(t *testing.T) {
+	f := newFixture(t)
+	f.cfg.Branching.DiskReserveMB = 1_000_000_000 // a reserve no disk has free
+	for _, q := range []string{"", "?allow_egress=true"} {
+		rec := f.do("POST", "/v1/projects/"+testRef+"/branches"+q, map[string]any{"branch_name": "d", "with_data": true})
+		msg, _ := jsonField(t, rec, "message").(string)
+		if rec.Code != 409 || !strings.Contains(msg, "not enough free disk") || !strings.Contains(msg, "disk_reserve_mb") || strings.Contains(msg, "branching:") {
+			t.Fatalf("with_data on a full disk%s: %d %s", q, rec.Code, rec.Body)
+		}
+	}
+	if rec := f.do("GET", "/v1/projects/"+testRef+"/branches", nil); len(decodeBody(t, rec).([]any)) != 1 {
+		t.Fatalf("a refused create left a branch: %s", rec.Body)
+	}
+	// A schema-only branch copies nothing and is not held back.
+	if rec := f.do("POST", "/v1/projects/"+testRef+"/branches", map[string]any{"branch_name": "s"}); rec.Code != 201 {
+		t.Fatalf("schema-only create: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A branch reports its outbound network policy next to the spec's fields, which stay as they are.
+func TestBranchJSONCarriesTheEgressPolicy(t *testing.T) {
+	b := &branching.Branch{
+		ID: "6f9619ff-8b86-4011-b42d-00c04fc964ff", Name: "d", Ref: "abcdefghijklmnopqrst", ParentRef: testRef, WithData: true,
+		State: registry.BranchMigrationsPassed, ProjectStatus: registry.StatusActiveHealthy, Egress: registry.EgressDenied,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	out, err := branchJSON(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["sbctl_egress"] != "denied" || m["with_data"] != true || m["project_ref"] != "abcdefghijklmnopqrst" || m["status"] != "MIGRATIONS_PASSED" {
+		t.Fatalf("branch JSON = %s", body)
+	}
+	validateAgainstSpec(t, "GET /v1/projects/{ref}/branches/{name}", body)
+	// Schema-only and default branches have none.
+	b.Egress = ""
+	body, _ = json.Marshal(mustBranchJSON(t, b))
+	if strings.Contains(string(body), "sbctl_egress") {
+		t.Fatalf("branch without a policy reports one: %s", body)
+	}
+}
+
+func mustBranchJSON(t *testing.T, b *branching.Branch) *branchOut {
+	t.Helper()
+	out, err := branchJSON(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }

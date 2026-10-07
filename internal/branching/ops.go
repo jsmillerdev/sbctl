@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/OWNER/sbctl/internal/backup"
+	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
@@ -283,7 +285,7 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 		}
 		org = o.Slug
 	}
-	if err := s.preflightReset(ctx, b, parent); err != nil {
+	if err := s.preflightReset(ctx, b, parent, old); err != nil {
 		return "", err
 	}
 	var keys *secrets.ProjectKeys
@@ -312,9 +314,14 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 			}
 		}
 		info.DeletionScheduledAt = nil
-		// The row is still there: record the lifetime and the cleared method on it now.
+		if info.WithData {
+			// The new cluster gets the same outbound policy, applied again after its first
+			// start; an opt-out stays an opt-out, and what could not be enforced is tried again.
+			info.Egress = s.egressPolicy(info.Egress == registry.EgressAllowed)
+		}
+		// The row is still there: record the lifetime, the cleared method and the policy on it now.
 		s.setState(ctx, b.Ref, info.State, info.Detail, func(bi *registry.BranchInfo) {
-			bi.CloneMethod, bi.ExpiresAt, bi.DeletionScheduledAt = info.CloneMethod, info.ExpiresAt, nil
+			bi.CloneMethod, bi.ExpiresAt, bi.DeletionScheduledAt, bi.Egress = info.CloneMethod, info.ExpiresAt, nil, info.Egress
 		})
 		j := &createJob{
 			parent: parent, ref: b.Ref, info: &info, class: old.Class, org: org, recreate: true,
@@ -333,9 +340,19 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 // preflightReset checks what a reset needs before the old cluster is removed: the same way
 // of getting data that creation would use, and for the base-backup way a base backup to
 // restore.
-func (s *Service) preflightReset(ctx context.Context, b *Branch, parent *registry.Project) error {
+func (s *Service) preflightReset(ctx context.Context, b *Branch, parent, old *registry.Project) error {
 	if !b.WithData {
 		return nil
+	}
+	// A base-backup branch holds a full private copy that the reset removes before it clones
+	// again, so that space counts; a copy-on-write branch shares blocks with its parent and
+	// gives back little, so nothing is assumed.
+	var credit int64
+	if old.Branch != nil && old.Branch.CloneMethod == MethodBackup {
+		credit = dataSize(filepath.Join(s.cfg.Paths().ProjectService(b.Ref, config.SvcPostgres), "data"))
+	}
+	if err := s.checkDisk(parent.Ref, credit); err != nil {
+		return err
 	}
 	method, _, reason := s.planData(parent.Ref, b.Ref)
 	switch method {

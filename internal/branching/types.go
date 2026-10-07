@@ -36,6 +36,12 @@ type Branch struct {
 	CloneMethod string
 	// Detail is the outcome of the last operation, an error text after a failure.
 	Detail string
+	// Egress is the outbound network policy of a branch with data (the registry.Egress*
+	// values): "denied" (the branch's Postgres unit reaches loopback only), "pending" (denied
+	// once isolation finishes), "allowed" (created with the opt-out) or "unenforced" (denial
+	// wanted, but the supervisor cannot confine a unit's network). Empty for schema-only
+	// branches and for the default branch.
+	Egress string
 
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
@@ -120,7 +126,7 @@ func branchOf(p *registry.Project) *Branch {
 	return &Branch{
 		ID: b.ID, Name: b.Name, Ref: p.Ref, ParentRef: b.ParentRef, GitBranch: b.GitBranch,
 		Persistent: b.Persistent, WithData: b.WithData, State: b.State, ProjectStatus: p.Status,
-		CloneMethod: b.CloneMethod, Detail: b.Detail, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
+		CloneMethod: b.CloneMethod, Detail: b.Detail, Egress: b.Egress, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 		ExpiresAt: b.ExpiresAt, DeletionScheduledAt: b.DeletionScheduledAt, ReviewRequestedAt: b.ReviewRequestedAt, NotifyURL: b.NotifyURL,
 	}
 }

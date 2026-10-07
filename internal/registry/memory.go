@@ -220,7 +220,7 @@ func (m *Memory) UpdateBranch(_ context.Context, ref string, b *BranchInfo) erro
 	}
 	nb := *cur.Branch
 	nb.Name, nb.GitBranch, nb.Persistent, nb.WithData, nb.ExpiresAt, nb.DeletionScheduledAt = b.Name, b.GitBranch, b.Persistent, b.WithData, b.ExpiresAt, b.DeletionScheduledAt
-	nb.NotifyURL, nb.State, nb.Detail, nb.CloneMethod, nb.ReviewRequestedAt = b.NotifyURL, b.State, b.Detail, b.CloneMethod, b.ReviewRequestedAt
+	nb.NotifyURL, nb.State, nb.Detail, nb.CloneMethod, nb.ReviewRequestedAt, nb.Egress = b.NotifyURL, b.State, b.Detail, b.CloneMethod, b.ReviewRequestedAt, b.Egress
 	cur.Branch, cur.UpdatedAt = &nb, time.Now()
 	m.projects[ref] = cloneProject(cur)
 	m.notify("projects", "update", ref)

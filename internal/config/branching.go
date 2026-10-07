@@ -36,6 +36,11 @@ type Branching struct {
 	// extension, a function URL) would otherwise run twice, once from the parent and once
 	// from every branch.
 	KeepCronJobs bool `toml:"keep_cron_jobs"`
+	// DiskReserveMB is the free space, in MB, that must remain on the state directory's disk
+	// after a branch with data is created or reset, on top of 1.2 times the parent's data
+	// (0 means 2048). A create or reset that would not leave it is refused before anything is
+	// done: a clone that fills the disk takes every project on the node down with it.
+	DiskReserveMB int `toml:"disk_reserve_mb"`
 }
 
 const (
@@ -44,6 +49,7 @@ const (
 	defaultMaxBranches    = 50
 	defaultSweepInterval  = time.Minute
 	defaultSoftDeleteHold = time.Hour
+	defaultDiskReserveMB  = 2048
 )
 
 // TTL returns the default lifetime of a non-persistent branch; ok is false when branches
@@ -90,6 +96,15 @@ func (b Branching) Limits() (perProject, total int) {
 	return perProject, total
 }
 
+// DiskReserve is the free space in bytes that a branch with data must leave on the disk.
+func (b Branching) DiskReserve() int64 {
+	mb := b.DiskReserveMB
+	if mb <= 0 {
+		mb = defaultDiskReserveMB
+	}
+	return int64(mb) << 20
+}
+
 // SweepInterval is the pause between sweeps.
 func (b Branching) SweepInterval() time.Duration {
 	if b.SweepIntervalSeconds <= 0 {
@@ -114,6 +129,9 @@ func (b Branching) validate() error {
 	case "", "auto", "backup":
 	default:
 		return fmt.Errorf("config: branching.clone must be auto or backup, not %q", b.Clone)
+	}
+	if b.DiskReserveMB < 0 {
+		return fmt.Errorf("config: branching.disk_reserve_mb must not be negative, not %d", b.DiskReserveMB)
 	}
 	return nil
 }

@@ -151,6 +151,10 @@ func newStack(t *testing.T) *stack {
 	cfg.BinPath = sbctlBinary(t)
 	cfg.Backup.Backend = "file://" + filepath.Join(state, "backups")
 	cfg.Backup.ArchiveTimeoutSeconds = 30
+	// The free-disk check runs on the real disk here; CI's 8 GB loop file and a developer's
+	// disk should not turn the default 2 GB reserve into a flaky refusal. The check itself is
+	// covered by the unit tests.
+	cfg.Branching.DiskReserveMB = 256
 	cfg.Ports.SystemPostgres, cfg.Ports.SystemGoTrue, cfg.Ports.ProjectBase = base, base+1, base+2
 	cfgPath := filepath.Join(state, "config.toml")
 	b, err := toml.Marshal(cfg)
@@ -859,8 +863,11 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 	}
 	defer func() { st.svc.isolate = realIsolate }()
 
-	check := func(b *Branch, keepJobs bool) {
+	check := func(b *Branch, keepJobs bool, wantEgress string) {
 		t.Helper()
+		if b.Egress != wantEgress {
+			t.Errorf("branch %s: egress = %q, want %q (%s)", b.Name, b.Egress, wantEgress, b.Detail)
+		}
 		if v, ok := firstStart.Load(b.Ref); !ok {
 			t.Errorf("branch %s: the first start was not observed", b.Name)
 		} else if v.(string) != "" {
@@ -883,6 +890,20 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 			}
 			if active != keepJobs {
 				t.Errorf("branch %s: cron job active = %v, want %v", b.Name, active, keepJobs)
+			}
+			// The jobs that were active are recorded, so that a later opt-in can restore them.
+			var recorded int
+			var hasTable bool
+			if err := ba.QueryRow(ctx, `select to_regclass('`+PausedCronTable+`') is not null`).Scan(&hasTable); err != nil {
+				t.Fatal(err)
+			}
+			if hasTable {
+				if err := ba.QueryRow(ctx, `select count(*) from `+PausedCronTable+` p join cron.job j using (jobid) where j.jobname = 'sbctl-test-job'`).Scan(&recorded); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if keepJobs && hasTable || !keepJobs && recorded != 1 {
+				t.Errorf("branch %s: paused-jobs table present=%v, recorded test job=%d (keep jobs %v)", b.Name, hasTable, recorded, keepJobs)
 			}
 		}
 		// The first-start settings are gone and the cluster runs with the node's settings.
@@ -916,7 +937,12 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 	}
 	b := st.createBranch(pref, "isolated", func(in *CreateInput) { in.WithData = true })
 	t.Logf("method %s", b.CloneMethod)
-	check(b, false)
+	// This stack runs the exec supervisor: it cannot confine a unit's network, and the branch says so.
+	// (The systemd path, a pg_net request to an external host that fails, is tests/linux/branching-egress.sh.)
+	check(b, false, registry.EgressUnenforced)
+	if !strings.Contains(b.Detail, "egress NOT blocked") || !strings.Contains(b.Detail, "cron jobs paused") {
+		t.Errorf("the branch's detail does not say what it can reach: %s", b.Detail)
+	}
 	evs, _ := st.node.Registry.ListEvents(ctx, b.Ref, 50)
 	var isolated bool
 	for _, e := range evs {
@@ -935,7 +961,15 @@ func TestIntegrationCloneIsolatesTheParentsIntegrations(t *testing.T) {
 	// keep_cron_jobs leaves the jobs as the parent had them; subscriptions are always detached.
 	st.cfg.Branching.KeepCronJobs = true
 	kept := st.createBranch(pref, "keeps-jobs", func(in *CreateInput) { in.WithData = true })
-	check(kept, true)
+	check(kept, true, registry.EgressUnenforced)
+	st.cfg.Branching.KeepCronJobs = false
+
+	// allow_egress is the explicit opt-out: the parent's jobs stay as they were.
+	open := st.createBranch(pref, "allows-egress", func(in *CreateInput) { in.WithData, in.AllowEgress = true, true })
+	check(open, true, registry.EgressAllowed)
+	if !strings.Contains(open.Detail, "allow_egress") {
+		t.Errorf("the opt-out is not reported: %s", open.Detail)
+	}
 }
 
 // A version that another merge applied while this one waited for the lock is refused, not run

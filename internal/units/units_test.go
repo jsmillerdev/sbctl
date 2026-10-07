@@ -422,3 +422,32 @@ func TestTemplatesContainment(t *testing.T) {
 		}
 	}
 }
+
+// The egress policy is IPAddressDeny=any with IPAddressAllow=localhost, in the shape of the
+// systemd D-Bus a(iayu) type: both families, loopback only.
+func TestEgressRanges(t *testing.T) {
+	deny, allow := EgressDeny(), EgressAllow()
+	if len(deny) != 2 || deny[0].Family != 2 || len(deny[0].Addr) != 4 || deny[0].Prefix != 0 ||
+		deny[1].Family != 10 || len(deny[1].Addr) != 16 || deny[1].Prefix != 0 {
+		t.Fatalf("deny = %+v", deny)
+	}
+	for _, r := range deny {
+		for _, b := range r.Addr {
+			if b != 0 {
+				t.Fatalf("deny %+v is not the whole address space", r)
+			}
+		}
+	}
+	if len(allow) != 2 || allow[0].Family != 2 || allow[0].Addr[0] != 127 || allow[0].Prefix != 8 ||
+		allow[1].Family != 10 || allow[1].Addr[15] != 1 || allow[1].Prefix != 128 {
+		t.Fatalf("allow = %+v", allow)
+	}
+}
+
+// The exec backend runs plain child processes: it cannot confine a unit's network and says so.
+func TestExecDoesNotEnforceEgress(t *testing.T) {
+	var s Supervisor = NewExec(config.Default(), nil)
+	if e, ok := s.(EgressEnforcer); ok && e.EnforcesEgress() {
+		t.Fatal("the exec backend claims to enforce egress")
+	}
+}

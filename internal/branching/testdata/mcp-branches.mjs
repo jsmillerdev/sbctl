@@ -59,7 +59,14 @@ async function branchStatus(name, want, timeoutMs = 180000) {
     const { out } = await tool("list_branches", { project_id: ref }, () => true);
     const list = json(out)?.branches ?? [];
     const b = list.find((x) => x.name === name);
-    if (b && (b.status === want || b.status === "MIGRATIONS_FAILED")) return b;
+    if (b && b.status === want) return b;
+    // A failed operation ends in MIGRATIONS_FAILED: that is a failure of the run, not a state to
+    // accept as "done" (unless the caller waits for it).
+    if (b && b.status === "MIGRATIONS_FAILED") {
+      failed++;
+      console.log(`FAIL branch ${name} ended MIGRATIONS_FAILED while waiting for ${want}`);
+      return b;
+    }
     if (Date.now() - t0 > timeoutMs) { failed++; console.log(`FAIL branch ${name} never reached ${want}`); return b; }
     await sleep(1500);
   }

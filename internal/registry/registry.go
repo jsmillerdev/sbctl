@@ -101,7 +101,26 @@ type BranchInfo struct {
 	// or "base-backup".
 	CloneMethod       string
 	ReviewRequestedAt *time.Time
+	// Egress is the branch's outbound network policy (the Egress* constants). It is chosen
+	// when the branch is created and kept through reset; empty on a schema-only branch.
+	Egress string
 }
+
+// Outbound network policy of a branch cloned from its parent's data. The clone carries
+// every outbound integration of the parent (webhooks, pg_net, pg_cron, foreign servers), so
+// by default the branch's Postgres unit may reach loopback only.
+const (
+	// EgressPending: deny non-loopback egress once the first-start isolation is done. The
+	// first start (a base-backup restore may fetch WAL from the backup backend) runs open
+	// because the first-start settings already silence the integrations.
+	EgressPending = "pending"
+	// EgressDenied: the unit is rendered with every non-loopback address denied.
+	EgressDenied = "denied"
+	// EgressAllowed: the branch was created with the explicit opt-out.
+	EgressAllowed = "allowed"
+	// EgressUnenforced: denial was wanted but the supervisor cannot enforce it (exec backend).
+	EgressUnenforced = "unenforced"
+)
 
 type AccessToken struct {
 	ID         int64

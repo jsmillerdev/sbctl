@@ -97,6 +97,8 @@ type Service struct {
 	// isolate switches off the integrations a cloned cluster inherited (isolateBranch).
 	isolate func(ctx context.Context, ref string) error
 	clone   func(ctx context.Context, parentRef, method, dstData string) (*CloneStats, error)
+	// freeBytes is the free space of the disk holding a path (-1: unknown).
+	freeBytes func(path string) int64
 
 	mu   sync.Mutex
 	runs map[string]*run // by branch ref
@@ -156,6 +158,7 @@ func New(d Deps) (*Service, error) {
 	s.rotate = s.rotateCredentials
 	s.isolate = s.isolateBranch
 	s.clone = s.cloneParent
+	s.freeBytes = freeBytes
 	s.base, s.stop = context.WithCancel(context.Background())
 	return s, nil
 }

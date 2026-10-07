@@ -172,13 +172,13 @@ func testBranches(t *testing.T, r Registry, orgID int64) {
 	exp := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	b := &Project{Ref: kid, OrgID: orgID, Name: "feature", Branch: &BranchInfo{
 		ID: "6f9619ff-8b86-4011-b42d-00c04fc964ff", ParentRef: parent, Name: "feature", GitBranch: "feat/x", ExpiresAt: &exp,
-		NotifyURL: "https://example.test/hook", State: BranchCreatingProject}}
+		NotifyURL: "https://example.test/hook", State: BranchCreatingProject, Egress: EgressPending}}
 	if err := r.CreateProject(ctx, b); err != nil {
 		t.Fatal(err)
 	}
 	got, err := r.GetProject(ctx, kid)
 	if err != nil || got.Branch == nil || got.Branch.ParentRef != parent || got.Branch.GitBranch != "feat/x" ||
-		got.Branch.State != BranchCreatingProject || got.Branch.ExpiresAt == nil || !got.Branch.ExpiresAt.Equal(exp) || got.Branch.Persistent {
+		got.Branch.State != BranchCreatingProject || got.Branch.Egress != EgressPending || got.Branch.ExpiresAt == nil || !got.Branch.ExpiresAt.Equal(exp) || got.Branch.Persistent {
 		t.Fatalf("branch round trip: %v %+v %+v", err, got, got.Branch)
 	}
 	if p, _ := r.GetProject(ctx, parent); p.Branch != nil {
@@ -194,6 +194,7 @@ func testBranches(t *testing.T, r Registry, orgID int64) {
 		t.Fatalf("delete parent with branches: %v", err)
 	}
 	got.Branch.State, got.Branch.Detail, got.Branch.CloneMethod, got.Branch.Persistent, got.Branch.ExpiresAt = BranchMigrationsPassed, "ok", "clonefile", true, nil
+	got.Branch.Egress = EgressDenied
 	if err := r.SetProjectStatus(ctx, kid, StatusActiveHealthy); err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +202,7 @@ func testBranches(t *testing.T, r Registry, orgID int64) {
 		t.Fatal(err)
 	}
 	again, _ := r.GetProject(ctx, kid)
-	if again.Status != StatusActiveHealthy || again.Branch.State != BranchMigrationsPassed || !again.Branch.Persistent || again.Branch.ExpiresAt != nil || again.Branch.CloneMethod != "clonefile" || again.Branch.ParentRef != parent {
+	if again.Status != StatusActiveHealthy || again.Branch.State != BranchMigrationsPassed || !again.Branch.Persistent || again.Branch.ExpiresAt != nil || again.Branch.CloneMethod != "clonefile" || again.Branch.Egress != EgressDenied || again.Branch.ParentRef != parent {
 		t.Fatalf("update branch: %+v %+v", again, again.Branch)
 	}
 	if err := r.UpdateBranch(ctx, parent, got.Branch); !errors.Is(err, ErrNotFound) {
