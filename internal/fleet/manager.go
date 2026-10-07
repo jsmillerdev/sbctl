@@ -52,8 +52,13 @@ type Deps struct {
 	// ReadyTimeout bounds the wait for one service to answer after its unit started
 	// (default 3 minutes: Realtime and Supavisor run their migrations first).
 	ReadyTimeout time.Duration
-	// HTTPClient is used for health checks and tenant calls (default: 20 s timeout).
-	HTTPClient *http.Client
+	// ProbeClient is used for the health checks of Manager (default: 4 s timeout).
+	ProbeClient *http.Client
+	// TenantClient is used for the tenant calls of Setup (default: 2 minute timeout).
+	// Creating a Realtime or Storage tenant runs that service's migrations in the
+	// project's database before the call answers, so a client with a short timeout makes
+	// tenant creation fail.
+	TenantClient *http.Client
 	// Retry bounds the retries of tenant calls (default: 5 attempts, 500 ms to 8 s backoff).
 	Retry Retry
 }
@@ -115,7 +120,7 @@ func NewManager(d Deps) (*Manager, error) {
 	if d.ReadyTimeout == 0 {
 		d.ReadyTimeout = 3 * time.Minute
 	}
-	hc := d.HTTPClient
+	hc := d.ProbeClient
 	if hc == nil {
 		hc = &http.Client{Timeout: 4 * time.Second}
 	}
@@ -212,10 +217,17 @@ func (m *Manager) Specs(ctx context.Context) ([]units.Spec, error) {
 	return specs, errors.Join(errs...)
 }
 
+// studioReadyTimeout caps the wait for Studio, which nothing else depends on: a Studio
+// that does not come up must not hold the boot of the node for the full ReadyTimeout.
+const studioReadyTimeout = time.Minute
+
 // Start renders and starts every service (except Deps.Skip) in order and waits until each
 // answers its health endpoint. It is idempotent: a running service whose rendered files
 // are unchanged is left alone, one whose files changed is restarted. A service that
-// cannot start does not stop the others from starting; the errors are joined.
+// cannot start does not stop the others from starting; the errors are joined. Studio is
+// optional: it needs our own artifact, and nothing depends on it, so when it cannot start
+// (no artifact, a unit that fails) Start logs a warning and does not return an error; the
+// failure shows in Status.
 func (m *Manager) Start(ctx context.Context) error {
 	if m.d.Registry == nil || m.d.Secrets == nil || m.d.Artifacts == nil {
 		return errors.New("fleet: starting services needs Deps.Registry, Secrets and Artifacts")
@@ -232,6 +244,10 @@ func (m *Manager) Start(ctx context.Context) error {
 		spec, err := m.spec(svc, c)
 		if err == nil {
 			err = m.startOne(ctx, spec)
+		}
+		if err != nil && svc == config.SvcStudio {
+			m.log.Warn("studio did not start; the other services are not affected", "error", err)
+			continue
 		}
 		if err != nil {
 			m.log.Error("fleet service did not start", "service", svc, "error", err)
@@ -268,14 +284,18 @@ func (m *Manager) startOne(ctx context.Context, spec units.Spec) error {
 	if err := m.d.Supervisor.Start(ctx, unit); err != nil {
 		return err
 	}
-	return m.waitReady(ctx, spec.Service, unit)
+	timeout := m.d.ReadyTimeout
+	if spec.Service == config.SvcStudio && timeout > studioReadyTimeout {
+		timeout = studioReadyTimeout
+	}
+	return m.waitReady(ctx, spec.Service, unit, timeout)
 }
 
 // waitReady polls svc's health endpoint until it answers, the timeout passes, or the unit
 // dies (failed, stopped or restarting), in which case it returns at once with the end of
 // the unit's log when the backend keeps one.
-func (m *Manager) waitReady(ctx context.Context, svc, unit string) error {
-	deadline := time.Now().Add(m.d.ReadyTimeout)
+func (m *Manager) waitReady(ctx context.Context, svc, unit string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	var last error
 	for delay := 100 * time.Millisecond; ; {
 		if last = m.probe(ctx, svc); last == nil {
@@ -287,7 +307,7 @@ func (m *Manager) waitReady(ctx context.Context, svc, unit string) error {
 			}
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%s not ready after %s: %v%s", unit, m.d.ReadyTimeout, last, m.logTail(unit))
+			return fmt.Errorf("%s not ready after %s: %v%s", unit, timeout, last, m.logTail(unit))
 		}
 		select {
 		case <-ctx.Done():

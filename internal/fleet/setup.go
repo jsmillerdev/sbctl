@@ -20,40 +20,50 @@ const tenantTimeout = 2 * time.Minute
 // EnsureTenant calls them, and returns them as a Fleet that lifecycle.Options.Fleet takes.
 // It generates the services' sealed secrets in the registry if this is the first call (the
 // tenants authenticate to the admin APIs with them), so the system project must be
-// initialized. With Deps.Start it also renders and starts the services first (see
-// Manager.Start) and fails if one cannot start.
+// initialized. With Deps.Start it also renders and starts the services (see Manager.Start).
+//
+// The returned Fleet is usable even when the error is not nil: a service that does not
+// start is reported in the error, but the tenants of the others (and of this one, once it
+// runs) work, so a caller logs the error and keeps going instead of booting with an empty
+// Fleet, which would silently skip every tenant call. The Fleet is nil only when Setup
+// could not build it at all (missing Deps, uninitialized system project). Studio is
+// optional: its failure to start is logged and shows in Manager.Status, but is not an
+// error here.
 //
 // Setup needs Cfg, Registry and Secrets, and Supervisor and Artifacts when Start is set.
 // lifecycle.Open builds its Engine before anyone can hand it a Fleet, so a caller that
-// wants the Engine to use this Fleet builds the Engine again:
+// wants the Engine to use this Fleet either passes Lazy to lifecycle.Open, or builds the
+// Engine again:
 //
 //	n, _ := lifecycle.Open(ctx, cfg, oo)
-//	fl, _ := fleet.Setup(ctx, fleet.Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets,
+//	fl, err := fleet.Setup(ctx, fleet.Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets,
 //		Supervisor: n.Supervisor, Artifacts: n.Artifacts, Start: true})
+//	if err != nil { log(err) } // fl is still usable unless it is nil
 //	eng := lifecycle.NewEngine(cfg, n.Registry, n.Secrets, n.Artifacts, n.Plane, lifecycle.Options{Fleet: fl})
 func Setup(ctx context.Context, d Deps) (Fleet, error) {
 	if d.Cfg == nil || d.Registry == nil || d.Secrets == nil {
 		return nil, errors.New("fleet: Setup needs Deps.Cfg, Registry and Secrets")
 	}
-	if d.Start {
-		m, err := NewManager(d)
-		if err != nil {
-			return nil, err
-		}
-		if err := m.Start(ctx); err != nil {
-			return nil, err
-		}
-	}
 	c, err := loadCreds(ctx, d, true)
 	if err != nil {
 		return nil, err
 	}
-	return newTenants(d, c), nil
+	f := newTenants(d, c)
+	if d.Start {
+		m, err := NewManager(d)
+		if err != nil {
+			return f, err
+		}
+		if err := m.Start(ctx); err != nil {
+			return f, err
+		}
+	}
+	return f, nil
 }
 
 func newTenants(d Deps, c *creds) Fleet {
 	cfg := d.Cfg
-	hc := d.HTTPClient
+	hc := d.TenantClient
 	if hc == nil {
 		hc = &http.Client{Timeout: tenantTimeout}
 	}

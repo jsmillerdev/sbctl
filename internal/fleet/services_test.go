@@ -116,6 +116,13 @@ func TestSupavisorEnv(t *testing.T) {
 	if env["RELEASE_TMP"] != n.cfg.Paths().System("supavisor")+"/tmp" {
 		t.Errorf("RELEASE_TMP = %q", env["RELEASE_TMP"])
 	}
+	crt, key := DownstreamCertPaths(n.cfg)
+	if env["GLOBAL_DOWNSTREAM_CERT_PATH"] != crt || env["GLOBAL_DOWNSTREAM_KEY_PATH"] != key {
+		t.Errorf("TLS paths = %q, %q", env["GLOBAL_DOWNSTREAM_CERT_PATH"], env["GLOBAL_DOWNSTREAM_KEY_PATH"])
+	}
+	if _, ok := env["SUPAVISOR_BIND_IP"]; ok {
+		t.Error("SUPAVISOR_BIND_IP would make the pooler ports loopback-only")
+	}
 	if _, ok := env["CLUSTER_POSTGRES"]; ok {
 		t.Error("CLUSTER_POSTGRES needs a region and is for multi-node setups")
 	}

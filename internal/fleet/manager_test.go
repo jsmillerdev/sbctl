@@ -116,16 +116,48 @@ func TestManagerOneFailureDoesNotBlockTheRest(t *testing.T) {
 	}
 }
 
-func TestManagerMissingArtifactIsReportedPerService(t *testing.T) {
+func TestManagerMissingStudioArtifactIsNotFatal(t *testing.T) {
 	arts := allArtifacts()
 	delete(arts, config.SvcStudio)
 	r := newManagerRig(t, func(d *Deps) { d.Artifacts = arts })
-	err := r.m.Start(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "studio") || strings.Contains(err.Error(), "realtime") {
-		t.Fatalf("err = %v", err)
+	if err := r.m.Start(context.Background()); err != nil {
+		t.Fatalf("a Studio without an artifact must not fail Start: %v", err)
 	}
 	if !strings.Contains(r.sup.log(), "start sb-storage.service") {
 		t.Fatal("the other services must still start")
+	}
+	var studio *Health
+	for _, h := range r.m.Status(context.Background()) {
+		if h.Service == config.SvcStudio {
+			h := h
+			studio = &h
+		} else if !h.Healthy {
+			t.Errorf("%+v", h)
+		}
+	}
+	if studio == nil || studio.Healthy {
+		t.Fatalf("Status must report the Studio that did not start: %+v", studio)
+	}
+}
+
+func TestManagerMissingArtifactIsReportedPerService(t *testing.T) {
+	arts := allArtifacts()
+	delete(arts, config.SvcStorage)
+	r := newManagerRig(t, func(d *Deps) { d.Artifacts = arts })
+	err := r.m.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "storage") || strings.Contains(err.Error(), "realtime") {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(r.sup.log(), "start sb-studio.service") {
+		t.Fatal("the other services must still start")
+	}
+}
+
+func TestManagerStudioUnitFailureIsNotFatal(t *testing.T) {
+	r := newManagerRig(t, nil)
+	r.sup.failOn["start sb-studio.service"] = errors.New("read-only file system")
+	if err := r.m.Start(context.Background()); err != nil {
+		t.Fatalf("a Studio unit that fails must not fail Start: %v", err)
 	}
 }
 

@@ -3,6 +3,7 @@ package fleet_test
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -158,18 +159,24 @@ func TestIntegrationFleetTenants(t *testing.T) {
 	}
 	host := cfg.ProjectHost(p.Ref)
 
-	// Supavisor: postgres.<ref> logs in on both ports.
+	// Supavisor: postgres.<ref> logs in on both ports, in the clear and over TLS (the
+	// Supabase CLI refuses a database that answers without TLS).
 	for _, port := range []int{cfg.Ports.SupavisorSession, cfg.Ports.SupavisorTransaction} {
-		dsn := fmt.Sprintf("postgres://postgres.%s:%s@127.0.0.1:%d/postgres?sslmode=disable&default_query_exec_mode=simple_protocol", p.Ref, keys.DBPassword, port)
-		c, err := pgx.Connect(ctx, dsn)
-		if err != nil {
-			t.Fatalf("pooler port %d: %v", port, err)
+		for _, mode := range []string{"disable", "require"} {
+			dsn := fmt.Sprintf("postgres://postgres.%s:%s@127.0.0.1:%d/postgres?sslmode=%s&default_query_exec_mode=simple_protocol", p.Ref, keys.DBPassword, port, mode)
+			c, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatalf("pooler port %d, sslmode=%s: %v", port, mode, err)
+			}
+			if _, isTLS := c.PgConn().Conn().(*tls.Conn); isTLS != (mode == "require") {
+				t.Errorf("pooler port %d, sslmode=%s: TLS = %v", port, mode, isTLS)
+			}
+			var user string
+			if err := c.QueryRow(ctx, "select current_user").Scan(&user); err != nil || user != "postgres" {
+				t.Fatalf("pooler port %d, sslmode=%s: user %q, %v", port, mode, user, err)
+			}
+			c.Close(ctx)
 		}
-		var user string
-		if err := c.QueryRow(ctx, "select current_user").Scan(&user); err != nil || user != "postgres" {
-			t.Fatalf("pooler port %d: user %q, %v", port, user, err)
-		}
-		c.Close(ctx)
 	}
 	if _, err := pgx.Connect(ctx, fmt.Sprintf("postgres://postgres.%s:wrong@127.0.0.1:%d/postgres?sslmode=disable", p.Ref, cfg.Ports.SupavisorSession)); err == nil {
 		t.Fatal("pooler accepted a wrong password")

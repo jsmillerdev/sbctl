@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/units"
@@ -71,6 +72,11 @@ func (m *Manager) spec(svc string, c *creds) (units.Spec, error) {
 		s.Env = pgmetaEnv(cfg, c)
 	case config.SvcSupavisor:
 		s.Env = supavisorEnv(cfg, c)
+		sum, err := ensureDownstreamCert(cfg, time.Now())
+		if err != nil {
+			return units.Spec{}, err
+		}
+		s.Env[downstreamCertMarkerEnv] = sum
 		s.PreStart = [][]string{{"bin/prepare"}} // schema migrations of _supavisor
 	case config.SvcRealtime:
 		s.Env = realtimeEnv(cfg, c)
@@ -104,30 +110,42 @@ func pgmetaEnv(cfg *config.Config, c *creds) map[string]string {
 // RELEASE_TMP, set for both Elixir services, is where an Elixir release writes its
 // runtime files if it needs any (the artifact directory is read-only under systemd).
 //
+// downstreamCertMarkerEnv carries the hash of the pooler certificate. Supavisor ignores it;
+// it makes the rendered environment change, and so Start restart the unit, when the
+// certificate is replaced.
+const downstreamCertMarkerEnv = "SBCTL_DOWNSTREAM_CERT_SHA256"
+
 // supavisorEnv follows the dockerless CLI's recipe (supabase/cli packages/stack
 // services/Pooler.ts), the upstream compose file, and config/runtime.exs at the pinned
-// version. Supavisor has no bind-address variable: its API port and the pooler ports
-// listen on every interface. The internal shard listeners (PROXY_PORT,
-// SESSION_PROXY_PORTS, TRANSACTION_PROXY_PORTS) take ephemeral ports. The metadata
-// database is _supavisor of the system cluster, as its own owner role. Metrics are
-// unreachable: their JWT secret is random and never shown to anyone.
+// version. The pooler ports must be reachable from outside, so SUPAVISOR_BIND_IP (a
+// slim-services addition that moves the HTTP API and every proxy listener to one
+// address) is not set: the API port and the ephemeral shard listeners (PROXY_PORT,
+// SESSION_PROXY_PORTS, TRANSACTION_PROXY_PORTS, which take ephemeral ports) listen on
+// every interface, and the host firewall must close them (see the README). The API needs
+// a JWT only sbctl can sign. The metadata database is _supavisor of the system cluster,
+// as its own owner role. Metrics are unreachable: their JWT secret is random and never
+// shown to anyone. Clients that connect with TLS (the Supabase CLI requires it for a
+// remote database) are served from the node's own certificate (see ensureDownstreamCert).
 func supavisorEnv(cfg *config.Config, c *creds) map[string]string {
+	certPath, keyPath := DownstreamCertPaths(cfg)
 	return map[string]string{
-		"DATABASE_URL":            ectoURL(c.logins[config.SvcSupavisor], cfg.Ports.SystemPostgres),
-		"DB_POOL_SIZE":            "5",
-		"PORT":                    strconv.Itoa(cfg.Fleet.SupavisorAPI()),
-		"PROXY_PORT_SESSION":      strconv.Itoa(cfg.Ports.SupavisorSession),
-		"PROXY_PORT_TRANSACTION":  strconv.Itoa(cfg.Ports.SupavisorTransaction),
-		"PROXY_PORT":              "0",
-		"SESSION_PROXY_PORTS":     "0",
-		"TRANSACTION_PROXY_PORTS": "0",
-		"RELEASE_TMP":             filepath.Join(cfg.Paths().System(config.SvcSupavisor), "tmp"),
-		"API_JWT_SECRET":          c.supavisorAPIJWT,
-		"METRICS_JWT_SECRET":      c.supavisorMetricsJWT,
-		"SECRET_KEY_BASE":         c.supavisorSecretBase,
-		"VAULT_ENC_KEY":           c.supavisorVaultKey,
-		"REGION":                  "local",
-		"NODE_IP":                 "127.0.0.1",
+		"GLOBAL_DOWNSTREAM_CERT_PATH": certPath,
+		"GLOBAL_DOWNSTREAM_KEY_PATH":  keyPath,
+		"DATABASE_URL":                ectoURL(c.logins[config.SvcSupavisor], cfg.Ports.SystemPostgres),
+		"DB_POOL_SIZE":                "5",
+		"PORT":                        strconv.Itoa(cfg.Fleet.SupavisorAPI()),
+		"PROXY_PORT_SESSION":          strconv.Itoa(cfg.Ports.SupavisorSession),
+		"PROXY_PORT_TRANSACTION":      strconv.Itoa(cfg.Ports.SupavisorTransaction),
+		"PROXY_PORT":                  "0",
+		"SESSION_PROXY_PORTS":         "0",
+		"TRANSACTION_PROXY_PORTS":     "0",
+		"RELEASE_TMP":                 filepath.Join(cfg.Paths().System(config.SvcSupavisor), "tmp"),
+		"API_JWT_SECRET":              c.supavisorAPIJWT,
+		"METRICS_JWT_SECRET":          c.supavisorMetricsJWT,
+		"SECRET_KEY_BASE":             c.supavisorSecretBase,
+		"VAULT_ENC_KEY":               c.supavisorVaultKey,
+		"REGION":                      "local",
+		"NODE_IP":                     "127.0.0.1",
 	}
 }
 

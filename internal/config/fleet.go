@@ -13,10 +13,13 @@ const (
 // Realtime, Storage, postgres-meta, Studio) that internal/fleet starts. Everything has a
 // working default; the environment overrides are SBCTL_FLEET_*.
 type Fleet struct {
-	// SupavisorAPIPort is the port of Supavisor's HTTP API. Supavisor has no bind-address
-	// setting, so it listens on every interface; its tenant API needs a JWT signed with a
-	// secret only sbctl knows, but a host firewall should still close this port (the
-	// installer opens 80, 443, 5432 and 6543 only). Zero means DefaultSupavisorAPIPort.
+	// SupavisorAPIPort is the port of Supavisor's HTTP API. The pinned artifact reads
+	// SUPAVISOR_BIND_IP (a slim-services addition) for the API and the proxy listeners, but
+	// it moves 5432 and 6543 to that address too, and those must stay reachable from
+	// outside, so sbctl does not set it: the API and Supavisor's ephemeral shard listeners
+	// listen on every interface. The API needs a JWT signed with a secret only sbctl knows,
+	// but the host firewall or security group must still close this port and the ephemeral
+	// ones (the installer opens 80, 443, 5432 and 6543 only). Zero means DefaultSupavisorAPIPort.
 	SupavisorAPIPort int `toml:"supavisor_api_port"`
 	// StorageBackend is "file" (default: objects under <state_dir>/system/storage) or "s3".
 	StorageBackend string `toml:"storage_backend"`

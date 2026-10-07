@@ -133,6 +133,14 @@ for port in $P_SESSION $P_TRANSACTION; do
     || fail "pooler port $port: login failed"
   [[ $got == postgres ]] || fail "pooler port $port: current_user is '$got'"
 done
+# The Supabase CLI refuses a remote database that does not answer TLS, so the pooler must
+# (node-generated certificate: require encrypts without verifying it).
+log "pooler: TLS on both ports (sslmode=require)"
+for port in $P_SESSION $P_TRANSACTION; do
+  info=$(PGPASSWORD=$DBPW "$PSQL" "host=127.0.0.1 port=$port user=postgres.$REF dbname=postgres sslmode=require connect_timeout=10" -Atc '\conninfo' </dev/null) \
+    || fail "pooler port $port: sslmode=require login failed"
+  grep -Eiq 'ssl connection.*(protocol|true)' <<<"$info" || fail "pooler port $port: sslmode=require connected without TLS: $info"
+done
 if PGPASSWORD=wrong "$PSQL" "host=127.0.0.1 port=$P_SESSION user=postgres.$REF dbname=postgres sslmode=disable connect_timeout=10" -Atc 'select 1' </dev/null >/dev/null 2>&1; then
   fail "pooler accepted a wrong password"
 fi
