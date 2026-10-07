@@ -299,14 +299,24 @@ pkill -KILL -u "$SUPAVISE_USER" -x sleep || true   # SIGTERM would not stop the 
 wait "$CLIWAIT" "$SLEEPER" 2>/dev/null || true
 rm -rf "$DUMPDIR"
 
+log "an object in $A's Storage directory (and one in $B's), for the nightly backup to copy"
+OBJ_ROOT="$SUPAVISE_STATE/system/storage/objects/stub"
+for r in "$A" "$B"; do
+  sudo -u "$SUPAVISE_USER" mkdir -p "$OBJ_ROOT/$r/bucket/hello.txt"
+  echo "stored object of $r" | sudo -u "$SUPAVISE_USER" tee "$OBJ_ROOT/$r/bucket/hello.txt/v1" >/dev/null
+done
+
 log "nightly backup: the supavise-basebackup@$A service runs as the timer would"
 systemctl start "supavise-basebackup@$A.service" || { journalctl --no-pager -u "supavise-basebackup@$A" | tail -30 >&2; fail "$A: supavise-basebackup service failed"; }
 [[ $(supavise backups list "$A" | grep -c completed) -ge 1 ]] || { supavise backups list "$A" >&2 || true; fail "$A: no completed base backup after the backup service ran"; }
+# The unit sees $A's objects through its mount allowlist and copied them.
+[[ $(supavise backups list "$A" --files | awk '$2 == "storage" && $5 >= 1' | wc -l) -ge 1 ]] || { supavise backups list "$A" --files >&2 || true; journalctl --no-pager -u "supavise-basebackup@$A" | tail -30 >&2; fail "$A: the nightly backup did not copy the Storage object"; }
 
 log "a base backup with the daemon down: the command serves the relay sockets nobody answers while it runs"
 systemctl stop supavise.service
 supavise backups create "$B" --reason manual || { journalctl --no-pager -u "supavise-postgres@$B" | tail -20 >&2; fail "$B: base backup with the daemon down"; }
 [[ $(supavise backups list "$B" | grep -c completed) -ge 1 ]] || fail "$B: no completed base backup after a backup with the daemon down"
+[[ $(supavise backups list "$B" --files | awk '$2 == "storage" && $5 == 1' | wc -l) -ge 1 ]] || { supavise backups list "$B" --files >&2 || true; fail "$B: the manual backup did not copy the Storage object"; }
 systemctl start supavise.service
 for ((i = 0; i < 30; i++)); do
   [[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] && break
@@ -320,6 +330,7 @@ wait_archived "$A" "$SEGR" 90 || fail "$A: the segment with the restore marker w
 CLONE=restoredcloneprojxyz
 supavise backups restore "$A" --to latest --as "$CLONE" || { journalctl --no-pager -u "supavise-postgres@$CLONE" -u supavise.service | tail -40 >&2; fail "restore of $A as $CLONE"; }
 supavise projects health "$CLONE" || fail "$CLONE: unhealthy after the restore"
+[[ $(cat "$OBJ_ROOT/$CLONE/bucket/hello.txt/v1" 2>/dev/null) == "stored object of $A" ]] || fail "$CLONE: the Storage object of $A did not come back with the restore"
 [[ $(pg_admin "$CLONE" "select count(*) from public.restore_marker") == 1 ]] || fail "$CLONE: the restored cluster lacks the row written after the base backup (WAL replay through the relay)"
 [[ ! -e "$SUPAVISE_STATE/projects/$CLONE/restore-sources" ]] || fail "$CLONE: the file that lets its relay read $A's archive survived the recovery"
 [[ -z $(pg_admin "$CLONE" "show restore_command") ]] || fail "$CLONE: restore_command was not reset after recovery"
