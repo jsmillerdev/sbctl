@@ -43,7 +43,7 @@ registered in a second mux of a chain, tried in order.
 
 | Area | Routes |
 |---|---|
-| Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (the full branch API, served by `internal/branching`, see below); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/database/{ref}/backups` (empty) |
+| Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (the full branch API, served by `internal/branching`, see below); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`, `restart-services`; `POST /v1/projects/{ref}/restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/database/{ref}/backups` (empty) |
 | Keys | `/v1/projects/{ref}/api-keys` (legacy `anon`, `service_role`, `sb_publishable_*`, `sb_secret_*`; secrets masked unless `reveal=true`), `api-keys/{id}`, `api-keys/legacy` |
 | Database | `database/query`, `database/query/read-only` (rows as JSON; `parameters` supported), `database/migrations` list and apply (`supabase_migrations.schema_migrations`), `types/typescript` (pg-meta generator), `cli/login-role` create and delete, `advisors/*` (no lints yet) |
 | Functions and secrets | `functions` list, create, deploy (multipart), get, patch, delete, `body`; `secrets` list (digests), create, delete. Sources and sealed secrets are stored; there is no runtime yet (phase 2) |
@@ -75,7 +75,7 @@ the default branch only and a create answers 400. Organization entitlements alre
 
 | Route family | Credentials |
 |---|---|
-| `/platform/*` | GoTrue session JWT from `sb-gotrue@system`: HS256, signed with the system project's JWT secret (`Manager.Keys("system")`; re-read when a signature fails, at most once every 5 seconds, so a rotation takes effect and garbage tokens cost nothing), `role: authenticated`, not anonymous, **and an admin** (below) |
+| `/platform/*` | GoTrue session JWT from `sb-gotrue@system`: HS256, signed with the system project's JWT secret (`Manager.Keys("system")`; re-read when a signature fails, at most once every 5 seconds, so a rotation takes effect and garbage tokens cost nothing), audience `authenticated`, an `exp` claim, not anonymous, **and an admin** (below). The session is identified by audience and signature, not by the `role` claim: users created through GoTrue's admin API have an empty `auth.users.role`, so their tokens carry `role: ""` (research/08 section 9); tokens with role `anon` or `service_role` are refused |
 | `/v1/*`, `/v2/*` | `sbp_` personal access token (`sbp_` + 40 hex, also `sbp_v0_`, `sbp_oauth_`; looked up by `secrets.HashToken`, expiry honored, `last_used_at` touched at most once a minute) **or** a dashboard JWT |
 | `GET /platform/cli/login/{session_id}` | none (the CLI has no token yet); guarded by the verification code |
 
@@ -240,6 +240,25 @@ The Supabase CLI may also have started its own stack host (`supabase __supabase_
 for the project directory it ran in; that process belongs to the CLI and to whatever project
 you ran it from, so check its working directory (`lsof -p <pid> | grep cwd`) before stopping it.
 
+## Lifecycle calls outlive the request
+
+Delete, pause, restore (resume), restart and create run on a context detached from the HTTP
+request (`context.WithoutCancel`) with a bound: 30 minutes for delete (it includes a final base
+backup), 20 for create, 10 for pause and resume, 20 for restart (pause and resume as one unit). A
+client that leaves partway (Ctrl-C on `supabase projects delete`, a closed Studio tab, a proxy
+idle timeout) therefore cannot strand a project half deleted or stopped; the operation finishes
+and its outcome shows in the project's status. Status codes follow the specs: v1 pause, restore
+and restart answer 200; platform pause, restart and restart-services answer 201 and platform
+restore 200. A request cancelled by the client answers 499 (not 5xx, and not logged as an
+error), which is what a browser navigation does to Studio's in-flight pg-meta queries.
+The HTTP client toward pg-meta, GoTrue and Storage drops idle keep-alive connections after 2
+seconds, below the 5 seconds after which postgres-meta (fastify) closes them, because a SQL
+`POST` that hits a closed connection cannot be replayed. `api.Deps.Store` is passed explicitly by
+`internal/app` (the Postgres store); the in-memory fallback logs a warning. Concurrent device-login
+creates for one `session_id` are serialized, so a duplicate create replaces the first session and
+deletes its token instead of orphaning it. The project region shown to clients is always an AWS
+region code (`config.Region`, default `us-east-1`).
+
 ## Not done / known limits
 
 - **No `db push --linked` end to end here.** The CLI dials `db.<ref>.<project_host>:5432` and
@@ -261,7 +280,7 @@ you ran it from, so check its working directory (`lsof -p <pid> | grep cwd`) bef
   `PATCH` on auth, storage, realtime and postgrest *config* is a stub; `PATCH
   /v1/projects/{ref}/database/password` is a stub.
 - Not checked against a running Studio: that is workstream A. Region and cloud provider
-  are reported as stored (`local`) and `AWS`; Studio may expect known region names.
+  are reported as the configured AWS region code (`region`, default `us-east-1`) and `AWS`.
 - The direct database host reported to clients is `db.<ref>.api.<domain>`, which a
   `*.api.<domain>` wildcard record does not cover (two labels).
 - The regular-expression engine of the schema validator in the tests lacks look-ahead, so

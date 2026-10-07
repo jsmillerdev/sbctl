@@ -106,6 +106,11 @@ func New(o Options) (*Service, error) {
 	return s, nil
 }
 
+// SetManager sets the lifecycle Manager that Restore needs. The Manager (the Engine)
+// needs this service as its base backuper, so one of the two is built first and the
+// other handed in afterwards; call it before the first Restore.
+func (s *Service) SetManager(m lifecycle.Manager) { s.opt.Manager = m }
+
 // Store returns the backend the service writes to.
 func (s *Service) Store() Store { return s.opt.Store }
 

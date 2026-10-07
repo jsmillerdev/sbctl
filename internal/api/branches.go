@@ -138,6 +138,11 @@ func (s *Server) branchProjectErr(err error) error {
 }
 
 func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) error {
+	done, err := s.beginOp()
+	if err != nil {
+		return err
+	}
+	defer done()
 	var in v1.CreateBranchBody
 	if err := decode(r, &in); err != nil {
 		return err
@@ -172,6 +177,11 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) disableBranching(w http.ResponseWriter, r *http.Request) error {
+	done, err := s.beginOp()
+	if err != nil {
+		return err
+	}
+	defer done()
 	if s.branches == nil {
 		return s.noBranching()
 	}
@@ -228,6 +238,11 @@ func (s *Server) getBranch(w http.ResponseWriter, r *http.Request) error {
 func pgEngine(p *registry.Project) string { return itoa(int64(pgMajor(p))) }
 
 func (s *Server) updateBranch(w http.ResponseWriter, r *http.Request) error {
+	done, err := s.beginOp()
+	if err != nil {
+		return err
+	}
+	defer done()
 	var in v1.UpdateBranchBody
 	if err := decode(r, &in); err != nil {
 		return err
@@ -245,11 +260,16 @@ func (s *Server) updateBranch(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) deleteBranch(w http.ResponseWriter, r *http.Request) error {
+	done, err := s.beginOp()
+	if err != nil {
+		return err
+	}
+	defer done()
 	if s.branches == nil {
 		return errf(http.StatusNotFound, "Branch not found")
 	}
 	// force=false asks for the soft delete with a grace period; anything else is immediate.
-	_, err := s.branches.Delete(r.Context(), r.PathValue("branch_id_or_ref"), branching.DeleteOptions{Schedule: r.URL.Query().Get("force") == "false"})
+	_, err = s.branches.Delete(r.Context(), r.PathValue("branch_id_or_ref"), branching.DeleteOptions{Schedule: r.URL.Query().Get("force") == "false"})
 	if err != nil {
 		return mapBranchErr(err)
 	}
@@ -261,6 +281,11 @@ func (s *Server) deleteBranch(w http.ResponseWriter, r *http.Request) error {
 // answer is the run id; the branch's status (GET) follows it.
 func (s *Server) branchAction(op string) handlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
+		done, err := s.beginOp()
+		if err != nil {
+			return err
+		}
+		defer done()
 		var in v1.BranchActionBody
 		if err := decode(r, &in); err != nil {
 			return err
@@ -276,7 +301,6 @@ func (s *Server) branchAction(op string) handlerFunc {
 		ai.Force = r.URL.Query().Get("force") == "true"
 		id := r.PathValue("branch_id_or_ref")
 		var run string
-		var err error
 		switch op {
 		case "merge":
 			run, err = s.branches.Merge(r.Context(), id, ai)
@@ -294,6 +318,11 @@ func (s *Server) branchAction(op string) handlerFunc {
 }
 
 func (s *Server) restoreBranch(w http.ResponseWriter, r *http.Request) error {
+	done, err := s.beginOp()
+	if err != nil {
+		return err
+	}
+	defer done()
 	if s.branches == nil {
 		return errf(http.StatusNotFound, "Branch not found")
 	}

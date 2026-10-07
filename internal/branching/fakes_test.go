@@ -29,6 +29,7 @@ type fakeEngine struct {
 	deletes []string
 	skipped map[string]bool // ref -> SkipFinalBackup of the last delete
 	rotated []string
+	paused  map[string]int
 
 	createErr error
 	hold      chan struct{} // when set, Create waits for it to close (after the row exists)
@@ -84,7 +85,15 @@ func (f *fakeEngine) DeleteWith(ctx context.Context, ref string, o lifecycle.Del
 func (f *fakeEngine) Delete(ctx context.Context, ref string) error {
 	return f.DeleteWith(ctx, ref, lifecycle.DeleteOptions{})
 }
-func (f *fakeEngine) Pause(context.Context, string) error  { return nil }
+func (f *fakeEngine) Pause(_ context.Context, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.paused == nil {
+		f.paused = map[string]int{}
+	}
+	f.paused[ref]++
+	return nil
+}
 func (f *fakeEngine) Resume(context.Context, string) error { return nil }
 func (f *fakeEngine) RotateKeys(_ context.Context, ref string) (*secrets.ProjectKeys, error) {
 	f.mu.Lock()

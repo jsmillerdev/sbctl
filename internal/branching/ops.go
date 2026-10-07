@@ -238,8 +238,9 @@ func (s *Service) Reset(ctx context.Context, idOrRef string, in ActionInput) (st
 	}
 	var keys *secrets.ProjectKeys
 	if !b.WithData {
+		// A branch whose creation failed may have no credentials worth keeping.
 		if keys, err = s.eng.Keys(ctx, b.Ref); err != nil {
-			return "", err
+			keys = nil
 		}
 	}
 	r, err := s.begin(b.Ref, "reset")
@@ -356,8 +357,11 @@ func (s *Service) Delete(ctx context.Context, idOrRef string, o DeleteOptions) (
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkIdle(b); err != nil {
-		return nil, err
+	// Only an operation running here blocks a delete. A busy state in the registry may be a
+	// crash's leftover, and an operation in another process holds the lifecycle's advisory
+	// lock, which the delete waits for.
+	if op, ok := s.running(b.Ref); ok {
+		return nil, conflict("branch %s is busy with %s", b.Name, op)
 	}
 	if o.Schedule {
 		p, err := s.project(ctx, b.Ref)

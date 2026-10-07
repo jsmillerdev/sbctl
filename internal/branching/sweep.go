@@ -11,13 +11,13 @@ import (
 
 // purgeArchive removes everything the backup store holds for ref (WAL and base backups).
 func (s *Service) purgeArchive(ctx context.Context, ref string) error {
-	if s.bk == nil || s.bk.Store == nil {
+	if s.bk == nil || s.bk.Store() == nil {
 		return nil
 	}
 	if !secrets.ValidRef(ref) { // the prefix must never be empty or reach another project
 		return fmt.Errorf("branching: refusing to purge the archive of %q", ref)
 	}
-	objs, err := s.bk.Store.List(ctx, ref+"/")
+	objs, err := s.bk.Store().List(ctx, ref+"/")
 	if err != nil {
 		return err
 	}
@@ -28,7 +28,7 @@ func (s *Service) purgeArchive(ctx context.Context, ref string) error {
 		for i := range keys {
 			keys[i] = objs[i].Key
 		}
-		if err := s.bk.Store.Delete(ctx, keys...); err != nil {
+		if err := s.bk.Store().Delete(ctx, keys...); err != nil {
 			return err
 		}
 		objs = objs[n:]
@@ -68,6 +68,9 @@ func (s *Service) Sweep(ctx context.Context, dryRun bool) (*SweepResult, error) 
 				s.setState(ctx, p.Ref, registry.BranchMigrationsFailed, "interrupted: no process was working on this operation (the daemon stopped?)", nil)
 			}
 			continue
+		}
+		if busy(b.State) {
+			continue // another process (the CLI) is working on it; a stale one was handled above
 		}
 		lapsed := (!b.Persistent && b.ExpiresAt != nil && !b.ExpiresAt.After(now)) ||
 			(b.DeletionScheduledAt != nil && !b.DeletionScheduledAt.After(now))

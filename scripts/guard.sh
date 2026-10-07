@@ -4,14 +4,15 @@
 #   scripts/guard.sh [--no-lock] -- <command> [args...]
 #
 # - Waits until free memory and disk are above their floors before starting.
-# - Holds a machine-wide lock so only one heavy job runs at a time (--no-lock skips it,
-#   for light long-running helpers such as a test Postgres).
+# - Holds one of GUARD_SLOTS machine-wide slots (default 2), so at most that many heavy jobs
+#   run at once; a second slot is taken only while free memory is well above the floor
+#   (--no-lock skips the slots, for light long-running helpers such as a test Postgres).
 # - Runs the command at low priority in its own process group with capped Go and Node
 #   parallelism and heap.
 # - Kills the whole process group if free memory, swap growth or free disk cross a floor.
 #
 # Tunables (env): GUARD_MIN_FREE_PCT (25), GUARD_MIN_DISK_GB (6), GUARD_MAX_SWAP_GROWTH_MB (1500),
-# GUARD_WAIT_SECS (900), GUARD_LOCK (/tmp/sbctl-guard.lock), GUARD_LOG (~/.cache/sbctl/guard.log).
+# GUARD_WAIT_SECS (900), GUARD_SLOTS (2), GUARD_LOCK (/tmp/sbctl-guard.lock), GUARD_LOG (~/.cache/sbctl/guard.log).
 set -uo pipefail
 
 MIN_FREE_PCT=${GUARD_MIN_FREE_PCT:-25}
@@ -19,6 +20,7 @@ MIN_DISK_GB=${GUARD_MIN_DISK_GB:-6}
 MAX_SWAP_GROWTH_MB=${GUARD_MAX_SWAP_GROWTH_MB:-1500}
 WAIT_SECS=${GUARD_WAIT_SECS:-900}
 LOCK=${GUARD_LOCK:-/tmp/sbctl-guard.lock}
+SLOTS=${GUARD_SLOTS:-2}
 LOG=${GUARD_LOG:-$HOME/.cache/sbctl/guard.log}
 PIDDIR=/tmp/sbctl-guard.pids
 
@@ -45,19 +47,29 @@ healthy() { # $1 = extra headroom required to start
   [[ ${f:-0} -ge $((MIN_FREE_PCT + $1)) && ${d:-0} -ge $((MIN_DISK_GB + $1 / 5)) ]]
 }
 
-lock_held=0
+held=""
 release() {
-  if [[ $lock_held -eq 1 ]]; then rm -rf "$LOCK"; lock_held=0; fi
+  if [[ -n "$held" ]]; then rm -rf "$held"; held=""; fi
+}
+slot_path() { if [[ $1 -eq 1 ]]; then echo "$LOCK"; else echo "$LOCK.$1"; fi; }
+try_slot() { # $1 = slot number; succeeds when the slot was free or stale and is now ours
+  local p owner; p=$(slot_path "$1")
+  if mkdir "$p" 2>/dev/null; then echo $$ >"$p/pid"; held="$p"; return 0; fi
+  owner=$(cat "$p/pid" 2>/dev/null || true)
+  if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then rm -rf "$p"; try_slot "$1"; return; fi
+  return 1
 }
 acquire() {
-  local waited=0
-  while ! mkdir "$LOCK" 2>/dev/null; do
-    local owner; owner=$(cat "$LOCK/pid" 2>/dev/null || true)
-    if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
-    [[ $waited -eq 0 ]] && log "waiting for heavy-job lock held by pid ${owner:-?}"
+  local waited=0 i
+  while true; do
+    try_slot 1 && return
+    # Extra slots only while memory is well above the floor.
+    for ((i = 2; i <= SLOTS; i++)); do
+      if [[ $(free_pct) -ge $((MIN_FREE_PCT + 20)) ]] && try_slot "$i"; then return; fi
+    done
+    [[ $waited -eq 0 ]] && log "waiting for a heavy-job slot"
     sleep 3; waited=$((waited + 3))
   done
-  echo $$ >"$LOCK/pid"; lock_held=1
 }
 
 pgid=0

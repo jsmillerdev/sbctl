@@ -2,7 +2,10 @@ package lifecycle
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/registry"
@@ -38,10 +41,25 @@ func (pl *PostgresPlane) siteURL(ref string) string {
 }
 
 func (pl *PostgresPlane) archiveCommand(ref string) string {
+	if pl.opts.ArchiveCommandFor != nil {
+		if c := pl.opts.ArchiveCommandFor(ref); c != "" {
+			return c
+		}
+	}
 	if c := pl.opts.ArchiveCommand; c != "" {
 		return c
 	}
-	return fmt.Sprintf("'%s' wal push --ref %s %%p", pl.cfg.BinPath, ref)
+	// Fallback for callers that did not wire the backup package (lifecycle cannot import
+	// it): the same quoting rules as backup.ArchiveCommand, which the daemon and the CLI
+	// install through PlaneOptions.ArchiveCommandFor.
+	return fmt.Sprintf("'%s' wal push --ref %s %%p", strings.ReplaceAll(strings.ReplaceAll(pl.cfg.BinPath, "%", "%%"), "'", `'\''`), ref)
+}
+
+func (pl *PostgresPlane) archiveTimeout() int {
+	if pl.opts.ArchiveTimeout > 0 {
+		return pl.opts.ArchiveTimeout
+	}
+	return 900
 }
 
 // postgresSpec renders the cluster unit. The launcher (bin/supabase-postgres-start)
@@ -80,7 +98,7 @@ func (pl *PostgresPlane) postgresSpec(p *registry.Project, keys *secrets.Project
 	if pl.archiveCommand(p.Ref) == "off" {
 		settings = append(settings, "archive_mode=off")
 	} else {
-		settings = append(settings, "archive_mode=on", "archive_timeout=900", "archive_command="+pl.archiveCommand(p.Ref))
+		settings = append(settings, "archive_mode=on", "archive_timeout="+strconv.Itoa(pl.archiveTimeout()), "archive_command="+pl.archiveCommand(p.Ref))
 	}
 	args := []string{units.StandardExec(config.SvcPostgres)[0], "-p", strconv.Itoa(pp.Port)}
 	for _, s := range settings {
@@ -91,9 +109,14 @@ func (pl *PostgresPlane) postgresSpec(p *registry.Project, keys *secrets.Project
 		"PGSODIUM_KEY_FILE": pp.RootKey,
 		"POSTGRES_USER":     RoleAdmin,
 		"POSTGRES_DB":       "postgres",
+	}
+	if bootstrapPending(pp.Data) {
 		// Only read on the first boot, when the launcher creates the postgres and
 		// supabase_admin roles; setRolePasswords replaces them with the stored ones.
-		"POSTGRES_PASSWORD": keys.AdminPassword,
+		// Rendered only while the data directory is not initialized, so the superuser
+		// password does not sit in the env file and in every postmaster's environment
+		// for the life of the cluster.
+		env["POSTGRES_PASSWORD"] = keys.AdminPassword
 	}
 	if pl.opts.ConfigPath != "" {
 		env["SBCTL_CONFIG"] = pl.opts.ConfigPath
@@ -192,4 +215,14 @@ func (pl *PostgresPlane) apiSpecs(p *registry.Project, keys *secrets.ProjectKeys
 		},
 	}
 	return append(specs, rest), nil
+}
+
+// bootstrapPending reports whether the launcher still has first-boot work to do in
+// dataDir: the cluster does not exist yet, or an earlier initialization was cut short.
+func bootstrapPending(dataDir string) bool {
+	if _, err := os.Stat(filepath.Join(dataDir, "PG_VERSION")); err != nil {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(dataDir, initPendingWitness))
+	return err == nil
 }

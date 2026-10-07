@@ -235,7 +235,7 @@ func (s *Service) doCreate(ctx context.Context, j *createJob) (string, error) {
 			return "", err
 		}
 		if err := s.rotate(ctx, j.ref); err != nil {
-			return "", fmt.Errorf("rotate the credentials of the clone: %w", err)
+			return "", s.quarantine(ctx, j.ref, fmt.Errorf("rotate the credentials of the clone: %w", err))
 		}
 	}
 	// Record how the data was made before the migrations run: a failure below still tells it.
@@ -324,21 +324,8 @@ func (s *Service) cloneParent(ctx context.Context, parentRef, method, dstData st
 // createFromBackup is the fallback for with_data: restore the parent's latest base backup
 // plus all archived WAL as a new project (internal/backup), then make it a branch.
 func (s *Service) createFromBackup(ctx context.Context, j *createJob) error {
-	opts := *s.bk
-	opts.Manager = stampManager{Manager: s.eng, info: j.info, class: j.class}
-	if opts.Registry == nil {
-		opts.Registry = s.reg
-	}
-	if opts.Secrets == nil {
-		opts.Secrets = s.sec
-	}
-	if opts.Config == nil {
-		opts.Config = s.cfg
-	}
-	bs, err := backup.New(opts)
-	if err != nil {
-		return err
-	}
+	// The restore creates its project through this Manager, which stamps it as a branch.
+	bs := s.bk.WithManager(stampManager{Manager: s.eng, info: j.info, class: j.class})
 	if _, err := bs.RestoreWith(ctx, j.parent.Ref, s.now(), j.ref, backup.RestoreOptions{Latest: true}); err != nil {
 		return fmt.Errorf("restore the parent's base backup: %w", err)
 	}
@@ -351,9 +338,20 @@ func (s *Service) createFromBackup(ctx context.Context, j *createJob) error {
 		_ = s.reg.UpdateProject(ctx, p)
 	}
 	if err := s.rotate(ctx, j.ref); err != nil {
-		return fmt.Errorf("rotate the credentials of the restored branch: %w", err)
+		return s.quarantine(ctx, j.ref, fmt.Errorf("rotate the credentials of the restored branch: %w", err))
 	}
 	return nil
+}
+
+// quarantine stops a branch that still carries the parent's database passwords because the
+// rotation failed, so that nobody holding the parent's credentials can open it, and returns
+// err with that said. The branch stays registered (MIGRATIONS_FAILED) for inspection, reset or delete.
+func (s *Service) quarantine(ctx context.Context, ref string, err error) error {
+	if perr := s.eng.Pause(context.WithoutCancel(ctx), ref); perr != nil {
+		s.log.Error("could not stop a branch that kept the parent's credentials", "ref", ref, "err", perr)
+		return fmt.Errorf("%w (the branch could not be stopped either: %v; delete it)", err, perr)
+	}
+	return fmt.Errorf("%w (the branch was stopped; delete it or reset it)", err)
 }
 
 // stampManager makes the projects a backup restore creates into branches, and sizes them.

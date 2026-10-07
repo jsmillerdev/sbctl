@@ -14,6 +14,7 @@ One static Go binary that turns a Linux machine into a multi-project Supabase fo
 | `internal/config` | `/etc/sbctl/config.toml`, `SBCTL_*` overrides, paths, ports, hostnames |
 | `internal/secrets` | master-key sealing and every generated credential |
 | `internal/registry` | control-plane store (system Postgres, schema `sbctl`) |
+| `internal/app` | composition: `sbctl serve` (the daemon), backup wired into lifecycle |
 | `internal/api` | Management API (`/v1`, `/v2`, `/platform`) |
 | `internal/proxy` | HTTPS/WebSocket edge, CertMagic, apikey handling |
 | `internal/artifacts`, `internal/units`, `internal/lifecycle` | artifact fetch, systemd units, project lifecycle |
@@ -22,6 +23,27 @@ One static Go binary that turns a Linux machine into a multi-project Supabase fo
 | `studio/` | platform-mode Studio build and its three patches |
 | `deploy/` | installer, systemd templates, CloudFormation |
 | `tests/conformance` | end-to-end suite against a running node |
+| `tests/e2e` | browser check of Studio through the edge (`studio-smoke.mjs`) |
+| `tests/linux` | systemd smoke test and footprint measurement (CI) |
+
+## Configuration notes
+
+`region` (top level, default `us-east-1`) is the AWS region code that every project reports to
+Studio, the CLI and the MCP server. It is only a label here, but it must be one of the 17 codes
+in Studio's region table (`AWS_REGIONS` in `packages/shared-data/regions.ts` at the pinned Studio
+commit; `config.Regions` copies it): Studio resolves it against that table and the project list breaks
+on anything else, including real AWS regions such as `eu-south-1` (a project created with another
+label gets this value).
+
+Every project's Postgres can read `/etc/sbctl/config.toml` (`archive_command` runs `sbctl wal push`
+inside the unit), so `backup.s3_secret_access_key` and `tls.credentials` in that file are readable by
+the tenants' clusters. Prefer an instance profile for S3 and HTTP-01 over DNS-01 where tenants run
+untrusted code; see `deploy/systemd/README.md`.
+
+`sbctl serve` is the daemon that `sbctl.service` runs. On SIGTERM it refuses new lifecycle
+operations (503) and waits up to 10 minutes for running ones (a delete with its final backup, a
+restart) before it exits; `sbctl.service` allows 11 minutes to stop. An operation cut off anyway
+is finished or reverted at the next start. At boot it waits up to 2 minutes for the registry.
 
 ## Develop
 

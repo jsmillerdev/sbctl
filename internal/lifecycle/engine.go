@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,8 +28,37 @@ type Options struct {
 	Fleet fleet.Fleet
 	// Backup takes the final base backup before a project is deleted; nil skips it.
 	Backup BaseBackuper
+	// Timers starts and stops a project's nightly base backup timer as the project
+	// becomes active, pauses and is deleted; nil does nothing (the exec backend).
+	Timers Timers
 	// Now is the clock for key issue times; tests set it.
 	Now func() time.Time
+}
+
+// Timers drives the per-project nightly base backup timer (sb-basebackup@<ref>.timer).
+// Failures are logged by the Engine and never fail the operation: a missing timer is
+// repaired by the next start.
+type Timers interface {
+	StartTimer(ctx context.Context, ref string) error
+	StopTimer(ctx context.Context, ref string) error
+}
+
+func (e *Engine) startTimer(ctx context.Context, ref string) {
+	if e.opts.Timers == nil {
+		return
+	}
+	if err := e.opts.Timers.StartTimer(ctx, ref); err != nil {
+		e.log.Warn("backup timer did not start; nightly base backups will not run until the project is started again", "ref", ref, "error", err)
+	}
+}
+
+func (e *Engine) stopTimer(ctx context.Context, ref string) {
+	if e.opts.Timers == nil {
+		return
+	}
+	if err := e.opts.Timers.StopTimer(ctx, ref); err != nil {
+		e.log.Warn("backup timer did not stop", "ref", ref, "error", err)
+	}
 }
 
 // Engine is the Manager: it owns the order of registry rows, sealed secrets, units,
@@ -236,10 +266,7 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 	if req.DBPassword != "" {
 		keys.DBPassword = req.DBPassword
 	}
-	region := req.Region
-	if region == "" {
-		region = "local"
-	}
+	region := e.cfg.ProjectRegion(req.Region)
 	name := req.Name
 	if name == "" {
 		name = ref
@@ -291,6 +318,7 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusActiveHealthy); err != nil {
 		return fail("status", err)
 	}
+	e.startTimer(ctx, ref)
 	e.event(ctx, ref, "project.created", map[string]string{"class": class})
 	return e.reg.GetProject(ctx, ref)
 }
@@ -340,6 +368,7 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusPausing); err != nil {
 		return err
 	}
+	e.stopTimer(ctx, ref)
 	if err := e.plane.Stop(ctx, ref); err != nil {
 		_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, registry.StatusActiveUnhealthy)
 		return fmt.Errorf("lifecycle: pause %s: %w", ref, err)
@@ -389,6 +418,7 @@ func (e *Engine) Resume(ctx context.Context, ref string) error {
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusActiveHealthy); err != nil {
 		return err
 	}
+	e.startTimer(ctx, ref)
 	e.event(ctx, ref, "project.resumed", nil)
 	return nil
 }
@@ -424,15 +454,41 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 		return fmt.Errorf("%w: %s still has branches (%s); delete them first", ErrInvalidState, ref, strings.Join(kids, ", "))
 	}
 	prev := p.Status
+	backupDone, tookBackup := false, false
+	if prev == registry.StatusGoingDown {
+		// A retry of an interrupted delete: take up where it stopped.
+		if dp := e.deleteProgress(ctx, ref); dp.known {
+			prev, backupDone, tookBackup = dp.prev, dp.backupDone, dp.backupTaken
+		}
+	} else {
+		e.event(ctx, ref, EventDeleteStarted, map[string]string{"prev": string(prev)})
+	}
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusGoingDown); err != nil {
 		return err
 	}
-	if e.opts.Backup != nil && !o.SkipFinalBackup && prev != registry.StatusInitFailed {
-		if err := e.finalBackup(ctx, p, prev); err != nil {
-			_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, prev)
-			return fmt.Errorf("lifecycle: final backup of %s failed, project kept: %w", ref, err)
+	if !backupDone {
+		if e.opts.Backup != nil && !o.SkipFinalBackup && prev != registry.StatusInitFailed {
+			switch err := e.finalBackup(ctx, p, prev); {
+			case errors.Is(err, ErrNoRestorableState):
+				e.log.Warn("delete: nothing to back up, deleting without a final backup", "ref", ref, "reason", err)
+				e.event(ctx, ref, "project.final_backup_skipped", map[string]string{"reason": err.Error()})
+			case err != nil:
+				hint := ""
+				if prev == registry.StatusGoingDown {
+					hint = " (if its data is already gone, delete it with --skip-final-backup)"
+				}
+				_ = e.reg.SetProjectStatus(context.WithoutCancel(ctx), ref, prev)
+				return fmt.Errorf("lifecycle: final backup of %s failed, project kept%s: %w", ref, hint, err)
+			default:
+				tookBackup = true
+			}
 		}
+		// The backup step is settled (done, skipped or not wanted): an interrupted delete
+		// continues from here, and the nightly timer must not fire against a cluster
+		// that is about to go away.
+		e.event(ctx, ref, EventDeleteBackupDone, map[string]bool{"final_backup": tookBackup})
 	}
+	e.stopTimer(ctx, ref)
 	if len(e.opts.Fleet) > 0 {
 		if err := e.opts.Fleet.RemoveTenant(ctx, ref); err != nil {
 			e.log.Warn("delete: remove fleet tenants (continuing)", "ref", ref, "error", err)
@@ -448,7 +504,7 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	if err := e.reg.DeleteProject(ctx, ref); err != nil {
 		return err
 	}
-	e.event(ctx, ref, "project.deleted", map[string]any{"final_backup": e.opts.Backup != nil && !o.SkipFinalBackup && prev != registry.StatusInitFailed})
+	e.event(ctx, ref, "project.deleted", map[string]any{"final_backup": tookBackup})
 	return nil
 }
 
@@ -465,6 +521,57 @@ func (e *Engine) branchesOf(ctx context.Context, ref string) ([]string, error) {
 		}
 	}
 	return kids, nil
+}
+
+// Events that make an operation resumable after a daemon stop.
+const (
+	// EventDeleteStarted opens a delete; its payload names the status to go back to.
+	EventDeleteStarted = "project.delete_started"
+	// EventDeleteBackupDone records that a delete's final-backup step is settled (taken,
+	// skipped or not wanted); everything after it removes things and can run again.
+	EventDeleteBackupDone = "project.delete_backup_done"
+	// EventRestartRequested and EventRestartFinished bracket a restart (the API's pause
+	// then resume). Recover resumes a project whose restart was cut after the pause.
+	EventRestartRequested = "project.restart_requested"
+	EventRestartFinished  = "project.restart_finished"
+)
+
+type deleteState struct {
+	known       bool
+	prev        registry.Status
+	backupDone  bool
+	backupTaken bool
+}
+
+// deleteProgress reads the newest delete's events for ref. known is false when none was
+// recorded (a delete interrupted by a version that did not record them).
+func (e *Engine) deleteProgress(ctx context.Context, ref string) deleteState {
+	evs, err := e.reg.ListEvents(ctx, ref, 200) // newest first
+	if err != nil {
+		return deleteState{}
+	}
+	var st deleteState
+	for _, ev := range evs {
+		switch ev.Kind {
+		case EventDeleteBackupDone:
+			var pl struct {
+				FinalBackup bool `json:"final_backup"`
+			}
+			_ = json.Unmarshal(ev.Payload, &pl)
+			st.backupDone, st.backupTaken = true, pl.FinalBackup
+		case EventDeleteStarted:
+			var pl struct {
+				Prev string `json:"prev"`
+			}
+			_ = json.Unmarshal(ev.Payload, &pl)
+			if pl.Prev == "" || registry.Status(pl.Prev) == registry.StatusGoingDown {
+				return deleteState{}
+			}
+			st.known, st.prev = true, registry.Status(pl.Prev)
+			return st
+		}
+	}
+	return deleteState{}
 }
 
 func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev registry.Status) error {
@@ -484,6 +591,10 @@ func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev regi
 				e.log.Warn("delete: stop database after backup", "ref", p.Ref, "error", err)
 			}
 		}()
+	}
+	if fb, ok := e.opts.Backup.(FinalBackuper); ok {
+		_, err = fb.FinalBackup(ctx, p.Ref)
+		return err
 	}
 	_, err = e.opts.Backup.BaseBackup(ctx, p.Ref)
 	return err
@@ -586,6 +697,9 @@ func (e *Engine) startOne(ctx context.Context, p *registry.Project) error {
 	if want != p.Status {
 		_ = e.reg.SetProjectStatus(ctx, p.Ref, want)
 	}
+	if err == nil {
+		e.startTimer(ctx, p.Ref)
+	}
 	return err
 }
 
@@ -672,4 +786,189 @@ func FormatHealth(hs []ServiceHealth) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// Recovered describes one project Recover moved out of a transitional status.
+type Recovered struct {
+	Ref  string
+	From registry.Status
+	To   registry.Status
+	Note string
+	// Resume is set for a project whose restart was cut after the pause: it is INACTIVE
+	// and ResumeRecovered brings it back.
+	Resume bool
+}
+
+// StatusDeleted is the To of a Recovered entry for a delete Recover finished.
+const StatusDeleted registry.Status = "DELETED"
+
+// Recover runs once when the daemon starts, before StartActive. A crash or restart in
+// the middle of an operation leaves the project in a transitional status that nothing
+// else would ever move again: COMING_UP (create or resume), PAUSING and RESTARTING.
+//
+//   - PAUSING: the pause is finished (units stopped), status INACTIVE.
+//
+//   - COMING_UP or RESTARTING with a route: the project was created before and a resume
+//     or restart was cut short; its units are stopped and it becomes INACTIVE, so that
+//     Resume can be run again.
+//
+//   - COMING_UP with no route: the create never finished. INIT_FAILED, with the data
+//     left in place; Delete cleans it up.
+//
+//   - GOING_DOWN: an interrupted delete. If its final-backup step had settled (the events
+//     say so), the removal is finished now with no second backup. If the backup was cut
+//     off, the project returns to the status it had and is kept (a paused project's
+//     database is stopped again). A delete from a version that recorded no events is only
+//     logged: run `sbctl projects delete <ref> --skip-final-backup` if its data is gone.
+//
+//   - A restart (the API's pause then resume) cut after the pause is recorded as an
+//     intent; the project is INACTIVE and Recovered.Resume is set, so ResumeRecovered
+//     brings it back. A stale intent on a project that is not paused is cleared.
+//
+// RESTORING is not touched: a restore is for its operator to judge.
+func (e *Engine) Recover(ctx context.Context) []Recovered {
+	ps, err := e.reg.ListProjects(ctx)
+	if err != nil {
+		e.log.Error("recover: listing projects", "error", err)
+		return nil
+	}
+	routes := map[string]bool{}
+	if rs, err := e.reg.ListRoutes(ctx); err == nil {
+		for _, r := range rs {
+			routes[r.Ref] = true
+		}
+	}
+	var out []Recovered
+	var finishDelete []string
+	for i := range ps {
+		p := ps[i]
+		if p.Ref == config.SystemRef {
+			continue
+		}
+		var to registry.Status
+		note := ""
+		switch p.Status {
+		case registry.StatusPausing:
+			to, note = registry.StatusInactive, "the daemon stopped during a pause"
+		case registry.StatusComingUp, registry.StatusRestarting:
+			if routes[p.Ref] {
+				to, note = registry.StatusInactive, "the daemon stopped during a resume or restart"
+			} else {
+				to, note = registry.StatusInitFailed, "the daemon stopped before the project finished creating; delete it and create it again"
+			}
+		case registry.StatusGoingDown:
+			dp := e.deleteProgress(ctx, p.Ref)
+			switch {
+			case !dp.known:
+				e.log.Warn("recover: project is GOING_DOWN from an interrupted delete that left no record; run `sbctl projects delete "+p.Ref+"` again, with --skip-final-backup if its data is already gone", "ref", p.Ref)
+				continue
+			case dp.backupDone:
+				finishDelete = append(finishDelete, p.Ref)
+				continue
+			}
+			to, note = dp.prev, "the daemon stopped during the final backup of a delete; the project is kept"
+		default:
+			continue
+		}
+		unlock, err := e.lock(ctx, p.Ref)
+		if err != nil {
+			e.log.Warn("recover: lock", "ref", p.Ref, "error", err)
+			continue
+		}
+		cur, err := e.reg.GetProject(ctx, p.Ref)
+		if err == nil && cur.Status == p.Status {
+			if to == registry.StatusInactive {
+				if serr := e.plane.Stop(ctx, p.Ref); serr != nil {
+					e.log.Warn("recover: stopping units", "ref", p.Ref, "error", serr)
+				}
+			}
+			if err := e.reg.SetProjectStatus(ctx, p.Ref, to); err != nil {
+				e.log.Error("recover: set status", "ref", p.Ref, "error", err)
+			} else {
+				e.event(ctx, p.Ref, "project.recovered", map[string]string{"from": string(p.Status), "to": string(to), "note": note})
+				e.log.Warn("recovered project after an interrupted operation", "ref", p.Ref, "from", p.Status, "to", to, "note", note)
+				out = append(out, Recovered{Ref: p.Ref, From: p.Status, To: to, Note: note})
+			}
+		}
+		unlock()
+	}
+	for _, ref := range finishDelete {
+		dctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		err := e.Delete(dctx, ref)
+		cancel()
+		if err != nil {
+			e.log.Error("recover: could not finish an interrupted delete; run `sbctl projects delete "+ref+"` again", "ref", ref, "error", err)
+			continue
+		}
+		e.log.Warn("finished a delete the daemon had interrupted", "ref", ref)
+		out = append(out, Recovered{Ref: ref, From: registry.StatusGoingDown, To: StatusDeleted, Note: "the daemon stopped during a delete; the removal was finished"})
+	}
+	out = e.recoverRestarts(ctx, ps, out)
+	return out
+}
+
+// restartPending reports whether the newest restart event of ref is an unfinished request.
+func (e *Engine) restartPending(ctx context.Context, ref string) bool {
+	evs, err := e.reg.ListEvents(ctx, ref, 200) // newest first
+	if err != nil {
+		return false
+	}
+	for _, ev := range evs {
+		switch ev.Kind {
+		case EventRestartFinished:
+			return false
+		case EventRestartRequested:
+			return true
+		}
+	}
+	return false
+}
+
+// recoverRestarts marks the projects whose restart was cut after the pause for
+// ResumeRecovered and clears intents that no longer apply.
+func (e *Engine) recoverRestarts(ctx context.Context, ps []registry.Project, out []Recovered) []Recovered {
+	for i := range ps {
+		ref := ps[i].Ref
+		if ref == config.SystemRef || !e.restartPending(ctx, ref) {
+			continue
+		}
+		cur, err := e.reg.GetProject(ctx, ref)
+		if err != nil {
+			continue
+		}
+		if cur.Status != registry.StatusInactive {
+			e.event(ctx, ref, EventRestartFinished, map[string]string{"result": "cleared: project is " + string(cur.Status)})
+			continue
+		}
+		found := false
+		for k := range out {
+			if out[k].Ref == ref {
+				out[k].Resume, found = true, true
+			}
+		}
+		if !found {
+			out = append(out, Recovered{Ref: ref, From: cur.Status, To: cur.Status, Note: "the daemon stopped during a restart", Resume: true})
+		}
+	}
+	return out
+}
+
+// ResumeRecovered resumes the projects Recover flagged (a restart cut after its pause)
+// one at a time and closes each restart intent. It returns the failures by ref; a
+// project that does not resume stays INACTIVE and can be resumed by hand.
+func (e *Engine) ResumeRecovered(ctx context.Context, rs []Recovered) map[string]error {
+	errs := map[string]error{}
+	for _, r := range rs {
+		if !r.Resume {
+			continue
+		}
+		err := e.Resume(ctx, r.Ref)
+		res := "resumed"
+		if err != nil {
+			errs[r.Ref] = err
+			res = "failed: " + err.Error()
+		}
+		e.event(context.WithoutCancel(ctx), r.Ref, EventRestartFinished, map[string]string{"result": res})
+	}
+	return errs
 }

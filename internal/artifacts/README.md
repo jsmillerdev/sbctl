@@ -14,7 +14,9 @@ under `<state_dir>/artifacts/<service>/<tag>/` (`config.Paths.Artifact`).
   device or FIFO entries, setuid/setgid/sticky dropped, modes and symlinks kept. The tree is
   unpacked next to its destination and renamed into place, so a directory either does not
   exist or is complete. The artifact root is mode 0755 so that the `sbctl` user can run an
-  artifact that root fetched. A `.sbctl-artifact.json` marker records tag, platform, digest
+  artifact that root fetched, and when root fetches, the unpacked tree is handed to the owner of
+  `state_dir` (the `sbctl` user): the Postgres launcher chmods a script inside its artifact on
+  first boot, which only the file's owner may do. A `.sbctl-artifact.json` marker records tag, platform, digest
   and source.
 - **CLI:** `sbctl artifacts fetch [service...] [--studio]`, `sbctl artifacts list`.
 

@@ -276,9 +276,16 @@ func (s *Server) createLoginRole(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// Each drop has its own exception block: one expired role that cannot be dropped (it owns
+// an object because a migration ran `reset role` before a CREATE, or holds a privilege)
+// must not fail the batch, and with it the CREATE ROLE that follows.
 const dropExpiredLoginRoles = `do $$ declare r record; begin
   for r in select rolname from pg_roles where (rolname like 'cli\_login\_%' or rolname like 'sbctl\_cli\_ro\_%') and rolvaliduntil < now() loop
-    execute format('drop role %I', r.rolname);
+    begin
+      execute format('drop role %I', r.rolname);
+    exception when others then
+      raise warning 'sbctl: could not drop expired login role %: %', r.rolname, sqlerrm;
+    end;
   end loop;
 end $$;
 `
@@ -290,7 +297,11 @@ func (s *Server) deleteLoginRoles(w http.ResponseWriter, r *http.Request) error 
 	}
 	q := `do $$ declare r record; begin
   for r in select rolname from pg_roles where rolname like 'cli\_login\_%' or rolname like 'sbctl\_cli\_ro\_%' loop
-    execute format('drop role %I', r.rolname);
+    begin
+      execute format('drop role %I', r.rolname);
+    exception when others then
+      raise warning 'sbctl: could not drop login role %: %', r.rolname, sqlerrm;
+    end;
   end loop;
 end $$;`
 	if _, err := s.sqlRows(r.Context(), p.Ref, "supabase_admin", false, q); err != nil {

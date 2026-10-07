@@ -249,6 +249,23 @@ func TestWithDataCloneUsesParentCredentialsThenRotates(t *testing.T) {
 	}
 }
 
+func TestFailedRotationStopsTheBranch(t *testing.T) {
+	h := newHarness(t, nil)
+	h.svc.detect = func(string, string) (string, string, string) { return MethodClonefile, "apfs", "" }
+	h.svc.clone = func(_ context.Context, _, method, _ string) (*CloneStats, error) {
+		return &CloneStats{Method: method}, nil
+	}
+	h.svc.rotate = func(context.Context, string) error { return errors.New("socket gone") }
+	b := h.create("leaky", func(in *CreateInput) { in.WithData = true })
+	h.mustState(b, registry.BranchMigrationsFailed)
+	if !strings.Contains(b.Detail, "socket gone") || !strings.Contains(b.Detail, "stopped") {
+		t.Fatalf("detail = %q", b.Detail)
+	}
+	if h.eng.paused[b.Ref] != 1 {
+		t.Fatalf("a branch that kept the parent's credentials must be stopped: %v", h.eng.paused)
+	}
+}
+
 func TestMerge(t *testing.T) {
 	h := newHarness(t, nil)
 	b := h.create("feat", nil)

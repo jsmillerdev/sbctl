@@ -180,16 +180,15 @@ func newStack(t *testing.T) *stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bo := backup.Options{
+	if st.bk, err = backup.New(backup.Options{
 		Config: cfg, Registry: n.Registry, Store: store, Secrets: n.Secrets,
 		Access: backup.AccessFromRegistry(cfg, n.Registry, n.Secrets), ConfigPath: cfgPath,
 		RecoveryTimeout: 3 * time.Minute, RecoveryPoll: 250 * time.Millisecond,
-	}
-	if st.bk, err = backup.New(bo); err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
-	bo.Manager = n.Engine
-	st.svc, err = New(Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Engine: n.Engine, Backup: &bo, CreateWait: 60 * time.Second})
+	st.bk.SetManager(n.Engine)
+	st.svc, err = New(Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Engine: n.Engine, Backup: st.bk, CreateWait: 60 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

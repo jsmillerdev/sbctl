@@ -254,6 +254,9 @@ type fakeManager struct {
 	resumed  []string
 	dataDir  string
 	failSeed bool
+	// failResume makes the n-th Resume call (1-based) fail; 0 never fails.
+	failResume  int
+	resumeCalls int
 }
 
 func (f *fakeManager) Create(ctx context.Context, req lifecycle.CreateRequest) (*registry.Project, error) {
@@ -273,6 +276,10 @@ func (f *fakeManager) Pause(_ context.Context, ref string) error {
 }
 func (f *fakeManager) Resume(_ context.Context, ref string) error {
 	f.resumed = append(f.resumed, ref)
+	f.resumeCalls++
+	if f.failResume == f.resumeCalls {
+		return errors.New("PostgreSQL did not become ready: recovery ended before configured recovery target was reached")
+	}
 	return nil
 }
 

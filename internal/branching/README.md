@@ -10,25 +10,33 @@ itself when its lifetime ends.
 wrappers over it, so the stock Supabase CLI (`supabase branches ...`) and the Supabase MCP
 server's branch tools work unchanged (verified, below).
 
-## Wiring it into the daemon
+## Wiring
+
+`sbctl serve` (`internal/app/serve.go`) builds the service, hands it to the API as
+`Deps.Branching`, runs the expiry sweeper (`svc.Run(gctx)`) and drains running branch operations
+with the API's drain at shutdown (a cut-off operation ends `MIGRATIONS_FAILED`; nothing else is
+left half-done that the lifecycle's own recovery does not handle). That wiring compiles and is
+covered by the API tests, but it was not exercised by a running `sbctl serve`: `TestServeIntegration`
+in `internal/app` uses ports outside the range this workstream was allowed, and the real clients below
+ran against `internal/branching`'s own harness (`TestServe`), which mounts the same API and service.
 
 ```go
 svc, err := branching.New(branching.Deps{
     Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets,
-    Engine: n.Engine,        // *lifecycle.Engine
-    Backup: &backupOpts,     // optional: base-backup fallback and archive cleanup
+    Engine: n.Engine,   // *lifecycle.Engine
+    Backup: bk,         // optional *backup.Service (app.NewBackupService), with SetManager(n.Engine)
     Log:    log,
 })
 go svc.Run(ctx)                                  // the expiry sweeper
-srv := api.New(api.Deps{ /* ... */ Branching: svc })
-// on shutdown, after the API stops accepting requests:
-svc.Drain(shutdownCtx)
+srv := api.NewServer(api.Deps{ /* ... */ Branching: svc })
+svc.Drain(shutdownCtx)                           // on shutdown, after the API stops accepting requests
 ```
 
-`Backup` is a `backup.Options` without `Manager` (the service sets it per operation, see
-"Base backup path"). Without it `with_data` needs a filesystem that can clone files, and a
-branch's WAL archive is not cleaned up on delete. Without `Deps.Branching` the API lists only
-the default branch and refuses to create one.
+Without `Backup`, `with_data` needs a filesystem that can clone files and a branch's WAL archive is
+not cleaned up on delete. The base-backup path restores through `Backup.WithManager(...)`, a copy of
+the service whose restores create their project through a manager that stamps it as a branch; the
+shared service's own Manager is not touched. Without `Deps.Branching` the API lists only the default
+branch and refuses to create one.
 
 ## Data model
 

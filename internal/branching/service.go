@@ -36,10 +36,11 @@ type Deps struct {
 	Registry registry.Registry
 	Secrets  secrets.Secrets
 	Engine   Engine
-	// Backup configures the base-backup path of with_data branches and the cleanup of an
-	// ephemeral branch's archive. Manager is filled in by the service. Nil: neither exists,
-	// and with_data needs a filesystem that supports copy-on-write clones.
-	Backup *backup.Options
+	// Backup serves the base-backup path of with_data branches and the cleanup of an
+	// ephemeral branch's archive; it must have its Manager set (SetManager) or not be used
+	// for restores of its own. Nil: neither exists, and with_data needs a filesystem that
+	// supports copy-on-write clones.
+	Backup *backup.Service
 	// DB runs SQL in project databases. Nil connects with pgx through Engine.ConnString.
 	DB         Database
 	Log        *slog.Logger
@@ -61,7 +62,7 @@ type Service struct {
 	reg  registry.Registry
 	sec  secrets.Secrets
 	eng  Engine
-	bk   *backup.Options
+	bk   *backup.Service
 	db   Database
 	log  *slog.Logger
 	now  func() time.Time

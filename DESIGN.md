@@ -105,8 +105,8 @@ Laptops are not a target. Supabase's own `supabase start --runtime native` alrea
 
 - **Idle sleep.** Because `sbctl` is the proxy, it can stop a project's GoTrue and PostgREST after an idle period and start them on the next request. Not in v1: measured Postgres idle is 15 to 20 MB, so a hundred warm projects already fit on one machine.
 - **File-database engine.** The project record carries `engine: postgres | file` from day one and the data-plane sits behind a five-call interface. Turso has no open multi-tenant server yet, so nothing is built on it; when one exists it becomes one more shared process per shard, with auth and quotas in `sbctl`'s proxy.
-- **Edge Functions, image transforms, Logflare.** Optional units behind flags; Functions needs our tenant-aware main service.
-- **Members and RBAC, restore UI, multi-node scheduling.** After the single-node product is solid.
+- **Image transforms, Logflare.** Optional units behind flags. (Edge Functions moved into v1 as workstream J: a tenant-aware main service inside the edge-runtime artifact.)
+- **Restore UI, multi-node scheduling.** After the single-node product is solid. (Settings writes, API keys, password reset, storage actions, members and roles, and SSO for the dashboard and for projects are v1: HANDOFF workstreams K and L.)
 
 ## 9a. Branching for agents (right after v1)
 
@@ -139,7 +139,7 @@ Ordering only, no dates. The workstream split and shared conventions for paralle
 0. **Spike.** Build platform-mode Studio with the three patches. Generate a mock `/platform` and `/v1` from the specs. Sign in, list two projects, open the table editor on each, run SQL, `supabase link`, MCP `list_tables`. Exit: the captured list of endpoints Studio calls and which tolerate stubs.
 1. **Single-node v1.** `sbctl` proxy, ACME, units, artifact fetch, lifecycle, fleet tenant calls, P0 API subset, WAL archiving and restore, installer, conformance suite. Exit: Auth, REST, Realtime, Storage and Studio at parity on Ubuntu 24.04; measured Linux footprint at 10, 25 and 50 projects.
 2. **Branching.** Section 9a: branch API, schema-only and copy-on-write data branches, merge, reset, push, expiry. Exit: the Supabase MCP server's branch tools work against `sbctl` unchanged.
-3. **AWS and Functions.** CloudFormation quick-create, Edge Functions main service, imgproxy, idle sleep.
+3. **AWS polish.** CloudFormation quick-create hardening, imgproxy, idle sleep. (Edge Functions ship in v1, workstream J.)
 4. **Product.** Members, restore UI, metrics, docs, name and trademark check, upstream PRs.
 
 ## 12. Open items

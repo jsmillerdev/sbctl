@@ -132,9 +132,13 @@ func TestServe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bo := backup.Options{Config: cfg, Registry: n.Registry, Store: store, Secrets: n.Secrets,
-		Access: backup.AccessFromRegistry(cfg, n.Registry, n.Secrets), ConfigPath: cfgPath}
-	svc, err := branching.New(branching.Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Engine: n.Engine, Backup: &bo, CreateWait: 60 * time.Second})
+	bk, err := backup.New(backup.Options{Config: cfg, Registry: n.Registry, Store: store, Secrets: n.Secrets,
+		Access: backup.AccessFromRegistry(cfg, n.Registry, n.Secrets), ConfigPath: cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bk.SetManager(n.Engine)
+	svc, err := branching.New(branching.Deps{Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Engine: n.Engine, Backup: bk, CreateWait: 60 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -6,78 +6,38 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/OWNER/sbctl/internal/app"
 	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/branching"
-	"github.com/OWNER/sbctl/internal/fleet"
-	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
 )
 
-// lazyBackuper hands the engine a backup service that exists only after the engine's own
-// registry connection does.
-type lazyBackuper struct {
-	mu  sync.Mutex
-	svc *backup.Service
-}
-
-func (l *lazyBackuper) set(s *backup.Service) {
-	l.mu.Lock()
-	l.svc = s
-	l.mu.Unlock()
-}
-
-func (l *lazyBackuper) BaseBackup(ctx context.Context, ref string) (*registry.Backup, error) {
-	l.mu.Lock()
-	s := l.svc
-	l.mu.Unlock()
-	if s == nil {
-		return nil, lifecycle.ErrNoSnapshot
-	}
-	return s.BaseBackup(ctx, ref)
-}
-
 // openBranching connects to the node and builds the branching service. The backup backend
-// is optional: without one, with_data needs a copy-on-write filesystem and a persistent
-// branch is deleted without a final backup.
+// is optional: without one, with_data needs a copy-on-write filesystem and the archive of a
+// deleted branch is not cleaned up.
 func openBranching(ctx context.Context) (*branching.Service, func(), error) {
 	cfg, err := loadConfig()
 	if err != nil {
 		return nil, nil, err
 	}
 	log := newLogger(cfg)
-	lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log})
-	lb := &lazyBackuper{}
-	oo := openOptions(cfg)
-	oo.Fleet = lz.Fleet()
-	oo.Backup = lb
-	n, err := lifecycle.Open(ctx, cfg, oo)
+	n, err := openNode(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	lz.Bind(n.Registry, n.Secrets)
-	var bopts *backup.Options
-	if store, err := backup.OpenStore(ctx, cfg.Backup); err != nil {
-		log.Warn("no backup backend; with_data falls back to nothing but copy-on-write", "err", err)
+	var bk *backup.Service
+	if bk, err = app.NewBackupService(ctx, cfg, n.Registry, n.Secrets, appOptions(cfg)); err != nil {
+		log.Warn("no usable backup backend: with_data needs a copy-on-write filesystem here", "err", err)
+		bk = nil
 	} else {
-		o := backup.Options{
-			Config: cfg, Registry: n.Registry, Store: store, Secrets: n.Secrets,
-			Access: backup.AccessFromRegistry(cfg, n.Registry, n.Secrets), ConfigPath: effectiveConfigPath(), Version: version, Log: log,
-		}
-		bs, err := backup.New(o)
-		if err != nil {
-			n.Close()
-			return nil, nil, err
-		}
-		lb.set(bs)
-		bopts = &o
+		bk.SetManager(n.Engine)
 	}
 	svc, err := branching.New(branching.Deps{
-		Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Engine: n.Engine, Backup: bopts, Log: log,
+		Cfg: cfg, Registry: n.Registry, Secrets: n.Secrets, Engine: n.Engine, Backup: bk, Log: log,
 	})
 	if err != nil {
 		n.Close()

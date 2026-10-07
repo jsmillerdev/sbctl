@@ -234,6 +234,11 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
     awk -F': ' '/Maximum resident set size|Elapsed \(wall clock\)/ {print "next build: " $0}' "$WORK/next-build.time" >&2
   fi
   unset NODE_OPTIONS CIRCLE_NODE_TOTAL
+  # The verify step starts Studio from this shell. The build-time placeholders must not leak into
+  # it as if they were configuration (CI run: NEXT_PUBLIC_DISABLED_FEATURES was still
+  # "sbctl-placeholder-disabled-features" and the entrypoint refused it).
+  for v in $(compgen -e | grep -E '^(NEXT_PUBLIC_|CSP_)' || true); do unset "$v"; done
+  unset STUDIO_FRAMEWORK
 
   PREBUILT="$APP/apps/studio"
   PLACEHOLDERS="$HERE/placeholders.json"
@@ -270,9 +275,6 @@ cp "$HERE/runtime/runtime-env.sh" "$STAGE/bin/.runtime-env.sh"
 chmod 755 "$STAGE/bin/studio" "$STAGE/node/bin/node"
 cp "$HERE/runtime/docker-entrypoint.mjs" "$HERE/runtime/sbctl-runtime-config.mjs" "$STAGE/app/apps/studio/"
 chmod 755 "$STAGE/app/apps/studio/docker-entrypoint.mjs"
-
-# Fixups on generated output (static answer for /api/incident-banner), before the placeholder scan.
-node "$HERE/runtime/package-fixups.mjs" "$STAGE/app"
 
 # Runtime substitution: find every file that holds a placeholder, keep a pristine copy of each,
 # and record the list. Fails if a placeholder did not survive the build.
