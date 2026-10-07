@@ -103,6 +103,7 @@ installer() { # extra env is set by the caller
 log "install.sh --verify-only accepts the signed release"
 out=$(installer deploy/install.sh --version v0.0.1 --verify-only) || fail "verify-only failed on a good release: $out"
 [[ $out == *"verified v0.0.1 sbctl-linux-$ARCH"* ]] || fail "unexpected verify-only output: $out"
+[[ $out == *"dashboard build: sbctl-studio-test-p1-linux-$ARCH.tar.zst"* ]] || fail "install.sh did not pick the Studio asset out of the signed list: $out"
 
 expect_refusal() { # DESCRIPTION EXPECTED-TEXT env... -- the command runs with the caller's mutation in place
   local what=$1 text=$2 out
