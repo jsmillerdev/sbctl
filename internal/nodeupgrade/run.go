@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"strings"
 	"time"
-
 )
 
 // Exit statuses of `supavise upgrade` and `supavise rollback`.

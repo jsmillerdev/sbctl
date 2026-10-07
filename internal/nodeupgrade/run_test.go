@@ -122,20 +122,20 @@ func TestRefusalsChangeNothing(t *testing.T) {
 		setup func(h *fakeHost, o *Options)
 		want  string
 	}{
-		"another upgrade runs": {func(h *fakeHost, o *Options) { h.node.Running = &Running{PID: 7, Phase: "projects"} }, "another upgrade is running (process 7"},
+		"another upgrade runs":       {func(h *fakeHost, o *Options) { h.node.Running = &Running{PID: 7, Phase: "projects"} }, "another upgrade is running (process 7"},
 		"release cannot be resolved": {func(h *fakeHost, o *Options) { h.resolveErr = errors.New("signature does not verify") }, "signature does not verify"},
 		"unsupported jump": {func(h *fakeHost, o *Options) {
 			h.resolveErr = errors.New("this release cannot be installed over the running version")
 		}, "cannot be installed over"},
-		"older release": {func(h *fakeHost, o *Options) { h.tag = "v0.9.0" }, "older than the installed v1.0.0"},
+		"older release":         {func(h *fakeHost, o *Options) { h.tag = "v0.9.0" }, "older than the installed v1.0.0"},
 		"binary does not stage": {func(h *fakeHost, o *Options) { h.stageErr = errors.New("does not match its checksum") }, "checksum"},
-		"node down": {func(h *fakeHost, o *Options) { h.node.Verdict, h.node.Summary = VerdictDown, "down" }, "the node is down"},
-		"postgres major": {func(h *fakeHost, o *Options) { h.info.Pins["postgres"] = "postgres-18.0.0-r0" }, "17 to 18"},
+		"node down":             {func(h *fakeHost, o *Options) { h.node.Verdict, h.node.Summary = VerdictDown, "down" }, "the node is down"},
+		"postgres major":        {func(h *fakeHost, o *Options) { h.info.Pins["postgres"] = "postgres-18.0.0-r0" }, "17 to 18"},
 		"unattended and degraded": {func(h *fakeHost, o *Options) {
 			o.Unattended = true
 			h.node.Verdict, h.node.Summary = VerdictDegraded, "degraded"
 		}, "unattended upgrade needs a healthy node"},
-		"declined": {func(h *fakeHost, o *Options) { o.Yes, h.confirm = false, false }, "nothing was changed"},
+		"declined":      {func(h *fakeHost, o *Options) { o.Yes, h.confirm = false, false }, "nothing was changed"},
 		"nobody to ask": {func(h *fakeHost, o *Options) { o.Yes, h.confirmErr = false, errors.New("run it again with --yes") }, "--yes"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -282,9 +282,9 @@ func TestRollbackRefusedByTheRegistrySchema(t *testing.T) {
 
 func TestRollbackThatFailsNeedsTheOperator(t *testing.T) {
 	for name, set := range map[string]func(*fakeHost){
-		"restore fails":        func(h *fakeHost) { h.restoreErr = errors.New("units would not render") },
+		"restore fails":          func(h *fakeHost) { h.restoreErr = errors.New("units would not render") },
 		"projects do not return": func(h *fakeHost) { h.revertErr = errors.New("project a failed") },
-		"registry unreadable":  func(h *fakeHost) { h.appliedErr = errors.New("connection refused") },
+		"registry unreadable":    func(h *fakeHost) { h.appliedErr = errors.New("connection refused") },
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newFakeHost()

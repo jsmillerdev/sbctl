@@ -83,7 +83,7 @@ func TestRollbackRefusals(t *testing.T) {
 		setup func(h *fakeHost, o *Options)
 		want  string
 	}{
-		"no previous release": {func(h *fakeHost, o *Options) { h.prev = nil }, "no previous release is kept"},
+		"no previous release":       {func(h *fakeHost, o *Options) { h.prev = nil }, "no previous release is kept"},
 		"registry migrated past it": {func(h *fakeHost, o *Options) { h.applied = schemaV2 }, "Restore the system project's pre-upgrade backup"},
 		"registry unreadable":       {func(h *fakeHost, o *Options) { h.appliedErr = errBoom }, "cannot read the registry schema"},
 		"an upgrade is running":     {func(h *fakeHost, o *Options) { h.node.Running = &Running{PID: 9, Phase: "services"} }, "an upgrade is running"},
