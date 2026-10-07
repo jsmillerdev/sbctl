@@ -3,21 +3,27 @@ package proxy
 import (
 	"net/http"
 	"strings"
+
+	"github.com/jsmillerdev/supavise/internal/notice"
 )
 
 // Studio is served unmodified (three patches, no fixups), so the two things its build
 // gets wrong for a self-hosted node are corrected here, on the way through.
 
-// incidentBanner is what Studio's banner code expects when there is no incident. Studio's
-// own /api/incident-banner route asks incident.io, answers 500 without a key, and
+// Studio's own /api/incident-banner route asks incident.io, answers 500 without a key, and
 // react-query retries it after 1, 4 and 16 seconds while the sign-in form awaits the query
 // cache reset: sign-in took 22 seconds (docs/research/08 section 9). The proxy answers the route
-// itself, instantly and with no outbound call.
-const incidentBanner = `{"incidents":[]}` + "\n"
+// itself, instantly and with no outbound call, with {"incidents":[]}.
+//
+// The answer stays empty even while a maintenance window is announced or an upgrade runs: this
+// Studio build draws any incident as "We are investigating a technical issue" with a link to
+// Supabase's status page, which would present planned work as an outage (internal/notice has the
+// reasoning and the answer to serve once Studio can show the operator's own words). The
+// operator's notices appear in `supavise status` and /healthz/detail.
 
 // answerStudioLocally serves the routes supavise answers instead of Studio. It reports
 // whether it wrote a response.
-func answerStudioLocally(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) answerStudioLocally(w http.ResponseWriter, r *http.Request) bool {
 	if r.URL.Path != "/api/incident-banner" || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
 		return false
 	}
@@ -26,7 +32,7 @@ func answerStudioLocally(w http.ResponseWriter, r *http.Request) bool {
 	h.Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodGet {
-		_, _ = w.Write([]byte(incidentBanner))
+		_, _ = w.Write(notice.BannerJSON())
 	}
 	return true
 }

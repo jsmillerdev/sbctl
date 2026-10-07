@@ -34,6 +34,9 @@ const (
 	needSelf
 	// needOwner: the caller must hold the Owner role organization-wide in some organization.
 	needOwner
+	// needOperator: the caller must hold the Owner or Administrator role organization-wide in
+	// some organization: the node-wide reads that concern whoever runs projects on it.
+	needOperator
 )
 
 // need is the requirement of one route.
@@ -72,6 +75,8 @@ var (
 	nAny   = need{kind: needAny}
 	nSelf  = need{kind: needSelf}
 	nOwner = need{kind: needOwner}
+	// nOperator is nOwner's wider sibling, for what an Administrator may also see.
+	nOperator = need{kind: needOperator}
 )
 
 // routeRule maps routes to a need. methods is "" (any), "R" (GET and HEAD), "W" (the other
@@ -159,6 +164,11 @@ var routeRules = []routeRule{
 	rule("", "/v1/oauth/**", nAny),
 	rule("", "/v1/snippets/**", nAny),
 	rule("R", "/platform/integrations/{slug}", nAny),
+	// The node's health in detail: node-wide, so no organization or project to check against.
+	// Owners and Administrators see it (projects only of the organizations they run); a Developer
+	// or Read-only member has no business with the node's disks and shared services. The public
+	// /healthz (no credentials, a verdict and nothing else) is not an API route and has no rule.
+	rule("R", "/healthz/detail", nOperator),
 	// Lists are filtered to what the caller may see; creating needs the organization of the body.
 	rule("R", "/platform/organizations", nAny),
 	rule("R", "/v1/organizations", nAny),
@@ -457,6 +467,10 @@ func (s *Server) authorize(r *http.Request, key string, p *Principal) (context.C
 		case needOwner:
 			if !access.IsOwnerAnywhere() {
 				return ctx, errf(http.StatusForbidden, "Your role does not allow this action (needs the Owner role)")
+			}
+		case needOperator:
+			if !access.IsOperatorAnywhere() {
+				return ctx, errf(http.StatusForbidden, "Your role does not allow this action (needs the Owner or Administrator role)")
 			}
 		case needSelf: // the handler checks (organization creation, project creation)
 		default:

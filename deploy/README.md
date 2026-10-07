@@ -163,6 +163,34 @@ supavise artifacts gc --dry-run            # which unused artifacts would go
 
 An upgrade takes a fresh base backup first (reason `pre-upgrade`) while the project serves, and changes nothing if the backup fails. Then GoTrue and PostgREST restart on the new releases (PostgreSQL too when its release changes) and every service is health checked; if one does not come up, the previous versions start again. The data directory stays where it is: these are minor-release changes of the same Postgres major version, so no data is copied and the project is offline for about a minute (longer when PostgreSQL restarts and recovers). Upgrades across Postgres major versions are refused, and so is a move to an older release than the project runs (after a rollback of the binary, the node pins older versions; a project already upgraded on the newer release stays on it, Studio offers no upgrade, and `supavise projects versions` lists it as ahead of the node). When the Postgres release changes, every extension installed in the project's databases is checked against it first (control file, library, update path), and an upgrade that the release cannot serve is refused with the extension named, before anything stops; afterwards the code of each extension must load, or the upgrade rolls back. The upgrade never runs `ALTER EXTENSION UPDATE`. `supavise projects upgrade` ignores a dropped SSH session (SIGHUP), and a project left `UPGRADING` by an upgrade whose process was killed is started again on its previous versions within a few minutes by the daemon (or when it starts), with nothing for the operator to do (an upgrade killed before it touched a service, during the backup, leaves the project running untouched). GoTrue's database migrations run when it starts and only go forward, so the pre-upgrade backup, not the rollback, is the way back for the data (`supavise backups restore`). The artifacts of the previous release stay on disk for `[upgrade] keep_releases` releases (default 2) and while any project runs them; `supavise projects upgrade` removes the rest after it succeeds. `[upgrade] canary_projects` (default 1) and `batch_size` (default 3) set the rollout of `--all`. Details: `internal/lifecycle/README.md`, "Service versions and project upgrades".
 
+## Health, alerts and maintenance notices
+
+```bash
+sudo -u supavise supavise status           # one-line verdict, a table of components, the projects that need attention
+sudo -u supavise supavise status --json    # the whole report
+curl https://api.<domain>/healthz          # {"status":"healthy"}, for an uptime monitor
+```
+
+`supavise status` checks the daemon, the edge, the system cluster, each shared service and every project (Postgres answers, Auth and REST answer on loopback, Realtime and Storage hold the project's tenant), the age of each project's newest base backup, the free space on the state volume, the certificates, whether the backups hold an encrypted copy of the master key, and whether a newer release exists. The exit status is 0 for healthy, 1 for degraded (the node serves, something needs attention) and 2 for down (the daemon, the edge or the system cluster is not running). When `status` cannot check at all (an unreadable config, a user who may not read the node's files) it prints an error and exits 1 like any command, so a script that must tell "degraded" from "could not check" reads the `status` field of `--json` (no report, no verdict). A release that is available and a master key without a copy in the backups are notes: they do not change the verdict.
+
+`GET /healthz` on the API host needs no credentials and answers `{"status":"healthy"}`, `{"status":"degraded"}` or `{"status":"down"}` and nothing else (no project names, no versions). It is a 200 unless the node is down, so a load balancer does not pull a node out of service because one project's PostgREST stopped; a monitor that matches `"healthy"` sees degraded. The daemon reuses a report for 20 seconds, so a monitor polling every few seconds costs one probe of the projects per 20 seconds. `GET /healthz/detail` returns the whole report to an Owner or Administrator (a dashboard session or a personal access token); the projects in it are those of the organizations the caller is an Owner or Administrator of.
+
+The daemon sends alerts when something needs the operator, to webhooks and email:
+
+```toml
+[alerts]
+email_to = "ops@example.com"                 # through [mail]
+[[alerts.webhooks]]
+url = "https://hooks.example.com/supavise"
+secret = "a long random string"              # optional: signs timestamp and body (X-Supavise-Signature, X-Supavise-Timestamp)
+```
+
+It raises `disk_low`, `backup_failed` (a failed or stale backup), `project_unhealthy`, `certificate_expiring`, `node_unhealthy` (a shared service or the system cluster) and `update_available`. A problem is sent once, again as a reminder after 12 hours, and once more when it clears; it must last three minutes before it is sent, and no more than 20 notifications go out in an hour. While an upgrade runs or an announced maintenance window is open, the daemon does not raise or resolve `project_unhealthy` or non-critical `node_unhealthy` alerts, because the operator caused that downtime; a critical `node_unhealthy` (the system cluster or the registry down), `disk_low`, `backup_failed` and `certificate_expiring` are still sent. `sudo -u supavise supavise alerts test` sends a test alert to every destination and shows the result of each. Thresholds are in `[health]`, the rest in `[alerts]`; both are in `internal/health/README.md` and `internal/alerts/README.md`.
+
+Once a day the daemon asks GitHub for the newest release, records it (`<state>/system/update.json`) and raises `update_available` once per version; it installs nothing. `[update] check_interval` changes the interval (24 hours by default, one hour at the least; `off` turns the check off).
+
+`supavise maintenance announce --at "2026-10-12 22:00" --duration 2h --message "Database maintenance"` records a window that `supavise status` and `/healthz/detail` show while it is open, and that quiets the alerts described above; `supavise maintenance clear` removes it. A window longer than 24 hours needs `--allow-long`, and the alerts stop being quiet 24 hours after the start of a window that was not extended. An upgrade that is running (`<state>/system/upgrade.json`) is shown the same way; the marker counts only while it is under two hours old (by `started_at` or the file's modification time), so a crashed upgrade does not silence alerts for long. The dashboard banner stays empty for now: Studio draws any incident as "We are investigating a technical issue" with a link to Supabase's status page, and does not show the message. Tell dashboard users about planned downtime another way. An available update is never shown to dashboard users. `internal/notice/README.md` has the details.
+
 ## AWS
 
 One CloudFormation template (`cloudformation/supavise.yaml`) creates a complete node. You fill in an admin email; everything else has a default. There are three ways to deploy it, simplest first. All three give the same stack.
@@ -462,7 +490,8 @@ To rotate the key: generate a new pair, commit the new public file, replace the 
 - a re-run changes nothing and restarts nothing, and a re-run with one flag changes that setting only;
 - a re-run of `install.sh` with a v0.0.2 binary moves the daemon onto it (the daemon's `/proc/<pid>/exe` reports v0.0.2) without restarting shared services or projects;
 - `supavise self-update` against a local release server: refuses a tampered binary, a wrong key and an older signed binary under a newer tag, installs v0.0.3, restarts the daemon, leaves the project's Postgres running; then a release whose daemon exits on `serve` is rolled back to v0.0.3, whose daemon answers again;
-- the claim token stays out of the installer's output when `--claim-token-file` is used.
+- the claim token stays out of the installer's output when `--claim-token-file` is used;
+- `supavise status --json` on the healthy node reports every check and exits 0; with the project's PostgREST stopped it exits 1, names the project and `/healthz` stays a 200 that says degraded; `/healthz/detail` needs a token; an announced maintenance window shows in `supavise status` and clears, while the Studio host's `/api/incident-banner` stays empty.
 
 `tests/linux/upgrade-smoke.sh` (the `upgrade-smoke` job) covers project upgrades under systemd: projects on older GoTrue and PostgREST releases than the node's pins, kept on them by a node update, an upgrade onto a release that does not start (rolled back), the upgrade that works through the Management API (versions, the running processes, the data and an auth user intact), `supavise projects upgrade --all --yes` and `supavise artifacts gc` (`tests/linux/README.md`).
 

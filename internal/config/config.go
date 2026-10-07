@@ -60,6 +60,8 @@ type Config struct {
 	Functions Functions `toml:"functions"`
 	Branching Branching `toml:"branching"`
 	Upgrade   Upgrade   `toml:"upgrade"`
+	Alerts    Alerts    `toml:"alerts"`
+	Health    Health    `toml:"health"`
 	Defaults  Limits    `toml:"defaults"`
 }
 
@@ -217,6 +219,12 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.Upgrade.validate(); err != nil {
+		return err
+	}
+	if err := c.Health.validate(); err != nil {
+		return err
+	}
+	if err := c.validateAlerts(); err != nil {
 		return err
 	}
 	if c.StateDir == "" {

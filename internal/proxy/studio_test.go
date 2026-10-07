@@ -1,9 +1,15 @@
 package proxy
 
 import (
+	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jsmillerdev/supavise/internal/notice"
 )
 
 func TestIncidentBannerIsAnsweredByTheProxy(t *testing.T) {
@@ -121,5 +127,46 @@ func TestDashboardAuthIsForwardedToTheSystemGoTrue(t *testing.T) {
 	// Traversal cannot step out of /auth/v1.
 	if resp, _ := h.req("GET", api, "/auth/v1/../../v1/projects"); resp.StatusCode != 404 {
 		t.Errorf("path traversal out of /auth/v1: %d, want 404", resp.StatusCode)
+	}
+}
+
+// The answer stays empty while the operator has a window announced or an upgrade runs, and
+// whatever is available: Studio would draw any incident as an unexplained outage.
+func TestIncidentBannerStaysEmptyDuringMaintenanceAndUpgrade(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now()
+	incidents := func() []any {
+		t.Helper()
+		resp, body := h.req("GET", "studio."+testDomain, "/api/incident-banner")
+		if resp.StatusCode != 200 {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		var out map[string]any
+		if err := json.Unmarshal([]byte(body), &out); err != nil {
+			t.Fatalf("%v: %q", err, body)
+		}
+		return out["incidents"].([]any)
+	}
+	sysdir := filepath.Join(h.cfg.StateDir, "system")
+	if err := os.MkdirAll(sysdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysdir, "update.json"), []byte(`{"latest":"v9.9.9","available":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := notice.WriteMaintenance(h.cfg.Paths(), notice.Maintenance{Message: "Database maintenance", StartsAt: now.Add(-time.Minute), EndsAt: now.Add(time.Hour)}, now); err != nil {
+		t.Fatal(err)
+	}
+	up, _ := json.Marshal(notice.Upgrade{Phase: "rollout", From: "v1.0.0", To: "v1.1.0", StartedAt: now.Add(-time.Minute)})
+	if err := os.WriteFile(filepath.Join(sysdir, "upgrade.json"), up, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := incidents(); len(got) != 0 {
+		t.Errorf("Studio would show %v as an outage", got)
+	}
+	// HEAD still answers 200 with no body, and the answer is never cached.
+	resp, body := h.req("HEAD", "studio."+testDomain, "/api/incident-banner")
+	if resp.StatusCode != 200 || body != "" || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("HEAD: %d %q %q", resp.StatusCode, body, resp.Header.Get("Cache-Control"))
 	}
 }

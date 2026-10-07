@@ -7,6 +7,7 @@ This guide picks up after the install in the [README](../README.md#get-started).
 - [Use the Supabase CLI](#use-the-supabase-cli)
 - [Give an agent or a preview its own branch](#give-an-agent-or-a-preview-its-own-branch)
 - [Back up and restore](#back-up-and-restore)
+- [Monitor the node](#monitor-the-node)
 - [How Supavise compares](#how-supavise-compares)
 - [Sizing and cost](#sizing-and-cost)
 - [FAQ](#faq)
@@ -86,6 +87,15 @@ Good to know:
 - Don't restart `supavise` while a project shows RESTORING.
 - A restore needs free disk for a second copy of the project's data. The previous data stays on the server until the project's next successful restore.
 - If a restore fails, the project shows RESTORE_FAILED and keeps its original data where possible. Restore again, or pause and resume the project. The [backup docs](../internal/backup/README.md) cover the details.
+
+## Monitor the node
+
+```bash
+sudo -u supavise supavise status   # one verdict for the node and every project
+curl https://api.<domain>/healthz  # for an uptime monitor; reveals nothing else
+```
+
+Add an `[alerts]` section to `/etc/supavise/config.toml` to get a webhook or email when a backup fails, disk runs low, a project turns unhealthy, a certificate nears expiry or an update is available. Before planned work, `supavise maintenance announce` shows a notice in the dashboard. The deploy guide's [health and alerts](../deploy/README.md#health-alerts-and-maintenance-notices) section has the details.
 
 ## How Supavise compares
 

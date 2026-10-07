@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -180,6 +181,24 @@ func TestServeIntegration(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 401 {
 		t.Errorf("admin listener = %d, want 401", resp.StatusCode)
+	}
+
+	// The public health endpoint answers on both: 200 with a verdict that is not "down" (the
+	// shared services are not part of this node, which is not a failure), and nothing else in the body.
+	for _, base := range []string{"http://" + cfg.Listen.Admin} {
+		resp, err := http.Get(base + "/healthz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var hz map[string]string
+		_ = json.NewDecoder(resp.Body).Decode(&hz)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || len(hz) != 1 || (hz["status"] != "healthy" && hz["status"] != "degraded") {
+			t.Errorf("GET %s/healthz = %d %v, want 200 and a verdict that is not down", base, resp.StatusCode, hz)
+		}
+	}
+	if code, body := get(cfg.APIHost(), "/healthz"); code != 200 || !strings.Contains(body, `"status":`) || strings.Contains(body, p.Ref) {
+		t.Errorf("/healthz through the proxy = %d %s", code, body)
 	}
 
 	// Graceful stop on cancel; the project units keep running (they are systemd's).
