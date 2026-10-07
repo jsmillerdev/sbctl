@@ -317,6 +317,23 @@ log "the organization keeps its last Owner"
 if supavise users remove owner@example.com >"$WORK/rm.out" 2>&1; then fail "users remove deleted the only owner"; fi
 grep -q "only Owner" "$WORK/rm.out" || { cat "$WORK/rm.out" >&2; fail "users remove: unexpected refusal"; }
 
+log "deleting an organization: Owners only, and never the node's last"
+[[ $(papi "${JWT[owner]}" POST /platform/organizations '{"name":"Scrap"}') == 201 ]] || { cat "$WORK/last.json" >&2; fail "creating a second organization"; }
+SCRAP=$(json_get 'd["slug"]' <"$WORK/last.json")
+supavise users role admin@example.com administrator --org "$SCRAP" >/dev/null || fail "making an administrator of the second organization"
+[[ $(papi "${JWT[admin]}" DELETE "/platform/organizations/$SCRAP") == 403 ]] || fail "an administrator deleted an organization"
+[[ $(papi "${JWT[dev]}" DELETE "/platform/organizations/$ORG") == 403 ]] || fail "a developer deleted an organization"
+if supavise orgs delete "$SCRAP" >"$WORK/orgs.out" 2>&1; then fail "orgs delete without --yes deleted the organization"; fi
+supavise orgs list >"$WORK/orgs.txt" || fail "orgs list"
+grep -q "^$SCRAP " "$WORK/orgs.txt" || { cat "$WORK/orgs.txt" >&2; fail "orgs list does not show $SCRAP"; }
+[[ $(papi "${JWT[owner]}" DELETE "/platform/organizations/$SCRAP") == 200 ]] || { cat "$WORK/last.json" >&2; fail "an owner could not delete an organization"; }
+[[ $(papi "${JWT[owner]}" GET /platform/organizations) == 200 ]] || fail "listing organizations"
+[[ $(json_get '",".join(sorted(o["slug"] for o in d))' <"$WORK/last.json") == "$ORG" ]] || fail "the deleted organization is still listed: $(cat "$WORK/last.json")"
+supavise orgs list >"$WORK/orgs.txt" || fail "orgs list"
+if grep -q "^$SCRAP " "$WORK/orgs.txt"; then fail "orgs list still shows $SCRAP"; fi
+[[ $(papi "${JWT[owner]}" DELETE "/platform/organizations/$ORG") == 409 ]] || fail "the node's last organization was not kept"
+[[ $(body "${PAT[owner]}" GET /v1/projects | json_get 'len(d)') != 0 ]] || fail "a refused organization deletion removed projects"
+
 log "a project-scoped role: only that project's rights"
 [[ $(papi "${JWT[owner]}" PATCH "$M/${UID_OF[outsider]}" "{\"role_id\":3,\"role_scoped_projects\":[\"$REF\"]}") == 200 ]] || fail "scoped role"
 [[ $(papi "${JWT[owner]}" DELETE "$M/${UID_OF[outsider]}/roles/4") == 200 ]] || fail "dropping the organization-wide role"

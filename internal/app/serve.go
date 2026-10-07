@@ -133,6 +133,13 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	if err != nil {
 		return err
 	}
+	// `supavise functions dev --token-file` grants a stand-in Owner seat and removes it when it
+	// exits; one that was killed leaves the seat behind.
+	if m, t, err := api.SweepStandIn(ctx, node.Registry, apiH.Members()); err != nil {
+		log.Warn("could not sweep the stand-in seats of `functions dev`", "error", err)
+	} else if m+t > 0 {
+		log.Warn("removed the stand-in seats and tokens that `functions dev` left behind", "memberships", m, "tokens", t)
+	}
 	edge, err := proxy.New(proxy.Options{
 		Config: cfg, Registry: node.Registry, Keys: node.Engine, APIHandler: apiH,
 		FunctionsEnabled: cfg.Functions.Enabled,

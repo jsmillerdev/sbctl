@@ -49,7 +49,7 @@ registered in a second mux of a chain, tried in order.
 | Database | `database/query`, `database/query/read-only` (rows as JSON; `parameters` supported), `database/migrations` list and apply (`supabase_migrations.schema_migrations`), `types/typescript` (pg-meta generator), `cli/login-role` create and delete, `advisors/*` (no lints yet) |
 | Functions and secrets | `functions` list, create, deploy (multipart), get, patch, delete, `body`; `secrets` list (digests), create, delete. Sources, bundles and sealed secrets are stored. Uploads: multipart sources (`POST .../functions/deploy`, `supabase functions deploy --use-api`, the CLI when Docker is not running, Studio's editor; where `Deps.Functions` is set the runtime serves bundles only, because a function run from source files could import other projects' files, so the hook's `api.SourceBundler` bundles the sources in a sandbox and they are stored together with the bundle (`.supavise-bundle.ezbr`, `.supavise-bundle.json`; answers: 400 with the bundler's output for broken code, 501 where the node cannot bundle, 429 when the queue is full); the sources stay readable through `.../body`) and bundles (`POST` create and `PATCH` update with `Content-Type: application/vnd.denoland.eszip` and a body of `EZBR` + Brotli, which is what plain `supabase functions deploy` sends; metadata in the query, `ezbr_sha256` checked, stored as the file `.supavise-bundle.ezbr`; `functions_bundle.go`). `Deps.Functions` (`api.FunctionsHook`, `functions_hook.go`) is told after each change so `internal/functions` can put the files where the Edge Runtime reads them |
 | Identity | `/v1/profile`, `/platform/profile` (get, post, patch), `profile/permissions` and `permissions/v2` (computed from the caller's roles), `profile/access-tokens` (list, create, get, delete), `/platform/cli/login` and `/platform/cli/login/{session_id}` (device login) |
-| Organizations | `/v1/organizations` list, get, `entitlements`, `members`; `/platform/organizations` list, create, get, patch, `entitlements` (every feature of the spec's key enum granted), `billing/subscription` (plan stub), `projects` |
+| Organizations | `/v1/organizations` list, get, `entitlements`, `members`; `/platform/organizations` list, create, get, patch, delete (see Deleting an organization below), `entitlements` (every feature of the spec's key enum granted), `billing/subscription` (plan stub), `projects` |
 | Members and roles | `/platform/organizations/{slug}/members` (list; `PATCH` and `DELETE .../{gotrue_id}`; `PUT` and `DELETE .../{gotrue_id}/roles/{role_id}`), `members/invitations` (list, create, delete by id, get and accept by token), `members/mfa/enforcement`, `roles`, `members/reached-free-project-limit`; `/platform/projects/{ref}/members`; `/v2/organizations/{slug}/members`, `roles`, `PATCH .../members/{user_id}/roles`, `POST` and `DELETE .../members/invitations`. See Members, roles and permissions below |
 | Single sign-on | `/platform/organizations/{slug}/sso` (get, post, put, delete: Studio's organization page, one provider), Supavise's `.../sso/providers` (list, create, get, update, delete), `.../sso/pending` (list; `POST` approves and `DELETE` denies `.../pending/{user_id}`); `/v1/projects/{ref}/config/auth/sso/providers` (create, list, get, update, delete: a project's own identity providers, proxied to its GoTrue). See Single sign-on below |
 | Studio data | `/platform/projects/{ref}/content` (saved SQL snippets, reports; upsert, list, get, count, delete) and `content/folders` |
@@ -187,14 +187,16 @@ bound to no invitation creates an account with no membership. Redeeming records 
 browser never sends to a server. `Accounts` (the same type the CLI uses for `supavise claim token`, `supavise users invite|list|role|remove`)
 also lists dashboard users and removes one, which ends the user's access at once and takes the user's seats away:
 
-1. the user is recorded in `supavise.removed_users` (migration `0610`), and from then on `authJWT` refuses
+1. the user's memberships and project roles are removed. This is the step that can refuse: it fails, and
+   changes nothing, when the user is the only Owner of an organization (unless `--force`);
+2. the user is recorded in `supavise.removed_users` (migration `0610`), and from then on `authJWT` refuses
    a session whose `sub` is in it and `authPAT` refuses a token whose owner is in it, on every request
    and with no cache, whichever process made the removal (a GoTrue access token would otherwise stay
    valid until it expires, an hour, and could mint a personal access token that never expires);
-2. the user's memberships are removed, and the personal access tokens the user created are deleted;
-3. the GoTrue account is deleted, which also deletes its sessions and refresh tokens.
+3. the personal access tokens the user created are deleted;
+4. the GoTrue account is deleted, which also deletes its sessions and refresh tokens.
 
-A step that fails leaves the account findable, and the first step has already cut the access off, so
+A step that fails leaves the account findable, and step 2 has already cut the access off, so
 running `users remove` again finishes the job. `claim token --if-none` issues nothing while an unused,
 unexpired claim token exists (the installer uses it, so a re-run does not replace a token handed over
 earlier).
@@ -245,6 +247,31 @@ has no access (the "no-access" state). **An organization always keeps one Owner*
 the last Owner answers 400 (`ErrLastOwner`), concurrent changes included (the check runs in a transaction that locks
 the organization). Members may always leave. `POST /platform/organizations` needs an Owner role somewhere (or an
 empty node); the creator owns the new organization.
+
+**Deleting an organization** (`DELETE /platform/organizations/{slug}`, Owners only; `supavise orgs delete <slug> --yes`
+for the operator, `supavise orgs list` shows what exists, and without `--yes` the command lists what it would delete
+and stops) does what hosted does, whose dialog says the organization is deleted "and remove all of its projects":
+the projects go through the lifecycle manager, so each takes its final base backup as a normal project delete does
+(a branch goes first, through the branching service). The steps are `OrgDeleter` in `org_delete.go`, in an order that
+keeps a failed run harmless and lets a second run finish it:
+
+1. The organization's SSO providers are removed like `.../sso/providers/{id}` does (GoTrue drops the provider, its
+   users lose their seats and tokens, its record, users and refusals go), except that the last-owner rule does not
+   apply to the organization being deleted. This comes first because it can refuse (403, 409) before any project
+   is touched.
+2. The projects are deleted. One that cannot be deleted (its final backup failed) answers 500, or 409 for a project
+   in a state that refuses a delete, naming the project; the organization, its members and the projects not yet
+   reached stay, and the Owner runs the request again.
+3. The organization row is deleted. Foreign keys cascade from it to the members, project-scoped roles, invitations
+   (and the invite tokens bound to them), the MFA setting and the default-role rules, so nothing is left behind; the
+   row's `on delete restrict` from `projects` refuses (409) when a project was created in the meantime. The audit
+   event `org.deleted` is recorded under the system project.
+
+The node's **last organization is never deleted** (409). Studio copes with none (it shows its "no organizations"
+page), but this API gives a node with no organization a "Default" one owned by whoever lists organizations first
+(`allOrgs`), which would make an arbitrary member of the deleted organization the Owner of a new one. The
+one-time sign-up grants that invitations created (`signup_grants`) are keyed by address, not by organization, and
+expire on their own.
 
 ### Enforcement
 
@@ -362,7 +389,7 @@ How the invitee is told:
   signed in through. A domain without a rule grants nothing; an existing membership is never changed.
 - `supavise users invite|list|role|remove|default-role` (see `supavise users --help`): `role` sets an organization-wide role
   as the operator and also adds a user to an organization, which is how an organization without an Owner gets one
-  back; `remove` refuses to delete the only Owner of an organization unless `--force`.
+  back; `remove` refuses to delete the only Owner of an organization unless `--force`. `supavise functions dev --token-file` seats a stand-in user (`members.StandInOwnerID`) as Owner of every organization while it runs; the stand-in never counts as an Owner for these rules (`CountOwners` leaves it out), and the daemon removes its seats and tokens at start (`SweepStandIn`) in case a crash left them.
 
 ## Single sign-on
 
@@ -439,7 +466,10 @@ like every other `/auth/v1` path.
   before anything else changes; when one of them is the only Owner of an organization the removal is refused (409)
   until another Owner exists, as `supavise users remove` refuses it. The provider is deleted from GoTrue (a 404 there counts
   as done) before Supavise's own record goes, and the record goes last, so a removal that stopped at GoTrue is finished by
-  running it again.
+  running it again. The users' personal access tokens are revoked between the two: a token that cannot be revoked
+  stops the removal with 502 and keeps the record (a token whose owner has no SSO record passes `AdmitUser`, which
+  takes such an owner for a password account), and the retry finishes. Deleting the organization removes its
+  providers the same way (see Deleting an organization under Members, roles and permissions).
 - **Domains are claimed node-wide.** GoTrue finds the provider by the email domain, across the whole node, and Supavise
   does not verify that the registrant controls the domain: the first provider to register a domain gets it (a second
   one is refused, 409). A provider is also refused for a domain that another organization's default-role rule holds,

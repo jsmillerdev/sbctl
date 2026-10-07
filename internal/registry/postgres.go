@@ -106,6 +106,10 @@ func (r *Postgres) UpdateOrganization(ctx context.Context, o *Organization) erro
 	return affected(r.pool.Exec(ctx, `update supavise.organizations set slug = $2, name = $3 where id = $1`, o.ID, o.Slug, o.Name))
 }
 
+func (r *Postgres) DeleteOrganization(ctx context.Context, id int64) error {
+	return affected(r.pool.Exec(ctx, `delete from supavise.organizations where id = $1`, id))
+}
+
 // Projects
 
 const projectCols = `ref, coalesce(org_id, 0), seq, name, region, engine, class, status, versions, limits, created_at, updated_at,

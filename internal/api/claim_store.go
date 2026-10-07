@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,10 @@ type ClaimStore interface {
 	ConsumeClaimToken(ctx context.Context, hash []byte, now time.Time, usedBy string) (*ClaimToken, error)
 	// ReleaseClaimToken undoes a consume whose user could not be created.
 	ReleaseClaimToken(ctx context.Context, id int64) error
+	// DeleteInviteTokens removes the tokens bound to the invitations, used ones too (an
+	// organization was deleted with its invitations). Postgres already cascades the delete
+	// from the invitation row; this is for stores without the foreign key.
+	DeleteInviteTokens(ctx context.Context, invitationIDs []int64) error
 	// Claimed reports whether a claim token has been used.
 	Claimed(ctx context.Context) (bool, error)
 	// HasLiveClaimToken reports whether a token of this kind is unused and not expired at now.
@@ -114,6 +119,14 @@ func (s *PGClaimStore) ConsumeClaimToken(ctx context.Context, hash []byte, now t
 
 func (s *PGClaimStore) ReleaseClaimToken(ctx context.Context, id int64) error {
 	_, err := s.pool.Exec(ctx, `update supavise.claim_tokens set used_at = null, used_by = null where id = $1`, id)
+	return err
+}
+
+func (s *PGClaimStore) DeleteInviteTokens(ctx context.Context, invitationIDs []int64) error {
+	if len(invitationIDs) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `delete from supavise.claim_tokens where invitation_id = any($1::bigint[])`, invitationIDs)
 	return err
 }
 
@@ -287,6 +300,17 @@ func (m *MemoryClaimStore) ReleaseClaimToken(_ context.Context, id int64) error 
 	defer m.mu.Unlock()
 	if t := m.tokens[id]; t != nil {
 		t.UsedAt, t.UsedBy = nil, ""
+	}
+	return nil
+}
+
+func (m *MemoryClaimStore) DeleteInviteTokens(_ context.Context, invitationIDs []int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, t := range m.tokens {
+		if t.InvitationID != 0 && slices.Contains(invitationIDs, t.InvitationID) {
+			delete(m.tokens, id)
+		}
 	}
 	return nil
 }

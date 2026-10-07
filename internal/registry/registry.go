@@ -187,6 +187,11 @@ type Registry interface {
 	GetOrganizationByID(ctx context.Context, id int64) (*Organization, error)
 	ListOrganizations(ctx context.Context) ([]Organization, error)
 	UpdateOrganization(ctx context.Context, o *Organization) error
+	// DeleteOrganization removes the organization row, and with it, in Postgres, everything
+	// that references it (members, roles, invitations and their tokens, SSO providers, the
+	// MFA setting, default-role rules). ErrConflict while a project still belongs to it;
+	// ErrNotFound for an unknown id.
+	DeleteOrganization(ctx context.Context, id int64) error
 
 	// CreateProject inserts p. If p.Seq is 0 and p.Ref is not "system", the lowest
 	// free seq >= 1 is assigned. CreatedAt and UpdatedAt are set.

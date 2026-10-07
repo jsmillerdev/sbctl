@@ -165,6 +165,24 @@ func testRegistry(t *testing.T, r Registry) {
 		t.Fatal("backup must outlive its project")
 	}
 
+	// An organization with a project cannot be deleted; an empty one can, once.
+	if err := r.DeleteOrganization(ctx, org.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("delete an organization with a project: %v, want ErrConflict", err)
+	}
+	empty, err := r.CreateOrganization(ctx, "empty", "Empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DeleteOrganization(ctx, empty.ID); err != nil {
+		t.Fatalf("delete an empty organization: %v", err)
+	}
+	if err := r.DeleteOrganization(ctx, empty.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete it again: %v, want ErrNotFound", err)
+	}
+	if _, err := r.GetOrganization(ctx, "empty"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("get after delete: %v", err)
+	}
+
 	testBranches(t, r, org.ID)
 
 	seen := map[string]bool{}

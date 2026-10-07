@@ -585,9 +585,22 @@ func (d *DashboardSSO) Update(ctx context.Context, actor *members.Access, id str
 // Remove deletes a provider: the memberships and roles of its users are removed, the provider goes
 // from GoTrue, the personal access tokens of its users are revoked (a token would otherwise outlive
 // the identity provider that vouched for its owner), and supavise's record of it goes last, so a
-// removal that stopped halfway can be run again and finishes. A provider that only GoTrue still
+// removal that stopped halfway can be run again and finishes. A token that cannot be revoked
+// stops the removal (502) with the record kept: a token without a record would pass AdmitUser,
+// which takes a user with no record for a password account. A provider that only GoTrue still
 // has can be removed too. orgID limits the removal to that organization (0: any).
 func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id string, orgID int64) (*DashboardProvider, error) {
+	return d.remove(ctx, actor, id, orgID, 0)
+}
+
+// RemoveForOrgDelete is Remove for a provider of organization orgID while that organization is
+// being deleted: the last-owner rule does not apply to orgID, which goes away with its Owners.
+func (d *DashboardSSO) RemoveForOrgDelete(ctx context.Context, actor *members.Access, id string, orgID int64) (*DashboardProvider, error) {
+	return d.remove(ctx, actor, id, orgID, orgID)
+}
+
+// remove is Remove; dying is the organization whose deletion this is, or 0.
+func (d *DashboardSSO) remove(ctx context.Context, actor *members.Access, id string, orgID, dying int64) (*DashboardProvider, error) {
 	row, err := d.Store.GetProvider(ctx, id)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return nil, err
@@ -619,7 +632,7 @@ func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id str
 		// it, so their memberships go first: otherwise they would stay in the member lists and
 		// count as Owners for the last-owner rule. Removing the only Owner of an organization is
 		// refused (nothing of the provider changes then), as `supavise users remove` refuses it.
-		if err := d.removeMemberships(ctx, id); err != nil {
+		if err := d.removeMemberships(ctx, id, dying); err != nil {
 			return nil, err
 		}
 	}
@@ -644,7 +657,10 @@ func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id str
 			return nil, err
 		}
 		for _, u := range users {
-			d.revokeTokens(ctx, u.UserID)
+			if err := d.revokeTokens(ctx, u.UserID); err != nil {
+				d.log().Warn("personal access tokens of a removed SSO user could not be revoked; the provider record stays", "user", u.UserID, "error", err)
+				return nil, errf(http.StatusBadGateway, "The personal access tokens of %s could not be revoked, so the provider was kept. Try again.", u.Email)
+			}
 		}
 		// The record goes last: it is what a retry needs when a step above failed.
 		if _, err := d.Store.DeleteProvider(ctx, id); err != nil && !errors.Is(err, ErrNotFound) {
@@ -660,10 +676,11 @@ func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id str
 
 // removeMemberships removes the memberships and project roles of every user that signed in
 // through the provider, in every organization (the accounts can sign in no more). It stops at
-// the first user whose removal would leave an organization without an Owner; the users removed
-// before that stay removed (they wait for approval, were the provider kept), and running the
-// removal again after another Owner exists finishes it.
-func (d *DashboardSSO) removeMemberships(ctx context.Context, providerID string) error {
+// the first user whose removal would leave an organization without an Owner, not counting
+// organization dying (0: none), which is being deleted; the users removed before that stay removed
+// (they wait for approval, were the provider kept), and running the removal again after another
+// Owner exists finishes it.
+func (d *DashboardSSO) removeMemberships(ctx context.Context, providerID string, dying int64) error {
 	if d.Members == nil {
 		return nil
 	}
@@ -672,7 +689,7 @@ func (d *DashboardSSO) removeMemberships(ctx context.Context, providerID string)
 		return err
 	}
 	for _, u := range us {
-		if err := d.Members.RemoveUser(ctx, u.UserID, false); err != nil {
+		if err := d.Members.RemoveUserExcept(ctx, u.UserID, false, dying); err != nil {
 			if errors.Is(err, members.ErrLastOwner) {
 				return errf(http.StatusConflict, "%s signs in through this provider and is the only Owner of an organization; make another member an Owner first", u.Email)
 			}
@@ -682,17 +699,20 @@ func (d *DashboardSSO) removeMemberships(ctx context.Context, providerID string)
 	return nil
 }
 
-func (d *DashboardSSO) revokeTokens(ctx context.Context, userID string) {
+// revokeTokens deletes the personal access tokens of a user. It tries every token and returns
+// the errors together.
+func (d *DashboardSSO) revokeTokens(ctx context.Context, userID string) error {
 	ts, err := d.Reg.ListAccessTokens(ctx, userID)
 	if err != nil {
-		d.log().Warn("personal access tokens of a removed SSO user could not be listed", "user", userID, "error", err)
-		return
+		return fmt.Errorf("listing the tokens of %s: %w", userID, err)
 	}
+	var errs []error
 	for _, t := range ts {
-		if err := d.Reg.DeleteAccessToken(ctx, userID, t.ID); err != nil {
-			d.log().Warn("a personal access token of a removed SSO user could not be deleted", "user", userID, "error", err)
+		if err := d.Reg.DeleteAccessToken(ctx, userID, t.ID); err != nil && !errors.Is(err, registry.ErrNotFound) {
+			errs = append(errs, fmt.Errorf("deleting token %d of %s: %w", t.ID, userID, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // changed tells the owner of Studio's unit that the dashboard may have gained or lost its
@@ -854,7 +874,11 @@ func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org memb
 			}
 		}
 	}
-	d.revokeTokens(ctx, u.UserID)
+	// The account is recorded as removed above, so the API refuses its tokens whether or not they
+	// are deleted here: a failure is only logged.
+	if err := d.revokeTokens(ctx, u.UserID); err != nil {
+		d.log().Warn("personal access tokens of a denied SSO user could not be deleted", "user", u.UserID, "error", err)
+	}
 	d.mu.Lock()
 	delete(d.admitted, userID)
 	d.mu.Unlock()

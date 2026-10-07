@@ -13,6 +13,7 @@ import (
 	"github.com/jsmillerdev/supavise/internal/api"
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/members"
 	"github.com/jsmillerdev/supavise/internal/registry"
 	"github.com/jsmillerdev/supavise/internal/sso"
@@ -27,18 +28,26 @@ func openSSO(cmd *cobra.Command) (*api.DashboardSSO, *api.Accounts, *config.Conf
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	d, acc, err := openSSOOn(cmd, n)
+	if err != nil {
+		n.Close()
+		return nil, nil, nil, nil, err
+	}
+	return d, acc, n.Cfg, n.Close, nil
+}
+
+// openSSOOn builds the SSO service over an open node; the caller closes the node.
+func openSSOOn(cmd *cobra.Command, n *lifecycle.Node) (*api.DashboardSSO, *api.Accounts, error) {
 	pg, ok := n.Registry.(*registry.Postgres)
 	if !ok {
-		n.Close()
-		return nil, nil, nil, nil, fmt.Errorf("the registry is %T, want Postgres", n.Registry)
+		return nil, nil, fmt.Errorf("the registry is %T, want Postgres", n.Registry)
 	}
 	acc := &api.Accounts{Reg: n.Registry, Store: api.NewPGClaimStore(pg.Pool()), Keys: n.Engine.Keys, Config: n.Cfg, Log: newLogger(n.Cfg)}
 	acc.EnableMembers(n.Registry, api.NewPGStore(pg.Pool()))
 	d := api.NewDashboardSSO(acc, api.NewPGSSOStore(pg.Pool()))
 	fm, err := fleet.NewManager(fleet.Deps{Cfg: n.Cfg, Log: newLogger(n.Cfg), Registry: n.Registry, Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts})
 	if err != nil {
-		n.Close()
-		return nil, nil, nil, nil, err
+		return nil, nil, err
 	}
 	d.Changed = func(ctx context.Context) {
 		// Both daemon and CLI may be asked to change the providers; the one that was asked
@@ -48,7 +57,7 @@ func openSSO(cmd *cobra.Command) (*api.DashboardSSO, *api.Accounts, *config.Conf
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: Studio was not updated (%v); run `supavise fleet start` to apply it\n", err)
 		}
 	}
-	return d, acc, n.Cfg, n.Close, nil
+	return d, acc, nil
 }
 
 // spInstructions says what to configure in the identity provider.
