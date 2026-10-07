@@ -1,0 +1,21 @@
+[Unit]
+Description=sbctl base backup and retention for project %i
+After=sb-postgres@%i.service
+
+[Service]
+Type=oneshot
+User=sbctl
+Group=sbctl
+Slice=sbctl.slice
+# SBCTL_REGISTRY_DSN (and any other SBCTL_* override) for processes outside the daemon.
+EnvironmentFile=-/etc/sbctl/sbctl.env
+Nice=10
+# Not "idle": an idle-class backup can be starved indefinitely on a busy disk while
+# pg_backup_start() is held, which keeps the cluster in backup mode.
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=/usr/local/bin/sbctl backups create %i --reason scheduled
+ExecStart=/usr/local/bin/sbctl backups prune %i
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes

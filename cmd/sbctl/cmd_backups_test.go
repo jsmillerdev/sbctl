@@ -1,0 +1,159 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/OWNER/sbctl/internal/backup"
+	"github.com/OWNER/sbctl/internal/config"
+)
+
+func runRoot(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	var out bytes.Buffer
+	rootCmd.SetOut(&out)
+	rootCmd.SetErr(&out)
+	rootCmd.SetArgs(args)
+	err := rootCmd.Execute()
+	rootCmd.SetArgs(nil)
+	return out.String(), err
+}
+
+func TestBackupsCommandsAreRegistered(t *testing.T) {
+	for _, path := range [][]string{
+		{"wal", "push"}, {"wal", "fetch"},
+		{"backups", "create"}, {"backups", "list"}, {"backups", "prune"}, {"backups", "restore"}, {"backups", "finish-restore"},
+	} {
+		c, _, err := rootCmd.Find(path)
+		if err != nil || c == nil || c.Name() != path[len(path)-1] {
+			t.Errorf("sbctl %s is not registered: %v", strings.Join(path, " "), err)
+		}
+	}
+}
+
+func TestRestoreValidatesBeforeTouchingAnything(t *testing.T) {
+	const ref = "abcdefghijklmnopqrst"
+	if _, err := runRoot(t, "backups", "restore", ref, "--to", "yesterday"); err == nil || !strings.Contains(err.Error(), "RFC3339") {
+		t.Errorf("bad --to = %v", err)
+	}
+	// In place (no --as, or --as the same ref) needs --force.
+	for _, args := range [][]string{
+		{"backups", "restore", ref, "--to", "2026-10-06T14:30:00Z"},
+		{"backups", "restore", ref, "--to", "2026-10-06T14:30:00Z", "--as", ref},
+	} {
+		if _, err := runRoot(t, args...); !errors.Is(err, backup.ErrForceRequired) {
+			t.Errorf("%v = %v, want ErrForceRequired", args, err)
+		}
+	}
+	// latest and backup are targets of their own; in place still needs --force.
+	for _, to := range []string{"latest", "backup"} {
+		if _, err := runRoot(t, "backups", "restore", ref, "--to", to); !errors.Is(err, backup.ErrForceRequired) {
+			t.Errorf("--to %s in place = %v, want ErrForceRequired", to, err)
+		}
+	}
+	if _, err := runRoot(t, "backups", "restore", ref); err == nil {
+		t.Error("--to is required")
+	}
+}
+
+func TestWALPushNeedsRef(t *testing.T) {
+	if _, err := runRoot(t, "wal", "push", "pg_wal/000000010000000000000001"); err == nil || !strings.Contains(err.Error(), "ref") {
+		t.Errorf("wal push without --ref = %v", err)
+	}
+}
+
+func TestHumanBytes(t *testing.T) {
+	for n, want := range map[int64]string{0: "0 B", 1023: "1023 B", 1024: "1.0 KiB", 1536: "1.5 KiB", 5 << 20: "5.0 MiB", 3 << 30: "3.0 GiB"} {
+		if got := humanBytes(n); got != want {
+			t.Errorf("humanBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+func TestWarnEnvFileMode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sbctl.env")
+	var out bytes.Buffer
+	warnEnvFileMode(&out, p) // missing: silent
+	if out.Len() != 0 {
+		t.Fatalf("missing file warned: %q", out.String())
+	}
+	for _, tc := range []struct {
+		mode os.FileMode
+		warn bool
+	}{{0o600, false}, {0o640, true}, {0o644, true}, {0o400, false}} {
+		if err := os.WriteFile(p, []byte("SBCTL_REGISTRY_DSN=x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, tc.mode); err != nil {
+			t.Fatal(err)
+		}
+		out.Reset()
+		warnEnvFileMode(&out, p)
+		if (out.Len() > 0) != tc.warn {
+			t.Errorf("mode %04o: output %q, want warning=%v", tc.mode, out.String(), tc.warn)
+		}
+	}
+}
+
+func TestRefuseRoot(t *testing.T) {
+	if err := refuseRoot(0); !errors.Is(err, errRunAsRoot) || !strings.Contains(err.Error(), "sudo -u sbctl") {
+		t.Fatalf("refuseRoot(0) = %v", err)
+	}
+	for _, euid := range []int{1, 100, 1000} {
+		if err := refuseRoot(euid); err != nil {
+			t.Errorf("refuseRoot(%d) = %v", euid, err)
+		}
+	}
+	// Both command groups carry the check, so no subcommand can forget it.
+	for _, name := range []string{"backups", "wal"} {
+		c, _, err := rootCmd.Find([]string{name})
+		if err != nil || c.PersistentPreRunE == nil {
+			t.Errorf("sbctl %s has no root check: %v", name, err)
+		}
+	}
+}
+
+func TestCreateRejectsUnknownReason(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root is refused before flags are looked at")
+	}
+	if _, err := runRoot(t, "backups", "create", "abcdefghijklmnopqrst", "--reason", "because"); err == nil || !strings.Contains(err.Error(), "--reason") {
+		t.Fatalf("unknown --reason = %v", err)
+	}
+	for _, r := range []string{"manual", "scheduled", "final", "post-restore"} {
+		if !validReason(r) {
+			t.Errorf("%s must be valid", r)
+		}
+	}
+}
+
+func TestWarnConfigFileMode(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	cfg := &config.Config{}
+	warnConfigFileMode(&out, p, cfg)
+	if out.Len() != 0 {
+		t.Fatalf("no secret in config, no warning: %q", out.String())
+	}
+	cfg.Backup.S3SecretAccessKey = "secret"
+	warnConfigFileMode(&out, p, cfg)
+	if !strings.Contains(out.String(), "0600") || strings.Contains(out.String(), "secret\n") {
+		t.Fatalf("warning = %q", out.String())
+	}
+	out.Reset()
+	if err := os.Chmod(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	warnConfigFileMode(&out, p, cfg)
+	if out.Len() != 0 {
+		t.Fatalf("0600 file warned: %q", out.String())
+	}
+}
