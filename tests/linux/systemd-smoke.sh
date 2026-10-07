@@ -278,16 +278,16 @@ tenant_ls() { # PID: `ls /proc/PID/root/etc/sbctl` as the sbctl user from inside
   bash -c 'echo $$ >"$1" && exec runuser -u "$2" -- ls "/proc/$3/root/etc/sbctl"' _ "/sys/fs/cgroup$cg/cgroup.procs" "$SBCTL_USER" "$1" >/dev/null 2>&1
 }
 if [[ -n $CLIPID && -n $SLEEPPID ]]; then
-  tenant_ls "$SLEEPPID" || { kill "$SLEEPER" "$CLIWAIT" 2>/dev/null || true; fail "control: a tenant unit cannot read an ordinary process's /proc/<pid>/root, so the check below proves nothing"; }
-  tenant_ls "$CLIPID" && { pkill -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true; fail "a tenant unit read the /proc/<pid>/root of a running CLI command"; }
+  tenant_ls "$SLEEPPID" || { pkill -KILL -u "$SBCTL_USER" -x sleep || true; pkill -KILL -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true; fail "control: a tenant unit cannot read an ordinary process's /proc/<pid>/root, so the check below proves nothing"; }
+  tenant_ls "$CLIPID" && { pkill -KILL -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true; fail "a tenant unit read the /proc/<pid>/root of a running CLI command"; }
 else
   ps -u "$SBCTL_USER" -o pid,user,stat,args >&2 || true
   cat "$DUMPDIR/cli.log" >&2 || true
   for pid in $(pgrep -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push') $(pgrep -u "$SBCTL_USER" -x sleep); do ls -l "/proc/$pid/environ" >&2 || true; done
   fail "the CLI command did not become non-dumpable (cli pid '${CLIPID}', control pid '${SLEEPPID}')"
 fi
-pkill -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true
-kill "$SLEEPER" 2>/dev/null || true
+pkill -KILL -u "$SBCTL_USER" -f '^/usr/local/bin/sbctl wal push' || true
+pkill -KILL -u "$SBCTL_USER" -x sleep || true   # SIGTERM would not stop the CLI: Go catches it while open(2) blocks on the FIFO
 wait "$CLIWAIT" "$SLEEPER" 2>/dev/null || true
 rm -rf "$DUMPDIR"
 
