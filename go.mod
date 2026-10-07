@@ -85,7 +85,7 @@ require (
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/net v0.59.0
 	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.42.0 // indirect

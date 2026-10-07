@@ -16,4 +16,5 @@ studio:
   # studio artifact of the same upstream version is studio-2026.10.05-sha-94b8b06-r0.
   tag: 2026.10.05-sha-94b8b06
 cli:
-  version_tested: ""
+  # The Supabase CLI release the conformance suite runs (tests/conformance/pins.env).
+  version_tested: "2.120.0"
