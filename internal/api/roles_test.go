@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -707,7 +708,7 @@ func TestAccountsFromBeforeRolesBecomeOwners(t *testing.T) {
 		t.Fatalf("a legacy account is Owner: %d %s", rec.Code, rec.Body)
 	}
 	young := "eeeeeeee-0000-4000-8000-000000000002"
-	rf.gt.addUser(young, "young@example.test", time.Now())
+	rf.gt.addUser(young, "young@example.test", time.Now().Add(2*time.Hour))
 	tok2 := rf.signJWT(map[string]any{"sub": young, "email": "young@example.test", "role": "authenticated"})
 	if rec := rf.doAs(tok2, "GET", "/platform/organizations/default", nil); rec.Code != 403 {
 		t.Fatalf("an account created after roles has no access until invited: %d", rec.Code)
@@ -717,7 +718,7 @@ func TestAccountsFromBeforeRolesBecomeOwners(t *testing.T) {
 // newFixtureWithLegacy is a fixture whose store knows when roles began.
 func newFixtureWithLegacy(t testing.TB) *fixture {
 	f := newFixture(t)
-	f.srv.members.Store.(*members.Memory).Cutoff = time.Now().Add(-time.Hour)
+	f.srv.members.Store.(*members.Memory).Cutoff = time.Now().Add(time.Hour) // after the fixture's organization, before the 'young' account
 	return f
 }
 
@@ -897,5 +898,133 @@ func TestAnAdministratorCannotScopeAnOwner(t *testing.T) {
 	a, _ = rf.srv.members.Access(context.Background(), rf.ids["scoped"])
 	if a.OrgRole(rf.org.ID) != members.RoleDeveloper || len(a.Membership(rf.org.ID).Scoped) != 0 {
 		t.Errorf("an organization-wide role must replace the scoped roles: %+v", a.Memberships)
+	}
+}
+
+const sharedSnippetID = "11111111-1111-4111-8111-111111111111"
+
+// Saved items belong to their owner: a Developer or Read-only member cannot rewrite, rename or
+// delete what another member shared, which an Owner may later open and run.
+func TestSharedContentBelongsToItsOwner(t *testing.T) {
+	rf := newRolesFixture(t)
+	pp := "/platform/projects/" + testRef
+	ownerID := body[map[string]any](t, rf.status(200, "owner", "GET", "/platform/profile", nil))["id"]
+	rf.status(200, "owner", "PUT", pp+"/content", map[string]any{"id": sharedSnippetID, "name": "shared", "type": "sql", "visibility": "project", "content": map[string]any{"sql": "select 1"}})
+	folder := body[map[string]any](t, rf.status(201, "owner", "POST", pp+"/content/folders", map[string]any{"name": "Owner's"}))["id"].(string)
+	stored := func() map[string]any {
+		return body[map[string]any](t, rf.status(200, "owner", "GET", pp+"/content/item/"+sharedSnippetID, nil))
+	}
+	for _, role := range []string{"dev", "ro", "scoped"} {
+		rf.status(403, role, "PUT", pp+"/content", map[string]any{"id": sharedSnippetID, "name": "shared", "type": "sql", "visibility": "project", "content": map[string]any{"sql": "drop table important"}})
+		rf.status(403, role, "DELETE", pp+"/content?ids="+sharedSnippetID, nil)
+		rf.status(403, role, "PATCH", pp+"/content/folders/"+folder, map[string]any{"name": "renamed"})
+		rf.status(403, role, "DELETE", pp+"/content/folders?ids="+folder, nil)
+	}
+	if got := stored(); got["content"].(map[string]any)["sql"] != "select 1" || got["owner_id"] != ownerID || got["last_updated_by"] != ownerID {
+		t.Fatalf("the Owner's snippet was changed: %v", got)
+	}
+	// A member's own items are theirs to change; a Read-only member may keep SQL snippets, not reports.
+	for _, role := range []string{"dev", "ro"} {
+		id := map[string]string{"dev": "22222222-2222-4222-8222-222222222222", "ro": "33333333-3333-4333-8333-333333333333"}[role]
+		rf.status(200, role, "PUT", pp+"/content", map[string]any{"id": id, "name": "mine", "type": "sql", "visibility": "project", "content": map[string]any{"sql": "select 1"}})
+		rf.status(200, role, "PUT", pp+"/content", map[string]any{"id": id, "name": "mine", "type": "sql", "visibility": "project", "content": map[string]any{"sql": "select 2"}})
+		// The Owner's shared copy is out of their reach, however they reach it.
+		rf.status(403, role, "PUT", pp+"/content", map[string]any{"id": sharedSnippetID, "name": "x", "type": "sql", "content": map[string]any{}})
+		own := body[map[string]any](t, rf.status(201, role, "POST", pp+"/content/folders", map[string]any{"name": "mine"}))["id"].(string)
+		rf.status(200, role, "PATCH", pp+"/content/folders/"+own, map[string]any{"name": "renamed"})
+		rf.status(200, role, "DELETE", pp+"/content/folders?ids="+own, nil)
+		rf.status(200, role, "DELETE", pp+"/content?ids="+id, nil)
+	}
+	rf.status(403, "ro", "PUT", pp+"/content", map[string]any{"name": "r", "type": "report", "visibility": "user", "content": map[string]any{}})
+	rf.status(200, "dev", "PUT", pp+"/content", map[string]any{"name": "r", "type": "report", "visibility": "user", "content": map[string]any{}})
+	// An Administrator may edit it; the editor is recorded and the owner kept.
+	rf.status(200, "admin", "PUT", pp+"/content", map[string]any{"id": sharedSnippetID, "name": "shared", "type": "sql", "visibility": "project", "content": map[string]any{"sql": "select 3"}})
+	adminID := body[map[string]any](t, rf.status(200, "admin", "GET", "/platform/profile", nil))["id"]
+	if got := stored(); got["owner_id"] != ownerID || got["last_updated_by"] != adminID || got["last_updated_by"] == got["owner_id"] {
+		t.Fatalf("editor and owner: %v", got)
+	}
+	rf.status(200, "admin", "DELETE", pp+"/content?ids="+sharedSnippetID, nil)
+}
+
+// The permission list Studio reads says the same: it carries the owner condition.
+func TestContentPermissionsCarryTheOwnerCondition(t *testing.T) {
+	rf := newRolesFixture(t)
+	body := rf.status(200, "dev", "GET", "/platform/profile/permissions", nil).Body.String()
+	if !strings.Contains(body, `"resource.owner_id"`) || !strings.Contains(body, `"subject.id"`) {
+		t.Errorf("a Developer's content writes must be conditioned on the owner: %s", body)
+	}
+}
+
+// The invitation link is a credential, so the server does not log it.
+func TestInvitationLinksAreNotLogged(t *testing.T) {
+	rf := newRolesFixture(t)
+	var buf strings.Builder
+	l := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	rf.srv.accounts.Log = l
+	rf.srv.members.Log = l
+	// A new address (claim link) and an existing account (join link), neither mailed.
+	rf.gt.addUser("cccccccc-0000-4000-8000-000000000009", "known@example.test", time.Now())
+	rec := rf.status(201, "owner", "POST", orgBase+"/members/invitations", map[string]any{"emails": []string{"fresh@example.test", "known@example.test"}, "role_id": members.RoleDeveloper})
+	links := body[map[string]any](t, rec)["invite_links"].([]any)
+	if len(links) != 2 {
+		t.Fatalf("links: %v", links)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "fresh@example.test") {
+		t.Fatalf("the log should name the invitation: %q", logged)
+	}
+	for _, l := range links {
+		u, err := url.Parse(l.(map[string]any)["url"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		frag, _ := url.ParseQuery(u.Fragment)
+		for _, tok := range []string{frag.Get("token"), u.Query().Get("token")} {
+			if tok != "" && strings.Contains(logged, tok) {
+				t.Errorf("a token of the invitation links is in the log: %s", logged)
+			}
+		}
+		if strings.Contains(logged, "/claim#") || strings.Contains(logged, "/join?") {
+			t.Errorf("an invitation link is in the log: %s", logged)
+		}
+	}
+}
+
+// Anyone signed in may ask about a token, so a made-up token or slug reveals nothing: not the
+// organization's name, not whether the organization exists.
+func TestInvitationLookupRevealsNothingWithoutAToken(t *testing.T) {
+	rf := newRolesFixture(t)
+	for _, slug := range []string{"default", "nosuchorg"} {
+		rec := rf.status(200, "stranger", "GET", "/platform/organizations/"+slug+"/members/invitations/"+members.InvitationPrefix+"nope", nil)
+		got := body[map[string]any](t, rec)
+		if got["token_does_not_exist"] != true || got["organization_name"] != "" || strings.Contains(rec.Body.String(), rf.org.Name) {
+			t.Errorf("%s: %s", slug, rec.Body)
+		}
+	}
+}
+
+// A session without a second factor cannot create projects in, or list the projects of, an
+// organization that requires MFA.
+func TestMFAEnforcementCoversProjectCreationAndLists(t *testing.T) {
+	rf := newRolesFixture(t)
+	aal2 := rf.signJWT(map[string]any{"sub": rf.ids["owner"], "email": "owner@example.test", "role": "authenticated", "aal": "aal2"})
+	if rec := rf.doAs(aal2, "PATCH", orgBase+"/members/mfa/enforcement", map[string]any{"enforced": true}); rec.Code != 201 {
+		t.Fatalf("enforce: %d %s", rec.Code, rec.Body)
+	}
+	create := map[string]any{"name": "late", "organization_slug": "default", "db_pass": "a-long-database-password"}
+	rec := rf.status(403, "admin", "POST", "/platform/projects", create)
+	if !strings.Contains(rec.Body.String(), "MFA required") {
+		t.Errorf("creation: %s", rec.Body)
+	}
+	for _, path := range []string{"/platform/projects", "/v1/projects"} {
+		if got := rf.status(200, "admin", "GET", path, nil).Body.String(); strings.Contains(got, testRef) {
+			t.Errorf("%s lists a project of an organization that requires MFA to a session without it: %s", path, got)
+		}
+		if got := rf.doAs(aal2, "GET", path, nil).Body.String(); !strings.Contains(got, testRef) {
+			t.Errorf("%s: an aal2 session must see the project: %s", path, got)
+		}
+		if got := rf.doAs(rf.pat("admin"), "GET", "/v1/projects", nil).Body.String(); !strings.Contains(got, testRef) {
+			t.Errorf("a token is not held to the requirement: %s", got)
+		}
 	}
 }

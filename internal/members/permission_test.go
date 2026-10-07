@@ -91,7 +91,8 @@ func TestRoleCapabilities(t *testing.T) {
 		{ActUpdate, ResProjects, true, true, false, false},
 		{ActDelete, ResProjects, true, true, false, false},
 		{ActRead, ResProjects, true, true, true, true},
-		{ActInfraExecute, "reboot", true, true, false, false},
+		{ActInfraExecute, "reboot", true, true, true, false}, // hosted: Restart is for Developers too
+		{ActInfraExecute, "queue_jobs.projects.pause", true, true, false, false},
 		// settings and keys
 		{ActUpdate, "custom_config_gotrue", true, true, false, false},
 		{ActCreate, ResServiceKeys, true, true, false, false},
@@ -123,6 +124,34 @@ func TestRoleCapabilities(t *testing.T) {
 			if got := can(accessWith(role), "", c.action, c.resource); got != want {
 				t.Errorf("%s: %s on %s: got %v want %v", RoleName(role), c.action, c.resource, got, want)
 			}
+		}
+	}
+}
+
+// Saved content: every role creates, a Developer or Read-only member changes only their own
+// (Studio passes the item's owner_id and subject.id), and Read-only has no reports.
+func TestSavedContentPermissions(t *testing.T) {
+	item := func(typ string, owner, me int64) map[string]any { return OwnContentData(typ, "project", owner, me) }
+	for _, c := range []struct {
+		role   int
+		action string
+		data   map[string]any
+		want   bool
+	}{
+		{RoleOwner, ActUpdate, item("sql", 1, 2), true},
+		{RoleAdministrator, ActDelete, item("sql", 1, 2), true},
+		{RoleDeveloper, ActUpdate, item("sql", 2, 2), true},
+		{RoleDeveloper, ActUpdate, item("sql", 1, 2), false},
+		{RoleDeveloper, ActDelete, item("report", 1, 2), false},
+		{RoleDeveloper, ActCreate, item("report", 2, 2), true},
+		{RoleReadOnly, ActUpdate, item("sql", 2, 2), true},
+		{RoleReadOnly, ActDelete, item("sql", 1, 2), false},
+		{RoleReadOnly, ActUpdate, item("report", 2, 2), false},
+		{RoleReadOnly, ActCreate, item("sql", 2, 2), true},
+		{RoleReadOnly, ActCreate, item("report", 2, 2), false},
+	} {
+		if got := accessWith(c.role).Can(testOrg, "", c.action, ResUserContent, c.data); got != c.want {
+			t.Errorf("%s %s %v: got %v want %v", RoleName(c.role), c.action, c.data, got, c.want)
 		}
 	}
 }
@@ -200,7 +229,7 @@ func TestPermissionEntriesShape(t *testing.T) {
 			scoped++
 		}
 	}
-	if restrictive != 3 || scoped != 3 {
+	if restrictive != 3 || scoped != 6 {
 		t.Fatalf("restrictive=%d scoped=%d: %+v", restrictive, scoped, ps)
 	}
 	if got := accessWith(RoleOwner).Permissions([]OrgRef{testOrg}); len(got) != 1 || got[0].Actions[0] != "%" || got[0].Resources[0] != "%" || got[0].Condition != nil {

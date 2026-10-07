@@ -85,6 +85,32 @@ var contentActions = []string{
 
 var writeActions = []string{ActCreate, ActUpdate, ActDelete}
 
+// developerInfra are the infra:Execute resources a Developer holds: restarting the project and
+// restoring backups.
+var developerInfra = []string{"reboot", "queue_job.walg.prepare_restore", "queue_job.restore.prepare"}
+
+// ownContent conditions a write on saved content to the caller's own items, the check Studio
+// makes by passing the item's owner_id and the signed-in profile id as subject.id. extra, when
+// not nil, is a further condition that must hold.
+func ownContent(p Permission, extra any) Permission {
+	own := map[string]any{"==": []any{map[string]any{"var": "resource.owner_id"}, map[string]any{"var": "subject.id"}}}
+	if extra == nil {
+		p.Condition = own
+	} else {
+		p.Condition = map[string]any{"and": []any{own, extra}}
+	}
+	return p
+}
+
+// OwnContentData is the condition data of a check on a saved item: the item's type, visibility
+// and owner (profile id) and the caller's profile id. Studio passes the same shape.
+func OwnContentData(typ, visibility string, ownerID, subjectID int64) map[string]any {
+	return map[string]any{
+		"resource": map[string]any{"type": typ, "visibility": visibility, "owner_id": ownerID},
+		"subject":  map[string]any{"id": subjectID},
+	}
+}
+
 // secretReads are the resources a Read-only member cannot read: the service key and JWT
 // secret (hosted: "Read service key" and "JWT Secret" are Owner, Administrator and Developer
 // only) and the Storage S3 credentials.
@@ -116,12 +142,22 @@ func roleEntries(role int, ownerRoleIDs []int64) []Permission {
 		return []Permission{
 			perm(readActions, allActions, false),
 			perm(contentActions, allActions, false),
-			perm(writeActions, []string{ResUserContent, ResPreviewBranches}, false),
+			perm([]string{ActCreate}, []string{ResUserContent}, false),
+			ownContent(perm([]string{ActUpdate, ActDelete}, []string{ResUserContent}, false), nil),
+			perm(writeActions, []string{ResPreviewBranches}, false),
+			// Hosted lists Restart and the backup restores for Developers; Pause, Restore and
+			// Delete stay with Administrators.
+			perm([]string{ActInfraExecute}, developerInfra, false),
 		}
 	case RoleReadOnly:
+		noReports := map[string]any{"!=": []any{map[string]any{"var": "resource.type"}, "report"}}
+		create := perm([]string{ActCreate}, []string{ResUserContent}, false)
+		create.Condition = noReports
 		return []Permission{
 			perm(readActions, allActions, false),
-			perm(writeActions, []string{ResUserContent}, false),
+			// Hosted: SQL snippets belong to every role, custom reports to Developers and up.
+			create,
+			ownContent(perm([]string{ActUpdate, ActDelete}, []string{ResUserContent}, false), noReports),
 			perm([]string{ActRead}, secretReads, true),
 		}
 	}

@@ -75,6 +75,7 @@ func testService(t *testing.T, mk func(*testing.T) *env) {
 	t.Run("remove user", func(t *testing.T) { testRemoveUser(t, mk(t)) })
 	t.Run("concurrent demotions", func(t *testing.T) { testConcurrentOwners(t, mk(t)) })
 	t.Run("legacy accounts", func(t *testing.T) { testLegacyAccounts(t, mk) })
+	t.Run("scoped owner invitations", func(t *testing.T) { testScopedOwnerInvitations(t, mk(t)) })
 }
 
 func TestServiceMemory(t *testing.T) { testService(t, newMemEnv) }
@@ -524,12 +525,19 @@ func testLegacyAccounts(t *testing.T, mk func(*testing.T) *env) {
 		}
 		return created[u], nil
 	}
+	// An organization created after the cutoff is not granted to accounts that predate it.
+	late := OrgRef{ID: 9, Slug: "late", CreatedAt: cutoff.Add(time.Hour)}
+	early := OrgRef{ID: 1, Slug: "acme", CreatedAt: cutoff.Add(-time.Hour)}
+	e.svc.Orgs = func(context.Context) ([]OrgRef, error) { return []OrgRef{early, e.b, late}, nil }
 	old, young, flaky := e.newUser(), e.newUser(), e.newUser()
 	created[old], created[young], created[flaky] = cutoff.Add(-24*time.Hour), cutoff.Add(time.Hour), cutoff.Add(-time.Hour)
 
 	a := e.access(t, old)
 	if a.OrgRole(e.a.ID) != RoleOwner || a.OrgRole(e.b.ID) != RoleOwner {
 		t.Fatalf("an account from before roles becomes Owner everywhere: %+v", a.Memberships)
+	}
+	if a.IsMember(late.ID) {
+		t.Fatalf("an organization created after roles must not be granted by the legacy rule: %+v", a.Memberships)
 	}
 	if a := e.access(t, young); len(a.Memberships) != 0 {
 		t.Fatalf("an account created after: %+v", a.Memberships)
@@ -563,6 +571,28 @@ func testLegacyAccounts(t *testing.T, mk func(*testing.T) *env) {
 	e2.svc.AccountCreatedAt = func(context.Context, string) (time.Time, error) { return time.Time{}, nil }
 	if a := e2.access(t, e2.newUser()); len(a.Memberships) != 0 {
 		t.Fatal("no cutoff, no legacy accounts")
+	}
+}
+
+// An Administrator may not revoke a pending project-scoped Owner invitation, and Studio, which
+// checks the id the invitation is listed under, agrees with the server.
+func testScopedOwnerInvitations(t *testing.T, e *env) {
+	ctx := context.Background()
+	owner := e.owner(t, e.a)
+	admin := e.member(t, e.a, RoleAdministrator)
+	inv, _, err := e.svc.Invite(ctx, e.access(t, owner), e.a, InviteInput{Email: "scopedowner@example.test", RoleID: RoleOwner, Refs: []string{e.refs[0]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := e.access(t, admin)
+	if a.CanRole(e.a, ActDelete, ResUserInvites, inv.ListedRoleID()) {
+		t.Error("Studio's check (the listed id) lets an Administrator revoke a scoped Owner invitation")
+	}
+	if err := e.svc.RevokeInvitation(ctx, a, e.a, inv.ID); !errors.Is(err, ErrForbidden) {
+		t.Errorf("the server must refuse too: %v", err)
+	}
+	if err := e.svc.RevokeInvitation(ctx, e.access(t, owner), e.a, inv.ID); err != nil {
+		t.Errorf("an Owner revokes it: %v", err)
 	}
 }
 

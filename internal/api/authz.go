@@ -42,6 +42,10 @@ type need struct {
 	action, resource string
 	// resourceFn derives the resource from the request when it depends on the path.
 	resourceFn func(*http.Request) string
+	// own makes the middleware check the action as the caller's own saved item: the permissions
+	// on saved content are conditioned on the item's owner, which only the handler knows, so it
+	// repeats the check with the real item (content.go).
+	own bool
 }
 
 func (n need) res(r *http.Request) string {
@@ -52,6 +56,17 @@ func (n need) res(r *http.Request) string {
 }
 
 func chk(action, resource string) need { return need{action: action, resource: resource} }
+
+// chkOwn is chk for a write on saved content, which the handler checks again against the item.
+func chkOwn(action, resource string) need { return need{action: action, resource: resource, own: true} }
+
+// data is the condition data of the middleware's check.
+func (n need) data() map[string]any {
+	if n.own {
+		return members.OwnContentData("sql", "project", 1, 1)
+	}
+	return nil
+}
 
 var (
 	nAny   = need{kind: needAny}
@@ -233,8 +248,11 @@ var routeRules = []routeRule{
 	rule("R", "/v1/projects/{ref}/database/migrations/**", chk(members.ActSQLSelect, members.ResAny)),
 	rule("W", "/v1/projects/{ref}/database/migrations/**", chk(members.ActSQLAdminWrite, "migrations")),
 	rule("R", "/v1/projects/{ref}/types/typescript", chk(members.ActSQLAdminRead, "schemas")),
-	// The login role is read-only for a caller who cannot write SQL (handler).
-	rule("W", "/v1/projects/{ref}/cli/login-role", chk(members.ActSQLQuery, members.ResAny)),
+	// The login role is read-only for a caller who cannot write SQL (handler). Deleting the
+	// project's login roles drops those of every member, read-write ones included: it needs the
+	// right to change database roles.
+	rule("POST", "/v1/projects/{ref}/cli/login-role", chk(members.ActSQLQuery, members.ResAny)),
+	rule("DELETE", "/v1/projects/{ref}/cli/login-role", chk(members.ActSQLAdminWrite, members.ResAny)),
 	rule("POST", "/v1/projects/{ref}/database/webhooks/enable", chk(members.ActSQLAdminWrite, "triggers")),
 	rule("POST", "/platform/database/{ref}/hook-enable", chk(members.ActSQLAdminWrite, "triggers")),
 	rule("POST", "/platform/projects/{ref}/api/graphql", chk(members.ActSQLInsert, members.ResAny)),
@@ -269,15 +287,15 @@ var routeRules = []routeRule{
 	rule("R", "/v1/projects/{ref}/functions/**", chk(members.ActFunctionsRead, members.ResAny)),
 	rule("W", "/v1/projects/{ref}/functions/**", chk(members.ActFunctionsWrite, members.ResAny)),
 
-	// ---- projects: saved content (SQL snippets, reports, notebooks): every role keeps its own ----
+	// ---- projects: saved content (SQL snippets, reports, notebooks): a Developer or Read-only member may change only their own; the handlers check the item ----
 	rule("R", "/platform/projects/{ref}/content/**", chk(members.ActRead, UC)),
 	rule("POST", "/platform/projects/{ref}/content/**", chk(members.ActCreate, UC)),
-	rule("PUT,PATCH", "/platform/projects/{ref}/content/**", chk(members.ActUpdate, UC)),
-	rule("DELETE", "/platform/projects/{ref}/content/**", chk(members.ActDelete, UC)),
+	rule("PUT,PATCH", "/platform/projects/{ref}/content/**", chkOwn(members.ActUpdate, UC)),
+	rule("DELETE", "/platform/projects/{ref}/content/**", chkOwn(members.ActDelete, UC)),
 	rule("R", "/v2/projects/{ref}/notebooks/**", chk(members.ActRead, UC)),
 	rule("POST", "/v2/projects/{ref}/notebooks", chk(members.ActCreate, UC)),
-	rule("PATCH", "/v2/projects/{ref}/notebooks/{id}", chk(members.ActUpdate, UC)),
-	rule("DELETE", "/v2/projects/{ref}/notebooks/{id}", chk(members.ActDelete, UC)),
+	rule("PATCH", "/v2/projects/{ref}/notebooks/{id}", chkOwn(members.ActUpdate, UC)),
+	rule("DELETE", "/v2/projects/{ref}/notebooks/{id}", chkOwn(members.ActDelete, UC)),
 
 	// ---- projects: logs, branches ----
 	rule("POST", "/platform/projects/{ref}/analytics/endpoints/**", chk(members.ActAnalyticsRead, "logflare")),
@@ -370,7 +388,7 @@ func (s *Server) authorize(r *http.Request, key string, p *Principal) (context.C
 		if n.kind == needSelf || n.kind == needOwner {
 			n = chk(members.ActRead, P)
 		}
-		if res := n.res(r); !access.Can(ref, proj.Ref, n.action, res, nil) {
+		if res := n.res(r); !access.Can(ref, proj.Ref, n.action, res, n.data()) {
 			return ctx, forbidden(n.action, res)
 		}
 	case strings.Contains(tmpl, "organizations/{slug}"):
@@ -385,7 +403,7 @@ func (s *Server) authorize(r *http.Request, key string, p *Principal) (context.C
 		if n.kind == needSelf || n.kind == needOwner {
 			n = chk(members.ActRead, O)
 		}
-		if res := n.res(r); !access.Can(ref, "", n.action, res, nil) {
+		if res := n.res(r); !access.Can(ref, "", n.action, res, n.data()) {
 			return ctx, forbidden(n.action, res)
 		}
 	default:
@@ -445,11 +463,16 @@ func (s *Server) callerAccess(r *http.Request) (*members.Access, error) {
 // can reports whether the caller of r may perform action on resource in the project (ref
 // not empty) or organization.
 func (s *Server) can(r *http.Request, org *registry.Organization, ref, action, resource string) (bool, error) {
+	return s.canWith(r, org, ref, action, resource, nil)
+}
+
+// canWith is can for a permission conditioned on data (see members.OwnContentData).
+func (s *Server) canWith(r *http.Request, org *registry.Organization, ref, action, resource string, data map[string]any) (bool, error) {
 	a, err := s.callerAccess(r)
 	if err != nil {
 		return false, err
 	}
-	return a.Can(members.OrgRef{ID: org.ID, Slug: org.Slug}, ref, action, resource, nil), nil
+	return a.Can(members.OrgRef{ID: org.ID, Slug: org.Slug}, ref, action, resource, data), nil
 }
 
 // require is can that returns the refusal as an error.
@@ -472,6 +495,17 @@ func (s *Server) projectCan(r *http.Request, p *registry.Project, action, resour
 		return false, err
 	}
 	return s.can(r, org, p.Ref, action, resource)
+}
+
+// canContent reports whether the caller u may perform action (create, update or delete) on a
+// saved item or folder of typ, visibility and owner in project p. Owners and Administrators may
+// change anyone's shared items; every other role only its own.
+func (s *Server) canContent(r *http.Request, p *registry.Project, u *User, action, typ, visibility string, ownerID int64) (bool, error) {
+	org, err := s.orgOf(r.Context(), p)
+	if err != nil {
+		return false, err
+	}
+	return s.canWith(r, org, p.Ref, action, members.ResUserContent, members.OwnContentData(typ, visibility, ownerID, u.ID))
 }
 
 // canWriteSQL reports whether the caller may change data and schema; a caller who may only

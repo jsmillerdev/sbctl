@@ -149,6 +149,15 @@ func (s *Server) createProject(r *http.Request, in createInput) (*registry.Proje
 	if err := s.requireOrgMember(r, org); err != nil {
 		return nil, err
 	}
+	// The organization is named in the body, so the middleware could not hold the session to its
+	// MFA requirement.
+	access, err := s.callerAccess(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.gateOrg(ctx, principalFrom(ctx), access, orgRef(org)); err != nil {
+		return nil, err
+	}
 	if err := s.require(r, org, "", members.ActCreate, members.ResProjects); err != nil {
 		return nil, err
 	}

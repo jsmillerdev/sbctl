@@ -251,12 +251,12 @@ func (s *PGStore) DeleteFunctionSecrets(ctx context.Context, ref string, names [
 	return err
 }
 
-const contentCols = `id::text, ref, folder_id::text, owner_id, type, name, description, visibility, favorite, content::text, inserted_at, updated_at`
+const contentCols = `id::text, ref, folder_id::text, owner_id, coalesce(updated_by, 0), type, name, description, visibility, favorite, content::text, inserted_at, updated_at`
 
 func scanContent(row pgx.Row) (*Content, error) {
 	var c Content
 	var body string
-	if err := row.Scan(&c.ID, &c.Ref, &c.FolderID, &c.OwnerID, &c.Type, &c.Name, &c.Description, &c.Visibility, &c.Favorite, &body, &c.InsertedAt, &c.UpdatedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.Ref, &c.FolderID, &c.OwnerID, &c.UpdatedBy, &c.Type, &c.Name, &c.Description, &c.Visibility, &c.Favorite, &body, &c.InsertedAt, &c.UpdatedAt); err != nil {
 		return nil, notFound(err)
 	}
 	c.Body = []byte(body)
@@ -303,12 +303,12 @@ func (s *PGStore) UpsertContent(ctx context.Context, c *Content) error {
 		id = c.ID
 	}
 	got, err := scanContent(s.pool.QueryRow(ctx, `
-		insert into sbctl.api_content (id, ref, folder_id, owner_id, type, name, description, visibility, favorite, content)
-		values (coalesce($1::uuid, gen_random_uuid()), $2, $3::uuid, $4, $5, $6, $7, $8, $9, $10::jsonb)
-		on conflict (id) do update set folder_id = excluded.folder_id, name = excluded.name, description = excluded.description,
+		insert into sbctl.api_content (id, ref, folder_id, owner_id, type, name, description, visibility, favorite, content, updated_by)
+		values (coalesce($1::uuid, gen_random_uuid()), $2, $3::uuid, $4, $5, $6, $7, $8, $9, $10::jsonb, nullif($11::bigint, 0))
+		on conflict (id) do update set updated_by = excluded.updated_by, folder_id = excluded.folder_id, name = excluded.name, description = excluded.description,
 		  visibility = excluded.visibility, favorite = excluded.favorite, content = excluded.content, type = excluded.type, updated_at = now()
 		  where sbctl.api_content.ref = excluded.ref
-		returning `+contentCols, id, c.Ref, c.FolderID, c.OwnerID, c.Type, c.Name, c.Description, c.Visibility, c.Favorite, body))
+		returning `+contentCols, id, c.Ref, c.FolderID, c.OwnerID, c.Type, c.Name, c.Description, c.Visibility, c.Favorite, body, c.UpdatedBy))
 	if err != nil {
 		return err
 	}

@@ -200,6 +200,11 @@ func (s *Server) userProjects(ctx context.Context) ([]registry.Project, error) {
 		}
 	}
 	orgs := map[int64]members.OrgRef{}
+	// A dashboard session below aal2 does not see the projects of an organization that requires
+	// MFA, as it cannot open them.
+	pr := principalFrom(ctx)
+	checkMFA := pr != nil && pr.Via == "jwt" && pr.AAL != "aal2"
+	mfaOff := map[int64]bool{}
 	out := all[:0:0]
 	for _, p := range all {
 		if p.Ref == config.SystemRef {
@@ -217,6 +222,20 @@ func (s *Server) userProjects(ctx context.Context) ([]registry.Project, error) {
 			}
 			if !access.Can(ref, p.Ref, members.ActRead, members.ResProjects, nil) {
 				continue
+			}
+			if checkMFA {
+				off, seen := mfaOff[org.ID]
+				if !seen {
+					on, err := s.members.MFAEnforced(ctx, org.ID)
+					if err != nil {
+						return nil, err
+					}
+					off = !on
+					mfaOff[org.ID] = off
+				}
+				if !off {
+					continue
+				}
 			}
 		}
 		out = append(out, p)

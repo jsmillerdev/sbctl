@@ -169,12 +169,14 @@ Capabilities follow hosted's access-control documentation and the role descripti
 | Add, change, remove and invite Administrators, Developers and Read-only members | yes | yes | | |
 | Billing: read | yes | yes | yes | yes |
 | Billing: update; OAuth apps | yes | yes | | |
-| Create, rename, pause, restart, restore and delete projects; database password; backups restore | yes | yes | | |
+| Create, rename, pause, restore and delete projects; database password | yes | yes | | |
+| Restart a project; restore backups | yes | yes | yes | |
 | Project settings (Auth, PostgREST, Realtime, Storage, Postgres); API keys create, update, revoke; function secrets write; any unnamed write | yes | yes | | |
 | Read the service_role key, the JWT secret, the S3 credentials; temporary keys | yes | yes | yes | |
 | Write SQL, apply migrations, change schema (Studio and pg-meta), Auth users, Storage buckets and objects, deploy and delete functions, preview branches | yes | yes | yes | |
 | Read everything else: config, logs, advisors, users, buckets, functions, secrets (digests), `SELECT` SQL, types | yes | yes | yes | yes |
-| Saved SQL snippets, reports | yes | yes | yes | yes |
+| Saved SQL snippets: create; change or delete one's own (Owner and Administrator: anyone's shared ones) | yes | yes | yes | yes |
+| Saved reports: same, but Read-only may not create or change them | yes | yes | yes | |
 
 A **project-scoped role** is a base role held on a set of projects. The member sees only those projects (lists
 filter, the other projects answer 403) and has the base role's permissions on them; on the organization itself the
@@ -229,6 +231,21 @@ Developer and a user without a membership through the real handlers.
   invitation; turning it on needs an aal2 session, so an Owner cannot lock themselves out. `mfa_enabled` of a member
   is always false (GoTrue's factor list is not queried).
 
+- **Saved content belongs to its owner.** A Developer or Read-only member may create saved items, but change, rename or
+  delete only their own (folders included): the permission entries carry the condition `resource.owner_id ==
+  subject.id`, Studio passes both in its checks, and the content handlers repeat the check against the stored item
+  (the route table only checks the member's own item, `chkOwn`). Otherwise a member could rewrite a shared snippet
+  that an Owner later opens and runs as `postgres`. `last_updated_by` records the real editor (migration `0902`).
+- **Judgment calls against hosted's table.** Hosted's access-control page lists Developers under Auth Hooks
+  (create, delete); sbctl stores hooks in the Auth settings (`custom_config_gotrue`), which only Owners and
+  Administrators may change, so Developers cannot manage hooks. Developers hold the backup restore and Restart rows
+  as listed. The Read-only role's secret list (service key, JWT secret, S3 credentials) follows the same page.
+- **Residual exposure of Read-only SQL.** The write barrier is table privileges (`pg_read_all_data` only) plus
+  `default_transaction_read_only`, which a client can override with `set` or `begin read write`. A Read-only
+  member can therefore still call a `SECURITY DEFINER` function that `PUBLIC` may execute (Postgres's default for
+  new functions) and write through it. Hosted's read-only role has the same exposure. Revoke `EXECUTE` from `PUBLIC`
+  on such functions.
+
 ### Invitations
 
 `POST .../members/invitations` takes both body shapes of the spec (`emails` + `role_id` + `role_scoped_projects`,
@@ -247,7 +264,8 @@ How the invitee is told:
   the message: GoTrue's admin invite for an address without an account (the account is created confirmed and gets
   `sbctl_admin`; the link signs the person in and lands on the invitation), a sign-in link (`/magiclink`) that lands on
   the invitation for an existing account. If the relay fails the invitation stays and the caller gets the link.
-- **Without mail**, the answer carries the link and the server logs it at info level: the invitation page for an
+- **Without mail**, the answer carries the link and the server does not log it (the claim URL is a credential; the log
+  records the address, organization and invitation id only): the invitation page for an
   existing account, the claim page (token and address prefilled) for a new address, where the invitee picks a password
   and joins with the invited role in one step. `sbctl users invite <email> --role <role> [--org <slug>] [--project <ref>]...`
   prints that link on stdout.
@@ -308,7 +326,7 @@ file mode 0600. Changing it renders the system GoTrue's environment again; resta
   `pg_dump` runs with `row_security = off` and needs it on RLS tables),
   because the CLI runs `SET SESSION ROLE postgres` after connecting as any `cli_login_*`
   user (cli-go `internal/utils/connect.go`) and a read-only role cannot do that. Both expire
-  after an hour, are dropped by the next create or by `DELETE .../cli/login-role`, and are
+  after an hour, are dropped by the next create or by `DELETE .../cli/login-role` (which needs the right to change database roles: it drops every member's), and are
   created with a SCRAM verifier. The CLI's `db dump --role-only` skips only `cli_login_*`, so
   it lists `sbctl_read_only` and any live `sbctl_cli_ro_*` role; a read-only role cannot use
   the `cli_login_` name (see above), so this stays a known limit.
@@ -334,8 +352,8 @@ Migrations `internal/registry/migrations/0100_api.sql` and `0101_api_login_failu
 implementation behind one conformance suite (`store_test.go`). Members, roles and invitations are in
 `0900_members.sql` (range 0900-0999: `org_members`, `org_project_roles` and `org_project_role_refs`, `org_invitations`,
 `org_mfa`, `sso_default_roles`, and the legacy-account bookkeeping; `0901_claim_token_invitation.sql` binds invite claim
-tokens to their invitation). The legacy rule (an account from before roles becomes Owner of every organization
-on its first request) runs once per account: writing any membership for an account settles it, so removing the
+tokens to their invitation; `0902_content_updated_by.sql` records who edited a saved item last). The legacy rule (an account
+from before roles becomes Owner of every organization that existed when roles began, on its first request) runs once per account: writing any membership for an account settles it, so removing the
 membership later never hands the account back to the rule. Behind `internal/members` (Postgres and memory
 implementations, one service test suite that runs on both).
 

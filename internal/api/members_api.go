@@ -694,23 +694,36 @@ func (s *Server) deleteInvitation(w http.ResponseWriter, r *http.Request) error 
 	return nil
 }
 
+// invitationByToken answers what Studio's invitation page needs. Any signed-in user may ask, so
+// an unknown organization and an unknown token get the same answer, without the organization's
+// name: only the holder of a real token learns anything.
 func (s *Server) invitationByToken(w http.ResponseWriter, r *http.Request) error {
+	p := principalFrom(r.Context())
 	org, err := s.orgBySlug(r.Context(), r.PathValue("slug"))
+	var apiErr *Error
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+		org, err = nil, nil
+	}
 	if err != nil {
 		return err
 	}
-	p := principalFrom(r.Context())
-	st, err := s.members.InvitationState(r.Context(), orgRef(org), r.PathValue("token"), p.Email)
-	if err != nil {
-		return err
+	st := members.InviteState{TokenNotFound: true}
+	if org != nil {
+		if st, err = s.members.InvitationState(r.Context(), orgRef(org), r.PathValue("token"), p.Email); err != nil {
+			return err
+		}
 	}
 	if st.Accepted {
 		// Studio shows "This invite has already been accepted or declined" for this answer.
 		return errf(http.StatusUnauthorized, "Failed to retrieve organization invitation: it was already accepted")
 	}
+	name := ""
+	if !st.TokenNotFound {
+		name = org.Name
+	}
 	resp := base("GET /platform/organizations/{slug}/members/invitations/{token}")
 	setAll(resp, map[string]any{
-		"organization_name": org.Name, "token_does_not_exist": st.TokenNotFound, "sso_mismatch": false,
+		"organization_name": name, "token_does_not_exist": st.TokenNotFound, "sso_mismatch": false,
 		"email_match": st.EmailMatch, "authorized_user": st.EmailMatch && !st.Expired && !st.TokenNotFound, "expired_token": st.Expired,
 	})
 	if !st.TokenNotFound {

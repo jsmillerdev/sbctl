@@ -19,6 +19,9 @@ import (
 type OrgRef struct {
 	ID   int64
 	Slug string
+	// CreatedAt is set by Service.Orgs only: the legacy rule grants Owner on organizations that
+	// existed when roles were introduced, not on later ones (zero: unknown, counts as existing).
+	CreatedAt time.Time
 }
 
 // DefaultInvitationTTL is how long an invitation stays valid. Hosted keeps one for 24 hours;
@@ -168,11 +171,14 @@ func (s *Service) legacyOwner(ctx context.Context, userID string) error {
 				return err
 			}
 			for _, o := range orgs {
+				if !o.CreatedAt.IsZero() && !o.CreatedAt.Before(cutoff) {
+					continue // created after roles: its Owners decide who joins
+				}
 				if err := s.Store.PutMember(ctx, Member{OrgID: o.ID, UserID: userID, RoleID: RoleOwner}); err != nil {
 					return err
 				}
 			}
-			s.log().Info("members: account that predates roles became Owner of every organization", "user", userID)
+			s.log().Info("members: account that predates roles became Owner of every organization that predates roles", "user", userID)
 		}
 	}
 	return s.Store.MarkLegacyChecked(ctx, userID)

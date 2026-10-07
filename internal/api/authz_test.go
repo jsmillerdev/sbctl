@@ -132,7 +132,10 @@ func matrixCases() []routeCase {
 		rc("YYNNNN", "PATCH", pp, map[string]any{"name": "Renamed"}),
 		rd("YYNNNN", "DELETE", pp, nil),
 		rd("YYNNNN", "POST", pp+"/pause", nil),
-		rd("YYNNNN", "POST", pp+"/restart", nil),
+		rd("YYYNYN", "POST", pp+"/restart", nil), // hosted lists Restart for Developers
+		rd("YYYNYN", "POST", p+"/restart", nil),
+		rd("YYYNYN", "POST", pp+"/restart-services", map[string]any{}),
+		rd("YYYNYN", "POST", "/platform/database/"+testRef+"/backups/restore", map[string]any{}),
 		rd("YYNNNN", "POST", p+"/restore", nil),
 		rc("YYNNNN", "PATCH", p+"/config/auth", map[string]any{"site_url": "https://app.example.test"}),
 		rc("YYNNNN", "PATCH", pp+"/config/postgrest", map[string]any{"max_rows": 500}),
@@ -154,6 +157,8 @@ func matrixCases() []routeCase {
 		rc("YYYNYN", "POST", p+"/database/migrations", map[string]any{"query": "select 1", "name": "m"}),
 		rc("YYYYYN", "GET", p+"/types/typescript", nil),
 		rc("YYYYYN", "POST", p+"/cli/login-role", map[string]any{"read_only": false}),
+		// dropping the project's login roles drops every member's, so it needs the right to change roles
+		rc("YYYNYN", "DELETE", p+"/cli/login-role", nil),
 		rc("YYYNYN", "DELETE", p+"/functions/nope", nil),
 		rc("YYYNYN", "POST", p+"/branches", map[string]any{"branch_name": "x"}),
 		// project: users, storage
@@ -170,6 +175,10 @@ func matrixCases() []routeCase {
 		// project: saved content belongs to every member
 		rc("YYYYYN", "GET", pp+"/content", nil),
 		rc("YYYYYN", "PUT", pp+"/content", map[string]any{"name": "mine", "type": "sql", "visibility": "user", "content": map[string]any{"sql": "select 1"}}),
+		rc("YYYYYN", "POST", pp+"/content/folders", map[string]any{"name": "mine"}),
+		rc("YYYYYN", "PUT", pp+"/content", map[string]any{"name": "a report", "type": "log_sql", "visibility": "user", "content": map[string]any{}}),
+		// hosted: reports belong to Developers and up
+		rc("YYYNYN", "PUT", pp+"/content", map[string]any{"name": "a report", "type": "report", "visibility": "user", "content": map[string]any{}}),
 		rc("YYYYYN", "POST", pp+"/analytics/endpoints/logs.all", map[string]any{}),
 		// a project of the organization that the scoped member has no role on
 		rc("YYYYNN", "GET", "/platform/projects/"+secondRef, nil),

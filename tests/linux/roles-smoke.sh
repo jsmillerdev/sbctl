@@ -251,6 +251,18 @@ done
 # The login role the CLI uses for `db dump` is the read-only one, even when read-write is asked.
 LR=$(body "${PAT[ro]}" POST "$CFG/cli/login-role" '{"read_only":false}')
 [[ $(json_get 'd["role"].startswith("sbctl_cli_ro_")' <<<"$LR") == True ]] || fail "read-only member got a read-write login role: $LR"
+# Dropping the project's login roles would break every member's CLI session.
+expect 403 "${PAT[ro]}" DELETE "$CFG/cli/login-role"
+# Shared saved items belong to their owner: a Read-only member cannot rewrite the snippet an Owner shares.
+SNIP=44444444-4444-4444-8444-444444444444
+code=$(papi "${JWT[owner]}" PUT "/platform/projects/$REF/content" "{\"id\":\"$SNIP\",\"name\":\"shared\",\"type\":\"sql\",\"visibility\":\"project\",\"content\":{\"sql\":\"select 1\"}}")
+[[ $code == 200 ]] || fail "the Owner could not share a snippet: $code"
+code=$(papi "${JWT[ro]}" PUT "/platform/projects/$REF/content" "{\"id\":\"$SNIP\",\"name\":\"shared\",\"type\":\"sql\",\"visibility\":\"project\",\"content\":{\"sql\":\"drop table public.roles_t\"}}")
+[[ $code == 403 ]] || fail "a read-only member rewrote a shared snippet: $code"
+code=$(papi "${JWT[ro]}" DELETE "/platform/projects/$REF/content?ids=$SNIP")
+[[ $code == 403 ]] || fail "a read-only member deleted a shared snippet: $code"
+papi "${JWT[owner]}" GET "/platform/projects/$REF/content/item/$SNIP" >/dev/null
+[[ $(json_get 'd["content"]["sql"]' <"$WORK/last.json") == "select 1" ]] || fail "the shared snippet changed"
 # The same SQL through Studio's pg-meta route (a dashboard session).
 code=$(papi "${JWT[ro]}" POST "/platform/pg-meta/$REF/query" '{"query":"delete from public.roles_t"}')
 [[ $code =~ ^4 ]] || fail "read-only pg-meta delete answered $code"

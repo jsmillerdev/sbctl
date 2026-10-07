@@ -33,7 +33,7 @@ func NewMembers(reg registry.Registry, accounts *Accounts, now func() time.Time,
 		}
 		out := make([]members.OrgRef, len(orgs))
 		for i, o := range orgs {
-			out[i] = members.OrgRef{ID: o.ID, Slug: o.Slug}
+			out[i] = members.OrgRef{ID: o.ID, Slug: o.Slug, CreatedAt: o.CreatedAt}
 		}
 		return out, nil
 	}
@@ -150,9 +150,10 @@ func (a *Accounts) InviteToOrganization(ctx context.Context, actor *members.Acce
 		}
 	}
 	if !res.Emailed {
-		// The link is the credential-free half of the invitation (it works only for the signed-in
-		// holder of the address); log it so an administrator who lost it can find it again.
-		a.log().Info("organization invitation created; no mail was sent, give the invitee this link", "email", email, "org", org.Slug, "link", res.Link())
+		// The link is a credential (the claim URL creates the account with a password of the
+		// holder's choosing and accepts the invitation), so it goes to the caller only, never to
+		// the log. An administrator who lost it replaces the invitation to get a new one.
+		a.log().Info("organization invitation created; no mail was sent, the caller has the link", "email", email, "org", org.Slug, "invitation", inv.ID)
 	}
 	return res, nil
 }
