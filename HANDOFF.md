@@ -100,8 +100,12 @@ Each is independent given section 1. "Done" means merged with tests and a short 
 - Merge, reset, push as schema operations over migration history; expiry sweeper for `expires_at`.
 - Verify with the Supabase MCP server's branch tools and `supabase branches create|list|delete`; CI measures clone time and disk for a 1 GB parent on XFS and ext4.
 
+### J. Edge Functions (v1; starts when a build lane frees up)
+- Tenant-aware main service in `functions-main/` (Deno, runs inside the `edge-runtime` artifact): routes each request by the proxy's `X-Sbctl-Project-Ref` header to that project's functions directory, verifies the JWT with that project's secret unless the function opts out, injects the project's secrets and `SUPABASE_URL`/keys as env, and isolates workers per project.
+- `sb-edge-runtime` unit (fleet singleton, loopback 9000), `/functions/v1` route enabled in the proxy, the stored deployments from `/v1/projects/{ref}/functions*` (workstream B) materialized into `/var/lib/sbctl/projects/<ref>/functions/`, secrets endpoints wired.
+- Verify with `supabase functions deploy` and `supabase.functions.invoke` from supabase-js, JWT on and off, per-project secrets, two projects with same-named functions, and a function calling its project's database.
+
 ### Phase 2 workstreams (start once A to H are green)
-- Edge Functions: tenant-aware main service in `functions-main/`, `sb-edge-runtime` unit, `/functions/v1` route, `/v1/projects/{ref}/functions*` and secrets endpoints wired to the per-project functions directory.
 - Idle sleep in C and D.
 - imgproxy unit and Storage transform flag.
 - Members and RBAC, restore UI.
@@ -113,6 +117,7 @@ A (Studio + call list) ----> B (API stubs tightened)
 D (units/lifecycle) -------> E (fleet tenants)  -------> H (conformance)
 B + C + D + E + F ---------> G (installer)      -------> H
 B + D + F -----------------> I (branching)      -------> H
+B + C + E -----------------> J (Edge Functions) -------> H
 ```
 
 A, B, C, D, F can start simultaneously. E needs D's system cluster. G needs a working binary. H needs G.
