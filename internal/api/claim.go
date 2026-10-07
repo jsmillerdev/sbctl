@@ -72,6 +72,9 @@ type Accounts struct {
 	Users Store
 	// LiveRefs filters invited project refs to the projects that still exist.
 	LiveRefs func(ctx context.Context, refs []string) []string
+	// NoMail makes invitations skip the mail even when [mail] is configured (`users invite
+	// --no-mail`): the caller passes the link on.
+	NoMail bool
 }
 
 func (a *Accounts) now() time.Time {

@@ -127,7 +127,7 @@ func (a *Accounts) InviteToOrganization(ctx context.Context, actor *members.Acce
 	}
 	res := &InviteResult{Invitation: inv}
 	res.JoinURL = a.Config.DashboardURL() + "/join?" + url.Values{"token": {token}, "slug": {org.Slug}}.Encode()
-	mail := a.Config.Mail.Enabled()
+	mail := a.Config.Mail.Enabled() && !a.NoMail
 	if existing == nil && !mail {
 		// The link that creates the account; accepting is then automatic.
 		ct, _, err := a.IssueInvite(ctx, email, a.Members.InvitationTTL)

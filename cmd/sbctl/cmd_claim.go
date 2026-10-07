@@ -123,6 +123,7 @@ The dashboard's Team page and the Management API change the same roles.`,
 		inviteRole    string
 		inviteOrg     string
 		inviteProject []string
+		inviteNoMail  bool
 	)
 	invite := &cobra.Command{
 		Use:   "invite <email>",
@@ -145,6 +146,7 @@ printed either way). Without it sbctl sends no email: pass the link on yourself.
 			if inviteTTL > 0 {
 				acc.Members.InvitationTTL = inviteTTL
 			}
+			acc.NoMail = inviteNoMail
 			res, org, err := acc.InviteByEmail(cmd.Context(), args[0], inviteOrg, inviteRole, inviteProject)
 			if err != nil {
 				return err
@@ -170,6 +172,7 @@ printed either way). Without it sbctl sends no email: pass the link on yourself.
 	invite.Flags().StringVar(&inviteRole, "role", "developer", "owner, administrator, developer or read-only")
 	invite.Flags().StringVar(&inviteOrg, "org", "", "organization slug (not needed when there is one)")
 	invite.Flags().StringSliceVar(&inviteProject, "project", nil, "limit the role to these project refs")
+	invite.Flags().BoolVar(&inviteNoMail, "no-mail", false, "do not send the email even when [mail] is configured; print the link only")
 	invite.Flags().DurationVar(&inviteTTL, "ttl", members.DefaultInvitationTTL, "how long the invitation stays valid")
 
 	var asJSON bool
