@@ -147,7 +147,7 @@ has no other access, and whose password is sealed in the registry
 (`Engine.FleetCredentials`); fleet services connect with those, not as `supabase_admin`.
 `supabase_storage_admin` may also use `_storage`. It applies the registry migrations, records the system project and its
 sealed credentials, and starts GoTrue for Studio sign-in (`GOTRUE_SITE_URL` is
-`https://studio.<domain>`, sign-up closed). It is idempotent. If the first-time init fails
+`https://studio.<domain>`). It is idempotent. If the first-time init fails
 before the credentials are in the registry, it deletes what it created. If the process
 dies mid-init, the next run notices (the launcher's init-pending witness, or a cluster with
 no registry, no system credentials and no projects), removes that cluster and starts over;
@@ -155,6 +155,17 @@ a registry that holds projects but lost the system credentials is left alone and
 says how to recover.
 `Open` connects to an initialized node for everything else; `RegistryDSN` is the DSN other
 packages use to reach the registry.
+
+**Dashboard SSO in the system GoTrue.** With `PlaneOptions.SystemAuth` (set by `Open` and `InitSystem`;
+`systemAuth` in `system.go`) `sb-gotrue@system` gets `GOTRUE_SAML_ENABLED=true` and a signing key of its own (the
+system secret `saml_private_key`, created on first use), and its before-user-created hook points at the daemon's
+loopback listener (`sso.HookURL`, signed with a secret derived from the master key). `GOTRUE_DISABLE_SIGNUP` is `false`
+there: GoTrue creates an SSO user by signing them up, so it cannot stay on. Sign-up stays closed because the hook
+refuses everything the daemon does not vouch for (internal/api, Single sign-on), and GoTrue creates nobody while the
+daemon does not answer. Without `SystemAuth` (tests, a Secrets that cannot derive keys) the unit is rendered as before,
+with sign-up closed. `PostgresPlane.RefreshSystemAuth` renders the unit again and restarts it only when the files
+changed; the daemon calls it at every start, so a node that is upgraded, or whose `[mail]` changed, picks the new
+environment up without `sbctl system init`.
 
 Choices worth knowing:
 

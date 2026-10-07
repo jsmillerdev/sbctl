@@ -96,10 +96,20 @@ GoTrue reads `GOTRUE_SMS_TEMPLATE` from the environment only.
 `GOTRUE_EXTERNAL_<P>_REDIRECT_URI` set to `<API_EXTERNAL_URL>/callback`, which is GoTrue's default
 made explicit; the callback cannot be changed (hosted shows it read-only, too).
 
-**Stored, not rendered.** `saml_*` (workstream L owns the signing key GoTrue needs before SAML can
-be on), `nimbus_*` (hosted-only), and the response-only settings of the specs
-(`custom_oauth_max_providers`, `saml_allow_encrypted_assertions`, Studio's `MFA_ALLOW_LOW_AAL`,
-`AUDIT_LOG_DISABLE_POSTGRES`, ...). The GET answers them with defaults.
+**SAML.** `saml_enabled`, `saml_external_url` and `saml_allow_encrypted_assertions` render to
+`GOTRUE_SAML_ENABLED`, `GOTRUE_SAML_EXTERNAL_URL` and `GOTRUE_SAML_ALLOW_ENCRYPTED_ASSERTIONS`. GoTrue
+refuses to start with SAML on and no signing key, so `Manager.AuthEnv` adds the project's own key as
+`GOTRUE_SAML_PRIVATE_KEY` whenever `saml_enabled` renders as true (`Options.SigningKey`, which the
+lifecycle wires to `sso.EnsureSigningKey`: an RSA 2048 key, created on first use and sealed as the
+project secret `saml_private_key`, never shared between projects). The key is not a setting: a client
+cannot read or set it, and `rotate-keys` does not touch it. With SAML off nothing is rendered and no
+key exists; a project that never saved a SAML setting renders as before. The project's identity
+providers are managed through `/v1/projects/{ref}/config/auth/sso/providers` (`internal/api`, Single
+sign-on), which answers 404 until `saml_enabled` is on, as on hosted.
+
+**Stored, not rendered.** `nimbus_*` (hosted-only) and the response-only settings of the specs
+(`custom_oauth_max_providers`, Studio's `MFA_ALLOW_LOW_AAL`, `AUDIT_LOG_DISABLE_POSTGRES`, ...). The GET
+answers them with defaults.
 
 ### Secrets in responses
 

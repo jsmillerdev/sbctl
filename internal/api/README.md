@@ -51,6 +51,7 @@ registered in a second mux of a chain, tried in order.
 | Identity | `/v1/profile`, `/platform/profile` (get, post, patch), `profile/permissions` and `permissions/v2` (computed from the caller's roles), `profile/access-tokens` (list, create, get, delete), `/platform/cli/login` and `/platform/cli/login/{session_id}` (device login) |
 | Organizations | `/v1/organizations` list, get, `entitlements`, `members`; `/platform/organizations` list, create, get, patch, `entitlements` (every feature of the spec's key enum granted), `billing/subscription` (plan stub), `projects` |
 | Members and roles | `/platform/organizations/{slug}/members` (list; `PATCH` and `DELETE .../{gotrue_id}`; `PUT` and `DELETE .../{gotrue_id}/roles/{role_id}`), `members/invitations` (list, create, delete by id, get and accept by token), `members/mfa/enforcement`, `roles`, `members/reached-free-project-limit`; `/platform/projects/{ref}/members`; `/v2/organizations/{slug}/members`, `roles`, `PATCH .../members/{user_id}/roles`, `POST` and `DELETE .../members/invitations`. See Members, roles and permissions below |
+| Single sign-on | `/platform/organizations/{slug}/sso` (get, post, put, delete: Studio's organization page, one provider), sbctl's `.../sso/providers` (list, create, get, update, delete), `.../sso/pending` (list; `POST` approves and `DELETE` denies `.../pending/{user_id}`); `/v1/projects/{ref}/config/auth/sso/providers` (create, list, get, update, delete: a project's own identity providers, proxied to its GoTrue). See Single sign-on below |
 | Studio data | `/platform/projects/{ref}/content` (saved SQL snippets, reports; upsert, list, get, count, delete) and `content/folders` |
 | pg-meta | every `/platform/pg-meta/{ref}/*` operation of the spec, proxied to sb-pgmeta |
 | Auth admin | `/platform/auth/{ref}/users` (list, create, patch, delete), `invite`, `magiclink`, `otp`, `recover`, proxied to the project's GoTrue admin API with its `service_role` key |
@@ -123,11 +124,14 @@ the default branch only and a create answers 400. Organization entitlements alre
 **Admin gate.** A valid session is not enough: the user needs `app_metadata.sbctl_admin = true`
 (`api.AdminClaim`; GoTrue lets users edit `user_metadata` but not `app_metadata`) or an email in
 `[api] admin_emails`, otherwise the answer is `403`. sbctl sets the claim on every dashboard user
-it creates, and `sb-gotrue@system` **must run with `GOTRUE_DISABLE_SIGNUP=true`** so nobody else
-can obtain a session at all; the gate is defense in depth if that setting is ever lost.
+it creates, and `sb-gotrue@system` creates no other user: its sign-up is open to GoTrue (an SSO
+user is created by signing up) and closed by the **before-user-created hook**, which the daemon
+answers and which allows registered SSO providers and invited addresses only (Single sign-on,
+below); the gate is defense in depth if that is ever lost. A user whose account came from SSO has
+no claim and is admitted by the SSO rules instead.
 The email allowlist trusts the JWT's `email` claim: GoTrue's access token carries no claim
-that proves the address was confirmed, so with open signup and autoconfirm an unregistered
-allowlisted address could be claimed. Keep signup disabled; prefer the `sbctl_admin` claim.
+that proves the address was confirmed, so a registered SSO provider that vouches for an
+allowlisted address would be believed. Prefer the `sbctl_admin` claim and roles.
 A PAT is not re-checked against the user's admin status (the claim above) on each use: delete a
 user's tokens when you remove their account. It is checked against its owner's roles at every request
 (Members, roles and permissions, below), so removing the owner from an organization takes the access away at once.
@@ -194,7 +198,8 @@ Capabilities follow hosted's access-control documentation and the role descripti
 
 | | Owner | Administrator | Developer | Read-only |
 |---|---|---|---|---|
-| Organization settings, delete the organization, project transfer, SSO, MFA requirement | yes | | | |
+| Organization settings, delete the organization, project transfer, MFA requirement | yes | | | |
+| Single sign-on: identity providers, their domains and default role, people waiting for approval (a default role is granted only if the caller may add members with it, so an Administrator cannot make Owners through it) | yes | yes | | |
 | Add or remove Owners (also project-scoped Owner roles) | yes | | | |
 | Add, change, remove and invite Administrators, Developers and Read-only members | yes | yes | | |
 | Billing: read | yes | yes | yes | yes |
@@ -316,13 +321,80 @@ How the invitee is told:
   became Owner of every organization on its first request (the account's creation time comes from `sb-gotrue@system`;
   a failed lookup denies and retries after a minute; each account is looked at once, so removing it from an
   organization sticks). Accounts created afterwards have no access until they are invited, claimed or granted a role.
-- `members.Service.GrantSSODefault(ctx, userID, email)` is what the SSO workstream calls for a first-time SSO sign-in:
-  the email domain's rule (`sbctl users default-role set <domain> <role> [--org]`, table `sbctl.sso_default_roles`)
-  makes the user a member of its organization with its role. A domain without a rule grants nothing; an existing
-  membership is never changed.
+- `members.Service.GrantSSODefault(ctx, userID, email)` is what the SSO rules call for a first-time SSO sign-in
+  (`DashboardSSO.Admit`): the email domain's rule (`sbctl sso add --domain ... --default-role ...`, or by hand
+  `sbctl users default-role set <domain> <role> [--org]`, table `sbctl.sso_default_roles`) makes the user a member of its
+  organization with its role, provided a registered identity provider that vouches for the domain is the one the user
+  signed in through. A domain without a rule grants nothing; an existing membership is never changed.
 - `sbctl users invite|list|role|remove|default-role` (see `sbctl users --help`): `role` sets an organization-wide role
   as the operator and also adds a user to an organization, which is how an organization without an Owner gets one
   back; `remove` refuses to delete the only Owner of an organization unless `--force`.
+
+## Single sign-on
+
+Dashboard sign-in with SAML 2.0 (Okta, Entra ID, Google Workspace, anything that speaks it), and the same for the end
+users of a project. Implemented by `sso_dashboard.go` (the service, shared with `sbctl sso`), `sso_routes.go` (the
+routes), `sso_hook.go` (the sign-up hook) and `internal/sso` (the GoTrue admin client, metadata checks, signing keys,
+the hook's signature). `internal/sso/README.md` has the building blocks.
+
+**Dashboard.** `sb-gotrue@system` runs with SAML on and a signing key of its own (RSA 2048, sealed as the system secret
+`saml_private_key`). An Owner or Administrator registers a provider (`sbctl sso add`, `POST .../sso/providers`, or
+Studio's organization SSO page): GoTrue gets the provider and its email domains through its admin SSO API, sbctl
+records the organization, the domains and the role a first-time user gets (`--default-role`; none means the user waits
+for approval), and the default-role rule of each domain is set. The identity provider is configured with
+`https://api.<domain>/auth/v1/sso/saml/acs` (assertion consumer service) and
+`.../sso/saml/metadata` (entity id; `?download=true` gives a long-lived metadata file). Studio's sign-in page asks for an
+email address, GoTrue's `POST /auth/v1/sso` finds the provider by the domain, and the browser goes through the identity
+provider and back to `/auth/v1/sso/saml/acs`, which the proxy's dashboard-auth route forwards to `sb-gotrue@system`
+like every other `/auth/v1` path.
+
+- **Who gets in** (`DashboardSSO.Admit`, on every request of an SSO session): the session's
+  `app_metadata.provider` is `sso:<provider id>`; the provider must be registered with sbctl (a provider created in
+  GoTrue behind sbctl's back opens nothing, and a removed one ends its sessions within ten seconds); the user must belong
+  to an organization. On the user's first request the email's domain decides: a registered provider that vouches for
+  the domain, and a default-role rule of the provider's organization for it, make the user a member with that role.
+  Any other user is recorded as pending and refused on every `/platform` and `/v1` route with `403` until an
+  administrator approves them (`sbctl sso approve`, `POST .../sso/pending/{user_id}` with a role) or invites or promotes
+  them the usual way; denying (`sbctl sso deny`, `DELETE`) deletes the account. The default role is for the first
+  request only: a user who later loses every membership waits again and is not given it again. A second provider
+  cannot give its users another provider's default role by asserting that provider's domains. A personal access token
+  that an SSO user made carries the user's roles like any other; removing a provider revokes the tokens of its users.
+- **Sign-up stays closed.** GoTrue's own switch (`GOTRUE_DISABLE_SIGNUP`) also stops an SSO user's first sign-in, so
+  it is off on `sb-gotrue@system` and its before-user-created hook is on: GoTrue asks `POST
+  /internal/hooks/before-user-created` on the loopback admin listener (signed with a secret derived from the master key
+  as Standard Webhooks specify; a request that came through the edge proxy or whose signature is wrong is refused) before
+  it creates any user, and the daemon allows exactly a user of a registered SSO provider and an address that an
+  administrator invited by mail (the invite carries a one-time `sbctl_grant` in its metadata that the daemon issued for
+  that address and spends in its answer; a person who merely knows the address cannot sign up with it first).
+  Everything else is refused (`403`, "Sign-up is closed on this dashboard"), and while the daemon does not answer GoTrue
+  creates nobody. Users `sbctl` creates itself (the claim page, `users invite` without mail) go through GoTrue's admin
+  API, which has no hook.
+- **Studio's button.** Studio shows "Continue with SSO" only while the feature `dashboard_auth:sign_in_with_sso` is
+  enabled, which its build disables by default (`NEXT_PUBLIC_DISABLED_FEATURES`, patch 0002, no new patch). While the
+  dashboard has a provider, `fleet` starts Studio with that list minus the SSO entry; the API re-renders and restarts
+  Studio's unit (`Deps.StudioRefresh`, in the background) when the first provider appears and when the last one goes,
+  and `sbctl sso add|remove` does the same before it returns.
+- **Studio's organization page** (`/platform/organizations/{slug}/sso`) is served for real: one provider per
+  organization, `join_org_on_signup_enabled` and `join_org_on_signup_role` are the default role, `enabled` is GoTrue's
+  disabled flag; before one exists the page gets the 404 it reads as "not set up". Several providers per organization
+  and the pending list are sbctl's own routes.
+
+**Projects.** `/v1/projects/{ref}/config/auth/sso/providers` (create, list, get, update, delete) is a proxy to the
+project's GoTrue admin SSO API with the exact shapes of the spec (the list carries each provider's metadata document,
+which GoTrue's own list leaves out). As on hosted, it answers `404` ("SAML 2.0 support is not enabled for this
+project") until `saml_enabled` is on in the project's Auth settings; turning it on renders `GOTRUE_SAML_ENABLED` and
+the project's own signing key (sealed project secret `saml_private_key`, created on first use, never shared, not a
+setting and not rotated by `rotate-keys`) into its GoTrue, which restarts. Writes need the right to change Auth
+settings (Administrator, Owner), reads the right to see the project. `saml_external_url` and
+`saml_allow_encrypted_assertions` are settings too. `supabase sso add|list|show|update|remove --project-ref` work with
+`--profile` unchanged (Supabase CLI 2.119.0, `tests/linux/sso-smoke.sh`).
+
+**Limits.** Dashboard providers take SAML metadata as an https address (GoTrue fetches and refreshes it) or as a document; `sbctl sso add` also
+fetches a plain-http address on this machine (a development provider) and passes the document, which GoTrue does not
+refresh. There is no OIDC provider and no SCIM. A cloned or restored project starts with SAML off like every other
+setting. A user with a pending invitation who signs in through a provider without a membership is refused until
+the invitation is dealt with another way: `/join` is behind the same gate. Dashboard OAuth sign-in (Google, GitHub,
+Azure) behind the same allowlist is not built.
 
 ## Configuration (`[api]` in config.toml, or `SBCTL_API_*`)
 
@@ -380,8 +452,9 @@ file mode 0600. Changing it renders the system GoTrue's environment again; resta
   allocated ref (never a 504, which would invite a retry that creates a second project;
   clients poll `GET .../projects/{ref}`, which answers 404 until the row exists). Better
   for clients: have `Manager.Create` insert the registry row before it does anything slow.
-- **`sb-gotrue@system`** with `GOTRUE_DISABLE_SIGNUP=true`, and `app_metadata.sbctl_admin = true`
-  on each dashboard user sbctl creates (see Authentication).
+- **`sb-gotrue@system`** with SAML on, its before-user-created hook pointing at this daemon's loopback listener
+  (`lifecycle.SystemAuth`, rendered by `sbctl system init` and, at every daemon start, by `RefreshSystemAuth`), and
+  `app_metadata.sbctl_admin = true` on each password account sbctl creates (see Authentication).
 
 ## State
 
@@ -395,6 +468,11 @@ tokens to their invitation; `0902_content_updated_by.sql` records who edited a s
 from before roles becomes Owner of every organization that existed when roles began, on its first request) runs once per account: writing any membership for an account settles it, so removing the
 membership later never hands the account back to the rule. Behind `internal/members` (Postgres and memory
 implementations, one service test suite that runs on both).
+
+Single sign-on is in `1000_sso.sql` (range 1000-1099): `sso_providers` (the providers sbctl registered in
+`sb-gotrue@system`: organization, domains, default role), `sso_users` (who signed in through one, `pending` or `active`)
+and `signup_grants` (one-time grants that let GoTrue create an invited address). Behind `SSOStore` (`sso_store.go`, a
+Postgres and a memory implementation, one conformance suite) and `ClaimStore`.
 
 ## Generated types
 
@@ -431,6 +509,16 @@ SBCTL_API_INTEGRATION=1 \
 SBCTL_PG_BIN=$HOME/.cache/sbctl/unpacked/postgres-17.11.0.004-r1-darwin-arm64/bin \
 SBCTL_PGMETA_BIN=$HOME/.cache/sbctl/unpacked/pgmeta-v0.100.0-r0-darwin-arm64/bin/pgmeta \
 scripts/guard.sh -- go test ./internal/api -run Integration -v
+```
+
+The dashboard's single sign-on end to end on this machine (a real `sb-gotrue@system` with SAML and the sign-up hook
+pointing at an in-process API, a real project, and `testdata/saml-idp.py`, a SAML identity provider for tests that
+needs `pip install signxml`; about 25 seconds):
+
+```sh
+python3 -m venv /tmp/idp-venv && /tmp/idp-venv/bin/pip install signxml
+SBCTL_SSO_INTEGRATION=1 SBCTL_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked SBCTL_SSO_PYTHON=/tmp/idp-venv/bin/python \
+  SBCTL_API_IT_PORT_BASE=44100 scripts/guard.sh -- go test ./internal/api -run IntegrationDashboardSSO -v
 ```
 
 Real clients against the integration stack (Postgres on `127.0.0.1:32100-32999`, or from `SBCTL_API_IT_PORT_BASE`, nothing on
