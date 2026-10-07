@@ -97,11 +97,12 @@ sb "$WORK/work-b" functions deploy open --no-verify-jwt --project-ref "$REF_B" >
 log "setting secrets with the CLI"
 sb "$WORK/work-a" secrets set MY_SECRET=secret-for-a --project-ref "$REF_A" >/dev/null || fail "secrets set A"
 sb "$WORK/work-b" secrets set MY_SECRET=secret-for-b --project-ref "$REF_B" >/dev/null || fail "secrets set B"
-names=$(sb "$WORK/work-a" secrets list --project-ref "$REF_A" 2>/dev/null) || fail "secrets list"
+names=$(sb "$WORK/work-a" secrets list --project-ref "$REF_A" --output-format json 2>/dev/null) || fail "secrets list"
 grep -q MY_SECRET <<<"$names" || fail "secrets list does not show MY_SECRET: $names"
 
 log "functions list (CLI) and sbctl functions list"
-sb "$WORK/work-a" functions list --project-ref "$REF_A" | grep -q '"slug":"hello"' || fail "supabase functions list lacks hello"
+# Text on a terminal or in CI, JSON for agents: ask for JSON, the one format a script can read.
+sb "$WORK/work-a" functions list --project-ref "$REF_A" --output-format json | grep -q '"slug":"hello"' || fail "supabase functions list lacks hello"
 live=$(sbctl functions list "$REF_A" --json | jget 'sum(1 for r in d if r["live"])')
 [[ $live -eq 8 ]] || fail "sbctl functions list: $live of 8 functions live"
 
