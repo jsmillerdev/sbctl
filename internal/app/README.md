@@ -48,3 +48,17 @@ The gated test runs the daemon on real artifacts under the exec backend: system 
 created and stopped before the daemon starts, the daemon bringing it back at boot, requests
 through the proxy (project API, bad key, Management API, dashboard GoTrue) and the admin
 listener, and a graceful stop. It starts two PostgreSQL clusters, GoTrue and PostgREST.
+
+```
+SBCTL_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked SBCTL_SETTINGS_E2E=1 \
+  go test -run TestSettingsIntegration -v ./internal/app/       # about 25 s, under 1 GB
+```
+
+`TestSettingsIntegration` (ports 42000-42999, exec backend) runs the daemon with the system
+cluster, one micro project, Supavisor and Storage, saves settings through the Management API
+with a PAT and watches the services change: GoTrue's redirect allow list, sign-up toggle, SMTP and
+a custom mail template reaching a mail sink; PostgREST serving a newly exposed schema; Storage's
+upload limit; immediate refusal of a revoked key and of disabled legacy keys; the database
+password (direct and through the pooler); Postgres settings with `ALTER SYSTEM`, and their reset.
+With `SBCTL_SETTINGS_E2E_HOLD=<file>` it leaves the stack up and writes the connection details
+there, for the real Supabase CLI (`supabase --profile=... config push`); delete the file to stop.

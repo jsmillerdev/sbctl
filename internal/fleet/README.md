@@ -78,6 +78,21 @@ All three are idempotent and keep a fingerprint (a sealed hash of the request) p
 - **Realtime**: `POST /api/tenants` with `{"tenant": {external_id, name, jwt_secret, postgres_cdc_default, extensions:[{type:"postgres_cdc_rls", tenant_external_id, settings:{region, db_host, db_port (a string), db_name, db_user, db_password, slot_name, publication, poll_*, ssl_enforced}}]}}`, bearer JWT over `API_JWT_SECRET`. Realtime requires a superuser in the settings (upstream ENVS.md), so it connects as `supabase_admin`. Creating a tenant runs Realtime's tenant migrations in the project database.
 - **Storage**: `PUT /tenants/<ref>` on the admin port with the `apikey` header and `{anonKey, serviceKey, jwtSecret, databaseUrl, maxConnections, fileSizeLimit, features}`. The HANDOFF names `POST`, which inserts and fails on a second call; `PUT` is upstream's upsert. The database URL uses `supabase_storage_admin` as upstream's compose does; its password comes from `TenantSpec.StorageAdminPassword` or, when empty (what `lifecycle.Engine.tenantSpec` passes today), from the project's sealed secrets. Creating a tenant runs Storage's migrations in the project database.
 
+## Per-project settings and password changes
+
+`TenantSpec.Storage` and `TenantSpec.Realtime` carry the project's saved settings
+(`projectconfig.StorageSettings`, `RealtimeSettings`): the Storage tenant body gets `fileSizeLimit`
+and the feature flags (`icebergCatalog` and `vectorBuckets` stay off at the tenant: their services
+are not run), the Realtime tenant gets its limits and `private_only`/`suspend`/`presence_enabled`
+at the top level and `db_pool` and `postgres_changes_pool` in the `postgres_cdc_rls` extension
+settings. They are in the fingerprint, so an unchanged tenant is not touched and a saved change
+sends one update. `LoadTenantSpec` (the CLI's `fleet ensure-tenant`) reads them from the
+registry, so the CLI never sends defaults over saved settings.
+
+`Fleet.RefreshTenant(ref)` calls `Refresher.RefreshTenant` on the tenants that cache logins:
+Supavisor's `GET /api/tenants/<ref>/terminate` ("Stop tenant's pools and clear cache") makes the
+new password of a role take effect at once through the pooler. Lazy tenants forward it.
+
 ## Verified
 
 On darwin-arm64 with the slim-services artifacts under the exec backend, through `internal/proxy` and supabase-js 2.117.2 against `<ref>.api.127.0.0.1.sslip.io` (see `TestIntegrationFleetTenants` for what is automated):

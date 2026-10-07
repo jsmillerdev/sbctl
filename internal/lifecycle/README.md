@@ -85,6 +85,30 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
   configured `region` (default `us-east-1`) is stored: Studio and the CLI resolve the project
   region against a list of real regions, and an unknown one breaks the project list.
 
+## Saved settings
+
+`Settings` (implemented by `projectconfig.Manager`, built by `Open` and `InitSystem` as
+`Node.Settings`) is read whenever units and tenants are rendered: GoTrue's and PostgREST's
+environment (saved values laid over the base environment; an empty value removes a variable),
+the cluster's server arguments (only the settings that overlap the class's sizing; see
+`SplitPostgresSettings`), and the Storage and Realtime `TenantSpec`. A project that never saved a
+setting renders exactly as before. A settings source that cannot be read fails the render rather
+than falling back to defaults. The system project never reads user settings.
+
+`Engine.ApplyConfig(ref, service, opts)` (the `Reconfigurer` capability the Management API uses)
+makes a saved change take effect and touches only what the service owns: `ReconfigureService`
+re-renders both API unit files but restarts only GoTrue or PostgREST and waits for it to answer;
+Realtime and Storage get `EnsureTenant`; Postgres goes through `ApplyPostgresSettings`
+(`ALTER SYSTEM` for the settings not on the command line, a reset for those no longer saved,
+`pg_reload_conf`, and a restart when asked and needed; `pg_settings.pending_restart` and a diff of
+the command-line settings against the running ones say whether one is pending). A paused project
+is not touched, a project in a transitional status is refused (`ErrInvalidState`).
+
+`Engine.SetDatabasePassword(ref, password)` sets the `postgres` role's password over the unix
+socket as a SCRAM verifier, seals it, and calls `fleet.RefreshTenant` (Supavisor's terminate,
+which clears its pools and cached credentials); it restores the old password if the registry write
+fails and only warns when the pooler cannot be reached.
+
 ## System project
 
 `InitSystem` is the same code path with ref `system` on `[ports] system_postgres` and
