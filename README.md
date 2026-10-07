@@ -12,6 +12,13 @@
 </p>
 
 <p align="center">
+  <img alt="license: Apache-2.0" src="brand/readme/badge-license.svg">
+  <img alt="runs on: Ubuntu 24.04+ | Debian 12+" src="brand/readme/badge-platform.svg">
+  <img alt="arch: amd64 | arm64" src="brand/readme/badge-arch.svg">
+  <img alt="runs as: systemd units, no Docker" src="brand/readme/badge-docker.svg">
+</p>
+
+<p align="center">
   <a href="#get-started">Get started</a> ·
   <a href="docs/guide.md">Guide</a> ·
   <a href="deploy/README.md">Deploy guide</a>
@@ -19,7 +26,7 @@
 
 ---
 
-## Why Supavise
+## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>Why Supavise
 
 Self-hosted Supabase runs one project per Docker stack, with a single-project dashboard. Supavise gives you the multi-project platform instead.
 
@@ -32,12 +39,17 @@ Self-hosted Supabase runs one project per Docker stack, with a single-project da
   <br><sub>The real Supabase Studio, running on Supavise.</sub>
 </p>
 
-## Get started
+## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>Get started
 
 > [!NOTE]
 > The first release isn't published yet. The download links below work once it is.
 
-**On your own server.** You need Ubuntu 24.04+ or Debian 12+ with 4–8 GB of memory and ports 80, 443, 5432 and 6543 open. A domain is optional: without one, the server gets a free `<ip>.sslip.io` address for trying things out.
+<p align="center">
+  <a href="#your-server"><picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/path-server-dark.svg"><img alt="Your server: Ubuntu 24.04+ or Debian 12+, 4–8 GB of memory. Run one install command." src="brand/readme/path-server-light.svg" width="49%"></picture></a>
+  <a href="#on-aws"><picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/path-aws-dark.svg"><img alt="AWS: a CloudFormation template with one field. Create a stack from one file." src="brand/readme/path-aws-light.svg" width="49%"></picture></a>
+</p>
+
+<a name="your-server"></a>**On your own server.** You need Ubuntu 24.04+ or Debian 12+ with 4–8 GB of memory and ports 80, 443, 5432 and 6543 open. A domain is optional: without one, the server gets a free `<ip>.sslip.io` address for trying things out.
 
 ```bash
 curl -fsSL https://github.com/jsmillerdev/supavise/releases/latest/download/install.sh | sudo bash -s -- --email you@example.com --firewall ufw
@@ -45,7 +57,7 @@ curl -fsSL https://github.com/jsmillerdev/supavise/releases/latest/download/inst
 
 The installer turns on the server's firewall with SSH and those four ports open, then prints a claim URL and a one-time token. To use your own domain, see [Install on a server](deploy/README.md#install-on-a-server).
 
-**On AWS:**
+<a name="on-aws"></a>**On AWS:**
 
 1. Download `supavise.yaml` from the [latest release](https://github.com/jsmillerdev/supavise/releases/latest).
 2. In CloudFormation, create a stack from the file, enter your email address, tick the IAM acknowledgment and create the stack.
@@ -53,23 +65,15 @@ The installer turns on the server's firewall with SSH and those four ports open,
 
 Either way, open the claim URL, enter the token to create your admin account, and sign in. Then follow the [guide](docs/guide.md) to connect an app, use the CLI and create branches.
 
-## What's included
+## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>What's included
 
-| | |
-|---|---|
-| **Dashboard** | The real Supabase Studio, with multiple organizations and projects |
-| **Every project** | Postgres, Auth, REST, GraphQL, Realtime, Storage and Edge Functions |
-| **Branching** | Schema-only branches or full copies of your data, for previews and agents |
-| **Backups** | Continuous backups with point-in-time restore |
-| **Teams** | Roles, invitations, SAML single sign-on and MFA requirements |
-| **API keys** | Publishable and secret keys, legacy JWT keys and key rotation |
-| **Operations** | Automatic HTTPS, signed self-updates and a one-field AWS template |
+<picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/features-dark.svg"><img alt="What's included. Dashboard: the real Supabase Studio, with multiple organizations and projects. Every project: Postgres, Auth, REST, GraphQL, Realtime, Storage and Edge Functions. Branching: schema-only branches or full copies of your data, for previews and agents. Backups: continuous backups with point-in-time restore. Teams: roles, invitations, SAML single sign-on and MFA requirements. API keys: publishable and secret keys, legacy JWT keys and key rotation. Operations: automatic HTTPS and signed self-updates. AWS: a one-field CloudFormation template." src="brand/readme/features-light.svg" width="100%"></picture>
 
 <p align="center">
   <img alt="Supabase Studio's table editor on Supavise showing a products table with 12 rows" src="docs/images/screenshots/table-editor-dark.png" width="880">
 </p>
 
-## How it works
+## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>How it works
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="brand/readme/architecture-dark.svg">
@@ -78,6 +82,8 @@ Either way, open the claim URL, enter the token to create your admin account, an
 
 One Go program installs Supabase's open-source services and adds what self-hosting lacks: HTTPS, multiple projects, the API that the dashboard and CLI need, and backups. See [how Supavise compares](docs/guide.md#how-supavise-compares) to self-hosted and hosted Supabase, or read the [design](DESIGN.md).
 
-## License
+## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>License
 
 [Apache-2.0](LICENSE). Supavise is not affiliated with or endorsed by Supabase Inc. It runs Supabase's open-source services.
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/footer-dark.svg"><img alt="Supavise: Supabase orgs and projects, self-hosted. Not affiliated with Supabase Inc." src="brand/readme/footer-light.svg" width="100%"></picture>

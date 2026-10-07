@@ -29,6 +29,11 @@ brand/
   social/apple-touch-icon               180x180 iOS home-screen icon, .svg + .png
   readme/banner-{dark,light}.svg        1280x320 README hero: lockup, tagline, small print
   readme/architecture-{dark,light}.svg  1200x590 README diagram: clients, one node, backups
+  readme/features-{dark,light}.svg      1200x498 README "What's included" grid: 8 cards, 2 columns
+  readme/path-{server,aws}-{dark,light}.svg  580x148 README "Get started" path cards, linked to anchors
+  readme/glyph-{dark,light}.svg         the mark at heading size, with its right gap built in
+  readme/footer-{dark,light}.svg        1280x176 README footer: lockup, tagline, small print
+  readme/badge-{license,platform,arch,docker}.svg  22px README badges: white on ink, ink on teal
 ```
 
 PNGs are rendered from the SVGs with macOS `sips`:
@@ -108,14 +113,14 @@ Embed from the repository root README:
 </picture>
 ```
 
-Badges are static shields.io URLs, so no new service and nothing to keep in sync. The message side is neutral dark gray, not teal, because shields prints white text there and white on `#00e0c4` is about 1.3:1. A name that is a shields reserved character is escaped (`--` is a dash, `%7C` is a pipe).
+Round two of README graphics, all drawn by `build.py` and all SVG with no external references:
 
-```markdown
-![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-262626?labelColor=0b0b0b)
-![Runs as systemd units, no Docker](https://img.shields.io/badge/runs_as-systemd_units,_no_Docker-262626?labelColor=0b0b0b)
-![Ubuntu 24.04+ or Debian 12+](https://img.shields.io/badge/runs_on-Ubuntu_24.04%2B_%7C_Debian_12%2B-262626?labelColor=0b0b0b)
-![amd64 and arm64](https://img.shields.io/badge/arch-amd64_%7C_arm64-262626?labelColor=0b0b0b)
-```
+- Features grid: eight cards (icon, title, one or two lines) on a 2 by 4 grid. The ground is transparent so the cards sit on GitHub's own page color; card fill and border are the neutral grays, icons are teal (dark) or ink (light). Icons share one 48-unit grid, one 4-unit stroke, butt caps and mitered joins (no rounding, like the mark), and at most one filled accent each. Add or change a card in `FEATURES` and `ICONS`. The README `alt` carries the whole feature list, so edit it with the card text.
+- Path cards: "Your server" and "AWS", each wrapped in `<a href="#your-server">` and `<a href="#on-aws">`. The anchors are `<a name>` tags in the README text, because the headings are not where the paths start. The commands stay as Markdown code blocks under the cards so they can be copied.
+- Heading glyph: the mark, 17 px tall, as the first thing in each `##` heading, in a `<picture>` with no space before the heading text. A space would put a leading hyphen in GitHub's anchor id, and a bare `<img>` in a heading gets wrapped in a link to the image. Keep both rules or `#get-started` breaks.
+- Footer: lockup, a teal rule, the tagline, and "Not affiliated with Supabase Inc." in small print. The README text under License still says it in full.
+
+Badges are drawn by `build.py` as small SVGs (`readme/badge-*.svg`), not shields.io. shields.io picks the message text color from the background and prints white on `#00e0c4`, about 1.3:1, and has no option to change it. These badges put the label in white on ink and the message in ink on teal (about 12:1). `textLength` pins each string to its box, so a different system font cannot overflow it. They look the same on light and dark pages, so there is no `<picture>`. Badges must stay true: Apache-2.0, Ubuntu 24.04+ or Debian 12+, amd64 or arm64, systemd units with no Docker.
 
 ## Typography
 
