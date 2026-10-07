@@ -20,17 +20,19 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 TEARDOWN=0
 [[ ${1:-} == --teardown ]] && TEARDOWN=1
 
-trap 'rc=$?; collect_logs; fleet_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
+trap 'rc=$?; collect_logs; [[ $TEARDOWN -eq 1 ]] && teardown; exit $rc' EXIT
 
-fleet_logs() {
+# fleet_memory LABEL: append the memory each shared service holds to $LOG_DIR/fleet-memory.txt.
+fleet_memory() {
+  mkdir -p "$LOG_DIR"
   {
+    echo "# $1"
     for u in pgmeta supavisor realtime storage; do
-      printf '%s MemoryCurrent=%s MemoryMax=%s MainPID=%s\n' "sb-$u" \
+      printf '%s MemoryCurrent=%s bytes (%s MiB)\n' "sb-$u" \
         "$(systemctl show -p MemoryCurrent --value "sb-$u.service" 2>/dev/null)" \
-        "$(systemctl show -p MemoryMax --value "sb-$u.service" 2>/dev/null)" \
-        "$(systemctl show -p MainPID --value "sb-$u.service" 2>/dev/null)"
+        "$(( $(systemctl show -p MemoryCurrent --value "sb-$u.service" 2>/dev/null || echo 0) / 1048576 ))"
     done
-  } >"$LOG_DIR/fleet-memory.txt" 2>&1 || true
+  } >>"$LOG_DIR/fleet-memory.txt" 2>&1 || true
 }
 
 # Ports away from anything the runner may already listen on (Postgres on 5432, Node on
@@ -89,6 +91,7 @@ for svc in pgmeta supavisor realtime storage; do
   [[ ${PIDS[$svc]} == "$(systemctl show -p MainPID --value "sb-$svc.service")" ]] || fail "sb-$svc was restarted by an unchanged fleet start"
 done
 
+fleet_memory "after fleet start, no project registered"
 log "containment: what the fleet units cannot read"
 sees() { # UNIT PATH: exit 0 if PATH is readable from UNIT's namespace as the sbctl user
   local pid
@@ -240,6 +243,7 @@ done
 [[ $(http_code -H "x-forwarded-host: $HOST" -H "Authorization: Bearer $NEWSVC" "http://127.0.0.1:$P_STORAGE/bucket") == 200 ]] || fail "storage tenant lost after the restart"
 ws_join "$P_REALTIME" "$REF.realtime.internal" "$NEWANON" || fail "realtime tenant lost after the restart"
 
+fleet_memory "one project registered, after the crash recovery"
 log "remove the tenants, then delete the project"
 sbctl fleet remove-tenant "$REF" || fail "remove-tenant"
 [[ $(http_code -H "x-forwarded-host: $HOST" -H "Authorization: Bearer $NEWSVC" "http://127.0.0.1:$P_STORAGE/bucket") != 200 ]] || fail "storage still serves a removed tenant"
