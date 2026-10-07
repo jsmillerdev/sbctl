@@ -142,10 +142,11 @@ func TestRestoreFailureSettlesTheStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		healthy bool
-		want    registry.Status
 	}{
-		{"original back and healthy", true, registry.StatusActiveHealthy},
-		{"nothing runs", false, registry.StatusActiveUnhealthy},
+		// Either way the failure stays visible: a project that returned to ACTIVE_HEALTHY would
+		// read as a restore that worked.
+		{"original back and healthy", true},
+		{"nothing runs", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, fr := newRestoreHarness(t)
@@ -161,11 +162,69 @@ func TestRestoreFailureSettlesTheStatus(t *testing.T) {
 			if err == nil || !errors.Is(err, fr.err) {
 				t.Fatalf("Run = %v, want the restorer's error", err)
 			}
-			if got := status(t, h, p.Ref); got != tc.want {
-				t.Fatalf("status = %s, want %s", got, tc.want)
+			if got := status(t, h, p.Ref); got != registry.StatusRestoreFailed {
+				t.Fatalf("status = %s, want %s", got, registry.StatusRestoreFailed)
+			}
+			// A health check leaves it alone.
+			if _, err := h.e.Health(ctx, p.Ref); err != nil {
+				t.Fatal(err)
+			}
+			if got := status(t, h, p.Ref); got != registry.StatusRestoreFailed {
+				t.Fatalf("status after a health check = %s", got)
 			}
 		})
 	}
+}
+
+// RESTORE_FAILED ends with another restore that works, or with a pause and a resume.
+func TestRestoreFailedWaysOut(t *testing.T) {
+	ctx := context.Background()
+	fail := func(t *testing.T) (*harness, *fakeRestorer, string) {
+		t.Helper()
+		h, fr := newRestoreHarness(t)
+		p := h.create(t)
+		fr.err = errors.New("restore failed")
+		r, err := h.e.BeginRestore(ctx, p.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Run(ctx, RestoreRequest{Target: time.Now()}); err == nil {
+			t.Fatal("Run succeeded")
+		}
+		fr.err = nil
+		return h, fr, p.Ref
+	}
+	t.Run("restore again", func(t *testing.T) {
+		h, _, ref := fail(t)
+		r, err := h.e.BeginRestore(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Run(ctx, RestoreRequest{Target: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		if got := status(t, h, ref); got != registry.StatusActiveHealthy {
+			t.Fatalf("status = %s", got)
+		}
+	})
+	t.Run("pause and resume", func(t *testing.T) {
+		h, _, ref := fail(t)
+		if err := h.e.Pause(ctx, ref); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.e.Resume(ctx, ref); err != nil {
+			t.Fatal(err)
+		}
+		if got := status(t, h, ref); got != registry.StatusActiveHealthy {
+			t.Fatalf("status = %s", got)
+		}
+	})
+	t.Run("delete", func(t *testing.T) {
+		h, _, ref := fail(t)
+		if err := h.e.Delete(ctx, ref); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestBeginRestoreRefusals(t *testing.T) {

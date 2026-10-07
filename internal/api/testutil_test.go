@@ -155,7 +155,7 @@ func (m *fakeManager) BeginRestore(ctx context.Context, ref string) (lifecycle.R
 	if err != nil {
 		return nil, err
 	}
-	if p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy {
+	if p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy && p.Status != registry.StatusRestoreFailed {
 		return nil, fmt.Errorf("%w: cannot restore %s while it is %s", lifecycle.ErrInvalidState, ref, p.Status)
 	}
 	if err := m.reg.SetProjectStatus(ctx, ref, registry.StatusRestoring); err != nil {
@@ -179,7 +179,7 @@ func (r *fakeRestore) Run(ctx context.Context, req lifecycle.RestoreRequest) err
 	}
 	status := registry.StatusActiveHealthy
 	if err != nil {
-		status = registry.StatusActiveUnhealthy
+		status = registry.StatusRestoreFailed
 	}
 	_ = m.reg.SetProjectStatus(context.WithoutCancel(ctx), r.ref, status)
 	if out != nil {

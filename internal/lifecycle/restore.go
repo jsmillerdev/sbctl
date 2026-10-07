@@ -95,9 +95,9 @@ type Restore struct {
 	ref string
 }
 
-// BeginRestore moves an active project to RESTORING and returns the handle that runs the
-// restore. It refuses (ErrInvalidState) a project that is paused, starting, being deleted or
-// already being restored, so two operations never overlap: every other operation checks the
+// BeginRestore moves an active project, or one whose last restore failed, to RESTORING and
+// returns the handle that runs the restore. It refuses (ErrInvalidState) a project that is
+// paused, starting, being deleted or already being restored, so two operations never overlap: every other operation checks the
 // status under the same per-project lock. It refuses with ErrInsufficientDisk when the disk
 // cannot hold the restored copy next to the current data. The caller must call Run; until
 // then the project stays RESTORING.
@@ -125,7 +125,7 @@ func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, erro
 	if err != nil {
 		return nil, err
 	}
-	if !active(p.Status) {
+	if !active(p.Status) && p.Status != registry.StatusRestoreFailed {
 		return nil, invalidState(p, "restore")
 	}
 	if spaceErr != nil {
@@ -139,9 +139,11 @@ func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, erro
 }
 
 // Run restores the project in place and settles its status: ACTIVE_HEALTHY when the restore
-// worked; after a failure ACTIVE_UNHEALTHY until a health check finds the project running on
-// its original data again (the backup service puts the original back when it can). After a
-// restore that worked it also sets the cluster's role passwords to the registry's, and it
+// worked, RESTORE_FAILED when it did not. RESTORE_FAILED stays whether or not the backup
+// service managed to put the original data back, because a status that returned to
+// ACTIVE_HEALTHY would look to the dashboard and to API clients like a restore that worked.
+// The project leaves RESTORE_FAILED through another restore, a pause (then a resume), or a
+// delete; health checks leave it alone. After a restore that worked it also sets the cluster's role passwords to the registry's, and it
 // bounds the old data directories the restores left (pruneRestoreLeftovers). The outcome is
 // the backup service's error, if any.
 func (r *Restore) Run(ctx context.Context, req RestoreRequest) error {
@@ -160,7 +162,6 @@ func (r *Restore) Run(ctx context.Context, req RestoreRequest) error {
 		e.log.Warn("restore: could not settle the project status", "ref", r.ref, "error", serr)
 	}
 	if err != nil {
-		_, _ = e.Health(cctx, r.ref)
 		return fmt.Errorf("lifecycle: restore %s: %w", r.ref, err)
 	}
 	return nil
@@ -225,7 +226,7 @@ func (e *Engine) settleRestore(ctx context.Context, ref string, ok bool) error {
 	}
 	want := registry.StatusActiveHealthy
 	if !ok {
-		want = registry.StatusActiveUnhealthy
+		want = registry.StatusRestoreFailed
 	}
 	return e.reg.SetProjectStatus(ctx, ref, want)
 }

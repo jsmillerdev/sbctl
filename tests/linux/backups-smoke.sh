@@ -58,14 +58,15 @@ must() { # STATUS METHOD PATH [BODY]
   got=$(code "$2" "$3" "${4:-}")
   [[ $got == "$want" ]] || { log "response: $(papi "$2" "$3" ${4:+-H 'Content-Type: application/json' -d "$4"} | head -c 400)"; fail "$2 $3 answered $got, want $want"; }
 }
-# restore_failed prints the daemon's log line of a restore that failed (the project then returns to
-# ACTIVE_HEALTHY on its original data, so the status alone does not tell).
+# restore_failed prints the daemon's log line of a restore that failed (the project is then
+# RESTORE_FAILED, which wait_status treats as the end of the wait).
 restore_failed() { journalctl --no-pager -u supavise.service 2>/dev/null | grep 'msg="restore failed"' | tail -1 || true; }
 wait_status() { # STATUS SECONDS
   local want=$1 n=${2:-600} i s=""
   for ((i = 0; i < n; i++)); do
     s=$(status 2>/dev/null || true)
     [[ $s == "$want" ]] && return 0
+    [[ $s == RESTORE_FAILED ]] && break
     sleep 1
   done
   journalctl --no-pager -u supavise.service | tail -40 >&2

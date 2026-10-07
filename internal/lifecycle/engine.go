@@ -455,7 +455,9 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	if ref == config.SystemRef || !(active(p.Status) || inRestore(ctx, p)) {
+	// A project whose restore failed can be paused, and resumed after: the way back to ACTIVE_HEALTHY
+	// when the original data is intact.
+	if ref == config.SystemRef || !(active(p.Status) || p.Status == registry.StatusRestoreFailed || inRestore(ctx, p)) {
 		return invalidState(p, "pause")
 	}
 	if err := e.setStatus(ctx, ref, registry.StatusPausing); err != nil {
@@ -464,7 +466,11 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 	e.stopTimer(ctx, ref)
 	e.quiesce(ctx, ref)
 	if err := e.plane.Stop(ctx, ref); err != nil {
-		_ = e.setStatus(context.WithoutCancel(ctx), ref, registry.StatusActiveUnhealthy)
+		back := registry.StatusActiveUnhealthy
+		if p.Status == registry.StatusRestoreFailed {
+			back = p.Status
+		}
+		_ = e.setStatus(context.WithoutCancel(ctx), ref, back)
 		return fmt.Errorf("lifecycle: pause %s: %w", ref, err)
 	}
 	if err := e.setStatus(ctx, ref, registry.StatusInactive); err != nil {

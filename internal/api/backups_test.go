@@ -507,7 +507,10 @@ func TestRestoreRunsWithoutADeadline(t *testing.T) {
 	}
 }
 
-func TestRestoreFailureLeavesTheProjectUnhealthy(t *testing.T) {
+// A failed restore must not look like a finished one to Studio or to a v1 client polling the
+// status: the project reads RESTORE_FAILED, and a second restore from there is accepted and
+// ends ACTIVE_HEALTHY.
+func TestRestoreFailureShowsAndAllowsARetry(t *testing.T) {
 	b := newBackupFixture(t)
 	b.mgr.restores = make(chan restoreRecord, 4)
 	b.mgr.restoreErr = errors.New("recovery ended before configured recovery target was reached")
@@ -516,7 +519,15 @@ func TestRestoreFailureLeavesTheProjectUnhealthy(t *testing.T) {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 	b.waitRestore()
-	waitStatus(t, b, registry.StatusActiveUnhealthy)
+	waitStatus(t, b, registry.StatusRestoreFailed)
+
+	b.mgr.restoreErr = nil
+	rec = b.post("/platform/database/"+testRef+"/backups/pitr", map[string]any{"recovery_time_target_unix": b.now.Add(-time.Hour).Unix()})
+	if rec.Code != 201 {
+		t.Fatalf("retry after a failed restore: %d %s", rec.Code, rec.Body)
+	}
+	b.waitRestore()
+	waitStatus(t, b, registry.StatusActiveHealthy)
 }
 
 func TestDrainWaitsForARestore(t *testing.T) {
