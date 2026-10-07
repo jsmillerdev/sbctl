@@ -421,6 +421,9 @@ func TestTemplatesContainment(t *testing.T) {
 		if svc == "postgres" && line(body, "InaccessiblePaths") != "-/etc/sbctl/master.key" {
 			t.Errorf("%s must hide the master key only (config.toml is read by archive_command)", name)
 		}
+		if svc == "postgres" && strings.Join(postgresInaccessible(), " ") != line(body, "InaccessiblePaths") {
+			t.Errorf("%s: postgresInaccessible() = %v differs from the unit file; lifting an egress policy would change what the unit hides", name, postgresInaccessible())
+		}
 	}
 }
 
@@ -461,7 +464,13 @@ func TestEgressMatches(t *testing.T) {
 		}
 		return out
 	}
-	policy := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow())}
+	policy := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow()),
+		"InaccessiblePaths": append([]string{"-/etc/sbctl/master.key"}, EgressHiddenPaths()...)}
+	ipOnly := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow()),
+		"InaccessiblePaths": []string{"-/etc/sbctl/master.key"}}
+	// systemd may print the paths without the ignore prefix.
+	bare := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus(EgressAllow()),
+		"InaccessiblePaths": []string{"/etc/sbctl/master.key", "/run/systemd/resolve", "/run/dbus", "/run/nscd"}}
 	wide := map[string]interface{}{"IPAddressDeny": dbus(EgressDeny()), "IPAddressAllow": dbus([]IPRange{
 		{Family: 2, Addr: []byte{127, 0, 0, 0}, Prefix: 8}, EgressAllow()[1]})}
 	for _, tc := range []struct {
@@ -472,6 +481,9 @@ func TestEgressMatches(t *testing.T) {
 	}{
 		{"denied unit, deny wanted", policy, true, true},
 		{"denied unit, lift wanted", policy, false, false},
+		{"denied unit without the hidden paths (an earlier release)", ipOnly, true, false},
+		{"denied unit, paths shown without the prefix", bare, true, true},
+		{"only the master key hidden, lift wanted", map[string]interface{}{"InaccessiblePaths": []string{"-/etc/sbctl/master.key"}}, false, true},
 		{"open unit, lift wanted", map[string]interface{}{}, false, true},
 		{"unloaded unit, lift wanted", nil, false, true},
 		{"open unit, deny wanted", map[string]interface{}{}, true, false},

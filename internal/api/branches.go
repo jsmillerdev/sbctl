@@ -221,6 +221,10 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) error {
 	if in.Persistent != nil {
 		ci.Persistent = *in.Persistent
 	}
+	// with_data makes the branch a copy of production: users' sessions are removed and the keys sbctl
+	// issued are replaced, but node-local credentials users stored in their own tables, function
+	// bodies or Vault entries are not detected and loopback is open on every port. It is for trusted
+	// users and agents (branches are schema-only by default); the branch's detail says so.
 	if in.WithData != nil {
 		ci.WithData = *in.WithData
 	}

@@ -214,7 +214,7 @@ CLI and MCP server.`,
 		printBranch(cmd.OutOrStdout(), b)
 		return nil
 	})
-	create.Flags().BoolVar(&withData, "with-data", false, "clone the parent's data (copy-on-write when the disk supports it, else from its latest base backup)")
+	create.Flags().BoolVar(&withData, "with-data", false, "clone the parent's data (copy-on-write when the disk supports it, else from its latest base backup). The branch is a copy of production: credentials users stored in their own tables, function bodies or Vault entries (other than sbctl's keys) are not detected and loopback is open on every port, so use it for trusted users and agents only")
 	create.Flags().BoolVar(&allowEgress, "allow-egress", false, "with --with-data: keep the parent's outbound side effects (no egress block, pg_cron jobs stay active); by default the branch's Postgres reaches loopback only and the cron jobs are paused")
 	create.Flags().BoolVar(&persistent, "persistent", false, "never expire; take a final backup when deleted")
 	create.Flags().StringVar(&gitBranch, "git-branch", "", "git branch the branch tracks")

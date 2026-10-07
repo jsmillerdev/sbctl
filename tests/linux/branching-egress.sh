@@ -19,6 +19,9 @@
 #   6. the loopback allow is 127.0.0.1 and ::1 only: from the branch's Postgres a pg_net request to
 #      127.0.0.1 is answered (and the cluster's own clients, GoTrue and PostgREST, stay healthy)
 #      and one to 127.0.0.2 (the rest of 127.0.0.0/8, where systemd-resolved's stub lives) is dropped;
+#      The unit also hides the resolver socket, the D-Bus system bus and nscd (InaccessiblePaths, which
+#      the IP filter does not cover), still hides the master key, and the paths come back when the branch is deleted.
+#      Cron jobs cloned from the parent name the branch's own port.
 #   7. a parent with a loopback postgres_fdw server to another project and a Vault secret that holds
 #      its own service key: in the branch the foreign table cannot write (the server is disabled and
 #      its password dropped, recorded in sbctl_branch.paused_foreign_servers), the Vault secret holds
@@ -144,6 +147,26 @@ deny=$(unit_prop IPAddressDeny "$PGB") allow=$(unit_prop IPAddressAllow "$PGB")
 # systemd prints a full-length prefix without it: 127.0.0.1/32 as 127.0.0.1, ::1/128 as ::1.
 allow_norm=$(printf '%s\n' $allow | sed -e 's#/32$##' -e 's#/128$##' | LC_ALL=C sort | tr '\n' ' ')
 [[ $allow_norm == "127.0.0.1 ::1 " ]] || fail "$PGB: IPAddressAllow is '$allow', want exactly 127.0.0.1 and ::1 (not 127.0.0.0/8: 127.0.0.53 is the DNS stub)"
+# The IP filter does not cover unix sockets: the resolver's varlink socket, the D-Bus system bus and
+# nscd are hidden from the unit (InaccessiblePaths), and the unit keeps hiding the master key.
+check_hidden_paths() { # UNIT: the denied unit's property and, in its mount namespace, the sockets
+  local unit=$1 hidden pid p
+  hidden=$(unit_prop InaccessiblePaths "$unit")
+  for p in /run/systemd/resolve /run/dbus /run/nscd; do
+    [[ $hidden == *"$p"* ]] || fail "$unit: InaccessiblePaths is '$hidden', want it to hide $p"
+  done
+  [[ $hidden == *master.key* ]] || fail "$unit: InaccessiblePaths lost the master key: '$hidden'"
+  pid=$(unit_prop MainPID "$unit")
+  [[ $pid -gt 0 ]] || fail "$unit: no main pid"
+  if [[ -d /run/systemd/resolve && -n $(ls -A /run/systemd/resolve) ]]; then
+    [[ -z $(ls -A "/proc/$pid/root/run/systemd/resolve" 2>/dev/null) ]] || fail "$unit: /run/systemd/resolve is visible inside the unit"
+  fi
+  if [[ -S /run/dbus/system_bus_socket ]]; then
+    [[ ! -S /proc/$pid/root/run/dbus/system_bus_socket ]] || fail "$unit: the D-Bus system bus socket is visible inside the unit"
+  fi
+}
+check_hidden_paths "$PGB"
+BPORT=$(project_field "$B" 'd["ports"]["Postgres"]')
 for svc in gotrue postgrest; do
   [[ -z $(unit_prop IPAddressDeny "sb-$svc@$B.service") ]] || fail "sb-$svc@$B has an egress restriction (only the cluster's Postgres should)"
 done
@@ -155,6 +178,8 @@ sbctl projects health "$B" || fail "$B: unhealthy behind the egress filter"
 [[ $(sql "$B" "select count(*) from sbctl_branch.paused_cron_jobs p join cron.job j using (jobid) where j.jobname = 'egress-test-job'") == 1 ]] \
   || fail "$B: the paused cron job is not recorded in sbctl_branch.paused_cron_jobs"
 [[ $(sql "$A" "select active from cron.job where jobname = 'egress-test-job'") == t ]] || fail "the parent's cron job was touched"
+# pg_cron stamps the parent's port into a job: in the branch the jobs name the branch's own cluster.
+[[ $(sql "$B" "select count(*) from cron.job where nodeport <> $BPORT or nodename <> '127.0.0.1'") == 0 ]] || fail "$B: a cron job still names a node other than the branch ($BPORT)"
 
 row=$(net_request "$B" branch-denied)
 [[ $row == '|'?* ]] || fail "$B: a pg_net request to $HOSTIP:$HTTP_PORT answered '$row'; it must fail with no status and an error"
@@ -202,6 +227,7 @@ sbctl projects pause "$B"
 sbctl projects resume "$B"
 sbctl projects health "$B" || fail "$B: unhealthy after resume"
 [[ $(unit_prop IPAddressDeny "$PGB") == *0.0.0.0/0* ]] || fail "$PGB: the restriction is gone after resume"
+check_hidden_paths "$PGB"
 row=$(net_request "$B" branch-denied-after-resume)
 [[ $row == '|'?* && $(served branch-denied-after-resume) -eq 0 ]] || fail "$B: after resume a pg_net request answered '$row' or reached the server"
 
@@ -209,6 +235,7 @@ log "a reset recreates the cluster and denies again"
 sbctl branches reset "$B"
 [[ $(branch_json "$B" 'd.get("egress", "")') == denied ]] || fail "$B: egress after reset is '$(branch_json "$B" 'd.get("egress", "")')', want denied"
 [[ $(unit_prop IPAddressDeny "$PGB") == *0.0.0.0/0* ]] || fail "$PGB: no restriction after reset"
+check_hidden_paths "$PGB"
 [[ $(sql "$B" "select active from cron.job where jobname = 'egress-test-job'") == f ]] || fail "$B: the cron job is active after reset"
 check_isolated_data "$B"
 row=$(net_request "$B" branch-denied-after-reset)
@@ -219,6 +246,8 @@ log "branch with --allow-egress"
 C=$(create_branch egress-open --allow-egress)
 [[ $(branch_json "$C" 'd.get("egress", "")') == allowed ]] || fail "$C: egress is '$(branch_json "$C" 'd.get("egress", "")')', want allowed"
 [[ -z $(unit_prop IPAddressDeny "sb-postgres@$C.service") ]] || fail "$C: an opted-out branch has a restriction"
+[[ $(unit_prop InaccessiblePaths "sb-postgres@$C.service") != *run/dbus* ]] || fail "$C: an opted-out branch hides the D-Bus socket"
+[[ $(sql "$C" "select count(*) from cron.job where nodeport <> $(project_field "$C" 'd["ports"]["Postgres"]')") == 0 ]] || fail "$C: the opted-out branch's cron jobs name the parent's port"
 [[ $(sql "$C" "select active from cron.job where jobname = 'egress-test-job'") == t ]] || fail "$C: the opt-out did not keep the cron job active"
 row=$(net_request "$C" branch-open)
 [[ $row == "200|" ]] || fail "$C: with --allow-egress a pg_net request answered '$row', want '200|'"
@@ -229,6 +258,9 @@ log "delete the branches"
 sbctl branches delete "$B"
 sbctl branches delete "$C"
 [[ -z $(unit_prop IPAddressDeny "$PGB") ]] || fail "$PGB: the restriction remains after the branch was deleted (a later project with the ref would inherit it)"
+hidden=$(unit_prop InaccessiblePaths "$PGB")
+[[ $hidden != *run/dbus* && $hidden != *run/systemd/resolve* ]] || fail "$PGB: the hidden paths remain after the branch was deleted: '$hidden'"
+[[ $hidden == *master.key* ]] || fail "$PGB: the master key is no longer hidden after the branch was deleted: '$hidden'"
 [[ $(unit_state "$PGB") == inactive ]] || fail "$PGB is $(unit_state "$PGB") after delete"
 
 log "OK"

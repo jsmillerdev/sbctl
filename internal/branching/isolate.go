@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -35,6 +37,9 @@ import (
 // restarts normally.
 
 const quarantineMark = "# sbctl-branch-quarantine"
+
+// cronNodeName is the nodename of a branch's pg_cron jobs: the address its cluster listens on.
+const cronNodeName = "127.0.0.1"
 
 // quarantineSettings are the postmaster settings of a branch's first start.
 var quarantineSettings = []struct{ key, value string }{
@@ -169,6 +174,20 @@ type IsolateResult struct {
 	// ForeignNotNeutralized names foreign servers of another wrapper than postgres_fdw and
 	// dblink_fdw whose options the wrapper's validator would not let isolation change.
 	ForeignNotNeutralized []string `json:"foreign_servers_not_neutralized,omitempty"`
+	// CronNodesReset is the number of cron.job rows whose nodename and nodeport (the parent's
+	// own, stamped when the job was scheduled) now name the branch's cluster.
+	CronNodesReset int `json:"cron_nodes_reset"`
+	// AuthRowsDeleted counts the rows removed, per table, from the parent's GoTrue session
+	// material (isolate_auth.go); AuthRowsCleared the rows whose one-time token columns were
+	// emptied, per table. Counts only, never values. AuthTablesNotReviewed names tables of the auth
+	// schema that neither list of isolate_auth.go knows (a GoTrue release newer than the one that
+	// was reviewed).
+	AuthRowsDeleted       map[string]int64 `json:"auth_rows_deleted,omitempty"`
+	AuthRowsCleared       map[string]int64 `json:"auth_rows_cleared,omitempty"`
+	AuthTablesNotReviewed []string         `json:"auth_tables_not_reviewed,omitempty"`
+	// DatabasesOpened names databases that refuse connections (datallowconn = false) and that
+	// isolation opened for its own session and closed again.
+	DatabasesOpened []string `json:"databases_opened,omitempty"`
 }
 
 // isolateOptions say what isolateCluster leaves alone: the opt-outs of a branch.
@@ -178,33 +197,113 @@ type isolateOptions struct {
 	// KeepForeign leaves foreign servers, user mappings and the connection strings in cron
 	// commands as the parent had them (allow_egress: the branch is meant to act on the outside).
 	KeepForeign bool
+	// NodeName and NodePort are what every cron.job row's nodename and nodeport become: the
+	// branch's own cluster. pg_cron stamps the parent's port into a job when it is scheduled, so
+	// a job re-activated in the branch would otherwise connect to the parent. NodePort 0 leaves
+	// the rows alone.
+	NodeName string
+	NodePort int
 }
 
 // isolateCluster neutralizes the parent's outbound integrations in every database of the
 // cluster reachable at dsn (a superuser on the cluster's private socket). It is safe to run
 // twice.
-func isolateCluster(ctx context.Context, dsn string, opt isolateOptions) (IsolateResult, error) {
-	var res IsolateResult
+func isolateCluster(ctx context.Context, dsn string, opt isolateOptions) (res IsolateResult, err error) {
 	res.CronKept, res.ForeignKept = opt.KeepCron, opt.KeepForeign
-	c, err := connect(ctx, dsn, "")
+	dbs, opened, restore, err := openDatabases(ctx, dsn)
 	if err != nil {
 		return res, err
 	}
-	rows, err := c.Query(ctx, `select datname from pg_database where datallowconn and not datistemplate order by datname`)
-	var dbs []string
-	if err == nil {
-		dbs, err = pgx.CollectRows(rows, pgx.RowTo[string])
-	}
-	closeConn(c)
-	if err != nil {
-		return res, err
-	}
+	res.DatabasesOpened = opened
+	defer func() {
+		if rerr := restore(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	for _, db := range dbs {
 		if err := isolateDatabase(ctx, dsn, db, opt, &res); err != nil {
 			return res, fmt.Errorf("database %s: %w", db, err)
 		}
 	}
 	return res, nil
+}
+
+// openDatabases lists the databases isolation and the credential rewrite have to work through:
+// every database of the cluster except template0 (which is pristine and cannot be changed),
+// template databases and the ones with datallowconn = false included. The owner of a database
+// that refuses connections can allow them again in the branch, and what it holds (foreign
+// servers, Vault secrets, cron jobs) is as much a copy of the parent as the rest, so such a
+// database is opened for the duration with ALTER DATABASE ... ALLOW_CONNECTIONS true as the
+// superuser; restore puts the flag back. opened names the databases it opened. If sbctl dies
+// between the two the branch stays open, and the branch it belongs to has not finished
+// creating (isolation did not complete), so it ends up failed, not in use.
+func openDatabases(ctx context.Context, dsn string) (dbs, opened []string, restore func() error, err error) {
+	restore = func() error { return nil }
+	c, err := connect(ctx, dsn, "")
+	if err != nil {
+		return nil, nil, restore, err
+	}
+	defer closeConn(c)
+	rows, err := c.Query(ctx, `select datname, datallowconn from pg_database where datname <> 'template0' and datconnlimit <> -2 order by datname`)
+	if err != nil {
+		return nil, nil, restore, err
+	}
+	var closed []string
+	for rows.Next() {
+		var name string
+		var allow bool
+		if err := rows.Scan(&name, &allow); err != nil {
+			rows.Close()
+			return nil, nil, restore, err
+		}
+		dbs = append(dbs, name)
+		if !allow {
+			closed = append(closed, name)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, restore, err
+	}
+	setAllow := func(ctx context.Context, c *pgx.Conn, name string, allow bool) error {
+		var stmt string
+		if err := c.QueryRow(ctx, `select format('alter database %I allow_connections %s', $1::text, $2::text)`, name, fmt.Sprint(allow)).Scan(&stmt); err != nil {
+			return err
+		}
+		_, err := c.Exec(ctx, stmt)
+		return err
+	}
+	var done []string
+	restore = func() error {
+		if len(done) == 0 {
+			return nil
+		}
+		// The caller's context may be what failed: the flags go back regardless.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		rc, err := connect(rctx, dsn, "")
+		if err != nil {
+			return fmt.Errorf("close the databases that refused connections: %w", err)
+		}
+		defer closeConn(rc)
+		var firstErr error
+		for _, name := range done {
+			if err := setAllow(rctx, rc, name, false); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("close database %s again: %w", name, err)
+			}
+		}
+		done = nil
+		return firstErr
+	}
+	for _, name := range closed {
+		if err := setAllow(ctx, c, name, true); err != nil {
+			rerr := restore()
+			return nil, nil, func() error { return nil }, errors.Join(fmt.Errorf("open database %s: %w", name, err), rerr)
+		}
+		done = append(done, name)
+		opened = append(opened, name)
+	}
+	return dbs, opened, restore, nil
 }
 
 func isolateDatabase(ctx context.Context, dsn, db string, opt isolateOptions, res *IsolateResult) error {
@@ -237,6 +336,16 @@ func isolateDatabase(ctx context.Context, dsn, db string, opt isolateOptions, re
 	var hasCron bool
 	if err := c.QueryRow(ctx, `select to_regclass('cron.job') is not null`).Scan(&hasCron); err != nil {
 		return err
+	}
+	if hasCron && opt.NodePort != 0 {
+		n, err := resetCronNodes(ctx, c, opt.NodeName, opt.NodePort)
+		if err != nil {
+			return fmt.Errorf("point cron jobs at the branch: %w", err)
+		}
+		res.CronNodesReset += n
+	}
+	if err := wipeAuthSessions(ctx, c, res); err != nil {
+		return fmt.Errorf("remove the parent's GoTrue sessions: %w", err)
 	}
 	if hasCron && !opt.KeepCron {
 		n, err := pauseCronJobs(ctx, c)
@@ -322,6 +431,25 @@ func pauseCronJobs(ctx context.Context, c *pgx.Conn) (int, error) {
 	return int(tag.RowsAffected()), tx.Commit(ctx)
 }
 
+// resetCronNodes makes every job of cron.job run on the branch's own cluster. pg_cron stamps
+// nodename and nodeport into a row when the job is scheduled (the parent's port, here), and the
+// scheduler connects to them: left alone, a job that the branch's owner re-activates would run
+// against the parent as the job's user. Returns the number of rows changed.
+func resetCronNodes(ctx context.Context, c *pgx.Conn, host string, port int) (int, error) {
+	var n int
+	if err := c.QueryRow(ctx, `select count(*) from information_schema.columns where table_schema = 'cron' and table_name = 'job' and column_name in ('nodename', 'nodeport')`).Scan(&n); err != nil {
+		return 0, err
+	}
+	if n != 2 {
+		return 0, nil // an older pg_cron: jobs always run on this server
+	}
+	tag, err := c.Exec(ctx, `update cron.job set nodename = $1, nodeport = $2 where nodename is distinct from $1 or nodeport is distinct from $2`, host, port)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // connect opens a connection to dsn, to database db when it is not empty.
 func connect(ctx context.Context, dsn, db string) (*pgx.Conn, error) {
 	cc, err := pgx.ParseConfig(dsn)
@@ -348,6 +476,7 @@ func (s *Service) isolateBranch(ctx context.Context, ref string) error {
 	}
 	res, err := isolateCluster(ctx, s.adminSocketDSN(ref, p.Seq), isolateOptions{
 		KeepCron: s.keepsCron(egress), KeepForeign: egress == registry.EgressAllowed,
+		NodeName: cronNodeName, NodePort: s.cfg.PortsFor(ref, p.Seq).Postgres,
 	})
 	if err != nil {
 		return err

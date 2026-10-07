@@ -103,7 +103,19 @@ seed. The Management API has no seed field, so the seed is stored per parent:
 leaves the branch in `MIGRATIONS_FAILED` for inspection. Objects the parent got outside the
 migration history (the SQL editor, `execute_sql`) are not in a schema-only branch: use `with_data`.
 
-**With data**: the cheapest way available, decided at runtime and recorded as `clone_method`:
+**With data**
+
+> **A `with_data` branch is a copy of production.** Whoever can run SQL in it can read all of the parent's
+> data. sbctl replaces the credentials it knows about and cuts the branch off from the outside (below), but
+> it does not detect node-local credentials that users put in their own tables, in function bodies, in Vault
+> entries other than the keys sbctl issued, or in settings, and a branch can reach every port on loopback
+> (the filter is on addresses, not ports). Branches are schema-only by default; `with_data` is opt-in and
+> meant for trusted users and agents. See "What a branch with data can and cannot reach".
+>
+> **Followup (workstream K, part 2):** once roles exist, creating a `with_data` branch should require the
+> Owner or Administrator role. Until then anyone who can create a branch can ask for the data.
+
+The cheapest way available is chosen at runtime and recorded as `clone_method`:
 
 | `clone_method` | When | How |
 |---|---|---|
@@ -162,6 +174,27 @@ by value: the event `branch.credentials_rewritten` and the table `sbctl_branch.r
 (kind, name, which credentials). A failure stops the branch like a failed rotation. Not detected:
 see "What a branch with data can and cannot reach".
 
+**Sessions of the parent's users**: the `auth` schema of the clone holds bearer secrets of the parent's
+GoTrue, and the parent's GoTrue listens on loopback: plaintext refresh tokens (`auth.refresh_tokens`), the
+key that checks them per session (`auth.sessions.refresh_token_hmac_key`), the hashes of outstanding
+recovery, magic link and confirmation tokens (`auth.one_time_tokens` and the `*_token` columns of
+`auth.users`), and PKCE and OAuth flow state. Left in the branch, a refresh token read there is a session of
+a production user (the branch's GoTrue accepted one in a test before this was removed). So in **every**
+`with_data` branch, with or without `--allow-egress`, isolation (`wipeAuthSessions`, `isolate_auth.go`)
+empties `auth.sessions`, `auth.refresh_tokens`, `auth.mfa_amr_claims`, `auth.mfa_challenges`,
+`auth.one_time_tokens`, `auth.flow_state`, `auth.saml_relay_states`, `auth.oauth_authorizations`,
+`auth.oauth_client_states` and `auth.webauthn_challenges`, and blanks the token columns of `auth.users`
+(and the stored passkey challenge of `auth.mfa_factors`). Users and identities stay, so **the branch's users
+sign in again** with their passwords and get tokens of the branch (its own JWT secret). The event
+`branch.isolated` records the counts per table (`auth_rows_deleted`, `auth_rows_cleared`), never values. The
+two table lists in `isolate_auth.go` cover the GoTrue release pinned in `versions.yaml` (auth-v2.195.0); a
+table in neither list is named in the event (`auth_tables_not_reviewed`) and the integration test fails
+on it, so a GoTrue upgrade that adds a table gets classified. What stays is production data, not a
+session: password hashes, TOTP secrets, passkey public keys, OAuth and SSO configuration, and the client
+secrets of third-party identity providers (`auth.custom_oauth_providers`). Tested on real clusters
+(`TestIntegrationCloneNeutralizesForeignServersAndParentCredentials`: the parent's refresh token is gone
+from the branch and its GoTrue refuses it, the branch signs the user in again, the parent's token still works).
+
 **Isolation from the parent's integrations**: a copy of the data directory carries every outbound
 connection of the parent, and a branch that kept them would act as a second parent toward those
 systems. A logical replication subscription is copied enabled with the same slot name, so the
@@ -183,6 +216,17 @@ like a failed rotation). A pg_cron job that was paused is recorded in `sbctl_bra
 database that holds `cron.job` (`jobid`, `jobname`, `schedule`, `database`, `username`, `paused_at`), so that
 whoever owns the branch can opt in later:
 `update cron.job set active = true where jobid in (select jobid from sbctl_branch.paused_cron_jobs);`.
+pg_cron stamps the parent's port into each job (`cron.job.nodename`, `nodeport`) when it is scheduled, so
+isolation sets every job's `nodename` and `nodeport` to the branch's own cluster (`127.0.0.1` and its port,
+whether or not the job is paused); a job re-activated later cannot connect to the parent as its user
+(`cron_nodes_reset` in the event).
+Isolation and the credential rewrite work through **every database but `template0`**, template databases
+and databases with `datallowconn = false` included: such a database is opened for the duration with
+`ALTER DATABASE ... ALLOW_CONNECTIONS true` as the superuser and closed again afterwards (named in the event as
+`databases_opened`; the flags are as the parent had them). The owner of such a database could otherwise allow
+connections again in the branch and find its foreign servers and Vault secrets as the parent had them. If
+sbctl stops between the two statements the flag stays open, and the branch did not finish creating, so it
+ends up failed.
 Re-activating a job is not enough to make it behave as in the parent, because two things inside
 its command were changed: a connection string written as a literal (`dblink('host=... password=...', ...)`)
 was replaced by a disabled one (the jobs are in `sbctl_branch.neutralized_cron_commands`; the original
@@ -229,6 +273,11 @@ with data has these defaults:
    would be a DNS side channel out of a confined unit. Every client of a project's Postgres uses 127.0.0.1 (the cluster
    listens on `127.0.0.1` only; GoTrue, PostgREST, the pooler and the fleet connect to it) or the unix socket, which a
    filter on IP addresses does not touch. An earlier release allowed 127.0.0.0/8: the next render of a unit narrows it.
+   The IP filter does not touch unix sockets, so the unit's `InaccessiblePaths` also hides `/run/systemd/resolve`
+   (systemd-resolved's varlink socket, which glibc uses for lookups through `nss-resolve`), `/run/dbus` (the system bus,
+   where a polkit rule could let the unit lift its own filter) and `/run/nscd`, in addition to the master key
+   (`units.EgressHiddenPaths`, applied with the filter, in force when the unit starts; the delete drops them again). Names then
+   resolve only through `/etc/hosts` or a resolver on 127.0.0.1:53 (dnsmasq, unbound), which the loopback allow still reaches.
    The filter is a cgroup BPF program on the unit, so it covers every process of the cluster (backends, the pg_net
    and pg_cron workers, `COPY ... PROGRAM`) and it survives restarts and reboots. The unit
    still talks to its own GoTrue and PostgREST and to the pooler over loopback and unix sockets.
@@ -281,16 +330,19 @@ are named under Verified.
 **It cannot** (enforced; tested except where noted):
 
 * Send anything from its Postgres unit to an address other than 127.0.0.1 and ::1: another host, the internet, the node's own
-  non-loopback addresses, the resolver stub at 127.0.0.53 (a name that `/etc/hosts` does not answer cannot be resolved). Every process of the
-  unit's cgroup is covered. Not tested for IPv6.
+  non-loopback addresses, the resolver stub at 127.0.0.53. The resolver's varlink socket, the D-Bus system bus and nscd's socket
+  are hidden from the unit, so a name resolves only through `/etc/hosts` or a resolver listening on 127.0.0.1:53 (where one
+  runs, a lookup can still carry data out through it). Every process of the unit's cgroup is covered. Not tested for IPv6.
 * Use a foreign server of the cloned data (postgres_fdw, dblink, any server with libpq options) to write to or read from the parent or
   another project: the server is disabled and its stored passwords are dropped (above). A dblink connection string
   in a cron command is replaced, and the cron jobs are paused.
 * Use the parent's API keys, JWT secret or database passwords where the parent's setup kept them
-  (Vault, cron commands, database and role settings): they are the branch's own keys now (above).
+  (Vault secrets, cron commands, database and role settings): they are the branch's own keys now (above). This covers the keys
+  sbctl issued and only those; see the first item under "Residual risk".
 * Open another project's Postgres through its unix socket or read its files: the unit sees an empty
   `/var/lib/sbctl` with only its own cluster directory (the mount namespace in `sb-postgres@.service`; read from the unit file, not tested here).
-* Keep the parent's subscriptions, queued pg_net requests or active cron jobs (above).
+* Keep the parent's subscriptions, queued pg_net requests or active cron jobs (above), or the sessions of the parent's
+  users (refresh tokens, one-time tokens, flow state; above).
 
 **It can**:
 
@@ -303,12 +355,18 @@ are named under Verified.
 
 **Residual risk, not covered**:
 
-* **Credentials for the parent embedded in arbitrary user tables are not detected**, nor are those in function bodies, in trigger
-  arguments (the headers of a database webhook), in the options of foreign tables or of other wrappers' servers, in Storage objects,
-  in a Vault secret's name or description, in encoded or split form, or set with `ALTER SYSTEM`. Whoever can run SQL in the branch can read
-  them and use them against the parent over loopback (a database connection, or an HTTP call through the proxy with
-  the parent's host name). Only the credentials listed above are replaced, and only where listed: a credential of a third
-  party (a Stripe key in the Vault) is not the branch's to replace, and it cannot leave the node while egress is denied.
+* **Accepted by design: node-local credentials that users stored themselves are not detected.** A `with_data` branch is
+  a copy of production, and sbctl cannot tell which strings in it are secrets. Credentials in arbitrary user tables, in function
+  bodies, in trigger arguments (the headers of a database webhook), in the options of foreign tables or of other wrappers' servers,
+  in Storage objects, in a Vault secret's name or description, in Vault entries other than the keys sbctl issued, in settings other
+  than the ones rewritten, in encoded or split form, or set with `ALTER SYSTEM`, stay as they were. That includes a connection string
+  or key for **another project on this node or for a custom login role of the parent**, an `sbp_` personal access token for the
+  admin API, and a JWT with a role other than `anon` or `service_role`. Whoever can run SQL in the branch can read them and use them
+  over loopback (a database connection, or an HTTP call through the proxy with the parent's host name), and **loopback is open
+  on every port**: systemd filters by address, not port. Egress denial does not help here, because the target is on the node. Only
+  the credentials listed above are replaced, and only where listed. A credential of a third party (a Stripe key in the Vault) cannot
+  leave the node while egress is denied, but it is in the branch. This is why branches are schema-only by default and `with_data`
+  is for trusted users and agents.
 * A branch with data gives whoever can run SQL in it a copy of the parent's data, whatever is rewritten.
 * The shared pgsodium root key (see Credentials): whoever holds the parent's root key can decrypt the branch's Vault secrets that were not rewritten.
 * The unit's isolation from other projects is a mount namespace and an IP filter, not a sandbox: all units run as the same user and
@@ -436,6 +494,13 @@ plus a parent and at most two branches, class micro):
   nothing) and a pg_cron job; the branch has the subscription disabled with no slot, the job inactive
   (active with `keep_cron_jobs`), the node's `max_logical_replication_workers` and
   `cron.launch_active_jobs` back, no marked lines left, and the parent unchanged.
+* `TestIntegrationCloneNeutralizesForeignServersAndParentCredentials` also checks, on the exec backend, with and without
+  `--allow-egress` and on the clone and base-backup paths in CI: a user signed in on the parent (refresh token, session,
+  one-time token, flow state, user token columns) has none of it in the branch, the branch's GoTrue refuses the parent's refresh token
+  and signs the user in again, the parent's token still works afterwards; cron jobs name the branch's port and the parent's are
+  unchanged; a database with `datallowconn = false` (and one that is a template) has its foreign servers disabled and its Vault
+  secret rewritten and keeps its flags. Under systemd `tests/linux/branching-egress.sh` checks that the denied unit hides the resolver
+  socket, D-Bus and nscd inside its mount namespace and still hides the master key, and that the paths are gone from the drop-in after delete.
 * Outbound isolation: `TestIntegrationCloneIsolatesTheParentsIntegrations` also checks, on the exec backend, that the
   branch reports `egress: unenforced` with a detail that says "egress NOT blocked", that the paused cron job is
   recorded in `sbctl_branch.paused_cron_jobs` (and the table is absent with `keep_cron_jobs`), and that
@@ -503,6 +568,10 @@ in the job summary). On ext4 the clone is a restore, so its cost grows with the 
 is a full copy; on XFS and APFS it stays flat.
 
 ## Not done, not verified
+
+* **`with_data` is not restricted by role yet.** Until roles exist (workstream K, part 2) anyone who can create a branch can
+  ask for the data; the followup is to require Owner or Administrator for it. The credentials that are not detected are an
+  accepted residual risk (see "What a branch with data can and cannot reach").
 
 * **Edge Functions are not copied by branching yet.** They are workstream J (v1, in progress on
   `ws/j-functions`: the `sb-edge-runtime` unit, the tenant-aware main service, and the materializer

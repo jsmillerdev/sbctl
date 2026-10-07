@@ -177,21 +177,22 @@ func (r *RewriteResult) add(it RewrittenCredential) {
 }
 
 // rewriteCredentials runs rewriteDatabase in every database of the cluster at dsn.
-func rewriteCredentials(ctx context.Context, dsn string, sw *credentialSwap) (RewriteResult, error) {
-	var res RewriteResult
+func rewriteCredentials(ctx context.Context, dsn string, sw *credentialSwap) (res RewriteResult, err error) {
+	dbs, _, restore, err := openDatabases(ctx, dsn)
+	if err != nil {
+		return res, err
+	}
+	defer func() {
+		if rerr := restore(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	c, err := connect(ctx, dsn, "")
 	if err != nil {
 		return res, err
 	}
-	rows, err := c.Query(ctx, `select datname from pg_database where datallowconn and not datistemplate order by datname`)
-	var dbs []string
-	if err == nil {
-		dbs, err = pgx.CollectRows(rows, pgx.RowTo[string])
-	}
-	if err == nil {
-		// The settings catalog is shared by all databases: once, from the first connection.
-		err = rewriteSettings(ctx, c, sw, &res)
-	}
+	// The settings catalog is shared by all databases: once, from the first connection.
+	err = rewriteSettings(ctx, c, sw, &res)
 	closeConn(c)
 	if err != nil {
 		return res, fmt.Errorf("database and role settings: %w", err)
