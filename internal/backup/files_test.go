@@ -551,3 +551,290 @@ func TestRestoreReportsFilesThatFailAfterTheDatabaseCameBack(t *testing.T) {
 		t.Fatalf("no restore.files_failed event: %+v", evs)
 	}
 }
+
+// A nightly run copies the files first and takes the base backup after, so the snapshot a
+// backup is paired with finished before the backup did. "restore --to backup" must pick that
+// one: not the previous night's, and not none at all for the very first backup.
+func TestRestoreToBackupBringsBackTheFilesOfThatRun(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	src := e.addProject(t, testRef)
+	fns := newFakeFunctions()
+	e.svc.opt.Functions = fns
+	fm := &fakeManager{e: e}
+	e.svc.opt.Manager = fm
+	night := func(n int, content string) Manifest {
+		e.putObject(t, testRef, "b/o/v1", []byte(content), e.now.Add(-time.Hour))
+		fns.deploy(testRef, fnRec("hello", n, e.now), FunctionFile{Path: "index.ts", Content: []byte(content)})
+		if _, err := e.svc.BackupFiles(ctx, testRef, FilesOptions{Reason: ReasonScheduled}); err != nil {
+			t.Fatal(err)
+		}
+		e.now = e.now.Add(2 * time.Minute) // the base backup follows
+		return e.storeBase(t, testRef, fakeDataDir(t), e.now, src)
+	}
+	restoreAs := func(as string, o RestoreOptions) {
+		t.Helper()
+		fm.dataDir = filepath.Join(t.TempDir(), "restored")
+		o.ToBackup = true
+		if _, err := e.svc.RestoreWith(ctx, testRef, time.Time{}, as, o); err != nil {
+			t.Fatalf("restore --to backup --as %s: %v", as, err)
+		}
+	}
+	wantFiles := func(ref, content string) {
+		t.Helper()
+		if got := readTree(t, e.objectsDir(ref)); len(got) != 1 || string(got["b/o/v1"]) != content {
+			t.Errorf("%s: objects = %v, want %q", ref, got, content)
+		}
+		files, err := fns.FunctionFiles(ctx, ref, "hello")
+		if err != nil || len(files) != 1 || string(files[0].Content) != content {
+			t.Errorf("%s: function = %v, %v, want %q", ref, files, err, content)
+		}
+	}
+
+	// The first backup ever.
+	first := night(1, "night one")
+	restoreAs(testRef2, RestoreOptions{})
+	wantFiles(testRef2, "night one")
+
+	// A second night: the newest backup gets the second night's files, the first backup
+	// still gets the first night's.
+	e.now = e.now.Add(24 * time.Hour)
+	night(2, "night two")
+	restoreAs(testRef3, RestoreOptions{})
+	wantFiles(testRef3, "night two")
+	const ref4 = "cdefghijklmnopqrstuv"
+	restoreAs(ref4, RestoreOptions{BackupID: first.ID})
+	wantFiles(ref4, "night one")
+
+	// In place, the same pick applies.
+	e.putObject(t, testRef, "b/o/v1", []byte("damaged"), e.now)
+	writeFile(t, filepath.Join(e.svc.opt.DataDir(testRef), "PG_VERSION"), []byte("old"))
+	restoreAs("", RestoreOptions{Force: true, BackupID: first.ID})
+	wantFiles(testRef, "night one")
+}
+
+// Restoring files into an existing project that has functions or secrets would overwrite
+// those with the same names, so it is refused and nothing is written.
+func TestRestoreFilesRefusesAProjectThatHasFunctions(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	fns := newFakeFunctions()
+	e.svc.opt.Functions = fns
+	e.addProject(t, testRef)
+	e.addProject(t, testRef2)
+	e.putObject(t, testRef, "b/o/v1", []byte("object"), e.now.Add(-time.Hour))
+	fns.deploy(testRef, fnRec("hello", 1, e.now), FunctionFile{Path: "index.ts", Content: []byte("source project")})
+	if _, err := e.svc.BackupFiles(ctx, testRef, FilesOptions{Reason: ReasonScheduled}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The target has its own function of the same name, and a secret.
+	fns.deploy(testRef2, fnRec("hello", 2, e.now), FunctionFile{Path: "index.ts", Content: []byte("target project")})
+	fns.secrets[testRef2] = map[string][]byte{"STRIPE_KEY": []byte("sealed")}
+	_, err := e.svc.RestoreFiles(ctx, testRef, testRef2, FilesRestoreOptions{Latest: true, RequireProject: true})
+	if err == nil || !strings.Contains(err.Error(), "already has 1 Edge Functions and 1 function secrets") {
+		t.Fatalf("restore into a populated project = %v", err)
+	}
+	files, _ := fns.FunctionFiles(ctx, testRef2, "hello")
+	if len(files) != 1 || string(files[0].Content) != "target project" || string(fns.secrets[testRef2]["STRIPE_KEY"]) != "sealed" {
+		t.Fatalf("the target was changed: %v %v", files, fns.secrets[testRef2])
+	}
+	if _, err := os.Stat(e.objectsDir(testRef2)); err == nil {
+		t.Fatal("objects were restored although the functions were refused")
+	}
+
+	// A project with none takes the files and gets new function ids.
+	e.addProject(t, testRef3)
+	if _, err := e.svc.RestoreFiles(ctx, testRef, testRef3, FilesRestoreOptions{Latest: true, RequireProject: true}); err != nil {
+		t.Fatal(err)
+	}
+	src, _ := fns.ListFunctions(ctx, testRef)
+	dst, _ := fns.ListFunctions(ctx, testRef3)
+	if len(dst) != 1 || dst[0].Slug != "hello" || dst[0].Version != src[0].Version || !dst[0].UpdatedAt.Equal(src[0].UpdatedAt) {
+		t.Fatalf("restored functions = %+v, source %+v", dst, src)
+	}
+	if dst[0].ID == src[0].ID || !validUUID(dst[0].ID) {
+		t.Fatalf("the copy keeps the source's id or has a bad one: %q vs %q", dst[0].ID, src[0].ID)
+	}
+}
+
+func validUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch {
+		case i == 8 || i == 13 || i == 18 || i == 23:
+			if c != '-' {
+				return false
+			}
+		case !strings.ContainsRune("0123456789abcdef", c):
+			return false
+		}
+	}
+	return s[14] == '4'
+}
+
+// A file that has the same content as another file being stored must not be recorded as
+// stored until that upload has succeeded: the other file may change under its upload and
+// retry under a new hash, leaving this one's blob unwritten.
+func TestHasWaitsForTheUploadOfTheSameContent(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	bw, err := e.svc.newBlobWriter(testRef, KindStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bw.close()
+	hash := fmt.Sprintf("%x", sum256([]byte("content")))
+	started, release := make(chan struct{}), make(chan struct{})
+	uploadErr := make(chan error, 1)
+	go func() {
+		uploadErr <- bw.ensure(ctx, hash, func() (int64, error) {
+			close(started)
+			<-release
+			return 0, errChanged // the first file changed under its upload
+		})
+	}()
+	<-started
+	got := make(chan bool, 1)
+	go func() {
+		ok, err := bw.has(ctx, hash)
+		if err != nil {
+			t.Error(err)
+		}
+		got <- ok
+	}()
+	select {
+	case ok := <-got:
+		t.Fatalf("has answered %v while the upload was still running", ok)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-uploadErr; !errors.Is(err, errChanged) {
+		t.Fatalf("upload = %v", err)
+	}
+	if ok := <-got; ok {
+		t.Fatal("has reported a blob as stored after its upload failed")
+	}
+}
+
+// A pre-restore snapshot is never picked by a restore to a time, so it must not become the
+// retention anchor and push out the older snapshot that a restore to the start of the window
+// needs. It is kept for the window like any other and then dropped.
+func TestPruneAnchorIgnoresPreRestoreSnapshots(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.cfg.Backup.RetentionDays = 7
+	base := time.Now().UTC()
+	snap := func(day int, reason, content string) *FilesSnapshot {
+		e.now = base.Add(time.Duration(day) * 24 * time.Hour)
+		e.putObject(t, testRef, "b/o/v1", []byte(content), base.Add(-time.Duration(day+1)*time.Hour))
+		s, err := e.svc.backupStorage(ctx, testRef, reason)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	a := snap(0, ReasonScheduled, "day zero")
+	preOld := snap(1, ReasonPreRestore, "before a restore")
+	snap(2, ReasonScheduled, "day two") // still before the window at day 10: day 3 on
+	c := snap(8, ReasonScheduled, "day eight")
+	preNew := snap(9, ReasonPreRestore, "before another restore")
+
+	e.now = base.Add(10 * 24 * time.Hour)
+	if _, err := e.svc.Prune(ctx, testRef); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := e.svc.ListFilesSnapshots(ctx, testRef, KindStorage)
+	var got []string
+	for _, m := range all {
+		got = append(got, m.ID)
+	}
+	// Anchor: the newest normal snapshot before the window (day 2); a and preOld are out.
+	if len(all) != 3 || got[1] != c.ID || got[2] != preNew.ID {
+		t.Fatalf("kept %v; a=%s preOld=%s c=%s preNew=%s", got, a.ID, preOld.ID, c.ID, preNew.ID)
+	}
+	if all[0].Reason != ReasonScheduled || !all[0].StopTime.Before(base.Add(3*24*time.Hour)) {
+		t.Fatalf("the anchor is %+v, want the day-two snapshot", all[0])
+	}
+}
+
+// storeHook runs a function before every List, so a test can start "a backup" at the moment
+// the sweep is about to delete.
+type storeHook struct {
+	Store
+	onList func(prefix string)
+}
+
+func (h *storeHook) List(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	if h.onList != nil {
+		h.onList(prefix)
+	}
+	return h.Store.List(ctx, prefix)
+}
+
+// A backup that starts after the sweep looked at the running markers may be about to
+// reference a blob the sweep has chosen to delete. The sweep looks again before it deletes.
+func TestPruneSweepLooksAgainBeforeDeletingBlobs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		start func(t *testing.T, e *testEnv)
+	}{
+		{"a run that left its marker", func(t *testing.T, e *testEnv) {
+			marker := runningDir(testRef, KindStorage) + "late"
+			if err := e.store.Put(context.Background(), marker, strings.NewReader("x")); err != nil {
+				t.Fatal(err)
+			}
+			young := e.now.Add(-time.Hour)
+			if err := os.Chtimes(e.store.path(marker), young, young); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a run that already finished", func(t *testing.T, e *testEnv) {
+			key := snapshotsDir(testRef, KindStorage) + "late-run/" + summaryName
+			if err := e.store.Put(context.Background(), key, strings.NewReader("{}")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t)
+			ctx := context.Background()
+			e.cfg.Backup.RetentionDays = 7
+			base := time.Now().UTC()
+			for i, content := range []string{"only in a", "only in b", "only in c"} {
+				e.now = base.Add([]time.Duration{0, 24 * time.Hour, 10 * 24 * time.Hour}[i])
+				os.RemoveAll(e.objectsDir(testRef))
+				e.putObject(t, testRef, "b/o/v1", []byte(content), base.Add(-time.Duration(i+1)*time.Hour))
+				if _, err := e.svc.backupStorage(ctx, testRef, ReasonScheduled); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.now = base.Add(12 * 24 * time.Hour)
+			lists := 0
+			hs := &storeHook{Store: e.store}
+			hs.onList = func(prefix string) {
+				if prefix == runningDir(testRef, KindStorage) {
+					if lists++; lists == 2 { // the look right before the delete
+						tc.start(t, e)
+					}
+				}
+			}
+			e.svc.opt.Store = hs
+			res, err := e.svc.Prune(ctx, testRef)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.DeletedBlobs != 0 || len(blobList(t, e, testRef, KindStorage)) != 3 {
+				t.Fatalf("blobs were deleted although a run had started: %+v, %d blobs", res, len(blobList(t, e, testRef, KindStorage)))
+			}
+			// With nothing new, the next prune sweeps a's blob.
+			e.svc.opt.Store = e.store
+			e.store.Delete(ctx, runningDir(testRef, KindStorage)+"late", snapshotsDir(testRef, KindStorage)+"late-run/"+summaryName)
+			if res, err = e.svc.Prune(ctx, testRef); err != nil || res.DeletedBlobs != 1 {
+				t.Fatalf("later prune = %+v, %v", res, err)
+			}
+		})
+	}
+}

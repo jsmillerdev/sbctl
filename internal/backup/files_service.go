@@ -142,6 +142,9 @@ func (s *Service) RestoreFiles(ctx context.Context, ref, into string, o FilesRes
 	res := &FilesRestoreResult{}
 	stamp := s.opt.Now().UTC().Format("20060102T150405Z")
 	var errs []error
+
+	// Choose the snapshots first, so that a refusal below happens before anything is written.
+	picks := map[string]*FilesSnapshot{}
 	for _, kind := range []string{KindStorage, KindFunctions} {
 		all, err := s.ListFilesSnapshots(ctx, ref, kind)
 		if err != nil {
@@ -163,6 +166,24 @@ func (s *Service) RestoreFiles(ctx context.Context, ref, into string, o FilesRes
 					ref, kindName(kind), all[0].StopTime.UTC().Format(time.RFC3339))
 				continue
 			}
+		}
+		picks[kind] = snap
+	}
+	if len(errs) > 0 {
+		return res, errors.Join(errs...)
+	}
+	// Deployments and secrets are rows, and a restore writes them by name. Into a project
+	// that has some, it would overwrite its functions and secrets of the same names with no
+	// way back, so such a target is refused, as a target that holds objects is.
+	if _, ok := picks[KindFunctions]; ok && !replace && s.opt.Functions != nil {
+		if err := s.requireNoFunctions(ctx, into); err != nil {
+			return res, err
+		}
+	}
+	for _, kind := range []string{KindStorage, KindFunctions} {
+		snap := picks[kind]
+		if snap == nil {
+			continue
 		}
 		switch kind {
 		case KindStorage:
@@ -200,6 +221,22 @@ func (s *Service) RestoreFiles(ctx context.Context, ref, into string, o FilesRes
 		}
 	}
 	return res, errors.Join(errs...)
+}
+
+// requireNoFunctions refuses a restore target that already has Edge Functions or secrets.
+func (s *Service) requireNoFunctions(ctx context.Context, ref string) error {
+	recs, err := s.opt.Functions.ListFunctions(ctx, ref)
+	if err != nil {
+		return err
+	}
+	secs, err := s.opt.Functions.ListFunctionSecrets(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if len(recs) > 0 || len(secs) > 0 {
+		return fmt.Errorf("backup: project %s already has %d Edge Functions and %d function secrets, and restoring into it would overwrite those with the same names; restore into a project that has none (`supavise backups restore --as` creates one), or replace its own files from its own backup with --force", ref, len(recs), len(secs))
+	}
+	return nil
 }
 
 func kindName(kind string) string {

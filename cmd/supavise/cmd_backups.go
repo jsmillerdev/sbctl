@@ -126,15 +126,8 @@ func init() {
 			defer closeFn()
 			w := cmd.OutOrStdout()
 			var errs []error
-			if !createFilesOnly {
-				rec, err := svc.BaseBackupWith(cmd.Context(), args[0], backup.BackupOptions{Reason: createReason})
-				if err != nil {
-					errs = append(errs, err)
-				} else {
-					fmt.Fprintf(w, "backup %d of %s complete: %s, %s stored, WAL %s to %s (timeline %d)\n",
-						rec.ID, rec.Ref, rec.Location, humanBytes(rec.SizeBytes), rec.StartLSN, rec.StopLSN, rec.Timeline)
-				}
-			}
+			// The files go first: the snapshot a "restore --to backup" pairs with a base backup
+			// is the newest one that finished before the backup did, so it must be this run's.
 			if !createSkipFiles {
 				res, err := svc.BackupFiles(cmd.Context(), args[0], backup.FilesOptions{Reason: createReason})
 				if res != nil {
@@ -142,6 +135,15 @@ func init() {
 				}
 				if err != nil {
 					errs = append(errs, err)
+				}
+			}
+			if !createFilesOnly {
+				rec, err := svc.BaseBackupWith(cmd.Context(), args[0], backup.BackupOptions{Reason: createReason})
+				if err != nil {
+					errs = append(errs, err)
+				} else {
+					fmt.Fprintf(w, "backup %d of %s complete: %s, %s stored, WAL %s to %s (timeline %d)\n",
+						rec.ID, rec.Ref, rec.Location, humanBytes(rec.SizeBytes), rec.StartLSN, rec.StopLSN, rec.Timeline)
 				}
 			}
 			if err := errors.Join(errs...); err != nil {
@@ -332,7 +334,7 @@ func init() {
 			"project's own files are replaced, which needs --force: the old objects directory is kept as\n" +
 			"<dir>.pre-restore-<time>, and the current deployments are snapshotted first (reason\n" +
 			"pre-restore; --snapshot <id> brings one back). With --into <ref> the files go to that\n" +
-			"existing project, which must hold no objects.",
+			"existing project, which must hold no objects, Edge Functions or function secrets.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fo := backup.FilesRestoreOptions{SnapshotID: rfSnapshot, RequireProject: true,
@@ -523,26 +525,59 @@ const keyReminder = "The master key is not in your backups. It unseals the passw
 	"Run `sudo -u supavise supavise system export-key` and keep the output offline, or\n" +
 	"`sudo -u supavise supavise system escrow-key --passphrase-file <file>` to keep a copy in the backup backend, encrypted with a passphrase only you know."
 
-// escrowState looks for the master key's encrypted copy in the backend. It returns nil, nil
-// when there is none, and an error when the backend could not be asked.
-func escrowState(ctx context.Context, cfg *config.Config) (info *backup.EscrowInfo, err error) {
+// escrowStatus is what the backend holds in the way of encrypted copies of master keys.
+type escrowStatus struct {
+	All []backup.EscrowInfo
+	// NodeKeyID is the key id of this node's key, or empty when the key file cannot be read
+	// by the current user.
+	NodeKeyID string
+	// Mine is the copy of this node's key, if the backend has one.
+	Mine *backup.EscrowInfo
+}
+
+// covered reports whether the node's key has an encrypted copy in the backend. When the key
+// cannot be read (so the copies cannot be compared with it), any copy counts.
+func (e *escrowStatus) covered() bool {
+	if e.NodeKeyID == "" {
+		return len(e.All) > 0
+	}
+	return e.Mine != nil
+}
+
+// escrowState looks for the master key's encrypted copy in the backend. It returns an error
+// when the backend could not be asked.
+func escrowState(ctx context.Context, cfg *config.Config) (*escrowStatus, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	st, err := backup.OpenStore(ctx, cfg.Backup)
 	if err != nil {
 		return nil, err
 	}
-	return backup.KeyEscrowInfo(ctx, st)
+	all, err := backup.ListKeyEscrows(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+	e := &escrowStatus{All: all}
+	if b, rerr := os.ReadFile(cfg.KeyPath); rerr == nil {
+		e.NodeKeyID = backup.KeyID(string(b))
+		for i := range all {
+			if all[i].KeyID == e.NodeKeyID {
+				e.Mine = &all[i]
+			}
+		}
+	}
+	return e, nil
 }
 
-// remindKeyEscrow prints keyReminder to w when the backend has no escrow. It says nothing
-// when the backend cannot be asked: the backup that just ran did not need the answer.
+// remindKeyEscrow prints keyReminder to w when the backend has no copy of the node's key. It
+// says nothing when the backend cannot be asked: the backup that just ran did not need the
+// answer.
 func remindKeyEscrow(ctx context.Context, w io.Writer) {
 	cfg, err := loadConfig()
 	if err != nil {
 		return
 	}
-	if info, err := escrowState(ctx, cfg); err == nil && info == nil {
+	if st, err := escrowState(ctx, cfg); err == nil && !st.covered() {
 		fmt.Fprintln(w, keyReminder)
 	}
 }
@@ -567,18 +602,24 @@ func printBackupStatus(cmd *cobra.Command) error {
 	} else {
 		fmt.Fprintln(w, "storage:    objects and Edge Functions are copied to the backend with each nightly backup")
 	}
-	info, err := escrowState(cmd.Context(), cfg)
+	st, err := escrowState(cmd.Context(), cfg)
 	switch {
 	case err != nil:
 		fmt.Fprintf(w, "master key: could not check the backend for an encrypted copy: %v\n", err)
-	case info == nil:
-		fmt.Fprintf(w, "master key: NOT backed up\n%s\n", keyReminder)
+	case st.Mine != nil:
+		fmt.Fprintf(w, "master key: encrypted copy in the backend, made %s, key id %s: this node's key\n", st.Mine.Created.UTC().Format(time.RFC3339), st.Mine.KeyID)
+	case st.NodeKeyID == "" && len(st.All) > 0:
+		fmt.Fprintf(w, "master key: %d encrypted copy(ies) in the backend; this user cannot read key_path, so they cannot be compared with this node's key\n", len(st.All))
 	default:
-		cur := "this node's key"
-		if b, rerr := os.ReadFile(cfg.KeyPath); rerr == nil && backup.KeyID(string(b)) != info.KeyID {
-			cur = "NOT this node's key (made for another key; run `supavise system escrow-key` again)"
+		fmt.Fprintf(w, "master key: NOT backed up\n%s\n", keyReminder)
+	}
+	if err == nil {
+		for _, o := range st.All {
+			if o.KeyID != st.NodeKeyID && st.NodeKeyID != "" {
+				fmt.Fprintf(w, "            the backend also holds the copy of another master key (key id %s, made %s); `system restore-key --key-id %s` opens it\n",
+					o.KeyID, o.Created.UTC().Format(time.RFC3339), o.KeyID)
+			}
 		}
-		fmt.Fprintf(w, "master key: encrypted copy in the backend, made %s, key id %s: %s\n", info.Created.UTC().Format(time.RFC3339), info.KeyID, cur)
 	}
 	return nil
 }

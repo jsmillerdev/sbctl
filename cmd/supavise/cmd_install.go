@@ -297,7 +297,7 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	// The summary reminds the operator while the backend has no copy of the key. A backend
 	// that cannot be asked counts as having none: the reminder costs a line, silence could
 	// cost the key.
-	if info, err := escrowState(in.ctx, cfg); err == nil && info != nil {
+	if st, err := escrowState(in.ctx, cfg); err == nil && st.covered() {
 		o.KeyEscrowed = true
 	}
 

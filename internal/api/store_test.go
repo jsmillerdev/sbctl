@@ -117,6 +117,42 @@ func testStore(t *testing.T, s Store, ref string) {
 		t.Fatalf("files outlive their function: %+v", files)
 	}
 
+	// RestoreFunction (backups) stores a deployment as given, identifier, version and
+	// timestamps included, and replaces what the slug had.
+	at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	rf := Function{Ref: ref, Slug: "restored", ID: "c0ffee00-0000-4000-8000-000000000001", Name: "Restored", Version: 7, Status: "ACTIVE",
+		VerifyJWT: false, EntrypointPath: "index.ts", ImportMapPath: "deno.json", CreatedAt: at.Add(-time.Hour), UpdatedAt: at}
+	if err := s.RestoreFunction(ctx, rf, []FunctionFile{{Path: "index.ts", Content: []byte("r1")}, {Path: "deno.json", Content: []byte("{}")}}); err != nil {
+		t.Fatalf("restore fn: %v", err)
+	}
+	gf, err := s.GetFunction(ctx, ref, "restored")
+	if err != nil || gf.ID != rf.ID || gf.Version != 7 || gf.VerifyJWT || gf.ImportMapPath != "deno.json" || gf.EntrypointPath != "index.ts" ||
+		!gf.CreatedAt.Equal(rf.CreatedAt) || !gf.UpdatedAt.Equal(rf.UpdatedAt) {
+		t.Fatalf("restored fn = %+v, %v", gf, err)
+	}
+	if files, err := s.FunctionFiles(ctx, ref, "restored"); err != nil || len(files) != 2 {
+		t.Fatalf("restored files = %+v, %v", files, err)
+	}
+	rf.ID, rf.Version, rf.ImportMapPath = "c0ffee00-0000-4000-8000-000000000002", 8, ""
+	if err := s.RestoreFunction(ctx, rf, []FunctionFile{{Path: "index.ts", Content: []byte("r2")}}); err != nil {
+		t.Fatalf("restore over an existing fn: %v", err)
+	}
+	if gf, err = s.GetFunction(ctx, ref, "restored"); err != nil || gf.ID != rf.ID || gf.Version != 8 || gf.ImportMapPath != "" {
+		t.Fatalf("replaced fn = %+v, %v", gf, err)
+	}
+	if files, _ := s.FunctionFiles(ctx, ref, "restored"); len(files) != 1 || string(files[0].Content) != "r2" {
+		t.Fatalf("restore must replace the files: %+v", files)
+	}
+	if err := s.RestoreFunction(ctx, rf, nil); err != nil {
+		t.Fatal(err)
+	}
+	if files, _ := s.FunctionFiles(ctx, ref, "restored"); len(files) != 0 {
+		t.Fatalf("a restore without files leaves none: %+v", files)
+	}
+	if err := s.DeleteFunction(ctx, ref, "restored"); err != nil {
+		t.Fatal(err)
+	}
+
 	// function secrets
 	if err := s.PutFunctionSecrets(ctx, ref, map[string][]byte{"A": []byte("1"), "B": []byte("2")}); err != nil {
 		t.Fatal(err)

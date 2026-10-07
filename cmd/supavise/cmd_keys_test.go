@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jsmillerdev/supavise/internal/backup"
 	"github.com/jsmillerdev/supavise/internal/config"
 )
 
@@ -163,5 +164,43 @@ func TestSummaryRemindsAboutTheKeyUntilItIsEscrowed(t *testing.T) {
 	}
 	if strings.Contains(with.String(), "master key") {
 		t.Errorf("the summary of an install with an escrow still talks about the master key:\n%s", with.String())
+	}
+}
+
+// A rebuilt node installs with a new key and escrows it into the same bucket. That must not
+// destroy the old node's copy, and restore-key must make the operator choose between them.
+func TestEscrowOfANewKeyKeepsTheOldNodesCopy(t *testing.T) {
+	cfg, key, dir := keysNode(t)
+	pass := writePass(t, dir, "correct horse battery staple", 0o600)
+	if out, err := runRoot(t, "--config", cfg, "system", "escrow-key", "--passphrase-file", pass); err != nil {
+		t.Fatalf("escrow-key = %q, %v", out, err)
+	}
+
+	// The new node: another key, the same backend.
+	newKey := strings.Repeat("ab", 32)
+	if err := os.WriteFile(key, []byte(newKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runRoot(t, "--config", cfg, "system", "escrow-key", "--passphrase-file", pass)
+	if err != nil || !strings.Contains(out, "also holds the copy of another master key") || !strings.Contains(out, "--key-id") {
+		t.Fatalf("escrow-key of the new key = %q, %v (it must say that the old copy was kept)", out, err)
+	}
+	if out, err = runRoot(t, "--config", cfg, "backups", "status"); err != nil || !strings.Contains(out, "this node's key") || !strings.Contains(out, "another master key") {
+		t.Fatalf("status = %q, %v", out, err)
+	}
+
+	// Two copies: restore-key asks which one.
+	if _, err = runRoot(t, "--config", cfg, "system", "restore-key", "--passphrase-file", pass, "--config-out", "", "--force"); err == nil || !strings.Contains(err.Error(), "--key-id") && !strings.Contains(err.Error(), "key id") {
+		t.Fatalf("restore-key with two copies = %v", err)
+	}
+	if b, _ := os.ReadFile(key); strings.TrimSpace(string(b)) != newKey {
+		t.Fatal("restore-key changed the key although it could not tell which copy to use")
+	}
+	oldID := backup.KeyID(keysTestKey)
+	if out, err = runRoot(t, "--config", cfg, "system", "restore-key", "--passphrase-file", pass, "--config-out", "", "--key-id", oldID, "--force"); err != nil {
+		t.Fatalf("restore-key --key-id = %q, %v", out, err)
+	}
+	if b, _ := os.ReadFile(key); strings.TrimSpace(string(b)) != keysTestKey {
+		t.Fatalf("the old key did not come back: %q", b)
 	}
 }

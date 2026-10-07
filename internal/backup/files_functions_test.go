@@ -142,14 +142,14 @@ func TestFunctionsBackupIsIncrementalAndRestoresExactly(t *testing.T) {
 		t.Fatalf("snapshot 3 = %+v (loads %d), %v", s3, fns.loads, err)
 	}
 
-	// Restore snapshot 2 (the one before v4) as a new project: records come back exactly,
-	// with their versions, ids and timestamps.
+	// Restore snapshot 2 (the one before v4) as a new project: records come back with their
+	// versions and timestamps, and a new id each (ids are unique across projects).
 	res, err := e.svc.RestoreFiles(ctx, testRef, testRef2, FilesRestoreOptions{SnapshotID: s2.ID})
 	if err != nil || res.Functions == nil {
 		t.Fatalf("restore = %+v, %v", res, err)
 	}
 	got, _ := fns.ListFunctions(ctx, testRef2)
-	if len(got) != 3 || got[1].Slug != "hello" || got[1].Version != 3 || !got[1].UpdatedAt.Equal(t0) || got[1].ID != fnRec("hello", 3, t0).ID {
+	if len(got) != 3 || got[1].Slug != "hello" || got[1].Version != 3 || !got[1].UpdatedAt.Equal(t0) || got[1].ID == fnRec("hello", 3, t0).ID || !validUUID(got[1].ID) {
 		t.Fatalf("restored records = %+v", got)
 	}
 	files, _ := fns.FunctionFiles(ctx, testRef2, "hello")

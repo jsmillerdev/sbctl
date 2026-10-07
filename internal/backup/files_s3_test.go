@@ -87,15 +87,15 @@ func runFilesOverS3(t *testing.T, o S3Options) {
 	// The key escrow over the same backend: seal, find, open.
 	cheapKDF(t)
 	pass := []byte("a long enough passphrase")
-	if err := PutKeyEscrow(ctx, st, pass, EscrowContents{MasterKey: testKey, ConfigTOML: "x = 1\n"}, time.Now()); err != nil {
+	if _, err := PutKeyEscrow(ctx, st, pass, EscrowContents{MasterKey: testKey, ConfigTOML: "x = 1\n"}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	got, err := GetKeyEscrow(ctx, st, pass)
+	got, err := GetKeyEscrow(ctx, st, pass, "")
 	if err != nil || got.MasterKey != testKey {
 		t.Fatalf("escrow over S3 = %+v, %v", got, err)
 	}
-	if info, err := KeyEscrowInfo(ctx, st); err != nil || info == nil || info.KeyID != KeyID(testKey) {
-		t.Fatalf("escrow info over S3 = %+v, %v", info, err)
+	if all, err := ListKeyEscrows(ctx, st); err != nil || len(all) != 1 || all[0].KeyID != KeyID(testKey) {
+		t.Fatalf("escrow list over S3 = %+v, %v", all, err)
 	}
 }
 

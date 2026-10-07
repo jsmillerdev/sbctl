@@ -298,6 +298,7 @@ type blobWriter struct {
 type blobState struct {
 	once sync.Once
 	err  error
+	done chan struct{} // closed when once has finished, so err is final
 }
 
 func (s *Service) newBlobWriter(ref, kind string) (*blobWriter, error) {
@@ -313,8 +314,17 @@ func (w *blobWriter) close() { w.enc.Close() }
 // has reports whether the backend holds the blob for hash, without uploading anything.
 func (w *blobWriter) has(ctx context.Context, hash string) (bool, error) {
 	if v, ok := w.seen.Load(hash); ok {
-		if st := v.(*blobState); st.err == nil {
-			return true, nil // being stored by another file of this run, or already there
+		// Another file of this run is storing the blob or found it there. Wait for its
+		// outcome: "stored" is only true once the upload has finished, and a failed one
+		// (the other file changed under it) is retried by whoever needs the blob next.
+		st := v.(*blobState)
+		select {
+		case <-st.done:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+		if st.err == nil {
+			return true, nil
 		}
 	}
 	_, err := w.s.opt.Store.Stat(ctx, blobKey(w.ref, w.kind, hash))
@@ -327,9 +337,10 @@ func (w *blobWriter) has(ctx context.Context, hash string) (bool, error) {
 // ensure makes sure the backend holds the blob for hash, calling upload (which returns the
 // stored size) only if it does not. Files of one run with the same content share the outcome.
 func (w *blobWriter) ensure(ctx context.Context, hash string, upload func() (int64, error)) error {
-	v, _ := w.seen.LoadOrStore(hash, &blobState{})
+	v, _ := w.seen.LoadOrStore(hash, &blobState{done: make(chan struct{})})
 	st := v.(*blobState)
 	st.once.Do(func() {
+		defer close(st.done)
 		_, err := w.s.opt.Store.Stat(ctx, blobKey(w.ref, w.kind, hash))
 		switch {
 		case err == nil:

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,12 +24,29 @@ import (
 // (/etc/supavise/master.key), so a backend alone cannot rebuild a node. The key never goes
 // to the backend in the clear. With an operator passphrase it can go there encrypted:
 // the key and config.toml are sealed with AES-256-GCM under a key that argon2id derives
-// from the passphrase, and stored once at EscrowKey. The passphrase is the operator's to
-// keep; nothing on the node holds it, so the nightly timer never touches the escrow.
+// from the passphrase, and stored at EscrowKeyFor(key id). The passphrase is the operator's
+// to keep; nothing on the node holds it, so the nightly timer never touches the escrow.
+//
+// Each master key has its own escrow object. A node rebuilt from a bucket gets a new key
+// when it is installed, and a single shared object would let that install overwrite the
+// only copy of the old node's key, the one the existing backups need. With one object per
+// key id, no write can destroy another key's copy.
 
-// EscrowKey is the escrow's key in the backend. "_node" is not a project ref, so prune and
-// the restore-as-new check never mistake it for a project's tree.
-const EscrowKey = "_node/key-escrow.json"
+// EscrowPrefix starts the key of every escrow in the backend. "_node" is not a project
+// ref, so prune and the restore-as-new check never mistake it for a project's tree.
+const EscrowPrefix = "_node/key-escrow-"
+
+// EscrowKeyFor is the backend key of the escrow of the master key with the given KeyID.
+func EscrowKeyFor(keyID string) string { return EscrowPrefix + keyID + ".json" }
+
+// validKeyID reports whether s looks like a KeyID: 16 lowercase hex digits.
+func validKeyID(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil && s == strings.ToLower(s)
+}
 
 // MinPassphraseLen is the shortest passphrase accepted, in characters.
 const MinPassphraseLen = 12
@@ -80,8 +98,9 @@ type escrowFile struct {
 	Ciphertext []byte `json:"ciphertext"`
 }
 
-// EscrowInfo describes the escrow in the backend without opening it.
+// EscrowInfo describes one escrow in the backend without opening it.
 type EscrowInfo struct {
+	Key     string // backend key
 	Created time.Time
 	KeyID   string
 	Size    int64
@@ -192,48 +211,97 @@ func parseEscrow(blob []byte) (*escrowFile, error) {
 	return &f, nil
 }
 
-// PutKeyEscrow encrypts c under passphrase and stores it in the backend, replacing an
-// earlier escrow.
-func PutKeyEscrow(ctx context.Context, st Store, passphrase []byte, c EscrowContents, now time.Time) error {
+// PutKeyEscrow encrypts c under passphrase and stores it in the backend at the key of c's
+// master key, and returns that backend key. It replaces an earlier escrow of the same key
+// (for example after a config change or a new passphrase) and never touches the escrow of
+// another key.
+func PutKeyEscrow(ctx context.Context, st Store, passphrase []byte, c EscrowContents, now time.Time) (string, error) {
 	blob, err := SealEscrow(passphrase, c, now)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return st.Put(ctx, EscrowKey, bytes.NewReader(append(blob, '\n')))
+	key := EscrowKeyFor(KeyID(c.MasterKey))
+	return key, st.Put(ctx, key, bytes.NewReader(append(blob, '\n')))
 }
 
-// GetKeyEscrow reads and opens the escrow of the backend. ErrNotFound means there is none.
-func GetKeyEscrow(ctx context.Context, st Store, passphrase []byte) (*EscrowContents, error) {
-	rc, err := st.Get(ctx, EscrowKey)
+// AmbiguousEscrowError is what GetKeyEscrow returns when the backend holds escrows of more
+// than one master key and no key id was named.
+type AmbiguousEscrowError struct{ Escrows []EscrowInfo }
+
+func (e *AmbiguousEscrowError) Error() string {
+	var parts []string
+	for _, i := range e.Escrows {
+		parts = append(parts, fmt.Sprintf("%s (made %s)", i.KeyID, i.Created.UTC().Format(time.RFC3339)))
+	}
+	return fmt.Sprintf("backup: the backend holds escrows of %d different master keys: %s; name the one to open by its key id", len(e.Escrows), strings.Join(parts, ", "))
+}
+
+// GetKeyEscrow reads and opens the escrow of the master key with the given key id. An empty
+// keyID means the only escrow the backend holds; with several it returns an
+// *AmbiguousEscrowError. ErrNotFound means there is none.
+func GetKeyEscrow(ctx context.Context, st Store, passphrase []byte, keyID string) (*EscrowContents, error) {
+	if keyID == "" {
+		all, err := ListKeyEscrows(ctx, st)
+		if err != nil {
+			return nil, err
+		}
+		switch len(all) {
+		case 0:
+			return nil, ErrNotFound
+		case 1:
+			keyID = all[0].KeyID
+		default:
+			return nil, &AmbiguousEscrowError{Escrows: all}
+		}
+	}
+	if !validKeyID(keyID) {
+		return nil, fmt.Errorf("backup: %q is not a key id (16 hex digits, as `supavise system export-key` prints it)", keyID)
+	}
+	blob, err := readEscrowObject(ctx, st, EscrowKeyFor(keyID))
+	if err != nil {
+		return nil, err
+	}
+	c, err := OpenEscrow(passphrase, blob)
+	if err != nil {
+		return nil, err
+	}
+	if KeyID(c.MasterKey) != keyID {
+		return nil, errors.New("backup: the escrow stored under this key id holds another key; the file is damaged")
+	}
+	return c, nil
+}
+
+func readEscrowObject(ctx context.Context, st Store, key string) ([]byte, error) {
+	rc, err := st.Get(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
-	blob, err := io.ReadAll(io.LimitReader(rc, 4<<20))
-	if err != nil {
-		return nil, err
-	}
-	return OpenEscrow(passphrase, blob)
+	return io.ReadAll(io.LimitReader(rc, 4<<20))
 }
 
-// KeyEscrowInfo describes the backend's escrow without a passphrase, or returns nil when
-// there is none.
-func KeyEscrowInfo(ctx context.Context, st Store) (*EscrowInfo, error) {
-	rc, err := st.Get(ctx, EscrowKey)
-	if errors.Is(err, ErrNotFound) {
-		return nil, nil
-	}
+// ListKeyEscrows describes the escrows in the backend without a passphrase, oldest first.
+// The list is empty when there are none.
+func ListKeyEscrows(ctx context.Context, st Store) ([]EscrowInfo, error) {
+	objs, err := st.List(ctx, "_node/")
 	if err != nil {
 		return nil, err
 	}
-	defer rc.Close()
-	blob, err := io.ReadAll(io.LimitReader(rc, 4<<20))
-	if err != nil {
-		return nil, err
+	var out []EscrowInfo
+	for _, o := range objs {
+		if !strings.HasPrefix(o.Key, EscrowPrefix) || !strings.HasSuffix(o.Key, ".json") {
+			continue
+		}
+		blob, err := readEscrowObject(ctx, st, o.Key)
+		if err != nil {
+			return nil, err
+		}
+		f, err := parseEscrow(blob)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", o.Key, err)
+		}
+		out = append(out, EscrowInfo{Key: o.Key, Created: f.Created, KeyID: f.KeyID, Size: int64(len(blob))})
 	}
-	f, err := parseEscrow(blob)
-	if err != nil {
-		return nil, err
-	}
-	return &EscrowInfo{Created: f.Created, KeyID: f.KeyID, Size: int64(len(blob))}, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Created.Before(out[j].Created) })
+	return out, nil
 }

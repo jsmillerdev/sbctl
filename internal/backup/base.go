@@ -36,17 +36,16 @@ func (s *Service) BaseBackup(ctx context.Context, ref string) (*registry.Backup,
 // project's cluster is still running and aborts the delete if it fails. It also
 // satisfies lifecycle.DataPlane.Snapshot's shape.
 //
-// The project's Storage objects and function deployments are snapshotted too (BackupFiles):
-// the delete removes them with everything else, and a restore of the final state wants them back.
+// The project's Storage objects and function deployments are snapshotted first
+// (BackupFiles): the delete removes them with everything else, and a restore of the final
+// state wants them back.
 func (s *Service) FinalBackup(ctx context.Context, ref string) (*registry.Backup, error) {
-	rec, err := s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonFinal})
-	if err != nil {
-		return rec, err
-	}
+	// The files go first, so that the snapshot finishes before the base backup does and a
+	// "restore --to backup" of this backup finds it (see pickFilesSnapshot).
 	if _, err := s.BackupFiles(ctx, ref, FilesOptions{Reason: ReasonFinal}); err != nil {
-		return rec, fmt.Errorf("backup: final backup of the files of %s failed: %w", ref, err)
+		return nil, fmt.Errorf("backup: final backup of the files of %s failed: %w", ref, err)
 	}
-	return rec, nil
+	return s.BaseBackupWith(ctx, ref, BackupOptions{Reason: ReasonFinal})
 }
 
 // BaseBackupWith takes a base backup of ref's running cluster.

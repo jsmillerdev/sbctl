@@ -124,7 +124,7 @@ Not entirely. You get organizations, projects, the dashboard, the CLI, branching
 No. Apps use the same client libraries and API paths as on supabase.com; only the host name changes, to `<ref>.api.<domain>`.
 
 **Is my data backed up?**
-Yes: databases, Storage files and Edge Functions. Every database archives its WAL continuously and takes a nightly base backup, and you can restore to any point in the retention window (7 days by default). The nightly run also copies each project's Storage files and Edge Function deployments to the same place, keeping only what changed.
+Yes: databases, Storage files and Edge Functions, unless Storage uses its S3 backend (`[fleet] storage_backend = "s3"`), whose files stay in your own bucket: turn on versioning there. Every database archives its WAL continuously and takes a nightly base backup, and you can restore to any point in the retention window (7 days by default). The nightly run also copies each project's Storage files and Edge Function deployments to the same place, keeping only what changed.
 
 - Backups go to local disk unless you give an S3 bucket. A bucket keeps them off the server.
 - A restore returns files to the last nightly copy before the time you choose, not to that second. Hosted Supabase's database backups do not include Storage files, so this goes further than hosted.

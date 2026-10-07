@@ -65,6 +65,8 @@ func init() {
 			"lost server with `supavise system restore-key`. The key itself never leaves this server in\n" +
 			"the clear, and nothing here stores the passphrase: write it down offline. Without it the\n" +
 			"copy cannot be opened. Run the command again after you change config.toml.\n\n" +
+			"Every master key has its own copy in the backend, so running this on a new node never\n" +
+			"replaces the copy of an older node's key.\n\n" +
 			"The passphrase file holds the passphrase (at least " + fmt.Sprint(backup.MinPassphraseLen) + " characters) and must be mode 0600; use - to read it from\n" +
 			"standard input.",
 		Args: cobra.NoArgs,
@@ -88,11 +90,23 @@ func init() {
 			if err != nil {
 				return err
 			}
-			if err := backup.PutKeyEscrow(ctx, st, pass, backup.EscrowContents{MasterKey: key, ConfigTOML: cfgText}, time.Now()); err != nil {
+			escrowKey, err := backup.PutKeyEscrow(ctx, st, pass, backup.EscrowContents{MasterKey: key, ConfigTOML: cfgText}, time.Now())
+			if err != nil {
 				return err
 			}
 			w := cmd.OutOrStdout()
-			fmt.Fprintf(w, "encrypted copy of the master key (key id %s) and config.toml stored at %s\n", backup.KeyID(key), st.URL(backup.EscrowKey))
+			fmt.Fprintf(w, "encrypted copy of the master key (key id %s) and config.toml stored at %s\n", backup.KeyID(key), st.URL(escrowKey))
+			// Each key has its own copy, so this never replaces another key's. Say so when the
+			// backend holds one: it is usually the previous node's, whose key the existing
+			// backups need.
+			if all, lerr := backup.ListKeyEscrows(ctx, st); lerr == nil {
+				for _, o := range all {
+					if o.KeyID != backup.KeyID(key) {
+						fmt.Fprintf(w, "The backend also holds the copy of another master key (key id %s, made %s). It was kept. If it belongs to a node this one replaces, `supavise system restore-key --key-id %s` brings that key back.\n",
+							o.KeyID, o.Created.UTC().Format(time.RFC3339), o.KeyID)
+					}
+				}
+			}
 			fmt.Fprintln(w, "Keep the passphrase offline: nothing on this server stores it, and without it the copy cannot be opened.")
 			if strings.HasPrefix(cfg.Backup.Backend, "file://") {
 				fmt.Fprintln(w, "WARNING: the backend is a directory on this server, so this copy is lost with the server's disk. Copy it elsewhere, or use an S3 bucket.")
@@ -103,7 +117,7 @@ func init() {
 	escrow.Flags().StringVar(&escrowPass, "passphrase-file", "", "file holding the passphrase (mode 0600), or - for standard input")
 	_ = escrow.MarkFlagRequired("passphrase-file")
 
-	var rPass, rKeyOut, rConfigOut string
+	var rPass, rKeyOut, rConfigOut, rKeyID string
 	var rForce bool
 	restoreKey := &cobra.Command{
 		Use:   "restore-key --passphrase-file <file>",
@@ -112,7 +126,11 @@ func init() {
 			"opens it with the passphrase and writes the key to key_path (or --key-out), mode 0600. The\n" +
 			"command needs a config.toml that names the backend and its credentials; with --config-out\n" +
 			"it also writes the config.toml saved in the copy. It never replaces a different key unless\n" +
-			"--force is given.",
+			"--force is given.\n\n" +
+			"When the backend holds the copies of several keys (a node was rebuilt and installed with\n" +
+			"a new key), pass --key-id to say which one. The backups you want to open were made under\n" +
+			"the older node's key. Run this before `supavise install` on a rebuilt node, so that the\n" +
+			"installer finds the key and keeps it.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := loadConfig()
@@ -129,9 +147,9 @@ func init() {
 			if err != nil {
 				return err
 			}
-			c, err := backup.GetKeyEscrow(ctx, st, pass)
+			c, err := backup.GetKeyEscrow(ctx, st, pass, rKeyID)
 			if errors.Is(err, backup.ErrNotFound) {
-				return fmt.Errorf("the backend %s holds no key escrow (it is made by `supavise system escrow-key`)", cfg.Backup.Backend)
+				return fmt.Errorf("the backend %s holds no key escrow%s (it is made by `supavise system escrow-key`)", cfg.Backup.Backend, forKeyID(rKeyID))
 			}
 			if err != nil {
 				return err
@@ -173,12 +191,20 @@ func init() {
 		},
 	}
 	restoreKey.Flags().StringVar(&rPass, "passphrase-file", "", "file holding the passphrase (mode 0600), or - for standard input")
+	restoreKey.Flags().StringVar(&rKeyID, "key-id", "", "key id of the copy to open, when the backend holds the copies of several keys")
 	restoreKey.Flags().StringVar(&rKeyOut, "key-out", "", "where to write the key (default key_path)")
 	restoreKey.Flags().StringVar(&rConfigOut, "config-out", "", "also write the config.toml saved in the escrow to this path")
 	restoreKey.Flags().BoolVar(&rForce, "force", false, "replace a different key or an existing config file")
 	_ = restoreKey.MarkFlagRequired("passphrase-file")
 
 	systemCmd.AddCommand(export, escrow, restoreKey)
+}
+
+func forKeyID(id string) string {
+	if id == "" {
+		return ""
+	}
+	return " for key id " + id
 }
 
 // readMasterKey reads and checks the hex key at path.

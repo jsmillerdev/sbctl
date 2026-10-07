@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -187,6 +188,17 @@ func (s *Service) backupFunctions(ctx context.Context, ref, reason string) (*Fil
 	return snap, nil
 }
 
+// newUUID returns a random (version 4) UUID in its text form.
+func newUUID() string {
+	var b [16]byte
+	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
+		panic(err) // crypto/rand does not fail on a working system
+	}
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
 func fnSlug(entryPath string) (string, bool) {
 	rest, ok := strings.CutPrefix(entryPath, fnFilePrefix)
 	if !ok {
@@ -203,8 +215,15 @@ func (s *Service) restoreFunctions(ctx context.Context, snap *FilesSnapshot, ref
 	if s.opt.Functions == nil {
 		return errors.New("backup: no function store is configured for this operation")
 	}
+	// Function ids are unique across projects. A copy into another project (restore --as, or
+	// --into) keeps everything of the deployment except its id, which would otherwise
+	// collide with the source's for a client that keys on it.
+	fresh := snap.Ref != ref
 	recs := map[string]FunctionRecord{}
 	for _, r := range snap.Functions {
+		if fresh {
+			r.ID = newUUID()
+		}
 		recs[r.Slug] = r
 	}
 	sealed := map[string][]byte{}
@@ -270,7 +289,7 @@ func (s *Service) restoreFunctions(ctx context.Context, snap *FilesSnapshot, ref
 	for _, r := range snap.Functions {
 		keep[r.Slug] = true
 		if !done[r.Slug] { // a deployment without files
-			if err := s.opt.Functions.RestoreFunction(ctx, ref, r, nil); err != nil {
+			if err := s.opt.Functions.RestoreFunction(ctx, ref, recs[r.Slug], nil); err != nil {
 				return fmt.Errorf("restore function %s: %w", r.Slug, err)
 			}
 		}
