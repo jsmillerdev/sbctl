@@ -43,7 +43,7 @@ trap cleanup EXIT
 
 fetch() { # fetch <artifact> : unpack the pinned release into $unpacked/<tag>-<platform>
   local name=$1 tag
-  tag=$(awk -v n="  $name:" '$1 == n {print $2; exit}' versions.yaml)
+  tag=$(awk -v re="^  $name:" '$0 ~ re {print $2; exit}' versions.yaml)
   [[ -n "$tag" ]] || { echo "no artifacts.$name in versions.yaml" >&2; exit 1; }
   local base="https://github.com/supabase/slim-services/releases/download/${tag}"
   curl -fsSL "$base/${tag}-${platform}.tar.zst" -o "$work/$name.tar.zst"
