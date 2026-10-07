@@ -74,6 +74,7 @@ func testService(t *testing.T, mk func(*testing.T) *env) {
 	t.Run("sso defaults", func(t *testing.T) { testSSODefaults(t, mk(t)) })
 	t.Run("remove user", func(t *testing.T) { testRemoveUser(t, mk(t)) })
 	t.Run("concurrent demotions", func(t *testing.T) { testConcurrentOwners(t, mk(t)) })
+	t.Run("legacy accounts", func(t *testing.T) { testLegacyAccounts(t, mk) })
 }
 
 func TestServiceMemory(t *testing.T) { testService(t, newMemEnv) }
@@ -361,7 +362,7 @@ func testInvitations(t *testing.T, e *env) {
 		t.Errorf("scoped roles list: %+v", sr)
 	}
 	su := e.newUser()
-	if err := e.svc.AcceptInvitation(ctx, e.a, token5, su, "scoped@example.test", func(in []string) []string { return in[:1] }); err != nil {
+	if err := e.svc.AcceptInvitation(ctx, e.a, token5, su, "scoped@example.test", func([]string) []string { return []string{e.refs[0]} }); err != nil {
 		t.Fatal(err)
 	}
 	sa := e.access(t, su)
@@ -500,9 +501,9 @@ func testConcurrentOwners(t *testing.T, e *env) {
 	}
 }
 
-func TestLegacyAccounts(t *testing.T) {
+func testLegacyAccounts(t *testing.T, mk func(*testing.T) *env) {
 	ctx := context.Background()
-	e := newMemEnv(t)
+	e := mk(t)
 	cutoff := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 	e.setCutoff(cutoff)
 	created := map[string]time.Time{}
@@ -549,7 +550,8 @@ func TestLegacyAccounts(t *testing.T) {
 		t.Fatalf("retry: %+v", a.Memberships)
 	}
 	// Without a cutoff nobody is legacy.
-	e2 := newMemEnv(t)
+	e2 := mk(t)
+	e2.setCutoff(time.Time{})
 	e2.svc.AccountCreatedAt = func(context.Context, string) (time.Time, error) { return time.Time{}, nil }
 	if a := e2.access(t, e2.newUser()); len(a.Memberships) != 0 {
 		t.Fatal("no cutoff, no legacy accounts")

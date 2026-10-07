@@ -3,9 +3,13 @@ package registry
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestMemory runs the shared conformance checks against the in-memory registry.
@@ -157,5 +161,77 @@ func testRegistry(t *testing.T, r Registry) {
 		case <-timeout:
 			t.Fatalf("change feed incomplete: %v", seen)
 		}
+	}
+}
+
+// tempDatabase creates an empty database next to the one dsn names and returns a DSN for it.
+func tempDatabase(t *testing.T, dsn, prefix string) string {
+	t.Helper()
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	name := fmt.Sprintf("%s_%d_%d", prefix, os.Getpid(), time.Now().UnixNano()%1e9)
+	if _, err := admin.Exec(ctx, `create database `+name); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		a, err := pgxpool.New(context.Background(), dsn)
+		if err == nil {
+			_, _ = a.Exec(context.Background(), `drop database if exists `+name+` with (force)`)
+			a.Close()
+		}
+	})
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+	return u.String()
+}
+
+// TestMembersMigrationKeepsExistingUsersOwners applies every migration before 0900, adds an
+// organization and dashboard users the way a node from before roles has them, then applies
+// 0900: every known user must be Owner of every organization and be marked as checked.
+func TestMembersMigrationKeepsExistingUsersOwners(t *testing.T) {
+	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, tempDatabase(t, dsn, "sbctl_mig"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := migrate(ctx, pool, "0900_members.sql"); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`insert into sbctl.organizations (slug, name) values ('one', 'One'), ('two', 'Two')`,
+		`insert into sbctl.api_users (user_id, email) values ('11111111-1111-4111-8111-111111111111', 'a@example.test'), ('22222222-2222-4222-8222-222222222222', 'b@example.test')`,
+	} {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	var owners, checked int
+	var cutoff time.Time
+	if err := pool.QueryRow(ctx, `select count(*) from sbctl.org_members where role_id = 1`).Scan(&owners); err != nil {
+		t.Fatal(err)
+	}
+	_ = pool.QueryRow(ctx, `select count(*) from sbctl.member_legacy_checked`).Scan(&checked)
+	_ = pool.QueryRow(ctx, `select at from sbctl.member_meta where key = 'legacy_cutoff'`).Scan(&cutoff)
+	if owners != 4 || checked != 2 || cutoff.IsZero() {
+		t.Fatalf("owners=%d (want 2 users x 2 orgs) checked=%d cutoff=%v", owners, checked, cutoff)
+	}
+	// Applying again changes nothing.
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
 	}
 }
