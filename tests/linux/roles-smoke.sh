@@ -35,7 +35,7 @@ P_SESSION=15432 P_TRANSACTION=16543 P_REALTIME=14000 P_STORAGE=15000 P_STORAGE_A
 P_SMTP=12526
 ADMIN=http://127.0.0.1:7000
 PASSWORD=roles-correct-horse-battery
-ORG=roles
+ORG=default   # the claim keeps the organization the first project created
 
 preflight
 install_binary
