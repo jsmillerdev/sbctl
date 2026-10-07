@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/fleet"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 )
 
@@ -46,13 +47,23 @@ func openOptions(cfg *config.Config) lifecycle.OpenOptions {
 	return lifecycle.OpenOptions{Log: newLogger(cfg), ConfigPath: effectiveConfigPath()}
 }
 
-// openNode loads the config and connects to an initialized node.
+// openNode loads the config and connects to an initialized node. Its Engine registers,
+// re-keys and removes projects with the shared services (fleet.Lazy), so `sbctl projects
+// create|rotate-keys|delete` keep Supavisor, Realtime and Storage in step.
 func openNode(ctx context.Context) (*lifecycle.Node, error) {
 	cfg, err := loadConfig()
 	if err != nil {
 		return nil, err
 	}
-	return lifecycle.Open(ctx, cfg, openOptions(cfg))
+	lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: newLogger(cfg)})
+	oo := openOptions(cfg)
+	oo.Fleet = lz.Fleet()
+	n, err := lifecycle.Open(ctx, cfg, oo)
+	if err != nil {
+		return nil, err
+	}
+	lz.Bind(n.Registry, n.Secrets)
+	return n, nil
 }
 
 func printJSON(w io.Writer, v any) error {

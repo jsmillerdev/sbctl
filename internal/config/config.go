@@ -49,6 +49,7 @@ type Config struct {
 	Artifacts Artifacts `toml:"artifacts"`
 	Studio    Studio    `toml:"studio"`
 	API       API       `toml:"api"`
+	Fleet     Fleet     `toml:"fleet"`
 	Defaults  Limits    `toml:"defaults"`
 }
 
