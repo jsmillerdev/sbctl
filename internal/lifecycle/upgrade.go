@@ -294,6 +294,8 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 		return nil, fmt.Errorf("lifecycle: record the upgrade of %s: %w", ref, err)
 	}
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusUpgrading); err != nil {
+		up.Status, up.Error, up.Detail = registry.UpgradeFailed, UpgradeErrBackup, "could not set the project UPGRADING: "+err.Error()
+		_ = store.PutUpgrade(context.WithoutCancel(ctx), &up)
 		return nil, err
 	}
 	e.upgrading.Store(ref, struct{}{})
