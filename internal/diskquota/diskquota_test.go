@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jsmillerdev/supavise/deploy/systemd"
 )
 
 const mountinfo = `22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,discard
@@ -115,5 +117,30 @@ func TestApplyRunsXFSQuotaWithOnlyNumbersFromTheSetting(t *testing.T) {
 	}
 	if err := Apply(context.Background(), run, "/m", "/m/p", Setting{}); err == nil {
 		t.Fatal("an invalid setting reached xfs_quota")
+	}
+}
+
+// The root unit is narrow: it runs one command with the ref from its own name, keeps
+// NoNewPrivileges, and its name is the one Unit builds (the polkit rule lets the supavise user
+// start any supavise-* unit, so the unit file is what limits what it does).
+func TestRootUnitIsNarrow(t *testing.T) {
+	b, err := systemd.Read("supavise-diskquota@.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := string(b)
+	for _, want := range []string{
+		"Type=oneshot", "ExecStart=/usr/local/bin/supavise system set-disk-quota %i", "NoNewPrivileges=yes",
+		"CapabilityBoundingSet=CAP_SYS_ADMIN", "PrivateNetwork=yes", "ProtectSystem=strict", "ReadWritePaths=/var/lib/supavise",
+	} {
+		if !strings.Contains(u, want) {
+			t.Errorf("supavise-diskquota@.service lacks %q", want)
+		}
+	}
+	if strings.Contains(u, "\nUser=") {
+		t.Error("the unit must run as root: xfs_quota needs it")
+	}
+	if got := Unit("%i"); got != "supavise-diskquota@%i.service" {
+		t.Errorf("Unit = %q", got)
 	}
 }

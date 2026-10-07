@@ -146,6 +146,11 @@ func LoadTenantSpec(ctx context.Context, d Deps, ref string) (TenantSpec, error)
 		if spec.Realtime, err = m.RealtimeSettings(ctx, ref); err != nil {
 			return TenantSpec{}, fmt.Errorf("fleet: realtime settings of %s: %w", ref, err)
 		}
+		pool, err := m.PoolerSettings(ctx, ref)
+		if err != nil {
+			return TenantSpec{}, fmt.Errorf("fleet: pooler settings of %s: %w", ref, err)
+		}
+		spec.PoolSize, spec.MaxClients = pool.PoolSize, pool.MaxClients
 	}
 	return spec, nil
 }

@@ -202,3 +202,22 @@ func TestMigrationLimitsMatchTheSizeTable(t *testing.T) {
 		}
 	}
 }
+
+// A backup manifest keeps hand-set limits and lets the standard ones follow the size.
+func TestStandardLimits(t *testing.T) {
+	for _, tc := range []struct {
+		class string
+		l     config.Limits
+		want  bool
+	}{
+		{"small", config.Limits{MemoryMax: "2G", CPUQuota: "100%"}, true},
+		{"small", config.Limits{}, true},
+		{"default", config.Limits{MemoryMax: "1G", CPUQuota: "100%"}, true}, // an earlier version's default project
+		{"small", config.Limits{MemoryMax: "6G", CPUQuota: "300%"}, false},
+		{"bogus", config.Limits{MemoryMax: "1G", CPUQuota: "100%"}, false},
+	} {
+		if got := StandardLimits(tc.class, tc.l); got != tc.want {
+			t.Errorf("StandardLimits(%q, %+v) = %v", tc.class, tc.l, got)
+		}
+	}
+}

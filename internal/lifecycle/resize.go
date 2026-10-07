@@ -346,10 +346,15 @@ func IsCapacity(err error) (*CapacityError, bool) {
 	return nil, false
 }
 
-// poolDefaults fills the pool size and client limit a project's Supavisor tenant runs with
-// when none is saved: the size's (hosted's pooler client limit per size, a pool of 40% of
-// max_connections), with the client limit held under the node's per-project ceiling.
+// poolDefaults fills the pool size and client limit of p's Supavisor tenant (see ApplyPoolDefaults).
 func (e *Engine) poolDefaults(spec *fleet.TenantSpec, p *registry.Project) {
+	ApplyPoolDefaults(e.cfg, spec, p)
+}
+
+// ApplyPoolDefaults fills the pool size and client limit a project's Supavisor tenant runs with
+// when none is saved (zero in spec): the size's (hosted's pooler client limit per size, a pool of
+// 40% of max_connections), with the client limit held under the node's per-project ceiling.
+func ApplyPoolDefaults(cfg *config.Config, spec *fleet.TenantSpec, p *registry.Project) {
 	if p.Ref == config.SystemRef {
 		return
 	}
@@ -361,6 +366,6 @@ func (e *Engine) poolDefaults(spec *fleet.TenantSpec, p *registry.Project) {
 		spec.PoolSize = cl.PoolSize
 	}
 	if spec.MaxClients == 0 {
-		spec.MaxClients = min(cl.PoolerMaxClients, e.cfg.Fleet.PoolerMaxClients())
+		spec.MaxClients = min(cl.PoolerMaxClients, cfg.Fleet.PoolerMaxClients())
 	}
 }

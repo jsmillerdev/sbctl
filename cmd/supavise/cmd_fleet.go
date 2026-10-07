@@ -157,6 +157,10 @@ the shared services must be running. --all does every active project.`,
 				for _, ref := range refs {
 					spec, err := fleet.LoadTenantSpec(ctx, d, ref)
 					if err == nil {
+						// What nobody saved is the project's size's pool and client limit, as in the lifecycle.
+						if p, perr := reg.GetProject(ctx, ref); perr == nil {
+							lifecycle.ApplyPoolDefaults(d.Cfg, &spec, p)
+						}
 						err = f.EnsureTenant(ctx, spec)
 					}
 					if err != nil {

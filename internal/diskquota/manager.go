@@ -92,8 +92,12 @@ func (m *Manager) ApplyStored(ctx context.Context, ref string) error {
 	if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
 		return fmt.Errorf("diskquota: %s is not a project directory", dir)
 	}
-	if real, err := filepath.EvalSymlinks(dir); err != nil || real != dir {
-		return fmt.Errorf("diskquota: %s is a symbolic link or has one on its path", dir)
+	// The directory must be the project's own, not a link to somewhere else: root is about to mark
+	// the whole tree under it. (The state directory itself may sit behind a link.)
+	root, rerr := filepath.EvalSymlinks(filepath.Join(m.Cfg.StateDir, "projects"))
+	real, err := filepath.EvalSymlinks(dir)
+	if rerr != nil || err != nil || real != filepath.Join(root, ref) {
+		return fmt.Errorf("diskquota: %s is not the project directory (a symbolic link?)", dir)
 	}
 	s, ok, err := ReadSetting(SettingFile(dir))
 	if err != nil {
