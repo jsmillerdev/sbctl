@@ -38,7 +38,7 @@ sbctl fleet ensure-tenant <ref>... | --all       # repeat the tenant calls by ha
 sbctl fleet remove-tenant <ref>...
 ```
 
-Start order: pgmeta, supavisor, realtime, storage, studio; stop is the reverse. A service that does not start does not stop the others, and `start` then exits non-zero. Readiness is a request to each service's health path (2xx): Supavisor `/api/health` (answers 204), Realtime `/healthcheck`, Storage `/status`, pgmeta `/health`, Studio `/api/get-utc-time`.
+Start order: pgmeta, supavisor, realtime, storage, studio; stop is the reverse. A service that does not start does not stop the others, and `start` then exits non-zero. Studio is optional: `fleet start` skips it with a note when no artifact is installed and `[studio] artifact_url` is unset, and `fleet status` (and `fleet.AllHealthy`) does not count a Studio whose unit was never rendered. Readiness is a request to each service's health path (2xx): Supavisor `/api/health` (answers 204), Realtime `/healthcheck`, Storage `/status`, pgmeta `/health`, Studio `/api/get-utc-time`.
 
 ## Environment per service
 
@@ -77,7 +77,7 @@ On darwin-arm64 with the slim-services artifacts under the exec backend, through
 
 ## Not done, not verified
 
-- **Linux and systemd**: the units were not run under systemd here. `tests/linux/fleet-smoke.sh` (job `fleet-smoke` in `linux.yml`) covers them; see the CI notes in the workstream report for its result.
+- **Linux and systemd**: not run on a developer machine. `tests/linux/fleet-smoke.sh` (job `fleet-smoke` in `.github/workflows/linux.yml`, Ubuntu 24.04 amd64 and arm64) runs the four services under the real templates and as the `sbctl` user: start, a second start that restarts nothing, one project registered, pooler logins on both ports, a Storage bucket with upload and signed-URL download, a Realtime join, key rotation, `kill -9` of each service, tenant removal, project delete, stop. Studio is not part of it (no slim artifact). The job needs a VM-local drop-in that makes the artifact directory writable for `sb-postgres@`: the Postgres launcher runs `chmod +x` on `share/supabase-cli/config/pgsodium_getkey.sh` on the first boot, and `ProtectSystem=strict` makes the artifacts read-only. The fix belongs in `sb-postgres@.service` (or in the unpack step: chmod the script once) and the drop-in goes away with it.
 - **Studio under systemd needs a template change** (`deploy/systemd/sb-studio.service`, not ours): the launcher rewrites files under the artifact directory at every start (`studio/README.md`), which `ProtectSystem=strict` plus the read-only artifact bind forbids, so the unit needs the artifact's `app/` writable (`ReadWritePaths=` and `BindPaths=` for it), `RestartPreventExitStatus=78` and `SuccessExitStatus=143`.
 - Supavisor has no bind-address variable: its API port and the pooler ports listen on every interface. The API needs a JWT only sbctl can sign, but close `Fleet.SupavisorAPIPort` (4001) and the loopback-only ports in the host firewall; the installer must open 5432 and 6543 only.
 - No TLS on the pooler: Supavisor terminates TLS itself from `GLOBAL_DOWNSTREAM_CERT_PATH`/`KEY_PATH`, and the CertMagic certificates live outside the unit's namespace. Clients connect with `sslmode=disable` or `prefer`; `require` fails. A follow-up has to export a certificate for `pooler.<domain>` into `system/supavisor`.
