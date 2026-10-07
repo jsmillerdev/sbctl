@@ -1,0 +1,23 @@
+[Unit]
+Description=Supavise release check, unattended upgrade and OS reboot inside the maintenance window
+Documentation=https://github.com/jsmillerdev/supavise
+After=network-online.target supavise.service
+Wants=network-online.target
+# One run at a time: a timer tick that arrives while an upgrade runs waits.
+
+[Service]
+Type=oneshot
+# Root, unlike the other supavise units: an upgrade replaces /usr/local/bin/supavise, rewrites unit
+# files and restarts supavise.service, and an OS patch is finished by `systemctl reboot`.
+# `supavise update run` decides what to do from [update] in config.toml: it checks for a release,
+# and only in auto mode and only while the maintenance window is open does it run
+# `supavise upgrade --unattended`. It never starts an upgrade outside the window.
+EnvironmentFile=-/etc/supavise/supavise.env
+ExecStart=/usr/local/bin/supavise update run
+# A drain waits up to 10 minutes for running lifecycle operations, and every project gets a fresh
+# backup first; a long upgrade must not be cut off by systemd half way.
+TimeoutStartSec=3h
+Nice=10
+PrivateTmp=yes
+ProtectHome=yes
+SyslogIdentifier=supavise-upgrade

@@ -58,6 +58,12 @@ type installOptions struct {
 	// install and config.Default() apply only then, so a re-run keeps what the operator chose.
 	Fresh bool
 
+	// AutoUpgrade, MaintenanceWindow, NoOSUpdates and OSReboot set the [update] section.
+	AutoUpgrade       bool
+	MaintenanceWindow string
+	NoOSUpdates       bool
+	OSReboot          string
+
 	Sets           []string
 	ClaimTTL       time.Duration
 	ClaimTokenFile string
@@ -185,6 +191,29 @@ func applyInstall(cfg *config.Config, o installOptions, changed func(string) boo
 		cfg.Functions.Enabled = false
 	} else if o.Fresh {
 		cfg.Functions.Enabled = true
+	}
+	if changed("auto-upgrade") {
+		cfg.Update.Mode = config.UpdateNotify
+		if o.AutoUpgrade {
+			cfg.Update.Mode = config.UpdateAuto
+		}
+	}
+	if changed("maintenance-window") {
+		if _, err := config.ParseWindow(o.MaintenanceWindow); err != nil {
+			return fmt.Errorf("--maintenance-window: %w", err)
+		}
+		cfg.Update.Window = o.MaintenanceWindow
+	}
+	if changed("os-reboot") {
+		cfg.Update.OSReboot = o.OSReboot
+	}
+	// Unattended OS security updates are on for a new install, as a hosted platform patches its
+	// hosts; --no-os-updates opts out, and a re-run without it keeps the value in config.toml, so
+	// a node installed before this setting existed is not patched behind its operator's back.
+	if o.NoOSUpdates {
+		cfg.Update.OSSecurityUpdates = false
+	} else if o.Fresh {
+		cfg.Update.OSSecurityUpdates = true
 	}
 	for _, kv := range o.Sets {
 		k, v, ok := strings.Cut(kv, "=")

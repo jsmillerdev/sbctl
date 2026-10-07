@@ -1,0 +1,13 @@
+[Unit]
+Description=Supavise release check and maintenance window
+
+[Timer]
+# Release check: 15m after boot, then every 6h.
+OnBootSec=900s
+OnUnitActiveSec=21600s
+# Maintenance window Sun 04:00-06:00 (the node's time zone): 1 run(s) while it is open.
+OnCalendar=Sun *-*-* 04:00:00
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

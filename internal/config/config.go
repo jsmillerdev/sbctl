@@ -56,6 +56,7 @@ type Config struct {
 	Studio    Studio    `toml:"studio"`
 	API       API       `toml:"api"`
 	Mail      Mail      `toml:"mail"`
+	Update    Update    `toml:"update"`
 	Fleet     Fleet     `toml:"fleet"`
 	Functions Functions `toml:"functions"`
 	Branching Branching `toml:"branching"`
@@ -158,6 +159,7 @@ func Default() *Config {
 			BaseBackupOnCalendar: "*-*-* 03:00:00",
 		},
 		Artifacts: Artifacts{BaseURL: "https://github.com/supabase/slim-services/releases/download"},
+		Update:    DefaultUpdate(),
 		Defaults:  Limits{MemoryMax: "1G", CPUQuota: "100%"},
 	}
 }
@@ -213,6 +215,9 @@ func (c *Config) Validate() error {
 		return errors.New("config: backup.wal_relay = \"off\" cannot work with supervisor = \"systemd\": the Postgres units hide /etc/supavise and the backups directory, so a direct `supavise wal push` can read neither the backend settings nor write the archive, and archiving would fail forever; use auto or on")
 	}
 	if err := c.Branching.validate(); err != nil {
+		return err
+	}
+	if err := c.Update.validate(); err != nil {
 		return err
 	}
 	if c.StateDir == "" {
