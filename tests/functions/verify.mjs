@@ -355,6 +355,12 @@ async function mainPhase() {
   {
     const cap = cfg.maxPerProject ?? 0
     if (cap > 0) {
+      // Warm the worker first. The runtime serializes the creation of a worker for a function that has
+      // none: concurrent first requests wait for the first to finish and fail with "worker did not
+      // respond in time" (measured with v1.77.4 locally and in CI, a property of the runtime and
+      // not of the budget under test), which would make a cap's worth of long streams fail at once.
+      const warm = await call(`${fnUrl(a, 'stream')}?secs=0`, { headers: bearer(a.anon) })
+      assert.equal(warm.status, 200, `warming the stream function: ${warm.status} ${warm.text}`)
       const open = await Promise.all(
         Array.from({ length: cap }, () => fetch(`${fnUrl(a, 'stream')}?secs=6`, { headers: bearer(a.anon), signal: AbortSignal.timeout(60_000) })),
       )
