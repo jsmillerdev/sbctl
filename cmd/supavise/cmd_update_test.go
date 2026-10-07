@@ -253,3 +253,41 @@ func TestInstallUnitsRendersTheUpgradeTimerFromTheConfig(t *testing.T) {
 		t.Errorf("a bad window was accepted:\n%s", out)
 	}
 }
+
+// Every reader of config.toml accepts the documented forms of check_interval, a bare number
+// of seconds included: the installer, `update config` and `self-update` all read through
+// readConfigFile, and a file that loads for the daemon must load for them.
+func TestReadConfigFileAcceptsABareCheckInterval(t *testing.T) {
+	for body, want := range map[string]struct {
+		every time.Duration
+		on    bool
+	}{
+		"[update]\ncheck_interval = 7200\n":    {2 * time.Hour, true},
+		"[update]\ncheck_interval = 0\n":       {0, false},
+		"[update]\ncheck_interval = \"2d\"\n":  {48 * time.Hour, true},
+		"[update]\ncheck_interval = \"off\"\n": {0, false},
+	} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, existed, err := readConfigFile(path)
+		if err != nil || !existed {
+			t.Errorf("%q: %v", body, err)
+			continue
+		}
+		if d, on, err := cfg.Update.CheckEvery(); err != nil || on != want.on || d != want.every {
+			t.Errorf("%q: CheckEvery() = %v, %v, %v", body, d, on, err)
+		}
+		// printInstallConfig renders what readConfigFile read; the value survives that.
+		out, err := renderConfig(cfg)
+		if err != nil {
+			t.Errorf("%q: render: %v", body, err)
+			continue
+		}
+		again := config.Default()
+		if err := config.DecodeTOML(out, again); err != nil || again.Update.CheckInterval != cfg.Update.CheckInterval {
+			t.Errorf("%q: rendered %q read back as %q (%v)", body, out, again.Update.CheckInterval, err)
+		}
+	}
+}

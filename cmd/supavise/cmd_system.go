@@ -179,9 +179,8 @@ configuration. Run it as the user that owns the state directory (supavise).`,
 const defaultUnitDir = "/etc/systemd/system"
 
 // applyUpgradeTimer starts supavise-upgrade.timer, or stops it, according to [update]: it runs for
-// the release check, for auto upgrades and for the OS reboot in the window, and not at all when
-// none of them is on. A timer whose file changed is restarted, so that systemd schedules it again
-// from the new file.
+// auto upgrades and for the OS reboot in the window, and not at all when neither is on. A timer
+// whose file changed is restarted, so that systemd schedules it again from the new file.
 func applyUpgradeTimer(ctx context.Context, cfg *config.Config, fileChanged bool, out, errOut io.Writer) error {
 	if cfg.Supervisor != config.SupervisorSystemd {
 		return nil

@@ -133,6 +133,13 @@ func (u Update) validate() error {
 	return nil
 }
 
+// DecodeTOML decodes config.toml text into c, accepting every documented form of
+// update.check_interval. Every reader of the file goes through it, so the daemon, the
+// installer and `supavise update config` agree on what a file means.
+func DecodeTOML(b []byte, c *Config) error {
+	return toml.Unmarshal(quoteBareCheckInterval(b), c)
+}
+
 // quoteBareCheckInterval rewrites a bare TOML number in update.check_interval (seconds, as
 // `check_interval = 7200` or `= 0`) to the string the field holds, so that the number form
 // loads too. Any other file comes back unchanged.

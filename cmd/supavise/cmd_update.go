@@ -60,7 +60,8 @@ node in the window; nothing starts an upgrade outside it, and notify mode never 
 		Long: `Without flags it prints the current [update] settings. With flags it changes those settings
 only, writes config.toml, rewrites supavise-upgrade.timer for the new window and enables or
 disables it, and, when --os-security-updates changed, installs or removes the unattended-upgrades
-configuration. A re-run of the installer keeps what this sets.
+configuration. It does not restart the daemon: a new --check-interval takes effect at the next
+restart of supavise.service. A re-run of the installer keeps what this sets.
 
   sudo supavise update config --mode auto --window "Sun 03:00-05:00"
   sudo supavise update config --mode notify
@@ -117,6 +118,11 @@ configuration. A re-run of the installer keeps what this sets.
 				if err := applyOSUpdates(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), cfg.Update.OSSecurityUpdates); err != nil {
 					return err
 				}
+			}
+			if f.Changed("check-interval") {
+				// The daemon reads the interval once, at startup. A restart waits for running
+				// operations, so the operator picks the moment.
+				fmt.Fprintln(cmd.OutOrStdout(), "the new check_interval takes effect when supavise.service next restarts (sudo systemctl restart supavise.service)")
 			}
 			printUpdateSettings(cmd.OutOrStdout(), cfg.Update)
 			return nil

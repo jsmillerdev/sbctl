@@ -15,6 +15,7 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/jsmillerdev/supavise/internal/update"
 )
 
 func init() {
@@ -87,6 +88,19 @@ not through this command. A release states the oldest version it upgrades from
 			if os.Geteuid() != 0 {
 				return errors.New("run as root: sudo supavise self-update")
 			}
+			// Read the config before anything changes: a file the installer cannot read
+			// must not leave a swapped binary beside the old daemon.
+			cfg, _, err := readConfigFile(selfUpdateConfigPath())
+			if err != nil {
+				return err
+			}
+			// The OS reboot in the maintenance window waits on this lock, so it never lands
+			// between the swap and the verified restart.
+			unlock, err := update.LockHost(update.HostLockPath)
+			if err != nil {
+				return err
+			}
+			defer unlock()
 			res, err := selfupdate.Update(cmd.Context(), o)
 			if err != nil {
 				return err
@@ -107,10 +121,6 @@ not through this command. A release states the oldest version it upgrades from
 				return nil
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "restarting supavise.service (a restart waits for running operations, up to 10 minutes)")
-			cfg, _, cerr := readConfigFile(selfUpdateConfigPath())
-			if cerr != nil {
-				return cerr
-			}
 			if err := restartAndWait(cmd.Context(), cfg, wait); err != nil {
 				if res.Previous != "" {
 					return rollback(cmd, exe, res.Previous, cfg, wait, err, noUnits)

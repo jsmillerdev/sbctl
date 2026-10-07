@@ -17,5 +17,9 @@ polkit.addRule(function(action, subject) {
   if (unit.indexOf("supavise-") !== 0 && unit !== "supavise.service") {
     return polkit.Result.NOT_HANDLED;
   }
+  // supavise-upgrade.* runs as root and may be mid-upgrade: the daemon account must not stop it.
+  if (unit.indexOf("supavise-upgrade.") === 0) {
+    return polkit.Result.NOT_HANDLED;
+  }
   return polkit.Result.YES;
 });

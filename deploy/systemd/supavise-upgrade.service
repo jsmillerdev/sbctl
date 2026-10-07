@@ -13,7 +13,11 @@ Type=oneshot
 # only while the maintenance window is open does it run `supavise upgrade --unattended`, and only
 # then does it reboot for an OS patch. It does nothing outside the window. (The daemon, not this
 # unit, checks for new releases.)
-EnvironmentFile=-/etc/supavise/supavise.env
+#
+# No EnvironmentFile: /etc/supavise belongs to the supavise user, and this root unit must not read
+# anything that account can write. PATH is fixed for the same reason (systemctl, runuser,
+# needrestart and apt-get are found by name).
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # The service's own memory (the pause after a failed upgrade, the window that already ran) lives
 # in /var/lib/supavise-upgrade, owned by root. It must not sit in /var/lib/supavise, where every
 # supavise unit can write and could clear the pause. A custom state_dir puts it at <state_dir>-upgrade.

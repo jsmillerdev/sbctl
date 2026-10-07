@@ -78,3 +78,22 @@ func TestTryLock(t *testing.T) {
 	}
 	release2()
 }
+
+// A second command that wants the host lock is refused while the first holds it, and gets it
+// once the first lets go.
+func TestLockHostRefusesWhileHeld(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "maintenance.lock")
+	release, err := LockHost(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LockHost(path); err == nil || !strings.Contains(err.Error(), "is held") {
+		t.Fatalf("second LockHost = %v; want a refusal that says the lock is held", err)
+	}
+	release()
+	release, err = LockHost(path)
+	if err != nil {
+		t.Fatalf("LockHost after release: %v", err)
+	}
+	release()
+}

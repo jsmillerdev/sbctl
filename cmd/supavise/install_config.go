@@ -377,7 +377,7 @@ func readConfigFile(path string) (*config.Config, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if err := toml.Unmarshal(b, cfg); err != nil {
+	if err := config.DecodeTOML(b, cfg); err != nil {
 		return nil, false, fmt.Errorf("%s: %w", path, err)
 	}
 	return cfg, true, nil

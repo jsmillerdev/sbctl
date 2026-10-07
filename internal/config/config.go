@@ -10,8 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-
-	"github.com/pelletier/go-toml/v2"
 )
 
 const (
@@ -179,7 +177,7 @@ func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	switch {
 	case err == nil:
-		if err := toml.Unmarshal(quoteBareCheckInterval(b), c); err != nil {
+		if err := DecodeTOML(b, c); err != nil {
 			return nil, fmt.Errorf("config %s: %w", path, err)
 		}
 	case errors.Is(err, os.ErrNotExist):

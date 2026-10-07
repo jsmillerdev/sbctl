@@ -156,7 +156,7 @@ sudo supavise self-update            # replace the binary only (below)
 
 ### Settings
 
-The `[update]` section of `config.toml`. `supavise update config` changes it (it writes `config.toml`, rewrites the timer and applies the change, with no daemon restart), the installer's flags set the same keys, and a re-run of the installer keeps what is there.
+The `[update]` section of `config.toml`. `supavise update config` changes it (it writes `config.toml`, rewrites the timer and applies the change without restarting the daemon; a new `check_interval` takes effect the next time `supavise.service` restarts), the installer's flags set the same keys, and a re-run of the installer keeps what is there.
 
 | Key | Values | Meaning |
 |---|---|---|

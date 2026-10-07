@@ -118,6 +118,21 @@ type Gate struct {
 // reboot in the maintenance window never lands in the middle of one an operator started by hand.
 const HostLockPath = "/run/supavise-maintenance.lock"
 
+// LockHost takes the host lock at path (HostLockPath on a node) for a command that replaces the
+// binary or restarts the fleet, and returns the function that gives it back. It does not wait:
+// when another such command or the OS-update run holds the lock it returns an error that says so,
+// and the caller changes nothing.
+func LockHost(path string) (release func(), err error) {
+	release, held, err := tryLock(path)
+	switch {
+	case err != nil:
+		return nil, err
+	case held:
+		return nil, fmt.Errorf("another supavise upgrade or self-update is running (%s is held); wait for it to finish", path)
+	}
+	return release, nil
+}
+
 // HostRebootBlocker returns the check that stands in front of the OS reboot. The node may restart
 // only when:
 //
