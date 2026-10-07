@@ -159,12 +159,12 @@ check_hidden_paths() { # UNIT: the unit's property and, in its mount namespace, 
   [[ $hidden == *master.key* ]] || fail "$unit: InaccessiblePaths lost the master key: '$hidden'"
   pid=$(unit_prop MainPID "$unit")
   [[ $pid -gt 0 ]] || fail "$unit: no main pid"
-  if [[ -S /run/dbus/system_bus_socket ]]; then
-    [[ ! -S /proc/$pid/root/run/dbus/system_bus_socket ]] || fail "$unit: the D-Bus system bus socket is visible inside the unit"
-  fi
-  if [[ -S /run/systemd/resolve/io.systemd.Resolve ]]; then
-    [[ ! -S /proc/$pid/root/run/systemd/resolve/io.systemd.Resolve ]] || fail "$unit: the resolver socket is visible inside the unit"
-  fi
+  # InaccessiblePaths puts an inaccessible node of the same type (a socket, mode 000) over the path.
+  for p in /run/dbus/system_bus_socket /run/systemd/resolve/io.systemd.Resolve; do
+    if [[ -S $p ]]; then
+      [[ $(stat -c %a "/proc/$pid/root$p" 2>/dev/null) == 0 ]] || fail "$unit: $p is reachable inside the unit (mode $(stat -c %a "/proc/$pid/root$p" 2>&1), want 0)"
+    fi
+  done
 }
 check_hidden_paths "$PGB"
 check_hidden_paths "sb-postgres@$A.service" # in the template, so the parent has it too
