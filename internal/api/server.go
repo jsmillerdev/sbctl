@@ -251,6 +251,10 @@ func NewServer(d Deps) (*Server, error) {
 	return s, nil
 }
 
+// Members returns the roles service the server enforces permissions with. The SSO workstream
+// calls GrantSSODefault on it when a user signs in through SSO for the first time.
+func (s *Server) Members() *members.Service { return s.members }
+
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
 
