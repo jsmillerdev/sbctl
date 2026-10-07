@@ -1,0 +1,275 @@
+package proxy
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/caddyserver/certmagic"
+
+	"github.com/OWNER/sbctl/internal/config"
+)
+
+// TLS modes after resolving tls.mode against the rest of the configuration.
+const (
+	tlsOff    = "off"
+	tlsDNS01  = "dns01"  // wildcard by DNS-01 only
+	tlsAuto   = "auto"   // wildcard by DNS-01, other allowed hosts by HTTP-01 on demand
+	tlsHTTP01 = "http01" // per-host certificates by HTTP-01 / TLS-ALPN-01 on demand
+)
+
+// resolveTLSMode turns tls.mode, tls.dns_provider and the domain into the
+// effective strategy:
+//
+//   - off: nothing terminates TLS (tests, or a TLS-terminating front end).
+//   - dns01: *.api.<domain>, api.<domain> and studio.<domain> by DNS-01 only.
+//   - auto with a DNS provider and a real domain: dns01 plus on-demand HTTP-01
+//     for registry routes with custom hostnames.
+//   - auto without a DNS provider, http01, or no domain (sslip.io has no DNS
+//     API and no wildcard certificates): per-host HTTP-01 on demand.
+func resolveTLSMode(cfg *config.Config) (string, error) {
+	t := cfg.TLS
+	if t.Mode == "off" {
+		return tlsOff, nil
+	}
+	if cfg.BaseDomain() == "" {
+		return "", errors.New("tls: set domain or public_ip (or tls.mode = \"off\")")
+	}
+	hasDomain := cfg.Domain != ""
+	switch t.Mode {
+	case "dns01":
+		if !hasDomain {
+			return "", errors.New("tls: tls.mode dns01 needs a domain; sslip.io hosts cannot use DNS-01")
+		}
+		return tlsDNS01, nil
+	case "http01":
+		return tlsHTTP01, nil
+	}
+	if t.DNSProvider != "" && hasDomain {
+		return tlsAuto, nil
+	}
+	return tlsHTTP01, nil
+}
+
+// certManager owns the CertMagic configuration of one Server. CertMagic uses
+// DNS-01 exclusively whenever an issuer has a DNS solver, so a mode that needs both
+// DNS-01 (the wildcard) and HTTP-01 (custom hostnames) runs two configs on one
+// cache and picks one per server name:
+//
+//   - dns: *.api.<domain>, api.<domain> and studio.<domain> by DNS-01 (modes dns01, auto).
+//   - http: every other allowed host by HTTP-01 / TLS-ALPN-01 on demand (modes auto, http01).
+type certManager struct {
+	dns, http             *certmagic.Config // nil when the mode does not use it
+	dnsIssuer, httpIssuer *certmagic.ACMEIssuer
+	cache                 *certmagic.Cache
+	names                 []string // certificates managed from startup
+	mode                  string
+	base                  string // base domain
+}
+
+// certOptions are the inputs of newCertManager.
+type certOptions struct {
+	cfg  *config.Config
+	mode string
+	// provider is the DNS-01 provider (modes dns01 and auto).
+	provider certmagic.DNSProvider
+	// allow gates on-demand issuance (HTTP-01) per host name.
+	allow func(ctx context.Context, name string) error
+	// httpPort and httpsPort are the ports our own listeners are bound to; they are
+	// the ACME solvers' ports when we are not on 80 and 443.
+	httpPort, httpsPort int
+	log                 *slog.Logger
+}
+
+// managedNames lists the certificates obtained at startup.
+func managedNames(cfg *config.Config, mode string) []string {
+	api, studio := cfg.APIHost(), cfg.StudioHost()
+	switch mode {
+	case tlsDNS01, tlsAuto:
+		return []string{"*.api." + cfg.BaseDomain(), api, studio}
+	}
+	return []string{api, studio}
+}
+
+func newCertManager(o certOptions) (*certManager, error) {
+	cfg := o.cfg
+	zl := zapToSlog(o.log)
+	cm := &certManager{mode: o.mode, base: cfg.BaseDomain(), names: managedNames(cfg, o.mode)}
+	cm.cache = certmagic.NewCache(certmagic.CacheOptions{
+		GetConfigForCert: func(c certmagic.Certificate) (*certmagic.Config, error) { return cm.configForNames(c.Names), nil },
+		Logger:           zl,
+	})
+	storage := &certmagic.FileStorage{Path: cfg.Paths().Certs()}
+
+	tmpl := certmagic.ACMEIssuer{
+		CA:     cfg.TLS.CA,
+		Email:  cfg.TLS.Email,
+		Agreed: true, // running sbctl with TLS enabled accepts the CA's subscriber agreement
+		// Our own listeners are the challenge listeners; CertMagic must not bind :80 itself.
+		AltHTTPPort:    o.httpPort,
+		AltTLSALPNPort: o.httpsPort,
+		Logger:         zl,
+	}
+	if tmpl.CA == "" {
+		tmpl.CA = certmagic.LetsEncryptProductionCA
+	}
+	if cfg.TLS.CACert != "" {
+		pem, err := os.ReadFile(cfg.TLS.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("tls: ca_cert: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("tls: ca_cert %s holds no PEM certificate", cfg.TLS.CACert)
+		}
+		tmpl.TrustedRoots = pool
+	}
+
+	if o.mode == tlsDNS01 || o.mode == tlsAuto {
+		if o.provider == nil {
+			return nil, errors.New("tls: DNS-01 needs a DNS provider")
+		}
+		// Certificates of this config are obtained at startup and renewed in the
+		// background; project hosts are served from the cached wildcard, so no OnDemand.
+		cm.dns = certmagic.New(cm.cache, certmagic.Config{Storage: storage, Logger: zl})
+		t := tmpl
+		t.DNS01Solver = &certmagic.DNS01Solver{DNSManager: certmagic.DNSManager{DNSProvider: o.provider}}
+		t.DisableHTTPChallenge = true
+		t.DisableTLSALPNChallenge = true
+		cm.dnsIssuer = certmagic.NewACMEIssuer(cm.dns, t)
+		cm.dns.Issuers = []certmagic.Issuer{cm.dnsIssuer}
+	}
+	if o.mode == tlsAuto || o.mode == tlsHTTP01 {
+		cm.http = certmagic.New(cm.cache, certmagic.Config{
+			Storage:  storage,
+			Logger:   zl,
+			OnDemand: &certmagic.OnDemandConfig{DecisionFunc: o.allow},
+		})
+		cm.httpIssuer = certmagic.NewACMEIssuer(cm.http, tmpl)
+		cm.http.Issuers = []certmagic.Issuer{cm.httpIssuer}
+	}
+	return cm, nil
+}
+
+// dnsName reports whether name is covered by the DNS-01 config: api.<domain>,
+// studio.<domain>, or anything under api.<domain> (including the wildcard itself).
+func (cm *certManager) dnsName(name string) bool {
+	name = normalizeHost(name)
+	return name == "api."+cm.base || name == "studio."+cm.base || strings.HasSuffix(name, ".api."+cm.base)
+}
+
+// configFor picks the config that serves and renews the certificate for a server name.
+func (cm *certManager) configFor(name string) *certmagic.Config {
+	if cm.dns != nil && (name == "" || cm.dnsName(name)) {
+		return cm.dns
+	}
+	if cm.http != nil {
+		return cm.http
+	}
+	return cm.dns
+}
+
+// configForNames is configFor for a certificate with several names.
+func (cm *certManager) configForNames(names []string) *certmagic.Config {
+	for _, n := range names {
+		if cm.dns != nil && cm.dnsName(n) {
+			return cm.dns
+		}
+	}
+	if cm.http != nil {
+		return cm.http
+	}
+	return cm.dns
+}
+
+// challengeIssuer is the issuer whose HTTP-01 challenges :80 must answer.
+func (cm *certManager) challengeIssuer() *certmagic.ACMEIssuer {
+	if cm.httpIssuer != nil {
+		return cm.httpIssuer
+	}
+	return cm.dnsIssuer
+}
+
+// tlsConfig is the config of the HTTPS listener: certificates from CertMagic
+// (the config chosen per SNI) and the ACME TLS-ALPN-01 protocol next to HTTP/2
+// and HTTP/1.1.
+func (cm *certManager) tlsConfig() *tls.Config {
+	primary := cm.configFor("")
+	if cm.http != nil {
+		primary = cm.http // its TLS config also answers TLS-ALPN-01 challenges
+	}
+	c := primary.TLSConfig()
+	c.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return cm.configFor(normalizeHost(hello.ServerName)).GetCertificate(hello)
+	}
+	c.NextProtos = append([]string{"h2", "http/1.1"}, c.NextProtos...)
+	c.MinVersion = tls.VersionTLS12
+	return c
+}
+
+// manage starts obtaining and renewing the startup certificates in the background.
+func (cm *certManager) manage(ctx context.Context) error {
+	if cm.dns != nil {
+		return cm.dns.ManageAsync(ctx, cm.names)
+	}
+	return cm.http.ManageAsync(ctx, cm.names)
+}
+
+func (cm *certManager) close() { cm.cache.Stop() }
+
+// allowHost is the on-demand issuance gate: a certificate is only ever requested
+// for a host sbctl serves. In DNS-01 modes the derived project hosts are covered by
+// the wildcard and are refused here so a broken DNS setup cannot quietly burn
+// per-host HTTP-01 certificates against the CA's rate limits.
+func (s *Server) allowHost(_ context.Context, name string) error {
+	name = normalizeHost(name)
+	switch {
+	case name == "":
+		return errors.New("no server name")
+	case name == s.apiHost || name == s.studioHost:
+		return nil
+	}
+	switch s.table.routeKind(name) {
+	case "derived":
+		if s.tlsMode == tlsDNS01 || s.tlsMode == tlsAuto {
+			return fmt.Errorf("%s is covered by the wildcard certificate", name)
+		}
+		return nil
+	case "custom":
+		if s.tlsMode == tlsDNS01 {
+			return fmt.Errorf("%s needs HTTP-01, which tls.mode dns01 disables", name)
+		}
+		return nil
+	}
+	return fmt.Errorf("%s is not a host this node serves", name)
+}
+
+// redirectHandler is the :80 handler in TLS modes: it answers ACME HTTP-01
+// challenges, then redirects every host we serve to https and 404s the rest.
+func (s *Server) redirectHandler(cm *certManager, httpsPort int) http.Handler {
+	redirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := normalizeHost(r.Host)
+		if !s.serves(host) {
+			writeJSON(w, http.StatusNotFound, "Not Found")
+			return
+		}
+		authority := host
+		if httpsPort != 443 {
+			authority += ":" + strconv.Itoa(httpsPort)
+		}
+		http.Redirect(w, r, "https://"+authority+r.URL.RequestURI(), http.StatusPermanentRedirect)
+	})
+	return cm.challengeIssuer().HTTPChallengeHandler(redirect)
+}
+
+// serves reports whether host is one of ours: API, Studio, or a project.
+func (s *Server) serves(host string) bool {
+	return host != "" && (host == s.apiHost || host == s.studioHost || s.table.routeKind(host) != "")
+}
