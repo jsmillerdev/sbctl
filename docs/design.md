@@ -106,7 +106,7 @@ Laptops are not a target. Supabase's own `supabase start --runtime native` alrea
 - **Idle sleep.** Because `supavise` is the proxy, it can stop a project's GoTrue and PostgREST after an idle period and start them on the next request. Not in v1: measured Postgres idle is 15 to 20 MB, so a hundred warm projects already fit on one machine.
 - **File-database engine.** The project record carries `engine: postgres | file` from day one and the data-plane sits behind a five-call interface. Turso has no open multi-tenant server yet, so nothing is built on it; when one exists it becomes one more shared process per shard, with auth and quotas in `supavise`'s proxy.
 - **Image transforms, Logflare.** Optional units behind flags. (Edge Functions moved into v1 as workstream J: a tenant-aware main service inside the edge-runtime artifact.)
-- **Restore UI, multi-node scheduling.** After the single-node product is solid. (Settings writes, API keys, password reset, storage actions, members and roles, and SSO for the dashboard and for projects are v1: HANDOFF workstreams K and L.)
+- **Multi-node scheduling.** After the single-node product is solid. (Settings writes, API keys, password reset, storage actions, members and roles, and SSO for the dashboard and for projects are v1: HANDOFF workstreams K and L. So is the restore UI: Studio's Backups pages list the node's base backups and restore a project in place, to a point in time or to a backup, through the Management API; restore to a new project stays on the command line.)
 
 ## 9a. Branching for agents (right after v1)
 
