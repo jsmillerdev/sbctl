@@ -128,6 +128,8 @@ func New(d Deps) (*Service, error) {
 	s.detect = func(srcData, dstParent string) (string, string, string) {
 		return detectClone(srcData, dstParent, s.zfs)
 	}
+	s.rotate = s.rotateCredentials
+	s.clone = s.cloneParent
 	s.base, s.stop = context.WithCancel(context.Background())
 	return s, nil
 }
