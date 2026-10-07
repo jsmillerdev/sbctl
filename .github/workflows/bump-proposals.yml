@@ -1,0 +1,58 @@
+name: bump proposals
+
+# Every night: run the bump check (tests/conformance/bumpcheck) and, for each upstream service
+# whose newest release is newer than its pin in internal/versions/versions.yaml, open one pull
+# request that moves that pin (branch bump/<service>), or update the one that is open. The
+# conformance suite and the upgrade test gate each pull request. Nothing here merges anything.
+#
+# It uses the workflow's GITHUB_TOKEN (contents and pull requests: write to push the branch and
+# open the pull request; actions: write to start the gating runs, because a push made with
+# GITHUB_TOKEN does not start workflows). The repository setting "Allow GitHub Actions to create
+# and approve pull requests" (Settings, Actions, General) must be on, or opening the pull request
+# fails with a message that says so; the workflow cannot turn it on.
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print what would be proposed; push and open nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+# One run at a time: two would race on the same branches.
+concurrency:
+  group: bump-proposals
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  propose:
+    # Nightly on the default branch only; a manual run on another branch would base its pull requests on main anyway.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: propose
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}   # bumpcheck's rate limit
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: |
+          go build -o "$RUNNER_TEMP/releasetool" ./deploy/releasetool
+          RELEASETOOL="$RUNNER_TEMP/releasetool" tests/conformance/propose-bumps.sh

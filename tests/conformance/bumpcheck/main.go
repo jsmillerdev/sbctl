@@ -12,7 +12,8 @@
 //	go run ./tests/conformance/bumpcheck
 //
 // GITHUB_TOKEN, when set, raises the GitHub API rate limit. With GITHUB_STEP_SUMMARY set the
-// report is appended to it.
+// report is appended to it. -json FILE also writes the rows as JSON, which the nightly
+// proposals (tests/conformance/propose-bumps.sh) read to open one pull request per service.
 package main
 
 import (
@@ -30,6 +31,7 @@ func main() {
 	versions := flag.String("versions", "internal/versions/versions.yaml", "the pin file")
 	pins := flag.String("pins", "tests/conformance/pins.env", "conformance pins (SUPABASE_CLI_VERSION)")
 	pkg := flag.String("package-json", "tests/conformance/js/package.json", "conformance package.json (supabase-js)")
+	jsonOut := flag.String("json", "", "also write the rows to this file as JSON")
 	gh := flag.String("github-api", "https://api.github.com", "GitHub API base URL")
 	npm := flag.String("npm-registry", "https://registry.npmjs.org", "npm registry base URL")
 	flag.Parse()
@@ -45,6 +47,16 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bumpcheck:", err)
 		os.Exit(2)
+	}
+	if *jsonOut != "" {
+		b, err := json.MarshalIndent(rep.Rows, "", "  ")
+		if err == nil {
+			err = os.WriteFile(*jsonOut, append(b, '\n'), 0o644)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "bumpcheck:", err)
+			os.Exit(2)
+		}
 	}
 	md := rep.Markdown()
 	fmt.Print(md)
@@ -113,13 +125,13 @@ func httpGet(token string) Getter {
 
 // Row is one pinned thing and what upstream has.
 type Row struct {
-	Name    string
-	Pinned  string
-	Status  string // ok, missing, incomplete, unpinned, unknown
-	Install bool   // a slim-services release that installs fetch; an unknown state fails the run
-	Newest  string
-	Newer   bool
-	Details string
+	Name    string `json:"name"`
+	Pinned  string `json:"pinned"`
+	Status  string `json:"status"`  // ok, missing, incomplete, unpinned, unknown
+	Install bool   `json:"install"` // a slim-services release that installs fetch; an unknown state fails the run
+	Newest  string `json:"newest"`
+	Newer   bool   `json:"newer"`
+	Details string `json:"details"`
 }
 
 // Result is the whole report.

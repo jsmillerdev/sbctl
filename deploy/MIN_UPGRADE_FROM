@@ -1,0 +1,8 @@
+# The oldest installed Supavise version that may upgrade straight to the release being built.
+# deploy/release-assets.sh writes it into the signed release manifest as min_upgrade_from, and
+# `supavise upgrade` and `supavise self-update` refuse to skip past it: a node on an older
+# version installs this version first. Raise it in the commit that makes a release depend on
+# something the previous ones did not do (a data migration that is not backward compatible, a
+# removed unit, a changed on-disk layout); leave it alone otherwise. Nothing is released yet, so
+# every version may upgrade.
+v0.0.0

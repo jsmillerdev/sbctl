@@ -1,13 +1,15 @@
 // Package selfupdate replaces the supavise binary with a release from GitHub after checking
 // it against an ed25519 signature.
 //
-// A release carries four kinds of asset: the binaries `supavise-linux-amd64` and
-// `supavise-linux-arm64`, `SHA256SUMS` (one line per asset, as sha256sum prints them) and
-// `SHA256SUMS.sig`, the raw 64-byte ed25519 signature of the SHA256SUMS file. The public
-// key is compiled into the binary (release_key.pem). Update refuses a release whose
-// signature does not verify, whose checksum list lacks the binary, or whose binary does
-// not match its checksum, and it never touches the installed binary before all three
-// pass. The replacement is one rename in the binary's own directory, so a crash leaves
+// A release carries five kinds of asset: the binaries `supavise-linux-amd64` and
+// `supavise-linux-arm64`, `SHA256SUMS` (one line per asset, as sha256sum prints them),
+// `SHA256SUMS.sig`, the raw 64-byte ed25519 signature of the SHA256SUMS file, and the manifest
+// `supavise-release.json` (manifest.go), which the list covers. The public keys are compiled into
+// the binary: release_key.pem, and release_key_next.pem while a key rotation is under way
+// (keys.go). Update refuses a release whose signature does not verify against either, whose
+// manifest does not match the signed list or names another version than the release tag, whose
+// checksum list lacks the binary, or whose binary does not match its checksum, and it never
+// touches the installed binary before all of those pass. The replacement is one rename in the binary's own directory, so a crash leaves
 // either the old or the new file, and the previous binary stays next to it as
 // `<name>.prev` for a manual rollback.
 package selfupdate
@@ -91,8 +93,10 @@ type Options struct {
 	Current string
 	// ExecPath is the binary to replace; empty means the running executable.
 	ExecPath string
-	// Key verifies SHA256SUMS; nil means the embedded key.
+	// Key verifies SHA256SUMS. Keys, when set, replaces it with a list: the signature
+	// is valid if any of them verifies it. With neither set the embedded keys apply.
 	Key  ed25519.PublicKey
+	Keys []ed25519.PublicKey
 	HTTP *http.Client
 	// Force installs the release even when it is not newer than Current.
 	Force bool
@@ -233,12 +237,9 @@ type Result struct {
 
 // Update installs the selected release over ExecPath, or reports that it is current.
 func Update(ctx context.Context, o Options) (*Result, error) {
-	key := o.Key
-	if key == nil {
-		var err error
-		if key, err = EmbeddedKey(); err != nil {
-			return nil, err
-		}
+	keys, err := o.keys()
+	if err != nil {
+		return nil, err
 	}
 	if o.Platform == "" {
 		return nil, errors.New("selfupdate: Options.Platform is required")
@@ -257,27 +258,25 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 		return &Result{Tag: rel.Tag}, nil
 	}
 	asset := BinaryAsset(o.Platform)
-	for _, need := range []string{SumsAsset, SigAsset, asset} {
-		if rel.Assets[need] == "" {
-			return nil, fmt.Errorf("release %s has no asset %s", rel.Tag, need)
-		}
+	if rel.Assets[asset] == "" {
+		return nil, fmt.Errorf("release %s has no asset %s", rel.Tag, asset)
 	}
-	sums, err := o.fetch(ctx, rel.Assets[SumsAsset], maxSumsBytes)
+	ver, err := o.verify(ctx, rel, keys)
 	if err != nil {
-		return nil, fmt.Errorf("download %s: %w", SumsAsset, err)
-	}
-	sig, err := o.fetch(ctx, rel.Assets[SigAsset], 1024)
-	if err != nil {
-		return nil, fmt.Errorf("download %s: %w", SigAsset, err)
-	}
-	if err := VerifySums(key, sums, sig); err != nil {
 		return nil, err
 	}
-	want, err := ChecksumFor(sums, asset)
+	// A release states the oldest version it upgrades from. --force installs anyway; a downgrade
+	// is not an upgrade and is not held to it.
+	if !o.Force && Newer(rel.Tag, o.Current) {
+		if err := ver.Manifest.CheckUpgradeFrom(o.Current); err != nil {
+			return nil, err
+		}
+	}
+	want, err := ChecksumFor(ver.Sums, asset)
 	if err != nil {
 		return nil, fmt.Errorf("release %s: %w", rel.Tag, err)
 	}
-	o.say("signature verified; downloading %s", asset)
+	o.say("signature verified (%s); downloading %s", keyName(ver.Key), asset)
 
 	exe := o.ExecPath
 	if exe == "" {

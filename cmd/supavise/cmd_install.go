@@ -67,6 +67,10 @@ the DNS records the summary lists (a wildcard A record for *.api.<domain> is req
 	f.StringVar(&o.StudioSHA256, "studio-sha256", "", "SHA-256 of the Studio build")
 	f.BoolVar(&o.NoStudio, "no-studio", false, "run without the dashboard")
 	f.BoolVar(&o.NoFunctions, "no-functions", false, "run without Edge Functions (a new install turns them on)")
+	f.BoolVar(&o.AutoUpgrade, "auto-upgrade", false, "install new releases by itself inside the maintenance window (update.mode = auto); the default only logs that a release exists. --auto-upgrade=false switches back")
+	f.StringVar(&o.MaintenanceWindow, "maintenance-window", "", `weekly maintenance window in the node's time zone, for example "Sun 03:00-05:00" (default "Sun 04:00-06:00")`)
+	f.BoolVar(&o.NoOSUpdates, "no-os-updates", false, "do not set up unattended OS security updates (a new install does, on Ubuntu and Debian)")
+	f.StringVar(&o.OSReboot, "os-reboot", "", `reboot for OS patches: "window" inside the maintenance window (default) or "never"`)
 	f.StringArrayVar(&o.Sets, "set", nil, "set any config.toml path, repeatable, for example ports.project_base=38000")
 	f.DurationVar(&o.ClaimTTL, "claim-ttl", api.DefaultClaimTTL, "how long the claim token stays valid")
 	f.StringVar(&o.ClaimTokenFile, "claim-token-file", "", "also write the claim token to this file (mode 0600)")
@@ -255,6 +259,7 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	if err := in.firewall(o.Firewall, existed); err != nil {
 		return err
 	}
+	in.osUpdates()
 
 	in.step("creating the system project (first run downloads Postgres and the auth service)")
 	if err := in.asSupavise(nil, "system", "init"); err != nil {
@@ -307,6 +312,24 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	}
 	printSummary(in.out, cfg, publicIP, token, claimed, o)
 	return nil
+}
+
+// osUpdates sets up (or, after --no-os-updates, takes down) unattended OS security updates. A
+// failure is a warning: the node works without them, and a re-run tries again.
+func (in *installer) osUpdates() {
+	if !in.cfg.Update.OSSecurityUpdates {
+		// The operator opted out, or the node predates the setting. Take down Supavise's apt
+		// configuration if an earlier run wrote it; the needrestart setting stays, where
+		// needrestart is installed, so that a manual apt upgrade cannot restart a project.
+		if err := applyOSUpdates(in.ctx, io.Discard, in.err, false); err != nil {
+			in.warn("could not remove the unattended-upgrades configuration: %v", err)
+		}
+		return
+	}
+	in.step("setting up unattended OS security updates (--no-os-updates skips this)")
+	if err := applyOSUpdates(in.ctx, in.out, in.err, true); err != nil {
+		in.warn("unattended security updates are not set up: %v. Patch the OS yourself, or fix this and re-run the installer", err)
+	}
 }
 
 // daemonStale reports whether supavise.service runs a binary other than the one at BinPath.

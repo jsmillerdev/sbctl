@@ -1,0 +1,40 @@
+[Unit]
+Description=Supavise unattended upgrade and OS reboot inside the maintenance window
+Documentation=https://github.com/jsmillerdev/supavise
+After=network-online.target supavise.service
+Wants=network-online.target
+# One run at a time: a timer tick that arrives while an upgrade runs waits.
+
+[Service]
+Type=oneshot
+# Root, unlike the other supavise units: an upgrade replaces /usr/local/bin/supavise, rewrites unit
+# files and restarts supavise.service, and an OS patch is finished by `systemctl reboot`.
+# `supavise update run` decides what to do from [update] in config.toml: only in auto mode and
+# only while the maintenance window is open does it run `supavise upgrade --unattended`, and only
+# then does it reboot for an OS patch. It does nothing outside the window. (The daemon, not this
+# unit, checks for new releases.)
+#
+# No EnvironmentFile: /etc/supavise belongs to the supavise user, and this root unit must not read
+# anything that account can write. PATH is fixed for the same reason (systemctl, runuser,
+# needrestart and apt-get are found by name).
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The service's own memory (the pause after a failed upgrade, the window that already ran) lives
+# in /var/lib/supavise-upgrade, owned by root. It must not sit in /var/lib/supavise, where every
+# supavise unit can write and could clear the pause. A custom state_dir puts it at <state_dir>-upgrade.
+StateDirectory=supavise-upgrade
+StateDirectoryMode=0755
+ExecStart=/usr/local/bin/supavise update run
+# A drain waits up to 10 minutes for running lifecycle operations, and every project gets a fresh
+# backup first; on 50 projects with real data that can run for hours, and systemd must not cut
+# an upgrade off half way: no start timeout. The upgrade engine bounds its own steps.
+TimeoutStartSec=infinity
+# Stopping the unit (systemctl stop, a reboot or shutdown) sends SIGTERM to `supavise update run`
+# alone (KillMode=mixed), which passes it on to `supavise upgrade`; the upgrade then finishes the
+# step it is on or rolls back. systemd kills the whole group only after TimeoutStopSec, which is
+# longer than the 50 minutes `update run` waits for it.
+KillMode=mixed
+TimeoutStopSec=1h
+Nice=10
+PrivateTmp=yes
+ProtectHome=yes
+SyslogIdentifier=supavise-upgrade
