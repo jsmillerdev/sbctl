@@ -3,7 +3,9 @@
 #
 # Starts pebble and pebble-challtestsrv (built from source with Go), points Pebble's
 # DNS at the challenge test server so every name resolves to 127.0.0.1, and runs
-# TestPebbleIssuance against it. Needs: go, git, curl, free ports 5001, 5002, 8053, 8055, 14000, 15000.
+# TestPebbleIssuance (the node's own hosts) and TestPebbleCustomHostname (a customer's hostname:
+# initialize, DNS verification, activation, REST and Auth over its certificate, delete) against it.
+# Needs: go, git, curl, free ports 5001, 5002, 8053, 8055, 14000, 15000.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -41,6 +43,10 @@ wait_for https://localhost:14000/dir
 wait_for -X POST -d '{}' http://127.0.0.1:8055/clear-request-history
 
 cd "$root"
+# The challenge test server is also the DNS stub of the custom-hostname test: it answers every A
+# query with 127.0.0.1 and serves the TXT record the test publishes through its management API.
 SUPAVISE_TEST_PEBBLE_URL=https://localhost:14000/dir \
 SUPAVISE_TEST_PEBBLE_CA="$work/pebble/test/certs/pebble.minica.pem" \
-  go test -count=1 -v -run TestPebbleIssuance ./internal/proxy/
+SUPAVISE_TEST_CHALLTESTSRV_URL=http://127.0.0.1:8055 \
+SUPAVISE_TEST_CHALLTESTSRV_DNS=127.0.0.1:8053 \
+  go test -count=1 -v -run 'TestPebbleIssuance|TestPebbleCustomHostname' ./internal/proxy/

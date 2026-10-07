@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -313,6 +314,33 @@ func (s *Server) warmCertificates(ctx context.Context, cm *certManager, hosts []
 			}
 			s.log.Info("proxy: certificate ready for a newly routed host", "host", host)
 		}()
+	}
+}
+
+// forgetCertificates drops the certificates of hosts that registry routes stopped serving (a
+// custom hostname deleted, a vanity subdomain released, a project removed): out of the cache,
+// which ends their renewal, and out of storage, so a later claim of the name starts clean and no
+// key of a name we no longer serve stays on disk. Names under the DNS-01 config are skipped: their
+// certificate is the wildcard, which is not theirs to remove.
+func (s *Server) forgetCertificates(ctx context.Context, cm *certManager, hosts []string) {
+	if cm.http == nil {
+		return
+	}
+	for _, host := range hosts {
+		if cm.dnsName(host) && cm.dns != nil {
+			continue
+		}
+		if p, _ := s.table.hostProject(host); p.ref != "" {
+			continue // routed again meanwhile (a name moved between projects)
+		}
+		cm.cache.RemoveManaged([]certmagic.SubjectIssuer{{Subject: host}})
+		for _, is := range cm.http.Issuers {
+			key := certmagic.StorageKeys.CertsSitePrefix(is.IssuerKey(), host)
+			if err := cm.http.Storage.Delete(ctx, key); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				s.log.Warn("proxy: could not remove the certificate of a host no longer served", "host", host, "err", err)
+			}
+		}
+		s.log.Info("proxy: removed the certificate of a host no longer served", "host", host)
 	}
 }
 

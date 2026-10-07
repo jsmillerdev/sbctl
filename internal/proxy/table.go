@@ -62,28 +62,47 @@ type table struct {
 	// onKeysDropped, when set, is told (outside the lock, and it must not block) that the
 	// cached keys of a project, or of all projects (ref ""), were dropped.
 	onKeysDropped func(ref string)
-	// onRoutesAdded, when set, is told (outside the lock, and it must not block) of the hosts
-	// that registry routes started to serve: custom hostnames and vanity subdomains.
-	onRoutesAdded func(hosts []string)
+	// onRoutesChanged, when set, is told (outside the lock, and it must not block) of the hosts
+	// that registry routes started to serve and stopped serving: custom hostnames and vanity
+	// subdomains.
+	onRoutesChanged func(added, removed []string)
 }
 
-// setRoutesAdded installs the callback of newly routed hosts.
-func (t *table) setRoutesAdded(fn func(hosts []string)) {
+// setRoutesChanged installs the callback of changed hosts.
+func (t *table) setRoutesChanged(fn func(added, removed []string)) {
 	t.mu.Lock()
-	t.onRoutesAdded = fn
+	t.onRoutesChanged = fn
 	t.mu.Unlock()
 }
 
-// swapRoutesLocked installs a new route index and returns the hosts it adds, with the callback
-// to tell them to. t.mu must be held.
-func (t *table) swapRoutesLocked(custom, kinds map[string]string) (added []string, fn func([]string)) {
+// routesChange is what swapRoutesLocked reports for the caller to deliver after unlocking.
+type routesChange struct {
+	added, removed []string
+	fn             func(added, removed []string)
+}
+
+func (c routesChange) deliver() {
+	if c.fn != nil && (len(c.added) > 0 || len(c.removed) > 0) {
+		c.fn(c.added, c.removed)
+	}
+}
+
+// swapRoutesLocked installs a new route index and returns the hosts it adds and removes. t.mu
+// must be held.
+func (t *table) swapRoutesLocked(custom, kinds map[string]string) routesChange {
+	c := routesChange{fn: t.onRoutesChanged}
 	for h := range custom {
 		if _, had := t.custom[h]; !had {
-			added = append(added, h)
+			c.added = append(c.added, h)
+		}
+	}
+	for h := range t.custom {
+		if _, has := custom[h]; !has {
+			c.removed = append(c.removed, h)
 		}
 	}
 	t.custom, t.kinds = custom, kinds
-	return added, t.onRoutesAdded
+	return c
 }
 
 func newTable(cfg *config.Config, reg registry.Registry, keys KeySource, log *slog.Logger) *table {
@@ -180,12 +199,10 @@ func (t *table) reload(ctx context.Context) error {
 	}
 	t.mu.Lock()
 	t.projects = projects
-	added, fn := t.swapRoutesLocked(t.customRoutes(rs))
+	change := t.swapRoutesLocked(t.customRoutes(rs))
 	t.dropAllKeysLocked()
 	t.mu.Unlock()
-	if fn != nil && len(added) > 0 {
-		fn(added)
-	}
+	change.deliver()
 	if t.onKeysDropped != nil {
 		t.onKeysDropped("")
 	}
@@ -256,11 +273,9 @@ func (t *table) apply(ctx context.Context, c registry.Change) {
 			return
 		}
 		t.mu.Lock()
-		added, fn := t.swapRoutesLocked(t.customRoutes(rs))
+		change := t.swapRoutesLocked(t.customRoutes(rs))
 		t.mu.Unlock()
-		if fn != nil && len(added) > 0 {
-			fn(added)
-		}
+		change.deliver()
 	case "project_secrets":
 		t.invalidateKeys(c.Key)
 	}

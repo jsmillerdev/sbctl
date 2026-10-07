@@ -6,6 +6,9 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/caddyserver/certmagic"
 
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/domains"
@@ -377,5 +380,90 @@ func TestStudioCNAMECheckIsAnsweredByTheNode(t *testing.T) {
 	}
 	if !limited {
 		t.Error("no rate limit")
+	}
+}
+
+// TestForgetCertificates: when a custom hostname stops being routed its certificate and key leave
+// storage; a name that is routed again, or that the wildcard covers, keeps its own.
+func TestForgetCertificates(t *testing.T) {
+	ctx := context.Background()
+	s := tlsServer(t, func(c *config.Config) { c.Domain, c.TLS.Mode = "example.com", "http01" })
+	cm, err := newCertManager(certOptions{cfg: s.cfg, mode: s.tlsMode, allow: s.allowHost, log: quietLog()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cm.close()
+	st := cm.http.Storage
+	issuer := cm.http.Issuers[0].IssuerKey()
+	put := func(host string) {
+		t.Helper()
+		for _, key := range []string{certmagic.StorageKeys.SiteCert(issuer, host), certmagic.StorageKeys.SitePrivateKey(issuer, host), certmagic.StorageKeys.SiteMeta(issuer, host)} {
+			if err := st.Store(ctx, key, []byte("x")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	has := func(host string) bool { return st.Exists(ctx, certmagic.StorageKeys.SiteCert(issuer, host)) }
+	put("docs.customer.example")
+	put("kept.customer.example")
+	put("other.customer.example")
+	if err := s.reg().PutRoute(ctx, registry.Route{Host: "kept.customer.example", Ref: testRef, Kind: registry.RouteCustom}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.table.reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.forgetCertificates(ctx, cm, []string{"docs.customer.example", "kept.customer.example", "missing.customer.example"})
+	if has("docs.customer.example") {
+		t.Error("the certificate of a removed host stayed in storage")
+	}
+	if !has("kept.customer.example") {
+		t.Error("the certificate of a host that is routed again was removed")
+	}
+	if !has("other.customer.example") {
+		t.Error("a certificate that was not named was removed")
+	}
+}
+
+// TestRouteChangesAreReported: the table tells the certificate code which hosts started and
+// stopped being served, from registry changes.
+func TestRouteChangesAreReported(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	type change struct{ added, removed []string }
+	got := make(chan change, 8)
+	h.srv.table.setRoutesChanged(func(a, r []string) { got <- change{a, r} })
+	next := func() change {
+		t.Helper()
+		select {
+		case c := <-got:
+			return c
+		case <-time.After(3 * time.Second):
+			t.Fatal("no change reported")
+			return change{}
+		}
+	}
+	if err := h.reg.PutRoute(ctx, registry.Route{Host: "a.customer.example", Ref: h.ref, Kind: registry.RouteCustom}); err != nil {
+		t.Fatal(err)
+	}
+	if c := next(); len(c.added) != 1 || c.added[0] != "a.customer.example" || len(c.removed) != 0 {
+		t.Fatalf("after put: %+v", c)
+	}
+	if err := h.reg.DeleteRoute(ctx, "a.customer.example"); err != nil {
+		t.Fatal(err)
+	}
+	if c := next(); len(c.removed) != 1 || c.removed[0] != "a.customer.example" || len(c.added) != 0 {
+		t.Fatalf("after delete: %+v", c)
+	}
+	// Deleting the project takes its routes with it.
+	if err := h.reg.PutRoute(ctx, registry.Route{Host: "b.customer.example", Ref: h.ref, Kind: registry.RouteCustom}); err != nil {
+		t.Fatal(err)
+	}
+	next()
+	if err := h.reg.DeleteProject(ctx, h.ref); err != nil {
+		t.Fatal(err)
+	}
+	if c := next(); len(c.removed) == 0 {
+		t.Fatalf("after project delete: %+v", c)
 	}
 }
