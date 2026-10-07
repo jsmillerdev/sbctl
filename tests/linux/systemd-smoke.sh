@@ -109,6 +109,51 @@ if [[ $(unit_state sb-studio.service) == active ]]; then
   done
 fi
 
+log "WAL archiving: a switched segment of $A reaches the backend through sbctl wal push"
+PGPORT_A=$(project_field "$A" 'd["ports"]["Postgres"]')
+PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
+SEG=$(sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$A/postgres/sock port=$PGPORT_A user=supabase_admin dbname=postgres" \
+  -Atc "select pg_walfile_name(pg_switch_wal() - 1)" </dev/null) || fail "$A: could not switch WAL over the cluster socket"
+for ((i = 0; i < 40; i++)); do
+  [[ -s "$SBCTL_STATE/backups/$A/wal/$SEG.zst" ]] && break
+  sleep 1
+done
+[[ -s "$SBCTL_STATE/backups/$A/wal/$SEG.zst" ]] || { journalctl --no-pager -u "sb-postgres@$A" | tail -20 >&2; fail "$A: WAL segment $SEG was not archived (archive_command inside the namespace)"; }
+[[ $(sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/$A/postgres/sock port=$PGPORT_A user=supabase_admin dbname=postgres" \
+  -Atc "select failed_count from pg_stat_archiver" </dev/null) == 0 ]] || fail "$A: archive_command has failed"
+
+log "daemon: sbctl.service (sbctl serve) next to the CLI"
+systemctl start sbctl.service
+for ((i = 0; i < 30; i++)); do
+  [[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] && break
+  sleep 1
+done
+[[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] || { journalctl --no-pager -u sbctl.service | tail -30 >&2; fail "the management API does not answer on the admin listener"; }
+[[ $(http_code -H "Host: api.$SBCTL_DOMAIN" http://127.0.0.1/v1/projects) == 401 ]] || fail "the management API is not served at api.<domain> through the proxy"
+[[ $(http_code -H "Host: api.$SBCTL_DOMAIN" http://127.0.0.1/auth/v1/settings) == 200 ]] || fail "the dashboard GoTrue is not reachable at api.<domain>/auth/v1"
+PUB_A=$(project_field "$A" 'd["keys"]["publishable_key"]' --show-keys)
+[[ $(http_code -H "Host: $A.api.$SBCTL_DOMAIN" -H "apikey: $PUB_A" http://127.0.0.1/auth/v1/settings) == 200 ]] || fail "$A: project API through the proxy"
+[[ $(http_code -H "Host: $A.api.$SBCTL_DOMAIN" -H "apikey: sb_publishable_wrong" http://127.0.0.1/rest/v1/) == 401 ]] || fail "$A: a wrong key was not a 401"
+# Studio's sign-in goes to api.<domain>/auth/v1; the Studio host answers its banner route itself.
+[[ $(http_code -H "Host: studio.$SBCTL_DOMAIN" http://127.0.0.1/api/incident-banner) == 200 ]] || fail "the proxy does not answer /api/incident-banner"
+for t in "sb-basebackup@$A.timer" "sb-basebackup@system.timer" sb-basebackup-prune.timer; do
+  [[ $(unit_state "$t") == active ]] || fail "$t was not started by the daemon"
+done
+
+log "nightly backup: the sb-basebackup@$A service runs as the timer would"
+systemctl start "sb-basebackup@$A.service" || { journalctl --no-pager -u "sb-basebackup@$A" | tail -30 >&2; fail "$A: sb-basebackup service failed"; }
+[[ $(sbctl backups list "$A" | grep -c completed) -ge 1 ]] || { sbctl backups list "$A" >&2 || true; fail "$A: no completed base backup after the backup service ran"; }
+
+log "daemon restart leaves the projects running"
+PG_PID=$(systemctl show -p MainPID --value "sb-postgres@$A.service")
+systemctl restart sbctl.service
+for ((i = 0; i < 30; i++)); do
+  [[ $(http_code http://127.0.0.1:7000/v1/projects) == 401 ]] && break
+  sleep 1
+done
+[[ $(systemctl show -p MainPID --value "sb-postgres@$A.service") == "$PG_PID" ]] || fail "restarting sbctl.service restarted a project's Postgres"
+sbctl projects health "$A" || fail "$A unhealthy after the daemon restarted"
+
 log "pause and resume $A"
 sbctl projects pause "$A"
 for svc in postgres gotrue postgrest; do
@@ -116,8 +161,10 @@ for svc in postgres gotrue postgrest; do
 done
 [[ $(project_field "$A" 'd["status"]') == INACTIVE ]] || fail "$A not INACTIVE"
 [[ $(unit_state "sb-postgres@$B.service") == active ]] || fail "pausing $A disturbed $B"
+[[ $(unit_state "sb-basebackup@$A.timer") != active ]] || fail "$A is paused but its nightly backup timer still runs"
 sbctl projects resume "$A"
 check_project "$A"
+[[ $(unit_state "sb-basebackup@$A.timer") == active ]] || fail "$A resumed but its nightly backup timer was not started"
 
 log "rotate keys of $A"
 OLD=$(project_field "$A" 'd["keys"]["anon_key"]' --show-keys)
@@ -126,6 +173,14 @@ NEW=$(project_field "$A" 'd["keys"]["anon_key"]' --show-keys)
 RT=$(project_field "$A" 'd["ports"]["PostgREST"]')
 [[ $(http_code -H "Authorization: Bearer $OLD" "http://127.0.0.1:$RT/") == 401 ]] || fail "old key still accepted"
 [[ $(http_code -H "Authorization: Bearer $NEW" "http://127.0.0.1:$RT/") == 200 ]] || fail "new key rejected"
+# The daemon's proxy learns of the rotation from the registry (LISTEN/NOTIFY), not from a restart.
+NEWPUB=$(project_field "$A" 'd["keys"]["publishable_key"]' --show-keys)
+for ((i = 0; i < 20; i++)); do
+  [[ $(http_code -H "Host: $A.api.$SBCTL_DOMAIN" -H "apikey: $NEWPUB" http://127.0.0.1/auth/v1/settings) == 200 ]] && break
+  sleep 1
+done
+[[ $(http_code -H "Host: $A.api.$SBCTL_DOMAIN" -H "apikey: $NEWPUB" http://127.0.0.1/auth/v1/settings) == 200 ]] || fail "the proxy does not accept the rotated publishable key"
+[[ $(http_code -H "Host: $A.api.$SBCTL_DOMAIN" -H "apikey: $PUB_A" http://127.0.0.1/rest/v1/) == 401 ]] || fail "the proxy still accepts the old publishable key"
 
 log "crash recovery: kill -9 PostgREST of $B"
 PID=$(systemctl show -p MainPID --value "sb-postgrest@$B.service")
@@ -143,10 +198,18 @@ for ref in "$A" "$B"; do
     [[ $(unit_state "sb-$svc@$ref.service") == inactive ]] || fail "sb-$svc@$ref still $(unit_state "sb-$svc@$ref.service")"
   done
   [[ ! -e "$SBCTL_STATE/projects/$ref" ]] || fail "$ref: data directory remains"
+  # The delete took a final base backup and stopped the nightly timer.
+  ls "$SBCTL_STATE/backups/$ref/base/" 2>/dev/null | grep -q . || fail "$ref: no final base backup in the backend"
+  [[ $(unit_state "sb-basebackup@$ref.timer") != active ]] || fail "$ref: backup timer still runs after delete"
   # The drop-in files stay (removing them needs a polkit action sbctl must not hold); the limits are lifted.
   [[ $(systemctl show -p MemoryMax --value "sb-postgres@$ref.service") == infinity ]] || fail "$ref: MemoryMax limit remains"
 done
 [[ $(unit_state sb-postgres@system.service) == active ]] || fail "system postgres stopped"
 sbctl system status || fail "system status after deletes"
+
+log "daemon stops gracefully"
+systemctl stop sbctl.service
+[[ $(systemctl show -p Result --value sbctl.service) == success ]] || fail "sbctl.service did not stop cleanly: $(systemctl show -p Result --value sbctl.service)"
+[[ $(unit_state sb-postgres@system.service) == active ]] || fail "stopping the daemon stopped the system cluster"
 
 log "OK"
