@@ -50,6 +50,7 @@ type Config struct {
 	Studio    Studio    `toml:"studio"`
 	API       API       `toml:"api"`
 	Fleet     Fleet     `toml:"fleet"`
+	Branching Branching `toml:"branching"`
 	Defaults  Limits    `toml:"defaults"`
 }
 
@@ -175,6 +176,9 @@ func (c *Config) Validate() error {
 	}
 	if c.TLS.Mode == "dns01" && c.TLS.DNSProvider == "" {
 		return errors.New("config: tls.mode dns01 needs tls.dns_provider")
+	}
+	if err := c.Branching.validate(); err != nil {
+		return err
 	}
 	if c.StateDir == "" {
 		return errors.New("config: state_dir is empty")

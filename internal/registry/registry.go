@@ -65,6 +65,42 @@ type Project struct {
 	Limits    config.Limits
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	// Branch is set when the project is a branch of another project (workstream I).
+	Branch *BranchInfo
+}
+
+// BranchState is the (deprecated but still decoded) status of the Management API's branch
+// object: it tracks the last long operation, while the project's own Status tracks its units.
+type BranchState string
+
+const (
+	BranchCreatingProject  BranchState = "CREATING_PROJECT"
+	BranchRunningMigration BranchState = "RUNNING_MIGRATIONS"
+	BranchMigrationsPassed BranchState = "MIGRATIONS_PASSED"
+	BranchMigrationsFailed BranchState = "MIGRATIONS_FAILED"
+)
+
+// BranchInfo is what makes a project a branch.
+type BranchInfo struct {
+	ID         string // UUID, stable across reset
+	ParentRef  string // immutable
+	Name       string // unique per parent
+	GitBranch  string
+	Persistent bool
+	WithData   bool
+	// ExpiresAt is when the sweeper deletes a non-persistent branch; nil never.
+	ExpiresAt *time.Time
+	// DeletionScheduledAt is a soft delete: the sweeper removes the branch after it,
+	// whatever Persistent says, and restore clears it.
+	DeletionScheduledAt *time.Time
+	NotifyURL           string
+	State               BranchState
+	// Detail is the outcome of the last long operation (an error text on failure).
+	Detail string
+	// CloneMethod records how the data was obtained: "schema", "clonefile", "reflink",
+	// "zfs-snapshot" or "base-backup".
+	CloneMethod       string
+	ReviewRequestedAt *time.Time
 }
 
 type AccessToken struct {
@@ -142,6 +178,11 @@ type Registry interface {
 	// UpdateProject writes name, region, class, status, versions and limits.
 	UpdateProject(ctx context.Context, p *Project) error
 	SetProjectStatus(ctx context.Context, ref string, s Status) error
+	// UpdateBranch writes the mutable fields of b (name, git branch, persistence, expiry,
+	// notify URL, state, detail, clone method) of the branch project ref and nothing else,
+	// so it cannot overwrite a status change made at the same time. ErrNotFound when ref is
+	// not a branch; ErrConflict when the name is taken under the same parent.
+	UpdateBranch(ctx context.Context, ref string, b *BranchInfo) error
 	// DeleteProject removes the project, its secrets and routes (cascade).
 	DeleteProject(ctx context.Context, ref string) error
 

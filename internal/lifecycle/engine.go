@@ -248,6 +248,10 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 		Ref: ref, OrgID: org.ID, Name: name, Region: region, Engine: registry.EnginePostgres,
 		Class: class, Status: registry.StatusComingUp, Versions: versions, Limits: limits,
 	}
+	if req.Branch != nil {
+		b := *req.Branch
+		p.Branch = &b
+	}
 	if err := e.reg.CreateProject(ctx, p); err != nil {
 		return nil, fmt.Errorf("lifecycle: create project %s: %w", ref, err)
 	}
@@ -412,6 +416,13 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	if ref == config.SystemRef {
 		return fmt.Errorf("%w: the system project cannot be deleted", ErrInvalidState)
 	}
+	if kids, err := e.branchesOf(ctx, ref); err != nil {
+		return err
+	} else if len(kids) > 0 {
+		// Refuse before anything is stopped: the registry would reject the last step and
+		// leave a parent without data.
+		return fmt.Errorf("%w: %s still has branches (%s); delete them first", ErrInvalidState, ref, strings.Join(kids, ", "))
+	}
 	prev := p.Status
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusGoingDown); err != nil {
 		return err
@@ -439,6 +450,21 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	}
 	e.event(ctx, ref, "project.deleted", map[string]any{"final_backup": e.opts.Backup != nil && !o.SkipFinalBackup && prev != registry.StatusInitFailed})
 	return nil
+}
+
+// branchesOf lists the refs of the branches whose parent is ref.
+func (e *Engine) branchesOf(ctx context.Context, ref string) ([]string, error) {
+	ps, err := e.reg.ListProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var kids []string
+	for _, q := range ps {
+		if q.Branch != nil && q.Branch.ParentRef == ref {
+			kids = append(kids, q.Ref)
+		}
+	}
+	return kids, nil
 }
 
 func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev registry.Status) error {

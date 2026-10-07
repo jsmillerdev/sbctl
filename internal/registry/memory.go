@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -105,6 +106,10 @@ func cloneProject(p Project) Project {
 		v[k] = s
 	}
 	p.Versions = v
+	if p.Branch != nil {
+		b := *p.Branch
+		p.Branch = &b
+	}
 	return p
 }
 
@@ -113,6 +118,19 @@ func (m *Memory) CreateProject(_ context.Context, p *Project) error {
 	defer m.mu.Unlock()
 	if _, ok := m.projects[p.Ref]; ok {
 		return ErrConflict
+	}
+	if b := p.Branch; b != nil {
+		if b.ParentRef == "" || b.Name == "" || b.ID == "" || b.ParentRef == p.Ref {
+			return fmt.Errorf("registry: a branch needs an id, a parent and a name")
+		}
+		if _, ok := m.projects[b.ParentRef]; !ok {
+			return fmt.Errorf("registry: parent %s: %w", b.ParentRef, ErrNotFound)
+		}
+		for _, q := range m.projects {
+			if q.Branch != nil && (q.Branch.ID == b.ID || (q.Branch.ParentRef == b.ParentRef && q.Branch.Name == b.Name)) {
+				return ErrConflict
+			}
+		}
 	}
 	used := map[int]bool{}
 	for _, q := range m.projects {
@@ -187,6 +205,28 @@ func (m *Memory) UpdateProject(_ context.Context, p *Project) error {
 	return nil
 }
 
+// UpdateBranch implements Registry.
+func (m *Memory) UpdateBranch(_ context.Context, ref string, b *BranchInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.projects[ref]
+	if !ok || cur.Branch == nil {
+		return ErrNotFound
+	}
+	for _, q := range m.projects {
+		if q.Ref != ref && q.Branch != nil && q.Branch.ParentRef == cur.Branch.ParentRef && q.Branch.Name == b.Name {
+			return ErrConflict
+		}
+	}
+	nb := *cur.Branch
+	nb.Name, nb.GitBranch, nb.Persistent, nb.WithData, nb.ExpiresAt, nb.DeletionScheduledAt = b.Name, b.GitBranch, b.Persistent, b.WithData, b.ExpiresAt, b.DeletionScheduledAt
+	nb.NotifyURL, nb.State, nb.Detail, nb.CloneMethod, nb.ReviewRequestedAt = b.NotifyURL, b.State, b.Detail, b.CloneMethod, b.ReviewRequestedAt
+	cur.Branch, cur.UpdatedAt = &nb, time.Now()
+	m.projects[ref] = cloneProject(cur)
+	m.notify("projects", "update", ref)
+	return nil
+}
+
 func (m *Memory) SetProjectStatus(_ context.Context, ref string, s Status) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -205,6 +245,11 @@ func (m *Memory) DeleteProject(_ context.Context, ref string) error {
 	defer m.mu.Unlock()
 	if _, ok := m.projects[ref]; !ok {
 		return ErrNotFound
+	}
+	for _, q := range m.projects {
+		if q.Branch != nil && q.Branch.ParentRef == ref {
+			return fmt.Errorf("registry: project %s still has branches: %w", ref, ErrConflict)
+		}
 	}
 	delete(m.projects, ref)
 	delete(m.secrets, ref)

@@ -46,7 +46,8 @@ func mapErr(err error) error {
 		return ErrNotFound
 	}
 	var pe *pgconn.PgError
-	if errors.As(err, &pe) && pe.Code == "23505" {
+	if errors.As(err, &pe) && (pe.Code == "23505" || pe.Code == "23503") {
+		// unique_violation, or foreign_key_violation (a project that still has branches)
 		return fmt.Errorf("%w: %s", ErrConflict, pe.ConstraintName)
 	}
 	return err
@@ -107,14 +108,36 @@ func (r *Postgres) UpdateOrganization(ctx context.Context, o *Organization) erro
 
 // Projects
 
-const projectCols = `ref, coalesce(org_id, 0), seq, name, region, engine, class, status, versions, limits, created_at, updated_at`
+const projectCols = `ref, coalesce(org_id, 0), seq, name, region, engine, class, status, versions, limits, created_at, updated_at,
+	branch_id::text, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
+	notify_url, branch_state, branch_detail, clone_method, review_requested_at`
 
 func scanProject(row pgx.Row) (*Project, error) {
 	var p Project
 	var versions, limits []byte
+	var (
+		bID, bParent, bName, bGit, bNotify, bState, bDetail, bMethod *string
+		bPersistent, bData                                           bool
+		bExpires, bDeletion, bReview                                 *time.Time
+	)
 	if err := row.Scan(&p.Ref, &p.OrgID, &p.Seq, &p.Name, &p.Region, &p.Engine, &p.Class, &p.Status,
-		&versions, &limits, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		&versions, &limits, &p.CreatedAt, &p.UpdatedAt,
+		&bID, &bParent, &bName, &bGit, &bPersistent, &bData, &bExpires, &bDeletion,
+		&bNotify, &bState, &bDetail, &bMethod, &bReview); err != nil {
 		return nil, mapErr(err)
+	}
+	if bParent != nil {
+		str := func(s *string) string {
+			if s == nil {
+				return ""
+			}
+			return *s
+		}
+		p.Branch = &BranchInfo{
+			ID: str(bID), ParentRef: *bParent, Name: str(bName), GitBranch: str(bGit), Persistent: bPersistent, WithData: bData,
+			ExpiresAt: bExpires, DeletionScheduledAt: bDeletion, NotifyURL: str(bNotify), State: BranchState(str(bState)),
+			Detail: str(bDetail), CloneMethod: str(bMethod), ReviewRequestedAt: bReview,
+		}
 	}
 	if err := json.Unmarshal(versions, &p.Versions); err != nil {
 		return nil, err
@@ -164,15 +187,48 @@ func (r *Postgres) CreateProject(ctx context.Context, p *Project) error {
 			}
 		}
 		got, err := scanProject(tx.QueryRow(ctx, `
-			insert into sbctl.projects (ref, org_id, seq, name, region, engine, class, status, versions, limits)
-			values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning `+projectCols,
-			p.Ref, nullOrg(p.OrgID), seq, p.Name, p.Region, p.Engine, p.Class, p.Status, versions, limits))
+			insert into sbctl.projects (ref, org_id, seq, name, region, engine, class, status, versions, limits,
+				branch_id, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
+				notify_url, branch_state, branch_detail, clone_method, review_requested_at)
+			values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+				$11::text::uuid, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) returning `+projectCols,
+			append([]any{p.Ref, nullOrg(p.OrgID), seq, p.Name, p.Region, p.Engine, p.Class, p.Status, versions, limits}, branchArgs(p.Branch)...)...))
 		if err != nil {
 			return err
 		}
 		*p = *got
 		return nil
 	})
+}
+
+// nullStr maps "" to SQL null.
+func nullStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// branchArgs are the 13 branch columns of an insert, in column order.
+func branchArgs(b *BranchInfo) []any {
+	if b == nil {
+		a := make([]any, 13)
+		a[4], a[5] = false, false // persistent, with_data
+		return a
+	}
+	return []any{nullStr(b.ID), nullStr(b.ParentRef), nullStr(b.Name), nullStr(b.GitBranch), b.Persistent, b.WithData,
+		b.ExpiresAt, b.DeletionScheduledAt, nullStr(b.NotifyURL), nullStr(string(b.State)), nullStr(b.Detail), nullStr(b.CloneMethod), b.ReviewRequestedAt}
+}
+
+// UpdateBranch implements Registry.
+func (r *Postgres) UpdateBranch(ctx context.Context, ref string, b *BranchInfo) error {
+	return affected(r.pool.Exec(ctx, `
+		update sbctl.projects set branch_name = $2, git_branch = $3, persistent = $4, with_data = $5, expires_at = $6,
+			deletion_scheduled_at = $7, notify_url = $8, branch_state = $9, branch_detail = $10, clone_method = $11,
+			review_requested_at = $12, updated_at = now()
+		where ref = $1 and parent_ref is not null`,
+		ref, nullStr(b.Name), nullStr(b.GitBranch), b.Persistent, b.WithData, b.ExpiresAt, b.DeletionScheduledAt,
+		nullStr(b.NotifyURL), nullStr(string(b.State)), nullStr(b.Detail), nullStr(b.CloneMethod), b.ReviewRequestedAt))
 }
 
 func (r *Postgres) GetProject(ctx context.Context, ref string) (*Project, error) {

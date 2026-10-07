@@ -34,6 +34,9 @@ type CreateRequest struct {
 	// Keys reuses an existing credential set (restore keeps the source project's keys
 	// because the restored cluster already contains roles with those passwords).
 	Keys *secrets.ProjectKeys
+	// Branch makes the new project a branch of another one (workstream I): the registry row
+	// is written with it, so the branch is a branch from the moment it exists.
+	Branch *registry.BranchInfo
 }
 
 type ServiceHealth struct {
