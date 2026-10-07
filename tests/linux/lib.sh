@@ -357,8 +357,16 @@ assert_os_updates() { # on|off
     grep -q '^Unattended-Upgrade::Automatic-Reboot "false";' <<<"$cfg" || fail "unattended-upgrades may reboot by itself"
     grep -q '^APT::Periodic::Unattended-Upgrade "1";' <<<"$cfg" || fail "unattended upgrades are not switched on"
     # What the program itself reads from that configuration.
-    origins=$(unattended-upgrade --dry-run --debug 2>&1 || true)
-    origins=$(grep -m1 'Allowed origins are' <<<"$origins") || fail "unattended-upgrade printed no allowed origins"
+    # The distribution's own apt-daily timers (enabled by the step above) may hold the apt lock for a
+    # while, and unattended-upgrade then says nothing about origins: look again for up to two minutes.
+    local run="" n
+    for ((n = 0; n < 12; n++)); do
+      run=$(unattended-upgrade --dry-run --debug 2>&1 || true)
+      origins=$(grep -m1 'Allowed origins are' <<<"$run" || true)
+      [[ -n $origins ]] && break
+      sleep 10
+    done
+    [[ -n $origins ]] || fail "unattended-upgrade printed no allowed origins: $(tail -15 <<<"$run")"
     [[ $origins == *security* && $origins != *-updates* && $origins != *backports* ]] || fail "unattended-upgrade would take more than security updates: $origins"
     [[ ! -d /etc/needrestart/conf.d || -f /etc/needrestart/conf.d/50-supavise.conf ]] || fail "needrestart may restart supavise units"
   else
