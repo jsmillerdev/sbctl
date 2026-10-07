@@ -1,0 +1,98 @@
+name: screenshots
+
+# Real screenshots of Supabase Studio running on a Supavise node, for README.md: installs a node
+# (our platform-mode Studio build, --tls off, domain supavise.example), seeds the demo organization
+# "Acme" (five projects, a products table) and drives Studio with Playwright (tests/e2e/readme-shots):
+# the project list and the table editor, dark theme. Uploads the optimized PNGs as the
+# artifact readme-screenshots and logs, failed attempts and page text as readme-screenshots-debug.
+# workflow_dispatch only works once this file is on the default branch; iterate by pushing the branch.
+on:
+  push:
+    branches: [ws/readme-shots]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read   # gh run download of the Studio build
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  shots:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SHOTS_DIR: /tmp/shots
+      LOG_DIR: /tmp/shots-logs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The platform build of Studio takes 10 minutes; the newest successful one from main is the same code.
+      - name: Studio build from the newest successful studio run on main
+        id: studio_dl
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list --workflow studio.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          [[ -n $run ]]
+          echo "studio run: $run"
+          gh run download "$run" --name studio-linux-amd64 --dir "$RUNNER_TEMP/studio"
+          f=$(ls "$RUNNER_TEMP"/studio/*.tar.zst)
+          ls -l "$f"
+          echo "STUDIO_TARBALL=$f" >> "$GITHUB_ENV"
+      - name: build Studio (when no run could be downloaded)
+        if: steps.studio_dl.outcome != 'success'
+        run: |
+          sudo env SUPAVISE_CI=1 studio/ci-prepare.sh
+          studio/build.sh linux-amd64
+          echo "STUDIO_TARBALL=$(ls "$PWD"/studio/dist/*.tar.zst)" >> "$GITHUB_ENV"
+
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
+      - name: client tools (Playwright, sharp)
+        run: |
+          npm install --no-audit --no-fund --prefix tests/e2e/readme-shots
+          command -v google-chrome || npx --prefix tests/e2e/readme-shots playwright-core install --with-deps chromium
+
+      - name: install a node
+        run: |
+          mkdir -p "$SHOTS_DIR" "$LOG_DIR"
+          sudo env "PATH=$PATH" SHOTS_DIR="$SHOTS_DIR" LOG_DIR="$LOG_DIR" SUPAVISE_BIN=/tmp/supavise STUDIO_TARBALL="$STUDIO_TARBALL" tests/e2e/readme-shots/node.sh
+      - name: seed the demo organization
+        working-directory: tests/e2e/readme-shots
+        run: node seed.mjs
+      - name: capture
+        working-directory: tests/e2e/readme-shots
+        run: CHROME="$(command -v google-chrome || true)" node shots.mjs
+      - name: optimize
+        if: always()
+        working-directory: tests/e2e/readme-shots
+        run: node optimize.mjs "$SHOTS_DIR/raw" "$SHOTS_DIR/optimized"
+
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX "$LOG_DIR" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readme-screenshots
+          path: /tmp/shots/optimized
+          if-no-files-found: ignore
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readme-screenshots-debug
+          path: |
+            /tmp/shots/debug
+            /tmp/shots/seed.json
+            /tmp/shots-logs
+          if-no-files-found: ignore
