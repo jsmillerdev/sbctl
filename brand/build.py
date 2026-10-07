@@ -2,7 +2,8 @@
 
     python3 brand/build.py
 
-Writes brand/mark/*.svg, brand/lockups/*.svg, brand/favicon.svg, brand/social/*.svg and brand/variants.html.
+Writes brand/mark/*.svg, brand/lockups/*.svg, brand/favicon.svg, brand/social/*.svg, brand/readme/*.svg
+(the README banner and architecture diagram, each in a dark and a light variant) and brand/variants.html.
 Needs fontTools (pip install fonttools) and network access the first time,
 to fetch Manrope (OFL) from the google/fonts repo into a temp dir.
 
@@ -167,6 +168,156 @@ def og_svg(k, size=OG, name="link preview"):
     return canvas(W_, H_, BLACK, name,
                   mark_at(W_ - 190, H_ / 2 - 10, H_ * 0.86, SOCIAL) + lockup_at(W_ * 0.33, H_ / 2, 120, SOCIAL, WHITE, k))
 
+# ---- README graphics -----------------------------------------------------
+# Banner and architecture diagram, each in a dark and a light variant for <picture>. GitHub shows SVG through
+# <img>, so there are no webfonts, external references or foreignObject: the lockup is outlined paths and every
+# other word is live text in a system font stack. Brand color is teal on black and ink on light; boxes and
+# secondary text are neutral grays, picked to keep at least 4.5:1 against their ground.
+SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif"
+MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+TAGLINE = "Many Supabase projects. One server."
+SUBLINE = "Self-hosted and open source. Not affiliated with Supabase Inc."
+
+THEMES = {
+    "dark":  dict(bg=BLACK, accent=BRAND, word=WHITE, text=WHITE, sub="#a3a3a3", box="#151515", line="#3a3a3a",
+                  mark_c=BRAND, word_c=WHITE, ghost="#141414", onaccent=INK),
+    "light": dict(bg=WHITE, accent=INK, word=INK, text=INK, sub="#595959", box="#f4f4f4", line="#c9c9c9",
+                  mark_c=INK, word_c=INK, ghost="#f3f3f3", onaccent=WHITE),
+}
+
+def esc(t):
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def text(x, y, t, size, fill, weight=400, anchor="start", family=SANS, spacing=None):
+    ls = f' letter-spacing="{spacing}"' if spacing is not None else ""
+    return (f'<text x="{x:g}" y="{y:g}" font-family="{family}" font-size="{size:g}" font-weight="{weight}" '
+            f'fill="{fill}" text-anchor="{anchor}"{ls}>{esc(t)}</text>')
+
+def banner_svg(theme, k):
+    c = THEMES[theme]; W_, H_ = 1280, 320
+    lock_h = 84; lw = lock_h * k["w"] / k["h"]
+    x0 = 96; top = 70
+    body = (mark_at(W_ - 70, H_ / 2, 400, c["ghost"])
+            + lockup_at(x0 - 20 * lock_h / k["h"] + lw / 2, top + lock_h / 2, lock_h, c["mark_c"], c["word_c"], k)
+            + text(x0, top + lock_h + 54, TAGLINE, 34, c["text"], 600, spacing=-0.3)
+            + text(x0, top + lock_h + 90, SUBLINE, 18, c["sub"]))
+    return canvas(W_, H_, c["bg"], f"README banner ({theme})", body)
+
+def arch_svg(theme):
+    c = THEMES[theme]; W_, H_ = 1200, 590
+    out = []
+    add = out.append
+    SW = 1.5                                   # one stroke width for every box and line
+    def box(x, y, w, h, fill=None, stroke=None, sw=SW, rx=10, dash=None):
+        d = f' stroke-dasharray="{dash}"' if dash else ""
+        return (f'<rect x="{x:g}" y="{y:g}" width="{w:g}" height="{h:g}" rx="{rx}" fill="{fill or c["box"]}" '
+                f'stroke="{stroke or c["line"]}" stroke-width="{sw}"{d}/>')
+    def label(x, y, t, anchor="start"):
+        return text(x, y, t, 13, c["sub"], 700, anchor, spacing=1.4)
+    def arrow(x1, y1, x2, y2, color=None):
+        col = color or c["accent"]
+        dx = 1 if x2 > x1 else 0; dy = 1 if y2 > y1 else 0
+        if dx:
+            head = f'{x2:g},{y2:g} {x2-9:g},{y2-5:g} {x2-9:g},{y2+5:g}'; x2 -= 8
+        else:
+            head = f'{x2:g},{y2:g} {x2-5:g},{y2-9:g} {x2+5:g},{y2-9:g}'; y2 -= 8
+        return (f'<line x1="{x1:g}" y1="{y1:g}" x2="{x2:g}" y2="{y2:g}" stroke="{col}" stroke-width="{SW}"/>'
+                f'<polygon points="{head}" fill="{col}"/>')
+    def darrow(x1, y1, x2, y2):                 # arrowheads at both ends, for request and response traffic
+        return arrow(x1, y1, x2, y2) + arrow(x2, y2, x1, y1)
+
+    CX, CW = 24, 192                    # clients column
+    NX, NW = 296, 584                   # node container
+    BX, BW = 976, 200                   # backups column
+    TOP, BOT = 80, 550
+
+    # column labels
+    add(label(CX, 52, "CLIENTS")); add(label(NX, 52, "SUPAVISE NODE")); add(text(NX + NW, 52, "one Linux server", 13, c["sub"], 400, "end"))
+    add(label(BX, 52, "BACKUPS"))
+
+    # clients
+    clients = [("Supabase Studio", "the dashboard"), ("Supabase CLI", "link, push, deploy"),
+               ("MCP server", "AI assistants"), ("Your apps", "supabase-js")]
+    ch, cg = 80, 24
+    y0 = (TOP + BOT) / 2 - (4 * ch + 3 * cg) / 2
+    for i, (t, sub) in enumerate(clients):
+        y = y0 + i * (ch + cg)
+        add(box(CX, y, CW, ch))
+        add(text(CX + 20, y + 36, t, 17, c["text"], 600))
+        add(text(CX + 20, y + 59, sub, 14, c["sub"]))
+    # arrows from the clients into the node: one bus, so the lines do not fan out
+    mid = (TOP + BOT) / 2
+    bus = CX + CW + 18
+    ys = [y0 + i * (ch + cg) + ch / 2 for i in range(4)]
+    for y in ys:
+        add(f'<line x1="{CX+CW:g}" y1="{y:g}" x2="{bus:g}" y2="{y:g}" stroke="{c["accent"]}" stroke-width="{SW}"/>')
+    add(f'<line x1="{bus:g}" y1="{ys[0]:g}" x2="{bus:g}" y2="{ys[-1]:g}" stroke="{c["accent"]}" stroke-width="{SW}"/>')
+    add(arrow(bus, mid, NX, mid))
+    add(text((bus + NX) / 2, mid - 10, "HTTPS", 12, c["sub"], 500, "middle", spacing=0.4))
+
+    # node container
+    add(box(NX, TOP, NW, BOT - TOP, fill="none", stroke=c["accent"], sw=SW, rx=14))
+    ix, iw = NX + 24, NW - 48
+
+    # the supavise binary
+    by, bh = TOP + 24, 148
+    add(box(ix, by, iw, bh, sw=2, stroke=c["accent"]))
+    add(mark_at(ix + 36, by + 30, 18, c["accent"]))
+    add(text(ix + 58, by + 37, "supavise", 19, c["text"], 700, family=MONO))
+    add(text(ix + iw - 20, by + 36, "one Go binary", 14, c["sub"], 400, "end"))
+    chips = [("HTTPS", "proxy"), ("Management", "API"), ("Project", "lifecycle"), ("Backup", "service")]
+    gap = 12; cw_ = (iw - 40 - 3 * gap) / 4
+    for i, (a, b) in enumerate(chips):
+        x = ix + 20 + i * (cw_ + gap); y = by + 64
+        add(box(x, y, cw_, 64, fill=c["bg"], rx=8))
+        add(text(x + cw_ / 2, y + 28, a, 15, c["text"], 600, "middle"))
+        add(text(x + cw_ / 2, y + 48, b, 15, c["text"], 600, "middle"))
+
+    # per-project services
+    py = by + bh + 44
+    add(arrow(NX + NW / 2, by + bh, NX + NW / 2, py - 10, c["accent"]))
+    add(label(ix, py + 8, "PER PROJECT"))
+    pw = (iw - 2 * 16) / 3; ph = 118
+    for i, name in enumerate("ABC"):
+        x = ix + i * (pw + 16); y = py + 22
+        add(box(x, y, pw, ph))
+        add(text(x + 18, y + 31, f"Project {name}", 16, c["text"], 600))
+        for j, svc in enumerate(["Postgres", "Auth", "REST"]):
+            yy = y + 56 + j * 24
+            add(f'<rect x="{x+18:g}" y="{yy-8:g}" width="8" height="8" fill="{c["accent"]}"/>')
+            add(text(x + 36, yy, svc, 14, c["sub"]))
+
+    # shared services
+    sy = py + 22 + ph + 28
+    add(label(ix, sy + 6, "SHARED BY ALL PROJECTS"))
+    shared = ["Supavisor", "Realtime", "Storage", "Edge Runtime", "Studio"]
+    sg = 10; sw_ = (iw - 4 * sg) / 5
+    for i, s_ in enumerate(shared):
+        x = ix + i * (sw_ + sg); y = sy + 18
+        add(box(x, y, sw_, 44, rx=8))
+        add(text(x + sw_ / 2, y + 27, s_, 14, c["text"], 600, "middle"))
+
+    # backups
+    gx0, gx1 = NX + NW, BX
+    y1 = by                             # top of the column lines up with the top of the binary
+    add(box(BX, y1, BW, 80)); add(text(BX + 20, y1 + 36, "S3 bucket", 17, c["text"], 600)); add(text(BX + 20, y1 + 59, "versioned on AWS", 14, c["sub"]))
+    add(text(BX + BW / 2, y1 + 106, "or", 14, c["sub"], 400, "middle"))
+    add(box(BX, y1 + 124, BW, 80)); add(text(BX + 20, y1 + 160, "Local disk", 17, c["text"], 600)); add(text(BX + 20, y1 + 183, "on the node or a mount", 14, c["sub"]))
+    add(arrow(gx0, y1 + 40, gx1, y1 + 40))
+    add(text((gx0 + gx1) / 2, y1 + 18, "WAL +", 12, c["sub"], 500, "middle", spacing=0.2))
+    add(text((gx0 + gx1) / 2, y1 + 33, "base backups", 12, c["sub"], 500, "middle", spacing=0))
+    add(box(BX, y1 + 244, BW, 88, fill="none", dash="5 5"))
+    add(text(BX + 20, y1 + 277, "Point-in-time restore", 15, c["text"], 600))
+    add(text(BX + 20, y1 + 303, "supavise backups restore", 11.5, c["sub"], 400, family=MONO))
+
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W_} {H_}" width="{W_}" height="{H_}" role="img" aria-label="Supavise architecture">
+  <title>Supavise architecture ({theme})</title>
+  <desc>Clients (Supabase Studio, the Supabase CLI, the MCP server and your apps) reach one Supavise node over HTTPS. The supavise binary is the HTTPS proxy, the Management API, the project lifecycle engine and the backup service. Each project has its own Postgres, Auth and REST; all projects share Supavisor, Realtime, Storage, Edge Runtime and Studio. Backups go to S3 or local disk. Generated by brand/build.py.</desc>
+  <rect width="{W_}" height="{H_}" fill="{c["bg"]}"/>
+  {chr(10).join("  " + o for o in out).strip()}
+</svg>
+"""
+
 # ---- contact sheet -------------------------------------------------------
 def variants_html(k):
     inline = lambda svg: svg.strip()
@@ -215,5 +366,8 @@ if __name__ == "__main__":
     write("brand/social/og-image.svg", og_svg(k))
     write("brand/social/github-social-preview.svg", og_svg(k, GH, "GitHub social preview"))
     write("brand/social/apple-touch-icon.svg", apple_touch_svg())
+    for theme in THEMES:
+        write(f"brand/readme/banner-{theme}.svg", banner_svg(theme, k))
+        write(f"brand/readme/architecture-{theme}.svg", arch_svg(theme))
     write("brand/variants.html", variants_html(k))
     print("mark ink", round(MW), "x", round(MH), "(ratio", round(MW / MH, 2), ") | lockup viewBox", k["w"], k["h"])
