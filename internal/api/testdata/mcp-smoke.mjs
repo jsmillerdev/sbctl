@@ -78,7 +78,7 @@ await session("project-scoped (database, development, debugging)", ref, async ({
   await tool("apply_migration", { name: "mcp_smoke", query: "create table public.mcp_migrated (id int)" });
   await tool("list_migrations", {}, (o) => o.includes("mcp_smoke"));
   await tool("generate_typescript_types", {}, (o) => o.includes("mcp_widgets"));
-  // Known upstream limitation (research/05 section 3.3): the URL is derived from the API host.
+  // Known upstream limitation (docs/research/05 section 3.3): the URL is derived from the API host.
   await tool("get_project_url", {});
   await tool("get_publishable_keys", {}, (o) => o.includes("sb_publishable_"));
   await tool("list_edge_functions", {});

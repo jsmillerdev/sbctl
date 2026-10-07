@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// Branching is the [branching] config section (workstream I, DESIGN.md section 9a).
+// Branching is the [branching] config section (workstream I, docs/design.md section 9a).
 type Branching struct {
 	// DefaultTTL is how long a non-persistent branch lives before the sweeper deletes it:
 	// a Go duration ("36h") or whole days ("7d"). Empty means 7d; "0" or "off" never expires.

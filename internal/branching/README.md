@@ -1,6 +1,6 @@
 # internal/branching
 
-Branches for agents (DESIGN.md section 9a). A branch is a project with a parent: its own
+Branches for agents (docs/design.md section 9a). A branch is a project with a parent: its own
 Postgres, GoTrue and PostgREST, its own ref, keys and host, its own fleet tenants. An agent
 creates one per task, merges what worked and deletes the rest. A non-persistent branch deletes
 itself when its lifetime ends.
@@ -231,7 +231,7 @@ empties `auth.sessions`, `auth.refresh_tokens`, `auth.mfa_amr_claims`, `auth.mfa
 (and the stored passkey challenge of `auth.mfa_factors`). Users and identities stay, so **the branch's users
 sign in again** with their passwords and get tokens of the branch (its own JWT secret). The event
 `branch.isolated` records the counts per table (`auth_rows_deleted`, `auth_rows_cleared`), never values. The
-two table lists in `isolate_auth.go` cover the GoTrue release pinned in `versions.yaml` (auth-v2.195.0); a
+two table lists in `isolate_auth.go` cover the GoTrue release pinned in `internal/versions/versions.yaml` (auth-v2.195.0); a
 table in neither list is named in the event (`auth_tables_not_reviewed`) and the integration test fails
 on it, so a GoTrue upgrade that adds a table gets classified. What stays is production data, not a
 session: password hashes, TOTP secrets, passkey public keys, OAuth and SSO configuration, and the client

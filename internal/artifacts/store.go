@@ -57,11 +57,11 @@ func WithHTTPClient(c *http.Client) Option { return func(s *Store) { s.client = 
 // WithLogger sets the logger; the default discards.
 func WithLogger(l *slog.Logger) Option { return func(s *Store) { s.log = l } }
 
-// WithVersions replaces the versions loaded from versions.yaml.
+// WithVersions replaces the versions loaded from internal/versions/versions.yaml.
 func WithVersions(v *Versions) Option { return func(s *Store) { s.versions = v } }
 
 // New builds a Store for cfg. Versions come from cfg.Artifacts.VersionsFile or the
-// embedded versions.yaml; the platform is cfg.Platform or the running one.
+// embedded internal/versions/versions.yaml; the platform is cfg.Platform or the running one.
 func New(cfg *config.Config, opts ...Option) (*Store, error) {
 	platform, err := Platform(cfg)
 	if err != nil {

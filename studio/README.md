@@ -1,10 +1,10 @@
 # studio
 
-Platform-mode Studio for `supavise`: a build of upstream Studio with `NEXT_PUBLIC_IS_PLATFORM=true` and three small patches, packaged like the slim-services `studio` artifact so the systemd unit does not change. Also the mock Management API and the browser spike that tested it, and the endpoint list Workstream B builds against (`research/08-studio-platform-calls.md`).
+Platform-mode Studio for `supavise`: a build of upstream Studio with `NEXT_PUBLIC_IS_PLATFORM=true` and three small patches, packaged like the slim-services `studio` artifact so the systemd unit does not change. Also the mock Management API and the browser spike that tested it, and the endpoint list Workstream B builds against (`docs/research/08-studio-platform-calls.md`).
 
 | Path | What |
 |---|---|
-| `patches/` | The three patches, one `git format-patch` file each, made against `supabase/supabase@94b8b06eb294cf6b217c68d30357566cc8f146d9` (`versions.yaml` `studio.tag`). |
+| `patches/` | The three patches, one `git format-patch` file each, made against `supabase/supabase@94b8b06eb294cf6b217c68d30357566cc8f146d9` (`internal/versions/versions.yaml` `studio.tag`). |
 | `build.sh <platform>` | Fetch, patch, install, build, package, verify. Writes `dist/supavise-studio-<tag>-p<N>-<platform>.tar.zst` and a line in `dist/SHA256SUMS`. |
 | `Dockerfile.build` | The same build in a clean Ubuntu 24.04 image (`docker buildx build --target artifact --output type=local,dest=studio/dist`). |
 | `ci-prepare.sh` | For a GitHub-hosted runner (needs `SUPAVISE_CI=1` or `GITHUB_ACTIONS` in the environment, which `sudo` drops: `sudo env SUPAVISE_CI=1 studio/ci-prepare.sh`): frees disk, adds 6 GB swap, installs zstd, curl, git, python3 and build-essential when missing. |
@@ -57,7 +57,7 @@ Next inlines `NEXT_PUBLIC_*` and evaluates the CSP at build time, so `build.sh` 
 
 ### Studio's own routes the proxy answers
 
-Studio asks its own `/api/incident-banner` route for incident.io banners on every page. Without an incident.io key it answers 500, react-query retries it after 1, 4 and 16 s, and the sign-in form awaits that query, so the redirect after sign-in took 22 s in the spike (research/08 section 9). The artifact is not changed for this: Supavise's proxy answers `GET studio.<domain>/api/incident-banner` itself with `{"incidents":[]}` (`internal/proxy`), so Studio keeps exactly the three patches. Running the artifact without the proxy (`verify.sh`) shows the 500; the spike's browser script answers the route itself for the same reason.
+Studio asks its own `/api/incident-banner` route for incident.io banners on every page. Without an incident.io key it answers 500, react-query retries it after 1, 4 and 16 s, and the sign-in form awaits that query, so the redirect after sign-in took 22 s in the spike (docs/research/08 section 9). The artifact is not changed for this: Supavise's proxy answers `GET studio.<domain>/api/incident-banner` itself with `{"incidents":[]}` (`internal/proxy`), so Studio keeps exactly the three patches. Running the artifact without the proxy (`verify.sh`) shows the 500; the spike's browser script answers the route itself for the same reason.
 
 The proxy also rewrites the Content-Security-Policy that Studio sends so that the browser cannot reach `usercentrics.eu`, the consent-banner vendor Studio calls on every page load (`internal/proxy`, `studio.go`).
 

@@ -1,14 +1,14 @@
 # 08 - Studio platform-mode calls (static analysis)
 
-Status: first version, 2026-10-06. Sections 1 to 8 are from source only; section 9 holds the results of a local dry run of the spike. Studio at `supabase/supabase@94b8b06eb294cf6b217c68d30357566cc8f146d9` (= `versions.yaml` `studio.tag` 2026.10.05-sha-94b8b06), Next.js build, `NEXT_PUBLIC_IS_PLATFORM=true`. Outside section 9 nothing in this file was observed at runtime: *stub* and *fail-soft* statements in sections 1 to 8 are readings of the code, not measurements. Section 9 is the request log of a local dry run of `studio/spike.sh` (mock Management API, real Postgres, GoTrue and postgres-meta, real Studio build output, headless Chrome); the CI run on Linux has not happened yet.
+Status: first version, 2026-10-06. Sections 1 to 8 are from source only; section 9 holds the results of a local dry run of the spike. Studio at `supabase/supabase@94b8b06eb294cf6b217c68d30357566cc8f146d9` (= `internal/versions/versions.yaml` `studio.tag` 2026.10.05-sha-94b8b06), Next.js build, `NEXT_PUBLIC_IS_PLATFORM=true`. Outside section 9 nothing in this file was observed at runtime: *stub* and *fail-soft* statements in sections 1 to 8 are readings of the code, not measurements. Section 9 is the request log of a local dry run of `studio/spike.sh` (mock Management API, real Postgres, GoTrue and postgres-meta, real Studio build output, headless Chrome); the CI run on Linux has not happened yet.
 
-Input for workstream B (Management API). Evidence level: facts about request shapes, headers and paths come from the source files named in each row. The three OpenAPI type files (`packages/api-types/types/{platform,api-v1,api-v2}.d.ts`, 297, 115 and 34 paths) are the response contract; B generates server types from the live specs, as `HANDOFF.md` section 1 says.
+Input for workstream B (Management API). Evidence level: facts about request shapes, headers and paths come from the source files named in each row. The three OpenAPI type files (`packages/api-types/types/{platform,api-v1,api-v2}.d.ts`, 297, 115 and 34 paths) are the response contract; B generates server types from the live specs, as `docs/development/build-plan.md` section 1 says.
 
 ## 1. Method and limits
 
 - Scanned every string literal that looks like `/platform/...`, `/v1/...` or `/v2/...` in `apps/studio/{data,lib,components,hooks,state,pages,app,routes}` and in `packages/{common,ui,ui-patterns}`, excluding tests, fixtures, comments, `pages/api/**` (Studio's own self-hosted server routes, which answer 404 in platform mode, see section 7) and the scope-map files that only list endpoints for the access-token UI. Joined each with the three spec files.
 - Calls whose path is not a literal were added by hand: `POST /platform/pg-meta/{ref}/query` (path comes from `QUERY_SOURCE_REGISTRY`), `.../analytics/endpoints/logs.all[.otel]` (variable endpoint, both methods listed), the five `telemetry` calls in `packages/common`, and `HEAD /platform/projects/{ref}/api/rest` (`lib/pingPostgrest.ts`).
-- Result: 386 (method, path) pairs over 292 distinct paths (11 P0, 153 P1, 222 P2). The specs hold 446 paths; Studio's client code never calls the other 155 (57 platform, 68 v1, 30 v2). The CLI and MCP server call a different subset; see `research/05` section 6.
+- Result: 386 (method, path) pairs over 292 distinct paths (11 P0, 153 P1, 222 P2). The specs hold 446 paths; Studio's client code never calls the other 155 (57 platform, 68 v1, 30 v2). The CLI and MCP server call a different subset; see `docs/research/05` section 6.
 - Not covered by a literal scan: GoTrue (section 3), calls Studio makes straight to a project's own API (section 8), and Studio's own `/api/*` routes (section 7).
 - Anything Studio calls that is absent from a spec: `HEAD .../api/rest` (spec has `GET`), `/platform/projects/{projectRef}/ha-admin/v1/{subPath}` (hand-modelled, high-availability projects only).
 
@@ -23,7 +23,7 @@ Source: `apps/studio/data/fetchers.ts`, `packages/common/{helpers,telemetry,feat
 - **Success.** `openapi-fetch` treats any 2xx as success; Studio does not branch on the exact code. Match the spec's codes anyway (the CLI is strict). An empty 2xx body is fine (`204`, or `Content-Length: 0`; Studio normalizes it).
 - **Errors.** Any non-2xx is an error. Studio's `handleError` reads a string from the JSON body field `message` (or `msg`), takes the code from the HTTP status, and reads `Retry-After` or `X-RateLimit-Reset` for 429. Use the Management-API envelope `{"message": "..."}`. Two statuses have behavior attached: a **401 on `GET /platform/profile` signs the user out**, and a `GET /platform/profile` error whose `message` is exactly `User's profile not found` makes Studio `POST /platform/profile` to create the profile (`apps/studio/lib/profile.tsx`).
 - **Identifiers.** `{slug}` is the organization slug, `{ref}` the 20-letter project ref. `organization_id` and `id` fields are numbers: the registry needs a numeric id per organization and project besides the ref.
-- **Disable levers.** ConfigCat, PostHog, Sentry and Usercentrics stay off when their `NEXT_PUBLIC_*` keys are unset (`research/05` section 4.5); the artifact build sets none of them. `GET /platform/telemetry/feature-flags` is still requested on every page; an empty object or a 404 is tolerated by the code (`Promise.allSettled`).
+- **Disable levers.** ConfigCat, PostHog, Sentry and Usercentrics stay off when their `NEXT_PUBLIC_*` keys are unset (`docs/research/05` section 4.5); the artifact build sets none of them. `GET /platform/telemetry/feature-flags` is still requested on every page; an empty object or a 404 is tolerated by the code (`Promise.allSettled`).
 
 ## 3. GoTrue (dashboard sign-in), `NEXT_PUBLIC_GOTRUE_URL`
 
@@ -463,7 +463,7 @@ Counts: stub column `yes` 177, `defaults` 94, `no` 115.
 ## 6. Where the spec and Studio disagree (found while reading)
 
 - `GET /platform/projects/{ref}/status`: spec documents a 200 without a body, Studio reads `{status}`.
-- `POST /platform/pg-meta/{ref}/query`: spec documents 201 and no body; Studio needs the row array. The spec also lists ten `GET /platform/pg-meta/{ref}/...` routes (tables, columns, ...): Studio's client has no callers for them in this version (`research/05` section 4.1).
+- `POST /platform/pg-meta/{ref}/query`: spec documents 201 and no body; Studio needs the row array. The spec also lists ten `GET /platform/pg-meta/{ref}/...` routes (tables, columns, ...): Studio's client has no callers for them in this version (`docs/research/05` section 4.1).
 - `HEAD /platform/projects/{ref}/api/rest`: only `GET` is in the spec; Studio sends `HEAD` to check that PostgREST is up.
 - `GET /platform/projects/{ref}/daily-stats`, `.../infra-monitoring`, `GET /platform/organizations/{slug}/sso`, `GET /v1/projects/{ref}/jit-access`: spec documents no body.
 - `GET /platform/projects/{ref}/api/rest` is routed through the platform API in the spec but returns the PostgREST OpenAPI document (API docs page).

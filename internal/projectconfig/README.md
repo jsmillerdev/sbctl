@@ -55,7 +55,7 @@ durations, `sessions_timebox` is hours, `sms_test_otp` uses `:` where the API us
 `testdata/gotrue-env-names.txt` lists every variable GoTrue v2.195.0 reads, generated from the
 structs of `internal/conf` the way `envconfig` names them (`testdata/genenv`), and
 `TestAuthEnvNamesExist` pins every name the schema renders to that list. Regenerate it when
-`versions.yaml` bumps auth:
+`internal/versions/versions.yaml` bumps auth:
 
 ```sh
 go build -o /tmp/genenv internal/projectconfig/testdata/genenv/main.go

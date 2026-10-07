@@ -1,9 +1,9 @@
 # internal/artifacts
 
-Fetches the slim-services `tar.zst` releases pinned in `versions.yaml` and unpacks them
+Fetches the slim-services `tar.zst` releases pinned in `internal/versions/versions.yaml` and unpacks them
 under `<state_dir>/artifacts/<service>/<tag>/` (`config.Paths.Artifact`).
 
-- **Versions:** the `versions.yaml` embedded in the binary, or `[artifacts] versions_file`.
+- **Versions:** the `internal/versions/versions.yaml` embedded in the binary, or `[artifacts] versions_file`.
 - **Platform:** `platform` in the config, or the running `<goos>-<goarch>`; builds exist for
   `linux-amd64`, `linux-arm64` and `darwin-arm64`.
 - **Verification:** the archive must match its line in the release `SHA256SUMS`

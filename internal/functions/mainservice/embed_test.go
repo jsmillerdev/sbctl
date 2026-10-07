@@ -1,4 +1,4 @@
-package functionsmain
+package mainservice
 
 import (
 	"io/fs"

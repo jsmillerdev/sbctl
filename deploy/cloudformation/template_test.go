@@ -171,7 +171,7 @@ func TestDefaultsAreGravitonAndSized(t *testing.T) {
 	d := load(t)
 	def := get(t, d, "Parameters", "InstanceType", "Default").(string)
 	if def != "t4g.large" {
-		t.Errorf("default instance type is %s; research/09-footprint.md sizes t4g.large (8 GiB) for about 20 projects", def)
+		t.Errorf("default instance type is %s; docs/research/09-footprint.md sizes t4g.large (8 GiB) for about 20 projects", def)
 	}
 	arch := get(t, d, "Mappings", "InstanceTypes", def, "Ubuntu")
 	if arch != "arm64" {

@@ -1,5 +1,5 @@
-// Package supavise embeds repository-level data files into the binary.
-package supavise
+// Package versions embeds versions.yaml, the pinned upstream releases, into the binary.
+package versions
 
 import _ "embed"
 

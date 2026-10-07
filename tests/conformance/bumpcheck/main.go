@@ -1,6 +1,6 @@
 // Command bumpcheck checks every upstream release this repository pins:
 //
-//   - each artifact of versions.yaml still exists as a slim-services release with its linux
+//   - each artifact of internal/versions/versions.yaml still exists as a slim-services release with its linux
 //     amd64 and arm64 archives; a pin that does not exit non-zero (a release pulled upstream
 //     breaks every install);
 //   - for each pin it reports the newest release, as a summary that never fails the run: a
@@ -27,7 +27,7 @@ import (
 )
 
 func main() {
-	versions := flag.String("versions", "versions.yaml", "the pin file")
+	versions := flag.String("versions", "internal/versions/versions.yaml", "the pin file")
 	pins := flag.String("pins", "tests/conformance/pins.env", "conformance pins (SUPABASE_CLI_VERSION)")
 	pkg := flag.String("package-json", "tests/conformance/js/package.json", "conformance package.json (supabase-js)")
 	gh := flag.String("github-api", "https://api.github.com", "GitHub API base URL")

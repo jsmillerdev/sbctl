@@ -154,7 +154,7 @@ done
 
 STUDIO_ARGS=(--no-studio)
 if [[ $E2E_STUDIO == 1 ]]; then
-  stag=$(awk '/^studio:/{f=1;next} f&&/^ *tag:/{print $2;exit}' versions.yaml)
+  stag=$(awk '/^studio:/{f=1;next} f&&/^ *tag:/{print $2;exit}' internal/versions/versions.yaml)
   slim=studio-$stag-r0
   surl=https://github.com/supabase/slim-services/releases/download/$slim
   if ssum=$(curl -fsSL --retry 3 "$surl/SHA256SUMS" | awk -v n="$slim-linux-$ARCH.tar.zst" '$2==n || $2=="*"n {print $1}') && [[ -n $ssum ]]; then
