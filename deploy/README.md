@@ -50,6 +50,7 @@ Run `supavise install --help` for the full list. The ones most installs need:
 | `--dns route53\|cloudflare\|hetzner\|digitalocean` | DNS-01 provider for a wildcard certificate. Credentials: `--dns-credentials-file` (`KEY=VALUE` lines, `api_token=...`) or `--dns-credential KEY=VALUE` (visible in the process list). On AWS the instance role is enough; add `--dns-credential hosted_zone_id=Z...` to skip the zone lookup. |
 | `--email you@example.com` | ACME account contact. |
 | `--s3-bucket B --s3-region R` | Keep WAL archives and base backups in S3. Without static keys the AWS credential chain applies (instance role). `--s3-endpoint`, `--s3-path-style`, `--s3-credentials-file` for S3-compatible stores. |
+| `--key-passphrase-file F` | Keep an encrypted copy of the master key and `config.toml` in the backup backend, protected by the passphrase in `F` (mode 0600, at least 12 characters; nothing on the server stores it). Without it the summary reminds you to run `supavise system export-key` and keep the output offline. |
 | `--public-ip` | Detected from the EC2 metadata service or `checkip.amazonaws.com` when omitted. |
 | `--no-functions` | Run without Edge Functions. A new install turns them on; a re-run keeps the value in `config.toml`. |
 | `--tls off` | Plain HTTP on 80 and 443, for tests or behind a TLS terminator. |
@@ -321,7 +322,7 @@ The data volume holds everything the node needs to come back: the projects, the 
 
 ### Backups and restore
 
-Every project archives its WAL to the backup bucket and takes a nightly base backup; the daemon prunes old ones (`backup.retention_days`, 7 by default). Restore a project to a point in time on the instance (`aws ssm start-session`, then):
+Every project archives its WAL to the backup bucket and takes a nightly base backup, and the same nightly run copies its Storage objects and Edge Function deployments to the bucket (only what changed; `<ref>/storage/` and `<ref>/functions/`). The daemon prunes old ones (`backup.retention_days`, 7 by default). Restore a project to a point in time on the instance (`aws ssm start-session`, then):
 
 ```bash
 sudo -u supavise supavise backups list <ref>
@@ -329,18 +330,18 @@ sudo -u supavise supavise backups restore <ref> --to 2026-10-06T14:30:00Z --as <
 sudo -u supavise supavise backups restore <ref> --to latest --force                      # in place
 ```
 
-`internal/backup/README.md` explains the options. Two limits matter on AWS:
+`internal/backup/README.md` explains the options. The database comes back to the second you ask for. Storage objects and functions come back to the last nightly copy before that time: an object stored after the copy is missing and one deleted after it is back (hosted Supabase's database backups do not include Storage objects). Three limits matter on AWS:
 
-- **The bucket alone cannot rebuild a node.** The passwords in a backup are sealed with the node's master key, which lives on the data volume. The daily snapshots below cover the volume.
+- **The bucket alone cannot rebuild a node.** The passwords in a backup are sealed with the node's master key, which is not in the bucket in the clear. Keep it: `sudo -u supavise supavise system export-key` prints it for offline storage, and `system escrow-key --passphrase-file F` (or `--key-passphrase-file F` at install) stores a copy in the bucket encrypted with a passphrase only you know; `system restore-key` brings it back. The daily snapshots below also cover the volume, until the volume is lost with the instance.
 - **Deleting the stack keeps the bucket and takes a final snapshot of the volume** (see [Tear down](#tear-down)), so a deleted stack does not lose either.
 
 #### Daily snapshots of the data volume
 
-The S3 backups hold Postgres only. Storage objects (the file backend on the data volume), Edge Function bundles, `config.toml` and the master key live on the data volume and in no bucket. The stack therefore creates an Amazon Data Lifecycle Manager policy that snapshots the data volume once a day at 03:00 UTC and keeps the newest `DailySnapshotsKept` of them (7 by default; `0` creates neither the policy nor its role). The policy selects the volume by a tag whose value is the stack's ID, so it cannot reach another stack's volume. Every snapshot carries the volume's `Name` tag (`<stack name>-data`) and the tag `supavise:snapshot=daily`.
+The bucket holds each project's database, Storage objects (the file backend on the data volume) and Edge Function deployments as of the last nightly run. It does not hold `config.toml` and the master key (unless you made the encrypted escrow above), and objects stored since the last nightly copy live on the data volume only. The stack therefore creates an Amazon Data Lifecycle Manager policy that snapshots the data volume once a day at 03:00 UTC and keeps the newest `DailySnapshotsKept` of them (7 by default; `0` creates neither the policy nor its role). The policy selects the volume by a tag whose value is the stack's ID, so it cannot reach another stack's volume. Every snapshot carries the volume's `Name` tag (`<stack name>-data`) and the tag `supavise:snapshot=daily`.
 
 The policy runs under a role that only the Data Lifecycle Manager service can assume, for policies of this account and region. The role carries the AWS managed policy `AWSDataLifecycleManagerServiceRole`, which AWS documents as the permission set of the service's default role. It is wider than this one volume (it can create and delete snapshots in the account), and the template uses it deliberately: a hand-written subset that misses an action would stop the snapshots without a visible error. The instance cannot assume this role and holds no EC2 permission.
 
-The snapshots are crash-consistent: they capture the volume at one moment, without what the instance still holds in memory, so they look like the disk after a power cut. Postgres replays its write-ahead log when it starts from one, which is the recovery a power cut needs, so the databases should come up. A file that a service was writing at that moment (a Storage upload, a function bundle being deployed) can be incomplete. That is why the S3 point-in-time backups stay the primary database backup, and the snapshots protect the rest of the volume and give a whole-node fallback. Prices: [EBS pricing](https://aws.amazon.com/ebs/pricing/) (see [What it costs](#what-it-costs)).
+The snapshots are crash-consistent: they capture the volume at one moment, without what the instance still holds in memory, so they look like the disk after a power cut. Postgres replays its write-ahead log when it starts from one, which is the recovery a power cut needs, so the databases should come up. A file that a service was writing at that moment (a Storage upload, a function bundle being deployed) can be incomplete. That is why the S3 point-in-time backups stay the primary database backup, and the snapshots protect the rest of the volume (the master key, the configuration, objects newer than the nightly copy) and give a whole-node fallback. Prices: [EBS pricing](https://aws.amazon.com/ebs/pricing/) (see [What it costs](#what-it-costs)).
 
 To restore from one, list the snapshots with the `DataSnapshotsCommand` output (or `aws ec2 describe-snapshots --owner-ids self --filters Name=tag:Name,Values=<stack name>-data`), pick one by its `StartTime`, and create a new stack with `DataSnapshotId` set to it (`--data-snapshot-id snap-...`), as in [Bring the node back](#tear-down). A volume made from a snapshot cannot replace the volume of a running stack, so use a new stack name while the old stack exists, or delete the old stack first. The whole node, projects included, returns to the state of that snapshot; to bring back one project to a point in time, use `supavise backups restore` above, which is finer.
 
