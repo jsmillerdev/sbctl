@@ -2,7 +2,7 @@ name: screenshots
 
 # Real screenshots of Supabase Studio running on a Supavise node, for README.md: installs a node
 # (our platform-mode Studio build, --tls off, domain supavise.example), seeds the demo organization
-# "Acme" (three projects, a products table) and drives Studio with Playwright (tests/e2e/readme-shots):
+# "Acme" (five projects, a products table) and drives Studio with Playwright (tests/e2e/readme-shots):
 # the project list and the table editor, dark theme. Uploads the optimized PNGs as the
 # artifact readme-screenshots and logs, failed attempts and page text as readme-screenshots-debug.
 # workflow_dispatch only works once this file is on the default branch; iterate by pushing the branch.

@@ -1,4 +1,4 @@
-// Seeds the node that node.sh installed with a small demo organization (Acme): three projects, and
+// Seeds the node that node.sh installed with a small demo organization (Acme): five projects, and
 // in "storefront" a products table with twelve rows and a read policy.
 // Everything goes through the Management API, the way a customer's tooling would.
 //
@@ -103,6 +103,8 @@ async function seedSmall(p, ddl) {
 const storefront = await createProject('storefront')
 const analytics = await createProject('analytics')
 const sandbox = await createProject('agent-sandbox')
+const support = await createProject('support-desk')
+const internal = await createProject('internal-tools')
 
 await seedStorefront(storefront)
 
@@ -120,6 +122,6 @@ await seedSmall(sandbox, `
 
 writeFileSync(join(DIR, 'seed.json'), JSON.stringify({
   org: E.org,
-  projects: { storefront: storefront.ref, analytics: analytics.ref, 'agent-sandbox': sandbox.ref },
+  projects: { storefront: storefront.ref, analytics: analytics.ref, 'agent-sandbox': sandbox.ref, 'support-desk': support.ref, 'internal-tools': internal.ref },
 }, null, 2))
 log('seeded', E.org, storefront.ref, analytics.ref, sandbox.ref)

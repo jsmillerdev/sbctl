@@ -1,5 +1,5 @@
 // Captures the README screenshots of Supabase Studio (platform mode) running on the node that
-// node.sh installed and seed.mjs filled. 1440x900 at device scale factor 2, dark theme (THEMES=dark,light adds the light one).
+// node.sh installed and seed.mjs filled. 1600x1000 at device scale factor 2, dark theme (THEMES=dark,light adds the light one).
 //
 //   SHOTS_DIR=/tmp/shots CHROME=/usr/bin/google-chrome node shots.mjs
 //     [THEMES=dark,light] [ONLY=projects,table-editor] [OUT=/tmp/shots/raw]
@@ -22,6 +22,8 @@ const THEMES = (process.env.THEMES ?? 'dark').split(',')
 const ONLY = process.env.ONLY ? process.env.ONLY.split(',') : null
 for (const d of [OUT, DEBUG]) mkdirSync(d, { recursive: true })
 
+const VIEW_W = 1600
+const VIEW_H = 1000
 const STUDIO = E.studioUrl
 const store = S.projects.storefront
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a)
@@ -29,7 +31,7 @@ const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a)
 // ---- the shots ---------------------------------------------------------------------------
 // expect: texts that must be visible. prepare: what a person does after the page loads.
 const SHOTS = [
-  { name: 'projects', path: `/org/${S.org}`, expect: ['storefront', 'analytics', 'agent-sandbox'] },
+  { name: 'projects', path: `/org/${S.org}`, expect: ['storefront', 'analytics', 'agent-sandbox', 'support-desk', 'internal-tools'], clip: { x: 0, y: 0, width: VIEW_W, height: 660 } },
   {
     name: 'table-editor', path: `/project/${store}/editor`, expect: ['Ceramic Pour-Over Set', 'Walnut Cutting Board', 'Carbon-Steel Chef Knife'],
     async prepare(page) {
@@ -58,7 +60,7 @@ const results = []
 
 async function newPage(theme) {
   const ctx = await browser.newContext({
-    viewport: { width: 1440, height: 900 },
+    viewport: { width: VIEW_W, height: VIEW_H },
     deviceScaleFactor: 2,
     colorScheme: theme,
     locale: 'en-US',
@@ -123,6 +125,27 @@ async function signIn(page) {
   await page.waitForURL((u) => !u.pathname.startsWith('/sign-in'), { timeout: 60_000 })
 }
 
+// Studio's announcement cards (privacy notice, feature previews) float at the bottom right. Close them
+// the way a person does: the icon-only button inside the fixed-position card.
+async function dismissPopups(page) {
+  for (let i = 0; i < 4; i++) {
+    const closed = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('div')].filter((d) => {
+        const st = getComputedStyle(d)
+        const r = d.getBoundingClientRect()
+        return st.position === 'fixed' && r.width > 200 && r.width < 460 && r.left > innerWidth / 2 && r.top > innerHeight / 2 && /Learn more|Enable in preferences|NOTICE|NEW/.test(d.innerText || '')
+      })
+      for (const c of cards) {
+        const b = [...c.querySelectorAll('button')].find((x) => !(x.innerText || '').trim())
+        if (b) { b.click(); return true }
+      }
+      return false
+    })
+    if (!closed) break
+    await page.waitForTimeout(600)
+  }
+}
+
 const BUSY = '.animate-spin, [class*="shimmer"], [class*="skeleton"], [aria-busy="true"]'
 async function settle(page) {
   await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {})
@@ -145,7 +168,8 @@ async function capture(page, shot, theme) {
       await page.getByText(t).first().waitFor({ state: 'visible', timeout: 30_000 }).catch(() => problems.push(`missing text ${t}`))
     }
     await page.keyboard.press('Escape')
-    await page.mouse.move(1439, 899)
+    await dismissPopups(page)
+    await page.mouse.move(VIEW_W - 1, VIEW_H - 1)
     await settle(page)
     const busy = await page.evaluate((sel) => document.querySelectorAll(sel).length, BUSY)
     if (busy) problems.push(`${busy} spinner/skeleton element(s) still on the page`)
@@ -158,7 +182,7 @@ async function capture(page, shot, theme) {
     const err = text.match(/something went wrong|failed to (load|fetch|retrieve)|error (fetching|loading|retrieving)|unexpected error|page not found/i)
     if (err) problems.push(`error text on the page: ${err[0]}`)
     const file = join(problems.length ? DEBUG : OUT, `${problems.length ? 'FAIL-' : ''}${tag}.png`)
-    await page.screenshot({ path: file })
+    await page.screenshot({ path: file, ...(shot.clip ? { clip: shot.clip } : {}) })
     writeFileSync(join(DEBUG, `${tag}.txt`), [
       `url: ${page.url()}`, `problems: ${problems.join('; ') || 'none'}`, `toasts: ${JSON.stringify(toasts)}`,
       `bad responses: ${[...new Set(page.__bad)].slice(0, 20).join(' ; ')}`, `console errors: ${[...new Set(page.__console)].slice(0, 10).join(' ; ')}`,
