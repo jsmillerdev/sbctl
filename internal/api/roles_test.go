@@ -675,6 +675,17 @@ func TestInvitationMail(t *testing.T) {
 	if l["emailed"] != false || !strings.Contains(l["url"].(string), "/claim#") {
 		t.Errorf("fallback link: %v", l)
 	}
+	// --no-mail skips the relay.
+	rf.gt.mu.Lock()
+	rf.gt.mailFail = false
+	rf.gt.mu.Unlock()
+	rf.srv.accounts.NoMail = true
+	before0 := len(rf.gt.callList())
+	rec = rf.status(201, "owner", "POST", inv, map[string]any{"emails": []string{"hand@example.test"}, "role_id": members.RoleReadOnly})
+	if l := body[map[string]any](t, rec)["invite_links"].([]any)[0].(map[string]any); l["emailed"] != false || len(rf.gt.callList()) != before0 {
+		t.Errorf("no-mail: %v %v", l, rf.gt.callList()[before0:])
+	}
+	rf.srv.accounts.NoMail = false
 	// Without a relay no mail is attempted.
 	rf.cfg.Mail = config.Mail{}
 	before := len(rf.gt.callList())
