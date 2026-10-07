@@ -14,6 +14,7 @@ guard=${GUARD:-$root/scripts/guard.sh}
 [[ -x $guard ]] || guard=$(cd "$(git -C "$root" rev-parse --git-common-dir)/.." && pwd)/scripts/guard.sh
 art=${SBCTL_ARTIFACTS:-$HOME/.cache/sbctl/unpacked}
 export SBCTL_API_INTEGRATION=1
+export SBCTL_API_IT_PORT_BASE=${SBCTL_API_IT_PORT_BASE:-}
 export SBCTL_PG_BIN=${SBCTL_PG_BIN:-$(ls -d "$art"/postgres-*-darwin-arm64/bin | head -1)}
 export SBCTL_PGMETA_BIN=${SBCTL_PGMETA_BIN:-$(ls -d "$art"/pgmeta-*-darwin-arm64/bin/pgmeta | head -1)}
 export SBCTL_API_SERVE_FILE=$out

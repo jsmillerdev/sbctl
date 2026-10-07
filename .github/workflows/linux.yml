@@ -172,6 +172,43 @@ jobs:
           path: /tmp/sbctl-settings-logs
           if-no-files-found: ignore
 
+  # Members and roles under systemd: users with each role, Studio's permission list, a Read-only
+  # PAT refused writes through the API, the real MCP server and Supabase CLI, invitations by mail.
+  roles-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Supabase CLI (the version the API is tested with)
+        run: |
+          npm install --prefix /tmp/sbcli supabase@2.119.0
+          /tmp/sbcli/node_modules/.bin/supabase --version
+      - name: build sbctl
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/sbctl ./cmd/sbctl
+      - name: roles smoke
+        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/sbctl-roles-logs SBCTL_BIN=/tmp/sbctl SUPABASE_CLI=/tmp/sbcli/node_modules/.bin/supabase REQUIRE_CLIENTS=1 tests/linux/roles-smoke.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/sbctl-roles-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roles-smoke-${{ matrix.arch }}
+          path: /tmp/sbctl-roles-logs
+          if-no-files-found: ignore
+
   # The installer on a fresh VM: deploy/install.sh, the claim flow, a project through the
   # Management API with a PAT, REST through the proxy, the pooler, a re-run, self-update.
   install-e2e:

@@ -1,6 +1,10 @@
 package api
 
-import "context"
+import (
+	"context"
+
+	"github.com/OWNER/sbctl/internal/members"
+)
 
 type ctxKey int
 
@@ -17,6 +21,12 @@ type Principal struct {
 	Via string
 	// TokenID is the access token row for Via == "pat".
 	TokenID int64
+	// AAL is the authenticator assurance level of a dashboard session ("aal1", "aal2");
+	// empty for a personal access token.
+	AAL string
+
+	// access is what the user may do, loaded on first use during the request.
+	access *members.Access
 }
 
 func withPrincipal(ctx context.Context, p *Principal) context.Context {

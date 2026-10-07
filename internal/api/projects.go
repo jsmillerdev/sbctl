@@ -12,6 +12,7 @@ import (
 	v1 "github.com/OWNER/sbctl/internal/api/gen/v1"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -124,7 +125,8 @@ type createInput struct {
 // the allocated ref as COMING_UP. Provisioning continues in the background; a
 // failure after that answer is logged and recorded as an INIT_FAILED registry row,
 // so the ref the client holds does not 404.
-func (s *Server) createProject(ctx context.Context, in createInput) (*registry.Project, error) {
+func (s *Server) createProject(r *http.Request, in createInput) (*registry.Project, error) {
+	ctx := r.Context()
 	if strings.TrimSpace(in.Name) == "" {
 		return nil, errf(http.StatusBadRequest, "name is required")
 	}
@@ -134,11 +136,26 @@ func (s *Server) createProject(ctx context.Context, in createInput) (*registry.P
 		in.OrganizationSlug = in.OrganizationID
 	}
 	if in.OrganizationSlug == "" {
-		org, err = s.defaultOrg(ctx)
+		org, err = s.defaultCreateOrg(r)
 	} else {
 		org, err = s.orgBySlug(ctx, in.OrganizationSlug)
 	}
 	if err != nil {
+		return nil, err
+	}
+	if err := s.requireOrgMember(r, org); err != nil {
+		return nil, err
+	}
+	// The organization is named in the body, so the middleware could not hold the session to its
+	// MFA requirement.
+	access, err := s.callerAccess(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.gateOrg(ctx, principalFrom(ctx), access, orgRef(org)); err != nil {
+		return nil, err
+	}
+	if err := s.require(r, org, "", members.ActCreate, members.ResProjects); err != nil {
 		return nil, err
 	}
 	if in.Region == "" {
@@ -222,7 +239,7 @@ func (s *Server) v1CreateProject(w http.ResponseWriter, r *http.Request) error {
 	if err := decode(r, &in); err != nil {
 		return err
 	}
-	p, err := s.createProject(r.Context(), in)
+	p, err := s.createProject(r, in)
 	if err != nil {
 		return err
 	}

@@ -285,6 +285,7 @@ func TestBranchesWithoutService(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.srv = srv
+	f.ownerOn(srv)
 	if rec := f.do("GET", "/v1/projects/"+testRef+"/branches", nil); rec.Code != 200 || strings.TrimSpace(rec.Body.String()) != "[]" {
 		t.Fatalf("list: %d %s", rec.Code, rec.Body)
 	}
@@ -394,4 +395,84 @@ func mustBranchJSON(t *testing.T, b *branching.Branch) *branchOut {
 		t.Fatal(err)
 	}
 	return out
+}
+
+// A branch is governed by the roles of its parent project, whichever way a route names it (by
+// id, by its own ref, or through the parent), and a project-scoped role does not stop at the
+// parent's own ref or reach a branch of another project. Read-only members get no branch
+// credentials.
+func TestBranchRoutesFollowTheParentsRoles(t *testing.T) {
+	rf := newRolesFixture(t)
+	mk := func(parent, name string) (ref, id string) {
+		rec := rf.status(201, "owner", "POST", "/v1/projects/"+parent+"/branches", map[string]any{"branch_name": name})
+		b := decodeBody(t, rec).(map[string]any)
+		ref, id = b["project_ref"].(string), b["id"].(string)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			p, err := rf.reg.GetProject(context.Background(), ref)
+			if err == nil && p.Status == registry.StatusActiveHealthy && p.Branch != nil && p.Branch.State == registry.BranchMigrationsPassed {
+				return ref, id
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("branch %s did not settle: %+v %v", name, p, err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	ref, id := mk(testRef, "one")
+	ref2, id2 := mk(secondRef, "two")
+
+	for _, tc := range []struct {
+		role      string
+		see, keys bool // reads the branch of testRef; sees its db_pass
+	}{
+		{"owner", true, true}, {"admin", true, true}, {"dev", true, true}, {"scoped", true, true},
+		{"ro", true, false}, {"stranger", false, false},
+	} {
+		for _, name := range []string{id, ref} {
+			rec := rf.as(tc.role, "GET", "/v1/branches/"+name, nil)
+			if !tc.see {
+				if rec.Code != 403 {
+					t.Errorf("%s reads branch %s: %d, want 403", tc.role, name, rec.Code)
+				}
+				continue
+			}
+			if rec.Code != 200 {
+				t.Errorf("%s reads branch %s: %d %s", tc.role, name, rec.Code, rec.Body)
+				continue
+			}
+			if has := jsonField(t, rec, "db_pass") != nil || jsonField(t, rec, "jwt_secret") != nil; has != tc.keys {
+				t.Errorf("%s: branch credentials in the detail = %v, want %v", tc.role, has, tc.keys)
+			}
+		}
+		if rec := rf.as(tc.role, "GET", "/v1/branches/"+id+"/diff", nil); (rec.Code == 403) == tc.see {
+			t.Errorf("%s: diff of the branch: %d", tc.role, rec.Code)
+		}
+	}
+	// The default branch is the project: same answer as the project's own routes.
+	rf.status(403, "stranger", "GET", "/v1/branches/"+testRef, nil)
+	rf.status(200, "scoped", "GET", "/v1/branches/"+testRef, nil)
+	// The scoped Developer has testRef and its branches, not the other project's.
+	for _, name := range []string{id2, ref2} {
+		rf.status(403, "scoped", "GET", "/v1/branches/"+name, nil)
+		rf.status(403, "scoped", "PATCH", "/v1/branches/"+name, map[string]any{"persistent": true})
+		rf.status(403, "scoped", "DELETE", "/v1/branches/"+name, nil)
+		rf.status(403, "scoped", "POST", "/v1/branches/"+name+"/push", map[string]any{})
+	}
+	rf.status(403, "scoped", "POST", "/v1/projects/"+secondRef+"/branches", map[string]any{"branch_name": "x"})
+	rf.status(403, "scoped", "GET", "/v1/projects/"+ref2+"/api-keys", nil)
+	if rec := rf.as("scoped", "GET", "/v1/projects/"+ref+"/api-keys", nil); rec.Code == 403 {
+		t.Errorf("a role scoped to the parent is refused on its branch's project routes: %s", rec.Body)
+	}
+	// Writes need the branch permissions: Read-only and strangers are refused on every verb.
+	for _, role := range []string{"ro", "stranger"} {
+		rf.status(403, role, "PATCH", "/v1/branches/"+id, map[string]any{"persistent": true})
+		rf.status(403, role, "DELETE", "/v1/branches/"+id, nil)
+		for _, op := range []string{"push", "merge", "reset", "restore"} {
+			rf.status(403, role, "POST", "/v1/branches/"+id+"/"+op, map[string]any{})
+		}
+	}
+	// A branch that does not exist is a 404 for a caller who could use the permission.
+	rf.status(404, "owner", "GET", "/v1/branches/zzzzzzzzzzzzzzzzzzzz", nil)
+	rf.status(200, "scoped", "PATCH", "/v1/branches/"+id, map[string]any{"persistent": true})
 }

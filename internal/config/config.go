@@ -55,6 +55,7 @@ type Config struct {
 	Artifacts Artifacts `toml:"artifacts"`
 	Studio    Studio    `toml:"studio"`
 	API       API       `toml:"api"`
+	Mail      Mail      `toml:"mail"`
 	Fleet     Fleet     `toml:"fleet"`
 	Functions Functions `toml:"functions"`
 	Branching Branching `toml:"branching"`

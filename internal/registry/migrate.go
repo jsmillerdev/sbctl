@@ -30,7 +30,11 @@ func Migrations() ([]string, error) {
 // Migrate creates schema sbctl if needed and applies every embedded migration not yet
 // recorded in sbctl.schema_migrations, each in its own transaction. The pool must be
 // connected to the "sbctl" database as its owner.
-func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+func Migrate(ctx context.Context, pool *pgxpool.Pool) error { return migrate(ctx, pool, "") }
+
+// migrate is Migrate that stops before the migration named stopBefore ("" applies all);
+// tests use it to put data in place before a data-moving migration runs.
+func migrate(ctx context.Context, pool *pgxpool.Pool, stopBefore string) error {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return err
@@ -54,6 +58,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	for _, name := range names {
+		if stopBefore != "" && name >= "migrations/"+stopBefore {
+			break
+		}
 		var done bool
 		if err := conn.QueryRow(ctx, `select exists (select 1 from sbctl.schema_migrations where version = $1)`, name).Scan(&done); err != nil {
 			return err

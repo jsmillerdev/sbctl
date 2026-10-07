@@ -155,7 +155,7 @@ func (s *Server) platformCreateProject(w http.ResponseWriter, r *http.Request) e
 	if err := decode(r, &in); err != nil {
 		return err
 	}
-	p, err := s.createProject(r.Context(), in)
+	p, err := s.createProject(r, in)
 	if err != nil {
 		return err
 	}
@@ -282,11 +282,17 @@ func (s *Server) platformSettings(w http.ResponseWriter, r *http.Request) error 
 		},
 	})
 	if keys, err := s.mgr.Keys(r.Context(), p.Ref); err == nil {
-		set(resp, "jwt_secret", keys.JWTSecret)
-		set(resp, "service_api_keys", []map[string]string{
-			{"name": "anon key", "tags": "anon", "api_key": keys.AnonKey},
-			{"name": "service_role key", "tags": "service_role", "api_key": keys.ServiceRoleKey},
-		})
+		// The JWT secret and the service_role key stay with the roles that may read them.
+		list := []map[string]string{{"name": "anon key", "tags": "anon", "api_key": keys.AnonKey}}
+		secretsOK, err := s.canReadSecrets(r, p)
+		if err != nil {
+			return err
+		}
+		if secretsOK {
+			set(resp, "jwt_secret", keys.JWTSecret)
+			list = append(list, map[string]string{"name": "service_role key", "tags": "service_role", "api_key": keys.ServiceRoleKey})
+		}
+		set(resp, "service_api_keys", list)
 	} else {
 		s.log.Warn("keys unavailable for settings", "ref", p.Ref, "err", err)
 	}

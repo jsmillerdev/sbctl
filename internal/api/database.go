@@ -30,6 +30,23 @@ func (s *Server) routesDatabase(add func(string, handlerFunc)) {
 	add("DELETE /v1/projects/{ref}/secrets", s.deleteSecrets)
 }
 
+// sqlRole is the database role a caller's SQL runs as: postgres for a caller who may change
+// data and schema (Owner, Administrator, Developer), the read-only role otherwise.
+func (s *Server) sqlRole(r *http.Request, ref string) (string, error) {
+	p, err := s.loadProject(r.Context(), ref)
+	if err != nil {
+		return "", err
+	}
+	ok, err := s.canWriteSQL(r, p)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return roleReadOnly, nil
+	}
+	return "postgres", nil
+}
+
 // dbQuery runs SQL as the project's postgres role through pg-meta and answers with
 // the rows of the last statement, as the hosted Management API does.
 func (s *Server) dbQuery(readOnlyRoute bool) handlerFunc {
@@ -51,7 +68,10 @@ func (s *Server) dbQuery(readOnlyRoute bool) handlerFunc {
 		}
 		// Read-only queries run as roleReadOnly, a role that cannot write whatever
 		// the SQL says; a default_transaction_read_only setting alone could be undone.
-		role := "postgres"
+		role, err := s.sqlRole(r, p.Ref)
+		if err != nil {
+			return err
+		}
 		if readOnlyRoute || in.ReadOnly {
 			role = roleReadOnly
 		}
@@ -243,6 +263,12 @@ func (s *Server) createLoginRole(w http.ResponseWriter, r *http.Request) error {
 	p, err := s.running(r.Context(), r.PathValue("ref"))
 	if err != nil {
 		return err
+	}
+	// A caller who may only query gets the read-only login role whatever the request says.
+	if ok, err := s.canWriteSQL(r, p); err != nil {
+		return err
+	} else if !ok {
+		in.ReadOnly = true
 	}
 	// The CLI runs `SET SESSION ROLE postgres` after connecting as any cli_login_*
 	// user (cli-go internal/utils/connect.go), which a read-only role cannot do, so

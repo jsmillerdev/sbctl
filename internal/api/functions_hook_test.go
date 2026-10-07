@@ -41,6 +41,7 @@ func withHook(t *testing.T, f *fixture, hook FunctionsHook) {
 		t.Fatal(err)
 	}
 	f.srv = srv
+	f.ownerOn(srv)
 }
 
 func TestFunctionsHookIsCalledAfterEveryChange(t *testing.T) {

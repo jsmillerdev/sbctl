@@ -117,10 +117,12 @@ type FunctionSecret struct {
 
 // Content is a Studio saved item: a SQL snippet, report, log query or notebook.
 type Content struct {
-	ID          string
-	Ref         string
-	FolderID    *string
-	OwnerID     int64
+	ID       string
+	Ref      string
+	FolderID *string
+	OwnerID  int64
+	// UpdatedBy is the profile id of the last editor (0: never edited by anyone but the owner).
+	UpdatedBy   int64
 	Type        string
 	Name        string
 	Description string

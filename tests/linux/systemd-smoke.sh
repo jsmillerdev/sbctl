@@ -369,6 +369,11 @@ done
 sbctl projects health "$B" || fail "$B did not recover from a PostgREST crash"
 
 JWT=$(mint_dashboard_jwt "$(project_field system 'd["keys"]["jwt_secret"]' --show-keys)")
+# The minted user is not an account of sb-gotrue@system, so it is neither a claimed Owner nor an
+# account from before roles: give it the Owner role in the registry, as `sbctl users role` would.
+sudo -u "$SBCTL_USER" "$PSQL" "host=$SBCTL_STATE/projects/system/postgres/sock port=5433 user=supabase_admin dbname=sbctl" -qAt \
+  -c "insert into sbctl.org_members (org_id, user_id, role_id) select id, '00000000-0000-4000-8000-000000000001', 1 from sbctl.organizations on conflict do nothing" </dev/null \
+  || fail "could not give the smoke user the Owner role"
 [[ $(http_code -H "Authorization: Bearer $JWT" http://127.0.0.1:7000/v1/projects) == 200 ]] || fail "a dashboard session is not accepted by the Management API"
 
 log "delete both projects: $A through the Management API (the daemon's own sandbox), $B with the CLI"

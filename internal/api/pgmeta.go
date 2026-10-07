@@ -199,8 +199,14 @@ func (s *Server) pgmetaProxy(w http.ResponseWriter, r *http.Request) error {
 	if rest == "" {
 		rest = "/"
 	}
+	// A caller who may only query (the Read-only role) has every statement run as the
+	// read-only database role, which cannot change anything whatever the SQL says.
+	role, err := s.sqlRole(r, ref)
+	if err != nil {
+		return err
+	}
 	body := http.MaxBytesReader(w, r.Body, maxBody)
-	resp, err := s.pgmetaDo(r.Context(), ref, "postgres", false, r.Method, rest, r.URL.RawQuery, body, r.Header)
+	resp, err := s.pgmetaDo(r.Context(), ref, role, false, r.Method, rest, r.URL.RawQuery, body, r.Header)
 	if err != nil {
 		return err
 	}

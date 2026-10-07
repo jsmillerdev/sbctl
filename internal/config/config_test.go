@@ -186,3 +186,27 @@ func TestBranchingDiskReserve(t *testing.T) {
 		t.Fatalf("env override: %v %+v", err, c.Branching)
 	}
 }
+
+func TestMailEnv(t *testing.T) {
+	if (Mail{}).Enabled() || (Mail{}).GoTrueEnv() != nil {
+		t.Fatal("no host, no mail")
+	}
+	if (Mail{SMTPHost: "smtp.example.test"}).Enabled() {
+		t.Fatal("a sender address is required")
+	}
+	env := Mail{SMTPHost: "smtp.example.test", SMTPFrom: "ops@example.test", SMTPUser: "u", SMTPPass: "p"}.GoTrueEnv()
+	if env["GOTRUE_SMTP_HOST"] != "smtp.example.test" || env["GOTRUE_SMTP_PORT"] != "587" || env["GOTRUE_SMTP_USER"] != "u" ||
+		env["GOTRUE_SMTP_PASS"] != "p" || env["GOTRUE_SMTP_ADMIN_EMAIL"] != "ops@example.test" {
+		t.Fatalf("env: %v", env)
+	}
+	if _, ok := (Mail{SMTPHost: "h", SMTPFrom: "a@b.test"}).GoTrueEnv()["GOTRUE_SMTP_USER"]; ok {
+		t.Fatal("no user, no credentials")
+	}
+	t.Setenv("SBCTL_MAIL_SMTP_HOST", "relay.example.test")
+	t.Setenv("SBCTL_MAIL_SMTP_FROM", "x@example.test")
+	t.Setenv("SBCTL_CONFIG", "/nonexistent/sbctl.toml")
+	c, err := Load("")
+	if err != nil || !c.Mail.Enabled() || c.Mail.SMTPHost != "relay.example.test" {
+		t.Fatalf("env override: %+v %v", c.Mail, err)
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"github.com/OWNER/sbctl/internal/branching"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/projectconfig"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
@@ -301,6 +302,8 @@ type fixture struct {
 	system  *secrets.ProjectKeys
 	userID  string
 	jwt     string
+	// gt is the stand-in for sb-gotrue@system the server's account calls go to.
+	gt *fakeGoTrue
 }
 
 const testRef = "abcdefghijklmnopqrst"
@@ -330,14 +333,27 @@ func newFixture(t testing.TB) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { bsvc.Drain(context.Background()) })
+	f.gt = newFakeGoTrue(t)
 	f.srv, err = NewServer(Deps{
 		Registry: reg, Secrets: sec, Manager: mgr, Config: cfg, PGMetaURL: f.meta.URL, Branching: bsvc,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CreateWait: 2 * time.Second,
+		Upstream: func(p *registry.Project, svc string) string {
+			if p.Ref == config.SystemRef && svc == upGoTrue {
+				return f.gt.URL
+			}
+			// Nothing of ours listens here, whatever else this machine runs on its default ports
+			// (macOS answers on 5000).
+			return "http://127.0.0.1:1"
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.userID = "11111111-2222-4333-8444-555555555555"
+	// The signed-in user owns the organization, as the claimed first user does.
+	if err := f.srv.members.EnsureOwner(ctx, members.OrgRef{ID: f.org.ID, Slug: f.org.Slug}, f.userID); err != nil {
+		t.Fatal(err)
+	}
 	f.jwt = f.signJWT(map[string]any{"sub": f.userID, "email": "dev@example.test", "role": "authenticated",
 		"user_metadata": map[string]any{"full_name": "Dev Eloper"}})
 	return f
@@ -405,4 +421,24 @@ func decodeBody(t testing.TB, rec *httptest.ResponseRecorder) any {
 		t.Fatalf("body is not JSON: %v: %q", err, rec.Body.String())
 	}
 	return v
+}
+
+// addMember makes user a member of the fixture's organization with an organization-wide role.
+func (f *fixture) addMember(user string, role int) {
+	f.t.Helper()
+	err := f.srv.members.Store.Update(context.Background(), f.org.ID, func(ops members.Ops) error {
+		return ops.PutMember(context.Background(), members.Member{OrgID: f.org.ID, UserID: user, RoleID: role})
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// ownerOn makes the fixture's signed-in user Owner of the fixture's organization on srv: a server
+// built next to the fixture's has a member store of its own.
+func (f *fixture) ownerOn(srv *Server) {
+	f.t.Helper()
+	if err := srv.members.EnsureOwner(context.Background(), members.OrgRef{ID: f.org.ID, Slug: f.org.Slug}, f.userID); err != nil {
+		f.t.Fatal(err)
+	}
 }

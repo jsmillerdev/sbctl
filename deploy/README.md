@@ -78,15 +78,18 @@ Only 80, 443, 5432 and 6543 are meant to be reachable. The shared services liste
 
 The token is single use and expires after 72 hours (`--claim-ttl`); the database keeps only its SHA-256. A request that fails (the address exists, the password is refused) gives the token back. Failed attempts are limited node-wide. While the node is unclaimed, `sudo -u sbctl sbctl claim token` issues a new token and revokes the old one (`--if-none` issues nothing while an unused, unexpired token exists, which is how a re-run of the installer avoids replacing a token that was already handed over, for example the one in the CloudFormation secret); after the claim it refuses unless you pass `--force` (an administrator locked out). The endpoint is `GET` and `POST /claim` on `api.<domain>` and on the loopback admin listener (`127.0.0.1:7000`).
 
-Later users come by invitation. sbctl sends no email: it prints a token and you hand it over.
+Later users come by invitation, with a role as on hosted Supabase (owner, administrator, developer, read-only; see `internal/api/README.md` for what each may do). `sbctl users invite` prints the link to give the invitee. sbctl sends no email unless `[mail]` is configured in `config.toml` (an SMTP relay for `sb-gotrue@system`), in which case it also sends the invitation.
 
 ```bash
-sudo -u sbctl sbctl users invite dev@example.com    # prints sbi_... (valid 7 days, works once)
-sudo -u sbctl sbctl users list
-sudo -u sbctl sbctl users remove dev@example.com    # ends their access at once: sessions and tokens are refused on the next request
+sudo -u sbctl sbctl users invite dev@example.com --role developer   # prints the sbi_... link (valid 7 days, works once)
+sudo -u sbctl sbctl users invite ops@example.com --role administrator --org acme
+sudo -u sbctl sbctl users invite qa@example.com --role read-only --project abcdefghijklmnopqrst
+sudo -u sbctl sbctl users list                                       # who has which role
+sudo -u sbctl sbctl users role dev@example.com administrator         # change a role (or restore an owner)
+sudo -u sbctl sbctl users remove dev@example.com                     # ends their access at once (sessions and tokens are refused on the next request), removes memberships and the access tokens they made
 ```
 
-The invitee opens the same claim page, enters the token and a password; the address comes from the invite. Every account is an administrator today (members and roles are a later phase), so invite only people you would give the whole node.
+An address that has no account gets the claim page with the token filled in: the invitee picks a password and joins with the invited role. An address that already has an account gets the dashboard's invitation page. The Team page of an organization in the dashboard does the same through the Management API. An organization always keeps one owner: `users remove` refuses to delete the only owner unless you add `--force`. Accounts created before roles existed became owners of every organization when the roles were introduced.
 
 ## Update
 

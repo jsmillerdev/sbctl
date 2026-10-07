@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -65,6 +66,16 @@ type Accounts struct {
 	HTTP      *http.Client
 	Now       func() time.Time
 	Log       *slog.Logger
+	// Members assigns roles: the claimed first user becomes Owner, an invited user joins
+	// the organizations that invited the address, and a removed user loses every membership.
+	Members *members.Service
+	// Users records a created dashboard account as soon as it exists.
+	Users Store
+	// LiveRefs filters invited project refs to the projects that still exist.
+	LiveRefs func(ctx context.Context, refs []string) []string
+	// NoMail makes invitations skip the mail even when [mail] is configured (`users invite
+	// --no-mail`): the caller passes the link on.
+	NoMail bool
 }
 
 func (a *Accounts) now() time.Time {
@@ -118,7 +129,7 @@ func (a *Accounts) IssueClaimToken(ctx context.Context, ttl time.Duration, force
 	}
 	token = newToken(claimPrefix)
 	expires = a.now().Add(ttl)
-	if _, err = a.Store.CreateClaimToken(ctx, KindClaim, secrets.HashToken(token), "", expires); err != nil {
+	if _, err = a.Store.CreateClaimToken(ctx, KindClaim, secrets.HashToken(token), "", 0, expires); err != nil {
 		return "", time.Time{}, err
 	}
 	return token, expires, nil
@@ -131,9 +142,11 @@ func (a *Accounts) HasLiveClaimToken(ctx context.Context) (bool, error) {
 	return a.Store.HasLiveClaimToken(ctx, KindClaim, a.now())
 }
 
-// IssueInvite creates an invite token for email and revokes the unused one for the same
-// address.
-func (a *Accounts) IssueInvite(ctx context.Context, email string, ttl time.Duration) (token string, expires time.Time, err error) {
+// IssueInvite creates an invite token for email, bound to the organization invitation
+// invitationID (0: bound to none, so that redeeming it creates the account and accepts nothing).
+// It revokes the unused token of the same address and invitation; the invite tokens of other
+// invitations stay valid. The token dies with its invitation.
+func (a *Accounts) IssueInvite(ctx context.Context, email string, invitationID int64, ttl time.Duration) (token string, expires time.Time, err error) {
 	email, err = normalizeEmail(email)
 	if err != nil {
 		return "", time.Time{}, err
@@ -143,7 +156,7 @@ func (a *Accounts) IssueInvite(ctx context.Context, email string, ttl time.Durat
 	}
 	token = newToken(invitePrefix)
 	expires = a.now().Add(ttl)
-	if _, err = a.Store.CreateClaimToken(ctx, KindInvite, secrets.HashToken(token), email, expires); err != nil {
+	if _, err = a.Store.CreateClaimToken(ctx, KindInvite, secrets.HashToken(token), email, invitationID, expires); err != nil {
 		return "", time.Time{}, err
 	}
 	return token, expires, nil
@@ -204,6 +217,16 @@ func (a *Accounts) Redeem(ctx context.Context, in RedeemRequest) (*RedeemResult,
 			return nil, errf(http.StatusBadRequest, "this invite is for %s", email)
 		}
 	}
+	if tok.Kind == KindInvite && tok.InvitationID != 0 && a.Members != nil {
+		// The invitation this link was issued for must still be pending for this address; a
+		// replaced, revoked or expired invitation leaves a dead link, not an account.
+		if _, err := a.Members.PendingInvitation(ctx, tok.InvitationID, email); err != nil {
+			if errors.Is(err, members.ErrNotFound) {
+				return nil, errBadToken
+			}
+			return nil, err
+		}
+	}
 	tok, err = a.Store.ConsumeClaimToken(ctx, hash, a.now(), email)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -219,6 +242,12 @@ func (a *Accounts) Redeem(ctx context.Context, in RedeemRequest) (*RedeemResult,
 		return nil, err
 	}
 	res := &RedeemResult{Email: email, UserID: userID, DashboardURL: a.Config.DashboardURL()}
+	if a.Users != nil {
+		// Recorded now, so that "first seen" at sign-in only ever means an account from before roles.
+		if _, err := a.Users.UpsertUser(ctx, User{UserID: userID, Email: email, Username: strings.SplitN(email, "@", 2)[0]}); err != nil {
+			a.log().Error("claim: dashboard user not recorded", "error", err)
+		}
+	}
 	if tok.Kind == KindClaim {
 		org, err := a.firstOrg(ctx, in.Organization)
 		if err != nil {
@@ -227,6 +256,22 @@ func (a *Accounts) Redeem(ctx context.Context, in RedeemRequest) (*RedeemResult,
 			a.log().Error("claim: organization not created", "error", err)
 		} else {
 			res.Organization = org.Slug
+			// The claimed first user owns the organization.
+			if a.Members != nil {
+				if err := a.Members.EnsureOwner(ctx, members.OrgRef{ID: org.ID, Slug: org.Slug}, userID); err != nil {
+					a.log().Error("claim: first user not made Owner", "error", err)
+				}
+			}
+		}
+	} else if a.Members != nil && tok.InvitationID != 0 {
+		// The invite token proves the address, so the invitation it was issued for is accepted. Only
+		// that one: the invitations other organizations sent to the same address need their own links.
+		var live func([]string) []string
+		if a.LiveRefs != nil {
+			live = func(refs []string) []string { return a.LiveRefs(ctx, refs) }
+		}
+		if _, err := a.Members.AcceptInvitationByID(ctx, tok.InvitationID, userID, email, live); err != nil {
+			a.log().Error("claim: the invitation was not accepted", "error", err)
 		}
 	}
 	a.log().Info("dashboard user created", "email", email, "kind", tok.Kind)
@@ -374,19 +419,22 @@ func (a *Accounts) ListUsers(ctx context.Context) ([]DashboardUser, error) {
 	return out, nil
 }
 
-// RemoveUser removes the dashboard user with this email, and ends the user's access at
-// once. The order matters, and a failed step leaves the account findable so that the
-// command can be run again:
+// RemoveUser removes the dashboard user with this email, together with the memberships and
+// roles of the user, and ends the user's access at once. It refuses when the user is the only
+// Owner of an organization (members.ErrLastOwner) unless force is set; the refusal comes first
+// and changes nothing. The order after that matters, and a failed step leaves the account
+// findable so that the command can be run again:
 //
-//  1. The user is recorded as removed. From that moment the API refuses the user's GoTrue
+//  1. The memberships and roles are removed (the step that can refuse).
+//  2. The user is recorded as removed. From that moment the API refuses the user's GoTrue
 //     session (which would otherwise stay valid until it expires, an hour) and every
 //     personal access token the user holds, on the next request.
-//  2. The personal access tokens the user created are deleted.
-//  3. The GoTrue account is deleted, which also deletes the user's sessions and refresh
+//  3. The personal access tokens the user created are deleted.
+//  4. The GoTrue account is deleted, which also deletes the user's sessions and refresh
 //     tokens there, so no new access token can be issued.
 //
 // It returns the number of tokens removed.
-func (a *Accounts) RemoveUser(ctx context.Context, email string) (tokens int, err error) {
+func (a *Accounts) RemoveUser(ctx context.Context, email string, force bool) (tokens int, err error) {
 	email, err = normalizeEmail(email)
 	if err != nil {
 		return 0, err
@@ -397,6 +445,11 @@ func (a *Accounts) RemoveUser(ctx context.Context, email string) (tokens int, er
 	}
 	for _, u := range users {
 		if strings.EqualFold(u.Email, email) {
+			if a.Members != nil {
+				if err := a.Members.RemoveUser(ctx, u.ID, force); err != nil {
+					return 0, err
+				}
+			}
 			if err := a.Store.MarkUserRemoved(ctx, u.ID, u.Email); err != nil {
 				return 0, err
 			}
@@ -530,7 +583,7 @@ func claimClient(r *http.Request, trustForwarded bool) string {
 // admin listener without credentials (the token is the credential).
 func (s *Server) claimRoutes(mux *muxSet) {
 	lim := &claimLimiter{}
-	mux.handle("GET /claim", s.wrap(authNone, func(w http.ResponseWriter, r *http.Request) error {
+	mux.handle("GET /claim", s.wrap("", authNone, func(w http.ResponseWriter, r *http.Request) error {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Security-Policy", claimCSP)
@@ -539,7 +592,7 @@ func (s *Server) claimRoutes(mux *muxSet) {
 		w.Header().Set("X-Frame-Options", "DENY")
 		return claimPage.Execute(w, nil)
 	}))
-	mux.handle("POST /claim", s.wrap(authNone, func(w http.ResponseWriter, r *http.Request) error {
+	mux.handle("POST /claim", s.wrap("", authNone, func(w http.ResponseWriter, r *http.Request) error {
 		now := s.now()
 		client := claimClient(r, s.trustForwarded(r))
 		if lim.blocked(client, now) {
@@ -563,9 +616,16 @@ func (s *Server) claimRoutes(mux *muxSet) {
 	}))
 }
 
-// claimScript is the page's only script; its hash goes into the CSP.
+// claimScript is the page's only script; its hash goes into the CSP. It has no comments:
+// html/template strips them from the page, and the hash must match what is served. A link from
+// an invitation carries the token and the address in the fragment, which a browser never sends
+// to a server; the script reads them into the form and clears the address bar.
 const claimScript = `
 const f = document.getElementById('f'), out = document.getElementById('out'), btn = document.getElementById('go');
+const hp = new URLSearchParams(location.hash.slice(1));
+if (hp.get('token')) f.elements['token'].value = hp.get('token');
+if (hp.get('email')) f.elements['email'].value = hp.get('email');
+if (location.hash) history.replaceState(null, '', location.pathname);
 f.addEventListener('submit', async (e) => {
   e.preventDefault();
   out.className = ''; out.textContent = '';

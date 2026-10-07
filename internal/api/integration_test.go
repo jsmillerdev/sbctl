@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,12 +32,18 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
 
 type stack struct {
-	t       testing.TB
+	t testing.TB
+	// PATs by role ("owner", "admin", "dev", "ro"): personal access tokens of users with
+	// that organization-wide role.
+	PATs map[string]string
+	// JWTs are the dashboard sessions of the same users (the /platform routes take no PAT).
+	JWTs    map[string]string
 	APIURL  string
 	DSN     string // postgres superuser DSN of the project database
 	PGPort  int
@@ -56,17 +63,27 @@ func itLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// freePort returns a free TCP port in the private range 32100-32999.
+// portBase is the first port of the 900 the stack picks from: 32100 unless
+// SBCTL_API_IT_PORT_BASE says otherwise (a machine that reserves another range).
+func portBase() int {
+	if v, err := strconv.Atoi(os.Getenv("SBCTL_API_IT_PORT_BASE")); err == nil && v > 1024 && v < 64000 {
+		return v
+	}
+	return 32100
+}
+
+// freePort returns a free TCP port in portBase()..portBase()+899.
 func freePort(t testing.TB) int {
 	t.Helper()
-	for p := 32100 + int(time.Now().UnixNano()%400); p < 33000; p++ {
+	base := portBase()
+	for p := base + int(time.Now().UnixNano()%400); p < base+900; p++ {
 		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
 		if err == nil {
 			l.Close()
 			return p
 		}
 	}
-	t.Fatal("no free port in 32100-32999")
+	t.Fatal("no free port in the integration range")
 	return 0
 }
 
@@ -203,22 +220,41 @@ func startStack(t testing.TB) *stack {
 		PGPort: pgPort, Ref: ref, Manager: mgr, Cfg: cfg, Server: srv}
 	sysKeys, _ := mgr.Keys(ctx, config.SystemRef)
 	f := &fixture{t: t, system: sysKeys}
-	st.JWT = f.signJWT(map[string]any{"sub": "11111111-2222-4333-8444-555555555555", "email": "dev@example.test", "role": "authenticated"})
-	// A PAT, created the way the dashboard does.
-	req, _ := http.NewRequest("POST", st.APIURL+"/platform/profile/access-tokens", strings.NewReader(`{"name":"it"}`))
-	req.Header.Set("Authorization", "Bearer "+st.JWT)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	// The signed-in user owns the organization, like the claimed first user; one user per
+	// other role joins it, each with a PAT created the way the dashboard does.
+	st.PATs, st.JWTs = map[string]string{}, map[string]string{}
+	mkUser := func(name, id string, role int) string {
+		if err := srv.members.EnsureOwner(ctx, members.OrgRef{ID: org.ID, Slug: org.Slug}, id); err != nil {
+			t.Fatal(err)
+		}
+		if role != members.RoleOwner {
+			if err := srv.members.SetOrgRole(ctx, nil, members.OrgRef{ID: org.ID, Slug: org.Slug}, id, role); err != nil {
+				// A node needs an Owner: the first user is one, so demoting it is refused only for the last.
+				t.Fatal(err)
+			}
+		}
+		jwt := f.signJWT(map[string]any{"sub": id, "email": name + "@example.test", "role": "authenticated"})
+		req, _ := http.NewRequest("POST", st.APIURL+"/platform/profile/access-tokens", strings.NewReader(`{"name":"it-`+name+`"}`))
+		req.Header.Set("Authorization", "Bearer "+jwt)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var tok struct{ Token string }
+		_ = json.NewDecoder(resp.Body).Decode(&tok)
+		resp.Body.Close()
+		if tok.Token == "" {
+			t.Fatalf("could not create a PAT for %s", name)
+		}
+		st.PATs[name], st.JWTs[name] = tok.Token, jwt
+		return jwt
 	}
-	var tok struct{ Token string }
-	_ = json.NewDecoder(resp.Body).Decode(&tok)
-	resp.Body.Close()
-	st.PAT = tok.Token
-	if st.PAT == "" {
-		t.Fatal("could not create a PAT")
-	}
+	st.JWT = mkUser("owner", "11111111-2222-4333-8444-555555555555", members.RoleOwner)
+	mkUser("admin", "11111111-2222-4333-8444-555555555502", members.RoleAdministrator)
+	mkUser("dev", "11111111-2222-4333-8444-555555555503", members.RoleDeveloper)
+	mkUser("ro", "11111111-2222-4333-8444-555555555504", members.RoleReadOnly)
+	st.PAT = st.PATs["owner"]
 	return st
 }
 
@@ -492,7 +528,7 @@ func TestIntegrationServe(t *testing.T) {
 	}
 	s := startStack(t)
 	info, _ := json.MarshalIndent(map[string]any{
-		"api_url": s.APIURL, "pat": s.PAT, "jwt": s.JWT, "ref": s.Ref, "dsn": s.DSN, "pg_port": s.PGPort,
+		"api_url": s.APIURL, "pat": s.PAT, "pats": s.PATs, "jwt": s.JWT, "ref": s.Ref, "dsn": s.DSN, "pg_port": s.PGPort,
 	}, "", "  ")
 	if err := os.WriteFile(path, info, 0o600); err != nil {
 		t.Fatal(err)
@@ -513,4 +549,136 @@ func TestIntegrationStore(t *testing.T) {
 		t.Fatalf("expected the Postgres store, got %T", s.Server.store)
 	}
 	testStore(t, pg, s.Ref)
+}
+
+// TestIntegrationRoles checks, against a real Postgres and a real pg-meta, that a Read-only
+// member cannot change anything however the request is made, and that the other roles can.
+func TestIntegrationRoles(t *testing.T) {
+	s := startStack(t)
+	p := "/v1/projects/" + s.Ref
+	callAs := func(role, method, path string, body any) (int, string) {
+		t.Helper()
+		var rd io.Reader
+		if body != nil {
+			rd = strings.NewReader(string(mustJSON2(body)))
+		}
+		req, _ := http.NewRequest(method, s.APIURL+path, rd)
+		tok := s.PATs[role]
+		if strings.HasPrefix(path, "/platform/") {
+			tok = s.JWTs[role]
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+	if code, b := callAs("owner", "POST", p+"/database/query", map[string]any{"query": "create table public.roles_t (id int primary key, v text); insert into public.roles_t values (1, 'a')"}); code != 201 {
+		t.Fatalf("setup: %d %s", code, b)
+	}
+	count := func() string {
+		code, b := callAs("owner", "POST", p+"/database/query", map[string]any{"query": "select count(*)::int as n from public.roles_t"})
+		if code != 201 {
+			t.Fatalf("count: %d %s", code, b)
+		}
+		return b
+	}
+	writes := []string{
+		"insert into public.roles_t values (2, 'b')",
+		"update public.roles_t set v = 'x'",
+		"delete from public.roles_t",
+		"drop table public.roles_t",
+		"create table public.evil (id int)",
+		"begin read write; delete from public.roles_t; commit",
+		"set session characteristics as transaction read write; delete from public.roles_t",
+		"reset role; delete from public.roles_t",
+		"alter table public.roles_t add column z int",
+	}
+	for _, q := range writes {
+		// The Management API's SQL route (the MCP server's execute_sql) and Studio's pg-meta route.
+		if code, b := callAs("ro", "POST", p+"/database/query", map[string]any{"query": q}); code < 400 || code == 401 || code == 403 {
+			t.Errorf("read-only database/query did not fail in the database for %q: %d %s", q, code, b)
+		}
+		if code, b := callAs("ro", "POST", "/platform/pg-meta/"+s.Ref+"/query", map[string]any{"query": q}); code < 400 || code == 401 || code == 403 {
+			t.Errorf("read-only pg-meta did not fail in the database for %q: %d %s", q, code, b)
+		}
+	}
+	if got := count(); !strings.Contains(got, `"n":1`) {
+		t.Fatalf("a read-only write got through: %s", got)
+	}
+	// Reads work for everyone.
+	for _, role := range []string{"ro", "dev", "admin", "owner"} {
+		if code, b := callAs(role, "POST", p+"/database/query", map[string]any{"query": "select v from public.roles_t"}); code != 201 || !strings.Contains(b, `"v":"a"`) {
+			t.Errorf("%s read: %d %s", role, code, b)
+		}
+		if code, b := callAs(role, "POST", "/platform/pg-meta/"+s.Ref+"/query", map[string]any{"query": "select v from public.roles_t"}); code != 200 || !strings.Contains(b, `"v":"a"`) {
+			t.Errorf("%s pg-meta read: %d %s", role, code, b)
+		}
+	}
+	// Developers, Administrators and Owners write, through both routes.
+	for i, role := range []string{"dev", "admin", "owner"} {
+		q := "insert into public.roles_t values (" + itoa(int64(10+i)) + ", 'w')"
+		if code, b := callAs(role, "POST", p+"/database/query", map[string]any{"query": q}); code != 201 {
+			t.Errorf("%s write: %d %s", role, code, b)
+		}
+		q = "insert into public.roles_t values (" + itoa(int64(20+i)) + ", 'w')"
+		if code, b := callAs(role, "POST", "/platform/pg-meta/"+s.Ref+"/query", map[string]any{"query": q}); code != 200 {
+			t.Errorf("%s pg-meta write: %d %s", role, code, b)
+		}
+	}
+	// Migrations: refused for Read-only before anything runs; applied for a Developer.
+	mig := map[string]any{"query": "create table public.mig_t (id int)", "name": "roles_migration"}
+	if code, _ := callAs("ro", "POST", p+"/database/migrations", mig); code != 403 {
+		t.Errorf("read-only migration: %d", code)
+	}
+	if code, b := callAs("dev", "POST", p+"/database/migrations", mig); code != 200 && code != 201 {
+		t.Errorf("developer migration: %d %s", code, b)
+	}
+	if code, b := callAs("ro", "POST", p+"/database/query", map[string]any{"query": "select to_regclass('public.mig_t') is not null as e"}); code != 201 || !strings.Contains(b, `"e":true`) {
+		t.Errorf("the developer's migration is visible: %d %s", code, b)
+	}
+	// The CLI's login role for a Read-only member cannot write either.
+	code, b := callAs("ro", "POST", p+"/cli/login-role", map[string]any{"read_only": false})
+	if code != 201 || !strings.Contains(b, "sbctl_cli_ro_") {
+		t.Fatalf("read-only login role: %d %s", code, b)
+	}
+	var lr struct {
+		Role, Password string
+	}
+	_ = json.Unmarshal([]byte(b), &lr)
+	roConn, err := pgx.Connect(context.Background(), fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/postgres?sslmode=disable", lr.Role, lr.Password, s.PGPort))
+	if err != nil {
+		t.Fatalf("login with the read-only login role: %v", err)
+	}
+	defer roConn.Close(context.Background())
+	if _, err := roConn.Exec(context.Background(), "delete from public.roles_t"); err == nil {
+		t.Error("the read-only login role deleted rows")
+	}
+	if _, err := roConn.Exec(context.Background(), "select * from public.roles_t"); err != nil {
+		t.Errorf("the read-only login role cannot read: %v", err)
+	}
+	// Settings and keys.
+	for _, c := range []struct {
+		method, path string
+		body         any
+	}{
+		{"POST", p + "/secrets", []any{map[string]any{"name": "A", "value": "b"}}},
+		{"PATCH", p + "/config/auth", map[string]any{"site_url": "https://x.example.test"}},
+		{"POST", p + "/api-keys", map[string]any{"type": "publishable", "name": "k"}},
+		{"POST", p + "/pause", nil},
+		{"DELETE", p, nil},
+	} {
+		if code, b := callAs("ro", c.method, c.path, c.body); code != 403 {
+			t.Errorf("read-only %s %s: %d %s", c.method, c.path, code, b)
+		}
+		if code, b := callAs("dev", c.method, c.path, c.body); code != 403 {
+			t.Errorf("developer %s %s: %d %s", c.method, c.path, code, b)
+		}
+	}
 }

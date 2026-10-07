@@ -296,7 +296,14 @@ func (s *Server) getBranch(w http.ResponseWriter, r *http.Request) error {
 	}
 	// The password and JWT secret of a branch belong to the branch. The default branch is the
 	// project itself: its secrets stay in the secret store, as they do for the pooler route.
+	// A caller whose role cannot read the project's keys (Read-only) does not get them here either.
+	showKeys := false
 	if !b.IsDefault {
+		if showKeys, err = s.canReadSecrets(r, p); err != nil {
+			return err
+		}
+	}
+	if showKeys {
 		keys, err := s.mgr.Keys(r.Context(), b.Ref)
 		switch {
 		case err == nil:

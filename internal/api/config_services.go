@@ -72,7 +72,13 @@ func (s *Server) getPostgREST(key string, platform bool) handlerFunc {
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, s.postgrestView(key, st, keys.JWTSecret, platform))
+		jwtSecret := keys.JWTSecret
+		if ok, err := s.canReadSecrets(r, p); err != nil {
+			return err
+		} else if !ok {
+			jwtSecret = ""
+		}
+		writeJSON(w, http.StatusOK, s.postgrestView(key, st, jwtSecret, platform))
 		return nil
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/OWNER/sbctl/internal/members"
 	"github.com/OWNER/sbctl/internal/registry"
 )
 
@@ -31,7 +32,7 @@ func (s *Server) contentJSON(r *http.Request, p *registry.Project, c *Content, w
 	m := map[string]any{
 		"id": c.ID, "inserted_at": ts(c.InsertedAt), "updated_at": ts(c.UpdatedAt), "type": c.Type, "visibility": c.Visibility,
 		"name": c.Name, "project_id": projectNumID(p), "owner_id": c.OwnerID, "favorite": c.Favorite,
-		"last_updated_by": c.OwnerID,
+		"last_updated_by": c.editor(),
 	}
 	if c.Description != "" {
 		m["description"] = c.Description
@@ -57,9 +58,37 @@ func (s *Server) contentJSON(r *http.Request, p *registry.Project, c *Content, w
 			name = u.Username
 		}
 		m["owner"] = map[string]any{"id": c.OwnerID, "username": name}
-		m["updated_by"] = map[string]any{"id": c.OwnerID, "username": name}
+		editorName := name
+		if ed := c.editor(); ed != c.OwnerID {
+			editorName = ""
+			if u, err := s.store.GetUserByID(r.Context(), ed); err == nil {
+				editorName = u.Username
+			}
+		}
+		m["updated_by"] = map[string]any{"id": c.editor(), "username": editorName}
 	}
 	return m, nil
+}
+
+// requireContent refuses with 403 unless the caller may perform action on the saved item (or
+// folder) of that type, visibility and owner: see canContent.
+func (s *Server) requireContent(r *http.Request, p *registry.Project, u *User, action, typ, visibility string, ownerID int64) error {
+	ok, err := s.canContent(r, p, u, action, typ, visibility, ownerID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return forbidden(action, members.ResUserContent)
+	}
+	return nil
+}
+
+// editor is the profile id that last changed the item (its owner until someone else edits it).
+func (c *Content) editor() int64 {
+	if c.UpdatedBy != 0 {
+		return c.UpdatedBy
+	}
+	return c.OwnerID
 }
 
 // visible reports whether u may see c: private items belong to their owner.
@@ -145,17 +174,19 @@ func (s *Server) putContent(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	c := &Content{Ref: p.Ref, OwnerID: u.ID, Type: "sql", Visibility: "user"}
+	var cur *Content
 	if id := str(in, "id"); id != "" {
 		if !uuidRe.MatchString(id) {
 			return errf(http.StatusBadRequest, "id must be a uuid")
 		}
-		cur, err := s.store.GetContent(r.Context(), p.Ref, id)
+		got, err := s.store.GetContent(r.Context(), p.Ref, id)
 		switch {
 		case err == nil:
-			if !visible(cur, u) {
+			if !visible(got, u) {
 				return errf(http.StatusNotFound, "Content not found")
 			}
-			*c = *cur
+			cur = got
+			*c = *got
 		case !errors.Is(err, ErrNotFound):
 			return err
 		}
@@ -194,6 +225,19 @@ func (s *Server) putContent(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(c.Name) == "" {
 		return errf(http.StatusBadRequest, "name is required")
 	}
+	// Changing a stored item needs the right to change it: its owner, or a role that may change
+	// anyone's shared items. Without this check a member could rewrite the SQL another member
+	// later opens and runs.
+	if cur != nil {
+		for _, typ := range []string{cur.Type, c.Type} {
+			if err := s.requireContent(r, p, u, members.ActUpdate, typ, cur.Visibility, cur.OwnerID); err != nil {
+				return err
+			}
+		}
+	} else if err := s.requireContent(r, p, u, members.ActCreate, c.Type, c.Visibility, u.ID); err != nil {
+		return err
+	}
+	c.UpdatedBy = u.ID
 	if err := s.store.UpsertContent(r.Context(), c); errors.Is(err, ErrNotFound) {
 		// The id belongs to an item of another project.
 		return errf(http.StatusNotFound, "Content not found")
@@ -225,7 +269,24 @@ func (s *Server) deleteContent(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	deleted, err := s.store.DeleteContent(r.Context(), p.Ref, u.ID, idsParam(r))
+	// Every item the caller can see must be one they may delete; an item that is not theirs and
+	// not within their role's reach refuses the whole request.
+	ids := idsParam(r)
+	allowed := make([]string, 0, len(ids))
+	for _, id := range ids {
+		c, err := s.store.GetContent(r.Context(), p.Ref, id)
+		if errors.Is(err, ErrNotFound) || (err == nil && !visible(c, u)) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := s.requireContent(r, p, u, members.ActDelete, c.Type, c.Visibility, c.OwnerID); err != nil {
+			return err
+		}
+		allowed = append(allowed, id)
+	}
+	deleted, err := s.store.DeleteContent(r.Context(), p.Ref, u.ID, allowed)
 	if err != nil {
 		return err
 	}
@@ -357,6 +418,10 @@ func (s *Server) renameFolder(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	u, err := s.currentUser(r)
+	if err != nil {
+		return err
+	}
 	id := r.PathValue("id")
 	var in struct {
 		Name string `json:"name"`
@@ -366,6 +431,13 @@ func (s *Server) renameFolder(w http.ResponseWriter, r *http.Request) error {
 	}
 	if !uuidRe.MatchString(id) || strings.TrimSpace(in.Name) == "" {
 		return errf(http.StatusBadRequest, "valid id and name are required")
+	}
+	f, err := s.store.GetFolder(r.Context(), p.Ref, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	if err := s.requireContent(r, p, u, members.ActUpdate, "folder", "user", f.OwnerID); err != nil {
+		return err
 	}
 	if err := s.store.RenameFolder(r.Context(), p.Ref, id, in.Name); err != nil {
 		return mapErr(err)
@@ -379,7 +451,24 @@ func (s *Server) deleteFolders(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := s.store.DeleteFolders(r.Context(), p.Ref, idsParam(r)); err != nil {
+	u, err := s.currentUser(r)
+	if err != nil {
+		return err
+	}
+	ids := idsParam(r)
+	for _, id := range ids {
+		f, err := s.store.GetFolder(r.Context(), p.Ref, id)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := s.requireContent(r, p, u, members.ActDelete, "folder", "user", f.OwnerID); err != nil {
+			return err
+		}
+	}
+	if err := s.store.DeleteFolders(r.Context(), p.Ref, ids); err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusOK)

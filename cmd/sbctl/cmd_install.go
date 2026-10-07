@@ -656,7 +656,7 @@ func printSummary(w io.Writer, cfg *config.Config, ip, token string, claimed boo
 		fmt.Fprintln(w, "Lost it? sudo -u sbctl sbctl claim token   (revokes the old one)")
 		fmt.Fprintln(w)
 	case claimed:
-		fmt.Fprintln(w, "The first administrator already exists. Invite more users with: sudo -u sbctl sbctl users invite <email>")
+		fmt.Fprintln(w, "The first administrator already exists. Invite more users with: sudo -u sbctl sbctl users invite <email> --role developer")
 	default:
 		if o.ClaimTokenFile != "" {
 			// An unattended install (cloud-init) logs everything it prints; the token goes only
