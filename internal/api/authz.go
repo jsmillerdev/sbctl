@@ -320,7 +320,15 @@ var routeRules = []routeRule{
 
 	// ---- projects: network, billing, everything else ----
 	rule("POST", "/v1/projects/{ref}/network-bans/retrieve/**", chk(members.ActRead, P)),
+	// Custom domains: Owners and Administrators change them (hosted's custom_domain_write and
+	// vanity_subdomain_write; Developers hold no write on projects), every role reads them.
+	// Verifying is a write: it queries DNS and moves the claim. Checking a vanity name changes
+	// nothing, so it only needs read.
 	rule("POST", "/v1/projects/{ref}/vanity-subdomain/check-availability", chk(members.ActRead, P)),
+	rule("R", "/v1/projects/{ref}/custom-hostname", chk(members.ActRead, "custom_domain")),
+	rule("W", "/v1/projects/{ref}/custom-hostname/**", chk(members.ActUpdate, "custom_domain")),
+	rule("R", "/v1/projects/{ref}/vanity-subdomain", chk(members.ActRead, "vanity_subdomain")),
+	rule("W", "/v1/projects/{ref}/vanity-subdomain/**", chk(members.ActUpdate, "vanity_subdomain")),
 	rule("W", "/v1/projects/{ref}/billing/**", chk(members.ActBillingWrite, "stripe.subscriptions")),
 	rule("W", "/platform/projects/{ref}/billing/**", chk(members.ActBillingWrite, "stripe.subscriptions")),
 }

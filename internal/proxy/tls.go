@@ -273,18 +273,47 @@ func (s *Server) allowHost(_ context.Context, name string) error {
 		return fmt.Errorf("%s belongs to a project that is %s", name, p.status)
 	}
 	switch kind {
-	case "derived":
+	case "derived", "vanity":
+		// A vanity subdomain is <name>.api.<domain>: the wildcard covers it like a ref host.
 		if s.tlsMode == tlsDNS01 || s.tlsMode == tlsAuto {
 			return fmt.Errorf("%s is covered by the wildcard certificate", name)
 		}
 		return nil
 	case "custom":
+		// A route of a custom hostname exists only once the hostname is active: the domain
+		// store inserts it when the project activates the hostname and removes it with the
+		// hostname. Claimed, unverified or deleted names have no route, so no certificate.
 		if s.tlsMode == tlsDNS01 {
 			return fmt.Errorf("%s needs HTTP-01, which tls.mode dns01 disables", name)
 		}
 		return nil
 	}
 	return fmt.Errorf("%s is not a host this node serves", name)
+}
+
+// warmCertificates obtains the certificate of a custom hostname or vanity subdomain that has
+// just been routed, so that its first visitor does not wait for the CA. It asks allowHost
+// first, like a handshake would, and does nothing for a name that already has a certificate.
+// Failures are logged; the on-demand path at the first handshake retries.
+func (s *Server) warmCertificates(ctx context.Context, cm *certManager, hosts []string) {
+	if cm.http == nil {
+		return
+	}
+	for _, host := range hosts {
+		if err := s.allowHost(ctx, host); err != nil {
+			continue
+		}
+		go func() {
+			if _, err := cm.http.CacheManagedCertificate(ctx, host); err == nil {
+				return
+			}
+			if err := cm.http.ObtainCertAsync(ctx, host); err != nil && ctx.Err() == nil {
+				s.log.Warn("proxy: could not obtain the certificate of a newly routed host; it will be requested on first use", "host", host, "err", err)
+				return
+			}
+			s.log.Info("proxy: certificate ready for a newly routed host", "host", host)
+		}()
+	}
 }
 
 // redirectHandler is the :80 handler in TLS modes: it answers ACME HTTP-01

@@ -136,6 +136,7 @@ func (s *Server) Serve(ctx context.Context, httpLn, httpsLn net.Listener) error 
 			return err
 		}
 		defer cm.close()
+		s.table.setRoutesAdded(func(hosts []string) { s.warmCertificates(ctx, cm, hosts) })
 		httpH = s.redirectHandler(cm, httpsPort)
 		httpsSrv.TLSConfig = cm.tlsConfig()
 		useTLSOnLn = true

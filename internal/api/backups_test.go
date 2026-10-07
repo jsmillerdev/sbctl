@@ -581,16 +581,17 @@ func TestProjectAddonsReportPITR(t *testing.T) {
 	}{{7, "pitr_7"}, {10, "pitr_7"}, {14, "pitr_14"}, {21, "pitr_14"}, {28, "pitr_28"}, {90, "pitr_28"}} {
 		b.cfg.Backup.RetentionDays = tc.days
 		sel := plat()["selected_addons"].([]any)
-		if len(sel) != 1 {
+		// The custom domain entry comes first (Studio looks for it); PITR follows.
+		if len(sel) != 2 || sel[0].(map[string]any)["type"] != "custom_domain" {
 			t.Fatalf("%d days: selected_addons = %v", tc.days, sel)
 		}
-		a := sel[0].(map[string]any)
+		a := sel[1].(map[string]any)
 		v := a["variant"].(map[string]any)
 		if a["type"] != "pitr" || v["identifier"] != tc.id || v["price"] != float64(0) || v["price_description"] != "Included" ||
 			v["meta"].(map[string]any)["backup_duration_days"] != float64(tc.days) || !strings.Contains(v["name"].(string), "days") {
 			t.Errorf("%d days: %v", tc.days, a)
 		}
-		a1 := v1()["selected_addons"].([]any)[0].(map[string]any)
+		a1 := v1()["selected_addons"].([]any)[1].(map[string]any)
 		v1v := a1["variant"].(map[string]any)
 		if v1v["id"] != tc.id || v1v["price"].(map[string]any)["amount"] != float64(0) || v1v["meta"].(map[string]any)["backup_duration_days"] != float64(tc.days) {
 			t.Errorf("%d days (v1): %v", tc.days, a1)
@@ -602,8 +603,10 @@ func TestProjectAddonsReportPITR(t *testing.T) {
 
 	// Without a backup service there is no PITR.
 	b.srv.backups = nil
-	if len(plat()["selected_addons"].([]any)) != 0 || len(v1()["selected_addons"].([]any)) != 0 {
-		t.Error("an add-on is reported on a node without backups")
+	for _, sel := range [][]any{plat()["selected_addons"].([]any), v1()["selected_addons"].([]any)} {
+		if len(sel) != 1 || sel[0].(map[string]any)["type"] != "custom_domain" {
+			t.Errorf("add-ons on a node without backups: %v", sel)
+		}
 	}
 }
 

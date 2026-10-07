@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/domains"
 	"github.com/jsmillerdev/supavise/internal/registry"
 	"github.com/jsmillerdev/supavise/internal/secrets"
 	"github.com/jsmillerdev/supavise/internal/units"
@@ -30,6 +31,26 @@ func (pl *PostgresPlane) authExternalURL(ref string) string {
 		host = pl.cfg.APIHost()
 	}
 	return pl.scheme() + "://" + host + "/auth/v1"
+}
+
+// presentedAuthURL is the API_EXTERNAL_URL of a project: its own address as hosted presents it.
+// Once the project has an active custom hostname (or, failing that, a vanity subdomain) GoTrue
+// builds email links, OAuth redirect URIs and SAML endpoints on that host, as hosted does after
+// a custom domain is activated; until then, and again after it is deleted, it is the derived
+// <ref>.api.<domain>. The project's token issuer stays the derived URL either way (see
+// apiSpecs), so sessions and third-party verifiers keep working across the change.
+func (pl *PostgresPlane) presentedAuthURL(ctx context.Context, ref string) (string, error) {
+	if ref == config.SystemRef {
+		return pl.authExternalURL(ref), nil
+	}
+	host, err := domains.ExternalHost(ctx, pl.reg, pl.cfg, ref)
+	if err != nil {
+		return "", fmt.Errorf("lifecycle: custom domain of %s: %w", ref, err)
+	}
+	if host == "" {
+		return pl.authExternalURL(ref), nil
+	}
+	return pl.scheme() + "://" + host + "/auth/v1", nil
 }
 
 // siteURL is GoTrue's default redirect target. Studio is where the system project's
@@ -165,6 +186,13 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 		return nil, err
 	}
 	system := p.Ref == config.SystemRef
+	// extURL is what hosted changes on activating a custom domain: API_EXTERNAL_URL, which
+	// the mail link paths, the OAuth redirect URIs (AuthEnv) and the SAML endpoints derive from.
+	// GOTRUE_JWT_ISSUER keeps the derived URL, so adding or removing a domain invalidates no session.
+	extURL, err := pl.presentedAuthURL(ctx, p.Ref)
+	if err != nil {
+		return nil, err
+	}
 	auth := units.Spec{
 		Service:     config.SvcGoTrue,
 		Ref:         p.Ref,
@@ -181,15 +209,15 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 			"DATABASE_URL":           dsnURL(RoleAuthAdmin, keys.AuthAdminPassword, pgPort, "postgres"),
 			// Two connections is the artifact's default; five absorbs bursts of sign-ins.
 			"GOTRUE_DB_MAX_POOL_SIZE": "5",
-			"API_EXTERNAL_URL":        pl.authExternalURL(p.Ref),
+			"API_EXTERNAL_URL":        extURL,
 			"GOTRUE_SITE_URL":         pl.siteURL(p.Ref),
 			// GoTrue resolves these paths against API_EXTERNAL_URL with
 			// url.ResolveReference, so the default "/verify" would drop the /auth/v1
 			// prefix. Absolute URLs keep every email link routable.
-			"GOTRUE_MAILER_URLPATHS_INVITE":       pl.authExternalURL(p.Ref) + "/verify",
-			"GOTRUE_MAILER_URLPATHS_CONFIRMATION": pl.authExternalURL(p.Ref) + "/verify",
-			"GOTRUE_MAILER_URLPATHS_RECOVERY":     pl.authExternalURL(p.Ref) + "/verify",
-			"GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE": pl.authExternalURL(p.Ref) + "/verify",
+			"GOTRUE_MAILER_URLPATHS_INVITE":       extURL + "/verify",
+			"GOTRUE_MAILER_URLPATHS_CONFIRMATION": extURL + "/verify",
+			"GOTRUE_MAILER_URLPATHS_RECOVERY":     extURL + "/verify",
+			"GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE": extURL + "/verify",
 			"GOTRUE_JWT_SECRET":                   keys.JWTSecret,
 			"GOTRUE_JWT_ISSUER":                   pl.authExternalURL(p.Ref),
 			"GOTRUE_JWT_AUD":                      "authenticated",
@@ -216,7 +244,7 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 		}
 	}
 	if pl.opts.Settings != nil && !system {
-		over, err := pl.opts.Settings.AuthEnv(ctx, p.Ref, pl.authExternalURL(p.Ref))
+		over, err := pl.opts.Settings.AuthEnv(ctx, p.Ref, extURL)
 		if err != nil {
 			return nil, fmt.Errorf("lifecycle: saved auth settings of %s: %w", p.Ref, err)
 		}
