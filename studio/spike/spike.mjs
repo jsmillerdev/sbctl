@@ -29,6 +29,7 @@ const warnings = []
 const consoleErrors = []
 const failedRequests = []
 const pageErrors = []
+const badResponses = []
 
 const browser = await chromium.launch({
   headless: true,
@@ -43,6 +44,12 @@ page.on('console', (m) => {
 page.on('pageerror', (e) => pageErrors.push({ step: current, text: String(e).slice(0, 300) }))
 page.on('requestfailed', (r) => {
   failedRequests.push({ step: current, url: r.url().slice(0, 200), reason: r.failure()?.errorText })
+})
+page.on('response', (r) => {
+  if (r.status() >= 400) {
+    const u = new URL(r.url())
+    badResponses.push({ step: current, status: r.status(), method: r.request().method(), host: u.host, path: u.pathname })
+  }
 })
 // Studio's error boundary text; any step that shows it fails.
 const CRASH = 'Sorry! An unexpected error occurred'
@@ -190,7 +197,7 @@ await browser.close()
 const failed = steps.filter((s) => !s.ok)
 writeFileSync(
   join(OUT, 'steps.json'),
-  JSON.stringify({ steps, warnings, consoleErrors, pageErrors, failedRequests, ok: failed.length === 0 }, null, 2)
+  JSON.stringify({ steps, warnings, badResponses, consoleErrors, pageErrors, failedRequests, ok: failed.length === 0 }, null, 2)
 )
 console.log(`${steps.length - failed.length}/${steps.length} steps passed; ${warnings.length} warnings, ${consoleErrors.length} console errors, ${failedRequests.length} failed requests`)
 process.exit(failed.length === 0 ? 0 : 1)

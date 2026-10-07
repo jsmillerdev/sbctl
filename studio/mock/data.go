@@ -11,7 +11,7 @@ import (
 const (
 	orgSlug    = "mock-org"
 	orgID      = 1
-	region     = "local"
+	region     = "us-east-1"
 	provider   = "AWS"
 	statusOK   = "ACTIVE_HEALTHY"
 	createdAt  = "2026-01-01T00:00:00.000Z"
