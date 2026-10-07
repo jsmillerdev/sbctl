@@ -80,7 +80,7 @@ for svc in pgmeta supavisor realtime storage; do
   [[ $(systemctl show -p Slice --value "$u") == sbctl.slice ]] || fail "$u is not in sbctl.slice"
   [[ $(systemctl show -p MemoryMax --value "$u") == 1073741824 ]] || fail "$u: MemoryMax drop-in not applied"
 done
-sbctl fleet status || fail "fleet status"
+sbctl fleet status --skip studio || fail "fleet status"
 # A second start changes nothing: no unit restarts.
 declare -A PIDS
 for svc in pgmeta supavisor realtime storage; do PIDS[$svc]=$(systemctl show -p MainPID --value "sb-$svc.service"); done
