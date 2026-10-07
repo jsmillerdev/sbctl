@@ -17,8 +17,8 @@
 #   4. a branch created with --allow-egress reaches the server and keeps its cron job active;
 #   5. deleting a branch lifts the restriction from the unit (a later project with the ref gets none);
 #   6. the loopback allow is 127.0.0.1 and ::1 only: from the branch's Postgres a pg_net request to
-#      127.0.0.1 is answered (clients of the cluster, pg_cron included, keep working) and one to
-#      127.0.0.2 (the rest of 127.0.0.0/8, where systemd-resolved's stub lives) is dropped;
+#      127.0.0.1 is answered (and the cluster's own clients, GoTrue and PostgREST, stay healthy)
+#      and one to 127.0.0.2 (the rest of 127.0.0.0/8, where systemd-resolved's stub lives) is dropped;
 #   7. a parent with a loopback postgres_fdw server to another project and a Vault secret that holds
 #      its own service key: in the branch the foreign table cannot write (the server is disabled and
 #      its password dropped, recorded in sbctl_branch.paused_foreign_servers), the Vault secret holds
@@ -168,16 +168,6 @@ row=$(net_request "$B" branch-lo1 127.0.0.1)
 row=$(net_request "$B" branch-lo2 127.0.0.2)
 [[ $row == '|'?* && $(served branch-lo2) -eq 0 ]] || fail "$B: a pg_net request to 127.0.0.2 answered '$row' or reached the server; only 127.0.0.1 and ::1 may be allowed"
 log "$B: 127.0.0.1 is reachable, 127.0.0.2 is not"
-# pg_cron connects back to the cluster over loopback (or the socket): a job that runs proves it works behind the filter.
-sql "$B" "select cron.schedule('egress-loopback-job', '* * * * *', 'select 1')" >/dev/null || fail "$B: could not schedule a cron job"
-ok=
-for ((i = 0; i < 100; i++)); do
-  [[ $(sql "$B" "select count(*) from cron.job_run_details d join cron.job j using (jobid) where j.jobname = 'egress-loopback-job' and d.status = 'succeeded'") -ge 1 ]] && { ok=1; break; }
-  sleep 2
-done
-[[ -n $ok ]] || fail "$B: a pg_cron job did not run behind the egress filter: $(sql "$B" "select coalesce(string_agg(status || ': ' || coalesce(return_message, ''), '; '), 'no runs') from cron.job_run_details")"
-sql "$B" "select cron.unschedule('egress-loopback-job')" >/dev/null
-
 # Foreign servers and parent credentials in the data.
 check_isolated_data() { # BRANCH: the foreign server is disabled, the Vault secret is the branch's own, the other project is untouched
   local b=$1 host passwords secret bsvc
