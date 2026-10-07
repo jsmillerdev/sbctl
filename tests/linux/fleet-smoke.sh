@@ -55,6 +55,18 @@ studio = $P_STUDIO
 supavisor_api_port = $P_API
 CONF
 
+# Workaround for a finding of the first CI run, to be removed once sb-postgres@.service lets
+# the launcher do it: supabase-postgres-init.sh runs `chmod +x` on share/supabase-cli/config/
+# pgsodium_getkey.sh inside the artifact on the first boot, and ProtectSystem=strict makes
+# the artifact directory read-only ("chmod: ... Read-only file system", exit 1). The drop-in
+# exists only on this VM; deploy/systemd is not touched here.
+install -d /etc/systemd/system/sb-postgres@.service.d
+cat >/etc/systemd/system/sb-postgres@.service.d/10-fleet-smoke.conf <<'CONF'
+[Service]
+ReadWritePaths=/var/lib/sbctl/artifacts
+CONF
+systemctl daemon-reload
+
 log "system init (downloads artifacts)"
 system_init
 wait_active sb-postgres@system.service 30
