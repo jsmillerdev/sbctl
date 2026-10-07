@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -36,7 +37,7 @@ func ForNode(n *lifecycle.Node, o NodeOptions) (Deps, error) {
 		Escrow: o.Escrow,
 	}
 	if d.Escrow == nil {
-		d.Escrow = EscrowCheck(n.Cfg, time.Hour)
+		d.Escrow = EscrowCheck(n.Cfg, time.Hour, o.InDaemon)
 	}
 	d.System = func(ctx context.Context) []lifecycle.ServiceHealth {
 		p, err := n.Registry.GetProject(ctx, config.SystemRef)
@@ -70,20 +71,21 @@ func ForDown(cfg *config.Config, version string, log *slog.Logger, regErr error,
 }
 
 // EscrowCheck returns a check of the backup backend for an encrypted copy of this node's master
-// key (what `supavise backups status` prints as "master key"). The answer is reused for ttl:
-// listing an S3 bucket on every probe would be wasteful for something that changes once.
-func EscrowCheck(cfg *config.Config, ttl time.Duration) func(context.Context) (*Escrow, error) {
+// key (what `supavise backups status` prints as "master key"). The answer changes once in the
+// life of a node, so it is reused for ttl.
+//
+// With background set (the daemon) the check never waits for the backend: it answers from what
+// it last learned, or says "not checked yet", and refreshes in the background. A slow or
+// unreachable bucket must not slow down /healthz. Without it (`supavise status`) it asks and waits.
+func EscrowCheck(cfg *config.Config, ttl time.Duration, background bool) func(context.Context) (*Escrow, error) {
 	var (
-		mu   sync.Mutex
-		at   time.Time
-		last *Escrow
+		mu         sync.Mutex
+		at         time.Time
+		last       *Escrow
+		lastErr    error
+		refreshing bool
 	)
-	return func(ctx context.Context) (*Escrow, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		if last != nil && time.Since(at) < ttl {
-			return last, nil
-		}
+	ask := func(ctx context.Context) (*Escrow, error) {
 		st, err := backup.OpenStore(ctx, cfg.Backup)
 		if err != nil {
 			return nil, err
@@ -94,23 +96,57 @@ func EscrowCheck(cfg *config.Config, ttl time.Duration) func(context.Context) (*
 		}
 		e := &Escrow{}
 		b, rerr := os.ReadFile(cfg.KeyPath)
-		switch {
-		case rerr != nil:
+		if rerr != nil {
 			e.Covered = len(all) > 0 // the key cannot be read by this user, so any copy counts
 			e.Detail = fmt.Sprintf("%d encrypted copy(ies) in the backup backend", len(all))
-		default:
-			id := backup.KeyID(string(b))
-			for _, o := range all {
-				if o.KeyID == id {
-					e.Covered = true
-					e.Detail = "an encrypted copy of this node's key is in the backup backend"
-				}
-			}
-			if !e.Covered {
-				e.Detail = "the master key is not in the backups: run `supavise system escrow-key` or `supavise system export-key` (see `supavise backups status`)"
+			return e, nil
+		}
+		id := backup.KeyID(string(b))
+		for _, o := range all {
+			if o.KeyID == id {
+				e.Covered = true
+				e.Detail = "an encrypted copy of this node's key is in the backup backend"
 			}
 		}
-		last, at = e, time.Now()
+		if !e.Covered {
+			e.Detail = "the master key is not in the backups: run `supavise system escrow-key` or `supavise system export-key` (see `supavise backups status`)"
+		}
 		return e, nil
 	}
+	refresh := func(ctx context.Context) {
+		e, err := ask(ctx)
+		mu.Lock()
+		defer mu.Unlock()
+		last, lastErr, at, refreshing = e, err, time.Now(), false
+	}
+	return func(ctx context.Context) (*Escrow, error) {
+		mu.Lock()
+		fresh := !at.IsZero() && time.Since(at) < ttl
+		if fresh {
+			e, err := last, lastErr
+			mu.Unlock()
+			return e, err
+		}
+		if !background {
+			mu.Unlock()
+			e, err := ask(ctx)
+			return e, err
+		}
+		stale, staleErr, known := last, lastErr, !at.IsZero()
+		if !refreshing {
+			refreshing = true
+			go func() {
+				rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				refresh(rctx)
+			}()
+		}
+		mu.Unlock()
+		if !known {
+			return nil, errEscrowPending
+		}
+		return stale, staleErr
+	}
 }
+
+var errEscrowPending = errors.New("not checked yet")

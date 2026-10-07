@@ -308,6 +308,76 @@ for port in 5432 6543; do
   [[ $got == 2 ]] || fail "pooler on $port returned '$got'"
 done
 
+# ---- 5b. status, /healthz, the operator's view and the dashboard banner --------------------
+# `supavise status` runs as the user that owns the state directory, like the other commands (lib.sh).
+sup() { supavise "$@"; }
+verdict() { jq_ 'd["status"]' <"$1"; }
+
+log "supavise status --json on a healthy node: exit status 0, every check named"
+rc=0; sup status --json >"$WORK/status.json" || rc=$?
+if [[ $rc -ne 0 || $(verdict "$WORK/status.json") != healthy ]]; then cat "$WORK/status.json" >&2; fail "supavise status exited $rc with verdict '$(verdict "$WORK/status.json")' on a healthy node"; fi
+python3 - "$WORK/status.json" "$REF" <<'PY' || fail "the status report is missing a check (see above)"
+import json, sys
+d = json.load(open(sys.argv[1])); ref = sys.argv[2]
+names = {c["name"] for c in d["components"]}
+want = {"daemon", "edge", "system postgres", "system gotrue", "supavisor", "realtime", "storage", "pgmeta", "disk", "certificates", "update"}
+missing = want - names
+assert not missing, f"components missing: {sorted(missing)} (have {sorted(names)})"
+p = [p for p in d["projects"] if p["ref"] == ref]
+assert p and p[0]["state"] == "ok" and p[0]["probed"], p
+assert {s["name"] for s in p[0]["services"]} == {"postgres", "gotrue", "postgrest"}, p[0]["services"]
+assert {t["service"] for t in p[0]["tenants"]} >= {"realtime", "storage"}, p[0]["tenants"]
+assert all(t["present"] for t in p[0]["tenants"]), p[0]["tenants"]
+assert d["summary"].startswith("healthy:"), d["summary"]
+PY
+sup status | head -1 | grep -q '^healthy: ' || fail "the first line of supavise status is not the verdict"
+
+log "GET /healthz: public, a verdict and nothing else"
+HZ=$(api GET /healthz)
+[[ $HZ == '{"status":"healthy"}' ]] || fail "/healthz answered '$HZ'"
+[[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a healthy node"
+[[ $HZ != *"$REF"* ]] || fail "/healthz names a project"
+[[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz/detail) == 401 ]] || fail "/healthz/detail answered without credentials"
+DETAIL=$(papi GET /healthz/detail)
+[[ $(printf '%s' "$DETAIL" | jq_ 'd["status"]') == healthy && $DETAIL == *"$REF"* ]] || fail "/healthz/detail with the owner's token: $DETAIL"
+
+log "stopping the project's PostgREST degrades the node: exit status 1, the project named, /healthz still 200"
+systemctl stop "supavise-postgrest@$REF.service"
+rc=0; sup status --json >"$WORK/status.json" || rc=$?
+[[ $rc -eq 1 ]] || { cat "$WORK/status.json" >&2; fail "supavise status exited $rc with PostgREST stopped, want 1"; }
+[[ $(verdict "$WORK/status.json") == degraded ]] || fail "verdict '$(verdict "$WORK/status.json")' with PostgREST stopped, want degraded"
+python3 - "$WORK/status.json" "$REF" <<'PY' || fail "the degraded report does not blame the project's PostgREST (see above)"
+import json, sys
+d = json.load(open(sys.argv[1])); ref = sys.argv[2]
+p = [p for p in d["projects"] if p["ref"] == ref][0]
+assert p["state"] == "fail", p
+assert [s for s in p["services"] if s["name"] == "postgrest"][0]["ok"] is False, p["services"]
+assert ref in d["summary"] and d["summary"].startswith("degraded:"), d["summary"]
+PY
+sup status | head -1 | grep -q "^degraded: .*$REF" || fail "the verdict line does not name $REF: $(sup status | head -1)"
+# /healthz reuses a report for 20 seconds: wait for the new verdict, and see that it is a 200.
+HZ=""
+for ((i = 0; i < 40; i++)); do
+  HZ=$(api GET /healthz); [[ $HZ == '{"status":"degraded"}' ]] && break; sleep 2
+done
+[[ $HZ == '{"status":"degraded"}' ]] || fail "/healthz is '$HZ' with a project's PostgREST stopped, want degraded"
+[[ $(code -H "Host: api.$BASE" http://127.0.0.1/healthz) == 200 ]] || fail "/healthz is not a 200 on a degraded node (a load balancer would pull it)"
+systemctl start "supavise-postgrest@$REF.service"
+wait_active "supavise-postgrest@$REF.service" 60
+rc=1
+for ((i = 0; i < 30; i++)); do rc=0; sup status --json >"$WORK/status.json" || rc=$?; [[ $rc -eq 0 ]] && break; sleep 2; done
+[[ $rc -eq 0 ]] || fail "the node did not report healthy again after PostgREST was started"
+
+log "a maintenance window shows on the dashboard's incident banner and clears"
+STUDIO_HOST=studio.$BASE
+banner() { curl -sS -m 30 -H "Host: $STUDIO_HOST" http://127.0.0.1/api/incident-banner; }
+[[ $(banner) == '{"incidents":[]}' ]] || fail "the banner is not empty on a quiet node: $(banner)"
+sup maintenance announce --at now --duration 10m --message "e2e maintenance" >/dev/null || fail "maintenance announce"
+[[ $(banner | jq_ 'len(d["incidents"])') == 1 && $(banner | jq_ 'd["incidents"][0]["show_banner"]') == force && $(banner) == *"e2e maintenance"* ]] || fail "the announced window is not in the banner: $(banner)"
+sup maintenance clear >/dev/null || fail "maintenance clear"
+[[ $(banner) == '{"incidents":[]}' ]] || fail "the banner still shows a cleared window: $(banner)"
+[[ $(sup alerts list) == "no active alerts" ]] || fail "alerts are active on a healthy node: $(sup alerts list)"
+
 # ---- 6. re-run: idempotent, secrets kept -------------------------------------------------
 log "re-running install.sh keeps everything"
 KEY_SUM=$(sha256sum /etc/supavise/master.key)

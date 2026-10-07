@@ -128,6 +128,34 @@ supavise self-update --check
 
 A binary built without a committed release key refuses to self-update (it names the missing key).
 
+## Health, alerts and maintenance notices
+
+```bash
+sudo -u supavise supavise status           # one-line verdict, a table of components, the projects that need attention
+sudo -u supavise supavise status --json    # the whole report
+curl https://api.<domain>/healthz          # {"status":"healthy"}, for an uptime monitor
+```
+
+`supavise status` checks the daemon, the edge, the system cluster, each shared service and every project (Postgres answers, Auth and REST answer on loopback, Realtime and Storage hold the project's tenant), the age of each project's newest base backup, the free space on the state volume, the certificates, whether the backups hold an encrypted copy of the master key, and whether a newer release exists. The exit status is 0 for healthy, 1 for degraded (the node serves, something needs attention) and 2 for down (the daemon, the edge or the system cluster is not running). A release that is available and a master key without a copy in the backups are notes: they do not change the verdict.
+
+`GET /healthz` on the API host needs no credentials and answers `{"status":"healthy"}`, `{"status":"degraded"}` or `{"status":"down"}` and nothing else (no project names, no versions). It is a 200 unless the node is down, so a load balancer does not pull a node out of service because one project's PostgREST stopped; a monitor that matches `"healthy"` sees degraded. The daemon reuses a report for 20 seconds, so a monitor polling every few seconds costs one probe of the projects per 20 seconds. `GET /healthz/detail` returns the whole report to an Owner or Administrator (a dashboard session or a personal access token); the projects in it are those of the organizations the caller is an Owner or Administrator of.
+
+The daemon sends alerts when something needs the operator, to webhooks and email:
+
+```toml
+[alerts]
+email_to = "ops@example.com"                 # through [mail]
+[[alerts.webhooks]]
+url = "https://hooks.example.com/supavise"
+secret = "a long random string"              # optional: signs the body (X-Supavise-Signature)
+```
+
+It raises `disk_low`, `backup_failed` (a failed or stale backup), `project_unhealthy`, `certificate_expiring`, `node_unhealthy` (a shared service or the system cluster) and `update_available`. A problem is sent once, again as a reminder after 12 hours, and once more when it clears; it must last three minutes before it is sent, and no more than 20 notifications go out in an hour. During an upgrade or an announced maintenance window the daemon stays quiet. `sudo -u supavise supavise alerts test` sends a test alert to every destination and shows the result of each. Thresholds are in `[health]`, the rest in `[alerts]`; both are in `internal/health/README.md` and `internal/alerts/README.md`.
+
+Once a day the daemon asks GitHub for the newest release, records it (`<state>/system/update.json`) and raises `update_available` once per version; it installs nothing. `[update] check_interval` changes the interval (24 hours by default, one hour at the least).
+
+`supavise maintenance announce --at "2026-10-12 22:00" --duration 2h --message "Database maintenance"` shows a banner to every signed-in dashboard user while the window is open (`--notice 24h` shows it that long before); `supavise maintenance clear` removes it. While an upgrade runs (`<state>/system/upgrade.json`) the dashboard shows an "upgrade in progress" banner. Studio draws these with its own wording ("We are investigating a technical issue") and does not show the message; the message is in `supavise status`. An available update is never shown to dashboard users. `internal/notice/README.md` has the details.
+
 ## AWS
 
 One CloudFormation template (`cloudformation/supavise.yaml`) creates a complete node. You fill in an admin email; everything else has a default. There are three ways to deploy it, simplest first. All three give the same stack.
@@ -426,7 +454,8 @@ To rotate the key: generate a new pair, commit the new public file, replace the 
 - a re-run changes nothing and restarts nothing, and a re-run with one flag changes that setting only;
 - a re-run of `install.sh` with a v0.0.2 binary moves the daemon onto it (the daemon's `/proc/<pid>/exe` reports v0.0.2) without restarting shared services or projects;
 - `supavise self-update` against a local release server: refuses a tampered binary, a wrong key and an older signed binary under a newer tag, installs v0.0.3, restarts the daemon, leaves the project's Postgres running; then a release whose daemon exits on `serve` is rolled back to v0.0.3, whose daemon answers again;
-- the claim token stays out of the installer's output when `--claim-token-file` is used.
+- the claim token stays out of the installer's output when `--claim-token-file` is used;
+- `supavise status --json` on the healthy node reports every check and exits 0; with the project's PostgREST stopped it exits 1, names the project and `/healthz` stays a 200 that says degraded; `/healthz/detail` needs a token; an announced maintenance window shows in the Studio host's `/api/incident-banner` and clears.
 
 Go unit tests: `internal/selfupdate` (signature, checksum, atomic replace, refusals, an OpenSSL-made signature fixture), `internal/api/claim_test.go` (the endpoint, single use, expiry, rate limit, concurrent redemption, invites, user removal; the Postgres store runs when `SUPAVISE_TEST_DATABASE_URL` is set), `cmd/supavise/cmd_install_test.go` (flag to config mapping, minimal config rendering, `--set`, OS and glibc checks, EC2 metadata).
 

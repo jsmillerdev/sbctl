@@ -62,8 +62,8 @@ type Deps struct {
 	// Disk reads the free and total bytes of the filesystem holding path; nil uses statfs.
 	Disk func(path string) (free, total uint64, err error)
 
-	// Parallel bounds the projects probed at once (0 means 8). ProjectTimeout bounds one
-	// project's probes (0 means 20 seconds).
+	// Parallel bounds the projects probed at once (0 means 16). ProjectTimeout bounds one
+	// project's probes (0 means 10 seconds).
 	Parallel       int
 	ProjectTimeout time.Duration
 }
@@ -202,7 +202,7 @@ func (d *Deps) checkProjects(ctx context.Context) ([]ProjectResult, *Component) 
 	}
 	par := d.Parallel
 	if par <= 0 {
-		par = 8
+		par = 16
 	}
 	var (
 		wg      sync.WaitGroup
@@ -266,7 +266,7 @@ func (d *Deps) checkProject(ctx context.Context, p *registry.Project) ProjectRes
 
 	timeout := d.ProjectTimeout
 	if timeout <= 0 {
-		timeout = 20 * time.Second
+		timeout = 10 * time.Second
 	}
 	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -402,6 +402,8 @@ func (d *Deps) checkEscrow(ctx context.Context) *Component {
 	e, err := d.Escrow(ectx)
 	c := &Component{Name: "key escrow", State: OK}
 	switch {
+	case errors.Is(err, errEscrowPending):
+		c.Detail = "not checked yet"
 	case err != nil:
 		c.State, c.Detail = Info, "could not check the backup backend: "+shorten(err.Error())
 	case !e.Covered:
