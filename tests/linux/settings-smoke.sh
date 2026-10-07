@@ -222,7 +222,8 @@ log "realtime: tenant limits and private channels only"
 ws_join "$P_REALTIME" "$REF.realtime.internal" "$ANON" || fail "realtime join before the change"
 RT=$(api PATCH "$CFG/config/realtime" -o /dev/null -w '%{http_code}' -d '{"max_concurrent_users":123,"private_only":true}')
 [[ $RT == 204 ]] || fail "PATCH config/realtime answered $RT"
-[[ $(sysql _realtime "select max_concurrent_users || ',' || private_only from _realtime.tenants where external_id = '$REF'") == "123,t" ]] || fail "the Realtime tenant row did not take the settings"
+ROW=$(sysql _realtime "select max_concurrent_users || ',' || private_only::text from _realtime.tenants where external_id = '$REF'" 2>&1 || true)
+[[ $ROW == "123,true" ]] || fail "the Realtime tenant row did not take the settings (got '$ROW')"
 if ws_join "$P_REALTIME" "$REF.realtime.internal" "$ANON" >/dev/null 2>&1; then fail "a public channel was joined with private_only on"; fi
 [[ $(api GET "$CFG/config/realtime" | json_get 'd["private_only"]') == True ]] || fail "GET config/realtime does not return private_only"
 api PATCH "$CFG/config/realtime" -o /dev/null -d '{"private_only":false}'
