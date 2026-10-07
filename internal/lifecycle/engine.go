@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -636,11 +637,27 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 		e.event(ctx, ref, "project.data_removed", map[string]any{"final_backup": tookBackup})
 		return nil
 	}
+	// The Storage objects of the file backend live beside the Storage service, not in the project's
+	// directory, so plane.Delete left them. They go now and not earlier: the final backup above has
+	// copied them, and a delete that stopped before this point (status GOING_DOWN) comes back here.
+	// A KeepRecord delete returned above: its caller (a restore, a branch reset) brings the project back.
+	if err := e.removeStorageObjects(ref); err != nil {
+		return fmt.Errorf("lifecycle: delete %s: remove its Storage objects: %w", ref, err)
+	}
 	if err := e.reg.DeleteProject(ctx, ref); err != nil {
 		return err
 	}
 	e.event(ctx, ref, "project.deleted", map[string]any{"final_backup": tookBackup})
 	return nil
+}
+
+// removeStorageObjects deletes the directory of ref's Storage objects (file backend). A node with
+// another backend, or a project that never stored an object, has none: that is not an error.
+func (e *Engine) removeStorageObjects(ref string) error {
+	if !secrets.ValidRef(ref) { // never build a path from anything but a project ref
+		return nil
+	}
+	return os.RemoveAll(e.cfg.Paths().StorageObjects(ref))
 }
 
 // branchesOf lists the refs of the branches whose parent is ref.

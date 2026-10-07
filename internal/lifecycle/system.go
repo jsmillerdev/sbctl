@@ -129,6 +129,9 @@ type OpenOptions struct {
 	Artifacts Artifacts
 	// Store options for the default artifact store.
 	StoreOptions []artifacts.Option
+	// RegistryDSN replaces RegistryDSN(cfg), the system cluster's private socket (a command run
+	// with SUPAVISE_REGISTRY_DSN set, tests with a database of their own). Empty means the default.
+	RegistryDSN string
 }
 
 func (o *OpenOptions) log() *slog.Logger {
@@ -260,7 +263,11 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	if err != nil {
 		return nil, err
 	}
-	reg, err := registry.Open(ctx, RegistryDSN(cfg))
+	dsn := o.RegistryDSN
+	if dsn == "" {
+		dsn = RegistryDSN(cfg)
+	}
+	reg, err := registry.Open(ctx, dsn)
 	if err != nil {
 		if c, ok := sup.(interface{ Close() }); ok {
 			c.Close() // a caller that retries must not leak a bus connection per attempt

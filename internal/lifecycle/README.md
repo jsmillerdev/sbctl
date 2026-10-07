@@ -71,7 +71,7 @@ pending restart); no migration is needed.
 - `Delete`/`DeleteWith`: final base backup through `BaseBackuper` (the `FinalBackuper` method
   when it has one, so the manifest says "final"; skipped when nil, for `INIT_FAILED` projects
   and with `SkipFinalBackup`; a paused project's database is started just for it), tenants,
-  route, units, data, registry row. A failed backup keeps the project, except one that wraps
+  route, units, data, the project's Storage objects directory (`<state>/system/storage/objects/stub/<ref>`, removed after the data and only when the record goes too), registry row. A failed backup keeps the project, except one that wraps
   `ErrNoRestorableState` (a restore-as-new clone whose recovery failed or never finished and
   that has no base backup): there is nothing to back up, the delete records
   `project.final_backup_skipped` and goes on. A delete records `project.delete_started` (with
