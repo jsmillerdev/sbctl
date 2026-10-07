@@ -410,14 +410,14 @@ func (r *updateReport) print(w io.Writer) {
 		fmt.Fprintf(w, "; %s is the latest (checked %s)", r.Latest, r.CheckedAt)
 	}
 	fmt.Fprintln(w)
-	os := "off"
+	osLine := "off"
 	if r.Settings.OSSecurityUpdates {
-		os = "security updates on, reboot " + r.Settings.OSReboot
+		osLine = "security updates on, reboot " + r.Settings.OSReboot
 		if r.RebootNeeded {
-			os += "; a reboot is waiting"
+			osLine += "; a reboot is waiting"
 		}
 	}
-	fmt.Fprintf(w, "OS updates  %s\n", os)
+	fmt.Fprintf(w, "OS updates  %s\n", osLine)
 	if r.Timer != "" {
 		fmt.Fprintf(w, "Timer       %s %s\n", update.TimerUnit, r.Timer)
 	}
