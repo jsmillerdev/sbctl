@@ -314,14 +314,26 @@ func TestSettingsIntegration(t *testing.T) {
 	t.Run("email template", func(t *testing.T) {
 		mustAPI("PATCH", cfgPath+"/config/auth", map[string]any{"mailer_templates_recovery_content": "<h2>Reset for {{ .Email }}</h2>"})
 		// The daemon serves the template to the loopback, and GoTrue's unit points at it.
-		code, _, b := do(admin, "", "GET", "/internal/templates/"+p.Ref+"/recovery", nil)
+		unitEnv := authUnitEnvironment(t, cfg, p.Ref)
+		prefix := `GOTRUE_MAILER_TEMPLATES_RECOVERY="http://` + cfg.Listen.Admin
+		start := strings.Index(unitEnv, prefix)
+		if start < 0 {
+			t.Fatalf("GoTrue's environment does not point at the template (want %s...)", prefix)
+		}
+		tmplURL := unitEnv[start+len(prefix):]
+		tmplURL = tmplURL[:strings.IndexByte(tmplURL, '"')]
+		if !strings.HasPrefix(tmplURL, "/internal/templates/"+p.Ref+"/recovery?v=") || !strings.Contains(tmplURL, "&t=") {
+			t.Fatalf("the template URL has no version and token: %s", tmplURL)
+		}
+		// The token is required: the bare path, and a wrong token, are not found.
+		for _, bad := range []string{"/internal/templates/" + p.Ref + "/recovery", "/internal/templates/" + p.Ref + "/recovery?t=" + strings.Repeat("0", 64)} {
+			if code, _, _ := do(admin, "", "GET", bad, nil); code != 404 {
+				t.Fatalf("%s answered %d without the project's token, want 404", bad, code)
+			}
+		}
+		code, _, b := do(admin, "", "GET", tmplURL, nil)
 		if code != 200 || !strings.Contains(string(b), "Reset for") {
 			t.Fatalf("template endpoint: %d %s", code, b)
-		}
-		unitEnv := authUnitEnvironment(t, cfg, p.Ref)
-		want := `GOTRUE_MAILER_TEMPLATES_RECOVERY="http://` + cfg.Listen.Admin + "/internal/templates/" + p.Ref + "/recovery?v="
-		if !strings.Contains(unitEnv, want) {
-			t.Fatalf("GoTrue's environment does not point at the template (want %s...)", want)
 		}
 	})
 
@@ -436,6 +448,20 @@ func TestSettingsIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("postgrest refuses a schema that does not exist, quickly and briefly", func(t *testing.T) {
+		start := time.Now()
+		code, out := api("PATCH", cfgPath+"/postgrest", map[string]any{"db_schema": "does_not_exist,public"})
+		if code != 400 || !strings.Contains(string(out), "does_not_exist") || strings.Count(string(out), "\n") > 2 {
+			t.Fatalf("missing schema: %d %s", code, out)
+		}
+		if d := time.Since(start); d > 15*time.Second {
+			t.Fatalf("refusing a missing schema took %s", d)
+		}
+		if c, _, _ := project("GET", "/rest/v1/items", nil, "apikey", keys.PublishableKey, "Accept-Profile", "api_extra"); c != 200 {
+			t.Fatalf("PostgREST changed after a refused save: %d", c)
+		}
+	})
+
 	t.Run("storage upload limit", func(t *testing.T) {
 		svc := "Bearer " + keys.SecretKey
 		hdr := []string{"apikey", keys.SecretKey, "Authorization", svc, "Content-Type", "application/json"}
@@ -488,6 +514,25 @@ func TestSettingsIntegration(t *testing.T) {
 		}
 		if code, _, _ := project("GET", "/auth/v1/settings", nil, "apikey", keys.AnonKey); code != 401 {
 			t.Fatalf("legacy anon accepted: %d", code)
+		}
+		// Storage verifies the JWT itself: the legacy key is turned away there in every position.
+		storage := func(h ...string) int {
+			code, _, _ := project("GET", "/storage/v1/bucket", nil, h...)
+			return code
+		}
+		legacyBearer := "Bearer " + keys.ServiceRoleKey
+		for name, h := range map[string][]string{
+			"apikey and bearer":    {"apikey", keys.ServiceRoleKey, "Authorization", legacyBearer},
+			"apikey":               {"apikey", keys.ServiceRoleKey},
+			"bearer":               {"Authorization", legacyBearer},
+			"bearer beside a pub.": {"apikey", keys.PublishableKey, "Authorization", legacyBearer},
+		} {
+			if code := storage(h...); code != 401 {
+				t.Fatalf("Storage accepted the legacy service_role key (%s) while disabled: %d", name, code)
+			}
+		}
+		if code := storage("apikey", keys.SecretKey, "Authorization", "Bearer "+keys.SecretKey); code != 200 {
+			t.Fatalf("the secret key on Storage with the legacy keys off: %d", code)
 		}
 		mustAPI("PUT", cfgPath+"/api-keys/legacy?enabled=true", nil)
 		if code := status(keys.ServiceRoleKey); code != 200 {

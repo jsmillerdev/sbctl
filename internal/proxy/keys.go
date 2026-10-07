@@ -111,6 +111,21 @@ func disabledLegacyBearer(k *secrets.ProjectKeys, bearer string) bool {
 		(eqConst(bearer, k.AnonKey) || eqConst(bearer, k.ServiceRoleKey))
 }
 
+// refusedLegacy reports whether key is a legacy credential of the project (anon or
+// service_role key, or a JWT signed with the project secret for one of those roles) that the
+// disabled legacy switch turns away. The dashboard's temporary key is spared. Opaque sb_ keys
+// are never legacy.
+func refusedLegacy(k *secrets.ProjectKeys, ref, key string) bool {
+	if k == nil || !k.LegacyDisabled || key == "" || strings.HasPrefix(key, "sb_") {
+		return false
+	}
+	if _, _, tmp := temporaryKey(k, ref, key); tmp {
+		return false
+	}
+	_, _, legacy := legacyKey(k, ref, key)
+	return legacy
+}
+
 // temporaryKey accepts, while the legacy keys are disabled, the short-lived service_role
 // JWT the Management API issues for the dashboard's own calls (api-keys/temporary): it
 // is signed with the project secret and carries the secrets.TemporaryClaim.
@@ -179,7 +194,14 @@ func authorize(rt *route, k *secrets.ProjectKeys, ref string, h http.Header, raw
 	if key == "" && strings.HasPrefix(bearer, "sb_") {
 		key = bearer
 	}
-	if (rt.access == accessKey || rt.access == accessAdmin) && disabledLegacyBearer(k, bearer) {
+	// With the legacy keys disabled, a leaked one must stop working on every route that
+	// forwards credentials, including those that do not require a key at the gateway (Storage
+	// verifies the JWT itself): refuse it as a bearer, and as an apikey where classify below
+	// would not already refuse it.
+	if disabledLegacyBearer(k, bearer) {
+		return reject(http.StatusUnauthorized, msgInvalidKey)
+	}
+	if rt.access != accessKey && rt.access != accessAdmin && refusedLegacy(k, ref, key) {
 		return reject(http.StatusUnauthorized, msgInvalidKey)
 	}
 	role, jwt, valid := classify(k, ref, key)
@@ -245,14 +267,9 @@ func authorizeFunctions(k *secrets.ProjectKeys, ref string, h http.Header, rawQu
 		return reject(http.StatusUnauthorized, msgInvalidKey)
 	}
 	if !strings.HasPrefix(key, "sb_") {
-		if k.LegacyDisabled && key != "" {
-			// The runtime verifies JWTs itself and would accept a legacy key: refuse it here,
-			// except the dashboard's temporary key, which the switch spares.
-			if _, _, tmp := temporaryKey(k, ref, key); !tmp {
-				if _, _, legacy := legacyKey(k, ref, key); legacy {
-					return reject(http.StatusUnauthorized, msgInvalidKey)
-				}
-			}
+		// The runtime verifies JWTs itself and would accept a legacy key: refuse it here.
+		if refusedLegacy(k, ref, key) {
+			return reject(http.StatusUnauthorized, msgInvalidKey)
 		}
 		return res
 	}

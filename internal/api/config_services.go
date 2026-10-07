@@ -5,12 +5,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/projectconfig"
+	"github.com/OWNER/sbctl/internal/registry"
 )
 
 func (s *Server) routesConfig(add func(string, handlerFunc)) {
@@ -85,6 +87,9 @@ func (s *Server) patchPostgREST(key string) handlerFunc {
 		if err != nil {
 			return err
 		}
+		if err := s.checkExposedSchemas(r.Context(), p, in); err != nil {
+			return err
+		}
 		ch, _, err := s.saveSettings(r.Context(), p, projectconfig.PostgREST, in, lifecycle.ApplyOptions{})
 		if err != nil {
 			return err
@@ -92,6 +97,53 @@ func (s *Server) patchPostgREST(key string) handlerFunc {
 		writeJSON(w, http.StatusOK, s.postgrestView(key, ch.State, "", false))
 		return nil
 	}
+}
+
+// checkExposedSchemas refuses, while the project's database answers, a db_schema that names a
+// schema that does not exist: PostgREST would not load its schema cache and the save would
+// only fail after a full readiness timeout and a rollback. A database that cannot be asked
+// (paused project) is not checked; the apply itself then reports a problem.
+func (s *Server) checkExposedSchemas(ctx context.Context, p *registry.Project, patch map[string]any) error {
+	list, ok := patch["db_schema"].(string)
+	if !ok || p.Status == registry.StatusInactive {
+		return nil
+	}
+	var want []string
+	for _, n := range strings.Split(list, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			want = append(want, n)
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	dsn, err := s.mgr.ConnString(ctx, p.Ref, "postgres")
+	if err != nil {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(cctx, dsn)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	rows, err := conn.Query(cctx, `select n from unnest($1::text[]) as n where not exists (select 1 from pg_namespace where nspname = n)`, want)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var missing []string
+	for rows.Next() {
+		var n string
+		if rows.Scan(&n) == nil {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		return errf(http.StatusBadRequest, "db_schema names a schema that does not exist in the database: %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 // ---- Realtime --------------------------------------------------------------------

@@ -281,3 +281,51 @@ func TestPauseQuiescesTheSharedServicesFirst(t *testing.T) {
 		t.Fatalf("status %s", got.Status)
 	}
 }
+
+// Settings saved while a project is paused reach the cluster and the shared services when it
+// resumes: the Postgres ALTER SYSTEM part and the Storage and Realtime tenant settings are
+// not rendered into any unit, so Resume has to apply them.
+func TestResumeAppliesSettingsSavedWhilePaused(t *testing.T) {
+	h, cp, set, rt := configHarness(t)
+	ctx := context.Background()
+	p := h.create(t)
+	if err := h.e.Pause(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	set.storage = projectconfig.StorageSettings{FileSizeLimit: 1 << 20}
+	set.pg = []string{"statement_timeout=7s"}
+	rt.ensured, cp.pgCalls = nil, nil
+	// Saving while paused touches nothing.
+	if res, err := h.e.ApplyConfig(ctx, p.Ref, projectconfig.Storage, ApplyOptions{}); err != nil || res.Applied || len(rt.ensured) != 0 {
+		t.Fatalf("paused save: %+v %v %v", res, err, rt.ensured)
+	}
+	if err := h.e.Resume(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if len(cp.pgCalls) != 1 || cp.pgCalls[0] {
+		t.Fatalf("the saved Postgres settings must be applied once, without a restart: %v", cp.pgCalls)
+	}
+	if len(rt.ensured) != 1 || rt.ensured[0].Ref != p.Ref || rt.ensured[0].Storage.FileSizeLimit != 1<<20 {
+		t.Fatalf("the tenant must get the settings saved while paused: %+v", rt.ensured)
+	}
+
+	// A failing apply is recorded and does not undo the resume.
+	if err := h.e.Pause(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	rt.fakeTenant.err = errors.New("storage down")
+	if err := h.e.Resume(ctx, p.Ref); err != nil {
+		t.Fatalf("resume must succeed when a tenant apply fails: %v", err)
+	}
+	evs, _ := h.reg.ListEvents(ctx, p.Ref, 50)
+	found := false
+	for _, ev := range evs {
+		found = found || ev.Kind == "project.config_apply_failed"
+	}
+	if !found {
+		t.Fatal("a failed apply on resume must leave an event")
+	}
+	if got, _ := h.reg.GetProject(ctx, p.Ref); got.Status != registry.StatusActiveHealthy {
+		t.Fatalf("status %s", got.Status)
+	}
+}

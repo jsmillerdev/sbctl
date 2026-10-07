@@ -49,7 +49,10 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
 
 - `Pause`: the shared services are asked to let go of the project's database (`fleet.Quiescer`), then PostgREST, GoTrue, PostgreSQL stop in that order; `INACTIVE`; route and tenants
   stay. `Resume` reverses it; on failure what started is stopped and the project stays
-  `INACTIVE`.
+  `INACTIVE`. Once the cluster answers, `Resume` also applies what no unit renders and what
+  was saved while paused: the Postgres settings applied with `ALTER SYSTEM` and the Storage and
+  Realtime tenant settings (`EnsureTenant`). A failure there is logged and recorded as
+  `project.config_apply_failed`; it does not undo the resume.
 - `Delete`/`DeleteWith`: final base backup through `BaseBackuper` (the `FinalBackuper` method
   when it has one, so the manifest says "final"; skipped when nil, for `INIT_FAILED` projects
   and with `SkipFinalBackup`; a paused project's database is started just for it), tenants,

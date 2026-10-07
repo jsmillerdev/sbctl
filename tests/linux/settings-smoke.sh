@@ -9,9 +9,10 @@
 # template reaching a mail server, a provider's client id), PostgREST (a newly exposed
 # schema), Storage (a bigger upload), Realtime (private channels only), Postgres settings
 # (applied with ALTER SYSTEM, a restart-requiring one with a restart), API keys (a revoked
-# secret key and the disabled legacy keys are refused at once), the database password reset
-# (new works directly and through the pooler, the old one fails), and persistence: a pause
-# and resume keeps every saved setting.
+# secret key and the disabled legacy keys are refused at once, on Storage too), the database
+# password reset (new works directly and through the pooler, the old one fails), and
+# persistence: a pause and resume keeps every saved setting and applies the Postgres and
+# Storage settings saved while paused.
 #
 # Without SBCTL_BIN the script builds sbctl with the go toolchain. It needs network access
 # for the artifact downloads. Not run in development (root, systemd and Linux required); CI
@@ -202,6 +203,13 @@ done
 [[ $ok -eq 1 ]] || fail "PostgREST does not serve the newly exposed schema"
 [[ $(api GET "$CFG/postgrest" | json_get 'd["max_rows"]') == 7 ]] || fail "GET postgrest does not return max_rows"
 must 400 PATCH "$CFG/postgrest" '{"db_schema":""}'
+# A schema that does not exist is refused up front, with a short message, not after a restart
+# that cannot succeed and a rollback.
+T0=$SECONDS
+MSG=$(api PATCH "$CFG/postgrest" -d '{"db_schema":"does_not_exist,public"}')
+(( SECONDS - T0 < 20 )) || fail "a missing schema took $((SECONDS - T0)) s to be refused"
+grep -q does_not_exist <<<"$MSG" && [[ $(wc -l <<<"$MSG") -le 2 ]] || fail "the refusal of a missing schema is not short and specific: $MSG"
+[[ $(pcode GET /rest/v1/ -H "apikey: $SEC") == 200 && $(api GET "$CFG/postgrest" | json_get 'd["db_schema"]') == *api_extra* ]] || fail "a refused schema list changed PostgREST"
 
 log "storage: a bigger upload"
 head -c 2097152 /dev/urandom >"$WORK/2m.bin"
@@ -269,9 +277,17 @@ must 200 DELETE "$CFG/api-keys/$KID"
 must 200 PUT "$CFG/api-keys/legacy?enabled=false"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SVC") == 401 ]] || fail "a legacy key is accepted while disabled"
 [[ $(pcode GET /auth/v1/settings -H "apikey: $ANON") == 401 ]] || fail "the legacy anon key is accepted while disabled"
+# Storage verifies the JWT itself, so the legacy key must be turned away there too, in every position.
+storage_code() { pcode GET /storage/v1/bucket "$@"; }
+[[ $(storage_code -H "apikey: $SVC" -H "Authorization: Bearer $SVC") == 401 ]] || fail "the legacy service_role key as apikey and bearer reaches Storage while disabled"
+[[ $(storage_code -H "apikey: $SVC") == 401 ]] || fail "the legacy service_role key as apikey reaches Storage while disabled"
+[[ $(storage_code -H "Authorization: Bearer $SVC") == 401 ]] || fail "the legacy service_role key as bearer reaches Storage while disabled"
+[[ $(storage_code -H "apikey: $PUB" -H "Authorization: Bearer $SVC") == 401 ]] || fail "the legacy service_role key as bearer beside a publishable key reaches Storage while disabled"
+[[ $(storage_code -H "apikey: $SEC" -H "Authorization: Bearer $SEC") == 200 ]] || fail "the secret key stopped working on Storage with the legacy keys off"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SEC") == 200 ]] || fail "the secret key stopped working with the legacy keys off"
 must 200 PUT "$CFG/api-keys/legacy?enabled=true"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SVC") == 200 ]] || fail "the legacy keys did not come back"
+[[ $(storage_code -H "apikey: $SVC" -H "Authorization: Bearer $SVC") == 200 ]] || fail "the legacy keys did not come back on Storage"
 
 log "database password reset"
 NEWPW='a-brand-new-password-42'
@@ -291,8 +307,12 @@ for ((i = 0; i < 60; i++)); do
   [[ $(api GET "$CFG" | json_get 'd["status"]') == INACTIVE ]] && break
   sleep 2
 done
-# Settings can be saved while the project is paused and apply when it resumes.
+# Settings can be saved while the project is paused and apply when it resumes: PostgREST's are
+# rendered into its unit at start, Postgres' ALTER SYSTEM ones and the Storage tenant's are
+# applied by the resume itself.
 must 200 PATCH "$CFG/postgrest" '{"max_rows":9}'
+must 200 PUT "$CFG/config/database/postgres" '{"statement_timeout":"7s","work_mem":"5MB"}'
+must 200 PATCH "$CFG/config/storage" '{"fileSizeLimit":1048576}'
 must 200 POST "$CFG/restore"
 for ((i = 0; i < 90; i++)); do
   [[ $(api GET "$CFG" | json_get 'd["status"]') == ACTIVE_HEALTHY ]] && break
@@ -302,7 +322,16 @@ done
 [[ $(signup c@example.com) == 422 ]] || fail "disable_signup was lost by the pause"
 [[ $(location https%3A%2F%2Fnew.example.com%2Fcb) == https://new.example.com/cb* ]] || fail "the redirect allow list was lost by the pause"
 [[ $(pcode GET /rest/v1/items -H "apikey: $PUB" -H 'Accept-Profile: api_extra') == 200 ]] || fail "the exposed schema was lost by the pause"
-[[ $(sql "show statement_timeout") == 45s && $(sql "show max_connections") == 40 ]] || fail "the Postgres settings were lost by the pause"
+[[ $(sql "show max_connections") == 40 ]] || fail "a Postgres setting was lost by the pause"
+[[ $(sql "show statement_timeout") == 7s && $(sql "show work_mem") == 5MB ]] || fail "the Postgres settings saved while paused were not applied by the resume (statement_timeout $(sql "show statement_timeout"), work_mem $(sql "show work_mem"))"
+[[ $(api GET "$CFG/config/database/postgres" | json_get 'd["statement_timeout"]') == 7s ]] || fail "GET returns another statement_timeout"
+ok=0
+for ((i = 0; i < 20; i++)); do
+  c=$(upload big3.bin)
+  [[ $c == 413 || $c == 400 ]] && { ok=1; break; }
+  sleep 1
+done
+[[ $ok -eq 1 ]] || fail "the Storage limit saved while paused is not enforced after the resume (last status $c)"
 [[ $(api GET "$CFG/postgrest" | json_get 'd["max_rows"]') == 9 ]] || fail "a setting saved while paused was not kept"
 [[ $(pcode GET /rest/v1/ -H "apikey: $KEY") == 401 ]] || fail "a revoked key came back after the pause"
 

@@ -310,7 +310,10 @@ func TestAPIKeysLifecycle(t *testing.T) {
 	masked := false
 	for _, e := range decodeBody(t, f.mustDo("GET", base, nil, 200)).([]any) {
 		if m := e.(map[string]any); m["name"] == "ci_runner" {
-			masked = m["api_key"] != key && strings.HasPrefix(m["api_key"].(string), key[:20])
+			// The type prefix and four characters of the random part, then the mask.
+			want := key[:len("sb_secret_")+4]
+			masked = m["api_key"] != key && m["prefix"] == want && strings.HasPrefix(m["api_key"].(string), want) &&
+				!strings.Contains(m["api_key"].(string), key[len(want):])
 		}
 	}
 	if !masked {
@@ -732,5 +735,27 @@ func TestStorageDefaultLimitIsTheNodes(t *testing.T) {
 	f.mustDo("PATCH", url, map[string]any{"fileSizeLimit": nil}, 200)
 	if got := bodyMap(t, f.mustDo("GET", url, nil, 200)); got["fileSizeLimit"] != float64(123<<20) {
 		t.Fatalf("GET after a reset: %v", got["fileSizeLimit"])
+	}
+}
+
+func TestShortErrKeepsTheFirstLineOnly(t *testing.T) {
+	err := errors.New("lifecycle: apply postgrest settings: did not become ready\nGET /rest/v1 200\nPGRST002 retry")
+	if got := shortErr(err); got != "lifecycle: apply postgrest settings: did not become ready" {
+		t.Errorf("%q", got)
+	}
+	if got := shortErr(errors.New(strings.Repeat("x", 500))); len(got) != 303 {
+		t.Errorf("long message not cut: %d", len(got))
+	}
+}
+
+func TestKeyPrefix(t *testing.T) {
+	for in, want := range map[string]string{
+		"sb_secret_Bbn5nzeQ4HabcdEF":    "sb_secret_Bbn5",
+		"sb_publishable_Xy12zzzzzzzzzz": "sb_publishable_Xy12",
+		"sb_secret_ab":                  "sb_secret_ab",
+	} {
+		if got := keyPrefix(in); got != want {
+			t.Errorf("keyPrefix(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

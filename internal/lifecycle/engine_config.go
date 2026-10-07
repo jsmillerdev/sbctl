@@ -38,8 +38,8 @@ var _ Reconfigurer = (*Engine)(nil)
 // single services.
 var ErrNotSupported = errors.New("lifecycle: this data plane cannot apply settings")
 
-// ApplyConfig implements Reconfigurer. A paused project is not touched (the settings are
-// rendered when it starts) but they are rendered once without starting, so a value that
+// ApplyConfig implements Reconfigurer. A paused project is not touched (Resume applies the
+// settings: units render them at start, applySavedSettings does the rest) but they are rendered once without starting, so a value that
 // cannot be written into a unit fails the save and not the resume; a project in a
 // transitional state is refused.
 func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.Service, opts ApplyOptions) (ApplyResult, error) {
@@ -103,6 +103,40 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 	}
 	e.event(ctx, ref, "project.config_applied", map[string]any{"service": string(svc), "pending_restart": res.PendingRestart})
 	return res, nil
+}
+
+// applySavedSettings applies, once a resumed project's cluster answers, the settings that
+// were saved while it was paused and that no unit renders: the Postgres settings applied with
+// ALTER SYSTEM, and the Storage and Realtime tenant settings (the shared services keep
+// running while a project is paused, but a tenant is not touched while its database is down).
+// Auth and PostgREST need nothing here: Start rendered them. A failure is logged and recorded
+// as an event and does not undo the resume: the project is up, and saving the setting again
+// retries the apply.
+func (e *Engine) applySavedSettings(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) {
+	if p.Ref == config.SystemRef || e.opts.Settings == nil {
+		return
+	}
+	fail := func(what string, err error) {
+		e.log.Warn("resume: could not apply the saved "+what+"; save it again to retry", "ref", p.Ref, "error", err)
+		e.event(ctx, p.Ref, "project.config_apply_failed", map[string]string{"service": what, "error": err.Error()})
+	}
+	if cp, ok := e.plane.(configPlane); ok {
+		pending, err := cp.ApplyPostgresSettings(ctx, p, keys, false, nil)
+		if err != nil {
+			fail(string(projectconfig.Postgres)+" settings", err)
+		} else if pending {
+			e.event(ctx, p.Ref, "project.config_applied", map[string]any{"service": string(projectconfig.Postgres), "pending_restart": true})
+		}
+	}
+	if len(e.opts.Fleet) > 0 {
+		spec, err := e.tenantSpec(ctx, p, keys)
+		if err == nil {
+			err = e.opts.Fleet.EnsureTenant(ctx, spec)
+		}
+		if err != nil {
+			fail("storage and realtime settings", err)
+		}
+	}
 }
 
 // SetDatabasePassword implements Reconfigurer: the postgres role gets the new password in

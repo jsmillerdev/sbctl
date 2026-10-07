@@ -461,6 +461,7 @@ func (e *Engine) Resume(ctx context.Context, ref string) error {
 		e.event(cctx, ref, "project.resume_failed", map[string]string{"error": err.Error()})
 		return fmt.Errorf("lifecycle: resume %s: %w", ref, err)
 	}
+	e.applySavedSettings(ctx, p, keys)
 	if err := e.reg.PutRoute(ctx, registry.Route{Host: e.cfg.ProjectHost(ref), Ref: ref, Kind: "api"}); err != nil {
 		e.log.Warn("resume: route", "ref", ref, "error", err)
 	}

@@ -120,7 +120,18 @@ func (s *Server) saveSettings(ctx context.Context, p *registry.Project, svc proj
 	if errors.Is(err, lifecycle.ErrInvalidState) {
 		return nil, lifecycle.ApplyResult{}, errf(http.StatusConflict, "The project is not in a state that accepts this change: %v", err)
 	}
-	return nil, lifecycle.ApplyResult{}, errf(http.StatusBadGateway, "The %s service did not accept the new settings, which were rolled back: %v", svc, err)
+	// The full error (a unit's journal tail, for one) stays in the daemon's log.
+	return nil, lifecycle.ApplyResult{}, errf(http.StatusBadGateway, "The %s service did not accept the new settings, which were rolled back: %s", svc, shortErr(err))
+}
+
+// shortErr is the first line of err, cut to a length a client can show.
+func shortErr(err error) string {
+	msg, _, _ := strings.Cut(err.Error(), "\n")
+	msg = strings.TrimSpace(msg)
+	if len(msg) > 300 {
+		msg = msg[:300] + "..."
+	}
+	return msg
 }
 
 // settingsProject loads the project of the request and refuses states in which settings

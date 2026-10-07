@@ -88,6 +88,19 @@ func keyEntries(p *registry.Project, k *secrets.ProjectKeys) []keyEntry {
 	return out
 }
 
+// keyPrefixChars is how many characters of a key's random part its masked display shows.
+const keyPrefixChars = 4
+
+// keyPrefix is the type prefix of an opaque key ("sb_secret_") and the first characters of its
+// random part, enough to tell keys apart and no more.
+func keyPrefix(key string) string {
+	n := strings.LastIndexByte(key, '_') + 1
+	if n+keyPrefixChars < len(key) {
+		return key[:n+keyPrefixChars]
+	}
+	return key
+}
+
 // keyView is the response shape of one key. Secret keys are shown in full only when reveal
 // is set (a masked prefix otherwise); the legacy keys have no prefix.
 func keyView(e keyEntry, reveal bool) v1.ApiKeyResponseOutput {
@@ -95,10 +108,7 @@ func keyView(e keyEntry, reveal bool) v1.ApiKeyResponseOutput {
 	desc, ins, upd := e.desc, e.created, e.updated
 	out := v1.ApiKeyResponseOutput{Id: &id, Name: e.name, Type: &typ, Description: &desc, InsertedAt: &ins, UpdatedAt: &upd}
 	if !e.legacy {
-		prefix := e.key
-		if len(prefix) > 20 {
-			prefix = prefix[:20]
-		}
+		prefix := keyPrefix(e.key)
 		out.Prefix = &prefix
 	}
 	switch {

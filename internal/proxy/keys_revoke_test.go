@@ -200,3 +200,55 @@ func TestLegacyDisabledOnFunctionsAndBearer(t *testing.T) {
 		t.Errorf("rest with legacy keys enabled: %d", res.status)
 	}
 }
+
+// With the legacy keys disabled, Storage (a route that needs no key at the gateway and
+// verifies the JWT itself) must turn away the legacy keys in every position: as apikey, in
+// the query, as the exact bearer alone, and as a bearer beside a valid opaque key. Public
+// objects without credentials, users' sessions and the opaque keys keep working.
+func TestLegacyDisabledOnStorage(t *testing.T) {
+	k := testKeys(t, testRef)
+	k.LegacyDisabled = true
+	exp := time.Now().Add(time.Hour).Unix()
+	resigned := signJWT(t, k.JWTSecret, jwt.MapClaims{"role": "service_role", "ref": testRef, "exp": exp})
+	tmp := signJWT(t, k.JWTSecret, jwt.MapClaims{"role": "service_role", "ref": testRef, "exp": exp, secrets.TemporaryClaim: true})
+	user := signJWT(t, k.JWTSecret, jwt.MapClaims{"role": "authenticated", "sub": "u1", "ref": testRef, "exp": exp})
+
+	st := matchRoute("/storage/v1/bucket")
+	if st == nil || st.keys == keyNone {
+		t.Fatalf("storage route: %+v", st)
+	}
+	for name, c := range map[string]struct {
+		h     http.Header
+		query string
+	}{
+		"service_role apikey and bearer": {h: hdr("apikey", k.ServiceRoleKey, "Authorization", "Bearer "+k.ServiceRoleKey)},
+		"service_role apikey":            {h: hdr("apikey", k.ServiceRoleKey)},
+		"service_role bearer only":       {h: hdr("Authorization", "Bearer "+k.ServiceRoleKey)},
+		"publishable, legacy bearer":     {h: hdr("apikey", k.PublishableKey, "Authorization", "Bearer "+k.ServiceRoleKey)},
+		"secret key, legacy bearer":      {h: hdr("apikey", k.SecretKey, "Authorization", "Bearer "+k.ServiceRoleKey)},
+		"anon apikey":                    {h: hdr("apikey", k.AnonKey)},
+		"re-signed service_role apikey":  {h: hdr("apikey", resigned)},
+		"service_role in the query":      {h: hdr(), query: "apikey=" + k.ServiceRoleKey},
+	} {
+		if res := authorize(st, k, testRef, c.h, c.query); res.status != http.StatusUnauthorized {
+			t.Errorf("storage, %s: status %d, want 401", name, res.status)
+		}
+	}
+	for name, h := range map[string]http.Header{
+		"no credentials (public objects)": hdr(),
+		"publishable":                     hdr("apikey", k.PublishableKey),
+		"secret":                          hdr("apikey", k.SecretKey),
+		"publishable, user session":       hdr("apikey", k.PublishableKey, "Authorization", "Bearer "+user),
+		"user session only":               hdr("Authorization", "Bearer "+user),
+		"temporary dashboard key":         hdr("apikey", tmp),
+	} {
+		if res := authorize(st, k, testRef, h, ""); res.status != 0 {
+			t.Errorf("storage, %s: refused (%d %s)", name, res.status, res.body)
+		}
+	}
+	// Enabled again, the legacy keys work on Storage as before.
+	k.LegacyDisabled = false
+	if res := authorize(st, k, testRef, hdr("apikey", k.ServiceRoleKey, "Authorization", "Bearer "+k.ServiceRoleKey), ""); res.status != 0 {
+		t.Errorf("storage with legacy keys enabled: %d", res.status)
+	}
+}
