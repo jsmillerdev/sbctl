@@ -213,7 +213,11 @@ func renderFiles(cfg *config.Config, s Spec) (changed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	b, err := writeIfChanged(f.Run, run, 0o750)
+	runMode := os.FileMode(0o750)
+	if s.PublicRun {
+		runMode = 0o755
+	}
+	b, err := writeIfChanged(f.Run, run, runMode)
 	if err != nil {
 		return false, err
 	}

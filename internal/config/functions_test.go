@@ -27,6 +27,25 @@ func TestFunctionsDefaultsAndRoot(t *testing.T) {
 	}
 }
 
+func TestFunctionsTmpQuota(t *testing.T) {
+	for _, c := range []struct{ in, want int }{{0, DefaultFunctionsTmpQuotaMB}, {16, 16}, {-1, 0}} {
+		if got := (Functions{TmpQuotaMB: c.in}).TmpQuota(); got != c.want {
+			t.Errorf("tmp_quota_mb %d: %d, want %d", c.in, got, c.want)
+		}
+	}
+	if DefaultFunctionsTmpQuotaMB <= 0 {
+		t.Error("a worker's /tmp has no quota by default")
+	}
+	p := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(p, []byte("[functions]\nenabled = true\ntmp_quota_mb = 32\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(p)
+	if err != nil || c.Functions.TmpQuota() != 32 {
+		t.Fatalf("%v %+v", err, c.Functions)
+	}
+}
+
 func TestFunctionsLimitsCanBeSwitchedOffWithANegativeValue(t *testing.T) {
 	f := Functions{CPUSoftMs: -1, CPUHardMs: -5, MaxWorkers: -1, MaxPerProject: -1, MemoryMB: 64}
 	if f.CPUSoft() != 0 || f.CPUHard() != 0 || f.Workers() != 0 || f.WorkersPerProject() != 0 || f.PerProject() != 0 || f.Memory() != 64 || f.RuntimeMemoryMax() != "" {

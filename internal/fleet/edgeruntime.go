@@ -93,6 +93,7 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 		"SBCTL_FUNCTIONS_WORKER_COST_MB":          strconv.Itoa(f.WorkerCostMB()),
 		"SBCTL_FUNCTIONS_CPU_SOFT_MS":             strconv.Itoa(f.CPUSoft()),
 		"SBCTL_FUNCTIONS_CPU_HARD_MS":             strconv.Itoa(f.CPUHard()),
+		"SBCTL_FUNCTIONS_TMP_QUOTA_MB":            strconv.Itoa(f.TmpQuota()),
 		// The runtime keeps one module cache for the whole process (it reads DENO_DIR once,
 		// and a worker cannot change it), so remote imports of all projects share this
 		// directory. The cache is content-addressed by URL and holds public modules only.

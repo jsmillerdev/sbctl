@@ -194,13 +194,48 @@ async function mainPhase() {
   // environment: not the node's files, not another project's keys.
   {
     const tenants = `${cfg.stateDir}/system/edge-runtime/tenants`
-    const files = ['/etc/hosts', `${tenants}/${b.ref}/functions-env.json`, `${tenants}/${a.ref}/functions-env.json`]
+    // /proc/<pid>/environ and root are how a process of the same uid walks around a mount
+    // namespace; a worker is an isolate inside the runtime process, whose file system is a
+    // module graph and its own /tmp, so none of these exists for it.
+    const files = [
+      '/etc/hosts',
+      `${tenants}/${b.ref}/functions-env.json`,
+      `${tenants}/${a.ref}/functions-env.json`,
+      '/proc/self/environ',
+      '/proc/self/root/etc/hosts',
+      `/proc/self/root${tenants}/${b.ref}/functions-env.json`,
+      '/proc/1/environ',
+      '/proc/self/cmdline',
+    ]
     const q = files.map((f) => `p=${encodeURIComponent(f)}`).join('&')
     const r = await call(`${fnUrl(a, 'readfs')}?${q}`, { headers: bearer(a.anon) })
     assert.equal(r.status, 200, `readfs: ${r.status} ${r.text}`)
     for (const f of files) assert.match(r.json[f], /^ERROR: /, `a function read ${f}: ${r.json[f]}`)
     assert.equal(r.json.env, 'ENV: unset', 'the main service environment is visible to a worker')
-    ok('a function cannot read the files of the node or the environment of the main service')
+    assert.match(r.json.readDir, /^ERROR: /, `a function listed /proc: ${r.json.readDir}`)
+    assert.match(r.json.spawn, /^ERROR: /, `a function ran a child process: ${r.json.spawn}`)
+    assert.match(r.json.envNames, /^ERROR: /, `the environment of a worker holds main service variables: ${r.json.envNames}`)
+    ok('a function cannot read the files of the node (/proc included), start a process, or see the environment of the main service')
+  }
+
+  // A worker's /tmp is its only writable place and is backed by the node's disk, which holds every
+  // project's database: the node caps it ([functions] tmp_quota_mb, cfg.tmpQuotaMb). A function that
+  // writes past the cap fails inside itself, and nothing else is affected.
+  {
+    const quota = cfg.tmpQuotaMb ?? 64
+    const tmp = (p, mb) => call(`${fnUrl(p, 'tmpwrite')}?mb=${mb}`, { headers: bearer(p.anon), timeoutMs: 90_000 })
+    const small = await tmp(a, 4)
+    assert.equal(small.json?.ok, true, `a write within the quota: ${small.status} ${small.text}`)
+    assert.equal(small.json.bytes, 4 * 1024 * 1024)
+    const big = await tmp(a, quota + 16)
+    assert.equal(big.status, 200, `tmpwrite: ${big.status} ${big.text}`)
+    assert.equal(big.json?.ok, false, `a write of ${quota + 16} MiB to /tmp went through (quota ${quota} MiB): ${big.text}`)
+    assert.match(big.json.error, /quota/i, `the write failed, but not on the quota: ${big.json.error}`)
+    // The other project, and the same function again, are not affected.
+    const again = await tmp(a, 4)
+    assert.equal(again.json?.ok, true, `the function after its failed write: ${again.text}`)
+    assert.equal((await invoke(b, 'hello')).data?.who, 'project-b')
+    ok(`a function that writes past its /tmp quota (${quota} MiB) fails alone`)
   }
 
   // A bundled function cannot import files of the node either. A function that ran from
@@ -310,6 +345,30 @@ async function mainPhase() {
     assert.equal((await invoke(b, 'hello')).data?.who, 'project-b')
     console.log(`   (flood: ${results.map((r) => r.status).join(' ')})`)
     ok('a flood from one project is refused beyond its cap; the other project answers within bounds')
+  }
+
+  // 9. A streamed response keeps its place in the budgets until the stream ends. The function
+  // answers with its headers at once and then talks for a few seconds, and the worker is busy for
+  // that long. With max_per_project streams open, the project is at its cap: the next request is
+  // refused, and accepted when the streams are over. (A node that released at the headers would
+  // answer 200 here, and a project could hold more live workers than its budget behind them.)
+  {
+    const cap = cfg.maxPerProject ?? 0
+    if (cap > 0) {
+      const open = await Promise.all(
+        Array.from({ length: cap }, () => fetch(`${fnUrl(a, 'stream')}?secs=6`, { headers: bearer(a.anon), signal: AbortSignal.timeout(60_000) })),
+      )
+      for (const r of open) assert.equal(r.status, 200, `stream: ${r.status}`)
+      const during = await call(fnUrl(a, 'hello'), { headers: bearer(a.anon) })
+      assert.equal(during.status, 503, `a request while ${cap} streams are open: ${during.status} ${during.text}`)
+      assert.equal(during.headers.get('sb-error-code'), 'PROJECT_AT_CAPACITY')
+      assert.equal((await invoke(b, 'hello')).data?.who, 'project-b', 'project B was affected by the streams of A')
+      const texts = await Promise.all(open.map((r) => r.text()))
+      for (const t of texts) assert.match(t, /tick 0\n.*tick 5\n$/s, `a stream ended early: ${JSON.stringify(t)}`)
+      const after = await call(fnUrl(a, 'hello'), { headers: bearer(a.anon) })
+      assert.equal(after.status, 200, `a request after the streams ended: ${after.status} ${after.text}`)
+      ok(`${cap} open streams hold the project's request budget until they end`)
+    }
   }
 }
 

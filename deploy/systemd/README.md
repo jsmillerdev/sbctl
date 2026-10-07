@@ -8,13 +8,13 @@ systemd units for sbctl, embedded in the binary (`embed.go`) and installed by
 | `sb-postgres@.service`, `sb-gotrue@.service`, `sb-postgrest@.service` | per-project templates; the instance is the ref |
 | `sb-supavisor`, `sb-realtime`, `sb-storage`, `sb-pgmeta`, `sb-studio` | fleet singletons |
 | `sb-imgproxy`, `sb-edge-runtime` | optional singletons |
-| `sb-edge-bundle` | one-shot, started by the API for each upload of Edge Function sources: runs `edge-runtime bundle` in a sandbox that sees only its scratch directory and the artifacts, with no loopback and no instance metadata (see `internal/functions/README.md`) |
+| `sb-edge-bundle` | one-shot, started by the API for each upload of Edge Function sources: runs `edge-runtime bundle` under **its own uid** (`DynamicUser=yes`, the one exception to `User=sbctl`) in a sandbox that sees only the upload's sources (read-only), one output directory and the artifacts, with no loopback, no instance metadata and no other process in `/proc` (see `internal/functions/README.md`) |
 | `sbctl.slice` | every unit runs in it, so `systemctl status sbctl.slice` shows the total |
 | `sbctl.service` | the daemon (`sbctl serve`: Management API, edge proxy, lifecycle engine; starts active projects at boot) |
 | `50-sbctl.rules` | polkit rule: the `sbctl` user may start, stop and tune `sb-*` units and `sbctl.service` (manage-units only; enabling units and daemon-reload need root, through `install-units`) |
 | `sb-basebackup@.service` and `.timer`, `sb-basebackup-prune.service` and `.timer` | nightly base backup per project and the node-wide retention prune. The daemon and the lifecycle engine start the timer instances over D-Bus (they are not enabled for boot); `install-units` writes `sb-basebackup@.timer` with `backup.base_backup_on_calendar` |
 
-Every service unit runs as `User=sbctl`, reads `/var/lib/sbctl/projects/<ref>/<svc>.env`
+Every service unit but `sb-edge-bundle` runs as `User=sbctl`, reads `/var/lib/sbctl/projects/<ref>/<svc>.env`
 (0600, by systemd, before the unit's mount namespace exists) and executes `<svc>.run`; both are
 written by `units.Supervisor.Render`, so the templates never change per project. `MemoryMax` and `CPUQuota` are per-unit drop-ins applied
 over D-Bus. Logs go to journald, selected by unit name (`SyslogIdentifier` equals the
@@ -49,6 +49,8 @@ PostgREST. A file-read bug in a service reaches the same files (a path traversal
 any of that, and no unit option available on Ubuntu 22.04 and 24.04 and Debian 12 (systemd 249
 to 255) does: `ProtectProc=invisible` hides only other users' processes, and `PrivatePIDs=`
 needs systemd 257.
+
+**The exception, and why it is one.** `sb-edge-bundle.service` runs another person's source code through a bundler that opens whatever paths the code names, so it is the one unit whose input chooses file paths, and a mount namespace is not enough for it: under the `sbctl` uid an upload could import `/proc/<pid>/root/...` of any other unit and carry that unit's files, every project's `functions-env.json` included, out in its bundle. It therefore runs under a dynamic uid, with `ProtectProc=invisible` and `ProcSubset=pid` (they hide only other users' processes, so they work for it and not for the `sbctl` units), reading the sources the daemon hands over and writing two files the daemon prepares. `tests/linux/functions-smoke.sh` probes it in the real unit. **The Edge Runtime does not need the same treatment against its user workers**: they are isolates inside its process, with no path to name under `/proc` (see `functions-main/README.md`, "Isolation, as measured"); the runtime stays in the one trust domain of the node, and a compromise of the runtime itself (a V8 escape) is the case the future one-uid-per-project hardening below addresses.
 
 **What it does buy.** The allowlist below keeps a service from reading, by plain path, what it
 has no business with: the master key and config (`/etc/sbctl`), TLS keys, other projects' data
@@ -140,7 +142,7 @@ workstream J runs user code in Edge Functions, with a bucket policy or a separat
 Storage and with static credentials for the WAL archiver (`--s3-credentials-file`). Workstream
 J: keep `IPAddressDeny=169.254.169.254` on `sb-edge-runtime.service` and on any unit that runs
 tenant code; `sb-edge-bundle.service` (it reads tenant code's imports) has it too, and in addition
-denies loopback, so a bundler cannot reach the Management API or a database. It cannot be started
+denies loopback, so a bundler cannot reach the Management API or a database, and runs under its own uid. It cannot be started
 with `systemd-run` by the `sbctl` user: the polkit rule grants `manage-units` only for names that
 start with `sb-`, and polkit receives no unit name for a transient unit, so the sandbox is a fixed
 unit file, not a transient one.

@@ -1,4 +1,10 @@
-import { assert, assertEquals, assertFalse, assertStringIncludes } from 'jsr:@std/assert@1'
+import {
+  assert,
+  assertEquals,
+  assertFalse,
+  assertRejects,
+  assertStringIncludes,
+} from 'jsr:@std/assert@1'
 import {
   makeHandler,
   PROXY_TOKEN_HEADER,
@@ -9,6 +15,7 @@ import {
 import { ProjectLimiter } from './limiter.ts'
 import { ProjectStore } from './projects.ts'
 import {
+  draining,
   FakeError,
   FakeRuntime,
   REF_A,
@@ -32,6 +39,7 @@ const LIMITS: Limits = {
   maxBundleBytes: 0,
   cpuTimeSoftLimitMs: 100,
   cpuTimeHardLimitMs: 200,
+  tmpQuotaBytes: 8 * 1024 * 1024,
 }
 const TOKEN = 'proxy-token-0123456789abcdef'
 const SECRET_A = 'secret-of-project-a-0123456789012345678901'
@@ -40,7 +48,10 @@ const SECRET_B = 'secret-of-project-b-0123456789012345678901'
 interface Fixture {
   root: string
   rt: FakeRuntime
+  /** The handler, with every response read to its end (see draining). */
   handle: (r: Request) => Promise<Response>
+  /** The handler as it is: a response that is not read keeps its place in the budgets. */
+  handleRaw: (r: Request) => Promise<Response>
   anonA: string
   anonB: string
   cleanup: () => Promise<void>
@@ -60,7 +71,7 @@ async function fixture(limits: Partial<Limits> = {}): Promise<Fixture> {
   await writeFunction(root, REF_B, 'hello', { verifyJwt: true })
   await writeFunction(root, REF_A, 'open', { verifyJwt: false })
   const rt = new FakeRuntime()
-  const handle = makeHandler({
+  const handleRaw = makeHandler({
     store: new ProjectStore(root),
     runtime: rt,
     limits: { ...LIMITS, ...limits },
@@ -71,7 +82,8 @@ async function fixture(limits: Partial<Limits> = {}): Promise<Fixture> {
   return {
     root,
     rt,
-    handle,
+    handle: draining(handleRaw),
+    handleRaw,
     anonA: await signJWT(SECRET_A, { role: 'anon' }),
     anonB: await signJWT(SECRET_B, { role: 'anon' }),
     cleanup: () => Deno.remove(root, { recursive: true }),
@@ -559,13 +571,13 @@ Deno.test('a redeployment counts as a new worker until the old one has idled out
       workerTtlMs: 1000,
       now: () => t,
     })
-    const handle = makeHandler({
+    const handle = draining(makeHandler({
       store: new ProjectStore(root),
       runtime: rt,
       limits: LIMITS,
       limiter,
       log: silent,
-    })
+    }))
     const get = async (slug: string) => (await handle(req(`/${slug}`, REF_A))).status
     assertEquals([await get('a'), await get('b')], [200, 200])
     await writeFunction(root, REF_A, 'a', { verifyJwt: false, version: 2 })
@@ -574,5 +586,199 @@ Deno.test('a redeployment counts as a new worker until the old one has idled out
     assertEquals(await get('a'), 200)
   } finally {
     await Deno.remove(root, { recursive: true })
+  }
+})
+
+/** A response body the test ends, fails or cancels by hand: a function that streams. */
+function controlledStream() {
+  let ctl!: ReadableStreamDefaultController<Uint8Array>
+  const enc = new TextEncoder()
+  const state = { cancelled: false }
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      ctl = c
+    },
+    cancel() {
+      state.cancelled = true
+    },
+  })
+  return {
+    state,
+    response: () => new Response(stream, { headers: { 'content-type': 'text/event-stream' } }),
+    chunk: (s: string) => ctl.enqueue(enc.encode(s)),
+    end: () => ctl.close(),
+    fail: (e: Error) => ctl.error(e),
+  }
+}
+
+Deno.test('every worker gets a quota for its /tmp, unless the node switches it off', async () => {
+  const f = await fixture()
+  try {
+    await f.handle(req('/open', REF_A))
+    await f.handle(req('/hello', REF_B, { authorization: `Bearer ${f.anonB}` }))
+    assertEquals(f.rt.created.length, 2)
+    for (const o of f.rt.created) assertEquals(o.tmpFsConfig, { quota: 8 * 1024 * 1024 })
+  } finally {
+    await f.cleanup()
+  }
+  const off = await fixture({ tmpQuotaBytes: 0 })
+  try {
+    await off.handle(req('/open', REF_A))
+    assertEquals(off.rt.created[0].tmpFsConfig, undefined)
+  } finally {
+    await off.cleanup()
+  }
+})
+
+Deno.test('a function that fails on its /tmp quota fails alone: the other project and the next request are fine', async () => {
+  const f = await fixture()
+  try {
+    // What the runtime does when a worker writes past its quota: the write throws inside the
+    // function, which answers with an error (or the worker dies); nothing else is affected.
+    f.rt.respond = (r) =>
+      new URL(r.url).pathname === '/open'
+        ? Response.json({ error: 'filesystem quota exceeded' }, { status: 500 })
+        : new Response('fine')
+    const bad = await f.handle(req('/open', REF_A))
+    assertEquals(bad.status, 500)
+    assertEquals(bad.headers.get('sb-error-code'), 'EDGE_FUNCTION_ERROR')
+    const other = await f.handle(req('/hello', REF_B, { authorization: `Bearer ${f.anonB}` }))
+    assertEquals(await other.text(), 'fine')
+    assertEquals(
+      (await f.handle(req('/hello', REF_A, { authorization: `Bearer ${f.anonA}` }))).status,
+      200,
+    )
+  } finally {
+    await f.cleanup()
+  }
+})
+
+Deno.test('a streaming response keeps its request slot until the stream ends', async () => {
+  const f = await fixture({ maxPerProject: 1 })
+  try {
+    const s = controlledStream()
+    f.rt.respond = () => s.response()
+    // The headers are back and the function is still talking.
+    const first = await f.handleRaw(req('/open', REF_A))
+    assertEquals(first.status, 200)
+    s.chunk('data: 1\n\n')
+    const refused = await f.handleRaw(req('/open', REF_A))
+    assertEquals(refused.status, 503)
+    assertEquals(refused.headers.get('sb-error-code'), 'PROJECT_AT_CAPACITY')
+    // Another project is not affected.
+    f.rt.respond = () => new Response('fast')
+    assertEquals(
+      (await f.handle(req('/hello', REF_B, { authorization: `Bearer ${f.anonB}` }))).status,
+      200,
+    )
+    // The stream ends and the client has read it: the slot is free.
+    s.chunk('data: 2\n\n')
+    s.end()
+    assertEquals(await first.text(), 'data: 1\n\ndata: 2\n\n')
+    assertEquals((await f.handle(req('/open', REF_A))).status, 200)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+Deno.test('streams keep their workers in the budgets: max_workers_per_project and max_workers hold while they run', async () => {
+  // One worker for the whole runtime, one per project, no cap on requests: every function that
+  // would need another worker is refused for as long as a stream holds the only one.
+  const f = await fixture({ maxWorkers: 1, maxWorkersPerProject: 1, maxPerProject: 0 })
+  try {
+    const s = controlledStream()
+    f.rt.respond = () => s.response()
+    const first = await f.handleRaw(req('/open', REF_A))
+    assertEquals(first.status, 200)
+    f.rt.respond = () => new Response('fast')
+    const sameProject = await f.handleRaw(
+      req('/hello', REF_A, { authorization: `Bearer ${f.anonA}` }),
+    )
+    assertEquals(sameProject.status, 503)
+    assertStringIncludes((await sameProject.json()).message, 'too many functions')
+    const otherProject = await f.handleRaw(
+      req('/hello', REF_B, { authorization: `Bearer ${f.anonB}` }),
+    )
+    assertEquals(otherProject.status, 503)
+    assertStringIncludes((await otherProject.json()).message, 'runtime')
+    assertEquals(f.rt.created.length, 1, 'no second worker was created while the stream ran')
+    s.end()
+    await first.text()
+    // Free again: the first function's worker is still the live one, and project B may now
+    // not take a second one until it idles out, but the same function answers.
+    f.rt.respond = () => new Response('again')
+    assertEquals(await (await f.handle(req('/open', REF_A))).text(), 'again')
+  } finally {
+    await f.cleanup()
+  }
+})
+
+Deno.test('a worker with a stream open is still live after its idle time; it is forgotten after the stream ends and the idle time passes', async () => {
+  let t = 0
+  const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'sbctl-handler-test-' }))
+  try {
+    await writeProject(root, REF_A, SECRET_A)
+    await writeFunction(root, REF_A, 'a', { verifyJwt: false })
+    await writeFunction(root, REF_A, 'b', { verifyJwt: false })
+    const rt = new FakeRuntime()
+    const limiter = new ProjectLimiter({
+      maxRequests: 0,
+      maxWorkers: 1,
+      workerTtlMs: 1000,
+      now: () => t,
+    })
+    const raw = makeHandler({
+      store: new ProjectStore(root),
+      runtime: rt,
+      limits: LIMITS,
+      limiter,
+      log: silent,
+    })
+    const s = controlledStream()
+    rt.respond = () => s.response()
+    const stream = await raw(req('/a', REF_A))
+    rt.respond = () => new Response('b')
+    // Far past the time after which an idle worker is assumed gone: this one is not idle.
+    t = 600_000
+    assertEquals((await draining(raw)(req('/b', REF_A))).status, 503)
+    s.end()
+    await stream.text()
+    assertEquals(
+      (await draining(raw)(req('/b', REF_A))).status,
+      503,
+      'the worker idles on after the stream',
+    )
+    t = 600_000 + 1001
+    assertEquals((await draining(raw)(req('/b', REF_A))).status, 200)
+  } finally {
+    await Deno.remove(root, { recursive: true })
+  }
+})
+
+Deno.test('a client that goes away mid-stream, or a worker that dies mid-stream, frees the slot', async () => {
+  const f = await fixture({ maxPerProject: 1 })
+  try {
+    // The client cancels the response (the HTTP server does this when the connection closes).
+    const s1 = controlledStream()
+    f.rt.respond = () => s1.response()
+    const first = await f.handleRaw(req('/open', REF_A))
+    s1.chunk('x')
+    assertEquals((await f.handleRaw(req('/open', REF_A))).status, 503)
+    await first.body!.cancel('connection closed')
+    assert(s1.state.cancelled, 'the worker was not told that the client left')
+    f.rt.respond = () => new Response('next')
+    assertEquals(await (await f.handle(req('/open', REF_A))).text(), 'next')
+
+    // The worker is retired mid-stream: the body fails, the client sees a failed body, and the slot is free.
+    const s2 = controlledStream()
+    f.rt.respond = () => s2.response()
+    const second = await f.handleRaw(req('/open', REF_A))
+    assertEquals((await f.handleRaw(req('/open', REF_A))).status, 503)
+    s2.fail(new Error('worker retired'))
+    await assertRejects(() => second.text(), Error, 'worker retired')
+    f.rt.respond = () => new Response('after')
+    assertEquals(await (await f.handle(req('/open', REF_A))).text(), 'after')
+  } finally {
+    await f.cleanup()
   }
 })

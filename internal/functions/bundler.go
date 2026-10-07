@@ -30,9 +30,18 @@ import (
 // so the node turns the upload into an eszip first, with the edge-runtime artifact's own
 // `bundle` command, and serves only that. Bundling reads the imports of someone else's
 // code from the disk, which is the same attack as running it, so the command runs in the
-// sandbox of sb-edge-bundle.service: a mount namespace that shows nothing of the node but
-// the upload's scratch directory and the artifacts, no loopback services, no instance
-// metadata, a memory limit and a timeout.
+// sandbox of sb-edge-bundle.service: a uid of its own (a dynamic user: the node's other
+// processes are the sbctl user's, and a mount namespace does not stop a process from opening
+// /proc/<pid>/root of another process of its own uid), a mount namespace that shows nothing of
+// the node but the upload and the artifacts, no loopback services, no instance metadata, a
+// memory limit and a timeout.
+//
+// The unit's uid is not the daemon's, so what it may touch is handed over through the file
+// system: the sources are world-readable and owned by the daemon (the unit cannot change
+// them), and the two files it writes, the eszip and its own log, are created by the daemon in
+// a directory the unit cannot create anything in, and made world-writable. The unit cannot
+// make, replace or delete any other file, so the daemon can always remove the whole scratch
+// directory afterwards.
 
 const (
 	// bundleTimeoutDefault bounds one bundling, from the start of the unit to its end.
@@ -46,6 +55,14 @@ const (
 	// bundleCacheMax is the size of the module cache (remote imports) above which it is emptied.
 	bundleCacheMax = 512 << 20
 	bundleQueueMax = 8
+	// sandboxCacheDir is the module cache of the bundler under the systemd unit
+	// (CacheDirectory=sb-edge-bundle in sb-edge-bundle.service): private to the unit's uid, so
+	// the daemon cannot see it and the unit empties it itself (ExecStartPre) above 512 MiB.
+	// The exec backend, which has no such unit, keeps its cache in the state directory.
+	sandboxCacheDir = "/var/cache/sb-edge-bundle"
+	// sandboxWorkDir is the working directory of the bundler under the unit: the one place
+	// besides the cache it may write to (a private /tmp that goes away with the run).
+	sandboxWorkDir = "/tmp"
 )
 
 // bundleTimeout is a variable so that tests can shorten it.
@@ -121,6 +138,10 @@ func (b *Bundler) Bundle(ctx context.Context, in BundleInput) (bundle []byte, en
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: the edge-runtime artifact is not fetched: %v", api.ErrBundlingUnavailable, err)
 	}
+	sandboxed := false
+	if sb, ok := b.sup.(units.Sandboxer); ok {
+		sandboxed = sb.Sandboxed()
+	}
 	stateDir := b.cfg.Paths().EdgeBundleDir()
 	work := filepath.Join(stateDir, "work")
 	// Stale files of an earlier upload (a crash) never mix with this one.
@@ -128,40 +149,57 @@ func (b *Bundler) Bundle(ctx context.Context, in BundleInput) (bundle []byte, en
 		return nil, "", err
 	}
 	defer os.RemoveAll(work)
-	src := filepath.Join(work, "src")
-	if err := os.MkdirAll(src, 0o750); err != nil {
-		return nil, "", err
+	src, outDir := filepath.Join(work, "src"), filepath.Join(work, "out")
+	for _, d := range []string{src, outDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return nil, "", err
+		}
 	}
 	if real, err := filepath.EvalSymlinks(work); err == nil {
 		work = real
-		src = filepath.Join(work, "src")
+		src, outDir = filepath.Join(work, "src"), filepath.Join(work, "out")
 	}
 	if err := writeSources(src, in.Files); err != nil {
 		return nil, "", err
 	}
-	cache := filepath.Join(stateDir, "deno")
-	trimCache(cache)
-	if err := os.MkdirAll(cache, 0o750); err != nil {
+	out := filepath.Join(outDir, "out.eszip")
+	logFile := filepath.Join(outDir, "bundle.log")
+	if err := handOver(work, src, out, logFile); err != nil {
 		return nil, "", err
 	}
-	if real, err := filepath.EvalSymlinks(stateDir); err == nil {
-		cache = filepath.Join(real, "deno")
-		stateDir = real
-	}
 
-	out := filepath.Join(work, "out.eszip")
-	logFile := filepath.Join(work, "bundle.log")
 	args, env, err := bundleCommand(in, src, out)
 	if err != nil {
 		return nil, "", err
 	}
-	env["DENO_DIR"] = cache
-	env["HOME"] = stateDir
 	env["NO_COLOR"] = "1"
+	workDir := work
+	if sandboxed {
+		// Under the unit the module cache is the unit's own, and the sources and the output
+		// directory are not writable for it.
+		env["DENO_DIR"] = path.Join(sandboxCacheDir, "deno")
+		env["HOME"] = sandboxCacheDir
+		workDir = sandboxWorkDir
+		// The cache of an earlier version of the bundler, which ran as the daemon's user.
+		_ = os.RemoveAll(filepath.Join(stateDir, "deno"))
+	} else {
+		cache := filepath.Join(stateDir, "deno")
+		trimCache(cache)
+		if err := os.MkdirAll(cache, 0o750); err != nil {
+			return nil, "", err
+		}
+		if real, err := filepath.EvalSymlinks(stateDir); err == nil {
+			cache = filepath.Join(real, "deno")
+			stateDir = real
+		}
+		env["DENO_DIR"] = cache
+		env["HOME"] = stateDir
+	}
 	spec := units.Spec{
-		Service: config.SvcEdgeBundle, ArtifactDir: art, WorkDir: work, Log: logFile,
+		Service: config.SvcEdgeBundle, ArtifactDir: art, WorkDir: workDir, Log: logFile,
 		Exec: append([]string{"bin/edge-runtime"}, args...), Env: env,
-		Limits: config.Limits{MemoryMax: "1G", CPUQuota: "100%"},
+		Limits:    config.Limits{MemoryMax: "1G", CPUQuota: "100%"},
+		PublicRun: sandboxed,
 	}
 	unit := spec.Unit()
 	if err := b.sup.Render(ctx, spec); err != nil {
@@ -175,10 +213,6 @@ func (b *Bundler) Bundle(ctx context.Context, in BundleInput) (bundle []byte, en
 		_ = b.sup.Stop(sctx, unit)
 	}()
 
-	sandboxed := false
-	if sb, ok := b.sup.(units.Sandboxer); ok {
-		sandboxed = sb.Sandboxed()
-	}
 	started := time.Now()
 	startErr := b.sup.Start(ctx, unit)
 	if startErr == nil {
@@ -309,11 +343,45 @@ func writeSources(dir string, files []api.FunctionFile) error {
 		}
 		seen[rel] = true
 		p := filepath.Join(dir, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			return &api.BundleError{Msg: fmt.Sprintf("the file %q conflicts with another path of the upload", f.Path)}
 		}
-		if err := os.WriteFile(p, f.Content, 0o640); err != nil {
+		if err := os.WriteFile(p, f.Content, 0o644); err != nil {
 			return &api.BundleError{Msg: fmt.Sprintf("the file %q conflicts with another path of the upload", f.Path)}
+		}
+	}
+	return nil
+}
+
+// handOver sets the modes the unit's uid needs (the daemon's umask is 0027, which would hide
+// everything from it): the sources and the directories above them readable by everyone, and
+// the output files created empty and writable by everyone. The output directory itself stays
+// writable for the daemon only, so the unit can fill the two files and create nothing else.
+func handOver(work, src string, outFiles ...string) error {
+	if err := filepath.WalkDir(work, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return os.Chmod(p, 0o755)
+		}
+		if p == src || strings.HasPrefix(p, src+string(filepath.Separator)) {
+			return os.Chmod(p, 0o644)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, p := range outFiles {
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+		if err != nil {
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		if err := os.Chmod(p, 0o666); err != nil {
+			return err
 		}
 	}
 	return nil

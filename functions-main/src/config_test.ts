@@ -16,6 +16,7 @@ Deno.test('loadConfig applies the defaults', () => {
     maxBundleBytes: 192 * 1024 * 1024,
     cpuTimeSoftLimitMs: 1000,
     cpuTimeHardLimitMs: 2000,
+    tmpQuotaBytes: 64 * 1024 * 1024,
   })
 })
 
@@ -33,6 +34,7 @@ Deno.test('loadConfig reads the variables the unit passes', () => {
     SBCTL_FUNCTIONS_PROXY_TOKEN: ' tok\n',
     SBCTL_FUNCTIONS_CPU_SOFT_MS: '0',
     SBCTL_FUNCTIONS_CPU_HARD_MS: '',
+    SBCTL_FUNCTIONS_TMP_QUOTA_MB: '5',
   }
   const c = loadConfig((n) => vars[n])
   assertEquals(c.root, '/x/tenants')
@@ -47,6 +49,13 @@ Deno.test('loadConfig reads the variables the unit passes', () => {
   assertEquals(c.proxyToken, 'tok')
   assertEquals(c.limits.cpuTimeSoftLimitMs, 0)
   assertEquals(c.limits.cpuTimeHardLimitMs, 2000)
+  assertEquals(c.limits.tmpQuotaBytes, 5 * 1024 * 1024)
+  // 0 switches the quota off.
+  assertEquals(
+    loadConfig((n) => (n === 'SBCTL_FUNCTIONS_TMP_QUOTA_MB' ? '0' : undefined)).limits
+      .tmpQuotaBytes,
+    0,
+  )
 })
 
 Deno.test('loadConfig rejects nonsense', () => {

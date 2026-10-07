@@ -37,8 +37,11 @@
 #                   under $STATE_DIR/artifacts)
 #   MAX_PER_PROJECT  the node's [functions] max_per_project when it was set low (8) so that the flood
 #                   check can exceed it; unset skips the "refused beyond the cap" assertion
+#   TMP_QUOTA_MB    the node's [functions] tmp_quota_mb (default 64), which the tmpwrite check writes past
 #   SANDBOXED_BUNDLER  1 when the node's bundler runs in its systemd sandbox: the script then
 #                   also checks that an upload cannot import another project's files
+#   PROC_ESCAPE_PIDS  with SANDBOXED_BUNDLER: pids of processes of the node (the runtime, the
+#                   daemon) whose /proc/<pid>/root and environ an upload tries to import
 #   PROXY_TOKEN_FILE  file with the node's proxy secret, for checks that call the runtime
 #                   directly (default: $STATE_DIR/system/edge-runtime.token)
 #
@@ -163,16 +166,16 @@ print(json.dumps({"ref": ref, "name": name, "url": tpl.replace("{ref}", ref), "a
   "publishable": k["publishable_key"], "secret": k["secret_key"], "jwtSecret": k["jwt_secret"]}))' "$1" "$2" "$PROJECT_URL"
 }
 proxy_token=$(asnode cat "$PROXY_TOKEN_FILE" 2>/dev/null || true)
-python3 - "$WORK/config.json" "$API_URL" "$PAT" "${RUNTIME_URL:-}" "$(keys "$REF_A" a)" "$(keys "$REF_B" b)" "$STATE_DIR" "$proxy_token" "${MAX_PER_PROJECT:-0}" <<'PY'
+python3 - "$WORK/config.json" "$API_URL" "$PAT" "${RUNTIME_URL:-}" "$(keys "$REF_A" a)" "$(keys "$REF_B" b)" "$STATE_DIR" "$proxy_token" "${MAX_PER_PROJECT:-0}" "${TMP_QUOTA_MB:-64}" <<'PY'
 import json, sys
-out, api, pat, rt, a, b, _, tok, cap = sys.argv[1:10]
+out, api, pat, rt, a, b, _, tok, cap, quota = sys.argv[1:11]
 json.dump({"apiUrl": api, "pat": pat, "runtimeUrl": rt or None, "stateDir": sys.argv[7], "proxyToken": tok or None,
-  "maxPerProject": int(cap) or None, "projects": {"a": json.loads(a), "b": json.loads(b)}}, open(out, "w"))
+  "maxPerProject": int(cap) or None, "tmpQuotaMb": int(quota), "projects": {"a": json.loads(a), "b": json.loads(b)}}, open(out, "w"))
 PY
 chmod 600 "$WORK/config.json"
 
 log "deploying project A (bundled here, DEPLOY_VIA=$DEPLOY_VIA)"
-for slug in hello onlya dbcheck crash spin hog readfs escape callout; do
+for slug in hello onlya dbcheck crash spin hog readfs escape callout tmpwrite stream; do
   deploy_a "$slug" || fail "deploy A/$slug"
 done
 deploy_a open --no-verify-jwt || fail "deploy A/open"
@@ -183,19 +186,30 @@ done
 deploy_b open --no-verify-jwt || fail "deploy B/open"
 if [[ $SANDBOXED_BUNDLER == 1 ]]; then
   log "the node's bundler cannot import another project's files"
-  # A relative import that climbs out of the upload. Bundled outside the sandbox it would resolve
-  # to project A's environment file (JWT secret, service key, database password) and the bundle
-  # would carry it out; inside, the file does not exist.
-  rel="../../../../../../../../../..$TENANTS/$REF_A/functions-env.json"
-  printf 'import secret from "%s" with { type: "json" }\nDeno.serve(() => Response.json(secret))\n' "$rel" >"$WORK/steal-index.ts"
-  out=$(curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $PAT" \
-    -F 'metadata={"entrypoint_path":"index.ts","name":"steal"};type=application/json' \
-    -F "file=@$WORK/steal-index.ts;filename=index.ts" "$API_URL/v1/projects/$REF_B/functions/deploy?slug=steal") || fail "curl: steal upload"
-  [[ $(tail -n1 <<<"$out") == 400 ]] || fail "an upload that imports another project's file answered: $out"
-  grep -q "Could not bundle" <<<"$out" || fail "the refusal does not say why: $out"
   jwt_a=$(jget 'd["projects"]["a"]["jwtSecret"]' <"$WORK/config.json")
-  if grep -qF "$jwt_a" <<<"$out"; then fail "the bundler's error shows project A's JWT secret"; fi
-  [[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$API_URL/v1/projects/$REF_B/functions/steal") == 404 ]] || fail "the refused upload was stored"
+  # An upload whose entrypoint imports $2 (a JSON module), sent to project B. Bundled outside the
+  # sandbox it would resolve to project A's environment file (JWT secret, service key, database
+  # password) and the bundle would carry it out; inside, the file is not there or cannot be opened.
+  try_steal() { # NAME IMPORT-SPECIFIER
+    printf 'import secret from "%s" with { type: "json" }\nDeno.serve(() => Response.json(secret))\n' "$2" >"$WORK/steal-index.ts"
+    out=$(curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $PAT" \
+      -F 'metadata={"entrypoint_path":"index.ts","name":"steal"};type=application/json' \
+      -F "file=@$WORK/steal-index.ts;filename=index.ts" "$API_URL/v1/projects/$REF_B/functions/deploy?slug=steal") || fail "curl: steal upload ($1)"
+    [[ $(tail -n1 <<<"$out") == 400 ]] || fail "an upload that imports another project's file ($1) answered: $out"
+    grep -q "Could not bundle" <<<"$out" || fail "the refusal ($1) does not say why: $out"
+    if grep -qF "$jwt_a" <<<"$out"; then fail "the bundler's error ($1) shows project A's JWT secret"; fi
+    if grep -q "SBCTL_FUNCTIONS_\|EDGE_RUNTIME_PORT" <<<"$out"; then fail "the bundler's error ($1) shows the environment of the runtime: $out"; fi
+    [[ $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PAT" "$API_URL/v1/projects/$REF_B/functions/steal") == 404 ]] || fail "the refused upload ($1) was stored"
+  }
+  try_steal "a relative path" "../../../../../../../../../..$TENANTS/$REF_A/functions-env.json"
+  # The same file through /proc/<pid>/root of a process of the node: a mount namespace does not
+  # hide it from a process with the uid of that process, so the bundler must run under another uid
+  # (and not see these processes at all). PROC_ESCAPE_PIDS lists the pids to try: the runtime's
+  # and the daemon's.
+  for pid in ${PROC_ESCAPE_PIDS:-}; do
+    try_steal "through /proc/$pid/root" "/proc/$pid/root$TENANTS/$REF_A/functions-env.json"
+    try_steal "through /proc/$pid/environ" "/proc/$pid/environ"
+  done
 fi
 
 log "setting secrets with the CLI"
@@ -208,7 +222,7 @@ log "functions list (CLI) and sbctl functions list"
 # Text on a terminal or in CI, JSON for agents: ask for JSON, the one format a script can read.
 sb "$WORK/work-a" functions list --project-ref "$REF_A" --output-format json | grep -q '"slug":"hello"' || fail "supabase functions list lacks hello"
 live=$(sbctl functions list "$REF_A" --json | jget 'sum(1 for r in d if r["live"])')
-[[ $live -eq 10 ]] || fail "sbctl functions list: $live of 10 functions live"
+[[ $live -eq 12 ]] || fail "sbctl functions list: $live of 12 functions live"
 
 log "files on disk"
 for ref in "$REF_A" "$REF_B"; do

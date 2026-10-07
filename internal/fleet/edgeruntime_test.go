@@ -51,6 +51,7 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 	cfg.Functions.CPUSoftMs, cfg.Functions.CPUHardMs, cfg.Functions.MaxParallelism = -1, 3000, 2
 	cfg.Functions.MaxPerProject, cfg.Functions.MaxWorkers, cfg.Functions.MaxWorkersPerProject = 200, 8, 3
 	cfg.Functions.MemoryMax = "3G"
+	cfg.Functions.TmpQuotaMB = 100
 	specs, err := r.m.Specs(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +81,8 @@ func TestEdgeRuntimeSpec(t *testing.T) {
 			"SBCTL_FUNCTIONS_MEMORY_MB": "128", "SBCTL_FUNCTIONS_WALL_CLOCK_SEC": "20", "SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC": "9",
 			"SBCTL_FUNCTIONS_CPU_SOFT_MS": "0", "SBCTL_FUNCTIONS_CPU_HARD_MS": "3000", "SBCTL_FUNCTIONS_MAX_PER_PROJECT": "200", "SBCTL_FUNCTIONS_MAX_WORKERS": "8",
 			"SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT": "3", "SBCTL_FUNCTIONS_WORKER_COST_MB": "320", // 2 per function x (128 + 32)
-			"DENO_DIR": filepath.Join(cfg.Paths().System(config.SvcEdgeRuntime), "deno"),
+			"SBCTL_FUNCTIONS_TMP_QUOTA_MB": "100",
+			"DENO_DIR":                     filepath.Join(cfg.Paths().System(config.SvcEdgeRuntime), "deno"),
 			// 8 workers x 2 per function: one thread for each isolate the budget allows.
 			"EDGE_RUNTIME_WORKER_POOL_SIZE": "16",
 		} {
@@ -119,7 +121,7 @@ func TestEdgeRuntimeSpecDefaults(t *testing.T) {
 	for _, s := range specs {
 		if s.Service == config.SvcEdgeRuntime {
 			if env := s.Env; env["SBCTL_FUNCTIONS_MEMORY_MB"] != "256" || env["SBCTL_FUNCTIONS_WALL_CLOCK_SEC"] != "400" ||
-				env["SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC"] != "150" || env["SBCTL_FUNCTIONS_CPU_SOFT_MS"] != "1000" || env["SBCTL_FUNCTIONS_CPU_HARD_MS"] != "2000" || env["SBCTL_FUNCTIONS_MAX_PER_PROJECT"] != "128" || env["SBCTL_FUNCTIONS_MAX_WORKERS"] != "16" || env["SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT"] != "8" || env["EDGE_RUNTIME_WORKER_POOL_SIZE"] != "16" {
+				env["SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC"] != "150" || env["SBCTL_FUNCTIONS_CPU_SOFT_MS"] != "1000" || env["SBCTL_FUNCTIONS_CPU_HARD_MS"] != "2000" || env["SBCTL_FUNCTIONS_MAX_PER_PROJECT"] != "128" || env["SBCTL_FUNCTIONS_MAX_WORKERS"] != "16" || env["SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT"] != "8" || env["EDGE_RUNTIME_WORKER_POOL_SIZE"] != "16" || env["SBCTL_FUNCTIONS_TMP_QUOTA_MB"] != "64" {
 				t.Errorf("env %v", env)
 			}
 			if !strings.Contains(strings.Join(s.Exec, " "), "--max-parallelism 1") {

@@ -136,3 +136,19 @@ export function writeFunction(
 ): Promise<string> {
   return writeBundle(root, ref, slug, new TextEncoder().encode('ESZIP2.3 placeholder'), opts)
 }
+
+/**
+ * Wraps a handler so that every response is read to its end, as the HTTP server does for a
+ * client that is listening. The handler holds a request's place in its budgets until the
+ * body has been delivered, so a test that only looks at the status would never free it. The
+ * caller still gets an unread response.
+ */
+export function draining(
+  handle: (r: Request) => Promise<Response>,
+): (r: Request) => Promise<Response> {
+  return async (req) => {
+    const res = await handle(req)
+    await res.clone().arrayBuffer()
+    return res
+  }
+}

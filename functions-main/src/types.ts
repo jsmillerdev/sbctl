@@ -59,6 +59,12 @@ export interface Limits {
   maxBundleBytes: number
   cpuTimeSoftLimitMs: number
   cpuTimeHardLimitMs: number
+  /**
+   * Bytes a worker may write to /tmp, its only writable file system (0: no quota). The runtime
+   * backs it with real files on the node's disk, so without a quota one function can fill the
+   * disk that holds every project's database.
+   */
+  tmpQuotaBytes: number
 }
 
 /** The options handed to EdgeRuntime.userWorkers.create. */
@@ -75,6 +81,8 @@ export interface WorkerOptions {
   cpuTimeHardLimitMs: number
   noModuleCache: boolean
   forceCreate: boolean
+  /** The worker's /tmp (UserWorkerCreateOptions.tmp_fs_config of the runtime). */
+  tmpFsConfig?: { quota: number }
   context: {
     projectRef: string
     supervisor: { requestAbsentTimeoutMs: number }

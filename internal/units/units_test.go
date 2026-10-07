@@ -429,3 +429,27 @@ func TestTemplatesContainment(t *testing.T) {
 		}
 	}
 }
+
+// A launcher that a unit under another uid executes (sb-edge-bundle.service, a dynamic user) is
+// world-readable; every other launcher stays private to the sbctl user. The environment file is
+// 0600 either way: systemd reads it as root.
+func TestRenderPublicRunMode(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	for _, public := range []bool{false, true} {
+		spec := Spec{Service: config.SvcEdgeBundle, ArtifactDir: "/art", Exec: []string{"bin/edge-runtime", "bundle"}, Env: map[string]string{"K": "secret"}, PublicRun: public}
+		if _, err := renderFiles(cfg, spec); err != nil {
+			t.Fatal(err)
+		}
+		f := FilesFor(cfg, spec)
+		want := os.FileMode(0o750)
+		if public {
+			want = 0o755
+		}
+		for p, w := range map[string]os.FileMode{f.Run: want, f.Env: 0o600} {
+			if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != w {
+				t.Errorf("public=%v %s: %v %v, want %v", public, p, fi, err, w)
+			}
+		}
+	}
+}

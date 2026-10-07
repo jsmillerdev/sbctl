@@ -9,11 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/andybalholm/brotli"
 
+	"github.com/OWNER/sbctl/deploy/systemd"
 	"github.com/OWNER/sbctl/internal/api"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/units"
@@ -313,6 +315,154 @@ func TestBundlerWithASandboxedSupervisorNeedsNoOptOut(t *testing.T) {
 	r.cfg.Functions.BundleUnsandboxed = false
 	if _, err := NewBundler(r.cfg, sandboxedSup{r.sup}, dirs{}, nil); err != nil {
 		t.Fatalf("a sandboxed supervisor was refused: %v", err)
+	}
+}
+
+// layoutSup runs the exec backend as if it were the sandboxed systemd one and records what the
+// scratch directory looks like when the unit starts: that is what the unit's own uid gets to see.
+type layoutSup struct {
+	*recordingSup
+	cfg    *config.Config
+	mu     sync.Mutex
+	layout map[string]os.FileMode
+	runDir os.FileMode
+}
+
+func (*layoutSup) Sandboxed() bool { return true }
+
+func (l *layoutSup) Start(ctx context.Context, unit string) error {
+	work := filepath.Join(l.cfg.Paths().EdgeBundleDir(), "work")
+	layout := map[string]os.FileMode{}
+	_ = filepath.WalkDir(work, func(p string, d os.DirEntry, err error) error {
+		if err == nil {
+			if fi, ierr := d.Info(); ierr == nil {
+				rel, _ := filepath.Rel(work, p)
+				layout[rel] = fi.Mode()
+			}
+		}
+		return nil
+	})
+	l.mu.Lock()
+	l.layout = layout
+	if fi, err := os.Stat(units.FilesFor(l.cfg, l.last).Run); err == nil {
+		l.runDir = fi.Mode()
+	}
+	l.mu.Unlock()
+	// The exec backend reports a launcher that is quick as failed; the unit would not.
+	if err := l.recordingSup.Start(ctx, unit); err != nil && !strings.Contains(err.Error(), "exited right after start") {
+		return err
+	}
+	return nil
+}
+
+func (l *layoutSup) Status(ctx context.Context, unit string) (units.Status, error) {
+	st, err := l.recordingSup.Status(ctx, unit)
+	if st.State == units.StateFailed {
+		st.State = units.StateInactive
+	}
+	return st, err
+}
+
+// The bundler's unit runs under a uid of its own (see sb-edge-bundle.service), so the daemon hands
+// it what it needs through the modes of files: readable sources it cannot change, an output
+// directory it cannot create anything in, and two files it can write.
+func TestBundlerHandsTheUnitsUidWhatItNeedsAndNothingElse(t *testing.T) {
+	r := newBundlerRig(t)
+	r.cfg.Functions.BundleUnsandboxed = false
+	ls := &layoutSup{recordingSup: r.sup, cfg: r.cfg}
+	b, err := NewBundler(r.cfg, ls, dirs{config.SvcEdgeRuntime: r.art}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The daemon's umask hides group and other from everything it creates.
+	old := syscall.Umask(0o027)
+	defer syscall.Umask(old)
+	if _, _, err := b.Bundle(context.Background(), BundleInput{Entrypoint: "a/b/index.ts", Files: []api.FunctionFile{
+		{Path: "a/b/index.ts", Content: []byte("import '../x.ts'")}, {Path: "a/x.ts", Content: []byte("export {}")}}}); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing in the unit's reach may be writable by anyone but the daemon, except the two files.
+	want := map[string]os.FileMode{
+		".": os.ModeDir | 0o755, "src": os.ModeDir | 0o755, "src/a": os.ModeDir | 0o755, "src/a/b": os.ModeDir | 0o755,
+		"src/a/b/index.ts": 0o644, "src/a/x.ts": 0o644,
+		"out": os.ModeDir | 0o755, "out/out.eszip": 0o666, "out/bundle.log": 0o666,
+	}
+	if len(ls.layout) != len(want) {
+		t.Errorf("layout %v", ls.layout)
+	}
+	for p, m := range want {
+		if got := ls.layout[p]; got != m {
+			t.Errorf("%s: mode %v, want %v", p, got, m)
+		}
+	}
+	// The launcher is executed by that uid too; its environment file is not (systemd reads it).
+	if ls.runDir.Perm() != 0o755 {
+		t.Errorf("launcher mode %v, want 0755", ls.runDir.Perm())
+	}
+	spec := ls.last
+	if !spec.PublicRun {
+		t.Error("the launcher is not marked public")
+	}
+	if spec.Env["DENO_DIR"] != "/var/cache/sb-edge-bundle/deno" || spec.Env["HOME"] != "/var/cache/sb-edge-bundle" || spec.WorkDir != "/tmp" {
+		t.Errorf("a sandboxed bundle must use the unit's own cache and /tmp: %v workdir %q", spec.Env, spec.WorkDir)
+	}
+	// The output files are where the unit binds its one writable directory.
+	out := false
+	for i, a := range spec.Exec {
+		if a == "--output" && strings.HasSuffix(spec.Exec[i+1], "/work/out/out.eszip") {
+			out = true
+		}
+	}
+	if !out || !strings.HasSuffix(spec.Log, "/work/out/bundle.log") {
+		t.Errorf("output %v, log %q", spec.Exec, spec.Log)
+	}
+	if fi, err := os.Stat(units.FilesFor(r.cfg, spec).Env); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("env file: %v %v", fi, err)
+	}
+}
+
+// The unit file and the bundler must agree: a unit that ran as the sbctl user again, or that
+// bound the whole state directory, would reopen the /proc and path escapes.
+func TestBundleUnitIsolatesTheBundlerFromTheNode(t *testing.T) {
+	b, err := systemd.Read("sb-edge-bundle.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	val := func(key string) string {
+		for _, l := range strings.Split(body, "\n") {
+			if v, ok := strings.CutPrefix(l, key+"="); ok {
+				return v
+			}
+		}
+		return ""
+	}
+	// Another uid than the sbctl user's: the kernel refuses /proc/<pid>/root and environ of the
+	// processes of sbctl's units and the daemon, and /proc shows none of them.
+	for k, v := range map[string]string{"DynamicUser": "yes", "ProtectProc": "invisible", "ProcSubset": "pid", "NoNewPrivileges": "yes", "TemporaryFileSystem": "/var/lib/sbctl:ro"} {
+		if val(k) != v {
+			t.Errorf("%s=%q, want %q", k, val(k), v)
+		}
+	}
+	for _, k := range []string{"User", "Group", "SupplementaryGroups"} {
+		if val(k) != "" {
+			t.Errorf("%s=%s: the unit must not run as the sbctl user or in its group", k, val(k))
+		}
+	}
+	ro := strings.Fields(val("BindReadOnlyPaths"))
+	wantRO := []string{"/var/lib/sbctl/artifacts", "/var/lib/sbctl/projects/system/edge-bundle.run", "/var/lib/sbctl/system/edge-bundle/work/src"}
+	if strings.Join(ro, " ") != strings.Join(wantRO, " ") {
+		t.Errorf("BindReadOnlyPaths %v, want %v", ro, wantRO)
+	}
+	if rw := strings.Fields(val("BindPaths")); len(rw) != 1 || rw[0] != "/var/lib/sbctl/system/edge-bundle/work/out" || val("ReadWritePaths") != rw[0] {
+		t.Errorf("BindPaths %q ReadWritePaths %q: only the output directory may be writable", val("BindPaths"), val("ReadWritePaths"))
+	}
+	// The cache path the bundler puts in the environment is the unit's CacheDirectory.
+	if sandboxCacheDir != "/var/cache/"+val("CacheDirectory") || !strings.Contains(body, sandboxCacheDir) {
+		t.Errorf("CacheDirectory=%s does not match %s", val("CacheDirectory"), sandboxCacheDir)
+	}
+	if got := config.Default().Paths().System(config.SvcEdgeBundle); got != "/var/lib/sbctl/system/edge-bundle" {
+		t.Errorf("state directory %s no longer matches the unit's bind paths", got)
 	}
 }
 

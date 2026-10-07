@@ -40,6 +40,7 @@ export function loadConfig(get: (name: string) => string | undefined): MainConfi
       maxBundleBytes: intEnv(get, 'SBCTL_FUNCTIONS_MAX_BUNDLE_MB', 192) * 1024 * 1024,
       cpuTimeSoftLimitMs: intEnv(get, 'SBCTL_FUNCTIONS_CPU_SOFT_MS', 1000),
       cpuTimeHardLimitMs: intEnv(get, 'SBCTL_FUNCTIONS_CPU_HARD_MS', 2000),
+      tmpQuotaBytes: intEnv(get, 'SBCTL_FUNCTIONS_TMP_QUOTA_MB', 64) * 1024 * 1024,
     },
   }
 }

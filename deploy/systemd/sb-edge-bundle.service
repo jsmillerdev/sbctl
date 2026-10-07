@@ -6,19 +6,37 @@ StartLimitIntervalSec=0
 
 [Service]
 # Started by the Management API for one upload at a time (sbctl renders the two files below, and
-# the upload under /var/lib/sbctl/system/edge-bundle/work, before it starts the unit). It runs
-# "edge-runtime bundle", which parses the function's modules and writes one eszip file; it does
-# not run any of the function's code.
+# lays the upload out under /var/lib/sbctl/system/edge-bundle/work, before it starts the unit). It
+# runs "edge-runtime bundle", which parses the function's modules and writes one eszip file; it
+# does not run any of the function's code.
 #
 # The sources are another person's code and their imports are paths: a function can import
-# "../../../<other project>/functions-env.json" or any other file the sbctl user can read, and
-# the bundle would carry it out to the uploader. So this unit sees nothing of the node but its
-# own scratch directory and the artifacts.
+# "../../../<other project>/functions-env.json" or any other file this unit's user can read, and
+# the bundle would carry it out to the uploader. Two things keep that from working:
+#
+#  1. The mount namespace shows nothing of the node but the upload and the artifacts
+#     (TemporaryFileSystem, below).
+#  2. The unit runs under a uid of its own (DynamicUser), not the sbctl user. Every other unit and
+#     the daemon run as sbctl, and a process may open /proc/<pid>/root and /proc/<pid>/environ of
+#     every process with its own uid, which walks straight around a mount namespace (an upload
+#     could import /proc/<pid of sb-edge-runtime>/root/var/lib/sbctl/system/edge-runtime/tenants/
+#     <ref>/functions-env.json and the bundle would carry the keys of every project out). With
+#     another uid the kernel refuses (ptrace_may_access), and ProtectProc=invisible with
+#     ProcSubset=pid hide the processes of the node from /proc altogether.
+#
+# What the unit's uid can read and write is handed over by the daemon (internal/functions/bundler.go):
+# the sources in work/src (world-readable, owned by sbctl, read-only here) and two files it creates
+# in work/out and makes world-writable, the eszip and the log. The uid owns nothing in the state
+# directory, so it cannot make or replace anything there. Its module cache lives in
+# /var/cache/sb-edge-bundle (CacheDirectory, private to the uid) and is emptied before a start
+# when it has passed 512 MiB.
 Type=oneshot
-User=sbctl
-Group=sbctl
+DynamicUser=yes
 Slice=sbctl.slice
 EnvironmentFile=/var/lib/sbctl/projects/system/edge-bundle.env
+CacheDirectory=sb-edge-bundle
+CacheDirectoryMode=0700
+ExecStartPre=/bin/sh -c 'test "$$(du -sk /var/cache/sb-edge-bundle | cut -f1)" -le 524288 || find /var/cache/sb-edge-bundle -mindepth 1 -delete'
 ExecStart=/var/lib/sbctl/projects/system/edge-bundle.run
 # A bundle that has not finished in this time is killed; the API's request gives up at about the same time.
 TimeoutStartSec=150s
@@ -35,7 +53,8 @@ TasksMax=512
 LimitNOFILE=4096
 SyslogIdentifier=sb-edge-bundle
 
-# Hardening, as sb-edge-runtime.service.
+# Hardening, as sb-edge-runtime.service (DynamicUser implies ProtectSystem=strict, PrivateTmp,
+# NoNewPrivileges, RestrictSUIDSGID and RemoveIPC).
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -46,6 +65,10 @@ ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
+# Only this unit's own processes are visible in /proc (the processes of sbctl's units are not
+# listed and cannot be opened by number), and /proc has only the per-process directories.
+ProtectProc=invisible
+ProcSubset=pid
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
@@ -62,11 +85,13 @@ UMask=0027
 IPAddressDeny=169.254.169.254 localhost
 IPAddressAllow=127.0.0.53 127.0.0.54
 # Containment (allowlist), as sb-edge-runtime.service: an empty tmpfs where /var/lib/sbctl is,
-# the artifacts and the launcher read-only, and the one directory this unit works in.
+# the artifacts and the launcher read-only, the sources read-only and the one directory the
+# result goes to. The state directory of the unit itself (system/edge-bundle) is not bound
+# as a whole.
 InaccessiblePaths=-/etc/sbctl
 TemporaryFileSystem=/var/lib/sbctl:ro
-BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/system/edge-bundle.run
-BindPaths=/var/lib/sbctl/system/edge-bundle
-ReadWritePaths=/var/lib/sbctl/system/edge-bundle
+BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/system/edge-bundle.run /var/lib/sbctl/system/edge-bundle/work/src
+BindPaths=/var/lib/sbctl/system/edge-bundle/work/out
+ReadWritePaths=/var/lib/sbctl/system/edge-bundle/work/out
 
 # Never enabled: the API starts it when someone uploads sources.

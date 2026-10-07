@@ -16,6 +16,10 @@ const (
 	DefaultFunctionsIdleTimeoutSec = 150
 	DefaultFunctionsCPUSoftMs      = 1000
 	DefaultFunctionsCPUHardMs      = 2000
+	// DefaultFunctionsTmpQuotaMB is what one worker may write to /tmp, its only writable
+	// file system. Hosted Edge Functions allow 256 MB; 64 keeps max_workers (16) x quota at
+	// 1 GiB of the node's disk, which also holds every project's database.
+	DefaultFunctionsTmpQuotaMB = 64
 	// DefaultFunctionsMaxParallelism is the workers one function may have at once. The
 	// runtime's per_worker policy sends every request of a function to its one worker, so a
 	// second one exists only for a moment (a cold burst); 1 keeps the memory budget exact.
@@ -59,6 +63,14 @@ type Functions struct {
 	// a negative value switches the limit off.
 	CPUSoftMs int `toml:"cpu_soft_ms"`
 	CPUHardMs int `toml:"cpu_hard_ms"`
+	// TmpQuotaMB is how many MB one worker may write to /tmp. The runtime backs a worker's
+	// /tmp with real files on the node's disk (shared with every project's Postgres data
+	// and WAL) and puts no limit on it by itself, so the main service passes this quota when
+	// it creates a worker; a write past it fails inside that function only. At most
+	// max_workers x tmp_quota_mb can be in use at once (not checked against the free space of
+	// the disk). Zero means DefaultFunctionsTmpQuotaMB; negative switches the quota off,
+	// which is for a development machine.
+	TmpQuotaMB int `toml:"tmp_quota_mb"`
 	// MaxParallelism is how many workers ONE function (one deployment of one slug of one
 	// project) may have at once: edge-runtime's --max-parallelism, which in v1.77.4 is a
 	// semaphore per pool key, not a limit on the runtime. Zero means
@@ -120,6 +132,9 @@ func (f Functions) WallClock() int {
 func (f Functions) IdleTimeout() int {
 	return orDefault(f.IdleTimeoutSeconds, DefaultFunctionsIdleTimeoutSec)
 }
+
+// TmpQuota returns the quota of a worker's /tmp in MB with the default applied; 0 means off.
+func (f Functions) TmpQuota() int { return limitOrOff(f.TmpQuotaMB, DefaultFunctionsTmpQuotaMB) }
 
 // CPUSoft returns the soft CPU limit in ms; 0 means off.
 func (f Functions) CPUSoft() int { return limitOrOff(f.CPUSoftMs, DefaultFunctionsCPUSoftMs) }

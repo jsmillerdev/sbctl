@@ -3,6 +3,7 @@
 // header that sbctl's proxy sets (and overwrites when a client sends one).
 
 import { authErrorResponse, ErrorCode, ErrorCodes, extractToken, verifyJWT } from './auth.ts'
+import { releaseWhenDone } from './body.ts'
 import { ProjectLimiter } from './limiter.ts'
 import { ProjectStore, validRef, validSlug } from './projects.ts'
 import type {
@@ -19,6 +20,8 @@ export const TENANT_HEADER = 'x-sbctl-project-ref'
 /** The secret the proxy sends with every request (SBCTL_FUNCTIONS_PROXY_TOKEN). */
 export const PROXY_TOKEN_HEADER = 'x-sbctl-proxy-token'
 export const MAX_WORKER_RETRIES = 3
+/** How long past the worker's wall clock a response may hold its place in the budget. */
+export const HOLD_GRACE_MS = 5_000
 
 export interface HandlerDeps {
   store: ProjectStore
@@ -164,6 +167,9 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
         noModuleCache: false,
         forceCreate: false,
         permissions: workerPermissions(deps.port ?? ''),
+        // A worker's /tmp is a real directory on the node's disk, shared with Postgres and its
+        // WAL, and the runtime puts no limit on it unless asked to.
+        ...(limits.tmpQuotaBytes > 0 ? { tmpFsConfig: { quota: limits.tmpQuotaBytes } } : {}),
         context: {
           projectRef: ref,
           supervisor: { requestAbsentTimeoutMs: limits.requestAbsentTimeoutMs },
@@ -288,10 +294,19 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
       )
     }
     const { release } = admission
+    let res: Response
     try {
-      return await callWorker(req, ref, slug, info, env)
-    } finally {
+      res = await callWorker(req, ref, slug, info, env)
+    } catch (e) {
       release()
+      throw e
     }
+    // The place in the budget is held until the body has been delivered: the worker stays
+    // alive while a streamed response runs.
+    return releaseWhenDone(
+      res,
+      release,
+      limits.workerTimeoutMs > 0 ? limits.workerTimeoutMs + HOLD_GRACE_MS : 0,
+    )
   }
 }

@@ -136,16 +136,80 @@ log "tests/functions/run.sh"
 export SBCTL_RUN="sudo -u $SBCTL_USER -H /usr/local/bin/sbctl" AS_SBCTL="sudo -u $SBCTL_USER"
 export API_URL="http://api.$DOMAIN:$P_HTTP" PAT_FILE PROJECT_URL="http://{ref}.api.$DOMAIN:$P_HTTP"
 export REF_A REF_B STATE_DIR=$SBCTL_STATE RUNTIME_URL="http://127.0.0.1:$P_EDGE" WORK="$LOG_DIR/functions-work" SANDBOXED_BUNDLER=1 MAX_PER_PROJECT=8
+# Processes of the node whose /proc/<pid>/root and environ an uploaded source tries to import: the
+# runtime (it holds every project's environment) and the daemon, both of the sbctl user.
+RT_PID=$(systemctl show -p MainPID --value "$U")
+DAEMON_PID=$(pgrep -u "$SBCTL_USER" -f 'sbctl functions dev' | head -1)
+[[ $RT_PID -gt 0 && -n $DAEMON_PID ]] || fail "no pid for the runtime ($RT_PID) or the daemon ($DAEMON_PID)"
+export PROC_ESCAPE_PIDS="$RT_PID $DAEMON_PID"
 "$REPO_ROOT/tests/functions/run.sh" || fail "tests/functions/run.sh"
 
 log "the bundler unit ran for project B's uploads and is idle now"
 B=sb-edge-bundle.service
 [[ $(unit_state "$B") == inactive ]] || fail "$B is $(unit_state "$B")"
 [[ $(systemctl show -p Result --value "$B") == success ]] || fail "$B: last result $(systemctl show -p Result --value "$B")"
-[[ $(systemctl show -p User --value "$B") == "$SBCTL_USER" ]] || fail "$B does not run as $SBCTL_USER"
+# Another uid than the sbctl user: the kernel then refuses /proc/<pid>/root and environ of every
+# process of the node (below), and /proc shows none of them.
+[[ $(systemctl show -p DynamicUser --value "$B") == yes && -z $(systemctl show -p User --value "$B") ]] || fail "$B does not run under a uid of its own"
+[[ $(systemctl show -p ProtectProc --value "$B") == invisible && $(systemctl show -p ProcSubset --value "$B") == pid ]] || fail "$B: ProtectProc/ProcSubset not applied"
 [[ $(systemctl show -p MemoryMax --value "$B") == 1073741824 ]] || fail "$B: MemoryMax $(systemctl show -p MemoryMax --value "$B")"
 systemctl show -p IPAddressDeny --value "$B" | grep -q . || fail "$B has no IPAddressDeny"
 [[ ! -e $SBCTL_STATE/system/edge-bundle/work ]] || fail "the scratch directory of an upload stayed in $SBCTL_STATE/system/edge-bundle"
+
+log "the bundler's uid cannot read the node's files or the processes of its units"
+# The real unit, with its ExecStart replaced by a probe (a drop-in, removed afterwards), so the
+# probe runs as the bundler does: same uid, namespace, /proc and cache directory. It exits 3 when
+# it could read something it must not, which fails this start (1 is a bad upload, see the unit).
+install -d /run/systemd/system/$B.d
+cat >/usr/local/sbin/sbctl-bundle-probe <<'PROBE'
+#!/bin/sh
+bad=0
+violate() { echo "probe: VIOLATION: $*"; bad=1; }
+ok() { echo "probe: ok $*"; }
+[ "$(id -u)" != "$PROBE_SBCTL_UID" ] && ok "runs under uid $(id -u), not the sbctl user's $PROBE_SBCTL_UID" || violate "runs as the sbctl uid"
+# Controls: what the unit may do works, so the refusals below say something.
+cat /proc/self/environ >/dev/null 2>&1 && ok "reads its own /proc/self/environ" || violate "cannot read /proc/self/environ (control)"
+ls /var/lib/sbctl/artifacts >/dev/null 2>&1 && ok "reads the artifacts" || violate "cannot read the artifacts (control)"
+touch /var/cache/sb-edge-bundle/probe 2>/dev/null && ok "writes its cache directory" || violate "cannot write /var/cache/sb-edge-bundle (control)"
+touch /var/lib/sbctl/system/edge-bundle/work/out/probe 2>/dev/null && ok "writes the output directory" || violate "cannot write the output directory (control)"
+# What it must not do.
+touch /var/lib/sbctl/system/edge-bundle/work/src/probe 2>/dev/null && violate "writes the sources"
+env_file="$PROBE_TENANTS/$PROBE_REF/functions-env.json"
+cat "$env_file" >/dev/null 2>&1 && violate "reads $env_file"
+for pid in $PROBE_RT_PID $PROBE_DAEMON_PID; do
+  [ -e "/proc/$pid" ] && violate "/proc/$pid is visible"
+  cat "/proc/$pid/environ" >/dev/null 2>&1 && violate "reads /proc/$pid/environ"
+  ls "/proc/$pid/root/" >/dev/null 2>&1 && violate "lists /proc/$pid/root/"
+  cat "/proc/$pid/root$env_file" >/dev/null 2>&1 && violate "reads $env_file through /proc/$pid/root"
+done
+[ -e /proc/1 ] && violate "/proc/1 is visible"
+[ -e /proc/meminfo ] && violate "/proc/meminfo is visible (ProcSubset=pid)"
+n=$(ls /proc | grep -c '^[0-9][0-9]*$')
+[ "$n" -le 8 ] && ok "/proc lists $n processes, all of them this unit's" || violate "/proc lists $n processes"
+for d in /var/lib/sbctl/backups /var/lib/sbctl/certs /var/lib/sbctl/projects/system/edge-runtime.env /var/lib/sbctl/system/edge-runtime /etc/sbctl/master.key; do
+  [ -e "$d" ] && violate "sees $d"
+done
+[ "$bad" = 0 ] && exit 0 || exit 3
+PROBE
+chmod 0755 /usr/local/sbin/sbctl-bundle-probe
+install -d -o "$SBCTL_USER" -g "$SBCTL_USER" -m 0755 "$SBCTL_STATE/system/edge-bundle/work/src" "$SBCTL_STATE/system/edge-bundle/work/out"
+cat >/run/systemd/system/$B.d/90-probe.conf <<CONF
+[Service]
+Environment=PROBE_RT_PID=$RT_PID PROBE_DAEMON_PID=$DAEMON_PID PROBE_SBCTL_UID=$(id -u "$SBCTL_USER") PROBE_TENANTS=$SBCTL_STATE/system/edge-runtime/tenants PROBE_REF=$REF_A
+ExecStart=
+ExecStart=/usr/local/sbin/sbctl-bundle-probe
+CONF
+systemctl daemon-reload
+# The unit does not run as the daemon would start it (no upload): a sbctl-owned work/src and work/out
+# stand in for what the daemon lays out. A start by root is fine for the probe.
+if ! systemctl start "$B"; then
+  journalctl -u "$B" -n 60 --no-pager -o cat >&2 || true
+  fail "the bundler's uid could read what it must not (see the probe lines above), or the probe did not run"
+fi
+journalctl -u "$B" -n 40 --no-pager -o cat | grep '^probe: ' >&2 || fail "the probe printed nothing"
+rm -rf /run/systemd/system/$B.d /usr/local/sbin/sbctl-bundle-probe "$SBCTL_STATE/system/edge-bundle/work"
+systemctl daemon-reload
+[[ -z $(systemctl show -p DropInPaths --value "$B") ]] || fail "the probe drop-in is still in place"
 
 log "crash recovery: kill -9 of the runtime"
 open_code() { http_code "http://$REF_A.api.$DOMAIN:$P_HTTP/functions/v1/open"; }
