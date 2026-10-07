@@ -161,59 +161,6 @@ got=$(curl -fsS --max-time 20 -H "x-forwarded-host: $HOST" "http://127.0.0.1:$P_
 [[ -n $(find "$SBCTL_STATE/system/storage/objects" -type d -name "$REF" 2>/dev/null) ]] || fail "no object directory for $REF"
 
 log "realtime: join a channel (tenant from the Host header, JWT from the project)"
-ws_join() { # PORT HOST ANON: exits 0 when the server answers phx_join with status ok
-  python3 - "$@" <<'PY'
-import base64, json, os, socket, struct, sys
-port, host, anon = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-s = socket.create_connection(("127.0.0.1", port), timeout=20)
-key = base64.b64encode(os.urandom(16)).decode()
-s.sendall((f"GET /socket/websocket?apikey={anon}&vsn=1.0.0 HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
-           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
-buf = b""
-while b"\r\n\r\n" not in buf:
-    chunk = s.recv(4096)
-    if not chunk:
-        sys.exit("closed during handshake: %r" % buf)
-    buf += chunk
-head, rest = buf.split(b"\r\n\r\n", 1)
-if b" 101 " not in head.split(b"\r\n")[0]:
-    sys.exit("handshake refused: %r" % head.split(b"\r\n")[0])
-def send(text):
-    p = text.encode(); mask = os.urandom(4)
-    n = len(p)
-    hdr = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
-    s.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(p)))
-def need(n):
-    global rest
-    while len(rest) < n:
-        chunk = s.recv(4096)
-        if not chunk:
-            sys.exit("connection closed")
-        rest += chunk
-    out, rest = rest[:n], rest[n:]
-    return out
-def frame():
-    b0, b1 = need(2)
-    n = b1 & 0x7F
-    if n == 126: n = struct.unpack(">H", need(2))[0]
-    elif n == 127: n = struct.unpack(">Q", need(8))[0]
-    payload = need(n)
-    return b0 & 0x0F, payload
-send(json.dumps({"topic": "realtime:smoke", "event": "phx_join", "ref": "1", "join_ref": "1", "payload": {
-    "config": {"broadcast": {"self": False, "ack": False}, "presence": {"key": ""}, "postgres_changes": [], "private": False},
-    "access_token": anon}}))
-for _ in range(20):
-    op, payload = frame()
-    if op != 1:
-        continue
-    msg = json.loads(payload)
-    if msg.get("event") == "phx_reply" and msg.get("ref") == "1":
-        if msg["payload"].get("status") == "ok":
-            print("joined"); sys.exit(0)
-        sys.exit("join refused: %s" % payload.decode())
-sys.exit("no reply to phx_join")
-PY
-}
 ws_join "$P_REALTIME" "$REF.realtime.internal" "$ANON" || fail "realtime join"
 if ws_join "$P_REALTIME" "abcdefghijklmnopqrst.realtime.internal" "$ANON" >/dev/null 2>&1; then
   fail "realtime accepted a token for an unknown tenant"
