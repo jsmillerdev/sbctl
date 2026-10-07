@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jsmillerdev/supavise/internal/artifacts"
 	"github.com/jsmillerdev/supavise/internal/config"
@@ -1037,5 +1038,52 @@ func TestEnsureTenantsRegistersActiveProjectsOnly(t *testing.T) {
 	errs := h.e.EnsureTenants(ctx)
 	if len(errs) != 2 || errs[h.ref] == nil || errs[p2.Ref] == nil {
 		t.Fatalf("errors by ref = %v", errs)
+	}
+}
+
+// A node upgrade backs every project up first and tells each project upgrade to use that backup:
+// a second one would double the time the rollout takes, and the archived WAL carries the restore up
+// to the moment of the upgrade. A backup from before the run does not count.
+func TestUpgradeReusesTheBackupOfTheRun(t *testing.T) {
+	ctx := context.Background()
+	since := time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)
+	add := func(h *upHarness, finished time.Time, status registry.BackupStatus) int64 {
+		b := &registry.Backup{Ref: h.ref, Kind: "base", Status: status, StartedAt: finished.Add(-time.Minute), FinishedAt: &finished}
+		if err := h.reg.CreateBackup(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+		return b.ID
+	}
+	run := func(h *upHarness) *registry.Upgrade {
+		up, err := h.e.UpgradeProjectWith(ctx, h.ref, UpgradeRequest{ReuseBackupSince: since})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return up
+	}
+
+	h := newUpHarness(t)
+	id := add(h, since.Add(10*time.Minute), registry.BackupCompleted)
+	if up := run(h); up.BackupID != id || len(h.backup.calls) != 0 {
+		t.Fatalf("backup id %d (want %d), new backups %v: the run's backup was not reused", up.BackupID, id, h.backup.calls)
+	}
+
+	h = newUpHarness(t)
+	add(h, since.Add(-time.Hour), registry.BackupCompleted)
+	if up := run(h); up.BackupID != 42 || len(h.backup.calls) != 1 {
+		t.Fatalf("backup id %d, new backups %v: a backup from before the run was reused", up.BackupID, h.backup.calls)
+	}
+
+	h = newUpHarness(t)
+	add(h, since.Add(time.Minute), registry.BackupFailed)
+	if up := run(h); up.BackupID != 42 || len(h.backup.calls) != 1 {
+		t.Fatalf("backup id %d, new backups %v: a failed backup was reused", up.BackupID, h.backup.calls)
+	}
+
+	// Without the request an upgrade always takes its own.
+	h = newUpHarness(t)
+	add(h, since.Add(time.Minute), registry.BackupCompleted)
+	if _, err := h.e.UpgradeProjectWith(ctx, h.ref, UpgradeRequest{}); err != nil || len(h.backup.calls) != 1 {
+		t.Fatalf("err %v, new backups %v", err, h.backup.calls)
 	}
 }

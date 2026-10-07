@@ -263,3 +263,22 @@ func TestGates(t *testing.T) {
 		t.Fatalf("a local backup copy of 240 GiB (about 120 GiB compressed) does not fit in 100 GiB: %+v", g)
 	}
 }
+
+// A service the node never rendered (no dashboard installed, no Edge Functions) has no unit to
+// move, whatever the release pins.
+func TestPlanLeavesOutServicesTheNodeDoesNotRun(t *testing.T) {
+	n := testNode()
+	delete(n.Pins, "studio")
+	p := BuildPlan(n, newInfo(), PlanOptions{})
+	for _, m := range p.Shared {
+		if m.Service == "studio" {
+			t.Fatalf("Studio is in the plan of a node without it: %+v", p.Shared)
+		}
+	}
+	if len(p.Shared) == 0 {
+		t.Fatal("the services the node does run were left out too")
+	}
+	if !Finished(PhaseDone) || !Finished(PhaseRolledBack) || !Finished(PhaseFailed) || !Finished(PhaseRefused) || Finished(PhaseProjects) || Finished(PhaseRollingBack) {
+		t.Fatal("Finished")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
 )
@@ -61,10 +62,15 @@ func TestReleaseInfoReportsThePins(t *testing.T) {
 }
 
 func TestUpgradeProjectsArgs(t *testing.T) {
-	got := strings.Join(upgradeProjectsArgs(map[string]string{"postgrest": "postgrest-v16.4-r0", "gotrue": "auth-v2.195.0-r1"}), " ")
+	target := map[string]string{"postgrest": "postgrest-v16.4-r0", "gotrue": "auth-v2.195.0-r1"}
+	got := strings.Join(upgradeProjectsArgs(target, time.Time{}), " ")
 	want := "projects upgrade --all --yes --no-gc --to gotrue=auth-v2.195.0-r1 --to postgrest=postgrest-v16.4-r0"
 	if got != want {
 		t.Fatalf("args = %q, want %q", got, want)
+	}
+	since := time.Date(2026, 10, 12, 20, 0, 0, 0, time.FixedZone("x", 3600))
+	if got := strings.Join(upgradeProjectsArgs(target, since), " "); !strings.HasSuffix(got, "--reuse-backup-since 2026-10-12T19:00:00Z") {
+		t.Fatalf("args with a backup time = %q", got)
 	}
 	// Without --include-postgres the target has no postgres, so a project keeps its PostgreSQL.
 	if strings.Contains(got, "postgres=") {

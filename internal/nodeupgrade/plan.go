@@ -85,7 +85,11 @@ func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 			p.System = append(p.System, m)
 		case config.SvcPostgREST:
 		default:
-			p.Shared = append(p.Shared, m)
+			// A shared service the node never rendered (no dashboard on this node, no Edge
+			// Functions) has no unit to move.
+			if m.From != "" {
+				p.Shared = append(p.Shared, m)
+			}
 		}
 	}
 	for _, m := range p.System {

@@ -59,6 +59,15 @@ const (
 	PhaseRefused    = "refused"
 )
 
+// Finished reports whether phase ends an upgrade.
+func Finished(phase string) bool {
+	switch phase {
+	case PhaseDone, PhaseRolledBack, PhaseFailed, PhaseRefused:
+		return true
+	}
+	return false
+}
+
 // Candidate is a release found and verified (signature and manifest) but not downloaded.
 type Candidate struct {
 	Tag string

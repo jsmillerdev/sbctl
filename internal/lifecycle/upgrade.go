@@ -176,6 +176,12 @@ type UpgradeRequest struct {
 	// back (`supavise rollback`); every other caller leaves it false, and a project is never
 	// moved to an older release by accident.
 	AllowOlder bool
+	// ReuseBackupSince, when set, lets the upgrade take as its pre-upgrade backup a base backup of
+	// the project that finished at or after this time, instead of taking another one. `supavise
+	// upgrade` backs up every project first and passes the time it began: the base backup and the
+	// archived WAL after it restore the project to any moment up to the upgrade, so a second
+	// backup would only double the time the rollout takes.
+	ReuseBackupSince time.Time
 }
 
 // ProjectUpgrader is the optional Manager capability behind the Management API's upgrade
@@ -387,7 +393,7 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 	e.event(ctx, ref, EventUpgradeStarted, map[string]any{"tracking_id": up.TrackingID, "from": up.From, "to": up.To, "target_version": req.TargetVersion})
 	e.log.Info("upgrade_started", "ref", ref, "tracking_id", up.TrackingID, "changes", describeChanges(el.Changes))
 	started = true
-	return &upgradeRun{e: e, store: store, up: up, prev: p.Status, restarts: el.PostgresRestart, release: release}, nil
+	return &upgradeRun{e: e, store: store, up: up, prev: p.Status, restarts: el.PostgresRestart, release: release, reuseSince: req.ReuseBackupSince}, nil
 }
 
 // localRunners holds the upgrades of registries without advisory locks (the in-memory one, which
@@ -526,6 +532,8 @@ type upgradeRun struct {
 	restarts bool
 	// release gives up the claim on the project's upgrade (claimRunner).
 	release func()
+	// reuseSince is UpgradeRequest.ReuseBackupSince.
+	reuseSince time.Time
 }
 
 func (r *upgradeRun) Upgrade() registry.Upgrade {
@@ -560,7 +568,7 @@ func (r *upgradeRun) Run(ctx context.Context) error {
 	}
 	r.save(ctx, ProgressArtifactsReady)
 
-	b, err := e.preUpgradeBackup(ctx, ref)
+	b, err := r.backup(ctx)
 	if err != nil {
 		return r.abort(ctx, UpgradeErrBackup, "the base backup before the upgrade", err)
 	}
@@ -627,6 +635,22 @@ func (e *Engine) ensureArtifacts(ctx context.Context, from, to map[string]string
 		}
 	}
 	return nil
+}
+
+// backup returns the base backup the upgrade can be undone from: a recent one the request allows
+// reusing, else a fresh one.
+func (r *upgradeRun) backup(ctx context.Context) (*registry.Backup, error) {
+	if !r.reuseSince.IsZero() {
+		if bs, err := r.e.reg.ListBackups(ctx, r.up.Ref); err == nil {
+			for i := range bs { // newest first
+				if b := &bs[i]; b.Status == registry.BackupCompleted && b.FinishedAt != nil && !b.FinishedAt.Before(r.reuseSince) {
+					r.e.log.Info("upgrade: using the base backup taken for this run", "ref", r.up.Ref, "backup_id", b.ID)
+					return b, nil
+				}
+			}
+		}
+	}
+	return r.e.preUpgradeBackup(ctx, r.up.Ref)
 }
 
 func (e *Engine) preUpgradeBackup(ctx context.Context, ref string) (*registry.Backup, error) {

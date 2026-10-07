@@ -54,11 +54,15 @@ type nodeHost struct {
 	selfOpts selfupdate.Options
 
 	// state of one run
-	from, to  string
-	started   time.Time
-	swappedAt time.Time
-	stageDir  string
-	tmpStage  bool
+	mu          sync.Mutex
+	last        notice.Upgrade
+	hbStop      chan struct{}
+	knowsReason bool
+	from, to    string
+	started     time.Time
+	swappedAt   time.Time
+	stageDir    string
+	tmpStage    bool
 }
 
 func newNodeHost(cmd cobraIO, cfg *config.Config, wait time.Duration, so selfupdate.Options) (*nodeHost, error) {
@@ -143,6 +147,8 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	if info, err := nodeupgrade.ProbeInfo(ctx, h.binPath); err == nil {
 		n.BinaryInfo = info
 	}
+	// A binary that reports its release is one that knows the reason "pre-upgrade" for a backup.
+	h.knowsReason = n.BinaryInfo != nil
 	if u := notice.ReadUpgrade(h.cfg.Paths()); u != nil && u.Running(time.Now()) && u.PID != os.Getpid() && (u.PID == 0 || pidAlive(u.PID)) {
 		n.Running = &nodeupgrade.Running{PID: u.PID, Phase: u.Phase, To: u.To}
 	}
@@ -205,15 +211,12 @@ func (h *nodeHost) nodePins(n *nodeupgrade.Node) {
 			n.Pins[svc] = tag
 		}
 	}
-	if n.BinaryInfo != nil {
-		for svc, tag := range n.BinaryInfo.Pins {
-			if n.Pins[svc] == "" {
-				n.Pins[svc] = tag
-			}
-		}
-	}
 	for _, svc := range config.ProjectServices {
 		if n.Pins[svc] != "" {
+			continue
+		}
+		if n.BinaryInfo != nil && n.BinaryInfo.Pins[svc] != "" {
+			n.Pins[svc] = n.BinaryInfo.Pins[svc]
 			continue
 		}
 		count := map[string]int{}
@@ -430,7 +433,11 @@ func (h *nodeHost) Backup(ctx context.Context, refs []string, parallel int) erro
 	lw := &prefixWriter{w: h.out, mu: &mu}
 	for _, ref := range refs {
 		g.Go(func() error {
-			if err := h.asSupavise(gctx, lw.with(ref+": "), nil, h.binPath, "backups", "create", ref, "--reason", backup.ReasonUpgrade); err != nil {
+			args := []string{"backups", "create", ref}
+			if h.knowsReason {
+				args = append(args, "--reason", backup.ReasonUpgrade)
+			}
+			if err := h.asSupavise(gctx, lw.with(ref+": "), nil, h.binPath, args...); err != nil {
 				return fmt.Errorf("%s: %w", ref, err)
 			}
 			h.Mark(nodeupgrade.PhasePreparing, "backing up")
@@ -469,17 +476,50 @@ func (w *prefixed) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// Mark implements nodeupgrade.Host.
+// Mark implements nodeupgrade.Host. The marker is also written every ten minutes while the
+// upgrade runs, so that a long rollout does not look like a process that died (the marker counts
+// as stale two hours after its last write).
 func (h *nodeHost) Mark(phase, detail string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.started.IsZero() {
 		h.started = time.Now().UTC()
 	}
-	u := notice.Upgrade{Phase: phase, From: h.from, To: h.to, StartedAt: h.started, PID: os.Getpid(), Detail: detail}
-	if err := notice.WriteUpgrade(h.cfg.Paths(), u); err != nil {
+	h.last = notice.Upgrade{Phase: phase, From: h.from, To: h.to, StartedAt: h.started, PID: os.Getpid(), Detail: detail}
+	h.writeMarker()
+	switch {
+	case nodeupgrade.Finished(phase):
+		if h.hbStop != nil {
+			close(h.hbStop)
+			h.hbStop = nil
+		}
+	case h.hbStop == nil:
+		h.hbStop = make(chan struct{})
+		go h.heartbeat(h.hbStop)
+	}
+}
+
+func (h *nodeHost) writeMarker() {
+	if err := notice.WriteUpgrade(h.cfg.Paths(), h.last); err != nil {
 		h.log.Warn("could not write the upgrade marker", "error", err)
 		return
 	}
 	handOverToStateOwner(h.cfg, filepath.Join(h.cfg.Paths().Root, "system", "upgrade.json"))
+}
+
+func (h *nodeHost) heartbeat(stop chan struct{}) {
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			h.mu.Lock()
+			h.writeMarker()
+			h.mu.Unlock()
+		}
+	}
 }
 
 // handOverToStateOwner gives a file root wrote in the state directory to the directory's owner.
@@ -509,24 +549,22 @@ func (h *nodeHost) Install(ctx context.Context, s *nodeupgrade.Staged, prev, nex
 	if _, err := sd.st.Install(); err != nil {
 		return false, err
 	}
-	h.swappedAt = time.Now()
 	return true, h.activate(ctx)
 }
 
 // activate renders the units with the binary at BinPath, restarts the daemon and waits until it
 // answers.
 func (h *nodeHost) activate(ctx context.Context) error {
+	// A service counts as moved when it restarted after this point: the daemon restarts them
+	// while it starts, possibly before it answers on its admin listener.
+	h.swappedAt = time.Now()
 	c := exec.CommandContext(ctx, h.binPath, "system", "install-units")
 	c.Stdout, c.Stderr = h.out, h.errw
 	if err := c.Run(); err != nil {
 		fmt.Fprintf(h.errw, "warning: supavise system install-units failed: %v\n", err)
 	}
 	_ = exec.CommandContext(ctx, "systemctl", "reset-failed", "supavise.service").Run()
-	if err := restartAndWait(ctx, h.cfg, h.wait); err != nil {
-		return err
-	}
-	h.swappedAt = time.Now()
-	return nil
+	return restartAndWait(ctx, h.cfg, h.wait)
 }
 
 // Restore implements nodeupgrade.Host.
@@ -603,8 +641,10 @@ func (h *nodeHost) WaitShared(ctx context.Context, moves []nodeupgrade.ServiceMo
 func short(svc, tag string) string { return lifecycle.ShortVersion(svc, tag) }
 
 func (h *nodeHost) currentPhase() string {
-	if u := notice.ReadUpgrade(h.cfg.Paths()); u != nil && u.Phase != "" {
-		return u.Phase
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.last.Phase != "" {
+		return h.last.Phase
 	}
 	return nodeupgrade.PhaseServices
 }
@@ -677,13 +717,19 @@ func toArgs(target map[string]string) []string {
 
 // upgradeProjectsArgs is the command line of the rollout: the new binary upgrades every
 // eligible project to the named releases, canary first, and stops at the first failure.
-func upgradeProjectsArgs(target map[string]string) []string {
-	return append([]string{"projects", "upgrade", "--all", "--yes", "--no-gc"}, toArgs(target)...)
+func upgradeProjectsArgs(target map[string]string, since time.Time) []string {
+	args := append([]string{"projects", "upgrade", "--all", "--yes", "--no-gc"}, toArgs(target)...)
+	if !since.IsZero() {
+		// The base backups this run took are the pre-upgrade backups: a project does not take a
+		// second one, and the archived WAL carries a restore from them up to the moment of the upgrade.
+		args = append(args, "--reuse-backup-since", since.UTC().Format(time.RFC3339))
+	}
+	return args
 }
 
 // UpgradeProjects implements nodeupgrade.Host.
 func (h *nodeHost) UpgradeProjects(ctx context.Context, target map[string]string, since time.Time) ([]nodeupgrade.ProjectMove, error) {
-	err := h.asSupavise(ctx, h.out, nil, h.binPath, upgradeProjectsArgs(target)...)
+	err := h.asSupavise(ctx, h.out, nil, h.binPath, upgradeProjectsArgs(target, since)...)
 	moves, merr := h.MovesSince(context.WithoutCancel(ctx), since)
 	if merr != nil {
 		h.log.Warn("could not read which projects were upgraded", "error", merr)

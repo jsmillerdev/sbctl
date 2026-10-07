@@ -20,7 +20,8 @@ import (
 func init() {
 	var (
 		check, plan, yes, unattended, includePostgres bool
-		target, repo, apiBase, keyFile                string
+		target, repo, apiBase                         string
+		keyFiles                                      []string
 		wait                                          time.Duration
 	)
 	cmd := &cobra.Command{
@@ -71,14 +72,16 @@ rolled back; 4 failed and the node needs the operator. While it runs, the state 
 				return err
 			}
 			so := selfupdate.Options{Repo: repo, APIBase: apiBase}
-			if keyFile != "" {
-				b, err := os.ReadFile(keyFile)
+			for _, f := range keyFiles {
+				b, err := os.ReadFile(f)
 				if err != nil {
 					return err
 				}
-				if so.Key, err = selfupdate.ParsePublicKey(b); err != nil {
+				k, err := selfupdate.ParsePublicKey(b)
+				if err != nil {
 					return err
 				}
+				so.Keys = append(so.Keys, k)
 			}
 			h, err := newNodeHost(cobraIO{Out: cmd.OutOrStdout(), Err: cmd.ErrOrStderr(), In: cmd.InOrStdin()}, cfg, wait, so)
 			if err != nil {
@@ -115,7 +118,7 @@ rolled back; 4 failed and the node needs the operator. While it runs, the state 
 	// For tests against a local release server and a throwaway key.
 	f.StringVar(&repo, "repo", "", "GitHub repository to read releases from, owner/name (default "+selfupdate.DefaultRepo+")")
 	f.StringVar(&apiBase, "api-base", "", "GitHub API root (tests)")
-	f.StringVar(&keyFile, "public-key-file", "", "verify against this PEM public key instead of the built-in release key (tests)")
+	f.StringArrayVar(&keyFiles, "public-key-file", nil, "verify against this PEM public key instead of the built-in release keys; repeat for a second key (tests)")
 	_ = f.MarkHidden("api-base")
 	_ = f.MarkHidden("public-key-file")
 	rootCmd.AddCommand(cmd)

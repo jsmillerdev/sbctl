@@ -27,6 +27,7 @@ var (
 	upAll, upYes, upDryRun, upNoGC bool
 	upAllowOlder                   bool
 	upTo                           []string
+	upReuseBackupSince             string
 	versionsJSON                   bool
 )
 
@@ -34,6 +35,13 @@ var (
 // for the services it does not name), --allow-older lifts the refusal of an older one.
 func upgradeRequest() (lifecycle.UpgradeRequest, error) {
 	req := lifecycle.UpgradeRequest{AllowOlder: upAllowOlder}
+	if upReuseBackupSince != "" {
+		t, err := time.Parse(time.RFC3339, upReuseBackupSince)
+		if err != nil {
+			return req, fmt.Errorf("--reuse-backup-since %q: want an RFC 3339 time: %w", upReuseBackupSince, err)
+		}
+		req.ReuseBackupSince = t
+	}
 	for _, kv := range upTo {
 		svc, tag, ok := strings.Cut(kv, "=")
 		svc = serviceOf(svc)
@@ -482,6 +490,8 @@ and stops. Run as the user that owns the state directory (supavise).`
 	upgrade.Flags().BoolVar(&upDryRun, "dry-run", false, "show what would be upgraded and stop")
 	upgrade.Flags().BoolVar(&upNoGC, "no-gc", false, "keep the artifacts that nothing needs any more")
 	upgrade.Flags().StringArrayVar(&upTo, "to", nil, "move this service to this release instead of the node's pin, <service>=<release tag> (repeatable; services not named keep the version they run)")
+	upgrade.Flags().StringVar(&upReuseBackupSince, "reuse-backup-since", "", "use a base backup of the project that finished after this time (RFC 3339) as the pre-upgrade backup (what `supavise upgrade` passes after it backed everything up)")
+	_ = upgrade.Flags().MarkHidden("reuse-backup-since")
 	upgrade.Flags().BoolVar(&upAllowOlder, "allow-older", false, "allow --to to name an older release than the project runs (what `supavise rollback` does for the projects an upgrade moved)")
 
 	versions := projectCmd("versions [<ref>]", "Show the service versions projects run and whether an upgrade is available", cobra.MaximumNArgs(1), runVersions)
