@@ -333,8 +333,24 @@ KID=$(json_get 'd["id"]' <<<"$NEW")
 must 200 DELETE "$CFG/api-keys/$KID"
 [[ $(pcode GET /rest/v1/ -H "apikey: $KEY") == 401 ]] || fail "a revoked key is still accepted"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SEC") == 200 ]] || fail "revoking one key took the default secret key down"
+# A Realtime long-poll session opened with a legacy key while the keys are enabled keeps the key it connected with: the
+# proxy must stop it at the switch. Phoenix answers a GET without a token with the session token.
+LP=$(proj GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$SVC" || true)
+LP_TOKEN=$(json_get 'd["token"]' <<<"$LP" 2>/dev/null || true)
+[[ -n $LP_TOKEN ]] || fail "Realtime did not open a long-poll session: $LP"
 must 200 PUT "$CFG/api-keys/legacy?enabled=false"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SVC") == 401 ]] || fail "a legacy key is accepted while disabled"
+LP_CODE=$(pcode GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP_TOKEN")
+[[ $LP_CODE == 410 ]] || fail "a long-poll session opened before the switch can still be polled (answered $LP_CODE)"
+LP_CODE=$(pcode POST "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP_TOKEN" -H 'Content-Type: application/x-ndjson' -d '')
+[[ $LP_CODE == 410 ]] || fail "a long-poll session opened before the switch can still be pushed to (answered $LP_CODE)"
+# A new session goes through the guarded path: a legacy key is refused, the publishable key opens one that works.
+[[ $(pcode GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$SVC") == 401 ]] || fail "a legacy key opened a long-poll session while disabled"
+LP2=$(proj GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB" || true)
+LP2_TOKEN=$(json_get 'd["token"]' <<<"$LP2" 2>/dev/null || true)
+[[ -n $LP2_TOKEN ]] || fail "no long-poll session with the publishable key while the legacy keys are off: $LP2"
+LP_CODE=$(pcode GET "/realtime/v1/longpoll?vsn=1.0.0&apikey=$PUB&token=$LP2_TOKEN")
+[[ $LP_CODE == 200 || $LP_CODE == 204 ]] || fail "a long-poll session opened after the switch was refused (answered $LP_CODE)"
 [[ $(pcode GET /auth/v1/settings -H "apikey: $ANON") == 401 ]] || fail "the legacy anon key is accepted while disabled"
 # Storage verifies the JWT itself, so the legacy key must be turned away there too, in every position.
 storage_code() { pcode GET /storage/v1/bucket "$@"; }
@@ -342,6 +358,14 @@ storage_code() { pcode GET /storage/v1/bucket "$@"; }
 [[ $(storage_code -H "apikey: $SVC") == 401 ]] || fail "the legacy service_role key as apikey reaches Storage while disabled"
 [[ $(storage_code -H "Authorization: Bearer $SVC") == 401 ]] || fail "the legacy service_role key as bearer reaches Storage while disabled"
 [[ $(storage_code -H "apikey: $PUB" -H "Authorization: Bearer $SVC") == 401 ]] || fail "the legacy service_role key as bearer beside a publishable key reaches Storage while disabled"
+# Whatever way a client sends the key, the proxy refuses it before Storage, Functions or PostgREST read it.
+[[ $(storage_code -H "Authorization: $SVC") == 401 ]] || fail "the legacy service_role key as a bare Authorization value reaches Storage while disabled"
+[[ $(storage_code -H "Authorization: Bearer"$'\t'"$SVC") == 401 ]] || fail "the legacy service_role key after a tab reaches Storage while disabled"
+[[ $(storage_code -H "Authorization: bEaReR $SVC") == 401 ]] || fail "the legacy service_role key after a mixed-case scheme reaches Storage while disabled"
+[[ $(storage_code -H "X-Unrelated: $SVC") == 401 ]] || fail "the legacy service_role key in an unrelated header reaches Storage while disabled"
+[[ $(pcode GET "/storage/v1/bucket?x=$SVC") == 401 ]] || fail "the legacy service_role key in the query reaches Storage while disabled"
+[[ $(pcode GET /functions/v1/smoke -H "Authorization: $SVC") == 401 ]] || fail "the legacy service_role key as a bare Authorization value reaches Functions while disabled"
+[[ $(pcode GET /rest/v1/ -H "apikey: $SEC" -H "X-Unrelated: $ANON") == 401 ]] || fail "the legacy anon key in an unrelated header reaches PostgREST while disabled"
 [[ $(storage_code -H "apikey: $SEC" -H "Authorization: Bearer $SEC") == 200 ]] || fail "the secret key stopped working on Storage with the legacy keys off"
 [[ $(pcode GET /rest/v1/ -H "apikey: $SEC") == 200 ]] || fail "the secret key stopped working with the legacy keys off"
 # Storage's S3 endpoint takes any JWT of the project as the session token: a legacy key must be refused there (403, an

@@ -34,6 +34,10 @@ type Server struct {
 
 	// sockets are the Realtime sockets opened without inspection (see wsguard.go).
 	sockets socketSet
+	// lp are the Realtime long-poll sessions opened without inspection (see legacyguard.go).
+	lp lpSessions
+	// recheckWait is the delay before a failed key lookup is retried (tests); zero is the default.
+	recheckWait time.Duration
 
 	mu         sync.Mutex
 	transports map[time.Duration]*http.Transport
@@ -70,8 +74,8 @@ func New(opts Options) (*Server, error) {
 	}
 	s.table = newTable(s.cfg, opts.Registry, opts.Keys, s.log)
 	s.table.onKeysDropped = func(ref string) {
-		if len(s.sockets.refs(ref)) > 0 {
-			go s.recheckSockets(ref)
+		if len(s.sockets.refs(ref)) > 0 || len(s.lp.refs(ref)) > 0 {
+			go s.recheckRealtime(ref)
 		}
 	}
 	if err := s.table.reload(context.Background()); err != nil {

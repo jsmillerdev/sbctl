@@ -110,6 +110,14 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		return
 	}
 
+	if rt.keys == keyRealtime {
+		// A long-poll session opened before the legacy keys were switched off must not go on.
+		if toks := queryValues(r.URL.RawQuery, "token"); len(toks) > 0 && s.lp.seen(p.ref, toks) {
+			refuseRevokedSession(w)
+			return
+		}
+	}
+
 	res := authResult{rawQuery: r.URL.RawQuery}
 	var guardKeys [][]byte
 	if rt.keys != keyNone {
@@ -134,6 +142,12 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 			return
 		}
 		if k != nil {
+			// Before any route-specific rule: with the legacy keys disabled, a request that carries
+			// one of them anywhere in its headers or query is refused, whatever the route reads.
+			if carriesLegacyKey(k, r.Header, r.URL.RawQuery) {
+				refuseLegacy(w, rt)
+				return
+			}
 			if rt.keys == keyRealtime {
 				guardKeys = legacyNeedles(k)
 			}
@@ -193,6 +207,10 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 	tg.dropTenant = rt.svc != svcFunctions
 	if rt.keys == keyRealtime {
 		tg.trackRef = p.ref
+		// A GET without a session token opens a long-poll session (a WebSocket handshake never
+		// answers with one); while the legacy keys are enabled its token is tracked.
+		tg.trackSession = len(guardKeys) == 0 && r.Method == http.MethodGet && !isWebSocketHandshake(r) &&
+			len(queryValues(r.URL.RawQuery, "token")) == 0
 	}
 	if len(guardKeys) > 0 {
 		// Legacy keys are disabled: watch what the client sends into the socket (or the long-poll
@@ -245,6 +263,8 @@ type target struct {
 	// trackRef, set for a Realtime socket route, is the project whose sockets that were not
 	// inspected (legacy keys enabled) are closed when its legacy keys are switched off.
 	trackRef string
+	// trackSession marks a request that may open a long-poll session whose token is to be tracked.
+	trackSession bool
 }
 
 // forward proxies r to tg, streaming in both directions and passing WebSocket
@@ -280,7 +300,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 			ref := tg.trackRef
 			s.sockets.add(ref, gc)
 			gc.onClose = func() { s.sockets.remove(ref, gc) }
-			go s.recheckSockets(ref)
+			go s.recheckRealtime(ref)
 			return gc
 		}}
 	}
@@ -320,8 +340,14 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 			for name, v := range tg.set {
 				h.Set(name, v)
 			}
+			if tg.trackSession {
+				h.Del("Accept-Encoding") // the answer is read to find the session token
+			}
 		},
 		ModifyResponse: func(res *http.Response) error {
+			if tg.trackSession {
+				s.captureSession(tg.trackRef, res)
+			}
 			if tg.studio {
 				rewriteStudioResponse(res.Header)
 			} else {

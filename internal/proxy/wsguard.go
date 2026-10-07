@@ -3,7 +3,6 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -522,21 +521,6 @@ func (s *socketSet) closeAll(ref, reason string) int {
 		c.sever(reason)
 	}
 	return len(conns)
-}
-
-// recheckSockets closes the project's tracked sockets when its legacy keys are now disabled.
-// ref "" checks every project that has one. A failed key lookup leaves the sockets as they are;
-// the next invalidation or the periodic reload checks again.
-func (s *Server) recheckSockets(ref string) {
-	for _, r := range s.sockets.refs(ref) {
-		k, err := s.table.projectKeys(context.Background(), r)
-		if err != nil || k == nil || !k.LegacyDisabled {
-			continue
-		}
-		if n := s.sockets.closeAll(r, wsCloseReason); n > 0 {
-			s.log.Warn("proxy: closed Realtime sockets opened before the legacy API keys were disabled", "ref", r, "sockets", n)
-		}
-	}
 }
 
 // guardedWriter makes the hijacked connection of an upgrade go through wrap.
