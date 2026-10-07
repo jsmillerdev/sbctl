@@ -57,6 +57,10 @@ type authenticator struct {
 	now   func() time.Time
 	// admins is the [api] admin_emails allowlist, lower-cased.
 	admins []string
+	// removed reports whether a dashboard user was removed with `sbctl users remove`
+	// (nil: nobody is). It is asked on every request, with no cache, so that a removal
+	// ends the user's sessions and tokens at once, whichever process made it.
+	removed func(ctx context.Context, userID string) (bool, error)
 
 	mu        sync.Mutex
 	secret    string
@@ -128,6 +132,13 @@ func (a *authenticator) authPAT(ctx context.Context, token string) (*Principal, 
 	if t.ExpiresAt != nil && !t.ExpiresAt.After(a.now()) {
 		return nil, errUnauthorized
 	}
+	// A token is not tied to its owner's account: one that outlived the removal of its
+	// owner must not keep working.
+	if gone, err := a.isRemoved(ctx, t.UserID); err != nil {
+		return nil, err
+	} else if gone {
+		return nil, errUnauthorized
+	}
 	a.touch(ctx, t.ID)
 	p := &Principal{UserID: t.UserID, Via: "pat", TokenID: t.ID}
 	if u, err := a.store.GetUser(ctx, t.UserID); err == nil {
@@ -189,6 +200,12 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 	if sub == "" {
 		return nil, errUnauthorized
 	}
+	// A session issued before the user was removed stays valid until it expires; refuse it now.
+	if gone, err := a.isRemoved(ctx, sub); err != nil {
+		return nil, err
+	} else if gone {
+		return nil, errUnauthorized
+	}
 	email, _ := claims["email"].(string)
 	if !a.isAdmin(claims, email) {
 		return nil, errForbidden
@@ -210,6 +227,13 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 		a.mu.Unlock()
 	}
 	return p, nil
+}
+
+func (a *authenticator) isRemoved(ctx context.Context, userID string) (bool, error) {
+	if a.removed == nil {
+		return false, nil
+	}
+	return a.removed(ctx, userID)
 }
 
 // isAdmin reports whether a verified dashboard session may use the API: the user

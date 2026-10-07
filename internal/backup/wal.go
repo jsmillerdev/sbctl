@@ -56,11 +56,29 @@ func (s *Service) PushWAL(ctx context.Context, ref, path string) error {
 	if err := checkWALName(name); err != nil {
 		return err
 	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return s.PushWALReader(ctx, ref, name, f)
+}
+
+// PushWALReader is PushWAL for a file that arrives as a stream (the WAL relay): name is
+// the WAL file name and r its whole content. A reader that fails before its end (a client
+// that went away) makes the push fail and leaves nothing in the archive.
+func (s *Service) PushWALReader(ctx context.Context, ref, name string, r io.Reader) error {
+	if err := validRef(ref); err != nil {
+		return err
+	}
+	if err := checkWALName(name); err != nil {
+		return err
+	}
 	key := walKey(ref, name)
 	st := s.opt.Store
 
 	if _, err := st.Stat(ctx, key); err == nil {
-		same, cerr := s.sameAsArchived(ctx, key, path)
+		same, cerr := s.sameAsArchived(ctx, key, r)
 		if cerr != nil {
 			return cerr
 		}
@@ -72,17 +90,11 @@ func (s *Service) PushWAL(ctx context.Context, ref, path string) error {
 		return err
 	}
 
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
 	pr, pw := io.Pipe()
 	go func() {
 		enc, err := newEncoder(pw, 1)
 		if err == nil {
-			if _, err = io.Copy(enc, f); err == nil {
+			if _, err = io.Copy(enc, ctxReader{ctx, r}); err == nil {
 				err = enc.Close()
 			} else {
 				enc.Close()
@@ -90,18 +102,13 @@ func (s *Service) PushWAL(ctx context.Context, ref, path string) error {
 		}
 		pw.CloseWithError(err)
 	}()
-	err = st.Put(ctx, key, pr)
+	err := st.Put(ctx, key, pr)
 	pr.CloseWithError(err) // unblock the compressor if Put returned early
 	return err
 }
 
-// sameAsArchived reports whether the object at key decompresses to exactly the file at path.
-func (s *Service) sameAsArchived(ctx context.Context, key, path string) (bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
+// sameAsArchived reports whether the object at key decompresses to exactly the bytes of r.
+func (s *Service) sameAsArchived(ctx context.Context, key string, r io.Reader) (bool, error) {
 	rc, err := s.opt.Store.Get(ctx, key)
 	if err != nil {
 		return false, err
@@ -112,7 +119,7 @@ func (s *Service) sameAsArchived(ctx context.Context, key, path string) (bool, e
 		return false, err
 	}
 	defer dec.Close()
-	return readersEqual(dec, f)
+	return readersEqual(dec, ctxReader{ctx, r})
 }
 
 func readersEqual(a, b io.Reader) (bool, error) {
@@ -149,26 +156,49 @@ func isEOF(err error) bool { return errors.Is(err, io.EOF) || errors.Is(err, io.
 // dest is written through a temporary file and renamed, so Postgres never sees a
 // partial segment.
 func (s *Service) FetchWAL(ctx context.Context, ref, name, dest string) (err error) {
-	if err := validRef(ref); err != nil {
-		return err
-	}
-	if err := checkWALName(name); err != nil {
-		return err
-	}
-	rc, err := s.opt.Store.Get(ctx, walKey(ref, name))
-	if errors.Is(err, ErrNotFound) {
-		return fmt.Errorf("%w: %s", ErrNoWAL, name)
-	}
+	rc, err := s.OpenWAL(ctx, ref, name)
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
+	return writeFileAtomic(ctx, dest, rc, name)
+}
+
+// OpenWAL returns the decompressed content of an archived WAL file. A file that is not in
+// the archive yields an error wrapping ErrNoWAL; any other error means the archive could
+// not be read.
+func (s *Service) OpenWAL(ctx context.Context, ref, name string) (io.ReadCloser, error) {
+	if err := validRef(ref); err != nil {
+		return nil, err
+	}
+	if err := checkWALName(name); err != nil {
+		return nil, err
+	}
+	rc, err := s.opt.Store.Get(ctx, walKey(ref, name))
+	if errors.Is(err, ErrNotFound) {
+		return nil, fmt.Errorf("%w: %s", ErrNoWAL, name)
+	}
+	if err != nil {
+		return nil, err
+	}
 	dec, err := newDecoder(rc)
 	if err != nil {
-		return err
+		rc.Close()
+		return nil, err
 	}
-	defer dec.Close()
+	return struct {
+		io.Reader
+		io.Closer
+	}{dec, closerFunc(func() error { dec.Close(); return rc.Close() })}, nil
+}
 
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
+// writeFileAtomic writes r to dest through a temporary file in the same directory: it is
+// synced and renamed, so Postgres never sees a partial segment.
+func writeFileAtomic(ctx context.Context, dest string, r io.Reader, name string) (err error) {
 	dir := filepath.Dir(dest)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(dest)+tmpMarker+"*")
 	if err != nil {
@@ -180,7 +210,7 @@ func (s *Service) FetchWAL(ctx context.Context, ref, name, dest string) (err err
 			os.Remove(tmp.Name())
 		}
 	}()
-	if _, err = io.Copy(tmp, ctxReader{ctx, dec}); err != nil {
+	if _, err = io.Copy(tmp, ctxReader{ctx, r}); err != nil {
 		return fmt.Errorf("backup: reading %s: %w", name, err)
 	}
 	if err = tmp.Chmod(0o600); err != nil {

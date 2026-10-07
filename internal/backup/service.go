@@ -59,6 +59,11 @@ type Options struct {
 	// before the restore counts as failed: PostgreSQL shuts down on a fatal recovery error
 	// (default 15 seconds).
 	RecoveryFailGrace time.Duration
+	// RecoveryMaxOutages is how many times a cluster may go from reachable to unreachable
+	// while recovering before the restore counts as failed (default 3): a cluster that
+	// dies of a fatal recovery error is restarted by its supervisor, answers again for a
+	// moment, and dies again.
+	RecoveryMaxOutages int
 	// ArchiveFlushTimeout bounds how long a restore to the end of the archive waits for a
 	// running source to archive its newest WAL before a time or latest restore (default 60 seconds).
 	ArchiveFlushTimeout time.Duration
@@ -97,6 +102,9 @@ func New(o Options) (*Service, error) {
 	}
 	if o.RecoveryFailGrace <= 0 {
 		o.RecoveryFailGrace = 15 * time.Second
+	}
+	if o.RecoveryMaxOutages <= 0 {
+		o.RecoveryMaxOutages = 3
 	}
 	if o.ArchiveFlushTimeout <= 0 {
 		o.ArchiveFlushTimeout = time.Minute

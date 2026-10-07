@@ -297,40 +297,50 @@ func openBackupService(ctx context.Context, withManager bool) (*backup.Service, 
 	}
 	warnConfigFileMode(os.Stderr, configFilePath(), cfg)
 	opts := appOptions(cfg)
+	// A base backup waits until its WAL is archived, and archiving goes through the
+	// daemon's relay: with the daemon down (or between restarts) this process serves
+	// the sockets nobody answers while it runs.
+	_, stopRelay := app.StartWALRelay(ctx, cfg, opts.Log, true)
 	if withManager {
 		node, err := lifecycle.Open(ctx, cfg, openOptions(cfg))
 		if err != nil {
+			stopRelay()
 			return nil, nil, err
 		}
 		svc, err := app.NewBackupService(ctx, cfg, node.Registry, node.Secrets, opts)
 		if err != nil {
 			node.Close()
+			stopRelay()
 			return nil, nil, err
 		}
 		svc.SetManager(node.Engine)
-		return svc, node.Close, nil
+		return svc, func() { node.Close(); stopRelay() }, nil
 	}
 	reg, err := openRegistry(ctx, cfg)
 	if err != nil {
+		stopRelay()
 		return nil, nil, err
 	}
 	// Load, never LoadOrCreate: a missing master key must not be replaced by a new one.
 	body, err := os.ReadFile(cfg.KeyPath)
 	if err != nil {
 		reg.Close()
+		stopRelay()
 		return nil, nil, fmt.Errorf("master key: %w", err)
 	}
 	sec, err := secrets.Load(body)
 	if err != nil {
 		reg.Close()
+		stopRelay()
 		return nil, nil, err
 	}
 	svc, err := app.NewBackupService(ctx, cfg, reg, sec, opts)
 	if err != nil {
 		reg.Close()
+		stopRelay()
 		return nil, nil, err
 	}
-	return svc, reg.Close, nil
+	return svc, func() { reg.Close(); stopRelay() }, nil
 }
 
 func printPrune(cmd *cobra.Command, rs []*backup.PruneResult) {

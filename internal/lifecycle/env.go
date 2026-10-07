@@ -118,7 +118,7 @@ func (pl *PostgresPlane) postgresSpec(p *registry.Project, keys *secrets.Project
 		// for the life of the cluster.
 		env["POSTGRES_PASSWORD"] = keys.AdminPassword
 	}
-	if pl.opts.ConfigPath != "" {
+	if pl.opts.ConfigPath != "" && !pl.cfg.WALRelayEnabled() {
 		env["SBCTL_CONFIG"] = pl.opts.ConfigPath
 	}
 	return units.Spec{

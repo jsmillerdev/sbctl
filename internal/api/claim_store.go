@@ -41,6 +41,11 @@ type ClaimStore interface {
 	ReleaseClaimToken(ctx context.Context, id int64) error
 	// Claimed reports whether a claim token has been used.
 	Claimed(ctx context.Context) (bool, error)
+	// MarkUserRemoved records that the dashboard user was removed (migration
+	// 0610_removed_users.sql). The API refuses the user's sessions and tokens from then on.
+	MarkUserRemoved(ctx context.Context, userID, email string) error
+	// UserRemoved reports whether the dashboard user was removed.
+	UserRemoved(ctx context.Context, userID string) (bool, error)
 }
 
 // PGClaimStore is the Postgres ClaimStore over the registry's pool.
@@ -100,11 +105,39 @@ func (s *PGClaimStore) Claimed(ctx context.Context) (bool, error) {
 	return ok, err
 }
 
+func (s *PGClaimStore) MarkUserRemoved(ctx context.Context, userID, email string) error {
+	_, err := s.pool.Exec(ctx, `insert into sbctl.removed_users (user_id, email) values ($1, $2) on conflict (user_id) do nothing`, userID, email)
+	return err
+}
+
+func (s *PGClaimStore) UserRemoved(ctx context.Context, userID string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx, `select exists (select 1 from sbctl.removed_users where user_id = $1)`, userID).Scan(&ok)
+	return ok, err
+}
+
 // MemoryClaimStore is the in-memory ClaimStore for tests.
 type MemoryClaimStore struct {
-	mu     sync.Mutex
-	next   int64
-	tokens map[int64]*memClaim
+	mu      sync.Mutex
+	next    int64
+	tokens  map[int64]*memClaim
+	removed map[string]bool
+}
+
+func (m *MemoryClaimStore) MarkUserRemoved(_ context.Context, userID, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.removed == nil {
+		m.removed = map[string]bool{}
+	}
+	m.removed[userID] = true
+	return nil
+}
+
+func (m *MemoryClaimStore) UserRemoved(_ context.Context, userID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.removed[userID], nil
 }
 
 type memClaim struct {

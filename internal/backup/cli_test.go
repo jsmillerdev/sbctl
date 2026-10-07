@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -121,5 +122,75 @@ func TestWALCommandsExitStatuses(t *testing.T) {
 	cmd := exec.Command(c.bin, "--config", bad, "wal", "fetch", "--ref", testRef, name, dest)
 	if err := cmd.Run(); err == nil || cmd.ProcessState.ExitCode() != WALExitFatal {
 		t.Fatalf("fetch with a bad backend: %v", err)
+	}
+}
+
+// TestWALCommandsThroughTheRelay pins the same contract for the form a project's Postgres
+// unit runs on a systemd node: --socket, no config, no credentials. The relay is the
+// daemon's, here in-process over the same file backend.
+func TestWALCommandsThroughTheRelay(t *testing.T) {
+	c := newCLIEnv(t)
+	sockDir, err := os.MkdirTemp("/tmp", "sbr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "r.sock")
+	store, err := NewFileStore(c.archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(Options{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := NewRelay(RelayOptions{
+		Service: func(context.Context) (*Service, error) { return svc, nil },
+		Refs:    func() []string { return []string{testRef} },
+		Socket:  func(string) string { return sock },
+		Sources: func(string) []string { return nil },
+	})
+	relay.Reconcile()
+	defer relay.Close()
+
+	// A config that names no backend at all: the command must not need one.
+	c.cfg = filepath.Join(c.root, "empty.toml")
+	writeFile(t, c.cfg, []byte("[backup]\nbackend = \"ftp://not-a-backend\"\n"))
+	datadir := filepath.Join(c.root, "pgdata")
+	name := walName(1, 5)
+	writeFile(t, filepath.Join(datadir, "pg_wal", name), bytes.Repeat([]byte("wal"), 100000))
+
+	if code, errs, _ := c.run(datadir, "wal", "push", "--ref", testRef, "--socket", sock, "pg_wal/"+name); code != 0 {
+		t.Fatalf("push exit %d: %s", code, errs)
+	}
+	if _, err := os.Stat(filepath.Join(c.archive, testRef, "wal", name+".zst")); err != nil {
+		t.Fatalf("the daemon did not write the archive: %v", err)
+	}
+	if code, errs, _ := c.run(datadir, "wal", "push", "--ref", testRef, "--socket", sock, "pg_wal/"+name); code != 0 {
+		t.Fatalf("identical re-push exit %d: %s", code, errs)
+	}
+	writeFile(t, filepath.Join(datadir, "pg_wal", name), []byte("different"))
+	if code, errs, _ := c.run(datadir, "wal", "push", "--ref", testRef, "--socket", sock, "pg_wal/"+name); code == 0 || !strings.Contains(errs, "different content") {
+		t.Fatalf("push of different content: exit %d, stderr %q", code, errs)
+	}
+	dest := filepath.Join(c.root, "RECOVERYXLOG")
+	if code, errs, _ := c.run(datadir, "wal", "fetch", "--ref", testRef, "--socket", sock, name, dest); code != 0 {
+		t.Fatalf("fetch exit %d: %s", code, errs)
+	}
+	if b, _ := os.ReadFile(dest); len(b) != 300000 {
+		t.Fatalf("fetched %d bytes", len(b))
+	}
+	os.Remove(dest)
+	if code, errs, _ := c.run(datadir, "wal", "fetch", "--ref", testRef, "--socket", sock, walName(1, 6), dest); code != 1 {
+		t.Fatalf("fetch of a missing file: exit %d (%s); Postgres treats 1 as end of archive", code, errs)
+	}
+	// The daemon is down: push fails (Postgres retries), fetch is fatal (recovery must not
+	// end early and promote a cluster that is missing data).
+	relay.Close()
+	if code, _, _ := c.run(datadir, "wal", "push", "--ref", testRef, "--socket", sock, "pg_wal/"+name); code == 0 {
+		t.Fatal("push succeeded with no daemon")
+	}
+	if code, errs, _ := c.run(datadir, "wal", "fetch", "--ref", testRef, "--socket", sock, name, dest); code != WALExitFatal {
+		t.Fatalf("fetch with no daemon: exit %d (%s), want %d", code, errs, WALExitFatal)
 	}
 }

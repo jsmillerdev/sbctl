@@ -246,12 +246,22 @@ func TestStorageEnvS3AndValidation(t *testing.T) {
 	if _, ok := env["STORAGE_FILE_BACKEND_PATH"]; ok {
 		t.Error("the s3 backend must not set the file path")
 	}
-	// Without static keys the AWS default chain (instance role) applies.
+	// Without static keys the AWS default chain applies where it exists (the exec backend)...
 	n.cfg.Fleet = config.Fleet{StorageBackend: "s3", StorageS3Bucket: "objs"}
 	n.cfg.Backup.S3Region = "eu-west-1"
 	env, _ = storageEnv(n.cfg, c)
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok || env["STORAGE_S3_REGION"] != "eu-west-1" {
 		t.Errorf("env = %v", env)
+	}
+	// ... but not under systemd, where sb-storage cannot reach the instance role: static
+	// keys are required, and the error says why.
+	n.cfg.Supervisor = config.SupervisorSystemd
+	if _, err := storageEnv(n.cfg, c); err == nil || !strings.Contains(err.Error(), "IMDS") {
+		t.Fatalf("s3 without keys under systemd = %v; want an error that names IMDS", err)
+	}
+	n.cfg.Fleet.StorageS3AccessKeyID, n.cfg.Fleet.StorageS3SecretAccessKey = "AK", "SK"
+	if _, err := storageEnv(n.cfg, c); err != nil {
+		t.Fatalf("s3 with keys under systemd: %v", err)
 	}
 }
 

@@ -208,6 +208,7 @@ func NewServer(d Deps) (*Server, error) {
 	s.accounts = &Accounts{Reg: s.reg, Store: claims, Keys: s.mgr.Keys, Config: s.cfg, HTTP: s.hc, Now: s.now, Log: s.log,
 		GoTrueURL: s.upstream(&registry.Project{Ref: config.SystemRef}, upGoTrue)}
 	s.auth = newAuthenticator(s.reg, s.mgr.Keys, s.store, s.now, s.cfg.API.Admins())
+	s.auth.removed = claims.UserRemoved
 	h, err := s.build()
 	if err != nil {
 		return nil, err

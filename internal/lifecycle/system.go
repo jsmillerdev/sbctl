@@ -109,8 +109,10 @@ type OpenOptions struct {
 	ArchiveCommand    string
 	ArchiveCommandFor func(ref string) string
 	ArchiveTimeout    int
-	Fleet             fleet.Fleet
-	Backup            BaseBackuper
+	// ArchiveReady: see PlaneOptions.
+	ArchiveReady func(ref string)
+	Fleet        fleet.Fleet
+	Backup       BaseBackuper
 	// BackupFactory builds the BaseBackuper once the registry and the secrets are open
 	// (the backup service needs both, and the Engine needs the backup service). When the
 	// result also has a SetManager(Manager) method, Open hands it the Engine. Ignored
@@ -135,7 +137,7 @@ func (o *OpenOptions) log() *slog.Logger {
 
 func (o *OpenOptions) planeOptions() PlaneOptions {
 	return PlaneOptions{Log: o.log(), ConfigPath: o.ConfigPath, ArchiveCommand: o.ArchiveCommand,
-		ArchiveCommandFor: o.ArchiveCommandFor, ArchiveTimeout: o.ArchiveTimeout, Backup: o.Backup}
+		ArchiveCommandFor: o.ArchiveCommandFor, ArchiveTimeout: o.ArchiveTimeout, ArchiveReady: o.ArchiveReady, Backup: o.Backup}
 }
 
 // Node is everything a process needs to manage projects on this machine: the secrets

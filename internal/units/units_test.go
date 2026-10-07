@@ -401,8 +401,25 @@ func TestTemplatesContainment(t *testing.T) {
 			t.Errorf("%s does not hide /etc/sbctl or the master key", name)
 		}
 		ro := strings.Fields(line(body, "BindReadOnlyPaths"))
-		if len(ro) != 2 || ro[0] != "/var/lib/sbctl/artifacts" || !strings.HasSuffix(ro[1], "/"+svc+".run") {
+		if len(ro) < 2 || ro[0] != "/var/lib/sbctl/artifacts" || !strings.HasSuffix(ro[1], "/"+svc+".run") {
 			t.Errorf("%s: BindReadOnlyPaths must be the artifacts and its own launcher script, got %v", name, ro)
+		}
+		wantRO := 2
+		if svc == "postgres" {
+			// Plus the WAL relay directory of its own project, read-only (optional: created at the first start).
+			wantRO = 3
+			if len(ro) != 3 || ro[2] != "-/var/lib/sbctl/projects/%i/wal" {
+				t.Errorf("%s: BindReadOnlyPaths must end with its own WAL relay directory, got %v", name, ro)
+			}
+		}
+		if len(ro) != wantRO {
+			t.Errorf("%s: BindReadOnlyPaths has %d entries, want %d: %v", name, len(ro), wantRO, ro)
+		}
+		// Every unit denies the cloud metadata service on both address families: the instance
+		// role holds the backup bucket and DNS, and these units run tenant code or tenant input.
+		deny := strings.Fields(line(body, "IPAddressDeny"))
+		if len(deny) != 2 || deny[0] != "169.254.169.254" || deny[1] != "fd00:ec2::254" {
+			t.Errorf("%s: IPAddressDeny must be the IPv4 and IPv6 metadata addresses, got %v", name, deny)
 		}
 		for _, p := range strings.Fields(line(body, "BindPaths")) {
 			switch strings.TrimPrefix(p, "-") {
@@ -417,8 +434,16 @@ func TestTemplatesContainment(t *testing.T) {
 		if strings.Contains(line(body, "InaccessiblePaths"), ".env") {
 			t.Errorf("%s still hides sibling environment files (denylist); use the allowlist", name)
 		}
-		if svc == "postgres" && line(body, "InaccessiblePaths") != "-/etc/sbctl/master.key" {
-			t.Errorf("%s must hide the master key only (config.toml is read by archive_command)", name)
+		if line(body, "InaccessiblePaths") != "-/etc/sbctl" {
+			t.Errorf("%s must hide all of /etc/sbctl, got %q (archive_command reads no config: it goes through the relay socket)", name, line(body, "InaccessiblePaths"))
+		}
+		// No unit sees the backup directory, Postgres included: WAL leaves through the relay.
+		if strings.Contains(body, "/var/lib/sbctl/backups") && !strings.HasPrefix(strings.TrimSpace(body), "#") {
+			for _, l := range strings.Split(body, "\n") {
+				if !strings.HasPrefix(strings.TrimSpace(l), "#") && strings.Contains(l, "/var/lib/sbctl/backups") {
+					t.Errorf("%s still mounts or writes the backup directory: %s", name, l)
+				}
+			}
 		}
 	}
 }

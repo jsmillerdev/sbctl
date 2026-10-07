@@ -141,6 +141,23 @@ func (p Paths) ProjectService(ref, svc string) string {
 func (p Paths) EnvFile(ref, svc string) string {
 	return filepath.Join(p.Root, "projects", ref, svc+".env")
 }
+
+// WALDir is the directory the daemon serves a project's WAL relay socket in. The
+// project's Postgres unit gets this one directory (read-only) and nothing else of the
+// backup path, so it is also the whole of that cluster's reach into the archive.
+func (p Paths) WALDir(ref string) string { return filepath.Join(p.Root, "projects", ref, "wal") }
+
+// WALSocket is the unix socket of ref's WAL relay (see Backup.WALRelay). Short on purpose:
+// a unix socket path is limited to 107 bytes on Linux and 103 on macOS.
+func (p Paths) WALSocket(ref string) string { return filepath.Join(p.WALDir(ref), "r.sock") }
+
+// RestoreSources is the file naming the other projects whose WAL archive the project's
+// recovery may read through its relay: the source of a restore to a new project. It sits
+// in the project directory, outside every directory the project's own units can see.
+func (p Paths) RestoreSources(ref string) string {
+	return filepath.Join(p.Root, "projects", ref, "restore-sources")
+}
+
 func (p Paths) System(svc string) string { return filepath.Join(p.Root, "system", svc) }
 func (p Paths) Certs() string            { return filepath.Join(p.Root, "certs") }
 func (p Paths) Backups() string          { return filepath.Join(p.Root, "backups") }

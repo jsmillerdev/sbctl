@@ -39,6 +39,9 @@ type Options struct {
 	// StopBudget overrides StopBudget, how long Serve waits for running lifecycle
 	// operations when it is told to stop (tests).
 	StopBudget time.Duration
+	// ArchiveReady is called with a project's ref once its directories exist and before its
+	// cluster starts; the daemon uses it to serve the project's WAL relay socket at once.
+	ArchiveReady func(ref string)
 }
 
 func (o Options) log() *slog.Logger {
@@ -49,7 +52,8 @@ func (o Options) log() *slog.Logger {
 }
 
 // LifecycleOptions is lifecycle.OpenOptions with the backup package wired in: every
-// cluster archives WAL through `sbctl wal push` (backup.ArchiveCommand and the
+// cluster archives WAL through `sbctl wal push` (backup.ArchiveCommandFor: through the
+// daemon's relay socket on a systemd node, directly otherwise; and the
 // configured archive_timeout), deleting a project takes a final base backup through the
 // backup service, and a restore reaches the Engine. The backup service is built on first
 // use, so commands that never back up do not open the backend.
@@ -63,7 +67,8 @@ func LifecycleOptions(cfg *config.Config, o Options) lifecycle.OpenOptions {
 		ConfigPath:        o.ConfigPath,
 		Fleet:             o.Fleet,
 		Artifacts:         o.Artifacts,
-		ArchiveCommandFor: func(ref string) string { return backup.ArchiveCommand(cfg.BinPath, ref, o.ConfigPath) },
+		ArchiveCommandFor: func(ref string) string { return backup.ArchiveCommandFor(cfg, ref, o.ConfigPath) },
+		ArchiveReady:      o.ArchiveReady,
 		ArchiveTimeout:    timeout,
 		BackupFactory: func(n *lifecycle.Node) (lifecycle.BaseBackuper, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

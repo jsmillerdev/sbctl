@@ -43,6 +43,18 @@ var registryWait = 2 * time.Minute
 // Project units are systemd's, not the daemon's: stopping Serve leaves them running.
 func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	log := o.log()
+	// The WAL relay is the only holder of the backup credentials that clusters archive
+	// through (backup.Relay). It starts before the node opens, because the system cluster
+	// archives too and the daemon may wait for it to be reachable, and it stops after the
+	// drain: a delete's final base backup needs WAL archived until the very end.
+	if relay, stop := StartWALRelay(ctx, cfg, log, false); relay != nil {
+		defer stop()
+		o.ArchiveReady = func(ref string) {
+			if err := relay.Ensure(ref); err != nil {
+				log.Warn("wal relay: cannot serve project", "ref", ref, "error", err)
+			}
+		}
+	}
 	lo := LifecycleOptions(cfg, o)
 	// Without a Fleet from the caller the Engine registers projects with Supavisor,
 	// Realtime and Storage through a Lazy fleet (credentials loaded on first use, a

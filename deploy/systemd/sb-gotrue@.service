@@ -43,8 +43,9 @@ RestrictNamespaces=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# The EC2 instance role (backup bucket, DNS) must not reach tenant-facing code through IMDS.
-IPAddressDeny=169.254.169.254
+# The EC2 instance role (backup bucket, DNS) must not reach tenant-facing code through the
+# instance metadata service (IPv4 and IPv6 addresses). Only sbctl.service holds credentials.
+IPAddressDeny=169.254.169.254 fd00:ec2::254
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0027

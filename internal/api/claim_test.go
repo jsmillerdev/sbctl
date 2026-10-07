@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
@@ -445,6 +447,22 @@ func TestListAndRemoveUsers(t *testing.T) {
 func testClaimStore(t *testing.T, s ClaimStore) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
+
+	uid := "0a1b2c3d-0000-4000-8000-000000000042"
+	if gone, err := s.UserRemoved(ctx, uid); err != nil || gone {
+		t.Fatalf("UserRemoved before any removal: %v %v", gone, err)
+	}
+	for i := 0; i < 2; i++ { // marking twice is not an error
+		if err := s.MarkUserRemoved(ctx, uid, "gone@example.test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if gone, err := s.UserRemoved(ctx, uid); err != nil || !gone {
+		t.Fatalf("UserRemoved after the mark: %v %v", gone, err)
+	}
+	if gone, _ := s.UserRemoved(ctx, "0a1b2c3d-0000-4000-8000-000000000043"); gone {
+		t.Fatal("another user counts as removed")
+	}
 	h1, h2, h3 := secrets.HashToken("one"), secrets.HashToken("two"), secrets.HashToken("three")
 
 	if ok, err := s.Claimed(ctx); err != nil || ok {
@@ -620,4 +638,106 @@ func TestRemoveUserDeletesTokensBeforeTheAccount(t *testing.T) {
 	if us, _ := f.acc.ListUsers(ctx); len(us) != 0 {
 		t.Fatalf("user left after the retry: %+v", us)
 	}
+}
+
+// `sbctl users remove` must end the user's access at once: the GoTrue access token the
+// user holds keeps verifying until it expires, and a personal access token is never
+// checked against its owner's account.
+func TestRemovedUserIsRefusedImmediately(t *testing.T) {
+	f := newClaimFixture(t)
+	ctx := context.Background()
+	token, _, _ := f.acc.IssueClaimToken(ctx, 0, false)
+	var res RedeemResult
+	rec := f.post(RedeemRequest{Token: token, Email: "a@example.test", Password: goodPassword})
+	if rec.Code != 201 {
+		t.Fatalf("claim: %d %s", rec.Code, rec.Body)
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &res)
+
+	keys, err := f.srv.mgr.Keys(ctx, config.SystemRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := signSession(t, keys.JWTSecret, res.UserID, "a@example.test")
+	call := func(method, path, bearer string, body string) int {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		f.srv.ServeHTTP(w, req)
+		return w.Code
+	}
+	if code := call("GET", "/platform/profile", session, ""); code != 200 {
+		t.Fatalf("a signed-in user is refused before the removal: %d", code)
+	}
+	pat := secrets.NewPAT()
+	if err := f.reg.CreateAccessToken(ctx, &registry.AccessToken{UserID: res.UserID, Name: "t", Hash: secrets.HashToken(pat), Prefix: pat[:8]}); err != nil {
+		t.Fatal(err)
+	}
+	if code := call("GET", "/v1/projects", pat, ""); code != 200 {
+		t.Fatalf("a personal access token is refused before the removal: %d", code)
+	}
+
+	if _, err := f.acc.RemoveUser(ctx, "a@example.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The old session, still within its expiry, no longer opens anything...
+	for _, path := range []string{"/platform/profile", "/v1/projects"} {
+		if code := call("GET", path, session, ""); code != 401 {
+			t.Fatalf("GET %s with the removed user's session = %d, want 401", path, code)
+		}
+	}
+	// ... and cannot mint a token that would outlive the account.
+	if code := call("POST", "/platform/profile/access-tokens", session, `{"name":"after"}`); code != 401 {
+		t.Fatalf("minting a personal access token with the removed user's session = %d, want 401", code)
+	}
+	if ts, _ := f.reg.ListAccessTokens(ctx, res.UserID); len(ts) != 0 {
+		t.Fatalf("the removed user holds %d token(s)", len(ts))
+	}
+	// A token row that outlived the removal (made by a request already in flight, or an
+	// older version of the code) is refused too.
+	late := secrets.NewPAT()
+	if err := f.reg.CreateAccessToken(ctx, &registry.AccessToken{UserID: res.UserID, Name: "late", Hash: secrets.HashToken(late), Prefix: late[:8]}); err != nil {
+		t.Fatal(err)
+	}
+	if code := call("GET", "/v1/projects", late, ""); code != 401 {
+		t.Fatalf("a personal access token of a removed user = %d, want 401", code)
+	}
+}
+
+// A removal whose GoTrue delete failed has already cut the access off, and running it
+// again finishes the job.
+func TestRemoveUserFailedGoTrueDeleteStillRevokes(t *testing.T) {
+	f := newClaimFixture(t)
+	ctx := context.Background()
+	token, _, _ := f.acc.IssueClaimToken(ctx, 0, false)
+	var res RedeemResult
+	_ = json.Unmarshal(f.post(RedeemRequest{Token: token, Email: "a@example.test", Password: goodPassword}).Body.Bytes(), &res)
+	f.gt.mu.Lock()
+	f.gt.failDelete = true
+	f.gt.mu.Unlock()
+	if _, err := f.acc.RemoveUser(ctx, "a@example.test"); err == nil {
+		t.Fatal("expected the GoTrue failure")
+	}
+	if gone, _ := f.acc.Store.UserRemoved(ctx, res.UserID); !gone {
+		t.Fatal("the user is not marked removed although GoTrue still holds the account")
+	}
+	if _, err := f.acc.RemoveUser(ctx, "a@example.test"); err != nil {
+		t.Fatalf("the second run did not finish the removal: %v", err)
+	}
+}
+
+// signSession signs a dashboard session the way sb-gotrue@system does.
+func signSession(t *testing.T, secret, sub, email string) string {
+	t.Helper()
+	s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": sub, "email": email, "aud": "authenticated", "role": "authenticated",
+		"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(),
+		"app_metadata": map[string]any{AdminClaim: true},
+	}).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }

@@ -60,7 +60,9 @@ func (s *PGStore) UpdateUser(ctx context.Context, u *User) error {
 }
 
 func (s *PGStore) ListUsers(ctx context.Context) ([]User, error) {
-	rows, err := s.pool.Query(ctx, `select `+userCols+` from sbctl.api_users order by id`)
+	// A removed user (sbctl users remove) is no longer a member, though the profile row stays.
+	rows, err := s.pool.Query(ctx, `select `+userCols+` from sbctl.api_users u
+		 where not exists (select 1 from sbctl.removed_users r where r.user_id = u.user_id::text) order by id`)
 	if err != nil {
 		return nil, err
 	}

@@ -95,6 +95,24 @@ type Backup struct {
 	// longest an unarchived WAL change waits before the segment is switched and pushed.
 	// Zero means backup.DefaultArchiveTimeout (300 seconds).
 	ArchiveTimeoutSeconds int `toml:"archive_timeout_seconds"`
+	// WALRelay chooses how a cluster's archive_command and restore_command reach the
+	// backend: "on" through the daemon, over a unix socket inside the project's own
+	// directory (the Postgres unit holds no backend credentials and has no access to the
+	// backups); "off" by running `sbctl wal push` itself, which reads this file's backend
+	// settings; "auto" (the default) is "on" under systemd, where units have a mount
+	// sandbox, and "off" under the exec backend of development and tests.
+	WALRelay string `toml:"wal_relay"`
+}
+
+// WALRelayEnabled reports whether clusters archive through the daemon (Backup.WALRelay).
+func (c *Config) WALRelayEnabled() bool {
+	switch c.Backup.WALRelay {
+	case "on":
+		return true
+	case "off":
+		return false
+	}
+	return c.Supervisor == SupervisorSystemd
 }
 
 type Artifacts struct {
@@ -182,6 +200,11 @@ func (c *Config) Validate() error {
 	}
 	if c.TLS.Mode == "dns01" && c.TLS.DNSProvider == "" {
 		return errors.New("config: tls.mode dns01 needs tls.dns_provider")
+	}
+	switch c.Backup.WALRelay {
+	case "", "auto", "on", "off":
+	default:
+		return errors.New("config: backup.wal_relay must be auto, on or off")
 	}
 	if c.StateDir == "" {
 		return errors.New("config: state_dir is empty")

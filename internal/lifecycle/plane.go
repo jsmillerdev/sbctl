@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/OWNER/sbctl/internal/config"
@@ -40,8 +39,14 @@ type PlaneOptions struct {
 	ArchiveCommandFor func(ref string) string
 	ArchiveTimeout    int
 	// ConfigPath is exported to Postgres as SBCTL_CONFIG so that archive_command, which
-	// runs inside the postmaster, loads the same config file as the daemon.
+	// runs inside the postmaster, loads the same config file as the daemon. Not exported
+	// when archiving goes through the daemon's WAL relay (config.Backup.WALRelay): the
+	// cluster's unit has no business reading the config file then.
 	ConfigPath string
+	// ArchiveReady is called with the ref after a project's directories exist and before
+	// its cluster starts: the daemon serves the project's WAL relay socket from then on
+	// (backup.Relay.Ensure), so the first archive_command does not wait for the next sweep.
+	ArchiveReady func(ref string)
 	// Backup serves DataPlane.Snapshot; nil makes Snapshot return ErrNoSnapshot.
 	Backup BaseBackuper
 	// PostgresReadyTimeout bounds a cold start including first-boot migrations (default
@@ -99,7 +104,9 @@ func (pl *PostgresPlane) prepare(p *registry.Project, keys *secrets.ProjectKeys)
 	if n := len(pp.SockFile); n > unixSocketMax {
 		return fmt.Errorf("lifecycle: unix socket path %s is %d bytes, over the %d the OS allows; use a shorter state_dir", pp.SockFile, n, unixSocketMax)
 	}
-	dirs := []string{pl.cfg.Paths().Project(p.Ref), pp.Dir, pp.Sock, pl.cfg.Paths().ProjectService(p.Ref, config.SvcGoTrue)}
+	// WALDir is the one directory of the project's backup path the cluster's unit sees
+	// (read-only): the daemon serves the WAL relay socket in it.
+	dirs := []string{pl.cfg.Paths().Project(p.Ref), pp.Dir, pp.Sock, pl.cfg.Paths().WALDir(p.Ref), pl.cfg.Paths().ProjectService(p.Ref, config.SvcGoTrue)}
 	if hasPostgREST(p.Ref) {
 		dirs = append(dirs, pl.cfg.Paths().ProjectService(p.Ref, config.SvcPostgREST))
 	}
@@ -111,26 +118,16 @@ func (pl *PostgresPlane) prepare(p *registry.Project, keys *secrets.ProjectKeys)
 	if err := os.Chmod(pp.Sock, 0o700); err != nil {
 		return err
 	}
-	if err := pl.ensureBackupDir(p.Ref); err != nil {
-		return err
-	}
 	if _, err := writeFile(pp.HBA, []byte(hbaRules), 0o600); err != nil {
 		return err
 	}
-	_, err := writeFile(pp.RootKey, []byte(keys.PGSodiumRootKey), 0o600)
-	return err
-}
-
-// ensureBackupDir creates <backups>/<ref> for the local (file://) backup backend. The
-// systemd template binds that one directory into the cluster's namespace for
-// archive_command, and a bind of a missing path is skipped, so it must exist before the
-// first start. Other backends and a backend outside the state directory need nothing here.
-func (pl *PostgresPlane) ensureBackupDir(ref string) error {
-	dir, ok := strings.CutPrefix(pl.cfg.Backup.Backend, "file://")
-	if !ok || filepath.Clean(dir) != pl.cfg.Paths().Backups() {
-		return nil
+	if _, err := writeFile(pp.RootKey, []byte(keys.PGSodiumRootKey), 0o600); err != nil {
+		return err
 	}
-	return os.MkdirAll(filepath.Join(dir, ref), 0o700)
+	if pl.opts.ArchiveReady != nil {
+		pl.opts.ArchiveReady(p.Ref)
+	}
+	return nil
 }
 
 // hbaRules is the cluster's pg_hba.conf. The artifact's default trusts every loopback
