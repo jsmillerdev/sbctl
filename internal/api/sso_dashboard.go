@@ -79,6 +79,13 @@ type cachedProvider struct {
 // by another process (the CLI).
 const ssoCacheTTL = 10 * time.Second
 
+// NewDashboardSSO builds the service from the account service that shares its credentials,
+// members and registry: the CLI's `sbctl sso` uses it, the server builds its own the same way.
+func NewDashboardSSO(a *Accounts, store SSOStore) *DashboardSSO {
+	return &DashboardSSO{Reg: a.Reg, Store: store, Keys: a.Keys, Config: a.Config, GoTrueURL: a.GoTrueURL, HTTP: a.HTTP,
+		Members: a.Members, Accounts: a, Now: a.Now, Log: a.Log}
+}
+
 func (d *DashboardSSO) now() time.Time {
 	if d.Now != nil {
 		return d.Now()
@@ -843,4 +850,35 @@ func (d *DashboardSSO) grantDefault(ctx context.Context, row *SSOProviderRow, us
 		return nil, nil
 	}
 	return d.Members.GrantSSODefault(ctx, userID, email)
+}
+
+// Find resolves what an operator typed to a provider: a provider id, or an email domain it
+// serves. It sees the providers GoTrue holds that sbctl did not register, too.
+func (d *DashboardSSO) Find(ctx context.Context, who string) (*DashboardProvider, error) {
+	all, err := d.List(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	who = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(who, "@")))
+	for _, p := range all {
+		if strings.ToLower(p.ID) == who || slices.Contains(p.DomainNames(), who) {
+			return p, nil
+		}
+	}
+	return nil, errf(http.StatusNotFound, "No identity provider with the id or domain %q (see `sbctl sso list`)", who)
+}
+
+// FindPending resolves an email address or user id to a user waiting in org (0: any).
+func (d *DashboardSSO) FindPending(ctx context.Context, orgID int64, who string) (*PendingUser, error) {
+	us, err := d.Pending(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+	who = strings.ToLower(strings.TrimSpace(who))
+	for i := range us {
+		if strings.ToLower(us[i].UserID) == who || strings.ToLower(us[i].Email) == who {
+			return &us[i], nil
+		}
+	}
+	return nil, errNoPending
 }

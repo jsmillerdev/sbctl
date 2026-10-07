@@ -247,6 +247,11 @@ func (a *Accounts) orgBySlugOrOnly(ctx context.Context, slug string) (members.Or
 	return members.OrgRef{}, fmt.Errorf("there are several organizations (%s); name one with --org", strings.Join(slugs, ", "))
 }
 
+// Org resolves --org: the slug, or the only organization when slug is empty.
+func (a *Accounts) Org(ctx context.Context, slug string) (members.OrgRef, error) {
+	return a.orgBySlugOrOnly(ctx, slug)
+}
+
 // InviteByEmail is `sbctl users invite`: the operator invites an address to an organization.
 func (a *Accounts) InviteByEmail(ctx context.Context, email, orgSlug, role string, projectRefs []string) (*InviteResult, members.OrgRef, error) {
 	ro, err := members.ParseRole(role)

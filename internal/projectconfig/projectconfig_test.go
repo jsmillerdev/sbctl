@@ -412,3 +412,61 @@ func TestSecretsAreNeverRenderedForOtherServices(t *testing.T) {
 		}
 	}
 }
+
+// SAML is a setting like any other: GoTrue gets GOTRUE_SAML_ENABLED, and, while it is on, the
+// project's own signing key, because GoTrue refuses to start with SAML enabled and no key.
+func TestSAMLIsRenderedWithTheProjectsOwnKey(t *testing.T) {
+	sec, err := secrets.New(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var asked []string
+	m := NewManager(NewMemory(), sec, Options{SigningKey: func(_ context.Context, r string) (string, error) {
+		asked = append(asked, r)
+		return "key-of-" + r, nil
+	}})
+	ctx := context.Background()
+	env, err := m.AuthEnv(ctx, ref, "https://x.api.example.com/auth/v1")
+	if err != nil || env["GOTRUE_SAML_ENABLED"] != "" || env["GOTRUE_SAML_PRIVATE_KEY"] != "" || len(asked) != 0 {
+		t.Fatalf("a project that never saved anything renders no SAML: %v %v %v", env, asked, err)
+	}
+	patch(t, m, Auth, map[string]any{"saml_enabled": false})
+	if env, _ = m.AuthEnv(ctx, ref, ""); env["GOTRUE_SAML_ENABLED"] != "false" || env["GOTRUE_SAML_PRIVATE_KEY"] != "" || len(asked) != 0 {
+		t.Fatalf("SAML off asks for no key: %v %v", env, asked)
+	}
+	c := patch(t, m, Auth, map[string]any{"saml_enabled": true, "saml_external_url": "https://sso.example.com/auth/v1", "saml_allow_encrypted_assertions": true})
+	if len(c.Changed) != 3 {
+		t.Fatalf("changed %v", c.Changed)
+	}
+	env, err = m.AuthEnv(ctx, ref, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]string{
+		"GOTRUE_SAML_ENABLED": "true", "GOTRUE_SAML_PRIVATE_KEY": "key-of-" + ref,
+		"GOTRUE_SAML_EXTERNAL_URL": "https://sso.example.com/auth/v1", "GOTRUE_SAML_ALLOW_ENCRYPTED_ASSERTIONS": "true",
+	} {
+		if env[k] != want {
+			t.Errorf("%s = %q, want %q", k, env[k], want)
+		}
+	}
+	// The key is no setting: it cannot be read back or set through the API.
+	st, _ := m.Get(ctx, ref, Auth)
+	for name := range st.Effective {
+		if strings.Contains(name, "private_key") {
+			t.Fatalf("the signing key is a setting: %s", name)
+		}
+	}
+	if c := patch(t, m, Auth, map[string]any{"saml_private_key": "mine"}); len(c.Ignored) != 1 {
+		t.Fatalf("a client set the signing key: %+v", c)
+	}
+	if env, _ = m.AuthEnv(ctx, ref, ""); env["GOTRUE_SAML_PRIVATE_KEY"] != "key-of-"+ref {
+		t.Fatal("a client replaced the signing key")
+	}
+	wantInvalid(t, m, Auth, map[string]any{"saml_external_url": "not a url"}, "saml_external_url")
+	// A key that cannot be had fails the render instead of starting GoTrue without one.
+	bad := NewManager(m.store, sec, Options{SigningKey: func(context.Context, string) (string, error) { return "", errors.New("registry down") }})
+	if _, err := bad.AuthEnv(ctx, ref, ""); err == nil {
+		t.Fatal("rendered SAML without a key")
+	}
+}

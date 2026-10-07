@@ -2,9 +2,12 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -817,19 +820,38 @@ func TestProjectSSOProviders(t *testing.T) {
 
 // ---- stores ------------------------------------------------------------------
 
-func TestMemorySSOStore(t *testing.T) { testSSOStore(t, NewMemorySSOStore()) }
+func TestMemorySSOStore(t *testing.T) { testSSOStore(t, NewMemorySSOStore(), 1) }
 
-// testSSOStore is the conformance suite of SSOStore, run on the memory store here and on
-// Postgres when SBCTL_TEST_DATABASE_URL is set (store_test.go).
-func testSSOStore(t *testing.T, s SSOStore) {
-	ctx := context.Background()
-	org := int64(1)
-	if p, ok := s.(*PGSSOStore); ok {
-		var err error
-		if err = p.pool.QueryRow(ctx, `insert into sbctl.organizations (slug, name) values ('sso-store-test', 'x') returning id`).Scan(&org); err != nil {
-			t.Fatal(err)
-		}
+// TestPGSSOStore runs the same checks against a real database (CI provides one).
+func TestPGSSOStore(t *testing.T) {
+	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SBCTL_TEST_DATABASE_URL not set")
 	}
+	ctx := context.Background()
+	r, err := registry.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := registry.Migrate(ctx, r.Pool()); err != nil {
+		t.Fatal(err)
+	}
+	org, err := r.CreateOrganization(ctx, fmt.Sprintf("ssostore-%d", time.Now().UnixNano()), "SSO store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testSSOStore(t, NewPGSSOStore(r.Pool()), org.ID)
+	// Deleting the organization takes its providers and their users along.
+	if _, err := r.Pool().Exec(ctx, `delete from sbctl.organizations where id = $1`, org.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// testSSOStore is the conformance suite of SSOStore: the memory store, and Postgres where a
+// database is given. org is an organization the providers may belong to.
+func testSSOStore(t *testing.T, s SSOStore, org int64) {
+	ctx := context.Background()
 	const a, b = "a0000000-0000-4000-8000-000000000001", "a0000000-0000-4000-8000-000000000002"
 	const u1, u2, u3 = "bbbbbbbb-0000-4000-8000-000000000001", "bbbbbbbb-0000-4000-8000-000000000002", "bbbbbbbb-0000-4000-8000-000000000003"
 	if _, err := s.GetProvider(ctx, a); err != ErrNotFound {
@@ -925,5 +947,60 @@ func testSSOStore(t *testing.T, s SSOStore) {
 	}
 	if _, err := s.DeleteProvider(ctx, b); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMemorySignupGrants(t *testing.T) { testSignupGrants(t, NewMemoryClaimStore()) }
+
+func TestPGSignupGrants(t *testing.T) {
+	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	r, err := registry.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := registry.Migrate(ctx, r.Pool()); err != nil {
+		t.Fatal(err)
+	}
+	testSignupGrants(t, NewPGClaimStore(r.Pool()))
+}
+
+// A grant is for one address, works once and expires.
+func testSignupGrants(t *testing.T, s ClaimStore) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	h := func(x string) []byte { v := sha256.Sum256([]byte(x)); return v[:] }
+	if err := s.CreateSignupGrant(ctx, "New@Example.test", h("a"), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSignupGrant(ctx, "old@example.test", h("old"), now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		email string
+		token string
+		at    time.Time
+	}{
+		"another address": {"other@example.test", "a", now},
+		"another token":   {"new@example.test", "b", now},
+		"expired":         {"old@example.test", "old", now},
+		"too late":        {"new@example.test", "a", now.Add(2 * time.Minute)},
+	} {
+		if ok, err := s.ConsumeSignupGrant(ctx, tc.email, h(tc.token), tc.at); err != nil || ok {
+			t.Errorf("%s: %v %v", name, ok, err)
+		}
+	}
+	if err := s.CreateSignupGrant(ctx, "new@example.test", h("a"), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.ConsumeSignupGrant(ctx, "NEW@example.test", h("a"), now); err != nil || !ok {
+		t.Fatalf("the grant: %v %v", ok, err)
+	}
+	if ok, err := s.ConsumeSignupGrant(ctx, "new@example.test", h("a"), now); err != nil || ok {
+		t.Fatalf("the grant twice: %v %v", ok, err)
 	}
 }

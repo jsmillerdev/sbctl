@@ -100,6 +100,19 @@ func testRegistry(t *testing.T, r Registry) {
 	if s, err := r.GetSecret(ctx, c.Ref, "jwt_secret"); err != nil || len(s) != 1 || s[0] != 3 {
 		t.Fatalf("secret: %v %v", s, err)
 	}
+	// Put-if-absent: the first writer wins and says so; the project must exist.
+	if ok, err := PutSecretIfAbsent(ctx, r, c.Ref, "saml_private_key", []byte{7}); err != nil || !ok {
+		t.Fatalf("first put-if-absent: %v %v", ok, err)
+	}
+	if ok, err := PutSecretIfAbsent(ctx, r, c.Ref, "saml_private_key", []byte{8}); err != nil || ok {
+		t.Fatalf("second put-if-absent: %v %v", ok, err)
+	}
+	if s, err := r.GetSecret(ctx, c.Ref, "saml_private_key"); err != nil || len(s) != 1 || s[0] != 7 {
+		t.Fatalf("secret after put-if-absent: %v %v", s, err)
+	}
+	if _, err := PutSecretIfAbsent(ctx, r, "zzzzzzzzzzzzzzzzzzzz", "x", []byte{1}); err == nil {
+		t.Fatal("a secret for a project that does not exist")
+	}
 	if err := r.PutRoute(ctx, Route{Host: "x.example.com", Ref: c.Ref}); err != nil {
 		t.Fatal(err)
 	}
@@ -317,5 +330,39 @@ func TestMembersMigrationKeepsExistingUsersOwners(t *testing.T) {
 	// Applying again changes nothing.
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// HasDashboardSSO follows the rows of sbctl.sso_providers.
+func TestPostgresHasDashboardSSO(t *testing.T) {
+	dsn := os.Getenv("SBCTL_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SBCTL_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	r, err := Open(ctx, tempDatabase(t, dsn, "sbctl_sso"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if ok, err := r.HasDashboardSSO(ctx); err != nil || ok {
+		t.Fatalf("empty: %v %v", ok, err)
+	}
+	org, err := r.CreateOrganization(ctx, "acme", "Acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Pool().Exec(ctx, `insert into sbctl.sso_providers (id, org_id, entity_id) values ('a0000000-0000-4000-8000-000000000001', $1, 'e')`, org.ID); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := r.HasDashboardSSO(ctx); err != nil || !ok {
+		t.Fatalf("with a provider: %v %v", ok, err)
+	}
+	// The organization takes its providers and their users with it.
+	if _, err := r.Pool().Exec(ctx, `delete from sbctl.organizations where id = $1`, org.ID); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := r.HasDashboardSSO(ctx); ok {
+		t.Fatal("a provider outlived its organization")
 	}
 }

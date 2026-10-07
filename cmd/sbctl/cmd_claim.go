@@ -294,7 +294,9 @@ unless --force is given.`,
 		Short: "The role a user gets on the first SSO sign-in, by email domain",
 		Long: `When single sign-on is set up, a user who signs in for the first time becomes a member of the
 organization and role that their email domain maps to here. A domain without a rule gets no
-access until an administrator invites them.`,
+access until an administrator invites or approves them. A rule applies only to a domain that a
+registered identity provider vouches for (` + "`sbctl sso add --domain`" + ` sets the rules of its domains;
+this command sets one by hand).`,
 	}
 	var defOrg string
 	defSet := &cobra.Command{

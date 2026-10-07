@@ -272,8 +272,8 @@ func NewServer(d Deps) (*Server, error) {
 		}
 	}
 	s.studioRefresh = d.StudioRefresh
-	s.sso = &DashboardSSO{Reg: s.reg, Store: ssoStore, Keys: s.mgr.Keys, Config: s.cfg, GoTrueURL: s.accounts.GoTrueURL, HTTP: s.hc,
-		Members: s.members, Accounts: s.accounts, Now: s.now, Log: s.log, Changed: s.studioChanged}
+	s.sso = NewDashboardSSO(s.accounts, ssoStore)
+	s.sso.Changed = s.studioChanged
 	s.auth = newAuthenticator(s.reg, s.mgr.Keys, s.store, s.now, s.cfg.API.Admins())
 	s.auth.removed = claims.UserRemoved
 	s.auth.sso = s.sso.Admit
