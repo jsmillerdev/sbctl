@@ -117,7 +117,7 @@ export class ProjectStore {
   #fns = new Map<string, FunctionInfo>()
   #roots = new Map<string, string>()
 
-  constructor(readonly root: string) {}
+  constructor(readonly root: string, readonly cacheBytes = ESZIP_CACHE_BYTES) {}
 
   /** The environment of ref, or null when the project has none (no functions yet). */
   async env(ref: string): Promise<ProjectEnv | null> {
@@ -185,22 +185,44 @@ export class ProjectStore {
     return info
   }
 
+  // Insertion order is the LRU order: a hit moves the entry to the end.
   #eszips = new Map<string, Uint8Array>()
   #eszipBytes = 0
+  #sizes = new Map<string, number>()
+
+  /** The size of a function's bundle in bytes; generations never change, so it is read once. */
+  async eszipSize(info: FunctionInfo): Promise<number> {
+    const hit = this.#sizes.get(info.dir) ?? this.#eszips.get(info.dir)?.length
+    if (hit !== undefined) return hit
+    const size = (await retrying(() => Deno.stat(info.eszipPath))).size
+    if (this.#sizes.size >= 2048) this.#sizes.clear()
+    this.#sizes.set(info.dir, size)
+    return size
+  }
 
   /**
    * The bytes of a function's eszip, kept in memory (generations never change) while the
-   * cache stays under its budget; a bundle that alone exceeds the budget is read on every
-   * call and never cached.
+   * cache stays under its budget. The least recently used bundles make room for a new
+   * one; a bundle that alone exceeds the budget is read on every call and never cached.
    */
   async eszip(info: FunctionInfo): Promise<Uint8Array> {
     const hit = this.#eszips.get(info.dir)
-    if (hit) return hit
+    if (hit) {
+      this.#eszips.delete(info.dir)
+      this.#eszips.set(info.dir, hit)
+      return hit
+    }
     const bytes = await retrying(() => Deno.readFile(info.eszipPath))
-    if (bytes.length > ESZIP_CACHE_BYTES) return bytes
-    if (this.#eszipBytes + bytes.length > ESZIP_CACHE_BYTES) {
-      this.#eszips.clear()
-      this.#eszipBytes = 0
+    if (bytes.length > this.cacheBytes) return bytes
+    const raced = this.#eszips.get(info.dir) // another request read it meanwhile
+    if (raced) {
+      this.#eszips.delete(info.dir)
+      this.#eszipBytes -= raced.length
+    }
+    for (const [k, v] of this.#eszips) {
+      if (this.#eszipBytes + bytes.length <= this.cacheBytes) break
+      this.#eszips.delete(k)
+      this.#eszipBytes -= v.length
     }
     this.#eszips.set(info.dir, bytes)
     this.#eszipBytes += bytes.length
@@ -213,6 +235,9 @@ export class ProjectStore {
     this.#roots.delete(ref)
     for (const k of [...this.#fns.keys()]) {
       if (k.startsWith(join(this.root, ref) + '/')) this.#fns.delete(k)
+    }
+    for (const k of [...this.#sizes.keys()]) {
+      if (k.startsWith(join(this.root, ref) + '/')) this.#sizes.delete(k)
     }
     for (const [k, v] of [...this.#eszips]) {
       if (k.startsWith(join(this.root, ref) + '/')) {

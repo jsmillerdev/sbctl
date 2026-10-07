@@ -1,5 +1,12 @@
 import { assert, assertEquals, assertFalse, assertStringIncludes } from 'jsr:@std/assert@1'
-import { makeHandler, TENANT_HEADER, workerEnv, workerPermissions } from './handler.ts'
+import {
+  makeHandler,
+  PROXY_TOKEN_HEADER,
+  TENANT_HEADER,
+  workerEnv,
+  workerPermissions,
+} from './handler.ts'
+import { ProjectLimiter } from './limiter.ts'
 import { ProjectStore } from './projects.ts'
 import {
   FakeError,
@@ -20,10 +27,13 @@ const LIMITS: Limits = {
   requestIdleTimeoutMs: 7000,
   requestAbsentTimeoutMs: 3000,
   maxPerProject: 0,
+  maxWorkers: 0,
   maxWorkersPerProject: 0,
+  maxBundleBytes: 0,
   cpuTimeSoftLimitMs: 100,
   cpuTimeHardLimitMs: 200,
 }
+const TOKEN = 'proxy-token-0123456789abcdef'
 const SECRET_A = 'secret-of-project-a-0123456789012345678901'
 const SECRET_B = 'secret-of-project-b-0123456789012345678901'
 
@@ -55,6 +65,7 @@ async function fixture(limits: Partial<Limits> = {}): Promise<Fixture> {
     runtime: rt,
     limits: { ...LIMITS, ...limits },
     port: '9000',
+    proxyToken: TOKEN,
     log: silent,
   })
   return {
@@ -75,7 +86,11 @@ const req = (
 ) =>
   new Request(`http://runtime${path}`, {
     ...init,
-    headers: { ...(ref ? { [TENANT_HEADER]: ref } : {}), ...headers },
+    headers: {
+      [PROXY_TOKEN_HEADER]: TOKEN,
+      ...(ref ? { [TENANT_HEADER]: ref } : {}),
+      ...headers,
+    },
   })
 
 Deno.test('the health path needs no project', async () => {
@@ -464,5 +479,100 @@ Deno.test('a project cannot hold more live workers than its cap, and another pro
     )
   } finally {
     await f.cleanup()
+  }
+})
+
+Deno.test('a request without the proxy secret is refused, whatever project it names', async () => {
+  const f = await fixture()
+  try {
+    const bearer = { authorization: `Bearer ${f.anonA}` }
+    // What a function worker can do: reach the port and choose the project itself.
+    for (const token of ['', 'wrong', TOKEN + 'x', TOKEN.slice(1)]) {
+      const res = await f.handle(
+        new Request('http://runtime/hello', {
+          headers: { [TENANT_HEADER]: REF_A, [PROXY_TOKEN_HEADER]: token, ...bearer },
+        }),
+      )
+      assertEquals(res.status, 403, `token ${JSON.stringify(token)}`)
+    }
+    const none = await f.handle(
+      new Request('http://runtime/open', { headers: { [TENANT_HEADER]: REF_A } }),
+    )
+    assertEquals(none.status, 403)
+    assertEquals(f.rt.created.length, 0, 'no worker was created for a refused request')
+    // The health probe of the fleet carries no secret.
+    assertEquals((await f.handle(new Request('http://runtime/_internal/health'))).status, 200)
+    // With the secret the same request is served, and the worker never sees the secret.
+    assertEquals((await f.handle(req('/hello', REF_A, bearer))).status, 200)
+    const seen = f.rt.forwarded[0]
+    assertFalse(seen.headers.has(PROXY_TOKEN_HEADER))
+    assertFalse(seen.headers.has(TENANT_HEADER))
+  } finally {
+    await f.cleanup()
+  }
+})
+
+Deno.test('the runtime-wide worker budget holds across projects: over-budget requests get 503, workers stay within it', async () => {
+  // Budget of 6 workers for the whole runtime, at most 4 for one project. Two projects
+  // warm 5 and 5 functions each: A gets 4 (its share), B gets 2 (what is left), and every
+  // other function is refused before a worker is created.
+  const f = await fixture({ maxWorkers: 6, maxWorkersPerProject: 4, memoryLimitMb: 250 })
+  try {
+    const slugs = ['f1', 'f2', 'f3', 'f4', 'f5']
+    for (const ref of [REF_A, REF_B]) {
+      for (const slug of slugs) await writeFunction(f.root, ref, slug, { verifyJwt: false })
+    }
+    const status = async (ref: string, slug: string) =>
+      (await f.handle(req(`/${slug}`, ref))).status
+    const a = []
+    for (const slug of slugs) a.push(await status(REF_A, slug))
+    assertEquals(a, [200, 200, 200, 200, 503])
+    const b = []
+    for (const slug of slugs) b.push(await status(REF_B, slug))
+    assertEquals(b, [200, 200, 503, 503, 503])
+    const keys = new Set(f.rt.created.map((o) => o.poolKey))
+    assertEquals(keys.size, 6, 'six distinct workers in all, the budget')
+    for (const o of f.rt.created) assertEquals(o.memoryLimitMb, 250)
+    const refused = await f.handle(req('/f5', REF_B))
+    assertEquals(refused.headers.get('sb-error-code'), 'PROJECT_AT_CAPACITY')
+    assertStringIncludes((await refused.json()).message, 'runtime')
+    // Warm functions keep working, in both projects, while the budget is spent.
+    assertEquals(await status(REF_A, 'f1'), 200)
+    assertEquals(await status(REF_B, 'f2'), 200)
+    assertEquals(new Set(f.rt.created.map((o) => o.poolKey)).size, 6)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+Deno.test('a redeployment counts as a new worker until the old one has idled out', async () => {
+  let t = 0
+  const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'sbctl-handler-test-' }))
+  try {
+    await writeProject(root, REF_A, SECRET_A)
+    await writeFunction(root, REF_A, 'a', { verifyJwt: false })
+    await writeFunction(root, REF_A, 'b', { verifyJwt: false })
+    const rt = new FakeRuntime()
+    const limiter = new ProjectLimiter({
+      maxRequests: 0,
+      maxWorkers: 2,
+      workerTtlMs: 1000,
+      now: () => t,
+    })
+    const handle = makeHandler({
+      store: new ProjectStore(root),
+      runtime: rt,
+      limits: LIMITS,
+      limiter,
+      log: silent,
+    })
+    const get = async (slug: string) => (await handle(req(`/${slug}`, REF_A))).status
+    assertEquals([await get('a'), await get('b')], [200, 200])
+    await writeFunction(root, REF_A, 'a', { verifyJwt: false, version: 2 })
+    assertEquals(await get('a'), 503, 'old and new generation of a, and b: three workers')
+    t = 2000
+    assertEquals(await get('a'), 200)
+  } finally {
+    await Deno.remove(root, { recursive: true })
   }
 })

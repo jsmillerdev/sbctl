@@ -81,7 +81,9 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 		"SBCTL_FUNCTIONS_WALL_CLOCK_SEC":          strconv.Itoa(f.WallClock()),
 		"SBCTL_FUNCTIONS_IDLE_TIMEOUT_SEC":        strconv.Itoa(f.IdleTimeout()),
 		"SBCTL_FUNCTIONS_MAX_PER_PROJECT":         strconv.Itoa(f.PerProject()),
+		"SBCTL_FUNCTIONS_MAX_WORKERS":             strconv.Itoa(f.Workers()),
 		"SBCTL_FUNCTIONS_MAX_WORKERS_PER_PROJECT": strconv.Itoa(f.WorkersPerProject()),
+		"SBCTL_FUNCTIONS_WORKER_COST_MB":          strconv.Itoa(f.WorkerCostMB()),
 		"SBCTL_FUNCTIONS_CPU_SOFT_MS":             strconv.Itoa(f.CPUSoft()),
 		"SBCTL_FUNCTIONS_CPU_HARD_MS":             strconv.Itoa(f.CPUHard()),
 		// The runtime keeps one module cache for the whole process (it reads DENO_DIR once,
@@ -99,9 +101,10 @@ func edgeRuntimeSpec(cfg *config.Config, s units.Spec) (units.Spec, error) {
 		"--user-worker-request-idle-timeout", strconv.Itoa(f.IdleTimeout() * 1000),
 		"--graceful-exit-timeout", "10",
 	}
-	if n := f.Parallelism(); n > 0 {
-		args = append(args, "--max-parallelism", strconv.Itoa(n))
-	}
+	// --max-parallelism is a semaphore per pool key (one function), not a limit on the
+	// runtime: the cap on all workers together is the main service's (SBCTL_FUNCTIONS_
+	// MAX_WORKERS), derived from the same budget as the memory limit below.
+	args = append(args, "--max-parallelism", strconv.Itoa(f.Parallelism()))
 	s.Exec = args
 	// The workers of one runtime share its memory limit: the default is what all of them
 	// can use together (config validates an explicit value against that).

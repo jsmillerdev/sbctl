@@ -16,6 +16,8 @@ import type {
 } from './types.ts'
 
 export const TENANT_HEADER = 'x-sbctl-project-ref'
+/** The secret the proxy sends with every request (SBCTL_FUNCTIONS_PROXY_TOKEN). */
+export const PROXY_TOKEN_HEADER = 'x-sbctl-proxy-token'
 export const MAX_WORKER_RETRIES = 3
 
 export interface HandlerDeps {
@@ -26,6 +28,11 @@ export interface HandlerDeps {
   limiter?: ProjectLimiter
   /** Port of this runtime, denied to workers (see workerPermissions). */
   port?: string
+  /**
+   * The secret every request must carry in X-Sbctl-Proxy-Token; empty accepts requests
+   * without one (tests only: sbctl always sets it).
+   */
+  proxyToken?: string
   log?: Logger
   now?: () => number
 }
@@ -44,6 +51,18 @@ function failure(
       ...extra,
     },
   })
+}
+
+/** Compares two secrets without leaking where they differ. */
+async function sameSecret(a: string, b: string): Promise<boolean> {
+  const enc = new TextEncoder()
+  const [x, y] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(a)),
+    crypto.subtle.digest('SHA-256', enc.encode(b)),
+  ]).then((d) => d.map((buf) => new Uint8Array(buf)))
+  let diff = 0
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i]
+  return diff === 0
 }
 
 const notFound = () => failure(ErrorCodes.NotFound, 'Requested function was not found', 404)
@@ -73,12 +92,13 @@ export function workerEnv(slug: string, env: ProjectEnv): [string, string][] {
 
 /**
  * The permissions of a user worker: the runtime's own defaults for user workers (its
- * environment, the network, imports) plus a deny rule for the runtime's own port, so a
- * function cannot call this service with a project reference of its choosing. The rule
- * matches host names as written, so it is defense in depth; the real guard is that the
- * port listens on loopback and a forged reference only reaches what the proxy would
- * serve to anyone, still behind the function's own JWT check. Files are not listed: a
- * user worker sees only its module graph, not the disk (verified, see the README).
+ * environment, the network, imports) plus a deny rule for the runtime's own port. The
+ * rule matches host names as written (a name that resolves to loopback, such as
+ * <x>.127.0.0.1.sslip.io, or an IPv4-mapped IPv6 literal, is not covered), so it is only a
+ * first line: the guard is the proxy's secret. This service refuses every request that
+ * lacks X-Sbctl-Proxy-Token, so a worker that reaches the port by any name cannot choose
+ * a project reference. Files are not listed: a user worker sees only its module graph,
+ * not the disk (verified, see the README).
  */
 export function workerPermissions(port: string): WorkerOptions['permissions'] {
   const p: NonNullable<WorkerOptions['permissions']> = {
@@ -111,7 +131,9 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
   const limiter = deps.limiter ??
     new ProjectLimiter({
       maxRequests: limits.maxPerProject,
-      maxWorkers: limits.maxWorkersPerProject,
+      maxWorkers: limits.maxWorkers,
+      maxWorkersPerProject: limits.maxWorkersPerProject,
+      maxBundleBytes: limits.maxBundleBytes,
       workerTtlMs: limits.requestAbsentTimeoutMs + 5_000,
     })
 
@@ -151,6 +173,7 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
       // Internal headers are for this router only; a function never sees them.
       userReq.headers.delete('sb-api-key')
       userReq.headers.delete(TENANT_HEADER)
+      userReq.headers.delete(PROXY_TOKEN_HEADER)
       runtime.applyTag(req, userReq)
       return tagWorkerResponse(await worker.fetch(userReq))
     } catch (e) {
@@ -208,8 +231,16 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
     const url = new URL(req.url)
     if (url.pathname === '/_internal/health') return Response.json({ message: 'ok' })
 
-    // The tenant comes from the proxy only. A missing or malformed header means the
-    // request did not come through it, so there is no project to serve.
+    // Only the proxy may name a tenant. The port listens on loopback, which a function
+    // worker can reach too, so the proxy proves itself with a secret that workers never see.
+    if (deps.proxyToken) {
+      const token = req.headers.get(PROXY_TOKEN_HEADER) ?? ''
+      if (!await sameSecret(token, deps.proxyToken)) {
+        return failure(ErrorCodes.BadRequest, 'Forbidden', 403)
+      }
+    }
+    // A missing or malformed tenant header means the request did not come through the
+    // proxy either, so there is no project to serve.
     const ref = req.headers.get(TENANT_HEADER) ?? ''
     if (!validRef(ref)) {
       return failure(ErrorCodes.BadRequest, 'Missing or invalid project reference', 400)
@@ -234,12 +265,24 @@ export function makeHandler(deps: HandlerDeps): (req: Request) => Promise<Respon
       const bad = await verifyJWT(token, env.jwtSecret, deps.now?.())
       if (bad) return authErrorResponse(bad)
     }
-    const admission = limiter.acquire(ref, poolKey(ref, slug, info, env))
+    let bundleBytes = 0
+    try {
+      bundleBytes = await store.eszipSize(info)
+    } catch (e) {
+      if (!(e instanceof Deno.errors.NotFound)) {
+        log.error(`${ref}/${slug}: reading the bundle size:`, e)
+        return failure(ErrorCodes.BootError, 'Function failed to start (please check logs)', 503)
+      }
+      return notFound()
+    }
+    const admission = limiter.acquire(ref, poolKey(ref, slug, info, env), bundleBytes)
     if ('refused' in admission) {
-      log.warn(`${ref}/${slug}: refused, the project is at its limit of ${admission.refused}`)
+      log.warn(`${ref}/${slug}: refused, over the limit of ${admission.refused}`)
       return failure(
         ErrorCodes.ProjectAtCapacity,
-        'This project has too many functions running at once; try again shortly',
+        admission.refused === 'workers'
+          ? 'The Edge Functions runtime is running as many functions as it can; try again shortly'
+          : 'This project has too many functions or requests running at once; try again shortly',
         503,
         { 'Retry-After': '1' },
       )

@@ -16,12 +16,24 @@ const (
 	DefaultFunctionsIdleTimeoutSec = 150
 	DefaultFunctionsCPUSoftMs      = 1000
 	DefaultFunctionsCPUHardMs      = 2000
-	DefaultFunctionsMaxParallelism = 16
-	// DefaultFunctionsMaxPerProject applies when the runtime-wide cap is off.
-	DefaultFunctionsMaxPerProject = 4
+	// DefaultFunctionsMaxParallelism is the workers one function may have at once. The
+	// runtime's per_worker policy sends every request of a function to its one worker, so a
+	// second one exists only for a moment (a cold burst); 1 keeps the memory budget exact.
+	DefaultFunctionsMaxParallelism = 1
+	// DefaultFunctionsMaxWorkers is the functions (distinct live workers) the whole runtime
+	// may keep warm at once, across all projects, when neither max_workers nor memory_max
+	// says otherwise.
+	DefaultFunctionsMaxWorkers = 16
+	// DefaultFunctionsMaxPerProject is the requests one project may have in flight at once.
+	// It is generous because a worker serves many requests at a time; the memory budget is
+	// the worker cap, not this one.
+	DefaultFunctionsMaxPerProject = 128
 	// FunctionsRuntimeOverheadMB is what the runtime process needs besides its workers'
 	// heaps (the Deno main service, the V8 and Tokio runtimes).
-	FunctionsRuntimeOverheadMB   = 256
+	FunctionsRuntimeOverheadMB = 256
+	// FunctionsWorkerOverheadMB is added to memory_mb for every worker: the heap limit does
+	// not cover an isolate's own structures, buffers and compiled code.
+	FunctionsWorkerOverheadMB    = 32
 	DefaultFunctionsReconcileSec = 30
 )
 
@@ -47,19 +59,31 @@ type Functions struct {
 	// a negative value switches the limit off.
 	CPUSoftMs int `toml:"cpu_soft_ms"`
 	CPUHardMs int `toml:"cpu_hard_ms"`
-	// MaxParallelism caps the workers of the whole runtime alive at once. Zero means
-	// DefaultFunctionsMaxParallelism; negative means no cap.
+	// MaxParallelism is how many workers ONE function (one deployment of one slug of one
+	// project) may have at once: edge-runtime's --max-parallelism, which in v1.77.4 is a
+	// semaphore per pool key, not a limit on the runtime. Zero means
+	// DefaultFunctionsMaxParallelism. It is not the cap on the runtime's workers; see
+	// MaxWorkers.
 	MaxParallelism int `toml:"max_parallelism"`
-	// MaxPerProject caps the requests of one project in flight at once in the shared
-	// runtime; a request over it is answered 503 PROJECT_AT_CAPACITY. Zero means half of
-	// MaxParallelism (at least 1); negative means no cap. Independently of it, a project
-	// may have at most WorkersPerProject distinct live workers (MaxParallelism - 1), so it
-	// can never hold every slot of the pool.
+	// MaxWorkers caps the live workers of the whole runtime, all projects together; the
+	// main service enforces it (functions-main/src/limiter.ts) by refusing a request that
+	// would need a worker over the cap with 503 PROJECT_AT_CAPACITY. Zero derives it from
+	// memory_max (see Workers), or DefaultFunctionsMaxWorkers when that is unset; negative
+	// means no cap.
+	MaxWorkers int `toml:"max_workers"`
+	// MaxWorkersPerProject caps the live workers of one project, so one project cannot
+	// take the whole budget. Zero means half of MaxWorkers (at least 1); negative means
+	// the whole budget.
+	MaxWorkersPerProject int `toml:"max_workers_per_project"`
+	// MaxPerProject caps the requests of one project in flight at once; a request over it
+	// is answered 503 PROJECT_AT_CAPACITY. Zero means DefaultFunctionsMaxPerProject;
+	// negative means no cap.
 	MaxPerProject int `toml:"max_per_project"`
 	// MemoryMax is the memory limit of sb-edge-runtime (systemd syntax, "2G"). Empty means
-	// MaxParallelism x MemoryMB plus FunctionsRuntimeOverheadMB, the most the workers can
-	// use together; a value below that fails validation, because a runtime that hits its
-	// cgroup limit is killed whole, for every project.
+	// Workers x worker cost plus FunctionsRuntimeOverheadMB, the most the workers can use
+	// together. A value below what max_workers needs fails validation, because a runtime
+	// that hits its cgroup limit is killed whole, for every project. When max_workers is
+	// zero, memory_max sets it.
 	MemoryMax string `toml:"memory_max"`
 	// ProjectURLTemplate is SUPABASE_URL as functions see it, with {ref} for the project
 	// ref. Empty derives it from the domain, the TLS mode and the public listen ports
@@ -97,12 +121,21 @@ func (f Functions) CPUSoft() int { return limitOrOff(f.CPUSoftMs, DefaultFunctio
 // CPUHard returns the hard CPU limit in ms; 0 means off.
 func (f Functions) CPUHard() int { return limitOrOff(f.CPUHardMs, DefaultFunctionsCPUHardMs) }
 
-// Parallelism returns the worker cap; 0 means no cap.
+// Parallelism returns the workers one function may have at once (at least 1).
 func (f Functions) Parallelism() int {
-	return limitOrOff(f.MaxParallelism, DefaultFunctionsMaxParallelism)
+	if f.MaxParallelism < 1 {
+		return DefaultFunctionsMaxParallelism
+	}
+	return f.MaxParallelism
 }
 
-// PerProject returns the cap on one project's requests and workers; 0 means no cap.
+// WorkerCostMB is what one live function counts against the memory budget: its heap limit
+// and isolate overhead, for every worker it may have at once.
+func (f Functions) WorkerCostMB() int {
+	return f.Parallelism() * (f.Memory() + FunctionsWorkerOverheadMB)
+}
+
+// PerProject returns the cap on one project's requests in flight; 0 means no cap.
 func (f Functions) PerProject() int {
 	switch n := f.MaxPerProject; {
 	case n < 0:
@@ -110,20 +143,42 @@ func (f Functions) PerProject() int {
 	case n > 0:
 		return n
 	}
-	if p := f.Parallelism(); p > 0 {
-		return max(1, p/2)
-	}
 	return DefaultFunctionsMaxPerProject
 }
 
-// WorkersPerProject returns how many distinct live workers (functions) one project may
-// have: one less than the runtime-wide cap, so a project never holds every slot. 0 means
-// no cap (the runtime-wide cap is off).
-func (f Functions) WorkersPerProject() int {
-	if p := f.Parallelism(); p > 0 {
-		return max(1, p-1)
+// Workers returns the cap on live workers (functions kept warm) of the whole runtime;
+// 0 means no cap. An explicit max_workers wins; otherwise a finite memory_max decides how
+// many workers fit into it, and without either the default applies.
+func (f Functions) Workers() int {
+	switch n := f.MaxWorkers; {
+	case n < 0:
+		return 0
+	case n > 0:
+		return n
 	}
-	return 0
+	if f.MemoryMax != "" {
+		if limit, finite, err := parseSystemdSize(f.MemoryMax); err == nil && finite {
+			room := int64(limit>>20) - FunctionsRuntimeOverheadMB
+			return int(max(room, 0) / int64(f.WorkerCostMB()))
+		}
+	}
+	return DefaultFunctionsMaxWorkers
+}
+
+// WorkersPerProject returns how many live workers (functions) one project may have: its
+// share of Workers, so that one project cannot hold the whole budget. 0 means no cap
+// (the runtime-wide cap is off).
+func (f Functions) WorkersPerProject() int {
+	total := f.Workers()
+	switch n := f.MaxWorkersPerProject; {
+	case total == 0:
+		return max(n, 0)
+	case n < 0:
+		return total
+	case n > 0:
+		return min(n, total)
+	}
+	return max(1, total/2)
 }
 
 // RuntimeMemoryMax returns the MemoryMax of sb-edge-runtime: the configured value, or when
@@ -133,8 +188,8 @@ func (f Functions) RuntimeMemoryMax() string {
 	if f.MemoryMax != "" {
 		return f.MemoryMax
 	}
-	if p := f.Parallelism(); p > 0 {
-		return strconv.Itoa(p*f.Memory()+FunctionsRuntimeOverheadMB) + "M"
+	if w := f.Workers(); w > 0 {
+		return strconv.Itoa(w*f.WorkerCostMB()+FunctionsRuntimeOverheadMB) + "M"
 	}
 	return ""
 }
@@ -142,17 +197,27 @@ func (f Functions) RuntimeMemoryMax() string {
 // Validate checks that the limits agree: the workers the runtime may hold at once must
 // fit into its memory limit.
 func (f Functions) Validate() error {
-	if !f.Enabled || f.MemoryMax == "" || f.Parallelism() == 0 {
+	if !f.Enabled {
+		return nil
+	}
+	if f.MaxParallelism < 0 {
+		return fmt.Errorf("config: functions.max_parallelism %d must be positive: it is the workers one function may have at once, not a cap on the runtime (use max_workers for that)", f.MaxParallelism)
+	}
+	if f.MemoryMax == "" {
 		return nil
 	}
 	limit, finite, err := parseSystemdSize(f.MemoryMax)
 	if err != nil {
 		return fmt.Errorf("config: functions.memory_max: %w", err)
 	}
-	need := uint64(f.Parallelism()*f.Memory()+FunctionsRuntimeOverheadMB) << 20
-	if finite && limit < need {
-		return fmt.Errorf("config: functions.memory_max %s is below max_parallelism (%d) x memory_mb (%d) + %d MB = %d MB: the runtime would be killed for every project when its workers use their heaps; raise memory_max or lower max_parallelism or memory_mb",
-			f.MemoryMax, f.Parallelism(), f.Memory(), FunctionsRuntimeOverheadMB, need>>20)
+	if !finite || f.MaxWorkers < 0 {
+		return nil
+	}
+	workers := f.Workers()
+	need := uint64(max(workers, 1)*f.WorkerCostMB()+FunctionsRuntimeOverheadMB) << 20
+	if workers < 1 || limit < need {
+		return fmt.Errorf("config: functions.memory_max %s cannot hold %d worker(s) of %d MB (memory_mb %d + %d MB overhead, x %d per function) plus %d MB for the runtime (%d MB needed): the runtime would be killed for every project when its workers use their heaps; raise memory_max or lower max_workers or memory_mb",
+			f.MemoryMax, max(workers, 1), f.WorkerCostMB(), f.Memory(), FunctionsWorkerOverheadMB, f.Parallelism(), FunctionsRuntimeOverheadMB, need>>20)
 	}
 	return nil
 }

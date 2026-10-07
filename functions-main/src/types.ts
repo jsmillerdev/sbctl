@@ -44,14 +44,19 @@ export interface Limits {
   requestIdleTimeoutMs: number
   /** A worker that has had no request for this long is retired. */
   requestAbsentTimeoutMs: number
-  /**
-   * How many requests one project may have in flight at once (0: no cap). The runtime's
-   * worker pool and memory are shared by all projects; this keeps one project's flood of
-   * slow requests from taking them.
-   */
+  /** How many requests one project may have in flight at once (0: no cap). */
   maxPerProject: number
-  /** How many distinct live workers (functions) one project may have (0: no cap), so it never holds every pool slot. */
+  /**
+   * How many distinct live workers (functions) the whole runtime may have (0: no cap). The
+   * runtime's own --max-parallelism is a semaphore per function, not a limit on the
+   * runtime, so this is the only cap on the memory the workers can use together; the
+   * unit's MemoryMax is derived from it.
+   */
+  maxWorkers: number
+  /** How many distinct live workers one project may have (0: no cap): its share of maxWorkers. */
   maxWorkersPerProject: number
+  /** Bundle bytes of one project's functions in flight at once (0: no cap). */
+  maxBundleBytes: number
   cpuTimeSoftLimitMs: number
   cpuTimeHardLimitMs: number
 }

@@ -12,6 +12,7 @@ const handler = makeHandler({
   runtime: edgeRuntime(),
   limits: config.limits,
   port: Deno.env.get('EDGE_RUNTIME_PORT') ?? '',
+  proxyToken: config.proxyToken,
 })
 
 console.log(`sbctl functions main service started (functions in ${config.root})`)

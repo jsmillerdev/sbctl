@@ -1,4 +1,5 @@
 import {
+  assert,
   assertEquals,
   assertNotStrictEquals,
   assertRejects,
@@ -181,6 +182,37 @@ Deno.test('a bundle larger than the cache budget is read each time and never cac
     const cached = await store.eszip(smallInfo)
     await store.eszip(bigInfo)
     assertStrictEquals(await store.eszip(smallInfo), cached)
+  } finally {
+    await Deno.remove(root, { recursive: true })
+  }
+})
+
+Deno.test('the bundle cache evicts the least recently used bundle, not everything', async () => {
+  const root = await tmp()
+  try {
+    await writeProject(root, REF_A, 's')
+    const body = (c: string) => new TextEncoder().encode(c.repeat(40))
+    for (const s of ['a', 'b', 'c']) await writeBundle(root, REF_A, s, body(s))
+    const store = new ProjectStore(root, 100) // room for two bundles of 40 bytes
+    const info = async (s: string) => (await store.fn(REF_A, s))!
+    const [a, b, c] = [await info('a'), await info('b'), await info('c')]
+    await store.eszip(a)
+    await store.eszip(b)
+    await store.eszip(a) // a is now the most recently used
+    await store.eszip(c) // makes room by evicting b only
+    assertEquals(await store.eszipSize(b), 40)
+    // Files gone: only what the cache holds can still be read.
+    for (const i of [a, b, c]) await Deno.remove(i.eszipPath)
+    assertEquals((await store.eszip(a)).length, 40)
+    assertEquals((await store.eszip(c)).length, 40)
+    let gone = false
+    try {
+      await store.eszip(b)
+    } catch (e) {
+      gone = e instanceof Deno.errors.NotFound
+    }
+    assert(gone, 'b was evicted')
+    assertEquals(await store.eszipSize(b), 40, 'sizes are remembered per generation')
   } finally {
     await Deno.remove(root, { recursive: true })
   }
