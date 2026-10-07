@@ -22,6 +22,11 @@ EnvironmentFile=/var/lib/sbctl/projects/system/edge-bundle.env
 ExecStart=/var/lib/sbctl/projects/system/edge-bundle.run
 # A bundle that has not finished in this time is killed; the API's request gives up at about the same time.
 TimeoutStartSec=150s
+# "edge-runtime bundle" exits 1 when the uploaded code does not bundle (a module that does not exist, a
+# syntax error): that is the uploader's mistake, not a failure of the unit, so it must not leave the unit
+# in the failed state (systemctl --failed, alerts) for every bad upload. The API decides by the output file
+# and shows the bundler's own log; a kill by the timeout or the memory limit stays a failure.
+SuccessExitStatus=1
 MemoryAccounting=yes
 CPUAccounting=yes
 MemoryMax=1G
