@@ -358,7 +358,9 @@ like every other `/auth/v1` path.
   them the usual way; denying (`sbctl sso deny`, `DELETE`) deletes the account. The default role is for the first
   request only: a user who later loses every membership waits again and is not given it again. A second provider
   cannot give its users another provider's default role by asserting that provider's domains. A personal access token
-  that an SSO user made carries the user's roles like any other; removing a provider revokes the tokens of its users.
+  that an SSO user made carries the user's roles like any other; removing a provider revokes the tokens of its users. An SSO
+  session meets an organization's "require MFA" (GoTrue marks it aal1 whatever the provider did, and the provider is where
+  strong authentication is enforced; the switch would otherwise lock out every SSO user).
 - **Sign-up stays closed.** GoTrue's own switch (`GOTRUE_DISABLE_SIGNUP`) also stops an SSO user's first sign-in, so
   it is off on `sb-gotrue@system` and its before-user-created hook is on: GoTrue asks `POST
   /internal/hooks/before-user-created` on the loopback admin listener (signed with a secret derived from the master key

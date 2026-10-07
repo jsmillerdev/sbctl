@@ -1026,3 +1026,25 @@ func TestSSOUserRemovalClearsThePendingList(t *testing.T) {
 		t.Fatalf("the removed account's session: %d", rec.Code)
 	}
 }
+
+// An organization that requires MFA still lets its SSO users in: the identity provider is where
+// strong authentication is enforced, and GoTrue marks an SSO session aal1 whatever the provider did.
+func TestSSOSessionsMeetTheMFARequirement(t *testing.T) {
+	f := newSSOFixture(t)
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	tok := f.ssoToken(ssoUser1, "alice@acme.test", id)
+	if rec := f.doAs(tok, "GET", "/platform/projects", nil); rec.Code != 200 {
+		t.Fatalf("first: %d", rec.Code)
+	}
+	if err := f.srv.members.SetMFAEnforced(context.Background(), f.org.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if rec := f.doAs(tok, "GET", "/platform/organizations/default", nil); rec.Code != 200 {
+		t.Fatalf("an SSO session under the MFA requirement: %d %s", rec.Code, rec.Body)
+	}
+	// A password session below aal2 is still refused: the requirement is on.
+	pw := f.signJWT(map[string]any{"sub": f.userID, "email": "dev@example.test", "role": "authenticated", "aal": "aal1"})
+	if rec := f.doAs(pw, "GET", "/platform/organizations/default", nil); rec.Code != 403 {
+		t.Fatalf("a password session without a second factor: %d", rec.Code)
+	}
+}

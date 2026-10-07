@@ -212,6 +212,7 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 		return nil, errUnauthorized
 	}
 	email, _ := claims["email"].(string)
+	sso := false
 	if prov := ssoProviderOf(claims); prov != "" {
 		// A user who signed in through an identity provider has no sbctl_admin claim: the
 		// provider being registered and the user belonging to an organization (or getting the
@@ -222,10 +223,18 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 		if err := a.sso(ctx, sub, email, prov); err != nil {
 			return nil, err
 		}
+		sso = true
 	} else if !a.isAdmin(claims, email) {
 		return nil, errForbidden
 	}
 	aal, _ := claims["aal"].(string)
+	if sso {
+		// A session that the company's identity provider vouched for meets an organization's
+		// "require MFA": the provider is where strong authentication is enforced, and GoTrue's
+		// token for an SSO sign-in is aal1 whatever the provider did, so without this the
+		// switch would lock out every SSO user.
+		aal = "aal2"
+	}
 	p := &Principal{UserID: sub, Email: email, Via: "jwt", AAL: aal}
 	// Record the user on first sight, then at most once a minute: every dashboard
 	// request carries a JWT and none of them should write to the database.
