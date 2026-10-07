@@ -224,7 +224,8 @@ func TestPostgRESTRealtimeStorageConfig(t *testing.T) {
 		t.Fatalf("v1 read: %v", v)
 	}
 	f.mustDo("PATCH", st, map[string]any{"fileSizeLimit": 536870912001}, 400)
-	f.mustDo("PATCH", st, map[string]any{"features": map[string]any{"teleport": map[string]any{"enabled": true}}}, 400)
+	f.mustDo("PATCH", st, map[string]any{"features": map[string]any{"imageTransformation": map[string]any{"enabled": "yes"}}}, 400)
+	f.mustDo("PATCH", st, map[string]any{"features": map[string]any{"teleport": map[string]any{"enabled": true}}}, 200) // unknown features are dropped
 }
 
 func TestPostgresConfig(t *testing.T) {

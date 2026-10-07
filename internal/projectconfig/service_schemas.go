@@ -99,28 +99,31 @@ var storageFeatureKeys = map[string]map[string]Kind{
 	"vectorBuckets":       {"enabled": Bool, "maxBuckets": Number, "maxIndexes": Number},
 }
 
+// storageFeatures checks the types of the features it knows; a feature or a setting it does
+// not know is not an error (the tenant API grows, and Studio saves whole objects) and is
+// dropped by normalizeStorageFeatures.
 func storageFeatures(v any) error {
 	for name, raw := range v.(map[string]any) {
 		keys, ok := storageFeatureKeys[name]
 		if !ok {
-			return fmt.Errorf("unknown feature %q", name)
+			continue
 		}
 		obj, ok := raw.(map[string]any)
 		if !ok {
 			return fmt.Errorf("feature %s must be an object", name)
 		}
 		for k, x := range obj {
-			kind, ok := keys[k]
-			if !ok {
-				return fmt.Errorf("unknown setting %s.%s", name, k)
+			kind, known := keys[k]
+			if !known {
+				continue
 			}
 			switch kind {
 			case Bool:
-				if _, ok := x.(bool); !ok {
+				if _, isBool := x.(bool); !isBool {
 					return fmt.Errorf("%s.%s must be a boolean", name, k)
 				}
 			case Number:
-				if n, ok := x.(float64); !ok || n < 0 {
+				if n, isNum := x.(float64); !isNum || n < 0 {
 					return fmt.Errorf("%s.%s must be a non-negative number", name, k)
 				}
 			}
@@ -129,20 +132,45 @@ func storageFeatures(v any) error {
 	return nil
 }
 
+func hasKey(m map[string]Kind, k string) bool { _, ok := m[k]; return ok }
+
+// normalizeStorageFeatures keeps the features and settings Storage's tenant API knows.
+func normalizeStorageFeatures(v any) any {
+	out := map[string]any{}
+	for name, raw := range v.(map[string]any) {
+		keys, ok := storageFeatureKeys[name]
+		obj, isObj := raw.(map[string]any)
+		if !ok || !isObj {
+			continue
+		}
+		kept := map[string]any{}
+		for k, x := range obj {
+			if hasKey(keys, k) {
+				kept[k] = x
+			}
+		}
+		out[name] = kept
+	}
+	return out
+}
+
 func buildStorageSchema() *Schema {
 	return NewSchema(Storage, []Field{
 		{Name: "fileSizeLimit", Kind: Int, Default: int64(50 * 1024 * 1024), Min: 0, Max: 536870912000, HasRange: true},
-		{Name: "features", Kind: Object, Check: storageFeatures},
+		{Name: "features", Kind: Object, Check: storageFeatures, Normalize: normalizeStorageFeatures},
 		{Name: "external", Kind: Object, Check: func(v any) error {
-			for k, x := range v.(map[string]any) {
-				if k != "upstreamTarget" {
-					return fmt.Errorf("unknown setting %q", k)
-				}
+			if x, ok := v.(map[string]any)["upstreamTarget"]; ok {
 				if s, ok := x.(string); !ok || (s != "main" && s != "canary") {
 					return fmt.Errorf("upstreamTarget must be main or canary")
 				}
 			}
 			return nil
+		}, Normalize: func(v any) any {
+			out := map[string]any{}
+			if x, ok := v.(map[string]any)["upstreamTarget"]; ok {
+				out["upstreamTarget"] = x
+			}
+			return out
 		}},
 	})
 }
@@ -161,7 +189,7 @@ var (
 // the ones the class puts on the command line, which a reload cannot override.
 var pgRestart = map[string]bool{
 	"max_connections": true, "max_locks_per_transaction": true, "max_logical_replication_workers": true,
-	"max_replication_slots": true, "max_sync_workers_per_subscription": false, "max_wal_senders": true,
+	"max_replication_slots": true, "max_wal_senders": true,
 	"max_worker_processes": true, "shared_buffers": true, "track_commit_timestamp": true,
 	"track_activity_query_size": true, "effective_cache_size": true, "maintenance_work_mem": true, "max_wal_size": true,
 }

@@ -307,7 +307,12 @@ func TestStorageAndRealtimeSettings(t *testing.T) {
 	if st.FileSizeLimit != 104857600 || it["enabled"] != true || it["maxResolution"] != float64(1000) {
 		t.Fatalf("storage: %+v", st)
 	}
-	wantInvalid(t, m, Storage, map[string]any{"features": map[string]any{"teleport": map[string]any{"enabled": true}}}, "unknown feature")
+	wantInvalid(t, m, Storage, map[string]any{"features": map[string]any{"imageTransformation": map[string]any{"enabled": "yes"}}}, "must be a boolean")
+	patch(t, m, Storage, map[string]any{"features": map[string]any{"teleport": map[string]any{"enabled": true}, "s3Protocol": map[string]any{"enabled": false, "bogus": 1}}})
+	st, _ = m.StorageSettings(context.Background(), ref)
+	if _, kept := st.Features["teleport"]; kept || st.Features["s3Protocol"].(map[string]any)["enabled"] != false || len(st.Features["s3Protocol"].(map[string]any)) != 1 {
+		t.Fatalf("unknown features and settings must be dropped, known ones kept: %v", st.Features)
+	}
 	wantInvalid(t, m, Storage, map[string]any{"fileSizeLimit": float64(536870912001)}, "between")
 
 	patch(t, m, Realtime, map[string]any{"max_concurrent_users": float64(500), "connection_pool": float64(3), "postgres_changes_pool": float64(2), "private_only": true})
