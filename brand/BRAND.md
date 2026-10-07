@@ -86,15 +86,15 @@ white          #ffffff   the word on black and dark grounds
 
 `readme/` holds the two images the README embeds, each in a dark and a light variant so `<picture>` can follow the reader's GitHub theme. Both are SVG with no embedded rasters and no webfonts: GitHub shows them through `<img>`, which blocks external references. The lockup is outlined paths; every other word is live text in the system font stack (`-apple-system, Segoe UI, Inter, Helvetica, Arial`), so it matches the surrounding page on each platform.
 
-- Banner: lockup at the left, tagline "Multiple Supabase Orgs and Projects. Self-hosted, one server.", one line of small print that says it is not affiliated with Supabase Inc. The oversized mark off the right edge is a neutral gray watermark, not teal, so the banner stays quiet.
-- Architecture: clients on the left, the Supavise node in the middle, backups on the right. Boxes are neutral grays; teal (dark) or ink (light) marks only the node, the `supavise` binary and the data flow. One stroke width throughout. Text is 12 to 19 px in a 1200 px canvas, which is about 9 to 14 px at GitHub's 880 px README width.
+- Banner: lockup at the left, tagline "Supabase orgs and projects, self-hosted.", one line of small print that says it is not affiliated with Supabase Inc. The oversized mark off the right edge is a neutral gray watermark, not teal, so the banner stays quiet.
+- Architecture: clients on the left, the Supavise node in the middle, backups on the right. Boxes are neutral grays; teal (dark) or ink (light) marks only the node, the `supavise` binary and the data flow. The left column shows who calls in (a browser running Studio, not Studio itself); the node shows what runs. The binary is labeled in monospace with no mark beside it, so it never reads as a re-set lockup. Shared-service pills are sized to their labels. One stroke width throughout. Text is 12 to 19 px in a 1200 px canvas, which is about 9 to 14 px at GitHub's 880 px README width.
 - Change the diagram in `arch_svg()` in `build.py`, then re-run it. Check it in a browser as well as `sips`: browser system fonts run wider than the fallback `sips` uses, and the narrowest labels ("Edge Runtime", "WAL + base backups") are the ones that touch their boxes first.
 
 Embed from the repository root README:
 
 ```html
 <p align="center">
-  <a href="https://supavise.dev">
+  <a href="https://github.com/jsmillerdev/supavise">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="brand/readme/banner-dark.svg">
       <img alt="Supavise: many Supabase projects, one server" src="brand/readme/banner-light.svg" width="100%">
@@ -104,7 +104,7 @@ Embed from the repository root README:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="brand/readme/architecture-dark.svg">
-  <img alt="Supavise architecture: clients reach one node over HTTPS; the supavise binary fronts per-project Postgres, Auth and REST plus shared Supavisor, Realtime, Storage, Edge Runtime and Studio; backups go to S3 or local disk" src="brand/readme/architecture-light.svg" width="100%">
+  <img alt="Supavise architecture: a browser with Supabase Studio, the Supabase CLI, the MCP server and your apps reach one node over HTTPS; the supavise binary fronts per-project Postgres, Auth and REST plus shared Supavisor, Realtime, Storage, Edge Runtime and Studio; backups go to S3 or local disk" src="brand/readme/architecture-light.svg" width="100%">
 </picture>
 ```
 
@@ -112,7 +112,7 @@ Badges are static shields.io URLs, so no new service and nothing to keep in sync
 
 ```markdown
 ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-262626?labelColor=0b0b0b)
-![One Go binary](https://img.shields.io/badge/runs_as-one_Go_binary-262626?labelColor=0b0b0b)
+![Runs as systemd units, no Docker](https://img.shields.io/badge/runs_as-systemd_units,_no_Docker-262626?labelColor=0b0b0b)
 ![Ubuntu 24.04+ or Debian 12+](https://img.shields.io/badge/runs_on-Ubuntu_24.04%2B_%7C_Debian_12%2B-262626?labelColor=0b0b0b)
 ![amd64 and arm64](https://img.shields.io/badge/arch-amd64_%7C_arm64-262626?labelColor=0b0b0b)
 ```
