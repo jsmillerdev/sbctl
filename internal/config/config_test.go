@@ -91,3 +91,29 @@ func TestLayout(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestRegion(t *testing.T) {
+	c := Default()
+	if c.Region != "us-east-1" {
+		t.Fatalf("default region %q", c.Region)
+	}
+	for in, want := range map[string]string{"": "us-east-1", "local": "us-east-1", "Frankfurt": "us-east-1", "eu-west-2": "eu-west-2", "ap-southeast-4": "ap-southeast-4", "us-gov-west-1": "us-gov-west-1"} {
+		if got := c.ProjectRegion(in); got != want {
+			t.Errorf("ProjectRegion(%q) = %q, want %q", in, got, want)
+		}
+	}
+	c.Region = "eu-central-1"
+	if got := c.ProjectRegion("local"); got != "eu-central-1" {
+		t.Errorf("configured region not used: %q", got)
+	}
+	bad := Default()
+	bad.Region = "mars"
+	if err := bad.Validate(); err == nil {
+		t.Error("a region that is not an AWS region code must be rejected")
+	}
+	empty := Default()
+	empty.Region = ""
+	if err := empty.Validate(); err != nil || empty.Region != "us-east-1" {
+		t.Errorf("empty region: %v %q", err, empty.Region)
+	}
+}

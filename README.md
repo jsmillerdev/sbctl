@@ -14,6 +14,7 @@ One static Go binary that turns a Linux machine into a multi-project Supabase fo
 | `internal/config` | `/etc/sbctl/config.toml`, `SBCTL_*` overrides, paths, ports, hostnames |
 | `internal/secrets` | master-key sealing and every generated credential |
 | `internal/registry` | control-plane store (system Postgres, schema `sbctl`) |
+| `internal/app` | composition: `sbctl serve` (the daemon), backup wired into lifecycle |
 | `internal/api` | Management API (`/v1`, `/v2`, `/platform`) |
 | `internal/proxy` | HTTPS/WebSocket edge, CertMagic, apikey handling |
 | `internal/artifacts`, `internal/units`, `internal/lifecycle` | artifact fetch, systemd units, project lifecycle |
@@ -22,6 +23,16 @@ One static Go binary that turns a Linux machine into a multi-project Supabase fo
 | `studio/` | platform-mode Studio build and its three patches |
 | `deploy/` | installer, systemd templates, CloudFormation |
 | `tests/conformance` | end-to-end suite against a running node |
+| `tests/e2e` | browser check of Studio through the edge (`studio-smoke.mjs`) |
+| `tests/linux` | systemd smoke test and footprint measurement (CI) |
+
+## Configuration notes
+
+`region` (top level, default `us-east-1`) is the AWS region code that every project reports to
+Studio, the CLI and the MCP server. It is only a label here, but it must be a real region code:
+Studio resolves it against a list of regions and the project list breaks on anything else (a
+project created with another label gets this value). `sbctl serve` is the daemon that
+`sbctl.service` runs.
 
 ## Develop
 

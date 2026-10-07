@@ -1,0 +1,44 @@
+# internal/app
+
+Composition: the pieces that cannot import each other (`backup` needs the lifecycle `Manager`,
+`lifecycle` needs a base backuper, `api` and `proxy` need both) are joined here, and `sbctl serve`
+is the daemon that `sbctl.service` runs.
+
+- `LifecycleOptions(cfg, Options)` is `lifecycle.OpenOptions` with the backup package wired in:
+  every cluster archives WAL through `backup.ArchiveCommand` with the configured
+  `archive_timeout`, deleting a project takes the final base backup through the backup service
+  (`FinalBackup`), and a restore reaches the Engine (`SetManager`). The backup service is built on
+  first use, so commands that never back up do not open the backend. Every command that creates or
+  deletes projects (`sbctl projects`, `system`, `backups`, `serve`) goes through it.
+- `NewBackupService` builds the service over the configured backend and the registry.
+- `PGMetaCryptoKey` is the passphrase shared by sb-pgmeta (its `CRYPTO_KEY`) and the Management
+  API: `[api] pgmeta_crypto_key`, else the sealed system secret `pgmeta_crypto_key`, created on
+  first use. Whoever renders the `sb-pgmeta` unit (the fleet workstream) must pass exactly it.
+- `Serve(ctx, cfg, Options)` is the daemon: it opens the node (registry in the system cluster,
+  master key, Engine), runs `Engine.Recover` (statuses a crash left behind), creates the pg-meta
+  key, builds the Management API (`api.NewServer`, the Postgres store) and the edge proxy
+  (`proxy.New`, `KeySource` = the Engine, no-op `Waker`), listens for the API on the loopback
+  admin address and at `api.<domain>` through the proxy, and starts every active project one at a
+  time next to the listeners (the system project's backup timer and the prune timer too, on
+  systemd). `ctx` ending (SIGTERM) shuts the listeners down gracefully; project units belong to
+  systemd and keep running. The system project must exist (`sbctl system init`).
+
+## Not done
+
+- The fleet (`Options.Fleet`) is an empty `fleet.Fleet` until `cmd/sbctl/serve_fleet.go` calls
+  the fleet workstream's `fleet.Setup`; nothing here starts Supavisor, Realtime, Storage,
+  postgres-meta or Studio.
+- `Serve` does not supervise: a crashed project unit is systemd's to restart (`Restart=on-failure`)
+  and shows as unhealthy through `Health`.
+
+## Test
+
+```
+go test ./internal/app/                                          # wiring, pg-meta key
+SBCTL_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked go test -run Serve -v ./internal/app/
+```
+
+The gated test runs the daemon on real artifacts under the exec backend: system init, a project
+created and stopped before the daemon starts, the daemon bringing it back at boot, requests
+through the proxy (project API, bad key, Management API, dashboard GoTrue) and the admin
+listener, and a graceful stop. It starts two PostgreSQL clusters, GoTrue and PostgREST.

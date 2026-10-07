@@ -157,3 +157,29 @@ func TestWarnConfigFileMode(t *testing.T) {
 		t.Fatalf("0600 file warned: %q", out.String())
 	}
 }
+
+func TestInstallBackupTimerUsesTheConfiguredSchedule(t *testing.T) {
+	dir := t.TempDir()
+	if changed, err := installBackupTimer(dir, "*-*-* 03:00:00"); err != nil || !changed {
+		t.Fatalf("first install: %v %v", changed, err)
+	}
+	if changed, _ := installBackupTimer(dir, "*-*-* 03:00:00"); changed {
+		t.Error("an unchanged timer was rewritten")
+	}
+	if changed, err := installBackupTimer(dir, "*-*-* 01:30:00"); err != nil || !changed {
+		t.Fatalf("new schedule: %v %v", changed, err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "sb-basebackup@.timer"))
+	if !strings.Contains(string(b), "OnCalendar=*-*-* 01:30:00\n") {
+		t.Errorf("timer file:\n%s", b)
+	}
+	if _, err := installBackupTimer(dir, "bad\nExecStart=/bin/sh"); err == nil {
+		t.Error("an expression with a newline must be rejected, not written into the unit")
+	}
+}
+
+func TestServeIsRegistered(t *testing.T) {
+	if c, _, err := rootCmd.Find([]string{"serve"}); err != nil || c == nil || c.Name() != "serve" {
+		t.Fatalf("sbctl serve is not registered: %v", err)
+	}
+}

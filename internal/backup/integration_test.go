@@ -553,8 +553,9 @@ func TestBaseBackupRefusals(t *testing.T) {
 // current WAL segment, which the archiver has not shipped (archive_timeout is minutes
 // away). The restore must archive it first, or recovery runs out of WAL, Postgres shuts
 // down with "recovery ended before configured recovery target was reached", and a dead
-// project would be reported as restored. A target after the newest commit still cannot
-// be reached, and that must be an error, not a registered corpse.
+// project would be reported as restored. A target after the newest commit of an idle
+// source is reachable because the restore writes a commit record first; a target in the
+// future still cannot be reached, and that must be an error, not a registered corpse.
 func TestRestoreRunningSourceToRecentTime(t *testing.T) {
 	bin := pgBinDir(t)
 	sbctl := sbctlBinary(t)
@@ -614,21 +615,35 @@ func TestRestoreRunningSourceToRecentTime(t *testing.T) {
 	}
 	clone.stop()
 
-	// A target after the newest commit: no commit follows it, so recovery cannot stop there.
-	mgr.failStart = true
+	// A target after the newest commit of an idle source: flushArchive writes a commit record
+	// of its own (and switches WAL), so every target before now is reachable.
 	time.Sleep(1200 * time.Millisecond)
 	var late time.Time
 	if err := c.QueryRow(ctx, "select clock_timestamp()").Scan(&late); err != nil {
 		t.Fatal(err)
 	}
-	p3, err := e.svc.Restore(ctx, testRef, late, testRef3)
-	if err == nil {
-		t.Fatalf("restore to a time after the last commit succeeded: %+v", p3)
+	p2, err := e.svc.Restore(ctx, testRef, late, testRef3)
+	if err != nil {
+		t.Fatalf("restore of an idle running source to a time after its last commit: %v", err)
 	}
-	t.Logf("restore past the last commit failed as it must: %v", err)
+	clone2 := mgr.insts[p2.Ref]
+	if ids := queryIDs(t, ctx, clone2.connect(ctx)); idsString(ids) != "[1 2 3]" {
+		t.Fatalf("restored rows = %v, want [1 2 3]", ids)
+	}
+	clone2.stop()
+
+	// A target in the future cannot be reached by any commit: that must be an error, not a
+	// registered corpse.
+	mgr.failStart = true
+	future := time.Now().Add(time.Hour)
+	p3, err := e.svc.Restore(ctx, testRef, future, "cdefghijklmnopqrstuv")
+	if err == nil {
+		t.Fatalf("restore to a time in the future succeeded: %+v", p3)
+	}
+	t.Logf("restore past the end of the archive failed as it must: %v", err)
 	evs, _ := e.reg.ListEvents(ctx, testRef, 20)
 	for _, ev := range evs {
-		if ev.Kind == "restore.completed" && strings.Contains(string(ev.Payload), testRef3) {
+		if ev.Kind == "restore.completed" && strings.Contains(string(ev.Payload), "cdefghijklmnopqrstuv") {
 			t.Fatal("a failed restore was recorded as completed")
 		}
 	}

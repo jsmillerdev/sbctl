@@ -531,7 +531,9 @@ func TestEscapedPathReachesUpstreamUnchanged(t *testing.T) {
 func TestOpenRoutesSurviveKeyLookupFailure(t *testing.T) {
 	h := newHarness(t)
 	h.keys.setFail(errors.New("registry unavailable"))
+	h.srv.table.mu.Lock()
 	h.srv.table.dropAllKeysLocked() // no cached keys to hide the failure
+	h.srv.table.mu.Unlock()
 	for _, target := range []string{"/auth/v1/verify?token=abc&type=signup", "/auth/v1/callback?code=1", "/storage/v1/object/public/avatars/a.png"} {
 		if resp, body := h.project("GET", target); resp.StatusCode != 200 {
 			t.Errorf("GET %s with failing keys = %d %s, want it forwarded", target, resp.StatusCode, body)
@@ -553,8 +555,8 @@ func TestOpenRoutesSurviveKeyLookupFailure(t *testing.T) {
 func TestDerivedProjectRouteRowIsQuiet(t *testing.T) {
 	h := newHarness(t)
 	var buf strings.Builder
-	h.srv.table.log = slog.New(slog.NewTextHandler(&buf, nil))
-	h.srv.table.customRoutes([]registry.Route{
+	tb := newTable(h.cfg, h.reg, h.keys, slog.New(slog.NewTextHandler(&buf, nil))) // own table: the harness's is being synced
+	tb.customRoutes([]registry.Route{
 		{Host: h.host(h.ref), Ref: h.ref, Kind: "api"},     // what lifecycle writes for every project
 		{Host: h.host("tsrqponmlkjihgfedcba"), Ref: h.ref}, // a takeover attempt
 	})

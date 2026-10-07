@@ -28,10 +28,11 @@ func (d dirArts) Dir(svc string) (string, error) {
 }
 func (d dirArts) Tag(svc string) (string, error) { return filepath.Base(d[svc]), nil }
 
-func freePorts(t *testing.T, n int) []int {
+// freePorts returns n free loopback ports at or above from, inside the private range.
+func freePorts(t *testing.T, from, n int) []int {
 	t.Helper()
 	var out []int
-	for p := 34900; p < 35400 && len(out) < n; p++ {
+	for p := from; p < from+300 && len(out) < n; p++ {
 		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
 		if err != nil {
 			continue
@@ -67,7 +68,8 @@ func TestServeIntegration(t *testing.T) {
 	if err != nil {
 		t.Skip("no true(1)")
 	}
-	ports := freePorts(t, 8)
+	ports := freePorts(t, 34900, 3)  // system Postgres, system GoTrue, project base (3 ports per project follow it)
+	listen := freePorts(t, 35300, 3) // proxy HTTP, proxy HTTPS, admin; clear of the project ports above
 	state, err := os.MkdirTemp("/tmp", "sba")
 	if err != nil {
 		t.Fatal(err)
@@ -82,8 +84,8 @@ func TestServeIntegration(t *testing.T) {
 	cfg.TLS.Mode = "off"
 	cfg.BinPath = truePath // archive_command succeeds, so WAL does not pile up
 	cfg.Backup.Backend = "file://" + filepath.Join(state, "backups")
-	cfg.Ports.SystemPostgres, cfg.Ports.SystemGoTrue, cfg.Ports.ProjectBase = ports[0], ports[1], ports[2]
-	cfg.Listen = config.Listen{HTTP: fmt.Sprintf("127.0.0.1:%d", ports[5]), HTTPS: fmt.Sprintf("127.0.0.1:%d", ports[6]), Admin: fmt.Sprintf("127.0.0.1:%d", ports[7])}
+	cfg.Ports.SystemPostgres, cfg.Ports.SystemGoTrue, cfg.Ports.ProjectBase = ports[0], ports[1], 35100 // 35100 + 3n: project ports
+	cfg.Listen = config.Listen{HTTP: fmt.Sprintf("127.0.0.1:%d", listen[0]), HTTPS: fmt.Sprintf("127.0.0.1:%d", listen[1]), Admin: fmt.Sprintf("127.0.0.1:%d", listen[2])}
 	o := Options{Artifacts: arts}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
@@ -117,8 +119,9 @@ func TestServeIntegration(t *testing.T) {
 
 	sctx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
-	go func() { done <- Serve(sctx, cfg, o) }()
-	t.Cleanup(func() { stop(); <-done })
+	served := make(chan struct{}) // closed when Serve has returned, for any number of waiters
+	go func() { done <- Serve(sctx, cfg, o); close(served) }()
+	t.Cleanup(func() { stop(); <-served })
 
 	get := func(host, path string, hdr ...string) (int, string) {
 		req, _ := http.NewRequest("GET", "http://"+cfg.Listen.HTTP+path, nil)
