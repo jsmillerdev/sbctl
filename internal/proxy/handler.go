@@ -59,6 +59,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
+	if p := r.URL.Path; p == "/auth/v1" || strings.HasPrefix(p, "/auth/v1/") {
+		s.serveDashboardAuth(w, r)
+		return
+	}
 	if s.opts.APIHandler == nil {
 		writeJSON(w, http.StatusServiceUnavailable, "Management API is not available")
 		return
@@ -198,6 +202,9 @@ type target struct {
 	del       []string
 	timeout   time.Duration
 	studio    bool
+	// dashboardAuth marks the dashboard GoTrue route: its own CORS headers are replaced
+	// like the project API's, but the policy is set by serveDashboardAuth.
+	dashboardAuth bool
 	// dropTenant removes a client-supplied TenantHeader (only functions sets it).
 	dropTenant bool
 }
@@ -412,4 +419,63 @@ func writePreflight(w http.ResponseWriter, r *http.Request) {
 	}
 	h.Set("Access-Control-Max-Age", "3600")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// serveDashboardAuth forwards api.<domain>/auth/v1/* to the system project's GoTrue, the
+// sign-in service of Studio (its NEXT_PUBLIC_GOTRUE_URL, and the API_EXTERNAL_URL the
+// system GoTrue is configured with). It is the Kong route of upstream's self-hosted
+// gateway for the dashboard: the prefix is stripped, and no apikey is needed or wanted,
+// because gotrue-js in Studio sends none. CORS is limited to the dashboard's own origins
+// (public dashboard URL and [api] allowed_origins); anything else gets no CORS headers.
+func (s *Server) serveDashboardAuth(w http.ResponseWriter, r *http.Request) {
+	pth, trailing, err := cleanPath(r.URL)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, "Bad Request")
+		return
+	}
+	if pth != "/auth/v1" && !strings.HasPrefix(pth, "/auth/v1/") {
+		writeJSON(w, http.StatusNotFound, "Not Found") // ".." stepped out of the prefix
+		return
+	}
+	origin := r.Header.Get("Origin")
+	allowed := origin != "" && s.dashboardOrigin(origin)
+	if allowed {
+		w.Header().Add("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Expose-Headers", "*")
+	}
+	if isPreflight(r) {
+		if allowed {
+			writePreflight(w, r)
+		} else {
+			w.WriteHeader(http.StatusForbidden)
+		}
+		return
+	}
+	rest := strings.TrimPrefix(pth, "/auth/v1")
+	if rest == "" {
+		rest = "/"
+	} else if trailing && !strings.HasSuffix(rest, "/") {
+		rest += "/"
+	}
+	tg := &target{
+		addr: s.upstream(svcAuth, project{ref: config.SystemRef}), path: rest, rawQuery: r.URL.RawQuery,
+		fwdHost: r.Host, fwdPrefix: "/auth/v1/", timeout: defaultTimeout, dashboardAuth: true,
+	}
+	s.forward(w, r, tg)
+}
+
+// dashboardOrigin reports whether a browser origin may call the dashboard's GoTrue.
+func (s *Server) dashboardOrigin(origin string) bool {
+	origin = strings.TrimRight(origin, "/")
+	if strings.EqualFold(origin, s.cfg.DashboardURL()) {
+		return true
+	}
+	for _, o := range s.cfg.API.Origins() {
+		if strings.EqualFold(origin, o) {
+			return true
+		}
+	}
+	return false
 }

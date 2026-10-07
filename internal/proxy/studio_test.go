@@ -63,3 +63,63 @@ func TestStudioCSPDropsUsercentrics(t *testing.T) {
 		t.Fatalf("CSP through the proxy: %s", v)
 	}
 }
+
+// Studio's sign-in goes to api.<domain>/auth/v1 (its NEXT_PUBLIC_GOTRUE_URL and the system
+// GoTrue's API_EXTERNAL_URL): the edge forwards it to the system project's GoTrue.
+func TestDashboardAuthIsForwardedToTheSystemGoTrue(t *testing.T) {
+	h := newHarness(t)
+	var addrFor string
+	h.srv.upstreamFn = func(s service, p project) string {
+		if s == svcAuth {
+			addrFor = p.ref
+		}
+		return h.ups[s].addr()
+	}
+	api := "api." + testDomain
+	studioOrigin := "http://studio." + testDomain
+
+	resp, body := h.reqBody("POST", api, "/auth/v1/token?grant_type=password", `{"email":"a@b.c","password":"x"}`,
+		"Origin", studioOrigin, "Content-Type", "application/json")
+	if resp.StatusCode != 200 {
+		t.Fatalf("token: %d %s", resp.StatusCode, body)
+	}
+	got := h.ups[svcAuth].last(t)
+	if got.Path != "/token" || got.RawQuery != "grant_type=password" || addrFor != "system" {
+		t.Fatalf("upstream saw %s?%s for project %q", got.Path, got.RawQuery, addrFor)
+	}
+	if got.Header.Get("Apikey") != "" || got.Header.Get("Authorization") != "" {
+		t.Errorf("no credentials must be invented: %v", got.Header)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != studioOrigin || resp.Header.Get("Access-Control-Allow-Credentials") != "true" {
+		t.Errorf("CORS for the dashboard origin: %v", resp.Header)
+	}
+	if n := len(resp.Header.Values("Access-Control-Allow-Origin")); n != 1 {
+		t.Errorf("%d Access-Control-Allow-Origin headers, want 1 (upstream's own must be replaced)", n)
+	}
+
+	// Any other origin gets no CORS headers (the browser blocks the call).
+	resp, _ = h.req("GET", api, "/auth/v1/settings", "Origin", "https://evil.example")
+	if resp.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("foreign origin allowed: %v", resp.Header)
+	}
+	// Preflight from the dashboard answers without reaching GoTrue; from elsewhere it is refused.
+	before := h.ups[svcAuth].count()
+	resp, _ = h.req("OPTIONS", api, "/auth/v1/token", "Origin", studioOrigin, "Access-Control-Request-Method", "POST", "Access-Control-Request-Headers", "authorization,content-type,x-client-info")
+	if resp.StatusCode != 204 || !strings.Contains(resp.Header.Get("Access-Control-Allow-Headers"), "x-client-info") {
+		t.Errorf("preflight: %d %v", resp.StatusCode, resp.Header)
+	}
+	if resp, _ = h.req("OPTIONS", api, "/auth/v1/token", "Origin", "https://evil.example", "Access-Control-Request-Method", "POST"); resp.StatusCode != 403 {
+		t.Errorf("foreign preflight: %d", resp.StatusCode)
+	}
+	if h.ups[svcAuth].count() != before {
+		t.Error("preflight reached GoTrue")
+	}
+	// The Management API is untouched.
+	if resp, _ := h.req("GET", api, "/v1/projects"); resp.StatusCode != http.StatusTeapot {
+		t.Errorf("management API: %d", resp.StatusCode)
+	}
+	// Traversal cannot step out of /auth/v1.
+	if resp, _ := h.req("GET", api, "/auth/v1/../../v1/projects"); resp.StatusCode != 404 {
+		t.Errorf("path traversal out of /auth/v1: %d, want 404", resp.StatusCode)
+	}
+}
