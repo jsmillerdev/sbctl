@@ -152,7 +152,7 @@ PSQL=$(ls -d "$SBCTL_STATE"/artifacts/postgres/*/bin/psql | head -1)
 sbctl fleet ensure-tenant "$REF" || fail "ensure-tenant (the tenants the daemon registered must make this a no-op)"
 
 log "REST through the proxy with the publishable key"
-rest_through_proxy "$REF" "$PUB"
+rest_through_proxy "$REF" "$PUB" api
 
 log "Storage through the proxy: bucket, upload and read-back with the secret key"
 st_proxy() { curl -fsS -m 30 -H "Host: $HOST" -H "apikey: $SEC" -H "Authorization: Bearer $SEC" "$@"; }

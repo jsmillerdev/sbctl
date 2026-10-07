@@ -208,6 +208,9 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 			}
 		}
 	}
+	if n.Cfg.Supervisor == config.SupervisorSystemd {
+		refreshSystem(ctx, n, log)
+	}
 	for ref, err := range n.Engine.ResumeRecovered(ctx, recovered) {
 		log.Error("project did not resume after an interrupted restart", "ref", ref, "error", err)
 	}
@@ -229,6 +232,27 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 	log.Info("projects started", "active", started, "failed", len(errs))
 	if bk != nil {
 		finishRestores(ctx, bk, log)
+	}
+}
+
+// refreshSystem re-renders the system cluster with the current settings. StartActive covers
+// the user projects, but sb-postgres@system is started by systemd at boot from the files an
+// earlier run rendered: after an upgrade that changes how clusters archive (the relay, whose
+// unit no longer reads the config) its run script would still hold the old archive_command and
+// archiving would fail silently. Nothing is restarted when the files are unchanged.
+func refreshSystem(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+	p, err := n.Registry.GetProject(ctx, config.SystemRef)
+	if err != nil {
+		log.Warn("system cluster not refreshed", "error", err)
+		return
+	}
+	keys, err := n.Engine.Keys(ctx, config.SystemRef)
+	if err != nil {
+		log.Warn("system cluster not refreshed", "error", err)
+		return
+	}
+	if err := n.Plane.StartDatabase(ctx, p, keys); err != nil {
+		log.Warn("system cluster not refreshed", "error", err)
 	}
 }
 

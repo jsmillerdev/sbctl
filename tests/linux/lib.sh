@@ -164,19 +164,25 @@ project_keys() {
   SEC=$(printf '%s' "$k" | json_get '[x["api_key"] for x in d if str(x.get("api_key","")).startswith("sb_secret_")][0]') || fail "no secret key: $k"
 }
 
-# rest_through_proxy REF PUB: creates a table through database/query and reads it back with the
-# publishable key through the proxy.
+# SMOKE_TABLE_SQL creates the table the REST and pooler checks read.
+SMOKE_TABLE_SQL="create table public.smoke_items (id int primary key, label text); insert into public.smoke_items values (1, 'one'), (2, 'two'); grant select on public.smoke_items to anon; notify pgrst, 'reload schema';"
+
+# rest_through_proxy REF PUB [api]: reads public.smoke_items with the publishable key through
+# the proxy (the table is created first through the Management API's database/query, which needs
+# postgres-meta, when the third argument is "api"; otherwise the caller created it).
 rest_through_proxy() {
-  local ref=$1 pub=$2 n="" i sql
-  sql="create table public.smoke_items (id int primary key, label text); insert into public.smoke_items values (1, 'one'), (2, 'two'); grant select on public.smoke_items to anon; notify pgrst, 'reload schema';"
-  papi POST "/v1/projects/$ref/database/query" -H 'Content-Type: application/json' \
-    -d "$(python3 -c 'import json,sys; print(json.dumps({"query": sys.argv[1]}))' "$sql")" >/dev/null || fail "$ref: create table through database/query"
+  local ref=$1 pub=$2 how=${3:-} n="" body="" i
+  if [[ $how == api ]]; then
+    papi POST "/v1/projects/$ref/database/query" -H 'Content-Type: application/json' \
+      -d "$(python3 -c 'import json,sys; print(json.dumps({"query": sys.argv[1]}))' "$SMOKE_TABLE_SQL")" >/dev/null || fail "$ref: create table through database/query"
+  fi
   for ((i = 0; i < 30; i++)); do
-    n=$(curl -sS -m 30 -H "Host: $ref.api.$SBCTL_DOMAIN" -H "apikey: $pub" "http://127.0.0.1/rest/v1/smoke_items?select=id" | json_get 'len(d)' 2>/dev/null || true)
+    body=$(curl -sS -m 30 -H "Host: $ref.api.$SBCTL_DOMAIN" -H "apikey: $pub" "http://127.0.0.1/rest/v1/smoke_items?select=id" || true)
+    n=$(printf '%s' "$body" | json_get 'len(d) if isinstance(d, list) else -1' 2>/dev/null || true)
     [[ $n == 2 ]] && return 0
     sleep 2
   done
-  fail "$ref: REST through the proxy returned '$n' rows, want 2"
+  fail "$ref: REST through the proxy returned $body, want 2 rows"
 }
 
 # ---- cloud metadata (IMDS) --------------------------------------------------------------
