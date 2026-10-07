@@ -58,7 +58,7 @@ func TestPostgresSpec(t *testing.T) {
 	pl, cfg := testPlane(t)
 	p := testProject(cfg, "abcdefghijklmnopqrst", 2)
 	keys := testKeys(t, p.Ref)
-	spec, err := pl.postgresSpec(p, keys)
+	spec, err := pl.postgresSpec(context.Background(), p, keys)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestPostgresSpec(t *testing.T) {
 	// Class and overrides.
 	p.Class = "micro"
 	pl.opts.ArchiveCommand, pl.opts.ConfigPath = "off", "/etc/sbctl/config.toml"
-	spec, _ = pl.postgresSpec(p, keys)
+	spec, _ = pl.postgresSpec(context.Background(), p, keys)
 	args = strings.Join(spec.Exec, " ")
 	if !strings.Contains(args, "-c shared_buffers=16MB") || !strings.Contains(args, "-c max_connections=30") || !strings.Contains(args, "-c archive_mode=off") || strings.Contains(args, "archive_command") {
 		t.Fatalf("micro/off args:\n%s", args)
@@ -109,7 +109,7 @@ func TestPostgresSpec(t *testing.T) {
 		t.Fatalf("env = %v", spec.Env)
 	}
 	p.Class = "bogus"
-	if _, err := pl.postgresSpec(p, keys); err == nil {
+	if _, err := pl.postgresSpec(context.Background(), p, keys); err == nil {
 		t.Fatal("unknown class accepted")
 	}
 }
@@ -118,7 +118,7 @@ func TestAPISpecs(t *testing.T) {
 	pl, cfg := testPlane(t)
 	p := testProject(cfg, "abcdefghijklmnopqrst", 2)
 	keys := testKeys(t, p.Ref)
-	specs, err := pl.apiSpecs(p, keys)
+	specs, err := pl.apiSpecs(context.Background(), p, keys)
 	if err != nil || len(specs) != 2 {
 		t.Fatalf("specs = %d %v", len(specs), err)
 	}
@@ -176,7 +176,7 @@ func TestAPISpecs(t *testing.T) {
 
 	// The system project: GoTrue only, for Studio sign-in, signup closed.
 	sys := testProject(cfg, config.SystemRef, 0)
-	sysSpecs, err := pl.apiSpecs(sys, testKeys(t, config.SystemRef))
+	sysSpecs, err := pl.apiSpecs(context.Background(), sys, testKeys(t, config.SystemRef))
 	if err != nil || len(sysSpecs) != 1 {
 		t.Fatalf("system specs = %d %v", len(sysSpecs), err)
 	}
@@ -185,13 +185,13 @@ func TestAPISpecs(t *testing.T) {
 		e["GOTRUE_API_PORT"] != "9999" || e["GOTRUE_DISABLE_SIGNUP"] != "true" || !strings.Contains(e["GOTRUE_DB_DATABASE_URL"], "@127.0.0.1:5433/postgres") {
 		t.Fatalf("system gotrue env = %v", e)
 	}
-	sysPG, _ := pl.postgresSpec(sys, testKeys(t, config.SystemRef))
+	sysPG, _ := pl.postgresSpec(context.Background(), sys, testKeys(t, config.SystemRef))
 	if !strings.Contains(strings.Join(sysPG.Exec, " "), "-c max_connections=100") || !strings.Contains(strings.Join(sysPG.Exec, " "), "-p 5433") {
 		t.Fatalf("system postgres args = %v", sysPG.Exec)
 	}
 
 	cfg.TLS.Mode = "off"
-	specs, _ = pl.apiSpecs(p, keys)
+	specs, _ = pl.apiSpecs(context.Background(), p, keys)
 	if !strings.HasPrefix(specs[0].Env["API_EXTERNAL_URL"], "http://") {
 		t.Fatalf("tls off must use http: %s", specs[0].Env["API_EXTERNAL_URL"])
 	}

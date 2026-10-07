@@ -33,6 +33,9 @@ type Options struct {
 	Timers Timers
 	// Now is the clock for key issue times; tests set it.
 	Now func() time.Time
+	// Settings supplies the saved per-project settings for Storage and Realtime tenants
+	// (and, through the plane, for units); nil means defaults.
+	Settings Settings
 }
 
 // Timers drives the per-project nightly base backup timer (sb-basebackup@<ref>.timer).
@@ -195,7 +198,23 @@ func (e *Engine) org(ctx context.Context, slug string) (*registry.Organization, 
 	return o, err
 }
 
-func (e *Engine) tenantSpec(p *registry.Project, keys *secrets.ProjectKeys) fleet.TenantSpec {
+// tenantSpec describes p to the shared services, with its saved Storage and Realtime
+// settings when the Engine has a Settings source.
+func (e *Engine) tenantSpec(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (fleet.TenantSpec, error) {
+	spec := e.baseTenantSpec(p, keys)
+	if e.opts.Settings != nil && p.Ref != config.SystemRef {
+		var err error
+		if spec.Storage, err = e.opts.Settings.StorageSettings(ctx, p.Ref); err != nil {
+			return spec, fmt.Errorf("lifecycle: saved storage settings of %s: %w", p.Ref, err)
+		}
+		if spec.Realtime, err = e.opts.Settings.RealtimeSettings(ctx, p.Ref); err != nil {
+			return spec, fmt.Errorf("lifecycle: saved realtime settings of %s: %w", p.Ref, err)
+		}
+	}
+	return spec, nil
+}
+
+func (e *Engine) baseTenantSpec(p *registry.Project, keys *secrets.ProjectKeys) fleet.TenantSpec {
 	ports := e.cfg.PortsFor(p.Ref, p.Seq)
 	return fleet.TenantSpec{
 		Ref: p.Ref, DBHost: "127.0.0.1", DBPort: ports.Postgres, DBName: "postgres",
@@ -304,7 +323,11 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 		return fail("data plane", err)
 	}
 	if len(e.opts.Fleet) > 0 {
-		if err := e.opts.Fleet.EnsureTenant(ctx, e.tenantSpec(p, keys)); err != nil {
+		spec, err := e.tenantSpec(ctx, p, keys)
+		if err != nil {
+			return fail("fleet tenants", err)
+		}
+		if err := e.opts.Fleet.EnsureTenant(ctx, spec); err != nil {
 			return fail("fleet tenants", err)
 		}
 	}
@@ -623,7 +646,11 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 			return rollback(err)
 		}
 		if len(e.opts.Fleet) > 0 && ref != config.SystemRef {
-			if err := e.opts.Fleet.EnsureTenant(ctx, e.tenantSpec(p, &nk)); err != nil {
+			spec, err := e.tenantSpec(ctx, p, &nk)
+			if err == nil {
+				err = e.opts.Fleet.EnsureTenant(ctx, spec)
+			}
+			if err != nil {
 				return rollback(fmt.Errorf("update fleet tenants: %w", err))
 			}
 		}

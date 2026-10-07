@@ -49,6 +49,9 @@ type PlaneOptions struct {
 	PostgresReadyTimeout time.Duration
 	ServiceReadyTimeout  time.Duration
 	HTTPClient           *http.Client
+	// Settings supplies the project's saved settings for the units' environment and the
+	// cluster's arguments; nil renders the defaults (tests, the system project).
+	Settings Settings
 }
 
 // PostgresPlane is the DataPlane of engine "postgres": one cluster, one GoTrue and one
@@ -247,7 +250,7 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 	if err := pl.prepare(p, keys); err != nil {
 		return err
 	}
-	spec, err := pl.postgresSpec(p, keys)
+	spec, err := pl.postgresSpec(ctx, p, keys)
 	if err != nil {
 		return err
 	}
@@ -311,7 +314,7 @@ func (pl *PostgresPlane) Start(ctx context.Context, p *registry.Project, keys *s
 }
 
 func (pl *PostgresPlane) startAPI(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error {
-	specs, err := pl.apiSpecs(p, keys)
+	specs, err := pl.apiSpecs(ctx, p, keys)
 	if err != nil {
 		return err
 	}
@@ -418,7 +421,7 @@ func (pl *PostgresPlane) Stop(ctx context.Context, ref string) error {
 
 // Reconfigure implements Runner.
 func (pl *PostgresPlane) Reconfigure(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error {
-	specs, err := pl.apiSpecs(p, keys)
+	specs, err := pl.apiSpecs(ctx, p, keys)
 	if err != nil {
 		return err
 	}

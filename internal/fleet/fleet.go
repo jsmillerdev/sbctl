@@ -2,7 +2,11 @@
 // (Supavisor, Realtime, Storage) through their admin APIs.
 package fleet
 
-import "context"
+import (
+	"context"
+
+	"github.com/OWNER/sbctl/internal/projectconfig"
+)
 
 // TenantSpec is what a shared service needs to serve one project.
 type TenantSpec struct {
@@ -32,25 +36,8 @@ type TenantSpec struct {
 	// Storage and Realtime carry the project's saved settings for those services (the
 	// zero values mean "defaults"). They are part of the tenant fingerprint, so a changed
 	// setting makes EnsureTenant send an update.
-	Storage  StorageSettings
-	Realtime RealtimeSettings
-}
-
-// StorageSettings are the per-project Storage settings: the upload size limit in bytes
-// (0 keeps the node's configured limit) and the feature flags of the tenant API
-// (imageTransformation, s3Protocol, ...), laid over the node's defaults.
-type StorageSettings struct {
-	FileSizeLimit int64
-	Features      map[string]any
-}
-
-// RealtimeSettings are the per-project Realtime settings. Tenant holds the fields of the
-// tenant itself that differ from the server's defaults (max_concurrent_users,
-// max_events_per_second, private_only, suspend, ...); Extension those of its postgres_cdc_rls
-// extension (db_pool, postgres_changes_pool). Both are sent as given.
-type RealtimeSettings struct {
-	Tenant    map[string]any
-	Extension map[string]any
+	Storage  projectconfig.StorageSettings
+	Realtime projectconfig.RealtimeSettings
 }
 
 // Refresher is an optional Tenant capability: drop whatever the service cached about a

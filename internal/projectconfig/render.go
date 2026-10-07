@@ -6,8 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/OWNER/sbctl/internal/fleet"
 )
 
 // Seconds-valued settings that GoTrue takes as a Go duration, and hours-valued ones.
@@ -142,9 +140,26 @@ func RenderPostgres(set Values) []string {
 	return out
 }
 
+// StorageSettings are the per-project Storage settings: the upload size limit in bytes
+// (0 keeps the node's configured limit) and the feature flags of the tenant API
+// (imageTransformation, s3Protocol, ...), laid over the node's defaults.
+type StorageSettings struct {
+	FileSizeLimit int64
+	Features      map[string]any
+}
+
+// RealtimeSettings are the per-project Realtime settings. Tenant holds the fields of the
+// tenant itself that differ from the server's defaults (max_concurrent_users,
+// max_events_per_second, private_only, suspend, ...); Extension those of its postgres_cdc_rls
+// extension (db_pool, postgres_changes_pool). Both are sent as given.
+type RealtimeSettings struct {
+	Tenant    map[string]any
+	Extension map[string]any
+}
+
 // RenderStorage returns the Storage tenant settings.
-func RenderStorage(set Values) fleet.StorageSettings {
-	var out fleet.StorageSettings
+func RenderStorage(set Values) StorageSettings {
+	var out StorageSettings
 	if n, ok := set.Int("fileSizeLimit"); ok {
 		out.FileSizeLimit = n
 	}
@@ -156,8 +171,8 @@ func RenderStorage(set Values) fleet.StorageSettings {
 
 // RenderRealtime returns the Realtime tenant settings: only what differs from the
 // server's defaults is sent.
-func RenderRealtime(set Values) fleet.RealtimeSettings {
-	out := fleet.RealtimeSettings{Tenant: map[string]any{}, Extension: map[string]any{}}
+func RenderRealtime(set Values) RealtimeSettings {
+	out := RealtimeSettings{Tenant: map[string]any{}, Extension: map[string]any{}}
 	names := set.Keys()
 	sort.Strings(names)
 	for _, name := range names {
@@ -208,19 +223,19 @@ func (m *Manager) PostgresSettings(ctx context.Context, ref string) ([]string, e
 }
 
 // StorageSettings is the saved Storage tenant settings.
-func (m *Manager) StorageSettings(ctx context.Context, ref string) (fleet.StorageSettings, error) {
+func (m *Manager) StorageSettings(ctx context.Context, ref string) (StorageSettings, error) {
 	st, err := m.Get(ctx, ref, Storage)
 	if err != nil {
-		return fleet.StorageSettings{}, err
+		return StorageSettings{}, err
 	}
 	return RenderStorage(st.Set), nil
 }
 
 // RealtimeSettings is the saved Realtime tenant settings.
-func (m *Manager) RealtimeSettings(ctx context.Context, ref string) (fleet.RealtimeSettings, error) {
+func (m *Manager) RealtimeSettings(ctx context.Context, ref string) (RealtimeSettings, error) {
 	st, err := m.Get(ctx, ref, Realtime)
 	if err != nil {
-		return fleet.RealtimeSettings{}, err
+		return RealtimeSettings{}, err
 	}
 	return RenderRealtime(st.Set), nil
 }

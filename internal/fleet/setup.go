@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/projectconfig"
 	"github.com/OWNER/sbctl/internal/registry"
 	"github.com/OWNER/sbctl/internal/secrets"
 )
@@ -132,5 +135,17 @@ func LoadTenantSpec(ctx context.Context, d Deps, ref string) (TenantSpec, error)
 	if k.JWTSecret == "" || k.AdminPassword == "" {
 		return TenantSpec{}, fmt.Errorf("fleet: project %s has no stored credentials", ref)
 	}
-	return TenantSpecFor(d.Cfg, p, k), nil
+	spec := TenantSpecFor(d.Cfg, p, k)
+	// The saved Storage and Realtime settings belong to the tenant: `sbctl fleet
+	// ensure-tenant` must not send the defaults over them.
+	if pg, ok := d.Registry.(interface{ Pool() *pgxpool.Pool }); ok && ref != config.SystemRef {
+		m := projectconfig.NewManager(projectconfig.NewPGStore(pg.Pool()), d.Secrets, projectconfig.Options{})
+		if spec.Storage, err = m.StorageSettings(ctx, ref); err != nil {
+			return TenantSpec{}, fmt.Errorf("fleet: storage settings of %s: %w", ref, err)
+		}
+		if spec.Realtime, err = m.RealtimeSettings(ctx, ref); err != nil {
+			return TenantSpec{}, fmt.Errorf("fleet: realtime settings of %s: %w", ref, err)
+		}
+	}
+	return spec, nil
 }
