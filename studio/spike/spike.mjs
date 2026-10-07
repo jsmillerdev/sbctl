@@ -38,6 +38,9 @@ const browser = await chromium.launch({
 })
 const context = await browser.newContext({ viewport: { width: 1440, height: 900 } })
 const page = await context.newPage()
+// Production answers this Studio route in sbctl's proxy (internal/proxy, studio host): without
+// an incident.io key it is a 500 that react-query retries for 21 s while the sign-in waits.
+await page.route('**/api/incident-banner', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{"incidents":[]}' }))
 page.setDefaultTimeout(30_000)
 page.on('console', (m) => {
   if (m.type() === 'error') consoleErrors.push({ step: current, text: m.text().slice(0, 300) })

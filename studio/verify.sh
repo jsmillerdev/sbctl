@@ -110,10 +110,8 @@ check_round() { # api origin, hosts-regex-literal
   [[ "$code" == 200 ]] || fail "/api/get-utc-time returned $code, want 200"
   ok "platform mode: /api/platform/* is 404, allowlisted routes work"
 
-  # The sign-in redirect waits for this route; it must answer at once (see runtime/package-fixups.mjs).
-  local banner; banner="$(curl -sS --max-time 3 -w ' %{http_code}' "http://127.0.0.1:$port/api/incident-banner")" || fail "/api/incident-banner did not answer within 3 s"
-  [[ "$banner" == '{"incidents":[]}'*' 200' ]] || fail "/api/incident-banner returned: $banner"
-  ok "/api/incident-banner answers a static empty list"
+  # /api/incident-banner answers 500 here (no incident.io key); sbctl's proxy answers it
+  # itself on studio.<domain> (internal/proxy), so the artifact carries no fixup for it.
 
   leftover_placeholders || fail "placeholders left in rewritten files"
   [[ "$(files_containing "$api/platform")" -gt 0 ]] || fail "$api/platform is not in any rewritten file"

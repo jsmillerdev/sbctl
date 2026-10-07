@@ -239,7 +239,7 @@ func (s *Service) restoreAsNew(ctx context.Context, plan *RestorePlan, src *secr
 		return nil, fmt.Errorf("backup: create restored project %s: %w", plan.TargetRef, err)
 	}
 	if _, err := s.resetRecoverySettings(ctx, plan.TargetRef); err != nil {
-		return nil, fmt.Errorf("backup: project %s was created but its recovery did not finish, so it holds no usable data (it is registered: read its postgres log, then delete it): %w", plan.TargetRef, err)
+		return nil, fmt.Errorf("backup: project %s was created but its recovery did not finish, so it holds no usable data (it is registered so that its postgres log can be read; `sbctl projects delete` removes it without a final backup, since there is nothing to back up): %w", plan.TargetRef, err)
 	}
 	return p, nil
 }
@@ -278,14 +278,22 @@ func (s *Service) restoreInPlace(ctx context.Context, plan *RestorePlan) (*regis
 		}
 		return nil, fmt.Errorf("backup: seed data directory (original restored): %w", err)
 	}
+	failed := dataDir + ".failed-restore-" + stamp
 	if err := s.opt.Manager.Resume(ctx, ref); err != nil {
-		return nil, fmt.Errorf("backup: start %s after restore (original data kept in %s): %w", ref, aside, err)
+		// The restored cluster did not come up. The usual cause is the fatal "recovery
+		// ended before configured recovery target was reached", which kills the postmaster
+		// before the lifecycle readiness check sees it accept connections, so it surfaces
+		// here and not below. Same treatment as a recovery that fails later: put the
+		// original back, or the production project stays down on a failed restore.
+		if rerr := s.rollbackInPlace(ctx, ref, dataDir, aside, failed); rerr != nil {
+			return nil, fmt.Errorf("backup: start %s after restore failed (%v) and the original could not be put back (%v); original data is in %s, the failed restore in %s", ref, err, rerr, aside, dataDir)
+		}
+		return nil, fmt.Errorf("backup: start %s after restore failed; the original data is back in place and the project is running on it again, the failed restore is kept in %s: %w", ref, failed, err)
 	}
 	done, err := s.resetRecoverySettings(ctx, ref)
 	if err != nil {
 		// Recovery ended in a fatal error (typically: no commit after the target time in
 		// the archive). Put the original data back rather than leave a dead project.
-		failed := dataDir + ".failed-restore-" + stamp
 		if rerr := s.rollbackInPlace(ctx, ref, dataDir, aside, failed); rerr != nil {
 			return nil, fmt.Errorf("backup: recovery of %s did not finish (%v) and the original could not be put back (%v); original data is in %s, the failed restore in %s", ref, err, rerr, aside, dataDir)
 		}
@@ -413,6 +421,7 @@ func (s *Service) resetRecoverySettings(ctx context.Context, ref string) (bool, 
 	err := s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout)
 	switch {
 	case err == nil:
+		_ = s.opt.Registry.AppendEvent(ctx, ref, eventRecoveryFinished, nil)
 		return true, nil
 	case errors.Is(err, errRecoveryFailed):
 		_ = s.opt.Registry.AppendEvent(ctx, ref, "restore.recovery_failed", map[string]any{"error": err.Error()})
@@ -437,8 +446,19 @@ func (s *Service) FinishRestore(ctx context.Context, ref string) error {
 	if err := s.need("database access", s.opt.Access != nil); err != nil {
 		return err
 	}
-	return s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout)
+	if err := s.finishRecovery(ctx, ref, s.opt.RecoveryTimeout); err != nil {
+		return err
+	}
+	if s.opt.Registry != nil {
+		_ = s.opt.Registry.AppendEvent(ctx, ref, eventRecoveryFinished, nil)
+	}
+	return nil
 }
+
+// eventRecoveryFinished is recorded when a restored cluster has left recovery and its
+// recovery settings are cleared. It supersedes restore.recovery_failed and
+// restore.cleanup_pending in neverRecovered.
+const eventRecoveryFinished = "restore.recovery_finished"
 
 // finishRecovery polls until the cluster has left recovery (connecting as often as
 // needed, since the server may still be starting), then resets recoveryGUCs. A server
@@ -540,6 +560,12 @@ func (s *Service) flushArchive(ctx context.Context, ref string) {
 		return
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	// A time target needs a commit record after it in the archive, and an idle source has
+	// none. Forcing an xid and committing it (autocommit) writes one: it costs one xid, and
+	// makes every target before now reachable.
+	if _, err := conn.Exec(fctx, "select pg_current_xact_id()"); err != nil {
+		s.opt.Log.Debug("could not write a commit record on the source", "ref", ref, "err", err)
+	}
 	// pg_switch_wal() returns the end of the segment it closed, or the start of the current
 	// one when nothing was written since the last switch; minus one byte is the last
 	// segment that must be archived either way.

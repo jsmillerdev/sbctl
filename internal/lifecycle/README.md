@@ -12,23 +12,23 @@ project's PostgreSQL, GoTrue and PostgREST as units of a `units.Supervisor`.
    PGDATA (0600), then `bin/supabase-postgres-start` with these server arguments:
    `-p <port>`, `listen_addresses=127.0.0.1`, `unix_socket_directories=<project>/postgres/sock`
    (mode 0700), `hba_file`, `wal_level=logical`, `archive_mode=on`,
-   `archive_command='<bin_path> wal push --ref <ref> %p'`, `archive_timeout=900`,
+   `archive_command` and `archive_timeout`, `PlaneOptions.ArchiveCommandFor` and `ArchiveTimeout`: `internal/app` passes `backup.ArchiveCommand(bin_path, ref, config file)` (shell-quoted, `%` doubled, `--config` when the daemon loaded a non-default file) and `[backup] archive_timeout_seconds` (default 300); without them the plane falls back to a built-in quoting of `bin_path` and 900 s,
    `max_wal_senders=5`, and `shared_buffers`, `effective_cache_size`,
    `maintenance_work_mem`, `max_wal_size`, `max_connections` from the project class
    (`micro`, `default`/`small`, `medium`, `large`; default is 32MB and 60 connections).
    The launcher initializes PGDATA and runs the artifact's roles and migrations once.
    Role passwords of `postgres`, `supabase_admin`, `authenticator`,
    `supabase_auth_admin`, `supabase_storage_admin` and `supabase_replication_admin` are set
-   afterwards over the unix socket as SCRAM-SHA-256 verifiers computed in Go (the artifact
+   afterwards over the unix socket as SCRAM-SHA-256 verifiers computed in Go (after SASLprep, as libpq and Postgres do) (the artifact
 logs DDL, so a plaintext `alter role` would land in journald), with statement logging also
 silenced for that session. A running cluster whose rendered settings changed is restarted by
-`StartDatabase`. `CreateRequest.Seed` replaces initdb and role setup and
+`StartDatabase`. `POSTGRES_PASSWORD` (the superuser password the launcher reads on the first boot only) is in `postgres.env` only while the data directory is not initialized (no `PG_VERSION`, or the launcher's init-pending witness exists); once the role passwords are set, `createDatabase` renders the unit again without it and restarts the cluster, so it is not in the postmaster's environment for the life of the cluster. `CreateRequest.Seed` replaces initdb and role setup and
 requires `CreateRequest.Keys` (the seeded cluster's own credentials; fresh ones would not
 match its passwords).
 3. GoTrue (`bin/auth migrate`, then `bin/auth`) and PostgREST, each health-checked with a
    real request (`/health`, `/`).
 4. `fleet.Fleet.EnsureTenant` (skipped while the fleet is empty), `PutRoute` for
-   `<ref>.api.<domain>`, status `ACTIVE_HEALTHY`.
+   `<ref>.api.<domain>`, the nightly backup timer (`Options.Timers`, systemd backend only), status `ACTIVE_HEALTHY`.
 
 Any failure after the row exists stops and removes units and data, removes tenants and
 route, and leaves the row `INIT_FAILED` with an event that carries the cause. Cleanup uses
@@ -50,15 +50,40 @@ TCP. The socket is how sbctl reaches its own registry before it can decrypt any 
 - `Pause`: PostgREST, GoTrue, PostgreSQL stop in that order; `INACTIVE`; route and tenants
   stay. `Resume` reverses it; on failure what started is stopped and the project stays
   `INACTIVE`.
-- `Delete`/`DeleteWith`: final base backup through `BaseBackuper` (skipped when nil, for
-  `INIT_FAILED` projects and with `SkipFinalBackup`; a paused project's database is started
-  just for it), tenants, route, units, data, registry row. A failed backup keeps the project.
-  A failure after the backup leaves `GOING_DOWN` so the delete can be repeated.
+- `Delete`/`DeleteWith`: final base backup through `BaseBackuper` (the `FinalBackuper` method
+  when it has one, so the manifest says "final"; skipped when nil, for `INIT_FAILED` projects
+  and with `SkipFinalBackup`; a paused project's database is started just for it), tenants,
+  route, units, data, registry row. A failed backup keeps the project, except one that wraps
+  `ErrNoRestorableState` (a restore-as-new clone whose recovery failed or never finished and
+  that has no base backup): there is nothing to back up, the delete records
+  `project.final_backup_skipped` and goes on. A delete records `project.delete_started` (with
+  the status to go back to) and `project.delete_backup_done` (the backup step is settled); the
+  nightly timer stops right after it. A failure after the backup leaves `GOING_DOWN`, and a
+  repeated delete resumes from the recorded step without a second backup.
 - `RotateKeys`: new JWT secret, legacy and opaque keys; database passwords unchanged;
   GoTrue and PostgREST restart, fleet tenants update; previous keys are restored on error.
 - `Health`: unit state plus SQL ping, GoTrue `/health`, PostgREST `/`; moves
   `ACTIVE_HEALTHY` and `ACTIVE_UNHEALTHY` to match.
 - `StartActive`: starts every active project (after a reboot or `sbctl system stop`).
+- `Recover`: run once by the daemon before `StartActive`. A crash in the middle of an
+  operation leaves a project in a status nothing else would move: `PAUSING` becomes
+  `INACTIVE` (units stopped), `COMING_UP` or `RESTARTING` with a route (a resume or restart
+  was cut short) becomes `INACTIVE`, and `COMING_UP` without a route (a create that never
+  finished) becomes `INIT_FAILED`. `GOING_DOWN` is read from the delete's events: with the backup
+  step settled the removal is finished at once (no second backup); cut off during the backup,
+  the project returns to the status it had (a paused one is stopped again); with no record (an
+  older version) it is only logged, naming `--skip-final-backup`. A restart (the API's pause and
+  resume, bracketed by `project.restart_requested` and `project.restart_finished`) cut off after
+  the pause is flagged `Recovered.Resume`, and `ResumeRecovered` brings the project back; a stale
+  request on a project that is not paused is cleared. `RESTORING` is not touched. Each move is a
+  `project.recovered` event.
+- Backup timers: with the systemd backend the Engine starts `sb-basebackup@<ref>.timer` when
+  a project becomes active (create, resume, start) and stops it on pause and delete
+  (`Options.Timers`; failures are logged, never fatal). The timers are not enabled for boot;
+  `sbctl serve` starts the system project's timer and the prune timer at boot.
+- Region: `CreateRequest.Region` is kept when it is an AWS region code, otherwise the
+  configured `region` (default `us-east-1`) is stored: Studio and the CLI resolve the project
+  region against a list of real regions, and an unknown one breaks the project list.
 
 ## System project
 
@@ -112,10 +137,9 @@ removed on exit.
 
 ## Not done
 
-- No recovery pass for projects stuck in `COMING_UP`, `PAUSING` or `GOING_DOWN` after a
-  daemon crash (delete works from any status).
-- `Snapshot` and the final backup depend on the backup workstream's `BaseBackup`; until it
-  is wired in, `Delete` does not back up.
+- `Recover` does not finish an interrupted restore (`RESTORING`), and a delete interrupted by a
+  version that recorded no events (`GOING_DOWN` with no `project.delete_started`) is only logged.
+- `pg_hba.conf` is rewritten on start but a changed file is not reloaded in a running cluster.
 - Fleet tenant calls are a hook (`Options.Fleet`); the services themselves are the fleet
   workstream's.
 - Project upgrade (artifact version changes) is not implemented.

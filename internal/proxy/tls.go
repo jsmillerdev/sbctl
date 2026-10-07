@@ -11,6 +11,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/caddyserver/certmagic"
 
@@ -72,6 +74,8 @@ type certManager struct {
 	names                 []string // certificates managed from startup
 	mode                  string
 	base                  string // base domain
+	log                   *slog.Logger
+	wg                    sync.WaitGroup // startup issuance goroutines
 }
 
 // certOptions are the inputs of newCertManager.
@@ -101,7 +105,7 @@ func managedNames(cfg *config.Config, mode string) []string {
 func newCertManager(o certOptions) (*certManager, error) {
 	cfg := o.cfg
 	zl := zapToSlog(o.log)
-	cm := &certManager{mode: o.mode, base: cfg.BaseDomain(), names: managedNames(cfg, o.mode)}
+	cm := &certManager{mode: o.mode, base: cfg.BaseDomain(), names: managedNames(cfg, o.mode), log: o.log}
 	cm.cache = certmagic.NewCache(certmagic.CacheOptions{
 		GetConfigForCert: func(c certmagic.Certificate) (*certmagic.Config, error) { return cm.configForNames(c.Names), nil },
 		Logger:           zl,
@@ -219,10 +223,36 @@ func (cm *certManager) manage(ctx context.Context) error {
 	if cm.dns != nil {
 		return cm.dns.ManageAsync(ctx, cm.names)
 	}
-	return cm.http.ManageAsync(ctx, cm.names)
+	// The HTTP config has OnDemand set, and CertMagic's ManageAsync then only adds the
+	// names to the on-demand allowlist and defers issuance to the first handshake. Obtain
+	// the startup names here so the first visitor to api. or studio. does not wait for
+	// the CA. Failures are logged and retried by CertMagic; the on-demand path still works.
+	if err := cm.http.ManageAsync(ctx, cm.names); err != nil {
+		return err
+	}
+	for _, name := range cm.names {
+		cm.wg.Add(1)
+		go func() {
+			defer cm.wg.Done()
+			if err := cm.http.ObtainCertAsync(ctx, name); err != nil && ctx.Err() == nil {
+				cm.log.Warn("could not obtain the startup certificate; it will be requested on first use", "name", name, "err", err)
+			}
+		}()
+	}
+	return nil
 }
 
-func (cm *certManager) close() { cm.cache.Stop() }
+// close waits (briefly) for the startup issuance goroutines, which end when the context
+// passed to manage does, then stops the certificate cache.
+func (cm *certManager) close() {
+	done := make(chan struct{})
+	go func() { cm.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
+	cm.cache.Stop()
+}
 
 // allowHost is the on-demand issuance gate: a certificate is only ever requested
 // for a host sbctl serves. In DNS-01 modes the derived project hosts are covered by
@@ -236,7 +266,13 @@ func (s *Server) allowHost(_ context.Context, name string) error {
 	case name == s.apiHost || name == s.studioHost:
 		return nil
 	}
-	switch s.table.routeKind(name) {
+	p, kind := s.table.hostProject(name)
+	if kind != "" && !servable(p.status) {
+		// REMOVED, INIT_FAILED, INACTIVE: nothing is served there, so a handshake for the
+		// host must not spend certificate rate limit (50 per week on <ip>.sslip.io).
+		return fmt.Errorf("%s belongs to a project that is %s", name, p.status)
+	}
+	switch kind {
 	case "derived":
 		if s.tlsMode == tlsDNS01 || s.tlsMode == tlsAuto {
 			return fmt.Errorf("%s is covered by the wildcard certificate", name)

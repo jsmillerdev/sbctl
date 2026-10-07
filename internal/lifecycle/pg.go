@@ -11,8 +11,10 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/xdg-go/stringprep"
 
 	"github.com/OWNER/sbctl/internal/config"
 )
@@ -109,7 +111,10 @@ const scramIterations = 4096
 // ScramVerifier computes the SCRAM-SHA-256 verifier Postgres stores for password (RFC 5802,
 // the format of pg_authid.rolpassword). Sending the verifier instead of the password means
 // the plaintext never reaches the server, so statement logging cannot capture it. The
-// password is used as-is (SASLprep is the identity for the ASCII passwords sbctl generates).
+// password goes through SASLprep first, as Postgres (pg_be_scram_build_secret) and libpq
+// do, so a user-supplied password with characters SASLprep normalizes (a non-breaking
+// space, a full-width digit) still matches what a client sends. It is the identity for the
+// ASCII passwords sbctl generates.
 func ScramVerifier(password string) (string, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
@@ -118,8 +123,26 @@ func ScramVerifier(password string) (string, error) {
 	return scramVerifierWithSalt(password, salt, scramIterations)
 }
 
+// ScramVerifierWithSalt is ScramVerifier with a fixed salt and iteration count (the
+// read-only login role derives its salt from the password so the verifier is stable).
+func ScramVerifierWithSalt(password string, salt []byte, iter int) (string, error) {
+	return scramVerifierWithSalt(password, salt, iter)
+}
+
+// saslprep applies RFC 4013 SASLprep like pg_saslprep: a password that is not valid
+// UTF-8, or that SASLprep rejects, is used as it is.
+func saslprep(p string) string {
+	if !utf8.ValidString(p) {
+		return p
+	}
+	if out, err := stringprep.SASLprep.Prepare(p); err == nil {
+		return out
+	}
+	return p
+}
+
 func scramVerifierWithSalt(password string, salt []byte, iter int) (string, error) {
-	salted, err := pbkdf2.Key(sha256.New, password, salt, iter, sha256.Size)
+	salted, err := pbkdf2.Key(sha256.New, saslprep(password), salt, iter, sha256.Size)
 	if err != nil {
 		return "", err
 	}

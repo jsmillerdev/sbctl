@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/OWNER/sbctl/internal/app"
 	"github.com/OWNER/sbctl/internal/backup"
 	"github.com/OWNER/sbctl/internal/config"
 	"github.com/OWNER/sbctl/internal/lifecycle"
@@ -21,19 +22,24 @@ import (
 	"github.com/OWNER/sbctl/internal/secrets"
 )
 
-// envRegistryDSN names the DSN of the registry database ("sbctl" in the system
-// cluster) for commands that run outside the sbctl daemon.
+// envRegistryDSN overrides where commands that run outside the daemon find the registry
+// (a database "sbctl" in the system cluster). Unset, they use lifecycle.RegistryDSN: the
+// cluster's private unix socket as supabase_admin, which needs no password and works for
+// the sbctl user the nightly timers run as.
 const envRegistryDSN = "SBCTL_REGISTRY_DSN"
 
-// openRegistry connects to the registry. The default reads SBCTL_REGISTRY_DSN; the
-// integration step may replace it with whatever the daemon uses to find the system cluster.
-var openRegistry = func(ctx context.Context, _ *config.Config) (registry.Registry, error) {
+// openRegistry connects to the registry for commands that do not need the lifecycle engine.
+func openRegistry(ctx context.Context, cfg *config.Config) (registry.Registry, error) {
 	warnEnvFileMode(os.Stderr, backup.EnvFile)
 	dsn := os.Getenv(envRegistryDSN)
 	if dsn == "" {
-		return nil, fmt.Errorf("registry DSN unknown: set %s", envRegistryDSN)
+		dsn = lifecycle.RegistryDSN(cfg)
 	}
-	return registry.Open(ctx, dsn)
+	reg, err := registry.Open(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("cannot reach the registry (is sb-postgres@system running? run `sbctl system init`; set %s to use another one): %w", envRegistryDSN, err)
+	}
+	return reg, nil
 }
 
 // warnEnvFileMode warns when the env file that carries the registry DSN (with its
@@ -82,10 +88,6 @@ func configFilePath() string {
 	}
 	return config.DefaultPath
 }
-
-// newLifecycleManager builds the lifecycle.Manager that `backups restore` needs. It
-// is nil until the lifecycle workstream registers one from its own cmd file.
-var newLifecycleManager func(ctx context.Context, cfg *config.Config, reg registry.Registry, sec secrets.Secrets) (lifecycle.Manager, error)
 
 func init() {
 	backups := &cobra.Command{
@@ -286,19 +288,27 @@ var reasons = []string{backup.ReasonManual, backup.ReasonScheduled, backup.Reaso
 func validReason(r string) bool { return slices.Contains(reasons, r) }
 
 // openBackupService wires a Service from config, the registry and the master key.
-// withManager also builds the lifecycle.Manager (restore only).
+// withManager also builds the lifecycle engine for restore: it opens the whole node
+// (supervisor, artifacts, registry) as the daemon does.
 func openBackupService(ctx context.Context, withManager bool) (*backup.Service, func(), error) {
 	cfg, err := loadConfig()
 	if err != nil {
 		return nil, nil, err
 	}
 	warnConfigFileMode(os.Stderr, configFilePath(), cfg)
-	if err := backup.ValidateOnCalendar(cfg.Backup.BaseBackupOnCalendar); err != nil {
-		return nil, nil, fmt.Errorf("config backup.base_backup_on_calendar: %w", err)
-	}
-	store, err := backup.OpenStore(ctx, cfg.Backup)
-	if err != nil {
-		return nil, nil, err
+	opts := appOptions(cfg)
+	if withManager {
+		node, err := lifecycle.Open(ctx, cfg, openOptions(cfg))
+		if err != nil {
+			return nil, nil, err
+		}
+		svc, err := app.NewBackupService(ctx, cfg, node.Registry, node.Secrets, opts)
+		if err != nil {
+			node.Close()
+			return nil, nil, err
+		}
+		svc.SetManager(node.Engine)
+		return svc, node.Close, nil
 	}
 	reg, err := openRegistry(ctx, cfg)
 	if err != nil {
@@ -315,21 +325,7 @@ func openBackupService(ctx context.Context, withManager bool) (*backup.Service, 
 		reg.Close()
 		return nil, nil, err
 	}
-	opt := backup.Options{
-		Config: cfg, Registry: reg, Store: store, Secrets: sec,
-		Access: backup.AccessFromRegistry(cfg, reg, sec), ConfigPath: configPath, Version: version,
-	}
-	if withManager {
-		if newLifecycleManager == nil {
-			reg.Close()
-			return nil, nil, errors.New("restore needs the lifecycle manager, which is not wired into this build")
-		}
-		if opt.Manager, err = newLifecycleManager(ctx, cfg, reg, sec); err != nil {
-			reg.Close()
-			return nil, nil, err
-		}
-	}
-	svc, err := backup.New(opt)
+	svc, err := app.NewBackupService(ctx, cfg, reg, sec, opts)
 	if err != nil {
 		reg.Close()
 		return nil, nil, err

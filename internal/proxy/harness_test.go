@@ -80,6 +80,7 @@ type fakeKeys struct {
 	mu    sync.Mutex
 	keys  map[string]*secrets.ProjectKeys
 	calls map[string]int
+	fail  error // returned by every Keys call when set
 }
 
 func newFakeKeys() *fakeKeys {
@@ -90,11 +91,20 @@ func (f *fakeKeys) Keys(_ context.Context, ref string) (*secrets.ProjectKeys, er
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls[ref]++
+	if f.fail != nil {
+		return nil, f.fail
+	}
 	k, ok := f.keys[ref]
 	if !ok {
 		return nil, registry.ErrNotFound
 	}
 	return k, nil
+}
+
+func (f *fakeKeys) setFail(err error) {
+	f.mu.Lock()
+	f.fail = err
+	f.mu.Unlock()
 }
 
 func (f *fakeKeys) set(ref string, k *secrets.ProjectKeys) {

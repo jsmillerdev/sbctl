@@ -11,11 +11,6 @@ on:
 permissions:
   contents: read
 
-# bash with -eo pipefail, so a failing command piped into tee fails the step.
-defaults:
-  run:
-    shell: bash
-
 jobs:
   build:
     strategy:
@@ -35,7 +30,7 @@ jobs:
         with:
           node-version: 22
       - name: prepare runner
-        run: sudo SBCTL_CI=1 studio/ci-prepare.sh
+        run: sudo env SBCTL_CI=1 studio/ci-prepare.sh   # sudo drops GITHUB_ACTIONS from the environment
       - name: build
         run: studio/build.sh ${{ matrix.platform }}
       - uses: actions/upload-artifact@v4

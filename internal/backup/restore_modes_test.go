@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/OWNER/sbctl/internal/lifecycle"
 	"os"
 	"path/filepath"
 	"strings"
@@ -395,5 +396,114 @@ func TestRestoreInPlaceRefusesWhatIsNotADataDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dd, "pgdata", "PG_VERSION")); err != nil {
 		t.Fatalf("the directory was touched: %v", err)
+	}
+}
+
+// The restored cluster dies before the lifecycle readiness check sees it, so Resume itself
+// fails: the original data must come back and the project must be running on it, not left
+// dead with the real data in <dir>.pre-restore-<time>.
+func TestRestoreInPlaceRollsBackWhenResumeFails(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	e.storeBase(t, testRef, fakeDataDir(t), e.now.Add(-time.Hour), nil)
+	dd := e.svc.opt.DataDir(testRef)
+	writeFile(t, filepath.Join(dd, "PG_VERSION"), []byte("old"))
+	fm := &fakeManager{e: e, failResume: 1}
+	e.svc.opt.Manager = fm
+	_, err := e.svc.RestoreWith(ctx, testRef, e.now, "", RestoreOptions{Force: true})
+	if err == nil || !strings.Contains(err.Error(), "original data is back in place") {
+		t.Fatalf("in-place restore with a failing start = %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dd, "PG_VERSION")); string(b) != "old" {
+		t.Fatalf("original data not back in place: %q", b)
+	}
+	if failed, _ := filepath.Glob(dd + ".failed-restore-*"); len(failed) != 1 {
+		t.Fatalf("failed restore not kept for inspection: %v", failed)
+	}
+	if aside, _ := filepath.Glob(dd + ".pre-restore-*"); len(aside) != 0 {
+		t.Fatalf("the moved-aside directory is still there: %v", aside)
+	}
+	if fm.resumeCalls != 2 {
+		t.Fatalf("Resume calls = %d, want 2 (the failed one, then the original)", fm.resumeCalls)
+	}
+}
+
+// A restore-as-new clone whose recovery failed holds nothing to back up. Its delete runs
+// FinalBackup and aborts when that fails, so FinalBackup must say so with the sentinel.
+func TestFinalBackupOfAClonethatNeverRecoveredIsNotRestorable(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	for _, kind := range []string{"restore.recovery_failed", "restore.cleanup_pending"} {
+		_ = e.reg.AppendEvent(ctx, testRef, kind, nil)
+		e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+		if _, err := e.svc.FinalBackup(ctx, testRef); !errors.Is(err, lifecycle.ErrNoRestorableState) {
+			t.Fatalf("after %s: FinalBackup = %v, want ErrNoRestorableState", kind, err)
+		}
+		// Recovery finishing later supersedes the failure.
+		_ = e.reg.AppendEvent(ctx, testRef, eventRecoveryFinished, nil)
+		if _, err := e.svc.FinalBackup(ctx, testRef); errors.Is(err, lifecycle.ErrNoRestorableState) {
+			t.Fatalf("after recovery finished: FinalBackup = %v, must not claim there is nothing to restore", err)
+		}
+		e.reg.DeleteProject(ctx, testRef)
+		e.addProject(t, testRef)
+	}
+}
+
+// A restore-as-new clone tagged restore.cleanup_pending (recovery outlasted
+// RecoveryTimeout, restore reported success) promotes on its own later. The live cluster,
+// not the events, decides: out of recovery it is backed up, still replaying it is not.
+func TestCleanupPendingCloneThatPromotedCanBeBackedUp(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	_ = e.reg.AppendEvent(ctx, testRef, "restore.cleanup_pending", nil)
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+
+	// Still replaying: nothing to back up, and the delete may skip the final backup.
+	e.svc.probe = func(context.Context, string) (bool, error) { return true, nil }
+	e.svc.alter = func(context.Context, string, []string) error {
+		t.Fatal("recovery settings cleared during recovery")
+		return nil
+	}
+	if _, err := e.svc.FinalBackup(ctx, testRef); !errors.Is(err, lifecycle.ErrNoRestorableState) {
+		t.Fatalf("clone still in recovery: FinalBackup = %v, want ErrNoRestorableState", err)
+	}
+
+	// Promoted: the backup is attempted (it fails later, there is no real cluster behind
+	// the fake probe), the settings are cleared and recovery_finished is recorded.
+	var cleared []string
+	e.svc.probe = func(context.Context, string) (bool, error) { return false, nil }
+	e.svc.alter = func(_ context.Context, _ string, g []string) error { cleared = g; return nil }
+	if _, err := e.svc.FinalBackup(ctx, testRef); errors.Is(err, lifecycle.ErrNoRestorableState) {
+		t.Fatalf("promoted clone: FinalBackup = %v, must not skip the final backup", err)
+	}
+	if len(cleared) == 0 {
+		t.Fatal("recovery settings were not cleared on a cluster out of recovery")
+	}
+	if st := e.svc.restoreState(ctx, testRef); st != restoreStateFinished {
+		t.Fatalf("restore state = %q, want finished", st)
+	}
+}
+
+func TestFinishPendingRestores(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	e.svc.opt.Access = &portAccess{ports: map[string]int{}}
+	e.svc.opt.RecoveryPoll = time.Millisecond
+	_ = e.reg.AppendEvent(ctx, testRef, "restore.cleanup_pending", nil)
+	if got := e.svc.PendingRestores(ctx); len(got) != 1 || got[0] != testRef {
+		t.Fatalf("PendingRestores = %v", got)
+	}
+	n := 0
+	e.svc.probe = func(context.Context, string) (bool, error) { n++; return n < 3, nil }
+	e.svc.alter = func(context.Context, string, []string) error { return nil }
+	if got := e.svc.FinishPendingRestores(ctx); len(got) != 1 {
+		t.Fatalf("FinishPendingRestores = %v", got)
+	}
+	if got := e.svc.PendingRestores(ctx); len(got) != 0 {
+		t.Fatalf("still pending after finish: %v", got)
 	}
 }

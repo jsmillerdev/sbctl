@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -61,6 +62,8 @@ type Server struct {
 	upstreamOverride func(p *registry.Project, svc string) string
 	createWait       time.Duration
 
+	loginMu sync.Mutex // serializes device-login session creation
+
 	pgmetaKeyMu    chan struct{} // 1-slot lock around pgmetaKeyCache
 	pgmetaKeyCache string
 
@@ -68,7 +71,64 @@ type Server struct {
 	roLocks   map[string]*sync.Mutex     // per-project role setup locks
 	roEnsured map[string]readOnlyEnsured // by project ref
 
+	ops opTracker
+
 	handler http.Handler
+}
+
+// opTracker counts the lifecycle operations that outlive their HTTP request (create,
+// delete, pause, resume, restart) so that a shutdown can wait for them.
+type opTracker struct {
+	mu       sync.Mutex
+	wg       sync.WaitGroup
+	n        int
+	draining bool
+}
+
+// errDraining is what a mutation gets once Drain has begun.
+var errDraining = errf(http.StatusServiceUnavailable, "sbctl is shutting down; try again in a moment")
+
+// beginOp registers one in-flight operation; the returned func ends it. It fails once
+// Drain has begun, so the operation is never started.
+func (s *Server) beginOp() (func(), error) {
+	s.ops.mu.Lock()
+	defer s.ops.mu.Unlock()
+	if s.ops.draining {
+		return nil, errDraining
+	}
+	s.ops.wg.Add(1)
+	s.ops.n++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.ops.mu.Lock()
+			s.ops.n--
+			s.ops.mu.Unlock()
+			s.ops.wg.Done()
+		})
+	}, nil
+}
+
+// Drain stops the server from starting lifecycle operations (they answer 503) and waits
+// until the ones in flight have finished or ctx ends. Call it when shutdown begins and
+// close the registry only after it returns. A nil error means nothing is left running;
+// otherwise the error says how many operations were cut off, and lifecycle.Engine.Recover
+// finishes or reverts them at the next start.
+func (s *Server) Drain(ctx context.Context) error {
+	s.ops.mu.Lock()
+	s.ops.draining = true
+	s.ops.mu.Unlock()
+	done := make(chan struct{})
+	go func() { s.ops.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.ops.mu.Lock()
+		n := s.ops.n
+		s.ops.mu.Unlock()
+		return fmt.Errorf("api: %d lifecycle operation(s) still running at shutdown: %w", n, ctx.Err())
+	}
 }
 
 // route is one served operation.
@@ -107,7 +167,12 @@ func NewServer(d Deps) (*Server, error) {
 	if s.hc == nil {
 		// No overall timeout: pg-meta queries and function uploads may be long.
 		// Callers bound work with request contexts.
-		s.hc = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		// postgres-meta (fastify) closes idle keep-alive connections after 5 seconds. A
+		// client that reuses one at that moment gets EOF on a request it cannot safely
+		// replay (a SQL POST), so idle connections are dropped well before that.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.IdleConnTimeout = 2 * time.Second
+		s.hc = &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 	if s.pgmetaURL == "" {
 		s.pgmetaURL = fmt.Sprintf("http://127.0.0.1:%d", d.Config.Ports.PGMeta)
@@ -119,6 +184,10 @@ func NewServer(d Deps) (*Server, error) {
 		if pg, ok := d.Registry.(*registry.Postgres); ok {
 			s.store = NewPGStore(pg.Pool())
 		} else {
+			// Dashboard users, device-login PATs, function sources, sealed function secrets
+			// and saved snippets would all be lost on restart. Wiring code (internal/app)
+			// passes Deps.Store; only tests and the dev mock should land here.
+			s.log.Warn("api: no Store given and the registry is not Postgres; using an in-memory store, state is lost on restart")
 			s.store = NewMemoryStore()
 		}
 	}
@@ -240,6 +309,13 @@ func (s *Server) wrap(kind authKind, h handlerFunc) http.Handler {
 // fail writes err as the error envelope. Unexpected errors are logged with their
 // detail and answered with a generic 500.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+		// The client went away (a browser navigation cancels in-flight queries). Nobody
+		// reads the answer and it is not a server error: 499, as nginx records it.
+		s.log.Debug("api request cancelled by the client", "method", r.Method, "path", r.URL.Path)
+		writeError(w, &Error{Status: 499, Message: "Client closed request"})
+		return
+	}
 	e := asError(err)
 	if e.Status >= 500 {
 		s.log.Error("api request failed", "method", r.Method, "path", r.URL.Path, "status", e.Status, "err", err)

@@ -51,8 +51,22 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0027
-# The local backup backend (file://) writes WAL from archive_command into backups/.
-ReadWritePaths=/var/lib/sbctl/projects/%i -/var/lib/sbctl/backups
+# The local backup backend (file://) writes WAL from archive_command into backups/<ref>/,
+# which sbctl creates before the first start. The launcher chmods a script inside the
+# postgres artifact on first boot, so that one artifact directory is writable too.
+ReadWritePaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/postgres -/var/lib/sbctl/backups/%i
+# Containment (allowlist). Every unit runs as the sbctl user, so the mount namespace is
+# what keeps this cluster away from the master key, other projects' data and other
+# projects' backups. The unit sees an empty tmpfs where /var/lib/sbctl is, plus the
+# artifacts (read-only, the postgres one writable), its launcher script, its own cluster
+# directory and its own backup directory. The master key is hidden: archive_command
+# (`sbctl wal push`) reads only config.toml. Environment files are read by systemd before
+# the namespace exists. This does not isolate tenants from a compromised cluster (same
+# uid, /proc); see README.md.
+InaccessiblePaths=-/etc/sbctl/master.key
+TemporaryFileSystem=/var/lib/sbctl:ro
+BindReadOnlyPaths=/var/lib/sbctl/artifacts /var/lib/sbctl/projects/%i/postgres.run
+BindPaths=/var/lib/sbctl/projects/%i/postgres /var/lib/sbctl/artifacts/postgres -/var/lib/sbctl/backups/%i
 
 [Install]
 WantedBy=multi-user.target

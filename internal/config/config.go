@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,7 @@ const (
 	DefaultKeyPath    = "/etc/sbctl/master.key"
 	DefaultStateDir   = "/var/lib/sbctl"
 	DefaultBinPath    = "/usr/local/bin/sbctl"
+	DefaultRegion     = "us-east-1"
 	EnvPrefix         = "SBCTL_"
 	EnvConfigPath     = "SBCTL_CONFIG"
 	SupervisorSystemd = "systemd"
@@ -41,6 +43,10 @@ type Config struct {
 	// Platform selects the artifact build, for example "linux-amd64". Empty means the running platform.
 	Platform string `toml:"platform"`
 	LogLevel string `toml:"log_level"`
+	// Region is the AWS region code shown for every project (Studio and the Supabase CLI
+	// resolve it against a list of real regions, so a free-form label breaks the project
+	// list). It is only a label here: nothing is placed by it. Default "us-east-1".
+	Region string `toml:"region"`
 
 	Listen    Listen    `toml:"listen"`
 	Ports     Ports     `toml:"ports"`
@@ -121,6 +127,7 @@ func Default() *Config {
 		BinPath:    DefaultBinPath,
 		Supervisor: SupervisorSystemd,
 		LogLevel:   "info",
+		Region:     DefaultRegion,
 		Listen:     Listen{HTTP: ":80", HTTPS: ":443", Admin: "127.0.0.1:7000"},
 		Ports:      DefaultPorts(),
 		TLS:        TLS{Mode: "auto", Credentials: map[string]string{}},
@@ -178,6 +185,12 @@ func (c *Config) Validate() error {
 	}
 	if c.StateDir == "" {
 		return errors.New("config: state_dir is empty")
+	}
+	if c.Region == "" {
+		c.Region = DefaultRegion
+	}
+	if !ValidRegion(c.Region) {
+		return fmt.Errorf("config: region %q is not one of the regions Studio knows (%s; the list is AWS_REGIONS in Studio's packages/shared-data/regions.ts)", c.Region, strings.Join(Regions, ", "))
 	}
 	if c.Ports.ProjectBase < 1024 || c.MaxProjectSeq() < 1 {
 		return fmt.Errorf("config: ports.project_base %d out of range", c.Ports.ProjectBase)
@@ -246,4 +259,31 @@ func lookup(environ []string, name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// Regions are the region codes Studio knows: AWS_REGIONS in packages/shared-data/regions.ts
+// at the pinned Studio commit (versions.yaml, studio). Studio resolves a project's region
+// against this table and its project list breaks on any other code, real AWS region or not
+// (eu-south-1, ap-east-1 and us-gov-west-1 included). Update it when the Studio pin moves.
+var Regions = []string{
+	"us-west-1", "us-west-2", "us-east-1", "us-east-2", "ca-central-1",
+	"eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-central-2", "eu-north-1",
+	"ap-south-1", "ap-southeast-1", "ap-northeast-1", "ap-northeast-2", "ap-southeast-2",
+	"sa-east-1",
+}
+
+// ValidRegion reports whether s is one of Regions.
+func ValidRegion(s string) bool { return slices.Contains(Regions, s) }
+
+// ProjectRegion maps a stored or requested project region to the label shown to
+// clients: a code in Regions is kept, anything else (empty, the old "local") becomes the
+// configured region.
+func (c *Config) ProjectRegion(s string) string {
+	if ValidRegion(s) {
+		return s
+	}
+	if c.Region != "" {
+		return c.Region
+	}
+	return DefaultRegion
 }

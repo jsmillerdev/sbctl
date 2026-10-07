@@ -155,7 +155,7 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 	if err != nil {
 		return nil, err
 	}
-	claims, err := secrets.ParseHS256(token, secret)
+	claims, err := secrets.ParseSessionHS256(token, secret)
 	if errors.Is(err, jwt.ErrTokenSignatureInvalid) {
 		// Possibly signed with a rotated secret: re-read it (rate limited), once.
 		fresh, ferr := a.systemSecret(ctx, true)
@@ -163,16 +163,24 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 			return nil, ferr
 		}
 		if fresh != secret {
-			claims, err = secrets.ParseHS256(token, fresh)
+			claims, err = secrets.ParseSessionHS256(token, fresh)
 		}
 	}
 	if err != nil {
 		return nil, errUnauthorized
 	}
-	// Dashboard sessions are GoTrue access tokens of signed-in users. API keys of
-	// projects are signed with other secrets, and anonymous sign-ins are not users.
-	if role, _ := claims["role"].(string); role != "authenticated" {
+	// Dashboard sessions are GoTrue access tokens of signed-in users: signed with the
+	// system project's secret and issued for the audience "authenticated". The role
+	// claim is not checked: users created through GoTrue's admin API have an empty
+	// auth.users.role, so their tokens carry role "" (research/08 section 9). The
+	// sbctl-minted system keys (role anon or service_role) have no audience and fail
+	// here, API keys of projects are signed with other secrets, and anonymous sign-ins
+	// are not users.
+	if !hasAudience(claims["aud"], "authenticated") {
 		return nil, errUnauthorized
+	}
+	if role, _ := claims["role"].(string); role == "anon" || role == "service_role" {
+		return nil, errUnauthorized // never a GoTrue user session
 	}
 	if anon, _ := claims["is_anonymous"].(bool); anon {
 		return nil, errUnauthorized
@@ -245,4 +253,19 @@ func userFromClaims(sub, email string, meta map[string]any) User {
 		u.Username, _, _ = strings.Cut(email, "@")
 	}
 	return u
+}
+
+// hasAudience reports whether the aud claim (a string, or a list of strings) names want.
+func hasAudience(aud any, want string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == want
+	case []any:
+		for _, a := range v {
+			if s, _ := a.(string); s == want {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -12,6 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/OWNER/sbctl/internal/config"
+	"github.com/OWNER/sbctl/internal/lifecycle"
 	"github.com/OWNER/sbctl/internal/registry"
 )
 
@@ -63,6 +65,9 @@ func (s *Service) BaseBackupWith(ctx context.Context, ref string, bo BackupOptio
 	proj, err := reg.GetProject(ctx, ref)
 	if err != nil {
 		return nil, fmt.Errorf("backup: project %s: %w", ref, err)
+	}
+	if never, why := s.neverRecovered(ctx, ref); never {
+		return nil, fmt.Errorf("backup: %s has no restorable state: %s: %w", ref, why, lifecycle.ErrNoRestorableState)
 	}
 
 	started := s.opt.Now().UTC().Truncate(time.Second)
@@ -302,4 +307,136 @@ func (s *Service) writeSecretsFile(ctx context.Context, m *Manifest, sealed map[
 	m.Secrets = secretsName
 	m.StoredBytes += int64(len(b))
 	return nil
+}
+
+// Restore states recorded by the restore events, newest event wins.
+const (
+	restoreStateNone     = ""
+	restoreStateFinished = "finished"
+	restoreStateFailed   = "failed"
+	restoreStatePending  = "pending"
+)
+
+// restoreState is what the newest restore event says about ref's recovery: finished
+// (restore.recovery_finished), failed (restore.recovery_failed), pending
+// (restore.cleanup_pending: recovery outlasted RecoveryTimeout) or none.
+func (s *Service) restoreState(ctx context.Context, ref string) string {
+	evs, err := s.opt.Registry.ListEvents(ctx, ref, 200) // newest first
+	if err != nil {
+		return restoreStateNone
+	}
+	for _, e := range evs {
+		switch e.Kind {
+		case eventRecoveryFinished:
+			return restoreStateFinished
+		case "restore.recovery_failed":
+			return restoreStateFailed
+		case "restore.cleanup_pending":
+			return restoreStatePending
+		}
+	}
+	return restoreStateNone
+}
+
+// neverRecovered reports whether ref is a restore-as-new clone that holds no completed
+// base backup of its own and whose cluster cannot be backed up: its recovery failed
+// (restore.recovery_failed) or had not finished when the restore returned
+// (restore.cleanup_pending), no later restore.recovery_finished exists, and the live
+// cluster is unreachable or still replaying. Such a project cannot be backed up (a
+// cluster in recovery refuses, a dead one cannot be reached), and
+// lifecycle.Manager.Delete treats the resulting lifecycle.ErrNoRestorableState as "skip
+// the final backup". Without this the delete contract (abort when the final backup
+// fails) would make the project impossible to remove.
+//
+// The events alone are not enough: restore reports success when recovery outlasts
+// RecoveryTimeout, and the seeded recovery_target_action = 'promote' then makes the
+// cluster writable on its own. So the live cluster decides. One that has left recovery
+// is a working database: its recovery settings are cleared, restore.recovery_finished is
+// recorded and the backup goes ahead.
+func (s *Service) neverRecovered(ctx context.Context, ref string) (bool, string) {
+	bs, err := s.opt.Registry.ListBackups(ctx, ref)
+	if err != nil {
+		return false, ""
+	}
+	for _, b := range bs {
+		if b.Status == registry.BackupCompleted {
+			return false, ""
+		}
+	}
+	var why string
+	switch s.restoreState(ctx, ref) {
+	case restoreStateFailed:
+		why = "its restore failed during recovery and it holds no completed base backup"
+	case restoreStatePending:
+		why = "its restore has not finished recovery and it holds no completed base backup"
+	default:
+		return false, ""
+	}
+	if s.settleRecovered(ctx, ref) {
+		return false, ""
+	}
+	return true, why
+}
+
+// settleRecovered asks ref's live cluster whether it has left recovery. If so it clears
+// the recovery settings (a failure is logged; the cluster is usable regardless) and
+// records restore.recovery_finished, and reports true. An unreachable or still
+// replaying cluster reports false.
+func (s *Service) settleRecovered(ctx context.Context, ref string) bool {
+	pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	inRec, err := s.probe(pctx, ref)
+	if err != nil || inRec {
+		return false
+	}
+	if err := s.alter(pctx, ref, recoveryGUCs); err != nil {
+		s.opt.Log.Warn("restored cluster left recovery but its recovery settings could not be cleared", "ref", ref, "err", err)
+		return true
+	}
+	_ = s.opt.Registry.AppendEvent(context.WithoutCancel(ctx), ref, eventRecoveryFinished, nil)
+	return true
+}
+
+// PendingRestores lists the projects whose newest restore event is
+// restore.cleanup_pending: restored clones whose recovery outlasted RecoveryTimeout.
+func (s *Service) PendingRestores(ctx context.Context) []string {
+	if s.opt.Registry == nil {
+		return nil
+	}
+	ps, err := s.opt.Registry.ListProjects(ctx)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range ps {
+		if p.Ref != config.SystemRef && s.restoreState(ctx, p.Ref) == restoreStatePending {
+			out = append(out, p.Ref)
+		}
+	}
+	return out
+}
+
+// FinishPendingRestores completes every active project whose restore reported
+// restore.cleanup_pending: it waits (up to RecoveryTimeout each) for the cluster to leave
+// recovery, clears the recovery settings and records restore.recovery_finished. The
+// daemon runs it after it starts the projects and repeats it while any stays pending, so
+// a slow restore-as-new does not depend on someone running `sbctl backups
+// finish-restore`. It returns the refs it finished.
+func (s *Service) FinishPendingRestores(ctx context.Context) []string {
+	if s.opt.Access == nil {
+		return nil
+	}
+	var done []string
+	for _, ref := range s.PendingRestores(ctx) {
+		p, err := s.opt.Registry.GetProject(ctx, ref)
+		if err != nil || (p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy) {
+			continue
+		}
+		if err := s.FinishRestore(ctx, ref); err != nil {
+			s.opt.Log.Warn("restore still not finished", "ref", ref, "err", err)
+			continue
+		}
+		done = append(done, ref)
+	}
+	return done
 }

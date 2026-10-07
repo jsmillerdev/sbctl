@@ -39,6 +39,7 @@ func (s *Server) routesProjects(add func(string, handlerFunc)) {
 	add("DELETE /v1/projects/{ref}", s.v1DeleteProject)
 	add("POST /v1/projects/{ref}/pause", s.pauseProject(http.StatusOK))
 	add("POST /v1/projects/{ref}/restore", s.restoreProject(http.StatusOK))
+	add("POST /v1/projects/{ref}/restart", s.restartProject(http.StatusOK))
 	add("GET /v1/projects/{ref}/health", s.v1Health)
 	add("GET /v1/projects/{ref}/branches", s.noBranches)
 	add("GET /v1/projects/{ref}/branches/{name}", s.branchNotFound)
@@ -51,8 +52,9 @@ func (s *Server) routesProjects(add func(string, handlerFunc)) {
 	add("PATCH /platform/projects/{ref}", s.platformUpdateProject)
 	add("DELETE /platform/projects/{ref}", s.platformDeleteProject)
 	add("POST /platform/projects/{ref}/pause", s.pauseProject(http.StatusCreated))
-	add("POST /platform/projects/{ref}/restore", s.restoreProject(http.StatusCreated))
-	add("POST /platform/projects/{ref}/restart", s.restartProject)
+	add("POST /platform/projects/{ref}/restore", s.restoreProject(http.StatusOK))
+	add("POST /platform/projects/{ref}/restart", s.restartProject(http.StatusCreated))
+	add("POST /platform/projects/{ref}/restart-services", s.restartProject(http.StatusCreated))
 	add("GET /platform/projects/{ref}/status", s.platformStatus)
 	add("GET /platform/organizations/{slug}/projects", s.orgProjects)
 }
@@ -65,7 +67,7 @@ func (s *Server) v1Project(ctx context.Context, p *registry.Project) (*v1.V1Proj
 	}
 	out := &v1.V1ProjectWithDatabaseResponseOutput{
 		CreatedAt: ts(p.CreatedAt), Id: p.Ref, Name: p.Name, OrganizationId: org.Slug,
-		OrganizationSlug: org.Slug, Ref: p.Ref, Region: regionOf(p),
+		OrganizationSlug: org.Slug, Ref: p.Ref, Region: s.regionOf(p),
 		Status: v1.V1ProjectWithDatabaseResponseOutputStatus(p.Status),
 	}
 	out.Database.Host = s.dbHost(p.Ref)
@@ -75,12 +77,8 @@ func (s *Server) v1Project(ctx context.Context, p *registry.Project) (*v1.V1Proj
 	return out, nil
 }
 
-func regionOf(p *registry.Project) string {
-	if p.Region == "" {
-		return "local"
-	}
-	return p.Region
-}
+// regionOf is the region shown for p: a real AWS region code, never a free-form label.
+func (s *Server) regionOf(p *registry.Project) string { return s.cfg.ProjectRegion(p.Region) }
 
 func (s *Server) v1ListProjects(w http.ResponseWriter, r *http.Request) error {
 	ps, err := s.userProjects(r.Context())
@@ -157,9 +155,15 @@ func (s *Server) createProject(ctx context.Context, in createInput) (*registry.P
 	}
 	done := make(chan result, 1)
 	var answeredComingUp atomic.Bool
+	endOp, err := s.beginOp()
+	if err != nil {
+		return nil, err
+	}
 	go func() {
+		defer endOp()
 		// The request may end before provisioning does.
-		bg := context.WithoutCancel(ctx)
+		bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), createTimeout)
+		defer cancel()
 		p, err := s.mgr.Create(bg, req)
 		if err != nil {
 			s.log.Error("project creation failed", "ref", ref, "err", err)
@@ -231,7 +235,7 @@ func (s *Server) v1CreateProject(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeJSON(w, http.StatusCreated, &v1.V1ProjectResponseOutput{
 		CreatedAt: ts(p.CreatedAt), Id: p.Ref, Name: p.Name, OrganizationId: org.Slug,
-		OrganizationSlug: org.Slug, Ref: p.Ref, Region: regionOf(p), Status: v1.V1ProjectResponseOutputStatus(p.Status),
+		OrganizationSlug: org.Slug, Ref: p.Ref, Region: s.regionOf(p), Status: v1.V1ProjectResponseOutputStatus(p.Status),
 	})
 	return nil
 }
@@ -279,7 +283,12 @@ func (s *Server) deleteProject(r *http.Request) (*registry.Project, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.mgr.Delete(r.Context(), p.Ref); err != nil {
+	ctx, cancel, err := s.detach(r, deleteTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	if err := s.mgr.Delete(ctx, p.Ref); err != nil {
 		return nil, mapErr(err)
 	}
 	return p, nil
@@ -291,7 +300,12 @@ func (s *Server) pauseProject(status int) handlerFunc {
 		if err != nil {
 			return err
 		}
-		if err := s.mgr.Pause(r.Context(), p.Ref); err != nil {
+		ctx, cancel, err := s.detach(r, lifecycleTimeout)
+		if err != nil {
+			return err
+		}
+		defer cancel()
+		if err := s.mgr.Pause(ctx, p.Ref); err != nil {
 			return mapErr(err)
 		}
 		w.WriteHeader(status)
@@ -305,7 +319,12 @@ func (s *Server) restoreProject(status int) handlerFunc {
 		if err != nil {
 			return err
 		}
-		if err := s.mgr.Resume(r.Context(), p.Ref); err != nil {
+		ctx, cancel, err := s.detach(r, lifecycleTimeout)
+		if err != nil {
+			return err
+		}
+		defer cancel()
+		if err := s.mgr.Resume(ctx, p.Ref); err != nil {
 			return mapErr(err)
 		}
 		w.WriteHeader(status)
@@ -313,20 +332,62 @@ func (s *Server) restoreProject(status int) handlerFunc {
 	}
 }
 
-// restartProject pauses and resumes: there is no in-place restart in Manager.
-func (s *Server) restartProject(w http.ResponseWriter, r *http.Request) error {
-	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
+// restartProject pauses and resumes: there is no in-place restart in Manager. Both
+// calls run as one detached unit, so a client that leaves between them cannot strand the
+// project paused.
+func (s *Server) restartProject(status int) handlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		p, err := s.loadProject(r.Context(), r.PathValue("ref"))
+		if err != nil {
+			return err
+		}
+		ctx, cancel, err := s.detach(r, 2*lifecycleTimeout)
+		if err != nil {
+			return err
+		}
+		defer cancel()
+		// The intent is recorded so that a daemon stop between the two calls does not
+		// leave the project paused: Engine.Recover resumes it (lifecycle.EventRestart*).
+		s.recordEvent(ctx, p.Ref, lifecycle.EventRestartRequested, nil)
+		defer func() { s.recordEvent(ctx, p.Ref, lifecycle.EventRestartFinished, nil) }()
+		if err := s.mgr.Pause(ctx, p.Ref); err != nil {
+			return mapErr(err)
+		}
+		if err := s.mgr.Resume(ctx, p.Ref); err != nil {
+			return mapErr(err)
+		}
+		w.WriteHeader(status)
+		return nil
+	}
+}
+
+// Bounds for lifecycle operations that outlive their HTTP request. Delete includes a
+// final base backup, so it gets the longest.
+const (
+	createTimeout    = 20 * time.Minute
+	lifecycleTimeout = 10 * time.Minute
+	deleteTimeout    = 30 * time.Minute
+)
+
+// detach returns a context for a lifecycle mutation that keeps the request's values but
+// not its cancellation: a client that disconnects (Ctrl-C on `supabase projects delete`,
+// a closed Studio tab, a proxy idle timeout) must not stop the operation halfway and
+// leave a project half deleted or stopped. The timeout bounds a stuck operation. The
+// operation is registered for Drain, and the returned func ends it: a shutdown waits for
+// it, and a server that is already draining refuses it with 503 before anything starts.
+func (s *Server) detach(r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc, error) {
+	end, err := s.beginOp()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	if err := s.mgr.Pause(r.Context(), p.Ref); err != nil {
-		return mapErr(err)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), timeout)
+	return ctx, func() { cancel(); end() }, nil
+}
+
+func (s *Server) recordEvent(ctx context.Context, ref, kind string, payload any) {
+	if err := s.reg.AppendEvent(ctx, ref, kind, payload); err != nil {
+		s.log.Warn("could not record event", "ref", ref, "kind", kind, "err", err)
 	}
-	if err := s.mgr.Resume(r.Context(), p.Ref); err != nil {
-		return mapErr(err)
-	}
-	w.WriteHeader(http.StatusCreated)
-	return nil
 }
 
 // healthName maps service names of the lifecycle manager to the API's.
