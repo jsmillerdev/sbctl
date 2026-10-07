@@ -167,8 +167,10 @@ check_hidden_paths() { # UNIT: the unit's property and, in its mount namespace, 
   [[ $hidden == */etc/sbctl* ]] || fail "$unit: InaccessiblePaths lost /etc/sbctl (the master key and config): '$hidden'"
   pid=$(unit_prop MainPID "$unit")
   [[ $pid -gt 0 ]] || fail "$unit: no main pid"
-  # InaccessiblePaths puts an inaccessible node of the same type (a socket, mode 000) over the path.
-  for p in /run/dbus/system_bus_socket /run/systemd/resolve/io.systemd.Resolve; do
+  # InaccessiblePaths puts an inaccessible node of the same type (a socket, mode 000) over the path;
+  # over the directory /run/dbus it puts an empty mode-000 directory, so the bus socket is not there.
+  [[ $(stat -c %a "/proc/$pid/root/run/dbus" 2>/dev/null) == 0 && ! -e /proc/$pid/root/run/dbus/system_bus_socket ]] || fail "$unit: /run/dbus is reachable inside the unit"
+  for p in /run/systemd/resolve/io.systemd.Resolve; do
     if [[ -S $p ]]; then
       [[ $(stat -c %a "/proc/$pid/root$p" 2>/dev/null) == 0 ]] || fail "$unit: $p is reachable inside the unit (mode $(stat -c %a "/proc/$pid/root$p" 2>&1), want 0)"
     fi
