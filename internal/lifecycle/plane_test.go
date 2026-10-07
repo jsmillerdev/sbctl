@@ -76,7 +76,7 @@ func TestPostgresSpec(t *testing.T) {
 		"-c wal_level=logical",
 		"-c archive_mode=on",
 		"-c archive_command='/usr/local/bin/supavise' wal push --ref abcdefghijklmnopqrst %p",
-		"-c shared_buffers=32MB",
+		"-c shared_buffers=256MB",
 		"-c max_connections=60",
 		"-c cron.use_background_workers=on",
 		"-c cron.database_name=postgres",
@@ -103,11 +103,11 @@ func TestPostgresSpec(t *testing.T) {
 	}
 
 	// Class and overrides.
-	p.Class = "micro"
+	p.Class = "nano"
 	pl.opts.ArchiveCommand, pl.opts.ConfigPath = "off", "/etc/supavise/config.toml"
 	spec, _ = pl.postgresSpec(context.Background(), p, keys)
 	args = strings.Join(spec.Exec, " ")
-	if !strings.Contains(args, "-c shared_buffers=16MB") || !strings.Contains(args, "-c max_connections=30") || !strings.Contains(args, "-c archive_mode=off") || strings.Contains(args, "archive_command") {
+	if !strings.Contains(args, "-c shared_buffers=128MB") || !strings.Contains(args, "-c max_connections=60") || !strings.Contains(args, "-c archive_mode=off") || strings.Contains(args, "archive_command") {
 		t.Fatalf("micro/off args:\n%s", args)
 	}
 	if spec.Env["SUPAVISE_CONFIG"] != "/etc/supavise/config.toml" {
@@ -534,8 +534,9 @@ func TestPostgresSpecRunsCronInBackgroundWorkers(t *testing.T) {
 	if i, j := strings.LastIndex(args, "max_worker_processes=16"), strings.LastIndex(args, "max_worker_processes=24"); i < 0 || j < i {
 		t.Errorf("a saved max_worker_processes must come after the default:\n%s", args)
 	}
-	if strings.Contains(args, "-c work_mem") {
-		t.Errorf("work_mem goes through ALTER SYSTEM, not the command line:\n%s", args)
+	// work_mem is part of the size, so a saved one goes after it on the command line.
+	if i, j := strings.LastIndex(args, "-c work_mem=4MB"), strings.LastIndex(args, "-c work_mem=8MB"); i < 0 || j < i {
+		t.Errorf("a saved work_mem must come after the size's:\n%s", args)
 	}
 	// The hba file must keep refusing a passwordless loopback connection: background workers
 	// are the fix, not trust on 127.0.0.1.

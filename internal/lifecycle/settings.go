@@ -32,7 +32,7 @@ type Settings interface {
 // rendered into the unit after the class's and takes effect at the next restart. Every other
 // saved setting goes through ALTER SYSTEM.
 var cmdlineSettings = []string{
-	"shared_buffers", "effective_cache_size", "maintenance_work_mem", "max_wal_size",
+	"shared_buffers", "effective_cache_size", "work_mem", "maintenance_work_mem", "max_wal_size",
 	"max_connections", "max_wal_senders", "max_replication_slots", "max_worker_processes",
 }
 

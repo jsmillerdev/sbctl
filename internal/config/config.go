@@ -61,7 +61,10 @@ type Config struct {
 	Branching Branching `toml:"branching"`
 	Alerts    Alerts    `toml:"alerts"`
 	Health    Health    `toml:"health"`
-	Defaults  Limits    `toml:"defaults"`
+	Compute   Compute   `toml:"compute"`
+	// Defaults are the systemd limits of the shared services and the system project. A user
+	// project takes the limits of its size (internal/lifecycle, sizes.go) instead.
+	Defaults Limits `toml:"defaults"`
 }
 
 type Listen struct {
@@ -220,6 +223,9 @@ func (c *Config) Validate() error {
 	if err := c.Health.validate(); err != nil {
 		return err
 	}
+	if err := c.Compute.Validate(); err != nil {
+		return err
+	}
 	if err := c.validateAlerts(); err != nil {
 		return err
 	}
@@ -290,6 +296,12 @@ func applyEnv(v reflect.Value, prefix string, environ []string) error {
 				return fmt.Errorf("%s: %w", name, err)
 			}
 			fv.SetInt(n)
+		case reflect.Float64:
+			x, err := strconv.ParseFloat(val, 64)
+			if err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+			fv.SetFloat(x)
 		}
 	}
 	return nil
