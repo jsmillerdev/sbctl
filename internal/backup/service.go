@@ -38,7 +38,7 @@ type Options struct {
 	Access Access
 	// Secrets opens the sealed secrets stored in backups; required for Restore.
 	Secrets secrets.Secrets
-	// Manager is required for Restore; workstream D implements it.
+	// Manager is required for Restore; internal/lifecycle implements it.
 	Manager lifecycle.Manager
 	// ConfigPath is embedded as --config in archive_command and restore_command when
 	// it is not the default, so Postgres children find the same configuration.

@@ -159,7 +159,7 @@ A node needs about 1.5 GB of memory for itself and about 150 MB per idle project
 | `t4g.xlarge` | 16 GiB | about 90 |
 | `m7g.2xlarge` | 32 GiB | about 200 |
 
-These figures come from measurements up to 50 projects on amd64 and arm64 ([docs/research/09-footprint.md](research/09-footprint.md)); the 32 GiB row extends them.
+These figures come from measurements up to 50 projects on amd64 and arm64 ([docs/reference/footprint.md](reference/footprint.md)); the 32 GiB row extends them.
 
 Each project has a compute size, Nano to 16XL as on hosted Supabase, Micro by default. Change it in Studio under Compute and Disk or with `supavise projects resize <ref> --size small`; `supavise projects sizes` shows which sizes the node can give now ([project sizes and disk](../deploy/README.md#project-sizes-and-disk)). On AWS you pay AWS directly for the instance, storage and traffic; the deploy guide lists each item in [What it costs](../deploy/README.md#what-it-costs).
 

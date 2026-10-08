@@ -9,9 +9,6 @@
 set -euo pipefail
 out=${1:?usage: serve-stack.sh /path/to/stack.json}
 root=$(cd "$(dirname "$0")/../../.." && pwd)
-guard=${GUARD:-$root/scripts/guard.sh}
-# In a git worktree that predates scripts/guard.sh, use the main checkout's copy.
-[[ -x $guard ]] || guard=$(cd "$(git -C "$root" rev-parse --git-common-dir)/.." && pwd)/scripts/guard.sh
 art=${SUPAVISE_ARTIFACTS:-$HOME/.cache/sbctl/unpacked}
 export SUPAVISE_API_INTEGRATION=1
 export SUPAVISE_API_IT_PORT_BASE=${SUPAVISE_API_IT_PORT_BASE:-}
@@ -21,7 +18,5 @@ export SUPAVISE_API_SERVE_FILE=$out
 bin=$(mktemp -t supavise-api-test.XXXXXX)
 trap 'rm -f "$bin"' EXIT
 cd "$root"
-# Compile under the machine-wide heavy-job lock, then run the binary without it:
-# the stack is light and must not hold the lock for the length of a session.
-"$guard" -- go test -c -o "$bin" ./internal/api
-"$guard" --no-lock -- "$bin" -test.run IntegrationServe -test.v -test.timeout 40m
+go test -c -o "$bin" ./internal/api
+"$bin" -test.run IntegrationServe -test.v -test.timeout 40m

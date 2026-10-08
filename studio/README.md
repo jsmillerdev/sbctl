@@ -1,18 +1,18 @@
 # studio
 
-Platform-mode Studio for `supavise`: a build of upstream Studio with `NEXT_PUBLIC_IS_PLATFORM=true` and three small patches, packaged like the slim-services `studio` artifact so the systemd unit does not change. Also the mock Management API and the browser spike that tested it, and the endpoint list Workstream B builds against (`docs/research/08-studio-platform-calls.md`).
+Platform-mode Studio for `supavise`: a build of upstream Studio with `NEXT_PUBLIC_IS_PLATFORM=true` and three small patches, packaged like the slim-services `studio` artifact so the systemd unit does not change. Also the mock Management API and the browser spike that tests it. The calls Studio makes are listed in [docs/reference/studio-platform-calls.md](../docs/reference/studio-platform-calls.md).
 
 | Path | What |
 |---|---|
 | `patches/` | The three patches, one `git format-patch` file each, made against `supabase/supabase@94b8b06eb294cf6b217c68d30357566cc8f146d9` (`internal/versions/versions.yaml` `studio.tag`). |
 | `build.sh <platform>` | Fetch, patch, install, build, package, verify. Writes `dist/supavise-studio-<tag>-p<N>-<platform>.tar.zst` and a line in `dist/SHA256SUMS`. |
-| `Dockerfile.build` | The same build in a clean Ubuntu 24.04 image (`docker buildx build --target artifact --output type=local,dest=studio/dist`). |
-| `ci-prepare.sh` | For a GitHub-hosted runner (needs `SUPAVISE_CI=1` or `GITHUB_ACTIONS` in the environment, which `sudo` drops: `sudo env SUPAVISE_CI=1 studio/ci-prepare.sh`): frees disk, adds 6 GB swap, installs zstd, curl, git, python3 and build-essential when missing. |
-| `verify.sh` | Starts a packaged build on a loopback port and checks it (also run by `build.sh` before it writes the artifact). |
+| `Dockerfile.build` | The same build in an Ubuntu 24.04 image (`docker buildx build --target artifact --output type=local,dest=studio/dist`). |
+| `ci-prepare.sh` | For a GitHub-hosted runner (needs `SUPAVISE_CI=1` or `GITHUB_ACTIONS`, which `sudo` drops: `sudo env SUPAVISE_CI=1 studio/ci-prepare.sh`): frees disk, adds 6 GB swap, installs the build tools. |
+| `verify.sh` | Starts a packaged build on a loopback port and checks it (`build.sh` runs it before it writes the artifact). |
 | `runtime/` | What goes into the artifact: launcher, entrypoint, runtime substitution and its tests. |
 | `placeholders.json` | The per-install values baked into the build as placeholders. |
-| `PATCHSET` | Revision `N` in the artifact name. Bump it when the patches or `runtime/` change without a new upstream tag. |
-| `mock/` | Mock Management API (Go, `package main`). See `mock/README.md`. |
+| `PATCHSET` | Revision `N` in the artifact name; bump it when the patches or `runtime/` change without a new upstream tag. |
+| `mock/` | Stand-in Management API for `spike.sh` (Go, `package main`). See `mock/README.md`. |
 | `spike.sh`, `spike/` | The CI spike: small stack plus mock plus Studio, driven by Playwright. |
 
 ## The artifact
@@ -20,15 +20,15 @@ Platform-mode Studio for `supavise`: a build of upstream Studio with `NEXT_PUBLI
 Same layout and launcher contract as `studio-2026.10.05-sha-94b8b06-r0`:
 
 ```
-bin/studio              POSIX sh launcher; sources bin/.runtime-env.sh; cd app/; exec node/bin/node apps/studio/docker-entrypoint.mjs
+bin/studio              POSIX sh launcher; cd app/; exec node/bin/node apps/studio/docker-entrypoint.mjs
 bin/.runtime-env.sh     NODE_OPTIONS default (--max-old-space-size=384), NEXT_TELEMETRY_DISABLED=1; a set variable wins
 node/bin/node           Node 22.23.3 from nodejs.org (checksum pinned in build.sh)
-app/                    Next standalone output (apps/studio/server.js, .next, node_modules/.pnpm), plus .next/static and public/
+app/                    Next standalone output, plus .next/static and public/
 share/licenses/         Studio (Apache-2.0), Node, supavise
-share/supavise/            build-info.json, runtime-config.json (placeholders and the list of files that carry them), the patches
+share/supavise/         build-info.json, runtime-config.json (placeholders and the files that carry them), the patches
 ```
 
-The upstream dotenv file is not shipped; configuration is environment only, as in the slim artifact's `bin/studio`.
+The upstream dotenv file is not shipped; configuration is environment only.
 
 ### Environment at start
 
@@ -43,31 +43,29 @@ The upstream dotenv file is not shipped; configuration is environment only, as i
 | `CSP_EXTRA_PROJECT_HOSTS` | no | Host sources serving project APIs, e.g. `*.api.example.com` (patch 0003); each is allowed over `https` and `wss`. |
 | `SUPAVISE_STUDIO_SKIP_RUNTIME_CONFIG=1` | no | Start without substitution (debugging). |
 
-A missing required value or an unsafe one exits with status 78 and a message naming it. Values may only contain `A-Za-z0-9._~:/@%+,*=-`, so they cannot break out of a JS string, a JSON string or an HTML attribute.
+A missing required value or an unsafe one exits with status 78 and a message naming it. Values may only contain `A-Za-z0-9._~:/@%+,*=-`, so they cannot break out of a JS string, JSON string or HTML attribute.
 
 ### How the substitution works
 
-Next inlines `NEXT_PUBLIC_*` and evaluates the CSP at build time, so `build.sh` builds with unique placeholder strings (`https://supavise-placeholder-api.invalid/platform`, ...). At packaging time `runtime/supavise-runtime-config.mjs prepare` finds every file that contains one (about 280 files, 7 MB: client and server chunks, prerendered HTML, `routes-manifest.json` with the CSP), keeps a pristine copy as `<file>.supavise-tpl` and fails the build if a placeholder did not survive the bundler. At every start the entrypoint rewrites those files from the `.supavise-tpl` copies, in one regex pass, with a temp file and a rename per file. It never reads its own output, so starting again with other values works. The API and GoTrue placeholders carry a marker path so the bare origin used in the CSP is replaced by the bare origin of the real URL (a CSP source with a path only matches that exact path).
+Next inlines `NEXT_PUBLIC_*` and evaluates the CSP at build time, so `build.sh` builds with unique placeholder strings (`https://supavise-placeholder-api.invalid/platform`, ...). `runtime/supavise-runtime-config.mjs prepare` keeps a pristine `<file>.supavise-tpl` copy of every file that contains one (about 280 files) and fails the build if a placeholder did not survive the bundler. At every start the entrypoint rewrites those files from the copies, so starting again with other values works. The API and GoTrue placeholders carry a marker path so the bare origin used in the CSP is replaced by the bare origin of the real URL (a CSP source with a path only matches that exact path).
 
-**Requirement for unit D:** the artifact directory (`app/`) must be writable by the service user at start, for example `ReadWritePaths=` on the artifact directory under `ProtectSystem=strict`. Next also writes `app/apps/studio/.next/cache` at runtime (image cache).
+**Unit requirements.** The artifact directory (`app/`) must be writable by the service user at start (for example `ReadWritePaths=` under `ProtectSystem=strict`), because Next also writes `app/apps/studio/.next/cache` (image cache). The launcher exits 78 (`EX_CONFIG`) on a missing or unsafe value and mirrors the child's exit status, so a SIGTERM stop ends as 143: the unit needs `RestartPreventExitStatus=78` (a bad value would otherwise restart-loop) and `SuccessExitStatus=143`.
 
-**Also for unit D, exit codes:** the launcher exits 78 (`EX_CONFIG`) on a missing or unsafe configuration value and mirrors the child's exit status, so a SIGTERM stop ends as 143. The unit needs `RestartPreventExitStatus=78` (a bad value would otherwise restart-loop) and `SuccessExitStatus=143` (a normal stop is not a failure).
-
-`/_next/static` chunks keep their file names when a value changes, and Next serves them as immutable. After changing `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_GOTRUE_URL` on a running install, users need a hard reload once.
+`/_next/static` chunks keep their file names when a value changes and Next serves them as immutable, so after changing `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_GOTRUE_URL` users need a hard reload once.
 
 ### Studio's own routes the proxy answers
 
-Studio asks its own `/api/incident-banner` route for incident.io banners on every page. Without an incident.io key it answers 500, react-query retries it after 1, 4 and 16 s, and the sign-in form awaits that query, so the redirect after sign-in took 22 s in the spike (docs/research/08 section 9). The artifact is not changed for this: Supavise's proxy answers `GET studio.<domain>/api/incident-banner` itself with `{"incidents":[]}` (`internal/proxy`), so Studio keeps exactly the three patches. Running the artifact without the proxy (`verify.sh`) shows the 500; the spike's browser script answers the route itself for the same reason.
+Studio's `/api/incident-banner` route answers 500 without an incident.io key, which delays sign-in by about 22 s (docs/reference/studio-platform-calls.md, "Findings from running Studio"). The artifact is not changed for this: Supavise's proxy answers `GET studio.<domain>/api/incident-banner` with `{"incidents":[]}` (`internal/proxy`). Running the artifact without the proxy (`verify.sh`) shows the 500; the spike's browser script answers the route itself.
 
-The proxy also rewrites the Content-Security-Policy that Studio sends so that the browser cannot reach `usercentrics.eu`, the consent-banner vendor Studio calls on every page load (`internal/proxy`, `studio.go`).
+The proxy also rewrites Studio's Content-Security-Policy so that the browser cannot reach `usercentrics.eu`, the consent-banner vendor Studio calls on every page load (`internal/proxy/studio.go`).
 
-## Patches, as reviewed
+## Patches
 
-Applied with `git am --3way` onto a fresh sparse checkout of the pinned commit: all three apply cleanly. The new tests (`csp.test.ts`, `enabled-features/index.test.ts`, 7 cases) pass with vitest 5 in a scratch directory (Studio's full vitest setup was not installed).
+Applied with `git am --3way` onto the pinned commit. Each carries its own tests (`csp.test.ts`, `enabled-features/index.test.ts`).
 
-- **0001 hCaptcha only with a site key.** Covers the sign-in path (`SignInForm`, `ForgotPasswordWizard`) and the other pages that mount the widget with the build-time key (`SignInSSOForm`, `SignUpForm`, `ChangeEmailAddress`, `/new`), through a module-level `HCAPTCHA_SITE_KEY` that each page checks before rendering the widget. Seen working: with an empty key the sign-in page renders no widget and sign-in succeeds (spike, with the first two forms patched; the other four use the same guard and were checked by applying the patch, not by running them). Not touched: the four billing dialogs (`CreditCodeRedemption`, `CreditTopUp`, `PaymentMethodSelection`, `AddNewPaymentMethodModal`), which need Stripe and are not reachable without billing. The patch-set number (`PATCHSET`) went from 1 to 2 with this change.
-- **0002 feature flags through `NEXT_PUBLIC_DISABLED_FEATURES`.** Upstream resolves `dashboard_auth:*` through `useIsFeatureEnabled`, which layers `profile.disabled_features` (unavailable before login) and the `ENABLED_FEATURES_*` override (a no-op when `IS_PLATFORM` is true) on the static JSON. The patch merges a build-time list into the static set, so it covers the six `dashboard_auth:*` flags before login. The bundle contains the placeholder (checked in the built chunks) and the launcher substitutes it. Seen working in the spike: the sign-in page shows e-mail sign-in only, no sign-up link, no GitHub or SSO button, no testimonial, no terms text. The SSO button is the one flag a node turns on at run time: while the dashboard has a SAML identity provider (workstream L, `supavise sso add`), `internal/fleet` starts Studio with the default list minus `dashboard_auth:sign_in_with_sso`, and starts it again when the first provider is added or the last one removed (no new patch; the list is read at start, which is why).
-- **0003 extra project hosts in the platform CSP.** `CSP_EXTRA_PROJECT_HOSTS`, hosts validated against a strict pattern. It is read when `next.config.ts` computes the headers, which is build time, hence the placeholder. `verify.sh` checks that the substituted CSP contains the hosts over `https` and `wss`, the bare API origin, and no placeholder.
+- **0001 hCaptcha only with a site key.** Covers every page that mounts the widget with the build-time key (`SignInForm`, `ForgotPasswordWizard`, `SignInSSOForm`, `SignUpForm`, `ChangeEmailAddress`, `/new`) through a module-level `HCAPTCHA_SITE_KEY` that each checks. Not touched: the four billing dialogs, which need Stripe and are not reachable without billing.
+- **0002 feature flags through `NEXT_PUBLIC_DISABLED_FEATURES`.** Upstream resolves `dashboard_auth:*` from `profile.disabled_features` (unavailable before login) and the `ENABLED_FEATURES_*` override (a no-op when `IS_PLATFORM` is true). The patch merges a build-time list into the static set, so it covers the six `dashboard_auth:*` flags before login. The SSO button is the one flag a node turns on at run time: while the dashboard has a SAML identity provider (`supavise sso add`), `internal/fleet` starts Studio without `dashboard_auth:sign_in_with_sso` in the list, and restarts it when the first provider is added or the last removed.
+- **0003 extra project hosts in the platform CSP.** `CSP_EXTRA_PROJECT_HOSTS`, hosts validated against a strict pattern. It is read when `next.config.ts` computes the headers, which is build time, hence the placeholder. `verify.sh` checks the substituted CSP.
 
 ## Build on CI
 
@@ -76,22 +74,20 @@ sudo studio/ci-prepare.sh          # GitHub-hosted runner only
 studio/build.sh linux-amd64        # or linux-arm64, on a machine of that architecture
 ```
 
-`build.sh` downloads its own checksum-pinned Node and pnpm, so it needs nothing preinstalled beyond `git`, `curl`, `tar`, `zstd` and `python3`, plus a C toolchain (`build-essential`: the pnpm install compiles native modules such as `libpg-query`, as upstream's Dockerfile does) for the real build; `STUDIO_PREBUILT` packaging needs only `curl`, `tar`, `zstd` and `node`'s download. `spike.sh` does not: it needs `go` (to build the mock; or set `SPIKE_MOCK_BIN` to a prebuilt binary), `node` with `npm` (for `playwright-core`), and, for the browser, `sudo` without a password or root for `playwright install-deps` (the browser binaries themselves are installed as the invoking user). The `studio` workflow (`.github/workflows/studio.yml`) runs `ci-prepare.sh`, `build.sh` and `spike.sh` on amd64 and arm64 runners and uploads `studio/dist` and `studio/.build-cache/spike/out`.
+`build.sh` downloads its own checksum-pinned Node and pnpm, so it needs only `git`, `curl`, `tar`, `zstd`, `python3` and a C toolchain (`build-essential`: the pnpm install compiles native modules such as `libpg-query`). `spike.sh` needs `go` (or `SPIKE_MOCK_BIN`), `node` with `npm`, and `sudo` without a password or root for `playwright install-deps`.
 
-`build.sh` runs `next build` with one static-generation worker (`STUDIO_BUILD_WORKERS`, set through `CIRCLE_NODE_TOTAL`, which Next uses to size its worker pool) and a 4 GB V8 heap per node process (`STUDIO_BUILD_HEAP_MB`), on any host size. Expect about 9 GB of disk and a peak near 8 GB of RAM for `next build` (Turbopack; measured on the maintainer's Mac, not on a runner); `build.sh` prints the peak from `/usr/bin/time -v` and warns if RAM plus swap is under 11 GB. The artifact is about 75 MB compressed (the repackaged Mac output measured 73 MB). `STUDIO_UNTIL=prune` runs only the fetch, patch, prune and lockfile check (a few minutes, 300 MB).
+`build.sh` runs `next build` with one static-generation worker (`STUDIO_BUILD_WORKERS`) and a 4 GB V8 heap per node process (`STUDIO_BUILD_HEAP_MB`). Expect about 9 GB of disk and a peak near 8 GB of RAM for `next build` (Turbopack, measured on a Mac); `build.sh` warns if RAM plus swap is under 11 GB. The artifact is about 75 MB compressed. `STUDIO_UNTIL=prune` runs only the fetch, patch, prune and lockfile check.
 
-## Test it
+## Tests
 
 ```bash
 node --test studio/runtime/test/                     # substitution (placeholders, runtime config)
 go test ./studio/mock/                               # the mock (needs no Studio)
-STUDIO_PREBUILT=<apps/studio with .next/standalone> studio/build.sh <platform>   # packaging, launcher and verify.sh without the Next build
-studio/spike.sh                                      # whole spike; see the header of the script
 ```
 
-## Not done, not verified
+The `studio` workflow's `build` job runs `ci-prepare.sh`, `build.sh` and then `spike.sh` on amd64 and arm64 runners. To test packaging without the Next build, set `STUDIO_PREBUILT=<apps/studio with .next/standalone>` and run `studio/build.sh <platform>`.
 
-- The Next build has not run on Linux or on a CI runner. Verified up to the lockfile check (fetch, patches, prune) on the real upstream commit. The packaging, launcher, substitution and `verify.sh` ran on darwin-arm64 against a platform-mode Next output of the same commit built earlier on this machine; the Linux node binary, `tar --sort`, `cp --reflink`, `/usr/bin/time` and `ci-prepare.sh` paths were not executed.
-- `spike.sh` ran to a green result on darwin-arm64 only (19 of 19 steps), with `SPIKE_CHROME` pointing at Chrome. The Linux parts (artifact download and checksum, `playwright install-deps` and `install`, apt) are untested.
-- Studio makes a request to `api.usercentrics.eu` on every page load even without a ruleset id (it fails soft). Removing it needs a fourth patch; proposed upstream change: skip Usercentrics initialization when `NEXT_PUBLIC_USERCENTRICS_RULESET_ID` is unset.
-- Pages beyond the spike's list (Realtime, Edge Functions, Logs, Advisors, Integrations, Reports) are not exercised.
+## Limits
+
+- Studio calls `api.usercentrics.eu` on every page load even without a ruleset id (it fails soft). The proxy's CSP rewrite blocks it; removing the cause needs a fourth patch that skips Usercentrics initialization when `NEXT_PUBLIC_USERCENTRICS_RULESET_ID` is unset.
+- The spike does not exercise Realtime, Edge Functions, Logs, Advisors, Integrations or Reports (see the reference for the pages it visits).

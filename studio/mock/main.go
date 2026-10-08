@@ -7,7 +7,7 @@
 //	mock serve -config mock.json        run the server
 //	mock summarize request-log.jsonl    print the calls seen as a markdown table
 //
-// It is a test tool, not the API server (workstream B owns that); it shares no code with it.
+// It is a stand-in Management API for studio/spike.sh, not the API server in internal/api; it shares no code with it.
 package main
 
 import (

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # The Studio spike: stands up a small stack, runs the platform-mode Studio against the mock
 # Management API, and drives it with a headless browser. Written for a fresh Ubuntu 24.04 CI VM
-# (amd64 or arm64). Do not run it on the shared dev Mac without studio/../scripts/guard.sh; the
-# whole stack needs about 1.5 GB of RAM and no Docker.
+# (amd64 or arm64). The whole stack needs about 1.5 GB of RAM and no Docker.
 #
 #   studio/spike.sh [--keep] [--stack-only]
 #

@@ -299,7 +299,7 @@ func queryIDs(t *testing.T, ctx context.Context, c *pgx.Conn) []int {
 
 func idsString(ids []int) string { return fmt.Sprint(ids) }
 
-// TestPointInTimeRestore is the workstream's required test: write, back up, write,
+// TestPointInTimeRestore is the required restore test: write, back up, write,
 // note a time, destroy, then restore to the noted time (as a new project and in
 // place) from a base backup plus WAL fetched through the real supavise binary. The
 // backend is a local directory.

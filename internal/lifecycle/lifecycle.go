@@ -34,7 +34,7 @@ type CreateRequest struct {
 	// Keys reuses an existing credential set (restore keeps the source project's keys
 	// because the restored cluster already contains roles with those passwords).
 	Keys *secrets.ProjectKeys
-	// Branch makes the new project a branch of another one (workstream I): the registry row
+	// Branch makes the new project a branch of another one (branching): the registry row
 	// is written with it, so the branch is a branch from the moment it exists.
 	Branch *registry.BranchInfo
 	// Recreate builds the project over an existing registry row that DeleteWith kept
@@ -81,7 +81,7 @@ type Usage struct {
 	MemoryBytes uint64
 }
 
-// DataPlane is the per-engine half of Manager (docs/development/build-plan.md section 1). The Postgres
+// DataPlane is the per-engine half of Manager (docs/development.md, "Conventions"). The Postgres
 // engine runs one cluster plus GoTrue and PostgREST per project.
 type DataPlane interface {
 	Create(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, seed DataSeeder) error

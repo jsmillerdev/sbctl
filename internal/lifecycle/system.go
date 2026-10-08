@@ -55,7 +55,7 @@ type FleetCredential struct {
 }
 
 // FleetCredentials returns the decrypted logins of the fleet services' roles, which
-// InitSystem creates. Workstream E connects with these instead of supabase_admin.
+// InitSystem creates. The fleet connects with these instead of supabase_admin.
 func (e *Engine) FleetCredentials(ctx context.Context) ([]FleetCredential, error) {
 	out := make([]FleetCredential, 0, len(FleetRoles))
 	for _, fr := range FleetRoles {

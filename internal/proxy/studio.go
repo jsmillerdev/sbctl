@@ -12,7 +12,7 @@ import (
 
 // Studio's own /api/incident-banner route asks incident.io, answers 500 without a key, and
 // react-query retries it after 1, 4 and 16 seconds while the sign-in form awaits the query
-// cache reset: sign-in took 22 seconds (docs/research/08 section 9). The proxy answers the route
+// cache reset: sign-in took 22 seconds (docs/reference/studio-platform-calls.md, "Findings from running Studio"). The proxy answers the route
 // itself, instantly and with no outbound call, with {"incidents":[]}.
 //
 // The answer stays empty even while a maintenance window is announced or an upgrade runs: this

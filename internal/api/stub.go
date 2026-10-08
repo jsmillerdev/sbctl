@@ -187,7 +187,7 @@ func minimalNumber(s *openapi3.Schema, integer bool) any {
 // StubValue is the body a stubbed operation answers: the minimal instance of its success
 // schema, except for the logs and usage analytics endpoints, whose schema is an object with
 // no required field. Studio renders "Failed to load project usage" for a bare {} there and
-// zero counts for {"result": []} (docs/research/08 section 9), so those answer an empty result
+// zero counts for {"result": []} (docs/reference/studio-platform-calls.md, "Findings from running Studio"), so those answer an empty result
 // list, which is also what Logflare's endpoints return for a query with no rows.
 func StubValue(op *Operation) any {
 	if strings.Contains(op.Path, "/analytics/endpoints/") {

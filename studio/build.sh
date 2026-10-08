@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Workstream A: builds upstream Studio in platform mode, applies studio/patches/*.patch, and packages
+# Builds upstream Studio in platform mode, applies studio/patches/*.patch, and packages
 # it like the slim-services studio artifact (app/ bin/ node/ share/), so the systemd unit is unchanged.
 #
 #   studio/build.sh <platform>
@@ -215,7 +215,7 @@ if [[ -z "${STUDIO_PREBUILT:-}" ]]; then
     ' "$HERE/placeholders.json")
   export NEXT_PUBLIC_IS_PLATFORM=true
   # prod: hides internal-only UI and keeps consent-gated telemetry off. Never local or staging,
-  # which auto-grant telemetry consent (docs/research/05 section 4.5).
+  # which auto-grant telemetry consent.
   export NEXT_PUBLIC_ENVIRONMENT=prod
   export STUDIO_FRAMEWORK=next
   # Heap cap for each node process (the next build driver and its prerender workers). Turbopack's

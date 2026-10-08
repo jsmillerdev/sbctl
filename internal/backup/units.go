@@ -25,7 +25,7 @@ const (
 // EnvFile is the optional environment file the backup service reads. `supavise backups`
 // runs outside the daemon and finds the registry through SUPAVISE_REGISTRY_DSN, which
 // the installer or lifecycle writes here. The DSN contains the registry password, so
-// the file must be mode 0600 and owned by the supavise user (HANDOFF section 1); `supavise
+// the file must be mode 0600 and owned by the supavise user (docs/development.md, "Conventions"); `supavise
 // backups` warns when it is readable by group or others.
 const EnvFile = "/etc/supavise/supavise.env"
 

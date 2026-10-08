@@ -45,7 +45,7 @@ var formActionRe = regexp.MustCompile(`<form[^>]*action="([^"]*)"`)
 // administrator approves them, and nobody can sign up any other way.
 //
 //	SUPAVISE_SSO_INTEGRATION=1 SUPAVISE_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked SUPAVISE_SSO_PYTHON=/path/to/python-with-signxml \
-//	  SUPAVISE_API_IT_PORT_BASE=44100 scripts/guard.sh -- go test ./internal/api -run IntegrationDashboardSSO -v
+//	  SUPAVISE_API_IT_PORT_BASE=44100 go test ./internal/api -run IntegrationDashboardSSO -v
 //
 // It starts a PostgreSQL cluster, GoTrue and a Python process, and stops them again.
 func TestIntegrationDashboardSSO(t *testing.T) {

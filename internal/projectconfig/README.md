@@ -25,8 +25,7 @@ Migration `0800_project_settings.sql`: one row per project and service (`auth`, 
 `realtime`, `storage`, `postgres`; `pooler` from migration `0801`) in `supavise.project_settings`, deleted with the project. It holds
 only what was changed: `values` (plain), `sealed` (secrets, base64 of `secrets.Seal`: OAuth client
 secrets, the SMTP password, SMS provider tokens, hook secrets, the captcha secret). A setting with
-no entry has its default, which is what the units render when no row exists, so a project that
-never saved anything runs exactly as before this package. `version` counts saves; a write applies
+no entry has its default, which is what the units render when no row exists. `version` counts saves; a write applies
 only if the version is the one it read (`Store.Put`), and `Manager.Patch` retries a lost race on
 top of the newer row. Each save appends the registry event `settings.<service>.updated` with the
 version and the names of the changed settings, never values.
@@ -36,9 +35,8 @@ version and the names of the changed settings, never values.
 `Schema` lists each service's settings as `Field`s (type, range, enum, pattern, secret flag,
 default, environment variable). Names are the ones of the specs: `UpdateAuthConfigBody` of the v1
 spec (the platform twin uses them in upper case), `V1UpdatePostgrestConfigBody`,
-`UpdateRealtimeConfigBody`, `UpdateStorageConfigBody`, `UpdatePostgresConfigBody`. The api package
-test `TestAuthSchemaCoversTheSpecs` fails when a re-pinned spec lists an auth setting the schema
-does not know.
+`UpdateRealtimeConfigBody`, `UpdateStorageConfigBody`, `UpdatePostgresConfigBody`. A test in
+`internal/api` fails when a re-pinned spec lists an auth setting the schema does not know.
 
 Patch semantics: a key the schema does not know is ignored (the specs grow); `null` returns a
 setting to its default; a secret sent back as the redaction a GET handed out (below) changes
@@ -53,17 +51,16 @@ differs: `refresh_token_rotation_enabled` is `GOTRUE_SECURITY_REFRESH_TOKEN_ROTA
 `mailer_templates_*_content` is `GOTRUE_MAILER_TEMPLATES_*`, the seconds-valued ones are Go
 durations, `sessions_timebox` is hours, `sms_test_otp` uses `:` where the API uses `=`).
 `testdata/gotrue-env-names.txt` lists every variable GoTrue v2.195.0 reads, generated from the
-structs of `internal/conf` the way `envconfig` names them (`testdata/genenv`), and
-`TestAuthEnvNamesExist` pins every name the schema renders to that list. Regenerate it when
-`internal/versions/versions.yaml` bumps auth:
+structs of `internal/conf` the way `envconfig` names them (`testdata/genenv`), and a test pins
+every name the schema renders to that list. Regenerate it when `internal/versions/versions.yaml`
+bumps auth:
 
 ```sh
 go build -o /tmp/genenv internal/projectconfig/testdata/genenv/main.go
 /tmp/genenv configuration.go saml.go rate.go > internal/projectconfig/testdata/gotrue-env-names.txt  # from supabase/auth internal/conf at the pinned tag
 ```
 
-Validation mirrors what GoTrue refuses at start, because a bad value would turn into a crash
-loop: the redirect allow list is compiled with the same glob library and separators GoTrue uses;
+Validation mirrors what GoTrue refuses at start, because a bad value would crash-loop it: the redirect allow list is compiled with the same glob library and separators GoTrue uses;
 hook URIs must be `pg-functions://postgres/<schema>/<function>`, HTTPS, or HTTP on loopback; hook
 secrets must look like `v1,whsec_...`; captcha needs a provider and a secret; WebAuthn and
 passkeys need an RP id, name and origins; `mailer_autoconfirm` and
@@ -78,17 +75,15 @@ set it turns off unless saved explicitly.
 daemon (`internal/api/templates.go`) to loopback clients that did not come through the edge
 proxy. The version in the URL keeps GoTrue's template cache from serving an old body. The token
 is an HMAC of the project and template under a key derived from the node's master key
-(`Manager.TemplateToken`, `secrets.AESGCM.Derive`), so a process of the node that merely reaches
-the loopback port (user code in an Edge Function, another project's service) cannot read a
-project's templates; a request without the token is answered `404`. Secrets that cannot derive a
-key (test doubles) leave the route open.
+(`Manager.TemplateToken`), so a process of the node that merely reaches the loopback port (user
+code in an Edge Function, another project's service) cannot read a project's templates; a request
+without the token is answered `404`.
 
 **Line breaks.** A setting that renders to an environment variable (everything with an `Env`
 except the template bodies) refuses `\r` and `\n`, because a unit's environment file cannot carry
-them. The save is a 400 instead of a resume that fails. `Manager.Patch` also renders the service's
-environment before it saves and refuses any value with a line break or NUL, which covers a secret
-that was stored before the check existed. A multi-line SMS template therefore cannot be saved;
-GoTrue reads `GOTRUE_SMS_TEMPLATE` from the environment only.
+them. The save is a 400 instead of a resume that fails.  `Manager.Patch` also renders the service's
+environment before it saves and refuses any value with a line break or NUL. A multi-line SMS template therefore cannot be saved
+(GoTrue reads `GOTRUE_SMS_TEMPLATE` from the environment only).
 
 **External providers.** Every provider of the Management API that GoTrue supports (`apple` to
 `zoom`, including Azure, GitLab, Keycloak and WorkOS with their `url`, Google and Apple with
@@ -102,8 +97,8 @@ refuses to start with SAML on and no signing key, so `Manager.AuthEnv` adds the 
 `GOTRUE_SAML_PRIVATE_KEY` whenever `saml_enabled` renders as true (`Options.SigningKey`, which the
 lifecycle wires to `sso.EnsureSigningKey`: an RSA 2048 key, created on first use and sealed as the
 project secret `saml_private_key`, never shared between projects). The key is not a setting: a client
-cannot read or set it, and `rotate-keys` does not touch it. With SAML off nothing is rendered and no
-key exists; a project that never saved a SAML setting renders as before. The project's identity
+cannot read or set it, and `rotate-keys` does not touch it.  With SAML off nothing is rendered and no
+key exists. The project's identity
 providers are managed through `/v1/projects/{ref}/config/auth/sso/providers` (`internal/api`, Single
 sign-on), which answers 404 until `saml_enabled` is on, as on hosted.
 
@@ -114,10 +109,9 @@ answers them with defaults.
 ### Secrets in responses
 
 `Redact(secret)` is the hex SHA-256 of the value. Both the public API and Studio's twin answer a
-secret setting with it (null when unset): the same thing hosted's v1 GET gives the CLI, which
-compares it with a hash of its local value (`hash:` in `config.toml`). Plaintext never leaves the
-registry; Studio shows the hash in a secret field and a save that leaves it untouched keeps the
-stored secret.
+secret setting with it (null when unset), as hosted's v1 GET does for the CLI, which compares it
+with a hash of its local value (`hash:` in `config.toml`). Plaintext never leaves the registry; a
+save that leaves the hash untouched keeps the stored secret.
 
 ### PostgREST
 
@@ -140,8 +134,7 @@ them, so only a change sends an update). Realtime: `max_concurrent_users`, `max_
 its controller to `subcriber_pool_size`. Only changed settings are sent; the defaults reported
 are the server's own `TENANT_MAX_*`. The tenant API applies only the fields it receives, so a
 `null` (return to default) stores the default as an explicit value, and the tenant is sent it
-(`Schema.ResetStoresDefault`); without that Realtime would keep the old value while GET said
-default. Storage: `fileSizeLimit` and `features`
+(`Schema.ResetStoresDefault`), so Realtime never keeps the old value while GET says default. Storage: `fileSizeLimit` and `features`
 (`imageTransformation`, `s3Protocol`, `purgeCache`, `icebergCatalog`, `vectorBuckets`) of the
 tenant API; Iceberg and vector buckets are saved and reported (the CLI's default `config.toml`
 pushes them) but not sent, because the fleet does not run the services behind them, and
@@ -154,7 +147,7 @@ the pool size and the client limit of the project's Supavisor tenant: `internal/
 them in `fleet.TenantSpec` (`PoolSize`, `MaxClients`) and `EnsureTenant` sends them as
 `default_pool_size` (also as the pool size of the manager user, which is the one Supavisor takes
 the login pools' size from) and `default_max_clients`. The defaults are what the tenant runs with
-nothing saved: Supavisor's own, so a project that never saved anything runs as before. A save is
+nothing saved: Supavisor's own. A save is
 applied live (the tenant call ends the tenant's pooled connections; clients reconnect), a save
 while the project is paused when it resumes. A pool size of 0, which the specs allow, would leave
 the tenant without a database connection, so it is refused. Two limits come from outside the settings
@@ -181,13 +174,13 @@ effect at the next restart; every other one is applied with `ALTER SYSTEM` and a
 survives restarts in `postgresql.auto.conf`. The counts that size shared memory at start are
 capped far below what Postgres accepts in `ALTER SYSTEM` (`max_locks_per_transaction` 1024,
 `max_worker_processes` and `max_wal_senders` 256, `max_logical_replication_workers` 64, ...),
-because Postgres cannot start with an oversized one ("out of memory" while creating shared
-memory) and would leave the project down. What is left is estimated: the lock table
-(`max_locks_per_transaction` times the backends, about 300 bytes an entry) must stay under 10
-percent of the project's memory limit and the shared memory as a whole (with `shared_buffers`
-and a slot per backend) under 60 percent; with no limit known only a modest table (64 MB, 600
-backends) is accepted; a worker count that was not saved is estimated as 16, what the project renders. If an apply still fails, the API restores the previous settings and the
-lifecycle brings the cluster back (`ApplyOptions.Recover`, see internal/lifecycle). `PUT` with `restart_database: true` restarts the
+because Postgres cannot start with an oversized one and would leave the project down. The rest is
+estimated: the lock table (`max_locks_per_transaction` times the backends, about 300 bytes an entry)
+must stay under 10 percent of the project's memory limit and the shared memory as a whole under 60
+percent; with no limit known only a modest table (64 MB, 600 backends) is accepted; a worker count
+that was not saved is estimated as 16, what the project renders. If an apply still fails, the API
+restores the previous settings and the lifecycle brings the cluster back (`ApplyOptions.Recover`,
+`internal/lifecycle`). `PUT` with `restart_database: true` restarts the
 cluster when something needs it; without it the values are saved, rendered, and flagged
 "pending restart" in the log until the next restart (a pause and resume, for example).
 

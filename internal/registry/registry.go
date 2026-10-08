@@ -67,7 +67,7 @@ type Project struct {
 	Limits    config.Limits
 	CreatedAt time.Time
 	UpdatedAt time.Time
-	// Branch is set when the project is a branch of another project (workstream I).
+	// Branch is set when the project is a branch of another project (branching).
 	Branch *BranchInfo
 }
 

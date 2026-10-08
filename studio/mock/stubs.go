@@ -41,7 +41,8 @@ func stubBody(sh *shape) any {
 }
 
 // stubHandler answers a documented route with the empty value of its documented shape and the
-// documented success status. The research table calls these "defaults" or "yes" rows.
+// documented success status. docs/reference/studio-platform-calls.md lists the routes that need
+// a real answer; every other documented route gets this stub.
 func stubHandler(w *respWriter, r *http.Request, c *reqCtx) {
 	rt, _ := r.Context().Value(routeKey{}).(*route)
 	if rt == nil || rt.shape == nil {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CI only: a branch with data cannot act on the outside world (workstream I, README "Outbound
+# CI only: a branch with data cannot act on the outside world (internal/branching/README.md, "Outbound
 # isolation"), under real systemd units.
 #
 #   sudo SUPAVISE_BIN=/path/to/supavise-linux-amd64 tests/linux/branching-egress.sh

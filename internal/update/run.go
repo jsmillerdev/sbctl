@@ -70,7 +70,7 @@ type Deps struct {
 // a reboot may still start. An upgrade of many projects runs for a long time and is not cut off
 // when the window closes, so one that starts in the last minutes would run its outage past the
 // window the operator chose. The cutoffs are the smaller of a fixed span and a share of the window,
-// so that a short window still has a time to start in. A reboot is short (docs/research/09-footprint.md
+// so that a short window still has a time to start in. A reboot is short (docs/reference/footprint.md
 // measures the cold start), so it may start later than an upgrade.
 const (
 	upgradeCutoff = time.Hour
