@@ -364,3 +364,48 @@ func TestEnsureBaseCallsForOneRefRunOneAtATime(t *testing.T) {
 		t.Fatalf("backups taken = %d, want 1", n)
 	}
 }
+
+func TestClearStandbyConfKeepsTheRestOfTheFile(t *testing.T) {
+	e, _ := seedEnv(t)
+	dd := filepath.Join(t.TempDir(), "data")
+	if err := e.svc.SeedReplica(context.Background(), ReplicaSeedPlan{Ref: testRef, Identifier: testReplicaID, DataDir: dd,
+		PrimaryPort: 20003, ReplicationPassword: "very-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	// Settings the primary has of its own, before and after the standby block.
+	conf := readConf(t, dd)
+	if err := os.WriteFile(filepath.Join(dd, "postgresql.auto.conf"), []byte("work_mem = '8MB'\nhot_standby_feedback = 'on'\n"+conf+"max_connections = '60'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearStandbyConf(dd); err != nil {
+		t.Fatal(err)
+	}
+	got := readConf(t, dd)
+	for _, gone := range []string{"primary_conninfo", "very-secret", "restore_command", "recovery_target_timeline", "hot_standby = ", "supavise standby"} {
+		if strings.Contains(got, gone) {
+			t.Errorf("postgresql.auto.conf still has %q:\n%s", gone, got)
+		}
+	}
+	for _, kept := range []string{"# auto\n", "work_mem = '8MB'", "hot_standby_feedback = 'on'", "max_connections = '60'", "archive_mode = on", "archive_command = "} {
+		if !strings.Contains(got, kept) {
+			t.Errorf("postgresql.auto.conf lost %q:\n%s", kept, got)
+		}
+	}
+	if fi, err := os.Stat(filepath.Join(dd, "postgresql.auto.conf")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("postgresql.auto.conf = %v, %v", fi, err)
+	}
+	if _, err := os.Stat(filepath.Join(dd, "postgresql.auto.conf.tmp")); err == nil {
+		t.Error("a temporary file was left behind")
+	}
+	// Nothing to clear: the file is not rewritten. A directory without the file is fine too.
+	before, _ := os.Stat(filepath.Join(dd, "postgresql.auto.conf"))
+	if err := ClearStandbyConf(dd); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := os.Stat(filepath.Join(dd, "postgresql.auto.conf")); !after.ModTime().Equal(before.ModTime()) {
+		t.Error("a file without a standby block was rewritten")
+	}
+	if err := ClearStandbyConf(t.TempDir()); err != nil {
+		t.Fatalf("directory without postgresql.auto.conf: %v", err)
+	}
+}

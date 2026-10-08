@@ -101,6 +101,58 @@ func (s *Service) standbyConf(plan ReplicaSeedPlan, m *Manifest) string {
 	return b.String()
 }
 
+// StandbyGUCs are the settings the seeder adds that a primary does not keep. After a promotion,
+// ALTER SYSTEM RESET each of them (or ClearStandbyConf before the cluster starts as a primary):
+// primary_conninfo holds the replication password, and the base backups of the promoted cluster
+// copy its data directory. archive_mode and archive_command stay: they are the primary's own.
+var StandbyGUCs = []string{"primary_conninfo", "restore_command", "recovery_target_timeline", "hot_standby"}
+
+// ClearStandbyConf removes the standby block of SeedReplica from the postgresql.auto.conf of the
+// stopped cluster in dataDir: the lines of StandbyGUCs and the header comment. The rest of the
+// file is kept. It does nothing when the file has none of them.
+func ClearStandbyConf(dataDir string) error {
+	p := filepath.Join(dataDir, "postgresql.auto.conf")
+	b, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(b), "\n")
+	kept := lines[:0:0]
+	for _, l := range lines {
+		if !isStandbyLine(l) {
+			kept = append(kept, l)
+		}
+	}
+	if len(kept) == len(lines) {
+		return nil
+	}
+	tmp := p + ".tmp"
+	if err := writeSyncFile(tmp, []byte(strings.Join(kept, "\n")), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return syncDir(dataDir)
+}
+
+func isStandbyLine(line string) bool {
+	t := strings.TrimSpace(line)
+	if strings.HasPrefix(t, "# --- supavise standby ") || strings.HasPrefix(t, "# --- supavise archive-only standby ") {
+		return true
+	}
+	for _, k := range StandbyGUCs {
+		if rest, ok := strings.CutPrefix(t, k); ok && strings.HasPrefix(strings.TrimSpace(rest), "=") {
+			return true
+		}
+	}
+	return false
+}
+
 // connValue quotes s as a libpq connection-string value when it needs it.
 func connValue(s string) string {
 	if s != "" && strings.Trim(s, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") == "" {

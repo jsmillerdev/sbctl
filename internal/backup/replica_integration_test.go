@@ -154,10 +154,11 @@ func TestSeedReplicaStreamsAndTakesOver(t *testing.T) {
 		err := rc.QueryRow(ctx, "select coalesce((select status from pg_stat_wal_receiver), '')").Scan(&status)
 		return status == "streaming", fmt.Errorf("status %q, %v", status, err)
 	})
-	var app, state string
-	if err := f.c.QueryRow(ctx, "select application_name, state from pg_stat_replication").Scan(&app, &state); err != nil || app != testReplicaID || state != "streaming" {
-		t.Fatalf("pg_stat_replication = %q %q, %v; want %s streaming", app, state, err, testReplicaID)
-	}
+	waitFor(t, "the primary to list "+testReplicaID+" as streaming", 60*time.Second, func() (bool, error) {
+		var n int
+		err := f.c.QueryRow(ctx, "select count(*) from pg_stat_replication where application_name = $1 and state = 'streaming'", testReplicaID).Scan(&n)
+		return n == 1, fmt.Errorf("%d streaming walsenders named %s, %v", n, testReplicaID, err)
+	})
 	settings := map[string]string{}
 	rows, err := rc.Query(ctx, "select name, setting from pg_settings where name in ('hot_standby','archive_mode','recovery_target_timeline','restore_command','primary_conninfo')")
 	if err != nil {
