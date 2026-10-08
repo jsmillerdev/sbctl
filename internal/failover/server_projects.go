@@ -118,7 +118,7 @@ func (o *Orchestrator) serverProject(ctx context.Context, j *journal, run *serve
 		}
 	} else {
 		if err := j.step(ctx, pfx+"started", func() (string, error) {
-			if err := o.d.Primaries.Start(ctx, to.ID, ref); err != nil {
+			if err := o.whileTheNodeLearnsWhoLeads(ctx, func() error { return o.d.Primaries.Start(ctx, to.ID, ref) }); err != nil {
 				return "", fmt.Errorf("starting the project on %s: %w", to.Name, err)
 			}
 			return "", nil

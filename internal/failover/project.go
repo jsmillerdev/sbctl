@@ -5,11 +5,13 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -281,7 +283,7 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 		}
 	} else {
 		if err := j.step(ctx, "start-new", func() (string, error) {
-			if err := o.d.Primaries.Start(ctx, run.to.ID, ref); err != nil {
+			if err := o.whileTheNodeLearnsWhoLeads(ctx, func() error { return o.d.Primaries.Start(ctx, run.to.ID, ref) }); err != nil {
 				return "", fmt.Errorf("starting the project on %s: %w", run.to.Name, err)
 			}
 			return "", nil
@@ -353,7 +355,11 @@ func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, i
 		return "already primary on " + node.Name, nil
 	}
 	req := peerapi.InstanceAction{Epoch: a.Epoch, WaitLSN: a.WaitLSN, DrainArchive: a.Drain, TimeoutSeconds: a.Timeout}
-	if _, err := o.d.Instances.Do(ctx, node.ID, identifier, peerapi.ActionPromote, req); err != nil {
+	err := o.whileTheNodeLearnsWhoLeads(ctx, func() error {
+		_, err := o.d.Instances.Do(ctx, node.ID, identifier, peerapi.ActionPromote, req)
+		return err
+	})
+	if err != nil {
 		err = fmt.Errorf("promoting %s on %s: %w", identifier, node.Name, err)
 		if a.WaitLSN != "" {
 			if obs, oerr := o.d.Instances.Observe(ctx, node.ID, identifier); oerr == nil && obs.InRecovery {
@@ -363,6 +369,33 @@ func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, i
 		return "", err
 	}
 	return "primary on " + node.Name, nil
+}
+
+// whileTheNodeLearnsWhoLeads runs a call to another node and repeats it while the node refuses it
+// as coming from a node that does not lead (403). A node learns of a new leader from its replica
+// of the registry, which trails the leader by a moment, so right after a server move the first
+// calls of the new leader can be turned away. Nothing happened on the node when it refuses, so
+// repeating the call is safe. Any other error ends it; a 409, which can be a standby that did not
+// catch up, is not repeated here: the caller decides.
+func (o *Orchestrator) whileTheNodeLearnsWhoLeads(ctx context.Context, call func() error) error {
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			if werr := o.wait(ctx, 5*time.Second); werr != nil {
+				return werr
+			}
+		}
+		if err = call(); err == nil || !notYetLeader(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// notYetLeader reports whether a node answered that the caller is not (yet) its leader.
+func notYetLeader(err error) bool {
+	var re *mesh.RemoteError
+	return errors.As(err, &re) && re.Status == http.StatusForbidden
 }
 
 // undoSwitchover puts a switchover back that stopped before the promotion: the old primary starts

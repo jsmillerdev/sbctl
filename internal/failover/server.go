@@ -19,14 +19,16 @@ import (
 // failover.json until the system cluster is promoted, because the survivor's registry cannot be
 // written before that, and a moves row afterwards. The steps, in order:
 //
-//	switchover   begin, quiesce, caught-up, address, marker, promote-system, leader,
+//	switchover   begin, quiesce, caught-up, marker, address, promote-system, leader,
 //	             projects (p:<ref>:seed|promote|homed|started|tenant|done), demote:<ref>,
 //	             base-backups, dns
-//	failover     begin, fence, address, marker, promote-system, leader, projects, base-backups, dns
+//	failover     begin, fence, marker, address, promote-system, leader, projects, base-backups, dns
 //
 // Nothing is promoted before the old leader cannot write (a clean stop, or a fence that
 // succeeded), and nothing is written to the backup store's marker before the old leader is
-// beyond return, so that a switchover that fails before then can still be undone.
+// beyond return, so that a switchover that fails before then can still be undone. The marker is
+// also what decides between two survivors that act at once: the store accepts one of them, and
+// the other stops before it has touched the service address.
 
 // serverPlanRecord is what the first step of a server move writes down: the standby of the
 // system cluster and what happens to each project, so that a resume works after the replica rows
@@ -156,6 +158,10 @@ func (o *Orchestrator) serverSteps(ctx context.Context, j *journal, run *serverR
 		return err
 	}
 
+	if err := j.step(ctx, "marker", func() (string, error) { return o.writeMarker(ctx, run) }); err != nil {
+		return err
+	}
+
 	if err := j.step(ctx, "address", func() (string, error) {
 		err := o.d.Provider.TakeOver(ctx, req)
 		switch {
@@ -166,10 +172,6 @@ func (o *Orchestrator) serverSteps(ctx context.Context, j *journal, run *serverR
 		}
 		return "", fmt.Errorf("taking the service address over: %w", err)
 	}); err != nil {
-		return err
-	}
-
-	if err := j.step(ctx, "marker", func() (string, error) { return o.writeMarker(ctx, run) }); err != nil {
 		return err
 	}
 
@@ -331,12 +333,17 @@ func (o *Orchestrator) writeMarker(ctx context.Context, run *serverRun) (string,
 	if o.d.Marker == nil {
 		return "no backup store marker", nil
 	}
+	lost := &abortError{cause: fmt.Errorf("%w: the backup store's leader marker holds a higher epoch than %d, or this epoch under another leader: another node was promoted, and this node must not be (do not start %s again either)", ErrEpochLost, run.epoch, run.from.Name)}
+	// A store that cannot refuse the same epoch under another leader is asked first.
+	if m, rerr := o.d.Marker.ReadLeaderMarker(ctx); rerr == nil && m != nil && (m.Epoch > run.epoch || m.Epoch == run.epoch && m.Leader != run.to.ID) {
+		return "", lost
+	}
 	err := o.d.Marker.WriteLeaderMarker(ctx, backup.LeaderMarker{Epoch: run.epoch, Leader: run.to.ID, At: o.d.Now().UTC()})
 	switch {
 	case err == nil:
 		return fmt.Sprintf("epoch %d, leader %s", run.epoch, run.to.ID), nil
 	case errors.Is(err, backup.ErrMarkerNewer):
-		return "", &abortError{cause: fmt.Errorf("%w: the backup store's leader marker holds a higher epoch than %d: another node was promoted, and this node must not be (do not start %s again either)", ErrEpochLost, run.epoch, run.from.Name)}
+		return "", lost
 	case run.flags.Force:
 		return "warning: the leader marker was not written: " + err.Error(), nil
 	}

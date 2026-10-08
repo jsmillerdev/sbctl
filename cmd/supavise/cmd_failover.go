@@ -43,7 +43,8 @@ nothing is lost: the old leader stops cleanly, the survivor takes over, and the 
 the old leader dead it is a failover: the survivor fences the old leader first, takes the service address,
 promotes the system cluster and then every project's replica, and loses at most the replication lag.
 
-Run it on the node that should lead. --dry-run prints each precondition. State is kept so that --resume
+Run it on the node that should lead; a switchover can also be started on the leader with --to,
+which has that node run it. --dry-run prints each precondition. State is kept so that --resume
 continues a run that stopped. A project with no replica is refused unless --restore-missing, which builds
 its standby from the WAL archive (data loss up to archive_timeout).`,
 		Args: cobra.NoArgs,

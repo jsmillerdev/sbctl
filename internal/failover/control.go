@@ -124,8 +124,9 @@ type ControlServer struct {
 	Log *slog.Logger
 }
 
-// Handler is the HTTP handler of the control socket. Runs use ctx, not the request's context:
-// a CLI that goes away does not stop a move.
+// Handler is the HTTP handler of the control socket. A run takes ctx, the daemon's, and not the
+// request's: a CLI that goes away does not stop a move, and a daemon that stops interrupts it
+// between steps, which leaves it failed and resumable.
 func (s *ControlServer) Handler(ctx context.Context) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/readiness", func(w http.ResponseWriter, r *http.Request) {
@@ -221,7 +222,7 @@ func (s *ControlServer) run(base context.Context, w http.ResponseWriter, r *http
 	}
 	done := make(chan result, 1)
 	gone := r.Context().Done()
-	ctx := WithProgress(context.WithoutCancel(base), func(st registry.MoveStep) {
+	ctx := WithProgress(base, func(st registry.MoveStep) {
 		select {
 		case steps <- st:
 		case <-gone: // nobody is reading: the step is in the log

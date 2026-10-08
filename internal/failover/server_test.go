@@ -9,6 +9,7 @@ import (
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -88,8 +89,8 @@ func TestServerSwitchover(t *testing.T) {
 	lsys := w.lsn[config.SystemRef]
 	w.assertOrder(
 		"quiesce n1 to=n2 epoch=2",
-		"provider.takeover n2",
 		"marker epoch=2 leader=n2",
+		"provider.takeover n2",
 		"promote n2/"+idSysN2+" epoch=2 wait="+lsys,
 		"become-leader epoch=2",
 		"registry.CreateMove",
@@ -168,8 +169,8 @@ func TestServerFailover(t *testing.T) {
 	w.assertOrder(
 		"fence n1 unreachable",
 		"provider.fence n1 planned=false epoch=2",
-		"provider.takeover n2",
 		"marker epoch=2 leader=n2",
+		"provider.takeover n2",
 		"promote n2/"+idSysN2+" epoch=2 wait= drain=true",
 		"registry.CreateMove",
 		"registry.SetLeader n2 2",
@@ -269,7 +270,7 @@ func TestEpochRaceStopsBeforeThePromotion(t *testing.T) {
 	w := serverWorld(t)
 	w.down["n1"] = true
 	// Between the preflight and the marker another node is promoted and writes its marker.
-	w.afterEvent("provider.takeover", func() {
+	w.afterEvent("provider.fence", func() {
 		w.mu.Lock()
 		w.marker = &backup.LeaderMarker{Epoch: 9, Leader: "n3"}
 		w.mu.Unlock()
@@ -284,6 +285,8 @@ func TestEpochRaceStopsBeforeThePromotion(t *testing.T) {
 	}
 	w.assertNever("promote")
 	w.assertNever("registry.")
+	// The loser has not touched the service address, which the winner moves.
+	w.assertNever("provider.takeover")
 	if stateFileExists(w) {
 		t.Fatal("an aborted move leaves nothing to resume")
 	}
@@ -291,6 +294,24 @@ func TestEpochRaceStopsBeforeThePromotion(t *testing.T) {
 	if w.marker.Epoch != 9 {
 		t.Fatalf("marker: %+v", w.marker)
 	}
+}
+
+// Two survivors that act at once ask for the same epoch: the store takes one, and the other stops
+// before it moves the address, whether the store refuses the write or only shows the other's marker.
+func TestTwoSurvivorsOnTheSameEpochOnlyOneGoesOn(t *testing.T) {
+	w := serverWorld(t)
+	w.down["n1"] = true
+	w.afterEvent("provider.fence", func() {
+		w.mu.Lock()
+		w.marker = &backup.LeaderMarker{Epoch: 2, Leader: "n3"} // the other survivor got there first, at the same epoch
+		w.mu.Unlock()
+	})
+	mv, err := w.orch().FailoverServer(w.ctx, ServerOptions{})
+	if !errors.Is(err, ErrEpochLost) || mv.State != registry.MoveAborted {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	w.assertNever("provider.takeover")
+	w.assertNever("promote")
 }
 
 func TestAMarkerAlreadyAtTheEpochRefusesThePlan(t *testing.T) {
@@ -749,5 +770,39 @@ func TestAProjectMoveWaitsForAnUnfinishedServerMove(t *testing.T) {
 	must(t, err)
 	if c := findCheck(t, pl, "server move"); c.OK || !c.Hard {
 		t.Fatalf("check: %+v", c)
+	}
+}
+
+// Right after a server move the other nodes may not know yet that the survivor leads: their first
+// refusals are repeated.
+func TestACallTurnedAwayWhileTheNodeLearnsWhoLeadsIsRepeated(t *testing.T) {
+	w := serverWorld(t)
+	w.addNode3()
+	must(t, w.reg.DeleteReplica(w.ctx, idAN2))
+	delete(w.inst, idAN2)
+	idAN3 := refA + "-rr-eu-west-1-a3a3a3"
+	must(t, w.reg.CreateReplica(w.ctx, &registry.Replica{Identifier: idAN3, Ref: refA, NodeID: "n3", Status: statusHealthy, InitStep: registry.ReplicaStepDone}))
+	w.inst[idAN3] = &instState{node: "n3", ref: refA, role: "replica", lag: f64(1), postgres: true}
+	w.replay[idAN3] = w.lsn[refA]
+	w.fail("promote n3/"+idAN3, &mesh.RemoteError{Node: "n3", Status: 403, Message: "only the leader may ask for this"}, 2)
+	w.fail("start n3/"+refA, &mesh.RemoteError{Node: "n3", Status: 403, Message: "only the leader may ask for this"}, 1)
+	mv, err := w.orch().FailoverServer(w.ctx, ServerOptions{})
+	if err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if got := w.count("promote n3/" + idAN3); got != 3 {
+		t.Fatalf("%d promote calls, want 3", got)
+	}
+	if got := w.count("start n3/" + refA); got != 2 {
+		t.Fatalf("%d start calls, want 2", got)
+	}
+	// Another kind of error is not repeated, and neither is a 409.
+	for _, err := range []error{errors.New("pg_promote failed"), &mesh.RemoteError{Node: "n2", Status: 409, Message: "the standby did not catch up"}} {
+		w2 := serverWorld(t)
+		w2.fail("promote n2/"+idBN2, err, -1)
+		_, _ = w2.orch().FailoverServer(w2.ctx, ServerOptions{})
+		if got := w2.count("promote n2/" + idBN2); got != 1 {
+			t.Fatalf("%d promote calls for %v", got, err)
+		}
 	}
 }

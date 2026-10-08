@@ -44,8 +44,8 @@ Run on the node that takes over (`--to` defaults to it). From the leader, `--to 
 | `quiesce` (switchover) | the leader enters maintenance, stops the project clusters (8 at a time), the system GoTrue and the shared services, and last the system cluster, and reports each final LSN as `stopped:<ref>`. A failure undoes it: the leader starts again |
 | `caught-up` (switchover) | the standby of the system cluster replays to the leader's last position. A failure undoes it too |
 | `fence` (failover) | the cooperative fence of the old leader, then the provider's fence; a failed fence means no promotion |
+| `marker` | `_node/leader.json` records the new leader and epoch. A store that already holds a higher epoch, or this epoch under another leader, ends the move `aborted`: another node was promoted. It is also what decides between two survivors that act at once; the loser stops before it touches the address |
 | `address` | the service address moves to the survivor, before the promotion |
-| `marker` | `_node/leader.json` records the new leader and epoch. A store that already holds a higher epoch ends the move `aborted`: another node was promoted |
 | `promote-system` | the system standby promotes |
 | `leader` | the daemon becomes the leader (`Takeover`), the log moves into a `moves` row and `failover.json` is removed, `SetLeader`, the old leader is marked `fenced` after a failover, the system project is homed here, maintenance ends |
 | `system-homed`, `p:<ref>:seed|promote|homed|started|tenant|done` | the projects, four at a time, in sequence order. A project with no replica on the new leader goes to the node holding its healthiest replica; with `--restore-missing` a project with no replica gets a standby seeded from the archive and drained (data loss up to `archive_timeout`) |
@@ -64,6 +64,7 @@ The planned stop never touches the daemon. The WAL relay in it stays up until th
 |---|---|---|
 | the replica is a healthy standby, its lag is known and below `max_lag_seconds` | yes | no |
 | same release on both nodes | yes | no |
+| capacity of the target: the replica already counts against it (advice, from the project check) | no | no |
 | the epoch marker store is reachable | yes | no |
 | projects without a replica (unless `--restore-missing`) | yes | no |
 | `[fleet] storage_backend = "s3"` | yes | yes |
@@ -104,7 +105,7 @@ A planned switchover has nothing to fence: the clean stop takes its place. The a
 | lag | the plan passes with no `--force`: the lag of every replica needed is known and within `max_lag_seconds` | same |
 | one move | none is running | same |
 
-A leader that merely misses pings, while its address answers or EC2 says it runs, is not stopped. Projects without a replica are restored from the archive by the automatic server mode, because refusing the whole server over one project would leave it down. A project whose home does not answer is left to the server mode. There is no automatic failback.
+With three or more nodes every follower may decide at once; the marker lets one go on, and the others stop before they touch the address. A leader that merely misses pings, while its address answers or EC2 says it runs, is not stopped. Projects without a replica are restored from the archive by the automatic server mode, because refusing the whole server over one project would leave it down. A project whose home does not answer is left to the server mode. There is no automatic failback.
 
 ## The old primary's return
 
@@ -153,7 +154,7 @@ The CLI reaches the orchestrator through a unix socket of the daemon, `<state_di
 
 ## Tests
 
-`go test ./internal/failover/...` runs the orchestrator against a fake cluster (`world_test.go`) over the in-memory registry behind a gate that refuses writes while the node is a standby. Covered: every branch of both moves (a failed fence means no promotion, an epoch race, a promotion that fails halfway, partial project failures, restore of missing replicas, a third node, paused projects), a resume after a failure at each step with a fresh orchestrator, the order of the events, the preconditions and `--dry-run`, the automatic gates, the boot check, the peer endpoints, the control socket and the delegation. `aws/` runs the provider against awsapi's fake for the order stop, wait stopped, associate and promote, and for a partitioned peer that is never stopped.
+`go test ./internal/failover/...` runs the orchestrator against a fake cluster (`world_test.go`) over the in-memory registry behind a gate that refuses writes while the node is a standby. Covered: every branch of both moves (a failed fence means no promotion, an epoch race, a promotion that fails halfway, partial project failures, restore of missing replicas, a third node, paused projects), a resume after a failure at each step with a fresh orchestrator, the order of the events, the preconditions and `--dry-run`, the automatic gates, the boot check, the peer endpoints, the control socket and the delegation. `aws/` runs the provider against awsapi's fake for the order stop, wait stopped, associate and promote, and for a partitioned peer that is never stopped. `pg_test.go` runs the main flows again over a Postgres registry when `SUPAVISE_TEST_DATABASE_URL` is set, as in CI.
 
 ## Limits
 

@@ -5,8 +5,9 @@
 // other files.
 //
 // The order that keeps one writer: fence the old primary (a failed fence means no promotion),
-// take the service address, write the epoch marker to the backup store, promote, then register
-// the move in the registry. Every step is recorded in a registry.Move so that a crash resumes.
+// write the epoch marker to the backup store (the store lets one survivor through), take the
+// service address, promote, then register the move in the registry. Every step is recorded in a
+// registry.Move, or in failover.json until the system cluster is promoted, so that a crash resumes.
 package failover
 
 import (

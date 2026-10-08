@@ -197,6 +197,7 @@ func (o *Orchestrator) planProject(ctx context.Context, opts ProjectOptions) (*P
 		pl.Checks = append(pl.Checks, fail("replica", rep.Detail))
 	}
 	pl.Checks = append(pl.Checks, versionCheck(from, to))
+	pl.Checks = append(pl.Checks, advice("capacity", fmt.Sprintf("%s already holds the replica, which counts against its capacity", to.Name)))
 
 	// A project whose primary answers is switched over (the old primary stops cleanly and nothing
 	// is lost); one that does not is failed over and its old primary is fenced first.
