@@ -9,7 +9,18 @@
 #
 # Idempotent: re-running keeps the master key, the registry and every project, and a flag
 # you leave out keeps its value in /etc/supavise/config.toml. Flags this script does not know
-# are passed to `supavise install` (run `supavise install --help` for them).
+# are passed to `supavise install` (run `supavise install --help` for them). A re-run is also the
+# fallback for `sudo supavise upgrade`: the installer runs `supavise system converge`, which brings
+# the units, directories, mounts and firewall rule to what the release expects.
+#
+# To join an existing cluster instead of creating a system project, give the token file that
+# `supavise node token` printed on the leader (mode 0600):
+#
+#   curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- \
+#       --join-token-file /root/join-token
+#
+# On an EC2 instance made by the CloudFormation template, --aws-first-boot prepares the data volume
+# first (XFS only on a blank volume, project quotas, /etc/supavise on the volume).
 #
 # Own flags:
 #   --binary PATH    install this supavise binary instead of downloading one (no verification:
@@ -45,8 +56,9 @@ Own flags:
   --verify-only      download and verify the release, print what it holds, install nothing
   -h, --help
 
-Everything else goes to `supavise install` (--domain, --dns, --email, --s3-bucket, ...);
-run `supavise install --help` after installing for the list. Re-running keeps secrets.
+Everything else goes to `supavise install` (--domain, --dns, --email, --s3-bucket,
+--join-token-file, --aws-first-boot, ...); run `supavise install --help` after installing for
+the list. Re-running keeps secrets.
 USAGE
 }
 
@@ -75,6 +87,22 @@ main() {
 
   [[ $(id -u) -eq 0 ]] || die "run as root: curl -fsSL <url>/install.sh | sudo bash -s -- <flags>"
   [[ $(uname -s) == Linux ]] || die "this installs a Linux server; $(uname -s) is not supported"
+
+  # A join token that cannot be used fails here, before anything is downloaded or changed. The
+  # installer reads the token again; it never goes on a command line.
+  first_boot=0 join_file=""
+  for ((i = 0; i < ${#PASS[@]}; i++)); do
+    case ${PASS[i]} in
+      --aws-first-boot) first_boot=1 ;;
+      --join-token-file) join_file=${PASS[i+1]:-}; [[ -n $join_file ]] || die "--join-token-file needs a path" ;;
+      --join-token-file=*) join_file=${PASS[i]#*=} ;;
+    esac
+  done
+  if [[ -n $join_file ]]; then
+    [[ -f $join_file ]] || die "--join-token-file $join_file: no such file"
+    [[ -s $join_file ]] || die "--join-token-file $join_file is empty"
+    [[ $(stat -c %a "$join_file") =~ ^[0-7]00$ ]] || die "--join-token-file $join_file must be readable by its owner only (chmod 600 $join_file)"
+  fi
 
   # ---- host checks ------------------------------------------------------------------
   case $(uname -m) in
@@ -114,6 +142,8 @@ main() {
     command -v sha256sum >/dev/null || need+=(coreutils)
   fi
   command -v runuser >/dev/null || need+=(util-linux)
+  # --aws-first-boot makes the data volume's file system and grows it later.
+  if [[ $first_boot -eq 1 ]]; then command -v mkfs.xfs >/dev/null || need+=(xfsprogs); fi
   if ((${#need[@]})); then
     log "installing ${need[*]}"
     export DEBIAN_FRONTEND=noninteractive
