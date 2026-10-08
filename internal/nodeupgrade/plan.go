@@ -346,6 +346,9 @@ func (p *Plan) describe() {
 		}
 		p.Notes = append(p.Notes, fmt.Sprintf("the host layer (`supavise system converge`, revision %d -> %d) runs %s; it restarts no project, and a failure of it fails the upgrade and rolls it back", p.HostFrom, p.HostTo, when))
 	}
+	if p.HostPending && !p.BinaryChange && len(p.Shared) == 0 && len(p.System) == 0 && len(p.Upgrade) == 0 && len(p.Pending) == 0 {
+		p.Notes = append(p.Notes, "only the host layer changes, and it touches no data: `sudo supavise system converge` does it alone, without the base backups that this upgrade takes first")
+	}
 	if p.StackPending() {
 		p.Notes = append(p.Notes, "the AWS stack is changed only by `sudo -E supavise upgrade --aws`, with your own AWS credentials: this node's instance role has no right to change it. Everything else in this plan can go ahead without it, and the new features that need the stack stay off until it is updated")
 	}
