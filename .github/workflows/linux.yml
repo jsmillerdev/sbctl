@@ -546,3 +546,26 @@ jobs:
           name: converge-e2e-${{ matrix.arch }}
           path: /tmp/supavise-converge-logs
           if-no-files-found: ignore
+
+  # First boot of an EC2 instance (`supavise install --aws-first-boot`) on loop devices with the real
+  # blkid, lsblk, findmnt, mkfs.xfs, mount and xfs_quota: a blank device found through udev-style
+  # links and made XFS with enforced project quotas, the bind mount of /etc/supavise, fstab and the
+  # mount drop-ins, a repeat run that changes nothing, and a device with ext4 that is left alone.
+  firstboot-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build the test binary
+        run: go test -c -o /tmp/hostsetup.test ./internal/hostsetup
+      - name: first boot on loop devices
+        run: sudo SUPAVISE_HOSTSETUP_TEST=/tmp/hostsetup.test tests/linux/firstboot-e2e.sh

@@ -32,8 +32,11 @@
 #     That fails the upgrade: exit status 3, the node back on v0.2.0, the marker as it was, no project
 #     restarted. The same upgrade without the broken ufw succeeds (exit 0) and converges the host
 #     with no project restarted (invariant I4).
-#  7. install.sh refuses a --join-token-file that cannot be used before it downloads or changes
-#     anything, `supavise install --aws-first-boot` formats nothing off EC2, and the flag is listed.
+#  7. install.sh refuses a --join-token-file that cannot be used (a missing, empty or open file, an
+#     empty value) before it downloads or changes anything, `supavise install` refuses an empty
+#     --join-token-file and a --data-device without --aws-first-boot, `supavise install
+#     --aws-first-boot` formats nothing off EC2, and the flags are listed. (tests/linux/
+#     firstboot-e2e.sh runs first boot on loop devices.)
 #  8. The mounts: with /var/lib/supavise and /etc/supavise mount points (bind mounts of themselves),
 #     converge writes the RequiresMountsFor drop-ins for every supavise service unit, systemd reads
 #     them, and a second run changes nothing.
@@ -360,7 +363,13 @@ out=$(deploy/install.sh --binary /opt/supavise-e2e/prev --join-token-file "$WORK
 echo svj1.example >"$WORK/open-token"; chmod 644 "$WORK/open-token"
 out=$(deploy/install.sh --binary /opt/supavise-e2e/prev --join-token-file "$WORK/open-token" 2>&1) && fail "install.sh accepted a token file that others can read"
 [[ $out == *"chmod 600"* ]] || fail "open token file: $out"
+out=$(deploy/install.sh --binary /opt/supavise-e2e/prev --join-token-file= 2>&1) && fail "install.sh accepted an empty --join-token-file="
+[[ $out == *"needs a path"* ]] || fail "empty --join-token-file=: $out"
 [[ $(sha256sum "$SV" | cut -d' ' -f1) == "$BIN_SUM" ]] || fail "install.sh replaced the binary although it refused the token file"
+out=$($SV install --join-token-file "" 2>&1) && fail "install accepted an empty --join-token-file"
+[[ $out == *"needs a path"* ]] || fail "install --join-token-file \"\": $out"
+out=$($SV install --data-device /dev/nvme1n1 2>&1) && fail "install accepted --data-device without --aws-first-boot"
+[[ $out == *"belongs to --aws-first-boot"* ]] || fail "install --data-device without --aws-first-boot: $out"
 install_help=$($SV install --help)
 for flag in aws-first-boot data-device join-token-file; do
   [[ $install_help == *"--$flag"* ]] || fail "install --help does not list --$flag"
