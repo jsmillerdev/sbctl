@@ -37,9 +37,10 @@ func init() {
 --version), verifies the ed25519 signature of its SHA256SUMS against the public key built
 into this binary (the current one, or the next one while a key rotation is under way), checks
 the signed release manifest and the binary against their checksums, replaces /usr/local/bin/supavise
-atomically (the previous binary stays beside it as supavise.prev), refreshes the systemd units
-with the new binary and restarts supavise.service. Project units are not restarted: they
-belong to systemd and keep running. If the restarted daemon does not answer on its admin
+atomically (the previous binary stays beside it as supavise.prev), brings the host to what the
+new binary expects (` + "`supavise system converge`" + `: its systemd units and the rest of its host layer)
+and restarts supavise.service. Project units are not restarted: they belong to systemd and keep
+running. If the restarted daemon does not answer on its admin
 listener within --wait (default 5 minutes; the installer's readiness check, because systemd
 calls a daemon active the moment it forks), the previous binary is put back, the units are
 rendered again with it and the service is restarted.
@@ -109,11 +110,14 @@ not through this command. A release states the oldest version it upgrades from
 				return nil
 			}
 			if !noUnits {
-				// The new binary carries the new units; an unchanged set is a no-op.
-				c := exec.CommandContext(cmd.Context(), exe, "system", "install-units")
+				// The new binary carries the units and the host layer of its release; a node that is
+				// already converged changes nothing. A failure is a warning here: the daemon raises
+				// host_not_converged while the host is behind, and `sudo supavise system converge`
+				// repeats the step. (`supavise upgrade` treats it as a failure and rolls back.)
+				c := exec.CommandContext(cmd.Context(), exe, "system", "converge")
 				c.Stdout, c.Stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
 				if err := c.Run(); err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: supavise system install-units failed: %v\n", err)
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: supavise system converge failed: %v\n", err)
 				}
 			}
 			if noRestart || !serviceInstalled(cmd.Context()) {

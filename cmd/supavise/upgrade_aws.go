@@ -127,7 +127,16 @@ func (h *nodeHost) stackName(ctx context.Context, given string) (string, error) 
 		name = h.cfg.AWS.StackName
 	}
 	if name == "" {
-		if c, err := awsapi.New(awsapi.Config{}); err == nil {
+		// Reading what the instance is does not use its role. An operator who set
+		// AWS_EC2_METADATA_DISABLED so that no tool takes the role's credentials (the update script
+		// sets it too) still gets the instance's tags read here, before the script runs.
+		c, err := awsapi.New(awsapi.Config{Getenv: func(k string) string {
+			if k == "AWS_EC2_METADATA_DISABLED" {
+				return ""
+			}
+			return os.Getenv(k)
+		}})
+		if err == nil {
 			if tags, err := c.IMDS.Tags(ctx); err == nil {
 				name = tags["supavise:stack-name"]
 			}

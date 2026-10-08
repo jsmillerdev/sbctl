@@ -157,3 +157,53 @@ func TestJoinOptionsAreFlags(t *testing.T) {
 		}
 	}
 }
+
+// The installer reads config.toml and nothing else: the cluster keys of config.d and the stack
+// name are the daemon's view of the node, and are never written back into config.toml.
+func TestInstallerNeverCopiesConfigDIntoConfigToml(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("public_ip = '203.0.113.9'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cd := filepath.Join(dir, config.ConfigDName)
+	if err := os.MkdirAll(cd, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	cluster := "domain = 'cluster.example.com'\n[replicas]\nconcurrency = 3\n[failover]\ncooldown_minutes = 30\n[fleet]\nstorage_s3_bucket = 'objects'\n"
+	if err := os.WriteFile(filepath.Join(cd, config.ClusterConfigFile), []byte(cluster), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cd, config.AWSConfigFile), []byte("[aws]\nstack_name = 'supavise-b'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The daemon's view has them...
+	merged, err := config.Load(cfgPath)
+	if err != nil || merged.Domain != "cluster.example.com" || merged.AWS.StackName != "supavise-b" || merged.Replicas.Concurrency != 3 {
+		t.Fatalf("config.Load = %+v, %v", merged, err)
+	}
+	// ...the installer's does not, and what it writes back does not either.
+	cfg, existed, err := readConfigFile(cfgPath)
+	if err != nil || !existed {
+		t.Fatal(err)
+	}
+	if cfg.Domain != "" || cfg.AWS.StackName != "" || cfg.Replicas.Concurrency != 2 {
+		t.Fatalf("the installer read config.d: domain %q, stack %q, replicas %d", cfg.Domain, cfg.AWS.StackName, cfg.Replicas.Concurrency)
+	}
+	if err := applyInstall(cfg, installOptions{Fresh: false, JoinTokenFile: "x"}, func(string) bool { return false }); err != nil {
+		t.Fatal(err)
+	}
+	body, err := renderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{"cluster.example.com", "supavise-b", "objects", "replicas", "failover", "stack_name"} {
+		if strings.Contains(string(body), leaked) {
+			t.Errorf("config.toml would gain %q:\n%s", leaked, body)
+		}
+	}
+	if !strings.Contains(string(body), "203.0.113.9") {
+		t.Errorf("config.toml lost its own setting:\n%s", body)
+	}
+}
