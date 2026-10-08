@@ -1,10 +1,10 @@
 # Multi-tenant self-hosted Supabase: final design
 
-Status: v1.0.
+Status: v1.0, with the cluster work of [section 12](#12-clusters-replicas-and-failover).
 
 ## 1. In one paragraph
 
-One static Go binary, `supavise`, turns a Linux machine into a multi-project Supabase for a team. It runs Supabase's own native service artifacts as systemd units: three per project (Postgres, GoTrue, PostgREST) and a handful shared (Supavisor, Realtime, Storage, postgres-meta, Studio). The binary itself is the edge proxy with automatic TLS, the Management API that Studio, the Supabase CLI and the Supabase MCP server talk to, the project lifecycle engine, and the WAL archiver. No Docker, no Envoy, no third-party gateway, no fork of any Supabase service. A team installs it with one command or one CloudFormation click and gets a dashboard that behaves like supabase.com, for up to about a hundred projects.
+One static Go binary, `supavise`, turns a Linux machine into a multi-project Supabase for a team. It runs Supabase's own native service artifacts as systemd units: three per project (Postgres, GoTrue, PostgREST) and a handful shared (Supavisor, Realtime, Storage, postgres-meta, Studio). The binary itself is the edge proxy with automatic TLS, the Management API that Studio, the Supabase CLI and the Supabase MCP server talk to, the project lifecycle engine, and the WAL archiver. No Docker, no Envoy, no third-party gateway, no fork of any Supabase service. A team installs it with one command or one CloudFormation click and gets a dashboard that behaves like supabase.com, for up to about a hundred projects. A second server can join the first for per-project read replicas, a planned switchover and failover (section 12).
 
 ## 2. Why this shape is the native one
 
@@ -41,7 +41,7 @@ The code is split by job: `api`, `proxy`, `units`, `lifecycle`, `backup`, `artif
 
 **TLS.** A wildcard certificate by DNS-01 through CertMagic (Route 53 via the instance role on AWS; Cloudflare, Hetzner or DigitalOcean tokens elsewhere). Without a DNS API, per-project HTTP-01 certificates on first request. Without a domain, `<ref>.api.<ip>.sslip.io`. Wildcard DNS is required; there is no path-based mode.
 
-**Backups.** Postgres's own `archive_command` calls `supavise wal push`, which writes to S3 or a local directory. On a systemd node the command talks to the daemon over a per-project unix socket and the daemon does the storage I/O, so no cluster holds backend credentials or can reach another project's archive (`internal/backup/README.md`, "The WAL relay"). A nightly `pg_basebackup` per project gives point-in-time recovery with no wal-g or pgBackRest. Restore builds a new project from a base backup plus WAL; branches without a copy-on-write clone use the same path (section 9a).
+**Backups.** Postgres's own `archive_command` calls `supavise wal push`, which writes to S3 or a local directory. On a systemd node the command talks to the daemon over a per-project unix socket and the daemon does the storage I/O, so no cluster holds backend credentials or can reach another project's archive (`internal/backup/README.md`, "The WAL relay"). A nightly `pg_basebackup` per project gives point-in-time recovery with no wal-g or pgBackRest. Restore builds a new project from a base backup plus WAL; branches without a copy-on-write clone use the same path (section 9a). The same base backups seed a read replica's standby, the relay refuses a push from a standby until the node is promoted, and the backup store holds the leader marker of a cluster (section 12).
 
 **State.** Registry, secrets (encrypted with a key in `/etc/supavise`), refs, ports and versions live in the system Postgres. Project data lives in `/var/lib/supavise/projects/<ref>`.
 
@@ -77,7 +77,7 @@ Management API subset: `/v1` projects, api-keys, `database/query`, migrations, `
 curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- --domain example.com --dns cloudflare
 ```
 
-The installer verifies checksums, creates the `supavise` user, writes `/etc/supavise/config.toml`, installs the units, starts `supavise`, and prints the dashboard URL and claim token. Re-running keeps secrets. `supavise self-update` upgrades the binary. Artifacts upgrade through `internal/versions/versions.yaml`; a project follows the node's pins when its Owner or Administrator upgrades it (Studio, the Management API or `supavise projects upgrade`).
+The installer verifies checksums, creates the `supavise` user, writes `/etc/supavise/config.toml`, installs the units, starts `supavise`, and prints the dashboard URL and claim token. Re-running keeps secrets. `supavise upgrade` moves the node onto a newer release and `supavise self-update` replaces only the binary. Artifacts upgrade through `internal/versions/versions.yaml`; a project follows the node's pins when its Owner or Administrator upgrades it (Studio, the Management API or `supavise projects upgrade`).
 
 Laptops are not a target: `supabase start --runtime native` covers local development with the same artifacts, and a project exported from it restores into `supavise`.
 
@@ -87,14 +87,15 @@ Laptops are not a target: `supabase start --runtime native` covers local develop
 
 ## 9. In v1 and reserved
 
-**In v1.** Everything above, plus Edge Functions (a tenant-aware main service in the edge-runtime artifact); settings writes, API keys and database password reset; storage dashboard actions; organization members and roles; single sign-on for the dashboard and for projects; and the restore UI (Studio's Backups pages restore a project in place, to a point in time or to a base backup, through the Management API; restore to a new project stays on the command line). Branching is section 9a.
+**In v1.** Everything above, plus read replicas, switchover and failover on a second server, Storage on S3 and the upgrade path for servers and AWS stacks (section 12), Edge Functions (a tenant-aware main service in the edge-runtime artifact); settings writes, API keys and database password reset; storage dashboard actions; organization members and roles; single sign-on for the dashboard and for projects; and the restore UI (Studio's Backups pages restore a project in place, to a point in time or to a base backup, through the Management API; restore to a new project stays on the command line). Branching is section 9a.
 
 **Reserved, designed in but not built.**
 
 - **Idle sleep.** Because `supavise` is the proxy, it can stop a project's GoTrue and PostgREST after an idle period and start them on the next request. Measured Postgres idle is 15 to 20 MB, so a hundred warm projects already fit on one machine.
 - **File-database engine.** The project record carries `engine: postgres | file` and the data plane sits behind a five-call interface. Turso has no open multi-tenant server yet; when one exists it becomes one more shared process per shard, with auth and quotas in `supavise`'s proxy.
 - **Image transforms, Logflare.** Optional units behind flags.
-- **Multi-node scheduling.** After the single-node product is solid.
+- **Automatic failback, `pg_rewind` and a witness.** A node that returns is rebuilt from the archive and moved back by hand; no lease or third-party witness exists (section 12.5).
+- **Cross-region failover of the service address.** An Elastic IP belongs to one region, so the address moves by hand across regions.
 
 ## 9a. Branching
 
@@ -119,10 +120,186 @@ Hosted Supabase gives every branch its own Postgres instance, which is what AI a
 | Separate control-plane database | registry in the system Postgres | One cluster, one backup path, same unit shape as a project |
 | Separate dashboard GoTrue setup | `supavise-gotrue@system` | The system project is a project |
 | Idle sleep in v1 | always-on | Density target already met warm |
+| Replication slots for replicas | a standby that streams and falls back to the WAL archive | No disk-fill risk, no slot to recreate at each promotion, no competition with Realtime's logical slots; the primary's units stay as they were |
+| A lease or witness for failover | a hard fence, and an epoch marker in the backup store | A lease is a second mechanism, and stopping the instance already guarantees one writer |
+| An IAM authorizer for join | a token, a pinned CA and a keyed proof | One mechanism; on AWS the token travels through Secrets Manager |
+| Resources for a second server inside the first stack | a second stack from the same template | The template's network is one /24 with one subnet, and a changed network interface replaces the instance |
+| A stored IAM key for Storage on AWS | a role the daemon assumes, with short-lived credentials | No secret to store or rotate (spike S5) |
 
 ## 11. Open questions
 
 - Storage's S3-protocol endpoint on the file backend in multi-tenant mode.
 - Whether the CLI keeps `--profile` or moves to "platforms"; pin and test per bump.
+- Real AWS behavior of the stack update and of fencing onto a replica server: `deploy/aws/rehearse.sh` is the check, and no recorded run exists (section 12.6).
+- Recorded measurements of a full switchover and failover (RPO and RTO). The bounds in [reference/replicas.md](reference/replicas.md#rpo-and-rto) are designed, not measured.
+
+## 12. Clusters, replicas and failover
+
+A second Supavise server can join the first. The servers form a cluster: one registry, one writable copy of each project, and a standby copy of the registry on every other server. [reference/replicas.md](reference/replicas.md) is the operator's view of this section. The packages `internal/mesh`, `cluster`, `placement`, `replicas`, `failover`, `infra`, `hostsetup`, `nodeupgrade` and `storagemigrate` hold the code's rules in their own READMEs.
+
+### 12.1 Model and invariants
+
+| Term | Meaning |
+|---|---|
+| cluster | The joined servers. A server that never joined is a cluster of one and runs as before. |
+| node | One server: one row in `supavise.nodes`, id `n1`, `n2`, ... |
+| leader | The node whose system Postgres cluster is not in recovery. It is not a flag: promoting the system cluster makes a node the leader. It runs the writable registry, the Management API, Studio and the shared services. |
+| home | `projects.node_id`: where a project's primary, Auth and REST run. New projects are homed on the leader. |
+| replica | A standby Postgres and a PostgREST of one project on one node that is not its home: one `supavise.replicas` row. |
+| canonical ports | `PortsFor(ref, seq)`: Postgres `project_base + 3s`, Auth `+1`, PostgREST `+2`. |
+| replica ports | `replica_base + 3s` for Postgres, `+2` for PostgREST. |
+| forwarder | A loopback listener on a canonical, replica or shared-service port that sends each connection through the mesh to the node that runs the service. |
+| epoch | A counter in the `cluster` row, raised at each promotion of the system cluster. |
+
+Because every loopback port a consumer expects is either the real service or a forwarder to it, nothing re-points when a project or the whole server moves. The proxy, Supavisor, Realtime, Storage, Functions, pg-meta and the backups keep dialing `127.0.0.1:<canonical port>`. A failover is: promote, fence, and change `projects.node_id`.
+
+Invariants. Each has a test.
+
+- **I1** A node is the leader if and only if `pg_is_in_recovery()` is false on its system cluster. A leader that learns of a higher epoch fences itself.
+- **I2** A project has exactly one home. A replica is never on the home node: `supavise.replicas` has `unique (ref, node_id)`, and the setup refuses the home node.
+- **I3** On every node, each canonical port of every project is Postgres, Auth or PostgREST itself (home) or a forwarder to the home. Each replica port is the replica itself or a forwarder. Each shared-service port is the service (leader) or a forwarder to the leader.
+- **I4** Upgrading to the release with this work changes no rendered unit file or environment of an existing primary, so the rollout restarts none. `TestPrimaryUnitsMatchV011` in `internal/lifecycle` pins it with units rendered as v0.1.1 rendered them.
+- **I5** Registry rows are desired state. Agents report observed state to the leader, which writes status transitions. One snapshot deviates in spirit: the leader's replica controller writes `<state_dir>/replicas-status.json` (receiver status and lag, mode 0600, no LSNs) every pass, only so that `supavise replicas ls` in another process can show lag. Nothing reads it back as state.
+- **I6** Registry migrations from 1300 on are additive: create a table, create an index, add a column with a default. A binary one minor behind runs against the newer schema. `internal/registry/migrations_lint_test.go` enforces it.
+
+Decisions between the two designs that preceded this one:
+
+| Question | Decision | Reason |
+|---|---|---|
+| Placement | `projects.node_id` plus a `replicas` table | Studio identifies the primary as `identifier === ref`. After a failover the new primary must carry `<ref>`, so identifiers cannot be keys of a table whose roles flip. A home column leaves every reader of `registry.Project` working. |
+| Reaching a database on another node | forwarders on canonical ports, extended to the shared-service ports | the proxy, Supavisor, Storage, Realtime and Functions need no change |
+| Transport | one mTLS port, one multiplexed session per node pair, two stream types, either side opens streams | a returning node can have an unstable address; whichever side can dial makes the session, and both use it |
+| Cluster CA | derived from the master key (Ed25519) | no secret to store, replicate or lose, and every node already holds the key |
+| Join | a token, a pinned CA and a keyed proof, in two phases (`joining`, then `active`) | one mechanism; a joiner that stops resumes with `--resume` |
+| Shared-service state on a follower | the follower's Supavisor reads the replicated `_supavisor` | no second home for tenant data (spike S1) |
+| Replication slots | none | a standby streams and falls back to the archive; no slot to recreate at promotion |
+| A standby must not push WAL | `archive_mode=on` (not `always`), and the relay refuses a push for a replica without `promote.ok` | an accidental `pg_promote()` becomes an alert, not a corrupted archive |
+| Replica names | `<identifier>.api.<domain>` and `<ref>-lb.api.<domain>` | one wildcard certificate and the existing CSP list cover them |
+| Connection strings | placeholder passwords; the `x-connection-encrypted` header only selects a database | the header is never a credential; the handler authorizes by `{ref}` |
+| Failover witness | none; the hard fence guards, and an epoch marker in the backup store is written at promotion and read at boot | stopping the instance guarantees one writer; the marker covers a returning node that cannot reach its peer |
+| Return of the old primary | a planned switchover demotes in place; an unplanned failover rebuilds and keeps `data.diverged-<epoch>` for 3 days | |
+| Storage credentials on AWS | a role the daemon assumes, short-lived, no stored key | spike S5 |
+| Second AWS server | a second stack from the same template | the template's network is one /24 with one subnet |
+| Stack upgrade | `supavise upgrade --aws` wraps a signed script that also runs standalone | the instance never gains CloudFormation or IAM rights |
+| Fencing IAM | scoped by the `supavise:cluster` tag | works for peers made later, in other stacks and regions |
+| Automatic modes | `project` and `server`, with a hard fence (AWS) | per project is the common case; per server is the escalation when a node is dead |
+
+### 12.2 The mesh
+
+Nodes talk over one TCP port, `[node] peer_listen` (7443), with TLS 1.3 and the ALPN `supavise-mesh/1`.
+
+**Identity.** The cluster CA is an Ed25519 key derived from `Derive("supavise/cluster-ca/v1")`, with a fixed subject, serial 1 and 20 years of validity, so every node computes the same certificate. Its SHA-256 is the pin in a join token. A node certificate is Ed25519, valid one year, with the name `supavise://node/<id>`; the key never leaves the node. A handshake succeeds when the chain verifies to the CA, and the registry has a row for that node whose serial matches and whose state is `joining`, `active` or `fenced`. A `left` node, an unknown node or another serial is refused. A node renews at 30 days. A caller with no certificate can reach the join endpoints only, with tight limits on body size, streams, sessions and handshakes per address.
+
+**Sessions and streams.** One multiplexed session (`xtaci/smux`) joins each pair of nodes, and either side opens streams. A stream starts with one JSON line: `{"t":"fwd","kind":"postgres","ref":"<ref>"}` for raw bytes to a loopback port, or `{"t":"rpc"}` for one HTTP request and its answer. The reader ignores fields it does not know, so a node one release ahead can add one. The node with the lower id dials at once; the other waits 3 seconds and dials if there is still no session. The address is the node's `peer_address`, then, on AWS, the instance's current addresses from EC2.
+
+**Authorization.** `kind` is an enumeration, never a port, so there is no open relay: a stream names `postgres`, `gotrue` or `postgrest` of a ref the target homes, `replica-postgres` or `replica-postgrest` of a ref it holds a replica of, or `svc:<name>` of a shared service, which only the leader serves. A `fenced` node may open nothing, and a `joining` node only the system cluster's Postgres.
+
+**Forwarders.** On each node the forwarders bind the canonical ports of projects homed elsewhere, the replica ports of replicas it does not hold, and, on a non-leader, the shared-service ports. They follow the registry. A port that something holds is tried again every 2 seconds, so a promotion that needs the canonical port waits for the old forwarder to let go.
+
+**Peer API.** JSON over `rpc` streams:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /peer/v1/ping` | node, epoch, leader, release, applied migrations and health; every 5 seconds |
+| `GET`, `POST /peer/v1/join`, `POST .../join/confirm`, `POST .../rejoin` | joining and rejoining |
+| `POST /peer/v1/certs/renew`, `GET /peer/v1/certs` | node certificate renewal; the leader's certificate store, with an ETag |
+| `GET /peer/v1/config` | the cluster-scoped settings |
+| `POST /peer/v1/report` | observed state from a node to the leader |
+| `PUT`, `GET`, `DELETE /peer/v1/instances/{identifier}` and `POST .../{action}` | ensure, observe, remove and operate a replica instance |
+| `POST /peer/v1/projects/{ref}/plane/{method}`, `.../backup/{op}` | a lifecycle plane call or a backup operation for a project homed on the node |
+| `POST /peer/v1/fleet/refresh/{tenant}` | refresh a Supavisor tenant on a follower, after its standby replayed the change |
+| `POST /peer/v1/fence`, `.../failover/...` | the cooperative fence, the planned stop and the server switchover |
+
+### 12.3 Registry, configuration and roles
+
+Migrations 1300 and 1301 add `nodes`, `cluster` (name, epoch, leader, service address, maintenance), `join_tokens`, `replicas`, `replica_optouts` and `moves`, and a `node_id` column on `projects`. `registry.OpenExisting` and `OpenReadOnly` read a registry that is not yet migrated (v0.1.x) in legacy mode, where every project is on `n1`.
+
+`config.d/*.toml` is merged over `config.toml` in file-name order. `supavise node join` writes `10-cluster.toml` with the cluster-scoped keys (`domain`, `tls.*`, `backup.*`, `fleet.storage_*`, `replicas.*`, `failover.*`), and `supavise system converge` refreshes it from the leader. `20-aws.toml` holds `[aws] stack_name` and `30-storage-s3.toml` holds Storage's bucket credentials. A key with no value keeps its code default, so a v0.1.x `config.toml` loads unchanged.
+
+| Component | Leader | Follower |
+|---|---|---|
+| `supavise.service`: proxy, peer server, forwarders, agents, WAL relay | runs | runs |
+| `supavise-postgres@system` | primary | hot standby |
+| Management API, Studio, `supavise-gotrue@system` | run | not run; `api.` forwards to the leader, `studio.` through the forwarder |
+| Supavisor | primary pools | runs against the replicated `_supavisor`, with no `bin/prepare` |
+| Realtime, Storage, postgres-meta, Edge Runtime | run | installed, not started; their ports are forwarders to the leader |
+| Projects | homed here | those homed here, plus replicas |
+
+A follower opens its registry read-only: no migration, no locks, no tenant writes and no certificate issuance. It mirrors the leader's certificate store every minute and issues nothing, so two nodes never ask the CA for one name. A registry whose schema is newer than the binary leaves running instances alone and raises `standby_behind`.
+
+**Boot and role changes.** Before the node opens, `DecideBoot` weighs the local registry, every peer that answers a ping within 4 seconds, and `_node/leader.json` in the backup store. A node whose row is `fenced` or `left`, or that another source names as leader at an epoch no lower than its own, starts fenced: it records `fenced.json`, stops its units, raises `fenced` and answers HTTP `503`. A node that nothing can reach, with no demotion in its record, starts as leader. When the system cluster of a running node is promoted or demoted, the daemon exits with `app.ErrRoleChanged` and systemd starts it in the new role. The first token created on a node gives the node its cluster identity and restarts the daemon once to listen on the peer port.
+
+### 12.4 Replicas
+
+A replica is the project's Postgres in standby mode plus a PostgREST, rendered by the same code as the primary with a different port and a few settings. No unit template is new.
+
+- **Seeding.** The node extracts the project's newest base backup, writes `postgresql.auto.conf` with `primary_conninfo` (the canonical port on the replica's node, which is a forwarder to the home; the replication role and its sealed password), `restore_command` (the node's own WAL relay) and `recovery_target_timeline = 'latest'`, and writes `standby.signal` last. The Postgres artifact has no `pg_basebackup`, so seeding uses the tarball.
+- **Streaming and the archive.** No slot exists. A standby streams, and when the stream breaks it replays from the archive through `restore_command`, then streams again. The primary does not recycle a segment before `archive_command` succeeds.
+- **No push from a standby.** `archive_mode=on`, so a standby never archives. The relay also refuses a push for a ref that is a replica on the node unless `promote.ok` holds the cluster's epoch, which only a promotion writes. A push for a replica gets `412`.
+- **Settings.** The same class settings as the primary (Postgres needs the standby's limits at least the primary's), `hot_standby=on` and `hot_standby_feedback=on`. No Auth runs, because Auth migrates and a replica is read-only.
+- **PostgREST.** `PGRST_DB_URI` lists the replica first and the canonical port second with `target_session_attrs=read-only`: the pool uses the replica, and only the `LISTEN` session reaches the primary. A `SIGUSR1` every `schema_reload_seconds` covers a notification that arrives before replay.
+- **Pooler.** A Supavisor tenant with the replica's identifier and replica port. It replicates, so each node's Supavisor serves it. The leader asks a follower to refresh a tenant only after the follower's standby replayed the change.
+- **Status and lag.** The leader's controller is level triggered. It reads rows, moves each through seven setup steps, maps observations to a status and keeps a 24-hour lag series in memory.
+- **Server default.** `[replicas] default = "all"` makes a missing row for every project that is not a branch, not the system project and running, on every other active node, unless an opt-out row names the pair. A replica removed by hand writes an opt-out; a later setup clears it.
+
+### 12.5 Failover
+
+A switchover is planned: the old primary stops cleanly and nothing is lost. A failover is unplanned: the old primary is fenced first. Both exist for one project and for the whole server. Every step is written to a log after it finishes, and a step that is in the log is not done again, so `--resume` continues a move that stopped. The orchestrator never touches another node's database or files itself. It calls ports that the daemon wires to `placement`, the mesh, `fleet` and `backup`.
+
+**Project switchover**: `begin`, `quiesce` (status `RESTARTING`), `stop-old` (Realtime and the pooler let go, the old primary stops, its final checkpoint is read), `promote` (the replica replays past that position, then `promote.ok(epoch)`, `pg_promote`, restart as primary), `homed` (`SetProjectNode`, and a replica row for the old home), `start-new`, `tenant`, `demote-old` and `base-backup`. A failover replaces `quiesce` and `stop-old` with the cooperative fence of that project, and drains the archive instead of waiting for a position.
+
+**Server move**: `begin`, then for a switchover `quiesce` (the leader enters maintenance, stops the project clusters eight at a time, then the system GoTrue, the shared services and last the system cluster) and `caught-up`; for a failover `fence`. Then `marker` (`_node/leader.json`), `address` (the service address moves to the survivor), `promote-system`, `leader` (the daemon takes the role, the log moves into a `moves` row, the old leader is marked `fenced` after a failover), each project four at a time, and for a switchover `demote:<ref>` for the old leader's clusters. A project with no replica is refused unless `--restore-missing`, which seeds a standby from the archive.
+
+**Ordering.** Nothing is promoted before the old leader cannot write, and nothing is written to the marker before the old leader is beyond return, so a switchover that fails earlier can be undone. The marker comes before the address, so only a survivor whose marker stands reaches it. A store that already holds a higher epoch, or this epoch under another leader, ends the move `aborted`.
+
+**Fencing.** The AWS provider stops the peer's instance (a forced stop after the first wait), then associates the service address's Elastic IP with the survivor, on its secondary private address when the primary one already carries an Elastic IP. The command provider runs the operator's `fence_command` and `takeover_command`. With neither, the operator asserts with `--old-primary-is-down` that the old leader cannot write, and the node tries the cooperative fence first. A cooperative fence writes `fenced.json`, removes the launcher of each primary (the unit's `ConditionPathExists` then keeps it down, at boot too) and stops it.
+
+**Automatic modes** need the AWS fencer, whose `DryRun` probe must pass. Server mode needs the leader silent for `grace_seconds`, the public health probe of the service address failing and EC2 saying the leader is down; with several followers they take turns by node id. Project mode needs a project's primary unhealthy for `project_grace_seconds`. A held gate is maintenance, a cooldown, a different release or region, an unknown or large lag, or a move already running.
+
+**The old primary's return.** A node that led and returns learns of the higher epoch at boot (12.3) and starts fenced. `supavise node rejoin` moves each `data` directory to `data.diverged-<epoch>`, seeds a fresh system standby from the current leader's archive, keeps the node's identity and rebuilds its replicas through the controller. A running leader that sees a higher epoch in a ping or in the marker fences itself the same way (I1).
+
+**Role change inside a move.** A server move cuts its own run once, when the node's system cluster is promoted, because the daemon restarts. The cut is not a failure: the move stays `running`, the daemon that starts continues it, and the CLI waits for it and goes on printing steps.
+
+### 12.6 Upgrade layers
+
+`supavise upgrade` brings an existing install forward in three layers. Each is idempotent, and the first two do not need the third.
+
+1. **The host: `supavise system converge`.** A list of root steps that bring unit files, directories (`/etc/supavise/cluster`, `config.d`), mount protection (`RequiresMountsFor`), the firewall rule for 7443 and declared packages to what the binary expects. A second run changes nothing. It writes `<state_dir>/converged` with the revision it completed, and the daemon raises `host_not_converged` while the file is behind. `install-units` is an alias, which is how a v0.1.x driver reaches it: the old `supavise upgrade` runs `system install-units` on the new binary right after the swap.
+2. **The release.** `supavise release-info` on the new binary reports the converge revision, the host steps, the registry migrations it adds and the infrastructure revision it needs. The plan prints them and the projects that restart. The signed manifest carries `host.converge_revision`, `aws.stack_revision`, the template's asset name and SHA-256. The first hop from v0.1.x is driven by the old binary, so it prints the old plan; everything new runs on the new binary after the swap. Registry migrations only go forward, so a rollback after the new daemon started is refused, and the pre-upgrade base backup of the system project is the way back.
+3. **The AWS stack.** The node reads its stack's revision from its own instance tags through the metadata service, with no IAM permission. `supavise upgrade --aws` runs the signed `supavise-aws-deploy.sh update` with the operator's credentials, never the instance role. The script creates a CloudFormation change set from the release's signed template with `UsePreviousValue` for every parameter the stack has, shows it, refuses a change that would replace or remove a resource other than rules and policies, blocks one that would move the service address back after a failover, and applies it after the operator types `apply`. A stack that lacks the credentials is not an error: the node side proceeds and the command to run is printed.
+
+A test renders the v0.1.1 template and the current one with the v0.1.1 parameters and fails if any property of an existing resource that replaces or interrupts the instance, volume, address or network differs. A real change set cannot run in CI; `deploy/aws/rehearse.sh` makes a throwaway stack from the v0.1.1 template for that.
+
+### 12.7 Storage on S3
+
+A server move needs Storage on S3: objects on one node's disk cannot follow the leader. `supavise storage migrate --to s3` copies every project's objects to a bucket while Storage serves from files, catches up, verifies each project's `storage.objects` rows against the bucket, and switches. At the switch Storage's writes get `503` with `Retry-After: 5`, `supavise-storage` stops, a last pass runs over the files that no longer change, and Storage starts on the bucket. Reads fail from the stop to the start. The files are kept as `objects.migrated-<date>`; `--rollback` copies back what changed. Storage's S3 key, `<ref>/<bucket>/<name>/<version>`, equals the file backend's relative path, so the copy needs no mapping.
+
+On AWS the stack makes a `StorageRole` scoped to the objects bucket, and the instance role may assume exactly that role. The daemon assumes it, caches the credentials until five minutes before they end and serves them on `127.0.0.1:[fleet] storage_credentials_port` in the container-credential shape, to `supavise-storage` only, with a token that is random per boot. Storage's environment names the endpoint and holds no key. Off AWS, static `storage_s3_*` keys work as before.
+
+### 12.8 Spike outcomes
+
+These were proven before the dependent work was built. The spike code was not merged.
+
+| Spike | Outcome |
+|---|---|
+| S1 Supavisor on a standby | It serves a replicated tenant against the replicated `_supavisor` without `bin/prepare`, which exits 1 on a standby. It needs the leader's `VAULT_ENC_KEY`. After a replicated row changes it keeps the old target until `GET /api/tenants/<id>/terminate`, so the leader asks only after the follower replayed the change. |
+| S2 Background workers | `pg_cron` and `pg_net` workers do not start on a standby and start at promotion with no restart: no preload change. A replica connection cannot call `net.http_*`. The Edge Functions syncer only reads the registry. The replica must set `hot_standby=on`, because the project's cluster ships `hot_standby=off` and `postgresql.auto.conf` overrides it. |
+| S3 PostgREST on a standby | The two-host connection string works. The notification alone missed up to 5 of 15 tables under 20 MB/s of WAL. A `SIGUSR1` timer made every change visible: with a 5-second timer the slowest was 4.96 s, and the signal to visibility took 63 to 103 ms. The default is `schema_reload_seconds = 10`. |
+| S4 Realtime | After a promotion Realtime recreates its slots and `EnsureTenant` does nothing (the fingerprint matches). Before a planned stop, quiesce the tenant (`POST /api/tenants/<ref>/reload`) and keep clients out until the stop ends: without that the stop timed out at 90 s on Realtime's logical walsender. Keep the daemon, and with it the WAL relay, up until the cluster has stopped. |
+| S5 Storage | Its S3 key equals the file backend's path, so migration is a plain copy with content type and cache control. Names that are not valid UTF-8 are reported, not copied. It honors `AWS_CONTAINER_CREDENTIALS_FULL_URI` on loopback with `AWS_CONTAINER_AUTHORIZATION_TOKEN`, caches the credentials and fails with a wrong token. |
+| S6 Mesh throughput | Physical replication through a TLS and smux forwarder kept lag p99 at 0.10 to 0.41 s at 20 MB/s of WAL over 2 to 70 ms of round trip, only with sized windows: at least 4 MiB per stream and 16 MiB per session, and the receiver's setting governs. The walreceiver streamed again within 5.2 s of the forwarders returning. The smux keepalive timeout must stay below `wal_receiver_timeout` (60 s). Forwarder CPU was 10 to 12 percent of a core per side at 45 to 50 MB/s. |
+| S7 Catch-up | A standby with a broken stream catches up through `restore_command` and the relay and resumes streaming, also when the primary has recycled segments. The rebuild is for WAL that left the archive. `pg_basebackup` is not in the artifact, so seeding uses the tarball; a seeded directory needs `postmaster.opts`. |
+| S8 AWS | The owner's rehearsal checklist: `UsePreviousValue` for parameters new to a stack, a tags-only update with no instance interruption, tags in the metadata service without a restart, `DryRun` of the fencing calls, and the association to a secondary private address. It has not run. |
+| S9 Two-node CI | Incus virtual machines on amd64 and privileged system containers on arm64. Unprivileged containers do not enforce `IPAddressDeny`. |
+
+### 12.9 As built, against the design
+
+- Replica identifiers, hosts and the Studio contract follow the design. Two corrections: `infrastructure:read_replicas` is a key of `disabled_features` in the Studio profile, removed when the replica controller is wired and two nodes are active, not a permission check; and the read-only connection string keeps the caller's role on a replica, because Studio's reports read `pg_stat_statements` as `postgres` and no role has to reach the replica with the WAL first.
+- The replica controller's lag state is memory, plus the snapshot file of I5.
+- `supavise upgrade` does not set the cluster's maintenance announcement and does not order servers. The release-match gate holds the automatic modes while two nodes run different releases. Upgrade the leader first.
+- A bump of the Postgres artifact has no replicas-first order and no `wal_compat` field; a major upgrade of a project with replicas is refused, with no `--drop-replicas`.
+- The alert kinds `replica_needs_rebuild` and `storage_not_s3` are defined and nothing raises them. A replica that falls behind WAL that left the archive stays `ACTIVE_UNHEALTHY`.
+- `min_peer_from` is read from the manifest and nothing writes it.
+- The AWS stack, the rehearsal script and the fencing onto a replica server have not run against AWS (section 12.6). The two-server end-to-end run has no recorded RPO or RTO.
 
 Supavise is not affiliated with or endorsed by Supabase Inc.
