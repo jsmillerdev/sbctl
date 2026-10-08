@@ -166,3 +166,28 @@ func TestCheckManifestPins(t *testing.T) {
 		t.Fatal("a binary with another Studio build")
 	}
 }
+
+// A release the node was rolled back from is no rollback target and takes no place from the ones
+// that are.
+func TestReleasesGCDropsWithdrawnReleasesFirst(t *testing.T) {
+	r := Releases{Dir: t.TempDir()}
+	for i, v := range []string{"v1.0.0", "v1.1.0", "v1.2.0", "v1.3.0"} {
+		keepRelease(t, r, v, t0.Add(time.Duration(i)*time.Hour))
+	}
+	// v1.3.0 and v1.2.0 failed; the node is on v1.1.0 (touched last).
+	for _, v := range []string{"v1.3.0", "v1.2.0"} {
+		if err := r.Withdraw(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Touch("v1.1.0", t0.Add(10*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := r.GC(2, "v1.1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(removed, ",") != "v1.3.0,v1.2.0" || versionsOf(t, r) != "v1.1.0,v1.0.0" {
+		t.Fatalf("removed %v, kept %s: v1.0.0 is a rollback target and must stay", removed, versionsOf(t, r))
+	}
+}

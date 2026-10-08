@@ -242,8 +242,10 @@ func (r Releases) Previous(current string) (*Record, error) {
 	return nil, nil
 }
 
-// GC removes all but the keep newest records (the current release counts), and never removes
-// current. It returns the versions it removed.
+// GC removes the releases a rollback will not go to and all but the keep newest of the others (the
+// current release counts), and never removes current. A release the node was rolled back from
+// (Withdrawn) is no rollback target, so it takes no place from the ones that are. It returns the
+// versions it removed.
 func (r Releases) GC(keep int, current string) ([]string, error) {
 	all, err := r.List()
 	if err != nil {
@@ -251,8 +253,12 @@ func (r Releases) GC(keep int, current string) ([]string, error) {
 	}
 	keep = max(keep, 1)
 	var removed []string
-	for i, rec := range all {
-		if i < keep || rec.Version == current {
+	kept := 0
+	for _, rec := range all {
+		if rec.Version == current || (!rec.Withdrawn && kept < keep) {
+			if !rec.Withdrawn {
+				kept++
+			}
 			continue
 		}
 		d, err := r.dir(rec.Version)
