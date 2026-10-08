@@ -2,11 +2,13 @@
 # `supavise storage migrate` under real systemd units against a real S3 service (Garage): objects
 # uploaded through the Storage API on the file backend (and two that Storage's API cannot make, an
 # 80 MiB file and a file with a non-ASCII name, put on disk by hand) are copied to the bucket while
-# Storage keeps serving and a writer keeps uploading; the run is killed in the middle of the copy and
-# continued with --resume; Storage then serves every object from the bucket with its content type
-# and cache control; the credentials are in a 0600 file under config.d and nowhere else; --rollback
-# copies the objects written and deleted on the bucket back to the files; a second migration is
-# followed by --cleanup.
+# Storage keeps serving and a writer keeps uploading; a configuration that would not take effect is
+# refused before anything is copied; the run is killed once the bucket holds some of the objects and
+# not the big one, and continued with --resume, which sends only the rest; Storage then serves every
+# object from the bucket with its content type and cache control; the credentials are in a 0600 file
+# under config.d and nowhere else, and the record of the run is outside Storage's writable
+# directory; --rollback copies the objects written and deleted on the bucket back to the files; a
+# second migration is followed by --cleanup.
 #
 #   sudo S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=supavise-objects S3_KEY=... S3_SECRET=... \
 #     SUPAVISE_BIN=/path/to/supavise-linux-amd64 tests/linux/storage-migrate.sh
@@ -97,6 +99,7 @@ REF=$(api_create_project storage-migrate)
 project_keys "$REF"
 HOST="$REF.api.$SUPAVISE_DOMAIN"
 STORAGE_DIR=$SUPAVISE_STATE/system/storage
+RUN_DIR=$SUPAVISE_STATE/system/storage-migrate
 OBJ_ROOT=$STORAGE_DIR/objects/stub/$REF
 BASE=http://127.0.0.1/storage/v1
 
@@ -186,24 +189,45 @@ grep -q 'chmod 600' "$W/wide.log" || { cat "$W/wide.log" >&2; fail "the refusal 
 grep -q "$S3_SECRET" "$W/wide.log" && fail "the secret is in the error"
 chmod 0600 "$CREDS"
 
-log "migrate, throttled so that the copy of the 80 MiB file is still going when it is killed"
-migrate --to s3 --credentials-file "$CREDS" --rate-limit 2 >"$W/migrate1.log" 2>&1 &
+log "a configuration that would not take effect is refused before anything is copied"
+install -d -o "$SUPAVISE_USER" -g "$SUPAVISE_USER" -m 0755 /etc/supavise/config.d
+printf '[fleet]\nstorage_backend = "file"\n' >/etc/supavise/config.d/50-test-override.toml
+chmod 0644 /etc/supavise/config.d/50-test-override.toml
+if migrate --to s3 --credentials-file "$CREDS" >"$W/override.log" 2>&1; then fail "a migration went ahead although config.d overrides storage_backend"; fi
+rm -f /etc/supavise/config.d/50-test-override.toml
+grep -q 'overrides config.toml' "$W/override.log" || { cat "$W/override.log" >&2; fail "the refusal does not name the override"; }
+[[ ! -e $RUN_DIR/migrate.json ]] || fail "a refused run left a record"
+[[ -z $(s3 list "$REF/") ]] || fail "a refused run copied objects"
+[[ $(unit_state supavise-storage.service) == active ]] || fail "Storage is $(unit_state supavise-storage.service) after the refused run"
+
+# The bucket copies a file as current when it is newer than the file by a few seconds of clock slack:
+# the objects above are older than that when the migration starts.
+sleep 3
+log "migrate at 1 MiB/s: the 80 MiB file cannot be in the bucket for the first 80 seconds"
+migrate --to s3 --credentials-file "$CREDS" --rate-limit 1 >"$W/migrate1.log" 2>&1 &
 MIGRATE=$!
 for ((i = 0; i < 120; i++)); do
   status_has '^phase:  *copying' && break
   sleep 1
 done
 status_has '^phase:  *copying' || { cat "$W/migrate1.log" >&2; fail "the run never reached the copy"; }
-sleep 5
+bucket_has_some() { [[ $(s3 list "$REF/" | wc -l) -ge 3 ]]; }
+wait_for 90 "some of the objects in the bucket" bucket_has_some
 pkill -KILL -f 'supavise storage migrate' || true
 wait "$MIGRATE" 2>/dev/null || true
+s3 list "$REF/" | LC_ALL=C sort >"$W/keys-at-kill.txt"
+log "killed with $(wc -l <"$W/keys-at-kill.txt") objects in the bucket"
+grep -q "^$REF/docs/big.bin/" "$W/keys-at-kill.txt" && fail "the 80 MiB file reached the bucket in the first seconds of a 1 MiB/s copy: the rate limit does not bound the bytes sent"
 status | tee "$W/status-killed.txt" >&2
 grep -q '^phase:  *copying' "$W/status-killed.txt" || fail "a killed run did not leave its phase"
 grep -q 'migrate --resume' "$W/status-killed.txt" || fail "the status does not say how to continue"
 if migrate --to s3 --credentials-file "$CREDS" >"$W/second.log" 2>&1; then fail "a second run started over a run in progress"; fi
 grep -q -- '--resume' "$W/second.log" || { cat "$W/second.log" >&2; fail "the refusal does not mention --resume"; }
 [[ $(unit_state supavise-storage.service) == active ]] || fail "Storage is $(unit_state supavise-storage.service) after the killed run"
-[[ ! -e $STORAGE_DIR/write-hold.json ]] || log "a hold from the killed run is left (it expires on its own)"
+[[ ! -e $RUN_DIR/write-hold.json ]] || log "a hold from the killed run is left (it expires on its own)"
+FIRST_KEY=$(grep -v "^$REF/docs/live-" "$W/keys-at-kill.txt" | head -1)
+[[ -n $FIRST_KEY ]] || fail "only the writer's objects were in the bucket at the kill"
+FIRST_HEAD=$(s3 head "$FIRST_KEY")
 
 log "resume (no limit)"
 migrate --to s3 --resume --credentials-file "$CREDS" --rate-limit 0 >"$W/migrate2.log" 2>&1 || { cat "$W/migrate2.log" >&2; fail "--resume failed"; }
@@ -213,6 +237,15 @@ wait "$WRITER" || true
 status | tee "$W/status-done.txt" >&2
 grep -q '^phase:  *done' "$W/status-done.txt" || fail "the run did not finish"
 grep -q 'have no row' "$W/migrate2.log" || fail "the run did not report the files that have no row"
+# The resumed run sent only what the bucket lacked: the objects there at the kill were written long
+# before the copy started (all but the writer's), and are not sent again.
+COPY_LINE=$(sed -nE 's/^copy: ([0-9]+) files in [0-9]+ projects, ([0-9]+) sent.*/\1 \2/p' "$W/migrate2.log" | head -1)
+read -r FILES SENT <<<"$COPY_LINE"
+OLD_AT_KILL=$(grep -vc "^$REF/docs/live-" "$W/keys-at-kill.txt" || true)
+[[ -n ${FILES:-} && $OLD_AT_KILL -ge 1 && $SENT -le $((FILES - OLD_AT_KILL)) ]] \
+  || fail "the resumed run sent $SENT of $FILES files although $OLD_AT_KILL were in the bucket"
+[[ $(s3 head "$FIRST_KEY") == "$FIRST_HEAD" ]] || fail "$FIRST_KEY was sent again by the resumed run"
+log "resumed: $SENT of $FILES files sent, $OLD_AT_KILL were already in the bucket"
 
 # ---- what the switch left ------------------------------------------------------------------------
 log "the configuration: the backend, the bucket, and the key in its own file"
@@ -229,7 +262,10 @@ grep -q '^STORAGE_BACKEND="s3"' "$STORAGE_ENV" || fail "storage.env does not nam
 [[ ! -e $STORAGE_DIR/objects ]] || fail "the objects directory is still where Storage's file backend reads"
 KEPT=$(ls -d "$STORAGE_DIR"/objects.migrated-* 2>/dev/null | head -1 || true)
 [[ -n $KEPT && -d $KEPT/stub/$REF ]] || fail "the files were not kept ($STORAGE_DIR)"
-[[ ! -e $STORAGE_DIR/write-hold.json ]] || fail "the write hold was not released"
+[[ ! -e $RUN_DIR/write-hold.json ]] || fail "the write hold was not released"
+[[ -f $RUN_DIR/migrate.json && ! -e $STORAGE_DIR/migrate.json && ! -e $STORAGE_DIR/migrate.lock ]] \
+  || fail "the record of the run is not in $RUN_DIR, outside the directory supavise-storage may write"
+[[ $(stat -c %U "$RUN_DIR") == "$SUPAVISE_USER" ]] || fail "$RUN_DIR belongs to $(stat -c %U "$RUN_DIR")"
 journalctl --no-pager -u 'supavise*' >"$W/journal.txt" 2>&1 || true
 if grep -q "$S3_SECRET" "$W/journal.txt"; then fail "the secret is in the journal"; fi
 if grep -q "$S3_SECRET" "$W"/*.log "$W"/status-*.txt; then fail "the secret is in the output of the commands"; fi

@@ -4,7 +4,7 @@ library only, so that the test does not depend on the aws CLI or on a curl that 
 
   S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=b S3_KEY=... S3_SECRET=... [S3_REGION=us-east-1] \
     storage-migrate-s3.py list PREFIX     # one key per line
-    storage-migrate-s3.py head KEY        # content-length, content-type and cache-control
+    storage-migrate-s3.py head KEY        # content-length, content-type, cache-control and last-modified
     storage-migrate-s3.py get KEY         # the object on stdout
     storage-migrate-s3.py delete KEY
 
@@ -70,7 +70,7 @@ def main():
             token = root.findtext("s:NextContinuationToken", namespaces=NS)
     elif cmd == "head":
         r = request("HEAD", arg)
-        for h in ("content-length", "content-type", "cache-control"):
+        for h in ("content-length", "content-type", "cache-control", "last-modified"):
             print(f"{h}: {r.headers.get(h, '')}")
     elif cmd == "get":
         sys.stdout.buffer.write(request("GET", arg).read())
