@@ -9,9 +9,9 @@ name: replication
 # writer's files.
 #
 # Virtual machines where /dev/kvm works (amd64), privileged system containers where it does not (arm64): unit
-# hardening and the instance metadata block need either (tests/linux/multi/README.md). It is not part of the
-# release gate yet (deploy/release-gate.sh gates on linux.yml); it moves into linux.yml after a run of green
-# results.
+# hardening and the instance metadata block need either (tests/linux/multi/README.md). It is not in
+# deploy/release-gate.sh's list yet. The gate accepts a workflow_dispatch run on the tagged commit, so this workflow
+# can be listed as it stands: `gh workflow run replication.yml --ref <branch>`, then tag.
 on:
   push:
     branches: ["ws/rep-x2", "integrate/**"]
@@ -19,6 +19,11 @@ on:
 
 permissions:
   contents: read
+
+# A newer push to a branch ends the run that is still going on it: a run is up to 150 minutes on two runners.
+concurrency:
+  group: replication-${{ github.ref }}
+  cancel-in-progress: true
 
 # bash with -eo pipefail, so a failing command piped into tee fails the step.
 defaults:
@@ -49,7 +54,9 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
           CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/supavise-next ./cmd/supavise
           go build -o /tmp/releasetool ./deploy/releasetool
+      # Below the job's limit, so that a hang is ended here and the steps after it still run.
       - name: two servers
+        timeout-minutes: 135
         run: |
           sudo env LOG_DIR=/tmp/supavise-multi-logs MULTI_MODE=auto \
             SUPAVISE_BIN=/tmp/supavise SUPAVISE_BIN_NEXT=/tmp/supavise-next SUPAVISE_RELEASETOOL=/tmp/releasetool \
