@@ -375,3 +375,26 @@ func TestAWSRefusesUnattended(t *testing.T) {
 		t.Errorf("calls before the refusal: %v", h.calls)
 	}
 }
+
+// A host layer that fails after the swap is the upgrade's failure: the previous binary is put back
+// before any service or project moves, and the cause names the converge.
+func TestConvergeFailureAfterTheSwapRollsBack(t *testing.T) {
+	h := newFakeHost()
+	h.node.ConvergeKnown = true
+	h.info = newInfoWithHost()
+	h.installErr, h.installSwaps = errors.New("supavise system converge: exit status 1"), true
+	var events []Event
+	o := runOpts(h)
+	o.Notify = func(_ context.Context, ev Event) { events = append(events, ev) }
+	err := Run(context.Background(), h, o)
+	if code(t, err) != ExitRolledBack || !strings.Contains(err.Error(), "supavise system converge: exit status 1") {
+		t.Fatalf("err = %v (exit %d)\n%s", err, ExitCode(err), h.order())
+	}
+	if !strings.Contains(h.order(), "restore v1.0.0 (from v1.1.0)") || h.has("projects") {
+		t.Fatalf("calls: %s", h.order())
+	}
+	last := events[len(events)-1]
+	if last.Kind != EventRolledBack || !strings.Contains(last.Cause, "supavise system converge") {
+		t.Errorf("events = %+v", events)
+	}
+}
