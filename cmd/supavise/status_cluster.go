@@ -24,7 +24,7 @@ type clusterBlock struct {
 	Fenced      *cluster.FencedRecord `json:"fenced,omitempty"`
 	Maintenance *registry.Maintenance `json:"maintenance,omitempty"`
 	Nodes       []nodeRow             `json:"nodes,omitempty"`
-	Replicas    []clusterReplicaRow          `json:"replicas,omitempty"`
+	Replicas    []clusterReplicaRow   `json:"replicas,omitempty"`
 	// Live says whether the daemon's view (sessions, lag) is current; false when its status file is
 	// missing or stale, in which case sessions and lag are not shown.
 	Live bool `json:"live"`

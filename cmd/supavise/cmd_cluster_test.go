@@ -71,15 +71,8 @@ func hasCommandLine(help, name string) bool {
 	return false
 }
 
-// Every command of the cluster work is registered and says plainly that it is not there yet.
-func TestClusterCommandsAreStubs(t *testing.T) {
-	for _, args := range [][]string{
-	} {
-		_, err := run(t, args...)
-		if !errors.Is(err, notimpl.Err) {
-			t.Errorf("supavise %s: %v, want not implemented yet", strings.Join(args, " "), err)
-		}
-	}
+// replicas add needs a region of its own: a missing flag is a usage error, not a stub.
+func TestReplicasAddNeedsARegion(t *testing.T) {
 	if _, err := run(t, "replicas", "add", "abcdefghijklmnopqrst"); err == nil || errors.Is(err, notimpl.Err) {
 		t.Errorf("replicas add without --region: %v", err)
 	}
