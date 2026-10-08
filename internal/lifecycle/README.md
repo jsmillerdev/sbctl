@@ -165,6 +165,8 @@ none does not float onto the release that just failed), starts and health checks
 and the error names the pre-upgrade backup. The nightly backup timer starts again whenever PostgreSQL
 runs after the rollback.
 
+The unit requests of step 3 (`units.Supervisor.Stop` and `Start`) are sent again when the systemd bus drops them without an answer, so one such drop is not a failed upgrade (`internal/units/README.md`). `projects upgrade <ref>` acts on that project alone (`selectProjects`); a node-level revert runs one such command per project.
+
 **Alerts.** The Engine cannot import `internal/alerts` (alerts read the node's health through this
 package), so each upgrade event also goes to `Options.UpgradeNotify`, a hook that receives an
 `UpgradeNotice` (event, ref, tracking id, the service moves in words, backup id, and for a failure the

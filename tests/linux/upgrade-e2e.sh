@@ -422,6 +422,13 @@ unchanged "refused rollback"
 [[ $(versions_of "$REF") == "$NEWER_AUTH $NEW_REST "* ]] || fail "a refused rollback moved a project"
 reg "delete from supavise.schema_migrations where version = 'migrations/9999_from_the_future.sql'" >/dev/null
 
+log "projects upgrade <ref> plans that project alone, whichever of the two it is (a revert must touch nothing else)"
+for pair in "$REF $REF2" "$REF2 $REF"; do
+  read -r mine other <<<"$pair"
+  run supavise projects upgrade "$mine" --dry-run --allow-older --to "gotrue=$NEW_AUTH"
+  [[ $RC -eq 0 && $OUT == *"$mine"* && $OUT != *"$other"* ]] || fail "projects upgrade $mine --dry-run lists or acts on the other project: $RC $OUT"
+done
+
 log "supavise rollback --yes: back to v0.0.2, the projects back on their GoTrue"
 run "$SV" rollback --yes
 [[ $RC -eq 0 ]] || { journalctl --no-pager -u supavise.service | tail -60 >&2; fail "rollback exited $RC: $OUT"; }
