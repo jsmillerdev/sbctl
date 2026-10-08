@@ -400,7 +400,29 @@ type joinedHost struct {
 	unknown bool // leads cannot be told: the system cluster does not answer
 	stopped int
 	asked   int // how often the units were wanted
+
+	dropped int      // how often the command became the supavise user
+	opened  []bool   // the seeders the commands opened: joining or not
+	events  []string // the order of the drop, the preflight, the seed and the close
+	seedErr error    // what the seed answers
+	boot    []peerapi.SystemBootstrap
 }
+
+// fakeStandby is the seeder the commands get: it records what they ask of it.
+type fakeStandby struct{ h *joinedHost }
+
+func (f fakeStandby) Preflight(context.Context) error {
+	f.h.events = append(f.h.events, "preflight")
+	return nil
+}
+
+func (f fakeStandby) Seed(_ context.Context, b peerapi.SystemBootstrap) error {
+	f.h.events = append(f.h.events, "seed")
+	f.h.boot = append(f.h.boot, b)
+	return f.h.seedErr
+}
+
+func (f fakeStandby) Close() { f.h.events = append(f.h.events, "close") }
 
 func newJoinedHost(t *testing.T) *joinedHost {
 	t.Helper()
@@ -434,7 +456,7 @@ func newJoinedHost(t *testing.T) *joinedHost {
 		t.Fatal(err)
 	}
 
-	oldPath, oldStop, oldLeads, oldSeed, oldPre := configPath, stopLocalFn, leadsHere, seedSystemStandby, seedPreflight
+	oldPath, oldStop, oldLeads, oldOpen, oldDrop := configPath, stopLocalFn, leadsHere, openStandby, runAsSupavise
 	configPath = h.cfgPath
 	stopLocalFn = func(*config.Config, *slog.Logger) (func(context.Context) error, func(), error) {
 		h.asked++
@@ -449,10 +471,17 @@ func newJoinedHost(t *testing.T) *joinedHost {
 		}
 		return cluster.LeadsNo
 	}
-	seedSystemStandby = func(context.Context, peerapi.SystemBootstrap) error { return nil }
-	seedPreflight = func(context.Context) error { return nil }
+	openStandby = func(_ *slog.Logger, joining bool) standbySeeder {
+		h.opened = append(h.opened, joining)
+		return fakeStandby{h}
+	}
+	runAsSupavise = func() error {
+		h.dropped++
+		h.events = append(h.events, "drop")
+		return nil
+	}
 	t.Cleanup(func() {
-		configPath, stopLocalFn, leadsHere, seedSystemStandby, seedPreflight = oldPath, oldStop, oldLeads, oldSeed, oldPre
+		configPath, stopLocalFn, leadsHere, openStandby, runAsSupavise = oldPath, oldStop, oldLeads, oldOpen, oldDrop
 		rootCmd.SetIn(nil)
 	})
 	return h
@@ -665,4 +694,69 @@ func TestNodeCommandsRefuseWhileTheHostIsBehind(t *testing.T) {
 		}
 	}
 	h.unchanged(t, "host behind")
+}
+
+// A command that sudo started becomes the supavise user once the inputs only root could read are
+// read, and before it asks the seeder for anything or stops anything. The seeder is closed whatever the
+// join did.
+func TestNodeJoinBecomesTheSupaviseUserBeforeItSeedsOrStopsAnything(t *testing.T) {
+	h := newJoinedHost(t)
+	file := h.token(t, deadAddr(t))
+
+	// A token file that cannot be read stops the command before it becomes anyone else.
+	if _, err := run(t, "node", "join", "--token-file", filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("a missing token file was accepted")
+	}
+	if h.dropped != 0 {
+		t.Fatalf("the command dropped its rights %d times before it had read its inputs", h.dropped)
+	}
+
+	// A reset of a server whose leader cannot be reached: the drop comes first, then the preflight (the
+	// join asks it before it touches the server), and nothing is stopped.
+	h.events = nil
+	if _, err := run(t, "node", "join", "--reset", "--yes", "--token-file", file); err == nil || !strings.Contains(err.Error(), "cannot reach the leader") {
+		t.Fatalf("join --reset against a dead leader: %v", err)
+	}
+	if got, want := strings.Join(h.events, " "), "drop preflight close"; got != want {
+		t.Fatalf("order of events = %q, want %q", got, want)
+	}
+	if len(h.opened) != 2 || !h.opened[0] || !h.opened[1] {
+		t.Fatalf("seeders opened = %v: a join opens a joining seeder", h.opened)
+	}
+	if h.stopped != 0 || !cluster.Joined(config.ClusterDir(h.cfgPath)) {
+		t.Fatalf("the server was touched: stopped %d, identity kept %v", h.stopped, cluster.Joined(config.ClusterDir(h.cfgPath)))
+	}
+	if _, err := os.Stat(h.data); err != nil {
+		t.Fatalf("the data was moved: %v", err)
+	}
+}
+
+// A resumed join needs no token and no preflight: the seeder is opened, asked nothing and closed when
+// there is no join to resume.
+func TestNodeJoinResumeWithoutAJoinAsksTheSeederNothing(t *testing.T) {
+	h := newJoinedHost(t)
+	if _, err := run(t, "node", "join", "--resume"); err == nil || !strings.Contains(err.Error(), "no join to resume") {
+		t.Fatalf("join --resume: %v", err)
+	}
+	if got, want := strings.Join(h.events, " "), "drop close"; got != want {
+		t.Fatalf("order of events = %q, want %q", got, want)
+	}
+}
+
+// A rejoin becomes the supavise user before it stops the units, opens a seeder that checks the backend
+// (a rejoining server holds the cluster's settings already) and closes it.
+func TestNodeRejoinBecomesTheSupaviseUserAndPreflightsBeforeAnythingChanges(t *testing.T) {
+	h := newJoinedHost(t)
+	if _, err := run(t, "node", "rejoin"); err == nil || !strings.Contains(err.Error(), "not fenced") {
+		t.Fatalf("rejoin of a server that is not fenced: %v", err)
+	}
+	if got, want := strings.Join(h.events, " "), "drop preflight close"; got != want {
+		t.Fatalf("order of events = %q, want %q", got, want)
+	}
+	if len(h.opened) != 1 || h.opened[0] {
+		t.Fatalf("seeders opened = %v: a rejoin does not open a joining seeder", h.opened)
+	}
+	if h.stopped != 0 {
+		t.Error("rejoin stopped the units of a server that is not fenced")
+	}
 }

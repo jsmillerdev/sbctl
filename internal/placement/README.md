@@ -181,6 +181,8 @@ Five more pieces are the wiring's to attach:
   the registry.
 - `SystemStandby` (`systemstandby.go`) adapts `lifecycle.PostgresPlane.SeedSystemStandby` to the join's
   `cluster.SeedFunc` and `Preflight`, for a server that joins before its daemon and its registry exist.
+  `Joining` leaves the backend out of the preflight (the leader's settings replace it with the join).
+  `cmd/supavise/cmd_node_seed.go` builds it for `node join` and `node rejoin`.
 - `Router.ReconfigureService` sends the settings of GoTrue and PostgREST of a project homed elsewhere to
   its home as a `Reconfigure` (both services restart).
 

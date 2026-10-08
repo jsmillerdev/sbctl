@@ -530,7 +530,11 @@ aborted promotion left, since the relay trusts that file for the epoch it names.
 
 A server that joins a cluster builds its standby of the system cluster before its daemon runs
 (`SeedSystemStandby`, `SystemStandbyPreflight`; `placement.SystemStandby` adapts them to the join's
-`SeedFunc` and `Preflight`). The plane renders the replica's spec for the system project from this
+`SeedFunc` and `Preflight`). `OpenStandbyPlane` builds the plane for it over the supervisor and the artifact
+store, with an in-memory registry that is never read. `SystemStandbyPreflight` wants a backend a second
+server can read (not `file://`), room on the disk and the Postgres release on disk;
+`SystemStandbyJoinPreflight` is the same without the backend, for a server that has not joined yet, because the
+leader's `[backup]` replaces its own with the join (the AWS joiner passes no `--s3` flags). The plane renders the replica's spec for the system project from this
 node's pins, with credentials of its own for the pgsodium root key (nothing in the system cluster is
 encrypted with it; the node agent renders the registry's key over it once the registry can be read)
 and the leader's replication password. It can be repeated: a directory with the seeder's marker is
