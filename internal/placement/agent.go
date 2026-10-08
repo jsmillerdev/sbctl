@@ -738,6 +738,16 @@ func (a *NodeAgent) Do(ctx context.Context, identifier string, act peerapi.Actio
 			_ = os.Remove(a.filePath(ref))
 		}
 	case peerapi.ActionDemote:
+		// The registry names the new home before the old one is demoted (design 2.10.3, steps 5 and 7):
+		// a demotion of the node the registry still names the home would stop its primary.
+		var home bool
+		if home, err = a.isHome(ctx, ref); err != nil {
+			break
+		}
+		if home {
+			err = fmt.Errorf("%w: cannot demote the cluster of %s: %s is still its home in the registry; move the home first", lifecycle.ErrInvalidState, ref, a.self())
+			break
+		}
 		var t lifecycle.ReplicaTarget
 		if t, err = a.target(ctx, identifier, "", true); err != nil {
 			break
@@ -754,18 +764,27 @@ func (a *NodeAgent) Do(ctx context.Context, identifier string, act peerapi.Actio
 	return a.Observe(ctx, identifier)
 }
 
-// notHome refuses act on the replica of ref when the registry names this node the project's home.
-func (a *NodeAgent) notHome(ctx context.Context, ref string, act peerapi.Action) error {
+// isHome reports whether the registry names this node the home of ref; a node with no id answers false.
+func (a *NodeAgent) isHome(ctx context.Context, ref string) (bool, error) {
 	self := a.self()
 	if self == "" {
-		return nil
+		return false, nil
 	}
 	p, err := a.o.Registry.GetProject(ctx, ref)
 	if err != nil {
+		return false, err
+	}
+	return p.NodeID == self, nil
+}
+
+// notHome refuses act on the replica of ref when the registry names this node the project's home.
+func (a *NodeAgent) notHome(ctx context.Context, ref string, act peerapi.Action) error {
+	home, err := a.isHome(ctx, ref)
+	if err != nil {
 		return err
 	}
-	if p.NodeID == self {
-		return fmt.Errorf("%w: cannot %s a replica of %s: %s is its home", lifecycle.ErrInvalidState, act, ref, self)
+	if home {
+		return fmt.Errorf("%w: cannot %s a replica of %s: %s is its home", lifecycle.ErrInvalidState, act, ref, a.self())
 	}
 	return nil
 }
@@ -800,7 +819,14 @@ func (a *NodeAgent) StartLocal(ctx context.Context) {
 			continue
 		}
 		unlock := a.lockRef(r.Ref)
-		t, err := a.target(ctx, r.Identifier, "", true)
+		// A cluster that is no standby of this replica was promoted, and the registry has not caught up
+		// (the daemon or the machine restarted between the promotion and the move of the home): starting
+		// it from the replica's spec would run a writable cluster on the replica port beside the real one.
+		err := a.checkStandbyData(r.Ref, r.Identifier)
+		var t lifecycle.ReplicaTarget
+		if err == nil {
+			t, err = a.target(ctx, r.Identifier, "", true)
+		}
 		if err == nil {
 			err = a.o.Plane.StartReplica(ctx, t)
 		}

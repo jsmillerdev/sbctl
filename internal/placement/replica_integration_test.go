@@ -493,13 +493,20 @@ func TestIntegrationReplicaBlocks(t *testing.T) {
 		t.Fatal("the standby accepted a write")
 	}
 
-	// 4. pg_cron and pg_net workers run on the primary and idle on the standby (spike S2).
-	const workers = `select count(*) from pg_stat_activity where backend_type ilike '%cron%' or backend_type ilike '%pg_net%'`
-	if n := e.count(prim.Postgres, workers); n == 0 {
-		t.Fatalf("the control failed: no pg_cron or pg_net worker on the primary: %s", e.text(prim.Postgres, `select string_agg(backend_type, ', ') from pg_stat_activity where backend_type <> 'client backend'`))
+	// 4. pg_cron and pg_net workers run on the primary and idle on the standby (spike S2). Each one is
+	// counted by itself: a primary that runs only one of them would prove nothing about the other.
+	workers := map[string]string{
+		"pg_cron": `select count(*) from pg_stat_activity where backend_type ilike '%pg_cron%'`,
+		"pg_net":  `select count(*) from pg_stat_activity where backend_type ilike '%pg_net%'`,
 	}
-	if n := e.count(repl.Postgres, workers); n != 0 {
-		t.Fatalf("%d pg_cron or pg_net workers on the standby: %s", n, e.text(repl.Postgres, `select string_agg(backend_type, ', ') from pg_stat_activity where backend_type <> 'client backend'`))
+	const backends = `select string_agg(backend_type, ', ') from pg_stat_activity where backend_type <> 'client backend'`
+	for _, name := range []string{"pg_cron", "pg_net"} {
+		if n := e.count(prim.Postgres, workers[name]); n == 0 {
+			t.Fatalf("the control failed: no %s worker on the primary: %s", name, e.text(prim.Postgres, backends))
+		}
+		if n := e.count(repl.Postgres, workers[name]); n != 0 {
+			t.Fatalf("%d %s workers on the standby: %s", n, name, e.text(repl.Postgres, backends))
+		}
 	}
 
 	// 5. PostgREST on the standby sees a DDL change within the reload interval (spike S3), reads the
@@ -585,6 +592,18 @@ func TestIntegrationReplicaBlocks(t *testing.T) {
 		}
 	}
 	e.exec(prim.Postgres, `insert into public.items values (2001, 'written on the new primary')`)
+	// The registry names the new home (design 2.10.3, step 5) before the old one is demoted: the agent
+	// refuses to demote the node the registry still names the home.
+	if err := e.nodeA.Registry.CreateNode(ctx, &registry.Node{ID: "n2", Name: "second", State: registry.NodeActive}); err != nil {
+		t.Fatal(err)
+	}
+	cl, err := e.nodeA.Registry.GetCluster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.nodeA.Registry.SetProjectNode(ctx, ref, "n2", cl.Epoch); err != nil {
+		t.Fatal(err)
+	}
 	// The new primary's PostgREST and GoTrue start on the canonical ports.
 	p, _ := e.nodeA.Registry.GetProject(ctx, ref)
 	if err := e.planeB.Start(ctx, p, keys); err != nil {
@@ -602,8 +621,13 @@ func TestIntegrationReplicaBlocks(t *testing.T) {
 		}
 		return ""
 	})
-	if n := e.count(prim.Postgres, workers); n == 0 {
-		t.Fatal("no pg_cron worker on the promoted cluster")
+	for _, name := range []string{"pg_cron", "pg_net"} {
+		eventually(t, time.Minute, name+" worker on the promoted cluster", func() string {
+			if n := e.count(prim.Postgres, workers[name]); n == 0 {
+				return e.text(prim.Postgres, backends)
+			}
+			return ""
+		})
 	}
 
 	// 7. The old primary becomes a standby of the new one, in place (design 2.10.3, step 7).

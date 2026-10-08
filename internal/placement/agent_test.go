@@ -587,6 +587,32 @@ func TestDoRunsTheReplicaActions(t *testing.T) {
 	}
 }
 
+// The registry names the new home before the old one is demoted: a demotion of the node the registry
+// still names the home would stop its primary.
+func TestDemoteIsRefusedWhileTheRegistryNamesThisNodeTheHome(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t)
+	id := testReplicaID()
+	if err := e.reg.SetProjectNode(ctx, testRef, "n2", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.a.Do(ctx, id, peerapi.ActionDemote, peerapi.InstanceAction{Epoch: 5}); !errors.Is(err, lifecycle.ErrInvalidState) || !strings.Contains(err.Error(), "n2 is still its home") {
+		t.Fatalf("a demotion of the home: %v", err)
+	}
+	if e.plane.all() != "" {
+		t.Fatalf("the plane was driven: %s", e.plane.all())
+	}
+	if err := e.reg.SetProjectNode(ctx, testRef, "n1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.a.Do(ctx, id, peerapi.ActionDemote, peerapi.InstanceAction{Epoch: 5}); err != nil {
+		t.Fatalf("a demotion once the home moved: %v", err)
+	}
+	if e.plane.all() != "demote "+testRef {
+		t.Fatalf("calls = %s", e.plane.all())
+	}
+}
+
 func TestDoRefusesWhileTheReplicaIsBeingSetUp(t *testing.T) {
 	ctx := context.Background()
 	e := newAgentEnv(t)
@@ -647,6 +673,54 @@ func TestStartLocalStartsTheCompleteReplicasOfThisNode(t *testing.T) {
 	// ObserveAll lists what the registry says this node holds.
 	if all := e.a.ObserveAll(ctx); len(all) != 1 || all[0].Identifier != id {
 		t.Fatalf("ObserveAll = %+v", all)
+	}
+}
+
+// A replica row that is still in the registry for a cluster that was promoted (the machine restarted
+// between the promotion and the move of the home) is not started from the replica's spec: the cluster
+// is the project's primary, and a writable cluster on the replica port would run beside the real one.
+func TestStartLocalLeavesAClusterThatIsNoStandbyOfTheReplica(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t)
+	id := testReplicaID()
+	if err := e.reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: testRef, NodeID: "n2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.reg.SetReplicaStatus(ctx, id, string(registry.StatusActiveHealthy), StepCompleted, ""); err != nil {
+		t.Fatal(err)
+	}
+	dir := e.cfg.Paths().PostgresData(testRef)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conninfo := func(name string) string {
+		return "primary_conninfo = 'host=127.0.0.1 port=1 application_name=''" + name + "'''\n"
+	}
+	write("PG_VERSION", "17\n")
+
+	// A promoted cluster: no standby.signal.
+	e.a.StartLocal(ctx)
+	if e.plane.all() != "" {
+		t.Fatalf("started a promoted cluster as a replica: %s", e.plane.all())
+	}
+	// A standby that follows as another replica.
+	write("standby.signal", "")
+	write("postgresql.auto.conf", conninfo(registry.ReplicaIdentifier(testRef, "us-east-1", "zzz999")))
+	e.a.StartLocal(ctx)
+	if e.plane.all() != "" {
+		t.Fatalf("started the standby of another replica: %s", e.plane.all())
+	}
+	// This replica's standby.
+	write("postgresql.auto.conf", conninfo(id))
+	e.a.StartLocal(ctx)
+	if e.plane.all() != "start "+testRef {
+		t.Fatalf("calls = %s", e.plane.all())
 	}
 }
 
