@@ -2,11 +2,9 @@ package app
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
-	"github.com/supavise/supavise/internal/api"
 	"github.com/supavise/supavise/internal/awsapi"
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
@@ -15,8 +13,8 @@ import (
 	failoveraws "github.com/supavise/supavise/internal/failover/aws"
 	"github.com/supavise/supavise/internal/failover/command"
 	"github.com/supavise/supavise/internal/mesh"
-	"github.com/supavise/supavise/internal/notimpl"
 	"github.com/supavise/supavise/internal/placement"
+	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
 )
 
@@ -26,41 +24,58 @@ import (
 //
 // It takes from the other hooks what only they can build, by interface type (Provide/Get):
 //
-//	required   mesh.Mesh, placement.InstanceOps (wireMesh, wirePlacement), failover.LocalPrimaries
-//	           (wirePlacement: the node's plane, with the final checkpoint of a stopped cluster)
-//	optional   failover.Fleet and failover.LocalServices (wireFleet: Realtime and Supavisor quiesce
-//	           and re-registration; the shared services as one unit of work), failover.Takeover
-//	           (the role change to leader; without it the hook waits for the membership to say so),
-//	           placement.BackupOps, replicas.Service, failover.Locker (the engine's project lock),
-//	           failover.ExtraChecks (what wireProxy and wireFleet add to the preflight of a server move)
+//	wireMesh       mesh.Mesh, cluster.Membership
+//	wirePlacement  placement.InstanceOps, placement.BackupOps, failover.LocalPrimaries (the node's plane,
+//	               with the final checkpoint of a stopped cluster)
+//	wireFleet      failover.Fleet (Realtime and Supavisor quiesce and re-registration), failover.LocalServices
+//	               (the shared services as one unit of work), and server checks (AddServerCheck)
+//	wireReplicas   replicas.Service
 //
-// A part that is missing makes the matching step of a move a no-op, except the required ones,
-// without which the hook is skipped as not implemented yet.
+// and provides the ports that are its own: failover.Locker (the project lock), failover.ExtraChecks (the
+// checks the hooks added) and failover.Takeover (below). A part that is missing is not a quiet
+// no-op: the hook switches the matching feature off with the reason (Wire.Off), and the wiring test
+// fails for a port that is neither provided nor off.
+//
+// A server move spans two processes. The survivor is a follower, so its daemon opens the registry
+// read-only and runs the shared services in follower mode; the move promotes its system cluster, and
+// the daemon notices and restarts (ErrRoleChanged), as it does on every role change. The first process
+// runs the move up to the promotion; Takeover.BecomeLeader hands it to the next one, which boots as the
+// leader and finishes it (resumeServerMove) once the shared services and the projects are up.
 func wireFailover(ctx context.Context, w *Wire) error {
 	members, ok := Get[cluster.Membership](w)
-	if !ok || len(members.Nodes()) < 2 {
-		return nil
+	if !ok || !w.clustered() {
+		return nil // a single server has nothing to fail over to
 	}
-	rpc, ok := Get[mesh.Mesh](w)
-	if !ok {
-		return notimpl.For("wire failover: no mesh")
-	}
+	rpc, _ := Get[mesh.Mesh](w)
 	ops, ok := Get[placement.InstanceOps](w)
 	if !ok {
-		return notimpl.For("wire failover: no placement.InstanceOps")
+		w.Off("failover.Service", "no placement.InstanceOps: the node cannot reach the replica instances")
+		return nil
 	}
 	local, ok := Get[failover.LocalPrimaries](w)
 	if !ok {
-		return notimpl.For("wire failover: no failover.LocalPrimaries")
+		w.Off("failover.Service", "no failover.LocalPrimaries: the node cannot stop or start its primaries")
+		return nil
 	}
 
 	cfg := w.Cfg
 	store := func() failover.Store { return w.Node.Registry }
+	handoff := &handoffTakeover{m: members, log: w.Log.With("component", "failover")}
+	locks := &projectLocker{reg: func() registry.Registry { return w.Node.Registry }}
+	extra := joinServerChecks(w.serverChecks)
+	Provide[failover.Locker](w, locks)
+	Provide[failover.ExtraChecks](w, extra)
+	Provide[failover.Takeover](w, handoff)
+
 	d := failover.Deps{
 		Cfg: cfg, Log: w.Log, Store: store, Members: members,
 		Instances:      ops,
 		LocalPrimaries: local,
 		Primaries:      failover.MeshPrimaries{Self: func() string { return members.Self().ID }, Local: local, RPC: rpc, Epoch: members.Epoch},
+		Locks:          locks,
+		Extra:          extra,
+		Takeover:       handoff,
+		Notify:         handoff.notify,
 	}
 	peers := failover.MeshPeers{RPC: rpc}
 	d.Peers, d.Leader = peers, peers
@@ -76,19 +91,10 @@ func wireFailover(ctx context.Context, w *Wire) error {
 	if r, ok := Get[replicas.Service](w); ok {
 		d.Replicas = r
 	}
-	if l, ok := Get[failover.Locker](w); ok {
-		d.Locks = l
-	}
-	if x, ok := Get[failover.ExtraChecks](w); ok {
-		d.Extra = x
-	}
-	if t, ok := Get[failover.Takeover](w); ok {
-		d.Takeover = t
+	if bs, ok := Get[*backup.Service](w); ok {
+		d.Marker = bs
 	} else {
-		d.Takeover = membershipTakeover{members}
-	}
-	if m, ok := w.API.Backups.(backup.EpochMarkerStore); ok {
-		d.Marker = m
+		w.Off("failover.Marker", "the backup service did not open: no leader marker is written or read, so a node that cannot reach its peers cannot learn that it was replaced")
 	}
 	d.Provider = failoverProvider(w, members, store)
 	d.PublicProbe = failover.PublicProbe(cfg.APIHost(), func(ctx context.Context) string {
@@ -103,8 +109,7 @@ func wireFailover(ctx context.Context, w *Wire) error {
 		return err
 	}
 	Provide[failover.Service](w, o)
-	api.SetFailoverSource(o)
-	w.OnStop(func() { api.SetFailoverSource(nil) })
+	w.API.Failover = o
 	for pattern, h := range o.PeerHandlers() {
 		mesh.Handle(pattern, h)
 	}
@@ -122,8 +127,12 @@ func wireFailover(ctx context.Context, w *Wire) error {
 		w.Log.Error("this node is fenced: no cluster starts as a primary until `supavise node rejoin`", "reason", res.Reason, "epoch", res.Epoch, "leader", res.Leader)
 	}
 
-	mon := failover.NewMonitor(o)
-	w.Go("failover monitor", func(ctx context.Context) error { mon.Run(ctx); return nil })
+	if reason, behind := hostBehind(w); behind {
+		w.Off("failover monitor", reason)
+	} else {
+		mon := failover.NewMonitor(o)
+		w.Go("failover monitor", func(ctx context.Context) error { mon.Run(ctx); return nil })
+	}
 	ctl := &failover.ControlServer{Svc: o, Log: w.Log}
 	// The socket is the CLI's way in; a path that is too long or a directory that cannot be written
 	// costs the CLI, not the node, so the failure is logged and the daemon goes on.
@@ -137,7 +146,58 @@ func wireFailover(ctx context.Context, w *Wire) error {
 		sweepDiverged(ctx, cfg, w)
 		return nil
 	})
+	w.Go("failover resume", func(ctx context.Context) error {
+		resumeServerMove(ctx, w, o, members)
+		return nil
+	})
 	return nil
+}
+
+// joinServerChecks makes the one failover.ExtraChecks of the checks the hooks added. A node whose hooks
+// added none still gets a function: the preflight asks it, and it answers with nothing.
+func joinServerChecks(parts []failover.ExtraChecks) failover.ExtraChecks {
+	return func(ctx context.Context, to registry.Node) []failover.Check {
+		var out []failover.Check
+		for _, p := range parts {
+			out = append(out, p(ctx, to)...)
+		}
+		return out
+	}
+}
+
+// resumeServerMove finishes a server move that the restart of the daemon cut short. A move that
+// promoted this node's system cluster belongs to the leader this node now is: the process that ran it
+// handed it over (handoffTakeover), and nothing else would continue it. It waits for the shared services
+// and the projects to be up, because the move registers the projects with them again. A move that stopped
+// earlier (before the promotion) is not resumed: this node is not the leader then, and `supavise
+// failover --resume` is the operator's call.
+func resumeServerMove(ctx context.Context, w *Wire, o failover.Service, m cluster.Membership) {
+	if !m.IsLeader() {
+		return
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case <-w.Ready():
+	}
+	pl, err := o.PlanServer(ctx, failover.ServerOptions{Resume: true})
+	if err != nil || pl == nil || pl.To != m.Self().ID || !hasPassed(pl, "unfinished move") {
+		return
+	}
+	w.Log.Info("finishing the server move this node was promoted by", "from", pl.From, "to", pl.To, "epoch", pl.Epoch)
+	if _, err := o.FailoverServer(ctx, failover.ServerOptions{Resume: true}); err != nil && ctx.Err() == nil {
+		w.Log.Error("the server move that promoted this node did not finish; run `supavise failover --resume`", "error", err)
+	}
+}
+
+// hasPassed reports whether the plan holds a passed check called name.
+func hasPassed(pl *failover.Plan, name string) bool {
+	for _, c := range pl.Checks {
+		if c.Name == name && c.OK {
+			return true
+		}
+	}
+	return false
 }
 
 // sweepDiverged removes the data directories that `node rejoin` and a failover set aside once
@@ -193,20 +253,4 @@ func failoverProvider(w *Wire, members cluster.Membership, store func() failover
 		return &command.Provider{FenceCommand: f.FenceCommand, TakeoverCommand: f.TakeoverCommand, Timeout: f.StopTimeout()}
 	}
 	return failover.Manual{}
-}
-
-// membershipTakeover waits for the membership to report this node as the leader at the epoch of
-// the move: the daemon notices that its system cluster is a primary and says so. A node whose
-// wiring has a richer Takeover (one that waits for the shared services too) provides it instead.
-type membershipTakeover struct{ m cluster.Membership }
-
-func (t membershipTakeover) BecomeLeader(ctx context.Context, epoch int64) error {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	for s := range t.m.Watch(ctx) {
-		if s.Role == cluster.RoleLeader && s.Leader == s.Self.ID && s.Epoch >= epoch {
-			return nil
-		}
-	}
-	return fmt.Errorf("the node did not become the leader before the wait ended")
 }

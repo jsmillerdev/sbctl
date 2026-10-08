@@ -10,6 +10,7 @@ import (
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
+	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -56,6 +57,8 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	node.Engine.SetRemoteNodes(router)
 	if localTimers != nil {
 		Provide[lifecycle.Timers](w, localTimers)
+	} else {
+		w.Off("lifecycle.Timers", "the node has no backup timers (supervisor "+w.Cfg.Supervisor+"); base backups are taken with `supavise backups create`")
 	}
 
 	agent := placement.NewNodeAgent(placement.AgentOptions{
@@ -87,18 +90,27 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	Provide[placement.InstanceOps](w, ops)
 	Provide[placement.BackupOps](w, ops)
 
-	// The replicas of this node start with the daemon, report to the leader and get their PostgREST's
-	// schema cache reloaded on a timer. The observation of the replicas and of the projects homed here
-	// is kept in memory and refreshed in the background, so that a report answers from it.
+	// The failover orchestrator's operations on the primaries of this node: the node's own plane, not the
+	// router, with the backup timers that stop and start with a primary.
+	Provide[failover.LocalPrimaries](w, &localPrimaries{
+		cfg: w.Cfg, plane: node.Plane, reg: func() registry.Registry { return node.Registry }, keys: node.Engine.Keys,
+		timers: localTimers, log: w.Log.With("component", "failover"), now: time.Now,
+	})
+
+	// The replicas of this node start with the daemon and report to the leader, and their PostgREST's
+	// schema cache gets reloaded on a timer. The observation of the replicas and of the projects homed
+	// here is kept in memory and refreshed in the background, so that a report answers from it. The
+	// report is the mesh's (cluster.Reporter, which the mesh hook runs): this adds the node's
+	// observations to it, so that one sender speaks for the node.
 	cache := &placement.ReportCache{Agent: agent, Projects: unlessLeader(mem, projectHealth(node.Registry, node.Plane, self))}
 	Provide[placement.Contribution](w, cache.Contribute)
-	reporter := &placement.Reporter{Members: mem, RPC: m, Agent: cache, Projects: cache.ProjectHealth}
+	if rep, ok := Get[*cluster.Reporter](w); ok {
+		rep.Add(cluster.Contributor(cache.Contribute))
+	} else {
+		w.Off("cluster.Reporter", "the mesh provided no reporter; this node's replicas and projects are not reported to the leader")
+	}
 	w.Go("replicas start", func(ctx context.Context) error { agent.StartLocal(ctx); return nil })
 	w.Go("replica report cache", func(ctx context.Context) error { cache.Run(ctx, 10*time.Second); return nil })
-	w.Go("replica report", func(ctx context.Context) error {
-		reporter.Run(ctx, 10*time.Second, func(err error) { w.Log.Warn("replica report", "error", err) })
-		return nil
-	})
 	w.Go("replica schema reload", func(ctx context.Context) error {
 		node.Plane.RunSchemaReload(ctx, w.Cfg.Replicas.SchemaReload(), func(ctx context.Context) ([]string, error) {
 			rs, err := node.Registry.ListReplicasOn(ctx, self())
@@ -210,11 +222,7 @@ func (l *lazyBackups) seed(ctx context.Context, plan lifecycle.ReplicaSeedPlan) 
 	if err != nil {
 		return err
 	}
-	rs, ok := any(s).(backup.ReplicaSeeder)
-	if !ok {
-		return errors.New("this release's backup service cannot seed a replica")
-	}
-	return rs.SeedReplica(ctx, backup.ReplicaSeedPlan(plan))
+	return s.SeedReplica(ctx, backup.ReplicaSeedPlan(plan))
 }
 
 func (l *lazyBackups) BaseBackupWith(ctx context.Context, ref string, bo backup.BackupOptions) (*registry.Backup, error) {

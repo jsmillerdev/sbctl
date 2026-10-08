@@ -55,5 +55,12 @@ func wireProxy(ctx context.Context, w *Wire) error {
 		c.Lag = proxy.ReplicaLag(svc, ms.IsLeader)
 	}
 	w.Proxy.Cluster = c
+	// The proxy serves <ref>-lb.api.<domain> once a project has a replica; Studio lists the endpoint
+	// only if the Management API says so.
+	w.API.LoadBalancers = true
+	// The proxy can tell whether the certificates it mirrored are the leader's; the preflight of a
+	// server move does not ask yet, because the proxy offers no such question (proxy.CertSync has no
+	// state to read).
+	w.Off("failover.CertificateCheck", "the proxy does not report whether its mirror of the leader's certificates is current; a server move does not check it")
 	return nil
 }

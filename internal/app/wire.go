@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"sync"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/supavise/supavise/internal/api"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/notimpl"
 	"github.com/supavise/supavise/internal/placement"
@@ -58,6 +60,16 @@ type Wire struct {
 	runners []namedRunner
 	stops   []func()
 	values  map[reflect.Type]any
+	// off are the features a hook switched off, with the reason (Off).
+	off map[string]string
+	// ready is closed when the shared services and the projects have started (Ready).
+	ready     chan struct{}
+	readyOnce sync.Once
+	// fleetMu serializes the changes to the shared services' units: startFleet at boot and the role
+	// reconciliation that wireFleet runs when the node's role changes.
+	fleetMu sync.Mutex
+	// serverChecks are the preflight checks of a server move that the hooks add (AddServerCheck).
+	serverChecks []failover.ExtraChecks
 }
 
 type namedRunner struct {
@@ -66,7 +78,7 @@ type namedRunner struct {
 }
 
 func newWire(cfg *config.Config, log *slog.Logger, node *lifecycle.Node, o Options, apiDeps *api.Deps, popts *proxy.Options) *Wire {
-	w := &Wire{Cfg: cfg, Log: log, Node: node, Options: o, API: apiDeps, Proxy: popts, values: map[reflect.Type]any{}}
+	w := &Wire{Cfg: cfg, Log: log, Node: node, Options: o, API: apiDeps, Proxy: popts, values: map[reflect.Type]any{}, ready: make(chan struct{})}
 	// What a node that is not in a cluster has: itself as the leader, and the registry's answers
 	// about where projects live (all on this node).
 	Provide[placement.Resolver](w, placement.RegistryResolver{Reg: node.Registry})
@@ -75,6 +87,19 @@ func newWire(cfg *config.Config, log *slog.Logger, node *lifecycle.Node, o Optio
 	}
 	return w
 }
+
+// Ready is closed once the daemon has started the shared services and every project that should run, or
+// has stopped trying. Work that needs them (a move that registers a project with the pooler again)
+// waits for it; it never closes on a daemon that stops first, so such work also watches its context.
+func (w *Wire) Ready() <-chan struct{} { return w.ready }
+
+// markReady closes Ready. Serve calls it once.
+func (w *Wire) markReady() { w.readyOnce.Do(func() { close(w.ready) }) }
+
+// AddServerCheck adds checks to the preflight of a server move (failover.ExtraChecks): what only the
+// part that owns the matter can tell, such as whether the shared services' artifacts are in place.
+// wireFailover joins them into the one ExtraChecks the orchestrator takes.
+func (w *Wire) AddServerCheck(c failover.ExtraChecks) { w.serverChecks = append(w.serverChecks, c) }
 
 // Go registers fn to run in the daemon's group of goroutines once the hooks are done. fn gets a
 // context that ends when the daemon stops; its error stops the daemon.
@@ -109,6 +134,7 @@ func (w *Wire) run(ctx context.Context) error {
 			return fmt.Errorf("serve: %s: %w", h.name, err)
 		}
 	}
+	w.verifyPorts()
 	return nil
 }
 

@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,7 +16,6 @@ import (
 	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
-	"github.com/supavise/supavise/internal/notimpl"
 	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -73,24 +71,40 @@ func TestWireFailoverDoesNothingWithoutACluster(t *testing.T) {
 	}
 }
 
-// A cluster whose other hooks are not there yet: skipped as not implemented, like the other hooks.
+// A cluster whose other hooks did not provide what the orchestrator needs: the hook does not start, and
+// says which port is missing and why, so that the wiring test and the log name it.
 func TestWireFailoverNamesWhatItIsMissing(t *testing.T) {
 	w := testWire(t)
 	Provide[cluster.Membership](w, twoNodes(t, w))
-	err := wireFailover(context.Background(), w)
-	if !errors.Is(err, notimpl.Err) || !strings.Contains(err.Error(), "mesh") {
-		t.Fatalf("error: %v", err)
+	// No mesh: this node has no cluster, whatever the membership says.
+	if err := wireFailover(context.Background(), w); err != nil {
+		t.Fatal(err)
+	}
+	if _, off := w.offReason("failover.Service"); off {
+		t.Fatal("a node with no mesh switched failover off with a reason, as if it had a cluster")
 	}
 	Provide[mesh.Mesh](w, stubMesh{})
-	if err := wireFailover(context.Background(), w); !errors.Is(err, notimpl.Err) || !strings.Contains(err.Error(), "InstanceOps") {
-		t.Fatalf("error: %v", err)
+	if err := wireFailover(context.Background(), w); err != nil {
+		t.Fatal(err)
+	}
+	if r, off := w.offReason("failover.Service"); !off || !strings.Contains(r, "InstanceOps") {
+		t.Fatalf("reason %q", r)
 	}
 	Provide[placement.InstanceOps](w, stubOps{})
-	if err := wireFailover(context.Background(), w); !errors.Is(err, notimpl.Err) || !strings.Contains(err.Error(), "LocalPrimaries") {
-		t.Fatalf("error: %v", err)
+	if err := wireFailover(context.Background(), w); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := w.offReason("failover.Service"); !strings.Contains(r, "LocalPrimaries") {
+		t.Fatalf("reason %q", r)
 	}
 	if len(w.runners) != 0 {
-		t.Fatal("a hook that was skipped started something")
+		t.Fatal("a hook that was switched off started something")
+	}
+	if _, ok := Get[failover.Service](w); ok {
+		t.Fatal("a service without its ports")
+	}
+	if got := w.unaccounted(); len(got) == 0 {
+		t.Fatal("ports missing and nothing says so")
 	}
 }
 
@@ -116,6 +130,8 @@ func TestWireFailoverBuildsTheOrchestratorAndServesTheCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
+	mesh.ResetDefaultMux()
+	t.Cleanup(mesh.ResetDefaultMux)
 	w := testWire(t)
 	w.Cfg.StateDir = dir
 	w.Cfg.Fleet.StorageBackend = "s3"
@@ -131,12 +147,15 @@ func TestWireFailoverBuildsTheOrchestratorAndServesTheCLI(t *testing.T) {
 	if !ok {
 		t.Fatal("no failover.Service was provided")
 	}
-	if len(w.runners) != 3 {
+	if len(w.runners) != 4 {
 		var names []string
 		for _, r := range w.runners {
 			names = append(names, r.name)
 		}
-		t.Fatalf("runners: %v, want the monitor, the control socket and the janitor", names)
+		t.Fatalf("runners: %v, want the monitor, the control socket, the janitor and the resume of a move", names)
+	}
+	if w.API.Failover == nil {
+		t.Fatal("the Management API was not given the orchestrator")
 	}
 	// The peer endpoints are on the mesh.
 	have := map[string]bool{}

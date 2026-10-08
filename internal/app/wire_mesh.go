@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -21,7 +22,6 @@ import (
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
-	"github.com/supavise/supavise/internal/notimpl"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/units"
 	"github.com/supavise/supavise/internal/versions"
@@ -85,12 +85,7 @@ func (l *lazyMarker) store(ctx context.Context) (backup.EpochMarkerStore, error)
 			l.err = err
 			return
 		}
-		m, ok := any(svc).(backup.EpochMarkerStore)
-		if !ok {
-			l.err = errors.New("the backup service keeps no leader marker")
-			return
-		}
-		l.m = m
+		l.m = svc
 	})
 	return l.m, l.err
 }
@@ -150,15 +145,16 @@ func AWSIdentity(ctx context.Context, cfg *config.Config) *registry.NodeAWS {
 	return n
 }
 
-// openFollower makes lo open the registry the way a standby's daemon must: read-only, with no
-// Migrate and no advisory locks (registry.OpenReadOnly). lifecycle.OpenOptions has no such option
-// yet, and a follower cannot run until it has: the node role is decided here and the registry
-// handle is the engine's to open. The workstream that adds the option (replica data plane,
-// lifecycle) sets it in this function; until then a follower stops with this error rather than
-// opening a standby with a registry that tries to migrate it.
+// openFollower makes lo open the registry the way a standby's daemon must: read-only, through the
+// standby's socket, with no Migrate and no advisory locks (lifecycle.OpenOptions.ReadOnly). The Engine
+// of a follower is read-only too: it starts and recovers only what is homed on this node and writes
+// nothing to the registry. The boot decision supplies the socket that answered its role probe.
 func openFollower(lo *lifecycle.OpenOptions, boot cluster.BootDecision) error {
-	_ = lo
-	return notimpl.For("opening the registry read-only on a follower (lifecycle.OpenOptions)")
+	lo.ReadOnly = true
+	if lo.RegistryDSN == "" {
+		lo.RegistryDSN = boot.DSN
+	}
+	return nil
 }
 
 // serveFenced is the daemon of a node that was replaced as leader. It starts no primary: it records
@@ -254,13 +250,21 @@ func peersFromLocalRegistry(ctx context.Context, boot cluster.BootDecision, log 
 
 // wireMesh starts the peer server on [node] peer_listen, the sessions to the other nodes and the
 // forwarder reconciler (design 2.5), and provides mesh.Mesh and cluster.Membership. It also
-// registers the peer API endpoints of the mesh itself (ping, join, certs, config, report intake) with
-// mesh.Handle. On a node with no cluster it does nothing but wait for a cluster identity to appear.
+// registers the peer API endpoints of the mesh itself (ping, join, rejoin, certificate renewal, config,
+// report intake) with mesh.Handle; the certificate store is wireProxy's. On a node with no cluster it
+// does nothing but wait for a cluster identity to appear.
 func wireMesh(ctx context.Context, w *Wire) error {
 	mesh.ResetDefaultMux()
 	boot, _ := Get[cluster.BootDecision](w)
 	dir := config.ClusterDir(w.Options.ConfigPath)
 	if !boot.Joined {
+		// A host that has not run `supavise system converge` for this release lacks what a cluster needs
+		// (the peer port in the firewall, the directories the daemon writes): the cluster features stay
+		// off until it has and the daemon restarted (design 2.15.1).
+		if reason, behind := hostBehind(w); behind {
+			w.Off("cluster", reason)
+			return nil
+		}
 		// `supavise node token` gives the founding server its certificate; the daemon restarts to
 		// become the leader of a cluster. Until then nothing changes.
 		w.Go("cluster identity", func(ctx context.Context) error {
@@ -361,9 +365,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		},
 	}
 	if bs, ok := Get[*backup.Service](w); ok {
-		if e, ok := any(bs).(backup.BaseBackupEnsurer); ok {
-			auth.Ensure = e
-		}
+		auth.Ensure = bs
 	}
 	reports := cluster.NewReports()
 
@@ -399,7 +401,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		}
 		return peerapi.Ping{Node: selfID, Epoch: live.Epoch(), Leader: leader, Version: w.Options.Version, Schema: schema.get(), Health: verdict}
 	}
-	(&cluster.PeerAPI{Authority: auth, Topology: live, Cfg: cfg, Reports: reports, Ping: ping}).Register(mesh.DefaultMux)
+	registerPeerAPI(&cluster.PeerAPI{Authority: auth, Topology: live, Cfg: cfg, Reports: reports, Ping: ping}, mesh.Handle, peerAPIServedByOthers...)
 
 	fwd := &mesh.Forwarders{Cfg: cfg, Topology: live, Source: reg, Dialer: mgr, Log: log, Fenced: func() bool { return live.Role() == cluster.RoleFenced }}
 	reporter := &cluster.Reporter{
@@ -446,6 +448,27 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		}
 	})
 	return nil
+}
+
+// peerAPIServedByOthers are endpoints cluster.PeerAPI registers that another hook serves with its own
+// handler: GET /peer/v1/certs is the proxy's (proxy.CertsHandler, which also answers the etag query
+// of proxy.MeshCerts with a 304). mesh.Handle panics on a pattern registered twice, which would stop
+// every cluster node at start.
+var peerAPIServedByOthers = []string{"GET " + peerapi.PathCerts}
+
+// registerPeerAPI registers the membership endpoints with handle, except the patterns in skip. The
+// endpoints are collected on a mux of their own first, because cluster.PeerAPI registers on a
+// *mesh.Mux and cannot leave one out; each kept pattern is then handed to that mux, which routes the
+// request to the same handler again.
+func registerPeerAPI(api *cluster.PeerAPI, handle func(pattern string, fn mesh.HandlerFunc), skip ...string) {
+	own := mesh.NewMux()
+	api.Register(own)
+	for _, p := range own.Patterns() {
+		if slices.Contains(skip, p) {
+			continue
+		}
+		handle(p, own.ServeHTTP)
+	}
 }
 
 // certRenewalBlocked raises the alert that the node certificate cannot be renewed (err is why) or
