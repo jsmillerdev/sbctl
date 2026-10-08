@@ -1,0 +1,56 @@
+{
+  "ChangeSetName": "supavise-update-20261008T120000Z",
+  "StackName": "supavise",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Remove",
+        "LogicalResourceId": "FencingPolicy",
+        "ResourceType": "AWS::IAM::Policy",
+        "PhysicalResourceId": "supav-Fenc-ABCDEFGH",
+        "Scope": [],
+        "Details": []
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Remove",
+        "LogicalResourceId": "PeerIngress1",
+        "ResourceType": "AWS::EC2::SecurityGroupIngress",
+        "PhysicalResourceId": "x-PeerIngress1",
+        "Scope": [],
+        "Details": []
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "Instance",
+        "ResourceType": "AWS::EC2::Instance",
+        "Replacement": "False",
+        "PhysicalResourceId": "i-0123456789abcdef0",
+        "Scope": [
+          "Tags"
+        ],
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Tags",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          }
+        ]
+      }
+    }
+  ],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}

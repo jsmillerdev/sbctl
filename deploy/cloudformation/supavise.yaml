@@ -1,11 +1,13 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Supavise: multi-project Supabase on one Ubuntu 24.04 instance. Only an admin email is required.
-  Creates the instance, an Elastic IP, an encrypted XFS data volume, a backup bucket, a security
-  group, a least-privilege instance role and a Secrets Manager secret that holds the one-time
-  claim token. A daily snapshot of the data volume (7 kept by default) protects the node's files
-  between database backups. A domain with a Route 53 hosted zone is optional. Deleting the stack
-  keeps the backup bucket and a final snapshot of the data volume.
+  Creates the instance, an Elastic IP, an encrypted XFS data volume, a backup bucket, an objects
+  bucket for Storage with a role that reaches it, a security group, a least-privilege instance role
+  and a Secrets Manager secret that holds the one-time claim token. A daily snapshot of the data
+  volume (7 kept by default) protects the node's files between database backups. A domain with a
+  Route 53 hosted zone is optional. Peer rules, failover permissions and the replica server
+  settings are off until asked for. Deleting the stack keeps both buckets and a final snapshot of
+  the data volume.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -20,8 +22,12 @@ Metadata:
         Parameters: [AccessCidr, EnableSessionManager, SshCidr, KeyName]
       - Label: { default: "Master key copy (optional; leave empty to run escrow-key yourself)" }
         Parameters: [KeyEscrowPassphrase]
+      - Label: { default: "Peer servers and failover (optional; all off by default)" }
+        Parameters: [ClusterName, Failover, PeerCidr1, PeerCidr2, PeerCidr3]
+      - Label: { default: "Replica server (fill in only to join an existing Supavise cluster; supavise-aws-deploy.sh replica does)" }
+        Parameters: [JoinLeader, JoinTokenSecretArn, BackupBucketName, BackupBucketRegion, ObjectsBucketName, StorageRoleArn]
       - Label: { default: "Advanced (leave empty unless you know you need them)" }
-        Parameters: [VpcId, SubnetId, AmiId, DataSnapshotId]
+        Parameters: [VpcId, SubnetId, AvailabilityZone, AmiId, DataSnapshotId]
     ParameterLabels:
       AdminEmail: { default: Admin email }
       InstanceType: { default: Instance type }
@@ -37,8 +43,20 @@ Metadata:
       KeyName: { default: EC2 key pair for SSH }
       VpcId: { default: Existing VPC }
       SubnetId: { default: Existing public subnet }
+      AvailabilityZone: { default: Availability zone of the new subnet }
       AmiId: { default: Ubuntu 24.04 image ID }
       DataSnapshotId: { default: Snapshot to restore the data volume from }
+      ClusterName: { default: Cluster name (empty = the stack name) }
+      Failover: { default: Let this server take over from its peer (on/off) }
+      PeerCidr1: { default: Peer server 1 may reach the mesh port from }
+      PeerCidr2: { default: Peer server 2 may reach the mesh port from }
+      PeerCidr3: { default: Peer server 3 may reach the mesh port from }
+      JoinLeader: { default: Leader to join (host:7443; empty = a stack of its own) }
+      JoinTokenSecretArn: { default: Secrets Manager secret that holds the join token }
+      BackupBucketName: { default: Leader's backup bucket }
+      BackupBucketRegion: { default: Region of the leader's backup bucket }
+      ObjectsBucketName: { default: Leader's objects bucket }
+      StorageRoleArn: { default: Leader's Storage role }
 
 Parameters:
   AdminEmail:
@@ -168,6 +186,16 @@ Parameters:
     Default: ""
     AllowedPattern: "^$|^subnet-[0-9a-f]{8,17}$"
     Description: A public subnet (one that routes to an internet gateway) of that VPC.
+  AvailabilityZone:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z]{2}(-[a-z]+)+-[0-9][a-z]$"
+    ConstraintDescription: Enter a zone name such as us-east-1b, or leave it empty.
+    Description: >-
+      Zone of the subnet that the stack creates. Empty takes the first zone of the region. Set it
+      when creating a replica server in another zone of the same region; the data volume follows the
+      instance. Changing it on a stack that exists replaces the subnet, which an update refuses.
+      Give it only without VpcId and SubnetId: an existing subnet has its zone already.
   # Empty means: the newest Canonical Ubuntu 24.04 image of the instance's architecture, looked up
   # by CloudFormation through the public SSM parameter. CloudFormation may look it up again on an
   # update (this has not been checked in AWS); if it does and Canonical has published a newer
@@ -195,6 +223,94 @@ Parameters:
       Restore the data volume from the final snapshot of an earlier stack (its master key,
       registry and projects come back). Leave empty for a new node. Set it only when creating a
       stack, and keep it on later updates. DataVolumeSize must be at least the snapshot's size.
+  ClusterName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[A-Za-z0-9][A-Za-z0-9._:=+@-]{0,127}$"
+    ConstraintDescription: "Enter at most 128 letters, digits and the characters . _ - : = + @, starting with a letter or digit, or leave it empty."
+    Description: >-
+      Names the servers of one Supavise cluster: it is the supavise:cluster tag of their instances,
+      Elastic IPs and instance roles, and the failover permissions test it. Empty uses the stack
+      name. A replica server uses the name of the leader's stack (the leader's ClusterName output).
+      Give each independent deployment in one AWS account its own name: stack names repeat across
+      regions, and the failover permissions and the Storage role trust the name in every region.
+      Whoever may tag an instance role of the account (iam:TagRole) with this name, and may assume
+      roles, can reach the objects bucket and the fencing permissions of the cluster.
+  Failover:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: >-
+      "on" lets this server stop a peer server of the same cluster and move the service address to
+      itself (automatic failover). It adds a policy to the instance role that allows
+      ec2:StopInstances, ec2:AssociateAddress and ec2:DisassociateAddress on resources that carry
+      this cluster's tag, and three read-only EC2 describe calls. "off" adds nothing. A principal
+      that may tag an instance role of the account (iam:TagRole) can give it the cluster's tag, so
+      that permission is equivalent to these.
+  PeerCidr1:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.4/32, or leave it empty.
+    Description: >-
+      Optional source range for port 7443, the port the Supavise servers of a cluster use to talk
+      to each other. Use the peer's Elastic IP as a /32. Empty opens nothing.
+  PeerCidr2:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.4/32, or leave it empty.
+    Description: A second source range for port 7443. Larger clusters use one covering range instead.
+  PeerCidr3:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Enter an IPv4 CIDR range such as 203.0.113.4/32, or leave it empty.
+    Description: A third source range for port 7443.
+  JoinLeader:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?:[0-9]{1,5}$"
+    ConstraintDescription: Enter host:port such as 203.0.113.50:7443, or leave it empty.
+    Description: >-
+      Address of the leader server of an existing cluster, host:7443. Giving it makes this stack a
+      replica server that joins that cluster at first boot; the buckets, the Storage role and the
+      join token below come from the leader. Empty makes an ordinary stack. supavise-aws-deploy.sh
+      replica fills these in.
+  JoinTokenSecretArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$"
+    ConstraintDescription: Enter the ARN of a Secrets Manager secret, or leave it empty.
+    Description: >-
+      Secrets Manager secret, in this region, whose value is the join token that supavise node token
+      printed on the leader. The instance role may read exactly this secret.
+  BackupBucketName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Enter an S3 bucket name, or leave it empty.
+    Description: The leader's backup bucket (its BackupBucket output). The replica server reads and writes it with its instance role.
+  BackupBucketRegion:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z]{2}(-[a-z]+)+-[0-9]+$"
+    ConstraintDescription: Enter a region name such as us-east-1, or leave it empty.
+    Description: Region of the leader's backup bucket.
+  ObjectsBucketName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Enter an S3 bucket name, or leave it empty.
+    Description: The leader's objects bucket (its ObjectsBucket output), shown in this stack's outputs. Storage reaches it through the leader's Storage role.
+  StorageRoleArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$"
+    ConstraintDescription: Enter the ARN of an IAM role, or leave it empty.
+    Description: >-
+      The leader's Storage role (its StorageRoleArn output). The instance role may assume exactly this
+      role; the role trusts the roles of this cluster by their supavise:cluster tag.
 
 Rules:
   ZoneNeedsDomain:
@@ -207,6 +323,33 @@ Rules:
     Assertions:
       - Assert: !And [!Not [!Equals [!Ref VpcId, ""]], !Not [!Equals [!Ref SubnetId, ""]]]
         AssertDescription: Give both the VPC and the subnet, or neither.
+  ZoneNeedsNewSubnet:
+    RuleCondition: !Not [!Equals [!Ref AvailabilityZone, ""]]
+    Assertions:
+      - Assert: !Equals [!Ref VpcId, ""]
+        AssertDescription: The zone is for the subnet this stack creates; an existing subnet has its zone already.
+  ReplicaNeedsItsInputs:
+    RuleCondition: !Not [!Equals [!Ref JoinLeader, ""]]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref JoinTokenSecretArn, ""]]
+          - !Not [!Equals [!Ref BackupBucketName, ""]]
+          - !Not [!Equals [!Ref BackupBucketRegion, ""]]
+          - !Not [!Equals [!Ref ObjectsBucketName, ""]]
+          - !Not [!Equals [!Ref StorageRoleArn, ""]]
+        AssertDescription: A replica server needs the join token secret, the leader's two buckets and its Storage role.
+      - Assert: !And [!Equals [!Ref HostedZoneId, ""], !Equals [!Ref KeyEscrowPassphrase, ""]]
+        AssertDescription: A replica server makes no DNS records and takes no key passphrase; the domain and the master key reach it through the join.
+  LeaderInputsNeedAReplica:
+    RuleCondition: !Equals [!Ref JoinLeader, ""]
+    Assertions:
+      - Assert: !And
+          - !Equals [!Ref JoinTokenSecretArn, ""]
+          - !Equals [!Ref BackupBucketName, ""]
+          - !Equals [!Ref BackupBucketRegion, ""]
+          - !Equals [!Ref ObjectsBucketName, ""]
+          - !Equals [!Ref StorageRoleArn, ""]
+        AssertDescription: The join token secret, the bucket names and the Storage role belong to a replica server; give JoinLeader too, or leave them empty.
 
 # The image architecture follows the instance type, so there is no separate architecture choice
 # to get wrong. The value is the directory name in Canonical's public SSM parameter path.
@@ -241,6 +384,15 @@ Conditions:
   SessionManagerOn: !Equals [!Ref EnableSessionManager, "true"]
   CreateNetwork: !Equals [!Ref VpcId, ""]
   IsLatest: !Equals [!Ref SupaviseVersion, latest]
+  IsJoiner: !Not [!Equals [!Ref JoinLeader, ""]]
+  NotJoiner: !Equals [!Ref JoinLeader, ""]
+  HasAvailabilityZone: !Not [!Equals [!Ref AvailabilityZone, ""]]
+  HasClusterName: !Not [!Equals [!Ref ClusterName, ""]]
+  FailoverOn: !Equals [!Ref Failover, "on"]
+  HasPeerCidr1: !Not [!Equals [!Ref PeerCidr1, ""]]
+  HasPeerCidr2: !Not [!Equals [!Ref PeerCidr2, ""]]
+  HasPeerCidr3: !Not [!Equals [!Ref PeerCidr3, ""]]
+  HasAnyPeerCidr: !Or [!Condition HasPeerCidr1, !Condition HasPeerCidr2, !Condition HasPeerCidr3]
 
 Resources:
   # ---- network (only when no existing VPC is given) ------------------------------------
@@ -269,7 +421,7 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: 10.77.0.0/24
-      AvailabilityZone: !Select [0, !GetAZs ""]
+      AvailabilityZone: !If [HasAvailabilityZone, !Ref AvailabilityZone, !Select [0, !GetAZs ""]]
       MapPublicIpOnLaunch: true
       Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
   RouteTable:
@@ -318,11 +470,45 @@ Resources:
       ToPort: 22
       CidrIp: !Ref SshCidr
       Description: SSH
+  # The mesh port of the Supavise servers of one cluster. Separate resources, not entries of the
+  # group above, so that adding a peer never changes the group the instance is attached to.
+  PeerIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasPeerCidr1
+    Properties:
+      GroupId: !GetAtt SecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 7443
+      ToPort: 7443
+      CidrIp: !Ref PeerCidr1
+      Description: Supavise mesh (peer server 1)
+  PeerIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasPeerCidr2
+    Properties:
+      GroupId: !GetAtt SecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 7443
+      ToPort: 7443
+      CidrIp: !Ref PeerCidr2
+      Description: Supavise mesh (peer server 2)
+  PeerIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasPeerCidr3
+    Properties:
+      GroupId: !GetAtt SecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 7443
+      ToPort: 7443
+      CidrIp: !Ref PeerCidr3
+      Description: Supavise mesh (peer server 3)
 
   # ---- storage -------------------------------------------------------------------------
-  # Backups outlive the stack: deleting the stack keeps the bucket (and its WAL archive).
+  # Backups outlive the stack: deleting the stack keeps the bucket (and its WAL archive). A replica
+  # server uses the leader's buckets and makes none.
   BackupBucket:
     Type: AWS::S3::Bucket
+    Condition: NotJoiner
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Metadata:
@@ -353,6 +539,7 @@ Resources:
             NoncurrentVersionExpiration: { NoncurrentDays: 30 }
   BackupBucketPolicy:
     Type: AWS::S3::BucketPolicy
+    Condition: NotJoiner
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
@@ -365,6 +552,57 @@ Resources:
             Principal: "*"
             Action: "s3:*"
             Resource: [!GetAtt BackupBucket.Arn, !Sub "${BackupBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # What Storage keeps for every project once it runs on S3 instead of files (server failover needs
+  # it). Retained like the backup bucket; versioning is the protection the nightly copy of the
+  # Storage files gives on the file backend. Nothing writes to it until Storage is moved to S3.
+  ObjectsBucket:
+    Type: AWS::S3::Bucket
+    Condition: NotJoiner
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: No log bucket exists; CloudTrail data events cover object access when wanted.
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+  ObjectsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: NotJoiner
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref ObjectsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ObjectsBucket.Arn, !Sub "${ObjectsBucket.Arn}/*"]
             Condition: { Bool: { "aws:SecureTransport": "false" } }
 
   # Holds the master key, the registry and every project. Deleting the stack, or replacing this
@@ -443,6 +681,7 @@ Resources:
   # so a stack of the same name could not be created again for 30 days.
   ClaimTokenSecret:
     Type: AWS::SecretsManager::Secret
+    Condition: NotJoiner
     Metadata:
       checkov:
         skip:
@@ -468,13 +707,21 @@ Resources:
       SecretString: !Ref KeyEscrowPassphrase
 
   # ---- identity ------------------------------------------------------------------------
+  # The tag is what the failover permissions and the Storage role test, so that a server created
+  # later, in another stack or region, is covered without naming it.
   InstanceRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn-lint:
+        config:
+          # BackupBucketName defaults to "" and is used only when JoinLeader is given.
+          ignore_checks: [W1031]
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: "sts:AssumeRole" }
+      Tags: [{ Key: "supavise:cluster", Value: !If [HasClusterName, !Ref ClusterName, !Ref "AWS::StackName"] }]
       Policies:
         - PolicyName: backup-bucket
           PolicyDocument:
@@ -482,17 +729,20 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: ["s3:ListBucket", "s3:GetBucketLocation", "s3:ListBucketMultipartUploads"]
-                Resource: !GetAtt BackupBucket.Arn
+                Resource: !If [IsJoiner, !Sub "arn:${AWS::Partition}:s3:::${BackupBucketName}", !GetAtt BackupBucket.Arn]
               - Effect: Allow
                 Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
-                Resource: !Sub "${BackupBucket.Arn}/*"
-        - PolicyName: claim-token-secret
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: "secretsmanager:PutSecretValue"
-                Resource: !Ref ClaimTokenSecret
+                Resource: !If [IsJoiner, !Sub "arn:${AWS::Partition}:s3:::${BackupBucketName}/*", !Sub "${BackupBucket.Arn}/*"]
+        - !If
+          - NotJoiner
+          - PolicyName: claim-token-secret
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: "secretsmanager:PutSecretValue"
+                  Resource: !Ref ClaimTokenSecret
+          - !Ref "AWS::NoValue"
   # The passphrase secret: read it once, replace it once, and nothing else. Optional like the secret.
   KeyEscrowPolicy:
     Type: AWS::IAM::Policy
@@ -506,6 +756,104 @@ Resources:
           - Effect: Allow
             Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
             Resource: !Ref KeyEscrowSecret
+  # Storage runs without the instance role (the metadata service is denied to it). The daemon
+  # assumes this role for it and hands it the short-lived credentials, so that no access key exists
+  # for the objects bucket. Its own role by ARN; the roles (never users) of the other servers of the
+  # cluster by their supavise:cluster tag, because those are made later in other stacks.
+  StorageRole:
+    Type: AWS::IAM::Role
+    Condition: NotJoiner
+    Properties:
+      Description: Short-lived access to the objects bucket, assumed by the Supavise daemon for the Storage service.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !GetAtt InstanceRole.Arn }
+            Action: "sts:AssumeRole"
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals: { "aws:PrincipalTag/supavise:cluster": !If [HasClusterName, !Ref ClusterName, !Ref "AWS::StackName"] }
+              ArnLike: { "aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*" }
+      Policies:
+        - PolicyName: objects-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:ListBucket", "s3:GetBucketLocation"]
+                Resource: !GetAtt ObjectsBucket.Arn
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
+                Resource: !Sub "${ObjectsBucket.Arn}/*"
+  # The instance role may assume the Storage role and no other role. A separate policy, because the
+  # role above names the instance role and an inline policy would make the two wait for each other.
+  StorageAssumePolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      cfn-lint:
+        config:
+          # StorageRoleArn defaults to "" and is used only when JoinLeader is given.
+          ignore_checks: [W1031]
+    Properties:
+      PolicyName: storage-role
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "sts:AssumeRole"
+            Resource: !If [IsJoiner, !Sub "${StorageRoleArn}", !GetAtt StorageRole.Arn]
+  # A replica server reads the secret that holds its join token, and nothing else of Secrets Manager.
+  JoinTokenPolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsJoiner
+    Metadata:
+      cfn-lint:
+        config:
+          # JoinTokenSecretArn defaults to "" and the rule ReplicaNeedsItsInputs makes it an ARN here.
+          ignore_checks: [W1031]
+    Properties:
+      PolicyName: join-token-secret
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "secretsmanager:GetSecretValue"
+            Resource: !Sub "${JoinTokenSecretArn}"
+  # Automatic failover: stop a peer, move the service address. Only for resources that carry this
+  # cluster's tag, so a compromised node cannot touch anything else in the account. The describe
+  # calls accept no resource. Off unless Failover is "on".
+  FencingPolicy:
+    Type: AWS::IAM::Policy
+    Condition: FailoverOn
+    Properties:
+      PolicyName: failover-fencing
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Describe
+            Effect: Allow
+            Action: ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus", "ec2:DescribeAddresses"]
+            Resource: "*"
+          - Sid: StopClusterPeer
+            Effect: Allow
+            Action: "ec2:StopInstances"
+            Resource: !Sub "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*"
+            Condition:
+              StringEquals: { "aws:ResourceTag/supavise:cluster": !If [HasClusterName, !Ref ClusterName, !Ref "AWS::StackName"] }
+          - Sid: MoveServiceAddress
+            Effect: Allow
+            Action: ["ec2:AssociateAddress", "ec2:DisassociateAddress"]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:elastic-ip/*"
+              - !Sub "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*"
+            Condition:
+              StringEquals: { "aws:ResourceTag/supavise:cluster": !If [HasClusterName, !Ref ClusterName, !Ref "AWS::StackName"] }
   # DNS-01 certificates: change TXT records named _acme-challenge.<something under the domain>
   # in the one hosted zone and nothing else. The A records are the stack's own (DnsRecords). The
   # instance role is also what an attacker who reaches the instance metadata service would hold,
@@ -572,7 +920,9 @@ Resources:
     Type: AWS::EC2::EIP
     Properties:
       Domain: vpc
-      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}" }
+        - { Key: "supavise:cluster", Value: !If [HasClusterName, !Ref ClusterName, !Ref "AWS::StackName"] }
   ElasticIpAssociation:
     Type: AWS::EC2::EIPAssociation
     Properties:
@@ -618,228 +968,335 @@ Resources:
           AssociatePublicIpAddress: true
           SubnetId: !If [CreateNetwork, !Ref Subnet, !Ref SubnetId]
           GroupSet: [!GetAtt SecurityGroup.GroupId]
+          # A replica server takes the service address on a second private address and keeps its own
+          # Elastic IP on the first.
+          SecondaryPrivateIpAddressCount: !If [IsJoiner, 1, !Ref "AWS::NoValue"]
       MetadataOptions:
         HttpTokens: required
         HttpEndpoint: enabled
         HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: enabled
       BlockDeviceMappings:
         - DeviceName: /dev/sda1
           Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
-      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}" }]
+      # What the node reads from the instance metadata (no IAM): internal/infra.
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}" }
+        - { Key: "supavise:cluster", Value: !If [HasClusterName, !Ref ClusterName, !Ref "AWS::StackName"] }
+        - { Key: "supavise:stack-name", Value: !Ref "AWS::StackName" }
+        - { Key: "supavise:infra", Value: "2" }
+        - { Key: "supavise:eip", Value: !GetAtt ElasticIp.AllocationId }
+        - { Key: "supavise:storage-role", Value: !If [IsJoiner, !Ref StorageRoleArn, !GetAtt StorageRole.Arn] }
+        - Key: "supavise:caps"
+          Value: !Join
+            - ""
+            - - "tags,storage-role"
+              - !If [FailoverOn, ",fencing", ""]
+              - !If [HasAnyPeerCidr, ",peer-rule", ""]
+              - !If [IsJoiner, ",replica-server", ""]
+        - !If
+          - IsJoiner
+          - { Key: "supavise:leader", Value: !Ref JoinLeader }
+          - !Ref "AWS::NoValue"
       UserData:
-        Fn::Base64: !Sub
-          - |
-            #!/bin/bash
-            # supavise first boot: data volume, installer, claim token, signal. Logs: /var/log/supavise-bootstrap.log
-            # The log is created 0600 before anything is written: it must not be readable by the
-            # tenant-facing services that run on this host. The installer prints no secret when it
-            # is given --claim-token-file, and cloud-init copies this output to the console log.
-            install -m 0600 /dev/null /var/log/supavise-bootstrap.log
-            exec > >(tee -a /var/log/supavise-bootstrap.log) 2>&1
-            set -uo pipefail
-            export DEBIAN_FRONTEND=noninteractive
-            # The key escrow passphrase, when there is one, is written to this file for the installer. It
-            # is removed whichever way the script ends (and no command here prints it or runs with -x).
-            trap 'shred -u /root/key-passphrase 2>/dev/null || rm -f /root/key-passphrase' EXIT
-            # The snap fallback below installs the AWS CLI to /snap/bin, which cloud-init's PATH lacks.
-            export PATH="$PATH:/snap/bin"
-            HANDLE_URL='${InstallHandle}'
-            REGION='${AWS::Region}'
+        Fn::Base64: !If
+          - IsJoiner
+          - !Sub
+            - |
+              #!/bin/bash
+              # supavise replica server first boot: join the cluster, signal. Logs: /var/log/supavise-bootstrap.log
+              # The log is created 0600 before anything is written: the services that run tenant code must not
+              # read it. The join token goes into a file only root can read, removed whichever way the script ends.
+              install -m 0600 /dev/null /var/log/supavise-bootstrap.log
+              exec > >(tee -a /var/log/supavise-bootstrap.log) 2>&1
+              set -uo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              trap 'shred -u /root/join-token 2>/dev/null || rm -f /root/join-token' EXIT
+              export PATH="$PATH:/snap/bin"
+              HANDLE_URL='${InstallHandle}'
+              REGION='${AWS::Region}'
+              # deploy/release-assets.sh puts the release's public key here. A template that was not taken from
+              # a release has no key and stops before it runs anything it downloaded.
+              RELEASE_KEY_B64='__SUPAVISE_RELEASE_PUBKEY_B64__'
 
-            signal() { # SUCCESS|FAILURE reason
-              local status=$1 reason=$2
-              if command -v cfn-signal >/dev/null; then
-                if [ "$status" = SUCCESS ]; then cfn-signal -s true -r "$reason" "$HANDLE_URL" && return 0
-                else cfn-signal -s false -r "$reason" "$HANDLE_URL" && return 0; fi
-              fi
-              # The signal is a JSON document PUT to the pre-signed handle URL, which is all cfn-signal does.
-              curl -fsS -X PUT -H 'Content-Type:' --data-binary \
-                "{\"Status\":\"$status\",\"Reason\":\"$reason\",\"UniqueId\":\"supavise\",\"Data\":\"$reason\"}" "$HANDLE_URL"
-            }
-            fail() { echo "FAILED: $*"; signal FAILURE "$* (see /var/log/supavise-bootstrap.log on the instance)"; exit 1; }
-            step() { echo "==> $*"; }
+              signal() { # SUCCESS|FAILURE reason
+                curl -fsS -X PUT -H 'Content-Type:' --data-binary \
+                  "{\"Status\":\"$1\",\"Reason\":\"$2\",\"UniqueId\":\"supavise\",\"Data\":\"$2\"}" "$HANDLE_URL"
+              }
+              fail() { echo "FAILED: $*"; signal FAILURE "$* (see /var/log/supavise-bootstrap.log on the instance)"; exit 1; }
+              step() { echo "==> $*"; }
 
-            step "waiting for the network"
-            for i in $(seq 1 60); do curl -fsS -m 5 -o /dev/null https://checkip.amazonaws.com && break; sleep 5; done
-            # The Elastic IP is attached shortly after launch and replaces the launch address;
-            # carry on only once the instance answers from it.
-            for i in $(seq 1 60); do
-              [ "$(curl -fsS -m 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')" = '${ElasticIp}' ] && break
-              sleep 5
-            done
-
-            step "installing packages"
-            apt-get update -qq || fail "apt-get update"
-            apt-get install -y -qq xfsprogs curl ca-certificates openssl python3-venv || fail "apt-get install"
-            apt-get install -y -qq awscli || snap install aws-cli --classic || fail "cannot install the AWS CLI"
-            if [ ! -x /usr/local/bin/cfn-signal ] && ! command -v cfn-signal >/dev/null; then
-              python3 -m venv /opt/aws-cfn \
-                && /opt/aws-cfn/bin/pip install -q https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz \
-                && ln -sf /opt/aws-cfn/bin/cfn-signal /usr/local/bin/cfn-signal \
-                || echo "cfn-bootstrap not installed; signalling with curl"
-            fi
-
-            step "preparing the data volume (XFS at /var/lib/supavise)"
-            # The volume is attached after the instance is created and shows up as a second NVMe
-            # disk. The disk that holds / is the root volume; the other EBS disk is the data volume.
-            ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -n1)
-            DEV=""
-            for i in $(seq 1 120); do
-              for link in /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_*; do
-                [ -e "$link" ] || continue
-                case "$link" in *-part*) continue ;; esac
-                d=$(readlink -f "$link")
-                [ "$(basename "$d")" = "$ROOT_DISK" ] && continue
-                DEV=$d
+              step "waiting for the network"
+              for i in $(seq 1 60); do curl -fsS -m 5 -o /dev/null https://checkip.amazonaws.com && break; sleep 5; done
+              for i in $(seq 1 60); do
+                [ "$(curl -fsS -m 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')" = '${ElasticIp}' ] && break
+                sleep 5
               done
-              [ -n "$DEV" ] && break
-              sleep 5
-            done
-            [ -n "$DEV" ] || fail "the data volume did not appear"
-            if ! blkid "$DEV" >/dev/null 2>&1; then mkfs.xfs -L supavise "$DEV" || fail "mkfs.xfs"; fi
-            mkdir -p /var/lib/supavise
-            # prjquota turns on XFS project quotas, which is what lets a project have a disk size of
-            # its own (the Compute and Disk page, `supavise` disk limits); without it the size shown
-            # is the whole volume and cannot be changed per project. Quotas can only be switched on
-            # when the file system is mounted, so a volume restored from a snapshot gets them here too.
-            if ! grep -q ' /var/lib/supavise ' /etc/fstab; then
-              echo "UUID=$(blkid -s UUID -o value "$DEV") /var/lib/supavise xfs defaults,nofail,prjquota 0 2" >> /etc/fstab
-            fi
-            mountpoint -q /var/lib/supavise || mount /var/lib/supavise || fail "mount /var/lib/supavise"
-            # A volume restored from a smaller snapshot comes up with the snapshot's file system size.
-            xfs_growfs /var/lib/supavise >/dev/null 2>&1 || echo "xfs_growfs skipped"
-            # If the volume is missing at a later boot, the daemon and the system Postgres must fail
-            # rather than start against an empty /var/lib/supavise on the root disk (nofail only keeps
-            # the boot itself going).
-            for u in supavise.service supavise-postgres@.service; do
-              mkdir -p "/etc/systemd/system/$u.d"
-              printf '[Unit]\nRequiresMountsFor=/var/lib/supavise\n' > "/etc/systemd/system/$u.d/10-supavise-data-mount.conf"
-            done
-            systemctl daemon-reload
 
-            step "keeping the node's state on the data volume"
-            # /etc/supavise holds the master key (it unseals every secret in the registry) and
-            # config.toml. On the root volume they would be lost with the instance, and the
-            # data volume's secrets with them. Bind /etc/supavise to the data volume before the
-            # installer writes anything, and give a replacement instance the same owner uid
-            # so that the files on the volume stay readable.
-            mkdir -p /var/lib/supavise/etc /etc/supavise
-            mountpoint -q /etc/supavise || mount --bind /var/lib/supavise/etc /etc/supavise || fail "bind-mount /etc/supavise"
-            grep -q ' /etc/supavise ' /etc/fstab \
-              || echo '/var/lib/supavise/etc /etc/supavise none bind,nofail,x-systemd.requires-mounts-for=/var/lib/supavise 0 0' >> /etc/fstab
-            OWNER_UID=$(stat -c %u /var/lib/supavise); OWNER_GID=$(stat -c %g /var/lib/supavise)
-            if [ "$OWNER_UID" != 0 ] && ! id supavise >/dev/null 2>&1; then
-              # The volume already holds an install (an instance that was replaced): recreate the user
-              # with the uid that owns the files. The installer then runs as a repair and keeps the master key.
-              echo "the data volume holds an earlier install (owner uid $OWNER_UID): repairing it, keeping the master key"
-              # The ids come from the old instance; a package on this image may have taken one of them.
-              # Stop with the reason: units run as User=supavise Group=supavise, so a different primary group
-              # or a different uid would leave the volume unreadable. Fix: chown -R the volume to a free
-              # uid and gid, then update the stack again.
-              HOLDER=$(getent group "$OWNER_GID" | cut -d: -f1)
-              if [ -n "$HOLDER" ] && [ "$HOLDER" != supavise ]; then
-                fail "gid $OWNER_GID of the data volume is taken by group $HOLDER on this image"
+              step "installing packages"
+              apt-get update -qq || fail "apt-get update"
+              apt-get install -y -qq xfsprogs curl ca-certificates openssl || fail "apt-get install"
+              apt-get install -y -qq awscli || snap install aws-cli --classic || fail "cannot install the AWS CLI"
+
+              step "downloading and verifying the installer"
+              REL='${ReleaseBase}'
+              mkdir -p /root/supavise-release
+              cd /root/supavise-release || fail "cannot enter /root/supavise-release"
+              for f in install.sh SHA256SUMS SHA256SUMS.sig; do
+                curl -fsSL --retry 5 -o "$f" "$REL/$f" || fail "cannot download $REL/$f"
+              done
+              printf '%s' "$RELEASE_KEY_B64" | base64 -d > release.pem 2>/dev/null
+              openssl pkey -pubin -in release.pem -noout 2>/dev/null \
+                || fail "this template holds no release key: use the supavise.yaml attached to a Supavise release"
+              openssl pkeyutl -verify -rawin -pubin -inkey release.pem -sigfile SHA256SUMS.sig -in SHA256SUMS >/dev/null 2>&1 \
+                || fail "the signature of SHA256SUMS does not verify against the release key"
+              grep -E '^[0-9a-f]{64} [ *]install\.sh$' SHA256SUMS | sha256sum -c - >/dev/null 2>&1 \
+                || fail "install.sh does not match the signed checksum list"
+
+              step "reading the join token"
+              # ${JoinTokenPolicy} is attached by now; IAM can take a moment to show it to this instance.
+              got=0
+              for i in $(seq 1 12); do
+                if (umask 077; aws secretsmanager get-secret-value --region "$REGION" --secret-id '${JoinTokenSecretArn}' \
+                  --query SecretString --output text > /root/join-token); then got=1; break; fi
+                sleep 5
+              done
+              [ "$got" = 1 ] || fail "cannot read the join token secret"
+
+              step "joining the cluster"
+              set -- --email '${AdminEmail}' --s3-bucket '${BackupBucketName}' --s3-region '${BackupBucketRegion}' --public-ip '${ElasticIp}' \
+                --aws-first-boot --join-token-file /root/join-token --firewall none
+              case "$REGION" in
+                us-west-1|us-west-2|us-east-1|us-east-2|ca-central-1|eu-west-1|eu-west-2|eu-west-3|eu-central-1|eu-central-2|eu-north-1|ap-south-1|ap-southeast-1|ap-northeast-1|ap-northeast-2|ap-southeast-2|sa-east-1)
+                  set -- "$@" --region "$REGION" ;;
+              esac
+              ${VersionArgs}
+              bash install.sh "$@" || fail "the supavise installer failed"
+              cd / && rm -rf /root/supavise-release
+
+              step "done"
+              signal SUCCESS "supavise joined the cluster"
+            - ReleaseBase: !If
+                - IsLatest
+                - https://github.com/supavise/supavise/releases/latest/download
+                - !Sub "https://github.com/supavise/supavise/releases/download/${SupaviseVersion}"
+              VersionArgs: !If
+                - IsLatest
+                - "true"
+                - !Sub "set -- \"$@\" --version '${SupaviseVersion}'"
+          - !Sub
+            - |
+              #!/bin/bash
+              # supavise first boot: data volume, installer, claim token, signal. Logs: /var/log/supavise-bootstrap.log
+              # The log is created 0600 before anything is written: it must not be readable by the
+              # tenant-facing services that run on this host. The installer prints no secret when it
+              # is given --claim-token-file, and cloud-init copies this output to the console log.
+              install -m 0600 /dev/null /var/log/supavise-bootstrap.log
+              exec > >(tee -a /var/log/supavise-bootstrap.log) 2>&1
+              set -uo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              # The key escrow passphrase, when there is one, is written to this file for the installer. It
+              # is removed whichever way the script ends (and no command here prints it or runs with -x).
+              trap 'shred -u /root/key-passphrase 2>/dev/null || rm -f /root/key-passphrase' EXIT
+              # The snap fallback below installs the AWS CLI to /snap/bin, which cloud-init's PATH lacks.
+              export PATH="$PATH:/snap/bin"
+              HANDLE_URL='${InstallHandle}'
+              REGION='${AWS::Region}'
+
+              signal() { # SUCCESS|FAILURE reason
+                local status=$1 reason=$2
+                if command -v cfn-signal >/dev/null; then
+                  if [ "$status" = SUCCESS ]; then cfn-signal -s true -r "$reason" "$HANDLE_URL" && return 0
+                  else cfn-signal -s false -r "$reason" "$HANDLE_URL" && return 0; fi
+                fi
+                # The signal is a JSON document PUT to the pre-signed handle URL, which is all cfn-signal does.
+                curl -fsS -X PUT -H 'Content-Type:' --data-binary \
+                  "{\"Status\":\"$status\",\"Reason\":\"$reason\",\"UniqueId\":\"supavise\",\"Data\":\"$reason\"}" "$HANDLE_URL"
+              }
+              fail() { echo "FAILED: $*"; signal FAILURE "$* (see /var/log/supavise-bootstrap.log on the instance)"; exit 1; }
+              step() { echo "==> $*"; }
+
+              step "waiting for the network"
+              for i in $(seq 1 60); do curl -fsS -m 5 -o /dev/null https://checkip.amazonaws.com && break; sleep 5; done
+              # The Elastic IP is attached shortly after launch and replaces the launch address;
+              # carry on only once the instance answers from it.
+              for i in $(seq 1 60); do
+                [ "$(curl -fsS -m 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')" = '${ElasticIp}' ] && break
+                sleep 5
+              done
+
+              step "installing packages"
+              apt-get update -qq || fail "apt-get update"
+              apt-get install -y -qq xfsprogs curl ca-certificates openssl python3-venv || fail "apt-get install"
+              apt-get install -y -qq awscli || snap install aws-cli --classic || fail "cannot install the AWS CLI"
+              if [ ! -x /usr/local/bin/cfn-signal ] && ! command -v cfn-signal >/dev/null; then
+                python3 -m venv /opt/aws-cfn \
+                  && /opt/aws-cfn/bin/pip install -q https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz \
+                  && ln -sf /opt/aws-cfn/bin/cfn-signal /usr/local/bin/cfn-signal \
+                  || echo "cfn-bootstrap not installed; signalling with curl"
               fi
-              if [ -z "$HOLDER" ]; then
-                getent group supavise >/dev/null && fail "group supavise exists with another gid than the volume's $OWNER_GID"
-                groupadd --system --gid "$OWNER_GID" supavise || fail "cannot create group supavise with gid $OWNER_GID"
+
+              step "preparing the data volume (XFS at /var/lib/supavise)"
+              # The volume is attached after the instance is created and shows up as a second NVMe
+              # disk. The disk that holds / is the root volume; the other EBS disk is the data volume.
+              ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -n1)
+              DEV=""
+              for i in $(seq 1 120); do
+                for link in /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_*; do
+                  [ -e "$link" ] || continue
+                  case "$link" in *-part*) continue ;; esac
+                  d=$(readlink -f "$link")
+                  [ "$(basename "$d")" = "$ROOT_DISK" ] && continue
+                  DEV=$d
+                done
+                [ -n "$DEV" ] && break
+                sleep 5
+              done
+              [ -n "$DEV" ] || fail "the data volume did not appear"
+              if ! blkid "$DEV" >/dev/null 2>&1; then mkfs.xfs -L supavise "$DEV" || fail "mkfs.xfs"; fi
+              mkdir -p /var/lib/supavise
+              # prjquota turns on XFS project quotas, which is what lets a project have a disk size of
+              # its own (the Compute and Disk page, `supavise` disk limits); without it the size shown
+              # is the whole volume and cannot be changed per project. Quotas can only be switched on
+              # when the file system is mounted, so a volume restored from a snapshot gets them here too.
+              if ! grep -q ' /var/lib/supavise ' /etc/fstab; then
+                echo "UUID=$(blkid -s UUID -o value "$DEV") /var/lib/supavise xfs defaults,nofail,prjquota 0 2" >> /etc/fstab
               fi
-              HOLDER=$(getent passwd "$OWNER_UID" | cut -d: -f1)
-              if [ -n "$HOLDER" ]; then
-                fail "uid $OWNER_UID of the data volume is taken by user $HOLDER on this image"
+              mountpoint -q /var/lib/supavise || mount /var/lib/supavise || fail "mount /var/lib/supavise"
+              # A volume restored from a smaller snapshot comes up with the snapshot's file system size.
+              xfs_growfs /var/lib/supavise >/dev/null 2>&1 || echo "xfs_growfs skipped"
+              # If the volume is missing at a later boot, the daemon and the system Postgres must fail
+              # rather than start against an empty /var/lib/supavise on the root disk (nofail only keeps
+              # the boot itself going).
+              for u in supavise.service supavise-postgres@.service; do
+                mkdir -p "/etc/systemd/system/$u.d"
+                printf '[Unit]\nRequiresMountsFor=/var/lib/supavise\n' > "/etc/systemd/system/$u.d/10-supavise-data-mount.conf"
+              done
+              systemctl daemon-reload
+
+              step "keeping the node's state on the data volume"
+              # /etc/supavise holds the master key (it unseals every secret in the registry) and
+              # config.toml. On the root volume they would be lost with the instance, and the
+              # data volume's secrets with them. Bind /etc/supavise to the data volume before the
+              # installer writes anything, and give a replacement instance the same owner uid
+              # so that the files on the volume stay readable.
+              mkdir -p /var/lib/supavise/etc /etc/supavise
+              mountpoint -q /etc/supavise || mount --bind /var/lib/supavise/etc /etc/supavise || fail "bind-mount /etc/supavise"
+              grep -q ' /etc/supavise ' /etc/fstab \
+                || echo '/var/lib/supavise/etc /etc/supavise none bind,nofail,x-systemd.requires-mounts-for=/var/lib/supavise 0 0' >> /etc/fstab
+              OWNER_UID=$(stat -c %u /var/lib/supavise); OWNER_GID=$(stat -c %g /var/lib/supavise)
+              if [ "$OWNER_UID" != 0 ] && ! id supavise >/dev/null 2>&1; then
+                # The volume already holds an install (an instance that was replaced): recreate the user
+                # with the uid that owns the files. The installer then runs as a repair and keeps the master key.
+                echo "the data volume holds an earlier install (owner uid $OWNER_UID): repairing it, keeping the master key"
+                # The ids come from the old instance; a package on this image may have taken one of them.
+                # Stop with the reason: units run as User=supavise Group=supavise, so a different primary group
+                # or a different uid would leave the volume unreadable. Fix: chown -R the volume to a free
+                # uid and gid, then update the stack again.
+                HOLDER=$(getent group "$OWNER_GID" | cut -d: -f1)
+                if [ -n "$HOLDER" ] && [ "$HOLDER" != supavise ]; then
+                  fail "gid $OWNER_GID of the data volume is taken by group $HOLDER on this image"
+                fi
+                if [ -z "$HOLDER" ]; then
+                  getent group supavise >/dev/null && fail "group supavise exists with another gid than the volume's $OWNER_GID"
+                  groupadd --system --gid "$OWNER_GID" supavise || fail "cannot create group supavise with gid $OWNER_GID"
+                fi
+                HOLDER=$(getent passwd "$OWNER_UID" | cut -d: -f1)
+                if [ -n "$HOLDER" ]; then
+                  fail "uid $OWNER_UID of the data volume is taken by user $HOLDER on this image"
+                fi
+                useradd --system --uid "$OWNER_UID" --gid "$OWNER_GID" --home-dir /var/lib/supavise --no-create-home \
+                  --shell /usr/sbin/nologin supavise || fail "cannot recreate the supavise user with uid $OWNER_UID"
               fi
-              useradd --system --uid "$OWNER_UID" --gid "$OWNER_GID" --home-dir /var/lib/supavise --no-create-home \
-                --shell /usr/sbin/nologin supavise || fail "cannot recreate the supavise user with uid $OWNER_UID"
-            fi
-            for u in supavise.service supavise-postgres@.service; do
-              printf '[Unit]\nRequiresMountsFor=/etc/supavise\n' > "/etc/systemd/system/$u.d/20-supavise-etc-mount.conf"
-            done
-            systemctl daemon-reload
+              for u in supavise.service supavise-postgres@.service; do
+                printf '[Unit]\nRequiresMountsFor=/etc/supavise\n' > "/etc/systemd/system/$u.d/20-supavise-etc-mount.conf"
+              done
+              systemctl daemon-reload
 
-            step "downloading the installer"
-            REL='${ReleaseBase}'
-            curl -fsSL --retry 5 -o /root/supavise-install.sh "$REL/install.sh" || fail "cannot download $REL/install.sh"
+              step "downloading the installer"
+              REL='${ReleaseBase}'
+              curl -fsSL --retry 5 -o /root/supavise-install.sh "$REL/install.sh" || fail "cannot download $REL/install.sh"
 
-            step "running the installer"
-            set -- --email '${AdminEmail}' --s3-bucket '${BackupBucket}' --s3-region "$REGION" --public-ip '${ElasticIp}' \
-              --claim-token-file /root/claim-token --firewall none
-            case "$REGION" in
-              us-west-1|us-west-2|us-east-1|us-east-2|ca-central-1|eu-west-1|eu-west-2|eu-west-3|eu-central-1|eu-central-2|eu-north-1|ap-south-1|ap-southeast-1|ap-northeast-1|ap-northeast-2|ap-southeast-2|sa-east-1)
-                set -- "$@" --region "$REGION" ;;
-            esac
-            ${DomainArgs}
-            ${VersionArgs}
-            ${KeyEscrowFetch}
-            bash /root/supavise-install.sh "$@" || fail "the supavise installer failed"
+              step "running the installer"
+              set -- --email '${AdminEmail}' --s3-bucket '${BackupBucket}' --s3-region "$REGION" --public-ip '${ElasticIp}' \
+                --claim-token-file /root/claim-token --firewall none
+              case "$REGION" in
+                us-west-1|us-west-2|us-east-1|us-east-2|ca-central-1|eu-west-1|eu-west-2|eu-west-3|eu-central-1|eu-central-2|eu-north-1|ap-south-1|ap-southeast-1|ap-northeast-1|ap-northeast-2|ap-southeast-2|sa-east-1)
+                  set -- "$@" --region "$REGION" ;;
+              esac
+              ${DomainArgs}
+              ${VersionArgs}
+              ${KeyEscrowFetch}
+              bash /root/supavise-install.sh "$@" || fail "the supavise installer failed"
 
-            step "storing the claim token"
-            if [ -s /root/claim-token ]; then
-              # From a file, not argv: command lines are readable by every process on the host.
-              (umask 077; tr -d '[:space:]' < /root/claim-token > /root/claim-token.secret)
-              aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
-                --secret-string file:///root/claim-token.secret >/dev/null || fail "cannot write the claim token secret"
-              shred -u /root/claim-token /root/claim-token.secret 2>/dev/null || rm -f /root/claim-token /root/claim-token.secret
-            elif [ "$(sudo -u supavise supavise claim status 2>/dev/null)" = claimed ]; then
-              # No token comes from a repair of a data volume that already holds this node's
-              # administrator. Replace the placeholder so that the secret does not promise a
-              # token that never arrives. An unclaimed node is left alone: the secret may hold
-              # the only copy of its live token (the installer keeps just a hash).
-              aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
-                --secret-string 'No claim token was issued: this node already has an administrator, who still works. To get a token, run on the instance: sudo -u supavise supavise claim token (add --force when an administrator exists).' \
-                >/dev/null || echo "could not update the claim token secret"
-            fi
-            rm -f /root/supavise-install.sh
-            ${KeyEscrowDone}
+              step "storing the claim token"
+              if [ -s /root/claim-token ]; then
+                # From a file, not argv: command lines are readable by every process on the host.
+                (umask 077; tr -d '[:space:]' < /root/claim-token > /root/claim-token.secret)
+                aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
+                  --secret-string file:///root/claim-token.secret >/dev/null || fail "cannot write the claim token secret"
+                shred -u /root/claim-token /root/claim-token.secret 2>/dev/null || rm -f /root/claim-token /root/claim-token.secret
+              elif [ "$(sudo -u supavise supavise claim status 2>/dev/null)" = claimed ]; then
+                # No token comes from a repair of a data volume that already holds this node's
+                # administrator. Replace the placeholder so that the secret does not promise a
+                # token that never arrives. An unclaimed node is left alone: the secret may hold
+                # the only copy of its live token (the installer keeps just a hash).
+                aws secretsmanager put-secret-value --region "$REGION" --secret-id '${ClaimTokenSecret}' \
+                  --secret-string 'No claim token was issued: this node already has an administrator, who still works. To get a token, run on the instance: sudo -u supavise supavise claim token (add --force when an administrator exists).' \
+                  >/dev/null || echo "could not update the claim token secret"
+              fi
+              rm -f /root/supavise-install.sh
+              ${KeyEscrowDone}
 
-            step "done"
-            signal SUCCESS "supavise is installed"
-          - ReleaseBase: !If
-              - IsLatest
-              - https://github.com/supavise/supavise/releases/latest/download
-              - !Sub "https://github.com/supavise/supavise/releases/download/${SupaviseVersion}"
-            DomainArgs: !If
-              - HasZone
-              - !Sub "set -- \"$@\" --domain '${DomainName}' --dns route53 --dns-credential 'hosted_zone_id=${HostedZoneId}' --dns-credential \"region=$REGION\""
-              - !If
-                  - HasDomain
-                  - !Sub "set -- \"$@\" --domain '${DomainName}'"
-                  - "true"
-            VersionArgs: !If
-              - IsLatest
-              - "true"
-              - !Sub "set -- \"$@\" --version '${SupaviseVersion}'"
-            # An instance that is replaced in the same stack finds the note in the secret: the master key
-            # is already escrowed (it is on the data volume and in the bucket), so it installs without one.
-            KeyEscrowFetch: !If
-              - HasKeyEscrow
-              - !Sub |
-                  step "reading the key escrow passphrase"
-                  # ${KeyEscrowPolicy} is attached by now; IAM can take a moment to show it to this instance.
-                  got=0
-                  for i in $(seq 1 12); do
-                    if (umask 077; aws secretsmanager get-secret-value --region "$REGION" --secret-id '${KeyEscrowSecret}' \
-                      --query SecretString --output text > /root/key-passphrase); then got=1; break; fi
-                    sleep 5
-                  done
-                  [ "$got" = 1 ] || fail "cannot read the key escrow secret"
-                  if [ "$(head -c 9 /root/key-passphrase)" = 'ESCROWED:' ]; then
-                    echo "the key escrow passphrase was used on an earlier install of this stack: no new copy of the key"
-                    rm -f /root/key-passphrase
-                  else
-                    set -- "$@" --key-passphrase-file /root/key-passphrase
-                  fi
-              - "true"
-            KeyEscrowDone: !If
-              - HasKeyEscrow
-              - !Sub |
-                  if [ -s /root/key-passphrase ]; then
-                    step "removing the key escrow passphrase from Secrets Manager"
-                    aws secretsmanager put-secret-value --region "$REGION" --secret-id '${KeyEscrowSecret}' \
-                      --secret-string 'ESCROWED: the master key was copied to the backup bucket, encrypted with the passphrase you gave as KeyEscrowPassphrase. This note replaced the passphrase, which nothing on the node keeps.' \
-                      >/dev/null || echo "could not replace the passphrase in Secrets Manager: overwrite the secret by hand"
-                    shred -u /root/key-passphrase 2>/dev/null || rm -f /root/key-passphrase
-                  fi
-              - "true"
+              step "done"
+              signal SUCCESS "supavise is installed"
+            - ReleaseBase: !If
+                - IsLatest
+                - https://github.com/supavise/supavise/releases/latest/download
+                - !Sub "https://github.com/supavise/supavise/releases/download/${SupaviseVersion}"
+              DomainArgs: !If
+                - HasZone
+                - !Sub "set -- \"$@\" --domain '${DomainName}' --dns route53 --dns-credential 'hosted_zone_id=${HostedZoneId}' --dns-credential \"region=$REGION\""
+                - !If
+                    - HasDomain
+                    - !Sub "set -- \"$@\" --domain '${DomainName}'"
+                    - "true"
+              VersionArgs: !If
+                - IsLatest
+                - "true"
+                - !Sub "set -- \"$@\" --version '${SupaviseVersion}'"
+              # An instance that is replaced in the same stack finds the note in the secret: the master key
+              # is already escrowed (it is on the data volume and in the bucket), so it installs without one.
+              KeyEscrowFetch: !If
+                - HasKeyEscrow
+                - !Sub |
+                    step "reading the key escrow passphrase"
+                    # ${KeyEscrowPolicy} is attached by now; IAM can take a moment to show it to this instance.
+                    got=0
+                    for i in $(seq 1 12); do
+                      if (umask 077; aws secretsmanager get-secret-value --region "$REGION" --secret-id '${KeyEscrowSecret}' \
+                        --query SecretString --output text > /root/key-passphrase); then got=1; break; fi
+                      sleep 5
+                    done
+                    [ "$got" = 1 ] || fail "cannot read the key escrow secret"
+                    if [ "$(head -c 9 /root/key-passphrase)" = 'ESCROWED:' ]; then
+                      echo "the key escrow passphrase was used on an earlier install of this stack: no new copy of the key"
+                      rm -f /root/key-passphrase
+                    else
+                      set -- "$@" --key-passphrase-file /root/key-passphrase
+                    fi
+                - "true"
+              KeyEscrowDone: !If
+                - HasKeyEscrow
+                - !Sub |
+                    if [ -s /root/key-passphrase ]; then
+                      step "removing the key escrow passphrase from Secrets Manager"
+                      aws secretsmanager put-secret-value --region "$REGION" --secret-id '${KeyEscrowSecret}' \
+                        --secret-string 'ESCROWED: the master key was copied to the backup bucket, encrypted with the passphrase you gave as KeyEscrowPassphrase. This note replaced the passphrase, which nothing on the node keeps.' \
+                        >/dev/null || echo "could not replace the passphrase in Secrets Manager: overwrite the secret by hand"
+                      shred -u /root/key-passphrase 2>/dev/null || rm -f /root/key-passphrase
+                    fi
+                - "true"
 
   # DNS records, when the stack owns the zone. The wildcard covers every project.
   DnsRecords:
@@ -862,12 +1319,15 @@ Outputs:
     Description: Management API (Supabase CLI --profile api_url, MCP --api-url).
     Value: !If [HasDomain, !Sub "https://api.${DomainName}", !Sub "https://api.${ElasticIp}.sslip.io"]
   ClaimUrl:
+    Condition: NotJoiner
     Description: The claim page. Enter the token from ClaimTokenCommand there.
     Value: !If [HasDomain, !Sub "https://api.${DomainName}/claim", !Sub "https://api.${ElasticIp}.sslip.io/claim"]
   ClaimTokenCommand:
+    Condition: NotJoiner
     Description: Run this once to print the one-time claim token (needs the AWS CLI and read access to the secret).
     Value: !Sub "aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${ClaimTokenSecret} --query SecretString --output text"
   ClaimTokenSecretArn:
+    Condition: NotJoiner
     Description: Secrets Manager secret that holds the claim token.
     Value: !Ref ClaimTokenSecret
   InstanceId:
@@ -877,8 +1337,8 @@ Outputs:
     Description: Open a shell on the instance with Session Manager (needs the AWS CLI and its Session Manager plugin).
     Value: !Sub "aws ssm start-session --region ${AWS::Region} --target ${Instance}"
   BackupBucket:
-    Description: S3 bucket for WAL archives and base backups. Kept when the stack is deleted.
-    Value: !Ref BackupBucket
+    Description: S3 bucket for WAL archives and base backups. Kept when the stack is deleted. A replica server shows the leader's.
+    Value: !If [IsJoiner, !Ref BackupBucketName, !Ref BackupBucket]
   DataVolumeId:
     Description: EBS data volume (master key, registry, projects). A final snapshot is kept when the stack is deleted; find it with this volume ID.
     Value: !Ref DataVolume
@@ -898,3 +1358,21 @@ Outputs:
           - Created by this stack
           - !Sub "A api.${DomainName}, studio.${DomainName}, pooler.${DomainName} and *.api.${DomainName} -> ${ElasticIp}"
       - Not needed (sslip.io resolves the Elastic IP)
+  ElasticIpAllocationId:
+    Description: Allocation ID of the Elastic IP. Failover moves this address between the servers of a cluster.
+    Value: !GetAtt ElasticIp.AllocationId
+  ObjectsBucket:
+    Description: S3 bucket for Storage objects once Storage runs on S3. Kept when the stack is deleted. A replica server shows the leader's.
+    Value: !If [IsJoiner, !Ref ObjectsBucketName, !Ref ObjectsBucket]
+  StorageRoleArn:
+    Description: Role the Supavise daemon assumes to give Storage short-lived access to the objects bucket. A replica server shows the leader's.
+    Value: !If [IsJoiner, !Ref StorageRoleArn, !GetAtt StorageRole.Arn]
+  SecurityGroupId:
+    Description: Security group of the instance. Peer rules for port 7443 attach to it.
+    Value: !GetAtt SecurityGroup.GroupId
+  InfraRevision:
+    Description: Revision of the infrastructure this template describes. A release needs a revision (supavise status shows the gap).
+    Value: "2"
+  ClusterName:
+    Description: Name of the cluster this server belongs to (the supavise:cluster tag). A replica server stack takes the leader's.
+    Value: !If [HasClusterName, !Ref ClusterName, !Ref "AWS::StackName"]

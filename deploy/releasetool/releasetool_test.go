@@ -1,12 +1,17 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/supavise/supavise/internal/artifacts"
+	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/selfupdate"
 )
 
@@ -231,6 +236,90 @@ func TestManifestFromTheRepositoryPins(t *testing.T) {
 		t.Error("a bad version produced a manifest")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "bad.json")); err == nil {
+		t.Error("a refused manifest was written anyway")
+	}
+}
+
+// The manifest names the host converge revision of the built binary and the stack revision and
+// SHA-256 of the template, and says nothing about them when it is not given either.
+func TestManifestHostAndAWSFields(t *testing.T) {
+	dir := t.TempDir()
+	vf := filepath.Join(dir, "versions.yaml")
+	if err := os.WriteFile(vf, []byte(newYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	manifest := func(extra ...string) (*selfupdate.Manifest, error) {
+		out := filepath.Join(dir, "m.json")
+		os.Remove(out)
+		args := append([]string{"-version", "v1.1.0", "-min-upgrade-from", "v1.0.0", "-versions", vf, "-out", out}, extra...)
+		if err := cmdManifest(args); err != nil {
+			return nil, err
+		}
+		return selfupdate.ParseManifest(mustRead(t, out))
+	}
+
+	m, err := manifest()
+	if err != nil || m.Host != nil || m.AWS != nil {
+		t.Fatalf("without the flags: %+v %v", m, err)
+	}
+
+	for _, c := range []struct {
+		name, body string
+		want       int
+	}{
+		{"reports", `echo '{"version":"v1.1.0","converge_revision":4,"pins":{"auth":"x"}}'`, 4},
+		{"predates the field", `echo '{"version":"v1.1.0","pins":{"auth":"x"}}'`, 0},
+		{"does not run", `exit 1`, 0},
+		{"prints no JSON", `echo converged`, 0},
+		{"reports a bad number", `echo '{"converge_revision":"four"}'`, 0},
+	} {
+		bin := fake(strings.ReplaceAll(c.name, " ", "-"), c.body)
+		m, err := manifest("-binary", bin)
+		if err != nil || m.Host == nil || m.Host.ConvergeRevision != c.want {
+			t.Errorf("binary that %s: host %+v err %v, want revision %d", c.name, m.Host, err, c.want)
+		}
+		// Anything but a revision it reported is worth a warning on stderr.
+		if _, why := convergeRevision(bin); (why == "") != (c.name == "reports") {
+			t.Errorf("binary that %s: warning %q", c.name, why)
+		}
+	}
+	// A path that does not exist is the same as one that cannot run: 0, and a warning.
+	if m, err := manifest("-binary", filepath.Join(dir, "absent")); err != nil || m.Host == nil || m.Host.ConvergeRevision != 0 {
+		t.Errorf("absent binary: %+v %v", m, err)
+	}
+
+	tpl := filepath.Join("..", "cloudformation", "supavise.yaml")
+	m, err = manifest("-template", tpl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(mustRead(t, tpl))
+	if m.AWS == nil || m.AWS.StackRevision != infra.Current || m.AWS.TemplateAsset != "supavise.yaml" || m.AWS.TemplateSHA256 != hex.EncodeToString(sum[:]) {
+		t.Errorf("aws: %+v", m.AWS)
+	}
+	// A template at another revision than the release's code, or one with no revision, is refused,
+	// and no manifest is written.
+	revision := regexp.MustCompile(`(InfraRevision:\n    Description: .*\n    Value: )"\d+"`)
+	for name, body := range map[string]string{
+		"old":     revision.ReplaceAllString(string(mustRead(t, tpl)), `${1}"`+strconv.Itoa(infra.Current-1)+`"`),
+		"missing": strings.Replace(string(mustRead(t, tpl)), "InfraRevision:", "InfraRevisionX:", 1),
+	} {
+		p := filepath.Join(dir, name+".yaml")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manifest("-template", p); err == nil {
+			t.Errorf("a %s template produced a manifest", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "m.json")); err == nil {
 		t.Error("a refused manifest was written anyway")
 	}
 }

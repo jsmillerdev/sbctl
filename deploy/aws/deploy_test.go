@@ -40,8 +40,10 @@ type result struct {
 }
 
 // stubAWS writes an `aws` that logs every call and answers like the real CLI would for the few
-// calls deploy.sh makes. STACK_EXISTS=1 makes describe-stacks find a stack; STOP_FAILS=1 makes
-// stop-instances fail.
+// calls deploy.sh makes to create and delete a stack. STACK_EXISTS=1 makes describe-stacks find a
+// stack; STOP_FAILS=1 makes stop-instances fail; OBJECTS_BUCKET names the stack's objects bucket output and
+// JOIN_LEADER makes it the stack of a replica server. (update, status and replica have a fuller stub in
+// update_test.go.)
 func stubAWS(t *testing.T) (dir, log string) {
 	t.Helper()
 	dir = t.TempDir()
@@ -54,7 +56,8 @@ case "$*" in
     echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id supavise does not exist" >&2
     exit 254 ;;
   *"Stacks[0].Parameters"*)
-    printf 'AdminEmail\ta@b.co\nAmiId\t%s\nInstanceType\tt4g.large\n' "${STACK_AMI-ami-0aaaaaaaaaaaaaaaa}" ;;
+    printf 'AdminEmail\ta@b.co\nAmiId\t%s\nInstanceType\tt4g.large\n' "${STACK_AMI-ami-0aaaaaaaaaaaaaaaa}"
+    if [ -n "$JOIN_LEADER" ]; then printf 'JoinLeader\t%s\n' "$JOIN_LEADER"; else printf 'JoinLeader\t\n'; fi ;;
   *"Stacks[0].Outputs"*)
     # A stack whose creation failed has no outputs; the real CLI prints None for the empty list.
     if [ -n "$NO_OUTPUTS" ]; then echo None; exit 0; fi
@@ -62,7 +65,10 @@ case "$*" in
     printf 'ClaimTokenCommand\taws secretsmanager get-secret-value --region us-east-1 --secret-id arn:aws:secretsmanager:us-east-1:111122223333:secret:x --query SecretString --output text\n'
     printf 'DnsRecordsNeeded\tNot needed (sslip.io resolves the Elastic IP)\n'
     printf 'ConnectCommand\taws ssm start-session --region us-east-1 --target i-0abc\n'
-    printf 'InstanceId\ti-0123456789abcdef0\nBackupBucket\tsupavise-backupbucket-xyz\nDataVolumeId\tvol-0123456789abcdef0\n' ;;
+    printf 'InstanceId\ti-0123456789abcdef0\nBackupBucket\tsupavise-backupbucket-xyz\nDataVolumeId\tvol-0123456789abcdef0\n'
+    if [ -n "$OBJECTS_BUCKET" ]; then printf 'ObjectsBucket\t%s\n' "$OBJECTS_BUCKET"; fi ;;
+  *"sts get-caller-identity --query Account"*) echo 111122223333 ;;
+  *"s3api head-bucket"*) exit 254 ;;
   *"ssm get-parameter"*) echo ami-0123456789abcdef0 ;;
   *"ec2 describe-instances"*) echo ami-0bbbbbbbbbbbbbbbb ;;
   *"ec2 stop-instances"*)
@@ -208,6 +214,41 @@ func TestDryRunMinimal(t *testing.T) {
 	}
 }
 
+// The template is larger than the API takes inline (51,200 bytes), so a new stack's deploy hands the
+// CLI a bucket to stage it in: the one the person names, else one the script makes.
+func TestLargeTemplateIsStaged(t *testing.T) {
+	tpl, err := os.ReadFile("../cloudformation/supavise.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tpl) <= 51200 {
+		t.Skipf("the template is %d bytes: nothing to stage", len(tpl))
+	}
+	out := dryRun(t, bashes(t)[0], nil, "--region", "us-east-1", "--email", "a@b.co")
+	for _, want := range []string{
+		"# the template is over 51200 bytes, so it is staged in the bucket supavise-templates-<account>-us-east-1",
+		"aws --region us-east-1 s3 mb 's3://supavise-templates-<account>-us-east-1'",
+		"--s3-bucket 'supavise-templates-<account>-us-east-1' --s3-prefix _stack",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	out = dryRun(t, bashes(t)[0], nil, "--region", "us-east-1", "--email", "a@b.co", "--template-bucket", "my-templates")
+	if !strings.Contains(out, "--s3-bucket my-templates --s3-prefix _stack") || strings.Contains(out, "s3 mb") {
+		t.Errorf("a named bucket is used as it is and not created:\n%s", out)
+	}
+	// A template that fits is sent inline, as before.
+	small := filepath.Join(t.TempDir(), "small.yaml")
+	if err := os.WriteFile(small, []byte("AWSTemplateFormatVersion: \"2010-09-09\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = dryRun(t, bashes(t)[0], nil, "--region", "us-east-1", "--email", "a@b.co", "--template", small)
+	if strings.Contains(out, "--s3-bucket") {
+		t.Errorf("a small template needs no bucket:\n%s", out)
+	}
+}
+
 func TestDryRunAllOptions(t *testing.T) {
 	for _, b := range bashes(t) {
 		out := dryRun(t, b, nil,
@@ -268,6 +309,9 @@ func TestParameterNamesExistInTemplate(t *testing.T) {
 	line := strings.SplitN(out[idx:], "\n", 2)[0]
 	n := 0
 	for _, f := range strings.Fields(strings.TrimPrefix(line, "--parameter-overrides ")) {
+		if strings.HasPrefix(f, "--") { // the options that follow the overrides
+			break
+		}
 		name, _, ok := strings.Cut(strings.Trim(f, "'"), "=")
 		if !ok {
 			t.Errorf("not a Name=Value pair: %s", f)
@@ -326,7 +370,7 @@ func TestDryRunDelete(t *testing.T) {
 		out := dryRun(t, b, nil, "--region", "us-east-1", "--stack-name", "supavise", "--delete")
 		for _, want := range []string{
 			"About to delete the CloudFormation stack \"supavise\" in us-east-1.",
-			"the S3 backup bucket", "final EBS snapshot of the data volume",
+			"the S3 backup bucket", "the S3 objects bucket", "final EBS snapshot of the data volume",
 			"aws --region us-east-1 cloudformation delete-stack --stack-name supavise",
 			"aws --region us-east-1 cloudformation wait stack-delete-complete --stack-name supavise",
 			"ec2 describe-snapshots --owner-ids self",
@@ -378,6 +422,20 @@ func TestRealRunNewStack(t *testing.T) {
 		}
 		if !strings.Contains(deploy, "--capabilities CAPABILITY_IAM") || !strings.Contains(deploy, "AdminEmail=a@b.co AmiId=ami-0123456789abcdef0") {
 			t.Errorf("deploy call: %s\nall calls: %v", deploy, c)
+		}
+		// The template is over the inline limit: a bucket is made first and handed to deploy.
+		if !strings.Contains(deploy, "--s3-bucket supavise-templates-111122223333-us-east-1 --s3-prefix _stack") {
+			t.Errorf("deploy call lacks the staging bucket: %s", deploy)
+		}
+		if !strings.Contains(strings.Join(c, "\n"), "s3 mb s3://supavise-templates-111122223333-us-east-1") {
+			t.Errorf("the staging bucket was not made: %v", c)
+		}
+		// A bucket of that name that another account made and opened to this one is not trusted.
+		for _, want := range []string{"s3api head-bucket --bucket supavise-templates-111122223333-us-east-1 --expected-bucket-owner 111122223333",
+			"s3api put-public-access-block --bucket supavise-templates-111122223333-us-east-1 --expected-bucket-owner 111122223333"} {
+			if !strings.Contains(strings.Join(c, "\n"), want) {
+				t.Errorf("no %q in %v", want, c)
+			}
 		}
 		for _, l := range c {
 			if !strings.HasPrefix(l, "--region us-east-1 ") {
@@ -460,6 +518,33 @@ func TestRealRunDelete(t *testing.T) {
 		if !strings.Contains(r.stdout, want) {
 			t.Errorf("stdout lacks %q:\n%s", want, r.stdout)
 		}
+	}
+	if strings.Contains(r.stdout, "Objects bucket") || strings.Contains(r.stdout, "\n  objects bucket ") {
+		t.Errorf("a stack from before revision 2 has no objects bucket:\n%s", r.stdout)
+	}
+
+	// A stack at revision 2 keeps its objects bucket too, and the output says so.
+	dir, _ = stubAWS(t)
+	r = run(t, bashes(t)[0], dir, []string{"STACK_EXISTS=1", "OBJECTS_BUCKET=supavise-objectsbucket-xyz"}, "--region", "us-east-1", "--delete", "--yes")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	for _, want := range []string{"Objects bucket: supavise-objectsbucket-xyz", "backup bucket  supavise-backupbucket-xyz", "objects bucket supavise-objectsbucket-xyz   (versioned;"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("stdout lacks %q:\n%s", want, r.stdout)
+		}
+	}
+
+	// The stack of a replica server shows its leader's buckets: they are not its to keep or empty.
+	dir, _ = stubAWS(t)
+	r = run(t, bashes(t)[0], dir, []string{"STACK_EXISTS=1", "OBJECTS_BUCKET=supavise-objectsbucket-xyz", "JOIN_LEADER=203.0.113.50:7443"}, "--region", "us-east-1", "--delete", "--yes")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "Replica server of 203.0.113.50:7443: the buckets are the leader's and stay as they are.") ||
+		strings.Contains(r.stdout, "Backup bucket:") || strings.Contains(r.stdout, "Objects bucket:") || strings.Contains(r.stdout, "empty and delete it yourself") ||
+		!strings.Contains(r.stdout, "data snapshots") {
+		t.Errorf("a replica server's stack names its leader's buckets as its own:\n%s", r.stdout)
 	}
 
 	// An instance that cannot be stopped keeps the stack: a crash image is not what the person

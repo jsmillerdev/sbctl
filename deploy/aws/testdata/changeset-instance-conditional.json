@@ -1,0 +1,35 @@
+{
+  "ChangeSetName": "supavise-update-20261008T120000Z",
+  "StackName": "supavise",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "Instance",
+        "ResourceType": "AWS::EC2::Instance",
+        "Replacement": "Conditional",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "InstanceType",
+              "RequiresRecreation": "Conditionally"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          }
+        ],
+        "PhysicalResourceId": "x-Instance",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    }
+  ],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}

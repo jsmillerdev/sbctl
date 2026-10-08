@@ -1,12 +1,8 @@
 package infra
 
 import (
-	"context"
-	"errors"
 	"strings"
 	"testing"
-
-	"github.com/supavise/supavise/internal/notimpl"
 )
 
 func TestRender(t *testing.T) {
@@ -30,11 +26,5 @@ func TestRender(t *testing.T) {
 	Report{Have: 1, Need: 2}.Render(&b) // not AWS
 	if b.Len() != 0 {
 		t.Errorf("a report that is not behind wrote %q", b.String())
-	}
-}
-
-func TestGapIsNotImplementedYet(t *testing.T) {
-	if _, err := Gap(context.Background()); !errors.Is(err, notimpl.Err) {
-		t.Fatalf("Gap: %v", err)
 	}
 }

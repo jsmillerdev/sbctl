@@ -1,0 +1,58 @@
+{
+  "ChangeSetName": "supavise-update-20261008T120000Z",
+  "StackName": "supavise",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "ElasticIpAssociation",
+        "ResourceType": "AWS::EC2::EIPAssociation",
+        "Replacement": "False",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "InstanceId",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          }
+        ],
+        "PhysicalResourceId": "x-ElasticIpAssociation",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "Instance",
+        "ResourceType": "AWS::EC2::Instance",
+        "Replacement": "False",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Tags",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          }
+        ],
+        "PhysicalResourceId": "x-Instance",
+        "Scope": [
+          "Tags"
+        ]
+      }
+    }
+  ],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}

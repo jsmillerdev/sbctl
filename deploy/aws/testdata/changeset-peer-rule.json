@@ -1,0 +1,43 @@
+{
+  "ChangeSetName": "supavise-update-20261008T120000Z",
+  "StackName": "supavise",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "PeerIngress1",
+        "ResourceType": "AWS::EC2::SecurityGroupIngress",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "CidrIp",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ParameterReference"
+          }
+        ],
+        "PhysicalResourceId": "x-PeerIngress1",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Add",
+        "LogicalResourceId": "PeerIngress2",
+        "ResourceType": "AWS::EC2::SecurityGroupIngress"
+      }
+    }
+  ],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}
