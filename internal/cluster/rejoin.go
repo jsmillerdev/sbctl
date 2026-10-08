@@ -31,7 +31,9 @@ type RejoinOptions struct {
 	// Seed builds the system standby from the leader's archive and starts it; see SeedFunc. Required.
 	Seed SeedFunc
 	// Preflight, when set, runs before anything is asked of the leader or changed here. An error stops
-	// the rejoin with the node as it was: use it for what Seed needs and a refusal later would waste.
+	// the rejoin with the node as it was: use it for what Seed needs and a refusal later would waste. It
+	// must not look at the data directories: the rejoin sets the old data aside after it ran, and a
+	// rejoin that is repeated after a seeding that stopped finds that seeding's partial data.
 	Preflight func(ctx context.Context) error
 	// DSNs are the sockets the standby answers on.
 	DSNs          []string
@@ -143,25 +145,46 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 // divergedMark is the infix of the directories MoveDiverged creates.
 const divergedMark = ".diverged-"
 
-// MoveDiverged renames the PGDATA of the system project and of every project directory to
-// data.diverged-<epoch> (-2, -3 ... when that name is taken), and removes the diverged directories
-// that are older than [failover] keep_diverged_days. It returns the new paths. Nothing is copied: a
-// rename keeps the data and the disk it takes.
-func MoveDiverged(cfg *config.Config, epoch int64, now time.Time) ([]string, error) {
-	projects := filepath.Join(cfg.Paths().Root, "projects")
-	ents, err := os.ReadDir(projects)
+// LocalData lists the PGDATA directories of the system project and of every project directory that
+// has one: what a rejoin, a reset or a retirement sets aside.
+func LocalData(cfg *config.Config) []string {
+	out, _ := localData(cfg)
+	return out
+}
+
+func localData(cfg *config.Config) ([]string, error) {
+	ents, err := os.ReadDir(filepath.Join(cfg.Paths().Root, "projects"))
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	var moved []string
+	var out []string
 	for _, e := range ents {
 		if !e.IsDir() {
 			continue
 		}
 		data := cfg.Paths().PostgresData(e.Name())
-		if _, err := os.Stat(data); err != nil {
-			continue
+		if _, err := os.Stat(data); err == nil {
+			out = append(out, data)
 		}
+	}
+	return out, nil
+}
+
+// MoveDiverged renames the PGDATA of the system project and of every project directory to
+// data.diverged-<epoch> (-2, -3 ... when that name is taken), and removes the diverged directories
+// that were set aside more than [failover] keep_diverged_days ago. It returns the new paths. Nothing
+// is copied: a rename keeps the data and the disk it takes. A rename leaves the directory's own time
+// as it was (the last change of its top level, which may be days back: a fenced primary stopped when
+// it was fenced), so each directory is stamped with now when it is moved, and that is when its
+// retention starts. A directory that cannot be stamped is put back, because the next call would take
+// its old time for its age and remove it.
+func MoveDiverged(cfg *config.Config, epoch int64, now time.Time) ([]string, error) {
+	dirs, err := localData(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var moved []string
+	for _, data := range dirs {
 		dst := fmt.Sprintf("%s%s%d", data, divergedMark, epoch)
 		for i := 2; ; i++ {
 			if _, err := os.Lstat(dst); errors.Is(err, fs.ErrNotExist) {
@@ -172,13 +195,20 @@ func MoveDiverged(cfg *config.Config, epoch int64, now time.Time) ([]string, err
 		if err := os.Rename(data, dst); err != nil {
 			return moved, fmt.Errorf("cluster: setting %s aside: %w", data, err)
 		}
+		if err := os.Chtimes(dst, now, now); err != nil {
+			if back := os.Rename(dst, data); back != nil {
+				return moved, fmt.Errorf("cluster: %s was set aside as %s and its retention could not start (%v), and it could not be put back: %w; remove it by hand when its data is no longer needed", data, dst, err, back)
+			}
+			return moved, fmt.Errorf("cluster: the retention of %s could not start, so it was left where it was: %w", data, err)
+		}
 		moved = append(moved, dst)
 	}
 	pruneDiverged(cfg, now)
 	return moved, nil
 }
 
-// pruneDiverged removes the diverged directories whose last change is older than the retention.
+// pruneDiverged removes the diverged directories whose last change (the stamp MoveDiverged gave them)
+// is older than the retention.
 func pruneDiverged(cfg *config.Config, now time.Time) {
 	keep := cfg.Failover.KeepDiverged()
 	projects := filepath.Join(cfg.Paths().Root, "projects")
@@ -207,21 +237,22 @@ const RemovedReason = "this node was removed from the cluster; join it again wit
 // project directories aside like a rejoin does, records that it was removed, and deletes its cluster
 // identity and the cluster settings it was given. The daemon then starts as a node that is down like a
 // fenced one, with the reason, until `supavise node join` makes it a member again; the master key
-// stays. The record comes before the deletion, so that a node whose files cannot be deleted (the unit
-// may not let the daemon write there) still comes up down; the error then names what stayed, and
-// `supavise node join` clears it. It returns the directories it set aside.
+// stays. The record comes first, then the data, then the identity: a node whose data could not all be
+// set aside, or whose files cannot be deleted (the unit may not let the daemon write there), still
+// comes up down with the reason; the error then names what stayed, and `supavise node join` clears the
+// identity. It returns the directories it set aside.
 func Retire(ctx context.Context, cfg *config.Config, configPath string, stop func(context.Context) error, now time.Time) ([]string, error) {
 	if stop != nil {
 		if err := stop(ctx); err != nil {
 			return nil, err
 		}
 	}
+	if err := WriteFenced(cfg, FencedRecord{Reason: RemovedReason, Removed: true, At: now.UTC()}); err != nil {
+		return nil, err
+	}
 	moved, err := MoveDiverged(cfg, 0, now)
 	if err != nil {
-		return moved, err
-	}
-	if err := WriteFenced(cfg, FencedRecord{Reason: RemovedReason, Removed: true, At: now.UTC()}); err != nil {
-		return moved, err
+		return moved, fmt.Errorf("cluster: the node is recorded as removed and comes up down, but its data was not all set aside (the identity stays until it is): %w", err)
 	}
 	return moved, forgetIdentity(configPath)
 }

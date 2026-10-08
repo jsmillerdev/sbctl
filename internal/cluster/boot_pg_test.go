@@ -249,3 +249,50 @@ func TestProbeSystemAgainstPostgres(t *testing.T) {
 		t.Fatal("an unreachable cluster answered")
 	}
 }
+
+// A server leads when its system cluster is a primary and the registry in it names this node, which is
+// what `node join --reset` asks before it retires a node.
+func TestLeadsHereAgainstPostgres(t *testing.T) {
+	base := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
+	if base == "" {
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	dsn := tempDatabase(t, base, "supavise_leads")
+	reg, err := registry.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	if err := reg.CreateProject(ctx, &registry.Project{Ref: "system", Name: "system"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	conf := filepath.Join(t.TempDir(), "etc", "config.toml")
+	ca, _ := NewCA(newSecrets(t))
+	if _, err := EnsureFounder(ctx, reg, ca, cfg, conf, "v0.2.0", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	dsns := []string{"host=/nonexistent port=1 user=x connect_timeout=1", dsn}
+	if !LeadsHere(ctx, conf, dsns) {
+		t.Fatal("the founder, a primary that the registry names, does not lead")
+	}
+	n2 := &registry.Node{Name: "second", State: registry.NodeActive}
+	if err := reg.CreateNode(ctx, n2); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.SetLeader(ctx, n2.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if LeadsHere(ctx, conf, dsns) {
+		t.Fatal("a primary whose registry names another leader leads")
+	}
+	if LeadsHere(ctx, filepath.Join(t.TempDir(), "etc", "config.toml"), dsns) {
+		t.Fatal("a server with no cluster identity leads")
+	}
+	if LeadsHere(ctx, conf, []string{"host=/nonexistent port=1 user=x connect_timeout=1"}) {
+		t.Fatal("a server whose database does not answer leads")
+	}
+}

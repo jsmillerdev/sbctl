@@ -189,7 +189,7 @@ func (l *Live) ObserveEpoch(node string, epoch int64, leader string) {
 	if l.o.InRecovery != nil && !primaryUp {
 		return
 	}
-	rec := FencedRecord{Epoch: epoch, Leader: leader, At: l.o.Now(),
+	rec := FencedRecord{Epoch: epoch, Leader: leader, At: l.o.Now(), Peers: PeersOf(snap.Nodes, l.o.SelfID),
 		Reason: fmt.Sprintf("node %s says node %s leads at epoch %d; this node's epoch is %d", node, leader, epoch, snap.Epoch)}
 	l.mu.Lock()
 	if l.fenced != nil {

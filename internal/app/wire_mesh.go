@@ -450,10 +450,18 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 
 // certRenewalBlocked raises the alert that the node certificate cannot be renewed (err is why) or
 // resolves it (err is nil). The certificate works until it expires; the unit has to let the daemon write
-// the cluster directory before then.
+// the cluster directory before then. A renewal whose file could not be written (cluster.ErrNotKept) is
+// the worse case: the new certificate is in use and the old file no longer works, so a restart before
+// the renewer has written the file locks the node out; it tries again at every look.
 func certRenewalBlocked(store *cluster.Store, err error) {
 	ev := alerts.Event{Kind: alerts.KindCertificateExpiring, Title: "The node certificate cannot be renewed", Key: "node_cert_renewal"}
-	if err != nil {
+	if errors.Is(err, cluster.ErrNotKept) {
+		ev.Severity = alerts.SeverityCritical
+		ev.Title = "The renewed node certificate is not on disk"
+		ev.Detail = fmt.Sprintf("%v. The renewed certificate is in use, and the daemon writes it again every few hours; until it is written, "+
+			"a restart of the daemon loads the old file and this node can no longer reach its peers. "+
+			"Free disk space or let the daemon write there (ReadWritePaths= in supavise.service).", err)
+	} else if err != nil {
 		until := "its end"
 		if c := store.Creds(); c != nil {
 			until = c.NotAfter.Format("2006-01-02")

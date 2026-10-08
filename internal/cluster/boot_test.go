@@ -278,10 +278,18 @@ func TestLiveSeesAPromotion(t *testing.T) {
 
 func TestLiveFencesALeaderThatHearsOfAHigherEpoch(t *testing.T) {
 	p := &probe{}
-	l, _, cfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, p)
+	l, reg, cfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, p)
 	var got []FencedRecord
 	l.o.OnFenced = func(r FencedRecord) { got = append(got, r) }
 	ctx := context.Background()
+	n2, err := reg.GetNode(ctx, "n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2.PeerAddr = "10.0.0.2:7443"
+	if err := reg.UpdateNode(ctx, n2); err != nil {
+		t.Fatal(err)
+	}
 	l.Refresh(ctx)
 
 	for _, tc := range []struct {
@@ -308,6 +316,11 @@ func TestLiveFencesALeaderThatHearsOfAHigherEpoch(t *testing.T) {
 	onDisk, err := ReadFenced(cfg)
 	if err != nil || onDisk == nil || onDisk.Leader != "n2" {
 		t.Fatalf("fenced.json: %+v, %v", onDisk, err)
+	}
+	// `node rejoin` needs the peers' addresses, and the record written at run time is the one most
+	// fenced nodes keep.
+	if onDisk.Peers["n2"] != "10.0.0.2:7443" || len(onDisk.Peers) != 1 {
+		t.Fatalf("the record lost the peers: %+v", onDisk.Peers)
 	}
 	select {
 	case <-l.Changed():
@@ -498,6 +511,83 @@ func TestMoveDivergedSetsDataAsideAndPrunes(t *testing.T) {
 	if err != nil || len(moved) != 1 || !strings.HasSuffix(moved[0], "data.diverged-4-2") {
 		t.Fatalf("second move %v, %v", moved, err)
 	}
+}
+
+// A rename keeps a directory's own time, which for a fenced primary is the day it stopped. The
+// retention of what was set aside runs from the move: a directory whose time is days old survives
+// the call that moved it, and goes only once it has been set aside for longer than the retention.
+func TestMoveDivergedRetentionStartsAtTheMove(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	data := cfg.Paths().PostgresData("system")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "PG_VERSION"), []byte("17"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stopped := time.Now().Add(-20 * 24 * time.Hour) // the primary was fenced three weeks ago
+	if err := os.Chtimes(data, stopped, stopped); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	moved, err := MoveDiverged(cfg, 4, now)
+	if err != nil || len(moved) != 1 {
+		t.Fatalf("moved %v, %v", moved, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(moved[0], "PG_VERSION")); err != nil || string(b) != "17" {
+		t.Fatalf("the data set aside by the call that moved it: %q, %v", b, err)
+	}
+	if fi, err := os.Stat(moved[0]); err != nil || now.Sub(fi.ModTime()) > time.Minute {
+		t.Fatalf("the moved directory was not stamped: %v, %v", fi, err)
+	}
+	// Later calls keep it for the retention, and only then remove it.
+	keep := cfg.Failover.KeepDiverged()
+	for _, tc := range []struct {
+		after time.Duration
+		kept  bool
+	}{{time.Hour, true}, {keep - time.Hour, true}, {keep + time.Hour, false}} {
+		if _, err := MoveDiverged(cfg, 5, now.Add(tc.after)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(moved[0]); (err == nil) != tc.kept {
+			t.Fatalf("%s after the move the directory is kept=%v, want %v", tc.after, err == nil, tc.kept)
+		}
+	}
+}
+
+// The ping of the boot decision is authenticated by the chain to the cluster CA. The copy of the
+// registry that a returning node reads may be old: a peer that renewed its certificate while the node
+// was down has a serial that copy does not show, and its answer is wanted all the same.
+func TestBootPingDoesNotCheckSerialsAgainstAStaleRegistryCopy(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	creds, err := LoadCredentials(config.ClusterDir(j.confPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := BootEnv{Cfg: j.cfg, ConfigPath: j.confPath, Log: quiet(), PeerTimeout: 5 * time.Second,
+		openRegistry: func(context.Context, string) (registry.Registry, error) { return oldSerials{l.reg}, nil }}
+	ev, err := env.gather(ctx, "unused", creds)
+	if err != nil || len(ev.Peers) != 1 || ev.Peers[0].Node != "n1" || ev.Peers[0].Leader != "n1" {
+		t.Fatalf("evidence %+v, %v", ev, err)
+	}
+}
+
+// oldSerials is a registry whose copy shows no node's current certificate serial.
+type oldSerials struct{ registry.Registry }
+
+func (o oldSerials) ListNodes(ctx context.Context) ([]registry.Node, error) {
+	ns, err := o.Registry.ListNodes(ctx)
+	for i := range ns {
+		ns[i].CertSerial = "00"
+	}
+	return ns, err
 }
 
 func TestAssumeLeadership(t *testing.T) {

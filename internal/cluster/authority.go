@@ -303,6 +303,21 @@ func (a *Authority) Join(ctx context.Context, req peerapi.JoinRequest) (*peerapi
 	if err := a.checkJoinRequest(ctx, tok, req); err != nil {
 		return nil, err
 	}
+	// What the joiner is sent besides its certificate is read before the node exists: a failure here
+	// spends no token and leaves no row.
+	cfgText, err := a.clusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("cluster: the cluster settings were not rendered: %w", err)
+	}
+	var masterKey []byte
+	if !req.WithoutKey {
+		if a.MasterKey == nil {
+			return nil, errors.New("cluster: no way to read the master key")
+		}
+		if masterKey, err = a.MasterKey(); err != nil {
+			return nil, err
+		}
+	}
 
 	node := &registry.Node{
 		Name: req.Name, Region: req.Region, PublicHost: req.PublicHost, PeerAddr: req.PeerAddr,
@@ -337,18 +352,7 @@ func (a *Authority) Join(ctx context.Context, req peerapi.JoinRequest) (*peerapi
 		return nil, fail(http.StatusConflict, "token_used", "that join token was used already; create another with `supavise node token`")
 	}
 	a.changed(ctx)
-	resp := &peerapi.JoinResponse{NodeID: node.ID, Cert: issued.PEM(), CA: a.CA.PEM(), System: *sys}
-	if resp.ClusterConfig, err = a.clusterConfig(); err != nil {
-		a.log().Error("join: the cluster settings were not rendered; the node was admitted", "node", node.ID, "error", err)
-	}
-	if !req.WithoutKey {
-		if a.MasterKey == nil {
-			return nil, errors.New("cluster: no way to read the master key")
-		}
-		if resp.MasterKey, err = a.MasterKey(); err != nil {
-			return nil, err
-		}
-	}
+	resp := &peerapi.JoinResponse{NodeID: node.ID, Cert: issued.PEM(), CA: a.CA.PEM(), System: *sys, ClusterConfig: cfgText, MasterKey: masterKey}
 	a.log().Info("node joining", "node", node.ID, "name", node.Name, "region", node.Region, "version", node.Version)
 	return resp, nil
 }
@@ -594,11 +598,11 @@ func (a *Authority) Rejoin(ctx context.Context, caller string, req peerapi.Rejoi
 	if err != nil {
 		return nil, err
 	}
-	if err := a.Reg.SetNodeState(ctx, caller, registry.NodeJoining); err != nil {
-		return nil, err
-	}
 	cfgText, err := a.clusterConfig()
 	if err != nil {
+		return nil, fmt.Errorf("cluster: the cluster settings were not rendered: %w", err)
+	}
+	if err := a.Reg.SetNodeState(ctx, caller, registry.NodeJoining); err != nil {
 		return nil, err
 	}
 	a.changed(ctx)

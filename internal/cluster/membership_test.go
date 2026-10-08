@@ -3,7 +3,9 @@ package cluster
 import (
 	"context"
 	"crypto/ed25519"
+	crand "crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1243,5 +1245,297 @@ func TestDNSRecords(t *testing.T) {
 	svc := DNSRecords(cfg, &registry.Cluster{Leader: "n1", ServiceAddress: registry.ServiceAddress{IP: "2001:db8::1"}}, nodes[:1])
 	if svc[0].Type != "AAAA" || svc[0].Value != "2001:db8::1" {
 		t.Fatalf("service address: %+v", svc[0])
+	}
+}
+
+// followerNearExpiry joins node n2, runs it, and gives it a certificate with ten days left, which is
+// the leader's record of it. The renewer of its store is the one under test.
+func followerNearExpiry(t *testing.T) (*leaderFixture, *site) {
+	t.Helper()
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+	j.start(cctx, l.reg, RoleFollower, true)
+	eventually(t, "a session", func() bool { return j.mgr.Connected("n1") })
+	pub := j.store.Creds().Cert.PrivateKey.(ed25519.PrivateKey).Public().(ed25519.PublicKey)
+	short, err := l.ca.Issue(pub, "n2", time.Now(), 10*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.reg.SetNodeCert(ctx, "n2", short.Serial); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.store.Replace(short.DER); err != nil {
+		t.Fatal(err)
+	}
+	j.live.Refresh(ctx)
+	return l, j
+}
+
+func (j *site) renewer(wait time.Duration) *Renewer {
+	return &Renewer{Store: j.store, Self: j.live.Self, Leader: func() (string, bool) { return "n1", true }, IsLeader: func() bool { return false },
+		RPC: j.mgr, Log: quiet(), Grace: 10 * time.Millisecond, Wait: wait}
+}
+
+// The leader has recorded the new serial by the time the certificate arrives, so it is a node's
+// own copy of the registry being late, not the certificate being wrong, when the serial does not
+// show: the certificate that was issued is the one to use, because the old one is about to be refused.
+func TestRenewalUsesTheNewCertificateWhenTheRegistryCopyLags(t *testing.T) {
+	l, j := followerNearExpiry(t)
+	ctx := context.Background()
+	before := j.store.Creds().Serial
+	r := j.renewer(200 * time.Millisecond)
+	r.Self = func() registry.Node { return registry.Node{ID: "n2", CertSerial: before} } // the copy that never catches up
+	done, err := r.Once(ctx)
+	if err != nil || !done {
+		t.Fatalf("renewal with a lagging copy: %v, %v", done, err)
+	}
+	n2, _ := l.reg.GetNode(ctx, "n2")
+	if got := j.store.Creds().Serial; got == before || got != n2.CertSerial {
+		t.Fatalf("in use: %s, leader's record %s, before %s", got, n2.CertSerial, before)
+	}
+	if onDisk, err := LoadCredentials(config.ClusterDir(j.confPath)); err != nil || onDisk.Serial != n2.CertSerial {
+		t.Fatalf("on disk: %+v, %v", onDisk, err)
+	}
+}
+
+// A daemon that stops while a renewal waits for its copy of the registry has the new certificate on
+// disk already: the next start loads it, and the old file is not what the peers will admit.
+func TestRenewalIsOnDiskBeforeItWaits(t *testing.T) {
+	l, j := followerNearExpiry(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	before := j.store.Creds().Serial
+	r := j.renewer(time.Minute)
+	r.Self = func() registry.Node { return registry.Node{ID: "n2", CertSerial: before} }
+	go func() { time.Sleep(300 * time.Millisecond); cancel() }() // the daemon stops
+	if done, err := r.Once(ctx); err == nil || done {
+		t.Fatalf("renewal that was interrupted: %v, %v", done, err)
+	}
+	n2, _ := l.reg.GetNode(context.Background(), "n2")
+	onDisk, err := LoadCredentials(config.ClusterDir(j.confPath))
+	if err != nil || onDisk.Serial != n2.CertSerial || onDisk.Serial == before {
+		t.Fatalf("on disk after the interruption: %+v, %v (leader's record %s)", onDisk, err, n2.CertSerial)
+	}
+	if j.store.Creds().Serial != before {
+		t.Fatal("the new certificate was used before its serial showed")
+	}
+}
+
+// A file that cannot be written after the leader recorded the serial raises the alert, the new
+// certificate is used in memory, and the renewer writes the file when it can.
+func TestRenewalThatCannotWriteTheFileIsToldAndWrittenLater(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a directory that is not writable")
+	}
+	l, j := followerNearExpiry(t)
+	dir := config.ClusterDir(j.confPath)
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
+	var told []error
+	r := j.renewer(time.Second)
+	r.Blocked = func(err error) {
+		told = append(told, err)
+		if err == nil && len(told) == 1 {
+			_ = os.Chmod(dir, 0o500) // the check passed; now the disk goes away
+		}
+	}
+	done, err := r.Once(context.Background())
+	if err != nil || !done {
+		t.Fatalf("renewal whose file cannot be written: %v, %v", done, err)
+	}
+	if len(told) != 2 || told[0] != nil || !errors.Is(told[1], ErrNotKept) {
+		t.Fatalf("Blocked was told %v", told)
+	}
+	n2, _ := l.reg.GetNode(context.Background(), "n2")
+	if j.store.Creds().Serial != n2.CertSerial {
+		t.Fatal("the new certificate is not in use")
+	}
+	if onDisk, _ := LoadCredentials(dir); onDisk == nil || onDisk.Serial == n2.CertSerial {
+		t.Fatal("the file was written although the directory could not be")
+	}
+	if wrote, err := j.store.Resync(); wrote || err == nil {
+		t.Fatalf("a resync into a directory that cannot be written: %v, %v", wrote, err)
+	}
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if wrote, err := j.store.Resync(); err != nil || !wrote {
+		t.Fatalf("resync: %v, %v", wrote, err)
+	}
+	if onDisk, err := LoadCredentials(dir); err != nil || onDisk.Serial != n2.CertSerial {
+		t.Fatalf("on disk after the resync: %+v, %v", onDisk, err)
+	}
+	if wrote, err := j.store.Resync(); wrote || err != nil {
+		t.Fatalf("a resync with nothing to write: %v, %v", wrote, err)
+	}
+}
+
+// The removal is recorded before any data is touched: a node whose data cannot be set aside still
+// comes up down with the reason, and keeps its identity until the data is dealt with.
+func TestRetireRecordsTheRemovalBeforeItMovesData(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root renames into a directory that is not writable")
+	}
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	conf := filepath.Join(t.TempDir(), "etc", "config.toml")
+	ca, _ := NewCA(newSecrets(t))
+	key, _ := NewKey()
+	iss, _ := ca.Issue(key.Public().(ed25519.PublicKey), "n2", time.Now(), time.Hour)
+	if err := SaveIdentity(config.ClusterDir(conf), key, iss.DER, ca.DER()); err != nil {
+		t.Fatal(err)
+	}
+	data := cfg.Paths().PostgresData("system")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(data)
+	if err := os.Chmod(parent, 0o500); err != nil { // the data cannot be renamed out of here
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+	_, err := Retire(context.Background(), cfg, conf, nil, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "recorded as removed") {
+		t.Fatalf("retire with data that cannot be moved: %v", err)
+	}
+	if rec, _ := ReadFenced(cfg); rec == nil || !rec.Removed {
+		t.Fatalf("no record of the removal: %+v", rec)
+	}
+	if !Joined(config.ClusterDir(conf)) {
+		t.Fatal("the identity went before the data was set aside")
+	}
+	if d, err := DecideBoot(context.Background(), BootEnv{Cfg: cfg, ConfigPath: conf}); err != nil || d.Role != RoleFenced || d.Reason != RemovedReason {
+		t.Fatalf("the boot of that node: %+v, %v", d, err)
+	}
+}
+
+// A reset on a node that is still a member looks at the token and the key before it stops or moves
+// anything: a token that has expired, or a key that is not the cluster's, has retired nobody.
+func TestJoinResetChecksItsInputsBeforeItRetiresTheNode(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(j.cfg.Paths().PostgresData("system"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stop := func(context.Context) error { t.Error("something was stopped"); return nil }
+
+	expired := l.token(t, TokenOptions{TTL: time.Minute})
+	o := j.joinOptions(expired, "second-b", seed)
+	o.Reset, o.StopLocal = true, stop
+	o.Now = func() time.Time { return time.Now().Add(time.Hour) }
+	if _, err := Join(ctx, o); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("reset with an expired token: %v", err)
+	}
+
+	other := make([]byte, 32)
+	if _, err := crand.Read(other); err != nil {
+		t.Fatal(err)
+	}
+	o = j.joinOptions(l.token(t, TokenOptions{}), "second-b", seed)
+	o.Reset, o.StopLocal, o.MasterKey = true, stop, []byte(hex.EncodeToString(other)+"\n")
+	if _, err := Join(ctx, o); err == nil || !strings.Contains(err.Error(), "master key") {
+		t.Fatalf("reset with another cluster's key: %v", err)
+	}
+	if err := o.CheckInputs(); err == nil {
+		t.Fatal("CheckInputs accepted another cluster's key")
+	}
+
+	if !Joined(config.ClusterDir(j.confPath)) {
+		t.Fatal("the identity was deleted")
+	}
+	if rec, _ := ReadFenced(j.cfg); rec != nil {
+		t.Fatalf("the node was recorded as removed: %+v", rec)
+	}
+	if _, err := os.Stat(j.cfg.Paths().PostgresData("system")); err != nil {
+		t.Fatalf("data was moved: %v", err)
+	}
+}
+
+// A resumed join has begun: the preflight ran at its start, and what it looks at (room, the store)
+// is not what a half-seeded server offers.
+func TestResumeDoesNotRunThePreflight(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	stuck := func(context.Context, peerapi.SystemBootstrap) error { return errors.New("stuck") }
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", stuck)); err == nil {
+		t.Fatal("expected the seed to fail")
+	}
+	seed, boot := okSeed(t)
+	o := j.joinOptions(Token{}, "", seed)
+	o.Resume = true
+	o.Preflight = func(context.Context) error { return errors.New("the data directory is not empty") }
+	if _, err := Join(ctx, o); err != nil || len(*boot) != 1 {
+		t.Fatalf("resume: %v, seeded %d", err, len(*boot))
+	}
+}
+
+// What a joiner is sent besides its certificate is read before the node exists: a master key that
+// cannot be read spends no token and leaves no row, so the same token joins once the key can be read.
+func TestJoinReadsTheMasterKeyBeforeItSpendsTheToken(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	tok := l.token(t, TokenOptions{})
+	secret, _ := tokenSecretBytes(tok)
+	key, _ := NewKey()
+	csr, _ := NewCSR(key, "second")
+	build := func() peerapi.JoinRequest {
+		ch := l.auth.Challenge()
+		return peerapi.JoinRequest{TokenID: tok.ID, Nonce: ch.Nonce, Proof: Proof(secret, ch.Nonce, csr, "second"), CSR: csr, Name: "second", Region: "eu-west-1", PeerAddr: "127.0.0.1:7443", Version: "v0.2.0", ArtifactPins: testPins}
+	}
+	read := l.auth.MasterKey
+	l.auth.MasterKey = func() ([]byte, error) { return nil, errors.New("the key file cannot be read") }
+	if _, err := l.auth.Join(ctx, build()); err == nil || !strings.Contains(err.Error(), "cannot be read") {
+		t.Fatalf("join with a key that cannot be read: %v", err)
+	}
+	if ns, _ := l.reg.ListNodes(ctx); len(ns) != 1 {
+		t.Fatalf("a node was created: %v", ns)
+	}
+	if got, err := l.reg.GetJoinToken(ctx, tok.ID); err != nil || got.UsedAt != nil {
+		t.Fatalf("the token was spent: %+v, %v", got, err)
+	}
+	l.auth.MasterKey = read
+	if _, err := l.auth.Join(ctx, build()); err != nil {
+		t.Fatalf("the same token once the key can be read: %v", err)
+	}
+}
+
+type failingTokens struct{ registry.Registry }
+
+func (failingTokens) GetJoinToken(context.Context, string) (*registry.JoinToken, error) {
+	return nil, errors.New("dial tcp 10.0.0.9:5432: connection refused")
+}
+
+// A caller with no certificate gets no detail of an internal failure: the text of a database error
+// can carry a host name. A node does.
+func TestPeerAPIKeepsInternalDetailFromCallersWithNoCertificate(t *testing.T) {
+	l := newLeader(t)
+	auth := &Authority{Reg: failingTokens{l.reg}, CA: l.ca, Secrets: l.sec, Cfg: l.cfg, Topology: l.live, Log: quiet(), Version: "v0.2.0", Pins: testPins, Now: l.clk.Now}
+	mux := mesh.NewMux()
+	(&PeerAPI{Authority: auth, Topology: l.live, Cfg: l.cfg, Reports: l.rep}).Register(mux)
+	post := func(peer mesh.Peer) (int, string) {
+		ch := auth.Challenge()
+		body, _ := json.Marshal(peerapi.JoinRequest{TokenID: "x", Nonce: ch.Nonce})
+		req := httptest.NewRequest("POST", peerapi.PathJoin, strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req.WithContext(mesh.WithPeer(req.Context(), peer)))
+		return rec.Code, rec.Body.String()
+	}
+	if code, body := post(mesh.Peer{Remote: "198.51.100.9"}); code != http.StatusInternalServerError || strings.Contains(body, "10.0.0.9") || strings.Contains(body, "refused") {
+		t.Fatalf("a caller with no certificate got %d %s", code, body)
+	}
+	if code, body := post(mesh.Peer{Node: "n2", Remote: "198.51.100.9"}); code != http.StatusInternalServerError || !strings.Contains(body, "connection refused") {
+		t.Fatalf("a node got %d %s", code, body)
 	}
 }

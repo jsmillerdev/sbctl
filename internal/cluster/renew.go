@@ -14,10 +14,13 @@ import (
 )
 
 // Renewer replaces the node's certificate when RenewBefore of its life is left. A follower asks the
-// leader (POST /peer/v1/certs/renew); the leader signs its own. The new certificate is used only
-// after the node's own copy of the registry shows its serial, and a short grace after that, because
-// peers admit a certificate by the serial in their copy and a copy can lag: switching at once would
-// have some peers refuse the node for a moment.
+// leader (POST /peer/v1/certs/renew); the leader signs its own. The new certificate is written to the
+// cluster directory as soon as it arrives, because the leader has recorded its serial and the old file
+// stops working once the peers' copies show it: a restart of the daemon from here on loads the new one.
+// It is used in memory only after the node's own copy of the registry shows its serial, and a short
+// grace after that, because peers admit a certificate by the serial in their copy and a copy can lag:
+// switching at once would have some peers refuse the node for a moment. A copy that does not show it
+// within Wait is no reason to keep the old certificate, which the peers' copies are about to refuse.
 type Renewer struct {
 	Store     *Store
 	Self      func() registry.Node
@@ -80,6 +83,19 @@ func (r *Renewer) Run(ctx context.Context) error {
 				r.Log.Warn("certificate renewal failed; it is tried again later", "error", err)
 			}
 		}
+		// A renewal that could not write the file leaves the certificate in use ahead of the file.
+		if wrote, err := r.Store.Resync(); err != nil {
+			if r.Log != nil && !errors.Is(err, ErrNoIdentity) {
+				r.Log.Warn("the node certificate in use is not on disk yet; it is tried again later", "error", err)
+			}
+		} else if wrote {
+			if r.Log != nil {
+				r.Log.Info("the node certificate in use was written to the cluster directory")
+			}
+			if r.Blocked != nil {
+				r.Blocked(nil)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return nil
@@ -128,6 +144,22 @@ func (r *Renewer) Once(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	next, err := r.Store.Prepare(der)
+	if err != nil {
+		return false, err
+	}
+	// The file first: the leader has recorded the serial, so the old file is no good to a daemon that
+	// restarts from here on. A write that fails is told to Blocked and logged, and the new certificate
+	// still goes into use in memory below, because the old one is about to be refused.
+	keepErr := r.Store.Keep(der)
+	if keepErr != nil {
+		if r.Blocked != nil {
+			r.Blocked(keepErr)
+		}
+		if r.Log != nil {
+			r.Log.Error("certificate renewed but its file was not written; a restart of the daemon would lock the node out", "serial", resp.Serial, "error", keepErr.Error())
+		}
+	}
 	wait, grace := r.Wait, r.Grace
 	if wait <= 0 {
 		wait = 2 * time.Minute
@@ -138,7 +170,10 @@ func (r *Renewer) Once(ctx context.Context) (bool, error) {
 	deadline := time.Now().Add(wait)
 	for r.Self().CertSerial != resp.Serial {
 		if !time.Now().Before(deadline) {
-			return false, fmt.Errorf("cluster: the registry copy here does not show the new certificate serial after %s", wait)
+			if r.Log != nil {
+				r.Log.Warn("the registry copy here does not show the new certificate serial; the new certificate is used anyway", "serial", resp.Serial, "waited", wait.String())
+			}
+			break
 		}
 		select {
 		case <-ctx.Done():
@@ -151,16 +186,9 @@ func (r *Renewer) Once(ctx context.Context) (bool, error) {
 		return false, ctx.Err()
 	case <-time.After(grace):
 	}
-	if err := r.Store.Replace(der); err != nil {
-		// The leader has recorded the new serial, so the old file is no good to anyone: the new
-		// certificate stays in use in memory and the operator is told the file is stale.
-		if r.Store.Creds().Serial == resp.Serial {
-			if r.Log != nil {
-				r.Log.Error("certificate renewed but its file was not written; a restart of the daemon would lock the node out", "serial", resp.Serial, "error", err.Error())
-			}
-			return true, nil
-		}
-		return false, err
+	r.Store.Use(next)
+	if keepErr != nil {
+		return true, nil
 	}
 	if r.Log != nil {
 		r.Log.Info("certificate renewed", "serial", resp.Serial, "not_after", resp.NotAfter.Format(time.RFC3339))

@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
@@ -85,33 +86,79 @@ func (s *Store) Writable() error {
 	return nil
 }
 
-// Replace uses a new certificate (DER) for the node's key from now on and writes it to the cluster
-// directory. By the time it is called the leader has recorded the new serial, and peers admit a node
-// by the serial in the registry, so the old file no longer works for anyone. A write that fails
-// leaves the new certificate in use in memory only: after the next restart the node loads the old
-// file and no peer admits it. The renewer checks Writable before it asks for a certificate, so that a
-// directory the daemon cannot write to is found while the current certificate still works.
-func (s *Store) Replace(certDER []byte) error {
+// ErrNotKept: a renewed certificate is in use but its file could not be written, so a restart of the
+// daemon would load the old one, which the peers no longer admit.
+var ErrNotKept = errors.New("cluster: the renewed certificate was not written to the cluster directory")
+
+// Prepare checks a new certificate (DER) for the node's key and returns the credentials that use it.
+// Nothing changes until Use and Keep are called.
+func (s *Store) Prepare(certDER []byte) (*mesh.Credentials, error) {
 	old := s.cur.Load()
 	if old == nil {
-		return ErrNoIdentity
+		return nil, ErrNoIdentity
 	}
 	key, ok := old.Cert.PrivateKey.(ed25519.PrivateKey)
 	if !ok {
-		return errors.New("cluster: the node key is not an Ed25519 key")
+		return nil, errors.New("cluster: the node key is not an Ed25519 key")
 	}
 	c, err := mesh.NewCredentials(certDER, key, old.CA)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if c.NodeID != old.NodeID {
-		return fmt.Errorf("cluster: the new certificate names node %s, not %s", c.NodeID, old.NodeID)
+		return nil, fmt.Errorf("cluster: the new certificate names node %s, not %s", c.NodeID, old.NodeID)
 	}
-	s.cur.Store(c)
+	return c, nil
+}
+
+// Use makes c (from Prepare) the credentials of every handshake from now on.
+func (s *Store) Use(c *mesh.Credentials) { s.cur.Store(c) }
+
+// Keep writes a new certificate (DER) to the cluster directory, which is what a restart of the daemon
+// loads. By the time a renewal calls it the leader has recorded the new serial, and peers admit a node
+// by the serial in the registry, so the old file stops working for everyone once their copies catch up:
+// the file is written as soon as the certificate arrives, and the switch in memory waits for the copies.
+// The renewer checks Writable before it asks for a certificate, so that a directory the daemon cannot
+// write to is found while the current certificate still works.
+func (s *Store) Keep(certDER []byte) error {
 	if err := writeFile(filepath.Join(s.dir, config.NodeCertFile), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0o644); err != nil {
-		return fmt.Errorf("cluster: the renewed certificate is in use but %s was not updated: %w", config.NodeCertFile, err)
+		return fmt.Errorf("%w (%s): %v", ErrNotKept, config.NodeCertFile, err)
 	}
 	return nil
+}
+
+// Resync writes the certificate in use to the cluster directory when the file holds another one,
+// which is what a renewal that could not write the file leaves behind. It reports whether it wrote.
+// The renewer calls it between renewals, never during one: a renewal's new file is ahead of the
+// certificate in use for the length of its grace.
+func (s *Store) Resync() (bool, error) {
+	c := s.cur.Load()
+	if c == nil {
+		return false, ErrNoIdentity
+	}
+	der := c.Cert.Certificate[0]
+	have, err := os.ReadFile(filepath.Join(s.dir, config.NodeCertFile))
+	if err == nil {
+		if blk, _ := pem.Decode(have); blk != nil && bytes.Equal(blk.Bytes, der) {
+			return false, nil
+		}
+	}
+	if err := s.Keep(der); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Replace is Prepare, Use and Keep in one: it uses a new certificate (DER) for the node's key from now
+// on and writes it to the cluster directory. A write that fails leaves the new certificate in use in
+// memory only.
+func (s *Store) Replace(certDER []byte) error {
+	c, err := s.Prepare(certDER)
+	if err != nil {
+		return err
+	}
+	s.Use(c)
+	return s.Keep(certDER)
 }
 
 // SaveIdentity writes the node's key (0600), certificate and the CA certificate to dir.

@@ -64,9 +64,11 @@ type JoinOptions struct {
 	StopLocal func(ctx context.Context) error
 	// Seed builds and starts the system standby. Required.
 	Seed SeedFunc
-	// Preflight, when set, runs before anything is asked of the leader or changed here. An error stops
-	// the join with the server as it was: use it for what Seed needs and a refusal later would waste,
-	// because the token is spent and the node exists on the leader once the exchange is done.
+	// Preflight, when set, runs before anything is asked of the leader or changed here, and not for
+	// Resume. An error stops the join with the server as it was: use it for what Seed needs and a
+	// refusal later would waste, because the token is spent and the node exists on the leader once the
+	// exchange is done (room on the disk, the backup store). It must not look at the data directories:
+	// with Reset they are set aside after it ran. Refusing data that Seed would overwrite is Seed's job.
 	Preflight func(ctx context.Context) error
 	// DSNs are the sockets the system standby answers on, to see it stream.
 	DSNs []string
@@ -118,25 +120,31 @@ func Join(ctx context.Context, o JoinOptions) (*JoinResult, error) {
 	if o.Seed == nil {
 		return nil, errors.New("cluster: a join needs a way to seed the system standby")
 	}
-	if o.Preflight != nil {
-		if err := o.Preflight(ctx); err != nil {
-			return nil, err
-		}
-	}
 	dir := config.ClusterDir(o.ConfigPath)
 	var st *JoinState
 	var err error
 	if o.Resume {
+		// The seeding is under way or done; the preflight ran when the join began.
 		if st, err = ReadJoinState(dir); err != nil {
 			return nil, err
 		}
 	} else {
+		// What can be checked offline comes before anything is changed here, a reset's retirement included.
+		secret, keyBody, err := o.inputs()
+		if err != nil {
+			return nil, err
+		}
+		if o.Preflight != nil {
+			if err := o.Preflight(ctx); err != nil {
+				return nil, err
+			}
+		}
 		if Joined(dir) {
 			if err := o.startOver(ctx); err != nil {
 				return nil, err
 			}
 		}
-		if st, err = o.exchange(ctx, dir); err != nil {
+		if st, err = o.exchange(ctx, dir, secret, keyBody); err != nil {
 			return nil, err
 		}
 	}
@@ -149,6 +157,42 @@ func Join(ctx context.Context, o JoinOptions) (*JoinResult, error) {
 		return nil, err
 	}
 	return &JoinResult{NodeID: st.NodeID, System: st.System}, nil
+}
+
+// CheckInputs checks what a join can check without the leader: the token has not expired, its secret
+// is whole, and a master key the joiner supplies is the one the token's CA pin was made from. The join
+// command calls it before it asks for a confirmation, and Join calls it before it changes anything.
+func (o *JoinOptions) CheckInputs() error {
+	_, _, err := o.inputs()
+	return err
+}
+
+// inputs is CheckInputs, and returns the token's secret and the master key the joiner supplies (nil
+// when the leader sends it).
+func (o *JoinOptions) inputs() (secret, keyBody []byte, err error) {
+	tok := o.Token
+	if !tok.Expires().After(o.now()) {
+		return nil, nil, errors.New("cluster: the join token has expired; ask the leader for a new one with `supavise node token`")
+	}
+	secret, err = base64.RawURLEncoding.DecodeString(tok.Secret)
+	if err != nil || len(secret) == 0 {
+		return nil, nil, errors.New("cluster: the join token's secret is damaged")
+	}
+	if o.MasterKey != nil {
+		sec, err := secrets.Load(o.MasterKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		ca, err := NewCA(sec)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !strings.EqualFold(ca.Fingerprint(), tok.CAFpr) {
+			return nil, nil, errors.New("cluster: that master key is not the one this cluster was made with (the CA it derives is not the one the token pins)")
+		}
+		keyBody = o.MasterKey
+	}
+	return secret, keyBody, nil
 }
 
 // startOver deals with a server that already holds a cluster identity when a join with a token
@@ -186,31 +230,9 @@ func ReadJoinState(dir string) (*JoinState, error) {
 	return &st, nil
 }
 
-// exchange is phase one.
-func (o *JoinOptions) exchange(ctx context.Context, dir string) (*JoinState, error) {
+// exchange is phase one. secret and keyBody are what inputs checked.
+func (o *JoinOptions) exchange(ctx context.Context, dir string, secret, keyBody []byte) (*JoinState, error) {
 	tok := o.Token
-	if !tok.Expires().After(o.now()) {
-		return nil, errors.New("cluster: the join token has expired; ask the leader for a new one with `supavise node token`")
-	}
-	secret, err := base64.RawURLEncoding.DecodeString(tok.Secret)
-	if err != nil || len(secret) == 0 {
-		return nil, errors.New("cluster: the join token's secret is damaged")
-	}
-	var keyBody []byte
-	if o.MasterKey != nil {
-		sec, err := secrets.Load(o.MasterKey)
-		if err != nil {
-			return nil, err
-		}
-		ca, err := NewCA(sec)
-		if err != nil {
-			return nil, err
-		}
-		if !strings.EqualFold(ca.Fingerprint(), tok.CAFpr) {
-			return nil, errors.New("cluster: that master key is not the one this cluster was made with (the CA it derives is not the one the token pins)")
-		}
-		keyBody = o.MasterKey
-	}
 	name := firstNonEmpty(o.Name, tok.Name, o.Cfg.NodeName())
 	region := firstNonEmpty(o.Region, tok.Region, o.Cfg.NodeRegion())
 	address := firstNonEmpty(o.Address, o.Cfg.PeerAddr())

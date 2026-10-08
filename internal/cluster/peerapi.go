@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -45,13 +46,13 @@ func (p *PeerAPI) Register(m *mesh.Mux) {
 	m.Handle("GET "+peerapi.PathPing, mesh.PingHandler(p.Ping))
 	m.Handle("GET "+peerapi.PathJoin, func(w http.ResponseWriter, r *http.Request) {
 		if err := p.Authority.needLeader(); err != nil {
-			respond(w, err)
+			respond(w, r, err)
 			return
 		}
 		peer, _ := mesh.PeerFrom(r.Context())
 		ch, err := p.Authority.ChallengeFrom(peer.Remote)
 		if err != nil {
-			respond(w, err)
+			respond(w, r, err)
 			return
 		}
 		mesh.RespondJSON(w, http.StatusOK, ch)
@@ -63,7 +64,7 @@ func (p *PeerAPI) Register(m *mesh.Mux) {
 		}
 		resp, err := p.Authority.Join(r.Context(), req)
 		if err != nil {
-			respond(w, err)
+			respond(w, r, err)
 			return
 		}
 		mesh.RespondJSON(w, http.StatusOK, resp)
@@ -75,7 +76,7 @@ func (p *PeerAPI) Register(m *mesh.Mux) {
 		}
 		peer, _ := mesh.PeerFrom(r.Context())
 		if err := p.Authority.Confirm(r.Context(), peer.Node, c); err != nil {
-			respond(w, err)
+			respond(w, r, err)
 			return
 		}
 		mesh.RespondJSON(w, http.StatusNoContent, nil)
@@ -88,7 +89,7 @@ func (p *PeerAPI) Register(m *mesh.Mux) {
 		peer, _ := mesh.PeerFrom(r.Context())
 		resp, err := p.Authority.Rejoin(r.Context(), peer.Node, req)
 		if err != nil {
-			respond(w, err)
+			respond(w, r, err)
 			return
 		}
 		mesh.RespondJSON(w, http.StatusOK, resp)
@@ -101,19 +102,19 @@ func (p *PeerAPI) Register(m *mesh.Mux) {
 		peer, _ := mesh.PeerFrom(r.Context())
 		resp, err := p.Authority.Renew(r.Context(), peer.Node, req)
 		if err != nil {
-			respond(w, err)
+			respond(w, r, err)
 			return
 		}
 		mesh.RespondJSON(w, http.StatusOK, resp)
 	})
 	m.Handle("GET "+peerapi.PathConfig, func(w http.ResponseWriter, r *http.Request) {
 		if err := p.Authority.needLeader(); err != nil {
-			respond(w, err)
+			respond(w, r, err)
 			return
 		}
 		b, err := config.MarshalCluster(p.Cfg)
 		if err != nil {
-			respond(w, err)
+			respond(w, r, err)
 			return
 		}
 		sum := sha256.Sum256(b)
@@ -122,7 +123,7 @@ func (p *PeerAPI) Register(m *mesh.Mux) {
 	m.Handle("GET "+peerapi.PathCerts, p.certs)
 	m.Handle("POST "+peerapi.PathReport, func(w http.ResponseWriter, r *http.Request) {
 		if err := p.Authority.needLeader(); err != nil {
-			respond(w, err)
+			respond(w, r, err)
 			return
 		}
 		var rep peerapi.Report
@@ -143,7 +144,10 @@ func (p *PeerAPI) Register(m *mesh.Mux) {
 	})
 }
 
-func respond(w http.ResponseWriter, err error) {
+// respond answers a request that failed with err. A failure that is not one of the typed ones is a 500;
+// its text goes to a caller that is a node, and to the log only when the caller has no certificate (a
+// joiner reaches the join endpoints, where a database error can carry a host or a table name).
+func respond(w http.ResponseWriter, r *http.Request, err error) {
 	var ce *Error
 	switch {
 	case errors.As(err, &ce):
@@ -153,6 +157,11 @@ func respond(w http.ResponseWriter, err error) {
 	case errors.Is(err, registry.ErrReadOnly):
 		mesh.RespondError(w, http.StatusServiceUnavailable, "not_leader", "this node cannot write to the registry")
 	default:
+		if peer, _ := mesh.PeerFrom(r.Context()); peer.Node == "" {
+			slog.Warn("peer api: a request from a caller with no certificate failed", "path", r.URL.Path, "remote", peer.Remote, "error", err)
+			mesh.RespondError(w, http.StatusInternalServerError, "", "the leader could not handle the request")
+			return
+		}
 		mesh.RespondError(w, http.StatusInternalServerError, "", err.Error())
 	}
 }
@@ -165,12 +174,12 @@ const maxCertStore = 32 << 20
 // issuer holds while it works are left out.
 func (p *PeerAPI) certs(w http.ResponseWriter, r *http.Request) {
 	if err := p.Authority.needLeader(); err != nil {
-		respond(w, err)
+		respond(w, r, err)
 		return
 	}
 	snap, etag, err := SnapshotCerts(p.Cfg.Paths().Certs())
 	if err != nil {
-		respond(w, err)
+		respond(w, r, err)
 		return
 	}
 	w.Header().Set("ETag", etag)

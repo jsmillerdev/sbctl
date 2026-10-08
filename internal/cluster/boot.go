@@ -197,6 +197,27 @@ func DecideBoot(ctx context.Context, env BootEnv) (BootDecision, error) {
 	return d, nil
 }
 
+// LeadsHere reports whether this server is the leader of its cluster as far as its own database says:
+// the system cluster answers as a primary within a few seconds and the registry in it names this node as
+// the leader. A server whose database is stopped, or is a standby, or names another leader, is not.
+func LeadsHere(ctx context.Context, configPath string, dsns []string) bool {
+	creds, err := LoadCredentials(config.ClusterDir(configPath))
+	if err != nil {
+		return false
+	}
+	dsn, inRecovery, err := probeSystem(ctx, dsns, 3*time.Second)
+	if err != nil || inRecovery {
+		return false
+	}
+	reg, err := registry.OpenReadOnly(ctx, dsn)
+	if err != nil {
+		return false
+	}
+	defer reg.Close()
+	cl, err := reg.GetCluster(ctx)
+	return err == nil && cl.Leader == creds.NodeID
+}
+
 // probeSystem asks each candidate DSN whether its cluster is in recovery, retrying until wait ends.
 func probeSystem(ctx context.Context, dsns []string, wait time.Duration) (dsn string, inRecovery bool, err error) {
 	deadline := time.Now().Add(wait)
@@ -305,7 +326,6 @@ func (e *BootEnv) gather(ctx context.Context, dsn string, creds *mesh.Credential
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	admit := mesh.AdmitFromNodes(func() []registry.Node { return nodes })
 	for _, n := range nodes {
 		if n.ID == creds.NodeID || n.State != registry.NodeActive {
 			continue
@@ -315,7 +335,10 @@ func (e *BootEnv) gather(ctx context.Context, dsn string, creds *mesh.Credential
 			defer wg.Done()
 			pctx, cancel := context.WithTimeout(ctx, peerWait)
 			defer cancel()
-			p, err := AskPeer(pctx, creds, admit, n, e.Resolver, e.now)
+			// Only the chain to the cluster CA authenticates the answer. This copy of the registry may be
+			// stale (the node was down), and a peer that renewed its certificate meanwhile has a serial
+			// the copy does not show: checking serials would silence exactly the peers that know most.
+			p, err := AskPeer(pctx, creds, nil, n, e.Resolver, e.now)
 			if err != nil {
 				e.logger().Info("boot: a peer did not answer", "node", n.ID, "error", err)
 				return
@@ -346,7 +369,8 @@ func (e *BootEnv) gather(ctx context.Context, dsn string, creds *mesh.Credential
 }
 
 // AskPeer pings one peer over a session of its own and returns its answer. It tries the address in
-// the registry first and then the resolver's.
+// the registry first and then the resolver's. admit, when not nil, is the registry's say on the
+// peer's certificate; nil checks the chain to the cluster CA and the node's name only.
 func AskPeer(ctx context.Context, creds *mesh.Credentials, admit mesh.AdmitFunc, n registry.Node, res mesh.AddrResolver, now func() time.Time) (peerapi.Ping, error) {
 	if now == nil {
 		now = time.Now
