@@ -490,9 +490,10 @@ replica, never both. The role decides the ports and the settings when the units 
   a project's old home the replica ports may be forwarders to another replica. `PromoteReplica` and
   `DemoteToReplica` take the project's ports from the forwarders before they start Postgres on one
   (`PlaneOptions.HoldPorts`, `SetPortHolder`; the daemon binds it to `mesh.Forwarders.Suspend`). A
-  demotion gives them back when it returns. A promotion keeps them until `Start` of the project
-  succeeds on the node, which is after the registry names the node the home, and gives them back at
-  once when it fails. `Start` of a project with no hold does nothing more than before.
+  promotion does so once the standby is promoted, so a promotion that stops earlier leaves the standby's
+  stream through the forwarder alone. A demotion gives them back when it returns. A promotion keeps
+  them until `Start` of the project succeeds on the node, which is after the registry names the node
+  the home, and gives them back at once when it fails. `Start` of a project with no hold does nothing more than before.
 - `ReloadSchema` and `RunSchemaReload` send `SIGUSR1` to the replica's PostgREST every
   `[replicas] schema_reload_seconds` (default 10): the NOTIFY alone can arrive before the WAL of the
   change was replayed (spike S3). A PostgREST that started less than 5 seconds ago is left alone, because

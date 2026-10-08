@@ -66,9 +66,10 @@ func (pl *PostgresPlane) writePromoteOK(ref string, epoch int64) error {
 // when the registry names this node the home (Start).
 //
 // On a node of a cluster the canonical ports are forwarders to the old home until the registry moves
-// the home, and Start comes after that. PromoteReplica takes the ports from the forwarders before it
-// starts the primary (PlaneOptions.HoldPorts) and keeps them until Start succeeds; a failure gives
-// them back.
+// the home, and Start comes after that. PromoteReplica takes the ports from the forwarders once the
+// standby is promoted, before it starts the primary (PlaneOptions.HoldPorts), and keeps them until
+// Start succeeds; a failure gives them back. A promotion that ends before that point (the replay did
+// not reach the position) leaves the forwarders, and the standby's stream through them, alone.
 //
 // It can be repeated after a failure at any point: a cluster that was promoted but not restarted
 // is restarted as a primary, and one that already runs as a primary on the canonical port is left
@@ -84,7 +85,6 @@ func (pl *PostgresPlane) PromoteReplica(ctx context.Context, t ReplicaTarget, o 
 	if st, err := pl.sql().Status(ctx, addrOf(pl.paths(p))); err == nil && !st.InRecovery && pl.promoteOKAtLeast(p.Ref, o.Epoch) {
 		return nil // promoted and restarted earlier
 	}
-	pl.holdPorts(p.Ref)
 	if err := pl.promote(ctx, t, o); err != nil {
 		pl.releasePorts(p.Ref)
 		return err
@@ -143,7 +143,9 @@ func (pl *PostgresPlane) promote(ctx context.Context, t ReplicaTarget, o Promote
 		return fmt.Errorf("%w: %s: %v", ErrNotStandby, rp.Data, err)
 	}
 
-	// The cluster runs on the replica port with the standby's unit; restart it from the primary's.
+	// The cluster runs on the replica port with the standby's unit; restart it from the primary's. The
+	// forwarders are in the way of that start only, so they keep the standby's stream until here.
+	pl.holdPorts(p.Ref)
 	if hasPostgREST(p.Ref) {
 		if err := pl.sup.Stop(ctx, config.UnitName(config.SvcPostgREST, p.Ref)); err != nil {
 			return err

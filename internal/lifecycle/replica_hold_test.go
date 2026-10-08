@@ -138,27 +138,43 @@ func TestPromoteReplicaTakesTheCanonicalPortFromTheForwarder(t *testing.T) {
 }
 
 func TestAFailedPromotionGivesThePortsBack(t *testing.T) {
-	f, _ := forwarderFixture(t)
-	h := &portHolder{} // the forwarder stays: the promotion fails before it needs the port
+	// The forwarder stays, so the primary cannot start on the port the promotion took: the hold is
+	// given back when the call fails.
+	f, fwd := forwarderFixture(t)
+	h := &portHolder{}
 	f.pl.SetPortHolder(h.hold)
-	f.sql.promoteErr = errors.New("pg_promote: the promotion did not finish")
 	if err := f.pl.PromoteReplica(context.Background(), f.t, PromoteOptions{Epoch: 2}); err == nil {
-		t.Fatal("the promotion succeeded")
+		t.Fatal("the promotion succeeded beside the forwarder")
 	}
 	if got := h.state(); got != "held ["+testRef+"], released ["+testRef+"]" {
 		t.Fatalf("after a failed promotion: %s", got)
 	}
-	// A promotion that is not needed holds nothing: the cluster is a primary on the canonical port.
-	g := newReplicaFixture(t)
-	g.seeded(t, false)
-	g.sql.status[g.cp.Port] = ClusterStatus{}
-	if err := g.pl.writePromoteOK(testRef, 4); err != nil {
-		t.Fatal(err)
-	}
+	fwd.Close()
+
+	// A promotion that ends before the standby is promoted leaves the forwarders and the stream
+	// through them alone.
+	g, _ := forwarderFixture(t)
 	h2 := &portHolder{}
 	g.pl.SetPortHolder(h2.hold)
-	if err := g.pl.PromoteReplica(context.Background(), g.t, PromoteOptions{Epoch: 4}); err != nil || len(h2.held) != 0 {
-		t.Fatalf("a repeated promotion: %v, %s", err, h2.state())
+	g.sql.promoteErr = errors.New("pg_promote: the promotion did not finish")
+	if err := g.pl.PromoteReplica(context.Background(), g.t, PromoteOptions{Epoch: 2}); err == nil {
+		t.Fatal("the promotion succeeded")
+	}
+	if len(h2.held) != 0 {
+		t.Fatalf("a promotion that did not start took the ports: %s", h2.state())
+	}
+
+	// A promotion that is not needed holds nothing: the cluster is a primary on the canonical port.
+	k := newReplicaFixture(t)
+	k.seeded(t, false)
+	k.sql.status[k.cp.Port] = ClusterStatus{}
+	if err := k.pl.writePromoteOK(testRef, 4); err != nil {
+		t.Fatal(err)
+	}
+	h3 := &portHolder{}
+	k.pl.SetPortHolder(h3.hold)
+	if err := k.pl.PromoteReplica(context.Background(), k.t, PromoteOptions{Epoch: 4}); err != nil || len(h3.held) != 0 {
+		t.Fatalf("a repeated promotion: %v, %s", err, h3.state())
 	}
 }
 
