@@ -4,8 +4,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -240,66 +238,4 @@ func uriEncode(s string, keepSlash bool) string {
 		}
 	}
 	return b.String()
-}
-
-// Scope is who signed a request and for what.
-type Scope struct {
-	AccessKeyID string
-	Date        string
-	Region      string
-	Service     string
-}
-
-// Verify checks the SigV4 signature on a request received by a server, the way an AWS endpoint
-// does, and returns the scope it was signed for. lookup returns the credentials for an access key
-// id. body is the request payload. It exists for the fake server in awsfake; the client never
-// calls it.
-func Verify(r *http.Request, body []byte, lookup func(accessKeyID string) (Credentials, bool)) (Scope, error) {
-	auth := r.Header.Get("Authorization")
-	rest, ok := strings.CutPrefix(auth, signAlgorithm+" ")
-	if !ok {
-		return Scope{}, errors.New("no AWS4-HMAC-SHA256 Authorization header")
-	}
-	fields := map[string]string{}
-	for _, f := range strings.Split(rest, ",") {
-		k, v, _ := strings.Cut(strings.TrimSpace(f), "=")
-		fields[k] = v
-	}
-	cred := strings.Split(fields["Credential"], "/")
-	if len(cred) != 5 || cred[4] != "aws4_request" {
-		return Scope{}, fmt.Errorf("malformed credential scope %q", fields["Credential"])
-	}
-	sc := Scope{AccessKeyID: cred[0], Date: cred[1], Region: cred[2], Service: cred[3]}
-	creds, found := lookup(sc.AccessKeyID)
-	if !found {
-		return sc, fmt.Errorf("unknown access key id %q", sc.AccessKeyID)
-	}
-	if creds.SessionToken != r.Header.Get("X-Amz-Security-Token") {
-		return sc, errors.New("the session token does not match the access key")
-	}
-	stamp := r.Header.Get("X-Amz-Date")
-	t, err := time.Parse(timeFormat, stamp)
-	if err != nil || t.Format(dateFormat) != sc.Date {
-		return sc, fmt.Errorf("X-Amz-Date %q does not match the credential scope date %q", stamp, sc.Date)
-	}
-	names := strings.Split(fields["SignedHeaders"], ";")
-	signedSet := map[string]bool{}
-	for _, n := range names {
-		signedSet[n] = true
-	}
-	for _, need := range []string{"host", "x-amz-date"} {
-		if !signedSet[need] {
-			return sc, fmt.Errorf("the %s header is not signed", need)
-		}
-	}
-	if r.Header.Get("X-Amz-Security-Token") != "" && !signedSet["x-amz-security-token"] {
-		return sc, errors.New("the x-amz-security-token header is not signed")
-	}
-	host := r.Host
-	req := signRequest{Method: r.Method, Path: r.URL.EscapedPath(), Query: r.URL.RawQuery, Host: host, Header: r.Header, Body: body}
-	want := req.sign(creds, sc.Region, sc.Service, t, names)
-	if !hmac.Equal([]byte(want.Signature), []byte(fields["Signature"])) {
-		return sc, errors.New("the request signature does not match")
-	}
-	return sc, nil
 }

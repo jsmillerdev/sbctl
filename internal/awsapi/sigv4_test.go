@@ -3,8 +3,12 @@ package awsapi
 import (
 	"encoding/hex"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -251,6 +255,39 @@ func TestCredentialsPrintWithoutTheSecret(t *testing.T) {
 	for _, s := range []string{c.String(), fmt.Sprintf("%v %+v %#v", c, c, c)} {
 		if strings.Contains(s, "very-secret") || strings.Contains(s, "tok") || !strings.Contains(s, "AKIAEXAMPLE") {
 			t.Errorf("printed credentials: %s", s)
+		}
+	}
+}
+
+// The production package only signs. Checking a signature is the fake's job (awsfake.Verify), so
+// the daemon does not carry a verifier it never calls.
+func TestProductionPackageOnlySigns(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range f.Decls {
+			switch d := d.(type) {
+			case *ast.FuncDecl:
+				if d.Recv == nil && d.Name.Name == "Verify" {
+					t.Errorf("%s declares Verify", name)
+				}
+			case *ast.GenDecl:
+				for _, s := range d.Specs {
+					if ts, ok := s.(*ast.TypeSpec); ok && ts.Name.Name == "Scope" {
+						t.Errorf("%s declares Scope", name)
+					}
+				}
+			}
 		}
 	}
 }

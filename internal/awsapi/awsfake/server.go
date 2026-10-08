@@ -1,6 +1,6 @@
 // Package awsfake is an in-process fake of the AWS endpoints that package awsapi calls: EC2,
 // Secrets Manager, STS and the instance metadata service, all on one loopback listener. It checks
-// every signature with awsapi.Verify, so a test notices a client that signs the wrong thing or
+// every signature with Verify, so a test notices a client that signs the wrong thing or
 // uses the wrong credentials, and it records every call in arrival order, so a test can assert
 // that a fencer stopped the peer, waited for "stopped" and only then took the address.
 //
@@ -276,7 +276,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonAPI := strings.HasPrefix(r.Header.Get("X-Amz-Target"), "secretsmanager.")
 	s.mu.Lock()
-	sc, verr := awsapi.Verify(r, body, func(id string) (awsapi.Credentials, bool) { c, ok := s.creds[id]; return c, ok })
+	sc, verr := Verify(r, body, func(id string) (awsapi.Credentials, bool) { c, ok := s.creds[id]; return c, ok })
 	s.mu.Unlock()
 	rec := Call{AccessKeyID: sc.AccessKeyID, Service: sc.Service}
 	if jsonAPI {

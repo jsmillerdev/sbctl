@@ -74,11 +74,11 @@ The metadata service has its own loop: a token request, then the read with `X-aw
 
 ## The signer
 
-`Sign(req, body, creds, region, service, now)` sets `X-Amz-Date`, `X-Amz-Security-Token` when the credentials have a token, and `Authorization`. It signs `Host` and every header on the request except `Authorization`, `User-Agent`, `X-Amzn-Trace-Id`, `Expect`, `Connection`, `Transfer-Encoding` and `Content-Length`. The canonical path is the escaped path encoded a second time, as every AWS service except S3 expects; the services here use the path `/`. `internal/backup` does not export a signer (it uses the AWS SDK), so this one is separate. `Verify` checks a received request the way an AWS endpoint does; `awsfake` uses it.
+`Sign(req, body, creds, region, service, now)` sets `X-Amz-Date`, `X-Amz-Security-Token` when the credentials have a token, and `Authorization`. It signs `Host` and every header on the request except `Authorization`, `User-Agent`, `X-Amzn-Trace-Id`, `Expect`, `Connection`, `Transfer-Encoding` and `Content-Length`. The canonical path is the escaped path encoded a second time, as every AWS service except S3 expects; the services here use the path `/`. `internal/backup` does not export a signer (it uses the AWS SDK), so this one is separate. The package only signs. `awsfake.Verify` checks a received request the way an AWS endpoint does, by signing a copy that carries just the headers the request names as signed and comparing; it refuses a request that signs a header `Sign` leaves out, and returns the `awsfake.Scope` (access key id, date, region, service) it was signed for.
 
 ## The fake
 
-`awsfake.New(t)` starts one loopback server for all four services and stops it with the test. It checks every signature, so a client that signs the wrong thing, or with the wrong credentials, gets `SignatureDoesNotMatch`.
+`awsfake.New(t)` starts one loopback server for all four services and stops it with the test. It checks every signature with `awsfake.Verify`, so a client that signs the wrong thing, or with the wrong credentials, gets `SignatureDoesNotMatch`.
 
 ```go
 fake := awsfake.New(t)
@@ -117,7 +117,8 @@ What it does not model: IAM policy evaluation (use `Deny`), tag-scoped resources
 - the `DryRun` mapping, error parsing, retries (throttle codes, the jittered schedule and its bounds), a cancelled context and endpoint and region resolution;
 - the credential chain, the cache, the instance-role path, `AWS_EC2_METADATA_DISABLED` and the role-only switch;
 - the metadata service token flow, with an expired token and a refused one, and the memo of a service that does not answer;
-- the fake: the order of the fencing sequence, a stop that needs `Force`, address moves and replacement, `Deny`, signature checks and paging.
+- the fake: the order of the fencing sequence, a stop that needs `Force`, address moves and replacement, `Deny`, faults that take effect, signature checks (`awsfake.Verify` accepts what `Sign` produces and refuses a changed body, query, method, header, host, scope, date, token or secret) and paging;
+- that the production package declares no `Verify` or `Scope`.
 
 ## Limits
 
