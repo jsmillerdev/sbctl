@@ -17,7 +17,7 @@ Every command takes `--dry-run`, which prints the `aws` commands and runs none. 
 `update` changes a stack to the template of the release the script belongs to, and only in ways that cannot replace or interrupt the node. Steps:
 
 1. It reads the instance id, the region and the tag `supavise:stack-name` from the node's metadata service when it runs on one, then switches the metadata service off for every `aws` call. The stack is changed with your credentials; a credential that is an instance role is refused.
-2. It reads the stack (`describe-stacks`) and refuses one that is not in a `*_COMPLETE` state. On a node, the stack's `InstanceId` output must be this instance. A stack made in the console with an empty `AmiId` gets the image its instance runs as `AmiId`, so that the update cannot replace the instance for a newer image.
+2. It reads the stack (`describe-stacks`) and refuses one that is not at rest (created, updated, or rolled back to its last update); a stack that is changing or whose creation failed has to be waited for or deleted. On a node, the stack's `InstanceId` output must be this instance. A stack made in the console with an empty `AmiId` gets the image its instance runs as `AmiId`, so that the update cannot replace the instance for a newer image.
 3. It builds the parameters: `UsePreviousValue` for every parameter that the stack has and the template declares, `NoEcho` ones included (so `KeyEscrowPassphrase` and `AdminEmail` need not be given again), the value of each `--set NAME=VALUE`, and nothing for a parameter that is new to the stack, which takes its default. `SupaviseVersion` cannot be set: it feeds the user data, and a different value would replace the instance.
 4. It downloads the template of the release (unless `--template FILE` is given), checks the signature of `SHA256SUMS` with the release key stamped into the script, the template against the list, and the script itself against the list.
 5. A template over 51,200 bytes, the size the API takes inline, is copied to `s3://<BackupBucket>/_stack/<sha256>.yaml` and read from there (`--template-bucket` names another bucket in the stack's region).
@@ -55,7 +55,7 @@ Before an instance of the stack is replaced on purpose (a changed image or user 
 5. As soon as the new stack has its Elastic IP, long before the server has booted, it sets the first free `PeerCidr` of the leader stack to that address (`update`, same review) so that the join can connect.
 6. It waits for the new stack to finish.
 
-A template over the inline size goes through a bucket in the new server's region: the leader's backup bucket when the regions are the same, else `--template-bucket`, else `supavise-templates-<account>-<region>`, which the script creates (private, kept when the stack is deleted).
+A template over the inline size goes through a bucket in the stack's region: `--template-bucket` if given, else for the new server the leader's backup bucket when the regions are the same, else `supavise-templates-<account>-<region>`, which the script creates (private, kept when the stack is deleted). The leader's own update always uses the leader's backup bucket.
 
 ## A new stack
 
