@@ -89,6 +89,10 @@ type Check struct {
 	Detail string `json:"detail,omitempty"`
 	// Blocking: the move is refused while it fails, unless Force overrides it.
 	Blocking bool `json:"blocking"`
+	// Hard: Force does not override it either. It marks the checks whose failure would lose
+	// data or leave two writers (Storage objects that exist only on the old node, a fence that
+	// cannot be made).
+	Hard bool `json:"hard,omitempty"`
 }
 
 // ProjectPlan is what a server move does with one project.
@@ -105,8 +109,19 @@ type ProjectPlan struct {
 
 // Plan is what --dry-run prints.
 type Plan struct {
+	// Kind is "switchover" (the old primary is alive and stops cleanly) or "failover" (it is fenced
+	// first). From and To are the node ids the move goes between, Ref is the project of a project
+	// move and Epoch the cluster epoch the move runs in.
+	Kind  string `json:"kind,omitempty"`
+	Ref   string `json:"ref,omitempty"`
+	From  string `json:"from,omitempty"`
+	To    string `json:"to,omitempty"`
+	Epoch int64  `json:"epoch,omitempty"`
+
 	Checks   []Check       `json:"checks"`
 	Projects []ProjectPlan `json:"projects,omitempty"`
+	// Notes say what else the move does or leaves to the operator ("DNS: point api. at ...").
+	Notes []string `json:"notes,omitempty"`
 }
 
 // Blocked lists the failed blocking checks.
@@ -114,6 +129,18 @@ func (p Plan) Blocked() []Check {
 	var out []Check
 	for _, c := range p.Checks {
 		if c.Blocking && !c.OK {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// Refused lists the failed blocking checks that stop a move that was started with force: all
+// of them without it, and only the Hard ones with it.
+func (p Plan) Refused(force bool) []Check {
+	var out []Check
+	for _, c := range p.Blocked() {
+		if !force || c.Hard {
 			out = append(out, c)
 		}
 	}
