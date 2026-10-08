@@ -44,11 +44,13 @@ func wireProxy(ctx context.Context, w *Wire) error {
 	})
 	mesh.Handle("GET "+peerapi.PathCerts, proxy.CertsHandler(w.Cfg.Paths().Certs(), ms.IsLeader, w.Log))
 
+	certs := proxy.MeshCerts{RPC: m, Leader: leader}
 	c := &proxy.Cluster{
 		Self:  func() string { return ms.Self().ID },
 		RTT:   m.RTT,
-		Certs: &proxy.CertSync{Role: role, Source: proxy.MeshCerts{RPC: m, Leader: leader}},
+		Certs: &proxy.CertSync{Role: role, Source: certs},
 	}
+	w.AddServerCheck(certificatesCheck(certs, w.Cfg.Paths().Certs(), role, func() string { return ms.Self().ID }))
 	// The replica controller (wire_replicas.go) knows the lag; without it the load balancer's lag
 	// limit has nothing to read.
 	if svc, ok := Get[replicas.Service](w); ok {
@@ -58,9 +60,5 @@ func wireProxy(ctx context.Context, w *Wire) error {
 	// The proxy serves <ref>-lb.api.<domain> once a project has a replica; Studio lists the endpoint
 	// only if the Management API says so.
 	w.API.LoadBalancers = true
-	// The proxy can tell whether the certificates it mirrored are the leader's; the preflight of a
-	// server move does not ask yet, because the proxy offers no such question (proxy.CertSync has no
-	// state to read).
-	w.Off("failover.CertificateCheck", "the proxy does not report whether its mirror of the leader's certificates is current; a server move does not check it")
 	return nil
 }
