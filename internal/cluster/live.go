@@ -169,7 +169,9 @@ func (l *Live) adoptRecord() {
 		l.o.Log.Warn("membership: fenced.json cannot be read", "error", err)
 		return
 	}
-	if rec == nil {
+	if rec == nil || rec.Removed {
+		// A record of a removal is the retirement's own: it ends the daemon, and the node comes up down.
+		// It is not a fence by another node, and the membership of a running leader does not read it as one.
 		return
 	}
 	l.mu.Lock()

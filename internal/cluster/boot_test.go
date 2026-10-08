@@ -772,6 +772,16 @@ func TestLiveReportsFencedWhenTheRecordAppears(t *testing.T) {
 		t.Fatalf("role %s with the registry down", g.Role())
 	}
 
+	// The record of a removal is the retirement's own and does not fence a running leader.
+	r, _, rcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	if err := WriteFenced(rcfg, FencedRecord{Reason: RemovedReason, Removed: true, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	r.Refresh(ctx)
+	if r.Role() != RoleLeader {
+		t.Fatalf("role %s with the record of a removal", r.Role())
+	}
+
 	// A record that cannot be read does not make a leader a fenced node by itself.
 	h, _, hcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
 	if err := os.WriteFile(fenced.NodePath(hcfg.Paths()), []byte("{"), 0o600); err != nil {

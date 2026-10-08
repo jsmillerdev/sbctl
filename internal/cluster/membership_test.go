@@ -1772,3 +1772,37 @@ func TestConfigSyncRefreshesTheClusterSettingsFromTheLeader(t *testing.T) {
 		t.Fatalf("a server that never joined: %v, %v", got, err)
 	}
 }
+
+// The report intake names the reporting node from the certificate of the connection, never from the
+// body: a node cannot report for another, and an empty name in the body is the caller's own.
+func TestReportIntakeTakesTheNodeFromTheCertificate(t *testing.T) {
+	l := newLeader(t)
+	mux := mesh.NewMux()
+	(&PeerAPI{Authority: l.auth, Topology: l.live, Cfg: l.cfg, Reports: l.rep}).Register(mux)
+	var seen []string
+	l.rep.Subscribe(func(rep peerapi.Report) { seen = append(seen, rep.Node) })
+	post := func(body string) int {
+		req := httptest.NewRequest("POST", peerapi.PathReport, strings.NewReader(body))
+		req = req.WithContext(mesh.WithPeer(req.Context(), mesh.Peer{Node: "n2", State: registry.NodeActive}))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := post(`{"node":"n3","epoch":1}`); code != http.StatusForbidden {
+		t.Fatalf("a report for another node: %d", code)
+	}
+	if len(seen) != 0 {
+		t.Fatalf("the subscriber heard of a refused report: %v", seen)
+	}
+	for _, body := range []string{`{"epoch":1}`, `{"node":"n2","epoch":2}`} {
+		if code := post(body); code != http.StatusNoContent {
+			t.Fatalf("%s: %d", body, code)
+		}
+	}
+	if got := strings.Join(seen, ","); got != "n2,n2" {
+		t.Fatalf("the subscriber saw %q, want the peer's name twice", got)
+	}
+	if _, ok := l.rep.Latest("n3"); ok {
+		t.Fatal("a report was kept for n3")
+	}
+}
