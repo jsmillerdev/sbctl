@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,8 +59,8 @@ func TestMigrateCopiesVerifiesAndSwitches(t *testing.T) {
 	if !heldAtStop || hold.Held(e.paths, time.Now()) {
 		t.Errorf("write hold: during the stop %v, afterwards %v", heldAtStop, hold.Held(e.paths, time.Now()))
 	}
-	if len(e.rd.reads) == 0 {
-		t.Error("nothing was read back through Storage")
+	if len(e.rd.reads) == 0 || !strings.Contains(e.out.String(), "Storage served 2 sampled objects from the bucket") {
+		t.Errorf("nothing was read back through Storage:\n%s", e.out.String())
 	}
 	if len(st.Tenants) != 2 || st.Tenants[0].Rows != 3 || st.Tenants[1].Rows != 2 || st.Tenants[0].Bytes != 300_017 {
 		t.Errorf("verified: %+v", st.Tenants)
@@ -331,7 +332,6 @@ func TestResumeAfterAFailureInEachPhase(t *testing.T) {
 				}
 			}
 		}, clean: func(e *env) { e.svc.startErr, e.svc.onStart = nil, nil }},
-		"reading back": {phase: PhaseCatchingUp, arm: func(e *env) { e.rd.err = boom }, clean: func(e *env) { e.rd.err = nil }},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t)
@@ -612,7 +612,7 @@ func TestWriteHold(t *testing.T) {
 		t.Error("the hold expired while the run lives")
 	}
 	release()
-	if hold.Held(e.paths, time.Now()) || e.exists(hold.File) {
+	if hold.Held(e.paths, time.Now()) || fileExists(hold.Path(e.paths)) {
 		t.Error("held after release")
 	}
 	// A run that died leaves a marker that expires.
@@ -620,7 +620,7 @@ func TestWriteHold(t *testing.T) {
 	if !hold.Held(e.paths, now) || hold.Held(e.paths, now.Add(2*time.Minute)) {
 		t.Error("expiry")
 	}
-	if hold.ClearStale(e.paths, now) || !hold.ClearStale(e.paths, now.Add(2*time.Minute)) || e.exists(hold.File) {
+	if hold.ClearStale(e.paths, now) || !hold.ClearStale(e.paths, now.Add(2*time.Minute)) || fileExists(hold.Path(e.paths)) {
 		t.Error("ClearStale")
 	}
 }
@@ -635,5 +635,348 @@ func TestStatusWithoutARun(t *testing.T) {
 	buf.WriteString(Describe(&State{Phase: PhaseCatchingUp, Dest: Destination{Bucket: "b"}, Error: "x"}, time.Now()))
 	if !strings.Contains(buf.String(), "supavise storage migrate --resume") {
 		t.Errorf("an unfinished run does not say how to continue:\n%s", buf.String())
+	}
+}
+
+// storageStartsOnTheBucket arms e so that Storage, as soon as it starts on the bucket, takes a write
+// that only the bucket has, and the read-back through it fails.
+func storageStartsOnTheBucket(e *env) {
+	e.svc.onStart = func() {
+		if e.set.backend == "s3" {
+			e.bucket.mu.Lock()
+			e.bucket.objs[refA+"/avatars/written.bin/v20"] = memObj{data: []byte("only in the bucket"),
+				meta: FileMeta{ContentType: "image/png", CacheControl: "no-cache"}, mod: time.Now()}
+			e.bucket.mu.Unlock()
+		}
+	}
+	e.rd.err = errors.New("boom")
+}
+
+func TestAFailureAfterStorageStartedOnTheBucketIsNotUndone(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	storageStartsOnTheBucket(e)
+	err := e.engine().Migrate(ctx, e.req())
+	if err == nil || !strings.Contains(err.Error(), "boom") || !strings.Contains(err.Error(), "--rollback") {
+		t.Fatalf("Migrate = %v", err)
+	}
+	st := e.state()
+	if st.Phase != PhaseFlipping || st.Step != stepLive {
+		t.Fatalf("state: %s/%s", st.Phase, st.Step)
+	}
+	// Storage keeps running on the bucket, with the configuration that names it.
+	if e.set.backend != "s3" || e.set.useFiles != 0 || e.svc.log() != "stop,start" || !e.exists("objects") {
+		t.Errorf("backend %q, UseFiles %d, service %s", e.set.backend, e.set.useFiles, e.svc.log())
+	}
+	if d := Describe(st, time.Now()); !strings.Contains(d, "--rollback") || !strings.Contains(d, "--resume") {
+		t.Errorf("status:\n%s", d)
+	}
+
+	// The write Storage took on the bucket comes back with the rollback.
+	e.rd.err = nil
+	mustf(t, e.engine().Rollback(ctx, e.req()), "rollback")
+	st = e.state()
+	if st.Phase != PhaseRolledBack || st.Downloaded.Files != 1 || e.set.backend != "" || e.set.useFiles != 1 {
+		t.Errorf("state: %+v, backend %q", st, e.set.backend)
+	}
+	f := filepath.Join(e.paths.StorageObjects(refA), "avatars", "written.bin", "v20")
+	if b, err := os.ReadFile(f); err != nil || string(b) != "only in the bucket" {
+		t.Errorf("the write on the bucket: %q, %v", b, err)
+	}
+}
+
+func TestResumeAfterTheReadBackFailedFinishesTheSwitch(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	storageStartsOnTheBucket(e)
+	if err := e.engine().Migrate(ctx, e.req()); err == nil {
+		t.Fatal("Migrate worked")
+	}
+	e.rd.err = nil
+	mustf(t, e.engine().Resume(ctx, e.req()), "resume")
+	st := e.state()
+	if st.Phase != PhaseDone || st.Retained == "" || e.set.useBucket != 1 || e.set.useFiles != 0 {
+		t.Errorf("state %+v, settings %+v", st, e.set)
+	}
+	// Storage was running: it is not started again.
+	if got := e.svc.log(); got != "stop,start" {
+		t.Errorf("service calls: %s", got)
+	}
+}
+
+func TestStorageThatIsDownAfterItWasOnTheBucketIsNotPutBackOnTheFiles(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	storageStartsOnTheBucket(e)
+	if err := e.engine().Migrate(ctx, e.req()); err == nil {
+		t.Fatal("Migrate worked")
+	}
+	e.rd.err = nil
+	e.svc.health, e.svc.startErr = errors.New("down"), errors.New("does not start")
+	err := e.engine().Resume(ctx, e.req())
+	if err == nil || !strings.Contains(err.Error(), "does not start") || !strings.Contains(err.Error(), "--rollback") {
+		t.Fatalf("Resume = %v", err)
+	}
+	if st := e.state(); st.Phase != PhaseFlipping || st.Step != stepLive || e.set.backend != "s3" || e.set.useFiles != 0 {
+		t.Errorf("state %s/%s, backend %q, UseFiles %d", st.Phase, st.Step, e.set.backend, e.set.useFiles)
+	}
+	e.svc.health, e.svc.startErr = nil, nil
+	mustf(t, e.engine().Resume(ctx, e.req()), "resume")
+	if e.state().Phase != PhaseDone {
+		t.Errorf("phase %s", e.state().Phase)
+	}
+}
+
+func TestPreflightTriesTheSwitchBeforeAnythingIsCopied(t *testing.T) {
+	t.Run("the change would not take effect", func(t *testing.T) {
+		e := newEnv(t)
+		e.populate()
+		e.set.previewErr = errors.New("a file in config.d overrides config.toml")
+		err := e.engine().Migrate(ctx, e.req())
+		if err == nil || !strings.Contains(err.Error(), "would not take effect") || !strings.Contains(err.Error(), "overrides") {
+			t.Fatalf("Migrate = %v", err)
+		}
+		if st, _ := ReadState(e.paths); st != nil || e.svc.log() != "" || len(e.bucket.keys()) != 0 {
+			t.Errorf("something happened: state %v, service %q, keys %q", st, e.svc.log(), e.bucket.keys())
+		}
+	})
+	t.Run("Storage could not start", func(t *testing.T) {
+		e := newEnv(t)
+		e.populate()
+		e.svc.renderErr = errors.New("needs storage_s3_access_key_id")
+		err := e.engine().Migrate(ctx, e.req())
+		if err == nil || !strings.Contains(err.Error(), "could not start on the bucket") || !strings.Contains(err.Error(), "storage_s3_access_key_id") {
+			t.Fatalf("Migrate = %v", err)
+		}
+		if st, _ := ReadState(e.paths); st != nil || e.svc.log() != "" {
+			t.Errorf("something happened: state %v, service %q", st, e.svc.log())
+		}
+	})
+	t.Run("it broke during the copy", func(t *testing.T) {
+		e := newEnv(t)
+		e.populate()
+		var once sync.Once
+		e.bucket.onPut = func(key string) {
+			if !strings.HasPrefix(key, ".supavise") {
+				once.Do(func() { e.svc.setRenderErr(errors.New("the key is gone")) })
+			}
+		}
+		err := e.engine().Migrate(ctx, e.req())
+		if err == nil || !strings.Contains(err.Error(), "the key is gone") {
+			t.Fatalf("Migrate = %v", err)
+		}
+		// The check came before the stop, so Storage was never touched.
+		if e.svc.log() != "" || hold.Held(e.paths, time.Now()) || !e.exists("objects") {
+			t.Errorf("service %q", e.svc.log())
+		}
+		e.svc.setRenderErr(nil)
+		mustf(t, e.engine().Resume(ctx, e.req()), "resume")
+		if e.state().Phase != PhaseDone {
+			t.Errorf("phase %s", e.state().Phase)
+		}
+	})
+}
+
+func TestPassesOfTheSwitchRunAtFullSpeed(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	var mu sync.Mutex
+	var seen []string
+	e.bucket.onPut = func(key string) {
+		if strings.HasPrefix(key, ".supavise") {
+			return
+		}
+		l := e.bucket.lim
+		l.mu.Lock()
+		limited := l.rate > 0
+		l.mu.Unlock()
+		mu.Lock()
+		seen = append(seen, fmt.Sprintf("held=%v limited=%v", hold.Held(e.paths, time.Now()), limited))
+		mu.Unlock()
+	}
+	// A write that lands when Storage stops is sent by the pass of the switch.
+	e.svc.onStop = func() { e.put(refA, "avatars", "straggler.txt", "v8", []byte("one more"), "text/plain") }
+	req := e.req()
+	req.RateMiB = 1
+	mustf(t, e.engine().Migrate(ctx, req), "migrate")
+	count := map[string]int{}
+	for _, s := range seen {
+		count[s]++
+	}
+	if count["held=false limited=true"] != 5 || count["held=true limited=false"] != 1 || len(seen) != 6 {
+		t.Errorf("puts: %v", count)
+	}
+	if rate := e.bucket.lim.rate; rate != 1<<20 {
+		t.Errorf("the limit after the switch is %v bytes a second", rate)
+	}
+}
+
+func TestRecordThatDoesNotFitTheNodeIsRefused(t *testing.T) {
+	unfinished := func(t *testing.T) *env {
+		e := newEnv(t)
+		e.populate()
+		e.tenants.failOn = func(string) error { return errors.New("boom") }
+		if err := e.engine().Migrate(ctx, e.req()); err == nil {
+			t.Fatal("Migrate worked")
+		}
+		e.tenants.failOn = nil
+		return e
+	}
+	tamper := func(t *testing.T, e *env, f func(*State)) {
+		st := e.state()
+		f(st)
+		mustf(t, saveState(e.paths, st, time.Now()), "save")
+	}
+	t.Run("a backend to restore that is not one", func(t *testing.T) {
+		e := unfinished(t)
+		tamper(t, e, func(st *State) { st.PrevBackend = "file'\n[ports]" })
+		if err := e.engine().Resume(ctx, e.req()); err == nil || !strings.Contains(err.Error(), "never records") {
+			t.Errorf("Resume = %v", err)
+		}
+	})
+	t.Run("a directory outside the service directory", func(t *testing.T) {
+		e := unfinished(t)
+		for _, name := range []string{"../../etc", "objects", retainedPrefix + "x/../../y"} {
+			tamper(t, e, func(st *State) { st.KeepAs = name })
+			if err := e.engine().Resume(ctx, e.req()); err == nil || !strings.Contains(err.Error(), "not one this command keeps") {
+				t.Errorf("%q: Resume = %v", name, err)
+			}
+		}
+	})
+	t.Run("another service than the objects went to", func(t *testing.T) {
+		e := unfinished(t)
+		e.cfg.Fleet.StorageS3Endpoint = "http://elsewhere.test"
+		if err := e.engine().Resume(ctx, e.req()); err == nil || !strings.Contains(err.Error(), "another service") {
+			t.Errorf("Resume = %v", err)
+		}
+	})
+	t.Run("a finished run", func(t *testing.T) {
+		e := newEnv(t)
+		e.populate()
+		mustf(t, e.engine().Migrate(ctx, e.req()), "migrate")
+		e.cfg.Fleet.StorageS3ForcePathStyle = true
+		if err := e.engine().Rollback(ctx, e.req()); err == nil || !strings.Contains(err.Error(), "another service") {
+			t.Errorf("Rollback = %v", err)
+		}
+		e.cfg.Fleet.StorageS3ForcePathStyle = false
+		tamper(t, e, func(st *State) { st.Retained = "../../etc" })
+		if err := e.engine().Rollback(ctx, e.req()); err == nil || !strings.Contains(err.Error(), "not one this command keeps") {
+			t.Errorf("Rollback = %v", err)
+		}
+	})
+}
+
+func TestOnlyTheDirectoryThisRunNamedIsTakenForItsFiles(t *testing.T) {
+	e := newEnv(t) // Storage never stored an object
+	other := filepath.Join(e.paths.System("storage"), retainedPrefix+"20000101", "stub", "keep-me")
+	mustf(t, os.MkdirAll(filepath.Dir(other), 0o750), "mkdir")
+	mustf(t, os.WriteFile(other, []byte("an operator's copy"), 0o640), "write")
+	mustf(t, e.engine().Migrate(ctx, e.req()), "migrate")
+	st := e.state()
+	if st.Phase != PhaseDone || st.Retained != "" || st.KeepAs == "" {
+		t.Errorf("state: %+v", st)
+	}
+	if err := e.engine().Cleanup(ctx); err == nil {
+		t.Error("Cleanup worked on a run that kept nothing")
+	}
+	if !fileExists(other) {
+		t.Error("a directory this run did not name was deleted")
+	}
+	if !strings.Contains(e.out.String(), "nothing was read back") {
+		t.Errorf("a store without rows did not say so:\n%s", e.out.String())
+	}
+}
+
+func TestFileUnder(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "state", "objects", "stub", refA)
+	for rel, ok := range map[string]bool{
+		"docs/top.txt/v1": true, "docs/..hidden/v1": true, "docs/a b/ü.txt/v1": true, "docs/a\\b/v1": true,
+		"": false, ".": false, "..": false, "../x": false, "docs/../../x": false, "docs/./x": false, "docs//x": false,
+		"/etc/passwd": false, "docs/x/": false, "docs/\x00x/v1": false, "../" + refB + "/x": false,
+	} {
+		abs, got := fileUnder(root, rel)
+		if got != ok || (got && !strings.HasPrefix(abs, root+string(filepath.Separator))) {
+			t.Errorf("fileUnder(%q) = %q, %v; want %v", rel, abs, got, ok)
+		}
+	}
+}
+
+// treeOf lists the files below dir.
+func treeOf(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			out = append(out, p)
+		}
+		return err
+	})
+	mustf(t, err, "walk %s", dir)
+	return out
+}
+
+func TestRollbackRefusesKeysThatLeaveTheProject(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	mustf(t, e.engine().Migrate(ctx, e.req()), "migrate")
+	for _, k := range []string{
+		refA + "/../../../../escape-marker",          // out of the state directory
+		refA + "/avatars/../../" + refB + "/planted", // into another project's directory
+		refA + "/./dot/v1", refA + "//empty/v1", refA + "/a/../../../y", refA + "/",
+	} {
+		e.bucket.objs[k] = memObj{data: []byte("planted"), mod: time.Now()}
+	}
+	mustf(t, e.engine().Rollback(ctx, e.req()), "rollback")
+	for _, p := range treeOf(t, e.cfg.StateDir) {
+		if b := filepath.Base(p); b == "escape-marker" || b == "planted" || b == "y" || b == "empty" || b == "dot" {
+			t.Errorf("a hostile key was written: %s", p)
+		}
+	}
+	st := e.state()
+	if st.Phase != PhaseRolledBack || st.RefusedKeys != 6 || st.Downloaded.Files != 0 {
+		t.Errorf("state: %+v", st)
+	}
+	if out := e.out.String(); !strings.Contains(out, "cannot be files") || !strings.Contains(out, "escape-marker") {
+		t.Errorf("the rollback did not report the keys:\n%s", out)
+	}
+	if d := Describe(st, time.Now()); !strings.Contains(d, "refused") {
+		t.Errorf("status:\n%s", d)
+	}
+	// They are still in the bucket.
+	if _, ok := e.bucket.objs[refA+"/../../../../escape-marker"]; !ok {
+		t.Error("a refused key was removed from the bucket")
+	}
+}
+
+func TestRollbackDoesNotWriteThroughALink(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	mustf(t, e.engine().Migrate(ctx, e.req()), "migrate")
+	outside := t.TempDir()
+	link := filepath.Join(e.paths.System("storage"), e.state().Retained, "stub", refA, "linked")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("no links here: %v", err)
+	}
+	e.bucket.objs[refA+"/linked/name/v1"] = memObj{data: []byte("planted"), mod: time.Now()}
+	err := e.engine().Rollback(ctx, e.req())
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("Rollback = %v", err)
+	}
+	if got := treeOf(t, outside); len(got) != 0 {
+		t.Errorf("a file was written through the link: %v", got)
+	}
+}
+
+func TestLinksAreReportedByTheirPathBelowTheProject(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	link := filepath.Join(e.paths.StorageObjects(refA), "avatars", "link")
+	if err := os.Symlink("/etc/passwd", link); err != nil {
+		t.Skipf("no links here: %v", err)
+	}
+	mustf(t, e.engine().Migrate(ctx, e.req()), "migrate")
+	st := e.state()
+	if st.SkippedTotal != 1 || st.Skipped[0].Path != `"`+refA+`/avatars/link"` {
+		t.Errorf("skipped: %+v", st.Skipped)
 	}
 }

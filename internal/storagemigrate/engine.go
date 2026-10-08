@@ -163,6 +163,60 @@ func (e *Engine) begin(req Request) {
 	e.fence = false
 }
 
+// connect opens the bucket and hands it the limiter of the copy.
+func (e *Engine) connect(ctx context.Context, d Destination, c Credentials) (Bucket, error) {
+	b, err := e.open(ctx, d, c)
+	if err != nil {
+		return nil, err
+	}
+	if p, ok := b.(pacer); ok {
+		p.pace(e.lim)
+	}
+	return b, nil
+}
+
+// unthrottle lifts the rate limit until the returned function is called: the passes of the switch
+// run while writes are held or Storage is stopped, and the limit is there to spare the link of a
+// Storage that is serving.
+func (e *Engine) unthrottle() (restore func()) {
+	old := e.lim.setRate(0)
+	return func() { e.lim.setRate(old) }
+}
+
+// checkState refuses a record that this command could not have written for this node. It names the
+// backend, the directories and the service that --resume and --rollback act on.
+func (e *Engine) checkState(st *State) error {
+	record := filepath.Join(runDir(e.paths), stateFile)
+	if st.PrevBackend != "" && st.PrevBackend != "file" {
+		return fmt.Errorf("%s names %q as the backend before the migration, which this command never records", record, st.PrevBackend)
+	}
+	for _, name := range []string{st.Retained, st.KeepAs} {
+		if name != "" && (!strings.HasPrefix(name, retainedPrefix) || strings.ContainsRune(name, filepath.Separator)) {
+			return fmt.Errorf("%s names %q as a directory that keeps the files, which is not one this command keeps", record, name)
+		}
+	}
+	if st.Dest.Bucket == "" {
+		return fmt.Errorf("%s names no bucket", record)
+	}
+	if want := e.destination(Request{Bucket: st.Dest.Bucket}); st.Dest != want {
+		return fmt.Errorf("the run used %s but [fleet] now says %s: put the settings back, because Storage would use another service than the one the objects went to", st.Dest, want)
+	}
+	return nil
+}
+
+// String describes where the bucket is.
+func (d Destination) String() string {
+	at := "AWS"
+	if d.Endpoint != "" {
+		at = d.Endpoint
+	}
+	style := ""
+	if d.PathStyle {
+		style = ", path-style"
+	}
+	return fmt.Sprintf("bucket %q at %s (region %s%s)", d.Bucket, at, d.Region, style)
+}
+
 // Migrate starts a run: it checks the bucket and Storage, copies, verifies and switches.
 func (e *Engine) Migrate(ctx context.Context, req Request) error {
 	release, err := lock(e.paths)
@@ -183,12 +237,12 @@ func (e *Engine) Migrate(ctx context.Context, req Request) error {
 	if dest.Bucket == "" {
 		return errors.New("no bucket: give --bucket or set [fleet] storage_s3_bucket")
 	}
-	b, err := e.open(ctx, dest, req.Credentials)
+	e.begin(req)
+	b, err := e.connect(ctx, dest, req.Credentials)
 	if err != nil {
 		return err
 	}
-	e.begin(req)
-	if err := e.preflight(ctx, b); err != nil {
+	if err := e.preflight(ctx, b, dest, req.Credentials); err != nil {
 		return err
 	}
 	e.st = &State{ID: fmt.Sprintf("%x", e.now().UnixNano()), Phase: PhaseCopying, Dest: dest, Credentials: req.Credentials.Source,
@@ -200,11 +254,14 @@ func (e *Engine) Migrate(ctx context.Context, req Request) error {
 	return e.run(ctx, b)
 }
 
-// preflight checks what would otherwise fail halfway: that Storage runs and that the credentials
-// can write, read and delete in the bucket.
-func (e *Engine) preflight(ctx context.Context, b Bucket) error {
+// preflight checks what would otherwise fail halfway: that Storage runs, that the credentials can
+// write, read and delete in the bucket, and that the switch would take effect and Storage could start.
+func (e *Engine) preflight(ctx context.Context, b Bucket, dest Destination, c Credentials) error {
 	if err := e.d.Storage.Healthy(ctx); err != nil {
 		return fmt.Errorf("Storage is not healthy, so the switch could not be checked afterwards: %w", err)
+	}
+	if plainRemote(dest.Endpoint) {
+		e.say("warning: %s is not TLS: the objects and the signed requests cross the network unencrypted", dest.Endpoint)
 	}
 	key := fmt.Sprintf(".supavise-migrate-probe/%x", e.now().UnixNano())
 	body := []byte("supavise storage migrate")
@@ -222,6 +279,20 @@ func (e *Engine) preflight(ctx context.Context, b Bucket) error {
 	}
 	if err := b.Delete(ctx, key); err != nil {
 		return fmt.Errorf("the bucket does not take a delete with these credentials: %w", err)
+	}
+	return e.checkSwitch(ctx, dest, c)
+}
+
+// checkSwitch tries the new configuration without writing it: what the switch would make the node
+// load, and the unit of supavise-storage that follows from it. A configuration that fails here would
+// otherwise fail after Storage was stopped.
+func (e *Engine) checkSwitch(ctx context.Context, dest Destination, c Credentials) error {
+	cfg, err := e.d.Settings.Preview(ctx, dest, c)
+	if err != nil {
+		return fmt.Errorf("the switch would not take effect: %w", err)
+	}
+	if err := e.d.Storage.Render(ctx, cfg); err != nil {
+		return fmt.Errorf("supavise-storage could not start on the bucket with this configuration: %w", err)
 	}
 	return nil
 }
@@ -245,12 +316,15 @@ func (e *Engine) Resume(ctx context.Context, req Request) error {
 	case req.Bucket != "" && req.Bucket != st.Dest.Bucket:
 		return fmt.Errorf("the run in progress uses the bucket %q, not %q", st.Dest.Bucket, req.Bucket)
 	}
+	if err := e.checkState(st); err != nil {
+		return err
+	}
 	e.st, e.inv = st, map[string]inventory{}
-	b, err := e.open(ctx, st.Dest, req.Credentials)
+	e.begin(req)
+	b, err := e.connect(ctx, st.Dest, req.Credentials)
 	if err != nil {
 		return err
 	}
-	e.begin(req)
 	st.Error = ""
 	if st.Phase == PhaseRollingBack {
 		return e.rollback(ctx, b)

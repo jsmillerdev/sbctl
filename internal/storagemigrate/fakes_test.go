@@ -30,7 +30,11 @@ type memBucket struct {
 	dels  []string
 	onPut func(key string)
 	fail  func(op, key string) error
+	lim   *limiter
 }
+
+// pace implements pacer.
+func (b *memBucket) pace(l *limiter) { b.lim = l }
 
 type memObj struct {
 	data []byte
@@ -166,6 +170,9 @@ type fakeService struct {
 	startErr error
 	onStop   func()
 	onStart  func()
+
+	renderErr error
+	renders   int
 }
 
 func (s *fakeService) record(c string) { s.mu.Lock(); s.calls = append(s.calls, c); s.mu.Unlock() }
@@ -192,6 +199,15 @@ func (s *fakeService) Start(context.Context) error {
 	return nil
 }
 
+func (s *fakeService) Render(_ context.Context, cfg *config.Config) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.renders++
+	return s.renderErr
+}
+
+func (s *fakeService) setRenderErr(err error) { s.mu.Lock(); s.renderErr = err; s.mu.Unlock() }
+
 func (s *fakeService) log() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -208,6 +224,19 @@ type fakeSettings struct {
 	err       error
 	dest      Destination
 	creds     Credentials
+
+	previewErr error
+	previews   int
+}
+
+func (s *fakeSettings) Preview(_ context.Context, d Destination, c Credentials) (*config.Config, error) {
+	s.previews++
+	if s.previewErr != nil {
+		return nil, s.previewErr
+	}
+	cfg := config.Default()
+	cfg.Fleet.StorageBackend, cfg.Fleet.StorageS3Bucket = "s3", d.Bucket
+	return cfg, nil
 }
 
 func (s *fakeSettings) UseBucket(_ context.Context, d Destination, c Credentials) (bool, error) {
@@ -400,8 +429,14 @@ func (e *env) state() *State {
 	return st
 }
 
+// exists says whether rel is below Storage's own directory.
 func (e *env) exists(rel string) bool {
 	_, err := os.Lstat(filepath.Join(e.paths.System(config.SvcStorage), rel))
+	return err == nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Lstat(path)
 	return err == nil
 }
 

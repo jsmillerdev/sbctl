@@ -11,12 +11,13 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/storagemigrate/hold"
 )
 
 func TestWireStorageMigrateSaysWhenARunStopped(t *testing.T) {
 	cfg := config.Default()
 	cfg.StateDir = t.TempDir()
-	dir := cfg.Paths().System(config.SvcStorage)
+	dir := hold.Dir(cfg.Paths())
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}

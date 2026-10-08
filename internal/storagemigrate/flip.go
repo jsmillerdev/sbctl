@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,7 +19,7 @@ import (
 )
 
 var (
-	flipSteps     = []string{stepHold, stepFinal, stepStopped, stepFence, stepSwitched, stepStarted}
+	flipSteps     = []string{stepHold, stepFinal, stepStopped, stepFence, stepSwitched, stepLive, stepStarted}
 	rollbackSteps = []string{stepHold, stepRestore, stepFinal, stepStopped, stepFence, stepSwitched, stepStarted}
 )
 
@@ -46,19 +45,28 @@ func (e *Engine) mark(step string) error {
 // supavise-storage is stopped, and a pass over files that nothing writes to any more copies the
 // rest; only then does the configuration name the bucket and Storage start on it. The stop is
 // what makes the copy complete: the hold keeps clients from seeing errors, it does not have to be
-// airtight. Until the configuration changes, a failure puts Storage back on the files.
+// airtight. Until Storage has started on the bucket, a failure puts it back on the files. From then
+// on it may hold writes that only the bucket has, so a failure leaves it where it is: --resume
+// finishes the switch and --rollback copies those writes back.
 func (e *Engine) flip(ctx context.Context, b Bucket) error {
 	st := e.st
+	done := func(step string) bool { return reached(flipSteps, st.Step, step) }
+	if !done(stepStopped) {
+		// Storage is still up: what would fail after the stop fails now instead.
+		if err := e.checkSwitch(ctx, st.Dest, e.creds); err != nil {
+			return err
+		}
+	}
 	release := e.holdWrites(ctx)
 	defer release()
-	done := func(step string) bool { return reached(flipSteps, st.Step, step) }
+	defer e.unthrottle()()
 	if st.Step == "" {
 		if err := e.mark(stepHold); err != nil {
 			return err
 		}
 	}
-	stopped := done(stepStopped) && !done(stepStarted)
-	switched := done(stepSwitched) && !done(stepStarted)
+	stopped := done(stepStopped) && !done(stepLive)
+	switched := done(stepSwitched) && !done(stepLive)
 
 	if !done(stepFinal) {
 		e.say("holding Storage's writes; copying what changed")
@@ -70,7 +78,7 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 		}
 	}
 	if !done(stepStopped) {
-		e.say("stopping supavise-storage")
+		e.say("stopping supavise-storage: reads fail until it runs again")
 		stopped = true // a stop that fails may still have stopped it
 		if err := e.d.Storage.Stop(ctx); err != nil {
 			return e.abortFlip(ctx, err, stopped, switched)
@@ -104,13 +112,24 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 			return err
 		}
 	}
-	if !done(stepStarted) {
+	if !done(stepLive) {
 		e.say("starting supavise-storage on the bucket")
 		if err := e.d.Storage.Start(ctx); err != nil {
 			return e.abortFlip(ctx, err, stopped, switched)
 		}
-		if err := e.probe(ctx); err != nil {
-			return e.abortFlip(ctx, err, true, switched)
+		if err := e.mark(stepLive); err != nil {
+			return fmt.Errorf("Storage runs on the bucket, but the run could not record it: %w", err)
+		}
+	} else if err := e.d.Storage.Healthy(ctx); err != nil {
+		// An earlier attempt got Storage onto the bucket and it is not answering now.
+		e.say("starting supavise-storage on the bucket")
+		if err := e.d.Storage.Start(ctx); err != nil {
+			return fmt.Errorf("%w (Storage keeps its objects in the bucket now: fix the cause and --resume, or --rollback)", err)
+		}
+	}
+	if !done(stepStarted) {
+		if err := e.probe(ctx, "the bucket"); err != nil {
+			return fmt.Errorf("%w (Storage runs on the bucket and may have taken writes that the files lack: fix the cause and --resume, or --rollback to copy them back)", err)
 		}
 		if err := e.mark(stepStarted); err != nil {
 			return err
@@ -133,12 +152,12 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 	if kept != "" {
 		e.say("the files are kept in %s: --rollback goes back to them and --cleanup deletes them (keep them for about 14 days)", filepath.Join(serviceDir(e.paths), kept))
 	}
-	e.say("restart supavise.service when convenient so that the daemon reads the new setting too: until then, a backup it starts itself still looks for the files")
+	e.say("restart supavise.service now so that the daemon reads the new setting too: until then a backup that it starts itself looks for the files, finds none, and records an empty snapshot of them")
 	return nil
 }
 
-// abortFlip puts Storage back on the files after a failure before the switch is complete. The
-// run goes back to the catch-up phase, so --resume copies, verifies and tries the switch again.
+// abortFlip puts Storage back on the files after a failure before Storage has started on the bucket.
+// The run goes back to the catch-up phase, so --resume copies, verifies and tries the switch again.
 func (e *Engine) abortFlip(ctx context.Context, cause error, stopped, switched bool) error {
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
 	defer cancel()
@@ -193,13 +212,15 @@ func (e *Engine) checkAllRows(ctx context.Context) error {
 	return nil
 }
 
-// probe reads a few objects through Storage, which now runs on the new backend.
-func (e *Engine) probe(ctx context.Context) error {
+// probe reads a few objects through Storage, which now runs on the backend named by from. It says what
+// it read, because a store without rows gives it nothing to read.
+func (e *Engine) probe(ctx context.Context, from string) error {
 	if e.d.Reader == nil {
 		return nil
 	}
 	projects, err := e.d.Tenants.Projects(ctx)
 	if err != nil {
+		e.say("nothing was read back through Storage: the projects could not be listed (%v)", err)
 		return nil // the checks that mattered are done; a sample needs the databases
 	}
 	byRef := map[string]Project{}
@@ -210,7 +231,8 @@ func (e *Engine) probe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for ref, row := range e.samples(ctx, refs, 3) {
+	samples := e.samples(ctx, refs, 3)
+	for ref, row := range samples {
 		var last error
 		for try := 0; try < 5; try++ {
 			n, err := e.d.Reader.Read(ctx, ref, row)
@@ -230,45 +252,51 @@ func (e *Engine) probe(ctx context.Context) error {
 			}
 		}
 		if last != nil {
-			return fmt.Errorf("Storage could not read %s back from the bucket: %w", quote(ref+"/"+rowPath(row)), last)
+			return fmt.Errorf("Storage could not read %s back from %s: %w", quote(ref+"/"+rowPath(row)), from, last)
 		}
+	}
+	if len(samples) == 0 {
+		e.say("nothing was read back through Storage: no project has an object with a recorded size, and a write by Storage to %s is untested", from)
+	} else {
+		e.say("Storage served %d sampled objects from %s", len(samples), from)
 	}
 	return nil
 }
 
 // keepFiles renames the objects directory to objects.migrated-<date> and returns the new name; ""
-// when there is no objects directory (nothing was ever stored, or an earlier attempt renamed it).
+// when there is no objects directory and no earlier attempt of this run renamed it (nothing was ever
+// stored). The name is recorded before the rename, and only a directory with that name is taken for
+// the files of this run.
 func (e *Engine) keepFiles() (string, error) {
-	src := objectsDir(e.paths)
-	if _, err := os.Lstat(src); errors.Is(err, fs.ErrNotExist) {
-		return e.findKept(), nil
-	} else if err != nil {
-		return "", err
-	}
-	name := retainedPrefix + e.now().UTC().Format("20060102")
-	for i := 2; ; i++ {
-		if _, err := os.Lstat(filepath.Join(serviceDir(e.paths), name)); errors.Is(err, fs.ErrNotExist) {
-			break
+	st := e.st
+	if st.KeepAs == "" {
+		day := e.now().UTC().Format("20060102")
+		name := retainedPrefix + day
+		for i := 2; ; i++ {
+			if _, err := os.Lstat(filepath.Join(serviceDir(e.paths), name)); errors.Is(err, fs.ErrNotExist) {
+				break
+			}
+			name = fmt.Sprintf("%s%s-%d", retainedPrefix, day, i)
 		}
-		name = fmt.Sprintf("%s%s-%d", retainedPrefix, e.now().UTC().Format("20060102"), i)
-	}
-	return name, os.Rename(src, filepath.Join(serviceDir(e.paths), name))
-}
-
-// findKept is the newest directory that an earlier attempt of this run may have kept.
-func (e *Engine) findKept() string {
-	ents, _ := os.ReadDir(serviceDir(e.paths))
-	var kept []string
-	for _, en := range ents {
-		if en.IsDir() && strings.HasPrefix(en.Name(), retainedPrefix) {
-			kept = append(kept, en.Name())
+		st.KeepAs = name
+		if err := e.save(); err != nil {
+			return "", err
 		}
 	}
-	if len(kept) == 0 {
-		return ""
+	src, dst := objectsDir(e.paths), filepath.Join(serviceDir(e.paths), st.KeepAs)
+	_, serr := os.Lstat(src)
+	_, derr := os.Lstat(dst)
+	switch {
+	case errors.Is(serr, fs.ErrNotExist) && derr == nil:
+		return st.KeepAs, nil // an earlier attempt of this run renamed it
+	case errors.Is(serr, fs.ErrNotExist):
+		return "", nil
+	case serr != nil:
+		return "", serr
+	case derr == nil:
+		return "", fmt.Errorf("both %s and %s exist; move one of them aside, then --resume", src, dst)
 	}
-	sort.Strings(kept)
-	return kept[len(kept)-1]
+	return st.KeepAs, os.Rename(src, dst)
 }
 
 // Cleanup deletes the files a finished migration kept.
@@ -303,7 +331,8 @@ func (e *Engine) Cleanup(ctx context.Context) error {
 // Rollback goes back to the files: it copies what the bucket gained since the switch into the
 // files that were kept (all of it when they were deleted), stops Storage, copies once more and
 // starts Storage on the files. Objects uploaded after the switch come back with it, and objects
-// deleted since are deleted from the files.
+// deleted since are deleted from the files. It also undoes a switch that stopped after Storage
+// started on the bucket.
 func (e *Engine) Rollback(ctx context.Context, req Request) error {
 	release, err := lock(e.paths)
 	if err != nil {
@@ -314,19 +343,25 @@ func (e *Engine) Rollback(ctx context.Context, req Request) error {
 	if err != nil {
 		return err
 	}
-	if st == nil || (st.Phase != PhaseDone && st.Phase != PhaseRollingBack) {
+	// A run whose switch stopped after Storage started on the bucket can be rolled back too: Storage
+	// may have written there, and the rollback copies that back.
+	live := st != nil && st.Phase == PhaseFlipping && reached(flipSteps, st.Step, stepLive)
+	if st == nil || (st.Phase != PhaseDone && st.Phase != PhaseRollingBack && !live) {
 		return errors.New("there is no finished Storage migration to roll back")
 	}
+	if err := e.checkState(st); err != nil {
+		return err
+	}
 	e.st, e.inv = st, map[string]inventory{}
-	if st.Phase == PhaseDone {
+	if st.Phase == PhaseDone || live {
 		st.Phase, st.Step = PhaseRollingBack, ""
 	}
 	st.Error = ""
-	b, err := e.open(ctx, st.Dest, req.Credentials)
+	e.begin(req)
+	b, err := e.connect(ctx, st.Dest, req.Credentials)
 	if err != nil {
 		return err
 	}
-	e.begin(req)
 	return e.rollback(ctx, b)
 }
 
@@ -413,7 +448,7 @@ func (e *Engine) doRollback(ctx context.Context, b Bucket) error {
 		if err := e.d.Storage.Start(ctx); err != nil {
 			return err
 		}
-		if err := e.probe(ctx); err != nil {
+		if err := e.probe(ctx, "the files"); err != nil {
 			return err
 		}
 		if err := e.mark(stepStarted); err != nil {
@@ -480,34 +515,77 @@ func (e *Engine) pullAll(ctx context.Context, b Bucket, what string) error {
 		return err
 	}
 	var got Counts
-	removed := 0
+	removed, refused := 0, 0
 	for _, ref := range refs {
-		c, r, err := e.pullTenant(ctx, b, ref)
+		r, err := e.pullTenant(ctx, b, ref)
 		if err != nil {
 			return fmt.Errorf("%s: %w", ref, err)
 		}
-		got.Files += c.Files
-		got.Bytes += c.Bytes
-		removed += r
+		got.Files += r.Files
+		got.Bytes += r.Bytes
+		removed += r.removed
+		refused += len(r.refused)
+		if len(r.refused) > 0 {
+			e.say("project %s: %d keys in the bucket cannot be files and were left there: %s", ref, len(r.refused), strings.Join(first(r.refused, 3), ", "))
+		}
 	}
 	e.st.Downloaded.Files += got.Files
 	e.st.Downloaded.Bytes += got.Bytes
 	e.st.Removed += removed
+	e.st.RefusedKeys = refused // what a pass leaves out is the same every time
 	e.say("%s: %d objects (%s) copied back, %d removed from the files", what, got.Files, bytesString(got.Bytes), removed)
 	return e.save()
 }
 
+// pulled is what pullTenant did for one project: the objects fetched, the files removed and the keys
+// it would not write.
+type pulled struct {
+	Counts
+	removed int
+	refused []string
+}
+
+// fileUnder is where the object with the key rel (the part after <ref>/) lies below root, and false
+// when no file there could be that object. A key comes from the bucket and is not trusted: one that
+// is empty, has an empty, "." or ".." segment or holds a NUL would, once joined, leave root or name
+// another file than the object's.
+func fileUnder(root, rel string) (string, bool) {
+	if rel == "" || strings.ContainsRune(rel, 0) {
+		return "", false
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", false
+		}
+	}
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	if !strings.HasPrefix(abs, root+string(filepath.Separator)) {
+		return "", false
+	}
+	return abs, true
+}
+
 // pullTenant makes the files of one project match the bucket's copy.
-func (e *Engine) pullTenant(ctx context.Context, b Bucket, ref string) (Counts, int, error) {
-	listed, err := e.listTenant(ctx, b, ref)
+func (e *Engine) pullTenant(ctx context.Context, b Bucket, ref string) (pulled, error) {
+	var res pulled
+	all, err := e.listTenant(ctx, b, ref)
 	if err != nil {
-		return Counts{}, 0, err
+		return res, err
 	}
 	cur, _, err := e.walkTenant(ctx, ref)
 	if err != nil {
-		return Counts{}, 0, err
+		return res, err
 	}
+	root := e.paths.StorageObjects(ref)
 	prefix := ref + "/"
+	listed := all[:0:0]
+	for _, en := range all {
+		if _, ok := fileUnder(root, en.Key[len(prefix):]); !ok {
+			res.refused = append(res.refused, quote(en.Key))
+			continue
+		}
+		listed = append(listed, en)
+	}
 	var fetch []Entry
 	var drop []string
 	i, j := 0, 0
@@ -537,7 +615,6 @@ func (e *Engine) pullTenant(ctx context.Context, b Bucket, ref string) (Counts, 
 		e.say("project %s: the bucket lists nothing for it, so its %d files were not removed", ref, len(drop))
 		drop = nil
 	}
-	var got Counts
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(e.workers)
@@ -548,24 +625,27 @@ func (e *Engine) pullTenant(ctx context.Context, b Bucket, ref string) (Counts, 
 				return err
 			}
 			mu.Lock()
-			got.Files++
-			got.Bytes += n
+			res.Files++
+			res.Bytes += n
 			mu.Unlock()
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return got, 0, err
+		return res, err
 	}
-	root := e.paths.StorageObjects(ref)
 	for _, p := range drop {
-		abs := filepath.Join(root, filepath.FromSlash(p))
+		abs, ok := fileUnder(root, p)
+		if !ok {
+			continue
+		}
 		if err := os.Remove(abs); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return got, 0, err
+			return res, err
 		}
 		pruneEmpty(filepath.Dir(abs), root)
+		res.removed++
 	}
-	return got, len(drop), nil
+	return res, nil
 }
 
 // pruneEmpty removes the empty directories from dir up to, not including, root.
@@ -581,9 +661,11 @@ func pruneEmpty(dir, root string) {
 // download writes one object to its file: aside first, with its attributes and modification time,
 // then renamed into place, so Storage never reads half a file.
 func (e *Engine) download(ctx context.Context, b Bucket, ref string, en Entry) (int64, error) {
-	rel := en.Key[len(ref)+1:]
-	dst := filepath.Join(e.paths.StorageObjects(ref), filepath.FromSlash(rel))
-	if err := e.mkdirAll(filepath.Dir(dst)); err != nil {
+	dst, ok := fileUnder(e.paths.StorageObjects(ref), en.Key[len(ref)+1:])
+	if !ok {
+		return 0, fmt.Errorf("%s: the key cannot be a file below the project's directory", quote(en.Key))
+	}
+	if err := e.mkdirBelow(objectsDir(e.paths), filepath.Dir(dst)); err != nil {
 		return 0, err
 	}
 	rc, meta, err := b.Get(ctx, en.Key)
@@ -626,21 +708,36 @@ func (e *Engine) download(ctx context.Context, b Bucket, ref string, en Entry) (
 	return n, nil
 }
 
-// mkdirAll creates dir and the directories above it that are missing, owned like the
-// service directory when this process runs as root.
-func (e *Engine) mkdirAll(dir string) error {
-	if _, err := os.Lstat(dir); err == nil {
-		return nil
+// mkdirBelow creates the directories of dir that are missing below top, which exists, each owned like
+// the service directory when this process runs as root. A directory that is a link or a file is an
+// error: nothing Storage's file backend makes is one, and writing through it could leave top.
+func (e *Engine) mkdirBelow(top, dir string) error {
+	rel, err := filepath.Rel(top, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%s is not below %s", dir, top)
 	}
-	if err := e.mkdirAll(filepath.Dir(dir)); err != nil {
-		return err
-	}
-	if err := os.Mkdir(dir, 0o750); err != nil && !errors.Is(err, fs.ErrExist) {
-		return err
-	}
-	if f, err := os.Open(dir); err == nil {
-		e.chownLikeParent(f)
-		f.Close()
+	cur := top
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if seg == "." {
+			continue
+		}
+		cur = filepath.Join(cur, seg)
+		fi, err := os.Lstat(cur)
+		switch {
+		case err == nil && fi.IsDir():
+			continue
+		case err == nil:
+			return fmt.Errorf("%s is not a directory (a link or a file): a rollback does not write through it", cur)
+		case !errors.Is(err, fs.ErrNotExist):
+			return err
+		}
+		if err := os.Mkdir(cur, 0o750); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		if f, err := os.Open(cur); err == nil {
+			e.chownLikeParent(f)
+			f.Close()
+		}
 	}
 	return nil
 }

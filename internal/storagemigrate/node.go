@@ -163,15 +163,31 @@ func (s nodeService) manager() (*fleet.Manager, *config.Config, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	m, err := s.managerFor(cfg)
+	return m, cfg, err
+}
+
+// managerFor is a fleet manager over cfg that touches no service but supavise-storage.
+func (s nodeService) managerFor(cfg *config.Config) (*fleet.Manager, error) {
 	skip := []string{config.SvcEdgeRuntime}
 	for _, svc := range fleet.Services {
 		if svc != config.SvcStorage {
 			skip = append(skip, svc)
 		}
 	}
-	m, err := fleet.NewManager(fleet.Deps{Cfg: cfg, Log: s.log, Registry: s.n.Registry, Secrets: s.n.Secrets,
+	return fleet.NewManager(fleet.Deps{Cfg: cfg, Log: s.log, Registry: s.n.Registry, Secrets: s.n.Secrets,
 		Supervisor: s.n.Supervisor, Artifacts: s.n.Artifacts, Skip: skip})
-	return m, cfg, err
+}
+
+// Render implements Service: the fleet builds the unit specs without starting a unit, and fails
+// for what Start would refuse (no bucket, no key under systemd).
+func (s nodeService) Render(ctx context.Context, cfg *config.Config) error {
+	m, err := s.managerFor(cfg)
+	if err != nil {
+		return err
+	}
+	_, err = m.Specs(ctx)
+	return err
 }
 
 func (s nodeService) Healthy(ctx context.Context) error {

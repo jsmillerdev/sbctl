@@ -153,6 +153,10 @@ func TestStorageCredentialsComeFromTheFlagsFirst(t *testing.T) {
 	if c, _, err := storageCredentials(cfg, st, "", ""); err != nil || c.Source != storagemigrate.CredConfig || c.AccessKeyID != "K" {
 		t.Errorf("config: %v %v", c, err)
 	}
+	// A run that used a role goes on with it, whatever key is in [fleet].
+	if c, _, err := storageCredentials(cfg, &storagemigrate.State{RoleARN: "arn:r"}, "", ""); err != nil || c.Source != storagemigrate.CredRole || c.RoleARN != "arn:r" {
+		t.Errorf("resume with a role and a key in [fleet]: %v %v", c, err)
+	}
 }
 
 func TestStorageSettingsKeepSecretsOutOfConfigToml(t *testing.T) {
@@ -221,5 +225,58 @@ func TestStorageSettingsNeedAConfigFile(t *testing.T) {
 	err := storageSettings{path: filepath.Join(t.TempDir(), "none.toml")}.UseFiles(context.Background(), "", false)
 	if err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Errorf("UseFiles = %v", err)
+	}
+}
+
+func TestStorageSettingsPreviewChangesNothing(t *testing.T) {
+	path, _ := storageNode(t, "domain = \"example.test\"\n")
+	s := storageSettings{path: path}
+	d := storagemigrate.Destination{Bucket: "objects", Region: "us-east-1"}
+	creds := storagemigrate.Credentials{Source: storagemigrate.CredFile, AccessKeyID: "GKID", SecretAccessKey: "topsecret"}
+	before, _ := os.ReadFile(path)
+
+	cfg, err := s.Preview(context.Background(), d, creds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Fleet.StorageBackend != "s3" || cfg.Fleet.StorageS3Bucket != "objects" || cfg.Fleet.StorageS3AccessKeyID != "GKID" || cfg.Domain != "example.test" {
+		t.Errorf("the configuration it would load: %+v", cfg.Fleet)
+	}
+	if after, _ := os.ReadFile(path); string(after) != string(before) {
+		t.Errorf("config.toml changed:\n%s", after)
+	}
+	if _, err := os.Stat(config.ConfigDDir(path)); !os.IsNotExist(err) {
+		t.Errorf("config.d appeared: %v", err)
+	}
+
+	// Another drop-in that sets the backend, or the environment, wins over config.toml: the switch
+	// would not take effect, and the preview says so while Storage still runs.
+	dir := config.ConfigDDir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(dir, "50-other.toml")
+	if err := os.WriteFile(other, []byte("[fleet]\nstorage_backend = \"file\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Preview(context.Background(), d, creds); err == nil || !strings.Contains(err.Error(), "overrides config.toml") {
+		t.Errorf("a drop-in that sets the backend: %v", err)
+	}
+	if err := os.Remove(other); err != nil {
+		t.Fatal(err)
+	}
+	// The drop-in UseBucket writes is replaced, not read.
+	if err := os.WriteFile(filepath.Join(dir, storageS3DropIn), []byte("[fleet]\nstorage_backend = \"file\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Preview(context.Background(), d, creds); err != nil {
+		t.Errorf("an old credentials drop-in: %v", err)
+	}
+	t.Setenv("SUPAVISE_FLEET_STORAGE_BACKEND", "file")
+	if _, err := s.Preview(context.Background(), d, creds); err == nil || !strings.Contains(err.Error(), "overrides config.toml") {
+		t.Errorf("an environment variable: %v", err)
+	}
+	if _, err := (storageSettings{path: filepath.Join(t.TempDir(), "none.toml")}).Preview(context.Background(), d, creds); err == nil {
+		t.Error("a node without a configuration file")
 	}
 }

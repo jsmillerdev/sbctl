@@ -10,7 +10,10 @@ import (
 
 func TestReadStateRefusesAFileThatIsNotJSON(t *testing.T) {
 	e := newEnv(t)
-	if err := os.WriteFile(filepath.Join(serviceDir(e.paths), stateFile), []byte("{nope"), 0o644); err != nil {
+	if err := ensureDir(runDir(e.paths)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir(e.paths), stateFile), []byte("{nope"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ReadState(e.paths); err == nil || !strings.Contains(err.Error(), stateFile) {
@@ -34,7 +37,7 @@ func TestStateRoundTripKeepsNoSecret(t *testing.T) {
 	if d := got.UpdatedAt.Sub(now); d < -time.Second || d > time.Second {
 		t.Errorf("updated_at %s, saved at %s", got.UpdatedAt, now)
 	}
-	if fi, err := os.Stat(filepath.Join(serviceDir(e.paths), stateFile)); err != nil || fi.Mode().Perm() != 0o644 {
+	if fi, err := os.Stat(filepath.Join(runDir(e.paths), stateFile)); err != nil || fi.Mode().Perm() != 0o644 {
 		t.Errorf("state file: %v, %v", fi, err)
 	}
 	// Credentials print without their key.

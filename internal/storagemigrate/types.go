@@ -3,6 +3,8 @@
 // files; the switch holds Storage's writes, copies what changed, stops supavise-storage, copies
 // once more from files that no longer change, points the configuration at the bucket and starts
 // Storage again. The run's state is a JSON file, so a run that stopped continues with --resume.
+// Once Storage has started on the bucket it may hold writes that the files lack, so the run can
+// only finish or be rolled back from there.
 package storagemigrate
 
 import (
@@ -11,6 +13,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/supavise/supavise/internal/config"
 )
 
 // Phase is where a run stands.
@@ -37,7 +41,8 @@ const (
 	stepStopped  = "stopped"  // supavise-storage is stopped
 	stepFence    = "fence"    // a pass over files nothing writes to, and the last check of the databases
 	stepSwitched = "switched" // the configuration names the new backend
-	stepStarted  = "started"  // Storage runs on the new backend and serves a sample
+	stepLive     = "live"     // Storage was started on the new backend and may have taken writes: no way back but --rollback
+	stepStarted  = "started"  // Storage serves a sample from the new backend
 )
 
 // Destination is the bucket and how to reach it. It holds no secret.
@@ -75,7 +80,7 @@ type Counts struct {
 
 // Skipped is a file that cannot be an S3 key and was left out.
 type Skipped struct {
-	Path   string `json:"path"` // quoted, relative to the objects directory
+	Path   string `json:"path"` // quoted, <ref>/<path below the project's objects directory>
 	Reason string `json:"reason"`
 }
 
@@ -110,6 +115,9 @@ type State struct {
 	WroteCredentials bool `json:"wrote_credentials,omitempty"`
 	// PrevBackend is [fleet] storage_backend before the switch.
 	PrevBackend string `json:"previous_backend,omitempty"`
+	// KeepAs is the name the objects directory gets when the switch is done, recorded before it is
+	// renamed so that only a directory this run named is ever taken for its files.
+	KeepAs string `json:"keep_as,omitempty"`
 
 	StartedAt time.Time `json:"started_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -130,9 +138,11 @@ type State struct {
 	RetainUntil time.Time `json:"retain_until,omitzero"`
 	Cleaned     bool      `json:"cleaned,omitempty"`
 
-	// Downloaded and Removed count what a rollback changed in the files.
-	Downloaded Counts `json:"downloaded,omitzero"`
-	Removed    int    `json:"removed,omitempty"`
+	// Downloaded and Removed count what a rollback changed in the files. RefusedKeys counts the keys
+	// the last pass of a rollback left in the bucket because no file at their path could be that object.
+	Downloaded  Counts `json:"downloaded,omitzero"`
+	Removed     int    `json:"removed,omitempty"`
+	RefusedKeys int    `json:"refused_keys,omitempty"`
 
 	// Error is why the last attempt stopped.
 	Error string `json:"error,omitempty"`
@@ -169,6 +179,10 @@ type Bucket interface {
 	// Delete removes the keys; a key that does not exist is not an error.
 	Delete(ctx context.Context, keys ...string) error
 }
+
+// pacer is implemented by a Bucket that can hold back the bytes it sends (s3Bucket does): the
+// engine hands it the limiter of the copy.
+type pacer interface{ pace(l *limiter) }
 
 // OpenFunc connects to the bucket.
 type OpenFunc func(ctx context.Context, d Destination, c Credentials) (Bucket, error)
@@ -207,10 +221,17 @@ type Service interface {
 	// Start renders the unit from the configuration as it is on disk now, starts it and waits
 	// until it answers.
 	Start(ctx context.Context) error
+	// Render builds the unit for cfg without starting or writing anything, and returns what Start
+	// would refuse.
+	Render(ctx context.Context, cfg *config.Config) error
 }
 
 // Settings changes the node's configuration files.
 type Settings interface {
+	// Preview returns the configuration the node would load after UseBucket(d, c), changing
+	// nothing. It fails when the change would not take effect: a file in config.d or an environment
+	// variable overrides storage_backend.
+	Preview(ctx context.Context, d Destination, c Credentials) (*config.Config, error)
 	// UseBucket makes the configuration say that Storage keeps its objects in d with c. It reports
 	// whether it wrote the credentials into a file of its own.
 	UseBucket(ctx context.Context, d Destination, c Credentials) (wroteCredentials bool, err error)
