@@ -331,7 +331,15 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 			if restartOnly[ref] {
 				return restartChanged(ctx, n, out, ref)
 			}
-			return upgradeProject(ctx, n, out, ref, req)
+			if err := upgradeProject(ctx, n, out, ref, req); err != nil {
+				return err
+			}
+			if upRestartChanged {
+				// The upgrade moved a release; the project's units may also run files the daemon
+				// held back, the database included. (Nothing happens when none waits.)
+				return restartChanged(ctx, n, out, ref)
+			}
+			return nil
 		}}
 	if upAll && len(refs) > 1 {
 		opts.Canary, opts.Batch = n.Cfg.Upgrade.Canary(), n.Cfg.Upgrade.Batch()
