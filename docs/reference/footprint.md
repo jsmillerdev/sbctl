@@ -1,6 +1,6 @@
 # Footprint
 
-Memory, cold start and disk use of a node at 10, 25 and 50 projects, under real systemd on Ubuntu 24.04.
+Memory, cold start and disk use of a node at 10, 25 and 50 projects, under real systemd on Ubuntu 24.04. The last section describes the follower profile of a second server, which no run has measured.
 
 ## What is measured
 
@@ -55,3 +55,23 @@ The runs used class `default` as it was before compute sizes: 32 MB `shared_buff
 Measured 2026-10-07 at commit 83815eb, Ubuntu 24.04.5, kernel 6.17. The shared services were not running.
 
 A project's own memory (PSS) is about 65 MB idle; RSS counts shared pages once per process and overstates it about 3.5 times. The slice's `memory.current` grows by about 148 MB per project between 10 and 50 projects because it also charges page cache. Size an instance at about 150 MB per idle project plus about 1.5 GB fixed. Fifty idle projects used 7.4 GB of a 16 GB host.
+
+## Follower profile
+
+A second server that joined a cluster runs a different set of units from the first. The runs above measure the leader's shape only. No run has measured a follower, so the figures below are estimates built from the measured primary and each says so.
+
+| Runs on a follower | Cost |
+|---|---|
+| `supavise` (proxy, mesh, agents, WAL relay) | one process; the daemon's memory is not in the table above either |
+| `supavise-postgres@system`, a hot standby of the registry | about the measured system project's Postgres (55 MB PSS for its two units, at 10 to 50 projects) |
+| `supavise-supavisor`, against the replicated pooler database | as on the leader (the shared services are not in the table above) |
+| Realtime, Storage, postgres-meta, Edge Runtime, Studio | installed and stopped. They use disk, not memory, until a promotion starts them. |
+| each replica: `supavise-postgres@<ref>` as a standby and `supavise-postgrest@<ref>` | **Estimate:** about what one project costs on the leader (65 MB PSS for three units at idle) less Auth. A replica runs no Auth. A busy primary's WAL makes its standby replay and touch more pages. |
+| each project homed there: Postgres, Auth and PostgREST | as on the leader |
+
+- With `[replicas] default = "all"`, every project has a replica on the other server, so size the second server like the first. That roughly doubles the footprint of the cluster.
+- A replica needs the same limits as its primary (`max_connections` and its siblings must be at least the primary's), so a replica reserves what its project's size reserves.
+- Each replica needs disk for its own data directory: the primary's size at seeding, plus WAL.
+- Replication traffic goes through the mesh forwarder. In spike S6 (the spike code was not merged), a forwarder used 10 to 12 percent of a core per side at 45 to 50 MB/s of WAL, and replication lag p99 stayed between 0.10 and 0.41 s at 20 MB/s over 2 to 70 ms of round trip.
+
+`tests/linux/footprint.sh` creates the projects it measures, so it runs on a leader and cannot measure a follower. A follower measurement needs a script that joins a second node first, and none exists.

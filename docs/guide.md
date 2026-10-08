@@ -1,6 +1,6 @@
 # Using Supavise
 
-This guide picks up after the install in the [README](../README.md#get-started). Your Supavise server is called a node. For server and AWS options in depth, see the [deploy guide](../deploy/README.md).
+This guide picks up after the install in the [README](../README.md#get-started). Your Supavise server is called a node, and a second server that joins the first is another node. For server and AWS options in depth, see the [deploy guide](../deploy/README.md).
 
 - [Claim the node and sign in](#claim-the-node-and-sign-in)
 - [Create a project and connect an app](#create-a-project-and-connect-an-app)
@@ -8,6 +8,7 @@ This guide picks up after the install in the [README](../README.md#get-started).
 - [Give an agent or a preview its own branch](#give-an-agent-or-a-preview-its-own-branch)
 - [Back up and restore](#back-up-and-restore)
 - [Monitor the node](#monitor-the-node)
+- [Read replicas and failover](#read-replicas-and-failover)
 - [Updates and maintenance](#updates-and-maintenance)
 - [How Supavise compares](#how-supavise-compares)
 - [Sizing and cost](#sizing-and-cost)
@@ -96,7 +97,46 @@ sudo -u supavise supavise status   # one verdict for the node and every project
 curl https://api.<domain>/healthz  # for an uptime monitor; reveals nothing else
 ```
 
-Add an `[alerts]` section to `/etc/supavise/config.toml` to get a webhook or email when a backup fails, disk runs low, a project turns unhealthy, a certificate nears expiry, an update is available, or an upgrade starts, succeeds or fails. Before planned work, `supavise maintenance announce` shows a notice in the dashboard. The deploy guide's [health and alerts](../deploy/README.md#health-alerts-and-maintenance-notices) section has the details.
+Add an `[alerts]` section to `/etc/supavise/config.toml` to get a webhook or email when a backup fails, disk runs low, a project turns unhealthy, a certificate nears expiry, an update is available, or an upgrade starts, succeeds or fails. With a second server you also get one when a replica is unhealthy or lags, a server stops answering, a failover starts, ends or fails, or a server is fenced. Before planned work, `supavise maintenance announce` shows a notice in the dashboard. The deploy guide's [health and alerts](../deploy/README.md#health-alerts-and-maintenance-notices) section has the details.
+
+## Read replicas and failover
+
+A second Supavise server gives a project a read replica, a place to move the project to, and a standby of the registry that can take over. Both servers need an S3-compatible backup bucket, because the second server reads its first copy from it: pass `--s3-bucket` at install (see the deploy guide's [flags](../deploy/README.md#flags)). A replica always lives on a server other than the project's own. On AWS, make the second server with `supavise-aws-deploy.sh replica` ([Add a replica server](../deploy/README.md#add-a-replica-server)).
+
+**Join a second server.** On the first server (the leader), create a one-time token and save it in a file. Copy the file to the new server as `/root/join-token` with mode 0600, and install there with it:
+
+```bash
+# on the leader
+(umask 077; sudo -u supavise supavise node token --region eu-west-1 > join-token)
+# on the new server
+curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- --join-token-file /root/join-token
+# on the leader: the new node is joining, then active
+sudo -u supavise supavise node ls
+```
+
+The servers talk over TCP port 7443, so open it between them. `--region` is the region that Studio shows for the new server's replicas. The token works once and expires after an hour.
+
+**Add a replica.** In Studio, open **Project Settings**, **Infrastructure**, then **Add read replica**, and pick the new server's region. The button needs a project of size Small or larger. The same from the leader's shell:
+
+```bash
+sudo -u supavise supavise replicas add <ref> --region eu-west-1
+sudo -u supavise supavise replicas ls          # the setup step, status and lag
+```
+
+To give every project a replica on every other server, set `[replicas] default = "all"` in the leader's `/etc/supavise/config.toml`. That roughly doubles the footprint of the cluster.
+
+**Use it.** A replica answers reads at `https://<identifier>.api.<domain>/rest/v1`, with the project's own keys, and through the pooler as the user `postgres.<identifier>`. Studio lists both next to the primary. `https://<ref>-lb.api.<domain>` is a load balancer that sends reads (`GET` and `HEAD` on `/rest/v1`) to the nearest healthy database and everything else to the primary. Point a latency-routed DNS record at each server to spread reads; a name that resolves to the primary's server answers from the primary. [Read replicas reference](reference/replicas.md#names-and-ports) has the names.
+
+**Switch over or fail over.** A switchover is planned and loses nothing. A failover follows a failure and loses at most what the replica had not received. Run each command with `--dry-run` first: it prints every precondition and changes nothing.
+
+```bash
+sudo -u supavise supavise projects failover <ref> --dry-run     # on the leader: one project
+sudo -u supavise supavise failover --dry-run                    # on the server that should lead: the whole server
+```
+
+A project move needs a replica of that project. A server move needs one for every project, and Storage on S3 (`supavise storage migrate --to s3`, in the deploy guide's [Storage on S3](../deploy/README.md#storage-on-s3)). When the old primary is alive the move stops it cleanly and it follows as a replica, so moving back is the same command on the other server. When it is dead, the survivor fences it first. On AWS, `[failover] fencing = "aws"` stops the old instance and takes its Elastic IP. Elsewhere, set `fence_command` or pass `--old-primary-is-down`, which states that the old server cannot write. A server that returns after a failover starts no database until `sudo supavise node rejoin` rebuilds it.
+
+By default every move is yours to start. `[failover] mode = "project"` or `"server"` lets the servers act on their own, on AWS only. The [reference](reference/replicas.md#failover) lists what a move does, the data a failure can cost and the failure matrix.
 
 ## How Supavise compares
 
@@ -110,7 +150,11 @@ Add an `[alerts]` section to `/etc/supavise/config.toml` to get a webhook or ema
 | Point-in-time restore | Not included; you set up backups yourself | Yes, in the dashboard (in place) or with `supavise backups restore` on the server | Yes |
 | Edge Functions | Yes | Yes, on by default | Yes |
 | Team roles and SSO | One shared dashboard login | Owner, Administrator, Developer and Read-only roles; SAML SSO | Yes |
-| High availability | Not built in; you set it up yourself | No: one server, no failover or read replicas | Read replicas available |
+| Read replicas | Not available | Yes, per project on a second Supavise server, added in Studio or with `supavise replicas` | Yes |
+| API load balancer | Not available | Yes, once a project has a replica: reads go to the nearest healthy database | Yes |
+| Failover | Not built in; you set it up yourself | A switchover or failover of one project or the whole server, by hand; automatic on AWS only, with a fence | Managed by Supabase; depends on your plan |
+| Storage on S3 | You set it up yourself | Optional, with `supavise storage migrate --to s3`; a server failover needs it | Yes |
+| High availability | Not built in; you set it up yourself | Two servers: a standby copy of every replicated project and of the registry, so the second server can take over. One server alone has none. | Managed by Supabase; depends on your plan |
 | Where it runs | Your server | Your server or your AWS account | Supabase's cloud |
 | Who you pay | Your hosting provider | Your hosting provider | Supabase |
 
@@ -129,7 +173,9 @@ sudo supavise upgrade           # apply it
 sudo -u supavise supavise status
 ```
 
-`supavise upgrade` checks that the node is healthy and the release is signed, then backs up every project before it changes anything. It restarts Supavise (HTTPS pauses for a few seconds), updates the shared services one at a time, then updates projects: one canary first, then batches of five, with a health check after each. A project that restarts drops its connections briefly. The rollout stops at the first failure and puts the node back on the previous release.
+`supavise upgrade` checks that the node is healthy and the release is signed, then backs up every project before it changes anything. It also brings the host forward (unit files, directories, the firewall rule for the mesh port) with `supavise system converge`, which restarts no project. It restarts Supavise (HTTPS pauses for a few seconds), updates the shared services one at a time, then updates projects: one canary first, then batches of five, with a health check after each. A project that restarts drops its connections briefly. The rollout stops at the first failure and puts the node back on the previous release.
+
+**Two servers and AWS stacks.** Run `supavise upgrade` on each server, the leader first when the release adds registry migrations: a follower one release behind runs against the leader's newer registry. While the two run different releases, automatic failover waits. On AWS, `sudo -E supavise upgrade --aws` also brings the CloudFormation stack forward, with your AWS credentials. It shows a change set and refuses any change that would replace the instance, the data volume or the address. [Bring a v0.1.x AWS stack forward](../deploy/README.md#bring-a-v01x-aws-stack-forward) has the steps, and the FAQ below the order to follow.
 
 **Going back.** `sudo supavise rollback` returns to the previous release; the node keeps the last three. If the newer release changed Supavise's own database, rollback refuses and explains how to restore that database from its pre-upgrade backup first.
 
@@ -171,12 +217,27 @@ No. Supavise is an independent open-source project and is not affiliated with or
 **Does it replace hosted Supabase?**
 Not entirely. You get organizations, projects, the dashboard, the CLI, branching and backups on a server you run. The differences:
 
-- One server, so no high availability, failover or read replicas. If the server stops, its projects stop.
+- High availability needs a second server. On one server, if the server stops, its projects stop. With two, you move a project or the whole server by hand, and on AWS the servers can do it on their own. [Read replicas and failover](#read-replicas-and-failover) has the steps.
 - The dashboard restores a project in place. "Restore to new project" is missing: restore a copy with `supavise backups restore --as` on the server.
 - Management API operations that Studio, the CLI and the MCP server don't call, such as billing and log drains, answer with empty placeholders.
 
 **Do my apps need to change?**
 No. Apps use the same client libraries and API paths as on supabase.com; only the host name changes, to `<ref>.api.<domain>`.
+
+**Why do replicas need a second server?**
+A replica on the project's own server would share the failures it should protect against (the disk, the host, the power) and would draw on the same memory and CPU, so Supavise does not offer one there: the setup answers "Read replicas on the same server as the primary are not offered." The second server also holds a standby copy of the registry, which lets it take over as leader. It can sit in another availability zone or region.
+
+**What happens to Auth during a failover?**
+A project's Auth (GoTrue) runs where the project's primary runs. A failover starts it again on the server that took over, behind the same project URL, with the same keys and JWT secret, so tokens that clients already hold stay valid. Its users and sessions live in the project's database, which the replica copied, so a failover loses the sign-ins and token refreshes that were inside the replication lag (the lag shows in Studio, and a failover refuses a replica more than 30 seconds behind unless you pass `--force`). A planned switchover loses nothing. While a move runs, the project shows RESTARTING and requests to it can fail; they work again at the same URL when the move ends.
+
+**Can I use the file backend?**
+It depends on which one:
+
+- **Backups on local disk** (`[backup]` is a `file://` path). A second server cannot read them, so `supavise node token` refuses, and `[replicas] default = "all"` and the automatic failover modes are refused. Point `[backup]` at an S3-compatible bucket first.
+- **Storage on files** (`[fleet] storage_backend = "file"`, the default). Replicas and the failover of one project work. A failover of the whole server refuses, because the files exist on the old server only. Move them with `sudo -u supavise supavise storage migrate --to s3`: it copies while Storage serves, then pauses Storage's writes for a short time (uploads get 503 with `Retry-After: 5`) while it switches, and reads fail while Storage restarts on the bucket. `--rollback` goes back.
+
+**How do I upgrade an AWS stack made by v0.1.x?**
+Follow the [deploy guide](../deploy/README.md#bring-a-v01x-aws-stack-forward) and keep this order. First rehearse on a throwaway stack: `deploy/aws/rehearse.sh` (in a checkout of the release's tag) makes one from the v0.1.1 template, updates it, checks that the instance was not replaced and deletes it; it costs money while it runs. Then on the node, run `sudo supavise upgrade`: the v0.1.x binary drives this first step and brings the binary and the host forward. After that, run `sudo -E supavise upgrade --aws` with your AWS credentials, or `supavise-aws-deploy.sh update --stack <name>` in CloudShell. Read the change set. It adds resources and permissions and changes tags; the script refuses anything that would replace the instance, the data volume or the address, and applies the rest only after you type `apply`. Nothing has run against a real stack in this repository's tests, so the rehearsal is the check.
 
 **Is my data backed up?**
 Yes: databases, Storage files and Edge Functions, unless Storage uses its S3 backend (`[fleet] storage_backend = "s3"`), whose files stay in your own bucket: turn on versioning there. Every database archives its WAL continuously and takes a nightly base backup, and you can restore to any point in the retention window (7 days by default). The nightly run also copies each project's Storage files and Edge Function deployments to the same place, keeping only what changed.
