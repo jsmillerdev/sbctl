@@ -475,10 +475,11 @@ replica, never both. The role decides the ports and the settings when the units 
   (replay must stand still for one `wal_retrieve_retry_interval`, at most 10 seconds), writes
   `promote.ok` with the epoch (the content `backup.FormatPromoteOK` writes, which lets the WAL relay
   accept the first push; a standby that does not promote carries none), runs `pg_promote` and a
-  checkpoint, stops the units, removes the recovery settings from `postgresql.auto.conf` and
-  `standby.signal`, and starts the cluster from the primary's spec on the canonical port. GoTrue and
-  PostgREST start with `Start` once the registry names the node the home. A repeat after a failure at any
-  point finishes the job; a cluster that already runs as a primary on its canonical port is left alone.
+  checkpoint, stops the units, removes the recovery settings (`hot_standby` and the header of the
+  backup service's block among them) from `postgresql.auto.conf` and `standby.signal`, and starts the
+  cluster from the primary's spec on the canonical port. GoTrue and PostgREST start with `Start` once the
+  registry names the node the home. A repeat after a failure at any point finishes the job; a cluster
+  that already runs as a primary on its canonical port is left alone.
 - `DemoteToReplica` (step 7): for a cluster that shut down cleanly (`ReadControl` reads `pg_control`, so
   no binary is needed; `ErrNotCleanShutdown` otherwise): removes `promote.ok` and the GoTrue unit, writes
   `primary_conninfo` (the canonical port, a forwarder to the new home), `restore_command`
@@ -491,9 +492,12 @@ replica, never both. The role decides the ports and the settings when the units 
   `DemoteToReplica` take the project's ports from the forwarders before they start Postgres on one
   (`PlaneOptions.HoldPorts`, `SetPortHolder`; the daemon binds it to `mesh.Forwarders.Suspend`). A
   promotion does so once the standby is promoted, so a promotion that stops earlier leaves the standby's
-  stream through the forwarder alone. A demotion gives them back when it returns. A promotion keeps
-  them until `Start` of the project succeeds on the node, which is after the registry names the node
-  the home, and gives them back at once when it fails. `Start` of a project with no hold does nothing more than before.
+  stream through the forwarder alone. A demotion gives them back when it returns; the hold covers every
+  forwarder of the project, the canonical Postgres one the standby streams through included, so the
+  demoted cluster catches up from the archive meanwhile and streams once the call has returned. A
+  promotion keeps them until `Start` of the project succeeds on the node, which is after the registry
+  names the node the home, and gives them back at once when it fails. `Start` of a project with no hold
+  does nothing more than before.
 - `ReloadSchema` and `RunSchemaReload` send `SIGUSR1` to the replica's PostgREST every
   `[replicas] schema_reload_seconds` (default 10): the NOTIFY alone can arrive before the WAL of the
   change was replayed (spike S3). A PostgREST that started less than 5 seconds ago is left alone, because
@@ -505,18 +509,33 @@ these operations run, so that the state machines are tested with a fake runner.
 
 ### The Engine in a cluster
 
-`Options.NodeID` is the node the Engine runs on; `StartActive`, `Recover` and `EnsureTenants` leave a
-project homed on another node (`registry.Project.NodeID`) to its home, and so do pause, resume, delete,
-key rotation, settings, password change, resize, upgrade and restore: they answer `ErrInvalidState`
-naming the home, because this node's plane would act on whatever it holds of the project, which is a
-replica. An Engine whose plane is a `HomeRouter` (`internal/placement`'s `Router`) reaches the project
-on its home instead. `Open` looks the id up
-(`SelfNode`: the node named `[node] name`, else the founder on a writable registry). With
-`OpenOptions.ReadOnly` (a follower) the registry opens with `registry.OpenReadOnly` through the system
-standby's socket on the replica port (`FollowerRegistryDSN`), the Engine takes no advisory locks, and
-`Recover` does nothing. `Engine.SetPlane` puts the plane router of `internal/placement` in front of the
-node's plane; the router has every optional capability the Engine finds by type assertion
-(`FullPlane`).
+`Options.NodeID` is the node the Engine runs on. `StartActive`, `Recover`, `EnsureTenants` and
+`SettleUpgrades` leave a project homed on another node (`registry.Project.NodeID`) to its home, and the
+Engine of a follower (`OpenOptions.ReadOnly`: the registry opens with `registry.OpenReadOnly` through the
+system standby's socket on the replica port, `FollowerRegistryDSN`) takes no advisory locks and settles
+nothing. `Open` looks the node id up (`SelfNode`: the node named `[node] name`, else the founder on a
+writable registry).
+
+A project homed on another node is driven only by an Engine whose plane is a `HomeRouter`
+(`internal/placement`'s `Router`), and only through the operations whose every step is a plane call, a
+registry write or a call on the shared services: pause, resume, delete (but see the final backup below),
+key rotation, settings, password change, resize and health. Anywhere else they answer `ErrInvalidState` naming the home, because this node's plane would act
+on whatever it holds of the project, which is a replica, and `Health` would report the replica's units
+as the project's. `Engine.SetPlane` puts the router in front of the node's plane; the router has every
+optional capability the Engine finds by type assertion (`FullPlane`), and answers `ErrNotSupported` to
+the ones that apply settings on the node itself. The rest of what such an operation does follows the home
+through two more seams that `internal/app` sets beside it:
+
+- `SetTimers`: the nightly base backup timer starts and stops on the node that is the project's home,
+  where its data is, and not on the leader. `Engine.Timers` is the node's own, which the daemon provides
+  as `lifecycle.Timers` to whoever starts or stops a primary on this node (the failover).
+- `SetRemoteNodes` (`NodeResourcer`): a resume, a resize and `Offers` are judged against the memory and
+  cores of the home, read on that node, with the registry's projects and replicas for it and the leader's
+  `[compute] overcommit`. Without it a project homed elsewhere is not judged.
+
+What reads or writes this node's own disk, backup service or artifacts is refused for a project homed on
+another node whatever the plane: restore, upgrade and the final backup of a delete. Delete it with
+`SkipFinalBackup` (the data is gone afterwards), or move the project here first.
 
 - `Capacity` counts the replicas on the node with their project's memory cap (`ComputeNodeCapacity`);
   a failed or going-down replica and the system standby count nothing. The replica of a paused project
@@ -534,7 +553,7 @@ node's plane; the router has every optional capability the Engine finds by type 
   The replicas restart after the primary whichever way the value moved, so a raise leaves a replica
   paused for the seconds the restart takes. A replica that does not come back is `ACTIVE_UNHEALTHY`,
   leaves the event `replica.restart_failed` and is reported through `ReplicaFleet.Failed`. A save that
-  leaves the restart to the user restarts no replica.
+  leaves the restart to the user restarts no replica, and neither does the restart that applies it later.
 
 ## Tests
 
@@ -560,7 +579,14 @@ and `upgrade-smoke` run the systemd, compute size, saved settings and upgrade fl
   runtime); they move with the node.
 - `Usage` reports disk bytes and unit memory only.
 - A major upgrade of a project that has replicas is refused (`has_replicas`); there is no option that
-  drops the replicas first.
+  drops the replicas first, and a bump of the Postgres artifact has no replicas-first order: the manifest
+  has no `wal_compat` field to say when one is needed.
+- Replicas follow the primary's size and settings only through the restarts above. A resize, or a save of
+  Postgres settings, made while the project is paused, and the restart that applies a held-back setting
+  (`RestartPending`), restart no replica. A standby whose limits are below the primary's pauses replay
+  until it restarts, so restart the replica after such a change.
+- Restore, upgrade and the final backup of a delete are refused for a project homed on another node: the
+  Engine works on this node's disk. They run once the project is homed here again.
 - A project homed on another node answers `ErrNotSupported` to the optional capabilities (saved
   settings, role passwords, extensions); they are applied on its home. Create with a `DataSeeder` runs
   on the node that is the home.

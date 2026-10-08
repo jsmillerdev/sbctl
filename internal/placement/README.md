@@ -32,6 +32,13 @@ holds the replica (replica design, sections 2.5 to 2.7 and 2.10).
   control file of a stopped cluster on its home (`lifecycle.ReadControl`, answered as `lifecycle.ControlInfo`),
   which a switchover needs after the old primary's fast shutdown to learn the position the new primary
   must replay to (`PromoteOptions.WaitLSN`). `Router` and `RemotePlane` implement `CheckpointReader`.
+- Two more requests on the plane path serve what the leader's Engine runs for a project homed elsewhere
+  and that is no plane call. `start_timer` and `stop_timer` start and stop the project's nightly base
+  backup timer on its home, where its data is (`Router.Timers` is the `lifecycle.Timers` the daemon
+  gives the Engine through `Engine.SetTimers`; a node with no timers, the exec backend, does nothing).
+  `node_resources` reads the memory and cores of the home (`lifecycle.NodeResources`; zero when the node
+  does not know them), which the Engine judges a resume or a resize against (`Router` is the
+  `lifecycle.NodeResourcer` given to `Engine.SetRemoteNodes`).
 - A test fails when `lifecycle.Plane` gains a method that lacks a `peerapi.PlaneMethod`, an entry in the
   agent's table (`planeCalls`) or a method on `RemotePlane`.
 
@@ -101,16 +108,22 @@ node, the peer API for another.
   orchestrator's steps 4 and 7 of a project switchover; `lifecycle.PromoteReplica` and
   `DemoteToReplica`). An action during a setup is refused. `start`, `restart` and `stop` are refused
   when the registry names this node the project's home, and so is a `promote`, except one repeated after
-  the home moved here, which finds the cluster a primary and ends the replica instance. A promotion
+  the home moved here, which finds the cluster a primary and ends the replica instance. A `demote` is
+  refused while the registry still names this node the home: the registry moves the home first (design
+  2.10.3, steps 5 and 7), and a demotion of the home would stop its primary. A promotion
   and a demotion take the project's ports from the mesh's forwarders while they run
   (`lifecycle.PlaneOptions.HoldPorts`; `internal/app/wire_placement.go` binds it to
   `mesh.Forwarders.Suspend`): on a replica's node the canonical ports are forwarders to the old home,
   and Postgres could not bind them.
 - `StartLocal` starts the node's complete replicas after a restart; their units are not enabled for boot.
+  A cluster that is no standby of its replica (no `standby.signal`, or a standby that follows as another
+  replica) is left alone: the node was promoted and the registry has not caught up, and the replica's spec
+  would run a writable cluster on the replica port beside the real one.
 
 `ReportCache` keeps the observation of the node's replicas and of the projects homed there in memory and
 refreshes it every 10 seconds, so that a report answers from memory and never waits for a probe (each
-replica is a SQL and an HTTP probe). `Contribution` is its answer in the shape the cluster package's
+replica is a SQL and an HTTP probe; the daemon checks the projects homed here only on a node that is not the
+leader, which reports to nobody and reads its own). `Contribution` is its answer in the shape the cluster package's
 reporter adds to the report it sends (`cluster.Contributor`); the cluster's reporter stores the report of
 a leader too, which covers the replicas the leader holds. `Reporter` is the sender until then: it tells
 the leader what the node observes every 10 seconds (`POST /peer/v1/report`) when the node is not the
@@ -119,17 +132,22 @@ leader, and logs once, not every tick, that a leader has no report endpoint (`Er
 `Fleet` is the `lifecycle.ReplicaFleet` of the leader's Engine: it restarts a project's replicas through
 `InstanceOps` when the project is resized.
 
-`internal/app/wire_placement.go` wires all of it when the mesh is up; a node with no cluster runs
-exactly as before.
+`internal/app/wire_placement.go` wires all of it when the mesh is up, and provides `placement.Resolver`,
+`PlaneRouter`, `InstanceOps`, `BackupOps`, `Contribution` and the node's own backup timers as
+`lifecycle.Timers` (for whoever starts or stops a primary on the node); a node with no cluster runs exactly
+as before.
 
 ## Tests
 
 `go test ./internal/placement/` runs against fakes: the remote plane through the handlers in one process
 (every method, every status, authorization and epochs), the router, the agent's state machine (steps,
-failures, resume, removal guards, actions), `Ops`, `Fleet`, `Reporter`, `ReportCache`, and the format of
-`promote.ok` against `internal/backup`. `TestIntegrationReplicaBlocks` runs a seed, a stream, a PostgREST
-reload, a promotion and a demotion on real clusters (exec backend); it needs `SUPAVISE_TEST_UNPACKED` and
-runs in the linux job `replica-blocks` through `tests/linux/replica-blocks.sh`. It turns the event
+failures, resume, removal guards, actions), the timer and node-resource requests, `Ops`, `Fleet`,
+`Reporter`, `ReportCache`, and the format of `promote.ok` against `internal/backup`.
+`TestIntegrationReplicaBlocks` runs a seed, a stream, a PostgREST reload, a promotion, the move of the
+home in the registry and a demotion on real clusters (exec backend); it counts the `pg_cron` and
+`pg_net` workers separately on the primary, the standby and the promoted cluster. It needs
+`SUPAVISE_TEST_UNPACKED` and runs in the linux job `replica-blocks` through
+`tests/linux/replica-blocks.sh`. It turns the event
 triggers that NOTIFY PostgREST off before the DDL change it makes, so that only the reload timer can make
 the change visible, and checks that the change is not visible before the timer starts. One machine plays
 two nodes there, with no mesh forwarders: the canonical port stands for the forwarder, and the hold on
