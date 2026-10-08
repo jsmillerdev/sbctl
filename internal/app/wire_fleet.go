@@ -269,7 +269,10 @@ func modeFor(r cluster.Role) fleet.Mode {
 	return fleet.ModeLeader
 }
 
-// followRole keeps the shared services in the mode of the node's role. booted is the role the daemon
+// followRole keeps the shared services in the mode of the node's role. It is an early, best-effort
+// reconciliation: the daemon restarts on every role change (Live.Changed ends Serve with ErrRoleChanged)
+// and startFleet puts the units in step at that start, so what followRole does makes a fence take effect
+// at once and leaves the restart to make the result final. booted is the role the daemon
 // started in, which startFleet has already put in effect (empty: the first snapshot says it); a
 // snapshot of any other role, the first one included, is applied. An apply that fails leaves the
 // services half in step, so it is tried again after retry, whatever role is wanted by then, until one
