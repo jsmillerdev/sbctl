@@ -1,0 +1,75 @@
+name: replication-spike
+
+# Two Incus nodes with a real systemd on one runner (design spike S9): do they boot, run the polkit rule and
+# the unit hardening, take `install.sh --binary` of this checkout, block the instance metadata address, and
+# reach each other, Garage, a signed release server and a fake AWS service. Virtual machines where /dev/kvm
+# works, system containers otherwise; both architectures. tests/linux/multi/README.md has the outcome.
+#
+# expect_fail lists the checks that are known to fail in a mode (see SPIKE_EXPECT_FAIL in spike.sh): a job is
+# red when another check fails, and also when one of those passes, because the README would then be wrong.
+#   amd64 vm                  all checks pass
+#   amd64/arm64 container     unprivileged system containers do not enforce IPAddressDeny; systemd-smoke.sh
+#                             (the smoke input) stops at the same place
+#   container-privileged      all checks pass
+#   arm64 vm                  the arm64 runners have no /dev/kvm
+on:
+  push:
+    branches: ["ws/rep-x1"]
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: Also run tests/linux/systemd-smoke.sh on a third, fresh node of the same kind
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# bash with -eo pipefail, so a failing command piped into tee fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  two-nodes:
+    name: two-nodes (${{ matrix.arch }}, ${{ matrix.mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64, mode: vm, expect_fail: "" }
+          - { runner: ubuntu-24.04, arch: amd64, mode: container-privileged, expect_fail: "" }
+          - { runner: ubuntu-24.04, arch: amd64, mode: container, expect_fail: "imds smoke" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container-privileged, expect_fail: "" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container, expect_fail: "imds smoke" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: vm, expect_fail: incus }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The release server signs this build as v0.0.1; deploy/release-assets.sh writes the manifest with the
+      # release tool (root has no Go toolchain).
+      - name: build supavise and the release tool
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
+          go build -o /tmp/releasetool ./deploy/releasetool
+      - name: two nodes (${{ matrix.mode }})
+        run: |
+          sudo env LOG_DIR=/tmp/supavise-multi-logs MULTI_MODE=${{ matrix.mode }} MULTI_SMOKE=${{ inputs.smoke && '1' || '0' }} \
+            SPIKE_EXPECT_FAIL="${{ matrix.expect_fail }}" \
+            SUPAVISE_BIN=/tmp/supavise SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/multi/spike.sh 2>&1 | tee /tmp/spike.log
+      - if: always()
+        name: results
+        run: |
+          sudo chmod -R a+rX /tmp/supavise-multi-logs || true
+          cp /tmp/spike.log /tmp/supavise-multi-logs/ || true
+          cat /tmp/supavise-multi-logs/results.md >> "$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replication-spike-${{ matrix.arch }}-${{ matrix.mode }}
+          path: /tmp/supavise-multi-logs
+          if-no-files-found: ignore
