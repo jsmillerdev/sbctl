@@ -49,6 +49,12 @@ func TestOnPostgres(t *testing.T) {
 		"EpochRaceStopsBeforePromotion":   TestEpochRaceStopsBeforeThePromotion,
 		"ResumeAtEveryStep":               TestResumeAtEveryStep,
 		"PlannedUndoneWhenLeaderWontStop": TestPlannedSwitchoverUndoneWhenTheLeaderCannotBeStopped,
+		"CutOffByTheRestart":              TestAServerMoveCutOffByTheRestartContinuesInTheDaemonThatStarts,
+		"ReadOnlyAfterThePromotion":       TestAServerMoveThatFindsItsRegistryReadOnlyAfterThePromotionWaitsForTheRestart,
+		"FollowedFromItsLog":              TestTheMoveIsFollowedFromItsLogWhoeverContinuesIt,
+		"AbortBeforeTheMarker":            TestAbortDiscardsAMoveThatStoppedBeforeTheMarkerAndStartsTheLeaderAgain,
+		"PausedProject":                   TestAPausedProjectIsSwitchedOverAndStaysPaused,
+		"CooldownPerProject":              TestTheCooldownIsPerProjectInProjectModeAndForTheServerInServerMode,
 	} {
 		t.Run(name, func(t *testing.T) {
 			old := newWorldFunc
