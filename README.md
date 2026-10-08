@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <b>Supavise</b> runs multiple Supabase organizations and projects on one server you control.
+  <b>Supavise</b> runs multiple Supabase organizations and projects on a server you control, and a second server adds read replicas and failover.
 </p>
 
 <p align="center">
@@ -33,6 +33,7 @@ Self-hosted Supabase runs one project per Docker stack, with a single-project da
 - **Many projects, one server.** Run about 20 projects with room for traffic on an 8 GB server.
 - **The tools you already use.** Supabase Studio and `supabase-js` work against your server, and apps only change the URL. The Supabase CLI connects with a profile file.
 - **A database for every agent.** Give each preview or AI agent its own branch or project in seconds.
+- **A second server when you need one.** Join it to the first for read replicas, a planned switchover or a failover.
 
 <p align="center">
   <img alt="Supabase Studio on Supavise: the Acme organization's project list with five projects" src="docs/images/screenshots/projects-dark.png" width="880">
@@ -40,9 +41,6 @@ Self-hosted Supabase runs one project per Docker stack, with a single-project da
 </p>
 
 ## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>Get started
-
-> [!NOTE]
-> The first release isn't published yet. The download links below work once it is.
 
 <p align="center">
   <a href="#your-server"><picture><source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="brand/readme/path-server-narrow-dark.svg"><source media="(max-width: 600px)" srcset="brand/readme/path-server-narrow-light.svg"><source media="(prefers-color-scheme: dark)" srcset="brand/readme/path-server-dark.svg"><img alt="Your server: Ubuntu 24.04+ or Debian 12+, 4–8 GB of memory. Run one install command." src="brand/readme/path-server-light.svg" width="49%"></picture></a>
@@ -67,7 +65,7 @@ Either way, open the claim URL, enter the token to create your admin account, an
 
 ## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>What's included
 
-<picture><source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="brand/readme/features-narrow-dark.svg"><source media="(max-width: 600px)" srcset="brand/readme/features-narrow-light.svg"><source media="(prefers-color-scheme: dark)" srcset="brand/readme/features-dark.svg"><img alt="What's included. Dashboard: The real Supabase Studio, with multiple organizations and projects. Every project: Postgres, Auth, REST, GraphQL, Realtime, Storage, Edge Functions and custom domains. Compute sizes: Nano to 16XL per project, like hosted, resized from the dashboard. Branching: Schema-only branches or full copies of your data, for previews and agents. Backups: Point-in-time restore from the dashboard, including Storage files. Teams: Organizations, roles, invitations, SAML single sign-on and MFA. API keys: Publishable and secret keys, legacy JWT keys and key rotation. Monitoring: Health checks, an uptime endpoint, and alerts by email or webhook. Operations: Automatic HTTPS, security patches and signed updates. AWS: A one-field CloudFormation template." src="brand/readme/features-light.svg" width="100%"></picture>
+<picture><source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="brand/readme/features-narrow-dark.svg"><source media="(max-width: 600px)" srcset="brand/readme/features-narrow-light.svg"><source media="(prefers-color-scheme: dark)" srcset="brand/readme/features-dark.svg"><img alt="What's included. Dashboard: The real Supabase Studio, with multiple organizations and projects. Every project: Postgres, Auth, REST, GraphQL, Realtime, Storage, Edge Functions and custom domains. Compute sizes: Nano to 16XL per project, like hosted, resized from the dashboard. Branching: Schema-only branches or full copies of your data, for previews and agents. Backups: Point-in-time restore from the dashboard, including Storage files. Storage on S3: Move Storage's files to an S3 bucket in place, with a short pause for writes. Read replicas: A copy of a project on a second server, with its own API and pooler endpoints. Failover: Switch a project or the whole server to its replica, by hand or automatically on AWS. Teams: Organizations, roles, invitations, SAML single sign-on and MFA. API keys: Publishable and secret keys, legacy JWT keys and key rotation. Monitoring: Health checks, an uptime endpoint, and alerts by email or webhook. Operations: Automatic HTTPS, security patches and signed updates. Upgrades: One command brings servers and AWS stacks forward from v0.1.x, backed up first. AWS: A one-field CloudFormation template, and a second stack for a replica server." src="brand/readme/features-light.svg" width="100%"></picture>
 
 <p align="center">
   <img alt="Supabase Studio's table editor on Supavise showing a products table with 12 rows" src="docs/images/screenshots/table-editor-dark.png" width="880">
@@ -80,7 +78,10 @@ Each Supavise release is a tested bundle of Supabase's services, so you track on
 ```bash
 sudo supavise upgrade --check   # what's new
 sudo supavise upgrade           # backs up every project, rolls out with health checks, rolls back on failure
+sudo -E supavise upgrade --aws  # on AWS, first brings the CloudFormation stack forward too
 ```
+
+The same command moves a server and an AWS stack made by v0.1.x onto this release. It brings the host forward (`supavise system converge`) and, with `--aws`, shows a CloudFormation change set and refuses any change that would replace the instance, the data volume or the address. See [Bring a v0.1.x AWS stack forward](deploy/README.md#bring-a-v01x-aws-stack-forward). With two servers, run it on each, the leader first.
 
 For hands-off updates, turn on automatic upgrades in a weekly maintenance window with `sudo supavise update config --mode auto --window "Sun 03:00-05:00"`. OS security patches install on their own, and project owners upgrade their own project from the dashboard, as on hosted Supabase. The [guide](docs/guide.md#updates-and-maintenance) has the full routine.
 
@@ -91,7 +92,7 @@ For hands-off updates, turn on automatic upgrades in a weekly maintenance window
   <img alt="Supavise architecture: Supabase Studio, the Supabase CLI, the MCP server and your apps reach one node over HTTPS; the supavise binary fronts per-project Postgres, Auth and REST plus shared Supavisor, Realtime, Storage, Edge Runtime and Studio; backups go to S3 or local disk" src="brand/readme/architecture-light.svg" width="100%">
 </picture>
 
-One Go program installs Supabase's open-source services and adds what self-hosting lacks: HTTPS, multiple projects, the API that the dashboard and CLI need, and backups. See [how Supavise compares](docs/guide.md#how-supavise-compares) to self-hosted and hosted Supabase, or read the [design](docs/design.md).
+One Go program installs Supabase's open-source services and adds what self-hosting lacks: HTTPS, multiple projects, the API that the dashboard and CLI need, and backups. See [how Supavise compares](docs/guide.md#how-supavise-compares) to self-hosted and hosted Supabase, or read the [design](docs/design.md). To add a second server for read replicas and failover, see [Read replicas and failover](docs/guide.md#read-replicas-and-failover).
 
 ## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>License
 

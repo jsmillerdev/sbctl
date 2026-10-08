@@ -351,6 +351,13 @@ ICONS = {
     "pulse":     '<path d="M4 26H14L19 13L28 37L33 22H44"/>',
     "server":    '<rect x="5" y="7" width="38" height="14"/><rect x="5" y="27" width="38" height="14"/>'
                  '<path stroke="none" fill="@" d="M12 12h4v4h-4zM12 32h4v4h-4z"/><path d="M26 14H36M26 34H36"/>',
+    "replica":   '<rect x="4" y="8" width="14" height="32"/><rect x="30" y="8" width="14" height="32"/>'
+                 '<path d="M18 24H30"/><path stroke="none" fill="@" d="M8 13h6v6H8z"/>',
+    "failover":  '<path d="M6 16H30"/><path stroke="none" fill="@" d="M30 8L44 16L30 24Z"/>'
+                 '<path d="M42 32H18"/><path stroke="none" fill="@" d="M18 24L4 32L18 40Z"/>',
+    "upgrade":   '<path d="M24 36V14"/><path d="M12 24L24 12L36 24"/><path stroke="none" fill="@" d="M8 38h32v6H8z"/>',
+    "bucket":    '<ellipse cx="24" cy="12" rx="16" ry="6"/><path d="M8 12V36A16 6 0 0 0 40 36V12"/>'
+                 '<path stroke="none" fill="@" d="M19 24h10v6H19z"/>',
 }
 
 def icon(name, x, y, size, color):
@@ -364,11 +371,15 @@ FEATURES = [
     ("chip", "Compute sizes", "Nano to 16XL per project, like hosted, resized from the dashboard"),
     ("branch", "Branching", "Schema-only branches or full copies of your data, for previews and agents"),
     ("backup", "Backups", "Point-in-time restore from the dashboard, including Storage files"),
+    ("bucket", "Storage on S3", "Move Storage's files to an S3 bucket in place, with a short pause for writes"),
+    ("replica", "Read replicas", "A copy of a project on a second server, with its own API and pooler endpoints"),
+    ("failover", "Failover", "Switch a project or the whole server to its replica, by hand or automatically on AWS"),
     ("team", "Teams", "Organizations, roles, invitations, SAML single sign-on and MFA"),
     ("key", "API keys", "Publishable and secret keys, legacy JWT keys and key rotation"),
     ("pulse", "Monitoring", "Health checks, an uptime endpoint, and alerts by email or webhook"),
     ("shield", "Operations", "Automatic HTTPS, security patches and signed updates"),
-    ("cloud", "AWS", "A one-field CloudFormation template"),
+    ("upgrade", "Upgrades", "One command brings servers and AWS stacks forward from v0.1.x, backed up first"),
+    ("cloud", "AWS", "A one-field CloudFormation template, and a second stack for a replica server"),
 ]
 
 def wrap(t, n):
