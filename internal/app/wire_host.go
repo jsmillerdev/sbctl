@@ -18,7 +18,9 @@ import (
 // it, which enable the cluster features, so that they stay off until `supavise system converge` has
 // run and the daemon has restarted: the state they Get is the one the daemon started with (a hook
 // that wants the marker as it is now reads hostsetup.StatusOf). The hook adds itself to the front of
-// the list, so that the others can Get the state.
+// the list, so that the others can Get the state. hostBehind (wire_replicas.go) is how they read it:
+// wireMesh does not turn a server into a cluster, wireReplicas runs no replica controller and
+// wireFailover no monitor, while the host is behind.
 func init() {
 	wireHooks = append([]struct {
 		name string
