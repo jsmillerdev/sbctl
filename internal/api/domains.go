@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/domains"
@@ -266,6 +267,16 @@ func (s *Server) getVanity(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// replicaHostShape says whether a vanity name has the shape of a replica's or a balancer's host
+// (design 2.7.1): "<ref>-rr-<region>-<id6>" and "<ref>-lb". The proxy resolves those hosts before
+// routes, so a vanity route with such a name would be shadowed once the project it names has a
+// replica, and it could be taken for another project's balancer. The names are reserved here, where
+// they are handed out; internal/domains' own validator does not know them.
+func replicaHostShape(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(n, "-rr-") || strings.HasSuffix(n, "-lb")
+}
+
 func (s *Server) checkVanity(w http.ResponseWriter, r *http.Request) error {
 	svc, err := s.domainSvc()
 	if err != nil {
@@ -278,6 +289,12 @@ func (s *Server) checkVanity(w http.ResponseWriter, r *http.Request) error {
 	var in vanityBody
 	if err := decode(r, &in); err != nil {
 		return err
+	}
+	if replicaHostShape(in.Name) {
+		resp := base("POST /v1/projects/{ref}/vanity-subdomain/check-availability")
+		resp["available"] = false // reserved, like api and studio
+		writeJSON(w, http.StatusCreated, resp)
+		return nil
 	}
 	ok, err := svc.CheckVanity(r.Context(), p.Ref, in.Name)
 	if err != nil {
@@ -301,6 +318,9 @@ func (s *Server) activateVanity(w http.ResponseWriter, r *http.Request) error {
 	var in vanityBody
 	if err := decode(r, &in); err != nil {
 		return err
+	}
+	if replicaHostShape(in.Name) {
+		return errf(http.StatusBadRequest, "vanity_subdomain %s is reserved", strings.ToLower(strings.TrimSpace(in.Name)))
 	}
 	done, err := s.beginOp()
 	if err != nil {
