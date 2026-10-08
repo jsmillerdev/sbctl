@@ -56,15 +56,16 @@ type Live struct {
 	*Static
 	o LiveOptions
 
-	mu       sync.Mutex
-	fenced   *FencedRecord
-	primary  bool // the last probe of the system cluster succeeded and found a primary
-	fencing  bool // an observation is deciding whether to fence the node
-	notified bool // OnFenced has been called
-	drift    int  // consecutive polls that saw a role other than the boot role
-	changed  chan struct{}
-	once     sync.Once
-	reason   string
+	mu        sync.Mutex
+	fenced    *FencedRecord
+	primary   bool   // the last probe of the system cluster succeeded and found a primary
+	fencing   bool   // an observation is deciding whether to fence the node
+	notified  bool   // OnFenced has been called
+	recordErr string // the last error of reading fenced.json that was logged
+	drift     int    // consecutive polls that saw a role other than the boot role
+	changed   chan struct{}
+	once      sync.Once
+	reason    string
 }
 
 var _ Membership = (*Live)(nil)
@@ -166,7 +167,13 @@ func (l *Live) adoptRecord() {
 	}
 	rec, err := ReadFenced(l.o.Cfg)
 	if err != nil {
-		l.o.Log.Warn("membership: fenced.json cannot be read", "error", err)
+		l.mu.Lock()
+		again := l.recordErr == err.Error() // once per distinct error: the poll runs every two seconds
+		l.recordErr = err.Error()
+		l.mu.Unlock()
+		if !again {
+			l.o.Log.Warn("membership: fenced.json cannot be read", "error", err)
+		}
 		return
 	}
 	if rec == nil || rec.Removed {
