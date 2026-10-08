@@ -109,23 +109,11 @@ func wireFailover(ctx context.Context, w *Wire) error {
 		mesh.Handle(pattern, h)
 	}
 
-	// At boot, before any project starts: a node that was replaced while it was away learns it. A
-	// registry that cannot be read does not skip the check: the node is taken to claim a primary.
-	claims := members.IsLeader()
-	if !claims {
-		if ps, err := store().ListProjects(ctx); err != nil {
-			w.Log.Warn("the registry could not be read for the boot epoch check; checking as if this node homed a project", "error", err)
-			claims = true
-		} else {
-			for _, p := range ps {
-				if p.NodeID == members.Self().ID {
-					claims = true
-				}
-			}
-		}
-	}
+	// At boot, before any project starts: a leader that was replaced while it was away learns it.
+	// Only a node that leads according to its own registry is asked (a follower's copy is behind
+	// and nothing it homes moved); every node has its fence record read.
 	bctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	res, err := o.BootCheck(bctx, claims)
+	res, err := o.BootCheck(bctx)
 	cancel()
 	switch {
 	case err != nil:
@@ -137,7 +125,14 @@ func wireFailover(ctx context.Context, w *Wire) error {
 	mon := failover.NewMonitor(o)
 	w.Go("failover monitor", func(ctx context.Context) error { mon.Run(ctx); return nil })
 	ctl := &failover.ControlServer{Svc: o, Log: w.Log}
-	w.Go("failover control", func(ctx context.Context) error { return ctl.Serve(ctx, failover.ControlSocket(cfg)) })
+	// The socket is the CLI's way in; a path that is too long or a directory that cannot be written
+	// costs the CLI, not the node, so the failure is logged and the daemon goes on.
+	w.Go("failover control", func(ctx context.Context) error {
+		if err := ctl.Serve(ctx, failover.ControlSocket(cfg)); err != nil {
+			w.Log.Error("the failover control socket is not available; supavise failover and status cannot reach this daemon", "error", err)
+		}
+		return nil
+	})
 	w.Go("failover janitor", func(ctx context.Context) error {
 		sweepDiverged(ctx, cfg, w)
 		return nil

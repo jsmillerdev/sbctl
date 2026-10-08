@@ -41,19 +41,17 @@ type BootResult struct {
 	Sources []string
 }
 
-// BootCheck runs the boot-time epoch check. claims says whether this node would run a primary: it
-// leads according to its own registry, or homes a project. A node that claims nothing has no
-// primary to fence, and neither has one that does not lead (see above); both only have their
-// record read. It never returns an error for a source that is unreachable; that is the point of
-// having two.
-func (o *Orchestrator) BootCheck(ctx context.Context, claims bool) (BootResult, error) {
+// BootCheck runs the boot-time epoch check. Only a node that leads according to its own registry
+// is asked about the cluster (see above); any other node only has its record read. It never
+// returns an error for a source that is unreachable; that is the point of having two.
+func (o *Orchestrator) BootCheck(ctx context.Context) (BootResult, error) {
 	paths := o.d.Cfg.Paths()
 	if rec, err := fenced.Node(paths); err != nil {
 		return BootResult{Fenced: true, Reason: err.Error()}, nil // a record that cannot be read fences
 	} else if rec != nil {
 		return BootResult{Fenced: true, Reason: rec.Reason, Epoch: rec.Epoch, Leader: rec.Leader}, nil
 	}
-	if !claims || !o.d.Members.IsLeader() {
+	if !o.d.Members.IsLeader() {
 		return BootResult{}, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, bootTimeout)
@@ -112,18 +110,10 @@ func (o *Orchestrator) BootCheck(ctx context.Context, claims bool) (BootResult, 
 		res.Sources = append(res.Sources, a.source)
 	}
 	for _, a := range answers {
-		switch {
-		case a.epoch > localEpoch:
-			res.Fenced = true
-			res.Reason = fmt.Sprintf("%s says epoch %d (leader %s); this node's registry is at epoch %d", a.source, a.epoch, a.leader, localEpoch)
-		case a.epoch == localEpoch && a.leader != "" && a.leader != localLeader:
-			res.Fenced = true
-			res.Reason = fmt.Sprintf("%s says %s leads at epoch %d; this node's registry says %s", a.source, a.leader, a.epoch, localLeader)
-		default:
-			continue
+		if reason := replacedBy(a.source, a.epoch, a.leader, localEpoch, localLeader); reason != "" {
+			res.Fenced, res.Reason, res.Epoch, res.Leader = true, reason, a.epoch, a.leader
+			break
 		}
-		res.Epoch, res.Leader = a.epoch, a.leader
-		break
 	}
 	if !res.Fenced {
 		if len(answers) == 0 && len(o.d.Members.Nodes()) > 1 {
@@ -131,14 +121,48 @@ func (o *Orchestrator) BootCheck(ctx context.Context, claims bool) (BootResult, 
 		}
 		return res, nil
 	}
-	return res, o.fenceSelf(ctx, res)
+	return res, o.fenceSelf(ctx, res, "At boot")
+}
+
+// replacedBy says why what a source reported means that the node, which leads at localEpoch under
+// localLeader, has been replaced: a higher epoch, or another leader at its own. It returns "" when
+// the source shows no replacement.
+func replacedBy(source string, epoch int64, leader string, localEpoch int64, localLeader string) string {
+	switch {
+	case epoch > localEpoch:
+		return fmt.Sprintf("%s says epoch %d (leader %s); this node's registry is at epoch %d", source, epoch, leader, localEpoch)
+	case epoch == localEpoch && leader != "" && leader != localLeader:
+		return fmt.Sprintf("%s says %s leads at epoch %d; this node's registry says %s", source, leader, epoch, localLeader)
+	}
+	return ""
+}
+
+// FenceOnHigherEpoch is the boot check's verdict for a leader that is already running (invariant
+// I1): the membership layer calls it when a ping, a peer call or the leader marker shows that the
+// cluster is at a higher epoch, or that another node leads at this node's epoch. source names where
+// it was seen ("peer standby"). A node that does not lead, or that saw nothing newer than its own
+// registry, is left alone and false returned; otherwise the node fences itself exactly as at boot:
+// the record is written, the primaries stop, and the alert goes out.
+func (o *Orchestrator) FenceOnHigherEpoch(ctx context.Context, source string, epoch int64, leader string) (bool, error) {
+	if !o.d.Members.IsLeader() {
+		return false, nil
+	}
+	localLeader := o.self().ID
+	if l, ok := o.d.Members.Leader(); ok {
+		localLeader = l.ID
+	}
+	reason := replacedBy(source, epoch, leader, o.d.Members.Epoch(), localLeader)
+	if reason == "" {
+		return false, nil
+	}
+	return true, o.fenceSelf(ctx, BootResult{Fenced: true, Reason: reason, Epoch: epoch, Leader: leader}, "While running")
 }
 
 // fenceSelf makes the verdict stick: the record first, so that nothing starts a primary behind
 // the daemon's back, then the clusters that run now are stopped and the alert goes out. A record
 // that cannot be written (a full disk is likely on a node that is failing) does not leave the
 // primaries running: they are stopped and their launchers removed all the same.
-func (o *Orchestrator) fenceSelf(ctx context.Context, res BootResult) error {
+func (o *Orchestrator) fenceSelf(ctx context.Context, res BootResult, when string) error {
 	var errs []error
 	if err := fenced.WriteNode(o.d.Cfg.Paths(), fenced.Record{Epoch: res.Epoch, Leader: res.Leader, Reason: res.Reason, At: o.d.Now().UTC()}); err != nil {
 		errs = append(errs, fmt.Errorf("failover: recording that this node is fenced: %w", err))
@@ -150,7 +174,7 @@ func (o *Orchestrator) fenceSelf(ctx context.Context, res BootResult) error {
 	}
 	o.alert(ctx, alerts.Event{
 		Kind: alerts.KindFenced, Severity: alerts.SeverityCritical, Title: "This node was fenced",
-		Detail: "At boot: " + res.Reason + ". No cluster starts as a primary here until `supavise node rejoin` rebuilds this node as a follower of the current leader.",
+		Detail: when + ": " + res.Reason + ". No cluster starts as a primary here until `supavise node rejoin` rebuilds this node as a follower of the current leader.",
 		Key:    "fenced",
 	})
 	return errors.Join(errs...)

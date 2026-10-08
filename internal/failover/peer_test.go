@@ -454,6 +454,23 @@ func TestPrimaryEndpointsServeOnlyTheLeader(t *testing.T) {
 	}
 }
 
+// The data of a live primary is not moved aside on a peer's say-so: the registry must home the
+// project on another node first, as the leader does before it asks.
+func TestAsideRefusesAProjectTheRegistryHomesOnThisNode(t *testing.T) {
+	w := newWorld(t)
+	w.setSelf("n2", false)
+	rehomeOn(t, w, refA, "n2", "n1")
+	o := w.orch()
+	rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refA, OpAside), "n1", PrimaryCall{Epoch: 1}, nil)
+	if rec.Code != http.StatusConflict || errorOf(rec).Code != "homed_here" || w.has("local.aside") {
+		t.Fatalf("%d %s\n%v", rec.Code, rec.Body, w.snapshot())
+	}
+	// A project homed on the leader is the old primary of a move: its data on n2 may go.
+	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refB, OpAside), "n1", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusOK || !w.has("local.aside "+refB) {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+}
+
 // A ref from a peer builds paths (the launcher, the fence record, the set-aside data): only a real ref passes.
 func TestARefThatIsNotAProjectRefIsRefusedBeforeItBuildsAPath(t *testing.T) {
 	w := newWorld(t)
@@ -621,28 +638,26 @@ func bootRig(t *testing.T) *world {
 
 func TestBootCheck(t *testing.T) {
 	for name, tc := range map[string]struct {
-		claims bool
 		mut    func(w *world)
 		fenced bool
 		why    string
 	}{
-		"a node that claims nothing is not asked": {claims: false, mut: func(w *world) { w.setMarkerEpoch(9, "n2") }},
-		"nothing newer anywhere":                  {claims: true},
-		"a peer at a higher epoch": {claims: true, fenced: true, why: "peer standby says epoch 2",
+		"nothing newer anywhere": {},
+		"a peer at a higher epoch": {fenced: true, why: "peer standby says epoch 2",
 			mut: func(w *world) { w.setPeerEpoch(2, "n2") }},
-		"the marker at a higher epoch": {claims: true, fenced: true, why: "leader marker says epoch 2",
+		"the marker at a higher epoch": {fenced: true, why: "leader marker says epoch 2",
 			mut: func(w *world) { w.setMarkerEpoch(2, "n2"); w.down["n2"] = true }},
-		"a peer at the same epoch under another leader": {claims: true, fenced: true, why: "n2 leads at epoch 1",
+		"a peer at the same epoch under another leader": {fenced: true, why: "n2 leads at epoch 1",
 			mut: func(w *world) { w.setPeerEpoch(1, "n2") }},
-		"the marker at the same epoch under the same leader": {claims: true,
+		"the marker at the same epoch under the same leader": {
 			mut: func(w *world) { w.setMarkerEpoch(1, "n1") }},
-		"a peer behind": {claims: true,
+		"a peer behind": {
 			mut: func(w *world) { w.setPeerEpoch(0, "n1") }},
-		"neither source reachable": {claims: true,
+		"neither source reachable": {
 			mut: func(w *world) { w.down["n2"] = true; w.markErr = errors.New("store down") }},
-		"a follower that missed a leader change is not fenced for it": {claims: true,
+		"a follower that missed a leader change is not fenced for it": {
 			mut: func(w *world) { w.setSelf("n2", false); w.setPeerEpoch(2, "n3") }},
-		"an earlier record": {claims: false, fenced: true, why: "peer n2 leads",
+		"an earlier record": {fenced: true, why: "peer n2 leads",
 			mut: func(w *world) {
 				must(w.t, fenced.WriteNode(w.cfg.Paths(), fenced.Record{Epoch: 3, Leader: "n2", Reason: "peer n2 leads at epoch 3"}))
 			}},
@@ -652,7 +667,7 @@ func TestBootCheck(t *testing.T) {
 			if tc.mut != nil {
 				tc.mut(w)
 			}
-			res, err := w.orch().BootCheck(w.ctx, tc.claims)
+			res, err := w.orch().BootCheck(w.ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -687,6 +702,54 @@ func TestBootCheck(t *testing.T) {
 	}
 }
 
+// The runtime half of the boot check: a leader that learns of a higher epoch from the membership
+// layer fences itself the same way; a follower, or a leader that saw nothing newer, does not.
+func TestFenceOnHigherEpochIsTheBootVerdictForARunningLeader(t *testing.T) {
+	for name, tc := range map[string]struct {
+		follower bool
+		epoch    int64
+		leader   string
+		fenced   bool
+	}{
+		"a higher epoch":               {epoch: 2, leader: "n2", fenced: true},
+		"another leader at this epoch": {epoch: 1, leader: "n2", fenced: true},
+		"the same epoch and leader":    {epoch: 1, leader: "n1"},
+		"a lower epoch":                {epoch: 0, leader: "n2"},
+		"a follower is never replaced": {follower: true, epoch: 5, leader: "n3"},
+		"a higher epoch of no leader":  {epoch: 2, fenced: true},
+		"the same epoch of no leader":  {epoch: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := bootRig(t)
+			if tc.follower {
+				w.setSelf("n2", false)
+			}
+			done, err := w.orch().FenceOnHigherEpoch(w.ctx, "peer standby", tc.epoch, tc.leader)
+			if err != nil || done != tc.fenced {
+				t.Fatalf("fenced %v, error %v", done, err)
+			}
+			rec, _ := fenced.Node(w.cfg.Paths())
+			if !tc.fenced {
+				if rec != nil || w.has("local.stop") || len(w.alerts) != 0 {
+					t.Fatalf("a node that was not replaced changed: %+v", rec)
+				}
+				return
+			}
+			if rec == nil || rec.Epoch != tc.epoch || !strings.Contains(rec.Reason, "peer standby says") {
+				t.Fatalf("record: %+v", rec)
+			}
+			for _, ref := range []string{config.SystemRef, refA, refB} {
+				if !w.has("local.stop "+ref) || exists1(units.FilesFor(w.cfg, units.Spec{Service: config.SvcPostgres, Ref: ref}).Run) {
+					t.Errorf("%s still runs or keeps its launcher", ref)
+				}
+			}
+			if k := w.alertKinds(); len(k) != 1 || k[0] != alerts.KindFenced || !strings.Contains(w.alerts[0].Detail, "While running") {
+				t.Fatalf("alerts: %v", w.alerts)
+			}
+		})
+	}
+}
+
 // A node that cannot write its fence record (a full disk is likely on a node that is failing) still
 // stops its primaries and takes their launchers away.
 func TestFenceSelfStopsThePrimariesEvenWhenTheRecordCannotBeWritten(t *testing.T) {
@@ -698,7 +761,7 @@ func TestFenceSelfStopsThePrimariesEvenWhenTheRecordCannotBeWritten(t *testing.T
 	must(t, os.Chmod(root, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
 	w.setPeerEpoch(2, "n2")
-	res, err := w.orch().BootCheck(w.ctx, true)
+	res, err := w.orch().BootCheck(w.ctx)
 	if err == nil || !res.Fenced || !strings.Contains(err.Error(), "recording that this node is fenced") {
 		t.Fatalf("result %+v, error %v", res, err)
 	}
