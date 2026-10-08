@@ -17,8 +17,8 @@ tags, err := c.IMDS.Tags(ctx)                  // supavise:cluster, supavise:inf
 | Provider | Gives |
 |---|---|
 | `EnvCredentials(getenv)` | the standard variables; `ErrNoCredentials` when neither key is set, a plain error when only one is |
-| `IMDSCredentials(imds)` | the instance role; every failure wraps `ErrNoCredentials` |
-| `ChainCredentials(...)` | the first provider that has an answer; only `ErrNoCredentials` moves on |
+| `IMDSCredentials(imds)` | the instance role; every failure wraps `ErrNoCredentials` and its cause |
+| `ChainCredentials(...)` | the first provider that has an answer; only `ErrNoCredentials` moves on, and when all do the error wraps each provider's error |
 | `CachedCredentials(p, now)` | `p`'s answer until five minutes before it expires; a failed renewal keeps the old credentials while they still work |
 | `StaticCredentials(c)` | `c` |
 | `(*STS).RoleCredentials(in)` | the credentials of an assumed role, cached; give it to a second client's `Config.Credentials` to call AWS as that role |
@@ -64,7 +64,9 @@ Every EC2 call that takes `DryRun` asks only whether the call would be allowed, 
 
 ## Errors and retries
 
-An API error is an `*Error` with `Service`, `Action`, `StatusCode`, `Code`, `Message` and `RequestID`. `IsCode(err, ...)`, `IsAccessDenied(err)` and `IsNotFound(err)` test it. A request that gets no answer, a 500, 502, 503 or 504, and the throttling codes are sent again with a new signature, three tries in all (`Config.MaxAttempts`), after 200 ms and 400 ms (`Config.RetryBackoff`, doubled each time). A refusal, a 4xx and a `DryRunOperation` are final. A cancelled context ends the wait between tries.
+An API error is an `*Error` with `Service`, `Action`, `StatusCode`, `Code`, `Message` and `RequestID`. `IsCode(err, ...)`, `IsAccessDenied(err)` and `IsNotFound(err)` test it. A request that gets no answer, a 500, 502, 503 or 504, and the throttling codes are sent again with a new signature, three tries in all (`Config.MaxAttempts`), after 200 ms and 400 ms (`Config.RetryBackoff`, doubled each time). A refusal, a 4xx and a `DryRunOperation` are final. A cancelled context ends the wait between tries, and the error then carries the last failure and the context's error.
+
+An error names what failed first: `aws <service> <action>:` for a call (also when the credentials or the region could not be found), `aws imds <path>:` for the metadata service and `awsapi:` for the client's own setup. Errors wrap their causes, so `errors.Is` finds `ErrIMDSDisabled`, `ErrNotFound` and a cancelled context through the credential chain and the region lookup as well.
 
 The metadata service has its own loop: a token request, then the read with `X-aws-ec2-metadata-token`. The token is kept for just under six hours and fetched again after a 401. A refused token request (403, 404, 405) is final: there is no IMDSv1 fallback. A request that gets no answer or a 5xx is tried again. Each request times out after two seconds, so a machine that is not on EC2 and has no credentials in the environment fails after about six seconds and tries again at the next call.
 

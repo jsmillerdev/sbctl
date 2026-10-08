@@ -138,7 +138,13 @@ func DefaultCredentials(getenv func(string) string, imds *IMDS, now func() time.
 }
 
 // Region returns the region calls go to, resolving it the first time.
-func (c *Client) Region(ctx context.Context) (string, error) { return c.core.region(ctx) }
+func (c *Client) Region(ctx context.Context) (string, error) {
+	r, err := c.core.region(ctx)
+	if err != nil {
+		return "", fmt.Errorf("awsapi: %w", err)
+	}
+	return r, nil
+}
 
 func firstNonEmpty(vs ...string) string {
 	for _, v := range vs {
@@ -170,7 +176,7 @@ func (c *core) region(ctx context.Context) (string, error) {
 	if r == "" {
 		var err error
 		if r, err = c.imds.Region(ctx); err != nil {
-			return "", fmt.Errorf("awsapi: no region: set AWS_REGION, or run on an EC2 instance (%v)", err)
+			return "", fmt.Errorf("no region: set AWS_REGION, or run on an EC2 instance (%w)", err)
 		}
 	}
 	c.regionName = r
@@ -212,7 +218,7 @@ func (c *core) do(ctx context.Context, call apiCall) ([]byte, error) {
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			return nil, fmt.Errorf("%w (after: %v)", ctx.Err(), err)
+			return nil, fmt.Errorf("%w: %w", err, ctx.Err())
 		case <-t.C:
 		}
 	}
@@ -221,15 +227,15 @@ func (c *core) do(ctx context.Context, call apiCall) ([]byte, error) {
 func (c *core) once(ctx context.Context, call apiCall) ([]byte, error) {
 	region, err := c.region(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("aws %s %s: %w", call.service, call.action, err)
 	}
 	creds, err := c.creds.Retrieve(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("awsapi: %s %s: %w", call.service, call.action, err)
+		return nil, fmt.Errorf("aws %s %s: %w", call.service, call.action, err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(call.service, call.host, region)+"/", bytes.NewReader(call.body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("aws %s %s: %w", call.service, call.action, err)
 	}
 	for k, v := range call.header {
 		req.Header[k] = v

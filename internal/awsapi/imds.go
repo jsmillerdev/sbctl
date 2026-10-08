@@ -67,7 +67,7 @@ func newIMDS(cfg Config, base string) *IMDS {
 // ErrNotFound.
 func (m *IMDS) Get(ctx context.Context, path string) (string, error) {
 	if strings.EqualFold(m.getenv("AWS_EC2_METADATA_DISABLED"), "true") {
-		return "", ErrIMDSDisabled
+		return "", fmt.Errorf("aws imds %s: %w", path, ErrIMDSDisabled)
 	}
 	var lastErr error
 	for attempt := 1; attempt <= m.attempts; attempt++ {
@@ -76,7 +76,7 @@ func (m *IMDS) Get(ctx context.Context, path string) (string, error) {
 			select {
 			case <-ctx.Done():
 				t.Stop()
-				return "", fmt.Errorf("%w (after: %v)", ctx.Err(), lastErr)
+				return "", fmt.Errorf("%w: %w", lastErr, ctx.Err())
 			case <-t.C:
 			}
 		}
@@ -103,22 +103,25 @@ func (m *IMDS) get(ctx context.Context, path string) (body string, retry bool, e
 		req.Header.Set("X-aws-ec2-metadata-token", tok)
 		b, status, err := m.send(req)
 		if err != nil {
-			return "", true, fmt.Errorf("imds %s: %w", path, err)
+			return "", true, fmt.Errorf("aws imds %s: %w", path, err)
 		}
 		switch {
 		case status == http.StatusUnauthorized && !refreshed:
 			m.forgetToken(tok)
 			continue
 		case status == http.StatusNotFound:
-			return "", false, fmt.Errorf("imds %s: %w", path, ErrNotFound)
+			return "", false, fmt.Errorf("aws imds %s: %w", path, ErrNotFound)
 		case status/100 == 2:
 			return b, false, nil
 		}
-		return "", status >= 500, fmt.Errorf("imds %s: status %d", path, status)
+		return "", status >= 500, fmt.Errorf("aws imds %s: status %d", path, status)
 	}
 }
 
-var errIMDSRefused = errors.New("the instance metadata service refused a session token")
+var (
+	errIMDSRefused = errors.New("the instance metadata service refused a session token")
+	errNoRole      = errors.New("aws imds role credentials: the instance has no IAM role")
+)
 
 func (m *IMDS) sessionToken(ctx context.Context) (string, error) {
 	m.mu.Lock()
@@ -133,16 +136,16 @@ func (m *IMDS) sessionToken(ctx context.Context) (string, error) {
 	req.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", strconv.Itoa(int(imdsTokenTTL/time.Second)))
 	b, status, err := m.send(req)
 	if err != nil {
-		return "", fmt.Errorf("imds token: %w", err)
+		return "", fmt.Errorf("aws imds token: %w", err)
 	}
 	switch {
 	case status/100 == 2 && b != "":
 		m.token, m.expires = b, m.now().Add(imdsTokenTTL-imdsTokenMargin)
 		return b, nil
 	case status == http.StatusForbidden, status == http.StatusNotFound, status == http.StatusMethodNotAllowed:
-		return "", fmt.Errorf("imds token: status %d: %w", status, errIMDSRefused)
+		return "", fmt.Errorf("aws imds token: status %d: %w", status, errIMDSRefused)
 	}
-	return "", fmt.Errorf("imds token: status %d", status)
+	return "", fmt.Errorf("aws imds token: status %d", status)
 }
 
 func (m *IMDS) forgetToken(tok string) {
@@ -225,14 +228,14 @@ func (m *IMDS) RoleCredentials(ctx context.Context) (Credentials, error) {
 	const dir = "/latest/meta-data/iam/security-credentials/"
 	roles, err := m.Get(ctx, dir)
 	if errors.Is(err, ErrNotFound) {
-		return Credentials{}, errors.New("the instance has no IAM role")
+		return Credentials{}, errNoRole
 	}
 	if err != nil {
 		return Credentials{}, err
 	}
 	role := strings.TrimSpace(strings.SplitN(roles, "\n", 2)[0])
 	if role == "" {
-		return Credentials{}, errors.New("the instance has no IAM role")
+		return Credentials{}, errNoRole
 	}
 	doc, err := m.Get(ctx, dir+url.PathEscape(role))
 	if err != nil {
@@ -246,10 +249,10 @@ func (m *IMDS) RoleCredentials(ctx context.Context) (Credentials, error) {
 		Expiration      time.Time
 	}
 	if err := json.Unmarshal([]byte(doc), &v); err != nil {
-		return Credentials{}, fmt.Errorf("imds role credentials: %w", err)
+		return Credentials{}, fmt.Errorf("aws imds role credentials: %w", err)
 	}
 	if v.Code != "Success" || v.AccessKeyID == "" || v.SecretAccessKey == "" {
-		return Credentials{}, fmt.Errorf("imds role credentials: code %q", v.Code)
+		return Credentials{}, fmt.Errorf("aws imds role credentials: code %q", v.Code)
 	}
 	return Credentials{AccessKeyID: v.AccessKeyID, SecretAccessKey: v.SecretAccessKey, SessionToken: v.Token, Expires: v.Expiration}, nil
 }
