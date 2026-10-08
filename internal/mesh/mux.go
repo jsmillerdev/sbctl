@@ -44,6 +44,13 @@ const (
 	frameSize = 32768
 )
 
+// The windows of the session of a caller with no certificate (a joiner). The join exchange is a few
+// KiB each way, and a stranger must not be able to make the daemon hold more than this per session.
+const (
+	anonSessionBuffer = 1 << 20
+	anonStreamWindow  = 256 << 10
+)
+
 // muxConfig is smux protocol 2, which has a flow-control window per stream: a stalled stream (a
 // replica that stopped reading) cannot hold up the others.
 func muxConfig() *smux.Config {
@@ -57,18 +64,34 @@ func muxConfig() *smux.Config {
 	}
 }
 
+// anonMuxConfig is muxConfig with the small windows of a caller with no certificate.
+func anonMuxConfig() *smux.Config {
+	c := muxConfig()
+	c.MaxReceiveBuffer, c.MaxStreamBuffer = anonSessionBuffer, anonStreamWindow
+	return c
+}
+
 type session struct{ s *smux.Session }
 
 // NewSession multiplexes conn, usually the TLS connection of a handshake. client is the side that
 // dialed the TCP connection; the roles only keep the two sides' stream numbers apart, and both
 // sides may open and accept streams. Closing the Session closes conn.
 func NewSession(conn net.Conn, client bool) (Session, error) {
+	return newSession(conn, client, muxConfig())
+}
+
+// newAnonSession is the accepting side of a session with a caller that presented no certificate.
+func newAnonSession(conn net.Conn) (Session, error) {
+	return newSession(conn, false, anonMuxConfig())
+}
+
+func newSession(conn net.Conn, client bool, cfg *smux.Config) (Session, error) {
 	var s *smux.Session
 	var err error
 	if client {
-		s, err = smux.Client(conn, muxConfig())
+		s, err = smux.Client(conn, cfg)
 	} else {
-		s, err = smux.Server(conn, muxConfig())
+		s, err = smux.Server(conn, cfg)
 	}
 	if err != nil {
 		return nil, err

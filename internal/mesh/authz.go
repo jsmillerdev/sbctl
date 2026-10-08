@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
@@ -48,7 +49,8 @@ type Authorizer struct {
 	Source   Source
 	Now      func() time.Time
 
-	cache sync.Map // ref -> *placement, kept for placementTTL
+	cache  sync.Map // ref -> *placement, kept for placementTTL
+	stored atomic.Int64
 }
 
 // placementTTL is how long a project's home and replicas are remembered. A forward stream costs
@@ -90,7 +92,25 @@ func (a *Authorizer) place(ctx context.Context, ref string) (*placement, error) 
 		}
 	}
 	a.cache.Store(ref, p)
+	if a.stored.Add(1)%sweepEvery == 0 {
+		a.sweep()
+	}
 	return p, p.err
+}
+
+// sweepEvery is how many stored placements pass between looks for expired ones: an admitted peer that
+// sends streams for refs that do not exist would otherwise grow the cache without limit.
+const sweepEvery = 256
+
+// sweep drops the placements that have expired.
+func (a *Authorizer) sweep() {
+	now := a.now()
+	a.cache.Range(func(k, v any) bool {
+		if !now.Before(v.(*placement).until) {
+			a.cache.Delete(k)
+		}
+		return true
+	})
 }
 
 // Resolve returns the loopback port that a forward stream with header h, opened by peer, reaches
@@ -155,7 +175,8 @@ func hasReplicaOn(rs []registry.Replica, node string) bool {
 
 // rpcAllowed is the request policy of the peer server: which endpoints a caller may reach given
 // its state. A caller with no certificate reaches the join endpoint; a joining node confirms its
-// join; a fenced node hears the ping, the fence and the rejoin; an active node reaches every
+// join (and asks again to rejoin, when an earlier rejoin stopped); a fenced node hears the ping, the
+// fence and the rejoin; an active node reaches every
 // endpoint, and the handler of an endpoint that only the leader may call checks the caller itself
 // (RequireLeader). The endpoints other workstreams register are not listed because they are for
 // active nodes.
@@ -169,7 +190,7 @@ func rpcAllowed(p Peer, path string) (ok bool, why string) {
 	case p.State == registry.NodeActive:
 		return true, ""
 	case p.State == registry.NodeJoining:
-		if path == peerapi.PathPing || path == peerapi.PathJoinConfirm {
+		if path == peerapi.PathPing || path == peerapi.PathJoinConfirm || path == peerapi.PathRejoin {
 			return true, ""
 		}
 	case p.State == registry.NodeFenced:

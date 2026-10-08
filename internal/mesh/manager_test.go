@@ -1,14 +1,18 @@
 package mesh
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -517,5 +521,284 @@ func TestManagerCloseDoesNotWaitForTheContext(t *testing.T) {
 	}
 	if n1.Connected("n2") {
 		t.Fatal("a session survived Close")
+	}
+}
+
+// anonClient is a joiner's client: it pins the cluster CA and presents no certificate.
+func anonClient(t *testing.T, h *harness, n *tnode) *Client {
+	t.Helper()
+	c, err := DialClient(h.ctx, n.ln.Addr().String(), "n1", PinnedTLS(Fingerprint(h.ca.cert.Raw), nil, time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+// A caller with no certificate costs the daemon little: its request is bounded to a few KiB and has
+// to arrive in time, its session is small, there are few of them, and an idle one is closed.
+func TestAnonymousCallersAreCutOff(t *testing.T) {
+	h := newHarness(t, "n1")
+	n1 := h.nodes["n1"]
+	n1.mgr.o.AnonReadTimeout = 300 * time.Millisecond
+	n1.mgr.o.AnonLife = 400 * time.Millisecond
+	n1.mgr.o.MaxAnonSessions = 3
+	var got atomic.Int64
+	n1.mgr.o.Mux.Handle("POST "+peerapi.PathJoin, func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]string
+		if !DecodeBody(w, r, &req) {
+			return
+		}
+		got.Add(int64(len(req["csr"])))
+		RespondJSON(w, http.StatusOK, map[string]int{"n": len(req["csr"])})
+	})
+	h.start()
+	addr := n1.ln.Addr().String()
+	pin := Fingerprint(h.ca.cert.Raw)
+	var re *RemoteError
+
+	// A request of ordinary size goes through; one of 100 KiB is refused before the handler runs.
+	c := anonClient(t, h, n1)
+	var out map[string]int
+	if err := c.Call(h.ctx, "POST", peerapi.PathJoin, map[string]string{"csr": strings.Repeat("a", 4<<10)}, &out); err != nil || out["n"] != 4<<10 {
+		t.Fatalf("a request of 4 KiB: %v, %v", out, err)
+	}
+	err := c.Call(h.ctx, "POST", peerapi.PathJoin, map[string]string{"csr": strings.Repeat("a", 100<<10)}, nil)
+	if !errors.As(err, &re) || re.Status != http.StatusRequestEntityTooLarge || re.Code != "too_large" {
+		t.Fatalf("a request of 100 KiB: %v", err)
+	}
+	if got.Load() != 4<<10 {
+		t.Fatalf("the handler saw %d bytes", got.Load())
+	}
+
+	// A request that announces a body and does not send it is answered 408 when the time is up.
+	st := dialAnonymous(t, addr, PinnedTLS(pin, nil, time.Now))
+	_ = st.SetDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	if _, err := fmt.Fprintf(st, "POST %s HTTP/1.1\r\nHost: n1\r\nContent-Length: 100\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{", peerapi.PathJoin); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(st), nil)
+	if err != nil || resp.StatusCode != http.StatusRequestTimeout || time.Since(start) > 3*time.Second {
+		t.Fatalf("a body that never comes: %v, %v after %s", resp, err, time.Since(start))
+	}
+
+	// Streams: sixteen are served at a time and the rest are closed unread.
+	conn, err := tls.Dial("tcp", addr, PinnedTLS(pin, nil, time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	sess, err := NewSession(conn, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var streams []net.Conn
+	for range maxAnonStreams + 4 {
+		s, err := sess.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteHeader(s, Header{T: StreamRPC}); err != nil {
+			t.Fatal(err)
+		}
+		streams = append(streams, s)
+	}
+	open, closed := 0, 0
+	for _, s := range streams {
+		_ = s.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		var ne net.Error
+		if _, err := s.Read(make([]byte, 1)); errors.As(err, &ne) && ne.Timeout() {
+			open++
+		} else {
+			closed++
+		}
+	}
+	if open != maxAnonStreams || closed != 4 {
+		t.Fatalf("%d streams were kept and %d closed, want %d and 4", open, closed, maxAnonStreams)
+	}
+
+	// An idle session is closed once it is AnonLife old.
+	idleConn, err := tls.Dial("tcp", addr, PinnedTLS(pin, nil, time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idleConn.Close()
+	idle, err := NewSession(idleConn, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := make(chan error, 1)
+	go func() { _, err := idle.AcceptStream(); ended <- err }() // returns when the far end closes the connection
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an idle session without a certificate was not closed")
+	}
+}
+
+// Only so many callers with no certificate hold a session at once; a slot frees when one leaves.
+func TestAnonymousSessionsAreFew(t *testing.T) {
+	h := newHarness(t, "n1")
+	n1 := h.nodes["n1"]
+	n1.mgr.o.MaxAnonSessions = 2
+	n1.mgr.o.Mux.Handle("GET "+peerapi.PathJoin, func(w http.ResponseWriter, r *http.Request) { RespondJSON(w, 200, peerapi.JoinChallenge{}) })
+	h.start()
+	a, b := anonClient(t, h, n1), anonClient(t, h, n1)
+	for _, c := range []*Client{a, b} {
+		if err := c.Call(h.ctx, "GET", peerapi.PathJoin, nil, nil); err != nil {
+			t.Fatalf("a session within the limit: %v", err)
+		}
+	}
+	// The server closes the connection after the handshake, which the client sees when it first uses it.
+	conn, err := tls.Dial("tcp", n1.ln.Addr().String(), PinnedTLS(Fingerprint(h.ca.cert.Raw), nil, time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if sess, err := NewSession(conn, true); err == nil {
+		st, err := sess.OpenStream()
+		if err == nil {
+			if err = WriteHeader(st, Header{T: StreamRPC}); err == nil {
+				err = call(h.ctx, st, "n1", "GET", peerapi.PathJoin, nil, nil)
+			}
+		}
+		if err == nil {
+			t.Fatal("a third session without a certificate was served")
+		}
+	}
+	a.Close()
+	eventually(t, "a slot to be free again", func() bool {
+		c, err := DialClient(h.ctx, n1.ln.Addr().String(), "n1", PinnedTLS(Fingerprint(h.ca.cert.Raw), nil, time.Now))
+		if err != nil {
+			return false
+		}
+		defer c.Close()
+		return c.Call(h.ctx, "GET", peerapi.PathJoin, nil, nil) == nil
+	})
+}
+
+// failingListener fails the first n accepts with err.
+type failingListener struct {
+	net.Listener
+	n   atomic.Int32
+	err error
+}
+
+func (l *failingListener) Accept() (net.Conn, error) {
+	if l.n.Add(-1) >= 0 {
+		return nil, l.err
+	}
+	return l.Listener.Accept()
+}
+
+// Accept errors about resources do not stop the peer server; the others end it with the error.
+func TestServeOutlivesResourceErrorsOnAccept(t *testing.T) {
+	h := newHarness(t, "n1")
+	n1 := h.nodes["n1"]
+	n1.mgr.o.Mux.Handle("GET "+peerapi.PathJoin, func(w http.ResponseWriter, r *http.Request) { RespondJSON(w, 200, peerapi.JoinChallenge{}) })
+	fl := &failingListener{Listener: n1.ln, err: &net.OpError{Op: "accept", Err: os.NewSyscallError("accept", syscall.EMFILE)}}
+	fl.n.Store(3)
+	done := make(chan error, 1)
+	go func() { done <- n1.mgr.Serve(h.ctx, fl) }()
+	c := anonClient(t, h, n1)
+	if err := c.Call(h.ctx, "GET", peerapi.PathJoin, nil, nil); err != nil {
+		t.Fatalf("a call after three failed accepts: %v", err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Serve ended: %v", err)
+	default:
+	}
+
+	h2 := newHarness(t, "n1")
+	boom := errors.New("the listener is broken")
+	fatal := &failingListener{Listener: h2.nodes["n1"].ln, err: boom}
+	fatal.n.Store(1)
+	if err := h2.nodes["n1"].mgr.Serve(h2.ctx, fatal); !errors.Is(err, boom) {
+		t.Fatalf("Serve after a fatal accept error: %v", err)
+	}
+}
+
+// deadAccept is a listener that cannot accept.
+type deadAccept struct{ net.Listener }
+
+func (deadAccept) Accept() (net.Conn, error) { return nil, errors.New("the listener is broken") }
+
+// A forwarder whose listener stops accepting is forgotten, and the next look binds the port again.
+func TestForwarderRebindsAListenerThatStoppedAccepting(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	h.project(refA, 1, "n1")
+	n2 := h.nodes["n2"]
+	var mu sync.Mutex
+	binds := 0
+	n2.fwd.Listen = func(port int) (net.Listener, error) {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if binds++; binds == 1 {
+			return deadAccept{ln}, nil
+		}
+		return ln, nil
+	}
+	// A follower forwards the project's three ports and the leader's seven shared services.
+	n2.fwd.Reconcile(h.ctx)
+	mu.Lock()
+	total := binds
+	mu.Unlock()
+	if total != 10 {
+		t.Fatalf("%d forwarders bound", total)
+	}
+	eventually(t, "the broken listener to be dropped", func() bool { return len(n2.fwd.Ports()) == total-1 })
+	n2.fwd.Reconcile(h.ctx)
+	if got := len(n2.fwd.Ports()); got != total {
+		t.Fatalf("%d forwarders after the next look, want %d", got, total)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if binds != total+1 {
+		t.Fatalf("%d binds, want %d", binds, total+1)
+	}
+}
+
+// A Client whose session ended opens another to the same address; a closed Client does not.
+func TestClientReconnects(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	pingEndpoint(h)
+	n1, n2 := h.nodes["n1"], h.nodes["n2"]
+	// Only n1 runs: a client with n2's certificate beside n2's own manager would lose the tie-break
+	// between two sessions of the pair.
+	go n1.mgr.Serve(h.ctx, n1.ln)
+	go n1.mgr.Run(h.ctx)
+	c, err := DialClient(h.ctx, n1.ln.Addr().String(), "n1", ClientTLS(func() *Credentials { return n2.creds }, "n1", nil, time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p peerapi.Ping
+	if err := c.Call(h.ctx, "GET", peerapi.PathPing, nil, &p); err != nil || p.Node != "n1" {
+		t.Fatalf("first call: %+v, %v", p, err)
+	}
+	first := c.sess
+	_ = first.Close()
+	if err := c.Call(h.ctx, "GET", peerapi.PathPing, nil, &p); err != nil {
+		t.Fatalf("the call after the session ended: %v", err)
+	}
+	if c.sess == first || c.sess.IsClosed() {
+		t.Fatal("the client kept the dead session")
+	}
+	// A forward stream takes the same way.
+	_ = c.sess.Close()
+	st, err := c.Dial(h.ctx, "n1", Header{T: StreamForward, Kind: KindPostgres, Ref: "system"})
+	if err != nil {
+		t.Fatalf("a forward stream after the session ended: %v", err)
+	}
+	st.Close()
+	c.Close()
+	if err := c.Call(h.ctx, "GET", peerapi.PathPing, nil, &p); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("a call on a closed client: %v", err)
 	}
 }

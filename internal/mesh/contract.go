@@ -320,6 +320,9 @@ type Peer struct {
 	// and the rejoin, and refuses it everything else, so a handler sees NodeActive unless it is one
 	// of those.
 	State registry.NodeState
+	// Remote is the IP address of the far end of the connection (no port). The join endpoints rate
+	// limit by it.
+	Remote string
 }
 
 type peerKey struct{}

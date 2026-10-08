@@ -152,8 +152,37 @@ func (m *Manager) serveRPC(w http.ResponseWriter, r *http.Request) {
 		RespondError(w, http.StatusForbidden, CodeRefused, why)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxRPCBody)
+	if peer.Node == "" {
+		if !m.readAnonymousBody(w, r) {
+			return
+		}
+	} else {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRPCBody)
+	}
 	m.o.Mux.ServeHTTP(w, r)
+}
+
+// readAnonymousBody reads the whole body of a request from a caller with no certificate, which must
+// be at most maxAnonBody and arrive within AnonReadTimeout, and puts it back for the handler. The
+// deadline is lifted once the body is in: the join itself may take a while (the base backup), and the
+// server watches the connection while a handler runs, which a deadline left in place would cancel.
+// It answers and returns false when the body is too large or too slow.
+func (m *Manager) readAnonymousBody(w http.ResponseWriter, r *http.Request) bool {
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(m.o.AnonReadTimeout))
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAnonBody))
+	_ = rc.SetReadDeadline(time.Time{})
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			RespondError(w, http.StatusRequestEntityTooLarge, "too_large", "the request is larger than a caller without a certificate may send")
+		} else {
+			RespondError(w, http.StatusRequestTimeout, "too_slow", "the request did not arrive in time")
+		}
+		return false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(b))
+	return true
 }
 
 // ResetDefaultMux replaces DefaultMux with an empty Mux. The daemon calls it before its wire hooks

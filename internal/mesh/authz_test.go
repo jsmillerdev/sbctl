@@ -3,7 +3,9 @@ package mesh
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,6 +126,7 @@ func TestRequestPolicy(t *testing.T) {
 		{"active: fence", active, peerapi.PathFence, true},
 		{"joining: ping", joining, peerapi.PathPing, true},
 		{"joining: confirm", joining, peerapi.PathJoinConfirm, true},
+		{"joining: rejoin again", joining, peerapi.PathRejoin, true},
 		{"joining: report", joining, peerapi.PathReport, false},
 		{"joining: config", joining, peerapi.PathConfig, false},
 		{"fenced: ping", fenced, peerapi.PathPing, true},
@@ -195,5 +198,32 @@ func TestRefusedAndServedStreams(t *testing.T) {
 	// Dial validates the header before it opens anything.
 	if _, err := n2.mgr.Dial(h.ctx, "n1", Header{T: StreamForward, Kind: "svc:shell"}); err == nil {
 		t.Error("a header that does not validate was sent")
+	}
+}
+
+// The placements the authorizer remembers do not pile up: an admitted peer that asks for refs that do
+// not exist leaves entries that the next sweep drops once they have expired.
+func TestPlacementCacheIsSwept(t *testing.T) {
+	reg, cfg := authzFixture(t)
+	var mu sync.Mutex
+	now := time.Now()
+	az := &Authorizer{Cfg: cfg, Topology: regTopo{reg, "n1"}, Source: reg, Now: func() time.Time { mu.Lock(); defer mu.Unlock(); return now }}
+	ask := func(from, to int) {
+		for i := from; i < to; i++ {
+			_, _ = az.place(context.Background(), fmt.Sprintf("%020d", i))
+		}
+	}
+	size := func() int {
+		n := 0
+		az.cache.Range(func(any, any) bool { n++; return true })
+		return n
+	}
+	ask(0, 300)
+	mu.Lock()
+	now = now.Add(2 * placementTTL)
+	mu.Unlock()
+	ask(300, 600)
+	if n := size(); n > 300 {
+		t.Fatalf("%d placements kept after 600 refs, the first 300 long expired", n)
 	}
 }

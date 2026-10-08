@@ -263,7 +263,7 @@ func (f *Forwarders) Reconcile(ctx context.Context) {
 		l := &fwdListener{port: port, ln: ln}
 		l.target.Store(&t)
 		f.ls[port] = l
-		go f.accept(l)
+		go func() { _ = f.accept(l) }()
 	}
 	for port, l := range f.ls {
 		if _, ok := want[port]; !ok {
@@ -294,19 +294,32 @@ func (f *Forwarders) closeAll() {
 	}
 }
 
-func (f *Forwarders) accept(l *fwdListener) {
+// accept serves l until it is closed. An error that is about resources (no file descriptors, say) is
+// waited out. Any other ends the listener, and it is forgotten, so that the next Reconcile binds
+// the port again: a listener nobody accepts on would hold connections for ever.
+func (f *Forwarders) accept(l *fwdListener) error {
+	var delay time.Duration
 	for {
 		c, err := l.ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				return
+				return nil
 			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
+			if retryableAccept(err) {
+				delay = acceptDelay(delay)
+				time.Sleep(delay)
 				continue
 			}
-			return
+			f.log().Warn("mesh: a forwarder stopped accepting; its port is bound again at the next look", "port", l.port, "error", err)
+			f.mu.Lock()
+			if f.ls[l.port] == l {
+				delete(f.ls, l.port)
+			}
+			f.mu.Unlock()
+			_ = l.ln.Close()
+			return err
 		}
+		delay = 0
 		go f.forward(l, c)
 	}
 }
@@ -336,6 +349,5 @@ func ForwardOne(ctx context.Context, d Dialer, port int, node string, kind Kind,
 	l := &fwdListener{port: port, ln: ln}
 	l.target.Store(&target{kind: kind, ref: ref, node: node})
 	go func() { <-ctx.Done(); _ = ln.Close() }()
-	f.accept(l)
-	return nil
+	return f.accept(l)
 }

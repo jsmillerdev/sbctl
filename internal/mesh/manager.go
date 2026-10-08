@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -44,13 +45,25 @@ type Options struct {
 	OnPing func(node string, p peerapi.Ping, rtt time.Duration)
 
 	// The rest are for tests; the zero values are the production ones.
-	TCPDial     func(ctx context.Context, addr string) (net.Conn, error)
-	Now         func() time.Time
-	PingEvery   time.Duration // 5 s
-	Tick        time.Duration // 2 s: how often Run looks at the nodes
-	DialDelay   time.Duration // 3 s: how long the higher node id waits for the lower to dial
-	RevokeGrace time.Duration // 10 s: how long a session outlives its node's admission
+	TCPDial         func(ctx context.Context, addr string) (net.Conn, error)
+	Now             func() time.Time
+	PingEvery       time.Duration // 5 s
+	Tick            time.Duration // 2 s: how often Run looks at the nodes
+	DialDelay       time.Duration // 3 s: how long the higher node id waits for the lower to dial
+	RevokeGrace     time.Duration // 10 s: how long a session outlives its node's admission
+	AnonReadTimeout time.Duration // 10 s: how long a caller with no certificate has to send its request
+	AnonLife        time.Duration // 2 min: how long its session may be open before it is closed once idle
+	MaxAnonSessions int           // 32: sessions of callers with no certificate open at once
 }
+
+// What a caller with no certificate (a joiner) may cost. Its request is a few KiB, so the body is
+// bounded far below maxRPCBody; its session is short, small (anonMuxConfig) and few, and it may have
+// only so many streams open. An open session is closed at anonSessionMax whatever it is doing.
+const (
+	maxAnonBody    = 64 << 10
+	maxAnonStreams = 16
+	anonSessionMax = 15 * time.Minute
+)
 
 func (o *Options) fill() {
 	if o.Mux == nil {
@@ -69,10 +82,14 @@ func (o *Options) fill() {
 		}
 	}
 	for p, d := range map[*time.Duration]time.Duration{&o.PingEvery: 5 * time.Second, &o.Tick: 2 * time.Second,
-		&o.DialDelay: 3 * time.Second, &o.RevokeGrace: 10 * time.Second} {
+		&o.DialDelay: 3 * time.Second, &o.RevokeGrace: 10 * time.Second, &o.AnonReadTimeout: 10 * time.Second,
+		&o.AnonLife: 2 * time.Minute} {
 		if *p <= 0 {
 			*p = d
 		}
+	}
+	if o.MaxAnonSessions <= 0 {
+		o.MaxAnonSessions = 32
 	}
 }
 
@@ -85,6 +102,7 @@ type Manager struct {
 	rpcCh chan net.Conn
 
 	rpcOnce sync.Once
+	anon    atomic.Int32 // sessions of callers with no certificate that are open
 
 	mu       sync.Mutex
 	sessions map[string]*peerConn
@@ -477,20 +495,49 @@ func (m *Manager) dialAddr(ctx context.Context, node, addr string) (*peerConn, e
 func (m *Manager) Serve(ctx context.Context, ln net.Listener) error {
 	m.serveRPCStreams(ctx)
 	go func() { <-ctx.Done(); _ = ln.Close() }()
+	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				continue
+			if !retryableAccept(err) {
+				return err
 			}
-			return err
+			delay = acceptDelay(delay)
+			m.o.Log.Warn("mesh: accepting a connection failed; trying again", "error", err, "wait", delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil
+			}
+			continue
 		}
+		delay = 0
 		go m.accept(ctx, conn)
 	}
+}
+
+// retryableAccept reports whether an error of Accept is about this connection or about resources
+// that come back (a timeout, no file descriptors left, a connection reset before it was accepted)
+// and not about the listener: the loop that accepts goes on after the first and ends on the second.
+func retryableAccept(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	for _, e := range []error{syscall.EMFILE, syscall.ENFILE, syscall.ECONNABORTED, syscall.ENOBUFS, syscall.ENOMEM} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// acceptDelay is the wait after a failed Accept: 5 ms, doubling up to a second.
+func acceptDelay(prev time.Duration) time.Duration {
+	return min(max(2*prev, 5*time.Millisecond), time.Second)
 }
 
 func (m *Manager) accept(ctx context.Context, conn net.Conn) {
@@ -510,16 +557,66 @@ func (m *Manager) accept(ctx context.Context, conn net.Conn) {
 	if certs := tc.ConnectionState().PeerCertificates; len(certs) > 0 {
 		node, _ = NodeIDOf(certs[0])
 	}
+	if node == "" { // a joiner: serve it without keeping the session
+		m.serveAnonymous(tc, remoteIP(conn))
+		return
+	}
 	sess, err := NewSession(tc, false)
 	if err != nil {
 		_ = conn.Close()
 		return
 	}
-	if node == "" { // a joiner: serve it without keeping the session
-		m.serveStreams(sess, "")
+	m.register(&peerConn{node: node, sess: sess, since: m.o.Now()})
+}
+
+func remoteIP(c net.Conn) string {
+	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
+// serveAnonymous serves the streams of a caller that presented no certificate until its session
+// ends. There is room for MaxAnonSessions at a time, and a session that has been open for AnonLife is
+// closed once nothing runs on it.
+func (m *Manager) serveAnonymous(conn net.Conn, remote string) {
+	if int(m.anon.Add(1)) > m.o.MaxAnonSessions {
+		m.anon.Add(-1)
+		m.o.Log.Debug("mesh: too many sessions without a certificate", "remote", remote)
+		_ = conn.Close()
 		return
 	}
-	m.register(&peerConn{node: node, sess: sess, since: m.o.Now()})
+	defer m.anon.Add(-1)
+	sess, err := newAnonSession(conn)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	go m.reapAnonymous(sess)
+	m.serveStreams(sess, "", remote)
+	_ = sess.Close()
+}
+
+// reapAnonymous closes sess once it has been open for AnonLife and has no stream, and at anonSessionMax
+// in any case. A joiner needs its session for the time of its requests; a stranger that keeps one open
+// (the keepalive holds it) gets no more than that.
+func (m *Manager) reapAnonymous(sess Session) {
+	life := m.o.AnonLife
+	tick := time.NewTicker(min(max(life/4, 10*time.Millisecond), 5*time.Second))
+	defer tick.Stop()
+	start := time.Now()
+	for {
+		select {
+		case <-sess.CloseChan():
+			return
+		case <-tick.C:
+		}
+		if age := time.Since(start); age >= anonSessionMax || (age >= life && sess.NumStreams() == 0) {
+			_ = sess.Close()
+			return
+		}
+	}
 }
 
 // register makes pc the session to its node. When there already is one (both sides dialed at
@@ -545,7 +642,7 @@ func (m *Manager) register(pc *peerConn) {
 	} else {
 		go m.retire(pc)
 	}
-	go m.serveStreams(pc.sess, pc.node)
+	go m.serveStreams(pc.sess, pc.node, "")
 }
 
 // preferred reports whether the existing session a beats the new one b.
@@ -595,18 +692,41 @@ func (m *Manager) watch(pc *peerConn) {
 	m.mu.Unlock()
 }
 
-// serveStreams handles every stream the peer opens on sess until the session ends.
-func (m *Manager) serveStreams(sess Session, node string) {
+// serveStreams handles every stream the peer opens on sess until the session ends. remote is the
+// peer's IP address, for a caller that has no node. Such a caller has at most maxAnonStreams streams
+// open at a time; the others are closed unread.
+func (m *Manager) serveStreams(sess Session, node, remote string) {
+	var open atomic.Int32
 	for {
 		st, err := sess.AcceptStream()
 		if err != nil {
 			return
 		}
-		go m.handleStream(st, node)
+		if node == "" {
+			if open.Add(1) > maxAnonStreams {
+				open.Add(-1)
+				_ = st.Close()
+				continue
+			}
+			st = &releaseConn{Conn: st, release: func() { open.Add(-1) }}
+		}
+		go m.handleStream(st, node, remote)
 	}
 }
 
-func (m *Manager) handleStream(st net.Conn, node string) {
+// releaseConn calls release once, when it is closed.
+type releaseConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *releaseConn) Close() error {
+	c.once.Do(c.release)
+	return c.Conn.Close()
+}
+
+func (m *Manager) handleStream(st net.Conn, node, remote string) {
 	_ = st.SetReadDeadline(time.Now().Add(10 * time.Second))
 	h, err := ReadHeader(st)
 	_ = st.SetReadDeadline(time.Time{})
@@ -616,6 +736,7 @@ func (m *Manager) handleStream(st net.Conn, node string) {
 		return
 	}
 	peer := m.peerOf(node)
+	peer.Remote = remote
 	switch h.T {
 	case StreamRPC:
 		select {
