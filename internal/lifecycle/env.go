@@ -102,6 +102,13 @@ func (pl *PostgresPlane) archiveTimeout() int {
 //
 // pg_cron runs its jobs in background workers (see cronSettings), not over libpq.
 func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (units.Spec, error) {
+	return pl.postgresSpecFor(ctx, p, keys, pl.paths(p), false)
+}
+
+// postgresSpecFor renders the cluster unit of p listening on pp.Port. standby renders the unit of
+// a replica instead of a primary: the same class and saved settings (a standby needs at least the
+// primary's limits), hot_standby on, and the cluster must have been seeded already. See replica.go.
+func (pl *PostgresPlane) postgresSpecFor(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, pp pgPaths, standby bool) (units.Spec, error) {
 	art, err := pl.artifactDir(p, config.SvcPostgres)
 	if err != nil {
 		return units.Spec{}, err
@@ -114,7 +121,6 @@ func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, 
 	if err != nil {
 		return units.Spec{}, err
 	}
-	pp := pl.paths(p)
 	settings := append([]string{
 		"listen_addresses=127.0.0.1",
 		"unix_socket_directories=" + pp.Sock,
@@ -136,6 +142,12 @@ func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, 
 		cmdline, _ := SplitPostgresSettings(saved)
 		settings = append(settings, cmdline...)
 	}
+	if standby {
+		// Explicit: the cluster that was backed up ships hot_standby=off in its wal-g.conf, and a
+		// postgresql.auto.conf line would not beat the command line anyway. The feedback keeps the
+		// primary from vacuuming rows a query on the replica still needs (spike S2/S7).
+		settings = append(settings, "hot_standby=on", "hot_standby_feedback=on")
+	}
 	if pl.archiveCommand(p.Ref) == "off" {
 		settings = append(settings, "archive_mode=off")
 	} else {
@@ -151,7 +163,7 @@ func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, 
 		"POSTGRES_USER":     RoleAdmin,
 		"POSTGRES_DB":       "postgres",
 	}
-	if bootstrapPending(pp.Data) {
+	if bootstrapPending(pp.Data) && !standby {
 		// Only read on the first boot, when the launcher creates the postgres and
 		// supabase_admin roles; setRolePasswords replaces them with the stored ones.
 		// Rendered only while the data directory is not initialized, so the superuser
@@ -254,9 +266,31 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 	if !hasPostgREST(p.Ref) {
 		return specs, nil
 	}
-	restArt, err := pl.artifactDir(p, config.SvcPostgREST)
+	rest, err := pl.restSpec(ctx, p, keys, restTarget{
+		port:    ports.PostgREST,
+		dbURI:   dsnURL(RoleAuthn, keys.AuthenticatorPassword, pgPort, "postgres"),
+		openAPI: pl.scheme() + "://" + pl.cfg.ProjectHost(p.Ref) + "/rest/v1",
+	})
 	if err != nil {
 		return nil, err
+	}
+	return append(specs, rest), nil
+}
+
+// restTarget is what differs between the PostgREST of a project's primary and that of one of its
+// replicas: where it listens, which database it reads and the URL its OpenAPI document names.
+type restTarget struct {
+	port    int
+	dbURI   string
+	openAPI string
+}
+
+// restSpec renders the PostgREST unit of p. Everything but t is the project's: its JWT secret, so
+// that one apikey works on every database, its saved settings, its limits.
+func (pl *PostgresPlane) restSpec(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, t restTarget) (units.Spec, error) {
+	restArt, err := pl.artifactDir(p, config.SvcPostgREST)
+	if err != nil {
+		return units.Spec{}, err
 	}
 	rest := units.Spec{
 		Service:     config.SvcPostgREST,
@@ -266,8 +300,8 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 		Limits:      p.Limits,
 		Env: map[string]string{
 			"PGRST_SERVER_HOST":          "127.0.0.1",
-			"PGRST_SERVER_PORT":          strconv.Itoa(ports.PostgREST),
-			"PGRST_DB_URI":               dsnURL(RoleAuthn, keys.AuthenticatorPassword, pgPort, "postgres"),
+			"PGRST_SERVER_PORT":          strconv.Itoa(t.port),
+			"PGRST_DB_URI":               t.dbURI,
 			"PGRST_DB_SCHEMAS":           "public,graphql_public",
 			"PGRST_DB_EXTRA_SEARCH_PATH": "public,extensions",
 			"PGRST_DB_ANON_ROLE":         "anon",
@@ -280,17 +314,17 @@ func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys
 			"PGRST_APP_SETTINGS_JWT_SECRET":  keys.JWTSecret,
 			"PGRST_APP_SETTINGS_JWT_EXP":     "3600",
 			"PGRST_LOG_LEVEL":                "warn",
-			"PGRST_OPENAPI_SERVER_PROXY_URI": pl.scheme() + "://" + pl.cfg.ProjectHost(p.Ref) + "/rest/v1",
+			"PGRST_OPENAPI_SERVER_PROXY_URI": t.openAPI,
 		},
 	}
 	if pl.opts.Settings != nil {
 		over, err := pl.opts.Settings.PostgRESTEnv(ctx, p.Ref)
 		if err != nil {
-			return nil, fmt.Errorf("lifecycle: saved postgrest settings of %s: %w", p.Ref, err)
+			return units.Spec{}, fmt.Errorf("lifecycle: saved postgrest settings of %s: %w", p.Ref, err)
 		}
 		mergeEnv(rest.Env, over)
 	}
-	return append(specs, rest), nil
+	return rest, nil
 }
 
 // systemSSOEnv is what turns on single sign-on in supavise-gotrue@system: SAML with the node's own

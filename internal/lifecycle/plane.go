@@ -63,6 +63,15 @@ type PlaneOptions struct {
 	// SystemAuth supplies what supavise-gotrue@system needs for dashboard SSO (see SystemAuth); nil
 	// renders it as before: sign-up closed, no SAML.
 	SystemAuth func(ctx context.Context) (*SystemAuth, error)
+	// RestoreCommandFor builds restore_command for ref's cluster: the node's own relay fetch for
+	// ref's archive (backup.RestoreCommandFor, which this package cannot import). DemoteToReplica
+	// writes it into the cluster it turns into a standby.
+	RestoreCommandFor func(ref string) string
+	// ReplicaReadyTimeout bounds the start of a standby until it accepts connections (default 10
+	// minutes: it may replay a backlog of archived WAL first).
+	ReplicaReadyTimeout time.Duration
+	// ClusterSQL replaces the SQL the plane asks of a cluster (tests).
+	ClusterSQL ClusterSQL
 }
 
 // SystemAuth is the configuration of supavise-gotrue@system for single sign-on. With it the system
@@ -122,13 +131,21 @@ func (pl *PostgresPlane) paths(p *registry.Project) pgPaths {
 // prepare creates the project directories and the files outside PGDATA: pg_hba.conf
 // and the pgsodium root key.
 func (pl *PostgresPlane) prepare(p *registry.Project, keys *secrets.ProjectKeys) error {
-	pp := pl.paths(p)
+	return pl.prepareAt(p, keys, pl.paths(p), false)
+}
+
+// prepareAt is prepare for the cluster layout pp: the canonical one of a primary, or the replica's
+// (replica: no GoTrue directory, a replica has no GoTrue).
+func (pl *PostgresPlane) prepareAt(p *registry.Project, keys *secrets.ProjectKeys, pp pgPaths, replica bool) error {
 	if n := len(pp.SockFile); n > unixSocketMax {
 		return fmt.Errorf("lifecycle: unix socket path %s is %d bytes, over the %d the OS allows; use a shorter state_dir", pp.SockFile, n, unixSocketMax)
 	}
 	// WALDir is the one directory of the project's backup path the cluster's unit sees
 	// (read-only): the daemon serves the WAL relay socket in it.
-	dirs := []string{pl.cfg.Paths().Project(p.Ref), pp.Dir, pp.Sock, pl.cfg.Paths().WALDir(p.Ref), pl.cfg.Paths().ProjectService(p.Ref, config.SvcGoTrue)}
+	dirs := []string{pl.cfg.Paths().Project(p.Ref), pp.Dir, pp.Sock, pl.cfg.Paths().WALDir(p.Ref)}
+	if !replica {
+		dirs = append(dirs, pl.cfg.Paths().ProjectService(p.Ref, config.SvcGoTrue))
+	}
 	if hasPostgREST(p.Ref) {
 		dirs = append(dirs, pl.cfg.Paths().ProjectService(p.Ref, config.SvcPostgREST))
 	}
@@ -270,6 +287,14 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 	if err != nil {
 		return err
 	}
+	return pl.startCluster(ctx, spec, pl.paths(p), pl.opts.PostgresReadyTimeout)
+}
+
+// startCluster renders the cluster unit spec, restarts a running cluster whose settings changed
+// (or defers the restart, see DeferRestarts), starts it and waits until it answers on pp. A
+// replica's cluster takes the same path with its own spec and port.
+func (pl *PostgresPlane) startCluster(ctx context.Context, spec units.Spec, pp pgPaths, ready time.Duration) error {
+	var err error
 	before := pl.digest(spec)
 	changed := false
 	if cr, ok := pl.sup.(units.ChangeRenderer); ok {
@@ -319,8 +344,7 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 	if err := pl.sup.Start(ctx, spec.Unit()); err != nil {
 		return err
 	}
-	pp := pl.paths(p)
-	return pl.wait(ctx, spec.Unit(), "PostgreSQL", pl.opts.PostgresReadyTimeout, func(ctx context.Context) error { return ping(ctx, pp) })
+	return pl.wait(ctx, spec.Unit(), "PostgreSQL", ready, func(ctx context.Context) error { return pl.sql().Ping(ctx, addrOf(pp)) })
 }
 
 // startRendered starts the cluster unit from the files an earlier run rendered, which
@@ -713,20 +737,7 @@ func (pl *PostgresPlane) checkHTTP(ctx context.Context, p *registry.Project, svc
 	default:
 		return fmt.Errorf("lifecycle: no health check for %s", svc)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := pl.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
-	}
-	return nil
+	return pl.checkURL(ctx, url)
 }
 
 func (pl *PostgresPlane) unitsOf(ref string) []string {
@@ -781,38 +792,40 @@ func (pl *PostgresPlane) Reconfigure(ctx context.Context, p *registry.Project, k
 // Health implements Runner.
 func (pl *PostgresPlane) Health(ctx context.Context, p *registry.Project, _ *secrets.ProjectKeys) []ServiceHealth {
 	pp := pl.paths(p)
-	check := func(svc string, f func(context.Context) error) ServiceHealth {
-		h := ServiceHealth{Name: svc}
-		st, err := pl.sup.Status(ctx, config.UnitName(svc, p.Ref))
-		switch {
-		case err != nil:
-			h.Status, h.Error = "UNHEALTHY", err.Error()
-		case st.State != units.StateActive:
-			h.Status = "UNHEALTHY"
-			if st.State == units.StateActivating {
-				h.Status = "COMING_UP"
-			}
-			h.Error = fmt.Sprintf("unit is %s/%s", st.State, st.SubState)
-		default:
-			if err := f(ctx); err != nil {
-				h.Status, h.Error = "UNHEALTHY", err.Error()
-				if time.Since(st.Since) < 30*time.Second {
-					h.Status = "COMING_UP"
-				}
-			} else {
-				h.Healthy, h.Status = true, "ACTIVE_HEALTHY"
-			}
-		}
-		return h
-	}
 	out := []ServiceHealth{
-		check(config.SvcPostgres, func(ctx context.Context) error { return ping(ctx, pp) }),
-		check(config.SvcGoTrue, func(ctx context.Context) error { return pl.checkHTTP(ctx, p, config.SvcGoTrue) }),
+		pl.serviceHealth(ctx, p.Ref, config.SvcPostgres, func(ctx context.Context) error { return ping(ctx, pp) }),
+		pl.serviceHealth(ctx, p.Ref, config.SvcGoTrue, func(ctx context.Context) error { return pl.checkHTTP(ctx, p, config.SvcGoTrue) }),
 	}
 	if hasPostgREST(p.Ref) {
-		out = append(out, check(config.SvcPostgREST, func(ctx context.Context) error { return pl.checkHTTP(ctx, p, config.SvcPostgREST) }))
+		out = append(out, pl.serviceHealth(ctx, p.Ref, config.SvcPostgREST, func(ctx context.Context) error { return pl.checkHTTP(ctx, p, config.SvcPostgREST) }))
 	}
 	return out
+}
+
+// serviceHealth is the health of svc's unit of ref: the unit state first, then a real request (f).
+func (pl *PostgresPlane) serviceHealth(ctx context.Context, ref, svc string, f func(context.Context) error) ServiceHealth {
+	h := ServiceHealth{Name: svc}
+	st, err := pl.sup.Status(ctx, config.UnitName(svc, ref))
+	switch {
+	case err != nil:
+		h.Status, h.Error = "UNHEALTHY", err.Error()
+	case st.State != units.StateActive:
+		h.Status = "UNHEALTHY"
+		if st.State == units.StateActivating {
+			h.Status = "COMING_UP"
+		}
+		h.Error = fmt.Sprintf("unit is %s/%s", st.State, st.SubState)
+	default:
+		if err := f(ctx); err != nil {
+			h.Status, h.Error = "UNHEALTHY", err.Error()
+			if time.Since(st.Since) < 30*time.Second {
+				h.Status = "COMING_UP"
+			}
+		} else {
+			h.Healthy, h.Status = true, "ACTIVE_HEALTHY"
+		}
+	}
+	return h
 }
 
 // Delete implements DataPlane: stop and remove the units and delete the project
