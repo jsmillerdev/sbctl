@@ -60,7 +60,12 @@ type Authority struct {
 	// Ensure, when set, makes sure the system project has a base backup younger than the replica
 	// bootstrap age and names it in the join answer. Without it the joiner seeds from the newest one.
 	Ensure backup.BaseBackupEnsurer
-	Now    func() time.Time
+	// Changed, when set, is called after the authority changed a node's row (a joiner admitted, a
+	// join confirmed, a fenced node taken back), before the answer goes out, so that the node's own
+	// view of the cluster, which peers admit certificates by, holds the change when the peer comes
+	// back a moment later.
+	Changed func(ctx context.Context)
+	Now     func() time.Time
 
 	mu     sync.Mutex
 	nonces map[string]time.Time
@@ -78,6 +83,12 @@ func (a *Authority) log() *slog.Logger {
 		return a.Log
 	}
 	return slog.Default()
+}
+
+func (a *Authority) changed(ctx context.Context) {
+	if a.Changed != nil {
+		a.Changed(ctx)
+	}
 }
 
 func (a *Authority) needLeader() error {
@@ -266,6 +277,7 @@ func (a *Authority) Join(ctx context.Context, req peerapi.JoinRequest) (*peerapi
 		}
 		return nil, fail(http.StatusConflict, "token_used", "that join token was used already; create another with `supavise node token`")
 	}
+	a.changed(ctx)
 	resp := &peerapi.JoinResponse{NodeID: node.ID, Cert: issued.PEM(), CA: a.CA.PEM(), System: *sys}
 	if resp.ClusterConfig, err = a.clusterConfig(); err != nil {
 		a.log().Error("join: the cluster settings were not rendered; the node was admitted", "node", node.ID, "error", err)
@@ -414,6 +426,7 @@ func (a *Authority) Confirm(ctx context.Context, caller string, c peerapi.JoinCo
 			}
 		}
 	}
+	a.changed(ctx)
 	a.log().Info("node joined", "node", caller, "replay_lsn", c.ReplayLSN)
 	return nil
 }
@@ -438,6 +451,7 @@ func (a *Authority) Renew(ctx context.Context, caller string, req peerapi.CertRe
 	if err := a.Reg.SetNodeCert(ctx, caller, issued.Serial); err != nil {
 		return nil, err
 	}
+	a.changed(ctx)
 	return &peerapi.CertRenewResponse{Cert: issued.PEM(), Serial: issued.Serial, NotAfter: issued.NotAfter}, nil
 }
 
@@ -485,6 +499,7 @@ func (a *Authority) Rejoin(ctx context.Context, caller string, req peerapi.Rejoi
 	if err != nil {
 		return nil, err
 	}
+	a.changed(ctx)
 	a.log().Info("fenced node rejoining", "node", caller)
 	return &peerapi.RejoinResponse{System: *sys, ClusterConfig: cfgText}, nil
 }
@@ -506,6 +521,9 @@ func (a *Authority) ReapJoining(ctx context.Context) ([]string, error) {
 			a.log().Warn("a node never finished joining and was removed", "node", n.ID, "name", n.Name)
 			out = append(out, n.ID)
 		}
+	}
+	if len(out) > 0 {
+		a.changed(ctx)
 	}
 	return out, nil
 }
