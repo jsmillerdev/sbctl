@@ -144,6 +144,79 @@ jobs:
           path: /tmp/supavise-fleet-logs
           if-no-files-found: ignore
 
+  # The shared services of a follower node on a hot standby of the system cluster, and Storage
+  # uploading to Garage with credentials the daemon serves from an assumed role (replica design,
+  # workstream E).
+  fleet-follower:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: start S3 (Garage)
+        run: |
+          mkdir -p /tmp/garage/meta /tmp/garage/data
+          cat >/tmp/garage/garage.toml <<'TOML'
+          metadata_dir = "/var/lib/garage/meta"
+          data_dir = "/var/lib/garage/data"
+          db_engine = "sqlite"
+          replication_factor = 1
+          rpc_bind_addr = "127.0.0.1:3901"
+          rpc_public_addr = "127.0.0.1:3901"
+          rpc_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          [s3_api]
+          s3_region = "us-east-1"
+          api_bind_addr = "127.0.0.1:9000"
+          [admin]
+          api_bind_addr = "127.0.0.1:3903"
+          admin_token = "supavise-ci-admin-token"
+          TOML
+          docker run -d --name garage --network host \
+            -v /tmp/garage/garage.toml:/etc/garage.toml \
+            -v /tmp/garage/meta:/var/lib/garage/meta -v /tmp/garage/data:/var/lib/garage/data \
+            dxflrs/garage:v1.1.0
+          for i in $(seq 1 60); do
+            docker exec garage /garage status >/dev/null 2>&1 && break
+            sleep 1
+          done
+          ID=$(docker exec garage /garage node id -q | cut -d@ -f1)
+          docker exec garage /garage layout assign -z dc1 -c 1G "$ID"
+          docker exec garage /garage layout apply --version 1
+          docker exec garage /garage key import --yes -n ci GK0123456789abcdef01234567 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          docker exec garage /garage bucket create supavise-test
+          docker exec garage /garage bucket allow --read --write --owner supavise-test --key ci
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ || true)
+            [ "$code" != "000" ] && break
+            sleep 1
+          done
+          echo "S3 answered $code"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build supavise and the follower test
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
+          CGO_ENABLED=0 go test -c -tags fleetfollower -o /tmp/fleet-follower.test ./internal/fleet
+      - name: fleet follower
+        run: sudo LOG_DIR=/tmp/supavise-follower-logs SUPAVISE_BIN=/tmp/supavise FLEET_FOLLOWER_TEST=/tmp/fleet-follower.test tests/linux/fleet-follower.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/supavise-follower-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-follower-${{ matrix.arch }}
+          path: /tmp/supavise-follower-logs
+          if-no-files-found: ignore
+      - if: failure()
+        run: docker logs garage | tail -50
+
   # Dashboard writes under systemd: settings saved through the Management API change the
   # behavior of GoTrue, PostgREST, Storage, Realtime and Postgres; keys, the database password
   # and persistence across a pause.
