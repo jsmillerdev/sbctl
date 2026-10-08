@@ -158,7 +158,9 @@ func paramsByKey(ps []map[string]any) map[string]map[string]any {
 
 // smallTemplate is a template of a few bytes that has what the script reads of one: the
 // parameters and the revision. It fits in an API call, so it goes in the request body.
-func smallTemplate(t *testing.T) string {
+func smallTemplate(t *testing.T) string { return smallTemplateAt(t, "2") }
+
+func smallTemplateAt(t *testing.T, revision string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "small.yaml")
 	body := `AWSTemplateFormatVersion: "2010-09-09"
@@ -185,7 +187,7 @@ Resources: {}
 Outputs:
   InfraRevision:
     Description: Revision.
-    Value: "2"
+    Value: "` + revision + `"
 `
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -437,6 +439,28 @@ func TestUpdateFailureIsExit3(t *testing.T) {
 	r = f.run(nil, "update", "--stack", "nope", "--region", "us-east-1", "--template", smallTemplate(t), "--yes")
 	if r.code != 3 || !strings.Contains(r.stderr, "cannot read the stack nope") {
 		t.Errorf("exit %d\n%s", r.code, r.stderr)
+	}
+}
+
+// An older template would take the new resources away; update does not go back.
+func TestUpdateRefusesAnOlderTemplate(t *testing.T) {
+	f := newUpdFake(t)
+	f.copy("stack-rev2.json", "stack.json")
+	r := f.run(nil, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplateAt(t, "1"), "--yes")
+	if r.code != 2 || !strings.Contains(r.stderr, "does not move a stack back to an older template") {
+		t.Errorf("exit %d\n%s", r.code, r.stderr)
+	}
+	if len(f.callsMatching("create-change-set")) != 0 {
+		t.Error("a change set was made from an older template")
+	}
+	// The same revision, and a stack from before revisions with a template at 1 or more, are fine.
+	f = newUpdFake(t)
+	f.copy("stack-rev2.json", "stack.json")
+	if r = f.run(nil, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplateAt(t, "2"), "--yes"); r.code != 0 {
+		t.Errorf("same revision: exit %d\n%s", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "Credentials: arn:aws:iam::111122223333:user/admin") {
+		t.Errorf("the credentials in use are not shown:\n%s", r.stdout)
 	}
 }
 

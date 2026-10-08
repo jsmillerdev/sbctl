@@ -600,6 +600,7 @@ operator_credentials() {
   case $arn in
     *:assumed-role/*/i-[0-9a-f]*) die "these credentials belong to an instance role ($arn). A stack is changed with your own credentials, never the node's" ;;
   esac
+  say "Credentials: $arn"
 }
 
 # ---- stack facts ---------------------------------------------------------------------------
@@ -776,6 +777,9 @@ run_update() { # TAG HOW
   have=$(fact "$tag" output:InfraRevision); have=${have:-1}
   want=$(template_revision "$TEMPLATE")
   say "Stack $STACK is at infrastructure revision $have; the template is at revision $want."
+  if [[ $want -lt $have ]]; then
+    die "an update does not move a stack back to an older template (the stack is at revision $have, this template at $want); use the template of the release the stack runs, or a newer one"
+  fi
 
   bucket=$STAGE_BUCKET
   [[ -n $bucket ]] || bucket=$(fact "$tag" output:BackupBucket)
