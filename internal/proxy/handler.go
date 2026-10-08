@@ -369,8 +369,8 @@ type target struct {
 	// CORS policy.
 	keepCORS bool
 	// retry, when set, is the address a request that can be repeated (a GET or HEAD with no body) goes to
-	// once if addr cannot be reached or does not answer: a balanced read that picked a replica retries on
-	// the primary. onRetry runs first.
+	// once if addr cannot be reached or breaks the connection before it answers (retryable): a balanced
+	// read that picked a replica retries on the primary. onRetry runs first.
 	retry   string
 	onRetry func()
 }

@@ -19,8 +19,8 @@ type Cluster struct {
 	// it answered. Nil means every node is connected. This node always is.
 	Connected func(node string) bool
 	// Leader reports whether this node leads the cluster. Only the leader serves api.<domain> itself: any
-	// other node forwards it to the Management API's loopback listener, which the mesh binds to the leader
-	// there (design 2.6). Nil means this node leads.
+	// other node forwards it to the Management API's loopback listener ([listen] admin), where the mesh
+	// has put a forwarder to the leader's (design 2.6). Nil means this node leads.
 	Leader func() bool
 	// Fenced reports whether the cluster role of this node is fenced. The node record of
 	// internal/failover/fenced fences the node as well, whatever this says. Nil means not fenced.
