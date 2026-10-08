@@ -58,7 +58,7 @@ when its own system cluster becomes a standby.`,
 	}
 	f := cmd.Flags()
 	f.StringVar(&o.To, "to", "", "the node to promote (default: this one)")
-	f.BoolVar(&o.Force, "force", false, "go on although a precondition that is not marked hard fails: a replica that lags or is not healthy, nodes on different releases, an unreachable epoch-marker store")
+	f.BoolVar(&o.Force, "force", false, "go on although a precondition that is not marked hard fails: a replica that lags or is not healthy, nodes on different releases")
 	f.BoolVar(&o.DryRun, "dry-run", false, "print the preconditions and what would happen, and change nothing")
 	f.BoolVar(&o.Resume, "resume", false, "continue the run that stopped")
 	f.BoolVar(&o.RestoreMissing, "restore-missing", false, "seed a project that has no replica from the archive")

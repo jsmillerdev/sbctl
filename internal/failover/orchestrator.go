@@ -124,8 +124,42 @@ func New(d Deps) (*Orchestrator, error) {
 	if d.Notify == nil {
 		d.Notify = func(ctx context.Context, ev alerts.Event) { _ = alerts.Notify(ctx, ev) }
 	}
+	for _, g := range d.Gaps() {
+		d.Log.Warn("a part of the move is not wired", "port", g.Port, "effect", g.Effect)
+	}
 	return &Orchestrator{d: d, locks: map[string]*sync.Mutex{}}, nil
 }
+
+// Gap is a part of a move that has nothing wired to it, and what a move leaves undone because of it.
+type Gap struct {
+	Port   string
+	Effect string
+}
+
+// Gaps lists the ports of d that are not wired and that a move can do without, with what a move then
+// leaves undone. A move goes on without them, which is how a node without shared services runs one in
+// a test, and also how a daemon whose wiring lacks an adapter would run it: silently, if nobody said.
+// New logs each gap, and Readiness shows the ones that leave a service broken after a move.
+func (d Deps) Gaps() []Gap {
+	var gaps []Gap
+	add := func(missing bool, port, effect string) {
+		if missing {
+			gaps = append(gaps, Gap{Port: port, Effect: effect})
+		}
+	}
+	add(d.LocalPrimaries == nil, "LocalPrimaries", "this node cannot stop, start or fence a primary when a peer asks: a quiesce, a fence and the project calls of the leader are answered 501")
+	add(d.Fleet == nil, "Fleet", "Realtime and the pooler are not told to let go of a project before it stops, and are not registered with it again after a move: Realtime and Supavisor keep serving the old address")
+	add(d.LocalServices == nil, "LocalServices", "the shared services (Studio, Realtime, Storage and the rest) keep running while the leader stops for a switchover, and do not start again when it is undone")
+	add(d.Locks == nil, "Locker", "a project move is kept apart from pause, resume, delete and upgrade of the same project by a lock of this process only, which those do not take")
+	add(d.Extra == nil, "ExtraChecks", "the certificates and the shared-service artifacts are not checked before a server move")
+	add(d.Backups == nil, "BaseBackups", "no base backup is taken on the new timeline after a move; the backup timer takes the next one")
+	add(d.Replicas == nil, "ReplicaSetup", "the old home of a failed-over project gets no new replica by itself; the move prints the supavise replicas add command")
+	add(d.Takeover == nil, "Takeover", "a server move does not wait for the daemon to lead before it moves the projects")
+	return gaps
+}
+
+// Gaps lists what is not wired for this orchestrator (Deps.Gaps).
+func (o *Orchestrator) Gaps() []Gap { return o.d.Gaps() }
 
 func sleep(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)

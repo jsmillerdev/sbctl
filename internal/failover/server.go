@@ -373,10 +373,12 @@ func (o *Orchestrator) writeMarker(ctx context.Context, run *serverRun) (string,
 		return fmt.Sprintf("epoch %d, leader %s", run.epoch, run.to.ID), nil
 	case errors.Is(err, backup.ErrMarkerNewer):
 		return "", lost
-	case run.flags.Force:
+	case run.flags.Force && o.recordsLeadership():
 		return "warning: the leader marker was not written: " + err.Error(), nil
 	}
-	return "", fmt.Errorf("writing the leader marker: %w (--force goes on without it)", err)
+	// The daemon of the promoted node restarts and decides its role from its cluster row, its peers and
+	// this marker. With none of them naming it, it starts fenced: there would be no leader.
+	return "", fmt.Errorf("writing the leader marker: %w (without it the promoted node's daemon starts fenced, so --force does not go on without it)", err)
 }
 
 // becomeLeader runs when the system cluster has been promoted: the daemon notices and becomes the

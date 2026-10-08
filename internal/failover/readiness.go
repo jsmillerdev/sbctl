@@ -73,6 +73,15 @@ func (o *Orchestrator) Readiness(ctx context.Context) (Readiness, error) {
 	if reason := o.autoOff(); reason != "" {
 		r.Notes = append(r.Notes, "automatic failover is off: "+reason)
 	}
+	// A move works without these and leaves the services they serve broken or untouched.
+	for _, g := range o.Gaps() {
+		switch g.Port {
+		case "Fleet":
+			r.Notes = append(r.Notes, "Realtime and the pooler will not be re-registered after a move: this build has no shared-service adapter for it")
+		case "LocalServices":
+			r.Notes = append(r.Notes, "the shared services will keep running through a planned switchover: this build has no adapter that stops and starts them")
+		}
+	}
 
 	to, ok := o.candidate(ctx, nodes)
 	if !ok {

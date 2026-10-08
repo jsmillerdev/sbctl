@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -188,5 +189,46 @@ func TestReadinessSaysAutomaticServerModeWaitsForProjectsWithoutAReplica(t *test
 	r, err := m.o.Readiness(m.ctx)
 	if err != nil || !strings.Contains(strings.Join(r.Notes, "\n"), "does not run while a project has no replica") {
 		t.Fatalf("notes %v, %v", r.Notes, err)
+	}
+}
+
+// A daemon whose wiring lacks an adapter runs a move that leaves Realtime and the shared services as
+// they were. That is said where it is built and where it is read, not discovered after a switchover.
+func TestAPortThatIsNotWiredIsLoggedAndShownInReadiness(t *testing.T) {
+	w := serverWorld(t)
+	var logged strings.Builder
+	o := w.orch(func(d *Deps) {
+		d.Fleet, d.LocalServices, d.Locks, d.Extra, d.Backups, d.Replicas = nil, nil, nil, nil, nil, nil
+		d.Log = slog.New(slog.NewTextHandler(&logged, nil))
+	})
+	for _, port := range []string{"Fleet", "LocalServices", "Locker", "ExtraChecks", "BaseBackups", "ReplicaSetup"} {
+		if !strings.Contains(logged.String(), "port="+port) {
+			t.Errorf("the missing %s is not logged:\n%s", port, logged.String())
+		}
+	}
+	if strings.Contains(logged.String(), "port=LocalPrimaries") || strings.Contains(logged.String(), "port=Takeover") {
+		t.Errorf("a port that is wired is logged as missing:\n%s", logged.String())
+	}
+	r, err := o.Readiness(w.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := strings.Join(r.Notes, "\n")
+	if !strings.Contains(notes, "Realtime and the pooler will not be re-registered") || !strings.Contains(notes, "shared services will keep running through a planned switchover") {
+		t.Fatalf("notes: %v", r.Notes)
+	}
+	if !r.Ready {
+		t.Fatalf("the move works without them, so readiness is not blocked: %v", r.Blockers)
+	}
+	// With them wired the notes are gone.
+	if r, _ = w.orch().Readiness(w.ctx); strings.Contains(strings.Join(r.Notes, "\n"), "re-registered") {
+		t.Fatalf("notes: %v", r.Notes)
+	}
+	var ports []string
+	for _, g := range w.orch().Gaps() {
+		ports = append(ports, g.Port)
+	}
+	if strings.Join(ports, ",") != "Locker,ExtraChecks" { // the test world wires the rest
+		t.Fatalf("gaps of the test world: %v", ports)
 	}
 }

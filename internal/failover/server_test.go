@@ -329,12 +329,42 @@ func TestAMarkerAlreadyAtTheEpochRefusesThePlan(t *testing.T) {
 	}
 }
 
-func TestMarkerStoreDownRefusesUnlessForced(t *testing.T) {
+// The promoted node's daemon restarts and finds its role in the cluster row, from its peers or in the
+// marker. A marker that cannot be written leaves a survivor that starts fenced, so --force does not
+// skip it, unless the Takeover records the leadership in the promoted registry itself.
+func TestMarkerStoreDownRefusesTheMoveAndForceDoesNotChangeIt(t *testing.T) {
 	w := serverWorld(t)
 	w.markErr = errors.New("connection refused")
 	o := w.orch()
-	if _, err := o.FailoverServer(w.ctx, ServerOptions{}); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "backup store is not reachable") {
+	if _, err := o.FailoverServer(w.ctx, ServerOptions{}); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "cannot be read") {
 		t.Fatalf("error: %v", err)
+	}
+	if _, err := o.FailoverServer(w.ctx, ServerOptions{Force: true}); !errors.Is(err, ErrRefused) {
+		t.Fatalf("with force: %v", err)
+	}
+	w.assertNever("promote")
+	// A marker that fails to be written after the plan (the store went down in between) stops the move before the promotion.
+	w.markErr = nil
+	w.fail("marker epoch=", errors.New("connection reset"), -1)
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{Force: true})
+	if err == nil || !strings.Contains(err.Error(), "starts fenced") || mv.State != registry.MoveFailed {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	w.assertNever("promote")
+	w.assertNever("provider.takeover")
+}
+
+// recordingTakeover is a Takeover that writes the cluster row of the promoted registry itself.
+type recordingTakeover struct{ Takeover }
+
+func (recordingTakeover) RecordsLeadership() bool { return true }
+
+func TestMarkerStoreDownWithATakeoverThatRecordsTheLeadershipGoesOnWhenForced(t *testing.T) {
+	w := serverWorld(t)
+	w.markErr = errors.New("connection refused")
+	o := w.orch(func(d *Deps) { d.Takeover = recordingTakeover{d.Takeover} })
+	if _, err := o.FailoverServer(w.ctx, ServerOptions{}); !errors.Is(err, ErrRefused) {
+		t.Fatalf("without force: %v", err)
 	}
 	mv, err := o.FailoverServer(w.ctx, ServerOptions{Force: true})
 	if err != nil {
