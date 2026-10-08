@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -53,6 +54,12 @@ type rig struct {
 	// blocker is what RebootBlocker answers; upgradeTakes is how far Upgrade moves the clock.
 	blocker      string
 	upgradeTakes time.Duration
+	// The host lock: lockErr is why it cannot be taken; locks and unlocks count the takes and the
+	// gives; heldAtReboot is how many were held when Reboot ran.
+	lockErr        error
+	locks, unlocks int
+	heldAtReboot   int
+	rebootErr      error
 }
 
 // sunday is 2026-10-04, a Sunday; the default test window is Sun 03:00-05:00 UTC.
@@ -81,7 +88,18 @@ func newRig(t *testing.T, mode string) *rig {
 		},
 		RebootRequired: func(context.Context) bool { return r.rebootOK },
 		RebootBlocker:  func(context.Context) string { return r.blocker },
-		Reboot:         func(context.Context) error { r.reboots++; return nil },
+		LockHost: func() (func(), error) {
+			if r.lockErr != nil {
+				return nil, r.lockErr
+			}
+			r.locks++
+			return func() { r.unlocks++ }, nil
+		},
+		Reboot: func(context.Context) error {
+			r.reboots++
+			r.heldAtReboot = r.locks - r.unlocks
+			return r.rebootErr
+		},
 	}
 	return r
 }
@@ -628,12 +646,77 @@ func TestStateFile(t *testing.T) {
 	}
 }
 
-func TestStatePathIsOutsideTheStateDirectory(t *testing.T) {
-	if got := StatePath("/var/lib/supavise"); got != "/var/lib/supavise-upgrade/state.json" {
-		t.Errorf("StatePath = %s", got)
+// The record sits at the unit's StateDirectory ($STATE_DIRECTORY), or at the same fixed path when
+// a person runs the command: nothing in config.toml moves it.
+func TestStateDirIsPinnedToTheUnitsStateDirectory(t *testing.T) {
+	env := func(v string) func(string) string { return func(string) string { return v } }
+	for _, tc := range []struct {
+		name, env, want string
+		bad             bool
+	}{
+		{"started by systemd", "/var/lib/supavise-upgrade", "/var/lib/supavise-upgrade", false},
+		{"a unit with another StateDirectory", "/var/lib/other", "/var/lib/other", false},
+		{"by hand", "", DefaultStateDir, false},
+		{"several directories", "/var/lib/a:/var/lib/b", "", true},
+		{"relative", "supavise-upgrade", "", true},
+		{"not clean", "/var/lib/supavise-upgrade/../supavise", "", true},
+		{"trailing slash", "/var/lib/supavise-upgrade/", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := PinnedStateDir(env(tc.env))
+			if (err != nil) != tc.bad || got != tc.want {
+				t.Fatalf("PinnedStateDir(%q) = %q, %v", tc.env, got, err)
+			}
+		})
 	}
-	if got := StatePath("/data/sv/"); got != "/data/sv-upgrade/state.json" {
-		t.Errorf("StatePath = %s", got)
+	if DefaultStateDir != "/var/lib/supavise-upgrade" {
+		t.Errorf("DefaultStateDir = %s: the unit's StateDirectory=supavise-upgrade is /var/lib/supavise-upgrade", DefaultStateDir)
+	}
+	st, err := PinnedStore(env("/var/lib/supavise-upgrade"))
+	if err != nil || st.Path != "/var/lib/supavise-upgrade/state.json" {
+		t.Errorf("PinnedStore = %+v, %v", st, err)
+	}
+}
+
+// A pinned store creates no directory of its own choosing: systemd made the unit's, and one that is
+// missing elsewhere is a unit that is not what it should be.
+func TestPinnedStoreRefusesToCreateADirectoryElsewhere(t *testing.T) {
+	base := t.TempDir()
+	missing := filepath.Join(base, "elsewhere")
+	s, err := PinnedStore(func(string) string { return missing })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(State{Blocked: "x"}); err == nil || !strings.Contains(err.Error(), "does not exist") || !strings.Contains(err.Error(), "StateDirectory=") {
+		t.Fatalf("Save into a missing directory: %v", err)
+	}
+	if _, err := s.Lock(); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("Lock in a missing directory: %v", err)
+	}
+	if _, err := os.Lstat(missing); err == nil {
+		t.Fatal("the pinned store created a directory")
+	}
+	// The directory systemd made is used as it is.
+	if err := os.Mkdir(missing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(State{Blocked: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	release, err := s.Lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if got, err := s.Load(); err != nil || got.Blocked != "x" {
+		t.Fatalf("Load = %+v, %v", got, err)
+	}
+	// A directory that someone else can write is still refused.
+	if err := os.Chmod(missing, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(State{}); err == nil || !strings.Contains(err.Error(), "writable by group or others") {
+		t.Errorf("Save into a world-writable directory: %v", err)
 	}
 }
 
@@ -696,3 +779,128 @@ func TestUnitListParsing(t *testing.T) {
 		t.Errorf("UnitNames of nothing = %v", got)
 	}
 }
+
+// The host lock is taken before the gate looks at the node, and held until the machine is going
+// down: nothing that replaces the binary or restarts the fleet can start in between.
+func TestRebootHoldsTheHostLockFromBeforeTheGateThroughTheReboot(t *testing.T) {
+	r := newRig(t, config.UpdateNotify)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	var order []string
+	r.d.RebootBlocker = func(context.Context) string {
+		order = append(order, "gate held="+itoa(r.locks-r.unlocks))
+		return ""
+	}
+	r.d.AwaitShutdown = func(context.Context) { order = append(order, "await held="+itoa(r.locks-r.unlocks)) }
+	reboot := r.d.Reboot
+	r.d.Reboot = func(ctx context.Context) error {
+		order = append(order, "reboot held="+itoa(r.locks-r.unlocks))
+		return reboot(ctx)
+	}
+	r.at("2026-10-04 03:00")
+	if err := r.run(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(order, ", "), "gate held=1, reboot held=1, await held=1"; got != want {
+		t.Fatalf("order = %s, want %s", got, want)
+	}
+	if r.locks != 1 || r.unlocks != 1 {
+		t.Errorf("the lock was taken %d and given back %d time(s); want once each, after the reboot", r.locks, r.unlocks)
+	}
+}
+
+// Someone else holds the lock (an upgrade or a self-update is running): no gate check, no reboot,
+// and the window's reboot is not used up.
+func TestRebootWaitsWhileAnUpgradeHoldsTheHostLock(t *testing.T) {
+	r := newRig(t, config.UpdateNotify)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	r.lockErr = errors.New("another supavise upgrade or self-update is running (/run/supavise-maintenance.lock is held); wait for it to finish")
+	gateCalls := 0
+	r.d.RebootBlocker = func(context.Context) string { gateCalls++; return "" }
+	r.at("2026-10-04 03:00")
+	if err := r.run(); err != nil {
+		t.Fatal(err)
+	}
+	if r.reboots != 0 || gateCalls != 0 || r.logs.count("os_reboot_deferred") != 1 {
+		t.Fatalf("reboots %d, gate calls %d, deferrals %d", r.reboots, gateCalls, r.logs.count("os_reboot_deferred"))
+	}
+	if st, _ := r.d.Store.Load(); !st.RebootWindow.IsZero() {
+		t.Errorf("a deferred reboot used up the window's reboot: %+v", st)
+	}
+	// The upgrade is over a quarter of an hour later: the reboot follows in the same window.
+	r.lockErr = nil
+	r.at("2026-10-04 03:15")
+	_ = r.run()
+	if r.reboots != 1 {
+		t.Errorf("the reboot did not follow once the lock was free: %d", r.reboots)
+	}
+}
+
+func TestRebootGivesTheHostLockBackWhenItDoesNotGoAhead(t *testing.T) {
+	for name, set := range map[string]func(*rig){
+		"the node is busy":  func(r *rig) { r.blocker = "a base backup is running" },
+		"the reboot failed": func(r *rig) { r.rebootErr = errors.New("systemctl reboot: refused") },
+		"the window closes": func(r *rig) { r.at("2026-10-04 04:50") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t, config.UpdateNotify)
+			r.d.Update.OSSecurityUpdates = true
+			r.rebootOK = true
+			r.at("2026-10-04 03:00")
+			set(r)
+			_ = r.run()
+			if r.locks != r.unlocks {
+				t.Errorf("the lock was taken %d and given back %d time(s)", r.locks, r.unlocks)
+			}
+		})
+	}
+}
+
+// No reboot is due, so nothing takes the lock: an upgrade or self-update started by hand during a
+// window is never refused because the timer looked.
+func TestTheHostLockIsTakenOnlyForAReboot(t *testing.T) {
+	r := newRig(t, config.UpdateAuto)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = false
+	r.at("2026-10-04 03:00")
+	_ = r.run()
+	if r.locks != 0 {
+		t.Errorf("the lock was taken %d time(s) with no reboot due", r.locks)
+	}
+}
+
+// The upgrade this pass starts is a process of its own that takes the lock itself, so the pass must
+// not hold it while that process runs.
+func TestTheHostLockIsFreeWhileThePassRunsItsOwnUpgrade(t *testing.T) {
+	r := newRig(t, config.UpdateAuto)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	upgrade := r.d.Upgrade
+	heldDuringUpgrade := -1
+	r.d.Upgrade = func(ctx context.Context) (int, error) {
+		heldDuringUpgrade = r.locks - r.unlocks
+		return upgrade(ctx)
+	}
+	r.at("2026-10-04 03:00")
+	if err := r.run(); err != nil {
+		t.Fatal(err)
+	}
+	if heldDuringUpgrade != 0 || r.reboots != 1 || r.heldAtReboot != 1 {
+		t.Fatalf("held during the upgrade %d, reboots %d, held at the reboot %d", heldDuringUpgrade, r.reboots, r.heldAtReboot)
+	}
+}
+
+func TestNoHostLockNoReboot(t *testing.T) {
+	r := newRig(t, config.UpdateNotify)
+	r.d.Update.OSSecurityUpdates = true
+	r.rebootOK = true
+	r.d.LockHost = nil
+	r.at("2026-10-04 03:00")
+	_ = r.run()
+	if r.reboots != 0 || r.logs.count("os_reboot_deferred") != 1 {
+		t.Errorf("a reboot without the host lock: %d", r.reboots)
+	}
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }

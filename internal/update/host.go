@@ -80,12 +80,16 @@ const UpgradeStopTimeout = 50 * time.Minute
 // not an error here: the contract gives each one a meaning. The error is for a command that did
 // not run. When ctx is cancelled the command gets SIGTERM, not SIGKILL, and UpgradeStopTimeout to
 // end on its own terms: an upgrade cut off mid-step is the worst way for it to stop.
-func RunUpgrade(ctx context.Context, exe, configPath string, stdout, stderr io.Writer) (int, error) {
+//
+// extra are more arguments for `supavise upgrade` (the release server and key of the end-to-end
+// test); the unit passes none.
+func RunUpgrade(ctx context.Context, exe, configPath string, stdout, stderr io.Writer, extra ...string) (int, error) {
 	args := []string{}
 	if configPath != "" {
 		args = append(args, "--config", configPath)
 	}
 	args = append(args, "upgrade", "--unattended")
+	args = append(args, extra...)
 	c := exec.CommandContext(ctx, exe, args...)
 	c.Cancel = func() error { return c.Process.Signal(syscall.SIGTERM) }
 	c.WaitDelay = UpgradeStopTimeout
@@ -107,15 +111,13 @@ type Gate struct {
 	ConfigPath string // its config file
 	User       string // the user that owns the state directory and may open the registry
 	StateDir   string
-	// LockPath is the host lock that `supavise upgrade` and `supavise self-update` hold while
-	// they run (an flock; HostLockPath). The reboot waits while somebody else holds it. Empty:
-	// no lock to check.
-	LockPath string
 }
 
 // HostLockPath is the flock that every command that replaces the binary or restarts the fleet
-// (`supavise upgrade`, `supavise self-update`) holds for as long as it runs, so that the OS
-// reboot in the maintenance window never lands in the middle of one an operator started by hand.
+// (`supavise upgrade`, `supavise rollback`, `supavise self-update`) holds for as long as it runs, and
+// that `supavise update run` holds from before the reboot gate's checks until the machine goes down,
+// so that the OS reboot in the maintenance window never lands in the middle of one an operator
+// started by hand, and none starts between the check and the reboot.
 const HostLockPath = "/run/supavise-maintenance.lock"
 
 // LockHost takes the host lock at path (HostLockPath on a node) for a command that replaces the
@@ -139,11 +141,13 @@ func LockHost(path string) (release func(), err error) {
 //   - supavise.service runs and no supavise-* unit has failed (supavise-upgrade.service itself
 //     is not counted: it fails when an upgrade rolls back);
 //   - no base backup is running (supavise-basebackup@*.service, the prune service);
-//   - nobody holds the host lock (Gate.LockPath): no `supavise upgrade` or `supavise self-update`
-//     is running;
 //   - every project is in a quiet, good status (ACTIVE_HEALTHY, INACTIVE or REMOVED). A transitional
 //     one means a lifecycle operation is in flight (a Postgres upgrade an Owner started from
 //     Studio, a restore, a pause); a failed, unhealthy or unknown one means a person should look.
+//
+// The host lock is not checked here: Run takes it (Deps.LockHost) before it calls the gate and holds
+// it through the reboot, which is stronger than a probe that releases it again, and a probe from
+// inside the holding process would find its own lock held.
 //
 // The project statuses come from `supavise projects list --json` run as the supavise user, the
 // way the installer runs the other commands that open the registry. A check that cannot run
@@ -157,16 +161,6 @@ func HostRebootBlocker(g Gate) func(ctx context.Context) string {
 		}
 		if err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", "supavise.service").Run(); err != nil {
 			return "supavise.service is not running"
-		}
-		if g.LockPath != "" {
-			release, held, err := tryLock(g.LockPath)
-			switch {
-			case err != nil:
-				return "cannot check the host lock: " + err.Error()
-			case held:
-				return "an upgrade or self-update is running (" + g.LockPath + " is held)"
-			}
-			release()
 		}
 		out, err := systemctl("list-units", "--state=failed", "supavise*")
 		if err != nil {

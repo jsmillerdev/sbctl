@@ -60,12 +60,12 @@ type nodeHost struct {
 	hbStop      chan struct{}
 	knowsReason bool
 	// halted is the project the last rollout stopped at (HaltedProject).
-	halted string
-	from, to    string
-	started     time.Time
-	swappedAt   time.Time
-	stageDir    string
-	tmpStage    bool
+	halted    string
+	from, to  string
+	started   time.Time
+	swappedAt time.Time
+	stageDir  string
+	tmpStage  bool
 	// tagsAtSwap are the releases the node's units were set to run just before the binary was
 	// swapped (by Install or by Restore), by service.
 	tagsAtSwap map[string]string

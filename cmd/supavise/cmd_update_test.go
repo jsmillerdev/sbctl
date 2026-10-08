@@ -291,3 +291,13 @@ func TestReadConfigFileAcceptsABareCheckInterval(t *testing.T) {
 		}
 	}
 }
+
+func TestUpgradeTestArgs(t *testing.T) {
+	if got := upgradeTestArgs("", "", nil); len(got) != 0 {
+		t.Errorf("no flags, got %v", got)
+	}
+	got := strings.Join(upgradeTestArgs("o/r", "http://127.0.0.1:1", []string{"a.pem", "b.pem"}), " ")
+	if want := "--repo o/r --api-base http://127.0.0.1:1 --public-key-file a.pem --public-key-file b.pem"; got != want {
+		t.Errorf("args = %q, want %q", got, want)
+	}
+}

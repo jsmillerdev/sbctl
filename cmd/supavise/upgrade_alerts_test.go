@@ -15,8 +15,8 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/alerts"
 	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/notice"
 	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
+	"github.com/jsmillerdev/supavise/internal/notice"
 )
 
 type hookBody struct {

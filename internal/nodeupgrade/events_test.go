@@ -70,7 +70,11 @@ func TestRefusalsRaiseNoEvent(t *testing.T) {
 		"a failed backup": func(h *fakeHost, o *Options) { h.backupErr = errBoom },
 		"a gate":          func(h *fakeHost, o *Options) { h.node.Verdict = VerdictDown },
 		"before the swap": func(h *fakeHost, o *Options) { h.installErr = errBoom },
-		"nothing to do":   func(h *fakeHost, o *Options) { h.tag, h.node.Version, h.node.BinaryInfo = "v1.1.0", "v1.1.0", newInfo(); h.node.Pins = newPins(); h.node.Projects = nil },
+		"nothing to do": func(h *fakeHost, o *Options) {
+			h.tag, h.node.Version, h.node.BinaryInfo = "v1.1.0", "v1.1.0", newInfo()
+			h.node.Pins = newPins()
+			h.node.Projects = nil
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newFakeHost()
