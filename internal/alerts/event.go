@@ -32,6 +32,9 @@ const (
 	KindFailoverStarted   = "failover_started"
 	KindFailoverCompleted = "failover_completed"
 	KindFailoverFailed    = "failover_failed"
+	// KindFailoverAutoOff is a condition: automatic failover is configured and the node cannot fence.
+	// It has a recovery message and the cap holds it back, so a probe that flaps cannot flood.
+	KindFailoverAutoOff = "failover_auto_off"
 	// KindFenced is critical: this node lost the leadership to a higher epoch and starts no primary.
 	KindFenced = "fenced"
 

@@ -35,6 +35,7 @@ The cluster kinds are raised by the code that owns the event, not by the checker
 | `node_unreachable` | a peer does not answer the mesh | the mesh |
 | `node_version_skew` | a peer runs a release outside the window this one works with | the mesh, at join and ping |
 | `failover_started`, `failover_completed`, `failover_failed` | a switchover or failover begins, ends or stops (announcements) | the failover orchestrator |
+| `failover_auto_off` | `[failover] mode` asks for automatic failover and the node cannot fence, so it runs as manual; the recovery message says it is armed again | the failover monitor |
 | `fenced` | this node lost the leadership to a higher epoch and starts no primary (critical) | the daemon at boot |
 | `infra_behind` | the AWS stack lacks resources this release needs | `supavise upgrade` and the daemon |
 | `host_not_converged` | `supavise system converge` has not run for this release | the daemon |

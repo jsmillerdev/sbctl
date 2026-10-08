@@ -830,10 +830,12 @@ func TestHourlyCapDoesNotHoldBackTheFailoverAnnouncements(t *testing.T) {
 	if s.count() != 7 {
 		t.Errorf("%d sent, want 7: a failover_* announcement was held back by the cap", s.count())
 	}
-	// A condition of the cluster work is not an announcement: the cap still holds it.
+	// A condition of the cluster work is not an announcement: the cap still holds it. That
+	// includes the failover condition, which a probe that flaps would otherwise raise without limit.
 	_ = n.Notify(ctx, Event{Kind: KindReplicaLag, Ref: "p4", Title: "lag"})
+	_ = n.Notify(ctx, Event{Kind: KindFailoverAutoOff, Key: "failover/auto-off", Title: "Automatic failover is off"})
 	if s.count() != 7 {
-		t.Errorf("%d sent: replica_lag went past the cap", s.count())
+		t.Errorf("%d sent: replica_lag or failover_auto_off went past the cap", s.count())
 	}
 }
 
