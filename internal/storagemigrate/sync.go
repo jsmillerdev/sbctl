@@ -41,7 +41,11 @@ func (e *Engine) walkTenant(ctx context.Context, ref string) (inventory, []Skipp
 	var inv inventory
 	var skipped []Skipped
 	err := e.files.Walk(ctx, root, func(abs string) {
-		skipped = append(skipped, Skipped{Path: quote(abs), Reason: "not a regular file"})
+		rel, err := filepath.Rel(root, abs)
+		if err != nil {
+			rel = abs
+		}
+		skipped = append(skipped, Skipped{Path: quote(ref + "/" + filepath.ToSlash(rel)), Reason: "not a regular file"})
 	}, func(o Object) error {
 		if why := validKey(ref + "/" + o.Path); why != "" {
 			skipped = append(skipped, Skipped{Path: quote(ref + "/" + o.Path), Reason: why})
@@ -167,9 +171,6 @@ func (e *Engine) copyFile(ctx context.Context, b Bucket, ref string, f fileState
 	meta, err := e.files.Meta(abs)
 	if err != nil {
 		return 0, fmt.Errorf("%s: read extended attributes: %w", abs, err)
-	}
-	if err := e.lim.wait(ctx, fi.Size()); err != nil {
-		return 0, err
 	}
 	if err := b.Put(ctx, ref+"/"+f.Path, fh, fi.Size(), meta); err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {

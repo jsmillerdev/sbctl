@@ -2,6 +2,7 @@ package storagemigrate
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -166,5 +167,122 @@ func TestRoleProviderAssumesTheRole(t *testing.T) {
 	bad, _ := roleProvider("arn:aws:iam::123456789012:role/unknown")
 	if _, err := bad.Retrieve(ctx); err == nil || !strings.Contains(err.Error(), "assume arn:aws:iam::123456789012:role/unknown") {
 		t.Errorf("an unregistered role: %v", err)
+	}
+}
+
+// virtualLimiter is a limiter whose clock moves only when it sleeps, so a test does not wait.
+func virtualLimiter(rate float64) *limiter {
+	var mu sync.Mutex
+	now := time.Unix(0, 0)
+	return &limiter{rate: rate,
+		now: func() time.Time { mu.Lock(); defer mu.Unlock(); return now },
+		sleep: func(_ context.Context, d time.Duration) error {
+			mu.Lock()
+			now = now.Add(d)
+			mu.Unlock()
+			return nil
+		}}
+}
+
+// zeroAt is size bytes of zeros that take no memory.
+type zeroAt struct{}
+
+func (zeroAt) ReadAt(p []byte, _ int64) (int, error) { clear(p); return len(p), nil }
+
+func TestThePacedTransportChargesEveryByteOnce(t *testing.T) {
+	b, _ := fakeS3(t)
+	// Over plain http the SDK reads a body twice, once to sign it and once to send it; only the second
+	// is on the wire.
+	l := virtualLimiter(1 << 20)
+	b.pace(l)
+	const size = 3 << 20
+	if err := b.Put(ctx, "p/single/v1", zeroAt{}, size, FileMeta{}); err != nil {
+		t.Fatal(err)
+	}
+	if l.bytes != size {
+		t.Errorf("one request: %d bytes were paid for, want %d", l.bytes, size)
+	}
+	b.threshold, b.partSize = 1<<20, 1<<20
+	if err := b.Put(ctx, "p/parts/v1", zeroAt{}, size, FileMeta{}); err != nil {
+		t.Fatal(err)
+	}
+	// The parts and the few hundred bytes of the request that completes the upload.
+	if extra := l.bytes - 2*size; extra < 0 || extra > 1024 {
+		t.Errorf("in parts: %d bytes were paid for, want %d", l.bytes-size, size)
+	}
+	paid := l.bytes
+	// An empty object costs nothing but its headers.
+	before := l.bytes
+	if err := b.Put(ctx, "p/empty/v1", zeroAt{}, 0, FileMeta{}); err != nil {
+		t.Fatal(err)
+	}
+	if l.bytes != before {
+		t.Errorf("an empty object: %d bytes were paid for", l.bytes-before)
+	}
+	// Without a rate nothing is paid for.
+	l.setRate(0)
+	if err := b.Put(ctx, "p/free/v1", zeroAt{}, size, FileMeta{}); err != nil {
+		t.Fatal(err)
+	}
+	if l.bytes != paid {
+		t.Errorf("without a limit %d bytes were paid for", l.bytes-paid)
+	}
+	rc, _, err := b.Get(ctx, "p/single/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.Copy(io.Discard, rc); err != nil || n != size {
+		t.Errorf("Get: %d bytes, %v", n, err)
+	}
+	rc.Close()
+}
+
+func TestAStalledConnectionEndsTheRequest(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut: // takes no data and answers nothing
+			<-release
+		case http.MethodGet: // sends a little and goes quiet
+			w.Header().Set("Content-Length", "1000000")
+			_, _ = w.Write(make([]byte, 100))
+			w.(http.Flusher).Flush()
+			<-release
+		}
+	}))
+	t.Cleanup(func() { close(release); srv.CloseClientConnections(); srv.Close() })
+	bk, err := openS3(ctx, Destination{Bucket: "objects", Endpoint: srv.URL, Region: "us-east-1", PathStyle: true},
+		Credentials{Source: CredFile, AccessKeyID: "test", SecretAccessKey: "test"}, 300*time.Millisecond, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := bk.(*s3Bucket)
+
+	start := time.Now()
+	if err := b.Put(ctx, "p/x/v1", zeroAt{}, 48<<20, FileMeta{}); !errors.Is(err, errStalled) {
+		t.Errorf("Put = %v", err)
+	}
+	rc, _, err := b.Get(ctx, "p/x/v1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if n, err := io.Copy(io.Discard, rc); !errors.Is(err, errStalled) || n != 100 {
+		t.Errorf("reading the body: %d bytes, %v", n, err)
+	}
+	rc.Close()
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("the requests took %s to end", d)
+	}
+}
+
+func TestPlainRemote(t *testing.T) {
+	for endpoint, want := range map[string]bool{
+		"": false, "https://s3.example.test": false, "http://127.0.0.1:9000": false, "http://localhost:3900": false,
+		"http://[::1]:9000": false, "http://minio.localhost:9000": false,
+		"http://10.0.0.5:9000": true, "http://s3.test": true, "http://s3.example.test:9000": true,
+	} {
+		if got := plainRemote(endpoint); got != want {
+			t.Errorf("plainRemote(%q) = %v, want %v", endpoint, got, want)
+		}
 	}
 }

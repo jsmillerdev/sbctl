@@ -83,33 +83,50 @@ func diffBucket(cur inventory, listed []Entry, prefix string) (changed []fileSta
 	return changed
 }
 
-// limiter paces the copy: after it lets n bytes through, the next caller waits until n bytes of
-// the rate have gone by. An object bigger than a second of the rate is sent at full speed and the
-// wait comes after it, so the average is right without a burst size to tune.
+// limiter paces the bytes the copy sends: after it lets n bytes through, the next caller waits until
+// n bytes of the rate have gone by. The transport asks for a block of a request's body before it
+// sends it, so the average is right without a burst size to tune.
 type limiter struct {
 	mu    sync.Mutex
 	rate  float64 // bytes per second; zero means no limit
 	free  time.Time
+	bytes int64 // bytes let through while a rate was set
 	now   func() time.Time
 	sleep func(ctx context.Context, d time.Duration) error
 }
 
 func (l *limiter) wait(ctx context.Context, n int64) error {
-	if l == nil || l.rate <= 0 || n <= 0 {
+	if l == nil || n <= 0 {
 		return nil
 	}
 	l.mu.Lock()
+	if l.rate <= 0 {
+		l.mu.Unlock()
+		return nil
+	}
 	now := l.now()
 	start := l.free
 	if start.Before(now) {
 		start = now
 	}
 	l.free = start.Add(time.Duration(float64(n) / l.rate * float64(time.Second)))
+	l.bytes += n
 	l.mu.Unlock()
 	if d := start.Sub(now); d > 0 {
 		return l.sleep(ctx, d)
 	}
 	return nil
+}
+
+// setRate changes the rate (bytes per second; zero lifts the limit) and returns the old one.
+func (l *limiter) setRate(r float64) (old float64) {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	old, l.rate = l.rate, r
+	return old
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {

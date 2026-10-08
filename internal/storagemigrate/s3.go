@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -38,21 +40,31 @@ const (
 
 type s3Bucket struct {
 	c         *s3.Client
+	tr        *pacedTransport
 	bucket    string
 	threshold int64
 	partSize  int64
 }
 
+// pace implements pacer.
+func (b *s3Bucket) pace(l *limiter) { b.tr.lim.Store(l) }
+
 // OpenS3 connects to the bucket with the AWS SDK. The credentials are the key of c, or the
 // temporary credentials of the role it names, renewed before they expire.
 func OpenS3(ctx context.Context, d Destination, c Credentials) (Bucket, error) {
+	return openS3(ctx, d, c, stallAfter, s3Attempts)
+}
+
+func openS3(ctx context.Context, d Destination, c Credentials, stall time.Duration, attempts int) (Bucket, error) {
 	if d.Bucket == "" {
 		return nil, errors.New("storagemigrate: no bucket")
 	}
 	if d.Region == "" {
 		return nil, errors.New("storagemigrate: no region for the bucket")
 	}
-	opts := []func(*config.LoadOptions) error{config.WithRegion(d.Region), config.WithRetryMaxAttempts(s3Attempts)}
+	tr := &pacedTransport{next: awshttp.NewBuildableClient().GetTransport(), stall: stall}
+	opts := []func(*config.LoadOptions) error{config.WithRegion(d.Region), config.WithRetryMaxAttempts(attempts),
+		config.WithHTTPClient(&http.Client{Transport: tr})}
 	switch c.Source {
 	case CredFile, CredConfig:
 		if c.AccessKeyID == "" || c.SecretAccessKey == "" {
@@ -81,7 +93,22 @@ func OpenS3(ctx context.Context, d Destination, c Credentials) (Bucket, error) {
 		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
-	return &s3Bucket{c: cl, bucket: d.Bucket, threshold: singlePutMax, partSize: partSizeMin}, nil
+	return &s3Bucket{c: cl, tr: tr, bucket: d.Bucket, threshold: singlePutMax, partSize: partSizeMin}, nil
+}
+
+// plainRemote says whether endpoint sends the objects and the signed requests unencrypted over a
+// network: http to a host that is not this machine.
+func plainRemote(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	h := u.Hostname()
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return false
+	}
+	ip := net.ParseIP(h)
+	return ip == nil || !ip.IsLoopback()
 }
 
 // roleProvider assumes arn with the node's own credentials (the instance role on AWS) through
