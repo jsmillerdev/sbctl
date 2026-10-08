@@ -235,7 +235,7 @@ EOS
 # --claim-token-file or --join-token-file. The output goes to $LOG_DIR/NODE/install.log; the exit status is
 # install.sh's.
 multi_install() {
-  local n=$1 ip d=$LOG_DIR/$1
+  local n=$1 ip d=$LOG_DIR/$1 rc=0 try
   shift
   ip=$(node_ip "$n")
   mkdir -p "$d"
@@ -243,10 +243,20 @@ multi_install() {
   node_push "$n" "$REPO_ROOT/deploy/install.sh" /root/install.sh 0755
   node_push "$n" "$REPO_ROOT/tests/linux/lib.sh" /root/lib.sh
   printf 'access_key_id=%s\nsecret_access_key=%s\n' "$S3_KEY_ID" "$S3_SECRET" | on "$n" bash -c 'umask 077; cat >/root/s3.cred'
-  on "$n" /root/install.sh --binary /root/supavise --public-ip "$ip" --tls off --email ci@example.com --firewall none \
-    --no-studio --no-os-updates ${MULTI_DOMAIN:+--domain "$MULTI_DOMAIN"} \
-    --s3-endpoint "http://$BRIDGE_IP:$S3_PORT" --s3-bucket "$S3_BUCKET" --s3-prefix "${S3_PREFIX:-$n}" --s3-region us-east-1 \
-    --s3-path-style --s3-credentials-file /root/s3.cred "$@" >"$d/install.log" 2>&1
+  # install.sh is idempotent. The artifact host answers 500 now and then, and the installer does not try again,
+  # so a run that fails on a server error of that host is run once more.
+  for try in 1 2; do
+    rc=0
+    on "$n" /root/install.sh --binary /root/supavise --public-ip "$ip" --tls off --email ci@example.com --firewall none \
+      --no-studio --no-os-updates ${MULTI_DOMAIN:+--domain "$MULTI_DOMAIN"} \
+      --s3-endpoint "http://$BRIDGE_IP:$S3_PORT" --s3-bucket "$S3_BUCKET" --s3-prefix "${S3_PREFIX:-$n}" --s3-region us-east-1 \
+      --s3-path-style --s3-credentials-file /root/s3.cred "$@" >"$d/install.log" 2>&1 || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    grep -q -E 'GET https://[^ ]+: status 5[0-9][0-9]' "$d/install.log" || return $rc
+    log "$n: install.sh failed on a server error of the artifact host; running it once more"
+    cp "$d/install.log" "$d/install-try$try.log"
+  done
+  return $rc
 }
 
 # multi_push_tests NODE: the helpers the replication test runs inside the node, and the environment they read.
