@@ -2,22 +2,27 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/mesh/peerapi"
 )
 
 // TLS modes after resolving tls.mode against the rest of the configuration.
@@ -77,6 +82,22 @@ type certManager struct {
 	base                  string // base domain
 	log                   *slog.Logger
 	wg                    sync.WaitGroup // startup issuance goroutines
+
+	// managing is whether this node obtains and renews certificates. It is false while a follower
+	// mirrors the leader's: nothing is issued then (see certsync.go).
+	managing atomic.Bool
+	// mirror, when set, fetches the leader's store while the node does not manage.
+	mirror *certMirror
+	// mirrored are the mirrored certificates the cache holds as unmanaged ones, by site directory.
+	// CertMagic renews only managed certificates, so a follower's copies are never renewed.
+	mirrorMu sync.Mutex
+	mirrored map[string]mirroredCert
+}
+
+// mirroredCert is a mirrored certificate in the cache: tag identifies its content, hash is its
+// key in the CertMagic cache.
+type mirroredCert struct {
+	name, tag, hash string
 }
 
 // certOptions are the inputs of newCertManager.
@@ -91,6 +112,9 @@ type certOptions struct {
 	// the ACME solvers' ports when we are not on 80 and 443.
 	httpPort, httpsPort int
 	log                 *slog.Logger
+	// follower starts the manager as a mirror of another node's certificates: it issues nothing
+	// until startManaging.
+	follower bool
 }
 
 // managedNames lists the certificates obtained at startup.
@@ -106,7 +130,8 @@ func managedNames(cfg *config.Config, mode string) []string {
 func newCertManager(o certOptions) (*certManager, error) {
 	cfg := o.cfg
 	zl := zapToSlog(o.log)
-	cm := &certManager{mode: o.mode, base: cfg.BaseDomain(), names: managedNames(cfg, o.mode), log: o.log}
+	cm := &certManager{mode: o.mode, base: cfg.BaseDomain(), names: managedNames(cfg, o.mode), log: o.log, mirrored: map[string]mirroredCert{}}
+	cm.managing.Store(!o.follower)
 	cm.cache = certmagic.NewCache(certmagic.CacheOptions{
 		GetConfigForCert: func(c certmagic.Certificate) (*certmagic.Config, error) { return cm.configForNames(c.Names), nil },
 		Logger:           zl,
@@ -155,7 +180,7 @@ func newCertManager(o certOptions) (*certManager, error) {
 		cm.http = certmagic.New(cm.cache, certmagic.Config{
 			Storage:  storage,
 			Logger:   zl,
-			OnDemand: &certmagic.OnDemandConfig{DecisionFunc: o.allow},
+			OnDemand: &certmagic.OnDemandConfig{DecisionFunc: cm.decide(o.allow)},
 		})
 		cm.httpIssuer = certmagic.NewACMEIssuer(cm.http, tmpl)
 		cm.http.Issuers = []certmagic.Issuer{cm.httpIssuer}
@@ -255,6 +280,101 @@ func (cm *certManager) close() {
 	cm.cache.Stop()
 }
 
+// errMirroring is why a follower issues nothing.
+var errMirroring = errors.New("this node mirrors the leader's certificates and obtains none")
+
+// decide wraps the on-demand decision: a node that does not manage refuses every name that has no
+// cached certificate (CertMagic asks only then) and has the mirror look for one at the leader.
+func (cm *certManager) decide(allow func(ctx context.Context, name string) error) func(ctx context.Context, name string) error {
+	return func(ctx context.Context, name string) error {
+		if !cm.managing.Load() {
+			if cm.mirror != nil {
+				cm.mirror.wake()
+			}
+			return errMirroring
+		}
+		return allow(ctx, name)
+	}
+}
+
+// loadMirrored puts the mirrored certificates into the cache as unmanaged ones: it serves them and
+// never renews them, and a renewed certificate of the leader replaces the old one when the mirror
+// brings it. A site that left the store leaves the cache.
+func (cm *certManager) loadMirrored(ctx context.Context, snap peerapi.CertSnapshot) {
+	sites, _ := sitesOf(snap.Files)
+	cm.mirrorMu.Lock()
+	defer cm.mirrorMu.Unlock()
+	if cm.managing.Load() {
+		return // promoted while the fetch ran: startManaging has taken over
+	}
+	seen := make(map[string]bool, len(sites))
+	for _, st := range sites {
+		seen[st.dir] = true
+		tag := certTag(st.crt, st.key)
+		cur, ok := cm.mirrored[st.dir]
+		if ok && cur.tag == tag {
+			continue
+		}
+		hash, err := cm.configFor(st.name).CacheUnmanagedCertificatePEMBytes(ctx, st.crt, st.key, nil)
+		if err != nil {
+			cm.log.Warn("proxy: could not load a mirrored certificate", "name", st.name, "err", err)
+			continue
+		}
+		if ok && cur.hash != hash {
+			cm.cache.Remove([]string{cur.hash})
+		}
+		cm.mirrored[st.dir] = mirroredCert{name: st.name, tag: tag, hash: hash}
+	}
+	for dir, cur := range cm.mirrored {
+		if !seen[dir] {
+			cm.cache.Remove([]string{cur.hash})
+			delete(cm.mirrored, dir)
+		}
+	}
+}
+
+func certTag(crt, key []byte) string {
+	h := sha256.New()
+	h.Write(crt)
+	h.Write([]byte{0})
+	h.Write(key)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// startManaging makes this node the one that obtains and renews: the mirrored certificates become
+// managed ones, loaded from the mirrored tree (with the ACME account the tree holds), and management
+// starts as on a server of its own.
+func (cm *certManager) startManaging(ctx context.Context) error {
+	cm.mirrorMu.Lock()
+	cm.managing.Store(true)
+	for dir, cur := range cm.mirrored {
+		// Out of the cache and the managed copy in at once: CertMagic keeps one entry per content.
+		cm.cache.Remove([]string{cur.hash})
+		if _, err := cm.configFor(cur.name).CacheManagedCertificate(ctx, cur.name); err != nil {
+			cm.log.Warn("proxy: could not take over a mirrored certificate", "name", cur.name, "err", err)
+		}
+		delete(cm.mirrored, dir)
+	}
+	cm.mirrorMu.Unlock()
+	return cm.manage(ctx)
+}
+
+// stopManaging makes this node mirror: the managed certificates leave the cache, which ends their
+// renewal, and the mirror brings the leader's back as unmanaged ones.
+func (cm *certManager) stopManaging(storeDir string) {
+	cm.mirrorMu.Lock()
+	defer cm.mirrorMu.Unlock()
+	cm.managing.Store(false)
+	// Every managed certificate has its site directory in the store.
+	var subjects []certmagic.SubjectIssuer
+	if dirs, err := filepath.Glob(filepath.Join(storeDir, "certificates", "*", "*")); err == nil {
+		for _, d := range dirs {
+			subjects = append(subjects, certmagic.SubjectIssuer{Subject: siteName(filepath.ToSlash(d))})
+		}
+	}
+	cm.cache.RemoveManaged(subjects)
+}
+
 // allowHost is the on-demand issuance gate: a certificate is only ever requested
 // for a host supavise serves. In DNS-01 modes the derived project hosts are covered by
 // the wildcard and are refused here so a broken DNS setup cannot quietly burn
@@ -297,8 +417,8 @@ func (s *Server) allowHost(_ context.Context, name string) error {
 // first, like a handshake would, and does nothing for a name that already has a certificate.
 // Failures are logged; the on-demand path at the first handshake retries.
 func (s *Server) warmCertificates(ctx context.Context, cm *certManager, hosts []string) {
-	if cm.http == nil {
-		return
+	if cm.http == nil || !cm.managing.Load() {
+		return // a follower gets the leader's certificate through the mirror
 	}
 	for _, host := range hosts {
 		if err := s.allowHost(ctx, host); err != nil {
@@ -323,8 +443,8 @@ func (s *Server) warmCertificates(ctx context.Context, cm *certManager, hosts []
 // key of a name we no longer serve stays on disk. Names under the DNS-01 config are skipped: their
 // certificate is the wildcard, which is not theirs to remove.
 func (s *Server) forgetCertificates(ctx context.Context, cm *certManager, hosts []string) {
-	if cm.http == nil {
-		return
+	if cm.http == nil || !cm.managing.Load() {
+		return // a follower's store follows the leader's
 	}
 	for _, host := range hosts {
 		if cm.dnsName(host) && cm.dns != nil {

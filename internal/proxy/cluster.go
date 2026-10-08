@@ -14,6 +14,8 @@ type Cluster struct {
 	// nothing measures it. With [replicas] lb_max_lag_seconds set, the load balancer sends no read to a
 	// replica whose lag is above the limit or unknown.
 	Lag func(identifier string) (d time.Duration, ok bool)
+	// Certs, when set, makes the node mirror the leader's certificates while it follows (see CertSync).
+	Certs *CertSync
 }
 
 func (c *Cluster) self() string {

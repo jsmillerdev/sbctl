@@ -47,6 +47,8 @@ type Server struct {
 
 	mu         sync.Mutex
 	transports map[time.Duration]*http.Transport
+	// wg waits for the certificate role at shutdown.
+	wg sync.WaitGroup
 
 	// resolver and cnameLimit serve Studio's custom-domain DNS pre-check (studio_cname.go).
 	resolver   domains.Resolver
@@ -140,9 +142,11 @@ func (s *Server) Serve(ctx context.Context, httpLn, httpsLn net.Listener) error 
 	)
 	if s.tlsMode != tlsOff {
 		var err error
+		cs := s.certSync()
 		cm, err = newCertManager(certOptions{
 			cfg: s.cfg, mode: s.tlsMode, provider: s.provider, allow: s.allowHost,
 			httpPort: portOf(httpLn), httpsPort: httpsPort, log: s.log,
+			follower: cs != nil && !cs.Role.Managing(),
 		})
 		if err != nil {
 			// No server owns the listeners yet; do not leak them.
@@ -151,6 +155,10 @@ func (s *Server) Serve(ctx context.Context, httpLn, httpsLn net.Listener) error 
 			return err
 		}
 		defer cm.close()
+		if cs != nil {
+			cm.mirror = newCertMirror(s.cfg.Paths().Certs(), cs, s.log)
+			cm.mirror.onSnapshot = cm.loadMirrored
+		}
 		s.table.setRoutesChanged(func(added, removed []string) {
 			s.warmCertificates(ctx, cm, added)
 			s.forgetCertificates(ctx, cm, removed)
@@ -172,7 +180,10 @@ func (s *Server) Serve(ctx context.Context, httpLn, httpsLn net.Listener) error 
 	}()
 	if cm != nil {
 		// After the listeners are up, so HTTP-01 and TLS-ALPN-01 challenges can be answered.
-		if err := cm.manage(ctx); err != nil {
+		if cm.mirror != nil {
+			s.wg.Add(1)
+			go func() { defer s.wg.Done(); s.followCertRole(ctx, cm) }()
+		} else if err := cm.manage(ctx); err != nil {
 			s.log.Error("proxy: certificate management failed to start", "err", err)
 		}
 	}
@@ -185,6 +196,7 @@ func (s *Server) Serve(ctx context.Context, httpLn, httpsLn net.Listener) error 
 	case runErr = <-errc:
 	}
 	cancel()
+	s.wg.Wait()
 	sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer scancel()
 	_ = httpSrv.Shutdown(sctx)
@@ -192,6 +204,42 @@ func (s *Server) Serve(ctx context.Context, httpLn, httpsLn net.Listener) error 
 	// Shutdown leaves hijacked WebSocket connections alone; they end with the process.
 	s.closeTransports()
 	return runErr
+}
+
+// certSync is the certificate role of this node, nil when its certificates are always its own.
+func (s *Server) certSync() *CertSync {
+	if s.cluster == nil || s.cluster.Certs == nil || s.cluster.Certs.Role == nil || s.cluster.Certs.Source == nil {
+		return nil
+	}
+	return s.cluster.Certs
+}
+
+// followCertRole runs the certificate role until ctx ends: while the node manages it obtains and
+// renews as a server on its own does; while it follows it mirrors the leader's store.
+func (s *Server) followCertRole(ctx context.Context, cm *certManager) {
+	endRole := func() {}
+	var running sync.WaitGroup
+	defer func() {
+		endRole()
+		running.Wait()
+	}()
+	for managing := range s.certSync().Role.Watch(ctx) {
+		endRole()
+		running.Wait() // what the old role ran has ended before the new one starts
+		rctx, cancel := context.WithCancel(ctx)
+		endRole = cancel
+		if managing {
+			s.log.Info("proxy: this node obtains and renews the certificates")
+			if err := cm.startManaging(rctx); err != nil {
+				s.log.Error("proxy: certificate management failed to start", "err", err)
+			}
+			continue
+		}
+		s.log.Info("proxy: this node mirrors the leader's certificates")
+		cm.stopManaging(s.cfg.Paths().Certs())
+		running.Add(1)
+		go func() { defer running.Done(); cm.mirror.run(rctx) }()
+	}
 }
 
 func (s *Server) closeTransports() {
