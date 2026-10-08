@@ -218,7 +218,7 @@ A config check refuses `replicas.default = "all"` and any automatic failover mod
 
 | File | Holds |
 |---|---|
-| `/etc/supavise/cluster/` | `node.key` (0600), `node.crt`, `ca.crt`, and `join.json` while a join runs (0600) |
+| `/etc/supavise/cluster/` | `node.key` (0600), `node.crt`, `ca.crt`, `join.json` while a join runs (0600), and `follower.json`, the mark of a server that joined a cluster that already existed (0600) |
 | `/etc/supavise/config.d/` | `10-cluster.toml` (the leader's cluster keys), `20-aws.toml`, `30-storage-s3.toml` (0600) |
 | `<state_dir>/fenced.json` | the record of being fenced or removed, with the peers' addresses |
 | `<state_dir>/failover.json` | a server move on a node whose registry is a standby |
