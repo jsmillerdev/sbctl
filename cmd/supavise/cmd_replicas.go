@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -142,7 +139,7 @@ that [replicas] default = "all" made keeps the default from making it again.`,
 				return fmt.Errorf("%q is not a replica identifier (see `supavise replicas ls`)", args[0])
 			}
 			if !rmYes {
-				if err := confirmRemoval(cmd, fmt.Sprintf("Remove read replica %s?", args[0])); err != nil {
+				if err := confirm(cmd, fmt.Sprintf("Remove read replica %s?", args[0]), "remove"); err != nil {
 					return err
 				}
 			}
@@ -167,19 +164,6 @@ that [replicas] default = "all" made keeps the default from making it again.`,
 	rootCmd.AddCommand(replicasCmd)
 }
 
-// confirmRemoval asks on a terminal, and refuses to guess when stdin is not one.
-func confirmRemoval(cmd *cobra.Command, question string) error {
-	if fi, err := os.Stdin.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
-		return errors.New("nothing was changed; run it again with --yes to remove without being asked")
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s [y/N] ", question)
-	line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
-	if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
-		return errors.New("nothing was changed")
-	}
-	return nil
-}
-
 // leaderOnly says what to do when the registry refuses a write because this node follows.
 func leaderOnly(err error) error {
 	if errors.Is(err, registry.ErrReadOnly) {
@@ -195,6 +179,7 @@ func addReplica(ctx context.Context, w io.Writer, re *replicasEnv, ref, region, 
 	if err != nil {
 		return err
 	}
+	nodeID := node // the id of the node, when one is named
 	if node == "" {
 		err = re.svc.Setup(ctx, ref, region)
 	} else {
@@ -203,8 +188,11 @@ func addReplica(ctx context.Context, w io.Writer, re *replicasEnv, ref, region, 
 			return lerr
 		}
 		i := slices.IndexFunc(nodes, func(n registry.Node) bool { return n.ID == node || n.Name == node })
-		if i >= 0 && replicaid.Region(nodes[i]) != region {
-			return fmt.Errorf("node %s is in %s, not in %s", node, replicaid.Region(nodes[i]), region)
+		if i >= 0 {
+			nodeID = nodes[i].ID
+			if replicaid.Region(nodes[i]) != region {
+				return fmt.Errorf("node %s is in %s, not in %s", node, replicaid.Region(nodes[i]), region)
+			}
 		}
 		err = re.svc.SetupOn(ctx, ref, node)
 	}
@@ -215,8 +203,12 @@ func addReplica(ctx context.Context, w io.Writer, re *replicasEnv, ref, region, 
 	if err != nil {
 		return err
 	}
+	// With [replicas] default = "all" the daemon can make rows between the two listings, so the new
+	// row is the one this request would make: manual, on the named node or in the region, and not
+	// there before.
 	for _, r := range after {
-		if !slices.ContainsFunc(before, func(b replicas.Replica) bool { return b.Identifier == r.Identifier }) {
+		made := r.Origin == registry.ReplicaManual && !slices.ContainsFunc(before, func(b replicas.Replica) bool { return b.Identifier == r.Identifier })
+		if made && (node == "" && r.Region == region || node != "" && r.NodeID == nodeID) {
 			fmt.Fprintf(w, "requested %s on node %s; the setup runs in the background (supavise replicas ls %s)\n", r.Identifier, r.NodeID, ref)
 			return nil
 		}

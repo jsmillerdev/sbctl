@@ -13,6 +13,7 @@ import (
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
+	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
 
 const replicaTestRef = "aaaaaaaaaaaaaaaaaaaa"
@@ -143,6 +144,48 @@ func TestReplicasRmAsksFirst(t *testing.T) {
 	if r, _ := reg.GetReplica(context.Background(), rs[0].Identifier); r.Status == string(registry.StatusGoingDown) {
 		t.Fatal("removed without being confirmed")
 	}
+}
+
+// While the command waits, the daemon can make rows of its own (the default replicas). The command
+// prints the identifier of the row its request made, not the first new one it finds.
+func TestReplicasAddPrintsItsOwnRow(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	ctx := context.Background()
+	re, err := openReplicas(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n3, _ := reg.GetNode(ctx, "n3")
+	re.svc = beforeSetup{Service: re.svc, do: func() {
+		if _, err := replicaid.Create(ctx, reg, replicaTestRef, *n3, registry.ReplicaDefault, nil); err != nil {
+			t.Error(err)
+		}
+	}}
+	var out strings.Builder
+	if err := addReplica(ctx, &out, re, replicaTestRef, "eu-west-1", ""); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := reg.ListReplicas(ctx, replicaTestRef)
+	var manual registry.Replica
+	for _, r := range rs {
+		if r.Origin == registry.ReplicaManual {
+			manual = r
+		}
+	}
+	if len(rs) != 2 || manual.NodeID != "n2" || !strings.Contains(out.String(), "requested "+manual.Identifier+" on node n2") {
+		t.Fatalf("rows %+v, printed %q", rs, out.String())
+	}
+}
+
+// beforeSetup runs do just before the request it wraps.
+type beforeSetup struct {
+	replicas.Service
+	do func()
+}
+
+func (b beforeSetup) Setup(ctx context.Context, ref, region string) error {
+	b.do()
+	return b.Service.Setup(ctx, ref, region)
 }
 
 func TestStepText(t *testing.T) {
