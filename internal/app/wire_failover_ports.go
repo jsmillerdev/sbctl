@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,9 +64,10 @@ func (t *handoffTakeover) BecomeLeader(ctx context.Context, epoch int64) error {
 	return fmt.Errorf("%w: the daemon restarts as the leader and finishes the move", ErrRoleChanged)
 }
 
-// notify delivers the orchestrator's alerts, except the failure of a move this process handed over.
+// notify delivers the orchestrator's alerts, except the failure of a move that ended because this
+// process handed it over. A failure of the same move for another reason is announced.
 func (t *handoffTakeover) notify(ctx context.Context, ev alerts.Event) {
-	if t.handing.Load() && ev.Kind == alerts.KindFailoverFailed {
+	if t.handing.Load() && ev.Kind == alerts.KindFailoverFailed && strings.Contains(ev.Detail, ErrRoleChanged.Error()) {
 		t.log.Info("the move continues in the daemon that restarts as the leader; no failure is announced", "detail", ev.Detail)
 		return
 	}

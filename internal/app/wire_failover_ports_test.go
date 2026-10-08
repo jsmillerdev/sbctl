@@ -49,20 +49,24 @@ func TestHandoffTakeover(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	cancel() // the daemon is stopping
-	if err := <-done; !errors.Is(err, ErrRoleChanged) {
+	err := <-done
+	if !errors.Is(err, ErrRoleChanged) {
 		t.Fatalf("BecomeLeader = %v, want ErrRoleChanged", err)
 	}
-	tk.notify(context.Background(), alerts.Event{Kind: alerts.KindFailoverFailed, Detail: "waiting for n2 to run as the leader"})
+	handed := "The failover of server from n1 to n2 stopped after promote-system: waiting for n2 to run as the leader: " + err.Error()
+	tk.notify(context.Background(), alerts.Event{Kind: alerts.KindFailoverFailed, Detail: handed})
 	tk.notify(context.Background(), alerts.Event{Kind: alerts.KindFailoverStarted})
 	tk.notify(context.Background(), alerts.Event{Kind: alerts.KindFenced})
-	if len(sent) != 2 || sent[0].Kind != alerts.KindFailoverStarted || sent[1].Kind != alerts.KindFenced {
+	// The same move failing for another reason is a failure.
+	tk.notify(context.Background(), alerts.Event{Kind: alerts.KindFailoverFailed, Detail: "demoting n1: the node does not answer"})
+	if len(sent) != 3 || sent[0].Kind != alerts.KindFailoverStarted || sent[1].Kind != alerts.KindFenced || sent[2].Kind != alerts.KindFailoverFailed {
 		t.Fatalf("alerts sent: %+v; the failure of a handed-over move must not go out, and nothing else is held back", sent)
 	}
 
 	// A process that never handed anything over passes the failure on.
 	sent = nil
 	plain := &handoffTakeover{m: memberOf(cluster.RoleLeader, 6), log: quiet(), deliver: tk.deliver}
-	plain.notify(context.Background(), alerts.Event{Kind: alerts.KindFailoverFailed})
+	plain.notify(context.Background(), alerts.Event{Kind: alerts.KindFailoverFailed, Detail: handed})
 	if len(sent) != 1 {
 		t.Fatalf("alerts sent: %+v", sent)
 	}
