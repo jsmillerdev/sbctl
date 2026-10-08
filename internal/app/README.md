@@ -82,9 +82,17 @@ is the daemon that `supavise.service` runs.
 - `Serve` does not supervise: a crashed project unit is systemd's to restart (`Restart=on-failure`)
   and shows as unhealthy through `Health`.
 - The base backup a replica starts from is taken by the leader's backup service. For a project homed on
-  a follower the home node would take it, and it records the backup in its registry copy, which is
-  read-only there, so a replica of such a project cannot be set up until backups taken on another node
-  are recorded by the leader (`backup.Options.TakeBase` and `placement.BackupOps` are not connected).
+  a follower the home node would take it, and its backup service records the backup in its registry
+  copy, which is read-only there. Connecting `backup.Options.TakeBase` to `placement.BackupOps` here
+  would therefore fail at the home node, so a replica of such a project cannot be set up until the
+  backup package takes a base backup that the leader records (the home node writes the manifest to the
+  store, the leader writes the registry row) and `wireReplicas`' `baseBackups` is given a `TakeBase`
+  that calls `BackupOps.BaseBackup` on the project's home. A restore, an upgrade backup and a final
+  backup of a project homed on a follower are refused by the leader's Engine; routing them through `placement.BackupOps` is the same follow-up.
+- `supavise node join`, `node rejoin` and `install --join-token-file` cannot complete: `seedSystemStandby`
+  and `seedPreflight` (`cmd/supavise/cmd_node.go`) return `notimpl.Err`, because nothing in the tree builds
+  a joining server's standby of the system cluster (`backup.SeedReplica`, then the replica unit of
+  `lifecycle`). The cluster commands that remain stubs are those two functions.
 - The commands of the CLI that open the node (`openNode`, `openOptions`) open the registry as a
   leader's; a follower needs the read-only open that `openFollower` gives the daemon.
 - A server move that the restart interrupts is finished by the daemon that starts as the leader, without
