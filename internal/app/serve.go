@@ -409,15 +409,17 @@ func refreshSystem(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 		log.Warn("system cluster not refreshed", "error", err)
 		return
 	}
-	if err := n.Plane.StartDatabase(ctx, p, keys); err != nil {
-		log.Warn("system cluster not refreshed", "error", err)
-		return
-	}
 	// The dashboard's sign-in service gets the same treatment: a node upgraded to a version that
 	// turns on dashboard SSO (SAML key, the sign-up hook) or a changed [mail] section renders
-	// new files, and the unit is restarted only when they differ.
-	if err := n.Plane.RefreshSystemAuth(ctx, p, keys); err != nil {
+	// new files, and the unit is restarted only when they differ. When the cluster itself restarts
+	// the sign-in service goes down with it and is started again.
+	var re *lifecycle.SystemRefreshError
+	switch err := n.Plane.RefreshSystem(ctx, p, keys); {
+	case err == nil:
+	case errors.As(err, &re) && re.Auth:
 		log.Warn("the dashboard's sign-in service is not refreshed; run `supavise system init` to apply its settings", "error", err)
+	default:
+		log.Warn("system cluster not refreshed", "error", err)
 	}
 }
 
