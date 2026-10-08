@@ -153,6 +153,9 @@ type Converger struct {
 	Revision int
 	// Version is the release, recorded in the marker for people.
 	Version string
+	// NoMarker leaves the marker alone: a run that did not take every step of the host (the unit
+	// files of a test directory) has not converged it.
+	NoMarker bool
 	// Out receives what each step changed, one line each. Nil discards it.
 	Out io.Writer
 	// Activate runs once after the steps and gets what they did together: it re-reads systemd's
@@ -208,8 +211,8 @@ func (c *Converger) markerResult() Result {
 
 // Run applies every step, whether its check found something or not (each step checks for itself),
 // then records the revision. Every step runs even if an earlier one failed, so that one broken
-// step does not hold back the rest; the marker is written only when none failed. The returned
-// error joins the steps' errors.
+// step does not hold back the rest; the marker is written only when none failed (and NoMarker is
+// not set). The returned error joins the steps' errors.
 func (c *Converger) Run(ctx context.Context) ([]Result, error) {
 	var (
 		results []Result
@@ -246,7 +249,7 @@ func (c *Converger) Run(ctx context.Context) ([]Result, error) {
 		}
 	}
 	mr := c.markerResult()
-	if len(errs) == 0 && mr.Pending {
+	if len(errs) == 0 && mr.Pending && !c.NoMarker {
 		now := time.Now
 		if c.Now != nil {
 			now = c.Now

@@ -165,7 +165,7 @@ which is how a node reaches this command from a release that does not know it.`,
 	for _, c := range []*cobra.Command{converge, install} {
 		c.Flags().BoolVar(&convergeCheck, "check", false, "change nothing: print, for every step, whether it has something to do (needs no root)")
 		c.Flags().BoolVar(&convergeJSON, "json", false, "print the steps as JSON")
-		c.Flags().StringVar(&sysUnitDir, "unit-dir", defaultUnitDir, "where to write unit files; any other directory is a test: only the units are installed there, and nothing is reloaded")
+		c.Flags().StringVar(&sysUnitDir, "unit-dir", defaultUnitDir, "where to write unit files; any other directory is a test: only the units are installed there, nothing is reloaded and the host is not marked converged")
 		c.Flags().StringVar(&sysPolkitDir, "polkit-dir", "/etc/polkit-1/rules.d", "where to write the polkit rule (empty skips it)")
 	}
 

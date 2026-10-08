@@ -58,7 +58,8 @@ func TestConvergeCommandsAreRegistered(t *testing.T) {
 }
 
 // `install-units` is converge: what an older `supavise upgrade` runs on the new binary right after
-// the swap installs the units and records the revision.
+// the swap installs the units. In a test directory it takes the unit files and leaves the node's
+// marker alone: only a run that took every step of the host may say the host is converged.
 func TestInstallUnitsRunsConverge(t *testing.T) {
 	cfg, units, state := convergeNode(t)
 	args := []string{"--config", cfg, "system", "install-units", "--unit-dir", units, "--polkit-dir", "", "--check=false", "--json=false"}
@@ -66,20 +67,19 @@ func TestInstallUnitsRunsConverge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	if !strings.Contains(out, "installed "+filepath.Join(units, "supavise.service")) || !strings.Contains(out, "recorded converge revision") {
+	if !strings.Contains(out, "installed "+filepath.Join(units, "supavise.service")) || strings.Contains(out, "recorded") {
 		t.Errorf("output:\n%s", out)
 	}
-	m, err := hostsetup.ReadMarker(state)
-	if err != nil || m.Revision != hostsetup.Revision {
-		t.Fatalf("marker = %+v, %v", m, err)
+	if _, err := os.Stat(hostsetup.MarkerPath(state)); err == nil {
+		t.Error("a test directory marked the host converged")
 	}
 	// Again: nothing changes.
 	out, err = runRoot(t, args...)
-	if err != nil || !strings.Contains(out, "units are up to date") || !strings.Contains(out, "host is converged") || strings.Contains(out, "recorded") {
+	if err != nil || !strings.Contains(out, "units are up to date") || strings.Contains(out, "host is converged") {
 		t.Errorf("second run: %v\n%s", err, out)
 	}
 	// converge is the same thing under its own name.
-	if out, err := runRoot(t, "--config", cfg, "system", "converge", "--unit-dir", units, "--polkit-dir", "", "--check=false", "--json=false"); err != nil || !strings.Contains(out, "host is converged") {
+	if out, err := runRoot(t, "--config", cfg, "system", "converge", "--unit-dir", units, "--polkit-dir", "", "--check=false", "--json=false"); err != nil || !strings.Contains(out, "units are up to date") {
 		t.Errorf("converge: %v\n%s", err, out)
 	}
 }
@@ -122,9 +122,10 @@ func TestConvergeCheckJSON(t *testing.T) {
 	if out, err := runRoot(t, "--config", cfg, "system", "converge", "--unit-dir", units, "--polkit-dir", "", "--check=false", "--json=false"); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
+	// The unit files are in place; the marker is the real host's to write, and a test directory does not.
 	for _, r := range check() {
-		if r["pending"].(bool) {
-			t.Errorf("pending after a converge: %v", r)
+		if r["pending"].(bool) != (r["id"] == "marker") {
+			t.Errorf("after a converge into a test directory: %v", r)
 		}
 	}
 }
@@ -182,7 +183,8 @@ func TestPendingStepsOfTheHostStatus(t *testing.T) {
 	if _, err := c.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := pending(); len(got) != 0 {
-		t.Errorf("after: %v", got)
+	// A test directory takes the unit files only and leaves the marker to the real host.
+	if got := strings.Join(pending(), ","); got != "marker" {
+		t.Errorf("after: %s", got)
 	}
 }

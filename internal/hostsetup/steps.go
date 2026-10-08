@@ -101,10 +101,12 @@ func DefaultSteps(o Options) []Step {
 	return steps
 }
 
-// Titles are the titles of the steps of this release, in order: the release's host_changes.
+// Titles are the titles of the steps of this release, in order: the release's host_changes. The
+// cluster-settings step is not among them: a node has it only when it is in a cluster, which a
+// release cannot know, and a single server's plan must not list a step it never runs.
 func Titles() []string {
 	var out []string
-	for _, s := range DefaultSteps(Options{ConfigSync: noSync{}}) {
+	for _, s := range DefaultSteps(Options{}) {
 		out = append(out, s.Title())
 	}
 	return out
@@ -520,10 +522,6 @@ type ConfigSyncer interface {
 	// dryRun only reports. It returns the files it changed (or would change).
 	Sync(ctx context.Context, dryRun bool) (changed []string, err error)
 }
-
-type noSync struct{}
-
-func (noSync) Sync(context.Context, bool) ([]string, error) { return nil, nil }
 
 func configSyncStep(o Options) Step {
 	return &funcStep{

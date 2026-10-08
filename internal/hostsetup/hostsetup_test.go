@@ -475,6 +475,24 @@ func TestFailedStepLeavesNoMarker(t *testing.T) {
 	}
 }
 
+// A run that is told not to record (a test directory took the unit files only) changes the steps
+// and leaves the node's marker where it was.
+func TestNoMarkerLeavesTheMarkerAlone(t *testing.T) {
+	dir := t.TempDir()
+	var applied []string
+	c := &Converger{Steps: []Step{okStep{"a", &applied}}, StateDir: dir, NoMarker: true}
+	res, err := c.Run(context.Background())
+	if err != nil || strings.Join(applied, "") != "a" {
+		t.Fatalf("%v, applied %v", err, applied)
+	}
+	if _, err := os.Stat(MarkerPath(dir)); err == nil {
+		t.Error("the marker was written")
+	}
+	if last := res[len(res)-1]; last.ID != MarkerID || !last.Pending || len(last.Changed) != 0 {
+		t.Errorf("marker result = %+v", last)
+	}
+}
+
 func TestCheckReportsAStepThatCannotBeChecked(t *testing.T) {
 	c := &Converger{StateDir: t.TempDir(), Steps: []Step{&funcStep{id: "x", title: "X", check: func(context.Context) (Pending, error) {
 		return Pending{}, errors.New("no way to tell")
@@ -536,19 +554,28 @@ func TestMarker(t *testing.T) {
 	}
 }
 
-// The titles are what the release calls its host changes: stable, one per step, no duplicates.
+type noSync struct{}
+
+func (noSync) Sync(context.Context, bool) ([]string, error) { return nil, nil }
+
+// The titles are what the release calls its host changes: stable, one per step, no duplicates. The
+// cluster-settings step is in the step list of a node that has a syncer, and not in the release's list.
 func TestTitles(t *testing.T) {
 	titles := Titles()
-	want := []string{titleUnits, titleDirectories, titleMounts, titleUFW, titleConfigD}
+	want := []string{titleUnits, titleDirectories, titleMounts, titleUFW}
 	if strings.Join(titles, "|") != strings.Join(want, "|") {
 		t.Errorf("titles = %q", titles)
 	}
 	seen := map[string]bool{}
-	for _, s := range DefaultSteps(Options{ConfigSync: noSync{}}) {
+	steps := DefaultSteps(Options{ConfigSync: noSync{}})
+	for _, s := range steps {
 		if seen[s.ID()] {
 			t.Errorf("duplicate step id %s", s.ID())
 		}
 		seen[s.ID()] = true
+	}
+	if last := steps[len(steps)-1]; last.Title() != titleConfigD {
+		t.Errorf("a node with a syncer ends its steps with %q, not %q", titleConfigD, last.Title())
 	}
 }
 

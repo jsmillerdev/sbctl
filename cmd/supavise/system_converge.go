@@ -57,7 +57,7 @@ func runConverge(cmd *cobra.Command, check, asJSON bool) error {
 	if err != nil {
 		return err
 	}
-	if !asJSON && len(changedLines(rs)) == 0 {
+	if !asJSON && !sandbox && len(changedLines(rs)) == 0 {
 		fmt.Fprintf(out, "host is converged (revision %d)\n", hostsetup.Revision)
 	}
 	return nil
@@ -116,7 +116,9 @@ func newConverger(cfg *config.Config, unitDir, polkitDir string, sandbox bool, o
 		o.Owner, o.PeerPort = nil, 0
 		o.MountInfo = func() ([]byte, error) { return nil, errors.New("not read in a test directory") }
 	}
-	c := &hostsetup.Converger{Steps: hostsetup.DefaultSteps(o), StateDir: cfg.StateDir, Version: version, Out: out}
+	// A test directory takes the unit files and nothing else, so it must not record that the host is
+	// converged: the node's marker is the daemon's word on the real host.
+	c := &hostsetup.Converger{Steps: hostsetup.DefaultSteps(o), StateDir: cfg.StateDir, Version: version, Out: out, NoMarker: sandbox}
 	if !sandbox {
 		c.Activate = func(ctx context.Context, done hostsetup.Outcome) error {
 			return activateUnits(ctx, cfg, done, out, errOut)
