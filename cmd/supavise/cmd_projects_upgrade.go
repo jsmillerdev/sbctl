@@ -87,31 +87,49 @@ func changesText(el *lifecycle.UpgradeEligibility) string {
 	return strings.Join(parts, ", ")
 }
 
+// selectProjects returns the user projects named by refs, in registry order, or every user project
+// when refs is empty. A ref that names no project is an error. The system project is never
+// selected.
+func selectProjects(ps []registry.Project, refs []string) ([]*registry.Project, error) {
+	want := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		want[r] = true
+	}
+	found := make(map[string]bool, len(refs))
+	var out []*registry.Project
+	for i := range ps {
+		p := &ps[i]
+		if p.Ref == config.SystemRef || (len(want) > 0 && !want[p.Ref]) {
+			continue
+		}
+		found[p.Ref] = true
+		out = append(out, p)
+	}
+	for _, r := range refs {
+		if !found[r] {
+			return nil, fmt.Errorf("project %s: %w", r, registry.ErrNotFound)
+		}
+	}
+	return out, nil
+}
+
 // upgradeRows computes the eligibility of every user project (or of refs).
 func upgradeRows(ctx context.Context, n *lifecycle.Node, refs []string, req lifecycle.UpgradeRequest) ([]upgradeRow, error) {
 	ps, err := n.Registry.ListProjects(ctx)
 	if err != nil {
 		return nil, err
 	}
-	want := map[string]bool{}
-	for _, r := range refs {
-		want[r] = true
+	selected, err := selectProjects(ps, refs)
+	if err != nil {
+		return nil, err
 	}
-	var rows []upgradeRow
-	for i := range ps {
-		p := &ps[i]
-		if p.Ref == config.SystemRef || (len(want) > 0 && !want[p.Ref]) {
-			continue
-		}
-		delete(want, p.Ref)
+	rows := make([]upgradeRow, 0, len(selected))
+	for _, p := range selected {
 		el, err := n.Engine.UpgradeEligibilityFor(ctx, p.Ref, req)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", p.Ref, err)
 		}
 		rows = append(rows, upgradeRow{Project: p, El: el})
-	}
-	for r := range want {
-		return nil, fmt.Errorf("project %s: %w", r, registry.ErrNotFound)
 	}
 	return rows, nil
 }

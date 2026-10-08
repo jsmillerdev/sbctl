@@ -1,10 +1,14 @@
 package main
 
 import (
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 func TestProjectsUpgradeCommandsAreRegistered(t *testing.T) {
@@ -67,6 +71,39 @@ func TestUpgradeRequestFromFlags(t *testing.T) {
 		upTo = []string{bad}
 		if _, err := upgradeRequest(); err == nil {
 			t.Errorf("--to %q was accepted", bad)
+		}
+	}
+}
+
+// Naming a project selects that project and no other, whatever its place in the registry: the
+// first ref found used to empty the wanted set, which then let every later project through, so
+// `projects upgrade <ref>` upgraded the projects registered after <ref> too.
+func TestSelectProjectsNamesOnlyTheRef(t *testing.T) {
+	ps := []registry.Project{{Ref: config.SystemRef}, {Ref: "aaa"}, {Ref: "bbb"}, {Ref: "ccc"}}
+	refsOf := func(sel []*registry.Project) []string {
+		var out []string
+		for _, p := range sel {
+			out = append(out, p.Ref)
+		}
+		return out
+	}
+	for _, c := range []struct {
+		refs, want []string
+	}{
+		{[]string{"aaa"}, []string{"aaa"}},
+		{[]string{"bbb"}, []string{"bbb"}},
+		{[]string{"ccc"}, []string{"ccc"}},
+		{[]string{"ccc", "aaa"}, []string{"aaa", "ccc"}},
+		{nil, []string{"aaa", "bbb", "ccc"}},
+	} {
+		sel, err := selectProjects(ps, c.refs)
+		if err != nil || !slices.Equal(refsOf(sel), c.want) {
+			t.Errorf("refs %v: selected %v, %v; want %v", c.refs, refsOf(sel), err, c.want)
+		}
+	}
+	for _, refs := range [][]string{{"zzz"}, {"aaa", "zzz"}, {config.SystemRef}} {
+		if _, err := selectProjects(ps, refs); !errors.Is(err, registry.ErrNotFound) {
+			t.Errorf("refs %v: err = %v, want not found", refs, err)
 		}
 	}
 }
