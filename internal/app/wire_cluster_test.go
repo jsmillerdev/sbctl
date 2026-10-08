@@ -1,7 +1,9 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -169,3 +171,19 @@ var (
 	_ failover.Takeover = (*handoffTakeover)(nil)
 	_ failover.Locker   = (*projectLocker)(nil)
 )
+
+// A feature that is off says so in the log, with the reason, at a level an operator sees.
+func TestOffIsLoggedWithItsReason(t *testing.T) {
+	var buf bytes.Buffer
+	w := testWire(t)
+	w.Log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	w.Off("failover.LocalServices", "the shared services run under systemd; this node's supervisor is exec")
+	for _, want := range []string{"level=WARN", "cluster feature off", "failover.LocalServices", "the shared services run under systemd"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("the log lacks %q: %s", want, buf.String())
+		}
+	}
+	if r, ok := w.offReason("failover.LocalServices"); !ok || r == "" {
+		t.Fatal("the reason was not recorded")
+	}
+}
