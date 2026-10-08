@@ -73,8 +73,8 @@ type LeaderMarker struct {
 	At     time.Time `json:"at"`
 }
 
-// ErrMarkerNewer is returned by WriteLeaderMarker when the store already holds a higher epoch:
-// someone else was promoted first, and the writer must stop.
+// ErrMarkerNewer is returned by WriteLeaderMarker when the store already holds a higher epoch, or
+// the same epoch under another leader: someone else was promoted first, and the writer must stop.
 var ErrMarkerNewer = errors.New("backup: the leader marker holds a higher epoch")
 
 // EpochMarkerStore reads and writes the leader marker.
@@ -82,8 +82,10 @@ type EpochMarkerStore interface {
 	// ReadLeaderMarker returns the marker, or nil with no error when none was written.
 	ReadLeaderMarker(ctx context.Context) (*LeaderMarker, error)
 	// WriteLeaderMarker stores m. It is a conditional write where the store supports one and a
-	// read followed by a plain write otherwise; either way it returns ErrMarkerNewer, and writes
-	// nothing, when the stored epoch is higher than m.Epoch.
+	// read followed by a plain write otherwise; either way it returns an error wrapping
+	// ErrMarkerNewer, and writes nothing, when the stored epoch is higher than m.Epoch or equal
+	// to it under another leader. The same epoch under the same leader is written again. A zero
+	// m.At is the time of the call.
 	WriteLeaderMarker(ctx context.Context, m LeaderMarker) error
 }
 

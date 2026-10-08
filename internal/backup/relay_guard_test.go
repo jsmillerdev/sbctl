@@ -142,6 +142,19 @@ func TestRelayPromoteOKMustHoldTheCurrentEpoch(t *testing.T) {
 	}
 }
 
+// A promote.ok that exists but cannot be read is no authorization either, and says why.
+func TestRelayRefusesWhenPromoteOKCannotBeRead(t *testing.T) {
+	g := newGuardEnv(t, testRef)
+	g.set(func() { g.replicas[testRef] = true })
+	if err := os.MkdirAll(g.cfg.Paths().PromoteOK(testRef), 0o755); err != nil { // a directory is not a file
+		t.Fatal(err)
+	}
+	err := RelayPush(context.Background(), g.sock(testRef), testRef, writeWAL(t, walA, 1<<10, 1))
+	if !errors.Is(err, ErrPushRefused) || !strings.Contains(err.Error(), "cannot be read") {
+		t.Fatalf("push with an unreadable promote.ok = %v", err)
+	}
+}
+
 func TestRelayGuardLeavesPrimariesAlone(t *testing.T) {
 	g := newGuardEnv(t, testRef, testRef2)
 	g.set(func() { g.replicas[testRef2] = true }) // testRef is homed here, testRef2 is a replica

@@ -521,8 +521,11 @@ func (r *Relay) pushGuard(ctx context.Context, ref string) (int, error) {
 		return http.StatusPreconditionFailed, err
 	}
 	b, err := os.ReadFile(r.opt.PromoteOK(ref))
-	if err != nil {
+	if errors.Is(err, fs.ErrNotExist) {
 		return refuse("this node holds a replica of %s, which archives WAL only after its promotion (no promote.ok)", ref)
+	}
+	if err != nil {
+		return refuse("this node holds a replica of %s and its promote.ok cannot be read: %v", ref, err)
 	}
 	have, err := ParsePromoteOK(b)
 	if err != nil {
