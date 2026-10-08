@@ -338,6 +338,9 @@ func TestPaging(t *testing.T) {
 }
 
 func TestSecretsAndEnvironment(t *testing.T) {
+	// Variables that would keep the client off the instance role are cleared by SetEnv.
+	t.Setenv(awsapi.EnvNoInstanceRole, "1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 	fake := awsfake.New(t)
 	fake.AddSecret(awsfake.Secret{Name: "supavise/storage", String: `{"access_key_id":"AK"}`})
 	fake.AddSecret(awsfake.Secret{Name: "blob", Binary: []byte{1, 2, 3}})

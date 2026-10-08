@@ -23,7 +23,7 @@ tags, err := c.IMDS.Tags(ctx)                  // supavise:cluster, supavise:inf
 | `StaticCredentials(c)` | `c` |
 | `(*STS).RoleCredentials(in)` | the credentials of an assumed role, cached; give it to a second client's `Config.Credentials` to call AWS as that role |
 
-`AWS_EC2_METADATA_DISABLED=true` turns the metadata service off for every client, so the instance role is never used; a tool that must act with the operator's credentials can set it. A `Credentials` value prints only its access key id, and a `SecretValue` prints only its name.
+`SUPAVISE_AWS_NO_INSTANCE_ROLE=1` (or `Config.NoInstanceRole`) turns off the instance role alone: the default credentials are the `AWS_*` variables and nothing else, and `IMDS.InstanceID`, `Region`, `AvailabilityZone`, `LocalIPv4`, `PublicIPv4` and `Tags` keep working. A tool that must act with the operator's credentials sets it and can still ask which instance it runs on. `AWS_EC2_METADATA_DISABLED=true` is the stronger switch: it turns the metadata service off for every client, the identity reads included. Neither stops a caller from building `IMDSCredentials` itself. A `Credentials` value prints only its access key id, and a `SecretValue` prints only its name.
 
 ## Region and endpoints
 
@@ -92,7 +92,7 @@ fake.Order()                    // ["ec2:DescribeInstances", "ec2:StopInstances"
 
 | Method | Does |
 |---|---|
-| `SetEnv(t)` | sets the endpoint variables and the region, and clears the credential variables, so the client reaches the fake and takes the instance role from its metadata service |
+| `SetEnv(t)` | sets the endpoint variables and the region, and clears the credential variables and the two metadata switches, so the client reaches the fake and takes the instance role from its metadata service |
 | `Config()`, `Client()` | a configuration or client for the fake that ignores the real environment |
 | `Calls()`, `Order(services...)` | every call in arrival order, with its fields, the access key that signed it and the status and code the fake answered with; `Order` gives `"ec2:StopInstances"` or `"ec2:StopInstances(dryrun)"` and leaves out the metadata service unless asked |
 | `AddInstance`, `UpdateInstance`, `InstanceState` | instances; `StopPolls` is the number of describe calls that still see `stopping` after a stop, and `StopNeedsForce` keeps an instance at `stopping` until a stop with `Force` |
@@ -115,7 +115,7 @@ What it does not model: IAM policy evaluation (use `Deny`), tag-scoped resources
 - `AssociateAddress` after a lost answer: success on the named target, an error elsewhere, no check on a first answer;
 - replies parsed from XML and JSON fixtures in `testdata/` shaped like the API reference examples;
 - the `DryRun` mapping, error parsing, retries (throttle codes, the jittered schedule and its bounds), a cancelled context and endpoint and region resolution;
-- the credential chain, the cache, the instance-role path and `AWS_EC2_METADATA_DISABLED`;
+- the credential chain, the cache, the instance-role path, `AWS_EC2_METADATA_DISABLED` and the role-only switch;
 - the metadata service token flow, with an expired token and a refused one, and the memo of a service that does not answer;
 - the fake: the order of the fencing sequence, a stop that needs `Force`, address moves and replacement, `Deny`, signature checks and paging.
 

@@ -152,14 +152,14 @@ func (s *Server) Env() map[string]string {
 	}
 }
 
-// SetEnv sets Env for the test and clears the variables that would give the client credentials
-// or turn the metadata service off.
+// SetEnv sets Env for the test and clears the variables that would give the client credentials,
+// turn the metadata service off or keep the client from using the instance role.
 func (s *Server) SetEnv(t testing.TB) {
 	t.Helper()
 	for k, v := range s.Env() {
 		t.Setenv(k, v)
 	}
-	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION", "AWS_EC2_METADATA_DISABLED"} {
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION", "AWS_EC2_METADATA_DISABLED", awsapi.EnvNoInstanceRole} {
 		t.Setenv(k, "")
 	}
 }

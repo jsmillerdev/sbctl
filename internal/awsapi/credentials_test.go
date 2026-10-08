@@ -173,3 +173,90 @@ func TestInstanceWithoutARoleLeavesNoCredentials(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 }
+
+// The role-only switch leaves the environment as the one source of credentials and the metadata
+// service as the source of identity.
+func TestNoInstanceRoleKeepsTheIdentityReads(t *testing.T) {
+	setups := map[string]func(*awsapi.Config){
+		"Config.NoInstanceRole": func(c *awsapi.Config) { c.NoInstanceRole = true },
+		"=1":                    func(c *awsapi.Config) { c.Getenv = envOf(map[string]string{awsapi.EnvNoInstanceRole: "1"}) },
+		"=true":                 func(c *awsapi.Config) { c.Getenv = envOf(map[string]string{awsapi.EnvNoInstanceRole: " TRUE "}) },
+	}
+	for name, setup := range setups {
+		t.Run(name, func(t *testing.T) {
+			fake := awsfake.New(t)
+			d := fake.IMDS()
+			d.Tags = map[string]string{"supavise:cluster": "prod"}
+			fake.SetIMDS(d)
+			cfg := fake.Config()
+			cfg.Region = ""
+			setup(&cfg)
+			c := newClient(t, cfg)
+
+			// No role credentials: a call has none to sign with and says why.
+			_, err := c.EC2.DescribeInstances(ctx, awsapi.DescribeInstancesInput{})
+			if !errors.Is(err, awsapi.ErrNoCredentials) || !strings.Contains(err.Error(), awsapi.EnvNoInstanceRole) {
+				t.Errorf("EC2 call: %v", err)
+			}
+			if _, err := awsapi.DefaultCredentials(envOf(map[string]string{awsapi.EnvNoInstanceRole: "1"}), c.IMDS, time.Now).Retrieve(ctx); !errors.Is(err, awsapi.ErrNoCredentials) {
+				t.Errorf("DefaultCredentials: %v", err)
+			}
+
+			// The identity reads work, the region among them.
+			id, idErr := c.IMDS.InstanceID(ctx)
+			region, regionErr := c.Region(ctx)
+			az, azErr := c.IMDS.AvailabilityZone(ctx)
+			tags, tagsErr := c.IMDS.Tags(ctx)
+			if idErr != nil || regionErr != nil || azErr != nil || tagsErr != nil || id != "i-0aaaaaaaaaaaaaaaa" || region != "us-east-1" || az != "us-east-1a" || tags["supavise:cluster"] != "prod" {
+				t.Errorf("identity: %q %q %q %v / %v %v %v %v", id, region, az, tags, idErr, regionErr, azErr, tagsErr)
+			}
+			for _, o := range fake.Order("imds") {
+				if strings.Contains(o, "security-credentials") {
+					t.Errorf("the instance role was read: %s", o)
+				}
+			}
+			if n := len(fake.Order("ec2")); n != 0 {
+				t.Errorf("%d EC2 calls were sent without credentials", n)
+			}
+		})
+	}
+}
+
+// With the switch on, the credentials in the environment still sign, and the instance role is not
+// consulted. Without it (or with another value) the role is the fallback as before.
+func TestNoInstanceRoleUsesTheEnvironment(t *testing.T) {
+	fake := awsfake.New(t)
+	fake.AddInstance(awsfake.Instance{ID: "i-1"})
+	fake.AddCredentials(awsapi.Credentials{AccessKeyID: "AKIAOPERATOR", SecretAccessKey: "operator-secret"})
+	operator := map[string]string{"AWS_ACCESS_KEY_ID": "AKIAOPERATOR", "AWS_SECRET_ACCESS_KEY": "operator-secret"}
+
+	cfg := fake.Config()
+	cfg.NoInstanceRole = true
+	cfg.Getenv = envOf(operator)
+	if _, err := newClient(t, cfg).EC2.DescribeInstances(ctx, awsapi.DescribeInstancesInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fake.Calls(); len(calls) != 1 || calls[0].AccessKeyID != "AKIAOPERATOR" {
+		t.Errorf("%+v", calls)
+	}
+
+	for _, v := range []string{"", "0", "false", "no"} {
+		fake := awsfake.New(t)
+		cfg := fake.Config()
+		cfg.Getenv = envOf(map[string]string{awsapi.EnvNoInstanceRole: v})
+		if _, err := newClient(t, cfg).EC2.DescribeInstances(ctx, awsapi.DescribeInstancesInput{}); err != nil {
+			t.Errorf("%s=%q: %v", awsapi.EnvNoInstanceRole, v, err)
+		}
+	}
+}
+
+// AWS_EC2_METADATA_DISABLED stays the stronger switch: it turns off the identity reads too.
+func TestMetadataDisabledStillTurnsOffTheIdentityReads(t *testing.T) {
+	fake := awsfake.New(t)
+	cfg := fake.Config()
+	cfg.NoInstanceRole = true
+	cfg.Getenv = envOf(map[string]string{"AWS_EC2_METADATA_DISABLED": "true"})
+	if _, err := newClient(t, cfg).IMDS.InstanceID(ctx); !errors.Is(err, awsapi.ErrIMDSDisabled) {
+		t.Errorf("err = %v", err)
+	}
+}

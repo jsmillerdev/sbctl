@@ -22,6 +22,11 @@ import (
 	"time"
 )
 
+// EnvNoInstanceRole, set to 1 or true, is Config.NoInstanceRole. Unlike AWS_EC2_METADATA_DISABLED it
+// keeps the identity reads of the metadata service, so a tool can act with the operator's
+// credentials and still ask which instance it runs on.
+const EnvNoInstanceRole = "SUPAVISE_AWS_NO_INSTANCE_ROLE"
+
 // Environment variables that override a service endpoint. Secrets Manager also answers to the
 // name the AWS SDKs and CLI use, and the metadata service to AWS_EC2_METADATA_SERVICE_ENDPOINT.
 const (
@@ -53,6 +58,10 @@ type Config struct {
 	Endpoints Endpoints
 	// HTTPClient sends API requests. Nil uses a client with a 30 second timeout.
 	HTTPClient *http.Client
+	// NoInstanceRole stops the default credentials from falling back to the instance role: only the
+	// AWS_* variables are used. The metadata service is still read for the instance id, the region,
+	// the addresses and the tags. SUPAVISE_AWS_NO_INSTANCE_ROLE=1 sets it from the environment.
+	NoInstanceRole bool
 	// Getenv reads the environment. Nil is os.Getenv.
 	Getenv func(string) string
 	// Now is the clock for signing and for credential expiry. Nil is time.Now.
@@ -125,7 +134,7 @@ func New(cfg Config) (*Client, error) {
 	imds := newIMDS(cfg, ep["imds"], imdsAttempts)
 	creds := cfg.Credentials
 	if creds == nil {
-		creds = DefaultCredentials(cfg.Getenv, imds, cfg.Now)
+		creds = defaultCredentials(cfg.Getenv, imds, cfg.Now, cfg.NoInstanceRole)
 	}
 	c := &core{cfg: cfg, endpoints: ep, creds: creds, imds: imds, retry: newRetrier(cfg.MaxAttempts, cfg.RetryBackoff)}
 	return &Client{
@@ -137,10 +146,23 @@ func New(cfg Config) (*Client, error) {
 	}, nil
 }
 
-// DefaultCredentials is the environment, then the instance role, cached.
+// DefaultCredentials is the environment, then the instance role, cached. With
+// SUPAVISE_AWS_NO_INSTANCE_ROLE=1 it is the environment alone.
 func DefaultCredentials(getenv func(string) string, imds *IMDS, now func() time.Time) CredentialProvider {
+	return defaultCredentials(getenv, imds, now, false)
+}
+
+func defaultCredentials(getenv func(string) string, imds *IMDS, now func() time.Time, noRole bool) CredentialProvider {
+	if v := strings.TrimSpace(getenv(EnvNoInstanceRole)); noRole || v == "1" || strings.EqualFold(v, "true") {
+		return ChainCredentials(EnvCredentials(getenv), noInstanceRole)
+	}
 	return ChainCredentials(EnvCredentials(getenv), CachedCredentials(IMDSCredentials(imds), now))
 }
+
+// noInstanceRole stands in for the instance role when it is switched off.
+var noInstanceRole = CredentialProviderFunc(func(context.Context) (Credentials, error) {
+	return Credentials{}, fmt.Errorf("%w: the instance role is not used (Config.NoInstanceRole or %s=1)", ErrNoCredentials, EnvNoInstanceRole)
+})
 
 // Region returns the region calls go to, resolving it the first time.
 func (c *Client) Region(ctx context.Context) (string, error) {

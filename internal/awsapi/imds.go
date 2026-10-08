@@ -20,7 +20,8 @@ import (
 var ErrNotFound = errors.New("not found")
 
 // ErrIMDSDisabled means AWS_EC2_METADATA_DISABLED=true. `supavise-aws-deploy.sh` sets it so that
-// the stack step never uses the instance role.
+// the stack step never uses the instance role. It turns off every read, the instance id included;
+// SUPAVISE_AWS_NO_INSTANCE_ROLE=1 turns off the instance role alone.
 var ErrIMDSDisabled = errors.New("the instance metadata service is disabled (AWS_EC2_METADATA_DISABLED=true)")
 
 // ErrIMDSUnreachable means the metadata service gave no answer: no route, a refused connection or
