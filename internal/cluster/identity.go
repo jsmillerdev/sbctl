@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/mesh"
@@ -27,6 +28,28 @@ var ErrNoIdentity = errors.New("cluster: this node has no certificate")
 func Joined(dir string) bool {
 	_, err := os.Stat(filepath.Join(dir, config.NodeCertFile))
 	return err == nil
+}
+
+// FollowerFile is the file in the cluster directory that marks a server which joined a cluster that
+// already existed: `supavise node join` writes it before the certificate, and a rejoin writes it too.
+// The founder has none, though it holds a certificate as well once the first token was made.
+const FollowerFile = "follower.json"
+
+// IsFollower reports whether this server joined a cluster as a member (a join with a token, or a
+// rejoin after it was replaced as leader) and not as its founder. `supavise install` run again on a
+// server that has an identity asks it: a follower resumes its join, where a founder has nothing to
+// resume. The mark stays when a follower is promoted; only a retirement or a reset deletes it.
+func IsFollower(dir string) bool {
+	if !Joined(dir) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(dir, FollowerFile))
+	return err == nil
+}
+
+// markFollower writes FollowerFile: who this node is and which leader it joined.
+func markFollower(dir, node, leader string, at time.Time) error {
+	return writeJSON(filepath.Join(dir, FollowerFile), map[string]any{"node_id": node, "leader": leader, "at": at.UTC()})
 }
 
 // NewKey generates a node key.

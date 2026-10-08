@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
@@ -180,6 +181,11 @@ func TestRejoin(t *testing.T) {
 	if err := WriteFenced(j.cfg, FencedRecord{Epoch: 2, Leader: "n1", Reason: "replaced", At: time.Now(), Peers: map[string]string{"n1": l.cfg.PeerAddr()}}); err != nil {
 		t.Fatal(err)
 	}
+	// The old leader was a founder, with no follower mark; the rejoin makes it a follower of the new one.
+	dir := config.ClusterDir(j.confPath)
+	if err := os.Remove(filepath.Join(dir, FollowerFile)); err != nil || IsFollower(dir) {
+		t.Fatalf("setting up a founder: %v", err)
+	}
 	stopped := 0
 	rejoin.StopLocal = func(context.Context) error { stopped++; return nil }
 	var boot []peerapi.SystemBootstrap
@@ -204,6 +210,9 @@ func TestRejoin(t *testing.T) {
 	}
 	if rec, _ := ReadFenced(j.cfg); rec != nil {
 		t.Fatal("the fenced record is still there")
+	}
+	if !IsFollower(dir) {
+		t.Fatal("a node that rejoined is not marked as a follower")
 	}
 	if rs, _ := l.reg.ListReplicasOn(ctx, "n2"); len(rs) != 1 || rs[0].Ref != "system" || boot[0].Identifier != rs[0].Identifier {
 		t.Fatalf("system replica rows %+v for bootstrap %+v", rs, boot)
@@ -1660,5 +1669,106 @@ func TestRenewalRetryBacksOffToABound(t *testing.T) {
 	}
 	if r2 := (&Renewer{Retry: time.Second}); r2.nextRetry(0) != time.Second || r2.nextRetry(time.Second) != 2*time.Second {
 		t.Fatal("Retry does not set the first wait")
+	}
+}
+
+// A server that joined a cluster is marked a follower, which a founder, with its certificate, is not;
+// the mark goes with the identity.
+func TestFollowerMarkTellsAMemberFromTheFounder(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	if IsFollower(config.ClusterDir(l.confPath)) {
+		t.Fatal("the founder is marked a follower")
+	}
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	dir := config.ClusterDir(j.confPath)
+	if !IsFollower(dir) {
+		t.Fatal("a server that joined is not marked a follower")
+	}
+	info, err := os.Stat(filepath.Join(dir, FollowerFile))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("%s: %v, %v", FollowerFile, info, err)
+	}
+	if _, err := Retire(ctx, j.cfg, j.confPath, func(context.Context) error { return nil }, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if IsFollower(dir) || Joined(dir) {
+		t.Fatal("the identity or its mark survived a retirement")
+	}
+	// A mark without a certificate is not a member.
+	if err := markFollower(dir, "n2", "x", time.Now()); err != nil || IsFollower(dir) {
+		t.Fatalf("a mark with no certificate: %v", err)
+	}
+}
+
+// The converge step that refreshes config.d/10-cluster.toml fetches the leader's cluster settings with
+// the node's certificate, reports what it would change without writing, writes the file 0600 when the
+// text differs, and leaves a server that leads, that never joined, or whose leader does not answer alone.
+func TestConfigSyncRefreshesTheClusterSettingsFromTheLeader(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(config.ConfigDDir(j.confPath), config.ClusterConfigFile)
+	joined, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync := &ConfigSync{Cfg: j.cfg, ConfigPath: j.confPath, Log: quiet(),
+		Where: func(context.Context) (string, string, error) { return "n1", l.cfg.PeerAddr(), nil }}
+
+	if got, err := sync.Sync(ctx, true); err != nil || len(got) != 0 {
+		t.Fatalf("settings that match: %v, %v", got, err)
+	}
+	l.cfg.Domain = "changed.example.test" // a cluster-scoped key
+	got, err := sync.Sync(ctx, true)
+	if err != nil || len(got) != 1 || got[0] != path {
+		t.Fatalf("a changed setting, dry run: %v, %v", got, err)
+	}
+	if now, _ := os.ReadFile(path); !bytes.Equal(now, joined) {
+		t.Fatal("a dry run wrote the file")
+	}
+	if got, err := sync.Sync(ctx, false); err != nil || len(got) != 1 {
+		t.Fatalf("a changed setting: %v, %v", got, err)
+	}
+	now, err := os.ReadFile(path)
+	if err != nil || bytes.Equal(now, joined) || !strings.Contains(string(now), "changed.example.test") {
+		t.Fatalf("the file after the sync: %q, %v", now, err)
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v", info.Mode().Perm())
+	}
+	if got, err := sync.Sync(ctx, false); err != nil || len(got) != 0 {
+		t.Fatalf("the second run: %v, %v", got, err)
+	}
+
+	// A leader that does not answer is no failure of the convergence, and the file stays.
+	gone, _ := net.Listen("tcp", "127.0.0.1:0")
+	dead := gone.Addr().String()
+	gone.Close()
+	l.cfg.Domain = "again.example.test"
+	down := &ConfigSync{Cfg: j.cfg, ConfigPath: j.confPath, Log: quiet(),
+		Where: func(context.Context) (string, string, error) { return "n1", dead, nil }}
+	if got, err := down.Sync(ctx, false); err != nil || len(got) != 0 {
+		t.Fatalf("an unreachable leader: %v, %v", got, err)
+	}
+	if after, _ := os.ReadFile(path); !bytes.Equal(after, now) {
+		t.Fatal("the file changed although the leader did not answer")
+	}
+	// The leader and a server that never joined have nothing to fetch.
+	lead := &ConfigSync{Cfg: l.cfg, ConfigPath: l.confPath, Log: quiet(), Where: sync.Where}
+	if got, err := lead.Sync(ctx, false); err != nil || len(got) != 0 {
+		t.Fatalf("the founder: %v, %v", got, err)
+	}
+	none := &ConfigSync{Cfg: l.cfg, ConfigPath: filepath.Join(t.TempDir(), "etc", "config.toml"), Log: quiet(), Where: sync.Where}
+	if got, err := none.Sync(ctx, false); err != nil || len(got) != 0 {
+		t.Fatalf("a server that never joined: %v, %v", got, err)
 	}
 }

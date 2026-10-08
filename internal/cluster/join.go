@@ -327,6 +327,11 @@ func (o *JoinOptions) exchange(ctx context.Context, dir string, secret, keyBody 
 			return nil, fmt.Errorf("cluster: writing %s: %w", p, err)
 		}
 	}
+	// The mark before the certificate, whose presence is what Joined looks for: a server that holds the
+	// identity of a joined node always holds the mark.
+	if err := markFollower(dir, resp.NodeID, tok.Leader, o.now()); err != nil {
+		return nil, fmt.Errorf("cluster: writing %s: %w", FollowerFile, err)
+	}
 	if err := SaveIdentity(dir, key, creds.Cert.Certificate[0], creds.CA.Raw); err != nil {
 		return nil, err
 	}
