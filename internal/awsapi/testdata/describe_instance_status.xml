@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DescribeInstanceStatusResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <requestId>3be1508e-c444-4fef-89cc-0b1223c4f02f</requestId>
+  <instanceStatusSet>
+    <item>
+      <instanceId>i-1234567890abcdef0</instanceId>
+      <availabilityZone>us-east-1d</availabilityZone>
+      <instanceState><code>16</code><name>running</name></instanceState>
+      <systemStatus>
+        <status>ok</status>
+        <details><item><name>reachability</name><status>passed</status></item></details>
+      </systemStatus>
+      <instanceStatus>
+        <status>impaired</status>
+        <details><item><name>reachability</name><status>failed</status><impairedSince>2026-10-08T01:00:00.000Z</impairedSince></item></details>
+      </instanceStatus>
+      <eventsSet>
+        <item>
+          <code>instance-reboot</code>
+          <description>The instance is scheduled for a reboot</description>
+          <notBefore>2026-10-12T12:00:00.000Z</notBefore>
+          <notAfter>2026-10-12T18:00:00Z</notAfter>
+        </item>
+      </eventsSet>
+    </item>
+    <item>
+      <instanceId>i-0fedcba9876543210</instanceId>
+      <availabilityZone>us-east-1b</availabilityZone>
+      <instanceState><code>80</code><name>stopped</name></instanceState>
+      <systemStatus><status>not-applicable</status></systemStatus>
+      <instanceStatus><status>not-applicable</status></instanceStatus>
+    </item>
+  </instanceStatusSet>
+</DescribeInstanceStatusResponse>

@@ -1,0 +1,23 @@
+<DescribeAddressesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <requestId>f7de5e98-491a-4c19-a92d-908d6EXAMPLE</requestId>
+  <addressesSet>
+    <item>
+      <publicIp>203.0.113.25</publicIp>
+      <allocationId>eipalloc-64d5890a</allocationId>
+      <domain>vpc</domain>
+      <instanceId>i-1234567890abcdef0</instanceId>
+      <associationId>eipassoc-2bebb745</associationId>
+      <networkInterfaceId>eni-0a1b2c3d4e5f60718</networkInterfaceId>
+      <networkInterfaceOwnerId>123456789012</networkInterfaceOwnerId>
+      <privateIpAddress>10.77.0.11</privateIpAddress>
+      <tagSet>
+        <item><key>supavise:cluster</key><value>prod</value></item>
+      </tagSet>
+    </item>
+    <item>
+      <publicIp>198.51.100.7</publicIp>
+      <allocationId>eipalloc-0123abcd</allocationId>
+      <domain>vpc</domain>
+    </item>
+  </addressesSet>
+</DescribeAddressesResponse>
