@@ -6,7 +6,9 @@
 package cloudformation_test
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -20,21 +22,26 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/supavise/supavise/internal/infra"
 )
 
 type doc = map[string]any
 
 // load parses supavise.yaml. CloudFormation's short forms (!Ref, !Sub, !If ...) become the long
 // forms ({"Ref": ...}, {"Fn::Sub": ...}), so the assertions read like the JSON of the template.
-func load(t *testing.T) doc {
+func load(t *testing.T) doc { return loadFile(t, "supavise.yaml") }
+
+// loadFile parses the template at path the same way.
+func loadFile(t *testing.T, path string) doc {
 	t.Helper()
-	raw, err := os.ReadFile("supavise.yaml")
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var root yaml.Node
 	if err := yaml.Unmarshal(raw, &root); err != nil {
-		t.Fatalf("supavise.yaml does not parse: %v", err)
+		t.Fatalf("%s does not parse: %v", path, err)
 	}
 	return convert(t, &root).(doc)
 }
@@ -149,8 +156,10 @@ func strList(t *testing.T, v any) []string {
 
 func TestParametersAreMinimal(t *testing.T) {
 	params := get(t, load(t), "Parameters").(doc)
-	want := []string{"AccessCidr", "AdminEmail", "AmiId", "DailySnapshotsKept", "DataSnapshotId", "DataVolumeSize", "DomainName", "EnableSessionManager",
-		"HostedZoneId", "InstanceType", "KeyEscrowPassphrase", "KeyName", "SshCidr", "SubnetId", "SupaviseVersion", "VpcId"}
+	want := []string{"AccessCidr", "AdminEmail", "AmiId", "AvailabilityZone", "BackupBucketName", "BackupBucketRegion", "ClusterName", "DailySnapshotsKept",
+		"DataSnapshotId", "DataVolumeSize", "DomainName", "EnableSessionManager", "Failover", "HostedZoneId", "InstanceType", "JoinLeader",
+		"JoinTokenSecretArn", "KeyEscrowPassphrase", "KeyName", "ObjectsBucketName", "PeerCidr1", "PeerCidr2", "PeerCidr3", "SshCidr",
+		"StorageRoleArn", "SubnetId", "SupaviseVersion", "VpcId"}
 	if got := keys(params); !reflect.DeepEqual(got, want) {
 		t.Fatalf("parameters changed (update the README table and this list together):\n got %v\nwant %v", got, want)
 	}
@@ -248,7 +257,8 @@ func TestConsoleFormCoversEveryParameter(t *testing.T) {
 func TestOutputsNameWhatAPersonNeeds(t *testing.T) {
 	d := load(t)
 	outs := get(t, d, "Outputs").(doc)
-	for _, k := range []string{"DashboardUrl", "ApiUrl", "ClaimUrl", "ClaimTokenCommand", "BackupBucket", "InstanceId", "DataVolumeId", "ConnectCommand", "PublicIp", "DnsRecordsNeeded"} {
+	for _, k := range []string{"DashboardUrl", "ApiUrl", "ClaimUrl", "ClaimTokenCommand", "BackupBucket", "InstanceId", "DataVolumeId", "ConnectCommand", "PublicIp", "DnsRecordsNeeded",
+		"ElasticIpAllocationId", "ObjectsBucket", "StorageRoleArn", "SecurityGroupId", "InfraRevision", "ClusterName"} {
 		o, ok := outs[k]
 		if !ok {
 			t.Errorf("output %s is missing", k)
@@ -283,6 +293,7 @@ func TestDataIsNeverDeletedSilently(t *testing.T) {
 	r := resources(t, d)
 	for _, c := range []struct{ name, policy string }{
 		{"BackupBucket", "Retain"},
+		{"ObjectsBucket", "Retain"},
 		{"DataVolume", "Snapshot"},
 	} {
 		for _, attr := range []string{"DeletionPolicy", "UpdateReplacePolicy"} {
@@ -310,30 +321,38 @@ func TestDataIsNeverDeletedSilently(t *testing.T) {
 	if !has(vol, "SnapshotId") {
 		t.Error("the data volume must accept DataSnapshotId (restore path)")
 	}
-	bucket := get(t, r["BackupBucket"], "Properties")
-	if get(t, bucket, "VersioningConfiguration", "Status") != "Enabled" {
-		t.Error("the backup bucket must be versioned")
-	}
-	for _, k := range []string{"BlockPublicAcls", "BlockPublicPolicy", "IgnorePublicAcls", "RestrictPublicBuckets"} {
-		if get(t, bucket, "PublicAccessBlockConfiguration", k) != true {
-			t.Errorf("backup bucket: %s must be true", k)
+	for _, name := range []string{"BackupBucket", "ObjectsBucket"} {
+		bucket := get(t, r[name], "Properties")
+		if get(t, bucket, "VersioningConfiguration", "Status") != "Enabled" {
+			t.Errorf("%s must be versioned", name)
 		}
-	}
-	if !has(bucket, "BucketEncryption") {
-		t.Error("the backup bucket must be encrypted")
-	}
-	// The bucket must not name itself: a fixed name would collide when the stack is made again
-	// while the retained bucket still exists.
-	if has(bucket, "BucketName") {
-		t.Error("the backup bucket must have a generated name (a retained bucket would block a new stack)")
+		for _, k := range []string{"BlockPublicAcls", "BlockPublicPolicy", "IgnorePublicAcls", "RestrictPublicBuckets"} {
+			if get(t, bucket, "PublicAccessBlockConfiguration", k) != true {
+				t.Errorf("%s: %s must be true", name, k)
+			}
+		}
+		if !has(bucket, "BucketEncryption") {
+			t.Errorf("%s must be encrypted", name)
+		}
+		// The bucket must not name itself: a fixed name would collide when the stack is made again
+		// while the retained bucket still exists.
+		if has(bucket, "BucketName") {
+			t.Errorf("%s must have a generated name (a retained bucket would block a new stack)", name)
+		}
+		// A replica server stack uses the leader's buckets and makes none.
+		if get(t, r[name], "Condition") != "NotJoiner" {
+			t.Errorf("%s must exist only in a stack that is not a replica server", name)
+		}
 	}
 	// A fixed secret name stays reserved for the recovery window after the stack is deleted.
 	if has(r["ClaimTokenSecret"], "Properties", "Name") {
 		t.Error("ClaimTokenSecret must have a generated name (a deleted secret's name is reserved for 30 days)")
 	}
-	pol := fmt.Sprint(get(t, r["BackupBucketPolicy"], "Properties", "PolicyDocument"))
-	if !strings.Contains(pol, "aws:SecureTransport") {
-		t.Error("the bucket policy must deny non-TLS access")
+	for _, name := range []string{"BackupBucketPolicy", "ObjectsBucketPolicy"} {
+		pol := fmt.Sprint(get(t, r[name], "Properties", "PolicyDocument"))
+		if !strings.Contains(pol, "aws:SecureTransport") {
+			t.Errorf("%s must deny non-TLS access", name)
+		}
 	}
 }
 
@@ -344,6 +363,20 @@ func statements(t *testing.T, policyDoc any) []any {
 		return l
 	}
 	return []any{s}
+}
+
+// rolePolicies returns the inline policies of a role. An entry that is an Fn::If (the claim token
+// policy goes away in a replica server) stands for the policy of its first branch.
+func rolePolicies(t *testing.T, role any) []any {
+	t.Helper()
+	var out []any
+	for _, p := range get(t, role, "Policies").([]any) {
+		if has(p, "Fn::If") {
+			p = get(t, p, "Fn::If").([]any)[1]
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // TestInstanceRoleIsLeastPrivilege lists every action the instance role may take. A new line here
@@ -366,9 +399,10 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 	// Every IAM statement of the stack: role inline policies and AWS::IAM::Policy resources.
 	type stmt struct {
 		where   string
+		sid     string
 		actions []string
 		res     string
-		cond    bool
+		cond    string
 	}
 	var all []stmt
 	collect := func(where string, pd any) {
@@ -379,10 +413,15 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 			if has(st, "NotAction") || has(st, "NotResource") || has(st, "Principal") {
 				t.Errorf("%s: NotAction, NotResource and Principal are not allowed", where)
 			}
-			all = append(all, stmt{where, strList(t, get(t, st, "Action")), fmt.Sprint(get(t, st, "Resource")), has(st, "Condition")})
+			sid, _ := st.(doc)["Sid"].(string)
+			cond := ""
+			if has(st, "Condition") {
+				cond = fmt.Sprint(get(t, st, "Condition"))
+			}
+			all = append(all, stmt{where, sid, strList(t, get(t, st, "Action")), fmt.Sprint(get(t, st, "Resource")), cond})
 		}
 	}
-	for _, p := range get(t, role, "Policies").([]any) {
+	for _, p := range rolePolicies(t, role) {
 		collect("role/"+get(t, p, "PolicyName").(string), get(t, p, "PolicyDocument"))
 	}
 	var policyNames []string
@@ -397,12 +436,23 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 		collect(name, get(t, res, "Properties", "PolicyDocument"))
 	}
 	sort.Strings(policyNames)
-	if want := []string{"DnsPolicy", "KeyEscrowPolicy", "SessionManagerPolicy"}; !reflect.DeepEqual(policyNames, want) {
-		t.Errorf("IAM policy resources are %v, want %v", policyNames, want)
+	// The condition each policy resource carries: everything but the Storage role is optional.
+	wantCond := map[string]string{
+		"DnsPolicy": "HasZone", "KeyEscrowPolicy": "HasKeyEscrow", "SessionManagerPolicy": "SessionManagerOn",
+		"FencingPolicy": "FailoverOn", "JoinTokenPolicy": "IsJoiner", "StorageAssumePolicy": "",
+	}
+	var wantNames []string
+	for name := range wantCond {
+		wantNames = append(wantNames, name)
+	}
+	sort.Strings(wantNames)
+	if !reflect.DeepEqual(policyNames, wantNames) {
+		t.Errorf("IAM policy resources are %v, want %v", policyNames, wantNames)
 	}
 	for _, name := range policyNames {
-		if !has(r[name], "Condition") {
-			t.Errorf("%s must be conditional (it is optional)", name)
+		got, _ := r[name].(doc)["Condition"].(string)
+		if got != wantCond[name] {
+			t.Errorf("%s has condition %q, want %q", name, got, wantCond[name])
 		}
 	}
 
@@ -411,7 +461,7 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 		"s3:ListBucket": true, "s3:GetBucketLocation": true, "s3:ListBucketMultipartUploads": true,
 		"s3:GetObject": true, "s3:PutObject": true, "s3:DeleteObject": true,
 		"s3:AbortMultipartUpload": true, "s3:ListMultipartUploadParts": true,
-		// the claim token (write) and the key escrow passphrase (read once, replace once)
+		// the claim token (write), the key escrow passphrase (read once, replace once), the join token (read)
 		"secretsmanager:PutSecretValue": true, "secretsmanager:GetSecretValue": true,
 		// DNS-01 certificates
 		"route53:ChangeResourceRecordSets": true, "route53:ListResourceRecordSets": true, "route53:GetChange": true,
@@ -419,12 +469,19 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 		"ssm:UpdateInstanceInformation":    true,
 		"ssmmessages:CreateControlChannel": true, "ssmmessages:CreateDataChannel": true,
 		"ssmmessages:OpenControlChannel": true, "ssmmessages:OpenDataChannel": true,
+		// Storage: the daemon assumes the Storage role, and no other role
+		"sts:AssumeRole": true,
+		// failover, only in FencingPolicy and only on resources that carry the cluster tag
+		"ec2:DescribeInstances": true, "ec2:DescribeInstanceStatus": true, "ec2:DescribeAddresses": true,
+		"ec2:StopInstances": true, "ec2:AssociateAddress": true, "ec2:DisassociateAddress": true,
 	}
 	starOK := map[string]bool{ // actions that accept no narrower resource
 		"ssm:UpdateInstanceInformation":    true,
 		"ssmmessages:CreateControlChannel": true, "ssmmessages:CreateDataChannel": true,
 		"ssmmessages:OpenControlChannel": true, "ssmmessages:OpenDataChannel": true,
+		"ec2:DescribeInstances": true, "ec2:DescribeInstanceStatus": true, "ec2:DescribeAddresses": true,
 	}
+	clusterTag := "aws:ResourceTag/supavise:cluster"
 	for _, s := range all {
 		for _, a := range s.actions {
 			if strings.Contains(a, "*") {
@@ -433,7 +490,7 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 			if !allowed[a] {
 				t.Errorf("%s: unexpected action %s (add it here only when the node needs it)", s.where, a)
 			}
-			if strings.HasPrefix(a, "iam:") || strings.HasPrefix(a, "sts:") || strings.HasPrefix(a, "ec2:") || strings.HasPrefix(a, "kms:") {
+			if strings.HasPrefix(a, "iam:") || strings.HasPrefix(a, "kms:") || strings.HasPrefix(a, "cloudformation:") {
 				t.Errorf("%s: %s must not be granted to the instance", s.where, a)
 			}
 			if s.res == "*" && !starOK[a] {
@@ -454,14 +511,33 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 					if a != "secretsmanager:GetSecretValue" && a != "secretsmanager:PutSecretValue" {
 						t.Errorf("%s: %s on KeyEscrowSecret: only Get and Put", s.where, a)
 					}
+				case strings.Contains(s.res, "JoinTokenSecretArn"):
+					if a != "secretsmanager:GetSecretValue" {
+						t.Errorf("%s: %s on the join token secret: the instance may only read it", s.where, a)
+					}
 				default:
-					t.Errorf("%s: %s must name ClaimTokenSecret (put) or KeyEscrowSecret (get, put), got %s", s.where, a, s.res)
+					t.Errorf("%s: %s must name ClaimTokenSecret (put), KeyEscrowSecret (get, put) or JoinTokenSecretArn (get), got %s", s.where, a, s.res)
+				}
+			case strings.HasPrefix(a, "sts:"):
+				// The one exception to "no sts": assuming the Storage role, exactly that role.
+				if s.where != "StorageAssumePolicy" || a != "sts:AssumeRole" || !strings.Contains(s.res, "StorageRole") || strings.Contains(s.res, "*") {
+					t.Errorf("%s: %s on %s: the instance may assume the Storage role and no other", s.where, a, s.res)
+				}
+			case strings.HasPrefix(a, "ec2:"):
+				if s.where != "FencingPolicy" {
+					t.Errorf("%s: %s belongs in FencingPolicy (Failover=on), nowhere else", s.where, a)
+				}
+				if !starOK[a] && !strings.Contains(s.cond, clusterTag) {
+					t.Errorf("%s: %s must be limited by the %s condition, got %q", s.where, a, clusterTag, s.cond)
+				}
+				if starOK[a] && s.cond != "" {
+					t.Errorf("%s: %s takes no resource, so no condition applies: %q", s.where, a, s.cond)
 				}
 			case a == "route53:ChangeResourceRecordSets":
 				if !strings.Contains(s.res, "hostedzone/") || !strings.Contains(s.res, "HostedZoneId") {
 					t.Errorf("%s: %s must name the one hosted zone, got %s", s.where, a, s.res)
 				}
-				if !s.cond {
+				if s.cond == "" {
 					t.Errorf("%s: %s needs a condition on the record type and name", s.where, a)
 				}
 			case strings.HasPrefix(a, "route53:"):
@@ -649,11 +725,28 @@ func TestDailySnapshotsOfTheDataVolume(t *testing.T) {
 	}
 }
 
-// userData returns the first-boot script with every ${...} of the template replaced by a word.
+// userDataSub returns the Fn::Sub of the instance's user data: the script and the map of its
+// variables. The user data is one script for an ordinary stack and a short one for a replica
+// server, chosen by IsJoiner.
+func userDataSub(t *testing.T, joiner bool) (script string, vars doc) {
+	t.Helper()
+	pick := get(t, resources(t, load(t))["Instance"], "Properties", "UserData", "Fn::Base64", "Fn::If").([]any)
+	if pick[0] != "IsJoiner" {
+		t.Fatalf("the user data is chosen by %v, want IsJoiner", pick[0])
+	}
+	branch := pick[2]
+	if joiner {
+		branch = pick[1]
+	}
+	sub := get(t, branch, "Fn::Sub").([]any)
+	return strings.ReplaceAll(sub[0].(string), "${!", "${"), sub[1].(doc)
+}
+
+// userData returns the first-boot script of an ordinary stack with every ${...} of the template
+// replaced by a word.
 func userData(t *testing.T) string {
 	t.Helper()
-	sub := get(t, resources(t, load(t))["Instance"], "Properties", "UserData", "Fn::Base64", "Fn::Sub").([]any)
-	script := strings.ReplaceAll(sub[0].(string), "${!", "${")
+	script, _ := userDataSub(t, false)
 	return regexp.MustCompile(`\$\{[^}]+\}`).ReplaceAllString(script, "X")
 }
 
@@ -738,9 +831,7 @@ func TestUserDataReplacesTheTokenPlaceholderWhenNoneIsIssued(t *testing.T) {
 // ${KeyEscrowFetch} and ${KeyEscrowDone}, and the resource references inside them become words.
 func userDataWithKeyEscrow(t *testing.T) string {
 	t.Helper()
-	sub := get(t, resources(t, load(t))["Instance"], "Properties", "UserData", "Fn::Base64", "Fn::Sub").([]any)
-	script := strings.ReplaceAll(sub[0].(string), "${!", "${")
-	vars := sub[1].(doc)
+	script, vars := userDataSub(t, false)
 	for _, name := range []string{"KeyEscrowFetch", "KeyEscrowDone"} {
 		branches := get(t, vars[name], "Fn::If").([]any)
 		if branches[0] != "HasKeyEscrow" {
@@ -812,8 +903,8 @@ func TestKeyEscrowPassphrase(t *testing.T) {
 	}
 	// The one place the parameter is used is the secret.
 	uses := regexp.MustCompile(`!Ref KeyEscrowPassphrase`).FindAllIndex(raw, -1)
-	if len(uses) != 2 { // the Equals of HasKeyEscrow and the SecretString
-		t.Errorf("KeyEscrowPassphrase is referenced %d times, want 2 (HasKeyEscrow, KeyEscrowSecret)", len(uses))
+	if len(uses) != 3 { // the Equals of HasKeyEscrow, the SecretString, and the rule that a replica server takes none
+		t.Errorf("KeyEscrowPassphrase is referenced %d times, want 3 (HasKeyEscrow, KeyEscrowSecret, ReplicaNeedsItsInputs)", len(uses))
 	}
 
 	// What the script does with it.
@@ -963,10 +1054,11 @@ func TestTemplateIsSelfContained(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// aws cloudformation deploy sends the file in the request when it is below 51,200 bytes and
-	// needs a bucket above it. deploy.sh does not ask for one.
-	if len(raw) > 48000 {
-		t.Errorf("supavise.yaml is %d bytes; deploy.sh needs it under 51,200 (keep a margin)", len(raw))
+	// The API takes a template inline up to 51,200 bytes and from S3 up to 1 MB; the console
+	// uploads to S3 itself. deploy.sh stages a template above 51,200 bytes in a bucket, so the
+	// limit that matters is the 1 MB one (keep a wide margin).
+	if len(raw) > 500_000 {
+		t.Errorf("supavise.yaml is %d bytes; CloudFormation takes at most 1 MB from S3", len(raw))
 	}
 	d := load(t)
 	for name, res := range resources(t, d) {
@@ -1019,28 +1111,35 @@ func TestRulesAndConditionsStayInStep(t *testing.T) {
 	}
 }
 
-// TestReleaseAssetsStampTheTag runs the real deploy/release-assets.sh with a throwaway key and
-// checks what a release attaches: the template carries the tag as its default release and the
-// AWS deploy script travels with it.
-func TestReleaseAssetsStampTheTag(t *testing.T) {
-	// release-assets.sh signs with ed25519, which macOS's own LibreSSL lacks; use an OpenSSL 3 when
-	// there is one (Homebrew), else skip. CI runs on Ubuntu, where it always runs.
-	pathEnv := os.Getenv("PATH")
-	ssl := ""
+// findOpenSSL returns an openssl that can sign and verify ed25519, or skips the test. The scripts
+// sign with it, and macOS's own LibreSSL has none, so an OpenSSL 3 from Homebrew is used when
+// there is one. CI runs on Ubuntu, where it is the system one.
+func findOpenSSL(t *testing.T) string {
+	t.Helper()
 	for _, c := range []string{"openssl", "/opt/homebrew/opt/openssl@3/bin/openssl", "/usr/local/opt/openssl@3/bin/openssl"} {
 		p, err := exec.LookPath(c)
 		if err != nil {
 			continue
 		}
 		if exec.Command(p, "genpkey", "-algorithm", "ed25519", "-out", filepath.Join(t.TempDir(), "k.pem")).Run() == nil {
-			ssl = p
-			break
+			return p
 		}
 	}
-	if ssl == "" {
-		t.Skip("no openssl with ed25519 support")
-	}
-	pathEnv = filepath.Dir(ssl) + ":" + pathEnv
+	t.Skip("no openssl with ed25519 support")
+	return ""
+}
+
+// release is a directory made by the real deploy/release-assets.sh with a throwaway key.
+type release struct {
+	dist, privPEM, pubPEM, ssl string
+	keyB64                     string // the base64 of the public key PEM, as the script stamps it
+}
+
+// buildRelease runs release-assets.sh on fake binaries. binary is the text of the fake binaries
+// ("" makes them files that cannot run). tag "" builds a release without a manifest.
+func buildRelease(t *testing.T, tag, binary string) release {
+	t.Helper()
+	ssl := findOpenSSL(t)
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not installed")
 	}
@@ -1059,21 +1158,45 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 	if err := os.MkdirAll(dist, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	content := "not a binary"
+	if binary != "" {
+		content = binary
+	}
 	for _, f := range []string{"supavise-linux-amd64", "supavise-linux-arm64"} {
-		if err := os.WriteFile(filepath.Join(dist, f), []byte("not a binary"), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(dist, f), []byte(content), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	script, _ := filepath.Abs("../release-assets.sh")
 	cmd := exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
-	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SUPAVISE_RELEASE_TAG=v9.8.7-rc.1")
+	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(ssl)+":"+os.Getenv("PATH"), "SUPAVISE_RELEASE_TAG="+tag)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("release-assets.sh: %v\n%s", err, out)
 	}
-	tpl, err := os.ReadFile(filepath.Join(dist, "supavise.yaml"))
+	pem, err := os.ReadFile(filepath.Join(tmp, "pub.pem"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	return release{dist: dist, privPEM: filepath.Join(tmp, "priv.pem"), pubPEM: filepath.Join(tmp, "pub.pem"), ssl: ssl, keyB64: base64.StdEncoding.EncodeToString(pem)}
+}
+
+func (r release) read(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(r.dist, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+const keyMarker = "__SUPAVISE_RELEASE_PUBKEY_B64__"
+
+// TestReleaseAssetsStampTheTag runs the real deploy/release-assets.sh with a throwaway key and
+// checks what a release attaches: the template carries the tag as its default release and the
+// AWS deploy script travels with it.
+func TestReleaseAssetsStampTheTag(t *testing.T) {
+	rel := buildRelease(t, "v9.8.7-rc.1", "")
+	tpl := rel.read(t, "supavise.yaml")
 	var root yaml.Node
 	if err := yaml.Unmarshal(tpl, &root); err != nil {
 		t.Fatalf("the stamped template does not parse: %v", err)
@@ -1083,20 +1206,19 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 		t.Errorf("stamped default is %v, want the tag", stamped)
 	}
 	orig, _ := os.ReadFile("supavise.yaml")
-	if d := len(tpl) - len(orig); d != len("v9.8.7-rc.1")-len("latest") {
-		t.Errorf("stamping changed more than the default: size differs by %d", d)
+	// Stamping changes the release default and the key marker, and nothing else.
+	unkeyed := strings.ReplaceAll(string(tpl), rel.keyB64, keyMarker)
+	if d := len(unkeyed) - len(orig); d != len("v9.8.7-rc.1")-len("latest") {
+		t.Errorf("stamping changed more than the default and the key: size differs by %d", d)
 	}
 	for _, f := range []string{"supavise-aws-deploy.sh", "install.sh", "SHA256SUMS", "SHA256SUMS.sig", "supavise-release.json"} {
-		if _, err := os.Stat(filepath.Join(dist, f)); err != nil {
+		if _, err := os.Stat(filepath.Join(rel.dist, f)); err != nil {
 			t.Errorf("release asset %s missing: %v", f, err)
 		}
 	}
 	// The manifest names the tag and the oldest version that upgrades to it, and the signed list
 	// covers it: the signature check on SHA256SUMS is then a check on the manifest.
-	manifest, err := os.ReadFile(filepath.Join(dist, "supavise-release.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	manifest := rel.read(t, "supavise-release.json")
 	var mf struct {
 		Schema         int               `json:"schema"`
 		Version        string            `json:"version"`
@@ -1109,34 +1231,112 @@ func TestReleaseAssetsStampTheTag(t *testing.T) {
 	if mf.Schema != 1 || mf.Version != "v9.8.7-rc.1" || mf.MinUpgradeFrom == "" || mf.Artifacts["postgres"] == "" {
 		t.Errorf("manifest: %+v", mf)
 	}
-	sums, _ := os.ReadFile(filepath.Join(dist, "SHA256SUMS"))
+	sums := rel.read(t, "SHA256SUMS")
 	sum := sha256.Sum256(manifest)
 	if !strings.Contains(string(sums), hex.EncodeToString(sum[:])+"  supavise-release.json") {
 		t.Errorf("SHA256SUMS does not list the manifest:\n%s", sums)
 	}
-	run(ssl, "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", "pub.pem", "-sigfile", filepath.Join(dist, "SHA256SUMS.sig"), "-in", filepath.Join(dist, "SHA256SUMS"))
-	if fi, err := os.Stat(filepath.Join(dist, "supavise-aws-deploy.sh")); err == nil && fi.Mode()&0o111 == 0 {
+	verify := exec.Command(rel.ssl, "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", rel.pubPEM, "-sigfile", filepath.Join(rel.dist, "SHA256SUMS.sig"), "-in", filepath.Join(rel.dist, "SHA256SUMS"))
+	if out, err := verify.CombinedOutput(); err != nil {
+		t.Fatalf("the signature does not verify: %v\n%s", err, out)
+	}
+	if fi, err := os.Stat(filepath.Join(rel.dist, "supavise-aws-deploy.sh")); err == nil && fi.Mode()&0o111 == 0 {
 		t.Error("supavise-aws-deploy.sh must be executable")
 	}
 
-	// Without a tag the template is attached as it is, and there is no manifest to name a version.
-	cmd = exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
-	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SUPAVISE_RELEASE_TAG=")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("release-assets.sh without a tag: %v\n%s", err, out)
+	// Without a tag the template is attached as it is (but for the key), and there is no manifest
+	// to name a version.
+	rel = buildRelease(t, "", "")
+	if got := strings.ReplaceAll(string(rel.read(t, "supavise.yaml")), rel.keyB64, keyMarker); got != string(orig) {
+		t.Error("without SUPAVISE_RELEASE_TAG the template must be copied unchanged but for the release key")
 	}
-	tpl, _ = os.ReadFile(filepath.Join(dist, "supavise.yaml"))
-	if string(tpl) != string(orig) {
-		t.Error("without SUPAVISE_RELEASE_TAG the template must be copied unchanged")
-	}
-	if _, err := os.Stat(filepath.Join(dist, "supavise-release.json")); err == nil {
+	if _, err := os.Stat(filepath.Join(rel.dist, "supavise-release.json")); err == nil {
 		t.Error("a run without a tag left a manifest of an earlier run in the release directory")
+	}
+	if bytes.Contains(rel.read(t, "SHA256SUMS"), []byte("supavise-release.json")) {
+		t.Error("without a tag SHA256SUMS lists a manifest that does not exist")
+	}
+	if !bytes.Contains(rel.read(t, "supavise-aws-deploy.sh"), []byte("__SUPAVISE_RELEASE_TAG__")) {
+		t.Error("without a tag the script keeps the tag marker (it then means latest)")
 	}
 
 	// A tag that is not a version is refused: it would end up in a parameter default.
-	cmd = exec.Command("bash", script, dist, filepath.Join(tmp, "priv.pem"), filepath.Join(tmp, "pub.pem"))
-	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "SUPAVISE_RELEASE_TAG=latest; echo hi")
+	script, _ := filepath.Abs("../release-assets.sh")
+	cmd := exec.Command("bash", script, rel.dist, rel.privPEM, rel.pubPEM)
+	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(rel.ssl)+":"+os.Getenv("PATH"), "SUPAVISE_RELEASE_TAG=latest; echo hi")
 	if out, err := cmd.CombinedOutput(); err == nil {
 		t.Errorf("a bad tag must fail, got success:\n%s", out)
+	}
+}
+
+// TestReleaseAssetsSignTheTemplate: the template and the AWS script are in the signed list, with
+// the hashes of the bytes that are attached, and the manifest names the stack revision, the
+// template and the host converge revision of the binary.
+func TestReleaseAssetsSignTheTemplate(t *testing.T) {
+	// A binary that can run here and reports a host revision, as `supavise release-info --json` will.
+	rel := buildRelease(t, "v9.8.7", "#!/bin/sh\ncase \"$1\" in release-info) echo '{\"version\":\"v9.8.7\",\"converge_revision\":7,\"pins\":{}}' ;; esac\n")
+	sums := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(rel.read(t, "SHA256SUMS"))), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			t.Fatalf("SHA256SUMS line %q", line)
+		}
+		sums[f[1]] = f[0]
+	}
+	for _, name := range []string{"supavise-linux-amd64", "supavise-linux-arm64", "install.sh", "supavise.yaml", "supavise-aws-deploy.sh", "supavise-release.json"} {
+		want, ok := sums[name]
+		if !ok {
+			t.Errorf("SHA256SUMS does not list %s", name)
+			continue
+		}
+		got := sha256.Sum256(rel.read(t, name))
+		if hex.EncodeToString(got[:]) != want {
+			t.Errorf("SHA256SUMS says %s for %s, the attached file hashes to %x", want, name, got)
+		}
+	}
+	// The signature covers the list, so it covers the template and the script.
+	verify := exec.Command(rel.ssl, "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", rel.pubPEM, "-sigfile", filepath.Join(rel.dist, "SHA256SUMS.sig"), "-in", filepath.Join(rel.dist, "SHA256SUMS"))
+	if out, err := verify.CombinedOutput(); err != nil {
+		t.Fatalf("the signature does not verify: %v\n%s", err, out)
+	}
+
+	var mf struct {
+		Host *struct {
+			ConvergeRevision int `json:"converge_revision"`
+		} `json:"host"`
+		AWS *struct {
+			StackRevision  int    `json:"stack_revision"`
+			TemplateAsset  string `json:"template_asset"`
+			TemplateSHA256 string `json:"template_sha256"`
+		} `json:"aws"`
+	}
+	if err := json.Unmarshal(rel.read(t, "supavise-release.json"), &mf); err != nil {
+		t.Fatal(err)
+	}
+	if mf.Host == nil || mf.Host.ConvergeRevision != 7 {
+		t.Errorf("host: %+v, want the converge revision 7 the binary reports", mf.Host)
+	}
+	if mf.AWS == nil || mf.AWS.StackRevision != infra.Current || mf.AWS.TemplateAsset != "supavise.yaml" || mf.AWS.TemplateSHA256 != sums["supavise.yaml"] {
+		t.Errorf("aws: %+v, want revision %d, asset supavise.yaml, sha256 %s", mf.AWS, infra.Current, sums["supavise.yaml"])
+	}
+
+	// The key is in the three files that need it, once each, and the marker is gone.
+	for _, name := range []string{"install.sh", "supavise.yaml", "supavise-aws-deploy.sh"} {
+		b := rel.read(t, name)
+		if bytes.Contains(b, []byte(keyMarker)) {
+			t.Errorf("%s still holds the key marker", name)
+		}
+		if n := bytes.Count(b, []byte(rel.keyB64)); n != 1 {
+			t.Errorf("%s holds the release key %d times, want once", name, n)
+		}
+	}
+	if !bytes.Contains(rel.read(t, "supavise-aws-deploy.sh"), []byte("v9.8.7")) || bytes.Contains(rel.read(t, "supavise-aws-deploy.sh"), []byte("__SUPAVISE_RELEASE_TAG__")) {
+		t.Error("the script must carry the tag of its release")
+	}
+
+	// A binary that does not report a revision (it predates the field) gives 0, with the host block present.
+	rel = buildRelease(t, "v9.8.7", "#!/bin/sh\necho '{\"version\":\"v9.8.7\",\"pins\":{}}'\n")
+	if err := json.Unmarshal(rel.read(t, "supavise-release.json"), &mf); err != nil || mf.Host == nil || mf.Host.ConvergeRevision != 0 {
+		t.Errorf("host block for a binary without the field: %+v %v", mf.Host, err)
 	}
 }
