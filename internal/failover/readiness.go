@@ -57,13 +57,16 @@ func (o *Orchestrator) Readiness(ctx context.Context) (Readiness, error) {
 	if err != nil {
 		return r, fmt.Errorf("failover: listing nodes: %w", err)
 	}
-	active := 0
+	// A node that is fenced, or joining, still belongs to the cluster: after a failover the new leader
+	// has the fenced one beside it, and its readiness is the story of why it has no standby. Only a
+	// server with no other node that has not left is on its own.
+	members := 0
 	for _, n := range nodes {
-		if n.State == registry.NodeActive {
-			active++
+		if n.State != registry.NodeLeft {
+			members++
 		}
 	}
-	if active < 2 {
+	if members < 2 {
 		return r, ErrNoCluster
 	}
 

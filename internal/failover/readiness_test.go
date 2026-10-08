@@ -287,3 +287,17 @@ func TestTheMonitorDoesNotTurnAutomaticModeOffBecauseItsOwnContextEnded(t *testi
 		t.Fatalf("arm: %q", reason)
 	}
 }
+
+// After a failover the new leader has the old one beside it, fenced until it rejoins. That is a
+// cluster with no standby, and the readiness block says so instead of hiding.
+func TestReadinessOfALeaderWhoseOnlyOtherNodeIsFenced(t *testing.T) {
+	w := newWorld(t)
+	must(t, w.reg.SetNodeState(w.ctx, "n2", registry.NodeFenced))
+	r, err := w.orch().Readiness(w.ctx)
+	if err != nil {
+		t.Fatalf("a fenced node is still a node of the cluster: %v", err)
+	}
+	if r.Ready || !strings.Contains(strings.Join(r.Blockers, "\n"), "no other server holds a standby of the system cluster") {
+		t.Fatalf("readiness: %+v", r)
+	}
+}

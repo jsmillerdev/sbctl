@@ -349,9 +349,10 @@ func (o *Orchestrator) stopLeader(ctx context.Context, j *journal, run *serverRu
 }
 
 // resumeLeader tells the leader to start again; a failure is logged, because the caller is
-// already reporting the reason it gave up.
+// already reporting the reason it gave up. A leader that had nothing to undo (its quiesce failed
+// before a record was written, or it started again by itself) is not a failure.
 func (o *Orchestrator) resumeLeader(ctx context.Context, run *serverRun) {
-	if err := o.d.Leader.Resume(context.WithoutCancel(ctx), run.from.ID); err != nil {
+	if err := o.restartLeader(context.WithoutCancel(ctx), run.from.ID); err != nil {
 		o.d.Log.Error("could not tell the leader to start again; restart supavise on it", "node", run.from.ID, "error", err)
 	}
 }
