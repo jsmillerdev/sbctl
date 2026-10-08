@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -895,5 +896,61 @@ func TestSetWALKeepSizeAltersTheCanonicalCluster(t *testing.T) {
 	want := fmt.Sprintf("alter-system wal_keep_size=\"2GB\" on %d,alter-system wal_keep_size=\"\" on %d", f.cp.Port, f.cp.Port)
 	if got := f.sql.calls(); got != want {
 		t.Fatalf("calls = %s\nwant    %s", got, want)
+	}
+}
+
+// TestReplicaUnitsGolden pins what a replica's Postgres and PostgREST units render to, with the
+// primary's golden test (TestPrimaryUnitsMatchV011) beside it: a change to either shows in a diff
+// that someone has to read. SUPAVISE_UPDATE_GOLDEN=1 rewrites testdata/replica.
+func TestReplicaUnitsGolden(t *testing.T) {
+	f := newReplicaFixture(t)
+	f.seeded(t, true)
+	f.t.Keys = goldenKeys()
+	f.pl.opts.Settings = &fakeSettings{
+		rest: map[string]string{"PGRST_DB_SCHEMAS": "public,extra"},
+		pg:   []string{"max_connections=80", "statement_timeout=30s"},
+	}
+	ctx := context.Background()
+	pg, err := f.pl.replicaPostgresSpec(ctx, f.t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest, err := f.pl.replicaRESTSpec(ctx, f.t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, spec := range []units.Spec{pg, rest} {
+		js, err := json.MarshalIndent(spec, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := units.FormatEnv(spec.Env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := units.FormatRun(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&b, "### %s\n--- spec\n%s\n--- env\n%s--- run\n%s\n", spec.Unit(), js, env, run)
+	}
+	got := strings.ReplaceAll(b.String(), f.cfg.StateDir, "/STATE")
+	path := filepath.Join("testdata", "replica", "units.golden")
+	if os.Getenv("SUPAVISE_UPDATE_GOLDEN") != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Fatalf("the replica's units changed:\n%s", firstDifference(string(want), got))
 	}
 }

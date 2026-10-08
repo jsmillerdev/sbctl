@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -622,4 +623,31 @@ func largeMemory(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return c.Limits().MemoryMax
+}
+
+// recordingSeeder is a backup.ReplicaSeeder (the contract the backup package implements).
+type recordingSeeder struct {
+	plan backup.ReplicaSeedPlan
+	err  error
+}
+
+func (r *recordingSeeder) SeedReplica(_ context.Context, plan backup.ReplicaSeedPlan) error {
+	r.plan = plan
+	return r.err
+}
+
+// The plane's seeder hands the backup service's seeder every field of the plan.
+func TestSeederFromPassesThePlanToTheBackupSeeder(t *testing.T) {
+	rs := &recordingSeeder{}
+	plan := lifecycle.ReplicaSeedPlan{Ref: testRef, Identifier: testReplicaID(), DataDir: "/d", BackupID: "b1", PrimaryPort: 20009, ReplicationPassword: "pw"}
+	if err := SeederFrom(rs)(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	if rs.plan != (backup.ReplicaSeedPlan{Ref: testRef, Identifier: testReplicaID(), DataDir: "/d", BackupID: "b1", PrimaryPort: 20009, ReplicationPassword: "pw"}) {
+		t.Fatalf("plan = %+v", rs.plan)
+	}
+	rs.err = errors.New("no base backup")
+	if err := SeederFrom(rs)(context.Background(), plan); err == nil || err.Error() != "no base backup" {
+		t.Fatalf("error = %v", err)
+	}
 }
