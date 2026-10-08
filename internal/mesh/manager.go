@@ -110,6 +110,7 @@ type Manager struct {
 	rpcOnce sync.Once
 	anon    atomic.Int32 // sessions of callers with no certificate that are open
 	anonIP  perAddr      // of which each address holds so many
+	oneShot perAddr      // sessions of a node's command-line tools (OneShot), by node
 	shaking perAddr      // TLS handshakes in flight, by address
 
 	mu       sync.Mutex
@@ -577,6 +578,10 @@ func (m *Manager) accept(ctx context.Context, conn net.Conn) {
 		m.serveAnonymous(tc, ip)
 		return
 	}
+	if tc.ConnectionState().ServerName == OneShotName { // a tool of the node: its own session, not the node's
+		m.serveOneShot(tc, node)
+		return
+	}
 	sess, err := NewSession(tc, false)
 	if err != nil {
 		_ = conn.Close()
@@ -591,6 +596,27 @@ func remoteIP(c net.Conn) string {
 		return ""
 	}
 	return host
+}
+
+// maxOneShotPerNode is how many sessions of its command-line tools (OneShot) one node may hold at once.
+const maxOneShotPerNode = 4
+
+// serveOneShot serves a node's short call (OneShot) until its session ends. The node was admitted at the
+// handshake and its streams are judged as those of any session of the node, but the session is not kept
+// in the table, is not pinged and does not replace the one the node's daemon holds.
+func (m *Manager) serveOneShot(conn net.Conn, node string) {
+	if !m.oneShot.take(node, maxOneShotPerNode) {
+		m.o.Log.Debug("mesh: too many short sessions from one node", "node", node)
+		_ = conn.Close()
+		return
+	}
+	defer m.oneShot.drop(node)
+	sess, err := NewSession(conn, false)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	m.serveStreams(sess, node, "")
 }
 
 // serveAnonymous serves the streams of a caller that presented no certificate until its session

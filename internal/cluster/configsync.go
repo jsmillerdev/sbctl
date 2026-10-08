@@ -21,7 +21,8 @@ import (
 // ConfigSync keeps config.d/10-cluster.toml, the cluster-scoped settings a join writes, in step with
 // the leader's: `supavise system converge` runs it (hostsetup.ConfigSyncer) so that a change of the
 // domain, the backup store or the replica and failover settings reaches every node. It asks the leader
-// for GET /peer/v1/config over a session of its own, which needs only the node's certificate, and writes
+// for GET /peer/v1/config over a session of its own (mesh.OneShot, so that the leader does not take it for
+// the daemon's session), which needs only the node's certificate, and writes
 // the file (0600, the mode of the secrets a cluster setting may hold) when the text differs.
 //
 // It is for a follower. A server that never joined, a founder and the leader itself have nothing to
@@ -111,24 +112,28 @@ func (c *ConfigSync) where(ctx context.Context, dir, self string) (id, addr stri
 	} else if perr == nil {
 		return self, "", nil
 	}
-	// The registry is not at hand: the address the node joined, as the follower mark kept it.
+	// The registry is not at hand: the leader the node joined, as the follower mark kept it, by address and
+	// (a mark written by an older release has none) by node id, which the answer must name.
 	b, rerr := os.ReadFile(filepath.Join(dir, FollowerFile))
 	if rerr != nil {
 		return "", "", rerr
 	}
 	var m struct {
-		Leader string `json:"leader"`
+		Leader   string `json:"leader"`
+		LeaderID string `json:"leader_id"`
 	}
 	if jerr := json.Unmarshal(b, &m); jerr != nil || m.Leader == "" {
 		return "", "", errors.New("the registry cannot be read and the node kept no leader address")
 	}
-	return "", m.Leader, nil
+	return m.LeaderID, m.Leader, nil
 }
 
 func (c *ConfigSync) fetch(ctx context.Context, creds *mesh.Credentials, id, addr string, out *peerapi.ClusterConfig) error {
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	cl, err := mesh.DialClient(cctx, addr, firstNonEmpty(id, "leader"), mesh.ClientTLS(func() *mesh.Credentials { return creds }, id, nil, c.now))
+	// The call is made beside the daemon, which holds the node's session to the leader: it asks as a short
+	// call and is not taken for that session (mesh.OneShot).
+	cl, err := mesh.DialClient(cctx, addr, firstNonEmpty(id, "leader"), mesh.OneShot(mesh.ClientTLS(func() *mesh.Credentials { return creds }, id, nil, c.now)))
 	if err != nil {
 		return err
 	}

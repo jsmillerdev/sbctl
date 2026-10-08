@@ -1116,3 +1116,68 @@ func TestAFencedNodeStillHearsThePing(t *testing.T) {
 		t.Fatalf("a fenced node was given a forward stream: %d bytes, %v", n, err)
 	}
 }
+
+// A tool that runs beside a node's daemon asks its question over a session marked OneShot. The peer
+// answers it and keeps the session the daemon holds, whichever of the two nodes has the lower id: a second
+// ordinary session from the same node would replace the daemon's (the same side dialed again) or be
+// closed before the call (the other side dialed the one kept). A node may hold only a few such sessions.
+func TestAToolOfANodeDoesNotDisplaceTheNodesSession(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	pingEndpoint(h)
+	h.start()
+	n1, n2 := h.nodes["n1"], h.nodes["n2"]
+	eventually(t, "a session on both sides", func() bool { return n1.mgr.Connected("n2") && n2.mgr.Connected("n1") })
+	held := func(m *Manager, peer string) *peerConn {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.sessions[peer]
+	}
+	dial := func(from, to *tnode) *Client {
+		t.Helper()
+		c, err := DialClient(h.ctx, to.ln.Addr().String(), to.id, OneShot(ClientTLS(func() *Credentials { return from.creds }, to.id, nil, time.Now)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	for _, c := range []struct{ from, to *tnode }{{n2, n1}, {n1, n2}} {
+		before := held(c.to.mgr, c.from.id)
+		if before == nil {
+			t.Fatalf("%s holds no session to %s", c.to.id, c.from.id)
+		}
+		cl := dial(c.from, c.to)
+		var p peerapi.Ping
+		if err := cl.Call(h.ctx, "GET", peerapi.PathPing, nil, &p); err != nil || p.Node != c.to.id {
+			t.Fatalf("the call of a tool of %s to %s: %+v, %v", c.from.id, c.to.id, p, err)
+		}
+		cl.Close()
+		time.Sleep(300 * time.Millisecond) // long enough for a session that lost the tie-break to be retired
+		if now := held(c.to.mgr, c.from.id); now != before || now.sess.IsClosed() {
+			t.Fatalf("the session of %s at %s was replaced or closed by a tool's call", c.from.id, c.to.id)
+		}
+		if err := c.to.mgr.Call(h.ctx, c.from.id, "GET", peerapi.PathPing, nil, &p); err != nil || p.Node != c.from.id {
+			t.Fatalf("the daemon's session after a tool's call: %+v, %v", p, err)
+		}
+	}
+
+	var open []*Client
+	for range maxOneShotPerNode {
+		cl := dial(n2, n1)
+		var p peerapi.Ping
+		if err := cl.Call(h.ctx, "GET", peerapi.PathPing, nil, &p); err != nil {
+			t.Fatal(err)
+		}
+		open = append(open, cl)
+	}
+	var p peerapi.Ping
+	over := dial(n2, n1)
+	if err := over.Call(h.ctx, "GET", peerapi.PathPing, nil, &p); err == nil {
+		t.Fatal("a node held more short sessions than the limit")
+	}
+	open[0].Close()
+	eventually(t, "a short session to be allowed again", func() bool {
+		cl := dial(n2, n1)
+		return cl.Call(h.ctx, "GET", peerapi.PathPing, nil, &p) == nil
+	})
+}

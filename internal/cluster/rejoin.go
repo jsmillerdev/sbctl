@@ -127,7 +127,7 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 			return nil, fmt.Errorf("cluster: writing %s: %w", p, err)
 		}
 	}
-	if err := markFollower(dir, creds.NodeID, addr, now()); err != nil {
+	if err := markFollower(dir, creds.NodeID, addr, firstNonEmpty(resp.System.Leader, want), now()); err != nil {
 		return nil, fmt.Errorf("cluster: writing %s: %w", FollowerFile, err)
 	}
 	st := &JoinState{NodeID: creds.NodeID, Leader: addr, System: resp.System, At: now().UTC()}

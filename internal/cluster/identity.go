@@ -47,9 +47,10 @@ func IsFollower(dir string) bool {
 	return err == nil
 }
 
-// markFollower writes FollowerFile: who this node is and which leader it joined.
-func markFollower(dir, node, leader string, at time.Time) error {
-	return writeJSON(filepath.Join(dir, FollowerFile), map[string]any{"node_id": node, "leader": leader, "at": at.UTC()})
+// markFollower writes FollowerFile: who this node is and which leader it joined, by address and by node
+// id (empty when the answer did not name it).
+func markFollower(dir, node, leader, leaderID string, at time.Time) error {
+	return writeJSON(filepath.Join(dir, FollowerFile), map[string]any{"node_id": node, "leader": leader, "leader_id": leaderID, "at": at.UTC()})
 }
 
 // NewKey generates a node key.

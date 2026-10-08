@@ -1700,7 +1700,7 @@ func TestFollowerMarkTellsAMemberFromTheFounder(t *testing.T) {
 		t.Fatal("the identity or its mark survived a retirement")
 	}
 	// A mark without a certificate is not a member.
-	if err := markFollower(dir, "n2", "x", time.Now()); err != nil || IsFollower(dir) {
+	if err := markFollower(dir, "n2", "x", "n1", time.Now()); err != nil || IsFollower(dir) {
 		t.Fatalf("a mark with no certificate: %v", err)
 	}
 }
@@ -1770,6 +1770,33 @@ func TestConfigSyncRefreshesTheClusterSettingsFromTheLeader(t *testing.T) {
 	none := &ConfigSync{Cfg: l.cfg, ConfigPath: filepath.Join(t.TempDir(), "etc", "config.toml"), Log: quiet(), Where: sync.Where}
 	if got, err := none.Sync(ctx, false); err != nil || len(got) != 0 {
 		t.Fatalf("a server that never joined: %v, %v", got, err)
+	}
+}
+
+// With the registry out of reach the converge step falls back on the leader the node joined, and it holds
+// the leader to the node id the join recorded: a mark written by an older release has none, and then any
+// node of the cluster may answer.
+func TestConfigSyncFallbackNamesTheLeaderTheNodeJoined(t *testing.T) {
+	l := newLeader(t)
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(context.Background(), j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	dir := config.ClusterDir(j.confPath)
+	ended, cancel := context.WithCancel(context.Background()) // the system cluster is not asked for long
+	cancel()
+	sync := &ConfigSync{Cfg: j.cfg, ConfigPath: j.confPath, Log: quiet(), DSNs: []string{"host=/nonexistent port=1 user=x connect_timeout=1"}}
+	id, addr, err := sync.where(ended, dir, "n2")
+	if err != nil || id != "n1" || addr != l.cfg.PeerAddr() {
+		t.Fatalf("the leader the join recorded: %q %q %v", id, addr, err)
+	}
+	old := filepath.Join(dir, FollowerFile)
+	if err := os.WriteFile(old, []byte(`{"node_id":"n2","leader":"203.0.113.9:7443"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if id, addr, err := sync.where(ended, dir, "n2"); err != nil || id != "" || addr != "203.0.113.9:7443" {
+		t.Fatalf("a mark with no leader id: %q %q %v", id, addr, err)
 	}
 }
 
