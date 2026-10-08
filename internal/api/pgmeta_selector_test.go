@@ -71,12 +71,13 @@ func TestPGMetaHeaderSelectsTheDatabase(t *testing.T) {
 		t.Errorf("upper case host: port %s", port)
 	}
 
-	// The read-only string of a replica is run as the read-only role, which the primary sets up.
+	// The read-only string chooses the database like the read-write one and nothing more: the role
+	// stays the caller's on a replica as on the primary, so Studio's reports read pg_stat_statements
+	// as postgres does and no role has to reach the replica with the WAL first.
 	port, dsn = call(connString(readOnlyUser, id))
-	if port != replicaPort || !strings.HasPrefix(dsn, "postgres://supavise_read_only:") {
+	if port != replicaPort || !strings.HasPrefix(dsn, "postgres://postgres:pw@") {
 		t.Errorf("read-only string of a replica: port %s dsn %s", port, dsn)
 	}
-	// On the primary the string chooses the database only; the role stays the caller's.
 	if port, dsn := call(connString(readOnlyUser, testRef)); port != "1" || !strings.HasPrefix(dsn, "postgres://postgres:pw@") {
 		t.Errorf("read-only string of the primary: port %s dsn %s", port, dsn)
 	}
@@ -121,20 +122,45 @@ func TestPGMetaHeaderOfAReplicaThatIsNotReady(t *testing.T) {
 	}
 }
 
-// A caller who may not write SQL runs as the read-only role on a replica too.
+// A caller who may not write SQL runs as the read-only role on a replica too, whichever string
+// Studio sent.
 func TestPGMetaReplicaSelectionKeepsTheCallersRole(t *testing.T) {
 	rf := newRolesFixture(t)
 	f := rf.fixture
 	f.addNode(t, "eu", "eu-west-1", "", registry.NodeActive)
 	f.srv.replicas = &fakeReplicas{reg: f.reg}
 	id := f.addHealthyReplica(t, euNode, "eu-west-1", "abcdef")
-	rec := rf.doAs(rf.tokens["ro"], "GET", "/platform/pg-meta/"+testRef+"/tables", nil, connHeader, connString("postgres", id))
-	if rec.Code != 200 {
-		t.Fatalf("%d %s", rec.Code, rec.Body)
+	replicaPort := strconv.Itoa(f.cfg.ReplicaPorts(testRef, f.projectRow(t).Seq).Postgres)
+	for _, user := range []string{"postgres", readOnlyUser} {
+		rec := rf.doAs(rf.tokens["ro"], "GET", "/platform/pg-meta/"+testRef+"/tables", nil, connHeader, connString(user, id))
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", user, rec.Code, rec.Body)
+		}
+		if port, dsn := dsnPort(t, f); port != replicaPort || !strings.HasPrefix(dsn, "postgres://supavise_read_only:") {
+			t.Fatalf("%s: dsn %s", user, dsn)
+		}
 	}
-	port, dsn := dsnPort(t, f)
-	if port != strconv.Itoa(f.cfg.ReplicaPorts(testRef, f.projectRow(t).Seq).Postgres) || !strings.HasPrefix(dsn, "postgres://supavise_read_only:") {
-		t.Fatalf("dsn %s", dsn)
+}
+
+// The host of the header is read from its authority alone: an "@" in the query or the path does
+// not move it.
+func TestConnHeaderHost(t *testing.T) {
+	for _, c := range []struct {
+		in, host string
+		ok       bool
+	}{
+		{"postgresql://postgres:[YOUR-PASSWORD]@db.abc.api.example.test:5432/postgres", "db.abc.api.example.test", true},
+		{"postgres://u@db.abc.api.example.test/postgres", "db.abc.api.example.test", true},
+		{"postgresql://u:p@db.abc.api.example.test:5432/postgres?options=a@b", "db.abc.api.example.test", true},
+		{"postgresql://u:p@db.abc.api.example.test/postgres#x@y", "db.abc.api.example.test", true},
+		{"postgresql://db.abc.api.example.test/postgres?options=a@b", "", false},
+		{"postgresql://u@:5432/postgres", "", false},
+		{"mysql://u@db.abc.api.example.test", "", false},
+		{"", "", false},
+	} {
+		if host, ok := connHeaderHost(c.in); host != c.host || ok != c.ok {
+			t.Errorf("connHeaderHost(%q) = %q, %v; want %q, %v", c.in, host, ok, c.host, c.ok)
+		}
 	}
 }
 
@@ -151,8 +177,8 @@ func (r *fakeResolver) ReplicasOf(_ context.Context, ref string) ([]registry.Rep
 	return r.byRef[ref], nil
 }
 
-// The replicas a project has come from the placement Resolver: the pg-meta selector, the cap on
-// adding one and the organization's project list all ask it.
+// The replicas a project has come from the placement Resolver: the pg-meta selector and the cap on
+// adding one ask it.
 func TestReplicasComeFromThePlacementResolver(t *testing.T) {
 	rf := newReplicaFixture(t)
 	known := registry.ReplicaIdentifier(testRef, "eu-west-1", "abcdef")
@@ -177,12 +203,45 @@ func TestReplicasComeFromThePlacementResolver(t *testing.T) {
 	if rec := rf.do("POST", setupPath, map[string]any{"read_replica_region": "eu-west-1"}); rec.Code != 400 || !strings.Contains(rec.Body.String(), "maximum of 4") {
 		t.Fatalf("cap: %d %s", rec.Code, rec.Body)
 	}
-	res.byRef[testRef] = []registry.Replica{{Identifier: known, Ref: testRef, NodeID: euNode, Status: "ACTIVE_HEALTHY"}}
-	rec := rf.do("GET", "/platform/organizations/default/projects", nil)
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), known) {
-		t.Fatalf("organization projects: %d %s", rec.Code, rec.Body)
-	}
 	if len(res.asked) == 0 {
 		t.Fatal("the Resolver was never asked")
+	}
+}
+
+// replicaReads records the reads of the replicas table that go to the registry.
+type replicaReads struct {
+	registry.Registry
+	refs []string
+}
+
+func (r *replicaReads) ListReplicas(ctx context.Context, ref string) ([]registry.Replica, error) {
+	r.refs = append(r.refs, ref)
+	return r.Registry.ListReplicas(ctx, ref)
+}
+
+// The organization's project list reads the replicas of its whole page in one query, and a node
+// without a replica controller reads none.
+func TestOrganizationProjectsReadReplicasOnce(t *testing.T) {
+	rf := newReplicaFixture(t)
+	rf.addHealthyReplica(t, euNode, "eu-west-1", "abcdef")
+	rf.mgr.addProject(t, "bcdefghijklmnopqrstu", "Second project", rf.org.ID, registry.StatusActiveHealthy)
+	reads := &replicaReads{Registry: rf.reg}
+	rf.srv.reg = reads
+	res := &fakeResolver{}
+	rf.srv.placement = res
+
+	rec := rf.do("GET", "/platform/organizations/default/projects", nil)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "READ_REPLICA") {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if len(reads.refs) != 1 || reads.refs[0] != "" || len(res.asked) != 0 {
+		t.Fatalf("replica reads %q, Resolver asked %q", reads.refs, res.asked)
+	}
+
+	reads.refs = nil
+	rf.srv.replicas = nil
+	rec = rf.do("GET", "/platform/organizations/default/projects", nil)
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), "READ_REPLICA") || len(reads.refs) != 0 || len(res.asked) != 0 {
+		t.Fatalf("without a controller: %d, replica reads %q, Resolver asked %q: %s", rec.Code, reads.refs, res.asked, rec.Body)
 	}
 }
