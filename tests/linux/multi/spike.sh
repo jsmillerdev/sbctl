@@ -17,6 +17,7 @@
 #   prep       curl, sudo, python3 and the rest of what the install needs, from apt
 #   net        each node reaches the internet and the three services on the bridge
 #   peer       the nodes reach each other on port 7443, both ways, with the throughput
+#   rules      a probe: with the two DOCKER-USER rules taken away, what the nodes can still reach
 #   install    deploy/install.sh --binary of this checkout's build, the shared services active, Garage as the
 #              backup backend
 #   polkit     the supavise user restarts a supavise unit, and is refused daemon-reload and other units
@@ -38,7 +39,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib-multi.sh"
 SPIKE_EXPECT_FAIL=${SPIKE_EXPECT_FAIL:-}
 RESULTS=$LOG_DIR/results.tsv
 FACTS=$LOG_DIR/facts.tsv
-CHECK_ORDER="incus services launch boot prep net peer install polkit hardening imds project stub fakeaws fakeaws-log smoke"
+CHECK_ORDER="incus services launch boot prep net peer rules install polkit hardening imds project stub fakeaws fakeaws-log smoke"
 UNITS_IMDS=(supavise-postgres@system.service supavise-gotrue@system.service supavise-pgmeta.service supavise-supavisor.service supavise-realtime.service supavise-storage.service)
 
 # ---- results ----------------------------------------------------------------------------------------
@@ -236,6 +237,25 @@ c_peer() {
   echo "# n1 <-> n2 on $PEER_PORT"
 }
 
+# The nodes' traffic is forwarded by the host, and the runner image's Docker sets the FORWARD policy to DROP.
+# Take the rules away for a moment and record what still works; they are put back whatever happens.
+c_rules() {
+  needs peer
+  local out peer
+  iptables -w -nL DOCKER-USER >/dev/null 2>&1 || { echo "# no DOCKER-USER chain on this host"; return 0; }
+  note docker.forward_policy "$(iptables -w -S FORWARD | head -n1)"
+  trap multi_docker_rules EXIT
+  multi_docker_rules_remove
+  out=$(on n1 curl -s -o /dev/null -w '%{http_code}' -m 8 https://github.com 2>/dev/null) || true
+  peer_listen n2
+  peer=$(peer_send n1 "$(node_ip n2)" 0 2>/dev/null) || peer=none
+  on n2 systemctl stop peer-sink.service || true
+  multi_docker_rules
+  note rules.internet_without "${out:-000}"
+  note rules.n1_to_n2_without "${peer:-none}"
+  echo "# without the rules: internet from n1 answers '${out:-000}', n1 to n2 on $PEER_PORT answers '${peer:-none}'"
+}
+
 c_install() {
   local n=$1 ip t0=$SECONDS d=$LOG_DIR/$1
   ip=$(node_ip "$n")
@@ -421,6 +441,7 @@ mem_snapshot booted
 check_each prep "apt packages install" c_prep
 check_each net "internet and bridge services are reachable" c_net
 check peer "the nodes reach each other on port $PEER_PORT" c_peer
+check rules "what the nodes lose without Docker's forwarding rules (a probe)" c_rules
 check_each install "install.sh --binary succeeds" c_install
 mem_snapshot installed
 check_each polkit "polkit lets the supavise user manage only its units" c_polkit

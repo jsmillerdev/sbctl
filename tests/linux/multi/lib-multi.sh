@@ -157,6 +157,11 @@ multi_docker_rules() {
     || iptables -w -I DOCKER-USER -o "$MULTI_BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 }
 
+multi_docker_rules_remove() { # what multi_docker_rules added, for the probe that shows what it is for
+  iptables -w -D DOCKER-USER -i "$MULTI_BRIDGE" -j ACCEPT 2>/dev/null || true
+  iptables -w -D DOCKER-USER -o "$MULTI_BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+}
+
 # multi_launch_node NODE: create the instance with its address and start it (does not wait). A virtual
 # machine gets a bigger root disk than the image's; multi_grow_root grows the file system into it.
 multi_launch_node() {
