@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -236,8 +237,12 @@ type fakeFleet struct {
 	rows    []registry.Replica
 	failing map[string]error
 	hung    map[string]bool
+	// slow is how long a restart takes before it answers (or fails with failing[id]).
+	slow    map[string]time.Duration
 	failed  []string
 	classes []string
+	// failedCtxErr is the error of the context each call of Failed got, in call order.
+	failedCtxErr []error
 }
 
 func (f *fakeFleet) Replicas(_ context.Context, ref string) ([]registry.Replica, error) {
@@ -249,19 +254,24 @@ func (f *fakeFleet) Restart(ctx context.Context, r registry.Replica, class strin
 	f.classes = append(f.classes, class)
 	_ = f.h.plane.rec("Replica " + r.Identifier)
 	hung := f.hung[r.Identifier]
+	slow := f.slow[r.Identifier]
 	err := f.failing[r.Identifier]
 	f.mu.Unlock()
 	if hung {
 		<-ctx.Done() // a node that never answers
 		return ctx.Err()
 	}
+	if slow > 0 {
+		time.Sleep(slow)
+	}
 	return err
 }
 
-func (f *fakeFleet) Failed(_ context.Context, r registry.Replica, cause error) {
+func (f *fakeFleet) Failed(ctx context.Context, r registry.Replica, cause error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failed = append(f.failed, r.Identifier+": "+cause.Error())
+	f.failedCtxErr = append(f.failedCtxErr, ctx.Err())
 }
 
 // inReplicaOrder joins calls with the replicas of each run sorted: the replicas restart together, so
@@ -293,7 +303,7 @@ func replicaHarness(t *testing.T) (*harness, *registry.Project, *fakeFleet, []st
 		t.Fatal(err)
 	}
 	p := h.create(t)
-	fl := &fakeFleet{h: h, failing: map[string]error{}, hung: map[string]bool{}}
+	fl := &fakeFleet{h: h, failing: map[string]error{}, hung: map[string]bool{}, slow: map[string]time.Duration{}}
 	h.e.opts.Replicas = fl
 	var ids []string
 	for i, n := range []string{n2.ID, n3.ID} {
@@ -394,6 +404,62 @@ func TestAHungReplicaRestartEndsAtItsDeadlineAndOthersDoNotWaitForIt(t *testing.
 	}
 	if len(fl.failed) != 1 || !strings.Contains(fl.failed[0], ids[0]) || !strings.Contains(fl.failed[0], "deadline") {
 		t.Fatalf("failed = %v", fl.failed)
+	}
+}
+
+// deadlineRegistry refuses the writes of a replica's restart whose context has expired, as Postgres
+// does: the in-memory registry never looks at its context.
+type deadlineRegistry struct {
+	registry.Registry
+	refused atomic.Int32
+}
+
+func (d *deadlineRegistry) SetReplicaStatus(ctx context.Context, identifier, status, initStep, initError string) error {
+	if err := ctx.Err(); err != nil {
+		d.refused.Add(1)
+		return err
+	}
+	return d.Registry.SetReplicaStatus(ctx, identifier, status, initStep, initError)
+}
+
+func (d *deadlineRegistry) AppendEvent(ctx context.Context, ref, kind string, payload any) error {
+	if err := ctx.Err(); err != nil {
+		d.refused.Add(1)
+		return err
+	}
+	return d.Registry.AppendEvent(ctx, ref, kind, payload)
+}
+
+// What a restart records is written on a context that starts after the restart: one that was started
+// before it would have run out when the restart takes longer than the budget of a cleanup (three
+// minutes), which is the case the restart deadline is for. The budget is 100 ms here, the deadline
+// 2 s, and the replicas answer after 300 ms.
+func TestARestartLongerThanTheCleanupBudgetStillRecordsItsOutcome(t *testing.T) {
+	ctx := context.Background()
+	h, p, fl, ids := replicaHarness(t)
+	reg := &deadlineRegistry{Registry: h.reg}
+	h.e.reg = reg
+	h.e.recordBudget = 100 * time.Millisecond
+	h.e.opts.ReplicaRestartTimeout = 2 * time.Second
+	fl.slow[ids[0]], fl.slow[ids[1]] = 300*time.Millisecond, 300*time.Millisecond
+	fl.failing[ids[0]] = errors.New("the standby is still replaying")
+
+	h.e.restartReplicas(ctx, p, "a test", EventReplicaRestartFailed, registry.StatusRestarting)
+
+	if n := reg.refused.Load(); n != 0 {
+		t.Fatalf("%d writes were refused for a context that had expired", n)
+	}
+	if r, _ := h.reg.GetReplica(ctx, ids[0]); r.Status != string(registry.StatusActiveUnhealthy) {
+		t.Fatalf("the replica that failed after the budget is %s", r.Status)
+	}
+	if r, _ := h.reg.GetReplica(ctx, ids[1]); r.Status != string(registry.StatusActiveHealthy) {
+		t.Fatalf("the replica that came back after the budget is %s", r.Status)
+	}
+	if ev := h.events(t, p.Ref); !strings.Contains(ev, EventReplicaRestartFailed) {
+		t.Fatalf("no event for the failed restart: %q", ev)
+	}
+	if len(fl.failed) != 1 || !strings.Contains(fl.failed[0], ids[0]) || fl.failedCtxErr[0] != nil {
+		t.Fatalf("failed = %v, context errors = %v", fl.failed, fl.failedCtxErr)
 	}
 }
 

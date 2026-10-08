@@ -83,14 +83,23 @@ func (e *Engine) restartReplicas(ctx context.Context, p *registry.Project, why, 
 	wg.Wait()
 }
 
+// recordCtx is the context for the writes that record how a replica's restart went. It outlives the
+// caller, and its budget starts when it is made, so it is made where the writes are.
+func (e *Engine) recordCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	budget := e.recordBudget
+	if budget <= 0 {
+		budget = cleanupBudget
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), budget)
+}
+
 // restartReplica restarts one replica of p and records how it went.
 func (e *Engine) restartReplica(ctx context.Context, p *registry.Project, r registry.Replica, why, failEvent string, during registry.Status) {
-	// The rows are written after the restart, which may have taken the whole deadline or the caller's
-	// context: the outcome is recorded either way.
-	cctx, cancel := cleanupCtx(ctx)
-	defer cancel()
 	if during != "" {
-		if err := e.reg.SetReplicaStatus(cctx, r.Identifier, string(during), r.InitStep, r.InitError); err != nil {
+		dctx, cancel := e.recordCtx(ctx)
+		err := e.reg.SetReplicaStatus(dctx, r.Identifier, string(during), r.InitStep, r.InitError)
+		cancel()
+		if err != nil {
 			e.log.Warn("restarting the replicas: marking a replica "+string(during), "replica", r.Identifier, "error", err)
 		}
 	}
@@ -101,6 +110,10 @@ func (e *Engine) restartReplica(ctx context.Context, p *registry.Project, r regi
 	rctx, stop := context.WithTimeout(ctx, timeout)
 	err := e.opts.Replicas.Restart(rctx, r, p.Class)
 	stop()
+	// The outcome is written on a context made now: the restart may have taken the whole deadline, longer
+	// than a context made before it would last, or the caller's context may be gone. It is recorded either way.
+	cctx, cancel := e.recordCtx(ctx)
+	defer cancel()
 	status := registry.StatusActiveHealthy
 	switch {
 	case err == nil:

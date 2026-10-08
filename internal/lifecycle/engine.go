@@ -123,6 +123,9 @@ type Engine struct {
 	capacity capacityState
 	// remoteBackups takes the final backup of a project homed on another node (SetRemoteBackups).
 	remoteBackups RemoteBackups
+	// recordBudget is how long what a replica's restart left to record may take to write (zero: the
+	// budget of a cleanup); tests shorten it.
+	recordBudget time.Duration
 }
 
 var _ Manager = (*Engine)(nil)
@@ -227,9 +230,12 @@ func (e *Engine) SetPlane(p Plane) { e.plane = p }
 // NodeID is the node the Engine runs on ("" outside a cluster).
 func (e *Engine) NodeID() string { return e.opts.NodeID }
 
+// cleanupBudget is how long the cleanup after a failure may take.
+const cleanupBudget = 3 * time.Minute
+
 // cleanupCtx outlives a cancelled request: cleanup after a failure must still run.
 func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupBudget)
 }
 
 func (e *Engine) versions() (map[string]string, error) {
