@@ -98,10 +98,41 @@ var reservedNames = map[string]bool{
 	"vpn": true, "git": true, "test": true, "staging": true, "prod": true, "production": true,
 }
 
+// Replica and load balancer hosts are single labels under api.<domain> too (design 2.7.1): a replica's
+// is its identifier, <ref>-rr-<region>-<id6>, and a project's balancer is <ref>-lb.
+const (
+	replicaInfix   = "-rr-"
+	balancerSuffix = "-lb"
+)
+
+// replicaHostLabel reports whether n has the shape of a replica or balancer host label. It is wider
+// than the identifiers that exist: a name that could become one is not for a vanity subdomain.
+func replicaHostLabel(n string) bool {
+	return strings.Contains(n, replicaInfix) || strings.HasSuffix(n, balancerSuffix)
+}
+
 // ValidateVanityName normalizes a vanity subdomain and refuses a malformed name (one DNS label
-// of at most 63 letters, digits and hyphens, no hyphen at either end), a reserved one, and one
-// that looks like a project ref (twenty lower-case letters: those hosts belong to projects).
+// of at most 63 letters, digits and hyphens, no hyphen at either end), a reserved one, one that
+// looks like a project ref (twenty lower-case letters: those hosts belong to projects), and one
+// that contains -rr- or ends in -lb (the shape of a replica's or a load balancer's host).
 func ValidateVanityName(in string) (string, error) {
+	n, err := vanityLabel(in)
+	if err != nil {
+		return "", err
+	}
+	if replicaHostLabel(n) {
+		return "", &Error{Kind: KindInvalid, Reserved: true, Msg: "vanity_subdomain " + n + " is reserved: a name that contains -rr- or ends in -lb is the shape of a read replica or load balancer host"}
+	}
+	return n, nil
+}
+
+// RoutableVanityName is ValidateVanityName without the -rr- and -lb reservation. The edge uses it
+// to decide whether a stored vanity row may serve its host: a row made before the reservation
+// existed keeps working, and the edge resolves a replica or balancer host before any route, so the
+// row cannot take one over.
+func RoutableVanityName(in string) (string, error) { return vanityLabel(in) }
+
+func vanityLabel(in string) (string, error) {
 	n := strings.ToLower(strings.TrimSpace(in))
 	if n == "" {
 		return "", invalid("vanity_subdomain is required")

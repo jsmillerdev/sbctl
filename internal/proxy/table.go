@@ -210,12 +210,6 @@ func (t *table) resolve(host string) (hostMatch, bool) {
 	return hostMatch{}, false
 }
 
-// lookup resolves a request host to a project, however the host reaches it.
-func (t *table) lookup(host string) (project, bool) {
-	m, ok := t.resolve(host)
-	return m.project, ok
-}
-
 // routeKind reports how host reaches a project: "derived", "vanity", "custom", "replica" or
 // "balancer"; "" when it does not.
 func (t *table) routeKind(host string) string {
@@ -363,7 +357,9 @@ func (t *table) attachLocked(ref string) {
 // the proxy owns itself (a derived project host, api.<domain>, studio.<domain>) are ignored: no
 // route may take over another project's host or the control-plane hosts. The one exception is a
 // vanity row (written by the domain store) for <name>.api.<domain> where name is a valid vanity
-// name, which cannot have the shape of a ref or be one of the reserved names.
+// name, which cannot have the shape of a ref or be one of the reserved names. A name that
+// contains -rr- or ends in -lb is refused when a vanity name is chosen (design 2.7.1) but still
+// served when a row for it exists, as before; resolve looks at replica and balancer hosts first.
 func (t *table) customRoutes(rs []registry.Route) (map[string]string, map[string]string) {
 	m := make(map[string]string, len(rs))
 	kinds := make(map[string]string, len(rs))
@@ -371,7 +367,7 @@ func (t *table) customRoutes(rs []registry.Route) (map[string]string, map[string
 		h := normalizeHost(r.Host)
 		if own := t.cfg.RefFromProjectHost(h); own != "" || h == t.cfg.APIHost() || h == t.cfg.StudioHost() {
 			if r.Kind == registry.RouteVanity && own != "" {
-				if n, err := domains.ValidateVanityName(own); err == nil && n == own {
+				if n, err := domains.RoutableVanityName(own); err == nil && n == own {
 					m[h], kinds[h] = r.Ref, registry.RouteVanity
 					continue
 				}

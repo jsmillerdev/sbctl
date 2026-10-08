@@ -161,6 +161,60 @@ func TestValidateVanityName(t *testing.T) {
 	}
 }
 
+// The labels of a replica's host (<ref>-rr-<region>-<id6>) and a project's load balancer host
+// (<ref>-lb) are not for vanity subdomains (design 2.7.1): any name that contains -rr- or ends in -lb.
+func TestValidateVanityNameReservesReplicaAndBalancerHosts(t *testing.T) {
+	for _, in := range []string{
+		refA + "-lb", refA + "-rr-eu-abc123", "other-lb", "my-lb", "a-lb", "LB-LB", "shop-rr-eu", "x-rr-y", "a-rr-b-rr-c", "-lb",
+	} {
+		if got, err := ValidateVanityName(in); err == nil {
+			t.Errorf("ValidateVanityName(%q) = %q, want an error", in, got)
+		}
+	}
+	for _, in := range []string{refA + "-lb", "other-lb", "shop-rr-eu"} {
+		_, err := ValidateVanityName(in)
+		e, ok := AsError(err)
+		if !ok || e.Kind != KindInvalid || !e.Reserved || !strings.Contains(e.Msg, "-rr-") {
+			t.Errorf("ValidateVanityName(%q): %v, want a reserved-name error that says why", in, err)
+		}
+	}
+	// Names that only look alike are fine: lb or rr in another place, or without the hyphens.
+	for _, in := range []string{"lb", "lb-app", "lbapp", "applb", "rr", "rr-app", "app-rr", "app-rrx", "a-rrr-b", "app-lbx", "app-lb2"} {
+		if got, err := ValidateVanityName(in); err != nil || got != in {
+			t.Errorf("ValidateVanityName(%q) = %q, %v; want it accepted", in, got, err)
+		}
+	}
+}
+
+// RoutableVanityName is what the edge asks of a stored vanity row. A row made before the reservation
+// existed keeps working; the shapes that were never allowed still do not.
+func TestRoutableVanityName(t *testing.T) {
+	for _, in := range []string{"acme", "my-lb", "shop-rr-eu", refA + "-lb"} {
+		if got, err := RoutableVanityName(in); err != nil || got != in {
+			t.Errorf("RoutableVanityName(%q) = %q, %v", in, got, err)
+		}
+	}
+	for _, in := range []string{"", "api", "system", refA, "xn--abc", "a.b", "-a"} {
+		if got, err := RoutableVanityName(in); err == nil {
+			t.Errorf("RoutableVanityName(%q) = %q, want an error", in, got)
+		}
+	}
+}
+
+// The availability check answers "not available" for a reserved name instead of failing.
+func TestVanityAvailabilityOfReplicaHostNames(t *testing.T) {
+	e := newEnv(t, nil)
+	for _, name := range []string{refA + "-lb", "shop-rr-eu-abc123"} {
+		ok, err := e.svc.CheckVanity(context.Background(), refA, name)
+		if err != nil || ok {
+			t.Errorf("%s: available %v, err %v; want unavailable and no error", name, ok, err)
+		}
+	}
+	if _, err := e.svc.ActivateVanity(context.Background(), refA, "other-lb"); err == nil || kindOf(t, err) != KindInvalid {
+		t.Errorf("activating a reserved name: %v", err)
+	}
+}
+
 func TestCustomHostnameFlow(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()

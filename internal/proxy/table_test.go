@@ -15,6 +15,13 @@ import (
 	"github.com/supavise/supavise/internal/secrets"
 )
 
+// lookup resolves a request host to a project, however the host reaches it. Only the tests ask it; the
+// handler wants the kind of host too (resolve).
+func (t *table) lookup(host string) (project, bool) {
+	m, ok := t.resolve(host)
+	return m.project, ok
+}
+
 func TestKeysAreCachedPerRef(t *testing.T) {
 	h := newHarness(t)
 	for i := 0; i < 5; i++ {
