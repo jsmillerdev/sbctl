@@ -36,8 +36,8 @@ const (
 	// directory. {op} is a BackupOp; the body is a BackupRequest and the answer a BackupResult.
 	PathBackup = "/peer/v1/projects/{ref}/backup/{op}"
 	// PathFleetRefresh: POST, leader to a node that runs Supavisor. Drops the node's cached copy
-	// of the pooler tenant ({tenant} is the external id: a ref or a replica identifier). No
-	// body; the answer is a RefreshResult.
+	// of the pooler tenant ({tenant} is the external id: a ref or a replica identifier). The
+	// body is an optional RefreshRequest; the answer is a RefreshResult.
 	PathFleetRefresh = "/peer/v1/fleet/refresh/{tenant}"
 	// PathReport: POST, node to leader, every 10 seconds. A Report in, 204 out.
 	PathReport = "/peer/v1/report"
@@ -241,7 +241,17 @@ type BackupResult struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
-// RefreshResult is the answer of PathFleetRefresh.
+// RefreshRequest is the optional body of PathFleetRefresh. A follower's Supavisor reads the
+// tenant row from the follower's own standby of the system cluster, so it must not drop its copy
+// before the standby has replayed the change: LSN is the leader's pg_current_wal_lsn() taken
+// after it wrote the row, and the node waits until its replay has reached it (a bounded wait,
+// then 503 with code "replay_behind"). Without it the node refreshes at once.
+type RefreshRequest struct {
+	LSN string `json:"lsn,omitempty"`
+}
+
+// RefreshResult is the answer of PathFleetRefresh. Refreshed is false when the node does not run
+// Supavisor.
 type RefreshResult struct {
 	Refreshed bool `json:"refreshed"`
 }
