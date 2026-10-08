@@ -412,6 +412,9 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 	if err != nil {
 		return nil, err
 	}
+	if err := e.atHome(p, "upgrade"); err != nil {
+		return nil, err
+	}
 	if p.Ref == config.SystemRef {
 		return nil, fmt.Errorf("%w: the system project belongs to the node", ErrUpgradeUnsupported)
 	}
@@ -1160,6 +1163,9 @@ func (e *Engine) RestartPending(ctx context.Context, ref string) (bool, error) {
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return false, err
+	}
+	if err := e.atHome(p, "restart"); err != nil {
 		return false, err
 	}
 	if !active(p.Status) {

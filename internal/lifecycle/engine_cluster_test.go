@@ -186,7 +186,7 @@ func TestCapacityCountsReplicasOnTheNode(t *testing.T) {
 	if err := (Capacity{Node: NodeResources{MemoryBytes: 4 * gib, CPUs: 4}, Overcommit: 1, BudgetBytes: 2 * gib, CommittedBytes: 2 * gib, Projects: 1, Replicas: 1}).Fits(mustClass(t, "small")); err == nil || !strings.Contains(err.Error(), "after 1 other projects and 1 replica") {
 		t.Fatalf("fits = %v", err)
 	}
-	// A failed or going-down replica holds nothing; neither does the replica of a paused project.
+	// A failed or going-down replica holds nothing.
 	if err := c.reg.SetReplicaStatus(ctx, id, registry.ReplicaInitError, "3_download_base_backup_failed", "x"); err != nil {
 		t.Fatal(err)
 	}
@@ -199,11 +199,12 @@ func TestCapacityCountsReplicasOnTheNode(t *testing.T) {
 	if cp, _, _ = c.e.Capacity(ctx, c.home1.Ref); cp.Replicas != 0 {
 		t.Fatalf("the excluded project's replica counted: %+v", cp)
 	}
+	// Pausing a project does not stop its replicas, so they keep their memory.
 	if err := c.reg.SetProjectStatus(ctx, c.home1.Ref, registry.StatusInactive); err != nil {
 		t.Fatal(err)
 	}
-	if cp, _, _ = c.e.Capacity(ctx, ""); cp.Replicas != 0 {
-		t.Fatalf("the replica of a paused project counted: %+v", cp)
+	if cp, _, _ = c.e.Capacity(ctx, ""); cp.Replicas != 1 || cp.CommittedBytes != projectMemory(c.home2)+mem {
+		t.Fatalf("the replica of a paused project did not count: %+v", cp)
 	}
 	// On n1 the same registry says: one project homed here, no replicas.
 	if err := c.reg.SetProjectStatus(ctx, c.home1.Ref, registry.StatusActiveHealthy); err != nil {

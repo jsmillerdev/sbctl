@@ -469,10 +469,12 @@ replica, never both. The role decides the ports and the settings when the units 
   `ReplicaHealth` (cluster and PostgREST; a replica has no GoTrue) and `ObserveReplica` (role,
   receiver status, LSNs and lag as Studio computes it: 0 when everything received is replayed and
   the receiver streams, else the time since the last replayed commit).
-- `PromoteReplica` (step 4 of a project switchover): writes `promote.ok` with the epoch (the content
-  `backup.FormatPromoteOK` writes, which lets the WAL relay accept the first push), waits for replay to
-  reach `WaitLSN` and everything received, optionally lets `restore_command` drain the archive (replay
-  must stand still for one `wal_retrieve_retry_interval`, at most 10 seconds), runs `pg_promote` and a
+- `PromoteReplica` (step 4 of a project switchover): waits for replay to reach `WaitLSN` (the record that
+  starts there must be replayed, and everything received: `FinalCheckpoint` gives the start of the
+  old primary's shutdown checkpoint, its last record), optionally lets `restore_command` drain the archive
+  (replay must stand still for one `wal_retrieve_retry_interval`, at most 10 seconds), writes
+  `promote.ok` with the epoch (the content `backup.FormatPromoteOK` writes, which lets the WAL relay
+  accept the first push; a standby that does not promote carries none), runs `pg_promote` and a
   checkpoint, stops the units, removes the recovery settings from `postgresql.auto.conf` and
   `standby.signal`, and starts the cluster from the primary's spec on the canonical port. GoTrue and
   PostgREST start with `Start` once the registry names the node the home. A repeat after a failure at any
@@ -482,11 +484,19 @@ replica, never both. The role decides the ports and the settings when the units 
   `primary_conninfo` (the canonical port, a forwarder to the new home), `restore_command`
   (`PlaneOptions.RestoreCommandFor`) and `recovery_target_timeline = 'latest'`, creates
   `standby.signal` and starts the replica's units. The old timeline ends at the shutdown checkpoint
-  where the new primary's begins, so no base backup is read. `FinalCheckpoint` gives the failover
-  orchestrator the position to wait for.
+  where the new primary's begins, so no base backup is read. A repeat after the standby it started
+  stopped or crashed starts it again without the shutdown check, which only a primary has to pass.
+- The ports. On the node of a replica the canonical ports are forwarders to the project's home, and on
+  a project's old home the replica ports may be forwarders to another replica. `PromoteReplica` and
+  `DemoteToReplica` take the project's ports from the forwarders before they start Postgres on one
+  (`PlaneOptions.HoldPorts`, `SetPortHolder`; the daemon binds it to `mesh.Forwarders.Suspend`). A
+  demotion gives them back when it returns. A promotion keeps them until `Start` of the project
+  succeeds on the node, which is after the registry names the node the home, and gives them back at
+  once when it fails. `Start` of a project with no hold does nothing more than before.
 - `ReloadSchema` and `RunSchemaReload` send `SIGUSR1` to the replica's PostgREST every
   `[replicas] schema_reload_seconds` (default 10): the NOTIFY alone can arrive before the WAL of the
-  change was replayed (spike S3).
+  change was replayed (spike S3). A PostgREST that started less than 5 seconds ago is left alone, because
+  `SIGUSR1` ends a process that has not installed its handler yet.
 
 `pg_cron` and `pg_net` need no setting: their workers do not start on a standby and start at the
 promotion without a restart (spike S2). `ClusterSQL` (`PlaneOptions.ClusterSQL`) is the seam for the SQL
@@ -495,7 +505,11 @@ these operations run, so that the state machines are tested with a fake runner.
 ### The Engine in a cluster
 
 `Options.NodeID` is the node the Engine runs on; `StartActive`, `Recover` and `EnsureTenants` leave a
-project homed on another node (`registry.Project.NodeID`) to its home. `Open` looks the id up
+project homed on another node (`registry.Project.NodeID`) to its home, and so do pause, resume, delete,
+key rotation, settings, password change, resize, upgrade and restore: they answer `ErrInvalidState`
+naming the home, because this node's plane would act on whatever it holds of the project, which is a
+replica. An Engine whose plane is a `HomeRouter` (`internal/placement`'s `Router`) reaches the project
+on its home instead. `Open` looks the id up
 (`SelfNode`: the node named `[node] name`, else the founder on a writable registry). With
 `OpenOptions.ReadOnly` (a follower) the registry opens with `registry.OpenReadOnly` through the system
 standby's socket on the replica port (`FollowerRegistryDSN`), the Engine takes no advisory locks, and
@@ -504,13 +518,22 @@ node's plane; the router has every optional capability the Engine finds by type 
 (`FullPlane`).
 
 - `Capacity` counts the replicas on the node with their project's memory cap (`ComputeNodeCapacity`);
-  a failed or going-down replica, the replica of a paused project and the system standby count nothing.
+  a failed or going-down replica and the system standby count nothing. The replica of a paused project
+  counts: pausing stops the project's own units, and its replicas keep their memory.
   `AdmitReplica` is the check a node runs before it takes a replica: room in the budget and on the
   disk (the base backup's size plus a quarter and 1 GiB).
 - Resize: a larger size restarts the replicas first, a smaller one last (`ReplicaFleet`,
   `Options.Replicas`). A replica that does not come back is `ACTIVE_UNHEALTHY`, leaves the event
   `replica.resize_failed` and is reported through `ReplicaFleet.Failed`; it does not stop the primary.
   A grow whose primary fails puts the replicas back on the old size.
+- Postgres settings: a save that restarts the primary (`ApplyOptions.RestartDatabase`, with a setting
+  that waits for a restart) restarts the replicas after it. A standby pauses replay when its
+  `max_connections`, `max_worker_processes`, `max_wal_senders`, `max_prepared_transactions` or
+  `max_locks_per_transaction` is below the primary's, and resumes when it restarts on the new values.
+  The replicas restart after the primary whichever way the value moved, so a raise leaves a replica
+  paused for the seconds the restart takes. A replica that does not come back is `ACTIVE_UNHEALTHY`,
+  leaves the event `replica.restart_failed` and is reported through `ReplicaFleet.Failed`. A save that
+  leaves the restart to the user restarts no replica.
 
 ## Tests
 
@@ -535,6 +558,8 @@ and `upgrade-smoke` run the systemd, compute size, saved settings and upgrade fl
   path. Upgrades never touch the shared services (Supavisor, Realtime, Storage, pgmeta, Studio, the edge
   runtime); they move with the node.
 - `Usage` reports disk bytes and unit memory only.
+- A major upgrade of a project that has replicas is refused (`has_replicas`); there is no option that
+  drops the replicas first.
 - A project homed on another node answers `ErrNotSupported` to the optional capabilities (saved
   settings, role passwords, extensions); they are applied on its home. Create with a `DataSeeder` runs
   on the node that is the home.

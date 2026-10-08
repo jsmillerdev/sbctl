@@ -30,35 +30,48 @@ func (e *Engine) SetReplicaFleet(f ReplicaFleet) { e.opts.Replicas = f }
 // on its project.
 const EventReplicaResizeFailed = "replica.resize_failed"
 
+// EventReplicaRestartFailed is the event a replica that did not come back after the project's
+// Postgres settings made the primary restart leaves on its project.
+const EventReplicaRestartFailed = "replica.restart_failed"
+
 // resizeReplicas restarts every replica of p on the size p has now. A replica that is still being
 // set up or removed is left alone (it renders from the project row when it starts). A failure marks
 // the replica ACTIVE_UNHEALTHY, records an event and tells the fleet; it never returns an error,
 // because a replica must not stop the primary's resize.
 func (e *Engine) resizeReplicas(ctx context.Context, p *registry.Project) {
+	e.restartReplicas(ctx, p, "resize to "+p.Class, EventReplicaResizeFailed, registry.StatusResizing)
+}
+
+// restartReplicas restarts every replica of p on the size p has now and tells the fleet of the ones
+// that do not come back; why says what made the restart necessary. During is the status the registry
+// shows while a replica restarts ("" leaves it as it is).
+func (e *Engine) restartReplicas(ctx context.Context, p *registry.Project, why, failEvent string, during registry.Status) {
 	if e.opts.Replicas == nil || p.Ref == config.SystemRef {
 		return
 	}
 	rs, err := e.opts.Replicas.Replicas(ctx, p.Ref)
 	if err != nil {
-		e.log.Warn("resize: listing the replicas", "ref", p.Ref, "error", err)
+		e.log.Warn("restarting the replicas: listing them", "ref", p.Ref, "why", why, "error", err)
 		return
 	}
 	for _, r := range rs {
 		if r.Status != string(registry.StatusActiveHealthy) && r.Status != string(registry.StatusActiveUnhealthy) {
 			continue
 		}
-		if err := e.reg.SetReplicaStatus(ctx, r.Identifier, string(registry.StatusResizing), r.InitStep, r.InitError); err != nil {
-			e.log.Warn("resize: marking a replica RESIZING", "replica", r.Identifier, "error", err)
+		if during != "" {
+			if err := e.reg.SetReplicaStatus(ctx, r.Identifier, string(during), r.InitStep, r.InitError); err != nil {
+				e.log.Warn("restarting the replicas: marking a replica "+string(during), "replica", r.Identifier, "error", err)
+			}
 		}
 		status := registry.StatusActiveHealthy
 		if err := e.opts.Replicas.Restart(ctx, r, p.Class); err != nil {
 			status = registry.StatusActiveUnhealthy
-			e.log.Warn("resize: a replica did not come back on the new size", "replica", r.Identifier, "node", r.NodeID, "error", err)
-			e.event(ctx, p.Ref, EventReplicaResizeFailed, map[string]any{"replica": r.Identifier, "node": r.NodeID, "class": p.Class, "error": err.Error()})
-			e.opts.Replicas.Failed(ctx, r, fmt.Errorf("resize to %s: %w", p.Class, err))
+			e.log.Warn("a replica did not come back after its restart", "replica", r.Identifier, "node", r.NodeID, "why", why, "error", err)
+			e.event(ctx, p.Ref, failEvent, map[string]any{"replica": r.Identifier, "node": r.NodeID, "class": p.Class, "error": err.Error()})
+			e.opts.Replicas.Failed(ctx, r, fmt.Errorf("%s: %w", why, err))
 		}
 		if err := e.reg.SetReplicaStatus(ctx, r.Identifier, string(status), r.InitStep, r.InitError); err != nil {
-			e.log.Warn("resize: recording a replica's status", "replica", r.Identifier, "error", err)
+			e.log.Warn("restarting the replicas: recording a replica's status", "replica", r.Identifier, "error", err)
 		}
 	}
 }

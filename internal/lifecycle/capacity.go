@@ -216,8 +216,9 @@ func replicaCounts(s string) bool {
 // ComputeNodeCapacity is ComputeCapacity for the node with id node (empty: every project is
 // this node's): the projects homed on another node do not count, and each replica in rs (the
 // replicas on this node) counts with the memory cap of its project, which is the size its spec is
-// rendered from. A replica of the project exclude is left out with the project, and so are
-// those of a project that is paused (they stop with it) and the system cluster's standby.
+// rendered from. A replica of the project exclude is left out with the project, and so is the
+// system cluster's standby. A replica of a paused project counts: pausing a project stops its own
+// units and not its replicas, which keep their memory.
 func ComputeNodeCapacity(cfg *config.Config, n NodeResources, node string, ps []registry.Project, rs []registry.Replica, exclude string) Capacity {
 	c := Capacity{Node: n, Overcommit: cfg.Compute.OvercommitRatio()}
 	c.BudgetBytes = int64(float64(n.MemoryBytes) * c.Overcommit)
@@ -236,7 +237,7 @@ func ComputeNodeCapacity(cfg *config.Config, n NodeResources, node string, ps []
 	}
 	for _, r := range rs {
 		p := byRef[r.Ref]
-		if p == nil || p.Ref == config.SystemRef || p.Ref == exclude || !countsAgainstNode(p.Status) || !replicaCounts(r.Status) {
+		if p == nil || p.Ref == config.SystemRef || p.Ref == exclude || p.Status == registry.StatusRemoved || !replicaCounts(r.Status) {
 			continue
 		}
 		c.CommittedBytes += projectMemory(p)

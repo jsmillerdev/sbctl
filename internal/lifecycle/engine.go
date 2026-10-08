@@ -161,6 +161,19 @@ func (e *Engine) homedHere(p *registry.Project) bool {
 	return e.opts.NodeID == "" || p.NodeID == "" || p.NodeID == e.opts.NodeID
 }
 
+// atHome refuses op on a project that is homed on another node unless the Engine drives a plane that
+// routes by home. A node that holds a replica of the project would otherwise stop, restart or delete
+// the replica and flip the project's status in the registry.
+func (e *Engine) atHome(p *registry.Project, op string) error {
+	if e.homedHere(p) {
+		return nil
+	}
+	if _, ok := e.plane.(HomeRouter); ok {
+		return nil
+	}
+	return fmt.Errorf("%w: cannot %s %s here: it is homed on node %s and this is node %s", ErrInvalidState, op, p.Ref, p.NodeID, e.opts.NodeID)
+}
+
 // SetPlane replaces the plane the Engine drives. internal/app calls it before the Engine serves a
 // request, to put the plane router (internal/placement) in front of the node's own plane in a
 // cluster; it is not safe to call while operations run.
@@ -501,6 +514,9 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
+	if err := e.atHome(p, "pause"); err != nil {
+		return err
+	}
 	// A project whose restore failed can be paused, and resumed after: the way back to ACTIVE_HEALTHY
 	// when the original data is intact.
 	if ref == config.SystemRef || !(active(p.Status) || p.Status == registry.StatusRestoreFailed || inRestore(ctx, p)) {
@@ -546,6 +562,9 @@ func (e *Engine) resume(ctx context.Context, ref string, checkNode bool) error {
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return err
+	}
+	if err := e.atHome(p, "resume"); err != nil {
 		return err
 	}
 	if ref == config.SystemRef || !(p.Status == registry.StatusInactive || inRestore(ctx, p)) {
@@ -609,6 +628,9 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return err
+	}
+	if err := e.atHome(p, "delete"); err != nil {
 		return err
 	}
 	if ref == config.SystemRef {
@@ -823,6 +845,9 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return nil, err
+	}
+	if err := e.atHome(p, "rotate keys of"); err != nil {
 		return nil, err
 	}
 	if p.Status != registry.StatusInactive && !active(p.Status) {

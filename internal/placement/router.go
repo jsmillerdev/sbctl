@@ -42,15 +42,20 @@ type Router struct {
 }
 
 var (
-	_ PlaneRouter         = (*Router)(nil)
-	_ lifecycle.FullPlane = (*Router)(nil)
-	_ CheckpointReader    = (*Router)(nil)
+	_ PlaneRouter          = (*Router)(nil)
+	_ lifecycle.FullPlane  = (*Router)(nil)
+	_ lifecycle.HomeRouter = (*Router)(nil)
+	_ CheckpointReader     = (*Router)(nil)
 )
 
 // NewRouter builds the router.
 func NewRouter(o RouterOptions) *Router {
 	return &Router{opts: o, remotes: map[string]*RemotePlane{}}
 }
+
+// RoutesByHome implements lifecycle.HomeRouter: an Engine that drives a Router may act on a project
+// homed on another node.
+func (r *Router) RoutesByHome() {}
 
 // Local implements PlaneRouter.
 func (r *Router) Local() lifecycle.Plane { return r.opts.Local }

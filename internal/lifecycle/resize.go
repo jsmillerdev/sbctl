@@ -115,6 +115,9 @@ func (e *Engine) beginResize(ctx context.Context, ref string, to Class, unlock f
 	if err != nil {
 		return nil, err
 	}
+	if err := e.atHome(p, "resize"); err != nil {
+		return nil, err
+	}
 	if !(active(p.Status) || p.Status == registry.StatusInactive) {
 		return nil, invalidState(p, "resize")
 	}

@@ -17,6 +17,14 @@ type FullPlane interface {
 	PendingRestarter
 }
 
+// HomeRouter marks a Plane that sends each call for a project to the node the project is homed on
+// (the plane router of internal/placement). An Engine drives a project homed on another node only
+// through one: the node's own plane would act on whatever the node holds of that project, which is
+// at most a replica.
+type HomeRouter interface {
+	RoutesByHome()
+}
+
 // The capabilities of a FullPlane that the Engine's files define for themselves.
 type (
 	// ConfigPlane is what Engine.ApplyConfig needs beyond Plane.
