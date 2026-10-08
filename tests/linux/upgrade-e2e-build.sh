@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Builds the binaries that tests/linux/upgrade-e2e.sh upgrades between, into OUT_DIR:
 #
-#   prev   the previous release: origin/main (this checkout when origin/main is not there) with
-#          older GoTrue, PostgREST, postgres-meta and Storage pins, as v0.0.1
+#   prev   the previous release: origin/main as this checkout last merged it (the merge base of HEAD
+#          and origin/main, which is origin/main itself on a branch that is up to date; this checkout
+#          when there is no origin/main) with older GoTrue, PostgREST, postgres-meta and Storage
+#          pins, as v0.0.1. A main that moved on without this checkout would render the units
+#          differently and restart every project at the first start of the new daemon, which is a
+#          fact about main and not what the test is about.
 #   v2     this checkout, as v0.0.2: the release the node is upgraded to
 #   v4     this checkout, as v0.0.4, pinning a PostgREST release whose launcher the test makes exit
 #   v5     this checkout, as v0.0.5, pinning a newer GoTrue release
@@ -53,7 +57,9 @@ trap 'git worktree remove --force "$work/prev" 2>/dev/null || true; git worktree
 
 # The previous release. A checkout that has no origin/main (a local run) stands in for it.
 prev_ref=HEAD
-if git fetch --no-tags --depth=1 origin main 2>/dev/null; then prev_ref=FETCH_HEAD; fi
+if git fetch --no-tags origin main 2>/dev/null; then
+  prev_ref=$(git merge-base HEAD FETCH_HEAD 2>/dev/null || git rev-parse FETCH_HEAD)
+fi
 git worktree add --detach "$work/prev" "$prev_ref" >/dev/null
 pins "$work/prev/internal/versions/versions.yaml" "$out/prev.versions.yaml" \
   "auth=$OLD_AUTH" "postgrest=$OLD_REST" "pgmeta=$OLD_META" "storage=$OLD_STORAGE"
