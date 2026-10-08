@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,7 +14,9 @@ import (
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/cluster"
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -75,6 +78,57 @@ func TestHandoffTakeover(t *testing.T) {
 	tk = &handoffTakeover{m: memberOf(cluster.RoleLeader, 5), log: quiet(), wait: 20 * time.Millisecond}
 	if err := tk.BecomeLeader(context.Background(), 6); !errors.Is(err, ErrRoleChanged) {
 		t.Fatalf("BecomeLeader without a restart = %v", err)
+	}
+}
+
+// The failover lock is the Engine's lock: on a Postgres registry a lifecycle operation on the project
+// waits for it, as it waits for another Engine's. The key is a copy of the Engine's, so only an Engine
+// operation proves that the two are the same.
+func TestProjectLockerExcludesTheEnginesOperationsOnPostgres(t *testing.T) {
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	reg, err := registry.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	cfg := config.Default()
+	eng := lifecycle.NewEngine(cfg, reg, nil, nopArts{}, lifecycle.NewPostgresPlane(cfg, nopSup{}, nopArts{}, reg, lifecycle.PlaneOptions{}), lifecycle.Options{})
+	l := &projectLocker{reg: func() registry.Registry { return reg }}
+	const ref = "projectlockerzzzzzzz" // no project has it: Pause gets as far as the lock, then finds nothing
+	unlock, err := l.Lock(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			unlock()
+		}
+	}()
+	paused := make(chan error, 1)
+	go func() { paused <- eng.Pause(ctx, ref) }()
+	select {
+	case err := <-paused:
+		t.Fatalf("the Engine went on with a project whose failover lock is held: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	// Another project is not held up by it.
+	if err := eng.Pause(ctx, "projectlockeryyyyyyyy"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("an operation on another project: %v", err)
+	}
+	unlock()
+	released = true
+	select {
+	case err := <-paused:
+		if !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("the Engine's operation ended with %v, want the missing project", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the Engine did not go on after the failover lock was released")
 	}
 }
 
