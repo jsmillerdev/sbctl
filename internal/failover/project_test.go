@@ -917,3 +917,151 @@ func TestTheProjectIsMovingAgainAfterTheSharedServicesTookIt(t *testing.T) {
 		t.Fatalf("project: %+v", p)
 	}
 }
+
+// The window of a planned stop: from the moment the old primary stops until the registry names another
+// home, a restart of the old home's daemon runs the projects the registry still homes there. The hold
+// (a project fence record) is written before the stop and released when the old home follows.
+func TestAPlannedSwitchoverHoldsTheOldPrimaryBeforeItStops(t *testing.T) {
+	w := newWorld(t) // n1 leads and is the home of refA
+	paths := w.cfg.Paths()
+	var seen *fenced.Record
+	w.afterEvent("promote n2/", func() { seen, _ = fenced.Project(paths, refA) })
+	mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+	if err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("move: %+v, %v", mv, err)
+	}
+	if !w.heldAtStop["n1/"+refA] {
+		t.Fatalf("the primary was not held when it stopped:\n%v", w.snapshot())
+	}
+	// While the replica is promoted the hold is there, with the move's epoch and the new home's name.
+	n2, err := w.reg.GetNode(w.ctx, "n2")
+	must(t, err)
+	if seen == nil || !seen.Planned || seen.Epoch != 1 || seen.Leader != "n1" || !strings.Contains(seen.Reason, "move to "+n2.Name) || !strings.Contains(seen.Reason, "--resume") {
+		t.Fatalf("the hold at the promotion: %+v", seen)
+	}
+	// The old home follows the new one: nothing holds it, and a failback may promote its replica.
+	if _, blocked := fenced.Blocks(paths, refA); blocked {
+		t.Fatal("the hold is still there after the move")
+	}
+	if got := stepNames(mv); strings.Join(got, ",") != "begin,quiesce,stop-old,promote,homed,start-new,tenant,demote-old,base-backup" {
+		t.Fatalf("the hold is part of stop-old, not a step of its own: %v", got)
+	}
+}
+
+func TestAPlannedSwitchoverOfAProjectOnAFollowerHoldsItThroughTheMesh(t *testing.T) {
+	w := newWorld(t) // n1 leads
+	rehomeOn(t, w, refB, "n2", "n1")
+	w.prim["n2/"+refB] = &primState{running: true, healthy: true}
+	mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refB})
+	if err != nil || mv.Kind != registry.MoveSwitchover || mv.State != registry.MoveDone || mv.FromNode != "n2" || mv.ToNode != "n1" {
+		t.Fatalf("move: %+v, %v", mv, err)
+	}
+	w.assertOrder("hold n2/"+refB+" epoch=1", "stop n2/"+refB, "promote n1/", "registry.SetProjectNode "+refB+" n1 1", "demote n2/", "release n2/"+refB+" epoch=1")
+	if !w.heldAtStop["n2/"+refB] {
+		t.Fatalf("the primary was not held when it stopped:\n%v", w.snapshot())
+	}
+	if w.held["n2/"+refB] {
+		t.Fatal("the hold on n2 is still there after the move")
+	}
+	w.assertNever("fence")
+}
+
+// A switchover that undoes itself lets go of the hold before the old primary starts again: the plane
+// refuses to start a held primary. A paused project is released too, and stays stopped.
+func TestAnUndoneSwitchoverReleasesTheHoldBeforeItStartsTheOldPrimary(t *testing.T) {
+	t.Run("on a follower", func(t *testing.T) {
+		w := newWorld(t)
+		rehomeOn(t, w, refB, "n2", "n1")
+		w.prim["n2/"+refB] = &primState{running: true, healthy: true}
+		for id, in := range w.inst {
+			if in.ref == refB {
+				w.replay[id] = "0/1000000" // far behind the old primary's last WAL
+			}
+		}
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refB})
+		if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+			t.Fatalf("error %v, move %+v", err, mv)
+		}
+		w.assertOrder("hold n2/"+refB, "stop n2/"+refB, "release n2/"+refB, "start n2/"+refB)
+		if w.held["n2/"+refB] {
+			t.Fatal("the hold is still there after the undo")
+		}
+	})
+	t.Run("on this node", func(t *testing.T) {
+		w := newWorld(t)
+		w.replay[idAN2] = "0/1000000"
+		var heldAtStart bool
+		w.afterEvent("start n1/"+refA, func() { _, heldAtStart = fenced.Blocks(w.cfg.Paths(), refA) })
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+			t.Fatalf("error %v, move %+v", err, mv)
+		}
+		if !w.heldAtStop["n1/"+refA] {
+			t.Fatal("the primary was not held when it stopped")
+		}
+		if heldAtStart {
+			t.Fatal("the old primary was started while the hold was there")
+		}
+		if _, blocked := fenced.Blocks(w.cfg.Paths(), refA); blocked {
+			t.Fatal("the hold is still there after the undo")
+		}
+	})
+	t.Run("a paused project", func(t *testing.T) {
+		w := newWorld(t)
+		must(t, w.reg.SetProjectStatus(w.ctx, refA, registry.StatusInactive))
+		w.replay[idAN2] = "0/1000000"
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+			t.Fatalf("error %v, move %+v", err, mv)
+		}
+		w.assertNever("start n1/")
+		if _, blocked := fenced.Blocks(w.cfg.Paths(), refA); blocked {
+			t.Fatal("a paused project stays held after the undo")
+		}
+	})
+}
+
+// A home that cannot hold the primary down is not stopped: nothing was changed, and the move ends
+// aborted with the old primary running.
+func TestASwitchoverThatCannotHoldTheOldPrimaryDoesNotStopIt(t *testing.T) {
+	w := newWorld(t)
+	rehomeOn(t, w, refB, "n2", "n1")
+	w.prim["n2/"+refB] = &primState{running: true, healthy: true}
+	w.fail("hold n2/", errors.New("read-only file system"), -1)
+	mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refB})
+	if err == nil || !strings.Contains(err.Error(), "read-only file system") || !strings.Contains(err.Error(), "was not stopped") {
+		t.Fatalf("error: %v", err)
+	}
+	if mv.State != registry.MoveAborted {
+		t.Fatalf("move: %+v", mv)
+	}
+	w.assertNever("stop n2/")
+	w.assertNever("promote")
+	if p := projectOf(t, w, refB); p.NodeID != "n2" || p.Status != registry.StatusActiveHealthy {
+		t.Fatalf("project: %+v", p)
+	}
+}
+
+// A move that stops after the promotion leaves the hold: the old primary is behind the new one and must
+// not start, whatever restarts on the old home. The resume continues the move and releases it.
+func TestTheHoldOutlivesAMoveThatStopsAfterThePromotion(t *testing.T) {
+	w := newWorld(t)
+	paths := w.cfg.Paths()
+	w.fail("demote n1/", errors.New("boom"), -1)
+	o := w.orch()
+	mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+	if err == nil || mv.State != registry.MoveFailed {
+		t.Fatalf("error %v, move %+v", err, mv)
+	}
+	if r, _ := fenced.Project(paths, refA); r == nil || !r.Planned {
+		t.Fatalf("the hold was released before the old primary followed: %+v", r)
+	}
+	w.clearFailures()
+	mv, err = o.FailoverProject(w.ctx, ProjectOptions{Ref: refA, Resume: true})
+	if err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("resume: %+v, %v", mv, err)
+	}
+	if _, blocked := fenced.Blocks(paths, refA); blocked {
+		t.Fatal("the resumed move left the hold")
+	}
+}

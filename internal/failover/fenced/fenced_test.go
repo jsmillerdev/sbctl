@@ -138,3 +138,36 @@ func TestWriteCreatesTheProjectDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A planned stop's hold is the move's to release; the record of a fence is not.
+func TestReleaseProjectClearsOnlyTheHoldOfAPlannedStop(t *testing.T) {
+	p := paths(t)
+	const ref = "aaaaaaaaaaaaaaaaaaaa"
+	if err := ReleaseProject(p, ref); err != nil {
+		t.Fatalf("no record: %v", err)
+	}
+	if err := WriteProject(p, Record{Epoch: 2, Leader: "n1", Ref: ref, Reason: "planned", Planned: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, blocked := Blocks(p, ref); !blocked {
+		t.Fatal("the hold does not hold")
+	}
+	if err := ReleaseProject(p, ref); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := Project(p, ref); r != nil {
+		t.Fatalf("the hold is still there: %+v", r)
+	}
+	if err := WriteProject(p, Record{Epoch: 3, Leader: "n1", Ref: ref, Reason: "the project failed over"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReleaseProject(p, ref); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := Project(p, ref); r == nil || r.Planned {
+		t.Fatalf("the record of a fence was released: %+v", r)
+	}
+	if err := ReleaseProject(p, "../x"); err == nil {
+		t.Fatal("a path that is not a ref was accepted")
+	}
+}

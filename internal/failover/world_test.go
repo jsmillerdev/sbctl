@@ -16,6 +16,7 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -59,6 +60,11 @@ type world struct {
 	markErr error
 	// markerRace, when set, replaces the marker right after the next write.
 	markerRace *backup.LeaderMarker
+	// held: the holds of a planned stop on the nodes other than this one (node/ref); this node's is a
+	// file in cfg.StateDir, read with fenced.Project.
+	held map[string]bool
+	// heldAtStop: for each stop (node/ref), whether the primary was held when it stopped.
+	heldAtStop map[string]bool
 	// pingAs, when set, is what every reachable peer answers to a ping.
 	pingAs *peerapi.Ping
 
@@ -240,6 +246,26 @@ func (w *world) log(format string, args ...any) {
 }
 
 // fail makes the events that start with prefix return err, times times (-1: always).
+// noteHold records whether the primary of ref on node is held at the moment it stops: on this node by
+// the file the orchestrator wrote, on another by the hold the fake peer took.
+func (w *world) noteHold(node, ref string) {
+	held := false
+	if node == w.self {
+		r, err := fenced.Project(w.cfg.Paths(), ref)
+		held = err == nil && r != nil && r.Planned
+	} else {
+		w.mu.Lock()
+		held = w.held[node+"/"+ref]
+		w.mu.Unlock()
+	}
+	w.mu.Lock()
+	if w.heldAtStop == nil {
+		w.heldAtStop = map[string]bool{}
+	}
+	w.heldAtStop[node+"/"+ref] = held
+	w.mu.Unlock()
+}
+
 func (w *world) fail(prefix string, err error, times int) {
 	w.mu.Lock()
 	w.failures[prefix] = &failure{err: err, times: times}
@@ -517,6 +543,7 @@ func (p *worldPrimaries) Stop(_ context.Context, node, ref string) (string, erro
 	if err := w.do("stop %s/%s", node, ref); err != nil {
 		return "", err
 	}
+	w.noteHold(node, ref)
 	s := p.state(node, ref)
 	w.mu.Lock()
 	s.running = false
@@ -750,6 +777,45 @@ func (p *worldPeers) Fence(_ context.Context, node string, req FenceCall) (peera
 	}
 	sort.Strings(stopped)
 	return peerapi.FenceResponse{Epoch: req.Epoch, Fenced: true, Stopped: stopped}, nil
+}
+
+// Hold and Release of a node other than this one: the node's disk is not in the test, so what it
+// holds is in the world, and the order of the events is what the tests read.
+func (p *worldPeers) Hold(_ context.Context, node, ref string, epoch int64, _ string) error {
+	w := (*world)(p)
+	if err := w.errSelf(node); err != nil {
+		return err
+	}
+	if err := w.nodeUp(node); err != nil {
+		return err
+	}
+	if err := w.do("hold %s/%s epoch=%d", node, ref, epoch); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.held == nil {
+		w.held = map[string]bool{}
+	}
+	w.held[node+"/"+ref] = true
+	return nil
+}
+
+func (p *worldPeers) Release(_ context.Context, node, ref string, epoch int64) error {
+	w := (*world)(p)
+	if err := w.errSelf(node); err != nil {
+		return err
+	}
+	if err := w.nodeUp(node); err != nil {
+		return err
+	}
+	if err := w.do("release %s/%s epoch=%d", node, ref, epoch); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.held, node+"/"+ref)
+	return nil
 }
 
 // worldLeader implements Leader.

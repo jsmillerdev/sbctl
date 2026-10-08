@@ -34,6 +34,11 @@ type Record struct {
 	Leader string `json:"leader,omitempty"`
 	// Ref is the project of a project record; empty for a node record.
 	Ref string `json:"ref,omitempty"`
+	// Planned marks the hold of a planned stop: a switchover writes it before it stops the old primary,
+	// so that nothing starts the primary again (a restart of the daemon, a reboot) while the project
+	// moves, and the move clears it once the old home follows the new one or the move was undone
+	// (ReleaseProject). A record without it comes from a fence, which only setting the data aside clears.
+	Planned bool `json:"planned,omitempty"`
 	// Reason is one sentence for the operator: what was seen, and where.
 	Reason string    `json:"reason"`
 	At     time.Time `json:"at"`
@@ -91,6 +96,22 @@ func WriteProject(p config.Paths, r Record) error {
 		return fmt.Errorf("fenced: %q is not a project ref", r.Ref)
 	}
 	return write(ProjectPath(p, r.Ref), r)
+}
+
+// ReleaseProject removes the hold of a planned stop (Planned) and leaves any other project record alone:
+// the record of a fence says that the data diverged, and a planned move has no say in that.
+func ReleaseProject(p config.Paths, ref string) error {
+	if !ValidRef(ref) {
+		return fmt.Errorf("fenced: %q is not a project ref", ref)
+	}
+	r, err := read(ProjectPath(p, ref))
+	if err != nil {
+		return err
+	}
+	if r == nil || !r.Planned {
+		return nil
+	}
+	return remove(ProjectPath(p, ref))
 }
 
 // ClearNode removes the node record (`supavise node rejoin`).

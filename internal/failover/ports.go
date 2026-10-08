@@ -120,6 +120,15 @@ type Peers interface {
 	// Fence asks a node to stop acting as a primary (the cooperative fence). The call fails when
 	// the node does not answer; a node that answers has fenced itself or says why it did not.
 	Fence(ctx context.Context, node string, req FenceCall) (peerapi.FenceResponse, error)
+	// Hold writes the project's fence record on node before a planned move stops the primary there,
+	// so that nothing starts it again behind the move's back: a restart of the node's daemon runs the
+	// projects the registry still homes there, and a second writable primary would exist once the
+	// replica is promoted. Release removes the hold once the old home follows the new one, or the
+	// move was undone; it leaves the record of a fence alone. Both are repeatable, and a node that
+	// does not know the operation answers an error from Hold and success from Release (there is
+	// nothing of the move's to remove there).
+	Hold(ctx context.Context, node, ref string, epoch int64, reason string) error
+	Release(ctx context.Context, node, ref string, epoch int64) error
 }
 
 // Leader is what the current leader does for a planned switchover of the whole server. The

@@ -33,7 +33,7 @@ import (
 //	POST /peer/v1/fence                          any node to a node: the cooperative fence (peerapi.PathFence)
 //	POST /peer/v1/failover/quiesce               the survivor to the leader: stop everything for a planned switchover
 //	POST /peer/v1/failover/resume                the survivor to the leader: undo a quiesce
-//	POST /peer/v1/failover/primary/{ref}/{op}    the leader to a project's home: stop, start, health or aside
+//	POST /peer/v1/failover/primary/{ref}/{op}    the leader to a project's home: stop, start, health, aside, hold or release
 //	POST|GET /peer/v1/failover/server            the leader to the node that takes over: run a switchover, and tell how it goes
 const (
 	PathQuiesce = "/peer/v1/failover/quiesce"
@@ -47,10 +47,12 @@ const CodeHomedHere = "homed_here"
 
 // Operations of PathPrimary.
 const (
-	OpStop   = "stop"
-	OpStart  = "start"
-	OpHealth = "health"
-	OpAside  = "aside"
+	OpStop    = "stop"
+	OpStart   = "start"
+	OpHealth  = "health"
+	OpAside   = "aside"
+	OpHold    = "hold"
+	OpRelease = "release"
 )
 
 // PrimaryPath fills in PathPrimary.
@@ -80,9 +82,10 @@ type QuiesceResult struct {
 	LSNs map[string]string `json:"lsns"`
 }
 
-// PrimaryCall is the body of PathPrimary.
+// PrimaryCall is the body of PathPrimary. Reason is the sentence a hold records for the operator.
 type PrimaryCall struct {
-	Epoch int64 `json:"epoch"`
+	Epoch  int64  `json:"epoch"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // PrimaryResult is the answer of PathPrimary.
@@ -120,6 +123,19 @@ func (m MeshPeers) Fence(ctx context.Context, node string, req FenceCall) (peera
 	var r peerapi.FenceResponse
 	err := m.RPC.Call(ctx, node, http.MethodPost, peerapi.PathFence, req, &r)
 	return r, err
+}
+
+func (m MeshPeers) Hold(ctx context.Context, node, ref string, epoch int64, reason string) error {
+	return m.RPC.Call(ctx, node, http.MethodPost, PrimaryPath(ref, OpHold), PrimaryCall{Epoch: epoch, Reason: reason}, nil)
+}
+
+func (m MeshPeers) Release(ctx context.Context, node, ref string, epoch int64) error {
+	err := m.RPC.Call(ctx, node, http.MethodPost, PrimaryPath(ref, OpRelease), PrimaryCall{Epoch: epoch}, nil)
+	var re *mesh.RemoteError
+	if errors.As(err, &re) && re.Code == "unknown_op" {
+		return nil // a node that predates the hold has none of this move's to remove
+	}
+	return err
 }
 
 func (m MeshPeers) Quiesce(ctx context.Context, node string, req QuiesceRequest) (QuiesceResult, error) {
@@ -331,6 +347,15 @@ func (o *Orchestrator) fenceProjectHere(ctx context.Context, req FenceCall) (pee
 		return peerapi.FenceResponse{}, err
 	}
 	return peerapi.FenceResponse{Epoch: o.d.Members.Epoch(), Fenced: true, Stopped: stopped}, nil
+}
+
+// holdHere writes the hold of a planned stop on this node: the project's fence record, marked as the
+// move's own, so that the plane does not start the primary until the move releases it.
+func (o *Orchestrator) holdHere(ref, leader string, epoch int64, reason string) error {
+	if reason == "" {
+		reason = fmt.Sprintf("node %s stopped the primary of %s for a planned move at epoch %d", leader, ref, epoch)
+	}
+	return fenced.WriteProject(o.d.Cfg.Paths(), fenced.Record{Epoch: epoch, Leader: leader, Ref: ref, Reason: reason, At: o.d.Now().UTC(), Planned: true})
 }
 
 func reasonOf(req FenceCall) string {
@@ -728,6 +753,10 @@ func (o *Orchestrator) handlePrimary(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		err = o.d.LocalPrimaries.SetAside(ctx, ref, req.Epoch)
+	case OpHold:
+		err = o.holdHere(ref, peer.Node, req.Epoch, req.Reason)
+	case OpRelease:
+		err = fenced.ReleaseProject(o.d.Cfg.Paths(), ref)
 	default:
 		writePeerError(w, http.StatusNotFound, "unknown_op", "no such operation: "+op)
 		return

@@ -582,6 +582,70 @@ func TestPrimaryEndpointsServeOnlyTheLeader(t *testing.T) {
 	}
 }
 
+// The leader holds the primary of a project on its home before it stops it, and lets go of it when
+// the old home follows (or the move was undone): the hold is a project fence record that the plane
+// honors, marked as the move's own so that the release leaves a fence's record alone.
+func TestHoldAndReleaseOfAPlannedStopOnThisNode(t *testing.T) {
+	w := newWorld(t)
+	w.setSelf("n2", false) // n2 is the home; n1 leads
+	o := w.orch()
+	paths := w.cfg.Paths()
+	rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refA, OpHold), "n1", PrimaryCall{Epoch: 1, Reason: "moving to n1"}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hold: %d %s", rec.Code, rec.Body)
+	}
+	got, err := fenced.Project(paths, refA)
+	if err != nil || got == nil || !got.Planned || got.Epoch != 1 || got.Leader != "n1" || got.Reason != "moving to n1" || got.Ref != refA {
+		t.Fatalf("record: %+v, %v", got, err)
+	}
+	if _, blocked := fenced.Blocks(paths, refA); !blocked {
+		t.Fatal("the plane would start the primary")
+	}
+	if _, blocked := fenced.Blocks(paths, refB); blocked {
+		t.Fatal("another project is held")
+	}
+	// Asked again it changes nothing; a reason is made up when the leader gave none.
+	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refB, OpHold), "n1", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("hold: %d %s", rec.Code, rec.Body)
+	}
+	if r, _ := fenced.Project(paths, refB); r == nil || !strings.Contains(r.Reason, refB) {
+		t.Fatalf("the default reason: %+v", r)
+	}
+	// Only the leader holds, in an epoch that has not passed, and only for a ref.
+	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refC, OpHold), "n3", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusForbidden {
+		t.Errorf("a node that does not lead: %d", rec.Code)
+	}
+	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refC, OpHold), "n1", PrimaryCall{Epoch: 0}, nil); rec.Code != http.StatusConflict {
+		t.Errorf("a past epoch: %d", rec.Code)
+	}
+	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath("../x", OpHold), "n1", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusBadRequest {
+		t.Errorf("a path that is not a ref: %d", rec.Code)
+	}
+	if r, _ := fenced.Project(paths, refC); r != nil {
+		t.Errorf("a refused hold wrote %+v", r)
+	}
+	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refC, OpRelease), "n3", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusForbidden {
+		t.Errorf("release by a node that does not lead: %d", rec.Code)
+	}
+
+	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refA, OpRelease), "n1", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("release: %d %s", rec.Code, rec.Body)
+	}
+	if _, blocked := fenced.Blocks(paths, refA); blocked {
+		t.Fatal("the primary is still held")
+	}
+	// What a fence wrote is not the move's to release, and releasing nothing is not an error.
+	must(t, fenced.WriteProject(paths, fenced.Record{Epoch: 2, Leader: "n1", Ref: refC, Reason: "the project failed over"}))
+	for _, ref := range []string{refC, refA} {
+		if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(ref, OpRelease), "n1", PrimaryCall{Epoch: 2}, nil); rec.Code != http.StatusOK {
+			t.Fatalf("release of %s: %d %s", ref, rec.Code, rec.Body)
+		}
+	}
+	if _, blocked := fenced.Blocks(paths, refC); !blocked {
+		t.Fatal("the record of a fence was released")
+	}
+}
+
 // The data of a live primary is not moved aside on a peer's say-so: the registry must home the
 // project on another node first, as the leader does before it asks.
 func TestAsideRefusesAProjectTheRegistryHomesOnThisNode(t *testing.T) {
@@ -775,6 +839,38 @@ func TestMeshClientsSpeakThePeerAPI(t *testing.T) {
 	rpc.err = errors.New("no session")
 	if _, err := p.Ping(ctx, "n1"); err == nil {
 		t.Fatal("an error was lost")
+	}
+}
+
+// Hold and Release are two more operations of the primary endpoint; a node that does not know the
+// hold has nothing of the move's to release, but cannot be trusted to hold anything.
+func TestMeshPeersHoldAndRelease(t *testing.T) {
+	rpc := &fakeRPC{}
+	ctx := context.Background()
+	p := MeshPeers{RPC: rpc}
+	if err := p.Hold(ctx, "n2", refA, 4, "moving"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Release(ctx, "n2", refA, 4); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"n2 POST /peer/v1/failover/primary/" + refA + "/hold", "n2 POST /peer/v1/failover/primary/" + refA + "/release"}
+	if strings.Join(rpc.calls, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("calls:\n%s", strings.Join(rpc.calls, "\n"))
+	}
+	if rpc.bodies[0] != `{"epoch":4,"reason":"moving"}` || rpc.bodies[1] != `{"epoch":4}` {
+		t.Fatalf("bodies: %v", rpc.bodies)
+	}
+	rpc.err = &mesh.RemoteError{Node: "n2", Status: http.StatusNotFound, Code: "unknown_op", Message: "no such operation: hold"}
+	if err := p.Release(ctx, "n2", refA, 4); err != nil {
+		t.Fatalf("a node without the hold has nothing to release: %v", err)
+	}
+	if err := p.Hold(ctx, "n2", refA, 4, "moving"); err == nil {
+		t.Fatal("a node that cannot hold was taken for one that did")
+	}
+	rpc.err = &mesh.RemoteError{Node: "n2", Status: http.StatusInternalServerError, Code: "primary_failed", Message: "disk full"}
+	if err := p.Release(ctx, "n2", refA, 4); err == nil {
+		t.Fatal("a failed release was lost")
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -256,6 +257,12 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 			return err
 		}
 		if err := j.step(ctx, "stop-old", func() (string, error) {
+			// The hold comes first: once the replica is promoted, a primary that starts again on the old home
+			// (its daemon restarts and runs the projects the registry still homes there) would be a second one.
+			// If it cannot be written nothing has stopped, and the move undoes itself.
+			if err := o.holdPrimary(ctx, run); err != nil {
+				return "", &abortError{cause: fmt.Errorf("%s could not be kept from starting %s again, so the primary was not stopped: %w", run.from.Name, ref, err)}
+			}
 			lsn, err := o.stopPrimary(ctx, run.from.ID, ref)
 			if err != nil {
 				return "", fmt.Errorf("stopping the primary on %s: %w", run.from.Name, err)
@@ -335,7 +342,16 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 	}
 	if run.planned {
 		if err := j.step(ctx, "demote-old", func() (string, error) {
-			return o.demoteOld(ctx, run.from, ref, j.detail("homed"), run.epoch, timeout)
+			d, err := o.demoteOld(ctx, run.from, ref, j.detail("homed"), run.epoch, timeout)
+			if err != nil {
+				return "", err
+			}
+			// The old home follows the new one: the hold has done its work, and a later failback promotes
+			// this replica, which the plane refuses while the hold is there.
+			if err := o.releasePrimary(ctx, run); err != nil {
+				return "", fmt.Errorf("%s follows the new primary, but the hold on its old primary could not be released: %w; run the move again with --resume", run.from.Name, err)
+			}
+			return d, nil
 		}); err != nil {
 			setStatus(statusAfter(begin.Status))
 			return fmt.Errorf("the project runs on %s, but %w", run.to.Name, err)
@@ -510,11 +526,15 @@ func notYetLeader(err error) bool {
 func (o *Orchestrator) undoSwitchover(ctx context.Context, j *journal, run *projectRun, begin projectBegin, abort *abortError, hold *lockHold) error {
 	ref := run.project.Ref
 	paused := begin.Status == registry.StatusInactive
-	if !paused {
-		if err := o.d.Primaries.Start(ctx, run.from.ID, ref); err != nil {
-			_ = o.store().SetProjectStatus(ctx, ref, registry.StatusActiveUnhealthy)
-			return fmt.Errorf("%w; starting the old primary on %s again also failed: %v", abort.cause, run.from.Name, err)
-		}
+	// The hold is released before the old primary starts again, and for a paused project too, which stays
+	// stopped: nothing else would release it.
+	err := o.releasePrimary(ctx, run)
+	if err == nil && !paused {
+		err = o.d.Primaries.Start(ctx, run.from.ID, ref)
+	}
+	if err != nil {
+		_ = o.store().SetProjectStatus(ctx, ref, registry.StatusActiveUnhealthy)
+		return fmt.Errorf("%w; putting the old primary on %s back also failed: %v", abort.cause, run.from.Name, err)
 	}
 	// Active again first: the engine registers a project with the shared services only while it is.
 	_ = o.store().SetProjectStatus(ctx, ref, statusAfter(begin.Status))
@@ -529,6 +549,33 @@ func (o *Orchestrator) undoSwitchover(ctx context.Context, j *journal, run *proj
 		_ = j.record(ctx, "undo", "the old primary on "+run.from.Name+" runs again")
 	}
 	return &abortError{cause: abort.cause}
+}
+
+// holdPrimary writes the project's fence record on the old home of a planned move, marked as the move's
+// own (fenced.Record.Planned), before the primary stops. The home that is this node writes it itself; a
+// node cannot ask itself over the mesh.
+func (o *Orchestrator) holdPrimary(ctx context.Context, run *projectRun) error {
+	ref := run.project.Ref
+	reason := fmt.Sprintf("the primary of %s was stopped for its planned move to %s at epoch %d; finish the move with supavise projects failover %s --resume", ref, run.to.Name, run.epoch, ref)
+	if run.from.ID == o.self().ID {
+		return o.holdHere(ref, run.from.ID, run.epoch, reason)
+	}
+	if o.d.Peers == nil {
+		return errors.New("no way to reach the old home")
+	}
+	return o.whileTheNodeLearnsWhoLeads(ctx, func() error { return o.d.Peers.Hold(ctx, run.from.ID, ref, run.epoch, reason) })
+}
+
+// releasePrimary removes the hold of holdPrimary from the old home.
+func (o *Orchestrator) releasePrimary(ctx context.Context, run *projectRun) error {
+	ref := run.project.Ref
+	if run.from.ID == o.self().ID {
+		return fenced.ReleaseProject(o.d.Cfg.Paths(), ref)
+	}
+	if o.d.Peers == nil {
+		return errors.New("no way to reach the old home")
+	}
+	return o.whileTheNodeLearnsWhoLeads(ctx, func() error { return o.d.Peers.Release(ctx, run.from.ID, ref, run.epoch) })
 }
 
 // fenceProject asks the old home to stop the project's primary and keep it stopped. A home that is
