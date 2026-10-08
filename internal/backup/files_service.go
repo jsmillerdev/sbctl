@@ -41,7 +41,7 @@ func (s *Service) BackupFiles(ctx context.Context, ref string, fo FilesOptions) 
 	res := &FilesResult{}
 	var errs []error
 	if !fo.SkipStorage {
-		if s.opt.Config != nil && s.opt.Config.Fleet.StorageBackend == "s3" && s.opt.StorageDir == nil {
+		if s.opt.Config != nil && s.opt.StorageDir == nil && s.storageIsS3() {
 			res.Notes = append(res.Notes, "Storage uses its S3 backend, so its objects are in your own bucket and are not copied here; turn on versioning for that bucket")
 		} else {
 			snap, err := s.backupStorage(ctx, ref, fo.Reason)

@@ -727,7 +727,7 @@ func TestRewriteAutoConfKeepsTheRest(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "postgresql.auto.conf"), []byte(in), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if err := rewriteAutoConf(dir, []string{"recovery_target_timeline = 'latest'"}); err != nil {
+	if err := rewriteAutoConf(dir, []string{"recovery_target_timeline = 'latest'"}, false); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
@@ -740,11 +740,38 @@ func TestRewriteAutoConfKeepsTheRest(t *testing.T) {
 	}
 	// A missing file is created.
 	empty := t.TempDir()
-	if err := rewriteAutoConf(empty, []string{"a = 1"}); err != nil {
+	if err := rewriteAutoConf(empty, []string{"a = 1"}, false); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(empty, "postgresql.auto.conf")); string(b) != "a = 1\n" {
 		t.Fatalf("created file = %q", b)
+	}
+}
+
+// The seeder's block is one unit: its header, its recovery settings and, when asked, the archive settings
+// that follow the header. An archive_command of the primary's own that stands elsewhere in the file stays
+// in any case.
+func TestClearStandbyBlockDropsTheArchiveLinesOfTheBlockOnRequest(t *testing.T) {
+	in := "archive_mode = on\narchive_command = 'primary'\nwork_mem = '8MB'\n" +
+		"\n# --- supavise standby id of ref (backup b1) ---\narchive_mode = on\narchive_command = 'seeded'\nrestore_command = 'r'\n" +
+		"recovery_target_timeline = 'latest'\nhot_standby = on\nprimary_conninfo = 'c'\nmax_connections = '60'\n"
+	for _, tc := range []struct {
+		archive bool
+		want    string
+	}{
+		{false, "archive_mode = on\narchive_command = 'primary'\nwork_mem = '8MB'\n\narchive_mode = on\narchive_command = 'seeded'\nmax_connections = '60'\n"},
+		{true, "archive_mode = on\narchive_command = 'primary'\nwork_mem = '8MB'\n\nmax_connections = '60'\n"},
+	} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "postgresql.auto.conf"), []byte(in), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := ClearStandbyBlock(dir, tc.archive); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf")); string(b) != tc.want {
+			t.Errorf("archive=%v:\n%s\nwant:\n%s", tc.archive, b, tc.want)
+		}
 	}
 }
 

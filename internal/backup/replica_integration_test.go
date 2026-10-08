@@ -291,7 +291,7 @@ func TestSeedReplicaAccidentalPromoteIsRefusedByTheRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The standby archives through the relay, as it does where the relay is on.
-	if err := appendAutoConf(dd, "archive_command = "+confQuote(ArchiveCommandRelay(f.e.cfg.BinPath, testRef, sock))+"\n"); err != nil {
+	if err := appendAutoConf(dd, "archive_command = "+confString(ArchiveCommandRelay(f.e.cfg.BinPath, testRef, sock))+"\n"); err != nil {
 		t.Fatal(err)
 	}
 	_, rc := f.standby(dd)

@@ -126,12 +126,14 @@ type Relay struct {
 	// A relay never replaces a socket that answers: the daemon and a CLI relay (which serves
 	// while the daemon is down) can run at once, and the one that listens first keeps the
 	// project until it stops.
-	mu      sync.Mutex // guards ls, pinned, refMu, refused and done; never held across I/O
+	mu      sync.Mutex // guards ls, pinned, refMu, refused, unavailable and done; never held across I/O
 	ls      map[string]*relayListener
 	pinned  map[string]bool
 	refMu   map[string]*sync.Mutex
 	refused map[string]time.Time // when the guard last reported a refusal, per project
-	done    bool
+	// unavailable is when the guard last warned that it could not judge a push, per project.
+	unavailable map[string]time.Time
+	done        bool
 
 	// svcMu guards svc and is held while the backend opens (up to the factory's timeout),
 	// which must not block Ensure and Reconcile.
@@ -169,7 +171,7 @@ func NewRelay(o RelayOptions) *Relay {
 	if o.PromoteOK == nil && o.Config != nil {
 		o.PromoteOK = o.Config.Paths().PromoteOK
 	}
-	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), pushAllowance: relayPushAllowance, pushMinRate: relayPushMinRate, now: time.Now, ls: map[string]*relayListener{}, pinned: map[string]bool{}, refMu: map[string]*sync.Mutex{}, refused: map[string]time.Time{}}
+	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), pushAllowance: relayPushAllowance, pushMinRate: relayPushMinRate, now: time.Now, ls: map[string]*relayListener{}, pinned: map[string]bool{}, refMu: map[string]*sync.Mutex{}, refused: map[string]time.Time{}, unavailable: map[string]time.Time{}}
 }
 
 // projectsWithWALDir lists the refs that have a WAL directory under projects/.
@@ -514,7 +516,9 @@ func (r *Relay) pushGuard(ctx context.Context, ref string) (int, error) {
 	}
 	replica, err := r.opt.Replica(ctx, ref)
 	if err != nil {
-		return http.StatusServiceUnavailable, fmt.Errorf("cannot tell whether %s is a replica on this node: %w", ref, err)
+		err = fmt.Errorf("cannot tell whether %s is a replica on this node: %w", ref, err)
+		r.warnUnavailable(ref, err)
+		return http.StatusServiceUnavailable, err
 	}
 	if !replica {
 		return 0, nil
@@ -541,13 +545,32 @@ func (r *Relay) pushGuard(ctx context.Context, ref string) (int, error) {
 	if r.opt.Epoch != nil {
 		cur, err := r.opt.Epoch(ctx)
 		if err != nil {
-			return http.StatusServiceUnavailable, fmt.Errorf("cannot read the cluster epoch: %w", err)
+			err = fmt.Errorf("cannot read the cluster epoch: %w", err)
+			r.warnUnavailable(ref, err)
+			return http.StatusServiceUnavailable, err
 		}
 		if have < cur {
 			return refuse("this node holds a replica of %s and its promote.ok is for epoch %d, but the cluster is at epoch %d", ref, have, cur)
 		}
 	}
 	return 0, nil
+}
+
+// warnUnavailable logs a push the guard could not judge (the registry or the epoch did not answer),
+// at most once a minute per project. The archiver retries it, and a registry that stays unreachable
+// stalls the archiving of every project: Postgres's own log is the only other place that shows it.
+func (r *Relay) warnUnavailable(ref string, reason error) {
+	r.mu.Lock()
+	last := r.unavailable[ref]
+	now := r.now()
+	quiet := now.Sub(last) < time.Minute
+	if !quiet {
+		r.unavailable[ref] = now
+	}
+	r.mu.Unlock()
+	if !quiet {
+		r.opt.Log.Warn("wal relay: push held back; the guard could not tell whether the cluster may archive", "ref", ref, "reason", reason)
+	}
 }
 
 // reportRefused logs a refused push and tells Refused, at most once a minute per project:

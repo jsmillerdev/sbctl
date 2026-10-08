@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
@@ -438,5 +439,84 @@ func TestRemoveOfAnInstanceCarriesTheEpochAndIsRefusedWhenStale(t *testing.T) {
 	err = e.rpc.Call(ctx, "n2", http.MethodDelete, peerapi.InstancePath(id)+"?epoch=soon", nil, nil)
 	if !errors.As(err, &re) || re.Status != http.StatusBadRequest {
 		t.Fatalf("a malformed epoch: %v", err)
+	}
+}
+
+// A base backup that the leader asks a follower for is taken without writing the registry, whose copy
+// on the follower is read-only; the leader's own is recorded by the backup service as always.
+func TestABackupAskedOfAFollowerDoesNotWriteItsRegistry(t *testing.T) {
+	ctx := context.Background()
+	e := newOpsEnv(t)
+	if _, err := e.ops.BaseBackup(ctx, "n2", testRef, peerapi.BackupRequest{Reason: "final"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ops.BaseBackup(ctx, "n1", testRef, peerapi.BackupRequest{Reason: "manual"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.backups.noRecord) != 1 || !e.backups.noRecord[0] {
+		t.Fatalf("the follower's backup records itself: %v", e.backups.noRecord)
+	}
+	if len(e.own.noRecord) != 1 || e.own.noRecord[0] {
+		t.Fatalf("the leader's own backup does not record itself: %v", e.own.noRecord)
+	}
+}
+
+// RoutedBackups takes a project's base backup on its home and records it on the leader.
+func TestRoutedBackupsTakeTheBackupOnTheHomeAndRecordItHere(t *testing.T) {
+	ctx := context.Background()
+	e := newOpsEnv(t)
+	reg := registry.NewMemory()
+	mustCreate(t, reg, "second")
+	if err := reg.CreateProject(ctx, &registry.Project{Ref: testRef, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	local := &fakeBackups{}
+	rb := &RoutedBackups{Self: func() string { return "n1" }, Resolver: RegistryResolver{Reg: reg}, Ops: e.ops, Local: local}
+
+	// Homed here: the leader's own service takes it and records it.
+	if _, err := rb.TakeBase(ctx, testRef); err != nil {
+		t.Fatal(err)
+	}
+	if len(local.reasons) != 1 || len(local.recorded) != 0 || len(e.backups.reasons) != 0 {
+		t.Fatalf("homed here: local %v recorded %v, n2 %v", local.reasons, local.recorded, e.backups.reasons)
+	}
+
+	// Homed on n2: n2 takes it, without recording, and the leader records what n2 reports.
+	if err := reg.SetProjectNode(ctx, testRef, "n2", 1); err != nil {
+		t.Fatal(err)
+	}
+	row, err := rb.TakeBase(ctx, testRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(e.backups.reasons) != 1 || !e.backups.noRecord[0] || len(local.reasons) != 1 {
+		t.Fatalf("n2 %v/%v, local %v", e.backups.reasons, e.backups.noRecord, local.reasons)
+	}
+	if len(local.recorded) != 1 || local.recorded[0].ID != "20261001T000000Z-ab12" || local.recorded[0].Timeline != 2 ||
+		local.recorded[0].StopLSN != "0/3000100" || local.recorded[0].SizeBytes != 1234 {
+		t.Fatalf("recorded = %+v", local.recorded)
+	}
+	if row.ID != 31 || row.Status != registry.BackupCompleted {
+		t.Fatalf("row = %+v", row)
+	}
+
+	// The final backup of a delete: the files here, the base there, both as "final".
+	p, _ := reg.GetProject(ctx, testRef)
+	if _, err := rb.FinalBackup(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if len(local.files) != 1 || local.files[0] != testRef+" "+backup.ReasonFinal || e.backups.reasons[1] != backup.ReasonFinal || local.recorded[1].Reason != backup.ReasonFinal {
+		t.Fatalf("files %v, n2 %v, recorded %+v", local.files, e.backups.reasons, local.recorded)
+	}
+	// A failure on the home is the home's, named.
+	e.backups.err = errors.New("pg_backup_start: boom")
+	if _, err := rb.TakeBase(ctx, testRef); err == nil || !strings.Contains(err.Error(), "node n2") || len(local.recorded) != 2 {
+		t.Fatalf("a failed backup = %v, recorded %d", err, len(local.recorded))
+	}
+	// FinalBackup is for a project that is not homed here.
+	here := *p
+	here.NodeID = "n1"
+	if _, err := rb.FinalBackup(ctx, &here); err == nil {
+		t.Fatal("FinalBackup of a project homed here")
 	}
 }

@@ -568,3 +568,53 @@ func TestStartActiveLeavesAFencedPrimaryDown(t *testing.T) {
 		t.Fatalf("StartActive on a fenced node: %v, calls %v", errs, c.plane.calls)
 	}
 }
+
+// Restarting a project restarts its primary only (design 2.7.8): the Management API restarts a project
+// with a pause and a resume, and neither touches the project's replicas. They keep streaming from
+// the archive while the primary is down, so their rows, their status and their units stay as they
+// were and the fleet is not asked to restart any.
+func TestPauseAndResumeLeaveTheReplicasAlone(t *testing.T) {
+	ctx := context.Background()
+	h, p, fl, ids := replicaHarness(t)
+	before := map[string]registry.Replica{}
+	for _, id := range ids {
+		r, err := h.reg.GetReplica(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[id] = *r
+	}
+
+	if err := h.e.Pause(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.e.Resume(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if got := inReplicaOrder(h.plane.calls); got != "Stop "+p.Ref+",Start "+p.Ref {
+		t.Fatalf("the plane was driven for more than the primary: %s", got)
+	}
+	if len(fl.classes) != 0 || len(fl.failed) != 0 {
+		t.Fatalf("the replicas were restarted: classes %v, failed %v", fl.classes, fl.failed)
+	}
+	rs, err := h.reg.ListReplicas(ctx, p.Ref)
+	if err != nil || len(rs) != len(ids) {
+		t.Fatalf("replicas = %v, %v", rs, err)
+	}
+	for _, r := range rs {
+		if b := before[r.Identifier]; r.Status != b.Status || r.InitStep != b.InitStep || r.NodeID != b.NodeID {
+			t.Fatalf("replica %s changed: %+v, was %+v", r.Identifier, r, b)
+		}
+	}
+	// The same through the recovery of a restart the daemon's stop cut after the pause.
+	if err := h.e.Pause(ctx, p.Ref); err != nil {
+		t.Fatal(err)
+	}
+	h.plane.calls = nil
+	if errs := h.e.ResumeRecovered(ctx, []Recovered{{Ref: p.Ref, Resume: true}}); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if len(fl.classes) != 0 {
+		t.Fatalf("a recovered restart restarted the replicas: %v", fl.classes)
+	}
+}

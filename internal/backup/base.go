@@ -25,6 +25,12 @@ const stopTimeout = 15 * time.Minute
 type BackupOptions struct {
 	// Reason is recorded in the manifest: ReasonManual (default), ReasonScheduled, ReasonFinal, ReasonRestore or ReasonUpgrade.
 	Reason string
+	// NoRecord leaves the registry's backups table and events alone: the backup is taken and its
+	// manifest written, and the caller records it (RecordBase) where the registry takes writes. A
+	// node whose registry is a hot standby of the leader's (a follower) takes the base backups of the
+	// projects homed on it this way, for the leader that asked (placement.BackupOps). The returned row
+	// is the one that would have been written, with no ID.
+	NoRecord bool
 }
 
 // BaseBackup implements Backup: a manual base backup of ref.
@@ -89,8 +95,10 @@ func (s *Service) BaseBackupWith(ctx context.Context, ref string, bo BackupOptio
 	id := newBackupID(started)
 	rec := &registry.Backup{Ref: ref, Kind: "base", Status: registry.BackupRunning, StartedAt: started,
 		Location: s.opt.Store.URL(baseDir(ref) + id)}
-	if err := reg.CreateBackup(ctx, rec); err != nil {
-		return nil, err
+	if !bo.NoRecord {
+		if err := reg.CreateBackup(ctx, rec); err != nil {
+			return nil, err
+		}
 	}
 
 	m, err := s.runBase(ctx, proj, id, started, bo.Reason)
@@ -101,15 +109,69 @@ func (s *Service) BaseBackupWith(ctx context.Context, ref string, bo BackupOptio
 	if err != nil {
 		rec.Status, rec.Error = registry.BackupFailed, err.Error()
 		s.cleanupBackup(fctx, ref, id)
-		_ = reg.UpdateBackup(fctx, rec)
-		_ = reg.AppendEvent(fctx, ref, "backup.failed", map[string]any{"id": id, "reason": bo.Reason, "error": err.Error()})
+		if !bo.NoRecord {
+			_ = reg.UpdateBackup(fctx, rec)
+			_ = reg.AppendEvent(fctx, ref, "backup.failed", map[string]any{"id": id, "reason": bo.Reason, "error": err.Error()})
+		}
 		return rec, fmt.Errorf("backup: base backup of %s failed: %w", ref, err)
 	}
 	rec.Status, rec.Timeline, rec.StartLSN, rec.StopLSN, rec.SizeBytes = registry.BackupCompleted, m.Timeline, m.StartLSN, m.StopLSN, m.StoredBytes
+	if bo.NoRecord {
+		return rec, nil
+	}
 	if err := reg.UpdateBackup(fctx, rec); err != nil {
 		return rec, err
 	}
 	_ = reg.AppendEvent(fctx, ref, "backup.completed", map[string]any{"id": id, "reason": bo.Reason, "stored_bytes": m.StoredBytes, "start_lsn": m.StartLSN, "stop_lsn": m.StopLSN})
+	return rec, nil
+}
+
+// RemoteBase is a base backup that another node took with BackupOptions.NoRecord and reported to the
+// leader (peerapi.BackupResult).
+type RemoteBase struct {
+	// ID is the backup's directory name under the project's base/ prefix (Manifest.ID).
+	ID       string
+	Reason   string
+	Timeline int
+	StartLSN string
+	StopLSN  string
+	// SizeBytes is the stored size.
+	SizeBytes int64
+}
+
+// RecordBase records in the registry a base backup that the home node of ref took for this one: its
+// row in the backups table and its event, which BaseBackupWith writes when it runs here. The backup
+// must be complete in the store; a row that exists for it already is returned, so a report that is
+// repeated records once.
+func (s *Service) RecordBase(ctx context.Context, ref string, b RemoteBase) (*registry.Backup, error) {
+	if err := validRef(ref); err != nil {
+		return nil, err
+	}
+	if err := s.need("registry", s.opt.Registry != nil); err != nil {
+		return nil, err
+	}
+	if b.ID == "" || strings.ContainsAny(b.ID, "/\\ \t\r\n") {
+		return nil, fmt.Errorf("backup: %q is not a base backup id", b.ID)
+	}
+	loc := s.opt.Store.URL(baseDir(ref) + b.ID)
+	if rows, err := s.opt.Registry.ListBackups(ctx, ref); err == nil {
+		for i := range rows {
+			if rows[i].Location == loc && rows[i].Status == registry.BackupCompleted {
+				return &rows[i], nil
+			}
+		}
+	}
+	now := s.opt.Now().UTC()
+	rec := &registry.Backup{Ref: ref, Kind: "base", Status: registry.BackupCompleted, Location: loc,
+		Timeline: b.Timeline, StartLSN: b.StartLSN, StopLSN: b.StopLSN, SizeBytes: b.SizeBytes, StartedAt: now, FinishedAt: &now}
+	if err := s.opt.Registry.CreateBackup(ctx, rec); err != nil {
+		return nil, err
+	}
+	reason := b.Reason
+	if reason == "" {
+		reason = ReasonManual
+	}
+	_ = s.opt.Registry.AppendEvent(context.WithoutCancel(ctx), ref, "backup.completed", map[string]any{"id": b.ID, "reason": reason, "stored_bytes": b.SizeBytes, "start_lsn": b.StartLSN, "stop_lsn": b.StopLSN})
 	return rec, nil
 }
 

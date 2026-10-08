@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/supavise/supavise/internal/config"
 )
 
 // StorageDir returns the directory holding ref's Storage objects, or "" when the node does
@@ -26,10 +28,26 @@ func (s *Service) storageDir(ref string) string {
 	if s.opt.StorageDir != nil {
 		return s.opt.StorageDir(ref)
 	}
-	if s.opt.Config == nil || s.opt.Config.Fleet.StorageBackend == "s3" {
+	if s.opt.Config == nil || s.storageIsS3() {
 		return ""
 	}
 	return s.opt.Config.Paths().StorageObjects(ref)
+}
+
+// storageIsS3 reports whether Storage keeps its objects in a bucket. [fleet] storage_backend is read from
+// the config file at each run, not taken from the copy the daemon loaded when it started: `supavise
+// storage migrate` changes it, and a daemon that predates the migration (or its rollback) would
+// otherwise back up the wrong place, and record an empty Storage snapshot after the files were moved
+// aside. A file that is not there or cannot be read leaves the Service's own Config (a test, a service
+// built in memory).
+func (s *Service) storageIsS3() bool {
+	path := config.ResolvePath(s.opt.ConfigPath)
+	if _, err := os.Stat(path); err == nil {
+		if c, err := config.Load(path); err == nil {
+			return c.Fleet.StorageBackend == "s3"
+		}
+	}
+	return s.opt.Config != nil && s.opt.Config.Fleet.StorageBackend == "s3"
 }
 
 // backupStorage takes a snapshot of ref's Storage objects. It reports nil, nil when there

@@ -334,7 +334,8 @@ func (h *handlers) backup(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "unknown backup operation %q", op)
 		return
 	}
-	res, err := RunBackup(r.Context(), h.d.Backups, ref, op, req)
+	// This node's registry is a copy the leader writes: the leader records the backup (RecordBase).
+	res, err := runBackup(r.Context(), h.d.Backups, ref, op, req, false)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -343,11 +344,17 @@ func (h *handlers) backup(w http.ResponseWriter, r *http.Request) {
 }
 
 // RunBackup performs the backup operation op for ref with the node's backup service: a base backup,
-// or an in-place restore.
+// or an in-place restore. It is the leader's own backup, which records itself in the registry.
 func RunBackup(ctx context.Context, b LocalBackups, ref string, op peerapi.BackupOp, req peerapi.BackupRequest) (peerapi.BackupResult, error) {
+	return runBackup(ctx, b, ref, op, req, true)
+}
+
+// runBackup is RunBackup; record says whether a base backup writes the registry. The backup a
+// follower takes for the leader does not: its registry is a read-only copy.
+func runBackup(ctx context.Context, b LocalBackups, ref string, op peerapi.BackupOp, req peerapi.BackupRequest, record bool) (peerapi.BackupResult, error) {
 	switch op {
 	case peerapi.BackupBase:
-		bo := backup.BackupOptions{Reason: req.Reason}
+		bo := backup.BackupOptions{Reason: req.Reason, NoRecord: !record}
 		rec, err := b.BaseBackupWith(ctx, ref, bo)
 		if err != nil {
 			return peerapi.BackupResult{}, err

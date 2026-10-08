@@ -259,13 +259,13 @@ func TestConfStringEscapes(t *testing.T) {
 		`C:\state\dir`:  `'C:\\state\\dir'`,
 		`no escapes ''`: `'no escapes '''''`,
 	} {
-		if got := confString(in); got != want {
-			t.Errorf("confString(%q) = %s, want %s", in, got, want)
+		if got := ConfString(in); got != want {
+			t.Errorf("ConfString(%q) = %s, want %s", in, got, want)
 		}
 	}
 	// A conninfo whose password has a quote and a backslash survives both layers: libpq quoting inside,
 	// postgresql.conf quoting outside.
-	got := confString(primaryConninfo(5432, `p'a\ss`, "id"))
+	got := ConfString(primaryConninfo(5432, `p'a\ss`, "id"))
 	if !strings.Contains(got, `password=''p\\''a\\\\ss''`) {
 		t.Errorf("conf line: %s", got)
 	}

@@ -260,15 +260,31 @@ func (a *recordingAgent) Do(_ context.Context, id string, act peerapi.Action, re
 type fakeBackups struct {
 	mu       sync.Mutex
 	reasons  []string
+	noRecord []bool
 	restored []lifecycle.RestoreRequest
+	files    []string
+	recorded []backup.RemoteBase
 	err      error
 }
 
 func (f *fakeBackups) BaseBackupWith(_ context.Context, ref string, bo backup.BackupOptions) (*registry.Backup, error) {
 	f.mu.Lock()
 	f.reasons = append(f.reasons, bo.Reason)
+	f.noRecord = append(f.noRecord, bo.NoRecord)
 	f.mu.Unlock()
 	return &registry.Backup{Ref: ref, Location: "file:///b/" + ref + "/base/20261001T000000Z-ab12/", Timeline: 2, StartLSN: "0/3000028", StopLSN: "0/3000100", SizeBytes: 1234}, f.err
+}
+func (f *fakeBackups) BackupFiles(_ context.Context, ref string, fo backup.FilesOptions) (*backup.FilesResult, error) {
+	f.mu.Lock()
+	f.files = append(f.files, ref+" "+fo.Reason)
+	f.mu.Unlock()
+	return &backup.FilesResult{}, f.err
+}
+func (f *fakeBackups) RecordBase(_ context.Context, ref string, b backup.RemoteBase) (*registry.Backup, error) {
+	f.mu.Lock()
+	f.recorded = append(f.recorded, b)
+	f.mu.Unlock()
+	return &registry.Backup{ID: 31, Ref: ref, Status: registry.BackupCompleted, Location: "file:///b/" + ref + "/base/" + b.ID + "/", Timeline: b.Timeline}, nil
 }
 func (f *fakeBackups) RestoreInPlace(_ context.Context, ref string, req lifecycle.RestoreRequest) error {
 	f.mu.Lock()

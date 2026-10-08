@@ -607,3 +607,118 @@ func TestClearStandbyConfKeepsTheRestOfTheFile(t *testing.T) {
 		t.Fatalf("directory without postgresql.auto.conf: %v", err)
 	}
 }
+
+// The seeding marker is the last thing a clear removes, and only when everything else went: a directory
+// that could not be emptied still says it is half seeded.
+func TestClearDirKeepsTheSeedMarkerWhileAnythingRemains(t *testing.T) {
+	dd := t.TempDir()
+	for _, f := range []string{"PG_VERSION", "backup_label", seedMarker} {
+		if err := os.WriteFile(filepath.Join(dd, f), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A directory that cannot be removed: no permission on its parent entry's contents.
+	locked := filepath.Join(dd, "locked")
+	if err := os.MkdirAll(filepath.Join(locked, "inner"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	if os.Geteuid() == 0 {
+		t.Skip("root removes a directory whatever its mode")
+	}
+	if err := clearDir(dd); err == nil {
+		t.Fatal("clearDir reported success with a directory it could not remove")
+	}
+	if !SeedUnfinished(dd) {
+		t.Fatal("the marker went before the directory was empty")
+	}
+	if err := os.Chmod(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearDir(dd); err != nil {
+		t.Fatal(err)
+	}
+	if ents, _ := os.ReadDir(dd); len(ents) != 0 {
+		t.Fatalf("directory not empty after the clear: %v", ents)
+	}
+}
+
+// A standby cannot be made by a service that does not know where promote.ok is, and a backup id that
+// would start a line in postgresql.auto.conf is refused.
+func TestConfigureStandbyChecksItsPlan(t *testing.T) {
+	e, _ := seedEnv(t)
+	dd := fakeDataDir(t)
+	plan := ReplicaSeedPlan{Ref: testRef, DataDir: dd}
+	if err := e.svc.ConfigureStandby(ReplicaSeedPlan{Ref: testRef, DataDir: dd, BackupID: "b1\nrestore_command = 'x'"}); err == nil || !strings.Contains(err.Error(), "control characters") {
+		t.Fatalf("a backup id with a newline = %v", err)
+	}
+	if conf, err := os.ReadFile(filepath.Join(dd, "postgresql.auto.conf")); err == nil && strings.Contains(string(conf), "restore_command = 'x'") {
+		t.Fatal("the injected line reached postgresql.auto.conf")
+	}
+	bare := *e.svc
+	bare.opt.Config = nil
+	if err := bare.ConfigureStandby(plan); err == nil || !strings.Contains(err.Error(), "promote.ok") {
+		t.Fatalf("a service without a Config made a standby: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dd, "standby.signal")); err == nil {
+		t.Fatal("standby.signal written by a service that could not delete promote.ok")
+	}
+	if err := e.svc.ConfigureStandby(plan); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Every cycle of ConfigureStandby leaves one block, not another pair of archive lines.
+func TestConfigureStandbyTwiceLeavesOneBlock(t *testing.T) {
+	e, _ := seedEnv(t)
+	dd := fakeDataDir(t)
+	plan := ReplicaSeedPlan{Ref: testRef, Identifier: testReplicaID, DataDir: dd, PrimaryPort: 20003, ReplicationPassword: "pw"}
+	for i := 0; i < 3; i++ {
+		if err := e.svc.ConfigureStandby(plan); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conf := readConf(t, dd)
+	for _, once := range []string{"archive_mode = on", "archive_command = ", "primary_conninfo = ", "restore_command = ", "# --- supavise standby"} {
+		if n := strings.Count(conf, once); n != 1 {
+			t.Errorf("%q appears %d times:\n%s", once, n, conf)
+		}
+	}
+}
+
+// The leader records a base backup that its home took without writing the registry.
+func TestRecordBaseWritesTheRowAndTheEventOnce(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	if err := e.reg.CreateProject(ctx, &registry.Project{Ref: testRef, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	b := RemoteBase{ID: "20261008T120000Z-abcdef", Reason: ReasonFinal, Timeline: 3, StartLSN: "0/3000028", StopLSN: "0/3000120", SizeBytes: 4096}
+	row, err := e.svc.RecordBase(ctx, testRef, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ID == 0 || row.Status != registry.BackupCompleted || row.Timeline != 3 || row.StopLSN != "0/3000120" || row.SizeBytes != 4096 ||
+		!strings.HasSuffix(row.Location, testRef+"/base/20261008T120000Z-abcdef") || row.FinishedAt == nil {
+		t.Fatalf("row = %+v", row)
+	}
+	again, err := e.svc.RecordBase(ctx, testRef, b)
+	if err != nil || again.ID != row.ID {
+		t.Fatalf("a report repeated = %+v, %v", again, err)
+	}
+	if rows, _ := e.reg.ListBackups(ctx, testRef); len(rows) != 1 {
+		t.Fatalf("%d rows after a repeated report", len(rows))
+	}
+	evs, _ := e.reg.ListEvents(ctx, testRef, 10)
+	if len(evs) != 1 || evs[0].Kind != "backup.completed" {
+		t.Fatalf("events = %+v", evs)
+	}
+	for _, bad := range []string{"", "a/b", "a b", "a\nb"} {
+		if _, err := e.svc.RecordBase(ctx, testRef, RemoteBase{ID: bad}); err == nil {
+			t.Errorf("RecordBase accepted the id %q", bad)
+		}
+	}
+}

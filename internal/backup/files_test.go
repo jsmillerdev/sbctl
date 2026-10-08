@@ -838,3 +838,39 @@ func TestPruneSweepLooksAgainBeforeDeletingBlobs(t *testing.T) {
 		})
 	}
 }
+
+// storage_backend is read from the config file at each run: a daemon that started before `supavise
+// storage migrate` changed it must not back up the directory the objects left, nor the other way round.
+func TestStorageBackendIsReadFromTheConfigFileAtEachRun(t *testing.T) {
+	e := newTestEnv(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	e.svc.opt.ConfigPath = cfgPath
+	if e.cfg.Fleet.StorageBackend == "s3" {
+		t.Fatal("the test config starts on the file backend")
+	}
+	// No file: the Service's own configuration decides (it is on the file backend).
+	if e.svc.storageIsS3() || e.svc.storageDir(testRef) == "" {
+		t.Fatal("without a config file the Service's copy decides")
+	}
+	// The operator migrated Storage to S3 after the daemon started.
+	if err := os.WriteFile(cfgPath, []byte("[fleet]\nstorage_backend = \"s3\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !e.svc.storageIsS3() || e.svc.storageDir(testRef) != "" {
+		t.Fatal("a daemon that predates the migration still looks at the old directory")
+	}
+	// And rolled it back.
+	if err := os.WriteFile(cfgPath, []byte("[fleet]\nstorage_backend = \"file\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if e.svc.storageIsS3() || e.svc.storageDir(testRef) == "" {
+		t.Fatal("a daemon that predates the rollback still skips the objects")
+	}
+	// An unreadable file leaves the copy it started with.
+	if err := os.WriteFile(cfgPath, []byte("[fleet\nbroken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if e.svc.storageIsS3() {
+		t.Fatal("a broken file switched the backend")
+	}
+}

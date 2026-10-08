@@ -121,6 +121,8 @@ type Engine struct {
 	freeBytes func(path string) int64
 	// capacity is the node's room for project memory (capacity.go, resize.go).
 	capacity capacityState
+	// remoteBackups takes the final backup of a project homed on another node (SetRemoteBackups).
+	remoteBackups RemoteBackups
 }
 
 var _ Manager = (*Engine)(nil)
@@ -846,9 +848,25 @@ func (e *Engine) deleteProgress(ctx context.Context, ref string) deleteState {
 	return deleteState{}
 }
 
+// RemoteBackups takes the backups of the projects homed on other nodes, which the backup service of
+// this node cannot: it reads data directories of this node only (internal/placement implements it).
+type RemoteBackups interface {
+	// FinalBackup takes the delete-time backup of p, which is homed on another node: its base backup on its
+	// home, its files here, where the shared services keep them.
+	FinalBackup(ctx context.Context, p *registry.Project) (*registry.Backup, error)
+}
+
+// SetRemoteBackups sets the RemoteBackups the Engine takes the final backup of a project homed on
+// another node through. Without it that delete is refused. internal/app calls it while it wires the
+// cluster features, before the Engine serves a request.
+func (e *Engine) SetRemoteBackups(r RemoteBackups) { e.remoteBackups = r }
+
 func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev registry.Status) error {
-	if err := e.onHome(p, "take the final backup of", "the backup service reads the data directory of this node; delete it with SkipFinalBackup (the data is gone afterwards) or move it to this node first"); err != nil {
-		return err
+	remote := !e.homedHere(p)
+	if remote && e.remoteBackups == nil {
+		if err := e.onHome(p, "take the final backup of", "the backup service reads the data directory of this node; delete it with SkipFinalBackup (the data is gone afterwards) or move it to this node first"); err != nil {
+			return err
+		}
 	}
 	keys, err := e.loadKeys(ctx, p.Ref)
 	if err != nil {
@@ -866,6 +884,10 @@ func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev regi
 				e.log.Warn("delete: stop database after backup", "ref", p.Ref, "error", err)
 			}
 		}()
+	}
+	if remote {
+		_, err = e.remoteBackups.FinalBackup(ctx, p)
+		return err
 	}
 	if fb, ok := e.opts.Backup.(FinalBackuper); ok {
 		_, err = fb.FinalBackup(ctx, p.Ref)
