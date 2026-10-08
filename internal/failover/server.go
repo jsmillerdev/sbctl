@@ -79,6 +79,12 @@ func undoable(step string) bool {
 //
 // Only a move that did nothing it cannot take back is aborted: not one that fenced the old leader,
 // wrote the leader marker or promoted anything. Those continue with --resume.
+//
+// A switchover always tells the old leader to start again, whatever its log holds: the leader's stops
+// are recorded here only after its quiesce answered, so a survivor whose daemon died during the request
+// leaves a log with the plan alone and a leader that has stopped. A leader that has nothing to undo
+// answers that it has none. One that cannot be reached holds the abort back when the log says it was
+// stopped, and when the log does not say, the abort goes on and says what is left to do.
 func (o *Orchestrator) abortServer(ctx context.Context) (*registry.Move, error) {
 	prior, state, err := o.unfinishedServer(ctx)
 	switch {
@@ -96,9 +102,13 @@ func (o *Orchestrator) abortServer(ctx context.Context) (*registry.Move, error) 
 			return nil, fmt.Errorf("failover: the move went past what can be taken back (step %s): continue it with supavise failover --resume", s.Name)
 		}
 	}
-	if recordedStep(prior.steps, "quiesce") {
+	var left string
+	if prior.kind == registry.MoveSwitchover {
 		if err := o.restartLeader(ctx, prior.from); err != nil {
-			return nil, fmt.Errorf("failover: starting %s again failed, so the move is kept: %w", prior.from, err)
+			if recordedStep(prior.steps, "quiesce") {
+				return nil, fmt.Errorf("failover: starting %s again failed, so the move is kept: %w", prior.from, err)
+			}
+			left = fmt.Sprintf("%s could not be told to start again (%v); if it stopped for this switchover, restart supavise on it", prior.from, err)
 		}
 	}
 	if err := os.Remove(o.d.Cfg.Paths().FailoverState()); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -106,7 +116,12 @@ func (o *Orchestrator) abortServer(ctx context.Context) (*registry.Move, error) 
 	}
 	mv := registry.Move{Scope: registry.MoveServer, Kind: prior.kind, FromNode: prior.from, ToNode: prior.to, Epoch: prior.epoch, State: registry.MoveAborted,
 		Error: "aborted by the operator", Steps: prior.steps}
-	o.announce(ctx, alerts.KindFailoverFailed, alerts.SeverityWarning, mv, fmt.Sprintf("The %s of the server from %s to %s was aborted by the operator after %s; nothing was promoted.", prior.kind, prior.from, prior.to, prior.last))
+	detail := fmt.Sprintf("The %s of the server from %s to %s was aborted by the operator after %s; nothing was promoted.", prior.kind, prior.from, prior.to, prior.last)
+	if left != "" {
+		reportStep(ctx, registry.MoveStep{Name: "resume-leader", At: o.d.Now().UTC(), Detail: "warning: " + left})
+		detail += " Left to do: " + left + "."
+	}
+	o.announce(ctx, alerts.KindFailoverFailed, alerts.SeverityWarning, mv, detail)
 	return &mv, nil
 }
 

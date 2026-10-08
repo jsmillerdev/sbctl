@@ -1137,3 +1137,67 @@ func TestAbortRefusesAMoveThatCannotBeTakenBack(t *testing.T) {
 		}
 	})
 }
+
+// A survivor whose daemon dies while the leader stops leaves a log with the plan alone and a leader that
+// has stopped: the leader's stops are written down after its answer. The abort starts the leader again
+// all the same, and a leader that cannot be reached then does not hold back an abort that has no record
+// of having stopped it.
+func TestAbortOfASwitchoverWhoseLogHoldsOnlyThePlanStartsTheLeaderAgain(t *testing.T) {
+	planOnly := func(t *testing.T, w *world) *Orchestrator {
+		t.Helper()
+		o := w.orch()
+		_, run, err := o.planServer(w.ctx, ServerOptions{})
+		must(t, err)
+		_, _, err = o.beginServer(w.ctx, run)
+		must(t, err)
+		return o
+	}
+	t.Run("the leader is told", func(t *testing.T) {
+		w := serverWorld(t)
+		o := planOnly(t, w)
+		ab, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true})
+		if err != nil || ab == nil || ab.State != registry.MoveAborted || ab.Kind != registry.MoveSwitchover {
+			t.Fatalf("abort: %+v, %v", ab, err)
+		}
+		if !w.has("resume-leader n1") || stateFileExists(w) {
+			t.Fatalf("the leader was not told to start, or the file is left:\n%v", w.snapshot())
+		}
+	})
+	t.Run("a leader with nothing to undo is the state wanted", func(t *testing.T) {
+		w := serverWorld(t)
+		o := planOnly(t, w)
+		w.fail("resume-leader", &mesh.RemoteError{Node: "n1", Status: 409, Code: "no_quiesce"}, -1)
+		if ab, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true}); err != nil || ab.State != registry.MoveAborted || stateFileExists(w) {
+			t.Fatalf("abort: %+v, %v", ab, err)
+		}
+	})
+	t.Run("a leader that cannot be reached does not hold the abort back, and the abort says so", func(t *testing.T) {
+		w := serverWorld(t)
+		o := planOnly(t, w)
+		w.fail("resume-leader", errors.New("no session"), -1)
+		var told []registry.MoveStep
+		ctx := WithProgress(w.ctx, func(s registry.MoveStep) { told = append(told, s) })
+		ab, err := o.FailoverServer(ctx, ServerOptions{Abort: true})
+		if err != nil || ab.State != registry.MoveAborted || stateFileExists(w) {
+			t.Fatalf("abort: %+v, %v", ab, err)
+		}
+		if len(told) != 1 || told[0].Name != "resume-leader" || !strings.Contains(told[0].Detail, "restart supavise on it") {
+			t.Fatalf("progress: %+v", told)
+		}
+		if last := w.alerts[len(w.alerts)-1]; !strings.Contains(last.Detail, "Left to do") || !strings.Contains(last.Detail, "no session") {
+			t.Fatalf("alert: %+v", last)
+		}
+	})
+	t.Run("a failover has no leader to start", func(t *testing.T) {
+		w := serverWorld(t)
+		w.down["n1"] = true
+		o := w.orch()
+		_, run, err := o.planServer(w.ctx, ServerOptions{})
+		must(t, err)
+		_, _, err = o.beginServer(w.ctx, run)
+		must(t, err)
+		if ab, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true}); err != nil || ab.Kind != registry.MoveFailover || w.has("resume-leader") {
+			t.Fatalf("abort: %+v, %v\n%v", ab, err, w.snapshot())
+		}
+	})
+}
