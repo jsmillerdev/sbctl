@@ -574,13 +574,21 @@ func TestProjectAddonsReportPITR(t *testing.T) {
 	v1 := func() map[string]any {
 		return get("/v1/projects/"+testRef+"/billing/addons", "GET /v1/projects/{ref}/billing/addons")
 	}
+	// The compute size comes first (compute.go); this test is about the others.
+	noCompute := func(m map[string]any) []any {
+		sel := m["selected_addons"].([]any)
+		if len(sel) == 0 || sel[0].(map[string]any)["type"] != "compute_instance" {
+			t.Fatalf("selected_addons lack the compute size: %v", sel)
+		}
+		return sel[1:]
+	}
 
 	for _, tc := range []struct {
 		days int
 		id   string
 	}{{7, "pitr_7"}, {10, "pitr_7"}, {14, "pitr_14"}, {21, "pitr_14"}, {28, "pitr_28"}, {90, "pitr_28"}} {
 		b.cfg.Backup.RetentionDays = tc.days
-		sel := plat()["selected_addons"].([]any)
+		sel := noCompute(plat())
 		// PITR first, then the custom domain entry Studio looks for.
 		if len(sel) != 2 || sel[1].(map[string]any)["type"] != "custom_domain" {
 			t.Fatalf("%d days: selected_addons = %v", tc.days, sel)
@@ -591,19 +599,21 @@ func TestProjectAddonsReportPITR(t *testing.T) {
 			v["meta"].(map[string]any)["backup_duration_days"] != float64(tc.days) || !strings.Contains(v["name"].(string), "days") {
 			t.Errorf("%d days: %v", tc.days, a)
 		}
-		a1 := v1()["selected_addons"].([]any)[0].(map[string]any)
+		a1 := noCompute(v1())[0].(map[string]any)
 		v1v := a1["variant"].(map[string]any)
 		if v1v["id"] != tc.id || v1v["price"].(map[string]any)["amount"] != float64(0) || v1v["meta"].(map[string]any)["backup_duration_days"] != float64(tc.days) {
 			t.Errorf("%d days (v1): %v", tc.days, a1)
 		}
 	}
-	if len(plat()["available_addons"].([]any)) != 0 {
-		t.Error("an add-on is offered for purchase")
+	// Only the compute sizes are offered, and they are free.
+	av := plat()["available_addons"].([]any)
+	if len(av) != 1 || av[0].(map[string]any)["type"] != "compute_instance" {
+		t.Errorf("add-ons offered for purchase: %v", av)
 	}
 
 	// Without a backup service there is no PITR.
 	b.srv.backups = nil
-	for _, sel := range [][]any{plat()["selected_addons"].([]any), v1()["selected_addons"].([]any)} {
+	for _, sel := range [][]any{noCompute(plat()), noCompute(v1())} {
 		if len(sel) != 1 || sel[0].(map[string]any)["type"] != "custom_domain" {
 			t.Errorf("add-ons on a node without backups: %v", sel)
 		}

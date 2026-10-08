@@ -42,7 +42,7 @@ func (s *Server) v2Config(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	poolSize, poolMax := poolerValues(poolSt)
+	poolSize, poolMax := s.poolerValues(p, poolSt)
 
 	resp := base("GET /v2/projects/{ref}/config")
 	set(resp, "data.id", p.Ref)

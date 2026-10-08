@@ -408,6 +408,29 @@ A node needs about 1.5 GB of memory before the first project and about 150 MB fo
 
 The `t` types are burstable: they run well while load is light and slow down when their CPU credits run out, so choose `m7g`/`m7i` (or larger) for sustained load. Graviton (`g`) types run the arm64 build and usually cost less; x86 types run the amd64 build. The template picks the image architecture from the instance type. The data volume (100 GiB by default) holds about 75 MB per new project plus what the projects store; raise `DataVolumeSize` for more. It can grow but never shrink: after the update, run `sudo xfs_growfs /var/lib/supavise` on the instance.
 
+### Project sizes and disk
+
+Each project has a compute size, as on hosted Supabase: Nano, Micro, Small, Medium, Large, XL, 2XL and up to 16XL. New projects are Micro (1 GB memory cap, 60 connections). A size sets the memory cap and CPU quota of the project's units, its Postgres settings (`shared_buffers`, `work_mem`, `max_connections`, ...) and its Supavisor pool; the table is in [internal/lifecycle/README.md](../internal/lifecycle/README.md#compute-sizes). Change it in Studio under Project settings, Compute and Disk, with `supavise projects resize <ref> --size small`, or with the Management API (`PATCH /v1/projects/{ref}/billing/addons`). The project restarts (about as long as a pause and a resume) and shows `RESIZING`; if the new size does not start, the old one is put back. A resize is refused with the setting named when the Postgres or pooler settings saved for the project do not fit the new size (for example a `shared_buffers` of 3GB on a Micro), so change that setting first. Prices are always 0. `supavise projects sizes` lists the sizes and which of them the node can give now.
+
+A size is a memory cap, not a reservation. The node accepts sizes while the caps of its projects add up to its memory times `[compute] overcommit` (default 6, because an idle project uses about 150 MB of a 1 GB cap, which is what the table above counts on) and refuses a create with a size, a branch, a restore as a new project, a resize and the resume of a paused project beyond that, and any size that needs more cores than the node has, with the reason. A create without a size takes Micro and is not refused. What that means for the default instance:
+
+| Node memory | Room for caps at overcommit 6 | Micro projects | Small projects | Medium projects |
+|---|---|---|---|---|
+| 8 GiB (`t4g.large`) | 48 GB | 48 | 24 | 12 |
+| 16 GiB | 96 GB | 96 | 48 | 24 |
+| 32 GiB | 192 GB | 192 | 96 | 48 |
+
+If projects are busy, lower the ratio: at 1 the caps fit in the node's memory, and no combination of busy projects can exhaust it. `supavise status` shows how much is promised.
+
+```toml
+[compute]
+overcommit = 6        # sum of project memory caps / node memory; SUPAVISE_COMPUTE_OVERCOMMIT
+# node_memory = "16G" # when /proc shows the host's memory and not your VM's
+# node_cpus = 4
+```
+
+**Disk size per project.** The Compute and Disk page shows each project's disk size and usage (the project's data directory against the volume). A project can have a size of its own only where the data volume is XFS mounted with `prjquota`; Supavise then sets an XFS project quota on the project's directory, and a write past it fails with "No space left on device" for that project only (XFS reports a full project quota as ENOSPC). The CloudFormation template mounts the data volume with `defaults,nofail,prjquota`. Elsewhere, or on a node created before this option, the size shown is the whole volume, it is informational, and a request to change it is refused with a message that says so. To turn it on for an existing XFS volume, add `prjquota` to its `/etc/fstab` line and mount it again (`systemctl stop supavise.service 'supavise-*'`, `umount /var/lib/supavise`, `mount /var/lib/supavise`; quotas cannot be switched on by a remount) and check `findmnt -no OPTIONS /var/lib/supavise`. Setting the quota needs root, so the daemon starts a one-shot unit, `supavise-diskquota@<ref>.service`, which runs `supavise system set-disk-quota` and `xfs_quota`; the size cannot be set below what the project holds plus 20%. The quota covers the project's data directory, including its WAL; it does not cover Storage objects, which live under the shared system directory. IOPS, throughput and disk type are the volume's and cannot be changed per project, and disk autoscaling is not available: grow the volume itself (`DataVolumeSize`, then `xfs_growfs`).
+
 ### What it costs
 
 You pay AWS directly. Prices change by region and over time, so check the pages:
@@ -421,7 +444,7 @@ You pay AWS directly. Prices change by region and over time, so check the pages:
 
 ### What the stack creates
 
-One Ubuntu 24.04 instance (Graviton by default), an Elastic IP, a data volume formatted XFS and mounted at `/var/lib/supavise` (XFS with reflinks is what copy-on-write branching needs later), an S3 bucket for backups (versioned, encrypted, public access blocked, TLS only), a security group for ports 80, 443, 5432 and 6543, an instance role, a Secrets Manager secret for the claim token (and, when you give `KeyEscrowPassphrase`, one that carries the passphrase to the instance), and a Data Lifecycle Manager policy (with its own role) that snapshots the data volume every day. Without a VPC of your own it also creates a small VPC with one public subnet. Everything sits in one file: no nested stacks, no Lambda code, no custom resources, so the console can upload it as it is.
+One Ubuntu 24.04 instance (Graviton by default), an Elastic IP, a data volume formatted XFS and mounted at `/var/lib/supavise` with project quotas (`prjquota`, for a disk size per project; XFS with reflinks is what copy-on-write branching needs later), an S3 bucket for backups (versioned, encrypted, public access blocked, TLS only), a security group for ports 80, 443, 5432 and 6543, an instance role, a Secrets Manager secret for the claim token (and, when you give `KeyEscrowPassphrase`, one that carries the passphrase to the instance), and a Data Lifecycle Manager policy (with its own role) that snapshots the data volume every day. Without a VPC of your own it also creates a small VPC with one public subnet. Everything sits in one file: no nested stacks, no Lambda code, no custom resources, so the console can upload it as it is.
 
 | Parameter | Meaning |
 |---|---|

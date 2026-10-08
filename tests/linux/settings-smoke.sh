@@ -246,8 +246,8 @@ ws_join "$P_REALTIME" "$REF.realtime.internal" "$ANON" || fail "realtime join af
 log "pooler: pool size and client limit reach Supavisor's tenant, what it cannot do is refused"
 # Supavisor keeps its tenants in the _supavisor database of the system cluster.
 pool_row() { sysql _supavisor "select t.default_pool_size || ',' || t.default_max_clients || ',' || u.pool_size from _supavisor.tenants t join _supavisor.users u on u.tenant_external_id = t.external_id and u.is_manager where t.external_id = '$REF'" 2>&1 || true; }
-[[ $(pool_row) == "15,1000,15" ]] || fail "Supavisor's tenant before the change: '$(pool_row)'"
-[[ $(api GET "$CFG/config/database/pooler" | json_get 'd[0]["default_pool_size"]') == 15 ]] || fail "GET config/database/pooler: not the default pool size"
+[[ $(pool_row) == "20,200,20" ]] || fail "Supavisor's tenant before the change: '$(pool_row)'"
+[[ $(api GET "$CFG/config/database/pooler" | json_get 'd[0]["default_pool_size"]') == 20 ]] || fail "GET config/database/pooler: not the default pool size"
 must 200 PATCH "$CFG/config/database/pooler" '{"default_pool_size":7,"max_client_conn":321,"pool_mode":"transaction"}'
 [[ $(pool_row) == "7,321,7" ]] || fail "Supavisor's tenant did not take the pooler settings (got '$(pool_row)')"
 POOLER=$(api GET "$CFG/config/database/pooler")
@@ -259,12 +259,14 @@ must 400 PATCH "$CFG/config/database/pooler" '{"default_pool_size":3000}'  # mor
 must 400 PATCH "$CFG/config/database/pooler" '{"max_client_conn":50000}'   # above the node's per-project ceiling
 [[ $(pool_row) == "7,321,7" ]] || fail "a refused pooler save changed Supavisor's tenant (got '$(pool_row)')"
 must 200 PATCH "$CFG/config/database/pooler" '{"default_pool_size":null,"max_client_conn":null}'
-[[ $(pool_row) == "15,1000,15" ]] || fail "Supavisor's tenant did not return to the defaults (got '$(pool_row)')"
+[[ $(pool_row) == "20,200,20" ]] || fail "Supavisor's tenant did not return to the defaults (got '$(pool_row)')"
 pooler_login "$DBPW" || fail "pooler login after the pooler settings were reset"
 
 log "postgres: ALTER SYSTEM settings, an unsafe value, a setting that needs a restart"
-must 200 PUT "$CFG/config/database/postgres" '{"statement_timeout":"45s","work_mem":"8MB"}'
-[[ $(sql "show statement_timeout") == 45s && $(sql "show work_mem") == 8MB ]] || fail "the cluster did not take the settings"
+# (work_mem is part of the project's size and on the command line with the other sizing settings, so a
+# saved one takes effect at the next restart; the settings applied with ALTER SYSTEM show at once.)
+must 200 PUT "$CFG/config/database/postgres" '{"statement_timeout":"45s","log_checkpoints":false}'
+[[ $(sql "show statement_timeout") == 45s && $(sql "show log_checkpoints") == off ]] || fail "the cluster did not take the settings"
 must 400 PUT "$CFG/config/database/postgres" '{"max_connections":3}'
 must 400 PUT "$CFG/config/database/postgres" '{"work_mem":"16"}'
 # Values Postgres takes in ALTER SYSTEM and cannot start with are refused before anything is saved.
@@ -470,7 +472,7 @@ for ((i = 0; i < 20; i++)); do
 done
 [[ $ok -eq 1 ]] || fail "the Storage limit saved while paused is not enforced after the resume (last status $c)"
 [[ $(api GET "$CFG/postgrest" | json_get 'd["max_rows"]') == 9 ]] || fail "a setting saved while paused was not kept"
-[[ $(pool_row) == "11,1000,11" ]] || fail "the pool size saved while paused was not applied to Supavisor's tenant by the resume (got '$(pool_row)')"
+[[ $(pool_row) == "11,200,11" ]] || fail "the pool size saved while paused was not applied to Supavisor's tenant by the resume (got '$(pool_row)')"
 [[ $(pcode GET /rest/v1/ -H "apikey: $KEY") == 401 ]] || fail "a revoked key came back after the pause"
 
 log "settings smoke test passed"

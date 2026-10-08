@@ -148,13 +148,22 @@ func TestCreateValidation(t *testing.T) {
 
 func TestInstanceSizeMapsToClass(t *testing.T) {
 	h := newHarness(t, nil)
-	for size, want := range map[string]string{"": "micro", "pico": "micro", "nano": "micro", "micro": "micro", "small": "small", "medium": "medium", "large": "large", "2xlarge": "large", "24xlarge_optimized_memory": "large"} {
+	for size, want := range map[string]string{"": "micro", "pico": "nano", "nano": "nano", "micro": "micro", "small": "small", "medium": "medium", "large": "large", "xlarge": "xlarge", "2xlarge": "2xlarge", "ci_4xlarge": "4xlarge"} {
 		got, err := h.svc.classFor(size)
 		if err != nil || got != want {
 			t.Errorf("classFor(%q) = %q, %v; want %q", size, got, err, want)
 		}
 		if _, err := lifecycle.ClassFor(got); err != nil {
 			t.Errorf("class %q is not a lifecycle class: %v", got, err)
+		}
+	}
+}
+
+func TestUnknownInstanceSizeIsRefused(t *testing.T) {
+	h := newHarness(t, nil)
+	for _, size := range []string{"gigantic", "24xlarge_optimized_memory"} {
+		if _, err := h.svc.classFor(size); !errors.Is(err, ErrInvalid) {
+			t.Errorf("classFor(%q): %v", size, err)
 		}
 	}
 }

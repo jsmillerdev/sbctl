@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
@@ -236,4 +237,28 @@ func readCertificates(dir string) ([]certInfo, error) {
 		return nil
 	})
 	return out, err
+}
+
+// checkCapacity shows how much of the node's memory budget the projects' sizes promise
+// (internal/lifecycle, Capacity): the headroom a create or a resize has. Being over the budget is
+// a warning; it stops nothing that runs, only what would add to it.
+func (d *Deps) checkCapacity(ctx context.Context) *Component {
+	if d.Registry == nil {
+		return nil
+	}
+	ps, err := d.Registry.ListProjects(ctx)
+	if err != nil {
+		return nil
+	}
+	n := lifecycle.DetectNode(d.Cfg)
+	if d.Node != nil {
+		n = d.Node()
+	}
+	cp := lifecycle.ComputeCapacity(d.Cfg, n, ps, "")
+	c := &Component{Name: "capacity", State: OK, Detail: cp.Summary()}
+	if cp.Over() {
+		c.State = Warn
+		c.Detail += "; over the budget, so no project can grow until others shrink or are deleted"
+	}
+	return c
 }

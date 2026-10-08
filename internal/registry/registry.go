@@ -38,6 +38,7 @@ const (
 	StatusRestoring       Status = "RESTORING"
 	StatusRestoreFailed   Status = "RESTORE_FAILED" // an in-place restore failed; see lifecycle.Restore
 	StatusRestarting      Status = "RESTARTING"
+	StatusResizing        Status = "RESIZING" // a compute size change is restarting the project (lifecycle.Engine.BeginResize)
 	StatusUpgrading       Status = "UPGRADING"
 	StatusGoingDown       Status = "GOING_DOWN"
 	StatusRemoved         Status = "REMOVED"

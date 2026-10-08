@@ -79,9 +79,9 @@ honor every field, so these are refused with 400 `{"message": ...}` and nothing 
 (it would leave the tenant without a database connection) or over the route's limit (3000 on v1, 4950 on the platform route), and a
 `max_client_conn` outside 1 to 54000. Two limits depend on the project and the node, and a request above either
 is refused with 400 as well: `default_pool_size` may not exceed the project's `max_connections` (the saved
-Postgres setting, else the class's) minus 10, which stay free for superusers and the project's own services, and
+Postgres setting, else the size's) minus 10, which stay free for superusers and the project's own services, and
 `max_client_conn` may not exceed `[fleet] pooler_max_client_conn` (5000 unless set), so that one project cannot
-claim the shared Supavisor's client capacity. The shipped defaults (15 and 1000) always pass. Lowering
+claim the shared Supavisor's client capacity. The defaults of the project's size (a pool of 40% of `max_connections` and hosted's client limit for the size: 20 and 200 for Micro) always pass. Lowering
 `max_connections` later does not re-check a pool size that was saved before; the next pooler save does. A field that already has the value it would get is accepted, because the
 dashboard saves every field it was shown. Both PATCH routes need the permission to update project settings (Owner
 or Administrator).
@@ -152,6 +152,26 @@ the default branch only and a create answers 400. Organization entitlements alre
 **Restoring.** `POST .../backups/pitr` and `.../restore-pitr` take `recovery_time_target_unix`; `.../restore` and `.../restore-physical` take a listed backup's `id` (`restore-physical` also accepts `recovery_time_target`, RFC 3339 or Unix seconds, to replay from that backup to a time). A time outside the span answers 400 with the span in the message, as does a backup that is no longer usable; an unknown id is 404; a node without backups 503; a project that is neither `ACTIVE_*` nor `RESTORE_FAILED` (paused, starting, or already RESTORING) 409, as is one whose disk cannot hold the restored copy next to the current data (`lifecycle.ErrInsufficientDisk`: twice the data plus a fifth of it, at least 1 GiB, free). Otherwise the answer is 201 with no body and the restore runs in the background on a context detached from the request and without a deadline (an expired context would also expire the rollback that stops and starts the project; the log warns when a restore has run 4 hours; `Drain` waits for it, but only until its own timeout, `TimeoutStopSec`, about 11 minutes). `Engine.BeginRestore` moves the project to `RESTORING` under the project lock before the answer, so every other operation (pause, restart, a second restore, delete) is refused with 409 for as long as it runs; `backup.Service.RestoreWith` pauses and resumes the project through the same Engine, which keeps the status at `RESTORING` instead of walking it through `PAUSING`, `INACTIVE` and `COMING_UP`. When the restore ends the project is `ACTIVE_HEALTHY`. If it fails the backup service has put the original data back where it could, and the project becomes `RESTORE_FAILED` whether or not the original is running again, so that Studio's restore screen and a client polling `GET /v1/projects/{ref}` do not read a failed restore as a finished one (Studio shows its "Something went wrong while restoring your project" screen; the project's data is the original where the rollback worked). Health checks leave `RESTORE_FAILED` alone. A second restore (listing and restore routes accept the project), a pause followed by a resume, or a delete moves it on; a restart does both pause and resume, so it clears the status when the original data starts. The error is in the log and in the project's `restore.failed` event. A daemon that stops during a restore leaves the project `RESTORING` (`Engine.Recover` does not touch it, and nothing starts it): `internal/backup/README.md`, "From the dashboard and the Management API", says how an operator settles it. The old data directory is kept as `projects/<ref>/postgres/data.pre-restore-<time>` next to the new one; after a restore that worked the Engine removes the older `data.pre-restore-*` directories and every `data.failed-restore-*`, so one copy stays per project (after a failed one only the newest `data.failed-restore-*` stays). The Engine also sets the cluster's role passwords back to the registry's after a restore that worked, so a restore to a time before a database password reset does not leave the cluster and the registry disagreeing. A restart of the daemon is not safe while a restore runs, since `Drain` gives up after about 11 minutes.
 
 Not implemented, left as stubs: `restore-point`, `schedule`, `undo`, `download`, `downloadable-backups`, `enable-physical-backups`.
+
+## Compute sizes and disk (`compute.go`)
+
+What Studio's Compute and Disk page, the CLI and the MCP server call. The project's size is
+`infra_compute_size` on the project (detail, list and organization rows), in Studio's names (`nano`, `micro`,
+`small`, ... `2xlarge`).
+
+| Route | Behavior |
+|---|---|
+| `GET /platform/projects/{ref}/billing/addons`, `GET /v1/projects/{ref}/billing/addons` | `selected_addons` lists the compute add-on of the project's size (none for Nano, the absence of an add-on), `available_addons` the sizes the node can give it (`lifecycle.Resizer.Offers`) and its own. Prices are 0. Nano is never listed: the specs' variant enums have no `ci_nano`, and Studio adds its own Nano card |
+| `POST /platform/projects/{ref}/billing/addons`, `PATCH /v1/projects/{ref}/billing/addons` | `{addon_type: "compute_instance", addon_variant: "ci_small"}` (`ci_nano` too). Answers 201 (200 on v1) once the project is `RESIZING`; the restart runs on, and Studio polls the status. 400 with the reason when the node cannot honor the size or the variant is unknown, 409 while another operation runs or the project is not running or paused. Other add-on types are accepted and ignored (nothing else is sold) |
+| `DELETE /platform/projects/{ref}/billing/addons/{variant}`, `DELETE /v1/projects/{ref}/billing/addons/{variant}` | a compute variant returns the project to Nano, as removing the add-on does on hosted |
+| `GET /platform/projects/{ref}/disk`, `GET /v1/projects/{ref}/config/disk` | gp3 with 3000 IOPS and 125 MB/s; `size_gb` is the project's quota where one is in force, else the whole volume |
+| `GET .../disk/util`, `GET /v1/projects/{ref}/config/disk/util` | the real use of the project's data directory (`fs_used_bytes`) against the quota, or against the volume (`fs_size_bytes`, `fs_avail_bytes`); the directory walk is cached for 20 seconds |
+| `POST /platform/projects/{ref}/disk`, `POST /v1/projects/{ref}/config/disk`, `POST /platform/projects/{ref}/resize` | set the size where the volume is XFS with `prjquota` (`internal/diskquota`); elsewhere 400 saying the size is informational and how to enable it. The type, IOPS and throughput cannot change. At least the used space plus 20%, at most the volume |
+| `GET .../disk/custom-config`, `GET /v1/projects/{ref}/config/disk/autoscale` | fixed numbers; `POST .../disk/custom-config` is refused with 400 (nothing grows the volume) |
+
+`POST /platform/projects` and `POST /v1/projects` take `desired_instance_size`; the node's capacity check refuses a
+size it cannot hold with 400. Owners and Administrators change sizes and disks, every role that sees the project reads
+them (`authz.go`, "compute size and disk"). `Deps.Disk` is the disk limiter (`diskquota.Manager` by default).
 
 ## Authentication
 

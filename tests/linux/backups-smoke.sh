@@ -81,8 +81,9 @@ JWT=$(api POST '/auth/v1/token?grant_type=password' -H 'Content-Type: applicatio
   -d '{"email":"smoke@example.com","password":"smoke-correct-horse-battery"}' | json_get 'd["access_token"]') || fail "dashboard sign-in"
 japi() { local m=$1 p=$2; shift 2; api "$m" "$p" -H "Authorization: Bearer $JWT" "$@"; }
 ADDONS=$(japi GET "/platform/projects/$REF/billing/addons")
-[[ $(json_get 'd["selected_addons"][0]["type"]' <<<"$ADDONS") == pitr ]] || fail "no PITR add-on: $ADDONS"
-[[ $(json_get 'd["selected_addons"][0]["variant"]["meta"]["backup_duration_days"]' <<<"$ADDONS") == 7 ]] || fail "retention in the add-on: $ADDONS"
+# The compute size is listed first (compute.go); the PITR add-on is the one of type pitr.
+[[ $(json_get '[a["type"] for a in d["selected_addons"]]' <<<"$ADDONS") == *pitr* ]] || fail "no PITR add-on: $ADDONS"
+[[ $(json_get '[a["variant"]["meta"]["backup_duration_days"] for a in d["selected_addons"] if a["type"] == "pitr"][0]' <<<"$ADDONS") == 7 ]] || fail "retention in the add-on: $ADDONS"
 # The nightly timer has not run on a new project, so there is normally nothing to restore from yet.
 if [[ $(json_get 'len(d["backups"])' <<<"$LIST") == 0 ]]; then
   [[ $(json_get 'len(d["physical_backup_data"])' <<<"$LIST") == 0 ]] || fail "a restorable span before any base backup: $LIST"

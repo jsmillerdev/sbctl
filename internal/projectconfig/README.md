@@ -174,9 +174,9 @@ whole is checked against the project's memory limit (`shared_buffers` at most 40
 (`max_connections` at least 20, `max_wal_senders` at least 3, `max_replication_slots` at least 2,
 `max_worker_processes` at least 10: pg_cron runs up to 8 jobs in background workers and its launcher and pg_net's
 worker take two more).
-Rendering: settings that overlap the class's command-line sizing (`shared_buffers`,
-`effective_cache_size`, `maintenance_work_mem`, `max_wal_size`, `max_connections`,
-`max_wal_senders`, `max_replication_slots`) become server arguments after the class's and take
+Rendering: settings that overlap the size's command-line sizing (`shared_buffers`,
+`effective_cache_size`, `work_mem`, `maintenance_work_mem`, `max_wal_size`, `max_connections`,
+`max_worker_processes`, `max_wal_senders`, `max_replication_slots`) become server arguments after the size's and take
 effect at the next restart; every other one is applied with `ALTER SYSTEM` and a reload, so it
 survives restarts in `postgresql.auto.conf`. The counts that size shared memory at start are
 capped far below what Postgres accepts in `ALTER SYSTEM` (`max_locks_per_transaction` 1024,

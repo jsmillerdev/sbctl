@@ -698,8 +698,12 @@ Resources:
             [ -n "$DEV" ] || fail "the data volume did not appear"
             if ! blkid "$DEV" >/dev/null 2>&1; then mkfs.xfs -L supavise "$DEV" || fail "mkfs.xfs"; fi
             mkdir -p /var/lib/supavise
+            # prjquota turns on XFS project quotas, which is what lets a project have a disk size of
+            # its own (the Compute and Disk page, `supavise` disk limits); without it the size shown
+            # is the whole volume and cannot be changed per project. Quotas can only be switched on
+            # when the file system is mounted, so a volume restored from a snapshot gets them here too.
             if ! grep -q ' /var/lib/supavise ' /etc/fstab; then
-              echo "UUID=$(blkid -s UUID -o value "$DEV") /var/lib/supavise xfs defaults,nofail 0 2" >> /etc/fstab
+              echo "UUID=$(blkid -s UUID -o value "$DEV") /var/lib/supavise xfs defaults,nofail,prjquota 0 2" >> /etc/fstab
             fi
             mountpoint -q /var/lib/supavise || mount /var/lib/supavise || fail "mount /var/lib/supavise"
             # A volume restored from a smaller snapshot comes up with the snapshot's file system size.

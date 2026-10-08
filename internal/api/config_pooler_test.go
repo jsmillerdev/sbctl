@@ -28,9 +28,9 @@ func TestPoolerConfigSaveApplyAndReadBack(t *testing.T) {
 		return bodyMap(t, rec)
 	}
 
-	// Defaults are what the tenant runs without a saved setting.
+	// Defaults are what the tenant runs without a saved setting: the project's size's (Micro here).
 	for _, path := range []string{v1, sup, pgb} {
-		if got := read(path); got["default_pool_size"] != float64(15) || got["max_client_conn"] != float64(1000) {
+		if got := read(path); got["default_pool_size"] != float64(20) || got["max_client_conn"] != float64(200) {
 			t.Fatalf("%s defaults: %v", path, got)
 		}
 	}
@@ -45,7 +45,7 @@ func TestPoolerConfigSaveApplyAndReadBack(t *testing.T) {
 		t.Fatalf("the tenant was not told: %v", f.mgr.applied)
 	}
 	for _, path := range []string{v1, sup, pgb} {
-		if got := read(path); got["default_pool_size"] != float64(25) || got["max_client_conn"] != float64(1000) {
+		if got := read(path); got["default_pool_size"] != float64(25) || got["max_client_conn"] != float64(200) {
 			t.Fatalf("%s after the save: %v", path, got)
 		}
 	}
@@ -70,7 +70,7 @@ func TestPoolerConfigSaveApplyAndReadBack(t *testing.T) {
 	// Studio sends null for an emptied field and an empty ignore_startup_parameters when it
 	// was never shown one: both return to the defaults without error.
 	f.mustDo("PATCH", pgb, map[string]any{"default_pool_size": nil, "max_client_conn": nil, "ignore_startup_parameters": ""}, 200)
-	if got := read(v1); got["default_pool_size"] != float64(15) || got["max_client_conn"] != float64(1000) {
+	if got := read(v1); got["default_pool_size"] != float64(20) || got["max_client_conn"] != float64(200) {
 		t.Fatalf("after a reset: %v", got)
 	}
 	// A save that changes nothing does not touch the tenant.
@@ -122,7 +122,7 @@ func TestPoolerConfigRefusesWhatSupavisorCannotHonor(t *testing.T) {
 	// The same values that were echoed back are fine, and the pool size of a mixed body is
 	// not saved when another field of it is refused.
 	got := bodyMap(t, f.mustDo("GET", pgb, nil, 200))
-	if got["default_pool_size"] != float64(15) {
+	if got["default_pool_size"] != float64(20) {
 		t.Fatalf("a refused request saved something: %v", got)
 	}
 	f.mustDo("PATCH", v1, map[string]any{"pool_mode": "transaction", "default_pool_size": nil}, 200)

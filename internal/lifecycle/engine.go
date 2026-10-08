@@ -81,6 +81,8 @@ type Engine struct {
 	restoring sync.Map
 	// freeBytes reads the free space of the disk holding a path (-1: unknown); tests replace it.
 	freeBytes func(path string) int64
+	// capacity is the node's room for project memory (capacity.go, resize.go).
+	capacity capacityState
 }
 
 var _ Manager = (*Engine)(nil)
@@ -250,6 +252,7 @@ func (e *Engine) tenantSpec(ctx context.Context, p *registry.Project, keys *secr
 		}
 		spec.PoolSize, spec.MaxClients = pool.PoolSize, pool.MaxClients
 	}
+	e.poolDefaults(&spec, p)
 	return spec, nil
 }
 
@@ -274,16 +277,14 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 	if e.cfg.BaseDomain() == "" {
 		return nil, errors.New("lifecycle: set domain (or public_ip) in the config before creating projects")
 	}
-	class := req.Class
-	if class == "" {
-		class = DefaultClass
+	if req.Class == ClassSystem {
+		return nil, fmt.Errorf("lifecycle: class %q is reserved", req.Class)
 	}
-	if class == ClassSystem {
-		return nil, fmt.Errorf("lifecycle: class %q is reserved", class)
-	}
-	if _, err := ClassFor(class); err != nil {
+	size, err := ClassFor(req.Class)
+	if err != nil {
 		return nil, err
 	}
+	class := size.Name
 	if req.Seed != nil && req.Keys == nil {
 		// A seeded cluster already holds its role passwords and Create does not reset
 		// them, so fresh keys would never match and the units could not authenticate.
@@ -310,7 +311,7 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 	if err != nil {
 		return nil, err
 	}
-	limits := e.cfg.Defaults
+	limits := size.Limits()
 	if req.Limits != nil {
 		limits = *req.Limits
 	}
@@ -337,6 +338,11 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 		b := *req.Branch
 		p.Branch = &b
 	}
+	releaseCap, err := e.holdCapacity(ctx, req, size)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseCap()
 	if req.Recreate {
 		cur, err := e.reg.GetProject(ctx, ref)
 		if err != nil {
@@ -364,6 +370,7 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*registry.Proje
 			return nil, fmt.Errorf("%w: parent project %s is being deleted or gone", ErrInvalidState, p.Branch.ParentRef)
 		}
 	}
+	releaseCap() // the row exists and counts against the node from here
 	fail := func(stage string, cause error) (*registry.Project, error) {
 		cctx, cancel := cleanupCtx(ctx)
 		defer cancel()
@@ -483,7 +490,14 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 
 // Resume implements Manager: the reverse of Pause. If a unit does not come up, what
 // started is stopped again and the project stays INACTIVE, so Resume can be retried.
-func (e *Engine) Resume(ctx context.Context, ref string) error {
+//
+// A paused project holds no room on the node, so Resume judges its memory cap and CPU against the
+// node the way an upsize is judged and refuses with a *CapacityError when they no longer fit.
+func (e *Engine) Resume(ctx context.Context, ref string) error { return e.resume(ctx, ref, true) }
+
+// resume is Resume; checkNode is false for a project the daemon itself paused around a restart,
+// which comes back whatever the node's budget says (it ran before).
+func (e *Engine) resume(ctx context.Context, ref string, checkNode bool) error {
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return err
@@ -500,7 +514,15 @@ func (e *Engine) Resume(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	if err := e.setStatus(ctx, ref, registry.StatusComingUp); err != nil {
+	releaseCap := func() {}
+	if checkNode && p.Status == registry.StatusInactive {
+		if releaseCap, err = e.holdResume(ctx, p); err != nil {
+			return err
+		}
+	}
+	err = e.setStatus(ctx, ref, registry.StatusComingUp) // the project counts against the node from here
+	releaseCap()
+	if err != nil {
 		return err
 	}
 	if err := e.plane.Start(ctx, p, keys); err != nil {
@@ -1016,6 +1038,9 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 		switch p.Status {
 		case registry.StatusPausing:
 			to, note = registry.StatusInactive, "the daemon stopped during a pause"
+		case registry.StatusResizing:
+			// The registry holds the size the resize was going to; the project starts on it.
+			to, note = registry.StatusInactive, "the daemon stopped during a resize; the project is started again on the size recorded for it"
 		case registry.StatusComingUp, registry.StatusRestarting:
 			if routes[p.Ref] {
 				to, note = registry.StatusInactive, "the daemon stopped during a resume or restart"
@@ -1053,7 +1078,7 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 			} else {
 				e.event(ctx, p.Ref, "project.recovered", map[string]string{"from": string(p.Status), "to": string(to), "note": note})
 				e.log.Warn("recovered project after an interrupted operation", "ref", p.Ref, "from", p.Status, "to", to, "note", note)
-				out = append(out, Recovered{Ref: p.Ref, From: p.Status, To: to, Note: note})
+				out = append(out, Recovered{Ref: p.Ref, From: p.Status, To: to, Note: note, Resume: p.Status == registry.StatusResizing})
 			}
 		}
 		unlock()
@@ -1128,7 +1153,7 @@ func (e *Engine) ResumeRecovered(ctx context.Context, rs []Recovered) map[string
 		if !r.Resume {
 			continue
 		}
-		err := e.Resume(ctx, r.Ref)
+		err := e.resume(ctx, r.Ref, false)
 		res := "resumed"
 		if err != nil {
 			errs[r.Ref] = err

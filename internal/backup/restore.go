@@ -283,8 +283,12 @@ func (s *Service) restoreAsNew(ctx context.Context, plan *RestorePlan, src *secr
 	if mp := plan.Manifest.Project; mp != nil {
 		req.Name = mp.Name + " (restored)"
 		req.OrgSlug, req.Region, req.Class = mp.OrgSlug, mp.Region, mp.Class
-		lim := mp.Limits
-		req.Limits = &lim
+		if !lifecycle.StandardLimits(mp.Class, mp.Limits) {
+			// Hand-set limits stay; the standard ones follow the size, which an earlier version's
+			// manifest may name differently from what its limits were.
+			lim := mp.Limits
+			req.Limits = &lim
+		}
 	}
 	p, err := s.opt.Manager.Create(ctx, req)
 	if err != nil {

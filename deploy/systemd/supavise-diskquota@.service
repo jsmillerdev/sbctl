@@ -1,0 +1,46 @@
+[Unit]
+Description=Supavise XFS project quota of project %i
+Documentation=https://github.com/jsmillerdev/supavise
+
+[Service]
+# Started by supavise when a project's disk size is set (Management API or `supavise projects`)
+# on a data volume that is XFS mounted with prjquota. Setting an XFS project quota needs root
+# (xfs_quota), and the daemon runs as the supavise user, so this unit does it and nothing else:
+# `supavise system set-disk-quota` takes the ref from this unit's name (20 lowercase letters,
+# checked), reads the project id and size from <projects>/<ref>/disk-quota (numbers, range checked),
+# refuses a project directory that is a symbolic link, and runs only xfs_quota with those numbers
+# on the mount that holds the directory. The polkit rule of supavise (manage-units on supavise-*
+# units) is what lets the supavise user start it.
+#
+# PrivateDevices is off on purpose: xfs_quota reaches the quota of a filesystem through the
+# block device node named in /proc/mounts, which a private /dev does not have.
+Type=oneshot
+Slice=supavise.slice
+ExecStart=/usr/local/bin/supavise system set-disk-quota %i
+TimeoutStartSec=120s
+SyslogIdentifier=supavise-diskquota
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+# quotactl, the project-id ioctl on a tree owned by another uid, and reading the project directory.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/var/lib/supavise
+
+# Never enabled: supavise starts an instance when a project's disk size is set.

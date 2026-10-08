@@ -18,6 +18,7 @@ import (
 	"github.com/jsmillerdev/supavise/internal/api/cryptojs"
 	"github.com/jsmillerdev/supavise/internal/branching"
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/diskquota"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/members"
 	"github.com/jsmillerdev/supavise/internal/projectconfig"
@@ -56,6 +57,12 @@ type fakeManager struct {
 	gate       chan struct{}
 	restoreErr error
 	beginErr   error
+	// resize: resizeErr is what BeginResize returns, unfit the reason by size name that a size does
+	// not fit the node, resizeGate holds Run, resizes records the finished ones.
+	resizeErr  error
+	unfit      map[string]string
+	resizeGate chan struct{}
+	resizes    []string
 }
 
 // restoreRecord is one restore the fakeManager ran.
@@ -508,4 +515,102 @@ func (f *fixture) ownerOn(srv *Server) {
 	if err := srv.members.EnsureOwner(context.Background(), members.OrgRef{ID: f.org.ID, Slug: f.org.Slug}, f.userID); err != nil {
 		f.t.Fatal(err)
 	}
+}
+
+// ---- resize ----------------------------------------------------------------------------------
+
+// BeginResize makes fakeManager a lifecycle.Resizer that behaves like the Engine as far as the
+// API can tell: it refuses a project that is not running, judges the node (unfit holds the reason
+// by size name), moves the project to RESIZING with the new class, and Run puts it back to
+// ACTIVE_HEALTHY once resizeGate is closed (or at once when there is none).
+func (m *fakeManager) BeginResize(ctx context.Context, ref, size string) (lifecycle.ResizeHandle, error) {
+	m.mu.Lock()
+	err, reason := m.resizeErr, m.unfit[size]
+	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	p, perr := m.reg.GetProject(ctx, ref)
+	if perr != nil {
+		return nil, perr
+	}
+	if p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy {
+		return nil, fmt.Errorf("%w: cannot resize %s while it is %s", lifecycle.ErrInvalidState, ref, p.Status)
+	}
+	from, _ := lifecycle.ClassFor(p.Class)
+	to, _ := lifecycle.ClassFor(size)
+	h := &fakeResize{m: m, ref: ref, from: from.Name, to: to.Name, changed: from.Name != to.Name}
+	if !h.changed {
+		return h, nil
+	}
+	if reason != "" {
+		return nil, &lifecycle.CapacityError{Message: reason}
+	}
+	p.Class, p.Limits, p.Status = to.Name, to.Limits(), registry.StatusResizing
+	if err := m.reg.UpdateProject(ctx, p); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// Offers lists every size; those named in unfit do not fit.
+func (m *fakeManager) Offers(_ context.Context, _ string) ([]lifecycle.Offer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []lifecycle.Offer
+	for _, c := range lifecycle.Classes() {
+		r := m.unfit[c.Name]
+		out = append(out, lifecycle.Offer{Class: c, Fits: r == "", Reason: r})
+	}
+	return out, nil
+}
+
+type fakeResize struct {
+	m        *fakeManager
+	ref      string
+	from, to string
+	changed  bool
+	closed   bool
+}
+
+func (r *fakeResize) From() string  { return r.from }
+func (r *fakeResize) To() string    { return r.to }
+func (r *fakeResize) Changed() bool { return r.changed }
+func (r *fakeResize) Close()        { r.closed = true }
+func (r *fakeResize) Run(ctx context.Context) error {
+	m := r.m
+	m.mu.Lock()
+	gate := m.resizeGate
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	m.mu.Lock()
+	m.resizes = append(m.resizes, r.ref+"="+r.to)
+	m.mu.Unlock()
+	return m.reg.SetProjectStatus(context.WithoutCancel(ctx), r.ref, registry.StatusActiveHealthy)
+}
+
+// fakeDisk is a DiskLimits over numbers the test sets.
+type fakeDisk struct {
+	vol     diskquota.Volume
+	used    int64
+	limits  map[string]int
+	setErr  error
+	setCall []string
+}
+
+func (d *fakeDisk) Volume() (diskquota.Volume, error) { return d.vol, nil }
+func (d *fakeDisk) Used(string) int64                 { return d.used }
+func (d *fakeDisk) Limit(ref string) (int, bool)      { gb, ok := d.limits[ref]; return gb, ok }
+func (d *fakeDisk) Set(_ context.Context, ref string, seq, gb int) error {
+	if d.setErr != nil {
+		return d.setErr
+	}
+	if d.limits == nil {
+		d.limits = map[string]int{}
+	}
+	d.limits[ref] = gb
+	d.setCall = append(d.setCall, fmt.Sprintf("%s=%d", ref, gb))
+	return nil
 }
