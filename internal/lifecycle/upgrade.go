@@ -158,6 +158,10 @@ const (
 	// BlockerReplicas: the project has read replicas and the target is another Postgres major
 	// version, which a standby cannot follow. They are removed first.
 	BlockerReplicas = "has_replicas"
+	// BlockerElsewhere: the project is homed on another node. An upgrade renders and restarts the
+	// project from the artifacts and the data directory of the node it runs on, so `supavise upgrade`
+	// on that node moves it.
+	BlockerElsewhere = "homed_elsewhere"
 )
 
 // UpgradeBlocker is one reason a project cannot be upgraded now.
@@ -304,6 +308,15 @@ func (e *Engine) plan(ctx context.Context, p *registry.Project, target map[strin
 	if el.PostgresRestart {
 		el.DowntimeHours = downtimePostgresHours
 	}
+	// The pins of this node say nothing about a project that runs on another one: its home upgrades
+	// it, against its own pins. The answer is the reason and nothing else, so that neither the CLI
+	// (`projects upgrade --all`, which would otherwise halt its rollout at the first such project)
+	// nor Studio offers an upgrade this node would refuse in BeginUpgrade.
+	if !e.homedHere(p) {
+		el.Ahead = nil
+		el.Blockers = []UpgradeBlocker{{Type: BlockerElsewhere, Message: fmt.Sprintf("the project is homed on node %s; upgrade it there", p.NodeID)}}
+		return el, nil
+	}
 	block := func(typ, format string, args ...any) {
 		el.Blockers = append(el.Blockers, UpgradeBlocker{Type: typ, Message: fmt.Sprintf(format, args...)})
 	}
@@ -438,8 +451,20 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 		return nil, fmt.Errorf("lifecycle: record the upgrade of %s: %w", ref, err)
 	}
 	if err := e.reg.SetProjectStatus(ctx, ref, registry.StatusUpgrading); err != nil {
+		// A write that returns an error may have happened: a context that ends while the registry
+		// answers (a stop signal, a deadline) cuts the answer, not the commit. A project left UPGRADING
+		// here would have nobody behind it, and Recover would take its units down, the cluster included.
+		// The runner's claim and the project's lock are still ours, so the status is put back if it is
+		// there.
+		cctx, cancel := cleanupCtx(ctx)
+		defer cancel()
+		if cur, gerr := e.reg.GetProject(cctx, ref); gerr == nil && cur.Status == registry.StatusUpgrading {
+			if rerr := e.reg.SetProjectStatus(cctx, ref, p.Status); rerr != nil {
+				e.log.Error("upgrade: could not put the project's status back after a failed write", "ref", ref, "error", rerr)
+			}
+		}
 		up.Status, up.Error, up.Detail = registry.UpgradeFailed, UpgradeErrBackup, "could not set the project UPGRADING: "+err.Error()
-		_ = store.PutUpgrade(context.WithoutCancel(ctx), &up)
+		_ = store.PutUpgrade(cctx, &up)
 		return nil, err
 	}
 	e.upgrading.Store(ref, struct{}{})
@@ -1054,11 +1079,19 @@ func (e *Engine) settleUpgradeRows(ctx context.Context, ps []registry.Project) {
 // recoverUpgrade ends the running upgrade record of ref as failed. It stops the project's units
 // and reports true, unless the upgrade died before it touched any (progress before
 // ProgressStopping): then the units still run the recorded versions, nothing is stopped, and it
-// reports false. A missing or already closed record counts as touched.
+// reports false. A record that is closed as failed before that point says the same. A missing record,
+// or one that is closed otherwise, counts as touched.
 func (e *Engine) recoverUpgrade(ctx context.Context, ref string) (touched bool) {
 	touched = true
 	if store := registry.Upgrades(e.reg); store != nil {
-		if u, err := store.LatestUpgrade(ctx, ref); err == nil && u.Status == registry.UpgradeRunning {
+		u, err := store.LatestUpgrade(ctx, ref)
+		if err == nil && u.Status == registry.UpgradeFailed && u.Progress < ProgressStopping {
+			// The upgrade ended before it stopped a unit and left the status behind (BeginUpgrade writes
+			// the status after the record, and a write whose answer was lost can leave it set): the
+			// units still run the recorded versions.
+			return false
+		}
+		if err == nil && u.Status == registry.UpgradeRunning {
 			u.Status, u.Error, u.LatestStatusAt = registry.UpgradeFailed, UpgradeErrHealth, e.opts.Now().UTC()
 			u.Detail = "the process that ran the upgrade stopped; the project starts on its previous versions"
 			if u.Progress < ProgressStopping {
@@ -1143,6 +1176,12 @@ func (e *Engine) PendingRestart(ctx context.Context, ref string) (bool, error) {
 	if err != nil || !active(p.Status) {
 		return false, err
 	}
+	// The look renders the project's units from this node's files. A project homed on another node has
+	// none here (or, on a node that holds its replica, units of the replica, which the primary's spec
+	// would be rendered over): its home restarts what it owes.
+	if !e.homedHere(p) {
+		return false, nil
+	}
 	keys, err := e.loadKeys(ctx, ref)
 	if err != nil {
 		return false, err
@@ -1168,7 +1207,7 @@ func (e *Engine) RestartPending(ctx context.Context, ref string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := e.atHome(p, "restart"); err != nil {
+	if err := e.onHome(p, "restart the held-back units of", "the units, files and marks it looks at are this node's own"); err != nil {
 		return false, err
 	}
 	if !active(p.Status) {

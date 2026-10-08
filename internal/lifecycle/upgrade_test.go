@@ -1087,3 +1087,82 @@ func TestUpgradeReusesTheBackupOfTheRun(t *testing.T) {
 		t.Fatalf("err %v, new backups %v", err, h.backup.calls)
 	}
 }
+
+// lostAnswerRegistry commits the write that sets a project UPGRADING and then answers with an error,
+// which is what a registry does when the caller's context ends while the statement runs.
+type lostAnswerRegistry struct {
+	*registry.Memory
+	lose bool
+}
+
+func (r *lostAnswerRegistry) SetProjectStatus(ctx context.Context, ref string, s registry.Status) error {
+	err := r.Memory.SetProjectStatus(ctx, ref, s)
+	if err == nil && s == registry.StatusUpgrading && r.lose {
+		return context.Canceled
+	}
+	return err
+}
+
+// A stop signal that lands while BeginUpgrade writes the UPGRADING status can lose the answer and
+// keep the write. The project goes back to the status it had and nothing is left for a recovery to
+// stop: the cluster of a project that was serving must not restart because an upgrade was cancelled.
+func TestBeginUpgradePutsTheStatusBackWhenTheWriteLostItsAnswer(t *testing.T) {
+	ctx := context.Background()
+	h := newUpHarness(t)
+	lost := &lostAnswerRegistry{Memory: h.reg, lose: true}
+	cli := NewEngine(h.cfg, lost, h.e.sec, h.arts, h.plane, Options{Fleet: fleet.Fleet{&fakeTenant{}}, Backup: h.backup})
+	if _, err := cli.BeginUpgrade(ctx, h.ref, UpgradeRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("BeginUpgrade = %v", err)
+	}
+	if p := h.project(t); p.Status != registry.StatusActiveHealthy {
+		t.Fatalf("the project is %s; a refused upgrade leaves it as it was", p.Status)
+	}
+	if u := h.latest(t); u.Status != registry.UpgradeFailed || u.Progress != ProgressRequested {
+		t.Fatalf("the record = %+v", u)
+	}
+	// The claim and the lock went with the call: the next upgrade is accepted.
+	lost.lose = false
+	if _, err := cli.BeginUpgrade(ctx, h.ref, UpgradeRequest{}); err != nil {
+		t.Fatalf("the upgrade after the refused one: %v", err)
+	}
+}
+
+// The status that the write above could not put back (the registry went away in between) is
+// settled by the daemon without a stop: the record says the upgrade ended before it reached a unit.
+func TestRecoverLeavesTheUnitsOfAProjectWhoseUpgradeFailedBeforeTouchingThem(t *testing.T) {
+	ctx := context.Background()
+	for _, via := range []string{"Recover", "SettleUpgrades"} {
+		t.Run(via, func(t *testing.T) {
+			h := newUpHarness(t)
+			run, err := h.e.BeginUpgrade(ctx, h.ref, UpgradeRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// BeginUpgrade's failure path: the record is failed at the first step, the status is UPGRADING.
+			u := h.latest(t)
+			u.Status, u.Error, u.Detail = registry.UpgradeFailed, UpgradeErrBackup, "could not set the project UPGRADING: context canceled"
+			if err := h.reg.PutUpgrade(ctx, u); err != nil {
+				t.Fatal(err)
+			}
+			run.(*upgradeRun).release()
+			h.e.upgrading.Delete(h.ref)
+			h.plane.steps = nil
+			daemon := h.daemonOf()
+			var rec []Recovered
+			if via == "Recover" {
+				rec = daemon.Recover(ctx)
+			} else {
+				rec = daemon.SettleUpgrades(ctx)
+			}
+			if len(rec) != 1 || rec[0].To != registry.StatusActiveHealthy {
+				t.Fatalf("recovered = %+v", rec)
+			}
+			if got := h.plane.log(); got != "" {
+				t.Fatalf("a project that was serving was touched: %s", got)
+			}
+			if p := h.project(t); p.Status != registry.StatusActiveHealthy {
+				t.Fatalf("project = %s", p.Status)
+			}
+		})
+	}
+}

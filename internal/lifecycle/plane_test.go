@@ -953,3 +953,62 @@ func TestPostgresSpecRunsCronInBackgroundWorkers(t *testing.T) {
 		}
 	}
 }
+
+// The rollout looks twice at a project whose files the daemon never held back: PendingRestart decides
+// to restart it, and RestartPending restarts it. The first look renders the new files, so the second
+// would find them in place and nothing to do, unless the first leaves the owed restart on record.
+// That is the window of a daemon that started while the project was UPGRADING (it skipped the
+// project, and so held nothing back) before the rollout reached it.
+func TestPendingRestartLeavesTheOwedRestartOnRecordForRestartPending(t *testing.T) {
+	const ref = "abcdefghijklmnopqrst"
+	now := time.Now()
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	cfg.Domain = "example.test"
+	cfg.BinPath = "/usr/local/bin/supavise"
+	p := testProject(cfg, ref, 2)
+	pgSpec := units.Spec{Service: config.SvcPostgres, Ref: ref}
+	version := "v1"
+	writeVersion := func(spec units.Spec) {
+		files := units.FilesFor(cfg, spec)
+		for _, f := range []string{files.Env, files.Run} {
+			if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f, []byte(version+spec.Service), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(f, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeAPIFiles(t, cfg, ref, now.Add(-2*time.Hour))
+	writeVersion(pgSpec)
+	sup := &namedSup{recSup: recSup{state: units.StateActive, since: now.Add(-time.Hour), render: writeVersion}}
+	pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: time.Millisecond, ServiceReadyTimeout: time.Millisecond})
+
+	// The release renders other files: the first look renders them, the unit runs the old ones.
+	version, sup.changed = "v2", true
+	ctx := context.Background()
+	if pending, err := pl.PendingRestart(ctx, p, testKeys(t, ref)); err != nil || !pending {
+		t.Fatalf("first look: pending = %v, %v", pending, err)
+	}
+	if !HeldRestart(cfg, ref) {
+		t.Fatal("the look that rendered the files left no mark of the restart it found")
+	}
+	sup.changed = false // the files are rendered; nothing changes at the next look
+	if pending, err := pl.PendingRestart(ctx, p, testKeys(t, ref)); err != nil || !pending {
+		t.Fatalf("second look: pending = %v, %v", pending, err)
+	}
+	sup.units = nil
+	// Nothing answers, so the wait for the cluster ends the call; the stops and the start are the point.
+	_, _ = pl.RestartPending(ctx, p, testKeys(t, ref))
+	cluster := config.UnitName(config.SvcPostgres, ref)
+	if got := strings.Join(sup.units, ", "); !strings.Contains(got, "stop "+cluster) || !strings.Contains(got, "start "+cluster) {
+		t.Fatalf("the cluster on older files was not restarted: %s", got)
+	}
+	if HeldRestart(cfg, ref) {
+		t.Fatal("the restart left its mark behind")
+	}
+}
