@@ -327,6 +327,9 @@ func (s *Server) deleteProject(r *http.Request) (*registry.Project, error) {
 		return nil, err
 	}
 	defer cancel()
+	if err := s.removeReplicasFirst(ctx, p.Ref); err != nil {
+		return nil, err
+	}
 	if err := s.mgr.Delete(ctx, p.Ref); err != nil {
 		return nil, mapErr(err)
 	}
@@ -376,9 +379,11 @@ func (s *Server) restoreProject(status int) handlerFunc {
 
 // platformRestart restarts the project, or, when the body names a database_identifier that is one
 // of the project's read replicas, that replica alone (Studio's Restart replica). The identifier
-// of the primary, or none, restarts the project, which restarts the primary only. A node without a
-// replica controller never read the body and still does not; with one, a body that is not JSON is
-// a 400, so a client that meant a replica cannot restart the project by sending it badly.
+// of the primary, or none, restarts the project, which restarts the primary only. With a replica
+// controller a body that is not JSON is a 400, so a client that meant a replica cannot restart the
+// project by sending it badly. A node without one ignores a body it cannot parse, as it always did,
+// but a body that names a replica gets 503: restarting the primary for a request that meant a
+// replica would be worse.
 func (s *Server) platformRestart(w http.ResponseWriter, r *http.Request) error {
 	var in struct {
 		Identifier string `json:"database_identifier"`

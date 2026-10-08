@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
@@ -135,6 +136,9 @@ func (s *Server) removeReadReplica(w http.ResponseWriter, r *http.Request) error
 	if s.replicas == nil {
 		return errNoReplicas
 	}
+	if err := s.ownReplica(r.Context(), p.Ref, in.Identifier); err != nil {
+		return err
+	}
 	ctx, cancel, err := s.detach(r, lifecycleTimeout)
 	if err != nil {
 		return err
@@ -147,13 +151,35 @@ func (s *Server) removeReadReplica(w http.ResponseWriter, r *http.Request) error
 	return nil
 }
 
+// ownReplica answers 404 unless identifier is one of the project's replicas. The controller is
+// asked to check the same thing (ErrNotFound), but the handler does not rely on it: an identifier
+// comes from the client, and a controller that took any identifier for granted would let the admin
+// of one project remove or restart another project's replica.
+func (s *Server) ownReplica(ctx context.Context, ref, identifier string) error {
+	_, ok, err := s.replicaOf(ctx, ref, identifier)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return replicaServiceErr(replicas.ErrNotFound)
+	}
+	return nil
+}
+
 // restartReplica restarts one replica's services on its node (POST restart with a
-// database_identifier). Restarting the project itself restarts the primary only.
+// database_identifier). Restarting the project itself restarts the primary only. replicas.Service
+// .Restart does not wait for the replica to come back: it returns once the replica is RESTARTING,
+// and the units restart in the background, so the answer comes at once with the same status as the
+// project's restart and the progress shows in databases-statuses (RESTARTING, then ACTIVE_HEALTHY,
+// or ACTIVE_UNHEALTHY if the node could not do it).
 func (s *Server) restartReplica(w http.ResponseWriter, r *http.Request, p *registry.Project, identifier string, status int) error {
 	if s.replicas == nil {
 		return errNoReplicas
 	}
-	ctx, cancel, err := s.detach(r, 2*lifecycleTimeout)
+	if err := s.ownReplica(r.Context(), p.Ref, identifier); err != nil {
+		return err
+	}
+	ctx, cancel, err := s.detach(r, lifecycleTimeout)
 	if err != nil {
 		return err
 	}
@@ -165,17 +191,79 @@ func (s *Server) restartReplica(w http.ResponseWriter, r *http.Request, p *regis
 	return nil
 }
 
+// replicaRemoveTimeout bounds the removal of a project's replicas in front of a delete or a restore.
+const replicaRemoveTimeout = 5 * time.Minute
+
+// removeReplicasFirst removes every read replica of the project before the project is deleted or
+// restored in place (design 2.7.8): a standby cannot follow a restored primary, and the project row
+// owns its replica rows, so a delete would take the rows with it and leave the instances on their
+// nodes. A removal that cannot finish now (a node that does not answer, a worker that is still
+// setting the replica up) stays GOING_DOWN for the controller to retry and is a 409 here: the
+// project is neither deleted nor restored, and the same request succeeds when the replicas are
+// gone. Replicas that the server-wide default makes are made again when the project runs.
+//
+// The service must also be a replicas.Remover, as the controller is. One that is not cannot remove
+// anything, so a project that has replicas is refused rather than orphaned.
+func (s *Server) removeReplicasFirst(ctx context.Context, ref string) error {
+	if s.replicas == nil {
+		return nil
+	}
+	rm, ok := s.replicas.(replicas.Remover)
+	if !ok {
+		rs, err := s.replicasOf(ctx, ref)
+		if err != nil {
+			return err
+		}
+		if len(rs) > 0 {
+			return errf(http.StatusServiceUnavailable, "This project has read replicas and this Supavise server cannot remove them: remove them first")
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, replicaRemoveTimeout)
+	defer cancel()
+	err := rm.RemoveAll(ctx, ref)
+	var pe *replicas.PendingError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &pe):
+		return errf(http.StatusConflict, "The read replicas %s of this project are still being removed. Try again in a few minutes.", strings.Join(pe.Identifiers, ", "))
+	}
+	return mapErr(err)
+}
+
 // replicasOf lists the project's replicas with where they run, oldest first. A node without a
-// controller has none.
+// controller has none. When the controller cannot answer (on a follower it forwards to the leader,
+// which may be unreachable during a failover), the listing is made from the registry rows this node
+// has: they hold everything a listing needs, and an Infrastructure page that goes blank while the
+// leader changes is worse than one that shows the rows. The error is logged.
 func (s *Server) replicasOf(ctx context.Context, ref string) ([]replicas.Replica, error) {
 	if s.replicas == nil {
 		return nil, nil
 	}
 	rs, err := s.replicas.List(ctx, ref)
-	if err != nil {
-		return nil, mapErr(err)
+	if err == nil {
+		return rs, nil
 	}
-	return rs, nil
+	s.log.Warn("the replica controller could not list a project's replicas; listing the registry's rows", "ref", ref, "err", err)
+	rows, rerr := s.placement.ReplicasOf(ctx, ref)
+	if rerr != nil {
+		return nil, mapErr(rerr)
+	}
+	nodes, rerr := s.reg.ListNodes(ctx)
+	if rerr != nil {
+		return nil, mapErr(rerr)
+	}
+	byID := make(map[string]registry.Node, len(nodes))
+	for _, n := range nodes {
+		byID[n.ID] = n
+	}
+	out := make([]replicas.Replica, len(rows))
+	for i, r := range rows {
+		n := byID[r.NodeID]
+		out[i] = replicas.Replica{Replica: r, Region: n.Region, PublicHost: n.PublicHost}
+	}
+	return out, nil
 }
 
 // replicaOf finds identifier among the project's replicas by the placement Resolver, which reads

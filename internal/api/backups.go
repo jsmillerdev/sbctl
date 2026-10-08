@@ -334,6 +334,12 @@ func (s *Server) startRestore(w http.ResponseWriter, r *http.Request, p *registr
 	if err != nil {
 		return err
 	}
+	// A standby cannot follow a restored primary: the replicas go first, and the restore waits
+	// (409) while one cannot be removed yet.
+	if err := s.removeReplicasFirst(ctx, p.Ref); err != nil {
+		cancel()
+		return err
+	}
 	// detach's deadline bounds BeginRestore; the restore runs on a context without one.
 	rctx := context.WithoutCancel(ctx)
 	rs, err := dr.BeginRestore(ctx, p.Ref)

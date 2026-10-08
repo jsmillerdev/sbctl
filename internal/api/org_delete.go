@@ -182,8 +182,13 @@ func (s *Server) removeProject(ctx context.Context, p registry.Project) error {
 		if _, err := s.branches.Delete(ctx, p.Ref, branching.DeleteOptions{}); err != nil {
 			return err
 		}
-	} else if err := s.mgr.Delete(ctx, p.Ref); err != nil {
-		return err
+	} else {
+		if err := s.removeReplicasFirst(ctx, p.Ref); err != nil {
+			return err
+		}
+		if err := s.mgr.Delete(ctx, p.Ref); err != nil {
+			return err
+		}
 	}
 	s.functionsGone(ctx, p.Ref)
 	return nil

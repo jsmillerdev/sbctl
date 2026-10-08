@@ -94,14 +94,9 @@ func (s *Server) pgmetaKey(ctx context.Context) (string, error) {
 	return key, nil
 }
 
-// pgmetaConn builds the x-connection-encrypted header value for ref's database as
-// role (see Server.dsn for the roles and readOnly).
-func (s *Server) pgmetaConn(ctx context.Context, ref, role string, readOnly bool) (string, error) {
-	return s.pgmetaConnOn(ctx, "", ref, role, readOnly)
-}
-
-// pgmetaConnOn is pgmetaConn for the database called replica, one of ref's read replicas; an
-// empty replica is the primary.
+// pgmetaConnOn builds the x-connection-encrypted header value for ref's database as role (see
+// Server.dsn for the roles and readOnly). replica names one of ref's read replicas; an empty replica
+// is the primary.
 func (s *Server) pgmetaConnOn(ctx context.Context, replica, ref, role string, readOnly bool) (string, error) {
 	dsn, err := s.dsnOn(ctx, replica, ref, role, readOnly)
 	if err != nil {

@@ -13,8 +13,10 @@ import (
 // supavise_read_only), but the name should be one the project's database has. This reads the SQL
 // that the pinned Postgres artifact runs when it creates a project's cluster, so a pin that drops
 // the role fails here. It needs SUPAVISE_TEST_UNPACKED (the unpacked artifacts directory, as for
-// the other integration tests) and skips without it; roles-smoke (tests/linux) asks a real cluster of
-// each shipped archive for the same role.
+// the other integration tests) and skips without it; no workflow sets it for this package, so in CI
+// this test never runs. roles-smoke (tests/linux) asks a real cluster of each shipped archive for the
+// same role, login, bypassrls, pg_read_all_data and the read-only session default included, and is
+// what checks the archives.
 func TestPinnedPostgresCreatesTheReadOnlyUser(t *testing.T) {
 	root := os.Getenv("SUPAVISE_TEST_UNPACKED")
 	if root == "" {
