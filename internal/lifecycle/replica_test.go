@@ -509,6 +509,9 @@ func TestPromoteReplicaRefusalsAndRecovery(t *testing.T) {
 	if !errors.Is(err, ErrReplayBehind) || strings.Contains(f.sql.calls(), "promote") {
 		t.Fatalf("replay behind: %v (calls %s)", err, f.sql.calls())
 	}
+	if fileExists(f.cfg.Paths().PromoteOK(testRef)) {
+		t.Fatal("promote.ok was written for a node that is still a standby behind the old primary")
+	}
 
 	// pg_promote fails: the error comes back and the cluster keeps running as a standby.
 	f = newReplicaFixture(t)
@@ -517,6 +520,9 @@ func TestPromoteReplicaRefusalsAndRecovery(t *testing.T) {
 	f.sql.promoteErr = errors.New("pg_promote: the promotion did not finish")
 	if err := f.pl.PromoteReplica(ctx, f.t, PromoteOptions{Epoch: 2}); err == nil || strings.Contains(f.sup.ops(), "stop") {
 		t.Fatalf("pg_promote failure: %v\n%s", err, f.sup.ops())
+	}
+	if fileExists(f.cfg.Paths().PromoteOK(testRef)) {
+		t.Fatal("promote.ok stayed on a standby whose promotion did not start")
 	}
 
 	// A standby that is down is started to be promoted.
@@ -876,12 +882,16 @@ func startSignalProbe(t *testing.T) (pid int, got <-chan struct{}, stop func()) 
 // pidSup is a replicaSup whose units report a given main process.
 type pidSup struct {
 	*replicaSup
-	pid int
+	pid   int
+	since time.Time // when the unit became active, if not an hour ago
 }
 
 func (p pidSup) Status(ctx context.Context, u string) (units.Status, error) {
 	st, err := p.replicaSup.Status(ctx, u)
 	st.MainPID = p.pid
+	if !p.since.IsZero() {
+		st.Since = p.since
+	}
 	return st, err
 }
 

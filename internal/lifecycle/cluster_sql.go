@@ -3,6 +3,8 @@ package lifecycle
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -38,7 +40,9 @@ type ClusterSQL interface {
 	Ping(ctx context.Context, a ClusterAddr) error
 	// Status reads the recovery state. It fails when the cluster does not answer on a.
 	Status(ctx context.Context, a ClusterAddr) (ClusterStatus, error)
-	// ReplayedTo reports whether replay has reached lsn and everything the receiver got.
+	// ReplayedTo reports whether the record that starts at lsn was replayed, and everything the
+	// receiver got is: the replay position, which is the end of the last record replayed, is past lsn
+	// and not behind the receive position.
 	ReplayedTo(ctx context.Context, a ClusterAddr, lsn string) (bool, error)
 	// ReplayLSN is pg_last_wal_replay_lsn().
 	ReplayLSN(ctx context.Context, a ClusterAddr) (string, error)
@@ -92,10 +96,57 @@ func (pgSQL) ReplayedTo(ctx context.Context, a ClusterAddr, lsn string) (bool, e
 		return false, err
 	}
 	defer c.Close(context.Background())
-	var ok *bool
-	err = c.QueryRow(ctx, `select pg_last_wal_replay_lsn() >= $1::pg_lsn
-		and pg_last_wal_replay_lsn() >= coalesce(pg_last_wal_receive_lsn(), '0/0'::pg_lsn)`, lsn).Scan(&ok)
-	return ok != nil && *ok, err
+	var replay, receive *string
+	if err := c.QueryRow(ctx, `select pg_last_wal_replay_lsn()::text, pg_last_wal_receive_lsn()::text`).Scan(&replay, &receive); err != nil {
+		return false, err
+	}
+	if replay == nil {
+		return false, nil // not in recovery
+	}
+	got := ""
+	if receive != nil {
+		got = *receive
+	}
+	return replayedPast(*replay, got, lsn)
+}
+
+// replayedPast reports whether a standby at replay (the end of the last record it replayed) has
+// replayed the record that starts at lsn, and replay is not behind receive, the end of what its
+// receiver wrote ("" when it has none). A replay position equal to lsn means the record before lsn
+// is the last one replayed, so the record at lsn itself is still to come.
+func replayedPast(replay, receive, lsn string) (bool, error) {
+	want, err := parseLSN(lsn)
+	if err != nil {
+		return false, err
+	}
+	at, err := parseLSN(replay)
+	if err != nil {
+		return false, err
+	}
+	var got uint64
+	if receive != "" {
+		if got, err = parseLSN(receive); err != nil {
+			return false, err
+		}
+	}
+	return at > want && at >= got, nil
+}
+
+// parseLSN reads a pg_lsn in its text form, two hexadecimal numbers around a slash ("0/3000060").
+func parseLSN(s string) (uint64, error) {
+	hi, lo, ok := strings.Cut(s, "/")
+	if !ok {
+		return 0, fmt.Errorf("lifecycle: %q is not an LSN", s)
+	}
+	h, err := strconv.ParseUint(hi, 16, 32)
+	if err != nil {
+		return 0, fmt.Errorf("lifecycle: %q is not an LSN", s)
+	}
+	l, err := strconv.ParseUint(lo, 16, 32)
+	if err != nil {
+		return 0, fmt.Errorf("lifecycle: %q is not an LSN", s)
+	}
+	return h<<32 | l, nil
 }
 
 func (pgSQL) ReplayLSN(ctx context.Context, a ClusterAddr) (string, error) {

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
@@ -72,6 +73,13 @@ type PlaneOptions struct {
 	ReplicaReadyTimeout time.Duration
 	// ClusterSQL replaces the SQL the plane asks of a cluster (tests).
 	ClusterSQL ClusterSQL
+	// HoldPorts takes ref's canonical and replica ports from the mesh's forwarders
+	// (mesh.Forwarders.Suspend, which this package cannot import) and returns the function that gives
+	// them back. On the node of a replica the canonical ports are forwarders to the project's home, and
+	// on a project's old home the replica ports may be forwarders to another replica; PromoteReplica and
+	// DemoteToReplica call it before they start Postgres on a port the forwarder holds. Nil holds
+	// nothing, which is right outside a cluster.
+	HoldPorts func(ref string) (release func())
 }
 
 // SystemAuth is the configuration of supavise-gotrue@system for single sign-on. With it the system
@@ -98,6 +106,10 @@ type PostgresPlane struct {
 	opts PlaneOptions
 	log  *slog.Logger
 	http *http.Client
+	// holds are the releases of the port holds a promotion left in place until the project starts on
+	// this node (holdPorts).
+	holdMu sync.Mutex
+	holds  map[string]func()
 }
 
 var _ Plane = (*PostgresPlane)(nil)
@@ -368,7 +380,11 @@ func (pl *PostgresPlane) Start(ctx context.Context, p *registry.Project, keys *s
 	if err := pl.StartDatabase(ctx, p, keys); err != nil {
 		return err
 	}
-	return pl.startAPI(ctx, p, keys)
+	if err := pl.startAPI(ctx, p, keys); err != nil {
+		return err
+	}
+	pl.releasePorts(p.Ref) // a promoted replica is the project's home now: the forwarders may come back
+	return nil
 }
 
 func (pl *PostgresPlane) startAPI(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error {

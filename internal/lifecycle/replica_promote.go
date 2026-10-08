@@ -26,8 +26,9 @@ type PromoteOptions struct {
 	// Epoch is the cluster epoch the promotion is authorized under. It goes into promote.ok, which
 	// lets the WAL relay accept the first push of the new primary.
 	Epoch int64
-	// WaitLSN, when set, makes the promotion wait until replay reaches it and everything received:
-	// a planned switchover passes the old primary's final checkpoint LSN.
+	// WaitLSN, when set, makes the promotion wait until the record that starts at it was replayed and
+	// everything received is: a planned switchover passes the old primary's final checkpoint LSN
+	// (ControlInfo.Checkpoint), the start of the last record of its WAL.
 	WaitLSN string
 	// DrainArchive lets restore_command drain the WAL archive before the promotion: it waits until
 	// replay has stood still for one retry interval of the standby, bounded by Timeout and 10
@@ -58,11 +59,16 @@ func (pl *PostgresPlane) writePromoteOK(ref string, epoch int64) error {
 }
 
 // PromoteReplica turns the standby of t into the project's primary on its canonical port, as step 4
-// of a project switchover (design 2.10.3): it writes promote.ok(epoch), waits for the replay the
-// options ask for, runs pg_promote and a checkpoint, then restarts the cluster from the primary's
+// of a project switchover (design 2.10.3): it waits for the replay the options ask for, writes
+// promote.ok(epoch), runs pg_promote and a checkpoint, then restarts the cluster from the primary's
 // spec on the canonical port, with the standby's recovery settings removed from
 // postgresql.auto.conf. GoTrue and PostgREST are not started: they belong to the home and start
 // when the registry names this node the home (Start).
+//
+// On a node of a cluster the canonical ports are forwarders to the old home until the registry moves
+// the home, and Start comes after that. PromoteReplica takes the ports from the forwarders before it
+// starts the primary (PlaneOptions.HoldPorts) and keeps them until Start succeeds; a failure gives
+// them back.
 //
 // It can be repeated after a failure at any point: a cluster that was promoted but not restarted
 // is restarted as a primary, and one that already runs as a primary on the canonical port is left
@@ -75,17 +81,24 @@ func (pl *PostgresPlane) PromoteReplica(ctx context.Context, t ReplicaTarget, o 
 		return errors.New("lifecycle: PromoteReplica needs the cluster epoch")
 	}
 	p := t.Project
-	rp, cp := pl.replicaPaths(p), pl.paths(p)
-	ra, ca := addrOf(rp), addrOf(cp)
+	if st, err := pl.sql().Status(ctx, addrOf(pl.paths(p))); err == nil && !st.InRecovery && pl.promoteOKAtLeast(p.Ref, o.Epoch) {
+		return nil // promoted and restarted earlier
+	}
+	pl.holdPorts(p.Ref)
+	if err := pl.promote(ctx, t, o); err != nil {
+		pl.releasePorts(p.Ref)
+		return err
+	}
+	return nil
+}
+
+func (pl *PostgresPlane) promote(ctx context.Context, t ReplicaTarget, o PromoteOptions) error {
+	p := t.Project
+	rp := pl.replicaPaths(p)
+	ra := addrOf(rp)
 	sql := pl.sql()
 	timeout := o.timeout()
 
-	if st, err := sql.Status(ctx, ca); err == nil && !st.InRecovery && pl.promoteOKAtLeast(p.Ref, o.Epoch) {
-		return nil // promoted and restarted earlier
-	}
-	if err := pl.writePromoteOK(p.Ref, o.Epoch); err != nil {
-		return err
-	}
 	standby := fileExists(filepath.Join(rp.Data, "standby.signal"))
 	st, err := sql.Status(ctx, ra)
 	if err != nil && standby {
@@ -105,17 +118,27 @@ func (pl *PostgresPlane) PromoteReplica(ctx context.Context, t ReplicaTarget, o 
 		if o.DrainArchive {
 			pl.drainArchive(ctx, ra, min(timeout, 10*time.Second))
 		}
+		// The marker lets the relay accept the new primary's first push, so it is written when the
+		// promotion is about to run and not before the waits above, which may end it.
+		if err := pl.writePromoteOK(p.Ref, o.Epoch); err != nil {
+			return err
+		}
 		pl.log.Info("promoting the replica", "ref", p.Ref, "replica", t.Identifier, "epoch", o.Epoch)
 		if err := sql.Promote(ctx, ra, timeout); err != nil {
+			// A promotion that did not start leaves a standby, which must not carry the marker.
+			if st, serr := sql.Status(ctx, ra); serr == nil && st.InRecovery {
+				_ = os.Remove(pl.cfg.Paths().PromoteOK(p.Ref))
+			}
 			return err
 		}
 		if err := sql.Checkpoint(ctx, ra); err != nil {
 			return fmt.Errorf("lifecycle: checkpoint after the promotion of %s: %w", t.Identifier, err)
 		}
-	case err == nil:
-		// Promoted by an earlier try that died before the restart.
-	case !standby && fileExists(filepath.Join(rp.Data, "PG_VERSION")):
-		// Promoted and then stopped.
+	case err == nil, !standby && fileExists(filepath.Join(rp.Data, "PG_VERSION")):
+		// Promoted by an earlier try that died before the restart, or promoted and then stopped.
+		if err := pl.writePromoteOK(p.Ref, o.Epoch); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("%w: %s: %v", ErrNotStandby, rp.Data, err)
 	}
@@ -134,6 +157,37 @@ func (pl *PostgresPlane) PromoteReplica(ctx context.Context, t ReplicaTarget, o 
 	}
 	return pl.StartDatabase(ctx, p, t.Keys)
 }
+
+// holdPorts takes ref's ports from the mesh's forwarders. A hold that is in place is replaced: a
+// forwarder's own expiry would otherwise end it in the middle of a retried promotion.
+func (pl *PostgresPlane) holdPorts(ref string) {
+	if pl.opts.HoldPorts == nil {
+		return
+	}
+	release := pl.opts.HoldPorts(ref)
+	pl.holdMu.Lock()
+	if pl.holds == nil {
+		pl.holds = map[string]func(){}
+	}
+	pl.holds[ref] = release
+	pl.holdMu.Unlock()
+}
+
+// releasePorts gives ref's ports back to the forwarders, which bind again those the registry wants on
+// this node. It does nothing when no hold is in place.
+func (pl *PostgresPlane) releasePorts(ref string) {
+	pl.holdMu.Lock()
+	release := pl.holds[ref]
+	delete(pl.holds, ref)
+	pl.holdMu.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
+// SetPortHolder sets PlaneOptions.HoldPorts on a plane that was built without it. The daemon calls it
+// while it wires the cluster features, before any request is served.
+func (pl *PostgresPlane) SetPortHolder(f func(ref string) (release func())) { pl.opts.HoldPorts = f }
 
 func (pl *PostgresPlane) promoteOKAtLeast(ref string, epoch int64) bool {
 	b, err := os.ReadFile(pl.cfg.Paths().PromoteOK(ref))
@@ -198,15 +252,20 @@ func (pl *PostgresPlane) drainArchive(ctx context.Context, a ClusterAddr, bound 
 // written, and the cluster starts from the replica's spec on the replica port, with the replica's
 // PostgREST. The old timeline ends at the shutdown checkpoint, where the new primary's begins, so no
 // base backup is needed. ErrNotCleanShutdown when the cluster crashed or never shut down: it would
-// have to be rebuilt.
+// have to be rebuilt. The replica ports are taken from the mesh's forwarders while it starts
+// (PlaneOptions.HoldPorts): on the old home one may forward to another replica of the project.
 //
-// It can be repeated: a cluster that already runs as the replica is left running.
+// It can be repeated: a cluster that already runs as the replica is left running, and one whose
+// standby was set up and then stopped or crashed is started again without the shutdown check, which
+// only a primary has to pass.
 func (pl *PostgresPlane) DemoteToReplica(ctx context.Context, t ReplicaTarget) error {
 	if err := t.check(pl.cfg); err != nil {
 		return err
 	}
 	p := t.Project
 	rp, cp := pl.replicaPaths(p), pl.paths(p)
+	pl.holdPorts(p.Ref)
+	defer pl.releasePorts(p.Ref)
 	if fileExists(filepath.Join(rp.Data, "standby.signal")) {
 		if st, err := pl.sql().Status(ctx, addrOf(rp)); err == nil && st.InRecovery {
 			return pl.StartReplicaAPI(ctx, t)
@@ -218,31 +277,52 @@ func (pl *PostgresPlane) DemoteToReplica(ctx context.Context, t ReplicaTarget) e
 	if err := pl.Stop(ctx, p.Ref); err != nil {
 		return err
 	}
-	if st, err := ReadControl(cp.Data); err != nil {
-		return err
-	} else if !st.ShutDown() {
-		return fmt.Errorf("%w: %s is %q", ErrNotCleanShutdown, cp.Data, st.State)
-	}
-	if err := os.Remove(pl.cfg.Paths().PromoteOK(p.Ref)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	// GoTrue is the home's; the old home keeps none.
-	if err := pl.sup.Remove(ctx, config.UnitName(config.SvcGoTrue, p.Ref)); err != nil {
-		pl.log.Warn("demote: removing the GoTrue unit", "ref", p.Ref, "error", err)
-	}
-	conf := []string{
-		"primary_conninfo = " + confString(primaryConninfo(pl.cfg.PortsFor(p.Ref, p.Seq).Postgres, t.Keys.ReplicationPassword, t.Identifier)),
-		"restore_command = " + confString(pl.opts.RestoreCommandFor(p.Ref)),
-		"recovery_target_timeline = 'latest'",
-	}
-	if err := setRecoverySettings(rp.Data, conf); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(rp.Data, "standby.signal"), nil, 0o600); err != nil {
-		return err
+	if !standbyConfigured(rp.Data) {
+		if st, err := ReadControl(cp.Data); err != nil {
+			return err
+		} else if !st.ShutDown() {
+			return fmt.Errorf("%w: %s is %q", ErrNotCleanShutdown, cp.Data, st.State)
+		}
+		if err := os.Remove(pl.cfg.Paths().PromoteOK(p.Ref)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		// GoTrue is the home's; the old home keeps none.
+		if err := pl.sup.Remove(ctx, config.UnitName(config.SvcGoTrue, p.Ref)); err != nil {
+			pl.log.Warn("demote: removing the GoTrue unit", "ref", p.Ref, "error", err)
+		}
+		conf := []string{
+			"primary_conninfo = " + confString(primaryConninfo(pl.cfg.PortsFor(p.Ref, p.Seq).Postgres, t.Keys.ReplicationPassword, t.Identifier)),
+			"restore_command = " + confString(pl.opts.RestoreCommandFor(p.Ref)),
+			"recovery_target_timeline = 'latest'",
+		}
+		if err := setRecoverySettings(rp.Data, conf); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(rp.Data, "standby.signal"), nil, 0o600); err != nil {
+			return err
+		}
 	}
 	pl.log.Info("demoting the cluster to a replica", "ref", p.Ref, "replica", t.Identifier)
 	return pl.StartReplica(ctx, t)
+}
+
+// standbyConfigured reports whether dataDir is set up as a standby: it has standby.signal and the
+// recovery settings DemoteToReplica writes. DemoteToReplica writes standby.signal last.
+func standbyConfigured(dataDir string) bool {
+	if !fileExists(filepath.Join(dataDir, "standby.signal")) {
+		return false
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, "postgresql.auto.conf"))
+	if err != nil {
+		return false
+	}
+	have := map[string]bool{}
+	for _, line := range strings.Split(string(b), "\n") {
+		if name, ok := recoverySettingOf(line); ok {
+			have[name] = true
+		}
+	}
+	return have["primary_conninfo"] && have["restore_command"]
 }
 
 // SetWALKeepSize makes the primary of p keep size of WAL for its standbys (wal_keep_size, for example
@@ -262,8 +342,10 @@ func primaryConninfo(port int, password, applicationName string) string {
 		port, RoleReplication, kvQuote(password), kvQuote(applicationName))
 }
 
-// confString quotes a value for postgresql.conf.
-func confString(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+// confString quotes a value for postgresql.conf, where a backslash inside quotes starts an escape.
+func confString(s string) string {
+	return "'" + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), "'", "''") + "'"
+}
 
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
@@ -295,6 +377,17 @@ func setRecoverySettings(dataDir string, lines []string) error {
 	return rewriteAutoConf(dataDir, lines)
 }
 
+// recoverySettingOf returns the name of the recovery setting that a line of postgresql.auto.conf assigns.
+func recoverySettingOf(line string) (string, bool) {
+	name := strings.TrimSpace(line)
+	if i := strings.IndexAny(name, "= \t"); i > 0 && !strings.HasPrefix(name, "#") {
+		if n := strings.ToLower(name[:i]); recoverySettingNames[n] {
+			return n, true
+		}
+	}
+	return "", false
+}
+
 // rewriteAutoConf drops every assignment of a recovery setting from postgresql.auto.conf, keeps the
 // rest as it is and appends add.
 func rewriteAutoConf(dataDir string, add []string) error {
@@ -308,8 +401,7 @@ func rewriteAutoConf(dataDir string, add []string) error {
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	for sc.Scan() {
 		line := sc.Text()
-		name := strings.TrimSpace(line)
-		if i := strings.IndexAny(name, "= \t"); i > 0 && !strings.HasPrefix(name, "#") && recoverySettingNames[strings.ToLower(name[:i])] {
+		if _, ok := recoverySettingOf(line); ok {
 			continue
 		}
 		out.WriteString(line + "\n")
@@ -329,8 +421,9 @@ type ControlInfo struct {
 	// State is the cluster state as pg_controldata prints it: "shut down", "shut down in recovery",
 	// "in production", "in archive recovery", "in crash recovery", "starting up", "shutting down".
 	State string
-	// Checkpoint is the LSN of the latest checkpoint record ("0/3000060"). After a clean shutdown it
-	// is the shutdown checkpoint, the last record of the cluster's WAL.
+	// Checkpoint is the LSN where the latest checkpoint record starts ("0/3000060"). After a clean
+	// shutdown it is the shutdown checkpoint, the last record of the cluster's WAL: a standby has
+	// replayed it when its replay position, the end of the last record replayed, is past Checkpoint.
 	Checkpoint string
 }
 
