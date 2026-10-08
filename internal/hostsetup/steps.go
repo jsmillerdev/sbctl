@@ -395,42 +395,43 @@ func onOwnMount(dir string, mounts []string) bool {
 
 func ufwStep(o Options) Step {
 	// state says whether ufw is active and already admits the port; why explains a step that does
-	// not apply.
-	state := func(ctx context.Context) (open bool, why string, err error) {
+	// not apply. A ufw that cannot be read as root also leaves nothing to do, and unreadable says so:
+	// a firewall query that fails is no reason to fail an upgrade, but the operator is told.
+	state := func(ctx context.Context) (open bool, why string, unreadable bool) {
 		if o.PeerPort <= 0 {
-			return true, "no mesh port is configured", nil
+			return true, "no mesh port is configured", false
 		}
 		if _, err := o.lookPath("ufw"); err != nil {
-			return true, "ufw is not installed", nil
+			return true, "ufw is not installed", false
 		}
 		out, err := o.runner().Run(ctx, nil, "ufw", "status")
 		if err != nil {
 			if o.geteuid() != 0 {
-				return true, "ufw's rules cannot be read without root", nil
+				return true, "ufw's rules cannot be read without root", false
 			}
-			return false, "", err
+			return true, fmt.Sprintf("ufw status failed (%v), so %d/tcp was not checked", err, o.PeerPort), true
 		}
 		if !strings.Contains(string(out), "Status: active") {
-			return true, "ufw is not active", nil
+			return true, "ufw is not active", false
 		}
-		return ufwAdmits(string(out), o.PeerPort), "", nil
+		return ufwAdmits(string(out), o.PeerPort), "", false
 	}
 	return &funcStep{
 		id: "ufw", title: titleUFW, root: true,
 		check: func(ctx context.Context) (Pending, error) {
-			open, why, err := state(ctx)
-			if err != nil {
-				return Pending{}, err
-			}
+			open, why, _ := state(ctx)
 			if open {
 				return Pending{Detail: why}, nil
 			}
 			return Pending{Pending: true, Detail: fmt.Sprintf("%d/tcp is not allowed", o.PeerPort)}, nil
 		},
 		apply: func(ctx context.Context) (Outcome, error) {
-			open, _, err := state(ctx)
-			if err != nil || open {
-				return Outcome{}, err
+			open, why, unreadable := state(ctx)
+			if unreadable {
+				return Outcome{Warnings: []string{why + fmt.Sprintf("; if ufw is active, run `sudo ufw allow %d/tcp`", o.PeerPort)}}, nil
+			}
+			if open {
+				return Outcome{}, nil
 			}
 			rule := strconv.Itoa(o.PeerPort) + "/tcp"
 			if _, err := o.runner().Run(ctx, nil, "ufw", "allow", rule); err != nil {

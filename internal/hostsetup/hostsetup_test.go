@@ -348,10 +348,26 @@ func TestUFW(t *testing.T) {
 	if p, err := ufwStep(h.opts).Check(ctx); err != nil || p.Pending || !strings.Contains(p.Detail, "without root") {
 		t.Errorf("as a user: %+v, %v", p, err)
 	}
-	// As root the same failure is an error.
+	// As root the same failure is no reason to fail the host: the check says so, and the apply warns
+	// and opens nothing.
 	h.opts.Geteuid = func() int { return 0 }
-	if _, err := ufwStep(h.opts).Check(ctx); err == nil {
-		t.Error("a ufw that fails for root is not an error")
+	r := h.opts.Runner.(*fakeRunner)
+	if p, err := ufwStep(h.opts).Check(ctx); err != nil || p.Pending || !strings.Contains(p.Detail, "ufw status failed") {
+		t.Errorf("ufw fails for root: %+v, %v", p, err)
+	}
+	o, err := ufwStep(h.opts).Apply(ctx)
+	if err != nil || len(o.Changed) != 0 || len(o.Warnings) != 1 || !strings.Contains(o.Warnings[0], "sudo ufw allow 7443/tcp") || r.ran("ufw allow 7443/tcp") != 0 {
+		t.Errorf("ufw fails for root: %+v, %v, calls %v", o, err, r.calls)
+	}
+	// A rule that ufw refuses is a failure.
+	h.opts.Runner = &fakeRunner{do: func(name string, args []string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "allow" {
+			return nil, errors.New("ERROR: problem running ufw-init")
+		}
+		return []byte("Status: active\n\nTo   Action   From\n22/tcp   ALLOW   Anywhere\n"), nil
+	}}
+	if _, err := ufwStep(h.opts).Apply(ctx); err == nil {
+		t.Error("a ufw that refuses the rule is not an error")
 	}
 }
 

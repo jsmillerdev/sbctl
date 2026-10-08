@@ -98,6 +98,9 @@ type Outcome struct {
 	Files []string
 	// Reload is true when systemd has to re-read its unit files.
 	Reload bool
+	// Warnings are things the step could not do and went on without; Run prints each. They are not
+	// errors: the step counts as done.
+	Warnings []string
 }
 
 // Step is one idempotent change of the host.
@@ -229,7 +232,10 @@ func (c *Converger) Run(ctx context.Context) ([]Result, error) {
 		for _, line := range o.Changed {
 			c.say("%s", line)
 		}
-		if len(o.Changed) == 0 && err == nil {
+		for _, line := range o.Warnings {
+			c.say("warning: %s", line)
+		}
+		if len(o.Changed) == 0 && len(o.Warnings) == 0 && err == nil {
 			if u, ok := s.(interface{ unchanged() string }); ok && u.unchanged() != "" {
 				c.say("%s", u.unchanged())
 			}
