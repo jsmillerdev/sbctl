@@ -229,3 +229,21 @@ func TestVersionWindow(t *testing.T) {
 		}
 	}
 }
+
+// The CA a key derives must be the same bytes in every build of every release, because a join token
+// pins its hash and nodes of different releases join one cluster. A toolchain whose certificate
+// encoding differs would fail here instead of splitting a cluster.
+func TestCAFingerprintIsStableAcrossBuilds(t *testing.T) {
+	s, err := secrets.New(bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := NewCA(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "256c9c793279f2e7cf0c9882fb0cead20a039cff0b66816951a18b39784e866d"
+	if got := ca.Fingerprint(); got != want {
+		t.Fatalf("the CA of a fixed key hashes to %s, want %s: certificate encoding changed, and nodes built differently would pin different CAs", got, want)
+	}
+}
