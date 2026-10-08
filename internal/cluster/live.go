@@ -61,7 +61,7 @@ type Live struct {
 	fenced    *FencedRecord
 	primary   bool   // the last probe of the system cluster succeeded and found a primary
 	fencing   bool   // an observation is deciding whether to fence the node
-	notified  bool   // OnFenced has been called
+	notified  bool   // an observation fenced the node; OnFenced is called by it, once
 	recordErr string // the last error of reading fenced.json that was logged
 	drift     int    // consecutive polls that saw a role other than the boot role
 	changed   chan struct{}
@@ -161,9 +161,17 @@ func (l *Live) CheckMarker(ctx context.Context) {
 // adoptRecord makes the node fenced in the membership's eyes when fenced.json says so: the failover
 // procedure fences a leader cooperatively by writing it (failover/fenced), outside the daemon's own
 // ObserveEpoch. A record that cannot be read leaves the role as it is (the plane refuses to start a
-// primary on it all the same).
-func (l *Live) adoptRecord() {
-	if l.Fenced() != nil {
+// primary on it all the same). The record the failover writes has no peers' addresses, which `node
+// rejoin` needs, so this adds them (by node id, from the membership) and writes the record again.
+//
+// It leaves the file alone while observe is asking the fencer: the fencer writes the record before it
+// stops the primaries, and a node that adopted it then would tell the daemon to restart in the middle of
+// that. observe adopts its own record when the fencer is done.
+func (l *Live) adoptRecord(ctx context.Context) {
+	l.mu.Lock()
+	skip := l.fenced != nil || l.fencing
+	l.mu.Unlock()
+	if skip {
 		return
 	}
 	rec, err := ReadFenced(l.o.Cfg)
@@ -182,12 +190,35 @@ func (l *Live) adoptRecord() {
 		// It is not a fence by another node, and the membership of a running leader does not read it as one.
 		return
 	}
-	l.mu.Lock()
-	if l.fenced == nil {
-		l.fenced = rec
+	withPeers := len(rec.Peers) == 0
+	if withPeers {
+		rec.Peers = l.knownPeers(ctx)
 	}
+	l.mu.Lock()
+	if l.fenced != nil || l.fencing {
+		l.mu.Unlock()
+		return
+	}
+	l.fenced = rec
 	l.mu.Unlock()
+	if withPeers && len(rec.Peers) > 0 {
+		if err := WriteFenced(l.o.Cfg, *rec); err != nil {
+			l.o.Log.Warn("membership: the peers' addresses were not added to the fenced record", "error", err)
+		}
+	}
 	l.o.Log.Error("this node is fenced", "reason", rec.Reason, "epoch", rec.Epoch, "leader", rec.Leader)
+}
+
+// knownPeers is the peer addresses of the other nodes as the membership has them; before the first
+// snapshot it asks the registry.
+func (l *Live) knownPeers(ctx context.Context) map[string]string {
+	nodes := l.get().Nodes
+	if len(nodes) == 0 {
+		if ns, err := l.o.Reg.ListNodes(ctx); err == nil {
+			nodes = ns
+		}
+	}
+	return PeersOf(nodes, l.o.SelfID)
 }
 
 // publishFenced makes the snapshot say fenced, and tells the daemon to restart in that role.
@@ -217,7 +248,7 @@ func (l *Live) promotedEpoch() int64 {
 
 // Refresh reads the registry and the recovery state once and publishes the snapshot if it changed.
 func (l *Live) Refresh(ctx context.Context) {
-	l.adoptRecord()
+	l.adoptRecord(ctx)
 	cl, err := l.o.Reg.GetCluster(ctx)
 	if err != nil {
 		l.o.Log.Debug("membership: cluster row not read", "error", err)
@@ -330,20 +361,25 @@ func (l *Live) observe(source string, epoch int64, leader string) {
 			return
 		}
 	}
-	// The record may be there already: the orchestrator writes it first, and a refresh that ran meanwhile
-	// adopted it. The peers' addresses are in this one, so it replaces that, and the daemon is told once.
+	// The fencer wrote its own record before it stopped the primaries, and the refreshes that ran meanwhile
+	// left it alone (adoptRecord). This one has the peers' addresses and replaces it. It is on disk before
+	// the membership says fenced, because that is what tells the daemon to restart.
 	l.mu.Lock()
 	if l.notified {
 		l.mu.Unlock()
 		return
 	}
-	l.fenced, l.notified = &rec, true
+	l.notified = true
 	l.mu.Unlock()
 	if err := WriteFenced(l.o.Cfg, rec); err != nil {
 		l.o.Log.Error("membership: the fenced record was not written", "error", err)
 	}
+	l.mu.Lock()
+	l.fenced = &rec
+	l.mu.Unlock()
 	l.o.Log.Error("this node was replaced as leader and is fenced", "reason", rec.Reason)
-	next := snap
+	// The snapshot is read again: the fencer can take minutes, and the registry may have been read since.
+	next := l.get()
 	next.Role = RoleFenced
 	l.Set(next)
 	l.watchRole(RoleFenced)

@@ -117,20 +117,21 @@ func RemoveNode(ctx context.Context, reg registry.Registry, id string, o RemoveO
 	if cl.Leader == n.ID {
 		return fmt.Errorf("node %s is the leader; fail over to another node first (`supavise failover`)", n.ID)
 	}
-	ps, err := reg.ListProjects(ctx)
-	if err != nil {
+	if err := refuseHomed(ctx, reg, n.ID); err != nil {
 		return err
 	}
-	var homed []string
-	for _, p := range ps {
-		if p.NodeID == n.ID {
-			homed = append(homed, p.Ref)
-		}
-	}
-	if len(homed) > 0 {
-		return fmt.Errorf("node %s is the home of %d project(s) (%s); move them with `supavise projects failover` first", n.ID, len(homed), strings.Join(homed, ", "))
-	}
+	prev := n.State
 	if err := reg.SetNodeState(ctx, n.ID, registry.NodeLeft); err != nil {
+		return err
+	}
+	// A move of a project onto the node that committed between the check above and the state change is
+	// seen now; one that comes later is refused by the registry, which takes the node row for share and
+	// finds it left. The node is put back as it was, because a project homed on a left node would be
+	// stranded there, and the node, which reads its own row, would retire itself under it.
+	if err := refuseHomed(ctx, reg, n.ID); err != nil {
+		if rerr := reg.SetNodeState(ctx, n.ID, prev); rerr != nil {
+			return fmt.Errorf("%w; and node %s could not be put back to %s: %v", err, n.ID, prev, rerr)
+		}
 		return err
 	}
 	for _, r := range rs {
@@ -178,6 +179,24 @@ func RemoveNode(ctx context.Context, reg registry.Registry, id string, o RemoveO
 		case <-time.After(o.Poll):
 		}
 	}
+}
+
+// refuseHomed is the error of a node that is the home of a project: the projects are moved first.
+func refuseHomed(ctx context.Context, reg registry.Registry, id string) error {
+	ps, err := reg.ListProjects(ctx)
+	if err != nil {
+		return err
+	}
+	var homed []string
+	for _, p := range ps {
+		if p.NodeID == id {
+			homed = append(homed, p.Ref)
+		}
+	}
+	if len(homed) > 0 {
+		return fmt.Errorf("node %s is the home of %d project(s) (%s); move them with `supavise projects failover` first", id, len(homed), strings.Join(homed, ", "))
+	}
+	return nil
 }
 
 // DNSRecord is one record `supavise node ls --dns` says the cluster still needs.
