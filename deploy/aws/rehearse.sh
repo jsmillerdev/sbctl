@@ -13,8 +13,9 @@
 #   4. checks that the instance was not replaced or interrupted (same id, same launch time, running,
 #      no create or delete event for it), that the stack is at the new infrastructure revision, and that
 #      a second update finds nothing to change
-#   5. prints what to check on the node itself (the instance tags in the metadata service, the dry-run
-#      calls of the failover permissions) and waits for you
+#   5. prints what to check on the node itself and waits for you: the instance tags in the metadata
+#      service, the dry-run calls of the failover permissions, the boot time (no reboot) and whether
+#      the service address stays where it was put after an update of the instance's tags
 #   6. deletes the stack (the instance is stopped first, as `deploy.sh --delete` does)
 #
 # It creates real resources and costs money: a t4g.medium and a 20 GiB volume for the time it runs
@@ -64,6 +65,10 @@ done
 [[ $KEEP -eq 0 || $PURGE -eq 0 ]] || die "--keep and --purge contradict each other"
 [[ -f $OLD_TEMPLATE ]] || die "the v0.1.1 template is not at $OLD_TEMPLATE: run this from a checkout"
 [[ -f $NEW_TEMPLATE ]] || die "the template of this checkout is not at $NEW_TEMPLATE"
+
+# The rehearsal stack is not this host's. On an EC2 host (a jump host, say) deploy.sh would read the
+# host's instance id from the metadata service and refuse a stack that is not its own.
+export SUPAVISE_IMDS_ENDPOINT=http://127.0.0.1:1
 
 STACK=supavise-rehearsal-$(date -u +%m%d%H%M%S)
 AWS=(aws --region "$REGION")
@@ -221,6 +226,17 @@ cat <<LIST
       expect DryRunOperation (the instance carries supavise:cluster)
     aws ec2 associate-address --dry-run --allocation-id ${ALLOCATION:-ALLOCATION_ID} --instance-id $INSTANCE --allow-reassociation --region $REGION
       expect DryRunOperation; note whether a call that names a private address (--private-ip-address) also passes
+  The instance was not rebooted. The launch time stays the same across a reboot, so look at the boot time:
+    uptime -s
+      expect a time before $START (UTC, when the update began)
+  The service address stays where a failover put it. Move it by hand to another instance of yours in $REGION:
+    aws ec2 associate-address --allocation-id ${ALLOCATION:-ALLOCATION_ID} --instance-id OTHER_INSTANCE --allow-reassociation --region $REGION
+  copy deploy/cloudformation/supavise.yaml, add { Key: rehearsal, Value: "1" } to the Tags of the resource Instance, and run
+    $DEPLOY update --region $REGION --stack $STACK --template THE_COPY --set Failover=on --set PeerCidr1=198.51.100.0/24 --yes
+      expect: modify Instance: Tags (no interruption), and nothing else of the instance
+    aws ec2 describe-addresses --allocation-ids ${ALLOCATION:-ALLOCATION_ID} --query 'Addresses[0].InstanceId' --output text --region $REGION
+      expect OTHER_INSTANCE. If it prints $INSTANCE, CloudFormation attached the address again when it updated the
+      instance: an update after a failover would take the service address back, and the README must say so.
   Then run  $DEPLOY replica --leader-stack $STACK ...  against this stack to see the second server join (see deploy/aws/README.md).
 LIST
 if [[ $YES -eq 0 && -t 0 ]]; then

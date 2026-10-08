@@ -1,0 +1,131 @@
+{
+  "ChangeSetName": "supavise-update-20261008T120000Z",
+  "StackName": "supavise",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "DnsRecords",
+        "ResourceType": "AWS::Route53::RecordSetGroup",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "HostedZoneId",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ParameterReference"
+          }
+        ],
+        "PhysicalResourceId": "x-DnsRecords",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "InternetGateway",
+        "ResourceType": "AWS::EC2::InternetGateway",
+        "Replacement": "Conditional",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "Tags",
+              "RequiresRecreation": "Conditionally"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ParameterReference"
+          }
+        ],
+        "PhysicalResourceId": "x-InternetGateway",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "DefaultRoute",
+        "ResourceType": "AWS::EC2::Route",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "DestinationCidrBlock",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ParameterReference"
+          }
+        ],
+        "PhysicalResourceId": "x-DefaultRoute",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "PeerIngress1",
+        "ResourceType": "AWS::EC2::SecurityGroupIngress",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "CidrIp",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ParameterReference"
+          }
+        ],
+        "PhysicalResourceId": "x-PeerIngress1",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "FencingPolicy",
+        "ResourceType": "AWS::IAM::Policy",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "PolicyName",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ParameterReference"
+          }
+        ],
+        "PhysicalResourceId": "x-FencingPolicy",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    }
+  ],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}

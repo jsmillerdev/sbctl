@@ -38,6 +38,7 @@ esac
 const stubRehearseDeploy = `#!/bin/bash
 DIR="$(dirname "$0")"
 echo "$*" >> "$DIR/deploy.log"
+echo "${SUPAVISE_IMDS_ENDPOINT-unset}" >> "$DIR/imds.log"
 case "$1" in
   update)
     n=$(grep -c '^update' "$DIR/deploy.log")
@@ -155,7 +156,10 @@ func TestRehearsePasses(t *testing.T) {
 	}
 	for _, want := range []string{"PASS  the update ran", "PASS  the change set holds no replacement of the Instance", "PASS  the instance is the same",
 		"PASS  the launch time is the same", "PASS  no create or delete event for the Instance", "PASS  the stack is at infrastructure revision 2",
-		"PASS  a second update finds nothing to change", "== every check passed", "supavise:infra=2", "associate-address --dry-run --allocation-id eipalloc-0123456789abcdef0"} {
+		"PASS  a second update finds nothing to change", "== every check passed", "supavise:infra=2", "associate-address --dry-run --allocation-id eipalloc-0123456789abcdef0",
+		// What the script cannot see: a reboot keeps the launch time, and an update of the instance's tags may attach the address again.
+		"uptime -s", "expect a time before 20", "associate-address --allocation-id eipalloc-0123456789abcdef0 --instance-id OTHER_INSTANCE --allow-reassociation",
+		"describe-addresses --allocation-ids eipalloc-0123456789abcdef0", "expect OTHER_INSTANCE"} {
 		if !strings.Contains(r.stdout, want) {
 			t.Errorf("output lacks %q:\n%s", want, r.stdout)
 		}
@@ -167,6 +171,12 @@ func TestRehearsePasses(t *testing.T) {
 	}
 	if !strings.Contains(d[1], "--set Failover=on") {
 		t.Errorf("the update did not turn the failover permissions on: %s", d[1])
+	}
+	// The stack is not this host's: deploy.sh must not read the metadata service of an EC2 host running this.
+	for _, l := range fileLines(t, filepath.Join(dir, "imds.log")) {
+		if l != "http://127.0.0.1:1" {
+			t.Errorf("deploy.sh ran with SUPAVISE_IMDS_ENDPOINT=%q", l)
+		}
 	}
 	// The buckets and snapshots are left, with the commands to remove them, unless --purge.
 	if !strings.Contains(r.stdout, "Left in your account") || strings.Contains(strings.Join(fileLines(t, filepath.Join(dir, "aws.log")), "\n"), "delete-bucket") {

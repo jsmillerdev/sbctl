@@ -17,11 +17,11 @@ Every command takes `--dry-run`, which prints the `aws` commands and runs none. 
 `update` changes a stack to the template of the release the script belongs to, and only in ways that cannot replace or interrupt the node. Steps:
 
 1. It reads the instance id, the region and the tag `supavise:stack-name` from the node's metadata service when it runs on one, then switches the metadata service off for every `aws` call. The stack is changed with your credentials; a credential that is an instance role is refused.
-2. It reads the stack (`describe-stacks`) and refuses one that is not at rest (created, updated, or rolled back to its last update); a stack that is changing or whose creation failed has to be waited for or deleted. On a node, the stack's `InstanceId` output must be this instance. A stack made in the console with an empty `AmiId` gets the image its instance runs as `AmiId`, so that the update cannot replace the instance for a newer image.
+2. It reads the stack (`describe-stacks`) and refuses one that is not at rest (created, updated, or rolled back to its last update); a stack that is changing or whose creation failed has to be waited for or deleted. A stack from before revision 2 has no instance tags to name it, so on a node its `InstanceId` output must be this instance (update it from the node it belongs to or from CloudShell); a stack at revision 2 is matched by the node's `supavise:stack-name` tag, and any other host may update it. A stack made in the console with an empty `AmiId` gets the image its instance runs as `AmiId`, so that the update cannot replace the instance for a newer image.
 3. It builds the parameters: `UsePreviousValue` for every parameter that the stack has and the template declares, `NoEcho` ones included (so `KeyEscrowPassphrase` and `AdminEmail` need not be given again), the value of each `--set NAME=VALUE`, and nothing for a parameter that is new to the stack, which takes its default. `SupaviseVersion` cannot be set: it feeds the user data, and a different value would replace the instance.
-4. It downloads the template of the release (unless `--template FILE` is given), checks the signature of `SHA256SUMS` with the release key stamped into the script, the template against the list, and the script itself against the list.
-5. A template over 51,200 bytes, the size the API takes inline, is copied to `s3://<BackupBucket>/_stack/<sha256>.yaml` and read from there (`--template-bucket` names another bucket in the stack's region).
-6. It creates a change set (`create-change-set --change-set-type UPDATE`), prints every resource change and sorts each into allowed, refused or blocked.
+4. It downloads the template of the release (unless `--template FILE` is given), checks the signature of `SHA256SUMS` with the release key stamped into the script, the template against the list, and the script itself against the list. A list that does not name the script is refused for a release at revision 2 or later. The script is checked on this path only: with `--template FILE` nothing says which release the script belongs to, so a caller that passes a file has verified the script itself.
+5. A template over 51,200 bytes, the size the API takes inline, is uploaded to `s3://<BackupBucket>/_stack/<sha256>.yaml` (`s3api put-object` with your account as the expected bucket owner) and read from there. `--template-bucket` names another bucket of your account in the stack's region.
+6. It creates a change set (`create-change-set --change-set-type UPDATE`) and reads back the template it holds (`get-template --template-stage Original`): a template that differs from the verified file is refused and the change set deleted (exit 2). The instance role may write to the backup bucket, so the object could be swapped between the upload and CloudFormation's read; the read-back closes that gap. It then prints every resource change and sorts each into allowed, refused or blocked.
 7. It asks you to type `apply` (`--yes` skips the question), runs the change set and waits.
 
 | Change | Result |
@@ -29,10 +29,10 @@ Every command takes `--dry-run`, which prints the `aws` commands and runs none. 
 | a resource is added | allowed |
 | an instance, an Elastic IP or a role changes its tags; an instance changes `MetadataOptions`; a role, a policy or a bucket policy changes its policy document; a security group changes its rules; none of it replaces anything | allowed |
 | any resource is removed | refused |
-| a resource that holds state or identity is replaced (the instance, the volume and its attachment, the buckets, the Elastic IP and its association, the VPC and subnet, the security group, a role, an instance profile, a secret) | refused |
+| a resource other than a security group rule, an IAM policy or a bucket policy is replaced (the instance, the volume and its attachment, the buckets, the Elastic IP and its association, the network, the DNS records, a role, a secret, and any type this script does not list) | refused |
 | anything else in place, such as `UserData` or `InstanceType` of the instance | refused |
 | the service address association or the Elastic IP would change after a failover moved the address to another server | blocked |
-| a rule, record or policy that is not on the list above is replaced | allowed, shown as `replace` |
+| a security group rule, an IAM policy or a bucket policy is replaced | allowed, shown as `replace` |
 
 A refused change set is deleted and nothing changes (exit 2). `--allow-risky` runs it after you type the stack name, on a terminal; a blocked one is never run. Whether the service address is on the stack's instance is read with `describe-addresses`; an address that cannot be read counts as moved.
 
@@ -55,7 +55,13 @@ Before an instance of the stack is replaced on purpose (a changed image or user 
 5. As soon as the new stack has its Elastic IP, long before the server has booted, it sets the first free `PeerCidr` of the leader stack to that address (`update`, same review) so that the join can connect.
 6. It waits for the new stack to finish.
 
-A template over the inline size goes through a bucket in the stack's region: `--template-bucket` if given, else for the new server the leader's backup bucket when the regions are the same, else `supavise-templates-<account>-<region>`, which the script creates (private, kept when the stack is deleted). The leader's own update always uses the leader's backup bucket.
+A template over the inline size goes through a bucket in the stack's region: `--template-bucket` if given, else for the new server the leader's backup bucket when the regions are the same, else `supavise-templates-<account>-<region>`, which the script creates (private, kept when the stack is deleted). The leader's own update always uses the leader's backup bucket. Every bucket the script names must belong to your account, and the one it makes is checked against it before use (a bucket of that name that another account made is not used).
+
+When the script stops after it made something, it says what stays and the commands to remove it: the empty stack of a change set that was not run (`REVIEW_IN_PROGRESS`), or, when the leader could not be opened, the new stack and its join token secret.
+
+## delete
+
+`--delete` stops the instance, deletes the stack and names what stays in the account: the backup bucket, the objects bucket of a stack at revision 2 or later (versioned), and the snapshots of the data volume. The stack of a replica server shows its leader's buckets; they are not listed as kept, because they are not that stack's to empty.
 
 ## A new stack
 
@@ -67,13 +73,13 @@ Without a command word, `deploy.sh` creates a stack with `aws cloudformation dep
 
 `deploy/release-assets.sh` stamps first and signs last: `install.sh`, `supavise.yaml` and `supavise-aws-deploy.sh` are in `SHA256SUMS` with the hashes of the files as attached, and `supavise-release.json` names the stack revision, the template asset and its SHA-256 (`aws`) and the host converge revision of the binary (`host`).
 
-Test hooks, as in `install.sh`: `SUPAVISE_DEPLOY_BASE_URL` replaces `https://github.com/supavise/supavise/releases`, `SUPAVISE_DEPLOY_PUBKEY_B64` the stamped key, `SUPAVISE_IMDS_ENDPOINT` the metadata service address.
+Test hooks, as in `install.sh`: `SUPAVISE_DEPLOY_BASE_URL` replaces `https://github.com/supavise/supavise/releases`, `SUPAVISE_DEPLOY_PUBKEY_B64` the stamped key, `SUPAVISE_IMDS_ENDPOINT` the metadata service address. They are for tests: the first two replace the trust root of the script, so never set them in a session that changes a real stack.
 
 ## rehearse.sh
 
-`rehearse.sh --region R --email E` makes a throwaway stack from the v0.1.1 template (`deploy/cloudformation/testdata/supavise-v0.1.1.yaml`, the file of the tag), updates it to the template of the checkout with the failover permissions and a peer rule on, checks that the instance has the same id and launch time, is running and had no create or delete event, that the stack is at the new revision and that a second update changes nothing, prints what to check on the node, and deletes the stack. It costs money while it runs. `--purge` also empties and deletes the buckets and the snapshots; `--keep` leaves the stack; `--dry-run` prints the plan.
+`rehearse.sh --region R --email E` makes a throwaway stack from the v0.1.1 template (`deploy/cloudformation/testdata/supavise-v0.1.1.yaml`, the file of the tag), updates it to the template of the checkout with the failover permissions and a peer rule on, checks that the instance has the same id and launch time, is running and had no create or delete event, that the stack is at the new revision and that a second update changes nothing, prints what to check on the node, and deletes the stack. It tells `deploy.sh` not to read the metadata service, so that it can run on an EC2 host. It costs money while it runs. `--purge` also empties and deletes the buckets and the snapshots; `--keep` leaves the stack; `--dry-run` prints the plan.
 
-On the node, by hand (the script prints the commands): `supavise:infra`, `supavise:caps` and the other tags appear in the metadata service without a restart, and `aws ec2 stop-instances --dry-run` and `associate-address --dry-run` with the instance role answer `DryRunOperation`. Adding a second server (`replica`) is the other half of the rehearsal and needs a running leader to issue the token.
+On the node, by hand (the script prints the commands): `supavise:infra`, `supavise:caps` and the other tags appear in the metadata service without a restart, and `aws ec2 stop-instances --dry-run` and `associate-address --dry-run` with the instance role answer `DryRunOperation`. Two more checks need the node, because the script cannot see them: the boot time from `uptime -s` is earlier than the start of the update (a reboot keeps the launch time), and an update that changes only the tags of the instance leaves the service address where it was (move the address to another instance by hand, update, and read where it sits; the Instance resource documents that CloudFormation attaches the Elastic IP again after it updates an instance). Adding a second server (`replica`) is the other half of the rehearsal and needs a running leader to issue the token.
 
 ## Tests
 

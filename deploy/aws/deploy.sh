@@ -65,15 +65,15 @@ Options:
                            a new stack, the running image for an existing stack)
   --data-snapshot-id SNAP  restore the data volume from the final snapshot of an earlier stack
   --template FILE          use this template file
-  --template-bucket NAME   S3 bucket in the stack's region that holds a template over $INLINE_LIMIT
-                           bytes while CloudFormation reads it (default: the stack's backup bucket
-                           for update; for a new stack supavise-templates-<account>-<region>,
-                           which the script creates)
+  --template-bucket NAME   S3 bucket of your account, in the stack's region, that holds a template
+                           over $INLINE_LIMIT bytes while CloudFormation reads it (default: the
+                           stack's backup bucket for update; for a new stack
+                           supavise-templates-<account>-<region>, which the script creates)
   --profile NAME           AWS CLI profile
   --dry-run                print the aws commands, run nothing
-  --delete                 stop the instance, then delete the stack (the backup bucket, a final
-                           snapshot of the data volume and any daily snapshots stay in your
-                           account); asks for confirmation
+  --delete                 stop the instance, then delete the stack (the backup and objects
+                           buckets, a final snapshot of the data volume and any daily snapshots
+                           stay in your account); asks for confirmation
   --yes                    with --delete, update or replica: do not ask
   -h, --help
 
@@ -121,11 +121,15 @@ show() { local a out=""; for a in "$@"; do out="$out $(q "$a")"; done; printf '%
 CLEANUP=""
 # A join token secret made by replica is removed when the script stops before the stack that needs it exists.
 EARLY_SECRET=""
+# What replica made and leaves in place when it stops: said once, as the script ends with a failure.
+LEFTOVER=""
 on_exit() {
+  local rc=$?
   [[ -z $CLEANUP ]] || rm -rf "$CLEANUP"
   if [[ -n $EARLY_SECRET ]]; then
     "${AWS[@]}" secretsmanager delete-secret --secret-id "$EARLY_SECRET" --force-delete-without-recovery >/dev/null 2>&1 || true
   fi
+  if [[ $rc -ne 0 && -n $LEFTOVER ]]; then printf '%s\n' "$LEFTOVER" >&2; fi
 }
 trap on_exit EXIT
 WORK=""
@@ -203,15 +207,14 @@ done
 #   facts  STACK.json                     the stack as KEY<TAB>value lines
 #   params STACK.json TEMPLATE [K=V...]   the --parameters JSON of an update
 #   classify CHANGESET.json [--failed-over]   the review of a change set; exit 0 allowed, 10 refused, 11 blocked
+#   same   TEMPLATE STAGED.json           is the template CloudFormation holds the verified file? exit 0 yes, 1 no
 IFS= read -r -d '' PYHELPER <<'PY' || true
-import json, re, sys
+import io, json, re, sys
 
-# Resource types that hold state or identity: a change set that replaces one is refused.
-PROTECTED = set([
-    "AWS::EC2::Instance", "AWS::EC2::Volume", "AWS::EC2::VolumeAttachment", "AWS::S3::Bucket",
-    "AWS::EC2::EIP", "AWS::EC2::EIPAssociation", "AWS::EC2::VPC", "AWS::EC2::Subnet",
-    "AWS::EC2::SecurityGroup", "AWS::IAM::Role", "AWS::IAM::InstanceProfile",
-    "AWS::SecretsManager::Secret",
+# Resource types whose replacement does not interrupt the node: a rule and two policies. A change
+# set that replaces any other type is refused.
+REPLACE_OK = set([
+    "AWS::EC2::SecurityGroupIngress", "AWS::IAM::Policy", "AWS::S3::BucketPolicy",
 ])
 # Properties that change in place without an interruption, per type. Any other change to a
 # resource is refused until a person has read it (--allow-risky).
@@ -328,10 +331,10 @@ def judge(rc, failed_over):
     if action != "Modify":
         return "refused", "%-8s %s is a change this script does not know" % (action.upper(), what)
     if recreate:
+        if typ in REPLACE_OK:
+            return "ok", "replace  %s%s" % (what, detail)
         word = "would be replaced" if repl == "True" else "may be replaced"
-        if typ in PROTECTED:
-            return "refused", "REPLACE  %s %s%s" % (what, word, detail)
-        return "ok", "replace  %s%s" % (what, detail)
+        return "refused", "REPLACE  %s %s%s" % (what, word, detail)
     if not labels:
         return "refused", "MODIFY   %s changes in a way the change set does not describe" % what
     if unsafe:
@@ -361,8 +364,20 @@ def cmd_classify(path, *flags):
         sys.exit(10)
 
 
+def cmd_same(template, staged):
+    """Exit 0 when STAGED (the TemplateBody that get-template printed as JSON: a YAML template comes
+    back as one string) is the TEMPLATE file. Line ends and the trailing white space of the whole
+    file do not count."""
+    def norm(text):
+        return text.replace("\r\n", "\n").rstrip()
+    with io.open(template, encoding="utf-8", newline="") as f:
+        mine = f.read()
+    got = load(staged)
+    sys.exit(0 if isinstance(got, str) and norm(got) == norm(mine) else 1)
+
+
 def main(argv):
-    cmds = {"facts": cmd_facts, "params": cmd_params, "classify": cmd_classify}
+    cmds = {"facts": cmd_facts, "params": cmd_params, "classify": cmd_classify, "same": cmd_same}
     if len(argv) < 2 or argv[1] not in cmds:
         die("unknown helper command", 2)
     cmds[argv[1]](*argv[2:])
@@ -549,9 +564,8 @@ fetch_verified_template() {
   # This script is part of the release too: an edited copy would not be the code that was signed.
   want=$(awk '$2 == "supavise-aws-deploy.sh" || $2 == "*supavise-aws-deploy.sh" { print $1; exit }' "$WORK/release/SHA256SUMS")
   me=$(sha256_of "${BASH_SOURCE[0]}")
-  if [[ -n $want && $want != "$me" ]]; then
-    die "this copy of $SELF is not the one release $tag signed: download supavise-aws-deploy.sh from that release again"
-  fi
+  [[ -n $want ]] || die "the signed checksum list of $tag does not name supavise-aws-deploy.sh, so this copy cannot be checked: refusing to go on"
+  [[ $want == "$me" ]] || die "this copy of $SELF is not the one release $tag signed: download supavise-aws-deploy.sh from that release again"
   TEMPLATE=$WORK/release/supavise.yaml
   say "Template verified against the signed checksums of $tag"
 }
@@ -639,15 +653,21 @@ service_address_here() { # TAG
 
 # ---- a template too large for the API goes through S3 ---------------------------------------
 TEMPLATE_ARGS=()
+ACCOUNT=""
+need_account() { # sets ACCOUNT to the account of the credentials
+  [[ -n $ACCOUNT ]] || ACCOUNT=$("${AWS[@]}" sts get-caller-identity --query Account --output text) || fail "cannot read the account id"
+}
+# Every call that names a bucket here passes the account as the expected owner: a bucket that
+# someone else made under the predictable name, and opened to this account, is not trusted.
 ensure_template_bucket() { # prints the bucket for a staged template of a new stack in $REGION
-  local account b
+  local b
   if [[ -n $TBUCKET ]]; then printf '%s' "$TBUCKET"; return 0; fi
-  account=$("${AWS[@]}" sts get-caller-identity --query Account --output text) || fail "cannot read the account id"
-  b=$NAME-templates-$account-$REGION
-  if ! "${AWS[@]}" s3api head-bucket --bucket "$b" >/dev/null 2>&1; then
+  need_account
+  b=$NAME-templates-$ACCOUNT-$REGION
+  if ! "${AWS[@]}" s3api head-bucket --bucket "$b" --expected-bucket-owner "$ACCOUNT" >/dev/null 2>&1; then
     say "Creating the bucket $b for the template (it stays in your account)" >&2
-    "${AWS[@]}" s3 mb "s3://$b" >/dev/null || fail "cannot create the bucket $b: give --template-bucket with a bucket in $REGION"
-    "${AWS[@]}" s3api put-public-access-block --bucket "$b" \
+    "${AWS[@]}" s3 mb "s3://$b" >/dev/null || fail "cannot create the bucket $b (one of that name may belong to another account): give --template-bucket with a bucket of yours in $REGION"
+    "${AWS[@]}" s3api put-public-access-block --bucket "$b" --expected-bucket-owner "$ACCOUNT" \
       --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null
   fi
   printf '%s' "$b"
@@ -663,7 +683,9 @@ stage_template() { # BUCKET: sets TEMPLATE_ARGS; BUCKET is only used when the te
   sum=$(sha256_of "$TEMPLATE")
   key=_stack/$sum.yaml
   say "The template is $size bytes, over the $INLINE_LIMIT the API takes inline: staging it in s3://$1/$key"
-  "${AWS[@]}" s3 cp "$TEMPLATE" "s3://$1/$key" --only-show-errors || fail "cannot upload the template to s3://$1 (the credentials need s3:PutObject there)"
+  need_account
+  "${AWS[@]}" s3api put-object --bucket "$1" --key "$key" --body "$TEMPLATE" --expected-bucket-owner "$ACCOUNT" >/dev/null \
+    || fail "cannot upload the template to s3://$1 (the bucket must be in your account, and the credentials need s3:PutObject there)"
   TEMPLATE_ARGS=(--template-url "https://$1.s3.$REGION.$suffix/$key")
 }
 
@@ -695,11 +717,24 @@ make_change_set() { # TYPE
     cat "$WORK/err" >&2
     fail "the change set failed: ${reason:-no reason given}"
   fi
+  check_template_of_change_set
   "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$CS" --output json >"$WORK/cs.json" \
     || fail "cannot read the change set"
 }
 drop_change_set() {
   "${AWS[@]}" cloudformation delete-change-set --stack-name "$STACK" --change-set-name "$CS" >/dev/null 2>&1 || true
+}
+# CloudFormation keeps the template it read for the change set. A template staged in S3 is out of
+# this script's hands between the upload and that read (the instance role may write to the backup
+# bucket), so the template the change set holds is read back and must be the file that was verified.
+check_template_of_change_set() {
+  "${AWS[@]}" cloudformation get-template --stack-name "$STACK" --change-set-name "$CS" --template-stage Original \
+    --query TemplateBody --output json >"$WORK/staged.json" 2>"$WORK/err" \
+    || { cat "$WORK/err" >&2; drop_change_set; fail "cannot read back the template of the change set to compare it with $TEMPLATE"; }
+  py same "$TEMPLATE" "$WORK/staged.json" || {
+    drop_change_set
+    die "the template in the change set is not the file that was verified ($TEMPLATE): it was changed on its way to CloudFormation. Nothing was changed"
+  }
 }
 
 FAILED_OVER=0
@@ -833,10 +868,12 @@ mode_update() {
     note "Is the service address still on the stack's instance, or did a failover move it?"
     show "${AWS[@]}" ec2 describe-addresses --allocation-ids "<ElasticIpAllocationId>" --query 'Addresses[0].InstanceId' --output text
     resolve_template
-    note "a template over $INLINE_LIMIT bytes is staged in the stack's backup bucket (or --template-bucket):"
-    show "${AWS[@]}" s3 cp "$TEMPLATE" "s3://<BackupBucket>/_stack/<sha256>.yaml" --only-show-errors
+    note "a template over $INLINE_LIMIT bytes is staged in the stack's backup bucket (or --template-bucket), which must be in your account:"
+    show "${AWS[@]}" s3api put-object --bucket "<BackupBucket>" --key "_stack/<sha256>.yaml" --body "$TEMPLATE" --expected-bucket-owner "<account>"
     show "${AWS[@]}" cloudformation create-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>" --change-set-type UPDATE --capabilities CAPABILITY_IAM --template-url "<staged template>" --parameters "file://<params.json>"
     show "${AWS[@]}" cloudformation wait change-set-create-complete --stack-name "$STACK" --change-set-name "$NAME-update-<time>"
+    note "the template the change set holds is read back and must be the file that was verified; if it is not, the change set is deleted:"
+    show "${AWS[@]}" cloudformation get-template --stack-name "$STACK" --change-set-name "$NAME-update-<time>" --template-stage Original --query TemplateBody --output json
     show "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>" --output json
     note "every resource change is reviewed; a replacement or removal is refused and the change set deleted. Otherwise, after you type apply:"
     show "${AWS[@]}" cloudformation execute-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>"
@@ -849,8 +886,11 @@ mode_update() {
   load_facts "$STACK" "$REGION" s
   stack_ready s
   inst=$(fact s output:InstanceId)
-  if [[ -n $IMDS_ID && -n $inst && $IMDS_ID != "$inst" ]]; then
-    die "stack $STACK belongs to instance $inst, and this is $IMDS_ID: --stack names another node's stack"
+  # A stack from before revision 2 has no instance tags to name it, so on a node its InstanceId must
+  # be this instance's. A stack at revision 2 is told apart by the node's tags (locate_stack), and a
+  # host that is not a node of the stack (a jump host, another server of the cluster) may update it.
+  if [[ -z $(fact s output:InfraRevision) && -n $IMDS_ID && -n $inst && $IMDS_ID != "$inst" ]]; then
+    die "stack $STACK belongs to instance $inst, and this is $IMDS_ID: --stack names another node's stack (a stack from before revision 2 is updated from the node it belongs to, or from AWS CloudShell)"
   fi
   resolve_template
   [[ -n $(template_revision "$TEMPLATE") ]] || die "$TEMPLATE has no InfraRevision output: it is not a Supavise template of this release line"
@@ -942,6 +982,7 @@ mode_replica() {
     show "${AWS[@]}" secretsmanager create-secret --name "$NAME-join/$STACK/<time>" --secret-string "file://$TOKEN_FILE" --query ARN --output text
     note "creates the new server's stack from the same template (a change set, reviewed like an update):"
     show "${AWS[@]}" cloudformation create-change-set --stack-name "$STACK" --change-set-name "$NAME-create-<time>" --change-set-type CREATE --capabilities CAPABILITY_IAM --template-url "<staged template>" --parameters "file://<params.json>"
+    show "${AWS[@]}" cloudformation get-template --stack-name "$STACK" --change-set-name "$NAME-create-<time>" --template-stage Original --query TemplateBody --output json
     show "${AWS[@]}" cloudformation execute-change-set --stack-name "$STACK" --change-set-name "$NAME-create-<time>"
     note "as soon as the new stack has its Elastic IP, the leader's security group is opened to it on port 7443:"
     show "${AWS[@]}" cloudformation describe-stack-resource --stack-name "$STACK" --logical-resource-id ElasticIp --query 'StackResourceDetail.[ResourceStatus,PhysicalResourceId]' --output text
@@ -1025,9 +1066,17 @@ mode_replica() {
   python3 -c 'import json,sys; print(json.dumps([{"ParameterKey": a.split("=", 1)[0], "ParameterValue": a.split("=", 1)[1]} for a in sys.argv[1:]]))' "${p[@]}" >"$WORK/params.json"
   FAILED_OVER=0
   make_change_set CREATE || true
+  # The change set made the stack, empty, in REVIEW_IN_PROGRESS: it stays if the change set is not run.
+  LEFTOVER="Stack $STACK in $REGION exists but is empty, because its change set was not run. Delete it with:
+  aws cloudformation delete-stack --region $REGION --stack-name $STACK"
   review_change_set 1
   execute_change_set
   EARLY_SECRET=""
+  LEFTOVER="Stack $STACK in $REGION is being created and its server cannot join until stack $LEADER_STACK lets it in on port 7443.
+To open the leader, once the Elastic IP of $STACK is known:  $SELF update --stack $LEADER_STACK --region $LEADER_REGION --set PeerCidr$slot=ADDRESS/32
+To take the new server away again:
+  aws cloudformation delete-stack --region $REGION --stack-name $STACK
+  aws secretsmanager delete-secret --region $REGION --force-delete-without-recovery --secret-id $token_arn"
 
   # The leader lets the new address in as soon as it exists.
   ip=$(wait_for_elastic_ip) || fail "stack $STACK did not get its Elastic IP; see its Events tab. The leader was not changed"
@@ -1040,7 +1089,11 @@ mode_replica() {
   YES=$yes
   set_target "$new_stack" "$new_region"
   say "Waiting for the new server to install and join ..."
+  LEFTOVER="Stack $STACK in $REGION did not finish creating (stack $LEADER_STACK was opened to $ip/32 as PeerCidr$slot): see its Events tab.
+The join token secret stays until you delete it:
+  aws secretsmanager delete-secret --region $REGION --force-delete-without-recovery --secret-id $token_arn"
   wait_stack create
+  LEFTOVER=""
   "${AWS[@]}" secretsmanager delete-secret --secret-id "$token_arn" --force-delete-without-recovery >/dev/null 2>&1 \
     || say "Delete the spent join token yourself: aws secretsmanager delete-secret --force-delete-without-recovery --secret-id $token_arn"
   load_facts "$STACK" "$REGION" n
@@ -1071,10 +1124,13 @@ VPC and the DNS records.
 
 What stays in your account, and keeps costing money until you delete it yourself:
   - the S3 backup bucket (WAL archives and base backups; the stack never deletes it)
+  - the S3 objects bucket of a stack at infrastructure revision 2 or later (versioned; it holds
+    Storage files once Storage runs on S3; the stack never deletes it)
   - a final EBS snapshot of the data volume (it holds the master key, the registry and every
     project; encrypted, and restorable with --data-snapshot-id)
   - the daily snapshots of the data volume that the stack made (nothing deletes old ones once
     the stack is gone)
+(The stack of a replica server makes no buckets: it uses its leader's, which stay as they are.)
 
 A running instance is stopped first, so that Postgres and the other services can shut down in
 order before the final snapshot is taken, which then is not a crash image. The node is offline
@@ -1085,8 +1141,10 @@ WARN
     note "the commands --delete would run:"
     note "checks that the stack exists:"
     show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text
-    note "reads BackupBucket, DataVolumeId and InstanceId from the stack outputs, to name what stays and what to stop:"
+    note "reads BackupBucket, ObjectsBucket, DataVolumeId and InstanceId from the stack outputs, to name what stays and what to stop:"
     show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "$Q_OUTPUTS" --output text
+    note "and JoinLeader from its parameters: the stack of a replica server shows its leader's buckets, which are not its to keep:"
+    show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query "$Q_PARAMS" --output text
     note "stops the instance, so that the final snapshot is taken from a cleanly shut-down node"
     note "(skipped when the stack has no InstanceId output or is ROLLBACK_COMPLETE, CREATE_FAILED or DELETE_FAILED, as after a failed first launch):"
     show "${AWS[@]}" ec2 stop-instances --instance-ids "<InstanceId>"
@@ -1100,6 +1158,11 @@ WARN
   [[ $status != none ]] || fail "no stack named $STACK in $REGION"
   outs=$(describe "$Q_OUTPUTS")
   BUCKET=$(pick BackupBucket <<<"$outs")
+  OBJECTS=$(pick ObjectsBucket <<<"$outs")
+  # The stack of a replica server only shows its leader's buckets: they are not this stack's to keep or empty.
+  REPLICA_OF=$(describe "$Q_PARAMS" | pick JoinLeader)
+  [[ $REPLICA_OF != None ]] || REPLICA_OF=""
+  [[ -z $REPLICA_OF ]] || BUCKET="" OBJECTS=""
   VOLUME=$(pick DataVolumeId <<<"$outs")
   INSTANCE=$(pick InstanceId <<<"$outs")
   # A stack whose creation failed has no outputs and no instance: there is nothing to stop, and
@@ -1108,7 +1171,9 @@ WARN
   case $status in ROLLBACK_COMPLETE|CREATE_FAILED|DELETE_FAILED) STOP=0 ;; esac
   [[ $INSTANCE =~ ^i-[0-9a-f]{8,17}$ ]] || STOP=0
   say ""
+  [[ -z $REPLICA_OF ]] || say "Replica server of $REPLICA_OF: the buckets are the leader's and stay as they are."
   [[ -z $BUCKET ]] || say "Backup bucket:  $BUCKET"
+  [[ -z $OBJECTS ]] || say "Objects bucket: $OBJECTS"
   [[ -z $VOLUME ]] || say "Data volume:    $VOLUME"
   if [[ $STOP -eq 1 ]]; then
     say "Instance:       $INSTANCE (stopped first)"
@@ -1135,13 +1200,16 @@ WARN
   "${AWS[@]}" cloudformation wait stack-delete-complete --stack-name "$STACK" \
     || fail "the stack did not delete cleanly; see the Events tab of the stack in the CloudFormation console"
   say ""
-  if [[ -z $BUCKET && -z $VOLUME ]]; then
-    say "Deleted. The stack reported no backup bucket or data volume."
+  if [[ -z $BUCKET && -z $OBJECTS && -z $VOLUME ]]; then
+    say "Deleted. The stack reported no backup bucket, objects bucket or data volume."
     exit 0
   fi
   say "Deleted. Kept for you:"
   if [[ -n $BUCKET ]]; then
     say "  backup bucket  $BUCKET   (empty and delete it yourself when you no longer need the backups)"
+  fi
+  if [[ -n $OBJECTS ]]; then
+    say "  objects bucket $OBJECTS   (versioned; empty every version and delete it yourself when Storage no longer needs it)"
   fi
   if [[ -n $VOLUME ]]; then
     say "  data snapshots (the final one, and the daily ones when the stack made them); find them with:"

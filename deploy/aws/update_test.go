@@ -42,17 +42,27 @@ case "$*" in
   *"cloudformation create-change-set"*)
     p=$(arg --parameters "$@"); cp "${p#file://}" "$DIR/params-$n.json"
     t=$(arg --template-body "$@"); if [ -n "$t" ]; then cp "${t#file://}" "$DIR/template-$n.yaml"; fi
+    u=$(arg --template-url "$@"); if [ -n "$u" ]; then cp "$DIR/s3-$(basename "$u")" "$DIR/template-$n.yaml"; fi
     if [ -n "$CREATE_FAILS" ]; then echo "An error occurred (ValidationError) when calling the CreateChangeSet operation: bad" >&2; exit 254; fi ;;
   *"cloudformation wait change-set-create-complete"*) exit "${CS_WAIT_RC-0}" ;;
   *"cloudformation describe-change-set"*"StatusReason"*) echo "${CS_REASON-}" ;;
   *"cloudformation describe-change-set"*)
     f="$DIR/changeset-$n.json"; [ -f "$f" ] || f="$DIR/changeset.json"; cat "$f" ;;
-  *"cloudformation wait stack-update-complete"* | *"cloudformation wait stack-create-complete"*) exit "${STACK_WAIT_RC-0}" ;;
+  *"cloudformation get-template"*)
+    if [ -n "$GET_TEMPLATE_FAILS" ]; then echo "An error occurred (AccessDenied) when calling the GetTemplate operation" >&2; exit 254; fi
+    python3 -c 'import json, sys; print(json.dumps(open(sys.argv[1]).read()))' "$DIR/template-$n.yaml" ;;
+  *"cloudformation wait stack-update-complete"*) exit "${STACK_WAIT_RC-0}" ;;
+  *"cloudformation wait stack-create-complete"*) exit "${CREATE_WAIT_RC-${STACK_WAIT_RC-0}}" ;;
   *"ec2 describe-addresses"*)
     if [ -n "$ADDRESS_FAILS" ]; then echo "An error occurred (UnauthorizedOperation)" >&2; exit 254; fi
     echo "${ADDRESS_HOLDER-i-0123456789abcdef0}" ;;
   *"ec2 describe-instances"*) echo ami-0bbbbbbbbbbbbbbbb ;;
   *"s3api head-bucket"*) exit "${HEAD_BUCKET_RC-254}" ;;
+  *"s3api put-object"*)
+    b=$(arg --body "$@"); k=$(arg --key "$@"); cp "$b" "$DIR/s3-$(basename "$k")"
+    # What a swap of the object between the upload and the read would do; trailing white space is harmless.
+    if [ -n "$S3_TAMPER" ]; then printf 'Resources:\n  Evil: { Type: "AWS::IAM::Role" }\n' >> "$DIR/s3-$(basename "$k")"; fi
+    if [ -n "$S3_PAD" ]; then printf '\n\n  \n' >> "$DIR/s3-$(basename "$k")"; fi ;;
   *"ssm get-parameter"*) echo ami-0123456789abcdef0 ;;
   *"secretsmanager create-secret"*)
     v=$(arg --secret-string "$@"); cat "${v#file://}" > "$DIR/secret-value"
@@ -254,13 +264,15 @@ func TestUpdateKeepsPreviousValuesAndStagesALargeTemplate(t *testing.T) {
 	}
 	raw, _ := os.ReadFile(realTemplate(t))
 	sum := sha256.Sum256(raw)
-	if up := f.callsMatching("s3 cp"); len(up) != 1 || !strings.Contains(up[0], "s3://supavise-backupbucket-abc123/_stack/"+hex.EncodeToString(sum[:])+".yaml") {
+	// The object goes to the stack's bucket, which must be the account's: the owner is checked.
+	if up := f.callsMatching("s3api put-object"); len(up) != 1 || !strings.Contains(up[0], "--bucket supavise-backupbucket-abc123 --key _stack/"+hex.EncodeToString(sum[:])+".yaml") ||
+		!strings.Contains(up[0], "--expected-bucket-owner 111122223333") {
 		t.Errorf("upload: %v", up)
 	}
 	// The order: the credentials are checked, the stack read, the change set made, reviewed and run.
 	idx := func(s string) int { return f.first(s) }
-	order := []string{"sts get-caller-identity", "describe-stacks", "ec2 describe-addresses", "s3 cp", "create-change-set", "wait change-set-create-complete",
-		"describe-change-set", "execute-change-set", "wait stack-update-complete"}
+	order := []string{"sts get-caller-identity", "describe-stacks", "ec2 describe-addresses", "s3api put-object", "create-change-set", "wait change-set-create-complete",
+		"get-template --stack-name supavise --change-set-name", "describe-change-set", "execute-change-set", "wait stack-update-complete"}
 	last := -1
 	for _, o := range order {
 		if i := idx(o); i < 0 || i < last {
@@ -296,7 +308,7 @@ func TestUpdateSendsASmallTemplateInTheBody(t *testing.T) {
 	if len(cs) != 1 || !strings.Contains(cs[0], "--template-body file://") || strings.Contains(cs[0], "--template-url") {
 		t.Errorf("create-change-set: %v", cs)
 	}
-	if len(f.callsMatching("s3 cp")) != 0 {
+	if len(f.callsMatching("s3api put-object")) != 0 {
 		t.Error("a small template needs no upload")
 	}
 	// The stack keeps what the template still declares; one the template dropped is only noted.
@@ -306,6 +318,49 @@ func TestUpdateSendsASmallTemplateInTheBody(t *testing.T) {
 	}
 	if !strings.Contains(r.stderr, "the template no longer declares") {
 		t.Errorf("stderr: %s", r.stderr)
+	}
+}
+
+// A template staged in S3 is out of the script's hands until CloudFormation has read it, and the
+// instance role may write to the backup bucket. The template the change set holds is read back and
+// must be the file that was verified.
+func TestUpdateRefusesATemplateThatChangedOnItsWayToCloudFormation(t *testing.T) {
+	f := newUpdFake(t)
+	r := f.run([]string{"S3_TAMPER=1"}, "update", "--stack", "supavise", "--region", "us-east-1", "--template", realTemplate(t), "--yes")
+	if r.code != 2 || !strings.Contains(r.stderr, "is not the file that was verified") || !strings.Contains(r.stderr, "Nothing was changed") {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	if len(f.callsMatching("delete-change-set")) != 1 || len(f.callsMatching("execute-change-set")) != 0 || len(f.callsMatching("describe-change-set")) != 0 {
+		t.Errorf("the change set must be deleted, unread and never run: %v", f.calls())
+	}
+	if len(f.callsMatching("get-template --stack-name supavise --change-set-name supavise-update-")) != 1 ||
+		!strings.Contains(f.callsMatching("get-template")[0], "--template-stage Original") {
+		t.Errorf("the template of the change set is read in the stage the person submitted: %v", f.callsMatching("get-template"))
+	}
+
+	// The same in front of a new server: nothing of it exists when the leader's check stops.
+	f, tok := replicaFake(t)
+	r = f.run([]string{"S3_TAMPER=1"}, "replica", "--leader-stack", "supavise", "--region", "us-east-1", "--az", "us-east-1b", "--token-file", tok, "--template", realTemplate(t), "--yes")
+	if r.code != 2 || !strings.Contains(r.stderr, "is not the file that was verified") {
+		t.Fatalf("replica: exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	for _, none := range []string{"create-secret", "execute-change-set", "--change-set-type CREATE"} {
+		if len(f.callsMatching(none)) != 0 {
+			t.Errorf("%s ran although the template was changed", none)
+		}
+	}
+
+	// Trailing white space is not a change.
+	f = newUpdFake(t)
+	if r = f.run([]string{"S3_PAD=1"}, "update", "--stack", "supavise", "--region", "us-east-1", "--template", realTemplate(t), "--yes"); r.code != 0 {
+		t.Errorf("padded template: exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+
+	// A template that cannot be read back is not trusted either.
+	f = newUpdFake(t)
+	r = f.run([]string{"GET_TEMPLATE_FAILS=1"}, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplate(t), "--yes")
+	if r.code != 3 || !strings.Contains(r.stderr, "cannot read back the template") || len(f.callsMatching("execute-change-set")) != 0 || len(f.callsMatching("delete-change-set")) != 1 {
+		t.Errorf("exit %d\n%s\ncalls: %v", r.code, r.stderr, f.calls())
 	}
 }
 
@@ -629,7 +684,17 @@ func TestUpdateOnTheNode(t *testing.T) {
 		t.Errorf("--stack on a v0.1.x node, region from the metadata service: exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
 	}
 
-	// Another node's stack is refused.
+	// A host that is not a node of a revision 2 stack (a jump host, another server of the cluster)
+	// may update it: the node's tags, not its id, tell nodes apart.
+	f = newUpdFake(t)
+	f.copy("stack-rev2.json", "stack.json")
+	srv = imdsServer(t, "i-0aaaaaaaaaaaaaaaa", "us-east-1", "")
+	r = f.run([]string{"SUPAVISE_IMDS_ENDPOINT=" + srv.URL}, "update", "--stack", "supavise", "--template", smallTemplate(t), "--yes")
+	if r.code != 0 {
+		t.Errorf("another EC2 host, revision 2 stack: exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+
+	// Another node's stack from before revision 2 is refused: nothing else says whose it is.
 	f = newUpdFake(t)
 	srv = imdsServer(t, "i-0aaaaaaaaaaaaaaaa", "us-east-1", "")
 	r = f.run([]string{"SUPAVISE_IMDS_ENDPOINT=" + srv.URL}, "update", "--stack", "supavise", "--template", smallTemplate(t), "--yes")
@@ -761,6 +826,18 @@ func TestUpdateVerifiesTheTemplateItDownloads(t *testing.T) {
 	r = f.run(rel.env(), args...)
 	if r.code != 2 || !strings.Contains(r.stderr, "is not the one release v1.2.3 signed") {
 		t.Errorf("an edited script: exit %d\n%s", r.code, r.stderr)
+	}
+
+	// A signed list that does not name the script cannot vouch for it.
+	rel = makeRelease(t, "v1.2.3", tpl)
+	sums, _ = os.ReadFile(filepath.Join(rel.dir, "download", "v1.2.3", "SHA256SUMS"))
+	noScript := regexp.MustCompile(`(?m)^[0-9a-f]{64}  supavise-aws-deploy.sh\n`).ReplaceAllString(string(sums), "")
+	rel.write(t, "v1.2.3", "SHA256SUMS", []byte(noScript))
+	rel.write(t, "v1.2.3", "SHA256SUMS.sig", ed25519.Sign(rel.priv, []byte(noScript)))
+	f = newUpdFake(t)
+	r = f.run(rel.env(), args...)
+	if r.code != 2 || !strings.Contains(r.stderr, "does not name supavise-aws-deploy.sh") || len(f.callsMatching("create-change-set")) != 0 {
+		t.Errorf("a list without the script: exit %d\n%s", r.code, r.stderr)
 	}
 
 	// A copy of the script without a key (a checkout) cannot verify, and says what to do.
@@ -957,6 +1034,44 @@ func TestReplicaRemovesTheTokenWhenItStopsEarly(t *testing.T) {
 	if len(f.callsMatching("execute-change-set --stack-name supavise-replica")) != 0 {
 		t.Error("ran the change set")
 	}
+	// The change set made the new stack, empty: the output says how to remove it.
+	if !strings.Contains(r.stderr, "exists but is empty") || !strings.Contains(r.stderr, "aws cloudformation delete-stack --region us-east-1 --stack-name supavise-replica") {
+		t.Errorf("stderr does not say how to remove the empty stack:\n%s", r.stderr)
+	}
+}
+
+// The leader cannot be opened after the new stack exists (a change set that is refused here): the
+// server is booting and cannot join, and the token secret stays. The output says what to do.
+func TestReplicaSaysWhatStaysWhenTheLeaderCannotBeOpenedAfterTheStackExists(t *testing.T) {
+	f, tok := replicaFake(t)
+	f.copy("changeset-instance-replaced.json", "changeset-3.json")
+	r := f.run(nil, "replica", "--leader-stack", "supavise", "--region", "us-east-1", "--az", "us-east-1b", "--token-file", tok, "--template", smallTemplate(t), "--yes")
+	if r.code != 2 || !strings.Contains(r.stderr, "Nothing was changed") {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	if len(f.callsMatching("execute-change-set --stack-name supavise-replica")) != 1 || len(f.callsMatching("delete-secret")) != 0 {
+		t.Errorf("the stack was made and the secret stays: %v", f.calls())
+	}
+	for _, want := range []string{"Stack supavise-replica in us-east-1 is being created", "update --stack supavise --region us-east-1 --set PeerCidr1=ADDRESS/32",
+		"aws cloudformation delete-stack --region us-east-1 --stack-name supavise-replica",
+		"aws secretsmanager delete-secret --region us-east-1 --force-delete-without-recovery --secret-id arn:aws:secretsmanager:eu-west-1:111122223333:secret:supavise-join-AbCdEf"} {
+		if !strings.Contains(r.stderr, want) {
+			t.Errorf("stderr lacks %q:\n%s", want, r.stderr)
+		}
+	}
+
+	// The server never finished: the secret is named too, and the exit is a failure.
+	f, tok = replicaFake(t)
+	r = f.run([]string{"CREATE_WAIT_RC=255"}, "replica", "--leader-stack", "supavise", "--region", "us-east-1", "--az", "us-east-1b", "--token-file", tok, "--template", smallTemplate(t), "--yes")
+	if r.code != 3 || !strings.Contains(r.stderr, "did not finish creating") || !strings.Contains(r.stderr, "delete-secret --region us-east-1 --force-delete-without-recovery") {
+		t.Errorf("exit %d\n%s", r.code, r.stderr)
+	}
+	// A run that works says nothing of leftovers.
+	f, tok = replicaFake(t)
+	if r = f.run(nil, "replica", "--leader-stack", "supavise", "--region", "us-east-1", "--az", "us-east-1b", "--token-file", tok, "--template", smallTemplate(t), "--yes"); r.code != 0 ||
+		strings.Contains(r.stderr, "delete-stack") || strings.Contains(r.stderr, "delete-secret") {
+		t.Errorf("exit %d\n%s", r.code, r.stderr)
+	}
 }
 
 func TestReplicaTokenFile(t *testing.T) {
@@ -1048,6 +1163,8 @@ func TestNewCommandDryRuns(t *testing.T) {
 				"aws --region us-east-1 sts get-caller-identity --query Arn --output text",
 				"aws --region us-east-1 cloudformation describe-stacks --stack-name supavise --output json",
 				"--change-set-type UPDATE --capabilities CAPABILITY_IAM --template-url",
+				"s3api put-object --bucket '<BackupBucket>'", "--expected-bucket-owner '<account>'",
+				"cloudformation get-template --stack-name supavise --change-set-name", "--template-stage Original",
 				"aws --region us-east-1 cloudformation execute-change-set --stack-name supavise",
 				"SupaviseVersion is never set",
 			}},
@@ -1142,6 +1259,10 @@ func TestClassifier(t *testing.T) {
 		{"a peer rule that changes is replaced, which is harmless", "changeset-peer-rule.json", nil, 0, []string{
 			"replace  PeerIngress1 (AWS::EC2::SecurityGroupIngress): CidrIp", "add      PeerIngress2 (AWS::EC2::SecurityGroupIngress)"}, nil},
 		{"actions the script does not know", "changeset-unknown.json", nil, 10, []string{"DYNAMIC  Surprise (AWS::SQS::Queue) is a change this script does not know", "IMPORT   Other", "changes in a way the change set does not describe"}, nil},
+		{"the network and the records are not replaced, rules and policies may be", "changeset-replace-network.json", nil, 10, []string{
+			"REPLACE  DnsRecords (AWS::Route53::RecordSetGroup) would be replaced: HostedZoneId", "REPLACE  InternetGateway (AWS::EC2::InternetGateway) may be replaced: Tags",
+			"REPLACE  DefaultRoute (AWS::EC2::Route) would be replaced: DestinationCidrBlock", "replace  PeerIngress1 (AWS::EC2::SecurityGroupIngress): CidrIp",
+			"replace  FencingPolicy (AWS::IAM::Policy): PolicyName", "5 change(s): 2 allowed, 3 refused, 0 blocked"}, nil},
 		{"nothing", "changeset-empty.json", nil, 0, []string{"(no resource changes)", "0 change(s)"}, nil},
 	}
 	for _, c := range cases {
