@@ -128,6 +128,29 @@ assert hashlib.sha256(der).hexdigest() == sys.argv[1], "root fingerprint differs
 PY
 python3 "$WORK/chain.py" "$CA_FPR" <<<"$SC" || fail "the chain the peer port presents does not end in the pinned CA"
 
+log "the files a renewal and a retirement write: the unit and the daemon agree on whether the daemon may"
+# Keeping a renewed certificate writes $CLUSTER_DIR, and retiring a removed node deletes files in it and in
+# /etc/supavise/config.d. ProtectSystem=strict makes both read-only unless the unit's ReadWritePaths= names
+# them. The unit has to grant both or neither, and the daemon's own look at $CLUSTER_DIR (the renewer
+# makes it when it starts) has to find what the unit says: a daemon that is told it may not write there
+# says so in the journal and raises an alert, instead of locking the node out on the day it renews.
+CONFD=/etc/supavise/config.d
+rw_granted() { [[ " $(systemctl show -p ReadWritePaths --value supavise.service) " =~ [[:space:]]-?"$1"/?[[:space:]] ]]; }
+if rw_granted "$CLUSTER_DIR"; then GRANTED=yes; else GRANTED=no; fi
+if rw_granted "$CONFD"; then GRANTED_CONFD=yes; else GRANTED_CONFD=no; fi
+[[ $GRANTED == "$GRANTED_CONFD" ]] || fail "the unit grants writes to $CLUSTER_DIR ($GRANTED) and to $CONFD ($GRANTED_CONFD); a retirement needs both"
+SAW=""
+for ((i = 0; i < 30; i++)); do
+  J=$(journalctl --no-pager -u supavise.service)
+  if grep -q 'the node certificate cannot be renewed' <<<"$J"; then SAW=blocked; break; fi
+  if grep -q 'the node certificate is renewed before it expires' <<<"$J"; then SAW=armed; break; fi
+  sleep 1
+done
+[[ -n $SAW ]] || fail "the daemon said nothing about renewing its certificate"
+if [[ $GRANTED == yes && $SAW != armed ]]; then fail "the unit lets the daemon write $CLUSTER_DIR and the daemon says it cannot"; fi
+if [[ $GRANTED == no && $SAW != blocked ]]; then fail "the unit does not let the daemon write $CLUSTER_DIR and the daemon does not notice"; fi
+log "  the unit grants writes to the cluster files: $GRANTED; the daemon: $SAW"
+
 log "node ls and the cluster block of status"
 OUT=$(supavise node ls)
 [[ $OUT == *n1* && $OUT == *leader* && $OUT == *active* ]] || fail "node ls: $OUT"
