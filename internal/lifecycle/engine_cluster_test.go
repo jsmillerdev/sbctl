@@ -366,3 +366,37 @@ func TestResizeWithoutAReplicaFleetIsUnchanged(t *testing.T) {
 		t.Fatalf("calls = %s", got)
 	}
 }
+
+func TestAdmitReplica(t *testing.T) {
+	ctx := context.Background()
+	c := newClusterHarness(t, "n2")
+	c.node(4, 4, 1) // 4 GB of budget; n2 homes a micro project (1 GB)
+	id := registry.ReplicaIdentifier(c.home1.Ref, "us-east-1", "abc123")
+	if err := c.reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: c.home1.Ref, NodeID: "n2"}); err != nil {
+		t.Fatal(err)
+	}
+	// The replica's own row is already in the registry when it is admitted: it counts once.
+	if err := c.e.AdmitReplica(ctx, c.home1, id, 0); err != nil {
+		t.Fatalf("a micro replica on a node with 2 GB committed of 4: %v", err)
+	}
+	big := *c.home1
+	big.Class = "xlarge"
+	if err := c.e.AdmitReplica(ctx, &big, id, 0); err == nil {
+		t.Fatal("a replica larger than the node's room was admitted")
+	} else if _, ok := IsCapacity(err); !ok {
+		t.Fatalf("not a capacity error: %v", err)
+	}
+	// Disk: a base backup of 10 GB needs 13.5 GB.
+	c.e.freeBytes = func(string) int64 { return 12 * gib }
+	if err := c.e.AdmitReplica(ctx, c.home1, id, 10*gib); !errors.Is(err, ErrReplicaDisk) {
+		t.Fatalf("disk: %v", err)
+	}
+	c.e.freeBytes = func(string) int64 { return 14 * gib }
+	if err := c.e.AdmitReplica(ctx, c.home1, id, 10*gib); err != nil {
+		t.Fatalf("disk with room: %v", err)
+	}
+	c.e.freeBytes = func(string) int64 { return -1 }
+	if err := c.e.AdmitReplica(ctx, c.home1, id, 10*gib); err != nil {
+		t.Fatalf("an unreadable disk is not a refusal: %v", err)
+	}
+}

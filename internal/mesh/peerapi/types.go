@@ -175,6 +175,10 @@ type InstanceAction struct {
 	DrainArchive bool `json:"drain_archive,omitempty"`
 	// TimeoutSeconds bounds the waits of the action. 0 means the node's default.
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// Class (restart): the compute size to render the replica from, when the leader has just changed
+	// the project's size and the node's copy of the registry may not have caught up. Empty: the
+	// size in the node's copy.
+	Class string `json:"class,omitempty"`
 }
 
 // PlaneMethod names a method of lifecycle.Plane. placement's reflection test fails when the
