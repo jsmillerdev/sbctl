@@ -9,9 +9,13 @@ name: replication
 # writer's files.
 #
 # Virtual machines where /dev/kvm works (amd64), privileged system containers where it does not (arm64): unit
-# hardening and the instance metadata block need either (tests/linux/multi/README.md). It is not in
-# deploy/release-gate.sh's list yet. The gate accepts a workflow_dispatch run on the tagged commit, so this workflow
-# can be listed as it stands: `gh workflow run replication.yml --ref <branch>`, then tag.
+# hardening and the instance metadata block need either (tests/linux/multi/README.md). A push to a ws/** branch
+# runs amd64 only, as linux.yml does; integrate/** and a dispatch run both architectures.
+#
+# It is not in deploy/release-gate.sh's list yet. The gate accepts a workflow_dispatch run on the tagged commit, so
+# this workflow can be listed as it stands: `gh workflow run replication.yml --ref <branch>`, then tag. A run takes
+# 60 to 75 minutes when every check passes and up to 150 when a wait times out, so the run is dispatched before the
+# tag, or the gate's GATE_TIMEOUT_SECONDS is raised above 150 minutes.
 on:
   push:
     branches: ["ws/rep-x2", "integrate/**"]
@@ -36,9 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     steps:
@@ -54,13 +56,15 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
           CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/supavise-next ./cmd/supavise
           go build -o /tmp/releasetool ./deploy/releasetool
-      # Below the job's limit, so that a hang is ended here and the steps after it still run.
+      # The script has its own deadline, 120 minutes: `timeout` sends SIGTERM, the script's EXIT trap collects both
+      # nodes' journals and PostgreSQL logs and removes the nodes (10 minutes at most before SIGKILL), and the steps after
+      # this one still run. The step's limit is the backstop, below the job's.
       - name: two servers
         timeout-minutes: 135
         run: |
           sudo env LOG_DIR=/tmp/supavise-multi-logs MULTI_MODE=auto \
             SUPAVISE_BIN=/tmp/supavise SUPAVISE_BIN_NEXT=/tmp/supavise-next SUPAVISE_RELEASETOOL=/tmp/releasetool \
-            tests/linux/multi/replication.sh 2>&1 | tee /tmp/replication.log
+            timeout -k 600 7200 tests/linux/multi/replication.sh 2>&1 | tee /tmp/replication.log
       - if: always()
         name: results
         run: |
