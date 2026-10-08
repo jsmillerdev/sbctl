@@ -1,0 +1,8 @@
+<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <Error>
+    <Type>Sender</Type>
+    <Code>AccessDenied</Code>
+    <Message>User: arn:aws:sts::123456789012:assumed-role/node/i-1 is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::123456789012:role/other</Message>
+  </Error>
+  <RequestId>4c1f6d2e-aaaa-bbbb-cccc-example</RequestId>
+</ErrorResponse>
