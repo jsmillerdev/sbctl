@@ -153,6 +153,15 @@ func matrixCases() []routeCase {
 		rc("YYYYYN", "GET", p+"/database/backups", nil),
 		rc("YYYYYN", "GET", pp+"/billing/addons", nil),
 		rc("YYYYYN", "GET", p+"/billing/addons", nil),
+		// read replicas: every role that sees the project reads its databases and their lag; adding
+		// and removing a replica changes the project's infrastructure, like its size
+		rc("YYYYYN", "GET", pp+"/databases", nil),
+		rc("YYYYYN", "GET", pp+"/databases-statuses", nil),
+		rc("YYYYYN", "GET", pp+"/load-balancers", nil),
+		rc("YYYYYN", "GET", pp+"/infra-monitoring", nil),
+		rc("YYYYYN", "GET", pp+"/config/supavisor", nil),
+		rd("YYNNNN", "POST", p+"/read-replicas/setup", map[string]any{"read_replica_region": "eu-west-1"}),
+		rd("YYNNNN", "POST", p+"/read-replicas/remove", map[string]any{"database_identifier": testRef + "-rr-eu-west-1-abcdef"}),
 		rd("YYNNNN", "POST", "/platform/database/"+testRef+"/backups/restore", map[string]any{"id": 1}),
 		rd("YYNNNN", "POST", "/platform/database/"+testRef+"/backups/restore-physical", map[string]any{"id": 1}),
 		rd("YYNNNN", "POST", "/platform/database/"+testRef+"/backups/pitr", map[string]any{"recovery_time_target_unix": 1}),
