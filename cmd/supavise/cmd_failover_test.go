@@ -28,6 +28,20 @@ type fakeFailover struct {
 	ran     []string
 	gotSrv  failover.ServerOptions
 	gotProj failover.ProjectOptions
+
+	// followed is what Follow answers after a run whose connection the daemon's restart cut.
+	followSteps []registry.MoveStep
+	followMove  *registry.Move
+	followErr   error
+	followEpoch []int64
+}
+
+func (f *fakeFailover) Follow(_ context.Context, epoch int64, on func(registry.MoveStep)) (*registry.Move, error) {
+	f.followEpoch = append(f.followEpoch, epoch)
+	for _, s := range f.followSteps {
+		on(s)
+	}
+	return f.followMove, f.followErr
 }
 
 func (f *fakeFailover) Readiness(context.Context) (failover.Readiness, error) {
@@ -164,6 +178,104 @@ func TestFailoverRunsAndPrintsTheSteps(t *testing.T) {
 	}
 	if strings.Contains(out, `{"projects"`) {
 		t.Fatalf("the plan JSON of the first step is printed:\n%s", out)
+	}
+}
+
+// The daemon of the survivor restarts when its system cluster is promoted, and the connection that
+// carried the steps closes. The command waits for the daemon that starts and goes on printing.
+func TestFailoverFollowsTheMoveAcrossTheRestartOfTheDaemon(t *testing.T) {
+	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for name, cut := range map[string]error{
+		"the daemon says it restarts": &failover.RemoteError{Code: "restarting", Message: "failover: the daemon restarts in its new role and goes on with the move there"},
+		"the connection closes":       failover.ErrStreamClosed,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeFailover{plan: goodPlan(), runErr: cut, steps: []registry.MoveStep{{Name: "promote-system", At: at, Detail: "primary on standby"}},
+				followSteps: []registry.MoveStep{{Name: "leader", At: at, Detail: "standby leads at epoch 2"}, {Name: "dns", At: at, Detail: "DNS needs no change"}},
+				followMove:  doneMove()}
+			withFailover(t, f)
+			out, err := run(t, "failover", "--yes")
+			if err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			for _, want := range []string{"promote-system", "restarts in the role the move gives it", "leader: standby leads at epoch 2", "Done: the switchover of the server from n1 to n2 is finished (move 4)."} {
+				if !strings.Contains(out, want) {
+					t.Errorf("no %q in\n%s", want, out)
+				}
+			}
+			if len(f.followEpoch) != 1 || f.followEpoch[0] != 2 {
+				t.Fatalf("followed the move of epochs %v, want the plan's 2", f.followEpoch)
+			}
+		})
+	}
+	t.Run("the steps the lost run printed are not printed again", func(t *testing.T) {
+		// The daemon that starts sends the log from its first step.
+		f := &fakeFailover{plan: goodPlan(), runErr: failover.ErrStreamClosed,
+			steps:       []registry.MoveStep{{Name: "begin", At: at}, {Name: "marker", At: at, Detail: "epoch 2"}, {Name: "promote-system", At: at, Detail: "primary on standby"}},
+			followSteps: []registry.MoveStep{{Name: "begin", At: at}, {Name: "marker", At: at, Detail: "epoch 2"}, {Name: "promote-system", At: at, Detail: "primary on standby"}, {Name: "leader", At: at, Detail: "standby leads at epoch 2"}},
+			followMove:  doneMove()}
+		withFailover(t, f)
+		out, err := run(t, "failover", "--yes")
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		for _, name := range []string{"marker: epoch 2", "promote-system: primary on standby"} {
+			if n := strings.Count(out, name); n != 1 {
+				t.Errorf("%q printed %d times in\n%s", name, n, out)
+			}
+		}
+		if !strings.Contains(out, "leader: standby leads at epoch 2") {
+			t.Errorf("the step the daemon that starts recorded is missing in\n%s", out)
+		}
+	})
+	t.Run("the move fails after the restart", func(t *testing.T) {
+		mv := doneMove()
+		mv.State = registry.MoveFailed
+		f := &fakeFailover{plan: goodPlan(), runErr: failover.ErrStreamClosed, followMove: mv, followErr: &failover.RemoteError{Code: "failed", Message: "1 step(s) did not finish"}}
+		withFailover(t, f)
+		out, err := run(t, "failover", "--yes")
+		if err == nil || !strings.Contains(err.Error(), "did not finish") || !strings.Contains(out, "is failed after") {
+			t.Fatalf("error %v\n%s", err, out)
+		}
+	})
+	t.Run("the daemon has no record of it", func(t *testing.T) {
+		f := &fakeFailover{plan: goodPlan(), runErr: failover.ErrStreamClosed, followErr: failover.ErrNothingRunning}
+		withFailover(t, f)
+		_, err := run(t, "failover", "--yes")
+		if err == nil || !strings.Contains(err.Error(), "supavise status") || !strings.Contains(err.Error(), "--resume") {
+			t.Fatalf("error: %v", err)
+		}
+	})
+	t.Run("a refusal is not followed", func(t *testing.T) {
+		f := &fakeFailover{plan: goodPlan(), runErr: &failover.RemoteError{Code: "busy", Message: "another move is running"}}
+		withFailover(t, f)
+		if _, err := run(t, "failover", "--yes"); err == nil || len(f.followEpoch) != 0 {
+			t.Fatalf("error %v, followed %v", err, f.followEpoch)
+		}
+	})
+}
+
+func TestFailoverAbortRunsWithoutAPlanAndTakesNoOtherOption(t *testing.T) {
+	mv := doneMove()
+	mv.State = registry.MoveAborted
+	f := &fakeFailover{plan: goodPlan(), move: mv}
+	withFailover(t, f)
+	out, err := run(t, "failover", "--abort")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if len(f.planned) != 0 || strings.Join(f.ran, ",") != "server" || !f.gotSrv.Abort || !strings.Contains(out, "Aborted: the switchover of the server from n1 to n2 was discarded after dns") {
+		t.Fatalf("planned %v, ran %v with %+v\n%s", f.planned, f.ran, f.gotSrv, out)
+	}
+	for _, args := range [][]string{{"--resume"}, {"--force"}, {"--to", "n2"}, {"--dry-run"}} {
+		f.ran = nil
+		if _, err := run(t, append([]string{"failover", "--abort"}, args...)...); err == nil || !strings.Contains(err.Error(), "takes no other option") || len(f.ran) != 0 {
+			t.Fatalf("%v: error %v, ran %v", args, err, f.ran)
+		}
+	}
+	f.runErr = &failover.RemoteError{Code: "failed", Message: "failover: the move went past what can be taken back (step marker): continue it with supavise failover --resume"}
+	if _, err := run(t, "failover", "--abort"); err == nil || !strings.Contains(err.Error(), "step marker") {
+		t.Fatalf("a refused abort: %v", err)
 	}
 }
 

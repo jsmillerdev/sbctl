@@ -77,11 +77,18 @@ type Primaries interface {
 	Healthy(ctx context.Context, node, ref string) (ok bool, detail string, err error)
 	// SetAside moves the data of the project's old primary on node to data.diverged-<epoch>,
 	// where `supavise node rejoin` and the janitor of [failover] keep_diverged_days find it, and
-	// clears the project's fence record, so that a replica can be built in its place.
+	// clears the project's fence record, so that a replica can be built in its place. It must refuse
+	// while the cluster runs (SetAsideDiverged does), and the node refuses it for a project its
+	// registry homes there (the answer carries CodeHomedHere).
 	SetAside(ctx context.Context, node, ref string, epoch int64) error
 }
 
 // LocalPrimaries is Primaries for this node, implemented over the node's plane (lifecycle).
+//
+// The system project is one of the refs. A planned switchover stops the leader's system cluster, and
+// with it the registry the node reads projects from; the undo of that stop (Leader.Resume) starts the
+// system cluster first, so Start and Stop of ref "system" must not read the registry. Healthy and
+// SetAside of "system" are never asked of a node.
 type LocalPrimaries interface {
 	Stop(ctx context.Context, ref string) (lsn string, err error)
 	Start(ctx context.Context, ref string) error
@@ -170,6 +177,14 @@ type Cloud interface {
 	PeerState(ctx context.Context, node registry.Node) (PeerState, error)
 }
 
+// AddressProber is implemented by a Provider that can say, before a move, whether it will be able to
+// take the service address over on this node. The automatic mode needs it: with no operator to hand
+// the address to, a node that cannot move it stays manual. The plain Probe is about permissions; this
+// is about the node.
+type AddressProber interface {
+	ProbeTakeover(ctx context.Context) error
+}
+
 // PeerState is what the cloud says about a node's machine.
 type PeerState struct {
 	// State is the machine's state in the cloud's words ("running", "stopped", "terminated").
@@ -177,6 +192,16 @@ type PeerState struct {
 	// Impaired is true when the cloud's status checks fail (system or instance).
 	Impaired bool
 	Detail   string
+}
+
+// Gone reports whether the cloud says the machine is stopped or terminated: nothing on it can hear
+// a request, so a cooperative fence would only wait for its timeout.
+func (s PeerState) Gone() bool {
+	switch s.State {
+	case "stopped", "terminated", "shutting-down":
+		return true
+	}
+	return false
 }
 
 // Down reports whether the machine is not running, or is running and failing its checks. A

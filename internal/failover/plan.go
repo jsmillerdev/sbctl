@@ -227,7 +227,9 @@ func (o *Orchestrator) planProject(ctx context.Context, opts ProjectOptions) (*P
 	pl.Checks = append(pl.Checks, advice("capacity", fmt.Sprintf("%s already holds the replica, which counts against its capacity", to.Name)))
 
 	// A project whose primary answers is switched over (the old primary stops cleanly and nothing
-	// is lost); one that does not is failed over and its old primary is fenced first.
+	// is lost); one that does not is failed over and its old primary is fenced first. A paused
+	// project has no answering primary on purpose: its cluster is stopped cleanly already, so it is
+	// switched over too, and its control file gives the position the replica must reach.
 	healthy, detail, herr := o.projectHealthy(ctx, from, p.Ref)
 	switch {
 	case herr != nil:
@@ -236,6 +238,9 @@ func (o *Orchestrator) planProject(ctx context.Context, opts ProjectOptions) (*P
 	case healthy:
 		pl.Kind = string(registry.MoveSwitchover)
 		pl.Checks = append(pl.Checks, advice("primary", "healthy: a switchover, the old primary stops cleanly and becomes a replica"))
+	case p.Status == registry.StatusInactive:
+		pl.Kind = string(registry.MoveSwitchover)
+		pl.Checks = append(pl.Checks, advice("primary", "paused: a switchover, the stopped primary becomes a replica of the new home and the project stays paused"))
 	default:
 		pl.Kind = string(registry.MoveFailover)
 		pl.Checks = append(pl.Checks, advice("primary", fmt.Sprintf("not healthy (%s): a failover, the old primary is fenced first and loses what the replica has not received", detail)))
@@ -538,7 +543,10 @@ func (o *Orchestrator) storageCheck() Check {
 }
 
 // markerCheck: the epoch marker lives in the backup store; the store must be reachable, and
-// must not already hold the epoch of the move or a higher one (another node was promoted).
+// must not already hold the epoch of the move or a higher one (another node was promoted). The
+// marker is what lets the store pick one of two survivors that act at once; the promoted node starts
+// as the leader without it, from its own promote.ok, so an unreachable store is a failed check that
+// --force overrides.
 func (o *Orchestrator) markerCheck(ctx context.Context, epoch int64) []Check {
 	if o.d.Marker == nil {
 		return []Check{hard(fail("epoch marker", "no leader marker store in this build or backup mode (an S3-compatible backup store has one), so the leader marker cannot be written"))}
@@ -546,7 +554,7 @@ func (o *Orchestrator) markerCheck(ctx context.Context, epoch int64) []Check {
 	m, err := o.d.Marker.ReadLeaderMarker(ctx)
 	switch {
 	case err != nil:
-		return []Check{fail("epoch marker", fmt.Sprintf("the backup store is not reachable: %v", err))}
+		return []Check{fail("epoch marker", fmt.Sprintf("the leader marker in the backup store cannot be read: %v. If the store is up, the marker is malformed: delete _node/leader.json after you have checked which node leads", err))}
 	case m != nil && m.Epoch >= epoch:
 		return []Check{hard(fail("epoch marker", fmt.Sprintf("the store holds epoch %d (leader %s), which is not below this move's %d: another node was promoted", m.Epoch, m.Leader, epoch)))}
 	case m == nil:
@@ -678,6 +686,9 @@ type unfinishedMove struct {
 	epoch    int64
 	last     string
 	moveID   int64
+	steps    []registry.MoveStep
+	// running: the move was never finished, as when the daemon was cut off; false for a move that ended failed.
+	running bool
 }
 
 // unfinishedServer finds the server move that stopped: in the registry when it has one, else in failover.json.
@@ -692,10 +703,10 @@ func (o *Orchestrator) unfinishedServer(ctx context.Context) (*unfinishedMove, *
 	}
 	switch {
 	case m != nil:
-		return &unfinishedMove{kind: m.Kind, from: m.FromNode, to: m.ToNode, epoch: m.Epoch, last: lastStep(*m), moveID: m.ID}, fs, nil
+		return &unfinishedMove{kind: m.Kind, from: m.FromNode, to: m.ToNode, epoch: m.Epoch, last: lastStep(*m), moveID: m.ID, steps: m.Steps, running: m.State == registry.MoveRunning}, fs, nil
 	case fs != nil && fs.State != registry.MoveAborted:
 		mv := registry.Move{Steps: fs.Steps}
-		return &unfinishedMove{kind: fs.Kind, from: fs.From, to: fs.To, epoch: fs.Epoch, last: lastStep(mv)}, fs, nil
+		return &unfinishedMove{kind: fs.Kind, from: fs.From, to: fs.To, epoch: fs.Epoch, last: lastStep(mv), steps: fs.Steps, running: fs.State == "" || fs.State == registry.MoveRunning}, fs, nil
 	}
 	return nil, nil, nil
 }

@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -55,7 +58,85 @@ func (o *Orchestrator) FailoverServer(ctx context.Context, opts ServerOptions) (
 		return nil, err
 	}
 	defer release()
+	if opts.Abort {
+		return o.abortServer(ctx)
+	}
 	return o.failoverServer(ctx, opts)
+}
+
+// undoable are the steps of a server move that can still be taken back: the plan, the leader's stop
+// of everything for a switchover, where each cluster stopped, and the survivor's wait for its standby.
+// A fence, the leader marker and everything after them are not.
+func undoable(step string) bool {
+	return step == "begin" || step == "quiesce" || step == "caught-up" || strings.HasPrefix(step, "stopped:")
+}
+
+// abortServer discards the unfinished server move of this node. It is the way out of a move that
+// stopped early and keeps every new plan, and the automatic mode, from running (the plan refuses
+// "unfinished move"): a switchover whose marker could not be written has left the old leader stopped,
+// and a failover whose fence failed has left only the file. It starts the old leader again when the
+// move had stopped it, and removes failover.json.
+//
+// Only a move that did nothing it cannot take back is aborted: not one that fenced the old leader,
+// wrote the leader marker or promoted anything. Those continue with --resume.
+//
+// A switchover always tells the old leader to start again, whatever its log holds: the leader's stops
+// are recorded here only after its quiesce answered, so a survivor whose daemon died during the request
+// leaves a log with the plan alone and a leader that has stopped. A leader that has nothing to undo
+// answers that it has none. One that cannot be reached holds the abort back when the log says it was
+// stopped, and when the log does not say, the abort goes on and says what is left to do.
+func (o *Orchestrator) abortServer(ctx context.Context) (*registry.Move, error) {
+	prior, state, err := o.unfinishedServer(ctx)
+	switch {
+	case err != nil:
+		return nil, err
+	case prior == nil:
+		return nil, fmt.Errorf("%w: there is no server move to abort", ErrNothingToResume)
+	case state == nil || prior.moveID != 0:
+		return nil, fmt.Errorf("failover: the move is past its promotion (it is in the moves log); continue it with supavise failover --resume")
+	case prior.to != o.self().ID:
+		return nil, fmt.Errorf("failover: the move goes to node %s: abort it there", prior.to)
+	}
+	for _, s := range prior.steps {
+		if !undoable(s.Name) {
+			return nil, fmt.Errorf("failover: the move went past what can be taken back (step %s): continue it with supavise failover --resume", s.Name)
+		}
+	}
+	var left string
+	if prior.kind == registry.MoveSwitchover {
+		if err := o.restartLeader(ctx, prior.from); err != nil {
+			if recordedStep(prior.steps, "quiesce") {
+				return nil, fmt.Errorf("failover: starting %s again failed, so the move is kept: %w", prior.from, err)
+			}
+			left = fmt.Sprintf("%s could not be told to start again (%v); if it stopped for this switchover, restart supavise on it", prior.from, err)
+		}
+	}
+	if err := os.Remove(o.d.Cfg.Paths().FailoverState()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("failover: removing the state of the move: %w", err)
+	}
+	mv := registry.Move{Scope: registry.MoveServer, Kind: prior.kind, FromNode: prior.from, ToNode: prior.to, Epoch: prior.epoch, State: registry.MoveAborted,
+		Error: "aborted by the operator", Steps: prior.steps}
+	detail := fmt.Sprintf("The %s of the server from %s to %s was aborted by the operator after %s; nothing was promoted.", prior.kind, prior.from, prior.to, prior.last)
+	if left != "" {
+		reportStep(ctx, registry.MoveStep{Name: "resume-leader", At: o.d.Now().UTC(), Detail: "warning: " + left})
+		detail += " Left to do: " + left + "."
+	}
+	o.announce(ctx, alerts.KindFailoverFailed, alerts.SeverityWarning, mv, detail)
+	return &mv, nil
+}
+
+// restartLeader tells the old leader to start what the quiesce stopped. A leader that has nothing to
+// undo (it was told already, or never stopped) answers no_quiesce, which is the state wanted.
+func (o *Orchestrator) restartLeader(ctx context.Context, node string) error {
+	if o.d.Leader == nil {
+		return errors.New("no way to reach the leader")
+	}
+	err := o.d.Leader.Resume(ctx, node)
+	var re *mesh.RemoteError
+	if errors.As(err, &re) && re.Code == "no_quiesce" {
+		return nil
+	}
+	return err
 }
 
 // failoverServer is FailoverServer for a caller that holds the node's move already.
@@ -89,6 +170,9 @@ func (o *Orchestrator) failoverServer(ctx context.Context, opts ServerOptions) (
 		}
 	}
 	detail := fmt.Sprintf("Moving the leadership from %s to %s (epoch %d).", run.from.Name, run.to.Name, run.epoch)
+	if opts.Resume {
+		detail = fmt.Sprintf("Continuing the move of the leadership from %s to %s (epoch %d) after it stopped.", run.from.Name, run.to.Name, run.epoch)
+	}
 	if restored := restoredRefs(rec); len(restored) > 0 {
 		detail += fmt.Sprintf(" No replica exists for %s: their standbys are built from the archive, with data loss up to archive_timeout.", listRefs(restored))
 	}
@@ -278,9 +362,10 @@ func (o *Orchestrator) stopLeader(ctx context.Context, j *journal, run *serverRu
 }
 
 // resumeLeader tells the leader to start again; a failure is logged, because the caller is
-// already reporting the reason it gave up.
+// already reporting the reason it gave up. A leader that had nothing to undo (its quiesce failed
+// before a record was written, or it started again by itself) is not a failure.
 func (o *Orchestrator) resumeLeader(ctx context.Context, run *serverRun) {
-	if err := o.d.Leader.Resume(context.WithoutCancel(ctx), run.from.ID); err != nil {
+	if err := o.restartLeader(context.WithoutCancel(ctx), run.from.ID); err != nil {
 		o.d.Log.Error("could not tell the leader to start again; restart supavise on it", "node", run.from.ID, "error", err)
 	}
 }
@@ -314,7 +399,16 @@ func (o *Orchestrator) waitReplayed(ctx context.Context, node, identifier, lsn s
 // provider the operator asserted that the node is down, and that is what the move rests on.
 func (o *Orchestrator) fenceLeader(ctx context.Context, run *serverRun, req Request) (string, error) {
 	var parts []string
-	if o.d.Peers != nil {
+	// A leader that the cloud reports stopped or terminated hears nothing; the polite fence would wait
+	// out its whole timeout, which is added to the time the survivor takes to lead.
+	gone := false
+	if cloud, ok := o.d.Provider.(Cloud); ok && o.d.Provider.Name() != "manual" {
+		if st, err := cloud.PeerState(ctx, run.from); err == nil && st.Gone() {
+			gone = true
+			parts = append(parts, fmt.Sprintf("cooperative fence: skipped, the cloud reports %s %s", run.from.Name, st.State))
+		}
+	}
+	if o.d.Peers != nil && !gone {
 		timeout := o.conf().StopTimeout()
 		if o.d.Provider.Name() != "manual" {
 			timeout = 20 * time.Second // the hard fence follows
@@ -371,9 +465,12 @@ func (o *Orchestrator) writeMarker(ctx context.Context, run *serverRun) (string,
 	case errors.Is(err, backup.ErrMarkerNewer):
 		return "", lost
 	case run.flags.Force:
+		// The promoted node's daemon decides its role at boot from its peers, the marker and its own
+		// promote.ok, which the promotion writes: it starts as the leader without the marker. What the
+		// marker adds is the store's pick between two survivors that act at once.
 		return "warning: the leader marker was not written: " + err.Error(), nil
 	}
-	return "", fmt.Errorf("writing the leader marker: %w (--force goes on without it)", err)
+	return "", fmt.Errorf("writing the leader marker: %w (--force goes on without it; nothing then stops a second survivor from being promoted)", err)
 }
 
 // becomeLeader runs when the system cluster has been promoted: the daemon notices and becomes the
@@ -382,10 +479,18 @@ func (o *Orchestrator) writeMarker(ctx context.Context, run *serverRun) (string,
 func (o *Orchestrator) becomeLeader(ctx context.Context, j *journal, run *serverRun) (string, error) {
 	if o.d.Takeover != nil {
 		if err := o.d.Takeover.BecomeLeader(ctx, run.epoch); err != nil {
+			// The daemon of this node takes up its new role by restarting, which ends this wait with the
+			// context. The move is not over: the daemon that starts continues it at this step.
 			return "", fmt.Errorf("waiting for %s to run as the leader: %w", run.to.Name, err)
 		}
 	}
 	if err := j.adopt(ctx); err != nil {
+		if errors.Is(err, registry.ErrReadOnly) {
+			// The membership shows the promotion before the daemon has restarted into the role: the
+			// registry this process writes to is still the standby's read-only handle, and the daemon that
+			// starts opens it writable and continues the move at this step.
+			return "", fmt.Errorf("the daemon's registry is read-only until it restarts as the leader: %w", err)
+		}
 		return "", err
 	}
 	st := o.store()

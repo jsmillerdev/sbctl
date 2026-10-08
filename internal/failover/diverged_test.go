@@ -2,7 +2,9 @@ package failover
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -109,5 +111,39 @@ func TestSweepRemovesOnlyWhatIsPastKeepDiverged(t *testing.T) {
 		if !strings.Contains(r, ".diverged-") {
 			t.Fatalf("removed %s", r)
 		}
+	}
+}
+
+// A cluster that runs keeps its data: renaming a data directory under a postmaster loses the writes
+// it still holds in memory and breaks it. The pid file says which process owns the directory.
+func TestSetAsideRefusesWhileThePostmasterRuns(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	data := dataDir(t, cfg, refA)
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+
+	// This test process is alive: a pid file naming it is a running postmaster.
+	must(t, os.WriteFile(filepath.Join(data, "postmaster.pid"), []byte(strconv.Itoa(os.Getpid())+"\n"+data+"\n"), 0o600))
+	if _, err := SetAsideDiverged(cfg, refA, 2, "", "", now); err == nil || !strings.Contains(err.Error(), "running postmaster") {
+		t.Fatalf("error: %v", err)
+	}
+	if _, err := os.Stat(data); err != nil {
+		t.Fatal("the data directory moved although its postmaster runs")
+	}
+
+	// A pid file that a crash left names a process that is gone.
+	cmd := exec.Command("true")
+	must(t, cmd.Run())
+	must(t, os.WriteFile(filepath.Join(data, "postmaster.pid"), []byte(strconv.Itoa(cmd.Process.Pid)+"\n"+data+"\n"), 0o600))
+	d, err := SetAsideDiverged(cfg, refA, 2, "", "", now)
+	if err != nil || d.Path == "" {
+		t.Fatalf("a stale pid file: %+v, %v", d, err)
+	}
+
+	// A pid file that is not one does not stop it either.
+	data = dataDir(t, cfg, refB)
+	must(t, os.WriteFile(filepath.Join(data, "postmaster.pid"), []byte("not a pid\n"), 0o600))
+	if d, err := SetAsideDiverged(cfg, refB, 2, "", "", now); err != nil || d.Path == "" {
+		t.Fatalf("garbage in the pid file: %+v, %v", d, err)
 	}
 }

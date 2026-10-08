@@ -3,12 +3,18 @@ package failover
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/failover/fenced"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/mesh"
+	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -226,7 +232,9 @@ func TestAProjectMoveHoldsTheLockBeforeItPlans(t *testing.T) {
 	if _, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil {
 		t.Fatal(err)
 	}
-	if len(order) != 2 || order[0] != "lock "+refA || order[1] != "unlock "+refA || w.index("registry.CreateMove") < 0 {
+	// The lock is let go of around the registration with the shared services, which takes it itself,
+	// and taken again for the rest of the move.
+	if strings.Join(order, ",") != "lock "+refA+",unlock "+refA+",lock "+refA+",unlock "+refA || w.index("registry.CreateMove") < 0 {
 		t.Fatalf("lock calls: %v", order)
 	}
 	// A dry run changes nothing and needs no lock.
@@ -476,13 +484,14 @@ func TestProjectResumeAtEveryStep(t *testing.T) {
 			if p.NodeID != "n2" || p.Status != registry.StatusActiveHealthy {
 				t.Fatalf("project: %+v", p)
 			}
-			// The stop and the promotion ran once; a promotion that was only repeated because it
-			// failed is the only second one.
-			// (twice when the stop itself was what failed)
+			// The stop ran once (twice when the stop itself was what failed). The node is asked to promote
+			// again after a promotion that failed, and after one that was answered but not recorded: its
+			// promotion is repeatable, finds the cluster promoted and starts nothing twice, and it is
+			// what finishes a promotion that an earlier try left halfway.
 			if n := w.count("stop n1/" + refA); n > 1 && !strings.HasPrefix(c.fail, "stop ") {
 				t.Errorf("the old primary was stopped %d times", n)
 			}
-			if n := w.count("promote n2/"); n > 2 || (c.fail == "promote-after n2/" && n != 1) {
+			if n := w.count("promote n2/"); n > 2 {
 				t.Errorf("%d promotions", n)
 			}
 			reps, _ := w.reg.ListReplicas(w.ctx, refA)
@@ -493,5 +502,418 @@ func TestProjectResumeAtEveryStep(t *testing.T) {
 				t.Errorf("%d moves rows, want the one that was resumed", len(mvs))
 			}
 		})
+	}
+}
+
+// A paused project has no answering primary on purpose. It is switched over, not failed over: nothing
+// is fenced or set aside, the replica waits for the stopped cluster's last checkpoint, and the project
+// is paused on its new home like it was.
+func TestAPausedProjectIsSwitchedOverAndStaysPaused(t *testing.T) {
+	w := newWorld(t)
+	must(t, w.reg.SetProjectStatus(w.ctx, refA, registry.StatusInactive))
+	w.prim["n1/"+refA] = &primState{} // stopped by the pause: not running, not healthy
+	o := w.orch()
+
+	pl, err := o.PlanProject(w.ctx, ProjectOptions{Ref: refA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.Kind != string(registry.MoveSwitchover) || len(pl.Refused(false)) != 0 {
+		t.Fatalf("plan: %+v", pl)
+	}
+	if c := findCheck(t, pl, "primary"); !strings.Contains(c.Detail, "paused") {
+		t.Fatalf("check: %+v", c)
+	}
+
+	mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA, ExpectKind: string(registry.MoveSwitchover)})
+	if err != nil || mv.State != registry.MoveDone || mv.Kind != registry.MoveSwitchover {
+		t.Fatalf("move %+v, error %v\n%v", mv, err, w.snapshot())
+	}
+	w.assertNever("fence ")
+	w.assertNever("local.stop")
+	w.assertNever("aside ")
+	w.assertOrder("stop n1/"+refA, "promote n2/"+idAN2+" epoch=1 wait="+w.lsn[refA], "registry.SetProjectNode "+refA+" n2 1", "stop n2/"+refA, "demote n1/")
+	w.assertNever("start n2/" + refA)
+	w.assertNever("fleet.ensure " + refA)
+	if p := projectOf(t, w, refA); p.NodeID != "n2" || p.Status != registry.StatusInactive {
+		t.Fatalf("project: %+v", p)
+	}
+	if r := replicaOn(t, w, refA, "n1"); r == nil {
+		t.Fatal("the old home is a replica of the new one")
+	}
+	// A project that is not paused and does not answer is still failed over.
+	w2 := newWorld(t)
+	w2.prim["n1/"+refA].healthy = false
+	if pl, _ := w2.orch().PlanProject(w2.ctx, ProjectOptions{Ref: refA}); pl.Kind != string(registry.MoveFailover) {
+		t.Fatalf("plan: %+v", pl)
+	}
+}
+
+// The old home refuses to set its data aside while its registry copy still homes the project there; the
+// copy follows the leader by a moment, so the move asks again.
+func TestTheOldHomeIsAskedAgainWhileItsRegistryTrails(t *testing.T) {
+	trailing := &mesh.RemoteError{Node: "n1", Status: http.StatusConflict, Code: CodeHomedHere, Message: "the registry homes it on this node"}
+	run := func(t *testing.T, refusals int) (*world, string) {
+		w := newWorld(t)
+		w.prim["n1/"+refA].healthy = false
+		w.fail("aside n1/"+refA, trailing, refusals)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		return w, w.stepDetail(mv, "reseed-old")
+	}
+	w, detail := run(t, 3)
+	if n := w.count("aside n1/" + refA); n != 4 || strings.HasPrefix(detail, "warning:") {
+		t.Fatalf("%d tries, step %q", n, detail)
+	}
+	w, detail = run(t, -1)
+	if n := w.count("aside n1/" + refA); n != asideAttempts || !strings.HasPrefix(detail, "warning: the old primary's data") || !strings.Contains(detail, "supavise replicas add") {
+		t.Fatalf("%d tries, step %q", n, detail)
+	}
+	// Another refusal is not waited for.
+	w = newWorld(t)
+	w.prim["n1/"+refA].healthy = false
+	w.fail("aside n1/"+refA, errors.New("permission denied"), -1)
+	mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+	if err != nil || w.count("aside n1/"+refA) != 1 || !strings.HasPrefix(w.stepDetail(mv, "reseed-old"), "warning:") {
+		t.Fatalf("move %+v, error %v, %d tries", mv, err, w.count("aside n1/"+refA))
+	}
+}
+
+// What a node answers to a promotion says what happened to it. The placement layer gives the
+// sentinels back through errors.Is: a node that did not reach the position promoted nothing, so the
+// old primary starts again; a node at a higher epoch refused a leader that has been replaced, and
+// repeating the call changes nothing.
+func TestAPromotionThatTheNodeAnswersWithASentinelIsClassified(t *testing.T) {
+	t.Run("the replica did not reach the position: nothing was promoted", func(t *testing.T) {
+		w := newWorld(t)
+		w.fail("promote n2/", fmt.Errorf("%w: waiting for %s: not reached within 2m0s", lifecycle.ErrReplayBehind, w.lsn[refA]), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		w.assertOrder("stop n1/"+refA, "promote n2/", "start n1/"+refA)
+		if p := projectOf(t, w, refA); p.NodeID != "n1" || p.Status != registry.StatusActiveHealthy {
+			t.Fatalf("project: %+v", p)
+		}
+	})
+	t.Run("a node that refuses the promotion changed nothing", func(t *testing.T) {
+		for name, refusal := range map[string]error{
+			"the node is fenced":          fmt.Errorf("%w: the node is fenced", lifecycle.ErrInvalidState),
+			"the cluster is no standby":   fmt.Errorf("%w: no standby.signal", lifecycle.ErrNotStandby),
+			"the state does not allow it": fmt.Errorf("%w: still being set up", lifecycle.ErrInvalidState),
+			"the project is not homed":    fmt.Errorf("%w: refused", placement.ErrNotHome),
+			"the replica is not there":    fmt.Errorf("%w: no such replica", registry.ErrNotFound),
+		} {
+			w := newWorld(t)
+			w.fail("promote n2/", refusal, -1)
+			mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+			if err == nil || mv.State != registry.MoveAborted || !strings.Contains(err.Error(), "refused") {
+				t.Fatalf("%s: move %+v, error %v", name, mv, err)
+			}
+			w.assertOrder("stop n1/"+refA, "promote n2/", "start n1/"+refA)
+			if p := projectOf(t, w, refA); p.NodeID != "n1" || p.Status != registry.StatusActiveHealthy {
+				t.Fatalf("%s: project %+v", name, p)
+			}
+		}
+	})
+	t.Run("a node that does not take the leader for the leader is not asked to settle it", func(t *testing.T) {
+		w := newWorld(t)
+		w.fail("promote n2/", fmt.Errorf("%w: the caller is not the leader", cluster.ErrNotLeader), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if err == nil || mv.State != registry.MoveFailed {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		w.assertNever("start n1/")
+	})
+	t.Run("a failure in the middle may have promoted", func(t *testing.T) {
+		w := newWorld(t)
+		w.fail("promote n2/", errors.New("node n2: pg_promote: connection reset"), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if err == nil || mv.State != registry.MoveFailed {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		w.assertNever("start n1/")
+	})
+	t.Run("an unplanned failover has no position to wait for", func(t *testing.T) {
+		w := newWorld(t)
+		w.prim["n1/"+refA].healthy = false
+		w.fail("promote n2/", fmt.Errorf("%w: late", lifecycle.ErrReplayBehind), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveFailed {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		w.assertNever("start n1/")
+	})
+	t.Run("the node is at a higher epoch", func(t *testing.T) {
+		w := newWorld(t)
+		w.fail("promote n2/", fmt.Errorf("%w: the request is under epoch 1 and this node is at 3", placement.ErrStaleEpoch), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if !errors.Is(err, ErrEpochLost) || mv.State != registry.MoveFailed || !strings.Contains(err.Error(), "epoch 1") {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if n := w.count("promote n2/"); n != 1 {
+			t.Fatalf("a refusal for the epoch was repeated %d times", n)
+		}
+		w.assertNever("start n1/") // the node may be a primary under the other leader: the old one stays down
+	})
+}
+
+// engineLike plays the lifecycle engine as the orchestrator meets it: its project lock is not
+// reentrant, and its registration of a project with the shared services takes that lock and does
+// nothing for a project that is not active.
+type engineLike struct {
+	w       *world
+	mu      sync.Mutex
+	locks   map[string]*sync.Mutex
+	held    map[string]bool
+	skipped []string
+	locked  []string // refs registered while the move held their lock: a deadlock in the real engine
+	ensured []string
+}
+
+func newEngineLike(w *world) *engineLike {
+	return &engineLike{w: w, locks: map[string]*sync.Mutex{}, held: map[string]bool{}}
+}
+
+func (e *engineLike) lockOf(ref string) *sync.Mutex {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.locks[ref] == nil {
+		e.locks[ref] = &sync.Mutex{}
+	}
+	return e.locks[ref]
+}
+
+func (e *engineLike) Lock(_ context.Context, ref string) (func(), error) {
+	m := e.lockOf(ref)
+	m.Lock()
+	e.mu.Lock()
+	e.held[ref] = true
+	e.mu.Unlock()
+	return func() {
+		e.mu.Lock()
+		e.held[ref] = false
+		e.mu.Unlock()
+		m.Unlock()
+	}, nil
+}
+
+func (e *engineLike) isHeld(ref string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.held[ref]
+}
+
+func (e *engineLike) QuiesceTenant(_ context.Context, ref string) error {
+	return e.w.do("fleet.quiesce %s", ref)
+}
+
+func (e *engineLike) EnsureTenant(_ context.Context, ref string) error {
+	if err := e.w.do("fleet.ensure %s", ref); err != nil {
+		return err
+	}
+	m := e.lockOf(ref)
+	if !m.TryLock() {
+		e.mu.Lock()
+		e.locked = append(e.locked, ref)
+		e.mu.Unlock()
+		return errors.New("the project's lock is held: the real engine would wait for ever")
+	}
+	defer m.Unlock()
+	p, err := e.w.reg.GetProject(e.w.ctx, ref)
+	if err != nil {
+		return err
+	}
+	if p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy {
+		e.mu.Lock()
+		e.skipped = append(e.skipped, ref+" "+string(p.Status))
+		e.mu.Unlock()
+		return nil // its own operation registers it
+	}
+	e.mu.Lock()
+	e.ensured = append(e.ensured, ref)
+	e.mu.Unlock()
+	return nil
+}
+
+// The engine's registration takes the project's lock and skips a project that is not active, so a move
+// that held the lock across it would wait for itself, and one that called it while the project was
+// RESTARTING or COMING_UP would register nothing and say nothing.
+func TestTheMoveRegistersTheProjectWithTheEngineWhileItIsActiveAndNotUnderItsOwnLock(t *testing.T) {
+	t.Run("a project switchover", func(t *testing.T) {
+		w := newWorld(t)
+		eng := newEngineLike(w)
+		var heldAtDemote, heldAtEnsure bool
+		w.afterEvent("demote n1/", func() { heldAtDemote = eng.isHeld(refA) })
+		w.afterEvent("fleet.ensure "+refA, func() { heldAtEnsure = eng.isHeld(refA) })
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if len(eng.locked) != 0 || heldAtEnsure {
+			t.Fatalf("registered under the move's lock: %v (held %v)", eng.locked, heldAtEnsure)
+		}
+		if len(eng.skipped) != 0 || len(eng.ensured) != 1 || eng.ensured[0] != refA {
+			t.Fatalf("registered %v, skipped %v", eng.ensured, eng.skipped)
+		}
+		if !heldAtDemote || eng.isHeld(refA) {
+			t.Fatalf("the lock is taken again after the registration (%v) and let go at the end (%v)", heldAtDemote, eng.isHeld(refA))
+		}
+		if p := projectOf(t, w, refA); p.Status != registry.StatusActiveHealthy || p.NodeID != "n2" {
+			t.Fatalf("project: %+v", p)
+		}
+	})
+	t.Run("a project failover", func(t *testing.T) {
+		w := newWorld(t)
+		w.prim["n1/"+refA].healthy = false
+		eng := newEngineLike(w)
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		if mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if len(eng.locked) != 0 || len(eng.skipped) != 0 || len(eng.ensured) != 1 {
+			t.Fatalf("registered %v, skipped %v, under the lock %v", eng.ensured, eng.skipped, eng.locked)
+		}
+	})
+	t.Run("a switchover that is undone", func(t *testing.T) {
+		w := newWorld(t)
+		eng := newEngineLike(w)
+		w.fail("promote n2/", fmt.Errorf("%w: late", lifecycle.ErrReplayBehind), -1)
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if len(eng.locked) != 0 || len(eng.skipped) != 0 || len(eng.ensured) != 1 {
+			t.Fatalf("registered %v, skipped %v, under the lock %v", eng.ensured, eng.skipped, eng.locked)
+		}
+		if eng.isHeld(refA) {
+			t.Fatal("the lock outlives the move")
+		}
+	})
+	t.Run("a paused project is not registered", func(t *testing.T) {
+		w := newWorld(t)
+		must(t, w.reg.SetProjectStatus(w.ctx, refA, registry.StatusInactive))
+		w.prim["n1/"+refA] = &primState{}
+		eng := newEngineLike(w)
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		if mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if len(eng.ensured)+len(eng.skipped)+len(eng.locked) != 0 {
+			t.Fatalf("registered %v, skipped %v", eng.ensured, eng.skipped)
+		}
+		if p := projectOf(t, w, refA); p.Status != registry.StatusInactive {
+			t.Fatalf("project: %+v", p)
+		}
+	})
+	t.Run("a pause that got in while the move let go of the lock is kept", func(t *testing.T) {
+		w := newWorld(t)
+		eng := newEngineLike(w)
+		w.afterEvent("fleet.ensure "+refA, func() { must(t, w.reg.SetProjectStatus(w.ctx, refA, registry.StatusInactive)) })
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		if mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if p := projectOf(t, w, refA); p.Status != registry.StatusInactive {
+			t.Fatalf("the move overwrote a pause: %+v", p)
+		}
+	})
+}
+
+// A server move holds no project lock, and still registers a project only while it is active.
+func TestAServerMoveRegistersEachProjectWithTheEngineWhileItIsActive(t *testing.T) {
+	w := serverWorld(t)
+	eng := newEngineLike(w)
+	o := w.orch(func(d *Deps) { d.Fleet = eng })
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{})
+	if err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if len(eng.skipped) != 0 || len(eng.locked) != 0 || len(eng.ensured) != 2 {
+		t.Fatalf("registered %v, skipped %v", eng.ensured, eng.skipped)
+	}
+}
+
+// A paused project had its cluster stopped before the move. A switchover that is undone leaves it so:
+// it is not started, and its status comes back.
+func TestAnAbortedSwitchoverOfAPausedProjectDoesNotStartIt(t *testing.T) {
+	w := newWorld(t)
+	must(t, w.reg.SetProjectStatus(w.ctx, refA, registry.StatusInactive))
+	w.prim["n1/"+refA] = &primState{}
+	w.replay[idAN2] = "0/1000000" // the standby is far behind the cluster's last checkpoint
+	o := w.orch()
+	mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+	if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	w.assertNever("start n1/")
+	w.assertNever("fleet.ensure")
+	w.assertNever("promote")
+	if p := projectOf(t, w, refA); p.NodeID != "n1" || p.Status != registry.StatusInactive {
+		t.Fatalf("project: %+v", p)
+	}
+	if !hasStep(mv, "undo") {
+		t.Fatalf("steps %v", stepNames(mv))
+	}
+	// It moves once the standby has caught up.
+	w.replay[idAN2] = caughtUp(w.lsn[refA])
+	if mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("a new try: %+v, %v", mv, err)
+	}
+}
+
+// The answers that count as a refusal also come after the node has promoted (the restart on the canonical
+// port fails with an invalid state, say). The old primary starts again only while the node's instance
+// still is a standby that is up; otherwise it stays down, because two primaries are worse.
+func TestARefusalAfterThePromotionRanDoesNotStartTheOldPrimary(t *testing.T) {
+	for name, tc := range map[string]struct {
+		setup  func(w *world)
+		undone bool
+	}{
+		"the instance is still a standby": {setup: func(w *world) { w.fail("promote n2/", fmt.Errorf("%w: refused", placement.ErrNotHome), -1) }, undone: true},
+		"the instance promoted": {setup: func(w *world) {
+			w.fail("promote-after n2/"+idAN2, fmt.Errorf("%w: restarting on the canonical port", lifecycle.ErrInvalidState), -1)
+		}},
+		"the instance cannot be looked at": {setup: func(w *world) {
+			w.fail("promote n2/", fmt.Errorf("%w: refused", placement.ErrNotHome), -1)
+			w.afterEvent("promote n2/", func() { w.down["n2"] = true }) // the node stops answering after the refusal
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWorld(t)
+			tc.setup(w)
+			mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+			if err == nil {
+				t.Fatalf("move %+v", mv)
+			}
+			switch {
+			case tc.undone && (mv.State != registry.MoveAborted || !w.has("start n1/"+refA)):
+				t.Fatalf("move %+v, error %v\n%v", mv, err, w.snapshot())
+			case !tc.undone && (mv.State != registry.MoveFailed || w.has("start n1/")):
+				t.Fatalf("move %+v, error %v\n%v", mv, err, w.snapshot())
+			}
+		})
+	}
+}
+
+// The project is in the move for its whole length except while the shared services take it: after that it
+// shows RESTARTING again, so that what looks at the status and not at the lock still finds it moving.
+func TestTheProjectIsMovingAgainAfterTheSharedServicesTookIt(t *testing.T) {
+	w := newWorld(t)
+	var during, between registry.Status
+	w.afterEvent("fleet.ensure "+refA, func() { during = projectOf(t, w, refA).Status })
+	w.afterEvent("demote n1/", func() { between = projectOf(t, w, refA).Status })
+	if mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if during != registry.StatusActiveHealthy || between != registry.StatusRestarting {
+		t.Fatalf("status during the registration %s, after it %s", during, between)
+	}
+	if p := projectOf(t, w, refA); p.Status != registry.StatusActiveHealthy {
+		t.Fatalf("project: %+v", p)
 	}
 }

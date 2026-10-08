@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -188,5 +189,115 @@ func TestReadinessSaysAutomaticServerModeWaitsForProjectsWithoutAReplica(t *test
 	r, err := m.o.Readiness(m.ctx)
 	if err != nil || !strings.Contains(strings.Join(r.Notes, "\n"), "does not run while a project has no replica") {
 		t.Fatalf("notes %v, %v", r.Notes, err)
+	}
+}
+
+// A daemon whose wiring lacks an adapter runs a move that leaves Realtime and the shared services as
+// they were. That is said where it is built and where it is read, not discovered after a switchover.
+func TestAPortThatIsNotWiredIsLoggedAndShownInReadiness(t *testing.T) {
+	w := serverWorld(t)
+	var logged strings.Builder
+	o := w.orch(func(d *Deps) {
+		d.Fleet, d.LocalServices, d.Locks, d.Extra, d.Backups, d.Replicas = nil, nil, nil, nil, nil, nil
+		d.Log = slog.New(slog.NewTextHandler(&logged, nil))
+	})
+	for _, port := range []string{"Fleet", "LocalServices", "Locker", "ExtraChecks", "BaseBackups", "ReplicaSetup"} {
+		if !strings.Contains(logged.String(), "port="+port) {
+			t.Errorf("the missing %s is not logged:\n%s", port, logged.String())
+		}
+	}
+	if strings.Contains(logged.String(), "port=LocalPrimaries") || strings.Contains(logged.String(), "port=Takeover") {
+		t.Errorf("a port that is wired is logged as missing:\n%s", logged.String())
+	}
+	r, err := o.Readiness(w.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := strings.Join(r.Notes, "\n")
+	if !strings.Contains(notes, "Realtime and the pooler will not be re-registered") || !strings.Contains(notes, "shared services will keep running through a planned switchover") {
+		t.Fatalf("notes: %v", r.Notes)
+	}
+	if !r.Ready {
+		t.Fatalf("the move works without them, so readiness is not blocked: %v", r.Blockers)
+	}
+	// With them wired the notes are gone.
+	if r, _ = w.orch().Readiness(w.ctx); strings.Contains(strings.Join(r.Notes, "\n"), "re-registered") {
+		t.Fatalf("notes: %v", r.Notes)
+	}
+	var ports []string
+	for _, g := range w.orch().Gaps() {
+		ports = append(ports, g.Port)
+	}
+	if strings.Join(ports, ",") != "Locker,ExtraChecks" { // the test world wires the rest
+		t.Fatalf("gaps of the test world: %v", ports)
+	}
+}
+
+// ctxProvider is a fencer whose probe fails with the caller's context when it ends and passes otherwise.
+type ctxProvider struct {
+	*fakeProvider
+	calls int
+}
+
+func (p *ctxProvider) Probe(ctx context.Context) error {
+	p.calls++
+	return ctx.Err()
+}
+
+// An interrupted `supavise status`, or a request that timed out, ends the probe's context. That says
+// nothing about the fencer, and the next caller must not be told for a minute that the probe failed.
+func TestAProbeThatTheCallerCutShortIsNotRemembered(t *testing.T) {
+	w := serverWorld(t)
+	cp := &ctxProvider{fakeProvider: w.provider}
+	o := w.orch(func(d *Deps) { d.Provider = cp })
+	gone, cancel := context.WithCancel(w.ctx)
+	cancel()
+	if err := o.probe(gone); err == nil {
+		t.Fatal("a probe with a cancelled context passed")
+	}
+	if err := o.probe(w.ctx); err != nil || cp.calls != 2 {
+		t.Fatalf("the next caller: %v after %d probe(s)", err, cp.calls)
+	}
+	// What the fencer says is remembered, so that every status does not cost EC2 calls.
+	if err := o.probe(w.ctx); err != nil || cp.calls != 2 {
+		t.Fatalf("a repeated probe: %v after %d probe(s)", err, cp.calls)
+	}
+	r, err := o.Readiness(w.ctx)
+	if err != nil || strings.Contains(strings.Join(r.Blockers, "\n"), "fencer fails its probe") {
+		t.Fatalf("readiness after it: %+v, %v", r, err)
+	}
+}
+
+// The monitor's own context ends when the daemon stops: no verdict on the fencer, no alert.
+func TestTheMonitorDoesNotTurnAutomaticModeOffBecauseItsOwnContextEnded(t *testing.T) {
+	m := newMonitorRig(t, "server")
+	cp := &ctxProvider{fakeProvider: m.provider}
+	m.o.d.Provider = cp
+	gone, cancel := context.WithCancel(m.ctx)
+	cancel()
+	if reason := m.mon.arm(gone); reason != "" {
+		t.Fatalf("armed with a cancelled context: %q", reason)
+	}
+	for _, k := range m.alertKinds() {
+		if k == "failover_auto_off" {
+			t.Fatalf("alerts: %v", m.alerts)
+		}
+	}
+	if reason := m.mon.arm(m.ctx); reason != "" {
+		t.Fatalf("arm: %q", reason)
+	}
+}
+
+// After a failover the new leader has the old one beside it, fenced until it rejoins. That is a
+// cluster with no standby, and the readiness block says so instead of hiding.
+func TestReadinessOfALeaderWhoseOnlyOtherNodeIsFenced(t *testing.T) {
+	w := newWorld(t)
+	must(t, w.reg.SetNodeState(w.ctx, "n2", registry.NodeFenced))
+	r, err := w.orch().Readiness(w.ctx)
+	if err != nil {
+		t.Fatalf("a fenced node is still a node of the cluster: %v", err)
+	}
+	if r.Ready || !strings.Contains(strings.Join(r.Blockers, "\n"), "no other server holds a standby of the system cluster") {
+		t.Fatalf("readiness: %+v", r)
 	}
 }

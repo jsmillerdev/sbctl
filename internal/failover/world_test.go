@@ -39,6 +39,9 @@ type world struct {
 
 	// writable: the orchestrator's registry accepts writes.
 	writable bool
+	// frozen: the registry handle of this process stays read-only although the system cluster is
+	// promoted, as a daemon's does until it restarts in the role.
+	frozen bool
 	// down: nodes that do not answer anything.
 	down map[string]bool
 	// partitioned: nodes that do not answer pings and peer calls but still run (a partition).
@@ -416,7 +419,7 @@ type gatedStore struct {
 }
 
 func (g *gatedStore) gate(what string) error {
-	if !g.w.writable {
+	if !g.w.writable || g.w.frozen {
 		return fmt.Errorf("%s: %w", what, registry.ErrReadOnly)
 	}
 	return g.w.do("registry.%s", what)
@@ -476,7 +479,7 @@ func (g *gatedStore) CreateMove(ctx context.Context, m *registry.Move) error {
 }
 
 func (g *gatedStore) AppendMoveStep(ctx context.Context, id int64, s registry.MoveStep) error {
-	if !g.w.writable {
+	if !g.w.writable || g.w.frozen {
 		return registry.ErrReadOnly
 	}
 	return g.Registry.AppendMoveStep(ctx, id, s)
@@ -870,7 +873,12 @@ func (p *fakeProvider) PeerState(context.Context, registry.Node) (PeerState, err
 	return p.state, nil
 }
 
-var _ Cloud = (*fakeProvider)(nil)
+func (p *fakeProvider) ProbeTakeover(context.Context) error { return p.w.do("provider.probetakeover") }
+
+var (
+	_ Cloud         = (*fakeProvider)(nil)
+	_ AddressProber = (*fakeProvider)(nil)
+)
 
 // check finds the named check of a plan.
 func findCheck(t *testing.T, pl *Plan, name string) Check {

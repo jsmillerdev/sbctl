@@ -141,10 +141,17 @@ func replacedBy(source string, epoch int64, leader string, localEpoch int64, loc
 // I1): the membership layer calls it when a ping, a peer call or the leader marker shows that the
 // cluster is at a higher epoch, or that another node leads at this node's epoch. source names where
 // it was seen ("peer standby"). A node that does not lead, or that saw nothing newer than its own
-// registry, is left alone and false returned; otherwise the node fences itself exactly as at boot:
+// registry, is left alone and false returned, and so is a leader that stopped for the switchover whose
+// node and epoch it was told of; otherwise the node fences itself exactly as at boot:
 // the record is written, the primaries stop, and the alert goes out.
 func (o *Orchestrator) FenceOnHigherEpoch(ctx context.Context, source string, epoch int64, leader string) (bool, error) {
 	if !o.d.Members.IsLeader() {
+		return false, nil
+	}
+	// The leader that stopped for a switchover is told by the survivor's first ping and by the marker
+	// that the survivor leads at the next epoch. That is the switchover it stopped for, and it is
+	// demoted in place, not fenced.
+	if rec, err := o.currentQuiesce(); err == nil && rec != nil && rec.To == leader && rec.Epoch == epoch {
 		return false, nil
 	}
 	localLeader := o.self().ID
@@ -164,11 +171,11 @@ func (o *Orchestrator) FenceOnHigherEpoch(ctx context.Context, source string, ep
 // primaries running: they are stopped and their launchers removed all the same.
 func (o *Orchestrator) fenceSelf(ctx context.Context, res BootResult, when string) error {
 	var errs []error
-	if err := fenced.WriteNode(o.d.Cfg.Paths(), fenced.Record{Epoch: res.Epoch, Leader: res.Leader, Reason: res.Reason, At: o.d.Now().UTC()}); err != nil {
+	if err := fenced.WriteNode(o.d.Cfg.Paths(), o.nodeRecord(res.Epoch, res.Leader, res.Reason)); err != nil {
 		errs = append(errs, fmt.Errorf("failover: recording that this node is fenced: %w", err))
 	}
 	if o.d.LocalPrimaries != nil {
-		if _, err := o.fencePrimaries(context.WithoutCancel(ctx), o.primaryRefs(ctx), func() error { return nil }); err != nil {
+		if _, err := o.fencePrimaries(context.WithoutCancel(ctx), o.primaryRefs(ctx), func() error { return nil }, true); err != nil {
 			errs = append(errs, fmt.Errorf("failover: this node is fenced, but a primary could not be stopped: %w", err))
 		}
 	}

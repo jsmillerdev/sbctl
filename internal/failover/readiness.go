@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,17 +22,32 @@ type probeCache struct {
 	err error
 }
 
-// probe runs the provider's probe, at most once per probeTTL.
-func (o *Orchestrator) probe(ctx context.Context) error {
-	c := &o.probes
+// run calls fn, at most once per probeTTL, and remembers its answer.
+func (c *probeCache) run(ctx context.Context, now func() time.Time, fn func(context.Context) error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.at.IsZero() && o.d.Now().Sub(c.at) < probeTTL {
+	if !c.at.IsZero() && now().Sub(c.at) < probeTTL {
 		return c.err
 	}
-	c.err = o.d.Provider.Probe(ctx)
-	c.at = o.d.Now()
+	err := fn(ctx)
+	if err != nil && ctx.Err() != nil {
+		// The caller gave up (an interrupted status, a request that timed out): that says nothing about
+		// the fencer, and the next caller must not be told for a minute that the probe failed.
+		return err
+	}
+	c.err, c.at = err, now()
 	return c.err
+}
+
+// probe runs the provider's probe, at most once per probeTTL.
+func (o *Orchestrator) probe(ctx context.Context) error {
+	return o.probes.run(ctx, o.d.Now, o.d.Provider.Probe)
+}
+
+// probeTakeover asks the provider whether this node can take the service address over, at most once
+// per probeTTL. Only the automatic mode asks: a failover by hand hands the address to the operator.
+func (o *Orchestrator) probeTakeover(ctx context.Context, ap AddressProber) error {
+	return o.takeovers.run(ctx, o.d.Now, ap.ProbeTakeover)
 }
 
 // Readiness reports whether a server failover would be accepted now, for the node that would
@@ -51,13 +67,16 @@ func (o *Orchestrator) Readiness(ctx context.Context) (Readiness, error) {
 	if err != nil {
 		return r, fmt.Errorf("failover: listing nodes: %w", err)
 	}
-	active := 0
+	// A node that is fenced, or joining, still belongs to the cluster: after a failover the new leader
+	// has the fenced one beside it, and its readiness is the story of why it has no standby. Only a
+	// server with no other node that has not left is on its own.
+	members := 0
 	for _, n := range nodes {
-		if n.State == registry.NodeActive {
-			active++
+		if n.State != registry.NodeLeft {
+			members++
 		}
 	}
-	if active < 2 {
+	if members < 2 {
 		return r, ErrNoCluster
 	}
 
@@ -72,6 +91,15 @@ func (o *Orchestrator) Readiness(ctx context.Context) (Readiness, error) {
 	r.EpochMarker = o.markerStatus(ctx)
 	if reason := o.autoOff(); reason != "" {
 		r.Notes = append(r.Notes, "automatic failover is off: "+reason)
+	}
+	// A move works without these and leaves the services they serve broken or untouched.
+	for _, g := range o.Gaps() {
+		switch g.Port {
+		case "Fleet":
+			r.Notes = append(r.Notes, "Realtime and the pooler will not be re-registered after a move: this build has no shared-service adapter for it")
+		case "LocalServices":
+			r.Notes = append(r.Notes, "the shared services will keep running through a planned switchover: this build has no adapter that stops and starts them")
+		}
 	}
 
 	to, ok := o.candidate(ctx, nodes)
@@ -133,6 +161,9 @@ func (o *Orchestrator) markerStatus(ctx context.Context) string {
 		return "none: no leader marker store in this build or backup mode"
 	}
 	if _, err := o.d.Marker.ReadLeaderMarker(ctx); err != nil {
+		if strings.Contains(err.Error(), "malformed") {
+			return "marker unreadable (an operator who has checked which node leads deletes _node/leader.json): " + err.Error()
+		}
 		return "store not reachable: " + err.Error()
 	}
 	return "store reachable"

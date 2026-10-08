@@ -8,8 +8,10 @@
 //	PLANNED                     1 for a switchover, 0 for a failover
 //
 // A fence command must exit 0 only when the old node can no longer write; anything else means no
-// promotion. The environment is the daemon's own plus these variables. No secret is passed: a
-// command that needs one reads it from a file it owns.
+// promotion. The environment is a short list of the daemon's own (PATH, HOME, LANG, LC_ALL, TZ,
+// TMPDIR, AWS_REGION and AWS_DEFAULT_REGION) plus these variables. The daemon's environment may hold
+// secrets, such as the master key, and a command is the operator's script, not the daemon: nothing
+// else is passed, and a command that needs a secret reads it from a file it owns.
 package command
 
 import (
@@ -148,7 +150,7 @@ var waitDelay = 5 * time.Second
 // command started too.
 func shell(ctx context.Context, command string, env []string) (string, error) {
 	cmd := exec.Command("/bin/sh", "-c", command)
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(Inherited(os.Environ()), env...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = waitDelay
 	var out bytes.Buffer
@@ -169,4 +171,22 @@ func shell(ctx context.Context, command string, env []string) (string, error) {
 		<-done
 		return out.String(), ctx.Err()
 	}
+}
+
+// inherited are the variables of the daemon's environment a command gets: where to find programs and
+// the home directory, the locale, and the region the cloud tools ask about.
+var inherited = map[string]bool{
+	"PATH": true, "HOME": true, "LANG": true, "LC_ALL": true, "TZ": true, "TMPDIR": true,
+	"AWS_REGION": true, "AWS_DEFAULT_REGION": true,
+}
+
+// Inherited picks the variables of environ that a command gets, in their order.
+func Inherited(environ []string) []string {
+	var out []string
+	for _, kv := range environ {
+		if name, _, ok := strings.Cut(kv, "="); ok && inherited[name] {
+			out = append(out, kv)
+		}
+	}
+	return out
 }

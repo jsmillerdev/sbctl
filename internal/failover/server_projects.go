@@ -125,7 +125,13 @@ func (o *Orchestrator) serverProject(ctx context.Context, j *journal, run *serve
 		}); err != nil {
 			return err
 		}
-		if err := j.step(ctx, pfx+"tenant", func() (string, error) { return "", o.ensureTenant(ctx, ref) }); err != nil {
+		if err := j.step(ctx, pfx+"tenant", func() (string, error) {
+			// The engine registers a project with the shared services only while it is active.
+			if err := st.SetProjectStatus(ctx, ref, registry.StatusActiveHealthy); err != nil {
+				o.d.Log.Warn("could not set the project's status", "ref", ref, "error", err)
+			}
+			return "", o.ensureTenant(ctx, ref)
+		}); err != nil {
 			return err
 		}
 	}
@@ -166,9 +172,46 @@ func (o *Orchestrator) seedFromArchive(ctx context.Context, run *serverRun, ch p
 	}
 }
 
+// nodeWait bounds how long a move waits for the old leader to answer again, and nodePoll how often it
+// asks. A variable so that tests can shorten it.
+var (
+	nodeWait = 3 * time.Minute
+	nodePoll = 3 * time.Second
+)
+
+// waitForNode waits until node answers over the mesh and, when epoch is set, reports that epoch and
+// leader: its copy of the registry has caught up with the move. The old leader of a switchover is
+// down for the daemon's restart after its system cluster became a standby, and its copy of the
+// registry trails the new leader's by a moment; the demotion of its other clusters needs both.
+func (o *Orchestrator) waitForNode(ctx context.Context, n registry.Node, epoch int64, leader string) error {
+	if o.d.Peers == nil {
+		return nil
+	}
+	deadline := o.d.Now().Add(nodeWait)
+	var last string
+	for {
+		p, err := o.d.Peers.Ping(ctx, n.ID)
+		switch {
+		case err != nil:
+			last = err.Error()
+		case epoch > 0 && (p.Epoch < epoch || leader != "" && p.Leader != leader):
+			last = fmt.Sprintf("it answers and still reports epoch %d under %q; its daemon restarts by itself once its system cluster is a standby, and if it does not, restart supavise on it and run supavise failover --resume", p.Epoch, p.Leader)
+		default:
+			return nil
+		}
+		if !o.d.Now().Before(deadline) {
+			return fmt.Errorf("%s does not answer as a follower of the new leader after %s: %s", n.Name, nodeWait, last)
+		}
+		if err := o.wait(ctx, nodePoll); err != nil {
+			return err
+		}
+	}
+}
+
 // demoteOldLeader turns the clusters the old leader stopped into replicas of their new homes, in
 // place: the system cluster first, because the node needs its registry back to render the
-// others. It returns the failures.
+// others. The old leader's daemon restarts once its system cluster is a standby, so the others wait
+// until it answers again with the new leader's epoch. It returns the failures.
 func (o *Orchestrator) demoteOldLeader(ctx context.Context, j *journal, run *serverRun, rec serverPlanRecord, timeout int) []string {
 	var failed []string
 	demote := func(ref, identifier string) {
@@ -182,18 +225,29 @@ func (o *Orchestrator) demoteOldLeader(ctx context.Context, j *journal, run *ser
 			failed = append(failed, fmt.Sprintf("demote %s: %v", ref, err))
 		}
 	}
+	if !j.has("demote:" + config.SystemRef) {
+		if err := o.waitForNode(ctx, run.from, 0, ""); err != nil {
+			return []string{fmt.Sprintf("demote %s: %v", config.SystemRef, err)}
+		}
+	}
 	demote(config.SystemRef, j.detail("system-homed"))
 	if len(failed) > 0 { // the node's registry is not back: the rest would only wait for it
 		return failed
 	}
+	var todo []projectRecord
 	for _, ch := range rec.Projects {
-		if !j.has("p:" + ch.Ref + ":done") {
-			continue
+		if j.has("p:"+ch.Ref+":done") && !j.has("demote:"+ch.Ref) && !j.has("reseed:"+ch.Ref) {
+			todo = append(todo, ch)
 		}
+	}
+	if len(todo) > 0 {
+		if err := o.waitForNode(ctx, run.from, run.epoch, run.to.ID); err != nil {
+			return []string{fmt.Sprintf("demote the projects of %s: %v", run.from.Name, err)}
+		}
+	}
+	for _, ch := range todo {
 		if ch.Restore {
-			if step := "reseed:" + ch.Ref; !j.has(step) {
-				_ = j.record(ctx, step, o.reseedOld(ctx, run.from, ch.Ref, run.epoch))
-			}
+			_ = j.record(ctx, "reseed:"+ch.Ref, o.reseedOld(ctx, run.from, ch.Ref, run.epoch))
 			continue
 		}
 		demote(ch.Ref, j.detail("p:"+ch.Ref+":homed"))

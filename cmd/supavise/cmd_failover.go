@@ -26,6 +26,7 @@ type failoverClient interface {
 	PlanServer(ctx context.Context, o failover.ServerOptions) (*failover.Plan, error)
 	RunProject(ctx context.Context, o failover.ProjectOptions, onStep func(registry.MoveStep)) (*registry.Move, error)
 	RunServer(ctx context.Context, o failover.ServerOptions, onStep func(registry.MoveStep)) (*registry.Move, error)
+	Follow(ctx context.Context, epoch int64, onStep func(registry.MoveStep)) (*registry.Move, error)
 }
 
 // newFailoverClient reaches the daemon of this node. A variable so that tests can use a fake.
@@ -45,8 +46,15 @@ promotes the system cluster and then every project's replica, and loses at most 
 
 Run it on the node that should lead; a switchover can also be started on the leader with --to,
 which has that node run it. --dry-run prints each precondition. State is kept so that --resume
-continues a run that stopped. A project with no replica is refused unless --restore-missing, which builds
-its standby from the WAL archive (data loss up to archive_timeout).`,
+continues a run that stopped, and --abort discards one that stopped before the leader marker was
+written (it starts the old leader again if the switchover had stopped it); a run that went further
+only continues. A project with no replica is refused unless --restore-missing, which builds
+its standby from the WAL archive (data loss up to archive_timeout).
+
+The daemon of the node that takes over restarts once when its system cluster is promoted, because that
+makes it the leader. The move is not over then: the daemon that starts continues it, and this command
+waits for it and goes on printing the steps. A node that stops leading restarts its daemon the same way
+when its own system cluster becomes a standby.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runServerFailover(cmd, o) },
 	}
@@ -55,6 +63,7 @@ its standby from the WAL archive (data loss up to archive_timeout).`,
 	f.BoolVar(&o.Force, "force", false, "go on although a precondition that is not marked hard fails: a replica that lags or is not healthy, nodes on different releases, an unreachable epoch-marker store")
 	f.BoolVar(&o.DryRun, "dry-run", false, "print the preconditions and what would happen, and change nothing")
 	f.BoolVar(&o.Resume, "resume", false, "continue the run that stopped")
+	f.BoolVar(&o.Abort, "abort", false, "discard the run that stopped before the leader marker was written, and start the old leader again if it was stopped for a switchover")
 	f.BoolVar(&o.RestoreMissing, "restore-missing", false, "seed a project that has no replica from the archive")
 	f.BoolVar(&o.OldPrimaryIsDown, "old-primary-is-down", false, "assert that the old leader is down, when no fence is configured")
 	f.BoolVarP(&o.Yes, "yes", "y", false, "do not ask for confirmation")
@@ -73,6 +82,9 @@ func runServerFailover(cmd *cobra.Command, o failover.ServerOptions) error {
 	}
 	c := newFailoverClient(cfg)
 	out := cmd.OutOrStdout()
+	if o.Abort {
+		return abortServerFailover(ctx, out, c, o)
+	}
 	plan, err := c.PlanServer(ctx, o)
 	if err != nil {
 		return planError(err)
@@ -98,8 +110,44 @@ func runServerFailover(cmd *cobra.Command, o failover.ServerOptions) error {
 	if !o.Resume { // the daemon refuses to run a plan other than the one that was shown
 		o.ExpectKind, o.ExpectEpoch = plan.Kind, plan.Epoch
 	}
-	mv, err := c.RunServer(ctx, o, stepPrinter(out))
+	show := printOnce(stepPrinter(out))
+	mv, err := c.RunServer(ctx, o, show)
+	if errors.Is(err, failover.ErrRestarting) || errors.Is(err, failover.ErrStreamClosed) {
+		mv, err = followRestart(ctx, out, c, plan.Epoch, mv, show)
+	}
 	return finishMove(out, mv, err)
+}
+
+// followRestart goes on with a server move whose connection the daemon's restart cut: the daemon that
+// starts continues the move (the node that leads now) or has the log from the leader (a node that
+// follows now), and the steps it records are printed from where they stopped: the daemon sends the log
+// from its start, and what the lost run printed is not printed again (show).
+func followRestart(ctx context.Context, out io.Writer, c failoverClient, epoch int64, mv *registry.Move, show func(registry.MoveStep)) (*registry.Move, error) {
+	fmt.Fprintln(out, "\nThe daemon of this node restarts in the role the move gives it. Waiting for it, and following the move from there.")
+	next, err := c.Follow(ctx, epoch, show)
+	switch {
+	case errors.Is(err, failover.ErrNothingRunning):
+		return mv, errors.New("the daemon restarted and has no record of this move. The move goes on where the cluster leads: supavise status shows the leader and the cluster, and supavise failover --resume on the node it goes to continues a move that stopped")
+	case next == nil && err != nil:
+		return mv, err
+	}
+	return next, err
+}
+
+// abortServerFailover discards the run that stopped early. It plans nothing: there is no move to
+// plan, only the unfinished one to take back.
+func abortServerFailover(ctx context.Context, out io.Writer, c failoverClient, o failover.ServerOptions) error {
+	if o.Resume || o.DryRun || o.Force || o.RestoreMissing || o.OldPrimaryIsDown || o.To != "" {
+		return errors.New("--abort discards the unfinished run and takes no other option")
+	}
+	mv, err := c.RunServer(ctx, o, stepPrinter(out))
+	if err != nil {
+		return err
+	}
+	if mv != nil {
+		fmt.Fprintf(out, "\nAborted: the %s of the server from %s to %s was discarded after %s; nothing was promoted.\n", mv.Kind, mv.FromNode, mv.ToNode, lastStepName(mv))
+	}
+	return nil
 }
 
 // planError words an error of the plan request.
@@ -208,6 +256,18 @@ func stepPrinter(w io.Writer) func(registry.MoveStep) {
 			line += ": " + detail
 		}
 		fmt.Fprintln(w, line)
+	}
+}
+
+// printOnce passes on the first step of each name. The steps of one move have names of their own, and
+// a step the stream printed comes again from the log when the CLI follows the move.
+func printOnce(show func(registry.MoveStep)) func(registry.MoveStep) {
+	seen := map[string]bool{}
+	return func(s registry.MoveStep) {
+		if !seen[s.Name] {
+			seen[s.Name] = true
+			show(s)
+		}
 	}
 }
 

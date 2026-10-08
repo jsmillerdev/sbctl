@@ -12,8 +12,10 @@ import (
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
+	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -42,12 +44,14 @@ func (o *Orchestrator) FailoverProject(ctx context.Context, opts ProjectOptions)
 
 	// The project's lock first, and the plan under it: a pause or a resume cannot change the status
 	// the move records, and a move that cannot get the lock leaves no row behind.
+	hold := &lockHold{o: o, ref: opts.Ref}
 	if !opts.DryRun {
 		unlock, err := o.lockProject(ctx, opts.Ref)
 		if err != nil {
 			return nil, err
 		}
-		defer unlock()
+		hold.unlock = unlock
+		defer hold.release()
 	}
 	pl, run, err := o.planProject(ctx, opts)
 	if err != nil {
@@ -88,7 +92,7 @@ func (o *Orchestrator) FailoverProject(ctx context.Context, opts ProjectOptions)
 
 	o.announce(ctx, alerts.KindFailoverStarted, alerts.SeverityInfo, j.snapshot(),
 		fmt.Sprintf("Moving project %s from %s to %s.", run.project.Ref, run.from.Name, run.to.Name))
-	err = o.projectSteps(ctx, j, run, begin, timeoutSeconds(o.conf().StopTimeout()))
+	err = o.projectSteps(ctx, j, run, begin, timeoutSeconds(o.conf().StopTimeout()), hold)
 	return o.endMove(ctx, j, run.project.Ref, err)
 }
 
@@ -146,6 +150,13 @@ func timeoutSeconds(d time.Duration) int { return int(d / time.Second) }
 
 // endMove records the outcome of a move in its log and as an alert, and returns the move.
 func (o *Orchestrator) endMove(ctx context.Context, j *journal, ref string, runErr error) (*registry.Move, error) {
+	if runErr != nil && interrupted(ctx, j, runErr) {
+		// The daemon is stopping for the role the promotion gave its node. The move stays running in
+		// its log, no alert says it failed, and the daemon that starts continues it.
+		o.d.Log.Info("the daemon stops in the middle of a server move; the daemon that starts continues it", "cause", runErr)
+		mv := j.snapshot()
+		return &mv, fmt.Errorf("%w (%w)", ErrRestarting, runErr)
+	}
 	var abort *abortError
 	state, text := registry.MoveDone, ""
 	switch {
@@ -227,7 +238,7 @@ func (o *Orchestrator) announce(ctx context.Context, kind, severity string, mv r
 }
 
 // projectSteps runs the steps of a project move that are not in the log yet.
-func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projectRun, begin projectBegin, timeout int) (err error) {
+func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projectRun, begin projectBegin, timeout int, hold *lockHold) (err error) {
 	ref := run.project.Ref
 	paused := begin.Status == registry.StatusInactive
 	st := o.store()
@@ -259,7 +270,7 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 		}); err != nil {
 			var abort *abortError
 			if errors.As(err, &abort) {
-				return o.undoSwitchover(ctx, j, run, begin, abort)
+				return o.undoSwitchover(ctx, j, run, begin, abort, hold)
 			}
 			return err
 		}
@@ -279,7 +290,7 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 	}); err != nil {
 		var abort *abortError
 		if errors.As(err, &abort) && run.planned {
-			return o.undoSwitchover(ctx, j, run, begin, abort)
+			return o.undoSwitchover(ctx, j, run, begin, abort, hold)
 		}
 		return err
 	}
@@ -307,7 +318,18 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 		}); err != nil {
 			return err
 		}
-		if err := j.step(ctx, "tenant", func() (string, error) { return "", o.ensureTenant(ctx, ref) }); err != nil {
+		if err := j.step(ctx, "tenant", func() (string, error) {
+			// The engine registers a project only while it is active, and takes the project's lock to do
+			// it: the project is active again, and the move lets go of the lock meanwhile.
+			if o.d.Fleet == nil {
+				return "", nil
+			}
+			setStatus(statusAfter(begin.Status))
+			err := hold.without(ctx, func() error { return o.ensureTenant(ctx, ref) })
+			// The lock is held again: the project is in the move again, unless a pause or a delete got in.
+			o.restarting(ctx, ref)
+			return "", err
+		}); err != nil {
 			return err
 		}
 	}
@@ -328,8 +350,39 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 			return err
 		}
 	}
-	setStatus(statusAfter(begin.Status))
+	o.settle(ctx, ref, statusAfter(begin.Status))
 	return nil
+}
+
+// restarting shows the project as moving again after the registration with the shared services, which
+// ran with the project active and its lock let go. A project that something else changed meanwhile (a
+// pause, say) keeps what that did.
+func (o *Orchestrator) restarting(ctx context.Context, ref string) {
+	st := o.store()
+	if p, err := st.GetProject(ctx, ref); err != nil || !movable(p.Status) {
+		return
+	}
+	if err := st.SetProjectStatus(ctx, ref, registry.StatusRestarting); err != nil {
+		o.d.Log.Warn("could not set the project's status", "ref", ref, "status", registry.StatusRestarting, "error", err)
+	}
+}
+
+// settle gives the project the status the move ends with, unless something else changed it while the
+// move let go of the lock: a project that was paused meanwhile keeps what that did.
+func (o *Orchestrator) settle(ctx context.Context, ref string, s registry.Status) {
+	st := o.store()
+	if p, err := st.GetProject(ctx, ref); err == nil && !movable(p.Status) {
+		return
+	}
+	if err := st.SetProjectStatus(ctx, ref, s); err != nil {
+		o.d.Log.Warn("could not set the project's status", "ref", ref, "status", s, "error", err)
+	}
+}
+
+// movable reports whether the status is one a move leaves behind or sets: the move's own RESTARTING,
+// and the active ones it gives back.
+func movable(s registry.Status) bool {
+	return s == registry.StatusRestarting || s == registry.StatusActiveHealthy || s == registry.StatusActiveUnhealthy
 }
 
 // statusAfter is the status a project gets back once its move is over: paused stays paused, and
@@ -363,8 +416,7 @@ type promoteArgs struct {
 	Drain bool
 }
 
-// promoteReplica promotes the replica identifier on node. It does nothing when the instance is
-// primary already (a resume after a crash between the promotion and its record).
+// promoteReplica promotes the replica identifier on node.
 //
 // A promotion that waits for an LSN waits for it here first, before the node is asked to promote
 // anything. A standby that does not get past the position in time is an abortError: nothing was
@@ -372,9 +424,14 @@ type promoteArgs struct {
 // from the promotion itself says nothing about whether it happened (the node may still be inside
 // pg_promote or its restart when the call fails), so it is returned as it is and the caller leaves
 // the old primary stopped: two primaries are worse than a move that waits for --resume.
+//
+// An instance that is not in recovery any more is not taken for done, and no position is waited for
+// (a primary has no replay position): the node is asked again. Its promotion is repeatable, and
+// finishes what an earlier try left, which may be the restart on the canonical port: the daemon of a
+// node whose system cluster is promoted restarts in the middle of the promotion and cuts it off.
 func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, identifier string, a promoteArgs) (string, error) {
 	if obs, err := o.d.Instances.Observe(ctx, node.ID, identifier); err == nil && !obs.InRecovery && obs.PostgresUp {
-		return "already primary on " + node.Name, nil
+		a.WaitLSN = ""
 	}
 	if a.WaitLSN != "" {
 		if err := o.waitReplayed(ctx, node.ID, identifier, a.WaitLSN); err != nil {
@@ -389,10 +446,33 @@ func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, i
 		_, err := o.d.Instances.Do(ctx, node.ID, identifier, peerapi.ActionPromote, req)
 		return err
 	})
-	if err != nil {
-		return "", fmt.Errorf("promoting %s on %s: %w", identifier, node.Name, err)
+	switch {
+	case err == nil:
+		return "primary on " + node.Name, nil
+	case errors.Is(err, placement.ErrStaleEpoch):
+		// The node is at a higher epoch than this move: a leader that was not replaced would not be.
+		// The old primary stays down; the leader that holds the epoch decides about it.
+		return "", fmt.Errorf("%w: promoting %s on %s was refused: %v", ErrEpochLost, identifier, node.Name, err)
+	case a.WaitLSN != "" && errors.Is(err, lifecycle.ErrReplayBehind):
+		// The node waits for the position before it writes anything (promote.ok comes after the
+		// wait), so this answer says the same as the wait above: nothing was promoted.
+		return "", &abortError{cause: fmt.Errorf("%w: %s on %s: %v", ErrReplayBehind, identifier, node.Name, err)}
+	case a.WaitLSN != "" && refusedByTheNode(err) && !errors.Is(err, cluster.ErrNotLeader) && o.stillStandby(ctx, node.ID, identifier):
+		// A refusal is an answer before the node changed anything (the project is not homed there, the
+		// node is fenced, the cluster is no standby): the old primary, stopped for this switchover, starts
+		// again. A node that does not take this leader for the leader is not asked to settle it: the
+		// leadership may be what is in doubt. The same answers can come after pg_promote ran (the restart
+		// on the canonical port can fail with an invalid state), so the instance is looked at: the move is
+		// undone only while it is a standby that is up, and any other look leaves the old primary stopped.
+		return "", &abortError{cause: fmt.Errorf("promoting %s on %s was refused, so nothing was promoted: %w", identifier, node.Name, err)}
 	}
-	return "primary on " + node.Name, nil
+	return "", fmt.Errorf("promoting %s on %s: %w", identifier, node.Name, err)
+}
+
+// stillStandby reports whether the instance is up and in recovery, which a promotion that ran is not.
+func (o *Orchestrator) stillStandby(ctx context.Context, node, identifier string) bool {
+	obs, err := o.d.Instances.Observe(ctx, node, identifier)
+	return err == nil && obs.PostgresUp && obs.InRecovery
 }
 
 // whileTheNodeLearnsWhoLeads runs a call to another node and repeats it while the node refuses it
@@ -420,23 +500,34 @@ func (o *Orchestrator) whileTheNodeLearnsWhoLeads(ctx context.Context, call func
 // raw 403 of the mesh or as the cluster.ErrNotLeader that the placement layer turns it into.
 func notYetLeader(err error) bool {
 	var re *mesh.RemoteError
-	return errors.Is(err, cluster.ErrNotLeader) || errors.As(err, &re) && re.Status == http.StatusForbidden
+	return errors.Is(err, cluster.ErrNotLeader) || errors.As(err, &re) && (re.Status == http.StatusForbidden || re.Code == "not_leader")
 }
 
 // undoSwitchover puts a switchover back that stopped before the promotion: the old primary starts
 // again, the shared services take the project back, and the project gets its status. The move ends
-// aborted. If the old primary does not start, the project is down and the move says so.
-func (o *Orchestrator) undoSwitchover(ctx context.Context, j *journal, run *projectRun, begin projectBegin, abort *abortError) error {
+// aborted. If the old primary does not start, the project is down and the move says so. A project that
+// was paused had its cluster stopped before the move and has it stopped after: only its status comes back.
+func (o *Orchestrator) undoSwitchover(ctx context.Context, j *journal, run *projectRun, begin projectBegin, abort *abortError, hold *lockHold) error {
 	ref := run.project.Ref
-	if err := o.d.Primaries.Start(ctx, run.from.ID, ref); err != nil {
-		_ = o.store().SetProjectStatus(ctx, ref, registry.StatusActiveUnhealthy)
-		return fmt.Errorf("%w; starting the old primary on %s again also failed: %v", abort.cause, run.from.Name, err)
+	paused := begin.Status == registry.StatusInactive
+	if !paused {
+		if err := o.d.Primaries.Start(ctx, run.from.ID, ref); err != nil {
+			_ = o.store().SetProjectStatus(ctx, ref, registry.StatusActiveUnhealthy)
+			return fmt.Errorf("%w; starting the old primary on %s again also failed: %v", abort.cause, run.from.Name, err)
+		}
 	}
-	if err := o.ensureTenant(ctx, ref); err != nil {
-		o.d.Log.Warn("could not register the project with the shared services again", "ref", ref, "error", err)
-	}
+	// Active again first: the engine registers a project with the shared services only while it is.
 	_ = o.store().SetProjectStatus(ctx, ref, statusAfter(begin.Status))
-	_ = j.record(ctx, "undo", "the old primary on "+run.from.Name+" runs again")
+	if !paused && o.d.Fleet != nil {
+		if err := hold.without(ctx, func() error { return o.ensureTenant(ctx, ref) }); err != nil {
+			o.d.Log.Warn("could not register the project with the shared services again", "ref", ref, "error", err)
+		}
+	}
+	if paused {
+		_ = j.record(ctx, "undo", "the project stays paused on "+run.from.Name)
+	} else {
+		_ = j.record(ctx, "undo", "the old primary on "+run.from.Name+" runs again")
+	}
 	return &abortError{cause: abort.cause}
 }
 
@@ -536,15 +627,62 @@ func newID6() string {
 	return string(b[:])
 }
 
+// lockHold is the project's lock as a move holds it, released once whatever happens.
+type lockHold struct {
+	o      *Orchestrator
+	ref    string
+	unlock func()
+}
+
+func (h *lockHold) release() {
+	if h != nil && h.unlock != nil {
+		h.unlock()
+		h.unlock = nil
+	}
+}
+
+// without runs fn with the project's lock let go and takes it again after. The engine's registration
+// of a project with the shared services takes the same lock, which is not reentrant. The project is
+// active then, not RESTARTING, so what else wants the lock finds it as it finds any active project.
+func (h *lockHold) without(ctx context.Context, fn func() error) error {
+	if h == nil || h.unlock == nil {
+		return fn()
+	}
+	h.release()
+	err := fn()
+	unlock, lerr := h.o.lockProject(ctx, h.ref)
+	if lerr != nil {
+		return errors.Join(err, fmt.Errorf("taking the project's lock again: %w", lerr))
+	}
+	h.unlock = unlock
+	return err
+}
+
+// tenantAttempts and tenantWait bound the tries to register a project with the shared services. A
+// node that has just become the leader starts them while the move goes on, so the first try can meet
+// a service that is not up yet.
+const (
+	tenantAttempts = 4
+	tenantWait     = 5 * time.Second
+)
+
 // ensureTenant registers the project with the shared services again at its new home.
 func (o *Orchestrator) ensureTenant(ctx context.Context, ref string) error {
 	if o.d.Fleet == nil {
 		return nil
 	}
-	if err := o.d.Fleet.EnsureTenant(ctx, ref); err != nil {
-		return fmt.Errorf("registering %s with the shared services: %w", ref, err)
+	var err error
+	for attempt := 0; attempt < tenantAttempts; attempt++ {
+		if attempt > 0 {
+			if werr := o.wait(ctx, tenantWait); werr != nil {
+				return werr
+			}
+		}
+		if err = o.d.Fleet.EnsureTenant(ctx, ref); err == nil {
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("registering %s with the shared services: %w", ref, err)
 }
 
 // demoteOld turns the old home's stopped primary into a replica of the new home, in place. The
@@ -565,7 +703,11 @@ func (o *Orchestrator) demoteOld(ctx context.Context, from registry.Node, ref, i
 			return identifier + " on " + from.Name, nil
 		}
 	}
-	return "", fmt.Errorf("turning the old primary on %s into a replica failed: %w; run the move again with --resume", from.Name, err)
+	hint := ""
+	if ref == config.SystemRef {
+		hint = " (the node's agent reads its registry to render the standby, and that registry is the system cluster it stopped for this switchover: see the limits in the failover README)"
+	}
+	return "", fmt.Errorf("turning the old primary on %s into a replica failed: %w%s; run the move again with --resume", from.Name, err, hint)
 }
 
 // reseedOld rebuilds the old home of a failed-over project as a replica: its data diverged from the
@@ -573,7 +715,7 @@ func (o *Orchestrator) demoteOld(ctx context.Context, from registry.Node, ref, i
 // failure undoes the move, which has served the project for a while by now; both are
 // reported in the log and the alert as work left to do.
 func (o *Orchestrator) reseedOld(ctx context.Context, from registry.Node, ref string, epoch int64) string {
-	if err := o.d.Primaries.SetAside(ctx, from.ID, ref, epoch); err != nil {
+	if err := o.setAside(ctx, from, ref, epoch); err != nil {
 		return fmt.Sprintf("warning: the old primary's data on %s was not set aside (%v); remove it, then run supavise replicas add %s --node %s", from.Name, err, ref, from.ID)
 	}
 	if o.d.Replicas == nil {
@@ -583,6 +725,38 @@ func (o *Orchestrator) reseedOld(ctx context.Context, from registry.Node, ref st
 		return fmt.Sprintf("warning: a replica could not be added on %s (%v); run supavise replicas add %s --node %s", from.Name, err, ref, from.ID)
 	}
 	return "a replica is being built on " + from.Name
+}
+
+// asideAttempts and asideWait bound the tries to set the old primary's data aside. The old home
+// refuses while its copy of the registry still names it the project's home, and the copy follows the
+// leader's change by a moment.
+const (
+	asideAttempts = 6
+	asideWait     = 5 * time.Second
+)
+
+// setAside asks the old home to set the project's data aside, again while it answers that its registry
+// still homes the project there (the answer a node gives until the leader's SetProjectNode has
+// reached its copy).
+func (o *Orchestrator) setAside(ctx context.Context, from registry.Node, ref string, epoch int64) error {
+	var err error
+	for attempt := 0; attempt < asideAttempts; attempt++ {
+		if attempt > 0 {
+			if werr := o.wait(ctx, asideWait); werr != nil {
+				return werr
+			}
+		}
+		if err = o.d.Primaries.SetAside(ctx, from.ID, ref, epoch); err == nil || !homedHere(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// homedHere reports whether a node refused to set data aside because its registry homes the project on it.
+func homedHere(err error) bool {
+	var re *mesh.RemoteError
+	return errors.As(err, &re) && re.Code == CodeHomedHere
 }
 
 // baseBackup takes a fresh base backup of the project on its new timeline. The move does not wait

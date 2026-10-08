@@ -60,11 +60,18 @@ func (f *fakeService) FailoverServer(ctx context.Context, o ServerOptions) (*reg
 // controlRig serves the control socket of a fake service on a real unix socket.
 func controlRig(t *testing.T) (*fakeService, Client, context.CancelFunc) {
 	t.Helper()
+	svc := &fakeService{}
+	c, cancel := rigFor(t, svc)
+	return svc, c, cancel
+}
+
+// rigFor serves svc on a real unix socket.
+func rigFor(t *testing.T, svc Service) (Client, context.CancelFunc) {
+	t.Helper()
 	dir, err := os.MkdirTemp("", "fo")
 	must(t, err)
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	path := filepath.Join(dir, "c.sock")
-	svc := &fakeService{}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- (&ControlServer{Svc: svc}).Serve(ctx, path) }()
@@ -88,7 +95,7 @@ func controlRig(t *testing.T) (*fakeService, Client, context.CancelFunc) {
 	if di, err := os.Stat(dir); err != nil || di.Mode().Perm() != 0o700 {
 		t.Fatalf("socket directory: %v, %v", di, err)
 	}
-	return svc, Client{Path: path}, cancel
+	return Client{Path: path}, cancel
 }
 
 func TestControlSocketRoundTrips(t *testing.T) {
@@ -313,4 +320,151 @@ func TestSocketPathTooLong(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "longer than") {
 		t.Fatalf("error: %v", err)
 	}
+}
+
+// followingService is a Service that also keeps the run of a daemon that restarted.
+type followingService struct {
+	*fakeService
+	mu       sync.Mutex
+	answers  []ServerStatus
+	asked    []string
+	askedFor int64
+}
+
+func (f *followingService) Follow(_ context.Context, from int, epoch int64) ServerStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked = append(f.asked, fmt.Sprintf("%d@%d", from, epoch))
+	f.askedFor = epoch
+	st := f.answers[0]
+	if len(f.answers) > 1 {
+		f.answers = f.answers[1:]
+	}
+	return st
+}
+
+// The CLI whose connection the restart cut asks the daemon that starts for the move, from where it
+// stopped, and waits out the time the daemon needs to come up and pick the move up.
+func TestFollowShowsTheMoveTheDaemonContinuedAfterItsRestart(t *testing.T) {
+	followPollWas, followPatienceWas := followPoll, followPatience
+	followPoll, followPatience = 5*time.Millisecond, 5*time.Second
+	defer func() { followPoll, followPatience = followPollWas, followPatienceWas }()
+	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	svc := &followingService{fakeService: &fakeService{}, answers: []ServerStatus{
+		{State: "idle"}, // up, and the move is not picked up yet
+		{State: "running", Steps: []stepJSON{{Name: "leader", At: at, Detail: "standby leads at epoch 2"}}, Next: 1},
+		{State: "running", Next: 1},
+		{State: "done", Steps: []stepJSON{{Name: "dns", At: at}}, Next: 2, Move: &moveJSON{ID: 5, Scope: "server", Kind: "switchover", From: "n1", To: "n2", Epoch: 2, State: "done"}},
+	}}
+	c, _ := rigFor(t, svc)
+	var seen []string
+	mv, err := c.Follow(context.Background(), 2, func(s registry.MoveStep) { seen = append(seen, s.Name) })
+	if err != nil || mv == nil || mv.State != registry.MoveDone || mv.Epoch != 2 {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if strings.Join(seen, ",") != "leader,dns" {
+		t.Fatalf("steps: %v", seen)
+	}
+	if svc.askedFor != 2 || svc.asked[0] != "0@2" || svc.asked[len(svc.asked)-1] != "1@2" {
+		t.Fatalf("asked %v", svc.asked)
+	}
+
+	t.Run("a move that failed", func(t *testing.T) {
+		svc.answers = []ServerStatus{{State: "failed", Error: "1 step(s) did not finish", Move: &moveJSON{ID: 5, State: "failed"}}}
+		mv, err := c.Follow(context.Background(), 2, nil)
+		var re *RemoteError
+		if !errors.As(err, &re) || !strings.Contains(err.Error(), "did not finish") || mv == nil || mv.State != registry.MoveFailed {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+	})
+	t.Run("a daemon that has no move", func(t *testing.T) {
+		idleWas := followIdleGrace
+		followIdleGrace = 0
+		defer func() { followIdleGrace = idleWas }()
+		svc.answers = []ServerStatus{{State: "idle"}}
+		if _, err := c.Follow(context.Background(), 2, nil); !errors.Is(err, ErrNothingRunning) {
+			t.Fatalf("error: %v", err)
+		}
+	})
+	t.Run("a daemon that never comes back", func(t *testing.T) {
+		followPatience = 50 * time.Millisecond
+		_, err := Client{Path: filepath.Join(os.TempDir(), "no-such-socket-failover")}.Follow(context.Background(), 2, nil)
+		if err == nil || !strings.Contains(err.Error(), "did not answer again") {
+			t.Fatalf("error: %v", err)
+		}
+	})
+}
+
+// A Service without a run to follow (a test double, or a daemon without an orchestrator) says idle.
+func TestFollowOfAServiceThatKeepsNoRunIsIdle(t *testing.T) {
+	c, _ := rigFor(t, &fakeService{})
+	idleWas := followIdleGrace
+	followIdleGrace = 0
+	defer func() { followIdleGrace = idleWas }()
+	followPollWas := followPoll
+	followPoll = time.Millisecond
+	defer func() { followPoll = followPollWas }()
+	if _, err := c.Follow(context.Background(), 2, nil); !errors.Is(err, ErrNothingRunning) {
+		t.Fatalf("error: %v", err)
+	}
+}
+
+// A daemon that is up and cannot read the log of the move yet is waited for like one that is down, and
+// is not taken for a daemon that has no move. A move that is running and records nothing is not waited
+// for for ever, and the time the daemon was away does not count against the move.
+func TestFollowWaitsForALogThatCannotBeReadAndStopsWaitingForAMoveThatRecordsNothing(t *testing.T) {
+	followPollWas, followPatienceWas, followIdleWas, followStallWas := followPoll, followPatience, followIdleGrace, followStall
+	followPoll, followPatience, followIdleGrace = 5*time.Millisecond, 5*time.Second, 0
+	defer func() {
+		followPoll, followPatience, followIdleGrace, followStall = followPollWas, followPatienceWas, followIdleWas, followStallWas
+	}()
+	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	done := ServerStatus{State: "done", Next: 1, Steps: []stepJSON{{Name: "dns", At: at}}, Move: &moveJSON{ID: 5, Scope: "server", Kind: "switchover", From: "n1", To: "n2", Epoch: 2, State: "done"}}
+
+	t.Run("an unreadable log, then the move", func(t *testing.T) {
+		// With no grace for a daemon that shows no move, an unknown log taken for an idle daemon would end the wait.
+		svc := &followingService{fakeService: &fakeService{}, answers: []ServerStatus{
+			{State: stateUnknown, Error: "the registry copy is not readable"}, {State: stateUnknown}, done,
+		}}
+		c, _ := rigFor(t, svc)
+		mv, err := c.Follow(context.Background(), 2, nil)
+		if err != nil || mv == nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+	})
+	t.Run("a log that stays unreadable", func(t *testing.T) {
+		followPatience = 80 * time.Millisecond
+		defer func() { followPatience = 5 * time.Second }()
+		svc := &followingService{fakeService: &fakeService{}, answers: []ServerStatus{{State: stateUnknown, Error: "the registry copy is not readable"}}}
+		c, _ := rigFor(t, svc)
+		_, err := c.Follow(context.Background(), 2, nil)
+		if err == nil || !strings.Contains(err.Error(), "did not answer again") || !strings.Contains(err.Error(), "cannot read the log") || errors.Is(err, ErrNothingRunning) {
+			t.Fatalf("error: %v", err)
+		}
+	})
+	t.Run("a move that records nothing", func(t *testing.T) {
+		followStall = 60 * time.Millisecond
+		svc := &followingService{fakeService: &fakeService{}, answers: []ServerStatus{{State: "running", Next: 1, Steps: []stepJSON{{Name: "leader", At: at}}}, {State: "running", Next: 1}}}
+		c, _ := rigFor(t, svc)
+		var seen []string
+		_, err := c.Follow(context.Background(), 2, func(s registry.MoveStep) { seen = append(seen, s.Name) })
+		if err == nil || !strings.Contains(err.Error(), "no step") || !strings.Contains(err.Error(), "--resume") || len(seen) != 1 {
+			t.Fatalf("error %v, steps %v", err, seen)
+		}
+	})
+	t.Run("a daemon that was away for longer than the stall is not a stalled move", func(t *testing.T) {
+		followStall = 150 * time.Millisecond
+		defer func() { followStall = time.Hour }()
+		svc := &followingService{fakeService: &fakeService{}, answers: []ServerStatus{{State: stateUnknown}}}
+		c, _ := rigFor(t, svc)
+		go func() { // the log becomes readable after the stall has passed
+			time.Sleep(250 * time.Millisecond)
+			svc.mu.Lock()
+			svc.answers = []ServerStatus{{State: "running", Next: 1}, done}
+			svc.mu.Unlock()
+		}()
+		if mv, err := c.Follow(context.Background(), 2, nil); err != nil || mv == nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+	})
 }

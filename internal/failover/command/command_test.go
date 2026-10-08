@@ -180,3 +180,33 @@ func TestOutputInErrorsIsBounded(t *testing.T) {
 		t.Fatalf("error of %d bytes", n)
 	}
 }
+
+// The daemon's environment may hold the master key; the operator's command gets a short list and the
+// move.
+func TestACommandGetsAShortListOfTheDaemonsEnvironmentAndNoSecret(t *testing.T) {
+	t.Setenv("SUPAVISE_MASTER_KEY", "do-not-pass-this")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "nor-this")
+	t.Setenv("AWS_REGION", "eu-west-1")
+	t.Setenv("HOME", "/home/supavise")
+	p := &Provider{FenceCommand: "env"}
+	var got string
+	p.Run = func(ctx context.Context, command string, env []string) (string, error) {
+		out, err := shell(ctx, command, env)
+		got = out
+		return out, err
+	}
+	req := failover.Request{Old: registry.Node{ID: "n1", Name: "primary"}, New: registry.Node{ID: "n2", Name: "standby"}, Epoch: 2}
+	if err := p.Fence(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"OLD_NODE=primary", "NEW_NODE_ID=n2", "EPOCH=2", "PLANNED=0", "AWS_REGION=eu-west-1", "HOME=/home/supavise", "PATH="} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %q in the command's environment:\n%s", want, got)
+		}
+	}
+	for _, secret := range []string{"SUPAVISE_MASTER_KEY", "do-not-pass-this", "AWS_SECRET_ACCESS_KEY", "nor-this"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("%q reached the command:\n%s", secret, got)
+		}
+	}
+}

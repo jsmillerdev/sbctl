@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/mesh"
@@ -125,6 +126,127 @@ func TestCooperativeFenceOfANode(t *testing.T) {
 	serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, "n2", body, &resp)
 	if !resp.Fenced {
 		t.Fatalf("second answer: %+v", resp)
+	}
+}
+
+// A node fence is asked in the epoch after the node's own, by an active node that holds a standby of
+// the system cluster: the one that takes over. Anything else leaves the node as it is.
+func TestANodeFenceNeedsTheNextEpochAndTheNodeThatTakesOver(t *testing.T) {
+	ask := func(t *testing.T, w *world, peer string, epoch int64) (*httptest.ResponseRecorder, peerapi.FenceResponse) {
+		t.Helper()
+		var resp peerapi.FenceResponse
+		rec := serve(t, w.orch(), "POST "+peerapi.PathFence, peerapi.PathFence, peer, FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: epoch, Leader: peer}}, &resp)
+		return rec, resp
+	}
+	untouched := func(t *testing.T, w *world) {
+		t.Helper()
+		if exists1(fencedPath(w)) || w.has("local.stop") || len(w.alerts) != 0 {
+			t.Fatalf("a refused fence changed something: %v", w.snapshot())
+		}
+	}
+	t.Run("an epoch that is not the next one", func(t *testing.T) {
+		w := newWorld(t) // n1 leads at epoch 1
+		for _, epoch := range []int64{3, 9} {
+			rec, resp := ask(t, w, "n2", epoch)
+			if rec.Code != http.StatusOK || resp.Fenced || resp.Epoch != 1 {
+				t.Fatalf("epoch %d: %d %+v", epoch, rec.Code, resp)
+			}
+		}
+		untouched(t, w)
+		if rec, resp := ask(t, w, "n2", 2); rec.Code != http.StatusOK || !resp.Fenced {
+			t.Fatalf("the next epoch: %d %s", rec.Code, rec.Body)
+		}
+	})
+	t.Run("a node that holds no standby of the system cluster", func(t *testing.T) {
+		w := newWorld(t)
+		w.addNode3() // active, and it holds nothing
+		if rec, _ := ask(t, w, "n3", 2); rec.Code != http.StatusForbidden {
+			t.Fatalf("n3: %d %s", rec.Code, rec.Body)
+		}
+		untouched(t, w)
+	})
+	t.Run("a node the registry does not know, or that is not active", func(t *testing.T) {
+		w := newWorld(t)
+		if rec, _ := ask(t, w, "n9", 2); rec.Code != http.StatusForbidden {
+			t.Fatalf("unknown: %d %s", rec.Code, rec.Body)
+		}
+		must(t, w.reg.SetNodeState(w.ctx, "n2", registry.NodeLeft))
+		if rec, _ := ask(t, w, "n2", 2); rec.Code != http.StatusForbidden {
+			t.Fatalf("left: %d %s", rec.Code, rec.Body)
+		}
+		untouched(t, w)
+	})
+	t.Run("a registry that cannot say", func(t *testing.T) {
+		w := newWorld(t)
+		launcher(t, w, refA)
+		o := w.orch(func(d *Deps) { d.Store = func() Store { return brokenStore{} } })
+		var resp peerapi.FenceResponse
+		rec := serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, "n2", FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 2, Leader: "n2"}}, &resp)
+		if rec.Code != http.StatusOK || !resp.Fenced {
+			t.Fatalf("%d %s", rec.Code, rec.Body)
+		}
+	})
+}
+
+// The record carries the peers' addresses (`supavise node rejoin` needs the leader's when its own
+// registry is stopped), and the shared services stop with the primaries.
+func TestANodeFenceRecordsThePeersAndStopsTheSharedServices(t *testing.T) {
+	w := newWorld(t)
+	n2, err := w.reg.GetNode(w.ctx, "n2")
+	must(t, err)
+	n2.PeerAddr = "10.0.1.7:7443"
+	must(t, w.reg.UpdateNode(w.ctx, n2))
+	w.refreshMembers()
+	launcher(t, w, refA)
+	o := w.orch()
+	var resp peerapi.FenceResponse
+	if rec := serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, "n2", FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 2, Leader: "n2"}}, &resp); rec.Code != http.StatusOK || !resp.Fenced {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	rc, err := fenced.Node(w.cfg.Paths())
+	if err != nil || rc == nil || rc.Peers["n2"] != "10.0.1.7:7443" {
+		t.Fatalf("record: %+v, %v", rc, err)
+	}
+	// The membership layer reads the same file with its own type: both sides keep what the other wrote.
+	mrec, err := cluster.ReadFenced(w.cfg)
+	if err != nil || mrec == nil || mrec.Peers["n2"] != "10.0.1.7:7443" || mrec.Leader != "n2" || mrec.Epoch != 2 {
+		t.Fatalf("the membership layer reads %+v, %v", mrec, err)
+	}
+	w.assertOrder("services.stop", "local.stop "+refA)
+	// A project fence leaves the services alone.
+	w2 := newWorld(t)
+	o2 := w2.orch()
+	serve(t, o2, "POST "+peerapi.PathFence, peerapi.PathFence, "n1", FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 1, Leader: "n1"}, Ref: refA}, nil)
+	w2.assertNever("services.stop")
+}
+
+// A daemon that has the membership layer's own local fence (cluster.FenceLocal) hands the stops to it:
+// it knows every unit of the node, replicas and shared services included.
+func TestANodeFenceUsesTheNodesOwnLocalFenceWhenThereIsOne(t *testing.T) {
+	w := newWorld(t)
+	var calls int
+	o := w.orch(func(d *Deps) {
+		d.FenceNode = func(context.Context) ([]string, error) {
+			calls++
+			w.log("fence-node")
+			return []string{config.SystemRef, refA}, nil
+		}
+	})
+	var resp peerapi.FenceResponse
+	rec := serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, "n2", FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 2, Leader: "n2"}}, &resp)
+	if rec.Code != http.StatusOK || !resp.Fenced || len(resp.Stopped) != 2 || calls != 1 {
+		t.Fatalf("%d %s, %d calls", rec.Code, rec.Body, calls)
+	}
+	if rc, _ := fenced.Node(w.cfg.Paths()); rc == nil {
+		t.Fatal("the record is written before the stops")
+	}
+	if w.has("local.stop") || w.has("services.stop") {
+		t.Fatalf("the stops were done twice:\n%v", w.snapshot())
+	}
+	// One project's fence is the orchestrator's own: the node's local fence would stop the rest of the node.
+	serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, "n1", FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 1, Leader: "n1"}, Ref: refB}, nil)
+	if calls != 1 || !w.has("local.stop "+refB) {
+		t.Fatalf("project fence: %d calls\n%v", calls, w.snapshot())
 	}
 }
 
@@ -250,6 +372,12 @@ func registryGoneWithTheSystemCluster(w *world) func(d *Deps) {
 type brokenStore struct{ Store }
 
 func (brokenStore) ListProjects(context.Context) ([]registry.Project, error) {
+	return nil, errors.New("connection refused")
+}
+func (brokenStore) GetNode(context.Context, string) (*registry.Node, error) {
+	return nil, errors.New("connection refused")
+}
+func (brokenStore) ListReplicas(context.Context, string) ([]registry.Replica, error) {
 	return nil, errors.New("connection refused")
 }
 
@@ -469,6 +597,31 @@ func TestAsideRefusesAProjectTheRegistryHomesOnThisNode(t *testing.T) {
 	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refB, OpAside), "n1", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusOK || !w.has("local.aside "+refB) {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
+}
+
+// A registry that cannot say where the project is homed cannot clear the data for a rename.
+func TestAsideRefusesWhenTheRegistryCannotSayWhereTheProjectIsHomed(t *testing.T) {
+	w := newWorld(t)
+	w.setSelf("n2", false)
+	o := w.orch(func(d *Deps) {
+		d.Store = func() Store { return unreadableProjects{&gatedStore{w: w, Registry: w.reg}} }
+	})
+	rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refB, OpAside), "n1", PrimaryCall{Epoch: 1}, nil)
+	if rec.Code != http.StatusServiceUnavailable || errorOf(rec).Code != "registry_unavailable" || w.has("local.aside") {
+		t.Fatalf("%d %s\n%v", rec.Code, rec.Body, w.snapshot())
+	}
+	// A project the registry does not know has nothing homed here to protect.
+	o = w.orch()
+	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath("zzzzzzzzzzzzzzzzzzzz", OpAside), "n1", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("an unknown project: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// unreadableProjects is a registry whose project rows cannot be read.
+type unreadableProjects struct{ Store }
+
+func (unreadableProjects) GetProject(context.Context, string) (*registry.Project, error) {
+	return nil, errRegistryDown
 }
 
 // A ref from a peer builds paths (the launcher, the fence record, the set-aside data): only a real ref passes.
@@ -779,6 +932,30 @@ func TestFenceSelfStopsThePrimariesEvenWhenTheRecordCannotBeWritten(t *testing.T
 }
 
 // setPeerEpoch makes n2 answer pings with the given epoch and leader.
+// The old leader of a planned switchover is stopped on purpose. The survivor's first ping and its
+// marker say that it leads at the next epoch, which is the switchover, not a replacement: the leader
+// is demoted in place and not fenced. A higher epoch it was not told of still fences it.
+func TestALeaderThatStoppedForASwitchoverIsNotFencedByTheSurvivorsEpoch(t *testing.T) {
+	w := bootRig(t) // n1 leads at epoch 1
+	o := w.orch()
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("quiesce: %d %s", rec.Code, rec.Body)
+	}
+	for _, source := range []string{"node standby", "the leader marker in the backup store"} {
+		fenced, err := o.FenceOnHigherEpoch(w.ctx, source, 2, "n2")
+		if err != nil || fenced {
+			t.Fatalf("%s: fenced %v, %v", source, fenced, err)
+		}
+	}
+	if rc, _ := o.Fenced(); rc != nil {
+		t.Fatalf("a record was written: %+v", rc)
+	}
+	// Another node at that epoch, or the same node at a later one, is a replacement.
+	if fenced, _ := o.FenceOnHigherEpoch(w.ctx, "node third", 2, "n3"); !fenced {
+		t.Fatal("another node at the epoch of the switchover did not fence")
+	}
+}
+
 func (w *world) setPeerEpoch(epoch int64, leader string) {
 	w.mu.Lock()
 	w.pingAs = &peerapi.Ping{Epoch: epoch, Leader: leader, Health: "healthy"}
@@ -894,4 +1071,36 @@ func TestAQuiesceIsRefusedWhileALeaderMoveRuns(t *testing.T) {
 	if w.has("local.stop") || w.has("registry.SetMaintenance") {
 		t.Fatalf("a refused quiesce did something:\n%v", w.snapshot())
 	}
+}
+
+// A node fence from a node the registry cannot vouch for (the registry is what is broken) is judged by
+// the membership snapshot: an active member may ask, nobody else.
+func TestANodeFenceFromAClaimantThatTheMembershipDoesNotKnowIsRefusedWhenTheRegistryCannotBeRead(t *testing.T) {
+	ask := func(t *testing.T, w *world, claimant string) int {
+		t.Helper()
+		launcher(t, w, refA)
+		o := w.orch(func(d *Deps) { d.Store = func() Store { return brokenStore{} } })
+		rec := serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, claimant, FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 2, Leader: claimant}}, nil)
+		return rec.Code
+	}
+	t.Run("an active member", func(t *testing.T) {
+		w := newWorld(t)
+		if code := ask(t, w, "n2"); code != http.StatusOK || !w.has("local.stop "+refA) {
+			t.Fatalf("%d\n%v", code, w.snapshot())
+		}
+	})
+	t.Run("a node the membership does not list", func(t *testing.T) {
+		w := newWorld(t)
+		if code := ask(t, w, "n9"); code != http.StatusForbidden || w.has("local.stop") {
+			t.Fatalf("%d\n%v", code, w.snapshot())
+		}
+	})
+	t.Run("a member that is not active", func(t *testing.T) {
+		w := newWorld(t)
+		must(t, w.reg.SetNodeState(w.ctx, "n2", registry.NodeFenced))
+		w.refreshMembers()
+		if code := ask(t, w, "n2"); code != http.StatusForbidden || w.has("local.stop") {
+			t.Fatalf("%d\n%v", code, w.snapshot())
+		}
+	})
 }

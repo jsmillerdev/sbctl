@@ -285,7 +285,8 @@ func TestProbeUsesDryRunOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, c := range r.fake.Calls() {
-		if c.Service == "ec2" && !c.DryRun {
+		// Only reads are real: they say which private address the service address would map to.
+		if c.Service == "ec2" && !c.DryRun && !strings.HasPrefix(c.Action, "Describe") {
 			t.Fatalf("Probe made a real call: %s", c.Action)
 		}
 	}
@@ -356,5 +357,60 @@ func TestPeerState(t *testing.T) {
 	}
 	if s := state("i-n4"); s.State != "stopped" || !s.Down() {
 		t.Errorf("a stopped peer: %+v", s)
+	}
+}
+
+// The permission to associate an address is asked for the call a failover makes: to the survivor's
+// secondary private address, where a network-interface resource enters the policy.
+func TestProbeAsksForTheAssociationWithTheSecondaryAddress(t *testing.T) {
+	r := newRig(t)
+	if err := r.p.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var private []string
+	for _, c := range r.fake.Calls() {
+		if c.Action == "AssociateAddress" && c.DryRun {
+			private = append(private, c.Params.Get("PrivateIpAddress"))
+		}
+	}
+	if len(private) != 1 || private[0] != "10.77.0.21" {
+		t.Fatalf("the dry run asked about %q, want the secondary address", private)
+	}
+	// With no Elastic IP of its own on the primary address, the primary address is what is asked about.
+	r = newRigOn(t, false)
+	if err := r.p.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range r.fake.Calls() {
+		if c.Action == "AssociateAddress" && c.DryRun && c.Params.Get("PrivateIpAddress") != "" {
+			t.Fatalf("the dry run named an address: %v", c.Params)
+		}
+	}
+	// A role that may associate to the instance and not to its network interface is told apart only
+	// by the private address in the request, which is why the probe sends it.
+}
+
+// A survivor whose only private address has an Elastic IP of its own passes the permissions and cannot
+// take the address over: the probe of the permissions stays green, ProbeTakeover says why the
+// automatic mode cannot run.
+func TestProbeTakeoverSaysWhenTheSurvivorHasNoAddressToSpare(t *testing.T) {
+	r := newRig(t, func(f *awsfake.Server) { f.AddInstance(awsfake.Instance{ID: "i-n2", PrivateIP: "10.77.0.20"}) })
+	ctx := context.Background()
+	if err := r.p.Probe(ctx); err != nil {
+		t.Fatalf("the permissions are in place: %v", err)
+	}
+	err := r.p.ProbeTakeover(ctx)
+	if !errors.Is(err, failover.ErrNoTakeover) || !strings.Contains(err.Error(), "secondary") {
+		t.Fatalf("ProbeTakeover: %v", err)
+	}
+	// Nothing was changed by asking.
+	if a := r.fake.AddressOf("eipalloc-svc"); a.InstanceID != "i-n1" {
+		t.Fatalf("service address: %+v", a)
+	}
+	if err := newRig(t).p.ProbeTakeover(ctx); err != nil {
+		t.Fatalf("a survivor with a secondary address: %v", err)
+	}
+	if err := newRigOn(t, false).p.ProbeTakeover(ctx); err != nil {
+		t.Fatalf("a survivor with no Elastic IP of its own: %v", err)
 	}
 }

@@ -37,6 +37,13 @@ type Record struct {
 	// Reason is one sentence for the operator: what was seen, and where.
 	Reason string    `json:"reason"`
 	At     time.Time `json:"at"`
+	// Removed and Peers belong to the membership layer, which writes the same file when it fences the
+	// node itself (cluster.FencedRecord): Removed marks a node taken out of the cluster, and Peers are
+	// the peer addresses by node id as this node's registry had them, which `supavise node rejoin`
+	// needs to find the leader when the local registry is stopped. The fields are here so that a record
+	// written by either side keeps what the other put in it.
+	Removed bool              `json:"removed,omitempty"`
+	Peers   map[string]string `json:"peers,omitempty"`
 }
 
 var refRe = regexp.MustCompile(`^(system|[a-z]{20})$`)

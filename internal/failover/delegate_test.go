@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -21,6 +23,7 @@ type scriptedRemote struct {
 	statuses  []ServerStatus // answered in turn; the last one repeats
 	statusErr error
 	asked     []int
+	epochs    []int64
 }
 
 func (r *scriptedRemote) StartServer(_ context.Context, _ string, o ServerOptions) error {
@@ -28,8 +31,9 @@ func (r *scriptedRemote) StartServer(_ context.Context, _ string, o ServerOption
 	return r.startErr
 }
 
-func (r *scriptedRemote) ServerStatus(_ context.Context, _ string, from int) (ServerStatus, error) {
+func (r *scriptedRemote) ServerStatus(_ context.Context, _ string, from int, epoch int64) (ServerStatus, error) {
 	r.asked = append(r.asked, from)
+	r.epochs = append(r.epochs, epoch)
 	if r.statusErr != nil {
 		return ServerStatus{}, r.statusErr
 	}
@@ -74,9 +78,85 @@ func TestTheLeaderHasTheSurvivorRunTheSwitchoverAndFollowsIt(t *testing.T) {
 	if len(rem.asked) != 3 || rem.asked[0] != 0 || rem.asked[1] != 2 || rem.asked[2] != 2 {
 		t.Fatalf("asked from %v", rem.asked)
 	}
+	// It asks for the move of the epoch it started at.
+	for _, e := range rem.epochs {
+		if e != 2 {
+			t.Fatalf("asked for epochs %v, want 2", rem.epochs)
+		}
+	}
 	// This node did none of the work: its registry stops partway and the survivor's takes over.
 	for _, e := range []string{"quiesce", "stop ", "local.stop", "provider.", "marker", "promote", "registry.CreateMove"} {
 		w.assertNever(e)
+	}
+}
+
+// survivingRemote plays the survivor's daemon: when the leader asks it to run the switchover, it
+// does what the real one does first and calls the leader's quiesce, from inside the leader's
+// delegation, which is still holding the leader's move slot.
+type survivingRemote struct {
+	*scriptedRemote
+	onStart func(ctx context.Context) error
+}
+
+func (r survivingRemote) StartServer(ctx context.Context, node string, o ServerOptions) error {
+	if err := r.onStart(ctx); err != nil {
+		return err
+	}
+	return r.scriptedRemote.StartServer(ctx, node, o)
+}
+
+// A switchover started on the leader with --to can run: the survivor's quiesce, its repeat and its
+// resume reach the leader's handlers while the leader's own move waits for the survivor, and no
+// other move or caller gets through the slot the delegation holds.
+func TestTheSurvivorsQuiesceAndResumeReachTheLeaderThatDelegated(t *testing.T) {
+	rem := &scriptedRemote{statuses: []ServerStatus{{State: "done", Next: 1, Move: &moveJSON{ID: 5, Scope: "server", Kind: "switchover", From: "n1", To: "n2", Epoch: 2, State: "done"}}}}
+	w := newWorld(t) // n1 leads and is this node
+	var o *Orchestrator
+	var first, again QuiesceResult
+	var codes struct{ first, again, stranger, resume int }
+	var projectErr error
+	sr := survivingRemote{scriptedRemote: rem}
+	sr.onStart = func(ctx context.Context) error {
+		codes.first = serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, &first).Code
+		codes.again = serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, &again).Code
+		// The slot is the delegation's and only the node it was lent to may use it.
+		codes.stranger = serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n3", QuiesceRequest{Epoch: 2, To: "n3"}, nil).Code
+		_, projectErr = o.FailoverProject(ctx, ProjectOptions{Ref: refA})
+		codes.resume = serve(t, o, "POST "+PathResume, PathResume, "n2", struct{}{}, nil).Code
+		return nil
+	}
+	o = w.orch(func(d *Deps) { rem.Peers = d.Peers; d.Peers = sr })
+
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{To: "n2"})
+	if err != nil || mv == nil || mv.State != registry.MoveDone {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if codes.first != http.StatusOK || codes.again != http.StatusOK {
+		t.Fatalf("the survivor's quiesce was answered %d, its repeat %d", codes.first, codes.again)
+	}
+	for _, ref := range []string{config.SystemRef, refA, refB} {
+		if first.LSNs[ref] != w.lsn[ref] || again.LSNs[ref] != w.lsn[ref] {
+			t.Errorf("%s: stopped at %q, then %q, want %q", ref, first.LSNs[ref], again.LSNs[ref], w.lsn[ref])
+		}
+	}
+	if codes.stranger != http.StatusConflict {
+		t.Fatalf("a quiesce from a node the slot was not lent to: %d", codes.stranger)
+	}
+	if !errors.Is(projectErr, ErrBusy) {
+		t.Fatalf("a project move beside the delegation: %v", projectErr)
+	}
+	if codes.resume != http.StatusOK || !w.has("local.start system") {
+		t.Fatalf("the survivor's undo: %d, events %v", codes.resume, w.snapshot())
+	}
+	if w.count("local.stop system") != 1 {
+		t.Fatalf("the repeat stopped the system cluster again: %d", w.count("local.stop system"))
+	}
+	if o.Busy() {
+		t.Fatal("the slot was not given back when the delegation ended")
+	}
+	// Once the delegation is over, a quiesce takes the slot like any other.
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("a quiesce after the delegation: %d %s", rec.Code, rec.Body)
 	}
 }
 
@@ -260,6 +340,223 @@ func TestTheSurvivorRefusesWhatItCannotRun(t *testing.T) {
 		serve(t, w.orch(), "GET "+PathServer, PathServer, "n1", nil, &st)
 		if st.State != "idle" {
 			t.Fatalf("status: %+v", st)
+		}
+	})
+}
+
+// The survivor's daemon is cut by the role change in the middle of the move it runs for the leader. That
+// is no failure: the leader that asked is told the move is running, and waits for the daemon that starts.
+func TestADelegatedMoveCutByTheRoleChangeIsRunningAndNotFailed(t *testing.T) {
+	w := serverWorld(t)
+	w.frozen = true // the promotion is shown while this process still has the standby's registry
+	o := w.orch()
+	if rec := serve(t, o, "POST "+PathServer, PathServer, "n1", serverReq{To: "n2"}, nil); rec.Code != http.StatusAccepted {
+		t.Fatalf("start: %d %s", rec.Code, rec.Body)
+	}
+	for deadline := time.Now().Add(10 * time.Second); o.Busy(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the delegated move did not end")
+		}
+	}
+	var st ServerStatus
+	if rec := serve(t, o, "GET "+PathServer, PathServer+"?from=0&epoch=2", "n1", nil, &st); rec.Code != http.StatusOK {
+		t.Fatalf("status: %d %s", rec.Code, rec.Body)
+	}
+	if st.State != "running" || st.Error != "" || len(st.Steps) == 0 || st.Steps[len(st.Steps)-1].Name != "promote-system" {
+		t.Fatalf("status of a move that the restart cut: %+v", st)
+	}
+	for _, k := range w.alertKinds() {
+		if k == alerts.KindFailoverFailed {
+			t.Fatalf("alerts: %v", w.alerts)
+		}
+	}
+
+	// The daemon that starts keeps no run: the leader that asked reads the move from the log, for its epoch.
+	w.frozen = false
+	w.restarted(2)
+	fresh := w.orch()
+	var logged ServerStatus
+	serve(t, fresh, "GET "+PathServer, PathServer+"?from=0&epoch=2", "n1", nil, &logged)
+	if logged.State != "running" || logged.Next != st.Next {
+		t.Fatalf("status from the log: %+v", logged)
+	}
+	if mv, err := fresh.FailoverServer(w.ctx, ServerOptions{Resume: true}); err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("resume: %+v, %v", mv, err)
+	}
+	var end ServerStatus
+	serve(t, fresh, "GET "+PathServer, PathServer+"?from=0&epoch=2", "n1", nil, &end)
+	if end.State != "done" {
+		t.Fatalf("status after: %+v", end)
+	}
+}
+
+// The leader asks for the move of the epoch it started at: an earlier switchover between the same two
+// nodes is not that move, whatever the log still holds of it.
+func TestTheStatusOfAMoveIsMatchedOnItsEpoch(t *testing.T) {
+	w := serverWorld(t)
+	mv := &registry.Move{Scope: registry.MoveServer, Kind: registry.MoveSwitchover, FromNode: "n1", ToNode: "n2", Epoch: 2}
+	must(t, w.reg.CreateMove(w.ctx, mv))
+	must(t, w.reg.FinishMove(w.ctx, mv.ID, registry.MoveDone, ""))
+	o := w.orch()
+	for query, want := range map[string]string{"?from=0&epoch=2": "done", "?from=0": "done", "?from=0&epoch=4": "idle"} {
+		var st ServerStatus
+		if rec := serve(t, o, "GET "+PathServer, PathServer+query, "n1", nil, &st); rec.Code != http.StatusOK || st.State != want {
+			t.Fatalf("%s: %d %+v, want %s", query, rec.Code, st, want)
+		}
+	}
+	// A run this node kept for another epoch is not shown for this one either.
+	run := o.keepRun("n1")
+	run.record(w.ctx, func(context.Context) (*registry.Move, error) {
+		return &registry.Move{Scope: registry.MoveServer, FromNode: "n1", ToNode: "n2", Epoch: 6, State: registry.MoveDone}, nil
+	})
+	var st ServerStatus
+	serve(t, o, "GET "+PathServer, PathServer+"?from=0&epoch=2", "n1", nil, &st)
+	if st.State != "done" || st.Move == nil || st.Move.Epoch != 2 {
+		t.Fatalf("the finished run of epoch 6 answered for epoch 2: %+v", st)
+	}
+	serve(t, o, "GET "+PathServer, PathServer+"?from=0&epoch=6", "n1", nil, &st)
+	if st.State != "done" || st.Move == nil || st.Move.Epoch != 6 {
+		t.Fatalf("the run of epoch 6: %+v", st)
+	}
+}
+
+func TestDelegationWaitsOutALogThatCannotBeReadAndStopsFollowingAMoveThatRecordsNothing(t *testing.T) {
+	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	done := ServerStatus{State: "done", Next: 2, Move: &moveJSON{ID: 5, Scope: "server", Kind: "switchover", From: "n1", To: "n2", Epoch: 2, State: "done"}}
+	follow := func(t *testing.T, next func(i int) (ServerStatus, error)) (looks int, err error) {
+		t.Helper()
+		rem := &scriptedRemote{}
+		w := newWorld(t)
+		o := w.orch(func(d *Deps) {
+			rem.Peers = d.Peers
+			d.Peers = scriptedStatus{scriptedRemote: rem, next: func() (ServerStatus, error) {
+				looks++
+				return next(looks - 1)
+			}}
+		})
+		_, err = o.delegateServer(w.ctx, ServerOptions{To: "n2"}, &serverRun{to: registry.Node{ID: "n2", Name: "standby"}, planned: true, epoch: 2})
+		return looks, err
+	}
+	t.Run("a daemon that cannot read its log yet is waited for", func(t *testing.T) {
+		looks, err := follow(t, func(i int) (ServerStatus, error) {
+			switch {
+			case i == 0:
+				return ServerStatus{State: "running", Next: 1}, nil
+			case i < 4:
+				return ServerStatus{State: stateUnknown, Error: "the registry copy is not readable"}, nil
+			}
+			return done, nil
+		})
+		if err != nil || looks != 5 {
+			t.Fatalf("error %v after %d looks", err, looks)
+		}
+	})
+	t.Run("a log that stays unreadable", func(t *testing.T) {
+		looks, err := follow(t, func(i int) (ServerStatus, error) {
+			if i == 0 {
+				return ServerStatus{State: "running", Next: 1}, nil
+			}
+			return ServerStatus{State: stateUnknown, Error: "the registry copy is not readable"}, nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "cannot read the log of the move") || !strings.Contains(err.Error(), "goes on with the switchover") || looks != 1+delegationPatience {
+			t.Fatalf("error %v after %d looks", err, looks)
+		}
+	})
+	t.Run("a move that is running and records nothing", func(t *testing.T) {
+		looks, err := follow(t, func(int) (ServerStatus, error) { return ServerStatus{State: "running", Next: 1}, nil })
+		if err == nil || !strings.Contains(err.Error(), "no step") || !strings.Contains(err.Error(), "--resume") || looks != delegationStall {
+			t.Fatalf("error %v after %d looks", err, looks)
+		}
+	})
+	t.Run("a move that records a step now and then is followed to its end", func(t *testing.T) {
+		looks, err := follow(t, func(i int) (ServerStatus, error) {
+			if i == 3*delegationStall {
+				return done, nil
+			}
+			if i%(delegationStall/2) == 0 {
+				return ServerStatus{State: "running", Next: i + 1, Steps: []stepJSON{{Name: "step", At: at}}}, nil
+			}
+			return ServerStatus{State: "running", Next: i}, nil
+		})
+		if err != nil || looks != 3*delegationStall+1 {
+			t.Fatalf("error %v after %d looks", err, looks)
+		}
+	})
+}
+
+// unreadableLog is a registry whose moves cannot be read, as the copy of a follower that has just started.
+type unreadableLog struct{ Store }
+
+func (unreadableLog) ListMoves(context.Context, registry.MoveState, int) ([]registry.Move, error) {
+	return nil, errors.New("the registry copy is not readable")
+}
+
+// The old leader of a switchover restarts as a follower, and its copy of the registry does not have the
+// move yet, or cannot be read: the node that leads has the move, and tells.
+func TestAFollowerWhoseLogCannotSayAsksTheNodeThatLeads(t *testing.T) {
+	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	led := ServerStatus{State: "running", Next: 1, Steps: []stepJSON{{Name: "leader", At: at, Detail: "standby leads at epoch 2"}}}
+	follower := func(mut func(*Deps)) (*world, *Orchestrator) {
+		w := newWorld(t)
+		must(t, w.reg.SetLeader(w.ctx, "n2", 2))
+		w.setSelf("n1", false) // the old leader, restarted as a follower
+		return w, w.orch(mut)
+	}
+	t.Run("the copy does not have the move", func(t *testing.T) {
+		rem := &scriptedRemote{statuses: []ServerStatus{led}}
+		_, o := follower(func(d *Deps) { rem.Peers = d.Peers; d.Peers = rem })
+		st := o.Follow(context.Background(), 0, 2)
+		if st.State != "running" || len(st.Steps) != 1 || len(rem.asked) != 1 || rem.epochs[0] != 2 {
+			t.Fatalf("follow: %+v, asked %v for epochs %v", st, rem.asked, rem.epochs)
+		}
+	})
+	t.Run("the copy cannot be read", func(t *testing.T) {
+		rem := &scriptedRemote{statuses: []ServerStatus{led}}
+		_, o := follower(func(d *Deps) {
+			rem.Peers = d.Peers
+			d.Peers = rem
+			inner := d.Store
+			d.Store = func() Store { return unreadableLog{inner()} }
+		})
+		if st := o.Follow(context.Background(), 0, 2); st.State != "running" || len(rem.asked) != 1 {
+			t.Fatalf("follow: %+v", st)
+		}
+	})
+	t.Run("neither can say: the answer is that the log is unknown, not that there is no move", func(t *testing.T) {
+		rem := &scriptedRemote{statusErr: mesh.ErrNoSession}
+		_, o := follower(func(d *Deps) {
+			rem.Peers = d.Peers
+			d.Peers = rem
+			inner := d.Store
+			d.Store = func() Store { return unreadableLog{inner()} }
+		})
+		if st := o.Follow(context.Background(), 0, 2); st.State != stateUnknown || st.Error == "" {
+			t.Fatalf("follow: %+v", st)
+		}
+	})
+	t.Run("a copy that has the move answers itself", func(t *testing.T) {
+		rem := &scriptedRemote{statuses: []ServerStatus{led}}
+		w, o := follower(func(d *Deps) { rem.Peers = d.Peers; d.Peers = rem })
+		mv := &registry.Move{Scope: registry.MoveServer, Kind: registry.MoveSwitchover, FromNode: "n1", ToNode: "n2", Epoch: 2}
+		must(t, w.reg.CreateMove(w.ctx, mv))
+		must(t, w.reg.FinishMove(w.ctx, mv.ID, registry.MoveDone, ""))
+		if st := o.Follow(context.Background(), 0, 2); st.State != "done" || len(rem.asked) != 0 {
+			t.Fatalf("follow: %+v, asked %v", st, rem.asked)
+		}
+	})
+	t.Run("the leader does not know the move either", func(t *testing.T) {
+		rem := &scriptedRemote{statuses: []ServerStatus{{State: "idle"}}}
+		_, o := follower(func(d *Deps) { rem.Peers = d.Peers; d.Peers = rem })
+		if st := o.Follow(context.Background(), 0, 2); st.State != "idle" {
+			t.Fatalf("follow: %+v", st)
+		}
+	})
+	t.Run("a leader asks nobody", func(t *testing.T) {
+		rem := &scriptedRemote{statuses: []ServerStatus{led}}
+		w := newWorld(t)
+		o := w.orch(func(d *Deps) { rem.Peers = d.Peers; d.Peers = rem })
+		if st := o.Follow(context.Background(), 0, 2); st.State != "idle" || len(rem.asked) != 0 {
+			t.Fatalf("follow: %+v, asked %v", st, rem.asked)
 		}
 	})
 }

@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/mesh"
@@ -39,6 +40,10 @@ const (
 	PathResume  = "/peer/v1/failover/resume"
 	PathPrimary = "/peer/v1/failover/primary/{ref}/{op}"
 )
+
+// CodeHomedHere is the code of the answer to an aside request for a project the node's registry still
+// homes on it.
+const CodeHomedHere = "homed_here"
 
 // Operations of PathPrimary.
 const (
@@ -284,10 +289,22 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 		writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local, Fenced: already})
 		return
 	}
+	// A node fence names the epoch after this node's, and comes from an active node that holds a
+	// standby of the system cluster: the survivor that takes over. A survivor whose registry copy
+	// lags is refused (its epoch is not the next one); it does not ask again, and goes on to the
+	// provider's fence, which is the one that counts.
+	if req.Epoch != local+1 {
+		writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local})
+		return
+	}
+	if !o.mayTakeOver(ctx, peer.Node) {
+		writePeerError(w, http.StatusForbidden, "forbidden", "only an active node that holds a standby of the system cluster may fence this node")
+		return
+	}
 	refs := o.primaryRefs(ctx)
 	stopped, err := o.fencePrimaries(ctx, refs, func() error {
-		return fenced.WriteNode(paths, fenced.Record{Epoch: req.Epoch, Leader: req.Leader, Reason: reasonOf(req), At: o.d.Now().UTC()})
-	})
+		return fenced.WriteNode(paths, o.nodeRecord(req.Epoch, req.Leader, reasonOf(req)))
+	}, true)
 	if err != nil {
 		writePeerError(w, http.StatusInternalServerError, "fence_failed", err.Error())
 		return
@@ -309,7 +326,7 @@ func (o *Orchestrator) fenceProjectHere(ctx context.Context, req FenceCall) (pee
 	}
 	stopped, err := o.fencePrimaries(ctx, []string{req.Ref}, func() error {
 		return fenced.WriteProject(o.d.Cfg.Paths(), fenced.Record{Epoch: req.Epoch, Leader: req.Leader, Ref: req.Ref, Reason: reasonOf(req), At: o.d.Now().UTC()})
-	})
+	}, false)
 	if err != nil {
 		return peerapi.FenceResponse{}, err
 	}
@@ -323,14 +340,71 @@ func reasonOf(req FenceCall) string {
 	return fmt.Sprintf("node %s leads at epoch %d", req.Leader, req.Epoch)
 }
 
+// nodeRecord is the fence record of this node: who replaced it, why, and the peers it knew, so that
+// `supavise node rejoin` finds the leader's address when the node's own registry is stopped.
+func (o *Orchestrator) nodeRecord(epoch int64, leader, reason string) fenced.Record {
+	return fenced.Record{Epoch: epoch, Leader: leader, Reason: reason, At: o.d.Now().UTC(), Peers: cluster.PeersOf(o.d.Members.Nodes(), o.self().ID)}
+}
+
+// mayTakeOver reports whether node is an active node that holds a standby of the system cluster, as
+// this node's registry has it. A registry that cannot be read (the system cluster of a node that is
+// being replaced is often what is broken) cannot say, and the cooperative fence is only the polite
+// half of the fence, so this node's snapshot of the membership answers instead: a member that is active
+// may ask, and a node that is not a member, or is not active, may not. The provider's fence is the one
+// that counts.
+func (o *Orchestrator) mayTakeOver(ctx context.Context, node string) bool {
+	st := o.store()
+	n, err := st.GetNode(ctx, node)
+	switch {
+	case errors.Is(err, registry.ErrNotFound):
+		return false
+	case err != nil:
+		o.d.Log.Warn("the claimant of a fence could not be checked against the registry; the membership answers", "node", node, "error", err)
+		return o.activeMember(node)
+	}
+	if n.State != registry.NodeActive {
+		return false
+	}
+	reps, err := st.ListReplicas(ctx, config.SystemRef)
+	if err != nil {
+		return true // active in the registry; whether it holds the standby cannot be read
+	}
+	for _, r := range reps {
+		if r.NodeID == node {
+			return true
+		}
+	}
+	return false
+}
+
+// activeMember reports whether this node's snapshot of the membership lists node as active.
+func (o *Orchestrator) activeMember(node string) bool {
+	for _, n := range o.d.Members.Nodes() {
+		if n.ID == node {
+			return n.State == registry.NodeActive
+		}
+	}
+	return false
+}
+
 // fencePrimaries records the fence, then for each ref removes the launcher and stops the
-// primary. It stops at nothing: every ref is tried, and the first error is returned after.
-func (o *Orchestrator) fencePrimaries(ctx context.Context, refs []string, record func() error) ([]string, error) {
+// primary. It stops at nothing: every ref is tried, and the first error is returned after. A fence
+// of the whole node (services) also stops the shared services first: a node that no longer leads
+// must not keep Realtime, Storage and the rest running against clusters that are stopped.
+func (o *Orchestrator) fencePrimaries(ctx context.Context, refs []string, record func() error, services bool) ([]string, error) {
 	if err := record(); err != nil {
 		return nil, fmt.Errorf("recording the fence: %w", err)
 	}
+	if services && o.d.FenceNode != nil {
+		return o.d.FenceNode(ctx)
+	}
 	var stopped []string
 	var first error
+	if services && o.d.LocalServices != nil {
+		if err := o.d.LocalServices.Stop(ctx); err != nil {
+			first = fmt.Errorf("stopping the shared services: %w", err)
+		}
+	}
 	for _, ref := range refs {
 		if err := removeLauncher(o.d.Cfg, ref); err != nil && first == nil {
 			first = err
@@ -414,10 +488,12 @@ func (o *Orchestrator) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 	// One quiesce at a time, and not beside a move of this node's own: a second request waits for
 	// the first and answers from its record, and a project move that started during the stops would
 	// stop or start the same clusters. Only the quiesce a switchover is waiting for holds the slot;
-	// the leader refuses to start another move until it has finished.
+	// the leader refuses to start another move until it has finished. A switchover that this node
+	// started with --to holds the slot itself while the survivor runs it, and the survivor's
+	// quiesce is that move continuing: it passes (acquireForDelegate).
 	o.quiesceMu.Lock()
 	defer o.quiesceMu.Unlock()
-	release, err := o.acquire()
+	release, err := o.acquireForDelegate(peer.Node)
 	if err != nil {
 		writePeerError(w, http.StatusConflict, "busy", "a move is running on the leader")
 		return
@@ -639,9 +715,16 @@ func (o *Orchestrator) handlePrimary(w http.ResponseWriter, r *http.Request) {
 		res.Healthy, res.Detail, err = o.d.LocalPrimaries.Healthy(ctx, ref)
 	case OpAside:
 		// Data moves aside only for a project the registry homes elsewhere: the leader homes the
-		// project on the replica's node before it asks, and one this node still homes is live.
-		if p, gerr := o.store().GetProject(ctx, ref); gerr == nil && p.NodeID == o.self().ID {
-			writePeerError(w, http.StatusConflict, "homed_here", "the registry homes "+ref+" on this node: its data is not set aside")
+		// project on the replica's node before it asks, and one this node still homes is live. A
+		// registry that cannot be read cannot say, and a rename of live data is not undone by a
+		// retry: the answer is no, and the leader asks again.
+		p, gerr := o.store().GetProject(ctx, ref)
+		switch {
+		case gerr == nil && p.NodeID == o.self().ID:
+			writePeerError(w, http.StatusConflict, CodeHomedHere, "the registry homes "+ref+" on this node: its data is not set aside")
+			return
+		case gerr != nil && !errors.Is(gerr, registry.ErrNotFound):
+			writePeerError(w, http.StatusServiceUnavailable, "registry_unavailable", "this node's registry cannot say where "+ref+" is homed, so its data is not set aside: "+gerr.Error())
 			return
 		}
 		err = o.d.LocalPrimaries.SetAside(ctx, ref, req.Epoch)

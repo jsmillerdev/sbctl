@@ -62,8 +62,9 @@ type Provider struct {
 }
 
 var (
-	_ failover.Provider = (*Provider)(nil)
-	_ failover.Cloud    = (*Provider)(nil)
+	_ failover.Provider      = (*Provider)(nil)
+	_ failover.Cloud         = (*Provider)(nil)
+	_ failover.AddressProber = (*Provider)(nil)
 )
 
 func (p *Provider) Name() string { return "aws" }
@@ -357,12 +358,58 @@ func (p *Provider) Probe(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	// The permission is asked for the call a failover makes: with the survivor's secondary private
+	// address when that is where the service address goes, which the role's policy covers through the
+	// network interface and not only the instance and the address. A survivor with no free address is
+	// ProbeTakeover's to report; its dry run asks about the primary address.
+	target, err := p.takeoverTarget(ctx, c, self, cl.Service.AllocationID)
+	if err != nil && !errors.Is(err, failover.ErrNoTakeover) {
+		return err
+	}
 	return dry("AssociateAddress", func() error {
 		_, err := c.AssociateAddress(ctx, awsapi.AssociateAddressInput{
-			AllocationID: cl.Service.AllocationID, InstanceID: self.InstanceID, AllowReassociation: true, DryRun: true,
+			AllocationID: cl.Service.AllocationID, InstanceID: self.InstanceID, PrivateIP: target, AllowReassociation: true, DryRun: true,
 		})
 		return err
 	})
+}
+
+// takeoverTarget is the private address of the survivor that TakeOver maps the service address to,
+// "" for its primary address; failover.ErrNoTakeover when it has no address to spare.
+func (p *Provider) takeoverTarget(ctx context.Context, c EC2, self *registry.NodeAWS, alloc string) (string, error) {
+	inst, err := describe(ctx, c, self.InstanceID)
+	if err != nil {
+		return "", err
+	}
+	own, err := c.DescribeAddresses(ctx, awsapi.DescribeAddressesInput{Filters: []awsapi.Filter{{Name: "instance-id", Values: []string{self.InstanceID}}}})
+	if err != nil {
+		return "", fmt.Errorf("aws: DescribeAddresses for %s: %w", self.InstanceID, err)
+	}
+	return takeoverIP(inst, own, alloc)
+}
+
+// ProbeTakeover asks whether this node can take the service address over by itself. A survivor whose
+// only private address carries an Elastic IP of its own cannot, and a failover on it ends with the
+// address left to the operator; the automatic mode, which has no operator to hand it to, stays off
+// with this as its reason (failover.AddressProber).
+func (p *Provider) ProbeTakeover(ctx context.Context) error {
+	cl, err := p.Cluster(ctx)
+	if err != nil {
+		return fmt.Errorf("aws: reading the cluster: %w", err)
+	}
+	self, err := identity(cl.Self)
+	if err != nil {
+		return err
+	}
+	if cl.Service.AllocationID == "" {
+		return failover.ErrNoServiceAddress
+	}
+	c, err := p.client(self.Region)
+	if err != nil {
+		return err
+	}
+	_, err = p.takeoverTarget(ctx, c, self, cl.Service.AllocationID)
+	return err
 }
 
 // dry runs one DryRun call and words a refusal for the operator.
