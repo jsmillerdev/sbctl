@@ -192,6 +192,31 @@ func (s *Server) replicaOf(ctx context.Context, ref, identifier string) (rep reg
 	return rs[i], true, nil
 }
 
+// replicasByRef reads the replicas of a page of projects in one query, for the listings that show
+// many projects at once; the Resolver answers one project at a time. Both read the registry's
+// replicas, so a project has the same replicas by either. A node without a controller lists the
+// primary alone, as replicasOf does, and reads nothing.
+func (s *Server) replicasByRef(ctx context.Context, ps []registry.Project) (map[string][]registry.Replica, error) {
+	if s.replicas == nil || len(ps) == 0 {
+		return nil, nil
+	}
+	all, err := s.reg.ListReplicas(ctx, "")
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	listed := make(map[string]bool, len(ps))
+	for _, p := range ps {
+		listed[p.Ref] = true
+	}
+	out := map[string][]registry.Replica{}
+	for _, rep := range all {
+		if listed[rep.Ref] {
+			out[rep.Ref] = append(out[rep.Ref], rep)
+		}
+	}
+	return out, nil
+}
+
 // nodeRegions maps node ids to the region shown for what runs on them: the node's own, else the
 // node-wide one.
 func (s *Server) nodeRegions(ctx context.Context) (map[string]string, error) {

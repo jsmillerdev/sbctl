@@ -218,6 +218,10 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 	mine = mine[offset:min(total, offset+limit)]
 	rows := make([]any, 0, len(mine))
 	const key = "GET /platform/organizations/{slug}/projects"
+	byRef, err := s.replicasByRef(r.Context(), mine)
+	if err != nil {
+		return err
+	}
 	var regions map[string]string // node regions, loaded when a project has a replica
 	for _, p := range mine {
 		row := elem(key, "projects")
@@ -231,10 +235,7 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 		}
 		setAll(db, map[string]any{"cloud_provider": "AWS", "identifier": p.Ref, "region": s.regionOf(&p), "status": string(p.Status), "type": "PRIMARY", "infra_compute_size": infraComputeSize(&p)})
 		dbs := []any{db}
-		reps, err := s.placement.ReplicasOf(r.Context(), p.Ref)
-		if err != nil {
-			return mapErr(err)
-		}
+		reps := byRef[p.Ref]
 		if len(reps) > 0 && regions == nil {
 			if regions, err = s.nodeRegions(r.Context()); err != nil {
 				return err
