@@ -226,13 +226,14 @@ apt-get -o DPkg::Lock::Timeout=300 install -y -qq curl ca-certificates sudo pyth
 EOS
 }
 
-# multi_install NODE [FLAGS...]: copies the binary (SUPAVISE_BIN), install.sh, lib.sh and the S3 credentials
-# (a 0600 file) into the node and runs `install.sh --binary` there with the flags every node of the
-# harness takes: its own address, no TLS, no firewall changes, no dashboard, no OS updates, and Garage as
-# the backup backend under the prefix S3_PREFIX (default: the node's name; a cluster shares one prefix, so
-# a joining server gets the same one as the server it joins) and, when MULTI_DOMAIN is set, that domain (a
-# domain left to the default follows each node's own address, so the nodes of a cluster need one). FLAGS follow, for example --claim-token-file
-# or --join-token-file. The output goes to $LOG_DIR/NODE/install.log; the exit status is install.sh's.
+# multi_install NODE [FLAGS...]: copies the binary (SUPAVISE_BIN), install.sh, lib.sh and the S3 credentials (a
+# 0600 file) into the node and runs `install.sh --binary` there with the flags every node of the harness takes:
+# its own address, no TLS, no firewall changes, no dashboard, no OS updates, and Garage as the backup backend
+# under the prefix S3_PREFIX (default: the node's name; a cluster shares one prefix, so a joining server gets the
+# same one as the server it joins). When MULTI_DOMAIN is set, that is the domain: left to the default, a domain
+# follows each node's own address, and the nodes of a cluster need one. FLAGS follow, for example
+# --claim-token-file or --join-token-file. The output goes to $LOG_DIR/NODE/install.log; the exit status is
+# install.sh's.
 multi_install() {
   local n=$1 ip d=$LOG_DIR/$1
   shift
