@@ -120,10 +120,10 @@ func awsResolver(cfg *config.Config, self func() registry.Node) mesh.AddrResolve
 	return &cluster.AWSResolver{EC2: c.EC2, Self: self}
 }
 
-// awsIdentity reads the instance id, zone, region and Elastic IP allocation of the instance this
+// AWSIdentity reads the instance id, zone, region and Elastic IP allocation of the instance this
 // daemon runs on from the metadata service. Nil when the server is not recorded as an AWS stack or
 // the metadata service does not answer.
-func awsIdentity(ctx context.Context, cfg *config.Config) *registry.NodeAWS {
+func AWSIdentity(ctx context.Context, cfg *config.Config) *registry.NodeAWS {
 	if cfg.AWS.StackName == "" {
 		return nil
 	}
@@ -512,7 +512,7 @@ func registerSelf(ctx context.Context, w *Wire, live *cluster.Live, log *slog.Lo
 	if n.PublicHost == "" {
 		n.PublicHost = w.Cfg.PublicIP
 	}
-	if id := awsIdentity(ctx, w.Cfg); id != nil {
+	if id := AWSIdentity(ctx, w.Cfg); id != nil {
 		n.Provider = registry.NodeProvider{AWS: id}
 	}
 	if err := w.Node.Registry.UpdateNode(ctx, &n); err != nil {

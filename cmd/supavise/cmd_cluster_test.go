@@ -74,12 +74,6 @@ func hasCommandLine(help, name string) bool {
 // Every command of the cluster work is registered and says plainly that it is not there yet.
 func TestClusterCommandsAreStubs(t *testing.T) {
 	for _, args := range [][]string{
-		{"node", "token", "--ttl", "30m"},
-		{"node", "join", "svj1.example"},
-		{"node", "join", "--resume"},
-		{"node", "ls", "--dns"},
-		{"node", "rm", "n2", "--yes"},
-		{"node", "rejoin", "--leader", "10.0.0.1:7443"},
 		{"replicas", "ls"},
 		{"replicas", "add", "abcdefghijklmnopqrst", "--region", "eu-west-1", "--node", "n2"},
 		{"replicas", "rm", "abcdefghijklmnopqrst-rr-eu-west-1-k3j9d2"},
