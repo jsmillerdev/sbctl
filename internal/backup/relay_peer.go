@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Who may use a relay socket
@@ -56,12 +58,29 @@ func relayPeerUnitAllowed(unit, ref string) bool {
 	switch {
 	case unit == "supavise-postgres@"+ref+".service":
 		return true
+	case replicaUnitOf(unit, ref):
+		return true
 	case strings.HasPrefix(unit, "supavise-basebackup@"), unit == "supavise-basebackup-prune.service":
 		return true
 	case strings.HasPrefix(unit, "supavise-"):
 		return false
 	}
 	return true
+}
+
+// replicaUnitOf reports whether unit is the Postgres unit of a replica of ref, named by the
+// replica's identifier (supavise-postgres@<ref>-rr-<region>-<id>.service).
+func replicaUnitOf(unit, ref string) bool {
+	id, ok := strings.CutPrefix(unit, "supavise-postgres@")
+	if !ok {
+		return false
+	}
+	id, ok = strings.CutSuffix(id, ".service")
+	if !ok {
+		return false
+	}
+	r, _, _, ok := registry.ParseReplicaIdentifier(id)
+	return ok && r == ref
 }
 
 // peerListener refuses the connections of peers that check rejects.
