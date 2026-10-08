@@ -981,3 +981,38 @@ func TestAPlanViewsTheReplicasInParallelButBounded(t *testing.T) {
 		t.Fatalf("%d nodes were asked at once; want between 2 and %d", peak, viewParallel)
 	}
 }
+
+// A leader that the cloud reports stopped is not asked to fence itself: the polite fence would wait
+// out its timeout against an address nobody answers.
+func TestTheCooperativeFenceIsSkippedForALeaderTheCloudSaysIsStopped(t *testing.T) {
+	for state, skipped := range map[string]bool{"stopped": true, "terminated": true, "running": false, "stopping": false, "": false} {
+		t.Run("cloud says "+state, func(t *testing.T) {
+			w := serverWorld(t)
+			w.down["n1"] = true
+			w.provider.state = PeerState{State: state}
+			mv, err := w.orch().FailoverServer(w.ctx, ServerOptions{})
+			if err != nil || mv.State != registry.MoveDone {
+				t.Fatalf("move %+v, error %v", mv, err)
+			}
+			detail := w.stepDetail(serverMove(t, w), "fence")
+			if got := strings.Contains(detail, "cooperative fence: skipped"); got != skipped {
+				t.Fatalf("fence step %q, skipped %v want %v", detail, got, skipped)
+			}
+			if asked := w.has("fence n1"); asked == skipped {
+				t.Fatalf("the cooperative fence was asked: %v, want %v\n%v", asked, !skipped, w.snapshot())
+			}
+			w.assertOrder("provider.fence n1")
+		})
+	}
+	t.Run("no fencer, no cloud", func(t *testing.T) {
+		w := serverWorld(t)
+		w.down["n1"] = true
+		o := w.orch(func(d *Deps) { d.Provider = Manual{} })
+		if _, err := o.FailoverServer(w.ctx, ServerOptions{OldPrimaryIsDown: true}); err != nil {
+			t.Fatal(err)
+		}
+		if !w.has("fence n1") {
+			t.Fatal("the manual provider has nothing to replace the cooperative fence")
+		}
+	})
+}

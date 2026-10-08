@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/mesh"
@@ -284,10 +285,21 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 		writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local, Fenced: already})
 		return
 	}
+	// A node fence names the epoch after this node's, and comes from an active node that holds a
+	// standby of the system cluster: the survivor that takes over. A survivor whose registry copy
+	// lags is refused (its epoch is not the next one) and asks again when it has caught up.
+	if req.Epoch != local+1 {
+		writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local})
+		return
+	}
+	if !o.mayTakeOver(ctx, peer.Node) {
+		writePeerError(w, http.StatusForbidden, "forbidden", "only an active node that holds a standby of the system cluster may fence this node")
+		return
+	}
 	refs := o.primaryRefs(ctx)
 	stopped, err := o.fencePrimaries(ctx, refs, func() error {
-		return fenced.WriteNode(paths, fenced.Record{Epoch: req.Epoch, Leader: req.Leader, Reason: reasonOf(req), At: o.d.Now().UTC()})
-	})
+		return fenced.WriteNode(paths, o.nodeRecord(req.Epoch, req.Leader, reasonOf(req)))
+	}, true)
 	if err != nil {
 		writePeerError(w, http.StatusInternalServerError, "fence_failed", err.Error())
 		return
@@ -309,7 +321,7 @@ func (o *Orchestrator) fenceProjectHere(ctx context.Context, req FenceCall) (pee
 	}
 	stopped, err := o.fencePrimaries(ctx, []string{req.Ref}, func() error {
 		return fenced.WriteProject(o.d.Cfg.Paths(), fenced.Record{Epoch: req.Epoch, Leader: req.Leader, Ref: req.Ref, Reason: reasonOf(req), At: o.d.Now().UTC()})
-	})
+	}, false)
 	if err != nil {
 		return peerapi.FenceResponse{}, err
 	}
@@ -323,14 +335,56 @@ func reasonOf(req FenceCall) string {
 	return fmt.Sprintf("node %s leads at epoch %d", req.Leader, req.Epoch)
 }
 
+// nodeRecord is the fence record of this node: who replaced it, why, and the peers it knew, so that
+// `supavise node rejoin` finds the leader's address when the node's own registry is stopped.
+func (o *Orchestrator) nodeRecord(epoch int64, leader, reason string) fenced.Record {
+	return fenced.Record{Epoch: epoch, Leader: leader, Reason: reason, At: o.d.Now().UTC(), Peers: cluster.PeersOf(o.d.Members.Nodes(), o.self().ID)}
+}
+
+// mayTakeOver reports whether node is an active node that holds a standby of the system cluster, as
+// this node's registry has it. A registry that cannot be read (the system cluster of a node that is
+// being replaced is often what is broken) cannot say, and the cooperative fence is only the polite
+// half of the fence: the answer is yes, and the provider's fence is what counts.
+func (o *Orchestrator) mayTakeOver(ctx context.Context, node string) bool {
+	st := o.store()
+	n, err := st.GetNode(ctx, node)
+	switch {
+	case errors.Is(err, registry.ErrNotFound):
+		return false
+	case err != nil:
+		o.d.Log.Warn("the claimant of a fence could not be checked against the registry", "node", node, "error", err)
+		return true
+	}
+	if n.State != registry.NodeActive {
+		return false
+	}
+	reps, err := st.ListReplicas(ctx, config.SystemRef)
+	if err != nil {
+		return true
+	}
+	for _, r := range reps {
+		if r.NodeID == node {
+			return true
+		}
+	}
+	return false
+}
+
 // fencePrimaries records the fence, then for each ref removes the launcher and stops the
-// primary. It stops at nothing: every ref is tried, and the first error is returned after.
-func (o *Orchestrator) fencePrimaries(ctx context.Context, refs []string, record func() error) ([]string, error) {
+// primary. It stops at nothing: every ref is tried, and the first error is returned after. A fence
+// of the whole node (services) also stops the shared services first: a node that no longer leads
+// must not keep Realtime, Storage and the rest running against clusters that are stopped.
+func (o *Orchestrator) fencePrimaries(ctx context.Context, refs []string, record func() error, services bool) ([]string, error) {
 	if err := record(); err != nil {
 		return nil, fmt.Errorf("recording the fence: %w", err)
 	}
 	var stopped []string
 	var first error
+	if services && o.d.LocalServices != nil {
+		if err := o.d.LocalServices.Stop(ctx); err != nil {
+			first = fmt.Errorf("stopping the shared services: %w", err)
+		}
+	}
 	for _, ref := range refs {
 		if err := removeLauncher(o.d.Cfg, ref); err != nil && first == nil {
 			first = err

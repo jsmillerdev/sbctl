@@ -190,6 +190,16 @@ type PeerState struct {
 	Detail   string
 }
 
+// Gone reports whether the cloud says the machine is stopped or terminated: nothing on it can hear
+// a request, so a cooperative fence would only wait for its timeout.
+func (s PeerState) Gone() bool {
+	switch s.State {
+	case "stopped", "terminated", "shutting-down":
+		return true
+	}
+	return false
+}
+
 // Down reports whether the machine is not running, or is running and failing its checks. A
 // pending or stopping machine is not down: it has not finished changing state.
 func (s PeerState) Down() bool {

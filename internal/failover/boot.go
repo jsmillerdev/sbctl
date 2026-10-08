@@ -164,11 +164,11 @@ func (o *Orchestrator) FenceOnHigherEpoch(ctx context.Context, source string, ep
 // primaries running: they are stopped and their launchers removed all the same.
 func (o *Orchestrator) fenceSelf(ctx context.Context, res BootResult, when string) error {
 	var errs []error
-	if err := fenced.WriteNode(o.d.Cfg.Paths(), fenced.Record{Epoch: res.Epoch, Leader: res.Leader, Reason: res.Reason, At: o.d.Now().UTC()}); err != nil {
+	if err := fenced.WriteNode(o.d.Cfg.Paths(), o.nodeRecord(res.Epoch, res.Leader, res.Reason)); err != nil {
 		errs = append(errs, fmt.Errorf("failover: recording that this node is fenced: %w", err))
 	}
 	if o.d.LocalPrimaries != nil {
-		if _, err := o.fencePrimaries(context.WithoutCancel(ctx), o.primaryRefs(ctx), func() error { return nil }); err != nil {
+		if _, err := o.fencePrimaries(context.WithoutCancel(ctx), o.primaryRefs(ctx), func() error { return nil }, true); err != nil {
 			errs = append(errs, fmt.Errorf("failover: this node is fenced, but a primary could not be stopped: %w", err))
 		}
 	}

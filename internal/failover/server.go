@@ -317,7 +317,16 @@ func (o *Orchestrator) waitReplayed(ctx context.Context, node, identifier, lsn s
 // provider the operator asserted that the node is down, and that is what the move rests on.
 func (o *Orchestrator) fenceLeader(ctx context.Context, run *serverRun, req Request) (string, error) {
 	var parts []string
-	if o.d.Peers != nil {
+	// A leader that the cloud reports stopped or terminated hears nothing; the polite fence would wait
+	// out its whole timeout, which is added to the time the survivor takes to lead.
+	gone := false
+	if cloud, ok := o.d.Provider.(Cloud); ok && o.d.Provider.Name() != "manual" {
+		if st, err := cloud.PeerState(ctx, run.from); err == nil && st.Gone() {
+			gone = true
+			parts = append(parts, fmt.Sprintf("cooperative fence: skipped, the cloud reports %s %s", run.from.Name, st.State))
+		}
+	}
+	if o.d.Peers != nil && !gone {
 		timeout := o.conf().StopTimeout()
 		if o.d.Provider.Name() != "manual" {
 			timeout = 20 * time.Second // the hard fence follows
