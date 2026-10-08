@@ -158,7 +158,10 @@ func TestResumeServerMove(t *testing.T) {
 	pass := func(to string) *failover.Plan {
 		return &failover.Plan{To: to, Checks: []failover.Check{{Name: "unfinished move", OK: true}}}
 	}
-	run := func(t *testing.T, role cluster.Role, plan *failover.Plan, ready bool) int {
+	// run starts the resume with the node in role and the plan given, marks the services up when ready
+	// is set, and reports how many times the move was resumed. A resume that is expected is waited for;
+	// one that is not gets a short time to show up.
+	run := func(t *testing.T, role cluster.Role, plan *failover.Plan, ready, want bool) int {
 		t.Helper()
 		w := testWire(t)
 		svc := &fakeService{plan: plan, resumeC: make(chan struct{}, 1)}
@@ -173,28 +176,32 @@ func TestResumeServerMove(t *testing.T) {
 		if ready {
 			w.markReady()
 		}
+		wait := 100 * time.Millisecond
+		if want {
+			wait = 10 * time.Second
+		}
 		select {
 		case <-svc.resumeC:
 		case <-done:
-		case <-time.After(150 * time.Millisecond):
+		case <-time.After(wait):
 		}
 		cancel()
 		<-done
 		return svc.count()
 	}
-	if n := run(t, cluster.RoleLeader, pass("n2"), true); n != 1 {
+	if n := run(t, cluster.RoleLeader, pass("n2"), true, true); n != 1 {
 		t.Errorf("the move that promoted this node was resumed %d times", n)
 	}
-	if n := run(t, cluster.RoleLeader, pass("n3"), true); n != 0 {
+	if n := run(t, cluster.RoleLeader, pass("n3"), true, false); n != 0 {
 		t.Errorf("a move to another node was resumed here")
 	}
-	if n := run(t, cluster.RoleLeader, &failover.Plan{To: "n2", Checks: []failover.Check{{Name: "unfinished move", OK: false}}}, true); n != 0 {
+	if n := run(t, cluster.RoleLeader, &failover.Plan{To: "n2", Checks: []failover.Check{{Name: "unfinished move", OK: false}}}, true, false); n != 0 {
 		t.Errorf("there was nothing to resume and it was resumed")
 	}
-	if n := run(t, cluster.RoleFollower, pass("n2"), true); n != 0 {
+	if n := run(t, cluster.RoleFollower, pass("n2"), true, false); n != 0 {
 		t.Errorf("a follower finished a move")
 	}
-	if n := run(t, cluster.RoleLeader, pass("n2"), false); n != 0 {
+	if n := run(t, cluster.RoleLeader, pass("n2"), false, false); n != 0 {
 		t.Errorf("the move resumed with the services not up")
 	}
 }
