@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,17 @@ type Options struct {
 	// the caller starts any slow delivery itself. `supavise upgrade` leaves it nil: it reports the
 	// node's upgrade as one, not every project's move.
 	UpgradeNotify func(ctx context.Context, n UpgradeNotice)
+	// NodeID is the id of the node this Engine runs on (registry.Node.ID). StartActive, Recover and
+	// EnsureTenants leave a project homed on another node (registry.Project.NodeID) to that node. Empty
+	// means every project is this node's: a server outside a cluster, and tests.
+	NodeID string
+	// ReadOnly is the Engine of a follower, whose registry is a hot standby of the leader's: it takes
+	// no advisory locks (a standby refuses them), and Recover, which settles statuses in the
+	// registry, does nothing. The operations that write the registry fail with registry.ErrReadOnly.
+	ReadOnly bool
+	// Replicas reaches the replicas of a project on the nodes that hold them, so that a resize can
+	// restart them in the right order (see ReplicaFleet). Nil: the node has none.
+	Replicas ReplicaFleet
 }
 
 // Timers drives the per-project nightly base backup timer (supavise-basebackup@<ref>.timer).
@@ -122,7 +134,7 @@ func (e *Engine) lock(ctx context.Context, ref string) (func(), error) {
 	mu := m.(*sync.Mutex)
 	mu.Lock()
 	ap, ok := e.reg.(advisoryPool)
-	if !ok || ap.Pool() == nil {
+	if !ok || ap.Pool() == nil || e.opts.ReadOnly {
 		return mu.Unlock, nil
 	}
 	conn, err := pgx.ConnectConfig(ctx, ap.Pool().Config().ConnConfig)
@@ -142,6 +154,20 @@ func (e *Engine) lock(ctx context.Context, ref string) (func(), error) {
 		mu.Unlock()
 	}, nil
 }
+
+// homedHere reports whether p is this node's to run: its home is this node, or the Engine has no
+// node (a server outside a cluster).
+func (e *Engine) homedHere(p *registry.Project) bool {
+	return e.opts.NodeID == "" || p.NodeID == "" || p.NodeID == e.opts.NodeID
+}
+
+// SetPlane replaces the plane the Engine drives. internal/app calls it before the Engine serves a
+// request, to put the plane router (internal/placement) in front of the node's own plane in a
+// cluster; it is not safe to call while operations run.
+func (e *Engine) SetPlane(p Plane) { e.plane = p }
+
+// NodeID is the node the Engine runs on ("" outside a cluster).
+func (e *Engine) NodeID() string { return e.opts.NodeID }
 
 // cleanupCtx outlives a cancelled request: cleanup after a failure must still run.
 func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -865,7 +891,7 @@ func (e *Engine) StartActive(ctx context.Context) map[string]error {
 	}
 	for i := range ps {
 		p := ps[i]
-		if p.Ref == config.SystemRef || !active(p.Status) {
+		if p.Ref == config.SystemRef || !active(p.Status) || !e.homedHere(&p) {
 			continue
 		}
 		if err := e.startOne(ctx, &p); err != nil {
@@ -892,7 +918,7 @@ func (e *Engine) EnsureTenants(ctx context.Context) map[string]error {
 		return errs
 	}
 	for i := range ps {
-		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) {
+		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) || !e.homedHere(&ps[i]) {
 			continue
 		}
 		if err := e.ensureTenantsOf(ctx, ps[i].Ref); err != nil {
@@ -1097,11 +1123,16 @@ const StatusDeleted registry.Status = "DELETED"
 //
 // RESTORING is not touched: a restore is for its operator to judge.
 func (e *Engine) Recover(ctx context.Context) []Recovered {
+	if e.opts.ReadOnly {
+		return nil // a follower settles nothing: it cannot write the registry
+	}
 	ps, err := e.reg.ListProjects(ctx)
 	if err != nil {
 		e.log.Error("recover: listing projects", "error", err)
 		return nil
 	}
+	// A project homed on another node is that node's to recover.
+	ps = slices.DeleteFunc(ps, func(p registry.Project) bool { return !e.homedHere(&p) })
 	routes := map[string]bool{}
 	if rs, err := e.reg.ListRoutes(ctx); err == nil {
 		for _, r := range rs {

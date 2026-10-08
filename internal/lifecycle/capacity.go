@@ -107,6 +107,23 @@ type Capacity struct {
 	// Projects is how many projects that is. The system project is not counted: it and the
 	// shared services are part of what the overcommit ratio absorbs.
 	Projects int
+	// Replicas is how many replicas of projects homed elsewhere run here; each holds its project's
+	// memory cap and is part of CommittedBytes and not of Projects.
+	Replicas int
+}
+
+// holders names what the committed memory is promised to: "3 projects", or "3 projects and 1
+// replica" on a node that holds replicas; with adj "other ", "3 other projects".
+func (c Capacity) holders(adj string) string {
+	s := fmt.Sprintf("%d %sprojects", c.Projects, adj)
+	switch c.Replicas {
+	case 0:
+	case 1:
+		s += " and 1 replica"
+	default:
+		s += fmt.Sprintf(" and %d replicas", c.Replicas)
+	}
+	return s
 }
 
 // FreeBytes is what is left of the budget (never negative; meaningless when BudgetBytes is 0).
@@ -129,8 +146,8 @@ func (c Capacity) fits(cl Class, memory, cpu bool) error {
 	}
 	if memory && c.BudgetBytes > 0 && c.CommittedBytes+cl.MemoryBytes > c.BudgetBytes {
 		return &CapacityError{fmt.Sprintf(
-			"this node cannot run a %s project: it needs a memory cap of %s, and the node's budget of %s (%s of memory x %g overcommit) has %s left after %d other projects; delete or shrink a project, pause one that is idle, or raise [compute] overcommit",
-			cl.Title, sizeText(cl.MemoryBytes), sizeText(c.BudgetBytes), sizeText(c.Node.MemoryBytes), c.Overcommit, sizeText(c.FreeBytes()), c.Projects)}
+			"this node cannot run a %s project: it needs a memory cap of %s, and the node's budget of %s (%s of memory x %g overcommit) has %s left after %s; delete or shrink a project, pause one that is idle, or raise [compute] overcommit",
+			cl.Title, sizeText(cl.MemoryBytes), sizeText(c.BudgetBytes), sizeText(c.Node.MemoryBytes), c.Overcommit, sizeText(c.FreeBytes()), c.holders("other "))}
 	}
 	return nil
 }
@@ -174,21 +191,56 @@ func (e *Engine) Capacity(ctx context.Context, exclude string) (Capacity, bool, 
 	if err != nil {
 		return Capacity{}, true, err
 	}
-	return ComputeCapacity(e.cfg, e.capacity.node(), ps, exclude), true, nil
+	var rs []registry.Replica
+	if e.opts.NodeID != "" {
+		if rs, err = e.reg.ListReplicasOn(ctx, e.opts.NodeID); err != nil {
+			return Capacity{}, true, err
+		}
+	}
+	return ComputeNodeCapacity(e.cfg, e.capacity.node(), e.opts.NodeID, ps, rs, exclude), true, nil
 }
 
 // ComputeCapacity works out the node's room from its resources and its projects, leaving out the
-// project exclude. `supavise status` uses it without an Engine.
+// project exclude. `supavise status` uses it without an Engine. Every project in ps counts: use
+// ComputeNodeCapacity on a node of a cluster.
 func ComputeCapacity(cfg *config.Config, n NodeResources, ps []registry.Project, exclude string) Capacity {
+	return ComputeNodeCapacity(cfg, n, "", ps, nil, exclude)
+}
+
+// replicaCounts reports whether a replica in status s holds its project's memory cap on its node:
+// one that failed to set up or is being removed has no units.
+func replicaCounts(s string) bool {
+	return s != registry.ReplicaInitError && s != string(registry.StatusGoingDown)
+}
+
+// ComputeNodeCapacity is ComputeCapacity for the node with id node (empty: every project is
+// this node's): the projects homed on another node do not count, and each replica in rs (the
+// replicas on this node) counts with the memory cap of its project, which is the size its spec is
+// rendered from. A replica of the project exclude is left out with the project, and so are
+// those of a project that is paused (they stop with it) and the system cluster's standby.
+func ComputeNodeCapacity(cfg *config.Config, n NodeResources, node string, ps []registry.Project, rs []registry.Replica, exclude string) Capacity {
 	c := Capacity{Node: n, Overcommit: cfg.Compute.OvercommitRatio()}
 	c.BudgetBytes = int64(float64(n.MemoryBytes) * c.Overcommit)
+	byRef := make(map[string]*registry.Project, len(ps))
 	for i := range ps {
 		p := &ps[i]
+		byRef[p.Ref] = p
 		if p.Ref == config.SystemRef || p.Ref == exclude || !countsAgainstNode(p.Status) {
+			continue
+		}
+		if node != "" && p.NodeID != "" && p.NodeID != node {
 			continue
 		}
 		c.CommittedBytes += projectMemory(p)
 		c.Projects++
+	}
+	for _, r := range rs {
+		p := byRef[r.Ref]
+		if p == nil || p.Ref == config.SystemRef || p.Ref == exclude || !countsAgainstNode(p.Status) || !replicaCounts(r.Status) {
+			continue
+		}
+		c.CommittedBytes += projectMemory(p)
+		c.Replicas++
 	}
 	return c
 }
@@ -196,10 +248,10 @@ func ComputeCapacity(cfg *config.Config, n NodeResources, ps []registry.Project,
 // Summary is the one-line account of the node's room, as `supavise status` shows it.
 func (c Capacity) Summary() string {
 	if c.BudgetBytes == 0 {
-		return fmt.Sprintf("%s of project memory caps promised to %d projects; the node's memory is unknown", sizeText(c.CommittedBytes), c.Projects)
+		return fmt.Sprintf("%s of project memory caps promised to %s; the node's memory is unknown", sizeText(c.CommittedBytes), c.holders(""))
 	}
-	return fmt.Sprintf("%s of %s project memory caps promised to %d projects (%s of memory x %g overcommit); %d cores",
-		sizeText(c.CommittedBytes), sizeText(c.BudgetBytes), c.Projects, sizeText(c.Node.MemoryBytes), c.Overcommit, c.Node.CPUs)
+	return fmt.Sprintf("%s of %s project memory caps promised to %s (%s of memory x %g overcommit); %d cores",
+		sizeText(c.CommittedBytes), sizeText(c.BudgetBytes), c.holders(""), sizeText(c.Node.MemoryBytes), c.Overcommit, c.Node.CPUs)
 }
 
 // Over reports whether the caps already promised exceed the budget (sizes were raised by
