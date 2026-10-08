@@ -386,3 +386,31 @@ func TestPoolerDefaultsFollowTheSize(t *testing.T) {
 		t.Fatalf("under a ceiling of 300: %v", got)
 	}
 }
+
+func TestAvailableRegionsOffersTheNodesRegion(t *testing.T) {
+	f := newFixture(t)
+	for _, path := range []string{"/platform/projects/available-regions?cloud_provider=AWS&organization_slug=" + f.org.Slug, "/v1/projects/available-regions?organization_slug=" + f.org.Slug} {
+		rec := f.do("GET", path, nil)
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body)
+		}
+		route := "GET /platform/projects/available-regions"
+		if strings.HasPrefix(path, "/v1/") {
+			route = "GET /v1/projects/available-regions"
+		}
+		body := decodeBody(t, rec).(map[string]any)
+		validateAgainstSpec(t, route, asJSON(t, body))
+		all := body["all"].(map[string]any)["specific"].([]any)
+		if len(all) != 1 || all[0].(map[string]any)["code"] != f.cfg.ProjectRegion("") {
+			t.Fatalf("%s: specific regions %v", path, all)
+		}
+	}
+	// Studio's form sends the region it offered as region_selection; the project keeps it.
+	got := f.body(t, "POST", "/platform/projects", map[string]any{
+		"name": "regional", "organization_slug": f.org.Slug, "db_pass": "a-long-enough-password",
+		"region_selection": map[string]any{"type": "specific", "code": "eu-west-2"},
+	}, http.StatusCreated)
+	if got["region"] != "eu-west-2" {
+		t.Fatalf("region from region_selection: %v", got["region"])
+	}
+}

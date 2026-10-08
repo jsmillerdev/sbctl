@@ -123,7 +123,13 @@ type createInput struct {
 	Region         string `json:"region"`
 	// DBRegion is what Studio's CreateProjectBody sends instead of region.
 	DBRegion string `json:"db_region"`
-	DBPass   string `json:"db_pass"`
+	// RegionSelection is what Studio's form sends when it offers regions from available-regions:
+	// {"type": "specific", "code": "us-east-1"} or {"type": "smartGroup", "code": "americas"}.
+	RegionSelection *struct {
+		Type string `json:"type"`
+		Code string `json:"code"`
+	} `json:"region_selection"`
+	DBPass string `json:"db_pass"`
 	// DesiredInstanceSize is the compute size asked for ("small", "xlarge", ...); empty is the
 	// default size, which the node does not check against its capacity.
 	DesiredInstanceSize string `json:"desired_instance_size"`
@@ -169,6 +175,9 @@ func (s *Server) createProject(r *http.Request, in createInput) (*registry.Proje
 	}
 	if in.Region == "" {
 		in.Region = in.DBRegion
+	}
+	if in.Region == "" && in.RegionSelection != nil && in.RegionSelection.Type == "specific" {
+		in.Region = in.RegionSelection.Code
 	}
 	ref := secrets.NewRef()
 	req := lifecycle.CreateRequest{Name: strings.TrimSpace(in.Name), OrgSlug: org.Slug, Region: in.Region, Ref: ref, DBPassword: in.DBPass}
