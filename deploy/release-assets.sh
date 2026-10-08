@@ -11,7 +11,13 @@
 #                    makes it, deploy/MIN_UPGRADE_FROM says the oldest version that upgrades straight
 #                    to this one. The converge revision is read from the built binary of this machine's
 #                    architecture (`supavise release-info`, which the script makes executable first: a
-#                    downloaded workflow artifact is not); a binary that cannot run here gives 0.
+#                    downloaded workflow artifact is not); a binary that cannot run here gives 0 and a
+#                    warning, or, with SUPAVISE_REQUIRE_CONVERGE=1 (the release workflow sets it), stops
+#                    the release: a manifest that says 0 weakens the host-not-converged gating.
+#                    deploy/MIN_PEER_FROM says the oldest release a joined server may run alongside this
+#                    one (min_peer_from; SUPAVISE_MIN_PEER_FROM overrides the file) and
+#                    SUPAVISE_WAL_COMPAT=false marks a release whose PostgreSQL cannot read the WAL of
+#                    the releases before it (wal_compat: false; the servers that hold standbys upgrade first)
 #                    SUPAVISE_RELEASETOOL names a built releasetool; without it the script uses `go run`;
 #                    SUPAVISE_VERSIONS_FILE names the versions.yaml to read instead of the checkout's
 #                    (the upgrade-e2e job signs releases whose binaries pin other versions)
@@ -87,6 +93,11 @@ files+=(install.sh supavise.yaml supavise-aws-deploy.sh)
 if [[ -n $tag ]]; then
   # SUPAVISE_MIN_UPGRADE_FROM overrides the file (the install-e2e job tests a release with a floor).
   min=${SUPAVISE_MIN_UPGRADE_FROM:-$(grep -v '^[[:space:]]*#' "$here/MIN_UPGRADE_FROM" | tr -d '[:space:]')}
+  peer=${SUPAVISE_MIN_PEER_FROM:-$(grep -v '^[[:space:]]*#' "$here/MIN_PEER_FROM" | tr -d '[:space:]')}
+  wal=${SUPAVISE_WAL_COMPAT:-true}
+  case $wal in true | false) ;; *) echo "SUPAVISE_WAL_COMPAT $wal is not true or false" >&2; exit 1 ;; esac
+  extra=(-min-peer-from "$peer" "-wal-compat=$wal")
+  [[ ${SUPAVISE_REQUIRE_CONVERGE:-} != 1 ]] || extra+=(-require-converge)
   # The binary that reports the host converge revision is the one this machine can run.
   case $(uname -m) in aarch64|arm64) probe=supavise-linux-arm64 ;; *) probe=supavise-linux-amd64 ;; esac
   # upload-artifact and download-artifact do not keep the execute bit, so the binary of the release
@@ -94,9 +105,9 @@ if [[ -n $tag ]]; then
   chmod 0755 "$dist/$probe"
   rm -f supavise-release.json
   if [[ -n ${SUPAVISE_RELEASETOOL:-} ]]; then
-    "$SUPAVISE_RELEASETOOL" manifest -version "$tag" -min-upgrade-from "$min" -versions "${SUPAVISE_VERSIONS_FILE:-$here/../internal/versions/versions.yaml}" -binary "$dist/$probe" -template "$dist/supavise.yaml" -out supavise-release.json
+    "$SUPAVISE_RELEASETOOL" manifest -version "$tag" -min-upgrade-from "$min" "${extra[@]}" -versions "${SUPAVISE_VERSIONS_FILE:-$here/../internal/versions/versions.yaml}" -binary "$dist/$probe" -template "$dist/supavise.yaml" -out supavise-release.json
   else
-    (cd "$here/.." && go run ./deploy/releasetool manifest -version "$tag" -min-upgrade-from "$min" -versions "${SUPAVISE_VERSIONS_FILE:-internal/versions/versions.yaml}" -binary "$dist/$probe" -template "$dist/supavise.yaml" -out "$dist/supavise-release.json")
+    (cd "$here/.." && go run ./deploy/releasetool manifest -version "$tag" -min-upgrade-from "$min" "${extra[@]}" -versions "${SUPAVISE_VERSIONS_FILE:-internal/versions/versions.yaml}" -binary "$dist/$probe" -template "$dist/supavise.yaml" -out "$dist/supavise-release.json")
   fi
   [[ -s supavise-release.json ]] || { echo "the release manifest was not written" >&2; exit 1; }
   files+=(supavise-release.json)

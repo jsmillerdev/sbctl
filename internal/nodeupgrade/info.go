@@ -81,7 +81,7 @@ func OwnInfo(version string) (*Info, error) {
 		return nil, err
 	}
 	return &Info{Version: version, Platform: runtime.GOOS + "-" + runtime.GOARCH, Pins: PinsOf(v), RegistrySchema: registry.SchemaVersion(), RegistryMigrations: registry.MigrationNames(),
-		HostChanges: hostsetup.Titles(), ConvergeRevision: hostsetup.Revision, InfraRevision: infra.Revision}, nil
+		HostChanges: hostsetup.Titles(), ConvergeRevision: hostsetup.Revision, InfraRevision: infra.Current}, nil
 }
 
 // ParseInfo reads the JSON `supavise release-info --json` prints.

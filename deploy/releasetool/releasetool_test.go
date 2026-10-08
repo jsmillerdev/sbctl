@@ -324,6 +324,101 @@ func TestManifestHostAndAWSFields(t *testing.T) {
 	}
 }
 
+// A release names its peer floor and whether its PostgreSQL keeps the WAL format; the binary's own
+// word about its revisions is checked against the template's, and a release can insist on the
+// converge revision.
+func TestManifestPeerWALAndStrictFields(t *testing.T) {
+	dir := t.TempDir()
+	vf := filepath.Join(dir, "versions.yaml")
+	if err := os.WriteFile(vf, []byte(newYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	out := filepath.Join(dir, "m.json")
+	manifest := func(extra ...string) (*selfupdate.Manifest, error) {
+		os.Remove(out)
+		args := append([]string{"-version", "v1.1.0", "-min-upgrade-from", "v1.0.0", "-versions", vf, "-out", out}, extra...)
+		if err := cmdManifest(args); err != nil {
+			return nil, err
+		}
+		return selfupdate.ParseManifest(mustRead(t, out))
+	}
+
+	m, err := manifest()
+	if err != nil || m.MinPeerFrom != "" || !m.WALCompatible() || strings.Contains(string(mustRead(t, out)), "wal_compat") {
+		t.Errorf("without the flags the fields are left out: %+v %v\n%s", m, err, mustRead(t, out))
+	}
+	m, err = manifest("-min-peer-from", "v1.0.0", "-wal-compat=false")
+	if err != nil || m.MinPeerFrom != "v1.0.0" || m.WALCompatible() || !strings.Contains(string(mustRead(t, out)), `"wal_compat": false`) {
+		t.Errorf("with the flags: %+v %v\n%s", m, err, mustRead(t, out))
+	}
+	if m, err = manifest("-wal-compat=true"); err != nil || strings.Contains(string(mustRead(t, out)), "wal_compat") {
+		t.Errorf("wal_compat true is the absent field: %+v %v", m, err)
+	}
+	if _, err := manifest("-min-peer-from", "v2.0.0"); err == nil {
+		t.Error("a peer floor above the release was accepted")
+	}
+
+	// -require-converge turns the warning into a refusal and writes nothing.
+	for name, body := range map[string]string{
+		"predates":     `echo '{"version":"v1.1.0","pins":{}}'`,
+		"does-not-run": `exit 1`,
+	} {
+		b := bin(name, body)
+		if _, err := manifest("-binary", b); err != nil {
+			t.Errorf("%s: without -require-converge a warning is enough: %v", name, err)
+		}
+		if _, err := manifest("-binary", b, "-require-converge"); err == nil || !strings.Contains(err.Error(), "converge_revision") && !strings.Contains(err.Error(), "did not run") {
+			t.Errorf("%s: -require-converge: %v", name, err)
+		}
+		if _, err := os.Stat(out); err == nil {
+			t.Errorf("%s: a refused manifest was written", name)
+		}
+	}
+	good := bin("good", `echo '{"version":"v1.1.0","converge_revision":4,"infra_revision":`+strconv.Itoa(infra.Current)+`}'`)
+	tpl := filepath.Join("..", "cloudformation", "supavise.yaml")
+	if m, err := manifest("-binary", good, "-require-converge", "-template", tpl); err != nil || m.Host.ConvergeRevision != 4 || m.AWS.StackRevision != infra.Current {
+		t.Errorf("a binary that reports both: %+v %v", m, err)
+	}
+	// A binary of another stack revision than the template is not of the release.
+	stale := bin("stale", `echo '{"version":"v1.1.0","converge_revision":4,"infra_revision":`+strconv.Itoa(infra.Current-1)+`}'`)
+	if _, err := manifest("-binary", stale, "-template", tpl); err == nil || !strings.Contains(err.Error(), "not of one release") {
+		t.Errorf("a binary at another stack revision: %v", err)
+	}
+	// A binary that says nothing about the stack revision leaves the template's word standing.
+	if _, err := manifest("-binary", bin("nostack", `echo '{"version":"v1.1.0","converge_revision":4}'`), "-template", tpl); err != nil {
+		t.Errorf("a binary without infra_revision: %v", err)
+	}
+}
+
+// The binary is run with a minimal environment: the release job's holds the signing key.
+func TestProbeRunsTheBinaryWithAMinimalEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "env")
+	script := "#!/bin/sh\nenv > " + envFile + "\necho '{\"converge_revision\":1}'\n"
+	bin := filepath.Join(dir, "supavise")
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUPAVISE_SIGNING_KEY", "not-for-the-probe")
+	t.Setenv("SOME_OTHER_SECRET", "x")
+	if p := probe(bin); p.Why != "" || p.Converge != 1 {
+		t.Fatalf("probe: %+v", p)
+	}
+	got := string(mustRead(t, envFile))
+	for _, bad := range []string{"SUPAVISE_SIGNING_KEY", "SOME_OTHER_SECRET", "not-for-the-probe"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("the probe saw %s:\n%s", bad, got)
+		}
+	}
+}
+
 // The repository's own pin file is something the notes can be made from.
 func TestRepositoryVersionsFileParses(t *testing.T) {
 	v, err := readVersions(filepath.Join("..", "..", "internal", "versions", "versions.yaml"))

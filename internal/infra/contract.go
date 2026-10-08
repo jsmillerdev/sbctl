@@ -15,8 +15,9 @@ import (
 
 // Revision is the stack revision this release needs: what `supavise release-info` reports as
 // infra_revision and the release manifest names as aws.stack_revision. A stack is at revision 1
-// (it predates revisions) or at the revision its template carries.
-const Revision = 2
+// (it predates revisions) or at the revision its template carries. It is Current under the name the
+// contract has used, so that the two cannot be raised apart.
+const Revision = Current
 
 // Missing is one thing the stack lacks.
 type Missing struct {
