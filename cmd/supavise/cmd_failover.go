@@ -90,7 +90,7 @@ func runServerFailover(cmd *cobra.Command, o failover.ServerOptions) error {
 		return &failover.RefusedError{Checks: refused, Force: o.Force}
 	}
 	if !o.Yes {
-		if err := confirmTyped(cmd, serverQuestion(plan), plan.To, orID(plan.ToName, plan.To)); err != nil {
+		if err := confirmTyped(cmd, serverQuestion(plan), "the name of the new leader", plan.To, orID(plan.ToName, plan.To)); err != nil {
 			return err
 		}
 	}
@@ -118,13 +118,13 @@ func serverQuestion(p *failover.Plan) string {
 	return fmt.Sprintf("This fences %s and makes %s the leader (epoch %d); what %s wrote and %s did not receive is lost.", from, to, p.Epoch, from, to)
 }
 
-// confirmTyped asks the operator to type the name of the node that takes over, and refuses to
-// guess when stdin is not a terminal.
-func confirmTyped(cmd *cobra.Command, question string, id, name string) error {
+// confirmTyped asks the operator to type what names the thing the move acts on (what: "the name of
+// the new leader"), and refuses to guess when stdin is not a terminal.
+func confirmTyped(cmd *cobra.Command, question, what, id, name string) error {
 	if fi, err := os.Stdin.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
 		return errors.New("nothing was changed; run it again with --yes to go on without being asked")
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "\n%s\nType the name of the new leader (%s) to go on: ", question, name)
+	fmt.Fprintf(cmd.OutOrStdout(), "\n%s\nType %s (%s) to go on: ", question, what, name)
 	line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
 	if a := strings.TrimSpace(line); a != name && a != id {
 		return errors.New("nothing was changed")

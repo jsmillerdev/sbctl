@@ -76,6 +76,8 @@ type ProjectOptions struct {
 	// refused with ErrPlanChanged: a project that stopped answering between the plan and the run
 	// is not fenced on the strength of a confirmation for a clean stop.
 	ExpectKind string
+	// Yes is the CLI's flag to skip the typed confirmation of a project failover; the daemon never reads it.
+	Yes bool
 }
 
 // ServerOptions are the flags of `supavise failover`.

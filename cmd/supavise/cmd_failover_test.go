@@ -238,7 +238,7 @@ func TestFailoverRunsOnlyThePlanThatWasShown(t *testing.T) {
 	pf := &fakeFailover{plan: &failover.Plan{Kind: "failover", Ref: "aaaaaaaaaaaaaaaaaaaa", Epoch: 1,
 		Checks: []failover.Check{{Name: "replica", OK: true, Blocking: true}}}, move: doneMove()}
 	withFailover(t, pf)
-	if _, err := run(t, "projects", "failover", "aaaaaaaaaaaaaaaaaaaa"); err != nil {
+	if _, err := run(t, "projects", "failover", "aaaaaaaaaaaaaaaaaaaa", "--yes"); err != nil {
 		t.Fatal(err)
 	}
 	if pf.gotProj.ExpectKind != "failover" {
@@ -296,6 +296,34 @@ func TestProjectFailover(t *testing.T) {
 	f.ran = nil
 	if _, err := run(t, "projects", "failover", "aaaaaaaaaaaaaaaaaaaa"); !errors.Is(err, failover.ErrRefused) || len(f.ran) != 0 {
 		t.Fatalf("refused: %v, ran %v", err, f.ran)
+	}
+}
+
+// A project failover loses data, so it asks for the project's ref; a switchover does not. --yes and
+// --resume (a move that already began) go on without asking.
+func TestProjectFailoverOfAPrimaryThatDoesNotAnswerAsksFirst(t *testing.T) {
+	const ref = "aaaaaaaaaaaaaaaaaaaa"
+	p := &failover.Plan{Kind: "failover", Ref: ref, From: "n1", To: "n2", FromName: "primary", ToName: "standby", Epoch: 1,
+		Checks: []failover.Check{{Name: "replica", OK: true, Blocking: true, Detail: "ok"}}}
+	mv := &registry.Move{ID: 9, Scope: registry.MoveProject, Ref: ref, Kind: registry.MoveFailover, FromNode: "n1", ToNode: "n2", State: registry.MoveDone}
+	f := &fakeFailover{plan: p, move: mv}
+	withFailover(t, f)
+
+	out, err := run(t, "projects", "failover", ref)
+	if err == nil || !strings.Contains(err.Error(), "nothing was changed") || len(f.ran) != 0 {
+		t.Fatalf("error %v, ran %v\n%s", err, f.ran, out)
+	}
+	if !strings.Contains(out, "Type the project ref ("+ref+") to go on") || !strings.Contains(out, "what the primary wrote and the replica did not receive is lost") {
+		t.Fatalf("the question was not asked:\n%s", out)
+	}
+	for _, args := range [][]string{{"projects", "failover", ref, "--yes"}, {"projects", "failover", ref, "--resume"}} {
+		f.ran = nil
+		if _, err := run(t, args...); err != nil || strings.Join(f.ran, ",") != "project" {
+			t.Fatalf("%v: %v, ran %v", args, err, f.ran)
+		}
+	}
+	if f.gotProj.ExpectKind != "" {
+		t.Fatalf("a resume must not pin the kind: %+v", f.gotProj)
 	}
 }
 
