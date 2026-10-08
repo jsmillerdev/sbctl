@@ -286,7 +286,7 @@ func TestManifestHostAndAWSFields(t *testing.T) {
 			t.Errorf("binary that %s: host %+v err %v, want revision %d", c.name, m.Host, err, c.want)
 		}
 		// Anything but a revision it reported is worth a warning on stderr.
-		if _, why := convergeRevision(bin); (why == "") != (c.name == "reports") {
+		if why := probe(bin).Why; (why == "") != (c.name == "reports") {
 			t.Errorf("binary that %s: warning %q", c.name, why)
 		}
 	}

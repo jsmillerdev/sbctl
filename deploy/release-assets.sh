@@ -12,8 +12,9 @@
 #                    to this one. The converge revision is read from the built binary of this machine's
 #                    architecture (`supavise release-info`, which the script makes executable first: a
 #                    downloaded workflow artifact is not); a binary that cannot run here gives 0 and a
-#                    warning, or, with SUPAVISE_REQUIRE_CONVERGE=1 (the release workflow sets it), stops
-#                    the release: a manifest that says 0 weakens the host-not-converged gating.
+#                    warning, or, with SUPAVISE_REQUIRE_CONVERGE=1, stops the release: set it in the
+#                    job that signs a release, because a manifest that says 0 weakens the
+#                    host-not-converged gating.
 #                    deploy/MIN_PEER_FROM says the oldest release a joined server may run alongside this
 #                    one (min_peer_from; SUPAVISE_MIN_PEER_FROM overrides the file) and
 #                    SUPAVISE_WAL_COMPAT=false marks a release whose PostgreSQL cannot read the WAL of

@@ -67,16 +67,6 @@ func probe(binary string) probed {
 	return p
 }
 
-// convergeRevision asks a built binary for the host layer revision it expects: the field
-// converge_revision of `supavise release-info --json`. A binary that does not report one (it
-// predates the field) or cannot run here (a binary for the other architecture) gives 0 and a
-// reason, which the caller prints as a warning; the manifest then says the host layer has no
-// revision, which is what such a binary means.
-func convergeRevision(binary string) (rev int, why string) {
-	p := probe(binary)
-	return p.Converge, p.Why
-}
-
 var templateRevisionRe = regexp.MustCompile(`(?m)^  InfraRevision:\n    Description: .*\n    Value: "(\d+)"$`)
 
 // awsOf describes the CloudFormation template that is attached to the release: the stack
