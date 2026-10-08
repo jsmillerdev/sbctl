@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,38 +14,44 @@ import (
 	"github.com/supavise/supavise/internal/registry"
 )
 
-var _ ReplicaSeeder = (*Service)(nil)
+var (
+	_ ReplicaSeeder     = (*Service)(nil)
+	_ StandbyConfigurer = (*Service)(nil)
+)
 
 // replicationRole is the role a standby streams with (lifecycle.RoleReplication; the loopback
 // pg_hba rule for it exists on every project cluster).
 const replicationRole = "supabase_replication_admin"
 
+// seedMarker is the file that tells a data directory is half seeded. SeedReplica writes it before
+// the first byte of the base backup lands and removes it as its last step, so a directory that
+// holds it was cut off (a kill, a power loss) and carries a backup_label without standby.signal.
+const seedMarker = "supavise-seeding"
+
+// SeedUnfinished reports whether dataDir holds a seed that did not finish. Nothing may start a
+// cluster on such a directory (it would come up as a primary); SeedReplica clears it and starts
+// over.
+func SeedUnfinished(dataDir string) bool {
+	_, err := os.Lstat(filepath.Join(dataDir, seedMarker))
+	return err == nil
+}
+
 // SeedReplica implements ReplicaSeeder: it extracts the base backup of plan.Ref into the empty
-// plan.DataDir the way a restore does and turns the directory into a standby. A failed seed
-// removes what it extracted, so the caller can retry on the same directory.
+// plan.DataDir the way a restore does and turns the directory into a standby (ConfigureStandby).
+// A failed seed removes what it extracted, so the caller can retry on the same directory; so does
+// the retry after a seed that was cut off.
 func (s *Service) SeedReplica(ctx context.Context, plan ReplicaSeedPlan) (err error) {
-	if err := validRef(plan.Ref); err != nil {
+	if err := checkStandbyPlan(plan); err != nil {
 		return err
-	}
-	if plan.DataDir == "" || !filepath.IsAbs(plan.DataDir) {
-		return fmt.Errorf("backup: replica data directory %q must be an absolute path", plan.DataDir)
-	}
-	if plan.PrimaryPort != 0 {
-		if plan.PrimaryPort < 1 || plan.PrimaryPort > 65535 {
-			return fmt.Errorf("backup: replica primary port %d is out of range", plan.PrimaryPort)
-		}
-		if ref, _, _, ok := registry.ParseReplicaIdentifier(plan.Identifier); !ok || ref != plan.Ref {
-			return fmt.Errorf("backup: %q is not a replica identifier of %s", plan.Identifier, plan.Ref)
-		}
-		if plan.ReplicationPassword == "" {
-			return errors.New("backup: a streaming replica needs the replication password")
-		}
 	}
 	// Start from a plan that finds a base backup on the archive's current timeline whose first
 	// WAL file is still there; the newest one unless plan.BackupID names another.
 	rp, err := s.PlanRestoreWith(ctx, plan.Ref, time.Time{}, RestoreOptions{Latest: true, BackupID: plan.BackupID})
 	if err != nil {
 		return err
+	}
+	if SeedUnfinished(plan.DataDir) {
+		clearDir(plan.DataDir)
 	}
 	if err := prepareDataDir(plan.DataDir); err != nil {
 		return err
@@ -54,41 +61,101 @@ func (s *Service) SeedReplica(ctx context.Context, plan ReplicaSeedPlan) (err er
 			clearDir(plan.DataDir)
 		}
 	}()
+	marker := filepath.Join(plan.DataDir, seedMarker)
+	if err := writeSyncFile(marker, nil, 0o600); err != nil {
+		return err
+	}
 	if err := s.unpackBase(ctx, &rp.Manifest, plan.DataDir); err != nil {
 		return err
 	}
-	// A backup of a cluster that was itself a standby or in recovery could carry either signal.
-	if err := os.Remove(filepath.Join(plan.DataDir, "recovery.signal")); err != nil && !errors.Is(err, os.ErrNotExist) {
+	plan.BackupID = rp.Manifest.ID
+	if err := s.ConfigureStandby(plan); err != nil {
 		return err
 	}
-	if err := appendAutoConf(plan.DataDir, s.standbyConf(plan, &rp.Manifest)); err != nil {
+	if err := syncTree(plan.DataDir); err != nil {
 		return err
 	}
-	// standby.signal last: it is what turns the start into a standby.
+	if err := os.Remove(marker); err != nil {
+		return err
+	}
+	return syncDir(plan.DataDir)
+}
+
+// ConfigureStandby implements StandbyConfigurer: it turns the stopped cluster in plan.DataDir into
+// a standby. It deletes the promote.ok of plan.Ref, so the relay refuses the standby's pushes
+// again, drops the standby block of an earlier configuration (ClearStandbyConf) and the
+// recovery.signal a backup of a cluster in recovery could carry, appends the block to
+// postgresql.auto.conf and writes standby.signal last, since it is what turns the start into a
+// standby.
+func (s *Service) ConfigureStandby(plan ReplicaSeedPlan) error {
+	if err := checkStandbyPlan(plan); err != nil {
+		return err
+	}
+	if s.opt.Config != nil {
+		if err := os.Remove(s.opt.Config.Paths().PromoteOK(plan.Ref)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	if err := ClearStandbyConf(plan.DataDir); err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(plan.DataDir, "recovery.signal")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := appendAutoConf(plan.DataDir, s.standbyConf(plan)); err != nil {
+		return err
+	}
 	if err := writeSyncFile(filepath.Join(plan.DataDir, "standby.signal"), nil, 0o600); err != nil {
 		return err
 	}
-	return syncTree(plan.DataDir)
+	return syncDir(plan.DataDir)
 }
 
-// standbyConf is the block appended to postgresql.auto.conf of a seeded standby. Later lines win,
-// so it overrides what the source's own ALTER SYSTEM history left there; the data directory's
+// checkStandbyPlan refuses a plan that SeedReplica and ConfigureStandby cannot carry out.
+func checkStandbyPlan(plan ReplicaSeedPlan) error {
+	if err := validRef(plan.Ref); err != nil {
+		return err
+	}
+	if plan.DataDir == "" || !filepath.IsAbs(plan.DataDir) {
+		return fmt.Errorf("backup: replica data directory %q must be an absolute path", plan.DataDir)
+	}
+	if plan.PrimaryPort == 0 {
+		return nil
+	}
+	if plan.PrimaryPort < 1 || plan.PrimaryPort > 65535 {
+		return fmt.Errorf("backup: replica primary port %d is out of range", plan.PrimaryPort)
+	}
+	if ref, _, _, ok := registry.ParseReplicaIdentifier(plan.Identifier); !ok || ref != plan.Ref {
+		return fmt.Errorf("backup: %q is not a replica identifier of %s", plan.Identifier, plan.Ref)
+	}
+	if plan.ReplicationPassword == "" {
+		return errors.New("backup: a streaming replica needs the replication password")
+	}
+	return nil
+}
+
+// standbyConf is the block appended to postgresql.auto.conf of a standby. Later lines win, so it
+// overrides what the source's own ALTER SYSTEM history left there; the data directory's
 // postgresql.conf and wal-g.conf are the source's, and the latter ships hot_standby = off.
 //
 // archive_mode = on, never always: the standby archives nothing until it is promoted, and then
 // it pushes under the project's prefix through the relay of this node, which checks promote.ok.
-func (s *Service) standbyConf(plan ReplicaSeedPlan, m *Manifest) string {
+func (s *Service) standbyConf(plan ReplicaSeedPlan) string {
 	cfgPath := s.opt.ConfigPath
 	c := s.opt.Config
 	if c == nil {
 		c = config.Default()
 		c.Backup.WALRelay = "off"
 	}
+	from := ""
+	if plan.BackupID != "" {
+		from = " (backup " + plan.BackupID + ")"
+	}
 	var b strings.Builder
 	if plan.PrimaryPort != 0 {
-		fmt.Fprintf(&b, "\n# --- supavise standby %s of %s (backup %s) ---\n", plan.Identifier, plan.Ref, m.ID)
+		fmt.Fprintf(&b, "\n# --- supavise standby %s of %s%s ---\n", plan.Identifier, plan.Ref, from)
 	} else {
-		fmt.Fprintf(&b, "\n# --- supavise archive-only standby of %s (backup %s) ---\n", plan.Ref, m.ID)
+		fmt.Fprintf(&b, "\n# --- supavise archive-only standby of %s%s ---\n", plan.Ref, from)
 	}
 	fmt.Fprintf(&b, "archive_mode = on\narchive_command = %s\n", confQuote(ArchiveCommandFor(c, plan.Ref, cfgPath)))
 	fmt.Fprintf(&b, "restore_command = %s\n", confQuote(RestoreCommandFor(c, plan.Ref, plan.Ref, cfgPath)))

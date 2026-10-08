@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -245,6 +246,155 @@ func TestSeedReplicaFailureLeavesAnEmptyDirectory(t *testing.T) {
 	}
 }
 
+// A seeded cluster is not promoted, whatever promote.ok an earlier life of the directory's project
+// left on this node: the relay would trust it for as long as it exists.
+func TestSeedReplicaDeletesPromoteOK(t *testing.T) {
+	e, _ := seedEnv(t)
+	ctx := context.Background()
+	own, other := e.cfg.Paths().PromoteOK(testRef), e.cfg.Paths().PromoteOK(testRef2)
+	writeFile(t, own, FormatPromoteOK(1))
+	writeFile(t, other, FormatPromoteOK(1))
+	if err := e.svc.SeedReplica(ctx, ReplicaSeedPlan{Ref: testRef, Identifier: testReplicaID, DataDir: filepath.Join(t.TempDir(), "streaming"),
+		PrimaryPort: 20003, ReplicationPassword: "pw"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(own); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("promote.ok of the seeded project: %v; want it deleted", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("promote.ok of another project: %v; want it kept", err)
+	}
+	writeFile(t, own, FormatPromoteOK(2))
+	if err := e.svc.SeedReplica(ctx, ReplicaSeedPlan{Ref: testRef, DataDir: filepath.Join(t.TempDir(), "archive-only")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(own); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("promote.ok after an archive-only seed: %v; want it deleted", err)
+	}
+}
+
+func TestSeedReplicaOfTheSystemProject(t *testing.T) {
+	e := newTestEnv(t)
+	e.storeBase(t, config.SystemRef, fakeDataDir(t), e.now.Add(-time.Hour), nil)
+	id := config.SystemRef + "-rr-eu-abc123"
+	dd := filepath.Join(t.TempDir(), "data")
+	if err := e.svc.SeedReplica(context.Background(), ReplicaSeedPlan{Ref: config.SystemRef, Identifier: id, DataDir: dd,
+		PrimaryPort: 20001, ReplicationPassword: "pw"}); err != nil {
+		t.Fatal(err)
+	}
+	conf := readConf(t, dd)
+	for _, want := range []string{"application_name=" + id + " ", "wal fetch --ref " + config.SystemRef + " ", "wal push --ref " + config.SystemRef + " "} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("postgresql.auto.conf lacks %q:\n%s", want, conf)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dd, "standby.signal")); err != nil {
+		t.Errorf("standby.signal: %v", err)
+	}
+}
+
+// A seed that was cut off leaves a backup_label and no standby.signal. It is marked, and the next
+// seed clears it; a finished seed leaves no marker.
+func TestSeedReplicaClearsAnInterruptedSeed(t *testing.T) {
+	e, _ := seedEnv(t)
+	ctx := context.Background()
+	dd := filepath.Join(t.TempDir(), "data")
+	writeFile(t, filepath.Join(dd, seedMarker), nil)
+	writeFile(t, filepath.Join(dd, "backup_label"), []byte("half"))
+	writeFile(t, filepath.Join(dd, "base", "1", "partial"), []byte("half"))
+	if !SeedUnfinished(dd) {
+		t.Fatal("SeedUnfinished = false for a directory with the marker")
+	}
+	if err := e.svc.SeedReplica(ctx, ReplicaSeedPlan{Ref: testRef2, DataDir: dd}); err == nil {
+		t.Fatal("seeded a project without a backup")
+	}
+	if !SeedUnfinished(dd) {
+		t.Fatal("a seed that failed before it started cleared the directory of the earlier one")
+	}
+	if err := e.svc.SeedReplica(ctx, ReplicaSeedPlan{Ref: testRef, DataDir: dd}); err != nil {
+		t.Fatalf("seed over an interrupted one: %v", err)
+	}
+	if SeedUnfinished(dd) {
+		t.Error("a finished seed left the marker")
+	}
+	if _, err := os.Stat(filepath.Join(dd, "base", "1", "partial")); err == nil {
+		t.Error("what the interrupted seed extracted survived")
+	}
+	for _, p := range []string{"standby.signal", "PG_VERSION"} {
+		if _, err := os.Stat(filepath.Join(dd, p)); err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(dd, "backup_label")); err != nil || strings.Contains(string(b), "half") {
+		t.Errorf("backup_label = %q, %v; want the backup's", b, err)
+	}
+	if SeedUnfinished(filepath.Join(t.TempDir(), "missing")) {
+		t.Error("SeedUnfinished = true for a missing directory")
+	}
+}
+
+// The demotion of a primary in place: its data directory is already there, the standby block is
+// written over whatever an earlier standby life left, and the project is not promoted any more.
+func TestConfigureStandbyDemotesInPlace(t *testing.T) {
+	e, _ := seedEnv(t)
+	ctx := context.Background()
+	dd := filepath.Join(t.TempDir(), "data")
+	if err := e.svc.SeedReplica(ctx, ReplicaSeedPlan{Ref: testRef, Identifier: testReplicaID, DataDir: dd,
+		PrimaryPort: 20003, ReplicationPassword: "old-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	// It was promoted: the standby block went, and so did standby.signal. Later it ran as a primary.
+	if err := ClearStandbyConf(dd); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dd, "standby.signal")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dd, "recovery.signal"), nil)
+	writeFile(t, e.cfg.Paths().PromoteOK(testRef), FormatPromoteOK(1))
+	conf := readConf(t, dd)
+	if err := os.WriteFile(filepath.Join(dd, "postgresql.auto.conf"), []byte(conf+"work_mem = '8MB'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	id := testRef + "-rr-eu-def456"
+	if err := e.svc.ConfigureStandby(ReplicaSeedPlan{Ref: testRef, Identifier: id, DataDir: dd, PrimaryPort: 20004, ReplicationPassword: "new-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	got := readConf(t, dd)
+	for _, want := range []string{"# auto\n", "work_mem = '8MB'\n", "archive_mode = on\n",
+		"primary_conninfo = 'host=127.0.0.1 port=20004 user=supabase_replication_admin password=new-secret application_name=" + id + " sslmode=disable'\n",
+		"restore_command = '", "recovery_target_timeline = 'latest'\n", "hot_standby = on\n", "# --- supavise standby " + id + " of " + testRef + " ---\n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("postgresql.auto.conf lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "old-secret") || strings.Contains(got, "(backup") {
+		t.Errorf("postgresql.auto.conf has a stale value:\n%s", got)
+	}
+	for _, p := range []string{"standby.signal", "PG_VERSION", "backup_label"} {
+		if _, err := os.Stat(filepath.Join(dd, p)); err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dd, "recovery.signal")); err == nil {
+		t.Error("recovery.signal survived")
+	}
+	if _, err := os.Stat(e.cfg.Paths().PromoteOK(testRef)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("promote.ok after the demotion: %v; want it deleted", err)
+	}
+	// Run again with the same plan: one block, not two.
+	if err := e.svc.ConfigureStandby(ReplicaSeedPlan{Ref: testRef, Identifier: id, DataDir: dd, PrimaryPort: 20004, ReplicationPassword: "new-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	if again := readConf(t, dd); strings.Count(again, "primary_conninfo") != 1 || strings.Count(again, "work_mem") != 1 {
+		t.Errorf("a second ConfigureStandby doubled the block:\n%s", again)
+	}
+	if err := e.svc.ConfigureStandby(ReplicaSeedPlan{Ref: testRef, DataDir: "data"}); err == nil {
+		t.Error("ConfigureStandby accepted a relative directory")
+	}
+}
+
 func TestBackupIDOf(t *testing.T) {
 	e := newTestEnv(t)
 	m := e.fakeBackup(t, testRef, e.now.Add(-time.Hour), 1, 3)
@@ -362,6 +512,54 @@ func TestEnsureBaseCallsForOneRefRunOneAtATime(t *testing.T) {
 	wg.Wait()
 	if n := taken.Load(); n != 1 {
 		t.Fatalf("backups taken = %d, want 1", n)
+	}
+}
+
+// A caller that waits for another one's backup gives up when its context ends, and leaves the
+// lock to the caller that holds it.
+func TestEnsureBaseWaitEndsWithItsContext(t *testing.T) {
+	e := newTestEnv(t)
+	var taken atomic.Int32
+	gate := make(chan struct{})
+	e.svc.opt.TakeBase = func(ctx context.Context, ref string) (*registry.Backup, error) {
+		taken.Add(1)
+		<-gate
+		return &registry.Backup{Ref: ref}, nil
+	}
+	first := make(chan error, 1)
+	go func() {
+		_, err := e.svc.EnsureBase(context.Background(), testRef, 0)
+		first <- err
+	}()
+	for taken.Load() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := e.svc.EnsureBase(ctx, testRef, 0); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("EnsureBase behind another call = %v; want the context's error", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("EnsureBase waited %s for a lock after its context ended", d)
+	}
+	// Another ref is not held up by it.
+	e.svc.opt.TakeBase = func(ctx context.Context, ref string) (*registry.Backup, error) {
+		return &registry.Backup{Ref: ref}, nil
+	}
+	if _, err := e.svc.EnsureBase(context.Background(), testRef2, 0); err != nil {
+		t.Fatalf("EnsureBase of another ref: %v", err)
+	}
+	close(gate)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	// The lock is free again.
+	if _, err := e.svc.EnsureBase(context.Background(), testRef, 0); err != nil {
+		t.Fatalf("EnsureBase after the others finished: %v", err)
+	}
+	if n := taken.Load(); n != 1 {
+		t.Errorf("blocking TakeBase ran %d times, want 1", n)
 	}
 }
 
