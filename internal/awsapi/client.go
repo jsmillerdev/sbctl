@@ -58,10 +58,11 @@ type Config struct {
 	// Now is the clock for signing and for credential expiry. Nil is time.Now.
 	Now func() time.Time
 	// MaxAttempts is how many times a request that got no answer, a 5xx or a throttle is sent.
-	// Zero is 3.
+	// Zero is 5 for the service calls and 3 for the metadata service.
 	MaxAttempts int
-	// RetryBackoff is the wait after the first failed attempt, doubled for each further one.
-	// Zero is 200 ms.
+	// RetryBackoff is the wait after the first failed attempt, doubled for each further one up to
+	// 5 seconds. Each wait is a random point in the upper half of that, so a wait is at least half
+	// of it. Zero is 200 ms.
 	RetryBackoff time.Duration
 }
 
@@ -92,11 +93,15 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	imdsAttempts := cfg.MaxAttempts
+	if imdsAttempts <= 0 {
+		imdsAttempts = defaultIMDSAttempts
+	}
 	if cfg.MaxAttempts <= 0 {
-		cfg.MaxAttempts = 3
+		cfg.MaxAttempts = defaultMaxAttempts
 	}
 	if cfg.RetryBackoff <= 0 {
-		cfg.RetryBackoff = 200 * time.Millisecond
+		cfg.RetryBackoff = defaultRetryBackoff
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
@@ -117,12 +122,12 @@ func New(cfg Config) (*Client, error) {
 		}
 		ep[name] = strings.TrimRight(v, "/")
 	}
-	imds := newIMDS(cfg, ep["imds"])
+	imds := newIMDS(cfg, ep["imds"], imdsAttempts)
 	creds := cfg.Credentials
 	if creds == nil {
 		creds = DefaultCredentials(cfg.Getenv, imds, cfg.Now)
 	}
-	c := &core{cfg: cfg, endpoints: ep, creds: creds, imds: imds}
+	c := &core{cfg: cfg, endpoints: ep, creds: creds, imds: imds, retry: newRetrier(cfg.MaxAttempts, cfg.RetryBackoff)}
 	return &Client{
 		EC2:            &EC2{c: c},
 		SecretsManager: &SecretsManager{c: c},
@@ -161,6 +166,7 @@ type core struct {
 	endpoints map[string]string
 	creds     CredentialProvider
 	imds      *IMDS
+	retry     *retrier
 
 	mu         sync.Mutex
 	regionName string
@@ -207,19 +213,15 @@ type apiCall struct {
 
 // do sends the call, signed with the current credentials, and returns the body of a 2xx answer.
 // Anything else is an *Error. A request that got no answer, a 5xx or a throttle is sent again
-// with a fresh signature.
+// with a fresh signature, after a jittered wait.
 func (c *core) do(ctx context.Context, call apiCall) ([]byte, error) {
 	for attempt := 1; ; attempt++ {
 		body, err := c.once(ctx, call)
-		if err == nil || attempt >= c.cfg.MaxAttempts || !retryable(err) || ctx.Err() != nil {
+		if err == nil || attempt >= c.retry.attempts || !retryable(err) || ctx.Err() != nil {
 			return body, err
 		}
-		t := time.NewTimer(c.cfg.RetryBackoff << (attempt - 1))
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return nil, fmt.Errorf("%w: %w", err, ctx.Err())
-		case <-t.C:
+		if werr := c.retry.wait(ctx, attempt); werr != nil {
+			return nil, fmt.Errorf("%w: %w", err, werr)
 		}
 	}
 }

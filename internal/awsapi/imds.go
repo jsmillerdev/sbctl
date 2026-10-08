@@ -33,19 +33,18 @@ const (
 // IMDS reads the instance metadata service with IMDSv2: every read carries a session token that
 // is fetched first and reused until shortly before it expires. There is no IMDSv1 fallback.
 type IMDS struct {
-	base     string
-	hc       *http.Client
-	getenv   func(string) string
-	now      func() time.Time
-	attempts int
-	backoff  time.Duration
+	base   string
+	hc     *http.Client
+	getenv func(string) string
+	now    func() time.Time
+	retry  *retrier
 
 	mu      sync.Mutex
 	token   string
 	expires time.Time
 }
 
-func newIMDS(cfg Config, base string) *IMDS {
+func newIMDS(cfg Config, base string, attempts int) *IMDS {
 	if base == "" {
 		base = defaultIMDSEndpoint
 	}
@@ -54,12 +53,11 @@ func newIMDS(cfg Config, base string) *IMDS {
 	tr.Proxy = nil
 	tr.DialContext = (&net.Dialer{Timeout: imdsTimeout}).DialContext
 	return &IMDS{
-		base:     base,
-		hc:       &http.Client{Transport: tr, Timeout: imdsTimeout},
-		getenv:   cfg.Getenv,
-		now:      cfg.Now,
-		attempts: cfg.MaxAttempts,
-		backoff:  cfg.RetryBackoff,
+		base:   base,
+		hc:     &http.Client{Transport: tr, Timeout: imdsTimeout},
+		getenv: cfg.Getenv,
+		now:    cfg.Now,
+		retry:  newRetrier(attempts, cfg.RetryBackoff),
 	}
 }
 
@@ -70,14 +68,10 @@ func (m *IMDS) Get(ctx context.Context, path string) (string, error) {
 		return "", fmt.Errorf("aws imds %s: %w", path, ErrIMDSDisabled)
 	}
 	var lastErr error
-	for attempt := 1; attempt <= m.attempts; attempt++ {
+	for attempt := 1; attempt <= m.retry.attempts; attempt++ {
 		if attempt > 1 {
-			t := time.NewTimer(m.backoff << (attempt - 2))
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return "", fmt.Errorf("%w: %w", lastErr, ctx.Err())
-			case <-t.C:
+			if werr := m.retry.wait(ctx, attempt-1); werr != nil {
+				return "", fmt.Errorf("%w: %w", lastErr, werr)
 			}
 		}
 		body, retry, err := m.get(ctx, path)

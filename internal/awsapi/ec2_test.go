@@ -285,8 +285,8 @@ func TestRetries(t *testing.T) {
 	if _, err := newClient(t, cfg).EC2.StopInstances(ctx, in); !awsapi.IsCode(err, "RequestLimitExceeded") {
 		t.Errorf("persistent throttle: %v", err)
 	}
-	if n := len(seen()); n != 3 {
-		t.Errorf("%d attempts, want the default 3", n)
+	if n := len(seen()); n != 5 {
+		t.Errorf("%d attempts, want the default 5", n)
 	}
 
 	cfg, seen = stub(t, throttle)

@@ -67,21 +67,26 @@ type transportError struct{ err error }
 func (e *transportError) Error() string { return e.err.Error() }
 func (e *transportError) Unwrap() error { return e.err }
 
+// throttleCodes are the error codes that mean "slow down" or "try again", whatever the status.
 var throttleCodes = map[string]bool{
-	"RequestLimitExceeded":     true,
-	"Throttling":               true,
-	"ThrottlingException":      true,
-	"ThrottledException":       true,
-	"TooManyRequestsException": true,
-	"RequestThrottled":         true,
-	"InternalError":            true,
-	"InternalFailure":          true,
-	"ServiceUnavailable":       true,
-	"Unavailable":              true,
+	"RequestLimitExceeded":      true,
+	"Throttling":                true,
+	"ThrottlingException":       true,
+	"ThrottledException":        true,
+	"EC2ThrottledException":     true,
+	"RequestThrottled":          true,
+	"RequestThrottledException": true,
+	"TooManyRequestsException":  true,
+	"PriorRequestNotComplete":   true,
+	"RequestTimeout":            true,
+	"InternalError":             true,
+	"InternalFailure":           true,
+	"ServiceUnavailable":        true,
+	"Unavailable":               true,
 }
 
 // retryable reports whether the same request may succeed when sent again: no answer, a server
-// error or a throttle. DryRunOperation (412) and every 4xx that is a refusal are final.
+// error, a throttle or a timeout. DryRunOperation (412) and every 4xx that is a refusal are final.
 func retryable(err error) bool {
 	var te *transportError
 	if errors.As(err, &te) {

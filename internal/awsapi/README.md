@@ -64,11 +64,11 @@ Every EC2 call that takes `DryRun` asks only whether the call would be allowed, 
 
 ## Errors and retries
 
-An API error is an `*Error` with `Service`, `Action`, `StatusCode`, `Code`, `Message` and `RequestID`. `IsCode(err, ...)`, `IsAccessDenied(err)` and `IsNotFound(err)` test it. A request that gets no answer, a 500, 502, 503 or 504, and the throttling codes are sent again with a new signature, three tries in all (`Config.MaxAttempts`), after 200 ms and 400 ms (`Config.RetryBackoff`, doubled each time). A refusal, a 4xx and a `DryRunOperation` are final. A cancelled context ends the wait between tries, and the error then carries the last failure and the context's error.
+An API error is an `*Error` with `Service`, `Action`, `StatusCode`, `Code`, `Message` and `RequestID`. `IsCode(err, ...)`, `IsAccessDenied(err)` and `IsNotFound(err)` test it. A request that gets no answer, a 500, 502, 503 or 504, or a throttle or timeout code (`RequestLimitExceeded`, `Throttling`, `ThrottlingException`, `ThrottledException`, `EC2ThrottledException`, `RequestThrottled`, `RequestThrottledException`, `TooManyRequestsException`, `PriorRequestNotComplete`, `RequestTimeout`, whatever the status) is sent again with a new signature, five tries in all (`Config.MaxAttempts`). The waits follow 200 ms, 400 ms, 800 ms and 1.6 s (`Config.RetryBackoff`, doubled each time, 5 s at most), and each is a random point in the upper half of its slot, so five tries last between 1.5 and 3 seconds and clients that failed together do not retry together. A refusal, a 4xx and a `DryRunOperation` are final. A cancelled context ends the wait between tries, and the error then carries the last failure and the context's error.
 
 An error names what failed first: `aws <service> <action>:` for a call (also when the credentials or the region could not be found), `aws imds <path>:` for the metadata service and `awsapi:` for the client's own setup. Errors wrap their causes, so `errors.Is` finds `ErrIMDSDisabled`, `ErrNotFound` and a cancelled context through the credential chain and the region lookup as well.
 
-The metadata service has its own loop: a token request, then the read with `X-aws-ec2-metadata-token`. The token is kept for just under six hours and fetched again after a 401. A refused token request (403, 404, 405) is final: there is no IMDSv1 fallback. A request that gets no answer or a 5xx is tried again. Each request times out after two seconds, so a machine that is not on EC2 and has no credentials in the environment fails after about six seconds and tries again at the next call.
+The metadata service has its own loop: a token request, then the read with `X-aws-ec2-metadata-token`. The token is kept for just under six hours and fetched again after a 401. A refused token request (403, 404, 405) is final: there is no IMDSv1 fallback. A request that gets no answer or a 5xx is tried again, three times in all, on the same jittered schedule. Each request times out after two seconds, so a machine that is not on EC2 and has no credentials in the environment fails after about six seconds and tries again at the next call.
 
 ## The signer
 
@@ -111,7 +111,7 @@ What it does not model: IAM policy evaluation (use `Deny`), tag-scoped resources
 - the signer against the cases of AWS's published Signature Version 4 test suite (`aws-sig-v4-test-suite`, query and path normalization, header ordering and trimming, session tokens, form bodies) and the documented IAM `ListUsers` example, including the derived signing key;
 - the exact form body of every EC2, STS and Secrets Manager request, and one signed request's headers;
 - replies parsed from XML and JSON fixtures in `testdata/` shaped like the API reference examples;
-- the `DryRun` mapping, error parsing, retries, a cancelled context and endpoint and region resolution;
+- the `DryRun` mapping, error parsing, retries (throttle codes, the jittered schedule and its bounds), a cancelled context and endpoint and region resolution;
 - the credential chain, the cache, the instance-role path and `AWS_EC2_METADATA_DISABLED`;
 - the metadata service token flow, with an expired token and a refused one;
 - the fake: the order of the fencing sequence, a stop that needs `Force`, address moves and replacement, `Deny`, signature checks and paging.
