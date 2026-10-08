@@ -678,6 +678,9 @@ type unfinishedMove struct {
 	epoch    int64
 	last     string
 	moveID   int64
+	steps    []registry.MoveStep
+	// running: the move was never finished, as when the daemon was cut off; false for a move that ended failed.
+	running bool
 }
 
 // unfinishedServer finds the server move that stopped: in the registry when it has one, else in failover.json.
@@ -692,10 +695,10 @@ func (o *Orchestrator) unfinishedServer(ctx context.Context) (*unfinishedMove, *
 	}
 	switch {
 	case m != nil:
-		return &unfinishedMove{kind: m.Kind, from: m.FromNode, to: m.ToNode, epoch: m.Epoch, last: lastStep(*m), moveID: m.ID}, fs, nil
+		return &unfinishedMove{kind: m.Kind, from: m.FromNode, to: m.ToNode, epoch: m.Epoch, last: lastStep(*m), moveID: m.ID, steps: m.Steps, running: m.State == registry.MoveRunning}, fs, nil
 	case fs != nil && fs.State != registry.MoveAborted:
 		mv := registry.Move{Steps: fs.Steps}
-		return &unfinishedMove{kind: fs.Kind, from: fs.From, to: fs.To, epoch: fs.Epoch, last: lastStep(mv)}, fs, nil
+		return &unfinishedMove{kind: fs.Kind, from: fs.From, to: fs.To, epoch: fs.Epoch, last: lastStep(mv), steps: fs.Steps, running: fs.State == "" || fs.State == registry.MoveRunning}, fs, nil
 	}
 	return nil, nil, nil
 }

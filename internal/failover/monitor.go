@@ -61,8 +61,13 @@ func NewMonitor(o *Orchestrator) *Monitor {
 	return &Monitor{o: o, Interval: MonitorInterval, unhealthySince: map[string]time.Time{}}
 }
 
-// Run looks every Interval until ctx ends. It does nothing for a node whose mode is manual.
+// Run looks every Interval until ctx ends. It first continues a server move to this node that the
+// restart of the daemon cut off (ResumeInterrupted), whatever the mode. Beyond that it does nothing
+// for a node whose mode is manual.
 func (m *Monitor) Run(ctx context.Context) {
+	if _, err := m.o.ResumeInterrupted(ctx); err != nil && ctx.Err() == nil {
+		m.o.d.Log.Error("continuing the server move after the restart failed", "error", err)
+	}
 	if !m.o.conf().Automatic() {
 		return
 	}

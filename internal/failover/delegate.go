@@ -28,9 +28,10 @@ const PathServer = "/peer/v1/failover/server"
 // delegationPoll is how often the leader looks at the node that runs the move.
 const delegationPoll = 2 * time.Second
 
-// delegationPatience is how many looks in a row may fail before the leader stops following. The
-// move goes on without it.
-const delegationPatience = 15
+// delegationPatience is how many looks in a row may fail before the leader stops following; the
+// move goes on without it. The node that runs the move restarts its daemon when its system cluster
+// is promoted and takes a while to answer again, so the patience covers a few minutes.
+const delegationPatience = 90
 
 // Remote starts a server move on another node and follows it. MeshPeers implements it.
 type Remote interface {
@@ -50,9 +51,10 @@ type ServerStatus struct {
 	Move  *moveJSON  `json:"move,omitempty"`
 }
 
-// delegated is the run this node does for a leader.
+// delegated is a run this node keeps for someone to follow: the switchover it does for a leader that
+// asked, or the move it continued after its daemon restarted (restart.go).
 type delegated struct {
-	// by is the node that asked.
+	// by is the node that follows it.
 	by    string
 	mu    sync.Mutex
 	state string
@@ -109,15 +111,23 @@ func (o *Orchestrator) delegateServer(ctx context.Context, opts ServerOptions, r
 	}
 	reportStep(ctx, registry.MoveStep{Name: "delegated", At: o.d.Now().UTC(), Detail: run.to.Name + " runs the switchover"})
 
-	next, misses := 0, 0
+	// The node that runs the move restarts its daemon when it promotes its system cluster, and the
+	// daemon that starts continues the move. While it is down, or has not picked the move up yet, the
+	// looks fail or find nothing; that is waited out, but only after the node was seen running it.
+	next, misses, seen := 0, 0, false
 	for {
 		st, err := remote.ServerStatus(ctx, run.to.ID, next)
-		if err != nil {
+		switch {
+		case err != nil || st.State == "idle" && seen:
 			if misses++; misses >= delegationPatience {
-				return nil, fmt.Errorf("failover: lost contact with %s, which goes on with the switchover; follow it there with supavise failover --resume or in the moves log: %w", run.to.Name, err)
+				cause := err
+				if cause == nil {
+					cause = errors.New("it reports no move")
+				}
+				return nil, fmt.Errorf("failover: lost contact with %s, which goes on with the switchover; follow it there with supavise failover --resume or in the moves log: %w", run.to.Name, cause)
 			}
-		} else {
-			misses = 0
+		default:
+			misses, seen = 0, true
 			for _, s := range st.Steps {
 				reportStep(ctx, registry.MoveStep{Name: s.Name, At: s.At, Detail: s.Detail})
 			}
@@ -180,32 +190,79 @@ func (o *Orchestrator) handleServerStart(w http.ResponseWriter, r *http.Request)
 		writePeerError(w, http.StatusConflict, "not_planned", "the old leader does not answer here: a failover is run on this node, not asked of it")
 		return
 	}
-	run := &delegated{state: "running", by: peer.Node}
-	o.delegMu.Lock()
-	o.deleg = run
-	o.delegMu.Unlock()
+	run := o.keepRun(peer.Node)
 	started = true
 	go func() {
 		defer release()
-		ctx := WithProgress(context.Background(), func(s registry.MoveStep) {
-			run.mu.Lock()
-			run.steps = append(run.steps, stepJSON{Name: s.Name, At: s.At, Detail: s.Detail})
-			run.mu.Unlock()
-		})
-		mv, err := o.failoverServer(ctx, opts)
-		run.mu.Lock()
-		defer run.mu.Unlock()
-		run.move = toMoveJSON(mv)
-		switch {
-		case err == nil:
-			run.state = "done"
-		case mv != nil && mv.State == registry.MoveAborted:
-			run.state, run.err = "aborted", err.Error()
-		default:
-			run.state, run.err = "failed", err.Error()
-		}
+		run.record(context.Background(), func(ctx context.Context) (*registry.Move, error) { return o.failoverServer(ctx, opts) })
 	}()
 	writePeerJSON(w, http.StatusAccepted, nil)
+}
+
+// keepRun starts the record of a run that node follows, in place of the one before it.
+func (o *Orchestrator) keepRun(by string) *delegated {
+	run := &delegated{state: "running", by: by}
+	o.delegMu.Lock()
+	o.deleg = run
+	o.delegMu.Unlock()
+	return run
+}
+
+// record runs do under base with each step it records, and its outcome, kept in the run.
+func (d *delegated) record(base context.Context, do func(ctx context.Context) (*registry.Move, error)) {
+	ctx := WithProgress(base, func(s registry.MoveStep) {
+		d.mu.Lock()
+		d.steps = append(d.steps, stepJSON{Name: s.Name, At: s.At, Detail: s.Detail})
+		d.mu.Unlock()
+	})
+	mv, err := do(ctx)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.move = toMoveJSON(mv)
+	switch {
+	case err == nil:
+		d.state = "done"
+	case mv != nil && mv.State == registry.MoveAborted:
+		d.state, d.err = "aborted", err.Error()
+	default:
+		d.state, d.err = "failed", err.Error()
+	}
+}
+
+// Follow reports a server move for someone who lost the connection that ran it: the run this node
+// keeps (a switchover it runs for a leader, or the move it continued after its daemon restarted),
+// else the server move of that epoch in the registry, which a node that restarted as a follower has
+// from the new leader's log. It gives the steps from index from on. The control socket serves it to
+// the CLI, whose daemon restarted in the middle of the move.
+func (o *Orchestrator) Follow(ctx context.Context, from int, epoch int64) ServerStatus {
+	o.delegMu.Lock()
+	run := o.deleg
+	o.delegMu.Unlock()
+	if run != nil {
+		return run.status(from)
+	}
+	if epoch <= 0 {
+		return ServerStatus{State: "idle"}
+	}
+	ms, err := o.store().ListMoves(ctx, "", 20)
+	if err != nil {
+		return ServerStatus{State: "idle"}
+	}
+	for _, m := range ms {
+		if m.Scope != registry.MoveServer || m.Epoch != epoch {
+			continue
+		}
+		from = max(0, min(from, len(m.Steps)))
+		st := ServerStatus{State: string(m.State), Next: len(m.Steps), Error: m.Error, Move: toMoveJSON(&m)}
+		for _, s := range m.Steps[from:] {
+			st.Steps = append(st.Steps, stepJSON{Name: s.Name, At: s.At, Detail: s.Detail})
+		}
+		if m.State == registry.MoveFailed && st.Error == "" {
+			st.Error = "the move stopped"
+		}
+		return st
+	}
+	return ServerStatus{State: "idle"}
 }
 
 // handleServerStatus tells the leader that asked how the move goes.

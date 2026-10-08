@@ -26,6 +26,7 @@ type failoverClient interface {
 	PlanServer(ctx context.Context, o failover.ServerOptions) (*failover.Plan, error)
 	RunProject(ctx context.Context, o failover.ProjectOptions, onStep func(registry.MoveStep)) (*registry.Move, error)
 	RunServer(ctx context.Context, o failover.ServerOptions, onStep func(registry.MoveStep)) (*registry.Move, error)
+	Follow(ctx context.Context, epoch int64, onStep func(registry.MoveStep)) (*registry.Move, error)
 }
 
 // newFailoverClient reaches the daemon of this node. A variable so that tests can use a fake.
@@ -46,7 +47,12 @@ promotes the system cluster and then every project's replica, and loses at most 
 Run it on the node that should lead; a switchover can also be started on the leader with --to,
 which has that node run it. --dry-run prints each precondition. State is kept so that --resume
 continues a run that stopped. A project with no replica is refused unless --restore-missing, which builds
-its standby from the WAL archive (data loss up to archive_timeout).`,
+its standby from the WAL archive (data loss up to archive_timeout).
+
+The daemon of the node that takes over restarts once when its system cluster is promoted, because that
+makes it the leader. The move is not over then: the daemon that starts continues it, and this command
+waits for it and goes on printing the steps. A node that stops leading restarts its daemon the same way
+when its own system cluster becomes a standby.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runServerFailover(cmd, o) },
 	}
@@ -99,7 +105,25 @@ func runServerFailover(cmd *cobra.Command, o failover.ServerOptions) error {
 		o.ExpectKind, o.ExpectEpoch = plan.Kind, plan.Epoch
 	}
 	mv, err := c.RunServer(ctx, o, stepPrinter(out))
+	if errors.Is(err, failover.ErrRestarting) || errors.Is(err, failover.ErrStreamClosed) {
+		mv, err = followRestart(ctx, out, c, plan.Epoch, mv)
+	}
 	return finishMove(out, mv, err)
+}
+
+// followRestart goes on with a server move whose connection the daemon's restart cut: the daemon that
+// starts continues the move (the node that leads now) or has the log from the leader (a node that
+// follows now), and the steps it records are printed from where they stopped.
+func followRestart(ctx context.Context, out io.Writer, c failoverClient, epoch int64, mv *registry.Move) (*registry.Move, error) {
+	fmt.Fprintln(out, "\nThe daemon of this node restarts in the role the move gives it. Waiting for it, and following the move from there.")
+	next, err := c.Follow(ctx, epoch, stepPrinter(out))
+	switch {
+	case errors.Is(err, failover.ErrNothingRunning):
+		return mv, errors.New("the daemon restarted and has no record of this move. The move goes on where the cluster leads: supavise status shows the leader and the cluster, and supavise failover --resume on the node it goes to continues a move that stopped")
+	case next == nil && err != nil:
+		return mv, err
+	}
+	return next, err
 }
 
 // planError words an error of the plan request.

@@ -43,6 +43,14 @@ var (
 	ErrPlanChanged = errors.New("failover: the plan changed since it was confirmed")
 	// ErrNotLeader: the operation belongs to the leader.
 	ErrNotLeader = errors.New("failover: this node is not the leader")
+	// ErrRestarting: the daemon is stopping because its node's role in the cluster changed (the
+	// system cluster it promoted makes it the leader, which the daemon takes up by restarting). The
+	// move is not over and not failed: the daemon that starts continues it from its log.
+	ErrRestarting = errors.New("failover: the daemon restarts in its new role and goes on with the move there")
+	// ErrStreamClosed: the control socket closed before the move reported its end.
+	ErrStreamClosed = errors.New("failover: the connection to the daemon closed before the move ended")
+	// ErrNothingRunning: the daemon runs no move and has none it finished since it started.
+	ErrNothingRunning = errors.New("failover: the daemon runs no move")
 )
 
 // RefusedError is returned (wrapping ErrRefused) when a move's preconditions fail.

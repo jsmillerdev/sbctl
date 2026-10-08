@@ -476,13 +476,14 @@ func TestProjectResumeAtEveryStep(t *testing.T) {
 			if p.NodeID != "n2" || p.Status != registry.StatusActiveHealthy {
 				t.Fatalf("project: %+v", p)
 			}
-			// The stop and the promotion ran once; a promotion that was only repeated because it
-			// failed is the only second one.
-			// (twice when the stop itself was what failed)
+			// The stop ran once (twice when the stop itself was what failed). The node is asked to promote
+			// again after a promotion that failed, and after one that was answered but not recorded: its
+			// promotion is repeatable, finds the cluster promoted and starts nothing twice, and it is
+			// what finishes a promotion that an earlier try left halfway.
 			if n := w.count("stop n1/" + refA); n > 1 && !strings.HasPrefix(c.fail, "stop ") {
 				t.Errorf("the old primary was stopped %d times", n)
 			}
-			if n := w.count("promote n2/"); n > 2 || (c.fail == "promote-after n2/" && n != 1) {
+			if n := w.count("promote n2/"); n > 2 {
 				t.Errorf("%d promotions", n)
 			}
 			reps, _ := w.reg.ListReplicas(w.ctx, refA)

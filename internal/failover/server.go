@@ -89,6 +89,9 @@ func (o *Orchestrator) failoverServer(ctx context.Context, opts ServerOptions) (
 		}
 	}
 	detail := fmt.Sprintf("Moving the leadership from %s to %s (epoch %d).", run.from.Name, run.to.Name, run.epoch)
+	if opts.Resume {
+		detail = fmt.Sprintf("Continuing the move of the leadership from %s to %s (epoch %d) after it stopped.", run.from.Name, run.to.Name, run.epoch)
+	}
 	if restored := restoredRefs(rec); len(restored) > 0 {
 		detail += fmt.Sprintf(" No replica exists for %s: their standbys are built from the archive, with data loss up to archive_timeout.", listRefs(restored))
 	}
@@ -382,6 +385,8 @@ func (o *Orchestrator) writeMarker(ctx context.Context, run *serverRun) (string,
 func (o *Orchestrator) becomeLeader(ctx context.Context, j *journal, run *serverRun) (string, error) {
 	if o.d.Takeover != nil {
 		if err := o.d.Takeover.BecomeLeader(ctx, run.epoch); err != nil {
+			// The daemon of this node takes up its new role by restarting, which ends this wait with the
+			// context. The move is not over: the daemon that starts continues it at this step.
 			return "", fmt.Errorf("waiting for %s to run as the leader: %w", run.to.Name, err)
 		}
 	}

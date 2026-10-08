@@ -146,6 +146,13 @@ func timeoutSeconds(d time.Duration) int { return int(d / time.Second) }
 
 // endMove records the outcome of a move in its log and as an alert, and returns the move.
 func (o *Orchestrator) endMove(ctx context.Context, j *journal, ref string, runErr error) (*registry.Move, error) {
+	if runErr != nil && interrupted(ctx, j) {
+		// The daemon is stopping for the role the promotion gave its node. The move stays running in
+		// its log, no alert says it failed, and the daemon that starts continues it.
+		o.d.Log.Info("the daemon stops in the middle of a server move; the daemon that starts continues it", "cause", runErr)
+		mv := j.snapshot()
+		return &mv, fmt.Errorf("%w (%v)", ErrRestarting, runErr)
+	}
 	var abort *abortError
 	state, text := registry.MoveDone, ""
 	switch {
@@ -363,8 +370,7 @@ type promoteArgs struct {
 	Drain bool
 }
 
-// promoteReplica promotes the replica identifier on node. It does nothing when the instance is
-// primary already (a resume after a crash between the promotion and its record).
+// promoteReplica promotes the replica identifier on node.
 //
 // A promotion that waits for an LSN waits for it here first, before the node is asked to promote
 // anything. A standby that does not get past the position in time is an abortError: nothing was
@@ -372,9 +378,14 @@ type promoteArgs struct {
 // from the promotion itself says nothing about whether it happened (the node may still be inside
 // pg_promote or its restart when the call fails), so it is returned as it is and the caller leaves
 // the old primary stopped: two primaries are worse than a move that waits for --resume.
+//
+// An instance that is not in recovery any more is not taken for done, and no position is waited for
+// (a primary has no replay position): the node is asked again. Its promotion is repeatable, and
+// finishes what an earlier try left, which may be the restart on the canonical port: the daemon of a
+// node whose system cluster is promoted restarts in the middle of the promotion and cuts it off.
 func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, identifier string, a promoteArgs) (string, error) {
 	if obs, err := o.d.Instances.Observe(ctx, node.ID, identifier); err == nil && !obs.InRecovery && obs.PostgresUp {
-		return "already primary on " + node.Name, nil
+		a.WaitLSN = ""
 	}
 	if a.WaitLSN != "" {
 		if err := o.waitReplayed(ctx, node.ID, identifier, a.WaitLSN); err != nil {
@@ -536,15 +547,31 @@ func newID6() string {
 	return string(b[:])
 }
 
+// tenantAttempts and tenantWait bound the tries to register a project with the shared services. A
+// node that has just become the leader starts them while the move goes on, so the first try can meet
+// a service that is not up yet.
+const (
+	tenantAttempts = 4
+	tenantWait     = 5 * time.Second
+)
+
 // ensureTenant registers the project with the shared services again at its new home.
 func (o *Orchestrator) ensureTenant(ctx context.Context, ref string) error {
 	if o.d.Fleet == nil {
 		return nil
 	}
-	if err := o.d.Fleet.EnsureTenant(ctx, ref); err != nil {
-		return fmt.Errorf("registering %s with the shared services: %w", ref, err)
+	var err error
+	for attempt := 0; attempt < tenantAttempts; attempt++ {
+		if attempt > 0 {
+			if werr := o.wait(ctx, tenantWait); werr != nil {
+				return werr
+			}
+		}
+		if err = o.d.Fleet.EnsureTenant(ctx, ref); err == nil {
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("registering %s with the shared services: %w", ref, err)
 }
 
 // demoteOld turns the old home's stopped primary into a replica of the new home, in place. The

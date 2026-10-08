@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
@@ -33,6 +34,9 @@ import (
 //	POST /v1/plan/server    ServerOptions in, a Plan out
 //	POST /v1/run/project    ProjectOptions in, a stream of events (one JSON object per line)
 //	POST /v1/run/server     ServerOptions in, a stream of events
+//	GET  /v1/follow         ?from=N&epoch=E: the move the daemon continued after it restarted, or runs
+//	                        for a leader, else the server move of epoch E in the registry (a
+//	                        ServerStatus, the steps from index N on)
 
 // maxSocketPath is the longest unix socket path Linux and macOS accept, less a margin.
 const maxSocketPath = 100
@@ -96,7 +100,8 @@ type event struct {
 	Step  *stepJSON `json:"step,omitempty"`
 	Move  *moveJSON `json:"move,omitempty"`
 	Error string    `json:"error,omitempty"`
-	// Code names the kind of error: "refused", "busy", "nothing_to_resume", "plan_changed", "no_cluster" or "failed".
+	// Code names the kind of error: "refused", "busy", "nothing_to_resume", "plan_changed", "no_cluster",
+	// "restarting" (the daemon restarts in its new role and continues the move) or "failed".
 	Code   string  `json:"code,omitempty"`
 	Checks []Check `json:"checks,omitempty"`
 	// Move is set with an error too when the move got as far as being recorded.
@@ -124,6 +129,12 @@ func (j *moveJSON) move() *registry.Move {
 	return m
 }
 
+// Follower is what a Service implements when it keeps the run it continued after its daemon restarted
+// (*Orchestrator does): the control socket serves it at /v1/follow.
+type Follower interface {
+	Follow(ctx context.Context, from int, epoch int64) ServerStatus
+}
+
 // ControlServer serves the control socket for a Service.
 type ControlServer struct {
 	Svc Service
@@ -145,6 +156,16 @@ func (s *ControlServer) Handler(ctx context.Context) http.Handler {
 		default:
 			writeControl(w, http.StatusOK, rd)
 		}
+	})
+	mux.HandleFunc("GET /v1/follow", func(w http.ResponseWriter, r *http.Request) {
+		f, ok := s.Svc.(Follower)
+		if !ok {
+			writeControl(w, http.StatusOK, ServerStatus{State: "idle"})
+			return
+		}
+		from, _ := strconv.Atoi(r.URL.Query().Get("from"))
+		epoch, _ := strconv.ParseInt(r.URL.Query().Get("epoch"), 10, 64)
+		writeControl(w, http.StatusOK, f.Follow(r.Context(), from, epoch))
 	})
 	mux.HandleFunc("POST /v1/plan/project", func(w http.ResponseWriter, r *http.Request) {
 		var req projectReq
@@ -344,6 +365,8 @@ func (e *RemoteError) Is(target error) bool {
 		return target == ErrPlanChanged
 	case "no_cluster":
 		return target == ErrNoCluster
+	case "restarting":
+		return target == ErrRestarting
 	}
 	return false
 }
@@ -469,5 +492,66 @@ func (c Client) stream(ctx context.Context, path string, in any, onStep func(reg
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	return nil, errors.New("failover: the connection to the daemon closed before the move ended; it goes on in the daemon, follow it with supavise failover --resume or the moves log")
+	return nil, fmt.Errorf("%w; a move that was cut off by the daemon's restart is continued by the daemon that starts, and Follow shows it; any other goes on in the daemon, follow it with supavise failover --resume or the moves log", ErrStreamClosed)
+}
+
+// followPatience is how long Follow waits for a daemon that is restarting to answer again, and
+// followPoll how often it looks.
+var (
+	followPatience = 5 * time.Minute
+	followPoll     = 2 * time.Second
+)
+
+// Follow shows a server move of epoch after the connection that ran it was cut by the daemon's
+// restart in its new role: it calls onStep for each step the daemon that starts records (the node that
+// leads now continues the move; a node that follows it reads the log from the registry) and returns
+// the move when it ends, or an error when it failed. It waits for the daemon to answer first.
+// ErrNothingRunning when the daemon has no move to show.
+func (c Client) Follow(ctx context.Context, epoch int64, onStep func(registry.MoveStep)) (*registry.Move, error) {
+	from, deadline := 0, time.Now().Add(followPatience)
+	var lastErr error
+	var idleSince time.Time
+	for {
+		var st ServerStatus
+		err := c.call(ctx, http.MethodGet, "/v1/follow?from="+strconv.Itoa(from)+"&epoch="+strconv.FormatInt(epoch, 10), nil, &st)
+		switch {
+		case ctx.Err() != nil:
+			return nil, ctx.Err()
+		case err != nil:
+			lastErr = err
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("failover: the daemon did not answer again within %s: %w", followPatience, lastErr)
+			}
+		default:
+			for _, s := range st.Steps {
+				if onStep != nil {
+					onStep(registry.MoveStep{Name: s.Name, At: s.At, Detail: s.Detail})
+				}
+			}
+			from = st.Next
+			if st.State != "idle" {
+				idleSince = time.Time{}
+			}
+			switch st.State {
+			case "done":
+				return st.Move.move(), nil
+			case "failed", "aborted":
+				return st.Move.move(), &RemoteError{Code: "failed", Message: st.Error}
+			case "idle":
+				// A daemon that is up and runs nothing yet may be about to pick the move up (it waits a
+				// moment after it starts); one that stays idle has none.
+				if idleSince.IsZero() {
+					idleSince = time.Now()
+				}
+				if time.Since(idleSince) > resumeSettle+3*followPoll {
+					return nil, ErrNothingRunning
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(followPoll):
+		}
+	}
 }
