@@ -247,6 +247,7 @@ what a pass would do and changes nothing (no upgrade, no reboot, no record kept)
 				LockHost:      func() (func(), error) { return update.LockHost(update.HostLockPath) },
 				Reboot:        update.HostReboot,
 				AwaitShutdown: awaitShutdown,
+				Notify:        unattendedNotifier(cfg, log),
 			}
 			if dryRun {
 				// A copy of the record in a scratch directory, so that the pass leaves the real one alone.

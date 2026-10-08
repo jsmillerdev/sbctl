@@ -32,6 +32,21 @@ func upgradeNotifier(cfg *config.Config, log *slog.Logger) func(context.Context,
 	return notifyWith(alerts.New(cfg, alerts.Options{Log: log}), log)
 }
 
+// unattendedNotifier returns the Notify hook of `supavise update run`: it raises upgrade_failed
+// (critical) for the outcomes of an unattended upgrade that the upgrade itself cannot report,
+// because it was cut off or never ran. It shares the notifier's state and rules with upgradeNotifier.
+func unattendedNotifier(cfg *config.Config, log *slog.Logger) func(context.Context, string, string) {
+	n := alerts.New(cfg, alerts.Options{Log: log})
+	return func(ctx context.Context, title, detail string) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upgradeAlertTimeout)
+		defer cancel()
+		ev := alerts.Event{Kind: alerts.KindUpgradeFailed, Severity: alerts.SeverityCritical, Title: title, Detail: detail}
+		if err := n.Notify(ctx, ev); err != nil {
+			log.Warn("could not send the upgrade alert", "event", "unattended", "error", err)
+		}
+	}
+}
+
 func notifyWith(n *alerts.Notifier, log *slog.Logger) func(context.Context, nodeupgrade.Event) {
 	return func(ctx context.Context, ev nodeupgrade.Event) {
 		// A SIGTERM that stops the upgrade must not also drop the message that says why.

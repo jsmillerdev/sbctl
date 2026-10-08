@@ -380,7 +380,12 @@ func TestInterruptedUpgradePausesInsteadOfRunningAgain(t *testing.T) {
 	r.d.Upgrade = died
 
 	r.at("2026-10-04 03:15") // the next tick of the same window
+	var told []string
+	r.d.Notify = func(_ context.Context, title, detail string) { told = append(told, title+" | "+detail) }
 	err := r.run()
+	if len(told) != 1 || !strings.Contains(told[0], "interrupted") || !strings.Contains(told[0], "sudo supavise update resume") {
+		t.Errorf("the operator was told %q, want one message about the interruption and how to resume", told)
+	}
 	if err == nil || !strings.Contains(err.Error(), "interrupted") {
 		t.Fatalf("Run = %v, want the interruption reported", err)
 	}
@@ -904,3 +909,35 @@ func TestNoHostLockNoReboot(t *testing.T) {
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// An upgrade that could not run, or that ended in a status nobody named, pauses automatic upgrades
+// and tells the operator. Exit 4 was already told by `supavise upgrade` itself, and a rollback
+// (3) or a refusal (2) is its own message there too.
+func TestUnattendedOutcomesTheUpgradeCannotReportAreSent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exit int
+		told bool
+	}{
+		{"could not run", -1, true},
+		{"unnamed status", 9, true},
+		{"needs the operator", ExitNeedsOperator, false},
+		{"rolled back", ExitRolledBack, false},
+		{"refused", ExitRefused, false},
+		{"ok", ExitOK, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t, config.UpdateAuto)
+			r.upgrades = []int{tc.exit}
+			var told []string
+			r.d.Notify = func(_ context.Context, title, detail string) { told = append(told, title+" | "+detail) }
+			_ = r.run()
+			if tc.told != (len(told) == 1) || len(told) > 1 {
+				t.Fatalf("told %q, want a message: %v", told, tc.told)
+			}
+			if tc.told && !strings.Contains(told[0], "sudo supavise update resume") {
+				t.Errorf("the message does not say how to resume: %q", told[0])
+			}
+		})
+	}
+}

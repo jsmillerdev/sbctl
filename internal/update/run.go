@@ -76,6 +76,17 @@ type Deps struct {
 	// the lock must outlast that gap. It returns when the service is told to stop (the shutdown does
 	// that) or after a grace period, whichever is first.
 	AwaitShutdown func(ctx context.Context)
+	// Notify tells the operator about an unattended outcome that no other process reports: an
+	// upgrade that was cut short, and one that could not run or ended in a status the contract
+	// does not name. (`supavise upgrade` reports its own failures, including exit 3 and 4.) A
+	// delivery problem is the hook's to log; a nil Notify sends nothing.
+	Notify func(ctx context.Context, title, detail string)
+}
+
+func (d Deps) notify(ctx context.Context, title, detail string) {
+	if d.Notify != nil {
+		d.Notify(ctx, title, detail)
+	}
 }
 
 // The latest moment, counted back from the close of the window, at which an unattended upgrade or
@@ -128,6 +139,8 @@ func Run(ctx context.Context, d Deps) error {
 		if err := d.Store.Save(st); err != nil {
 			return err
 		}
+		d.notify(ctx, "Automatic upgrade was interrupted",
+			fmt.Sprintf("The unattended upgrade that started at %s from Supavise %s did not report how it ended: the node or the service was stopped part way through. Automatic upgrades are paused until `sudo supavise update resume`.\nRun `supavise status` and `supavise upgrade --check` first.", p.Started.Format(time.RFC3339), d.Version))
 		return fmt.Errorf("an unattended upgrade was interrupted; automatic upgrades are paused until `sudo supavise update resume`")
 	}
 
@@ -187,6 +200,10 @@ func Run(ctx context.Context, d Deps) error {
 				st.Blocked = fmt.Sprintf("%s at %s", res.Meaning, res.At.Format(time.RFC3339))
 				upgradeFailed = true
 				d.Log.Error("unattended_upgrade_result", "exit", exit, "outcome", "needs_operator", "detail", res.Meaning)
+				if exit != ExitNeedsOperator { // `supavise upgrade` told the operator about its own exit 4
+					d.notify(ctx, "Automatic upgrade could not run to the end",
+						fmt.Sprintf("`supavise upgrade --unattended` from Supavise %s: %s. Automatic upgrades are paused until `sudo supavise update resume`.\nRun `supavise status` and `supavise upgrade --check` first.", d.Version, res.Meaning))
+				}
 				upgradeErr = fmt.Errorf("unattended upgrade needs the operator (supavise upgrade exit %d); automatic upgrades are paused until `supavise update resume`", exit)
 			}
 		}

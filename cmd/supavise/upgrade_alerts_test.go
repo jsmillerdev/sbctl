@@ -232,3 +232,13 @@ func TestUpgradeAndRollbackOptionsCarryTheAlertHook(t *testing.T) {
 		t.Errorf("sent %q", got)
 	}
 }
+
+func TestUnattendedNotifierRaisesACriticalUpgradeFailure(t *testing.T) {
+	w := newWebhook(t)
+	notify := unattendedNotifier(alertCfg(t, w.srv.URL), quietLog())
+	notify(context.Background(), "Automatic upgrade was interrupted", "paused until `sudo supavise update resume`")
+	notify(context.Background(), "Automatic upgrade was interrupted", "again")
+	if got := w.kinds(); got != "upgrade_failed/critical,upgrade_failed/critical" {
+		t.Fatalf("sent %q", got)
+	}
+}
