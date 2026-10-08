@@ -12,6 +12,9 @@
 #   v5     this checkout, as v0.0.5, pinning a newer GoTrue release
 #   v6     this checkout, as v0.0.6, with one PostgREST setting (PGRST_DB_POOL) rendered differently
 #          and the pins of v2: a release that moves no service and still restarts every project's PostgREST
+#   v7     this checkout, as v0.0.10, pinning the GoTrue release of v5 and rendering the PostgreSQL units of
+#          the projects differently (max_connections of the default class is 61): a release that restarts
+#          every project's database, which the daemon leaves running and the rollout restarts
 #   releasetool   deploy/releasetool, which writes the signed manifests
 #   *.versions.yaml   the versions.yaml each binary was built with (the manifest of its release is
 #                     made from the same file)
@@ -93,5 +96,21 @@ open(path, "w").write(s)
 PY
 build "$work/this" v0.0.6 "$out/v6"
 
+# v7: the GoTrue pin of v5, and a project's PostgreSQL unit rendered differently (the system cluster has
+# its own class and renders as before).
+git -C "$work/this" checkout -- internal/lifecycle/env.go
+cp "$out/v5.versions.yaml" "$out/v7.versions.yaml"
+cp "$out/v7.versions.yaml" "$work/this/internal/versions/versions.yaml"
+python3 - "$work/this/internal/lifecycle/classes.go" <<'PY'
+import re, sys
+path = sys.argv[1]
+s = open(path).read()
+s, n = re.subn(r'(newSize\("micro", "ci_micro", "Micro", 1024, 100, true, )60(, 5, 200\))', r'\g<1>61\2', s)
+if n != 1:
+    sys.exit("classes.go has no micro class with 60 connections to change")
+open(path, "w").write(s)
+PY
+build "$work/this" v0.0.10 "$out/v7"
+
 go build -o "$out/releasetool" ./deploy/releasetool
-echo "built prev (from $prev_ref), v2, v4, v5, v6 and releasetool in $out"
+echo "built prev (from $prev_ref), v2, v4, v5, v6, v7 and releasetool in $out"

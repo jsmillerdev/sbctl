@@ -220,7 +220,7 @@ func restartChanged(ctx context.Context, n *lifecycle.Node, out *lineWriter, ref
 	case err != nil:
 		out.printf("%s: FAILED after %s: %v\n", ref, time.Since(started).Round(time.Second), err)
 	case restarted:
-		out.printf("%s: restarted on the changed files in %s\n", ref, time.Since(started).Round(time.Second))
+		out.printf("%s: restarted on their changed files in %s\n", ref, time.Since(started).Round(time.Second))
 	}
 	return err
 }

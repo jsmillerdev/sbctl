@@ -67,10 +67,10 @@ need_root
 preflight
 ARCH=$(dpkg --print-architecture)
 cd "$REPO_ROOT" || exit 1
-for f in prev v2 v4 v5 v6 releasetool; do [[ -x $BINS/$f ]] || fail "$BINS/$f is missing: run tests/linux/upgrade-e2e-build.sh"; done
+for f in prev v2 v4 v5 v6 v7 releasetool; do [[ -x $BINS/$f ]] || fail "$BINS/$f is missing: run tests/linux/upgrade-e2e-build.sh"; done
 # The driver and the stubs are run by the supavise user too (as workers): out of a private directory.
 install -d -m 0755 /opt/supavise-e2e
-for f in prev v2 v4 v5 v6; do install -m 0755 "$BINS/$f" "/opt/supavise-e2e/$f"; done
+for f in prev v2 v4 v5 v6 v7; do install -m 0755 "$BINS/$f" "/opt/supavise-e2e/$f"; done
 B=/opt/supavise-e2e
 SV=/usr/local/bin/supavise
 STATE=$SUPAVISE_STATE
@@ -509,5 +509,32 @@ else
   [[ $(versions_of "$REF") == "$NEW_AUTH $NEW_REST "* && $(versions_of "$REF2") == "$NEW_AUTH $NEW_REST "* ]] || fail "versions after the stopped upgrade: $(versions_of "$REF") / $(versions_of "$REF2")"
   intact "$REF"; intact "$REF2"
 fi
+
+# ---- 9. a release that renders the projects' PostgreSQL units differently -------------------------
+log "a release that changes the PostgreSQL settings of every project: the daemon leaves the clusters running, the rollout restarts them"
+make_release v0.0.10 "$B/v7" "$BINS/v7.versions.yaml"
+FROM_VERSION=$($SV --version | grep -o 'v[0-9][0-9.]*' | head -1)
+PG_PID=$(pg_pid "$REF") PG_PID2=$(pg_pid "$REF2")
+for r in "$REF" "$REF2"; do
+  [[ $(pg_sock "$r" "show max_connections") == 60 ]] || fail "$r: max_connections is not 60 before the upgrade"
+done
+run upgrade "$B/v7" --yes --version v0.0.10
+[[ $RC -eq 0 ]] || { journalctl --no-pager -u supavise.service | tail -60 >&2; fail "the upgrade to v0.0.10 exited $RC: $OUT"; }
+EXPECT_VERSION=v0.0.10
+for want in "restarted on their changed files" "Supavise v0.0.10 is running"; do
+  [[ $OUT == *"$want"* ]] || fail "the upgrade's output lacks '$want':
+$OUT"
+done
+wait_daemon; [[ $(daemon_version) == *v0.0.10* ]] || fail "the daemon runs $(daemon_version)"
+wait_status "$REF" ACTIVE_HEALTHY 180; wait_status "$REF2" ACTIVE_HEALTHY 180
+journalctl --no-pager -u supavise.service | grep -q "postgres settings changed; the restart waits for the upgrade's rollout" || fail "the daemon did not hold the restart of the clusters back for the rollout"
+for r in "$REF" "$REF2"; do
+  [[ $(pg_sock "$r" "show max_connections") == 61 ]] || fail "$r: PostgreSQL still runs its old settings"
+done
+[[ $(pg_pid "$REF") != "$PG_PID" && $(pg_pid "$REF2") != "$PG_PID2" ]] || fail "a project's PostgreSQL was not restarted by the rollout"
+[[ $(marker) == "done $FROM_VERSION v0.0.10" ]] || fail "marker: $(marker), want done $FROM_VERSION v0.0.10"
+intact "$REF"; intact "$REF2"
+sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
+[[ $sup_status -eq 0 ]] || { cat "$WORK/status.txt" >&2; fail "supavise status exited $sup_status after the upgrade to v0.0.10"; }
 
 log "upgrade end to end: all checks passed"
