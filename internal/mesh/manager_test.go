@@ -1083,3 +1083,36 @@ func TestRPCPassesTheQueryAndReturnsNotModified(t *testing.T) {
 		t.Fatalf("a Client with a stale tag: %v, %v", got, err)
 	}
 }
+
+// A node that the registry marks fenced is still admitted at the handshake, and answers the ping, the
+// fence and the rejoin, so that a returning old leader's boot check can ask the new leader what epoch it
+// is at; nothing else is served to it.
+func TestAFencedNodeStillHearsThePing(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	pingEndpoint(h)
+	n1 := h.nodes["n1"]
+	n1.mgr.o.Mux.Handle("POST "+peerapi.PathReport, func(w http.ResponseWriter, r *http.Request) { RespondJSON(w, http.StatusNoContent, nil) })
+	if err := h.reg.SetNodeState(h.ctx, "n2", registry.NodeFenced); err != nil {
+		t.Fatal(err)
+	}
+	go n1.mgr.Serve(h.ctx, n1.ln)
+	go n1.mgr.Run(h.ctx)
+	c := joinerClient(t, h, "n2")
+	var p peerapi.Ping
+	if err := c.Call(h.ctx, "GET", peerapi.PathPing, nil, &p); err != nil || p.Node != "n1" || p.Leader != "n1" {
+		t.Fatalf("the ping of a fenced node: %+v, %v", p, err)
+	}
+	var re *RemoteError
+	if err := c.Call(h.ctx, "POST", peerapi.PathReport, peerapi.Report{}, nil); !errors.As(err, &re) || re.Status != http.StatusForbidden || !errors.Is(err, ErrRefused) {
+		t.Fatalf("a report from a fenced node: %v", err)
+	}
+	st, err := c.OpenForward(KindPostgres, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	_ = st.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := st.Read(make([]byte, 1)); n != 0 || err == nil {
+		t.Fatalf("a fenced node was given a forward stream: %d bytes, %v", n, err)
+	}
+}
