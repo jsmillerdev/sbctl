@@ -45,9 +45,8 @@ type Deps struct {
 	LocalPrimaries LocalPrimaries
 	LocalServices  LocalServices
 
-	// Extra adds checks to the preflight of a server move: what only the owner of the part knows
-	// (the certificates are mirrored, the shared-service artifacts are present).
-	Extra func(ctx context.Context, to registry.Node) []Check
+	// Extra adds checks to the preflight of a server move.
+	Extra ExtraChecks
 	// PublicProbe checks the cluster's public address from outside, as a client would
 	// (GET /healthz of the API host through the service address). Nil: the automatic server mode
 	// has no such signal and does not act.
@@ -70,6 +69,10 @@ type Orchestrator struct {
 
 	lockMu sync.Mutex
 	locks  map[string]*sync.Mutex
+
+	// deleg is the switchover this node runs for a leader that asked (delegate.go).
+	delegMu sync.Mutex
+	deleg   *delegated
 
 	probes probeCache
 	// off is why the automatic mode is not running, "" while it is or was not asked for.

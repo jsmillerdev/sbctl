@@ -169,6 +169,7 @@ func (o *Orchestrator) planProject(ctx context.Context, opts ProjectOptions) (*P
 		return nil, nil, err
 	}
 	run.from = from
+	pl.FromName = from.Name
 	if from.State != registry.NodeActive {
 		pl.Checks = append(pl.Checks, hard(fail("home node", fmt.Sprintf("%s is %s", from.Name, from.State))))
 	} else {
@@ -185,7 +186,7 @@ func (o *Orchestrator) planProject(ctx context.Context, opts ProjectOptions) (*P
 		return nil, nil, err
 	}
 	run.to = to
-	pl.To = to.ID
+	pl.To, pl.ToName = to.ID, to.Name
 	pl.Projects = []ProjectPlan{{Ref: p.Ref, Replica: rep.Row.Identifier, Node: to.ID, LagSeconds: rep.Lag}}
 	if to.State != registry.NodeActive {
 		pl.Checks = append(pl.Checks, hard(fail("target node", fmt.Sprintf("%s is %s", to.Name, to.State))))
@@ -392,6 +393,7 @@ func (o *Orchestrator) planServer(ctx context.Context, opts ServerOptions) (*Pla
 		if run.to, err = o.node(ctx, prior.to); err != nil {
 			return nil, nil, err
 		}
+		pl.FromName, pl.ToName = run.from.Name, run.to.Name
 		return pl, run, nil
 	} else if opts.Resume {
 		pl.Checks = append(pl.Checks, hard(fail("unfinished move", "there is none to resume")))
@@ -414,7 +416,7 @@ func (o *Orchestrator) planServer(ctx context.Context, opts ServerOptions) (*Pla
 		return pl, run, nil
 	}
 	run.from, run.to = leader, toNode
-	pl.From, pl.To = leader.ID, toNode.ID
+	pl.From, pl.To, pl.FromName, pl.ToName = leader.ID, toNode.ID, leader.Name, toNode.Name
 	switch {
 	case leader.ID == toNode.ID:
 		pl.Checks = append(pl.Checks, hard(fail("target node", fmt.Sprintf("%s is the leader already", toNode.Name))))

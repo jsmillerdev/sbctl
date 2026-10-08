@@ -117,6 +117,9 @@ type Plan struct {
 	From  string `json:"from,omitempty"`
 	To    string `json:"to,omitempty"`
 	Epoch int64  `json:"epoch,omitempty"`
+	// FromName and ToName are the nodes' names ([node] name), which is what the operator types.
+	FromName string `json:"from_name,omitempty"`
+	ToName   string `json:"to_name,omitempty"`
 
 	Checks   []Check       `json:"checks"`
 	Projects []ProjectPlan `json:"projects,omitempty"`

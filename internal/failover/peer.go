@@ -33,6 +33,7 @@ import (
 //	POST /peer/v1/failover/quiesce               the survivor to the leader: stop everything for a planned switchover
 //	POST /peer/v1/failover/resume                the survivor to the leader: undo a quiesce
 //	POST /peer/v1/failover/primary/{ref}/{op}    the leader to a project's home: stop, start, health or aside
+//	POST|GET /peer/v1/failover/server            the leader to the node that takes over: run a switchover, and tell how it goes
 const (
 	PathQuiesce = "/peer/v1/failover/quiesce"
 	PathResume  = "/peer/v1/failover/resume"
@@ -184,6 +185,8 @@ func (o *Orchestrator) PeerHandlers() map[string]mesh.HandlerFunc {
 		"POST " + PathQuiesce:       o.handleQuiesce,
 		"POST " + PathResume:        o.handleResume,
 		"POST " + PathPrimary:       o.handlePrimary,
+		"POST " + PathServer:        o.handleServerStart,
+		"GET " + PathServer:         o.handleServerStatus,
 	}
 }
 
@@ -420,7 +423,8 @@ func (o *Orchestrator) quiesceLocal(ctx context.Context, req QuiesceRequest) (Qu
 			continue
 		}
 		g.Go(func() error {
-			lsn, err := o.stopPrimary(ctx, self.ID, p.Ref)
+			o.quiesceTenant(ctx, p.Ref)
+			lsn, err := o.d.LocalPrimaries.Stop(ctx, p.Ref)
 			if err != nil {
 				return fmt.Errorf("stopping %s: %w", p.Ref, err)
 			}
@@ -447,19 +451,24 @@ func (o *Orchestrator) quiesceLocal(ctx context.Context, req QuiesceRequest) (Qu
 }
 
 // stopPrimary stops one project's primary the way a planned stop needs: Realtime and the pooler
-// let go of the database first (design: without that Realtime's logical walsender holds the
-// shutdown until it times out), then the project's units stop and the cluster shuts down. It
-// returns the shutdown checkpoint.
+// let go of the database first (without that Realtime's logical walsender holds the shutdown
+// until it times out), then the project's units stop and the cluster shuts down. It returns the
+// shutdown checkpoint. The daemon, and the WAL relay in it, is not touched: the cluster archives
+// its last segments through the relay while it shuts down.
 func (o *Orchestrator) stopPrimary(ctx context.Context, node, ref string) (string, error) {
-	if o.d.Fleet != nil {
-		if err := o.d.Fleet.QuiesceTenant(ctx, ref); err != nil {
-			o.d.Log.Warn("could not quiesce the shared services before the stop", "ref", ref, "error", err)
-		}
-	}
-	if node == o.self().ID && o.d.LocalPrimaries != nil {
-		return o.d.LocalPrimaries.Stop(ctx, ref)
-	}
+	o.quiesceTenant(ctx, ref)
 	return o.d.Primaries.Stop(ctx, node, ref)
+}
+
+// quiesceTenant makes the shared services let go of the project's database. A failure is
+// logged: the stop may then be slow, and it still works.
+func (o *Orchestrator) quiesceTenant(ctx context.Context, ref string) {
+	if o.d.Fleet == nil {
+		return
+	}
+	if err := o.d.Fleet.QuiesceTenant(ctx, ref); err != nil {
+		o.d.Log.Warn("could not quiesce the shared services before the stop", "ref", ref, "error", err)
+	}
 }
 
 // handleResume undoes a quiesce: the survivor aborted before it fenced or promoted anything.

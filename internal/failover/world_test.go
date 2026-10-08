@@ -54,6 +54,8 @@ type world struct {
 	alerts  []alerts.Event
 	marker  *backup.LeaderMarker
 	markErr error
+	// pingAs, when set, is what every reachable peer answers to a ping.
+	pingAs *peerapi.Ping
 
 	clock    int
 	provider *fakeProvider
@@ -352,7 +354,7 @@ func (w *world) deps() Deps {
 		Store: func() Store { return &gatedStore{w: w, Memory: w.reg} }, Members: w.members,
 		Instances: (*worldInstances)(w), Primaries: (*worldPrimaries)(w), Backups: (*worldBackups)(w), Fleet: (*worldFleet)(w),
 		Peers: (*worldPeers)(w), Leader: (*worldLeader)(w), Takeover: (*worldTakeover)(w), Replicas: (*worldReplicas)(w),
-		Marker: (*worldMarker)(w), Provider: w.provider,
+		Marker: (*worldMarker)(w), Provider: w.provider, LocalPrimaries: (*worldLocal)(w), LocalServices: (*worldServices)(w),
 		Notify: func(_ context.Context, ev alerts.Event) { w.mu.Lock(); w.alerts = append(w.alerts, ev); w.mu.Unlock() },
 		Now:    w.now,
 		Sleep:  func(ctx context.Context, d time.Duration) error { return ctx.Err() },
@@ -675,6 +677,14 @@ func (p *worldPeers) Ping(_ context.Context, node string) (peerapi.Ping, error) 
 	if err := w.nodeUp(node); err != nil {
 		return peerapi.Ping{}, err
 	}
+	w.mu.Lock()
+	as := w.pingAs
+	w.mu.Unlock()
+	if as != nil {
+		p := *as
+		p.Node = node
+		return p, nil
+	}
 	cl, _ := w.reg.GetCluster(w.ctx)
 	return peerapi.Ping{Node: node, Epoch: cl.Epoch, Leader: cl.Leader, Health: "healthy"}, nil
 }
@@ -817,7 +827,9 @@ func (p *fakeProvider) TakeOver(_ context.Context, req Request) error {
 }
 
 func (p *fakeProvider) PeerState(context.Context, registry.Node) (PeerState, error) {
-	p.w.log("provider.peerstate")
+	if err := p.w.do("provider.peerstate"); err != nil {
+		return PeerState{}, err
+	}
 	return p.state, nil
 }
 
@@ -843,3 +855,50 @@ func hasCheck(pl *Plan, name string) bool {
 	}
 	return false
 }
+
+// worldLocal implements LocalPrimaries: this node's own primaries.
+type worldLocal world
+
+func (l *worldLocal) Stop(ctx context.Context, ref string) (string, error) {
+	w := (*world)(l)
+	if err := w.do("local.stop %s", ref); err != nil {
+		return "", err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if s := w.prim[w.self+"/"+ref]; s != nil {
+		s.running = false
+	}
+	return w.lsn[ref], nil
+}
+
+func (l *worldLocal) Start(ctx context.Context, ref string) error {
+	w := (*world)(l)
+	if err := w.do("local.start %s", ref); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.prim[w.self+"/"+ref] = &primState{running: true, healthy: true}
+	return nil
+}
+
+func (l *worldLocal) Healthy(ctx context.Context, ref string) (bool, string, error) {
+	w := (*world)(l)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	s := w.prim[w.self+"/"+ref]
+	return s != nil && s.running && s.healthy, "", nil
+}
+
+func (l *worldLocal) SetAside(ctx context.Context, ref string, epoch int64) error {
+	return (*world)(l).do("local.aside %s epoch=%d", ref, epoch)
+}
+
+// worldServices implements LocalServices.
+type worldServices world
+
+func (s *worldServices) Stop(context.Context) error  { return (*world)(s).do("services.stop") }
+func (s *worldServices) Start(context.Context) error { return (*world)(s).do("services.start") }
+
+type backupMarker = backup.LeaderMarker

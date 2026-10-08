@@ -45,8 +45,8 @@ type projectRecord struct {
 	Paused  bool   `json:"paused,omitempty"`
 }
 
-// FailoverServer moves the leadership to this node (or to --to, which must name this node: a
-// move runs on the node that takes over).
+// FailoverServer moves the leadership to this node. A switchover can be asked of the leader with
+// --to: the leader then has the node that takes over run the move (delegate.go).
 func (o *Orchestrator) FailoverServer(ctx context.Context, opts ServerOptions) (*registry.Move, error) {
 	release, err := o.acquire()
 	if err != nil {
@@ -65,7 +65,7 @@ func (o *Orchestrator) FailoverServer(ctx context.Context, opts ServerOptions) (
 		return nil, &RefusedError{Checks: refused, Force: opts.Force}
 	}
 	if run.to.ID != o.self().ID {
-		return nil, fmt.Errorf("failover: a server move runs on the node that takes over: run it on %s", run.to.Name)
+		return o.delegateServer(ctx, opts, run)
 	}
 
 	var j *journal

@@ -60,7 +60,7 @@ type Instances interface {
 // endpoints of peer.go.
 type Primaries interface {
 	// Stop stops the project's units on node, PostgREST and GoTrue first and Postgres last with
-	// a fast shutdown, and returns when the cluster has stopped. The LSN is the cluster's
+	// a fast shutdown, and its backup timer, and returns when the cluster has stopped. The LSN is the cluster's
 	// shutdown checkpoint ("0/3000060"), which is the last WAL the old primary wrote. Stopping a
 	// project that is not running returns the checkpoint of its control file. The daemon, and
 	// with it the WAL relay the cluster archives through, stays up: a cluster that cannot
@@ -148,6 +148,11 @@ type Takeover interface {
 type ReplicaSetup interface {
 	SetupOn(ctx context.Context, ref, nodeID string) error
 }
+
+// ExtraChecks adds checks to the preflight of a server move: what only the owner of a part knows
+// (the certificates are mirrored, the shared-service artifacts are present on the node that takes
+// over). Blocking checks refuse the move like the others do.
+type ExtraChecks func(ctx context.Context, to registry.Node) []Check
 
 // Locker serializes a move with the lifecycle operations on the same project (pause, resume,
 // delete, upgrade): the engine's lock for the project.
