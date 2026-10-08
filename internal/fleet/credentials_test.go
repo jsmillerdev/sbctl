@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +20,7 @@ import (
 	"github.com/supavise/supavise/internal/awsapi"
 	"github.com/supavise/supavise/internal/awsapi/awsfake"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/units"
 )
 
 const (
@@ -399,4 +403,176 @@ func flattenEnv(m map[string]string) []string {
 		out = append(out, k+"="+v)
 	}
 	return out
+}
+
+// slowSource answers after its gate opens and records whether its context ended first.
+type slowSource struct {
+	gate     chan struct{}
+	started  chan struct{}
+	mu       sync.Mutex
+	calls    int
+	ctxEnded []bool
+}
+
+func (s *slowSource) Retrieve(ctx context.Context) (awsapi.Credentials, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-s.gate
+	s.mu.Lock()
+	s.ctxEnded = append(s.ctxEnded, ctx.Err() != nil)
+	s.mu.Unlock()
+	return awsapi.Credentials{AccessKeyID: "ASIAEXAMPLE", SecretAccessKey: "secret", Expires: time.Now().Add(time.Hour)}, nil
+}
+
+// A client that gives up (an SDK's short fetch timeout) does not cancel the call to STS: the call
+// goes on with a context of its own, so that a first call slower than the client's patience still
+// ends, and fills whatever cache the source keeps.
+func TestStorageCredentialsCallSurvivesAClientThatLeaves(t *testing.T) {
+	src := &slowSource{gate: make(chan struct{}), started: make(chan struct{}, 1)}
+	ep := stubEndpoint(src)
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:4010/credentials", nil).WithContext(ctx)
+	req.RemoteAddr = "127.0.0.1:1"
+	req.Header.Set("Authorization", testToken)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { ep.ServeHTTP(rec, req); close(done) }()
+	<-src.started
+	cancel() // the client gives up while STS is still thinking
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request did not end with its client")
+	}
+	if rec.Code == 200 {
+		t.Fatalf("answered %d for a client that left", rec.Code)
+	}
+	close(src.gate)
+	waitUntil(t, "the call to end", func() bool { src.mu.Lock(); defer src.mu.Unlock(); return len(src.ctxEnded) == 1 })
+	if src.ctxEnded[0] {
+		t.Fatal("the call was cancelled with the client's request")
+	}
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Serving starts by assuming the role once, so the first request of Storage finds credentials, and
+// a node that cannot assume the role says so in the log at start, with the cause.
+func TestStorageCredentialsWarmUpAtStart(t *testing.T) {
+	src := &stubSource{creds: awsapi.Credentials{AccessKeyID: "ASIAEXAMPLE", SecretAccessKey: "secret", Expires: time.Now().Add(time.Hour)}}
+	ep := stubEndpoint(src)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ep.Serve(ctx, ln) }()
+	waitUntil(t, "the warm-up call", func() bool { src.mu.Lock(); defer src.mu.Unlock(); return src.calls == 1 })
+	cancel()
+	<-done
+
+	var logs strings.Builder
+	failing := &stubSource{err: fmt.Errorf("sts: %w", awsapi.ErrNoCredentials)}
+	ep = stubEndpoint(failing)
+	ep.log = slog.New(slog.NewTextHandler(&logs, nil))
+	ep.warm()
+	if !strings.Contains(logs.String(), "instance role") || !strings.Contains(logs.String(), testRoleARN) {
+		t.Fatalf("the warm-up failure was not explained: %q", logs.String())
+	}
+}
+
+// A token file that the daemon cannot open (made by a render that ran as root, root:root 0600) is
+// replaced: the directory is the daemon's, and its owner may replace what is in it. A mode 000 file of
+// our own stands in for it, which only root can open.
+func TestStorageCredentialTokenReplacesAFileItCannotOpen(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens every file")
+	}
+	n := newTestNode(t)
+	old := bootID
+	bootID = func() string { return "boot" }
+	t.Cleanup(func() { bootID = old })
+	path := credentialTokenPath(n.cfg)
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"boot":"boot","token":"from-another-user"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := StorageCredentialToken(n.cfg)
+	if err != nil || len(tok) != 64 || tok == "from-another-user" {
+		t.Fatalf("token %q, %v", tok, err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("token file after the replacement: %v, %v", fi, err)
+	}
+	if again, err := StorageCredentialToken(n.cfg); err != nil || again != tok {
+		t.Fatalf("the replacement is not kept: %q vs %q, %v", again, tok, err)
+	}
+}
+
+// Specs renders the unit of supavise-storage for a configuration that names a role and no key. That
+// is what `supavise storage migrate --role-arn` previews before it stops anything, so it must
+// neither refuse the role under systemd nor start anything, and it must leave the static-key
+// refusal as it was for a configuration with neither.
+func TestSpecsAcceptAStorageRoleWithoutAKey(t *testing.T) {
+	ctx := context.Background()
+	storageSpec := func(t *testing.T, specs []units.Spec) units.Spec {
+		t.Helper()
+		for _, s := range specs {
+			if s.Service == config.SvcStorage {
+				return s
+			}
+		}
+		t.Fatal("no unit spec for supavise-storage")
+		return units.Spec{}
+	}
+	r := newManagerRig(t, func(d *Deps) {
+		d.Cfg.Supervisor = config.SupervisorSystemd
+		d.Cfg.Fleet.StorageBackend, d.Cfg.Fleet.StorageS3Bucket, d.Cfg.Fleet.StorageS3RoleARN = "s3", "objects", testRoleARN
+	})
+	specs, err := r.m.Specs(ctx)
+	if err != nil {
+		t.Fatalf("Specs with a role and no key under systemd: %v", err)
+	}
+	env := storageSpec(t, specs).Env
+	if env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] == "" || env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] == "" {
+		t.Fatalf("env = %v", env)
+	}
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+		if _, ok := env[k]; ok {
+			t.Errorf("%s is in the unit of a role", k)
+		}
+	}
+	if got := r.sup.log(); got != "" {
+		t.Fatalf("Specs asked the supervisor to do something: %s", got)
+	}
+
+	// Neither a role nor a key: refused, and the message names the role.
+	r = newManagerRig(t, func(d *Deps) {
+		d.Cfg.Supervisor = config.SupervisorSystemd
+		d.Cfg.Fleet.StorageBackend, d.Cfg.Fleet.StorageS3Bucket = "s3", "objects"
+	})
+	if _, err := r.m.Specs(ctx); err == nil || !strings.Contains(err.Error(), "storage_s3_role_arn") {
+		t.Fatalf("Specs with neither = %v", err)
+	}
 }

@@ -5,8 +5,13 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/mesh"
 )
+
+// fleet.ReplicaPooler is the Pooler the controller is wired with. fleet cannot import this package
+// (it depends on fleet through lifecycle), so the check is here.
+var _ Pooler = fleet.ReplicaPooler{}
 
 // A node's refusal is final when it understood the request and said no; a busy node, a conflict
 // with another change and a lost session are tried again.
