@@ -8,7 +8,7 @@ import (
 
 // DefaultOvercommit is the memory overcommit ratio of the [compute] section. A project's size
 // is a cap (systemd MemoryMax), not a reservation, and an idle project uses a small fraction of
-// it: docs/research/09-footprint.md measured about 150 MB (PSS and page cache) for a project whose
+// it: docs/reference/footprint.md measured about 150 MB (PSS and page cache) for a project whose
 // Micro cap is 1 GB, on top of about 1.5 GB for the node. Counting 1 GiB for the operating system,
 // that fits about 37 idle projects in 8 GiB, 90 in 16 GiB and 200 in 32 GiB, which is what
 // docs/guide.md tells an operator to expect. A ratio of 6 puts the budget at 48, 96 and 192 caps of
@@ -16,7 +16,7 @@ import (
 const DefaultOvercommit = 6.0
 
 // Compute is the [compute] config section: how the node decides which project sizes it can
-// honor (docs/development/build-plan.md, internal/lifecycle/README.md "Compute sizes").
+// honor (internal/lifecycle/README.md "Compute sizes").
 type Compute struct {
 	// Overcommit is the ratio of the sum of the projects' memory caps to the node's memory that
 	// a create or a resize may reach. Zero means DefaultOvercommit. A cap is a limit, not memory

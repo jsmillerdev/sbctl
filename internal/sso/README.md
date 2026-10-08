@@ -1,6 +1,6 @@
 # internal/sso
 
-The building blocks of single sign-on (workstream L). The service that uses them, its routes and
+The building blocks of single sign-on. The service that uses them, its routes and
 the rules about who gets in are in `internal/api` (`sso_dashboard.go`, `sso_routes.go`, `sso_hook.go`;
 the README there, "Single sign-on"); the commands are `supavise sso` (`cmd/supavise/cmd_sso.go`).
 
@@ -23,5 +23,5 @@ and fails the request when the hook cannot answer. The admin API's `POST /admin/
 ## Tests
 
 `go test ./internal/sso` runs the unit tests (keys, signatures, metadata, the client against a stub). The behavior with a
-real GoTrue and a real SAML identity provider is `internal/api/sso_integration_test.go` (development machines, needs
-`pip install signxml` for the test identity provider) and `tests/linux/sso-smoke.sh` (CI, SimpleSAMLphp in a container).
+real GoTrue and a real SAML identity provider is `internal/api/sso_integration_test.go` (gated by `SUPAVISE_SSO_INTEGRATION`; needs
+`pip install signxml` for the test identity provider) and `tests/linux/sso-smoke.sh` (the `sso-smoke` job of `linux.yml`, SimpleSAMLphp in a container).

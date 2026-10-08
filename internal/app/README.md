@@ -13,7 +13,7 @@ is the daemon that `supavise.service` runs.
 - `NewBackupService` builds the service over the configured backend and the registry.
 - `PGMetaCryptoKey` is the passphrase shared by supavise-pgmeta (its `CRYPTO_KEY`) and the Management
   API: `[api] pgmeta_crypto_key`, else the sealed system secret `pgmeta_crypto_key`, created on
-  first use. Whoever renders the `supavise-pgmeta` unit (the fleet workstream) must pass exactly it.
+  first use. Whoever renders the `supavise-pgmeta` unit must pass exactly it.
 - `Serve(ctx, cfg, Options)` is the daemon: it opens the node (registry in the system cluster,
   master key, Engine), runs `Engine.Recover` (statuses a crash left behind), creates the pg-meta
   key, builds the Management API (`api.NewServer`, the Postgres store) and the edge proxy
@@ -55,7 +55,7 @@ is the daemon that `supavise.service` runs.
   serves the sockets nobody answers for a command-line process that waits for WAL
   (`supavise backups ...`, `projects delete`) while the daemon is down.
 
-## Not done
+## Limits
 
 - `Serve` does not supervise: a crashed project unit is systemd's to restart (`Restart=on-failure`)
   and shows as unhealthy through `Health`.
@@ -64,7 +64,7 @@ is the daemon that `supavise.service` runs.
 
 ```
 go test ./internal/app/                                          # wiring, pg-meta key
-SUPAVISE_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked go test -run Serve -v ./internal/app/
+SUPAVISE_TEST_UNPACKED=<unpacked artifacts dir> go test -run Serve -v ./internal/app/
 ```
 
 The gated test runs the daemon on real artifacts under the exec backend: system init, a project
@@ -73,7 +73,7 @@ through the proxy (project API, bad key, Management API, dashboard GoTrue) and t
 listener, and a graceful stop. It starts two PostgreSQL clusters, GoTrue and PostgREST.
 
 ```
-SUPAVISE_TEST_UNPACKED=$HOME/.cache/sbctl/unpacked SUPAVISE_SETTINGS_E2E=1 \
+SUPAVISE_TEST_UNPACKED=<unpacked artifacts dir> SUPAVISE_SETTINGS_E2E=1 \
   go test -run TestSettingsIntegration -v ./internal/app/       # about 25 s, under 1 GB
 ```
 

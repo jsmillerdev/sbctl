@@ -34,16 +34,13 @@ under `<state_dir>/artifacts/<service>/<tag>/` (`config.Paths.Artifact`).
   `Engine.CollectArtifacts`.
 - **CLI:** `supavise artifacts fetch [service...] [--studio]`, `supavise artifacts list`, `supavise artifacts gc`.
 
-## Test
+## Tests
 
-```
-go test ./internal/artifacts/
-SUPAVISE_TEST_ARCHIVE=/path/to/real.tar.zst go test -run RealArchive ./internal/artifacts/
-```
+`go test ./internal/artifacts/` uses small synthetic archives and an `httptest` release server; it makes no
+real downloads, and runs in the `test` job of the `ci` workflow. `SUPAVISE_TEST_ARCHIVE=/path/to/real.tar.zst
+go test -run RealArchive ./internal/artifacts/` unpacks a real archive.
 
-Tests use small synthetic archives and an `httptest` release server; no real downloads.
-
-## Not done
+## Limits
 
 - No mirror fall-through (GHCR, S3); one `base_url`.
 - The archive cache (`.cache`) is never collected.

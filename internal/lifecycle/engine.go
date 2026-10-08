@@ -25,7 +25,7 @@ import (
 type Options struct {
 	Log *slog.Logger
 	// Fleet registers projects with the shared services after their units are healthy.
-	// Empty (the default until the fleet workstream lands) skips tenant calls.
+	// Empty skips tenant calls.
 	Fleet fleet.Fleet
 	// Backup takes the final base backup before a project is deleted; nil skips it.
 	Backup BaseBackuper

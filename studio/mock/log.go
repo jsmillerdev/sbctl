@@ -67,8 +67,8 @@ func (l *requestLog) close() {
 }
 
 // summarizeCmd prints one markdown row per (method, template) found in a request log. The
-// columns match section 9 of docs/research/08-studio-platform-calls.md; the last three are left for
-// a person to fill in from the screenshots.
+// rows are for the call tables of docs/reference/studio-platform-calls.md; the last three columns are
+// left for a person to fill in from the screenshots.
 func summarizeCmd(args []string) int {
 	if len(args) != 1 {
 		usage()

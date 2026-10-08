@@ -26,22 +26,15 @@ Both backends read the same `Spec`, so the exec backend exercises the real launc
 environment files and quoting. `FormatEnv` writes `KEY="value"` lines with `\` and `"`
 escaped (valid for systemd `EnvironmentFile=` and for `ParseEnv`).
 
-## Test
+## Tests
 
-```
-go test ./internal/units/
-```
+`go test ./internal/units/` covers env round trips, launcher script rendering, the templates against the file
+layout, installing templates, and the exec backend with fake launchers (stop signals, crash detection, kill
+fallback, a second process stopping the first one's units). It runs in the `test` job of the `ci` workflow.
+The systemd backend is Linux-only and is exercised by `tests/linux/systemd-smoke.sh` in the linux
+`systemd-smoke` job.
 
-Covers env round trips, launcher script rendering, the templates against the file layout,
-installing templates, and the exec backend with fake launchers (stop signals, crash
-detection, kill fallback, a second process stopping the first one's units).
-The systemd backend is Linux-only and is exercised by `tests/linux/systemd-smoke.sh` on a
-CI VM, not here.
+## Limits
 
-## Not done
-
-- The systemd backend compiles for linux/amd64 and linux/arm64 but has not been run
-  (no Linux in development).
-- No `MemoryHigh` or `TasksMax`; only `MemoryMax` and `CPUQuota`, as the project record
-  specifies.
+- No `MemoryHigh` or `TasksMax`; only `MemoryMax` and `CPUQuota`.
 - Journald is the only log sink on Linux; `Exec.Tail` is the only log reader.

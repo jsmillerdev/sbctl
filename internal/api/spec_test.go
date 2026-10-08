@@ -11,7 +11,7 @@ func TestOperationsLoad(t *testing.T) {
 	for _, o := range ops {
 		counts[o.Spec]++
 	}
-	// Spec sizes at pin time: v1 169 ops, v2 50, platform 394 (docs/research/05 section 2.2).
+	// Spec sizes at pin time: v1 169 ops, v2 50, platform 394.
 	if counts["v1"] < 160 || counts["v2"] < 45 || counts["platform"] < 380 {
 		t.Fatalf("operation counts look wrong: %v", counts)
 	}

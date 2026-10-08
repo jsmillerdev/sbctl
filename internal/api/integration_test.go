@@ -7,7 +7,7 @@ package api
 //	SUPAVISE_API_INTEGRATION=1 \
 //	SUPAVISE_PG_BIN=$HOME/.cache/sbctl/unpacked/postgres-17.11.0.004-r1-darwin-arm64/bin \
 //	SUPAVISE_PGMETA_BIN=$HOME/.cache/sbctl/unpacked/pgmeta-v0.100.0-r0-darwin-arm64/bin/pgmeta \
-//	scripts/guard.sh -- go test ./internal/api -run Integration -v
+//	go test ./internal/api -run Integration -v
 //
 // Everything listens on 127.0.0.1 in 32100-32999 and is stopped by test cleanup.
 

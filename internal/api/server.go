@@ -29,7 +29,7 @@ type Deps struct {
 	Registry registry.Registry
 	Secrets  secrets.Secrets
 	// Manager creates, pauses and deletes projects and hands out connection strings
-	// and credentials. Implemented by the lifecycle workstream; fakes in tests.
+	// and credentials. Implemented by internal/lifecycle; fakes in tests.
 	Manager lifecycle.Manager
 	Config  *config.Config
 	Logger  *slog.Logger
@@ -323,7 +323,7 @@ func NewServer(d Deps) (*Server, error) {
 	return s, nil
 }
 
-// Members returns the roles service the server enforces permissions with. The SSO workstream
+// Members returns the roles service the server enforces permissions with. The SSO code
 // calls GrantSSODefault on it when a user signs in through SSO for the first time.
 func (s *Server) Members() *members.Service { return s.members }
 
@@ -414,7 +414,7 @@ func (s *Server) build() (http.Handler, error) {
 
 // unknown answers requests for routes that neither the specs nor we define. Studio
 // calls a handful of platform paths that no spec lists; an empty answer keeps its
-// pages alive (docs/research/05 section 4.4). Everything else is a 404.
+// pages alive. Everything else is a 404.
 func (s *Server) unknown(w http.ResponseWriter, r *http.Request) error {
 	s.log.Debug("unknown route", "method", r.Method, "path", r.URL.Path)
 	if !strings.HasPrefix(r.URL.Path, "/platform/") {

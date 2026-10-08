@@ -32,7 +32,7 @@ const DefaultInvitationTTL = 7 * 24 * time.Hour
 const InvitationPrefix = "sbo_"
 
 // Service applies the membership rules over a Store. The API server, the supavise CLI and the
-// SSO workstream share it.
+// SSO code share it.
 type Service struct {
 	Store Store
 	Now   func() time.Time
@@ -917,7 +917,7 @@ func DomainOf(email string) string {
 	return strings.ToLower(d)
 }
 
-// GrantSSODefault is what the SSO workstream calls when a user signs in through SSO for the
+// GrantSSODefault is what the SSO code calls when a user signs in through SSO for the
 // first time: the domain of email may have a default organization and role
 // (SetDomainDefault); the user becomes a member with it. It returns nil, nil when the domain
 // has no default or the user already belongs to that organization (an existing membership is

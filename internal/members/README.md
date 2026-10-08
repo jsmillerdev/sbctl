@@ -4,7 +4,7 @@ Who belongs to which organization with which role, project-scoped roles, invitat
 permissions those roles grant, in the shape Studio and the Management API use (hosted's
 `PermissionAction` model). The API server (`internal/api`, `authz.go` and `members_api.go`) enforces
 them on every `/platform` and `/v1` route and serves them to Studio; `supavise users` (`cmd/supavise`) and
-the SSO workstream use the same `Service`. The route table, the capability table and the HTTP
+the dashboard single sign-on (`internal/api`, `sso_dashboard.go`) use the same `Service`. The route table, the capability table and the HTTP
 behavior are documented in `internal/api/README.md` (Members, roles and permissions).
 
 | File | What |
@@ -20,7 +20,7 @@ svc := &members.Service{Store: members.NewPG(pool), Orgs: listOrgs, AccountCreat
 access, _ := svc.Access(ctx, userID)
 access.Can(members.OrgRef{ID: 1, Slug: "acme"}, projectRef, members.ActSQLAdminWrite, "migrations", nil)
 
-// the SSO workstream, on a user's first sign-in:
+// single sign-on, on a user's first sign-in:
 grant, _ := svc.GrantSSODefault(ctx, userID, email) // nil when the domain has no rule or the user is a member already
 ```
 

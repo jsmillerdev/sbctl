@@ -9,7 +9,7 @@ import (
 // SystemRef is the reserved ref of the system project (registry, fleet metadata, dashboard auth).
 const SystemRef = "system"
 
-// Default ports (docs/development/build-plan.md section 1). Everything except Supavisor and the public
+// Default ports (docs/development.md, "Conventions"). Everything except Supavisor and the public
 // proxy listens on loopback only. All of them can be changed in [ports] so that dev
 // machines and tests can run several nodes side by side.
 const (
@@ -208,7 +208,7 @@ func (c *Config) BaseDomain() string {
 	return ""
 }
 
-// Hostnames (docs/development/build-plan.md section 1).
+// Hostnames (docs/development.md, "Conventions").
 func (c *Config) ProjectHost(ref string) string { return ref + ".api." + c.BaseDomain() }
 
 // VanityHost is the host of a vanity subdomain: <name>.api.<base domain>, under the wildcard

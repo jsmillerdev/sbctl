@@ -1,6 +1,6 @@
 # studio/mock
 
-A stand-in for the Management API, for the Studio spike. Not workstream B's server and sharing no code with it.
+A stand-in Management API for `studio/spike.sh`. It is not the API server (`internal/api`) and shares no code with it.
 
 ```bash
 go run ./studio/mock serve -config mock.json        # serve

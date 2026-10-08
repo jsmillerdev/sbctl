@@ -198,7 +198,7 @@ func (a *authenticator) authJWT(ctx context.Context, token string) (*Principal, 
 	// Dashboard sessions are GoTrue access tokens of signed-in users: signed with the
 	// system project's secret and issued for the audience "authenticated". The role
 	// claim is not checked: users created through GoTrue's admin API have an empty
-	// auth.users.role, so their tokens carry role "" (docs/research/08 section 9). The
+	// auth.users.role, so their tokens carry role "" (docs/reference/studio-platform-calls.md, "Findings from running Studio"). The
 	// supavise-minted system keys (role anon or service_role) have no audience and fail
 	// here, API keys of projects are signed with other secrets, and anonymous sign-ins
 	// are not users.
