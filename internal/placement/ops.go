@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -76,7 +77,11 @@ func (o *Ops) Remove(ctx context.Context, node, identifier string) error {
 	if o.local(node) {
 		return o.Agent.Remove(ctx, identifier)
 	}
-	return wrapRemote(node, o.RPC.Call(ctx, node, http.MethodDelete, peerapi.InstancePath(identifier), nil, nil))
+	path := peerapi.InstancePath(identifier)
+	if epoch := o.epoch(0); epoch > 0 {
+		path += "?" + queryEpoch + "=" + strconv.FormatInt(epoch, 10)
+	}
+	return wrapRemote(node, o.RPC.Call(ctx, node, http.MethodDelete, path, nil, nil))
 }
 
 // Do implements InstanceOps.
@@ -187,11 +192,19 @@ type ReportCache struct {
 
 // Refresh observes the node now and keeps the result.
 func (c *ReportCache) Refresh(ctx context.Context) {
-	in := c.Agent.ObserveAll(ctx)
+	// The replicas and the projects are probed side by side: one does not wait for the other.
+	var in []peerapi.InstanceStatus
 	var pr []peerapi.ProjectHealth
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		in = c.Agent.ObserveAll(ctx)
+	}()
 	if c.Projects != nil {
 		pr = c.Projects(ctx)
 	}
+	wg.Wait()
 	c.mu.Lock()
 	c.instances, c.projects = in, pr
 	c.mu.Unlock()

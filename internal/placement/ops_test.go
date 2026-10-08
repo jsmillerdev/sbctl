@@ -29,7 +29,10 @@ type opsEnv struct {
 	own         *fakeBackups // the leader's
 }
 
-func newOpsEnv(t *testing.T) *opsEnv {
+func newOpsEnv(t *testing.T) *opsEnv { return newOpsEnvAtEpoch(t, 5) }
+
+// newOpsEnvAtEpoch is newOpsEnv with n2 at the cluster epoch given and the leader's requests under 5.
+func newOpsEnvAtEpoch(t *testing.T, nodeEpoch int64) *opsEnv {
 	t.Helper()
 	reg := registry.NewMemory()
 	mustCreate(t, reg, "second")
@@ -47,7 +50,7 @@ func newOpsEnv(t *testing.T) *opsEnv {
 	if err := nodeReg.SetProjectNode(context.Background(), testRef, "n2", 1); err != nil {
 		t.Fatal(err)
 	}
-	Register(mux.Handle, HandlerDeps{Agent: e.nodeAgent, Plane: newFakeLocal(), Resolver: RegistryResolver{Reg: nodeReg}, Members: members("n2", "n1", 5), Backups: e.backups})
+	Register(mux.Handle, HandlerDeps{Agent: e.nodeAgent, Plane: newFakeLocal(), Resolver: RegistryResolver{Reg: nodeReg}, Members: members("n2", "n1", nodeEpoch), Backups: e.backups})
 	e.rpc = &muxRPC{mux: mux, caller: "n1"}
 	e.ops = &Ops{Self: func() string { return "n1" }, Agent: e.leaderAgent, Backups: e.own, RPC: e.rpc, Epoch: func() int64 { return 5 }}
 	return e
@@ -399,5 +402,41 @@ func TestReportCacheAnswersFromMemory(t *testing.T) {
 	c2.Refresh(ctx)
 	if _, pr := c2.Contribute(ctx); len(pr) != 0 {
 		t.Fatalf("projects = %v", pr)
+	}
+}
+
+// The removal of an instance deletes a directory, so it is made under the epoch of the leader that
+// asks: a leader that was replaced and has not learned it yet cannot remove what the new one keeps.
+func TestRemoveOfAnInstanceCarriesTheEpochAndIsRefusedWhenStale(t *testing.T) {
+	ctx := context.Background()
+	e := newOpsEnv(t)
+	id := testReplicaID()
+
+	if err := e.ops.Remove(ctx, "n2", id); err != nil {
+		t.Fatal(err)
+	}
+	if log := e.rpc.callLog(); !strings.Contains(log, "DELETE /peer/v1/instances/"+id+"?epoch=5") {
+		t.Fatalf("the removal carries no epoch:\n%s", log)
+	}
+
+	// n2 knows epoch 7: the removal of a leader on epoch 5 is refused and nothing is removed.
+	e2 := newOpsEnvAtEpoch(t, 7)
+	err := e2.ops.Remove(ctx, "n2", id)
+	if !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("a removal under epoch 5 at a node on epoch 7: %v", err)
+	}
+	if got := e2.nodeAgent.all(); got != "" {
+		t.Fatalf("the agent removed under a stale epoch: %s", got)
+	}
+
+	// A request without an epoch (a leader of an older release) is judged by the leader check alone;
+	// a malformed one is a bad request.
+	var re *mesh.RemoteError
+	if err := e.rpc.Call(ctx, "n2", http.MethodDelete, peerapi.InstancePath(id), nil, nil); err != nil {
+		t.Fatalf("no epoch: %v", err)
+	}
+	err = e.rpc.Call(ctx, "n2", http.MethodDelete, peerapi.InstancePath(id)+"?epoch=soon", nil, nil)
+	if !errors.As(err, &re) || re.Status != http.StatusBadRequest {
+		t.Fatalf("a malformed epoch: %v", err)
 	}
 }

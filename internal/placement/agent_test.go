@@ -963,3 +963,183 @@ func TestDoRefusesAReplicaActionOnTheHome(t *testing.T) {
 		t.Fatalf("calls %s, instance %v", e.plane.all(), e.a.get(id))
 	}
 }
+
+// writeClusterAt makes ref's data directory on e hold the files given (a PG_VERSION and more).
+func writeClusterAt(t *testing.T, e *agentEnv, files map[string]string) {
+	t.Helper()
+	dir := e.cfg.Paths().PostgresData(testRef)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A start or a restart that arrives after the promotion, before the registry names the new home, would
+// render the standby's spec for a cluster that is a writable primary now: the agent is the last line of
+// defense, as it is in StartLocal and Remove.
+func TestDoStartAndRestartLeaveAPromotedCluster(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t)
+	if _, err := e.a.Ensure(ctx, e.spec()); err != nil {
+		t.Fatal(err)
+	}
+	e.settle(t)
+	id := testReplicaID()
+	e.plane.mu.Lock()
+	e.plane.calls, e.plane.targets = nil, nil
+	e.plane.mu.Unlock()
+
+	// A promoted cluster: a PG_VERSION and no standby.signal.
+	writeClusterAt(t, e, map[string]string{"PG_VERSION": "17\n"})
+	for _, act := range []peerapi.Action{peerapi.ActionStart, peerapi.ActionRestart} {
+		if _, err := e.a.Do(ctx, id, act, peerapi.InstanceAction{Epoch: 5}); !errors.Is(err, lifecycle.ErrInvalidState) || !strings.Contains(err.Error(), "primary") {
+			t.Errorf("%s of a promoted cluster: %v", act, err)
+		}
+	}
+	// The standby of another replica of the project.
+	writeClusterAt(t, e, map[string]string{"standby.signal": "", "postgresql.auto.conf": "primary_conninfo = 'host=127.0.0.1 application_name=''" + registry.ReplicaIdentifier(testRef, "us-east-1", "zzz999") + "'''\n"})
+	if _, err := e.a.Do(ctx, id, peerapi.ActionRestart, peerapi.InstanceAction{Epoch: 5}); !errors.Is(err, lifecycle.ErrInvalidState) {
+		t.Errorf("restart of another replica's standby: %v", err)
+	}
+	if e.plane.all() != "" {
+		t.Fatalf("the plane was asked: %s", e.plane.all())
+	}
+	// This replica's own standby restarts.
+	writeClusterAt(t, e, map[string]string{"postgresql.auto.conf": "primary_conninfo = 'host=127.0.0.1 application_name=''" + id + "'''\n"})
+	if _, err := e.a.Do(ctx, id, peerapi.ActionRestart, peerapi.InstanceAction{Epoch: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.plane.all(); got != "stop "+testRef+",start "+testRef {
+		t.Fatalf("calls = %s", got)
+	}
+}
+
+// The resume of a setup that had not got far deletes the project's directory, so it does not run on a
+// node the registry has made the project's home since.
+func TestEnsureDoesNotResumeASetupOnTheHome(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t)
+	in := &instance{spec: e.spec(), step: StepInitiated}
+	e.a.persist(in) // a setup the daemon's restart cut short
+	if err := e.reg.SetProjectNode(ctx, testRef, "n2", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.a.Ensure(ctx, e.spec()); !errors.Is(err, lifecycle.ErrInvalidState) || !strings.Contains(err.Error(), "home") {
+		t.Fatalf("Ensure on the home = %v", err)
+	}
+	if e.plane.all() != "" {
+		t.Fatalf("the directory of the home was touched: %s", e.plane.all())
+	}
+	// Away from the home the same request resumes.
+	if err := e.reg.SetProjectNode(ctx, testRef, "n1", 1); err != nil {
+		t.Fatal(err)
+	}
+	e.a.forget(testReplicaID())
+	if _, err := e.a.Ensure(ctx, e.spec()); err != nil {
+		t.Fatal(err)
+	}
+	if st := e.settle(t); st.Step != StepCompleted {
+		t.Fatalf("resumed: %+v", st)
+	}
+}
+
+// A replica of the system cluster is the node's own registry: no request removes it.
+func TestRemoveRefusesTheStandbyOfTheSystemCluster(t *testing.T) {
+	e := newAgentEnv(t)
+	id := registry.ReplicaIdentifier("system", "us-east-1", "abc123")
+	if err := e.a.Remove(context.Background(), id); !errors.Is(err, lifecycle.ErrInvalidState) || !strings.Contains(err.Error(), "own registry") {
+		t.Fatalf("Remove of the system standby = %v", err)
+	}
+	if e.plane.all() != "" {
+		t.Fatalf("the plane was asked: %s", e.plane.all())
+	}
+}
+
+// concurrentPlane counts how many StartReplica or ObserveReplica calls are in flight at once.
+type concurrentPlane struct {
+	*fakeReplicaPlane
+	mu      sync.Mutex
+	now     int
+	max     int
+	release chan struct{}
+}
+
+func (c *concurrentPlane) enter() {
+	c.mu.Lock()
+	c.now++
+	c.max = max(c.max, c.now)
+	c.mu.Unlock()
+	<-c.release
+	c.mu.Lock()
+	c.now--
+	c.mu.Unlock()
+}
+
+func (c *concurrentPlane) StartReplica(ctx context.Context, t lifecycle.ReplicaTarget) error {
+	c.enter()
+	return c.fakeReplicaPlane.StartReplica(ctx, t)
+}
+
+func (c *concurrentPlane) ObserveReplica(ctx context.Context, t lifecycle.ReplicaTarget) lifecycle.ReplicaObservation {
+	c.enter()
+	return c.fakeReplicaPlane.ObserveReplica(ctx, t)
+}
+
+// With a replica of every project, a follower starts them and reports them a few at a time, not one
+// after another, and not all at once.
+func TestStartLocalAndObserveAllRunABoundedNumberAtOnce(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t)
+	cp := &concurrentPlane{fakeReplicaPlane: e.plane, release: make(chan struct{})}
+	e.a.o.Plane = cp
+	e.a.o.Concurrency = 3
+	var ids []string
+	for i := 0; i < 8; i++ {
+		ref := fmt.Sprintf("%020d", i)
+		ref = strings.Map(func(r rune) rune { return 'a' + (r - '0') }, ref)
+		if err := e.reg.CreateProject(ctx, &registry.Project{Ref: ref, Name: ref, Class: "micro", Engine: registry.EnginePostgres, NodeID: "n1"}); err != nil {
+			t.Fatal(err)
+		}
+		id := registry.ReplicaIdentifier(ref, "us-east-1", "abc123")
+		if err := e.reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: ref, NodeID: "n2"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.reg.SetReplicaStatus(ctx, id, string(registry.StatusActiveHealthy), StepCompleted, ""); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	hold := func(do func()) {
+		done := make(chan struct{})
+		go func() { do(); close(done) }()
+		// Let the workers fill up, then let them go one by one.
+		waitFor(t, func() bool { cp.mu.Lock(); defer cp.mu.Unlock(); return cp.now == 3 })
+		time.Sleep(20 * time.Millisecond)
+		for i := 0; i < 8; i++ {
+			cp.release <- struct{}{}
+		}
+		<-done
+	}
+	hold(func() { e.a.StartLocal(ctx) })
+	if cp.max != 3 {
+		t.Fatalf("StartLocal ran %d at once, want 3", cp.max)
+	}
+	cp.max = 0
+	var got []peerapi.InstanceStatus
+	hold(func() { got = e.a.ObserveAll(ctx) })
+	if cp.max != 3 {
+		t.Fatalf("ObserveAll ran %d at once, want 3", cp.max)
+	}
+	if len(got) != len(ids) {
+		t.Fatalf("ObserveAll returned %d of %d replicas", len(got), len(ids))
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1].Identifier >= got[i].Identifier {
+			t.Fatalf("the report is not in the order of the identifiers: %s before %s", got[i-1].Identifier, got[i].Identifier)
+		}
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/supavise/supavise/internal/backup"
@@ -66,6 +67,10 @@ func Register(handle func(pattern string, fn mesh.HandlerFunc), d HandlerDeps) e
 	handle("POST "+peerapi.PathBackup, h.backup)
 	return nil
 }
+
+// queryEpoch is the query parameter that carries the cluster epoch of a request that has no body
+// (DELETE of an instance).
+const queryEpoch = "epoch"
 
 type handlers struct{ d HandlerDeps }
 
@@ -167,6 +172,21 @@ func (h *handlers) remove(w http.ResponseWriter, r *http.Request) {
 	if err := h.authorize(r); err != nil {
 		writeErr(w, err)
 		return
+	}
+	// The removal deletes a directory: it is made under the epoch of the leader that asks, like every
+	// other request that changes the node, so that a leader that was replaced and does not know it yet
+	// cannot destroy what the new one keeps. (A request without an epoch is a leader of an older
+	// release, which only the leader check covers.)
+	if q := r.URL.Query().Get(queryEpoch); q != "" {
+		epoch, err := strconv.ParseInt(q, 10, 64)
+		if err != nil || epoch < 0 {
+			badRequest(w, "the epoch %q is not a cluster epoch", q)
+			return
+		}
+		if err := h.epochOK(epoch); err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
 	if err := h.d.Agent.Remove(r.Context(), r.PathValue("identifier")); err != nil {
 		writeErr(w, err)
