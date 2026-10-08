@@ -16,6 +16,7 @@ import (
 	"github.com/supavise/supavise/internal/api"
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/branching"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/diskquota"
 	"github.com/supavise/supavise/internal/fleet"
@@ -49,6 +50,16 @@ var registryWait = 2 * time.Minute
 // Project units are systemd's, not the daemon's: stopping Serve leaves them running.
 func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	log := o.log()
+	// The node's role in its cluster is decided before anything opens (design 2.10.8): a server that
+	// never joined one is the leader without a look at anything, a standby opens its registry
+	// read-only, and a node that was replaced as leader starts no primary at all.
+	boot, err := decideBoot(ctx, cfg, o, log)
+	if err != nil {
+		return err
+	}
+	if boot.Role == cluster.RoleFenced {
+		return serveFenced(ctx, cfg, o, log, boot)
+	}
 	// The WAL relay is the only holder of the backup credentials that clusters archive
 	// through (backup.Relay). It starts before the node opens, because the system cluster
 	// archives too and the daemon may wait for it to be reachable, and it stops after the
@@ -62,6 +73,14 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		}
 	}
 	lo := LifecycleOptions(cfg, o)
+	if boot.DSN != "" {
+		lo.RegistryDSN = boot.DSN // the socket that answered the role probe
+	}
+	if boot.Role == cluster.RoleFollower {
+		if err := openFollower(&lo, boot); err != nil {
+			return err
+		}
+	}
 	// Alerts: what the rest of the node raises through alerts.Notify, and the project upgrades'
 	// events, which the Engine hands to a hook because it cannot import the alerting package. Both
 	// come before the node opens, so the upgrades that Recover closes are told too.
@@ -181,6 +200,13 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	}
 	wire := newWire(cfg, log, node, o, &apiDeps, &popts)
 	defer wire.stop()
+	// What the hooks of the cluster work read: the role decided at boot, the node's health, and the
+	// backup service.
+	Provide(wire, boot)
+	Provide(wire, monitor)
+	if bs := backups(node); bs != nil {
+		Provide(wire, bs)
+	}
 	if err := wire.run(ctx); err != nil {
 		return err
 	}
@@ -201,9 +227,14 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		return err
 	}
 
-	adminLn, err := net.Listen("tcp", cfg.Listen.Admin)
-	if err != nil {
-		return fmt.Errorf("serve: admin listener %s: %w", cfg.Listen.Admin, err)
+	// A follower does not run the Management API: its admin port is a forwarder to the leader's
+	// (mesh.KindAdmin), bound by the mesh.
+	var adminLn net.Listener
+	if boot.Role != cluster.RoleFollower {
+		adminLn, err = net.Listen("tcp", cfg.Listen.Admin)
+		if err != nil {
+			return fmt.Errorf("serve: admin listener %s: %w", cfg.Listen.Admin, err)
+		}
 	}
 	admin := &http.Server{
 		Handler: apiH, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute,
@@ -212,13 +243,15 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 
 	g, gctx := errgroup.WithContext(ctx)
 	wire.start(g, gctx)
-	g.Go(func() error {
-		log.Info("management API listening", "admin", adminLn.Addr().String())
-		if err := admin.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("serve: admin listener: %w", err)
-		}
-		return nil
-	})
+	if adminLn != nil {
+		g.Go(func() error {
+			log.Info("management API listening", "admin", adminLn.Addr().String())
+			if err := admin.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("serve: admin listener: %w", err)
+			}
+			return nil
+		})
+	}
 	budget := o.StopBudget
 	if budget <= 0 {
 		budget = StopBudget
