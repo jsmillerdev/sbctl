@@ -7,7 +7,8 @@ them, and logs each call to $FAKE_AWS_LOG, so a changed query fails the test tha
 State (see purge_test.go): account, stack {name, id, status, exists, outputs, params, volume,
 final_snapshot, final_tags, records}, deleted_stacks [{name, id, volume}], buckets {name: {tags,
 versions [[key, id]], markers [[key, id]], sizes, uploads [[key, id]], keep [keys S3 refuses to
-delete]}}, snapshots [{id, vol, size, start, state, tags, fail}], stop_fails.
+delete]}}, snapshots [{id, vol, size, start, state, tags, fail}], other_stacks [{name, params}] (the
+other stacks of the region, listed without a stack name), stacks_unlistable, stop_fails.
 """
 import fnmatch
 import json
@@ -72,6 +73,11 @@ for _b in st["buckets"].values():
     _b["markers"] = _b.get("markers") or []
 
 
+# What deploy.sh sends to read one page of a bucket as a delete-objects body, and what the real
+# JMESPath of the CLI makes of it: the page's versions and delete markers together, [] when none.
+BATCH_QUERY = "{Objects: [Versions, DeleteMarkers][].{Key: Key, VersionId: VersionId}, Quiet: `true`}"
+
+
 def out_json(v):
     print(json.dumps(v, indent=4))
 
@@ -97,6 +103,17 @@ def stack_here():
 
 if svc == "sts" and cmd == "get-caller-identity":
     print(st["account"])
+elif svc == "cloudformation" and cmd == "describe-stacks" and "--stack-name" not in opts:
+    # the other stacks of the region that use a bucket (replica servers use their leader's)
+    if not q.startswith("Stacks[?StackName!='") or "ParameterValue=='" not in q:
+        fail("fake aws: describe-stacks without a stack name and with an unknown query: " + q, 3)
+    if st.get("stacks_unlistable"):
+        fail("An error occurred (AccessDenied) when calling the DescribeStacks operation: not allowed")
+    me = q.split("'")[1]
+    want = q.split("ParameterValue=='")[1].split("'")[0]
+    names = [o["name"] for o in st.get("other_stacks", []) if o["name"] != me
+             and any(k in ("BackupBucketName", "ObjectsBucketName") and v == want for k, v in o.get("params", {}).items())]
+    print("\t".join(names))
 elif svc == "cloudformation" and cmd == "describe-stacks":
     if not (stack_here() and stack["exists"]):
         fail("An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id %s does not exist" % opts.get("--stack-name"))
@@ -164,10 +181,12 @@ elif svc == "s3api" and cmd == "list-object-versions":
     elif q.startswith("{Objects:"):
         if "--no-paginate" not in opts:
             fail("fake aws: a batch is listed with --no-paginate", 3)
-        page = ([("v", e) for e in b["versions"]] + [("m", e) for e in b["markers"]])[:1000]
-        kind = "v" if "Objects: Versions[]" in q else "m"
-        picked = [{"Key": e[0], "VersionId": e[1]} for t, e in page if t == kind]
-        out_json({"Objects": picked or None, "Quiet": True})
+        if q != BATCH_QUERY:
+            fail("fake aws: list-object-versions with an unknown batch query: " + q, 3)
+        # S3 lists versions and delete markers in one sequence, in key order, 1000 entries a page.
+        page = sorted([(e[0], 0, e) for e in b["versions"]] + [(e[0], 1, e) for e in b["markers"]])[:1000]
+        picked = [{"Key": e[0], "VersionId": e[1]} for _, _, e in page]
+        out_json({"Objects": picked, "Quiet": True})
     else:
         fail("fake aws: list-object-versions with an unknown query: " + q, 3)
 elif svc == "s3api" and cmd == "delete-objects":

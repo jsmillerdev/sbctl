@@ -433,6 +433,7 @@ re_az='^[a-z]{2}(-[a-z]+)+-[0-9][a-z]$'
 re_vpc='^vpc-[0-9a-f]{8,17}$'
 re_subnet='^subnet-[0-9a-f]{8,17}$'
 re_bucket='^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+re_allf='^vol-f+$'
 
 [[ -n $REGION || $MODE == update || $MODE == status ]] || die "--region is required (or set AWS_REGION)"
 [[ -z $REGION ]] || [[ $REGION =~ $re_region ]] || die "--region $REGION is not a region name such as us-east-1"
@@ -1175,21 +1176,31 @@ The join token secret stays until you delete it:
 # them, and destroys them after one confirmation. It needs the AWS CLI and nothing else: the
 # batches of an object delete are written by the CLI's own --query.
 STACK_ID=""
-PB_NAME=() PB_WHAT=() PB_VERS=() PB_MARKS=() PB_BYTES=()  # the buckets: name, role, versions, delete markers, bytes
+PB_NAME=() PB_WHAT=() PB_VERS=() PB_MARKS=() PB_BYTES=() PB_USERS=()  # the buckets: name, role, versions, delete markers, bytes, other stacks that use it
 PS_ID=() PS_VOL=() PS_SIZE=() PS_WHEN=() PS_STATE=()      # the snapshots
 re_vol='^vol-[0-9a-f]{8,17}$'
 re_snapid='^snap-[0-9a-f]{8,17}$'
+re_bucket='^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+re_allf='^vol-f+$'
+
+# A volume ID that names a data volume. EC2 reports vol-ffffffff as the volume of every snapshot that
+# is a copy (of a snapshot or of an image) and of the ones an image holds: one value for unrelated
+# snapshots of the whole account, so it identifies nothing and a filter on it would find them all.
+real_vol() { # ID
+  [[ $1 =~ $re_vol && ! $1 =~ $re_allf ]]
+}
 
 # The queries below are JMESPath, which the AWS CLI evaluates; its literals are written in backticks,
 # which are not command substitutions here.
 # shellcheck disable=SC2016
 Q_COUNT='[length(Versions || `[]`), length(DeleteMarkers || `[]`), sum(Versions[].Size || `[0]`)]'
-# batch_query KIND: the delete-objects body of the versions (Versions) or delete markers
-# (DeleteMarkers) of one page of a bucket; the CLI leaves "Objects": null when there are none.
-batch_query() {
-  # shellcheck disable=SC2016
-  printf '{Objects: %s[].{Key: Key, VersionId: VersionId}, Quiet: `true`}' "$1"
-}
+# The delete-objects body of one page of a bucket (at most 1000 entries): its object versions and its
+# delete markers together, in the order S3 lists them. The two kinds are mixed in key order, so a run
+# of one kind can fill the whole page; taking both from every page is what keeps a bucket whose first
+# 1000 entries are all delete markers (the ones left when old versions expire) from stopping the loop
+# with versions behind them. The CLI leaves "Objects": [] when the page has nothing.
+# shellcheck disable=SC2016
+Q_BATCH='{Objects: [Versions, DeleteMarkers][].{Key: Key, VersionId: VersionId}, Quiet: `true`}'
 
 human_bytes() { # BYTES
   awk -v b="$1" 'BEGIN { split("B KiB MiB GiB TiB PiB", u, " "); i = 1; while (b >= 1024 && i < 6) { b /= 1024; i++ } if (i == 1) printf "%d B", b; else printf "%.1f %s", b, u[i] }'
@@ -1223,6 +1234,21 @@ add_bucket() { # NAME ROLE
   PB_VERS+=("$v")
   PB_MARKS+=("$m")
   PB_BYTES+=("$b")
+  PB_USERS+=("$(bucket_users "$1")")
+}
+
+# The other stacks of this region that name the bucket as their BackupBucketName or ObjectsBucketName:
+# the stacks of replica servers, which keep their backups and Storage files in their leader's buckets.
+# Stacks of other regions are not looked at. Prints their names, nothing when there are none, or ?
+# when the stacks cannot be listed (the list says so then).
+bucket_users() { # BUCKET
+  local names
+  [[ $1 =~ $re_bucket ]] || return 0
+  names=$("${AWS[@]}" cloudformation describe-stacks \
+    --query "Stacks[?StackName!='$STACK' && Parameters[?(ParameterKey=='BackupBucketName' || ParameterKey=='ObjectsBucketName') && ParameterValue=='$1']].StackName" \
+    --output text 2>/dev/null) || { printf '?'; return 0; }
+  # (the CLI prints the names of each page of a long list on a line of their own)
+  printf '%s' "$names" | tr -s '\t\n' '  ' | sed 's/^ //; s/ $//; s/^None$//'
 }
 
 describe_snapshots() { # FILTER: one "id<TAB>volume<TAB>GiB<TAB>started<TAB>state" line per snapshot
@@ -1238,13 +1264,13 @@ collect_snapshots() { # TAGVALUE [VOLUME...]
   local tagval=$1 vols="" v lines more id vol size when state
   shift
   for v in "$@"; do
-    if [[ $v =~ $re_vol ]]; then vols="$vols $v"; fi
+    if real_vol "$v"; then vols="$vols $v"; fi
   done
   lines=$(describe_snapshots "Name=tag:supavise:stack,Values=$tagval") \
     || fail "cannot list the snapshots (the credentials need ec2:DescribeSnapshots)"
   while IFS=$'\t' read -r id vol _; do
     [[ -n $id ]] || continue
-    if [[ $vol =~ $re_vol ]]; then
+    if real_vol "$vol"; then
       case "$vols " in *" $vol "*) ;; *) vols="$vols $vol" ;; esac
     fi
   done <<<"$lines"
@@ -1271,7 +1297,13 @@ print_purge_list() { # what purge will destroy
     say "S3 buckets (every object version and delete marker, then the bucket itself):"
     for ((i = 0; i < ${#PB_NAME[@]}; i++)); do
       say "  ${PB_NAME[$i]}   ${PB_WHAT[$i]}: ${PB_VERS[$i]} object version(s), ${PB_MARKS[$i]} delete marker(s), $(human_bytes "${PB_BYTES[$i]}")"
+      case "${PB_USERS[$i]}" in
+        '') ;;
+        '?') say "    (the other stacks of $REGION could not be listed, so it is not known whether a replica server still uses it)" ;;
+        *) say "    WARNING: stack(s) ${PB_USERS[$i]} in $REGION use it as their BackupBucketName or ObjectsBucketName; their servers lose their backups or Storage files" ;;
+      esac
     done
+    say "  (A replica server keeps its backups and Storage files in its leader's buckets. Stacks of $REGION that name one are shown above; servers in other regions are not looked at.)"
   fi
   if [[ ${#PS_ID[@]} -gt 0 ]]; then
     say "EBS snapshots (the data volume: the master key, the registry and every project):"
@@ -1282,11 +1314,12 @@ print_purge_list() { # what purge will destroy
 }
 
 # Aborts the uploads that were never completed, then deletes every version and delete marker in
-# batches of up to 1000 (what one request takes), then the bucket. The batch is written by the CLI:
+# batches of up to 1000 (what one request takes; each batch is one page of the listing, of whichever
+# kind it holds), then the bucket. The batch is written by the CLI:
 # a key can hold any character, which a shell could not pass on safely. Returns 1 at the first
 # thing S3 refuses (Object Lock, a missing permission), with the reason on stderr.
 empty_bucket() { # BUCKET
-  local b=$1 kind key uid n=0 out
+  local b=$1 key uid n=0 out
   mkwork
   while [[ $n -lt 100000 ]]; do
     n=$((n + 1))
@@ -1298,23 +1331,21 @@ empty_bucket() { # BUCKET
     "${AWS[@]}" s3api abort-multipart-upload --bucket "$b" --key="$key" --upload-id "$uid" --expected-bucket-owner "$ACCOUNT" >/dev/null 2>"$WORK/err" \
       || { cat "$WORK/err" >&2; return 1; }
   done
-  for kind in Versions DeleteMarkers; do
-    rm -f "$WORK/previous.json"
-    while :; do
-      "${AWS[@]}" s3api list-object-versions --bucket "$b" --expected-bucket-owner "$ACCOUNT" --no-paginate --output json \
-        --query "$(batch_query "$kind")" >"$WORK/batch.json" 2>"$WORK/err" \
-        || { cat "$WORK/err" >&2; return 1; }
-      # An empty list prints "Objects": null; one with an entry always has a "VersionId".
-      grep -q '"VersionId"' "$WORK/batch.json" || break
-      if [[ -f $WORK/previous.json ]] && cmp -s "$WORK/batch.json" "$WORK/previous.json"; then
-        echo "the same $kind came back after they were deleted: S3 is not deleting them" >&2
-        return 1
-      fi
-      "${AWS[@]}" s3api delete-objects --bucket "$b" --expected-bucket-owner "$ACCOUNT" --delete "file://$WORK/batch.json" >"$WORK/deleted.json" 2>"$WORK/err" \
-        || { cat "$WORK/err" >&2; return 1; }
-      if grep -q '"Errors"' "$WORK/deleted.json"; then cat "$WORK/deleted.json" >&2; return 1; fi
-      cp "$WORK/batch.json" "$WORK/previous.json"
-    done
+  rm -f "$WORK/previous.json"
+  while :; do
+    "${AWS[@]}" s3api list-object-versions --bucket "$b" --expected-bucket-owner "$ACCOUNT" --no-paginate --output json \
+      --query "$Q_BATCH" >"$WORK/batch.json" 2>"$WORK/err" \
+      || { cat "$WORK/err" >&2; return 1; }
+    # An empty page prints "Objects": []; one with an entry always has a "VersionId".
+    grep -q '"VersionId"' "$WORK/batch.json" || break
+    if [[ -f $WORK/previous.json ]] && cmp -s "$WORK/batch.json" "$WORK/previous.json"; then
+      echo "the same object versions came back after they were deleted: S3 is not deleting them" >&2
+      return 1
+    fi
+    "${AWS[@]}" s3api delete-objects --bucket "$b" --expected-bucket-owner "$ACCOUNT" --delete "file://$WORK/batch.json" >"$WORK/deleted.json" 2>"$WORK/err" \
+      || { cat "$WORK/err" >&2; return 1; }
+    if grep -q '"Errors"' "$WORK/deleted.json"; then cat "$WORK/deleted.json" >&2; return 1; fi
+    cp "$WORK/batch.json" "$WORK/previous.json"
   done
   out=$("${AWS[@]}" s3api delete-bucket --bucket "$b" --expected-bucket-owner "$ACCOUNT" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
 }
@@ -1357,7 +1388,10 @@ purge_inventory_before_delete() {
     [[ -n ${b%%:*} ]] || continue
     origin=$(bucket_origin "${b%%:*}")
     IFS=$'\t' read -r tn ti _ <<<"$origin"
-    if [[ -n $tn$ti && ( $tn != "$STACK" || $ti != "$STACK_ID" ) ]]; then
+    if [[ -z $tn$ti ]]; then
+      die "the bucket ${b%%:*} shows no CloudFormation tags (it has none, or the credentials cannot read them: s3:GetBucketTagging), so it is not provably this stack's and is not purged"
+    fi
+    if [[ $tn != "$STACK" || $ti != "$STACK_ID" ]]; then
       die "the bucket ${b%%:*} carries the CloudFormation tags of another stack ($tn, $ti), so it is not purged"
     fi
     add_bucket "${b%%:*}" "${b#*:}"
@@ -1384,11 +1418,13 @@ mode_purge() {
     show "${AWS[@]}" s3api list-buckets --query "Buckets[?starts_with(Name, '$(printf '%s' "$STACK" | tr '[:upper:]' '[:lower:]' | cut -c1-16)')].Name" --output text
     show "${AWS[@]}" s3api get-bucket-tagging --bucket "<bucket>" --expected-bucket-owner "<account>" --query 'TagSet[].[Key,Value]' --output text
     show "${AWS[@]}" s3api list-object-versions --bucket "<bucket>" --expected-bucket-owner "<account>" --query "$Q_COUNT" --output text
+    note "and the other stacks of the region that use the bucket as their BackupBucketName or ObjectsBucketName (replica servers), which the list warns about:"
+    show "${AWS[@]}" cloudformation describe-stacks --query "Stacks[?StackName!='$STACK' && Parameters[?(ParameterKey=='BackupBucketName' || ParameterKey=='ObjectsBucketName') && ParameterValue=='<bucket>']].StackName" --output text
     note "the snapshots tagged with the stack's id, and every other snapshot of the volumes those came from:"
     show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=tag:supavise:stack,Values=arn:*:cloudformation:$REGION:<account>:stack/$STACK/*" --query 'Snapshots[].[SnapshotId,VolumeId,VolumeSize,StartTime,State]' --output text
     show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=volume-id,Values=<volume>" --query 'Snapshots[].[SnapshotId,VolumeId,VolumeSize,StartTime,State]' --output text
-    note "then, once you type the stack name (or with --yes), for each bucket, until a list comes back empty (versions, then delete markers):"
-    show "${AWS[@]}" s3api list-object-versions --bucket "<bucket>" --expected-bucket-owner "<account>" --no-paginate --output json --query "$(batch_query Versions)"
+    note "then, once you type the stack name (or with --yes), for each bucket, until a page comes back empty (versions and delete markers together):"
+    show "${AWS[@]}" s3api list-object-versions --bucket "<bucket>" --expected-bucket-owner "<account>" --no-paginate --output json --query "$Q_BATCH"
     show "${AWS[@]}" s3api delete-objects --bucket "<bucket>" --expected-bucket-owner "<account>" --delete "file://<batch of up to 1000>"
     show "${AWS[@]}" s3api delete-bucket --bucket "<bucket>" --expected-bucket-owner "<account>"
     show "${AWS[@]}" ec2 delete-snapshot --snapshot-id "<snapshot>"
@@ -1409,7 +1445,7 @@ mode_purge() {
   for id in $ids; do
     [[ $id == arn:* ]] || continue
     v=$("${AWS[@]}" cloudformation describe-stack-resource --stack-name "$id" --logical-resource-id DataVolume --query StackResourceDetail.PhysicalResourceId --output text 2>/dev/null) || v=""
-    if [[ $v =~ $re_vol ]]; then vols="$vols $v"; fi
+    if real_vol "$v"; then vols="$vols $v"; fi
   done
 
   # Buckets: the name only narrows the search; what proves a bucket is the tags CloudFormation put
@@ -1519,11 +1555,13 @@ WARN
       note "the backup and objects buckets of the stack (the stack of a replica server has none of its own) must carry the stack's id, and are counted:"
       show "${AWS[@]}" s3api get-bucket-tagging --bucket "<BackupBucket>" --expected-bucket-owner "<account>" --query 'TagSet[].[Key,Value]' --output text
       show "${AWS[@]}" s3api list-object-versions --bucket "<BackupBucket>" --expected-bucket-owner "<account>" --query "$Q_COUNT" --output text
+      note "and the other stacks of the region that use a bucket as their BackupBucketName or ObjectsBucketName (replica servers), which the list warns about:"
+      show "${AWS[@]}" cloudformation describe-stacks --query "Stacks[?StackName!='$STACK' && Parameters[?(ParameterKey=='BackupBucketName' || ParameterKey=='ObjectsBucketName') && ParameterValue=='<BackupBucket>']].StackName" --output text
       note "the snapshots tagged with the stack's id, and every other snapshot of the data volume:"
       show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=tag:supavise:stack,Values=<StackId>" --query 'Snapshots[].[SnapshotId,VolumeId,VolumeSize,StartTime,State]' --output text
       show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=volume-id,Values=<DataVolumeId>" --query 'Snapshots[].[SnapshotId,VolumeId,VolumeSize,StartTime,State]' --output text
-      note "after the stack is deleted (the final snapshot exists by then, so the snapshots are listed again), for each bucket, until a list comes back empty (versions, then delete markers):"
-      show "${AWS[@]}" s3api list-object-versions --bucket "<BackupBucket>" --expected-bucket-owner "<account>" --no-paginate --output json --query "$(batch_query Versions)"
+      note "after the stack is deleted (the final snapshot exists by then, so the snapshots are listed again), for each bucket, until a page comes back empty (versions and delete markers together):"
+      show "${AWS[@]}" s3api list-object-versions --bucket "<BackupBucket>" --expected-bucket-owner "<account>" --no-paginate --output json --query "$Q_BATCH"
       show "${AWS[@]}" s3api delete-objects --bucket "<BackupBucket>" --expected-bucket-owner "<account>" --delete "file://<batch of up to 1000>"
       show "${AWS[@]}" s3api delete-bucket --bucket "<BackupBucket>" --expected-bucket-owner "<account>"
       show "${AWS[@]}" ec2 delete-snapshot --snapshot-id "<snapshot>"

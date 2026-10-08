@@ -60,13 +60,20 @@ type pdeleted struct {
 	Volume string `json:"volume"`
 }
 
+type pother struct {
+	Name   string            `json:"name"`
+	Params map[string]string `json:"params"`
+}
+
 type pstate struct {
-	Account  string              `json:"account"`
-	Stack    pstack              `json:"stack"`
-	Deleted  []pdeleted          `json:"deleted_stacks,omitempty"`
-	Buckets  map[string]*pbucket `json:"buckets"`
-	Snaps    []psnap             `json:"snapshots"`
-	StopFail bool                `json:"stop_fails,omitempty"`
+	Account    string              `json:"account"`
+	Stack      pstack              `json:"stack"`
+	Deleted    []pdeleted          `json:"deleted_stacks,omitempty"`
+	Others     []pother            `json:"other_stacks,omitempty"`
+	Unlistable bool                `json:"stacks_unlistable,omitempty"`
+	Buckets    map[string]*pbucket `json:"buckets"`
+	Snaps      []psnap             `json:"snapshots"`
+	StopFail   bool                `json:"stop_fails,omitempty"`
 }
 
 func versions(n int, prefix string) [][2]string {
@@ -344,10 +351,10 @@ func TestPurgeOfADeletedStack(t *testing.T) {
 			t.Errorf("%s: snapshots left: %v (the final one is found by the volume of the tagged ones)", b, ids)
 		}
 		c := calls(t, log)
-		// 2500 versions and 40 markers: three batches of versions, one of markers; the last list of
-		// each kind comes back empty.
-		if n := count(c, "s3api delete-objects --bucket "+pBackup); n != 4 {
-			t.Errorf("%s: %d delete-objects calls for the backup bucket, want 4:\n%s", b, n, strings.Join(c, "\n"))
+		// 2500 versions and 40 markers are 2540 entries of one listing: three batches (1000, 1000,
+		// 540), and the page after them comes back empty.
+		if n := count(c, "s3api delete-objects --bucket "+pBackup); n != 3 {
+			t.Errorf("%s: %d delete-objects calls for the backup bucket, want 3:\n%s", b, n, strings.Join(c, "\n"))
 		}
 		if n := count(c, "s3api delete-objects --bucket "+pObjects); n != 1 {
 			t.Errorf("%s: %d delete-objects calls for the objects bucket, want 1", b, n)
@@ -578,5 +585,187 @@ func TestDeleteWithPurgeKeepsEverythingWhenTheStopFails(t *testing.T) {
 	}
 	if c := strings.Join(calls(t, log), "\n"); strings.Contains(c, "delete-stack") || strings.Contains(c, "delete-objects") || strings.Contains(c, "delete-snapshot") {
 		t.Errorf("destroyed something although the instance did not stop:\n%s", c)
+	}
+}
+
+// S3 lists object versions and delete markers in one sequence, in key order, a page of 1000. A
+// bucket whose first entries are all delete markers (the ones left when old versions expire), or
+// that alternates long runs of the two, is still emptied in one run: every page is deleted whatever
+// it holds, until a page comes back empty.
+func TestPurgeEmptiesABucketWhoseFirstPageHoldsOneKind(t *testing.T) {
+	cases := []struct {
+		name     string
+		versions [][2]string
+		markers  [][2]string
+	}{
+		{"markers first", versions(1500, "z-live"), versions(1500, "a-gone")},
+		{"versions first", versions(1500, "a-live"), versions(1500, "z-gone")},
+		{"alternating runs", append(versions(1100, "b-live"), versions(1100, "d-live")...), append(versions(1100, "a-gone"), versions(1100, "c-gone")...)},
+		{"only markers", nil, versions(2100, "gone")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := deletedStack()
+			st.Buckets[pBackup].Versions, st.Buckets[pBackup].Markers = c.versions, c.markers
+			st.Buckets[pBackup].Uploads = nil
+			dir, log, state := purgeStub(t, st)
+			r := run(t, bashes(t)[0], dir, purgeEnv(dir, state), "purge", "--region", "us-east-1", "--stack-name", "supavise", "--yes")
+			if r.code != 0 {
+				t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+			}
+			if _, ok := readState(t, state).Buckets[pBackup]; ok {
+				t.Error("the bucket is still there")
+			}
+			want := (len(c.versions) + len(c.markers) + 999) / 1000
+			if n := count(calls(t, log), "s3api delete-objects --bucket "+pBackup); n != want {
+				t.Errorf("%d delete-objects calls, want %d (one per page of the listing)", n, want)
+			}
+		})
+	}
+}
+
+// EC2 reports vol-ffffffff as the volume of every snapshot that is a copy (of a snapshot or of an
+// image). A tagged copy is the stack's by its tag, but the id must not lead to the other snapshots of
+// the account that share it.
+func TestPurgeDoesNotSearchByTheVolumeOfCopiedSnapshots(t *testing.T) {
+	st := deletedStack()
+	const copied = "vol-ffffffff"
+	st.Snaps = append(st.Snaps,
+		psnap{ID: "snap-00000000000000c1", Vol: copied, Size: 100, Start: "2026-10-05T03:00:00+00:00", State: "completed", Tags: map[string]string{"supavise:stack": pStackID}},
+		psnap{ID: "snap-00000000000000c2", Vol: copied, Size: 8, Start: "2026-09-01T03:00:00+00:00", State: "completed"},
+		psnap{ID: "snap-00000000000000c3", Vol: copied, Size: 8, Start: "2026-09-02T03:00:00+00:00", State: "completed", Tags: map[string]string{"Name": "somebody else's copy"}},
+	)
+	st.Deleted[0].Volume = copied // a record that names the copy marker is no more a volume than the snapshots' own
+	for _, b := range bashes(t) {
+		dir, log, state := purgeStub(t, st)
+		r := run(t, b, dir, purgeEnv(dir, state), "purge", "--region", "us-east-1", "--stack-name", "supavise", "--yes")
+		if r.code != 0 {
+			t.Fatalf("%s: exit %d\n%s\n%s", b, r.code, r.stdout, r.stderr)
+		}
+		ids := snapIDs(readState(t, state))
+		if want := "snap-0000000000000009,snap-0000000000000008,snap-00000000000000c2,snap-00000000000000c3"; strings.Join(ids, ",") != want {
+			t.Errorf("%s: snapshots left: %v, want the ones that are not the stack's: %s", b, ids, want)
+		}
+		for _, l := range calls(t, log) {
+			if strings.Contains(l, "volume-id") && strings.Contains(l, copied) {
+				t.Errorf("%s: searched by the volume of copies: %s", b, l)
+			}
+		}
+	}
+
+	// The same through --delete --purge, where the volume is the stack's output.
+	live := liveStack()
+	live.Snaps = append(live.Snaps, st.Snaps[len(st.Snaps)-3:]...)
+	live.Stack.Outputs["DataVolumeId"] = copied
+	dir, _, state := purgeStub(t, live)
+	r := run(t, bashes(t)[0], dir, purgeEnv(dir, state), "--region", "us-east-1", "--stack-name", "supavise", "--delete", "--purge", "--yes")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	for _, id := range snapIDs(readState(t, state)) {
+		if id == "snap-00000000000000c1" {
+			t.Error("the tagged copy was left")
+		}
+	}
+	if got := strings.Join(snapIDs(readState(t, state)), ","); !strings.Contains(got, "snap-00000000000000c2") || !strings.Contains(got, "snap-00000000000000c3") {
+		t.Errorf("an untagged copy of somebody else's was destroyed: %s", got)
+	}
+}
+
+// A bucket the stack's outputs name, whose tags cannot be read or are absent, is not provably the
+// stack's: the purge stops before it stops anything, as it does for another stack's bucket.
+func TestDeleteWithPurgeRefusesABucketWithoutTags(t *testing.T) {
+	st := liveStack()
+	st.Buckets[pBackup].Tags = nil
+	dir, log, state := purgeStub(t, st)
+	r := run(t, bashes(t)[0], dir, purgeEnv(dir, state), "--region", "us-east-1", "--stack-name", "supavise", "--delete", "--purge", "--yes")
+	if r.code != 2 || !strings.Contains(r.stderr, "shows no CloudFormation tags") || !strings.Contains(r.stderr, "s3:GetBucketTagging") {
+		t.Errorf("exit %d\n%s%s", r.code, r.stdout, r.stderr)
+	}
+	c := strings.Join(calls(t, log), "\n")
+	for _, bad := range []string{"stop-instances", "delete-stack", "delete-objects", "delete-bucket", "delete-snapshot"} {
+		if strings.Contains(c, bad) {
+			t.Errorf("went on (%s) after the refusal:\n%s", bad, c)
+		}
+	}
+	if got := readState(t, state); !got.Stack.Exists || got.Buckets[pBackup] == nil {
+		t.Error("the stack or the bucket is gone")
+	}
+}
+
+// bucketBlock is the line of a bucket in the purge list and the lines under it that belong to it.
+func bucketBlock(t *testing.T, stdout, bucket string) string {
+	t.Helper()
+	lines := strings.Split(stdout, "\n")
+	for i, l := range lines {
+		if !strings.HasPrefix(l, "  "+bucket+"   ") {
+			continue
+		}
+		block := l
+		for _, next := range lines[i+1:] {
+			if !strings.HasPrefix(next, "    ") {
+				break
+			}
+			block += "\n" + next
+		}
+		return block
+	}
+	t.Fatalf("no line for %s in:\n%s", bucket, stdout)
+	return ""
+}
+
+// Replica servers keep their backups and Storage files in their leader's buckets. The list warns,
+// before the question, about every stack of the region that names a bucket it is about to destroy.
+func TestPurgeWarnsAboutStacksThatUseTheBuckets(t *testing.T) {
+	others := []pother{
+		{Name: "supavise-replica", Params: map[string]string{"BackupBucketName": pBackup, "ObjectsBucketName": pObjects, "JoinLeader": "203.0.113.50:7443"}},
+		{Name: "supavise-eu", Params: map[string]string{"ObjectsBucketName": pObjects}},
+		{Name: "unrelated", Params: map[string]string{"BackupBucketName": "somebody-elses-bucket"}},
+	}
+	for _, c := range []struct {
+		name string
+		args []string
+		st   *pstate
+	}{
+		{"purge", []string{"purge", "--region", "us-east-1", "--stack-name", "supavise"}, deletedStack()},
+		{"delete --purge", []string{"--region", "us-east-1", "--stack-name", "supavise", "--delete", "--purge"}, liveStack()},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			c.st.Others = others
+			dir, log, state := purgeStub(t, c.st)
+			// no --yes and no terminal: the list is printed and nothing is destroyed
+			r := run(t, bashes(t)[0], dir, purgeEnv(dir, state), c.args...)
+			if r.code == 0 || !strings.Contains(r.stderr, "pass --yes") {
+				t.Errorf("exit %d\n%s%s", r.code, r.stdout, r.stderr)
+			}
+			if w := bucketBlock(t, r.stdout, pBackup); !strings.Contains(w, "WARNING: stack(s) supavise-replica in us-east-1 use it") || strings.Contains(w, "supavise-eu") || strings.Contains(w, "unrelated") {
+				t.Errorf("backup bucket warning: %s", w)
+			}
+			if w := bucketBlock(t, r.stdout, pObjects); !strings.Contains(w, "WARNING: stack(s) supavise-replica supavise-eu in us-east-1 use it") {
+				t.Errorf("objects bucket warning: %s", w)
+			}
+			if !strings.Contains(r.stdout, "servers in other regions are not looked at") {
+				t.Errorf("no note about other regions:\n%s", r.stdout)
+			}
+			if got := strings.Join(calls(t, log), "\n"); strings.Contains(got, "delete-objects") || strings.Contains(got, "stop-instances") {
+				t.Errorf("destroyed or stopped something without an answer:\n%s", got)
+			}
+		})
+	}
+
+	// Stacks that cannot be listed are said so, not read as "nobody uses it".
+	st := deletedStack()
+	st.Unlistable = true
+	dir, _, state := purgeStub(t, st)
+	r := run(t, bashes(t)[0], dir, purgeEnv(dir, state), "purge", "--region", "us-east-1", "--stack-name", "supavise")
+	if !strings.Contains(r.stdout, "could not be listed, so it is not known whether a replica server still uses it") {
+		t.Errorf("stdout:\n%s", r.stdout)
+	}
+
+	// A stack with a bucket of its own and nobody using it has no warning.
+	dir, _, state = purgeStub(t, deletedStack())
+	r = run(t, bashes(t)[0], dir, purgeEnv(dir, state), "purge", "--region", "us-east-1", "--stack-name", "supavise")
+	if strings.Contains(r.stdout, "WARNING") {
+		t.Errorf("a warning with no other stack:\n%s", r.stdout)
 	}
 }
