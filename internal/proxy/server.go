@@ -30,8 +30,15 @@ type Server struct {
 	tlsMode  string
 	provider certmagic.DNSProvider
 
-	// upstreamFn overrides the upstream address resolution (tests).
-	upstreamFn func(service, project) string
+	// cluster is nil on a server that stands alone.
+	cluster *Cluster
+	// turns count, per project, the balanced reads that no rule decided (see pickDatabase).
+	turns sync.Map
+
+	// upstreamFn overrides the upstream address resolution (tests); replicaUpstreamFn does the
+	// same for the PostgREST of a replica.
+	upstreamFn        func(service, project) string
+	replicaUpstreamFn func(project, replica) string
 
 	// sockets are the Realtime sockets opened without inspection (see wsguard.go).
 	sockets socketSet
@@ -57,7 +64,7 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		opts: opts, cfg: opts.Config, log: opts.Logger, waker: opts.Waker,
+		opts: opts, cfg: opts.Config, log: opts.Logger, waker: opts.Waker, cluster: opts.Cluster,
 		transports: map[time.Duration]*http.Transport{},
 	}
 	if s.log == nil {

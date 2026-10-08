@@ -94,6 +94,9 @@ type route struct {
 	setHeaders [][2]string
 	// timeout bounds the wait for upstream response headers.
 	timeout time.Duration
+	// balance lets a GET or HEAD on a project's load balancer host go to a replica; every other
+	// request there goes to the primary like on the project's own host.
+	balance bool
 }
 
 const (
@@ -123,8 +126,8 @@ var projectRoutes = []route{
 	// Protected GoTrue and PostgREST.
 	{name: "auth-v1", prefix: "/auth/v1", svc: svcAuth, access: accessKey, keys: keyBearer, fwdPrefix: "/auth/v1/", timeout: defaultTimeout},
 	// The PostgREST OpenAPI document at the root is admin only (supabase discussion 42949).
-	{name: "rest-v1-openapi", prefix: "/rest/v1", exact: true, svc: svcRest, access: accessAdmin, keys: keyBearer, fwdPrefix: "/rest/v1/", timeout: defaultTimeout},
-	{name: "rest-v1", prefix: "/rest/v1", svc: svcRest, access: accessKey, keys: keyBearer, fwdPrefix: "/rest/v1/", timeout: defaultTimeout},
+	{name: "rest-v1-openapi", prefix: "/rest/v1", exact: true, svc: svcRest, access: accessAdmin, keys: keyBearer, fwdPrefix: "/rest/v1/", timeout: defaultTimeout, balance: true},
+	{name: "rest-v1", prefix: "/rest/v1", svc: svcRest, access: accessKey, keys: keyBearer, fwdPrefix: "/rest/v1/", timeout: defaultTimeout, balance: true},
 	{name: "graphql-v1", prefix: "/graphql/v1", svc: svcRest, upstream: "/rpc/graphql", access: accessKey, keys: keyBearer, fwdPrefix: "/graphql/v1",
 		// Forced, not added when absent: a client-chosen profile would call graphql() in another schema.
 		setHeaders: [][2]string{{"Content-Profile", "graphql_public"}}, timeout: defaultTimeout},
