@@ -307,6 +307,29 @@ func TestUpdateSendsASmallTemplateInTheBody(t *testing.T) {
 	}
 }
 
+// A value may hold spaces, commas and quotes; it reaches the parameters document as one string.
+func TestUpdateSetValueWithSpaces(t *testing.T) {
+	f := newUpdFake(t)
+	r := f.run(nil, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplate(t), "--yes",
+		"--set", "KeyEscrowPassphrase=twelve chars, \"quoted\" and more", "--set", "Failover=on")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	ps := paramsByKey(f.params(1))
+	if got := ps["KeyEscrowPassphrase"]["ParameterValue"]; got != `twelve chars, "quoted" and more` {
+		t.Errorf("KeyEscrowPassphrase = %q", got)
+	}
+	if ps["Failover"]["ParameterValue"] != "on" {
+		t.Errorf("Failover = %v", ps["Failover"])
+	}
+	// The value is not on any command line: it travels in the parameters file.
+	for _, c := range f.calls() {
+		if strings.Contains(c, "quoted") {
+			t.Errorf("a value is on a command line: %s", c)
+		}
+	}
+}
+
 func TestUpdateNeverChangesTheVersion(t *testing.T) {
 	f := newUpdFake(t)
 	r := f.run(nil, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplate(t), "--set", "SupaviseVersion=v9.9.9", "--yes")
@@ -1005,7 +1028,7 @@ func TestNewCommandDryRuns(t *testing.T) {
 				"SupaviseVersion is never set",
 			}},
 			"status": {[]string{"status", "--stack", "supavise", "--region", "us-east-1"}, []string{"cloudformation describe-stacks --stack-name supavise --output json", "ec2 describe-addresses"}},
-			"replica": {[]string{"replica", "--leader-stack", "supavise", "--region", "eu-west-1", "--az", "eu-west-1b", "--token-file", "/x/token", "--template", "/x/t.yaml"}, []string{
+			"replica": {[]string{"replica", "--leader-stack", "supavise", "--leader-region", "us-east-1", "--region", "eu-west-1", "--az", "eu-west-1b", "--token-file", "/x/token", "--template", "/x/t.yaml"}, []string{
 				"aws --region us-east-1 cloudformation describe-stacks --stack-name supavise --output json",
 				"secretsmanager create-secret --name",
 				"--secret-string file:///x/token",

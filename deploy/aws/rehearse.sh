@@ -145,7 +145,7 @@ items = [{"Key": v["Key"], "VersionId": v["VersionId"]} for k in ("Versions", "D
 json.dump({"Objects": items, "Quiet": True}, open(sys.argv[1], "w"))
 print(len(items))' "$WORK/delete.json")
     [[ $n -gt 0 ]] || break
-    "${AWS[@]}" s3api delete-objects --bucket "$1" --delete "file://$WORK/delete.json" >/dev/null
+    "${AWS[@]}" s3api delete-objects --bucket "$1" --delete "file://$WORK/delete.json" >/dev/null || return 1
   done
   "${AWS[@]}" s3api delete-bucket --bucket "$1"
 }

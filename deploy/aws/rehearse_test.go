@@ -14,6 +14,7 @@ import (
 const stubRehearseAWS = `#!/bin/bash
 DIR="$(dirname "$0")"
 echo "$*" >> "$DIR/aws.log"
+arg() { local k=$1; shift; while [ $# -gt 0 ]; do if [ "$1" = "$k" ]; then echo "$2"; return; fi; shift; done; }
 case "$*" in
   *"OutputKey=='InstanceId'"*) if [ -f "$DIR/replaced" ]; then echo i-0newnewnewnew0001; else echo i-0123456789abcdef0; fi ;;
   *"OutputKey=='BackupBucket'"*) echo supavise-rehearsal-backup ;;
@@ -25,7 +26,9 @@ case "$*" in
   *"describe-stack-events"*)
     printf '2026-10-08T12:00:01+00:00\tCREATE_COMPLETE\n'
     if [ -f "$DIR/recreated" ]; then printf '2099-01-01T00:00:00+00:00\tCREATE_IN_PROGRESS\n'; fi ;;
-  *"s3api list-object-versions"*) echo '{"Versions":[{"Key":"k","VersionId":"v1"}],"DeleteMarkers":[]}' > "$DIR/listing"; cat "$DIR/listing" ;;
+  *"s3api list-object-versions"*)
+    if [ -f "$DIR/emptied-$(arg --bucket "$@")" ]; then echo '{}'; else echo '{"Versions":[{"Key":"k","VersionId":"v1"}],"DeleteMarkers":[]}'; fi ;;
+  *"s3api delete-objects"*) touch "$DIR/emptied-$(arg --bucket "$@")" ;;
   *"ec2 describe-snapshots"*) echo "snap-1 snap-2" ;;
 esac
 `

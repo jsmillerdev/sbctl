@@ -750,8 +750,9 @@ STAGE_BUCKET=""
 # Updates $STACK, read as facts TAG, with the parameters it has and UPDATE_SETS. HOW is run, or
 # check: check makes and reviews the change set and drops it.
 run_update() { # TAG HOW
-  local tag=$1 how=$2 ami inst image have want bucket rc=0
-  local sets=(${UPDATE_SETS[@]+"${UPDATE_SETS[@]}"})
+  local tag=$1 how=$2 ami inst image have want bucket rc=0 sets=()
+  # (bash 3.2 fails on the expansion of an empty array; a value may hold spaces, so no unquoted copy)
+  if [[ ${#UPDATE_SETS[@]} -gt 0 ]]; then sets=("${UPDATE_SETS[@]}"); fi
   inst=$(fact "$tag" output:InstanceId)
   # A stack made in the console with an empty AmiId would look the image up again; give it the one
   # its instance runs, so that the update cannot replace the instance for a newer image.
@@ -849,7 +850,8 @@ mode_update() {
   fi
   resolve_template
   [[ -n $(template_revision "$TEMPLATE") ]] || die "$TEMPLATE has no InfraRevision output: it is not a Supavise template of this release line"
-  UPDATE_SETS=(${SETS[@]+"${SETS[@]}"})
+  UPDATE_SETS=()
+  if [[ ${#SETS[@]} -gt 0 ]]; then UPDATE_SETS=("${SETS[@]}"); fi
   STAGE_BUCKET=$TBUCKET
   run_update s run
   say "The node reads its stack from its instance tags: run  supavise status  on it."
