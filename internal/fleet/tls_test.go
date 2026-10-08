@@ -75,18 +75,18 @@ func TestSupavisorSpecCarriesTheCertificateHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s1, err := m.spec("supavisor", c)
+	s1, err := m.spec("supavisor", c, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2, _ := m.spec("supavisor", c)
+	s2, _ := m.spec("supavisor", c, false)
 	if len(s1.Env[downstreamCertMarkerEnv]) != 64 || s1.Env[downstreamCertMarkerEnv] != s2.Env[downstreamCertMarkerEnv] {
 		t.Fatalf("marker %q / %q", s1.Env[downstreamCertMarkerEnv], s2.Env[downstreamCertMarkerEnv])
 	}
 	crt, key := DownstreamCertPaths(n.cfg)
 	os.Remove(crt)
 	os.Remove(key)
-	s3, err := m.spec("supavisor", c)
+	s3, err := m.spec("supavisor", c, false)
 	if err != nil || s3.Env[downstreamCertMarkerEnv] == s1.Env[downstreamCertMarkerEnv] {
 		t.Fatalf("a new certificate must change the environment: %v", err)
 	}

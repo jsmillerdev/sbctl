@@ -11,6 +11,9 @@ const (
 	// be configured to hold (max_client_conn): the shared Supavisor serves every project, and its
 	// file descriptors and memory are theirs together.
 	DefaultPoolerMaxClientConn = 5000
+	// DefaultStorageCredentialsPort is the loopback port of the credential endpoint the daemon
+	// serves to supavise-storage when storage_s3_role_arn is set.
+	DefaultStorageCredentialsPort = 4010
 )
 
 // Fleet is the [fleet] config section: settings of the shared services (Supavisor,
@@ -39,12 +42,17 @@ type Fleet struct {
 	// config.toml in plain text, so keep that file 0600 and owned by the supavise user.
 	StorageS3AccessKeyID     string `toml:"storage_s3_access_key_id"`
 	StorageS3SecretAccessKey string `toml:"storage_s3_secret_access_key"`
-	// StorageS3CredentialsSecret is the ARN of an AWS Secrets Manager secret that holds
-	// {"bucket", "region", "access_key_id", "secret_access_key"}. The daemon reads it with the
-	// instance role when it renders Storage's environment, so the key is not in config.toml and
-	// rotating it is a restart. It takes the place of the storage_s3_* settings above that it
-	// names. supavise-storage cannot use the instance role itself: IMDS is denied to it.
-	StorageS3CredentialsSecret string `toml:"storage_s3_credentials_secret"`
+	// StorageS3RoleARN is the ARN of an IAM role the daemon assumes for supavise-storage (AWS STS
+	// AssumeRole, with the instance's own credentials). The daemon serves the role's short-lived
+	// credentials on a loopback endpoint (StorageCredentialsPort) in the container-credential
+	// shape, and Storage's environment points at it (AWS_CONTAINER_CREDENTIALS_FULL_URI and
+	// AWS_CONTAINER_AUTHORIZATION_TOKEN), so no access key is stored anywhere. It replaces
+	// storage_s3_access_key_id and storage_s3_secret_access_key, which may not be set with it.
+	// supavise-storage cannot use the instance role itself: IMDS is denied to it.
+	StorageS3RoleARN string `toml:"storage_s3_role_arn"`
+	// StorageCredentialsPort is the loopback port of that endpoint; zero means
+	// DefaultStorageCredentialsPort.
+	StorageCredentialsPort int `toml:"storage_credentials_port"`
 	// StorageFileSizeLimit is the per-object upload limit in bytes; zero means
 	// DefaultStorageFileSizeLimit.
 	StorageFileSizeLimit int64 `toml:"storage_file_size_limit"`
@@ -60,6 +68,14 @@ func (f Fleet) SupavisorAPI() int {
 		return f.SupavisorAPIPort
 	}
 	return DefaultSupavisorAPIPort
+}
+
+// StorageCredentials returns the port of the Storage credential endpoint with the default applied.
+func (f Fleet) StorageCredentials() int {
+	if f.StorageCredentialsPort > 0 {
+		return f.StorageCredentialsPort
+	}
+	return DefaultStorageCredentialsPort
 }
 
 // FileSizeLimit returns the Storage upload limit with the default applied.

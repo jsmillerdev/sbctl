@@ -41,8 +41,8 @@ func TestClusterKeysHaveCodeDefaults(t *testing.T) {
 	if want := (Failover{Mode: "manual", MaxLagSeconds: 30, GraceSeconds: 90, ProjectGraceSeconds: 180, StopTimeoutSeconds: 120, CooldownMinutes: 60, KeepDivergedDays: 3}); c.Failover != want {
 		t.Errorf("failover: %+v", c.Failover)
 	}
-	if c.AWS.StackName != "" || c.Fleet.StorageS3CredentialsSecret != "" {
-		t.Errorf("aws %+v fleet %q", c.AWS, c.Fleet.StorageS3CredentialsSecret)
+	if c.AWS.StackName != "" || c.Fleet.StorageS3RoleARN != "" || c.Fleet.StorageCredentials() != DefaultStorageCredentialsPort {
+		t.Errorf("aws %+v fleet %q", c.AWS, c.Fleet.StorageS3RoleARN)
 	}
 	r, f := c.Replicas, c.Failover
 	if !(r.SetupConcurrency() == 2 && r.BootstrapMaxAge() == 24*time.Hour && r.UnhealthyLag() == 5*time.Minute && r.LBMaxLag() == 0 && r.SchemaReload() == 30*time.Second && !r.AllByDefault()) {
@@ -178,10 +178,14 @@ func TestClusterValidation(t *testing.T) {
 		{"peer address ok", func(c *Config) { c.Node.PeerAddress = "203.0.113.5:7443" }, ""},
 		{"stack name", func(c *Config) { c.AWS.StackName = "1 bad" }, "aws.stack_name"},
 		{"stack name ok", func(c *Config) { c.AWS.StackName = "supavise-prod" }, ""},
-		{"storage secret", func(c *Config) { c.Fleet.StorageS3CredentialsSecret = "my-secret" }, "storage_s3_credentials_secret"},
-		{"storage secret ok", func(c *Config) {
-			c.Fleet.StorageS3CredentialsSecret = "arn:aws:secretsmanager:us-east-1:123456789012:secret:storage-AbCdEf"
-		}, ""},
+		{"storage role", func(c *Config) { c.Fleet.StorageS3RoleARN = "my-role" }, "storage_s3_role_arn"},
+		{"storage role ok", func(c *Config) { c.Fleet.StorageS3RoleARN = "arn:aws:iam::123456789012:role/supavise-storage" }, ""},
+		{"storage role and a static key", func(c *Config) {
+			c.Fleet.StorageS3RoleARN = "arn:aws:iam::123456789012:role/supavise-storage"
+			c.Fleet.StorageS3AccessKeyID = "AKIAEXAMPLE"
+		}, "alternatives"},
+		{"storage credentials port", func(c *Config) { c.Fleet.StorageCredentialsPort = 70000 }, "storage_credentials_port"},
+		{"storage credentials port ok", func(c *Config) { c.Fleet.StorageCredentialsPort = 4011 }, ""},
 		// The replica port range is judged only once replicas are in use, so a node with a small
 		// project_base that never uses them still starts.
 		{"small project_base, no replicas", func(c *Config) { c.Ports.ProjectBase = 5000 }, ""},

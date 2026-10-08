@@ -54,8 +54,9 @@ func regexpQuote(s string) string {
 	return string(b)
 }
 
-// spec builds the unit spec of svc.
-func (m *Manager) spec(svc string, c *creds) (units.Spec, error) {
+// spec builds the unit spec of svc. A follower's specs carry no PreStart: bin/prepare migrates a
+// database, and a standby's cannot be written (spike S1: it exits 1 there).
+func (m *Manager) spec(svc string, c *creds, follower bool) (units.Spec, error) {
 	cfg := m.cfg()
 	art, err := m.d.Artifacts.Dir(svc)
 	if err != nil {
@@ -77,12 +78,19 @@ func (m *Manager) spec(svc string, c *creds) (units.Spec, error) {
 			return units.Spec{}, err
 		}
 		s.Env[downstreamCertMarkerEnv] = sum
-		s.PreStart = [][]string{{"bin/prepare"}} // schema migrations of _supavisor
+		s.PreStart = [][]string{{"bin/prepare"}} // schema migrations of _supavisor, not on a standby
 	case config.SvcRealtime:
 		s.Env = realtimeEnv(cfg, c)
 		s.PreStart = [][]string{{"bin/prepare"}} // schema migrations of _realtime (no self-host seeding)
 	case config.SvcStorage:
-		env, err := storageEnv(cfg, c)
+		var token string
+		if cfg.Fleet.StorageBackend == "s3" && cfg.Fleet.StorageS3RoleARN != "" {
+			var err error
+			if token, err = StorageCredentialToken(cfg); err != nil {
+				return units.Spec{}, err
+			}
+		}
+		env, err := storageEnv(cfg, c, token)
 		if err != nil {
 			return units.Spec{}, err
 		}
@@ -93,6 +101,9 @@ func (m *Manager) spec(svc string, c *creds) (units.Spec, error) {
 		return edgeRuntimeSpec(cfg, s)
 	default:
 		return units.Spec{}, fmt.Errorf("fleet: no unit definition for %q", svc)
+	}
+	if follower {
+		s.PreStart = nil
 	}
 	return s, nil
 }
@@ -197,7 +208,12 @@ func realtimeEnv(cfg *config.Config, c *creds) map[string]string {
 // upstream compose file does). The tenant table lives in _storage of the system cluster;
 // each tenant's own database is reached with the credentials its tenant record carries.
 // The admin API (tenant management) is on its own port, behind an API key.
-func storageEnv(cfg *config.Config, c *creds) (map[string]string, error) {
+//
+// The s3 backend gets its credentials one of two ways. With [fleet] storage_s3_role_arn the
+// environment holds the address of the daemon's credential endpoint and the token for it
+// (credentials.go) and no key at all; credToken is that token. Otherwise the static
+// storage_s3_access_key_id and storage_s3_secret_access_key go in, as they always have.
+func storageEnv(cfg *config.Config, c *creds, credToken string) (map[string]string, error) {
 	l := c.logins[config.SvcStorage]
 	env := map[string]string{
 		"MULTI_TENANT":                    "true",
@@ -228,11 +244,15 @@ func storageEnv(cfg *config.Config, c *creds) (map[string]string, error) {
 		if f.StorageS3Bucket == "" {
 			return nil, fmt.Errorf("fleet: [fleet] storage_backend = \"s3\" needs storage_s3_bucket")
 		}
-		if cfg.Supervisor == config.SupervisorSystemd && (f.StorageS3AccessKeyID == "" || f.StorageS3SecretAccessKey == "") {
+		role := f.StorageS3RoleARN != ""
+		if role && credToken == "" {
+			return nil, fmt.Errorf("fleet: [fleet] storage_s3_role_arn needs the credential token of this boot")
+		}
+		if !role && cfg.Supervisor == config.SupervisorSystemd && (f.StorageS3AccessKeyID == "" || f.StorageS3SecretAccessKey == "") {
 			// supavise-storage denies the instance metadata service (deploy/systemd/README.md), so
 			// the instance role is out of reach by design: Storage holds the objects of every
 			// project and runs on user input, and the role also covers the backups.
-			return nil, fmt.Errorf("fleet: [fleet] storage_backend = \"s3\" needs storage_s3_access_key_id and storage_s3_secret_access_key under systemd: supavise-storage cannot reach the instance role (IMDS is denied to it), so give it a key scoped to the objects bucket")
+			return nil, fmt.Errorf("fleet: [fleet] storage_backend = \"s3\" needs storage_s3_role_arn, or storage_s3_access_key_id and storage_s3_secret_access_key, under systemd: supavise-storage cannot reach the instance role (IMDS is denied to it), so give it a role the daemon assumes for it or a key scoped to the objects bucket")
 		}
 		env["STORAGE_BACKEND"] = "s3"
 		env["STORAGE_S3_BUCKET"] = f.StorageS3Bucket
@@ -250,7 +270,11 @@ func storageEnv(cfg *config.Config, c *creds) (map[string]string, error) {
 		if f.StorageS3ForcePathStyle {
 			env["STORAGE_S3_FORCE_PATH_STYLE"] = "true"
 		}
-		if f.StorageS3AccessKeyID != "" || f.StorageS3SecretAccessKey != "" {
+		switch {
+		case role:
+			env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = StorageCredentialsURL(cfg)
+			env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = credToken
+		case f.StorageS3AccessKeyID != "" || f.StorageS3SecretAccessKey != "":
 			env["AWS_ACCESS_KEY_ID"] = f.StorageS3AccessKeyID
 			env["AWS_SECRET_ACCESS_KEY"] = f.StorageS3SecretAccessKey
 		}

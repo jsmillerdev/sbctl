@@ -293,8 +293,16 @@ func (c *Config) validateCluster() error {
 	if c.AWS.StackName != "" && !stackNameRe.MatchString(c.AWS.StackName) {
 		return fmt.Errorf("config: aws.stack_name %q is not a CloudFormation stack name", c.AWS.StackName)
 	}
-	if s := c.Fleet.StorageS3CredentialsSecret; s != "" && !strings.HasPrefix(s, "arn:") {
-		return fmt.Errorf("config: fleet.storage_s3_credentials_secret %q must be the ARN of an AWS Secrets Manager secret", s)
+	if f := c.Fleet; f.StorageS3RoleARN != "" {
+		if !strings.HasPrefix(f.StorageS3RoleARN, "arn:") {
+			return fmt.Errorf("config: fleet.storage_s3_role_arn %q must be the ARN of an IAM role", f.StorageS3RoleARN)
+		}
+		if f.StorageS3AccessKeyID != "" || f.StorageS3SecretAccessKey != "" {
+			return errors.New("config: fleet.storage_s3_role_arn and fleet.storage_s3_access_key_id or storage_s3_secret_access_key are alternatives: set one kind of credential")
+		}
+	}
+	if p := c.Fleet.StorageCredentialsPort; p < 0 || p > 65535 {
+		return fmt.Errorf("config: fleet.storage_credentials_port %d must be a port from 1 to 65535", p)
 	}
 
 	r := c.Replicas

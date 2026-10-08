@@ -123,6 +123,31 @@ func (t lazyTenant) RefreshTenant(ctx context.Context, ref string) error {
 	return nil
 }
 
+// EnsureReplicaTenant implements ReplicaTenanter for the Supavisor entry; the other two tenants
+// serve no replica.
+func (t lazyTenant) EnsureReplicaTenant(ctx context.Context, spec TenantSpec) error {
+	r, err := t.l.tenant(ctx, t.svc)
+	if err != nil || r == nil {
+		return err
+	}
+	if rt, ok := r.(ReplicaTenanter); ok {
+		return rt.EnsureReplicaTenant(ctx, spec)
+	}
+	return nil
+}
+
+// RemoveReplicaTenant implements ReplicaTenanter for the Supavisor entry.
+func (t lazyTenant) RemoveReplicaTenant(ctx context.Context, identifier string) error {
+	r, err := t.l.tenant(ctx, t.svc)
+	if err != nil || r == nil {
+		return err
+	}
+	if rt, ok := r.(ReplicaTenanter); ok {
+		return rt.RemoveReplicaTenant(ctx, identifier)
+	}
+	return nil
+}
+
 // QuiesceTenant implements Quiescer for the Realtime entry.
 func (t lazyTenant) QuiesceTenant(ctx context.Context, ref string) error {
 	r, err := t.l.tenant(ctx, t.svc)

@@ -48,7 +48,13 @@ func Setup(ctx context.Context, d Deps) (Fleet, error) {
 	if d.Cfg == nil || d.Registry == nil || d.Secrets == nil {
 		return nil, errors.New("fleet: Setup needs Deps.Cfg, Registry and Secrets")
 	}
-	c, err := loadCreds(ctx, d, true)
+	follower, err := d.isFollower(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A follower reads the services' secrets (the leader generated them and they replicated) and
+	// writes none.
+	c, err := loadCreds(ctx, d, !follower)
 	if err != nil {
 		return nil, err
 	}
@@ -75,6 +81,7 @@ func newTenants(d Deps, c *creds) Fleet {
 		return &apiClient{name: name, http: hc, retry: d.Retry, log: d.log()}
 	}
 	store := tenantStore{reg: d.Registry, sec: d.Secrets}
+	gate := d.gate()
 	now := time.Now
 	// The releases this node pins: part of the Realtime and Storage tenants' fingerprints.
 	var tags map[string]string
@@ -83,15 +90,15 @@ func newTenants(d Deps, c *creds) Fleet {
 	}
 	return Fleet{
 		&supavisorTenant{
-			cl: client(config.SvcSupavisor), store: store, base: "http://" + Addr(cfg, config.SvcSupavisor),
+			followerGate: gate, cl: client(config.SvcSupavisor), store: store, base: "http://" + Addr(cfg, config.SvcSupavisor),
 			secret: c.supavisorAPIJWT, now: now, setManager: setManagerPassword,
 		},
 		&realtimeTenant{
-			cl: client(config.SvcRealtime), store: store, base: "http://" + Addr(cfg, config.SvcRealtime),
+			followerGate: gate, cl: client(config.SvcRealtime), store: store, base: "http://" + Addr(cfg, config.SvcRealtime),
 			secret: c.realtimeAPIJWT, now: now, release: tags[config.SvcRealtime],
 		},
 		&storageTenant{
-			cl: client(config.SvcStorage), store: store, base: fmt.Sprintf("http://127.0.0.1:%d", cfg.Ports.StorageAdmin),
+			followerGate: gate, cl: client(config.SvcStorage), store: store, base: fmt.Sprintf("http://127.0.0.1:%d", cfg.Ports.StorageAdmin),
 			adminKey: c.storageAdminKey, fileSize: cfg.Fleet.FileSizeLimit(), release: tags[config.SvcStorage],
 			adminPassword: registryAdminPassword(d.Registry, d.Secrets),
 		},
@@ -110,6 +117,43 @@ func TenantSpecFor(cfg *config.Config, p *registry.Project, k *secrets.ProjectKe
 		JWTSecret:            k.JWTSecret, AnonKey: k.AnonKey, ServiceRoleKey: k.ServiceRoleKey,
 		Host: cfg.ProjectHost(p.Ref),
 	}
+}
+
+// TenantSpecForReplica describes replica r of project p to Supavisor: the project's own spec with
+// the replica's identifier as the tenant's external id and the replica's port as the database
+// (design 2.7.6). That port is the replica itself on its node and a forwarder on every other, so
+// one tenant row serves every node's Supavisor. The caller refuses a project whose sequence is
+// above config.MaxReplicaSeq (LoadReplicaTenantSpec does).
+func TenantSpecForReplica(cfg *config.Config, p *registry.Project, r *registry.Replica, k *secrets.ProjectKeys) TenantSpec {
+	s := TenantSpecFor(cfg, p, k)
+	s.ReplicaID = r.Identifier
+	s.DBPort = cfg.ReplicaPorts(p.Ref, p.Seq).Postgres
+	return s
+}
+
+// LoadReplicaTenantSpec reads the replica with the given identifier, its project and the
+// project's sealed credentials from the registry and returns the replica's TenantSpec.
+func LoadReplicaTenantSpec(ctx context.Context, d Deps, identifier string) (TenantSpec, error) {
+	if d.Cfg == nil || d.Registry == nil || d.Secrets == nil {
+		return TenantSpec{}, errors.New("fleet: LoadReplicaTenantSpec needs Deps.Cfg, Registry and Secrets")
+	}
+	r, err := d.Registry.GetReplica(ctx, identifier)
+	if err != nil {
+		return TenantSpec{}, fmt.Errorf("fleet: replica %s: %w", identifier, err)
+	}
+	p, err := d.Registry.GetProject(ctx, r.Ref)
+	if err != nil {
+		return TenantSpec{}, fmt.Errorf("fleet: project %s: %w", r.Ref, err)
+	}
+	if p.Seq > d.Cfg.MaxReplicaSeq() {
+		return TenantSpec{}, fmt.Errorf("fleet: project %s has sequence %d, above %d, the last one whose replica has a port", p.Ref, p.Seq, d.Cfg.MaxReplicaSeq())
+	}
+	spec, err := LoadTenantSpec(ctx, d, r.Ref)
+	if err != nil {
+		return TenantSpec{}, err
+	}
+	spec.ReplicaID, spec.DBPort = r.Identifier, d.Cfg.ReplicaPorts(p.Ref, p.Seq).Postgres
+	return spec, nil
 }
 
 // LoadTenantSpec reads project ref and its sealed credentials from the registry and

@@ -177,7 +177,7 @@ func TestStorageEnvFile(t *testing.T) {
 	n.cfg.Ports.SystemPostgres, n.cfg.Ports.Storage, n.cfg.Ports.StorageAdmin = 37001, 37030, 37031
 	n.cfg.Domain = "Example.COM"
 	c := testCreds(t, n)
-	env, err := storageEnv(n.cfg, c)
+	env, err := storageEnv(n.cfg, c, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,15 +226,15 @@ func TestStorageEnvS3AndValidation(t *testing.T) {
 	n := newTestNode(t)
 	c := testCreds(t, n)
 	n.cfg.Fleet = config.Fleet{StorageBackend: "s3"}
-	if _, err := storageEnv(n.cfg, c); err == nil || !strings.Contains(err.Error(), "storage_s3_bucket") {
+	if _, err := storageEnv(n.cfg, c, ""); err == nil || !strings.Contains(err.Error(), "storage_s3_bucket") {
 		t.Fatalf("s3 without a bucket: %v", err)
 	}
 	n.cfg.Fleet = config.Fleet{StorageBackend: "tape"}
-	if _, err := storageEnv(n.cfg, c); err == nil {
+	if _, err := storageEnv(n.cfg, c, ""); err == nil {
 		t.Fatal("unknown backend accepted")
 	}
 	n.cfg.Fleet = config.Fleet{StorageBackend: "s3", StorageS3Bucket: "objs", StorageS3Endpoint: "http://minio:9000", StorageS3ForcePathStyle: true, StorageS3AccessKeyID: "AK", StorageS3SecretAccessKey: "SK", StorageFileSizeLimit: 123}
-	env, err := storageEnv(n.cfg, c)
+	env, err := storageEnv(n.cfg, c, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,18 +253,18 @@ func TestStorageEnvS3AndValidation(t *testing.T) {
 	// Without static keys the AWS default chain applies where it exists (the exec backend)...
 	n.cfg.Fleet = config.Fleet{StorageBackend: "s3", StorageS3Bucket: "objs"}
 	n.cfg.Backup.S3Region = "eu-west-1"
-	env, _ = storageEnv(n.cfg, c)
+	env, _ = storageEnv(n.cfg, c, "")
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok || env["STORAGE_S3_REGION"] != "eu-west-1" {
 		t.Errorf("env = %v", env)
 	}
 	// ... but not under systemd, where supavise-storage cannot reach the instance role: static
 	// keys are required, and the error says why.
 	n.cfg.Supervisor = config.SupervisorSystemd
-	if _, err := storageEnv(n.cfg, c); err == nil || !strings.Contains(err.Error(), "IMDS") {
+	if _, err := storageEnv(n.cfg, c, ""); err == nil || !strings.Contains(err.Error(), "IMDS") {
 		t.Fatalf("s3 without keys under systemd = %v; want an error that names IMDS", err)
 	}
 	n.cfg.Fleet.StorageS3AccessKeyID, n.cfg.Fleet.StorageS3SecretAccessKey = "AK", "SK"
-	if _, err := storageEnv(n.cfg, c); err != nil {
+	if _, err := storageEnv(n.cfg, c, ""); err != nil {
 		t.Fatalf("s3 with keys under systemd: %v", err)
 	}
 }

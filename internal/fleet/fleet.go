@@ -19,6 +19,10 @@ type TenantSpec struct {
 	// service documents otherwise).
 	DBUser     string
 	DBPassword string
+	// ReplicaID is the identifier of a project's replica when the spec describes the replica's
+	// Supavisor tenant (TenantSpecForReplica): the tenant's external id, with DBPort the replica's
+	// port. Ref stays the project's, which owns the credentials. Empty for the project's own tenant.
+	ReplicaID string
 	// Pooler: the "postgres" role password users log in with as postgres.<ref>.
 	PostgresPassword string
 	// StorageAdminPassword is the password of supabase_storage_admin, the role Storage
@@ -75,6 +79,39 @@ func (f Fleet) RefreshTenant(ctx context.Context, ref string) error {
 	for _, t := range f {
 		if r, ok := t.(Refresher); ok {
 			if err := r.RefreshTenant(ctx, ref); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	return first
+}
+
+// ReplicaTenanter is an optional Tenant capability: pool a project's read replica under a tenant
+// of its own (Supavisor's, with the replica's identifier as the external id), so that
+// postgres.<identifier> logs in to the standby. Services that serve no replica do not implement it.
+type ReplicaTenanter interface {
+	EnsureReplicaTenant(ctx context.Context, spec TenantSpec) error
+	RemoveReplicaTenant(ctx context.Context, identifier string) error
+}
+
+// EnsureReplicaTenant calls EnsureReplicaTenant on every tenant that implements ReplicaTenanter.
+func (f Fleet) EnsureReplicaTenant(ctx context.Context, spec TenantSpec) error {
+	for _, t := range f {
+		if r, ok := t.(ReplicaTenanter); ok {
+			if err := r.EnsureReplicaTenant(ctx, spec); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// RemoveReplicaTenant calls RemoveReplicaTenant on every tenant that implements ReplicaTenanter.
+func (f Fleet) RemoveReplicaTenant(ctx context.Context, identifier string) error {
+	var first error
+	for _, t := range f {
+		if r, ok := t.(ReplicaTenanter); ok {
+			if err := r.RemoveReplicaTenant(ctx, identifier); err != nil && first == nil {
 				first = err
 			}
 		}

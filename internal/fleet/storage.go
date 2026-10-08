@@ -30,6 +30,7 @@ const (
 )
 
 type storageTenant struct {
+	followerGate
 	cl       *apiClient
 	store    tenantStore
 	base     string // admin API: http://127.0.0.1:<storage_admin>
@@ -82,8 +83,11 @@ func storageBody(spec TenantSpec, dbURL string, fileSize int64) map[string]any {
 	}
 }
 
-// EnsureTenant implements Tenant.
+// EnsureTenant implements Tenant. A follower parks Storage and leaves the call to the leader.
 func (t *storageTenant) EnsureTenant(ctx context.Context, spec TenantSpec) error {
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return err
+	}
 	if err := validTenantRef(spec.Ref); err != nil {
 		return err
 	}
@@ -136,6 +140,9 @@ func (t *storageTenant) EnsureTenant(ctx context.Context, spec TenantSpec) error
 // RemoveTenant implements Tenant: DELETE /tenants/<tenant> removes the tenant row (its objects
 // stay where the backend keeps them: <ref>/ under the file directory or the bucket).
 func (t *storageTenant) RemoveTenant(ctx context.Context, ref string) error {
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return err
+	}
 	if err := validTenantRef(ref); err != nil {
 		return err
 	}

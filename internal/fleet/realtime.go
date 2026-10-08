@@ -25,6 +25,7 @@ const (
 )
 
 type realtimeTenant struct {
+	followerGate
 	cl     *apiClient
 	store  tenantStore
 	base   string // http://127.0.0.1:<port>
@@ -104,8 +105,11 @@ func realtimeBody(spec TenantSpec) map[string]any {
 	return map[string]any{"tenant": tenant}
 }
 
-// EnsureTenant implements Tenant.
+// EnsureTenant implements Tenant. A follower parks Realtime and leaves the call to the leader.
 func (t *realtimeTenant) EnsureTenant(ctx context.Context, spec TenantSpec) error {
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return err
+	}
 	if err := validTenantRef(spec.Ref); err != nil {
 		return err
 	}
@@ -155,6 +159,9 @@ func (t *realtimeTenant) EnsureTenant(ctx context.Context, spec TenantSpec) erro
 // postgres_cdc_rls processes, shuts its database connection down and disconnects its sockets
 // (the tenant row stays). A tenant Realtime does not know counts as quiet.
 func (t *realtimeTenant) QuiesceTenant(ctx context.Context, ref string) error {
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return err
+	}
 	if err := validTenantRef(ref); err != nil {
 		return err
 	}
@@ -175,6 +182,9 @@ func (t *realtimeTenant) QuiesceTenant(ctx context.Context, ref string) error {
 // RemoveTenant implements Tenant: DELETE /api/tenants/<ref> disconnects the tenant's
 // sockets, deletes the row, and stops its replication connections. 404 counts as removed.
 func (t *realtimeTenant) RemoveTenant(ctx context.Context, ref string) error {
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return err
+	}
 	if err := validTenantRef(ref); err != nil {
 		return err
 	}
