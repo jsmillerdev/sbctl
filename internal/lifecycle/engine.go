@@ -1029,7 +1029,9 @@ func (e *Engine) EnsureTenants(ctx context.Context) map[string]error {
 // EnsureTenant registers ref, and its replicas that are up, with the shared services again and asks
 // the other nodes that run Supavisor to drop their cached copy: the call that follows a move of the
 // project's home (the failover orchestrator's Fleet), once its database answers at the new home, so
-// that Realtime creates its replication slot there. It takes the project's lock.
+// that Realtime creates its replication slot there. It does not take the project's lock: the
+// orchestrator already holds it through Lock for the steps of a move, and the lock is not reentrant. A
+// caller that needs the call serialized with pause, resume and upgrade takes Lock first.
 func (e *Engine) EnsureTenant(ctx context.Context, ref string) error {
 	if len(e.opts.Fleet) == 0 || ref == config.SystemRef {
 		return nil

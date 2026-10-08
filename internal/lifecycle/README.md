@@ -206,7 +206,7 @@ instance; Studio draws them under its own labels, and the constants in `upgrade.
 `Engine.UpgradeEligibility` answers for the node's pins: the changes, whether PostgreSQL restarts, an
 estimated downtime (about 3 minutes without a PostgreSQL restart, 15 with one; the base backup does not
 count) and blockers. A project homed on another node (`registry.Project.NodeID` is not `Options.NodeID`) is answered with
-one blocker, `BlockerElsewhere` ("homed on node n2; upgrade it there"): an upgrade renders and restarts
+one blocker, `BlockerElsewhere` ("the project is homed on node n2; upgrade it there"): an upgrade renders and restarts
 the project from the artifacts and the data directory of the node it runs on, and `supavise upgrade`
 runs on every node over the whole registry. Blockers: not `ACTIVE_HEALTHY`, another Postgres major version, a service the
 project runs a newer release of than the target (`CompareTags` orders tags by upstream version, then
@@ -595,7 +595,9 @@ resume, a settings restart, an upgrade's rollback and the Engine's other restart
 `ErrFenced` and write no launcher. A record that cannot be read blocks too. A replica is not a
 primary and starts on a fenced node (it is how the node is rebuilt), so `DemoteToReplica` and the
 replica starts do not check the fence. `PromoteReplica` checks first, so `ErrFenced` from it is a
-refusal that changed nothing. `Engine.PendingRestart` and `Engine.RestartPending` answer no for a
+refusal that changed nothing. A record that appears after `pg_promote` ran is caught by the check in
+`StartDatabase`, which ends the promotion; that error says the cluster was promoted and its primary did
+not start, and it does not wrap `ErrFenced`, so `placement.Refused` does not read it as a refusal. `Engine.PendingRestart` and `Engine.RestartPending` answer no for a
 fenced primary instead of the error: it does not run here, so no restart is owed, and
 `supavise upgrade` goes on to the next project.
 

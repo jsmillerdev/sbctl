@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/units"
 )
@@ -492,6 +493,27 @@ func TestPromoteReplicaStateMachine(t *testing.T) {
 	}
 	if f.sup.ops() != before {
 		t.Fatalf("a repeated promotion touched the units:\n%s", f.sup.ops())
+	}
+}
+
+// A fence record that appears while the promotion runs does not come back as ErrFenced: pg_promote
+// ran, so the error is not the refusal that changed nothing.
+func TestPromoteReplicaFencedAfterThePromotionIsNotARefusal(t *testing.T) {
+	fastReplicaPoll(t)
+	f := newReplicaFixture(t)
+	f.seeded(t, true)
+	f.sql.status[f.rp.Port] = ClusterStatus{InRecovery: true}
+	f.sql.onPromote = func(ClusterAddr) {
+		if err := fenced.WriteProject(f.cfg.Paths(), fenced.Record{Epoch: 9, Leader: "n2", Ref: testRef, Reason: "project failover of " + testRef}); err != nil {
+			t.Error(err)
+		}
+	}
+	err := f.pl.PromoteReplica(context.Background(), f.t, PromoteOptions{Epoch: 2})
+	if err == nil || errors.Is(err, ErrFenced) || !strings.Contains(err.Error(), "promoted") {
+		t.Fatalf("a promotion fenced after pg_promote = %v", err)
+	}
+	if !strings.Contains(f.sql.calls(), "promote") {
+		t.Fatalf("sql calls = %s", f.sql.calls())
 	}
 }
 

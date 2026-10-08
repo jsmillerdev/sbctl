@@ -82,7 +82,8 @@ func (pl *PostgresPlane) PromoteReplica(ctx context.Context, t ReplicaTarget, o 
 	p := t.Project
 	// A fenced node does not promote anything. The check comes before every other step so that
 	// ErrFenced is a refusal that changed nothing, which the orchestrator can tell from a promotion
-	// that may have happened.
+	// that may have happened. A fence record that appears after the promotion ran is not reported as
+	// ErrFenced (see the end of promote).
 	if err := fencedErr(pl.cfg, p.Ref); err != nil {
 		return err
 	}
@@ -161,7 +162,17 @@ func (pl *PostgresPlane) promote(ctx context.Context, t ReplicaTarget, o Promote
 	if err := dropRecoverySettings(rp.Data); err != nil {
 		return err
 	}
-	return pl.StartDatabase(ctx, p, t.Keys)
+	if err := pl.StartDatabase(ctx, p, t.Keys); err != nil {
+		// StartDatabase checks the fence again. A record that appeared since the entry check
+		// arrives after pg_promote ran, so the error must not read as the refusal that changed
+		// nothing (placement.Refused): the cluster is promoted, and the orchestrator has to treat the
+		// outcome as unknown.
+		if errors.Is(err, ErrFenced) {
+			return fmt.Errorf("lifecycle: promoted %s, but its primary did not start: %v", t.Identifier, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // holdPorts takes ref's ports from the mesh's forwarders. A hold that is in place is replaced: a
