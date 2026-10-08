@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/supavise/supavise/deploy/systemd"
 )
@@ -404,7 +405,8 @@ func ufwStep(o Options) Step {
 		if _, err := o.lookPath("ufw"); err != nil {
 			return true, "ufw is not installed", false
 		}
-		out, err := o.runner().Run(ctx, nil, "ufw", "status")
+		// ufw translates its output, and sudo keeps LANG and LC_*: "Status: active" is read in English.
+		out, err := o.runner().Run(ctx, []string{"LC_ALL=C"}, "ufw", "status")
 		if err != nil {
 			if o.geteuid() != 0 {
 				return true, "ufw's rules cannot be read without root", false
@@ -503,10 +505,13 @@ func packageStep(o Options, p PackageSpec) Step {
 				return Outcome{}, err
 			}
 			env := []string{"DEBIAN_FRONTEND=noninteractive"}
+			// unattended-upgrades holds the dpkg lock for minutes at times; wait for it instead of
+			// failing the converge (and, under the upgrade, rolling it back).
+			lock := []string{"-o", "DPkg::Lock::Timeout=300"}
 			// A stale package index is common on a server that has been up for months; a failed
 			// refresh is not fatal if the install can still find the packages.
-			_, _ = o.runner().Run(ctx, env, "apt-get", "update", "-qq")
-			if _, err := o.runner().Run(ctx, env, "apt-get", append([]string{"install", "-y", "-qq"}, m...)...); err != nil {
+			_, _ = o.runner().Run(ctx, env, "apt-get", append(append([]string{}, lock...), "update", "-qq")...)
+			if _, err := o.runner().Run(ctx, env, "apt-get", append(append([]string{}, lock...), append([]string{"install", "-y", "-qq"}, m...)...)...); err != nil {
 				return Outcome{}, err
 			}
 			return Outcome{Changed: []string{"installed " + strings.Join(m, ", ")}}, nil
@@ -524,13 +529,24 @@ type ConfigSyncer interface {
 	Sync(ctx context.Context, dryRun bool) (changed []string, err error)
 }
 
+// configCheckTimeout is how long a check waits for the leader. The check backs `supavise status` and
+// `converge --check`, which must not stall on a leader that is down; the apply, which has the root
+// command's patience, keeps its own longer limit. A variable so that a test can shorten it.
+var configCheckTimeout = 5 * time.Second
+
 func configSyncStep(o Options) Step {
 	return &funcStep{
 		id: "config-d", title: titleConfigD, root: true,
+		// A leader that cannot be reached is no reason to fail a host: the settings stay as they are
+		// and the step says so (an upgrade that failed on it would roll the node back for the sake of
+		// a copy of the leader's settings). The check reports such a step as not checked, not as in
+		// order, and not as pending: applying it would change nothing that is known.
 		check: func(ctx context.Context) (Pending, error) {
+			ctx, cancel := context.WithTimeout(ctx, configCheckTimeout)
+			defer cancel()
 			changed, err := o.ConfigSync.Sync(ctx, true)
 			if err != nil {
-				return Pending{}, err
+				return Pending{Unknown: true, Detail: "could not compare with the leader's cluster settings: " + err.Error()}, nil
 			}
 			sort.Strings(changed)
 			return Pending{Pending: len(changed) > 0, Detail: strings.Join(changed, ", ")}, nil
@@ -538,11 +554,15 @@ func configSyncStep(o Options) Step {
 		apply: func(ctx context.Context) (Outcome, error) {
 			changed, err := o.ConfigSync.Sync(ctx, false)
 			var out Outcome
+			if err != nil {
+				out.Warnings = append(out.Warnings, "the cluster settings were not refreshed: "+err.Error())
+				return out, nil
+			}
 			for _, f := range changed {
 				out.Changed = append(out.Changed, "wrote "+f)
 			}
 			out.Files = changed
-			return out, err
+			return out, nil
 		},
 	}
 }

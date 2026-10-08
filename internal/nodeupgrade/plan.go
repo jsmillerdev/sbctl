@@ -68,6 +68,8 @@ type Plan struct {
 	Refusal string
 
 	Target *Info
+	// cluster is the node's view of its cluster, kept for the notes.
+	cluster *ClusterView
 }
 
 // SkippedProject is a project the upgrade leaves alone.
@@ -106,9 +108,19 @@ func (p *Plan) NodeChanges() bool {
 
 // Rollout reports whether the plan runs the project rollout: a project to move, a project whose
 // held-back restart is owed, or a new binary (which can render any project's files differently).
+// A follower never runs it: the rollout opens the registry for writing, which a follower cannot,
+// and a follower with a project of its own running has a plan that is refused (followerRefusal), so
+// the one that is not has no project for the rollout to move or restart.
 func (p *Plan) Rollout() bool {
+	if p.follower() {
+		return false
+	}
 	return p.BinaryChange || len(p.Upgrade) > 0 || len(p.Pending) > 0
 }
+
+// follower reports whether the plan is for a server of a cluster that does not lead: its system
+// cluster is a standby of the leader's, so its registry is a copy it only reads.
+func (p *Plan) follower() bool { return p.cluster != nil && !p.cluster.Leader }
 
 // projectServices are the services of a project in the order they are listed.
 var projectServices = []string{config.SvcGoTrue, config.SvcPostgREST, config.SvcPostgres}
@@ -116,7 +128,7 @@ var projectServices = []string{config.SvcGoTrue, config.SvcPostgREST, config.Svc
 // BuildPlan computes what moving n onto the release described by to does.
 func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 	p := &Plan{From: n.Version, To: to.Version, BinaryChange: n.Version != to.Version, IncludePostgres: o.IncludePostgres,
-		Canary: o.Canary, Batch: o.Batch, Target: to, ProjectTarget: map[string]string{}}
+		Canary: o.Canary, Batch: o.Batch, Target: to, ProjectTarget: map[string]string{}, cluster: n.Cluster}
 	if c, ok := selfupdate.Compare(to.Version, n.Version); ok && c < 0 {
 		p.Refusal = fmt.Sprintf("%s is older than the installed %s; `supavise rollback` goes back to the previous release", to.Version, n.Version)
 		return p
@@ -175,6 +187,12 @@ func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 		p.Upgrade = append(p.Upgrade, pr.Ref)
 	}
 	sort.Strings(p.Upgrade)
+	if to.WALIncompatible && n.Cluster != nil && p.movesPostgres(n) {
+		if behind := n.Cluster.Behind(to.Version); len(behind) > 0 {
+			p.Refusal = walOrderRefusal(to.Version, behind)
+			return p
+		}
+	}
 	moving := map[string]bool{}
 	for _, ref := range p.Upgrade {
 		moving[ref] = true
@@ -194,8 +212,77 @@ func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 	if n.Infra != nil && n.Infra.Platform != "" && to.InfraRevision > 0 {
 		p.Stack = &StackGap{Report: *n.Infra, Need: to.InfraRevision}
 	}
+	if why := p.followerRefusal(n); why != "" {
+		p.Refusal = why
+		return p
+	}
 	p.describe()
 	return p
+}
+
+// followerRefusal is why a follower does not upgrade while a project of its own runs, or "". The
+// commands the upgrade runs for such a project (its base backup, its rollout, the restart of its
+// services) open the registry for writing through the socket of the system cluster's primary, which
+// a follower does not have: its system cluster is a standby, on the replica port. Left to run, the
+// upgrade would fail after the binary was swapped and the daemon restarted, and go back. A plan
+// with nothing to change on the node, and a follower with no running project (the usual one: it
+// holds replicas, which belong to the leader's projects), go ahead, and neither runs the rollout.
+func (p *Plan) followerRefusal(n *Node) string {
+	if !p.follower() || !p.NodeChanges() {
+		return ""
+	}
+	refs := BackupRefs(n)
+	if len(refs) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("this server follows the leader of its cluster, so its registry is the leader's copy and it cannot write it, and the backup, the upgrade and the restart of a project need a registry it can write. %d project(s) run here: %s. Move them to the server that leads, or pause them, and run the upgrade again; on the leader, `supavise projects failover <ref>` moves a project's primary to the server that holds its replica. Nothing was changed",
+		len(refs), refList(refs))
+}
+
+// movesPostgres reports whether the upgrade changes a PostgreSQL release that runs on this node:
+// the system cluster's, or a project's when the projects' PostgreSQL moves too.
+func (p *Plan) movesPostgres(n *Node) bool {
+	for _, m := range p.System {
+		if m.Service == config.SvcPostgres {
+			return true
+		}
+	}
+	if t := p.ProjectTarget[config.SvcPostgres]; t != "" {
+		for _, ref := range p.Upgrade {
+			for _, pr := range n.UserProjects() {
+				if pr.Ref == ref && pr.Effective(config.SvcPostgres, n.Pins) != t {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// walOrderRefusal is why a release whose PostgreSQL keeps no WAL compatibility waits for the nodes
+// that hold standbys: a standby reads the WAL of a primary on the same or an older release, so the
+// standbys are upgraded first.
+func walOrderRefusal(version string, behind []Standby) string {
+	var parts []string
+	for _, b := range behind {
+		who := b.Node
+		if b.Name != "" && b.Name != b.Node {
+			who += " (" + b.Name + ")"
+		}
+		running := b.Version
+		if running == "" {
+			running = "an unknown release"
+		}
+		parts = append(parts, fmt.Sprintf("%s runs %s and holds standbys of %s", who, running, standbyRefs(b.Refs)))
+	}
+	return fmt.Sprintf("%s changes PostgreSQL in a way a standby on an older release cannot follow (the release manifest says wal_compat: false), so the servers that hold standbys of this server's databases are upgraded first: %s. Run `sudo supavise upgrade` on each of them, then here. A project's primary moves to another server with `supavise projects failover`, if two servers hold standbys of each other's databases", version, strings.Join(parts, "; "))
+}
+
+func standbyRefs(refs []string) string {
+	if len(refs) == 0 {
+		return "the system cluster"
+	}
+	return refList(refs)
 }
 
 // skipReason says why a project is not upgraded now, or "" when it is.
@@ -279,6 +366,9 @@ func (p *Plan) describe() {
 	if p.HeldBack > 0 {
 		p.Notes = append(p.Notes, fmt.Sprintf("%d project(s) keep their PostgreSQL release (the release pins %s); pass --include-postgres to move them, each restarts PostgreSQL", p.HeldBack, short(config.SvcPostgres, p.HeldTo)))
 	}
+	if c := p.cluster; c != nil && len(c.Elsewhere) > 0 {
+		p.Notes = append(p.Notes, fmt.Sprintf("%d project(s) are homed on other servers of the cluster (%s): each server upgrades the projects it runs, and takes their backups, so run `sudo supavise upgrade` on those servers too", len(c.Elsewhere), refList(c.Elsewhere)))
+	}
 	if len(p.NewMigrations) > 0 {
 		p.Notes = append(p.Notes, fmt.Sprintf("the release adds %d registry migration(s) (%s). The new daemon applies them when it starts, and migrations only go forward: from then on the node cannot go back to the previous release by itself, and `supavise rollback` is refused until the system cluster is restored by hand from its pre-upgrade backup (internal/backup/README.md, \"Disaster recovery of the system cluster\")", len(p.NewMigrations), refList(p.NewMigrations)))
 	}
@@ -288,6 +378,9 @@ func (p *Plan) describe() {
 			when = "after the backups"
 		}
 		p.Notes = append(p.Notes, fmt.Sprintf("the host layer (`supavise system converge`, revision %d -> %d) runs %s; it restarts no project, and a failure of it fails the upgrade and rolls it back", p.HostFrom, p.HostTo, when))
+	}
+	if p.HostPending && !p.BinaryChange && len(p.Shared) == 0 && len(p.System) == 0 && len(p.Upgrade) == 0 && len(p.Pending) == 0 {
+		p.Notes = append(p.Notes, "only the host layer changes, and it touches no data: `sudo supavise system converge` does it alone, without the base backups that this upgrade takes first")
 	}
 	if p.StackPending() {
 		p.Notes = append(p.Notes, "the AWS stack is changed only by `sudo -E supavise upgrade --aws`, with your own AWS credentials: this node's instance role has no right to change it. Everything else in this plan can go ahead without it, and the new features that need the stack stay off until it is updated")
@@ -303,12 +396,21 @@ func (p *Plan) describe() {
 		back = "If the new daemon fails before it applies the migrations, the node goes back to the previous release by itself; after that it stays on the new binary, the projects this run moved are put back, and the node needs you."
 	}
 	if p.NodeChanges() {
-		p.Notes = append(p.Notes, "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "+back)
+		taken := "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "
+		if p.follower() {
+			// The refusal leaves a follower with no running project, and the leader backs up the system project.
+			taken = "No base backup is taken here: the leader takes the system project's, and no project runs on this server. "
+		}
+		p.Notes = append(p.Notes, taken+back)
 	}
 	if p.BinaryChange {
 		p.Notes = append(p.Notes, "The new daemon restarts any shared service whose files it renders differently, whether or not the service's release moves, so a service this list does not name can restart too; if that is Supavisor, every pooled connection drops, and if it is Realtime, every websocket drops. The files are rendered by the new binary, so this list cannot name those services before the upgrade.")
-		p.Notes = append(p.Notes, "A project whose PostgreSQL, GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order (a PostgreSQL restart drops the project's database connections and restarts its GoTrue and PostgREST with it); the files are rendered by the new binary, so this list cannot name those projects before the upgrade. That restart also applies PostgreSQL settings an Owner saved without restarting; a project with only such a setting waiting is not restarted for it.")
-		p.Notes = append(p.Notes, "Going back to the previous release, by itself after a failed rollout or with `supavise rollback`, restarts every project whose PostgreSQL, GoTrue or PostgREST files the rollout had already restarted onto the new release's files (the projects it never reached keep running), one after another when the old daemon starts and outside the canary and batches; each such restart drops that project's database connections. A previous release built without the held-back-restart marks restarts every project whose files the two releases render differently.")
+		if p.follower() {
+			p.Notes = append(p.Notes, "This server follows the leader and runs no project of its own, so the rollout of projects does not run here and no project restarts.")
+		} else {
+			p.Notes = append(p.Notes, "A project whose PostgreSQL, GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order (a PostgreSQL restart drops the project's database connections and restarts its GoTrue and PostgREST with it); the files are rendered by the new binary, so this list cannot name those projects before the upgrade. That restart also applies PostgreSQL settings an Owner saved without restarting; a project with only such a setting waiting is not restarted for it.")
+			p.Notes = append(p.Notes, "Going back to the previous release, by itself after a failed rollout or with `supavise rollback`, restarts every project whose PostgreSQL, GoTrue or PostgREST files the rollout had already restarted onto the new release's files (the projects it never reached keep running), one after another when the old daemon starts and outside the canary and batches; each such restart drops that project's database connections. A previous release built without the held-back-restart marks restarts every project whose files the two releases render differently.")
+		}
 		p.Notes = append(p.Notes, "The system PostgreSQL cluster restarts when the daemon starts if the new release renders its files differently, even when its release does not move. The registry, the dashboard's sign-in and the Management API are unavailable for some seconds then; this is not part of the rollout.")
 	}
 }
@@ -354,7 +456,7 @@ func (p *Plan) Render(w io.Writer) {
 		}
 		// A new binary can render a project's files differently, and the notes below say so; the line
 		// is for a run whose only work is the host and the registry.
-		if len(p.Upgrade) == 0 && len(p.Pending) == 0 && !p.BinaryChange {
+		if len(p.Upgrade) == 0 && len(p.Pending) == 0 && (!p.BinaryChange || p.follower()) {
 			fmt.Fprintln(w, "Projects restarted: none expected")
 		}
 	}
@@ -404,8 +506,9 @@ func (g *StackGap) render(w io.Writer) {
 	fmt.Fprintf(w, "  Fix: %s\n", fix)
 }
 
-// BackupRefs lists the projects the upgrade backs up first: the system project (the registry) and
-// every project whose database runs. A paused project's data does not change.
+// BackupRefs lists the projects the upgrade backs up first: the system project (the registry, on
+// the node that leads) and every project homed on the node whose database runs. A paused project's
+// data does not change.
 func BackupRefs(n *Node) []string {
 	var rest []string
 	for _, pr := range n.UserProjects() {
@@ -414,6 +517,11 @@ func BackupRefs(n *Node) []string {
 		}
 	}
 	sort.Strings(rest)
+	if n.Cluster != nil && !n.Cluster.Leader {
+		// The system cluster of a follower is a standby of the leader's: its base backup is the
+		// leader's to take, and a standby has no data of its own to back up.
+		return rest
+	}
 	return append([]string{config.SystemRef}, rest...)
 }
 

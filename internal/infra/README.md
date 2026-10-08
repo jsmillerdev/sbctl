@@ -1,6 +1,6 @@
 # internal/infra
 
-What the cloud stack of a node lacks for the release the node runs. On AWS a node was made by a CloudFormation stack, and each release needs the stack at some infrastructure revision. `Gap` compares the two and says what is missing and which command closes the gap. The node learns its revision from its own instance tags, through the instance metadata service, so it needs no IAM permission and makes no call to AWS.
+What the cloud stack of a node lacks for the release the node runs. On AWS a node was made by a CloudFormation stack, and each release needs the stack at some infrastructure revision. `Gap` compares the two and says what is missing and which command closes the gap. The node learns its revision from its own instance tags, through the instance metadata service, so it needs no IAM permission and makes no call to AWS. The read takes no credentials either, so it never asks for the instance role (`awsapi.Config.NoInstanceRole`) and ignores `AWS_EC2_METADATA_DISABLED`, which an operator sets so that no tool takes the role.
 
 ```go
 r, err := infra.Gap(ctx)     // the zero Report off AWS; an error when the node could not tell
@@ -23,7 +23,7 @@ A report that is not behind writes nothing. The fix names the stack (`--stack-na
 
 ## Revisions
 
-`Current` is the revision this release needs. The template that the release ships, `deploy/cloudformation/supavise.yaml`, is at that revision: its output `InfraRevision` and the `supavise:infra` tag of its instance say so, a test keeps the three equal, and `deploy/releasetool` refuses a template at another revision when it writes the manifest.
+`Current` is the revision this release needs. `Revision` (`contract.go`, the name `supavise release-info` and the manifest's `aws.stack_revision` used first) is the same constant, so the two cannot be raised apart; `deploy/releasetool` also compares the `infra_revision` of the binary it is given with the template's and writes no manifest when they differ. The template that the release ships, `deploy/cloudformation/supavise.yaml`, is at that revision: its output `InfraRevision` and the `supavise:infra` tag of its instance say so, a test keeps the three equal, and `deploy/releasetool` refuses a template at another revision when it writes the manifest.
 
 | Revision | Stack | Capabilities it adds |
 |---|---|---|

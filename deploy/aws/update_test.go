@@ -854,6 +854,47 @@ func TestUpdateOnTheNode(t *testing.T) {
 	}
 }
 
+// A region from the environment (sudo -E keeps the operator's) does not send the update of the
+// node's own stack to the wrong place: the node's tags say where the stack is. A region given with
+// --region is taken as it is.
+func TestUpdateOnTheNodePrefersItsOwnRegionToTheEnvironment(t *testing.T) {
+	f := newUpdFake(t)
+	f.copy("stack-rev2.json", "stack.json")
+	srv := imdsServer(t, "i-0123456789abcdef0", "us-east-1", "supavise")
+	r := f.run([]string{"SUPAVISE_IMDS_ENDPOINT=" + srv.URL, "AWS_DEFAULT_REGION=eu-west-1"}, "update", "--template", smallTemplate(t), "--yes")
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "the environment says region eu-west-1, but this node's stack supavise is in us-east-1") {
+		t.Errorf("stdout lacks the note:\n%s", r.stdout)
+	}
+	for _, l := range f.calls() {
+		if !strings.HasPrefix(l, "--region us-east-1 ") {
+			t.Errorf("a call in the wrong region: %s", l)
+		}
+	}
+
+	// --region is the operator's word.
+	f = newUpdFake(t)
+	f.copy("stack-rev2.json", "stack.json")
+	r = f.run([]string{"SUPAVISE_IMDS_ENDPOINT=" + srv.URL, "AWS_DEFAULT_REGION=eu-west-1"}, "update", "--region", "ap-south-1", "--template", smallTemplate(t), "--yes")
+	if r.code != 0 || strings.Contains(r.stdout, "the environment says") {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	if got := f.calls(); len(got) == 0 || !strings.HasPrefix(got[0], "--region ap-south-1 ") {
+		t.Errorf("--region not used: %v", got)
+	}
+
+	// Another stack's tag is no reason to move: the environment's region stands.
+	f = newUpdFake(t)
+	f.copy("stack-rev2.json", "stack.json")
+	srv = imdsServer(t, "i-0aaaaaaaaaaaaaaaa", "us-east-1", "")
+	r = f.run([]string{"SUPAVISE_IMDS_ENDPOINT=" + srv.URL, "AWS_REGION=eu-west-1"}, "update", "--stack", "supavise", "--template", smallTemplate(t), "--yes")
+	if r.code != 0 || strings.Contains(r.stdout, "the environment says") {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+}
+
 // ---- the verified download ------------------------------------------------------------------
 
 // needOpenSSL skips a test when no OpenSSL here can verify ed25519, like the script itself.
@@ -1341,7 +1382,7 @@ func TestNewCommandDryRuns(t *testing.T) {
 
 func TestHelpListsTheNewCommands(t *testing.T) {
 	r := run(t, bashes(t)[0], "", nil, "--help")
-	for _, want := range []string{"update  --stack NAME", "status  --stack NAME", "replica --leader-stack NAME", "--allow-risky", "--set NAME=VALUE", "Exit status of update, status and replica"} {
+	for _, want := range []string{"update  --stack NAME", "status  --stack NAME", "replica --leader-stack NAME", "--allow-risky", "--set NAME=VALUE", "purge   --region REGION --stack-name NAME", "--purge ", "Exit status of update, status, replica and purge"} {
 		if !strings.Contains(r.stdout, want) {
 			t.Errorf("--help lacks %q", want)
 		}

@@ -65,6 +65,42 @@ func TestParseManifestRefusals(t *testing.T) {
 	}
 }
 
+// min_peer_from and wal_compat are optional: a manifest without them reads as before, a bad
+// min_peer_from is refused like a bad min_upgrade_from, and wal_compat false survives a round trip
+// (omitempty on a bool would drop it).
+func TestManifestPeerAndWALFields(t *testing.T) {
+	m, err := ParseManifest([]byte(`{"schema":1,"version":"v1.4.0","min_upgrade_from":"v1.2.0"}`))
+	if err != nil || !m.WALCompatible() || m.MinPeerFrom != "" {
+		t.Fatalf("a manifest without the fields: %+v %v", m, err)
+	}
+	for name, body := range map[string]string{
+		"bad peer":   `{"schema":1,"version":"v1.4.0","min_upgrade_from":"v1.2.0","min_peer_from":"1.3"}`,
+		"newer peer": `{"schema":1,"version":"v1.4.0","min_upgrade_from":"v1.2.0","min_peer_from":"v1.5.0"}`,
+	} {
+		if _, err := ParseManifest([]byte(body)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	no := false
+	out := &Manifest{Schema: 1, Version: "v1.4.0", MinUpgradeFrom: "v1.2.0", MinPeerFrom: "v1.4.0", WALCompat: &no}
+	b, err := out.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"wal_compat": false`) || !strings.Contains(string(b), `"min_peer_from": "v1.4.0"`) {
+		t.Errorf("fields lost:\n%s", b)
+	}
+	got, err := ParseManifest(b)
+	if err != nil || got.WALCompatible() || got.MinPeerFrom != "v1.4.0" {
+		t.Errorf("round trip: %+v %v", got, err)
+	}
+	yes := true
+	b, _ = (&Manifest{Schema: 1, Version: "v1.4.0", MinUpgradeFrom: "v1.2.0", WALCompat: &yes}).Marshal()
+	if g, err := ParseManifest(b); err != nil || !g.WALCompatible() {
+		t.Errorf("wal_compat true: %+v %v", g, err)
+	}
+}
+
 func TestCheckUpgradeFrom(t *testing.T) {
 	m := &Manifest{Schema: 1, Version: "v2.0.0", MinUpgradeFrom: "v1.2.0"}
 	for _, c := range []struct {

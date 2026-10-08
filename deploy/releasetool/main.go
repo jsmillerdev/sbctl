@@ -4,7 +4,7 @@
 // .github/workflows/bump-proposals.yml call it; it reads and writes files, runs a built binary's
 // release-info when the manifest is given one, and never touches the network.
 //
-//	releasetool manifest -version v1.4.0 -min-upgrade-from v1.2.0 [-versions FILE] [-binary FILE] [-template FILE] [-out FILE]
+//	releasetool manifest -version v1.4.0 -min-upgrade-from v1.2.0 [-min-peer-from v1.3.0] [-wal-compat=false] [-versions FILE] [-binary FILE [-require-converge]] [-template FILE] [-out FILE]
 //	releasetool notes    -tag v1.4.0 [-prev-tag v1.3.0] -repo owner/name -new FILE [-old FILE] [-log FILE] [-min-upgrade-from v1.2.0]
 //	releasetool bump     -versions FILE -service auth -to auth-v2.196.0-r0
 //	releasetool table    -old FILE -new FILE        (the service version table alone, for a pull request)
@@ -73,7 +73,10 @@ func cmdManifest(args []string) error {
 	min := fs.String("min-upgrade-from", "", "the oldest installed version that upgrades straight to this release")
 	versions := fs.String("versions", "internal/versions/versions.yaml", "the pin file of this release")
 	binary := fs.String("binary", "", "a built supavise binary that can run here: its release-info names the host converge revision (without it the manifest says 0)")
-	template := fs.String("template", "", "the CloudFormation template as attached to the release: the manifest names its stack revision, asset and SHA-256")
+	requireConverge := fs.Bool("require-converge", false, "refuse to write the manifest when the binary does not report its converge revision (a release must: the host-not-converged gating reads it)")
+	template := fs.String("template", "", "the CloudFormation template as attached to the release: the manifest names its stack revision, asset and SHA-256; with -binary the two must agree on the stack revision")
+	minPeer := fs.String("min-peer-from", "", "the oldest release a joined server may run alongside this one (min_peer_from; empty leaves the field out)")
+	walCompat := fs.Bool("wal-compat", true, "false when this release's PostgreSQL cannot read the WAL of the releases before it, so that the servers holding standbys must upgrade first (wal_compat)")
 	out := fs.String("out", "-", "output file")
 	_ = fs.Parse(args)
 	v, err := readVersions(*versions)
@@ -81,17 +84,29 @@ func cmdManifest(args []string) error {
 		return err
 	}
 	m := &selfupdate.Manifest{Schema: selfupdate.ManifestSchema, Version: *version, MinUpgradeFrom: *min,
-		Artifacts: v.Artifacts, Studio: v.Studio.Tag}
+		MinPeerFrom: *minPeer, Artifacts: v.Artifacts, Studio: v.Studio.Tag}
+	if !*walCompat {
+		m.WALCompat = walCompat
+	}
+	var built probed
 	if *binary != "" {
-		rev, why := convergeRevision(*binary)
-		if why != "" {
-			fmt.Fprintln(os.Stderr, "releasetool: warning:", why)
+		built = probe(*binary)
+		if built.Why != "" {
+			if *requireConverge {
+				return fmt.Errorf("%s (a release must say which host layer its binary expects; build the binary from a tree that has `supavise release-info` report converge_revision)", built.Why)
+			}
+			fmt.Fprintln(os.Stderr, "releasetool: warning:", built.Why)
 		}
-		m.Host = &selfupdate.ManifestHost{ConvergeRevision: rev}
+		m.Host = &selfupdate.ManifestHost{ConvergeRevision: built.Converge}
 	}
 	if *template != "" {
 		if m.AWS, err = awsOf(*template); err != nil {
 			return err
+		}
+		// The binary and the template are one release: a binary built before the template's revision
+		// was raised (or the other way round) would be refused by every node that stages it.
+		if built.HasStack && built.Stack != m.AWS.StackRevision {
+			return fmt.Errorf("the binary %s reports stack revision %d (infra_revision) and %s is at revision %d: they are not of one release", *binary, built.Stack, *template, m.AWS.StackRevision)
 		}
 	}
 	b, err := m.Marshal()

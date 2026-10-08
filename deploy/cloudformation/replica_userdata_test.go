@@ -38,7 +38,7 @@ done
 case "$url" in
   *checkip.amazonaws.com) if [ -n "$out" ] && [ "$out" != /dev/null ]; then echo 203.0.113.9 > "$out"; elif [ -z "$out" ]; then echo 203.0.113.9; fi ;;
   file://*) cp "${url#file://}" "$out" ;;
-  https://handle.example/signal) echo "$data" >> "$STUB_DIR/signals.log" ;;
+  https://handle.example/signal) echo "$data" >> "$STUB_DIR/signals.log"; echo signal >> "$STUB_DIR/order.log" ;;
 esac
 `
 
@@ -52,11 +52,13 @@ for a in "$@"; do
   fi
   prev=$a
 done
+echo "installer returned" >> "$STUB_DIR/order.log"
 exit "${INSTALL_RC-0}"
 `
 
 type stubRun struct {
 	signals, args, token, mode, out string
+	order                           string
 	installed                       bool
 	tokenRead                       bool
 	rc                              int
@@ -146,7 +148,7 @@ func runReplicaUserData(t *testing.T, tamper func(rel string, pub ed25519.Public
 		return strings.TrimSpace(string(b))
 	}
 	_, tokErr := os.Stat(filepath.Join(root, "join-token"))
-	return stubRun{signals: read("signals.log"), args: read("install.args"), token: read("install.token"), mode: read("install.tokenmode"),
+	return stubRun{order: read("order.log"), signals: read("signals.log"), args: read("install.args"), token: read("install.token"), mode: read("install.tokenmode"),
 		out: string(out), installed: read("install.args") != "", tokenRead: tokErr == nil || read("install.token") != "", rc: rc}
 }
 
@@ -161,6 +163,12 @@ func TestReplicaUserDataRunsTheVerifiedInstaller(t *testing.T) {
 		if !strings.Contains(root, want) {
 			t.Errorf("the installer was run with %q, lacks %q", root, want)
 		}
+	}
+	// The stack is told it succeeded only after the installer has returned, and the installer's join
+	// is synchronous (cluster.Join returns once the standby streams and the leader has confirmed it):
+	// a stack that reports success has a node that is active in `supavise node ls`.
+	if r.order != "installer returned\nsignal" {
+		t.Errorf("order of events: %q", r.order)
 	}
 	// The token reached the installer through the file, and the file is private.
 	if r.token != "svj1.TESTTOKEN" || r.mode != "600" {
