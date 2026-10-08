@@ -77,17 +77,3 @@ func TestIdentifierCollisionIsRetried(t *testing.T) {
 		t.Fatalf("identifier %q", got)
 	}
 }
-
-func TestRandomIdentifiersAreValid(t *testing.T) {
-	seen := map[string]bool{}
-	for range 200 {
-		id := registry.ReplicaIdentifier(refA, "eu-west-1", randomID6())
-		if !registry.ValidReplicaIdentifier(id) {
-			t.Fatalf("invalid identifier %q", id)
-		}
-		seen[id] = true
-	}
-	if len(seen) < 190 {
-		t.Fatalf("only %d different identifiers in 200 draws", len(seen))
-	}
-}

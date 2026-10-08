@@ -15,6 +15,7 @@ import (
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
 
 const (
@@ -372,6 +373,20 @@ func (e *env) replica(ref, node string) registry.Replica {
 	}
 	e.t.Fatalf("no replica of %s on %s (have %+v)", ref, node, rs)
 	return registry.Replica{}
+}
+
+// systemReplica records the standby of the system cluster on node, as the cluster join does.
+func (e *env) systemReplica(node string) *registry.Replica {
+	e.t.Helper()
+	n, err := e.reg.GetNode(e.ctx, node)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	r, err := replicaid.EnsureSystem(e.ctx, e.reg, *n, nil)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return r
 }
 
 func (e *env) hasReplica(ref, node string) bool {

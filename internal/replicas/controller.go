@@ -2,7 +2,6 @@ package replicas
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"log/slog"
 	"sync"
@@ -372,38 +371,6 @@ func (c *Controller) HandleReport(ctx context.Context, rep peerapi.Report) {
 		c.observed(r.Identifier, st)
 	}
 	c.kick()
-}
-
-// Identifiers are made of the project, the node's region and six random characters.
-func (c *Controller) newIdentifier(ref string, n registry.Node) string {
-	id6 := ""
-	if c.o.NewID != nil {
-		id6 = c.o.NewID()
-	} else {
-		id6 = randomID6()
-	}
-	return registry.ReplicaIdentifier(ref, nodeRegion(n), id6)
-}
-
-const id6Alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-
-func randomID6() string {
-	var b [6]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // the system's random source is gone
-	}
-	for i := range b {
-		b[i] = id6Alphabet[int(b[i])%len(id6Alphabet)]
-	}
-	return string(b[:])
-}
-
-// nodeRegion is the region of a node's replicas; a node that names none is in the default region.
-func nodeRegion(n registry.Node) string {
-	if n.Region != "" {
-		return n.Region
-	}
-	return config.DefaultRegion
 }
 
 // nodeLabel is how a message names a node: the operator's name for it.

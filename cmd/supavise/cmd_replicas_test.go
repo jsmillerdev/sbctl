@@ -167,3 +167,17 @@ func TestReplicasWriteOnAFollower(t *testing.T) {
 		t.Fatal("another error must pass through")
 	}
 }
+
+// A node that names no region is in the default one, for --node as for the service.
+func TestReplicasAddNodeWithoutRegion(t *testing.T) {
+	reg, _ := replicaTestEnv(t)
+	if err := reg.CreateNode(context.Background(), &registry.Node{ID: "n4", Name: "bare", State: registry.NodeActive}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, "replicas", "add", replicaTestRef, "--region", "eu-west-1", "--node", "bare"); err == nil || !strings.Contains(err.Error(), "node bare is in us-east-1, not in eu-west-1") {
+		t.Fatalf("add with the wrong region: %v", err)
+	}
+	if out, err := run(t, "replicas", "add", replicaTestRef, "--region", config.DefaultRegion, "--node", "bare"); err != nil || !strings.Contains(out, "on node n4") {
+		t.Fatalf("add --node: %q %v", out, err)
+	}
+}

@@ -16,6 +16,7 @@ import (
 
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
+	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
 
 // replicasEnv is what the `supavise replicas` commands work with: the replica service over the
@@ -202,8 +203,8 @@ func addReplica(ctx context.Context, w io.Writer, re *replicasEnv, ref, region, 
 			return lerr
 		}
 		i := slices.IndexFunc(nodes, func(n registry.Node) bool { return n.ID == node || n.Name == node })
-		if i >= 0 && nodes[i].Region != region {
-			return fmt.Errorf("node %s is in %s, not in %s", node, nodes[i].Region, region)
+		if i >= 0 && replicaid.Region(nodes[i]) != region {
+			return fmt.Errorf("node %s is in %s, not in %s", node, replicaid.Region(nodes[i]), region)
 		}
 		err = re.svc.SetupOn(ctx, ref, node)
 	}

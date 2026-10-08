@@ -9,6 +9,7 @@ import (
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
 
 // The refusals of a setup request (design 2.7.2). The Management API returns the text as a 400
@@ -36,7 +37,7 @@ func (c *Controller) Setup(ctx context.Context, ref, region string) error {
 	}
 	var inRegion []registry.Node
 	for _, n := range nodes {
-		if n.State == registry.NodeActive && nodeRegion(n) == region {
+		if n.State == registry.NodeActive && replicaid.Region(n) == region {
 			inRegion = append(inRegion, n)
 		}
 	}
@@ -195,7 +196,7 @@ func (c *Controller) create(ctx context.Context, p *registry.Project, nodes []re
 			return refuse(msgNoCapacity, nodeLabel(target))
 		}
 	}
-	r, err := c.insert(ctx, p.Ref, target, registry.ReplicaManual)
+	r, err := replicaid.Create(ctx, c.reg, p.Ref, target, registry.ReplicaManual, c.o.NewID)
 	if err != nil {
 		if errors.Is(err, registry.ErrConflict) {
 			return refuse(msgHasReplica, nodeLabel(target))
@@ -209,20 +210,4 @@ func (c *Controller) create(ctx context.Context, p *registry.Project, nodes []re
 	c.log.Info("replicas: replica requested", "identifier", r.Identifier, "ref", p.Ref, "node", target.ID)
 	c.kick()
 	return nil
-}
-
-// insert writes a replica row for ref on node, retrying with another identifier when the six
-// random characters collide.
-func (c *Controller) insert(ctx context.Context, ref string, node registry.Node, origin string) (*registry.Replica, error) {
-	var err error
-	for range 5 {
-		r := &registry.Replica{Identifier: c.newIdentifier(ref, node), Ref: ref, NodeID: node.ID, Origin: origin}
-		if err = c.reg.CreateReplica(ctx, r); err == nil {
-			return r, nil
-		}
-		if _, e := c.reg.GetReplica(ctx, r.Identifier); e != nil {
-			return nil, err // not an identifier clash
-		}
-	}
-	return nil, err
 }

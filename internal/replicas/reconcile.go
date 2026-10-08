@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
 
 // reconcileDefaults makes [replicas] default = "all" true: every project that can be copied
@@ -49,7 +50,7 @@ func (c *Controller) reconcileDefaults(ctx context.Context, nodes []registry.Nod
 			if n.State != registry.NodeActive || n.ID == p.NodeID || skip[registry.ReplicaOptout{Ref: p.Ref, NodeID: n.ID}] {
 				continue
 			}
-			r, err := c.insert(ctx, p.Ref, n, registry.ReplicaDefault)
+			r, err := replicaid.Create(ctx, c.reg, p.Ref, n, registry.ReplicaDefault, c.o.NewID)
 			if err != nil {
 				c.log.Warn("replicas: default replica", "ref", p.Ref, "node", n.ID, "error", err)
 				continue

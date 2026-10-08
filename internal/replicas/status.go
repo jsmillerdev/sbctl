@@ -8,6 +8,7 @@ import (
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
 
 // Thresholds of the status mapping (design 2.7.7).
@@ -240,7 +241,7 @@ func (c *Controller) List(ctx context.Context, ref string) ([]Replica, error) {
 	out := make([]Replica, len(rows))
 	for i, r := range rows {
 		n := byID[r.NodeID]
-		out[i] = Replica{Replica: r, Region: nodeRegion(n), PublicHost: n.PublicHost}
+		out[i] = Replica{Replica: r, Region: replicaid.Region(n), PublicHost: n.PublicHost}
 	}
 	return out, nil
 }

@@ -153,10 +153,7 @@ func TestRemoveOnALeftNodeDeletesTheRow(t *testing.T) {
 // The system standby goes with its node.
 func TestRemoveRefusesTheSystemStandby(t *testing.T) {
 	e := newEnv(t)
-	r, err := CreateSystemReplica(e.ctx, e.reg, "n2")
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := e.systemReplica("n2")
 	if got := e.user(e.ctrl.Remove(e.ctx, "system", r.Identifier)); got != "The standby of the system cluster goes away with its server: use `supavise node rm`." {
 		t.Fatalf("refused with %q", got)
 	}
@@ -204,10 +201,7 @@ func TestRemoveAllAndRemoveOn(t *testing.T) {
 	}
 
 	// RemoveOn: node rm. The node's system standby goes too.
-	sys, err := CreateSystemReplica(e.ctx, e.reg, "n2")
-	if err != nil {
-		t.Fatal(err)
-	}
+	sys := e.systemReplica("n2")
 	e.settle(refB, "n2")
 	if err := e.ctrl.RemoveOn(e.ctx, "n2"); err != nil {
 		t.Fatal(err)
