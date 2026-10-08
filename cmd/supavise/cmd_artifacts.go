@@ -10,6 +10,7 @@ import (
 	"github.com/jsmillerdev/supavise/internal/artifacts"
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
 )
 
 var artifactsCmd = &cobra.Command{
@@ -105,7 +106,7 @@ var artifactsGCCmd = projectCmd("gc", "Remove artifacts that no project, pin or 
 		if keep <= 0 {
 			keep = n.Cfg.Upgrade.Keep()
 		}
-		gone, err := n.Engine.CollectArtifacts(cmd.Context(), keep, artifactsGCDry)
+		gone, err := n.Engine.CollectArtifacts(cmd.Context(), keep, artifactsGCDry, keptReleasePins(n.Cfg, keep)...)
 		verb := "removed"
 		if artifactsGCDry {
 			verb = "would remove"
@@ -118,6 +119,26 @@ var artifactsGCCmd = projectCmd("gc", "Remove artifacts that no project, pin or 
 		}
 		return err
 	})
+
+// keptReleasePins are the pins of the newest keep binaries that `supavise rollback` can go back to
+// (supavise upgrade keeps them in the releases directory, which is readable by everyone and
+// writable by root): their artifacts stay, whatever the daemon recorded in its history.
+func keptReleasePins(cfg *config.Config, keep int) []map[string]string {
+	recs, err := nodeupgrade.Releases{Dir: releasesDir(cfg.BinPath)}.List()
+	if err != nil {
+		return nil
+	}
+	var out []map[string]string
+	for _, r := range recs { // newest first
+		if len(out) >= keep {
+			break
+		}
+		if !r.Withdrawn {
+			out = append(out, r.Pins)
+		}
+	}
+	return out
+}
 
 // serviceOf maps a release name (auth, pooler) to the service name used in unit names.
 func serviceOf(name string) string {

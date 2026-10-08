@@ -317,7 +317,7 @@ func diskBytes(ctx context.Context, n *lifecycle.Node, ref string) int64 {
 // collectArtifacts removes the releases nothing runs any more. A failure only warns: the
 // upgrade is done.
 func collectArtifacts(cmd *cobra.Command, n *lifecycle.Node) {
-	gone, err := n.Engine.CollectArtifacts(cmd.Context(), n.Cfg.Upgrade.Keep(), false)
+	gone, err := n.Engine.CollectArtifacts(cmd.Context(), n.Cfg.Upgrade.Keep(), false, keptReleasePins(n.Cfg, n.Cfg.Upgrade.Keep())...)
 	for _, u := range gone {
 		fmt.Fprintf(cmd.OutOrStdout(), "removed the unused artifact %s %s\n", u.Name, u.Tag)
 	}

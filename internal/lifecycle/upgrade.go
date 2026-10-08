@@ -1026,8 +1026,10 @@ func (e *Engine) recoverUpgrade(ctx context.Context, ref string) (touched bool) 
 
 // CollectArtifacts removes the artifacts that nothing references: not the node's pins, not those
 // of the last keepReleases releases the node ran, and not any version a project runs or is being
-// upgraded to. dryRun lists them only. The artifact store must be an *artifacts.Store.
-func (e *Engine) CollectArtifacts(ctx context.Context, keepReleases int, dryRun bool) ([]artifacts.Unused, error) {
+// upgraded to. keep names more versions to keep, by service (the pins of the binaries `supavise
+// rollback` can go back to: a daemon that did not record its pins leaves no history). dryRun lists
+// them only. The artifact store must be an *artifacts.Store.
+func (e *Engine) CollectArtifacts(ctx context.Context, keepReleases int, dryRun bool, keep ...map[string]string) ([]artifacts.Unused, error) {
 	st, ok := e.arts.(interface {
 		KeepSet(int, []map[string]string) (map[string]bool, error)
 		GC(map[string]bool, bool) ([]artifacts.Unused, error)
@@ -1054,9 +1056,9 @@ func (e *Engine) CollectArtifacts(ctx context.Context, keepReleases int, dryRun 
 			used = append(used, u.To)
 		}
 	}
-	keep, err := st.KeepSet(keepReleases, used)
+	keepSet, err := st.KeepSet(keepReleases, append(used, keep...))
 	if err != nil {
 		return nil, err
 	}
-	return st.GC(keep, dryRun)
+	return st.GC(keepSet, dryRun)
 }

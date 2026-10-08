@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
 )
 
@@ -145,5 +148,34 @@ func TestParseStatusReport(t *testing.T) {
 	}
 	if v, _, _ := parseStatusReport([]byte(`{"summary":"x"}`)); v != nodeupgrade.VerdictUnknown {
 		t.Fatalf("a report with no verdict reads as %q", v)
+	}
+}
+
+// The artifacts of the binaries a rollback can go back to are not garbage, whether or not the
+// daemon that ran them recorded its pins.
+func TestKeptReleasePinsProtectTheArtifactsOfTheReleasesToRollBackTo(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.BinPath = filepath.Join(root, "bin", "supavise")
+	rel := nodeupgrade.Releases{Dir: releasesDir(cfg.BinPath)}
+	bin := filepath.Join(root, "b")
+	if err := os.WriteFile(bin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)
+	for i, v := range []string{"v1.0.0", "v1.1.0", "v1.2.0", "v1.3.0"} {
+		if _, err := rel.Keep(nodeupgrade.Record{Version: v, Pins: map[string]string{"gotrue": "auth-" + v}, InstalledAt: at.Add(time.Duration(i) * time.Hour)}, bin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := rel.Withdraw("v1.3.0"); err != nil { // rolled back from
+		t.Fatal(err)
+	}
+	got := keptReleasePins(cfg, 2)
+	if len(got) != 2 || got[0]["gotrue"] != "auth-v1.2.0" || got[1]["gotrue"] != "auth-v1.1.0" {
+		t.Fatalf("kept pins = %v: the newest two that are not withdrawn", got)
+	}
+	if got := keptReleasePins(&config.Config{BinPath: filepath.Join(t.TempDir(), "bin", "supavise")}, 3); len(got) != 0 {
+		t.Fatalf("a node that kept nothing: %v", got)
 	}
 }

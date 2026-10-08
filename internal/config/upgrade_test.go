@@ -36,3 +36,21 @@ func TestUpgradeSectionLoads(t *testing.T) {
 		t.Fatalf("upgrade = %+v (the environment overrides the file)", c.Upgrade)
 	}
 }
+
+// `supavise upgrade` hands the dashboard build of the new release to the artifact fetch through the
+// environment: the signed list names its URL and checksum, the config file is not rewritten.
+func TestStudioArtifactComesFromTheEnvironment(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(p, []byte("[studio]\nartifact_url = \"https://old.example/studio.tar.zst\"\nartifact_sha256 = \"aa\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUPAVISE_STUDIO_ARTIFACT_URL", "https://new.example/studio.tar.zst")
+	t.Setenv("SUPAVISE_STUDIO_ARTIFACT_SHA256", "bb")
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Studio.ArtifactURL != "https://new.example/studio.tar.zst" || c.Studio.ArtifactSHA256 != "bb" {
+		t.Fatalf("studio = %+v", c.Studio)
+	}
+}
