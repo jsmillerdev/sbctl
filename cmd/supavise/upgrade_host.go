@@ -705,12 +705,13 @@ func (h *nodeHost) Converge(ctx context.Context) error {
 }
 
 // infraReport is what the node knows of its AWS stack. A host that is not on EC2, or that cannot
-// answer, has none to report: a question that cannot be asked is not a reason to hold an upgrade.
+// answer in time (infraGapTimeout), has none to report: a question that cannot be asked is not a
+// reason to hold an upgrade or a rollback.
 func (h *nodeHost) infraReport(ctx context.Context) *infra.Report {
 	if !ec2Likely() {
 		return nil
 	}
-	r, err := infra.Gap(ctx)
+	r, err := infraGap(ctx)
 	if err != nil {
 		h.log.Debug("could not read the AWS stack's revision", "error", err)
 		return nil
