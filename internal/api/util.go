@@ -93,6 +93,11 @@ func pgVersion(p *registry.Project) string {
 	return "17.0.0"
 }
 
+// dbVersion is the project's database version as the project detail names it: hosted's
+// "supabase-postgres-17.11.0.004". Studio reads the major version after the prefix and counts a
+// bare number as below 15, which is the gate of its Add read replica button.
+func dbVersion(p *registry.Project) string { return "supabase-postgres-" + pgVersion(p) }
+
 // pgMajor is the major version of the project's Postgres.
 func pgMajor(p *registry.Project) int {
 	major, _, _ := strings.Cut(pgVersion(p), ".")
@@ -117,7 +122,8 @@ func (s *Server) projectURL(ref string) string {
 }
 
 // dbHost is the direct database host the CLI derives for a project
-// (db.<ref>.<project_host> with project_host = the API host).
+// (db.<ref>.<project_host> with project_host = the API host). A read replica's identifier is a
+// single label like a ref, so its host has the same shape.
 func (s *Server) dbHost(ref string) string { return "db." + s.cfg.ProjectHost(ref) }
 
 // projectKey is the stable numeric id Studio's types carry for a project.

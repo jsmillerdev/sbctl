@@ -38,15 +38,16 @@ func elem(key, prop string) map[string]any {
 }
 
 // connectionPlaceholder is the connectionString Studio requires to be non-empty
-// before it will call pg-meta. It carries no password: the pg-meta proxy ignores the
-// header Studio sends back and builds its own from the lifecycle manager.
+// before it will call pg-meta. It carries no password: the pg-meta proxy reads only the
+// host of the header Studio sends back, to know which database of the project the request
+// is for, and builds its own connection from the lifecycle manager.
 func (s *Server) connectionPlaceholder(p *registry.Project) string {
-	return fmt.Sprintf("postgresql://postgres:[YOUR-PASSWORD]@%s:%d/postgres", s.dbHost(p.Ref), s.cfg.Ports.SupavisorSession)
+	return s.dbString(p.Ref, "postgres")
 }
 
 func (s *Server) platformProject(p *registry.Project, org *registry.Organization) plat.ProjectDetailResponseOutput {
 	conn := s.connectionPlaceholder(p)
-	ver := pgVersion(p)
+	ver := dbVersion(p)
 	var parent *string
 	if p.Branch != nil {
 		parent = &p.Branch.ParentRef
@@ -54,7 +55,7 @@ func (s *Server) platformProject(p *registry.Project, org *registry.Organization
 	infra := plat.ProjectDetailResponseOutputInfraComputeSize(infraComputeSize(p))
 	return plat.ProjectDetailResponseOutput{
 		IsBranchEnabled: s.branches != nil, ParentProjectRef: parent,
-		CloudProvider: "AWS", ConnectionString: &conn, DbVersion: &ver, DbHost: s.dbHost(p.Ref),
+		CloudProvider: "AWS", ConnectionString: &conn, DbVersion: &ver, DbHost: s.dbHost(p.Ref), IsPhysicalBackupsEnabled: s.pitrEnabled(),
 		Id: projectNumID(p), InsertedAt: ts(p.CreatedAt), UpdatedAt: ts(p.UpdatedAt), InfraComputeSize: &infra,
 		Name: p.Name, OrganizationId: float32(org.ID), Ref: p.Ref, Region: s.regionOf(p),
 		RestUrl: s.projectURL(p.Ref) + "/rest/v1/", Status: plat.ProjectDetailResponseOutputStatus(p.Status),
@@ -130,7 +131,7 @@ func (s *Server) platformListProjects(w http.ResponseWriter, r *http.Request) er
 		row := elem("GET /platform/projects", "projects")
 		rows = append(rows, setAll(row, map[string]any{
 			"cloud_provider": "AWS", "id": projectNumID(p), "inserted_at": ts(p.CreatedAt), "is_branch_enabled": s.branches != nil,
-			"is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID, "organization_slug": org.Slug,
+			"is_physical_backups_enabled": s.pitrEnabled(), "name": p.Name, "organization_id": org.ID, "organization_slug": org.Slug,
 			"preview_branch_refs": s.branchRefs(all, p.Ref), "ref": p.Ref, "region": s.regionOf(p), "status": string(p.Status), "subscription_id": "supavise",
 			"infra_compute_size": infraComputeSize(p),
 		}))
@@ -175,7 +176,7 @@ func (s *Server) platformCreateProject(w http.ResponseWriter, r *http.Request) e
 	resp := base("POST /platform/projects")
 	setAll(resp, map[string]any{
 		"cloud_provider": "AWS", "endpoint": s.projectURL(p.Ref), "id": projectNumID(p), "inserted_at": ts(p.CreatedAt),
-		"is_branch_enabled": s.branches != nil, "is_physical_backups_enabled": false, "name": p.Name, "organization_id": org.ID,
+		"is_branch_enabled": s.branches != nil, "is_physical_backups_enabled": s.pitrEnabled(), "name": p.Name, "organization_id": org.ID,
 		"organization_slug": org.Slug, "preview_branch_refs": []string{}, "ref": p.Ref, "region": s.regionOf(p),
 		"status": string(p.Status), "subscription_id": "supavise",
 	})
@@ -217,6 +218,11 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 	mine = mine[offset:min(total, offset+limit)]
 	rows := make([]any, 0, len(mine))
 	const key = "GET /platform/organizations/{slug}/projects"
+	byRef, err := s.replicasByRef(r.Context(), mine)
+	if err != nil {
+		return err
+	}
+	var regions map[string]string // node regions, loaded when a project has a replica
 	for _, p := range mine {
 		row := elem(key, "projects")
 		db := map[string]any{}
@@ -228,8 +234,27 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 			db, _ = MinimalValue(item).(map[string]any)
 		}
 		setAll(db, map[string]any{"cloud_provider": "AWS", "identifier": p.Ref, "region": s.regionOf(&p), "status": string(p.Status), "type": "PRIMARY", "infra_compute_size": infraComputeSize(&p)})
+		dbs := []any{db}
+		reps := byRef[p.Ref]
+		if len(reps) > 0 && regions == nil {
+			if regions, err = s.nodeRegions(r.Context()); err != nil {
+				return err
+			}
+		}
+		for _, rep := range reps {
+			// A replica is the primary's element with its own identifier, region and status.
+			rdb := map[string]any{}
+			for k, v := range db {
+				rdb[k] = v
+			}
+			region := regions[rep.NodeID]
+			if region == "" {
+				region = s.regionOf(&p)
+			}
+			dbs = append(dbs, setAll(rdb, map[string]any{"identifier": rep.Identifier, "region": region, "status": rep.Status, "type": "READ_REPLICA"}))
+		}
 		setAll(row, map[string]any{
-			"cloud_provider": "AWS", "databases": []any{db}, "inserted_at": ts(p.CreatedAt), "integration_source": nil,
+			"cloud_provider": "AWS", "databases": dbs, "inserted_at": ts(p.CreatedAt), "integration_source": nil,
 			"is_branch": false, "name": p.Name, "ref": p.Ref, "region": s.regionOf(&p), "status": string(p.Status),
 		})
 		rows = append(rows, row)

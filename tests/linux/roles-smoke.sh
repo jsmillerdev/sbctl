@@ -13,6 +13,8 @@
 #   migrations, settings, keys, lifecycle; SQL fails in the database), a Developer writes SQL and
 #   migrations but not settings or secrets (nor a branch with data), an Administrator manages settings and members but not
 #   Owners, the last Owner cannot be demoted or removed;
+# - the pinned Postgres creates supabase_read_only_user, the user of the read-only connection string
+#   the databases listing hands Studio;
 # - the MCP server (apply_migration, execute_sql) and, when SUPABASE_CLI is set, the Supabase CLI
 #   (secrets set) list as Read-only and are refused writes; an Owner's can;
 # - [mail] reaches supavise-gotrue@system: an invitation to a new address (GoTrue invite) and to an
@@ -255,6 +257,9 @@ for q in "insert into public.roles_t values (2, 'b')" "update public.roles_t set
 done
 [[ $(sql "select count(*) from public.roles_t") == 1 && $(sql "select v from public.roles_t") == a ]] || fail "a read-only statement changed data"
 [[ $(sql "select to_regclass('public.ro_migration') is null") == t ]] || fail "a read-only migration ran"
+# The read-only connection string the databases listing hands Studio names hosted's read-only user
+# (the API never connects as it); the shipped Postgres creates it, with login, bypassrls and pg_read_all_data.
+[[ $(sql "select r.rolcanlogin and r.rolbypassrls and pg_has_role(r.oid, 'pg_read_all_data', 'member') from pg_roles r where r.rolname = 'supabase_read_only_user'") == t ]] || fail "supabase_read_only_user is missing, or lacks login, bypassrls or pg_read_all_data, in the pinned Postgres"
 # The login role the CLI uses for `db dump` is the read-only one, even when read-write is asked.
 LR=$(body "${PAT[ro]}" POST "$CFG/cli/login-role" '{"read_only":false}')
 [[ $(json_get 'd["role"].startswith("supavise_cli_ro_")' <<<"$LR") == True ]] || fail "read-only member got a read-write login role: $LR"

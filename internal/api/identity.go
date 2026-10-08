@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 
 	plat "github.com/supavise/supavise/internal/api/gen/platform"
@@ -16,10 +18,15 @@ import (
 // Keys are Studio's enabled-features keys (packages/common/enabled-features).
 var disabledFeatures = []string{
 	"billing:all", "database:replication", "database:restore_to_new_project", "database:network_restrictions",
-	"infrastructure:read_replicas", "integrations:vercel", "integrations:aws_private_link", "integrations:partners",
+	featureReadReplicas, "integrations:vercel", "integrations:aws_private_link", "integrations:partners",
 	"organization:show_sso_settings", "project_addons:dedicated_ipv4_address", "project_addons:show_compute_price",
 	"project_creation:show_high_availability", "project_settings:custom_domains", "project_settings:log_drains",
 }
+
+// featureReadReplicas is the key that hides Studio's read replica screens (the Infrastructure
+// page, the database selector, the replica rows of the reports). It stays in disabledFeatures
+// until a second server has joined (replicasOffered).
+const featureReadReplicas = "infrastructure:read_replicas"
 
 func (s *Server) routesProfile(add func(string, handlerFunc)) {
 	add("GET /v1/profile", s.v1Profile)
@@ -59,11 +66,11 @@ func (s *Server) platformProfile(w http.ResponseWriter, r *http.Request) error {
 	if r.Method == http.MethodPost {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, s.profileOf(u))
+	writeJSON(w, status, s.profileOf(r.Context(), u))
 	return nil
 }
 
-func (s *Server) profileOf(u *User) *plat.ProfileResponseOutput {
+func (s *Server) profileOf(ctx context.Context, u *User) *plat.ProfileResponseOutput {
 	opt := func(v string) *string {
 		if v == "" {
 			return nil
@@ -71,6 +78,9 @@ func (s *Server) profileOf(u *User) *plat.ProfileResponseOutput {
 		return &v
 	}
 	disabled := append([]string(nil), disabledFeatures...)
+	if s.replicasOffered(ctx) {
+		disabled = slices.DeleteFunc(disabled, func(f string) bool { return f == featureReadReplicas })
+	}
 	return &plat.ProfileResponseOutput{
 		Auth0Id: u.UserID, DisabledFeatures: &disabled, FirstName: opt(u.FirstName), LastName: opt(u.LastName),
 		GotrueId: u.UserID, Id: float32(u.ID), PrimaryEmail: u.Email, Username: u.Username,
@@ -102,7 +112,7 @@ func (s *Server) platformUpdateProfile(w http.ResponseWriter, r *http.Request) e
 	if err := s.store.UpdateUser(r.Context(), u); err != nil {
 		return mapErr(err)
 	}
-	writeJSON(w, http.StatusOK, s.profileOf(u))
+	writeJSON(w, http.StatusOK, s.profileOf(r.Context(), u))
 	return nil
 }
 

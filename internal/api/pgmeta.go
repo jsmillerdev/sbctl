@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -94,7 +97,13 @@ func (s *Server) pgmetaKey(ctx context.Context) (string, error) {
 // pgmetaConn builds the x-connection-encrypted header value for ref's database as
 // role (see Server.dsn for the roles and readOnly).
 func (s *Server) pgmetaConn(ctx context.Context, ref, role string, readOnly bool) (string, error) {
-	dsn, err := s.dsn(ctx, ref, role, readOnly)
+	return s.pgmetaConnOn(ctx, "", ref, role, readOnly)
+}
+
+// pgmetaConnOn is pgmetaConn for the database called replica, one of ref's read replicas; an
+// empty replica is the primary.
+func (s *Server) pgmetaConnOn(ctx context.Context, replica, ref, role string, readOnly bool) (string, error) {
+	dsn, err := s.dsnOn(ctx, replica, ref, role, readOnly)
 	if err != nil {
 		return "", err
 	}
@@ -105,9 +114,39 @@ func (s *Server) pgmetaConn(ctx context.Context, ref, role string, readOnly bool
 	return cryptojs.Encrypt(dsn, key)
 }
 
+// dsnOn is dsn for the database called replica, one of ref's read replicas (an empty replica is
+// the primary): the same credentials, at the replica's port on this node, which is the replica
+// itself or a forwarder to the node that runs it. The read-only role of a Read-only member is set
+// up on the primary, where roles can be written; it reaches the replica with the WAL.
+func (s *Server) dsnOn(ctx context.Context, replica, ref, role string, readOnly bool) (string, error) {
+	dsn, err := s.dsn(ctx, ref, role, readOnly)
+	if err != nil || replica == "" {
+		return dsn, err
+	}
+	p, err := s.reg.GetProject(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	if p.Seq > s.cfg.MaxReplicaSeq() {
+		return "", fmt.Errorf("api: project %s (sequence %d) has no replica port", ref, p.Seq)
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", fmt.Errorf("api: connection string: %w", err)
+	}
+	u.Host = net.JoinHostPort(u.Hostname(), strconv.Itoa(s.cfg.ReplicaPorts(ref, p.Seq).Postgres))
+	return u.String(), nil
+}
+
 // pgmetaDo sends one request to supavise-pgmeta against ref's database.
 func (s *Server) pgmetaDo(ctx context.Context, ref, role string, readOnly bool, method, path, rawQuery string, body io.Reader, hdr http.Header) (*http.Response, error) {
-	conn, err := s.pgmetaConn(ctx, ref, role, readOnly)
+	return s.pgmetaDoOn(ctx, "", ref, role, readOnly, method, path, rawQuery, body, hdr)
+}
+
+// pgmetaDoOn is pgmetaDo against the database called replica, one of ref's read replicas (an
+// empty replica is the primary).
+func (s *Server) pgmetaDoOn(ctx context.Context, replica, ref, role string, readOnly bool, method, path, rawQuery string, body io.Reader, hdr http.Header) (*http.Response, error) {
+	conn, err := s.pgmetaConnOn(ctx, replica, ref, role, readOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -182,9 +221,70 @@ func (s *Server) sqlRows(ctx context.Context, ref, role string, readOnly bool, q
 	return b, nil
 }
 
+// connHeaderHost reads the host out of the connection string Studio sends back as
+// x-connection-encrypted. It is the placeholder this server listed (the password is
+// "[YOUR-PASSWORD]", which net/url refuses in a user info), so it is cut by hand: the authority
+// ends at the first "/", "?" or "#", and the host follows the last "@" in it. ok is false for
+// anything that is not a postgres URL with a host.
+func connHeaderHost(v string) (host string, ok bool) {
+	rest, ok := strings.CutPrefix(v, "postgresql://")
+	if !ok {
+		if rest, ok = strings.CutPrefix(v, "postgres://"); !ok {
+			return "", false
+		}
+	}
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	at := strings.LastIndexByte(rest, '@')
+	if at < 0 {
+		return "", false
+	}
+	host = rest[at+1:]
+	if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	return host, host != ""
+}
+
+// selectDatabase reads the database a pg-meta request is for from its x-connection-encrypted
+// header and returns the identifier of the read replica it names, or "" for the primary. The
+// header is a selector and nothing more: it names a database by the host label
+// (db.<identifier>.api.<domain>) and never carries a credential or a role, because the connection
+// is built from the project's own. The request is authorized by {ref}, so the label must be the
+// project itself or one of its replicas; a label of another project is refused. A header that is
+// not a database host of this node (none, or one the dashboard of another version made up) selects
+// the primary, as every request did before replicas existed.
+func (s *Server) selectDatabase(ctx context.Context, p *registry.Project, header string) (replica string, err error) {
+	host, ok := connHeaderHost(header)
+	if !ok {
+		return "", nil
+	}
+	label, ok := strings.CutPrefix(strings.ToLower(host), "db.")
+	if !ok {
+		return "", nil
+	}
+	id := s.cfg.RefFromProjectHost(label)
+	if id == "" || id == p.Ref {
+		return "", nil
+	}
+	rep, found, err := s.replicaOf(ctx, p.Ref, id)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", errf(http.StatusForbidden, "The selected database does not belong to this project")
+	}
+	if rep.Status != string(registry.StatusActiveHealthy) && rep.Status != string(registry.StatusActiveUnhealthy) {
+		return "", errf(http.StatusServiceUnavailable, "Read replica %s is not ready (status %s)", rep.Identifier, rep.Status)
+	}
+	return rep.Identifier, nil
+}
+
 // pgmetaProxy forwards /platform/pg-meta/{ref}/<path> to supavise-pgmeta, replacing the
 // connection header Studio sends with one built here, and relays the answer
-// verbatim: Studio reads pg-meta's own error format.
+// verbatim: Studio reads pg-meta's own error format. The header Studio sends only chooses
+// between the project's databases (selectDatabase).
 //
 // It connects as postgres, not supabase_admin like upstream's self-hosted Studio
 // does: objects created in the SQL editor then belong to postgres, the role the CLI
@@ -192,7 +292,12 @@ func (s *Server) sqlRows(ctx context.Context, ref, role string, readOnly bool, q
 // only where a superuser is needed (login roles, the read-only role).
 func (s *Server) pgmetaProxy(w http.ResponseWriter, r *http.Request) error {
 	ref := r.PathValue("ref")
-	if _, err := s.running(r.Context(), ref); err != nil {
+	p, err := s.running(r.Context(), ref)
+	if err != nil {
+		return err
+	}
+	replica, err := s.selectDatabase(r.Context(), p, r.Header.Get("X-Connection-Encrypted"))
+	if err != nil {
 		return err
 	}
 	rest := strings.TrimPrefix(r.URL.Path, "/platform/pg-meta/"+ref)
@@ -200,13 +305,15 @@ func (s *Server) pgmetaProxy(w http.ResponseWriter, r *http.Request) error {
 		rest = "/"
 	}
 	// A caller who may only query (the Read-only role) has every statement run as the
-	// read-only database role, which cannot change anything whatever the SQL says.
+	// read-only database role, which cannot change anything whatever the SQL says. The role is the
+	// caller's on a replica too, whichever string Studio sent: postgres is replicated, and Studio's
+	// reports read pg_stat_statements, which supavise_read_only may not see in full.
 	role, err := s.sqlRole(r, ref)
 	if err != nil {
 		return err
 	}
 	body := http.MaxBytesReader(w, r.Body, maxBody)
-	resp, err := s.pgmetaDo(r.Context(), ref, role, false, r.Method, rest, r.URL.RawQuery, body, r.Header)
+	resp, err := s.pgmetaDoOn(r.Context(), replica, ref, role, false, r.Method, rest, r.URL.RawQuery, body, r.Header)
 	if err != nil {
 		return err
 	}
