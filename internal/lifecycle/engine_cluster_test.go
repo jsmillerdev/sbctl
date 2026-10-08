@@ -3,9 +3,11 @@ package lifecycle
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover/fenced"
@@ -51,15 +53,25 @@ func newClusterHarness(t *testing.T, nodeID string) *clusterHarness {
 func TestEngineLeavesProjectsOfOtherNodesToThem(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		node string
-		want func(c *clusterHarness) []string
+		node     string
+		readOnly bool
+		want     func(c *clusterHarness) []string // the units that start
+		tenants  func(c *clusterHarness) []string // the tenants that are registered
 	}{
-		{"n1", func(c *clusterHarness) []string { return []string{c.home1.Ref} }},
-		{"n2", func(c *clusterHarness) []string { return []string{c.home2.Ref} }},
-		{"", func(c *clusterHarness) []string { return []string{c.home1.Ref, c.home2.Ref} }},
+		// The shared services run on the leader, whatever node a project is homed on: a writable Engine
+		// registers every project, a read-only one (a follower) the projects homed on it.
+		{"n1", false, func(c *clusterHarness) []string { return []string{c.home1.Ref} },
+			func(c *clusterHarness) []string { return []string{c.home1.Ref, c.home2.Ref} }},
+		{"n2", false, func(c *clusterHarness) []string { return []string{c.home2.Ref} },
+			func(c *clusterHarness) []string { return []string{c.home1.Ref, c.home2.Ref} }},
+		{"n2", true, func(c *clusterHarness) []string { return []string{c.home2.Ref} },
+			func(c *clusterHarness) []string { return []string{c.home2.Ref} }},
+		{"", false, func(c *clusterHarness) []string { return []string{c.home1.Ref, c.home2.Ref} },
+			func(c *clusterHarness) []string { return []string{c.home1.Ref, c.home2.Ref} }},
 	} {
-		t.Run("node "+tc.node, func(t *testing.T) {
+		t.Run("node "+tc.node+map[bool]string{true: " read-only"}[tc.readOnly], func(t *testing.T) {
 			c := newClusterHarness(t, tc.node)
+			c.e.opts.ReadOnly = tc.readOnly
 			if errs := c.e.StartActive(ctx); len(errs) != 0 {
 				t.Fatal(errs)
 			}
@@ -79,7 +91,7 @@ func TestEngineLeavesProjectsOfOtherNodesToThem(t *testing.T) {
 			for _, ts := range c.tenant.ensured {
 				ensured = append(ensured, ts.Ref)
 			}
-			if got, want := strings.Join(ensured, ","), strings.Join(tc.want(c), ","); !sameSet(got, want) {
+			if got, want := strings.Join(ensured, ","), strings.Join(tc.tenants(c), ","); !sameSet(got, want) {
 				t.Fatalf("EnsureTenants registered %s, want %s", got, want)
 			}
 		})
@@ -223,6 +235,7 @@ type fakeFleet struct {
 	h       *harness
 	rows    []registry.Replica
 	failing map[string]error
+	hung    map[string]bool
 	failed  []string
 	classes []string
 }
@@ -231,16 +244,39 @@ func (f *fakeFleet) Replicas(_ context.Context, ref string) ([]registry.Replica,
 	return f.h.reg.ListReplicas(context.Background(), ref)
 }
 
-func (f *fakeFleet) Restart(_ context.Context, r registry.Replica, class string) error {
+func (f *fakeFleet) Restart(ctx context.Context, r registry.Replica, class string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.classes = append(f.classes, class)
 	_ = f.h.plane.rec("Replica " + r.Identifier)
-	return f.failing[r.Identifier]
+	hung := f.hung[r.Identifier]
+	err := f.failing[r.Identifier]
+	f.mu.Unlock()
+	if hung {
+		<-ctx.Done() // a node that never answers
+		return ctx.Err()
+	}
+	return err
 }
 
 func (f *fakeFleet) Failed(_ context.Context, r registry.Replica, cause error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.failed = append(f.failed, r.Identifier+": "+cause.Error())
+}
+
+// inReplicaOrder joins calls with the replicas of each run sorted: the replicas restart together, so
+// the order among them is not one the tests can ask for.
+func inReplicaOrder(calls []string) string {
+	out := slices.Clone(calls)
+	for i := 0; i < len(out); {
+		j := i
+		for j < len(out) && strings.HasPrefix(out[j], "Replica ") {
+			j++
+		}
+		slices.Sort(out[i:j])
+		i = max(j, i+1)
+	}
+	return strings.Join(out, ",")
 }
 
 func replicaHarness(t *testing.T) (*harness, *registry.Project, *fakeFleet, []string) {
@@ -257,7 +293,7 @@ func replicaHarness(t *testing.T) (*harness, *registry.Project, *fakeFleet, []st
 		t.Fatal(err)
 	}
 	p := h.create(t)
-	fl := &fakeFleet{h: h, failing: map[string]error{}}
+	fl := &fakeFleet{h: h, failing: map[string]error{}, hung: map[string]bool{}}
 	h.e.opts.Replicas = fl
 	var ids []string
 	for i, n := range []string{n2.ID, n3.ID} {
@@ -280,7 +316,7 @@ func TestResizeRestartsReplicasBeforeAGrowingPrimary(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "Replica " + ids[0] + ",Replica " + ids[1] + ",Stop " + p.Ref + ",Start " + p.Ref
-	if got := strings.Join(h.plane.calls, ","); got != want {
+	if got := inReplicaOrder(h.plane.calls); got != want {
 		t.Fatalf("calls = %s\nwant    %s", got, want)
 	}
 	if strings.Join(fl.classes, ",") != "small,small" {
@@ -303,7 +339,7 @@ func TestResizeRestartsReplicasAfterAShrinkingPrimary(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "Stop " + p.Ref + ",Start " + p.Ref + ",Replica " + ids[0] + ",Replica " + ids[1]
-	if got := strings.Join(h.plane.calls, ","); got != want {
+	if got := inReplicaOrder(h.plane.calls); got != want {
 		t.Fatalf("calls = %s\nwant    %s", got, want)
 	}
 }
@@ -333,6 +369,49 @@ func TestAReplicaThatDoesNotComeBackDoesNotStopThePrimary(t *testing.T) {
 	}
 	if ev := h.events(t, p.Ref); !strings.Contains(ev, EventReplicaResizeFailed) || !strings.Contains(ev, EventResized) {
 		t.Fatalf("events = %s", ev)
+	}
+}
+
+// A replica on a node that never answers holds the primary's resize for its deadline and no longer,
+// and the replicas restart together: the one that answers is not made to wait for the one that hangs.
+func TestAHungReplicaRestartEndsAtItsDeadlineAndOthersDoNotWaitForIt(t *testing.T) {
+	ctx := context.Background()
+	h, p, fl, ids := replicaHarness(t)
+	h.e.opts.ReplicaRestartTimeout = 50 * time.Millisecond
+	fl.hung[ids[0]] = true
+	start := time.Now()
+	if _, err := h.e.Resize(ctx, p.Ref, "small"); err != nil {
+		t.Fatalf("the resize failed because of a replica: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("the resize waited %s for a hung replica", d)
+	}
+	if r, _ := h.reg.GetReplica(ctx, ids[0]); r.Status != string(registry.StatusActiveUnhealthy) {
+		t.Fatalf("the hung replica is %s", r.Status)
+	}
+	if r, _ := h.reg.GetReplica(ctx, ids[1]); r.Status != string(registry.StatusActiveHealthy) {
+		t.Fatalf("the replica that answered is %s", r.Status)
+	}
+	if len(fl.failed) != 1 || !strings.Contains(fl.failed[0], ids[0]) || !strings.Contains(fl.failed[0], "deadline") {
+		t.Fatalf("failed = %v", fl.failed)
+	}
+}
+
+// A caller that gives up (the daemon is stopping, a request is cancelled) does not make a replica
+// unhealthy or raise an alert: nobody saw it fail.
+func TestACancelledRestartLeavesTheReplicasStatusAndRaisesNoAlert(t *testing.T) {
+	h, p, fl, ids := replicaHarness(t)
+	fl.hung[ids[0]], fl.hung[ids[1]] = true, true
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	h.e.restartReplicas(ctx, p, "a test", EventReplicaRestartFailed, registry.StatusRestarting)
+	for _, id := range ids {
+		if r, _ := h.reg.GetReplica(context.Background(), id); r.Status != string(registry.StatusActiveHealthy) {
+			t.Fatalf("replica %s is %s", id, r.Status)
+		}
+	}
+	if len(fl.failed) != 0 {
+		t.Fatalf("a cancelled restart raised an alert: %v", fl.failed)
 	}
 }
 

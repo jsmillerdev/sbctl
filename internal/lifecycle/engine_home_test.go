@@ -325,7 +325,7 @@ func TestPostgresSettingsRestartRestartTheReplicas(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "Restart " + p.Ref + ",Replica " + ids[0] + ",Replica " + ids[1]
-	if got := strings.Join(h.plane.calls, ","); got != want {
+	if got := inReplicaOrder(h.plane.calls); got != want {
 		t.Fatalf("calls = %s\nwant    %s", got, want)
 	}
 	for _, id := range ids {

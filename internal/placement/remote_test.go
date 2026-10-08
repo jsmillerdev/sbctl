@@ -156,8 +156,9 @@ func TestSentinelErrorsSurviveTheWire(t *testing.T) {
 		{lifecycle.ErrNoSnapshot, lifecycle.ErrNoSnapshot},
 		{fmt.Errorf("%w: new", lifecycle.ErrNoRestorableState), lifecycle.ErrNoRestorableState},
 		{lifecycle.ErrReplayBehind, lifecycle.ErrReplayBehind},
-		{lifecycle.ErrNotStandby, lifecycle.ErrInvalidState},
-		{lifecycle.ErrNotCleanShutdown, lifecycle.ErrInvalidState},
+		{lifecycle.ErrNotStandby, lifecycle.ErrNotStandby},
+		{lifecycle.ErrNotCleanShutdown, lifecycle.ErrNotCleanShutdown},
+		{fmt.Errorf("%w: n2 leads", lifecycle.ErrFenced), lifecycle.ErrFenced},
 		{fmt.Errorf("%w: %w", ErrNoRoom, &lifecycle.CapacityError{Message: "no room"}), ErrNoRoom},
 	} {
 		e.local.err["Delete"] = tc.err
@@ -391,5 +392,70 @@ func TestRegisterNeedsWhatTheHandlersCheckAgainst(t *testing.T) {
 	}
 	if err := Register(mux.Handle, good); err != nil || len(mux.Patterns()) != 6 {
 		t.Fatalf("Register: %v, %v", err, mux.Patterns())
+	}
+}
+
+// What the node refused and what it may have done is told apart by the error, on the node's own agent
+// and across the peer API: a promotion that ended in a refusal changed nothing, one that ended in
+// anything else may have happened.
+func TestRefusedTellsARefusalFromAFailureInTheMiddle(t *testing.T) {
+	ctx := context.Background()
+	e := newRemoteEnv(t, "n1", 5)
+	for _, tc := range []struct {
+		err     error
+		refused bool
+	}{
+		{fmt.Errorf("project: %w", registry.ErrNotFound), true},
+		{fmt.Errorf("%w: busy", lifecycle.ErrInvalidState), true},
+		{fmt.Errorf("%w: not a standby", lifecycle.ErrNotStandby), true},
+		{fmt.Errorf("%w: n2 leads", lifecycle.ErrFenced), true},
+		{lifecycle.ErrReplayBehind, true},
+		{fmt.Errorf("%w: /x", lifecycle.ErrClusterExists), true},
+		{lifecycle.ErrNoSnapshot, true},
+		{fmt.Errorf("%w: %w", ErrNoRoom, &lifecycle.CapacityError{Message: "no room"}), true},
+		{fmt.Errorf("%w: epoch 3", ErrStaleEpoch), true},
+		{fmt.Errorf("%w: homed elsewhere", ErrNotHome), true},
+		{cluster.ErrNotLeader, true},
+		// The cluster was stopped before the check: the node changed.
+		{lifecycle.ErrNotCleanShutdown, false},
+		{errors.New("checkpoint after the promotion: connection reset"), false},
+		{context.DeadlineExceeded, false},
+		{nil, false},
+	} {
+		if got := Refused(tc.err); got != tc.refused {
+			t.Errorf("Refused(%v) = %v on the node's side", tc.err, got)
+		}
+		if tc.err == nil {
+			continue
+		}
+		e.local.err["Delete"] = tc.err
+		err := e.remote.Delete(ctx, testRef)
+		if got := Refused(err); got != tc.refused {
+			t.Errorf("Refused(%v) = %v across the peer API (%v)", tc.err, got, err)
+		}
+	}
+}
+
+// A node that has no room for a replica answers so that the replica controller waits and asks again:
+// the error has a NoRoom method, on the node itself and across the peer API.
+func TestNoRoomSurvivesTheWireAsARefusalForLackOfRoom(t *testing.T) {
+	type roomError interface{ NoRoom() bool }
+	noRoom := func(err error) bool {
+		var re roomError
+		return errors.As(err, &re) && re.NoRoom()
+	}
+	disk := fmt.Errorf("%w: %w", ErrNoRoom, &lifecycle.CapacityError{Message: "this node cannot run a Small project"})
+	if !noRoom(disk) {
+		t.Fatalf("the node's own refusal: %v", disk)
+	}
+	e := newRemoteEnv(t, "n1", 5)
+	e.local.err["Delete"] = disk
+	err := e.remote.Delete(context.Background(), testRef)
+	var nr *NoRoomError
+	if !errors.As(err, &nr) || !noRoom(err) || !errors.Is(err, ErrNoRoom) || nr.Node != "n2" {
+		t.Fatalf("across the peer API: %v", err)
+	}
+	if noRoom(errors.New("boom")) {
+		t.Fatal("an error with no NoRoom method counts as one")
 	}
 }

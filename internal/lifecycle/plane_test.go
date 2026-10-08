@@ -1025,7 +1025,9 @@ func TestFencedPrimaryIsNeitherRenderedNorStarted(t *testing.T) {
 		{"project", func(p config.Paths) error {
 			return fenced.WriteProject(p, fenced.Record{Epoch: 3, Leader: "n2", Ref: ref, Reason: "project failover of " + ref})
 		}},
-		{"node", func(p config.Paths) error { return fenced.WriteNode(p, fenced.Record{Epoch: 3, Leader: "n2", Reason: "n2 leads"}) }},
+		{"node", func(p config.Paths) error {
+			return fenced.WriteNode(p, fenced.Record{Epoch: 3, Leader: "n2", Reason: "n2 leads"})
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := config.Default()

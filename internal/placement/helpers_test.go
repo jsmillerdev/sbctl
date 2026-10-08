@@ -49,7 +49,7 @@ func (m *muxRPC) Call(ctx context.Context, node, method, path string, in, out an
 	if rec.Code < 200 || rec.Code > 299 {
 		var pe peerapi.Error
 		_ = json.Unmarshal(rec.Body.Bytes(), &pe)
-		return &mesh.RemoteError{Node: node, Status: rec.Code, Message: pe.Message}
+		return &mesh.RemoteError{Node: node, Status: rec.Code, Message: pe.Message, Code: pe.Code}
 	}
 	if out != nil && rec.Body.Len() > 0 {
 		return json.Unmarshal(rec.Body.Bytes(), out)

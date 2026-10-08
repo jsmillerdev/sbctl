@@ -56,6 +56,13 @@ type Options struct {
 	// Replicas reaches the replicas of a project on the nodes that hold them, so that a resize can
 	// restart them in the right order (see ReplicaFleet). Nil: the node has none.
 	Replicas ReplicaFleet
+	// ReplicaRestartTimeout bounds the restart of one replica after a resize or a settings save (see
+	// restartReplicas); zero means five minutes.
+	ReplicaRestartTimeout time.Duration
+	// PeerRefresh asks the other nodes that run Supavisor to drop their cached copy of a tenant after
+	// the Engine changed it (a database password, a restore, a tenant that moved with its project).
+	// Nil: the node is part of no cluster, or the daemon has not wired the fleet yet (SetPeerRefresher).
+	PeerRefresh fleet.PeerRefresher
 }
 
 // Timers drives the per-project nightly base backup timer (supavise-basebackup@<ref>.timer).
@@ -971,6 +978,11 @@ func (e *Engine) StartActive(ctx context.Context) map[string]error {
 // or Realtime, the new tag changes their tenants' fingerprints, so this call is what makes the new
 // release run its tenant migrations in every project (Storage on the tenant update, Realtime on the
 // tenant create). The daemon calls it once the shared services and the projects have started.
+//
+// The shared services run on the leader, whichever node a project is homed on, so a writable Engine
+// registers every active project, the ones homed elsewhere too (their canonical ports are forwarders
+// to the home): a shared-service database that was reset, or a tenant whose fingerprint changed, is
+// put right for all of them. A read-only Engine (a follower) registers the projects homed on it only.
 func (e *Engine) EnsureTenants(ctx context.Context) map[string]error {
 	errs := map[string]error{}
 	if len(e.opts.Fleet) == 0 {
@@ -982,17 +994,66 @@ func (e *Engine) EnsureTenants(ctx context.Context) map[string]error {
 		return errs
 	}
 	for i := range ps {
-		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) || !e.homedHere(&ps[i]) {
+		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) || (e.opts.ReadOnly && !e.homedHere(&ps[i])) {
 			continue
 		}
-		if err := e.ensureTenantsOf(ctx, ps[i].Ref); err != nil {
+		if err := e.ensureTenantsOf(ctx, ps[i].Ref, false); err != nil {
 			errs[ps[i].Ref] = err
 		}
 	}
 	return errs
 }
 
-func (e *Engine) ensureTenantsOf(ctx context.Context, ref string) error {
+// EnsureTenant registers ref, and its replicas that are up, with the shared services again and asks
+// the other nodes that run Supavisor to drop their cached copy: the call that follows a move of the
+// project's home (the failover orchestrator's Fleet), once its database answers at the new home, so
+// that Realtime creates its replication slot there. It takes the project's lock.
+func (e *Engine) EnsureTenant(ctx context.Context, ref string) error {
+	if len(e.opts.Fleet) == 0 || ref == config.SystemRef {
+		return nil
+	}
+	return e.ensureTenantsOf(ctx, ref, true)
+}
+
+// QuiesceTenant asks the shared services to let go of ref's database and keeps their clients out until
+// the project's cluster has stopped (the failover orchestrator's Fleet, before a planned stop):
+// Realtime's logical walsender otherwise holds the shutdown until it times out. Unlike the quiesce of
+// a pause, it reports the failure, so that the orchestrator can decide.
+func (e *Engine) QuiesceTenant(ctx context.Context, ref string) error {
+	if len(e.opts.Fleet) == 0 || ref == config.SystemRef {
+		return nil
+	}
+	return e.opts.Fleet.QuiesceTenant(ctx, ref)
+}
+
+// Lock takes the project's operation lock, the one pause, resume, delete, restore and upgrade take,
+// and returns the function that releases it. The failover orchestrator holds it for the steps of a move
+// so that none of them runs on the project meanwhile.
+func (e *Engine) Lock(ctx context.Context, ref string) (unlock func(), err error) {
+	return e.lock(ctx, ref)
+}
+
+// SetPeerRefresher sets Options.PeerRefresh on an Engine that was built without it. The daemon calls
+// it while it wires the fleet, before the Engine serves a request.
+func (e *Engine) SetPeerRefresher(r fleet.PeerRefresher) { e.opts.PeerRefresh = r }
+
+// refreshPeers asks the other nodes that run Supavisor to drop their copy of tenant after this node
+// refreshed its own. A node that cannot be reached costs a warning and nothing else: the refresh is
+// idempotent and the next change of the tenant sends it again.
+func (e *Engine) refreshPeers(ctx context.Context, tenant string) {
+	if e.opts.PeerRefresh == nil {
+		return
+	}
+	if err := e.opts.PeerRefresh.RefreshPeers(ctx, tenant); err != nil {
+		e.log.Warn("the other nodes' poolers could not drop their cached copy of a tenant; they may keep the old one until they restart or the tenant changes again", "tenant", tenant, "error", err)
+	}
+}
+
+// ensureTenantsOf registers ref with the shared services, and with it the tenants of its replicas
+// that are up. peers asks the other nodes to drop their cached copy afterwards, which a call that
+// moved the project's home needs and the daemon's sweep at start does not (a follower learns the
+// tenant rows by replication when it starts).
+func (e *Engine) ensureTenantsOf(ctx context.Context, ref string, peers bool) error {
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return err
@@ -1016,7 +1077,44 @@ func (e *Engine) ensureTenantsOf(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	return e.opts.Fleet.EnsureTenant(ctx, spec)
+	if err := e.opts.Fleet.EnsureTenant(ctx, spec); err != nil {
+		return err
+	}
+	if peers {
+		e.refreshPeers(ctx, ref)
+	}
+	return e.ensureReplicaTenants(ctx, p, spec, peers)
+}
+
+// ensureReplicaTenants registers the replicas of p that are up with the shared services, each as a
+// tenant of its own with the replica's identifier and port (fleet.TenantSpec.ReplicaID). The
+// project's own tenant comes first: it sets the pooler password the replica replicates.
+func (e *Engine) ensureReplicaTenants(ctx context.Context, p *registry.Project, base fleet.TenantSpec, peers bool) error {
+	if p.Seq > e.cfg.MaxReplicaSeq() {
+		return nil
+	}
+	rs, err := e.reg.ListReplicas(ctx, p.Ref)
+	if err != nil {
+		return err
+	}
+	var first error
+	for _, r := range rs {
+		if r.Status != string(registry.StatusActiveHealthy) && r.Status != string(registry.StatusActiveUnhealthy) {
+			continue // being set up or removed: the replica controller registers it when it is healthy
+		}
+		spec := base
+		spec.ReplicaID, spec.DBPort = r.Identifier, e.cfg.ReplicaPorts(p.Ref, p.Seq).Postgres
+		if err := e.opts.Fleet.EnsureReplicaTenant(ctx, spec); err != nil {
+			if first == nil {
+				first = fmt.Errorf("replica %s: %w", r.Identifier, err)
+			}
+			continue
+		}
+		if peers {
+			e.refreshPeers(ctx, r.Identifier)
+		}
+	}
+	return first
 }
 
 func (e *Engine) startOne(ctx context.Context, listed *registry.Project) error {

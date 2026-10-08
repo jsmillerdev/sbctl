@@ -12,6 +12,14 @@ import (
 // ErrReplicaDisk is returned by AdmitReplica when the disk cannot hold the replica.
 var ErrReplicaDisk = errors.New("lifecycle: not enough free disk for a replica")
 
+// diskError is the refusal of AdmitReplica for lack of disk. It matches ErrReplicaDisk and, like a
+// *CapacityError, says it is a refusal for lack of room (NoRoom).
+type diskError struct{ msg string }
+
+func (e *diskError) Error() string { return ErrReplicaDisk.Error() + ": " + e.msg }
+func (e *diskError) Unwrap() error { return ErrReplicaDisk }
+func (e *diskError) NoRoom() bool  { return true }
+
 // replicaReserve is the disk a new replica wants on top of the size of its base backup, which
 // grows when it is extracted and again while it replays WAL.
 const replicaReserve = 1 << 30
@@ -66,8 +74,8 @@ func (e *Engine) AdmitReplica(ctx context.Context, p *registry.Project, identifi
 		return nil
 	}
 	if need := replicaNeed(backupBytes); free < need {
-		return fmt.Errorf("%w: the disk has %s free and a replica seeded from a base backup of %s needs about %s",
-			ErrReplicaDisk, humanBytes(free), humanBytes(backupBytes), humanBytes(need))
+		return &diskError{fmt.Sprintf("the disk has %s free and a replica seeded from a base backup of %s needs about %s",
+			humanBytes(free), humanBytes(backupBytes), humanBytes(need))}
 	}
 	return nil
 }

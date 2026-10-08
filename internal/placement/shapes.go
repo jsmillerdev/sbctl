@@ -149,7 +149,8 @@ var planeCalls = map[peerapi.PlaneMethod]planeCall{
 //	410  the project has no restorable state                  lifecycle.ErrNoRestorableState
 //	412  the directory holds a cluster already                lifecycle.ErrClusterExists
 //	421  the project is not homed on the node                 ErrNotHome
-//	422  the operation is not allowed in the current state    lifecycle.ErrInvalidState
+//	422  the operation is not allowed in the current state    lifecycle.ErrInvalidState; the code tells
+//	     lifecycle.ErrFenced, ErrNotStandby and ErrNotCleanShutdown apart
 //	501  the node has no backup engine                        lifecycle.ErrNoSnapshot
 //	504  replay did not reach the position asked              lifecycle.ErrReplayBehind
 //	507  the node has no room for the replica                 ErrNoRoom
@@ -177,76 +178,162 @@ var (
 	ErrNoRoom = errors.New("placement: the node has no room for the replica")
 )
 
+// NoRoomError is the answer of a node that has no room for a replica (status 507), as the leader
+// gets it from the peer API. It matches ErrNoRoom, and its NoRoom method says it is a refusal for
+// lack of room, which is what the replica controller looks for in an error from InstanceOps.Ensure
+// (replicas.RoomError). A refusal that happens on the leader's own node carries the
+// *lifecycle.CapacityError of the admission, or an error wrapping lifecycle.ErrReplicaDisk, and
+// matches the same way.
+type NoRoomError struct {
+	Node    string
+	Message string
+}
+
+func (e *NoRoomError) Error() string        { return "node " + e.Node + ": " + e.Message }
+func (e *NoRoomError) Is(target error) bool { return target == ErrNoRoom }
+
+// NoRoom is true: the node refused the replica for lack of room and recorded nothing.
+func (e *NoRoomError) NoRoom() bool { return true }
+
+// Codes of the peerapi.Error that tell apart the errors that share a status.
+const (
+	codeNotLeader        = "not_leader"
+	codeStaleEpoch       = "stale_epoch"
+	codeNotHome          = "not_home"
+	codeNoCapacity       = "no_capacity"
+	codeNotFound         = "not_found"
+	codeClusterExists    = "cluster_exists"
+	codeNoRestorable     = "no_restorable_state"
+	codeNoSnapshot       = "no_snapshot"
+	codeLagTooHigh       = "lag_too_high"
+	codeInvalidState     = "invalid_state"
+	codeFenced           = "fenced"
+	codeNotStandby       = "not_standby"
+	codeNotCleanShutdown = "not_clean_shutdown"
+)
+
 // statusOf is the HTTP status the agent answers for err, and the peerapi code of the ones a caller
 // can act on.
 func statusOf(err error) (int, string) {
 	switch {
 	case errors.Is(err, cluster.ErrNotLeader):
-		return statusNotLeader, "not_leader"
+		return statusNotLeader, codeNotLeader
 	case errors.Is(err, ErrStaleEpoch):
-		return statusStaleEpoch, "stale_epoch"
+		return statusStaleEpoch, codeStaleEpoch
 	case errors.Is(err, ErrNotHome):
-		return statusNotHome, "not_home"
+		return statusNotHome, codeNotHome
 	case errors.Is(err, ErrNoRoom):
-		return statusNoRoom, "no_capacity"
+		return statusNoRoom, codeNoCapacity
 	case errors.Is(err, registry.ErrNotFound):
-		return http.StatusNotFound, "not_found"
+		return http.StatusNotFound, codeNotFound
 	case errors.Is(err, lifecycle.ErrClusterExists):
-		return statusClusterExists, "cluster_exists"
+		return statusClusterExists, codeClusterExists
 	case errors.Is(err, lifecycle.ErrNoRestorableState):
-		return statusNoRestorable, "no_restorable_state"
+		return statusNoRestorable, codeNoRestorable
 	case errors.Is(err, lifecycle.ErrNoSnapshot):
-		return statusNoSnapshot, "no_snapshot"
+		return statusNoSnapshot, codeNoSnapshot
 	case errors.Is(err, lifecycle.ErrReplayBehind):
-		return statusReplayBehind, "lag_too_high"
-	case errors.Is(err, lifecycle.ErrInvalidState), errors.Is(err, lifecycle.ErrNotStandby), errors.Is(err, lifecycle.ErrNotCleanShutdown):
-		return statusInvalidState, "invalid_state"
+		return statusReplayBehind, codeLagTooHigh
+	case errors.Is(err, lifecycle.ErrFenced):
+		return statusInvalidState, codeFenced
+	case errors.Is(err, lifecycle.ErrNotStandby):
+		return statusInvalidState, codeNotStandby
+	case errors.Is(err, lifecycle.ErrNotCleanShutdown):
+		return statusInvalidState, codeNotCleanShutdown
+	case errors.Is(err, lifecycle.ErrInvalidState):
+		return statusInvalidState, codeInvalidState
 	}
 	return http.StatusInternalServerError, ""
 }
 
-// remoteError is an error that came back from another node, carrying the sentinel that its status
-// stands for so that errors.Is works on the leader as it did on the node.
+// remoteError is an error that came back from another node, carrying the sentinels that its status
+// and code stand for so that errors.Is works on the leader as it did on the node.
 type remoteError struct {
-	sentinel error
-	node     string
-	msg      string
+	sentinels []error
+	node      string
+	msg       string
 }
 
-func (e *remoteError) Error() string { return "node " + e.node + ": " + e.msg }
-func (e *remoteError) Unwrap() error { return e.sentinel }
+func (e *remoteError) Error() string   { return "node " + e.node + ": " + e.msg }
+func (e *remoteError) Unwrap() []error { return e.sentinels }
 
 // wrapRemote turns what mesh.RPC.Call returned into the error the caller of lifecycle.Plane expects:
-// a *mesh.RemoteError whose status stands for a sentinel is wrapped so that errors.Is finds it.
+// a *mesh.RemoteError whose status stands for a sentinel is wrapped so that errors.Is finds it, and
+// a node's refusal for lack of room becomes a *NoRoomError.
 func wrapRemote(node string, err error) error {
 	var re *mesh.RemoteError
 	if !errors.As(err, &re) {
 		return err
 	}
-	var sentinel error
+	var sentinels []error
 	switch re.Status {
 	case statusNotLeader:
-		sentinel = cluster.ErrNotLeader
+		sentinels = append(sentinels, cluster.ErrNotLeader)
 	case statusStaleEpoch:
-		sentinel = ErrStaleEpoch
+		sentinels = append(sentinels, ErrStaleEpoch)
 	case statusNotHome:
-		sentinel = ErrNotHome
+		sentinels = append(sentinels, ErrNotHome)
 	case http.StatusNotFound:
-		sentinel = registry.ErrNotFound
+		sentinels = append(sentinels, registry.ErrNotFound)
 	case statusClusterExists:
-		sentinel = lifecycle.ErrClusterExists
+		sentinels = append(sentinels, lifecycle.ErrClusterExists)
 	case statusNoRestorable:
-		sentinel = lifecycle.ErrNoRestorableState
+		sentinels = append(sentinels, lifecycle.ErrNoRestorableState)
 	case statusNoSnapshot:
-		sentinel = lifecycle.ErrNoSnapshot
+		sentinels = append(sentinels, lifecycle.ErrNoSnapshot)
 	case statusReplayBehind:
-		sentinel = lifecycle.ErrReplayBehind
+		sentinels = append(sentinels, lifecycle.ErrReplayBehind)
 	case statusNoRoom:
-		sentinel = ErrNoRoom
+		return &NoRoomError{Node: node, Message: re.Message}
 	case statusInvalidState:
-		sentinel = lifecycle.ErrInvalidState
+		// The code says which of the errors that share the status it was; an answer from a node that
+		// sends none is the general one.
+		// A fenced node and a cluster that is no standby also match ErrInvalidState, as they always did;
+		// a cluster that did not shut down cleanly does not: the node stopped it before it looked.
+		switch re.Code {
+		case codeFenced:
+			sentinels = append(sentinels, lifecycle.ErrFenced, lifecycle.ErrInvalidState)
+		case codeNotStandby:
+			sentinels = append(sentinels, lifecycle.ErrNotStandby, lifecycle.ErrInvalidState)
+		case codeNotCleanShutdown:
+			sentinels = append(sentinels, lifecycle.ErrNotCleanShutdown)
+		default:
+			sentinels = append(sentinels, lifecycle.ErrInvalidState)
+		}
 	default:
 		return err
 	}
-	return &remoteError{sentinel: sentinel, node: node, msg: re.Message}
+	return &remoteError{sentinels: sentinels, node: node, msg: re.Message}
+}
+
+// refusals are the errors a node answers with when it refuses a request before it changes anything.
+var refusals = []error{
+	cluster.ErrNotLeader, ErrStaleEpoch, ErrNotHome, ErrNoRoom, registry.ErrNotFound,
+	lifecycle.ErrInvalidState, lifecycle.ErrNotStandby, lifecycle.ErrFenced, lifecycle.ErrReplayBehind,
+	lifecycle.ErrClusterExists, lifecycle.ErrNoRestorableState, lifecycle.ErrNoSnapshot,
+}
+
+// Refused reports whether err is a node's refusal of a request: the caller is not the leader, or acts
+// under an older epoch; the project is not homed there, the replica is not there or the node is
+// fenced; the state does not allow the action (the cluster is no standby, a standby has not replayed
+// as far as asked); the node has no room, no backup engine or nothing to restore. The node refused
+// before it changed anything, so the request can be repeated or given up on with the node as it was.
+// An error that is not a refusal (a status 500, a timeout, a lost answer, a failure in the middle of
+// the work, ErrNotCleanShutdown after the cluster was stopped) says nothing about what the node did:
+// the failover orchestrator treats a promotion that ends in one as possibly done. It finds the
+// refusal through the wrapping of the peer API (wrapRemote) and of the node's own agent.
+func Refused(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ce *lifecycle.CapacityError
+	if errors.As(err, &ce) {
+		return true
+	}
+	for _, target := range refusals {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
 }
