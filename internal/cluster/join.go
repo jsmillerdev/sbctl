@@ -16,8 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -381,11 +379,7 @@ func WaitStreaming(ctx context.Context, dsns []string, timeout time.Duration) (s
 func standbyStreaming(ctx context.Context, dsn string) (lsn string, streaming bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	cc, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		return "", false, err
-	}
-	conn, err := pgx.ConnectConfig(ctx, cc)
+	conn, err := connect(ctx, dsn)
 	if err != nil {
 		return "", false, err
 	}

@@ -547,7 +547,7 @@ func (s *schemaCache) get() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for _, dsn := range s.dsns {
-		applied, err := registry.AppliedMigrations(ctx, dsn)
+		applied, err := registry.AppliedMigrations(ctx, cluster.PlainDSN(dsn))
 		if err != nil {
 			continue
 		}

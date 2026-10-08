@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
@@ -131,6 +135,10 @@ type BootEnv struct {
 	Now      func() time.Time
 	// PeerTimeout and MarkerTimeout bound the evidence gathering; the zero values are 4 s and 5 s.
 	PeerTimeout, MarkerTimeout time.Duration
+
+	// probe and openRegistry replace the database calls in tests that have no Postgres.
+	probe        func(ctx context.Context, dsns []string, wait time.Duration) (dsn string, inRecovery bool, err error)
+	openRegistry func(ctx context.Context, dsn string) (registry.Registry, error)
 }
 
 func (e *BootEnv) now() time.Time {
@@ -169,7 +177,11 @@ func DecideBoot(ctx context.Context, env BootEnv) (BootDecision, error) {
 	if err != nil {
 		return BootDecision{}, fmt.Errorf("cluster: the node certificate cannot be read: %w", err)
 	}
-	dsn, inRecovery, err := probeSystem(ctx, env.DSNs, env.Wait)
+	probe := probeSystem
+	if env.probe != nil {
+		probe = env.probe
+	}
+	dsn, inRecovery, err := probe(ctx, env.DSNs, env.Wait)
 	if err != nil {
 		return BootDecision{}, err
 	}
@@ -210,15 +222,44 @@ func probeSystem(ctx context.Context, dsns []string, wait time.Duration) (dsn st
 	}
 }
 
+// connect opens one connection to the database at dsn. The DSNs the daemon holds (the lifecycle's
+// RegistryDSN) carry pool_max_conns for pgxpool, which a plain connection would send to the server
+// as a setting it does not have; pgxpool's parser takes the pool parameters out.
+func connect(ctx context.Context, dsn string) (*pgx.Conn, error) {
+	pc, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.ConnectConfig(ctx, pc.ConnConfig)
+}
+
+var poolParam = regexp.MustCompile(`\s+pool_[a-z_]+=\S+`)
+
+// PlainDSN is dsn without the pool_* parameters, for code that connects with pgx alone
+// (registry.AppliedMigrations).
+func PlainDSN(dsn string) string {
+	if strings.Contains(dsn, "://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return dsn
+		}
+		q := u.Query()
+		for k := range q {
+			if strings.HasPrefix(k, "pool_") {
+				q.Del(k)
+			}
+		}
+		u.RawQuery = q.Encode()
+		return u.String()
+	}
+	return poolParam.ReplaceAllString(dsn, "")
+}
+
 // InRecovery asks the cluster at dsn whether it is a standby (pg_is_in_recovery()).
 func InRecovery(ctx context.Context, dsn string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	cc, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		return false, err
-	}
-	conn, err := pgx.ConnectConfig(ctx, cc)
+	conn, err := connect(ctx, dsn)
 	if err != nil {
 		return false, err
 	}
@@ -230,7 +271,13 @@ func InRecovery(ctx context.Context, dsn string) (bool, error) {
 
 // gather reads the local record, asks the peers and reads the marker.
 func (e *BootEnv) gather(ctx context.Context, dsn string, creds *mesh.Credentials) (Evidence, error) {
-	reg, err := registry.OpenReadOnly(ctx, dsn)
+	open := func(ctx context.Context, dsn string) (registry.Registry, error) {
+		return registry.OpenReadOnly(ctx, dsn)
+	}
+	if e.openRegistry != nil {
+		open = e.openRegistry
+	}
+	reg, err := open(ctx, dsn)
 	if err != nil {
 		return Evidence{}, fmt.Errorf("cluster: reading the local registry: %w", err)
 	}

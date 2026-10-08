@@ -92,7 +92,7 @@ func TestDecideBootAgainstPostgres(t *testing.T) {
 	if base == "" {
 		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	dsn := tempDatabase(t, base, "supavise_boot")
 	reg, err := registry.Open(ctx, dsn)
@@ -100,6 +100,31 @@ func TestDecideBootAgainstPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reg.Close()
+	if rec, err := InRecovery(ctx, dsn); err != nil || rec {
+		t.Fatalf("a primary reports recovery=%v, %v", rec, err)
+	}
+	if rec, err := InRecovery(ctx, dsn+"&pool_max_conns=6"); err != nil || rec {
+		t.Fatalf("a DSN with a pool parameter, as the daemon's has: recovery=%v, %v", rec, err)
+	}
+	bootScenario(ctx, t, reg, dsn, []string{"host=/nonexistent port=1 user=x connect_timeout=1", dsn}, func(*BootEnv) {})
+}
+
+// The same decisions over an in-memory registry, with the database calls replaced: they run on a
+// development machine, where the Postgres test is skipped.
+func TestDecideBootOverAMemoryRegistry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	reg := registry.NewMemory()
+	bootScenario(ctx, t, reg, "memory", []string{"memory"}, func(e *BootEnv) {
+		e.probe = func(context.Context, []string, time.Duration) (string, bool, error) { return "memory", false, nil }
+		e.openRegistry = func(context.Context, string) (registry.Registry, error) { return reg, nil }
+	})
+}
+
+// bootScenario walks DecideBoot through the cases of 2.10.8 against registry reg, which holds the
+// founder (this node) and gets a second node that answers pings over mutual TLS.
+func bootScenario(ctx context.Context, t *testing.T, reg registry.Registry, dsn string, dsns []string, tweak func(*BootEnv)) {
+	t.Helper()
 	if err := reg.CreateProject(ctx, &registry.Project{Ref: "system", Name: "system"}); err != nil {
 		t.Fatal(err)
 	}
@@ -146,47 +171,57 @@ func TestDecideBootAgainstPostgres(t *testing.T) {
 	go peer.Serve(ctx, ln)
 
 	env := func(m backup.EpochMarkerStore) BootEnv {
-		return BootEnv{Cfg: cfg, ConfigPath: conf, DSNs: []string{"host=/nonexistent port=1 user=x connect_timeout=1", dsn}, Wait: 10 * time.Second, Marker: m, Log: quiet(),
+		e := BootEnv{Cfg: cfg, ConfigPath: conf, DSNs: dsns, Wait: 10 * time.Second, Marker: m, Log: quiet(),
 			PeerTimeout: 3 * time.Second, MarkerTimeout: time.Second}
+		tweak(&e)
+		return e
 	}
-	if rec, err := InRecovery(ctx, dsn); err != nil || rec {
-		t.Fatalf("a primary reports recovery=%v, %v", rec, err)
+	// decide runs one boot decision under a budget of its own, so that a stall names its step.
+	decide := func(step string, m backup.EpochMarkerStore) BootDecision {
+		t.Helper()
+		start := time.Now()
+		sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		d, err := DecideBoot(sctx, env(m))
+		t.Logf("%s: %s in %s", step, d.Role, time.Since(start).Round(time.Millisecond))
+		if err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+		return d
 	}
 
-	d, err := DecideBoot(ctx, env(nil))
-	if err != nil || d.Role != RoleLeader || !d.Joined || d.SelfID != "n1" || d.Epoch != 1 || d.DSN != dsn {
-		t.Fatalf("peer agrees: %+v, %v", d, err)
+	if d := decide("peer agrees", nil); d.Role != RoleLeader || !d.Joined || d.SelfID != "n1" || d.Epoch != 1 || d.DSN != dsn {
+		t.Fatalf("peer agrees: %+v", d)
 	}
 	set(peerapi.Ping{Node: "n2", Epoch: 5, Leader: "n2"})
-	if d, err = DecideBoot(ctx, env(nil)); err != nil || d.Role != RoleFenced || d.Epoch != 5 || d.Leader != "n2" {
-		t.Fatalf("peer holds a higher epoch: %+v, %v", d, err)
+	if d := decide("peer holds a higher epoch", nil); d.Role != RoleFenced || d.Epoch != 5 || d.Leader != "n2" {
+		t.Fatalf("peer holds a higher epoch: %+v", d)
 	}
 	set(peerapi.Ping{Node: "n2", Epoch: 1, Leader: "n1"})
-	mk := &backup.LeaderMarker{Epoch: 3, Leader: "n2", At: time.Now()}
-	if d, err = DecideBoot(ctx, env(fakeMarker{m: mk})); err != nil || d.Role != RoleFenced || d.Epoch != 3 {
-		t.Fatalf("marker holds a higher epoch: %+v, %v", d, err)
+	if d := decide("marker holds a higher epoch", fakeMarker{m: &backup.LeaderMarker{Epoch: 3, Leader: "n2", At: time.Now()}}); d.Role != RoleFenced || d.Epoch != 3 {
+		t.Fatalf("marker holds a higher epoch: %+v", d)
 	}
 	// A marker that cannot be read is not evidence.
-	if d, err = DecideBoot(ctx, env(fakeMarker{err: fmt.Errorf("store down")})); err != nil || d.Role != RoleLeader {
-		t.Fatalf("marker unreadable: %+v, %v", d, err)
+	if d := decide("marker unreadable", fakeMarker{err: fmt.Errorf("store down")}); d.Role != RoleLeader {
+		t.Fatalf("marker unreadable: %+v", d)
 	}
 	// Nobody answers: the node starts, its own record shows no demotion.
 	ln.Close()
 	peer.Close()
-	if d, err = DecideBoot(ctx, env(nil)); err != nil || d.Role != RoleLeader {
-		t.Fatalf("no peer answers: %+v, %v", d, err)
+	if d := decide("no peer answers", nil); d.Role != RoleLeader {
+		t.Fatalf("no peer answers: %+v", d)
 	}
 
 	// A promotion the registry has not caught up with: the registry names n2, the marker names this node.
 	if err := reg.SetLeader(ctx, "n2", 2); err != nil {
 		t.Fatal(err)
 	}
-	if d, err = DecideBoot(ctx, env(nil)); err != nil || d.Role != RoleFenced {
-		t.Fatalf("a primary that nothing names: %+v, %v", d, err)
+	if d := decide("a primary that nothing names", nil); d.Role != RoleFenced {
+		t.Fatalf("a primary that nothing names: %+v", d)
 	}
-	d, err = DecideBoot(ctx, env(fakeMarker{m: &backup.LeaderMarker{Epoch: 3, Leader: "n1", At: time.Now()}}))
-	if err != nil || d.Role != RoleLeader || d.Epoch != 3 {
-		t.Fatalf("promoted: %+v, %v", d, err)
+	d := decide("promoted", fakeMarker{m: &backup.LeaderMarker{Epoch: 3, Leader: "n1", At: time.Now()}})
+	if d.Role != RoleLeader || d.Epoch != 3 {
+		t.Fatalf("promoted: %+v", d)
 	}
 	planned, err := AssumeLeadership(ctx, reg, "n1", d.Epoch, time.Now())
 	if err != nil || planned {

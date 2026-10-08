@@ -557,3 +557,16 @@ func TestAssumeLeadership(t *testing.T) {
 		t.Fatal("an expired announcement counted")
 	}
 }
+
+func TestPlainDSNDropsThePoolParameters(t *testing.T) {
+	for in, want := range map[string]string{
+		"host='/var/lib/supavise/projects/system/postgres/sock' port=5433 user=supabase_admin dbname=supavise sslmode=disable connect_timeout=5 application_name=supavise pool_max_conns=6": "host='/var/lib/supavise/projects/system/postgres/sock' port=5433 user=supabase_admin dbname=supavise sslmode=disable connect_timeout=5 application_name=supavise",
+		"host=/s port=1 pool_max_conns=6 pool_min_conns=1 dbname=x": "host=/s port=1 dbname=x",
+		"host=/s port=1": "host=/s port=1",
+		"postgres://u:p@127.0.0.1:5432/db?sslmode=disable&pool_max_conns=6": "postgres://u:p@127.0.0.1:5432/db?sslmode=disable",
+	} {
+		if got := PlainDSN(in); got != want {
+			t.Errorf("PlainDSN(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -501,3 +501,21 @@ func TestForwardingSurvivesASessionLoss(t *testing.T) {
 		eventually(t, "both sides to hold a session again", func() bool { return n1.mgr.Connected("n2") && n2.mgr.Connected("n1") })
 	}
 }
+
+// Close ends the peer API server at once, without waiting for the context that Run or Serve got.
+func TestManagerCloseDoesNotWaitForTheContext(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	h.start()
+	n1 := h.nodes["n1"].mgr
+	eventually(t, "a session", func() bool { return n1.Connected("n2") })
+	done := make(chan struct{})
+	go func() { n1.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waits for the context")
+	}
+	if n1.Connected("n2") {
+		t.Fatal("a session survived Close")
+	}
+}

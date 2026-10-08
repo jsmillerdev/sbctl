@@ -708,21 +708,37 @@ type rpcConn struct {
 	peer Peer
 }
 
-// chanListener hands the rpc streams that the session loops accept to the http.Server.
+// chanListener hands the rpc streams that the session loops accept to the http.Server. Closing it
+// (http.Server.Close does) unblocks Accept, as a listener's Close must.
 type chanListener struct {
 	ch   chan net.Conn
 	done <-chan struct{}
+
+	once      sync.Once
+	closeOnce sync.Once
+	closed    chan struct{}
 }
 
+func (l *chanListener) init() { l.once.Do(func() { l.closed = make(chan struct{}) }) }
+
 func (l *chanListener) Accept() (net.Conn, error) {
+	l.init()
 	select {
 	case c := <-l.ch:
 		return c, nil
 	case <-l.done:
 		return nil, net.ErrClosed
+	case <-l.closed:
+		return nil, net.ErrClosed
 	}
 }
-func (l *chanListener) Close() error   { return nil }
+
+func (l *chanListener) Close() error {
+	l.init()
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+
 func (l *chanListener) Addr() net.Addr { return pipeAddr{} }
 
 type pipeAddr struct{}
