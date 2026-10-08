@@ -22,6 +22,10 @@ var (
 	// ErrReplayBehind: the replica did not replay up to the old primary's last WAL in time. Nothing
 	// was promoted; the old primary is started again.
 	ErrReplayBehind = errors.New("failover: the replica did not reach the old primary's final position")
+	// ErrNoFinalPosition: a planned stop did not report the position the cluster stopped at, so
+	// there is nothing to hold the promotion for. Nothing was promoted; the old primary is
+	// started again.
+	ErrNoFinalPosition = errors.New("failover: the stopped primary reported no final position")
 	// ErrFence: the old primary could not be fenced, so nothing was promoted.
 	ErrFence = errors.New("failover: the old primary could not be fenced")
 	// ErrEpochLost: another node holds a higher epoch. Nothing was promoted.

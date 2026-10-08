@@ -587,7 +587,7 @@ func TestAProjectWithItsReplicaOnAThirdNodeMovesThere(t *testing.T) {
 	idAN3 := refA + "-rr-eu-west-1-a3a3a3"
 	must(t, w.reg.CreateReplica(w.ctx, &registry.Replica{Identifier: idAN3, Ref: refA, NodeID: "n3", Status: statusHealthy, InitStep: registry.ReplicaStepDone}))
 	w.inst[idAN3] = &instState{node: "n3", ref: refA, role: "replica", lag: f64(1), postgres: true}
-	w.replay[idAN3] = w.lsn[refA]
+	w.replay[idAN3] = caughtUp(w.lsn[refA])
 	mv, err := w.orch().FailoverServer(w.ctx, ServerOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -789,7 +789,7 @@ func TestACallTurnedAwayWhileTheNodeLearnsWhoLeadsIsRepeated(t *testing.T) {
 	idAN3 := refA + "-rr-eu-west-1-a3a3a3"
 	must(t, w.reg.CreateReplica(w.ctx, &registry.Replica{Identifier: idAN3, Ref: refA, NodeID: "n3", Status: statusHealthy, InitStep: registry.ReplicaStepDone}))
 	w.inst[idAN3] = &instState{node: "n3", ref: refA, role: "replica", lag: f64(1), postgres: true}
-	w.replay[idAN3] = w.lsn[refA]
+	w.replay[idAN3] = caughtUp(w.lsn[refA])
 	w.fail("promote n3/"+idAN3, &mesh.RemoteError{Node: "n3", Status: 403, Message: "only the leader may ask for this"}, 2)
 	w.fail("start n3/"+refA, &mesh.RemoteError{Node: "n3", Status: 403, Message: "only the leader may ask for this"}, 1)
 	mv, err := w.orch().FailoverServer(w.ctx, ServerOptions{})

@@ -99,6 +99,18 @@ const (
 
 func f64(v float64) *float64 { return &v }
 
+// caughtUp is the replay position of a standby that has replayed everything up to a cluster's stop
+// position: the stop position is where the shutdown checkpoint record starts, replay is where the
+// last record it replayed ends.
+func caughtUp(stop string) string {
+	n, err := ParseLSN(stop)
+	if err != nil {
+		return stop
+	}
+	n += 0x70
+	return fmt.Sprintf("%X/%X", n>>32, uint32(n))
+}
+
 // newWorld builds the standard cluster: n1 leads with the system project and two projects
 // (refA, refB), n2 follows and holds a healthy standby of each, Storage is on S3 and the epoch is 1.
 func newWorld(t *testing.T) *world { return newWorldFunc(t) }
@@ -150,7 +162,7 @@ func newWorldOn(t *testing.T, reg registry.Registry) *world {
 		w.lsn[ref] = fmt.Sprintf("0/%X000060", 3+i)
 	}
 	for id, in := range w.inst {
-		w.replay[id] = w.lsn[in.ref] // fully caught up
+		w.replay[id] = caughtUp(w.lsn[in.ref])
 	}
 	w.marker = nil
 	w.setSelf("n1", true)
@@ -594,7 +606,7 @@ func (i *worldInstances) Ensure(_ context.Context, node string, spec peerapi.Ins
 	w.mu.Lock()
 	if w.inst[spec.Identifier] == nil {
 		w.inst[spec.Identifier] = &instState{node: node, ref: spec.Ref, role: "replica", noUp: spec.NoUpstream, postgres: true}
-		w.replay[spec.Identifier] = w.lsn[spec.Ref]
+		w.replay[spec.Identifier] = caughtUp(w.lsn[spec.Ref])
 	}
 	w.mu.Unlock()
 	return i.status(spec.Identifier), nil
@@ -616,7 +628,7 @@ func (i *worldInstances) Do(_ context.Context, node, identifier string, a peerap
 			w.mu.Unlock()
 			return peerapi.InstanceStatus{}, fmt.Errorf("no instance %s on %s", identifier, node)
 		}
-		if req.WaitLSN != "" && !lsnReached(w.replay[identifier], req.WaitLSN) {
+		if req.WaitLSN != "" && !lsnPast(w.replay[identifier], req.WaitLSN) {
 			w.mu.Unlock()
 			return peerapi.InstanceStatus{}, fmt.Errorf("replay %s did not reach %s", w.replay[identifier], req.WaitLSN)
 		}
@@ -640,7 +652,7 @@ func (i *worldInstances) Do(_ context.Context, node, identifier string, a peerap
 		}
 		w.mu.Lock()
 		w.inst[identifier] = &instState{node: node, ref: ref, role: "replica", lag: f64(0), postgres: true}
-		w.replay[identifier] = w.lsn[ref]
+		w.replay[identifier] = caughtUp(w.lsn[ref])
 		w.mu.Unlock()
 	default:
 		return peerapi.InstanceStatus{}, fmt.Errorf("unexpected action %s", a)

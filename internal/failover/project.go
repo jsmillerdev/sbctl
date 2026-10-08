@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -248,8 +249,18 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 			if err != nil {
 				return "", fmt.Errorf("stopping the primary on %s: %w", run.from.Name, err)
 			}
+			// The position is what the promotion waits for. Without one the replica could be
+			// promoted before it has the old primary's last WAL, and a switchover loses nothing
+			// only because it waits. Nothing is recorded, so a resume stops again and reads it again.
+			if _, perr := ParseLSN(lsn); perr != nil {
+				return "", &abortError{cause: fmt.Errorf("%w: %s reported %q for %s", ErrNoFinalPosition, run.from.Name, lsn, ref)}
+			}
 			return lsn, nil
 		}); err != nil {
+			var abort *abortError
+			if errors.As(err, &abort) {
+				return o.undoSwitchover(ctx, j, run, begin, abort)
+			}
 			return err
 		}
 	} else {
@@ -353,12 +364,25 @@ type promoteArgs struct {
 }
 
 // promoteReplica promotes the replica identifier on node. It does nothing when the instance is
-// primary already (a resume after a crash between the promotion and its record). When a
-// promotion that waits for an LSN fails while the instance is still a standby, nothing happened
-// and the error is an abortError: the caller starts the old primary again.
+// primary already (a resume after a crash between the promotion and its record).
+//
+// A promotion that waits for an LSN waits for it here first, before the node is asked to promote
+// anything. A standby that does not get past the position in time is an abortError: nothing was
+// asked of it, and the caller starts the old primary again. Once the position is passed, an error
+// from the promotion itself says nothing about whether it happened (the node may still be inside
+// pg_promote or its restart when the call fails), so it is returned as it is and the caller leaves
+// the old primary stopped: two primaries are worse than a move that waits for --resume.
 func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, identifier string, a promoteArgs) (string, error) {
 	if obs, err := o.d.Instances.Observe(ctx, node.ID, identifier); err == nil && !obs.InRecovery && obs.PostgresUp {
 		return "already primary on " + node.Name, nil
+	}
+	if a.WaitLSN != "" {
+		if err := o.waitReplayed(ctx, node.ID, identifier, a.WaitLSN); err != nil {
+			if errors.Is(err, ErrReplayBehind) {
+				return "", &abortError{cause: err}
+			}
+			return "", err
+		}
 	}
 	req := peerapi.InstanceAction{Epoch: a.Epoch, WaitLSN: a.WaitLSN, DrainArchive: a.Drain, TimeoutSeconds: a.Timeout}
 	err := o.whileTheNodeLearnsWhoLeads(ctx, func() error {
@@ -366,13 +390,7 @@ func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, i
 		return err
 	})
 	if err != nil {
-		err = fmt.Errorf("promoting %s on %s: %w", identifier, node.Name, err)
-		if a.WaitLSN != "" {
-			if obs, oerr := o.d.Instances.Observe(ctx, node.ID, identifier); oerr == nil && obs.InRecovery {
-				return "", &abortError{cause: err}
-			}
-		}
-		return "", err
+		return "", fmt.Errorf("promoting %s on %s: %w", identifier, node.Name, err)
 	}
 	return "primary on " + node.Name, nil
 }
@@ -398,10 +416,11 @@ func (o *Orchestrator) whileTheNodeLearnsWhoLeads(ctx context.Context, call func
 	return err
 }
 
-// notYetLeader reports whether a node answered that the caller is not (yet) its leader.
+// notYetLeader reports whether a node answered that the caller is not (yet) its leader, as the
+// raw 403 of the mesh or as the cluster.ErrNotLeader that the placement layer turns it into.
 func notYetLeader(err error) bool {
 	var re *mesh.RemoteError
-	return errors.As(err, &re) && re.Status == http.StatusForbidden
+	return errors.Is(err, cluster.ErrNotLeader) || errors.As(err, &re) && re.Status == http.StatusForbidden
 }
 
 // undoSwitchover puts a switchover back that stopped before the promotion: the old primary starts
@@ -418,7 +437,7 @@ func (o *Orchestrator) undoSwitchover(ctx context.Context, j *journal, run *proj
 	}
 	_ = o.store().SetProjectStatus(ctx, ref, statusAfter(begin.Status))
 	_ = j.record(ctx, "undo", "the old primary on "+run.from.Name+" runs again")
-	return &abortError{cause: fmt.Errorf("%w (%v)", ErrReplayBehind, abort.cause)}
+	return &abortError{cause: abort.cause}
 }
 
 // fenceProject asks the old home to stop the project's primary and keep it stopped. A home that is

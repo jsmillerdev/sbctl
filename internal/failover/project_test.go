@@ -184,7 +184,7 @@ func rehomeOn(t *testing.T, w *world, ref, node, replicaNode string) {
 	id := ref + "-rr-eu-west-1-r1r1r1"
 	must(t, w.reg.CreateReplica(w.ctx, &registry.Replica{Identifier: id, Ref: ref, NodeID: replicaNode, Origin: old.Origin, Status: statusHealthy, InitStep: registry.ReplicaStepDone}))
 	w.inst[id] = &instState{node: replicaNode, ref: ref, role: "replica", lag: f64(0.4), postgres: true}
-	w.replay[id] = w.lsn[ref]
+	w.replay[id] = caughtUp(w.lsn[ref])
 	w.prim[replicaNode+"/"+ref] = &primState{}
 	delete(w.prim, "n1/"+ref)
 	if node == "n1" {
@@ -297,8 +297,10 @@ func TestSwitchoverThatCannotCatchUpIsUndone(t *testing.T) {
 	if mv.State != registry.MoveAborted {
 		t.Fatalf("move: %+v", mv)
 	}
-	// Nothing was promoted, the old primary runs again and the shared services have it back.
-	w.assertOrder("stop n1/"+refA, "promote n2/", "start n1/"+refA, "fleet.ensure "+refA)
+	// The wait is made before the node is asked to promote anything. Nothing was promoted, the old
+	// primary runs again and the shared services have it back.
+	w.assertOrder("stop n1/"+refA, "start n1/"+refA, "fleet.ensure "+refA)
+	w.assertNever("promote")
 	w.assertNever("registry.SetProjectNode")
 	w.assertNever("demote")
 	if p := projectOf(t, w, refA); p.NodeID != "n1" || p.Status != registry.StatusActiveHealthy {
@@ -311,9 +313,74 @@ func TestSwitchoverThatCannotCatchUpIsUndone(t *testing.T) {
 		t.Fatalf("alerts %v", k)
 	}
 	// An aborted move is over: another one can start.
-	w.replay[idAN2] = w.lsn[refA]
+	w.replay[idAN2] = caughtUp(w.lsn[refA])
 	if _, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil {
 		t.Fatalf("a new try after the abort: %v", err)
+	}
+}
+
+// A standby sitting exactly at the stop position has not replayed the shutdown checkpoint: it is not
+// past it, and promoting it there would fork before the old primary's end.
+func TestSwitchoverWaitsUntilTheStandbyIsPastTheStopPosition(t *testing.T) {
+	w := newWorld(t)
+	w.replay[idAN2] = w.lsn[refA]
+	mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+	if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+		t.Fatalf("error %v, move %+v", err, mv)
+	}
+	w.assertNever("promote")
+}
+
+// A stop that reports no position gives the promotion nothing to wait for. The replica is not
+// promoted without it: the switchover undoes itself, and nothing is recorded as stopped.
+func TestSwitchoverThatLearnsNoStopPositionIsUndone(t *testing.T) {
+	for name, lsn := range map[string]string{"empty": "", "not an LSN": "unknown"} {
+		t.Run(name, func(t *testing.T) {
+			w := newWorld(t)
+			w.lsn[refA] = lsn
+			mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+			if !errors.Is(err, ErrNoFinalPosition) || mv.State != registry.MoveAborted {
+				t.Fatalf("error %v, move %+v", err, mv)
+			}
+			w.assertNever("promote")
+			w.assertOrder("stop n1/"+refA, "start n1/"+refA, "fleet.ensure "+refA)
+			if mv, _ := w.reg.GetMove(w.ctx, mv.ID); mv != nil {
+				for _, s := range mv.Steps {
+					if s.Name == "stop-old" {
+						t.Fatalf("the stop was recorded without a position: %+v", s)
+					}
+				}
+			}
+			if p := projectOf(t, w, refA); p.NodeID != "n1" || p.Status != registry.StatusActiveHealthy {
+				t.Fatalf("project: %+v", p)
+			}
+		})
+	}
+}
+
+// A promotion call that fails after the standby caught up may be a promotion in flight (the node is
+// inside pg_promote or its restart when the connection drops). The old primary is not started again:
+// two primaries are worse than a move that waits for --resume, and the resume promotes again.
+func TestAFailedPromotionCallDoesNotRestartTheOldPrimaryEvenIfTheStandbyStillReplays(t *testing.T) {
+	w := newWorld(t)
+	w.fail("promote n2/", errors.New("context deadline exceeded"), 1) // the standby is still in recovery afterwards
+	o := w.orch()
+	mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+	if err == nil || errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveFailed {
+		t.Fatalf("error %v, move %+v", err, mv)
+	}
+	w.assertNever("start n1/")
+	if in := w.inst[idAN2]; in.role != "replica" {
+		t.Fatalf("the fake promoted: %+v", in)
+	}
+	if _, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA, Resume: true}); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if p := projectOf(t, w, refA); p.NodeID != "n2" || p.Status != registry.StatusActiveHealthy {
+		t.Fatalf("project: %+v", p)
+	}
+	if in := w.inst[idAN2]; in == nil || in.role != "primary" {
+		t.Fatalf("the resume did not promote: %+v", in)
 	}
 }
 
@@ -362,12 +429,10 @@ func TestProjectResumeAtEveryStep(t *testing.T) {
 		name      string
 		unhealthy bool
 		fail      string
-		// aborts: the switchover undoes itself instead of stopping (nothing was promoted).
-		aborts bool
 	}
 	cases := []tc{
 		{name: "planned/stop", fail: "stop n1/" + refA},
-		{name: "planned/promote", fail: "promote n2/", aborts: true},
+		{name: "planned/promote", fail: "promote n2/"},
 		{name: "planned/promote answered", fail: "promote-after n2/"},
 		{name: "planned/home", fail: "registry.SetProjectNode"},
 		{name: "planned/old home's row", fail: "registry.CreateReplica"},
@@ -391,18 +456,6 @@ func TestProjectResumeAtEveryStep(t *testing.T) {
 			mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
 			if err == nil {
 				t.Fatalf("no error although %q fails", c.fail)
-			}
-			if c.aborts {
-				if mv.State != registry.MoveAborted {
-					t.Fatalf("move: %+v", mv)
-				}
-				// Undone: the old primary runs, and a new try works.
-				w.clearFailures()
-				mv, err = w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
-				if err != nil || mv.State != registry.MoveDone {
-					t.Fatalf("new try: %+v, %v", mv, err)
-				}
-				return
 			}
 			if mv.State != registry.MoveFailed {
 				t.Fatalf("move: %+v", mv)

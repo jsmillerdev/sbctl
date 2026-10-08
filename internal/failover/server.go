@@ -293,7 +293,7 @@ func (o *Orchestrator) waitReplayed(ctx context.Context, node, identifier, lsn s
 		obs, err := o.d.Instances.Observe(ctx, node, identifier)
 		if err == nil {
 			last = obs.ReplayLSN
-			if lsnReached(obs.ReplayLSN, lsn) {
+			if lsnPast(obs.ReplayLSN, lsn) {
 				return nil
 			}
 		} else {
