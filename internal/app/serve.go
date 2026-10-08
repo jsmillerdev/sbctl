@@ -445,7 +445,7 @@ func ensureRemoteTenants(ctx context.Context, w *Wire, log *slog.Logger) {
 			continue
 		}
 		done++
-		if err := ensureTenantLocked(ctx, locks, f, p.Ref); err != nil {
+		if err := ensureRemoteTenant(ctx, locks, f, p.Ref); err != nil {
 			log.Warn("project homed elsewhere not registered with the shared services", "ref", p.Ref, "node", p.NodeID, "error", err)
 			failed++
 		}
@@ -455,7 +455,32 @@ func ensureRemoteTenants(ctx context.Context, w *Wire, log *slog.Logger) {
 	}
 }
 
-func ensureTenantLocked(ctx context.Context, locks failover.Locker, f failover.Fleet, ref string) error {
+// splitTenants is what projectTenants offers beyond failover.Fleet: the write on this node and the
+// refresh of the other nodes apart.
+type splitTenants interface {
+	ensureTenantHere(ctx context.Context, ref string) error
+	tellPeers(ctx context.Context, ref string)
+}
+
+// ensureRemoteTenant registers one project under its lock. The lock is held for the write on this node;
+// the other nodes are told after it is released, because each of them may take its whole timeout to
+// answer and a lifecycle operation on the project must not wait for that. A failover.Fleet that cannot
+// split the two is called under the lock.
+func ensureRemoteTenant(ctx context.Context, locks failover.Locker, f failover.Fleet, ref string) error {
+	s, split := f.(splitTenants)
+	err := underProjectLock(ctx, locks, ref, func() error {
+		if split {
+			return s.ensureTenantHere(ctx, ref)
+		}
+		return f.EnsureTenant(ctx, ref)
+	})
+	if err == nil && split {
+		s.tellPeers(ctx, ref)
+	}
+	return err
+}
+
+func underProjectLock(ctx context.Context, locks failover.Locker, ref string, fn func() error) error {
 	if locks != nil {
 		unlock, err := locks.Lock(ctx, ref)
 		if err != nil {
@@ -463,7 +488,7 @@ func ensureTenantLocked(ctx context.Context, locks failover.Locker, f failover.F
 		}
 		defer unlock()
 	}
-	return f.EnsureTenant(ctx, ref)
+	return fn()
 }
 
 // startProjects brings the system project's backup timer and every active project up

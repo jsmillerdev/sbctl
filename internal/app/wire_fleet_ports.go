@@ -71,15 +71,27 @@ func (p *projectTenants) QuiesceTenant(ctx context.Context, ref string) error {
 }
 
 func (p *projectTenants) EnsureTenant(ctx context.Context, ref string) error {
+	if err := p.ensureTenantHere(ctx, ref); err != nil {
+		return err
+	}
+	p.tellPeers(ctx, ref)
+	return nil
+}
+
+// ensureTenantHere registers the project with this node's shared services and tells no other node, and
+// tellPeers is the second half of EnsureTenant. A caller that holds the project's lock for the write
+// and not for the peers' answers (each peer may take peerRefreshTimeout) calls the two apart
+// (ensureRemoteTenant).
+func (p *projectTenants) ensureTenantHere(ctx context.Context, ref string) error {
 	spec, err := fleet.LoadTenantSpec(ctx, p.deps, ref)
 	if err != nil {
 		return err
 	}
-	if err := p.fleet.EnsureTenant(ctx, spec); err != nil {
-		return err
-	}
+	return p.fleet.EnsureTenant(ctx, spec)
+}
+
+func (p *projectTenants) tellPeers(ctx context.Context, ref string) {
 	refreshPeers(ctx, p.peers, ref, p.log)
-	return nil
 }
 
 // refreshPeers asks the other nodes to drop their Supavisor's copy of a tenant. It never fails the caller.

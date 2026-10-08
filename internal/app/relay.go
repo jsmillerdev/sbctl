@@ -68,7 +68,9 @@ func StartWALRelayAt(ctx context.Context, cfg *config.Config, configPath string,
 	rctx, stopRun := context.WithCancel(context.WithoutCancel(ctx))
 	done := make(chan struct{})
 	go func() { defer close(done); _ = relay.Run(rctx) }()
-	return relay, func() { stopRun(); g.close(); <-done }
+	// The guard closes after the relay has stopped: a push still running asks it, and an answer after the
+	// close would open a registry connection that nobody closes.
+	return relay, func() { stopRun(); <-done; g.close() }
 }
 
 // relayGuard answers the three questions the relay's push guard asks (backup.RelayOptions.Replica,

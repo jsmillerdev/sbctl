@@ -291,6 +291,50 @@ func (r *recFleet) EnsureTenant(_ context.Context, ref string) error {
 	return r.fail[ref]
 }
 
+// lockSpy is a failover.Locker that says whether a project's lock is held.
+type lockSpy struct{ held atomic.Bool }
+
+func (l *lockSpy) Lock(context.Context, string) (func(), error) {
+	l.held.Store(true)
+	return func() { l.held.Store(false) }, nil
+}
+
+// heldPeers records whether the project's lock was held when a peer was asked to refresh.
+type heldPeers struct {
+	held  func() bool
+	asked []bool
+}
+
+func (h *heldPeers) RefreshPeers(context.Context, string) error {
+	h.asked = append(h.asked, h.held())
+	return nil
+}
+
+// The project's lock is held for the write on this node and not for the peers' answers, each of which
+// may take its whole timeout: a lifecycle operation on the project does not wait for them.
+func TestEnsureRemoteTenantAsksThePeersAfterTheLockIsReleased(t *testing.T) {
+	fl, deps, logs, _ := tenantFixture(t)
+	spy := &lockSpy{}
+	peers := &heldPeers{held: spy.held.Load}
+	pt := &projectTenants{fleet: fl, deps: deps, peers: peers, log: quiet()}
+	const ref = "abcdefghijklmnopqrst"
+	if err := ensureRemoteTenant(context.Background(), spy, pt, ref); err != nil {
+		t.Fatal(err)
+	}
+	if len(*logs) != 2 {
+		t.Fatalf("tenant calls: %v", *logs)
+	}
+	if len(peers.asked) != 1 || peers.asked[0] || spy.held.Load() {
+		t.Fatalf("peers asked %v (true: the lock was held), lock held afterwards %v", peers.asked, spy.held.Load())
+	}
+	// A write that fails tells nobody, and the lock is let go.
+	peers.asked = nil
+	fl[0].(*fakeTenant).fail = errors.New("supavisor: connection refused")
+	if err := ensureRemoteTenant(context.Background(), spy, pt, ref); err == nil || len(peers.asked) != 0 || spy.held.Load() {
+		t.Fatalf("a failed write: %v, peers asked %v, lock held %v", err, peers.asked, spy.held.Load())
+	}
+}
+
 // The leader registers the projects that run on other nodes with the shared services it runs, once
 // they are up; a follower, whose shared services are parked, does not.
 func TestEnsureRemoteTenantsRegistersWhatRunsElsewhere(t *testing.T) {
