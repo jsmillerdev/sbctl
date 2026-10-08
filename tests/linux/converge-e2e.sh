@@ -341,7 +341,7 @@ out=$(upgrade_next 2>&1) || rc=$?
 printf '%s\n' "$out" >"$WORK/upgrade-converge.log"
 [[ $rc -eq 0 ]] || { printf '%s\n' "$out" >&2; fail "the upgrade exited with status $rc"; }
 [[ $($SV --version) == *v0.2.1* ]] || fail "after the upgrade the installed binary is $($SV --version), want v0.2.1"
-[[ $(upgrade_phase) == done ]] || fail "the upgrade marker says $(upgrade_phase), want done"
+[[ $(upgrade_phase) == "done" ]] || fail "the upgrade marker says $(upgrade_phase), want done"
 wait_daemon
 for u in "${UNITS[@]:1}"; do wait_active "$u" 60; done
 grep -qx "revision=$REV" "$STATE/converged" || fail "the marker after the upgrade is $(cat "$STATE/converged")"
