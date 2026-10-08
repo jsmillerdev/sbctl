@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
@@ -83,9 +82,8 @@ type Options struct {
 // Service implements Backup over a Store and the registry.
 type Service struct {
 	opt Options
-	// ensure holds one lock per ref for EnsureBase.
-	ensureMu sync.Mutex
-	ensure   map[string]*sync.Mutex
+	// ensure serializes EnsureBase per ref; copies of the service (WithManager) share it.
+	ensure *refLocks
 	// probe and alter are the database calls of the post-restore wait; tests replace them.
 	probe func(ctx context.Context, ref string) (inRecovery bool, err error)
 	alter func(ctx context.Context, ref string, gucs []string) error
@@ -123,7 +121,7 @@ func New(o Options) (*Service, error) {
 	if o.ArchiveFlushTimeout <= 0 {
 		o.ArchiveFlushTimeout = time.Minute
 	}
-	s := &Service{opt: o}
+	s := &Service{opt: o, ensure: &refLocks{}}
 	s.probe, s.alter = s.pgInRecovery, s.pgResetSettings
 	return s, nil
 }

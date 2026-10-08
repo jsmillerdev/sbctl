@@ -30,7 +30,7 @@ func (s *Service) EnsureBase(ctx context.Context, ref string, maxAge time.Durati
 	if err := validRef(ref); err != nil {
 		return nil, err
 	}
-	defer s.lockEnsure(ref)()
+	defer s.ensure.lock(ref)()
 	if maxAge > 0 {
 		m, err := s.newestUsableBase(ctx, ref)
 		if err != nil {
@@ -46,18 +46,24 @@ func (s *Service) EnsureBase(ctx context.Context, ref string, maxAge time.Durati
 	return s.BaseBackup(ctx, ref)
 }
 
-// lockEnsure takes ref's EnsureBase lock and returns the function that releases it.
-func (s *Service) lockEnsure(ref string) (unlock func()) {
-	s.ensureMu.Lock()
-	m := s.ensure[ref]
-	if m == nil {
-		if s.ensure == nil {
-			s.ensure = map[string]*sync.Mutex{}
-		}
-		m = &sync.Mutex{}
-		s.ensure[ref] = m
+// refLocks is one mutex per ref.
+type refLocks struct {
+	mu sync.Mutex
+	m  map[string]*sync.Mutex
+}
+
+// lock takes ref's mutex and returns the function that releases it.
+func (l *refLocks) lock(ref string) (unlock func()) {
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[string]*sync.Mutex{}
 	}
-	s.ensureMu.Unlock()
+	m := l.m[ref]
+	if m == nil {
+		m = &sync.Mutex{}
+		l.m[ref] = m
+	}
+	l.mu.Unlock()
 	m.Lock()
 	return m.Unlock
 }
