@@ -13,7 +13,7 @@ func TestClusterKinds(t *testing.T) {
 	announcements := []string{KindFailoverStarted, KindFailoverCompleted, KindFailoverFailed}
 	conditions := []string{
 		KindReplicaUnhealthy, KindReplicaLag, KindReplicaNeedsRebuild, KindReplicaCapacity, KindNodeUnreachable,
-		KindNodeVersionSkew, KindFenced, KindInfraBehind, KindHostNotConverged, KindStandbyBehind, KindStorageNotS3,
+		KindNodeVersionSkew, KindFailoverAutoOff, KindFenced, KindInfraBehind, KindHostNotConverged, KindStandbyBehind, KindStorageNotS3,
 	}
 	seen := map[string]bool{}
 	for _, k := range append(append([]string{}, announcements...), conditions...) {

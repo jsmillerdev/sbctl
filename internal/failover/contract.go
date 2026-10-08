@@ -5,8 +5,9 @@
 // other files.
 //
 // The order that keeps one writer: fence the old primary (a failed fence means no promotion),
-// take the service address, write the epoch marker to the backup store, promote, then register
-// the move in the registry. Every step is recorded in a registry.Move so that a crash resumes.
+// write the epoch marker to the backup store (the store lets one survivor through), take the
+// service address, promote, then register the move in the registry. Every step is recorded in a
+// registry.Move, or in failover.json until the system cluster is promoted, so that a crash resumes.
 package failover
 
 import (
@@ -65,21 +66,35 @@ type Provider interface {
 type ProjectOptions struct {
 	Ref string
 	// To is the node to move the project to; empty picks the healthiest replica.
-	To     string
-	Force  bool
+	To    string
+	Force bool
+	// DryRun changes nothing: the plan is made and FailoverProject returns a nil move.
 	DryRun bool
 	Resume bool
+	// ExpectKind is the kind of move the operator confirmed in the plan, "switchover" or "failover".
+	// When it is set and the plan made at the start of the run says the other, the run is
+	// refused with ErrPlanChanged: a project that stopped answering between the plan and the run
+	// is not fenced on the strength of a confirmation for a clean stop.
+	ExpectKind string
+	// Yes is the CLI's flag to skip the typed confirmation of a project failover; the daemon never reads it.
+	Yes bool
 }
 
 // ServerOptions are the flags of `supavise failover`.
 type ServerOptions struct {
-	To               string
-	Force            bool
+	To    string
+	Force bool
+	// DryRun changes nothing: the plan is made and FailoverServer returns a nil move.
 	DryRun           bool
 	Resume           bool
 	RestoreMissing   bool
 	OldPrimaryIsDown bool
 	Yes              bool
+	// ExpectKind and ExpectEpoch are what the operator confirmed in the plan. When ExpectKind is
+	// set and the plan made at the start of the run differs in kind or epoch, the run is refused
+	// with ErrPlanChanged.
+	ExpectKind  string
+	ExpectEpoch int64
 }
 
 // Check is one precondition and its verdict.
@@ -89,6 +104,10 @@ type Check struct {
 	Detail string `json:"detail,omitempty"`
 	// Blocking: the move is refused while it fails, unless Force overrides it.
 	Blocking bool `json:"blocking"`
+	// Hard: Force does not override it either. It marks the checks whose failure would lose
+	// data or leave two writers (Storage objects that exist only on the old node, a fence that
+	// cannot be made).
+	Hard bool `json:"hard,omitempty"`
 }
 
 // ProjectPlan is what a server move does with one project.
@@ -105,8 +124,22 @@ type ProjectPlan struct {
 
 // Plan is what --dry-run prints.
 type Plan struct {
+	// Kind is "switchover" (the old primary is alive and stops cleanly) or "failover" (it is fenced
+	// first). From and To are the node ids the move goes between, Ref is the project of a project
+	// move and Epoch the cluster epoch the move runs in.
+	Kind  string `json:"kind,omitempty"`
+	Ref   string `json:"ref,omitempty"`
+	From  string `json:"from,omitempty"`
+	To    string `json:"to,omitempty"`
+	Epoch int64  `json:"epoch,omitempty"`
+	// FromName and ToName are the nodes' names ([node] name), which is what the operator types.
+	FromName string `json:"from_name,omitempty"`
+	ToName   string `json:"to_name,omitempty"`
+
 	Checks   []Check       `json:"checks"`
 	Projects []ProjectPlan `json:"projects,omitempty"`
+	// Notes say what else the move does or leaves to the operator ("DNS: point api. at ...").
+	Notes []string `json:"notes,omitempty"`
 }
 
 // Blocked lists the failed blocking checks.
@@ -114,6 +147,18 @@ func (p Plan) Blocked() []Check {
 	var out []Check
 	for _, c := range p.Checks {
 		if c.Blocking && !c.OK {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// Refused lists the failed blocking checks that stop a move that was started with force: all
+// of them without it, and only the Hard ones with it.
+func (p Plan) Refused(force bool) []Check {
+	var out []Check
+	for _, c := range p.Blocked() {
+		if !force || c.Hard {
 			out = append(out, c)
 		}
 	}

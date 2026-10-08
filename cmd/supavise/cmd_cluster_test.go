@@ -74,9 +74,6 @@ func hasCommandLine(help, name string) bool {
 // Every command of the cluster work is registered and says plainly that it is not there yet.
 func TestClusterCommandsAreStubs(t *testing.T) {
 	for _, args := range [][]string{
-		{"failover", "--dry-run"},
-		{"failover", "--to", "n2", "--force", "--restore-missing", "--old-primary-is-down", "--yes"},
-		{"projects", "failover", "abcdefghijklmnopqrst", "--to", "n2", "--dry-run"},
 	} {
 		_, err := run(t, args...)
 		if !errors.Is(err, notimpl.Err) {

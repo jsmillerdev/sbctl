@@ -35,6 +35,7 @@ The cluster kinds are raised by the code that owns the event, not by the checker
 | `node_unreachable` | a peer does not answer the mesh | the mesh |
 | `node_version_skew` | a peer runs a release outside the window this one works with | the mesh, at join and ping |
 | `failover_started`, `failover_completed`, `failover_failed` | a switchover or failover begins, ends or stops (announcements) | the failover orchestrator |
+| `failover_auto_off` | `[failover] mode` asks for automatic failover and the node cannot fence, so it runs as manual; the recovery message says it is armed again | the failover monitor |
 | `fenced` | this node lost the leadership to a higher epoch and starts no primary (critical) | the daemon at boot |
 | `infra_behind` | the AWS stack lacks resources this release needs | `supavise upgrade` and the daemon |
 | `host_not_converged` | `supavise system converge` has not run for this release | the daemon |
@@ -55,7 +56,7 @@ A node upgrade rolls out project upgrades in worker processes that have no hook,
 
 - A condition has a key (`Event.Key`, by default `Kind/Ref`). The same key is not sent again until `[alerts] repeat_hours` (12) have passed since it was last sent; then it is a reminder.
 - `Event{Resolved: true, Key: ...}` sends a recovery, once, and only for a problem that was sent. The checker sends one when a condition clears, including after a daemon restart (the state is on disk).
-- At most `[alerts] max_per_hour` (20) notifications go out in any hour. A critical alert, the `upgrade_*` events and `update_available` (one message per version, recorded as told once sent) ignore the cap, so a burst of conditions cannot swallow the message that says an upgrade failed. Any other alert held back by the cap is counted once however often it is asked again, and the next notification that goes out says how many were held back.
+- At most `[alerts] max_per_hour` (20) notifications go out in any hour. A critical alert, the `upgrade_*` events, the `failover_*` events and `update_available` (one message per version, recorded as told once sent) ignore the cap, so a burst of conditions cannot swallow the message that says an upgrade failed or a failover started. Any other alert held back by the cap is counted once however often it is asked again, and the next notification that goes out says how many were held back.
 - A notification that fails at every destination is not recorded as sent, so the next check sends it. One working destination is enough to count it as sent; the others' failures are logged.
 - `min_severity` drops what is below it (`info`, `warning`, `critical`; default `info`).
 

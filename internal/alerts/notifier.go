@@ -133,8 +133,8 @@ func (n *Notifier) Notify(ctx context.Context, ev Event) error {
 		case !ev.Resolved && !oneShot(ev.Kind) && active && now.Sub(prev.LastSent) < n.cfg.Repeat():
 			return errSkip
 		}
-		// The hourly cap. A critical alert, the upgrade's own events and update_available are not held back: a
-		// burst of conditions must not swallow the one message that says an upgrade failed.
+		// The hourly cap. A critical alert, the upgrade's own events, the failover announcements and update_available are
+		// not held back: a burst of conditions must not swallow the one message that says an upgrade failed.
 		cutoff := now.Add(-time.Hour)
 		kept := s.Sent[:0]
 		for _, t := range s.Sent {
@@ -227,9 +227,16 @@ func (r reservation) release(s *state) {
 
 // exemptFromCap reports whether ev is sent even when the hourly cap is reached. update_available
 // is one message per version and the checker records the version as told once it is sent, so a
-// held-back notice would never come again.
+// held-back notice would never come again. The three failover announcements are one-shot like the
+// upgrade ones: each says what a move that cannot be repeated just did, and a burst of conditions
+// must not swallow the message that a failover started, finished or stopped. The other
+// failover_* kinds are conditions and stay under the cap.
 func exemptFromCap(ev Event) bool {
-	return ev.Severity == SeverityCritical || strings.HasPrefix(ev.Kind, "upgrade_") || ev.Kind == KindUpdateAvailable
+	switch ev.Kind {
+	case KindFailoverStarted, KindFailoverCompleted, KindFailoverFailed, KindUpdateAvailable:
+		return true
+	}
+	return ev.Severity == SeverityCritical || strings.HasPrefix(ev.Kind, "upgrade_")
 }
 
 // worthLogging reports whether ev is news for the log. The checker offers every standing
