@@ -4,10 +4,22 @@ name: replication-spike
 # the unit hardening, take `install.sh --binary` of this checkout, block the instance metadata address, and
 # reach each other, Garage, a signed release server and a fake AWS service. Virtual machines where /dev/kvm
 # works, system containers otherwise; both architectures. tests/linux/multi/README.md has the outcome.
+#
+# expect_fail lists the checks that are known to fail in a mode (see SPIKE_EXPECT_FAIL in spike.sh): a job is
+# red when another check fails, and also when one of those passes, because the README would then be wrong.
+#   amd64 vm                  all checks pass
+#   amd64/arm64 container     unprivileged system containers cannot load the BPF program IPAddressDeny needs
+#   container-privileged      all checks pass
+#   arm64 vm                  the arm64 runners have no /dev/kvm
 on:
   push:
     branches: ["ws/rep-x1"]
   workflow_dispatch:
+    inputs:
+      smoke:
+        description: Also run tests/linux/systemd-smoke.sh on a third, fresh node of the same kind
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -23,14 +35,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-24.04, arch: amd64, mode: vm }
-          - { runner: ubuntu-24.04, arch: amd64, mode: container }
-          - { runner: ubuntu-24.04, arch: amd64, mode: container-privileged }
-          - { runner: ubuntu-24.04-arm, arch: arm64, mode: vm }
-          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container }
-          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container-privileged }
+          - { runner: ubuntu-24.04, arch: amd64, mode: vm, expect_fail: "" }
+          - { runner: ubuntu-24.04, arch: amd64, mode: container-privileged, expect_fail: "" }
+          - { runner: ubuntu-24.04, arch: amd64, mode: container, expect_fail: imds }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container-privileged, expect_fail: "" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container, expect_fail: imds }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: vm, expect_fail: incus }
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -44,8 +56,9 @@ jobs:
           go build -o /tmp/releasetool ./deploy/releasetool
       - name: two nodes (${{ matrix.mode }})
         run: |
-          sudo env LOG_DIR=/tmp/supavise-multi-logs MULTI_MODE=${{ matrix.mode }} SUPAVISE_BIN=/tmp/supavise \
-            SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/multi/spike.sh 2>&1 | tee /tmp/spike.log
+          sudo env LOG_DIR=/tmp/supavise-multi-logs MULTI_MODE=${{ matrix.mode }} MULTI_SMOKE=${{ inputs.smoke && '1' || '0' }} \
+            SPIKE_EXPECT_FAIL="${{ matrix.expect_fail }}" \
+            SUPAVISE_BIN=/tmp/supavise SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/multi/spike.sh 2>&1 | tee /tmp/spike.log
       - if: always()
         name: results
         run: |

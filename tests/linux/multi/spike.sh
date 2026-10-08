@@ -25,17 +25,20 @@
 #   project    a project created and healthy, a base backup written to and listed from Garage
 #   stub       install.sh of the signed release, fetched from the release server, verifies the release
 #   fakeaws    IMDSv2, EC2 and Secrets Manager calls to the fake service answer with the node's identity
+#   smoke      only with MULTI_SMOKE=1: tests/linux/systemd-smoke.sh on a third, fresh node of the same kind
 #
-# SPIKE_STRICT=0 records the failures and still exits 0 (a mode that is known not to work is run this way).
+# SPIKE_EXPECT_FAIL names the checks (without the @node) that are known to fail in the mode, for example
+# "imds" for system containers that are not privileged. The script exits 0 when exactly those fail, and
+# non-zero when another check fails or one of them passes (the README is then out of date).
 # Needs root and Ubuntu 24.04 with Docker; see lib-multi.sh. Logs, results.md and the per-check output are
 # in $LOG_DIR (default /tmp/supavise-multi-logs).
 # shellcheck source=lib-multi.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib-multi.sh"
 
-SPIKE_STRICT=${SPIKE_STRICT:-1}
+SPIKE_EXPECT_FAIL=${SPIKE_EXPECT_FAIL:-}
 RESULTS=$LOG_DIR/results.tsv
 FACTS=$LOG_DIR/facts.tsv
-CHECK_ORDER="incus services launch boot prep net peer install polkit hardening imds project stub fakeaws fakeaws-log"
+CHECK_ORDER="incus services launch boot prep net peer install polkit hardening imds project stub fakeaws fakeaws-log smoke"
 UNITS_IMDS=(supavise-postgres@system.service supavise-gotrue@system.service supavise-pgmeta.service supavise-supavisor.service supavise-realtime.service supavise-storage.service)
 
 # ---- results ----------------------------------------------------------------------------------------
@@ -101,15 +104,29 @@ write_results() {
   } >"$f" 2>/dev/null
 }
 
+# verdict: 0 when the failures are exactly SPIKE_EXPECT_FAIL.
+verdict() {
+  local res id base rc=0
+  while IFS=$'\t' read -r res id _; do
+    base=${id%@*}
+    case $res in
+      FAIL) [[ " $SPIKE_EXPECT_FAIL " == *" $base "* ]] || { log "unexpected failure: $id"; rc=1; } ;;
+      PASS) [[ " $SPIKE_EXPECT_FAIL " != *" $base "* ]] || { log "$id was expected to fail and passed"; rc=1; } ;;
+    esac
+  done <"$RESULTS"
+  return $rc
+}
+
 finish() {
   local rc=$?
   trap - EXIT
+  note spike.total_seconds "$SECONDS"
   mem_snapshot end 2>/dev/null || true
   multi_collect_logs
   write_results || true
   cat "$LOG_DIR/results.md" >&2 2>/dev/null || true
   multi_down
-  if [[ $SPIKE_STRICT == 1 && $rc -eq 0 ]] && grep -q '^FAIL' "$RESULTS" 2>/dev/null; then rc=1; fi
+  [[ $rc -ne 0 ]] || verdict || rc=1
   exit $rc
 }
 
@@ -160,6 +177,7 @@ c_boot() {
   [[ $(on "$n" cat /proc/1/comm) == systemd ]] || fail "$n: PID 1 is not systemd"
   on "$n" test -f /sys/fs/cgroup/cgroup.controllers || fail "$n: no cgroup v2"
   note "$n.os" "$(on "$n" bash -c '. /etc/os-release; echo "$PRETTY_NAME"')"
+  note "$n.systemd_version" "$(on "$n" systemctl --version | head -n1)"
   note "$n.kernel" "$(on "$n" uname -r)"
   note "$n.virt" "$(on "$n" systemd-detect-virt || true)"
   note "$n.cpus" "$(on "$n" nproc)"
@@ -287,9 +305,6 @@ EOS
 c_imds() {
   local n=$1
   needs "install@$n"
-  # What the kernel and systemd can do for IPAddressDeny, recorded whether or not the check passes.
-  note "$n.ip_accounting" "$(on "$n" systemctl show -p IPAccounting -p IPIngressBytes supavise-postgres@system.service | paste -sd ' ' - || true)"
-  note "$n.bpf_messages" "$(on "$n" journalctl -b --no-pager -q | grep -i -c -E 'bpf|ip firewall' || true)"
   on "$n" bash -s -- "${UNITS_IMDS[@]}" <<'EOS' || fail "$n: the instance metadata block does not hold"
 source /root/lib.sh
 imds_up
@@ -359,6 +374,21 @@ c_fakeaws_log() {
   echo "# the call log names each node by its address"
 }
 
+# systemd-smoke.sh, unchanged, on a fresh node (it sets the node up itself, so it cannot run on n1 or n2).
+c_smoke() {
+  local n=$SMOKE_NODE
+  needs install@n1 install@n2
+  multi_launch_node "$n"
+  multi_wait "$n" >/dev/null
+  multi_prep_node "$n"
+  node_push "$n" "$SUPAVISE_BIN" /root/supavise 0755
+  tar -C "$REPO_ROOT" -cf - tests/linux/lib.sh tests/linux/systemd-smoke.sh | on "$n" tar -C /root -xf -
+  on "$n" env SUPAVISE_BIN=/root/supavise LOG_DIR=/root/smoke-logs timeout 2400 bash /root/tests/linux/systemd-smoke.sh \
+    >"$LOG_DIR/systemd-smoke.log" 2>&1 || { tail -n 40 "$LOG_DIR/systemd-smoke.log"; fail "systemd-smoke.sh failed on $n"; }
+  incus file pull --quiet -r "$n/root/smoke-logs" "$LOG_DIR/" || true
+  echo "# $(tail -n 1 "$LOG_DIR/systemd-smoke.log" | cut -c1-200)"
+}
+
 # ---- run -------------------------------------------------------------------------------------------------
 need_root
 preflight
@@ -401,5 +431,8 @@ mem_snapshot project
 check_each stub "the signed release verifies from the release server" c_stub
 check_each fakeaws "the fake AWS service answers each node" c_fakeaws
 check fakeaws-log "the fake AWS service saw each node" c_fakeaws_log
+[[ ${MULTI_SMOKE:-0} != 1 ]] || check smoke "systemd-smoke.sh passes on a fresh node" c_smoke
 note garage.bucket "$(docker exec garage /garage bucket info "$S3_BUCKET" 2>&1 | grep -i -E 'objects|size' | paste -sd ' ' - || true)"
+for n in "${NODES[@]}"; do note "$n.root_used_mb_at_end" "$(on "$n" df -BM --output=used / 2>/dev/null | tail -n1 | tr -dc 0-9 || true)"; done
+note host.incus_storage_mb "$(du -sm /var/lib/incus/storage-pools 2>/dev/null | cut -f1 || true)"
 log "done in $SECONDS s"

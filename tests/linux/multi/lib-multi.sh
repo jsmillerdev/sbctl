@@ -25,6 +25,7 @@ S3_PORT=3900 RELEASE_PORT=38801 AWS_PORT=38170
 GARAGE_IMAGE=${GARAGE_IMAGE:-dxflrs/garage:v1.1.0}
 S3_BUCKET=supavise-test
 NODES=(n1 n2)
+SMOKE_NODE=n3                         # a third, fresh instance for systemd-smoke.sh (MULTI_SMOKE=1)
 WORK=${WORK:-}
 
 node_ip() { echo "$MULTI_NET.1${1#n}"; }
@@ -398,7 +399,8 @@ multi_collect_logs() {
   docker logs garage >"$LOG_DIR/host/garage.log" 2>&1 || true
   cp "$WORK/http.log" "$LOG_DIR/host/release-server.log" 2>/dev/null || true
   cp "$WORK/fake-aws.out" "$LOG_DIR/host/fake-aws.out" 2>/dev/null || true
-  for n in "${NODES[@]}"; do
+  for n in "${NODES[@]}" "$SMOKE_NODE"; do
+    incus info "$n" >/dev/null 2>&1 || continue
     mkdir -p "$LOG_DIR/$n"
     incus info "$n" >"$LOG_DIR/$n/incus-info.txt" 2>&1 || true
     incus config show "$n" --expanded >"$LOG_DIR/$n/incus-config.yaml" 2>&1 || true
@@ -415,5 +417,5 @@ multi_down() {
   local n p
   while read -r p; do kill "$p" 2>/dev/null || true; done <"$WORK/state/pids" 2>/dev/null || true
   garage_down
-  for n in "${NODES[@]}"; do incus delete --force "$n" >/dev/null 2>&1 || true; done
+  for n in "${NODES[@]}" "$SMOKE_NODE"; do incus delete --force "$n" >/dev/null 2>&1 || true; done
 }
