@@ -1121,7 +1121,8 @@ const StatusDeleted registry.Status = "DELETED"
 //     intent; the project is INACTIVE and Recovered.Resume is set, so ResumeRecovered
 //     brings it back. A stale intent on a project that is not paused is cleared.
 //
-// RESTORING is not touched: a restore is for its operator to judge.
+// RESTORING is not touched: a restore is for its operator to judge. A project homed on another node
+// is that node's to recover, and a read-only Engine (a follower) recovers nothing.
 func (e *Engine) Recover(ctx context.Context) []Recovered {
 	if e.opts.ReadOnly {
 		return nil // a follower settles nothing: it cannot write the registry
