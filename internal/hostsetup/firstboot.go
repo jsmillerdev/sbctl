@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -248,13 +249,16 @@ func (f *FirstBoot) rootDisk(ctx context.Context) (string, error) {
 	return "", errors.New("cannot tell which disk holds /: lsblk named no parent disk")
 }
 
-// dataCandidates lists the whole-disk EBS devices other than the root disk.
+// dataCandidates lists the whole-disk EBS devices other than the root disk. udev can give one disk
+// several links (systemd 255 adds a "_1" link beside "nvme-Amazon_Elastic_Block_Store_<serial>"), so
+// a device counts once however many links lead to it.
 func (f *FirstBoot) dataCandidates(rootDisk string) ([]string, error) {
 	ents, err := os.ReadDir(f.ByID)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	var out []string
+	seen := map[string]bool{}
 	for _, e := range ents {
 		n := e.Name()
 		if !strings.HasPrefix(n, "nvme-Amazon_Elastic_Block_Store_") || strings.Contains(n, "-part") {
@@ -264,9 +268,10 @@ func (f *FirstBoot) dataCandidates(rootDisk string) ([]string, error) {
 		if err != nil {
 			continue
 		}
-		if filepath.Base(dev) == rootDisk {
+		if filepath.Base(dev) == rootDisk || seen[dev] {
 			continue
 		}
+		seen[dev] = true
 		out = append(out, dev)
 	}
 	return out, nil
@@ -327,6 +332,10 @@ func nonEmptyLines(b []byte) []string {
 	return out
 }
 
+// uuidRe matches the UUID of an XFS file system (36 characters with dashes) and of the file systems
+// that print a short serial.
+var uuidRe = regexp.MustCompile(`^[0-9A-Fa-f][0-9A-Fa-f-]{7,35}$`)
+
 // mountData mounts the volume at StateDir with project quotas on, and records it in fstab. Quotas
 // can only be switched on when the file system is mounted, so a volume restored from a snapshot
 // gets them here too.
@@ -334,11 +343,16 @@ func (f *FirstBoot) mountData(ctx context.Context, dev string) error {
 	if err := os.MkdirAll(f.StateDir, 0o755); err != nil {
 		return err
 	}
-	uuid, err := f.Runner.Run(ctx, nil, "blkid", "-s", "UUID", "-o", "value", dev)
+	out, err := f.Runner.Run(ctx, nil, "blkid", "-s", "UUID", "-o", "value", dev)
 	if err != nil {
 		return fmt.Errorf("reading the UUID of %s: %w", dev, err)
 	}
-	line := fmt.Sprintf("UUID=%s %s xfs defaults,nofail,prjquota 0 2", strings.TrimSpace(string(uuid)), f.StateDir)
+	// The runner joins stdout and stderr, and fstab takes whatever is written to it.
+	uuid := strings.TrimSpace(string(out))
+	if !uuidRe.MatchString(uuid) {
+		return fmt.Errorf("blkid did not print a UUID for %s (it printed %q)", dev, uuid)
+	}
+	line := fmt.Sprintf("UUID=%s %s xfs defaults,nofail,prjquota 0 2", uuid, f.StateDir)
 	if err := f.addFstab(f.StateDir, line); err != nil {
 		return err
 	}

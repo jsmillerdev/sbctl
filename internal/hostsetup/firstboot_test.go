@@ -344,6 +344,61 @@ func TestFirstBootRefusesSeveralCandidates(t *testing.T) {
 	}
 }
 
+// Ubuntu 24.04 (systemd 255) gives every EBS disk two links, with and without a "_1" suffix, and its
+// partitions two each. One data volume is one candidate, whatever its links.
+func TestFirstBootCountsADiskOnceWhateverItsLinks(t *testing.T) {
+	in := newInstance(t)
+	link := func(name, target string) {
+		t.Helper()
+		if err := os.Symlink(target, filepath.Join(in.byID, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link("nvme-Amazon_Elastic_Block_Store_vol0root_1", filepath.Join(in.root, "dev/nvme0n1"))
+	link("nvme-Amazon_Elastic_Block_Store_vol0root_1-part1", filepath.Join(in.root, "dev/nvme0n1p1"))
+	link("nvme-Amazon_Elastic_Block_Store_vol0data_1", in.dataDev())
+	link("nvme-Amazon_Elastic_Block_Store_vol0data-part1", filepath.Join(in.root, "dev/nvme1n1p1"))
+	link("nvme-Amazon_Elastic_Block_Store_vol0data_1-part1", filepath.Join(in.root, "dev/nvme1n1p1"))
+	res, err := in.run()
+	if err != nil || res.Device != in.dataDev() {
+		t.Fatalf("%+v, %v", res, err)
+	}
+
+	// A second disk is still a second candidate.
+	in.disk("nvme2n1", "nvme-Amazon_Elastic_Block_Store_vol0other")
+	link("nvme-Amazon_Elastic_Block_Store_vol0other_1", filepath.Join(in.root, "dev/nvme2n1"))
+	if _, err := in.run(); err == nil || !strings.Contains(err.Error(), "2 EBS volumes") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// What blkid prints goes into fstab, so it has to be a UUID.
+func TestFirstBootWritesOnlyAUUIDToFstab(t *testing.T) {
+	for name, out := range map[string]string{
+		"a warning": "blkid: error: cannot open /dev/nvme1n1\n",
+		"nothing":   "\n",
+		"two lines": "1111-2222\nsomething else\n",
+	} {
+		in := newInstance(t)
+		answer := in.runner.do
+		in.runner.do = func(name string, args []string) ([]byte, error) {
+			if name == "blkid" && args[0] == "-s" {
+				return []byte(out), nil
+			}
+			return answer(name, args)
+		}
+		if _, err := in.run(); err == nil || !strings.Contains(err.Error(), "did not print a UUID") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+		if b, _ := os.ReadFile(in.fstab); len(b) != 0 {
+			t.Errorf("%s: fstab = %q", name, b)
+		}
+		if in.runner.ran("mount") != 0 {
+			t.Errorf("%s: mounted: %v", name, in.runner.calls)
+		}
+	}
+}
+
 // An instance that takes over a volume an earlier install used gets the account back with the
 // ids that own the files.
 func TestFirstBootRecreatesTheAccountOfAnEarlierInstall(t *testing.T) {
