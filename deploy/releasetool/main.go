@@ -1,10 +1,10 @@
 // Command releasetool is the release engineering helper of the repository: it writes the signed
 // release manifest, generates the release notes and edits internal/versions/versions.yaml for the
 // nightly bump proposals. deploy/release-assets.sh, .github/workflows/release.yml and
-// .github/workflows/bump-proposals.yml call it; it reads and writes files and never touches the
-// network.
+// .github/workflows/bump-proposals.yml call it; it reads and writes files, runs a built binary's
+// release-info when the manifest is given one, and never touches the network.
 //
-//	releasetool manifest -version v1.4.0 -min-upgrade-from v1.2.0 [-versions FILE] [-out FILE]
+//	releasetool manifest -version v1.4.0 -min-upgrade-from v1.2.0 [-versions FILE] [-binary FILE] [-template FILE] [-out FILE]
 //	releasetool notes    -tag v1.4.0 [-prev-tag v1.3.0] -repo owner/name -new FILE [-old FILE] [-log FILE] [-min-upgrade-from v1.2.0]
 //	releasetool bump     -versions FILE -service auth -to auth-v2.196.0-r0
 //	releasetool table    -old FILE -new FILE        (the service version table alone, for a pull request)
@@ -72,6 +72,8 @@ func cmdManifest(args []string) error {
 	version := fs.String("version", "", "the release tag, vMAJOR.MINOR.PATCH[-suffix]")
 	min := fs.String("min-upgrade-from", "", "the oldest installed version that upgrades straight to this release")
 	versions := fs.String("versions", "internal/versions/versions.yaml", "the pin file of this release")
+	binary := fs.String("binary", "", "a built supavise binary that can run here: its release-info names the host converge revision (without it the manifest says 0)")
+	template := fs.String("template", "", "the CloudFormation template as attached to the release: the manifest names its stack revision, asset and SHA-256")
 	out := fs.String("out", "-", "output file")
 	_ = fs.Parse(args)
 	v, err := readVersions(*versions)
@@ -80,6 +82,18 @@ func cmdManifest(args []string) error {
 	}
 	m := &selfupdate.Manifest{Schema: selfupdate.ManifestSchema, Version: *version, MinUpgradeFrom: *min,
 		Artifacts: v.Artifacts, Studio: v.Studio.Tag}
+	if *binary != "" {
+		rev, why := convergeRevision(*binary)
+		if why != "" {
+			fmt.Fprintln(os.Stderr, "releasetool: warning:", why)
+		}
+		m.Host = &selfupdate.ManifestHost{ConvergeRevision: rev}
+	}
+	if *template != "" {
+		if m.AWS, err = awsOf(*template); err != nil {
+			return err
+		}
+	}
 	b, err := m.Marshal()
 	if err != nil {
 		return err

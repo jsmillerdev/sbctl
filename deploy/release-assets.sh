@@ -6,18 +6,25 @@
 # DIST_DIR holds supavise-linux-amd64, supavise-linux-arm64 and any supavise-studio-*-linux-*.tar.zst.
 # The script writes into DIST_DIR:
 #   supavise-release.json  the release manifest (version, min_upgrade_from, the pinned Supabase
-#                    releases), written when SUPAVISE_RELEASE_TAG is set; deploy/releasetool makes it,
-#                    deploy/MIN_UPGRADE_FROM says the oldest version that upgrades straight to this one.
+#                    releases, the host converge revision and the AWS stack revision with the SHA-256
+#                    of the template), written when SUPAVISE_RELEASE_TAG is set; deploy/releasetool
+#                    makes it, deploy/MIN_UPGRADE_FROM says the oldest version that upgrades straight
+#                    to this one. The converge revision is read from the built binary of this machine's
+#                    architecture (`supavise release-info`); a binary that cannot run here gives 0.
 #                    SUPAVISE_RELEASETOOL names a built releasetool; without it the script uses `go run`;
 #                    SUPAVISE_VERSIONS_FILE names the versions.yaml to read instead of the checkout's
 #                    (the upgrade-e2e job signs releases whose binaries pin other versions)
-#   SHA256SUMS       sha256sum of every file above and the manifest, so the signature covers it
-#   SHA256SUMS.sig   raw ed25519 signature of SHA256SUMS (what install.sh and `supavise self-update` verify)
 #   install.sh       deploy/install.sh with the public key stamped in
-#   supavise.yaml       the CloudFormation template; with SUPAVISE_RELEASE_TAG set (v1.2.3), its
+#   supavise.yaml    the CloudFormation template with the public key stamped in (the replica server
+#                    verifies the installer with it); with SUPAVISE_RELEASE_TAG set (v1.2.3), its
 #                    SupaviseVersion default names that tag instead of "latest", so the template
 #                    of a release installs that release
-#   supavise-aws-deploy.sh  deploy/aws/deploy.sh, the one-command deploy for people with the AWS CLI
+#   supavise-aws-deploy.sh  deploy/aws/deploy.sh, for people with the AWS CLI: the one-command deploy
+#                    and the stack update. The public key and the tag are stamped in; `update`
+#                    verifies the template it downloads against the signed list with that key
+#   SHA256SUMS       sha256sum of every file above (binaries, Studio archives, install.sh, the
+#                    template, the script and the manifest), so the signature covers them
+#   SHA256SUMS.sig   raw ed25519 signature of SHA256SUMS (what install.sh and `supavise self-update` verify)
 # It refuses when the private key is not the one the public key names, and it verifies its own
 # signature before it returns. The signing key is the one whose public half is the committed
 # internal/selfupdate/release_key.pem (the current key; deploy/README.md, "Rotating the release
@@ -48,14 +55,44 @@ for f in supavise-linux-amd64 supavise-linux-arm64; do
 done
 files=(supavise-linux-amd64 supavise-linux-arm64)
 for f in supavise-studio-*-linux-*.tar.zst; do [[ -e $f ]] && files+=("$f"); done
+
+# ---- the files that carry the release: they are stamped first, so that the manifest and the
+# checksum list describe the bytes that are attached
+b64=$(base64 <"$pub" | tr -d '\n')
+stamp_key() { # FILE: put the public key in the marker; refuse a file that still has it
+  sed "s|__SUPAVISE_RELEASE_PUBKEY_B64__|$b64|" "$1" >"$1.new" && mv "$1.new" "$1"
+  if grep -q '__SUPAVISE_RELEASE_PUBKEY_B64__' "$1"; then echo "the key marker is still in $1" >&2; exit 1; fi
+}
+cp "$here/install.sh" install.sh
+stamp_key install.sh
+chmod 0755 install.sh
+cp "$here/cloudformation/supavise.yaml" supavise.yaml
+[[ $(grep -c '__SUPAVISE_RELEASE_PUBKEY_B64__' supavise.yaml) -eq 1 ]] || { echo "supavise.yaml must hold the key marker once (the replica server's user data)" >&2; exit 1; }
+stamp_key supavise.yaml
+if [[ -n $tag ]]; then
+  # The SupaviseVersion parameter is the only place the template says "Default: latest".
+  sed "s|^    Default: latest\$|    Default: $tag|" supavise.yaml >supavise.yaml.new && mv supavise.yaml.new supavise.yaml
+  [[ $(grep -c "^    Default: $tag\$" supavise.yaml) -eq 1 ]] || { echo "could not stamp $tag into supavise.yaml" >&2; exit 1; }
+fi
+cp "$here/aws/deploy.sh" supavise-aws-deploy.sh
+stamp_key supavise-aws-deploy.sh
+if [[ -n $tag ]]; then
+  sed "s|__SUPAVISE_RELEASE_TAG__|$tag|" supavise-aws-deploy.sh >supavise-aws-deploy.sh.new && mv supavise-aws-deploy.sh.new supavise-aws-deploy.sh
+  if grep -q '__SUPAVISE_RELEASE_TAG__' supavise-aws-deploy.sh; then echo "the tag marker is still in supavise-aws-deploy.sh" >&2; exit 1; fi
+fi
+chmod 0755 supavise-aws-deploy.sh
+files+=(install.sh supavise.yaml supavise-aws-deploy.sh)
+
 if [[ -n $tag ]]; then
   # SUPAVISE_MIN_UPGRADE_FROM overrides the file (the install-e2e job tests a release with a floor).
   min=${SUPAVISE_MIN_UPGRADE_FROM:-$(grep -v '^[[:space:]]*#' "$here/MIN_UPGRADE_FROM" | tr -d '[:space:]')}
+  # The binary that reports the host converge revision is the one this machine can run.
+  case $(uname -m) in aarch64|arm64) probe=supavise-linux-arm64 ;; *) probe=supavise-linux-amd64 ;; esac
   rm -f supavise-release.json
   if [[ -n ${SUPAVISE_RELEASETOOL:-} ]]; then
-    "$SUPAVISE_RELEASETOOL" manifest -version "$tag" -min-upgrade-from "$min" -versions "${SUPAVISE_VERSIONS_FILE:-$here/../internal/versions/versions.yaml}" -out supavise-release.json
+    "$SUPAVISE_RELEASETOOL" manifest -version "$tag" -min-upgrade-from "$min" -versions "${SUPAVISE_VERSIONS_FILE:-$here/../internal/versions/versions.yaml}" -binary "$dist/$probe" -template "$dist/supavise.yaml" -out supavise-release.json
   else
-    (cd "$here/.." && go run ./deploy/releasetool manifest -version "$tag" -min-upgrade-from "$min" -versions "${SUPAVISE_VERSIONS_FILE:-internal/versions/versions.yaml}" -out "$dist/supavise-release.json")
+    (cd "$here/.." && go run ./deploy/releasetool manifest -version "$tag" -min-upgrade-from "$min" -versions "${SUPAVISE_VERSIONS_FILE:-internal/versions/versions.yaml}" -binary "$dist/$probe" -template "$dist/supavise.yaml" -out "$dist/supavise-release.json")
   fi
   [[ -s supavise-release.json ]] || { echo "the release manifest was not written" >&2; exit 1; }
   files+=(supavise-release.json)
@@ -68,17 +105,4 @@ openssl pkeyutl -sign -rawin -inkey "$priv" -in SHA256SUMS -out SHA256SUMS.sig
 [[ $(wc -c <SHA256SUMS.sig | tr -d ' ') -eq 64 ]] || { echo "unexpected signature size" >&2; exit 1; }
 openssl pkeyutl -verify -rawin -pubin -inkey "$pub" -sigfile SHA256SUMS.sig -in SHA256SUMS >/dev/null \
   || { echo "the new signature does not verify" >&2; exit 1; }
-
-b64=$(base64 <"$pub" | tr -d '\n')
-sed "s|__SUPAVISE_RELEASE_PUBKEY_B64__|$b64|" "$here/install.sh" >install.sh
-chmod 0755 install.sh
-if grep -q '__SUPAVISE_RELEASE_PUBKEY_B64__' install.sh; then echo "the key marker is still in install.sh" >&2; exit 1; fi
-cp "$here/cloudformation/supavise.yaml" supavise.yaml
-if [[ -n $tag ]]; then
-  # The SupaviseVersion parameter is the only place the template says "Default: latest".
-  sed "s|^    Default: latest\$|    Default: $tag|" supavise.yaml >supavise.yaml.new && mv supavise.yaml.new supavise.yaml
-  [[ $(grep -c "^    Default: $tag\$" supavise.yaml) -eq 1 ]] || { echo "could not stamp $tag into supavise.yaml" >&2; exit 1; }
-fi
-cp "$here/aws/deploy.sh" supavise-aws-deploy.sh
-chmod 0755 supavise-aws-deploy.sh
 echo "signed ${#files[@]} files; key sha256 $(der "$pub")"
