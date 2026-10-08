@@ -595,7 +595,13 @@ func (h *nodeHost) Restore(ctx context.Context, from string, rec nodeupgrade.Rec
 	if !h.root {
 		return errors.New("run as root: sudo supavise rollback")
 	}
-	if err := h.rel.Verify(&rec); err != nil {
+	// The record on disk is the authority: root wrote it when it kept the binary, with the checksum
+	// the binary has to match. The one the caller holds may be the plan's, made before it was kept.
+	stored, err := h.rel.Get(rec.Version)
+	if err != nil {
+		return fmt.Errorf("the kept release %s has no record: %w", rec.Version, err)
+	}
+	if err := h.rel.Verify(stored); err != nil {
 		return err
 	}
 	src, err := h.rel.BinaryPath(rec.Version)
