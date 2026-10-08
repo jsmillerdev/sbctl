@@ -63,6 +63,12 @@ func (o *Orchestrator) ResumeInterrupted(ctx context.Context) (*registry.Move, e
 	if again, _, err := o.unfinishedServer(ctx); err != nil || again == nil || !again.running {
 		return nil, err
 	}
+	// Another caller may be running it now (the wiring's, which is slower than the wait on a node whose
+	// services take long to come up): its run is the one that is followed, and this one starts nothing.
+	if o.Busy() {
+		o.d.Log.Info("another caller continues the server move that the restart cut off")
+		return nil, nil
+	}
 	run := o.keepRun(prior.from)
 	var mv *registry.Move
 	var rerr error
@@ -71,7 +77,7 @@ func (o *Orchestrator) ResumeInterrupted(ctx context.Context) (*registry.Move, e
 		return mv, rerr
 	})
 	switch {
-	case errors.Is(rerr, ErrBusy):
+	case errors.Is(rerr, ErrBusy): // it started between the look and the call
 		o.d.Log.Info("another caller continues the server move that the restart cut off")
 		return nil, nil
 	case rerr != nil:

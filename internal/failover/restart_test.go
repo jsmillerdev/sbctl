@@ -482,3 +482,28 @@ func TestAClientFollowsAServerMoveAcrossTheRestartOverTheControlSocket(t *testin
 		t.Fatalf("followed steps: %v", followed)
 	}
 }
+
+// A move that the wiring is still running when the fallback's wait ends is not started a second time,
+// and the run that is followed stays the wiring's.
+func TestTheDaemonLeavesAMoveThatIsRunningNowToItsCaller(t *testing.T) {
+	w := serverWorld(t)
+	ctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
+	o := w.orch(func(d *Deps) { d.Takeover = cutAtTheTakeover(w, cancel) })
+	if _, err := o.FailoverServer(ctx, ServerOptions{}); !errors.Is(err, ErrRestarting) {
+		t.Fatal(err)
+	}
+	w.restarted(2)
+	daemon := w.orch()
+	release, err := daemon.acquire() // the wiring's resume holds the move's slot
+	must(t, err)
+	defer release()
+	before := daemon.Follow(w.ctx, 0, 2)
+	if got, err := daemon.ResumeInterrupted(w.ctx); got != nil || err != nil {
+		t.Fatalf("the daemon started the move beside its caller: %+v, %v", got, err)
+	}
+	if after := daemon.Follow(w.ctx, 0, 2); after.State != before.State || after.Error != "" {
+		t.Fatalf("the followed run changed: %+v, then %+v", before, after)
+	}
+	w.assertNever("registry.CreateMove")
+}
