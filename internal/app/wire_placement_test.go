@@ -23,24 +23,24 @@ import (
 	"github.com/supavise/supavise/internal/units"
 )
 
-// fakeMesh is a mesh.Mesh that records the peer API calls made through it.
-type fakeMesh struct {
+// callMesh is a mesh.Mesh that records the peer API calls made through it.
+type callMesh struct {
 	mu    sync.Mutex
 	calls []string
 }
 
-func (f *fakeMesh) Call(_ context.Context, node, method, path string, _, _ any) error {
+func (f *callMesh) Call(_ context.Context, node, method, path string, _, _ any) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, node+" "+method+" "+path)
 	return nil
 }
-func (f *fakeMesh) Dial(context.Context, string, mesh.Header) (net.Conn, error) {
+func (f *callMesh) Dial(context.Context, string, mesh.Header) (net.Conn, error) {
 	return nil, mesh.ErrNoSession
 }
-func (f *fakeMesh) Connected(string) bool            { return true }
-func (f *fakeMesh) RTT(string) (time.Duration, bool) { return 0, false }
-func (f *fakeMesh) Peers() []string                  { return nil }
+func (f *callMesh) Connected(string) bool            { return true }
+func (f *callMesh) RTT(string) (time.Duration, bool) { return 0, false }
+func (f *callMesh) Peers() []string                  { return nil }
 
 type nopSup struct{}
 
@@ -59,7 +59,7 @@ func (nopArts) Tag(svc string) (string, error) { return svc + "-tag", nil }
 
 // clusterWire is a wire for a leader (n1) in a cluster of two, with a real Engine and plane over a
 // Memory registry and a mesh that records.
-func clusterWire(t *testing.T) (*Wire, *fakeMesh, *registry.Memory) {
+func clusterWire(t *testing.T) (*Wire, *callMesh, *registry.Memory) {
 	t.Helper()
 	ctx := context.Background()
 	reg := registry.NewMemory()
@@ -78,7 +78,7 @@ func clusterWire(t *testing.T) (*Wire, *fakeMesh, *registry.Memory) {
 	node := &lifecycle.Node{Cfg: cfg, Secrets: sec, Registry: reg, Plane: plane, Engine: eng}
 	w := testWire(t)
 	w.Cfg, w.Node = cfg, node
-	fm := &fakeMesh{}
+	fm := &callMesh{}
 	Provide[mesh.Mesh](w, fm)
 	Provide[cluster.Membership](w, cluster.NewStatic(cluster.Snapshot{
 		Self: registry.Node{ID: "n1", Name: "primary"}, Nodes: []registry.Node{{ID: "n1"}, {ID: "n2", Name: "second"}},

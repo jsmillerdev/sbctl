@@ -24,14 +24,14 @@ type clusterBlock struct {
 	Fenced      *cluster.FencedRecord `json:"fenced,omitempty"`
 	Maintenance *registry.Maintenance `json:"maintenance,omitempty"`
 	Nodes       []nodeRow             `json:"nodes,omitempty"`
-	Replicas    []replicaRow          `json:"replicas,omitempty"`
+	Replicas    []clusterReplicaRow          `json:"replicas,omitempty"`
 	// Live says whether the daemon's view (sessions, lag) is current; false when its status file is
 	// missing or stale, in which case sessions and lag are not shown.
 	Live bool `json:"live"`
 }
 
-// replicaRow is a replica in the cluster block.
-type replicaRow struct {
+// clusterReplicaRow is a replica in the cluster block.
+type clusterReplicaRow struct {
 	Identifier string   `json:"identifier"`
 	Ref        string   `json:"ref"`
 	Node       string   `json:"node"`
@@ -143,7 +143,7 @@ func clusterStatus(ctx context.Context, cfg *config.Config) (*clusterBlock, erro
 		if r.Ref == config.SystemRef { // the system cluster's standby is part of the node, not a replica of a project
 			continue
 		}
-		row := replicaRow{Identifier: r.Identifier, Ref: r.Ref, Node: r.NodeID, Status: r.Status, Step: r.InitStep}
+		row := clusterReplicaRow{Identifier: r.Identifier, Ref: r.Ref, Node: r.NodeID, Status: r.Status, Step: r.InitStep}
 		if o, ok := lag[r.Identifier]; ok {
 			row.Receiver, row.LagSeconds = o.ReceiverStatus, o.LagSeconds
 		}

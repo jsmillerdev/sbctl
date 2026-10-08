@@ -326,7 +326,7 @@ func TestClusterBlockRendersNodesReplicasAndFencing(t *testing.T) {
 	b := &clusterBlock{Name: "prod", Epoch: 3, Leader: "n1", Node: "n1", Role: "leader", Live: true,
 		Nodes: []nodeRow{{ID: "n1", Name: "main", Role: "leader", State: "active", Region: "us-east-1", Version: "v0.2.0", Self: true},
 			{ID: "n2", Name: "second", Role: "follower", State: "active", Version: "v0.2.0", Connected: ptr(true), RTTMillis: 12}},
-		Replicas: []replicaRow{{Identifier: "a-rr-eu-west-1-abc123", Node: "n2", Status: "ACTIVE_HEALTHY", LagSeconds: &lag},
+		Replicas: []clusterReplicaRow{{Identifier: "a-rr-eu-west-1-abc123", Node: "n2", Status: "ACTIVE_HEALTHY", LagSeconds: &lag},
 			{Identifier: "b-rr-eu-west-1-def456", Node: "n2", Status: "INIT_READ_REPLICA", Step: "3_initiated_read_replica_setup"}},
 		Maintenance: &registry.Maintenance{Node: "n2", Until: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), Reason: "upgrade"}}
 	var w bytes.Buffer
