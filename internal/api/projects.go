@@ -31,6 +31,9 @@ func mapErr(err error) error {
 	case errors.Is(err, lifecycle.ErrInsufficientDisk):
 		return errf(http.StatusConflict, "%v", err)
 	}
+	if ce, ok := lifecycle.IsCapacity(err); ok {
+		return errf(http.StatusBadRequest, "%s", capitalize(ce.Message))
+	}
 	return err
 }
 
@@ -121,6 +124,9 @@ type createInput struct {
 	// DBRegion is what Studio's CreateProjectBody sends instead of region.
 	DBRegion string `json:"db_region"`
 	DBPass   string `json:"db_pass"`
+	// DesiredInstanceSize is the compute size asked for ("small", "xlarge", ...); empty is the
+	// default size, which the node does not check against its capacity.
+	DesiredInstanceSize string `json:"desired_instance_size"`
 }
 
 // createProject provisions a project through the lifecycle manager and returns it
@@ -166,6 +172,13 @@ func (s *Server) createProject(r *http.Request, in createInput) (*registry.Proje
 	}
 	ref := secrets.NewRef()
 	req := lifecycle.CreateRequest{Name: strings.TrimSpace(in.Name), OrgSlug: org.Slug, Region: in.Region, Ref: ref, DBPassword: in.DBPass}
+	if in.DesiredInstanceSize != "" {
+		size, ok := lifecycle.ParseSize(in.DesiredInstanceSize)
+		if !ok {
+			return nil, errf(http.StatusBadRequest, "%q is not a compute size this node offers (have %s)", in.DesiredInstanceSize, strings.Join(lifecycle.ClassNames(), ", "))
+		}
+		req.Class = size
+	}
 	type result struct {
 		p   *registry.Project
 		err error
@@ -486,7 +499,7 @@ func (s *Server) v1Pooler(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	pool, maxClients := poolerValues(st)
+	pool, maxClients := s.poolerValues(p, st)
 	size, maxConn := int(pool), int(maxClients)
 	writeJSON(w, http.StatusOK, []v1.SupavisorConfigResponseOutput{{
 		ConnectionString: conn, ConnectionStringSnake: conn, DatabaseType: "PRIMARY",

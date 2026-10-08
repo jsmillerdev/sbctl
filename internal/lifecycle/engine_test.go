@@ -25,15 +25,28 @@ type fakePlane struct {
 	keysIn  *secrets.ProjectKeys
 	reconf  []string // JWT secrets passed to Reconfigure
 	healthy bool
+	// started holds a copy of the project of every Start, in order.
+	started []registry.Project
+	// failOnce fails the next call named by the key and then forgets it.
+	failOnce map[string]error
+	// onStart, when set, runs at every Start with the project passed in.
+	onStart func(p registry.Project)
 }
 
-func newFakePlane() *fakePlane { return &fakePlane{failOn: map[string]error{}, healthy: true} }
+func newFakePlane() *fakePlane {
+	return &fakePlane{failOn: map[string]error{}, failOnce: map[string]error{}, healthy: true}
+}
 
 func (f *fakePlane) rec(call string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, call)
-	return f.failOn[strings.SplitN(call, " ", 2)[0]]
+	name := strings.SplitN(call, " ", 2)[0]
+	if err, ok := f.failOnce[name]; ok {
+		delete(f.failOnce, name)
+		return err
+	}
+	return f.failOn[name]
 }
 
 func (f *fakePlane) has(call string) bool {
@@ -58,6 +71,12 @@ func (f *fakePlane) Snapshot(context.Context, string) (*registry.Backup, error) 
 func (f *fakePlane) Route(context.Context, string) (Upstreams, error) { return Upstreams{}, nil }
 func (f *fakePlane) Usage(context.Context, string) (Usage, error)     { return Usage{}, nil }
 func (f *fakePlane) Start(_ context.Context, p *registry.Project, _ *secrets.ProjectKeys) error {
+	f.mu.Lock()
+	f.started = append(f.started, *p)
+	f.mu.Unlock()
+	if f.onStart != nil {
+		f.onStart(*p)
+	}
 	return f.rec("Start " + p.Ref)
 }
 func (f *fakePlane) StartDatabase(_ context.Context, p *registry.Project, _ *secrets.ProjectKeys) error {
@@ -625,9 +644,9 @@ func TestClasses(t *testing.T) {
 	if _, err := ClassFor("nope"); err == nil {
 		t.Fatal("unknown class accepted")
 	}
-	// The default must stay small: a developer machine runs several of these.
+	// New projects are Micro, as on hosted, and the default keeps the 1 GB cap it always had.
 	d, _ := ClassFor("")
-	if d.SharedBuffers != "32MB" || d.MaxConnections != 60 {
+	if d.Name != "micro" || d.MaxConnections != 60 || d.Limits() != (config.Limits{MemoryMax: "1G", CPUQuota: "100%"}) {
 		t.Fatalf("default class = %+v", d)
 	}
 	for _, n := range ClassNames() {

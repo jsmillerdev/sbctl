@@ -669,6 +669,31 @@ func TestUserDataIsValidBash(t *testing.T) {
 	}
 }
 
+// The data volume is mounted with XFS project quotas: they are what gives a project a disk size
+// of its own (internal/diskquota). The fstab line is the one that survives a reboot, and the
+// first mount reads it, so the option has to be in that line and not only on a mount command.
+func TestDataVolumeIsMountedWithProjectQuotas(t *testing.T) {
+	ud := userData(t)
+	line := regexp.MustCompile(`(?m)^\s*echo "UUID=.* /var/lib/supavise xfs ([^ ]+) 0 2" >> /etc/fstab$`).FindStringSubmatch(ud)
+	if line == nil {
+		t.Fatal("user data has no fstab line for /var/lib/supavise")
+	}
+	opts := strings.Split(line[1], ",")
+	for _, want := range []string{"prjquota", "nofail"} {
+		found := false
+		for _, o := range opts {
+			found = found || o == want
+		}
+		if !found {
+			t.Errorf("the fstab options %q lack %s", line[1], want)
+		}
+	}
+	// The mount comes from the fstab line, so nothing may mount it first without the option.
+	if strings.Contains(ud, "mount -o") && regexp.MustCompile(`mount -o [^\n]*/var/lib/supavise`).MatchString(ud) {
+		t.Error("the data volume is mounted by a command that may leave out prjquota")
+	}
+}
+
 // The snap fallback installs the AWS CLI to /snap/bin, which cloud-init's PATH does not hold. The
 // claim-token write is the first use of the CLI after the install.
 func TestUserDataCanRunAwsFromSnap(t *testing.T) {

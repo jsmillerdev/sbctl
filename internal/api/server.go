@@ -14,6 +14,7 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/branching"
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/diskquota"
 	"github.com/jsmillerdev/supavise/internal/domains"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/members"
@@ -80,6 +81,10 @@ type Deps struct {
 	// Health serves GET /healthz and GET /healthz/detail (health.go). Nil: /healthz is a
 	// liveness check and the detail route answers 503.
 	Health HealthSource
+	// Disk reads the data volume and sets per-project disk limits where the volume can enforce
+	// them (compute.go). Nil: internal/diskquota.Manager over Config, which can read but, with no
+	// supervisor, only set limits when the process is root.
+	Disk DiskLimits
 	// CreateWait bounds how long POST /v1/projects waits for the new project to show
 	// up in the registry before answering 201 COMING_UP. Zero means 10 seconds.
 	CreateWait time.Duration
@@ -132,6 +137,11 @@ type Server struct {
 	roEnsured map[string]readOnlyEnsured // by project ref
 
 	ops opTracker
+
+	// disk is the data volume and the projects' disk limits (compute.go).
+	disk DiskLimits
+	// diskUse caches the size of each project's directory for a few seconds (ref -> diskUse).
+	diskUse sync.Map
 
 	handler http.Handler
 }
@@ -253,6 +263,10 @@ func NewServer(d Deps) (*Server, error) {
 			s.store = NewMemoryStore()
 		}
 	}
+	s.disk = d.Disk
+	if s.disk == nil {
+		s.disk = diskquota.New(d.Config, nil)
+	}
 	s.domains = domains.New(domains.Options{Reg: d.Registry, Config: d.Config, Resolver: d.DNSResolver})
 	s.settings = d.Settings
 	if s.settings == nil {
@@ -349,6 +363,7 @@ func (s *Server) implemented() map[string]route {
 	s.routesPlatformProject(add)
 	s.routesBackups(add)
 	s.routesUpgrade(add)
+	s.routesCompute(add)
 	s.routesDomains(add)
 	s.routesContent(add)
 	s.routesProxies(add)

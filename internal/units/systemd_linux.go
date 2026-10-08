@@ -204,9 +204,11 @@ func (s *Systemd) Start(ctx context.Context, unit string) error {
 	if err != nil {
 		return err
 	}
-	if st, err := s.Status(ctx, unit); err == nil && st.State == StateFailed {
-		_ = c.ResetFailedUnitContext(ctx, unit)
-	}
+	// A start the node's own operations ask for (a resume, a resize, a rollback after one) must not
+	// be refused by the unit's rate limit (StartLimitBurst): reset-failed clears the start counter
+	// of a unit in any state, not only the failed state of one that hit the limit. A unit that is
+	// not loaded answers with an error, which is ignored.
+	_ = c.ResetFailedUnitContext(ctx, unit)
 	ch := make(chan string, 1)
 	if _, err := c.StartUnitContext(ctx, unit, "replace", ch); err != nil {
 		return fmt.Errorf("units: start %s: %w", unit, err)

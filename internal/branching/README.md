@@ -91,8 +91,9 @@ and a `postgres_engine` other than the parent's are refused with 400 rather than
 must be running.
 A `with_data` create is also refused with `409` before anything is created when the state disk
 cannot hold the clone (see Free disk), and its outbound side effects are blocked unless the request
-opts out (see Outbound isolation). `desired_instance_size` maps to a class (`pico`/`nano`/`micro` to `micro`, `small`, `medium`,
-every larger size to `large`); without one a branch is `[branching] default_class`, `micro`.
+opts out (see Outbound isolation). `desired_instance_size` is a compute size (`pico` is Nano; `nano` to `16xlarge`, see
+internal/lifecycle/README.md, Compute sizes; a size that does not exist is refused with 400); without one a branch is
+`[branching] default_class`, `micro`, as on hosted. A branch is a project, so it counts against the node's memory budget.
 
 **Schema only** (the default, as on hosted): a new project, then the parent's migration history
 (`supabase_migrations.schema_migrations`: versions, names and statements, each migration in its own

@@ -61,6 +61,8 @@ type Deps struct {
 	Escrow func(ctx context.Context) (*Escrow, error)
 	// Disk reads the free and total bytes of the filesystem holding path; nil uses statfs.
 	Disk func(path string) (free, total uint64, err error)
+	// Node reads the machine's memory and cores for the capacity line; nil detects them.
+	Node func() lifecycle.NodeResources
 
 	// Parallel bounds the projects probed at once (0 means 16). ProjectTimeout bounds one
 	// project's probes (0 means 10 seconds).
@@ -385,6 +387,9 @@ func (d *Deps) systemBackup(ctx context.Context, p registry.Project) *Component 
 // master key's copy, the update record and the notices.
 func (d *Deps) checkLocal(ctx context.Context) []Component {
 	out := []Component{d.checkDisk(), d.checkCertificates(ctx)}
+	if c := d.checkCapacity(ctx); c != nil {
+		out = append(out, *c)
+	}
 	if c := d.checkEscrow(ctx); c != nil {
 		out = append(out, *c)
 	}

@@ -545,19 +545,14 @@ func (s *Service) activeBranch(ctx context.Context, b *Branch) error {
 	return nil
 }
 
+// classFor is the compute size of a new branch: the one asked for (hosted's names, Studio's
+// infra_compute_size values and the add-on variants all work), else [branching] default_class.
 func (s *Service) classFor(size string) (string, error) {
-	switch size {
-	case "":
-		return s.cfg.Branching.Class(), nil
-	case "pico", "nano", "micro":
-		return "micro", nil
-	case "small":
-		return "small", nil
-	case "medium":
-		return "medium", nil
+	if size == "" {
+		size = s.cfg.Branching.Class()
 	}
-	if strings.HasSuffix(size, "large") || strings.Contains(size, "xlarge") || strings.HasPrefix(size, "large") {
-		return "large", nil
+	if n, ok := lifecycle.ParseSize(size); ok {
+		return n, nil
 	}
 	return "", invalid("unknown instance size %q", size)
 }

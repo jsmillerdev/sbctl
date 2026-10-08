@@ -13,7 +13,9 @@ import (
 	"github.com/jsmillerdev/supavise/deploy/systemd"
 	"github.com/jsmillerdev/supavise/internal/backup"
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/diskquota"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/secrets"
 	"github.com/jsmillerdev/supavise/internal/update"
 )
 
@@ -172,7 +174,23 @@ configuration. Run it as the user that owns the state directory (supavise).`,
 	install.Flags().StringVar(&sysUnitDir, "unit-dir", defaultUnitDir, "where to write unit files")
 	install.Flags().StringVar(&sysPolkitDir, "polkit-dir", "/etc/polkit-1/rules.d", "where to write the polkit rule (empty skips it)")
 
-	systemCmd.AddCommand(initCmd, status, start, stop, install)
+	quota := &cobra.Command{
+		Use:    "set-disk-quota <ref>",
+		Short:  "Apply a project's stored disk limit as an XFS project quota (run by supavise-diskquota@<ref>, as root)",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !secrets.ValidRef(args[0]) {
+				return fmt.Errorf("%q is not a project ref", args[0])
+			}
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			return diskquota.New(cfg, nil).ApplyStored(cmd.Context(), args[0])
+		},
+	}
+	systemCmd.AddCommand(initCmd, status, start, stop, install, quota)
 	rootCmd.AddCommand(systemCmd)
 }
 

@@ -13,9 +13,9 @@ project's PostgreSQL, GoTrue and PostgREST as units of a `units.Supervisor`.
    `-p <port>`, `listen_addresses=127.0.0.1`, `unix_socket_directories=<project>/postgres/sock`
    (mode 0700), `hba_file`, `wal_level=logical`, `archive_mode=on`,
    `archive_command` and `archive_timeout`, `PlaneOptions.ArchiveCommandFor` and `ArchiveTimeout`: `internal/app` passes `backup.ArchiveCommandFor(cfg, ref, config file)` (shell-quoted, `%` doubled; the relay form `--socket <state>/projects/<ref>/wal/r.sock` under systemd, otherwise `--config` when the daemon loaded a non-default file; the relay form also drops `SUPAVISE_CONFIG` from the unit's environment) and `[backup] archive_timeout_seconds` (default 300); without them the plane falls back to a built-in quoting of `bin_path` and 900 s,
-   `max_wal_senders=5`, and `shared_buffers`, `effective_cache_size`,
-   `maintenance_work_mem`, `max_wal_size`, `max_connections` from the project class
-   (`micro`, `default`/`small`, `medium`, `large`; default is 32MB and 60 connections).
+   and the project's compute size (see Compute sizes): `shared_buffers`, `effective_cache_size`,
+   `work_mem`, `maintenance_work_mem`, `max_wal_size`, `max_connections`, `max_worker_processes`,
+   `max_wal_senders` and `max_replication_slots`. A new project is Micro: 256MB `shared_buffers`, 60 connections, a 1 GB memory cap.
    The launcher initializes PGDATA and runs the artifact's roles and migrations once.
    Role passwords of `postgres`, `supabase_admin`, `authenticator`,
    `supabase_auth_admin`, `supabase_storage_admin` and `supabase_replication_admin` are set
@@ -47,7 +47,7 @@ TCP. The socket is how Supavise reaches its own registry before it can decrypt a
 
 `pg_cron` runs its jobs in background workers of the cluster (`cron.use_background_workers=on`,
 `cron.database_name=postgres`, `cron.max_running_jobs=8`, `max_worker_processes=16`; see
-`cronSettings`). Hosted Supabase leaves pg_cron on its default, a libpq connection to localhost
+`cronSettings`; every size keeps that worker count as a floor, `MinWorkerProcesses`). Hosted Supabase leaves pg_cron on its default, a libpq connection to localhost
 that its pg_hba.conf trusts; ours does not trust a loopback connection, so a libpq job would fail
 with "connection failed". Workers need no connection, no pg_hba rule and no network, which also
 keeps them working behind a branch's egress filter and independent of the `nodename` and `nodeport`
@@ -284,6 +284,130 @@ the restored settings; the apply that follows writes them again with `ALTER SYST
 socket as a SCRAM verifier, seals it, and calls `fleet.RefreshTenant` (Supavisor's terminate,
 which clears its pools and cached credentials); it restores the old password if the registry write
 fails and only warns when the pooler cannot be reached.
+
+## Compute sizes
+
+A project has a compute size, the way a hosted project has a compute add-on. `registry.Project.Class` holds
+the size's name; `classes.go` is the table. Hosted publishes the memory, the vCPU count, the connection
+limits, the replication limits and the pooler client limit of each size
+([compute and disk](https://supabase.com/docs/guides/platform/compute-and-disk)); those columns are
+copied. It generates the Postgres settings per size with a closed tool (`supabase-admin-api optimize db`)
+and documents none of them, so those columns are ours, derived from the published ones by the rules below.
+
+| Size | Add-on variant | CPU | MemoryMax | CPUQuota | max_connections | slots and WAL senders | pooler clients | pool size |
+|---|---|---|---|---|---|---|---|---|
+| `nano` (Nano) | `ci_nano` | 1 vCPU shared | 512M | 100% | 60 | 5 | 200 | 20 |
+| `micro` (Micro) | `ci_micro` | 1 vCPU shared | 1G | 100% | 60 | 5 | 200 | 20 |
+| `small` (Small) | `ci_small` | 1 vCPU shared | 2G | 100% | 90 | 5 | 400 | 35 |
+| `medium` (Medium) | `ci_medium` | 2 vCPU shared | 4G | 200% | 120 | 5 | 600 | 45 |
+| `large` (Large) | `ci_large` | 2 vCPU dedicated | 8G | 200% | 160 | 8 | 800 | 60 |
+| `xlarge` (XL) | `ci_xlarge` | 4 vCPU dedicated | 16G | 400% | 240 | 24 | 1000 | 95 |
+| `2xlarge` (2XL) | `ci_2xlarge` | 8 vCPU dedicated | 32G | 800% | 380 | 80 | 1500 | 150 |
+| `4xlarge` (4XL) | `ci_4xlarge` | 16 vCPU dedicated | 64G | 1600% | 480 | 80 | 3000 | 190 |
+| `8xlarge` (8XL) | `ci_8xlarge` | 32 vCPU dedicated | 128G | 3200% | 490 | 80 | 6000 | 195 |
+| `12xlarge` (12XL) | `ci_12xlarge` | 48 vCPU dedicated | 192G | 4800% | 500 | 80 | 9000 | 200 |
+| `16xlarge` (16XL) | `ci_16xlarge` | 64 vCPU dedicated | 256G | 6400% | 500 | 80 | 12000 | 200 |
+
+| Size | shared_buffers | effective_cache_size | work_mem | maintenance_work_mem | max_wal_size | max_worker_processes |
+|---|---|---|---|---|---|---|
+| `nano` | 128MB | 384MB | 4MB | 32MB | 128MB | 16 |
+| `micro` | 256MB | 768MB | 4MB | 64MB | 256MB | 16 |
+| `small` | 512MB | 1536MB | 5MB | 128MB | 512MB | 16 |
+| `medium` | 1GB | 3GB | 8MB | 256MB | 1GB | 16 |
+| `large` | 2GB | 6GB | 12MB | 512MB | 2GB | 16 |
+| `xlarge` | 4GB | 12GB | 17MB | 1GB | 4GB | 16 |
+| `2xlarge` | 8GB | 24GB | 21MB | 2GB | 8GB | 24 |
+| `4xlarge` | 16GB | 48GB | 34MB | 2GB | 8GB | 40 |
+| `8xlarge` | 32GB | 96GB | 64MB | 2GB | 8GB | 72 |
+| `12xlarge` | 48GB | 144GB | 64MB | 2GB | 8GB | 104 |
+| `16xlarge` | 64GB | 192GB | 64MB | 2GB | 8GB | 136 |
+
+How the derived columns follow from the published ones (`newSize`):
+
+- `shared_buffers` is 25% of the memory and `effective_cache_size` 75%, PostgreSQL's usual guidance.
+- `work_mem` is the memory left after `shared_buffers`, divided by three times `max_connections`, from 4 MB to 64 MB.
+- `maintenance_work_mem` is a sixteenth of the memory, from 32 MB to 2 GB; `max_wal_size` equals
+  `shared_buffers`, from 128 MB to 8 GB.
+- `max_worker_processes` is two per vCPU plus 8, never below 16: pg_cron runs its jobs in background workers
+  (`cronSettings`), and its launcher and pg_net's worker take two slots.
+- The pool size of the project's Supavisor tenant is 40% of `max_connections`, rounded down to 5: the share
+  hosted advises when PostgREST is in heavy use. `default_max_clients` is hosted's pooler client limit,
+  held under `[fleet] pooler_max_client_conn`. A pool size or client limit that someone saved wins
+  (`ApplyPoolDefaults`; the Management API reports the same defaults).
+- CPU: hosted publishes only "shared" up to Medium and dedicated vCPUs from Large. The quota is 100% per
+  core: 1 core for Nano to Small, 2 for Medium and Large, then the vCPU count of the size.
+- The size's memory and CPU become the project's `Limits` (systemd `MemoryMax` and `CPUQuota`), applied to
+  each of its units. The memory cap bounds each unit, so a project whose GoTrue and PostgREST grew to the
+  cap as well would hold up to three times its size; they use about 12 and 9 MB idle, and the capacity
+  check counts one cap per project.
+
+**Saved Postgres settings win**, as hosted's custom Postgres config wins over its generated one. A saved
+`shared_buffers` stays when a project changes size, so a resize is refused (see Resize, step 1) when the saved Postgres or pooler settings would not pass validation under the new size. `work_mem` is on
+the command line with the other sizing settings (`cmdlineSettings`), so a saved `work_mem` takes effect at the
+next restart like they do.
+
+**Names.** Studio's `infra_compute_size` values are the registry names (`nano`, `micro`, `small`, `medium`,
+`large`, `xlarge`, `2xlarge` ... `16xlarge`); the add-on variants are `ci_` plus the name. `ParseSize` also takes
+hosted's titles (`XL`, `2XL`) and `default` (what a manifest of an earlier version calls Micro). Registry
+migration 1250 renamed the classes of earlier versions: `micro` (16 MB `shared_buffers`, 30 connections) became
+Nano, `default` became Micro, `small`, `medium` and `large` kept their names, and a row whose limits were still the
+node default took the limits of its size. Sizes above 16XL are not offered.
+
+**Node capacity.** A size is a cap, not a reservation, and an idle project uses a small part of it
+(docs/research/09-footprint.md: about 65 MB PSS, or 150 MB with page cache, against Micro's 1 GB). The node
+therefore promises more memory than it has. `[compute] overcommit` (default 6, chosen so that the budget covers the
+idle projects docs/guide.md says a node holds: 48 Micro caps on 8 GiB, 96 on 16 GiB, 192 on 32 GiB) is the ratio: the sum of the memory
+caps of the projects that count may reach the node's memory times the ratio, and a size whose vCPUs exceed the
+node's cores is never offered. A create that names its size (`CreateRequest.Class`; a create without one gets Micro
+unchecked), a resize and a resume are refused with `*CapacityError` (400 through the API, with the reason in the
+message) when the node cannot honor them. Branch creates and restores as a new project always name their size (the
+branch's, the original's), so they are judged like `--size`; the plain create is the one exception. Going down never needs room, so a node that is over its budget can still shrink a
+project. Projects that count: every one but the system project, a paused one (`INACTIVE`, its units are down;
+it holds no room, so `Resume` judges its cap and cores like an upsize, which keeps a resize into a paused project's room from being undone by resuming it; the restart recovery of a daemon is not judged), a failed one and a removed one. `[compute] node_memory` and `node_cpus` override what is
+read from `/proc/meminfo` and the machine, for VMs whose view is the host's. Without `Engine.SetNode` (tests) nothing
+is checked; `Open` and `InitSystem` set it. `Engine.Offers` lists every size with whether it fits;
+`supavise projects sizes` and the dashboard's size list use it, and `supavise status` shows the headroom
+(`Capacity.Summary`).
+
+**Resize** (`resize.go`; `Engine.BeginResize` and `Run`, or `Resize` for both):
+
+1. Under the project's lock, taken without waiting (another operation running on the project, in this process or
+   another, is `ErrInvalidState`, 409 through the API): the project must be `ACTIVE_*` or paused. The saved Postgres and
+   pooler settings are validated against the new size (memory cap, `max_connections`); one that does not fit refuses
+   the resize with a 400 that names it (`*SettingsError`). The capacity check and the registry write are one step under
+   a node-wide lock (the Engine's mutex and, with the Postgres registry, an advisory lock, so the daemon and a CLI
+   `supavise projects resize` cannot both take the last room).
+2. The registry gets the new size and limits and the status `RESIZING`, which Studio shows as "Resizing"
+   (`project.resize_started`). `BeginResize` returns here; the Management API answers and runs `Run` in the
+   background, and the dashboard polls the status.
+3. `Run` asks the shared services to let go of the database (`quiesce`), stops the project's units, renders and starts
+   them again on the new size (the `MemoryMax` and `CPUQuota` drop-ins, the server arguments, the saved settings on
+   top), waits for PostgreSQL, GoTrue and PostgREST to answer a real request, and updates the Supavisor tenant with the
+   size's pool. Only this project restarts. The status returns to `ACTIVE_HEALTHY` and `project.resized` is recorded.
+4. Any failure puts the previous size back: the record, the units (stopped and started again on the old size) and the
+   tenant. The project stays `RESIZING` until the old units are back (a daemon that stops meanwhile recovers a `RESIZING`
+   project), then it is `ACTIVE_HEALTHY` on the old size, `project.resize_failed` carries the cause, and the error says
+   so. Downsizing a project that holds more replication slots than the smaller size allows is the case that fails: Postgres
+   refuses to start. If the old size does not come back either, the project is `ACTIVE_UNHEALTHY` and the error says that.
+5. A paused project only gets the new size in its record; `Resume` renders the units from it. A resize to the size the
+   project has changes nothing.
+
+**What Studio calls** (the pinned tag, `components/interfaces/DiskManagement`, which the Compute and Disk page renders):
+the project's size from `infra_compute_size` of `GET /platform/projects/{ref}`; the cards from `available_addons`
+(type `compute_instance`) of `GET /platform/projects/{ref}/billing/addons`; the change as `POST` of
+`{addon_type, addon_variant}` to the same path (it then sets the project's status to `RESIZING` itself and polls); disk
+from `GET /platform/projects/{ref}/disk`, `/disk/util` and `/disk/custom-config`, and `POST` of `/disk` and
+`/disk/custom-config`; `POST /platform/projects/{ref}/resize` is the older volume-size call. The page reads the
+permission to update projects and the entitlement `instances.compute_update_available_sizes` (granted: supavise
+has no plans). Two things Studio decides on its own: it adds a Nano card when the API lists none, and it locks that
+card on any plan but free unless the project is Nano already (supavise reports the plan `enterprise`), so going down
+to Nano is a CLI or API step (`supavise projects resize <ref> --size nano`, or removing the add-on). Its cards have no
+disabled state of their own, so the sizes the node cannot give are left out of the list instead of shown disabled;
+`supavise projects sizes` has them with the reason.
+
+`Recover` (run at daemon start) finds a project left `RESIZING` by a stopped daemon, stops its units, sets
+`INACTIVE` and flags it for `ResumeRecovered`, which starts it on the size the registry holds (the size the resize was
+going to, because the record is written first).
 
 ## System project
 

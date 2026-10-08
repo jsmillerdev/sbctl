@@ -237,11 +237,6 @@ func TestStudioCanOfferTheUpgrade(t *testing.T) {
 			t.Fatalf("disabled_features hides the upgrade section: %v", prof.Disabled)
 		}
 	}
-	disk := upJSON(t, f.fixture, "GET", "/platform/projects/"+testRef+"/disk", nil, 200, "GET /platform/projects/{ref}/disk")
-	attrs, _ := disk["attributes"].(map[string]any)
-	if attrs["type"] != "gp3" || attrs["size_gb"] != float64(includedDiskGB) {
-		t.Fatalf("disk attributes = %v, want the plan's included gp3 size so Studio prints no right-sizing note", attrs)
-	}
 }
 
 func TestUpgradeThroughTheAPI(t *testing.T) {

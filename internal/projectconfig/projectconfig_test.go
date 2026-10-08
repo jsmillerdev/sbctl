@@ -501,3 +501,33 @@ func TestSAMLIsRenderedWithTheProjectsOwnKey(t *testing.T) {
 		t.Fatal("rendered SAML without a key")
 	}
 }
+
+// CheckSaved judges what is saved against a smaller memory cap, as a save of it would be, so a
+// resize can refuse a size the saved settings do not fit.
+func TestCheckSavedJudgesSavedSettingsAgainstANewSize(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newManager(t)
+	big := CrossContext{MemoryLimit: 8 << 30}
+	if _, err := m.Patch(ctx, ref, Postgres, map[string]any{"shared_buffers": "3GB"}, big); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CheckSaved(ctx, ref, Postgres, big); err != nil {
+		t.Fatalf("3GB on an 8 GB cap: %v", err)
+	}
+	var ve *ValidationError
+	err := m.CheckSaved(ctx, ref, Postgres, CrossContext{MemoryLimit: 1 << 30})
+	if !errors.As(err, &ve) || !strings.Contains(ve.Msg, "shared_buffers") {
+		t.Fatalf("3GB on a 1 GB cap: %v", err)
+	}
+	// A pool saved on a large size is judged against the max_connections the target will run with.
+	if _, err := m.Patch(ctx, ref, Pooler, map[string]any{"default_pool_size": 200}, CrossContext{MaxConnections: 500}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CheckSaved(ctx, ref, Pooler, CrossContext{MaxConnections: 60}); !errors.As(err, &ve) || !strings.Contains(ve.Msg, "default_pool_size") {
+		t.Fatalf("a pool of 200 on 60 connections: %v", err)
+	}
+	// Nothing saved always passes.
+	if err := m.CheckSaved(ctx, "otherprojectrefabcdef", Postgres, CrossContext{MemoryLimit: 512 << 20}); err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+}

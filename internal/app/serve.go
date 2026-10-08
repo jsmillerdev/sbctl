@@ -17,6 +17,7 @@ import (
 	"github.com/jsmillerdev/supavise/internal/backup"
 	"github.com/jsmillerdev/supavise/internal/branching"
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/diskquota"
 	"github.com/jsmillerdev/supavise/internal/fleet"
 	"github.com/jsmillerdev/supavise/internal/functions"
 	"github.com/jsmillerdev/supavise/internal/health"
@@ -145,6 +146,8 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		Settings:      node.Settings, // the settings the engine renders units and tenants from
 		StudioRefresh: fm.RefreshStudio,
 		Logger:        log.With("component", "api"),
+		// Per-project disk sizes: the supervisor starts the root unit that sets an XFS quota.
+		Disk: diskquota.New(cfg, node.Supervisor),
 	}
 	if bs := backups(node); bs != nil { // a nil *backup.Service in the interface would not be nil
 		apiDeps.Backups = bs
