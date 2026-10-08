@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 	"github.com/supavise/supavise/internal/units"
@@ -951,5 +952,145 @@ func TestPostgresSpecRunsCronInBackgroundWorkers(t *testing.T) {
 		if f := strings.Fields(l); len(f) >= 5 && f[0] == "host" && f[4] == "trust" {
 			t.Errorf("pg_hba.conf trusts a TCP connection: %q", l)
 		}
+	}
+}
+
+// The rollout looks twice at a project whose files the daemon never held back: PendingRestart decides
+// to restart it, and RestartPending restarts it. The first look renders the new files, so the second
+// would find them in place and nothing to do, unless the first leaves the owed restart on record.
+// That is the window of a daemon that started while the project was UPGRADING (it skipped the
+// project, and so held nothing back) before the rollout reached it.
+func TestPendingRestartLeavesTheOwedRestartOnRecordForRestartPending(t *testing.T) {
+	const ref = "abcdefghijklmnopqrst"
+	now := time.Now()
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	cfg.Domain = "example.test"
+	cfg.BinPath = "/usr/local/bin/supavise"
+	p := testProject(cfg, ref, 2)
+	pgSpec := units.Spec{Service: config.SvcPostgres, Ref: ref}
+	version := "v1"
+	writeVersion := func(spec units.Spec) {
+		files := units.FilesFor(cfg, spec)
+		for _, f := range []string{files.Env, files.Run} {
+			if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f, []byte(version+spec.Service), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(f, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeAPIFiles(t, cfg, ref, now.Add(-2*time.Hour))
+	writeVersion(pgSpec)
+	sup := &namedSup{recSup: recSup{state: units.StateActive, since: now.Add(-time.Hour), render: writeVersion}}
+	pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: time.Millisecond, ServiceReadyTimeout: time.Millisecond})
+
+	// The release renders other files: the first look renders them, the unit runs the old ones.
+	version, sup.changed = "v2", true
+	ctx := context.Background()
+	if pending, err := pl.PendingRestart(ctx, p, testKeys(t, ref)); err != nil || !pending {
+		t.Fatalf("first look: pending = %v, %v", pending, err)
+	}
+	if !HeldRestart(cfg, ref) {
+		t.Fatal("the look that rendered the files left no mark of the restart it found")
+	}
+	sup.changed = false // the files are rendered; nothing changes at the next look
+	if pending, err := pl.PendingRestart(ctx, p, testKeys(t, ref)); err != nil || !pending {
+		t.Fatalf("second look: pending = %v, %v", pending, err)
+	}
+	sup.units = nil
+	// Nothing answers, so the wait for the cluster ends the call; the stops and the start are the point.
+	_, _ = pl.RestartPending(ctx, p, testKeys(t, ref))
+	cluster := config.UnitName(config.SvcPostgres, ref)
+	if got := strings.Join(sup.units, ", "); !strings.Contains(got, "stop "+cluster) || !strings.Contains(got, "start "+cluster) {
+		t.Fatalf("the cluster on older files was not restarted: %s", got)
+	}
+	if HeldRestart(cfg, ref) {
+		t.Fatal("the restart left its mark behind")
+	}
+}
+
+// The fence records of a node (failover/fenced) keep a primary from being rendered or started: its
+// launcher was removed to keep it down, and rendering it again would bring it back.
+func TestFencedPrimaryIsNeitherRenderedNorStarted(t *testing.T) {
+	const ref = "abcdefghijklmnopqrst"
+	for _, tc := range []struct {
+		name  string
+		write func(config.Paths) error
+	}{
+		{"project", func(p config.Paths) error {
+			return fenced.WriteProject(p, fenced.Record{Epoch: 3, Leader: "n2", Ref: ref, Reason: "project failover of " + ref})
+		}},
+		{"node", func(p config.Paths) error {
+			return fenced.WriteNode(p, fenced.Record{Epoch: 3, Leader: "n2", Reason: "n2 leads"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.StateDir = shortTempDir(t)
+			cfg.Domain = "example.test"
+			cfg.BinPath = "/usr/local/bin/supavise"
+			sup := &recSup{state: units.StateInactive, changed: true}
+			pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: time.Millisecond, ServiceReadyTimeout: time.Millisecond})
+			p := testProject(cfg, ref, 2)
+			keys := testKeys(t, ref)
+			if err := tc.write(cfg.Paths()); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			for name, call := range map[string]func() error{
+				"StartDatabase": func() error { return pl.StartDatabase(ctx, p, keys) },
+				"Start":         func() error { return pl.Start(ctx, p, keys) },
+				"Reconfigure":   func() error { return pl.Reconfigure(ctx, p, keys) },
+				"PendingRestart": func() error {
+					_, err := pl.PendingRestart(ctx, p, keys)
+					return err
+				},
+				"startRendered": func() error { return pl.startRendered(ctx, p) },
+				"PromoteReplica": func() error {
+					return pl.PromoteReplica(ctx, ReplicaTarget{Identifier: registry.ReplicaIdentifier(ref, "local", "abc123"), Project: p, Keys: keys}, PromoteOptions{Epoch: 3})
+				},
+			} {
+				if err := call(); !errors.Is(err, ErrFenced) {
+					t.Errorf("%s on a fenced %s = %v", name, tc.name, err)
+				}
+			}
+			if len(sup.calls) != 0 {
+				t.Fatalf("the supervisor was asked: %v", sup.calls)
+			}
+			if _, err := os.Stat(units.FilesFor(cfg, units.Spec{Service: config.SvcPostgres, Ref: ref}).Run); !os.IsNotExist(err) {
+				t.Fatalf("the launcher was written again: %v", err)
+			}
+
+			// The fence is lifted (`supavise node rejoin`, or the data set aside): the primary renders again.
+			if tc.name == "node" {
+				_ = fenced.ClearNode(cfg.Paths())
+			} else {
+				_ = fenced.ClearProject(cfg.Paths(), ref)
+			}
+			if _, err := pl.postgresSpec(ctx, p, keys); err != nil {
+				t.Fatalf("spec after the fence: %v", err)
+			}
+		})
+	}
+}
+
+// An unreadable record blocks too: the answer fails closed.
+func TestUnreadableFenceRecordBlocksThePrimary(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	path := fenced.NodePath(cfg.Paths())
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fencedErr(cfg, "abcdefghijklmnopqrst"); !errors.Is(err, ErrFenced) {
+		t.Fatalf("fencedErr = %v", err)
 	}
 }

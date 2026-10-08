@@ -49,7 +49,7 @@ func (m *muxRPC) Call(ctx context.Context, node, method, path string, in, out an
 	if rec.Code < 200 || rec.Code > 299 {
 		var pe peerapi.Error
 		_ = json.Unmarshal(rec.Body.Bytes(), &pe)
-		return &mesh.RemoteError{Node: node, Status: rec.Code, Message: pe.Message}
+		return &mesh.RemoteError{Node: node, Status: rec.Code, Message: pe.Message, Code: pe.Code}
 	}
 	if out != nil && rec.Body.Len() > 0 {
 		return json.Unmarshal(rec.Body.Bytes(), out)
@@ -260,15 +260,36 @@ func (a *recordingAgent) Do(_ context.Context, id string, act peerapi.Action, re
 type fakeBackups struct {
 	mu       sync.Mutex
 	reasons  []string
+	noRecord []bool
 	restored []lifecycle.RestoreRequest
+	files    []string
+	recorded []backup.RemoteBase
 	err      error
+	// recordErr is what RecordBase answers instead of a row.
+	recordErr error
 }
 
 func (f *fakeBackups) BaseBackupWith(_ context.Context, ref string, bo backup.BackupOptions) (*registry.Backup, error) {
 	f.mu.Lock()
 	f.reasons = append(f.reasons, bo.Reason)
+	f.noRecord = append(f.noRecord, bo.NoRecord)
 	f.mu.Unlock()
 	return &registry.Backup{Ref: ref, Location: "file:///b/" + ref + "/base/20261001T000000Z-ab12/", Timeline: 2, StartLSN: "0/3000028", StopLSN: "0/3000100", SizeBytes: 1234}, f.err
+}
+func (f *fakeBackups) BackupFiles(_ context.Context, ref string, fo backup.FilesOptions) (*backup.FilesResult, error) {
+	f.mu.Lock()
+	f.files = append(f.files, ref+" "+fo.Reason)
+	f.mu.Unlock()
+	return &backup.FilesResult{}, f.err
+}
+func (f *fakeBackups) RecordBase(_ context.Context, ref string, b backup.RemoteBase) (*registry.Backup, error) {
+	f.mu.Lock()
+	f.recorded = append(f.recorded, b)
+	f.mu.Unlock()
+	if f.recordErr != nil {
+		return nil, f.recordErr
+	}
+	return &registry.Backup{ID: 31, Ref: ref, Status: registry.BackupCompleted, Location: "file:///b/" + ref + "/base/" + b.ID + "/", Timeline: b.Timeline}, nil
 }
 func (f *fakeBackups) RestoreInPlace(_ context.Context, ref string, req lifecycle.RestoreRequest) error {
 	f.mu.Lock()

@@ -1,8 +1,6 @@
 package lifecycle
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -82,6 +80,13 @@ func (pl *PostgresPlane) PromoteReplica(ctx context.Context, t ReplicaTarget, o 
 		return errors.New("lifecycle: PromoteReplica needs the cluster epoch")
 	}
 	p := t.Project
+	// A fenced node does not promote anything. The check comes before every other step so that
+	// ErrFenced is a refusal that changed nothing, which the orchestrator can tell from a promotion
+	// that may have happened. A fence record that appears after the promotion ran is not reported as
+	// ErrFenced (see the end of promote).
+	if err := fencedErr(pl.cfg, p.Ref); err != nil {
+		return err
+	}
 	if st, err := pl.sql().Status(ctx, addrOf(pl.paths(p))); err == nil && !st.InRecovery && pl.promoteOKAtLeast(p.Ref, o.Epoch) {
 		return nil // promoted and restarted earlier
 	}
@@ -157,7 +162,17 @@ func (pl *PostgresPlane) promote(ctx context.Context, t ReplicaTarget, o Promote
 	if err := dropRecoverySettings(rp.Data); err != nil {
 		return err
 	}
-	return pl.StartDatabase(ctx, p, t.Keys)
+	if err := pl.StartDatabase(ctx, p, t.Keys); err != nil {
+		// StartDatabase checks the fence again. A record that appeared since the entry check
+		// arrives after pg_promote ran, so the error must not read as the refusal that changed
+		// nothing (placement.Refused): the cluster is promoted, and the orchestrator has to treat the
+		// outcome as unknown.
+		if errors.Is(err, ErrFenced) {
+			return fmt.Errorf("lifecycle: promoted %s, but its primary did not start: %v", t.Identifier, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // holdPorts takes ref's ports from the mesh's forwarders. A hold that is in place is replaced: a
@@ -266,6 +281,9 @@ func (pl *PostgresPlane) DemoteToReplica(ctx context.Context, t ReplicaTarget) e
 	}
 	p := t.Project
 	rp, cp := pl.replicaPaths(p), pl.paths(p)
+	if fileExists(filepath.Join(rp.Data, SeedMarker)) {
+		return fmt.Errorf("lifecycle: the seeding of replica %s in %s did not finish; it is seeded again, not demoted onto", t.Identifier, rp.Data)
+	}
 	pl.holdPorts(p.Ref)
 	defer pl.releasePorts(p.Ref)
 	if fileExists(filepath.Join(rp.Data, "standby.signal")) {
@@ -293,8 +311,8 @@ func (pl *PostgresPlane) DemoteToReplica(ctx context.Context, t ReplicaTarget) e
 			pl.log.Warn("demote: removing the GoTrue unit", "ref", p.Ref, "error", err)
 		}
 		conf := []string{
-			"primary_conninfo = " + confString(primaryConninfo(pl.cfg.PortsFor(p.Ref, p.Seq).Postgres, t.Keys.ReplicationPassword, t.Identifier)),
-			"restore_command = " + confString(pl.opts.RestoreCommandFor(p.Ref)),
+			"primary_conninfo = " + ConfString(primaryConninfo(pl.cfg.PortsFor(p.Ref, p.Seq).Postgres, t.Keys.ReplicationPassword, t.Identifier)),
+			"restore_command = " + ConfString(pl.opts.RestoreCommandFor(p.Ref)),
 			"recovery_target_timeline = 'latest'",
 		}
 		if err := setRecoverySettings(rp.Data, conf); err != nil {
@@ -344,93 +362,9 @@ func primaryConninfo(port int, password, applicationName string) string {
 		port, RoleReplication, kvQuote(password), kvQuote(applicationName))
 }
 
-// confString quotes a value for postgresql.conf, where a backslash inside quotes starts an escape.
-func confString(s string) string {
-	return "'" + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), "'", "''") + "'"
-}
-
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
-}
-
-// recoverySettingNames are the settings of a cluster in recovery that a primary must not carry.
-// hot_standby is the one the backup service's seeder writes and a primary ignores; the replica's units
-// pass it on the command line.
-var recoverySettingNames = map[string]bool{
-	"primary_conninfo": true, "primary_slot_name": true, "restore_command": true, "hot_standby": true,
-	"recovery_target_timeline": true, "recovery_target": true, "recovery_target_name": true,
-	"recovery_target_time": true, "recovery_target_xid": true, "recovery_target_lsn": true,
-	"recovery_target_inclusive": true, "recovery_target_action": true, "archive_cleanup_command": true,
-	"recovery_end_command": true, "recovery_min_apply_delay": true,
-}
-
-// dropRecoverySettings removes the recovery settings from the postgresql.auto.conf of dataDir and the
-// signal files that start a recovery, so that the cluster starts as a primary.
-func dropRecoverySettings(dataDir string) error {
-	for _, f := range []string{"standby.signal", "recovery.signal"} {
-		if err := os.Remove(filepath.Join(dataDir, f)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	return rewriteAutoConf(dataDir, nil)
-}
-
-// setRecoverySettings replaces the recovery settings of dataDir's postgresql.auto.conf by lines.
-func setRecoverySettings(dataDir string, lines []string) error {
-	return rewriteAutoConf(dataDir, lines)
-}
-
-// recoverySettingOf returns the name of the recovery setting that a line of postgresql.auto.conf assigns.
-func recoverySettingOf(line string) (string, bool) {
-	name := strings.TrimSpace(line)
-	if i := strings.IndexAny(name, "= \t"); i > 0 && !strings.HasPrefix(name, "#") {
-		if n := strings.ToLower(name[:i]); recoverySettingNames[n] {
-			return n, true
-		}
-	}
-	return "", false
-}
-
-// standbyBlockHeaders open the block of settings the backup service's seeder appends to a standby's
-// postgresql.auto.conf (backup.SeedReplica); the settings go with the block, so its header does too.
-var standbyBlockHeaders = []string{"# --- supavise standby ", "# --- supavise archive-only standby "}
-
-func isStandbyBlockHeader(line string) bool {
-	for _, h := range standbyBlockHeaders {
-		if strings.HasPrefix(strings.TrimSpace(line), h) {
-			return true
-		}
-	}
-	return false
-}
-
-// rewriteAutoConf drops every assignment of a recovery setting, and the header of the seeder's block
-// of them, from postgresql.auto.conf, keeps the rest as it is and appends add.
-func rewriteAutoConf(dataDir string, add []string) error {
-	path := filepath.Join(dataDir, "postgresql.auto.conf")
-	b, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	var out bytes.Buffer
-	sc := bufio.NewScanner(bytes.NewReader(b))
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	for sc.Scan() {
-		line := sc.Text()
-		if _, ok := recoverySettingOf(line); ok || isStandbyBlockHeader(line) {
-			continue
-		}
-		out.WriteString(line + "\n")
-	}
-	if err := sc.Err(); err != nil {
-		return err
-	}
-	for _, l := range add {
-		out.WriteString(l + "\n")
-	}
-	_, err = writeFile(path, out.Bytes(), 0o600)
-	return err
 }
 
 // ControlInfo is what a cluster's pg_control file says.

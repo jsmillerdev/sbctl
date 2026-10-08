@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/supavise/supavise/internal/config"
 )
 
 // StorageDir returns the directory holding ref's Storage objects, or "" when the node does
@@ -26,11 +28,36 @@ func (s *Service) storageDir(ref string) string {
 	if s.opt.StorageDir != nil {
 		return s.opt.StorageDir(ref)
 	}
-	if s.opt.Config == nil || s.opt.Config.Fleet.StorageBackend == "s3" {
+	if s.opt.Config == nil || s.storageIsS3() {
 		return ""
 	}
 	return s.opt.Config.Paths().StorageObjects(ref)
 }
+
+// storageIsS3 reports whether Storage keeps its objects in a bucket. [fleet] storage_backend is read from
+// the config file at each run, not taken from the copy the daemon loaded when it started: `supavise
+// storage migrate` changes it, and a daemon that predates the migration (or its rollback) would
+// otherwise back up the wrong place, and record an empty Storage snapshot after the files were moved
+// aside. Without Options.ConfigPath (a Service built in memory, a process that loaded no file), or
+// when the file is not there, the Service's own Config decides. A file that is there and cannot be
+// loaded leaves that copy too, and the first time says so.
+func (s *Service) storageIsS3() bool {
+	if path := s.opt.ConfigPath; path != "" {
+		if _, err := os.Stat(path); err == nil {
+			c, err := config.Load(path)
+			if err == nil {
+				return c.Fleet.StorageBackend == "s3"
+			}
+			if _, seen := unloadableConfig.LoadOrStore(path+"\n"+err.Error(), true); !seen {
+				s.opt.Log.Warn("the config file cannot be loaded, so the backup of Storage uses the storage_backend this process started with; it may look at the wrong place after `supavise storage migrate`", "path", path, "error", err)
+			}
+		}
+	}
+	return s.opt.Config != nil && s.opt.Config.Fleet.StorageBackend == "s3"
+}
+
+// unloadableConfig holds the config files storageIsS3 has warned about, by path and error.
+var unloadableConfig sync.Map
 
 // backupStorage takes a snapshot of ref's Storage objects. It reports nil, nil when there
 // is nothing to do: no objects directory on this node and no earlier snapshot to supersede.

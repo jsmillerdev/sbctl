@@ -73,6 +73,10 @@ type CapacityError struct {
 
 func (e *CapacityError) Error() string { return "lifecycle: " + e.Message }
 
+// NoRoom is true: the node cannot hold what was asked of it. The replica controller reads it as a
+// reason to wait and ask again, not as a failed setup (replicas.RoomError).
+func (e *CapacityError) NoRoom() bool { return true }
+
 // countsAgainstNode reports whether a project in status s holds, or is about to hold, its
 // memory cap on the node. A paused project holds none, and a failed or removed one has no units.
 func countsAgainstNode(s registry.Status) bool {

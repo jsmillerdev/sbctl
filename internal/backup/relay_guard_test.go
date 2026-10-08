@@ -280,3 +280,38 @@ func TestRelayGuardWithoutPromoteOKPathRefuses(t *testing.T) {
 		t.Fatalf("pushGuard of a primary = %d, %v", code, err)
 	}
 }
+
+// A guard that cannot judge a push (the registry or the epoch does not answer) holds it back with a 503
+// and says so in the log, once a minute per project: a registry that stays away stalls the archiving
+// of every project, and Postgres's own log is the only other place that shows it.
+func TestRelayLogsAPushItCouldNotJudgeOncePerMinute(t *testing.T) {
+	g := newGuardEnv(t, testRef)
+	ctx := context.Background()
+	g.set(func() { g.roleErr = errors.New("registry unreachable") })
+	wal := writeWAL(t, walA, 1<<10, 7)
+	for i := 0; i < 3; i++ {
+		if err := RelayPush(ctx, g.sock(testRef), testRef, wal); err == nil {
+			t.Fatal("a push the guard could not judge went through")
+		}
+	}
+	if n := strings.Count(g.log.String(), "the guard could not tell whether the cluster may archive"); n != 1 {
+		t.Fatalf("logged %d times in one minute:\n%s", n, g.log.String())
+	}
+	g.set(func() { g.clock = g.clock.Add(2 * time.Minute) })
+	if err := RelayPush(ctx, g.sock(testRef), testRef, wal); err == nil {
+		t.Fatal("a push the guard could not judge went through")
+	}
+	if n := strings.Count(g.log.String(), "the guard could not tell whether the cluster may archive"); n != 2 {
+		t.Fatalf("logged %d times after a minute:\n%s", n, g.log.String())
+	}
+	// The epoch that does not answer is the same.
+	g.set(func() { g.roleErr, g.replicas[testRef], g.epochErr = nil, true, errors.New("no epoch") })
+	g.promoteOK(t, testRef, FormatPromoteOK(3))
+	g.set(func() { g.clock = g.clock.Add(2 * time.Minute) })
+	if err := RelayPush(ctx, g.sock(testRef), testRef, wal); err == nil {
+		t.Fatal("a push under an unknown epoch went through")
+	}
+	if !strings.Contains(g.log.String(), "cannot read the cluster epoch") {
+		t.Fatalf("the epoch failure is not in the log:\n%s", g.log.String())
+	}
+}

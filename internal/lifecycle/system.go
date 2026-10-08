@@ -352,6 +352,17 @@ func (t supervisorTimers) StopTimer(ctx context.Context, ref string) error {
 	return t.sup.Stop(ctx, "supavise-basebackup@"+ref+".timer")
 }
 
+// followerTimers is the timer control of a follower: StartTimer stops the timer. `supavise backups
+// create` records its backup in the registry, and a follower's copy of the registry takes no write, so
+// the leader takes the nightly backup of the projects homed on a follower (placement.ScheduledBackups)
+// and the follower runs no timer for them. Stopping covers a timer that this node left running from
+// when it led.
+type followerTimers struct{ supervisorTimers }
+
+func (t followerTimers) StartTimer(ctx context.Context, ref string) error {
+	return t.StopTimer(ctx, ref)
+}
+
 // timers returns the backup timer control for the systemd backend; the exec backend has
 // no timers (backups are taken with `supavise backups create`).
 func (o *OpenOptions) timers(cfg *config.Config, sup units.Supervisor) Timers {
@@ -360,6 +371,9 @@ func (o *OpenOptions) timers(cfg *config.Config, sup units.Supervisor) Timers {
 	}
 	if cfg.Supervisor != config.SupervisorSystemd {
 		return nil
+	}
+	if o.ReadOnly {
+		return followerTimers{supervisorTimers{sup: sup}}
 	}
 	return supervisorTimers{sup: sup}
 }

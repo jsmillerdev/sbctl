@@ -363,6 +363,9 @@ func (pl *PostgresPlane) startCluster(ctx context.Context, spec units.Spec, pp p
 // needs no credentials, and waits for it. The system project uses it to reach its own
 // registry, where its credentials are stored.
 func (pl *PostgresPlane) startRendered(ctx context.Context, p *registry.Project) error {
+	if err := fencedErr(pl.cfg, p.Ref); err != nil {
+		return err
+	}
 	unit := config.UnitName(config.SvcPostgres, p.Ref)
 	files := units.FilesFor(pl.cfg, units.Spec{Service: config.SvcPostgres, Ref: p.Ref})
 	if _, err := os.Stat(files.Run); err != nil {
@@ -604,6 +607,7 @@ func (pl *PostgresPlane) pendingAPI(ctx context.Context, p *registry.Project, ke
 	}
 	var out []units.Spec
 	for _, spec := range specs {
+		before := pl.digest(spec)
 		changed, err := pl.render(ctx, spec)
 		if err != nil {
 			return nil, err
@@ -612,6 +616,11 @@ func (pl *PostgresPlane) pendingAPI(ctx context.Context, p *registry.Project, ke
 		if err != nil || (st.State != units.StateActive && st.State != units.StateActivating) {
 			pl.clearHeld(spec)
 			continue
+		}
+		if changed {
+			// This render is the only account of the owed restart: the next look finds the files already
+			// rendered. The mark keeps the answer the same until the unit restarts.
+			pl.holdBack(spec, before)
 		}
 		switch held := pl.heldState(spec, st); {
 		case held == heldSettled:
@@ -631,6 +640,7 @@ func (pl *PostgresPlane) pendingDatabase(ctx context.Context, p *registry.Projec
 	if err != nil {
 		return nil, err
 	}
+	before := pl.digest(spec)
 	changed, err := pl.render(ctx, spec)
 	if err != nil {
 		return nil, err
@@ -639,6 +649,11 @@ func (pl *PostgresPlane) pendingDatabase(ctx context.Context, p *registry.Projec
 	if err != nil || (st.State != units.StateActive && st.State != units.StateActivating) {
 		pl.clearHeld(spec)
 		return nil, nil
+	}
+	if changed {
+		// See pendingAPI: a look that renders must leave the owed restart on record, or the rollout's
+		// second look (RestartPending after PendingRestart) finds nothing to restart.
+		pl.holdBack(spec, before)
 	}
 	switch held := pl.heldState(spec, st); {
 	case held == heldSettled:

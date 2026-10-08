@@ -325,7 +325,7 @@ func TestPostgresSettingsRestartRestartTheReplicas(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "Restart " + p.Ref + ",Replica " + ids[0] + ",Replica " + ids[1]
-	if got := strings.Join(h.plane.calls, ","); got != want {
+	if got := inReplicaOrder(h.plane.calls); got != want {
 		t.Fatalf("calls = %s\nwant    %s", got, want)
 	}
 	for _, id := range ids {
@@ -365,5 +365,54 @@ func TestPostgresSettingsRestartRestartTheReplicas(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no %s event in %+v", EventReplicaRestartFailed, evs)
+	}
+}
+
+// remoteBackups is the RemoteBackups of a leader whose backup service cannot read the data of another node.
+type remoteBackups struct {
+	calls []string
+	err   error
+}
+
+func (r *remoteBackups) FinalBackup(_ context.Context, p *registry.Project) (*registry.Backup, error) {
+	r.calls = append(r.calls, p.NodeID+" "+p.Ref)
+	return &registry.Backup{Ref: p.Ref}, r.err
+}
+
+// The final backup of a delete of a project homed on another node is taken on its home when the Engine
+// has a way to ask, and the delete otherwise refuses as it did.
+func TestDeleteOfAProjectHomedElsewhereTakesItsFinalBackupOnTheHome(t *testing.T) {
+	ctx := context.Background()
+	c := newClusterHarness(t, "n1")
+	fr := &fakeRestorer{h: c.harness}
+	c.e = NewEngine(c.cfg, c.reg, c.sec, fakeArts{}, routedPlane{c.plane}, Options{Fleet: fleet.Fleet{c.tenant}, Backup: fr, NodeID: "n1"})
+	ref := c.home2.Ref
+	rb := &remoteBackups{}
+	c.e.SetRemoteBackups(rb)
+
+	// A failed backup keeps the project and the delete stops there.
+	rb.err = errors.New("n2 did not answer")
+	if err := c.e.Delete(ctx, ref); err == nil || !strings.Contains(err.Error(), "n2 did not answer") {
+		t.Fatalf("Delete with a failing remote backup = %v", err)
+	}
+	if p, _ := c.reg.GetProject(ctx, ref); p.Status != c.home2.Status || c.plane.has("Delete "+ref) {
+		t.Fatalf("status %s, plane %v", p.Status, c.plane.calls)
+	}
+
+	rb.err = nil
+	if err := c.e.Delete(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(rb.calls, ","); got != c.home2.NodeID+" "+ref+","+c.home2.NodeID+" "+ref {
+		t.Fatalf("remote backups = %s", got)
+	}
+	if len(fr.calls) != 0 {
+		t.Fatalf("the leader's own backup service was asked for a project it holds no data of: %v", fr.calls)
+	}
+	if !c.plane.has("Delete " + ref) {
+		t.Fatalf("plane calls: %v", c.plane.calls)
+	}
+	if _, err := c.reg.GetProject(ctx, ref); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("the project is still there: %v", err)
 	}
 }

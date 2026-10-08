@@ -359,6 +359,10 @@ func (s *S3Store) PutIf(ctx context.Context, key string, data []byte, tag string
 	switch {
 	case status == http.StatusPreconditionFailed || code == "PreconditionFailed" || code == "ConditionalRequestConflict":
 		return fmt.Errorf("%w: s3 put %s", ErrPreconditionFailed, k)
+	// An If-Match on an object that was deleted after it was read: the state the caller read is gone, which
+	// is what a failed precondition says, and the caller reads again.
+	case tag != "" && (status == http.StatusNotFound || code == "NoSuchKey"):
+		return fmt.Errorf("%w: s3 put %s: the object is gone", ErrPreconditionFailed, k)
 	case status == http.StatusNotImplemented || code == "NotImplemented",
 		// A service that does not know the header may refuse it as a bad request instead.
 		status == http.StatusBadRequest && (code == "InvalidArgument" || code == "MalformedHeader"):

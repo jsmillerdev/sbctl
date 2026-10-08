@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/units"
 )
@@ -495,6 +496,27 @@ func TestPromoteReplicaStateMachine(t *testing.T) {
 	}
 }
 
+// A fence record that appears while the promotion runs does not come back as ErrFenced: pg_promote
+// ran, so the error is not the refusal that changed nothing.
+func TestPromoteReplicaFencedAfterThePromotionIsNotARefusal(t *testing.T) {
+	fastReplicaPoll(t)
+	f := newReplicaFixture(t)
+	f.seeded(t, true)
+	f.sql.status[f.rp.Port] = ClusterStatus{InRecovery: true}
+	f.sql.onPromote = func(ClusterAddr) {
+		if err := fenced.WriteProject(f.cfg.Paths(), fenced.Record{Epoch: 9, Leader: "n2", Ref: testRef, Reason: "project failover of " + testRef}); err != nil {
+			t.Error(err)
+		}
+	}
+	err := f.pl.PromoteReplica(context.Background(), f.t, PromoteOptions{Epoch: 2})
+	if err == nil || errors.Is(err, ErrFenced) || !strings.Contains(err.Error(), "promoted") {
+		t.Fatalf("a promotion fenced after pg_promote = %v", err)
+	}
+	if !strings.Contains(f.sql.calls(), "promote") {
+		t.Fatalf("sql calls = %s", f.sql.calls())
+	}
+}
+
 func TestPromoteReplicaRefusalsAndRecovery(t *testing.T) {
 	fastReplicaPoll(t)
 	ctx := context.Background()
@@ -727,7 +749,7 @@ func TestRewriteAutoConfKeepsTheRest(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "postgresql.auto.conf"), []byte(in), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if err := rewriteAutoConf(dir, []string{"recovery_target_timeline = 'latest'"}); err != nil {
+	if err := rewriteAutoConf(dir, []string{"recovery_target_timeline = 'latest'"}, false); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
@@ -740,11 +762,38 @@ func TestRewriteAutoConfKeepsTheRest(t *testing.T) {
 	}
 	// A missing file is created.
 	empty := t.TempDir()
-	if err := rewriteAutoConf(empty, []string{"a = 1"}); err != nil {
+	if err := rewriteAutoConf(empty, []string{"a = 1"}, false); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(empty, "postgresql.auto.conf")); string(b) != "a = 1\n" {
 		t.Fatalf("created file = %q", b)
+	}
+}
+
+// The seeder's block is one unit: its header, its recovery settings and, when asked, the archive settings
+// that follow the header. An archive_command of the primary's own that stands elsewhere in the file stays
+// in any case.
+func TestClearStandbyBlockDropsTheArchiveLinesOfTheBlockOnRequest(t *testing.T) {
+	in := "archive_mode = on\narchive_command = 'primary'\nwork_mem = '8MB'\n" +
+		"\n# --- supavise standby id of ref (backup b1) ---\narchive_mode = on\narchive_command = 'seeded'\nrestore_command = 'r'\n" +
+		"recovery_target_timeline = 'latest'\nhot_standby = on\nprimary_conninfo = 'c'\nmax_connections = '60'\n"
+	for _, tc := range []struct {
+		archive bool
+		want    string
+	}{
+		{false, "archive_mode = on\narchive_command = 'primary'\nwork_mem = '8MB'\n\narchive_mode = on\narchive_command = 'seeded'\nmax_connections = '60'\n"},
+		{true, "archive_mode = on\narchive_command = 'primary'\nwork_mem = '8MB'\n\nmax_connections = '60'\n"},
+	} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "postgresql.auto.conf"), []byte(in), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := ClearStandbyBlock(dir, tc.archive); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf")); string(b) != tc.want {
+			t.Errorf("archive=%v:\n%s\nwant:\n%s", tc.archive, b, tc.want)
+		}
 	}
 }
 
@@ -973,5 +1022,111 @@ func TestReplicaUnitsGolden(t *testing.T) {
 	}
 	if got != string(want) {
 		t.Fatalf("the replica's units changed:\n%s", firstDifference(string(want), got))
+	}
+}
+
+// pg-meta and the parameterized-query path of the Management API connect to the replica's port on
+// loopback with a password, as postgres and as supavise_read_only, as they do to the primary's: the
+// standby's pg_hba.conf is the primary's, which takes a SCRAM login from any role on 127.0.0.1 and
+// ::1 and trusts no TCP connection.
+func TestReplicaHBATakesPasswordLoginsOnLoopback(t *testing.T) {
+	f := newReplicaFixture(t)
+	if err := f.pl.prepareAt(f.t.Project, f.t.Keys, f.rp, true); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(f.rp.HBA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rules []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			rules = append(rules, strings.Join(strings.Fields(line), " "))
+		}
+	}
+	has := func(want string) bool {
+		for _, r := range rules {
+			if r == want {
+				return true
+			}
+		}
+		return false
+	}
+	for _, want := range []string{"host all all 127.0.0.1/32 scram-sha-256", "host all all ::1/128 scram-sha-256"} {
+		if !has(want) {
+			t.Errorf("the replica's pg_hba.conf lacks %q:\n%s", want, b)
+		}
+	}
+	for _, r := range rules {
+		if strings.HasPrefix(r, "host") && strings.HasSuffix(r, " trust") {
+			t.Errorf("the replica trusts a TCP connection: %q", r)
+		}
+	}
+	if fi, err := os.Stat(f.rp.HBA); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("pg_hba.conf = %v, %v", fi, err)
+	}
+	// It is the file of the primary: one source for both.
+	p, err := os.ReadFile(f.cp.HBA)
+	if err != nil || string(p) != string(b) {
+		t.Errorf("the primary's pg_hba.conf differs: %v", err)
+	}
+}
+
+// A directory that carries the seeder's marker was cut off while it was filled: it holds a backup_label
+// and no standby.signal, and a unit started on it would be a primary. Nothing starts one.
+func TestNoUnitStartsOnADirectoryASeedLeftUnfinished(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	f.seeded(t, true)
+	if err := os.WriteFile(filepath.Join(f.rp.Data, SeedMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, call := range map[string]func() error{
+		"StartReplicaDatabase": func() error { return f.pl.StartReplicaDatabase(ctx, f.t) },
+		"StartReplica":         func() error { return f.pl.StartReplica(ctx, f.t) },
+		"DemoteToReplica":      func() error { return f.pl.DemoteToReplica(ctx, f.t) },
+	} {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "did not finish") {
+			t.Errorf("%s on an unfinished seed = %v", name, err)
+		}
+	}
+	if ops := f.sup.ops(); ops != "" {
+		t.Fatalf("the supervisor was asked: %s", ops)
+	}
+	if err := os.Remove(filepath.Join(f.rp.Data, SeedMarker)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pl.replicaPostgresSpec(ctx, f.t); err != nil {
+		t.Fatalf("a finished seed: %v", err)
+	}
+}
+
+// A promotion that died after it wrote promote.ok and before pg_promote ran leaves a standby with the
+// file; the standby's next start removes it, because the relay would trust it for the epoch it names.
+// A cluster that is already a primary keeps its file.
+func TestAStandbyThatStartsDoesNotKeepPromoteOK(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	f.seeded(t, true)
+	if err := f.pl.writePromoteOK(testRef, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.pl.StartReplicaDatabase(ctx, f.t); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(f.cfg.Paths().PromoteOK(testRef)) {
+		t.Fatal("a standby started with a promote.ok beside it")
+	}
+
+	g := newReplicaFixture(t)
+	g.seeded(t, false) // promoted: no standby.signal
+	if err := g.pl.writePromoteOK(testRef, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.pl.StartReplicaDatabase(ctx, g.t); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExists(g.cfg.Paths().PromoteOK(testRef)) {
+		t.Fatal("the promote.ok of a promoted cluster went")
 	}
 }

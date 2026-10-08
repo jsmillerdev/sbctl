@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/supavise/supavise/internal/backup"
@@ -66,6 +67,10 @@ func Register(handle func(pattern string, fn mesh.HandlerFunc), d HandlerDeps) e
 	handle("POST "+peerapi.PathBackup, h.backup)
 	return nil
 }
+
+// queryEpoch is the query parameter that carries the cluster epoch of a request that has no body
+// (DELETE of an instance).
+const queryEpoch = "epoch"
 
 type handlers struct{ d HandlerDeps }
 
@@ -167,6 +172,21 @@ func (h *handlers) remove(w http.ResponseWriter, r *http.Request) {
 	if err := h.authorize(r); err != nil {
 		writeErr(w, err)
 		return
+	}
+	// The removal deletes a directory: it is made under the epoch of the leader that asks, like every
+	// other request that changes the node, so that a leader that was replaced and does not know it yet
+	// cannot destroy what the new one keeps. (A request without an epoch is a leader of an older
+	// release, which only the leader check covers.)
+	if q := r.URL.Query().Get(queryEpoch); q != "" {
+		epoch, err := strconv.ParseInt(q, 10, 64)
+		if err != nil || epoch < 0 {
+			badRequest(w, "the epoch %q is not a cluster epoch", q)
+			return
+		}
+		if err := h.epochOK(epoch); err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
 	if err := h.d.Agent.Remove(r.Context(), r.PathValue("identifier")); err != nil {
 		writeErr(w, err)
@@ -314,7 +334,8 @@ func (h *handlers) backup(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "unknown backup operation %q", op)
 		return
 	}
-	res, err := RunBackup(r.Context(), h.d.Backups, ref, op, req)
+	// This node's registry is a copy the leader writes: the leader records the backup (RecordBase).
+	res, err := runBackup(r.Context(), h.d.Backups, ref, op, req, false)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -323,11 +344,17 @@ func (h *handlers) backup(w http.ResponseWriter, r *http.Request) {
 }
 
 // RunBackup performs the backup operation op for ref with the node's backup service: a base backup,
-// or an in-place restore.
+// or an in-place restore. It is the leader's own backup, which records itself in the registry.
 func RunBackup(ctx context.Context, b LocalBackups, ref string, op peerapi.BackupOp, req peerapi.BackupRequest) (peerapi.BackupResult, error) {
+	return runBackup(ctx, b, ref, op, req, true)
+}
+
+// runBackup is RunBackup; record says whether a base backup writes the registry. The backup a
+// follower takes for the leader does not: its registry is a read-only copy.
+func runBackup(ctx context.Context, b LocalBackups, ref string, op peerapi.BackupOp, req peerapi.BackupRequest, record bool) (peerapi.BackupResult, error) {
 	switch op {
 	case peerapi.BackupBase:
-		bo := backup.BackupOptions{Reason: req.Reason}
+		bo := backup.BackupOptions{Reason: req.Reason, NoRecord: !record}
 		rec, err := b.BaseBackupWith(ctx, ref, bo)
 		if err != nil {
 			return peerapi.BackupResult{}, err

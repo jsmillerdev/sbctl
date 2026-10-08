@@ -109,6 +109,12 @@ func (pl *PostgresPlane) postgresSpec(ctx context.Context, p *registry.Project, 
 // a replica instead of a primary: the same class and saved settings (a standby needs at least the
 // primary's limits), hot_standby on, and the cluster must have been seeded already. See replica.go.
 func (pl *PostgresPlane) postgresSpecFor(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, pp pgPaths, standby bool) (units.Spec, error) {
+	// A fenced primary is not rendered, which would write its launcher again (design 2.10.6).
+	if !standby {
+		if err := fencedErr(pl.cfg, p.Ref); err != nil {
+			return units.Spec{}, err
+		}
+	}
 	art, err := pl.artifactDir(p, config.SvcPostgres)
 	if err != nil {
 		return units.Spec{}, err
@@ -190,6 +196,11 @@ func (pl *PostgresPlane) postgresSpecFor(ctx context.Context, p *registry.Projec
 
 // apiSpecs returns the GoTrue spec and, for user projects, the PostgREST spec.
 func (pl *PostgresPlane) apiSpecs(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) ([]units.Spec, error) {
+	// GoTrue and PostgREST belong to the primary's home: on a fenced node they would serve the
+	// project through the forwarder to its new home.
+	if err := fencedErr(pl.cfg, p.Ref); err != nil {
+		return nil, err
+	}
 	ports := pl.cfg.PortsFor(p.Ref, p.Seq)
 	pgPort := ports.Postgres
 

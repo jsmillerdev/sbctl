@@ -207,6 +207,7 @@ func (e *Engine) SetDatabasePassword(ctx context.Context, ref, password string) 
 		if err := e.opts.Fleet.RefreshTenant(ctx, ref); err != nil {
 			e.log.Warn("database password changed, but the pooler could not drop its cached logins; the old password may keep working through it for a while", "ref", ref, "error", err)
 		}
+		e.refreshPeers(ctx, ref)
 	}
 	e.event(ctx, ref, "project.db_password_changed", nil)
 	return nil

@@ -288,7 +288,8 @@ type fixedPort struct {
 }
 
 // fixedPorts are the ports a node binds whatever projects exist: the [ports] values that are set,
-// the port of [listen] admin and the port of [node] peer_listen.
+// the port of [listen] admin and the port of [node] peer_listen, Supavisor's API port, and the port of
+// the Storage credential endpoint when the daemon serves one (a role ARN is set, or the port is).
 func (c *Config) fixedPorts() []fixedPort {
 	p := c.Ports
 	var out []fixedPort
@@ -313,7 +314,17 @@ func (c *Config) fixedPorts() []fixedPort {
 			out = append(out, fixedPort{"node.peer_listen", n})
 		}
 	}
+	out = append(out, fixedPort{"fleet.supavisor_api_port", c.Fleet.SupavisorAPI()})
+	if c.servesStorageCredentials() {
+		out = append(out, fixedPort{"fleet.storage_credentials_port", c.Fleet.StorageCredentials()})
+	}
 	return out
+}
+
+// servesStorageCredentials reports whether the daemon serves the Storage credential endpoint: it does
+// when a role ARN is set, and a port set by hand says the operator means to.
+func (c *Config) servesStorageCredentials() bool {
+	return c.Fleet.StorageS3RoleARN != "" || c.Fleet.StorageCredentialsPort > 0
 }
 
 func (c *Config) validateCluster() error {
@@ -347,6 +358,19 @@ func (c *Config) validateCluster() error {
 	}
 	if p := c.Fleet.StorageCredentialsPort; p < 0 || p > 65535 {
 		return fmt.Errorf("config: fleet.storage_credentials_port %d must be a port from 1 to 65535", p)
+	}
+	// A port that two services bind shows at runtime as a logged "cannot listen" while Storage on S3
+	// fails every request: say it when the configuration loads.
+	if c.servesStorageCredentials() {
+		port := c.Fleet.StorageCredentials()
+		for _, f := range c.fixedPorts() {
+			if f.key != "fleet.storage_credentials_port" && f.port == port {
+				return fmt.Errorf("config: fleet.storage_credentials_port %d is %s as well; the credential endpoint needs a port of its own", port, f.key)
+			}
+		}
+		if port >= c.Ports.ProjectBase {
+			return fmt.Errorf("config: fleet.storage_credentials_port %d lies in the project port range (ports.project_base %d and up); choose a port below it", port, c.Ports.ProjectBase)
+		}
 	}
 
 	r := c.Replicas

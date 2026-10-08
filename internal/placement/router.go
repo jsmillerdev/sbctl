@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -265,12 +266,23 @@ func (r *Router) local(ctx context.Context, p *registry.Project, what string) (l
 	return r.opts.Local, nil
 }
 
+// ReconfigureService restarts one of the project's API services on its new settings. For a project homed
+// elsewhere GoTrue's and PostgREST's go through Reconfigure, which is on the wire: it renders and
+// restarts both units from the row and keys the caller holds, so a save of the settings of one restarts
+// the other too. Anything else is applied on the home and answers lifecycle.ErrNotSupported.
 func (r *Router) ReconfigureService(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, svc string) error {
 	l, err := r.local(ctx, p, "reconfiguring "+svc)
-	if err != nil {
+	if err == nil {
+		return l.ReconfigureService(ctx, p, keys, svc)
+	}
+	if !errors.Is(err, lifecycle.ErrNotSupported) || (svc != config.SvcGoTrue && svc != config.SvcPostgREST) {
 		return err
 	}
-	return l.ReconfigureService(ctx, p, keys, svc)
+	pl, perr := r.forProject(ctx, p)
+	if perr != nil {
+		return perr
+	}
+	return pl.Reconfigure(ctx, p, keys)
 }
 
 func (r *Router) ApplyPostgresSettings(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, restart bool, beforeRestart func(context.Context)) (bool, error) {

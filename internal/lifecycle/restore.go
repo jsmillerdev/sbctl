@@ -212,6 +212,7 @@ func (e *Engine) reapplyRolePasswords(ctx context.Context, ref string) {
 		if err := e.opts.Fleet.RefreshTenant(ctx, ref); err != nil {
 			e.log.Warn("restore: the pooler could not drop its cached logins", "ref", ref, "error", err)
 		}
+		e.refreshPeers(ctx, ref)
 	}
 }
 

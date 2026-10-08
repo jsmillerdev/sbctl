@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -26,7 +27,7 @@ const replicationRole = "supabase_replication_admin"
 // seedMarker is the file that tells a data directory is half seeded. SeedReplica writes it before
 // the first byte of the base backup lands and removes it as its last step, so a directory that
 // holds it was cut off (a kill, a power loss) and carries a backup_label without standby.signal.
-const seedMarker = "supavise-seeding"
+const seedMarker = lifecycle.SeedMarker
 
 // SeedUnfinished reports whether dataDir holds a seed that did not finish. Nothing may start a
 // cluster on such a directory (it would come up as a primary); SeedReplica clears it and starts
@@ -51,14 +52,18 @@ func (s *Service) SeedReplica(ctx context.Context, plan ReplicaSeedPlan) (err er
 		return err
 	}
 	if SeedUnfinished(plan.DataDir) {
-		clearDir(plan.DataDir)
+		if err := clearDir(plan.DataDir); err != nil {
+			return fmt.Errorf("backup: clearing the seed %s that was cut off: %w", plan.DataDir, err)
+		}
 	}
 	if err := prepareDataDir(plan.DataDir); err != nil {
 		return err
 	}
 	defer func() {
 		if err != nil {
-			clearDir(plan.DataDir)
+			// The marker stays if the directory cannot be emptied, which is what the next call and
+			// SeedUnfinished look for.
+			_ = clearDir(plan.DataDir)
 		}
 	}()
 	marker := filepath.Join(plan.DataDir, seedMarker)
@@ -82,8 +87,9 @@ func (s *Service) SeedReplica(ctx context.Context, plan ReplicaSeedPlan) (err er
 }
 
 // ConfigureStandby implements StandbyConfigurer: it turns the stopped cluster in plan.DataDir into
-// a standby. It deletes the promote.ok of plan.Ref, so the relay refuses the standby's pushes
-// again, drops the standby block of an earlier configuration (ClearStandbyConf) and the
+// a standby. It deletes the promote.ok of plan.Ref (config.Paths.PromoteOK of the Service's Config,
+// which is the path the relay reads unless RelayOptions.PromoteOK names another: the two must agree),
+// so the relay refuses the standby's pushes again, drops the standby block of an earlier configuration (ClearStandbyConf) and the
 // recovery.signal a backup of a cluster in recovery could carry, appends the block to
 // postgresql.auto.conf and writes standby.signal last, since it is what turns the start into a
 // standby.
@@ -91,12 +97,17 @@ func (s *Service) ConfigureStandby(plan ReplicaSeedPlan) error {
 	if err := checkStandbyPlan(plan); err != nil {
 		return err
 	}
-	if s.opt.Config != nil {
-		if err := os.Remove(s.opt.Config.Paths().PromoteOK(plan.Ref)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
+	// The relay trusts promote.ok for as long as it exists: the standby must not leave one behind. A
+	// Service without a Config cannot say where it is, so it cannot make a standby.
+	if s.opt.Config == nil {
+		return errors.New("backup: a service without a Config cannot delete promote.ok, so it cannot make a standby")
 	}
-	if err := ClearStandbyConf(plan.DataDir); err != nil {
+	if err := os.Remove(s.opt.Config.Paths().PromoteOK(plan.Ref)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	// The block of an earlier configuration goes whole, its archive settings too: the block that follows
+	// has its own, and each cycle of demotion and promotion would add another pair.
+	if err := lifecycle.ClearStandbyBlock(plan.DataDir, true); err != nil {
 		return err
 	}
 	if err := os.Remove(filepath.Join(plan.DataDir, "recovery.signal")); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -118,6 +129,11 @@ func checkStandbyPlan(plan ReplicaSeedPlan) error {
 	}
 	if plan.DataDir == "" || !filepath.IsAbs(plan.DataDir) {
 		return fmt.Errorf("backup: replica data directory %q must be an absolute path", plan.DataDir)
+	}
+	// The backup id goes into a comment of postgresql.auto.conf: a newline in it would start a line
+	// of settings.
+	if strings.IndexFunc(plan.BackupID, func(r rune) bool { return r <= ' ' || r == 0x7f }) >= 0 {
+		return fmt.Errorf("backup: replica backup id %q has whitespace or control characters", plan.BackupID)
 	}
 	if plan.PrimaryPort == 0 {
 		return nil
@@ -157,13 +173,13 @@ func (s *Service) standbyConf(plan ReplicaSeedPlan) string {
 	} else {
 		fmt.Fprintf(&b, "\n# --- supavise archive-only standby of %s%s ---\n", plan.Ref, from)
 	}
-	fmt.Fprintf(&b, "archive_mode = on\narchive_command = %s\n", confQuote(ArchiveCommandFor(c, plan.Ref, cfgPath)))
-	fmt.Fprintf(&b, "restore_command = %s\n", confQuote(RestoreCommandFor(c, plan.Ref, plan.Ref, cfgPath)))
+	fmt.Fprintf(&b, "archive_mode = on\narchive_command = %s\n", confString(ArchiveCommandFor(c, plan.Ref, cfgPath)))
+	fmt.Fprintf(&b, "restore_command = %s\n", confString(RestoreCommandFor(c, plan.Ref, plan.Ref, cfgPath)))
 	b.WriteString("recovery_target_timeline = 'latest'\nhot_standby = on\n")
 	if plan.PrimaryPort != 0 {
 		info := fmt.Sprintf("host=127.0.0.1 port=%d user=%s password=%s application_name=%s sslmode=disable",
 			plan.PrimaryPort, replicationRole, connValue(plan.ReplicationPassword), plan.Identifier)
-		fmt.Fprintf(&b, "primary_conninfo = %s\n", confQuote(info))
+		fmt.Fprintf(&b, "primary_conninfo = %s\n", confString(info))
 	}
 	return b.String()
 }
@@ -175,49 +191,15 @@ func (s *Service) standbyConf(plan ReplicaSeedPlan) string {
 var StandbyGUCs = []string{"primary_conninfo", "restore_command", "recovery_target_timeline", "hot_standby"}
 
 // ClearStandbyConf removes the standby block of SeedReplica from the postgresql.auto.conf of the
-// stopped cluster in dataDir: the lines of StandbyGUCs and the header comment. The rest of the
-// file is kept. It does nothing when the file has none of them.
+// stopped cluster in dataDir: its header and every setting of a cluster in recovery (StandbyGUCs and
+// the recovery_target_* family). The primary's own archive_mode and archive_command stay. The rest of
+// the file is kept, and it is not rewritten when it has none of them. The shared implementation is
+// lifecycle.ClearStandbyBlock, which the plane's promotion and demotion use as well.
 func ClearStandbyConf(dataDir string) error {
-	p := filepath.Join(dataDir, "postgresql.auto.conf")
-	b, err := os.ReadFile(p)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	lines := strings.Split(string(b), "\n")
-	kept := lines[:0:0]
-	for _, l := range lines {
-		if !isStandbyLine(l) {
-			kept = append(kept, l)
-		}
-	}
-	if len(kept) == len(lines) {
-		return nil
-	}
-	tmp := p + ".tmp"
-	if err := writeSyncFile(tmp, []byte(strings.Join(kept, "\n")), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		os.Remove(tmp)
+	if err := lifecycle.ClearStandbyBlock(dataDir, false); err != nil {
 		return err
 	}
 	return syncDir(dataDir)
-}
-
-func isStandbyLine(line string) bool {
-	t := strings.TrimSpace(line)
-	if strings.HasPrefix(t, "# --- supavise standby ") || strings.HasPrefix(t, "# --- supavise archive-only standby ") {
-		return true
-	}
-	for _, k := range StandbyGUCs {
-		if rest, ok := strings.CutPrefix(t, k); ok && strings.HasPrefix(strings.TrimSpace(rest), "=") {
-			return true
-		}
-	}
-	return false
 }
 
 // connValue quotes s as a libpq connection-string value when it needs it.
@@ -225,21 +207,31 @@ func connValue(s string) string {
 	if s != "" && strings.Trim(s, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") == "" {
 		return s
 	}
-	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(s) + "'"
+	return lifecycle.KVQuote(s)
 }
 
-// confQuote quotes s as a postgresql.conf string literal; the file reads backslash escapes.
-func confQuote(s string) string {
-	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `''`).Replace(s) + "'"
-}
-
-// clearDir removes everything in dir and keeps dir.
-func clearDir(dir string) {
+// clearDir removes everything in dir and keeps dir. The seeding marker goes last, and only when
+// everything else did: a directory that could not be emptied (a busy mount, an immutable file) still
+// says it is half seeded, so that nothing starts a cluster on it (SeedUnfinished).
+func clearDir(dir string) error {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return err
 	}
+	var first error
 	for _, e := range ents {
-		_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+		if e.Name() == seedMarker {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil && first == nil {
+			first = err
+		}
 	}
+	if first != nil {
+		return first
+	}
+	if err := os.Remove(filepath.Join(dir, seedMarker)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }

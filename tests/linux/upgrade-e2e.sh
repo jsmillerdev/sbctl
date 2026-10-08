@@ -60,7 +60,9 @@ export SUPAVISE_DOMAIN=$BASE
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 BINS=${UPGRADE_E2E_BIN_DIR:?run tests/linux/upgrade-e2e-build.sh OUT_DIR first and pass UPGRADE_E2E_BIN_DIR}
-SRV_PORT=38801
+# The release server and the alert receiver bind port 0 and write the port they got: a fixed port in
+# the ephemeral range can be a source port of a connection the runner has open (Address already in use).
+SRV_PORT=""
 WORK=$(mktemp -d)
 START_TS=$(date +%s)
 # The supavise user reads the release key (--plan as that user); the private files keep their own modes.
@@ -153,9 +155,21 @@ for name in (("latest",) if latest == "latest" else ()) + (f"tags/{tag}",):
 PY
 }
 mkdir -p "$WORK/srv"
-make_release v0.0.1 "$B/prev" "$BINS/prev.versions.yaml"
-(cd "$WORK/srv" && exec python3 -m http.server "$SRV_PORT" --bind 127.0.0.1 >"$WORK/http.log" 2>&1) &
+cat >"$WORK/srv.py" <<'PY'
+import functools, http.server, os, sys
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1])
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+with open(sys.argv[2] + ".tmp", "w") as f:
+    f.write(str(srv.server_address[1]))
+os.rename(sys.argv[2] + ".tmp", sys.argv[2])
+srv.serve_forever()
+PY
+python3 "$WORK/srv.py" "$WORK/srv" "$WORK/srv.port" >"$WORK/http.log" 2>&1 &
 SRV_PID=$!
+for ((i = 0; i < 40; i++)); do [[ -s $WORK/srv.port ]] && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 0.25; done
+[[ -s $WORK/srv.port ]] || { cat "$WORK/http.log" >&2; fail "the release server did not start"; }
+SRV_PORT=$(cat "$WORK/srv.port")
+make_release v0.0.1 "$B/prev" "$BINS/prev.versions.yaml"
 for ((i = 0; i < 20; i++)); do [[ $(http_code "http://127.0.0.1:$SRV_PORT/download/v0.0.1/SHA256SUMS") == 200 ]] && break; sleep 0.5; done
 
 # ---- install the previous release ---------------------------------------------------------
@@ -635,7 +649,7 @@ supavise status --json >"$WORK/status.json" || { cat "$WORK/status.json" >&2; fa
 
 # A local alert receiver: the upgrade alerts must arrive.
 cat >"$WORK/hook.py" <<'PY'
-import http.server, sys
+import http.server, os, sys
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -645,12 +659,17 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
     def log_message(self, *a):
         pass
-http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write(str(srv.server_address[1]))
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+srv.serve_forever()
 PY
-HOOK_PORT=38802
-python3 "$WORK/hook.py" "$HOOK_PORT" "$WORK/hook.jsonl" &
+python3 "$WORK/hook.py" "$WORK/hook.port" "$WORK/hook.jsonl" &
 HOOK_PID=$!
-for ((i = 0; i < 40; i++)); do ss -ltnH "sport = :$HOOK_PORT" | grep -q . && break; sleep 0.25; done
+for ((i = 0; i < 40; i++)); do [[ -s $WORK/hook.port ]] && break; kill -0 "$HOOK_PID" 2>/dev/null || break; sleep 0.25; done
+[[ -s $WORK/hook.port ]] || fail "the alert receiver did not start"
+HOOK_PORT=$(cat "$WORK/hook.port")
 hook_events() { # "kind severity text" of the upgrade_* alerts received, in order
   python3 - "$WORK/hook.jsonl" <<'PY'
 import json, os, sys

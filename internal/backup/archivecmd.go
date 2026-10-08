@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 )
 
 // ArchiveCommand is the archive_command for ref's cluster. Postgres runs it from the
@@ -82,5 +83,5 @@ func ArchiveSettings(c *config.Config, ref, configPath string) string {
 		confString(ArchiveCommandFor(c, ref, configPath)), archiveTimeout(c))
 }
 
-// confString quotes s as a postgresql.conf string literal.
-func confString(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+// confString quotes s as a postgresql.conf string literal (the file reads backslash escapes).
+func confString(s string) string { return lifecycle.ConfString(s) }

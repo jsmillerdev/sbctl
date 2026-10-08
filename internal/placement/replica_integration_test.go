@@ -141,40 +141,9 @@ func writeConfig(t *testing.T, cfg *config.Config) string {
 	return p
 }
 
-// testSeeder is the standby builder the test uses: the backup service's SeedReplica when this
-// release has one, else the restore seeder with the standby's settings written over it.
-func testSeeder(svc *backup.Service) lifecycle.ReplicaSeeder {
-	if rs, ok := any(svc).(backup.ReplicaSeeder); ok {
-		return SeederFrom(rs)
-	}
-	return func(ctx context.Context, plan lifecycle.ReplicaSeedPlan) error {
-		rp, err := svc.PlanRestoreWith(ctx, plan.Ref, time.Now(), backup.RestoreOptions{Latest: true, BackupID: plan.BackupID})
-		if err != nil {
-			return err
-		}
-		if err := svc.Seeder(rp)(ctx, nil, plan.DataDir); err != nil {
-			return err
-		}
-		if err := os.Remove(filepath.Join(plan.DataDir, "recovery.signal")); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(plan.DataDir, "standby.signal"), nil, 0o600); err != nil {
-			return err
-		}
-		if plan.PrimaryPort == 0 {
-			return nil
-		}
-		f, err := os.OpenFile(filepath.Join(plan.DataDir, "postgresql.auto.conf"), os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		conninfo := fmt.Sprintf("host=127.0.0.1 port=%d user=supabase_replication_admin password='%s' application_name='%s' sslmode=disable",
-			plan.PrimaryPort, plan.ReplicationPassword, plan.Identifier)
-		_, err = fmt.Fprintf(f, "primary_conninfo = '%s'\n", strings.ReplaceAll(conninfo, "'", "''"))
-		return err
-	}
-}
+// testSeeder is the standby builder the test uses: the backup service's SeedReplica, which the
+// compiler checks the service implements (backup.ReplicaSeeder).
+func testSeeder(svc *backup.Service) lifecycle.ReplicaSeeder { return SeederFrom(svc) }
 
 // rrEnv is the two nodes of the test.
 type rrEnv struct {
@@ -492,6 +461,24 @@ func TestIntegrationReplicaBlocks(t *testing.T) {
 	if _, err := e.sql(repl.Postgres).Exec(ctx, `insert into public.items values (999, 'write')`); err == nil {
 		t.Fatal("the standby accepted a write")
 	}
+	// pg-meta and the parameterized-query path log in to the replica's port with a password, as they do to
+	// the primary's: postgres above, and the read-only role the Management API creates on the primary
+	// (it replicates, so it can log in once the standby has replayed its creation).
+	roPass := "ro-" + keys.AdminPassword[:12]
+	e.exec(prim.Postgres, `create role supavise_read_only login bypassrls password '`+roPass+`'`)
+	e.exec(prim.Postgres, `grant pg_read_all_data to supavise_read_only`)
+	eventually(t, 30*time.Second, "supavise_read_only logging in to the replica with its password", func() string {
+		c, err := pgx.Connect(ctx, fmt.Sprintf("postgres://supavise_read_only:%s@127.0.0.1:%d/postgres?sslmode=disable", roPass, repl.Postgres))
+		if err != nil {
+			return err.Error()
+		}
+		defer c.Close(ctx)
+		var n int
+		if err := c.QueryRow(ctx, `select count(*) from public.items`).Scan(&n); err != nil || n != 200 {
+			return fmt.Sprintf("read %d rows, %v", n, err)
+		}
+		return ""
+	})
 
 	// 4. pg_cron and pg_net workers run on the primary and idle on the standby (spike S2). Each one is
 	// counted by itself: a primary that runs only one of them would prove nothing about the other.

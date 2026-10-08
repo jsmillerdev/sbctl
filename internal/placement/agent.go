@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -84,8 +85,10 @@ type AgentOptions struct {
 	// fails (default 15 minutes). Poll is how often the setup looks at it (default 2 seconds).
 	StallTimeout time.Duration
 	Poll         time.Duration
-	Log          *slog.Logger
-	Now          func() time.Time
+	// Concurrency is how many replicas StartLocal starts and ObserveAll observes at once (default 4).
+	Concurrency int
+	Log         *slog.Logger
+	Now         func() time.Time
 }
 
 // NodeAgent runs the replica operations the leader asks of this node: it implements Agent. It keeps
@@ -136,6 +139,9 @@ func NewNodeAgent(o AgentOptions) *NodeAgent {
 	}
 	if o.Poll <= 0 {
 		o.Poll = 2 * time.Second
+	}
+	if o.Concurrency <= 0 {
+		o.Concurrency = defaultConcurrency
 	}
 	return &NodeAgent{o: o, insts: map[string]*instance{}, locks: map[string]*sync.Mutex{}, base: context.Background()}
 }
@@ -348,6 +354,14 @@ func (a *NodeAgent) Ensure(ctx context.Context, spec peerapi.InstanceSpec) (peer
 
 	if in := a.get(spec.Identifier); in != nil {
 		if step, errc, _, running := a.snapshot(in); !running && errc == "" && step != StepCompleted {
+			// The resume of a setup that had not got far deletes the project's directory here. The
+			// registry may name this node the home by now (a switchover moved the project onto the
+			// replica's node while its setup was cut short): the directory is the home's then.
+			if home, err := a.isHome(ctx, ref); err != nil {
+				return peerapi.InstanceStatus{}, err
+			} else if home {
+				return peerapi.InstanceStatus{}, fmt.Errorf("%w: %s is the home of %s now, and a replica is never on the home", lifecycle.ErrInvalidState, a.self(), ref)
+			}
 			a.resume(in) // interrupted by a restart of the daemon
 		}
 		return a.status(ctx, in), nil
@@ -562,7 +576,9 @@ func (a *NodeAgent) Observe(ctx context.Context, identifier string) (peerapi.Ins
 	return st, nil
 }
 
-// ObserveAll observes every replica this node holds, for the report to the leader.
+// ObserveAll observes every replica this node holds, for the report to the leader, a few at a time
+// (AgentOptions.Concurrency): each observation runs SQL and HTTP probes of its own. The result is in
+// the order of the identifiers.
 func (a *NodeAgent) ObserveAll(ctx context.Context) []peerapi.InstanceStatus {
 	ids := map[string]bool{}
 	for id := range a.known() {
@@ -575,10 +591,28 @@ func (a *NodeAgent) ObserveAll(ctx context.Context) []peerapi.InstanceStatus {
 			}
 		}
 	}
-	var out []peerapi.InstanceStatus
+	order := make([]string, 0, len(ids))
 	for id := range ids {
-		if st, err := a.Observe(ctx, id); err == nil {
-			out = append(out, st)
+		order = append(order, id)
+	}
+	slices.Sort(order)
+	type observed struct {
+		id string
+		st *peerapi.InstanceStatus
+	}
+	got := make([]*observed, len(order))
+	for i, id := range order {
+		got[i] = &observed{id: id}
+	}
+	eachLimit(ctx, a.o.Concurrency, got, func(o *observed) {
+		if st, err := a.Observe(ctx, o.id); err == nil {
+			o.st = &st
+		}
+	})
+	var out []peerapi.InstanceStatus
+	for _, o := range got {
+		if o.st != nil {
+			out = append(out, *o.st)
 		}
 	}
 	return out
@@ -592,6 +626,12 @@ func (a *NodeAgent) Remove(ctx context.Context, identifier string) error {
 	ref, err := refOf(identifier)
 	if err != nil {
 		return err
+	}
+	// The system cluster's standby is this node's own registry, which the daemon reads. A node leaves
+	// the cluster through its retirement (`supavise node rm` on the leader, `node join --reset` here),
+	// never by a request for one replica.
+	if ref == config.SystemRef {
+		return fmt.Errorf("%w: %s is the standby of the system cluster, this node's own registry; it goes with the node when the node leaves", lifecycle.ErrInvalidState, identifier)
 	}
 	defer a.lockRef(ref)()
 	if held := a.recorded(ref); held != "" && held != identifier {
@@ -705,6 +745,12 @@ func (a *NodeAgent) Do(ctx context.Context, identifier string, act peerapi.Actio
 		if err = a.notHome(ctx, ref, act); err != nil {
 			break
 		}
+		// A restart that arrives after the promotion and before the registry names the new home would
+		// render the standby's spec (the replica port, hot_standby) for a cluster that is a writable
+		// primary now: only a standby of this replica is started from the replica's spec.
+		if err = a.checkStandbyData(ref, identifier); err != nil {
+			break
+		}
 		var t lifecycle.ReplicaTarget
 		if t, err = a.target(ctx, identifier, req.Class, true); err != nil {
 			break
@@ -812,12 +858,15 @@ func (a *NodeAgent) StartLocal(ctx context.Context) {
 		a.o.Log.Warn("replica start: listing the replicas of this node", "error", err)
 		return
 	}
+	var todo []registry.Replica
 	for _, r := range rs {
 		// The system cluster's standby is the daemon's own registry: systemd starts it before the
 		// daemon, and the daemon does not restart it.
-		if r.InitStep != StepCompleted || r.Ref == config.SystemRef {
-			continue
+		if r.InitStep == StepCompleted && r.Ref != config.SystemRef {
+			todo = append(todo, r)
 		}
+	}
+	eachLimit(ctx, a.o.Concurrency, todo, func(r registry.Replica) {
 		unlock := a.lockRef(r.Ref)
 		// A cluster that is no standby of this replica was promoted, and the registry has not caught up
 		// (the daemon or the machine restarted between the promotion and the move of the home): starting
@@ -834,5 +883,5 @@ func (a *NodeAgent) StartLocal(ctx context.Context) {
 		if err != nil {
 			a.o.Log.Warn("replica did not start", "replica", r.Identifier, "error", err)
 		}
-	}
+	})
 }
