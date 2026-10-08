@@ -29,194 +29,22 @@
 #   fakeaws    IMDSv2, EC2 and Secrets Manager calls to the fake service answer with the node's identity
 #   smoke      only with MULTI_SMOKE=1: tests/linux/systemd-smoke.sh on a third, fresh node of the same kind
 #
-# SPIKE_EXPECT_FAIL names the checks (without the @node) that are known to fail in the mode, for example
-# "imds" for system containers that are not privileged. The script exits 0 when exactly those fail, and
-# non-zero when another check fails or one of them passes (the README is then out of date).
+# EXPECT_FAIL names the checks (without the @node) that are known to fail in the mode, each with the reason
+# its failure gives: "imds=can reach the instance metadata service" for system containers that are not
+# privileged. The script exits 0 when exactly those fail, each for its reason, and non-zero when another
+# check fails, when one of them fails for another reason or when one of them passes (the README is then
+# out of date). lib-checks.sh has the runner.
 # Needs root and Ubuntu 24.04 with Docker; see lib-multi.sh. Logs, results.md and the per-check output are
 # in $LOG_DIR (default /tmp/supavise-multi-logs).
 # shellcheck source=lib-multi.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib-multi.sh"
+# shellcheck source=lib-checks.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib-checks.sh"
 
-SPIKE_EXPECT_FAIL=${SPIKE_EXPECT_FAIL:-}
-RESULTS=$LOG_DIR/results.tsv
-FACTS=$LOG_DIR/facts.tsv
+RESULTS_TITLE="Two-node harness"
+FACT_PREFIX=spike
 CHECK_ORDER="incus services launch boot prep net peer rules install polkit hardening imds project stub fakeaws fakeaws-log smoke"
 UNITS_IMDS=(supavise-postgres@system.service supavise-gotrue@system.service supavise-pgmeta.service supavise-supavisor.service supavise-realtime.service supavise-storage.service)
-
-# ---- results ----------------------------------------------------------------------------------------
-note() { printf '%s\t%s\n' "$1" "$2" >>"$FACTS"; }                       # KEY VALUE
-stamp() { printf '%s\t%d\n' "$1" $((SECONDS - ${2:-0})) >>"$LOG_DIR/timings.tsv"; } # LABEL SINCE
-needs() { local i; for i in "$@"; do [[ -e $WORK/state/$i.ok ]] || { echo "# needs $i"; exit 125; }; done; }
-
-# check ID DESCRIPTION CMD...: runs CMD in a subshell with errexit on; its output goes to checks/ID.log, its
-# lines that start with "# " become the detail. Exit status 125 (needs) is a SKIP. Never stops the script.
-check() {
-  local id=$1 desc=$2 res detail="" rc=0 t0=$SECONDS f
-  shift 2
-  f=$LOG_DIR/checks/$id.log
-  ( set -e; "$@" ) >"$f" 2>&1 & wait $! || rc=$?
-  case $rc in
-    0) res=PASS; touch "$WORK/state/$id.ok" ;;
-    125) res=SKIP ;;
-    *) res=FAIL ;;
-  esac
-  if [[ $res == FAIL ]]; then
-    detail=$(grep -h 'FAIL:' "$f" | tail -n1 | cut -c1-300 || true)
-    [[ -n $detail ]] || detail=$(tail -n1 "$f" | cut -c1-300)
-  else
-    detail=$(grep -h '^# ' "$f" | tail -n4 | sed 's/^# //' | paste -sd ';' - | cut -c1-300 || true)
-  fi
-  printf '%s\t%s\t%s\t%d\t%s\n' "$res" "$id" "$desc" $((SECONDS - t0)) "$detail" >>"$RESULTS"
-  log "$res $id ($((SECONDS - t0))s): $desc${detail:+ -- $detail}"
-  if [[ $res == FAIL ]]; then echo "--- end of $id.log" >&2; tail -n 30 "$f" >&2; fi
-  return 0
-}
-
-check_each() { # ID DESCRIPTION FUNC: FUNC NODE on every node at once
-  local id=$1 desc=$2 fn=$3 n p pids=()
-  for n in "${NODES[@]}"; do
-    check "$id@$n" "$desc ($n)" "$fn" "$n" &
-    pids+=($!)
-  done
-  for p in "${pids[@]}"; do wait "$p" || true; done
-}
-
-write_results() {
-  local f=$LOG_DIR/results.md
-  {
-    echo "## Two-node harness: $(dpkg --print-architecture), nodes as $MULTI_RESOLVED"
-    echo
-    echo "| Check | Result | Seconds | Detail |"
-    echo "|---|---|---|---|"
-    awk -F'\t' -v order="$CHECK_ORDER" 'BEGIN {n = split(order, o, " "); for (i = 1; i <= n; i++) idx[o[i]] = i}
-      {id = $2; sub(/@.*/, "", id); print idx[id] "\t" $0}' "$RESULTS" | sort -s -t "$(printf '\t')" -k1,1n -k3,3 | cut -f2- \
-      | awk -F'\t' '{gsub(/\|/, "/", $5); printf "| %s: %s | %s | %s | %s |\n", $2, $3, $1, $4, $5}'
-    echo
-    echo "| Fact | Value |"
-    echo "|---|---|"
-    awk -F'\t' '{gsub(/\|/, "/", $2); printf "| %s | %s |\n", $1, $2}' "$FACTS"
-    echo
-    echo "| Step | Seconds |"
-    echo "|---|---|"
-    awk -F'\t' '{printf "| %s | %s |\n", $1, $2}' "$LOG_DIR/timings.tsv"
-    echo
-    echo "| When | Who | Used MB | Detail |"
-    echo "|---|---|---|---|"
-    awk -F'\t' '{printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4}' "$LOG_DIR/memory.tsv"
-  } >"$f" 2>/dev/null
-}
-
-# verdict: 0 when the failures are exactly SPIKE_EXPECT_FAIL.
-verdict() {
-  local res id base rc=0
-  while IFS=$'\t' read -r res id _; do
-    base=${id%@*}
-    case $res in
-      FAIL) [[ " $SPIKE_EXPECT_FAIL " == *" $base "* ]] || { log "unexpected failure: $id"; rc=1; } ;;
-      PASS) [[ " $SPIKE_EXPECT_FAIL " != *" $base "* ]] || { log "$id was expected to fail and passed"; rc=1; } ;;
-    esac
-  done <"$RESULTS"
-  return $rc
-}
-
-finish() {
-  local rc=$?
-  trap - EXIT
-  note spike.total_seconds "$SECONDS"
-  mem_snapshot end 2>/dev/null || true
-  multi_collect_logs
-  write_results || true
-  cat "$LOG_DIR/results.md" >&2 2>/dev/null || true
-  multi_down
-  [[ $rc -ne 0 ]] || verdict || rc=1
-  exit $rc
-}
-
-# ---- the checks ---------------------------------------------------------------------------------------
-c_incus() {
-  [[ $MULTI_RESOLVED != vm ]] || kvm_usable || fail "virtual machines need a usable /dev/kvm: $(ls -l /dev/kvm 2>&1)"
-  local t0=$SECONDS
-  multi_incus_install
-  stamp "host: apt install incus" "$t0"
-  multi_incus_init
-  multi_docker_rules
-  note incus.version "$(incus --version)"
-  echo "# incus $(incus --version), nodes as $MULTI_RESOLVED"
-}
-
-c_services() {
-  needs incus
-  local t0=$SECONDS
-  garage_up
-  release_server_up v0.0.1 "$SUPAVISE_BIN"
-  fake_aws_up
-  stamp "host: Garage, release server, fake AWS" "$t0"
-  note garage.image "$GARAGE_IMAGE"
-  echo "# Garage :$S3_PORT, release server :$RELEASE_PORT, fake AWS :$AWS_PORT on $BRIDGE_IP"
-}
-
-c_launch() {
-  needs incus
-  local n t0
-  for n in "${NODES[@]}"; do
-    t0=$SECONDS
-    multi_launch_node "$n"
-    echo "$SECONDS" >"$WORK/state/started-$n"
-    stamp "$n: incus init and start ($MULTI_RESOLVED)" "$t0"
-  done
-  note image "$(incus image list --format csv -c fdast | head -n1)"
-}
-
-c_boot() {
-  local n=$1 st t0 free
-  needs launch
-  t0=$(cat "$WORK/state/started-$n")
-  st=$(multi_wait "$n")
-  stamp "$n: start to systemd finished starting" "$t0"
-  note "$n.systemd" "$st"
-  note "$n.failed-units" "$(on "$n" systemctl --failed --no-legend --plain | awk '{print $1}' | paste -sd ' ' - || true)"
-  [[ $st == running || $st == degraded ]] || fail "$n: systemd is '$st'"
-  [[ $(on "$n" cat /proc/1/comm) == systemd ]] || fail "$n: PID 1 is not systemd"
-  on "$n" test -f /sys/fs/cgroup/cgroup.controllers || fail "$n: no cgroup v2"
-  note "$n.os" "$(on "$n" bash -c '. /etc/os-release; echo "$PRETTY_NAME"')"
-  note "$n.systemd_version" "$(on "$n" systemctl --version | head -n1)"
-  note "$n.kernel" "$(on "$n" uname -r)"
-  note "$n.virt" "$(on "$n" systemd-detect-virt || true)"
-  note "$n.cpus" "$(on "$n" nproc)"
-  note "$n.mem_total_mb" "$(on "$n" free -m | awk '/^Mem:/ {print $2}')"
-  free=$(on "$n" df -BG --output=avail / | tail -n1 | tr -dc 0-9)
-  if [[ $MULTI_RESOLVED == vm && $free -lt 10 ]]; then
-    multi_grow_root "$n" || echo "# the root file system could not be grown"
-    free=$(on "$n" df -BG --output=avail / | tail -n1 | tr -dc 0-9)
-  fi
-  note "$n.root_free_gb" "$free"
-  [[ $free -ge 8 ]] || fail "$n: $free GB free on the root file system"
-  [[ $(on "$n" ip -4 route get "$BRIDGE_IP" | grep -o 'src [0-9.]*' | cut -d' ' -f2) == "$(node_ip "$n")" ]] \
-    || fail "$n does not have the address $(node_ip "$n")"
-  echo "# systemd $st, $(on "$n" bash -c '. /etc/os-release; echo "$PRETTY_NAME"'), $(node_ip "$n")"
-}
-
-c_prep() {
-  local n=$1 t0=$SECONDS
-  needs "boot@$n"
-  multi_prep_node "$n"
-  stamp "$n: apt packages" "$t0"
-}
-
-c_net() {
-  local n=$1 code
-  needs "prep@$n" services
-  code=$(on "$n" curl -sL -o /dev/null -w '%{http_code}' -m 30 https://github.com/supabase/slim-services) || true
-  [[ $code == 200 ]] || fail "$n: github.com answered '$code'"
-  code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$S3_PORT/") || true
-  [[ $code =~ ^(200|400|403|404)$ ]] || fail "$n: Garage on the bridge answered '$code'"
-  code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$RELEASE_PORT/download/v0.0.1/SHA256SUMS") || true
-  [[ $code == 200 ]] || fail "$n: the release server on the bridge answered '$code'"
-  code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$AWS_PORT/_calls") || true
-  [[ $code == 200 ]] || fail "$n: the fake AWS service on the bridge answered '$code'"
-  note "$n.rtt_ms_to_bridge" "$(on "$n" ping -c 5 -q "$BRIDGE_IP" | awk -F/ '/^rtt/ {print $5}')"
-  echo "# internet, S3, release server and fake AWS reachable"
-}
 
 c_peer() {
   needs prep@n1 prep@n2
@@ -261,20 +89,9 @@ c_install() {
   local n=$1 ip t0=$SECONDS d=$LOG_DIR/$1
   ip=$(node_ip "$n")
   needs "net@$n"
-  mkdir -p "$d"
-  node_push "$n" "$SUPAVISE_BIN" /root/supavise 0755
-  node_push "$n" "$REPO_ROOT/deploy/install.sh" /root/install.sh 0755
-  node_push "$n" "$REPO_ROOT/tests/linux/lib.sh" /root/lib.sh
-  printf 'access_key_id=%s\nsecret_access_key=%s\n' "$S3_KEY_ID" "$S3_SECRET" | on "$n" tee /root/s3.cred >/dev/null
-  on "$n" chmod 0600 /root/s3.cred
-  stamp "$n: copy the binary into the node" "$t0"
-  t0=$SECONDS
-  on "$n" /root/install.sh --binary /root/supavise --public-ip "$ip" --tls off --email ci@example.com --firewall none \
-    --no-studio --no-os-updates --claim-token-file /root/claim-token \
-    --s3-endpoint "http://$BRIDGE_IP:$S3_PORT" --s3-bucket "$S3_BUCKET" --s3-prefix "$n" --s3-region us-east-1 \
-    --s3-path-style --s3-credentials-file /root/s3.cred >"$d/install.log" 2>&1 \
+  multi_install "$n" --claim-token-file /root/claim-token \
     || { tail -n 40 "$d/install.log"; fail "$n: install.sh --binary failed"; }
-  stamp "$n: install.sh --binary" "$t0"
+  stamp "$n: copy the binary into the node, install.sh --binary" "$t0"
   grep -q "Supavise is running" "$d/install.log" || fail "$n: install.sh did not report success"
   on "$n" test -s /root/claim-token || fail "$n: no claim token file"
   on "$n" bash -s -- "$ip" <<'EOS' || fail "$n: the node is not healthy after the install"
@@ -405,7 +222,7 @@ c_smoke() {
   node_push "$n" "$SUPAVISE_BIN" /root/supavise 0755
   tar -C "$REPO_ROOT" -cf - tests/linux/lib.sh tests/linux/systemd-smoke.sh | on "$n" tar -C /root -xf -
   on "$n" env SUPAVISE_BIN=/root/supavise LOG_DIR=/root/smoke-logs timeout 2400 bash /root/tests/linux/systemd-smoke.sh \
-    >"$LOG_DIR/systemd-smoke.log" 2>&1 || { tail -n 40 "$LOG_DIR/systemd-smoke.log"; fail "systemd-smoke.sh failed on $n"; }
+    >"$LOG_DIR/systemd-smoke.log" 2>&1 || { tail -n 40 "$LOG_DIR/systemd-smoke.log"; fail "systemd-smoke.sh failed on $n: $(grep 'FAIL:' "$LOG_DIR/systemd-smoke.log" | tail -n1 | cut -c1-200)"; }
   incus file pull --quiet -r "$n/root/smoke-logs" "$LOG_DIR/" || true
   echo "# $(tail -n 1 "$LOG_DIR/systemd-smoke.log" | cut -c1-200)"
 }
@@ -415,7 +232,7 @@ need_root
 preflight
 multi_init
 trap finish EXIT
-: >"$RESULTS"; : >"$FACTS"; : >"$LOG_DIR/timings.tsv"; : >"$LOG_DIR/memory.tsv"
+checks_init
 [[ -x ${SUPAVISE_BIN:-} ]] || fail "SUPAVISE_BIN: a Linux build of this checkout, built with -X main.version=v0.0.1"
 [[ $("$SUPAVISE_BIN" --version) == *v0.0.1* ]] || fail "SUPAVISE_BIN must report v0.0.1 (the release server signs it as v0.0.1): $("$SUPAVISE_BIN" --version)"
 cd "$REPO_ROOT"
