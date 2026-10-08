@@ -35,6 +35,12 @@ type Server struct {
 	// turns count, per project, the balanced reads that no rule decided (see pickDatabase).
 	turns sync.Map
 
+	// now is the clock of the gates (gates.go); nil means time.Now. fencedGate and holdGate hold their
+	// last answers.
+	now        func() time.Time
+	fencedGate gate[fencedState]
+	holdGate   gate[bool]
+
 	// upstreamFn overrides the upstream address resolution (tests); replicaUpstreamFn does the
 	// same for the PostgREST of a replica.
 	upstreamFn        func(service, project) string

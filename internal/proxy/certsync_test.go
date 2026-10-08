@@ -916,3 +916,240 @@ func TestServeFollowsTheCertificateRole(t *testing.T) {
 		}
 	}
 }
+
+// TestMirrorFetchesOnScheduleWhilePoked: a handshake for a name nobody mirrors pokes the mirror, and a
+// client that keeps asking must not keep the scheduled fetch from happening. (A poke used to restart the
+// wait, so pokes more often than the interval stopped the mirror altogether; a node that had just lost
+// the cache to a demotion then never got its certificates back while a client retried.)
+func TestMirrorFetchesOnScheduleWhilePoked(t *testing.T) {
+	var calls atomic.Int32
+	src := sourceFunc(func(context.Context, string) (peerapi.CertSnapshot, error) {
+		calls.Add(1)
+		return peerapi.CertSnapshot{}, nil
+	})
+	m := newCertMirror(t.TempDir(), &CertSync{Source: src, Interval: 30 * time.Millisecond}, quietLog())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.run(ctx); close(done) }()
+	for end := time.Now().Add(600 * time.Millisecond); time.Now().Before(end); time.Sleep(2 * time.Millisecond) {
+		m.wake()
+	}
+	cancel()
+	<-done
+	if n := calls.Load(); n < 8 {
+		t.Errorf("%d fetches in 600 ms with an interval of 30 ms while pokes came every 2 ms, want at least 8", n)
+	}
+}
+
+// TestMirrorPokeBringsTheNextFetchForward: a poke after a fetch makes the next one come pokeGap after it,
+// not at the end of the interval, and only once.
+func TestMirrorPokeBringsTheNextFetchForward(t *testing.T) {
+	var calls atomic.Int32
+	src := sourceFunc(func(context.Context, string) (peerapi.CertSnapshot, error) {
+		calls.Add(1)
+		return peerapi.CertSnapshot{}, nil
+	})
+	m := newCertMirror(t.TempDir(), &CertSync{Source: src, Interval: time.Hour}, quietLog())
+	m.pokeGap = 40 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	waitFor := func(what string, f func() bool) {
+		t.Helper()
+		for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+			if f() {
+				return
+			}
+		}
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	waitFor("the first fetch", func() bool { return calls.Load() == 1 })
+	m.wake()
+	waitFor("the fetch a poke asks for", func() bool { return calls.Load() == 2 })
+	time.Sleep(200 * time.Millisecond)
+	if n := calls.Load(); n != 2 {
+		t.Errorf("%d fetches: one poke asked for one", n)
+	}
+}
+
+// followerOf is a certificate manager of a follower on cfg's store, with a CA it could not reach.
+func followerOf(t *testing.T, cfg *config.Config) *certManager {
+	t.Helper()
+	cm, err := newCertManager(certOptions{
+		cfg: cfg, mode: tlsHTTP01, log: quietLog(), follower: true,
+		allow: func(context.Context, string) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm.http.Issuers = []certmagic.Issuer{&failingIssuer{key: cm.httpIssuer.IssuerKey()}}
+	return cm
+}
+
+// failingIssuer is a CA that refuses.
+type failingIssuer struct {
+	key   string
+	calls atomic.Int32
+}
+
+func (f *failingIssuer) IssuerKey() string { return f.key }
+
+func (f *failingIssuer) Issue(context.Context, *x509.CertificateRequest) (*certmagic.IssuedCertificate, error) {
+	f.calls.Add(1)
+	return nil, errors.New("the CA is not reachable")
+}
+
+// TestMirrorStartsFromTheStoreOnDisk: a follower that restarts while the leader cannot be reached serves
+// the certificates it mirrored before, and one that is half written is left out.
+func TestMirrorStartsFromTheStoreOnDisk(t *testing.T) {
+	cfg := config.Default()
+	cfg.Domain, cfg.TLS.Mode, cfg.StateDir = "example.com", "http01", t.TempDir()
+	cm := followerOf(t, cfg)
+	defer cm.close()
+	store := cfg.Paths().Certs()
+	issuer := cm.httpIssuer.IssuerKey()
+	crt, key := testCert(t, "api.example.com")
+	writeSite(t, store, issuer, "api.example.com", crt, key)
+	crtS, _ := testCert(t, "studio.example.com")
+	_, keyS := testCert(t, "studio.example.com")
+	writeSite(t, store, issuer, "studio.example.com", crtS, keyS) // a certificate and a key that do not belong together
+
+	down := sourceFunc(func(context.Context, string) (peerapi.CertSnapshot, error) {
+		return peerapi.CertSnapshot{}, errors.New("the leader is unreachable")
+	})
+	m := newCertMirror(store, &CertSync{Source: down, Interval: time.Hour}, quietLog())
+	m.onSnapshot = cm.loadMirrored
+	cm.mirror = m
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	var got *x509.Certificate
+	for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		if c, err := handshakeCert(t, cm, "api.example.com"); err == nil {
+			got = c
+			break
+		}
+	}
+	if got == nil || got.SerialNumber.Cmp(serialOfPEM(t, crt)) != 0 {
+		t.Fatal("the follower did not serve the certificate it had on disk")
+	}
+	if _, err := handshakeCert(t, cm, "studio.example.com"); err == nil {
+		t.Error("a certificate whose key does not match was served")
+	}
+}
+
+// TestMirrorEmptySnapshotLeavesTheCacheAlone: a leader that has issued nothing yet changes neither the
+// follower's files nor what it serves.
+func TestMirrorEmptySnapshotLeavesTheCacheAlone(t *testing.T) {
+	ctx := context.Background()
+	l := newLeaderStore(t)
+	crt, key := testCert(t, "api.example.com")
+	writeSite(t, l.dir, "acme.test-dir", "api.example.com", crt, key)
+	m := newMirrorOf(l, t.TempDir())
+	told := 0
+	m.onSnapshot = func(context.Context, peerapi.CertSnapshot) { told++ }
+	if err := m.sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(l.dir, "certificates")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := m.sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if told != 1 {
+		t.Errorf("onSnapshot was told %d times: an empty store carries nothing to the cache", told)
+	}
+}
+
+// TestStartManagingKeepsAMirroredCopyItCannotTakeOver: a promotion that cannot load a mirrored certificate
+// as a managed one leaves the mirrored copy in the cache, so that the name still has a certificate.
+func TestStartManagingKeepsAMirroredCopyItCannotTakeOver(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cfg := config.Default()
+	cfg.Domain, cfg.TLS.Mode, cfg.StateDir = "example.com", "http01", t.TempDir()
+	cm := followerOf(t, cfg)
+	defer cm.close()
+	defer cancel() // before close: the issuance that follows the promotion ends with the context
+
+	l := newLeaderStore(t)
+	crt, key := testCert(t, "api.example.com")
+	writeSite(t, l.dir, cm.httpIssuer.IssuerKey(), "api.example.com", crt, key)
+	m := newMirrorOf(l, cfg.Paths().Certs())
+	m.onSnapshot = cm.loadMirrored
+	cm.mirror = m
+	if err := m.sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handshakeCert(t, cm, "api.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The files are gone when the node takes over, so CertMagic cannot load the managed copy.
+	if err := os.RemoveAll(filepath.Join(cfg.Paths().Certs(), "certificates")); err != nil {
+		t.Fatal(err)
+	}
+	if err := cm.startManaging(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c, err := handshakeCert(t, cm, "api.example.com")
+	if err != nil || c.SerialNumber.Cmp(serialOfPEM(t, crt)) != 0 {
+		t.Errorf("after a promotion that could not load the managed copy: %v", err)
+	}
+	if n := certsFor(cm, "api.example.com"); n != 1 {
+		t.Errorf("%d certificates cached for the name", n)
+	}
+}
+
+// TestMirrorRecoversWhenClientsAskForASiteTheFirstFetchLacked is the failure TestServeFollowsTheCertificateRole
+// showed on a slow machine, in order: the first fetch after a demotion reads the leader's store while a renewal
+// is half written, so one site is missing and the node has no certificate for it; clients ask for it, each
+// handshake pokes the mirror, and the next scheduled fetch has to happen anyway.
+func TestMirrorRecoversWhenClientsAskForASiteTheFirstFetchLacked(t *testing.T) {
+	cfg := config.Default()
+	cfg.Domain, cfg.TLS.Mode, cfg.StateDir = "example.com", "http01", t.TempDir()
+	cm := followerOf(t, cfg)
+	defer cm.close()
+	issuer := cm.httpIssuer.IssuerKey()
+
+	l := newLeaderStore(t)
+	for _, n := range []string{"api.example.com", "studio.example.com"} {
+		crt, key := testCert(t, n)
+		writeSite(t, l.dir, issuer, n, crt, key)
+	}
+	var calls atomic.Int32
+	torn := sourceFunc(func(ctx context.Context, etag string) (peerapi.CertSnapshot, error) {
+		snap, err := l.src.Certs(ctx, etag)
+		if calls.Add(1) == 1 && err == nil {
+			// The first answer lacks the studio site, as a read between CertMagic's writes would.
+			var files []peerapi.CertFile
+			for _, f := range snap.Files {
+				if !strings.Contains(f.Path, "studio.example.com") {
+					files = append(files, f)
+				}
+			}
+			snap.Files = files
+		}
+		return snap, err
+	})
+	m := newCertMirror(cfg.Paths().Certs(), &CertSync{Source: torn, Interval: 50 * time.Millisecond}, quietLog())
+	m.onSnapshot = cm.loadMirrored
+	cm.mirror = m
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+		if _, err := handshakeCert(t, cm, "studio.example.com"); err == nil {
+			return
+		}
+	}
+	t.Fatalf("no certificate for the site the first fetch lacked after %d fetches", calls.Load())
+}

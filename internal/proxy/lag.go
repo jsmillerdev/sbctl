@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
 )
@@ -28,6 +30,8 @@ type lagCache struct {
 
 	mu   sync.Mutex
 	refs map[string]lagReading
+	// sf makes the requests that miss at the same moment share one question to the controller.
+	sf singleflight.Group
 }
 
 // lagReading is what the controller said about a project's replicas at a time; a replica with no
@@ -55,21 +59,31 @@ func (c *lagCache) lag(identifier string) (time.Duration, bool) {
 	return d, ok
 }
 
-// read asks the controller about ref's replicas. A failed question is remembered as "unknown" for the
-// same time as an answer, so that an unreachable controller is not asked once per request.
+// read asks the controller about ref's replicas, once for all the callers that ask together. A failed
+// question is remembered as "unknown" for the same time as an answer, so that an unreachable controller
+// is not asked once per request.
 func (c *lagCache) read(ref string) lagReading {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	r := lagReading{at: c.now(), lag: map[string]time.Duration{}}
-	if sts, err := c.svc.Statuses(ctx, ref); err == nil {
-		for _, st := range sts {
-			if st.LagSeconds >= 0 {
-				r.lag[st.Identifier] = time.Duration(st.LagSeconds * float64(time.Second))
+	v, _, _ := c.sf.Do(ref, func() (any, error) {
+		c.mu.Lock()
+		r, have := c.refs[ref]
+		c.mu.Unlock()
+		if have && c.now().Sub(r.at) < lagTTL {
+			return r, nil // a flight that ended while this caller was on its way answered already
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		r = lagReading{at: c.now(), lag: map[string]time.Duration{}}
+		if sts, err := c.svc.Statuses(ctx, ref); err == nil {
+			for _, st := range sts {
+				if st.LagSeconds >= 0 {
+					r.lag[st.Identifier] = time.Duration(st.LagSeconds * float64(time.Second))
+				}
 			}
 		}
-	}
-	c.mu.Lock()
-	c.refs[ref] = r
-	c.mu.Unlock()
-	return r
+		c.mu.Lock()
+		c.refs[ref] = r
+		c.mu.Unlock()
+		return r, nil
+	})
+	return v.(lagReading)
 }

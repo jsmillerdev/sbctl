@@ -64,8 +64,11 @@ Studio process, is answered by the proxy from the same resolver (`internal/proxy
 - Verification attempts: five per project in a burst, one more every 15 seconds, and fifty for the node in a burst with one
   more every 1.5 seconds (`Options.Attempts`, `Options.Refill`). A refused attempt makes no DNS query.
 - Names: `ValidateHostname` refuses IP addresses, wildcards, single labels, bad labels, reserved zones and the node's own
-  hosts; `ValidateVanityName` refuses reserved names and ref-shaped names (the proxy refuses the same two in a route row, so
-  a vanity route cannot shadow a project even if written directly).
+  hosts; `ValidateVanityName` refuses reserved names, ref-shaped names, and any name that contains `-rr-` or ends in `-lb`
+  (the shape of a replica's host `<ref>-rr-<region>-<id6>` and a project's load balancer host `<ref>-lb`, design 2.7.1); a
+  reserved name is "not available" in `CheckVanity`. The proxy applies `RoutableVanityName` to a route row: the same checks
+  without the `-rr-` and `-lb` rule, so a row made before that rule keeps serving, and a vanity route cannot shadow a
+  project even if written directly (replica and balancer hosts are resolved before routes).
 - A custom domain and a vanity subdomain are mutually exclusive, as on hosted.
 - `tls.mode = "dns01"` nodes refuse custom hostnames (no per-host certificates there).
 
