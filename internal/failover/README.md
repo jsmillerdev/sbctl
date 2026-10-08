@@ -4,7 +4,7 @@ Moves one project's home, or the leadership of the whole server, to another node
 
 ```
 supavise projects failover <ref> [--to NODE] [--force] [--dry-run] [--resume] [--yes]
-supavise failover [--to NODE] [--force] [--dry-run] [--resume] [--restore-missing] [--old-primary-is-down] [--yes]
+supavise failover [--to NODE] [--force] [--dry-run] [--resume | --abort] [--restore-missing] [--old-primary-is-down] [--yes]
 GET /supavise/v1/failover/readiness
 ```
 
