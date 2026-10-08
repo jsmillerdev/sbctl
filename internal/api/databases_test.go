@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	plat "github.com/supavise/supavise/internal/api/gen/platform"
+	v1 "github.com/supavise/supavise/internal/api/gen/v1"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/replicas"
 )
@@ -274,4 +276,54 @@ func TestOrganizationProjectsListReplicas(t *testing.T) {
 			t.Fatalf("replica = %v", dbs[1])
 		}
 	}}})
+}
+
+// The bodies decode into the generated types with unknown fields refused, as a strict client
+// (the Supabase CLI, Studio's generated client) decodes them.
+func TestReplicaResponsesDecodeIntoTheGeneratedTypes(t *testing.T) {
+	rf := newReplicaFixture(t)
+	rf.srv.lbOn = true
+	us := rf.addNode(t, "us", "us-east-1", "us.pooler.example.test", "active")
+	up := rf.addHealthyReplica(t, euNode, "eu-west-1", "abcdef")
+	going := rf.addReplica(t, us, "us-east-1", "uvwxyz", "INIT_READ_REPLICA", "5_replayed_wal_archives", "")
+	rf.svc.statuses[going] = replicas.Status{Identifier: going, Status: "INIT_READ_REPLICA", Init: &replicas.InitStatus{
+		Status: "in_progress", Progress: "5_replayed_wal_archives", BaseBackupDownloadEstimateSeconds: 90}}
+	strict := func(path string, into any) {
+		t.Helper()
+		rec := rf.do("GET", path, nil)
+		if rec.Code != 200 {
+			t.Fatalf("GET %s: %d %s", path, rec.Code, rec.Body)
+		}
+		dec := json.NewDecoder(rec.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(into); err != nil {
+			t.Fatalf("GET %s: %v: %s", path, err, rec.Body)
+		}
+	}
+	var dbs []plat.DatabaseDetailResponseOutput
+	strict(dbsPath, &dbs)
+	var sts []plat.DatabaseStatusResponseOutput
+	strict(statusesPath, &sts)
+	var lbs []plat.LoadBalancerDetailResponseOutput
+	strict(lbPath, &lbs)
+	var pool []v1.SupavisorConfigResponseOutput
+	strict("/platform/projects/"+testRef+"/config/supavisor", &pool)
+	var pool1 []v1.SupavisorConfigResponseOutput
+	strict("/v1/projects/"+testRef+"/config/database/pooler", &pool1)
+	var orgs plat.OrganizationProjectsResponseOutput
+	strict("/platform/organizations/default/projects", &orgs)
+
+	if len(dbs) != 3 || dbs[1].Identifier != up || string(dbs[2].Status) != "INIT_READ_REPLICA" || dbs[0].ConnectionStringReadOnly == nil {
+		t.Errorf("databases = %+v", dbs)
+	}
+	if len(sts) != 3 || sts[2].ReplicaInitializationStatus == nil {
+		t.Fatalf("statuses = %+v", sts)
+	}
+	in, err := sts[2].ReplicaInitializationStatus.AsDatabaseStatusResponseOutputReplicaInitializationStatus0()
+	if err != nil || in.Status != "in_progress" || in.Progress == nil || string(*in.Progress) != "5_replayed_wal_archives" || in.Estimations == nil || in.Estimations.BaseBackupDownloadEstimateSeconds != 90 {
+		t.Errorf("initialization status = %+v (%v)", in, err)
+	}
+	if len(lbs) != 1 || len(lbs[0].Databases) != 3 || len(pool) != 3 || len(pool1) != 3 {
+		t.Errorf("balancers %d, pooler %d and %d", len(lbs), len(pool), len(pool1))
+	}
 }
