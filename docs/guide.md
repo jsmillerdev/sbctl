@@ -96,7 +96,7 @@ sudo -u supavise supavise status   # one verdict for the node and every project
 curl https://api.<domain>/healthz  # for an uptime monitor; reveals nothing else
 ```
 
-Add an `[alerts]` section to `/etc/supavise/config.toml` to get a webhook or email when a backup fails, disk runs low, a project turns unhealthy, a certificate nears expiry or an update is available. Before planned work, `supavise maintenance announce` shows a notice in the dashboard. The deploy guide's [health and alerts](../deploy/README.md#health-alerts-and-maintenance-notices) section has the details.
+Add an `[alerts]` section to `/etc/supavise/config.toml` to get a webhook or email when a backup fails, disk runs low, a project turns unhealthy, a certificate nears expiry, an update is available, or an upgrade starts, succeeds or fails. Before planned work, `supavise maintenance announce` shows a notice in the dashboard. The deploy guide's [health and alerts](../deploy/README.md#health-alerts-and-maintenance-notices) section has the details.
 
 ## How Supavise compares
 
