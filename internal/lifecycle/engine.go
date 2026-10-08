@@ -66,6 +66,16 @@ type Timers interface {
 	StopTimer(ctx context.Context, ref string) error
 }
 
+// Timers is the Timers the Engine drives: the node's own, or the one that sends each call to the node a
+// project is homed on once SetTimers has put it in front (nil: none).
+func (e *Engine) Timers() Timers { return e.opts.Timers }
+
+// SetTimers replaces the Timers the Engine drives. internal/app calls it before the Engine serves a
+// request, to put the router of internal/placement in front of the node's own timers in a cluster: a
+// backup timer runs where the project's data is, which is its home. It is not safe to call while
+// operations run.
+func (e *Engine) SetTimers(t Timers) { e.opts.Timers = t }
+
 func (e *Engine) startTimer(ctx context.Context, ref string) {
 	if e.opts.Timers == nil {
 		return
@@ -163,15 +173,41 @@ func (e *Engine) homedHere(p *registry.Project) bool {
 
 // atHome refuses op on a project that is homed on another node unless the Engine drives a plane that
 // routes by home. A node that holds a replica of the project would otherwise stop, restart or delete
-// the replica and flip the project's status in the registry.
+// the replica and flip the project's status in the registry. Only an operation whose every step is a
+// plane call, a registry write or a call on the shared services may use it (the leader's Timers and
+// capacity check follow the home too, see SetTimers and SetRemoteNodes); an operation that reads or
+// writes this node's own disk uses onHome.
 func (e *Engine) atHome(p *registry.Project, op string) error {
+	if e.drives(p) {
+		return nil
+	}
+	return e.notHomedHere(p, op, "")
+}
+
+// drives reports whether the Engine acts on p: it is homed here, or the plane routes by home.
+func (e *Engine) drives(p *registry.Project) bool {
+	if e.homedHere(p) {
+		return true
+	}
+	_, ok := e.plane.(HomeRouter)
+	return ok
+}
+
+// onHome refuses op on a project that is not homed on this node, whatever the plane: the operation
+// works on the data directory, the backup service or the artifacts of this node, which hold nothing of
+// a project that runs elsewhere. why says what stays here, for the message.
+func (e *Engine) onHome(p *registry.Project, op, why string) error {
 	if e.homedHere(p) {
 		return nil
 	}
-	if _, ok := e.plane.(HomeRouter); ok {
-		return nil
+	return e.notHomedHere(p, op, why)
+}
+
+func (e *Engine) notHomedHere(p *registry.Project, op, why string) error {
+	if why != "" {
+		why = "; " + why
 	}
-	return fmt.Errorf("%w: cannot %s %s here: it is homed on node %s and this is node %s", ErrInvalidState, op, p.Ref, p.NodeID, e.opts.NodeID)
+	return fmt.Errorf("%w: cannot %s %s here: it is homed on node %s and this is node %s%s", ErrInvalidState, op, p.Ref, p.NodeID, e.opts.NodeID, why)
 }
 
 // SetPlane replaces the plane the Engine drives. internal/app calls it before the Engine serves a
@@ -804,6 +840,9 @@ func (e *Engine) deleteProgress(ctx context.Context, ref string) deleteState {
 }
 
 func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev registry.Status) error {
+	if err := e.onHome(p, "take the final backup of", "the backup service reads the data directory of this node; delete it with SkipFinalBackup (the data is gone afterwards) or move it to this node first"); err != nil {
+		return err
+	}
 	keys, err := e.loadKeys(ctx, p.Ref)
 	if err != nil {
 		return err
@@ -1032,8 +1071,13 @@ func (e *Engine) Health(ctx context.Context, ref string) ([]ServiceHealth, error
 	if err != nil {
 		return nil, err
 	}
+	// The units of a project that runs elsewhere are not this node's to judge: its plane would find the
+	// replica's units, or none, and the verdict would be written to the registry.
+	if err := e.atHome(p, "check the health of"); err != nil {
+		return nil, err
+	}
 	hs := e.plane.Health(ctx, p, nil)
-	if active(p.Status) {
+	if active(p.Status) && !e.opts.ReadOnly {
 		want := registry.StatusActiveHealthy
 		for _, h := range hs {
 			if !h.Healthy {

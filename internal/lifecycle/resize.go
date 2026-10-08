@@ -145,7 +145,7 @@ func (e *Engine) beginResize(ctx context.Context, ref string, to Class, unlock f
 		return nil, err
 	}
 	defer release()
-	cp, known, err := e.Capacity(ctx, ref)
+	cp, known, err := e.capacityOf(ctx, p, ref)
 	if err != nil {
 		return nil, err
 	}

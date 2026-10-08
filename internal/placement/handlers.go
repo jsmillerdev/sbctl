@@ -40,6 +40,11 @@ type HandlerDeps struct {
 	Resolver Resolver
 	Members  cluster.Membership
 	Backups  LocalBackups
+	// Timers starts and stops the backup timer of a project homed here; nil does nothing (the exec
+	// backend has none).
+	Timers lifecycle.Timers
+	// Resources reads the memory and cores of this node; nil answers that they are unknown.
+	Resources func() lifecycle.NodeResources
 	// MaxBody bounds a request body (default 4 MiB).
 	MaxBody int64
 }
@@ -206,10 +211,7 @@ func (h *handlers) plane(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ref, method := r.PathValue("ref"), peerapi.PlaneMethod(r.PathValue("method"))
-	call, ok := planeCalls[method]
-	if method == planeFinalCheckpoint {
-		ok, call = true, h.finalCheckpoint
-	}
+	call, ok := h.planeCall(method)
 	if !ok {
 		badRequest(w, "unknown plane method %q", method)
 		return
@@ -243,6 +245,38 @@ func (h *handlers) plane(w http.ResponseWriter, r *http.Request) {
 		out.Result = b
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// planeCall is what the agent does for method: a method of lifecycle.Plane (planeCalls), or one of the
+// requests of this package that share the path.
+func (h *handlers) planeCall(method peerapi.PlaneMethod) (planeCall, bool) {
+	switch method {
+	case planeFinalCheckpoint:
+		return h.finalCheckpoint, true
+	case planeStartTimer:
+		return func(ctx context.Context, _ lifecycle.Plane, ref string, _ json.RawMessage) (any, error) {
+			if h.d.Timers == nil {
+				return nil, nil
+			}
+			return nil, h.d.Timers.StartTimer(ctx, ref)
+		}, true
+	case planeStopTimer:
+		return func(ctx context.Context, _ lifecycle.Plane, ref string, _ json.RawMessage) (any, error) {
+			if h.d.Timers == nil {
+				return nil, nil
+			}
+			return nil, h.d.Timers.StopTimer(ctx, ref)
+		}, true
+	case planeNodeResources:
+		return func(context.Context, lifecycle.Plane, string, json.RawMessage) (any, error) {
+			if h.d.Resources == nil {
+				return lifecycle.NodeResources{}, nil
+			}
+			return h.d.Resources(), nil
+		}, true
+	}
+	call, ok := planeCalls[method]
+	return call, ok
 }
 
 // finalCheckpoint is the plane call that reads a stopped cluster's control file.

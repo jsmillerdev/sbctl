@@ -48,6 +48,15 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	// The Engine drives the router; the node's own plane serves what is homed here.
 	router := placement.NewRouter(placement.RouterOptions{Local: node.Plane, Resolver: res, Self: self, RPC: m, Epoch: mem.Epoch})
 	node.Engine.SetPlane(router)
+	// What is not a plane call follows the home too: a project's backup timer runs where its data is,
+	// and a resume or a resize is judged against the memory and cores of the node that runs it. The
+	// node's own timers stay available to whoever starts or stops a primary here (failover).
+	localTimers := node.Engine.Timers()
+	node.Engine.SetTimers(router.Timers(localTimers))
+	node.Engine.SetRemoteNodes(router)
+	if localTimers != nil {
+		Provide[lifecycle.Timers](w, localTimers)
+	}
 
 	agent := placement.NewNodeAgent(placement.AgentOptions{
 		Cfg: w.Cfg, Plane: node.Plane, Registry: node.Registry, Keys: node.Engine.Keys, Members: mem,
@@ -55,7 +64,10 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	})
 	agent.Start(ctx)
 	ops := &placement.Ops{Self: self, Agent: agent, Backups: bk, RPC: m, Epoch: mem.Epoch}
-	if err := placement.Register(handle, placement.HandlerDeps{Agent: agent, Plane: node.Plane, Checkpoints: node.Plane, Resolver: res, Members: mem, Backups: bk}); err != nil {
+	if err := placement.Register(handle, placement.HandlerDeps{
+		Agent: agent, Plane: node.Plane, Checkpoints: node.Plane, Resolver: res, Members: mem, Backups: bk,
+		Timers: localTimers, Resources: func() lifecycle.NodeResources { return lifecycle.DetectNode(w.Cfg) },
+	}); err != nil {
 		return err
 	}
 

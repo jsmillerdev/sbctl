@@ -173,13 +173,26 @@ type Offer struct {
 // capacityState carries the Engine's view of the node. Its mutex orders the capacity check and
 // the registry write that makes it true, so two creates or resizes cannot both take the last room.
 type capacityState struct {
-	mu   sync.Mutex
-	node func() NodeResources
+	mu     sync.Mutex
+	node   func() NodeResources
+	remote NodeResourcer
 }
 
 // SetNode sets how the Engine reads the node's resources. Without it (nil) no capacity check is
 // made: tests and callers that do not know the node run unconstrained. internal/app sets DetectNode.
 func (e *Engine) SetNode(node func() NodeResources) { e.capacity.node = node }
+
+// NodeResourcer reads the resources of the node a project is homed on when that is not this one
+// (internal/placement implements it over the peer API): a resume or a resize is judged against the
+// machine that runs the project, not the leader's.
+type NodeResourcer interface {
+	NodeResources(ctx context.Context, p *registry.Project) (NodeResources, error)
+}
+
+// SetRemoteNodes sets how the Engine reads the resources of another node. Without it a project homed
+// elsewhere is not judged against its home. internal/app sets it in a cluster, before the Engine serves
+// a request.
+func (e *Engine) SetRemoteNodes(r NodeResourcer) { e.capacity.remote = r }
 
 // Capacity computes the node's room for project memory, leaving out the project exclude (a
 // resize judges the new size against everything else). ok is false when the Engine has no node.
@@ -198,6 +211,32 @@ func (e *Engine) Capacity(ctx context.Context, exclude string) (Capacity, bool, 
 		}
 	}
 	return ComputeNodeCapacity(e.cfg, e.capacity.node(), e.opts.NodeID, ps, rs, exclude), true, nil
+}
+
+// capacityOf is Capacity for the node p is homed on (a project that does not exist yet, p nil, is this
+// node's): this one, or another whose resources the Engine asks for (SetRemoteNodes), with the
+// registry's projects and replicas counted the same way. ok is false when the Engine cannot know them,
+// and no check is made.
+func (e *Engine) capacityOf(ctx context.Context, p *registry.Project, exclude string) (Capacity, bool, error) {
+	if p == nil || e.homedHere(p) {
+		return e.Capacity(ctx, exclude)
+	}
+	if e.capacity.node == nil || e.capacity.remote == nil {
+		return Capacity{}, false, nil
+	}
+	res, err := e.capacity.remote.NodeResources(ctx, p)
+	if err != nil {
+		return Capacity{}, true, fmt.Errorf("lifecycle: read the resources of node %s: %w", p.NodeID, err)
+	}
+	ps, err := e.reg.ListProjects(ctx)
+	if err != nil {
+		return Capacity{}, true, err
+	}
+	rs, err := e.reg.ListReplicasOn(ctx, p.NodeID)
+	if err != nil {
+		return Capacity{}, true, err
+	}
+	return ComputeNodeCapacity(e.cfg, res, p.NodeID, ps, rs, exclude), true, nil
 }
 
 // ComputeCapacity works out the node's room from its resources and its projects, leaving out the
@@ -263,9 +302,10 @@ func (c Capacity) Over() bool { return c.BudgetBytes > 0 && c.CommittedBytes > c
 // that does not exist yet). Sizes below the current one always fit.
 func (e *Engine) Offers(ctx context.Context, ref string) ([]Offer, error) {
 	have := ""
+	var p *registry.Project
 	if ref != "" {
-		p, err := e.reg.GetProject(ctx, ref)
-		if err != nil {
+		var err error
+		if p, err = e.reg.GetProject(ctx, ref); err != nil {
 			return nil, err
 		}
 		have = p.Class
@@ -273,7 +313,7 @@ func (e *Engine) Offers(ctx context.Context, ref string) ([]Offer, error) {
 			have = c.Name
 		}
 	}
-	cp, known, err := e.Capacity(ctx, ref)
+	cp, known, err := e.capacityOf(ctx, p, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -350,8 +390,8 @@ func (e *Engine) holdCapacity(ctx context.Context, req CreateRequest, size Class
 	return release, nil
 }
 
-// holdResume judges a paused project coming back against the node, as an upsize is judged: its
-// cap must fit on top of the projects that run. A paused project holds no room, so without this
+// holdResume judges a paused project coming back against the node it is homed on, as an upsize is
+// judged: its cap must fit on top of the projects that run. A paused project holds no room, so without this
 // a resize could take the room of a paused project and the resume would put the node over its
 // budget. The returned release keeps the room until the status that counts it is written.
 func (e *Engine) holdResume(ctx context.Context, p *registry.Project) (release func(), err error) {
@@ -365,7 +405,7 @@ func (e *Engine) holdResume(ctx context.Context, p *registry.Project) (release f
 	}
 	var once sync.Once
 	release = func() { once.Do(unlock) }
-	cp, known, err := e.Capacity(ctx, p.Ref)
+	cp, known, err := e.capacityOf(ctx, p, p.Ref)
 	if err == nil && known {
 		cl, cerr := ClassFor(p.Class)
 		if cerr != nil {

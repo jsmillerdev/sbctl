@@ -8,6 +8,7 @@ import (
 
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
+	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/projectconfig"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
@@ -42,10 +43,11 @@ type Router struct {
 }
 
 var (
-	_ PlaneRouter          = (*Router)(nil)
-	_ lifecycle.FullPlane  = (*Router)(nil)
-	_ lifecycle.HomeRouter = (*Router)(nil)
-	_ CheckpointReader     = (*Router)(nil)
+	_ PlaneRouter             = (*Router)(nil)
+	_ lifecycle.FullPlane     = (*Router)(nil)
+	_ lifecycle.HomeRouter    = (*Router)(nil)
+	_ CheckpointReader        = (*Router)(nil)
+	_ lifecycle.NodeResourcer = (*Router)(nil)
 )
 
 // NewRouter builds the router.
@@ -196,6 +198,55 @@ func (r *Router) FinalCheckpoint(ctx context.Context, ref string) (lifecycle.Con
 		return lr.FinalCheckpoint(ref)
 	}
 	return lifecycle.ControlInfo{}, fmt.Errorf("%w: the plane cannot read a control file", lifecycle.ErrNotSupported)
+}
+
+// NodeResources implements lifecycle.NodeResourcer: the memory and cores of the node p is homed on, read
+// on that node. A project homed here answers zero, which stands for unknown.
+func (r *Router) NodeResources(ctx context.Context, p *registry.Project) (lifecycle.NodeResources, error) {
+	pl, err := r.forProject(ctx, p)
+	if err != nil {
+		return lifecycle.NodeResources{}, err
+	}
+	var res lifecycle.NodeResources
+	if rp, ok := pl.(*RemotePlane); ok {
+		err = rp.call(ctx, p.Ref, planeNodeResources, nil, &res)
+	}
+	return res, err
+}
+
+// Timers returns the lifecycle.Timers of the leader's Engine: a project's nightly base backup timer
+// starts and stops on the node that is the project's home, where its data is. local is this node's own
+// timers (nil: it has none, the exec backend, and a project homed here gets none either).
+func (r *Router) Timers(local lifecycle.Timers) lifecycle.Timers { return routedTimers{r, local} }
+
+type routedTimers struct {
+	r     *Router
+	local lifecycle.Timers
+}
+
+func (t routedTimers) StartTimer(ctx context.Context, ref string) error {
+	return t.r.timer(ctx, ref, planeStartTimer, t.local, lifecycle.Timers.StartTimer)
+}
+
+func (t routedTimers) StopTimer(ctx context.Context, ref string) error {
+	return t.r.timer(ctx, ref, planeStopTimer, t.local, lifecycle.Timers.StopTimer)
+}
+
+// timer runs do on local for a project homed here and sends m to the home of any other. A ref the
+// registry no longer knows is a leftover of this node (a delete that is finishing).
+func (r *Router) timer(ctx context.Context, ref string, m peerapi.PlaneMethod, local lifecycle.Timers, do func(lifecycle.Timers, context.Context, string) error) error {
+	pl, err := r.forCleanup(ctx, ref)
+	if err != nil {
+		return err
+	}
+	rp, remote := pl.(*RemotePlane)
+	if !remote {
+		if local == nil {
+			return nil
+		}
+		return do(local, ctx, ref)
+	}
+	return rp.call(ctx, ref, m, nil, nil)
 }
 
 // local returns the node's own plane when p is homed here, and otherwise the error an optional

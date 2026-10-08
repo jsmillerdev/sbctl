@@ -50,6 +50,16 @@ func planeMethodName(goName string) peerapi.PlaneMethod {
 // after the old primary's fast shutdown to learn the position the new primary must replay to.
 const planeFinalCheckpoint peerapi.PlaneMethod = "final_checkpoint"
 
+// The requests below are on the plane path as well, and are not methods of lifecycle.Plane either. They
+// reach what the leader's Engine runs for a project that is homed on another node and that is not a plane
+// call: the project's nightly base backup timer, which runs where its data is, and the memory and cores
+// of the node, which a resume or a resize is judged against.
+const (
+	planeStartTimer    peerapi.PlaneMethod = "start_timer"
+	planeStopTimer     peerapi.PlaneMethod = "stop_timer"
+	planeNodeResources peerapi.PlaneMethod = "node_resources"
+)
+
 // CheckpointReader reads the control file of a project's cluster on its home node.
 type CheckpointReader interface {
 	FinalCheckpoint(ctx context.Context, ref string) (lifecycle.ControlInfo, error)

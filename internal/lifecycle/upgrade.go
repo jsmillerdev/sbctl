@@ -412,7 +412,7 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 	if err != nil {
 		return nil, err
 	}
-	if err := e.atHome(p, "upgrade"); err != nil {
+	if err := e.onHome(p, "upgrade", "an upgrade stops and renders the project from this node's artifacts and data; move the project to this node first"); err != nil {
 		return nil, err
 	}
 	if p.Ref == config.SystemRef {
@@ -968,6 +968,9 @@ func (e *Engine) settleUpgrading(ctx context.Context, ref string) (Recovered, bo
 // ACTIVE_HEALTHY); an upgrade whose process still holds its claim is not touched. The daemon
 // calls it every few minutes.
 func (e *Engine) SettleUpgrades(ctx context.Context) []Recovered {
+	if e.opts.ReadOnly {
+		return nil // a follower settles nothing: its registry is a copy
+	}
 	ps, err := e.reg.ListProjects(ctx)
 	if err != nil {
 		e.log.Error("settle upgrades: listing projects", "error", err)
@@ -976,7 +979,7 @@ func (e *Engine) SettleUpgrades(ctx context.Context) []Recovered {
 	var out []Recovered
 	for i := range ps {
 		p := ps[i]
-		if p.Ref == config.SystemRef || p.Status != registry.StatusUpgrading || e.runnerLive(ctx, p.Ref) {
+		if p.Ref == config.SystemRef || p.Status != registry.StatusUpgrading || !e.drives(&p) || e.runnerLive(ctx, p.Ref) {
 			continue
 		}
 		r, ok := e.settleUpgrading(ctx, p.Ref)
@@ -1011,7 +1014,7 @@ func (e *Engine) settleUpgradeRows(ctx context.Context, ps []registry.Project) {
 	}
 	for i := range ps {
 		p := &ps[i]
-		if p.Ref == config.SystemRef || p.Status == registry.StatusUpgrading {
+		if p.Ref == config.SystemRef || p.Status == registry.StatusUpgrading || !e.drives(p) {
 			continue
 		}
 		u, err := store.LatestUpgrade(ctx, p.Ref)

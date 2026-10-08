@@ -105,9 +105,26 @@ func TestPlacementWiringDoesNothingWithoutACluster(t *testing.T) {
 	}
 }
 
+// recTimers records the backup timers started and stopped on a node.
+type recTimers struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *recTimers) StartTimer(_ context.Context, ref string) error { return r.rec("start " + ref) }
+func (r *recTimers) StopTimer(_ context.Context, ref string) error  { return r.rec("stop " + ref) }
+func (r *recTimers) rec(call string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, call)
+	return nil
+}
+
 func TestPlacementWiringPutsTheRouterInFrontOfTheEngineAndServesThePeerAPI(t *testing.T) {
 	ctx := context.Background()
 	w, fm, reg := clusterWire(t)
+	timers := &recTimers{}
+	w.Node.Engine.SetTimers(timers)
 	mux := mesh.NewMux()
 	if err := placementWiring(ctx, w, mux.Handle); err != nil {
 		t.Fatal(err)
@@ -144,7 +161,13 @@ func TestPlacementWiringPutsTheRouterInFrontOfTheEngineAndServesThePeerAPI(t *te
 		t.Errorf("runners = %v", names)
 	}
 
-	// The Engine now sends a project homed on n2 to n2: a pause stops it through the mesh.
+	// The node's own timers are what the wiring provides to whoever starts a primary here.
+	if lt, ok := Get[lifecycle.Timers](w); !ok || lt != lifecycle.Timers(timers) {
+		t.Errorf("provided timers = %v", lt)
+	}
+
+	// The Engine now sends a project homed on n2 to n2: a pause stops it through the mesh, and so
+	// does its backup timer, which runs where its data is and not here.
 	p := &registry.Project{Ref: "abcdefghijklmnopqrst", Name: "demo", Class: "micro", Engine: registry.EnginePostgres, Status: registry.StatusActiveHealthy}
 	if err := reg.CreateProject(ctx, p); err != nil {
 		t.Fatal(err)
@@ -155,16 +178,23 @@ func TestPlacementWiringPutsTheRouterInFrontOfTheEngineAndServesThePeerAPI(t *te
 	if err := w.Node.Engine.Pause(ctx, p.Ref); err != nil {
 		t.Fatal(err)
 	}
-	if len(fm.calls) != 1 || fm.calls[0] != "n2 POST /peer/v1/projects/"+p.Ref+"/plane/stop" {
+	wantCalls := []string{"n2 POST /peer/v1/projects/" + p.Ref + "/plane/stop_timer", "n2 POST /peer/v1/projects/" + p.Ref + "/plane/stop"}
+	if strings.Join(fm.calls, ",") != strings.Join(wantCalls, ",") {
 		t.Fatalf("mesh calls = %v", fm.calls)
+	}
+	if len(timers.calls) != 0 {
+		t.Fatalf("the leader's own timers were driven for a project homed on n2: %v", timers.calls)
 	}
 	// A project homed here stays local.
 	q := &registry.Project{Ref: "bcdefghijklmnopqrstu", Name: "other", Class: "micro", Engine: registry.EnginePostgres, Status: registry.StatusActiveHealthy}
 	if err := reg.CreateProject(ctx, q); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Node.Engine.Pause(ctx, q.Ref); err != nil || len(fm.calls) != 1 {
+	if err := w.Node.Engine.Pause(ctx, q.Ref); err != nil || len(fm.calls) != 2 {
 		t.Fatalf("local pause: %v, calls %v", err, fm.calls)
+	}
+	if strings.Join(timers.calls, ",") != "stop "+q.Ref {
+		t.Fatalf("the timers of the project homed here: %v", timers.calls)
 	}
 
 	// The instance endpoints answer the leader and nobody else; an unknown replica is absent.
@@ -184,7 +214,7 @@ func TestPlacementWiringPutsTheRouterInFrontOfTheEngineAndServesThePeerAPI(t *te
 		t.Fatalf("observe: %d %s", rec.Code, rec.Body)
 	}
 	// InstanceOps for this node reaches the agent without the mesh.
-	if _, err := ops.Observe(ctx, "n1", id); err != nil || len(fm.calls) != 1 {
+	if _, err := ops.Observe(ctx, "n1", id); err != nil || len(fm.calls) != 2 {
 		t.Fatalf("local observe: %v, calls %v", err, fm.calls)
 	}
 }
