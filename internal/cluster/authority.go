@@ -60,6 +60,9 @@ type Authority struct {
 	// Ensure, when set, makes sure the system project has a base backup younger than the replica
 	// bootstrap age and names it in the join answer. Without it the joiner seeds from the newest one.
 	Ensure backup.BaseBackupEnsurer
+	// ReplicationPassword returns the opened password of the system cluster's replication role, which a
+	// joiner puts in its standby's primary_conninfo.
+	ReplicationPassword func(ctx context.Context) (string, error)
 	// Changed, when set, is called after the authority changed a node's row (a joiner admitted, a
 	// join confirmed, a fenced node taken back), before the answer goes out, so that the node's own
 	// view of the cluster, which peers admit certificates by, holds the change when the peer comes
@@ -366,7 +369,13 @@ func (a *Authority) systemBootstrap(ctx context.Context, node *registry.Node) (*
 		}
 		backupID = path.Base(strings.TrimRight(b.Location, "/")) // the manifest id ends the backup's location
 	}
-	return &peerapi.SystemBootstrap{Identifier: id, BackupID: backupID, Leader: cl.Leader, Epoch: cl.Epoch}, nil
+	boot := &peerapi.SystemBootstrap{Identifier: id, BackupID: backupID, Leader: cl.Leader, Epoch: cl.Epoch}
+	if a.ReplicationPassword != nil {
+		if boot.ReplicationPassword, err = a.ReplicationPassword(ctx); err != nil {
+			return nil, fmt.Errorf("cluster: the replication password of the system cluster: %w", err)
+		}
+	}
+	return boot, nil
 }
 
 // shortID is the six character id of a replica identifier.

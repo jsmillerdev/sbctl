@@ -421,6 +421,11 @@ type SystemBootstrap struct {
 	BackupID string `json:"backup_id"`
 	Leader   string `json:"leader"`
 	Epoch    int64  `json:"epoch"`
+	// ReplicationPassword is the opened password of the system cluster's replication role
+	// (supabase_replication_admin): the joiner has no registry to read it from yet, and the standby's
+	// primary_conninfo needs it. It is a secret: it goes into the 0600 postgresql.auto.conf of the
+	// standby and the 0600 join state, and into no log.
+	ReplicationPassword string `json:"replication_password,omitempty"`
 }
 
 // JoinConfirm is the body of POST PathJoinConfirm: the joiner's standby streams, so the node

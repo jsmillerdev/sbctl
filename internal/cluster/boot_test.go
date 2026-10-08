@@ -323,6 +323,24 @@ func TestLiveFencesALeaderThatHearsOfAHigherEpoch(t *testing.T) {
 		t.Fatal("a refresh un-fenced the node")
 	}
 
+	// A leader whose database is stopped writes nothing: a planned switchover looks like this to the new
+	// leader until the old one is demoted in place. It is not fenced by the new leader's pings.
+	g, _, _ := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	gp := &probe{}
+	g.o.InRecovery = gp.InRecovery
+	gp.set(false, errors.New("the system cluster is stopped"))
+	g.Refresh(ctx)
+	g.ObserveEpoch("n2", 2, "n2")
+	if g.Role() != RoleLeader || g.Fenced() != nil {
+		t.Fatal("a leader with its database down was fenced")
+	}
+	gp.set(false, nil) // the database is back as a primary: now it is a zombie
+	g.Refresh(ctx)
+	g.ObserveEpoch("n2", 2, "n2")
+	if g.Role() != RoleFenced {
+		t.Fatal("a primary that hears of a higher epoch was not fenced")
+	}
+
 	// A follower does not fence itself on anyone's word.
 	f, _, _ := newLive(t, BootDecision{Role: RoleFollower, SelfID: "n2"}, &probe{rec: true})
 	f.Refresh(ctx)
@@ -479,5 +497,63 @@ func TestMoveDivergedSetsDataAsideAndPrunes(t *testing.T) {
 	moved, err = MoveDiverged(cfg, 4, time.Now())
 	if err != nil || len(moved) != 1 || !strings.HasSuffix(moved[0], "data.diverged-4-2") {
 		t.Fatalf("second move %v, %v", moved, err)
+	}
+}
+
+func TestAssumeLeadership(t *testing.T) {
+	ctx := context.Background()
+	mk := func() *registry.Memory {
+		reg := registry.NewMemory()
+		if err := reg.CreateNode(ctx, &registry.Node{Name: "second", State: registry.NodeActive}); err != nil {
+			t.Fatal(err)
+		}
+		return reg
+	}
+	now := time.Now()
+
+	// The node that has led all along changes nothing.
+	reg := mk()
+	if planned, err := AssumeLeadership(ctx, reg, "n1", 1, now); err != nil || planned {
+		t.Fatalf("steady state: %v %v", planned, err)
+	}
+	if cl, _ := reg.GetCluster(ctx); cl.Epoch != 1 || cl.Leader != "n1" {
+		t.Fatalf("%+v", cl)
+	}
+
+	// An unplanned promotion: n2 leads at epoch 2 and n1 is fenced.
+	if planned, err := AssumeLeadership(ctx, reg, "n2", 2, now); err != nil || planned {
+		t.Fatalf("unplanned: %v %v", planned, err)
+	}
+	cl, _ := reg.GetCluster(ctx)
+	n1, _ := reg.GetNode(ctx, "n1")
+	if cl.Leader != "n2" || cl.Epoch != 2 || n1.State != registry.NodeFenced {
+		t.Fatalf("leader %s epoch %d, n1 %s", cl.Leader, cl.Epoch, n1.State)
+	}
+	// Asked again it does nothing, and a lower epoch is refused by the registry.
+	if _, err := AssumeLeadership(ctx, reg, "n2", 2, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AssumeLeadership(ctx, reg, "n1", 2, now); !errors.Is(err, registry.ErrConflict) {
+		t.Fatalf("a lower claim: %v", err)
+	}
+
+	// A planned switchover: maintenance names the old leader, so it stays active.
+	reg = mk()
+	if err := reg.SetMaintenance(ctx, registry.Maintenance{Node: "n1", Until: now.Add(time.Hour), Reason: "switchover"}); err != nil {
+		t.Fatal(err)
+	}
+	if planned, err := AssumeLeadership(ctx, reg, "n2", 2, now); err != nil || !planned {
+		t.Fatalf("planned: %v %v", planned, err)
+	}
+	if n1, _ := reg.GetNode(ctx, "n1"); n1.State != registry.NodeActive {
+		t.Fatalf("the old leader of a planned switchover is %s", n1.State)
+	}
+	// An announcement about another node, or an expired one, does not make it planned.
+	reg = mk()
+	if err := reg.SetMaintenance(ctx, registry.Maintenance{Node: "n1", Until: now.Add(-time.Minute), Reason: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if planned, _ := AssumeLeadership(ctx, reg, "n2", 2, now); planned {
+		t.Fatal("an expired announcement counted")
 	}
 }

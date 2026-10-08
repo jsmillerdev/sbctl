@@ -334,3 +334,33 @@ func AskPeer(ctx context.Context, creds *mesh.Credentials, admit mesh.AdmitFunc,
 	}
 	return peerapi.Ping{}, last
 }
+
+// AssumeLeadership records, in the registry of a node that has just booted as the leader, that it
+// leads: the cluster row names it at the epoch the boot decision settled on. It is the step that
+// follows a promotion (the failover procedure promoted the system cluster; the registry on it still
+// names the old leader). The old leader's row becomes fenced, unless the cluster row announces
+// maintenance on that node, which is how a planned switchover tells the new leader that the old one
+// stopped on purpose and is to be demoted in place: its row stays active. The failover procedure
+// clears the announcement when the move is done. A node that already leads at that epoch or a
+// higher one changes nothing; a SetLeader that the registry refuses (the epoch is not above its)
+// is returned, and the node is not the leader.
+func AssumeLeadership(ctx context.Context, reg registry.Registry, self string, epoch int64, now time.Time) (planned bool, err error) {
+	cl, err := reg.GetCluster(ctx)
+	if err != nil {
+		return false, err
+	}
+	if cl.Leader == self && cl.Epoch >= epoch {
+		return false, nil
+	}
+	old := cl.Leader
+	planned = old != self && cl.Maintenance.Active(now) && cl.Maintenance.Node == old
+	if err := reg.SetLeader(ctx, self, epoch); err != nil {
+		return false, err
+	}
+	if old != self && !planned {
+		if err := reg.SetNodeState(ctx, old, registry.NodeFenced); err != nil && !errors.Is(err, registry.ErrNotFound) {
+			return false, err
+		}
+	}
+	return planned, nil
+}

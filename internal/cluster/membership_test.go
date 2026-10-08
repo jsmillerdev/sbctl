@@ -41,8 +41,11 @@ func TestJoinResumes(t *testing.T) {
 	}
 	dir := config.ClusterDir(j.confPath)
 	st, err := ReadJoinState(dir)
-	if err != nil || st.NodeID != "n2" || st.System.Identifier == "" || st.Leader != l.cfg.PeerAddr() {
+	if err != nil || st.NodeID != "n2" || st.System.Identifier == "" || st.Leader != l.cfg.PeerAddr() || st.System.ReplicationPassword != "replication-secret" {
 		t.Fatalf("join state %+v, %v", st, err)
+	}
+	if fi, err := os.Stat(filepath.Join(dir, JoinStateFile)); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("join.json holds the replication password and must be 0600: %v, %v", fi, err)
 	}
 	if n, _ := l.reg.GetNode(ctx, "n2"); n.State != registry.NodeJoining {
 		t.Fatalf("the node is %s", n.State)

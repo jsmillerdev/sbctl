@@ -187,6 +187,7 @@ func newLeader(t *testing.T) *leaderFixture {
 	auth := &Authority{Reg: reg, CA: ca, Secrets: sec, Cfg: s.cfg, Topology: s.live, Log: quiet(), Version: "v0.2.0", Pins: testPins, Now: clk.Now,
 		MasterKey: func() ([]byte, error) { return os.ReadFile(s.cfg.KeyPath) }}
 	auth.Changed = func(ctx context.Context) { s.live.Refresh(ctx) }
+	auth.ReplicationPassword = func(context.Context) (string, error) { return "replication-secret", nil }
 	api := &PeerAPI{Authority: auth, Topology: s.live, Cfg: s.cfg, Reports: rep, Now: clk.Now,
 		Ping: func() peerapi.Ping {
 			return peerapi.Ping{Node: "n1", Epoch: s.live.Epoch(), Leader: "n1", Version: "v0.2.0"}
@@ -256,7 +257,7 @@ func TestJoinAndForwardBothWays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.NodeID != "n2" || len(seeded) != 1 || seeded[0].Identifier == "" || seeded[0].Leader != "n1" || seeded[0].Epoch != 1 {
+	if res.NodeID != "n2" || len(seeded) != 1 || seeded[0].Identifier == "" || seeded[0].Leader != "n1" || seeded[0].Epoch != 1 || seeded[0].ReplicationPassword != "replication-secret" {
 		t.Fatalf("result %+v, seeded %+v", res, seeded)
 	}
 	if viaForwarder != "system@leader:hello" {

@@ -34,6 +34,9 @@ var (
 	fencedPoll   = 3 * time.Second
 )
 
+// unreachableAfter is how long an active peer may have no session before node_unreachable is raised.
+const unreachableAfter = time.Minute
+
 // ErrRoleChanged is what the daemon stops with when the role it started in no longer holds: its system
 // cluster was promoted or demoted, it was fenced, or the server was given a cluster identity. The
 // error ends Serve, systemd starts the daemon again, and the boot decision (cluster.DecideBoot) opens
@@ -317,6 +320,17 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 			}()
 		},
 	})
+	// A node that boots as the leader after a promotion records that it leads (design 2.10.4 step 6);
+	// on the node that has led all along this changes nothing.
+	if boot.Role == cluster.RoleLeader {
+		planned, err := cluster.AssumeLeadership(ctx, reg, selfID, boot.Epoch, time.Now())
+		if err != nil {
+			return fmt.Errorf("recording that node %s leads at epoch %d: %w", selfID, boot.Epoch, err)
+		}
+		if planned {
+			log.Info("this node took the leadership in a planned switchover; the old leader stays active to be demoted", "epoch", boot.Epoch)
+		}
+	}
 	live.Refresh(ctx)
 	Provide[cluster.Membership](w, live)
 	Provide(w, live)
@@ -329,6 +343,13 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		Reg: reg, CA: ca, Secrets: der, Cfg: cfg, Topology: live, Log: log, Version: w.Options.Version, Pins: pins,
 		MasterKey: func() ([]byte, error) { return os.ReadFile(cfg.KeyPath) },
 		Changed:   func(ctx context.Context) { live.Refresh(ctx) },
+		ReplicationPassword: func(ctx context.Context) (string, error) {
+			k, err := w.Node.Engine.Keys(ctx, config.SystemRef)
+			if err != nil {
+				return "", err
+			}
+			return k.ReplicationPassword, nil
+		},
 	}
 	if bs, ok := Get[*backup.Service](w); ok {
 		if e, ok := any(bs).(backup.BaseBackupEnsurer); ok {
@@ -338,6 +359,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	reports := cluster.NewReports()
 
 	schema := &schemaCache{dsns: dsns, log: log}
+	skews := &skewState{}
 	var monitor *health.Monitor
 	if m, ok := Get[*health.Monitor](w); ok {
 		monitor = m
@@ -347,7 +369,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		Authz: &mesh.Authorizer{Cfg: cfg, Topology: live, Source: reg},
 		OnPing: func(node string, p peerapi.Ping, _ time.Duration) {
 			live.ObserveEpoch(node, p.Epoch, p.Leader)
-			peerSeen(ctx, reg, live, w.Options.Version, node, p, log)
+			peerSeen(ctx, reg, live, skews, w.Options.Version, node, p, log)
 		},
 	})
 	ping := func() peerapi.Ping {
@@ -412,14 +434,39 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	return nil
 }
 
-// peerSeen records what a ping says about a peer. The leader keeps the node's version in its row and
-// raises node_version_skew while the release is outside the window.
-func peerSeen(ctx context.Context, reg registry.Registry, live *cluster.Live, version, node string, p peerapi.Ping, log *slog.Logger) {
-	if err := cluster.CheckVersionWindow(version, p.Version, nil, nil); err != nil {
-		_ = alerts.Notify(ctx, alerts.Event{Kind: alerts.KindNodeVersionSkew, Severity: alerts.SeverityWarning,
-			Title: "A node runs a release outside the window", Detail: fmt.Sprintf("node %s: %v. Upgrade the node that lags.", node, err), Key: "version_skew/" + node})
-	} else {
-		_ = alerts.Notify(ctx, alerts.Event{Kind: alerts.KindNodeVersionSkew, Title: "A node runs a release outside the window", Key: "version_skew/" + node, Resolved: true})
+// skewState remembers which peers are outside the version window, so that the alert is raised and
+// resolved when that changes and not on every ping.
+type skewState struct {
+	mu   sync.Mutex
+	skew map[string]bool
+}
+
+func (s *skewState) changed(node string, skewed bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.skew == nil {
+		s.skew = map[string]bool{}
+	}
+	if s.skew[node] == skewed {
+		return false
+	}
+	s.skew[node] = skewed
+	return true
+}
+
+// peerSeen records what a ping says about a peer. Every node raises node_version_skew while the peer's
+// release is outside the window; the leader also keeps the peer's version in its row.
+func peerSeen(ctx context.Context, reg registry.Registry, live *cluster.Live, skews *skewState, version, node string, p peerapi.Ping, log *slog.Logger) {
+	err := cluster.CheckVersionWindow(version, p.Version, nil, nil)
+	if skews.changed(node, err != nil) {
+		ev := alerts.Event{Kind: alerts.KindNodeVersionSkew, Title: "A node runs a release outside the window", Key: "version_skew/" + node}
+		if err != nil {
+			ev.Severity = alerts.SeverityWarning
+			ev.Detail = fmt.Sprintf("node %s: %v. Upgrade the node that lags.", node, err)
+		} else {
+			ev.Resolved = true
+		}
+		_ = alerts.Notify(ctx, ev)
 	}
 	if !live.IsLeader() || p.Version == "" {
 		return
@@ -438,9 +485,10 @@ type schemaCache struct {
 	dsns []string
 	log  *slog.Logger
 
-	mu   sync.Mutex
-	at   time.Time
-	text string
+	mu     sync.Mutex
+	at     time.Time
+	text   string
+	behind bool
 }
 
 func (s *schemaCache) get() string {
@@ -459,14 +507,17 @@ func (s *schemaCache) get() string {
 		}
 		s.text = peerapi.SchemaString(applied)
 		ahead := peerapi.SchemaAhead(applied, registry.MigrationNames())
-		ev := alerts.Event{Kind: alerts.KindStandbyBehind, Title: "The registry is newer than this binary", Key: "standby_behind"}
-		if len(ahead) > 0 {
-			ev.Severity = alerts.SeverityWarning
-			ev.Detail = fmt.Sprintf("The registry has migrations this release lacks (%v). Running instances are left alone; upgrade this node.", ahead)
-		} else {
-			ev.Resolved = true
+		if (len(ahead) > 0) != s.behind {
+			s.behind = len(ahead) > 0
+			ev := alerts.Event{Kind: alerts.KindStandbyBehind, Title: "The registry is newer than this binary", Key: "standby_behind"}
+			if s.behind {
+				ev.Severity = alerts.SeverityWarning
+				ev.Detail = fmt.Sprintf("The registry has migrations this release lacks (%v). Running instances are left alone; upgrade this node.", ahead)
+			} else {
+				ev.Resolved = true
+			}
+			_ = alerts.Notify(ctx, ev)
 		}
-		_ = alerts.Notify(ctx, ev)
 		break
 	}
 	return s.text
@@ -525,6 +576,30 @@ func registerSelf(ctx context.Context, w *Wire, live *cluster.Live, log *slog.Lo
 // statusWriter writes the daemon's live view of the cluster to the state directory every ten
 // seconds, for `supavise status` and `supavise node ls`.
 func statusWriter(ctx context.Context, cfg *config.Config, live *cluster.Live, mgr *mesh.Manager, reports *cluster.Reports, log *slog.Logger) {
+	downSince := map[string]time.Time{}
+	raised := map[string]bool{}
+	// unreachable raises node_unreachable for an active peer this node has had no session with for
+	// a minute, and resolves it when the session is back.
+	unreachable := func(n registry.Node, up bool) {
+		if up || n.State != registry.NodeActive {
+			delete(downSince, n.ID)
+			if raised[n.ID] {
+				raised[n.ID] = false
+				_ = alerts.Notify(ctx, alerts.Event{Kind: alerts.KindNodeUnreachable, Title: "A node does not answer the mesh", Key: "node_unreachable/" + n.ID, Resolved: true})
+			}
+			return
+		}
+		since, ok := downSince[n.ID]
+		if !ok {
+			downSince[n.ID] = time.Now()
+			return
+		}
+		if time.Since(since) >= unreachableAfter && !raised[n.ID] {
+			raised[n.ID] = true
+			_ = alerts.Notify(ctx, alerts.Event{Kind: alerts.KindNodeUnreachable, Severity: alerts.SeverityWarning, Title: "A node does not answer the mesh",
+				Detail: fmt.Sprintf("node %s (%s) has had no session with this node since %s.", n.ID, n.Name, since.Format(time.RFC3339)), Key: "node_unreachable/" + n.ID})
+		}
+	}
 	write := func() {
 		self := live.Self()
 		leader := ""
@@ -537,6 +612,7 @@ func statusWriter(ctx context.Context, cfg *config.Config, live *cluster.Live, m
 				continue
 			}
 			p := cluster.PeerStatus{Node: n.ID, Connected: mgr.Connected(n.ID)}
+			unreachable(n, p.Connected)
 			if rtt, ok := mgr.RTT(n.ID); ok {
 				p.RTTMillis = float64(rtt.Microseconds()) / 1000
 			}

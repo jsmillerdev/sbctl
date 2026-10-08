@@ -44,7 +44,8 @@ type Live struct {
 
 	mu      sync.Mutex
 	fenced  *FencedRecord
-	drift   int // consecutive polls that saw a role other than the boot role
+	primary bool // the last probe of the system cluster succeeded and found a primary
+	drift   int  // consecutive polls that saw a role other than the boot role
 	changed chan struct{}
 	once    sync.Once
 	reason  string
@@ -125,11 +126,16 @@ func (l *Live) Refresh(ctx context.Context) {
 	if l.Fenced() != nil {
 		role = RoleFenced
 	} else if l.o.InRecovery != nil {
-		if rec, err := l.o.InRecovery(ctx); err != nil {
+		rec, err := l.o.InRecovery(ctx)
+		l.mu.Lock()
+		l.primary = err == nil && !rec
+		l.mu.Unlock()
+		switch {
+		case err != nil:
 			l.o.Log.Debug("membership: recovery state not read", "error", err)
-		} else if rec {
+		case rec:
 			role = RoleFollower
-		} else {
+		default:
 			role = RoleLeader
 		}
 	}
@@ -169,10 +175,18 @@ func (l *Live) watchRole(role Role) {
 
 // ObserveEpoch is told what a peer believes (every answer to a ping). A leader that sees another
 // node named as leader at its epoch or a higher one is fenced: it records that in fenced.json, which the
-// next start reads, and calls OnFenced.
+// next start reads, and calls OnFenced. Only a leader whose system cluster answers as a primary is
+// fenced: one whose database is stopped writes nothing, and that is how the old leader of a planned
+// switchover looks to the new one until it is demoted in place.
 func (l *Live) ObserveEpoch(node string, epoch int64, leader string) {
 	snap := l.get()
 	if snap.Role != RoleLeader || leader == "" || leader == l.o.SelfID || epoch < snap.Epoch {
+		return
+	}
+	l.mu.Lock()
+	primaryUp := l.primary
+	l.mu.Unlock()
+	if l.o.InRecovery != nil && !primaryUp {
 		return
 	}
 	rec := FencedRecord{Epoch: epoch, Leader: leader, At: l.o.Now(),

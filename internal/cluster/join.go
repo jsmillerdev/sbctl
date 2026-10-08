@@ -26,7 +26,8 @@ import (
 )
 
 // JoinStateFile is the file in the cluster directory that records a join that has the certificate
-// but is not confirmed, so that `node join --resume` can continue it.
+// but is not confirmed, so that `node join --resume` can continue it. It holds the system cluster's
+// replication password, so it is 0600; it is removed when the join is confirmed.
 const JoinStateFile = "join.json"
 
 // SeedFunc builds this node's standby of the system cluster from the base backup that b names

@@ -99,10 +99,9 @@ func SaveIdentity(dir string, key ed25519.PrivateKey, certDER, caDER []byte) err
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := mkdirAllOwned(dir); err != nil {
 		return err
 	}
-	chownLike(dir, filepath.Dir(dir))
 	files := []struct {
 		name string
 		data []byte
