@@ -18,8 +18,10 @@ import (
 	"github.com/supavise/supavise/internal/domains"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/projectconfig"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/replicas"
 	"github.com/supavise/supavise/internal/secrets"
 	"github.com/supavise/supavise/internal/sso"
 )
@@ -88,6 +90,17 @@ type Deps struct {
 	// CreateWait bounds how long POST /v1/projects waits for the new project to show
 	// up in the registry before answering 201 COMING_UP. Zero means 10 seconds.
 	CreateWait time.Duration
+	// Replicas is the read-replica controller (internal/replicas): the setup, remove and restart
+	// of a replica, the listings of a project's databases and the replication lag. Nil: the node
+	// has no controller, the listings show the primary alone and adding a replica is refused.
+	Replicas replicas.Service
+	// Placement says where a project's replicas are (replicas.go, pgmeta.go). Empty derives it
+	// from Registry.
+	Placement placement.Resolver
+	// LoadBalancers is whether the proxy serves each project's API load balancer
+	// (<ref>-lb.api.<domain>) once the project has a replica. False: GET load-balancers
+	// answers an empty list, because Studio would show an endpoint nothing serves.
+	LoadBalancers bool
 }
 
 // Server is the Management API. It implements http.Handler.
@@ -137,6 +150,11 @@ type Server struct {
 	roEnsured map[string]readOnlyEnsured // by project ref
 
 	ops opTracker
+
+	// replicas and placement serve the read-replica routes (replicas.go); lbOn is Deps.LoadBalancers.
+	replicas  replicas.Service
+	placement placement.Resolver
+	lbOn      bool
 
 	// disk is the data volume and the projects' disk limits (compute.go).
 	disk DiskLimits
@@ -262,6 +280,10 @@ func NewServer(d Deps) (*Server, error) {
 			s.log.Warn("api: no Store given and the registry is not Postgres; using an in-memory store, state is lost on restart")
 			s.store = NewMemoryStore()
 		}
+	}
+	s.replicas, s.placement, s.lbOn = d.Replicas, d.Placement, d.LoadBalancers
+	if s.placement == nil {
+		s.placement = placement.RegistryResolver{Reg: d.Registry}
 	}
 	s.disk = d.Disk
 	if s.disk == nil {

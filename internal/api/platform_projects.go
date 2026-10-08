@@ -38,10 +38,11 @@ func elem(key, prop string) map[string]any {
 }
 
 // connectionPlaceholder is the connectionString Studio requires to be non-empty
-// before it will call pg-meta. It carries no password: the pg-meta proxy ignores the
-// header Studio sends back and builds its own from the lifecycle manager.
+// before it will call pg-meta. It carries no password: the pg-meta proxy reads only the
+// host of the header Studio sends back, to know which database of the project the request
+// is for, and builds its own connection from the lifecycle manager.
 func (s *Server) connectionPlaceholder(p *registry.Project) string {
-	return fmt.Sprintf("postgresql://postgres:[YOUR-PASSWORD]@%s:%d/postgres", s.dbHost(p.Ref), s.cfg.Ports.SupavisorSession)
+	return s.dbString(p.Ref, "postgres")
 }
 
 func (s *Server) platformProject(p *registry.Project, org *registry.Organization) plat.ProjectDetailResponseOutput {
@@ -217,6 +218,7 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 	mine = mine[offset:min(total, offset+limit)]
 	rows := make([]any, 0, len(mine))
 	const key = "GET /platform/organizations/{slug}/projects"
+	var regions map[string]string // node regions, loaded when a project has a replica
 	for _, p := range mine {
 		row := elem(key, "projects")
 		db := map[string]any{}
@@ -228,8 +230,30 @@ func (s *Server) orgProjects(w http.ResponseWriter, r *http.Request) error {
 			db, _ = MinimalValue(item).(map[string]any)
 		}
 		setAll(db, map[string]any{"cloud_provider": "AWS", "identifier": p.Ref, "region": s.regionOf(&p), "status": string(p.Status), "type": "PRIMARY", "infra_compute_size": infraComputeSize(&p)})
+		dbs := []any{db}
+		reps, err := s.placement.ReplicasOf(r.Context(), p.Ref)
+		if err != nil {
+			return mapErr(err)
+		}
+		if len(reps) > 0 && regions == nil {
+			if regions, err = s.nodeRegions(r.Context()); err != nil {
+				return err
+			}
+		}
+		for _, rep := range reps {
+			// A replica is the primary's element with its own identifier, region and status.
+			rdb := map[string]any{}
+			for k, v := range db {
+				rdb[k] = v
+			}
+			region := regions[rep.NodeID]
+			if region == "" {
+				region = s.regionOf(&p)
+			}
+			dbs = append(dbs, setAll(rdb, map[string]any{"identifier": rep.Identifier, "region": region, "status": rep.Status, "type": "READ_REPLICA"}))
+		}
 		setAll(row, map[string]any{
-			"cloud_provider": "AWS", "databases": []any{db}, "inserted_at": ts(p.CreatedAt), "integration_source": nil,
+			"cloud_provider": "AWS", "databases": dbs, "inserted_at": ts(p.CreatedAt), "integration_source": nil,
 			"is_branch": false, "name": p.Name, "ref": p.Ref, "region": s.regionOf(&p), "status": string(p.Status),
 		})
 		rows = append(rows, row)

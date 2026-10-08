@@ -57,7 +57,7 @@ func (s *Server) routesProjects(add func(string, handlerFunc)) {
 	add("DELETE /platform/projects/{ref}", s.platformDeleteProject)
 	add("POST /platform/projects/{ref}/pause", s.pauseProject(http.StatusCreated))
 	add("POST /platform/projects/{ref}/restore", s.restoreProject(http.StatusOK))
-	add("POST /platform/projects/{ref}/restart", s.restartProject(http.StatusCreated))
+	add("POST /platform/projects/{ref}/restart", s.platformRestart)
 	add("POST /platform/projects/{ref}/restart-services", s.restartProject(http.StatusCreated))
 	add("GET /platform/projects/{ref}/status", s.platformStatus)
 	add("GET /platform/organizations/{slug}/projects", s.orgProjects)
@@ -377,6 +377,25 @@ func (s *Server) restoreProject(status int) handlerFunc {
 // restartProject pauses and resumes: there is no in-place restart in Manager. Both
 // calls run as one detached unit, so a client that leaves between them cannot strand the
 // project paused.
+// platformRestart restarts the project, or, when the body names a database_identifier that is one
+// of the project's read replicas, that replica alone (Studio's Restart replica). The identifier
+// of the primary, or none, restarts the project, which restarts the primary only. The body was
+// never read before and still is not required to parse: a malformed one restarts the project.
+func (s *Server) platformRestart(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		Identifier string `json:"database_identifier"`
+	}
+	_ = decode(r, &in)
+	if in.Identifier != "" && in.Identifier != r.PathValue("ref") {
+		p, err := s.loadProject(r.Context(), r.PathValue("ref"))
+		if err != nil {
+			return err
+		}
+		return s.restartReplica(w, r, p, in.Identifier, http.StatusCreated)
+	}
+	return s.restartProject(http.StatusCreated)(w, r)
+}
+
 func (s *Server) restartProject(status int) handlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		p, err := s.loadProject(r.Context(), r.PathValue("ref"))
@@ -493,27 +512,43 @@ func (s *Server) v1Health(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// v1Pooler describes the shared Supavisor entry of a project, with the pool size and client
-// limit saved for it (config_pooler.go). The password is a placeholder: it never leaves the
-// secret store through this route.
+// v1Pooler describes the shared Supavisor entries of a project, the primary's and one for each
+// read replica, with the pool size and client limit saved for the project (config_pooler.go). A
+// replica's entry connects as postgres.<identifier> on the pooler of its node. The password is a
+// placeholder: it never leaves the secret store through this route.
 func (s *Server) v1Pooler(w http.ResponseWriter, r *http.Request) error {
 	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
 	if err != nil {
 		return err
 	}
-	user := "postgres." + p.Ref
-	conn := fmt.Sprintf("postgres://%s:[YOUR-PASSWORD]@%s:%d/postgres", user, s.cfg.PoolerHost(), s.cfg.Ports.SupavisorTransaction)
-	mode := v1.SupavisorConfigResponseOutputPoolMode(poolerMode)
 	st, err := s.poolerState(r, p)
 	if err != nil {
 		return err
 	}
 	pool, maxClients := s.poolerValues(p, st)
-	size, maxConn := int(pool), int(maxClients)
-	writeJSON(w, http.StatusOK, []v1.SupavisorConfigResponseOutput{{
-		ConnectionString: conn, ConnectionStringSnake: conn, DatabaseType: "PRIMARY",
-		DbHost: s.cfg.PoolerHost(), DbName: "postgres", DbPort: s.cfg.Ports.SupavisorTransaction, DbUser: user,
-		DefaultPoolSize: &size, Identifier: p.Ref, IsUsingScramAuth: true, MaxClientConn: &maxConn, PoolMode: mode,
-	}})
+	entry := func(identifier, host, kind string) v1.SupavisorConfigResponseOutput {
+		user := "postgres." + identifier
+		conn := fmt.Sprintf("postgres://%s:[YOUR-PASSWORD]@%s:%d/postgres", user, host, s.cfg.Ports.SupavisorTransaction)
+		size, maxConn := int(pool), int(maxClients)
+		return v1.SupavisorConfigResponseOutput{
+			ConnectionString: conn, ConnectionStringSnake: conn, DatabaseType: v1.SupavisorConfigResponseOutputDatabaseType(kind),
+			DbHost: host, DbName: "postgres", DbPort: s.cfg.Ports.SupavisorTransaction, DbUser: user,
+			DefaultPoolSize: &size, Identifier: identifier, IsUsingScramAuth: true, MaxClientConn: &maxConn,
+			PoolMode: v1.SupavisorConfigResponseOutputPoolMode(poolerMode),
+		}
+	}
+	out := []v1.SupavisorConfigResponseOutput{entry(p.Ref, s.cfg.PoolerHost(), "PRIMARY")}
+	reps, err := s.replicasOf(r.Context(), p.Ref)
+	if err != nil {
+		return err
+	}
+	for _, rep := range reps {
+		host := rep.PublicHost
+		if host == "" {
+			host = s.cfg.PoolerHost()
+		}
+		out = append(out, entry(rep.Identifier, host, "READ_REPLICA"))
+	}
+	writeJSON(w, http.StatusOK, out)
 	return nil
 }
