@@ -346,6 +346,9 @@ ICONS = {
     "key":       '<circle cx="15" cy="24" r="9"/><path d="M24 24H44"/><path d="M34 24V32M41 24V30"/>',
     "shield":    '<path d="M24 5L40 11V24L24 43L8 24V11Z"/><path d="M16 23L22 29L32 18"/>',
     "cloud":     '<path d="M14 37A8 8 0 0 1 12.8 21.2A12 12 0 0 1 35.6 19.2A9 9 0 0 1 35 37Z"/>',
+    "chip":      '<rect x="12" y="12" width="24" height="24"/><path stroke="none" fill="@" d="M19 19h10v10H19z"/>'
+                 '<path d="M18 4V12M30 4V12M18 36V44M30 36V44M4 18H12M4 30H12M36 18H44M36 30H44"/>',
+    "pulse":     '<path d="M4 26H14L19 13L28 37L33 22H44"/>',
     "server":    '<rect x="5" y="7" width="38" height="14"/><rect x="5" y="27" width="38" height="14"/>'
                  '<path stroke="none" fill="@" d="M12 12h4v4h-4zM12 32h4v4h-4z"/><path d="M26 14H36M26 34H36"/>',
 }
@@ -358,11 +361,13 @@ def icon(name, x, y, size, color):
 FEATURES = [
     ("dashboard", "Dashboard", "The real Supabase Studio, with multiple organizations and projects"),
     ("project", "Every project", "Postgres, Auth, REST, GraphQL, Realtime, Storage, Edge Functions and custom domains"),
+    ("chip", "Compute sizes", "Nano to 16XL per project, like hosted, resized from the dashboard"),
     ("branch", "Branching", "Schema-only branches or full copies of your data, for previews and agents"),
     ("backup", "Backups", "Point-in-time restore from the dashboard, including Storage files"),
     ("team", "Teams", "Organizations, roles, invitations, SAML single sign-on and MFA"),
     ("key", "API keys", "Publishable and secret keys, legacy JWT keys and key rotation"),
-    ("shield", "Operations", "Automatic HTTPS, health checks, alerts, security patches and signed updates"),
+    ("pulse", "Monitoring", "Health checks, an uptime endpoint, and alerts by email or webhook"),
+    ("shield", "Operations", "Automatic HTTPS, security patches and signed updates"),
     ("cloud", "AWS", "A one-field CloudFormation template"),
 ]
 
@@ -389,7 +394,8 @@ def features_svg(theme):
         out.append(text(x + 100, y + 44, title, 24, c["text"], 700))
         for j, ln in enumerate(wrap(line, 46)):
             out.append(text(x + 100, y + 71 + j * 23, ln, 17, c["sub"]))
-    H_ = 2 + 4 * CH + 3 * GAP_
+    rows = (len(FEATURES) + 1) // 2
+    H_ = 2 + rows * CH + (rows - 1) * GAP_
     desc = "What is included: " + " ".join(f"{t}: {l}." for _, t, l in FEATURES)
     return frame(W_, H_, f"What is included ({theme})", desc, "\n  ".join(out))
 
