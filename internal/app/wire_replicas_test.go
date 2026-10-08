@@ -11,6 +11,7 @@ import (
 
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
+	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/placement"
@@ -209,6 +210,15 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(
 	}
 	if len(w.off) != 0 {
 		t.Fatalf("a single server switched features off: %v", w.off)
+	}
+	// A single server whose host is behind runs no controller either, and says nothing more than wireMesh did.
+	wb := testWire(t)
+	Provide(wb, hostsetup.Status{Have: 1, Want: 2, Known: true})
+	if err := wireReplicas(context.Background(), wb); err != nil {
+		t.Fatal(err)
+	}
+	if wb.API.Replicas != nil || len(wb.off) != 0 || len(wb.runners) != 0 {
+		t.Fatalf("a single server that is behind: replicas %v, off %v, runners %d", wb.API.Replicas, wb.off, len(wb.runners))
 	}
 
 	// A cluster node that cannot reach the replica nodes or take base backups runs no controller. The
