@@ -638,6 +638,37 @@ func TestConfigSyncStep(t *testing.T) {
 	}
 }
 
+// lateSync is a leader that does not answer the check and answers the write.
+type lateSync struct{ files []string }
+
+func (l lateSync) Sync(_ context.Context, dryRun bool) ([]string, error) {
+	if dryRun {
+		return nil, errors.New("deadline exceeded")
+	}
+	return l.files, nil
+}
+
+// A converge whose check could not tell, and whose write reached the leader, reports what it wrote
+// and no longer calls the step unknown.
+func TestConvergeClearsUnknownWhenTheWriteReachedTheLeader(t *testing.T) {
+	h := newHost(t)
+	h.opts.ConfigSync = lateSync{files: []string{"/etc/supavise/config.d/10-cluster.toml"}}
+	c := &Converger{Steps: []Step{configSyncStep(h.opts)}, StateDir: h.state, Out: &bytes.Buffer{}, NoMarker: true}
+	rs, err := c.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs[0].ID != "config-d" || rs[0].Unknown || rs[0].Detail != "" || len(rs[0].Changed) != 1 {
+		t.Errorf("result: %+v", rs[0])
+	}
+	// A leader that stays silent keeps the step unknown (it was a warning, not a change).
+	c = &Converger{Steps: []Step{configSyncStep(Options{ConfigSync: &scriptedSync{err: errors.New("cannot reach the leader n1")}})}, StateDir: h.state, Out: &bytes.Buffer{}, NoMarker: true}
+	rs, err = c.Run(context.Background())
+	if err != nil || !rs[0].Unknown {
+		t.Errorf("a leader that never answered: %+v, %v", rs[0], err)
+	}
+}
+
 // blockedSync waits for the context, as a leader that accepts the connection and never answers does.
 type blockedSync struct{}
 

@@ -235,6 +235,11 @@ func (c *Converger) Run(ctx context.Context) ([]Result, error) {
 		}
 		o, err := s.Apply(ctx)
 		r.Changed = o.Changed
+		if r.Unknown && err == nil && len(o.Warnings) == 0 {
+			// The check could not tell, the apply could: a leader that answered late. Nothing is
+			// unknown about the step any more.
+			r.Unknown, r.Detail = false, ""
+		}
 		for _, line := range o.Changed {
 			c.say("%s", line)
 		}

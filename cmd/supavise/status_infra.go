@@ -44,45 +44,66 @@ func infraStatus(ctx context.Context, cfg *config.Config) (*infra.Report, error)
 }
 
 // hostBlock is the host block of `supavise status`: the steps of `supavise system converge` that
-// have something to do. nil means the host is converged.
+// have something to do, and the ones that could not be checked (the cluster settings, when the
+// leader did not answer). nil means the host is converged.
 type hostBlock struct {
-	Pending []hostsetup.Result `json:"pending"`
+	Pending   []hostsetup.Result `json:"pending"`
+	Unchecked []hostsetup.Result `json:"unchecked,omitempty"`
 }
 
-// hostStatusBlock is hostStatus as a block for the status report: nil when no step is pending.
+// hostStatusBlock is hostStatus as a block for the status report: nil when no step is pending and
+// none was left unchecked.
 func hostStatusBlock(ctx context.Context, cfg *config.Config) (*hostBlock, error) {
-	pending, err := hostStatus(ctx, cfg)
-	if err != nil || len(pending) == 0 {
+	pending, unchecked, err := hostStatus(ctx, cfg)
+	if err != nil || len(pending)+len(unchecked) == 0 {
 		return nil, err
 	}
-	return &hostBlock{Pending: pending}, nil
+	return &hostBlock{Pending: pending, Unchecked: unchecked}, nil
 }
 
-// Render writes the block: what is pending and the command that does it.
+// Render writes the block: what is pending and the command that does it, then what could not be
+// checked. A step that could not be checked is not called pending: nothing says it has work.
 func (b *hostBlock) Render(w io.Writer) {
-	fmt.Fprintf(w, "Host  %d step(s) of the host layer are pending\n", len(b.Pending))
-	for _, r := range b.Pending {
-		line := "  pending  " + r.Title
-		if r.Detail != "" {
-			line += " (" + r.Detail + ")"
+	if len(b.Pending) > 0 {
+		fmt.Fprintf(w, "Host  %d step(s) of the host layer are pending\n", len(b.Pending))
+		for _, r := range b.Pending {
+			fmt.Fprintln(w, stepLine("pending", r))
 		}
-		fmt.Fprintln(w, line)
+		fmt.Fprintln(w, "  Fix: sudo supavise system converge")
 	}
-	fmt.Fprintln(w, "  Fix: sudo supavise system converge")
+	if len(b.Unchecked) > 0 {
+		if len(b.Pending) == 0 {
+			fmt.Fprintln(w, "Host  the host layer could not be checked in full")
+		}
+		for _, r := range b.Unchecked {
+			fmt.Fprintln(w, stepLine("not checked", r))
+		}
+	}
+}
+
+func stepLine(what string, r hostsetup.Result) string {
+	line := "  " + what + "  " + r.Title
+	if r.Detail != "" {
+		line += " (" + r.Detail + ")"
+	}
+	return line
 }
 
 // hostStatus lists the steps of the host layer that have something to do, from the same checks as
-// `supavise system converge --check`; empty when the host is converged. It needs no root.
-func hostStatus(ctx context.Context, cfg *config.Config) ([]hostsetup.Result, error) {
+// `supavise system converge --check`, and the ones that could not be checked; both are empty when the
+// host is converged. It needs no root.
+func hostStatus(ctx context.Context, cfg *config.Config) (pending, unchecked []hostsetup.Result, err error) {
 	c, err := newConverger(cfg, defaultUnitDir, "/etc/polkit-1/rules.d", false, io.Discard, io.Discard)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var pending []hostsetup.Result
 	for _, r := range c.Check(ctx) {
-		if r.Pending {
+		switch {
+		case r.Pending:
 			pending = append(pending, r)
+		case r.Unknown:
+			unchecked = append(unchecked, r)
 		}
 	}
-	return pending, nil
+	return pending, unchecked, nil
 }
