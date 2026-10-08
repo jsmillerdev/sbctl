@@ -50,7 +50,7 @@ cleanup() {
   collect_logs
   mkdir -p "$LOG_DIR"
   cp "$STS_LOG" "$FF_ROOT"/follower.toml "$LOG_DIR/" 2>/dev/null
-  cp "$F_STATE"/run/*.log "$LOG_DIR/" 2>/dev/null
+  cp "$F_STATE"/logs/*.log "$LOG_DIR/" 2>/dev/null
   for u in $(systemctl list-units --all --plain --no-legend 'ff-*' 2>/dev/null | awk '{print $1}'); do
     journalctl --no-pager -o short-iso -u "$u" >"$LOG_DIR/$u.log" 2>&1
   done
@@ -308,7 +308,7 @@ T0=$(date '+%Y-%m-%d %H:%M:%S')
 sleep 1
 export FLEET_FOLLOWER_CONFIG=$FF_ROOT/follower.toml FLEET_LEADER_CONFIG=$SUPAVISE_CONF FLEET_REF=$REF FLEET_DB_PASSWORD=$DBPW FLEET_REPLICA_PORT=$REPLICA_PORT
 (cd / && sudo -u "$SUPAVISE_USER" -H --preserve-env=FLEET_FOLLOWER_CONFIG,FLEET_LEADER_CONFIG,FLEET_REF,FLEET_DB_PASSWORD,FLEET_REPLICA_PORT \
-  "$FOLLOWER_TEST" -test.v -test.run '^TestLinuxFollower$' -test.timeout 20m) || fail "the follower test failed"
+  "$FOLLOWER_TEST" -test.v -test.run '^TestLinuxFollower$' -test.timeout 20m) 2>&1 | tee "$LOG_DIR/follower-test.log" || fail "the follower test failed"
 
 log "nothing wrote to the standby"
 errs=$(journalctl --no-pager -o cat -u ff-pg-ff-system --since "$T0" | grep -E 'ERROR|FATAL|PANIC|read-only|cannot execute' || true)
@@ -322,6 +322,7 @@ psql_at "$F_STATE/projects/system/postgres/sock" "$F_SYS" "$SUP_DB" 'create tabl
 has "$(journalctl --no-pager -o cat -u ff-pg-ff-system --since "$T1")" 'read-only|cannot execute' || fail "a deliberate write on the standby left no line the detector matches"
 
 log "the follower's Supavisor log shows no database errors"
-serrs=$(grep -iE 'read-only|cannot execute|postgrex.*error' "$F_STATE"/run/supavise-supavisor.service.log 2>/dev/null | head -5 || true)
+[[ -s $F_STATE/logs/supavise-supavisor.service.log ]] || fail "the follower's Supavisor left no log under $F_STATE/logs"
+serrs=$(grep -iE 'read-only|cannot execute|postgrex.*error' "$F_STATE/logs/supavise-supavisor.service.log" | head -5 || true)
 [[ -z $serrs ]] || { echo "$serrs" >&2; fail "the follower's Supavisor logged database errors"; }
 log "fleet-follower: ok"

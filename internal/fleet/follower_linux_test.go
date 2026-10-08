@@ -69,7 +69,7 @@ func TestLinuxFollower(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the standby's registry: %v", err)
 	}
-	defer freg.Close()
+	t.Cleanup(freg.Close) // after the cleanups registered below, which still use the registries
 	var inRecovery bool
 	if err := freg.Pool().QueryRow(ctx, `select pg_is_in_recovery()`).Scan(&inRecovery); err != nil || !inRecovery {
 		t.Fatalf("the follower's system cluster is not a standby: %v, %v", inRecovery, err)
@@ -78,7 +78,7 @@ func TestLinuxFollower(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the leader's registry: %v", err)
 	}
-	defer lreg.Close()
+	t.Cleanup(lreg.Close)
 
 	sup := units.NewExec(fcfg, log)
 	arts, err := artifacts.New(fcfg, artifacts.WithLogger(log))
@@ -157,6 +157,7 @@ func TestLinuxFollower(t *testing.T) {
 		var err error
 		for deadline := time.Now().Add(90 * time.Second); time.Now().Before(deadline); time.Sleep(time.Second) {
 			if got, err = login(port, user); err == nil && got == want {
+				t.Logf("%s: %s on port %d answers %s (in recovery|server port)", what, user, port, got)
 				return
 			}
 		}
@@ -192,7 +193,9 @@ func TestLinuxFollower(t *testing.T) {
 	})
 	leaderPos, followerReplay := fleet.PGReplay{Pool: lreg.Pool()}, fleet.PGReplay{Pool: freg.Pool()}
 	refresh := fleet.PeerRefresh{Replay: followerReplay, Refresh: ffleet, Wait: 30 * time.Second}
-	publish := func(port int) {
+	// publish writes the replica tenant on the leader, waits for the follower's standby to replay it,
+	// calls between (it sees the follower's Supavisor before the refresh), and refreshes.
+	publish := func(port int, between func()) {
 		t.Helper()
 		spec.ReplicaID, spec.DBPort = id, port
 		if err := lfleet.EnsureReplicaTenant(ctx, spec); err != nil {
@@ -202,13 +205,31 @@ func TestLinuxFollower(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+			if past, err := followerReplay.ReplayedPast(ctx, lsn); err != nil || past {
+				if err != nil {
+					t.Fatal(err)
+				}
+				break
+			} else if time.Now().After(deadline) {
+				t.Fatalf("the follower's standby did not replay %s", lsn)
+			}
+		}
+		if between != nil {
+			between()
+		}
 		if done, err := refresh.Do(ctx, id, lsn); err != nil || !done {
 			t.Fatalf("refresh of %s after replay of %s: %v, %v", id, lsn, done, err)
 		}
 	}
-	publish(primaryPort) // a tenant that points at the primary: a login lands there
+	publish(primaryPort, nil) // a tenant that points at the primary: a login lands there
 	eventually("the replica tenant on its first port", fmt.Sprintf("false|%d", primaryPort), fcfg.Ports.SupavisorTransaction, "postgres."+id)
-	publish(replicaPort) // the row changes; the refresh makes the follower's Supavisor follow it
+	publish(replicaPort, func() {
+		// The row on the standby already names the replica; the follower's Supavisor may still pool to the
+		// old target until it is told (spike S1). What it answers here is recorded, not required.
+		got, err := login(fcfg.Ports.SupavisorTransaction, "postgres."+id)
+		t.Logf("after replay, before the refresh: %q, %v", got, err)
+	})
 	for _, port := range []int{fcfg.Ports.SupavisorSession, fcfg.Ports.SupavisorTransaction} {
 		eventually("the replica tenant after the refresh", fmt.Sprintf("true|%d", replicaPort), port, "postgres."+id)
 	}
