@@ -24,7 +24,7 @@ Every step checks for itself before it changes anything: `Run` calls each step's
 
 ## The daemon
 
-`marker.go` reads and writes the marker (`ReadMarker`, `WriteMarker`, `StatusOf`). `monitor.go` is `Monitor`: one minute after the daemon starts and every five minutes it compares the marker with `Revision` and tells `Raise`, which `internal/app/wire_host.go` turns into `host_not_converged` (warning, "run `sudo supavise system converge`") and its resolution. It does not judge the node while an upgrade runs, and an unreadable marker says nothing. The hook registers itself at the front of the daemon's hook list and provides `hostsetup.Status` (`Get[hostsetup.Status](w)`), so a hook that enables a cluster feature can stay off while `Status.Behind()`. It starts only for a daemon that is a systemd service (`INVOCATION_ID`) on the systemd supervisor.
+`marker.go` reads and writes the marker (`ReadMarker`, `WriteMarker`, `StatusOf`). `monitor.go` is `Monitor`: one minute after the daemon starts and every five minutes it compares the marker with `Revision` and tells `Raise`, which `internal/app/wire_host.go` turns into `host_not_converged` (warning, "run `sudo supavise system converge`") and its resolution. It does not judge the node while an upgrade runs, and an unreadable marker says nothing. The hook registers itself at the front of the daemon's hook list and provides `hostsetup.Status` (`Get[hostsetup.Status](w)`), so a hook that enables a cluster feature can stay off while `Status.Behind()`. It starts only for a daemon that runs in `supavise.service` (its control group says so) on the systemd supervisor.
 
 ## First boot
 

@@ -111,6 +111,9 @@ func TestPlanEmptyWhileAHostOrStackRevisionIsPending(t *testing.T) {
 	if strings.Contains(out.String(), "nothing to change") {
 		t.Errorf("a plan with a stack to update says there is nothing to change:\n%s", out.String())
 	}
+	if strings.Contains(out.String(), "base backup") {
+		t.Errorf("a plan that only updates the stack promises backups:\n%s", out.String())
+	}
 
 	// A stack at the revision, and a host that is not on a stack, have nothing to update.
 	n.Infra.Have = 2

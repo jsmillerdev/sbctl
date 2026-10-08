@@ -38,11 +38,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 WORK=$(mktemp -d)
 chmod 0755 "$WORK"
 HOOK_PID=""
+BOUND=0 # set once the mount checks have bound the two directories to themselves
 cleanup() {
   local rc=$?
   [[ -n $HOOK_PID ]] && kill "$HOOK_PID" 2>/dev/null || true
-  umount -l /etc/supavise 2>/dev/null || true
-  umount -l /var/lib/supavise 2>/dev/null || true
+  if [[ $BOUND -eq 1 ]]; then
+    umount -l /etc/supavise 2>/dev/null || true
+    umount -l /var/lib/supavise 2>/dev/null || true
+  fi
   collect_logs
   cp -r "$WORK"/*.log "$LOG_DIR/" 2>/dev/null || true
   rm -rf "$WORK"
@@ -89,13 +92,14 @@ install -d -m 0755 /opt/supavise-e2e
 install -m 0755 "$PREV" /opt/supavise-e2e/prev
 install -m 0755 "$NEW" /opt/supavise-e2e/new
 PREV_HAS_CONVERGE=0
-/opt/supavise-e2e/prev system --help 2>&1 | grep -q '^  converge' && PREV_HAS_CONVERGE=1
+/opt/supavise-e2e/prev system --help >"$WORK/prev-help.log" 2>&1 || true
+grep -q '^  converge' "$WORK/prev-help.log" && PREV_HAS_CONVERGE=1
 if [[ $PREV_HAS_CONVERGE -eq 1 ]]; then
   log "the previous release already has 'system converge': the checks about a node without a marker are skipped"
 fi
 REV=$(/opt/supavise-e2e/new release-info --json | json_get 'd["converge_revision"]')
 [[ $REV =~ ^[1-9][0-9]*$ ]] || fail "release-info names no converge revision: $REV"
-/opt/supavise-e2e/new release-info --json | json_get 'len(d["host_changes"])' | grep -q '^[1-9]' || fail "release-info lists no host changes"
+[[ $(/opt/supavise-e2e/new release-info --json | json_get 'len(d["host_changes"])') -ge 1 ]] || fail "release-info lists no host changes"
 
 # ---- 2. the previous release, with a project -----------------------------------------------
 systemctl stop apache2 nginx postgresql mysql 2>/dev/null || true
@@ -107,6 +111,12 @@ deploy/install.sh --binary /opt/supavise-e2e/prev --public-ip 127.0.0.1 --tls of
   --claim-token-file "$WORK/claim-token" 2>&1 | tee "$WORK/install.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "install.sh failed"
 for u in supavise.service supavise-postgres@system.service supavise-gotrue@system.service; do wait_active "$u" 90; done
+
+# pending_ids: the ids of the steps that `converge --check` reports pending, in a comma list with a
+# comma at each end, so that a step is looked for as ",id,". The answers are read into a variable
+# first: a grep -q that ends a pipe early makes the writer die of SIGPIPE, and pipefail then fails.
+pending_ids() { local out; out=$("$SV" system converge --check --json) || return 1; printf ',%s,' "$(json_get '",".join(s["id"] for s in d if s["pending"])' <<<"$out")"; }
+is_pending() { [[ $(pending_ids) == *",$1,"* ]]; }
 
 wait_daemon() {
   local i
@@ -148,8 +158,8 @@ for s in steps:
 assert steps[-1]["id"] == "marker", steps
 PY
 if [[ $PREV_HAS_CONVERGE -eq 0 ]]; then
-  json_get '[s["id"] for s in d if s["pending"]]' <"$WORK/check0.json" | grep -q "'directories'" || fail "a v0.1.x node has no pending directories step: $(cat "$WORK/check0.json")"
-  json_get '[s["id"] for s in d if s["pending"]]' <"$WORK/check0.json" | grep -q "'marker'" || fail "a v0.1.x node has no pending marker: $(cat "$WORK/check0.json")"
+  is_pending directories || fail "a v0.1.x node has no pending directories step: $(cat "$WORK/check0.json")"
+  is_pending marker || fail "a v0.1.x node has no pending marker: $(cat "$WORK/check0.json")"
 fi
 
 $SV system install-units 2>&1 | tee "$WORK/converge1.log"
@@ -160,7 +170,7 @@ grep -qx "revision=$REV" "$STATE/converged" || fail "the marker is $(cat "$STATE
 for d in cluster config.d; do
   [[ $(stat -c '%U:%G:%a' "/etc/supavise/$d") == supavise:supavise:750 ]] || fail "/etc/supavise/$d is $(stat -c '%U:%G:%a' "/etc/supavise/$d" 2>&1), want supavise:supavise:750"
 done
-$SV system converge --check --json | json_get '[s["id"] for s in d if s["pending"]]' | grep -qx '\[\]' || fail "steps are pending after converge: $($SV system converge --check --json)"
+[[ $(pending_ids) == ",," ]] || fail "steps are pending after converge: $($SV system converge --check --json)"
 $SV system converge 2>&1 | tee "$WORK/converge2.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "the second converge failed"
 grep -q "units are up to date" "$WORK/converge2.log" || fail "the second converge does not say the units are up to date"
@@ -205,7 +215,7 @@ HOOK_PID=$!
 for ((i = 0; i < 40; i++)); do ss -ltnH "sport = :$HOOK_PORT" | grep -q . && break; sleep 0.25; done
 printf '\n[[alerts.webhooks]]\nurl = "http://127.0.0.1:%s/hook"\n' "$HOOK_PORT" >>/etc/supavise/config.toml
 printf 'revision=0\n' >"$STATE/converged"
-$SV system converge --check --json | json_get '[s["id"] for s in d if s["pending"]]' | grep -q "'marker'" || fail "a marker at revision 0 is not pending"
+is_pending marker || fail "a marker at revision 0 is not pending"
 systemctl restart supavise.service
 wait_daemon
 hook_kinds() { python3 -c '
@@ -224,7 +234,8 @@ log "host_not_converged raised and cleared by converge"
 
 # ---- 6. no root, and the firewall -----------------------------------------------------------
 log "converge --check as the supavise user"
-sudo -u "$SUPAVISE_USER" -H "$SV" system converge --check --json | json_get 'len(d)' | grep -q '^[1-9]' || fail "converge --check as the supavise user"
+as_user=$(sudo -u "$SUPAVISE_USER" -H "$SV" system converge --check --json) || fail "converge --check as the supavise user"
+[[ $(json_get 'len(d)' <<<"$as_user") -ge 1 ]] || fail "converge --check as the supavise user printed no steps: $as_user"
 run_as_user_apply=$(sudo -u "$SUPAVISE_USER" -H "$SV" system converge 2>&1 || true)
 [[ $run_as_user_apply == *"run as root"* ]] || fail "converge without root: $run_as_user_apply"
 
@@ -240,7 +251,7 @@ case "\$1" in
 esac
 UFW
 chmod 0755 "$FAKE/ufw"
-PATH="$FAKE:$PATH" $SV system converge --check --json | json_get '[s["id"] for s in d if s["pending"]]' | grep -q "'ufw'" || fail "an active ufw without 7443/tcp is not pending"
+PATH="$FAKE:$PATH" is_pending ufw || fail "an active ufw without 7443/tcp is not pending"
 PATH="$FAKE:$PATH" $SV system converge 2>&1 | tee "$WORK/converge3.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "converge with ufw failed"
 grep -q "allowed 7443/tcp in ufw" "$WORK/converge3.log" || fail "converge did not open 7443/tcp: $(cat "$WORK/converge3.log")"
@@ -261,8 +272,9 @@ echo svj1.example >"$WORK/open-token"; chmod 644 "$WORK/open-token"
 out=$(deploy/install.sh --binary /opt/supavise-e2e/prev --join-token-file "$WORK/open-token" 2>&1) && fail "install.sh accepted a token file that others can read"
 [[ $out == *"chmod 600"* ]] || fail "open token file: $out"
 [[ $(sha256sum "$SV" | cut -d' ' -f1) == "$BIN_SUM" ]] || fail "install.sh replaced the binary although it refused the token file"
+install_help=$($SV install --help)
 for flag in aws-first-boot data-device join-token-file; do
-  $SV install --help | grep -q -e "--$flag" || fail "install --help does not list --$flag"
+  [[ $install_help == *"--$flag"* ]] || fail "install --help does not list --$flag"
 done
 
 log "supavise install --aws-first-boot formats nothing off EC2"
@@ -274,8 +286,8 @@ out=$($SV install --aws-first-boot --skip-os-check 2>&1) && fail "install --aws-
 
 # ---- 8. the mounts --------------------------------------------------------------------------
 log "mount protection: /var/lib/supavise and /etc/supavise are mount points"
-if mount --bind "$STATE" "$STATE" && mount --bind /etc/supavise /etc/supavise; then
-  $SV system converge --check --json | json_get '[s["id"] for s in d if s["pending"]]' | grep -q "'mounts'" || fail "mounts are not pending with the directories mounted"
+if mount --bind "$STATE" "$STATE" && BOUND=1 && mount --bind /etc/supavise /etc/supavise; then
+  is_pending mounts || fail "mounts are not pending with the directories mounted"
   $SV system converge 2>&1 | tee "$WORK/converge4.log"
   [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "converge with mounts failed"
   for u in supavise.service supavise-postgres@.service supavise-gotrue@.service supavise-postgrest@.service supavise-basebackup@.service supavise-realtime.service supavise-storage.service; do

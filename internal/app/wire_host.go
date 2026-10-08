@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
@@ -23,10 +24,14 @@ func init() {
 	}{{"host", wireHost}}, wireHooks...)
 }
 
-// runsAsService says whether this process is a systemd service, which is what a server install
-// is; systemd gives every service an invocation id. A daemon started by hand or by a test has no
-// host to converge.
-var runsAsService = func() bool { return os.Getenv("INVOCATION_ID") != "" }
+// runsAsService says whether this process runs in supavise.service, which is what a server
+// install is. The control group says it; an environment variable such as INVOCATION_ID would be
+// inherited by every process a service starts, a test run by a CI agent included. A daemon started
+// by hand or by a test has no host to converge.
+var runsAsService = func() bool {
+	b, err := os.ReadFile("/proc/self/cgroup")
+	return err == nil && strings.Contains(string(b), "/supavise.service")
+}
 
 // wireHost provides the converge state (Get[hostsetup.Status]) and starts the monitor.
 func wireHost(_ context.Context, w *Wire) error {
