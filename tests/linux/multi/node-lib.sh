@@ -64,6 +64,7 @@ node_state() { # NODE: the state of a node in this node's copy of the registry
   nodes_json | json_get '[n["state"] for n in d["nodes"] if n["id"] == "'"$1"'"][0]'
 }
 node_version() { nodes_json | json_get '[n["version"] for n in d["nodes"] if n["id"] == "'"$1"'"][0]'; }
+node_has_version() { [[ $(node_version "$1") == "$2" ]]; } # NODE VERSION
 
 # ---- waiting -----------------------------------------------------------------------------------------
 # wait_for SECONDS WHAT CMD...: polls CMD every two seconds until it succeeds. CMD runs in a subshell, so a
@@ -76,6 +77,13 @@ wait_for() {
     sleep 2
   done
   fail "timed out after ${n}s waiting for $what"
+}
+
+# wait_node_versions VERSION SECONDS NODE...: this node's copy of the registry shows every NODE at VERSION.
+wait_node_versions() {
+  local want=$1 n=$2 id
+  shift 2
+  for id in "$@"; do wait_for "$n" "the registry to show $id at $want" node_has_version "$id" "$want"; done
 }
 
 wait_api() { # SECONDS: the Management API answers (401 without a token) on this node
@@ -347,13 +355,23 @@ daemon_version() { "/proc/$(systemctl show -p MainPID --value supavise.service)/
 
 # wait_fenced SECONDS: a node that came back after its replacement records that it is fenced, runs no
 # PostgreSQL primary (no unit, and no launcher for the unit's ConditionPathExists) and answers 503.
+# The clusters are the ones in the data directory: after a restart of the machine `systemctl list-units` shows only
+# the units that are loaded, and a unit that never started is not, so the list alone could be empty and check nothing.
 wait_fenced() {
-  local n=${1:-240} u ref
+  local n=${1:-240} u ref refs
   wait_for "$n" "the node to record that it is fenced" test -s /var/lib/supavise/fenced.json
   sleep 10
-  for u in $(systemctl list-units 'supavise-postgres@*.service' --all --no-legend --plain | awk '{print $1}'); do
+  refs=$(
+    {
+      find /var/lib/supavise/projects -mindepth 2 -maxdepth 2 -name postgres -type d | awk -F/ '{print $(NF-1)}'
+      systemctl list-units 'supavise-postgres@*.service' --all --no-legend --plain | awk '{print $1}' | sed -e 's/^supavise-postgres@//' -e 's/\.service$//'
+    } | sort -u
+  )
+  [[ $(grep -cx system <<<"$refs") == 1 && $(grep -vcx system <<<"$refs") -ge 2 ]] \
+    || fail "the fenced node has the PostgreSQL clusters '$(paste -sd' ' - <<<"$refs")', want system and the two projects"
+  for ref in $refs; do
+    u=supavise-postgres@$ref.service
     [[ $(unit_state "$u") != active ]] || fail "$u runs on a fenced node"
-    ref=${u#supavise-postgres@}; ref=${ref%.service}
     [[ ! -e /var/lib/supavise/projects/$ref/postgres.run ]] || fail "$ref: the fenced node still has its launcher /var/lib/supavise/projects/$ref/postgres.run"
     systemctl start "$u" 2>/dev/null || true
     [[ $(unit_state "$u") != active ]] || fail "$u started on a fenced node although its launcher is gone"
@@ -549,6 +567,17 @@ primary_ids() {
 # replay_lag REF: the largest replay lag a standby of REF shows on this node (a primary), in seconds.
 replay_lag() {
   pg_local "$1" "select coalesce(max(extract(epoch from replay_lag)), 0)::numeric(8,3) from pg_stat_replication"
+}
+# replay_lag_max REF SECONDS: the largest replay_lag seen when it is read once a second for SECONDS; one reading can fall
+# between two bursts of the writer.
+replay_lag_max() {
+  local i v max=0
+  for ((i = 0; i < $2; i++)); do
+    v=$(replay_lag "$1") || v=0
+    max=$(awk -v a="$max" -v b="${v:-0}" 'BEGIN {print (b > a ? b : a)}')
+    sleep 1
+  done
+  echo "$max"
 }
 
 # ---- what the test leaves for the artifact ---------------------------------------------------------------------

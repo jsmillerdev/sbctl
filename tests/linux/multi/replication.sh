@@ -86,7 +86,7 @@ export S3_PREFIX MULTI_DOMAIN
 REGION=us-east-1                 # both servers are in the default region
 LAG_BUDGET_S=20                  # a row written on the primary is read from the replica's endpoint within this
 RPO_BUDGET_S=5                   # an unplanned failover loses the rows of the last seconds at most, whatever the replay lag was
-RPO_SLACK_S=2                    # and at most the replay lag measured before the stop plus this
+RPO_SLACK_S=2                    # and at most the largest replay lag of the ten seconds before the stop plus this
 WRITER_RATE=20                   # rows a second (writer.py)
 RTO_BUDGET_S=300                 # from the stop of the leader to the first acknowledged write on the new one
 MULTI_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -412,10 +412,10 @@ c_hard_failover() {
   for ref in $ref1 $ref2; do onl n1 wait_replicas "$ref" 1 600; done
   run=$(next_run)
   onl n2 writer_start "$ref1" "$run"
-  sleep 15
-  lag=$(onl n1 replay_lag "$ref1")
+  sleep 5
+  lag=$(onl n1 replay_lag_max "$ref1" 10)
   note hard.replay_lag_before_seconds "$lag"
-  log "n1 stops now (replay lag of the project's replica: $lag s)"
+  log "n1 stops now (the largest replay lag of the project's replica in the last 10 s: $lag s)"
   multi_kill_node n1
   tstop=$(on n2 date +%s.%N)
   onl n2 supavise failover --force --dry-run || log "the dry run was refused (the move would be refused)"
@@ -485,6 +485,8 @@ c_rejoin() {
   onl n1 supavise node rejoin
   onl n1 wait_unfenced 300
   onl n2 wait_nodes n2 300
+  # The upgrade needs two active nodes, not the replicas that the rest of this check waits for up to 30 minutes.
+  reached cluster-two-nodes
   [[ $(on n1 sh -c 'ls -d /var/lib/supavise/projects/*/postgres/data.diverged-* 2>/dev/null | wc -l') -ge 1 ]] || fail "the old data of n1 was not kept as data.diverged-<epoch>"
   for ref in $(refs); do onl n2 wait_replicas "$ref" 1 1800; done
   onl n1 follower_services
@@ -499,6 +501,10 @@ upgrade_one() {
   lead=$(lead)
   node_push "$n" "$WORK/keys/pub.pem" /root/release-pub.pem
   onl "$n" unit_stamp >"$WORK/stamp-$n.before"
+  # A stamp that is empty, or that holds no start times, would be equal to the one after the upgrade whatever happened:
+  # it names the system cluster and the two projects, each with the time its postmaster started.
+  [[ $(wc -l <"$WORK/stamp-$n.before") -ge 3 ]] && ! grep -q ' none$' "$WORK/stamp-$n.before" \
+    || fail "$n: the stamp of the PostgreSQL clusters is not complete: $(cat "$WORK/stamp-$n.before")"
   log "$n: $(on "$n" /usr/local/bin/supavise --version | head -n1) -> v0.0.2; PostgreSQL clusters here: $(wc -l <"$WORK/stamp-$n.before")"
   on "$n" timeout 3000 /usr/local/bin/supavise upgrade --repo o/r --api-base "http://$BRIDGE_IP:$RELEASE_PORT" \
     --public-key-file /root/release-pub.pem --yes --version v0.0.2 \
@@ -508,10 +514,12 @@ upgrade_one() {
   [[ $n != "$lead" ]] || onl "$n" wait_healthy 300
   onl "$n" unit_stamp >"$WORK/stamp-$n.after"
   diff -u "$WORK/stamp-$n.before" "$WORK/stamp-$n.after" || fail "$n: a PostgreSQL cluster was restarted by the upgrade"
-  # The cluster as it was: two active nodes, a session between them, the replicas healthy, and a row written on the
-  # primary read from a replica.
+  echo "# $n: $(wc -l <"$WORK/stamp-$n.after") PostgreSQL clusters kept their invocation and their postmaster"
+  # The cluster as it was: two active nodes and a session between them; and, when `rejoin` brought the replicas back,
+  # the replicas healthy and a row written on the primary read from a replica.
   onl "$lead" wait_nodes "$lead" 300
   onl "$n" wait_peers 180
+  [[ -e $WORK/state/rejoin.ok ]] || { echo "# the replicas were not looked at after the upgrade: rejoin did not pass"; return 0; }
   for ref in $(refs); do onl "$lead" wait_replicas "$ref" 1 600; done
   ref=$(sget ref1)
   other=$(follower)
@@ -523,7 +531,7 @@ upgrade_one() {
 }
 
 c_upgrade_leader() {
-  needs rejoin
+  needs cluster-two-nodes
   local lead
   lead=$(lead)
   [[ -x ${SUPAVISE_BIN_NEXT:-} ]] || fail "SUPAVISE_BIN_NEXT: a Linux build of this checkout, built with -X main.version=v0.0.2"
@@ -538,8 +546,8 @@ c_upgrade_follower() {
   local f lead
   f=$(follower) lead=$(lead)
   upgrade_one "$f"
-  [[ $(onl "$lead" node_version n1) == v0.0.2 && $(onl "$lead" node_version n2) == v0.0.2 ]] \
-    || fail "the nodes report $(onl "$lead" node_version n1) and $(onl "$lead" node_version n2), want v0.0.2"
+  # The leader writes a peer's version into the registry on its next ping, a few seconds after the peer's daemon is back.
+  onl "$lead" wait_node_versions v0.0.2 60 n1 n2
   echo "# $f (the follower) runs v0.0.2 too; both nodes report v0.0.2; no PostgreSQL cluster restarted"
 }
 
