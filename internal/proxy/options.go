@@ -58,7 +58,10 @@ type Options struct {
 	// Resolver answers Studio's custom-domain DNS pre-check (studio_cname.go); nil means the
 	// system resolver.
 	Resolver domains.Resolver
-	Logger   *slog.Logger
+	// Cluster, when set, ties the proxy to the other nodes: the load balancer's view of them and the
+	// follower's certificate mirror. Nil is a server on its own.
+	Cluster *Cluster
+	Logger  *slog.Logger
 }
 
 func (o *Options) validate() error {

@@ -36,6 +36,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	host := normalizeHost(r.Host)
 	which, ref := "", ""
+	route := "" // the database a load balancer host sent the request to
 	switch {
 	case s.apiHost != "" && host == s.apiHost:
 		which = "api"
@@ -44,20 +45,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		which = "studio"
 		s.serveStudio(sw, r)
 	default:
-		p, ok := s.table.lookup(host)
+		m, ok := s.table.resolve(host)
 		if !ok {
 			which = "unknown"
 			writeJSON(sw, http.StatusNotFound, "Not Found")
 			break
 		}
-		which, ref = "project", p.ref
-		s.serveProject(sw, r, p)
+		which, ref = "project", m.project.ref
+		switch m.kind {
+		case kindReplica, kindBalancer:
+			which = m.kind
+		}
+		route = s.serveProject(sw, r, m)
 	}
 
 	lvl := slogLevel(sw.code())
-	s.log.Log(r.Context(), lvl, "request", "id", rid, "kind", which, "host", host, "ref", ref,
+	attrs := []any{"id", rid, "kind", which, "host", host, "ref", ref,
 		"method", r.Method, "path", r.URL.Path, "status", sw.code(), "bytes", sw.bytes,
-		"dur_ms", time.Since(start).Milliseconds(), "remote", clientIP(r))
+		"dur_ms", time.Since(start).Milliseconds(), "remote", clientIP(r)}
+	if route != "" {
+		attrs = append(attrs, "load_balancer_redirect_identifier", route)
+	}
+	s.log.Log(r.Context(), lvl, "request", attrs...)
 }
 
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
@@ -88,8 +97,12 @@ func (s *Server) serveStudio(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// serveProject routes a request on <ref>.api.<domain>.
-func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project) {
+// serveProject routes a request on <ref>.api.<domain>, or on one of the other hosts that reach a
+// project (m.kind): a replica's endpoint answers the Data API from that replica and nothing else; a
+// load balancer sends a GET or HEAD on /rest/v1 to the nearest healthy database and everything else
+// to the primary. On a load balancer host it returns the database the request went to.
+func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, m hostMatch) (route string) {
+	p := m.project
 	setCORS(w.Header(), r)
 	if isPreflight(r) {
 		writePreflight(w, r)
@@ -101,7 +114,9 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		return
 	}
 	rt := matchRoute(pth)
-	if rt == nil {
+	// A replica's endpoint serves /rest/v1 and /graphql/v1 and nothing else: the rest of the
+	// project's API is not a replica's to answer (the Kong-style miss, as for an unknown path).
+	if rt == nil || (m.kind == kindReplica && rt.svc != svcRest) {
 		writeJSON(w, http.StatusNotFound, "no Route matched with those values")
 		return
 	}
@@ -179,8 +194,32 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		return
 	}
 
+	addr := s.upstream(rt.svc, p)
+	switch {
+	case m.kind == kindReplica:
+		if !replicaServable(m.replica.status) {
+			w.Header().Set("Retry-After", "5")
+			writeJSON(w, http.StatusServiceUnavailable, "Read replica is not active ("+m.replica.status+")")
+			return
+		}
+		var ok bool
+		if addr, ok = s.replicaAddr(p, m.replica); !ok {
+			writeJSON(w, http.StatusServiceUnavailable, "Read replica is not available")
+			return
+		}
+	case m.kind == kindBalancer:
+		route = p.ref
+		if balanced(r, rt) {
+			db := s.pickDatabase(p)
+			route = db.identifier
+			if db.replica != nil {
+				addr, _ = s.replicaAddr(p, *db.replica) // candidates only holds replicas that have an address
+			}
+		}
+		w.Header().Set(routeHeader, route)
+	}
 	tg := &target{
-		addr: s.upstream(rt.svc, p), path: rt.upstreamPath(pth, trailing), rawPath: escapedUpstreamPath(r.URL, pth, rt, trailing), rawQuery: res.rawQuery,
+		addr: addr, path: rt.upstreamPath(pth, trailing), rawPath: escapedUpstreamPath(r.URL, pth, rt, trailing), rawQuery: res.rawQuery,
 		fwdHost: r.Host, fwdPrefix: rt.fwdPrefix, timeout: rt.timeout, set: res.set, del: res.del,
 	}
 	for _, h := range rt.setHeaders {
@@ -234,6 +273,7 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, p project)
 		}
 	}
 	s.forward(w, r, tg)
+	return route
 }
 
 // isRealtimeWebSocket reports whether r is the one request a Realtime route accepts while the

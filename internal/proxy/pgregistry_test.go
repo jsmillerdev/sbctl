@@ -154,3 +154,135 @@ func privateDatabase(t *testing.T, dsn string) string {
 	}
 	return dsn + " dbname=" + name // keyword/value DSN: the last dbname wins
 }
+
+// TestPostgresReadOnlyRegistry runs the proxy of a follower: its registry is opened read-only, cannot
+// LISTEN, and tells the table to read each table again whenever the cluster's change counter moves.
+// Nodes, replicas and projects written through the leader's registry reach the routes of the follower.
+func TestPostgresReadOnlyRegistry(t *testing.T) {
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	private := privateDatabase(t, dsn)
+	w, err := registry.Open(ctx, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	ro, err := registry.OpenReadOnly(ctx, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	sec, err := secrets.New(secrets.RandomBytes(32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := testKeys(t, testRef)
+	if err := w.CreateProject(ctx, &registry.Project{Ref: testRef, Name: "p", Status: registry.StatusActiveHealthy, Engine: registry.EnginePostgres}); err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range k.Map() {
+		blob, err := sec.Seal([]byte(v))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.PutSecret(ctx, testRef, name, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	primary, standby := newUpstream(t, "primary"), newUpstream(t, "replica")
+	cfg := config.Default()
+	cfg.Domain, cfg.TLS.Mode, cfg.StateDir = testDomain, "off", t.TempDir()
+	srv, err := New(Options{Config: cfg, Registry: ro, Keys: RegistryKeys{Registry: ro, Secrets: sec}, Logger: quietLog()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.upstreamFn = func(service, project) string { return primary.addr() }
+	srv.replicaUpstreamFn = func(project, replica) string { return standby.addr() }
+	srv.table.retry = 50 * time.Millisecond
+	sctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { srv.Sync(sctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	status := func(host string) int {
+		t.Helper()
+		r, _ := http.NewRequest("GET", ts.URL+"/rest/v1/x", nil)
+		r.Host = host
+		r.Header.Set("apikey", k.PublishableKey)
+		resp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// The poll runs once a second.
+	until := func(what string, f func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if f() {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	if status(testRef+".api."+testDomain) != 200 {
+		t.Fatal("the project is not served")
+	}
+
+	// A second node, a replica on it, and a status change: all written on the leader's side.
+	node := &registry.Node{Name: "eu-1", Region: "eu", State: registry.NodeActive}
+	if err := w.CreateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.CreateReplica(ctx, &registry.Replica{Identifier: repEU, Ref: testRef, NodeID: node.ID}); err != nil {
+		t.Fatal(err)
+	}
+	repHost, lbHost := repEU+".api."+testDomain, testRef+"-lb.api."+testDomain
+	until("the replica to reach the follower's routes", func() bool { return srv.table.routeKind(repHost) == kindReplica })
+	if srv.table.routeKind(lbHost) != kindBalancer {
+		t.Error("the balancer does not exist while the project has a replica")
+	}
+	if got := status(repHost); got != 503 {
+		t.Errorf("a replica still setting up answers %d, want 503", got)
+	}
+	if err := w.SetReplicaStatus(ctx, repEU, string(registry.StatusActiveHealthy), registry.ReplicaStepDone, ""); err != nil {
+		t.Fatal(err)
+	}
+	until("the replica to be served", func() bool { return status(repHost) == 200 })
+	if standby.count() == 0 || primary.count() != 1 {
+		t.Errorf("replica asked %d times, primary %d", standby.count(), primary.count())
+	}
+	if !srv.table.nodeActive(node.ID) {
+		t.Error("the node's state did not reach the table")
+	}
+	if err := w.SetNodeState(ctx, node.ID, registry.NodeFenced); err != nil {
+		t.Fatal(err)
+	}
+	until("the node state to change", func() bool { return !srv.table.nodeActive(node.ID) })
+
+	// The project's own status moves with the poll as well.
+	if err := w.SetProjectStatus(ctx, testRef, registry.StatusInactive); err != nil {
+		t.Fatal(err)
+	}
+	until("the project status to change", func() bool { return status(testRef+".api."+testDomain) == 503 })
+	if err := w.SetProjectStatus(ctx, testRef, registry.StatusActiveHealthy); err != nil {
+		t.Fatal(err)
+	}
+	until("the project to be active again", func() bool { return status(testRef+".api."+testDomain) == 200 })
+
+	if err := w.DeleteReplica(ctx, repEU); err != nil {
+		t.Fatal(err)
+	}
+	until("the replica to leave the follower's routes", func() bool {
+		return srv.table.routeKind(repHost) == "" && srv.table.routeKind(lbHost) == ""
+	})
+}

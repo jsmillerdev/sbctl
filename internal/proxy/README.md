@@ -13,7 +13,7 @@ err = srv.Run(ctx) // or srv.Serve(ctx, httpLn, httpsLn); srv.Handler() for test
 
 ## Routing
 
-`Host` decides the target: `api.<domain>` is the in-process Management API (except `/auth/v1/*`, below), `studio.<domain>` is Studio on `127.0.0.1:Ports.Studio`, `<ref>.api.<domain>` (or a `routes` row of the registry) is a project. Anything else is `404`. The `system` project is never reachable.
+`Host` decides the target: `api.<domain>` is the in-process Management API (except `/auth/v1/*`, below), `studio.<domain>` is Studio on `127.0.0.1:Ports.Studio`, `<ref>.api.<domain>` (or a `routes` row of the registry) is a project. Two more hosts exist while a project has a read replica: `<identifier>.api.<domain>` is that replica's Data API and `<ref>-lb.api.<domain>` is the project's load balancer (below). Anything else is `404`. The `system` project, and the standby of its cluster, are never reachable.
 
 **Custom hostnames and vanity subdomains** (`internal/domains`) are `routes` rows, kind `custom` (a customer's hostname, written when it is activated) and `vanity` (`<name>.api.<domain>`). They reach the project like its derived host (same keys and routes; Storage always gets `x-forwarded-host: <ref>.api.<domain>`, because its tenant regexp needs a ref). The client's own host goes in `X-Supavise-Client-Host`, which Storage's SigV4 check reads (`S3_PROTOCOL_NON_CANONICAL_HOST_HEADER`, set by the fleet) so S3 clients that signed the custom hostname verify; REST and Auth see it in `X-Forwarded-Host`, and GoTrue builds its links from `API_EXTERNAL_URL`. A vanity row may claim a `<name>.api.<domain>` host only when `<name>` is a valid vanity name (not ref-shaped, not reserved), and the derived host always wins, so no route can shadow a project.
 
@@ -33,6 +33,23 @@ err = srv.Run(ctx) // or srv.Serve(ctx, httpLn, httpsLn); srv.Handler() for test
 The table is `routes.go` (sources: the Envoy template `docker/volumes/api/envoy/lds.template.yaml` in `supabase/supabase`, and the stack proxy in `supabase/cli` `packages/stack`). Paths are normalized before matching (`..`, `//`, escaped slashes are rejected or collapsed), responses carry one CORS policy (the project API allows any origin; the keys are the access control), and every request gets an `X-Request-Id`. Client-sent `X-Forwarded-*`, `X-Real-Ip` and `X-Supavise-Project-Ref` headers are replaced.
 
 Edge Functions: `Options.FunctionsEnabled` is `cfg.Functions.Enabled` (`internal/functions/README.md`). On `/functions/v1` the proxy replaces a client-supplied `X-Supavise-Project-Ref` or `X-Supavise-Proxy-Token` with its own, and removes both on every other route. The token is the node's proxy secret (`config.LoadFunctionsProxyToken`, or `Options.FunctionsProxyToken`); the runtime's port is reachable from the function workers it runs, so the main service serves only callers that have it.
+
+## Read replicas and the load balancer
+
+A replica's PostgREST listens on `127.0.0.1:<replica port>` (`config.ReplicaPorts`) on every node: it is the replica itself on its node and a forwarder to it everywhere else (`internal/mesh`), so the proxy never needs to know where a replica runs. Any node answers the replica and balancer hosts of any project; DNS decides which node a client reaches.
+
+| Host | Reaches |
+|---|---|
+| `<identifier>.api.<domain>` | the replica's PostgREST, for `/rest/v1` and `/graphql/v1` only; every other path is `404` `no Route matched with those values` |
+| `<ref>-lb.api.<domain>` | `GET` and `HEAD` on `/rest/v1/*`: a database chosen as below; everything else (other methods, `/graphql/v1`, Auth, Storage, Realtime, Functions): the primary |
+| custom and vanity hosts | the primary, always |
+
+- **Replica endpoint.** Keys, the OpenAPI document (service_role only), CORS and the legacy-key guard are the project's. Every method goes through to PostgREST, which refuses writes on the standby; the proxy has no method policy. A replica that is `INIT_READ_REPLICA`, `INIT_READ_REPLICA_FAILED` or `GOING_DOWN` answers `503`; the other statuses are passed to PostgREST. A project that is not servable answers `503` as on its own host.
+- **Load balancer.** It exists exactly while the project has a replica row, in any status. The candidates are the primary and every replica that is `ACTIVE_HEALTHY` and runs on an active node; with `[replicas] lb_max_lag_seconds` above zero, a replica whose lag is above the limit, or unknown, is left out. The pick is the database on the node that received the request; otherwise the one on the node with the lowest round-trip time in the peer heartbeats (a node with no reading is passed over); otherwise the candidates in turn, per project. So a balancer host that DNS resolves to the primary's node always answers from the primary: point `<ref>-lb` at the nodes (latency-routed records) to spread reads.
+- **Evidence.** Every response from a balancer host carries `X-Supavise-Route: <identifier>` (the ref for the primary), and the access log line of a request on it has `load_balancer_redirect_identifier` with the same value. A replica endpoint sets neither.
+- **Failures.** A replica that stops answering between two status reports gives `502` until its status changes; the balancer does not retry on the primary.
+
+`proxy.Options.Cluster` (`Cluster`) carries what the balancer asks of the cluster: this node's id, the heartbeat round-trip times (`mesh.Mesh.RTT`) and the replicas' lag (`ReplicaLag` over `replicas.Service`, which only the leader can answer). A server on its own leaves it nil.
 
 ## Studio and the dashboard's GoTrue
 
@@ -58,7 +75,7 @@ Edge Functions: `Options.FunctionsEnabled` is `cfg.Functions.Enabled` (`internal
 
 ## Caches
 
-Host to project and project keys are in memory and follow registry changes (`Subscribe`): project and route changes, and `project_secrets` changes (key rotation), drop the cached entries. When the change stream closes the proxy resubscribes with backoff and reloads everything. Keys also expire after five minutes and the host table is reloaded every five minutes, because LISTEN/NOTIFY delivery is best effort.
+Host to project, each project's home node and replicas, the state of every node, and project keys are in memory and follow registry changes (`Subscribe`): project, route, node and replica changes, and `project_secrets` changes (key rotation), update or drop the cached entries. A registry opened read-only (a follower's) cannot tell which row changed; it sends `Op: "reload"` with no key for each table when the cluster's change counter moves, and the table reads that table again. When the change stream closes the proxy resubscribes with backoff and reloads everything. Keys also expire after five minutes and the host table is reloaded every five minutes, because LISTEN/NOTIFY delivery is best effort.
 
 ## TLS
 
@@ -76,11 +93,20 @@ CertMagic uses DNS-01 exclusively for any issuer that has a DNS solver, so `auto
 
 On-demand issuance is gated by `allowHost`: only `api.`, `studio.`, derived hosts of servable projects (not `REMOVED`, `INIT_FAILED`, `INACTIVE`, so a dead project cannot spend the CA's rate limit) and registry routes qualify, and never a host the wildcard already covers. A custom hostname has a route only once it is activated, so a claimed or merely verified hostname gets no certificate; in `tls.mode = "dns01"` custom hosts are refused outright. When a custom or vanity route appears the proxy obtains its certificate at once (`warmCertificates`); when it disappears the certificate leaves the cache and storage (`forgetCertificates`). Provider credentials come from `[tls] credentials` or `SUPAVISE_TLS_CREDENTIALS_<KEY>` (`api_token`; route53 optional `region`, `hosted_zone_id`, `access_key_id`, `secret_access_key`). `tls.ca` selects another ACME directory and `tls.ca_cert` the root that signs that directory's own HTTPS certificate (Pebble, private CAs). Certificates live in `Paths.Certs()`. Running with TLS enabled accepts the CA's subscriber agreement.
 
+### On a cluster
+
+The leader obtains and renews every certificate, as a server on its own does. A follower issues none: it mirrors the leader's CertMagic store and serves what it mirrored, so two nodes never ask the CA for the same name, and a custom hostname whose DNS still points at the old server cannot fail HTTP-01 on the new one.
+
+- **Leader side.** `CertsHandler` serves `GET /peer/v1/certs` (registered by `internal/app/wire_proxy.go` with `mesh.Handle`): the files under `certificates/` and `acme/` of the store (the ACME account included) as a `peerapi.CertSnapshot`, with an `ETag` that hashes every path and content. It honors `If-None-Match` and an `etag` query parameter with `304`. It answers only a node that authenticated with its certificate, and only on the leader (`409` `not_leader` otherwise). A certificate it finds half written is left out of the snapshot. Locks, OCSP staples and pending challenge tokens are not offered.
+- **Follower side.** `CertSync` fetches the store through `mesh.RPC` (`MeshCerts`) once a minute (`Interval`), and at once when a handshake asks for a name no mirrored certificate covers, at most every ten seconds. It writes the files that differ (0600, atomically), removes the ones the leader no longer has, and loads each complete certificate into CertMagic's cache as an unmanaged one, which CertMagic never renews; a renewed certificate replaces the old one when the next fetch brings it. A file missing from two fetches in a row is removed, not from one; an empty snapshot removes nothing. Paths outside the two trees are refused.
+- **Issuing.** While synced, the on-demand decision refuses every name that has no cached certificate, route changes obtain nothing, and no management starts. Nothing reaches the CA.
+- **Role.** `CertRole` says managing or synced. `wire_proxy.go` sets it from `cluster.Membership` (the leader manages; a follower or a fenced node is synced) and provides it as `*proxy.CertRole`; `Promote` and `Demote` switch the proxy at once. A promotion loads the mirrored tree as managed certificates and starts management, with the ACME account the tree holds; a demotion drops the managed certificates from the cache and mirrors again. A node without `Options.Cluster.Certs` always manages.
+
 `supavise proxy` runs the edge alone for development. It reads the existing master key (`key_path`) and never creates one; prefer `SUPAVISE_REGISTRY_DSN` over `--registry-dsn`, which shows in the process list.
 
 ## Tests
 
-The `ci.yml` job `test` runs the unit and `httptest` tests (`go test ./internal/proxy/`, no network) with a Postgres service. `TestPostgresRegistry` needs `SUPAVISE_TEST_DATABASE_URL` and a role that may create databases; it runs in a database of its own and exercises real LISTEN/NOTIFY. The `linux.yml` job `pebble` runs `internal/proxy/pebble-test.sh`: real ACME against Pebble, including a customer's custom hostname from initialize to activation (`tests/functions/verify.mjs` covers the Functions route against the real runtime).
+The `ci.yml` job `test` runs the unit and `httptest` tests (`go test ./internal/proxy/`, no network) with a Postgres service. They cover the host classes (replica, balancer, custom, vanity), the replica endpoint's paths, the balancer's rules and its headers and log field, the table's reload operations, the certificate snapshot, the mirror by ETag, and a certificate manager that serves mirrored certificates, refuses to issue while synced and issues through a fake CA after a promotion. `TestPostgresRegistry` and `TestPostgresReadOnlyRegistry` need `SUPAVISE_TEST_DATABASE_URL` and a role that may create databases; each runs in a database of its own. The first exercises real LISTEN/NOTIFY, the second a registry opened read-only that polls the change counter. The `linux.yml` job `pebble` runs `internal/proxy/pebble-test.sh`: real ACME against Pebble, including a customer's custom hostname from initialize to activation, and a follower that serves the leader's certificates and issues after a promotion (`tests/functions/verify.mjs` covers the Functions route against the real runtime).
 
 ## Limits
 
@@ -88,3 +114,5 @@ The `ci.yml` job `test` runs the unit and `httptest` tests (`go test ./internal/
 - DNS-01 against a real provider and HTTP-01 against a real CA have not been run; the Pebble job covers HTTP-01 and TLS-ALPN-01.
 - The `/pg/` (postgres-meta) and `/mcp` routes of the self-hosted gateway are not exposed; Studio reaches pg-meta through the Management API.
 - No rate limiting (beyond `check-cname`), request size limits or access log persistence beyond slog.
+- The replica lag the balancer limits on comes from the replica controller, which runs on the leader: on a follower `lb_max_lag_seconds` leaves every replica out and reads go to the primary.
+- `api.<domain>` is the in-process Management API on every node; the proxy does not forward it to the leader's admin listener.
