@@ -6,16 +6,16 @@ A node is the leader exactly when the system cluster on that node is not in reco
 
 ## The certificate authority
 
-`NewCA(secrets)` derives an Ed25519 key from `Derive("supavise/cluster-ca/v1")` (HKDF-SHA256 expands it if `Derive` returns other than 32 bytes) and signs a CA certificate with a fixed subject, serial 1 and a fixed 20-year validity, so every node that holds the master key computes the same bytes. The SHA-256 of that certificate is the pin in a join token. Rotation is a new label and a reissue.
+`NewCA(secrets)` derives an Ed25519 key from `Derive("supavise/cluster-ca/v1")` (HKDF-SHA256 expands it if `Derive` returns other than 32 bytes) and signs a CA certificate with a fixed subject, serial 1 and a fixed 20-year validity, so every node that holds the master key computes the same bytes. The SHA-256 of that certificate is the pin in a join token. Rotation is another label and a reissue.
 
 A node certificate is Ed25519, one year, usable as server and client, with the subject alternative name `supavise://node/<id>` and a random serial that is recorded in `nodes.cert_serial`. The key is generated on the node and never leaves it. A promoted node can issue certificates, because the CA derives from a key it holds. The files are in `/etc/supavise/cluster`: `node.key` (0600), `node.crt`, `ca.crt`. A server whose directory holds `node.crt` belongs to a cluster as far as the files can say (`Joined`); a server without it is a single server and nothing here changes how it runs.
 
-`Renewer` replaces a certificate when 30 days are left. A follower sends a request to the leader (`POST /peer/v1/certs/renew`), the leader signs it and records the serial, and the node starts using the new certificate once its own copy of the registry shows the serial and 10 seconds have passed: peers admit a certificate by the serial in their copy, and switching sooner would have some of them refuse the node for a moment. A write of `node.crt` that fails (the daemon may not be allowed to write there) leaves the new certificate in use and the old file valid until it expires.
+`Renewer` replaces a certificate when 30 days are left. A follower sends a request to the leader (`POST /peer/v1/certs/renew`), the leader signs it and records the serial, and the node starts using the renewed certificate once its own copy of the registry shows the serial and 10 seconds have passed: peers admit a certificate by the serial in their copy, and switching sooner would have some of them refuse the node for a moment. A write of `node.crt` that fails (the daemon may not be allowed to write there) leaves the renewed certificate in use and the old file valid until it expires.
 
 ## Joining
 
 ```
-leader                                            new server
+leader                                            joiner
 supavise node token  ->  svj1.<token>
                                                   supavise node join --token-file F
                           <- TLS, root hash = ca_fpr ->      (an impostor fails here)
@@ -35,7 +35,7 @@ node row `active`
 
 **The joiner** checks the answer before it writes anything: the CA hashes to the pin, the certificate chains to it, is for its key and names the node the leader says. It never overwrites a different `master.key`. `--master-key-file` and `--key-from-escrow` supply the key instead of receiving it (`WithoutKey`); the key must derive the CA the token pins.
 
-`Join(ctx, JoinOptions)` is the function `supavise install --join-token-file` calls. `JoinOptions.Seed` (a `SeedFunc`) builds the system standby from the base backup the leader names and starts it; its `primary_conninfo` points at `127.0.0.1:<system port>`, where the join serves a forwarder to the leader until the daemon takes over. When the standby streams (`WaitStreaming`, or `JoinOptions.Streaming` in tests) the joiner confirms. A join that stopped after the certificate was issued continues with `JoinOptions.Resume` (`join.json` records the node id, the leader and the bootstrap).
+`Join(ctx, JoinOptions)` is the function `supavise install --join-token-file` calls. `JoinOptions.Seed` (a `SeedFunc`) builds the system standby from the base backup the leader names and starts it, with the system cluster's replication password, which the leader sends in the bootstrap (`peerapi.SystemBootstrap.ReplicationPassword`; the joiner has no registry to read it from, and `join.json` is 0600 for that reason); its `primary_conninfo` points at `127.0.0.1:<system port>`, where the join serves a forwarder to the leader until the daemon takes over. When the standby streams (`WaitStreaming`, or `JoinOptions.Streaming` in tests) the joiner confirms. A join that stopped after the certificate was issued continues with `JoinOptions.Resume` (`join.json` records the node id, the leader and the bootstrap).
 
 ## Boot
 
@@ -49,13 +49,15 @@ node row `active`
 | a source names this node at a higher epoch (a promotion the registry has not caught up with) | leader at that epoch; claims of the old leader at the old epoch are stale |
 | nothing reachable, and the local record shows no demotion | leader |
 
+After a promotion the boot decision settles on the epoch the marker names, and `AssumeLeadership` records it in the registry: the cluster row names this node at that epoch and the old leader's row becomes `fenced`, unless the cluster row announces maintenance on that node, which is how a planned switchover says that the old leader stopped on purpose and is to be demoted in place (its row stays `active`; the failover procedure clears the announcement).
+
 A fenced node starts no primary: `serveFenced` (`internal/app`) records `fenced.json` with the peers' addresses, stops the units (`FenceLocal`), raises the critical `fenced` alert and answers 503. `FenceLocal` is also what the cooperative fence endpoint of the failover work can call.
 
 ## Live
 
-`Live` is the `Membership` of a node in a cluster. It reads the registry and the recovery state every 2 seconds and publishes a `Snapshot` when it changes. While the system cluster is a primary here, `Leader()` is this node even if the registry still names another. `Changed()` closes when the role differs from the boot role on two polls in a row, or at once when the node is fenced: the daemon then stops with `app.ErrRoleChanged` and systemd starts it in the new role.
+`Live` is the `Membership` of a node in a cluster. It reads the registry and the recovery state every 2 seconds and publishes a `Snapshot` when it changes. While the system cluster is a primary here, `Leader()` is this node even if the registry still names another. `Changed()` closes when the role differs from the boot role on two polls in a row, or at once when the node is fenced: the daemon then stops with `app.ErrRoleChanged` and systemd starts it in the role the cluster gives it.
 
-`ObserveEpoch` is told what a peer's ping says. A running leader that sees another node named as leader at its own epoch or a higher one fences itself: it writes `fenced.json`, calls `OnFenced` (the alert, `FenceLocal`) and the daemon restarts into fenced mode. A follower never fences itself on a peer's word.
+`ObserveEpoch` is told what a peer's ping says. A running leader whose system cluster answers as a primary, and that sees another node named as leader at its own epoch or a higher one, fences itself (a leader whose database is stopped writes nothing, which is how the old leader of a planned switchover looks until it is demoted): it writes `fenced.json`, calls `OnFenced` (the alert, `FenceLocal`) and the daemon restarts into fenced mode. A follower never fences itself on a peer's word.
 
 ## Authority and the peer endpoints
 
@@ -67,7 +69,7 @@ A fenced node starts no primary: `serveFenced` (`internal/app`) records `fenced.
 | `GET`, `POST /peer/v1/join` | no certificate | challenge; the join |
 | `POST /peer/v1/join/confirm` | the joining node | 204, the node is active |
 | `POST /peer/v1/rejoin` | a fenced node | how to rebuild the system standby |
-| `POST /peer/v1/certs/renew` | an active node | the new certificate |
+| `POST /peer/v1/certs/renew` | an active node | the renewed certificate |
 | `GET /peer/v1/config` | a follower | the cluster-scoped settings and their revision (leader only) |
 | `GET /peer/v1/certs` | a follower | the certificate store with an ETag, 304 on a match (leader only) |
 | `POST /peer/v1/report` | a node | 204; the report goes to `Reports` (leader only) |
@@ -78,7 +80,7 @@ A fenced node starts no primary: `serveFenced` (`internal/app`) records `fenced.
 
 `RemoveNode` (`supavise node rm`, on the leader, through the registry) refuses the leader and a node that is the home of a project, deletes the system replica row, sets the other replicas of the node `GOING_DOWN` for the replica controller to remove, waits for them to go (or deletes the rows with `--force`) and sets the node `left`. A left node is refused at the next handshake; the node, which sees its own row, retires itself (`Retire`: stops what runs, sets the data aside, deletes its cluster identity).
 
-`Rejoin` (`supavise node rejoin`) is for a fenced node. It asks the leader to take it back (the row goes to `joining`), stops what runs, renames the system project's and every project's `data` directory to `data.diverged-<epoch>` (kept for `[failover] keep_diverged_days`), seeds a new system standby, waits for it to stream, confirms, and removes `fenced.json`. The node keeps its identity and certificate. Its replicas are rebuilt by the replica controller once the node is active. The size of the lost tail (`pg_controldata` against the fork) is not recorded.
+`Rejoin` (`supavise node rejoin`) is for a fenced node. It asks the leader to take it back (the row goes to `joining`), stops what runs, renames the system project's and every project's `data` directory to `data.diverged-<epoch>` (kept for `[failover] keep_diverged_days`), seeds a fresh system standby, waits for it to stream, confirms, and removes `fenced.json`. The node keeps its identity and certificate. Its replicas are rebuilt by the replica controller once the node is active. The size of the lost tail (`pg_controldata` against the fork) is not recorded.
 
 ## The AWS resolver
 
