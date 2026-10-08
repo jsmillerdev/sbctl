@@ -90,7 +90,7 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	// The replicas of this node start with the daemon, report to the leader and get their PostgREST's
 	// schema cache reloaded on a timer. The observation of the replicas and of the projects homed here
 	// is kept in memory and refreshed in the background, so that a report answers from it.
-	cache := &placement.ReportCache{Agent: agent, Projects: projectHealth(node.Registry, node.Plane, self)}
+	cache := &placement.ReportCache{Agent: agent, Projects: unlessLeader(mem, projectHealth(node.Registry, node.Plane, self))}
 	Provide[placement.Contribution](w, cache.Contribute)
 	reporter := &placement.Reporter{Members: mem, RPC: m, Agent: cache, Projects: cache.ProjectHealth}
 	w.Go("replicas start", func(ctx context.Context) error { agent.StartLocal(ctx); return nil })
@@ -141,6 +141,17 @@ func replicaFailed(ctx context.Context, r registry.Replica, cause error) {
 		Title:  fmt.Sprintf("Replica %s is unhealthy", r.Identifier),
 		Detail: fmt.Sprintf("The replica on node %s did not come back after it was restarted: %v. Restart it from the dashboard or with `supavise replicas`, or remove it and add it again.", r.NodeID, cause),
 	})
+}
+
+// unlessLeader is f on a node that is not the leader, and nothing on the leader: it reports to nobody
+// and reads the health of its own projects itself, so the probes would be wasted.
+func unlessLeader(m cluster.Membership, f func(context.Context) []peerapi.ProjectHealth) func(context.Context) []peerapi.ProjectHealth {
+	return func(ctx context.Context) []peerapi.ProjectHealth {
+		if m.IsLeader() {
+			return nil
+		}
+		return f(ctx)
+	}
 }
 
 // projectHealth reports the health of the projects homed on this node, for the report to the leader.

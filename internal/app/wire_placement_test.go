@@ -280,3 +280,21 @@ func TestPlacementWiringWithoutForwardersHoldsNothing(t *testing.T) {
 		t.Fatalf("a contribution before the first refresh: %v %v", in, pr)
 	}
 }
+
+// The leader reports to nobody, so it checks no project for the report; a follower does.
+func TestProjectHealthIsCheckedForTheReportOnAFollowerOnly(t *testing.T) {
+	checked := 0
+	f := func(context.Context) []peerapi.ProjectHealth {
+		checked++
+		return []peerapi.ProjectHealth{{Ref: "abcdefghijklmnopqrst", Healthy: true}}
+	}
+	member := func(role cluster.Role) cluster.Membership {
+		return cluster.NewStatic(cluster.Snapshot{Self: registry.Node{ID: "n1"}, Nodes: []registry.Node{{ID: "n1"}, {ID: "n2"}}, Leader: "n2", Epoch: 1, Role: role})
+	}
+	if got := unlessLeader(member(cluster.RoleLeader), f)(context.Background()); len(got) != 0 || checked != 0 {
+		t.Fatalf("the leader checked %d projects and reported %v", checked, got)
+	}
+	if got := unlessLeader(member(cluster.RoleFollower), f)(context.Background()); len(got) != 1 || checked != 1 {
+		t.Fatalf("a follower checked %d projects and reported %v", checked, got)
+	}
+}
