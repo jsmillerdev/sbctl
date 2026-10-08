@@ -137,7 +137,11 @@ func (m *Monitor) arm(ctx context.Context) string {
 	case o.d.Provider.Name() != "aws":
 		reason = "automatic failover needs [failover] fencing = \"aws\""
 	default:
-		if err := o.probe(ctx); err != nil {
+		err := o.probe(ctx)
+		if ap, ok := o.d.Provider.(AddressProber); ok && err == nil {
+			err = ap.ProbeTakeover(ctx)
+		}
+		if err != nil {
 			if ctx.Err() != nil { // the daemon is stopping: that is no verdict on the fencer
 				return o.autoOff()
 			}

@@ -46,7 +46,9 @@ promotes the system cluster and then every project's replica, and loses at most 
 
 Run it on the node that should lead; a switchover can also be started on the leader with --to,
 which has that node run it. --dry-run prints each precondition. State is kept so that --resume
-continues a run that stopped. A project with no replica is refused unless --restore-missing, which builds
+continues a run that stopped, and --abort discards one that stopped before the leader marker was
+written (it starts the old leader again if the switchover had stopped it); a run that went further
+only continues. A project with no replica is refused unless --restore-missing, which builds
 its standby from the WAL archive (data loss up to archive_timeout).
 
 The daemon of the node that takes over restarts once when its system cluster is promoted, because that
@@ -61,6 +63,7 @@ when its own system cluster becomes a standby.`,
 	f.BoolVar(&o.Force, "force", false, "go on although a precondition that is not marked hard fails: a replica that lags or is not healthy, nodes on different releases")
 	f.BoolVar(&o.DryRun, "dry-run", false, "print the preconditions and what would happen, and change nothing")
 	f.BoolVar(&o.Resume, "resume", false, "continue the run that stopped")
+	f.BoolVar(&o.Abort, "abort", false, "discard the run that stopped before the leader marker was written, and start the old leader again if it was stopped for a switchover")
 	f.BoolVar(&o.RestoreMissing, "restore-missing", false, "seed a project that has no replica from the archive")
 	f.BoolVar(&o.OldPrimaryIsDown, "old-primary-is-down", false, "assert that the old leader is down, when no fence is configured")
 	f.BoolVarP(&o.Yes, "yes", "y", false, "do not ask for confirmation")
@@ -79,6 +82,9 @@ func runServerFailover(cmd *cobra.Command, o failover.ServerOptions) error {
 	}
 	c := newFailoverClient(cfg)
 	out := cmd.OutOrStdout()
+	if o.Abort {
+		return abortServerFailover(ctx, out, c, o)
+	}
 	plan, err := c.PlanServer(ctx, o)
 	if err != nil {
 		return planError(err)
@@ -124,6 +130,22 @@ func followRestart(ctx context.Context, out io.Writer, c failoverClient, epoch i
 		return mv, err
 	}
 	return next, err
+}
+
+// abortServerFailover discards the run that stopped early. It plans nothing: there is no move to
+// plan, only the unfinished one to take back.
+func abortServerFailover(ctx context.Context, out io.Writer, c failoverClient, o failover.ServerOptions) error {
+	if o.Resume || o.DryRun || o.Force || o.RestoreMissing || o.OldPrimaryIsDown || o.To != "" {
+		return errors.New("--abort discards the unfinished run and takes no other option")
+	}
+	mv, err := c.RunServer(ctx, o, stepPrinter(out))
+	if err != nil {
+		return err
+	}
+	if mv != nil {
+		fmt.Fprintf(out, "\nAborted: the %s of the server from %s to %s was discarded after %s; nothing was promoted.\n", mv.Kind, mv.FromNode, mv.ToNode, lastStepName(mv))
+	}
+	return nil
 }
 
 // planError words an error of the plan request.

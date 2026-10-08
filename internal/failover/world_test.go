@@ -870,7 +870,12 @@ func (p *fakeProvider) PeerState(context.Context, registry.Node) (PeerState, err
 	return p.state, nil
 }
 
-var _ Cloud = (*fakeProvider)(nil)
+func (p *fakeProvider) ProbeTakeover(context.Context) error { return p.w.do("provider.probetakeover") }
+
+var (
+	_ Cloud         = (*fakeProvider)(nil)
+	_ AddressProber = (*fakeProvider)(nil)
+)
 
 // check finds the named check of a plan.
 func findCheck(t *testing.T, pl *Plan, name string) Check {

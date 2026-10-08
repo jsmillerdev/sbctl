@@ -3,6 +3,7 @@ package fenced
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -17,12 +18,12 @@ func TestNodeRecordRoundTrip(t *testing.T) {
 		t.Fatalf("empty: %+v, %v", r, err)
 	}
 	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	want := Record{Epoch: 4, Leader: "n2", Reason: "peer n2 leads at epoch 4", At: at}
+	want := Record{Epoch: 4, Leader: "n2", Reason: "peer n2 leads at epoch 4", At: at, Peers: map[string]string{"n2": "10.0.1.7:7443"}}
 	if err := WriteNode(p, want); err != nil {
 		t.Fatal(err)
 	}
 	got, err := Node(p)
-	if err != nil || got == nil || *got != want {
+	if err != nil || got == nil || !reflect.DeepEqual(*got, want) {
 		t.Fatalf("read: %+v, %v", got, err)
 	}
 	fi, err := os.Stat(NodePath(p))

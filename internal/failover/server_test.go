@@ -1016,3 +1016,138 @@ func TestTheCooperativeFenceIsSkippedForALeaderTheCloudSaysIsStopped(t *testing.
 		}
 	})
 }
+
+// A move that stopped before it did anything it cannot take back keeps every new plan out, and it
+// leaves the old leader stopped when it was a switchover. --abort is the way out.
+func TestAbortDiscardsAMoveThatStoppedBeforeTheMarkerAndStartsTheLeaderAgain(t *testing.T) {
+	w := serverWorld(t)
+	w.fail("marker epoch=", errors.New("connection reset"), -1)
+	o := w.orch()
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{})
+	if err == nil || mv.State != registry.MoveFailed {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if !stateFileExists(w) || !w.has("quiesce n1") {
+		t.Fatalf("the move left no file, or never stopped the leader:\n%v", w.snapshot())
+	}
+	// Until it is gone, a new plan is refused.
+	if pl, _ := o.PlanServer(w.ctx, ServerOptions{}); len(pl.Refused(true)) == 0 {
+		t.Fatal("a new plan was not refused by the unfinished move")
+	}
+	w.clearFailures()
+
+	ab, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true})
+	if err != nil || ab == nil || ab.State != registry.MoveAborted || ab.Kind != registry.MoveSwitchover || ab.ToNode != "n2" {
+		t.Fatalf("abort: %+v, %v", ab, err)
+	}
+	if stateFileExists(w) {
+		t.Fatal("failover.json is left behind")
+	}
+	w.assertOrder("quiesce n1", "resume-leader n1")
+	if k := w.alertKinds(); k[len(k)-1] != alerts.KindFailoverFailed || w.alerts[len(w.alerts)-1].Severity != alerts.SeverityWarning {
+		t.Fatalf("alerts: %v", w.alerts)
+	}
+	// A new plan passes, and a second abort has nothing to abort.
+	if pl, err := o.PlanServer(w.ctx, ServerOptions{}); err != nil || len(pl.Refused(false)) != 0 {
+		t.Fatalf("plan after the abort: %+v, %v", pl, err)
+	}
+	if _, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true}); !errors.Is(err, ErrNothingToResume) {
+		t.Fatalf("second abort: %v", err)
+	}
+	// And a move can be run again from the start.
+	if mv, err := o.FailoverServer(w.ctx, ServerOptions{}); err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("the move after the abort: %+v, %v", mv, err)
+	}
+}
+
+func TestAbortOfAFailoverThatNeverFencedAsksNothingOfTheDeadLeader(t *testing.T) {
+	w := serverWorld(t)
+	w.down["n1"] = true
+	w.fail("provider.fence", errors.New("StopInstances: throttled"), -1)
+	o := w.orch()
+	if _, err := o.FailoverServer(w.ctx, ServerOptions{}); !errors.Is(err, ErrFence) {
+		t.Fatal(err)
+	}
+	ab, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true})
+	if err != nil || ab.State != registry.MoveAborted || ab.Kind != registry.MoveFailover {
+		t.Fatalf("abort: %+v, %v", ab, err)
+	}
+	if w.has("resume-leader") || stateFileExists(w) {
+		t.Fatalf("events %v", w.snapshot())
+	}
+}
+
+func TestAbortRefusesAMoveThatCannotBeTakenBack(t *testing.T) {
+	t.Run("the marker is written", func(t *testing.T) {
+		w := serverWorld(t)
+		w.fail("promote n2/"+idSysN2, errors.New("pg_promote timed out"), -1)
+		o := w.orch()
+		if _, err := o.FailoverServer(w.ctx, ServerOptions{}); err == nil {
+			t.Fatal("no error")
+		}
+		_, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true})
+		if err == nil || !strings.Contains(err.Error(), "--resume") || !strings.Contains(err.Error(), "step marker") && !strings.Contains(err.Error(), "step address") {
+			t.Fatalf("error: %v", err)
+		}
+		if !stateFileExists(w) || w.has("resume-leader") {
+			t.Fatalf("an abort that was refused changed something:\n%v", w.snapshot())
+		}
+	})
+	t.Run("the old leader was fenced", func(t *testing.T) {
+		w := serverWorld(t)
+		w.down["n1"] = true
+		w.fail("marker epoch=", errors.New("connection reset"), -1)
+		o := w.orch()
+		if _, err := o.FailoverServer(w.ctx, ServerOptions{}); err == nil {
+			t.Fatal("no error")
+		}
+		if _, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true}); err == nil || !strings.Contains(err.Error(), "step fence") {
+			t.Fatalf("error: %v", err)
+		}
+	})
+	t.Run("the move is in the registry", func(t *testing.T) {
+		w := serverWorld(t)
+		w.fail("promote n2/"+idAN2, errors.New("injected"), -1)
+		o := w.orch()
+		if _, err := o.FailoverServer(w.ctx, ServerOptions{}); err == nil {
+			t.Fatal("no error")
+		}
+		if _, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true}); err == nil || !strings.Contains(err.Error(), "past its promotion") {
+			t.Fatalf("error: %v", err)
+		}
+	})
+	t.Run("another node's move", func(t *testing.T) {
+		w := serverWorld(t)
+		w.fail("marker epoch=", errors.New("connection reset"), -1)
+		if _, err := w.orch().FailoverServer(w.ctx, ServerOptions{}); err == nil {
+			t.Fatal("no error")
+		}
+		w.addNode3()
+		w.setSelf("n3", false)
+		if _, err := w.orch().FailoverServer(w.ctx, ServerOptions{Abort: true}); err == nil || !strings.Contains(err.Error(), "abort it there") {
+			t.Fatalf("error: %v", err)
+		}
+	})
+	t.Run("the leader cannot be started again", func(t *testing.T) {
+		w := serverWorld(t)
+		w.fail("marker epoch=", errors.New("connection reset"), -1)
+		o := w.orch()
+		if _, err := o.FailoverServer(w.ctx, ServerOptions{}); err == nil {
+			t.Fatal("no error")
+		}
+		w.clearFailures()
+		w.fail("resume-leader", errors.New("no session"), -1)
+		if _, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true}); err == nil || !strings.Contains(err.Error(), "the move is kept") {
+			t.Fatalf("error: %v", err)
+		}
+		if !stateFileExists(w) {
+			t.Fatal("the move was discarded although the leader is still stopped")
+		}
+		// A leader that has nothing to undo (it started again by itself) is the state wanted.
+		w.clearFailures()
+		w.fail("resume-leader", &mesh.RemoteError{Node: "n1", Status: 409, Code: "no_quiesce"}, -1)
+		if ab, err := o.FailoverServer(w.ctx, ServerOptions{Abort: true}); err != nil || ab.State != registry.MoveAborted {
+			t.Fatalf("abort: %+v, %v", ab, err)
+		}
+	})
+}

@@ -183,6 +183,14 @@ type Cloud interface {
 	PeerState(ctx context.Context, node registry.Node) (PeerState, error)
 }
 
+// AddressProber is implemented by a Provider that can say, before a move, whether it will be able to
+// take the service address over on this node. The automatic mode needs it: with no operator to hand
+// the address to, a node that cannot move it stays manual. The plain Probe is about permissions; this
+// is about the node.
+type AddressProber interface {
+	ProbeTakeover(ctx context.Context) error
+}
+
 // PeerState is what the cloud says about a node's machine.
 type PeerState struct {
 	// State is the machine's state in the cloud's words ("running", "stopped", "terminated").

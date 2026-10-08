@@ -235,6 +235,30 @@ func TestFailoverFollowsTheMoveAcrossTheRestartOfTheDaemon(t *testing.T) {
 	})
 }
 
+func TestFailoverAbortRunsWithoutAPlanAndTakesNoOtherOption(t *testing.T) {
+	mv := doneMove()
+	mv.State = registry.MoveAborted
+	f := &fakeFailover{plan: goodPlan(), move: mv}
+	withFailover(t, f)
+	out, err := run(t, "failover", "--abort")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if len(f.planned) != 0 || strings.Join(f.ran, ",") != "server" || !f.gotSrv.Abort || !strings.Contains(out, "Aborted: the switchover of the server from n1 to n2 was discarded after dns") {
+		t.Fatalf("planned %v, ran %v with %+v\n%s", f.planned, f.ran, f.gotSrv, out)
+	}
+	for _, args := range [][]string{{"--resume"}, {"--force"}, {"--to", "n2"}, {"--dry-run"}} {
+		f.ran = nil
+		if _, err := run(t, append([]string{"failover", "--abort"}, args...)...); err == nil || !strings.Contains(err.Error(), "takes no other option") || len(f.ran) != 0 {
+			t.Fatalf("%v: error %v, ran %v", args, err, f.ran)
+		}
+	}
+	f.runErr = &failover.RemoteError{Code: "failed", Message: "failover: the move went past what can be taken back (step marker): continue it with supavise failover --resume"}
+	if _, err := run(t, "failover", "--abort"); err == nil || !strings.Contains(err.Error(), "step marker") {
+		t.Fatalf("a refused abort: %v", err)
+	}
+}
+
 func TestFailoverAsksBeforeItActsAndWontGuess(t *testing.T) {
 	f := &fakeFailover{plan: goodPlan(), move: doneMove()}
 	withFailover(t, f)

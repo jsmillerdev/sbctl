@@ -431,7 +431,7 @@ func (o *Orchestrator) whileTheNodeLearnsWhoLeads(ctx context.Context, call func
 // raw 403 of the mesh or as the cluster.ErrNotLeader that the placement layer turns it into.
 func notYetLeader(err error) bool {
 	var re *mesh.RemoteError
-	return errors.Is(err, cluster.ErrNotLeader) || errors.As(err, &re) && re.Status == http.StatusForbidden
+	return errors.Is(err, cluster.ErrNotLeader) || errors.As(err, &re) && (re.Status == http.StatusForbidden || re.Code == "not_leader")
 }
 
 // undoSwitchover puts a switchover back that stopped before the promotion: the old primary starts

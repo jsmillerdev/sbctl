@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -55,7 +58,72 @@ func (o *Orchestrator) FailoverServer(ctx context.Context, opts ServerOptions) (
 		return nil, err
 	}
 	defer release()
+	if opts.Abort {
+		return o.abortServer(ctx)
+	}
 	return o.failoverServer(ctx, opts)
+}
+
+// undoable are the steps of a server move that can still be taken back: the plan, the leader's stop
+// of everything for a switchover, where each cluster stopped, and the survivor's wait for its standby.
+// A fence, the leader marker and everything after them are not.
+func undoable(step string) bool {
+	return step == "begin" || step == "quiesce" || step == "caught-up" || strings.HasPrefix(step, "stopped:")
+}
+
+// abortServer discards the unfinished server move of this node. It is the way out of a move that
+// stopped early and keeps every new plan, and the automatic mode, from running (the plan refuses
+// "unfinished move"): a switchover whose marker could not be written has left the old leader stopped,
+// and a failover whose fence failed has left only the file. It starts the old leader again when the
+// move had stopped it, and removes failover.json.
+//
+// Only a move that did nothing it cannot take back is aborted: not one that fenced the old leader,
+// wrote the leader marker or promoted anything. Those continue with --resume.
+func (o *Orchestrator) abortServer(ctx context.Context) (*registry.Move, error) {
+	prior, state, err := o.unfinishedServer(ctx)
+	switch {
+	case err != nil:
+		return nil, err
+	case prior == nil:
+		return nil, fmt.Errorf("%w: there is no server move to abort", ErrNothingToResume)
+	case state == nil || prior.moveID != 0:
+		return nil, fmt.Errorf("failover: the move is past its promotion (it is in the moves log); continue it with supavise failover --resume")
+	case prior.to != o.self().ID:
+		return nil, fmt.Errorf("failover: the move goes to node %s: abort it there", prior.to)
+	}
+	for _, s := range prior.steps {
+		if !undoable(s.Name) {
+			return nil, fmt.Errorf("failover: the move went past what can be taken back (step %s): continue it with supavise failover --resume", s.Name)
+		}
+	}
+	if recordedStep(prior.steps, "quiesce") {
+		switch err := o.restartLeader(ctx, prior.from); {
+		case err == nil:
+		default:
+			return nil, fmt.Errorf("failover: starting %s again failed, so the move is kept: %w", prior.from, err)
+		}
+	}
+	if err := os.Remove(o.d.Cfg.Paths().FailoverState()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("failover: removing the state of the move: %w", err)
+	}
+	mv := registry.Move{Scope: registry.MoveServer, Kind: prior.kind, FromNode: prior.from, ToNode: prior.to, Epoch: prior.epoch, State: registry.MoveAborted,
+		Error: "aborted by the operator", Steps: prior.steps}
+	o.announce(ctx, alerts.KindFailoverFailed, alerts.SeverityWarning, mv, fmt.Sprintf("The %s of the server from %s to %s was aborted by the operator after %s; nothing was promoted.", prior.kind, prior.from, prior.to, prior.last))
+	return &mv, nil
+}
+
+// restartLeader tells the old leader to start what the quiesce stopped. A leader that has nothing to
+// undo (it was told already, or never stopped) answers no_quiesce, which is the state wanted.
+func (o *Orchestrator) restartLeader(ctx context.Context, node string) error {
+	if o.d.Leader == nil {
+		return errors.New("no way to reach the leader")
+	}
+	err := o.d.Leader.Resume(ctx, node)
+	var re *mesh.RemoteError
+	if errors.As(err, &re) && re.Code == "no_quiesce" {
+		return nil
+	}
+	return err
 }
 
 // failoverServer is FailoverServer for a caller that holds the node's move already.

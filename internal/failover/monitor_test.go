@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -231,6 +232,29 @@ func TestTheCooldownIsPerProjectInProjectModeAndForTheServerInServerMode(t *test
 			t.Fatalf("decision: %+v\n%v", d, m.snapshot())
 		}
 	})
+}
+
+// A survivor that cannot move the service address by itself leaves the move to an operator who has the
+// DNS change in hand. The automatic mode has none, so it stays off, with the reason, until it can.
+func TestAutoModeStaysOffWhenTheSurvivorCannotTakeTheAddressOver(t *testing.T) {
+	m := newMonitorRig(t, config.FailoverServer)
+	m.world.fail("provider.probetakeover", fmt.Errorf("%w: standby's private address has an Elastic IP of its own and it has no free secondary address", ErrNoTakeover), -1)
+	d := m.mon.Tick(m.ctx)
+	if d.Action != "none" || !strings.Contains(d.Reason, "automatic failover is off") || !strings.Contains(d.Reason, "no free secondary address") {
+		t.Fatalf("decision: %+v", d)
+	}
+	if k := m.alertKinds(); len(k) != 1 || k[0] != alerts.KindFailoverAutoOff {
+		t.Fatalf("alerts: %v", k)
+	}
+	m.advance(2 * time.Minute)
+	m.world.clearFailures()
+	m.o.probes = probeCache{}
+	if d := m.mon.Tick(m.ctx); strings.Contains(d.Reason, "automatic failover is off") {
+		t.Fatalf("the mode did not come back: %+v", d)
+	}
+	if k := m.alertKinds(); len(k) != 2 || !m.alerts[1].Resolved {
+		t.Fatalf("alerts: %v", m.alerts)
+	}
 }
 
 func TestAutoModeDowngradesToManualWhenTheProbeFailsAndSaysSo(t *testing.T) {

@@ -63,6 +63,7 @@ type serverReq struct {
 	Resume           bool   `json:"resume,omitempty"`
 	RestoreMissing   bool   `json:"restore_missing,omitempty"`
 	OldPrimaryIsDown bool   `json:"old_primary_is_down,omitempty"`
+	Abort            bool   `json:"abort,omitempty"`
 	ExpectKind       string `json:"expect_kind,omitempty"`
 	ExpectEpoch      int64  `json:"expect_epoch,omitempty"`
 }
@@ -73,7 +74,7 @@ func (r projectReq) options() ProjectOptions {
 
 func (r serverReq) options() ServerOptions {
 	return ServerOptions{To: r.To, Force: r.Force, DryRun: r.DryRun, Resume: r.Resume, RestoreMissing: r.RestoreMissing, OldPrimaryIsDown: r.OldPrimaryIsDown, Yes: true,
-		ExpectKind: r.ExpectKind, ExpectEpoch: r.ExpectEpoch}
+		Abort: r.Abort, ExpectKind: r.ExpectKind, ExpectEpoch: r.ExpectEpoch}
 }
 
 // stepJSON, moveJSON and event are what the stream carries.
@@ -447,7 +448,7 @@ func (c Client) PlanServer(ctx context.Context, o ServerOptions) (*Plan, error) 
 
 func serverFromOptions(o ServerOptions) serverReq {
 	return serverReq{To: o.To, Force: o.Force, Resume: o.Resume, RestoreMissing: o.RestoreMissing, OldPrimaryIsDown: o.OldPrimaryIsDown,
-		ExpectKind: o.ExpectKind, ExpectEpoch: o.ExpectEpoch}
+		Abort: o.Abort, ExpectKind: o.ExpectKind, ExpectEpoch: o.ExpectEpoch}
 }
 
 // RunProject starts the move and calls onStep for each step as the daemon records it. The move is

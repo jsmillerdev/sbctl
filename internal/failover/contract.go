@@ -90,6 +90,10 @@ type ServerOptions struct {
 	RestoreMissing   bool
 	OldPrimaryIsDown bool
 	Yes              bool
+	// Abort discards the unfinished server move of this node, when it stopped before anything that
+	// cannot be undone: the leader marker is not written, and an old leader that was stopped for a
+	// switchover is started again. It replaces the run; no other option applies.
+	Abort bool
 	// ExpectKind and ExpectEpoch are what the operator confirmed in the plan. When ExpectKind is
 	// set and the plan made at the start of the run differs in kind or epoch, the run is refused
 	// with ErrPlanChanged.

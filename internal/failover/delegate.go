@@ -102,9 +102,8 @@ func (o *Orchestrator) delegateServer(ctx context.Context, opts ServerOptions, r
 	defer o.delegate(run.to.ID)()
 	if err := remote.StartServer(ctx, run.to.ID, opts); err != nil {
 		var re *mesh.RemoteError
-		// The refusal is a 409 whose text is the RefusedError (the peer API's code does not
-		// reach this release's RemoteError).
-		if errors.As(err, &re) && re.Status == http.StatusConflict && strings.HasPrefix(re.Message, "failover: refused") {
+		// The refusal is a 409 with the code "refused" whose text is the RefusedError.
+		if errors.As(err, &re) && re.Status == http.StatusConflict && (re.Code == "refused" || strings.HasPrefix(re.Message, "failover: refused")) {
 			return nil, fmt.Errorf("%w by %s: %s", ErrRefused, run.to.Name, re.Message)
 		}
 		return nil, fmt.Errorf("failover: asking %s to take over: %w", run.to.Name, err)
