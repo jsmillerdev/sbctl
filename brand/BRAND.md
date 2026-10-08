@@ -28,7 +28,7 @@ brand/
   social/github-social-preview          1280x640 repository social preview, .svg + .png
   social/apple-touch-icon               180x180 iOS home-screen icon, .svg + .png
   readme/banner-{dark,light}.svg        1280x320 README hero: lockup, tagline, small print
-  readme/architecture-{dark,light}.svg  1200x590 README diagram: clients, one node, backups
+  readme/architecture-{dark,light}.svg  1200x590 README diagram: clients, one node, backups, an optional second server
   readme/features-{dark,light}.svg      1200x882 README "What's included" grid: 14 cards, 2 columns
   readme/path-{server,aws}-{dark,light}.svg  580x148 README "Get started" path cards, linked to anchors
   readme/glyph-{dark,light}.svg         the mark at heading size, with its right gap built in
@@ -109,7 +109,7 @@ Embed from the repository root README:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="brand/readme/architecture-dark.svg">
-  <img alt="Supavise architecture: a browser with Supabase Studio, the Supabase CLI, the MCP server and your apps reach one node over HTTPS; the supavise binary fronts per-project Postgres, Auth and REST plus shared Supavisor, Realtime, Storage, Edge Runtime and Studio; backups go to S3 or local disk" src="brand/readme/architecture-light.svg" width="100%">
+  <img alt="Supavise architecture: a browser with Supabase Studio, the Supabase CLI, the MCP server and your apps reach one node over HTTPS; the supavise binary fronts per-project Postgres, Auth and REST plus shared Supavisor, Realtime, Storage, Edge Runtime and Studio; backups go to S3 or local disk; an optional second server joins over the mesh port for read replicas and failover" src="brand/readme/architecture-light.svg" width="100%">
 </picture>
 ```
 
