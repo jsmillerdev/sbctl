@@ -1,0 +1,68 @@
+{
+  "ChangeSetName": "supavise-update-20261008T120000Z",
+  "StackName": "supavise",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "Instance",
+        "ResourceType": "AWS::EC2::Instance",
+        "Replacement": "False",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "UserData",
+              "RequiresRecreation": "Never"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          }
+        ],
+        "PhysicalResourceId": "x-Instance",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "SecurityGroup",
+        "ResourceType": "AWS::EC2::SecurityGroup",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "GroupDescription",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "DirectModification"
+          }
+        ],
+        "PhysicalResourceId": "x-SecurityGroup",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Remove",
+        "LogicalResourceId": "DnsRecords",
+        "ResourceType": "AWS::Route53::RecordSetGroup",
+        "PhysicalResourceId": "x-DnsRecords"
+      }
+    }
+  ],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}

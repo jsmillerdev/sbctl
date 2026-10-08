@@ -1,0 +1,10 @@
+{
+  "ChangeSetName": "supavise-update-20261008T120000Z",
+  "StackName": "supavise",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "ChangeSetName": "supavise-update-20261008T120000Z",
+  "StackName": "supavise",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Dynamic",
+        "LogicalResourceId": "Surprise",
+        "ResourceType": "AWS::SQS::Queue",
+        "PhysicalResourceId": "x-Surprise"
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Import",
+        "LogicalResourceId": "Other",
+        "ResourceType": "AWS::SQS::Queue",
+        "PhysicalResourceId": "x-Other"
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "Mystery",
+        "ResourceType": "AWS::SNS::Topic",
+        "Replacement": "False",
+        "PhysicalResourceId": "x-Mystery"
+      }
+    }
+  ],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}

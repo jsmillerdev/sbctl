@@ -1,0 +1,193 @@
+{
+  "Stacks": [
+    {
+      "StackId": "arn:aws:cloudformation:us-east-1:111122223333:stack/supavise/11111111-2222-3333-4444-555555555555",
+      "StackName": "supavise",
+      "StackStatus": "UPDATE_COMPLETE",
+      "Parameters": [
+        {
+          "ParameterKey": "AdminEmail",
+          "ParameterValue": "owner@example.com"
+        },
+        {
+          "ParameterKey": "InstanceType",
+          "ParameterValue": "t4g.large"
+        },
+        {
+          "ParameterKey": "DataVolumeSize",
+          "ParameterValue": "100"
+        },
+        {
+          "ParameterKey": "DailySnapshotsKept",
+          "ParameterValue": "7"
+        },
+        {
+          "ParameterKey": "SupaviseVersion",
+          "ParameterValue": "v0.1.1"
+        },
+        {
+          "ParameterKey": "KeyEscrowPassphrase",
+          "ParameterValue": "****"
+        },
+        {
+          "ParameterKey": "DomainName",
+          "ParameterValue": "example.com"
+        },
+        {
+          "ParameterKey": "HostedZoneId",
+          "ParameterValue": "Z0123456789ABCDEFGHIJ"
+        },
+        {
+          "ParameterKey": "AccessCidr",
+          "ParameterValue": "0.0.0.0/0"
+        },
+        {
+          "ParameterKey": "EnableSessionManager",
+          "ParameterValue": "true"
+        },
+        {
+          "ParameterKey": "SshCidr",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "KeyName",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "VpcId",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "SubnetId",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "AmiId",
+          "ParameterValue": "ami-0aaaaaaaaaaaaaaaa"
+        },
+        {
+          "ParameterKey": "DataSnapshotId",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "Failover",
+          "ParameterValue": "off"
+        },
+        {
+          "ParameterKey": "ClusterName",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "PeerCidr1",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "PeerCidr2",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "PeerCidr3",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "JoinLeader",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "JoinTokenSecretArn",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "BackupBucketName",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "BackupBucketRegion",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "ObjectsBucketName",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "StorageRoleArn",
+          "ParameterValue": ""
+        },
+        {
+          "ParameterKey": "AvailabilityZone",
+          "ParameterValue": ""
+        }
+      ],
+      "Outputs": [
+        {
+          "OutputKey": "DashboardUrl",
+          "OutputValue": "https://studio.example.com"
+        },
+        {
+          "OutputKey": "ApiUrl",
+          "OutputValue": "https://api.example.com"
+        },
+        {
+          "OutputKey": "ClaimUrl",
+          "OutputValue": "https://api.example.com/claim"
+        },
+        {
+          "OutputKey": "ClaimTokenCommand",
+          "OutputValue": "aws secretsmanager get-secret-value --region us-east-1 --secret-id arn:aws:secretsmanager:us-east-1:111122223333:secret:ClaimTokenSecret-AbCdEf --query SecretString --output text"
+        },
+        {
+          "OutputKey": "ClaimTokenSecretArn",
+          "OutputValue": "arn:aws:secretsmanager:us-east-1:111122223333:secret:ClaimTokenSecret-AbCdEf"
+        },
+        {
+          "OutputKey": "InstanceId",
+          "OutputValue": "i-0123456789abcdef0"
+        },
+        {
+          "OutputKey": "ConnectCommand",
+          "OutputValue": "aws ssm start-session --region us-east-1 --target i-0123456789abcdef0"
+        },
+        {
+          "OutputKey": "BackupBucket",
+          "OutputValue": "supavise-backupbucket-abc123"
+        },
+        {
+          "OutputKey": "DataVolumeId",
+          "OutputValue": "vol-0123456789abcdef0"
+        },
+        {
+          "OutputKey": "PublicIp",
+          "OutputValue": "203.0.113.50"
+        },
+        {
+          "OutputKey": "DnsRecordsNeeded",
+          "OutputValue": "Created by this stack"
+        },
+        {
+          "OutputKey": "ElasticIpAllocationId",
+          "OutputValue": "eipalloc-0123456789abcdef0"
+        },
+        {
+          "OutputKey": "ObjectsBucket",
+          "OutputValue": "supavise-objectsbucket-abc123"
+        },
+        {
+          "OutputKey": "StorageRoleArn",
+          "OutputValue": "arn:aws:iam::111122223333:role/supavise-StorageRole-ABC"
+        },
+        {
+          "OutputKey": "SecurityGroupId",
+          "OutputValue": "sg-0123456789abcdef0"
+        },
+        {
+          "OutputKey": "InfraRevision",
+          "OutputValue": "2"
+        },
+        {
+          "OutputKey": "ClusterName",
+          "OutputValue": "supavise"
+        }
+      ]
+    }
+  ]
+}

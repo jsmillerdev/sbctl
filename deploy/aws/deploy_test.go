@@ -40,8 +40,9 @@ type result struct {
 }
 
 // stubAWS writes an `aws` that logs every call and answers like the real CLI would for the few
-// calls deploy.sh makes. STACK_EXISTS=1 makes describe-stacks find a stack; STOP_FAILS=1 makes
-// stop-instances fail.
+// calls deploy.sh makes to create and delete a stack. STACK_EXISTS=1 makes describe-stacks find a
+// stack; STOP_FAILS=1 makes stop-instances fail. (update, status and replica have a fuller stub in
+// update_test.go.)
 func stubAWS(t *testing.T) (dir, log string) {
 	t.Helper()
 	dir = t.TempDir()
@@ -63,6 +64,8 @@ case "$*" in
     printf 'DnsRecordsNeeded\tNot needed (sslip.io resolves the Elastic IP)\n'
     printf 'ConnectCommand\taws ssm start-session --region us-east-1 --target i-0abc\n'
     printf 'InstanceId\ti-0123456789abcdef0\nBackupBucket\tsupavise-backupbucket-xyz\nDataVolumeId\tvol-0123456789abcdef0\n' ;;
+  *"sts get-caller-identity --query Account"*) echo 111122223333 ;;
+  *"s3api head-bucket"*) exit 254 ;;
   *"ssm get-parameter"*) echo ami-0123456789abcdef0 ;;
   *"ec2 describe-instances"*) echo ami-0bbbbbbbbbbbbbbbb ;;
   *"ec2 stop-instances"*)
@@ -208,6 +211,41 @@ func TestDryRunMinimal(t *testing.T) {
 	}
 }
 
+// The template is larger than the API takes inline (51,200 bytes), so a new stack's deploy hands the
+// CLI a bucket to stage it in: the one the person names, else one the script makes.
+func TestLargeTemplateIsStaged(t *testing.T) {
+	tpl, err := os.ReadFile("../cloudformation/supavise.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tpl) <= 51200 {
+		t.Skipf("the template is %d bytes: nothing to stage", len(tpl))
+	}
+	out := dryRun(t, bashes(t)[0], nil, "--region", "us-east-1", "--email", "a@b.co")
+	for _, want := range []string{
+		"# the template is over 51200 bytes, so it is staged in the bucket supavise-templates-<account>-us-east-1",
+		"aws --region us-east-1 s3 mb 's3://supavise-templates-<account>-us-east-1'",
+		"--s3-bucket 'supavise-templates-<account>-us-east-1' --s3-prefix _stack",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	out = dryRun(t, bashes(t)[0], nil, "--region", "us-east-1", "--email", "a@b.co", "--template-bucket", "my-templates")
+	if !strings.Contains(out, "--s3-bucket my-templates --s3-prefix _stack") || strings.Contains(out, "s3 mb") {
+		t.Errorf("a named bucket is used as it is and not created:\n%s", out)
+	}
+	// A template that fits is sent inline, as before.
+	small := filepath.Join(t.TempDir(), "small.yaml")
+	if err := os.WriteFile(small, []byte("AWSTemplateFormatVersion: \"2010-09-09\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = dryRun(t, bashes(t)[0], nil, "--region", "us-east-1", "--email", "a@b.co", "--template", small)
+	if strings.Contains(out, "--s3-bucket") {
+		t.Errorf("a small template needs no bucket:\n%s", out)
+	}
+}
+
 func TestDryRunAllOptions(t *testing.T) {
 	for _, b := range bashes(t) {
 		out := dryRun(t, b, nil,
@@ -268,6 +306,9 @@ func TestParameterNamesExistInTemplate(t *testing.T) {
 	line := strings.SplitN(out[idx:], "\n", 2)[0]
 	n := 0
 	for _, f := range strings.Fields(strings.TrimPrefix(line, "--parameter-overrides ")) {
+		if strings.HasPrefix(f, "--") { // the options that follow the overrides
+			break
+		}
 		name, _, ok := strings.Cut(strings.Trim(f, "'"), "=")
 		if !ok {
 			t.Errorf("not a Name=Value pair: %s", f)
@@ -378,6 +419,13 @@ func TestRealRunNewStack(t *testing.T) {
 		}
 		if !strings.Contains(deploy, "--capabilities CAPABILITY_IAM") || !strings.Contains(deploy, "AdminEmail=a@b.co AmiId=ami-0123456789abcdef0") {
 			t.Errorf("deploy call: %s\nall calls: %v", deploy, c)
+		}
+		// The template is over the inline limit: a bucket is made first and handed to deploy.
+		if !strings.Contains(deploy, "--s3-bucket supavise-templates-111122223333-us-east-1 --s3-prefix _stack") {
+			t.Errorf("deploy call lacks the staging bucket: %s", deploy)
+		}
+		if !strings.Contains(strings.Join(c, "\n"), "s3 mb s3://supavise-templates-111122223333-us-east-1") {
+			t.Errorf("the staging bucket was not made: %v", c)
 		}
 		for _, l := range c {
 			if !strings.HasPrefix(l, "--region us-east-1 ") {

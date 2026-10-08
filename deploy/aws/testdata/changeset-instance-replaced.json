@@ -1,0 +1,107 @@
+{
+  "ChangeSetName": "supavise-update-20261008T120000Z",
+  "StackName": "supavise",
+  "Status": "CREATE_COMPLETE",
+  "ExecutionStatus": "AVAILABLE",
+  "Changes": [
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "Instance",
+        "ResourceType": "AWS::EC2::Instance",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "ImageId",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ParameterReference"
+          }
+        ],
+        "PhysicalResourceId": "x-Instance",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "DataVolume",
+        "ResourceType": "AWS::EC2::Volume",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "AvailabilityZone",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ResourceAttribute"
+          }
+        ],
+        "PhysicalResourceId": "x-DataVolume",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "DataVolumeAttachment",
+        "ResourceType": "AWS::EC2::VolumeAttachment",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "InstanceId",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ResourceReference"
+          }
+        ],
+        "PhysicalResourceId": "x-DataVolumeAttachment",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    },
+    {
+      "Type": "Resource",
+      "ResourceChange": {
+        "Action": "Modify",
+        "LogicalResourceId": "ElasticIpAssociation",
+        "ResourceType": "AWS::EC2::EIPAssociation",
+        "Replacement": "True",
+        "Details": [
+          {
+            "Target": {
+              "Attribute": "Properties",
+              "Name": "InstanceId",
+              "RequiresRecreation": "Always"
+            },
+            "Evaluation": "Static",
+            "ChangeSource": "ResourceReference"
+          }
+        ],
+        "PhysicalResourceId": "x-ElasticIpAssociation",
+        "Scope": [
+          "Properties"
+        ]
+      }
+    }
+  ],
+  "Capabilities": [
+    "CAPABILITY_IAM"
+  ]
+}
