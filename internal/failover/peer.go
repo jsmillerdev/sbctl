@@ -291,7 +291,8 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 	}
 	// A node fence names the epoch after this node's, and comes from an active node that holds a
 	// standby of the system cluster: the survivor that takes over. A survivor whose registry copy
-	// lags is refused (its epoch is not the next one) and asks again when it has caught up.
+	// lags is refused (its epoch is not the next one); it does not ask again, and goes on to the
+	// provider's fence, which is the one that counts.
 	if req.Epoch != local+1 {
 		writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local})
 		return
@@ -348,7 +349,9 @@ func (o *Orchestrator) nodeRecord(epoch int64, leader, reason string) fenced.Rec
 // mayTakeOver reports whether node is an active node that holds a standby of the system cluster, as
 // this node's registry has it. A registry that cannot be read (the system cluster of a node that is
 // being replaced is often what is broken) cannot say, and the cooperative fence is only the polite
-// half of the fence: the answer is yes, and the provider's fence is what counts.
+// half of the fence, so this node's snapshot of the membership answers instead: a member that is active
+// may ask, and a node that is not a member, or is not active, may not. The provider's fence is the one
+// that counts.
 func (o *Orchestrator) mayTakeOver(ctx context.Context, node string) bool {
 	st := o.store()
 	n, err := st.GetNode(ctx, node)
@@ -356,19 +359,29 @@ func (o *Orchestrator) mayTakeOver(ctx context.Context, node string) bool {
 	case errors.Is(err, registry.ErrNotFound):
 		return false
 	case err != nil:
-		o.d.Log.Warn("the claimant of a fence could not be checked against the registry", "node", node, "error", err)
-		return true
+		o.d.Log.Warn("the claimant of a fence could not be checked against the registry; the membership answers", "node", node, "error", err)
+		return o.activeMember(node)
 	}
 	if n.State != registry.NodeActive {
 		return false
 	}
 	reps, err := st.ListReplicas(ctx, config.SystemRef)
 	if err != nil {
-		return true
+		return true // active in the registry; whether it holds the standby cannot be read
 	}
 	for _, r := range reps {
 		if r.NodeID == node {
 			return true
+		}
+	}
+	return false
+}
+
+// activeMember reports whether this node's snapshot of the membership lists node as active.
+func (o *Orchestrator) activeMember(node string) bool {
+	for _, n := range o.d.Members.Nodes() {
+		if n.ID == node {
+			return n.State == registry.NodeActive
 		}
 	}
 	return false

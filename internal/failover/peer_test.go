@@ -1072,3 +1072,35 @@ func TestAQuiesceIsRefusedWhileALeaderMoveRuns(t *testing.T) {
 		t.Fatalf("a refused quiesce did something:\n%v", w.snapshot())
 	}
 }
+
+// A node fence from a node the registry cannot vouch for (the registry is what is broken) is judged by
+// the membership snapshot: an active member may ask, nobody else.
+func TestANodeFenceFromAClaimantThatTheMembershipDoesNotKnowIsRefusedWhenTheRegistryCannotBeRead(t *testing.T) {
+	ask := func(t *testing.T, w *world, claimant string) int {
+		t.Helper()
+		launcher(t, w, refA)
+		o := w.orch(func(d *Deps) { d.Store = func() Store { return brokenStore{} } })
+		rec := serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, claimant, FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 2, Leader: claimant}}, nil)
+		return rec.Code
+	}
+	t.Run("an active member", func(t *testing.T) {
+		w := newWorld(t)
+		if code := ask(t, w, "n2"); code != http.StatusOK || !w.has("local.stop "+refA) {
+			t.Fatalf("%d\n%v", code, w.snapshot())
+		}
+	})
+	t.Run("a node the membership does not list", func(t *testing.T) {
+		w := newWorld(t)
+		if code := ask(t, w, "n9"); code != http.StatusForbidden || w.has("local.stop") {
+			t.Fatalf("%d\n%v", code, w.snapshot())
+		}
+	})
+	t.Run("a member that is not active", func(t *testing.T) {
+		w := newWorld(t)
+		must(t, w.reg.SetNodeState(w.ctx, "n2", registry.NodeFenced))
+		w.refreshMembers()
+		if code := ask(t, w, "n2"); code != http.StatusForbidden || w.has("local.stop") {
+			t.Fatalf("%d\n%v", code, w.snapshot())
+		}
+	})
+}
