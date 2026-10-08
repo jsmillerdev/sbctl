@@ -269,7 +269,8 @@ storage_to_s3() {
 make_join_token() {
   (umask 077; supavise node token --ttl 30m >/root/join-token) || fail "supavise node token"
   [[ -s /root/join-token ]] || fail "supavise node token printed no token"
-  wait_for 180 "the daemon to listen on the peer port 7443" bash -c 'ss -ltnH "sport = :7443" | grep -q .'
+  wait_for 180 "the daemon to listen on the peer port 7443" bash -c 'ss -ltnH "sport = :7443" | grep -q .' \
+    || { journalctl --no-pager -u supavise.service -n 60 | cut -c1-300 >&2; exit 1; }
   wait_active supavise.service 60
   wait_api 120
 }
