@@ -10,7 +10,8 @@
 #                    of the template), written when SUPAVISE_RELEASE_TAG is set; deploy/releasetool
 #                    makes it, deploy/MIN_UPGRADE_FROM says the oldest version that upgrades straight
 #                    to this one. The converge revision is read from the built binary of this machine's
-#                    architecture (`supavise release-info`); a binary that cannot run here gives 0.
+#                    architecture (`supavise release-info`, which the script makes executable first: a
+#                    downloaded workflow artifact is not); a binary that cannot run here gives 0.
 #                    SUPAVISE_RELEASETOOL names a built releasetool; without it the script uses `go run`;
 #                    SUPAVISE_VERSIONS_FILE names the versions.yaml to read instead of the checkout's
 #                    (the upgrade-e2e job signs releases whose binaries pin other versions)
@@ -88,6 +89,9 @@ if [[ -n $tag ]]; then
   min=${SUPAVISE_MIN_UPGRADE_FROM:-$(grep -v '^[[:space:]]*#' "$here/MIN_UPGRADE_FROM" | tr -d '[:space:]')}
   # The binary that reports the host converge revision is the one this machine can run.
   case $(uname -m) in aarch64|arm64) probe=supavise-linux-arm64 ;; *) probe=supavise-linux-amd64 ;; esac
+  # upload-artifact and download-artifact do not keep the execute bit, so the binary of the release
+  # workflow arrives as 0644 and could not report its revision; the mode of an asset is no one's concern.
+  chmod 0755 "$dist/$probe"
   rm -f supavise-release.json
   if [[ -n ${SUPAVISE_RELEASETOOL:-} ]]; then
     "$SUPAVISE_RELEASETOOL" manifest -version "$tag" -min-upgrade-from "$min" -versions "${SUPAVISE_VERSIONS_FILE:-$here/../internal/versions/versions.yaml}" -binary "$dist/$probe" -template "$dist/supavise.yaml" -out supavise-release.json

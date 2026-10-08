@@ -1136,7 +1136,9 @@ type release struct {
 }
 
 // buildRelease runs release-assets.sh on fake binaries. binary is the text of the fake binaries
-// ("" makes them files that cannot run). tag "" builds a release without a manifest.
+// ("" makes them files that cannot run). tag "" builds a release without a manifest. The binaries
+// are 0644, as the release workflow has them after download-artifact (which drops the execute bit):
+// the script has to make the one it runs executable.
 func buildRelease(t *testing.T, tag, binary string) release {
 	t.Helper()
 	ssl := findOpenSSL(t)
@@ -1163,7 +1165,7 @@ func buildRelease(t *testing.T, tag, binary string) release {
 		content = binary
 	}
 	for _, f := range []string{"supavise-linux-amd64", "supavise-linux-arm64"} {
-		if err := os.WriteFile(filepath.Join(dist, f), []byte(content), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(dist, f), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1314,7 +1316,7 @@ func TestReleaseAssetsSignTheTemplate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if mf.Host == nil || mf.Host.ConvergeRevision != 7 {
-		t.Errorf("host: %+v, want the converge revision 7 the binary reports", mf.Host)
+		t.Errorf("host: %+v, want the converge revision 7 the binary reports (a 0644 binary, as the workflow's artifacts are, has to run too)", mf.Host)
 	}
 	if mf.AWS == nil || mf.AWS.StackRevision != infra.Current || mf.AWS.TemplateAsset != "supavise.yaml" || mf.AWS.TemplateSHA256 != sums["supavise.yaml"] {
 		t.Errorf("aws: %+v, want revision %d, asset supavise.yaml, sha256 %s", mf.AWS, infra.Current, sums["supavise.yaml"])
