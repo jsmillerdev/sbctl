@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 )
 
@@ -124,5 +126,34 @@ func TestNewClusterConfigSyncNeedsAMeshIdentity(t *testing.T) {
 	}
 	if cs := newClusterConfigSync(config.Default(), filepath.Join(dir, "config.toml")); cs == nil {
 		t.Error("a server with a mesh identity has no cluster settings step")
+	}
+}
+
+// converge --check tells a step that was not checked from one that is in order: a leader that does
+// not answer must not read as "host is converged".
+func TestRenderCheckSaysWhatWasNotChecked(t *testing.T) {
+	ok := hostsetup.Result{ID: "units", Title: "Install the systemd units"}
+	unknown := hostsetup.Result{ID: "config-d", Title: "Refresh the cluster settings", Unknown: true, Detail: "could not compare with the leader's cluster settings: refused"}
+	pending := hostsetup.Result{ID: "ufw", Title: "Open the mesh port", Pending: true}
+	for _, c := range []struct {
+		name string
+		rs   []hostsetup.Result
+		want []string
+		not  string
+	}{
+		{"all in order", []hostsetup.Result{ok}, []string{"host is converged"}, "could not be checked"},
+		{"one not checked", []hostsetup.Result{ok, unknown}, []string{"unknown  Refresh the cluster settings", "nothing is pending, but 1 step(s) could not be checked"}, "host is converged"},
+		{"pending and not checked", []hostsetup.Result{pending, unknown}, []string{"pending  Open the mesh port", "1 step(s) pending", "1 step(s) could not be checked"}, "host is converged"},
+	} {
+		var b bytes.Buffer
+		renderCheck(&b, c.rs)
+		for _, w := range c.want {
+			if !strings.Contains(b.String(), w) {
+				t.Errorf("%s: output lacks %q:\n%s", c.name, w, b.String())
+			}
+		}
+		if strings.Contains(b.String(), c.not) {
+			t.Errorf("%s: output has %q:\n%s", c.name, c.not, b.String())
+		}
 	}
 }

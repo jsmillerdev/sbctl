@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/supavise/supavise/deploy/systemd"
 )
@@ -528,16 +529,24 @@ type ConfigSyncer interface {
 	Sync(ctx context.Context, dryRun bool) (changed []string, err error)
 }
 
+// configCheckTimeout is how long a check waits for the leader. The check backs `supavise status` and
+// `converge --check`, which must not stall on a leader that is down; the apply, which has the root
+// command's patience, keeps its own longer limit. A variable so that a test can shorten it.
+var configCheckTimeout = 5 * time.Second
+
 func configSyncStep(o Options) Step {
 	return &funcStep{
 		id: "config-d", title: titleConfigD, root: true,
 		// A leader that cannot be reached is no reason to fail a host: the settings stay as they are
 		// and the step says so (an upgrade that failed on it would roll the node back for the sake of
-		// a copy of the leader's settings).
+		// a copy of the leader's settings). The check reports such a step as not checked, not as in
+		// order, and not as pending: applying it would change nothing that is known.
 		check: func(ctx context.Context) (Pending, error) {
+			ctx, cancel := context.WithTimeout(ctx, configCheckTimeout)
+			defer cancel()
 			changed, err := o.ConfigSync.Sync(ctx, true)
 			if err != nil {
-				return Pending{Detail: "the cluster settings were not refreshed: " + err.Error()}, nil
+				return Pending{Unknown: true, Detail: "could not compare with the leader's cluster settings: " + err.Error()}, nil
 			}
 			sort.Strings(changed)
 			return Pending{Pending: len(changed) > 0, Detail: strings.Join(changed, ", ")}, nil

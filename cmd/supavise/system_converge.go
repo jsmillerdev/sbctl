@@ -74,20 +74,29 @@ func changedLines(rs []hostsetup.Result) []string {
 // renderCheck prints the result of --check for a person.
 func renderCheck(w io.Writer, rs []hostsetup.Result) {
 	t := newTable(w)
-	n := 0
+	n, unknown := 0, 0
 	for _, r := range rs {
 		state := "ok"
-		if r.Pending {
+		switch {
+		case r.Pending:
 			state, n = "pending", n+1
+		case r.Unknown:
+			state, unknown = "unknown", unknown+1
 		}
 		fmt.Fprintf(t, "%s\t%s\t%s\n", state, r.Title, r.Detail)
 	}
 	_ = t.Flush()
-	if n == 0 {
+	switch {
+	case n > 0:
+		fmt.Fprintf(w, "%d step(s) pending: sudo supavise system converge\n", n)
+		if unknown > 0 {
+			fmt.Fprintf(w, "%d step(s) could not be checked\n", unknown)
+		}
+	case unknown > 0:
+		fmt.Fprintf(w, "nothing is pending, but %d step(s) could not be checked (revision %d)\n", unknown, hostsetup.Revision)
+	default:
 		fmt.Fprintf(w, "host is converged (revision %d)\n", hostsetup.Revision)
-		return
 	}
-	fmt.Fprintf(w, "%d step(s) pending: sudo supavise system converge\n", n)
 }
 
 // newConverger builds the step list of this node. sandbox keeps it to the unit files: the other

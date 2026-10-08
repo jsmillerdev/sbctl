@@ -3,6 +3,7 @@ package hostsetup
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -620,8 +621,8 @@ func TestConfigSyncStep(t *testing.T) {
 
 	down := &scriptedSync{err: errors.New("cannot reach the leader n1")}
 	step = configSyncStep(Options{ConfigSync: down})
-	if p, err := step.Check(ctx); err != nil || p.Pending || !strings.Contains(p.Detail, "cannot reach the leader n1") {
-		t.Errorf("check with the leader down: %+v, %v", p, err)
+	if p, err := step.Check(ctx); err != nil || p.Pending || !p.Unknown || !strings.Contains(p.Detail, "cannot reach the leader n1") {
+		t.Errorf("check with the leader down: %+v, %v (want not pending, but not known to be in order either)", p, err)
 	}
 	o, err = step.Apply(ctx)
 	if err != nil || len(o.Changed) != 0 || len(o.Warnings) != 1 || !strings.Contains(o.Warnings[0], "were not refreshed") {
@@ -634,6 +635,43 @@ func TestConfigSyncStep(t *testing.T) {
 	c := &Converger{Steps: DefaultSteps(h.opts), StateDir: h.state, Out: &bytes.Buffer{}}
 	if _, err := c.Run(ctx); err != nil {
 		t.Errorf("a converge failed on a leader that could not be reached: %v", err)
+	}
+}
+
+// blockedSync waits for the context, as a leader that accepts the connection and never answers does.
+type blockedSync struct{}
+
+func (blockedSync) Sync(ctx context.Context, _ bool) ([]string, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A check does not wait for a leader that is down: status and `converge --check` run it. The result
+// says the step was not checked, and the converge report carries that to a person and to JSON.
+func TestConfigSyncCheckGivesUpOnALeaderThatDoesNotAnswer(t *testing.T) {
+	old := configCheckTimeout
+	configCheckTimeout = 50 * time.Millisecond
+	defer func() { configCheckTimeout = old }()
+
+	h := newHost(t)
+	h.opts.ConfigSync = blockedSync{}
+	c := &Converger{Steps: []Step{configSyncStep(h.opts)}, StateDir: h.state, Out: &bytes.Buffer{}}
+	start := time.Now()
+	rs := c.Check(context.Background())
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("the check waited %s", took)
+	}
+	if len(rs) < 1 || rs[0].ID != "config-d" || rs[0].Pending || !rs[0].Unknown || !strings.Contains(rs[0].Detail, "deadline exceeded") {
+		t.Fatalf("results: %+v", rs)
+	}
+	b, err := json.Marshal(rs[0])
+	if err != nil || !strings.Contains(string(b), `"unknown":true`) {
+		t.Errorf("json: %s %v", b, err)
+	}
+	// A step that was checked says nothing about it.
+	ok := Result{ID: "x", Title: "x"}
+	if b, _ := json.Marshal(ok); strings.Contains(string(b), "unknown") {
+		t.Errorf("json of a checked step: %s", b)
 	}
 }
 
