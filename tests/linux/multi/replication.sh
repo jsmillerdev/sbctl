@@ -53,8 +53,10 @@
 #   fenced             n1 returns: it records that it is fenced, runs no primary and answers 503
 #   rejoin             `supavise node rejoin`: n1 follows n2 and its replicas come back
 # 7. Upgrade
+#   upgrade-refused    a follower that has a project of its own running is refused by `supavise upgrade` (exit status 2),
+#                      and nothing on it changes; the project goes back to the leader
 #   upgrade-leader     `supavise upgrade` to v0.0.2 on the leader: no PostgreSQL cluster restarts
-#   upgrade-follower   and on the follower
+#   upgrade-follower   and on the follower, which has no project of its own: no rollout
 #   status-final       `supavise status` exits 0 on the leader
 #   follower-status-final
 #                      `supavise status` exits 0 on the follower, a check of its own
@@ -75,7 +77,7 @@ RESULTS_TITLE="Two-server release test"
 MULTI_FAKE_AWS=0                 # lib-checks.sh does not start the fake AWS service (the spike's fakeaws checks use it)
 export MULTI_FAKE_AWS
 FACT_PREFIX=replication
-CHECK_ORDER="incus services launch boot prep net install claim projects storage token join cluster follower-status replica-setup replica-shapes replica-read replica-ddl pooler lb project-switchover project-failback server-switchover server-failback hard-failover fenced rejoin upgrade-leader upgrade-follower status-final follower-status-final"
+CHECK_ORDER="incus services launch boot prep net install claim projects storage token join cluster follower-status replica-setup replica-shapes replica-read replica-ddl pooler lb project-switchover project-failback server-switchover server-failback hard-failover fenced rejoin upgrade-refused upgrade-leader upgrade-follower status-final follower-status-final"
 CHECK_ON_FAIL=on_fail
 
 # One prefix and one domain for the cluster: a joining server takes the leader's settings, and a domain left to the
@@ -530,13 +532,60 @@ upgrade_one() {
   echo "# a row written on the primary reached the replica in $secs s"
 }
 
+# release_next: the release server signs v0.0.2, the release the upgrades move to; once, by the first check that needs it.
+release_next() {
+  [[ ! -e $WORK/state/kv/release-next ]] || return 0
+  [[ -x ${SUPAVISE_BIN_NEXT:-} ]] || fail "SUPAVISE_BIN_NEXT: a Linux build of this checkout, built with -X main.version=v0.0.2"
+  [[ $("$SUPAVISE_BIN_NEXT" --version) == *v0.0.2* ]] || fail "SUPAVISE_BIN_NEXT must report v0.0.2: $("$SUPAVISE_BIN_NEXT" --version)"
+  (cd "$REPO_ROOT" && make_release v0.0.2 "$SUPAVISE_BIN_NEXT")
+  sset release-next 1
+}
+
+# A follower writes no registry, and the backup, the rollout and the restart of a project need one: with a project of its
+# own running it is refused before anything changes (exit status 2). The check homes the second project on the follower
+# with a planned move, asks the follower to upgrade and looks at what the refusal left, then moves the project back. The
+# upgrades come after it, so that both servers still run the same release for the two moves.
+refused_cleanup() { # LEADER REF: the project is on the leader again, whatever the check did
+  onl "$1" supavise projects failover "$2" --to "$1" --yes >/dev/null 2>&1 || true
+}
+c_upgrade_refused() {
+  needs cluster-two-nodes
+  local f out rc=0
+  lead=$(lead) f=$(follower) ref=$(sget ref2) moved=""   # the trap reads these as they are when the check ends
+  release_next
+  node_push "$f" "$WORK/keys/pub.pem" /root/release-pub.pem
+  onl "$lead" wait_replicas "$ref" 1 600
+  trap '[[ -z $moved ]] || refused_cleanup "$lead" "$ref"' EXIT
+  moved=1
+  onl "$lead" supavise projects failover "$ref" --to "$f" --yes
+  onl "$lead" wait_project "$ref" ACTIVE_HEALTHY 300
+  [[ $(onl "$lead" home_of "$ref") == "$f" ]] || fail "$ref is homed on $(onl "$lead" home_of "$ref"), want the follower $f"
+  onl "$f" wait_items_rest "$ref" 100 120
+  onl "$f" unit_stamp >"$WORK/refused-$f.before"
+  out=$(on "$f" timeout 900 /usr/local/bin/supavise upgrade --repo o/r --api-base "http://$BRIDGE_IP:$RELEASE_PORT" \
+    --public-key-file /root/release-pub.pem --yes --version v0.0.2 2>&1) || rc=$?
+  log "$f: supavise upgrade with a project of its own running exited $rc: $(head -c 600 <<<"$out" | tr '\n' ' ')"
+  [[ $rc -eq 2 ]] || fail "$f: supavise upgrade exited $rc, want 2 (refused before it changed anything)"
+  grep -q 'project(s) run here' <<<"$out" || fail "$f: the refusal does not say that a project runs there: $(head -c 400 <<<"$out")"
+  grep -q "$ref" <<<"$out" || fail "$f: the refusal does not name the project $ref"
+  [[ $(on "$f" /usr/local/bin/supavise --version) == *v0.0.1* ]] || fail "$f: the binary is $(on "$f" /usr/local/bin/supavise --version) after a refusal"
+  [[ $(onl "$f" daemon_version) == *v0.0.1* ]] || fail "$f: the daemon runs $(onl "$f" daemon_version) after a refusal"
+  onl "$f" unit_stamp >"$WORK/refused-$f.after"
+  diff -u "$WORK/refused-$f.before" "$WORK/refused-$f.after" || fail "$f: a PostgreSQL cluster was restarted by a refused upgrade"
+  onl "$lead" supavise projects failover "$ref" --to "$lead" --yes
+  moved=""
+  onl "$lead" wait_project "$ref" ACTIVE_HEALTHY 300
+  [[ $(onl "$lead" home_of "$ref") == "$lead" ]] || fail "$ref is homed on $(onl "$lead" home_of "$ref"), want the leader $lead"
+  onl "$lead" wait_replicas "$ref" 1 600
+  onl "$lead" wait_items_rest "$ref" 100 120
+  echo "# $f, with $ref running on it, was refused (exit status 2) and kept its release and its clusters; $ref is on $lead again"
+}
+
 c_upgrade_leader() {
   needs cluster-two-nodes
   local lead
   lead=$(lead)
-  [[ -x ${SUPAVISE_BIN_NEXT:-} ]] || fail "SUPAVISE_BIN_NEXT: a Linux build of this checkout, built with -X main.version=v0.0.2"
-  [[ $("$SUPAVISE_BIN_NEXT" --version) == *v0.0.2* ]] || fail "SUPAVISE_BIN_NEXT must report v0.0.2: $("$SUPAVISE_BIN_NEXT" --version)"
-  (cd "$REPO_ROOT" && make_release v0.0.2 "$SUPAVISE_BIN_NEXT")
+  release_next
   upgrade_one "$lead"
   echo "# $lead (the leader) runs v0.0.2; no PostgreSQL cluster restarted"
 }
@@ -615,6 +664,7 @@ check_snap server-failback "failover makes n1 the leader again" c_server_failbac
 check_snap hard-failover "failover --force promotes n2 after n1 is stopped at once; RPO and RTO" c_hard_failover
 check fenced "n1 returns fenced and runs no primary" c_fenced
 check_snap rejoin "node rejoin brings n1 back as a follower" c_rejoin
+check upgrade-refused "supavise upgrade refuses a follower that has a project of its own running" c_upgrade_refused
 check_snap upgrade-leader "supavise upgrade of the leader restarts no PostgreSQL cluster" c_upgrade_leader
 check_snap upgrade-follower "supavise upgrade of the follower restarts no PostgreSQL cluster" c_upgrade_follower
 check status-final "supavise status is healthy on the leader" c_status_final

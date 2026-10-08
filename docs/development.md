@@ -43,6 +43,7 @@ The unpacked artifacts default to `~/.cache/sbctl/unpacked`, a path the test cod
 | `bump-proposals` | nightly; opens one pull request per upstream release newer than its pin |
 | `release` | on a `v*` tag |
 | `replication-spike` | the two-node Incus harness of `tests/linux/multi` on both architectures |
+| `replication` | `two-servers`: the two-server release test (`tests/linux/multi/replication.sh`) on both architectures: install, join, a read replica, planned and unplanned failover, rejoin, and the upgrade of both servers. Pushes to `integrate/**` and a manual run use both runners; a push to a `ws/**` branch listed in the workflow uses amd64 only |
 | `screenshots` | README screenshots |
 
 ## Conventions
