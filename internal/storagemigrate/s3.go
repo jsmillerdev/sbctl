@@ -65,18 +65,18 @@ func openS3(ctx context.Context, d Destination, c Credentials, stall time.Durati
 	tr := &pacedTransport{next: awshttp.NewBuildableClient().GetTransport(), stall: stall}
 	opts := []func(*config.LoadOptions) error{config.WithRegion(d.Region), config.WithRetryMaxAttempts(attempts),
 		config.WithHTTPClient(&http.Client{Transport: tr})}
-	switch c.Source {
-	case CredFile, CredConfig:
-		if c.AccessKeyID == "" || c.SecretAccessKey == "" {
-			return nil, errors.New("storagemigrate: the access key is incomplete")
-		}
-		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, "")))
-	case CredRole:
+	switch {
+	case c.assumesARole():
 		p, err := roleProvider(c.RoleARN)
 		if err != nil {
 			return nil, err
 		}
 		opts = append(opts, config.WithCredentialsProvider(p))
+	case c.Source == CredFile || c.Source == CredConfig:
+		if c.AccessKeyID == "" || c.SecretAccessKey == "" {
+			return nil, errors.New("storagemigrate: the access key is incomplete")
+		}
+		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, "")))
 	default:
 		return nil, fmt.Errorf("storagemigrate: unknown credentials %q", c.Source)
 	}
@@ -181,7 +181,7 @@ func (b *s3Bucket) Put(ctx context.Context, key string, src io.ReaderAt, size in
 		ContentType: str(meta.ContentType), CacheControl: str(meta.CacheControl),
 	})
 	if err != nil {
-		return fmt.Errorf("s3 put %s: %w%s", key, err, accessHint(err))
+		return fmt.Errorf("s3 put %s: %w%s", quote(key), err, accessHint(err))
 	}
 	return nil
 }
@@ -191,7 +191,7 @@ func (b *s3Bucket) putParts(ctx context.Context, key string, src io.ReaderAt, si
 		Bucket: &b.bucket, Key: &key, ContentType: str(meta.ContentType), CacheControl: str(meta.CacheControl),
 	})
 	if err != nil {
-		return fmt.Errorf("s3 create multipart upload %s: %w%s", key, err, accessHint(err))
+		return fmt.Errorf("s3 create multipart upload %s: %w%s", quote(key), err, accessHint(err))
 	}
 	defer func() {
 		if err != nil {
@@ -214,7 +214,7 @@ func (b *s3Bucket) putParts(ctx context.Context, key string, src io.ReaderAt, si
 				Body: io.NewSectionReader(src, off, length), ContentLength: aws.Int64(length),
 			})
 			if err != nil {
-				return fmt.Errorf("s3 upload part %d of %s: %w", i+1, key, err)
+				return fmt.Errorf("s3 upload part %d of %s: %w", i+1, quote(key), err)
 			}
 			done[i] = types.CompletedPart{ETag: out.ETag, PartNumber: aws.Int32(int32(i + 1))}
 			return nil
@@ -226,7 +226,7 @@ func (b *s3Bucket) putParts(ctx context.Context, key string, src io.ReaderAt, si
 	if _, err = b.c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket: &b.bucket, Key: &key, UploadId: up.UploadId, MultipartUpload: &types.CompletedMultipartUpload{Parts: done},
 	}); err != nil {
-		return fmt.Errorf("s3 complete multipart upload %s: %w", key, err)
+		return fmt.Errorf("s3 complete multipart upload %s: %w", quote(key), err)
 	}
 	return nil
 }
@@ -237,7 +237,7 @@ func (b *s3Bucket) List(ctx context.Context, prefix string, fn func(Entry) error
 	for pg.HasMorePages() {
 		page, err := pg.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("s3 list %s: %w%s", prefix, err, accessHint(err))
+			return fmt.Errorf("s3 list %s: %w%s", quote(prefix), err, accessHint(err))
 		}
 		for _, o := range page.Contents {
 			if err := fn(Entry{Key: aws.ToString(o.Key), Size: aws.ToInt64(o.Size), ModTime: aws.ToTime(o.LastModified)}); err != nil {
@@ -255,7 +255,7 @@ func (b *s3Bucket) Get(ctx context.Context, key string) (io.ReadCloser, FileMeta
 		if isNotFound(err) {
 			return nil, FileMeta{}, ErrNotFound
 		}
-		return nil, FileMeta{}, fmt.Errorf("s3 get %s: %w%s", key, err, accessHint(err))
+		return nil, FileMeta{}, fmt.Errorf("s3 get %s: %w%s", quote(key), err, accessHint(err))
 	}
 	return out.Body, FileMeta{ContentType: aws.ToString(out.ContentType), CacheControl: aws.ToString(out.CacheControl)}, nil
 }
@@ -268,7 +268,7 @@ func (b *s3Bucket) Delete(ctx context.Context, keys ...string) error {
 	for _, k := range keys {
 		g.Go(func() error {
 			if _, err := b.c.DeleteObject(gctx, &s3.DeleteObjectInput{Bucket: &b.bucket, Key: &k}); err != nil && !isNotFound(err) {
-				return fmt.Errorf("s3 delete %s: %w%s", k, err, accessHint(err))
+				return fmt.Errorf("s3 delete %s: %w%s", quote(k), err, accessHint(err))
 			}
 			return nil
 		})

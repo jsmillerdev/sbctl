@@ -286,3 +286,89 @@ func TestPlainRemote(t *testing.T) {
 		}
 	}
 }
+
+// A store that assembles a large object's parts before it answers CompleteMultipartUpload may take
+// longer than a connection that moves no data is believed to be alive. That request gets its own,
+// longer wait for the answer once its body is sent, and is not ended and started over.
+func TestTheAnswerToCompleteMultipartUploadMayTakeLongerThanAStall(t *testing.T) {
+	backend := s3mem.New()
+	if err := backend.CreateBucket("objects"); err != nil {
+		t.Fatal(err)
+	}
+	fake := gofakes3.New(backend).Server()
+	var slow, completes int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if completesMultipart(r) {
+			mu.Lock()
+			completes++
+			mu.Unlock()
+			time.Sleep(700 * time.Millisecond) // longer than the stall limit below
+			mu.Lock()
+			slow++
+			mu.Unlock()
+		}
+		fake.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	bk, err := openS3(ctx, Destination{Bucket: "objects", Endpoint: srv.URL, Region: "us-east-1", PathStyle: true},
+		Credentials{Source: CredFile, AccessKeyID: "test", SecretAccessKey: "test"}, 300*time.Millisecond, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := bk.(*s3Bucket)
+	b.tr.complete = 10 * time.Second
+	b.threshold, b.partSize = 6<<20, 5<<20
+	data := make([]byte, 11<<20)
+	if err := b.Put(ctx, "p/big/v1", bytes.NewReader(data), int64(len(data)), FileMeta{}); err != nil {
+		t.Fatalf("Put = %v (the answer to the completion took longer than a stall but is not one)", err)
+	}
+	if completes != 1 || slow != 1 {
+		t.Fatalf("%d completions, %d answered", completes, slow)
+	}
+
+	// Every other request keeps the stall limit.
+	release := make(chan struct{})
+	quiet := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	t.Cleanup(func() { close(release); quiet.CloseClientConnections(); quiet.Close() })
+	bk, err = openS3(ctx, Destination{Bucket: "objects", Endpoint: quiet.URL, Region: "us-east-1", PathStyle: true},
+		Credentials{Source: CredFile, AccessKeyID: "test", SecretAccessKey: "test"}, 300*time.Millisecond, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bk.(*s3Bucket).tr.complete = 10 * time.Second
+	if err := bk.Put(ctx, "p/x/v1", bytes.NewReader([]byte("x")), 1, FileMeta{}); !errors.Is(err, errStalled) {
+		t.Errorf("a plain Put to a store that never answers = %v", err)
+	}
+}
+
+// A key is a file name, and a file name can hold an escape sequence: the errors that carry one
+// show it quoted, as the rest of the run does.
+func TestErrorsQuoteTheKeysTheyName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "no", http.StatusForbidden) }))
+	t.Cleanup(srv.Close)
+	bk, err := openS3(ctx, Destination{Bucket: "objects", Endpoint: srv.URL, Region: "us-east-1", PathStyle: true},
+		Credentials{Source: CredFile, AccessKeyID: "test", SecretAccessKey: "test"}, time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "p/evil\x1b[31m\nname/v1"
+	check := func(what string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Errorf("%s: no error", what)
+			return
+		}
+		if strings.ContainsAny(err.Error(), "\x1b\n") {
+			t.Errorf("%s: the error holds a raw control character: %q", what, err.Error())
+		}
+	}
+	check("put", bk.Put(ctx, key, bytes.NewReader([]byte("x")), 1, FileMeta{}))
+	_, _, err = bk.Get(ctx, key)
+	check("get", err)
+	check("list", bk.List(ctx, key, func(Entry) error { return nil }))
+	check("delete", bk.Delete(ctx, key))
+	b := bk.(*s3Bucket)
+	b.threshold, b.partSize = 1, 1
+	check("multipart", b.Put(ctx, key, bytes.NewReader([]byte("xx")), 2, FileMeta{}))
+}

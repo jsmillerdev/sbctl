@@ -222,6 +222,7 @@ type fakeSettings struct {
 	useBucket int
 	useFiles  int
 	err       error
+	filesErr  error // what UseFiles returns
 	dest      Destination
 	creds     Credentials
 
@@ -251,6 +252,9 @@ func (s *fakeSettings) UseBucket(_ context.Context, d Destination, c Credentials
 
 func (s *fakeSettings) UseFiles(_ context.Context, previous string, remove bool) error {
 	s.useFiles++
+	if s.filesErr != nil {
+		return s.filesErr
+	}
 	s.backend, s.prev = previous, previous
 	if remove {
 		s.wrote = false
@@ -292,6 +296,8 @@ func (m *metaFiles) Meta(abs string) (FileMeta, error) {
 	defer m.mu.Unlock()
 	return m.meta[abs], nil
 }
+
+func (m *metaFiles) MetaOf(f *os.File) (FileMeta, error) { return m.Meta(f.Name()) }
 
 func (m *metaFiles) SetMeta(abs string, fm FileMeta) (bool, error) {
 	m.mu.Lock()

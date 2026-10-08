@@ -3,6 +3,7 @@ package storagemigrate
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -131,8 +132,55 @@ func TestWalkSkipsLinksAndIgnoresAMissingRoot(t *testing.T) {
 	if err := (OSFiles{}).Walk(context.Background(), filepath.Join(dir, "none"), nil, func(Object) error { t.Error("called"); return nil }); err != nil {
 		t.Errorf("a missing root: %v", err)
 	}
-	if _, err := openNoFollow(filepath.Join(dir, "b", "link")); err == nil {
-		t.Error("openNoFollow followed a link")
+}
+
+// The copy opens a file below the project's directory and nothing else: a leaf that is a link and a
+// parent directory swapped for a link to somewhere else are refused, and a file that is there is
+// opened whole.
+func TestOpenStaysBelowTheRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("not an object"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "b", "n"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b", "n", "v1"), []byte("object"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	f, err := OSFiles{}.Open(root, "b/n/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(f)
+	f.Close()
+	if string(b) != "object" {
+		t.Fatalf("read %q", b)
+	}
+	for name, mk := range map[string]func() error{
+		"a leaf that is a link out": func() error {
+			return os.Symlink(filepath.Join(outside, "secret"), filepath.Join(root, "b", "n", "link"))
+		},
+		"a parent that is a link out": func() error {
+			return os.Symlink(outside, filepath.Join(root, "b", "swapped"))
+		},
+	} {
+		if err := mk(); err != nil {
+			t.Skipf("no links here: %v", err)
+		}
+		rel := map[string]string{"a leaf that is a link out": "b/n/link", "a parent that is a link out": "b/swapped/secret"}[name]
+		if f, err := (OSFiles{}).Open(root, rel); err == nil {
+			f.Close()
+			t.Errorf("%s: opened %s", name, rel)
+		}
+	}
+	if f, err := (OSFiles{}).Open(root, "b/n"); err == nil {
+		f.Close()
+		t.Error("a directory was opened as an object")
+	}
+	if _, err := (OSFiles{}).Open(root, "b/n/none"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a file that is gone = %v", err)
 	}
 }
 
@@ -151,6 +199,15 @@ func TestExtendedAttributesRoundTrip(t *testing.T) {
 	m, err := OSFiles{}.Meta(p)
 	if err != nil || m.ContentType != "image/png" || m.CacheControl != "max-age=1" {
 		t.Errorf("Meta = %+v, %v", m, err)
+	}
+	// The attributes of the open file are the file's, not those of the path by the time they are read.
+	fh, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fh.Close()
+	if m, err := (OSFiles{}).MetaOf(fh); err != nil || m.ContentType != "image/png" || m.CacheControl != "max-age=1" {
+		t.Errorf("MetaOf = %+v, %v", m, err)
 	}
 	if _, err := (OSFiles{}).Meta(filepath.Join(t.TempDir(), "none")); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("Meta of a missing file: %v", err)

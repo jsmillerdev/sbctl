@@ -31,6 +31,10 @@ func serviceDir(p config.Paths) string { return p.System(config.SvcStorage) }
 // runDir is where the record of the run, its lock and the write hold are.
 func runDir(p config.Paths) string { return hold.Dir(p) }
 
+// RunDir is runDir for the command that makes the scratch directories of a preview in it: the
+// state directory is the daemon's user's, not the world's like $TMPDIR.
+func RunDir(p config.Paths) string { return runDir(p) }
+
 // objectsDir is the directory Storage's file backend writes to (STORAGE_FILE_BACKEND_PATH).
 func objectsDir(p config.Paths) string { return filepath.Join(serviceDir(p), "objects") }
 
@@ -150,12 +154,13 @@ func Describe(st *State, now time.Time) string {
 		line("copied", fmt.Sprintf("%d objects, %s, in %d passes", st.Uploaded.Files, bytesString(st.Uploaded.Bytes), st.Passes))
 	}
 	if len(st.Tenants) > 0 {
-		var rows, files, offline int
+		var rows, files, offline, unversioned int
 		var bytes int64
 		for _, t := range st.Tenants {
 			rows += t.Rows
 			files += t.Files
 			bytes += t.Bytes
+			unversioned += t.Unversioned
 			if t.Offline {
 				offline++
 			}
@@ -163,6 +168,9 @@ func Describe(st *State, now time.Time) string {
 		line("verified", fmt.Sprintf("%d objects (%s) in %d projects; %d files in the directories", rows, bytesString(bytes), len(st.Tenants)-offline, files))
 		if offline > 0 {
 			line("", fmt.Sprintf("%d projects had no running database; only their copy was checked", offline))
+		}
+		if unversioned > 0 {
+			line("", fmt.Sprintf("%d rows have no version, so their files could not be matched; the files were copied but not verified", unversioned))
 		}
 	}
 	if st.SkippedTotal > 0 {

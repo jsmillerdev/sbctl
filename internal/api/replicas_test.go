@@ -24,6 +24,7 @@ type fakeReplicas struct {
 	n        int
 	setupErr error
 	listErr  error
+	statErr  error
 	rmErr    error
 	setups   []string // "ref region" per Setup
 	removed  []string // identifiers
@@ -33,9 +34,41 @@ type fakeReplicas struct {
 	unreported map[string]bool
 	lag        map[string][]replicas.LagPoint
 	lagSince   []time.Time
+
+	// trusting makes Remove and Restart take any identifier for the project's own, as a controller
+	// that skipped its ownership check would; the handlers must not rely on that check.
+	trusting bool
+	// removeAlls are the refs RemoveAll was called for, removeAllErr what it returns (a
+	// *replicas.PendingError, say) and onRemoveAll runs when it is called.
+	removeAlls   []string
+	removeAllErr error
+	onRemoveAll  func()
 }
 
-var _ replicas.Service = (*fakeReplicas)(nil)
+var (
+	_ replicas.Service = (*fakeReplicas)(nil)
+	_ replicas.Remover = (*fakeReplicas)(nil)
+)
+
+func (f *fakeReplicas) RemoveAll(ctx context.Context, ref string) error {
+	f.mu.Lock()
+	f.removeAlls = append(f.removeAlls, ref)
+	hook, err := f.onRemoveAll, f.removeAllErr
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if err != nil {
+		return err
+	}
+	rs, _ := f.reg.ListReplicas(ctx, ref)
+	for _, r := range rs {
+		_ = f.reg.DeleteReplica(ctx, r.Identifier)
+	}
+	return nil
+}
+
+func (f *fakeReplicas) RemoveOn(context.Context, string) error { return nil }
 
 func (f *fakeReplicas) Setup(ctx context.Context, ref, region string) error {
 	f.mu.Lock()
@@ -77,7 +110,7 @@ func (f *fakeReplicas) Remove(ctx context.Context, ref, identifier string) error
 	if err != nil {
 		return err
 	}
-	if !f.owns(ctx, ref, identifier) {
+	if !f.trusting && !f.owns(ctx, ref, identifier) {
 		return replicas.ErrNotFound
 	}
 	f.mu.Lock()
@@ -87,7 +120,7 @@ func (f *fakeReplicas) Remove(ctx context.Context, ref, identifier string) error
 }
 
 func (f *fakeReplicas) Restart(ctx context.Context, ref, identifier string) error {
-	if !f.owns(ctx, ref, identifier) {
+	if !f.trusting && !f.owns(ctx, ref, identifier) {
 		return replicas.ErrNotFound
 	}
 	f.mu.Lock()
@@ -119,6 +152,12 @@ func (f *fakeReplicas) List(ctx context.Context, ref string) ([]replicas.Replica
 }
 
 func (f *fakeReplicas) Statuses(ctx context.Context, ref string) ([]replicas.Status, error) {
+	f.mu.Lock()
+	err := f.statErr
+	f.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	rs, err := f.reg.ListReplicas(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -373,7 +412,7 @@ func TestRemoveReadReplica(t *testing.T) {
 		t.Fatalf("no identifier: %d %s", rec.Code, rec.Body)
 	}
 	rf.svc.rmErr = errors.New("node unreachable: dial tcp 10.0.0.9: i/o timeout")
-	rec := rf.do("POST", removePath, map[string]any{"database_identifier": id})
+	rec := rf.do("POST", removePath, map[string]any{"database_identifier": rf.addHealthyReplica(t, euNode, "eu-west-1", "ghijkl")})
 	if rec.Code != 500 || strings.Contains(rec.Body.String(), "10.0.0.9") {
 		t.Fatalf("a controller failure is a generic 500: %d %s", rec.Code, rec.Body)
 	}
@@ -495,5 +534,170 @@ func TestProfileOffersReplicasWithASecondServer(t *testing.T) {
 	}
 	if !slices.Contains(disabledFeatures, "infrastructure:read_replicas") || !slices.Contains(disabledFeatures, "billing:all") {
 		t.Fatal("the default list lost an entry")
+	}
+}
+
+// The handlers check that the identifier is one of the project's replicas themselves, before they
+// ask the controller: with a controller that takes any identifier for granted, an admin of one
+// project still cannot remove or restart another project's replica, or the primary.
+func TestReplicaHandlersCheckOwnershipThemselves(t *testing.T) {
+	rf := newReplicaFixture(t)
+	rf.svc.trusting = true
+	mine := rf.addHealthyReplica(t, euNode, "eu-west-1", "abcdef")
+	const other = "bcdefghijklmnopqrstu"
+	rf.mgr.addProject(t, other, "Other", rf.org.ID, registry.StatusActiveHealthy)
+	theirs := registry.ReplicaIdentifier(other, "eu-west-1", "ghijkl")
+	if err := rf.reg.CreateReplica(t.Context(), &registry.Replica{Identifier: theirs, Ref: other, NodeID: euNode}); err != nil {
+		t.Fatal(err)
+	}
+	for name, ident := range map[string]string{"another project's": theirs, "the primary": testRef, "unknown": registry.ReplicaIdentifier(testRef, "eu-west-1", "zzzzzz")} {
+		for _, path := range []string{removePath, "/platform/projects/" + testRef + "/restart"} {
+			rec := rf.do("POST", path, map[string]any{"database_identifier": ident})
+			if name == "the primary" && strings.HasSuffix(path, "/restart") {
+				continue // the primary's identifier on restart restarts the project
+			}
+			if rec.Code != 404 || !strings.Contains(rec.Body.String(), "Read replica not found") {
+				t.Errorf("%s replica, POST %s: %d %s", name, path, rec.Code, rec.Body)
+			}
+		}
+	}
+	if len(rf.svc.removed) != 0 || len(rf.svc.restarts) != 0 {
+		t.Fatalf("the controller was reached: removed %v, restarted %v", rf.svc.removed, rf.svc.restarts)
+	}
+	// Its own replica still works.
+	if rec := rf.do("POST", removePath, map[string]any{"database_identifier": mine}); rec.Code != 204 {
+		t.Fatalf("own replica: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A project's delete removes its replicas first, and does not go on while a removal is pending: the
+// replicas' rows go with the project's, so the controller's retry would be lost and the instances
+// would stay on their nodes.
+func TestDeleteRemovesTheReplicasFirst(t *testing.T) {
+	for _, tc := range []struct{ name, method, path string }{
+		{"v1", "DELETE", "/v1/projects/" + testRef},
+		{"platform", "DELETE", "/platform/projects/" + testRef},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rf := newReplicaFixture(t)
+			id := rf.addHealthyReplica(t, euNode, "eu-west-1", "abcdef")
+			var deletedAtCall []string
+			rf.svc.onRemoveAll = func() { deletedAtCall = slices.Clone(rf.mgr.deleted) }
+
+			// A removal that cannot finish: refused with 409, nothing deleted, the replica still listed.
+			rf.svc.removeAllErr = &replicas.PendingError{Identifiers: []string{id}}
+			rec := rf.do(tc.method, tc.path, nil)
+			if rec.Code != 409 || !strings.Contains(rec.Body.String(), id) {
+				t.Fatalf("pending removal: %d %s", rec.Code, rec.Body)
+			}
+			if len(rf.mgr.deleted) != 0 {
+				t.Fatalf("the project was deleted while a replica was pending: %v", rf.mgr.deleted)
+			}
+
+			rf.svc.removeAllErr = nil
+			rec = rf.do(tc.method, tc.path, nil)
+			if rec.Code != 200 {
+				t.Fatalf("delete: %d %s", rec.Code, rec.Body)
+			}
+			if !slices.Equal(rf.mgr.deleted, []string{testRef}) || len(deletedAtCall) != 0 {
+				t.Fatalf("deleted %v; at the time of RemoveAll %v", rf.mgr.deleted, deletedAtCall)
+			}
+			if rs, _ := rf.reg.ListReplicas(t.Context(), testRef); len(rs) != 0 {
+				t.Fatalf("replicas left: %+v", rs)
+			}
+		})
+	}
+}
+
+// A controller that cannot remove replicas must not let a project that has some be deleted, and a
+// project with none is deleted as before.
+func TestDeleteWithAServiceThatCannotRemove(t *testing.T) {
+	rf := newReplicaFixture(t)
+	rf.srv.replicas = struct{ replicas.Service }{rf.svc}
+	if rec := rf.do("DELETE", "/v1/projects/"+testRef, nil); rec.Code != 200 {
+		t.Fatalf("no replicas: %d %s", rec.Code, rec.Body)
+	}
+	rf = newReplicaFixture(t)
+	rf.srv.replicas = struct{ replicas.Service }{rf.svc}
+	rf.addHealthyReplica(t, euNode, "eu-west-1", "abcdef")
+	if rec := rf.do("DELETE", "/v1/projects/"+testRef, nil); rec.Code != 503 || len(rf.mgr.deleted) != 0 {
+		t.Fatalf("with a replica: %d %s, deleted %v", rec.Code, rec.Body, rf.mgr.deleted)
+	}
+}
+
+// A restore in place removes the replicas first, and waits while one cannot be removed yet.
+func TestRestoreRemovesTheReplicasFirst(t *testing.T) {
+	b := newBackupFixture(t)
+	b.addNode(t, "eu", "eu-west-1", "eu.pooler.example.test", registry.NodeActive)
+	svc := &fakeReplicas{reg: b.reg, statuses: map[string]replicas.Status{}}
+	b.srv.replicas = svc
+	id := b.addHealthyReplica(t, euNode, "eu-west-1", "abcdef")
+	b.mgr.restores = make(chan restoreRecord, 4)
+	path := "/platform/database/" + testRef + "/backups/restore"
+
+	svc.removeAllErr = &replicas.PendingError{Identifiers: []string{id}}
+	rec := b.post(path, map[string]any{"id": b.midID})
+	if rec.Code != 409 || !strings.Contains(rec.Body.String(), id) {
+		t.Fatalf("pending removal: %d %s", rec.Code, rec.Body)
+	}
+	if got := b.status(); got != registry.StatusActiveHealthy {
+		t.Fatalf("the project is %s although nothing was restored", got)
+	}
+
+	svc.removeAllErr = nil
+	if rec := b.post(path, map[string]any{"id": b.midID}); rec.Code != 201 {
+		t.Fatalf("restore: %d %s", rec.Code, rec.Body)
+	}
+	b.waitRestore()
+	if rs, _ := b.reg.ListReplicas(t.Context(), testRef); len(rs) != 0 || len(svc.removeAlls) != 2 {
+		t.Fatalf("replicas left %+v after %d RemoveAll calls", rs, len(svc.removeAlls))
+	}
+}
+
+// When the controller cannot answer, the listings come from the registry rows the node has: the
+// leader may be unreachable during a failover, and the page should show the replicas it knows.
+func TestListingsFallBackToTheRegistryRows(t *testing.T) {
+	rf := newReplicaFixture(t)
+	id := rf.addReplica(t, euNode, "eu-west-1", "abcdef", "ACTIVE_HEALTHY", registry.ReplicaStepDone, "")
+	rf.svc.listErr = errors.New("replicas: the leader does not answer")
+	rf.svc.statErr = errors.New("replicas: the leader does not answer")
+
+	rec := rf.do("GET", "/platform/projects/"+testRef+"/databases", nil)
+	if rec.Code != 200 {
+		t.Fatalf("databases: %d %s", rec.Code, rec.Body)
+	}
+	rows, _ := decodeBody(t, rec).([]any)
+	if len(rows) != 2 || rows[1].(map[string]any)["identifier"] != id || rows[1].(map[string]any)["region"] != "eu-west-1" {
+		t.Fatalf("databases = %s", rec.Body)
+	}
+	rec = rf.do("GET", "/platform/projects/"+testRef+"/databases-statuses", nil)
+	if rec.Code != 200 {
+		t.Fatalf("databases-statuses: %d %s", rec.Code, rec.Body)
+	}
+	sts, _ := decodeBody(t, rec).([]any)
+	if len(sts) != 2 || sts[1].(map[string]any)["status"] != "ACTIVE_HEALTHY" ||
+		sts[1].(map[string]any)["replicaInitializationStatus"].(map[string]any)["status"] != "completed" {
+		t.Fatalf("databases-statuses = %s", rec.Body)
+	}
+}
+
+// The server a Deps builds carries the controller, the resolver and the balancer flag the handlers
+// use, so a wiring that sets Deps.Replicas is what makes the replica routes work.
+func TestNewServerTakesTheReplicaDeps(t *testing.T) {
+	f := newFixture(t)
+	svc := &fakeReplicas{reg: f.reg}
+	srv, err := NewServer(Deps{Registry: f.reg, Secrets: f.mgr.sec, Manager: f.mgr, Config: f.cfg, Replicas: svc, LoadBalancers: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.replicas == nil || !srv.lbOn || srv.placement == nil {
+		t.Fatalf("replicas %v, load balancers %v, placement %v", srv.replicas, srv.lbOn, srv.placement)
+	}
+	srv, err = NewServer(Deps{Registry: f.reg, Secrets: f.mgr.sec, Manager: f.mgr, Config: f.cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.replicas != nil || srv.lbOn {
+		t.Fatalf("a server with no controller has replicas %v and balancers %v", srv.replicas, srv.lbOn)
 	}
 }

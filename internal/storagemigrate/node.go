@@ -44,9 +44,12 @@ func (t nodeTenants) Projects(ctx context.Context) ([]Project, error) {
 	return out, nil
 }
 
-// rowsQuery lists the objects a project's Storage knows. A row without a version has no key in
-// Storage's S3 layout and is left out.
-const rowsQuery = `select bucket_id, name, version::text, metadata->>'size' from storage.objects where version is not null`
+// rowsQuery lists the objects a project's Storage knows. A row without a version (the column is
+// nullable, and an object that predates versions has none) comes back with an empty Version: the
+// migration does not know under which key Storage keeps its file or its S3 object, so it does not
+// verify that row, and counts it (Tenant.Unversioned). The copy goes by file path, so the file is
+// sent all the same.
+const rowsQuery = `select bucket_id, name, coalesce(version::text, ''), metadata->>'size' from storage.objects`
 
 func (t nodeTenants) Rows(ctx context.Context, ref string, fn func(Row) error) error {
 	dsn, err := t.dsn(ctx, ref)

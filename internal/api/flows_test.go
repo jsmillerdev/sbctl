@@ -230,7 +230,7 @@ func TestPGMetaKeyPersisted(t *testing.T) {
 	if k2, _ := srv2.pgmetaKey(nil); k2 != k1 { //nolint:staticcheck
 		t.Fatalf("key not persisted: %q vs %q", k2, k1)
 	}
-	enc, _ := srv.pgmetaConn(nil, testRef, "postgres", false) //nolint:staticcheck
+	enc, _ := srv.pgmetaConnOn(nil, "", testRef, "postgres", false) //nolint:staticcheck
 	if dsn, err := cryptojs.Decrypt(enc, k1); err != nil || dsn != f.mgr.dsn {
 		t.Fatalf("header: %q %v", dsn, err)
 	}

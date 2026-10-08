@@ -88,9 +88,10 @@ func (s *Server) databasesStatuses(w http.ResponseWriter, r *http.Request) error
 	}
 	rows := []any{map[string]any{"identifier": p.Ref, "status": databaseStatus(p.Status)}}
 	if len(rs) > 0 {
+		// Without the controller's statuses (see replicasOf) every replica shows what its row holds.
 		sts, err := s.replicas.Statuses(r.Context(), p.Ref)
 		if err != nil {
-			return mapErr(err)
+			s.log.Warn("the replica controller could not give the statuses of a project's replicas; using the registry's rows", "ref", p.Ref, "err", err)
 		}
 		byID := make(map[string]replicas.Status, len(sts))
 		for _, st := range sts {
@@ -99,7 +100,7 @@ func (s *Server) databasesStatuses(w http.ResponseWriter, r *http.Request) error
 		for _, rep := range rs {
 			st, ok := byID[rep.Identifier]
 			if !ok {
-				// The controller has not caught up with a row it has just been given.
+				// The controller has not caught up with a row it has just been given, or could not answer.
 				st = replicas.Status{Identifier: rep.Identifier, Status: rep.Status, Init: initFromRow(rep.Replica)}
 			}
 			row := map[string]any{"identifier": rep.Identifier, "status": st.Status}

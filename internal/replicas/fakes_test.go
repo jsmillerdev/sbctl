@@ -75,6 +75,11 @@ type fakeNodes struct {
 	script func(*fakeInstance)
 	// gate, when set, holds every Observe until it is closed.
 	gate chan struct{}
+	// doBlock makes Do wait until its context ends, then fail with the context's error: a node
+	// that does not answer a restart.
+	doBlock bool
+	// ensureGate, when set, holds every Ensure until it is closed.
+	ensureGate chan struct{}
 }
 
 func newFakeNodes() *fakeNodes {
@@ -109,9 +114,15 @@ func (f *fakeNodes) record(s string) { f.calls = append(f.calls, s) }
 
 func (f *fakeNodes) Ensure(_ context.Context, node string, spec peerapi.InstanceSpec) (peerapi.InstanceStatus, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.record("ensure " + node + " " + spec.Identifier)
 	f.ensured = append(f.ensured, spec)
+	gate := f.ensureGate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.down[node] {
 		return peerapi.InstanceStatus{}, fmt.Errorf("mesh: no session to node %s", node)
 	}
@@ -170,7 +181,14 @@ func (f *fakeNodes) Remove(_ context.Context, node, identifier string) error {
 	return nil
 }
 
-func (f *fakeNodes) Do(_ context.Context, node, identifier string, a peerapi.Action, _ peerapi.InstanceAction) (peerapi.InstanceStatus, error) {
+func (f *fakeNodes) Do(ctx context.Context, node, identifier string, a peerapi.Action, _ peerapi.InstanceAction) (peerapi.InstanceStatus, error) {
+	f.mu.Lock()
+	block := f.doBlock
+	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return peerapi.InstanceStatus{}, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(string(a) + " " + node + " " + identifier)
@@ -203,6 +221,53 @@ func (f *fakeNodes) callsMatching(prefix string) int {
 		}
 	}
 	return n
+}
+
+// hookRegistry is a registry a test can break: it fails the status writes it is told to, counts
+// the reads of a node's replicas and lets a test run code just after a replica row was inserted.
+type hookRegistry struct {
+	registry.Registry
+	mu         sync.Mutex
+	failStatus error
+	listOn     int
+	beforeAdd  func()
+	afterAdd   func()
+}
+
+func (h *hookRegistry) SetReplicaStatus(ctx context.Context, id, status, step, code string) error {
+	h.mu.Lock()
+	err := h.failStatus
+	h.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return h.Registry.SetReplicaStatus(ctx, id, status, step, code)
+}
+
+func (h *hookRegistry) ListReplicasOn(ctx context.Context, node string) ([]registry.Replica, error) {
+	h.mu.Lock()
+	h.listOn++
+	h.mu.Unlock()
+	return h.Registry.ListReplicasOn(ctx, node)
+}
+
+func (h *hookRegistry) CreateReplica(ctx context.Context, r *registry.Replica) error {
+	if h.beforeAdd != nil {
+		h.beforeAdd()
+	}
+	if err := h.Registry.CreateReplica(ctx, r); err != nil {
+		return err
+	}
+	if h.afterAdd != nil {
+		h.afterAdd()
+	}
+	return nil
+}
+
+func (h *hookRegistry) reads() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.listOn
 }
 
 // fakeBackups is backup.BaseBackupEnsurer.
@@ -329,6 +394,7 @@ type env struct {
 	ctrl    *Controller
 	members *cluster.Static
 	opts    Options
+	idMu    sync.Mutex
 	ids     int
 }
 
@@ -354,7 +420,12 @@ func newEnv(t *testing.T, mutate ...func(*Options)) *env {
 	e.opts = Options{
 		Registry: e.reg, Config: e.cfg, Log: slog.New(slog.DiscardHandler), Members: e.members, Ops: e.nodes, Backups: e.bk,
 		Pooler: e.pool, Admit: e.admit, Alert: e.alerts.add, Now: e.clock.Now, Interval: 10 * time.Second,
-		NewID: func() string { e.ids++; return fmt.Sprintf("%06d", e.ids) },
+		NewID: func() string {
+			e.idMu.Lock()
+			defer e.idMu.Unlock()
+			e.ids++
+			return fmt.Sprintf("%06d", e.ids)
+		},
 	}
 	for _, m := range mutate {
 		m(&e.opts)

@@ -5,14 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path"
-	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
+	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -61,13 +61,21 @@ func (c *Controller) admit(ctx context.Context, nodes []registry.Node, projects 
 		}
 	}
 	hosted := map[string][]registry.Project{}
-	waiting := map[string]int{}      // node -> replicas at 0_requested that could start
+	waiting := map[string]int{}      // node -> replicas at 0_requested that could start, or admitted after a refusal and not launched yet
 	cleared := map[string]bool{}     // node -> one was admitted this pass
 	blocked := map[string][]string{} // node -> refs that wait for room
 	reasons := map[string]string{}
 	seeds := map[string]int64{}
 	for i := range rows {
 		r := &rows[i]
+		if settingUp(r) && r.Origin != registry.ReplicaSystem && r.InitStep == StepStarted && c.roomRefusal(r.Identifier) != nil {
+			// Admitted again after the node refused it, and the node has not taken it yet: the
+			// node is still the one this replica waits for, so its alert stays open.
+			if n := nodeByID[r.NodeID]; n.ID != "" {
+				waiting[n.ID]++
+			}
+			continue
+		}
 		if !settingUp(r) || r.Origin == registry.ReplicaSystem || r.InitStep != StepRequested {
 			continue
 		}
@@ -113,7 +121,9 @@ func (c *Controller) admit(ctx context.Context, nodes []registry.Node, projects 
 
 // hostedOn lists what node holds room for: the projects homed there and, for each replica there
 // that is past admission, the replica's project under its identifier. The replica exclude is
-// the one being admitted.
+// the one being admitted. The standby of the system cluster is not counted: the capacity
+// accounting leaves the system project out, and a stand-in under the replica's identifier would
+// make its 1 GiB class count as a hosted project.
 func hostedOn(node string, projects []registry.Project, rows []registry.Replica, exclude string) []registry.Project {
 	var out []registry.Project
 	byRef := make(map[string]registry.Project, len(projects))
@@ -124,7 +134,7 @@ func hostedOn(node string, projects []registry.Project, rows []registry.Replica,
 		}
 	}
 	for _, r := range rows {
-		if r.NodeID != node || r.Identifier == exclude || (settingUp(&r) && r.InitStep == StepRequested) {
+		if r.NodeID != node || r.Identifier == exclude || r.Origin == registry.ReplicaSystem || (settingUp(&r) && r.InitStep == StepRequested) {
 			continue
 		}
 		if p, ok := byRef[r.Ref]; ok {
@@ -199,7 +209,7 @@ func (c *Controller) launch(ctx context.Context, r *registry.Replica) {
 		c.stepError(ctx, r, "launch", fmt.Errorf("base backup: %w", err), false)
 		return
 	}
-	spec := peerapi.InstanceSpec{Identifier: r.Identifier, Ref: r.Ref, BackupID: backupID(bk), Epoch: epoch}
+	spec := peerapi.InstanceSpec{Identifier: r.Identifier, Ref: r.Ref, BackupID: backup.BackupIDOf(bk), Epoch: epoch}
 	st, err := c.o.Ops.Ensure(ctx, r.NodeID, spec)
 	if noRoom(err) {
 		c.waitForRoom(ctx, r, err)
@@ -230,8 +240,10 @@ const roomRetry = time.Minute
 // RoomError is what InstanceOps.Ensure returns when the node refused the replica because it has no
 // room for it (memory, cores or disk), before it created anything. The replica then waits at
 // 0_requested with a replica_capacity alert, as for a node the leader knows to be full, instead of
-// failing its setup. The *lifecycle.CapacityError a node's admission produces counts as one, so
-// does any error with a NoRoom method that says so, and both are found through wrapping.
+// failing its setup. Three kinds of error count, found through any wrapping: placement.ErrNoRoom,
+// which is what the node's agent answers with (507) and the leader's remote calls give back; the
+// *lifecycle.CapacityError a local admission produces; and any error with a NoRoom method that
+// says so.
 type RoomError interface {
 	error
 	NoRoom() bool
@@ -243,7 +255,7 @@ func noRoom(err error) bool {
 		return false
 	}
 	var ce *lifecycle.CapacityError
-	if errors.As(err, &ce) {
+	if errors.Is(err, placement.ErrNoRoom) || errors.As(err, &ce) {
 		return true
 	}
 	var re RoomError
@@ -271,15 +283,6 @@ func (c *Controller) waitForRoom(ctx context.Context, r *registry.Replica, err e
 	if c.setStatus(ctx, r.Identifier, registry.ReplicaInit, StepRequested, "") {
 		c.log.Info("replicas: the node has no room for the replica, it waits", "identifier", r.Identifier, "node", r.NodeID, "reason", err.Error())
 	}
-}
-
-// backupID is the id of a base backup, the last element of its location, which is what
-// InstanceSpec.BackupID takes. Empty when the row has no location.
-func backupID(b *registry.Backup) string {
-	if b == nil || b.Location == "" {
-		return ""
-	}
-	return path.Base(strings.TrimRight(b.Location, "/"))
 }
 
 // boundStep limits a step an agent reports to the ones it can reach by itself: the leader writes
@@ -312,8 +315,7 @@ func (c *Controller) watch(ctx context.Context, r *registry.Replica) {
 		}
 	default:
 		step := laterStep(r.InitStep, boundStep(st.Step))
-		if step != r.InitStep {
-			c.advance(ctx, r, step)
+		if step != r.InitStep && c.advance(ctx, r, step) {
 			r.InitStep = step
 		}
 		if stepIndex(st.Step) >= stepIndex(StepDone) && st.PostgresUp && st.PostgRESTReady && st.InRecovery {
@@ -392,15 +394,17 @@ func (c *Controller) finish(ctx context.Context, r *registry.Replica) {
 	}
 }
 
-// advance writes the step the setup reached.
-func (c *Controller) advance(ctx context.Context, r *registry.Replica, step string) {
+// advance writes the step the setup reached, and reports whether the row now holds it.
+func (c *Controller) advance(ctx context.Context, r *registry.Replica, step string) bool {
 	if step == r.InitStep {
-		return
+		return false
 	}
 	if c.setStatus(ctx, r.Identifier, registry.ReplicaInit, step, "") {
 		c.log.Info("replicas: setup step", "identifier", r.Identifier, "step", step)
 		c.stepReached(r.Identifier, step)
+		return true
 	}
+	return false
 }
 
 // stepError handles a failed call at a step: it is tried again later unless it can never work or

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -40,6 +41,11 @@ const (
 	// credentialsWarnEvery bounds how often a failing STS call is logged: Storage retries a refused
 	// request ten times.
 	credentialsWarnEvery = 30 * time.Second
+	// credentialsCallTimeout bounds one call to STS. The call has a context of its own, not the
+	// request's: a client that gives up (the container-credential fetch of an AWS SDK has a short
+	// timeout) must not cancel the call in flight, or a first call slower than that timeout would be
+	// cancelled by every retry and the cache would never fill.
+	credentialsCallTimeout = 15 * time.Second
 )
 
 // StorageCredentialsURL is the endpoint supavise-storage is pointed at.
@@ -90,10 +96,21 @@ func StorageCredentialToken(cfg *config.Config) (string, error) {
 		return "", err
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if errors.Is(err, fs.ErrPermission) {
+		// A file another user made: a render run as root creates it root:root 0600, and the daemon
+		// cannot open it, so its endpoint would never start. The directory is the daemon's, and a
+		// directory's owner may replace what is in it; the token that file held is replaced with
+		// the new one, which the next render hands to Storage (one restart of Storage, once).
+		if rerr := os.Remove(path); rerr != nil {
+			return "", fmt.Errorf("fleet: credential token: %s belongs to another user and cannot be replaced: %w", path, rerr)
+		}
+		f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	}
 	if err != nil {
 		return "", fmt.Errorf("fleet: credential token: %w", err)
 	}
 	defer f.Close()
+	chownLikeDir(f, filepath.Dir(path))
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		return "", fmt.Errorf("fleet: credential token: %w", err)
 	}
@@ -122,6 +139,22 @@ func StorageCredentialToken(cfg *config.Config) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(raw), nil
+}
+
+// chownLikeDir gives f the owner of dir when this process runs as root, so that a token made by a
+// render that was run with sudo can be read by the daemon, which runs as the unit's user and owns
+// the directory.
+func chownLikeDir(f *os.File, dir string) {
+	if os.Geteuid() != 0 {
+		return
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		_ = f.Chown(int(st.Uid), int(st.Gid))
+	}
 }
 
 // ---- the endpoint -------------------------------------------------------------------------
@@ -214,9 +247,11 @@ func (s *StorageCredentials) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	c, err := s.src.Retrieve(r.Context())
+	c, err := s.retrieve(r.Context())
 	if err != nil {
-		s.warn(err)
+		if r.Context().Err() == nil {
+			s.warn(err)
+		}
 		http.Error(w, "the role's credentials are not available", http.StatusBadGateway)
 		return
 	}
@@ -232,17 +267,64 @@ func (s *StorageCredentials) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// retrieve asks the source for the role's credentials on a context that ends after
+// credentialsCallTimeout and not with the request: when the client leaves, the call goes on and
+// fills the cache for the next request. The request is answered when the call is, or when the
+// client's context ends.
+func (s *StorageCredentials) retrieve(ctx context.Context) (awsapi.Credentials, error) {
+	type result struct {
+		c   awsapi.Credentials
+		err error
+	}
+	done := make(chan result, 1)
+	call, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialsCallTimeout)
+	go func() {
+		defer cancel()
+		c, err := s.src.Retrieve(call)
+		done <- result{c, err}
+	}()
+	select {
+	case r := <-done:
+		return r.c, r.err
+	case <-ctx.Done():
+		return awsapi.Credentials{}, ctx.Err()
+	}
+}
+
+// warm assumes the role once, so that the first request of supavise-storage after the daemon starts
+// finds the credentials in the cache, and a role the node cannot assume shows in the log at start.
+func (s *StorageCredentials) warm() {
+	if _, err := s.retrieve(context.Background()); err != nil {
+		s.warn(err)
+	}
+}
+
 func (s *StorageCredentials) warn(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if t := s.now(); t.Sub(s.lastWarn) >= credentialsWarnEvery {
 		s.lastWarn = t
-		s.log.Warn("storage credentials: assuming the role failed; supavise-storage cannot reach its bucket until it works", "role", s.arn, "error", err)
+		s.log.Warn("storage credentials: assuming the role failed; supavise-storage cannot reach its bucket until it works", "role", s.arn, "cause", causeOf(err), "error", err)
 	}
+}
+
+// causeOf names the usual reasons the instance's own credentials, which AssumeRole is signed with,
+// are missing. awsapi's errors are compared with errors.Is, never by their text.
+func causeOf(err error) string {
+	switch {
+	case errors.Is(err, awsapi.ErrNoCredentials):
+		return "this node has no AWS credentials to assume the role with: it needs an instance role"
+	case errors.Is(err, awsapi.ErrIMDSDisabled):
+		return "the instance metadata service is disabled for the daemon, so it has no instance role"
+	case errors.Is(err, awsapi.ErrIMDSUnreachable):
+		return "the instance metadata service did not answer"
+	}
+	return ""
 }
 
 // Serve answers on ln until ctx ends.
 func (s *StorageCredentials) Serve(ctx context.Context, ln net.Listener) error {
+	go s.warm()
 	srv := &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: time.Minute,
 		ErrorLog: slog.NewLogLogger(s.log.Handler(), slog.LevelDebug)}
 	done := make(chan struct{})

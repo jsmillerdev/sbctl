@@ -257,6 +257,19 @@ func TestVanitySubdomainAPI(t *testing.T) {
 	if code, _ := check(testRef, "no good"); code != 400 {
 		t.Fatalf("check malformed: %d", code)
 	}
+	// The hosts of replicas and balancers (design 2.7.1) are reserved, so a project cannot take
+	// the name of another project's balancer, <ref>-lb.
+	for _, name := range []string{secondRef + "-lb", "shop-lb", testRef + "-rr-eu-west-1-abc123", "my-rr-name", "SHOP-LB"} {
+		if code, av := check(testRef, name); code != 201 || av != false {
+			t.Errorf("check %q: %d %v", name, code, av)
+		}
+		if rec := f.do("POST", "/v1/projects/"+testRef+"/vanity-subdomain/activate", map[string]any{"vanity_subdomain": name}); rec.Code != 400 || !strings.Contains(rec.Body.String(), "reserved") {
+			t.Errorf("activate %q: %d %s", name, rec.Code, rec.Body)
+		}
+	}
+	if code, av := check(testRef, "lb-shop"); code != 201 || av != true {
+		t.Errorf("a name that only starts with lb: %d %v", code, av)
+	}
 
 	rec = f.do("POST", p+"/activate", map[string]any{"vanity_subdomain": "Acme"})
 	if rec.Code != 201 || mapAt(t, decodeBody(t, rec), "custom_domain") != "acme.api.example.test" {

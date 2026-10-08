@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/mesh"
-	"github.com/supavise/supavise/internal/registry"
 )
+
+// fleet.ReplicaPooler is the Pooler the controller is wired with. fleet cannot import this package
+// (it depends on fleet through lifecycle), so the check is here.
+var _ Pooler = fleet.ReplicaPooler{}
 
 // A node's refusal is final when it understood the request and said no; a busy node, a conflict
 // with another change and a lost session are tried again.
@@ -21,21 +25,6 @@ func TestTerminal(t *testing.T) {
 		if got := terminal(err); got != want {
 			t.Errorf("terminal(%v) = %v, want %v", err, got, want)
 		}
-	}
-}
-
-func TestBackupID(t *testing.T) {
-	for in, want := range map[string]string{
-		"s3://bucket/ref/base/20261008T110000Z/":  "20261008T110000Z",
-		"file:///var/backups/ref/base/20261008T1": "20261008T1",
-		"": "",
-	} {
-		if got := backupID(&registry.Backup{Location: in}); got != want {
-			t.Errorf("backupID(%q) = %q, want %q", in, got, want)
-		}
-	}
-	if backupID(nil) != "" {
-		t.Error("backupID(nil)")
 	}
 }
 

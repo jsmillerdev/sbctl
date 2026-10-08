@@ -260,6 +260,8 @@ done
 # The read-only connection string the databases listing hands Studio names hosted's read-only user
 # (the API never connects as it); the shipped Postgres creates it, with login, bypassrls and pg_read_all_data.
 [[ $(sql "select r.rolcanlogin and r.rolbypassrls and pg_has_role(r.oid, 'pg_read_all_data', 'member') from pg_roles r where r.rolname = 'supabase_read_only_user'") == t ]] || fail "supabase_read_only_user is missing, or lacks login, bypassrls or pg_read_all_data, in the pinned Postgres"
+# Its sessions open read-only (the Go test of the SQL text in internal/api skips in CI, so this is where it is checked).
+[[ $(sql "select coalesce('default_transaction_read_only=on' = any(r.rolconfig), false) from pg_roles r where r.rolname = 'supabase_read_only_user'") == t ]] || fail "supabase_read_only_user does not open its sessions with default_transaction_read_only = on in the pinned Postgres"
 # The login role the CLI uses for `db dump` is the read-only one, even when read-write is asked.
 LR=$(body "${PAT[ro]}" POST "$CFG/cli/login-role" '{"read_only":false}')
 [[ $(json_get 'd["role"].startswith("supavise_cli_ro_")' <<<"$LR") == True ]] || fail "read-only member got a read-write login role: $LR"

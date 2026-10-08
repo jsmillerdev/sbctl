@@ -980,3 +980,161 @@ func TestLinksAreReportedByTheirPathBelowTheProject(t *testing.T) {
 		t.Errorf("skipped: %+v", st.Skipped)
 	}
 }
+
+// A run killed after it renamed the files and before it saved the new name has only KeepAs, which
+// is written before the rename. A rollback finds the files there and puts them back, and does not
+// fetch every object from the bucket into an empty directory and leave the files orphaned.
+func TestRollbackFindsTheFilesByKeepAsWhenTheRenameWasNotRecorded(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	mustf(t, e.engine().Migrate(ctx, e.req()), "migrate")
+	st := e.state()
+	kept := st.Retained
+	if kept == "" || st.KeepAs != kept || !e.exists(kept) {
+		t.Fatalf("state: %+v", st)
+	}
+	st.Phase, st.Step, st.Retained, st.RetainUntil = PhaseFlipping, stepStarted, "", time.Time{}
+	mustf(t, saveState(e.paths, st, time.Now()), "save")
+
+	mustf(t, e.engine().Rollback(ctx, e.req()), "rollback")
+	after := e.state()
+	if after.Phase != PhaseRolledBack || after.Downloaded.Files != 0 {
+		t.Fatalf("the rollback fetched %d objects although the files were there: %+v", after.Downloaded.Files, after)
+	}
+	if e.exists(kept) {
+		t.Errorf("%s is still there: the files were not moved back", kept)
+	}
+	if len(treeOf(t, e.paths.StorageObjects(refA))) != 3 || len(treeOf(t, e.paths.StorageObjects(refB))) != 2 {
+		t.Errorf("files after the rollback: %v", treeOf(t, filepath.Join(e.paths.System("storage"), "objects")))
+	}
+}
+
+// A row without a version has no key the migration can look for. The verification does not count it
+// against the project and does not stop at it, its file is copied by path like every other, and the
+// run says how many rows it could not match.
+func TestRowsWithoutAVersionAreCountedNotVerified(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	e.write(refA, "avatars/legacy.txt", []byte("an object that predates versions"), "text/plain")
+	e.tenants.mu.Lock()
+	e.tenants.rows[refA] = append(e.tenants.rows[refA], Row{Bucket: "avatars", Name: "legacy.txt", Version: "", Size: 32, HasSize: true})
+	e.tenants.mu.Unlock()
+	mustf(t, e.engine().Migrate(ctx, e.req()), "migrate")
+	st := e.state()
+	if st.Phase != PhaseDone {
+		t.Fatalf("phase %s: %s", st.Phase, st.Error)
+	}
+	var tn Tenant
+	for _, x := range st.Tenants {
+		if x.Ref == refA {
+			tn = x
+		}
+	}
+	if tn.Unversioned != 1 || tn.Orphans != 0 || tn.Rows != 3 || tn.Files != 4 {
+		t.Fatalf("tenant: %+v", tn)
+	}
+	if _, ok := e.bucket.objs[refA+"/avatars/legacy.txt"]; !ok {
+		t.Errorf("the file of the row without a version was not copied: %v", e.keyList())
+	}
+	if out := e.out.String(); !strings.Contains(out, "1 rows have no version") {
+		t.Errorf("the run did not say so:\n%s", out)
+	}
+	if d := Describe(st, time.Now()); !strings.Contains(d, "no version") {
+		t.Errorf("status:\n%s", d)
+	}
+}
+
+// A rollback that stopped after it had copied everything back and switched the configuration only has
+// Storage to start. It asks for no credentials and does not open the bucket, so a credentials file that
+// was deleted since the first run is not in the way.
+func TestResumeOfARollbackPastTheCopyNeedsNoCredentials(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	mustf(t, e.engine().Migrate(ctx, e.req()), "migrate")
+	e.svc.mu.Lock()
+	e.svc.startErr = errors.New("systemd is busy")
+	e.svc.mu.Unlock()
+	if err := e.engine().Rollback(ctx, e.req()); err == nil {
+		t.Fatal("Rollback worked although Storage did not start")
+	}
+	st := e.state()
+	if st.Phase != PhaseRollingBack || st.Step != stepSwitched || st.NeedsBucket() {
+		t.Fatalf("state: %+v (needs the bucket: %v)", st, st.NeedsBucket())
+	}
+	e.svc.mu.Lock()
+	e.svc.startErr = nil
+	e.svc.mu.Unlock()
+	opens := e.opens
+	mustf(t, e.engine().Resume(ctx, Request{RateMiB: -1}), "resume with no credentials")
+	if e.opens != opens {
+		t.Errorf("the bucket was opened %d more times", e.opens-opens)
+	}
+	if after := e.state(); after.Phase != PhaseRolledBack {
+		t.Fatalf("phase %s", after.Phase)
+	}
+
+	// Before the copy back is done the bucket is needed.
+	for _, s := range []*State{
+		{Phase: PhaseRollingBack, Step: stepHold}, {Phase: PhaseRollingBack, Step: stepFinal}, {Phase: PhaseRollingBack, Step: stepFence},
+		{Phase: PhaseRollingBack}, {Phase: PhaseCopying}, {Phase: PhaseFlipping, Step: stepSwitched}, {Phase: PhaseDone},
+	} {
+		if !s.NeedsBucket() {
+			t.Errorf("%s/%s does not need the bucket", s.Phase, s.Step)
+		}
+	}
+	if (&State{Phase: PhaseRollingBack, Step: stepStarted}).NeedsBucket() {
+		t.Error("a rollback past the switch needs the bucket")
+	}
+}
+
+// When Storage did not start on the bucket and the configuration cannot be put back on the files,
+// starting Storage would bring it up on the bucket. It stays stopped, the run stays in the switch, and
+// --resume finishes it once the cause is gone.
+func TestStorageStaysStoppedWhenTheConfigurationCannotBePutBack(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	boom := errors.New("boom")
+	e.svc.onStart = func() {
+		if e.set.backend == "s3" {
+			e.svc.startErr = boom
+		}
+	}
+	e.set.filesErr = errors.New("config.toml is read-only")
+	err := e.engine().Migrate(ctx, e.req())
+	if err == nil || !strings.Contains(err.Error(), "left stopped") || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("Migrate = %v", err)
+	}
+	if got := e.svc.log(); got != "stop,start" { // the one start that failed on the bucket; none after it
+		t.Fatalf("service calls: %s", got)
+	}
+	st := e.state()
+	if st.Phase != PhaseFlipping || st.Step != stepSwitched && st.Step != stepFence {
+		t.Fatalf("state: %s/%s", st.Phase, st.Step)
+	}
+	e.svc.onStart, e.svc.startErr, e.set.filesErr = nil, nil, nil
+	mustf(t, e.engine().Resume(ctx, e.req()), "resume")
+	if after := e.state(); after.Phase != PhaseDone || e.set.backend != "s3" {
+		t.Fatalf("after the resume: %+v, backend %s", after, e.set.backend)
+	}
+}
+
+// With a role, a daemon that started before the role was in the configuration serves Storage no
+// credentials; the first read through Storage fails, and the error says what to do. With a key it
+// says nothing about it.
+func TestAFailedFirstReadWithARoleSaysToRestartTheDaemon(t *testing.T) {
+	e := newEnv(t)
+	e.populate()
+	e.rd.err = errors.New("HTTP 500: could not load credentials")
+	req := e.req()
+	req.Credentials = Credentials{Source: CredRole, RoleARN: "arn:aws:iam::1:role/storage"}
+	err := e.engine().Migrate(ctx, req)
+	if err == nil || !strings.Contains(err.Error(), "systemctl restart supavise.service") || !strings.Contains(err.Error(), "--resume") {
+		t.Fatalf("Migrate with a role = %v", err)
+	}
+	e = newEnv(t)
+	e.populate()
+	e.rd.err = errors.New("HTTP 500")
+	if err := e.engine().Migrate(ctx, e.req()); err == nil || strings.Contains(err.Error(), "systemctl restart") {
+		t.Fatalf("Migrate with a key = %v", err)
+	}
+}

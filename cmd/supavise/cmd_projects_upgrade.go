@@ -143,13 +143,21 @@ func printPlan(w io.Writer, rows []upgradeRow) {
 	t.Flush()
 }
 
-// confirm asks on a terminal, and refuses to guess when stdin is not one.
-func confirm(cmd *cobra.Command, question string) error {
+// confirm asks on a terminal, and refuses to guess when stdin is not one. verb finishes the hint
+// the refusal gives ("to upgrade" for "run it again with --yes to upgrade without being asked").
+// An input that ends before an answer comes (stdin is /dev/null, which is a character device but no
+// terminal) gets the same hint.
+func confirm(cmd *cobra.Command, question, verb string) error {
+	hint := fmt.Errorf("nothing was changed; run it again with --yes to %s without being asked", verb)
 	if fi, err := os.Stdin.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
-		return errors.New("nothing was changed; run it again with --yes to upgrade without being asked")
+		return hint
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "%s [y/N] ", question)
-	line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+	line, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+	if line == "" && err != nil {
+		fmt.Fprintln(cmd.OutOrStdout())
+		return hint
+	}
 	if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
 		return errors.New("nothing was changed")
 	}
@@ -312,7 +320,7 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 		return nil
 	}
 	if !upYes {
-		if err := confirm(cmd, fmt.Sprintf("Upgrade %d project(s)?", len(todo))); err != nil {
+		if err := confirm(cmd, fmt.Sprintf("Upgrade %d project(s)?", len(todo)), "upgrade"); err != nil {
 			return err
 		}
 	}

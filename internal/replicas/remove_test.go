@@ -3,6 +3,7 @@ package replicas
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -201,9 +202,12 @@ func TestRemoveAllAndRemoveOn(t *testing.T) {
 		t.Fatal("the controller did not finish the removal")
 	}
 
-	// RemoveOn: node rm. The node's system standby goes too.
+	// RemoveOn: node rm, after the node left. The node's system standby goes too.
 	sys := e.systemReplica("n2")
 	e.settle(refB, "n2")
+	if err := e.reg.SetNodeState(e.ctx, "n2", registry.NodeLeft); err != nil {
+		t.Fatal(err)
+	}
 	if err := e.ctrl.RemoveOn(e.ctx, "n2"); err != nil {
 		t.Fatal(err)
 	}
@@ -369,5 +373,128 @@ func TestRemoveAllWaitsUntilTheWorkerIsDone(t *testing.T) {
 	}
 	if e.hasReplica(refA, "n2") || e.nodes.get("n2", r.Identifier) != nil {
 		t.Fatal("not removed")
+	}
+}
+
+// node rm leaves the node first. RemoveOn on a node that is still active would let the default
+// reconciler make the replicas again, so it says no and removes nothing.
+func TestRemoveOnRefusesAnActiveNode(t *testing.T) {
+	e := newEnv(t)
+	e.activeReplica()
+	if err := e.ctrl.RemoveOn(e.ctx, "n2"); err == nil || !strings.Contains(err.Error(), "still active") {
+		t.Fatalf("RemoveOn of an active node = %v", err)
+	}
+	if !e.hasReplica(refA, "n2") || e.nodes.callsMatching("remove n2") != 0 {
+		t.Fatal("something was removed")
+	}
+}
+
+// The standby of the system cluster is the node's own registry copy. A node that is fenced is
+// not gone, so removing its replicas must not send a remove for that standby: the row goes and
+// the cluster stays; the project's replica on the node is removed as usual.
+func TestRemoveOnNeverWipesTheSystemStandbyOfALiveNode(t *testing.T) {
+	e := newEnv(t)
+	sys := e.systemReplica("n2")
+	id := e.activeReplica().Identifier
+	if err := e.reg.SetNodeState(e.ctx, "n2", registry.NodeFenced); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ctrl.RemoveOn(e.ctx, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	if rs, _ := e.reg.ListReplicasOn(e.ctx, "n2"); len(rs) != 0 {
+		t.Fatalf("rows left: %+v", rs)
+	}
+	if e.nodes.callsMatching("remove n2 "+id) != 1 {
+		t.Fatalf("the project's replica was not removed on its node: %v", e.nodes.calls)
+	}
+	if e.nodes.callsMatching("remove n2 "+sys.Identifier) != 0 {
+		t.Fatalf("the system standby was sent to the node for removal: %v", e.nodes.calls)
+	}
+	if len(e.pool.removed) != 1 || e.pool.removed[0] != id {
+		t.Fatalf("pooler removals: %v", e.pool.removed)
+	}
+}
+
+// A registry that refuses a write is not an unknown replica, and a removal that could not even be
+// recorded is not a removal: the callers that guard a project delete must hear about it.
+func TestRegistryErrorsAreNotTakenForAGoneRow(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.Registry = &hookRegistry{Registry: o.Registry} })
+	h := e.opts.Registry.(*hookRegistry)
+	id := e.activeReplica().Identifier
+	refusing := errors.New("registry: the node follows another")
+	h.failStatus = refusing
+
+	if err := e.ctrl.Remove(e.ctx, refA, id); !errors.Is(err, refusing) || errors.Is(err, ErrNotFound) {
+		t.Fatalf("Remove = %v", err)
+	}
+	if err := e.ctrl.Restart(e.ctx, refA, id); !errors.Is(err, refusing) || errors.Is(err, ErrNotFound) {
+		t.Fatalf("Restart = %v", err)
+	}
+	var pe *PendingError
+	if err := e.ctrl.RemoveAll(e.ctx, refA); !errors.As(err, &pe) || len(pe.Identifiers) != 1 || pe.Identifiers[0] != id {
+		t.Fatalf("RemoveAll = %v", err)
+	}
+	if !e.hasReplica(refA, "n2") || e.nodes.callsMatching("remove ") != 0 {
+		t.Fatal("the replica was removed although the registry never recorded it")
+	}
+	if got := e.replica(refA, "n2").Status; got != statusHealthy {
+		t.Fatalf("status %s", got)
+	}
+
+	// Once the registry takes writes again, the same calls work.
+	h.failStatus = nil
+	if err := e.ctrl.RemoveAll(e.ctx, refA); err != nil {
+		t.Fatal(err)
+	}
+	if e.hasReplica(refA, "n2") {
+		t.Fatal("not removed")
+	}
+}
+
+// A restart whose call to the node times out still records the failure: the status and the alert
+// are written under a context of their own, not the one that just ran out.
+func TestRestartThatTimesOutIsRecorded(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.Timeouts.Restart = 30 * time.Millisecond })
+	r := e.activeReplica()
+	e.nodes.doBlock = true
+	if err := e.ctrl.Restart(e.ctx, refA, r.Identifier); err != nil {
+		t.Fatal(err)
+	}
+	e.ctrl.wg.Wait()
+	if got := e.replica(refA, "n2").Status; got != statusUnhealthy {
+		t.Fatalf("status %s: the failure of a restart that timed out was not written", got)
+	}
+	if e.alerts.count(alerts.KindReplicaUnhealthy, false) != 1 {
+		t.Fatalf("alerts: %+v", e.alerts.evs)
+	}
+}
+
+// A restart cut off by the daemon stopping says nothing: the node may have restarted the units, and
+// the next daemon looks at the replica again.
+func TestRestartInterruptedByShutdownRaisesNothing(t *testing.T) {
+	e := newEnv(t)
+	r := e.activeReplica()
+	e.nodes.doBlock = true
+	ctx, cancel := context.WithCancel(e.ctx)
+	done := make(chan error, 1)
+	go func() { done <- e.ctrl.Run(ctx) }()
+	waitFor(t, "the controller to run", func() bool {
+		e.ctrl.mu.Lock()
+		defer e.ctrl.mu.Unlock()
+		return e.ctrl.runCtx != nil
+	})
+	if err := e.ctrl.Restart(e.ctx, refA, r.Identifier); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v", err)
+	}
+	if got := e.replica(refA, "n2").Status; got != statusRestart {
+		t.Fatalf("status %s", got)
+	}
+	if e.alerts.count(alerts.KindReplicaUnhealthy, false) != 0 {
+		t.Fatalf("alerts: %+v", e.alerts.evs)
 	}
 }

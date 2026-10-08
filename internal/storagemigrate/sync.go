@@ -155,8 +155,9 @@ func (e *Engine) upload(ctx context.Context, b Bucket, ref string, files []fileS
 // walk's if the file changed since; the inventory keeps the walk's values, so the next pass sees
 // the difference and sends the file again.
 func (e *Engine) copyFile(ctx context.Context, b Bucket, ref string, f fileState) (int64, error) {
-	abs := filepath.Join(e.paths.StorageObjects(ref), filepath.FromSlash(f.Path))
-	fh, err := openNoFollow(abs)
+	root := e.paths.StorageObjects(ref)
+	abs := filepath.Join(root, filepath.FromSlash(f.Path))
+	fh, err := e.files.Open(root, f.Path)
 	if err != nil {
 		return 0, err
 	}
@@ -166,15 +167,15 @@ func (e *Engine) copyFile(ctx context.Context, b Bucket, ref string, f fileState
 		return 0, err
 	}
 	if !fi.Mode().IsRegular() {
-		return 0, fmt.Errorf("%s: %w", abs, fs.ErrNotExist)
+		return 0, fmt.Errorf("%s: %w", quote(abs), fs.ErrNotExist)
 	}
-	meta, err := e.files.Meta(abs)
+	meta, err := e.files.MetaOf(fh)
 	if err != nil {
-		return 0, fmt.Errorf("%s: read extended attributes: %w", abs, err)
+		return 0, fmt.Errorf("%s: read extended attributes: %w", quote(abs), err)
 	}
 	if err := b.Put(ctx, ref+"/"+f.Path, fh, fi.Size(), meta); err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-			return 0, fmt.Errorf("%s: %w", abs, errChanged) // shorter than it was when the copy began
+			return 0, fmt.Errorf("%s: %w", quote(abs), errChanged) // shorter than it was when the copy began
 		}
 		return 0, err
 	}

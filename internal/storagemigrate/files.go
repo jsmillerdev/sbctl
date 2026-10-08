@@ -26,8 +26,15 @@ type Files interface {
 	// a device would take the copy out of the tree. A root that does not exist holds no files; a file
 	// that vanishes during the walk is left out.
 	Walk(ctx context.Context, root string, skip func(abs string), fn func(Object) error) error
+	// Open opens the file at rel (slash-separated) below root for reading. Nothing may take the open
+	// out of root: a parent directory that is replaced by a link, between the walk and the open,
+	// to a place the daemon's user can read must not make the copy send that file as an object. A
+	// link that stays inside root is followed, and the leaf must be a regular file.
+	Open(root, rel string) (*os.File, error)
 	// Meta reads the content type and cache control Storage keeps in the file's extended attributes.
 	Meta(abs string) (FileMeta, error)
+	// MetaOf reads them from an open file, the one whose bytes are sent.
+	MetaOf(f *os.File) (FileMeta, error)
 	// SetMeta writes them. It reports false, not an error, when the file system has no extended
 	// attributes.
 	SetMeta(abs string, m FileMeta) (bool, error)
@@ -91,6 +98,38 @@ func (OSFiles) Meta(abs string) (FileMeta, error) {
 	return FileMeta{ContentType: ct, CacheControl: cc}, nil
 }
 
+// MetaOf implements Files.
+func (OSFiles) MetaOf(f *os.File) (FileMeta, error) {
+	fd := int(f.Fd())
+	ct, _, err := readAttrFd(fd, "content-type")
+	if err != nil {
+		return FileMeta{}, err
+	}
+	cc, _, err := readAttrFd(fd, "cache-control")
+	if err != nil {
+		return FileMeta{}, err
+	}
+	return FileMeta{ContentType: ct, CacheControl: cc}, nil
+}
+
+// Open implements Files, through os.Root.
+func (OSFiles) Open(root, rel string) (*os.File, error) {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close() // a file opened through the Root stays open
+	name := filepath.FromSlash(rel)
+	fi, err := r.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: not a regular file: %w", quote(filepath.Join(root, name)), fs.ErrNotExist)
+	}
+	return r.Open(name)
+}
+
 // SetMeta implements Files.
 func (OSFiles) SetMeta(abs string, m FileMeta) (bool, error) {
 	for name, v := range map[string]string{"content-type": m.ContentType, "cache-control": m.CacheControl} {
@@ -103,8 +142,5 @@ func (OSFiles) SetMeta(abs string, m FileMeta) (bool, error) {
 	}
 	return true, nil
 }
-
-// openNoFollow opens path for reading and refuses a symbolic link.
-func openNoFollow(path string) (*os.File, error) { return openFileNoFollow(path) }
 
 func lstat(path string) (os.FileInfo, error) { return os.Lstat(path) }

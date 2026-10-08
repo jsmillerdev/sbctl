@@ -28,6 +28,12 @@ var ErrReplayBehind = errors.New("fleet: the system standby has not replayed the
 // once their standby has replayed the leader's write. A caller on the leader changes the tenant
 // row (EnsureTenant, EnsureReplicaTenant, a role password), refreshes its own Supavisor with
 // Fleet.RefreshTenant, then calls this. It is nil on a node that is part of no cluster.
+//
+// The error joins those of every node that failed, and a node that is active in the registry but
+// down costs its whole timeout (20 seconds in the daemon's implementation). A caller treats it as a
+// warning about those nodes and not as a failure of the change it made: a refresh is idempotent, it
+// can be sent again, and a node that missed it reads the replicated row when its Supavisor next
+// needs it. ReplicaPooler logs it and goes on.
 type PeerRefresher interface {
 	RefreshPeers(ctx context.Context, tenant string) error
 }

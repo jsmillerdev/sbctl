@@ -321,9 +321,11 @@ func (e *Engine) Resume(ctx context.Context, req Request) error {
 	}
 	e.st, e.inv = st, map[string]inventory{}
 	e.begin(req)
-	b, err := e.connect(ctx, st.Dest, req.Credentials)
-	if err != nil {
-		return err
+	var b Bucket
+	if st.NeedsBucket() {
+		if b, err = e.connect(ctx, st.Dest, req.Credentials); err != nil {
+			return err
+		}
 	}
 	st.Error = ""
 	if st.Phase == PhaseRollingBack {
@@ -531,6 +533,9 @@ func (t Tenant) note() string {
 	}
 	if t.Orphans > 0 {
 		n = append(n, fmt.Sprintf("%d files have no row and are copied anyway", t.Orphans))
+	}
+	if t.Unversioned > 0 {
+		n = append(n, fmt.Sprintf("%d rows have no version, so their files could not be matched and are not verified", t.Unversioned))
 	}
 	if t.Extra > 0 {
 		n = append(n, fmt.Sprintf("%d objects in the bucket have no file and were left alone", t.Extra))

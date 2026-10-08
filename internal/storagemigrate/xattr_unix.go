@@ -4,9 +4,7 @@ package storagemigrate
 
 import (
 	"errors"
-	"os"
 	"runtime"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -27,10 +25,20 @@ func xattrUnsupported(err error) bool {
 	return errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, errNoAttr)
 }
 
-// readAttr returns Storage's attribute name of the file, and false when it has none.
+// readAttr returns Storage's attribute name of the file at path, and false when it has none.
 func readAttr(path, name string) (string, bool, error) {
+	return readAttrWith(name, func(attr string, dest []byte) (int, error) { return unix.Getxattr(path, attr, dest) })
+}
+
+// readAttrFd is readAttr for an open file, which is the file whose bytes were read and not whatever
+// the path names by the time the attributes are asked for.
+func readAttrFd(fd int, name string) (string, bool, error) {
+	return readAttrWith(name, func(attr string, dest []byte) (int, error) { return unix.Fgetxattr(fd, attr, dest) })
+}
+
+func readAttrWith(name string, get func(attr string, dest []byte) (int, error)) (string, bool, error) {
 	for _, p := range attrPrefixes {
-		v, ok, err := getxattr(path, p+name)
+		v, ok, err := getxattr(get, p+name)
 		if err != nil || ok {
 			return v, ok, err
 		}
@@ -38,9 +46,9 @@ func readAttr(path, name string) (string, bool, error) {
 	return "", false, nil
 }
 
-func getxattr(path, name string) (string, bool, error) {
+func getxattr(get func(attr string, dest []byte) (int, error), name string) (string, bool, error) {
 	for {
-		n, err := unix.Getxattr(path, name, nil)
+		n, err := get(name, nil)
 		if err != nil {
 			if xattrUnsupported(err) {
 				return "", false, nil
@@ -48,7 +56,7 @@ func getxattr(path, name string) (string, bool, error) {
 			return "", false, err
 		}
 		buf := make([]byte, n)
-		if n, err = unix.Getxattr(path, name, buf); err != nil {
+		if n, err = get(name, buf); err != nil {
 			if errors.Is(err, unix.ERANGE) {
 				continue // grew since the size query
 			}
@@ -70,8 +78,4 @@ func writeAttr(path, name, value string) (bool, error) {
 		return false, err
 	}
 	return true, nil
-}
-
-func openFileNoFollow(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 }
