@@ -85,7 +85,7 @@ func TestUpgradeEventsBecomeAlerts(t *testing.T) {
 		{"started", nodeupgrade.Event{Kind: nodeupgrade.EventStarted, From: "v1.3.0", To: "v1.4.0", Projects: 12},
 			alerts.KindUpgradeStarted, alerts.SeverityInfo, "Upgrade to v1.4.0 started", []string{"v1.3.0 -> v1.4.0", "12 project(s) move"}},
 		{"started by the window", nodeupgrade.Event{Kind: nodeupgrade.EventStarted, From: "v1.3.0", To: "v1.4.0", Unattended: true},
-			alerts.KindUpgradeStarted, alerts.SeverityInfo, "Upgrade to v1.4.0 started", []string{"by the maintenance window", "No project move"}},
+			alerts.KindUpgradeStarted, alerts.SeverityInfo, "Upgrade to v1.4.0 started", []string{"by the maintenance window", "No project release moves"}},
 		{"succeeded", nodeupgrade.Event{Kind: nodeupgrade.EventSucceeded, From: "v1.3.0", To: "v1.4.0", Projects: 3},
 			alerts.KindUpgradeSucceeded, alerts.SeverityInfo, "Node is on v1.4.0", []string{"v1.3.0 -> v1.4.0", "3 project(s) moved"}},
 		{"rolled back", nodeupgrade.Event{Kind: nodeupgrade.EventRolledBack, From: "v1.3.0", To: "v1.4.0", BackTo: "v1.3.0", Halted: "abcdefghijklmnopqrst", Cause: "the rollout of the projects stopped: boom", Unattended: true},

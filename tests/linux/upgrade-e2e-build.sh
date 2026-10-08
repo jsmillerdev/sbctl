@@ -15,6 +15,8 @@
 #   v7     this checkout, as v0.0.10, pinning the GoTrue release of v5 and rendering the PostgreSQL units of
 #          the projects differently (max_connections of the default class is 61): a release that restarts
 #          every project's database, which the daemon leaves running and the rollout restarts
+#   v8     this checkout, as v0.0.11, with the pins of v2: the release `supavise update run` (the maintenance
+#          window's timer) upgrades the node to by itself, from v0.0.6, which is also a build of this checkout
 #   releasetool   deploy/releasetool, which writes the signed manifests
 #   *.versions.yaml   the versions.yaml each binary was built with (the manifest of its release is
 #                     made from the same file)
@@ -112,5 +114,11 @@ open(path, "w").write(s)
 PY
 build "$work/this" v0.0.10 "$out/v7"
 
+# v8: this checkout as it is.
+git -C "$work/this" checkout -- internal/lifecycle/classes.go
+cp internal/versions/versions.yaml "$work/this/internal/versions/versions.yaml"
+cp internal/versions/versions.yaml "$out/v8.versions.yaml"
+build "$work/this" v0.0.11 "$out/v8"
+
 go build -o "$out/releasetool" ./deploy/releasetool
-echo "built prev (from $prev_ref), v2, v4, v5, v6, v7 and releasetool in $out"
+echo "built prev (from $prev_ref), v2, v4, v5, v6, v7, v8 and releasetool in $out"

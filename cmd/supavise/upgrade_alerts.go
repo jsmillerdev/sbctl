@@ -58,14 +58,14 @@ func upgradeAlert(ev nodeupgrade.Event) alerts.Event {
 	case nodeupgrade.EventStarted:
 		a.Kind, a.Severity = alerts.KindUpgradeStarted, alerts.SeverityInfo
 		a.Title = fmt.Sprintf("%s to %s started", what, target)
-		a.Detail = fmt.Sprintf("Supavise %s -> %s started%s. %s", ev.From, ev.To, by, projectsLine(ev, "move"))
+		a.Detail = fmt.Sprintf("Supavise %s -> %s started%s. %s", ev.From, ev.To, by, projectsLine(ev))
 	case nodeupgrade.EventSucceeded:
 		a.Kind, a.Severity = alerts.KindUpgradeSucceeded, alerts.SeverityInfo
 		a.Title = fmt.Sprintf("Node is on %s", target)
 		if ev.Rollback {
 			a.Title = fmt.Sprintf("Node rolled back to %s", target)
 		}
-		a.Detail = fmt.Sprintf("Supavise %s -> %s finished%s. %s", ev.From, ev.To, by, projectsLine(ev, "moved"))
+		a.Detail = fmt.Sprintf("Supavise %s -> %s finished%s. %s", ev.From, ev.To, by, projectsLine(ev))
 	case nodeupgrade.EventRefused:
 		a.Kind, a.Severity = alerts.KindUpgradeFailed, alerts.SeverityWarning
 		a.Title = fmt.Sprintf("%s to %s did not go ahead", what, target)
@@ -93,18 +93,25 @@ func upgradeAlert(ev nodeupgrade.Event) alerts.Event {
 	return a
 }
 
-func projectsLine(ev nodeupgrade.Event, verb string) string {
+func projectsLine(ev nodeupgrade.Event) string {
+	n := ev.Projects
 	switch {
-	case ev.Projects == 0:
-		return "No project " + verb + "."
+	case ev.Rollback && ev.Kind == nodeupgrade.EventStarted && n == 0:
+		return "No project goes back."
 	case ev.Rollback && ev.Kind == nodeupgrade.EventStarted:
-		return fmt.Sprintf("%d project(s) go back to the releases they ran.", ev.Projects)
+		return fmt.Sprintf("%d project(s) go back to the releases they ran.", n)
+	case ev.Rollback && n == 0:
+		return "No project went back."
 	case ev.Rollback:
-		return fmt.Sprintf("%d project(s) went back to the releases they ran.", ev.Projects)
-	case verb == "move":
-		return fmt.Sprintf("%d project(s) move, one at a time after the canary.", ev.Projects)
+		return fmt.Sprintf("%d project(s) went back to the releases they ran.", n)
+	case ev.Kind == nodeupgrade.EventStarted && n == 0:
+		return "No project release moves."
+	case ev.Kind == nodeupgrade.EventStarted:
+		return fmt.Sprintf("%d project(s) move, one at a time after the canary.", n)
+	case n == 0:
+		return "No project release moved."
 	}
-	return fmt.Sprintf("%d project(s) %s.", ev.Projects, verb)
+	return fmt.Sprintf("%d project(s) moved.", n)
 }
 
 func haltedLine(ev nodeupgrade.Event) string {

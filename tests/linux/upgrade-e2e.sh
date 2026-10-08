@@ -42,6 +42,14 @@
 #     clusters running, the rollout restarts them.
 # 10. `supavise rollback` from v0.0.10: its output names the restarts, and the old daemon restarts the
 #     clusters onto the old settings.
+# 11. Automatic upgrades: [update] mode = "auto" and supavise-upgrade.service, the unit the maintenance
+#     window's timer starts (its ExecStart gets the release server of this test and nothing else). With
+#     the window somewhere else it does nothing. With a window that covers now it runs a real
+#     `supavise upgrade --unattended` from v0.0.6 to v0.0.11 (both builds of this checkout; the installed
+#     build drives the upgrade, so it is the one that raises the alerts), exits 0, records the result in
+#     its StateDirectory (/var/lib/supavise-upgrade, the unit's $STATE_DIRECTORY, never a path from
+#     config.toml) and sends upgrade_started and upgrade_succeeded to a local webhook receiver. A second
+#     start in the same window does nothing.
 
 # Needs root, systemd, cgroup v2 and network access (artifact downloads). Do not run it on a
 # machine you care about: it creates the supavise user, writes /etc/supavise and starts real
@@ -57,9 +65,12 @@ WORK=$(mktemp -d)
 # The supavise user reads the release key (--plan as that user); the private files keep their own modes.
 chmod 0755 "$WORK"
 SRV_PID=""
+HOOK_PID=""
 cleanup() {
   local rc=$?
   [[ -n $SRV_PID ]] && kill "$SRV_PID" 2>/dev/null || true
+  [[ -n $HOOK_PID ]] && kill "$HOOK_PID" 2>/dev/null || true
+  journalctl --no-pager -u supavise-upgrade.service >"$WORK/outputs/supavise-upgrade.journal" 2>/dev/null || true
   collect_logs
   cp -r "$WORK/outputs" "$LOG_DIR/" 2>/dev/null || true
   rm -rf "$WORK"
@@ -72,10 +83,10 @@ need_root
 preflight
 ARCH=$(dpkg --print-architecture)
 cd "$REPO_ROOT" || exit 1
-for f in prev v2 v4 v5 v6 v7 releasetool; do [[ -x $BINS/$f ]] || fail "$BINS/$f is missing: run tests/linux/upgrade-e2e-build.sh"; done
+for f in prev v2 v4 v5 v6 v7 v8 releasetool; do [[ -x $BINS/$f ]] || fail "$BINS/$f is missing: run tests/linux/upgrade-e2e-build.sh"; done
 # The driver and the stubs are run by the supavise user too (as workers): out of a private directory.
 install -d -m 0755 /opt/supavise-e2e
-for f in prev v2 v4 v5 v6 v7; do install -m 0755 "$BINS/$f" "/opt/supavise-e2e/$f"; done
+for f in prev v2 v4 v5 v6 v7 v8; do install -m 0755 "$BINS/$f" "/opt/supavise-e2e/$f"; done
 B=/opt/supavise-e2e
 SV=/usr/local/bin/supavise
 STATE=$SUPAVISE_STATE
@@ -563,5 +574,145 @@ journalctl --no-pager -u supavise.service | grep -q "postgres settings changed; 
 intact "$REF"; intact "$REF2"
 sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
 [[ $sup_status -eq 0 ]] || { cat "$WORK/status.txt" >&2; fail "supavise status exited $sup_status after the rollback from v0.0.10"; }
+
+# ---- 11. automatic upgrades: the command of the maintenance window's timer ---------------------------------
+log "auto mode: supavise-upgrade.service upgrades the node inside the window, and does nothing outside it"
+[[ $($SV --version) == *v0.0.6* ]] || fail "the node should run v0.0.6 here: $($SV --version)"
+install -m 0644 "$KEYS/pub.pem" /opt/supavise-e2e/pub.pem # the unit has a private /tmp
+make_release v0.0.11 "$B/v8" "$BINS/v8.versions.yaml" latest
+
+# The record sits in the unit's StateDirectory and nowhere else: a directory that the environment names
+# and systemd did not make is refused, and nothing is created.
+run env STATE_DIRECTORY=/var/lib/supavise-e2e-elsewhere "$SV" update run
+[[ $RC -ne 0 && $OUT == *"does not exist"* && $OUT == *"StateDirectory="* && ! -e /var/lib/supavise-e2e-elsewhere ]] || fail "update run with a state directory that systemd did not make: $RC $OUT"
+run env STATE_DIRECTORY=relative/dir "$SV" update run
+[[ $RC -ne 0 && $OUT == *"clean absolute path"* ]] || fail "update run with a relative state directory: $RC $OUT"
+
+# What the unattended upgrade needs: a healthy node, a copy of the master key in the backup backend and a
+# backup of every running project newer than 24 hours.
+printf 'upgrade-e2e passphrase: correct horse\n' >"$WORK/passphrase"; chown "$SUPAVISE_USER" "$WORK/passphrase"; chmod 0600 "$WORK/passphrase"
+supavise system escrow-key --passphrase-file "$WORK/passphrase" >/dev/null || fail "escrow-key"
+for r in "$REF" "$REF2"; do supavise backups create "$r" >/dev/null || fail "backups create $r"; done
+supavise status --json >"$WORK/status.json" || { cat "$WORK/status.json" >&2; fail "supavise status is not healthy before the unattended upgrade"; }
+[[ $(json_get '[c["state"] for c in d["components"] if c["name"] == "key escrow"][0]' <"$WORK/status.json") == ok ]] || fail "the key escrow is not ok: $(cat "$WORK/status.json")"
+
+# A local alert receiver: the upgrade alerts must arrive.
+cat >"$WORK/hook.py" <<'PY'
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        with open(sys.argv[2], "ab") as f:
+            f.write(body + b"\n")
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+HOOK_PORT=38802
+python3 "$WORK/hook.py" "$HOOK_PORT" "$WORK/hook.jsonl" &
+HOOK_PID=$!
+for ((i = 0; i < 40; i++)); do ss -ltnH "sport = :$HOOK_PORT" | grep -q . && break; sleep 0.25; done
+hook_events() { # "kind severity text" of the upgrade_* alerts received, in order
+  python3 - "$WORK/hook.jsonl" <<'PY'
+import json, os, sys
+if os.path.exists(sys.argv[1]):
+    for line in open(sys.argv[1]):
+        if line.strip():
+            d = json.loads(line)
+            if d["kind"].startswith("upgrade_"):
+                print(d["kind"] + " " + d["severity"] + " " + d["text"].replace("\n", " "))
+PY
+}
+hook_kinds() { hook_events | awk '{print $1}' | paste -sd, -; }
+
+# The window is somewhere else: auto mode, a window two hours from now. `update config` also writes the
+# timer, which would wake the unit in the middle of this test; the unit is started by hand below.
+OUTSIDE="daily $(date -d '+2 hours' +%H:%M)-$(date -d '+4 hours' +%H:%M)"
+$SV update config --mode auto --window "$OUTSIDE" --os-security-updates=false --os-reboot never >/dev/null || fail "update config --mode auto"
+[[ $(systemctl is-enabled supavise-upgrade.timer) == enabled ]] || fail "update config --mode auto did not enable the timer"
+grep -q '^OnCalendar=' /etc/systemd/system/supavise-upgrade.timer || fail "the timer has no ticks: $(cat /etc/systemd/system/supavise-upgrade.timer)"
+systemctl disable --now supavise-upgrade.timer 2>/dev/null || true
+printf '\n[[alerts.webhooks]]\nurl = "http://127.0.0.1:%s/hook"\n' "$HOOK_PORT" >>/etc/supavise/config.toml
+[[ $($SV update config | grep -E '^(mode|window)' | tr '\n' ' ') == "mode = \"auto\" window = \"$OUTSIDE\" " ]] || fail "update config: $($SV update config)"
+# The real unit, with the release server of this test as its only change.
+install -d /etc/systemd/system/supavise-upgrade.service.d
+cat >/etc/systemd/system/supavise-upgrade.service.d/e2e.conf <<UNIT
+[Service]
+ExecStart=
+ExecStart=$SV update run --repo o/r --api-base http://127.0.0.1:$SRV_PORT --public-key-file /opt/supavise-e2e/pub.pem
+UNIT
+systemctl daemon-reload
+start_unit() { # runs supavise-upgrade.service to its end; UNIT_RC is the exit status of systemctl start
+  UNIT_RC=0
+  timeout 3000 systemctl start supavise-upgrade.service || UNIT_RC=$?
+}
+unit_journal() { journalctl --no-pager -u supavise-upgrade.service --since "$1"; }
+journal_has() { # SINCE TEXT: the unit's journal since SINCE mentions TEXT (a file, not a pipe: grep -q would end a pipe early)
+  unit_journal "$1" >"$WORK/journal.tmp" || true
+  grep -q -- "$2" "$WORK/journal.tmp"
+}
+
+log "auto mode outside the window: the unit exits 0 and changes nothing"
+HOOK_BEFORE=$(hook_kinds); T0=$(date '+%Y-%m-%d %H:%M:%S')
+MARKER_BEFORE=$(marker)
+start_unit
+[[ $UNIT_RC -eq 0 ]] || { unit_journal "$T0" >&2; fail "supavise-upgrade.service outside the window exited $UNIT_RC"; }
+[[ $($SV --version) == *v0.0.6* ]] || fail "the unit upgraded the node outside the window: $($SV --version)"
+[[ $(hook_kinds) == "$HOOK_BEFORE" ]] || fail "the unit raised upgrade alerts outside the window: $(hook_events)"
+if journal_has "$T0" unattended_upgrade_started; then fail "the unit started an upgrade outside the window"; fi
+if [[ -e /var/lib/supavise-upgrade/state.json ]]; then
+  [[ $(python3 -c 'import json; print(json.load(open("/var/lib/supavise-upgrade/state.json")).get("result"))') == None ]] || fail "the unit recorded a result outside the window"
+fi
+[[ $(marker) == "$MARKER_BEFORE" ]] || fail "the upgrade marker changed outside the window: $(marker), was $MARKER_BEFORE"
+
+log "auto mode inside the window: a real supavise upgrade --unattended from v0.0.6 to v0.0.11"
+INSIDE="daily $(date -d '-1 hour' +%H:%M)-$(date -d '+3 hours' +%H:%M)"
+sed -i "s|^window = .*|window = \"$INSIDE\"|" /etc/supavise/config.toml
+[[ $($SV update config | grep -E '^(mode|window)' | tr '\n' ' ') == "mode = \"auto\" window = \"$INSIDE\" " ]] || fail "the window was not set: $($SV update config)"
+for r in "$REF" "$REF2"; do
+  REST_PID[$r]=$(systemctl show -p MainPID --value "supavise-postgrest@$r.service")
+done
+PG_PID=$(pg_pid "$REF") PG_PID2=$(pg_pid "$REF2")
+HOOK_BEFORE=$(hook_kinds); T1=$(date '+%Y-%m-%d %H:%M:%S')
+start_unit
+unit_journal "$T1" >"$WORK/outputs/unit-inside-window.log"
+[[ $UNIT_RC -eq 0 ]] || { tail -80 "$WORK/outputs/unit-inside-window.log" >&2; journalctl --no-pager -u supavise.service | tail -40 >&2; fail "supavise-upgrade.service inside the window exited $UNIT_RC"; }
+EXPECT_VERSION=v0.0.11
+for want in "unattended_upgrade_started" "outcome=ok" "Supavise v0.0.11 is running" "upgrade_succeeded"; do
+  grep -q -- "$want" "$WORK/outputs/unit-inside-window.log" || { cat "$WORK/outputs/unit-inside-window.log" >&2; fail "the unit's journal lacks '$want'"; }
+done
+[[ $($SV --version) == *v0.0.11* ]] || fail "the installed binary is $($SV --version)"
+wait_daemon; [[ $(daemon_version) == *v0.0.11* ]] || fail "the daemon runs $(daemon_version)"
+wait_status "$REF" ACTIVE_HEALTHY 180; wait_status "$REF2" ACTIVE_HEALTHY 180
+[[ $(marker) == "done v0.0.6 v0.0.11" ]] || fail "marker after the unattended upgrade: $(marker) (before: $MARKER_BEFORE)"
+# The record: in the unit's StateDirectory, root's, with the result and nothing left in progress.
+UNIT_STATE=/var/lib/supavise-upgrade/state.json
+[[ -f $UNIT_STATE && $(stat -c %U /var/lib/supavise-upgrade) == root && $(stat -c %U "$UNIT_STATE") == root ]] || fail "the record is not root's in /var/lib/supavise-upgrade: $(ls -ld /var/lib/supavise-upgrade; ls -l "$UNIT_STATE" 2>&1)"
+[[ $(python3 -c 'import json; d=json.load(open("'"$UNIT_STATE"'")); print(d["result"]["exit"], d["result"]["version"], "in_progress" in d, "blocked" in d, "rolled_back" in d, "window" in d)') == "0 v0.0.6 False False False True" ]] || fail "the record: $(cat "$UNIT_STATE")"
+[[ $(systemctl show -p Result --value supavise-upgrade.service) == success ]] || fail "the unit's result is $(systemctl show -p Result --value supavise-upgrade.service)"
+[[ $(supavise update status --json | json_get 'd["last_unattended_upgrade"]["exit"]') == 0 ]] || fail "update status does not show the result"
+# The upgrade really ran: the rollout restarted each project's PostgREST onto the files of v0.0.11, PostgreSQL untouched.
+for r in "$REF" "$REF2"; do
+  grep -q 'PGRST_DB_POOL="5"' "$STATE/projects/$r/postgrest.env" || fail "$r: the files were not rendered by v0.0.11"
+  [[ $(systemctl show -p MainPID --value "supavise-postgrest@$r.service") != "${REST_PID[$r]}" ]] || fail "$r: PostgREST was not restarted by the rollout"
+done
+[[ $(pg_pid "$REF") == "$PG_PID" && $(pg_pid "$REF2") == "$PG_PID2" ]] || fail "a project's PostgreSQL was restarted"
+intact "$REF"; intact "$REF2"
+# The alerts: one started and one succeeded for this upgrade, in order, with the versions and who started it.
+NEW_EVENTS=$(hook_events | tail -n 2)
+[[ $(hook_kinds) == "${HOOK_BEFORE:+$HOOK_BEFORE,}upgrade_started,upgrade_succeeded" ]] || fail "upgrade alerts: $(hook_kinds) (before: $HOOK_BEFORE)"
+grep -q '^upgrade_started info .*v0.0.6 -> v0.0.11 started by the maintenance window' <<<"$NEW_EVENTS" || fail "the started alert: $NEW_EVENTS"
+grep -q '^upgrade_succeeded info .*v0.0.6 -> v0.0.11 finished by the maintenance window' <<<"$NEW_EVENTS" || fail "the succeeded alert: $NEW_EVENTS"
+sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
+[[ $sup_status -eq 0 ]] || { cat "$WORK/status.txt" >&2; fail "supavise status exited $sup_status after the unattended upgrade"; }
+
+log "a second start in the same window does nothing: the window had its attempt"
+HOOK_BEFORE=$(hook_kinds); T2=$(date '+%Y-%m-%d %H:%M:%S')
+start_unit
+[[ $UNIT_RC -eq 0 ]] || { unit_journal "$T2" >&2; fail "the second start exited $UNIT_RC"; }
+if journal_has "$T2" unattended_upgrade_started; then fail "the unit upgraded twice in one window"; fi
+[[ $(hook_kinds) == "$HOOK_BEFORE" && $($SV --version) == *v0.0.11* ]] || fail "the second start changed something: $(hook_kinds)"
 
 log "upgrade end to end: all checks passed"
