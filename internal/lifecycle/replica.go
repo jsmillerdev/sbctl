@@ -237,6 +237,15 @@ func (pl *PostgresPlane) StartReplicaDatabase(ctx context.Context, t ReplicaTarg
 	if err != nil {
 		return err
 	}
+	// A cluster that starts as a standby must not carry promote.ok: the relay trusts the file for the
+	// epoch it names, and a promotion that was aborted after it wrote the file (the process died before
+	// pg_promote ran) would let a stray promotion push a new timeline. A promotion writes the file when
+	// it is about to run, after the standby is up.
+	if fileExists(filepath.Join(pp.Data, "standby.signal")) {
+		if err := os.Remove(pl.cfg.Paths().PromoteOK(t.Project.Ref)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	return pl.startCluster(ctx, spec, pp, pl.replicaReadyTimeout())
 }
 

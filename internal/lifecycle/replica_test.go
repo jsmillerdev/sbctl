@@ -1078,3 +1078,33 @@ func TestNoUnitStartsOnADirectoryASeedLeftUnfinished(t *testing.T) {
 		t.Fatalf("a finished seed: %v", err)
 	}
 }
+
+// A promotion that died after it wrote promote.ok and before pg_promote ran leaves a standby with the
+// file; the standby's next start removes it, because the relay would trust it for the epoch it names.
+// A cluster that is already a primary keeps its file.
+func TestAStandbyThatStartsDoesNotKeepPromoteOK(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	f.seeded(t, true)
+	if err := f.pl.writePromoteOK(testRef, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.pl.StartReplicaDatabase(ctx, f.t); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(f.cfg.Paths().PromoteOK(testRef)) {
+		t.Fatal("a standby started with a promote.ok beside it")
+	}
+
+	g := newReplicaFixture(t)
+	g.seeded(t, false) // promoted: no standby.signal
+	if err := g.pl.writePromoteOK(testRef, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.pl.StartReplicaDatabase(ctx, g.t); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExists(g.cfg.Paths().PromoteOK(testRef)) {
+		t.Fatal("the promote.ok of a promoted cluster went")
+	}
+}
