@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"time"
 
@@ -21,12 +22,17 @@ import (
 // services and the mesh sessions it needs have had time to come up. A variable for tests.
 var resumeSettle = 15 * time.Second
 
-// interrupted reports whether a restart of the daemon can have ended the run of the move: the context
-// is over, and the move is a server move that passed its leader marker, which is the point from which
-// the system cluster is promoted or about to be and the move goes on from its log. A move cut off
-// earlier failed like any other, and its owner decides about it.
-func interrupted(ctx context.Context, j *journal) bool {
-	return ctx.Err() != nil && j.move.Scope == registry.MoveServer && j.has("marker")
+// interrupted reports whether the run of the move ended because of the daemon's role change: it is a
+// server move that passed its leader marker (from there the system cluster is promoted or about to be
+// and the move goes on from its log), and either its context is over (the daemon is stopping) or the
+// registry it writes to still refuses writes (the daemon has not restarted yet, and the promoted
+// cluster is writable only for the daemon that starts). A move cut off earlier failed like any other,
+// and its owner decides about it.
+func interrupted(ctx context.Context, j *journal, runErr error) bool {
+	if j.move.Scope != registry.MoveServer || !j.has("marker") {
+		return false
+	}
+	return ctx.Err() != nil || errors.Is(runErr, registry.ErrReadOnly)
 }
 
 // ResumeInterrupted continues the server move to this node that a restart of the daemon cut off. It

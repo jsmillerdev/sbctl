@@ -46,7 +46,7 @@ Run on the node that takes over (`--to` defaults to it). From the leader, `--to 
 | `quiesce` (switchover) | the leader enters maintenance, stops the project clusters (8 at a time), the system GoTrue and the shared services, and last the system cluster, and reports each final LSN as `stopped:<ref>`. A failure undoes it: the leader starts again |
 | `caught-up` (switchover) | the standby of the system cluster replays to the leader's last position. A failure undoes it too |
 | `fence` (failover) | the cooperative fence of the old leader, then the provider's fence; a failed fence means no promotion |
-| `marker` | `_node/leader.json` records the new leader and epoch. A store that already holds a higher epoch, or this epoch under another leader, ends the move `aborted`: another node was promoted. It narrows the choice between two survivors that act at once: the loser stops before it touches the address. It is also what names the survivor as the leader when its daemon restarts (below), so a marker that cannot be written ends the move `failed` before anything is promoted, and `--force` does not skip it unless the `Takeover` records the leadership itself (`LeadershipRecorder`) |
+| `marker` | `_node/leader.json` records the new leader and epoch. A store that already holds a higher epoch, or this epoch under another leader, ends the move `aborted`: another node was promoted. It narrows the choice between two survivors that act at once: the loser stops before it touches the address. A marker that cannot be written ends the move `failed` before anything is promoted; `--force` goes on without it, and the promoted node still starts as the leader from its own `promote.ok` (below), but nothing then stops a second survivor |
 | `address` | the service address moves to the survivor, before the promotion. The marker comes first, the reverse of the order in design 2.10.4 (steps 4 and 5), so that only a survivor whose marker stands reaches the address |
 | `promote-system` | the system standby promotes |
 | `leader` | the daemon becomes the leader (`Takeover`), the log moves into a `moves` row and `failover.json` is removed, `SetLeader`, the old leader is marked `fenced` after a failover, the system project is homed here, maintenance ends. The daemon restarts before this step runs (see "The daemon's restart"), and the daemon that starts runs it |
@@ -64,9 +64,12 @@ A daemon takes a new role by stopping and starting again (`app.ErrRoleChanged`; 
 - The daemon that starts continues the move. `Monitor.Run` does it first, whatever the mode (`ResumeInterrupted`): when the move to this node is still `running`, passed its marker, and this node leads. A move that ended `failed` is the operator's (`--resume`) and is not started again by the daemon. The first steps of the continued run wait a few seconds for the shared services and the mesh sessions to come up.
 - The CLI follows. A connection that closes, or an `ErrRestarting` answer, makes `supavise failover` wait for the daemon (`Client.Follow`, `GET /v1/follow?epoch=N`) and go on printing the steps of the continued run. A daemon that restarted as a follower has no run of its own and reads the move of that epoch from the registry it replicates, which is how the old leader's CLI ends after a switchover it started with `--to`.
 - The leader that delegated the switchover waits for the node it asked: its looks fail while the node's daemon is down and find nothing until the daemon picks the move up, which is waited out for about three minutes. The continued run is kept for the node that started the move.
-- The `Takeover` port waits for the membership to show the node as the leader at the epoch of the move. The daemon that starts records it (`cluster.AssumeLeadership`, from the epoch the boot decision settled on: the marker names the survivor), so the wait ends at once there.
+- The membership shows the promotion before the daemon has restarted (it reads the epoch from the node's `promote.ok`), so the `Takeover` wait can end in the old process, and the next step writes to the registry handle of a standby, which refuses writes. A server move that meets `registry.ErrReadOnly` after its marker is cut the same way as one whose context ends: it returns `ErrRestarting`, stays `running`, and the daemon that starts continues it. The daemon that starts records the leadership (`cluster.AssumeLeadership`, from the epoch the boot decision settled on), so the wait ends at once there.
+- If the daemon does not restart by itself, the move waits: restart supavise on that node, and the move continues at start.
 
-The boot decision is why the marker matters. A promoted node whose registry still names the old leader, and that no peer and no marker names, starts fenced. A `Takeover` that writes the cluster row of the promoted system cluster itself before the restart can implement `LeadershipRecorder` and lets a move go on with `--force` when the backup store is down.
+The boot decision settles the epoch from the cluster row, the peers, the leader marker and the node's own `promote.ok`, which the promotion writes before `pg_promote`. A promoted node whose registry still names the old leader and that none of them names starts fenced, so the promotion must have written `promote.ok` before the daemon restarts; the marker adds the arbiter between two survivors.
+
+The old leader of a switchover is spared the same way. It stopped its system cluster on purpose, and the survivor's first ping and the marker say that another node leads at the next epoch. `FenceOnHigherEpoch` leaves a leader alone when its quiesce record names that node and epoch.
 
 ### Undoing a move that stopped early
 
@@ -87,7 +90,7 @@ The planned stop never touches the daemon. The WAL relay in it stays up until th
 | the replica is a healthy standby, its lag is known and below `max_lag_seconds` | yes | no |
 | same release on both nodes | yes | no |
 | capacity of the target: the replica already counts against it (advice, from the project check) | no | no |
-| the leader marker can be read from the backup store | yes | yes, unless the `Takeover` records the leadership itself |
+| the leader marker can be read from the backup store | yes | no |
 | projects without a replica (unless `--restore-missing`; the automatic server mode never passes it) | yes | yes |
 | `[fleet] storage_backend = "s3"` | yes | yes |
 | the marker does not already hold this epoch or a higher one; an unreadable marker is reported with what to do about a malformed one | yes | yes |
@@ -167,7 +170,7 @@ The fence record is a file; it keeps a node down only if the parts that start pr
 | `Fleet` | quiesce and re-register a project with Supavisor and Realtime | to be provided by the wiring: `fleet.Fleet.QuiesceTenant`, and an `EnsureTenant` over the engine, which builds the tenant spec (`wireFleet` provides `fleet.Fleet`, a different type) |
 | `LocalServices` | stop and start the leader's shared services as one | to be provided by the wiring over `fleet.Manager` |
 | `Peers`, `Leader`, `Remote` | ping, fence, quiesce and resume the leader, delegate a switchover | `MeshPeers` over `mesh.RPC` |
-| `Takeover` | the daemon runs as the leader | `membershipTakeover` in the hook, which waits for the membership; a recorder (`LeadershipRecorder`) may write the promoted registry itself |
+| `Takeover` | the daemon runs as the leader | `membershipTakeover` in the hook, which waits for the membership to show the node as the leader at the epoch |
 | `ReplicaSetup` | replica setup | `replicas.Service` |
 | `Locker` | the engine's project lock | to be provided by the engine (its lock is not exported) |
 | `ExtraChecks` | more preflight checks | to be provided by the proxy (certificates mirrored) and `fleet` (artifacts present) |
@@ -203,7 +206,7 @@ The CLI reaches the orchestrator through a unix socket of the daemon, `<state_di
 - A project homed on a follower that does not answer is failed over by nothing. A project move fences the home through the mesh and needs it to answer, a server move moves only the projects homed on the old leader, and the monitor watches only the leader. The project stays down until its node returns; its replica holds the data, and the backup store has its WAL. Getting it to serve before then is by hand. A fence that can reach a dead node needs a node-level fenced state and an epoch bump, which no part of this package does.
 - A node that led and reboots before its registry copy has replayed a planned switchover reads itself as the leader the cluster has replaced, and is fenced; `supavise node rejoin` brings it back.
 - The boot check runs in the daemon's wiring, after the node opened: a cluster that systemd started before the daemon is stopped by it, not prevented.
-- `api.SetFailoverSource` is a package-level setting that the daemon's wiring makes once, because the Management API is built from `api.Deps`, which does not carry the orchestrator. Two servers in one process would share it. The route answers 404 until it is set.
+- The Management API asks the orchestrator through `api.FailoverSource`, which the daemon passes in when the node belongs to a cluster; the readiness route answers 404 on a server whose daemon built none.
 - A project move runs one at a time on the leader, and the project's lock is the engine's only when the wiring gives the orchestrator a `Locker`; without one, a pause, a resume or an upgrade of the same project is not kept apart from the move.
 - A project that is restored from the archive in a server move (`--restore-missing`) loses up to `archive_timeout` of writes; the old leader's copy of it is rebuilt, not demoted.
 - `supavise node rejoin` (workstream M) clears `fenced.json` and calls `SetAsideDiverged`; until it does, a fenced node stays fenced.

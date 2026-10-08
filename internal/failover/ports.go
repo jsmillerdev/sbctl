@@ -149,17 +149,6 @@ type Takeover interface {
 	BecomeLeader(ctx context.Context, epoch int64) error
 }
 
-// LeadershipRecorder is implemented by a Takeover that records the leadership itself: its BecomeLeader
-// writes the cluster row of the promoted system cluster (cluster.AssumeLeadership on a writable handle
-// to it) before the daemon restarts. The daemon decides its role at boot from that row, from its
-// peers and from the leader marker in the backup store (internal/cluster/boot.go); a promoted node
-// that finds none of them naming it starts fenced. Without a recorder the marker is what names it, so
-// a move whose marker cannot be written is refused, and --force does not change that.
-type LeadershipRecorder interface {
-	Takeover
-	RecordsLeadership() bool
-}
-
 // ReplicaSetup builds a replica where there is none. replicas.Service implements it.
 type ReplicaSetup interface {
 	SetupOn(ctx context.Context, ref, nodeID string) error

@@ -932,6 +932,30 @@ func TestFenceSelfStopsThePrimariesEvenWhenTheRecordCannotBeWritten(t *testing.T
 }
 
 // setPeerEpoch makes n2 answer pings with the given epoch and leader.
+// The old leader of a planned switchover is stopped on purpose. The survivor's first ping and its
+// marker say that it leads at the next epoch, which is the switchover, not a replacement: the leader
+// is demoted in place and not fenced. A higher epoch it was not told of still fences it.
+func TestALeaderThatStoppedForASwitchoverIsNotFencedByTheSurvivorsEpoch(t *testing.T) {
+	w := bootRig(t) // n1 leads at epoch 1
+	o := w.orch()
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("quiesce: %d %s", rec.Code, rec.Body)
+	}
+	for _, source := range []string{"node standby", "the leader marker in the backup store"} {
+		fenced, err := o.FenceOnHigherEpoch(w.ctx, source, 2, "n2")
+		if err != nil || fenced {
+			t.Fatalf("%s: fenced %v, %v", source, fenced, err)
+		}
+	}
+	if rc, _ := o.Fenced(); rc != nil {
+		t.Fatalf("a record was written: %+v", rc)
+	}
+	// Another node at that epoch, or the same node at a later one, is a replacement.
+	if fenced, _ := o.FenceOnHigherEpoch(w.ctx, "node third", 2, "n3"); !fenced {
+		t.Fatal("another node at the epoch of the switchover did not fence")
+	}
+}
+
 func (w *world) setPeerEpoch(epoch int64, leader string) {
 	w.mu.Lock()
 	w.pingAs = &peerapi.Ping{Epoch: epoch, Leader: leader, Health: "healthy"}

@@ -17,8 +17,7 @@ type FailoverSource interface {
 
 // failoverSource is the daemon's orchestrator. It is set once by the daemon's wiring
 // (SetFailoverSource) because the Management API is built from Deps, and the readiness route is
-// the only route that needs the orchestrator. A server with none is not part of a cluster (the
-// wiring builds the orchestrator only for a node that has a peer) and answers 404.
+// the only route that needs the orchestrator. A server with none answers 503.
 var failoverSource atomic.Pointer[FailoverSource]
 
 // SetFailoverSource tells the Management API where to ask whether a failover would be accepted.
@@ -52,7 +51,7 @@ func (s *Server) routesFailover(add func(string, handlerFunc)) {
 	add("GET /supavise/v1/failover/readiness", func(w http.ResponseWriter, r *http.Request) error {
 		p := failoverSource.Load()
 		if p == nil {
-			return errf(http.StatusNotFound, "This server is not part of a cluster")
+			return errf(http.StatusServiceUnavailable, "Failover is not available on this node")
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), readinessTimeout)
 		defer cancel()

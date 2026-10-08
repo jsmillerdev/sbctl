@@ -141,10 +141,17 @@ func replacedBy(source string, epoch int64, leader string, localEpoch int64, loc
 // I1): the membership layer calls it when a ping, a peer call or the leader marker shows that the
 // cluster is at a higher epoch, or that another node leads at this node's epoch. source names where
 // it was seen ("peer standby"). A node that does not lead, or that saw nothing newer than its own
-// registry, is left alone and false returned; otherwise the node fences itself exactly as at boot:
+// registry, is left alone and false returned, and so is a leader that stopped for the switchover whose
+// node and epoch it was told of; otherwise the node fences itself exactly as at boot:
 // the record is written, the primaries stop, and the alert goes out.
 func (o *Orchestrator) FenceOnHigherEpoch(ctx context.Context, source string, epoch int64, leader string) (bool, error) {
 	if !o.d.Members.IsLeader() {
+		return false, nil
+	}
+	// The leader that stopped for a switchover is told by the survivor's first ping and by the marker
+	// that the survivor leads at the next epoch. That is the switchover it stopped for, and it is
+	// demoted in place, not fenced.
+	if rec, err := o.currentQuiesce(); err == nil && rec != nil && rec.To == leader && rec.Epoch == epoch {
 		return false, nil
 	}
 	localLeader := o.self().ID

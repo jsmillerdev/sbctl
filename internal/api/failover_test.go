@@ -22,8 +22,8 @@ func TestFailoverReadinessRoute(t *testing.T) {
 	t.Cleanup(func() { SetFailoverSource(nil) })
 
 	SetFailoverSource(nil)
-	if rec := f.do("GET", "/supavise/v1/failover/readiness", nil); rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "not part of a cluster") {
-		t.Fatalf("without an orchestrator (a single server): %d %s", rec.Code, rec.Body)
+	if rec := f.do("GET", "/supavise/v1/failover/readiness", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("without an orchestrator: %d %s", rec.Code, rec.Body)
 	}
 
 	SetFailoverSource(fakeFailover{r: failover.Readiness{

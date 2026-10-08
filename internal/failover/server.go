@@ -450,12 +450,13 @@ func (o *Orchestrator) writeMarker(ctx context.Context, run *serverRun) (string,
 		return fmt.Sprintf("epoch %d, leader %s", run.epoch, run.to.ID), nil
 	case errors.Is(err, backup.ErrMarkerNewer):
 		return "", lost
-	case run.flags.Force && o.recordsLeadership():
+	case run.flags.Force:
+		// The promoted node's daemon decides its role at boot from its peers, the marker and its own
+		// promote.ok, which the promotion writes: it starts as the leader without the marker. What the
+		// marker adds is the store's pick between two survivors that act at once.
 		return "warning: the leader marker was not written: " + err.Error(), nil
 	}
-	// The daemon of the promoted node restarts and decides its role from its cluster row, its peers and
-	// this marker. With none of them naming it, it starts fenced: there would be no leader.
-	return "", fmt.Errorf("writing the leader marker: %w (without it the promoted node's daemon starts fenced, so --force does not go on without it)", err)
+	return "", fmt.Errorf("writing the leader marker: %w (--force goes on without it; nothing then stops a second survivor from being promoted)", err)
 }
 
 // becomeLeader runs when the system cluster has been promoted: the daemon notices and becomes the
@@ -470,6 +471,12 @@ func (o *Orchestrator) becomeLeader(ctx context.Context, j *journal, run *server
 		}
 	}
 	if err := j.adopt(ctx); err != nil {
+		if errors.Is(err, registry.ErrReadOnly) {
+			// The membership shows the promotion before the daemon has restarted into the role: the
+			// registry this process writes to is still the standby's read-only handle, and the daemon that
+			// starts opens it writable and continues the move at this step.
+			return "", fmt.Errorf("the daemon's registry is read-only until it restarts as the leader: %w", err)
+		}
 		return "", err
 	}
 	st := o.store()

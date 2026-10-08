@@ -542,17 +542,11 @@ func (o *Orchestrator) storageCheck() Check {
 	return pass("storage backend", "s3: the objects are not on the old node")
 }
 
-// recordsLeadership reports whether the Takeover records the leadership in the promoted system
-// cluster itself, which makes the leader marker something a move can do without (LeadershipRecorder).
-func (o *Orchestrator) recordsLeadership() bool {
-	r, ok := o.d.Takeover.(LeadershipRecorder)
-	return ok && r.RecordsLeadership()
-}
-
 // markerCheck: the epoch marker lives in the backup store; the store must be reachable, and
 // must not already hold the epoch of the move or a higher one (another node was promoted). The
-// marker is what names the survivor as the leader when its daemon restarts after the promotion, so
-// a store that cannot be read is a hard failure unless the Takeover records the leadership itself.
+// marker is what lets the store pick one of two survivors that act at once; the promoted node starts
+// as the leader without it, from its own promote.ok, so an unreachable store is a failed check that
+// --force overrides.
 func (o *Orchestrator) markerCheck(ctx context.Context, epoch int64) []Check {
 	if o.d.Marker == nil {
 		return []Check{hard(fail("epoch marker", "no leader marker store in this build or backup mode (an S3-compatible backup store has one), so the leader marker cannot be written"))}
@@ -560,11 +554,7 @@ func (o *Orchestrator) markerCheck(ctx context.Context, epoch int64) []Check {
 	m, err := o.d.Marker.ReadLeaderMarker(ctx)
 	switch {
 	case err != nil:
-		c := fail("epoch marker", fmt.Sprintf("the leader marker in the backup store cannot be read: %v. If the store is up, the marker is malformed: delete _node/leader.json after you have checked which node leads", err))
-		if !o.recordsLeadership() {
-			c = hard(c)
-		}
-		return []Check{c}
+		return []Check{fail("epoch marker", fmt.Sprintf("the leader marker in the backup store cannot be read: %v. If the store is up, the marker is malformed: delete _node/leader.json after you have checked which node leads", err))}
 	case m != nil && m.Epoch >= epoch:
 		return []Check{hard(fail("epoch marker", fmt.Sprintf("the store holds epoch %d (leader %s), which is not below this move's %d: another node was promoted", m.Epoch, m.Leader, epoch)))}
 	case m == nil:

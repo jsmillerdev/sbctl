@@ -148,12 +148,12 @@ func timeoutSeconds(d time.Duration) int { return int(d / time.Second) }
 
 // endMove records the outcome of a move in its log and as an alert, and returns the move.
 func (o *Orchestrator) endMove(ctx context.Context, j *journal, ref string, runErr error) (*registry.Move, error) {
-	if runErr != nil && interrupted(ctx, j) {
+	if runErr != nil && interrupted(ctx, j, runErr) {
 		// The daemon is stopping for the role the promotion gave its node. The move stays running in
 		// its log, no alert says it failed, and the daemon that starts continues it.
 		o.d.Log.Info("the daemon stops in the middle of a server move; the daemon that starts continues it", "cause", runErr)
 		mv := j.snapshot()
-		return &mv, fmt.Errorf("%w (%v)", ErrRestarting, runErr)
+		return &mv, fmt.Errorf("%w (%w)", ErrRestarting, runErr)
 	}
 	var abort *abortError
 	state, text := registry.MoveDone, ""

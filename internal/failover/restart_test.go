@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -129,6 +130,44 @@ func TestAServerMoveCutOffByTheRestartContinuesInTheDaemonThatStarts(t *testing.
 	}
 }
 
+// The membership shows a promotion before the registry does (it reads the epoch from promote.ok), so
+// the wait for the takeover can end while the daemon is still the standby's, with a registry handle
+// that refuses writes. That is the same cut as a stopping daemon, and not a failure of the move.
+func TestAServerMoveThatFindsItsRegistryReadOnlyAfterThePromotionWaitsForTheRestart(t *testing.T) {
+	w := serverWorld(t)
+	w.frozen = true
+	o := w.orch()
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{})
+	if !errors.Is(err, ErrRestarting) || !errors.Is(err, registry.ErrReadOnly) {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if mv == nil || mv.State == registry.MoveFailed {
+		t.Fatalf("the move: %+v", mv)
+	}
+	for _, k := range w.alertKinds() {
+		if k == alerts.KindFailoverFailed {
+			t.Fatalf("alerts: %v", w.alerts)
+		}
+	}
+	fs, err := readStateFile(w.cfg.Paths().FailoverState())
+	if err != nil || fs == nil || (fs.State != "" && fs.State != registry.MoveRunning) || !recordedStep(fs.Steps, "promote-system") {
+		t.Fatalf("failover.json: %+v, %v", fs, err)
+	}
+	if w.has("registry.CreateMove") || w.has("registry.SetLeader") {
+		t.Fatalf("the read-only registry was written:\n%v", w.snapshot())
+	}
+	// The daemon that starts writes.
+	w.frozen = false
+	w.restarted(2)
+	got, err := w.orch().ResumeInterrupted(w.ctx)
+	if err != nil || got == nil || got.State != registry.MoveDone {
+		t.Fatalf("the continued move: %+v, %v", got, err)
+	}
+	if n := w.count("promote n2/" + idSysN2); n != 1 {
+		t.Fatalf("the system cluster was promoted %d times", n)
+	}
+}
+
 func TestOnlyAMoveThatIsStillRunningIsContinuedByTheDaemon(t *testing.T) {
 	t.Run("a move that ended failed is the operator's", func(t *testing.T) {
 		w := serverWorld(t)
@@ -178,15 +217,19 @@ func TestACancelledContextIsARestartOnlyAfterTheLeaderMarker(t *testing.T) {
 	ctx, cancel := context.WithCancel(w.ctx)
 	cancel()
 	j := o.fileJournal(registry.Move{Scope: registry.MoveServer, Kind: registry.MoveSwitchover, FromNode: "n1", ToNode: "n2", Epoch: 2}, serverFlags{}, nil)
-	if interrupted(ctx, j) {
+	someError := errors.New("a step failed")
+	if interrupted(ctx, j, someError) || interrupted(w.ctx, j, registry.ErrReadOnly) {
 		t.Fatal("a move that has not written its marker counts as cut off by a restart")
 	}
 	must(t, j.record(w.ctx, "marker", "epoch 2"))
-	if !interrupted(ctx, j) || interrupted(w.ctx, j) {
+	if !interrupted(ctx, j, someError) || interrupted(w.ctx, j, someError) {
 		t.Fatal("a cancelled context after the marker, and only it, is a restart")
 	}
+	if !interrupted(w.ctx, j, fmt.Errorf("creating the move: %w", registry.ErrReadOnly)) {
+		t.Fatal("a registry that still refuses writes after the marker is a daemon that has not restarted yet")
+	}
 	pj := o.journalFor(registry.Move{Scope: registry.MoveProject, Steps: []registry.MoveStep{{Name: "marker"}}})
-	if interrupted(ctx, pj) {
+	if interrupted(ctx, pj, someError) || interrupted(w.ctx, pj, registry.ErrReadOnly) {
 		t.Fatal("a project move is never cut off by a role change")
 	}
 }
