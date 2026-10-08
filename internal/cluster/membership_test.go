@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1490,5 +1491,107 @@ func TestPeerAPIKeepsInternalDetailFromCallersWithNoCertificate(t *testing.T) {
 	}
 	if code, body := post(mesh.Peer{Node: "n2", Remote: "198.51.100.9"}); code != http.StatusInternalServerError || !strings.Contains(body, "connection refused") {
 		t.Fatalf("a node got %d %s", code, body)
+	}
+}
+
+// A reset retires the server before the exchange, so the leader is looked at first: one that cannot be
+// reached, or does not take joins, costs nothing, where it would have left the server down with its
+// data set aside.
+func TestJoinResetLooksAtTheLeaderBeforeItRetiresTheNode(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(j.cfg.Paths().PostgresData("system"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stop := func(context.Context) error { t.Error("something was stopped"); return nil }
+	unchanged := func(what string) {
+		t.Helper()
+		if !Joined(config.ClusterDir(j.confPath)) {
+			t.Fatalf("%s: the identity was deleted", what)
+		}
+		if rec, _ := ReadFenced(j.cfg); rec != nil {
+			t.Fatalf("%s: the node was recorded as removed: %+v", what, rec)
+		}
+		if _, err := os.Stat(j.cfg.Paths().PostgresData("system")); err != nil {
+			t.Fatalf("%s: data was moved: %v", what, err)
+		}
+	}
+
+	// A leader at an address nothing listens on.
+	gone, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := gone.Addr().String()
+	gone.Close()
+	tok := l.token(t, TokenOptions{})
+	tok.Leader = dead
+	o := j.joinOptions(tok, "second-b", seed)
+	o.Reset, o.StopLocal = true, stop
+	if _, err := Join(ctx, o); err == nil || !strings.Contains(err.Error(), "cannot reach the leader") || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Fatalf("reset with an unreachable leader: %v", err)
+	}
+	unchanged("unreachable leader")
+
+	// A node that answers but is not the leader.
+	l.auth.Topology = cluster2Follower{l.auth.Topology}
+	o = j.joinOptions(l.token2(t), "second-b", seed)
+	o.Reset, o.StopLocal = true, stop
+	if _, err := Join(ctx, o); err == nil || !strings.Contains(err.Error(), "does not take joins") {
+		t.Fatalf("reset against a node that is not the leader: %v", err)
+	}
+	unchanged("not the leader")
+}
+
+// A server with a master key of its own finds out before the exchange that it is not the cluster's:
+// the token is not spent and the leader has no row for the node.
+func TestJoinRefusesAMasterKeyOfItsOwnBeforeAskingTheLeader(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	seed, _ := okSeed(t)
+	tok := l.token(t, TokenOptions{})
+	j := l.joiner(t, "n2")
+	own := make([]byte, 32)
+	if _, err := crand.Read(own); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(j.cfg.KeyPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(j.cfg.KeyPath, []byte(hex.EncodeToString(own)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Join(ctx, j.joinOptions(tok, "second", seed))
+	if err == nil || !strings.Contains(err.Error(), "holds another key than the cluster's") || !strings.Contains(err.Error(), "--master-key-file") {
+		t.Fatalf("join with a key of its own: %v", err)
+	}
+	if ns, _ := l.reg.ListNodes(ctx); len(ns) != 1 {
+		t.Fatalf("the leader created a node: %v", ns)
+	}
+	if got, err := l.reg.GetJoinToken(ctx, tok.ID); err != nil || got.UsedAt != nil {
+		t.Fatalf("the token was spent: %+v, %v", got, err)
+	}
+	// A key file that is not a key at all is no better.
+	if err := os.WriteFile(j.cfg.KeyPath, []byte("not a key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Join(ctx, j.joinOptions(tok, "second", seed)); err == nil || !strings.Contains(err.Error(), "holds another key") {
+		t.Fatalf("join with a damaged key file: %v", err)
+	}
+	// The cluster's own key in that place is fine, and the same token joins.
+	body, err := os.ReadFile(l.cfg.KeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(j.cfg.KeyPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Join(ctx, j.joinOptions(tok, "second", seed)); err != nil {
+		t.Fatalf("join with the cluster's key already in place: %v", err)
 	}
 }

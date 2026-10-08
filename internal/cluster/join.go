@@ -58,7 +58,11 @@ type JoinOptions struct {
 	// Reset discards the cluster identity this server already holds (a join that never finished and was
 	// reaped, a fenced node that cannot rejoin, a node that was removed while it was down) and joins as a
 	// new node. What runs here is stopped with StopLocal and the data is set aside, as a retirement does.
-	// Ignored with Resume.
+	// The retirement comes before the exchange, so it follows every check that does not spend the token:
+	// the token and the master key, Preflight, and a look at the leader (a challenge, thrown away). A
+	// refusal that only the exchange can make (the token was used already, the name is taken, the release
+	// is outside the window) leaves the server stopped with its data set aside; the operator runs the
+	// join again with a new token. Ignored with Resume.
 	Reset bool
 	// StopLocal stops everything that runs on this server (FenceLocal). Required with Reset.
 	StopLocal func(ctx context.Context) error
@@ -179,20 +183,55 @@ func (o *JoinOptions) inputs() (secret, keyBody []byte, err error) {
 		return nil, nil, errors.New("cluster: the join token's secret is damaged")
 	}
 	if o.MasterKey != nil {
-		sec, err := secrets.Load(o.MasterKey)
-		if err != nil {
-			return nil, nil, err
-		}
-		ca, err := NewCA(sec)
-		if err != nil {
-			return nil, nil, err
-		}
-		if !strings.EqualFold(ca.Fingerprint(), tok.CAFpr) {
-			return nil, nil, errors.New("cluster: that master key is not the one this cluster was made with (the CA it derives is not the one the token pins)")
+		if err := keyMatchesPin(o.MasterKey, tok.CAFpr); err != nil {
+			return nil, nil, fmt.Errorf("cluster: that master key is not the one this cluster was made with (%w)", err)
 		}
 		keyBody = o.MasterKey
+	} else if have, err := os.ReadFile(o.Cfg.KeyPath); err == nil {
+		// This server has a master key of its own, which the leader's would not replace (writeKey keeps
+		// it). Finding out after the exchange would cost the token, the leader's row for this node and
+		// the wait for the leader to reap it.
+		if err := keyMatchesPin(have, tok.CAFpr); err != nil {
+			return nil, nil, fmt.Errorf("cluster: %s holds another key than the cluster's (%w); move it away if this server holds nothing worth keeping, or pass the cluster's key with --master-key-file", o.Cfg.KeyPath, err)
+		}
 	}
 	return secret, keyBody, nil
+}
+
+// keyMatchesPin checks that the master key in body (the key file's text) derives the CA the join token
+// pins. The error says which half failed.
+func keyMatchesPin(body []byte, pin string) error {
+	sec, err := secrets.Load(body)
+	if err != nil {
+		return err
+	}
+	ca, err := NewCA(sec)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(ca.Fingerprint(), pin) {
+		return errors.New("the CA it derives is not the one the token pins")
+	}
+	return nil
+}
+
+// reachLeader asks the leader the token names for a challenge, the first step of every join, and
+// throws it away. A reset retires this server before the exchange; the leader being unreachable, not the
+// leader or not the one the token pins would leave the server down with its data set aside, so
+// it is looked at while nothing has changed. What only the exchange can tell (a token used already, a
+// name taken, a release outside the window) cannot be looked at without spending the token.
+func (o *JoinOptions) reachLeader(ctx context.Context) error {
+	tok := o.Token
+	c, err := mesh.DialClient(ctx, tok.Leader, "leader", mesh.PinnedTLS(tok.CAFpr, nil, o.now))
+	if err != nil {
+		return fmt.Errorf("cluster: cannot reach the leader at %s: %w (nothing was changed on this server)", tok.Leader, err)
+	}
+	defer c.Close()
+	var ch peerapi.JoinChallenge
+	if err := c.Call(ctx, "GET", peerapi.PathJoin, nil, &ch); err != nil {
+		return fmt.Errorf("cluster: the leader at %s does not take joins: %w (nothing was changed on this server)", tok.Leader, err)
+	}
+	return nil
 }
 
 // startOver deals with a server that already holds a cluster identity when a join with a token
@@ -209,6 +248,9 @@ func (o *JoinOptions) startOver(ctx context.Context) error {
 	}
 	if o.StopLocal == nil {
 		return errors.New("cluster: a reset needs a way to stop the local clusters")
+	}
+	if err := o.reachLeader(ctx); err != nil {
+		return err
 	}
 	_, err := Retire(ctx, o.Cfg, o.ConfigPath, o.StopLocal, o.now())
 	return err

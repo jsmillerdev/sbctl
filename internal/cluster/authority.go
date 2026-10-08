@@ -22,6 +22,7 @@ import (
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/replicas/replicaid"
 )
 
 // Error is a refusal of the leader's membership endpoints: an HTTP status, a code the caller can
@@ -429,32 +430,18 @@ func checkAWSIdentity(a *registry.NodeAWS) error {
 }
 
 // systemBootstrap creates (or finds) the system replica row of node and names the base backup it
-// seeds from.
+// seeds from. The row is the replica controller's to name (replicaid.EnsureSystem): its region is the
+// node's own, else the default region, the rule the controller and the platform listings share.
 func (a *Authority) systemBootstrap(ctx context.Context, node *registry.Node) (*peerapi.SystemBootstrap, error) {
 	cl, err := a.Reg.GetCluster(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rs, err := a.Reg.ListReplicas(ctx, config.SystemRef)
+	row, err := replicaid.EnsureSystem(ctx, a.Reg, *node, nil)
 	if err != nil {
 		return nil, err
 	}
-	id := ""
-	for _, r := range rs {
-		if r.NodeID == node.ID {
-			id = r.Identifier
-		}
-	}
-	if id == "" {
-		region := node.Region
-		if region == "" {
-			region = a.Cfg.NodeRegion()
-		}
-		id = registry.ReplicaIdentifier(config.SystemRef, region, shortID())
-		if err := a.Reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: config.SystemRef, NodeID: node.ID, Origin: registry.ReplicaSystem}); err != nil {
-			return nil, err
-		}
-	}
+	id := row.Identifier
 	backupID := ""
 	if a.Ensure != nil {
 		b, err := a.Ensure.EnsureBase(ctx, config.SystemRef, a.Cfg.Replicas.BootstrapMaxAge())
@@ -470,17 +457,6 @@ func (a *Authority) systemBootstrap(ctx context.Context, node *registry.Node) (*
 		}
 	}
 	return boot, nil
-}
-
-// shortID is the six character id of a replica identifier.
-func shortID() string {
-	b := make([]byte, 6)
-	_, _ = rand.Read(b)
-	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-	for i := range b {
-		b[i] = alphabet[int(b[i])%len(alphabet)]
-	}
-	return string(b)
 }
 
 // removeJoining retires a node that never finished joining: its certificate no longer works
