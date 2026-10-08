@@ -35,7 +35,7 @@ func TestClusterKeysHaveCodeDefaults(t *testing.T) {
 	if c.Ports.ReplicaBase != 10000 || c.ReplicaBase() != 10000 {
 		t.Errorf("replica_base = %d", c.Ports.ReplicaBase)
 	}
-	if want := (Replicas{Default: "off", Concurrency: 2, BootstrapMaxBackupAge: "24h", UnhealthyLagSeconds: 300, SchemaReloadSeconds: 30}); c.Replicas != want {
+	if want := (Replicas{Default: "off", Concurrency: 2, BootstrapMaxBackupAge: "24h", UnhealthyLagSeconds: 300, SchemaReloadSeconds: 10}); c.Replicas != want {
 		t.Errorf("replicas: %+v", c.Replicas)
 	}
 	if want := (Failover{Mode: "manual", MaxLagSeconds: 30, GraceSeconds: 90, ProjectGraceSeconds: 180, StopTimeoutSeconds: 120, CooldownMinutes: 60, KeepDivergedDays: 3}); c.Failover != want {
@@ -45,7 +45,7 @@ func TestClusterKeysHaveCodeDefaults(t *testing.T) {
 		t.Errorf("aws %+v fleet %q", c.AWS, c.Fleet.StorageS3CredentialsSecret)
 	}
 	r, f := c.Replicas, c.Failover
-	if !(r.SetupConcurrency() == 2 && r.BootstrapMaxAge() == 24*time.Hour && r.UnhealthyLag() == 5*time.Minute && r.LBMaxLag() == 0 && r.SchemaReload() == 30*time.Second && !r.AllByDefault()) {
+	if !(r.SetupConcurrency() == 2 && r.BootstrapMaxAge() == 24*time.Hour && r.UnhealthyLag() == 5*time.Minute && r.LBMaxLag() == 0 && r.SchemaReload() == 10*time.Second && !r.AllByDefault()) {
 		t.Errorf("replica accessors: %+v", r)
 	}
 	if !(f.MaxLag() == 30*time.Second && f.Grace() == 90*time.Second && f.ProjectGrace() == 3*time.Minute && f.StopTimeout() == 2*time.Minute &&

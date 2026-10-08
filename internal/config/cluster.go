@@ -56,8 +56,9 @@ type Replicas struct {
 	// 0 means the balancer ignores lag.
 	LBMaxLagSeconds int `toml:"lb_max_lag_seconds"`
 	// SchemaReloadSeconds is how often the daemon asks a replica's PostgREST to reload its schema
-	// cache, a safety net for a DDL change whose notification beat the replay of its WAL.
-	// 0 means 30.
+	// cache, a safety net for a DDL change whose notification beat the replay of its WAL
+	// (spike S3: the notification alone missed some changes; a timer of 5 s made all of them
+	// visible within 5 s). 0 means 10.
 	SchemaReloadSeconds int `toml:"schema_reload_seconds"`
 }
 
@@ -118,7 +119,7 @@ type AWS struct {
 
 // DefaultReplicas and DefaultFailover are the built-in [replicas] and [failover] sections.
 func DefaultReplicas() Replicas {
-	return Replicas{Default: ReplicasOff, Concurrency: 2, BootstrapMaxBackupAge: "24h", UnhealthyLagSeconds: 300, SchemaReloadSeconds: 30}
+	return Replicas{Default: ReplicasOff, Concurrency: 2, BootstrapMaxBackupAge: "24h", UnhealthyLagSeconds: 300, SchemaReloadSeconds: 10}
 }
 
 func DefaultFailover() Failover {
@@ -162,7 +163,7 @@ func (r Replicas) LBMaxLag() time.Duration {
 }
 
 // SchemaReload is the interval of the PostgREST schema reload on a replica.
-func (r Replicas) SchemaReload() time.Duration { return secondsOr(r.SchemaReloadSeconds, 30) }
+func (r Replicas) SchemaReload() time.Duration { return secondsOr(r.SchemaReloadSeconds, 10) }
 
 // Automatic reports whether the daemon may fail over by itself.
 func (f Failover) Automatic() bool { return f.Mode == FailoverProject || f.Mode == FailoverServer }
@@ -263,13 +264,56 @@ func (c *Config) FileBackup() bool { return strings.HasPrefix(c.Backup.Backend, 
 
 // CheckReplicaPorts reports whether the replica port range fits: ReplicaBase must be an
 // unprivileged port and MaxReplicaSeq at least 1, so that replica ports and project ports never
-// meet. Validate calls it when the node uses replicas; the code that adds a replica calls it too.
+// meet, and no fixed port of the node ([ports], the admin listener, the peer listener) may lie in
+// the range or be the system standby's port (ReplicaBase itself). Validate calls it when the node
+// uses replicas; the code that adds a replica calls it too.
 func (c *Config) CheckReplicaPorts() error {
-	if b := c.ReplicaBase(); b < 1024 || c.MaxReplicaSeq() < 1 {
+	b := c.ReplicaBase()
+	if b < 1024 || c.MaxReplicaSeq() < 1 {
 		return fmt.Errorf("config: ports.replica_base %d out of range: replica ports run from it up to %d projects' worth (3 each) and must end below ports.project_base %d",
 			b, max(c.MaxReplicaSeq(), 0), c.Ports.ProjectBase)
 	}
+	lo, hi := b, b+3*c.MaxReplicaSeq()+2
+	for _, f := range c.fixedPorts() {
+		if f.port >= lo && f.port <= hi {
+			return fmt.Errorf("config: %s %d lies in the replica port range %d-%d (ports.replica_base %d); move ports.replica_base or that port", f.key, f.port, lo, hi, b)
+		}
+	}
 	return nil
+}
+
+type fixedPort struct {
+	key  string
+	port int
+}
+
+// fixedPorts are the ports a node binds whatever projects exist: the [ports] values that are set,
+// the port of [listen] admin and the port of [node] peer_listen.
+func (c *Config) fixedPorts() []fixedPort {
+	p := c.Ports
+	var out []fixedPort
+	for _, f := range []fixedPort{
+		{"ports.supavisor_session", p.SupavisorSession}, {"ports.supavisor_transaction", p.SupavisorTransaction},
+		{"ports.system_postgres", p.SystemPostgres}, {"ports.system_gotrue", p.SystemGoTrue},
+		{"ports.realtime", p.Realtime}, {"ports.storage", p.Storage}, {"ports.storage_admin", p.StorageAdmin},
+		{"ports.imgproxy", p.Imgproxy}, {"ports.pgmeta", p.PGMeta}, {"ports.studio", p.Studio},
+		{"ports.edge_runtime", p.EdgeRuntime},
+	} {
+		if f.port > 0 {
+			out = append(out, f)
+		}
+	}
+	if _, port, err := net.SplitHostPort(c.Listen.Admin); err == nil {
+		if n, err := strconv.Atoi(port); err == nil && n > 0 {
+			out = append(out, fixedPort{"listen.admin", n})
+		}
+	}
+	if _, port, err := net.SplitHostPort(c.PeerListen()); err == nil {
+		if n, err := strconv.Atoi(port); err == nil && n > 0 {
+			out = append(out, fixedPort{"node.peer_listen", n})
+		}
+	}
+	return out
 }
 
 func (c *Config) validateCluster() error {
