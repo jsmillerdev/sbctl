@@ -43,6 +43,9 @@ type Diverged struct {
 // project with no data directory returns the zero Diverged and no error. controlLSN and forkLSN
 // are optional; with both, the size of the lost tail is recorded.
 func SetAsideDiverged(cfg *config.Config, ref string, epoch int64, controlLSN, forkLSN string, now time.Time) (Diverged, error) {
+	if !fenced.ValidRef(ref) {
+		return Diverged{}, fmt.Errorf("failover: %q is not a project ref", ref)
+	}
 	paths := cfg.Paths()
 	data := paths.PostgresData(ref)
 	if _, err := os.Stat(data); errors.Is(err, fs.ErrNotExist) {

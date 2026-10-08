@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
@@ -37,6 +38,12 @@ type Record struct {
 	Reason string    `json:"reason"`
 	At     time.Time `json:"at"`
 }
+
+var refRe = regexp.MustCompile(`^(system|[a-z]{20})$`)
+
+// ValidRef reports whether ref can name a project directory: the system project or a project ref.
+// A ref that arrives from a peer is checked with it before it builds a path.
+func ValidRef(ref string) bool { return refRe.MatchString(ref) }
 
 // NodePath is the file of the node record: <state_dir>/fenced.json.
 func NodePath(p config.Paths) string { return filepath.Join(p.Root, "fenced.json") }
@@ -73,8 +80,8 @@ func WriteNode(p config.Paths, r Record) error { return write(NodePath(p), r) }
 
 // WriteProject records that the primary of r.Ref is fenced on this node.
 func WriteProject(p config.Paths, r Record) error {
-	if r.Ref == "" {
-		return errors.New("fenced: a project record needs the project's ref")
+	if !ValidRef(r.Ref) {
+		return fmt.Errorf("fenced: %q is not a project ref", r.Ref)
 	}
 	return write(ProjectPath(p, r.Ref), r)
 }
@@ -84,7 +91,12 @@ func ClearNode(p config.Paths) error { return remove(NodePath(p)) }
 
 // ClearProject removes a project record: the old primary's data was set aside, or the project was
 // demoted in place into a replica of its new home.
-func ClearProject(p config.Paths, ref string) error { return remove(ProjectPath(p, ref)) }
+func ClearProject(p config.Paths, ref string) error {
+	if !ValidRef(ref) {
+		return fmt.Errorf("fenced: %q is not a project ref", ref)
+	}
+	return remove(ProjectPath(p, ref))
+}
 
 func read(path string) (*Record, error) {
 	b, err := os.ReadFile(path)

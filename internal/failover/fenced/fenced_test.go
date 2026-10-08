@@ -110,6 +110,24 @@ func TestProjectRecordNeedsARef(t *testing.T) {
 	}
 }
 
+func TestOnlyAProjectRefNamesAProjectRecord(t *testing.T) {
+	p := paths(t)
+	for _, ref := range []string{"../x", "a/b", "ABCDEFGHIJKLMNOPQRST", "short", "abcdefghijklmnopqrstu"} {
+		if ValidRef(ref) {
+			t.Errorf("%q is a ref", ref)
+		}
+		if err := WriteProject(p, Record{Epoch: 1, Ref: ref}); err == nil {
+			t.Errorf("a record was written for %q", ref)
+		}
+		if err := ClearProject(p, ref); err == nil {
+			t.Errorf("a record was cleared for %q", ref)
+		}
+	}
+	if !ValidRef("system") || !ValidRef("abcdefghijklmnopqrst") {
+		t.Fatal("a real ref was refused")
+	}
+}
+
 func TestWriteCreatesTheProjectDirectory(t *testing.T) {
 	p := paths(t)
 	if err := WriteProject(p, Record{Epoch: 1, Ref: "system", Reason: "x"}); err != nil {
