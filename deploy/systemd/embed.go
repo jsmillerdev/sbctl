@@ -1,5 +1,6 @@
 // Package systemd embeds the unit templates, the slice and the polkit rule so the
-// binary can install them (supavise system install-units) without the repository.
+// binary can install them (supavise system converge, and its alias install-units) without the
+// repository.
 package systemd
 
 import (
@@ -38,6 +39,43 @@ func Install(unitDir, polkitDir string) (changed []string, err error) {
 // its rendering here, so the file is written once with its final content and a second
 // run reports no change.
 func InstallWith(unitDir, polkitDir string, override map[string][]byte) (changed []string, err error) {
+	todo, err := plan(unitDir, polkitDir, override)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range todo {
+		if err := os.MkdirAll(filepath.Dir(f.path), 0o755); err != nil {
+			return changed, err
+		}
+		if err := os.WriteFile(f.path, f.content, 0o644); err != nil {
+			return changed, err
+		}
+		changed = append(changed, f.path)
+	}
+	return changed, nil
+}
+
+// Pending returns the files InstallWith would write, and writes nothing.
+func Pending(unitDir, polkitDir string, override map[string][]byte) ([]string, error) {
+	todo, err := plan(unitDir, polkitDir, override)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, len(todo))
+	for i, f := range todo {
+		paths[i] = f.path
+	}
+	return paths, nil
+}
+
+type pendingFile struct {
+	path    string
+	content []byte
+}
+
+// plan lists the files whose content differs from what is installed, in the order of Names.
+func plan(unitDir, polkitDir string, override map[string][]byte) ([]pendingFile, error) {
+	var todo []pendingFile
 	for _, name := range Names() {
 		dir := unitDir
 		if filepath.Ext(name) == ".rules" {
@@ -48,21 +86,16 @@ func InstallWith(unitDir, polkitDir string, override map[string][]byte) (changed
 		}
 		b, ok := override[name]
 		if !ok {
+			var err error
 			if b, err = files.ReadFile(name); err != nil {
-				return changed, err
+				return nil, err
 			}
 		}
 		dst := filepath.Join(dir, name)
 		if cur, err := os.ReadFile(dst); err == nil && string(cur) == string(b) {
 			continue
 		}
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return changed, err
-		}
-		if err := os.WriteFile(dst, b, 0o644); err != nil {
-			return changed, err
-		}
-		changed = append(changed, dst)
+		todo = append(todo, pendingFile{dst, b})
 	}
-	return changed, nil
+	return todo, nil
 }
