@@ -3,8 +3,10 @@ package placement
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -279,5 +281,123 @@ func TestReporterTellsTheLeaderAndOnlyThe(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not stop")
+	}
+}
+
+func TestReporterIsQuietAboutALeaderWithoutAReportEndpoint(t *testing.T) {
+	ctx := context.Background()
+	m := members("n2", "n1", 5)
+	r := &Reporter{Members: m, RPC: failingRPC{&mesh.RemoteError{Node: "n1", Status: http.StatusNotFound, Message: "page not found"}}, Agent: fixedObserver{}}
+	if err := r.Once(ctx, time.Now); !errors.Is(err, ErrNoReportEndpoint) {
+		t.Fatalf("Once: %v", err)
+	}
+	// Run says so once, and again only after the leader answered in between.
+	ctx2, cancel := context.WithCancel(ctx)
+	var logged []string
+	var calls int
+	rpc := funcRPC(func() error {
+		calls++
+		switch {
+		case calls <= 3:
+			return &mesh.RemoteError{Node: "n1", Status: http.StatusNotFound, Message: "page not found"}
+		case calls == 4:
+			return nil
+		case calls == 5:
+			return &mesh.RemoteError{Node: "n1", Status: http.StatusNotFound, Message: "page not found"}
+		case calls == 6:
+			return errors.New("connection reset")
+		}
+		cancel()
+		return nil
+	})
+	r.RPC = rpc
+	done := make(chan struct{})
+	go func() {
+		r.Run(ctx2, time.Millisecond, func(err error) { logged = append(logged, err.Error()) })
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	if len(logged) != 3 || !strings.Contains(logged[0], "no report endpoint") || !strings.Contains(logged[1], "no report endpoint") || !strings.Contains(logged[2], "connection reset") {
+		t.Fatalf("logged = %q", logged)
+	}
+}
+
+type funcRPC func() error
+
+func (f funcRPC) Call(context.Context, string, string, string, any, any) error { return f() }
+
+// countingObserver counts the observations of the node and answers with the n-th.
+type countingObserver struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (o *countingObserver) ObserveAll(context.Context) []peerapi.InstanceStatus {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.n++
+	return []peerapi.InstanceStatus{{Identifier: testReplicaID(), Ref: testRef, ReplayLSN: fmt.Sprintf("0/%d", o.n)}}
+}
+
+func (o *countingObserver) count() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.n
+}
+
+func TestReportCacheAnswersFromMemory(t *testing.T) {
+	ctx := context.Background()
+	obs := &countingObserver{}
+	c := &ReportCache{Agent: obs, Projects: func(context.Context) []peerapi.ProjectHealth {
+		return []peerapi.ProjectHealth{{Ref: testRef, Healthy: true}}
+	}}
+	// Before the first refresh there is nothing, and nothing is probed to say so.
+	if in, pr := c.Contribute(ctx); len(in) != 0 || len(pr) != 0 || obs.count() != 0 {
+		t.Fatalf("before a refresh: %v %v (%d probes)", in, pr, obs.count())
+	}
+	c.Refresh(ctx)
+	for i := 0; i < 3; i++ {
+		in, pr := c.Contribute(ctx)
+		if len(in) != 1 || in[0].ReplayLSN != "0/1" || len(pr) != 1 || !pr[0].Healthy {
+			t.Fatalf("contribution = %v %v", in, pr)
+		}
+	}
+	// A caller that changes the answer does not change the cache.
+	in := c.ObserveAll(ctx)
+	in[0].ReplayLSN = "changed"
+	if got := c.ObserveAll(ctx); got[0].ReplayLSN != "0/1" {
+		t.Fatalf("the cache was changed through its answer: %v", got)
+	}
+	if obs.count() != 1 {
+		t.Fatalf("reading the cache probed the node: %d", obs.count())
+	}
+	// The reporter reads it as an Observer and a Projects function.
+	r := &Reporter{Members: members("n2", "n1", 5), RPC: &recordRPC{}, Agent: c, Projects: c.ProjectHealth}
+	if rep := r.Report(ctx, time.Now()); len(rep.Instances) != 1 || len(rep.Projects) != 1 || obs.count() != 1 {
+		t.Fatalf("report = %+v (%d probes)", rep, obs.count())
+	}
+
+	// Run refreshes at once and on every tick, and stops with its context.
+	rctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { c.Run(rctx, 5*time.Millisecond); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for obs.count() < 4 {
+		if time.Now().After(deadline) {
+			t.Fatalf("Run refreshed %d times", obs.count())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	// Without a projects function the report has none.
+	c2 := &ReportCache{Agent: fixedObserver{}}
+	c2.Refresh(ctx)
+	if _, pr := c2.Contribute(ctx); len(pr) != 0 {
+		t.Fatalf("projects = %v", pr)
 	}
 }

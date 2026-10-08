@@ -55,7 +55,15 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	})
 	agent.Start(ctx)
 	ops := &placement.Ops{Self: self, Agent: agent, Backups: bk, RPC: m, Epoch: mem.Epoch}
-	placement.Register(handle, placement.HandlerDeps{Agent: agent, Plane: node.Plane, Checkpoints: node.Plane, Resolver: res, Members: mem, Backups: bk})
+	if err := placement.Register(handle, placement.HandlerDeps{Agent: agent, Plane: node.Plane, Checkpoints: node.Plane, Resolver: res, Members: mem, Backups: bk}); err != nil {
+		return err
+	}
+
+	// A promotion and a demotion take the project's ports from the mesh's forwarders (the canonical
+	// ports on a replica's node are forwarders to the home).
+	if h, ok := providedAs[portHolder](w); ok {
+		node.Plane.SetPortHolder(h.Suspend)
+	}
 
 	// A demoted cluster catches up through the node's own relay.
 	node.Plane.SetRestoreCommand(func(ref string) string { return backup.RestoreCommandFor(w.Cfg, ref, ref, w.Options.ConfigPath) })
@@ -68,9 +76,13 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	Provide[placement.BackupOps](w, ops)
 
 	// The replicas of this node start with the daemon, report to the leader and get their PostgREST's
-	// schema cache reloaded on a timer.
-	reporter := &placement.Reporter{Members: mem, RPC: m, Agent: agent, Projects: projectHealth(node.Registry, node.Plane, self)}
+	// schema cache reloaded on a timer. The observation of the replicas and of the projects homed here
+	// is kept in memory and refreshed in the background, so that a report answers from it.
+	cache := &placement.ReportCache{Agent: agent, Projects: projectHealth(node.Registry, node.Plane, self)}
+	Provide[placement.Contribution](w, cache.Contribute)
+	reporter := &placement.Reporter{Members: mem, RPC: m, Agent: cache, Projects: cache.ProjectHealth}
 	w.Go("replicas start", func(ctx context.Context) error { agent.StartLocal(ctx); return nil })
+	w.Go("replica report cache", func(ctx context.Context) error { cache.Run(ctx, 10*time.Second); return nil })
 	w.Go("replica report", func(ctx context.Context) error {
 		reporter.Run(ctx, 10*time.Second, func(err error) { w.Log.Warn("replica report", "error", err) })
 		return nil
@@ -89,6 +101,24 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 		return nil
 	})
 	return nil
+}
+
+// portHolder is what the mesh's forwarders (*mesh.Forwarders) offer a promotion: Suspend closes the
+// listeners of a project and keeps them closed until the returned function is called.
+type portHolder interface {
+	Suspend(ref string) (resume func())
+}
+
+// providedAs returns the value of type T that an earlier hook provided, under whatever type it
+// chose. The forwarders are provided by the mesh hook under their own type.
+func providedAs[T any](w *Wire) (T, bool) {
+	for _, v := range w.values {
+		if t, ok := v.(T); ok {
+			return t, true
+		}
+	}
+	var zero T
+	return zero, false
 }
 
 // replicaFailed raises the replica_unhealthy alert for a replica that did not come back after the

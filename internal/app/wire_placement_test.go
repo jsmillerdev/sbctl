@@ -140,7 +140,7 @@ func TestPlacementWiringPutsTheRouterInFrontOfTheEngineAndServesThePeerAPI(t *te
 	for _, r := range w.runners {
 		names = append(names, r.name)
 	}
-	if strings.Join(names, ",") != "replicas start,replica report,replica schema reload" {
+	if strings.Join(names, ",") != "replicas start,replica report cache,replica report,replica schema reload" {
 		t.Errorf("runners = %v", names)
 	}
 
@@ -186,5 +186,67 @@ func TestPlacementWiringPutsTheRouterInFrontOfTheEngineAndServesThePeerAPI(t *te
 	// InstanceOps for this node reaches the agent without the mesh.
 	if _, err := ops.Observe(ctx, "n1", id); err != nil || len(fm.calls) != 1 {
 		t.Fatalf("local observe: %v, calls %v", err, fm.calls)
+	}
+}
+
+// fakeForwarders stands for *mesh.Forwarders, which the mesh hook provides under its own type.
+type fakeForwarders struct {
+	mu       sync.Mutex
+	held     []string
+	released []string
+}
+
+func (f *fakeForwarders) Suspend(ref string) func() {
+	f.mu.Lock()
+	f.held = append(f.held, ref)
+	f.mu.Unlock()
+	return func() {
+		f.mu.Lock()
+		f.released = append(f.released, ref)
+		f.mu.Unlock()
+	}
+}
+
+// A promotion and a demotion take the project's ports from the forwarders the mesh hook provided,
+// whatever type it provided them as.
+func TestPlacementWiringBindsThePlaneToTheForwarders(t *testing.T) {
+	ctx := context.Background()
+	w, _, _ := clusterWire(t)
+	fwd := &fakeForwarders{}
+	Provide(w, fwd)
+	if err := placementWiring(ctx, w, mesh.NewMux().Handle); err != nil {
+		t.Fatal(err)
+	}
+	ref := "abcdefghijklmnopqrst"
+	target := lifecycle.ReplicaTarget{
+		Identifier: registry.ReplicaIdentifier(ref, "us-east-1", "abc123"),
+		Project:    &registry.Project{Ref: ref, Seq: 3, Class: "micro", Engine: registry.EnginePostgres},
+		Keys:       &secrets.ProjectKeys{ReplicationPassword: "pw"},
+	}
+	// There is no cluster to demote: the call fails after it took the ports and gives them back.
+	if err := w.Node.Plane.DemoteToReplica(ctx, target); err == nil {
+		t.Fatal("a demotion of nothing succeeded")
+	}
+	if len(fwd.held) != 1 || fwd.held[0] != ref || len(fwd.released) != 1 {
+		t.Fatalf("held %v, released %v", fwd.held, fwd.released)
+	}
+}
+
+func TestPlacementWiringWithoutForwardersHoldsNothing(t *testing.T) {
+	ctx := context.Background()
+	w, _, _ := clusterWire(t)
+	if err := placementWiring(ctx, w, mesh.NewMux().Handle); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := providedAs[portHolder](w); ok {
+		t.Fatal("a port holder from nowhere")
+	}
+	// The contribution to the leader's report is provided for the cluster package to take.
+	contrib, ok := Get[placement.Contribution](w)
+	if !ok {
+		t.Fatal("no contribution")
+	}
+	if in, pr := contrib(ctx); len(in) != 0 || len(pr) != 0 {
+		t.Fatalf("a contribution before the first refresh: %v %v", in, pr)
 	}
 }
