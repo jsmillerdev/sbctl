@@ -4,9 +4,11 @@
 // Signature Version 4 and uses nothing outside the standard library.
 //
 // Credentials come from the standard AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and
-// AWS_SESSION_TOKEN variables, then from the instance role. Endpoints can be overridden per
-// service with AWS_ENDPOINT_URL_EC2, AWS_ENDPOINT_URL_SECRETSMANAGER, AWS_ENDPOINT_URL_STS and
-// AWS_ENDPOINT_URL_IMDS, which is how tests and the two-node CI harness point it at a fake.
+// AWS_SESSION_TOKEN variables, then from the instance role. SUPAVISE_AWS_NO_INSTANCE_ROLE=1 drops
+// the instance role and keeps the metadata service for the instance id, the region and the tags.
+// Endpoints can be overridden per service with AWS_ENDPOINT_URL_EC2,
+// AWS_ENDPOINT_URL_SECRETSMANAGER, AWS_ENDPOINT_URL_STS and AWS_ENDPOINT_URL_IMDS, which is how
+// tests and the two-node CI harness point it at a fake.
 package awsapi
 
 import (
@@ -242,7 +244,7 @@ func (c *core) do(ctx context.Context, call apiCall) ([]byte, error) {
 }
 
 // send is do that also returns how many times the request was sent.
-func (c *core) send(ctx context.Context, call apiCall) (body []byte, sent int, err error) {
+func (c *core) send(ctx context.Context, call apiCall) ([]byte, int, error) {
 	for attempt := 1; ; attempt++ {
 		body, err := c.once(ctx, call)
 		if err == nil || attempt >= c.retry.attempts || !retryable(err) || ctx.Err() != nil {
