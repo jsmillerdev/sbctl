@@ -468,9 +468,12 @@ type certMirror struct {
 	src      CertSource
 	interval time.Duration
 	log      *slog.Logger
-	// onSnapshot is told of the store after every fetch that reached the leader, changed or not.
+	// onSnapshot is told of the store after every fetch that reached the leader and brought files,
+	// changed or not, and once at the start of run of what the node already holds on disk.
 	onSnapshot func(ctx context.Context, snap peerapi.CertSnapshot)
 	poke       chan struct{}
+	// pokeGap is the least time between two fetches that pokes ask for.
+	pokeGap time.Duration
 
 	mu sync.Mutex // one fetch at a time
 	// tag and fetched are the leader's store as last sent; shown is what the disk holds, which is
@@ -486,7 +489,7 @@ type certMirror struct {
 const pokeEvery = 10 * time.Second
 
 func newCertMirror(dir string, cs *CertSync, log *slog.Logger) *certMirror {
-	m := &certMirror{dir: dir, src: cs.Source, interval: cs.Interval, log: log, poke: make(chan struct{}, 1)}
+	m := &certMirror{dir: dir, src: cs.Source, interval: cs.Interval, log: log, poke: make(chan struct{}, 1), pokeGap: pokeEvery}
 	if m.interval <= 0 {
 		m.interval = time.Minute
 	}
@@ -509,23 +512,30 @@ func (m *certMirror) reset() {
 	m.mu.Unlock()
 }
 
-// run fetches until ctx ends: at once, then every interval; a failed fetch is retried after a
-// growing pause that never exceeds the interval.
+// run fetches until ctx ends: first the certificates the node already has on disk are told to the cache
+// (a restart, or a demotion, must not leave the node without a certificate while the leader answers),
+// then the leader's store at once and every interval; a failed fetch is retried after a growing pause
+// that never exceeds the interval. A poke (wake) brings the next fetch forward to pokeGap after the
+// last one, and never moves it back: a client that keeps asking for a name nobody mirrors must not keep the
+// scheduled fetch from happening.
 func (m *certMirror) run(ctx context.Context) {
 	m.reset()
+	m.loadStore(ctx)
 	var last time.Time
 	var wait time.Duration
+	next := time.Now()
 	for {
-		timer := time.NewTimer(wait)
+		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
 		case <-m.poke:
 			timer.Stop()
-			if time.Since(last) < pokeEvery {
-				continue
+			if at := last.Add(m.pokeGap); at.Before(next) {
+				next = at
 			}
+			continue
 		case <-timer.C:
 		}
 		last = time.Now()
@@ -535,9 +545,31 @@ func (m *certMirror) run(ctx context.Context) {
 			}
 			m.log.Warn("proxy: could not mirror the leader's certificates", "err", err)
 			wait = min(max(2*wait, 2*time.Second), m.interval)
-			continue
+		} else {
+			wait = m.interval
 		}
-		wait = m.interval
+		next = time.Now().Add(wait)
+	}
+}
+
+// loadStore tells onSnapshot of the certificates the node's own store holds, and remembers them as
+// what is shown, so that the first fetch keeps a site it lacks for one round (carryOver) as it would
+// after any other. A node that restarts while the leader cannot be reached serves them until it can.
+func (m *certMirror) loadStore(ctx context.Context) {
+	files, err := readCertStore(m.dir, m.log)
+	if err != nil {
+		m.log.Warn("proxy: could not read the certificates the node already has", "err", err)
+		return
+	}
+	if len(files) == 0 {
+		return
+	}
+	snap := peerapi.CertSnapshot{Files: files}
+	m.mu.Lock()
+	m.shown = snap
+	m.mu.Unlock()
+	if m.onSnapshot != nil {
+		m.onSnapshot(ctx, snap)
 	}
 }
 
@@ -557,6 +589,12 @@ func (m *certMirror) sync(ctx context.Context) error {
 		return err
 	default:
 		m.fetched, m.tag = snap, snapshotTag(snap)
+	}
+	if len(snap.Files) == 0 {
+		// A leader that has issued nothing yet: applySnapshot would change nothing on disk, so the
+		// cache keeps what it has as well.
+		m.have = true
+		return nil
 	}
 	shown := m.carryOver(snap)
 	if err := applySnapshot(m.dir, shown); err != nil {

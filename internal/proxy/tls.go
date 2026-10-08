@@ -95,9 +95,11 @@ type certManager struct {
 }
 
 // mirroredCert is a mirrored certificate in the cache: tag identifies its content, hash is its
-// key in the CertMagic cache.
+// key in the CertMagic cache. crt and key are the PEM it was loaded from, kept to put it back if a
+// promotion cannot load the managed copy.
 type mirroredCert struct {
 	name, tag, hash string
+	crt, key        []byte
 }
 
 // certOptions are the inputs of newCertManager.
@@ -323,7 +325,7 @@ func (cm *certManager) loadMirrored(ctx context.Context, snap peerapi.CertSnapsh
 		if ok && cur.hash != hash {
 			cm.cache.Remove([]string{cur.hash})
 		}
-		cm.mirrored[st.dir] = mirroredCert{name: st.name, tag: tag, hash: hash}
+		cm.mirrored[st.dir] = mirroredCert{name: st.name, tag: tag, hash: hash, crt: st.crt, key: st.key}
 	}
 	for dir, cur := range cm.mirrored {
 		if !seen[dir] {
@@ -343,15 +345,29 @@ func certTag(crt, key []byte) string {
 
 // startManaging makes this node the one that obtains and renews: the mirrored certificates become
 // managed ones, loaded from the mirrored tree (with the ACME account the tree holds), and management
-// starts as on a server of its own.
+// starts as on a server of its own. A certificate that cannot be loaded as a managed one stays as the
+// mirrored copy, which serves but is not renewed, so that its name keeps a certificate; the warning
+// says which.
 func (cm *certManager) startManaging(ctx context.Context) error {
 	cm.mirrorMu.Lock()
 	cm.managing.Store(true)
 	for dir, cur := range cm.mirrored {
-		// Out of the cache and the managed copy in at once: CertMagic keeps one entry per content.
+		cfg := cm.configFor(cur.name)
+		// CertMagic keeps one entry per content, so the unmanaged copy goes out before the managed one
+		// goes in. A handshake in between finds nothing cached and loads the file as a managed one
+		// itself, which is what is wanted.
 		cm.cache.Remove([]string{cur.hash})
-		if _, err := cm.configFor(cur.name).CacheManagedCertificate(ctx, cur.name); err != nil {
-			cm.log.Warn("proxy: could not take over a mirrored certificate", "name", cur.name, "err", err)
+		if _, err := cfg.CacheManagedCertificate(ctx, cur.name); err != nil {
+			hash, rerr := cfg.CacheUnmanagedCertificatePEMBytes(ctx, cur.crt, cur.key, nil)
+			if rerr != nil {
+				cm.log.Warn("proxy: could not take over a mirrored certificate, and its mirrored copy cannot be put back", "name", cur.name, "err", err, "restore_err", rerr)
+				delete(cm.mirrored, dir)
+				continue
+			}
+			cm.log.Warn("proxy: could not take over a mirrored certificate; the mirrored copy serves but is not renewed", "name", cur.name, "err", err)
+			cur.hash = hash
+			cm.mirrored[dir] = cur
+			continue
 		}
 		delete(cm.mirrored, dir)
 	}
