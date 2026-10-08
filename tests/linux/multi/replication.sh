@@ -28,8 +28,9 @@
 #   token              `supavise node token` on n1 (its daemon restarts once to listen on the peer port)
 #   join               `install.sh --join-token-file` on n2; the node is active the moment the installer returns
 #                      (the joiner stack of the AWS template signals success then)
-#   cluster            both nodes healthy, a mesh session each way, n2's copy of the registry shows the projects,
+#   cluster            the leader healthy, a mesh session each way, n2's copy of the registry shows the projects,
 #                      n2 runs the pooler and parks the other shared services
+#   follower-status    `supavise status` exits 0 on n2
 # 3. Read replicas
 #   replica-setup      POST /v1/projects/{ref}/read-replicas/setup for both projects: databases-statuses walks to
 #                      ACTIVE_HEALTHY
@@ -54,6 +55,7 @@
 # 7. Upgrade
 #   upgrade-leader     `supavise upgrade` to v0.0.2 on the leader: no PostgreSQL cluster restarts
 #   upgrade-follower   and on the follower
+#   status-final       `supavise status` exits 0 on both
 #
 # What a check needs, it names with `needs`; a state that a failed check may still have reached (a move that
 # ended with an error but moved the leader) is marked with `reached`, so that the checks after it still run.
@@ -69,7 +71,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib-checks.sh"
 
 RESULTS_TITLE="Two-server release test"
 FACT_PREFIX=replication
-CHECK_ORDER="incus services launch boot prep net install claim projects storage token join cluster replica-setup replica-shapes replica-read replica-ddl pooler lb project-switchover project-failback server-switchover server-failback hard-failover fenced rejoin upgrade-leader upgrade-follower"
+CHECK_ORDER="incus services launch boot prep net install claim projects storage token join cluster follower-status replica-setup replica-shapes replica-read replica-ddl pooler lb project-switchover project-failback server-switchover server-failback hard-failover fenced rejoin upgrade-leader upgrade-follower status-final"
 CHECK_ON_FAIL=on_fail
 
 # One prefix and one domain for the cluster: a joining server takes the leader's settings, and a domain left to the
@@ -227,7 +229,7 @@ c_cluster() {
     onl "$n" wait_nodes n1 180
     onl "$n" wait_peers 180
   done
-  for n in n1 n2; do onl "$n" wait_healthy 300; done
+  onl n1 wait_healthy 300
   onl n1 leader_services
   onl n2 follower_services
   # The registry is readable on n2, and its copy follows the leader's.
@@ -236,7 +238,15 @@ c_cluster() {
   [[ $(onl n1 node_epoch) == "$(onl n2 node_epoch)" ]] || fail "the epoch differs between the nodes"
   note cluster.epoch "$(onl n1 node_epoch)"
   mem_snapshot cluster
-  echo "# n1 leads at epoch $(onl n1 node_epoch); both healthy, a session each way; n2 serves the registry and the pooler, and parks the other shared services"
+  echo "# n1 leads at epoch $(onl n1 node_epoch) and is healthy; a session each way; n2 serves the registry and the pooler, and parks the other shared services"
+}
+
+# What `supavise status` says on a follower is its own question: a follower parks the shared services, and the
+# checks that move the cluster do not wait for it.
+c_follower_status() {
+  needs cluster
+  onl n2 wait_healthy 300
+  echo "# supavise status exits 0 on the follower n2"
 }
 
 # ---- 3. read replicas ----------------------------------------------------------------------------------------
@@ -379,7 +389,6 @@ server_move() {
   onl "$new" wait_items_rest "$ref2" 100 120
   onl "$old" data_intact "$ref1" "$sha1"
   onl "$new" wait_healthy 300
-  onl "$old" wait_healthy 300
   note "server.$old-$new.writer_silence_seconds" "$(cmp_get "$run" max_gap_s)"
   [[ $rc -eq 0 ]] || fail "supavise failover exited $rc, although the cluster did move to $new"
   echo "# the leader moved $old -> $new in $((SECONDS - t0)) s at epoch $(onl "$new" node_epoch); $(cmp_get "$run" acked) rows acknowledged, none lost, the longest silence $(cmp_get "$run" max_gap_s) s"
@@ -468,7 +477,6 @@ c_rejoin() {
   [[ $(on n1 sh -c 'ls -d /var/lib/supavise/projects/*/postgres/data.diverged-* 2>/dev/null | wc -l') -ge 1 ]] || fail "the old data of n1 was not kept as data.diverged-<epoch>"
   for ref in $(refs); do onl n2 wait_replicas "$ref" 1 1800; done
   onl n1 follower_services
-  onl n1 wait_healthy 300
   onl n2 wait_healthy 300
   echo "# n1 follows n2 again after $((SECONDS - t0)) s; its replicas are ACTIVE_HEALTHY; the old data is kept as data.diverged-<epoch>"
 }
@@ -486,7 +494,7 @@ upgrade_one() {
     || fail "$n: supavise upgrade exited $?"
   [[ $(on "$n" /usr/local/bin/supavise --version) == *v0.0.2* ]] || fail "$n: the installed binary is $(on "$n" /usr/local/bin/supavise --version)"
   [[ $(onl "$n" daemon_version) == *v0.0.2* ]] || fail "$n: the daemon runs $(onl "$n" daemon_version)"
-  onl "$n" wait_healthy 300
+  [[ $n != "$lead" ]] || onl "$n" wait_healthy 300
   onl "$n" unit_stamp >"$WORK/stamp-$n.after"
   diff -u "$WORK/stamp-$n.before" "$WORK/stamp-$n.after" || fail "$n: a PostgreSQL cluster was restarted by the upgrade"
   # The cluster as it was: two active nodes, a session between them, the replicas healthy, and a row written on the
@@ -524,6 +532,13 @@ c_upgrade_follower() {
   echo "# $f (the follower) runs v0.0.2 too; both nodes report v0.0.2; no PostgreSQL cluster restarted"
 }
 
+c_status_final() {
+  needs upgrade-follower
+  local n
+  for n in n1 n2; do onl "$n" wait_healthy 300; done
+  echo "# supavise status exits 0 on both nodes after the upgrade"
+}
+
 # ---- run -------------------------------------------------------------------------------------------------------------
 need_root
 preflight
@@ -559,7 +574,8 @@ check projects "two small projects with data, one with a Storage object" c_proje
 check storage "Storage serves the object from the S3 bucket" c_storage
 check token "n1 makes a join token" c_token
 check join "n2 joins with install.sh --join-token-file" c_join
-check_snap cluster "both nodes are healthy and n2 reads the registry" c_cluster
+check_snap cluster "the leader is healthy, a session each way, n2 reads the registry" c_cluster
+check follower-status "supavise status is healthy on the follower" c_follower_status
 check_snap replica-setup "read replicas of both projects reach ACTIVE_HEALTHY through the Management API" c_replica_setup
 check replica-shapes "GET databases and databases-statuses have the shapes Studio reads" c_replica_shapes
 check replica-read "a write on the primary is read from the replica's endpoint within the lag budget" c_replica_read
@@ -575,6 +591,7 @@ check fenced "n1 returns fenced and runs no primary" c_fenced
 check_snap rejoin "node rejoin brings n1 back as a follower" c_rejoin
 check_snap upgrade-leader "supavise upgrade of the leader restarts no PostgreSQL cluster" c_upgrade_leader
 check_snap upgrade-follower "supavise upgrade of the follower restarts no PostgreSQL cluster" c_upgrade_follower
+check status-final "supavise status is healthy on both nodes" c_status_final
 
 for n in "${NODES[@]}"; do note "$n.root_used_mb_at_end" "$(on "$n" df -BM --output=used / 2>/dev/null | tail -n1 | tr -dc 0-9 || true)"; done
 note garage.bucket "$(docker exec garage /garage bucket info "$S3_BUCKET" 2>&1 | grep -i -E 'objects|size' | paste -sd ' ' - || true)"

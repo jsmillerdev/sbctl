@@ -40,7 +40,8 @@ check() {
     *) res=FAIL ;;
   esac
   if [[ $res == FAIL ]]; then
-    detail=$(grep -h 'FAIL:' "$f" | tail -n1 | cut -c1-300 || true)
+    # The last FAIL lines: a check that wraps a helper's failure in its own message keeps both.
+    detail=$(grep -h 'FAIL:' "$f" | tail -n2 | sed 's/^[0-9:]* FAIL: //' | paste -sd '~' - | sed 's|~| // |g' | cut -c1-400 || true)
     [[ -n $detail ]] || detail=$(tail -n1 "$f" | cut -c1-300)
   else
     detail=$(grep -h '^# ' "$f" | tail -n4 | sed 's/^# //' | paste -sd ';' - | cut -c1-300 || true)
