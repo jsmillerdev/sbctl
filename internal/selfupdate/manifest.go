@@ -44,6 +44,26 @@ type Manifest struct {
 	MinUpgradeFrom string            `json:"min_upgrade_from"`
 	Artifacts      map[string]string `json:"artifacts,omitempty"`
 	Studio         string            `json:"studio,omitempty"`
+	// Host and AWS name what a node needs beyond the binary: the host layer's converge revision
+	// (`supavise system converge`) and the AWS stack revision with the signed template that
+	// brings a stack to it. MinPeerFrom is the oldest release a joined server may run alongside
+	// this one. Readers that predate the fields ignore them, so the schema stays 1.
+	Host        *ManifestHost `json:"host,omitempty"`
+	AWS         *ManifestAWS  `json:"aws,omitempty"`
+	MinPeerFrom string        `json:"min_peer_from,omitempty"`
+}
+
+// ManifestHost is the host layer a release expects.
+type ManifestHost struct {
+	ConvergeRevision int `json:"converge_revision"`
+}
+
+// ManifestAWS is the CloudFormation stack a release expects, and the release asset that holds
+// its template.
+type ManifestAWS struct {
+	StackRevision  int    `json:"stack_revision"`
+	TemplateAsset  string `json:"template_asset"`
+	TemplateSHA256 string `json:"template_sha256"`
 }
 
 var versionRe = regexp.MustCompile(`^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$`)
