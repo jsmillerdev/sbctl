@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/supavise/supavise/internal/config"
 )
 
 // objectsDir is where the test node's Storage keeps ref's objects.
@@ -866,11 +869,33 @@ func TestStorageBackendIsReadFromTheConfigFileAtEachRun(t *testing.T) {
 	if e.svc.storageIsS3() || e.svc.storageDir(testRef) == "" {
 		t.Fatal("a daemon that predates the rollback still skips the objects")
 	}
-	// An unreadable file leaves the copy it started with.
+	// An unreadable file leaves the copy it started with, and says so once.
 	if err := os.WriteFile(cfgPath, []byte("[fleet\nbroken"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if e.svc.storageIsS3() {
-		t.Fatal("a broken file switched the backend")
+	var logged bytes.Buffer
+	e.svc.opt.Log = slog.New(slog.NewTextHandler(&logged, nil))
+	for i := 0; i < 3; i++ {
+		if e.svc.storageIsS3() {
+			t.Fatal("a broken file switched the backend")
+		}
+	}
+	if n := strings.Count(logged.String(), "cannot be loaded"); n != 1 {
+		t.Fatalf("the broken file was reported %d times:\n%s", n, logged.String())
+	}
+}
+
+// A Service that loaded no config file does not go looking for one: $SUPAVISE_CONFIG and the default
+// path belong to whatever else runs on the host.
+func TestStorageBackendIgnoresAFileTheServiceWasNotGiven(t *testing.T) {
+	e := newTestEnv(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("[fleet]\nstorage_backend = \"s3\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvConfigPath, cfgPath)
+	e.svc.opt.ConfigPath = ""
+	if e.svc.storageIsS3() || e.svc.storageDir(testRef) == "" {
+		t.Fatal("a file named only by the environment steered the Service")
 	}
 }

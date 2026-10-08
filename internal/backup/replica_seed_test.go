@@ -697,9 +697,33 @@ func TestRecordBaseWritesTheRowAndTheEventOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := RemoteBase{ID: "20261008T120000Z-abcdef", Reason: ReasonFinal, Timeline: 3, StartLSN: "0/3000028", StopLSN: "0/3000120", SizeBytes: 4096}
+
+	// The backup must be complete in the store, and be the one the home reports.
+	if _, err := e.svc.RecordBase(ctx, testRef, b); err == nil || !strings.Contains(err.Error(), "not complete in the store") {
+		t.Fatalf("a backup with no manifest = %v", err)
+	}
+	started := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	m := &Manifest{Version: manifestVersion, ID: b.ID, Ref: testRef, Timeline: 3, StartLSN: "0/3000028", StopLSN: "0/3000999", StartTime: started}
+	if err := e.svc.writeManifest(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.RecordBase(ctx, testRef, b); err == nil || !strings.Contains(err.Error(), "0/3000999") {
+		t.Fatalf("a report that disagrees with the manifest = %v", err)
+	}
+	if rows, _ := e.reg.ListBackups(ctx, testRef); len(rows) != 0 {
+		t.Fatalf("a refused report left %d rows", len(rows))
+	}
+	m.StopLSN = "0/3000120"
+	if err := e.svc.writeManifest(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+
 	row, err := e.svc.RecordBase(ctx, testRef, b)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !row.StartedAt.Equal(started) {
+		t.Fatalf("the row starts at %v, the backup did at %v", row.StartedAt, started)
 	}
 	if row.ID == 0 || row.Status != registry.BackupCompleted || row.Timeline != 3 || row.StopLSN != "0/3000120" || row.SizeBytes != 4096 ||
 		!strings.HasSuffix(row.Location, testRef+"/base/20261008T120000Z-abcdef") || row.FinishedAt == nil {
@@ -716,7 +740,7 @@ func TestRecordBaseWritesTheRowAndTheEventOnce(t *testing.T) {
 	if len(evs) != 1 || evs[0].Kind != "backup.completed" {
 		t.Fatalf("events = %+v", evs)
 	}
-	for _, bad := range []string{"", "a/b", "a b", "a\nb"} {
+	for _, bad := range []string{"", "a/b", "a b", "a\nb", "..", "20261008T120000Z-abcdef/..", "20261008T120000Z-ABCDEF", "b1"} {
 		if _, err := e.svc.RecordBase(ctx, testRef, RemoteBase{ID: bad}); err == nil {
 			t.Errorf("RecordBase accepted the id %q", bad)
 		}

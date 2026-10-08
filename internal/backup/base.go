@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -139,10 +140,14 @@ type RemoteBase struct {
 	SizeBytes int64
 }
 
+// baseIDShape is the name newBackupID gives a base backup: its start time and six hex digits.
+var baseIDShape = regexp.MustCompile(`^\d{8}T\d{6}Z-[0-9a-f]{6}$`)
+
 // RecordBase records in the registry a base backup that the home node of ref took for this one: its
 // row in the backups table and its event, which BaseBackupWith writes when it runs here. The backup
-// must be complete in the store; a row that exists for it already is returned, so a report that is
-// repeated records once.
+// must be complete in the store: the manifest the home wrote is read, and its timeline and positions
+// must be the ones the home reported. A row that exists for it already is returned, so a report that
+// is repeated records once.
 func (s *Service) RecordBase(ctx context.Context, ref string, b RemoteBase) (*registry.Backup, error) {
 	if err := validRef(ref); err != nil {
 		return nil, err
@@ -150,7 +155,7 @@ func (s *Service) RecordBase(ctx context.Context, ref string, b RemoteBase) (*re
 	if err := s.need("registry", s.opt.Registry != nil); err != nil {
 		return nil, err
 	}
-	if b.ID == "" || strings.ContainsAny(b.ID, "/\\ \t\r\n") {
+	if !baseIDShape.MatchString(b.ID) {
 		return nil, fmt.Errorf("backup: %q is not a base backup id", b.ID)
 	}
 	loc := s.opt.Store.URL(baseDir(ref) + b.ID)
@@ -161,9 +166,21 @@ func (s *Service) RecordBase(ctx context.Context, ref string, b RemoteBase) (*re
 			}
 		}
 	}
+	m, err := s.readManifest(ctx, ref, b.ID)
+	if err != nil {
+		return nil, fmt.Errorf("backup: base backup %s of %s is not complete in the store: %w", b.ID, ref, err)
+	}
+	if m.Timeline != b.Timeline || m.StartLSN != b.StartLSN || m.StopLSN != b.StopLSN {
+		return nil, fmt.Errorf("backup: the manifest of base backup %s of %s says timeline %d, WAL %s to %s; the report says timeline %d, WAL %s to %s",
+			b.ID, ref, m.Timeline, m.StartLSN, m.StopLSN, b.Timeline, b.StartLSN, b.StopLSN)
+	}
 	now := s.opt.Now().UTC()
+	started := m.StartTime
+	if started.IsZero() {
+		started = now
+	}
 	rec := &registry.Backup{Ref: ref, Kind: "base", Status: registry.BackupCompleted, Location: loc,
-		Timeline: b.Timeline, StartLSN: b.StartLSN, StopLSN: b.StopLSN, SizeBytes: b.SizeBytes, StartedAt: now, FinishedAt: &now}
+		Timeline: b.Timeline, StartLSN: b.StartLSN, StopLSN: b.StopLSN, SizeBytes: b.SizeBytes, StartedAt: started, FinishedAt: &now}
 	if err := s.opt.Registry.CreateBackup(ctx, rec); err != nil {
 		return nil, err
 	}
