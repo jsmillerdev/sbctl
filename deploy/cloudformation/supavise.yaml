@@ -232,6 +232,8 @@ Parameters:
       Names the servers of one Supavise cluster: it is the supavise:cluster tag of their instances,
       Elastic IPs and instance roles, and the failover permissions test it. Empty uses the stack
       name. A replica server uses the name of the leader's stack (the leader's ClusterName output).
+      Give each independent deployment in one AWS account its own name: stack names repeat across
+      regions, and the failover permissions and the Storage role trust the name in every region.
   Failover:
     Type: String
     Default: "off"
@@ -752,8 +754,8 @@ Resources:
             Resource: !Ref KeyEscrowSecret
   # Storage runs without the instance role (the metadata service is denied to it). The daemon
   # assumes this role for it and hands it the short-lived credentials, so that no access key exists
-  # for the objects bucket. Its own role by ARN; the roles of the other servers of the cluster by
-  # their supavise:cluster tag, because those are made later in other stacks.
+  # for the objects bucket. Its own role by ARN; the roles (never users) of the other servers of the
+  # cluster by their supavise:cluster tag, because those are made later in other stacks.
   StorageRole:
     Type: AWS::IAM::Role
     Condition: NotJoiner
@@ -770,6 +772,7 @@ Resources:
             Action: "sts:AssumeRole"
             Condition:
               StringEquals: { "aws:PrincipalTag/supavise:cluster": !If [HasClusterName, !Ref ClusterName, !Ref "AWS::StackName"] }
+              ArnLike: { "aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*" }
       Policies:
         - PolicyName: objects-bucket
           PolicyDocument:

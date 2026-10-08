@@ -191,13 +191,16 @@ func TestStorageRole(t *testing.T) {
 	if has(trust[0], "Condition") {
 		t.Error("the stack's own role needs no condition")
 	}
-	// The second statement trusts the account, and only for roles that carry the cluster's tag.
+	// The second statement trusts the account, and only for roles (not users) that carry the cluster's tag.
 	if got := fmt.Sprint(get(t, trust[1], "Principal", "AWS")); got != "map[Fn::Sub:arn:${AWS::Partition}:iam::${AWS::AccountId}:root]" {
 		t.Errorf("the second principal is %s, want this account's root", got)
 	}
 	cond := get(t, trust[1], "Condition").(doc)
-	if len(cond) != 1 || fmt.Sprint(get(t, cond, "StringEquals")) != "map[aws:PrincipalTag/supavise:cluster:"+clusterTag+"]" {
-		t.Errorf("the second statement must test the supavise:cluster tag of the caller and nothing else: %v", cond)
+	if len(cond) != 2 || fmt.Sprint(get(t, cond, "StringEquals")) != "map[aws:PrincipalTag/supavise:cluster:"+clusterTag+"]" {
+		t.Errorf("the second statement must test the supavise:cluster tag of the caller and nothing else but its kind: %v", cond)
+	}
+	if got := fmt.Sprint(get(t, cond, "ArnLike")); got != "map[aws:PrincipalArn:map[Fn::Sub:arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*]]" {
+		t.Errorf("the second statement must admit roles of this account only, not users: %s", got)
 	}
 
 	// What the role may do: the bucket's objects and nothing else, and not another bucket.

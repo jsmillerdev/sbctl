@@ -16,14 +16,16 @@ Every parameter added after revision 1 defaults to off:
 | Parameter | Turns on |
 |---|---|
 | `Failover` (`off`) | `FencingPolicy`: stop and re-address resources that carry the cluster tag, three describe calls |
-| `ClusterName` (the stack name) | the value of the `supavise:cluster` tag that the fencing permissions and the Storage role test |
+| `ClusterName` (the stack name) | the value of the `supavise:cluster` tag that the fencing permissions and the Storage role test; give each independent deployment in one account its own (see below) |
 | `PeerCidr1..3` | a rule for port 7443 from that range, one `AWS::EC2::SecurityGroupIngress` each |
 | `JoinLeader`, `JoinTokenSecretArn`, `BackupBucketName`, `BackupBucketRegion`, `ObjectsBucketName`, `StorageRoleArn` | the replica server stack: no buckets, no claim token, a short user data that installs the verified release and joins, a second private address |
 | `AvailabilityZone` | the zone of the subnet the stack makes |
 
 ## Storage credentials
 
-Storage cannot use the instance role (the metadata service is denied to it). The stack makes `StorageRole`, scoped to `ObjectsBucket`; the instance role may assume exactly that role (`StorageAssumePolicy`); the daemon assumes it and hands Storage the short-lived credentials. No IAM user, access key or stored secret exists. The role trusts the stack's instance role by ARN and the roles of the cluster's other servers by their `supavise:cluster` tag.
+Storage cannot use the instance role (the metadata service is denied to it). The stack makes `StorageRole`, scoped to `ObjectsBucket`; the instance role may assume exactly that role (`StorageAssumePolicy`); the daemon assumes it and hands Storage the short-lived credentials. No IAM user, access key or stored secret exists. The role trusts the stack's instance role by ARN and the roles (never users) of the cluster's other servers by their `supavise:cluster` tag.
+
+The tag is what ties the servers of one cluster together, in every region: the fencing permissions cover the instances and addresses of the account that carry it, and the Storage role admits the roles that carry it. Stack names repeat across regions, so two independent deployments in one account that both keep the default (`supavise` in us-east-1 and in eu-west-1, say) share a cluster name, and a server with `Failover` on could stop the other deployment's instance. Set a distinct `ClusterName` for each.
 
 ## What the tests guard
 
