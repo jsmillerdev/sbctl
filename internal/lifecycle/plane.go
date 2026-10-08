@@ -2,6 +2,8 @@ package lifecycle
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jsmillerdev/supavise/internal/config"
@@ -267,6 +270,7 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 	if err != nil {
 		return err
 	}
+	before := pl.digest(spec)
 	changed := false
 	if cr, ok := pl.sup.(units.ChangeRenderer); ok {
 		if changed, err = cr.RenderChanged(ctx, spec); err != nil {
@@ -275,16 +279,25 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 	} else if err := pl.sup.Render(ctx, spec); err != nil {
 		return err
 	}
-	if changed {
+	if changed || pl.hasHeld(spec) {
 		// A running cluster keeps the settings it started with (Start on a running unit is
 		// a no-op), so changed sizing, archive_command or launcher path need a restart.
 		st, serr := pl.sup.Status(ctx, spec.Unit())
 		running := serr != nil || st.State == units.StateActive || st.State == units.StateActivating
 		switch {
 		case !running:
+			pl.clearHeld(spec)
+		case serr == nil && pl.heldState(spec, st) == heldSettled:
+			// The cluster runs exactly the files rendered now: a rollback rendered back the files
+			// that a held-back restart never replaced.
+		case !changed:
+			// Rendered earlier, the restart held back, and nothing deferred now: it waits for the
+			// rollout (PendingRestart), the only restart of clusters that runs in canary order.
+			pl.log.Info("postgres restart still held back; `supavise upgrade` restarts it", "unit", spec.Unit())
 		case restartsDeferred(ctx):
 			// A restart stops the project's GoTrue and PostgREST with it (their units require the
 			// cluster), so it belongs to the upgrade's rollout like theirs (RestartPending).
+			pl.holdBack(spec, before)
 			pl.log.Info("postgres settings changed; the restart waits for the upgrade's rollout", "unit", spec.Unit())
 		case serr != nil:
 			// Cannot tell whether it runs. Start on a running unit is a no-op, so skipping
@@ -294,11 +307,13 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
 				return err
 			}
+			pl.clearHeld(spec)
 		default:
 			pl.log.Info("postgres settings changed; restarting the running cluster", "unit", spec.Unit())
 			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
 				return err
 			}
+			pl.clearHeld(spec)
 		}
 	}
 	if err := pl.sup.Start(ctx, spec.Unit()); err != nil {
@@ -353,29 +368,40 @@ func (pl *PostgresPlane) startAPI(ctx context.Context, p *registry.Project, keys
 }
 
 // renderStopIfChanged renders spec and, when the unit runs older files than the ones rendered
-// (changed now, or rendered earlier and left running), stops the unit, so that the Start that
-// follows runs the new files: Start on a running unit is a no-op, and GoTrue or PostgREST would
+// (changed now, rendered earlier and left running, or held back), stops the unit, so that the Start
+// that follows runs the new files: Start on a running unit is a no-op, and GoTrue or PostgREST would
 // otherwise keep the binary and settings it started with after a release or a setting changed
 // what the unit runs. An unchanged unit is left alone. A context marked DeferRestarts renders
-// and leaves the unit running: the upgrade's rollout restarts it (RestartPending).
+// and leaves the unit running, with a mark that the restart is owed: the upgrade's rollout restarts
+// it (RestartPending).
 func (pl *PostgresPlane) renderStopIfChanged(ctx context.Context, spec units.Spec) error {
+	before := pl.digest(spec)
 	changed, err := pl.render(ctx, spec)
 	if err != nil {
 		return err
 	}
 	st, err := pl.sup.Status(ctx, spec.Unit())
 	if err != nil || (st.State != units.StateActive && st.State != units.StateActivating) {
+		pl.clearHeld(spec)
 		return nil
 	}
-	if !changed && !pl.filesNewerThan(spec, st) {
+	held := pl.heldState(spec, st)
+	if held == heldSettled || (!changed && held == heldNone && !pl.filesNewerThan(spec, st)) {
 		return nil
 	}
 	if restartsDeferred(ctx) {
+		if changed {
+			pl.holdBack(spec, before)
+		}
 		pl.log.Info("service files changed; the restart waits for the upgrade's rollout", "unit", spec.Unit())
 		return nil
 	}
 	pl.log.Info("service files changed; restarting the running unit", "unit", spec.Unit())
-	return pl.sup.Stop(ctx, spec.Unit())
+	if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
+		return err
+	}
+	pl.clearHeld(spec)
+	return nil
 }
 
 // render renders spec and reports whether its files changed.
@@ -400,6 +426,103 @@ func (pl *PostgresPlane) filesNewerThan(spec units.Spec, st units.Status) bool {
 		}
 	}
 	return false
+}
+
+// A restart the daemon held back is recorded in a mark next to the unit's env file
+// (<svc>.held), which holds the digest of the files the running process started with. The mark makes
+// the owed restart visible to the rollout however long ago the files were rendered, and lets a
+// rollback tell a unit that never restarted (the files rendered back are the digest in its mark: it
+// already runs them) from one the rollout restarted onto the new files.
+type heldState int
+
+const (
+	heldNone    heldState = iota // no restart is owed
+	heldPending                  // the unit runs files other than the rendered ones
+	heldSettled                  // the unit runs exactly the rendered files; the mark is gone
+)
+
+func (pl *PostgresPlane) heldPath(spec units.Spec) string {
+	return strings.TrimSuffix(units.FilesFor(pl.cfg, spec).Env, ".env") + ".held"
+}
+
+// digest hashes the rendered env file and run script of spec; "" when there are none.
+func (pl *PostgresPlane) digest(spec units.Spec) string {
+	files := units.FilesFor(pl.cfg, spec)
+	h := sha256.New()
+	found := false
+	for _, f := range []string{files.Env, files.Run} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		found = true
+		h.Write([]byte(f))
+		h.Write(b)
+	}
+	if !found {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (pl *PostgresPlane) hasHeld(spec units.Spec) bool {
+	_, err := os.Stat(pl.heldPath(spec))
+	return err == nil
+}
+
+// holdBack records that spec's running unit keeps the files with digest before. A mark that is
+// there already names older files and stays.
+func (pl *PostgresPlane) holdBack(spec units.Spec, before string) {
+	if pl.hasHeld(spec) {
+		return
+	}
+	if before == "" {
+		before = "-" // unknown: the restart is always owed
+	}
+	if err := os.WriteFile(pl.heldPath(spec), []byte(before+"\n"), 0o644); err != nil {
+		pl.log.Warn("could not record the held-back restart; `supavise upgrade` may not find it", "unit", spec.Unit(), "error", err)
+	}
+}
+
+func (pl *PostgresPlane) clearHeld(spec units.Spec) { _ = os.Remove(pl.heldPath(spec)) }
+
+// heldState reads the mark of spec for a unit that runs (status st). A mark older than the unit's
+// process is stale (the unit restarted on its own since) and is removed. One that names the digest
+// of the files rendered now is removed too, and the files get the unit's start time as their
+// modification time, so that filesNewerThan does not take the render that put them back for a
+// restart that is owed.
+func (pl *PostgresPlane) heldState(spec units.Spec, st units.Status) heldState {
+	path := pl.heldPath(spec)
+	fi, err := os.Stat(path)
+	if err != nil {
+		return heldNone
+	}
+	if !st.Since.IsZero() && fi.ModTime().Before(st.Since) {
+		_ = os.Remove(path)
+		return heldNone
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return heldPending
+	}
+	if d := strings.TrimSpace(string(b)); d != "" && d != "-" && d == pl.digest(spec) {
+		_ = os.Remove(path)
+		if !st.Since.IsZero() {
+			files := units.FilesFor(pl.cfg, spec)
+			for _, f := range []string{files.Env, files.Run} {
+				_ = os.Chtimes(f, st.Since, st.Since)
+			}
+		}
+		return heldSettled
+	}
+	return heldPending
+}
+
+// HeldRestart reports whether a restart of a unit of project ref is recorded as held back. It
+// reads the marks only; Engine.PendingRestart is the check that also looks at the unit.
+func HeldRestart(cfg *config.Config, ref string) bool {
+	m, _ := filepath.Glob(filepath.Join(cfg.Paths().Project(ref), "*.held"))
+	return len(m) > 0
 }
 
 type deferRestartsKey struct{}
@@ -447,9 +570,12 @@ func (pl *PostgresPlane) pendingAPI(ctx context.Context, p *registry.Project, ke
 		}
 		st, err := pl.sup.Status(ctx, spec.Unit())
 		if err != nil || (st.State != units.StateActive && st.State != units.StateActivating) {
+			pl.clearHeld(spec)
 			continue
 		}
-		if changed || pl.filesNewerThan(spec, st) {
+		switch held := pl.heldState(spec, st); {
+		case held == heldSettled:
+		case changed, held == heldPending, pl.filesNewerThan(spec, st):
 			out = append(out, spec)
 		}
 	}
@@ -457,8 +583,9 @@ func (pl *PostgresPlane) pendingAPI(ctx context.Context, p *registry.Project, ke
 }
 
 // pendingDatabase renders the cluster unit of p and returns its spec when the running cluster
-// started on older files than the ones rendered. A saved setting that waits for a restart renders
-// into the unit too, so such a cluster counts as pending.
+// owes a restart: this render changed its files, or the daemon held the restart back (the mark). A
+// setting an Owner saved without restarting also renders into the unit, but the upgrade does not
+// owe that restart, so it does not count; a restart the release owes applies it too.
 func (pl *PostgresPlane) pendingDatabase(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (*units.Spec, error) {
 	spec, err := pl.postgresSpec(ctx, p, keys)
 	if err != nil {
@@ -470,9 +597,12 @@ func (pl *PostgresPlane) pendingDatabase(ctx context.Context, p *registry.Projec
 	}
 	st, err := pl.sup.Status(ctx, spec.Unit())
 	if err != nil || (st.State != units.StateActive && st.State != units.StateActivating) {
+		pl.clearHeld(spec)
 		return nil, nil
 	}
-	if changed || pl.filesNewerThan(spec, st) {
+	switch held := pl.heldState(spec, st); {
+	case held == heldSettled:
+	case changed, held == heldPending:
 		return &spec, nil
 	}
 	return nil, nil
@@ -511,11 +641,13 @@ func (pl *PostgresPlane) RestartPending(ctx context.Context, p *registry.Project
 			if err := pl.sup.Stop(ctx, all[i].Unit()); err != nil {
 				return false, err
 			}
+			pl.clearHeld(all[i])
 		}
 		pl.log.Info("postgres files changed; restarting the running cluster", "unit", db.Unit())
 		if err := pl.sup.Stop(ctx, db.Unit()); err != nil {
 			return false, err
 		}
+		pl.clearHeld(*db)
 		if err := pl.StartDatabase(ctx, p, keys); err != nil {
 			return false, err
 		}
@@ -525,6 +657,7 @@ func (pl *PostgresPlane) RestartPending(ctx context.Context, p *registry.Project
 			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
 				return false, err
 			}
+			pl.clearHeld(spec)
 		}
 	}
 	return true, pl.startAPI(ctx, p, keys)

@@ -377,14 +377,19 @@ type recSup struct {
 	state   units.State
 	changed bool
 	since   time.Time // when the running unit started; zero: unknown
+	// render, when set, rewrites the unit's files in RenderChanged, as a render that changed them does.
+	render func(units.Spec)
 }
 
 func (r *recSup) Render(context.Context, units.Spec) error {
 	r.calls = append(r.calls, "render")
 	return nil
 }
-func (r *recSup) RenderChanged(context.Context, units.Spec) (bool, error) {
+func (r *recSup) RenderChanged(_ context.Context, spec units.Spec) (bool, error) {
 	r.calls = append(r.calls, "render")
+	if r.changed && r.render != nil {
+		r.render(spec)
+	}
 	return r.changed, nil
 }
 func (r *recSup) Start(context.Context, string) error { r.calls = append(r.calls, "start"); return nil }
@@ -609,7 +614,8 @@ func (n *namedSup) Stop(ctx context.Context, unit string) error {
 
 // The rollout finds a cluster the daemon left on older files and restarts it: GoTrue and PostgREST
 // stop first (their units require the cluster), then the cluster, and it starts again on the
-// rendered files. A project whose cluster is current is not touched.
+// rendered files. A project whose cluster is current is not touched, and neither is one whose only
+// newer file is a setting an Owner saved without restarting.
 func TestRestartPendingRestartsAClusterOnOlderFiles(t *testing.T) {
 	const ref = "abcdefghijklmnopqrst"
 	now := time.Now()
@@ -618,22 +624,24 @@ func TestRestartPendingRestartsAClusterOnOlderFiles(t *testing.T) {
 	cfg.Domain = "example.test"
 	cfg.BinPath = "/usr/local/bin/supavise"
 	p := testProject(cfg, ref, 2)
-	pgFiles := units.FilesFor(cfg, units.Spec{Service: config.SvcPostgres, Ref: ref})
-	// The API units' files are old; the cluster's were rendered after the process started.
-	writeAPIFiles(t, cfg, ref, now.Add(-2*time.Hour))
-	for _, f := range []string{pgFiles.Env, pgFiles.Run} {
-		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chtimes(f, now, now); err != nil {
-			t.Fatal(err)
+	pgSpec := units.Spec{Service: config.SvcPostgres, Ref: ref}
+	version := "v1"
+	writeVersion := func(spec units.Spec) {
+		files := units.FilesFor(cfg, spec)
+		for _, f := range []string{files.Env, files.Run} {
+			if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f, []byte(version+spec.Service), 0o644); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
+	writeAPIFiles(t, cfg, ref, now.Add(-2*time.Hour))
+	writeVersion(pgSpec)
+	pgFiles := units.FilesFor(cfg, pgSpec)
 	newPlane := func(started time.Time) (*PostgresPlane, *namedSup) {
-		sup := &namedSup{recSup: recSup{state: units.StateActive, since: started}}
+		sup := &namedSup{recSup: recSup{state: units.StateActive, since: started, render: writeVersion}}
 		return NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: time.Millisecond, ServiceReadyTimeout: time.Millisecond}), sup
 	}
 
@@ -645,18 +653,40 @@ func TestRestartPendingRestartsAClusterOnOlderFiles(t *testing.T) {
 		t.Fatalf("current: restarted = %v, %v, units %v", restarted, err, sup.units)
 	}
 
-	pl, sup = newPlane(now.Add(-time.Hour)) // started before the cluster's files, after the API's
-	if pending, err := pl.PendingRestart(context.Background(), p, testKeys(t, ref)); err != nil || !pending {
-		t.Fatalf("held back: pending = %v, %v", pending, err)
+	// An Owner saved a setting without restarting: the cluster's files are newer than its process,
+	// and the upgrade owes no restart for that.
+	pl, _ = newPlane(now.Add(-time.Hour))
+	if err := os.Chtimes(pgFiles.Env, now, now); err != nil {
+		t.Fatal(err)
 	}
-	// The daemon's start leaves the cluster running...
+	if pending, err := pl.PendingRestart(context.Background(), p, testKeys(t, ref)); err != nil || pending {
+		t.Fatalf("saved setting: pending = %v, %v", pending, err)
+	}
+
+	// The new release renders different files: the daemon's start leaves the cluster running and
+	// records the owed restart.
+	pl, sup = newPlane(now.Add(-time.Hour))
+	version, sup.changed = "v2", true
 	_ = pl.StartDatabase(DeferRestarts(context.Background()), p, testKeys(t, ref))
 	if len(sup.units) != 1 || !strings.HasPrefix(sup.units[0], "start ") {
 		t.Fatalf("a deferred start touched the running cluster: %v", sup.units)
 	}
+	if !HeldRestart(cfg, ref) {
+		t.Fatal("the deferred restart left no mark")
+	}
+	sup.changed, sup.units = false, nil
+	if pending, err := pl.PendingRestart(context.Background(), p, testKeys(t, ref)); err != nil || !pending {
+		t.Fatalf("held back: pending = %v, %v", pending, err)
+	}
+	// A later start of the daemon, with no upgrade deferring, leaves the cluster alone too: its
+	// restart is the rollout's, and the mark keeps it from being forgotten.
+	_ = pl.StartDatabase(context.Background(), p, testKeys(t, ref))
+	if len(sup.units) != 1 || !strings.HasPrefix(sup.units[0], "start ") || !HeldRestart(cfg, ref) {
+		t.Fatalf("a later start did not leave the held-back cluster alone: %v, held %v", sup.units, HeldRestart(cfg, ref))
+	}
 	sup.units = nil
-	// ...and the rollout restarts it, even when it carries a deferral. (Nothing answers, so the
-	// wait for the cluster ends the call; the order of the stops and the start is what is checked.)
+	// The rollout restarts it, even when it carries a deferral. (Nothing answers, so the wait for the
+	// cluster ends the call; the order of the stops and the start is what is checked.)
 	_, _ = pl.RestartPending(DeferRestarts(context.Background()), p, testKeys(t, ref))
 	cluster := config.UnitName(config.SvcPostgres, ref)
 	var want []string
@@ -666,6 +696,141 @@ func TestRestartPendingRestartsAClusterOnOlderFiles(t *testing.T) {
 	want = append(want, "stop "+config.UnitName(config.SvcGoTrue, ref), "stop "+cluster, "start "+cluster)
 	if got := strings.Join(sup.units, ", "); got != strings.Join(want, ", ") {
 		t.Fatalf("units:\n got %s\nwant %s", got, strings.Join(want, ", "))
+	}
+	if HeldRestart(cfg, ref) {
+		t.Fatal("the restart left its mark behind")
+	}
+}
+
+// A rollback renders the old release's files back. A cluster the rollout never restarted still runs
+// them, so the daemon of the old release must not restart it (its mark names the digest of the
+// files it runs); a cluster the rollout did restart runs the new files and is restarted onto the
+// old ones. The same holds for GoTrue and PostgREST, and the render that put the files back must not
+// look like a restart that is owed later.
+func TestRollbackRestartsOnlyUnitsTheRolloutRestarted(t *testing.T) {
+	const reached, untouched = "abcdefghijklmnopqrst", "tsrqponmlkjihgfedcba"
+	now := time.Now()
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	cfg.Domain = "example.test"
+	cfg.BinPath = "/usr/local/bin/supavise"
+	version := "v1"
+	writeVersion := func(spec units.Spec) {
+		files := units.FilesFor(cfg, spec)
+		for _, f := range []string{files.Env, files.Run} {
+			if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f, []byte(version+spec.Service), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(f, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	specs := func(ref string) []units.Spec {
+		out := []units.Spec{{Service: config.SvcPostgres, Ref: ref}, {Service: config.SvcGoTrue, Ref: ref}}
+		if hasPostgREST(ref) {
+			out = append(out, units.Spec{Service: config.SvcPostgREST, Ref: ref})
+		}
+		return out
+	}
+	for _, ref := range []string{reached, untouched} {
+		for _, spec := range specs(ref) {
+			writeVersion(spec)
+		}
+	}
+	started := now.Add(-time.Hour)
+	newPlane := func() (*PostgresPlane, *namedSup) {
+		sup := &namedSup{recSup: recSup{state: units.StateActive, since: started, render: writeVersion}}
+		return NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: time.Millisecond, ServiceReadyTimeout: time.Millisecond}), sup
+	}
+	startAll := func(pl *PostgresPlane, ctx context.Context, ref string) {
+		p := testProject(cfg, ref, 2)
+		_ = pl.StartDatabase(ctx, p, testKeys(t, ref))
+		for _, spec := range specs(ref)[1:] {
+			_ = pl.renderStopIfChanged(ctx, spec)
+		}
+	}
+
+	// The new release's daemon renders v2 for both projects and holds the restarts back; the
+	// rollout restarts one of them, which is the canary that failed.
+	pl, sup := newPlane()
+	version, sup.changed = "v2", true
+	for _, ref := range []string{reached, untouched} {
+		startAll(pl, DeferRestarts(context.Background()), ref)
+	}
+	for _, u := range sup.units {
+		if strings.HasPrefix(u, "stop ") {
+			t.Fatalf("the deferred starts stopped a unit: %v", sup.units)
+		}
+	}
+	sup.changed = false
+	_, _ = pl.RestartPending(context.Background(), testProject(cfg, reached, 2), testKeys(t, reached))
+	// The restarted project's process is newer than its files now.
+	restartedAt := time.Now().Add(time.Hour)
+	sup.since = restartedAt
+
+	// The old release's daemon renders v1 back, with no deferral (the units are the old daemon's to
+	// start, which a daemon built before the marks would also restart in full).
+	version = "v1"
+	pl2, sup2 := newPlane()
+	sup2.changed, sup2.since = true, started
+	startAll(pl2, context.Background(), untouched)
+	for _, u := range sup2.units {
+		if strings.HasPrefix(u, "stop ") {
+			t.Fatalf("the old daemon restarted a unit the rollout never reached: %v", sup2.units)
+		}
+	}
+	if HeldRestart(cfg, untouched) {
+		t.Fatal("the marks of the project the rollout never reached are still there")
+	}
+	// A later start finds nothing owed either: the files were put back with the process's start time.
+	sup2.units, sup2.changed = nil, false
+	startAll(pl2, context.Background(), untouched)
+	for _, u := range sup2.units {
+		if strings.HasPrefix(u, "stop ") {
+			t.Fatalf("a later start restarted a unit that runs the rendered files: %v", sup2.units)
+		}
+	}
+
+	// The project the rollout restarted runs v2: the old daemon restarts it onto v1.
+	pl3, sup3 := newPlane()
+	sup3.changed, sup3.since = true, restartedAt
+	startAll(pl3, context.Background(), reached)
+	var stops int
+	for _, u := range sup3.units {
+		if strings.HasPrefix(u, "stop ") {
+			stops++
+		}
+	}
+	if stops == 0 {
+		t.Fatalf("the old daemon did not restart the project the rollout had restarted: %v", sup3.units)
+	}
+}
+
+// A mark older than the process of its unit is stale: the unit restarted by itself since.
+func TestHeldMarkOlderThanTheProcessIsDropped(t *testing.T) {
+	const ref = "abcdefghijklmnopqrst"
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	cfg.Domain = "example.test"
+	cfg.BinPath = "/usr/local/bin/supavise"
+	writeAPIFiles(t, cfg, ref, time.Now().Add(-2*time.Hour))
+	spec := units.Spec{Service: config.SvcGoTrue, Ref: ref}
+	sup := &recSup{state: units.StateActive, since: time.Now().Add(time.Hour)} // started after the mark
+	pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{})
+	pl.holdBack(spec, "abc")
+	if !HeldRestart(cfg, ref) {
+		t.Fatal("no mark written")
+	}
+	p := testProject(cfg, ref, 2)
+	if pending, err := pl.PendingRestart(context.Background(), p, testKeys(t, ref)); err != nil || pending {
+		t.Fatalf("stale mark: pending = %v, %v", pending, err)
+	}
+	if HeldRestart(cfg, ref) {
+		t.Fatal("the stale mark stayed")
 	}
 }
 

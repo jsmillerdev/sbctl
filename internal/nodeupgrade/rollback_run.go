@@ -76,6 +76,7 @@ func Rollback(ctx context.Context, h Host, o Options) error {
 		o.say("%d project(s) go back to the releases they ran before the upgrade: %s", len(moves), refList(refs))
 		o.say("note: GoTrue's database migrations only go forward; the older GoTrue runs on the schema the newer one left")
 	}
+	o.say("note: when the old daemon starts it restarts, one after another and outside the canary and batches, every project whose PostgreSQL, GoTrue or PostgREST files %s and %s render differently and that runs the newer files; each such restart drops the project's database connections. A project that still runs the files of %s keeps running. A release built without the held-back-restart marks restarts every project whose files differ.", node.Version, prev.Version, prev.Version)
 	if !o.Yes {
 		ok, err := h.Confirm("Roll back now?")
 		if err != nil {

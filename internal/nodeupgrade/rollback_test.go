@@ -76,6 +76,8 @@ func TestRollbackGoesBackToThePreviousRelease(t *testing.T) {
 	}
 	mustContain(t, h.out.String(), "Supavise v1.1.0 -> v1.0.0")
 	mustContain(t, h.out.String(), "2 project(s) go back")
+	mustContain(t, h.out.String(), "one after another and outside the canary and batches")
+	mustContain(t, h.out.String(), "drops the project's database connections")
 	if got := strings.Join(h.marks, " "); got != "rolling_back rolling_back rolled_back" {
 		t.Fatalf("phases = %s", got)
 	}

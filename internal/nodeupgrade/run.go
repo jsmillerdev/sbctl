@@ -347,11 +347,14 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	// A new binary can render a project's PostgreSQL, GoTrue or PostgREST files differently without moving a
 	// release; the daemon leaves those units running while the upgrade runs, and the rollout
 	// restarts them, so the rollout runs after every change of binary.
-	if len(plan.Upgrade) > 0 || plan.BinaryChange {
+	if plan.Rollout() {
 		r.mark(PhaseProjects, fmt.Sprintf("upgrading %d project(s)", len(plan.Upgrade)))
 		o.say("upgrading %d project(s): %d canary, then %d at a time", len(plan.Upgrade), plan.Canary, plan.Batch)
-		if len(plan.Upgrade) == 0 {
+		if plan.BinaryChange {
 			o.say("(and restarting the projects whose service files the new release renders differently, PostgreSQL included)")
+		}
+		if len(plan.Pending) > 0 {
+			o.say("(and restarting %d project(s) whose restart an earlier upgrade held back)", len(plan.Pending))
 		}
 		var err error
 		if projectMoves, err = h.UpgradeProjects(ctx, plan.ProjectTarget, r.started); err != nil {
@@ -464,6 +467,9 @@ func (r *run) rollback(ctx context.Context, prev Record, moves []ProjectMove, ca
 	if err := rollBackTo(ctx, r.h, r.o, rollbackArgs{From: r.plan.To, FromPins: r.plan.Target.Pins, To: &prev, Moves: moves, Verdict: r.node.Verdict, Mark: r.mark}); err != nil {
 		r.mark(PhaseFailed, err.Error())
 		o.log().Error("upgrade_needs_operator", "error", err.Error())
+		if errors.Is(err, ErrRegistryNewer) {
+			err = fmt.Errorf("%w. The projects the rollout had not reached may still run the PostgreSQL, GoTrue and PostgREST they ran before, on the settings of the old release; `sudo supavise upgrade` restarts them in canary order", err)
+		}
 		return &Failure{Code: ExitNeedsOperator, Err: fmt.Errorf("%w (the upgrade failed because: %v)", err, cause)}
 	}
 	r.mark(PhaseRolledBack, cause.Error())

@@ -38,6 +38,11 @@
 #     v0.0.9): the worker is told to stop and is not killed, the upgrade rolls back (exit status 3),
 #     and no project is left UPGRADING.
 #
+#  9. A release that renders the projects' PostgreSQL differently (v0.0.10): the daemon leaves the
+#     clusters running, the rollout restarts them.
+# 10. `supavise rollback` from v0.0.10: its output names the restarts, and the old daemon restarts the
+#     clusters onto the old settings.
+
 # Needs root, systemd, cgroup v2 and network access (artifact downloads). Do not run it on a
 # machine you care about: it creates the supavise user, writes /etc/supavise and starts real
 # clusters. Exit status is non-zero on the first failure.
@@ -536,5 +541,27 @@ done
 intact "$REF"; intact "$REF2"
 sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
 [[ $sup_status -eq 0 ]] || { cat "$WORK/status.txt" >&2; fail "supavise status exited $sup_status after the upgrade to v0.0.10"; }
+
+# ---- 10. going back across a release that renders PostgreSQL differently -----------------------
+log "supavise rollback after v0.0.10: the output names the restarts, the old daemon restarts the clusters the rollout had restarted"
+PG_PID=$(pg_pid "$REF") PG_PID2=$(pg_pid "$REF2")
+run "$SV" rollback --yes
+[[ $RC -eq 0 ]] || { journalctl --no-pager -u supavise.service | tail -60 >&2; fail "the rollback from v0.0.10 exited $RC: $OUT"; }
+EXPECT_VERSION=v0.0.6
+for want in "one after another and outside the canary and batches" "drops the project's database connections" "Supavise v0.0.6 is running"; do
+  [[ $OUT == *"$want"* ]] || fail "the rollback's output lacks '$want':
+$OUT"
+done
+wait_daemon; [[ $(daemon_version) == *v0.0.6* ]] || fail "the daemon runs $(daemon_version)"
+wait_status "$REF" ACTIVE_HEALTHY 180; wait_status "$REF2" ACTIVE_HEALTHY 180
+for r in "$REF" "$REF2"; do
+  for ((i = 0; i < 120; i++)); do [[ $(pg_sock "$r" "show max_connections" 2>/dev/null || true) == 60 ]] && break; sleep 1; done
+  [[ $(pg_sock "$r" "show max_connections") == 60 ]] || fail "$r: PostgreSQL still runs the settings of v0.0.10 after the rollback"
+done
+[[ $(pg_pid "$REF") != "$PG_PID" && $(pg_pid "$REF2") != "$PG_PID2" ]] || fail "the old daemon did not restart a cluster that runs the newer settings"
+journalctl --no-pager -u supavise.service | grep -q "postgres settings changed; restarting the running cluster" || fail "the old daemon did not restart the clusters"
+intact "$REF"; intact "$REF2"
+sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
+[[ $sup_status -eq 0 ]] || { cat "$WORK/status.txt" >&2; fail "supavise status exited $sup_status after the rollback from v0.0.10"; }
 
 log "upgrade end to end: all checks passed"

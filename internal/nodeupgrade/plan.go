@@ -39,6 +39,9 @@ type Plan struct {
 	Upgrade []string
 	Skipped []SkippedProject
 	Current int
+	// Pending lists the projects, not in Upgrade, whose service files an earlier upgrade rendered
+	// and whose restart it held back; the rollout restarts them.
+	Pending []string
 	// HeldBack counts projects that keep their PostgreSQL release because IncludePostgres is
 	// not set, and HeldTo is the release they would move to.
 	HeldBack int
@@ -63,9 +66,15 @@ type SkippedProject struct {
 }
 
 // Empty reports whether the upgrade has nothing to do: same binary, services already on the
-// target, no project to move.
+// target, no project to move or to restart.
 func (p *Plan) Empty() bool {
-	return !p.BinaryChange && len(p.Shared) == 0 && len(p.System) == 0 && len(p.Upgrade) == 0
+	return !p.BinaryChange && len(p.Shared) == 0 && len(p.System) == 0 && len(p.Upgrade) == 0 && len(p.Pending) == 0
+}
+
+// Rollout reports whether the plan runs the project rollout: a project to move, a project whose
+// held-back restart is owed, or a new binary (which can render any project's files differently).
+func (p *Plan) Rollout() bool {
+	return p.BinaryChange || len(p.Upgrade) > 0 || len(p.Pending) > 0
 }
 
 // projectServices are the services of a project in the order they are listed.
@@ -133,6 +142,16 @@ func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 		p.Upgrade = append(p.Upgrade, pr.Ref)
 	}
 	sort.Strings(p.Upgrade)
+	moving := map[string]bool{}
+	for _, ref := range p.Upgrade {
+		moving[ref] = true
+	}
+	for _, pr := range n.UserProjects() {
+		if pr.HeldRestart && pr.Status == "ACTIVE_HEALTHY" && !moving[pr.Ref] {
+			p.Pending = append(p.Pending, pr.Ref)
+		}
+	}
+	sort.Strings(p.Pending)
 	if len(to.RegistryMigrations) > 0 {
 		p.NewMigrations = missing(to.RegistryMigrations, n.AppliedMigrations)
 	}
@@ -214,6 +233,10 @@ func (p *Plan) describe() {
 			p.Impact = append(p.Impact, "a project whose PostgreSQL release changes also drops every database connection")
 		}
 	}
+	if k := len(p.Pending); k > 0 {
+		p.Restarts = append(p.Restarts, fmt.Sprintf("PostgreSQL, GoTrue and PostgREST of %d project(s) whose restart an earlier upgrade held back (%s), %d canary first, then %d at a time", k, refList(p.Pending), p.Canary, p.Batch))
+		p.Impact = append(p.Impact, "each of those projects drops its database connections and is offline for a minute or two while its services restart; the rollout stops at the first project that fails")
+	}
 	if p.HeldBack > 0 {
 		p.Notes = append(p.Notes, fmt.Sprintf("%d project(s) keep their PostgreSQL release (the release pins %s); pass --include-postgres to move them, each restarts PostgreSQL", p.HeldBack, short(config.SvcPostgres, p.HeldTo)))
 	}
@@ -233,7 +256,8 @@ func (p *Plan) describe() {
 	p.Notes = append(p.Notes, "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "+back)
 	if p.BinaryChange {
 		p.Notes = append(p.Notes, "The new daemon restarts any shared service whose files it renders differently, whether or not the service's release moves, so a service this list does not name can restart too; if that is Supavisor, every pooled connection drops, and if it is Realtime, every websocket drops. The files are rendered by the new binary, so this list cannot name those services before the upgrade.")
-		p.Notes = append(p.Notes, "A project whose PostgreSQL, GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order (a PostgreSQL restart drops the project's database connections and restarts its GoTrue and PostgREST with it); the files are rendered by the new binary, so this list cannot name those projects before the upgrade.")
+		p.Notes = append(p.Notes, "A project whose PostgreSQL, GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order (a PostgreSQL restart drops the project's database connections and restarts its GoTrue and PostgREST with it); the files are rendered by the new binary, so this list cannot name those projects before the upgrade. That restart also applies PostgreSQL settings an Owner saved without restarting; a project with only such a setting waiting is not restarted for it.")
+		p.Notes = append(p.Notes, "Going back to the previous release, by itself after a failed rollout or with `supavise rollback`, restarts every project whose PostgreSQL, GoTrue or PostgREST files the rollout had already restarted onto the new release's files (the projects it never reached keep running), one after another when the old daemon starts and outside the canary and batches; each such restart drops that project's database connections. A previous release built without the held-back-restart marks restarts every project whose files the two releases render differently.")
 		p.Notes = append(p.Notes, "The system PostgreSQL cluster restarts when the daemon starts if the new release renders its files differently, even when its release does not move. The registry, the dashboard's sign-in and the Management API are unavailable for some seconds then; this is not part of the rollout.")
 	}
 }

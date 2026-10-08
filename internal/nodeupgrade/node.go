@@ -73,6 +73,9 @@ type Project struct {
 	DiskBytes int64
 	// LastBackup is the end of the newest completed base backup; zero when there is none.
 	LastBackup time.Time
+	// HeldRestart is true when a restart of the project's PostgreSQL, GoTrue or PostgREST was
+	// held back for a rollout that did not finish (lifecycle.HeldRestart).
+	HeldRestart bool
 }
 
 // Effective returns the release tag the project runs for svc.

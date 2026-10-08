@@ -231,6 +231,9 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	if listErr != nil {
 		return nil, listErr
 	}
+	for i := range n.Projects {
+		n.Projects[i].HeldRestart = lifecycle.HeldRestart(h.cfg, n.Projects[i].Ref)
+	}
 	h.nodePins(n)
 
 	n.Verdict, n.Summary, n.Escrow = h.statusReport(ctx)

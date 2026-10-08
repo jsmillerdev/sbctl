@@ -41,6 +41,16 @@ func CheckRollback(to *Record, applied []string) error {
 	return fmt.Errorf("%w: the registry holds %d migration(s) that %s does not know (%s), and migrations only go forward. Put the registry back first: restore the system cluster from its pre-upgrade base backup by hand, with the control plane stopped (internal/backup/README.md, \"Disaster recovery of the system cluster\"; `supavise backups restore` refuses the system project), then run `supavise rollback` again", ErrRegistryNewer, len(unknown), to.Version, refList(unknown))
 }
 
+// stayError is the error of a rollback that left the node on the release it runs; it unwraps to the
+// refusal (ErrRegistryNewer).
+type stayError struct {
+	msg string
+	err error
+}
+
+func (e *stayError) Error() string { return e.msg }
+func (e *stayError) Unwrap() error { return e.err }
+
 // ProjectMove is one project an upgrade moved: the releases it ran and the ones it runs.
 type ProjectMove struct {
 	Ref      string
@@ -96,7 +106,7 @@ func rollBackTo(ctx context.Context, h Host, o Options, a rollbackArgs) error {
 				msg += fmt.Sprintf("; the %d project(s) this run moved are back on the releases they ran", len(a.Moves))
 			}
 		}
-		return errors.New(msg)
+		return &stayError{msg: msg, err: err}
 	}
 	var revertErr error
 	if len(a.Moves) > 0 {

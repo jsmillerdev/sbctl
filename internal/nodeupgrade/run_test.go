@@ -1,6 +1,7 @@
 package nodeupgrade
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -277,6 +278,8 @@ func TestRollbackRefusedByTheRegistrySchema(t *testing.T) {
 	mustContain(t, err.Error(), "the upgrade failed because")
 	// The binary stays, but the projects the run moved go back: the new binary reads its own schema.
 	mustContain(t, err.Error(), "the 1 project(s) this run moved are back on the releases they ran")
+	// Projects the rollout had not reached are still on the old settings, and the message says how to restart them.
+	mustContain(t, err.Error(), "`sudo supavise upgrade` restarts them in canary order")
 	if h.has("restore") || !h.has("revert a") {
 		t.Fatalf("the node was rolled back past the registry, or the projects were left moved: %s", h.order())
 	}
@@ -534,4 +537,55 @@ func TestEndOfTheUpgradeIsRecordedWithRetries(t *testing.T) {
 	}
 	mustContain(t, h.out.String(), "could not record the end of the upgrade")
 	mustContain(t, h.out.String(), "leave the projects it moved")
+}
+
+// A restart an earlier upgrade held back is still owed after that upgrade ended without it. With
+// no new binary and no release to move, a re-run still plans the rollout, names the projects, and
+// runs it.
+func TestHeldBackRestartsAreRolledOutByARerun(t *testing.T) {
+	h := newFakeHost()
+	h.tag = "v1.1.0"
+	h.node.Version = "v1.1.0"
+	h.node.BinaryInfo = newInfo()
+	h.node.Pins = newPins()
+	for i := range h.node.Projects {
+		h.node.Projects[i].Versions = map[string]string{"gotrue": authNew, "postgrest": restNew, "postgres": pgOld}
+	}
+	h.node.Projects[2].HeldRestart = true // bbbb
+	h.node.Projects[3].HeldRestart = true // cccc is paused: its start restarts it on the new files
+	h.info = h.node.BinaryInfo
+	if err := Run(context.Background(), h, runOpts(h)); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	mustContain(t, h.out.String(), "whose restart an earlier upgrade held back (bbbbbbbbbbbbbbbbbbbb)")
+	mustContain(t, h.out.String(), "restarting 1 project(s) whose restart an earlier upgrade held back")
+	if !h.has("projects") || h.has("install") {
+		t.Fatalf("calls: %s", h.order())
+	}
+	// Nothing held back and nothing to move: nothing to do.
+	h = newFakeHost()
+	h.tag = "v1.1.0"
+	h.node.Version, h.node.BinaryInfo, h.node.Pins = "v1.1.0", newInfo(), newPins()
+	h.info = h.node.BinaryInfo
+	h.node.Projects = h.node.Projects[:1]
+	if err := Run(context.Background(), h, runOpts(h)); err != nil || h.has("projects") {
+		t.Fatalf("a current node ran the rollout: %v %s", err, h.order())
+	}
+}
+
+// The plan says what going back costs, because the old daemon's start restarts the projects the
+// rollout had restarted.
+func TestPlanSaysWhatGoingBackRestarts(t *testing.T) {
+	p := BuildPlan(testNode(), newInfo(), PlanOptions{Canary: 1, Batch: 5})
+	var out bytes.Buffer
+	p.Render(&out)
+	mustContain(t, out.String(), "Going back to the previous release")
+	mustContain(t, out.String(), "outside the canary and batches")
+	mustContain(t, out.String(), "a project with only such a setting waiting is not restarted for it")
+	same := BuildPlan(testNode(), &Info{Version: "v1.0.0", Pins: oldPins()}, PlanOptions{})
+	out.Reset()
+	same.Render(&out)
+	if strings.Contains(out.String(), "Going back to the previous release") {
+		t.Fatalf("a plan without a new binary talks of the old daemon:\n%s", out.String())
+	}
 }
