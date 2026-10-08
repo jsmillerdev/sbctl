@@ -165,7 +165,7 @@ Differences from hosted: Developers cannot manage Auth hooks (they are Auth sett
 - **Studio uses the same list.** `GET /platform/profile/permissions` returns the caller's entries, evaluated like Studio's `doPermissionsCheck` (`internal/members/permission.go`): `%` wildcards, a matching restrictive entry beats any grant, project-scoped entries take over, an empty list denies. Studio reads it every five minutes, so a changed role shows in the UI after a reload while the API refuses at once.
 - **Read-only SQL is read-only in the database.** Whoever lacks `tenant:Sql:Write:Insert` has SQL run as `supavise_read_only` on every path (`database/query`, which the MCP server's `execute_sql` uses; Studio's pg-meta reads), and `cli/login-role` hands them the read-only login role. The barrier is table privileges plus `default_transaction_read_only`, which a client can override with `set` or `begin read write`, so a Read-only member can still call a `SECURITY DEFINER` function that `PUBLIC` may execute (Postgres's default) and write through it, as on hosted. Revoke `EXECUTE` from `PUBLIC` on such functions.
 - **Secrets stay with the roles that may read them.** Without `read:Read` on `service_api_keys`, `field.jwt_secret` and `storage.s3_credentials` (Read-only), settings omit the JWT secret and service_role key, `api-keys?reveal=true` and the temporary key answer 403, S3 credentials are not listed, and branches omit `db_pass` and `jwt_secret`.
-- **Tokens and sessions follow the roles** at each request, so demoting or removing a member takes their tokens' access away at once.
+- **Tokens and sessions follow the roles** at each request, so demoting or removing a member takes their tokens' access away at once. A dashboard session of a removed member keeps answering the routes that only need the user to exist (profile) for the rest of its lifetime, up to an hour; every other route re-reads the roles.
 - **MFA requirement.** `GET` and `PATCH .../members/mfa/enforcement` store and report it (201 on both, as the spec says). While it is on, a dashboard session whose JWT lacks `aal: aal2` gets 403 `MFA required` in the organization's routes and cannot accept an invitation; turning it on needs an aal2 session, and so does minting a token (`POST /platform/profile/access-tokens`, `POST /platform/cli/login`) for a member of such an organization. Earlier tokens keep working. `mfa_enabled` of a member is always false. An SSO session counts as aal2 whatever the provider did, so an Owner who does not trust a provider's authentication should remove it, or keep its default role at none and approve users by hand.
 - **Saved content belongs to its owner.** Developers and Read-only members change or delete only their own items (folders included), so a member cannot rewrite a shared snippet that an Owner later runs as `postgres`.
 
@@ -196,7 +196,7 @@ Provider changes and sign-in decisions are events of the system project (`sso.pr
 
 **Projects.** `/v1/projects/{ref}/config/auth/sso/providers` proxies to the project's GoTrue admin SSO API with the spec's shapes. As on hosted it answers `404` ("SAML 2.0 support is not enabled for this project") until `saml_enabled` is on in the project's Auth settings; turning it on restarts its GoTrue with the project's own signing key (sealed project secret `saml_private_key`, never shared, not rotated by `rotate-keys`). `saml_external_url` and `saml_allow_encrypted_assertions` are settings too. Writes need the right to change Auth settings (Administrator, Owner), reads the right to see the project. `supabase sso add|list|show|update|remove --project-ref` work with `--profile` unchanged (Supabase CLI 2.119.0).
 
-**Limits.** Dashboard providers take SAML metadata as an https address (GoTrue refreshes it) or a document; `supavise sso add` also fetches a plain-http address on the local machine (a development provider) and passes the document, which GoTrue does not refresh. There is no OIDC provider, no SCIM and no dashboard OAuth sign-in (Google, GitHub, Azure). A cloned or restored project starts with SAML off. A user with a pending invitation who signs in through a provider without a membership is refused until the invitation is dealt with another way.
+**Limits.** Dashboard providers take SAML metadata as an https address (GoTrue refreshes it) or a document; `supavise sso add` also fetches a plain-http address on the local machine (a development provider) and passes the document, which GoTrue does not refresh. There is no OIDC provider, no SCIM and no dashboard OAuth sign-in (Google, GitHub, Azure). A cloned or restored project starts with SAML off. A user with a pending invitation who signs in through a provider without a membership is refused until the invitation is dealt with another way (`/join` is behind the same gate).
 
 ## Configuration (`[api]` in config.toml, or `SUPAVISE_API_*`)
 
@@ -271,6 +271,13 @@ API=$(jq -r .api_url /path/stack.json); PAT=$(jq -r .pat /path/stack.json)
 SUPABASE_ACCESS_TOKEN=$PAT node internal/api/testdata/mcp-smoke.mjs $API abcdefghijklmnopqrst
 SUPABASE_ACCESS_TOKEN=$(jq -r .pats.ro /path/stack.json) \
   node internal/api/testdata/mcp-roles.mjs $API abcdefghijklmnopqrst read-only   # a PAT per role: ro, owner
+cat > profile.yaml <<EOF
+name: supavise-test
+api_url: $API
+dashboard_url: http://127.0.0.1:1
+project_host: api.supavise.test
+pooler_host: supavise.test
+EOF
 SUPABASE_ACCESS_TOKEN=$PAT SUPABASE_NO_KEYRING=1 supabase --profile=./profile.yaml projects list
 python3 internal/api/testdata/cli-login.py ./profile.yaml /path/stack.json       # `supabase login` browser flow
 ```

@@ -45,7 +45,7 @@ socket only (the directory is private to the `supavise` user) and requires scram
 TCP. The socket is how Supavise reaches its own registry before it can decrypt any secret.
 
 `pg_cron` runs its jobs in background workers (`cron.use_background_workers=on`,
-`cron.max_running_jobs=8`, `max_worker_processes=16`; see `cronSettings`). Hosted uses a libpq connection
+`cron.database_name=postgres`, `cron.max_running_jobs=8`, `max_worker_processes=16`; see `cronSettings`). Hosted uses a libpq connection
 to localhost that its pg_hba.conf trusts; ours does not trust loopback, so a libpq job would fail.
 Workers need no connection, pg_hba rule or network, so they also work behind a branch's egress filter.
 A saved `max_worker_processes` overrides the 16 (applied at the next restart); the Postgres settings
