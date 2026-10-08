@@ -331,7 +331,8 @@ func (a *NodeAgent) backupBytes(ctx context.Context, spec peerapi.InstanceSpec) 
 // Ensure implements Agent. A replica this node does not know is checked (it must not be on the
 // project's home, it must fit the node) and set up in the background; one it knows is reported
 // as it is, so a repeated request changes nothing. A setup that failed stays failed until the
-// replica is removed and added again.
+// replica is removed and added again. A replica the node has no room for is refused with ErrNoRoom
+// and recorded nowhere, so that the leader can ask again when there is room.
 func (a *NodeAgent) Ensure(ctx context.Context, spec peerapi.InstanceSpec) (peerapi.InstanceStatus, error) {
 	ref, err := refOf(spec.Identifier)
 	if err != nil {
@@ -364,24 +365,48 @@ func (a *NodeAgent) Ensure(ctx context.Context, spec peerapi.InstanceSpec) (peer
 	if err := a.o.Cfg.CheckReplicaPorts(); err != nil {
 		return peerapi.InstanceStatus{}, err
 	}
-	for id, other := range a.known() {
-		if other.spec.Ref == ref && id != spec.Identifier {
-			return peerapi.InstanceStatus{}, fmt.Errorf("%w: this node holds the replica %s of %s already", lifecycle.ErrInvalidState, id, ref)
+	if held := a.recorded(ref); held != "" {
+		return peerapi.InstanceStatus{}, fmt.Errorf("%w: this node holds the replica %s of %s already", lifecycle.ErrInvalidState, held, ref)
+	}
+	if a.o.Admit != nil {
+		if err := a.o.Admit(ctx, p, spec.Identifier, a.backupBytes(ctx, spec)); err != nil {
+			var ce *lifecycle.CapacityError
+			if errors.As(err, &ce) || errors.Is(err, lifecycle.ErrReplicaDisk) {
+				return peerapi.InstanceStatus{}, fmt.Errorf("%w: %w", ErrNoRoom, err)
+			}
+			return peerapi.InstanceStatus{}, err
 		}
 	}
 	in := &instance{spec: spec, step: StepStarted}
 	a.mu.Lock()
 	a.insts[spec.Identifier] = in
 	a.mu.Unlock()
-	if a.o.Admit != nil {
-		if err := a.o.Admit(ctx, p, spec.Identifier, a.backupBytes(ctx, spec)); err != nil {
-			a.fail(ctx, in, err)
-			return a.status(ctx, in), nil
-		}
-	}
 	a.persist(in)
 	a.run(in, false)
 	return a.status(ctx, in), nil
+}
+
+// recorded returns the identifier of the replica of ref that this node holds a record of: one it
+// knows in memory, or the one replica.json names. It is empty when there is none. A node holds one
+// replica of a project at most.
+func (a *NodeAgent) recorded(ref string) string {
+	a.mu.Lock()
+	for id, in := range a.insts {
+		if in.spec.Ref == ref {
+			a.mu.Unlock()
+			return id
+		}
+	}
+	a.mu.Unlock()
+	b, err := os.ReadFile(a.filePath(ref))
+	if err != nil {
+		return ""
+	}
+	var f instanceFile
+	if json.Unmarshal(b, &f) != nil {
+		return ""
+	}
+	return f.Spec.Identifier
 }
 
 func (a *NodeAgent) known() map[string]*instance {
@@ -560,15 +585,20 @@ func (a *NodeAgent) ObserveAll(ctx context.Context) []peerapi.InstanceStatus {
 }
 
 // Remove implements Agent. It stops the setup if one runs, stops the units and deletes the
-// replica's directory. It refuses when the cluster here has become the project's primary or
-// the project is homed on this node: removing a replica must never remove a home.
+// replica's directory. It removes only the replica this node holds: another identifier of the
+// project is refused, and so is a directory whose cluster is a primary (a promoted replica, or a
+// home) and the project's home itself. Removing a replica must never remove a home.
 func (a *NodeAgent) Remove(ctx context.Context, identifier string) error {
 	ref, err := refOf(identifier)
 	if err != nil {
 		return err
 	}
 	defer a.lockRef(ref)()
-	if in := a.get(identifier); in != nil {
+	if held := a.recorded(ref); held != "" && held != identifier {
+		return fmt.Errorf("%w: this node holds the replica %s of %s, not %s", lifecycle.ErrInvalidState, held, ref, identifier)
+	}
+	in := a.get(identifier)
+	if in != nil {
 		a.mu.Lock()
 		cancel, done := in.cancel, in.done
 		a.mu.Unlock()
@@ -587,6 +617,13 @@ func (a *NodeAgent) Remove(ctx context.Context, identifier string) error {
 	} else if !errors.Is(err, registry.ErrNotFound) {
 		return err
 	}
+	// The cluster may not answer (a promoted primary that was stopped): what is on disk decides. A
+	// setup that has not finished leaves a directory with no standby.signal yet, and may go.
+	if in == nil || in.step == StepCompleted {
+		if err := a.checkStandbyData(ref, identifier); err != nil {
+			return err
+		}
+	}
 	if err := a.o.Plane.RemoveReplica(ctx, ref); err != nil {
 		return err
 	}
@@ -597,7 +634,52 @@ func (a *NodeAgent) Remove(ctx context.Context, identifier string) error {
 	return nil
 }
 
-// Do implements Agent.
+// checkStandbyData refuses to remove ref's data directory on this node when it is not a standby of
+// identifier: a cluster without standby.signal is a primary, and a standby that was set up for
+// another replica is not this one's to delete. A directory with no cluster in it is left to the plane.
+func (a *NodeAgent) checkStandbyData(ref, identifier string) error {
+	dir := a.o.Cfg.Paths().PostgresData(ref)
+	if _, err := os.Stat(filepath.Join(dir, "PG_VERSION")); err != nil {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(dir, "standby.signal")); err != nil {
+		return fmt.Errorf("%w: the cluster of %s here has no standby.signal, so it is a primary", lifecycle.ErrInvalidState, ref)
+	}
+	if name := standbyName(dir); name != "" && name != identifier {
+		return fmt.Errorf("%w: the standby of %s here follows as %s, not %s", lifecycle.ErrInvalidState, ref, name, identifier)
+	}
+	return nil
+}
+
+// standbyName is the application_name in the primary_conninfo of dataDir's postgresql.auto.conf,
+// which the replica's identifier is; empty when the file or the setting is not there.
+func standbyName(dataDir string) string {
+	b, err := os.ReadFile(filepath.Join(dataDir, "postgresql.auto.conf"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "primary_conninfo") {
+			continue
+		}
+		_, rest, ok := strings.Cut(line, "application_name=")
+		if !ok {
+			return ""
+		}
+		rest = strings.TrimLeft(rest, `'\`)
+		if i := strings.IndexAny(rest, `'\ `); i >= 0 {
+			rest = rest[:i]
+		}
+		return rest
+	}
+	return ""
+}
+
+// Do implements Agent. A start, restart, stop or promotion of a replica of a project that is homed on
+// this node is refused: the units are the home's own, and the replica spec would be rendered over the
+// primary. A promotion repeated after the registry moved the home here is the exception, which finds
+// the cluster a primary and has nothing left to do.
 func (a *NodeAgent) Do(ctx context.Context, identifier string, act peerapi.Action, req peerapi.InstanceAction) (peerapi.InstanceStatus, error) {
 	ref, err := refOf(identifier)
 	if err != nil {
@@ -615,8 +697,14 @@ func (a *NodeAgent) Do(ctx context.Context, identifier string, act peerapi.Actio
 	}
 	switch act {
 	case peerapi.ActionStop:
+		if err = a.notHome(ctx, ref, act); err != nil {
+			break
+		}
 		err = a.o.Plane.StopReplica(ctx, ref)
 	case peerapi.ActionStart, peerapi.ActionRestart:
+		if err = a.notHome(ctx, ref, act); err != nil {
+			break
+		}
 		var t lifecycle.ReplicaTarget
 		if t, err = a.target(ctx, identifier, req.Class, true); err != nil {
 			break
@@ -632,10 +720,16 @@ func (a *NodeAgent) Do(ctx context.Context, identifier string, act peerapi.Actio
 		if t, err = a.target(ctx, identifier, "", true); err != nil {
 			break
 		}
-		err = a.o.Plane.PromoteReplica(ctx, t, lifecycle.PromoteOptions{
-			Epoch: req.Epoch, WaitLSN: req.WaitLSN, DrainArchive: req.DrainArchive,
-			Timeout: time.Duration(req.TimeoutSeconds) * time.Second,
-		})
+		if self := a.self(); self != "" && t.Project.NodeID == self {
+			if a.o.Plane.ObserveReplica(ctx, t).Role != lifecycle.ReplicaRolePrimary {
+				err = fmt.Errorf("%w: %s is the home of %s and its cluster is no promoted replica", lifecycle.ErrInvalidState, self, ref)
+			}
+		} else {
+			err = a.o.Plane.PromoteReplica(ctx, t, lifecycle.PromoteOptions{
+				Epoch: req.Epoch, WaitLSN: req.WaitLSN, DrainArchive: req.DrainArchive,
+				Timeout: time.Duration(req.TimeoutSeconds) * time.Second,
+			})
+		}
 		if err == nil {
 			// The cluster is the project's primary now: it is no replica instance any more.
 			if in != nil {
@@ -658,6 +752,22 @@ func (a *NodeAgent) Do(ctx context.Context, identifier string, act peerapi.Actio
 		return peerapi.InstanceStatus{}, err
 	}
 	return a.Observe(ctx, identifier)
+}
+
+// notHome refuses act on the replica of ref when the registry names this node the project's home.
+func (a *NodeAgent) notHome(ctx context.Context, ref string, act peerapi.Action) error {
+	self := a.self()
+	if self == "" {
+		return nil
+	}
+	p, err := a.o.Registry.GetProject(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if p.NodeID == self {
+		return fmt.Errorf("%w: cannot %s a replica of %s: %s is its home", lifecycle.ErrInvalidState, act, ref, self)
+	}
+	return nil
 }
 
 // adopt records a cluster that was demoted in place as a complete replica.

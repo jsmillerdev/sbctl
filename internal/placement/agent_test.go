@@ -3,6 +3,7 @@ package placement
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -319,9 +320,13 @@ func TestEnsureRefusesWhatIsNotAReplica(t *testing.T) {
 func TestEnsureAdmitsTheReplicaOnThisNodesRoom(t *testing.T) {
 	e := newAgentEnv(t)
 	var asked []int64
+	refuse := true
 	e.a.o.Admit = func(_ context.Context, p *registry.Project, id string, bytes int64) error {
 		asked = append(asked, bytes)
-		return &lifecycle.CapacityError{Message: "this node cannot run a Micro project"}
+		if refuse {
+			return &lifecycle.CapacityError{Message: "this node cannot run a Micro project"}
+		}
+		return nil
 	}
 	// The newest complete base backup is what the replica is seeded from, and its size is what is judged.
 	for i, b := range []registry.Backup{
@@ -337,15 +342,44 @@ func TestEnsureAdmitsTheReplicaOnThisNodesRoom(t *testing.T) {
 	}
 	s := e.spec()
 	s.BackupID = ""
-	st, err := e.a.Ensure(context.Background(), s)
-	if err != nil {
-		t.Fatal(err)
+	// A refusal is an error the leader can tell from a failed setup, and it leaves no trace: no
+	// instance, no file, nothing for the plane.
+	_, err := e.a.Ensure(context.Background(), s)
+	var ce *lifecycle.CapacityError
+	if !errors.Is(err, ErrNoRoom) || !errors.As(err, &ce) || !strings.Contains(err.Error(), "cannot run") || len(asked) != 1 || asked[0] != 222 {
+		t.Fatalf("a refused replica: %v, asked %v", err, asked)
 	}
-	if st.Error != "1_read_replica_instance_launch_failed" || !strings.Contains(st.Detail, "cannot run") || len(asked) != 1 || asked[0] != 222 {
-		t.Fatalf("status %+v, asked %v", st, asked)
+	if e.a.get(testReplicaID()) != nil || e.a.recorded(testRef) != "" {
+		t.Fatal("a refused replica was recorded")
+	}
+	if _, err := os.Stat(e.a.filePath(testRef)); !os.IsNotExist(err) {
+		t.Fatalf("replica.json after a refusal: %v", err)
 	}
 	if e.plane.all() != "" {
 		t.Fatalf("a refused replica reached the plane: %s", e.plane.all())
+	}
+	// The disk is a room too.
+	e.a.o.Admit = func(context.Context, *registry.Project, string, int64) error {
+		return fmt.Errorf("%w: the disk has 1 GiB free", lifecycle.ErrReplicaDisk)
+	}
+	if _, err := e.a.Ensure(context.Background(), s); !errors.Is(err, ErrNoRoom) || !errors.Is(err, lifecycle.ErrReplicaDisk) {
+		t.Fatalf("no disk: %v", err)
+	}
+	// Any other failure of the check is an error too, and is not a lack of room.
+	e.a.o.Admit = func(context.Context, *registry.Project, string, int64) error { return errors.New("registry down") }
+	if _, err := e.a.Ensure(context.Background(), s); err == nil || errors.Is(err, ErrNoRoom) || e.a.recorded(testRef) != "" {
+		t.Fatalf("a failed check: %v", err)
+	}
+	// Asking again once there is room starts the replica.
+	e.a.o.Admit = func(_ context.Context, _ *registry.Project, _ string, bytes int64) error {
+		asked = append(asked, bytes)
+		return nil
+	}
+	if _, err := e.a.Ensure(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if st := e.settle(t); st.Step != StepCompleted || st.Error != "" {
+		t.Fatalf("after room was made: %+v", st)
 	}
 	// A named base backup is looked up by its id.
 	e2 := newAgentEnv(t)
@@ -649,5 +683,209 @@ func TestSeederFromPassesThePlanToTheBackupSeeder(t *testing.T) {
 	rs.err = errors.New("no base backup")
 	if err := SeederFrom(rs)(context.Background(), plan); err == nil || err.Error() != "no base backup" {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+// newAgent is a second agent over the same node: a daemon that restarted keeps nothing in memory.
+func (e *agentEnv) newAgent() *agentEnv {
+	n := &agentEnv{plane: newFakeReplicaPlane(), reg: e.reg, cfg: e.cfg}
+	n.a = NewNodeAgent(AgentOptions{Cfg: e.cfg, Plane: n.plane, Registry: e.reg, Members: members("n2", "n1", 5),
+		Keys:   func(context.Context, string) (*secrets.ProjectKeys, error) { return testKeys(), nil },
+		Seeder: func(context.Context, lifecycle.ReplicaSeedPlan) error { return nil },
+		Poll:   time.Millisecond, StallTimeout: 200 * time.Millisecond})
+	return n
+}
+
+func TestEnsureFindsTheReplicaThatARestartedDaemonForgot(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t)
+	if _, err := e.a.Ensure(ctx, e.spec()); err != nil {
+		t.Fatal(err)
+	}
+	e.settle(t)
+
+	// A request for another replica of the project after the restart finds the first by its file, and
+	// the file is not written over.
+	n := e.newAgent()
+	other := e.spec()
+	other.Identifier = registry.ReplicaIdentifier(testRef, "us-east-1", "zzz999")
+	if _, err := n.a.Ensure(ctx, other); !errors.Is(err, lifecycle.ErrInvalidState) || !strings.Contains(err.Error(), testReplicaID()) {
+		t.Fatalf("a second replica after a restart: %v", err)
+	}
+	b, err := os.ReadFile(n.a.filePath(testRef))
+	if err != nil || !strings.Contains(string(b), testReplicaID()) || strings.Contains(string(b), "zzz999") {
+		t.Fatalf("replica.json = %s, %v", b, err)
+	}
+	if n.plane.all() != "" {
+		t.Fatalf("the second request reached the plane: %s", n.plane.all())
+	}
+	// The same replica is still the same.
+	if st, err := n.a.Ensure(ctx, e.spec()); err != nil || st.Step != StepCompleted {
+		t.Fatalf("the same replica again: %+v %v", st, err)
+	}
+}
+
+func TestRemoveRemovesOnlyTheReplicaThisNodeHolds(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t)
+	if _, err := e.a.Ensure(ctx, e.spec()); err != nil {
+		t.Fatal(err)
+	}
+	e.settle(t)
+	other := registry.ReplicaIdentifier(testRef, "us-east-1", "zzz999")
+	calls := e.plane.all()
+	if err := e.a.Remove(ctx, other); !errors.Is(err, lifecycle.ErrInvalidState) || !strings.Contains(err.Error(), testReplicaID()) {
+		t.Fatalf("remove of another replica of the project: %v", err)
+	}
+	// A daemon that forgot the replica finds it by its file just the same.
+	n := e.newAgent()
+	if err := n.a.Remove(ctx, other); !errors.Is(err, lifecycle.ErrInvalidState) {
+		t.Fatalf("remove of another replica after a restart: %v", err)
+	}
+	if e.plane.all() != calls || n.plane.all() != "" {
+		t.Fatalf("a refused removal reached the plane: %s / %s", e.plane.all(), n.plane.all())
+	}
+	if _, err := os.Stat(e.a.filePath(testRef)); err != nil {
+		t.Fatalf("replica.json went: %v", err)
+	}
+	if err := e.a.Remove(ctx, testReplicaID()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeCluster makes ref's data directory on this node look like a cluster, with the files given.
+func writeCluster(t *testing.T, e *agentEnv, files map[string]string) {
+	t.Helper()
+	dir := e.cfg.Paths().PostgresData(testRef)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRemoveRefusesAPrimaryWhateverTheClusterAnswers(t *testing.T) {
+	ctx := context.Background()
+	id := testReplicaID()
+	standbyConf := func(name string) string {
+		return "primary_conninfo = 'host=127.0.0.1 port=20009 user=r password=''x'' application_name=''" + name + "'' sslmode=disable'\n"
+	}
+
+	// A promoted replica that was stopped: nothing answers, and nothing is recorded.
+	e := newAgentEnv(t)
+	e.plane.obs = lifecycle.ReplicaObservation{Role: lifecycle.ReplicaRoleAbsent}
+	writeCluster(t, e, map[string]string{"PG_VERSION": "17\n", "postgresql.auto.conf": "work_mem = '8MB'\n"})
+	if err := e.a.Remove(ctx, id); !errors.Is(err, lifecycle.ErrInvalidState) || !strings.Contains(err.Error(), "primary") {
+		t.Fatalf("remove of a stopped primary: %v", err)
+	}
+	if strings.Contains(e.plane.all(), "remove") {
+		t.Fatalf("the plane removed it: %s", e.plane.all())
+	}
+
+	// The same for a replica whose setup was complete and whose promotion died after standby.signal went.
+	e = newAgentEnv(t)
+	e.plane.obs = lifecycle.ReplicaObservation{Role: lifecycle.ReplicaRoleAbsent}
+	in := &instance{spec: e.spec(), step: StepCompleted}
+	e.a.persist(in)
+	writeCluster(t, e, map[string]string{"PG_VERSION": "17\n"})
+	if err := e.a.Remove(ctx, id); !errors.Is(err, lifecycle.ErrInvalidState) || strings.Contains(e.plane.all(), "remove") {
+		t.Fatalf("remove of a complete replica that is a primary on disk: %v", err)
+	}
+
+	// A setup that has not finished has no standby.signal yet, and is cleaned up.
+	e = newAgentEnv(t)
+	e.plane.obs = lifecycle.ReplicaObservation{Role: lifecycle.ReplicaRoleAbsent}
+	e.a.persist(&instance{spec: e.spec(), step: StepInitiated})
+	writeCluster(t, e, map[string]string{"PG_VERSION": "17\n"})
+	if err := e.a.Remove(ctx, id); err != nil || !strings.Contains(e.plane.all(), "remove") {
+		t.Fatalf("remove of a setup in progress: %v (%s)", err, e.plane.all())
+	}
+
+	// A standby that follows under another identifier is not this one's to delete.
+	e = newAgentEnv(t)
+	e.plane.obs = lifecycle.ReplicaObservation{Role: lifecycle.ReplicaRoleAbsent}
+	writeCluster(t, e, map[string]string{"PG_VERSION": "17\n", "standby.signal": "", "postgresql.auto.conf": standbyConf(registry.ReplicaIdentifier(testRef, "us-east-1", "zzz999"))})
+	if err := e.a.Remove(ctx, id); !errors.Is(err, lifecycle.ErrInvalidState) || !strings.Contains(err.Error(), "zzz999") {
+		t.Fatalf("remove of a standby that follows as another replica: %v", err)
+	}
+	// Its own identifier, or none (an archive-only standby), is removed.
+	e = newAgentEnv(t)
+	e.plane.obs = lifecycle.ReplicaObservation{Role: lifecycle.ReplicaRoleAbsent}
+	writeCluster(t, e, map[string]string{"PG_VERSION": "17\n", "standby.signal": "", "postgresql.auto.conf": standbyConf(id)})
+	if err := e.a.Remove(ctx, id); err != nil || !strings.Contains(e.plane.all(), "remove") {
+		t.Fatalf("remove of its own standby: %v (%s)", err, e.plane.all())
+	}
+	e = newAgentEnv(t)
+	e.plane.obs = lifecycle.ReplicaObservation{Role: lifecycle.ReplicaRoleAbsent}
+	writeCluster(t, e, map[string]string{"PG_VERSION": "17\n", "standby.signal": "", "postgresql.auto.conf": "work_mem = '8MB'\n"})
+	if err := e.a.Remove(ctx, id); err != nil || !strings.Contains(e.plane.all(), "remove") {
+		t.Fatalf("remove of an archive-only standby: %v (%s)", err, e.plane.all())
+	}
+}
+
+func TestStandbyName(t *testing.T) {
+	dir := t.TempDir()
+	for conf, want := range map[string]string{
+		"primary_conninfo = 'host=h application_name=''abc-rr-us-east-1-abc123'' sslmode=disable'\n": "abc-rr-us-east-1-abc123",
+		"primary_conninfo = 'application_name=plain'\n":                                              "plain",
+		"work_mem = '8MB'\n":                          "",
+		"primary_conninfo = 'host=h'\n":               "",
+		"# primary_conninfo = 'application_name=x'\n": "",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "postgresql.auto.conf"), []byte(conf), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := standbyName(dir); got != want {
+			t.Errorf("standbyName(%q) = %q, want %q", conf, got, want)
+		}
+	}
+	if got := standbyName(t.TempDir()); got != "" {
+		t.Errorf("no file: %q", got)
+	}
+}
+
+func TestDoRefusesAReplicaActionOnTheHome(t *testing.T) {
+	ctx := context.Background()
+	e := newAgentEnv(t)
+	if _, err := e.a.Ensure(ctx, e.spec()); err != nil {
+		t.Fatal(err)
+	}
+	e.settle(t)
+	// The registry moved the home here (a stale or misdirected request must not render the replica's
+	// spec over the primary, nor stop it).
+	if err := e.reg.SetProjectNode(ctx, testRef, "n2", 1); err != nil {
+		t.Fatal(err)
+	}
+	e.plane.mu.Lock()
+	e.plane.calls, e.plane.targets = nil, nil
+	e.plane.mu.Unlock()
+	id := testReplicaID()
+	for _, act := range []peerapi.Action{peerapi.ActionStart, peerapi.ActionRestart, peerapi.ActionStop} {
+		if _, err := e.a.Do(ctx, id, act, peerapi.InstanceAction{Epoch: 5}); !errors.Is(err, lifecycle.ErrInvalidState) || !strings.Contains(err.Error(), "is its home") {
+			t.Errorf("%s on the home: %v", act, err)
+		}
+	}
+	// A promotion of a cluster that is not a promoted replica is refused...
+	if _, err := e.a.Do(ctx, id, peerapi.ActionPromote, peerapi.InstanceAction{Epoch: 5}); !errors.Is(err, lifecycle.ErrInvalidState) {
+		t.Fatalf("promote on the home: %v", err)
+	}
+	if e.plane.all() != "" {
+		t.Fatalf("the plane was asked: %s", e.plane.all())
+	}
+	if e.a.get(id) == nil {
+		t.Fatal("the replica instance went with a refused promotion")
+	}
+	// ...and one repeated after the switchover found the home here and the cluster a primary has
+	// nothing left to do, but ends the instance.
+	e.plane.obs.Role, e.plane.obs.InRecovery = lifecycle.ReplicaRolePrimary, false
+	st, err := e.a.Do(ctx, id, peerapi.ActionPromote, peerapi.InstanceAction{Epoch: 5})
+	if err != nil || st.Role != "primary" {
+		t.Fatalf("a repeated promotion: %+v %v", st, err)
+	}
+	if strings.Contains(e.plane.all(), "promote") || e.a.get(id) != nil {
+		t.Fatalf("calls %s, instance %v", e.plane.all(), e.a.get(id))
 	}
 }

@@ -142,6 +142,7 @@ var planeCalls = map[peerapi.PlaneMethod]planeCall{
 //	422  the operation is not allowed in the current state    lifecycle.ErrInvalidState
 //	501  the node has no backup engine                        lifecycle.ErrNoSnapshot
 //	504  replay did not reach the position asked              lifecycle.ErrReplayBehind
+//	507  the node has no room for the replica                 ErrNoRoom
 const (
 	statusNotLeader     = http.StatusForbidden
 	statusStaleEpoch    = http.StatusConflict
@@ -151,6 +152,7 @@ const (
 	statusInvalidState  = http.StatusUnprocessableEntity
 	statusNoSnapshot    = http.StatusNotImplemented
 	statusReplayBehind  = http.StatusGatewayTimeout
+	statusNoRoom        = http.StatusInsufficientStorage
 )
 
 // Errors the agent answers with and RemotePlane gives back.
@@ -160,6 +162,9 @@ var (
 	ErrStaleEpoch = errors.New("placement: the request is from an older epoch than the node's")
 	// ErrNotHome: the project is not homed on the node that was asked to run it.
 	ErrNotHome = errors.New("placement: the project is not homed on this node")
+	// ErrNoRoom: the node has no room for the replica, in its memory budget or on its disk. The
+	// request is recorded nowhere, so asking again once there is room starts the replica.
+	ErrNoRoom = errors.New("placement: the node has no room for the replica")
 )
 
 // statusOf is the HTTP status the agent answers for err, and the peerapi code of the ones a caller
@@ -172,6 +177,8 @@ func statusOf(err error) (int, string) {
 		return statusStaleEpoch, "stale_epoch"
 	case errors.Is(err, ErrNotHome):
 		return statusNotHome, "not_home"
+	case errors.Is(err, ErrNoRoom):
+		return statusNoRoom, "no_capacity"
 	case errors.Is(err, registry.ErrNotFound):
 		return http.StatusNotFound, "not_found"
 	case errors.Is(err, lifecycle.ErrClusterExists):
@@ -224,6 +231,8 @@ func wrapRemote(node string, err error) error {
 		sentinel = lifecycle.ErrNoSnapshot
 	case statusReplayBehind:
 		sentinel = lifecycle.ErrReplayBehind
+	case statusNoRoom:
+		sentinel = ErrNoRoom
 	case statusInvalidState:
 		sentinel = lifecycle.ErrInvalidState
 	default:

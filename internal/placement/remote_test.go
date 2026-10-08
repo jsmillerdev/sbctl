@@ -158,6 +158,7 @@ func TestSentinelErrorsSurviveTheWire(t *testing.T) {
 		{lifecycle.ErrReplayBehind, lifecycle.ErrReplayBehind},
 		{lifecycle.ErrNotStandby, lifecycle.ErrInvalidState},
 		{lifecycle.ErrNotCleanShutdown, lifecycle.ErrInvalidState},
+		{fmt.Errorf("%w: %w", ErrNoRoom, &lifecycle.CapacityError{Message: "no room"}), ErrNoRoom},
 	} {
 		e.local.err["Delete"] = tc.err
 		err := e.remote.Delete(ctx, testRef)
@@ -366,4 +367,29 @@ type localWithCheckpoint struct{ *fakeLocal }
 
 func (localWithCheckpoint) FinalCheckpoint(string) (lifecycle.ControlInfo, error) {
 	return lifecycle.ControlInfo{State: "shut down", Checkpoint: "0/28"}, nil
+}
+
+// Handlers that cannot tell the leader from another peer, or the home from another node, would serve
+// every request, so Register refuses to be built without what tells them.
+func TestRegisterNeedsWhatTheHandlersCheckAgainst(t *testing.T) {
+	mux := mesh.NewMux()
+	reg := registry.NewMemory()
+	good := HandlerDeps{Agent: &recordingAgent{}, Plane: newFakeLocal(), Resolver: RegistryResolver{Reg: reg}, Members: members("n2", "n1", 5)}
+	for name, mutate := range map[string]func(d *HandlerDeps){
+		"no agent":      func(d *HandlerDeps) { d.Agent = nil },
+		"no membership": func(d *HandlerDeps) { d.Members = nil },
+		"no resolver":   func(d *HandlerDeps) { d.Resolver = nil },
+	} {
+		d := good
+		mutate(&d)
+		if err := Register(mux.Handle, d); err == nil {
+			t.Errorf("%s: Register accepted it", name)
+		}
+	}
+	if len(mux.Patterns()) != 0 {
+		t.Fatalf("a refused Register registered %v", mux.Patterns())
+	}
+	if err := Register(mux.Handle, good); err != nil || len(mux.Patterns()) != 6 {
+		t.Fatalf("Register: %v, %v", err, mux.Patterns())
+	}
 }

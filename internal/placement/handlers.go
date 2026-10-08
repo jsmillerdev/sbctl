@@ -3,6 +3,7 @@ package placement
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,6 +35,8 @@ type HandlerDeps struct {
 	Checkpoints interface {
 		FinalCheckpoint(ref string) (lifecycle.ControlInfo, error)
 	}
+	// Resolver and Members are required: the handlers admit the leader only, check the epoch and that
+	// the project is homed here against them.
 	Resolver Resolver
 	Members  cluster.Membership
 	Backups  LocalBackups
@@ -42,8 +45,13 @@ type HandlerDeps struct {
 }
 
 // Register registers the instance, plane and backup endpoints of the peer API with handle, which is
-// mesh.Handle in the daemon and a mesh.Mux's Handle in tests.
-func Register(handle func(pattern string, fn mesh.HandlerFunc), d HandlerDeps) {
+// mesh.Handle in the daemon and a mesh.Mux's Handle in tests. It refuses a HandlerDeps with no Agent,
+// Members or Resolver: handlers that cannot tell the leader from a peer, or the home from another
+// node, would serve every request.
+func Register(handle func(pattern string, fn mesh.HandlerFunc), d HandlerDeps) error {
+	if d.Agent == nil || d.Members == nil || d.Resolver == nil {
+		return errors.New("placement: the peer API handlers need the agent, the cluster membership and the resolver")
+	}
 	h := &handlers{d}
 	handle("PUT "+peerapi.PathInstance, h.ensure)
 	handle("GET "+peerapi.PathInstance, h.observe)
@@ -51,6 +59,7 @@ func Register(handle func(pattern string, fn mesh.HandlerFunc), d HandlerDeps) {
 	handle("POST "+peerapi.PathInstanceAction, h.action)
 	handle("POST "+peerapi.PathPlane, h.plane)
 	handle("POST "+peerapi.PathBackup, h.backup)
+	return nil
 }
 
 type handlers struct{ d HandlerDeps }
@@ -99,9 +108,6 @@ func (h *handlers) authorize(r *http.Request) error {
 	if !ok || peer.Node == "" {
 		return fmt.Errorf("%w: the request carries no node certificate", cluster.ErrNotLeader)
 	}
-	if h.d.Members == nil {
-		return nil
-	}
 	leader, ok := h.d.Members.Leader()
 	if !ok || leader.ID != peer.Node {
 		return fmt.Errorf("%w: %s asked, the leader is %q", cluster.ErrNotLeader, peer.Node, leader.ID)
@@ -110,9 +116,6 @@ func (h *handlers) authorize(r *http.Request) error {
 }
 
 func (h *handlers) epochOK(epoch int64) error {
-	if h.d.Members == nil {
-		return nil
-	}
 	if cur := h.d.Members.Epoch(); epoch < cur {
 		return fmt.Errorf("%w: the request is under epoch %d and this node is at %d", ErrStaleEpoch, epoch, cur)
 	}
@@ -187,9 +190,6 @@ func (h *handlers) action(w http.ResponseWriter, r *http.Request) {
 // home checks that the project is homed on this node: the plane and backup endpoints run what only
 // the home can.
 func (h *handlers) home(ctx context.Context, ref string) error {
-	if h.d.Members == nil || h.d.Resolver == nil {
-		return nil
-	}
 	home, err := h.d.Resolver.HomeOf(ctx, ref)
 	if err != nil {
 		return err
