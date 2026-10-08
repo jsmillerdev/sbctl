@@ -308,8 +308,14 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	}
 	in.osUpdates()
 
-	if o.JoinTokenFile != "" {
+	// A join that stopped after the certificate is continued, with or without the token; a server that
+	// already follows a leader is kept as it is. Neither creates a system project, and nothing above
+	// created a project directory before the join, which seeds the system standby into an empty one.
+	switch {
+	case o.JoinTokenFile != "", joinUnfinished(config.DefaultPath):
 		return in.joinCluster(o, configChanged, existed, uid, gid)
+	case followsALeader(cfg):
+		return in.keepFollower(configChanged, existed)
 	}
 
 	in.step("creating the system project (first run downloads Postgres and the auth service)")

@@ -52,6 +52,9 @@ type nodeHost struct {
 	cfgPath string
 	root    bool
 	wait    time.Duration
+	// dsn is the registry this run reads (registryDSN), found once.
+	dsnMu sync.Mutex
+	dsn   string
 	// restart restarts supavise.service and waits until it answers; nil is restartAndWait. A test
 	// sets it, so that it never touches the machine's units.
 	restart func(ctx context.Context) error
@@ -213,7 +216,7 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 		n.Running = &nodeupgrade.Running{PID: u.PID, Phase: u.Phase, To: u.To}
 	}
 
-	dsn := lifecycle.SystemSocketDSN(h.cfg, "supavise")
+	dsn := h.registryDSN(ctx)
 	if n.AppliedMigrations, err = registry.AppliedMigrations(ctx, dsn); err != nil {
 		return nil, fmt.Errorf("cannot reach the registry (is supavise-postgres@system running? run as root or as the supavise user): %w", err)
 	}
@@ -949,7 +952,7 @@ func (h *nodeHost) EndUpgrade(_ context.Context, version string, at time.Time) e
 
 // MovesBetween implements nodeupgrade.Host.
 func (h *nodeHost) MovesBetween(ctx context.Context, since, until time.Time) ([]nodeupgrade.ProjectMove, error) {
-	reg, err := registry.OpenExisting(ctx, lifecycle.SystemSocketDSN(h.cfg, "supavise")+" pool_max_conns=2")
+	reg, err := registry.OpenExisting(ctx, h.registryDSN(ctx)+" pool_max_conns=2")
 	if err != nil {
 		return nil, err
 	}
@@ -1002,7 +1005,7 @@ func netMoves(ups []registry.Upgrade) []nodeupgrade.ProjectMove {
 
 // AppliedMigrations implements nodeupgrade.Host.
 func (h *nodeHost) AppliedMigrations(ctx context.Context) ([]string, error) {
-	return registry.AppliedMigrations(ctx, lifecycle.SystemSocketDSN(h.cfg, "supavise"))
+	return registry.AppliedMigrations(ctx, h.registryDSN(ctx))
 }
 
 // PreviousRelease implements nodeupgrade.Host.

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
+	"time"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
@@ -76,4 +78,32 @@ func clusterView(ctx context.Context, cfg *config.Config, reg registry.Registry,
 		}
 	}
 	return view, here, nil
+}
+
+// readableRegistryDSN is the DSN of the registry this server can read as the user it runs as: the
+// socket of its system cluster, else the socket of the hot standby a follower keeps of the leader's
+// (lifecycle.FollowerRegistryDSN). The first that answers a query wins; when none does the first is
+// returned, so that the caller's error is the one it has always shown. A follower's registry is the
+// replicated copy, which `supavise upgrade` only reads.
+func readableRegistryDSN(ctx context.Context, cfg *config.Config) string {
+	cands := []string{lifecycle.SystemSocketDSN(cfg, "supavise"), lifecycle.FollowerRegistryDSN(cfg)}
+	for _, c := range cands {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err := registry.AppliedMigrations(cctx, strings.TrimSuffix(c, " pool_max_conns=6"))
+		cancel()
+		if err == nil {
+			return c
+		}
+	}
+	return cands[0]
+}
+
+// registryDSN is readableRegistryDSN, looked up once for the run.
+func (h *nodeHost) registryDSN(ctx context.Context) string {
+	h.dsnMu.Lock()
+	defer h.dsnMu.Unlock()
+	if h.dsn == "" {
+		h.dsn = readableRegistryDSN(ctx, h.cfg)
+	}
+	return h.dsn
 }

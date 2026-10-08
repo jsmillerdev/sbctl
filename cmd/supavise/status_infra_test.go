@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/supavise/supavise/internal/awsapi"
+	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/infra"
 )
 
@@ -31,5 +34,19 @@ func TestTheQuestionToTheCloudIsBounded(t *testing.T) {
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Errorf("the questions took %s", d)
+	}
+}
+
+// The host block lists what converge would do and says how; a converged host has none.
+func TestHostBlockRenders(t *testing.T) {
+	var out bytes.Buffer
+	(&hostBlock{Pending: []hostsetup.Result{
+		{ID: "units", Title: "Install the systemd units and the polkit rule", Pending: true, Detail: "2 files differ"},
+		{ID: "ufw", Title: "Open the mesh port in ufw when ufw is active", Pending: true},
+	}}).Render(&out)
+	for _, want := range []string{"Host  2 step(s) of the host layer are pending", "pending  Install the systemd units and the polkit rule (2 files differ)", "pending  Open the mesh port in ufw when ufw is active\n", "Fix: sudo supavise system converge"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("block lacks %q:\n%s", want, out.String())
+		}
 	}
 }

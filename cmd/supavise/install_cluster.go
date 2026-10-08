@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/awsapi"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/hostsetup"
 )
@@ -114,6 +115,39 @@ func (j cliJoiner) Join(_ context.Context, tokenFile string, resume bool) error 
 func joined(configPath string) bool {
 	_, err := os.Stat(filepath.Join(config.ClusterDir(configPath), config.NodeCertFile))
 	return err == nil
+}
+
+// followsALeader reports whether this server's system cluster is a standby of another server's: it
+// joined a cluster and has not been promoted. A founder (or a follower after a failover) has no
+// standby.signal in its system data directory. An installer run again on a follower must not take
+// the founder's steps, which create and start a system project of its own.
+func followsALeader(cfg *config.Config) bool {
+	_, err := os.Stat(filepath.Join(cfg.Paths().PostgresData(config.SystemRef), "standby.signal"))
+	return err == nil
+}
+
+// joinUnfinished reports whether an earlier join got as far as the certificate and stopped: the
+// installer continues it with `node join --resume`, which needs no token.
+func joinUnfinished(configPath string) bool {
+	_, err := os.Stat(filepath.Join(config.ClusterDir(configPath), cluster.JoinStateFile))
+	return err == nil
+}
+
+// keepFollower is a re-run of the installer on a server that follows a leader: the binary, the
+// units and the host are current by now, and what is left is the daemon, which starts the follower's
+// services itself. Nothing here creates a system project or starts one.
+func (in *installer) keepFollower(configChanged, existed bool) error {
+	in.step("this server follows a leader (its system cluster is a standby): keeping it, not creating a system project")
+	if err := in.startDaemon(configChanged, existed); err != nil {
+		return err
+	}
+	if err := in.waitActive(30 * time.Second); err != nil {
+		_ = in.run("journalctl", "-u", "supavise.service", "-n", "40", "--no-pager")
+		return err
+	}
+	fmt.Fprintln(in.out)
+	fmt.Fprintln(in.out, "This server is a follower and supavise.service is running. `supavise node ls` on the leader shows it.")
+	return nil
 }
 
 // stageToken copies the token to a file the supavise user can read in a directory only it can

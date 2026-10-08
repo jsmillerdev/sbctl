@@ -116,7 +116,7 @@ func newClusterConfigSync(cfg *config.Config, configPath string) hostsetup.Confi
 func fetchLeaderConfig(ctx context.Context, cfg *config.Config, clusterDir string) (*peerapi.ClusterConfig, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	reg, err := registry.OpenExisting(ctx, lifecycle.SystemSocketDSN(cfg, "supavise")+" pool_max_conns=2")
+	reg, err := registry.OpenExisting(ctx, readableRegistryDSN(ctx, cfg)+" pool_max_conns=2")
 	if err != nil {
 		return nil, fmt.Errorf("cannot read the registry to find the leader: %w", err)
 	}
