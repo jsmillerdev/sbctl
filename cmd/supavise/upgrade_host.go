@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,8 +36,9 @@ import (
 
 // nodeHost is nodeupgrade.Host for a Linux node. `supavise upgrade` runs as root, because the
 // binary and the unit files are root's, and runs everything that touches the node's data as the
-// supavise user through runuser, the way the installer does; what root itself reads (the
-// registry, the unit scripts, the disk) it only reads.
+// supavise user (asSupavise); what root itself reads (the registry, the unit scripts, the disk) it
+// only reads. The one binary root runs is the installed one at config.DefaultBinPath, checked by
+// installedBinary, never a path from the config.
 type nodeHost struct {
 	cfg  *config.Config
 	out  io.Writer
@@ -67,12 +70,18 @@ type nodeHost struct {
 }
 
 func newNodeHost(cmd cobraIO, cfg *config.Config, wait time.Duration, so selfupdate.Options) (*nodeHost, error) {
-	h := &nodeHost{cfg: cfg, out: cmd.Out, errw: cmd.Err, in: cmd.In, log: newLogger(cfg), binPath: cfg.BinPath,
+	// Root runs, copies and replaces this file, so its path is not taken from the config (the
+	// supavise user writes that) and nothing is executed before it has passed the check.
+	binPath, err := installedBinary(cfg)
+	if err != nil {
+		return nil, err
+	}
+	h := &nodeHost{cfg: cfg, out: cmd.Out, errw: cmd.Err, in: cmd.In, log: newLogger(cfg), binPath: binPath,
 		cfgPath: effectiveConfigPath(), root: os.Geteuid() == 0, wait: wait, selfOpts: so}
 	if h.cfgPath == "" {
 		h.cfgPath = selfUpdateConfigPath()
 	}
-	h.rel = nodeupgrade.Releases{Dir: releasesDir(cfg.BinPath)}
+	h.rel = nodeupgrade.Releases{Dir: releasesDir(binPath)}
 	return h, nil
 }
 
@@ -89,27 +98,62 @@ func releasesDir(binPath string) string {
 }
 
 // asSupavise runs bin with args as the supavise user (directly when this process already is).
+// Root drops to that user in the child itself, not through runuser: runuser opens a PAM session
+// and keeps a parent that, on SIGTERM, sends the worker SIGKILL two seconds later, which would cut
+// a project upgrade off between its steps.
 func (h *nodeHost) asSupavise(ctx context.Context, stdout io.Writer, env []string, bin string, args ...string) error {
 	full := append([]string{bin, "--config", h.cfgPath}, args...)
-	var c *exec.Cmd
+	c := exec.CommandContext(ctx, full[0], full[1:]...)
+	c.Env = append(os.Environ(), env...)
 	if h.root {
-		pre := append([]string{"-u", installUser, "--", "env", "HOME=" + h.cfg.StateDir}, env...)
-		c = exec.CommandContext(ctx, "runuser", append(pre, full...)...)
-	} else {
-		c = exec.CommandContext(ctx, full[0], full[1:]...)
-		c.Env = append(os.Environ(), env...)
+		cred, err := h.superviseCredential()
+		if err != nil {
+			return err
+		}
+		c.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
+		c.Env = append(os.Environ(), append([]string{"HOME=" + h.cfg.StateDir, "USER=" + installUser, "LOGNAME=" + installUser}, env...)...)
 	}
 	if stdout == nil {
 		stdout = h.out
 	}
 	c.Stdout, c.Stderr = stdout, h.errw
-	// A cancelled upgrade asks the worker to stop; a project upgrade mid-way settles itself.
+	// A cancelled upgrade asks the worker to stop. It gets the signal itself: a project upgrade
+	// that is cut off rolls its project back and settles it, and is given two minutes to do that.
 	c.Cancel = func() error { return c.Process.Signal(syscall.SIGTERM) }
 	c.WaitDelay = 2 * time.Minute
 	if err := c.Run(); err != nil {
 		return fmt.Errorf("supavise %s: %w", strings.Join(args, " "), err)
 	}
 	return nil
+}
+
+// superviseCredential is the uid, gid and groups of the supavise user.
+func (h *nodeHost) superviseCredential() (*syscall.Credential, error) {
+	u, err := user.Lookup(installUser)
+	if err != nil {
+		return nil, fmt.Errorf("the %s user: %w", installUser, err)
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("the %s user's uid %q: %w", installUser, u.Uid, err)
+	}
+	gid, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("the %s user's gid %q: %w", installUser, u.Gid, err)
+	}
+	ids, err := u.GroupIds()
+	if err != nil {
+		return nil, fmt.Errorf("the groups of the %s user: %w", installUser, err)
+	}
+	groups := make([]uint32, 0, len(ids))
+	for _, g := range ids {
+		n, err := strconv.ParseUint(g, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("the %s user's group %q: %w", installUser, g, err)
+		}
+		groups = append(groups, uint32(n))
+	}
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, nil
 }
 
 // version of the installed binary: the last word of `supavise --version`.
@@ -578,7 +622,9 @@ func (h *nodeHost) Install(ctx context.Context, s *nodeupgrade.Staged, prev, nex
 		return false, errors.New("run as root: sudo supavise upgrade")
 	}
 	if old, err := h.rel.Get(prev.Version); err == nil {
-		prev.InstalledAt = old.InstalledAt
+		// What the store knows of the running release stays: when it became current and the window
+		// of the upgrade that installed it, which its own rollback needs.
+		prev.InstalledAt, prev.UpgradeStartedAt, prev.UpgradeEndedAt = old.InstalledAt, old.UpgradeStartedAt, old.UpgradeEndedAt
 	}
 	if _, err := h.rel.Keep(prev, h.binPath); err != nil {
 		return false, fmt.Errorf("keeping the running release: %w", err)
@@ -803,7 +849,7 @@ func upgradeProjectsArgs(target map[string]string, since time.Time) []string {
 // UpgradeProjects implements nodeupgrade.Host.
 func (h *nodeHost) UpgradeProjects(ctx context.Context, target map[string]string, since time.Time) ([]nodeupgrade.ProjectMove, error) {
 	err := h.asSupavise(ctx, h.out, nil, h.binPath, upgradeProjectsArgs(target, since)...)
-	moves, merr := h.MovesSince(context.WithoutCancel(ctx), since)
+	moves, merr := h.MovesBetween(context.WithoutCancel(ctx), since, time.Time{})
 	if merr != nil {
 		h.log.Warn("could not read which projects were upgraded", "error", merr)
 	}
@@ -815,34 +861,57 @@ func (h *nodeHost) EndUpgrade(_ context.Context, version string, at time.Time) e
 	return h.rel.EndUpgrade(version, at)
 }
 
-// MovesSince implements nodeupgrade.Host.
-func (h *nodeHost) MovesSince(ctx context.Context, since time.Time) ([]nodeupgrade.ProjectMove, error) {
+// MovesBetween implements nodeupgrade.Host.
+func (h *nodeHost) MovesBetween(ctx context.Context, since, until time.Time) ([]nodeupgrade.ProjectMove, error) {
 	reg, err := registry.OpenExisting(ctx, lifecycle.SystemSocketDSN(h.cfg, "supavise")+" pool_max_conns=2")
 	if err != nil {
 		return nil, err
 	}
 	defer reg.Close()
-	rows, err := reg.ListProjects(ctx)
+	store := registry.Upgrades(reg)
+	if store == nil {
+		return nil, errors.New("the registry keeps no upgrade history")
+	}
+	ups, err := store.UpgradesBetween(ctx, since, until)
 	if err != nil {
 		return nil, err
 	}
-	var out []nodeupgrade.ProjectMove
-	for _, p := range rows {
-		if p.Ref == config.SystemRef {
+	return netMoves(ups), nil
+}
+
+// netMoves folds the upgrades (oldest first) into one move per project: each service goes from
+// the release it ran before its first upgrade in the list to the one it runs after its last. The
+// system project is left out, and so is a service an upgrade left where it was.
+func netMoves(ups []registry.Upgrade) []nodeupgrade.ProjectMove {
+	byRef := map[string]*nodeupgrade.ProjectMove{}
+	var order []string
+	for _, u := range ups {
+		if u.Ref == config.SystemRef {
 			continue
 		}
-		u, err := reg.LatestUpgrade(ctx, p.Ref)
-		if errors.Is(err, registry.ErrNotFound) {
-			continue
+		m := byRef[u.Ref]
+		if m == nil {
+			m = &nodeupgrade.ProjectMove{Ref: u.Ref, From: map[string]string{}, To: map[string]string{}, At: u.InitiatedAt}
+			byRef[u.Ref] = m
+			order = append(order, u.Ref)
 		}
-		if err != nil {
-			return nil, err
+		for svc, from := range u.From {
+			if _, seen := m.From[svc]; !seen {
+				m.From[svc] = from
+			}
 		}
-		if u.Status == registry.UpgradeDone && !u.InitiatedAt.Before(since) {
-			out = append(out, nodeupgrade.ProjectMove{Ref: p.Ref, From: u.From, To: u.To, At: u.InitiatedAt})
+		for svc, to := range u.To {
+			m.To[svc] = to
 		}
 	}
-	return out, nil
+	var out []nodeupgrade.ProjectMove
+	for _, ref := range order {
+		m := byRef[ref]
+		if len(m.RevertTargets()) > 0 {
+			out = append(out, *m)
+		}
+	}
+	return out
 }
 
 // RevertProjects implements nodeupgrade.Host.

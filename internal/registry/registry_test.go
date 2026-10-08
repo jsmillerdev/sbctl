@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -421,6 +422,37 @@ func testUpgrades(t *testing.T, r Registry, orgID int64) {
 	}
 	if len(got.From) != 0 || len(got.To) != 0 {
 		t.Fatalf("versions of an upgrade that set none: %v %v", got.From, got.To)
+	}
+	// The history: finished upgrades only, inside the window, oldest first, whatever is latest.
+	third := &Upgrade{TrackingID: "44444444-4444-4444-8444-444444444444", Ref: ref, From: map[string]string{"auth": "a2"}, To: map[string]string{"auth": "a1"},
+		Status: UpgradeDone, InitiatedAt: t0.Add(2 * time.Hour), LatestStatusAt: t0.Add(2 * time.Hour)}
+	if err := st.PutUpgrade(ctx, third); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []struct {
+		since, until time.Time
+		want         []string
+	}{
+		{t0.Add(-time.Hour), time.Time{}, []string{first.TrackingID, third.TrackingID}},
+		{t0.Add(-time.Hour), t0.Add(90 * time.Minute), []string{first.TrackingID}}, // the failed one is never listed
+		{t0, t0, []string{first.TrackingID}},                                       // both ends are inclusive
+		{t0.Add(time.Second), time.Time{}, []string{third.TrackingID}},
+		{t0.Add(3 * time.Hour), time.Time{}, nil},
+	} {
+		got, err := st.UpgradesBetween(ctx, w.since, w.until)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, u := range got {
+			ids = append(ids, u.TrackingID)
+		}
+		if strings.Join(ids, ",") != strings.Join(w.want, ",") {
+			t.Fatalf("upgrades between %v and %v = %v, want %v", w.since, w.until, ids, w.want)
+		}
+	}
+	if got, _ := st.UpgradesBetween(ctx, t0, t0); len(got) != 1 || got[0].From["auth"] != "a1" || got[0].To["auth"] != "a2" {
+		t.Fatalf("the versions of a listed upgrade: %+v", got)
 	}
 	if err := st.PutUpgrade(ctx, &Upgrade{TrackingID: "33333333-3333-4333-8333-333333333333", Ref: "nope", InitiatedAt: t0, LatestStatusAt: t0}); err == nil {
 		t.Fatal("an upgrade of an unknown project was stored")

@@ -128,8 +128,11 @@ type Host interface {
 	// PreviousRelease returns the kept release before current, and the record of current when
 	// the node kept one (nil otherwise); prev is nil when there is nothing to go back to.
 	PreviousRelease(ctx context.Context, current string) (prev, cur *Record, err error)
-	// MovesSince lists the projects whose latest upgrade finished successfully after since.
-	MovesSince(ctx context.Context, since time.Time) ([]ProjectMove, error)
+	// MovesBetween lists what the finished upgrades that began from since to until (zero: no
+	// limit) did to each project, as one move per project: the releases it ran before the first of
+	// them and the ones it runs after the last. Upgrades outside the window, such as a revert that a
+	// rollback made later, are not in it.
+	MovesBetween(ctx context.Context, since, until time.Time) ([]ProjectMove, error)
 	// RevertProjects puts projects back on the releases they ran.
 	RevertProjects(ctx context.Context, moves []ProjectMove) error
 	// Restore reinstalls the kept release rec: its binary, its units, the daemon, and waits.
@@ -316,7 +319,7 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	if node.BinaryInfo != nil && len(node.BinaryInfo.RegistryMigrations) > 0 {
 		prev.Migrations, prev.MigrationsFrom = node.BinaryInfo.RegistryMigrations, MigrationsFromBinary
 	}
-	next := Record{Version: plan.To, Platform: staged.Info.Platform, Pins: staged.Info.Pins, Migrations: staged.Info.RegistryMigrations, MigrationsFrom: MigrationsFromBinary, InstalledAt: o.now().UTC()}
+	next := Record{Version: plan.To, Platform: staged.Info.Platform, Pins: staged.Info.Pins, Migrations: staged.Info.RegistryMigrations, MigrationsFrom: MigrationsFromBinary, InstalledAt: o.now().UTC(), UpgradeStartedAt: r.started.UTC()}
 
 	if plan.BinaryChange {
 		r.mark(PhaseSwitching, "installing "+plan.To+" and restarting the daemon")

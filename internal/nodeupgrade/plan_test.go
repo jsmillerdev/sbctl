@@ -174,7 +174,8 @@ func TestPlanSaysWhatRestarts(t *testing.T) {
 	var out bytes.Buffer
 	p.Render(&out)
 	s := out.String()
-	if strings.Contains(s, "Supavisor") || strings.Contains(s, "websocket") {
+	// The restart and impact lists name what moves; the notes below them warn about what might.
+	if listed := s[:strings.Index(s, "note:")]; strings.Contains(listed, "Supavisor") || strings.Contains(listed, "websocket") {
 		t.Fatalf("a release that moves neither restarts them:\n%s", s)
 	}
 	if !strings.Contains(s, "GoTrue and PostgREST of 2 project(s), 1 canary first, then 5 at a time") || !strings.Contains(s, "a few seconds") {
@@ -287,5 +288,29 @@ func TestPlanLeavesOutServicesTheNodeDoesNotRun(t *testing.T) {
 	}
 	if !Finished(PhaseDone) || !Finished(PhaseRolledBack) || !Finished(PhaseFailed) || !Finished(PhaseRefused) || Finished(PhaseProjects) || Finished(PhaseRollingBack) {
 		t.Fatal("Finished")
+	}
+}
+
+// A new binary can render a shared service's files differently under the same pin, and the daemon
+// restarts that service; the plan cannot name it, so it says so (and says what it would drop).
+func TestPlanSaysSharedServicesCanRestartWithoutAMove(t *testing.T) {
+	n := testNode()
+	to := newInfo()
+	to.Pins = oldPins() // no service moves, the binary does
+	p := BuildPlan(n, to, PlanOptions{})
+	if !p.BinaryChange || len(p.Shared) != 0 {
+		t.Fatalf("plan: binary change %v, shared moves %s", p.BinaryChange, moveNames(p.Shared))
+	}
+	var out bytes.Buffer
+	p.Render(&out)
+	for _, want := range []string{"restarts any shared service whose files it renders differently", "every pooled connection drops", "every websocket drops"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("plan lacks %q:\n%s", want, out.String())
+		}
+	}
+	// The same binary renders the same files: nothing to warn about.
+	n.Version = to.Version
+	if q := BuildPlan(n, to, PlanOptions{}); q.BinaryChange {
+		t.Fatalf("same binary: %+v", q)
 	}
 }

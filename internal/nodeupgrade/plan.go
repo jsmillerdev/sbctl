@@ -232,6 +232,7 @@ func (p *Plan) describe() {
 	}
 	p.Notes = append(p.Notes, "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "+back)
 	if p.BinaryChange {
+		p.Notes = append(p.Notes, "The new daemon restarts any shared service whose files it renders differently, whether or not the service's release moves, so a service this list does not name can restart too; if that is Supavisor, every pooled connection drops, and if it is Realtime, every websocket drops. The files are rendered by the new binary, so this list cannot name those services before the upgrade.")
 		p.Notes = append(p.Notes, "A project whose GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order; the files are rendered by the new binary, so this list cannot name those projects before the upgrade.")
 	}
 }

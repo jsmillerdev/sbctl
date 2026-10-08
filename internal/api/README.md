@@ -785,6 +785,13 @@ Differences from hosted that Studio shows as it does there:
 - Studio's note on a paused project in "Service versions" says that restoring it updates Postgres to
   the newest version. Resume here keeps the versions recorded; the project is upgraded only when its
   owner asks.
+- Studio's upgrade dialog says "Your current disk size of NGB will also be right-sized with the
+  upgrade" whenever the disk answer's `size_gb` differs from the plan's included size (8 GB on gp3).
+  Hosted resizes the disk during an upgrade; Supavise resizes nothing, so for a project whose quota or
+  volume is another size the sentence is untrue. This is a known text mismatch: the condition is
+  computed in the page (`ProjectUpgradeAlert.tsx`, `isDiskSizeUpdated`) from the plan and the disk
+  answer, and no flag or profile field switches it off. Answering the plan's size would hide it and
+  would break the disk page, so the routes tell the truth about the disk and the dialog keeps the line.
 - Studio's "Your project can be upgraded to the latest version of Postgres" alert appears whenever the
   eligibility answer is `eligible`, including when only GoTrue or PostgREST differ from the node's
   pins; the Postgres badge next to it can still read "Latest".

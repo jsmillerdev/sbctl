@@ -3,6 +3,7 @@ package nodeupgrade
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -169,9 +170,18 @@ func TestRollbackStepsBackwards(t *testing.T) {
 	if prev == nil || prev.Version != "v1.1.0" {
 		t.Fatalf("previous of v1.2.0 = %+v", prev)
 	}
+	// The upgrade to v1.1.0 began at t0+30m and ended at t0+1h.
+	rec, _ := r.Get("v1.1.0")
+	rec.UpgradeStartedAt, rec.UpgradeEndedAt = t0.Add(30*time.Minute), t0.Add(time.Hour)
+	if _, err := r.Keep(*rec, filepath.Join(r.Dir, "v1.1.0", BinaryName)); err != nil {
+		t.Fatal(err)
+	}
 	// Rolled back from v1.2.0 to v1.1.0, which becomes the newest again.
 	if err := r.Touch("v1.1.0", t0.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
+	}
+	if got, _ := r.Get("v1.1.0"); !got.InstalledAt.Equal(t0.Add(3*time.Hour)) || !got.UpgradeStartedAt.Equal(t0.Add(30*time.Minute)) || !got.UpgradeEndedAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("a rollback moved the window of the upgrade that installed v1.1.0: %+v", got)
 	}
 	if err := r.Withdraw("v1.2.0"); err != nil {
 		t.Fatal(err)
@@ -183,6 +193,30 @@ func TestRollbackStepsBackwards(t *testing.T) {
 	keepRelease(t, r, "v1.2.0", t0.Add(4*time.Hour))
 	if prev, _ = r.Previous("v1.1.0"); prev == nil || prev.Version != "v1.2.0" {
 		t.Fatalf("a reinstalled release is still withdrawn: %+v", prev)
+	}
+}
+
+// A rollback asks for the moves of the upgrade that installed the release it leaves, by that
+// upgrade's own window; a release the node reached by an earlier rollback was installed again
+// later, and its moves lie before that.
+func TestRollbackAsksForTheWindowOfTheUpgrade(t *testing.T) {
+	h := rollbackHost()
+	start, end := t0.Add(-3*time.Hour), t0.Add(-2*time.Hour)
+	h.cur = &Record{Version: "v1.1.0", Pins: newPins(), Migrations: migsV1, InstalledAt: t0.Add(-time.Minute), UpgradeStartedAt: start, UpgradeEndedAt: end}
+	if err := Rollback(context.Background(), h, runOpts(h)); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	if !h.window[0].Equal(start) || !h.window[1].Equal(end) {
+		t.Fatalf("the moves were read for %v to %v, want %v to %v", h.window[0], h.window[1], start, end)
+	}
+	// A release that no upgrade installed has no window: its moves start when it became current.
+	h = rollbackHost()
+	h.cur.UpgradeStartedAt = time.Time{}
+	if err := Rollback(context.Background(), h, runOpts(h)); err != nil {
+		t.Fatal(err)
+	}
+	if !h.window[0].Equal(h.cur.InstalledAt) {
+		t.Fatalf("window start = %v, want %v", h.window[0], h.cur.InstalledAt)
 	}
 }
 

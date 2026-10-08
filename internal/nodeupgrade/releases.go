@@ -34,11 +34,15 @@ type Record struct {
 	// InstalledAt is when the release became the one the node runs; zero for a release that was
 	// running before the first upgrade kept it.
 	InstalledAt time.Time `json:"installed_at"`
-	// UpgradeEndedAt is when the upgrade that installed the release finished. The projects that
-	// upgrade moved are the ones whose upgrade started between InstalledAt and this time; a project
-	// that an Owner upgraded later is not put back by a rollback. Zero while the upgrade has not
-	// ended, and in records written before it was kept.
-	UpgradeEndedAt time.Time `json:"upgrade_ended_at,omitzero"`
+	// UpgradeStartedAt and UpgradeEndedAt are the window of the upgrade that installed the release.
+	// The projects that upgrade moved are the ones whose upgrade began inside it; a project that an
+	// Owner upgraded later is not put back by a rollback. They are set once, by that upgrade, and
+	// nothing after changes them: InstalledAt moves when a rollback makes the release current again,
+	// the window does not, so a second rollback still finds the moves of this release. Zero for a
+	// release that was running before the first upgrade kept it; the end is zero too while the
+	// upgrade has not finished.
+	UpgradeStartedAt time.Time `json:"upgrade_started_at,omitzero"`
+	UpgradeEndedAt   time.Time `json:"upgrade_ended_at,omitzero"`
 	// Withdrawn marks a release the node was rolled back from: `supavise rollback` does not go
 	// back to it, so that a second rollback keeps stepping backwards. Installing the release
 	// again writes a fresh record.
@@ -148,7 +152,7 @@ func (r Releases) write(d string, rec Record) error {
 
 // Touch marks version as installed now, which makes it the newest record: a rollback to it
 // makes it the release the node runs. It clears Withdrawn: a release the node runs is not one
-// it was rolled back from.
+// it was rolled back from. It leaves the upgrade window (UpgradeStartedAt, UpgradeEndedAt) alone.
 func (r Releases) Touch(version string, at time.Time) error {
 	rec, err := r.Get(version)
 	if err != nil {

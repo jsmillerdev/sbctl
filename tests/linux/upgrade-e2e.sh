@@ -13,8 +13,9 @@
 #  1. `--check` and `--plan` change nothing (nothing is fetched, the marker is not written).
 #  2. Refusals leave the node as it was and exit with status 2: a release that does not exist, one
 #     whose manifest says it upgrades from v0.0.5, a binary that does not match its checksum,
-#     `--unattended` on a node that is not backed up and escrowed, and a release that pins an
-#     artifact that cannot be fetched.
+#     `--unattended` on a node that is not backed up and escrowed, a release that pins an
+#     artifact that cannot be fetched, and a config whose bin_path names another file (root runs
+#     only the installed binary, never a path the supavise user can write: nothing is executed).
 #  3. The upgrade to v0.0.2 (the driver is not the installed binary: the upgrade reads the new
 #     binary's pins, backs everything up, swaps, restarts the daemon, rolls pgmeta, Storage and the
 #     system GoTrue, then the two projects with a canary): versions in the registry and in the
@@ -33,6 +34,9 @@
 #  7. A release that moves no service and renders PostgREST's environment differently (v0.0.6): the
 #     daemon starts without restarting the projects, the upgrade's rollout restarts each project's
 #     PostgREST (canary first), PostgreSQL untouched, data intact.
+#  8. SIGTERM to `supavise upgrade` while the projects are being upgraded (a stub of v0.0.5 as
+#     v0.0.9): the worker is told to stop and is not killed, the upgrade rolls back (exit status 3),
+#     and no project is left UPGRADING.
 #
 # Needs root, systemd, cgroup v2 and network access (artifact downloads). Do not run it on a
 # machine you care about: it creates the supavise user, writes /etc/supavise and starts real
@@ -243,6 +247,16 @@ SUPAVISE_MIN_UPGRADE_FROM=v0.0.5 make_release v0.0.6 "$B/v2" "$BINS/v2.versions.
 run upgrade "$B/v2" --yes --version v0.0.6
 [[ $RC -eq 2 && $OUT == *"upgrades from v0.0.5 or later"* ]] || fail "min_upgrade_from: $RC $OUT"
 unchanged "min_upgrade_from"
+# Root runs only the installed binary. A bin_path in the config (the supavise user owns that file)
+# that names another file is refused before anything is executed, `--check` included.
+printf '#!/bin/sh\ntouch %s/evil-ran\n' "$WORK" >"$WORK/evil-supavise"; chmod 755 "$WORK/evil-supavise"
+{ echo "bin_path = \"$WORK/evil-supavise\""; grep -v '^bin_path' /etc/supavise/config.toml; } >"$WORK/evil.toml"
+run upgrade "$B/v2" --check --config "$WORK/evil.toml"
+[[ $RC -eq 2 && $OUT == *"bin_path"* && $OUT == *"$SV"* ]] || fail "a foreign bin_path: $RC $OUT"
+run upgrade "$B/v2" --yes --version v0.0.2 --config "$WORK/evil.toml"
+[[ $RC -eq 2 && $OUT == *"bin_path"* ]] || fail "a foreign bin_path with --yes: $RC $OUT"
+[[ ! -e $WORK/evil-ran ]] || fail "root ran the binary that bin_path named"
+unchanged "foreign bin_path"
 make_release v0.0.7 "$B/v2" "$BINS/v2.versions.yaml"
 echo tampered >>"$WORK/srv/download/v0.0.7/supavise-linux-$ARCH"
 run upgrade "$B/v2" --yes --version v0.0.7
@@ -413,8 +427,11 @@ if [[ $RC -eq 2 ]]; then
   [[ $OUT == *"restore the system cluster from its pre-upgrade base backup"* ]] || fail "second rollback refusal: $OUT"
 else
   # The previous release already carries every migration (a main that has this code): the
-  # rollback goes through to v0.0.1.
+  # rollback goes through to v0.0.1, and the projects the upgrade to v0.0.2 moved go back too
+  # (the revert of the first rollback is by now their latest upgrade; the window of v0.0.2's
+  # upgrade finds the moves).
   [[ $RC -eq 0 && $($SV --version) == *v0.0.1* ]] || fail "second rollback: $RC $OUT"
+  [[ $(versions_of "$REF") == "$OLD_AUTH $OLD_REST "* && $(versions_of "$REF2") == "$OLD_AUTH $OLD_REST "* ]] || fail "the second rollback left the projects on $(versions_of "$REF") / $(versions_of "$REF2")"
 fi
 
 # ---- 7. a release that renders the units differently ------------------------------------------
@@ -453,5 +470,44 @@ journalctl --no-pager -u supavise.service | grep -q "restart waits for the upgra
 intact "$REF"; intact "$REF2"
 sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
 [[ $sup_status -eq 0 ]] || { cat "$WORK/status.txt" >&2; fail "supavise status exited $sup_status after the upgrade to v0.0.6"; }
+
+# ---- 8. a stop while the projects are upgraded ---------------------------------------------------
+log "SIGTERM to the upgrade while it upgrades the projects: the worker settles, the upgrade rolls back, no project stays UPGRADING"
+cp "$B/v5" /opt/supavise-e2e/v5-real
+cat >"$WORK/stub9" <<'EOF'
+#!/bin/sh
+REAL=/opt/supavise-e2e/v5-real
+[ "$1" = --version ] && { echo "supavise version v0.0.9"; exit 0; }
+if [ "$1" = release-info ]; then "$REAL" release-info --json | sed 's/"version": "v0.0.5"/"version": "v0.0.9"/'; exit $?; fi
+exec "$REAL" "$@"
+EOF
+chmod 755 "$WORK/stub9"
+make_release v0.0.9 "$WORK/stub9" "$BINS/v5.versions.yaml"
+"$B/v5" upgrade --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" --public-key-file "$KEYS/pub.pem" --yes --version v0.0.9 >"$WORK/cancel.out" 2>&1 &
+UP_PID=$!
+for ((i = 0; i < 1200; i++)); do
+  [[ $(marker 2>/dev/null || true) == "projects "* ]] && break
+  kill -0 "$UP_PID" 2>/dev/null || break
+  sleep 0.25
+done
+kill -TERM "$UP_PID" 2>/dev/null || true
+RC=0; wait "$UP_PID" || RC=$?
+OUT=$(cat "$WORK/cancel.out"); cp "$WORK/cancel.out" "$WORK/outputs/cancel.log"
+if [[ $RC -eq 0 ]]; then
+  # The rollout was already over when the signal arrived (it is quick on a small node): there is
+  # nothing to cancel, and the upgrade to v0.0.9 stands. The checks below need the cancelled run.
+  log "the upgrade finished before the signal reached it; the cancel checks are skipped"
+else
+  [[ $RC -eq 3 ]] || { journalctl --no-pager -u supavise.service | tail -40 >&2; fail "a stopped upgrade: exit $RC, want 3: $OUT"; }
+  [[ $OUT == *"rolled back"* ]] || fail "a stopped upgrade did not roll back: $OUT"
+  EXPECT_VERSION=v0.0.6
+  unchanged "stopped upgrade"
+  wait_daemon; [[ $(daemon_version) == *v0.0.6* ]] || fail "the daemon runs $(daemon_version)"
+  [[ $(reg "select count(*) from supavise.projects where status = 'UPGRADING'") == 0 ]] || fail "a project is left UPGRADING: $(reg "select ref, status from supavise.projects")"
+  [[ $(reg "select count(*) from supavise.project_upgrades where status = 0") == 0 ]] || fail "an upgrade row still says running: $(reg "select ref, status, progress from supavise.project_upgrades order by initiated_at")"
+  wait_status "$REF" ACTIVE_HEALTHY 180; wait_status "$REF2" ACTIVE_HEALTHY 180
+  [[ $(versions_of "$REF") == "$NEW_AUTH $NEW_REST "* && $(versions_of "$REF2") == "$NEW_AUTH $NEW_REST "* ]] || fail "versions after the stopped upgrade: $(versions_of "$REF") / $(versions_of "$REF2")"
+  intact "$REF"; intact "$REF2"
+fi
 
 log "upgrade end to end: all checks passed"

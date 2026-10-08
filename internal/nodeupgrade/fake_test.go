@@ -94,6 +94,7 @@ type fakeHost struct {
 	restoreErr    error
 	prev, cur     *Record
 	since         []ProjectMove
+	window        [2]time.Time // the window MovesBetween was asked about
 	confirm       bool
 	confirmErr    error
 	marks         []string
@@ -224,7 +225,10 @@ func (f *fakeHost) PreviousRelease(context.Context, string) (*Record, *Record, e
 	return f.prev, f.cur, nil
 }
 
-func (f *fakeHost) MovesSince(context.Context, time.Time) ([]ProjectMove, error) {
+func (f *fakeHost) MovesBetween(_ context.Context, since, until time.Time) ([]ProjectMove, error) {
+	f.mu.Lock()
+	f.window = [2]time.Time{since, until}
+	f.mu.Unlock()
 	return f.since, nil
 }
 

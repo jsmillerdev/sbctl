@@ -39,7 +39,14 @@ func Rollback(ctx context.Context, h Host, o Options) error {
 
 	var moves []ProjectMove
 	if cur != nil {
-		all, err := h.MovesSince(ctx, cur.InstalledAt)
+		// The window of the upgrade that installed the release, not the time the release last became
+		// current: a release the node reached by a rollback was installed again at that moment,
+		// and its own moves lie before it.
+		since := cur.UpgradeStartedAt
+		if since.IsZero() {
+			since = cur.InstalledAt
+		}
+		all, err := h.MovesBetween(ctx, since, cur.UpgradeEndedAt)
 		if err != nil {
 			return refused("cannot read which projects the upgrade moved: %v", err)
 		}
