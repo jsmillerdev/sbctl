@@ -31,6 +31,15 @@ func mapWriteErr(err error) error {
 // cluster.change_seq every readOnlyPoll and, when it moved, tells the consumer to reload each
 // table. The channel closes when ctx ends or a poll fails.
 func (r *Postgres) subscribePoll(ctx context.Context) (<-chan Change, error) {
+	// A registry that had not run migration 1300 may have since: look again before giving up.
+	if r.legacy.Load() {
+		if err := r.probe(ctx); err != nil {
+			return nil, err
+		}
+		if r.legacy.Load() {
+			return nil, errors.New("registry: the registry has no change counter yet (migration 1300 has not run)")
+		}
+	}
 	seq, err := r.changeSeq(ctx)
 	if err != nil {
 		return nil, err

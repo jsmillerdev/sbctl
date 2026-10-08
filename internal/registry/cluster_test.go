@@ -627,3 +627,77 @@ var v011Migrations = []string{
 	"0900_members.sql", "0901_claim_token_invitation.sql", "0902_content_updated_by.sql", "1000_sso.sql", "1001_sso_denied.sql",
 	"1100_project_upgrades.sql", "1190_custom_domains.sql", "1250_compute_sizes.sql",
 }
+
+// `supavise upgrade` runs the new binary against a registry the old release left, before anything
+// migrates it: the registry must read it, with every project on the founder node, and write the
+// project rows it always wrote.
+func TestPostgresReadsARegistryThatHasNotMigrated(t *testing.T) {
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db := tempDatabase(t, dsn, "supavise_unmigrated")
+	pool, err := pgxpool.New(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := migrate(ctx, pool, "1300_cluster.sql"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `insert into supavise.projects (ref, seq, name, status) values ('system', 0, 'system', 'ACTIVE_HEALTHY')`); err != nil {
+		t.Fatal(err)
+	}
+
+	existing, err := OpenExisting(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer existing.Close()
+	if ps, err := existing.ListProjects(ctx); err != nil || len(ps) != 1 || ps[0].NodeID != FounderNodeID {
+		t.Fatalf("list: %v %+v", err, ps)
+	}
+	if err := existing.SetProjectStatus(ctx, "system", StatusRestarting); err != nil {
+		t.Fatal(err)
+	}
+	p := &Project{Ref: refA, Name: "a"}
+	if err := existing.CreateProject(ctx, p); err != nil || p.NodeID != FounderNodeID || p.Seq != 1 {
+		t.Fatalf("create: %v %+v", err, p)
+	}
+	if err := existing.CreateProject(ctx, &Project{Ref: refB, Name: "b", NodeID: "n2"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a project on a node that cannot exist yet: %v", err)
+	}
+	p.Name = "renamed"
+	if err := existing.UpdateProject(ctx, p); err != nil || p.NodeID != FounderNodeID {
+		t.Fatalf("update: %v %+v", err, p)
+	}
+
+	// A read-only registry reads it too, and refuses to subscribe until migration 1300 has run.
+	ro, err := OpenReadOnly(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	if got, err := ro.GetProject(ctx, refA); err != nil || got.NodeID != FounderNodeID || got.Name != "renamed" {
+		t.Fatalf("read-only get: %v %+v", err, got)
+	}
+	if _, err := ro.Subscribe(ctx); err == nil {
+		t.Fatal("subscribed to a registry without a change counter")
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := ro.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("subscribe after the migration: %v", err)
+	}
+	_ = sub
+	if got, err := ro.GetProject(ctx, refA); err != nil || got.NodeID != FounderNodeID {
+		t.Fatalf("read-only get after the migration: %v %+v", err, got)
+	}
+	if ro.legacy.Load() {
+		t.Fatal("still reading the legacy columns after the migration")
+	}
+}
