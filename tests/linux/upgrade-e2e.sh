@@ -62,6 +62,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 BINS=${UPGRADE_E2E_BIN_DIR:?run tests/linux/upgrade-e2e-build.sh OUT_DIR first and pass UPGRADE_E2E_BIN_DIR}
 SRV_PORT=38801
 WORK=$(mktemp -d)
+START_TS=$(date +%s)
 # The supavise user reads the release key (--plan as that user); the private files keep their own modes.
 chmod 0755 "$WORK"
 SRV_PID=""
@@ -71,6 +72,11 @@ cleanup() {
   [[ -n $SRV_PID ]] && kill "$SRV_PID" 2>/dev/null || true
   [[ -n $HOOK_PID ]] && kill "$HOOK_PID" 2>/dev/null || true
   journalctl --no-pager -u supavise-upgrade.service >"$WORK/outputs/supavise-upgrade.journal" 2>/dev/null || true
+  # Every unit, not just supavise's: a bus drop's cause (dbus, polkit, apt, a daemon-reexec) shows here.
+  journalctl --no-pager -o short-iso --since "@$START_TS" >"$WORK/outputs/system.journal" 2>/dev/null || true
+  if journalctl --no-pager --since "@$START_TS" -u 'supavise*' 2>/dev/null | grep -q "systemd did not answer the request; sending it again"; then
+    echo "::warning title=systemd bus drop::a unit request was sent again; see system.journal in the upgrade-e2e artifact"
+  fi
   collect_logs
   cp -r "$WORK/outputs" "$LOG_DIR/" 2>/dev/null || true
   rm -rf "$WORK"

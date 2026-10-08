@@ -88,11 +88,7 @@ func (h *nodeHost) RevertProjects(ctx context.Context, moves []nodeupgrade.Proje
 				if err := h.asSupavise(ctx, &buf, nil, h.binPath, "projects", "versions", ref, "--json"); err != nil {
 					return nil, "", err
 				}
-				var v versionsView
-				if err := json.Unmarshal(buf.Bytes(), &v); err != nil {
-					return nil, "", fmt.Errorf("projects versions %s --json: %w", ref, err)
-				}
-				return maps.Clone(v.Versions), v.Status, nil
+				return projectState(buf.Bytes(), ref)
 			},
 			say: func(format string, args ...any) { fmt.Fprintf(notes, format+"\n", args...) },
 		}
@@ -101,4 +97,17 @@ func (h *nodeHost) RevertProjects(ctx context.Context, moves []nodeupgrade.Proje
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// projectState reads what `projects versions <ref> --json` prints for one ref: one object, not a
+// list, for that ref.
+func projectState(b []byte, ref string) (map[string]string, string, error) {
+	var v versionsView
+	if err := json.Unmarshal(b, &v); err != nil {
+		return nil, "", fmt.Errorf("projects versions %s --json: %w", ref, err)
+	}
+	if v.Ref != ref {
+		return nil, "", fmt.Errorf("projects versions %s --json answered for %q", ref, v.Ref)
+	}
+	return maps.Clone(v.Versions), v.Status, nil
 }

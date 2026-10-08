@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -123,5 +124,27 @@ func TestRevertStopsWhenCancelled(t *testing.T) {
 	r.run = func(ctx context.Context, args []string) error { cancel(); return run(ctx, args) }
 	if err := r.revert(ctx, gotrueMove); err == nil || len(f.runs) != 1 {
 		t.Fatalf("err = %v after %d runs", err, len(f.runs))
+	}
+}
+
+func TestProjectStateReadsTheVersionsJSON(t *testing.T) {
+	v := versionsView{Ref: "aaaa", Status: "ACTIVE_HEALTHY", Versions: gotrueMove.From}
+	var buf bytes.Buffer
+	if err := printJSON(&buf, v); err != nil {
+		t.Fatal(err)
+	}
+	got, status, err := projectState(buf.Bytes(), "aaaa")
+	if err != nil || status != "ACTIVE_HEALTHY" || got["gotrue"] != "auth-v2.195.0-r1" || got["postgrest"] != "postgrest-v16.4-r0" {
+		t.Fatalf("%v %q %v", got, status, err)
+	}
+	if _, _, err := projectState(buf.Bytes(), "bbbb"); err == nil {
+		t.Error("another project's answer was taken")
+	}
+	var list bytes.Buffer
+	if err := printJSON(&list, []versionsView{v}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := projectState(list.Bytes(), "aaaa"); err == nil {
+		t.Error("a list was taken for one project")
 	}
 }
