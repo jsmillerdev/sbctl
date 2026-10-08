@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -36,6 +37,15 @@ type Node struct {
 	DiskUnknown  bool
 	DiskPath     string
 	LocalBackups bool
+
+	// ConvergeRevision is the host layer revision the node completed (its converged marker; 0 for
+	// a node that never converged, which is every v0.1.x node). ConvergeKnown is false when the
+	// marker could not be read, and the plan then claims nothing about the host.
+	ConvergeRevision int
+	ConvergeKnown    bool
+	// Infra is what the node knows of its AWS stack (infra.Gap); nil on a host that is not on a
+	// stack or when the question could not be answered.
+	Infra *infra.Report
 
 	// Running is set while another upgrade is running.
 	Running *Running

@@ -20,15 +20,17 @@ import (
 
 	"github.com/supavise/supavise/internal/artifacts"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/hostsetup"
+	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/selfupdate"
 	"github.com/supavise/supavise/internal/versions"
 )
 
 // Info describes one release as its binary reports it (`supavise release-info`): the versions
-// it pins and the registry schema it expects. The upgrade runs the new binary to read this,
-// so the plan comes from the versions.yaml that was built into the binary, not from a list
-// next to it.
+// it pins, the registry schema it expects and what it asks of the host and of the cloud stack. The
+// upgrade runs the new binary to read this, so the plan comes from the versions.yaml that was
+// built into the binary, not from a list next to it.
 type Info struct {
 	// Version is the release tag the binary was built as ("v1.4.0").
 	Version  string `json:"version"`
@@ -41,6 +43,12 @@ type Info struct {
 	// and no others.
 	RegistrySchema     string   `json:"registry_schema"`
 	RegistryMigrations []string `json:"registry_migrations"`
+	// HostChanges are the titles of the steps of the release's host layer (`supavise system
+	// converge`), ConvergeRevision the revision the layer completes (0: the release has none) and
+	// InfraRevision the revision the AWS stack needs for the release's features (0: none).
+	HostChanges      []string `json:"host_changes,omitempty"`
+	ConvergeRevision int      `json:"converge_revision"`
+	InfraRevision    int      `json:"infra_revision"`
 }
 
 // PinsOf maps a versions.yaml to service names.
@@ -72,7 +80,8 @@ func OwnInfo(version string) (*Info, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Info{Version: version, Platform: runtime.GOOS + "-" + runtime.GOARCH, Pins: PinsOf(v), RegistrySchema: registry.SchemaVersion(), RegistryMigrations: registry.MigrationNames()}, nil
+	return &Info{Version: version, Platform: runtime.GOOS + "-" + runtime.GOARCH, Pins: PinsOf(v), RegistrySchema: registry.SchemaVersion(), RegistryMigrations: registry.MigrationNames(),
+		HostChanges: hostsetup.Titles(), ConvergeRevision: hostsetup.Revision, InfraRevision: infra.Revision}, nil
 }
 
 // ParseInfo reads the JSON `supavise release-info --json` prints.
@@ -153,6 +162,20 @@ func CheckManifestPins(info *Info, artifacts map[string]string, studio string) e
 	}
 	if studio != "" && info.Pins[config.SvcStudio] != studio {
 		return fmt.Errorf("the release manifest pins Studio %s and the binary of %s pins %q: refusing a binary that is not the one the signed manifest describes", studio, info.Version, info.Pins[config.SvcStudio])
+	}
+	return nil
+}
+
+// CheckManifestRevisions compares the converge and stack revisions a binary reports with those in
+// the signed release manifest. A manifest that names none (an older manifest) has nothing to
+// compare. A difference means the binary is not the one the manifest describes, and a node
+// upgraded to it would never reach the revision the manifest promises.
+func CheckManifestRevisions(info *Info, m *selfupdate.Manifest) error {
+	if m.Host != nil && m.Host.ConvergeRevision != info.ConvergeRevision {
+		return fmt.Errorf("the release manifest names converge revision %d and the binary of %s reports %d: refusing a binary that is not the one the signed manifest describes", m.Host.ConvergeRevision, info.Version, info.ConvergeRevision)
+	}
+	if m.AWS != nil && m.AWS.StackRevision != info.InfraRevision {
+		return fmt.Errorf("the release manifest names stack revision %d and the binary of %s reports %d: refusing a binary that is not the one the signed manifest describes", m.AWS.StackRevision, info.Version, info.InfraRevision)
 	}
 	return nil
 }

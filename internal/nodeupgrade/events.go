@@ -17,6 +17,9 @@ const (
 	EventRolledBack = "rolled_back"
 	// EventNeedsOperator: the change failed and the node is not back (exit status 4).
 	EventNeedsOperator = "needs_operator"
+	// EventInfraBehind: the plan found the node's AWS stack behind what the release needs, and the
+	// run did not update it (an unattended run cannot). The run itself is not a failure.
+	EventInfraBehind = "infra_behind"
 )
 
 // Event is one thing the operator should hear about an upgrade or a rollback. The package sends no
