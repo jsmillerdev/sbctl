@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -115,11 +116,7 @@ not through this command. A release states the oldest version it upgrades from
 				// already converged changes nothing. A failure is a warning here: the daemon raises
 				// host_not_converged while the host is behind, and `sudo supavise system converge`
 				// repeats the step. (`supavise upgrade` treats it as a failure and rolls back.)
-				c := exec.CommandContext(cmd.Context(), exe, "system", "converge")
-				c.Stdout, c.Stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
-				if err := c.Run(); err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: supavise system converge failed: %v\n", err)
-				}
+				applyHostLayer(cmd.Context(), exe, cmd.OutOrStdout(), cmd.ErrOrStderr())
 			}
 			if noRestart || !serviceInstalled(cmd.Context()) {
 				fmt.Fprintln(cmd.OutOrStdout(), "supavise.service was not restarted; run `systemctl restart supavise.service` to use the new binary")
@@ -161,6 +158,16 @@ func hostLayerCommand(ctx context.Context, exe string) string {
 		return "converge"
 	}
 	return "install-units"
+}
+
+// applyHostLayer runs the host layer of the binary at exe and reports a failure as a warning.
+func applyHostLayer(ctx context.Context, exe string, stdout, stderr io.Writer) {
+	sub := hostLayerCommand(ctx, exe)
+	c := exec.CommandContext(ctx, exe, "system", sub)
+	c.Stdout, c.Stderr = stdout, stderr
+	if err := c.Run(); err != nil {
+		fmt.Fprintf(stderr, "warning: supavise system %s failed: %v\n", sub, err)
+	}
 }
 
 func serviceInstalled(ctx context.Context) bool {
