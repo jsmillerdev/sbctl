@@ -22,6 +22,7 @@ import (
 	"github.com/jsmillerdev/supavise/internal/functions"
 	"github.com/jsmillerdev/supavise/internal/health"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/notice"
 	"github.com/jsmillerdev/supavise/internal/proxy"
 	"github.com/jsmillerdev/supavise/internal/registry"
 )
@@ -84,6 +85,15 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	// reads the same sealed secret the API uses (PGMetaCryptoKey).
 	if _, err := PGMetaCryptoKey(ctx, cfg, node.Registry, node.Secrets); err != nil {
 		return err
+	}
+	// The artifact versions this release pins join the node's release history, which
+	// `supavise artifacts gc` reads to keep the artifacts of the previous release.
+	if rs, ok := node.Artifacts.(interface{ RecordPins() (bool, error) }); ok {
+		if added, err := rs.RecordPins(); err != nil {
+			log.Warn("could not record the release's artifact pins", "error", err)
+		} else if added {
+			log.Info("release's artifact pins recorded")
+		}
 	}
 	recovered := node.Engine.Recover(ctx)
 	for _, r := range recovered {
@@ -203,10 +213,33 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		return err
 	}
 	superviseStop(g, gctx, budget, edge.Run, drain, admin.Shutdown, log)
+	fleetUp := make(chan bool, 1)
+	projectsUp := make(chan struct{})
 	if cfg.Supervisor == config.SupervisorSystemd {
 		// Next to the projects: a shared service that takes minutes to answer (Realtime and
 		// Supavisor run migrations first) must not hold the projects back.
-		g.Go(func() error { startFleet(gctx, node, log); return nil })
+		g.Go(func() error { fleetUp <- startFleet(gctx, node, log); return nil })
+		// Once both are up, every project is registered with the shared services again. It is a
+		// no-op when nothing changed, and when a release moved Storage or Realtime it is what runs
+		// the new release's migrations in each project's database (they need the database, so the
+		// projects come first).
+		g.Go(func() error {
+			select {
+			case ok := <-fleetUp:
+				if !ok {
+					return nil
+				}
+			case <-gctx.Done():
+				return nil
+			}
+			select {
+			case <-projectsUp:
+			case <-gctx.Done():
+				return nil
+			}
+			ensureTenants(gctx, node, log)
+			return nil
+		})
 	}
 	g.Go(func() error {
 		_ = bsvc.Run(gctx) // expiry sweeper; returns when the daemon stops
@@ -223,9 +256,10 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		})
 	}
 	g.Go(func() error {
-		startProjects(gctx, node, recovered, backups(node), log)
+		startProjects(gctx, node, recovered, backups(node), log, func() { close(projectsUp) })
 		return nil
 	})
+	g.Go(func() error { settleUpgrades(gctx, node, log); return nil })
 	log.Info("Supavise is up", "domain", cfg.BaseDomain(), "api", cfg.APIURL(), "dashboard", cfg.DashboardURL())
 	err = g.Wait()
 	log.Info("Supavise stopped")
@@ -268,20 +302,37 @@ func superviseStop(g *errgroup.Group, gctx context.Context, budget time.Duration
 // Studio) at boot. Their units are not enabled for boot, like every unit of the
 // control plane's own: the daemon starts them, in order, once the registry is up, so a
 // reboot brings the whole node back from one enabled unit (supavise.service). Already
-// running services whose files are unchanged are left alone. The installer renders and
-// first starts them (`supavise fleet start`); a service whose artifact was never fetched
-// fails here and is logged, and the rest of the node still comes up.
-func startFleet(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+// running services whose files are unchanged are left alone, and one whose files changed
+// (a release moved its pin) is restarted, one at a time, each waited for. The installer renders
+// and first starts them (`supavise fleet start`); a service whose artifact was never fetched
+// fails here and is logged, and the rest of the node still comes up. While a `supavise upgrade`
+// runs, the first failure ends the roll instead, so that the upgrade, which watches the
+// services, rolls back with the later ones still on the old release. It reports whether every
+// service started.
+func startFleet(ctx context.Context, n *lifecycle.Node, log *slog.Logger) bool {
 	// fleet.Setup generates the services' sealed secrets on first use, renders and starts
 	// the units in order, and waits for each. Its tenants are not used here: the Engine's
 	// own Fleet (a Lazy over the same Setup) registers projects.
+	_, upgrading := notice.UpgradeRunning(n.Cfg.Paths(), time.Now())
 	_, err := fleet.Setup(ctx, fleet.Deps{Cfg: n.Cfg, Log: log.With("component", "fleet"), Registry: n.Registry,
-		Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts, Start: true})
+		Secrets: n.Secrets, Supervisor: n.Supervisor, Artifacts: n.Artifacts, Start: true, HaltOnFailure: upgrading})
 	if err != nil {
 		log.Error("shared services did not all start", "error", err)
-		return
+		return false
 	}
 	log.Info("shared services started")
+	return true
+}
+
+// ensureTenants registers the active projects with the shared services again (see
+// lifecycle.Engine.EnsureTenants). A failure is logged: `supavise status` reports a project
+// whose tenant is missing, and the next change to the project registers it.
+func ensureTenants(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+	errs := n.Engine.EnsureTenants(ctx)
+	for ref, err := range errs {
+		log.Warn("project not registered with the shared services", "ref", ref, "error", err)
+	}
+	log.Info("projects registered with the shared services", "failed", len(errs))
 }
 
 // startProjects brings the system project's backup timer and every active project up
@@ -290,7 +341,7 @@ func startFleet(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 // projects start, and a project that fails is marked ACTIVE_UNHEALTHY. Projects whose
 // restart the previous process cut off after the pause are resumed first, and restored
 // clones whose recovery outlasted the restore's wait are finished in the background.
-func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle.Recovered, bk *backup.Service, log *slog.Logger) {
+func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle.Recovered, bk *backup.Service, log *slog.Logger, ready func()) {
 	if n.Cfg.Supervisor == config.SupervisorSystemd {
 		for _, unit := range []string{backup.BackupTimerInstance(config.SystemRef), backup.PruneTimerUnit} {
 			if err := n.Supervisor.Start(ctx, unit); err != nil {
@@ -304,10 +355,21 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 	for ref, err := range n.Engine.ResumeRecovered(ctx, recovered) {
 		log.Error("project did not resume after an interrupted restart", "ref", ref, "error", err)
 	}
-	errs := n.Engine.StartActive(ctx)
+	// While an upgrade moves the node forward, a project whose service files the new binary
+	// rendered differently keeps running on the old ones; the upgrade's rollout restarts those
+	// projects, canary first, and stops at the first failure.
+	startCtx := ctx
+	if u, running := notice.UpgradeRunning(n.Cfg.Paths(), time.Now()); running && u.Forward() && u.ProcessAlive() {
+		startCtx = lifecycle.DeferRestarts(ctx)
+		log.Info("an upgrade is running; project services whose files changed are restarted by its rollout")
+	}
+	errs := n.Engine.StartActive(startCtx)
 	for ref, err := range errs {
 		log.Error("project did not start", "ref", ref, "error", err)
 	}
+	// Every project has been tried: the daemon may register them with the shared services now.
+	// (The restore sweep below runs until the daemon stops, so it cannot be waited for.)
+	ready()
 	ps, err := n.Registry.ListProjects(ctx)
 	if err != nil {
 		log.Error("listing projects after start", "error", err)
@@ -322,6 +384,23 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 	log.Info("projects started", "active", started, "failed", len(errs))
 	if bk != nil {
 		finishRestores(ctx, bk, log)
+	}
+}
+
+// settleUpgrades runs until ctx ends: a project left UPGRADING by an upgrade whose process died
+// (the CLI's, since the daemon's own upgrades end with the daemon and Recover settles those)
+// is started again on its recorded versions, and an upgrade record that never got its final
+// status is closed. An upgrade whose process is alive is left alone.
+func settleUpgrades(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Minute):
+		}
+		for _, r := range n.Engine.SettleUpgrades(ctx) {
+			log.Warn("project recovered", "ref", r.Ref, "from", r.From, "to", r.To, "note", r.Note)
+		}
 	}
 }
 
@@ -341,15 +420,17 @@ func refreshSystem(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 		log.Warn("system cluster not refreshed", "error", err)
 		return
 	}
-	if err := n.Plane.StartDatabase(ctx, p, keys); err != nil {
-		log.Warn("system cluster not refreshed", "error", err)
-		return
-	}
 	// The dashboard's sign-in service gets the same treatment: a node upgraded to a version that
 	// turns on dashboard SSO (SAML key, the sign-up hook) or a changed [mail] section renders
-	// new files, and the unit is restarted only when they differ.
-	if err := n.Plane.RefreshSystemAuth(ctx, p, keys); err != nil {
+	// new files, and the unit is restarted only when they differ. When the cluster itself restarts
+	// the sign-in service goes down with it and is started again.
+	var re *lifecycle.SystemRefreshError
+	switch err := n.Plane.RefreshSystem(ctx, p, keys); {
+	case err == nil:
+	case errors.As(err, &re) && re.Auth:
 		log.Warn("the dashboard's sign-in service is not refreshed; run `supavise system init` to apply its settings", "error", err)
+	default:
+		log.Warn("system cluster not refreshed", "error", err)
 	}
 }
 

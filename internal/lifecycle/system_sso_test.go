@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -184,5 +185,79 @@ func TestRefreshSystemAuthRestartsOnlyOnAChange(t *testing.T) {
 	}
 	if got := sup.calls(); got != "render supavise-gotrue@system.service" {
 		t.Fatalf("a unit that is not running: %s", got)
+	}
+}
+
+// depSup is a supervisor in which stopping the system cluster stops the sign-in service with it, as
+// systemd does for a unit that requires it, and starting the cluster does not start it again.
+type depSup struct {
+	changeSup
+	states map[string]units.State
+}
+
+func (d *depSup) Stop(_ context.Context, u string) error {
+	d.rec("stop " + u)
+	d.states[u] = units.StateInactive
+	if u == "supavise-postgres@system.service" {
+		d.states["supavise-gotrue@system.service"] = units.StateInactive
+	}
+	return nil
+}
+func (d *depSup) Start(_ context.Context, u string) error {
+	d.rec("start " + u)
+	d.states[u] = units.StateActive
+	return nil
+}
+func (d *depSup) Status(_ context.Context, u string) (units.Status, error) {
+	return units.Status{State: d.states[u]}, nil
+}
+
+// A release that changes how the system cluster is rendered restarts it when the daemon starts, which
+// stops the dashboard's sign-in service: the daemon starts it again. A sign-in service that was not
+// running before is not started.
+func TestRefreshSystemStartsTheSignInServiceTheClusterRestartStopped(t *testing.T) {
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer health.Close()
+	_, port, _ := net.SplitHostPort(health.Listener.Addr().String())
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	cfg.Domain = "example.test"
+	cfg.Ports.SystemGoTrue, _ = strconv.Atoi(port)
+	sys := testProject(cfg, config.SystemRef, 0)
+	keys := testKeys(t, config.SystemRef)
+	ctx := context.Background()
+	const gotrue, pg = "supavise-gotrue@system.service", "supavise-postgres@system.service"
+	restart := func(d *depSup) func() error {
+		return func() error { // StartDatabase on a cluster whose files changed
+			_ = d.Stop(ctx, pg)
+			return d.Start(ctx, pg)
+		}
+	}
+
+	d := &depSup{states: map[string]units.State{gotrue: units.StateActive, pg: units.StateActive}}
+	pl := NewPostgresPlane(cfg, d, fakeArts{}, registry.NewMemory(), PlaneOptions{})
+	if err := pl.refreshSystem(ctx, sys, keys, restart(d)); err != nil {
+		t.Fatal(err)
+	}
+	if d.states[gotrue] != units.StateActive {
+		t.Fatalf("the sign-in service is %s after the cluster restarted: %s", d.states[gotrue], d.calls())
+	}
+
+	d = &depSup{states: map[string]units.State{gotrue: units.StateInactive, pg: units.StateActive}}
+	pl = NewPostgresPlane(cfg, d, fakeArts{}, registry.NewMemory(), PlaneOptions{})
+	if err := pl.refreshSystem(ctx, sys, keys, restart(d)); err != nil {
+		t.Fatal(err)
+	}
+	if d.states[gotrue] != units.StateInactive {
+		t.Fatalf("a sign-in service that was not running was started: %s", d.calls())
+	}
+
+	// A cluster that does not start is the cluster's error, and the sign-in service is not touched.
+	d = &depSup{states: map[string]units.State{gotrue: units.StateActive, pg: units.StateActive}}
+	pl = NewPostgresPlane(cfg, d, fakeArts{}, registry.NewMemory(), PlaneOptions{})
+	err := pl.refreshSystem(ctx, sys, keys, func() error { return errors.New("postgres did not start") })
+	var re *SystemRefreshError
+	if !errors.As(err, &re) || re.Auth || !strings.Contains(err.Error(), "did not start") {
+		t.Fatalf("err = %v", err)
 	}
 }

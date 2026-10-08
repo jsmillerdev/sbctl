@@ -412,7 +412,7 @@ func init() {
 }
 
 // reasons are the values `backups create --reason` accepts.
-var reasons = []string{backup.ReasonManual, backup.ReasonScheduled, backup.ReasonFinal, backup.ReasonRestore}
+var reasons = []string{backup.ReasonManual, backup.ReasonScheduled, backup.ReasonFinal, backup.ReasonRestore, backup.ReasonUpgrade}
 
 func validReason(r string) bool { return slices.Contains(reasons, r) }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/jsmillerdev/supavise/internal/artifacts"
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/projectconfig"
 	"github.com/jsmillerdev/supavise/internal/registry"
@@ -75,6 +76,11 @@ func newTenants(d Deps, c *creds) Fleet {
 	}
 	store := tenantStore{reg: d.Registry, sec: d.Secrets}
 	now := time.Now
+	// The releases this node pins: part of the Realtime and Storage tenants' fingerprints.
+	var tags map[string]string
+	if v, err := artifacts.LoadVersions(cfg); err == nil {
+		tags = map[string]string{config.SvcRealtime: v.Artifacts[config.ArtifactName(config.SvcRealtime)], config.SvcStorage: v.Artifacts[config.ArtifactName(config.SvcStorage)]}
+	}
 	return Fleet{
 		&supavisorTenant{
 			cl: client(config.SvcSupavisor), store: store, base: "http://" + Addr(cfg, config.SvcSupavisor),
@@ -82,11 +88,11 @@ func newTenants(d Deps, c *creds) Fleet {
 		},
 		&realtimeTenant{
 			cl: client(config.SvcRealtime), store: store, base: "http://" + Addr(cfg, config.SvcRealtime),
-			secret: c.realtimeAPIJWT, now: now,
+			secret: c.realtimeAPIJWT, now: now, release: tags[config.SvcRealtime],
 		},
 		&storageTenant{
 			cl: client(config.SvcStorage), store: store, base: fmt.Sprintf("http://127.0.0.1:%d", cfg.Ports.StorageAdmin),
-			adminKey: c.storageAdminKey, fileSize: cfg.Fleet.FileSizeLimit(),
+			adminKey: c.storageAdminKey, fileSize: cfg.Fleet.FileSizeLimit(), release: tags[config.SvcStorage],
 			adminPassword: registryAdminPassword(d.Registry, d.Secrets),
 		},
 	}

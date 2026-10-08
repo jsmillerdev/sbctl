@@ -97,7 +97,9 @@ pending restart); no migration is needed.
   resume, bracketed by `project.restart_requested` and `project.restart_finished`) cut off after
   the pause is flagged `Recovered.Resume`, and `ResumeRecovered` brings the project back; a stale
   request on a project that is not paused is cleared. `RESTORING` is not touched. Each move is a
-  `project.recovered` event.
+  `project.recovered` event. `UPGRADING` is stopped and set `ACTIVE_UNHEALTHY` when nobody runs its
+  upgrade any more, and left alone while another process (the CLI) holds it (see "Service versions
+  and project upgrades").
 - In-place restore (`restore.go`): `Engine.BeginRestore` (the optional `DatabaseRestorer` capability of the Manager; the Management API's backup routes use it) moves an `ACTIVE_*` or `RESTORE_FAILED` project to `RESTORING` under the project lock and returns a handle whose `Run` calls the backup service's `RestoreInPlace` (`InPlaceRestorer`, found through `Options.Backup`; the late backuper checks beforehand that the backend opens, `ErrNoRestorer` otherwise). The service pauses and resumes the project through this Engine with a context marked as a restore, and `Pause` and `Resume` then accept `RESTORING` and leave the status alone, so the project stays `RESTORING` from the first call to the end. `BeginRestore` first checks that the disk can hold the restored copy next to the current data (`ErrInsufficientDisk`, 409 through the API; skipped when the free space cannot be read). After a restore that worked, `Run` sets the cluster's role passwords to the registry's again (`rolePasswordPlane`, which `PostgresPlane` implements; a failure is logged and recorded as `restore.passwords_failed`, the restore stands) and prunes the leftovers of earlier restores (`restore_space.go`): the newest `data.pre-restore-*` stays, older ones and all `data.failed-restore-*` go; after a failure only older `data.failed-restore-*` go. `Run` settles it: `ACTIVE_HEALTHY` after a restore, `RESTORE_FAILED` after a failure, whether or not the original data is running again (a status that went back to `ACTIVE_HEALTHY` would look like a restore that worked to Studio's restore screen and to API clients). `Health` leaves `RESTORE_FAILED` alone; another restore, `Pause` (then `Resume`, which is what a restart does) and `Delete` move the project on, and a `Pause` that fails keeps the status. Every other operation refuses a `RESTORING` project (`ErrInvalidState`), and `Delete` also refuses one whose restore runs in this process; a project left `RESTORING` by a stopped daemon can be deleted. `restore.requested` is the event.
 - Backup timers: with the systemd backend the Engine starts `supavise-basebackup@<ref>.timer` when
   a project becomes active (create, resume, start) and stops it on pause and delete
@@ -106,6 +108,137 @@ pending restart); no migration is needed.
 - Region: `CreateRequest.Region` is kept when it is an AWS region code, otherwise the
   configured `region` (default `us-east-1`) is stored: Studio and the CLI resolve the project
   region against a list of real regions, and an unknown one breaks the project list.
+
+## Service versions and project upgrades
+
+A project runs the versions in `registry.Project.Versions` (service name to slim-services release
+tag; `postgres`, `gotrue`, `postgrest`). A new project records the node's pins
+(`internal/versions/versions.yaml`). The plane renders the project's Postgres, GoTrue and PostgREST
+units from the project's own versions (`PostgresPlane.artifactDir`, through `artifacts.Store.DirFor`),
+so a Supavise release that moves the pins changes no running project. A service the project
+recorded no version for runs the node's pin, and the system project always runs the pins: it
+belongs to the node. A version whose artifact is not on disk fails the render with
+`ErrNotFetched` and names `supavise projects upgrade <ref>`. Artifacts stay on disk while a project
+runs them: `Engine.CollectArtifacts` (`supavise artifacts gc`, and after a successful
+`projects upgrade`) removes only what no project runs or is being upgraded to, what the node
+pins, what the newest recorded release pinned (what the daemon last started with, whatever
+`keep_releases` says: the CLI that runs the collection may be a newer binary than the daemon), and
+what the last `[upgrade] keep_releases` releases of the node's release history pinned
+(`artifacts.Store.RecordPins`, written at daemon start; default 3: the current release and the
+two before).
+
+`Engine.UpgradeProject(ref, target)` (`BeginUpgrade` + `Run`; the `ProjectUpgrader` capability of
+the Manager, which the Management API and the CLI use) moves a project to other versions, the
+node's pins by default, on the same data directory. It follows hosted Supabase's flow (Owner or
+Administrator asks, the project is `UPGRADING` with a tracking id and a progress Studio draws, a
+failure brings the original back online) but is a restart on other binaries, not a `pg_upgrade`
+onto a new instance: the three services change by minor release inside one Postgres major version,
+and that does not change the on-disk format.
+
+1. `BeginUpgrade`, under the project's lock: only `ACTIVE_HEALTHY` projects, a node with a backup
+   service, something to change, no other Postgres major version and no service that would move to
+   an older release than the project runs (`ErrInvalidState`,
+   `ErrNoBackupEngine`, `ErrUpgradeNotNeeded`, `ErrUpgradeUnsupported`; nothing changes on a
+   refusal). It claims the upgrade of the ref (a session-level advisory lock on a connection of its
+   own, `supavise:upgrade:<ref>`, held until `Run` ends; the lock goes when the process dies),
+   writes the `registry.Upgrade` row (the tracking id; `project_upgrades`), sets `UPGRADING` and
+   records `project.upgrade_started`. Other operations on the ref fail at once with
+   `ErrInvalidState` while the upgrade runs in this process (`upgradeBusy`), and a second runner
+   in another process is refused.
+2. `Run`: the target artifacts are fetched and verified (`FetchTag`; progress `1_started`); when
+   the Postgres release changes, the installed extensions are checked against it (see
+   "Extensions"); a base backup with the reason `pre-upgrade` is taken while the project serves
+   (`2_...`). Any of them failing ends the upgrade before any service is touched: fail closed, the
+   project returns to its status, the upgrade row says `failed` with the stage's error code.
+3. Under the lock: the extension check again (a database may have changed during the backup). The
+   nightly backup timer stops. With a new Postgres release the shared services let
+   go of the database, all three units stop and start again from the target versions (database
+   first); otherwise only GoTrue and PostgREST restart (`Runner.Reconfigure`) and the cluster keeps
+   serving. Each unit answers a real request before the next starts (GoTrue runs its migrations
+   first), then `Runner.Health` checks every service and, after a Postgres change, every
+   installed extension's code must load (`VerifyExtensions`).
+4. One `UpdateProject` records the target versions and `ACTIVE_HEALTHY`; the status row says
+   `9_completed_upgrade`, status 1.
+
+A failure in step 3 renders the previous versions again (recorded explicitly, so a project that had
+none does not float onto the release that just failed), starts and health checks them, and
+records `project.upgrade_failed`, the status row (status 2, the error code of the stage, the
+cause) and the log message `upgrade_failed`. If the rollback fails too the project is
+`ACTIVE_UNHEALTHY` and the error names the pre-upgrade backup; its nightly backup timer starts
+again whenever PostgreSQL itself runs after the rollback, whatever the API units do (otherwise the
+status row says the scheduled backups stay paused until the project restarts). **The data directory is not
+restored by a rollback.** A Postgres, GoTrue or PostgREST minor release does not change the format
+of the files, so the previous binaries read what the new ones left. GoTrue's (and Storage's)
+migrations run when the service starts and only go forward, so an older GoTrue can meet a schema a
+newer one migrated: the pre-upgrade base backup is the way back for the data
+(`supavise backups restore`), and its id is in the error, the events and the status row.
+
+Who runs an upgrade can die: the daemon restarts, or the CLI's process is killed (`projects
+upgrade` ignores SIGHUP and SIGPIPE, so a dropped SSH session does not end it, but SIGKILL and the
+OOM killer can). The claim tells a live runner from a dead one. A project that is `UPGRADING` with
+the claim free lost its runner: `Recover` (at the daemon's start, before `StartActive`) and
+`SettleUpgrades` (the daemon calls it every 2 minutes) stop its units, mark the upgrade failed and
+set `ACTIVE_UNHEALTHY`, and start it on the recorded, previous versions. An upgrade that died
+before it touched a unit (progress before `4_attached_volume_to_original_instance`: the artifact
+fetch, the base backup) only has its row marked failed and the project set `ACTIVE_HEALTHY`:
+nothing is stopped. While the claim is held
+they leave the project alone, so a daemon restart during a CLI upgrade's base backup does not stop
+a serving project. The same pass closes an upgrade row that still says running on a project that is
+not `UPGRADING` (the process died after recording the versions, or after a rollback): `done` when
+the project runs the row's target versions, `failed` otherwise. An operator needs to do nothing
+beyond waiting for the next pass or restarting the daemon; with no daemon, `supavise serve` settles
+the project when it starts. The pre-upgrade backup id stays in the events and the status row.
+
+### What a node upgrade adds
+
+`supavise upgrade` (`internal/nodeupgrade`) drives `Engine.UpgradeProject` through the CLI: `projects upgrade --all --to <service>=<tag>...` moves a project only to the releases named (a service it does not name stays; `--include-postgres` is how the node upgrade names PostgreSQL), and three more request fields serve it. `UpgradeRequest.Target` and `UpgradeEligibilityFor(ref, request)` plan for a target other than the node's pins. `AllowOlder` (`--allow-older`) lets the target be older than what the project runs: the one move to an older release that is allowed, used by `supavise rollback` to put the projects an upgrade moved back on the releases they ran (tags that cannot be ordered stay refused). `ReuseBackupSince` (`--reuse-backup-since`, hidden) lets the upgrade take as its pre-upgrade backup a completed base backup of the project that finished after that time instead of taking another: the node upgrade backs everything up first, and a base backup plus the archived WAL after it restores a project to any moment up to the upgrade.
+
+Two changes make a release take effect on units that are already running. `startAPI` (a project's GoTrue and PostgREST, at every start) renders the units and stops a running one whose files changed, so that the `Start` after it runs the new files (it used to leave the old process running: `Start` on a running unit is a no-op); an unchanged unit is left alone. "Changed" is the render's answer or a file written after the unit's process started (`filesNewerThan`, from the unit's start time), so a restart that was held back shows later. While `supavise upgrade` moves the node forward the daemon holds those restarts back: it starts the projects with a context marked `DeferRestarts`, `startAPI` and `StartDatabase` render and leave the running units on their old files, and the upgrade's rollout does the restarts. A restart of a project's PostgreSQL stops its GoTrue and PostgREST with it (their units require the cluster), so `RestartPending` stops them first and starts all three on the rendered files. A restart the daemon holds back leaves a mark (`<svc>.held`, next to the unit's env file) with the digest of the files the process started with. The mark is what makes the restart visible to the rollout however long ago the files were rendered: `PendingRestart` is true for a cluster that has a mark or whose render changed now, and for GoTrue and PostgREST also for files written after the process started. A setting an Owner saved without restarting renders into the cluster's unit too, but it leaves no mark, so the rollout does not restart a cluster for it (a restart the release owes applies it as well). `RestartPending` removes the marks of the units it restarts. A mark older than the unit's process is stale and dropped. When a rollback renders the old release's files back and the digest equals the mark's, the unit still runs those files: the daemon restarts nothing, removes the mark and sets the files' modification time to the process's start; a unit without a mark, which the rollout restarted onto the new files, is restarted onto the old ones by the old daemon at its start, in sequence, as any changed render is. A later start of the daemon with a mark left (a rollout that was cut short) leaves a PostgreSQL cluster alone and restarts GoTrue and PostgREST; `supavise upgrade` finishes the cluster, its plan lists the project, and `HeldRestart(cfg, ref)` is what the node upgrade reads. The system cluster is not deferred: the daemon needs it, and the node upgrade's plan names its restart. A new binary can render every project's files differently, and fifty restarts in a row with no canary and no stop at the first failure belong to the rollout, not to the daemon's start. `Engine.PendingRestart(ref)` says whether a project's PostgreSQL, GoTrue or PostgREST runs older files than the rendered ones and `Engine.RestartPending(ref)` restarts them and waits (`PendingRestarter`, implemented by the plane); `supavise projects upgrade --all --restart-changed` (hidden, what the node upgrade passes) puts those projects in the same canary and batch order as the ones whose release moves. A daemon that starts while the upgrade rolls back does not defer: it restarts, one after another, the units the rollout had restarted (see the marks above), which is what puts them back. And `Engine.EnsureTenants` registers every active project with Supavisor, Realtime and Storage again, one at a time; the tenants' fingerprints include the release tag of Storage and Realtime (`internal/fleet`), so after a release moved either of them the call sends each project's tenant once more, which is what runs the new release's tenant migrations in every project's database (Storage on the tenant update, Realtime on the tenant create). The daemon calls it once the shared services and the projects have started; with nothing changed it asks each service and sends nothing.
+
+### Extensions
+
+A Postgres upgrade swaps the binaries under the same data directory, and the extensions created in
+the project's databases keep their catalog version and the shared library their functions name. A
+release that drops either leaves an extension broken while the cluster starts and answers, so
+`extensions.go` checks, only when the Postgres release changes:
+
+- Before anything is touched (in `UpgradeEligibility`, again after the artifact is fetched, and again
+  under the lock): every extension of every database (`Plane`'s optional `ExtensionInspector`;
+  `PostgresPlane` reads `pg_extension` of each database that accepts connections) must have a control
+  file in the target artifact, a library (`module_pathname`, or `<extension>-<version>` for extensions
+  built in versioned shared-object mode such as `wrappers`), and its version's own script or a chain
+  of update scripts to the release's default version (`CheckExtensionFiles`). A finding is a blocker
+  of type `unsupported_extension`, which Studio shows in its list of issues to resolve; the message
+  tells the owner to run `ALTER EXTENSION <name> UPDATE` while the project still runs its current
+  release. Planning only notes a release that is not on disk yet or a cluster that does not answer;
+  the upgrade itself refuses in both cases.
+- After the new cluster starts and before the versions are recorded: `VerifyExtensions` runs
+  Postgres's own C-function validator (`fmgr_c_validator`) on every C function an extension owns,
+  which loads the library and looks up the symbol. A failure rolls the upgrade back.
+
+An upgrade never runs `ALTER EXTENSION UPDATE`: extensions keep their versions, and the owner
+updates them once the project is on the new release. A GoTrue or PostgREST upgrade does not touch
+the databases' extensions and skips these checks.
+
+Progress values and what they mean here (hosted's names describe a `pg_upgrade` onto a new
+instance; Studio draws them under its own labels): `0_requested` accepted, `1_started` artifacts,
+`2_launched_upgraded_instance` backup running, `3_detached_volume_from_upgraded_instance` backup
+done, `4_attached_volume_to_original_instance` stopping services, `5_initiated_data_upgrade`
+starting PostgreSQL, `6_completed_data_upgrade` starting GoTrue and PostgREST,
+`7_detached_volume_from_original_instance` health check, `8_attached_volume_to_upgraded_instance`
+recording, `9_completed_upgrade`. Error codes: `1_upgraded_instance_launch_failed` (artifacts),
+`4_data_upgrade_initiation_failed` (the backup), `5_data_upgrade_completion_failed` (stop or start),
+`8_upgrade_completion_failed` (health gate, recording, an interrupted upgrade).
+
+`Engine.UpgradeEligibility` answers for the node's pins: current and target versions, the changes
+and whether PostgreSQL restarts, blockers (not `ACTIVE_HEALTHY`, another Postgres major version,
+a service the project runs a newer release of than the target (`Ahead`; `CompareTags` orders the
+tags by upstream version, then packaging revision, and tags it cannot order are refused too),
+no backup service, the system project, an extension the target release cannot serve), an
+estimated downtime (about 3 minutes without PostgreSQL restarting, 15 when it restarts; the base
+backup does not count, the project serves during it) and notes. `Rollout` (`rollout.go`) runs many upgrades for `supavise projects upgrade --all`:
+`[upgrade] canary_projects` (default 1) one at a time, then `[upgrade] batch_size` (default 5)
+at once, halting at the first failure.
 
 ## Branches
 
@@ -350,5 +483,5 @@ removed on exit.
 - `pg_hba.conf` is rewritten on start but a changed file is not reloaded in a running cluster.
 - Fleet tenant calls are a hook (`Options.Fleet`); the services themselves are the fleet
   workstream's.
-- Project upgrade (artifact version changes) is not implemented.
+- Upgrades across Postgres major versions (`pg_upgrade`): the eligibility answer says there is no upgrade path. Upgrades never touch the shared services (Supavisor, Realtime, Storage, pgmeta, Studio, the edge runtime); they move with the node.
 - `Usage` reports disk bytes and unit memory only.

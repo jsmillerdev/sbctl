@@ -9,6 +9,8 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/artifacts"
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
 )
 
 var artifactsCmd = &cobra.Command{
@@ -93,6 +95,51 @@ var artifactsListCmd = &cobra.Command{
 	},
 }
 
+var (
+	artifactsGCDry  bool
+	artifactsGCKeep int
+)
+
+var artifactsGCCmd = projectCmd("gc", "Remove artifacts that no project, pin or kept release uses", cobra.NoArgs,
+	func(cmd *cobra.Command, n *lifecycle.Node, _ []string) error {
+		keep := artifactsGCKeep
+		if keep <= 0 {
+			keep = n.Cfg.Upgrade.Keep()
+		}
+		gone, err := n.Engine.CollectArtifacts(cmd.Context(), keep, artifactsGCDry, keptReleasePins(n.Cfg, keep)...)
+		verb := "removed"
+		if artifactsGCDry {
+			verb = "would remove"
+		}
+		for _, u := range gone {
+			fmt.Fprintf(cmd.OutOrStdout(), "%s %s %s\n", verb, u.Name, u.Tag)
+		}
+		if len(gone) == 0 && err == nil {
+			fmt.Fprintln(cmd.OutOrStdout(), "nothing to remove")
+		}
+		return err
+	})
+
+// keptReleasePins are the pins of the newest keep binaries that `supavise rollback` can go back to
+// (supavise upgrade keeps them in the releases directory, which is readable by everyone and
+// writable by root): their artifacts stay, whatever the daemon recorded in its history.
+func keptReleasePins(cfg *config.Config, keep int) []map[string]string {
+	recs, err := nodeupgrade.Releases{Dir: releasesDir(cfg.BinPath)}.List()
+	if err != nil {
+		return nil
+	}
+	var out []map[string]string
+	for _, r := range recs { // newest first
+		if len(out) >= keep {
+			break
+		}
+		if !r.Withdrawn {
+			out = append(out, r.Pins)
+		}
+	}
+	return out
+}
+
 // serviceOf maps a release name (auth, pooler) to the service name used in unit names.
 func serviceOf(name string) string {
 	switch name {
@@ -106,6 +153,13 @@ func serviceOf(name string) string {
 
 func init() {
 	artifactsFetchCmd.Flags().BoolVar(&artifactsFetchStudio, "studio", false, "also fetch our Studio build")
-	artifactsCmd.AddCommand(artifactsFetchCmd, artifactsListCmd)
+	artifactsGCCmd.Long = `Removes the unpacked artifacts that nothing needs: not the versions this binary pins,
+not the versions any project runs (or is being upgraded to), and not those of the last
+[upgrade] keep_releases releases this node ran (default 3: the current one and the two before, so a
+rollback finds its artifacts). The archive cache is left alone. Run as the user that owns the
+state directory (supavise).`
+	artifactsGCCmd.Flags().BoolVar(&artifactsGCDry, "dry-run", false, "list what would be removed")
+	artifactsGCCmd.Flags().IntVar(&artifactsGCKeep, "keep", 0, "releases to keep (default: [upgrade] keep_releases)")
+	artifactsCmd.AddCommand(artifactsFetchCmd, artifactsListCmd, artifactsGCCmd)
 	rootCmd.AddCommand(artifactsCmd)
 }

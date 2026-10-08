@@ -30,6 +30,9 @@ type realtimeTenant struct {
 	base   string // http://127.0.0.1:<port>
 	secret string // API_JWT_SECRET
 	now    func() time.Time
+	// release is the release tag of the Realtime this node runs. It is part of the tenant's
+	// fingerprint, so that a new release sends every tenant again and runs its migrations.
+	release string
 }
 
 func (t *realtimeTenant) Service() string { return config.SvcRealtime }
@@ -114,6 +117,7 @@ func (t *realtimeTenant) EnsureTenant(ctx context.Context, spec TenantSpec) erro
 	if err != nil {
 		return err
 	}
+	fp = withRelease(fp, t.release)
 	h, err := t.headers()
 	if err != nil {
 		return err

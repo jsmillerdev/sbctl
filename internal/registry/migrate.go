@@ -3,11 +3,14 @@ package registry
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -83,4 +86,57 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, stopBefore string) error {
 		}
 	}
 	return nil
+}
+
+// SchemaVersion is the name of the newest migration this binary embeds ("1190_custom_domains.sql").
+// It is a label for people; whether a binary can run on a registry is a question about the set of
+// migrations (MigrationNames, AppliedMigrations), because lanes number theirs in separate ranges.
+func SchemaVersion() string {
+	names, err := Migrations()
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+	return strings.TrimPrefix(names[len(names)-1], "migrations/")
+}
+
+// MigrationNames returns the names of the embedded migrations ("0001_init.sql") in apply order.
+func MigrationNames() []string {
+	names, err := Migrations()
+	if err != nil {
+		return nil
+	}
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = strings.TrimPrefix(n, "migrations/")
+	}
+	return out
+}
+
+// AppliedMigrations returns the names of the migrations recorded in the registry database at dsn,
+// in apply order, without applying any (Open would). `supavise upgrade` reads them before the new
+// release has migrated the registry, and again to see whether a release can still run on it.
+func AppliedMigrations(ctx context.Context, dsn string) ([]string, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	rows, err := conn.Query(ctx, `select version from supavise.schema_migrations order by version`)
+	if err != nil {
+		var pe *pgconn.PgError
+		if errors.As(err, &pe) && pe.Code == "42P01" { // undefined_table: never migrated
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, strings.TrimPrefix(v, "migrations/"))
+	}
+	return out, rows.Err()
 }

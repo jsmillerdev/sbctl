@@ -121,6 +121,24 @@ func TestManagerOneFailureDoesNotBlockTheRest(t *testing.T) {
 	}
 }
 
+// While a node upgrade runs the daemon stops at the first service that does not start, so that
+// a release whose Realtime fails does not also restart the services after it.
+func TestManagerHaltsAtTheFirstFailureWhenAsked(t *testing.T) {
+	r := newManagerRig(t, func(d *Deps) { d.HaltOnFailure = true })
+	r.sup.failOn["start supavise-realtime.service"] = errors.New("exec format error")
+	err := r.m.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "realtime") {
+		t.Fatalf("err = %v", err)
+	}
+	log := r.sup.log()
+	if !strings.Contains(log, "start supavise-supavisor.service") {
+		t.Fatalf("the service before the failure was not started:\n%s", log)
+	}
+	if strings.Contains(log, "supavise-storage.service") || strings.Contains(log, "supavise-studio.service") {
+		t.Fatalf("services after the failure were touched:\n%s", log)
+	}
+}
+
 func TestManagerMissingStudioArtifactIsNotFatal(t *testing.T) {
 	arts := allArtifacts()
 	delete(arts, config.SvcStudio)

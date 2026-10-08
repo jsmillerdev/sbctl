@@ -79,6 +79,8 @@ type Engine struct {
 	locks sync.Map // ref -> *sync.Mutex
 	// restoring holds the refs whose in-place restore is running in this process (restore.go).
 	restoring sync.Map
+	// upgrading holds the refs whose upgrade is running in this process (upgrade.go).
+	upgrading sync.Map
 	// freeBytes reads the free space of the disk holding a path (-1: unknown); tests replace it.
 	freeBytes func(path string) int64
 	// capacity is the node's room for project memory (capacity.go, resize.go).
@@ -454,6 +456,9 @@ func invalidState(p *registry.Project, op string) error {
 // Pause implements Manager: GoTrue, PostgREST and PostgreSQL stop, in that order, and
 // the project becomes INACTIVE. Its route and fleet tenants stay; the data stays.
 func (e *Engine) Pause(ctx context.Context, ref string) error {
+	if err := e.upgradeBusy(ref, "pause"); err != nil {
+		return err
+	}
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return err
@@ -498,6 +503,9 @@ func (e *Engine) Resume(ctx context.Context, ref string) error { return e.resume
 // resume is Resume; checkNode is false for a project the daemon itself paused around a restart,
 // which comes back whatever the node's budget says (it ran before).
 func (e *Engine) resume(ctx context.Context, ref string, checkNode bool) error {
+	if err := e.upgradeBusy(ref, "resume"); err != nil {
+		return err
+	}
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return err
@@ -558,6 +566,9 @@ func (e *Engine) Delete(ctx context.Context, ref string) error {
 // leaves the project GOING_DOWN so that Delete can be run again. A project that failed
 // to initialize has nothing worth backing up and skips the backup.
 func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) error {
+	if err := e.upgradeBusy(ref, "delete"); err != nil {
+		return err
+	}
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return err
@@ -769,6 +780,9 @@ func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev regi
 // gets new stored keys; its env files are rewritten when it resumes. If applying the
 // keys fails, the previous keys are restored.
 func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKeys, error) {
+	if err := e.upgradeBusy(ref, "rotate keys of"); err != nil {
+		return nil, err
+	}
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -852,6 +866,60 @@ func (e *Engine) StartActive(ctx context.Context) map[string]error {
 		}
 	}
 	return errs
+}
+
+// EnsureTenants registers every active project with the shared services again, one at a time, and
+// returns the errors by ref. The calls are idempotent: a tenant whose configuration and whose
+// services' releases are unchanged sends nothing. After a Supavise release moved the pins of Storage
+// or Realtime, the new tag changes their tenants' fingerprints, so this call is what makes the new
+// release run its tenant migrations in every project (Storage on the tenant update, Realtime on the
+// tenant create). The daemon calls it once the shared services and the projects have started.
+func (e *Engine) EnsureTenants(ctx context.Context) map[string]error {
+	errs := map[string]error{}
+	if len(e.opts.Fleet) == 0 {
+		return errs
+	}
+	ps, err := e.reg.ListProjects(ctx)
+	if err != nil {
+		errs[""] = err
+		return errs
+	}
+	for i := range ps {
+		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) {
+			continue
+		}
+		if err := e.ensureTenantsOf(ctx, ps[i].Ref); err != nil {
+			errs[ps[i].Ref] = err
+		}
+	}
+	return errs
+}
+
+func (e *Engine) ensureTenantsOf(ctx context.Context, ref string) error {
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	p, err := e.reg.GetProject(ctx, ref)
+	if errors.Is(err, registry.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !active(p.Status) {
+		return nil // paused, upgrading or being restored since the list: its own operation registers it
+	}
+	keys, err := e.loadKeys(ctx, ref)
+	if err != nil {
+		return err
+	}
+	spec, err := e.tenantSpec(ctx, p, keys)
+	if err != nil {
+		return err
+	}
+	return e.opts.Fleet.EnsureTenant(ctx, spec)
 }
 
 func (e *Engine) startOne(ctx context.Context, listed *registry.Project) error {
@@ -996,6 +1064,13 @@ const StatusDeleted registry.Status = "DELETED"
 //
 //   - PAUSING: the pause is finished (units stopped), status INACTIVE.
 //
+//   - UPGRADING: when nobody holds the project's upgrade (the process that ran it is gone), the
+//     units stop, the upgrade is marked failed (its backup id stays in its events), and the
+//     project becomes ACTIVE_UNHEALTHY, so that StartActive starts it on the versions the
+//     registry recorded, the previous ones. An upgrade that another process (the CLI) still
+//     runs is left alone; SettleUpgrades picks it up if that process dies later. A recorded
+//     upgrade that never got its final status is settled as well (settleUpgradeRows).
+//
 //   - COMING_UP or RESTARTING with a route: the project was created before and a resume
 //     or restart was cut short; its units are stopped and it becomes INACTIVE, so that
 //     Resume can be run again.
@@ -1047,6 +1122,15 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 			} else {
 				to, note = registry.StatusInitFailed, "the daemon stopped before the project finished creating; delete it and create it again"
 			}
+		case registry.StatusUpgrading:
+			if e.runnerLive(ctx, p.Ref) {
+				e.log.Info("recover: another process is still upgrading the project; leaving it to that process", "ref", p.Ref)
+				continue
+			}
+			if r, ok := e.settleUpgrading(ctx, p.Ref); ok {
+				out = append(out, r)
+			}
+			continue
 		case registry.StatusGoingDown:
 			dp := e.deleteProgress(ctx, p.Ref)
 			switch {
@@ -1095,6 +1179,7 @@ func (e *Engine) Recover(ctx context.Context) []Recovered {
 		out = append(out, Recovered{Ref: ref, From: registry.StatusGoingDown, To: StatusDeleted, Note: "the daemon stopped during a delete; the removal was finished"})
 	}
 	out = e.recoverRestarts(ctx, ps, out)
+	e.settleUpgradeRows(ctx, ps)
 	return out
 }
 

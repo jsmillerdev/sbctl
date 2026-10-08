@@ -179,6 +179,10 @@ func matrixCases() []routeCase {
 		rc("YYNNNN", "POST", pp+"/disk/custom-config", map[string]any{}),
 		rc("YYNNNN", "POST", pp+"/resize", map[string]any{"volume_size_gb": 1}),
 		rc("YYNNNN", "POST", p+"/upgrade", map[string]any{}),
+		// upgrade state is readable by every member; only Owners and Administrators upgrade
+		rc("YYYYYN", "GET", p+"/upgrade/eligibility", nil),
+		rc("YYYYYN", "GET", p+"/upgrade/status", nil),
+		rc("YYYYYN", "GET", pp+"/service-versions", nil),
 		rc("YYNNNN", "POST", p+"/secrets", []any{map[string]any{"name": "FOO", "value": "bar"}}),
 		rc("YYNNNN", "DELETE", p+"/secrets", []any{"FOO"}),
 		rc("YYNNNN", "POST", p+"/api-keys", map[string]any{"type": "publishable", "name": "matrix_key"}),

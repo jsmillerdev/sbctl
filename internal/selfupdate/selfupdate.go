@@ -102,6 +102,9 @@ type Options struct {
 	Force bool
 	// Out receives progress lines; nil discards them.
 	Out io.Writer
+	// StageDir is where Stage writes the downloaded binary; empty means the directory of
+	// ExecPath.
+	StageDir string
 	// Probe runs the downloaded binary to check that it starts and returns what it
 	// prints for --version; nil means run it with --version. Tests replace it.
 	Probe func(ctx context.Context, path string) (string, error)
@@ -272,6 +275,38 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 			return nil, err
 		}
 	}
+	st, err := ver.Stage(ctx, o)
+	if err != nil {
+		return nil, err
+	}
+	return st.Install()
+}
+
+// Staged is a release binary that has been downloaded, checked against the signed list and run
+// with --version, and that sits next to the file it will replace. Install swaps it in; Discard
+// throws it away. `supavise upgrade` stages the binary first, reads its pins, and installs it only
+// after the node has been backed up.
+type Staged struct {
+	*Verified
+	// Path is the verified binary.
+	Path string
+	// Reported is what it printed for --version.
+	Reported string
+
+	exe string
+	o   Options
+}
+
+// Stage downloads the binary of the verified release for o.Platform, checks it against the checksum
+// in the signed list, and checks that it starts and reports the tag it was published under.
+// Nothing that is installed changes. The file is created in StageDir, or in the directory of
+// ExecPath, so that Install is one rename.
+func (ver *Verified) Stage(ctx context.Context, o Options) (*Staged, error) {
+	rel := ver.Release
+	asset := BinaryAsset(o.Platform)
+	if rel.Assets[asset] == "" {
+		return nil, fmt.Errorf("release %s has no asset %s", rel.Tag, asset)
+	}
 	want, err := ChecksumFor(ver.Sums, asset)
 	if err != nil {
 		return nil, fmt.Errorf("release %s: %w", rel.Tag, err)
@@ -288,6 +323,9 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 	dir := filepath.Dir(exe)
+	if o.StageDir != "" {
+		dir = o.StageDir
+	}
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(exe)+".new-*")
 	if err != nil {
 		return nil, fmt.Errorf("cannot write next to %s (run as root): %w", exe, err)
@@ -327,18 +365,63 @@ func Update(ctx context.Context, o Options) (*Result, error) {
 		os.Remove(tmpPath)
 		return nil, fmt.Errorf("release %s ships a binary that reports %q: refusing to install (an older signed binary under a newer tag would be a downgrade)", rel.Tag, strings.TrimSpace(reported))
 	}
-	// Keep the old inode reachable as <name>.prev, then swap the new file in.
-	prev := exe + ".prev"
+	return &Staged{Verified: ver, Path: tmpPath, Reported: reported, exe: exe, o: o}, nil
+}
+
+// Discard removes the staged file.
+func (s *Staged) Discard() { _ = os.Remove(s.Path) }
+
+// Install keeps the old inode reachable as <name>.prev and renames the staged binary over the
+// installed one.
+func (s *Staged) Install() (*Result, error) {
+	prev := s.exe + ".prev"
 	_ = os.Remove(prev)
-	if err := os.Link(exe, prev); err != nil {
+	if err := os.Link(s.exe, prev); err != nil {
 		prev = ""
 	}
-	if err := os.Rename(tmpPath, exe); err != nil {
-		os.Remove(tmpPath)
+	if err := os.Rename(s.Path, s.exe); err != nil {
+		os.Remove(s.Path)
 		return nil, err
 	}
-	o.say("installed %s at %s", rel.Tag, exe)
-	return &Result{Tag: rel.Tag, Replaced: true, Previous: prev}, nil
+	s.o.say("installed %s at %s", s.Release.Tag, s.exe)
+	return &Result{Tag: s.Release.Tag, Replaced: true, Previous: prev}, nil
+}
+
+// Studio returns the dashboard build the release ships for platform, as the signed list names it:
+// the asset name, its download URL and its SHA-256. ok is false when there is none.
+func (ver *Verified) Studio(platform string) (name, url, sha string, ok bool) {
+	suffix := "-" + platform + ".tar.zst"
+	sc := bufio.NewScanner(bytes.NewReader(ver.Sums))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) != 2 || len(f[0]) != 64 {
+			continue
+		}
+		n := strings.TrimPrefix(f[1], "*")
+		if strings.HasPrefix(n, "supavise-studio-") && strings.HasSuffix(n, suffix) && ver.Release.Assets[n] != "" {
+			return n, ver.Release.Assets[n], strings.ToLower(f[0]), true
+		}
+	}
+	return "", "", "", false
+}
+
+// Compare orders two release tags: negative when a is older than b, positive when it is newer. ok
+// is false when either is not a release version. A suffix ("-rc1", "-4-gabcdef") is dropped.
+func Compare(a, b string) (c int, ok bool) {
+	x, ok1 := parseVersion(a)
+	y, ok2 := parseVersion(b)
+	if !ok1 || !ok2 {
+		return 0, false
+	}
+	for i := range x {
+		if x[i] != y[i] {
+			if x[i] < y[i] {
+				return -1, true
+			}
+			return 1, true
+		}
+	}
+	return 0, true
 }
 
 func runVersion(ctx context.Context, path string) (string, error) {

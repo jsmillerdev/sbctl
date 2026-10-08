@@ -33,6 +33,21 @@ func Open(ctx context.Context, dsn string) (*Postgres, error) {
 	return &Postgres{pool: pool}, nil
 }
 
+// OpenExisting connects to the registry at dsn without migrating it, for the commands that must
+// look at a registry as its release left it (`supavise upgrade` reads it before the new release has
+// migrated it). Open is what a node runs.
+func OpenExisting(ctx context.Context, dsn string) (*Postgres, error) {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &Postgres{pool: pool}, nil
+}
+
 // NewPostgres wraps an existing, already migrated pool.
 func NewPostgres(pool *pgxpool.Pool) *Postgres { return &Postgres{pool: pool} }
 

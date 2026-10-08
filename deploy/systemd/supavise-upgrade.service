@@ -15,7 +15,7 @@ Type=oneshot
 # unit, checks for new releases.)
 #
 # No EnvironmentFile: /etc/supavise belongs to the supavise user, and this root unit must not read
-# anything that account can write. PATH is fixed for the same reason (systemctl, runuser,
+# anything that account can write. PATH is fixed for the same reason (systemctl,
 # needrestart and apt-get are found by name).
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # The service's own memory (the pause after a failed upgrade, the window that already ran) lives

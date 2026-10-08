@@ -18,7 +18,21 @@ under `<state_dir>/artifacts/<service>/<tag>/` (`config.Paths.Artifact`).
   `state_dir` (the `supavise` user): the Postgres launcher chmods a script inside its artifact on
   first boot, which only the file's owner may do. A `.supavise-artifact.json` marker records tag, platform, digest
   and source.
-- **CLI:** `supavise artifacts fetch [service...] [--studio]`, `supavise artifacts list`.
+- **By tag:** `Store.DirFor(svc, tag)` and `Store.FetchTag(ctx, svc, tag)` find and fetch a release that is
+  not the pinned one. A project runs the versions it was last upgraded to, so the lifecycle renders
+  its units from `DirFor` of the project's recorded tags (`internal/lifecycle/README.md`, "Service
+  versions and project upgrades").
+- **Release history and garbage collection:** the daemon appends the pins of the running release to
+  `<state_dir>/artifacts/.releases.json` when they change (`Store.RecordPins`, at start, the last 20
+  kept). `Store.KeepSet` and `Store.GC` remove the unpacked artifacts that nothing needs: not the
+  pins, not the newest recorded release (what the daemon last started with; the binary that runs GC
+  may be newer than the daemon), not the last `[upgrade] keep_releases` releases of the history
+  (default 3: the current one and the two before, so a rollback finds its artifacts), not any tag the caller names (the
+  lifecycle names every version a project runs or is being upgraded to). Directories that start
+  with a dot (the archive cache, unpacking in progress) are never touched. Entry points:
+  `supavise artifacts gc [--dry-run] [--keep N]` and, after a successful `supavise projects upgrade`,
+  `Engine.CollectArtifacts`.
+- **CLI:** `supavise artifacts fetch [service...] [--studio]`, `supavise artifacts list`, `supavise artifacts gc`.
 
 ## Test
 
@@ -32,5 +46,5 @@ Tests use small synthetic archives and an `httptest` release server; no real dow
 ## Not done
 
 - No mirror fall-through (GHCR, S3); one `base_url`.
-- No garbage collection of old artifact versions or of the archive cache.
+- The archive cache (`.cache`) is never collected.
 - Archive signatures are not checked; integrity comes from `SHA256SUMS` over HTTPS.

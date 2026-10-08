@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,6 +185,7 @@ func testRegistry(t *testing.T, r Registry) {
 	}
 
 	testBranches(t, r, org.ID)
+	testUpgrades(t, r, org.ID)
 
 	seen := map[string]bool{}
 	timeout := time.After(5 * time.Second)
@@ -382,6 +384,85 @@ func TestPostgresHasDashboardSSO(t *testing.T) {
 	}
 	if ok, _ := r.HasDashboardSSO(ctx); ok {
 		t.Fatal("a provider outlived its organization")
+	}
+}
+
+func testUpgrades(t *testing.T, r Registry, orgID int64) {
+	t.Helper()
+	ctx := context.Background()
+	const ref = "dddddddddddddddddddd"
+	if err := r.CreateProject(ctx, &Project{Ref: ref, OrgID: orgID, Name: "d"}); err != nil {
+		t.Fatal(err)
+	}
+	st := Upgrades(r)
+	if st == nil {
+		t.Fatal("registry has no UpgradeStore")
+	}
+	if _, err := st.LatestUpgrade(ctx, ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("latest before any upgrade: %v, want ErrNotFound", err)
+	}
+	t0 := time.Now().UTC().Truncate(time.Millisecond)
+	first := &Upgrade{TrackingID: "11111111-1111-4111-8111-111111111111", Ref: ref, From: map[string]string{"auth": "a1"}, To: map[string]string{"auth": "a2"},
+		TargetVersion: "17", Progress: "0_requested", InitiatedAt: t0, LatestStatusAt: t0}
+	if err := st.PutUpgrade(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	first.Status, first.Progress, first.BackupID, first.LatestStatusAt = UpgradeDone, "9_completed_upgrade", 7, t0.Add(time.Minute)
+	if err := st.PutUpgrade(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := &Upgrade{TrackingID: "22222222-2222-4222-8222-222222222222", Ref: ref, TargetVersion: "17", Status: UpgradeFailed, Progress: "5_initiated_data_upgrade",
+		Error: "5_data_upgrade_completion_failed", Detail: "gotrue did not start", InitiatedAt: t0.Add(time.Hour), LatestStatusAt: t0.Add(time.Hour)}
+	if err := st.PutUpgrade(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.LatestUpgrade(ctx, ref)
+	if err != nil || got.TrackingID != second.TrackingID || got.Status != UpgradeFailed || got.Error != second.Error || got.Detail != "gotrue did not start" {
+		t.Fatalf("latest = %+v, %v", got, err)
+	}
+	if len(got.From) != 0 || len(got.To) != 0 {
+		t.Fatalf("versions of an upgrade that set none: %v %v", got.From, got.To)
+	}
+	// The history: finished upgrades only, inside the window, oldest first, whatever is latest.
+	third := &Upgrade{TrackingID: "44444444-4444-4444-8444-444444444444", Ref: ref, From: map[string]string{"auth": "a2"}, To: map[string]string{"auth": "a1"},
+		Status: UpgradeDone, InitiatedAt: t0.Add(2 * time.Hour), LatestStatusAt: t0.Add(2 * time.Hour)}
+	if err := st.PutUpgrade(ctx, third); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []struct {
+		since, until time.Time
+		want         []string
+	}{
+		{t0.Add(-time.Hour), time.Time{}, []string{first.TrackingID, third.TrackingID}},
+		{t0.Add(-time.Hour), t0.Add(90 * time.Minute), []string{first.TrackingID}}, // the failed one is never listed
+		{t0, t0, []string{first.TrackingID}},                                       // both ends are inclusive
+		{t0.Add(time.Second), time.Time{}, []string{third.TrackingID}},
+		{t0.Add(3 * time.Hour), time.Time{}, nil},
+	} {
+		got, err := st.UpgradesBetween(ctx, w.since, w.until)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, u := range got {
+			ids = append(ids, u.TrackingID)
+		}
+		if strings.Join(ids, ",") != strings.Join(w.want, ",") {
+			t.Fatalf("upgrades between %v and %v = %v, want %v", w.since, w.until, ids, w.want)
+		}
+	}
+	if got, _ := st.UpgradesBetween(ctx, t0, t0); len(got) != 1 || got[0].From["auth"] != "a1" || got[0].To["auth"] != "a2" {
+		t.Fatalf("the versions of a listed upgrade: %+v", got)
+	}
+	if err := st.PutUpgrade(ctx, &Upgrade{TrackingID: "33333333-3333-4333-8333-333333333333", Ref: "nope", InitiatedAt: t0, LatestStatusAt: t0}); err == nil {
+		t.Fatal("an upgrade of an unknown project was stored")
+	}
+	// A project's upgrades go with it.
+	if err := r.DeleteProject(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.LatestUpgrade(ctx, ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("upgrades survived their project: %v", err)
 	}
 }
 

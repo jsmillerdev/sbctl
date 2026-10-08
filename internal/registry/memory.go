@@ -23,6 +23,7 @@ type Memory struct {
 	vanity    map[string]VanitySubdomain
 	backups   []Backup
 	events    []Event
+	upgrades  []Upgrade
 	nextID    int64
 	subs      map[chan Change]struct{}
 }
@@ -292,6 +293,13 @@ func (m *Memory) DeleteProject(_ context.Context, ref string) error {
 	}
 	delete(m.projects, ref)
 	delete(m.secrets, ref)
+	kept := m.upgrades[:0]
+	for _, u := range m.upgrades {
+		if u.Ref != ref {
+			kept = append(kept, u)
+		}
+	}
+	m.upgrades = kept
 	delete(m.hostnames, ref)
 	delete(m.vanity, ref)
 	for h, r := range m.routes {

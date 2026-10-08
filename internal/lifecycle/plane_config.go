@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/projectconfig"
 	"github.com/jsmillerdev/supavise/internal/registry"
 	"github.com/jsmillerdev/supavise/internal/secrets"
@@ -48,6 +49,51 @@ func (pl *PostgresPlane) ReconfigureService(ctx context.Context, p *registry.Pro
 		return err
 	}
 	return pl.wait(ctx, target.Unit(), svc, pl.opts.ServiceReadyTimeout, func(ctx context.Context) error { return pl.checkHTTP(ctx, p, svc) })
+}
+
+// SystemRefreshError says which part of RefreshSystem failed.
+type SystemRefreshError struct {
+	// Auth is true when the dashboard's sign-in service failed, false for the cluster.
+	Auth bool
+	Err  error
+}
+
+func (e *SystemRefreshError) Error() string { return e.Err.Error() }
+func (e *SystemRefreshError) Unwrap() error { return e.Err }
+
+// RefreshSystem brings the system project's cluster and the dashboard's sign-in service to the
+// files the current settings render: the cluster restarts when its files changed (StartDatabase),
+// then RefreshSystemAuth. A restart of the cluster stops the sign-in service with it (the unit
+// requires the cluster, and systemd stops a unit that requires one that is stopped, without
+// starting it again when the cluster comes back), so a sign-in service that was running when the
+// refresh began and is not running after it is started: the dashboard must not be left without
+// sign-in by a release that changed how the cluster is rendered. One that was not running is left
+// alone, as in RefreshSystemAuth.
+func (pl *PostgresPlane) RefreshSystem(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) error {
+	return pl.refreshSystem(ctx, p, keys, func() error { return pl.StartDatabase(ctx, p, keys) })
+}
+
+// refreshSystem is RefreshSystem with the cluster's step given, so that a test can stand in for it.
+func (pl *PostgresPlane) refreshSystem(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys, startDatabase func() error) error {
+	unit := config.UnitName(config.SvcGoTrue, config.SystemRef)
+	was := pl.unitRunning(ctx, unit)
+	if err := startDatabase(); err != nil {
+		return &SystemRefreshError{Err: err}
+	}
+	authErr := pl.RefreshSystemAuth(ctx, p, keys)
+	if authErr == nil && was && !pl.unitRunning(ctx, unit) {
+		pl.log.Info("the dashboard's sign-in service was stopped by the restart of the system cluster; starting it", "unit", unit)
+		authErr = pl.startAPI(ctx, p, keys)
+	}
+	if authErr != nil {
+		return &SystemRefreshError{Auth: true, Err: authErr}
+	}
+	return nil
+}
+
+func (pl *PostgresPlane) unitRunning(ctx context.Context, unit string) bool {
+	st, err := pl.sup.Status(ctx, unit)
+	return err == nil && (st.State == units.StateActive || st.State == units.StateActivating)
 }
 
 // RefreshSystemAuth renders supavise-gotrue@system again and restarts it when what it renders

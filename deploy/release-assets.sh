@@ -8,7 +8,9 @@
 #   supavise-release.json  the release manifest (version, min_upgrade_from, the pinned Supabase
 #                    releases), written when SUPAVISE_RELEASE_TAG is set; deploy/releasetool makes it,
 #                    deploy/MIN_UPGRADE_FROM says the oldest version that upgrades straight to this one.
-#                    SUPAVISE_RELEASETOOL names a built releasetool; without it the script uses `go run`
+#                    SUPAVISE_RELEASETOOL names a built releasetool; without it the script uses `go run`;
+#                    SUPAVISE_VERSIONS_FILE names the versions.yaml to read instead of the checkout's
+#                    (the upgrade-e2e job signs releases whose binaries pin other versions)
 #   SHA256SUMS       sha256sum of every file above and the manifest, so the signature covers it
 #   SHA256SUMS.sig   raw ed25519 signature of SHA256SUMS (what install.sh and `supavise self-update` verify)
 #   install.sh       deploy/install.sh with the public key stamped in
@@ -51,9 +53,9 @@ if [[ -n $tag ]]; then
   min=${SUPAVISE_MIN_UPGRADE_FROM:-$(grep -v '^[[:space:]]*#' "$here/MIN_UPGRADE_FROM" | tr -d '[:space:]')}
   rm -f supavise-release.json
   if [[ -n ${SUPAVISE_RELEASETOOL:-} ]]; then
-    "$SUPAVISE_RELEASETOOL" manifest -version "$tag" -min-upgrade-from "$min" -versions "$here/../internal/versions/versions.yaml" -out supavise-release.json
+    "$SUPAVISE_RELEASETOOL" manifest -version "$tag" -min-upgrade-from "$min" -versions "${SUPAVISE_VERSIONS_FILE:-$here/../internal/versions/versions.yaml}" -out supavise-release.json
   else
-    (cd "$here/.." && go run ./deploy/releasetool manifest -version "$tag" -min-upgrade-from "$min" -versions internal/versions/versions.yaml -out "$dist/supavise-release.json")
+    (cd "$here/.." && go run ./deploy/releasetool manifest -version "$tag" -min-upgrade-from "$min" -versions "${SUPAVISE_VERSIONS_FILE:-internal/versions/versions.yaml}" -out "$dist/supavise-release.json")
   fi
   [[ -s supavise-release.json ]] || { echo "the release manifest was not written" >&2; exit 1; }
   files+=(supavise-release.json)

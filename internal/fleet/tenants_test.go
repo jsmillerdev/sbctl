@@ -665,3 +665,65 @@ func (s *stubTenant) RemoveTenant(context.Context, string) error {
 	*s.order = append(*s.order, "remove "+s.name)
 	return s.err
 }
+
+// A Supavise release that moves the pin of Storage or Realtime must send every tenant again once:
+// Storage migrates a tenant's database when the tenant is updated, Realtime when it is created.
+// The same release sends nothing.
+func TestANewServiceReleaseSendsTheTenantAgain(t *testing.T) {
+	n := newTestNode(t)
+	k := n.project(t, testRef)
+	ctx := context.Background()
+	spec := testSpec(k, 20003)
+
+	const adminKey = "storage-admin-key-0123456789"
+	sapi := newFakeAPI(t, func(h http.Header) bool { return h.Get("apikey") == adminKey }, pathTenant("/tenants/"), 204)
+	scl, _ := testClient(config.SvcStorage)
+	st := &storageTenant{cl: scl, store: tenantStore{reg: n.reg, sec: n.sec}, base: sapi.srv.URL, adminKey: adminKey, fileSize: 1234,
+		release: "storage-v1.79.36-r0", adminPassword: registryAdminPassword(n.reg, n.sec)}
+	steps := []struct {
+		release string
+		want    string
+	}{
+		{"storage-v1.79.36-r0", "GET PUT"},
+		{"storage-v1.79.36-r0", "GET PUT GET"},
+		{"storage-v1.80.0-r0", "GET PUT GET GET PUT"},
+		{"storage-v1.80.0-r0", "GET PUT GET GET PUT GET"},
+	}
+	for i, s := range steps {
+		st.release = s.release
+		if err := st.EnsureTenant(ctx, spec); err != nil {
+			t.Fatal(err)
+		}
+		if got := sapi.methods(); got != s.want {
+			t.Fatalf("storage step %d (%s): calls = %s, want %s", i, s.release, got, s.want)
+		}
+	}
+
+	const apiSecret = "realtime-api-secret-0123456789abcdef"
+	rapi := newFakeAPI(t, bearerOK(apiSecret), pathTenant("/api/tenants/"), 201)
+	rcl, _ := testClient(config.SvcRealtime)
+	rt := &realtimeTenant{cl: rcl, store: tenantStore{reg: n.reg, sec: n.sec}, base: rapi.srv.URL, secret: apiSecret, now: time.Now, release: "realtime-v2.140.10-r0"}
+	for i, s := range []struct{ release, want string }{
+		{"realtime-v2.140.10-r0", "GET POST"},
+		{"realtime-v2.140.10-r0", "GET POST GET"},
+		{"realtime-v2.141.0-r0", "GET POST GET GET POST"},
+	} {
+		rt.release = s.release
+		if err := rt.EnsureTenant(ctx, spec); err != nil {
+			t.Fatal(err)
+		}
+		if got := rapi.methods(); got != s.want {
+			t.Fatalf("realtime step %d (%s): calls = %s, want %s", i, s.release, got, s.want)
+		}
+	}
+}
+
+func TestWithReleaseKeepsAnUnknownReleaseAsItWas(t *testing.T) {
+	fp := fingerprint("body")
+	if withRelease(fp, "") != fp {
+		t.Fatal("an empty tag changed the fingerprint")
+	}
+	if withRelease(fp, "storage-v1-r0") == fp || withRelease(fp, "storage-v1-r0") == withRelease(fp, "storage-v2-r0") {
+		t.Fatal("the tag is not part of the fingerprint")
+	}
+}

@@ -45,6 +45,7 @@ registered in a second mux of a chain, tried in order.
 |---|---|
 | Projects | `/v1/projects` list, create, get, patch, delete; `pause`, `restore`; `health`; `branches` (the full branch API, served by `internal/branching`, see below); `config/database/pooler`. `/platform/projects` list, create, get, patch, delete, `status`, `settings`, `pause`, `restore`, `restart`, `restart-services`; `POST /v1/projects/{ref}/restart`; `config/postgrest`, `config/storage`, `config/pgbouncer`, `config/supavisor`; `api-keys/temporary`; `/v2/projects/{ref}/config`; `/platform/projects/{ref}/billing/addons` and `/v1/projects/{ref}/billing/addons` (the PITR add-on, and a `custom_domain` entry Studio looks for) |
 | Domains | `GET`, `DELETE /v1/projects/{ref}/custom-hostname`; `POST .../custom-hostname/initialize`, `/reverify`, `/activate`; `GET`, `DELETE .../vanity-subdomain`; `POST .../vanity-subdomain/check-availability`, `/activate` (`domains.go`, rules in `internal/domains/README.md`). Studio's Custom Domains page reads them; it first looks for a `custom_domain` entry in the billing add-ons, which both add-on routes report as included. `GET custom-hostname` without a hostname answers 400 "Project does not have a custom hostname configuration" (Studio matches the words "custom hostname configuration"), a refused verification 429 with `Retry-After`, a hostname another project holds 409. Activating or deleting a domain restarts the project's GoTrue through `ApplyConfig` (Auth); if that fails the domain stays saved, the answer is 500 and repeating `activate` retries it. Owners and Administrators change domains, every role reads them (`authz.go`) |
+| Upgrades | `GET /v1/projects/{ref}/upgrade/eligibility`, `POST /v1/projects/{ref}/upgrade`, `GET /v1/projects/{ref}/upgrade/status`, `GET /platform/projects/{ref}/service-versions`. See Project upgrades below |
 | Backups | `GET /platform/database/{ref}/backups` and `GET /v1/projects/{ref}/database/backups` (the node's base backups and the span a point-in-time restore reaches); `POST /platform/database/{ref}/backups/restore`, `restore-physical` and `/pitr`, `POST /v1/projects/{ref}/database/backups/restore` and `restore-pitr` (restores in place). See Backups and point-in-time restore below |
 | Keys | `/v1/projects/{ref}/api-keys`: list, create (publishable and secret keys with names; the secret is shown in full by the create and by `reveal=true`, masked otherwise), get, patch, delete (a revocation), `api-keys/legacy` get and put (`?enabled=`). See Settings and keys below |
 | Settings | `GET` and `PATCH /v1/projects/{ref}/config/auth` and `/platform/auth/{ref}/config` (+ `/hooks`), `/v1/projects/{ref}/postgrest` and `/platform/projects/{ref}/config/postgrest`, `config/realtime`, `config/storage` (v1 and platform), `GET` and `PUT /v1/projects/{ref}/config/database/postgres`, `GET` and `PATCH /v1/projects/{ref}/config/database/pooler` (and `/platform/projects/{ref}/config/pgbouncer`; `config/supavisor` is the read), `GET /v2/projects/{ref}/config` (the document the CLI diffs), `PATCH /v1/projects/{ref}/database/password` and `/platform/projects/{ref}/db-password` |
@@ -731,9 +732,73 @@ The Supabase CLI may also have started its own stack host (`supabase __supabase_
 for the project directory it ran in; that process belongs to the CLI and to whatever project
 you ran it from, so check its working directory (`lsof -p <pid> | grep cwd`) before stopping it.
 
+## Project upgrades
+
+A project runs the Postgres, GoTrue and PostgREST versions it was created or last upgraded with; the
+node's pins move with a Supavise release. Studio shows the project's versions in Settings > General,
+"Service versions" (`GET /platform/projects/{ref}/service-versions`: `gotrue`, `postgrest`,
+`supabase-postgres`, as release tags without the service prefix, for example `v2.195.0-r1`), and
+offers "Upgrade project" when the eligibility answer says `eligible`. Studio places this section
+on the General page, not on Infrastructure. The section (the alert, the validation errors and the
+warnings) renders only while the profile does not list `project_settings:database_upgrades` in
+`disabled_features`, so the list leaves it out (`TestStudioCanOfferTheUpgrade`). The upgrade dialog
+also reads `GET /platform/projects/{ref}/disk` (answered by the compute routes, "Compute sizes and
+disk" below) and prints "Your current disk size of NGB will also be right-sized" unless `size_gb`
+equals the plan's included size (8 for an enterprise organization on gp3); a project whose quota
+or volume is another size gets that sentence, although an upgrade resizes nothing. Routes and rules (`upgrade.go`, `internal/lifecycle/upgrade.go`):
+
+- `GET .../upgrade/eligibility`: `current_app_version` and `latest_app_version` are
+  `supabase-<postgres release tag>` (Studio shows what follows `supabase-postgres-`),
+  `target_upgrade_versions` has one entry (`postgres_version` the node's Postgres major version,
+  `release_channel` `ga`) when the project can be upgraded and none otherwise, and
+  `duration_estimate_hours` is how long the project is offline (the base backup does not count).
+  Every array of the response is present, and mostly empty: the hosted ones that describe objects that
+  block `pg_upgrade` (`legacy_auth_custom_roles`, `warnings`, and `potential_breaking_changes`, which Studio reads
+  and the spec omits) cannot apply to a restart on the same major version. `validation_errors` holds a
+  paused project's `project_hibernating` and, when the node's Postgres release differs from the
+  project's, one `unsupported_extension` (`extension_name`, which Studio lists with a link to the
+  extensions page) per installed extension the new release cannot serve; `unsupported_extensions`
+  repeats their names. `eligible` is false
+  when the project is on the node's versions, is not `ACTIVE_HEALTHY`, runs another Postgres major version (no
+  upgrade path), has such an extension, or the node has no backup service. `duration_estimate_hours` is the real estimate
+  in hours, so it is fractional (0.05 when only GoTrue and PostgREST restart, 0.25 with PostgreSQL), and Studio prints it as
+  "offline for up to 0.05 hours" where hosted's whole hours read "1 hour".
+- `POST .../upgrade` with `target_version` (Postgres's major version as Studio posts it, `"17"`; the app version or the
+  release tag also work) and an optional `release_channel` (only `ga`): 201 with `tracking_id`, the
+  project `UPGRADING`, the upgrade running in the background on a context detached from the request and
+  bounded to 2 hours (a shutdown waits for it like for a delete). 400 for a target that is not the
+  node's, another channel, a project that already runs the node's versions or has no upgrade path; 409 for a
+  project that is not `ACTIVE_HEALTHY` or is being upgraded, and for any project while `supavise upgrade` moves the node (the upgrade marker says it runs; the daemon restarts under a project upgrade, and the node upgrade's rollback would revert it); 503 on a node without a backup service.
+- `GET .../upgrade/status`: `databaseUpgradeStatus` is null for a project never upgraded, otherwise the newest upgrade:
+  `status` 0 upgrading, 1 upgraded, 2 failed (Studio's `DatabaseUpgradeStatus`), `progress` and `error` as hosted names
+  them (the mapping is in `internal/lifecycle/README.md`), `initiated_at`, `latest_status_at`, `target_version`. The
+  `tracking_id` query parameter is accepted and the newest upgrade is returned whatever it says. A failed upgrade shows
+  Studio's failure banner and "back online" screen, which is true once the rollback worked.
+
+Permissions (`authz.go`): eligibility, status and service-versions are reads (Read-only and up, a role scoped to the
+project included); the upgrade is `infra:Execute` on `queue_jobs.projects.upgrade`, so Owners and Administrators only,
+like hosted (a Developer restarts, `reboot`, but does not upgrade). `POST /platform/projects/{ref}/restart-services`
+restarts the whole project whatever services it names.
+
+Differences from hosted that Studio shows as it does there:
+
+- Studio's note on a paused project in "Service versions" says that restoring it updates Postgres to
+  the newest version. Resume here keeps the versions recorded; the project is upgraded only when its
+  owner asks.
+- Studio's upgrade dialog says "Your current disk size of NGB will also be right-sized with the
+  upgrade" whenever the disk answer's `size_gb` differs from the plan's included size (8 GB on gp3).
+  Hosted resizes the disk during an upgrade; Supavise resizes nothing, so for a project whose quota or
+  volume is another size the sentence is untrue. This is a known text mismatch: the condition is
+  computed in the page (`ProjectUpgradeAlert.tsx`, `isDiskSizeUpdated`) from the plan and the disk
+  answer, and no flag or profile field switches it off. Answering the plan's size would hide it and
+  would break the disk page, so the routes tell the truth about the disk and the dialog keeps the line.
+- Studio's "Your project can be upgraded to the latest version of Postgres" alert appears whenever the
+  eligibility answer is `eligible`, including when only GoTrue or PostgREST differ from the node's
+  pins; the Postgres badge next to it can still read "Latest".
+
 ## Lifecycle calls outlive the request
 
-Delete, pause, restore (resume), restart and create run on a context detached from the HTTP
+Delete, pause, restore (resume), restart, upgrade and create run on a context detached from the HTTP
 request (`context.WithoutCancel`) with a bound: 30 minutes for delete (it includes a final base
 backup), 20 for create, 10 for pause and resume, 20 for restart (pause and resume as one unit). A database restore has no deadline (the detach bound
 covers only `BeginRestore`); the log warns when one has run 4 hours. A
