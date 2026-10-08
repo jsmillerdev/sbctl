@@ -16,18 +16,18 @@ import (
 	"github.com/supavise/supavise/internal/replicas"
 )
 
-// fakeMesh is a mesh.Mesh that knows two round-trip times.
-type fakeMesh struct{}
+// rttMesh is a mesh.Mesh that knows two round-trip times.
+type rttMesh struct{}
 
-func (fakeMesh) Dial(context.Context, string, mesh.Header) (net.Conn, error) {
+func (rttMesh) Dial(context.Context, string, mesh.Header) (net.Conn, error) {
 	return nil, mesh.ErrNoSession
 }
-func (fakeMesh) Call(context.Context, string, string, string, any, any) error {
+func (rttMesh) Call(context.Context, string, string, string, any, any) error {
 	return mesh.ErrNoSession
 }
-func (fakeMesh) Connected(string) bool { return true }
-func (fakeMesh) Peers() []string       { return []string{"n2"} }
-func (fakeMesh) RTT(node string) (time.Duration, bool) {
+func (rttMesh) Connected(string) bool { return true }
+func (rttMesh) Peers() []string       { return []string{"n2"} }
+func (rttMesh) RTT(node string) (time.Duration, bool) {
 	if node == "n2" {
 		return 7 * time.Millisecond, true
 	}
@@ -46,7 +46,7 @@ func snapshotOf(role cluster.Role) cluster.Snapshot {
 	return cluster.Snapshot{Self: self, Nodes: []registry.Node{n1, n2}, Leader: "n1", Epoch: 3, Role: role}
 }
 
-func clusterOf(role cluster.Role) *cluster.Static { return cluster.NewStatic(snapshotOf(role)) }
+func proxyClusterOf(role cluster.Role) *cluster.Static { return cluster.NewStatic(snapshotOf(role)) }
 
 // A node with no cluster has nothing to wire: the proxy keeps the options it was given.
 func TestWireProxyDoesNothingWithoutACluster(t *testing.T) {
@@ -68,8 +68,8 @@ func TestWireProxyGivesTheProxyItsClusterAndFollowsTheRole(t *testing.T) {
 	defer func() { mesh.DefaultMux = old }()
 
 	w := testWire(t)
-	ms := clusterOf(cluster.RoleFollower)
-	Provide[mesh.Mesh](w, fakeMesh{})
+	ms := proxyClusterOf(cluster.RoleFollower)
+	Provide[mesh.Mesh](w, rttMesh{})
 	Provide[cluster.Membership](w, ms)
 	Provide[replicas.Service](w, fakeReplicas{})
 	if err := wireProxy(context.Background(), w); err != nil {
@@ -131,8 +131,8 @@ func TestWireProxyLeaderManages(t *testing.T) {
 	mesh.DefaultMux = mesh.NewMux()
 	defer func() { mesh.DefaultMux = old }()
 	w := testWire(t)
-	Provide[mesh.Mesh](w, fakeMesh{})
-	Provide[cluster.Membership](w, clusterOf(cluster.RoleLeader))
+	Provide[mesh.Mesh](w, rttMesh{})
+	Provide[cluster.Membership](w, proxyClusterOf(cluster.RoleLeader))
 	if err := wireProxy(context.Background(), w); err != nil {
 		t.Fatal(err)
 	}
