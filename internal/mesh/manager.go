@@ -40,8 +40,6 @@ type Options struct {
 	Authz *Authorizer
 	Log   *slog.Logger
 
-	// PingInfo is what this node answers to a ping. Nil answers the node id alone.
-	PingInfo func() peerapi.Ping
 	// OnPing is told every answer to a ping this node sent, with the round trip.
 	OnPing func(node string, p peerapi.Ping, rtt time.Duration)
 

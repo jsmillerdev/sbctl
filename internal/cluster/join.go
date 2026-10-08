@@ -128,6 +128,10 @@ func Join(ctx context.Context, o JoinOptions) (*JoinResult, error) {
 		return nil, fmt.Errorf("%w; run `supavise node join --resume` to continue", err)
 	}
 	_ = os.Remove(filepath.Join(dir, JoinStateFile))
+	// A server that was removed from a cluster and joins one again is no longer down.
+	if err := ClearFenced(o.Cfg); err != nil {
+		return nil, err
+	}
 	return &JoinResult{NodeID: st.NodeID, System: st.System}, nil
 }
 

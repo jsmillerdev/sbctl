@@ -205,6 +205,15 @@ func TestRejoin(t *testing.T) {
 		t.Fatalf("system replica rows %+v for bootstrap %+v", rs, boot)
 	}
 
+	// A node that was removed does not rejoin: it joins again with a token.
+	if err := WriteFenced(j.cfg, FencedRecord{Reason: RemovedReason, Removed: true, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Rejoin(ctx, rejoin); err == nil || !strings.Contains(err.Error(), "removed from the cluster") {
+		t.Fatalf("rejoin of a removed node: %v", err)
+	}
+	_ = ClearFenced(j.cfg)
+
 	// A node that is active is not let back in as if fenced.
 	if err := WriteFenced(j.cfg, FencedRecord{Epoch: 3, Leader: "n1", At: time.Now(), Peers: map[string]string{"n1": l.cfg.PeerAddr()}}); err != nil {
 		t.Fatal(err)
@@ -520,6 +529,15 @@ func TestRetireClearsTheNodeFromTheCluster(t *testing.T) {
 	}
 	if _, err := os.Stat(cl); !os.IsNotExist(err) {
 		t.Fatal("the cluster settings are still there")
+	}
+	rec, err := ReadFenced(cfg)
+	if err != nil || rec == nil || !rec.Removed || rec.Reason != RemovedReason {
+		t.Fatalf("the record of the removal: %+v, %v", rec, err)
+	}
+	// The boot decision keeps a removed node down, with the reason.
+	d, err := DecideBoot(context.Background(), BootEnv{Cfg: cfg, ConfigPath: conf})
+	if err != nil || d.Role != RoleFenced || d.Reason != RemovedReason {
+		t.Fatalf("boot of a removed node: %+v, %v", d, err)
 	}
 }
 

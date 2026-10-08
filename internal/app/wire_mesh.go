@@ -27,11 +27,12 @@ import (
 	"github.com/supavise/supavise/internal/versions"
 )
 
-// identityPoll and fencedPoll are how often a single server looks for a cluster identity and a
-// fenced node looks for its record to be gone. Variables so that tests can shorten them.
+// identityPoll, fencedPoll and retirePoll are how often a single server looks for a cluster identity,
+// a fenced node looks for its record to be gone, and a follower looks at its own row. Variables so that tests can shorten them.
 var (
 	identityPoll = 5 * time.Second
 	fencedPoll   = 3 * time.Second
+	retirePoll   = 2 * time.Second
 )
 
 // unreachableAfter is how long an active peer may have no session before node_unreachable is raised.
@@ -167,16 +168,20 @@ func openFollower(lo *lifecycle.OpenOptions, boot cluster.BootDecision) error {
 // record is gone, which is what `supavise node rejoin` does last.
 func serveFenced(ctx context.Context, cfg *config.Config, o Options, log *slog.Logger, boot cluster.BootDecision) error {
 	log = log.With("component", "cluster")
-	log.Error("this node is fenced and starts no primary", "epoch", boot.Epoch, "leader", boot.Leader, "reason", boot.Reason)
-	notifier := alerts.New(cfg, alerts.Options{Log: log.With("component", "alerts")})
-	alerts.SetDefault(notifier)
-	_ = alerts.Notify(ctx, alerts.Event{
-		Kind: alerts.KindFenced, Severity: alerts.SeverityCritical, Title: "This node is fenced",
-		Detail: fmt.Sprintf("%s. It starts no primary and answers 503 until it is rebuilt: run `sudo supavise node rejoin` on it.", boot.Reason),
-	})
 	rec, err := cluster.ReadFenced(cfg)
 	if err != nil {
 		return err
+	}
+	if rec != nil && rec.Removed {
+		log.Warn("this node was removed from the cluster and stays down until it joins one again", "reason", rec.Reason)
+	} else {
+		log.Error("this node is fenced and starts no primary", "epoch", boot.Epoch, "leader", boot.Leader, "reason", boot.Reason)
+		notifier := alerts.New(cfg, alerts.Options{Log: log.With("component", "alerts")})
+		alerts.SetDefault(notifier)
+		_ = alerts.Notify(ctx, alerts.Event{
+			Kind: alerts.KindFenced, Severity: alerts.SeverityCritical, Title: "This node is fenced",
+			Detail: fmt.Sprintf("%s. It starts no primary and answers 503 until it is rebuilt: run `sudo supavise node rejoin` on it.", boot.Reason),
+		})
 	}
 	if rec == nil {
 		r := cluster.FencedRecord{Epoch: boot.Epoch, Leader: boot.Leader, Reason: boot.Reason, At: time.Now().UTC(), Peers: peersFromLocalRegistry(ctx, boot, log)}
@@ -198,11 +203,15 @@ func serveFenced(ctx context.Context, cfg *config.Config, o Options, log *slog.L
 		log.Info("fenced: the clusters were stopped", "projects", stopped)
 	}
 
+	state := "fenced"
+	if rec.Removed {
+		state = "down"
+	}
 	srv := &http.Server{Addr: cfg.Listen.HTTP, ReadHeaderTimeout: 10 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = fmt.Fprintf(w, `{"message":"This Supavise node is fenced: %s"}`+"\n", rec.Reason)
+		_, _ = fmt.Fprintf(w, `{"message":"This Supavise node is %s: %s"}`+"\n", state, rec.Reason)
 	})}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -423,6 +432,9 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		statusWriter(ctx, cfg, live, mgr, reports, log)
 		return nil
 	})
+	w.Go("retirement", func(ctx context.Context) error {
+		return retireWhenRemoved(ctx, w, live, log)
+	})
 	w.Go("role watch", func(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
@@ -432,6 +444,40 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		}
 	})
 	return nil
+}
+
+// retireWhenRemoved watches this node's own row, which the registry copy it follows keeps current:
+// `supavise node rm` sets it left, and the node then retires itself (cluster.Retire) and stops, to
+// restart as a node that is down until it joins a cluster again. It needs the row to read left on
+// two polls in a row. The leader never retires: the leader's row is not removed while it leads.
+func retireWhenRemoved(ctx context.Context, w *Wire, live *cluster.Live, log *slog.Logger) error {
+	seen := 0
+	tick := time.NewTicker(retirePoll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+		}
+		if live.IsLeader() || live.Self().State != registry.NodeLeft {
+			seen = 0
+			continue
+		}
+		if seen++; seen < 2 {
+			continue
+		}
+		log.Warn("this node was removed from the cluster; stopping what runs and setting its data aside")
+		moved, err := cluster.Retire(context.WithoutCancel(ctx), w.Cfg, w.Options.ConfigPath, func(ctx context.Context) error {
+			_, err := cluster.FenceLocal(ctx, w.Cfg, w.Node.Supervisor, log)
+			return err
+		}, time.Now())
+		if err != nil {
+			return fmt.Errorf("retiring the node: %w", err)
+		}
+		log.Info("the node retired", "data_set_aside", moved)
+		return fmt.Errorf("%w: the node was removed from the cluster", ErrRoleChanged)
+	}
 }
 
 // skewState remembers which peers are outside the version window, so that the alert is raised and

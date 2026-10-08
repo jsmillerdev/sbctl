@@ -71,7 +71,10 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 		return nil, err
 	}
 	if rec == nil {
-		return nil, errors.New("cluster: this node is not fenced; there is nothing to rejoin (a node that was removed joins again with a new token)")
+		return nil, errors.New("cluster: this node is not fenced; there is nothing to rejoin (a node that was removed joins again with a token from `supavise node token`)")
+	}
+	if rec.Removed {
+		return nil, errors.New("cluster: this node was removed from the cluster; it joins again with a token from `supavise node token` (`supavise node join`), not with rejoin")
 	}
 	dir := config.ClusterDir(o.ConfigPath)
 	creds, err := LoadCredentials(dir)
@@ -187,9 +190,14 @@ func pruneDiverged(cfg *config.Config, now time.Time) {
 	}
 }
 
-// Retire is what a node that learns it was removed from the cluster does: it stops what runs,
-// sets the project directories aside like a rejoin does, and deletes its cluster identity, so
-// that a restart finds a server that belongs to no cluster. The master key stays.
+// RemovedReason is the reason of the record a removed node keeps.
+const RemovedReason = "this node was removed from the cluster; join it again with a token from `supavise node token` (`supavise node join`)"
+
+// Retire is what a node that learns it was removed from the cluster does: it stops what runs, sets the
+// project directories aside like a rejoin does, deletes its cluster identity and the cluster settings
+// it was given, and records that it was removed. The daemon then starts as a node that is down like a
+// fenced one, with the reason, until `supavise node join` makes it a member again; the master key
+// stays. It returns the directories it set aside.
 func Retire(ctx context.Context, cfg *config.Config, configPath string, stop func(context.Context) error, now time.Time) ([]string, error) {
 	if stop != nil {
 		if err := stop(ctx); err != nil {
@@ -205,8 +213,7 @@ func Retire(ctx context.Context, cfg *config.Config, configPath string, stop fun
 		_ = os.Remove(filepath.Join(dir, f))
 	}
 	_ = os.Remove(filepath.Join(config.ConfigDDir(configPath), config.ClusterConfigFile))
-	_ = ClearFenced(cfg)
-	return moved, nil
+	return moved, WriteFenced(cfg, FencedRecord{Reason: RemovedReason, Removed: true, At: now.UTC()})
 }
 
 // PeersOf lists the peer addresses of the nodes other than self, for the fenced record.

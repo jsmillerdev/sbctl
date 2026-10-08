@@ -44,6 +44,8 @@ type replicaRow struct {
 func (b *clusterBlock) render(w io.Writer) {
 	const label, indent = "cluster   ", "          "
 	switch {
+	case b.Fenced != nil && b.Fenced.Removed:
+		fmt.Fprintf(w, "%sREMOVED: %s\n", label, b.Fenced.Reason)
 	case b.Fenced != nil:
 		fmt.Fprintf(w, "%sFENCED: %s\n", label, b.Fenced.Reason)
 		fmt.Fprintf(w, "%sThis node starts no primary and answers 503. Fix: sudo supavise node rejoin\n", indent)

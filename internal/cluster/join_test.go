@@ -113,9 +113,6 @@ func (s *site) start(ctx context.Context, reg registry.Registry, role Role, inRe
 		PingEvery: 100 * time.Millisecond, Tick: 50 * time.Millisecond, DialDelay: 150 * time.Millisecond,
 		RevokeGrace: 200 * time.Millisecond,
 		OnPing:      func(node string, p peerapi.Ping, _ time.Duration) { s.live.ObserveEpoch(node, p.Epoch, p.Leader) },
-		PingInfo: func() peerapi.Ping {
-			return peerapi.Ping{Node: s.id, Epoch: s.live.Epoch(), Version: "v0.2.0"}
-		},
 	})
 	s.fwd = &mesh.Forwarders{Cfg: s.cfg, Topology: s.live, Source: reg, Dialer: s.mgr, Log: quiet(), Interval: 50 * time.Millisecond,
 		Fenced: func() bool { return s.live.Role() == RoleFenced }}
@@ -564,3 +561,20 @@ func (l *leaderFixture) token2(t *testing.T) Token {
 type cluster2Follower struct{ mesh.Topology }
 
 func (cluster2Follower) IsLeader() bool { return false }
+
+// A server that was removed from a cluster joins one again: the record of the removal goes with the join.
+func TestJoinClearsTheRecordOfARemoval(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	if err := WriteFenced(j.cfg, FencedRecord{Reason: RemovedReason, Removed: true, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := ReadFenced(j.cfg); rec != nil {
+		t.Fatalf("the record of the removal is still there: %+v", rec)
+	}
+}

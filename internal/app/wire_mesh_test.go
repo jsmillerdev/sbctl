@@ -27,6 +27,7 @@ import (
 	"github.com/supavise/supavise/internal/proxy"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/units"
 )
 
 func freeAddr(t *testing.T) string {
@@ -298,4 +299,71 @@ func eventually(t testing.TB, what string, cond func() bool) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+type nopSupervisor struct{ units.Supervisor }
+
+func (nopSupervisor) Status(_ context.Context, unit string) (units.Status, error) {
+	return units.Status{Unit: unit, State: units.StateInactive}, nil
+}
+
+// A follower whose own row says left retires itself: it stops what runs, sets its data aside,
+// deletes its identity, records that it was removed and ends the daemon so that it restarts down.
+func TestRetireWhenRemoved(t *testing.T) {
+	old := retirePoll
+	retirePoll = 10 * time.Millisecond
+	defer func() { retirePoll = old }()
+	ctx := context.Background()
+	w, ca, conf, reg := meshWire(t)
+	w.Node.Supervisor = nopSupervisor{}
+	n2 := &registry.Node{Name: "second", State: registry.NodeActive}
+	if err := reg.CreateNode(ctx, n2); err != nil {
+		t.Fatal(err)
+	}
+	_ = ca
+	if err := os.MkdirAll(w.Cfg.Paths().PostgresData("system"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	live := cluster.NewLive(cluster.LiveOptions{Cfg: w.Cfg, Reg: reg, SelfID: n2.ID, Boot: cluster.BootDecision{Role: cluster.RoleFollower, SelfID: n2.ID},
+		InRecovery: func(context.Context) (bool, error) { return true, nil }})
+	live.Refresh(ctx)
+	done := make(chan error, 1)
+	go func() { done <- retireWhenRemoved(ctx, w, live, w.Log) }()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("a node that is active retired: %v", err)
+	default:
+	}
+	if err := reg.SetNodeState(ctx, n2.ID, registry.NodeLeft); err != nil {
+		t.Fatal(err)
+	}
+	live.Refresh(ctx)
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrRoleChanged) {
+			t.Fatalf("retirement ended with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a removed node did not retire")
+	}
+	if cluster.Joined(config.ClusterDir(conf)) {
+		t.Fatal("the node kept its cluster identity")
+	}
+	rec, err := cluster.ReadFenced(w.Cfg)
+	if err != nil || rec == nil || !rec.Removed {
+		t.Fatalf("record %+v, %v", rec, err)
+	}
+	if _, err := os.Stat(w.Cfg.Paths().PostgresData("system")); !os.IsNotExist(err) {
+		t.Fatal("the data was not set aside")
+	}
+	// The leader does not retire, whatever its row says.
+	lead := cluster.NewLive(cluster.LiveOptions{Cfg: w.Cfg, Reg: reg, SelfID: n2.ID, Boot: cluster.BootDecision{Role: cluster.RoleLeader, SelfID: n2.ID},
+		InRecovery: func(context.Context) (bool, error) { return false, nil }})
+	lead.Refresh(ctx)
+	cctx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer cancel()
+	if err := retireWhenRemoved(cctx, w, lead, w.Log); err != nil {
+		t.Fatalf("a leader retired: %v", err)
+	}
 }

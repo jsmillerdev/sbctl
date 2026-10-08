@@ -21,6 +21,10 @@ type FencedRecord struct {
 	Leader string    `json:"leader"`
 	Reason string    `json:"reason"`
 	At     time.Time `json:"at"`
+	// Removed: the node was taken out of the cluster with `supavise node rm`, not replaced as leader. It
+	// stays down like a fenced node until `supavise node join` brings it into a cluster again;
+	// `node rejoin` is not the way back.
+	Removed bool `json:"removed,omitempty"`
 	// Peers are the peer addresses of the other nodes as this node's registry had them when it was
 	// fenced, by node id: `node rejoin` needs the leader's address when the local registry is stopped.
 	Peers map[string]string `json:"peers,omitempty"`
