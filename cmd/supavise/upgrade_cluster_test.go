@@ -11,8 +11,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/supavise/supavise/internal/app"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/nodeupgrade"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -190,5 +192,76 @@ func TestReadableRegistryDSNIsAPlainConnectionString(t *testing.T) {
 	got := readableRegistryDSN(ctx, cfg)
 	if got != lifecycle.SystemSocketDSN(cfg, "supavise") || strings.Contains(got, "pool_max_conns") {
 		t.Errorf("DSN = %q", got)
+	}
+}
+
+// The pool size is taken off whatever it is, and the DSNs tried are the ones the node's other
+// commands try for the registry (app.RegistryDSNs), in the same order.
+func TestWithoutPool(t *testing.T) {
+	for in, want := range map[string]string{
+		"host=/run/x port=5433 user=supavise pool_max_conns=6":  "host=/run/x port=5433 user=supavise",
+		"host=/run/x port=5433 user=supavise pool_max_conns=64": "host=/run/x port=5433 user=supavise",
+		"host=/run/x port=5433 user=supavise":                   "host=/run/x port=5433 user=supavise",
+	} {
+		if got := withoutPool(in); got != want {
+			t.Errorf("withoutPool(%q) = %q, want %q", in, got, want)
+		}
+	}
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	dsns := app.RegistryDSNs(cfg)
+	if len(dsns) != 2 || !strings.Contains(dsns[0], fmt.Sprintf("port=%d", cfg.Ports.SystemPostgres)) || withoutPool(dsns[1]) == withoutPool(dsns[0]) {
+		t.Errorf("the system cluster's sockets: %v", dsns)
+	}
+}
+
+// A follower that homes a project is refused by the plan its own registry produces, with the project
+// named; the same server without a project upgrades, and a leader is not asked to move anything.
+func TestUpgradePlanOfAFollowerFromItsRegistry(t *testing.T) {
+	ctx := context.Background()
+	reg, rows := clusterRegistry(t)
+	cfg := config.Default()
+	cfg.Node.Name = "second"
+	view, here, err := clusterView(ctx, cfg, reg, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := func(rows []registry.Project) *nodeupgrade.Node {
+		old := map[string]string{"gotrue": "auth-v2.100.0-r1", "postgrest": "postgrest-v12.0-r0"}
+		n := &nodeupgrade.Node{Version: "v1.0.0", Pins: old, Cluster: view, Verdict: nodeupgrade.VerdictHealthy,
+			Projects: nodeupgrade.ProjectsOf(rows, func(string) time.Time { return time.Time{} })}
+		for i := range n.Projects {
+			n.Projects[i].Status = "ACTIVE_HEALTHY"
+		}
+		return n
+	}
+	to := &nodeupgrade.Info{Version: "v1.1.0", Pins: map[string]string{"gotrue": "auth-v2.195.0-r1", "postgrest": "postgrest-v16.4-r0"}}
+
+	p := nodeupgrade.BuildPlan(node(here), to, nodeupgrade.PlanOptions{})
+	if !strings.Contains(p.Refusal, "bbbbbbbbbbbbbbbbbbbb") || !strings.Contains(p.Refusal, "supavise projects failover") || p.Rollout() {
+		t.Errorf("a follower that homes b: refusal %q, rollout %v", p.Refusal, p.Rollout())
+	}
+	p = nodeupgrade.BuildPlan(node(nil), to, nodeupgrade.PlanOptions{})
+	if p.Refusal != "" || p.Rollout() || !p.NodeChanges() {
+		t.Errorf("a follower with no project: refusal %q, rollout %v, node changes %v", p.Refusal, p.Rollout(), p.NodeChanges())
+	}
+}
+
+// The worker that removes unused artifacts opens the registry for writing, so a follower leaves it
+// out and says so; any other node runs it.
+func TestCleanupSkipsArtifactGCOnAFollower(t *testing.T) {
+	for _, follower := range []bool{false, true} {
+		bin, record := stubBinary(t, "")
+		h, out, _ := stubHost(bin)
+		h.follower = follower
+		h.rel = nodeupgrade.Releases{Dir: t.TempDir()}
+		h.Cleanup(context.Background(), 3, "v1.1.0")
+		got := calls(t, record)
+		if follower && (got != "" || !strings.Contains(out.String(), "not removed on a follower")) {
+			t.Errorf("follower: calls %q, output %q", got, out.String())
+		}
+		if !follower && !strings.HasSuffix(got, "artifacts gc --keep 3") {
+			t.Errorf("leader: calls %q", got)
+		}
 	}
 }

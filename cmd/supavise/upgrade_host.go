@@ -68,7 +68,10 @@ type nodeHost struct {
 	hbStop      chan struct{}
 	knowsReason bool
 	// halted is the project the last rollout stopped at (HaltedProject).
-	halted    string
+	halted string
+	// follower is set by Inspect for a server of a cluster that does not lead: its registry is the
+	// leader's copy, which the commands the run starts as workers cannot open for writing.
+	follower  bool
 	from, to  string
 	started   time.Time
 	swappedAt time.Time
@@ -234,6 +237,9 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	if n.Cluster, rows, err = clusterView(ctx, h.cfg, reg, rows); err != nil {
 		return nil, err
 	}
+	h.mu.Lock()
+	h.follower = n.Cluster != nil && !n.Cluster.Leader
+	h.mu.Unlock()
 	var listErr error
 	n.Projects = nodeupgrade.ProjectsOf(rows, func(ref string) time.Time {
 		bs, err := reg.ListBackups(ctx, ref)
@@ -1030,6 +1036,15 @@ func (h *nodeHost) Cleanup(ctx context.Context, keep int, current string) {
 		fmt.Fprintf(h.errw, "warning: removing old kept releases: %v\n", err)
 	} else if len(removed) > 0 {
 		fmt.Fprintf(h.out, "removed the kept release(s) %s\n", strings.Join(removed, ", "))
+	}
+	h.mu.Lock()
+	follower := h.follower
+	h.mu.Unlock()
+	if follower {
+		// `artifacts gc` opens the registry for writing, which a follower cannot, so the artifacts
+		// that nothing uses any more stay until the command can run here.
+		fmt.Fprintln(h.out, "unused artifacts are not removed on a follower of a cluster")
+		return
 	}
 	if err := h.asSupavise(ctx, h.out, nil, h.binPath, "artifacts", "gc", "--keep", fmt.Sprint(keep)); err != nil {
 		fmt.Fprintf(h.errw, "warning: removing unused artifacts: %v\n", err)

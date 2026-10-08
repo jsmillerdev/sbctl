@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/supavise/supavise/internal/app"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/nodeupgrade"
@@ -97,12 +98,14 @@ func noClusterTables(err error) bool {
 
 // readableRegistryDSN is the DSN of the registry this server can read as the user it runs as: the
 // socket of its system cluster, else the socket of the hot standby a follower keeps of the leader's
-// (lifecycle.FollowerRegistryDSN). The first that answers a query wins; when none does the first is
-// returned, so that the caller's error is the one it has always shown. A follower's registry is the
-// replicated copy, which `supavise upgrade` only reads.
+// (app.RegistryDSNs lists them in that order). The first that answers a query wins; when none does
+// the first is returned, so that the caller's error is the one it has always shown. A follower's
+// registry is the replicated copy, which `supavise upgrade` only reads.
 func readableRegistryDSN(ctx context.Context, cfg *config.Config) string {
-	// The follower's DSN carries a pool size of its own, which a single connection cannot take.
-	cands := []string{lifecycle.SystemSocketDSN(cfg, "supavise"), strings.TrimSuffix(lifecycle.FollowerRegistryDSN(cfg), " pool_max_conns=6")}
+	var cands []string
+	for _, dsn := range app.RegistryDSNs(cfg) {
+		cands = append(cands, withoutPool(dsn))
+	}
 	for _, c := range cands {
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		_, err := registry.AppliedMigrations(cctx, c)
@@ -113,6 +116,14 @@ func readableRegistryDSN(ctx context.Context, cfg *config.Config) string {
 	}
 	return cands[0]
 }
+
+// poolParam is the pool size lifecycle puts at the end of the DSNs the daemon's pools use. The
+// callers here open one connection, or a pool of their own size, and a single connection does not
+// take the setting.
+var poolParam = regexp.MustCompile(`\s+pool_max_conns=\S+`)
+
+// withoutPool is dsn as a plain connection string.
+func withoutPool(dsn string) string { return poolParam.ReplaceAllString(dsn, "") }
 
 // registryDSN is readableRegistryDSN, looked up once for the run.
 func (h *nodeHost) registryDSN(ctx context.Context) string {

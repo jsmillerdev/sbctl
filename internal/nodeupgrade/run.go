@@ -381,15 +381,18 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	if err := h.Prefetch(ctx, staged, node, plan); err != nil {
 		return r.endRefused(ctx, fmt.Errorf("fetching the artifacts of %s: %w; nothing was changed", plan.To, err))
 	}
-	refs := BackupRefs(node)
-	r.mark(PhasePreparing, fmt.Sprintf("backing up %d project(s)", len(refs)))
-	o.say("taking a base backup of %d project(s) (the projects keep running)", len(refs))
-	par := o.BackupParallel
-	if par <= 0 {
-		par = 3
-	}
-	if err := h.Backup(ctx, refs, par); err != nil {
-		return r.endRefused(ctx, fmt.Errorf("the base backups failed: %w; nothing was stopped or changed", err))
+	// A follower with no project of its own has nothing to back up: the leader backs up the system
+	// project.
+	if refs := BackupRefs(node); len(refs) > 0 {
+		r.mark(PhasePreparing, fmt.Sprintf("backing up %d project(s)", len(refs)))
+		o.say("taking a base backup of %d project(s) (the projects keep running)", len(refs))
+		par := o.BackupParallel
+		if par <= 0 {
+			par = 3
+		}
+		if err := h.Backup(ctx, refs, par); err != nil {
+			return r.endRefused(ctx, fmt.Errorf("the base backups failed: %w; nothing was stopped or changed", err))
+		}
 	}
 
 	// Everything above changed nothing that runs; from here the node changes.

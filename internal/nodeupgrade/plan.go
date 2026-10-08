@@ -108,9 +108,19 @@ func (p *Plan) NodeChanges() bool {
 
 // Rollout reports whether the plan runs the project rollout: a project to move, a project whose
 // held-back restart is owed, or a new binary (which can render any project's files differently).
+// A follower never runs it: the rollout opens the registry for writing, which a follower cannot,
+// and a follower with a project of its own running has a plan that is refused (followerRefusal), so
+// the one that is not has no project for the rollout to move or restart.
 func (p *Plan) Rollout() bool {
+	if p.follower() {
+		return false
+	}
 	return p.BinaryChange || len(p.Upgrade) > 0 || len(p.Pending) > 0
 }
+
+// follower reports whether the plan is for a server of a cluster that does not lead: its system
+// cluster is a standby of the leader's, so its registry is a copy it only reads.
+func (p *Plan) follower() bool { return p.cluster != nil && !p.cluster.Leader }
 
 // projectServices are the services of a project in the order they are listed.
 var projectServices = []string{config.SvcGoTrue, config.SvcPostgREST, config.SvcPostgres}
@@ -202,8 +212,31 @@ func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 	if n.Infra != nil && n.Infra.Platform != "" && to.InfraRevision > 0 {
 		p.Stack = &StackGap{Report: *n.Infra, Need: to.InfraRevision}
 	}
+	if why := p.followerRefusal(n); why != "" {
+		p.Refusal = why
+		return p
+	}
 	p.describe()
 	return p
+}
+
+// followerRefusal is why a follower does not upgrade while a project of its own runs, or "". The
+// commands the upgrade runs for such a project (its base backup, its rollout, the restart of its
+// services) open the registry for writing through the socket of the system cluster's primary, which
+// a follower does not have: its system cluster is a standby, on the replica port. Left to run, the
+// upgrade would fail after the binary was swapped and the daemon restarted, and go back. A plan
+// with nothing to change on the node, and a follower with no running project (the usual one: it
+// holds replicas, which belong to the leader's projects), go ahead, and neither runs the rollout.
+func (p *Plan) followerRefusal(n *Node) string {
+	if !p.follower() || !p.NodeChanges() {
+		return ""
+	}
+	refs := BackupRefs(n)
+	if len(refs) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("this server follows the leader of its cluster, so its registry is the leader's copy and it cannot write it, and the backup, the upgrade and the restart of a project need a registry it can write. %d project(s) run here: %s. Move them to the server that leads, or pause them, and run the upgrade again; on the leader, `supavise projects failover <ref>` moves a project's primary to the server that holds its replica. Nothing was changed",
+		len(refs), refList(refs))
 }
 
 // movesPostgres reports whether the upgrade changes a PostgreSQL release that runs on this node:
@@ -363,12 +396,21 @@ func (p *Plan) describe() {
 		back = "If the new daemon fails before it applies the migrations, the node goes back to the previous release by itself; after that it stays on the new binary, the projects this run moved are put back, and the node needs you."
 	}
 	if p.NodeChanges() {
-		p.Notes = append(p.Notes, "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "+back)
+		taken := "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "
+		if p.follower() {
+			// The refusal leaves a follower with no running project, and the leader backs up the system project.
+			taken = "No base backup is taken here: the leader takes the system project's, and no project runs on this server. "
+		}
+		p.Notes = append(p.Notes, taken+back)
 	}
 	if p.BinaryChange {
 		p.Notes = append(p.Notes, "The new daemon restarts any shared service whose files it renders differently, whether or not the service's release moves, so a service this list does not name can restart too; if that is Supavisor, every pooled connection drops, and if it is Realtime, every websocket drops. The files are rendered by the new binary, so this list cannot name those services before the upgrade.")
-		p.Notes = append(p.Notes, "A project whose PostgreSQL, GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order (a PostgreSQL restart drops the project's database connections and restarts its GoTrue and PostgREST with it); the files are rendered by the new binary, so this list cannot name those projects before the upgrade. That restart also applies PostgreSQL settings an Owner saved without restarting; a project with only such a setting waiting is not restarted for it.")
-		p.Notes = append(p.Notes, "Going back to the previous release, by itself after a failed rollout or with `supavise rollback`, restarts every project whose PostgreSQL, GoTrue or PostgREST files the rollout had already restarted onto the new release's files (the projects it never reached keep running), one after another when the old daemon starts and outside the canary and batches; each such restart drops that project's database connections. A previous release built without the held-back-restart marks restarts every project whose files the two releases render differently.")
+		if p.follower() {
+			p.Notes = append(p.Notes, "This server follows the leader and runs no project of its own, so the rollout of projects does not run here and no project restarts.")
+		} else {
+			p.Notes = append(p.Notes, "A project whose PostgreSQL, GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order (a PostgreSQL restart drops the project's database connections and restarts its GoTrue and PostgREST with it); the files are rendered by the new binary, so this list cannot name those projects before the upgrade. That restart also applies PostgreSQL settings an Owner saved without restarting; a project with only such a setting waiting is not restarted for it.")
+			p.Notes = append(p.Notes, "Going back to the previous release, by itself after a failed rollout or with `supavise rollback`, restarts every project whose PostgreSQL, GoTrue or PostgREST files the rollout had already restarted onto the new release's files (the projects it never reached keep running), one after another when the old daemon starts and outside the canary and batches; each such restart drops that project's database connections. A previous release built without the held-back-restart marks restarts every project whose files the two releases render differently.")
+		}
 		p.Notes = append(p.Notes, "The system PostgreSQL cluster restarts when the daemon starts if the new release renders its files differently, even when its release does not move. The registry, the dashboard's sign-in and the Management API are unavailable for some seconds then; this is not part of the rollout.")
 	}
 }
@@ -414,7 +456,7 @@ func (p *Plan) Render(w io.Writer) {
 		}
 		// A new binary can render a project's files differently, and the notes below say so; the line
 		// is for a run whose only work is the host and the registry.
-		if len(p.Upgrade) == 0 && len(p.Pending) == 0 && !p.BinaryChange {
+		if len(p.Upgrade) == 0 && len(p.Pending) == 0 && (!p.BinaryChange || p.follower()) {
 			fmt.Fprintln(w, "Projects restarted: none expected")
 		}
 	}
