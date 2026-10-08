@@ -293,10 +293,11 @@ done
 [[ $(python3 -c 'import json; d=json.load(open("'"$RELEASES"'/v0.0.1/release.json")); print(d["pins"]["gotrue"], len(d["registry_migrations"]) > 0, d["migrations_from"] in ("applied", "binary"))') == "$OLD_AUTH True True" ]] || fail "the record of v0.0.1: $(cat "$RELEASES/v0.0.1/release.json")"
 sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
 [[ $sup_status -eq 0 ]] || { cat "$WORK/status.txt" >&2; fail "supavise status exited $sup_status after the upgrade"; }
-$SV artifacts list | grep -q "$NEW_AUTH" || fail "artifacts list does not show the new GoTrue"
+ARTS=$($SV artifacts list); grep -q "$NEW_AUTH" <<<"$ARTS" || fail "artifacts list does not show the new GoTrue"
 # The previous release's artifacts stay for a rollback, although the previous daemon recorded no history.
 for a in "auth/$OLD_AUTH" "pgmeta/$OLD_META" "storage/$OLD_STORAGE"; do [[ -d $STATE/artifacts/$a ]] || fail "the upgrade's cleanup removed $a, which the previous release needs"; done
-journalctl --no-pager -u supavise.service | grep -q 'projects registered with the shared services' || fail "the daemon did not register the projects with the shared services after the start"
+JOURNAL=$(journalctl --no-pager -u supavise.service)
+grep -q 'projects registered with the shared services' <<<"$JOURNAL" || fail "the daemon did not register the projects with the shared services after the start"
 run upgrade "$B/v2" --yes --version v0.0.2
 [[ $RC -eq 0 && $OUT == *"nothing to change"* ]] || fail "a second upgrade should have nothing to do: $RC $OUT"
 unchanged "second upgrade"

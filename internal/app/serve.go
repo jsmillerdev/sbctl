@@ -253,8 +253,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		})
 	}
 	g.Go(func() error {
-		startProjects(gctx, node, recovered, backups(node), log)
-		close(projectsUp)
+		startProjects(gctx, node, recovered, backups(node), log, func() { close(projectsUp) })
 		return nil
 	})
 	g.Go(func() error { settleUpgrades(gctx, node, log); return nil })
@@ -339,7 +338,7 @@ func ensureTenants(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 // projects start, and a project that fails is marked ACTIVE_UNHEALTHY. Projects whose
 // restart the previous process cut off after the pause are resumed first, and restored
 // clones whose recovery outlasted the restore's wait are finished in the background.
-func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle.Recovered, bk *backup.Service, log *slog.Logger) {
+func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle.Recovered, bk *backup.Service, log *slog.Logger, ready func()) {
 	if n.Cfg.Supervisor == config.SupervisorSystemd {
 		for _, unit := range []string{backup.BackupTimerInstance(config.SystemRef), backup.PruneTimerUnit} {
 			if err := n.Supervisor.Start(ctx, unit); err != nil {
@@ -357,6 +356,9 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 	for ref, err := range errs {
 		log.Error("project did not start", "ref", ref, "error", err)
 	}
+	// Every project has been tried: the daemon may register them with the shared services now.
+	// (The restore sweep below runs until the daemon stops, so it cannot be waited for.)
+	ready()
 	ps, err := n.Registry.ListProjects(ctx)
 	if err != nil {
 		log.Error("listing projects after start", "error", err)

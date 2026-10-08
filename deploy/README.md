@@ -662,6 +662,8 @@ Go unit tests: `internal/config` (the maintenance window: parsing, inside-window
 
 ## Not done
 
+- `supavise upgrade --include-postgres` (a project's PostgreSQL moving to a new release) and `--unattended` run in unit tests with a fake node only; `upgrade-e2e` upgrades GoTrue, PostgREST, postgres-meta and Storage and runs `--unattended` only far enough to see it refuse. The shared services' roll is watched, not driven: a Studio build of a release is fetched from the signed list, but no CI job installs one.
+- The node upgrade restarts the daemon, so HTTPS and the Management API fail for a few seconds and WAL archiving pauses meanwhile; there is no socket hand-over.
 - Custom hostnames: DNS-01 and HTTP-01 against a real certificate authority and real DNS have not been run (CI uses Pebble and a DNS stub). There is no wildcard custom hostname and no CAA check, and the limits on certificate orders are counted in memory per project and per server, not per organization.
 - Uninstall: there is no `supavise uninstall`. Stop and disable `supavise.service` and the `supavise-*` units, then remove `/var/lib/supavise`, `/etc/supavise` and the `supavise` user by hand.
 - `install.sh` resolves `latest` through a redirect of github.com and trusts TLS for that step only: the tag it gets is then used for signed files, so a wrong tag can only pick an older signed release.
