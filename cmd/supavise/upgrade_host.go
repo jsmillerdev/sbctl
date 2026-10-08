@@ -43,7 +43,6 @@ type nodeHost struct {
 	log  *slog.Logger
 	in   io.Reader
 
-	exe     string // the running binary (the driver)
 	binPath string // the installed binary
 	cfgPath string
 	root    bool
@@ -65,14 +64,7 @@ type nodeHost struct {
 }
 
 func newNodeHost(cmd cobraIO, cfg *config.Config, wait time.Duration, so selfupdate.Options) (*nodeHost, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
-	if exe, err = filepath.EvalSymlinks(exe); err != nil {
-		return nil, err
-	}
-	h := &nodeHost{cfg: cfg, out: cmd.Out, errw: cmd.Err, in: cmd.In, log: newLogger(cfg), exe: exe, binPath: cfg.BinPath,
+	h := &nodeHost{cfg: cfg, out: cmd.Out, errw: cmd.Err, in: cmd.In, log: newLogger(cfg), binPath: cfg.BinPath,
 		cfgPath: effectiveConfigPath(), root: os.Geteuid() == 0, wait: wait, selfOpts: so}
 	if h.cfgPath == "" {
 		h.cfgPath = selfUpdateConfigPath()
