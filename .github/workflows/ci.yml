@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, "ws/**"]
+    branches: [main, "ws/**", "integrate/**"]
   pull_request:
   # The nightly bump proposals start this workflow on their branches: a push made with a
   # workflow's GITHUB_TOKEN does not (.github/workflows/bump-proposals.yml).
@@ -15,6 +15,12 @@ permissions:
 defaults:
   run:
     shell: bash
+
+# A newer push to a branch cancels that branch's older run; main keeps every run (the release gate
+# reads them).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
