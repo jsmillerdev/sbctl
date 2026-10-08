@@ -63,8 +63,11 @@ func ec2Likely() bool {
 }
 
 // awsCredentialsPresent says whether the environment holds AWS credentials of the operator's: the
-// standard variables, a web identity or container credential source, or a shared credentials or
-// config file. The instance role does not count; the update script refuses to use it.
+// standard variables, a web identity or container credential source, a shared credentials file, or
+// a config file that names where credentials come from. The instance role does not count; the
+// update script refuses to use it. A config file with a region and nothing else is not a credential
+// (it is what an instance's own account often has), and neither is one the operator did not select
+// a profile for.
 func awsCredentialsPresent(getenv func(string) string, home string) bool {
 	if getenv("AWS_ACCESS_KEY_ID") != "" && getenv("AWS_SECRET_ACCESS_KEY") != "" {
 		return true
@@ -74,16 +77,51 @@ func awsCredentialsPresent(getenv func(string) string, home string) bool {
 			return true
 		}
 	}
-	files := []string{getenv("AWS_SHARED_CREDENTIALS_FILE"), getenv("AWS_CONFIG_FILE")}
+	credFiles := []string{getenv("AWS_SHARED_CREDENTIALS_FILE")}
+	cfgFiles := []string{getenv("AWS_CONFIG_FILE")}
 	if home != "" {
-		files = append(files, filepath.Join(home, ".aws", "credentials"), filepath.Join(home, ".aws", "config"))
+		credFiles = append(credFiles, filepath.Join(home, ".aws", "credentials"))
+		cfgFiles = append(cfgFiles, filepath.Join(home, ".aws", "config"))
 	}
-	for _, f := range files {
+	for _, f := range credFiles {
 		if f == "" {
 			continue
 		}
 		if _, err := os.Stat(f); err == nil {
 			return true
+		}
+	}
+	for _, f := range cfgFiles {
+		if f != "" && (getenv("AWS_PROFILE") != "" || awsConfigNamesCredentials(f)) {
+			if _, err := os.Stat(f); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// awsConfigKeys are the settings of an AWS config file that say where credentials come from: keys
+// of their own, an SSO session, an assumed role, a helper program or a web identity.
+var awsConfigKeys = []string{"aws_access_key_id", "sso_session", "sso_start_url", "sso_account_id", "role_arn", "credential_process", "credential_source", "source_profile", "web_identity_token_file"}
+
+// awsConfigNamesCredentials reports whether the AWS config file at path has a setting of
+// awsConfigKeys.
+func awsConfigNamesCredentials(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		key, _, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		for _, k := range awsConfigKeys {
+			if key == k {
+				return true
+			}
 		}
 	}
 	return false

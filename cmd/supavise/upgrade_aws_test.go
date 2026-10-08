@@ -52,11 +52,39 @@ func TestAWSCredentialsPresent(t *testing.T) {
 	if awsCredentialsPresent(env(nil), home) {
 		t.Error("an empty .aws directory counted")
 	}
-	if err := os.WriteFile(filepath.Join(home, ".aws", "config"), []byte("[default]\n"), 0o600); err != nil {
+	// A config file with a region and nothing else says nowhere to get credentials from: the update
+	// script would run and fail, so the node side goes ahead and the command is printed instead.
+	cfgFile := filepath.Join(home, ".aws", "config")
+	if err := os.WriteFile(cfgFile, []byte("[default]\nregion = us-east-1\noutput = json\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !awsCredentialsPresent(env(nil), home) {
-		t.Error("~/.aws/config not found")
+	if awsCredentialsPresent(env(nil), home) {
+		t.Error("a region-only ~/.aws/config counted")
+	}
+	// A profile the operator selected is theirs to have set up.
+	if !awsCredentialsPresent(env(map[string]string{"AWS_PROFILE": "ops"}), home) {
+		t.Error("AWS_PROFILE with a config file not found")
+	}
+	for _, body := range []string{
+		"[profile ops]\nsso_session = acme\n",
+		"[profile ops]\n  role_arn=arn:aws:iam::123456789012:role/deploy\nsource_profile = base\n",
+		"[profile ops]\ncredential_process = /usr/local/bin/creds\n",
+		"[default]\naws_access_key_id = AKIA\n",
+	} {
+		if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if !awsCredentialsPresent(env(nil), home) {
+			t.Errorf("~/.aws/config not found: %q", body)
+		}
+	}
+	// AWS_CONFIG_FILE is read the same way.
+	other := filepath.Join(home, "other-config")
+	if err := os.WriteFile(other, []byte("[default]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if awsCredentialsPresent(env(map[string]string{"AWS_CONFIG_FILE": other}), t.TempDir()) {
+		t.Error("a region-only AWS_CONFIG_FILE counted")
 	}
 }
 
