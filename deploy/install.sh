@@ -95,7 +95,7 @@ main() {
     case ${PASS[i]} in
       --aws-first-boot) first_boot=1 ;;
       --join-token-file) join_file=${PASS[i+1]:-}; [[ -n $join_file ]] || die "--join-token-file needs a path" ;;
-      --join-token-file=*) join_file=${PASS[i]#*=} ;;
+      --join-token-file=*) join_file=${PASS[i]#*=}; [[ -n $join_file ]] || die "--join-token-file needs a path" ;;
     esac
   done
   if [[ -n $join_file ]]; then

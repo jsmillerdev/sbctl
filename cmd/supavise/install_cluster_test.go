@@ -57,6 +57,61 @@ func TestCheckJoinOptions(t *testing.T) {
 	}
 }
 
+func TestCheckInstallFlags(t *testing.T) {
+	changed := func(names ...string) func(string) bool {
+		return func(n string) bool {
+			for _, m := range names {
+				if m == n {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	for name, c := range map[string]struct {
+		o       installOptions
+		changed func(string) bool
+		want    string // "" is accepted
+	}{
+		"nothing":                        {installOptions{}, changed(), ""},
+		"a token file":                   {installOptions{JoinTokenFile: "/root/token"}, changed("join-token-file"), ""},
+		"an empty token file name":       {installOptions{}, changed("join-token-file"), "--join-token-file needs a path"},
+		"a device":                       {installOptions{AWSFirstBoot: true, DataDevice: "/dev/nvme1n1"}, changed("data-device"), ""},
+		"first boot without a device":    {installOptions{AWSFirstBoot: true}, changed(), ""},
+		"a device without first boot":    {installOptions{DataDevice: "/dev/nvme1n1"}, changed("data-device"), "belongs to --aws-first-boot"},
+		"a device that is a flag":        {installOptions{AWSFirstBoot: true, DataDevice: "-f"}, changed("data-device"), "not a device node"},
+		"a device outside /dev":          {installOptions{AWSFirstBoot: true, DataDevice: "/var/lib/disk.img"}, changed("data-device"), "not a device node"},
+		"a device that climbs out":       {installOptions{AWSFirstBoot: true, DataDevice: "/dev/../etc/passwd"}, changed("data-device"), "not a device node"},
+		"a relative device":              {installOptions{AWSFirstBoot: true, DataDevice: "nvme1n1"}, changed("data-device"), "not a device node"},
+		"a device with a double slash":   {installOptions{AWSFirstBoot: true, DataDevice: "/dev//nvme1n1"}, changed("data-device"), "not a device node"},
+		"a flag value of /dev/ itself":   {installOptions{AWSFirstBoot: true, DataDevice: "/dev/"}, changed("data-device"), "not a device node"},
+		"a loop device":                  {installOptions{AWSFirstBoot: true, DataDevice: "/dev/loop7"}, changed("data-device"), ""},
+		"an empty name given explicitly": {installOptions{AWSFirstBoot: true}, changed("data-device"), ""},
+	} {
+		err := checkInstallFlags(c.changed, c.o)
+		switch {
+		case c.want == "" && err != nil:
+			t.Errorf("%s: %v", name, err)
+		case c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)):
+			t.Errorf("%s: err = %v, want %q", name, err, c.want)
+		}
+	}
+}
+
+// The stack name comes from an instance tag. A name that is not a stack name stays out of config.d,
+// where a stray quote or newline would make the file invalid TOML.
+func TestWriteAWSConfigRefusesWhatIsNotAStackName(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"", "a\"b", "x\ny = 1", "1stack", "has space", strings.Repeat("a", 129)} {
+		if err := writeAWSConfig(dir, name); err == nil {
+			t.Errorf("%q was written", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, config.ConfigDName)); err == nil {
+		t.Error("a refused name created config.d")
+	}
+}
+
 // The token reaches the joiner in a private file that the supavise user can read, and is removed
 // when the join returns; the operator's file is left as it was.
 func TestJoinStepStagesTheToken(t *testing.T) {

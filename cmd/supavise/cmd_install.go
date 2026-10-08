@@ -90,6 +90,9 @@ copy of the registry from the leader (` + "`supavise node join`" + `), and the d
 	f.StringVar(&o.JoinTokenFile, "join-token-file", "", "join the cluster whose leader printed the token in this file (mode 0600) instead of creating a system project")
 	printCfg := f.Bool("print-config", false, "print the config.toml this run would write and exit; changes nothing")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if err := checkInstallFlags(cmd.Flags().Changed, o); err != nil {
+			return err
+		}
 		if *printCfg {
 			return printInstallConfig(cmd, o)
 		}

@@ -31,6 +31,25 @@ func firstBootAWS(ctx context.Context, out io.Writer, o installOptions) (*hostse
 	return fb.Run(ctx)
 }
 
+// checkInstallFlags refuses the first-boot and join flags that cannot be meant: an empty
+// --join-token-file (an unset shell variable would turn a join into a founding install), and a
+// --data-device that is not a path under /dev (mkfs.xfs, blkid and mount take it as an argument) or
+// that goes without --aws-first-boot. It runs before anything changes.
+func checkInstallFlags(changed func(string) bool, o installOptions) error {
+	if changed("join-token-file") && o.JoinTokenFile == "" {
+		return errors.New("--join-token-file needs a path")
+	}
+	if o.DataDevice != "" {
+		if !o.AWSFirstBoot {
+			return errors.New("--data-device belongs to --aws-first-boot")
+		}
+		if !strings.HasPrefix(o.DataDevice, "/dev/") || filepath.Clean(o.DataDevice) != o.DataDevice {
+			return fmt.Errorf("--data-device %q is not a device node under /dev", o.DataDevice)
+		}
+	}
+	return nil
+}
+
 // maxTokenBytes bounds a join token file: a token is a short line.
 const maxTokenBytes = 4096
 

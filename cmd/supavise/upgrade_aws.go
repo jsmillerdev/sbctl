@@ -247,6 +247,11 @@ func (h *nodeHost) UpdateStack(ctx context.Context, c *nodeupgrade.Candidate, so
 // writeAWSConfig records the node's stack in config.d/20-aws.toml. The file is read by the
 // supavise user, so it is not root's alone; it holds no secret.
 func writeAWSConfig(configDir, stack string) error {
+	// The name comes from an instance tag when first boot records it; a name that is not a stack name
+	// could make the file invalid TOML, and the daemon would stop loading its configuration.
+	if !stackNameRe.MatchString(stack) {
+		return fmt.Errorf("%q is not a CloudFormation stack name", stack)
+	}
 	path := filepath.Join(configDir, config.ConfigDName, config.AWSConfigFile)
 	body := fmt.Sprintf("# Written by `supavise upgrade --aws`: the CloudFormation stack that made this server.\n[aws]\nstack_name = %q\n", stack)
 	if cur, err := os.ReadFile(path); err == nil && string(cur) == body {
