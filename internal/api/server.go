@@ -101,6 +101,10 @@ type Deps struct {
 	// (<ref>-lb.api.<domain>) once the project has a replica. False: GET load-balancers
 	// answers an empty list, because Studio would show an endpoint nothing serves.
 	LoadBalancers bool
+	// Failover answers whether a server failover would be accepted (GET /supavise/v1/failover/readiness);
+	// *failover.Orchestrator implements it. Nil: the node is not part of a cluster and the route
+	// answers 404.
+	Failover FailoverSource
 }
 
 // Server is the Management API. It implements http.Handler.
@@ -155,6 +159,8 @@ type Server struct {
 	replicas  replicas.Service
 	placement placement.Resolver
 	lbOn      bool
+	// failover is Deps.Failover (failover.go).
+	failover FailoverSource
 
 	// disk is the data volume and the projects' disk limits (compute.go).
 	disk DiskLimits
@@ -281,7 +287,7 @@ func NewServer(d Deps) (*Server, error) {
 			s.store = NewMemoryStore()
 		}
 	}
-	s.replicas, s.placement, s.lbOn = d.Replicas, d.Placement, d.LoadBalancers
+	s.replicas, s.placement, s.lbOn, s.failover = d.Replicas, d.Placement, d.LoadBalancers, d.Failover
 	if s.placement == nil {
 		s.placement = placement.RegistryResolver{Reg: d.Registry}
 	}
