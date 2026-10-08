@@ -23,6 +23,8 @@ func TestCheckReplicaPortsRefusesOverlapWithFixedPorts(t *testing.T) {
 		{"the admin listener", func(c *Config) { c.Listen.Admin = "127.0.0.1:10500" }, "listen.admin 10500"},
 		{"the peer listener", func(c *Config) { c.Node.PeerListen = ":10600" }, "node.peer_listen 10600"},
 		{"supavisor", func(c *Config) { c.Ports.SupavisorSession = 11000 }, "ports.supavisor_session"},
+		{"supavisor's API", func(c *Config) { c.Fleet.SupavisorAPIPort = 10800 }, "fleet.supavisor_api_port 10800"},
+		{"the storage credential endpoint", func(c *Config) { c.Fleet.StorageCredentialsPort = 10900 }, "fleet.storage_credentials_port 10900"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := Default()

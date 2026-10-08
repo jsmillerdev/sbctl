@@ -186,6 +186,20 @@ func TestClusterValidation(t *testing.T) {
 		}, "alternatives"},
 		{"storage credentials port", func(c *Config) { c.Fleet.StorageCredentialsPort = 70000 }, "storage_credentials_port"},
 		{"storage credentials port ok", func(c *Config) { c.Fleet.StorageCredentialsPort = 4011 }, ""},
+		// The endpoint's port is a fixed port of the node: nothing else may bind it.
+		{"storage credentials port is supavisor's", func(c *Config) { c.Fleet.StorageCredentialsPort = 4001 }, "fleet.supavisor_api_port"},
+		{"storage credentials port is supavisor's, moved", func(c *Config) { c.Fleet.SupavisorAPIPort = 4999; c.Fleet.StorageCredentialsPort = 4999 }, "fleet.supavisor_api_port"},
+		{"storage credentials port is studio's", func(c *Config) { c.Fleet.StorageCredentialsPort = c.Ports.Studio }, "ports.studio"},
+		{"storage credentials port is the admin listener's", func(c *Config) { c.Fleet.StorageCredentialsPort = 7000 }, "listen.admin"},
+		{"storage credentials port is the peer port", func(c *Config) { c.Fleet.StorageCredentialsPort = 7443 }, "node.peer_listen"},
+		{"storage credentials port in the project range", func(c *Config) { c.Fleet.StorageCredentialsPort = c.Ports.ProjectBase + 3 }, "project port range"},
+		{"role ARN with the default port", func(c *Config) { c.Fleet.StorageS3RoleARN = "arn:aws:iam::123456789012:role/supavise-storage" }, ""},
+		{"role ARN and supavisor on the default port", func(c *Config) {
+			c.Fleet.StorageS3RoleARN = "arn:aws:iam::123456789012:role/supavise-storage"
+			c.Fleet.SupavisorAPIPort = DefaultStorageCredentialsPort
+		}, "fleet.supavisor_api_port"},
+		// Not served, not judged: a port nobody binds collides with nothing.
+		{"unused default port is supavisor's", func(c *Config) { c.Fleet.SupavisorAPIPort = DefaultStorageCredentialsPort }, ""},
 		// The replica port range is judged only once replicas are in use, so a node with a small
 		// project_base that never uses them still starts.
 		{"small project_base, no replicas", func(c *Config) { c.Ports.ProjectBase = 5000 }, ""},
