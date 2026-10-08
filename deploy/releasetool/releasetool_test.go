@@ -280,9 +280,14 @@ func TestManifestHostAndAWSFields(t *testing.T) {
 		{"prints no JSON", `echo converged`, 0},
 		{"reports a bad number", `echo '{"converge_revision":"four"}'`, 0},
 	} {
-		m, err := manifest("-binary", fake(strings.ReplaceAll(c.name, " ", "-"), c.body))
+		bin := fake(strings.ReplaceAll(c.name, " ", "-"), c.body)
+		m, err := manifest("-binary", bin)
 		if err != nil || m.Host == nil || m.Host.ConvergeRevision != c.want {
 			t.Errorf("binary that %s: host %+v err %v, want revision %d", c.name, m.Host, err, c.want)
+		}
+		// Anything but a revision it reported is worth a warning on stderr.
+		if _, why := convergeRevision(bin); (why == "") != (c.name == "reports") {
+			t.Errorf("binary that %s: warning %q", c.name, why)
 		}
 	}
 	// A path that does not exist is the same as one that cannot run: 0, and a warning.

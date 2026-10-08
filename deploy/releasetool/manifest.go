@@ -20,8 +20,8 @@ import (
 // convergeRevision asks a built binary for the host layer revision it expects: the field
 // converge_revision of `supavise release-info --json`. A binary that does not report one (it
 // predates the field) or cannot run here (a binary for the other architecture) gives 0 and a
-// reason; the manifest then says the host layer has no revision, which is what such a binary
-// means.
+// reason, which the caller prints as a warning; the manifest then says the host layer has no
+// revision, which is what such a binary means.
 func convergeRevision(binary string) (rev int, why string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -35,7 +35,7 @@ func convergeRevision(binary string) (rev int, why string) {
 	}
 	raw, ok := info["converge_revision"]
 	if !ok {
-		return 0, ""
+		return 0, fmt.Sprintf("%s release-info reports no converge_revision: the manifest will say the host layer has revision 0", binary)
 	}
 	if err := json.Unmarshal(raw, &rev); err != nil || rev < 0 {
 		return 0, fmt.Sprintf("%s release-info: converge_revision %s is not a revision number", binary, raw)
