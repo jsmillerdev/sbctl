@@ -666,3 +666,38 @@ func newRegistryWithProject(t *testing.T) *registry.Memory {
 	}
 	return reg
 }
+
+// TestAllowHostReplicaAndBalancer: the endpoints of a replica and the balancer of its project are one
+// label under api.<domain>, so they are certified like a project host: on demand where there is no
+// wildcard, and never where the wildcard covers them.
+func TestAllowHostReplicaAndBalancer(t *testing.T) {
+	base := "example.com"
+	for mode, want := range map[string]bool{"http01": true, "auto": false, "dns01": false} {
+		s := tlsServer(t, func(c *config.Config) {
+			c.Domain, c.TLS.Mode = base, mode
+			if mode != "http01" {
+				c.TLS.DNSProvider = "route53"
+			}
+		})
+		addNode(t, s.reg(), "n2", "eu-1", registry.NodeActive)
+		addReplica(t, s.reg(), repEU, testRef, "n2", string(registry.StatusActiveHealthy))
+		if err := s.table.reload(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		for _, host := range []string{repEU + ".api." + base, testRef + "-lb.api." + base} {
+			if err := s.allowHost(context.Background(), host); (err == nil) != want {
+				t.Errorf("mode %s: allowHost(%s) = %v, want allowed=%v", mode, host, err, want)
+			}
+		}
+		// A host that only has the shape of one is not served.
+		for _, host := range []string{testRef + "-rr-eu-zzz999.api." + base, "zzzzzzzzzzzzzzzzzzzz-lb.api." + base} {
+			if err := s.allowHost(context.Background(), host); err == nil {
+				t.Errorf("mode %s: allowHost(%s) allowed", mode, host)
+			}
+		}
+		// The redirect on :80 knows them too.
+		if !s.serves(repEU+".api."+base) || !s.serves(testRef+"-lb.api."+base) {
+			t.Errorf("mode %s: the :80 redirect does not serve the replica or balancer host", mode)
+		}
+	}
+}

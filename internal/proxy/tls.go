@@ -394,13 +394,14 @@ func (s *Server) allowHost(_ context.Context, name string) error {
 		return fmt.Errorf("%s belongs to a project that is %s", name, p.status)
 	}
 	switch kind {
-	case "derived", "vanity":
-		// A vanity subdomain is <name>.api.<domain>: the wildcard covers it like a ref host.
+	case kindDerived, kindVanity, kindReplica, kindBalancer:
+		// A vanity subdomain, a replica's endpoint and a project's load balancer are all one label
+		// under api.<domain>: the wildcard covers them like a ref host.
 		if s.tlsMode == tlsDNS01 || s.tlsMode == tlsAuto {
 			return fmt.Errorf("%s is covered by the wildcard certificate", name)
 		}
 		return nil
-	case "custom":
+	case kindCustom:
 		// A route of a custom hostname exists only once the hostname is active: the domain
 		// store inserts it when the project activates the hostname and removes it with the
 		// hostname. Claimed, unverified or deleted names have no route, so no certificate.

@@ -177,6 +177,9 @@ func etagMatches(header, tag string) bool {
 // a node that authenticated with its certificate may ask, and only the leader answers: its store is the
 // one that counts. wire_proxy.go registers it with mesh.Handle.
 func CertsHandler(dir string, leader func() bool, log *slog.Logger) mesh.HandlerFunc {
+	if log == nil {
+		log = slog.Default()
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if p, ok := mesh.PeerFrom(r.Context()); !ok || p.Node == "" {
 			writePeerError(w, http.StatusForbidden, "forbidden", "the certificate store is for the nodes of the cluster")
