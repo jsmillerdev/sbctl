@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"reflect"
 	"sync"
 	"time"
 
+	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -25,11 +27,23 @@ type LiveOptions struct {
 	InRecovery func(ctx context.Context) (bool, error)
 	// Poll is how often the registry and the probe are read; zero is 2 s.
 	Poll time.Duration
+	// Fence, when set, is asked first when a running leader learns that another node holds the
+	// leadership (ObserveEpoch): the failover orchestrator's FenceOnHigherEpoch, which writes the node's
+	// record, stops the primaries and raises the alert. source says where it was seen ("node n2", "the
+	// leader marker in the backup store"). It is called while the membership still reports the leader,
+	// which it checks, and its verdict decides: false leaves the node leading. An error with a true verdict
+	// is logged; the node is fenced all the same.
+	Fence func(ctx context.Context, source string, epoch int64, leader string) (fenced bool, err error)
 	// OnFenced is called once, when a running leader learns that another node holds the leadership
 	// (ObserveEpoch). The daemon stops the clusters, raises the alert and restarts into fenced mode.
 	OnFenced func(FencedRecord)
-	Log      *slog.Logger
-	Now      func() time.Time
+	// Marker, when set, is the backup store's leader marker, which Run reads every MarkerEvery while
+	// this node leads a cluster of more than one node: a leader that no peer can reach still learns from
+	// it that another node was promoted. Zero MarkerEvery is 30 s.
+	Marker      backup.EpochMarkerStore
+	MarkerEvery time.Duration
+	Log         *slog.Logger
+	Now         func() time.Time
 }
 
 // Live is the Membership of a node in a cluster: it follows the registry and the system cluster's
@@ -42,13 +56,15 @@ type Live struct {
 	*Static
 	o LiveOptions
 
-	mu      sync.Mutex
-	fenced  *FencedRecord
-	primary bool // the last probe of the system cluster succeeded and found a primary
-	drift   int  // consecutive polls that saw a role other than the boot role
-	changed chan struct{}
-	once    sync.Once
-	reason  string
+	mu       sync.Mutex
+	fenced   *FencedRecord
+	primary  bool // the last probe of the system cluster succeeded and found a primary
+	fencing  bool // an observation is deciding whether to fence the node
+	notified bool // OnFenced has been called
+	drift    int  // consecutive polls that saw a role other than the boot role
+	changed  chan struct{}
+	once     sync.Once
+	reason   string
 }
 
 var _ Membership = (*Live)(nil)
@@ -99,26 +115,114 @@ func (l *Live) Fenced() *FencedRecord {
 func (l *Live) Run(ctx context.Context) error {
 	tick := time.NewTicker(l.o.Poll)
 	defer tick.Stop()
+	var markerTick <-chan time.Time
+	if l.o.Marker != nil {
+		every := l.o.MarkerEvery
+		if every <= 0 {
+			every = 30 * time.Second
+		}
+		t := time.NewTicker(every)
+		defer t.Stop()
+		markerTick = t.C
+	}
 	for {
 		l.Refresh(ctx)
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-tick.C:
+		case <-markerTick:
+			l.CheckMarker(ctx)
 		}
 	}
 }
 
+// CheckMarker reads the leader marker and treats what it says as a peer's word (ObserveEpoch). It does
+// nothing on a node that does not lead, on a cluster of one node, and when the store does not answer.
+func (l *Live) CheckMarker(ctx context.Context) {
+	snap := l.get()
+	if l.o.Marker == nil || snap.Role != RoleLeader || len(snap.Nodes) < 2 {
+		return
+	}
+	mctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	m, err := l.o.Marker.ReadLeaderMarker(mctx)
+	if err != nil {
+		l.o.Log.Debug("membership: the leader marker was not read", "error", err)
+		return
+	}
+	if m != nil && m.Leader != "" {
+		l.observe("the leader marker in the backup store", m.Epoch, m.Leader)
+	}
+}
+
+// adoptRecord makes the node fenced in the membership's eyes when fenced.json says so: the failover
+// procedure fences a leader cooperatively by writing it (failover/fenced), outside the daemon's own
+// ObserveEpoch. A record that cannot be read leaves the role as it is (the plane refuses to start a
+// primary on it all the same).
+func (l *Live) adoptRecord() {
+	if l.Fenced() != nil {
+		return
+	}
+	rec, err := ReadFenced(l.o.Cfg)
+	if err != nil {
+		l.o.Log.Warn("membership: fenced.json cannot be read", "error", err)
+		return
+	}
+	if rec == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.fenced == nil {
+		l.fenced = rec
+	}
+	l.mu.Unlock()
+	l.o.Log.Error("this node is fenced", "reason", rec.Reason, "epoch", rec.Epoch, "leader", rec.Leader)
+}
+
+// publishFenced makes the snapshot say fenced, and tells the daemon to restart in that role.
+func (l *Live) publishFenced() {
+	if prev := l.get(); prev.Role != RoleFenced {
+		next := prev
+		next.Role = RoleFenced
+		l.Set(next)
+	}
+	l.watchRole(RoleFenced)
+}
+
+// promotedEpoch is the epoch of this node's own promotion of the system cluster: the failover
+// procedure writes promote.ok with the epoch before it promotes, and the registry on the node does not
+// show the epoch until the procedure has moved the leadership into it. 0 when there is none.
+func (l *Live) promotedEpoch() int64 {
+	b, err := os.ReadFile(l.o.Cfg.Paths().PromoteOK(config.SystemRef))
+	if err != nil {
+		return 0
+	}
+	n, err := backup.ParsePromoteOK(b)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // Refresh reads the registry and the recovery state once and publishes the snapshot if it changed.
 func (l *Live) Refresh(ctx context.Context) {
+	l.adoptRecord()
 	cl, err := l.o.Reg.GetCluster(ctx)
 	if err != nil {
 		l.o.Log.Debug("membership: cluster row not read", "error", err)
+		// A fence stops the system cluster too, so a registry that cannot be read says nothing against it.
+		if l.Fenced() != nil {
+			l.publishFenced()
+		}
 		return
 	}
 	nodes, err := l.o.Reg.ListNodes(ctx)
 	if err != nil {
 		l.o.Log.Debug("membership: nodes not read", "error", err)
+		if l.Fenced() != nil {
+			l.publishFenced()
+		}
 		return
 	}
 	prev := l.get()
@@ -147,6 +251,11 @@ func (l *Live) Refresh(ctx context.Context) {
 	}
 	if role == RoleLeader {
 		snap.Leader = l.o.SelfID
+		// A node that was just promoted leads at the epoch it was promoted for, before the registry
+		// says so: the procedure that promoted it waits for the membership to show this.
+		if e := l.promotedEpoch(); e > snap.Epoch {
+			snap.Epoch = e
+		}
 	}
 	if !reflect.DeepEqual(prev, snap) {
 		l.Set(snap)
@@ -173,30 +282,52 @@ func (l *Live) watchRole(role Role) {
 	})
 }
 
-// ObserveEpoch is told what a peer believes (every answer to a ping). A leader that sees another
-// node named as leader at its epoch or a higher one is fenced: it records that in fenced.json, which the
-// next start reads, and calls OnFenced. Only a leader whose system cluster answers as a primary is
-// fenced: one whose database is stopped writes nothing, and that is how the old leader of a planned
-// switchover looks to the new one until it is demoted in place.
+// ObserveEpoch is told what a peer believes (every answer to a ping). A leader that sees another node
+// named as leader at its epoch or a higher one is fenced: Fence is asked first (the orchestrator
+// records the fence and stops the primaries), then the node writes fenced.json (with the peers'
+// addresses, which `node rejoin` needs) and calls OnFenced, and the daemon restarts into fenced mode. Only
+// a leader whose system cluster answers as a primary is fenced: one whose database is stopped writes
+// nothing, and that is how the old leader of a planned switchover looks to the new one until it is
+// demoted in place. The leader marker in the backup store is read the same way (CheckMarker).
 func (l *Live) ObserveEpoch(node string, epoch int64, leader string) {
+	l.observe("node "+node, epoch, leader)
+}
+
+func (l *Live) observe(source string, epoch int64, leader string) {
 	snap := l.get()
 	if snap.Role != RoleLeader || leader == "" || leader == l.o.SelfID || epoch < snap.Epoch {
 		return
 	}
 	l.mu.Lock()
-	primaryUp := l.primary
-	l.mu.Unlock()
-	if l.o.InRecovery != nil && !primaryUp {
-		return
-	}
-	rec := FencedRecord{Epoch: epoch, Leader: leader, At: l.o.Now(), Peers: PeersOf(snap.Nodes, l.o.SelfID),
-		Reason: fmt.Sprintf("node %s says node %s leads at epoch %d; this node's epoch is %d", node, leader, epoch, snap.Epoch)}
-	l.mu.Lock()
-	if l.fenced != nil {
+	if l.fencing || l.fenced != nil || (l.o.InRecovery != nil && !l.primary) {
 		l.mu.Unlock()
 		return
 	}
-	l.fenced = &rec
+	l.fencing = true
+	l.mu.Unlock()
+	defer func() { l.mu.Lock(); l.fencing = false; l.mu.Unlock() }()
+
+	rec := FencedRecord{Epoch: epoch, Leader: leader, At: l.o.Now(), Peers: PeersOf(snap.Nodes, l.o.SelfID),
+		Reason: fmt.Sprintf("%s says node %s leads at epoch %d; this node's epoch is %d", source, leader, epoch, snap.Epoch)}
+	if l.o.Fence != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		fenced, err := l.o.Fence(ctx, source, epoch, leader)
+		cancel()
+		if err != nil {
+			l.o.Log.Error("membership: fencing this node did not finish cleanly", "error", err)
+		}
+		if !fenced {
+			return
+		}
+	}
+	// The record may be there already: the orchestrator writes it first, and a refresh that ran meanwhile
+	// adopted it. The peers' addresses are in this one, so it replaces that, and the daemon is told once.
+	l.mu.Lock()
+	if l.notified {
+		l.mu.Unlock()
+		return
+	}
+	l.fenced, l.notified = &rec, true
 	l.mu.Unlock()
 	if err := WriteFenced(l.o.Cfg, rec); err != nil {
 		l.o.Log.Error("membership: the fenced record was not written", "error", err)

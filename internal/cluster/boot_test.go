@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -51,6 +53,13 @@ func TestDecide(t *testing.T) {
 		{"the registry names another leader and nothing names this node", ev(func(e *Evidence) { e.Leader = "n2" }), RoleFenced, 3, "names node n2"},
 		{"promoted: the marker names this node at a higher epoch",
 			ev(func(e *Evidence) { e.Leader = "n2"; e.Marker = marker(4, "n1") }), RoleLeader, 4, ""},
+		{"promoted: the node's own promote.ok names it, with no marker", ev(func(e *Evidence) { e.Leader = "n2"; e.Promoted = 4 }), RoleLeader, 4, ""},
+		{"an old promote.ok changes nothing", ev(func(e *Evidence) { e.Leader = "n2"; e.Promoted = 3 }), RoleFenced, 3, "names node n2"},
+		{"a peer at a higher epoch beats the node's promote.ok", ev(func(e *Evidence) {
+			e.Leader = "n2"
+			e.Promoted = 4
+			e.Peers = []PeerView{{"n3", 5, "n3"}}
+		}), RoleFenced, 5, "node n3"},
 		{"promoted: the old leader still claims the old epoch",
 			ev(func(e *Evidence) {
 				e.Leader = "n2"
@@ -719,5 +728,218 @@ func TestPlainDSNDropsThePoolParameters(t *testing.T) {
 		if got := PlainDSN(in); got != want {
 			t.Errorf("PlainDSN(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// ---- Live: the failover procedure's side of the membership ----
+
+// The cooperative fence of the failover procedure writes fenced.json from outside the daemon's own
+// observation. The membership reports the node fenced as soon as it reads the record, tells the daemon
+// to restart in that role, and does so when the registry cannot be read either: the fence stops the
+// system cluster too.
+func TestLiveReportsFencedWhenTheRecordAppears(t *testing.T) {
+	ctx := context.Background()
+	l, reg, cfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	l.Refresh(ctx)
+	if l.Role() != RoleLeader {
+		t.Fatalf("role %s", l.Role())
+	}
+	if err := fenced.WriteNode(cfg.Paths(), fenced.Record{Epoch: 2, Leader: "n2", Reason: "a survivor fenced this node", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	l.Refresh(ctx)
+	if l.Role() != RoleFenced || l.IsLeader() {
+		t.Fatalf("role %s after the record appeared", l.Role())
+	}
+	if rec := l.Fenced(); rec == nil || rec.Leader != "n2" || rec.Epoch != 2 {
+		t.Fatalf("record %+v", rec)
+	}
+	select {
+	case <-l.Changed():
+	default:
+		t.Fatal("the daemon was not told to restart as a fenced node")
+	}
+
+	// The registry is down: the node is fenced all the same.
+	g, _, gcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	g.Refresh(ctx)
+	g.o.Reg = noCluster{reg}
+	if err := fenced.WriteNode(gcfg.Paths(), fenced.Record{Epoch: 2, Leader: "n2", Reason: "fenced", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	g.Refresh(ctx)
+	if g.Role() != RoleFenced {
+		t.Fatalf("role %s with the registry down", g.Role())
+	}
+
+	// A record that cannot be read does not make a leader a fenced node by itself.
+	h, _, hcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	if err := os.WriteFile(fenced.NodePath(hcfg.Paths()), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.Refresh(ctx)
+	if h.Role() != RoleLeader {
+		t.Fatalf("role %s with a damaged record", h.Role())
+	}
+}
+
+type noCluster struct{ registry.Registry }
+
+func (noCluster) GetCluster(context.Context) (*registry.Cluster, error) {
+	return nil, errors.New("the system cluster is stopped")
+}
+
+// The orchestrator's FenceOnHigherEpoch is asked while the membership still reports the leader, and its
+// verdict decides: a node it will not fence keeps leading, one it fences is fenced and the daemon told.
+func TestLiveAsksTheFencerBeforeItFencesALeader(t *testing.T) {
+	ctx := context.Background()
+	l, reg, cfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	n2, err := reg.GetNode(ctx, "n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2.PeerAddr = "10.0.0.2:7443"
+	if err := reg.UpdateNode(ctx, n2); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	var verdict bool
+	var ferr error
+	l.o.Fence = func(_ context.Context, source string, epoch int64, leader string) (bool, error) {
+		calls = append(calls, fmt.Sprintf("%s|%d|%s|leader=%v", source, epoch, leader, l.IsLeader()))
+		return verdict, ferr
+	}
+	var told []FencedRecord
+	l.o.OnFenced = func(r FencedRecord) { told = append(told, r) }
+	l.Refresh(ctx)
+
+	l.ObserveEpoch("n2", 5, "n2") // the fencer says no
+	if l.Role() != RoleLeader || len(told) != 0 || len(calls) != 1 {
+		t.Fatalf("role %s, told %d, calls %v", l.Role(), len(told), calls)
+	}
+	if calls[0] != "node n2|5|n2|leader=true" {
+		t.Fatalf("the fencer was asked %q", calls[0])
+	}
+	verdict, ferr = true, errors.New("a primary did not stop")
+	l.ObserveEpoch("n2", 5, "n2")
+	if l.Role() != RoleFenced || len(told) != 1 || len(calls) != 2 {
+		t.Fatalf("role %s, told %d, calls %v", l.Role(), len(told), calls)
+	}
+	if rec, err := ReadFenced(cfg); err != nil || rec == nil || rec.Leader != "n2" || len(rec.Peers) != 1 {
+		t.Fatalf("fenced.json: %+v, %v", rec, err)
+	}
+	l.ObserveEpoch("n3", 6, "n3")
+	if len(calls) != 2 || len(told) != 1 {
+		t.Fatal("fenced twice")
+	}
+
+	// The record the fencer wrote and a refresh adopted does not stop the daemon from being told once.
+	m, _, mcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	var mtold int
+	m.o.OnFenced = func(FencedRecord) { mtold++ }
+	m.o.Fence = func(context.Context, string, int64, string) (bool, error) {
+		if err := fenced.WriteNode(mcfg.Paths(), fenced.Record{Epoch: 5, Leader: "n2", Reason: "fenced", At: time.Now()}); err != nil {
+			t.Error(err)
+		}
+		m.Refresh(ctx) // the membership polls while the primaries stop
+		return true, nil
+	}
+	m.Refresh(ctx)
+	m.ObserveEpoch("n2", 5, "n2")
+	if m.Role() != RoleFenced || mtold != 1 {
+		t.Fatalf("role %s, told %d", m.Role(), mtold)
+	}
+}
+
+// A leader that no peer reaches learns from the backup store's leader marker that another node was
+// promoted; a store that does not answer, a follower and a cluster of one node leave things as they are.
+func TestLiveReadsTheLeaderMarker(t *testing.T) {
+	ctx := context.Background()
+	newLeader := func(m fakeMarker) *Live {
+		l, _, _ := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+		l.o.Marker = m
+		l.Refresh(ctx)
+		return l
+	}
+	l := newLeader(fakeMarker{err: errors.New("the store does not answer")})
+	l.CheckMarker(ctx)
+	if l.Role() != RoleLeader {
+		t.Fatal("an unreadable marker fenced the leader")
+	}
+	l = newLeader(fakeMarker{m: &backup.LeaderMarker{Epoch: 1, Leader: "n1"}})
+	l.CheckMarker(ctx)
+	if l.Role() != RoleLeader {
+		t.Fatal("a marker that names this node fenced it")
+	}
+	l = newLeader(fakeMarker{m: &backup.LeaderMarker{Epoch: 3, Leader: "n2"}})
+	var called string
+	l.o.Fence = func(_ context.Context, source string, epoch int64, leader string) (bool, error) {
+		called = fmt.Sprintf("%s|%d|%s", source, epoch, leader)
+		return true, nil
+	}
+	l.CheckMarker(ctx)
+	if l.Role() != RoleFenced || called != "the leader marker in the backup store|3|n2" {
+		t.Fatalf("role %s, fencer asked %q", l.Role(), called)
+	}
+	if rec := l.Fenced(); rec == nil || !strings.Contains(rec.Reason, "leader marker") {
+		t.Fatalf("record %+v", rec)
+	}
+
+	f, _, _ := newLive(t, BootDecision{Role: RoleFollower, SelfID: "n2"}, &probe{rec: true})
+	f.o.Marker = fakeMarker{m: &backup.LeaderMarker{Epoch: 9, Leader: "n3"}}
+	f.Refresh(ctx)
+	f.CheckMarker(ctx)
+	if f.Role() != RoleFollower {
+		t.Fatal("a follower fenced itself on the marker")
+	}
+
+	// Run reads the marker on its own timer.
+	r := newLeader(fakeMarker{m: &backup.LeaderMarker{Epoch: 3, Leader: "n2"}})
+	r.o.MarkerEvery = 10 * time.Millisecond
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go r.Run(rctx)
+	eventually(t, "Run to read the marker", func() bool { return r.Role() == RoleFenced })
+}
+
+// A node that was just promoted leads at the epoch it was promoted for before the registry says so:
+// the procedure that promoted it waits for the membership to show it. An older promote.ok shows nothing.
+func TestLiveShowsThePromotedEpoch(t *testing.T) {
+	ctx := context.Background()
+	p := &probe{rec: true}
+	l, _, cfg := newLive(t, BootDecision{Role: RoleFollower, SelfID: "n2"}, p)
+	l.Refresh(ctx)
+	path := cfg.Paths().PromoteOK(config.SystemRef)
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, backup.FormatPromoteOK(4), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l.Refresh(ctx) // still a standby: promote.ok is written before pg_promote, and says nothing yet
+	if l.IsLeader() || l.Epoch() != 1 {
+		t.Fatalf("a standby: leader %v, epoch %d", l.IsLeader(), l.Epoch())
+	}
+	p.set(false, nil)
+	l.Refresh(ctx)
+	if !l.IsLeader() || l.Epoch() != 4 {
+		t.Fatalf("after the promotion: leader %v, epoch %d, want epoch 4", l.IsLeader(), l.Epoch())
+	}
+	if lead, ok := l.Leader(); !ok || lead.ID != "n2" {
+		t.Fatalf("leader %+v", lead)
+	}
+	// A promote.ok from an epoch the registry has passed changes nothing.
+	if err := os.WriteFile(path, backup.FormatPromoteOK(1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, _, mcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	mp := mcfg.Paths().PromoteOK(config.SystemRef)
+	_ = os.MkdirAll(filepath.Dir(mp), 0o750)
+	if err := os.WriteFile(mp, backup.FormatPromoteOK(1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.Refresh(ctx)
+	if m.Epoch() != 1 {
+		t.Fatalf("epoch %d", m.Epoch())
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -63,6 +64,10 @@ type Evidence struct {
 	Peers []PeerView
 	// Marker is the leader marker in the backup store; nil when none was written or the store did not answer.
 	Marker *backup.LeaderMarker
+	// Promoted is the epoch in this node's own promote.ok of the system cluster, which the failover
+	// procedure writes before it promotes the cluster: the node's own word that it was promoted for that
+	// epoch, from the one source that needs neither a peer nor the backup store. 0 when there is none.
+	Promoted int64
 }
 
 // Decide is the rule of 2.10.8 for a node that finds its system cluster to be a primary. It starts
@@ -73,7 +78,8 @@ type Evidence struct {
 // A source that names this node as leader at a higher epoch than the local record is a promotion that
 // the registry has not caught up with yet (the failover procedure wrote the marker and promoted the
 // cluster): the node leads at that epoch, and the claims of nodes that still name the old leader at the
-// old epoch are stale. A node that is a primary while the registry names another leader, and that no
+// old epoch are stale. The node's own promote.ok is such a source, so a promotion made while the backup
+// store could not be written still starts as the leader it was made for. A node that is a primary while the registry names another leader, and that no
 // source names, is a stale or accidental primary and does not start.
 func Decide(ev Evidence) BootDecision {
 	d := BootDecision{Role: RoleLeader, Joined: true, SelfID: ev.SelfID, Epoch: ev.Epoch, Leader: ev.SelfID}
@@ -96,6 +102,9 @@ func Decide(ev Evidence) BootDecision {
 	}
 	if m := ev.Marker; m != nil && m.Leader != "" {
 		claims = append(claims, claim{"the leader marker in the backup store", m.Epoch, m.Leader})
+	}
+	if ev.Promoted > 0 {
+		claims = append(claims, claim{"this node's promote.ok", ev.Promoted, ev.SelfID})
 	}
 	raised := ev.Epoch
 	for _, c := range claims {
@@ -312,6 +321,11 @@ func (e *BootEnv) gather(ctx context.Context, dsn string, creds *mesh.Credential
 		return Evidence{}, err
 	}
 	ev := Evidence{SelfID: creds.NodeID, Epoch: cl.Epoch, Leader: cl.Leader}
+	if b, err := os.ReadFile(e.Cfg.Paths().PromoteOK(config.SystemRef)); err == nil {
+		if n, err := backup.ParsePromoteOK(b); err == nil {
+			ev.Promoted = n
+		}
+	}
 	for _, n := range nodes {
 		if n.ID == creds.NodeID {
 			ev.Self = n
