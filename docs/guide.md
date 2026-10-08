@@ -103,15 +103,18 @@ Add an `[alerts]` section to `/etc/supavise/config.toml` to get a webhook or ema
 
 A second Supavise server gives a project a read replica, a place to move the project to, and a standby of the registry that can take over. Both servers need an S3-compatible backup bucket, because the second server reads its first copy from it: pass `--s3-bucket` at install (see the deploy guide's [flags](../deploy/README.md#flags)). A replica always lives on a server other than the project's own. On AWS, make the second server with `supavise-aws-deploy.sh replica` ([Add a replica server](../deploy/README.md#add-a-replica-server)).
 
-**Join a second server.** On the first server (the leader), create a one-time token. Save it in a file that only root can read on the new server, then install there with it:
+**Join a second server.** On the first server (the leader), create a one-time token and save it in a file. Copy the file to the new server as `/root/join-token` with mode 0600, and install there with it:
 
 ```bash
-sudo -u supavise supavise node token --region eu-west-1          # on the leader
-curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- --join-token-file /root/join-token   # on the new server
-sudo -u supavise supavise node ls                                 # on the leader: the new node is joining, then active
+# on the leader
+(umask 077; sudo -u supavise supavise node token --region eu-west-1 > join-token)
+# on the new server
+curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- --join-token-file /root/join-token
+# on the leader: the new node is joining, then active
+sudo -u supavise supavise node ls
 ```
 
-The servers talk over TCP port 7443, so open it between them. `--region` is the region that Studio shows for the new server's replicas.
+The servers talk over TCP port 7443, so open it between them. `--region` is the region that Studio shows for the new server's replicas. The token works once and expires after an hour.
 
 **Add a replica.** In Studio, open **Project Settings**, **Infrastructure**, then **Add read replica**, and pick the new server's region. The button needs a project of size Small or larger. The same from the leader's shell, and for every project at once:
 
@@ -131,7 +134,7 @@ sudo -u supavise supavise projects failover <ref> --dry-run     # on the leader:
 sudo -u supavise supavise failover --dry-run                    # on the server that should lead: the whole server
 ```
 
-A project move needs a replica of that project. A server move needs one for every project, and Storage on S3 (`sudo -u supavise supavise storage migrate --to s3`). When the old primary is alive the move stops it cleanly and it follows as a replica, so moving back is the same command on the other server. When it is dead, the survivor fences it first. On AWS, `[failover] fencing = "aws"` stops the old instance and takes its Elastic IP. Elsewhere, set `fence_command` or pass `--old-primary-is-down`, which states that the old server cannot write. A server that returns after a failover starts no database until `sudo supavise node rejoin` rebuilds it.
+A project move needs a replica of that project. A server move needs one for every project, and Storage on S3 (`supavise storage migrate --to s3`, in the deploy guide's [Storage on S3](../deploy/README.md#storage-on-s3)). When the old primary is alive the move stops it cleanly and it follows as a replica, so moving back is the same command on the other server. When it is dead, the survivor fences it first. On AWS, `[failover] fencing = "aws"` stops the old instance and takes its Elastic IP. Elsewhere, set `fence_command` or pass `--old-primary-is-down`, which states that the old server cannot write. A server that returns after a failover starts no database until `sudo supavise node rejoin` rebuilds it.
 
 By default every move is yours to start. `[failover] mode = "project"` or `"server"` lets the servers act on their own, on AWS only. The [reference](reference/replicas.md#failover) lists what a move does, the data a failure can cost and the failure matrix.
 
