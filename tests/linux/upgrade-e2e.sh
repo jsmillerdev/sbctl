@@ -653,7 +653,18 @@ UNIT
 systemctl daemon-reload
 start_unit() { # runs supavise-upgrade.service to its end; UNIT_RC is the exit status of systemctl start
   UNIT_RC=0
-  timeout 3000 systemctl start supavise-upgrade.service || UNIT_RC=$?
+  timeout 3000 systemctl start supavise-upgrade.service 2>"$WORK/start-unit.err" || UNIT_RC=$?
+  cat "$WORK/start-unit.err" >&2
+  # systemctl can lose its connection to systemd while it waits for the job ("D-Bus connection
+  # terminated", "Connection reset by peer"); the job goes on. The unit's own result decides then.
+  if [[ $UNIT_RC -ne 0 ]] && grep -q -e "D-Bus connection terminated" -e "Connection reset by peer" "$WORK/start-unit.err"; then
+    local i
+    for i in $(seq 1 600); do
+      [[ $(systemctl show -p ActiveState --value supavise-upgrade.service) == activating ]] || break
+      sleep 5
+    done
+    if [[ $(systemctl show -p ActiveState --value supavise-upgrade.service) == inactive && $(systemctl show -p Result --value supavise-upgrade.service) == success ]]; then UNIT_RC=0; fi
+  fi
 }
 unit_journal() { journalctl --no-pager -u supavise-upgrade.service --since "$1"; }
 journal_has() { # SINCE TEXT: the unit's journal since SINCE mentions TEXT (a file, not a pipe: grep -q would end a pipe early)
