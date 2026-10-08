@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // guardEnv is a relay with the replica guard on: the node's role per ref and the cluster epoch
@@ -22,6 +24,7 @@ type guardEnv struct {
 	roleErr  error
 	epochErr error
 	refused  []string
+	clock    time.Time
 }
 
 func newGuardEnv(t *testing.T, refs ...string) *guardEnv {
@@ -32,7 +35,7 @@ func newGuardEnv(t *testing.T, refs ...string) *guardEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	g := &guardEnv{replicas: map[string]bool{}, epoch: 3}
+	g := &guardEnv{replicas: map[string]bool{}, epoch: 3, clock: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)}
 	g.relayEnv = &relayEnv{testEnv: e, dir: dir, log: &bytes.Buffer{}}
 	g.relay = NewRelay(RelayOptions{
 		Config:  e.cfg,
@@ -56,6 +59,11 @@ func newGuardEnv(t *testing.T, refs ...string) *guardEnv {
 		},
 		Log: slog.New(slog.NewTextHandler(g.log, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
+	g.relay.now = func() time.Time {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.clock
+	}
 	t.Cleanup(g.relay.Close)
 	g.relay.Reconcile()
 	return g
@@ -103,12 +111,15 @@ func TestRelayRefusesPushOfAReplicaUntilPromoteOK(t *testing.T) {
 	if err := RelayPush(ctx, g.sock(testRef), testRef, other); !errors.Is(err, ErrWALConflict) {
 		t.Fatalf("conflicting push by a promoted replica = %v; want ErrWALConflict", err)
 	}
-	// Demoted again (the registry says replica and promote.ok is gone): refused again.
-	if err := os.Remove(g.cfg.Paths().PromoteOK(testRef)); err != nil {
+	// Demoted again in place: ConfigureStandby deletes promote.ok, and the push is refused again.
+	if err := g.svc.ConfigureStandby(ReplicaSeedPlan{Ref: testRef, DataDir: fakeDataDir(t)}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(g.cfg.Paths().PromoteOK(testRef)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("promote.ok after ConfigureStandby: %v", err)
+	}
 	if err := RelayPush(ctx, g.sock(testRef), testRef, small); !errors.Is(err, ErrPushRefused) {
-		t.Fatalf("push after promote.ok was removed = %v; want ErrPushRefused", err)
+		t.Fatalf("push after the demotion = %v; want ErrPushRefused", err)
 	}
 }
 
@@ -200,22 +211,43 @@ func TestRelayGuardReportsRefusalsOncePerMinute(t *testing.T) {
 	g := newGuardEnv(t, testRef)
 	g.set(func() { g.replicas[testRef] = true })
 	p := writeWAL(t, walA, 1<<10, 1)
-	for range 5 {
+	push := func() {
+		t.Helper()
 		if err := RelayPush(context.Background(), g.sock(testRef), testRef, p); !errors.Is(err, ErrPushRefused) {
 			t.Fatal(err)
 		}
 	}
-	g.mu.Lock()
-	n, first := len(g.refused), ""
-	if n > 0 {
-		first = g.refused[0]
+	heard := func() (n int, first string) {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if len(g.refused) > 0 {
+			first = g.refused[0]
+		}
+		return len(g.refused), first
 	}
-	g.mu.Unlock()
-	if n != 1 || !strings.HasPrefix(first, testRef+": ") || !strings.Contains(first, "promote.ok") {
+	for range 5 {
+		push()
+	}
+	if n, first := heard(); n != 1 || !strings.HasPrefix(first, testRef+": ") || !strings.Contains(first, "promote.ok") {
 		t.Fatalf("Refused heard %d times: %q", n, first)
 	}
 	if c := strings.Count(g.log.String(), "push refused for a replica"); c != 1 {
 		t.Fatalf("log has %d refusal lines:\n%s", c, g.log.String())
+	}
+	// Still inside the minute: nothing new. Past it: the next refusal is reported again.
+	g.set(func() { g.clock = g.clock.Add(59 * time.Second) })
+	push()
+	if n, _ := heard(); n != 1 {
+		t.Fatalf("Refused heard %d times after 59 seconds", n)
+	}
+	g.set(func() { g.clock = g.clock.Add(2 * time.Second) })
+	push()
+	push()
+	if n, _ := heard(); n != 2 {
+		t.Fatalf("Refused heard %d times after a minute; want 2", n)
+	}
+	if c := strings.Count(g.log.String(), "push refused for a replica"); c != 2 {
+		t.Fatalf("log has %d refusal lines after a minute:\n%s", c, g.log.String())
 	}
 }
 
@@ -232,5 +264,19 @@ func TestRelayPromoteOKDefaultsToThePathsOfTheConfig(t *testing.T) {
 	r := NewRelay(RelayOptions{Config: e.cfg})
 	if got, want := r.opt.PromoteOK(testRef), e.cfg.Paths().PromoteOK(testRef); got != want || !strings.HasSuffix(got, "/projects/"+testRef+"/promote.ok") {
 		t.Fatalf("PromoteOK = %q, want %q", got, want)
+	}
+}
+
+// A relay that was given a role check and no way to find promote.ok has nothing to authorize a
+// replica with: it refuses, and does not panic.
+func TestRelayGuardWithoutPromoteOKPathRefuses(t *testing.T) {
+	r := NewRelay(RelayOptions{Replica: func(context.Context, string) (bool, error) { return true, nil }})
+	code, err := r.pushGuard(context.Background(), testRef)
+	if err == nil || code != http.StatusPreconditionFailed {
+		t.Fatalf("pushGuard = %d, %v; want a 412", code, err)
+	}
+	r = NewRelay(RelayOptions{Replica: func(context.Context, string) (bool, error) { return false, nil }})
+	if code, err := r.pushGuard(context.Background(), testRef); err != nil || code != 0 {
+		t.Fatalf("pushGuard of a primary = %d, %v", code, err)
 	}
 }

@@ -96,12 +96,15 @@ type RelayOptions struct {
 	// follower reads its replicated copy). The relay refuses to push the WAL of a replica unless
 	// promote.ok holds the current epoch; it fetches for one as for any other project. An error
 	// answers the push with 503, which Postgres retries. Nil: no cluster here is a replica, and
-	// the guard is off.
+	// the guard is off. It is called on every push of every project, the system project's
+	// included, so it must answer from state that exists before the registry opens, or tolerate a
+	// registry that is not open yet.
 	Replica func(ctx context.Context, ref string) (bool, error)
 	// Epoch returns the epoch of the cluster. A promote.ok that holds a lower one is stale and
 	// does not authorize a push. Nil: any well-formed promote.ok does.
 	Epoch func(ctx context.Context) (int64, error)
-	// PromoteOK returns the path of ref's promote.ok. Default: config.Paths.PromoteOK.
+	// PromoteOK returns the path of ref's promote.ok. Default: config.Paths.PromoteOK. Without it
+	// (and without Config) a replica has no way to be promoted, and every push of one is refused.
 	PromoteOK func(ref string) string
 	// Refused is called when the guard refuses a push, at most once a minute per project, so the
 	// daemon can raise an alert.
@@ -118,6 +121,7 @@ type Relay struct {
 
 	pushAllowance time.Duration // relayPushAllowance; tests shorten it
 	pushMinRate   int64         // relayPushMinRate
+	now           func() time.Time
 
 	// A relay never replaces a socket that answers: the daemon and a CLI relay (which serves
 	// while the daemon is down) can run at once, and the one that listens first keeps the
@@ -165,7 +169,7 @@ func NewRelay(o RelayOptions) *Relay {
 	if o.PromoteOK == nil && o.Config != nil {
 		o.PromoteOK = o.Config.Paths().PromoteOK
 	}
-	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), pushAllowance: relayPushAllowance, pushMinRate: relayPushMinRate, ls: map[string]*relayListener{}, pinned: map[string]bool{}, refMu: map[string]*sync.Mutex{}, refused: map[string]time.Time{}}
+	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), pushAllowance: relayPushAllowance, pushMinRate: relayPushMinRate, now: time.Now, ls: map[string]*relayListener{}, pinned: map[string]bool{}, refMu: map[string]*sync.Mutex{}, refused: map[string]time.Time{}}
 }
 
 // projectsWithWALDir lists the refs that have a WAL directory under projects/.
@@ -520,6 +524,9 @@ func (r *Relay) pushGuard(ctx context.Context, ref string) (int, error) {
 		r.reportRefused(ref, err)
 		return http.StatusPreconditionFailed, err
 	}
+	if r.opt.PromoteOK == nil {
+		return refuse("this node holds a replica of %s and the relay has no promote.ok path to check", ref)
+	}
 	b, err := os.ReadFile(r.opt.PromoteOK(ref))
 	if errors.Is(err, fs.ErrNotExist) {
 		return refuse("this node holds a replica of %s, which archives WAL only after its promotion (no promote.ok)", ref)
@@ -548,9 +555,10 @@ func (r *Relay) pushGuard(ctx context.Context, ref string) (int, error) {
 func (r *Relay) reportRefused(ref string, reason error) {
 	r.mu.Lock()
 	last := r.refused[ref]
-	quiet := time.Since(last) < time.Minute
+	now := r.now()
+	quiet := now.Sub(last) < time.Minute
 	if !quiet {
-		r.refused[ref] = time.Now()
+		r.refused[ref] = now
 	}
 	r.mu.Unlock()
 	if quiet {
