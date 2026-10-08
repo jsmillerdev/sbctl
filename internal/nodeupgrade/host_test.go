@@ -40,6 +40,15 @@ func TestPlanHostLayer(t *testing.T) {
 		}
 	}
 
+	// With a new binary the notes say that a project whose files it renders differently restarts, so
+	// the plan does not also promise that none does.
+	p.Upgrade, p.Pending, p.BinaryChange = nil, nil, true
+	out.Reset()
+	p.Render(&out)
+	if strings.Contains(out.String(), "Projects restarted: none expected") {
+		t.Errorf("a plan with a swap promises that no project restarts:\n%s", out.String())
+	}
+
 	// A node at the release's revision, or one whose marker could not be read, claims no host work.
 	n.ConvergeRevision = 2
 	if p := BuildPlan(n, newInfoWithHost(), PlanOptions{}); p.HostPending {
@@ -206,6 +215,8 @@ func TestHostLayerWithoutASwap(t *testing.T) {
 	}
 	mustContain(t, h.out.String(), "converging the host (revision 0 -> 2)")
 	mustContain(t, h.out.String(), "Host (converge revision 0 -> 2")
+	// The daemon read the host's state before the converge, so the run says it has to restart.
+	mustContain(t, h.out.String(), "sudo systemctl restart supavise.service")
 
 	// A failure of it fails the upgrade: nothing was moved, the node is as healthy as before (exit 3).
 	h = newFakeHost()

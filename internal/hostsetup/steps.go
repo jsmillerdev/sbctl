@@ -21,7 +21,7 @@ import (
 const (
 	titleUnits       = "Install the systemd units and the polkit rule"
 	titleDirectories = "Create the cluster and config.d directories in /etc/supavise"
-	titleMounts      = "Make the units wait for the data and config mounts"
+	titleMounts      = "Make the units wait for the data and config directories when they are mounts"
 	titleUFW         = "Open the mesh port in ufw when ufw is active"
 	titleConfigD     = "Refresh the cluster settings in config.d from the leader"
 )

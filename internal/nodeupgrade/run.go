@@ -418,6 +418,7 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 		}
 	}
 
+	lateConverge := false
 	if plan.HostPending && !plan.BinaryChange {
 		// A swap converges the host as part of installing the binary; without one, the installed
 		// binary does it here.
@@ -427,6 +428,7 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 			if err := hc.Converge(ctx); err != nil {
 				return r.rollback(ctx, prev, nil, fmt.Errorf("converging the host failed: %w", err))
 			}
+			lateConverge = true
 		}
 	}
 
@@ -468,6 +470,10 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	r.mark(PhaseDone, "")
 	log.Info("upgrade_succeeded", "from", node.Version, "to", plan.To, "projects", len(projectMoves))
 	o.say("Supavise %s is running; %d project(s) upgraded", plan.To, len(projectMoves))
+	if lateConverge {
+		// The daemon reads the state of the host when it starts; this one started before the converge.
+		o.say("The daemon started before the host was converged and reads that state only at its start: run `sudo systemctl restart supavise.service` when it suits you (no project restarts).")
+	}
 	o.notify(ctx, Event{Kind: EventSucceeded, From: node.Version, To: plan.To, Projects: len(projectMoves)})
 	return nil
 }

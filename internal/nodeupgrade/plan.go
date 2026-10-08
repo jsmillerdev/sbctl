@@ -352,7 +352,9 @@ func (p *Plan) Render(w io.Writer) {
 		if len(p.NewMigrations) > 0 {
 			fmt.Fprintf(w, "Registry migrations (forward only): %s\n", strings.Join(p.NewMigrations, ", "))
 		}
-		if len(p.Upgrade) == 0 && len(p.Pending) == 0 {
+		// A new binary can render a project's files differently, and the notes below say so; the line
+		// is for a run whose only work is the host and the registry.
+		if len(p.Upgrade) == 0 && len(p.Pending) == 0 && !p.BinaryChange {
 			fmt.Fprintln(w, "Projects restarted: none expected")
 		}
 	}
