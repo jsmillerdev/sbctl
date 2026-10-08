@@ -399,7 +399,7 @@ func TestRestartReplica(t *testing.T) {
 		t.Fatalf("unknown replica: %d %s", rec.Code, rec.Body)
 	}
 
-	for _, body := range []any{nil, map[string]any{}, map[string]any{"database_identifier": testRef}, "not json"} {
+	for _, body := range []any{nil, map[string]any{}, map[string]any{"database_identifier": testRef}} {
 		rf.mgr.paused, rf.mgr.resumed = nil, nil
 		if rec := rf.do("POST", path, body); rec.Code != 201 {
 			t.Fatalf("restart project with %v: %d %s", body, rec.Code, rec.Body)
@@ -410,6 +410,23 @@ func TestRestartReplica(t *testing.T) {
 	}
 	if len(rf.svc.restarts) != 1 {
 		t.Fatalf("replica restarts = %v", rf.svc.restarts)
+	}
+
+	// A body that is not JSON restarts nothing where replicas are managed: a client that meant a
+	// replica must not take the primary down by sending it badly.
+	rf.mgr.paused, rf.mgr.resumed = nil, nil
+	for _, body := range []any{"not json", `{"database_identifier":`} {
+		if rec := rf.do("POST", path, body); rec.Code != 400 {
+			t.Fatalf("restart with %v: %d %s", body, rec.Code, rec.Body)
+		}
+	}
+	if len(rf.mgr.paused) != 0 || len(rf.svc.restarts) != 1 {
+		t.Fatalf("a bad body restarted something: paused %v, replica restarts %v", rf.mgr.paused, rf.svc.restarts)
+	}
+	// A node without a controller never read the body.
+	rf.srv.replicas = nil
+	if rec := rf.do("POST", path, "not json"); rec.Code != 201 || len(rf.mgr.paused) != 1 {
+		t.Fatalf("restart without a controller: %d %s, paused %v", rec.Code, rec.Body, rf.mgr.paused)
 	}
 }
 

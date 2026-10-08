@@ -374,18 +374,18 @@ func (s *Server) restoreProject(status int) handlerFunc {
 	}
 }
 
-// restartProject pauses and resumes: there is no in-place restart in Manager. Both
-// calls run as one detached unit, so a client that leaves between them cannot strand the
-// project paused.
 // platformRestart restarts the project, or, when the body names a database_identifier that is one
 // of the project's read replicas, that replica alone (Studio's Restart replica). The identifier
-// of the primary, or none, restarts the project, which restarts the primary only. The body was
-// never read before and still is not required to parse: a malformed one restarts the project.
+// of the primary, or none, restarts the project, which restarts the primary only. A node without a
+// replica controller never read the body and still does not; with one, a body that is not JSON is
+// a 400, so a client that meant a replica cannot restart the project by sending it badly.
 func (s *Server) platformRestart(w http.ResponseWriter, r *http.Request) error {
 	var in struct {
 		Identifier string `json:"database_identifier"`
 	}
-	_ = decode(r, &in)
+	if err := decode(r, &in); err != nil && s.replicas != nil {
+		return err
+	}
 	if in.Identifier != "" && in.Identifier != r.PathValue("ref") {
 		p, err := s.loadProject(r.Context(), r.PathValue("ref"))
 		if err != nil {
@@ -396,6 +396,9 @@ func (s *Server) platformRestart(w http.ResponseWriter, r *http.Request) error {
 	return s.restartProject(http.StatusCreated)(w, r)
 }
 
+// restartProject pauses and resumes: there is no in-place restart in Manager. Both
+// calls run as one detached unit, so a client that leaves between them cannot strand the
+// project paused.
 func (s *Server) restartProject(status int) handlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		p, err := s.loadProject(r.Context(), r.PathValue("ref"))
