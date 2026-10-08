@@ -88,6 +88,15 @@ func TestAWSCredentialsPresent(t *testing.T) {
 	}
 }
 
+func TestAWSStandalone(t *testing.T) {
+	if c := awsStandalone("supavise", "eu-west-1", []string{"Failover=on"}); c != "supavise-aws-deploy.sh update --stack supavise --region eu-west-1 --set Failover=on" {
+		t.Errorf("standalone = %q", c)
+	}
+	if c := awsStandalone("s", "", []string{"X=a b"}); c != "supavise-aws-deploy.sh update --stack s --region REGION --set 'X=a b'" {
+		t.Errorf("standalone = %q", c)
+	}
+}
+
 func TestAWSCommandAndArgs(t *testing.T) {
 	got := awsUpdateArgs("supavise", "/tmp/x/supavise.yaml", []string{"Failover=on", "PeerCidr1=203.0.113.7/32"})
 	want := "update --stack supavise --template /tmp/x/supavise.yaml --params-from-stack --set Failover=on --set PeerCidr1=203.0.113.7/32"
@@ -165,7 +174,7 @@ type awsRelease struct {
 func newAWSRelease(t *testing.T) *awsRelease {
 	t.Helper()
 	r := &awsRelease{record: filepath.Join(t.TempDir(), "args")}
-	script := []byte("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >\"$RECORD\"\ncat \"${5:-/dev/null}\" >>\"$RECORD\"\nexit \"${EXIT_CODE:-0}\"\n")
+	script := []byte("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >\"$RECORD\"\nprintf 'pubkey=%s base=%s imds=%s\\n' \"${SUPAVISE_DEPLOY_PUBKEY_B64-unset}\" \"${SUPAVISE_DEPLOY_BASE_URL-unset}\" \"${SUPAVISE_IMDS_ENDPOINT-unset}\" >\"$RECORD.seen\"\ncat \"${5:-/dev/null}\" >>\"$RECORD\"\nexit \"${EXIT_CODE:-0}\"\n")
 	tmpl := []byte("AWSTemplateFormatVersion: 2010-09-09\n")
 	r.files = map[string][]byte{selfupdate.AWSDeployAsset: script, "supavise.yaml": tmpl}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -331,6 +340,36 @@ var (
 	_ nodeupgrade.HostConverger = (*nodeHost)(nil)
 )
 
+// The variables that replace what the script trusts (the release key, the download address, the
+// metadata service) do not reach it from the environment the operator's `sudo -E` passes on.
+func TestUpdateStackKeepsTheScriptsTestHooksOutOfTheEnvironment(t *testing.T) {
+	rel := newAWSRelease(t)
+	h, _, _ := awsHost(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAOPERATOR")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	t.Setenv("EXIT_CODE", "0")
+	t.Setenv("SUPAVISE_DEPLOY_PUBKEY_B64", "bm90LXRoZS1yZWxlYXNlLWtleQ==")
+	t.Setenv("SUPAVISE_DEPLOY_BASE_URL", "https://evil.example/releases")
+	t.Setenv("SUPAVISE_IMDS_ENDPOINT", "http://127.0.0.1:1")
+	if _, err := h.UpdateStack(context.Background(), rel.cand, nodeupgrade.StackOptions{Name: "supavise"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(rel.record + ".seen")
+	if err != nil || strings.TrimSpace(string(got)) != "pubkey=unset base=unset imds=unset" {
+		t.Errorf("the script saw %q (%v)", got, err)
+	}
+	if os.Getenv("SUPAVISE_DEPLOY_BASE_URL") == "" {
+		t.Error("the process's own environment was changed")
+	}
+}
+
+func TestWithoutEnv(t *testing.T) {
+	got := withoutEnv([]string{"A=1", "AB=2", "B=3", "A_=4"}, "A", "B")
+	if strings.Join(got, ",") != "AB=2,A_=4" {
+		t.Errorf("withoutEnv = %v (a name matches whole, not as a prefix)", got)
+	}
+}
+
 func TestUpdateStackMapsTheScriptsExitStatus(t *testing.T) {
 	rel := newAWSRelease(t)
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAOPERATOR")
@@ -361,6 +400,11 @@ func TestUpdateStackWithoutCredentialsPrintsTheCommand(t *testing.T) {
 	out, err := h.UpdateStack(context.Background(), rel.cand, nodeupgrade.StackOptions{Name: "supavise-b", Sets: []string{"PeerCidr1=203.0.113.7/32"}})
 	if err != nil || out.Command != "sudo -E supavise upgrade --aws --stack-name supavise-b --set PeerCidr1=203.0.113.7/32" {
 		t.Fatalf("%+v, %v", out, err)
+	}
+	// The signed script runs the same update from a shell that is not the node; the node's region is
+	// named when the metadata service says it (not here), else the script's own argument is a placeholder.
+	if out.Standalone != "supavise-aws-deploy.sh update --stack supavise-b --region REGION --set PeerCidr1=203.0.113.7/32" {
+		t.Errorf("standalone = %q", out.Standalone)
 	}
 	if _, err := os.Stat(rel.record); err == nil {
 		t.Error("the script ran without credentials")

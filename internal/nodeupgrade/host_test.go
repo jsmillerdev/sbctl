@@ -40,6 +40,24 @@ func TestPlanHostLayer(t *testing.T) {
 		}
 	}
 
+	// A plan whose only work is the host layer says that converge does it without the backups.
+	same := testNode()
+	same.Version, same.Pins, same.ConvergeKnown, same.ConvergeRevision = "v1.1.0", newPins(), true, 0
+	for i := range same.Projects {
+		if same.Projects[i].Ref != "system" {
+			same.Projects[i].Versions = map[string]string{"gotrue": authNew, "postgrest": restNew, "postgres": pgOld}
+		}
+	}
+	hostInfo := newInfoWithHost()
+	hostInfo.Version = "v1.1.0"
+	only := BuildPlan(same, hostInfo, PlanOptions{})
+	if only.BinaryChange || !only.HostPending || !strings.Contains(strings.Join(only.Notes, "\n"), "`sudo supavise system converge` does it alone") {
+		t.Errorf("a host-only plan: binary change %v, host pending %v, notes %q", only.BinaryChange, only.HostPending, only.Notes)
+	}
+	if strings.Contains(strings.Join(p.Notes, "\n"), "does it alone") {
+		t.Errorf("a plan with a swap offers converge alone: %q", p.Notes)
+	}
+
 	// With a new binary the notes say that a project whose files it renders differently restarts, so
 	// the plan does not also promise that none does.
 	p.Upgrade, p.Pending, p.BinaryChange = nil, nil, true

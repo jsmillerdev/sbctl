@@ -134,3 +134,26 @@ func TestAssociateAddressRetryWithReassociationNeedsNoCheck(t *testing.T) {
 		t.Errorf("order %v", got)
 	}
 }
+
+// The mirror of the lost answer: the first send released the Elastic IP, the second meets
+// InvalidAssociationID.NotFound, and the call succeeds because the association is gone. A first
+// send that meets it is an error.
+func TestDisassociateAddressRetryAfterALostAnswerSucceeds(t *testing.T) {
+	fake := associateFake(t, false)
+	assoc, err := fake.Client().EC2.AssociateAddress(ctx, awsapi.AssociateAddressInput{AllocationID: "eipalloc-svc", InstanceID: "i-0self"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.Inject("ec2", "DisassociateAddress", onceThenLost)
+	if err := fake.Client().EC2.DisassociateAddress(ctx, awsapi.DisassociateAddressInput{AssociationID: assoc}); err != nil {
+		t.Errorf("a repeated send after a lost answer: %v", err)
+	}
+	if a := fake.AddressOf("eipalloc-svc"); a.InstanceID != "" || a.AssociationID != "" {
+		t.Errorf("the address is still associated: %+v", a)
+	}
+
+	err = fake.Client().EC2.DisassociateAddress(ctx, awsapi.DisassociateAddressInput{AssociationID: assoc})
+	if !awsapi.IsNotFound(err) {
+		t.Errorf("a first send for an association that is gone: %v", err)
+	}
+}

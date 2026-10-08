@@ -353,10 +353,18 @@ type DisassociateAddressInput struct {
 }
 
 // DisassociateAddress releases an Elastic IP from what it is associated with. It stays allocated.
+//
+// A send that reached EC2 but lost its answer is sent again and meets InvalidAssociationID.NotFound
+// for its own work. After a send that was repeated that error is success: the association is gone,
+// which is what the call asked for. A first send that already meets it still fails.
 func (e *EC2) DisassociateAddress(ctx context.Context, in DisassociateAddressInput) error {
 	p := params{}
 	p.set("AssociationId", in.AssociationID)
-	return e.call(ctx, "DisassociateAddress", p, in.DryRun, nil)
+	sent, err := e.send(ctx, "DisassociateAddress", p, in.DryRun, nil)
+	if err != nil && sent > 1 && !in.DryRun && IsCode(err, "InvalidAssociationID.NotFound") {
+		return nil
+	}
+	return err
 }
 
 // Address is an Elastic IP. The association fields are empty while it is not associated.

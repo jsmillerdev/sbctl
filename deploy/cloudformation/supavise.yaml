@@ -393,6 +393,7 @@ Conditions:
   HasPeerCidr2: !Not [!Equals [!Ref PeerCidr2, ""]]
   HasPeerCidr3: !Not [!Equals [!Ref PeerCidr3, ""]]
   HasAnyPeerCidr: !Or [!Condition HasPeerCidr1, !Condition HasPeerCidr2, !Condition HasPeerCidr3]
+  UsesCluster: !Or [!Condition IsJoiner, !Condition HasAnyPeerCidr]
 
 Resources:
   # ---- network (only when no existing VPC is given) ------------------------------------
@@ -824,6 +825,22 @@ Resources:
           - Effect: Allow
             Action: "secretsmanager:GetSecretValue"
             Resource: !Sub "${JoinTokenSecretArn}"
+  # A server of a cluster finds a peer again by its instance id when the peer's address changes (the
+  # address resolver of the mesh asks EC2), with or without automatic failover. The one call takes no
+  # resource and reads; FencingPolicy repeats it for Failover=on. Off on a single server.
+  ClusterDescribePolicy:
+    Type: AWS::IAM::Policy
+    Condition: UsesCluster
+    Properties:
+      PolicyName: cluster-describe
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Describe
+            Effect: Allow
+            Action: "ec2:DescribeInstances"
+            Resource: "*"
   # Automatic failover: stop a peer, move the service address. Only for resources that carry this
   # cluster's tag, so a compromised node cannot touch anything else in the account. The describe
   # calls accept no resource. Off unless Failover is "on".

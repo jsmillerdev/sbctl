@@ -5,6 +5,8 @@
 #   deploy.sh --region us-east-1 --email you@example.com
 #   deploy.sh --region us-east-1 --email you@example.com --domain example.com --hosted-zone-id Z0123456789ABCDEFGHIJ
 #   deploy.sh --region us-east-1 --stack-name supavise --delete
+#   deploy.sh --region us-east-1 --stack-name supavise --delete --purge
+#   deploy.sh purge   --region us-east-1 --stack-name supavise
 #   deploy.sh update  --stack supavise [--set Failover=on] [--set PeerCidr1=203.0.113.4/32]
 #   deploy.sh status  --stack supavise
 #   deploy.sh replica --leader-stack supavise --region eu-west-1 --az eu-west-1b --token-file token.txt
@@ -38,7 +40,8 @@ INLINE_LIMIT=51200
 usage() {
   cat <<USAGE
 Usage: $SELF --region REGION --email ADDRESS [options]
-       $SELF --region REGION --stack-name NAME --delete [--yes]
+       $SELF --region REGION --stack-name NAME --delete [--purge] [--yes]
+       $SELF purge   --region REGION --stack-name NAME [--yes]
        $SELF update  --stack NAME [options]
        $SELF status  --stack NAME [options]
        $SELF replica --leader-stack NAME --region REGION --az ZONE --token-file FILE [options]
@@ -74,7 +77,11 @@ Options:
   --delete                 stop the instance, then delete the stack (the backup and objects
                            buckets, a final snapshot of the data volume and any daily snapshots
                            stay in your account); asks for confirmation
-  --yes                    with --delete, update or replica: do not ask
+  --purge                  with --delete: also destroy what the stack leaves in your account, the
+                           backup and objects buckets (every object version) and the snapshots of
+                           the data volume. One confirmation lists all of it; nothing is left to
+                           clean by hand, and none of it can be brought back
+  --yes                    with --delete, purge, update or replica: do not ask
   -h, --help
 
 update: brings the stack of a node forward to the template of this release. It shows a change
@@ -99,8 +106,16 @@ opens the leader's security group to it.
   --token-file FILE        the join token that "supavise node token" printed on the leader
   --vpc-id ID, --subnet-id ID   an existing network for the new server (both, in --region)
 
-Exit status of update, status and replica: 0 done or nothing to do, 2 refused (arguments, a
-change that is not allowed, a signature that does not verify), 3 failed.
+purge: destroys what an already deleted stack left in your account, for a stack that was deleted
+without --purge. It finds only what carries that stack's own marks (buckets tagged by CloudFormation
+with the stack's name and id, snapshots tagged with the stack's id and the other snapshots of the
+volumes those came from), lists them, and asks you to type the stack name. It refuses while the
+stack exists. Only the AWS CLI is needed.
+  --region REGION          the stack's region
+  --stack-name NAME        the deleted stack
+
+Exit status of update, status, replica and purge: 0 done or nothing to do, 2 refused (arguments, a
+change that is not allowed, a signature that does not verify, a stack that still exists), 3 failed.
 USAGE
 }
 
@@ -138,13 +153,13 @@ mkwork() { if [[ -z $WORK ]]; then WORK=$(mktemp -d); CLEANUP=$WORK; fi; }
 # ---- arguments -----------------------------------------------------------------------------
 MODE=create
 case ${1:-} in
-  update | status | replica | __classify | __params) MODE=$1; shift ;;
+  update | status | replica | purge | __classify | __params) MODE=$1; shift ;;
 esac
 
 REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
 EMAIL="" DOMAIN="" ZONE="" ITYPE="" STACK=$NAME VOLSIZE="" SNAPS="" VERSION="" ACCESS="" SSH="" KEY=""
-SSM="" AMI="" SNAP="" TEMPLATE="" PROFILE="" DRY=0 DELETE=0 YES=0
-STACK_GIVEN="" TBUCKET="" ALLOW_RISKY=0 SETS=() LEADER_STACK="" LEADER_REGION="" AZ="" TOKEN_FILE="" VPC="" SUBNET=""
+SSM="" AMI="" SNAP="" TEMPLATE="" PROFILE="" DRY=0 DELETE=0 PURGE=0 YES=0
+REGION_GIVEN="" STACK_GIVEN="" TBUCKET="" ALLOW_RISKY=0 SETS=() LEADER_STACK="" LEADER_REGION="" AZ="" TOKEN_FILE="" VPC="" SUBNET=""
 REST=()
 
 # An option takes its value from "--opt=value" or from the next argument.
@@ -165,7 +180,7 @@ while [[ $# -gt 0 ]]; do
     has_val=1
   fi
   case $opt in
-    --region) need "$@"; REGION=$val ;;
+    --region) need "$@"; REGION=$val; REGION_GIVEN=1 ;;
     --email) need "$@"; EMAIL=$val ;;
     --domain) need "$@"; DOMAIN=$val ;;
     --hosted-zone-id) need "$@"; ZONE=$val ;;
@@ -194,6 +209,7 @@ while [[ $# -gt 0 ]]; do
     --params-from-stack) ;;
     --dry-run) DRY=1 ;;
     --delete) DELETE=1 ;;
+    --purge) PURGE=1 ;;
     --yes | -y) YES=1 ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
@@ -417,6 +433,7 @@ re_az='^[a-z]{2}(-[a-z]+)+-[0-9][a-z]$'
 re_vpc='^vpc-[0-9a-f]{8,17}$'
 re_subnet='^subnet-[0-9a-f]{8,17}$'
 re_bucket='^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+re_allf='^vol-f+$'
 
 [[ -n $REGION || $MODE == update || $MODE == status ]] || die "--region is required (or set AWS_REGION)"
 [[ -z $REGION ]] || [[ $REGION =~ $re_region ]] || die "--region $REGION is not a region name such as us-east-1"
@@ -454,21 +471,24 @@ case $MODE in
   create)
     if [[ $DELETE -eq 1 ]]; then
       [[ -z $EMAIL$DOMAIN$ZONE$ITYPE$VOLSIZE$SNAPS$VERSION$ACCESS$SSH$KEY$SSM$AMI$SNAP$TEMPLATE ]] \
-        || die "--delete takes only --region, --stack-name, --profile, --yes and --dry-run"
+        || die "--delete takes only --region, --stack-name, --profile, --purge, --yes and --dry-run"
     else
+      [[ $PURGE -eq 0 ]] || die "--purge belongs to --delete (or use: $SELF purge --region REGION --stack-name NAME for a stack that is already deleted)"
       [[ $YES -eq 0 ]] || die "--yes belongs to --delete"
       validate_create_options
     fi ;;
   update)
     [[ $DELETE -eq 0 ]] || die "update does not take --delete"
+    [[ $PURGE -eq 0 ]] || die "update does not take --purge"
     [[ -z $EMAIL$DOMAIN$ZONE$ITYPE$VOLSIZE$SNAPS$ACCESS$SSH$KEY$SSM$AMI$SNAP$LEADER_STACK$LEADER_REGION$AZ$TOKEN_FILE$VPC$SUBNET ]] \
       || die "update changes nothing but what --set names (use --set NAME=VALUE for a parameter)"
     [[ -z $VERSION || $VERSION =~ $re_version ]] || die "--version must be latest or a release tag such as v1.2.3" ;;
   status)
-    [[ $DELETE -eq 0 && $ALLOW_RISKY -eq 0 && ${#SETS[@]} -eq 0 ]] || die "status takes only --stack, --region, --profile and --template"
+    [[ $DELETE -eq 0 && $PURGE -eq 0 && $ALLOW_RISKY -eq 0 && ${#SETS[@]} -eq 0 ]] || die "status takes only --stack, --region, --profile and --template"
     [[ -z $VERSION || $VERSION =~ $re_version ]] || die "--version must be latest or a release tag such as v1.2.3" ;;
   replica)
     [[ $DELETE -eq 0 ]] || die "replica does not take --delete"
+    [[ $PURGE -eq 0 ]] || die "replica does not take --purge"
     [[ ${#SETS[@]} -eq 0 ]] || die "replica takes no --set"
     [[ -n $LEADER_STACK ]] || die "--leader-stack is required"
     [[ $LEADER_STACK =~ $re_stack ]] || die "--leader-stack must start with a letter and hold only letters, digits and hyphens"
@@ -493,6 +513,11 @@ case $MODE in
     [[ -z $AMI || $AMI =~ $re_ami ]] || die "--ami-id must look like ami-0123456789abcdef0"
     [[ -z $VOLSIZE ]] || { [[ $VOLSIZE =~ ^[0-9]+$ ]] && [[ $VOLSIZE -ge 20 && $VOLSIZE -le 16384 ]]; } || die "--volume-size must be a whole number of GiB from 20 to 16384"
     [[ -z $DOMAIN$ZONE$SNAP ]] || die "a replica server takes its domain from the leader: --domain, --hosted-zone-id and --data-snapshot-id are not for it" ;;
+  purge)
+    [[ $DELETE -eq 0 ]] || die "purge does not take --delete: it is for a stack that is already deleted ($SELF --delete --purge deletes a stack that exists and purges it)"
+    [[ -n $STACK_GIVEN ]] || die "purge needs --stack-name: it destroys data, so the stack is never guessed"
+    [[ -z $EMAIL$DOMAIN$ZONE$ITYPE$VOLSIZE$SNAPS$VERSION$ACCESS$SSH$KEY$SSM$AMI$SNAP$TEMPLATE$LEADER_STACK$LEADER_REGION$AZ$TOKEN_FILE$VPC$SUBNET && $ALLOW_RISKY -eq 0 && ${#SETS[@]} -eq 0 ]] \
+      || die "purge takes only --region, --stack-name, --profile, --yes and --dry-run" ;;
 esac
 
 AWS=(aws)
@@ -885,6 +910,12 @@ locate_stack() {
   if [[ -z $REGION ]]; then
     REGION=$IMDS_REGION
     [[ -n $REGION ]] || die "--region is required (or set AWS_REGION)"
+  elif [[ -z $REGION_GIVEN && -n $IMDS_REGION && $IMDS_REGION != "$REGION" && $IMDS_STACK == "$STACK" ]]; then
+    # The region came from the environment, and `sudo -E` on the node keeps whatever the operator has
+    # exported. This node's own tags say the stack is the one it belongs to, and an instance belongs
+    # to a stack of its own region; a region given with --region is taken as it is.
+    say "Note: the environment says region $REGION, but this node's stack $STACK is in $IMDS_REGION: using $IMDS_REGION (--region overrides)."
+    REGION=$IMDS_REGION
   fi
   [[ $REGION =~ $re_region ]] || die "--region $REGION is not a region name such as us-east-1"
   set_target "$STACK" "$REGION"
@@ -1138,8 +1169,326 @@ The join token secret stays until you delete it:
   say "Shell on it (Session Manager): $(fact n output:ConnectCommand)"
 }
 
+# ---- purge ---------------------------------------------------------------------------------
+# What a deleted stack leaves in the account: the backup and objects buckets (they are retained
+# and versioned) and the snapshots of the data volume (the final one CloudFormation takes, and the
+# daily ones). purge finds them by the marks the stack put on them and never by a name alone, lists
+# them, and destroys them after one confirmation. It needs the AWS CLI and nothing else: the
+# batches of an object delete are written by the CLI's own --query.
+STACK_ID=""
+PB_NAME=() PB_WHAT=() PB_VERS=() PB_MARKS=() PB_BYTES=() PB_USERS=()  # the buckets: name, role, versions, delete markers, bytes, other stacks that use it
+PS_ID=() PS_VOL=() PS_SIZE=() PS_WHEN=() PS_STATE=()      # the snapshots
+re_vol='^vol-[0-9a-f]{8,17}$'
+
+# A volume ID that names a data volume. EC2 reports vol-ffffffff as the volume of every snapshot that
+# is a copy (of a snapshot or of an image) and of the ones an image holds: one value for unrelated
+# snapshots of the whole account, so it identifies nothing and a filter on it would find them all.
+real_vol() { # ID
+  [[ $1 =~ $re_vol && ! $1 =~ $re_allf ]]
+}
+
+# The queries below are JMESPath, which the AWS CLI evaluates; its literals are written in backticks,
+# which are not command substitutions here.
+# shellcheck disable=SC2016
+Q_COUNT='[length(Versions || `[]`), length(DeleteMarkers || `[]`), sum(Versions[].Size || `[0]`)]'
+# The delete-objects body of one page of a bucket (at most 1000 entries): its object versions and its
+# delete markers together, in the order S3 lists them. The two kinds are mixed in key order, so a run
+# of one kind can fill the whole page; taking both from every page is what keeps a bucket whose first
+# 1000 entries are all delete markers (the ones left when old versions expire) from stopping the loop
+# with versions behind them. The CLI leaves "Objects": [] when the page has nothing.
+# shellcheck disable=SC2016
+Q_BATCH='{Objects: [Versions, DeleteMarkers][].{Key: Key, VersionId: VersionId}, Quiet: `true`}'
+
+human_bytes() { # BYTES
+  awk -v b="$1" 'BEGIN { split("B KiB MiB GiB TiB PiB", u, " "); i = 1; while (b >= 1024 && i < 6) { b /= 1024; i++ } if (i == 1) printf "%d B", b; else printf "%.1f %s", b, u[i] }'
+}
+
+# The CloudFormation tags of a bucket, as "stack-name<TAB>stack-id<TAB>logical-id" (empty fields when
+# the bucket has none of them).
+bucket_origin() { # BUCKET
+  local k v tn="" ti="" tl="" tags
+  tags=$("${AWS[@]}" s3api get-bucket-tagging --bucket "$1" --expected-bucket-owner "$ACCOUNT" --query 'TagSet[].[Key,Value]' --output text 2>/dev/null) || tags=""
+  while IFS=$'\t' read -r k v; do
+    case $k in
+      aws:cloudformation:stack-name) tn=$v ;;
+      aws:cloudformation:stack-id) ti=$v ;;
+      aws:cloudformation:logical-id) tl=$v ;;
+    esac
+  done <<<"$tags"
+  printf '%s\t%s\t%s' "$tn" "$ti" "$tl"
+}
+
+# Counts the object versions, delete markers and bytes of a bucket and adds it to the list.
+add_bucket() { # NAME ROLE
+  local out v m b
+  out=$("${AWS[@]}" s3api list-object-versions --bucket "$1" --expected-bucket-owner "$ACCOUNT" \
+    --query "$Q_COUNT" --output text) \
+    || fail "cannot list the object versions of $1 (the credentials need s3:ListBucketVersions on it)"
+  # (the CLI prints one line per page of a large bucket)
+  read -r v m b <<<"$(printf '%s\n' "$out" | awk '{ v += $1; m += $2; s += $3 } END { printf "%d %d %.0f", v, m, s }')"
+  PB_NAME+=("$1")
+  PB_WHAT+=("$2")
+  PB_VERS+=("$v")
+  PB_MARKS+=("$m")
+  PB_BYTES+=("$b")
+  PB_USERS+=("$(bucket_users "$1")")
+}
+
+# The other stacks of this region that name the bucket as their BackupBucketName or ObjectsBucketName:
+# the stacks of replica servers, which keep their backups and Storage files in their leader's buckets.
+# Stacks of other regions are not looked at. Prints their names, nothing when there are none, or ?
+# when the stacks cannot be listed (the list says so then).
+bucket_users() { # BUCKET
+  local names
+  [[ $1 =~ $re_bucket ]] || return 0
+  names=$("${AWS[@]}" cloudformation describe-stacks \
+    --query "Stacks[?StackName!='$STACK' && Parameters[?(ParameterKey=='BackupBucketName' || ParameterKey=='ObjectsBucketName') && ParameterValue=='$1']].StackName" \
+    --output text 2>/dev/null) || { printf '?'; return 0; }
+  # (the CLI prints the names of each page of a long list on a line of their own)
+  printf '%s' "$names" | tr -s '\t\n' '  ' | sed 's/^ //; s/ $//; s/^None$//'
+}
+
+describe_snapshots() { # FILTER: one "id<TAB>volume<TAB>GiB<TAB>started<TAB>state" line per snapshot
+  "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "$1" \
+    --query 'Snapshots[].[SnapshotId,VolumeId,VolumeSize,StartTime,State]' --output text
+}
+
+# Fills PS_* with the snapshots of a stack: those that carry its supavise:stack tag (TAGVALUE; the
+# daily ones do, the volume's tags are copied to them), and every other snapshot of the volumes those
+# were taken from and of the volumes given (the final snapshot CloudFormation takes when the stack
+# deletes its data volume names no stack, but it names the volume).
+collect_snapshots() { # TAGVALUE [VOLUME...]
+  local tagval=$1 vols="" v lines more id vol size when state
+  shift
+  for v in "$@"; do
+    if real_vol "$v"; then vols="$vols $v"; fi
+  done
+  lines=$(describe_snapshots "Name=tag:supavise:stack,Values=$tagval") \
+    || fail "cannot list the snapshots (the credentials need ec2:DescribeSnapshots)"
+  while IFS=$'\t' read -r id vol _; do
+    [[ -n $id ]] || continue
+    if real_vol "$vol"; then
+      case "$vols " in *" $vol "*) ;; *) vols="$vols $vol" ;; esac
+    fi
+  done <<<"$lines"
+  if [[ -n $vols ]]; then
+    vols=${vols# }
+    more=$(describe_snapshots "Name=volume-id,Values=${vols// /,}") \
+      || fail "cannot list the snapshots of the data volume (the credentials need ec2:DescribeSnapshots)"
+    lines=$(printf '%s\n%s\n' "$lines" "$more")
+  fi
+  PS_ID=() PS_VOL=() PS_SIZE=() PS_WHEN=() PS_STATE=()
+  while IFS=$'\t' read -r id vol size when state; do
+    [[ $id =~ $re_snap ]] || continue
+    PS_ID+=("$id")
+    PS_VOL+=("$vol")
+    PS_SIZE+=("$size")
+    PS_WHEN+=("$when")
+    PS_STATE+=("$state")
+  done <<<"$(printf '%s\n' "$lines" | awk -F'\t' 'NF && !seen[$1]++' | sort -t"$(printf '\t')" -k4,4)"
+}
+
+print_purge_list() { # what purge will destroy
+  local i
+  if [[ ${#PB_NAME[@]} -gt 0 ]]; then
+    say "S3 buckets (every object version and delete marker, then the bucket itself):"
+    for ((i = 0; i < ${#PB_NAME[@]}; i++)); do
+      say "  ${PB_NAME[$i]}   ${PB_WHAT[$i]}: ${PB_VERS[$i]} object version(s), ${PB_MARKS[$i]} delete marker(s), $(human_bytes "${PB_BYTES[$i]}")"
+      case "${PB_USERS[$i]}" in
+        '') ;;
+        '?') say "    (the other stacks of $REGION could not be listed, so it is not known whether a replica server still uses it)" ;;
+        *) say "    WARNING: stack(s) ${PB_USERS[$i]} in $REGION use it as their BackupBucketName or ObjectsBucketName; their servers lose their backups or Storage files" ;;
+      esac
+    done
+    say "  (A replica server keeps its backups and Storage files in its leader's buckets. Stacks of $REGION that name one are shown above; servers in other regions are not looked at.)"
+  fi
+  if [[ ${#PS_ID[@]} -gt 0 ]]; then
+    say "EBS snapshots (the data volume: the master key, the registry and every project):"
+    for ((i = 0; i < ${#PS_ID[@]}; i++)); do
+      say "  ${PS_ID[$i]}   ${PS_SIZE[$i]} GiB   ${PS_WHEN[$i]}   ${PS_STATE[$i]}   volume ${PS_VOL[$i]}"
+    done
+  fi
+}
+
+# Aborts the uploads that were never completed, then deletes every version and delete marker in
+# batches of up to 1000 (what one request takes; each batch is one page of the listing, of whichever
+# kind it holds), then the bucket. The batch is written by the CLI:
+# a key can hold any character, which a shell could not pass on safely. Returns 1 at the first
+# thing S3 refuses (Object Lock, a missing permission), with the reason on stderr.
+empty_bucket() { # BUCKET
+  local b=$1 key uid n=0 out
+  mkwork
+  while [[ $n -lt 100000 ]]; do
+    n=$((n + 1))
+    "${AWS[@]}" s3api list-multipart-uploads --bucket "$b" --expected-bucket-owner "$ACCOUNT" --no-paginate \
+      --query 'Uploads[0].[Key,UploadId]' --output text >"$WORK/upload" 2>"$WORK/err" || { cat "$WORK/err" >&2; return 1; }
+    key="" uid=""
+    IFS=$'\t' read -r key uid <"$WORK/upload" || true
+    [[ -n $uid && $uid != None ]] || break
+    "${AWS[@]}" s3api abort-multipart-upload --bucket "$b" --key="$key" --upload-id "$uid" --expected-bucket-owner "$ACCOUNT" >/dev/null 2>"$WORK/err" \
+      || { cat "$WORK/err" >&2; return 1; }
+  done
+  rm -f "$WORK/previous.json"
+  while :; do
+    "${AWS[@]}" s3api list-object-versions --bucket "$b" --expected-bucket-owner "$ACCOUNT" --no-paginate --output json \
+      --query "$Q_BATCH" >"$WORK/batch.json" 2>"$WORK/err" \
+      || { cat "$WORK/err" >&2; return 1; }
+    # An empty page prints "Objects": []; one with an entry always has a "VersionId".
+    grep -q '"VersionId"' "$WORK/batch.json" || break
+    if [[ -f $WORK/previous.json ]] && cmp -s "$WORK/batch.json" "$WORK/previous.json"; then
+      echo "the same object versions came back after they were deleted: S3 is not deleting them" >&2
+      return 1
+    fi
+    "${AWS[@]}" s3api delete-objects --bucket "$b" --expected-bucket-owner "$ACCOUNT" --delete "file://$WORK/batch.json" >"$WORK/deleted.json" 2>"$WORK/err" \
+      || { cat "$WORK/err" >&2; return 1; }
+    if grep -q '"Errors"' "$WORK/deleted.json"; then cat "$WORK/deleted.json" >&2; return 1; fi
+    cp "$WORK/batch.json" "$WORK/previous.json"
+  done
+  out=$("${AWS[@]}" s3api delete-bucket --bucket "$b" --expected-bucket-owner "$ACCOUNT" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+}
+
+# Destroys what print_purge_list showed. A failure is reported, the rest still goes, and the script
+# ends with a failure so that a person runs it again after fixing the reason.
+destroy_purged() {
+  local i failed=0 err
+  mkwork
+  for ((i = 0; i < ${#PB_NAME[@]}; i++)); do
+    say "Emptying ${PB_NAME[$i]} (${PB_VERS[$i]} object version(s)) ..."
+    if empty_bucket "${PB_NAME[$i]}"; then
+      say "  deleted the bucket ${PB_NAME[$i]}"
+    else
+      failed=1
+      printf '%s: could not empty and delete %s\n' "$SELF" "${PB_NAME[$i]}" >&2
+    fi
+  done
+  for ((i = 0; i < ${#PS_ID[@]}; i++)); do
+    if "${AWS[@]}" ec2 delete-snapshot --snapshot-id "${PS_ID[$i]}" 2>"$WORK/err"; then
+      say "Deleted ${PS_ID[$i]}"
+    else
+      failed=1
+      err=$(cat "$WORK/err")
+      printf '%s: could not delete %s: %s\n' "$SELF" "${PS_ID[$i]}" "$err" >&2
+    fi
+  done
+  [[ $failed -eq 0 ]] || FAIL_CODE=3 fail "some of it is still there (see above): fix the reason, then run  $SELF purge --region $REGION --stack-name $STACK"
+}
+
+# `--delete --purge`: finds, before anything is stopped, what the stack will leave: its own buckets
+# (named by its outputs, and refused when their CloudFormation tags name another stack) and the
+# snapshots that carry its id or were taken from its data volume. A replica server's stack has no
+# buckets of its own: the ones its outputs show are its leader's and are never touched.
+purge_inventory_before_delete() {
+  local b origin tn ti
+  need_account
+  STACK_ID=$(describe 'Stacks[0].StackId') || fail "cannot read the stack's id"
+  for b in "$BUCKET:backup bucket" "$OBJECTS:objects bucket"; do
+    [[ -n ${b%%:*} ]] || continue
+    origin=$(bucket_origin "${b%%:*}")
+    IFS=$'\t' read -r tn ti _ <<<"$origin"
+    if [[ -z $tn$ti ]]; then
+      die "the bucket ${b%%:*} shows no CloudFormation tags (it has none, or the credentials cannot read them: s3:GetBucketTagging), so it is not provably this stack's and is not purged"
+    fi
+    if [[ $tn != "$STACK" || $ti != "$STACK_ID" ]]; then
+      die "the bucket ${b%%:*} carries the CloudFormation tags of another stack ($tn, $ti), so it is not purged"
+    fi
+    add_bucket "${b%%:*}" "${b#*:}"
+  done
+  if [[ -n $REPLICA_OF ]]; then
+    say "Replica server of $REPLICA_OF: the leader's buckets are not touched."
+  fi
+  # shellcheck disable=SC2086
+  collect_snapshots "$STACK_ID" $VOLUME
+}
+
+mode_purge() {
+  local status ids id v vols="" cand prefix origin tn ti tl what b answer
+  if [[ $DRY -eq 1 ]]; then
+    note "dry run: nothing is sent to AWS"
+    note "purge refuses while the stack exists:"
+    show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text
+    note "the account, for the expected-bucket-owner checks:"
+    show "${AWS[@]}" sts get-caller-identity --query Account --output text
+    note "the ids of the deleted stack (CloudFormation lists a deleted stack for 90 days) and the data volume each one held:"
+    show "${AWS[@]}" cloudformation list-stacks --stack-status-filter DELETE_COMPLETE --query "StackSummaries[?StackName=='$STACK'].StackId" --output text
+    show "${AWS[@]}" cloudformation describe-stack-resource --stack-name "<StackId>" --logical-resource-id DataVolume --query StackResourceDetail.PhysicalResourceId --output text
+    note "the buckets whose CloudFormation tags name this stack (aws:cloudformation:stack-name, stack-id in this region and account, logical-id BackupBucket or ObjectsBucket):"
+    show "${AWS[@]}" s3api list-buckets --query "Buckets[?starts_with(Name, '$(printf '%s' "$STACK" | tr '[:upper:]' '[:lower:]' | cut -c1-16)')].Name" --output text
+    show "${AWS[@]}" s3api get-bucket-tagging --bucket "<bucket>" --expected-bucket-owner "<account>" --query 'TagSet[].[Key,Value]' --output text
+    show "${AWS[@]}" s3api list-object-versions --bucket "<bucket>" --expected-bucket-owner "<account>" --query "$Q_COUNT" --output text
+    note "and the other stacks of the region that use the bucket as their BackupBucketName or ObjectsBucketName (replica servers), which the list warns about:"
+    show "${AWS[@]}" cloudformation describe-stacks --query "Stacks[?StackName!='$STACK' && Parameters[?(ParameterKey=='BackupBucketName' || ParameterKey=='ObjectsBucketName') && ParameterValue=='<bucket>']].StackName" --output text
+    note "the snapshots tagged with the stack's id, and every other snapshot of the volumes those came from:"
+    show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=tag:supavise:stack,Values=arn:*:cloudformation:$REGION:<account>:stack/$STACK/*" --query 'Snapshots[].[SnapshotId,VolumeId,VolumeSize,StartTime,State]' --output text
+    show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=volume-id,Values=<volume>" --query 'Snapshots[].[SnapshotId,VolumeId,VolumeSize,StartTime,State]' --output text
+    note "then, once you type the stack name (or with --yes), for each bucket, until a page comes back empty (versions and delete markers together):"
+    show "${AWS[@]}" s3api list-object-versions --bucket "<bucket>" --expected-bucket-owner "<account>" --no-paginate --output json --query "$Q_BATCH"
+    show "${AWS[@]}" s3api delete-objects --bucket "<bucket>" --expected-bucket-owner "<account>" --delete "file://<batch of up to 1000>"
+    show "${AWS[@]}" s3api delete-bucket --bucket "<bucket>" --expected-bucket-owner "<account>"
+    show "${AWS[@]}" ec2 delete-snapshot --snapshot-id "<snapshot>"
+    return 0
+  fi
+  FAIL_CODE=3
+  command -v aws >/dev/null 2>&1 || fail "the AWS CLI (aws) is not installed: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+  export AWS_PAGER=""
+  need_account
+  status=$(stack_status)
+  [[ $status == none ]] || die "stack $STACK still exists in $REGION ($status), and purge is for a stack that is already deleted. To delete it and destroy what it leaves in one go: $SELF --region $REGION --stack-name $STACK --delete --purge"
+
+  # Where the stack's own records still exist (CloudFormation keeps a deleted stack for 90 days),
+  # they name its data volume.
+  ids=$("${AWS[@]}" cloudformation list-stacks --stack-status-filter DELETE_COMPLETE --query "StackSummaries[?StackName=='$STACK'].StackId" --output text) \
+    || fail "cannot list the deleted stacks (the credentials need cloudformation:ListStacks)"
+  # shellcheck disable=SC2086
+  for id in $ids; do
+    [[ $id == arn:* ]] || continue
+    v=$("${AWS[@]}" cloudformation describe-stack-resource --stack-name "$id" --logical-resource-id DataVolume --query StackResourceDetail.PhysicalResourceId --output text 2>/dev/null) || v=""
+    if real_vol "$v"; then vols="$vols $v"; fi
+  done
+
+  # Buckets: the name only narrows the search; what proves a bucket is the tags CloudFormation put
+  # on it, and a bucket of this region and account.
+  prefix=$(printf '%s' "$STACK" | tr '[:upper:]' '[:lower:]' | cut -c1-16)
+  cand=$("${AWS[@]}" s3api list-buckets --query "Buckets[?starts_with(Name, '$prefix')].Name" --output text) \
+    || fail "cannot list the buckets (the credentials need s3:ListAllMyBuckets)"
+  # shellcheck disable=SC2086
+  for b in $cand; do
+    origin=$(bucket_origin "$b")
+    IFS=$'\t' read -r tn ti tl <<<"$origin"
+    [[ $tn == "$STACK" && $ti == arn:*:cloudformation:"$REGION":"$ACCOUNT":stack/"$STACK"/* ]] || continue
+    case $tl in
+      BackupBucket) what="backup bucket" ;;
+      ObjectsBucket) what="objects bucket" ;;
+      *) continue ;;
+    esac
+    add_bucket "$b" "$what"
+  done
+
+  # shellcheck disable=SC2086
+  collect_snapshots "arn:*:cloudformation:$REGION:$ACCOUNT:stack/$STACK/*" $vols
+  if [[ ${#PB_NAME[@]} -eq 0 && ${#PS_ID[@]} -eq 0 ]]; then
+    say "Nothing of stack $STACK is left in $REGION: no bucket or snapshot carries its marks."
+    say "(A final snapshot of a stack that was deleted more than 90 days ago, and that never made daily snapshots, carries no mark this script can match. Find it by its volume: aws ec2 describe-snapshots --owner-ids self --region $REGION)"
+    return 0
+  fi
+  say "Stack $STACK is deleted. What it left in $REGION, found by its marks:"
+  say ""
+  print_purge_list
+  say ""
+  say "All of it will be destroyed, and none of it can be brought back."
+  if [[ $YES -eq 0 ]]; then
+    [[ -t 0 ]] || die "not a terminal: pass --yes to destroy these without asking"
+    printf 'Type the stack name (%s) to destroy everything above: ' "$STACK"
+    read -r answer
+    [[ $answer == "$STACK" ]] || die "not confirmed; nothing was destroyed"
+  fi
+  destroy_purged
+  say ""
+  say "Purged. Nothing of stack $STACK is left in $REGION."
+}
+
 case $MODE in
   update) mode_update; exit $? ;;
+  purge) mode_purge; exit $? ;;
   status) mode_status; exit $? ;;
   replica) mode_replica; exit $? ;;
 esac
@@ -1171,6 +1520,14 @@ A running instance is stopped first, so that Postgres and the other services can
 order before the final snapshot is taken, which then is not a crash image. The node is offline
 from that moment. (A stack whose first launch failed has no instance; nothing is stopped.)
 WARN
+  if [[ $PURGE -eq 1 ]]; then
+    cat <<WARN
+--purge: once the stack is deleted, what stays is destroyed too: the buckets named below with every
+object version and delete marker, and every snapshot of the data volume, the final one included.
+Nothing of the stack is left in your account, and none of it can be brought back.
+
+WARN
+  fi
   if [[ $DRY -eq 1 ]]; then
     note "dry run: nothing is sent to AWS"
     note "the commands --delete would run:"
@@ -1187,6 +1544,25 @@ WARN
     show "${AWS[@]}" cloudformation delete-stack --stack-name "$STACK"
     show "${AWS[@]}" cloudformation wait stack-delete-complete --stack-name "$STACK"
     show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=volume-id,Values=<DataVolumeId>" --query 'Snapshots[].[SnapshotId,StartTime,State]' --output text
+    if [[ $PURGE -eq 1 ]]; then
+      note "--purge: before anything is stopped, what will be destroyed is found and listed, and you type the stack name once."
+      note "the stack's id, to match the marks on its snapshots, and the account for the expected-bucket-owner checks:"
+      show "${AWS[@]}" cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackId' --output text
+      show "${AWS[@]}" sts get-caller-identity --query Account --output text
+      note "the backup and objects buckets of the stack (the stack of a replica server has none of its own) must carry the stack's id, and are counted:"
+      show "${AWS[@]}" s3api get-bucket-tagging --bucket "<BackupBucket>" --expected-bucket-owner "<account>" --query 'TagSet[].[Key,Value]' --output text
+      show "${AWS[@]}" s3api list-object-versions --bucket "<BackupBucket>" --expected-bucket-owner "<account>" --query "$Q_COUNT" --output text
+      note "and the other stacks of the region that use a bucket as their BackupBucketName or ObjectsBucketName (replica servers), which the list warns about:"
+      show "${AWS[@]}" cloudformation describe-stacks --query "Stacks[?StackName!='$STACK' && Parameters[?(ParameterKey=='BackupBucketName' || ParameterKey=='ObjectsBucketName') && ParameterValue=='<BackupBucket>']].StackName" --output text
+      note "the snapshots tagged with the stack's id, and every other snapshot of the data volume:"
+      show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=tag:supavise:stack,Values=<StackId>" --query 'Snapshots[].[SnapshotId,VolumeId,VolumeSize,StartTime,State]' --output text
+      show "${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=volume-id,Values=<DataVolumeId>" --query 'Snapshots[].[SnapshotId,VolumeId,VolumeSize,StartTime,State]' --output text
+      note "after the stack is deleted (the final snapshot exists by then, so the snapshots are listed again), for each bucket, until a page comes back empty (versions and delete markers together):"
+      show "${AWS[@]}" s3api list-object-versions --bucket "<BackupBucket>" --expected-bucket-owner "<account>" --no-paginate --output json --query "$Q_BATCH"
+      show "${AWS[@]}" s3api delete-objects --bucket "<BackupBucket>" --expected-bucket-owner "<account>" --delete "file://<batch of up to 1000>"
+      show "${AWS[@]}" s3api delete-bucket --bucket "<BackupBucket>" --expected-bucket-owner "<account>"
+      show "${AWS[@]}" ec2 delete-snapshot --snapshot-id "<snapshot>"
+    fi
     exit 0
   fi
   status=$(stack_status)
@@ -1215,9 +1591,26 @@ WARN
   else
     say "Instance:       none to stop (stack status $status)"
   fi
+  if [[ $PURGE -eq 1 ]]; then
+    purge_inventory_before_delete
+    say ""
+    say "Destroyed once the stack is deleted, none of it to be brought back:"
+    print_purge_list
+    if [[ ${#PB_NAME[@]} -eq 0 && ${#PS_ID[@]} -eq 0 ]]; then
+      say "  (no bucket and no snapshot of the stack exists yet)"
+    fi
+    if [[ -n $VOLUME ]]; then
+      say "  and the final snapshot of $VOLUME that CloudFormation takes when the stack deletes it"
+    fi
+    say ""
+  fi
   if [[ $YES -eq 0 ]]; then
     [[ -t 0 ]] || fail "not a terminal: pass --yes to delete without asking"
-    printf 'Type the stack name (%s) to delete it: ' "$STACK"
+    if [[ $PURGE -eq 1 ]]; then
+      printf 'Type the stack name (%s) to delete it and destroy everything listed above: ' "$STACK"
+    else
+      printf 'Type the stack name (%s) to delete it: ' "$STACK"
+    fi
     read -r answer
     [[ $answer == "$STACK" ]] || fail "not deleted"
   fi
@@ -1235,6 +1628,15 @@ WARN
   "${AWS[@]}" cloudformation wait stack-delete-complete --stack-name "$STACK" \
     || fail "the stack did not delete cleanly; see the Events tab of the stack in the CloudFormation console"
   say ""
+  if [[ $PURGE -eq 1 ]]; then
+    # The final snapshot exists now: list the snapshots again so that it is among them.
+    # shellcheck disable=SC2086
+    collect_snapshots "$STACK_ID" $VOLUME
+    destroy_purged
+    say ""
+    say "Deleted and purged. Nothing of stack $STACK is left in $REGION."
+    exit 0
+  fi
   if [[ -z $BUCKET && -z $OBJECTS && -z $VOLUME ]]; then
     say "Deleted. The stack reported no backup bucket, objects bucket or data volume."
     exit 0

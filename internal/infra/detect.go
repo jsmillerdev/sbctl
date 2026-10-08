@@ -127,7 +127,8 @@ func DefaultSource() Source {
 // tool from using the instance role (AWS_EC2_METADATA_DISABLED, which `supavise upgrade --aws`
 // sets for the stack step) does not apply: it is hidden from this client.
 func metadataTags(ctx context.Context) (map[string]string, error) {
-	c, err := awsapi.New(awsapi.Config{Getenv: func(k string) string {
+	// NoInstanceRole: reading tags takes no credentials, so the role is never asked for.
+	c, err := awsapi.New(awsapi.Config{NoInstanceRole: true, Getenv: func(k string) string {
 		if k == "AWS_EC2_METADATA_DISABLED" {
 			return ""
 		}

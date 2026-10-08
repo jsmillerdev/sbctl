@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/supavise/supavise/internal/awsapi"
+	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/infra"
 )
 
@@ -31,5 +34,40 @@ func TestTheQuestionToTheCloudIsBounded(t *testing.T) {
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Errorf("the questions took %s", d)
+	}
+}
+
+// The host block lists what converge would do and says how; a converged host has none.
+func TestHostBlockRenders(t *testing.T) {
+	var out bytes.Buffer
+	(&hostBlock{Pending: []hostsetup.Result{
+		{ID: "units", Title: "Install the systemd units and the polkit rule", Pending: true, Detail: "2 files differ"},
+		{ID: "ufw", Title: "Open the mesh port in ufw when ufw is active", Pending: true},
+	}}).Render(&out)
+	for _, want := range []string{"Host  2 step(s) of the host layer are pending", "pending  Install the systemd units and the polkit rule (2 files differ)", "pending  Open the mesh port in ufw when ufw is active\n", "Fix: sudo supavise system converge"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("block lacks %q:\n%s", want, out.String())
+		}
+	}
+}
+
+// A step that could not be checked is listed as that, not as pending: nothing says it has work, and
+// the fix line is for the pending ones.
+func TestHostBlockSaysWhatItCouldNotCheck(t *testing.T) {
+	leaderDown := hostsetup.Result{ID: "config-d", Title: "Refresh the cluster settings from the leader", Unknown: true, Detail: "cannot reach the leader n1"}
+	var out bytes.Buffer
+	(&hostBlock{Unchecked: []hostsetup.Result{leaderDown}}).Render(&out)
+	for _, want := range []string{"Host  the host layer could not be checked in full", "not checked  Refresh the cluster settings from the leader (cannot reach the leader n1)"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("block lacks %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "pending") || strings.Contains(out.String(), "Fix:") {
+		t.Errorf("an unchecked step is reported as pending:\n%s", out.String())
+	}
+	out.Reset()
+	(&hostBlock{Pending: []hostsetup.Result{{ID: "ufw", Title: "Open the mesh port in ufw when ufw is active", Pending: true}}, Unchecked: []hostsetup.Result{leaderDown}}).Render(&out)
+	if !strings.Contains(out.String(), "1 step(s) of the host layer are pending") || !strings.Contains(out.String(), "not checked  Refresh") || strings.Count(out.String(), "Host  ") != 1 {
+		t.Errorf("both kinds:\n%s", out.String())
 	}
 }

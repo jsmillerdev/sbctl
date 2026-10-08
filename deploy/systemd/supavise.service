@@ -48,8 +48,11 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 # supavise writes project state, env files and run scripts under the state directory.
-# systemd itself writes unit drop-ins when supavise asks over D-Bus.
-ReadWritePaths=/var/lib/supavise
+# systemd itself writes unit drop-ins when supavise asks over D-Bus. In a cluster the daemon keeps a
+# renewed node certificate in /etc/supavise/cluster and a retirement (`node rm` of this node, a
+# rejoin) deletes the identity there and the cluster settings in /etc/supavise/config.d; the leading
+# "-" leaves out a directory that does not exist yet, which a single server never has.
+ReadWritePaths=/var/lib/supavise -/etc/supavise/cluster -/etc/supavise/config.d
 
 [Install]
 WantedBy=multi-user.target

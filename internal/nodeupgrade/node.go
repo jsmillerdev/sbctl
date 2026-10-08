@@ -6,6 +6,7 @@ import (
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/selfupdate"
 )
 
 // Node is what the upgrade learns about the machine before it changes anything.
@@ -47,8 +48,53 @@ type Node struct {
 	// stack or when the question could not be answered.
 	Infra *infra.Report
 
+	// Cluster is what the node knows of the cluster it belongs to; nil on a single server, whose
+	// every project is its own.
+	Cluster *ClusterView
+
 	// Running is set while another upgrade is running.
 	Running *Running
+}
+
+// ClusterView is the node's place in a cluster, as far as an upgrade of this node needs it.
+// Projects holds only the projects homed on this node: a project homed on another server is
+// upgraded by that server (its files, its backups and its restarts are there), and Elsewhere names
+// them.
+type ClusterView struct {
+	// Self is this node's id; Leader says its system cluster is the primary.
+	Self   string
+	Leader bool
+	// Standbys are the other active nodes that hold a standby of a database whose primary runs
+	// here: the system cluster on every node while this one leads, and the replicas of the projects
+	// homed here.
+	Standbys []Standby
+	// Elsewhere are the refs of the projects homed on other nodes.
+	Elsewhere []string
+}
+
+// Standby is a node that holds standbys of this node's databases.
+type Standby struct {
+	// Node and Name identify the node; Version is the release it runs ("" when it never said).
+	Node, Name, Version string
+	// Refs are the databases it holds a standby of: "system" and project refs.
+	Refs []string
+}
+
+// Behind returns the standbys that do not run the release version yet: the nodes that must be
+// upgraded before this one when the release changes PostgreSQL in a way a standby cannot follow. A
+// node that never reported its version counts as behind, one on a build that is not a release
+// ("dev") does not: it cannot be judged.
+func (c *ClusterView) Behind(version string) []Standby {
+	if c == nil {
+		return nil
+	}
+	var out []Standby
+	for _, s := range c.Standbys {
+		if cmp, ok := selfupdate.Compare(s.Version, version); s.Version == "" || (ok && cmp < 0) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // Verdicts of `supavise status`.

@@ -9,7 +9,7 @@ The template is at a revision (`InfraRevision` output, `supavise:infra` tag of t
 | Revision | What the template has |
 |---|---|
 | 1 | the template of v0.1.x |
-| 2 | instance tags and `InstanceMetadataTags`; `ObjectsBucket` and `StorageRole`; `PeerIngress1..3`; `FencingPolicy`; outputs `ElasticIpAllocationId`, `ObjectsBucket`, `StorageRoleArn`, `SecurityGroupId`, `InfraRevision`, `ClusterName`; the replica server stack |
+| 2 | instance tags and `InstanceMetadataTags`; `ObjectsBucket` and `StorageRole`; `PeerIngress1..3`; `FencingPolicy`; `ClusterDescribePolicy`; outputs `ElasticIpAllocationId`, `ObjectsBucket`, `StorageRoleArn`, `SecurityGroupId`, `InfraRevision`, `ClusterName`; the replica server stack |
 
 Every parameter added after revision 1 defaults to off:
 
@@ -17,9 +17,13 @@ Every parameter added after revision 1 defaults to off:
 |---|---|
 | `Failover` (`off`) | `FencingPolicy`: stop and re-address resources that carry the cluster tag, three describe calls |
 | `ClusterName` (the stack name) | the value of the `supavise:cluster` tag that the fencing permissions and the Storage role test; give each independent deployment in one account its own (see below) |
-| `PeerCidr1..3` | a rule for port 7443 from that range, one `AWS::EC2::SecurityGroupIngress` each |
-| `JoinLeader`, `JoinTokenSecretArn`, `BackupBucketName`, `BackupBucketRegion`, `ObjectsBucketName`, `StorageRoleArn` | the replica server stack: no buckets, no claim token, a short user data that installs the verified release and joins, a second private address |
+| `PeerCidr1..3` | a rule for port 7443 from that range, one `AWS::EC2::SecurityGroupIngress` each; the first one also turns on `ClusterDescribePolicy` |
+| `JoinLeader`, `JoinTokenSecretArn`, `BackupBucketName`, `BackupBucketRegion`, `ObjectsBucketName`, `StorageRoleArn` | the replica server stack: no buckets, no claim token, a short user data that installs the verified release and joins, a second private address, `ClusterDescribePolicy`. The user data signals the stack after `install.sh` returns, and the installer's join is synchronous, so a created stack has an active node |
 | `AvailabilityZone` | the zone of the subnet the stack makes |
+
+## Describing instances in a cluster
+
+The address resolver of the mesh asks EC2 for a peer's addresses by its instance id when the address it has stopped answering (`internal/cluster/resolver.go`). That is one read, `ec2:DescribeInstances`, which takes no resource. `FencingPolicy` has it for `Failover=on`; `ClusterDescribePolicy` gives the same single action to a server of a cluster without failover, that is a stack with a `PeerCidr` or with `JoinLeader`. A single server has neither and gets no such policy, so an update of a v0.1.1 stack adds nothing it does not use.
 
 ## Storage credentials
 
@@ -34,7 +38,7 @@ The same tag decides who may reach the objects bucket and the fencing permission
 | Test | Guards |
 |---|---|
 | `TestUpgradeFromV011` (`upgrade_test.go`) | An update of a stack made from `testdata/supavise-v0.1.1.yaml` (the file of the tag) changes nothing that can replace or interrupt the instance, volume, address or network: the two templates are rendered with the parameters of a v0.1.1 stack, conditions applied, and every property of a resource that exists in both is compared; the user data is byte for byte the same; the only new resources are the Storage bucket and role; new parameters have defaults. `TestUpgradeGuardCatchesReplacements` makes sure the comparison fails for the edits it is meant to catch. |
-| `TestInstanceRoleIsLeastPrivilege` | Every action the instance role may take. `sts:AssumeRole` only on `StorageRole`; `ec2:` only in `FencingPolicy` and only for tagged resources. |
+| `TestInstanceRoleIsLeastPrivilege` | Every action the instance role may take. `sts:AssumeRole` only on `StorageRole`; `ec2:` only in `FencingPolicy` and only for tagged resources, apart from `ec2:DescribeInstances` alone in `ClusterDescribePolicy`. |
 | `TestStorageRole`, `TestPeerRules`, `TestFencingPolicy`, `TestReplicaServerStack`, `TestInstanceTagsForTheNode` (`replica_test.go`) | the pieces of revision 2 |
 | `TestReplicaUserData*` | the replica user data, run with stand-ins for `curl` and the AWS CLI: the installer runs only after the signature, the checksum and the key check, and the token is read after that |
 | `TestReleaseAssets*` | what `deploy/release-assets.sh` attaches and signs |

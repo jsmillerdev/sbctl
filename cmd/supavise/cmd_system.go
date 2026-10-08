@@ -143,7 +143,9 @@ the binary, and ` + "`supavise upgrade`" + ` runs converge after it swaps the bi
 when it does not succeed.
 
 --check changes nothing and needs no root: it prints, for every step, whether it has something to
-do. --json prints a list of {id, title, pending, needs_root, detail} for --check and the same with
+do. A step that could not be checked, such as the refresh of the cluster settings when the leader
+does not answer within a few seconds, is reported as unknown, not as in order. --json prints a list of
+{id, title, pending, needs_root, detail, unknown} (unknown only when set) for --check and the same with
 what changed after a run. Exit status 0 means the command ran; --check reports pending steps in its
 output and does not signal them in the status.
 
