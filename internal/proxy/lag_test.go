@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,5 +74,44 @@ func TestReplicaLag(t *testing.T) {
 	}
 	if got := ReplicaLag(svc, func() bool { return true }); got == nil {
 		t.Error("ReplicaLag returned no function")
+	}
+}
+
+// slowStatuses is a replicas.Service whose Statuses waits to be released.
+type slowStatuses struct {
+	replicas.Service
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (s *slowStatuses) Statuses(context.Context, string) ([]replicas.Status, error) {
+	s.calls.Add(1)
+	<-s.release
+	return []replicas.Status{{Identifier: repEU, LagSeconds: 2}}, nil
+}
+
+// Requests that miss at the same moment share one question to the controller.
+func TestReplicaLagAsksOnceForSimultaneousMisses(t *testing.T) {
+	svc := &slowStatuses{release: make(chan struct{})}
+	c := &lagCache{svc: svc, leader: func() bool { return true }, now: time.Now, refs: map[string]lagReading{}}
+	var wg sync.WaitGroup
+	lags := make([]time.Duration, 20)
+	for i := range lags {
+		wg.Add(1)
+		go func() { defer wg.Done(); lags[i], _ = c.lag(repEU) }()
+	}
+	for svc.calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // the others have arrived and wait for the flight
+	close(svc.release)
+	wg.Wait()
+	if n := svc.calls.Load(); n != 1 {
+		t.Errorf("the controller was asked %d times by 20 requests that missed together, want 1", n)
+	}
+	for i, d := range lags {
+		if d != 2*time.Second {
+			t.Errorf("request %d got a lag of %v", i, d)
+		}
 	}
 }

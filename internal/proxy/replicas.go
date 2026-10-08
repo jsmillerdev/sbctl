@@ -48,14 +48,14 @@ type database struct {
 }
 
 // candidates are the databases a balanced read may go to: the primary, and every replica that is
-// ACTIVE_HEALTHY, runs on an active node and, when [replicas] lb_max_lag_seconds is set, lags
-// no more than that (a replica whose lag is unknown is skipped then).
+// ACTIVE_HEALTHY, runs on an active node this node has a mesh session to and, when [replicas]
+// lb_max_lag_seconds is set, lags no more than that (a replica whose lag is unknown is skipped then).
 func (s *Server) candidates(p project) []database {
 	cs := []database{{identifier: p.ref, node: p.home}}
 	maxLag := s.cfg.Replicas.LBMaxLag()
 	for i := range p.replicas {
 		r := &p.replicas[i]
-		if r.status != string(registry.StatusActiveHealthy) || !s.table.nodeActive(r.node) {
+		if r.status != string(registry.StatusActiveHealthy) || !s.table.nodeActive(r.node) || !s.cluster.connected(r.node) {
 			continue
 		}
 		if _, ok := s.replicaAddr(p, *r); !ok {
@@ -95,7 +95,10 @@ func (s *Server) pickDatabase(p project) database {
 	if best >= 0 {
 		return cs[best]
 	}
-	n, _ := s.turns.LoadOrStore(p.ref, new(atomic.Uint64))
+	n, ok := s.turns.Load(p.ref)
+	if !ok {
+		n, _ = s.turns.LoadOrStore(p.ref, new(atomic.Uint64))
+	}
 	return cs[(n.(*atomic.Uint64).Add(1)-1)%uint64(len(cs))]
 }
 

@@ -37,7 +37,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := normalizeHost(r.Host)
 	which, ref := "", ""
 	route := "" // the database a load balancer host sent the request to
+	reason, isFenced := s.fencedNow()
 	switch {
+	case isFenced:
+		which = "fenced"
+		s.serveFenced(sw, r, reason)
 	case s.apiHost != "" && host == s.apiHost:
 		which = "api"
 		s.serveAPI(sw, r)
@@ -74,7 +78,8 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		s.serveDashboardAuth(w, r)
 		return
 	}
-	if s.opts.APIHandler == nil {
+	forwarded := !s.cluster.leads()
+	if s.opts.APIHandler == nil && !forwarded {
 		writeJSON(w, http.StatusServiceUnavailable, "Management API is not available")
 		return
 	}
@@ -84,7 +89,26 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, "Not Found")
 		return
 	}
+	if forwarded {
+		s.forwardAPI(w, r)
+		return
+	}
 	s.opts.APIHandler.ServeHTTP(w, r)
+}
+
+// apiTimeout bounds the wait for the headers of the Management API's answer on a node that forwards it:
+// longer than any call that does not detach its work, since the in-process handler has no limit at all.
+const apiTimeout = 10 * time.Minute
+
+// forwardAPI hands a request on api.<domain> to the Management API's loopback listener, which on a
+// node that does not lead is a forwarder to the leader's (mesh.KindAdmin, design 2.6): the follower's
+// own registry is read-only. The API authenticates and sets its own CORS headers, so the request goes
+// through as it came and the answer is not touched.
+func (s *Server) forwardAPI(w http.ResponseWriter, r *http.Request) {
+	s.forward(w, r, &target{
+		addr: s.cfg.Listen.Admin, path: r.URL.Path, rawPath: r.URL.EscapedPath(), rawQuery: r.URL.RawQuery,
+		fwdHost: r.Host, timeout: apiTimeout, keepCORS: true,
+	})
 }
 
 func (s *Server) serveStudio(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +127,12 @@ func (s *Server) serveStudio(w http.ResponseWriter, r *http.Request) {
 // to the primary. On a load balancer host it returns the database the request went to.
 func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, m hostMatch) (route string) {
 	p := m.project
+	if m.kind == kindBalancer {
+		// Every answer from a balancer host says which database it came from: the primary, until a
+		// read picks a replica (a refusal before that point is the primary's too).
+		route = p.ref
+		w.Header().Set(routeHeader, route)
+	}
 	setCORS(w.Header(), r)
 	if isPreflight(r) {
 		writePreflight(w, r)
@@ -122,6 +152,11 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, m hostMatc
 	}
 	if rt.access == accessBlocked {
 		writeText(w, http.StatusForbidden, msgForbidden)
+		return
+	}
+	// While `supavise storage migrate` switches Storage's backend, what changes data waits (reads go on).
+	if rt.svc == svcStorage && changesData(r.Method) && s.storageHeld() {
+		refuseStorageWrite(w, rt)
 		return
 	}
 
@@ -195,6 +230,7 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, m hostMatc
 	}
 
 	addr := s.upstream(rt.svc, p)
+	var retry string // where a read goes once more if the replica it picked cannot be reached
 	switch {
 	case m.kind == kindReplica:
 		if !replicaServable(m.replica.status) {
@@ -208,15 +244,14 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, m hostMatc
 			return
 		}
 	case m.kind == kindBalancer:
-		route = p.ref
 		if balanced(r, rt) {
-			db := s.pickDatabase(p)
-			route = db.identifier
-			if db.replica != nil {
+			if db := s.pickDatabase(p); db.replica != nil {
+				retry = addr
 				addr, _ = s.replicaAddr(p, *db.replica) // candidates only holds replicas that have an address
+				route = db.identifier
+				w.Header().Set(routeHeader, route)
 			}
 		}
-		w.Header().Set(routeHeader, route)
 	}
 	tg := &target{
 		addr: addr, path: rt.upstreamPath(pth, trailing), rawPath: escapedUpstreamPath(r.URL, pth, rt, trailing), rawQuery: res.rawQuery,
@@ -258,6 +293,13 @@ func (s *Server) serveProject(w http.ResponseWriter, r *http.Request, m hostMatc
 			return
 		}
 		tg.set[config.FunctionsProxyTokenHeader] = tok
+	}
+	if retry != "" {
+		tg.retry = retry
+		tg.onRetry = func() {
+			route = p.ref
+			w.Header().Set(routeHeader, route)
+		}
 	}
 	tg.dropTenant = rt.svc != svcFunctions
 	if rt.keys == keyRealtime {
@@ -323,6 +365,14 @@ type target struct {
 	// trackRef, set for a Realtime socket route, is the project whose sockets that were not
 	// inspected (legacy keys enabled) are closed when its legacy keys are switched off.
 	trackRef string
+	// keepCORS leaves the upstream's Access-Control headers in the answer: the Management API owns its
+	// CORS policy.
+	keepCORS bool
+	// retry, when set, is the address a request that can be repeated (a GET or HEAD with no body) goes to
+	// once if addr cannot be reached or does not answer: a balanced read that picked a replica retries on
+	// the primary. onRetry runs first.
+	retry   string
+	onRetry func()
 }
 
 // forward proxies r to tg, streaming in both directions and passing WebSocket
@@ -386,7 +436,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 		ModifyResponse: func(res *http.Response) error {
 			if tg.studio {
 				rewriteStudioResponse(res.Header)
-			} else {
+			} else if !tg.keepCORS {
 				// One CORS policy, ours: upstream services add their own and the browser rejects duplicates.
 				for name := range res.Header {
 					if strings.HasPrefix(http.CanonicalHeaderKey(name), "Access-Control-") {
@@ -397,6 +447,16 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if tg.retry != "" && repeatable(r) && retryable(err) {
+				s.log.Warn("proxy: upstream failed, retrying on the primary", "upstream", tg.addr, "err", err)
+				again := *tg
+				again.addr, again.retry, again.onRetry = tg.retry, "", nil
+				if tg.onRetry != nil {
+					tg.onRetry()
+				}
+				s.forward(w, r, &again)
+				return
+			}
 			var ne net.Error
 			switch {
 			case errors.Is(err, context.Canceled):
@@ -411,6 +471,28 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, tg *target) {
 		},
 	}
 	rp.ServeHTTP(w, r)
+}
+
+// repeatable reports whether r can be sent to a second upstream after the first failed: it reads, and
+// it has no body that the first attempt could have consumed.
+func repeatable(r *http.Request) bool {
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && (r.Body == nil || r.Body == http.NoBody)
+}
+
+// retryable reports whether err says the upstream could not be reached or went away, so that asking
+// another one is worth the wait: the connection was refused or timed out being made, or it broke before
+// an answer came. A client that left is not, and neither is an upstream that took its time: a query that
+// outlasts the wait on a replica would outlast it on the primary too.
+func retryable(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var oe *net.OpError
+	if errors.As(err, &oe) && oe.Op == "dial" {
+		return true
+	}
+	var ne net.Error
+	return !(errors.As(err, &ne) && ne.Timeout())
 }
 
 // transport returns the shared upstream transport for a response-header timeout.

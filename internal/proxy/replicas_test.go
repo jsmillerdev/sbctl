@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -27,6 +31,7 @@ type fakeCluster struct {
 	self string
 	rtt  map[string]time.Duration
 	lag  map[string]time.Duration
+	down map[string]bool // nodes the mesh has no session to
 }
 
 func (f *fakeCluster) set(fn func(*fakeCluster)) {
@@ -49,6 +54,11 @@ func (f *fakeCluster) cluster() *Cluster {
 			defer f.mu.Unlock()
 			d, ok := f.lag[id]
 			return d, ok
+		},
+		Connected: func(n string) bool {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return !f.down[n]
 		},
 	}
 }
@@ -698,6 +708,151 @@ func TestAllowHostReplicaAndBalancer(t *testing.T) {
 		// The redirect on :80 knows them too.
 		if !s.serves(repEU+".api."+base) || !s.serves(testRef+"-lb.api."+base) {
 			t.Errorf("mode %s: the :80 redirect does not serve the replica or balancer host", mode)
+		}
+	}
+}
+
+// A replica on a node the mesh has no session to is not asked, although its heartbeat time is the last one
+// it answered and its row says it is healthy.
+func TestLoadBalancerSkipsReplicasOnNodesWithoutASession(t *testing.T) {
+	h := newRepHarness(t)
+	h.cl.set(func(f *fakeCluster) {
+		f.self = "n9"
+		f.rtt = map[string]time.Duration{"n1": 90 * time.Millisecond, "n2": 5 * time.Millisecond, "n3": 20 * time.Millisecond}
+	})
+	if got, _ := h.routeOf("GET", "/rest/v1/x"); got != repEU {
+		t.Fatalf("routed to %q with every node connected", got)
+	}
+	h.cl.set(func(f *fakeCluster) { f.down = map[string]bool{"n2": true} })
+	if got, _ := h.routeOf("GET", "/rest/v1/x"); got != repUS {
+		t.Errorf("routed to %q with no session to n2, want %s", got, repUS)
+	}
+	h.cl.set(func(f *fakeCluster) { f.down = map[string]bool{"n2": true, "n3": true} })
+	if got, _ := h.routeOf("GET", "/rest/v1/x"); got != h.ref {
+		t.Errorf("routed to %q with no session to either replica", got)
+	}
+	// This node's own replica needs no session.
+	h.cl.set(func(f *fakeCluster) { f.self = "n3"; f.down = map[string]bool{"n3": true} })
+	if got, _ := h.routeOf("GET", "/rest/v1/x"); got != repUS {
+		t.Errorf("routed to %q: the replica on this node needs no session", got)
+	}
+}
+
+// Every answer of a balancer host names the database, the refusals before a read has picked one included.
+func TestLoadBalancerNamesTheDatabaseOnEveryAnswer(t *testing.T) {
+	h := newRepHarness(t)
+	ctx := context.Background()
+	lb := h.lbHost()
+	check := func(what string, resp *http.Response, status int) {
+		t.Helper()
+		if resp.StatusCode != status || resp.Header.Get(routeHeader) != h.ref {
+			t.Errorf("%s: %d with %s %q, want %d and %s", what, resp.StatusCode, routeHeader, resp.Header.Get(routeHeader), status, h.ref)
+		}
+	}
+	resp, _ := h.req("GET", lb, "/rest/v1/x")
+	check("no key", resp, 401)
+	resp, _ = h.get(lb, "/rest/v1/")
+	check("the openapi document with a publishable key", resp, 403)
+	resp, _ = h.get(lb, "/nothing/here")
+	check("a path nobody serves", resp, 404)
+	resp, _ = h.req("OPTIONS", lb, "/rest/v1/x", "Origin", "https://app.example", "Access-Control-Request-Method", "GET")
+	check("a preflight", resp, 204)
+	if err := h.reg.SetProjectStatus(ctx, h.ref, registry.StatusInactive); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the project is inactive", func() bool {
+		resp, _ := h.get(lb, "/rest/v1/x")
+		return resp.StatusCode == 503
+	})
+	resp, _ = h.get(lb, "/rest/v1/x")
+	check("an inactive project", resp, 503)
+
+	for _, rec := range h.logs.records(t) {
+		if id, _ := rec["load_balancer_redirect_identifier"].(string); rec["kind"] == kindBalancer && id != h.ref {
+			t.Errorf("the access log of a refused request on the balancer names %q, want %s: %v", id, h.ref, rec)
+		}
+	}
+}
+
+// A read that picked a replica which cannot be reached is repeated once on the primary; a replica that
+// answered, whatever it said, is not asked twice, and a request that cannot be repeated is not.
+func TestLoadBalancerRetriesTheReadOnThePrimary(t *testing.T) {
+	h := newRepHarness(t)
+	h.cl.set(func(f *fakeCluster) { f.self = "n2" })
+	primary := h.ups[svcRest]
+	h.reps[repEU].srv.Close() // n2's PostgREST is gone: connection refused
+
+	for _, m := range []string{"GET", "HEAD"} {
+		before := primary.count()
+		resp, _ := h.req(m, h.lbHost(), "/rest/v1/todos?select=*", "apikey", h.k.PublishableKey)
+		if resp.StatusCode != 200 || resp.Header.Get(routeHeader) != h.ref || primary.count() != before+1 {
+			t.Errorf("%s: %d from %q, primary asked %d times", m, resp.StatusCode, resp.Header.Get(routeHeader), primary.count()-before)
+		}
+		if got := primary.last(t); got.Path != "/todos" || got.RawQuery != "select=*" || got.Header.Get("Authorization") != "Bearer "+h.k.AnonKey {
+			t.Errorf("%s: the primary saw %s?%s auth %q", m, got.Path, got.RawQuery, got.Header.Get("Authorization"))
+		}
+	}
+	recs := h.logs.records(t)
+	if last := recs[len(recs)-1]; last["load_balancer_redirect_identifier"] != h.ref || last["status"] != float64(200) {
+		t.Errorf("the access log of the retried read: %v", last)
+	}
+
+	// A body cannot be sent twice.
+	before := primary.count()
+	if resp, _ := h.reqBody("GET", h.lbHost(), "/rest/v1/todos", `{"a":1}`, "apikey", h.k.PublishableKey); resp.StatusCode != http.StatusBadGateway || primary.count() != before {
+		t.Errorf("a GET with a body: %d, primary asked %d times", resp.StatusCode, primary.count()-before)
+	}
+
+	// A replica that answers with an error has answered.
+	h.cl.set(func(f *fakeCluster) { f.self = "n3" })
+	h.reps[repUS].mu.Lock()
+	h.reps[repUS].handler = func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) }
+	h.reps[repUS].mu.Unlock()
+	before = primary.count()
+	if resp, _ := h.get(h.lbHost(), "/rest/v1/todos"); resp.StatusCode != http.StatusInternalServerError || resp.Header.Get(routeHeader) != repUS || primary.count() != before {
+		t.Errorf("a replica that answered 500: %d from %q, primary asked %d times", resp.StatusCode, resp.Header.Get(routeHeader), primary.count()-before)
+	}
+}
+
+// A vanity row made before -rr- and -lb were reserved keeps serving its host; one that names a project's
+// balancer cannot take the balancer over, because the balancer is resolved first.
+func TestVanityRowsOfReplicaHostShapedNames(t *testing.T) {
+	h := newRepHarness(t)
+	ctx := context.Background()
+	base := ".api." + testDomain
+	for _, host := range []string{"my-lb" + base, "shop-rr-eu" + base, h.ref + "-lb" + base} {
+		if err := h.reg.PutRoute(ctx, registry.Route{Host: host, Ref: h.ref, Kind: registry.RouteVanity}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	eventually(t, "routes reach the table", func() bool { return h.srv.table.routeKind("my-lb"+base) != "" })
+	eventually(t, "routes reach the table", func() bool { return h.srv.table.routeKind("shop-rr-eu"+base) != "" })
+	if got := h.srv.table.routeKind("my-lb" + base); got != kindVanity {
+		t.Errorf("a vanity row for my-lb resolves to %q", got)
+	}
+	if got := h.srv.table.routeKind("shop-rr-eu" + base); got != kindVanity {
+		t.Errorf("a vanity row for shop-rr-eu resolves to %q", got)
+	}
+	if got := h.srv.table.routeKind(h.ref + "-lb" + base); got != kindBalancer {
+		t.Errorf("the project's balancer host resolves to %q, a vanity row must not take it", got)
+	}
+}
+
+func TestRetryable(t *testing.T) {
+	timeout := &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
+	for name, c := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"connection refused":     {&net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, true},
+		"dial timeout":           {&net.OpError{Op: "dial", Err: os.ErrDeadlineExceeded}, true},
+		"reset before an answer": {&net.OpError{Op: "read", Err: syscall.ECONNRESET}, true},
+		"closed without answer":  {io.EOF, true},
+		"slow to answer":         {timeout, false},
+		"the client left":        {context.Canceled, false},
+	} {
+		if got := retryable(c.err); got != c.want {
+			t.Errorf("%s: %v, want %v", name, got, c.want)
 		}
 	}
 }
