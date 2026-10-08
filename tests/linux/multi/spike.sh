@@ -35,6 +35,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib-multi.sh"
 SPIKE_STRICT=${SPIKE_STRICT:-1}
 RESULTS=$LOG_DIR/results.tsv
 FACTS=$LOG_DIR/facts.tsv
+CHECK_ORDER="incus services launch boot prep net peer install polkit hardening imds project stub fakeaws fakeaws-log"
 UNITS_IMDS=(supavise-postgres@system.service supavise-gotrue@system.service supavise-pgmeta.service supavise-supavisor.service supavise-realtime.service supavise-storage.service)
 
 # ---- results ----------------------------------------------------------------------------------------
@@ -82,7 +83,9 @@ write_results() {
     echo
     echo "| Check | Result | Seconds | Detail |"
     echo "|---|---|---|---|"
-    awk -F'\t' '{gsub(/\|/, "/", $5); printf "| %s: %s | %s | %s | %s |\n", $2, $3, $1, $4, $5}' "$RESULTS"
+    awk -F'\t' -v order="$CHECK_ORDER" 'BEGIN {n = split(order, o, " "); for (i = 1; i <= n; i++) idx[o[i]] = i}
+      {id = $2; sub(/@.*/, "", id); print idx[id] "\t" $0}' "$RESULTS" | sort -s -t "$(printf '\t')" -k1,1n -k3,3 | cut -f2- \
+      | awk -F'\t' '{gsub(/\|/, "/", $5); printf "| %s: %s | %s | %s | %s |\n", $2, $3, $1, $4, $5}'
     echo
     echo "| Fact | Value |"
     echo "|---|---|"
@@ -149,9 +152,8 @@ c_boot() {
   local n=$1 st t0 free
   needs launch
   t0=$(cat "$WORK/state/started-$n")
-  multi_wait "$n" >/dev/null
+  st=$(multi_wait "$n")
   stamp "$n: start to systemd finished starting" "$t0"
-  st=$(on "$n" systemctl is-system-running 2>&1) || true
   note "$n.systemd" "$st"
   note "$n.failed-units" "$(on "$n" systemctl --failed --no-legend --plain | awk '{print $1}' | paste -sd ' ' - || true)"
   [[ $st == running || $st == degraded ]] || fail "$n: systemd is '$st'"
@@ -242,7 +244,7 @@ for u in supavise.service supavise-postgres@system.service supavise-gotrue@syste
     supavise-supavisor.service supavise-realtime.service supavise-storage.service; do wait_active "$u" 90; done
 [[ $(systemctl show -p User --value supavise.service) == supavise ]] || fail "supavise.service does not run as supavise"
 [[ $(http_code -H "Host: api.$1.sslip.io" http://127.0.0.1/claim) == 200 ]] || fail "the claim page does not answer through the proxy"
-grep -q "bucket" /etc/supavise/config.toml || fail "config.toml names no S3 bucket"
+grep -q "^backend = 's3://" /etc/supavise/config.toml || fail "config.toml does not name an S3 backup backend: $(grep backend /etc/supavise/config.toml)"
 EOS
   note "$n.version" "$(on "$n" /usr/local/bin/supavise --version | head -n1)"
   note "$n.polkit" "$(on "$n" pkaction --version)"

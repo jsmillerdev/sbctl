@@ -44,7 +44,7 @@ multi_init() {
 # on NODE CMD...: run CMD in the node as root. A script goes in on standard input: on n1 bash -s <<'EOS'.
 on() { local node=$1; shift; incus exec "$node" --env HOME=/root -- "$@"; }
 
-node_push() { incus file push --mode "${4:-0644}" "$2" "$1$3"; } # NODE SRC DEST [MODE]
+node_push() { incus file push --quiet --mode "${4:-0644}" "$2" "$1$3"; } # NODE SRC DEST [MODE]
 
 # nsystemctl NODE ARGS...: systemctl in the node. systemd's bus is away for a moment now and then
 # ("Transport endpoint is not connected", "Connection reset by peer", "disconnected from message bus
@@ -104,10 +104,12 @@ multi_resolve_mode() { # sets MULTI_RESOLVED
 multi_incus_install() {
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
   local pkgs=(incus)
-  case $(dpkg --print-architecture) in
-    amd64) pkgs+=(qemu-system-x86 ovmf) ;;
-    arm64) pkgs+=(qemu-system-arm qemu-efi-aarch64) ;;
-  esac
+  if [[ $MULTI_RESOLVED == vm ]]; then
+    case $(dpkg --print-architecture) in
+      amd64) pkgs+=(qemu-system-x86 ovmf) ;;
+      arm64) pkgs+=(qemu-system-arm qemu-efi-aarch64) ;;
+    esac
+  fi
   apt-get update -qq
   apt-get install -y -qq "${pkgs[@]}"
   # Unprivileged containers need an id range for root.
@@ -170,15 +172,22 @@ multi_launch_node() {
   incus start "$node"
 }
 
-# multi_wait NODE: the node answers `incus exec` and systemd has finished starting. Prints the state.
+# multi_wait NODE: the node answers `incus exec` and systemd has finished starting. Prints the state
+# (running or degraded). `systemctl is-system-running --wait` is not used: it fails at once while D-Bus is
+# not up yet.
 multi_wait() {
-  local node=$1 i
+  local node=$1 i st=""
   for ((i = 0; i < 90; i++)); do
     incus exec "$node" -- true 2>/dev/null && break
     sleep 2
   done
   incus exec "$node" -- true || fail "$node does not answer incus exec"
-  timeout 180 incus exec "$node" -- systemctl is-system-running --wait 2>/dev/null || true
+  for ((i = 0; i < 90; i++)); do
+    st=$(incus exec "$node" -- systemctl is-system-running 2>/dev/null) || true
+    case $st in running | degraded | stopping) break ;; esac
+    sleep 2
+  done
+  echo "$st"
 }
 
 # multi_grow_root NODE: grow the root partition and its file system to the size of the disk.
@@ -200,7 +209,8 @@ multi_prep_node() {
   on "$1" bash -s <<'EOS'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-systemctl mask --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+systemctl mask apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 for try in 1 2 3 4 5; do apt-get -o DPkg::Lock::Timeout=300 update -qq && break; sleep 5; done
 apt-get -o DPkg::Lock::Timeout=300 install -y -qq curl ca-certificates sudo python3 iproute2 iputils-ping openssl procps
 EOS
