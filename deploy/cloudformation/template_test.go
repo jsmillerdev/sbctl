@@ -440,6 +440,7 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 	wantCond := map[string]string{
 		"DnsPolicy": "HasZone", "KeyEscrowPolicy": "HasKeyEscrow", "SessionManagerPolicy": "SessionManagerOn",
 		"FencingPolicy": "FailoverOn", "JoinTokenPolicy": "IsJoiner", "StorageAssumePolicy": "",
+		"ClusterDescribePolicy": "UsesCluster",
 	}
 	var wantNames []string
 	for name := range wantCond {
@@ -524,7 +525,13 @@ func TestInstanceRoleIsLeastPrivilege(t *testing.T) {
 					t.Errorf("%s: %s on %s: the instance may assume the Storage role and no other", s.where, a, s.res)
 				}
 			case strings.HasPrefix(a, "ec2:"):
-				if s.where != "FencingPolicy" {
+				// ClusterDescribePolicy is the one outside FencingPolicy: a server of a cluster finds a peer by its
+				// instance id, and reads nothing else.
+				if s.where == "ClusterDescribePolicy" {
+					if a != "ec2:DescribeInstances" || s.res != "*" {
+						t.Errorf("%s: %s on %s: the cluster policy may describe instances and nothing else", s.where, a, s.res)
+					}
+				} else if s.where != "FencingPolicy" {
 					t.Errorf("%s: %s belongs in FencingPolicy (Failover=on), nowhere else", s.where, a)
 				}
 				if !starOK[a] && !strings.Contains(s.cond, clusterTag) {

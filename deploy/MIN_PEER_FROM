@@ -1,0 +1,7 @@
+# The oldest Supavise release a joined server may run alongside the release being built.
+# deploy/release-assets.sh writes it into the signed release manifest as min_peer_from. Servers of
+# one cluster talk over the mesh and replicate to each other, so a release that changes what they
+# say to each other (a peer API call without a fallback, a registry change an older binary cannot
+# read) raises it, in the commit that makes that change; leave it alone otherwise. Nothing is
+# released yet, so every release may join.
+v0.0.0

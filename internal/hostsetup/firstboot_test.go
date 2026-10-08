@@ -344,6 +344,58 @@ func TestFirstBootRefusesSeveralCandidates(t *testing.T) {
 	}
 }
 
+// An explicit --data-device is not trusted blindly: the root disk, a partition of it and the device
+// the root file system is mounted from are refused, and nothing is formatted or mounted.
+func TestFirstBootRefusesTheRootVolumeAsTheNamedDevice(t *testing.T) {
+	for name, dev := range map[string]string{
+		"the root disk by its node":         "nvme0n1",
+		"the device the root is mounted on": "/dev/nvme0n1p1",
+		"another partition of the root":     "nvme0n1p2",
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := newInstance(t)
+			if !strings.HasPrefix(dev, "/") {
+				dev = filepath.Join(in.root, "dev", dev)
+				if err := os.WriteFile(dev, nil, 0o600); err != nil && !os.IsExist(err) {
+					t.Fatal(err)
+				}
+			}
+			wrapped := in.answer
+			in.runner.do = func(n string, a []string) ([]byte, error) {
+				if n+" "+strings.Join(a, " ") == "lsblk -no PKNAME "+dev && strings.Contains(dev, "nvme0n1p") {
+					return []byte("nvme0n1\n"), nil
+				}
+				return wrapped(n, a)
+			}
+			in.fb.Device = dev
+			if _, err := in.run(); err == nil || !strings.Contains(err.Error(), "root volume") {
+				t.Fatalf("err = %v", err)
+			}
+			if in.runner.ran("mkfs") != 0 || in.runner.ran("mount") != 0 {
+				t.Errorf("the root volume was formatted or mounted: %v", in.runner.calls)
+			}
+		})
+	}
+	// The data volume named explicitly is fine, and so is a root that cannot be told only when no
+	// device was named (the next test): here the check needs the root and fails without it.
+	in := newInstance(t)
+	in.fb.Device = in.dataDev()
+	if _, err := in.run(); err != nil {
+		t.Errorf("the data volume named by hand: %v", err)
+	}
+	in = newInstance(t)
+	in.fb.Device = in.dataDev()
+	in.runner.do = func(n string, a []string) ([]byte, error) {
+		if n == "findmnt" {
+			return nil, errors.New("findmnt: not found")
+		}
+		return in.answer(n, a)
+	}
+	if _, err := in.run(); err == nil || !strings.Contains(err.Error(), "which disk holds /") {
+		t.Errorf("a named device with an unknown root: %v", err)
+	}
+}
+
 // Ubuntu 24.04 (systemd 255) gives every EBS disk two links, with and without a "_1" suffix, and its
 // partitions two each. One data volume is one candidate, whatever its links.
 func TestFirstBootCountsADiskOnceWhateverItsLinks(t *testing.T) {

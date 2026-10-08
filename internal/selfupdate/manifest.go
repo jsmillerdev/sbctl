@@ -51,7 +51,16 @@ type Manifest struct {
 	Host        *ManifestHost `json:"host,omitempty"`
 	AWS         *ManifestAWS  `json:"aws,omitempty"`
 	MinPeerFrom string        `json:"min_peer_from,omitempty"`
+	// WALCompat is false when the release's PostgreSQL cannot read the WAL of the releases before
+	// it, or they cannot read its WAL: a server that holds a standby of another server's database
+	// has to run the release before the server that holds the primary does. Absent means true, which
+	// is what every manifest before the field says.
+	WALCompat *bool `json:"wal_compat,omitempty"`
 }
+
+// WALCompatible reports whether the PostgreSQL of this release and of the releases around it keep
+// the WAL format, so that the servers of a cluster can be upgraded in any order.
+func (m *Manifest) WALCompatible() bool { return m.WALCompat == nil || *m.WALCompat }
 
 // ManifestHost is the host layer a release expects.
 type ManifestHost struct {
@@ -92,7 +101,25 @@ func (m *Manifest) Validate() error {
 			break
 		}
 	}
+	if m.MinPeerFrom != "" {
+		if !versionRe.MatchString(m.MinPeerFrom) {
+			return fmt.Errorf("release manifest min_peer_from %q is not vMAJOR.MINOR.PATCH[-suffix]", m.MinPeerFrom)
+		}
+		if peer, _ := parseVersion(m.MinPeerFrom); newerParts(peer, v) {
+			return fmt.Errorf("release manifest min_peer_from %s is newer than its version %s", m.MinPeerFrom, m.Version)
+		}
+	}
 	return nil
+}
+
+// newerParts reports whether a is a later version than b (the numbers only).
+func newerParts(a, b [3]int) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] > b[i]
+		}
+	}
+	return false
 }
 
 // ParseManifest reads and validates a manifest. Unknown fields are ignored, so that a later

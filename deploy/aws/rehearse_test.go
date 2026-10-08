@@ -231,11 +231,19 @@ func TestRehearseKeepAndPurge(t *testing.T) {
 	if r.code != 0 {
 		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
 	}
+	// --purge is deploy.sh's own cleanup, in the same call that deletes the stack; the rehearsal runs
+	// no deletion of its own.
+	d := fileLines(t, filepath.Join(dir, "deploy.log"))
+	if len(d) == 0 || !strings.HasSuffix(d[len(d)-1], "--delete --yes --purge") {
+		t.Errorf("--purge did not become deploy.sh --delete --purge: %v", d)
+	}
 	log := strings.Join(fileLines(t, filepath.Join(dir, "aws.log")), "\n")
-	for _, want := range []string{"s3api delete-objects --bucket supavise-rehearsal-backup", "s3api delete-bucket --bucket supavise-rehearsal-backup",
-		"s3api delete-bucket --bucket supavise-rehearsal-objects", "ec2 delete-snapshot --snapshot-id snap-1", "ec2 delete-snapshot --snapshot-id snap-2"} {
-		if !strings.Contains(log, want) {
-			t.Errorf("--purge did not run %q:\n%s", want, log)
+	for _, bad := range []string{"delete-objects", "delete-bucket", "delete-snapshot"} {
+		if strings.Contains(log, bad) {
+			t.Errorf("the rehearsal ran %s itself:\n%s", bad, log)
 		}
+	}
+	if strings.Contains(r.stdout, "Left in your account") {
+		t.Errorf("--purge leaves nothing:\n%s", r.stdout)
 	}
 }

@@ -262,3 +262,42 @@ func TestInstallerNeverCopiesConfigDIntoConfigToml(t *testing.T) {
 		t.Errorf("config.toml lost its own setting:\n%s", body)
 	}
 }
+
+// A server whose system cluster is a standby follows a leader; a founder, or a follower that was
+// promoted, does not. An installer that runs again on a follower keeps it, and one that finds a join
+// that stopped after the certificate continues it.
+func TestFollowsALeaderAndAnUnfinishedJoin(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	if followsALeader(cfg) {
+		t.Error("a server with no system cluster follows a leader")
+	}
+	data := cfg.Paths().PostgresData(config.SystemRef)
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if followsALeader(cfg) {
+		t.Error("a founder's system cluster (no standby.signal) is a standby")
+	}
+	if err := os.WriteFile(filepath.Join(data, "standby.signal"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !followsALeader(cfg) {
+		t.Error("a standby system cluster is not a follower")
+	}
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if joinUnfinished(cfgPath) {
+		t.Error("a join that never started is unfinished")
+	}
+	if err := os.MkdirAll(config.ClusterDir(cfgPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config.ClusterDir(cfgPath), "join.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !joinUnfinished(cfgPath) {
+		t.Error("a join state file is not an unfinished join")
+	}
+}

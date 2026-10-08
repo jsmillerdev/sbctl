@@ -52,6 +52,9 @@ type nodeHost struct {
 	cfgPath string
 	root    bool
 	wait    time.Duration
+	// dsn is the registry this run reads (registryDSN), found once.
+	dsnMu sync.Mutex
+	dsn   string
 	// restart restarts supavise.service and waits until it answers; nil is restartAndWait. A test
 	// sets it, so that it never touches the machine's units.
 	restart func(ctx context.Context) error
@@ -65,7 +68,10 @@ type nodeHost struct {
 	hbStop      chan struct{}
 	knowsReason bool
 	// halted is the project the last rollout stopped at (HaltedProject).
-	halted    string
+	halted string
+	// follower is set by Inspect for a server of a cluster that does not lead: its registry is the
+	// leader's copy, which the commands the run starts as workers cannot open for writing.
+	follower  bool
 	from, to  string
 	started   time.Time
 	swappedAt time.Time
@@ -213,7 +219,7 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 		n.Running = &nodeupgrade.Running{PID: u.PID, Phase: u.Phase, To: u.To}
 	}
 
-	dsn := lifecycle.SystemSocketDSN(h.cfg, "supavise")
+	dsn := h.registryDSN(ctx)
 	if n.AppliedMigrations, err = registry.AppliedMigrations(ctx, dsn); err != nil {
 		return nil, fmt.Errorf("cannot reach the registry (is supavise-postgres@system running? run as root or as the supavise user): %w", err)
 	}
@@ -226,6 +232,14 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	// In a cluster the upgrade is the node's own: the projects homed here, and the standbys other
+	// nodes hold of them (the order of a release that keeps no WAL compatibility).
+	if n.Cluster, rows, err = clusterView(ctx, h.cfg, reg, rows); err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	h.follower = n.Cluster != nil && !n.Cluster.Leader
+	h.mu.Unlock()
 	var listErr error
 	n.Projects = nodeupgrade.ProjectsOf(rows, func(ref string) time.Time {
 		bs, err := reg.ListBackups(ctx, ref)
@@ -452,6 +466,8 @@ func (h *nodeHost) Stage(ctx context.Context, c *nodeupgrade.Candidate) (*nodeup
 		st.Discard()
 		return nil, err
 	}
+	// The signed manifest says whether this release keeps the WAL format; the binary cannot.
+	info.WALIncompatible = !r.ver.Manifest.WALCompatible()
 	s := &staged{st: st}
 	s.studio.name, s.studio.url, s.studio.sha, _ = r.ver.Studio(o.Platform)
 	return &nodeupgrade.Staged{Info: info, Data: s}, nil
@@ -942,7 +958,7 @@ func (h *nodeHost) EndUpgrade(_ context.Context, version string, at time.Time) e
 
 // MovesBetween implements nodeupgrade.Host.
 func (h *nodeHost) MovesBetween(ctx context.Context, since, until time.Time) ([]nodeupgrade.ProjectMove, error) {
-	reg, err := registry.OpenExisting(ctx, lifecycle.SystemSocketDSN(h.cfg, "supavise")+" pool_max_conns=2")
+	reg, err := registry.OpenExisting(ctx, h.registryDSN(ctx)+" pool_max_conns=2")
 	if err != nil {
 		return nil, err
 	}
@@ -995,7 +1011,7 @@ func netMoves(ups []registry.Upgrade) []nodeupgrade.ProjectMove {
 
 // AppliedMigrations implements nodeupgrade.Host.
 func (h *nodeHost) AppliedMigrations(ctx context.Context) ([]string, error) {
-	return registry.AppliedMigrations(ctx, lifecycle.SystemSocketDSN(h.cfg, "supavise"))
+	return registry.AppliedMigrations(ctx, h.registryDSN(ctx))
 }
 
 // PreviousRelease implements nodeupgrade.Host.
@@ -1020,6 +1036,15 @@ func (h *nodeHost) Cleanup(ctx context.Context, keep int, current string) {
 		fmt.Fprintf(h.errw, "warning: removing old kept releases: %v\n", err)
 	} else if len(removed) > 0 {
 		fmt.Fprintf(h.out, "removed the kept release(s) %s\n", strings.Join(removed, ", "))
+	}
+	h.mu.Lock()
+	follower := h.follower
+	h.mu.Unlock()
+	if follower {
+		// `artifacts gc` opens the registry for writing, which a follower cannot, so the artifacts
+		// that nothing uses any more stay until the command can run here.
+		fmt.Fprintln(h.out, "unused artifacts are not removed on a follower of a cluster")
+		return
 	}
 	if err := h.asSupavise(ctx, h.out, nil, h.binPath, "artifacts", "gc", "--keep", fmt.Sprint(keep)); err != nil {
 		fmt.Fprintf(h.errw, "warning: removing unused artifacts: %v\n", err)

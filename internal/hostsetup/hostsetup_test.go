@@ -3,10 +3,12 @@ package hostsetup
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,12 +21,15 @@ import (
 type fakeRunner struct {
 	mu    sync.Mutex
 	calls []string
-	do    func(name string, args []string) ([]byte, error)
+	// envs holds the extra environment of each call, in the order of calls.
+	envs [][]string
+	do   func(name string, args []string) ([]byte, error)
 }
 
-func (f *fakeRunner) Run(_ context.Context, _ []string, name string, args ...string) ([]byte, error) {
+func (f *fakeRunner) Run(_ context.Context, env []string, name string, args ...string) ([]byte, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, strings.TrimSpace(name+" "+strings.Join(args, " ")))
+	f.envs = append(f.envs, env)
 	f.mu.Unlock()
 	if f.do == nil {
 		return nil, nil
@@ -329,6 +334,17 @@ func TestUFW(t *testing.T) {
 		}
 	}
 
+	// ufw translates "Status: active"; the rules are read in English whatever the locale is.
+	h0 := newHost(t)
+	r0 := &fakeRunner{do: func(string, []string) ([]byte, error) { return []byte("Status: active\n"), nil }}
+	h0.opts.Runner = r0
+	if _, err := ufwStep(h0.opts).Check(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(r0.calls) != 1 || r0.calls[0] != "ufw status" || !slices.Equal(r0.envs[0], []string{"LC_ALL=C"}) {
+		t.Errorf("ufw status was run as %v with the environment %v", r0.calls, r0.envs)
+	}
+
 	// No ufw, or no mesh port: nothing.
 	h := newHost(t)
 	h.opts.LookPath = func(string) (string, error) { return "", errors.New("not found") }
@@ -383,8 +399,8 @@ func TestPackageStepWithAFakeRunner(t *testing.T) {
 			}
 			return nil, &ExitError{Command: "dpkg-query", Code: 1, Err: errors.New("exit status 1")}
 		case "apt-get":
-			if args[0] == "install" {
-				for _, a := range args[1:] {
+			if i := slices.Index(args, "install"); i >= 0 {
+				for _, a := range args[i+1:] {
 					if !strings.HasPrefix(a, "-") {
 						installed[a] = true
 					}
@@ -413,11 +429,12 @@ func TestPackageStepWithAFakeRunner(t *testing.T) {
 	if err != nil || len(o.Changed) != 1 || o.Changed[0] != "installed xfsprogs" {
 		t.Fatalf("apply = %+v, %v", o, err)
 	}
-	if r.ran("apt-get install -y -qq xfsprogs") != 1 {
+	// apt waits for the dpkg lock that unattended-upgrades may hold, for the refresh and the install.
+	if r.ran("apt-get -o DPkg::Lock::Timeout=300 install -y -qq xfsprogs") != 1 || r.ran("apt-get -o DPkg::Lock::Timeout=300 update -qq") != 1 {
 		t.Errorf("calls: %v", r.calls)
 	}
-	n := r.ran("apt-get install")
-	if o, err := s.Apply(ctx); err != nil || len(o.Changed) != 0 || r.ran("apt-get install") != n {
+	n := r.ran("apt-get -o DPkg::Lock::Timeout=300 install")
+	if o, err := s.Apply(ctx); err != nil || len(o.Changed) != 0 || r.ran("apt-get -o DPkg::Lock::Timeout=300 install") != n {
 		t.Errorf("second apply: %+v, %v, calls %v", o, err, r.calls)
 	}
 	// This release declares none.
@@ -573,6 +590,121 @@ func TestMarker(t *testing.T) {
 type noSync struct{}
 
 func (noSync) Sync(context.Context, bool) ([]string, error) { return nil, nil }
+
+type scriptedSync struct {
+	files []string
+	err   error
+	asked []bool // dryRun of each call
+}
+
+func (s *scriptedSync) Sync(_ context.Context, dryRun bool) ([]string, error) {
+	s.asked = append(s.asked, dryRun)
+	return s.files, s.err
+}
+
+// The cluster-settings step reports what it would write and writes it; a leader that cannot be
+// reached leaves the settings as they are and is a warning, never a failure of the host.
+func TestConfigSyncStep(t *testing.T) {
+	ctx := context.Background()
+	sync := &scriptedSync{files: []string{"/etc/supavise/config.d/10-cluster.toml"}}
+	step := configSyncStep(Options{ConfigSync: sync})
+	if p, err := step.Check(ctx); err != nil || !p.Pending || !strings.Contains(p.Detail, "10-cluster.toml") {
+		t.Errorf("check: %+v, %v", p, err)
+	}
+	o, err := step.Apply(ctx)
+	if err != nil || len(o.Changed) != 1 || o.Changed[0] != "wrote /etc/supavise/config.d/10-cluster.toml" || len(o.Files) != 1 {
+		t.Errorf("apply: %+v, %v", o, err)
+	}
+	if len(sync.asked) != 2 || !sync.asked[0] || sync.asked[1] {
+		t.Errorf("the check must be a dry run and the apply a write: %v", sync.asked)
+	}
+
+	down := &scriptedSync{err: errors.New("cannot reach the leader n1")}
+	step = configSyncStep(Options{ConfigSync: down})
+	if p, err := step.Check(ctx); err != nil || p.Pending || !p.Unknown || !strings.Contains(p.Detail, "cannot reach the leader n1") {
+		t.Errorf("check with the leader down: %+v, %v (want not pending, but not known to be in order either)", p, err)
+	}
+	o, err = step.Apply(ctx)
+	if err != nil || len(o.Changed) != 0 || len(o.Warnings) != 1 || !strings.Contains(o.Warnings[0], "were not refreshed") {
+		t.Errorf("apply with the leader down: %+v, %v", o, err)
+	}
+
+	// Run counts such a step as done: the converge succeeds and records its revision.
+	h := newHost(t)
+	h.opts.ConfigSync = down
+	c := &Converger{Steps: DefaultSteps(h.opts), StateDir: h.state, Out: &bytes.Buffer{}}
+	if _, err := c.Run(ctx); err != nil {
+		t.Errorf("a converge failed on a leader that could not be reached: %v", err)
+	}
+}
+
+// lateSync is a leader that does not answer the check and answers the write.
+type lateSync struct{ files []string }
+
+func (l lateSync) Sync(_ context.Context, dryRun bool) ([]string, error) {
+	if dryRun {
+		return nil, errors.New("deadline exceeded")
+	}
+	return l.files, nil
+}
+
+// A converge whose check could not tell, and whose write reached the leader, reports what it wrote
+// and no longer calls the step unknown.
+func TestConvergeClearsUnknownWhenTheWriteReachedTheLeader(t *testing.T) {
+	h := newHost(t)
+	h.opts.ConfigSync = lateSync{files: []string{"/etc/supavise/config.d/10-cluster.toml"}}
+	c := &Converger{Steps: []Step{configSyncStep(h.opts)}, StateDir: h.state, Out: &bytes.Buffer{}, NoMarker: true}
+	rs, err := c.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs[0].ID != "config-d" || rs[0].Unknown || rs[0].Detail != "" || len(rs[0].Changed) != 1 {
+		t.Errorf("result: %+v", rs[0])
+	}
+	// A leader that stays silent keeps the step unknown (it was a warning, not a change).
+	c = &Converger{Steps: []Step{configSyncStep(Options{ConfigSync: &scriptedSync{err: errors.New("cannot reach the leader n1")}})}, StateDir: h.state, Out: &bytes.Buffer{}, NoMarker: true}
+	rs, err = c.Run(context.Background())
+	if err != nil || !rs[0].Unknown {
+		t.Errorf("a leader that never answered: %+v, %v", rs[0], err)
+	}
+}
+
+// blockedSync waits for the context, as a leader that accepts the connection and never answers does.
+type blockedSync struct{}
+
+func (blockedSync) Sync(ctx context.Context, _ bool) ([]string, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A check does not wait for a leader that is down: status and `converge --check` run it. The result
+// says the step was not checked, and the converge report carries that to a person and to JSON.
+func TestConfigSyncCheckGivesUpOnALeaderThatDoesNotAnswer(t *testing.T) {
+	old := configCheckTimeout
+	configCheckTimeout = 50 * time.Millisecond
+	defer func() { configCheckTimeout = old }()
+
+	h := newHost(t)
+	h.opts.ConfigSync = blockedSync{}
+	c := &Converger{Steps: []Step{configSyncStep(h.opts)}, StateDir: h.state, Out: &bytes.Buffer{}}
+	start := time.Now()
+	rs := c.Check(context.Background())
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("the check waited %s", took)
+	}
+	if len(rs) < 1 || rs[0].ID != "config-d" || rs[0].Pending || !rs[0].Unknown || !strings.Contains(rs[0].Detail, "deadline exceeded") {
+		t.Fatalf("results: %+v", rs)
+	}
+	b, err := json.Marshal(rs[0])
+	if err != nil || !strings.Contains(string(b), `"unknown":true`) {
+		t.Errorf("json: %s %v", b, err)
+	}
+	// A step that was checked says nothing about it.
+	ok := Result{ID: "x", Title: "x"}
+	if b, _ := json.Marshal(ok); strings.Contains(string(b), "unknown") {
+		t.Errorf("json of a checked step: %s", b)
+	}
+}
 
 // The titles are what the release calls its host changes: stable, one per step, no duplicates. The
 // cluster-settings step is in the step list of a node that has a syncer, and not in the release's list.

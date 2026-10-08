@@ -329,11 +329,39 @@ func TestFencingPolicy(t *testing.T) {
 			t.Errorf("%s takes no resource and no condition: %s", w.sid, res)
 		}
 	}
-	// Nothing in the template grants more of EC2 than this.
+	// Nothing in the template grants more of EC2 than this, and the one other policy that names EC2
+	// (a server of a cluster finds a peer by its instance id) reads instances and nothing else.
 	for name, res := range r {
-		if get(t, res, "Type") == "AWS::IAM::Policy" && name != "FencingPolicy" && strings.Contains(fmt.Sprint(get(t, res, "Properties", "PolicyDocument")), "ec2:") {
-			t.Errorf("%s grants EC2 actions; only FencingPolicy may", name)
+		if get(t, res, "Type") != "AWS::IAM::Policy" || name == "FencingPolicy" {
+			continue
 		}
+		doc := fmt.Sprint(get(t, res, "Properties", "PolicyDocument"))
+		if !strings.Contains(doc, "ec2:") {
+			continue
+		}
+		if name != "ClusterDescribePolicy" || strings.Count(doc, "ec2:") != 1 || !strings.Contains(doc, "ec2:DescribeInstances") {
+			t.Errorf("%s grants EC2 actions; only FencingPolicy may (and ClusterDescribePolicy, DescribeInstances alone)", name)
+		}
+	}
+}
+
+// A server of a cluster, a leader with a peer rule or a replica server, may describe instances
+// whether or not automatic failover is on: the mesh resolver asks EC2 for a peer's address. A single
+// server (every default) has no such statement, so an update of a v0.1.1 stack adds nothing.
+func TestClusterDescribePolicyFollowsTheCluster(t *testing.T) {
+	d := load(t)
+	has := func(params map[string]string) bool {
+		_, ok := render(t, d, params).res["ClusterDescribePolicy"]
+		return ok
+	}
+	if has(map[string]string{"AdminEmail": "a@b.co"}) {
+		t.Error("a single server got the cluster describe policy")
+	}
+	if !has(map[string]string{"AdminEmail": "a@b.co", "PeerCidr1": "203.0.113.4/32"}) {
+		t.Error("a leader with a peer rule has no cluster describe policy")
+	}
+	if !has(joinerParams()) {
+		t.Error("a replica server has no cluster describe policy")
 	}
 }
 

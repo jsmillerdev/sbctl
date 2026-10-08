@@ -74,20 +74,29 @@ func changedLines(rs []hostsetup.Result) []string {
 // renderCheck prints the result of --check for a person.
 func renderCheck(w io.Writer, rs []hostsetup.Result) {
 	t := newTable(w)
-	n := 0
+	n, unknown := 0, 0
 	for _, r := range rs {
 		state := "ok"
-		if r.Pending {
+		switch {
+		case r.Pending:
 			state, n = "pending", n+1
+		case r.Unknown:
+			state, unknown = "unknown", unknown+1
 		}
 		fmt.Fprintf(t, "%s\t%s\t%s\n", state, r.Title, r.Detail)
 	}
 	_ = t.Flush()
-	if n == 0 {
+	switch {
+	case n > 0:
+		fmt.Fprintf(w, "%d step(s) pending: sudo supavise system converge\n", n)
+		if unknown > 0 {
+			fmt.Fprintf(w, "%d step(s) could not be checked\n", unknown)
+		}
+	case unknown > 0:
+		fmt.Fprintf(w, "nothing is pending, but %d step(s) could not be checked (revision %d)\n", unknown, hostsetup.Revision)
+	default:
 		fmt.Fprintf(w, "host is converged (revision %d)\n", hostsetup.Revision)
-		return
 	}
-	fmt.Fprintf(w, "%d step(s) pending: sudo supavise system converge\n", n)
 }
 
 // newConverger builds the step list of this node. sandbox keeps it to the unit files: the other
@@ -112,8 +121,12 @@ func newConverger(cfg *config.Config, unitDir, polkitDir string, sandbox bool, o
 		},
 		PeerPort: peerPort(cfg),
 	}
+	// A server in a cluster refreshes the cluster-scoped settings from its leader.
+	if cs := newClusterConfigSync(cfg, selfUpdateConfigPath()); cs != nil {
+		o.ConfigSync = cs
+	}
 	if sandbox {
-		o.Owner, o.PeerPort = nil, 0
+		o.Owner, o.PeerPort, o.ConfigSync = nil, 0, nil
 		o.MountInfo = func() ([]byte, error) { return nil, errors.New("not read in a test directory") }
 	}
 	// A test directory takes the unit files and nothing else, so it must not record that the host is

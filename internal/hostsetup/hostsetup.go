@@ -86,6 +86,10 @@ func exitCode(err error) int {
 type Pending struct {
 	// Pending is true when applying the step would change something.
 	Pending bool
+	// Unknown is true when the check could not tell, because what it compares with did not answer
+	// (the leader of a cluster). Pending is false then, since applying changes nothing that is
+	// known, but the step has not been seen to be in order.
+	Unknown bool
 	// Detail says what, or why the step does not apply here.
 	Detail string
 }
@@ -137,6 +141,8 @@ type Result struct {
 	Title     string `json:"title"`
 	Pending   bool   `json:"pending"`
 	NeedsRoot bool   `json:"needs_root"`
+	// Unknown is set on a check that could not tell (see Pending.Unknown); it is left out otherwise.
+	Unknown bool `json:"unknown,omitempty"`
 	// Detail says what is pending, or why the step does not apply on this host.
 	Detail string `json:"detail,omitempty"`
 	// Changed lists what Run changed.
@@ -193,7 +199,7 @@ func (c *Converger) Check(ctx context.Context) []Result {
 		if err != nil {
 			r.Pending, r.Detail = true, err.Error()
 		} else {
-			r.Pending, r.Detail = p.Pending, p.Detail
+			r.Pending, r.Unknown, r.Detail = p.Pending, p.Unknown, p.Detail
 		}
 		out = append(out, r)
 	}
@@ -225,10 +231,15 @@ func (c *Converger) Run(ctx context.Context) ([]Result, error) {
 	for _, s := range c.Steps {
 		r := Result{ID: s.ID(), Title: s.Title(), NeedsRoot: s.NeedsRoot()}
 		if p, err := s.Check(ctx); err == nil {
-			r.Pending, r.Detail = p.Pending, p.Detail
+			r.Pending, r.Unknown, r.Detail = p.Pending, p.Unknown, p.Detail
 		}
 		o, err := s.Apply(ctx)
 		r.Changed = o.Changed
+		if r.Unknown && err == nil && len(o.Warnings) == 0 {
+			// The check could not tell, the apply could: a leader that answered late. Nothing is
+			// unknown about the step any more.
+			r.Unknown, r.Detail = false, ""
+		}
 		for _, line := range o.Changed {
 			c.say("%s", line)
 		}

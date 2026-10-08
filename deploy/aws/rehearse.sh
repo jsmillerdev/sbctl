@@ -23,7 +23,7 @@
 # with credentials of an account you may spend in. Exit status: 0 every check passed, 1 a check failed
 # (the stack is still deleted unless --keep), 2 bad arguments or a refused step.
 #
-# --keep leaves the stack; --purge empties and deletes the two buckets and the snapshots the rehearsal
+# --keep leaves the stack; --purge also destroys the two buckets and the snapshots the rehearsal
 # made (otherwise it prints what remains and the commands); --yes skips the prompt before the deletion;
 # --dry-run prints the commands and runs none. SUPAVISE_REHEARSE_DEPLOY names another deploy.sh.
 set -euo pipefail
@@ -73,6 +73,8 @@ export SUPAVISE_IMDS_ENDPOINT=http://127.0.0.1:1
 STACK=supavise-rehearsal-$(date -u +%m%d%H%M%S)
 AWS=(aws --region "$REGION")
 [[ -z $PROFILE ]] || AWS+=(--profile "$PROFILE")
+PURGE_ARG=()
+[[ $PURGE -eq 0 ]] || PURGE_ARG=(--purge)
 DEPLOY_ARGS=(--region "$REGION")
 [[ -z $PROFILE ]] || DEPLOY_ARGS+=(--profile "$PROFILE")
 
@@ -91,8 +93,8 @@ if [[ $DRY -eq 1 ]]; then
   show "$DEPLOY" update "${DEPLOY_ARGS[@]}" --stack "$STACK" --template "$NEW_TEMPLATE" --set Failover=on --set PeerCidr1=198.51.100.0/24 --yes
   say "# 5. the checklist for the node, then you press Enter"
   say "# 6. the deletion:"
-  show "$DEPLOY" "${DEPLOY_ARGS[@]}" --stack-name "$STACK" --delete --yes
-  [[ $PURGE -eq 0 ]] || say "# and with --purge: both buckets are emptied (every version) and deleted, and the snapshots of the data volume are deleted"
+  show "$DEPLOY" "${DEPLOY_ARGS[@]}" --stack-name "$STACK" --delete --yes ${PURGE_ARG[@]+"${PURGE_ARG[@]}"}
+  [[ $PURGE -eq 0 ]] || say "# with --purge: both buckets are emptied (every version) and deleted, and the snapshots of the data volume are deleted, by deploy.sh --delete --purge"
   exit 0
 fi
 
@@ -132,43 +134,21 @@ cleanup() {
     read -r _ || true
   fi
   say "== 6. deleting $STACK"
-  "$DEPLOY" "${DEPLOY_ARGS[@]}" --stack-name "$STACK" --delete --yes || say "WARNING: the stack was not deleted: $DEPLOY ${DEPLOY_ARGS[*]} --stack-name $STACK --delete --yes"
+  # With --purge the deletion is deploy.sh's own one-command cleanup (--delete --purge), which is
+  # thereby tried against a real account: the stack, both buckets with every object version, and
+  # every snapshot of the data volume.
+  "$DEPLOY" "${DEPLOY_ARGS[@]}" --stack-name "$STACK" --delete --yes ${PURGE_ARG[@]+"${PURGE_ARG[@]}"} \
+    || say "WARNING: the stack was not deleted: $DEPLOY ${DEPLOY_ARGS[*]} --stack-name $STACK --delete --yes ${PURGE_ARG[*]}"
   leftovers
   rm -rf "$WORK"
   exit "$rc"
 }
 
 # shellcheck disable=SC2329  # run by cleanup
-purge_bucket() { # BUCKET: every object version and delete marker, then the bucket
-  local out n
-  while :; do
-    out=$("${AWS[@]}" s3api list-object-versions --bucket "$1" --max-items 500 --output json) || return 1
-    n=$(printf '%s' "$out" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-items = [{"Key": v["Key"], "VersionId": v["VersionId"]} for k in ("Versions", "DeleteMarkers") for v in (d.get(k) or [])]
-json.dump({"Objects": items, "Quiet": True}, open(sys.argv[1], "w"))
-print(len(items))' "$WORK/delete.json")
-    [[ $n -gt 0 ]] || break
-    "${AWS[@]}" s3api delete-objects --bucket "$1" --delete "file://$WORK/delete.json" >/dev/null || return 1
-  done
-  "${AWS[@]}" s3api delete-bucket --bucket "$1"
-}
-# shellcheck disable=SC2329  # run by cleanup
 leftovers() {
-  local objects="" snaps s
+  local objects=""
+  [[ $PURGE -eq 0 ]] || return 0 # deploy.sh --delete --purge destroyed them
   objects=$(printf '%s\n' "$OBJECTS" | sed '/^$/d')
-  if [[ $PURGE -eq 1 ]]; then
-    for b in $BACKUP $objects; do
-      [[ -n $b && $b != None ]] || continue
-      say "purging bucket $b"; purge_bucket "$b" || say "WARNING: bucket $b was not purged"
-    done
-    if [[ -n $VOLUME && $VOLUME != None ]]; then
-      snaps=$("${AWS[@]}" ec2 describe-snapshots --owner-ids self --filters "Name=volume-id,Values=$VOLUME" --query 'Snapshots[].SnapshotId' --output text || true)
-      for s in $snaps; do say "deleting snapshot $s"; "${AWS[@]}" ec2 delete-snapshot --snapshot-id "$s" || true; done
-    fi
-    return
-  fi
   say "Left in your account, and billed until you delete them:"
   say "  buckets  $BACKUP $objects  (empty every version, then:  aws s3 rb s3://BUCKET)  or run this again with --purge"
   say "  snapshots of volume $VOLUME  (aws ec2 describe-snapshots --owner-ids self --filters Name=volume-id,Values=$VOLUME)"

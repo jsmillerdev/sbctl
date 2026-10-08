@@ -148,6 +148,20 @@ func awsCommand(stack string, sets []string) string {
 	return cmd
 }
 
+// awsStandalone is the same update as the signed script runs it on its own: for an operator whose
+// credentials live in CloudShell or on a laptop and not on the node. The script reads the region
+// from AWS_REGION or --region, so the node's region is named when it is known.
+func awsStandalone(stack, region string, sets []string) string {
+	if region == "" {
+		region = "REGION"
+	}
+	cmd := "supavise-aws-deploy.sh update --stack " + shellQuote(stack) + " --region " + shellQuote(region)
+	for _, s := range sets {
+		cmd += " --set " + shellQuote(s)
+	}
+	return cmd
+}
+
 // shellQuote quotes s for display, only when a shell would need it.
 func shellQuote(s string) string {
 	if s != "" && strings.Trim(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:=@%+,-") == "" {
@@ -168,12 +182,7 @@ func (h *nodeHost) stackName(ctx context.Context, given string) (string, error) 
 		// Reading what the instance is does not use its role. An operator who set
 		// AWS_EC2_METADATA_DISABLED so that no tool takes the role's credentials (the update script
 		// sets it too) still gets the instance's tags read here, before the script runs.
-		c, err := awsapi.New(awsapi.Config{Getenv: func(k string) string {
-			if k == "AWS_EC2_METADATA_DISABLED" {
-				return ""
-			}
-			return os.Getenv(k)
-		}})
+		c, err := awsapi.New(awsapi.Config{NoInstanceRole: true, Getenv: hideMetadataSwitch})
 		if err == nil {
 			if tags, err := c.IMDS.Tags(ctx); err == nil {
 				name = tags["supavise:stack-name"]
@@ -200,7 +209,7 @@ func (h *nodeHost) UpdateStack(ctx context.Context, c *nodeupgrade.Candidate, so
 	}
 	home, _ := os.UserHomeDir()
 	if !awsCredentialsPresent(os.Getenv, home) {
-		return nodeupgrade.StackOutcome{Command: awsCommand(stack, so.Sets)}, nil
+		return nodeupgrade.StackOutcome{Command: awsCommand(stack, so.Sets), Standalone: awsStandalone(stack, h.region(ctx), so.Sets)}, nil
 	}
 	r, ok := c.Data.(*resolved)
 	if !ok {
@@ -226,9 +235,16 @@ func (h *nodeHost) UpdateStack(ctx context.Context, c *nodeupgrade.Candidate, so
 	}
 
 	// The script asks the operator to type "apply" after it shows the change set, so it keeps the
-	// terminal. It is run by bash, not executed, so a noexec /tmp does not matter.
+	// terminal. It is run by bash, not executed, so a noexec /tmp does not matter. The script and the
+	// template are the bytes that AWSAssets checked against the signed list, so nothing is left for the
+	// script's own check of itself, which only runs on its download path.
 	cmd := exec.CommandContext(ctx, "bash", append([]string{script}, awsUpdateArgs(stack, template, so.Sets)...)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, h.out, h.errw
+	// The script takes its trust root (the release key, the download address) and the address of the
+	// metadata service it checks the node's identity against from these variables when they are set,
+	// for tests. `sudo -E` passes on whatever the caller exported, and the stack is changed with this
+	// script: the variables do not reach it.
+	cmd.Env = withoutEnv(os.Environ(), scriptTestHookVars...)
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
@@ -242,6 +258,49 @@ func (h *nodeHost) UpdateStack(ctx context.Context, c *nodeupgrade.Candidate, so
 		fmt.Fprintf(h.errw, "warning: could not record the stack name in config.d: %v\n", err)
 	}
 	return nodeupgrade.StackOutcome{}, nil
+}
+
+// scriptTestHookVars are the variables that replace what supavise-aws-deploy.sh trusts: the release
+// key, the address the release is fetched from and the address of the metadata service.
+var scriptTestHookVars = []string{"SUPAVISE_DEPLOY_PUBKEY_B64", "SUPAVISE_DEPLOY_BASE_URL", "SUPAVISE_IMDS_ENDPOINT"}
+
+// withoutEnv returns env without the variables named.
+func withoutEnv(env []string, names ...string) []string {
+	out := make([]string, 0, len(env))
+next:
+	for _, kv := range env {
+		for _, n := range names {
+			if strings.HasPrefix(kv, n+"=") {
+				continue next
+			}
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// region is the region the instance runs in, read from the metadata service without its role
+// credentials, or "" when it cannot be read.
+func (h *nodeHost) region(ctx context.Context) string {
+	c, err := awsapi.New(awsapi.Config{NoInstanceRole: true, Getenv: hideMetadataSwitch})
+	if err != nil {
+		return ""
+	}
+	r, err := c.IMDS.Region(ctx)
+	if err != nil {
+		return ""
+	}
+	return r
+}
+
+// hideMetadataSwitch is os.Getenv without AWS_EC2_METADATA_DISABLED. An operator sets that switch so
+// that no tool takes the instance role's credentials, and the update script sets it itself; reading
+// the instance's identity and tags takes no credentials, so these reads ignore it.
+func hideMetadataSwitch(k string) string {
+	if k == "AWS_EC2_METADATA_DISABLED" {
+		return ""
+	}
+	return os.Getenv(k)
 }
 
 // writeAWSConfig records the node's stack in config.d/20-aws.toml. The file is read by the
