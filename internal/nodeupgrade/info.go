@@ -18,11 +18,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/artifacts"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
-	"github.com/jsmillerdev/supavise/internal/versions"
+	"github.com/supavise/supavise/internal/artifacts"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/versions"
 )
 
 // Info describes one release as its binary reports it (`supavise release-info`): the versions

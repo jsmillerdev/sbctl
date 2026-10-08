@@ -8,10 +8,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/api"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/members"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // openAccounts connects to the registry and returns the account service the claim page

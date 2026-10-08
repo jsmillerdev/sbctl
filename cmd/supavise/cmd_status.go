@@ -11,11 +11,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/health"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/health"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/units"
 )
 
 func init() {

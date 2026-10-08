@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // A branch is a project created with CreateRequest.Branch: the registry row carries the

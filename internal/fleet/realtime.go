@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // Realtime is one shared server for every project. It finds the tenant of a request in

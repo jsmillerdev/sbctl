@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/api"
-	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/backup"
 )
 
 // Deployments made through the API store survive a backup and a restore: into another

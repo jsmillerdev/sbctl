@@ -3,10 +3,10 @@ package main
 import (
 	"log/slog"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // newFleet returns the tenant fleet that every process creating, re-keying or deleting

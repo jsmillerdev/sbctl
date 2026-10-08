@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // pgStoreWithProject opens the registry database CI provides (SUPAVISE_TEST_DATABASE_URL), applies the

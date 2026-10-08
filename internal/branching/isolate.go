@@ -13,8 +13,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // A branch cloned from the parent's data (copy-on-write or base backup) carries everything

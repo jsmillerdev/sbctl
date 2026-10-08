@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"text/tabwriter"
 
-	"github.com/jsmillerdev/supavise/internal/app"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/app"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 )
 
 // newLogger returns a text logger on stderr at the config's log level.

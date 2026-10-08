@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/notice"
+	"github.com/supavise/supavise/internal/notice"
 )
 
 func TestIncidentBannerIsAnsweredByTheProxy(t *testing.T) {

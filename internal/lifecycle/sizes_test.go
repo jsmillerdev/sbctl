@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/projectconfig"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/projectconfig"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // hostedRow is a row of the compute table at supabase.com/docs/guides/platform/compute-and-disk:

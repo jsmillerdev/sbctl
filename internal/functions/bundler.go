@@ -17,9 +17,9 @@ import (
 
 	"github.com/andybalholm/brotli"
 
-	"github.com/jsmillerdev/supavise/internal/api"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // Server-side bundling.

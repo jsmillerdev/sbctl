@@ -20,8 +20,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/api"
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/config"
 )
 
 const installUser = "supavise"

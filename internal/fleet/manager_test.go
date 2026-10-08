@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // managerRig is a Manager over a fake supervisor whose units bring a health endpoint up

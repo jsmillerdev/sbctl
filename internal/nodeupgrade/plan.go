@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/selfupdate"
 )
 
 // PlanOptions are the settings the plan depends on.

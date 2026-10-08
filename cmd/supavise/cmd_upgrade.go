@@ -12,9 +12,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
-	"github.com/jsmillerdev/supavise/internal/update"
+	"github.com/supavise/supavise/internal/nodeupgrade"
+	"github.com/supavise/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/update"
 )
 
 // refusedBefore makes an error that stops `upgrade` or `rollback` before it has read the node a

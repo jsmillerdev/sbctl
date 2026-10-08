@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // ArchiveCommand is the archive_command for ref's cluster. Postgres runs it from the

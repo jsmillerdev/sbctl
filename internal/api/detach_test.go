@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/lifecycle"
 )
 
 // A client that disconnects partway (Ctrl-C on `supabase projects delete`, a closed

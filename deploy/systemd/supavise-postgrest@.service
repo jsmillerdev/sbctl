@@ -1,6 +1,6 @@
 [Unit]
 Description=Supavise PostgREST for project %i
-Documentation=https://github.com/jsmillerdev/supavise
+Documentation=https://github.com/supavise/supavise
 Requires=supavise-postgres@%i.service
 After=network.target local-fs.target supavise-postgres@%i.service
 StartLimitIntervalSec=0

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // objectsBackup is a BaseBackuper that records whether the project's Storage objects were still

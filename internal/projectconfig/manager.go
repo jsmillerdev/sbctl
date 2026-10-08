@@ -8,7 +8,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // Options configure a Manager.

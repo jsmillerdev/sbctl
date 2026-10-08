@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // Values the services are configured with that are not secrets.

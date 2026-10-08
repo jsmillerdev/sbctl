@@ -7,7 +7,7 @@ import (
 	"errors"
 	"log/slog"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // Systemd is only available on Linux; elsewhere NewSystemd fails and the exec

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/units"
 )
 
 func testCreds(t *testing.T, n *testNode) *creds {

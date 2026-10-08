@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 var t0 = time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)

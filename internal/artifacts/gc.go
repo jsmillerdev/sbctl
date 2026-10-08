@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // A node keeps old artifacts for two reasons: a project may still run them (a project moves to

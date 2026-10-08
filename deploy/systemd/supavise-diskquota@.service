@@ -1,6 +1,6 @@
 [Unit]
 Description=Supavise XFS project quota of project %i
-Documentation=https://github.com/jsmillerdev/supavise
+Documentation=https://github.com/supavise/supavise
 
 [Service]
 # Started by supavise when a project's disk size is set (Management API or `supavise projects`)

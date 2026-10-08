@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/selfupdate"
 )
 
 // rebootMarkers are the files that packages write when an update needs a reboot.

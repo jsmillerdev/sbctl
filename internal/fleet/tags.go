@@ -5,8 +5,8 @@ import (
 	"os"
 	"regexp"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // RenderedTag returns the release tag of svc that the node's unit is set to run: the artifact

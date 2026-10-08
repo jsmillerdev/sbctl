@@ -14,7 +14,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // maxDeploy bounds one function upload (all files together).

@@ -4,7 +4,7 @@
 # `supavise install`, which does the rest (user, config, units, firewall, system project,
 # shared services, supavise.service) and prints the dashboard URL and the claim token.
 #
-#   curl -fsSL https://github.com/jsmillerdev/supavise/releases/latest/download/install.sh | sudo bash -s -- \
+#   curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- \
 #       --domain example.com --dns cloudflare --dns-credentials-file /root/cf.env --email you@example.com
 #
 # Idempotent: re-running keeps the master key, the registry and every project, and a flag
@@ -23,7 +23,7 @@
 # and SUPAVISE_INSTALL_PUBKEY_B64 replaces the embedded release key (base64 of its PEM).
 set -euo pipefail
 
-REPO=${SUPAVISE_INSTALL_REPO:-jsmillerdev/supavise}
+REPO=${SUPAVISE_INSTALL_REPO:-supavise/supavise}
 # The release workflow replaces this marker with the base64 of the release public key
 # (internal/selfupdate/release_key.pem) in the install.sh it attaches to each release.
 RELEASE_PUBKEY_B64=${SUPAVISE_INSTALL_PUBKEY_B64:-__SUPAVISE_RELEASE_PUBKEY_B64__}

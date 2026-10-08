@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/domains"
-	"github.com/jsmillerdev/supavise/internal/projectconfig"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/domains"
+	"github.com/supavise/supavise/internal/projectconfig"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // dnsStub is the node's resolver in these tests: fixed records, NXDOMAIN for everything else.

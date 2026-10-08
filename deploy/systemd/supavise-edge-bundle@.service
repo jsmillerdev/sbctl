@@ -1,6 +1,6 @@
 [Unit]
 Description=Supavise one-shot bundler for uploaded Edge Function sources of project %i
-Documentation=https://github.com/jsmillerdev/supavise
+Documentation=https://github.com/supavise/supavise
 After=network.target local-fs.target
 StartLimitIntervalSec=0
 

@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/nodeupgrade"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // The history behind a second rollback: v1 -> v2 moves a project (window 1), v2 -> v3 moves it

@@ -7,11 +7,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/projectconfig"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/projectconfig"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // fakeSettings is a Settings with canned answers.

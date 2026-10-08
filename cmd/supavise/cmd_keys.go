@@ -14,8 +14,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // The master key (/etc/supavise/master.key) unseals the passwords inside every backup and

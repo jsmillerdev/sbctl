@@ -20,7 +20,7 @@ The work happens in `supavise install` (`cmd/supavise/cmd_install.go`), not in s
 Create the DNS records first (below), then, as root:
 
 ```bash
-curl -fsSL https://github.com/jsmillerdev/supavise/releases/latest/download/install.sh | sudo bash -s -- \
+curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- \
   --domain example.com --dns cloudflare --dns-credentials-file /root/cloudflare.env --email you@example.com
 ```
 
@@ -315,7 +315,7 @@ Every release attaches two files for this: `supavise.yaml` (the template, with t
 
 ### a. Console upload
 
-1. Download `supavise.yaml` from the [latest release](https://github.com/jsmillerdev/supavise/releases/latest).
+1. Download `supavise.yaml` from the [latest release](https://github.com/supavise/supavise/releases/latest).
 2. In the AWS console, pick your region, open CloudFormation, then **Create stack, With new resources, Upload a template file**, and choose the file.
 3. Enter a stack name (`supavise`) and your **Admin email**. Leave the rest as it is.
 4. Tick **I acknowledge that AWS CloudFormation might create IAM resources**, then **Create stack**.
@@ -324,7 +324,7 @@ Every release attaches two files for this: `supavise.yaml` (the template, with t
 ### b. deploy.sh
 
 ```bash
-curl -fsSLO https://github.com/jsmillerdev/supavise/releases/latest/download/supavise-aws-deploy.sh
+curl -fsSLO https://github.com/supavise/supavise/releases/latest/download/supavise-aws-deploy.sh
 chmod +x supavise-aws-deploy.sh
 ./supavise-aws-deploy.sh --region us-east-1 --email you@example.com
 ```
@@ -387,10 +387,10 @@ aws iam create-role --role-name supavise-release-templates --assume-role-policy-
     "Condition": {
       "StringEquals": {
         "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-        "token.actions.githubusercontent.com:sub": "repo:jsmillerdev/supavise:environment:release"
+        "token.actions.githubusercontent.com:sub": "repo:supavise/supavise:environment:release"
       },
       "StringLike": {
-        "token.actions.githubusercontent.com:job_workflow_ref": "jsmillerdev/supavise/.github/workflows/release.yml@refs/tags/v*"
+        "token.actions.githubusercontent.com:job_workflow_ref": "supavise/supavise/.github/workflows/release.yml@refs/tags/v*"
       }
     }
   }]
@@ -405,9 +405,9 @@ aws iam put-role-policy --role-name supavise-release-templates --policy-name put
 }'
 
 # 6. Tell the repository (variables, not secrets).
-gh variable set AWS_TEMPLATE_BUCKET --repo jsmillerdev/supavise --body "$BUCKET"
-gh variable set AWS_TEMPLATE_REGION --repo jsmillerdev/supavise --body "$REGION"
-gh variable set AWS_RELEASE_ROLE_ARN --repo jsmillerdev/supavise --body "arn:aws:iam::$ACCOUNT:role/supavise-release-templates"
+gh variable set AWS_TEMPLATE_BUCKET --repo supavise/supavise --body "$BUCKET"
+gh variable set AWS_TEMPLATE_REGION --repo supavise/supavise --body "$REGION"
+gh variable set AWS_RELEASE_ROLE_ARN --repo supavise/supavise --body "arn:aws:iam::$ACCOUNT:role/supavise-release-templates"
 ```
 
 If step 2 fails with an access-denied error on the public access block, the account has Block Public Access switched on for all buckets; turn off only its "block public policy" and "restrict public buckets" settings (S3 console, Block Public Access settings for this account), or give up the button and use paths a and b.

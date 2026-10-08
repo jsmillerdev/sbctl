@@ -1,4 +1,4 @@
-module github.com/jsmillerdev/supavise
+module github.com/supavise/supavise
 
 go 1.26.0
 

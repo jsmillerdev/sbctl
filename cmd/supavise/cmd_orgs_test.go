@@ -13,7 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // orgsNode prepares what `supavise orgs` needs without a system cluster: a registry database of its

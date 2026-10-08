@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 func TestCompare(t *testing.T) {

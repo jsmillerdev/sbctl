@@ -39,8 +39,8 @@ import (
 )
 
 // DefaultRepo is the GitHub repository releases come from. Variable so that a fork can
-// set it at build time (-ldflags "-X github.com/jsmillerdev/supavise/internal/selfupdate.DefaultRepo=owner/name").
-var DefaultRepo = "jsmillerdev/supavise"
+// set it at build time (-ldflags "-X github.com/supavise/supavise/internal/selfupdate.DefaultRepo=owner/name").
+var DefaultRepo = "supavise/supavise"
 
 //go:embed release_key.pem
 var releaseKeyPEM []byte

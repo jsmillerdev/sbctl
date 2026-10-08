@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // While a project's legacy keys are disabled, no request to its host may carry the signing

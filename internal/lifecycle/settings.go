@@ -5,7 +5,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/supavise/supavise/internal/projectconfig"
 )
 
 // Settings is the project's saved configuration as the lifecycle renders it: the

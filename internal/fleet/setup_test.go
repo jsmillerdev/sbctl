@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // touchRunFile marks svc's unit as rendered on this node.

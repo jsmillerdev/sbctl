@@ -11,11 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/branching"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/members"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/branching"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Deleting an organization (DELETE /platform/organizations/{slug}, `supavise orgs delete`).

@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Backups and point-in-time restore, in the shapes of hosted Supabase's dashboard (/platform) and

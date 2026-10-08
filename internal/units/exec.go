@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // Exec is the development and test Supervisor: it runs each unit's launcher as a

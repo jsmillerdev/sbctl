@@ -8,12 +8,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/api"
-	"github.com/jsmillerdev/supavise/internal/app"
-	"github.com/jsmillerdev/supavise/internal/branching"
-	"github.com/jsmillerdev/supavise/internal/functions"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/app"
+	"github.com/supavise/supavise/internal/branching"
+	"github.com/supavise/supavise/internal/functions"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 type orgView struct {

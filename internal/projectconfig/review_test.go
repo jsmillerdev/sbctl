@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 func patchWith(m *Manager, svc Service, body map[string]any, cx CrossContext) error {

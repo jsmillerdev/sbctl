@@ -99,7 +99,7 @@ Embed from the repository root README:
 
 ```html
 <p align="center">
-  <a href="https://github.com/jsmillerdev/supavise">
+  <a href="https://github.com/supavise/supavise">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="brand/readme/banner-dark.svg">
       <img alt="Supavise: many Supabase projects, one server" src="brand/readme/banner-light.svg" width="100%">

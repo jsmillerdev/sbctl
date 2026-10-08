@@ -11,9 +11,9 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/health"
-	"github.com/jsmillerdev/supavise/internal/update"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/health"
+	"github.com/supavise/supavise/internal/update"
 )
 
 func TestInstallUpdateFlags(t *testing.T) {

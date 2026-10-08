@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jsmillerdev/supavise/internal/members"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // SweepStandIn removes what `supavise functions dev --token-file` leaves behind when it dies

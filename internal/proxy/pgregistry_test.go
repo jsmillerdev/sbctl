@@ -14,9 +14,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // TestPostgresRegistry runs the proxy over the real Postgres registry and real

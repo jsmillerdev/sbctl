@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/config"
 )
 
 func escrowConfig(t *testing.T) *config.Config {

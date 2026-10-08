@@ -3,8 +3,8 @@ package nodeupgrade
 import (
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Node is what the upgrade learns about the machine before it changes anything.

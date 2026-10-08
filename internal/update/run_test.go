@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // logBuf collects the messages of a run so that a test can ask for a stable key.

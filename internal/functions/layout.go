@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // File and directory names under <state>/system/edge-runtime/tenants/<ref>/. The Deno main service reads exactly

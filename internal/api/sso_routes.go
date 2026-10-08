@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/members"
-	"github.com/jsmillerdev/supavise/internal/projectconfig"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/sso"
+	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/projectconfig"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/sso"
 )
 
 func (s *Server) routesSSO(add func(string, handlerFunc)) {

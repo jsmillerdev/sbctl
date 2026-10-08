@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/deploy/systemd"
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/deploy/systemd"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/config"
 )
 
 func runRoot(t *testing.T, args ...string) (string, error) {

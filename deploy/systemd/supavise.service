@@ -1,6 +1,6 @@
 [Unit]
 Description=Supavise control plane (Management API, proxy, lifecycle, WAL archiver)
-Documentation=https://github.com/jsmillerdev/supavise
+Documentation=https://github.com/supavise/supavise
 After=network-online.target supavise-postgres@system.service
 Wants=network-online.target supavise-postgres@system.service supavise-gotrue@system.service
 # The daemon waits for the registry itself (up to 2 minutes), and Restart= must never

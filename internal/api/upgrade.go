@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/notice"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/notice"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Project upgrades: the routes of Studio's Settings > General > Service versions section and of

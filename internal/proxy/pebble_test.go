@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // TestPebbleIssuance obtains real certificates from a Pebble ACME test server

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // HookPath is where the daemon answers supavise-gotrue@system's before-user-created hook: GoTrue asks

@@ -12,8 +12,8 @@ import (
 
 	"github.com/caddyserver/certmagic"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/domains"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/domains"
 )
 
 // Server is supavise's public edge. Create it with New, then call Run (or Serve with

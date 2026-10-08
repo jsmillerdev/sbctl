@@ -15,10 +15,10 @@ import (
 
 	"github.com/andybalholm/brotli"
 
-	"github.com/jsmillerdev/supavise/deploy/systemd"
-	"github.com/jsmillerdev/supavise/internal/api"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/deploy/systemd"
+	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // fakeEdgeRuntime is a stand-in for bin/edge-runtime: "bundle" writes an eszip-looking file that

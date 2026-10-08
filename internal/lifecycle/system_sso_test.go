@@ -11,11 +11,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
-	"github.com/jsmillerdev/supavise/internal/sso"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/sso"
+	"github.com/supavise/supavise/internal/units"
 )
 
 func testAESGCM(t *testing.T) *secrets.AESGCM {

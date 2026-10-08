@@ -10,13 +10,13 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/api"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/members"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/sso"
+	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/sso"
 )
 
 // openSSO connects to the registry and returns the service that manages the dashboard's SAML

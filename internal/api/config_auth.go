@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/projectconfig"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/projectconfig"
 )
 
 // The auth settings of a project are served three ways: the public Management API

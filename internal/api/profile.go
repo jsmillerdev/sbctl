@@ -7,7 +7,7 @@ import (
 
 	"golang.org/x/net/publicsuffix"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // CLIProfile is the file the Supabase CLI reads with --profile (or

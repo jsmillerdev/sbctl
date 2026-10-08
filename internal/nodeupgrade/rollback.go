@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // ErrRegistryNewer means the registry was migrated past what the release to roll back to

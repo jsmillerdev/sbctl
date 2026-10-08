@@ -9,12 +9,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	v1 "github.com/jsmillerdev/supavise/internal/api/gen/v1"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/members"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	v1 "github.com/supavise/supavise/internal/api/gen/v1"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // mapErr turns registry and lifecycle errors into API errors.

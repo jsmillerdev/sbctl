@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // githubAPI is a fake GitHub API answering /repos/<repo>/releases/latest.

@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/branching"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/branching"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 func TestBranchesCommandTree(t *testing.T) {

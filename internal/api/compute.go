@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/diskquota"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/diskquota"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Compute sizes and disk: the routes behind Studio's Compute and Disk page and the Supabase

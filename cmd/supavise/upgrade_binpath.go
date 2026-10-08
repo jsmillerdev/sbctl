@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // installedBinary is the path of the installed supavise binary that `supavise upgrade` and

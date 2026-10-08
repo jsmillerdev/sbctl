@@ -18,7 +18,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 type entry struct {

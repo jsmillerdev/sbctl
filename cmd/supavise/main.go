@@ -9,7 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
+	"github.com/supavise/supavise/internal/nodeupgrade"
 )
 
 func main() {

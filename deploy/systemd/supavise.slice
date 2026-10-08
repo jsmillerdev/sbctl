@@ -1,6 +1,6 @@
 [Unit]
 Description=supavise projects and shared services
-Documentation=https://github.com/jsmillerdev/supavise
+Documentation=https://github.com/supavise/supavise
 Before=slices.target
 
 [Slice]

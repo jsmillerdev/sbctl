@@ -13,7 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/lifecycle"
 )
 
 // authClient does not keep connections open: the test ports (39000-39999) lie inside Linux's

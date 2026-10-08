@@ -12,7 +12,7 @@ import (
 	"sort"
 	"syscall"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/backup"
 )
 
 // errNoClone is returned by cloneFile when the filesystem (or the pair of paths) cannot

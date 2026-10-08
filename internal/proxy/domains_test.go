@@ -11,9 +11,9 @@ import (
 
 	"github.com/caddyserver/certmagic"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/domains"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/domains"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // staticDNS answers the checks of a verified custom hostname: the TXT token and an A record

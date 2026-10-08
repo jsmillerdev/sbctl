@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/jsmillerdev/supavise/internal/api"
-	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/backup"
 )
 
 // BackupStore adapts the API's store of deployments and secrets to what backups read and

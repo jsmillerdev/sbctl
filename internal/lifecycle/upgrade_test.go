@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/artifacts"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/artifacts"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // tagArts is an artifact store whose pins a test can move, like a node update does.

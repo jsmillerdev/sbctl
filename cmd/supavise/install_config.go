@@ -18,7 +18,7 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // installOptions are the flags of `supavise install`. A field is applied to the config only

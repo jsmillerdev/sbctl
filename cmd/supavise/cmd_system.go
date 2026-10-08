@@ -10,13 +10,13 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/deploy/systemd"
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/diskquota"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/secrets"
-	"github.com/jsmillerdev/supavise/internal/update"
+	"github.com/supavise/supavise/deploy/systemd"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/diskquota"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/update"
 )
 
 var systemCmd = &cobra.Command{

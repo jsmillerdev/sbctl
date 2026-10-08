@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/config"
 )
 
 const keysTestKey = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"

@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/health"
-	"github.com/jsmillerdev/supavise/internal/notice"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/health"
+	"github.com/supavise/supavise/internal/notice"
 )
 
 // Checker is the daemon's periodic look at the node. Every [alerts] check_interval_seconds it

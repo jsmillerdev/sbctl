@@ -6,8 +6,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 func TestLoadCredsGeneratesOnceAndKeepsThem(t *testing.T) {

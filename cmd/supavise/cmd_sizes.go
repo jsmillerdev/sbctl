@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/lifecycle"
 )
 
 var (

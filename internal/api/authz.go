@@ -6,8 +6,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/members"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Authorization. Authentication (auth.go) says who calls; this file says what that caller

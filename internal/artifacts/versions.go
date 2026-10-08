@@ -8,8 +8,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/versions"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/versions"
 )
 
 // Versions is the parsed internal/versions/versions.yaml: the slim-services release tag of every

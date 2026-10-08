@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // StartWALRelay starts the WAL relay over the configured backend (nil and a no-op stop

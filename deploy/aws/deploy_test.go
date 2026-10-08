@@ -294,8 +294,8 @@ func TestDryRunDownloadsTheReleaseTemplateWhenNoneIsNearby(t *testing.T) {
 		args []string
 		url  string
 	}{
-		{nil, "https://github.com/jsmillerdev/supavise/releases/latest/download/supavise.yaml"},
-		{[]string{"--version", "v1.2.3"}, "https://github.com/jsmillerdev/supavise/releases/download/v1.2.3/supavise.yaml"},
+		{nil, "https://github.com/supavise/supavise/releases/latest/download/supavise.yaml"},
+		{[]string{"--version", "v1.2.3"}, "https://github.com/supavise/supavise/releases/download/v1.2.3/supavise.yaml"},
 	} {
 		dir, log := stubAWS(t)
 		cmd := exec.Command(bashes(t)[0], append([]string{filepath.Join(lone, "deploy.sh"), "--region", "us-east-1", "--email", "a@b.co", "--dry-run"}, c.args...)...)

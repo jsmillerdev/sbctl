@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/domains"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/domains"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // TestPebbleCustomHostname takes a custom hostname from initialize to activation against a Pebble

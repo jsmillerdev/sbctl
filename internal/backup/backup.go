@@ -20,7 +20,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // ErrNoWAL is returned by FetchWAL when the segment is not in the archive; the CLI

@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // Config is the JSON file read by `mock serve -config`.

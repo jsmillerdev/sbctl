@@ -13,14 +13,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/artifacts"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/projectconfig"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
-	"github.com/jsmillerdev/supavise/internal/sso"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/artifacts"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/projectconfig"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/sso"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // SystemDatabases are created in the system cluster next to "postgres" (GoTrue's

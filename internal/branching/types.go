@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // DefaultBranchName is the name the Management API gives the branch that is the project

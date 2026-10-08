@@ -17,7 +17,7 @@ import (
 
 	"github.com/caddyserver/certmagic"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // TLS modes after resolving tls.mode against the rest of the configuration.

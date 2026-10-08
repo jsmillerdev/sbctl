@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/backup"
 )
 
 const (

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/deploy/systemd"
+	"github.com/supavise/supavise/deploy/systemd"
 )
 
 const mountinfo = `22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,discard

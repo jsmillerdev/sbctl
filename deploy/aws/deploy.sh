@@ -14,7 +14,7 @@
 set -euo pipefail
 
 NAME=supavise
-REPO=jsmillerdev/supavise
+REPO=supavise/supavise
 SELF=$(basename "$0")
 
 usage() {

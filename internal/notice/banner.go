@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // Incident is one entry of the list Studio's /api/incident-banner returns. The first three

@@ -15,8 +15,8 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/selfupdate"
 )
 
 // UpdateRecord is what the daily update check found, kept in <state_dir>/system/update.json.

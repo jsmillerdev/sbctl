@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/lifecycle"
 )
 
 func TestRestoreWindowWithoutBackups(t *testing.T) {

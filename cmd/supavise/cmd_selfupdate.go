@@ -13,9 +13,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
-	"github.com/jsmillerdev/supavise/internal/update"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/update"
 )
 
 func init() {

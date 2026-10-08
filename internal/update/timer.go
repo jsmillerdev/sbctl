@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // The unit pair that runs `supavise update run`. deploy/systemd/ holds the files rendered with

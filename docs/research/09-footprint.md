@@ -70,7 +70,7 @@ the migrations; the first CI run should confirm that number).
 
 | Run | Host | Class | Projects | create avg (s) | PSS/project (MB) | RSS/project (MB) | system PSS (MB) | slice (MB) | disk/project (MB) | resume avg (s) | node cold start (s) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| [37573996289](https://github.com/jsmillerdev/supavise/actions/runs/37573996289) | GitHub ubuntu-24.04, x86_64, 4 vCPU, 16 GB | default | 10 | 2.59 | 70.3 | 230.7 | 58.2 | 1547.5 | 56.5 | 0.50 | 5.01 |
+| [37573996289](https://github.com/supavise/supavise/actions/runs/37573996289) | GitHub ubuntu-24.04, x86_64, 4 vCPU, 16 GB | default | 10 | 2.59 | 70.3 | 230.7 | 58.2 | 1547.5 | 56.5 | 0.50 | 5.01 |
 | same | same | default | 25 | 2.48 | 66.5 | 230.5 | 55.9 | 3784.1 | 72.7 | 0.51 | 12.06 |
 | same | same | default | 50 | 2.48 | 65.2 | 230.3 | 55.0 | 7451.2 | 72.7 | 0.50 | 23.70 |
 | same | GitHub ubuntu-24.04-arm, aarch64, 4 vCPU, 16 GB | default | 10 | 2.69 | 68.4 | 236.4 | 56.6 | 1519.2 | 56.4 | 0.49 | 4.99 |

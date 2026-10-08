@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/lifecycle"
 )
 
 // roleReadOnly is the login role behind read-only SQL (POST .../database/query

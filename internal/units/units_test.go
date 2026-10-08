@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/deploy/systemd"
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/deploy/systemd"
+	"github.com/supavise/supavise/internal/config"
 )
 
 func TestEnvRoundTrip(t *testing.T) {

@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/branching"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/branching"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // branchEngine adds DeleteWith to the fake manager.

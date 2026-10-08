@@ -1,6 +1,6 @@
 [Unit]
 Description=Supavise removal of the Edge Function bundler's module cache of project %i
-Documentation=https://github.com/jsmillerdev/supavise
+Documentation=https://github.com/supavise/supavise
 
 [Service]
 # Started by supavise when it deletes project <ref> (units.Systemd.Remove), after it has stopped

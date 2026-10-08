@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/nodeupgrade"
 )
 
 func TestUpgradeCommandsAreRegistered(t *testing.T) {

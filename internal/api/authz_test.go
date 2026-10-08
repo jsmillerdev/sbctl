@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/members"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // rolesFixture is a fixture with one signed-in user per role, a project-scoped Developer and a

@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/api"
+	"github.com/supavise/supavise/internal/api"
 )
 
 func init() {

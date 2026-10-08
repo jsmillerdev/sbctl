@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://github.com/jsmillerdev/supavise">
+  <a href="https://github.com/supavise/supavise">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="brand/readme/banner-dark.svg">
       <img alt="Supavise: Supabase orgs and projects, self-hosted" src="brand/readme/banner-light.svg" width="100%">
@@ -52,14 +52,14 @@ Self-hosted Supabase runs one project per Docker stack, with a single-project da
 <a name="your-server"></a>**On your own server.** You need Ubuntu 24.04+ or Debian 12+ with 4–8 GB of memory and ports 80, 443, 5432 and 6543 open. A domain is optional: without one, the server gets a free `<ip>.sslip.io` address for trying things out.
 
 ```bash
-curl -fsSL https://github.com/jsmillerdev/supavise/releases/latest/download/install.sh | sudo bash -s -- --email you@example.com --firewall ufw
+curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- --email you@example.com --firewall ufw
 ```
 
 The installer turns on the server's firewall with SSH and those four ports open, then prints a claim URL and a one-time token. To use your own domain, see [Install on a server](deploy/README.md#install-on-a-server).
 
 <a name="on-aws"></a>**On AWS:**
 
-1. Download `supavise.yaml` from the [latest release](https://github.com/jsmillerdev/supavise/releases/latest).
+1. Download `supavise.yaml` from the [latest release](https://github.com/supavise/supavise/releases/latest).
 2. In CloudFormation, create a stack from the file, enter your email address, tick the IAM acknowledgment and create the stack.
 3. When the stack is ready, open its **Outputs** tab. Run the `ClaimTokenCommand` value in AWS CloudShell to get your token.
 

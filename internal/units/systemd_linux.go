@@ -15,7 +15,7 @@ import (
 	sddbus "github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // Systemd is the production Supervisor. It drives systemd over D-Bus (pure Go, no

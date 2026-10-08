@@ -6,7 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/supavise/supavise/internal/members"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // The dashboard session of anyone who signs in to supavise-gotrue@system is not enough:

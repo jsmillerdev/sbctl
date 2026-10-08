@@ -13,9 +13,9 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/functions/mainservice"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/functions/mainservice"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // edgeRuntimeHealthPath is answered by the main service itself (internal/functions/mainservice/src/handler.ts),

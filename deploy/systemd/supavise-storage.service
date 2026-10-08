@@ -1,6 +1,6 @@
 [Unit]
 Description=Supavise Storage, the shared multi-tenant object store
-Documentation=https://github.com/jsmillerdev/supavise
+Documentation=https://github.com/supavise/supavise
 Requires=supavise-postgres@system.service
 After=network.target local-fs.target supavise-postgres@system.service
 StartLimitIntervalSec=0

@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // SignatureHeader carries the HMAC of a webhook that has a secret: "sha256=" and the hex

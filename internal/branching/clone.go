@@ -12,7 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/backup"
 )
 
 // errWALGone means a WAL segment the backup needs was recycled before it could be copied.

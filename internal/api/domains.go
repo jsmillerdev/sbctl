@@ -6,10 +6,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/domains"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/projectconfig"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/domains"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/projectconfig"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Custom hostnames and vanity subdomains (internal/domains), the endpoints of the Management

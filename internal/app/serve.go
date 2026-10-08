@@ -12,19 +12,19 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/jsmillerdev/supavise/internal/alerts"
-	"github.com/jsmillerdev/supavise/internal/api"
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/branching"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/diskquota"
-	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/functions"
-	"github.com/jsmillerdev/supavise/internal/health"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/notice"
-	"github.com/jsmillerdev/supavise/internal/proxy"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/api"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/branching"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/diskquota"
+	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/functions"
+	"github.com/supavise/supavise/internal/health"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/notice"
+	"github.com/supavise/supavise/internal/proxy"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // StopBudget is how long Serve, once told to stop, waits for lifecycle operations that

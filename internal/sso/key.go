@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // SecretSigningKey is the name of the sealed project secret that holds a GoTrue's SAML signing

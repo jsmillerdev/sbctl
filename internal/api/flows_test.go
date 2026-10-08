@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/api/cryptojs"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/api/cryptojs"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 func TestProjectLifecycle(t *testing.T) {

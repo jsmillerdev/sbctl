@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/health"
-	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/supavise/supavise/internal/health"
+	"github.com/supavise/supavise/internal/members"
 )
 
 // HealthSource is the node's health report. *health.Monitor implements it, so every request

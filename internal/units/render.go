@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // Files are the paths Render owns for one unit.

@@ -6,7 +6,7 @@ import (
 
 	"golang.org/x/net/publicsuffix"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // The Supabase CLI connects through the pooler URL that `supabase link` recorded only when

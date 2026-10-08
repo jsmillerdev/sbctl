@@ -7,9 +7,9 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	plat "github.com/jsmillerdev/supavise/internal/api/gen/platform"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	plat "github.com/supavise/supavise/internal/api/gen/platform"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // elem returns a minimal valid element of the array at property prop of the object

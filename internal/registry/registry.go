@@ -10,7 +10,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 var (

@@ -3,7 +3,7 @@ package main
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/app"
+	"github.com/supavise/supavise/internal/app"
 )
 
 func init() {

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // HasTenant asks once and does not retry: a health check must not wait out EnsureTenant's backoff.

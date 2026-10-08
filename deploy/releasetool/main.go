@@ -16,8 +16,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/artifacts"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/artifacts"
+	"github.com/supavise/supavise/internal/selfupdate"
 )
 
 func main() {
@@ -125,7 +125,7 @@ func cmdNotes(args []string) error {
 	fs := flag.NewFlagSet("notes", flag.ExitOnError)
 	tag := fs.String("tag", "", "this release's tag")
 	prev := fs.String("prev-tag", "", "the previous release's tag (empty for the first release)")
-	repo := fs.String("repo", "jsmillerdev/supavise", "owner/name, for links")
+	repo := fs.String("repo", "supavise/supavise", "owner/name, for links")
 	oldF := fs.String("old", "", "internal/versions/versions.yaml at the previous tag (empty for the first release)")
 	newF := fs.String("new", "internal/versions/versions.yaml", "internal/versions/versions.yaml at this tag")
 	logF := fs.String("log", "", "file of `git log --no-merges --pretty=format:'%H%x09%s' PREV..TAG` lines")

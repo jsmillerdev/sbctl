@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // ErrNotFetched is returned by Dir when the artifact is not unpacked yet.

@@ -8,11 +8,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/domains"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/domains"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // scheme is the public URL scheme: https unless TLS is switched off (dev and tests).

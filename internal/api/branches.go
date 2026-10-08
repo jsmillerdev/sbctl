@@ -11,9 +11,9 @@ import (
 
 	openapi_types "github.com/oapi-codegen/runtime/types"
 
-	v1 "github.com/jsmillerdev/supavise/internal/api/gen/v1"
-	"github.com/jsmillerdev/supavise/internal/branching"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	v1 "github.com/supavise/supavise/internal/api/gen/v1"
+	"github.com/supavise/supavise/internal/branching"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // routesBranches serves the branch endpoints of the Management API (v1). Studio calls them

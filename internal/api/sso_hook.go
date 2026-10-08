@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/sso"
+	"github.com/supavise/supavise/internal/sso"
 )
 
 // serveBeforeUserCreated answers supavise-gotrue@system before it creates a user (its

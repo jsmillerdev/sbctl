@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/units"
 )
 
 func TestServicesForPutsTheEdgeRuntimeBeforeStudioWhenEnabled(t *testing.T) {

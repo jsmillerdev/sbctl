@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/artifacts"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/artifacts"
+	"github.com/supavise/supavise/internal/selfupdate"
 )
 
 const oldYAML = `# Pinned upstream releases.

@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // fakeRestorer stands in for backup.Service: like the real one it pauses the project and

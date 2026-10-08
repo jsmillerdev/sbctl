@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // loginSessionTTL is how long a `supabase login` handshake stays claimable.

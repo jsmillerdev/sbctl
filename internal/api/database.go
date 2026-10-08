@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/jsmillerdev/supavise/internal/api/gen/v1"
-	"github.com/jsmillerdev/supavise/internal/secrets"
+	v1 "github.com/supavise/supavise/internal/api/gen/v1"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 func (s *Server) routesDatabase(add func(string, handlerFunc)) {

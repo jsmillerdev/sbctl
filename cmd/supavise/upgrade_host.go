@@ -23,15 +23,15 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/jsmillerdev/supavise/internal/backup"
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/fleet"
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
-	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
-	"github.com/jsmillerdev/supavise/internal/notice"
-	"github.com/jsmillerdev/supavise/internal/registry"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
-	"github.com/jsmillerdev/supavise/internal/units"
+	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/nodeupgrade"
+	"github.com/supavise/supavise/internal/notice"
+	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/units"
 )
 
 // nodeHost is nodeupgrade.Host for a Linux node. `supavise upgrade` runs as root, because the

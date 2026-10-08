@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // orphanAge is how old an upload without a manifest must be before prune treats it

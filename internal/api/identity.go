@@ -5,10 +5,10 @@ import (
 	"regexp"
 	"strings"
 
-	plat "github.com/jsmillerdev/supavise/internal/api/gen/platform"
-	v1 "github.com/jsmillerdev/supavise/internal/api/gen/v1"
-	"github.com/jsmillerdev/supavise/internal/members"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	plat "github.com/supavise/supavise/internal/api/gen/platform"
+	v1 "github.com/supavise/supavise/internal/api/gen/v1"
+	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // disabledFeatures are the dashboard features hidden through profile.disabled_features:

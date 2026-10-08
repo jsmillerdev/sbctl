@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/notice"
+	"github.com/supavise/supavise/internal/notice"
 )
 
 // Studio is served unmodified (three patches, no fixups), so the two things its build

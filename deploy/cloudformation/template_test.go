@@ -981,8 +981,8 @@ func TestTemplateIsSelfContained(t *testing.T) {
 	if strings.Contains(string(raw), "TemplateURL") {
 		t.Error("no TemplateURL: no nested stacks")
 	}
-	// Outside the user data, a statically known place for jsmillerdev/supavise is the release download.
-	if !strings.Contains(string(raw), "https://github.com/jsmillerdev/supavise/releases/") {
+	// Outside the user data, a statically known place for supavise/supavise is the release download.
+	if !strings.Contains(string(raw), "https://github.com/supavise/supavise/releases/") {
 		t.Error("user data downloads install.sh from the GitHub release")
 	}
 }

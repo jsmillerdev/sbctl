@@ -12,7 +12,7 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 func changedSet(names ...string) func(string) bool {

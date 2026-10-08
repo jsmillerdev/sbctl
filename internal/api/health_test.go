@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/health"
+	"github.com/supavise/supavise/internal/health"
 )
 
 // fakeHealth is a HealthSource with a fixed report.

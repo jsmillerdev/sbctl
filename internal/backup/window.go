@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/lifecycle"
 )
 
 // RestoreWindow is what a point-in-time restore of a project can reach: the dashboard's

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/selfupdate"
 )
 
 // binTree makes <top>/bin/supavise, owned by the test's own uid, the stand-in for root on a node:

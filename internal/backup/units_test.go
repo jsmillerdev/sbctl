@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // The deploy/ files are the default renderings; regenerate them with

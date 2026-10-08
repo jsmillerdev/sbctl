@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/jsmillerdev/supavise/internal/artifacts"
+	"github.com/supavise/supavise/internal/artifacts"
 )
 
 // upstream says where the releases of a slim-services artifact come from. The slim-services tag

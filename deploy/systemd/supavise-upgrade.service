@@ -1,6 +1,6 @@
 [Unit]
 Description=Supavise unattended upgrade and OS reboot inside the maintenance window
-Documentation=https://github.com/jsmillerdev/supavise
+Documentation=https://github.com/supavise/supavise
 After=network-online.target supavise.service
 Wants=network-online.target
 # One run at a time: a timer tick that arrives while an upgrade runs waits.

@@ -7,7 +7,7 @@ Read `docs/design.md` first; it is the contract. `docs/research/` is evidence, n
 ## 0. Repo state and first actions
 
 - This directory is **not its own git repository** (the enclosing repo root is the home directory). First action in a fresh session: `git init` here, commit `docs/design.md`, `docs/development/build-plan.md`, `docs/research/`, then create the skeleton in section 2.
-- Language: **Go** (single static binary, `CGO_ENABLED=0`). Module path placeholder `github.com/jsmillerdev/supavise` until the product is named. The name must not contain "Supabase".
+- Language: **Go** (single static binary, `CGO_ENABLED=0`). Module path placeholder `github.com/supavise/supavise` until the product is named. The name must not contain "Supabase".
 - License: **Apache-2.0** for everything we write. Studio patches carry upstream's Apache-2.0.
 - Target OS for v1: Ubuntu 24.04, Debian 12 (Ubuntu 22.04 is out: its polkit 0.105 ignores the JavaScript rule that lets Supavise manage units), amd64 and arm64. glibc 2.35 floor comes from the artifacts.
 - Do not vendor or copy code from `kmhari/supastack` (AGPL). Reading it for evidence is fine.

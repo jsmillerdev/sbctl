@@ -5,7 +5,7 @@ import (
 	"io/fs"
 	"path/filepath"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // ErrInsufficientDisk is returned by Create and Reset when the state disk cannot hold a

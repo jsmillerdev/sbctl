@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jsmillerdev/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/alerts"
 )
 
 var alertsCmd = &cobra.Command{

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/domains"
+	"github.com/supavise/supavise/internal/domains"
 )
 
 // Studio's Custom Domains page asks its own server route, /api/check-cname?domain=<host>, whether

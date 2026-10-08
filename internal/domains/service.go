@@ -21,8 +21,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Resolver is the DNS the node verifies with. *net.Resolver implements it; tests use a fake.

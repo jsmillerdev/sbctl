@@ -5,7 +5,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // Rollback is `supavise rollback`: it puts the node back on the previous kept release, binary and

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/supavise/supavise/internal/config"
 )
 
 // The nightly base backup is a systemd template pair. deploy/systemd/ holds the files

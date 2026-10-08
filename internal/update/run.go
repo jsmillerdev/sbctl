@@ -14,8 +14,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jsmillerdev/supavise/internal/config"
-	"github.com/jsmillerdev/supavise/internal/selfupdate"
+	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/selfupdate"
 )
 
 // Exit codes of `supavise upgrade --unattended`.
