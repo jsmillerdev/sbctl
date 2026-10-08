@@ -106,6 +106,7 @@ func TestFetchReturnsTheSignedManifest(t *testing.T) {
 	}
 	// Without any key it does not go to the network.
 	o.Key = nil
+	withoutEmbeddedKeys(t)
 	if _, err := Fetch(context.Background(), o); err != ErrNoKey {
 		t.Errorf("Fetch with no key: %v", err)
 	}

@@ -249,7 +249,8 @@ func TestUpdateExplicitTag(t *testing.T) {
 func TestNoKeyRefusesToUpdate(t *testing.T) {
 	r := newReleaseServer(t, "v1.2.0", "new binary")
 	o, exe := r.opts(t, "v1.0.0")
-	o.Key = nil // the embedded placeholder is not a key
+	o.Key = nil
+	withoutEmbeddedKeys(t) // as in a checkout whose release key is still the placeholder
 	if _, err := Update(context.Background(), o); err == nil || err != ErrNoKey {
 		t.Fatalf("%v", err)
 	}
@@ -367,4 +368,13 @@ func TestReportsVersion(t *testing.T) {
 			t.Errorf("%q vs %s: %v", tc.out, tc.tag, got)
 		}
 	}
+}
+
+// withoutEmbeddedKeys makes the embedded release keys placeholders for the rest of the test, so
+// the no-key paths are tested whatever key this checkout carries.
+func withoutEmbeddedKeys(t *testing.T) {
+	t.Helper()
+	cur, next := releaseKeyPEM, releaseKeyNextPEM
+	releaseKeyPEM, releaseKeyNextPEM = []byte("UNSET\n"), []byte("UNSET\n")
+	t.Cleanup(func() { releaseKeyPEM, releaseKeyNextPEM = cur, next })
 }
