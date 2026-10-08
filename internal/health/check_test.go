@@ -683,3 +683,101 @@ func TestReportJSONShape(t *testing.T) {
 		t.Errorf("the organization id leaks into the report: %s", b)
 	}
 }
+
+func writeUpgradeMarker(t *testing.T, e *env, u notice.Upgrade) {
+	t.Helper()
+	b, _ := json.Marshal(u)
+	if err := os.MkdirAll(filepath.Join(e.cfg.StateDir, "system"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.cfg.StateDir, "system", "upgrade.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A running node upgrade is a note: the phase, the releases, how long, and nothing that degrades
+// the node (an unattended upgrade or the alert checker must not read it as a problem).
+func TestRunningUpgradeSaysWhatItIsDoingAndStaysInformational(t *testing.T) {
+	e := newEnv(t)
+	writeUpgradeMarker(t, e, notice.Upgrade{Phase: "projects", From: "v1.2.3", To: "v1.3.0", StartedAt: e.now.Add(-42 * time.Minute), PID: os.Getpid(), Detail: "upgrading 12 project(s)"})
+	r := e.check()
+	c, ok := r.Component("upgrade")
+	if !ok || c.State != Info {
+		t.Fatalf("upgrade: %+v", c)
+	}
+	for _, want := range []string{"phase projects", "v1.2.3 to v1.3.0", "running for 42m", "upgrading 12 project(s)"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Errorf("detail %q lacks %q", c.Detail, want)
+		}
+	}
+	if strings.Contains(c.Detail, "is gone") {
+		t.Errorf("the process is alive: %q", c.Detail)
+	}
+	if r.Verdict != Healthy || r.Verdict.ExitCode() != 0 {
+		t.Errorf("a running upgrade changed the verdict to %q: %s", r.Verdict, r.Summary)
+	}
+	// A marker whose process died is still a note, and says what to do.
+	writeUpgradeMarker(t, e, notice.Upgrade{Phase: "services", From: "v1.2.3", To: "v1.3.0", StartedAt: e.now.Add(-5 * time.Minute), PID: 2147483646})
+	if c, _ := e.check().Component("upgrade"); c.State != Info || !strings.Contains(c.Detail, "its process (2147483646) is gone") || !strings.Contains(c.Detail, "sudo supavise upgrade") {
+		t.Errorf("a dead upgrade: %+v", c)
+	}
+	// A finished upgrade is not shown.
+	writeUpgradeMarker(t, e, notice.Upgrade{Phase: "done", From: "v1.2.3", To: "v1.3.0", StartedAt: e.now.Add(-5 * time.Minute)})
+	if _, ok := e.check().Component("upgrade"); ok {
+		t.Error("a finished upgrade is listed")
+	}
+}
+
+func holdRestart(t *testing.T, e *env, ref, unit string) {
+	t.Helper()
+	dir := e.cfg.Paths().Project(ref)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, unit+".held"), []byte("digest\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A restart that an upgrade held back is listed with the command that finishes it, and does not
+// make the node degraded.
+func TestHeldBackRestartsAreListedAndInformational(t *testing.T) {
+	e := newEnv(t)
+	if _, ok := e.check().Component("held restarts"); ok {
+		t.Fatal("a node with nothing held back lists held restarts")
+	}
+	holdRestart(t, e, refA, "postgres")
+	holdRestart(t, e, refA, "gotrue")
+	r := e.check()
+	c, ok := r.Component("held restarts")
+	if !ok || c.State != Info {
+		t.Fatalf("held restarts: %+v", c)
+	}
+	for _, want := range []string{"1 project still runs the files it started with", refA, "`sudo supavise upgrade` restarts them in canary order"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Errorf("detail %q lacks %q", c.Detail, want)
+		}
+	}
+	if r.Verdict != Healthy {
+		t.Errorf("a held-back restart changed the verdict to %q: %s", r.Verdict, r.Summary)
+	}
+	holdRestart(t, e, refB, "postgrest")
+	// A paused project and a removed one are not owed a restart; the plan skips them too.
+	holdRestart(t, e, refC, "gotrue")
+	c, _ = e.check().Component("held restarts")
+	if !strings.Contains(c.Detail, "2 projects still run the files they started with") || !strings.Contains(c.Detail, refB) || strings.Contains(c.Detail, refC) {
+		t.Errorf("two projects: %q", c.Detail)
+	}
+	// While an upgrade runs its rollout does the restarts.
+	writeUpgradeMarker(t, e, notice.Upgrade{Phase: "projects", From: "v1.2.3", To: "v1.3.0", StartedAt: e.now.Add(-time.Minute)})
+	c, _ = e.check().Component("held restarts")
+	if !strings.Contains(c.Detail, "the upgrade that is running restarts them") || strings.Contains(c.Detail, "sudo supavise upgrade") {
+		t.Errorf("during an upgrade: %q", c.Detail)
+	}
+	// Both notes show in the text form.
+	var out strings.Builder
+	Render(&out, e.check(), false)
+	if !strings.Contains(out.String(), "held restarts") || !strings.Contains(out.String(), "upgrade") {
+		t.Errorf("rendered report:\n%s", out.String())
+	}
+}
