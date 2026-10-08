@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
@@ -596,6 +597,44 @@ func TestAPromotionThatTheNodeAnswersWithASentinelIsClassified(t *testing.T) {
 		if p := projectOf(t, w, refA); p.NodeID != "n1" || p.Status != registry.StatusActiveHealthy {
 			t.Fatalf("project: %+v", p)
 		}
+	})
+	t.Run("a node that refuses the promotion changed nothing", func(t *testing.T) {
+		for name, refusal := range map[string]error{
+			"the node is fenced":          fmt.Errorf("%w: the node is fenced", lifecycle.ErrInvalidState),
+			"the cluster is no standby":   fmt.Errorf("%w: no standby.signal", lifecycle.ErrNotStandby),
+			"the state does not allow it": fmt.Errorf("%w: still being set up", lifecycle.ErrInvalidState),
+			"the project is not homed":    fmt.Errorf("%w: refused", placement.ErrNotHome),
+			"the replica is not there":    fmt.Errorf("%w: no such replica", registry.ErrNotFound),
+		} {
+			w := newWorld(t)
+			w.fail("promote n2/", refusal, -1)
+			mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+			if err == nil || mv.State != registry.MoveAborted || !strings.Contains(err.Error(), "refused") {
+				t.Fatalf("%s: move %+v, error %v", name, mv, err)
+			}
+			w.assertOrder("stop n1/"+refA, "promote n2/", "start n1/"+refA)
+			if p := projectOf(t, w, refA); p.NodeID != "n1" || p.Status != registry.StatusActiveHealthy {
+				t.Fatalf("%s: project %+v", name, p)
+			}
+		}
+	})
+	t.Run("a node that does not take the leader for the leader is not asked to settle it", func(t *testing.T) {
+		w := newWorld(t)
+		w.fail("promote n2/", fmt.Errorf("%w: the caller is not the leader", cluster.ErrNotLeader), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if err == nil || mv.State != registry.MoveFailed {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		w.assertNever("start n1/")
+	})
+	t.Run("a failure in the middle may have promoted", func(t *testing.T) {
+		w := newWorld(t)
+		w.fail("promote n2/", errors.New("node n2: pg_promote: connection reset"), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if err == nil || mv.State != registry.MoveFailed {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		w.assertNever("start n1/")
 	})
 	t.Run("an unplanned failover has no position to wait for", func(t *testing.T) {
 		w := newWorld(t)

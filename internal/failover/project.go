@@ -433,13 +433,20 @@ func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, i
 	switch {
 	case err == nil:
 		return "primary on " + node.Name, nil
+	case errors.Is(err, placement.ErrStaleEpoch):
+		// The node is at a higher epoch than this move: a leader that was not replaced would not be.
+		// The old primary stays down; the leader that holds the epoch decides about it.
+		return "", fmt.Errorf("%w: promoting %s on %s was refused: %v", ErrEpochLost, identifier, node.Name, err)
 	case a.WaitLSN != "" && errors.Is(err, lifecycle.ErrReplayBehind):
 		// The node waits for the position before it writes anything (promote.ok comes after the
 		// wait), so this answer says the same as the wait above: nothing was promoted.
 		return "", &abortError{cause: fmt.Errorf("%w: %s on %s: %v", ErrReplayBehind, identifier, node.Name, err)}
-	case errors.Is(err, placement.ErrStaleEpoch):
-		// The node is at a higher epoch than this move: a leader that was not replaced would not be.
-		return "", fmt.Errorf("%w: promoting %s on %s was refused: %v", ErrEpochLost, identifier, node.Name, err)
+	case a.WaitLSN != "" && refusedByTheNode(err) && !errors.Is(err, cluster.ErrNotLeader):
+		// A refusal is an answer before the node changed anything (the project is not homed there, the
+		// node is fenced, the cluster is no standby): the old primary, stopped for this switchover, starts
+		// again. A node that does not take this leader for the leader is not asked to settle it: the
+		// leadership may be what is in doubt.
+		return "", &abortError{cause: fmt.Errorf("promoting %s on %s was refused, so nothing was promoted: %w", identifier, node.Name, err)}
 	}
 	return "", fmt.Errorf("promoting %s on %s: %w", identifier, node.Name, err)
 }
