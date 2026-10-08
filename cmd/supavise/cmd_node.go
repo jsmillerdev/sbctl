@@ -368,13 +368,11 @@ func masterKeyInput(ctx context.Context, cfg *config.Config, file string, fromEs
 
 // ---- the commands ----
 
-// runNodeToken gives the founding server its cluster identity if it has none and prints a token.
+// runNodeToken prints a token and gives the founding server its cluster identity if it has none.
+// The token comes first: a refusal (a file:// backend, no address to dial, a taken name) must not
+// leave the server with an identity that restarts its daemon into cluster mode.
 func runNodeToken(ctx context.Context, env *nodeEnv, o cluster.TokenOptions) error {
 	ca, err := cluster.NewCA(env.sec)
-	if err != nil {
-		return err
-	}
-	created, err := cluster.EnsureFounder(ctx, env.reg, ca, env.cfg, env.configPath, version, env.now())
 	if err != nil {
 		return err
 	}
@@ -384,6 +382,10 @@ func runNodeToken(ctx context.Context, env *nodeEnv, o cluster.TokenOptions) err
 	}
 	a := &cluster.Authority{Reg: env.reg, CA: ca, Secrets: env.sec, Cfg: env.cfg, Topology: cluster.Solo(*self), Now: env.now}
 	tok, err := a.IssueToken(ctx, o)
+	if err != nil {
+		return err
+	}
+	created, err := cluster.EnsureFounder(ctx, env.reg, ca, env.cfg, env.configPath, version, env.now())
 	if err != nil {
 		return err
 	}

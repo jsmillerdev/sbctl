@@ -61,8 +61,6 @@ REF=$(create_project ident micro)
 PGU="supavise-postgres@$REF.service"
 wait_active "$PGU" 30
 entered() { systemctl show -p ActiveEnterTimestampMonotonic --value "$1"; }
-SYS_ENTERED=$(entered supavise-postgres@system.service)
-PRJ_ENTERED=$(entered "$PGU")
 
 log "daemon: supavise.service"
 systemctl start supavise.service
@@ -77,7 +75,12 @@ log "a single server: no cluster identity, no peer port, no cluster block"
 if ss -ltn "sport = :$PEER_PORT" | grep -q ":$PEER_PORT"; then fail "something listens on the peer port of a single server"; fi
 OUT=$(supavise status 2>&1 || true)
 if grep -q '^cluster   ' <<<"$OUT"; then fail "status shows a cluster block on a single server: $OUT"; fi
+# The daemon's first start may restart a unit whose files it renders differently; what counts is what the
+# daemon's restart into cluster mode does, so the clocks are read once the first start has settled.
+sleep 10
 INV0=$(systemctl show -p InvocationID --value supavise.service)
+SYS_ENTERED=$(entered supavise-postgres@system.service)
+PRJ_ENTERED=$(entered "$PGU")
 
 log "supavise node token: the token, the identity files and who owns them"
 supavise node token --ttl 30m --name replica-1 >"$WORK/token" 2>"$WORK/token.err" || { cat "$WORK/token.err" >&2; fail "node token"; }

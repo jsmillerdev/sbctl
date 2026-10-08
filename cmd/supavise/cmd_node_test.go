@@ -82,6 +82,19 @@ func TestNodeTokenPrintsTheTokenAndGivesTheFounderItsIdentity(t *testing.T) {
 	}
 }
 
+// A refused token leaves a server that never had a cluster identity without one: the daemon restarts
+// into cluster mode when the identity appears, and it must not for a token that was not made.
+func TestNodeTokenRefusalLeavesNoIdentity(t *testing.T) {
+	env, out, _ := nodeTestEnv(t)
+	env.cfg.Backup.Backend = "file:///var/lib/supavise/backups"
+	if err := runNodeToken(context.Background(), env, cluster.TokenOptions{}); err == nil {
+		t.Fatal("a token on a file backend")
+	}
+	if cluster.Joined(config.ClusterDir(env.configPath)) || out.Len() != 0 {
+		t.Fatalf("identity %v, stdout %q", cluster.Joined(config.ClusterDir(env.configPath)), out.String())
+	}
+}
+
 func seedCluster(t *testing.T, env *nodeEnv) {
 	t.Helper()
 	ctx := context.Background()
