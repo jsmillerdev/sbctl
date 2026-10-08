@@ -7,6 +7,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/supavise/supavise/internal/artifacts"
+	"github.com/supavise/supavise/internal/versions"
 )
 
 // Studio decides whether to enable "Add read replica" in the browser, from the answers of six
@@ -26,7 +29,21 @@ import (
 // usage_billing_enabled), GET /platform/organizations/{slug}/entitlements, GET
 // /platform/stripe/invoices/overdue (only off the higher plans), GET
 // /platform/projects/{ref}/billing/addons (the compute_instance add-on) and GET
-// /platform/projects/{ref}/databases. When Studio is bumped, diff those files against this port.
+// /platform/projects/{ref}/databases. When Studio is bumped, diff those files against this port
+// and set studioPortedAt; TestStudioEligibilityPortMatchesThePin fails until then.
+
+// studioPortedAt is the studio.tag the port was made at.
+const studioPortedAt = "2026.10.05-sha-94b8b06"
+
+func TestStudioEligibilityPortMatchesThePin(t *testing.T) {
+	v, err := artifacts.ParseVersions(versions.VersionsYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Studio.Tag != studioPortedAt {
+		t.Fatalf("versions.yaml pins Studio %s, this port was made at %s: diff the files listed above against the port, then set studioPortedAt", v.Studio.Tag, studioPortedAt)
+	}
+}
 
 // studioCaps is READ_REPLICA_COMPUTE_CAPS; a size not listed has studioDefaultCap replicas.
 var studioCaps = map[string]int{"ci_pico": 0, "ci_nano": 0, "ci_micro": 0, "ci_small": 4, "ci_medium": 4, "ci_large": 4}
