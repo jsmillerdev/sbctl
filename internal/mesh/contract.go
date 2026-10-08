@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // ALPN is the application protocol the mesh negotiates in the TLS handshake.
@@ -117,11 +118,20 @@ type RemoteError struct {
 	Node    string
 	Status  int
 	Message string
+	// Code is the peerapi.Error code of the answer, when it had one ("not_leader", "stale_epoch").
+	Code string
 }
 
 func (e *RemoteError) Error() string {
 	return fmt.Sprintf("mesh: node %s answered %d: %s", e.Node, e.Status, e.Message)
 }
+
+// Is makes a refusal of the peer server (code "refused") answer errors.Is(err, ErrRefused).
+func (e *RemoteError) Is(target error) bool { return target == ErrRefused && e.Code == CodeRefused }
+
+// CodeRefused is the code of the answer the peer server gives a request it will not serve: the
+// caller is not admitted, or its state does not allow the endpoint.
+const CodeRefused = "refused"
 
 // Header is the first line of every stream, written as one line of JSON ending in a newline.
 type Header struct {
@@ -299,11 +309,17 @@ type Mesh interface {
 }
 
 // Peer is the authenticated far end of a request: the node whose certificate the TLS handshake
-// verified against the cluster CA and the registry (state active, serial current).
+// verified against the cluster CA and the registry (serial current, state joining, active or
+// fenced).
 type Peer struct {
 	// Node is the node id. Empty for a request that arrived without a client certificate, which
 	// only the join endpoints accept.
 	Node string
+	// State is the node's state in the registry when the request arrived. The peer server serves
+	// a joining node the ping and the join confirmation, and a fenced node the ping, the fence
+	// and the rejoin, and refuses it everything else, so a handler sees NodeActive unless it is one
+	// of those.
+	State registry.NodeState
 }
 
 type peerKey struct{}

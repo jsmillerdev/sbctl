@@ -83,3 +83,22 @@ func TestInstanceStatusJSON(t *testing.T) {
 		t.Errorf("round trip: %+v, %v", out, err)
 	}
 }
+
+// Ping.Schema is a set: the same migrations in any order give the same text, and a node can tell
+// which migrations a peer's database has that its own binary lacks.
+func TestPingSchemaIsASet(t *testing.T) {
+	a := SchemaString([]string{"1300_cluster.sql", "0001_init.sql", "1250_compute_sizes.sql"})
+	b := SchemaString([]string{"0001_init.sql", "1250_compute_sizes.sql", "1300_cluster.sql"})
+	if a != b || a != "0001_init.sql,1250_compute_sizes.sql,1300_cluster.sql" {
+		t.Fatalf("schema strings: %q vs %q", a, b)
+	}
+	if SchemaString(nil) != "" || ParseSchema("") != nil {
+		t.Fatal("an empty set is the empty string")
+	}
+	if got := SchemaAhead(ParseSchema(a), []string{"0001_init.sql", "1250_compute_sizes.sql"}); !reflect.DeepEqual(got, []string{"1300_cluster.sql"}) {
+		t.Fatalf("ahead = %v", got)
+	}
+	if got := SchemaAhead([]string{"0001_init.sql"}, ParseSchema(a)); got != nil {
+		t.Fatalf("a peer behind is not ahead: %v", got)
+	}
+}
