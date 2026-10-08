@@ -15,16 +15,19 @@ import (
 // The refusals of a setup request (design 2.7.2). The Management API returns the text as a 400
 // and Studio shows it as it is.
 const (
-	msgNoNode        = "No Supavise server is joined in %s."
-	msgSameServer    = "Read replicas on the same server as the primary are not offered."
-	msgHasReplica    = "This project already has a replica on %s."
-	msgSizeTooSmall  = "Read replicas need a compute size of small or larger."
-	msgMaxReplicas   = "The project already has the maximum of %d read replicas."
-	msgNoCapacity    = "Not enough capacity on %s."
-	msgNeedS3        = "Read replicas need S3-compatible backup storage."
-	msgBranch        = "Read replicas are not offered for branches."
-	msgSystem        = "The system project has no read replicas of its own: its standby is made when a server joins."
-	msgNodeNotActive = "The server %s has not finished joining the cluster."
+	msgNoNode       = "No Supavise server is joined in %s."
+	msgSameServer   = "Read replicas on the same server as the primary are not offered."
+	msgHasReplica   = "This project already has a replica on %s."
+	msgGoingDown    = "The replica on %s is being removed; try again when it is gone."
+	msgSizeTooSmall = "Read replicas need a compute size of small or larger."
+	msgMaxReplicas  = "The project already has the maximum of %d read replicas."
+	msgNoCapacity   = "Not enough capacity on %s."
+	msgNeedS3       = "Read replicas need S3-compatible backup storage."
+	msgBranch       = "Read replicas are not offered for branches."
+	msgSystem       = "The system project has no read replicas of its own: its standby is made when a server joins."
+	msgNodeJoining  = "The server %s has not finished joining the cluster."
+	msgNodeFenced   = "The server %s is fenced and cannot take a replica."
+	msgNodeLeft     = "The server %s has left the cluster."
 )
 
 func refuse(format string, args ...any) error { return &UserError{Msg: fmt.Sprintf(format, args...)} }
@@ -58,15 +61,21 @@ func (c *Controller) Setup(ctx context.Context, ref, region string) error {
 		return refuse(msgSameServer)
 	}
 	var free []registry.Node
-	var taken []string
+	var taken, leaving []string
 	for _, n := range candidates {
-		if hasReplicaOn(existing, n.ID) {
-			taken = append(taken, nodeLabel(n))
-		} else {
+		switch r := replicaOn(existing, n.ID); {
+		case r == nil:
 			free = append(free, n)
+		case r.Status == statusGoingDown:
+			leaving = append(leaving, nodeLabel(n))
+		default:
+			taken = append(taken, nodeLabel(n))
 		}
 	}
 	if len(free) == 0 {
+		if len(taken) == 0 {
+			return refuse(msgGoingDown, strings.Join(leaving, ", "))
+		}
 		return refuse(msgHasReplica, strings.Join(taken, ", "))
 	}
 	target, err := c.leastLoaded(ctx, free)
@@ -91,7 +100,7 @@ func (c *Controller) SetupOn(ctx context.Context, ref, node string) error {
 	}
 	target := nodes[i]
 	if target.State != registry.NodeActive {
-		return refuse(msgNodeNotActive, nodeLabel(target))
+		return refuse(nodeStateMsg(target.State), nodeLabel(target))
 	}
 	if target.ID == p.NodeID {
 		return refuse(msgSameServer)
@@ -100,7 +109,10 @@ func (c *Controller) SetupOn(ctx context.Context, ref, node string) error {
 	if err != nil {
 		return err
 	}
-	if hasReplicaOn(existing, target.ID) {
+	if r := replicaOn(existing, target.ID); r != nil {
+		if r.Status == statusGoingDown {
+			return refuse(msgGoingDown, nodeLabel(target))
+		}
 		return refuse(msgHasReplica, nodeLabel(target))
 	}
 	return c.create(ctx, p, nodes, existing, target)
@@ -136,8 +148,23 @@ func (c *Controller) setupContext(ctx context.Context, ref string) (*registry.Pr
 	return p, nodes, nil
 }
 
-func hasReplicaOn(rows []registry.Replica, node string) bool {
-	return slices.ContainsFunc(rows, func(r registry.Replica) bool { return r.NodeID == node })
+// replicaOn returns the row of the replica on node, or nil.
+func replicaOn(rows []registry.Replica, node string) *registry.Replica {
+	if i := slices.IndexFunc(rows, func(r registry.Replica) bool { return r.NodeID == node }); i >= 0 {
+		return &rows[i]
+	}
+	return nil
+}
+
+// nodeStateMsg is the refusal for a node that is not active.
+func nodeStateMsg(s registry.NodeState) string {
+	switch s {
+	case registry.NodeFenced:
+		return msgNodeFenced
+	case registry.NodeLeft:
+		return msgNodeLeft
+	}
+	return msgNodeJoining
 }
 
 // leastLoaded picks the node that holds the fewest projects and replicas; the lower id wins a tie.

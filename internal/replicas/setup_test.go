@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -115,7 +116,25 @@ func TestSetupOnRefusals(t *testing.T) {
 			if err := e.reg.SetNodeState(e.ctx, "n3", registry.NodeFenced); err != nil {
 				e.t.Fatal(err)
 			}
+		}, "n3", "The server ap is fenced and cannot take a replica."},
+		{"a server that is joining", func(e *env) {
+			if err := e.reg.SetNodeState(e.ctx, "n3", registry.NodeJoining); err != nil {
+				e.t.Fatal(err)
+			}
 		}, "n3", "The server ap has not finished joining the cluster."},
+		{"a server that left", func(e *env) {
+			if err := e.reg.SetNodeState(e.ctx, "n3", registry.NodeLeft); err != nil {
+				e.t.Fatal(err)
+			}
+		}, "n3", "The server ap has left the cluster."},
+		{"the replica there is going down", func(e *env) {
+			if err := e.ctrl.SetupOn(e.ctx, refA, "n2"); err != nil {
+				e.t.Fatal(err)
+			}
+			if err := e.ctrl.Remove(e.ctx, refA, e.replica(refA, "n2").Identifier); err != nil {
+				e.t.Fatal(err)
+			}
+		}, "eu", "The replica on eu is being removed; try again when it is gone."},
 		{"no room", func(e *env) { e.admit.full["n3"] = true }, "n3", "Not enough capacity on ap."},
 	}
 	for _, tt := range tests {
@@ -138,6 +157,30 @@ func TestSetupOnRefusals(t *testing.T) {
 	}
 	if err := e.ctrl.Setup(e.ctx, "zzzzzzzzzzzzzzzzzzzz", "eu-west-1"); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("unknown project: %v", err)
+	}
+}
+
+// Studio's recovery drops a failed replica and adds it again. While the old row is going down the
+// answer says so, by region as by node; once it is gone the new one is accepted.
+func TestSetupWhileTheOldReplicaGoesDown(t *testing.T) {
+	e := newEnv(t)
+	e.nodes.down["n2"] = true // the removal cannot finish
+	if err := e.ctrl.SetupOn(e.ctx, refA, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ctrl.Remove(e.ctx, refA, e.replica(refA, "n2").Identifier); err != nil {
+		t.Fatal(err)
+	}
+	// Only n2 is in eu-west-1.
+	if got := e.user(e.ctrl.Setup(e.ctx, refA, "eu-west-1")); got != "The replica on eu is being removed; try again when it is gone." {
+		t.Fatalf("by region: %q", got)
+	}
+	e.nodes.down["n2"] = false
+	e.tick(1)
+	e.clock.Advance(3 * time.Minute)
+	e.tick(1)
+	if err := e.ctrl.Setup(e.ctx, refA, "eu-west-1"); err != nil {
+		t.Fatalf("after the removal: %v", err)
 	}
 }
 
