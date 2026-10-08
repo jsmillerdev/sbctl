@@ -965,3 +965,121 @@ func TestClientReconnects(t *testing.T) {
 		t.Fatalf("a call on a closed client: %v", err)
 	}
 }
+
+// joinerClient is the session `supavise node join` holds: a Client with the certificate of node id
+// (named in the registry, in whatever state the test gives it), connected to the manager of n1.
+func joinerClient(t *testing.T, h *harness, id string) *Client {
+	t.Helper()
+	n1 := h.nodes["n1"]
+	creds := h.nodes[id].creds
+	c, err := DialClient(h.ctx, n1.ln.Addr().String(), "n1", ClientTLS(func() *Credentials { return creds }, "n1", nil, time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+// The leader does not ping a node that is joining: its session belongs to a Client with no peer API,
+// which never answers, and three silent pings would cut the session its standby replicates through.
+// Once the node is active it is pinged like any other.
+func TestAJoiningNodeIsNotPinged(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	n1 := h.nodes["n1"]
+	if err := h.reg.SetNodeState(h.ctx, "n2", registry.NodeJoining); err != nil {
+		t.Fatal(err)
+	}
+	h.project(refA, 1, "n1")
+	echoServer(t, n1.cfg.PortsFor(refA, 1).Postgres, "n1")
+	// Only n1 runs, as in TestClientReconnects.
+	go n1.mgr.Serve(h.ctx, n1.ln)
+	go n1.mgr.Run(h.ctx)
+	c := joinerClient(t, h, "n2")
+	eventually(t, "the leader to register the session", func() bool { return n1.mgr.Connected("n2") })
+
+	// The forward stream of a standby that streams: it stays open while the node is joining.
+	st, err := c.OpenForward(KindPostgres, refA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	time.Sleep(15 * n1.mgr.o.PingEvery) // fifteen rounds of the ping loop, several times what cuts a session
+	if !n1.mgr.Connected("n2") || c.sess.IsClosed() {
+		t.Fatal("the leader cut the session of a joining node")
+	}
+	if got := c.sess.NumStreams(); got != 1 {
+		t.Fatalf("the joiner's session holds %d streams, want the forward stream alone: the leader pinged it", got)
+	}
+	if err := h.reg.SetNodeState(h.ctx, "n2", registry.NodeActive); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the first ping of the node that became active", func() bool { return c.sess.NumStreams() > 1 })
+}
+
+// A session whose far end closed it leaves the table at once, not when the keepalive notices: the
+// node that restarts is then not turned away by the tie-break in favour of its own dead session.
+func TestASessionThatTheFarEndClosedIsForgotten(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	n1 := h.nodes["n1"]
+	// A node that is joining is not pinged, so nothing but the session's own loop can notice.
+	if err := h.reg.SetNodeState(h.ctx, "n2", registry.NodeJoining); err != nil {
+		t.Fatal(err)
+	}
+	go n1.mgr.Serve(h.ctx, n1.ln)
+	go n1.mgr.Run(h.ctx)
+	c := joinerClient(t, h, "n2")
+	eventually(t, "the leader to register the session", func() bool { return n1.mgr.Connected("n2") })
+	_ = c.sess.Close()
+	eventually(t, "the leader to forget the closed session", func() bool { return !n1.mgr.Connected("n2") })
+	c2 := joinerClient(t, h, "n2")
+	eventually(t, "the leader to take the session of the node that came back", func() bool { return n1.mgr.Connected("n2") && !c2.sess.IsClosed() })
+	n1.mgr.mu.Lock()
+	pc := n1.mgr.sessions["n2"]
+	n1.mgr.mu.Unlock()
+	if pc == nil || pc.sess.IsClosed() {
+		t.Fatal("the table holds no live session after the node came back")
+	}
+}
+
+// A path may carry a query, which the handler reads, and a 304 answer comes back as a RemoteError with
+// that status, so that a conditional GET works over the mesh (the certificate mirror asks with the ETag
+// it holds).
+func TestRPCPassesTheQueryAndReturnsNotModified(t *testing.T) {
+	certs := func(w http.ResponseWriter, r *http.Request) {
+		tag := `"v2"`
+		w.Header().Set("ETag", tag)
+		if r.URL.Query().Get("etag") == tag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		RespondJSON(w, http.StatusOK, map[string]string{"query": r.URL.RawQuery})
+	}
+	h := newHarness(t, "n1", "n2")
+	h.nodes["n2"].mgr.o.Mux.Handle("GET /peer/v1/certs", certs)
+	h.start()
+	n1 := h.nodes["n1"].mgr
+	eventually(t, "a session", func() bool { return n1.Connected("n2") })
+
+	var got map[string]string
+	if err := n1.Call(h.ctx, "n2", "GET", "/peer/v1/certs?etag=%22v1%22&x=1", nil, &got); err != nil || got["query"] != `etag=%22v1%22&x=1` {
+		t.Fatalf("a stale tag: %v, %v", got, err)
+	}
+	err := n1.Call(h.ctx, "n2", "GET", "/peer/v1/certs?etag=%22v2%22", nil, &got)
+	var re *RemoteError
+	if !errors.As(err, &re) || re.Status != http.StatusNotModified || re.Node != "n2" {
+		t.Fatalf("the current tag: %v", err)
+	}
+
+	// The same through a Client, which only n1 runs beside (see TestClientReconnects).
+	h2 := newHarness(t, "n1", "n2")
+	h2.nodes["n1"].mgr.o.Mux.Handle("GET /peer/v1/certs", certs)
+	go h2.nodes["n1"].mgr.Serve(h2.ctx, h2.nodes["n1"].ln)
+	go h2.nodes["n1"].mgr.Run(h2.ctx)
+	c := joinerClient(t, h2, "n2")
+	if err := c.Call(h2.ctx, "GET", "/peer/v1/certs?etag=%22v2%22", nil, &got); !errors.As(err, &re) || re.Status != http.StatusNotModified {
+		t.Fatalf("a Client with the current tag: %v", err)
+	}
+	if err := c.Call(h2.ctx, "GET", "/peer/v1/certs?etag=%22v0%22", nil, &got); err != nil || got["query"] != `etag=%22v0%22` {
+		t.Fatalf("a Client with a stale tag: %v, %v", got, err)
+	}
+}

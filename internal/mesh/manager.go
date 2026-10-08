@@ -769,6 +769,11 @@ func (m *Manager) serveStreams(sess Session, node, remote string) {
 	for {
 		st, err := sess.AcceptStream()
 		if err != nil {
+			// The far end is gone or the session ended. smux reports a remote close here and nowhere
+			// else (its CloseChan fires on a local Close or the keepalive timeout), so the session is
+			// closed now: watch then drops it from the table, and a node that restarted is not shut out
+			// by its own dead session when the tie-break prefers it.
+			_ = sess.Close()
 			return
 		}
 		if node == "" {
@@ -845,30 +850,20 @@ func (m *Manager) serveForward(st net.Conn, peer Peer, h Header) {
 	Pipe(st, c)
 }
 
-// pingLoop pings the peer every PingEvery: it measures the round trip, hands the answer to OnPing,
-// and closes a session whose pings fail three times in a row (the connection is up but the far
-// end's handler is not answering).
+// pingLoop pings an active peer every PingEvery: it measures the round trip, hands the answer to
+// OnPing, and closes a session whose pings fail three times in a row (the connection is up but the far
+// end's handler is not answering). A peer that is not active is not pinged. Its session is a joiner's or
+// a fenced node's, and what holds the far end there is `supavise node join` or `node rejoin`, a Client
+// that has no peer API to answer with; counting its silence would cut the session that carries the
+// standby's stream a few seconds into the join. The state is read at every round, so the first ping
+// follows the node's confirmation.
 func (m *Manager) pingLoop(pc *peerConn) {
 	fails := 0
 	for {
-		ctx, cancel := context.WithTimeout(m.runCtx(), 5*time.Second)
-		start := time.Now()
-		var p peerapi.Ping
-		err := m.callOn(ctx, pc, "GET", peerapi.PathPing, nil, &p)
-		cancel()
-		if err == nil || peerAnswered(err) { // a refusal still proves the far end answers
+		if m.peerOf(pc.node).State != registry.NodeActive {
 			fails = 0
-			if err == nil {
-				rtt := time.Since(start)
-				pc.rtt.Store(int64(rtt))
-				pc.lastPng.Store(&pingState{At: m.o.Now(), Ping: p})
-				if m.o.OnPing != nil {
-					m.o.OnPing(pc.node, p, rtt)
-				}
-			}
-		} else if fails++; fails >= 3 && !pc.sess.IsClosed() {
-			m.o.Log.Warn("mesh: closing a session whose pings fail", "node", pc.node, "error", err)
-			_ = pc.sess.Close()
+		} else {
+			fails = m.pingOnce(pc, fails)
 		}
 		select {
 		case <-pc.sess.CloseChan():
@@ -878,6 +873,31 @@ func (m *Manager) pingLoop(pc *peerConn) {
 		case <-time.After(m.o.PingEvery):
 		}
 	}
+}
+
+// pingOnce sends one ping and returns the number of failures in a row after it.
+func (m *Manager) pingOnce(pc *peerConn, fails int) int {
+	ctx, cancel := context.WithTimeout(m.runCtx(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	var p peerapi.Ping
+	err := m.callOn(ctx, pc, "GET", peerapi.PathPing, nil, &p)
+	if err == nil || peerAnswered(err) { // a refusal still proves the far end answers
+		if err == nil {
+			rtt := time.Since(start)
+			pc.rtt.Store(int64(rtt))
+			pc.lastPng.Store(&pingState{At: m.o.Now(), Ping: p})
+			if m.o.OnPing != nil {
+				m.o.OnPing(pc.node, p, rtt)
+			}
+		}
+		return 0
+	}
+	if fails++; fails >= 3 && !pc.sess.IsClosed() {
+		m.o.Log.Warn("mesh: closing a session whose pings fail", "node", pc.node, "error", err)
+		_ = pc.sess.Close()
+	}
+	return fails
 }
 
 // peerAnswered reports whether err is an answer of the far end, of any status.
