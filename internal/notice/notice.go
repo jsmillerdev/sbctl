@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jsmillerdev/supavise/internal/config"
@@ -110,7 +111,7 @@ func WriteMaintenance(p config.Paths, m Maintenance, now time.Time) (*Maintenanc
 	m.AnnouncedAt = now.UTC()
 	m.StartsAt, m.EndsAt = m.StartsAt.UTC(), m.EndsAt.UTC()
 	m.ID = fmt.Sprintf("m%d", now.UnixNano()/int64(time.Millisecond))
-	if err := writeJSON(file(p, maintenanceFile), m); err != nil {
+	if err := writeJSON(file(p, maintenanceFile), m, -1, -1); err != nil {
 		return nil, err
 	}
 	return &m, nil
@@ -170,8 +171,34 @@ func (u Upgrade) Running(now time.Time) bool {
 // WriteUpgrade replaces the upgrade marker. The upgrade calls it at each phase change, which also
 // keeps the marker alive (Running counts the file's modification time).
 func WriteUpgrade(p config.Paths, u Upgrade) error {
-	return writeJSON(file(p, upgradeFile), u)
+	return writeJSON(file(p, upgradeFile), u, -1, -1)
 }
+
+// WriteUpgradeAs is WriteUpgrade for a writer that is not the file's owner: the new file belongs
+// to uid and gid (-1 leaves an id as it is). The owner is set on the open temporary file before it
+// is renamed into place, so nothing that another user does to the directory can point the change
+// at a different file: the upgrade runs as root, and the directory belongs to the supavise user.
+func WriteUpgradeAs(p config.Paths, u Upgrade, uid, gid int) error {
+	return writeJSON(file(p, upgradeFile), u, uid, gid)
+}
+
+// PhaseRollingBack is the phase of an upgrade that is putting the node back. A daemon that starts
+// in it restarts every project unit whose files changed at once, which is what puts them back.
+const PhaseRollingBack = "rolling_back"
+
+// ProcessAlive reports whether the process that wrote the marker still exists (true when the
+// marker names none). An upgrade whose process died leaves a marker that is believed for two
+// hours, and nothing is waiting for the rollout that would have finished its work.
+func (u Upgrade) ProcessAlive() bool {
+	if u.PID == 0 {
+		return true
+	}
+	err := syscall.Kill(u.PID, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// Forward reports whether the upgrade is moving the node forward (not undoing a move).
+func (u Upgrade) Forward() bool { return u.Phase != PhaseRollingBack }
 
 // ClearUpgrade removes the upgrade marker; it reports whether there was one.
 func ClearUpgrade(p config.Paths) (bool, error) {
@@ -222,8 +249,10 @@ func readJSON(path string, v any) (bool, error) {
 	return true, nil
 }
 
-// writeJSON replaces path atomically (written aside, then renamed), so a reader never sees half a file.
-func writeJSON(path string, v any) error {
+// writeJSON replaces path atomically (written aside, then renamed), so a reader never sees half a
+// file. A uid or gid of -1 keeps the writer's own; otherwise the temporary file is given to them
+// (by descriptor) before the rename.
+func writeJSON(path string, v any, uid, gid int) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
@@ -239,6 +268,12 @@ func writeJSON(path string, v any) error {
 	if err := tmp.Chmod(0o644); err != nil { // not secret; the proxy and the CLI may run as different users
 		tmp.Close()
 		return err
+	}
+	if uid >= 0 || gid >= 0 {
+		if err := tmp.Chown(uid, gid); err != nil {
+			tmp.Close()
+			return err
+		}
 	}
 	if _, err := tmp.Write(append(b, '\n')); err != nil {
 		tmp.Close()

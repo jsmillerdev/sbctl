@@ -110,10 +110,16 @@ type Host interface {
 	// WaitShared waits until each service runs its new release and answers, in order.
 	WaitShared(ctx context.Context, moves []ServiceMove) error
 	// UpgradeProjects runs `projects upgrade --all` on the new binary for the target releases and
-	// returns every project that moved since `since`, also when it fails.
+	// returns every project that moved since `since`, also when it fails. The same rollout also
+	// restarts the projects whose GoTrue or PostgREST files the new daemon rendered differently
+	// and left running (the daemon holds those restarts back while an upgrade runs), in the same
+	// canary and batch order.
 	UpgradeProjects(ctx context.Context, target map[string]string, since time.Time) ([]ProjectMove, error)
 	// Status returns the verdict of `supavise status` and its first line.
 	Status(ctx context.Context) (verdict, summary string, err error)
+	// EndUpgrade records in the kept record of version when the upgrade that installed it ended:
+	// a later `supavise rollback` puts back only the projects this upgrade moved.
+	EndUpgrade(ctx context.Context, version string, at time.Time) error
 	// Cleanup removes the artifacts and the kept binaries beyond keep releases.
 	Cleanup(ctx context.Context, keep int, current string)
 
@@ -131,6 +137,13 @@ type Host interface {
 	Restore(ctx context.Context, from string, rec Record) error
 	// Confirm asks the operator; it returns an error when there is nobody to ask.
 	Confirm(question string) (bool, error)
+}
+
+// VersionInspector is the optional Host capability behind --check: the installed version and what
+// the binary says about itself, without the registry, the projects or the status report, so that
+// a check works for an account that cannot reach the registry.
+type VersionInspector interface {
+	InspectVersion(ctx context.Context) (*Node, error)
 }
 
 // Options of Run.
@@ -186,16 +199,23 @@ type run struct {
 	started time.Time
 	node    *Node
 	plan    *Plan
+	// sharedFailed is set when a shared service did not come up on the release this run moved it to.
+	sharedFailed bool
 }
 
 func (r *run) run(ctx context.Context) error {
 	o := &r.o
-	node, err := r.h.Inspect(ctx)
+	inspect := r.h.Inspect
+	if vi, ok := r.h.(VersionInspector); ok && o.Check {
+		inspect = vi.InspectVersion
+	}
+	node, err := inspect(ctx)
 	if err != nil {
 		return refused("cannot read the node: %v", err)
 	}
 	r.node = node
-	if node.Running != nil {
+	// A check only reads; it has no quarrel with an upgrade that runs.
+	if node.Running != nil && !o.Check {
 		return refused("another upgrade is running (process %d, phase %s)", node.Running.PID, node.Running.Phase)
 	}
 	cand, err := r.h.Resolve(ctx, o.Version, node)
@@ -315,14 +335,21 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 		r.mark(PhaseServices, "rolling the shared services")
 		o.say("rolling %d service(s) onto the new release, one at a time", len(moves))
 		if err := h.WaitShared(ctx, moves); err != nil {
+			r.sharedFailed = true
 			return r.rollback(ctx, prev, nil, fmt.Errorf("a shared service did not come up on its new release: %w", err))
 		}
 	}
 
 	var projectMoves []ProjectMove
-	if len(plan.Upgrade) > 0 {
+	// A new binary can render a project's GoTrue or PostgREST files differently without moving a
+	// release; the daemon leaves those units running while the upgrade runs, and the rollout
+	// restarts them, so the rollout runs after every change of binary.
+	if len(plan.Upgrade) > 0 || plan.BinaryChange {
 		r.mark(PhaseProjects, fmt.Sprintf("upgrading %d project(s)", len(plan.Upgrade)))
 		o.say("upgrading %d project(s): %d canary, then %d at a time", len(plan.Upgrade), plan.Canary, plan.Batch)
+		if len(plan.Upgrade) == 0 {
+			o.say("(and restarting the projects whose service files the new release renders differently)")
+		}
 		var err error
 		if projectMoves, err = h.UpgradeProjects(ctx, plan.ProjectTarget, r.started); err != nil {
 			return r.rollback(ctx, prev, projectMoves, fmt.Errorf("the rollout of the projects stopped: %w", err))
@@ -332,6 +359,9 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	r.mark(PhaseVerifying, "checking the node")
 	if err := waitVerdict(ctx, h, r.o, node.Verdict); err != nil {
 		return r.rollback(ctx, prev, projectMoves, fmt.Errorf("the node is not healthy after the upgrade: %w", err))
+	}
+	if err := h.EndUpgrade(ctx, plan.To, o.now()); err != nil {
+		log.Warn("could not record the end of the upgrade", "error", err.Error())
 	}
 	h.Cleanup(ctx, o.Keep, plan.To)
 	r.mark(PhaseDone, "")
@@ -402,6 +432,9 @@ func (r *run) rollback(ctx context.Context, prev Record, moves []ProjectMove, ca
 	o.say("going back to %s", prev.Version)
 	o.log().Error("upgrade_failed", "to", r.plan.To, "error", cause.Error())
 	r.mark(PhaseRollingBack, cause.Error())
+	if !r.plan.BinaryChange {
+		return r.revertProjectsOnly(ctx, moves, cause)
+	}
 	if err := rollBackTo(ctx, r.h, r.o, rollbackArgs{From: r.plan.To, FromPins: r.plan.Target.Pins, To: &prev, Moves: moves, Verdict: r.node.Verdict, Mark: r.mark}); err != nil {
 		r.mark(PhaseFailed, err.Error())
 		o.log().Error("upgrade_needs_operator", "error", err.Error())
@@ -411,4 +444,39 @@ func (r *run) rollback(ctx context.Context, prev Record, moves []ProjectMove, ca
 	o.log().Warn("upgrade_rolled_back", "to", prev.Version, "error", cause.Error())
 	o.say("rolled back: Supavise %s is running again", prev.Version)
 	return &Failure{Code: ExitRolledBack, Err: fmt.Errorf("the upgrade to %s failed and the node is back on %s: %w", r.plan.To, prev.Version, cause)}
+}
+
+// revertProjectsOnly is the rollback of an upgrade that did not change the binary (the services
+// and projects were brought onto the release the installed binary already is). There is no kept
+// binary to go back to, and the shared services run the releases this binary pins, so the rollback
+// puts back the projects this run moved and checks the node. A shared service that did not come up
+// cannot be put back by it: that is exit 4, and the message says so. When the shared services came
+// up and a project failed, the node is exit 3 with the services on the new releases.
+func (r *run) revertProjectsOnly(ctx context.Context, moves []ProjectMove, cause error) error {
+	o := &r.o
+	fail := func(err error) error {
+		r.mark(PhaseFailed, err.Error())
+		o.log().Error("upgrade_needs_operator", "error", err.Error())
+		return &Failure{Code: ExitNeedsOperator, Err: fmt.Errorf("%w (the upgrade failed because: %v)", err, cause)}
+	}
+	var revertErr error
+	if len(moves) > 0 {
+		o.say("putting %d project(s) back on the releases they ran", len(moves))
+		if revertErr = r.h.RevertProjects(ctx, moves); revertErr != nil {
+			o.say("warning: not every project went back: %v", revertErr)
+		}
+	}
+	switch {
+	case r.sharedFailed:
+		return fail(fmt.Errorf("the installed binary %s already is the release being applied and pins the services that failed, so they cannot be put back by a rollback: fix the service, or run `supavise rollback` to go back to the previous release", r.node.Version))
+	case revertErr != nil:
+		return fail(fmt.Errorf("not every project went back to its old releases: %v. `supavise projects versions` lists them", revertErr))
+	}
+	if err := waitVerdict(ctx, r.h, r.o, r.node.Verdict); err != nil {
+		return fail(fmt.Errorf("the node is not healthy: %v", err))
+	}
+	r.mark(PhaseRolledBack, cause.Error())
+	o.log().Warn("upgrade_rolled_back", "to", r.node.Version, "error", cause.Error())
+	o.say("rolled back: the projects are on the releases they ran; the binary %s did not change", r.node.Version)
+	return &Failure{Code: ExitRolledBack, Err: fmt.Errorf("the upgrade to %s failed and the projects it moved are back on the releases they ran (the binary did not change, so the node's services stay on the releases it pins): %w", r.plan.To, cause)}
 }

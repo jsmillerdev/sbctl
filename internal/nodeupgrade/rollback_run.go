@@ -43,7 +43,7 @@ func Rollback(ctx context.Context, h Host, o Options) error {
 		if err != nil {
 			return refused("cannot read which projects the upgrade moved: %v", err)
 		}
-		moves = revertable(all, node)
+		moves = revertable(all, node, cur.UpgradeEndedAt)
 	} else {
 		o.say("note: the kept record of %s is gone, so the projects it upgraded are left on their releases (`supavise projects versions` lists them)", node.Version)
 	}
@@ -91,9 +91,10 @@ func Rollback(ctx context.Context, h Host, o Options) error {
 }
 
 // revertable keeps the moves a rollback should undo: the project still runs the releases the
-// upgrade moved it to (a project upgraded again since is left alone), and the move changed
-// something. The result is in ref order.
-func revertable(all []ProjectMove, node *Node) []ProjectMove {
+// upgrade moved it to (a project upgraded again since is left alone), the move changed something,
+// and it began before the upgrade ended (end zero: no limit), so that an upgrade an Owner started
+// later is not undone. The result is in ref order.
+func revertable(all []ProjectMove, node *Node, end time.Time) []ProjectMove {
 	now := map[string]Project{}
 	for _, p := range node.Projects {
 		now[p.Ref] = p
@@ -101,7 +102,7 @@ func revertable(all []ProjectMove, node *Node) []ProjectMove {
 	var out []ProjectMove
 	for _, m := range all {
 		p, ok := now[m.Ref]
-		if !ok || !p.Active() {
+		if !ok || !p.Active() || (!end.IsZero() && m.At.After(end)) {
 			continue
 		}
 		back := m.RevertTargets()

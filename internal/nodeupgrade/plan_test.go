@@ -157,7 +157,7 @@ func TestPlanRegistryMigrationsNote(t *testing.T) {
 	}
 	var out bytes.Buffer
 	p.Render(&out)
-	if !strings.Contains(out.String(), "adds 1 registry migration(s) (1200_next.sql)") || !strings.Contains(out.String(), "pre-upgrade backup of the system project") {
+	if !strings.Contains(out.String(), "adds 1 registry migration(s) (1200_next.sql)") || !strings.Contains(out.String(), "from its pre-upgrade backup") {
 		t.Fatalf("plan:\n%s", out.String())
 	}
 }
@@ -248,9 +248,13 @@ func TestGates(t *testing.T) {
 	if g := CheckGates(n, plan(n), GateOptions{Now: t0, Unattended: true}); len(g.Refusals) != 1 || !strings.Contains(g.Refusals[0], "master key") {
 		t.Fatalf("escrow, unattended: %+v", g)
 	}
+	// A copy that cannot be shown to exist stops a timer too; to a person it is a warning.
 	n.Escrow = Escrow{}
-	if g := CheckGates(n, plan(n), GateOptions{Now: t0, Unattended: true}); len(g.Refusals) != 0 || len(g.Warnings) != 1 {
-		t.Fatalf("escrow unknown is a warning even unattended: %+v", g)
+	if g := CheckGates(n, plan(n), opts); len(g.Refusals) != 0 || len(g.Warnings) != 1 {
+		t.Fatalf("escrow unknown, attended: %+v", g)
+	}
+	if g := CheckGates(n, plan(n), GateOptions{Now: t0, Unattended: true}); len(g.Refusals) != 1 || !strings.Contains(g.Refusals[0], "could not check") {
+		t.Fatalf("escrow unknown, unattended: %+v", g)
 	}
 
 	// Disk: refused whoever asks.

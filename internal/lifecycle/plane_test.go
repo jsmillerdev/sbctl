@@ -376,6 +376,7 @@ type recSup struct {
 	calls   []string
 	state   units.State
 	changed bool
+	since   time.Time // when the running unit started; zero: unknown
 }
 
 func (r *recSup) Render(context.Context, units.Spec) error {
@@ -393,7 +394,7 @@ func (r *recSup) Remove(context.Context, string) error {
 	return nil
 }
 func (r *recSup) Status(context.Context, string) (units.Status, error) {
-	return units.Status{State: r.state}, nil
+	return units.Status{State: r.state, Since: r.since}, nil
 }
 
 // TestStartDatabaseAppliesChangedSettings: new rendered settings restart a running
@@ -456,6 +457,103 @@ func TestStartAPIRestartsUnitsWhoseFilesChanged(t *testing.T) {
 				t.Fatalf("calls = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// writeAPIFiles writes the rendered files of the project's GoTrue and PostgREST with the given
+// modification time, the way a render leaves them.
+func writeAPIFiles(t *testing.T, cfg *config.Config, ref string, mtime time.Time) {
+	t.Helper()
+	for _, svc := range []string{config.SvcGoTrue, config.SvcPostgREST} {
+		files := units.FilesFor(cfg, units.Spec{Service: svc, Ref: ref})
+		for _, f := range []string{files.Env, files.Run} {
+			if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(f, mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+// While an upgrade moves the node forward, the daemon renders the API units and leaves the running
+// ones on their old files; the restart is the rollout's. The same holds for files that an earlier
+// render wrote after the process started, which is how a held-back restart shows later.
+func TestStartAPIDefersRestartsWhenAskedAndFindsHeldBackFiles(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name     string
+		changed  bool
+		started  time.Time // when the unit's process started
+		deferred bool
+		want     string
+	}{
+		{"changed now", true, now.Add(-time.Hour), false, "render stop start"},
+		{"changed now, deferred", true, now.Add(-time.Hour), true, "render start"},
+		{"rendered after the process started", false, now.Add(-time.Hour), false, "render stop start"},
+		{"rendered after the process started, deferred", false, now.Add(-time.Hour), true, "render start"},
+		{"process started after the render", false, now.Add(time.Hour), false, "render start"},
+		{"start time unknown", false, time.Time{}, false, "render start"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.StateDir = shortTempDir(t)
+			cfg.Domain = "example.test"
+			cfg.BinPath = "/usr/local/bin/supavise"
+			writeAPIFiles(t, cfg, "abcdefghijklmnopqrst", now)
+			sup := &recSup{state: units.StateActive, changed: tc.changed, since: tc.started}
+			pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{ServiceReadyTimeout: time.Millisecond})
+			p := testProject(cfg, "abcdefghijklmnopqrst", 2)
+			ctx := context.Background()
+			if tc.deferred {
+				ctx = DeferRestarts(ctx)
+			}
+			_ = pl.startAPI(ctx, p, testKeys(t, p.Ref))
+			if got := strings.Join(sup.calls, " "); got != tc.want {
+				t.Fatalf("calls = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The rollout asks whether a project has a restart held back, and does it.
+func TestRestartPendingRestartsOnlyUnitsOnOlderFiles(t *testing.T) {
+	now := time.Now()
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	cfg.Domain = "example.test"
+	cfg.BinPath = "/usr/local/bin/supavise"
+	writeAPIFiles(t, cfg, "abcdefghijklmnopqrst", now)
+	p := testProject(cfg, "abcdefghijklmnopqrst", 2)
+
+	sup := &recSup{state: units.StateActive, since: now.Add(time.Hour)} // started after the files
+	pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{ServiceReadyTimeout: time.Millisecond})
+	if pending, err := pl.PendingRestart(context.Background(), p, testKeys(t, p.Ref)); err != nil || pending {
+		t.Fatalf("up to date: pending = %v, %v", pending, err)
+	}
+	if restarted, err := pl.RestartPending(context.Background(), p, testKeys(t, p.Ref)); err != nil || restarted {
+		t.Fatalf("up to date: restarted = %v, %v", restarted, err)
+	}
+	if strings.Contains(strings.Join(sup.calls, " "), "stop") {
+		t.Fatalf("a unit on its current files was stopped: %v", sup.calls)
+	}
+
+	sup = &recSup{state: units.StateActive, since: now.Add(-time.Hour)} // started before the files
+	pl = NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{ServiceReadyTimeout: time.Millisecond})
+	if pending, err := pl.PendingRestart(context.Background(), p, testKeys(t, p.Ref)); err != nil || !pending {
+		t.Fatalf("held back: pending = %v, %v", pending, err)
+	}
+	sup.calls = nil
+	// Nothing answers, so the wait after the start fails; the stop of each unit comes first.
+	_, _ = pl.RestartPending(context.Background(), p, testKeys(t, p.Ref))
+	// (The fake supervisor keeps reporting the unit active, so the start that follows stops it
+	// once more; a real one reports it inactive.)
+	if got := strings.Join(sup.calls, " "); !strings.Contains(got, "stop stop") || !strings.Contains(got, "start") {
+		t.Fatalf("calls = %q: both API units stop, then start", got)
 	}
 }
 

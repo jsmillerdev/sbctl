@@ -19,7 +19,7 @@ func TestCheckRollback(t *testing.T) {
 		{"registry holds what the release knows", migsV1, migsV1, false, ""},
 		{"registry behind the release", migsV2, migsV1, false, ""},
 		{"registry never migrated", migsV1, nil, false, ""},
-		{"registry migrated past the release", migsV1, migsV2, true, "Restore the system project's pre-upgrade backup"},
+		{"registry migrated past the release", migsV1, migsV2, true, "restore the system cluster from its pre-upgrade base backup"},
 		// The newest name does not tell: a lane's migration can number below the newest one.
 		{"a migration numbered below the newest", []string{"0001_init.sql", "1190_custom_domains.sql"}, migsV1, true, "1100_project_upgrades.sql"},
 		{"a release that does not say", nil, migsV1, true, "does not say which migrations"},
@@ -86,7 +86,7 @@ func TestRollbackRefusals(t *testing.T) {
 		want  string
 	}{
 		"no previous release":       {func(h *fakeHost, o *Options) { h.prev = nil }, "no previous release is kept"},
-		"registry migrated past it": {func(h *fakeHost, o *Options) { h.applied = migsV2 }, "Restore the system project's pre-upgrade backup"},
+		"registry migrated past it": {func(h *fakeHost, o *Options) { h.applied = migsV2 }, "restore the system cluster from its pre-upgrade base backup"},
 		"registry unreadable":       {func(h *fakeHost, o *Options) { h.appliedErr = errBoom }, "cannot read the registry's migrations"},
 		"an upgrade is running":     {func(h *fakeHost, o *Options) { h.node.Running = &Running{PID: 9, Phase: "services"} }, "an upgrade is running"},
 		"declined":                  {func(h *fakeHost, o *Options) { o.Yes, h.confirm = false, false }, "nothing was changed"},
@@ -147,7 +147,7 @@ func TestRevertableFiltersTheMoves(t *testing.T) {
 		{Ref: "cccccccccccccccccccc", From: map[string]string{"gotrue": authOld}, To: map[string]string{"gotrue": authNew}},
 		{Ref: "zzzzzzzzzzzzzzzzzzzz", From: map[string]string{"gotrue": authOld}, To: map[string]string{"gotrue": authNew}},
 	}
-	got := revertable(all, n)
+	got := revertable(all, n, time.Time{})
 	if len(got) != 2 || got[0].Ref != "aaaaaaaaaaaaaaaaaaaa" || got[1].Ref != "bbbbbbbbbbbbbbbbbbbb" {
 		t.Fatalf("revertable = %+v", got)
 	}
@@ -183,5 +183,36 @@ func TestRollbackStepsBackwards(t *testing.T) {
 	keepRelease(t, r, "v1.2.0", t0.Add(4*time.Hour))
 	if prev, _ = r.Previous("v1.1.0"); prev == nil || prev.Version != "v1.2.0" {
 		t.Fatalf("a reinstalled release is still withdrawn: %+v", prev)
+	}
+}
+
+// A project an Owner upgraded after the node's upgrade ended is not put back by a rollback; with no
+// end recorded the limit is off.
+func TestRevertableStopsAtTheEndOfTheUpgrade(t *testing.T) {
+	n := rollbackHost().node
+	end := t0.Add(-30 * time.Minute)
+	all := []ProjectMove{
+		{Ref: "aaaaaaaaaaaaaaaaaaaa", At: end.Add(-5 * time.Minute), From: map[string]string{"gotrue": authOld}, To: map[string]string{"gotrue": authNew}},
+		{Ref: "bbbbbbbbbbbbbbbbbbbb", At: end.Add(24 * time.Hour), From: map[string]string{"gotrue": authOld}, To: map[string]string{"gotrue": authNew}},
+	}
+	if got := revertable(all, n, end); len(got) != 1 || got[0].Ref != "aaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("with an end: %+v", got)
+	}
+	if got := revertable(all, n, time.Time{}); len(got) != 2 {
+		t.Fatalf("without an end: %+v", got)
+	}
+}
+
+func TestEndOfTheUpgradeIsKeptInTheRecord(t *testing.T) {
+	r := Releases{Dir: t.TempDir()}
+	keepRelease(t, r, "v1.1.0", t0)
+	if rec, _ := r.Get("v1.1.0"); !rec.UpgradeEndedAt.IsZero() {
+		t.Fatalf("a new record has an end: %+v", rec)
+	}
+	if err := r.EndUpgrade("v1.1.0", t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := r.Get("v1.1.0"); !rec.UpgradeEndedAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("record = %+v", rec)
 	}
 }

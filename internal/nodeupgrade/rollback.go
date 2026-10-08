@@ -16,9 +16,10 @@ var ErrRegistryNewer = errors.New("the registry schema is newer than the release
 // CheckRollback applies the one rule that makes a rollback unsafe by itself: registry migrations
 // only go forward, so a binary that does not know every migration the registry holds may find
 // tables and columns it does not know, and may write rows the newer release cannot read. The rule
-// refuses then. Restoring the pre-upgrade base backup of the system project (which holds the
-// registry) brings the registry back; after that the same check passes, and nothing else has to be
-// said. It compares sets of migrations, not their newest name: the lanes of the project number
+// refuses then. Restoring the system cluster (which holds the registry) from its pre-upgrade base
+// backup brings the registry back; after that the same check passes, and nothing else has to be
+// said. The restore is by hand: `supavise backups restore` refuses the system project, because it
+// reads and writes the registry it would replace. It compares sets of migrations, not their newest name: the lanes of the project number
 // their migrations in separate ranges, so the newest name says little.
 func CheckRollback(to *Record, applied []string) error {
 	known := make(map[string]bool, len(to.Migrations))
@@ -37,7 +38,7 @@ func CheckRollback(to *Record, applied []string) error {
 	case len(to.Migrations) == 0:
 		return fmt.Errorf("%w: the kept record of %s does not say which migrations it knows, and the registry holds %d", ErrRegistryNewer, to.Version, len(applied))
 	}
-	return fmt.Errorf("%w: the registry holds %d migration(s) that %s does not know (%s), and migrations only go forward. Restore the system project's pre-upgrade backup first (`supavise backups restore system`, see the backups documentation), then run the rollback again", ErrRegistryNewer, len(unknown), to.Version, refList(unknown))
+	return fmt.Errorf("%w: the registry holds %d migration(s) that %s does not know (%s), and migrations only go forward. Put the registry back first: restore the system cluster from its pre-upgrade base backup by hand, with the control plane stopped (internal/backup/README.md, \"Disaster recovery of the system cluster\"; `supavise backups restore` refuses the system project), then run `supavise rollback` again", ErrRegistryNewer, len(unknown), to.Version, refList(unknown))
 }
 
 // ProjectMove is one project an upgrade moved: the releases it ran and the ones it runs.
@@ -84,7 +85,18 @@ func rollBackTo(ctx context.Context, h Host, o Options, a rollbackArgs) error {
 		return fmt.Errorf("cannot read the registry's migrations, so the rollback is not safe to start: %v. The node stays on %s; fix the registry connection and run `supavise rollback`", err, a.From)
 	}
 	if err := CheckRollback(a.To, applied); err != nil {
-		return fmt.Errorf("%v. The node stays on %s", err, a.From)
+		// The binary cannot go back, but the projects can: the binary that runs now reads the
+		// registry it migrated, and it puts them on the releases they ran.
+		msg := fmt.Sprintf("%v. The node stays on %s", err, a.From)
+		if len(a.Moves) > 0 {
+			o.say("putting %d project(s) back on the releases they ran", len(a.Moves))
+			if rerr := h.RevertProjects(ctx, a.Moves); rerr != nil {
+				msg += fmt.Sprintf("; not every project went back to its old releases: %v", rerr)
+			} else {
+				msg += fmt.Sprintf("; the %d project(s) this run moved are back on the releases they ran", len(a.Moves))
+			}
+		}
+		return errors.New(msg)
 	}
 	var revertErr error
 	if len(a.Moves) > 0 {

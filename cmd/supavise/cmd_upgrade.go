@@ -17,6 +17,12 @@ import (
 	"github.com/jsmillerdev/supavise/internal/update"
 )
 
+// refusedBefore makes an error that stops `upgrade` or `rollback` before it has read the node a
+// refusal (exit status 2): the contract has no other status for a command that changed nothing.
+func refusedBefore(err error) error {
+	return &nodeupgrade.Failure{Code: nodeupgrade.ExitRefused, Err: err}
+}
+
 func init() {
 	var (
 		check, plan, yes, unattended, includePostgres bool
@@ -47,8 +53,8 @@ releases they ran, the previous binary is put back, and the node is checked agai
 PostgreSQL release moves only with --include-postgres: on hosted Supabase the owner of a project
 decides when its Postgres is upgraded, and each move restarts PostgreSQL.
 
---check only looks for a release; --plan also prints the plan and stops. Neither changes anything,
-and neither needs root. The upgrade needs root (the binary is root's); it runs everything that
+--check only looks for a release (it reads the installed version and nothing else, so any account can run it);
+--plan also prints the plan and stops. Neither changes anything, and neither needs root. The upgrade needs root (the binary is root's); it runs everything that
 touches the node's data as the supavise user.
 
 --unattended is for a timer. It implies --yes, never asks, and refuses (exit status 2) unless
@@ -67,25 +73,26 @@ rolled back; 4 failed and the node needs the operator. While it runs, the state 
 			if apply && os.Geteuid() != 0 {
 				return &nodeupgrade.Failure{Code: nodeupgrade.ExitRefused, Err: errors.New("run as root: sudo supavise upgrade")}
 			}
+			// Whatever stops the command before it has looked at the node is a refusal: nothing changed.
 			cfg, err := loadConfig()
 			if err != nil {
-				return err
+				return refusedBefore(err)
 			}
 			so := selfupdate.Options{Repo: repo, APIBase: apiBase}
 			for _, f := range keyFiles {
 				b, err := os.ReadFile(f)
 				if err != nil {
-					return err
+					return refusedBefore(err)
 				}
 				k, err := selfupdate.ParsePublicKey(b)
 				if err != nil {
-					return err
+					return refusedBefore(err)
 				}
 				so.Keys = append(so.Keys, k)
 			}
 			h, err := newNodeHost(cobraIO{Out: cmd.OutOrStdout(), Err: cmd.ErrOrStderr(), In: cmd.InOrStdin()}, cfg, wait, so)
 			if err != nil {
-				return err
+				return refusedBefore(err)
 			}
 			if apply {
 				// The OS reboot in the maintenance window waits on this lock, so it never lands
@@ -135,8 +142,9 @@ upgrade is the way back for the data). The last [upgrade] keep_releases (default
 kept, with the releases they pin.
 
 Registry migrations only go forward. A binary older than the registry's schema may not run on it, so
-the rollback refuses (exit status 2) until the system project's pre-upgrade backup has been
-restored; the same command then goes through. A rollback that fails after it started exits with
+the rollback refuses (exit status 2) until the registry has been put back: restore the system
+cluster from its pre-upgrade base backup by hand, with the control plane stopped (internal/backup/README.md,
+"Disaster recovery of the system cluster"); the same command then goes through. A rollback that fails after it started exits with
 status 4. Needs root.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -148,11 +156,11 @@ status 4. Needs root.`,
 			}
 			cfg, err := loadConfig()
 			if err != nil {
-				return err
+				return refusedBefore(err)
 			}
 			h, err := newNodeHost(cobraIO{Out: cmd.OutOrStdout(), Err: cmd.ErrOrStderr(), In: cmd.InOrStdin()}, cfg, rollWait, selfupdate.Options{})
 			if err != nil {
-				return err
+				return refusedBefore(err)
 			}
 			unlock, err := update.LockHost(update.HostLockPath)
 			if err != nil {

@@ -245,6 +245,11 @@ func (f *fakeHost) Restore(_ context.Context, from string, rec Record) error {
 	return f.restoreErr
 }
 
+func (f *fakeHost) EndUpgrade(_ context.Context, version string, _ time.Time) error {
+	f.rec("end %s", version)
+	return nil
+}
+
 func (f *fakeHost) Confirm(q string) (bool, error) {
 	f.rec("confirm")
 	return f.confirm, f.confirmErr

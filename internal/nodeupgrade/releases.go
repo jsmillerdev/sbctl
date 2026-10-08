@@ -34,6 +34,11 @@ type Record struct {
 	// InstalledAt is when the release became the one the node runs; zero for a release that was
 	// running before the first upgrade kept it.
 	InstalledAt time.Time `json:"installed_at"`
+	// UpgradeEndedAt is when the upgrade that installed the release finished. The projects that
+	// upgrade moved are the ones whose upgrade started between InstalledAt and this time; a project
+	// that an Owner upgraded later is not put back by a rollback. Zero while the upgrade has not
+	// ended, and in records written before it was kept.
+	UpgradeEndedAt time.Time `json:"upgrade_ended_at,omitzero"`
 	// Withdrawn marks a release the node was rolled back from: `supavise rollback` does not go
 	// back to it, so that a second rollback keeps stepping backwards. Installing the release
 	// again writes a fresh record.
@@ -150,6 +155,17 @@ func (r Releases) Touch(version string, at time.Time) error {
 		return err
 	}
 	rec.InstalledAt, rec.Withdrawn = at.UTC(), false
+	d, _ := r.dir(version)
+	return r.write(d, *rec)
+}
+
+// EndUpgrade records when the upgrade to version ended.
+func (r Releases) EndUpgrade(version string, at time.Time) error {
+	rec, err := r.Get(version)
+	if err != nil {
+		return err
+	}
+	rec.UpgradeEndedAt = at.UTC()
 	d, _ := r.dir(version)
 	return r.write(d, *rec)
 }

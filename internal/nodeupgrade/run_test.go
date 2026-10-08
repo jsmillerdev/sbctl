@@ -42,6 +42,7 @@ func TestUpgradeHappyPath(t *testing.T) {
 		"wait gotrue,realtime,storage,studio",
 		"projects gotrue=v2.195.0-r1 postgres=?",
 		"status",
+		"end v1.1.0",
 		"cleanup keep=3 current=v1.1.0",
 		"discard",
 	}
@@ -266,14 +267,18 @@ func TestRollbackRefusedByTheRegistrySchema(t *testing.T) {
 	h := newFakeHost()
 	h.projectsErr = errBoom
 	h.applied = migsV2 // the new release migrated the registry
+	h.info.RegistryMigrations = migsV2
+	h.moves = []ProjectMove{{Ref: "aaaaaaaaaaaaaaaaaaaa", From: map[string]string{"gotrue": authOld}, To: map[string]string{"gotrue": authNew}}}
 	err := Run(context.Background(), h, runOpts(h))
 	if code(t, err) != ExitNeedsOperator {
 		t.Fatalf("err = %v", err)
 	}
-	mustContain(t, err.Error(), "Restore the system project's pre-upgrade backup")
+	mustContain(t, err.Error(), "restore the system cluster from its pre-upgrade base backup")
 	mustContain(t, err.Error(), "the upgrade failed because")
-	if h.has("restore") || h.has("revert") {
-		t.Fatalf("the node was rolled back past the registry: %s", h.order())
+	// The binary stays, but the projects the run moved go back: the new binary reads its own schema.
+	mustContain(t, err.Error(), "the 1 project(s) this run moved are back on the releases they ran")
+	if h.has("restore") || !h.has("revert a") {
+		t.Fatalf("the node was rolled back past the registry, or the projects were left moved: %s", h.order())
 	}
 	if got := h.marks[len(h.marks)-1]; got != PhaseFailed {
 		t.Fatalf("last phase = %s", got)
@@ -360,5 +365,146 @@ func TestExitCodes(t *testing.T) {
 	}
 	if !errors.Is(&Failure{Code: 3, Err: errBoom}, errBoom) {
 		t.Fatal("a Failure does not unwrap")
+	}
+}
+
+// A release that adds a migration cannot be undone by the automatic rollback once its daemon has
+// applied it, and the plan does not promise it.
+func TestPlanDoesNotPromiseAnAutomaticRollbackPastAMigration(t *testing.T) {
+	render := func(info *Info) string {
+		var out strings.Builder
+		BuildPlan(testNode(), info, PlanOptions{Canary: 1, Batch: 5}).Render(&out)
+		return out.String()
+	}
+	plain := render(newInfo())
+	mustContain(t, plain, "the node goes back to the previous release by itself")
+	withMig := newInfo()
+	withMig.RegistryMigrations = migsV2
+	text := render(withMig)
+	if strings.Contains(text, "goes back to the previous release by itself.") {
+		t.Fatalf("the plan promises a rollback it cannot do:\n%s", text)
+	}
+	mustContain(t, text, "the node cannot go back to the previous release by itself")
+	mustContain(t, text, "Disaster recovery of the system cluster")
+	mustContain(t, text, "the node needs you")
+}
+
+// A failure on a release that adds a migration, after its daemon applied it: exit 4, with the
+// projects it moved back on the releases they ran and the binary left in place.
+func TestForcedFailureOnAReleaseThatAddsAMigration(t *testing.T) {
+	h := newFakeHost()
+	h.info.RegistryMigrations = migsV2
+	h.applied = migsV2
+	h.sharedErr = errBoom
+	err := Run(context.Background(), h, runOpts(h))
+	if code(t, err) != ExitNeedsOperator {
+		t.Fatalf("err = %v\n%s", err, h.order())
+	}
+	if h.has("restore") {
+		t.Fatalf("restored a binary that cannot read the registry: %s", h.order())
+	}
+	mustContain(t, err.Error(), "migrations only go forward")
+	mustContain(t, err.Error(), "The node stays on v1.1.0")
+}
+
+// A binary that does not change has no kept binary to go back to: a project that fails puts back
+// the projects the run moved, and nothing is restored or waited for on the old pins.
+func TestSameBinaryProjectFailureRevertsOnlyTheProjects(t *testing.T) {
+	h := newFakeHost()
+	h.tag = "v1.1.0"
+	h.node.Version = "v1.1.0"
+	h.node.BinaryInfo = newInfo()
+	h.projectsErr = errBoom
+	h.moves = []ProjectMove{{Ref: "aaaaaaaaaaaaaaaaaaaa", From: map[string]string{"gotrue": authOld}, To: map[string]string{"gotrue": authNew}}}
+	err := Run(context.Background(), h, runOpts(h))
+	if code(t, err) != ExitRolledBack {
+		t.Fatalf("err = %v\n%s", err, h.order())
+	}
+	order := h.order()
+	if h.has("restore") || h.has("install") || !h.has("revert a") || strings.LastIndex(order, "wait") > strings.Index(order, "projects ") {
+		t.Fatalf("calls: %s", order)
+	}
+	if h.has("cleanup") || h.has("end") {
+		t.Fatalf("a failed upgrade finished: %s", order)
+	}
+	mustContain(t, err.Error(), "the binary did not change")
+	if got := h.marks[len(h.marks)-1]; got != PhaseRolledBack {
+		t.Fatalf("last phase = %s", got)
+	}
+}
+
+// A shared service that does not come up on the release this binary pins cannot be put back by
+// a rollback: exit 4 with an accurate account, and no 6-minute wait for old pins the binary never renders.
+func TestSameBinarySharedFailureNeedsTheOperator(t *testing.T) {
+	h := newFakeHost()
+	h.tag = "v1.1.0"
+	h.node.Version = "v1.1.0"
+	h.node.BinaryInfo = newInfo()
+	h.sharedErr = errBoom
+	err := Run(context.Background(), h, runOpts(h))
+	if code(t, err) != ExitNeedsOperator {
+		t.Fatalf("err = %v\n%s", err, h.order())
+	}
+	if h.has("restore") || strings.Count(h.order(), "wait") != 1 {
+		t.Fatalf("calls: %s", h.order())
+	}
+	mustContain(t, err.Error(), "pins the services that failed")
+	if got := h.marks[len(h.marks)-1]; got != PhaseFailed {
+		t.Fatalf("last phase = %s", got)
+	}
+}
+
+// A same-binary run whose projects went back but whose node is worse than before is exit 4.
+func TestSameBinaryRevertThatFailsNeedsTheOperator(t *testing.T) {
+	h := newFakeHost()
+	h.tag = "v1.1.0"
+	h.node.Version = "v1.1.0"
+	h.node.BinaryInfo = newInfo()
+	h.projectsErr = errBoom
+	h.revertErr = errors.New("project a failed")
+	h.moves = []ProjectMove{{Ref: "aaaaaaaaaaaaaaaaaaaa", From: map[string]string{"gotrue": authOld}, To: map[string]string{"gotrue": authNew}}}
+	if err := Run(context.Background(), h, runOpts(h)); code(t, err) != ExitNeedsOperator {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// A release that changes the binary runs the rollout even when no project's release moves: the
+// new daemon may have rendered the projects' service files differently and left them running.
+func TestRolloutRunsAfterAChangeOfBinary(t *testing.T) {
+	h := newFakeHost()
+	h.info.Pins = oldPins() // no project release moves
+	if err := Run(context.Background(), h, runOpts(h)); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	if !h.has("projects") || !h.has("install") {
+		t.Fatalf("calls: %s", h.order())
+	}
+}
+
+// --check reads the installed version and nothing else: not the registry, and it does not mind
+// an upgrade that runs.
+type versionOnlyHost struct{ *fakeHost }
+
+func (versionOnlyHost) Inspect(context.Context) (*Node, error) {
+	return nil, errors.New("the registry is out of reach")
+}
+
+func (v versionOnlyHost) InspectVersion(context.Context) (*Node, error) {
+	n := *v.node
+	n.Running = &Running{PID: 9, Phase: "services"}
+	return &n, nil
+}
+
+func TestCheckNeedsNeitherTheRegistryNorAQuietNode(t *testing.T) {
+	h := versionOnlyHost{newFakeHost()}
+	o := runOpts(h.fakeHost)
+	o.Check = true
+	if err := Run(context.Background(), h, o); err != nil {
+		t.Fatalf("--check: %v", err)
+	}
+	mustContain(t, h.out.String(), "update available")
+	o.Check = false
+	if err := Run(context.Background(), h, o); code(t, err) != ExitRefused {
+		t.Fatalf("an upgrade reads the registry: %v", err)
 	}
 }

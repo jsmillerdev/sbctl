@@ -25,7 +25,7 @@ import (
 
 var (
 	upAll, upYes, upDryRun, upNoGC bool
-	upAllowOlder                   bool
+	upAllowOlder, upRestartChanged bool
 	upTo                           []string
 	upReuseBackupSince             string
 	versionsJSON                   bool
@@ -207,6 +207,21 @@ func upgradeProject(ctx context.Context, n *lifecycle.Node, out *lineWriter, ref
 	return nil
 }
 
+// restartChanged restarts the GoTrue and PostgREST of ref that run older files than the ones
+// rendered for them, and prints what happened.
+func restartChanged(ctx context.Context, n *lifecycle.Node, out *lineWriter, ref string) error {
+	started := time.Now()
+	out.printf("%s: restarting GoTrue and PostgREST on their changed service files\n", ref)
+	restarted, err := n.Engine.RestartPending(ctx, ref)
+	switch {
+	case err != nil:
+		out.printf("%s: FAILED after %s: %v\n", ref, time.Since(started).Round(time.Second), err)
+	case restarted:
+		out.printf("%s: restarted on their changed files in %s\n", ref, time.Since(started).Round(time.Second))
+	}
+	return err
+}
+
 func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 	ctx := cmd.Context()
 	out := &lineWriter{w: cmd.OutOrStdout()}
@@ -228,6 +243,24 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 		fmt.Fprintln(cmd.OutOrStdout(), "no projects")
 		return nil
 	}
+	// The projects that move no release but run older service files than the ones rendered for
+	// them join the rollout as restarts: they go through the same canary and batches.
+	restartOnly := map[string]bool{}
+	if upRestartChanged {
+		for _, r := range rows {
+			if r.El.Eligible || r.Project.Status != registry.StatusActiveHealthy {
+				continue
+			}
+			pending, err := n.Engine.PendingRestart(ctx, r.Project.Ref)
+			if err != nil {
+				return fmt.Errorf("%s: %w", r.Project.Ref, err)
+			}
+			if pending {
+				restartOnly[r.Project.Ref] = true
+				todo = append(todo, r)
+			}
+		}
+	}
 	printPlan(cmd.OutOrStdout(), rows)
 	if len(todo) == 0 {
 		if len(args) == 1 && len(rows[0].El.Blockers) > 0 {
@@ -238,6 +271,9 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 	}
 	notes := map[string]bool{}
 	for _, r := range todo {
+		if restartOnly[r.Project.Ref] {
+			continue
+		}
 		for _, note := range r.El.Notes {
 			notes[note] = true
 		}
@@ -245,7 +281,12 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 	for note := range notes {
 		fmt.Fprintf(cmd.OutOrStdout(), "note: %s\n", note)
 	}
-	fmt.Fprintln(cmd.OutOrStdout(), "A base backup is taken first; if it fails nothing is stopped. If the new versions do not start, the previous ones are started again.")
+	if len(restartOnly) > 0 {
+		fmt.Fprintf(cmd.OutOrStdout(), "%d project(s) only restart GoTrue and PostgREST: their service files changed and the units still run the old ones.\n", len(restartOnly))
+	}
+	if len(restartOnly) < len(todo) {
+		fmt.Fprintln(cmd.OutOrStdout(), "A base backup is taken first; if it fails nothing is stopped. If the new versions do not start, the previous ones are started again.")
+	}
 	if upDryRun {
 		return nil
 	}
@@ -283,7 +324,12 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 		refs[i] = r.Project.Ref
 	}
 	opts := lifecycle.RolloutOptions{Canary: 0, Batch: 1,
-		Upgrade: func(ctx context.Context, ref string) error { return upgradeProject(ctx, n, out, ref, req) }}
+		Upgrade: func(ctx context.Context, ref string) error {
+			if restartOnly[ref] {
+				return restartChanged(ctx, n, out, ref)
+			}
+			return upgradeProject(ctx, n, out, ref, req)
+		}}
 	if upAll && len(refs) > 1 {
 		opts.Canary, opts.Batch = n.Cfg.Upgrade.Canary(), n.Cfg.Upgrade.Batch()
 		out.printf("rolling out to %d projects: %d canary project(s) first, then %d at a time; it stops at the first failure\n", len(refs), min(opts.Canary, len(refs)), opts.Batch)
@@ -492,6 +538,8 @@ and stops. Run as the user that owns the state directory (supavise).`
 	upgrade.Flags().StringArrayVar(&upTo, "to", nil, "move this service to this release instead of the node's pin, <service>=<release tag> (repeatable; services not named keep the version they run)")
 	upgrade.Flags().StringVar(&upReuseBackupSince, "reuse-backup-since", "", "use a base backup of the project that finished after this time (RFC 3339) as the pre-upgrade backup (what `supavise upgrade` passes after it backed everything up)")
 	_ = upgrade.Flags().MarkHidden("reuse-backup-since")
+	upgrade.Flags().BoolVar(&upRestartChanged, "restart-changed", false, "with --all: also restart the GoTrue and PostgREST of projects that run older service files than the ones rendered for them (what `supavise upgrade` passes; the daemon holds those restarts back while it runs)")
+	_ = upgrade.Flags().MarkHidden("restart-changed")
 	upgrade.Flags().BoolVar(&upAllowOlder, "allow-older", false, "allow --to to name an older release than the project runs (what `supavise rollback` does for the projects an upgrade moved)")
 
 	versions := projectCmd("versions [<ref>]", "Show the service versions projects run and whether an upgrade is available", cobra.MaximumNArgs(1), runVersions)

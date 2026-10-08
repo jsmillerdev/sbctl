@@ -346,28 +346,127 @@ func (pl *PostgresPlane) startAPI(ctx context.Context, p *registry.Project, keys
 	return nil
 }
 
-// renderStopIfChanged renders spec and, when its files changed under a unit that is running,
-// stops the unit, so that the Start that follows runs the new files: Start on a running unit is
-// a no-op, and GoTrue or PostgREST would otherwise keep the binary and settings it started with
-// after a release or a setting changed what the unit runs. An unchanged unit is left alone.
+// renderStopIfChanged renders spec and, when the unit runs older files than the ones rendered
+// (changed now, or rendered earlier and left running), stops the unit, so that the Start that
+// follows runs the new files: Start on a running unit is a no-op, and GoTrue or PostgREST would
+// otherwise keep the binary and settings it started with after a release or a setting changed
+// what the unit runs. An unchanged unit is left alone. A context marked DeferRestarts renders
+// and leaves the unit running: the upgrade's rollout restarts it (RestartPending).
 func (pl *PostgresPlane) renderStopIfChanged(ctx context.Context, spec units.Spec) error {
-	changed := false
-	if cr, ok := pl.sup.(units.ChangeRenderer); ok {
-		var err error
-		if changed, err = cr.RenderChanged(ctx, spec); err != nil {
-			return err
-		}
-	} else if err := pl.sup.Render(ctx, spec); err != nil {
+	changed, err := pl.render(ctx, spec)
+	if err != nil {
 		return err
 	}
-	if !changed {
+	st, err := pl.sup.Status(ctx, spec.Unit())
+	if err != nil || (st.State != units.StateActive && st.State != units.StateActivating) {
 		return nil
 	}
-	if st, err := pl.sup.Status(ctx, spec.Unit()); err == nil && (st.State == units.StateActive || st.State == units.StateActivating) {
-		pl.log.Info("service files changed; restarting the running unit", "unit", spec.Unit())
-		return pl.sup.Stop(ctx, spec.Unit())
+	if !changed && !pl.filesNewerThan(spec, st) {
+		return nil
 	}
-	return nil
+	if restartsDeferred(ctx) {
+		pl.log.Info("service files changed; the restart waits for the upgrade's rollout", "unit", spec.Unit())
+		return nil
+	}
+	pl.log.Info("service files changed; restarting the running unit", "unit", spec.Unit())
+	return pl.sup.Stop(ctx, spec.Unit())
+}
+
+// render renders spec and reports whether its files changed.
+func (pl *PostgresPlane) render(ctx context.Context, spec units.Spec) (changed bool, err error) {
+	if cr, ok := pl.sup.(units.ChangeRenderer); ok {
+		return cr.RenderChanged(ctx, spec)
+	}
+	return false, pl.sup.Render(ctx, spec)
+}
+
+// filesNewerThan reports whether spec's rendered files were written after the process of the unit
+// started, which is how a restart that was held back (or that the daemon's stop cut off) shows. A
+// supervisor that cannot say when the unit started says no.
+func (pl *PostgresPlane) filesNewerThan(spec units.Spec, st units.Status) bool {
+	if st.Since.IsZero() {
+		return false
+	}
+	files := units.FilesFor(pl.cfg, spec)
+	for _, f := range []string{files.Env, files.Run} {
+		if fi, err := os.Stat(f); err == nil && fi.ModTime().After(st.Since) {
+			return true
+		}
+	}
+	return false
+}
+
+type deferRestartsKey struct{}
+
+// DeferRestarts marks ctx so that Start renders the GoTrue and PostgREST files of a project and
+// leaves a running unit on its old ones. The daemon marks its start while `supavise upgrade`
+// moves the node forward: a new binary can render every project's files differently, and the
+// restart of fifty projects one after the other, with no canary and no stop at the first failure,
+// belongs to the upgrade's rollout (Engine.RestartPending, `projects upgrade --restart-changed`),
+// not to the daemon's start.
+func DeferRestarts(ctx context.Context) context.Context {
+	return context.WithValue(ctx, deferRestartsKey{}, true)
+}
+
+func restartsDeferred(ctx context.Context) bool {
+	v, _ := ctx.Value(deferRestartsKey{}).(bool)
+	return v
+}
+
+// PendingRestarter is the optional Plane capability behind Engine.PendingRestart.
+type PendingRestarter interface {
+	// PendingRestart reports whether a running GoTrue or PostgREST unit of p runs older files than
+	// the ones rendered for it now.
+	PendingRestart(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (bool, error)
+	// RestartPending stops the units PendingRestart names, starts them on the new files and waits
+	// until they answer. It reports whether it restarted any.
+	RestartPending(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (bool, error)
+}
+
+var _ PendingRestarter = (*PostgresPlane)(nil)
+
+// pendingAPI renders the API units of p and returns the ones that run older files.
+func (pl *PostgresPlane) pendingAPI(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) ([]units.Spec, error) {
+	specs, err := pl.apiSpecs(ctx, p, keys)
+	if err != nil {
+		return nil, err
+	}
+	var out []units.Spec
+	for _, spec := range specs {
+		changed, err := pl.render(ctx, spec)
+		if err != nil {
+			return nil, err
+		}
+		st, err := pl.sup.Status(ctx, spec.Unit())
+		if err != nil || (st.State != units.StateActive && st.State != units.StateActivating) {
+			continue
+		}
+		if changed || pl.filesNewerThan(spec, st) {
+			out = append(out, spec)
+		}
+	}
+	return out, nil
+}
+
+// PendingRestart implements PendingRestarter.
+func (pl *PostgresPlane) PendingRestart(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (bool, error) {
+	pending, err := pl.pendingAPI(ctx, p, keys)
+	return len(pending) > 0, err
+}
+
+// RestartPending implements PendingRestarter.
+func (pl *PostgresPlane) RestartPending(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (bool, error) {
+	pending, err := pl.pendingAPI(ctx, p, keys)
+	if err != nil || len(pending) == 0 {
+		return false, err
+	}
+	for _, spec := range pending {
+		pl.log.Info("service files changed; restarting the running unit", "unit", spec.Unit())
+		if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
+			return false, err
+		}
+	}
+	return true, pl.startAPI(ctx, p, keys)
 }
 
 // wait polls check until it succeeds, the timeout passes, or the unit dies. A unit that

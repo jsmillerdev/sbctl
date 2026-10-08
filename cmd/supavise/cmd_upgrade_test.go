@@ -67,7 +67,7 @@ func TestReleaseInfoReportsThePins(t *testing.T) {
 func TestUpgradeProjectsArgs(t *testing.T) {
 	target := map[string]string{"postgrest": "postgrest-v16.4-r0", "gotrue": "auth-v2.195.0-r1"}
 	got := strings.Join(upgradeProjectsArgs(target, time.Time{}), " ")
-	want := "projects upgrade --all --yes --no-gc --to gotrue=auth-v2.195.0-r1 --to postgrest=postgrest-v16.4-r0"
+	want := "projects upgrade --all --yes --no-gc --restart-changed --to gotrue=auth-v2.195.0-r1 --to postgrest=postgrest-v16.4-r0"
 	if got != want {
 		t.Fatalf("args = %q, want %q", got, want)
 	}
@@ -140,8 +140,19 @@ func TestParseStatusReport(t *testing.T) {
 		t.Fatalf("not covered: %+v", e)
 	}
 	_, _, e = parseStatusReport(report("info", "could not check the backup backend: timeout"))
-	if e.Known {
+	if e.Known || e.Covered {
 		t.Fatalf("an unreachable backend is not an answer: %+v", e)
+	}
+	// "ok" with nothing looked at yet, a reworded report and a report without the component do not
+	// show a copy; only an unattended upgrade needs the difference, and it needs the copy.
+	for name, b := range map[string][]byte{
+		"not checked yet": report("ok", "not checked yet"),
+		"reworded":        report("warn", "no copy"),
+		"missing":         []byte(`{"status":"healthy","summary":"healthy","components":[{"name":"disk","state":"ok"}]}`),
+	} {
+		if _, _, e := parseStatusReport(b); e.Covered {
+			t.Errorf("%s counts as covered: %+v", name, e)
+		}
 	}
 	if v, _, _ := parseStatusReport([]byte("not json")); v != nodeupgrade.VerdictUnknown {
 		t.Fatalf("garbage reads as %q", v)
@@ -177,5 +188,41 @@ func TestKeptReleasePinsProtectTheArtifactsOfTheReleasesToRollBackTo(t *testing.
 	}
 	if got := keptReleasePins(&config.Config{BinPath: filepath.Join(t.TempDir(), "bin", "supavise")}, 3); len(got) != 0 {
 		t.Fatalf("a node that kept nothing: %v", got)
+	}
+}
+
+// Whatever stops the command before it has read the node is a refusal, status 2.
+func TestErrorsBeforeTheNodeIsReadAreRefusals(t *testing.T) {
+	err := refusedBefore(errors.New("config: no such file"))
+	if nodeupgrade.ExitCode(err) != nodeupgrade.ExitRefused {
+		t.Fatalf("exit %d", nodeupgrade.ExitCode(err))
+	}
+	cfgPath := filepath.Join(t.TempDir(), "missing.toml")
+	for _, args := range [][]string{{"upgrade", "--check", "--public-key-file", cfgPath}, {"upgrade", "--plan", "--public-key-file", cfgPath}} {
+		if _, err := runRoot(t, args...); nodeupgrade.ExitCode(err) != nodeupgrade.ExitRefused {
+			t.Errorf("%v: err = %v (exit %d)", args, err, nodeupgrade.ExitCode(err))
+		}
+	}
+}
+
+// A service that was already set to run the release the rollback puts back has nothing to
+// restart (the daemon that died on its start never moved it); one that the swap moved does.
+func TestMustHaveRestarted(t *testing.T) {
+	swap := time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)
+	before, after := swap.Add(-time.Hour), swap.Add(time.Second)
+	for _, tc := range []struct {
+		name          string
+		since         time.Time
+		tagAtSwap, to string
+		want          bool
+	}{
+		{"moved by the swap, not restarted yet", before, "old", "new", true},
+		{"moved by the swap, restarted", after, "old", "new", false},
+		{"never moved: nothing to restart", before, "old", "old", false},
+		{"unknown unit file at the swap", before, "", "new", true},
+	} {
+		if got := mustHaveRestarted(tc.since, swap, tc.tagAtSwap, tc.to); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

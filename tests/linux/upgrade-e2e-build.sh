@@ -10,6 +10,8 @@
 #   v2     this checkout, as v0.0.2: the release the node is upgraded to
 #   v4     this checkout, as v0.0.4, pinning a PostgREST release whose launcher the test makes exit
 #   v5     this checkout, as v0.0.5, pinning a newer GoTrue release
+#   v6     this checkout, as v0.0.6, with one PostgREST setting (PGRST_DB_POOL) rendered differently
+#          and the pins of v2: a release that moves no service and still restarts every project's PostgREST
 #   releasetool   deploy/releasetool, which writes the signed manifests
 #   *.versions.yaml   the versions.yaml each binary was built with (the manifest of its release is
 #                     made from the same file)
@@ -77,5 +79,19 @@ pins internal/versions/versions.yaml "$out/v5.versions.yaml" "auth=$NEWER_AUTH"
 cp "$out/v5.versions.yaml" "$work/this/internal/versions/versions.yaml"
 build "$work/this" v0.0.5 "$out/v5"
 
+# v6: the pins of this checkout, and a PostgREST environment variable the units render differently.
+cp internal/versions/versions.yaml "$work/this/internal/versions/versions.yaml"
+cp internal/versions/versions.yaml "$out/v6.versions.yaml"
+python3 - "$work/this/internal/lifecycle/env.go" <<'PY'
+import re, sys
+path = sys.argv[1]
+s = open(path).read()
+s, n = re.subn(r'("PGRST_DB_POOL":\s+)"5"', r'\1"6"', s)
+if n != 1:
+    sys.exit("env.go has no PGRST_DB_POOL setting of 5 to change")
+open(path, "w").write(s)
+PY
+build "$work/this" v0.0.6 "$out/v6"
+
 go build -o "$out/releasetool" ./deploy/releasetool
-echo "built prev (from $prev_ref), v2, v4, v5 and releasetool in $out"
+echo "built prev (from $prev_ref), v2, v4, v5, v6 and releasetool in $out"

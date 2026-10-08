@@ -355,7 +355,15 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 	for ref, err := range n.Engine.ResumeRecovered(ctx, recovered) {
 		log.Error("project did not resume after an interrupted restart", "ref", ref, "error", err)
 	}
-	errs := n.Engine.StartActive(ctx)
+	// While an upgrade moves the node forward, a project whose service files the new binary
+	// rendered differently keeps running on the old ones; the upgrade's rollout restarts those
+	// projects, canary first, and stops at the first failure.
+	startCtx := ctx
+	if u, running := notice.UpgradeRunning(n.Cfg.Paths(), time.Now()); running && u.Forward() && u.ProcessAlive() {
+		startCtx = lifecycle.DeferRestarts(ctx)
+		log.Info("an upgrade is running; project services whose files changed are restarted by its rollout")
+	}
+	errs := n.Engine.StartActive(startCtx)
 	for ref, err := range errs {
 		log.Error("project did not start", "ref", ref, "error", err)
 	}

@@ -1062,3 +1062,50 @@ func (e *Engine) CollectArtifacts(ctx context.Context, keepReleases int, dryRun 
 	}
 	return st.GC(keepSet, dryRun)
 }
+
+// PendingRestart reports whether the GoTrue or PostgREST of ref runs older files than the ones
+// the node renders for it now: a release (or a setting) changed them while the daemon, which held
+// its restarts back for an upgrade's rollout (DeferRestarts), left the unit running. A plane that
+// cannot tell answers no.
+func (e *Engine) PendingRestart(ctx context.Context, ref string) (bool, error) {
+	pr, ok := e.plane.(PendingRestarter)
+	if !ok {
+		return false, nil
+	}
+	p, err := e.reg.GetProject(ctx, ref)
+	if err != nil || !active(p.Status) {
+		return false, err
+	}
+	keys, err := e.loadKeys(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	return pr.PendingRestart(ctx, p, keys)
+}
+
+// RestartPending restarts the GoTrue and PostgREST of ref that run older files than the ones
+// rendered for them, and waits until they answer. It reports whether it restarted any. The
+// project's database is not touched.
+func (e *Engine) RestartPending(ctx context.Context, ref string) (bool, error) {
+	pr, ok := e.plane.(PendingRestarter)
+	if !ok {
+		return false, nil
+	}
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	p, err := e.reg.GetProject(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	if !active(p.Status) {
+		return false, nil
+	}
+	keys, err := e.loadKeys(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	return pr.RestartPending(ctx, p, keys)
+}

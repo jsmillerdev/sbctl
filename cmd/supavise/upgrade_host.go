@@ -61,6 +61,9 @@ type nodeHost struct {
 	swappedAt   time.Time
 	stageDir    string
 	tmpStage    bool
+	// tagsAtSwap are the releases the node's units were set to run just before the binary was
+	// swapped (by Install or by Restore), by service.
+	tagsAtSwap map[string]string
 }
 
 func newNodeHost(cmd cobraIO, cfg *config.Config, wait time.Duration, so selfupdate.Options) (*nodeHost, error) {
@@ -124,8 +127,9 @@ func binaryVersion(ctx context.Context, path string) (string, error) {
 	return f[len(f)-1], nil
 }
 
-// Inspect implements nodeupgrade.Host.
-func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
+// InspectVersion implements nodeupgrade.VersionInspector: what `upgrade --check` needs, which is
+// the installed version and what the binary says about itself.
+func (h *nodeHost) InspectVersion(ctx context.Context) (*nodeupgrade.Node, error) {
 	if runtime.GOOS != "linux" {
 		return nil, errors.New("supavise upgrade works on a Linux server install")
 	}
@@ -137,6 +141,15 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	n.Version, h.from = ver, ver
 	if info, err := nodeupgrade.ProbeInfo(ctx, h.binPath); err == nil {
 		n.BinaryInfo = info
+	}
+	return n, nil
+}
+
+// Inspect implements nodeupgrade.Host.
+func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
+	n, err := h.InspectVersion(ctx)
+	if err != nil {
+		return nil, err
 	}
 	// A binary that reports its release is one that knows the reason "pre-upgrade" for a backup.
 	h.knowsReason = n.BinaryInfo != nil
@@ -280,10 +293,16 @@ func parseStatusReport(b []byte) (verdict, summary string, esc nodeupgrade.Escro
 			continue
 		}
 		switch {
-		case c.State == "ok":
+		// Covered needs the component to say ok and not to say that it has not looked yet; any
+		// other state, or no component, leaves it not covered, so a reworded report cannot let an
+		// unattended upgrade through. Known only tells the warning apart: the report named the
+		// key as missing (and not, say, an unreachable backend).
+		case c.State == "ok" && !strings.HasPrefix(c.Detail, "not checked"):
 			esc = nodeupgrade.Escrow{Known: true, Covered: true, Detail: c.Detail}
 		case strings.Contains(c.Detail, "not in the backups"):
 			esc = nodeupgrade.Escrow{Known: true, Covered: false, Detail: c.Detail}
+		default:
+			esc = nodeupgrade.Escrow{Detail: c.Detail}
 		}
 	}
 	return rep.Status, rep.Summary, esc
@@ -512,11 +531,10 @@ func (h *nodeHost) Mark(phase, detail string) {
 }
 
 func (h *nodeHost) writeMarker() {
-	if err := notice.WriteUpgrade(h.cfg.Paths(), h.last); err != nil {
+	uid, gid := stateOwner(h.cfg)
+	if err := notice.WriteUpgradeAs(h.cfg.Paths(), h.last, uid, gid); err != nil {
 		h.log.Warn("could not write the upgrade marker", "error", err)
-		return
 	}
-	handOverToStateOwner(h.cfg, filepath.Join(h.cfg.Paths().Root, "system", "upgrade.json"))
 }
 
 func (h *nodeHost) heartbeat(stop chan struct{}) {
@@ -534,16 +552,23 @@ func (h *nodeHost) heartbeat(stop chan struct{}) {
 	}
 }
 
-// handOverToStateOwner gives a file root wrote in the state directory to the directory's owner.
-func handOverToStateOwner(cfg *config.Config, path string) {
+// stateOwner is the owner of the state directory, whom a file that root writes there belongs to
+// (-1, -1 when this process is not root and its files are its own already). The owner is given to
+// the file while it is still a temporary one that only this process has open: the state directory
+// belongs to the supavise user, whose services run user code, and a chown by path after the rename
+// would follow whatever that user put at the path in between.
+func stateOwner(cfg *config.Config) (uid, gid int) {
 	if os.Geteuid() != 0 {
-		return
+		return -1, -1
 	}
-	if fi, err := os.Stat(cfg.StateDir); err == nil {
-		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-			_ = os.Chown(path, int(st.Uid), int(st.Gid))
-		}
+	fi, err := os.Stat(cfg.StateDir)
+	if err != nil {
+		return -1, -1
 	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return int(st.Uid), int(st.Gid)
+	}
+	return -1, -1
 }
 
 // Install implements nodeupgrade.Host.
@@ -573,6 +598,7 @@ func (h *nodeHost) activate(ctx context.Context) error {
 	// A service counts as moved when it restarted after this point: the daemon restarts them
 	// while it starts, possibly before it answers on its admin listener.
 	h.swappedAt = time.Now()
+	h.tagsAtSwap = h.renderedTags()
 	c := exec.CommandContext(ctx, h.binPath, "system", "install-units")
 	c.Stdout, c.Stderr = h.out, h.errw
 	if err := c.Run(); err != nil {
@@ -580,6 +606,17 @@ func (h *nodeHost) activate(ctx context.Context) error {
 	}
 	_ = exec.CommandContext(ctx, "systemctl", "reset-failed", "supavise.service").Run()
 	return restartAndWait(ctx, h.cfg, h.wait)
+}
+
+// renderedTags are the releases the units of the node's services are set to run, by service.
+func (h *nodeHost) renderedTags() map[string]string {
+	tags := map[string]string{}
+	for _, svc := range append([]string{config.SvcPostgres, config.SvcGoTrue}, fleet.ServicesFor(h.cfg)...) {
+		if tag, err := fleet.RenderedTag(h.cfg, svc); err == nil {
+			tags[svc] = tag
+		}
+	}
+	return tags
 }
 
 // Restore implements nodeupgrade.Host.
@@ -701,7 +738,7 @@ func (h *nodeHost) waitService(ctx context.Context, sup units.Supervisor, mgr *f
 			return fmt.Errorf("%s failed on %s", unit, short(m.Service, m.To))
 		case st.State != units.StateActive:
 			last = fmt.Sprintf("%s is %s/%s", unit, st.State, st.SubState)
-		case st.Since.Before(h.swappedAt):
+		case mustHaveRestarted(st.Since, h.swappedAt, h.tagsAtSwap[m.Service], m.To):
 			last = "still the process that ran before the swap"
 		case system:
 			return nil
@@ -728,6 +765,15 @@ func (h *nodeHost) waitService(ctx context.Context, sup units.Supervisor, mgr *f
 	}
 }
 
+// mustHaveRestarted says whether a service that is active since `since` is still the process of
+// the release before the swap, and so has to restart before it counts as moved. A unit that was
+// already set to run `to` when the binary was swapped has no reason to restart: the swap moved
+// nothing for it. That is the case for a service that a daemon which died on its start never got
+// to move, when a rollback puts the old release back.
+func mustHaveRestarted(since, swappedAt time.Time, tagAtSwap, to string) bool {
+	return tagAtSwap != to && since.Before(swappedAt)
+}
+
 // toArgs turns release tags per service into repeated --to flags.
 func toArgs(target map[string]string) []string {
 	svcs := make([]string, 0, len(target))
@@ -745,7 +791,7 @@ func toArgs(target map[string]string) []string {
 // upgradeProjectsArgs is the command line of the rollout: the new binary upgrades every
 // eligible project to the named releases, canary first, and stops at the first failure.
 func upgradeProjectsArgs(target map[string]string, since time.Time) []string {
-	args := append([]string{"projects", "upgrade", "--all", "--yes", "--no-gc"}, toArgs(target)...)
+	args := append([]string{"projects", "upgrade", "--all", "--yes", "--no-gc", "--restart-changed"}, toArgs(target)...)
 	if !since.IsZero() {
 		// The base backups this run took are the pre-upgrade backups: a project does not take a
 		// second one, and the archived WAL carries a restore from them up to the moment of the upgrade.
@@ -762,6 +808,11 @@ func (h *nodeHost) UpgradeProjects(ctx context.Context, target map[string]string
 		h.log.Warn("could not read which projects were upgraded", "error", merr)
 	}
 	return moves, err
+}
+
+// EndUpgrade implements nodeupgrade.Host.
+func (h *nodeHost) EndUpgrade(_ context.Context, version string, at time.Time) error {
+	return h.rel.EndUpgrade(version, at)
 }
 
 // MovesSince implements nodeupgrade.Host.

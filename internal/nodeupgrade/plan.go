@@ -218,12 +218,22 @@ func (p *Plan) describe() {
 		p.Notes = append(p.Notes, fmt.Sprintf("%d project(s) keep their PostgreSQL release (the release pins %s); pass --include-postgres to move them, each restarts PostgreSQL", p.HeldBack, short(config.SvcPostgres, p.HeldTo)))
 	}
 	if len(p.NewMigrations) > 0 {
-		p.Notes = append(p.Notes, fmt.Sprintf("the release adds %d registry migration(s) (%s). Migrations only go forward: `supavise rollback` afterwards needs the pre-upgrade backup of the system project restored first", len(p.NewMigrations), refList(p.NewMigrations)))
+		p.Notes = append(p.Notes, fmt.Sprintf("the release adds %d registry migration(s) (%s). The new daemon applies them when it starts, and migrations only go forward: from then on the node cannot go back to the previous release by itself, and `supavise rollback` is refused until the system cluster is restored by hand from its pre-upgrade backup (internal/backup/README.md, \"Disaster recovery of the system cluster\")", len(p.NewMigrations), refList(p.NewMigrations)))
 	}
 	for _, s := range p.Skipped {
 		p.Notes = append(p.Notes, fmt.Sprintf("project %s is skipped: %s", s.Ref, s.Why))
 	}
-	p.Notes = append(p.Notes, "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. If the new release does not come up healthy, the node goes back to the previous release by itself.")
+	back := "If the new release does not come up healthy, the node goes back to the previous release by itself."
+	switch {
+	case !p.BinaryChange:
+		back = "The binary does not change, so there is no earlier binary to go back to: if a project fails, the projects this run moved are put back, and the services stay on the releases the binary pins."
+	case len(p.NewMigrations) > 0:
+		back = "If the new daemon fails before it applies the migrations, the node goes back to the previous release by itself; after that it stays on the new binary, the projects this run moved are put back, and the node needs you."
+	}
+	p.Notes = append(p.Notes, "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "+back)
+	if p.BinaryChange {
+		p.Notes = append(p.Notes, "A project whose GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order; the files are rendered by the new binary, so this list cannot name those projects before the upgrade.")
+	}
 }
 
 // Render prints the plan.
@@ -352,16 +362,17 @@ func CheckGates(n *Node, p *Plan, o GateOptions) Gates {
 	if need := DiskNeeded(n, p); n.DiskFree != 0 && n.DiskFree < need {
 		refuse("%s has %s free and the upgrade needs about %s (new artifacts and, with local backups, a copy of every project's data)", n.DiskPath, human(n.DiskFree), human(need))
 	}
-	switch {
-	case n.Escrow.Known && !n.Escrow.Covered:
+	if !n.Escrow.Covered {
 		msg := "the master key has no encrypted copy in the backup backend: if this node is lost, its backups cannot be read (`supavise system escrow-key`)"
+		if !n.Escrow.Known {
+			msg = "could not check whether the master key has a copy in the backup backend (`supavise status` says why)"
+		}
+		// Only a copy that is known to be there lets a timer upgrade the node.
 		if o.Unattended {
 			refuse("%s", msg)
 		} else {
 			warn("%s", msg)
 		}
-	case !n.Escrow.Known:
-		warn("could not check whether the master key has a copy in the backup backend")
 	}
 	if o.Unattended {
 		limit := o.BackupMaxAge

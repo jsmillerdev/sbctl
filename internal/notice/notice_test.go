@@ -365,3 +365,53 @@ func TestWriteUpgradeRoundTrip(t *testing.T) {
 		t.Fatalf("ClearUpgrade: %v %v", had, err)
 	}
 }
+
+// The owner of the marker is set on the temporary file before it is renamed into place, so a
+// symlink put at the marker path (the state directory belongs to a user that root does not trust)
+// is replaced, not followed: its target is neither written nor re-owned.
+func TestWriteUpgradeAsReplacesASymlinkInsteadOfFollowingIt(t *testing.T) {
+	p := config.Paths{Root: t.TempDir()}
+	dir := filepath.Join(p.Root, "system")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("precious"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "upgrade.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteUpgradeAs(p, Upgrade{Phase: "services", From: "v1", To: "v2", StartedAt: time.Now()}, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Lstat(link); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("the marker is %v, %v", fi, err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "precious" {
+		t.Fatalf("the target was written: %q", b)
+	}
+	if after, _ := os.Stat(target); after.Mode() != before.Mode() || !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("the target was changed")
+	}
+	if u := ReadUpgrade(p); u == nil || u.Phase != "services" || u.To != "v2" {
+		t.Fatalf("marker = %+v", u)
+	}
+}
+
+func TestUpgradeForwardAndProcess(t *testing.T) {
+	if !(Upgrade{Phase: "projects"}).Forward() || (Upgrade{Phase: PhaseRollingBack}).Forward() {
+		t.Fatal("Forward")
+	}
+	if !(Upgrade{PID: os.Getpid()}).ProcessAlive() || !(Upgrade{}).ProcessAlive() {
+		t.Fatal("this process is alive, and an unnamed one counts as alive")
+	}
+	if (Upgrade{PID: 1 << 30}).ProcessAlive() {
+		t.Fatal("a process that does not exist is alive")
+	}
+}

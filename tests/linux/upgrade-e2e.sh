@@ -28,6 +28,11 @@
 #     the binary to v0.0.2, data intact; a second rollback steps back to v0.0.1 and is refused for
 #     the same reason when the registry holds a migration v0.0.1 does not know (origin/main has
 #     not got this branch's migrations until it is merged).
+#  5b. A release that moves GoTrue and whose daemon dies when it starts (a stub of v0.0.5 as v0.0.8):
+#     the rollback must not wait for the services the dead daemon never moved; exit status 3.
+#  7. A release that moves no service and renders PostgREST's environment differently (v0.0.6): the
+#     daemon starts without restarting the projects, the upgrade's rollout restarts each project's
+#     PostgREST (canary first), PostgreSQL untouched, data intact.
 #
 # Needs root, systemd, cgroup v2 and network access (artifact downloads). Do not run it on a
 # machine you care about: it creates the supavise user, writes /etc/supavise and starts real
@@ -58,10 +63,10 @@ need_root
 preflight
 ARCH=$(dpkg --print-architecture)
 cd "$REPO_ROOT" || exit 1
-for f in prev v2 v4 v5 releasetool; do [[ -x $BINS/$f ]] || fail "$BINS/$f is missing: run tests/linux/upgrade-e2e-build.sh"; done
+for f in prev v2 v4 v5 v6 releasetool; do [[ -x $BINS/$f ]] || fail "$BINS/$f is missing: run tests/linux/upgrade-e2e-build.sh"; done
 # The driver and the stubs are run by the supavise user too (as workers): out of a private directory.
 install -d -m 0755 /opt/supavise-e2e
-for f in prev v2 v4 v5; do install -m 0755 "$BINS/$f" "/opt/supavise-e2e/$f"; done
+for f in prev v2 v4 v5 v6; do install -m 0755 "$BINS/$f" "/opt/supavise-e2e/$f"; done
 B=/opt/supavise-e2e
 SV=/usr/local/bin/supavise
 STATE=$SUPAVISE_STATE
@@ -345,6 +350,29 @@ wait_status "$REF" ACTIVE_HEALTHY 180; wait_status "$REF2" ACTIVE_HEALTHY 180
 for r in "$REF" "$REF2"; do runs "supavise-postgrest@$r.service" "$NEW_REST"; done
 intact "$REF"; intact "$REF2"
 
+# ---- 5b. a daemon that dies after the release moved a shared service ---------------------------
+log "a release that moves GoTrue and whose daemon exits: the rollback does not wait for services that never moved, exit status 3"
+cp "$B/v5" /opt/supavise-e2e/v5-real
+cat >"$WORK/stub5" <<'EOF'
+#!/bin/sh
+REAL=/opt/supavise-e2e/v5-real
+for a in "$@"; do [ "$a" = serve ] && { echo "simulated crash" >&2; exit 1; }; done
+[ "$1" = --version ] && { echo "supavise version v0.0.8"; exit 0; }
+if [ "$1" = release-info ]; then "$REAL" release-info --json | sed 's/"version": "v0.0.5"/"version": "v0.0.8"/'; exit $?; fi
+exec "$REAL" "$@"
+EOF
+chmod 755 "$WORK/stub5"
+make_release v0.0.8 "$WORK/stub5" "$BINS/v5.versions.yaml"
+run upgrade "$B/v5" --yes --version v0.0.8 --wait 20s
+[[ $RC -eq 3 ]] || { journalctl --no-pager -u supavise.service | tail -40 >&2; fail "a daemon that exits on a release that moves GoTrue: exit $RC, want 3: $OUT"; }
+[[ $OUT == *"rolled back"* ]] || fail "rollback message: $OUT"
+unchanged "stub release that moves GoTrue"
+wait_daemon; [[ $(daemon_version) == *v0.0.2* ]] || fail "the daemon does not run the restored binary: $(daemon_version)"
+[[ $(versions_of "$REF") == "$NEW_AUTH $NEW_REST "* ]] || fail "versions changed: $(versions_of "$REF")"
+runs supavise-gotrue@system.service "$NEW_AUTH"; runs_not supavise-gotrue@system.service "$NEWER_AUTH"
+wait_status "$REF" ACTIVE_HEALTHY 180; wait_status "$REF2" ACTIVE_HEALTHY 180
+intact "$REF"; intact "$REF2"
+
 # ---- 6. upgrade to v0.0.5 and roll back -----------------------------------------------------
 log "upgrade to v0.0.5 (a newer GoTrue)"
 make_release v0.0.5 "$B/v5" "$BINS/v5.versions.yaml"
@@ -359,7 +387,7 @@ intact "$REF"; intact "$REF2"
 log "rollback is refused while the registry is newer than the previous release expects"
 reg "insert into supavise.schema_migrations (version) values ('migrations/9999_from_the_future.sql')" >/dev/null
 run "$SV" rollback --yes
-[[ $RC -eq 2 && $OUT == *"Restore the system project's pre-upgrade backup"* ]] || fail "rollback with a newer registry: $RC $OUT"
+[[ $RC -eq 2 && $OUT == *"restore the system cluster from its pre-upgrade base backup"* ]] || fail "rollback with a newer registry: $RC $OUT"
 unchanged "refused rollback"
 [[ $(versions_of "$REF") == "$NEWER_AUTH $NEW_REST "* ]] || fail "a refused rollback moved a project"
 reg "delete from supavise.schema_migrations where version = 'migrations/9999_from_the_future.sql'" >/dev/null
@@ -382,11 +410,48 @@ sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
 log "a second rollback steps back to v0.0.1, whose schema the registry has outgrown: refused"
 run "$SV" rollback --yes
 if [[ $RC -eq 2 ]]; then
-  [[ $OUT == *"Restore the system project's pre-upgrade backup"* ]] || fail "second rollback refusal: $OUT"
+  [[ $OUT == *"restore the system cluster from its pre-upgrade base backup"* ]] || fail "second rollback refusal: $OUT"
 else
   # The previous release already carries every migration (a main that has this code): the
   # rollback goes through to v0.0.1.
   [[ $RC -eq 0 && $($SV --version) == *v0.0.1* ]] || fail "second rollback: $RC $OUT"
 fi
+
+# ---- 7. a release that renders the units differently ------------------------------------------
+log "a release that renders PostgREST differently: the daemon holds the restarts back and the rollout does them"
+if [[ $($SV --version) == *v0.0.1* ]]; then # the second rollback went all the way back
+  run upgrade "$B/v2" --yes --version v0.0.2
+  [[ $RC -eq 0 ]] || { journalctl --no-pager -u supavise.service | tail -60 >&2; fail "the upgrade back to v0.0.2 exited $RC: $OUT"; }
+fi
+EXPECT_VERSION=v0.0.2
+wait_daemon
+wait_status "$REF" ACTIVE_HEALTHY 180; wait_status "$REF2" ACTIVE_HEALTHY 180
+PG_PID=$(pg_pid "$REF") PG_PID2=$(pg_pid "$REF2")
+declare -A REST_PID
+for r in "$REF" "$REF2"; do
+  REST_PID[$r]=$(systemctl show -p MainPID --value "supavise-postgrest@$r.service")
+  grep -q 'PGRST_DB_POOL="5"' "$STATE/projects/$r/postgrest.env" || fail "$r: PostgREST is not on pool size 5 before the upgrade"
+done
+make_release v0.0.6 "$B/v6" "$BINS/v6.versions.yaml"
+run upgrade "$B/v6" --yes --version v0.0.6
+[[ $RC -eq 0 ]] || { journalctl --no-pager -u supavise.service | tail -60 >&2; fail "the upgrade to v0.0.6 exited $RC: $OUT"; }
+EXPECT_VERSION=v0.0.6
+for want in "restarting the projects whose service files" "restarted on their changed files" "Supavise v0.0.6 is running"; do
+  [[ $OUT == *"$want"* ]] || fail "the upgrade's output lacks '$want':
+$OUT"
+done
+wait_daemon; [[ $(daemon_version) == *v0.0.6* ]] || fail "the daemon runs $(daemon_version)"
+wait_status "$REF" ACTIVE_HEALTHY 180; wait_status "$REF2" ACTIVE_HEALTHY 180
+for r in "$REF" "$REF2"; do
+  grep -q 'PGRST_DB_POOL="6"' "$STATE/projects/$r/postgrest.env" || fail "$r: the files were not rendered with pool size 6"
+  now_pid=$(systemctl show -p MainPID --value "supavise-postgrest@$r.service")
+  [[ $now_pid != "${REST_PID[$r]}" ]] || fail "$r: PostgREST was not restarted on its new files"
+done
+[[ $(pg_pid "$REF") == "$PG_PID" && $(pg_pid "$REF2") == "$PG_PID2" ]] || fail "a project's PostgreSQL was restarted by a release that moves no PostgreSQL"
+journalctl --no-pager -u supavise.service | grep -q "restart waits for the upgrade's rollout" || fail "the daemon did not hold the restarts back for the rollout"
+[[ $(marker) == "done v0.0.2 v0.0.6" ]] || fail "marker: $(marker)"
+intact "$REF"; intact "$REF2"
+sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
+[[ $sup_status -eq 0 ]] || { cat "$WORK/status.txt" >&2; fail "supavise status exited $sup_status after the upgrade to v0.0.6"; }
 
 log "upgrade end to end: all checks passed"
