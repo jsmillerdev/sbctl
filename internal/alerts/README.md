@@ -22,7 +22,24 @@ alerts.Notify(ctx, alerts.Event{Kind: alerts.KindUpgradeFailed, Severity: "criti
 | `node_unhealthy` | the registry, the system cluster or a shared service is not healthy | warning; critical for the registry and system Postgres |
 | `update_available` | a release newer than the running version exists | info, once per version |
 
-Other parts of the node may raise any kind through `alerts.Notify`. The kinds `upgrade_started`, `upgrade_succeeded` and `upgrade_failed` are raised by the upgrade paths below. Those three, `update_available` and `test` are announcements: each is sent when it happens (see the cap, below). Everything else is a condition: sent once while it lasts.
+Other parts of the node may raise any kind through `alerts.Notify`. The kinds `upgrade_started`, `upgrade_succeeded` and `upgrade_failed` are raised by the upgrade paths below. Those three, the three `failover_*` kinds, `update_available` and `test` are announcements: each is sent when it happens (see the cap, below). Everything else is a condition: sent once while it lasts.
+
+The cluster kinds are raised by the code that owns the event, not by the checker. A replica's `Ref` is the project it copies; the rest are about the node.
+
+| Kind | When | Raised by |
+|---|---|---|
+| `replica_unhealthy` | a replica's receiver is down for 2 minutes, its PostgREST does not answer, or its lag is above `[replicas] unhealthy_lag_seconds` | the replica controller |
+| `replica_lag` | replication lag is high (60 seconds) but the replica is still within its limit | the replica controller |
+| `replica_needs_rebuild` | a replica fell behind the WAL archive and no base backup is old enough to reseed it | the replica agent |
+| `replica_capacity` | a node has no room for a replica that `[replicas] default = "all"` wants | the default reconciler |
+| `node_unreachable` | a peer does not answer the mesh | the mesh |
+| `node_version_skew` | a peer runs a release outside the window this one works with | the mesh, at join and ping |
+| `failover_started`, `failover_completed`, `failover_failed` | a switchover or failover begins, ends or stops (announcements) | the failover orchestrator |
+| `fenced` | this node lost the leadership to a higher epoch and starts no primary (critical) | the daemon at boot |
+| `infra_behind` | the AWS stack lacks resources this release needs | `supavise upgrade` and the daemon |
+| `host_not_converged` | `supavise system converge` has not run for this release | the daemon |
+| `standby_behind` | the registry is newer than this binary, which leaves running instances alone | a standby's daemon |
+| `storage_not_s3` | a cluster feature needs Storage on S3 and the node still uses files | the cluster features |
 
 Three places raise the `upgrade_*` events, each about its own scope:
 

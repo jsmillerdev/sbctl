@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,7 +14,15 @@ import (
 )
 
 // Postgres is the production Registry.
-type Postgres struct{ pool *pgxpool.Pool }
+type Postgres struct {
+	pool *pgxpool.Pool
+	// readOnly is set by OpenReadOnly: the registry does not LISTEN and its pool refuses writes.
+	readOnly bool
+	// legacy is set while the registry has not run migration 1300, which only OpenExisting and
+	// OpenReadOnly can meet: projects have no node_id column and every project is on the
+	// founder node. Open and NewPostgres see a migrated registry.
+	legacy atomic.Bool
+}
 
 var (
 	_ Registry = (*Postgres)(nil)
@@ -35,9 +44,63 @@ func Open(ctx context.Context, dsn string) (*Postgres, error) {
 
 // OpenExisting connects to the registry at dsn without migrating it, for the commands that must
 // look at a registry as its release left it (`supavise upgrade` reads it before the new release has
-// migrated it). Open is what a node runs.
+// migrated it). It reads a registry from before the cluster migrations too: its projects are all on
+// the founder node. Open is what a node runs.
 func OpenExisting(ctx context.Context, dsn string) (*Postgres, error) {
 	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	r := &Postgres{pool: pool}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if err := r.probe(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+// probe looks for the column migration 1300 adds and records the answer in legacy.
+func (r *Postgres) probe(ctx context.Context) error {
+	var has bool
+	err := r.pool.QueryRow(ctx, `
+		select exists (select 1 from pg_attribute
+		  where attrelid = to_regclass('supavise.projects') and attname = 'node_id' and not attisdropped)`).Scan(&has)
+	if err != nil {
+		return err
+	}
+	r.legacy.Store(!has)
+	return nil
+}
+
+// projectCols is the column list of a project query: the legacy one reports every project on the
+// founder node.
+func (r *Postgres) projectCols() string {
+	if r.legacy.Load() {
+		return projectBaseCols + `, '` + FounderNodeID + `'::text`
+	}
+	return projectBaseCols + `, node_id`
+}
+
+// readOnlyPoll is how often a read-only registry looks at cluster.change_seq. A variable so
+// that tests can shorten it.
+var readOnlyPoll = time.Second
+
+// OpenReadOnly connects to the registry at dsn the way a standby's daemon must: it neither
+// migrates nor takes advisory locks, every connection is read-only (a write fails with
+// ErrReadOnly), and Subscribe polls cluster.change_seq once a second instead of LISTENing,
+// which Postgres refuses during recovery. It also works against a primary, and against a registry
+// that has not run the cluster migrations (see OpenExisting), where Subscribe fails until it has.
+func OpenReadOnly(ctx context.Context, dsn string) (*Postgres, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -45,7 +108,12 @@ func OpenExisting(ctx context.Context, dsn string) (*Postgres, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Postgres{pool: pool}, nil
+	r := &Postgres{pool: pool, readOnly: true}
+	if err := r.probe(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return r, nil
 }
 
 // NewPostgres wraps an existing, already migrated pool.
@@ -61,9 +129,15 @@ func mapErr(err error) error {
 		return ErrNotFound
 	}
 	var pe *pgconn.PgError
-	if errors.As(err, &pe) && (pe.Code == "23505" || pe.Code == "23503") {
-		// unique_violation, or foreign_key_violation (a project that still has branches)
-		return fmt.Errorf("%w: %s", ErrConflict, pe.ConstraintName)
+	if errors.As(err, &pe) {
+		switch pe.Code {
+		case "23505", "23503":
+			// unique_violation, or foreign_key_violation (a project that still has branches)
+			return fmt.Errorf("%w: %s", ErrConflict, pe.ConstraintName)
+		case "25006":
+			// read_only_sql_transaction: a standby, or a registry opened with OpenReadOnly
+			return fmt.Errorf("%w: %s", ErrReadOnly, pe.Message)
+		}
 	}
 	return err
 }
@@ -127,7 +201,7 @@ func (r *Postgres) DeleteOrganization(ctx context.Context, id int64) error {
 
 // Projects
 
-const projectCols = `ref, coalesce(org_id, 0), seq, name, region, engine, class, status, versions, limits, created_at, updated_at,
+const projectBaseCols = `ref, coalesce(org_id, 0), seq, name, region, engine, class, status, versions, limits, created_at, updated_at,
 	branch_id::text, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
 	notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress`
 
@@ -142,7 +216,7 @@ func scanProject(row pgx.Row) (*Project, error) {
 	if err := row.Scan(&p.Ref, &p.OrgID, &p.Seq, &p.Name, &p.Region, &p.Engine, &p.Class, &p.Status,
 		&versions, &limits, &p.CreatedAt, &p.UpdatedAt,
 		&bID, &bParent, &bName, &bGit, &bPersistent, &bData, &bExpires, &bDeletion,
-		&bNotify, &bState, &bDetail, &bMethod, &bReview, &bEgress); err != nil {
+		&bNotify, &bState, &bDetail, &bMethod, &bReview, &bEgress, &p.NodeID); err != nil {
 		return nil, mapErr(err)
 	}
 	if bParent != nil {
@@ -205,13 +279,23 @@ func (r *Postgres) CreateProject(ctx context.Context, p *Project) error {
 				return err
 			}
 		}
+		args := append([]any{p.Ref, nullOrg(p.OrgID), seq, p.Name, p.Region, p.Engine, p.Class, p.Status, versions, limits}, branchArgs(p.Branch)...)
+		// A new project lives where the leader does. A registry from before clusters has one node.
+		nodeCol, nodeVal := "", ""
+		if r.legacy.Load() {
+			if p.NodeID != "" && p.NodeID != FounderNodeID {
+				return fmt.Errorf("%w: projects_node_id_fkey", ErrConflict)
+			}
+		} else {
+			nodeCol, nodeVal = ", node_id", ", coalesce($25::text, (select leader from supavise.cluster))"
+			args = append(args, nullStr(p.NodeID))
+		}
 		got, err := scanProject(tx.QueryRow(ctx, `
 			insert into supavise.projects (ref, org_id, seq, name, region, engine, class, status, versions, limits,
 				branch_id, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
-				notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress)
+				notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress`+nodeCol+`)
 			values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-				$11::text::uuid, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) returning `+projectCols,
-			append([]any{p.Ref, nullOrg(p.OrgID), seq, p.Name, p.Region, p.Engine, p.Class, p.Status, versions, limits}, branchArgs(p.Branch)...)...))
+				$11::text::uuid, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24`+nodeVal+`) returning `+r.projectCols(), args...))
 		if err != nil {
 			return err
 		}
@@ -273,11 +357,11 @@ func (r *Postgres) SetBranchEgress(ctx context.Context, ref, from, to string) er
 }
 
 func (r *Postgres) GetProject(ctx context.Context, ref string) (*Project, error) {
-	return scanProject(r.pool.QueryRow(ctx, `select `+projectCols+` from supavise.projects where ref = $1`, ref))
+	return scanProject(r.pool.QueryRow(ctx, `select `+r.projectCols()+` from supavise.projects where ref = $1`, ref))
 }
 
 func (r *Postgres) ListProjects(ctx context.Context) ([]Project, error) {
-	rows, err := r.pool.Query(ctx, `select `+projectCols+` from supavise.projects order by seq`)
+	rows, err := r.pool.Query(ctx, `select `+r.projectCols()+` from supavise.projects order by seq`)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +379,7 @@ func (r *Postgres) UpdateProject(ctx context.Context, p *Project) error {
 	limits, _ := json.Marshal(p.Limits)
 	got, err := scanProject(r.pool.QueryRow(ctx, `
 		update supavise.projects set name = $2, region = $3, class = $4, status = $5, versions = $6, limits = $7, updated_at = now()
-		where ref = $1 returning `+projectCols, p.Ref, p.Name, p.Region, p.Class, p.Status, versions, limits))
+		where ref = $1 returning `+r.projectCols(), p.Ref, p.Name, p.Region, p.Class, p.Status, versions, limits))
 	if err != nil {
 		return err
 	}
@@ -537,8 +621,12 @@ func (r *Postgres) ListEvents(ctx context.Context, ref string, limit int) ([]Eve
 }
 
 // Subscribe LISTENs on supavise_changes with a dedicated connection. The channel closes
-// when ctx ends or the connection drops; consumers then resubscribe and reload.
+// when ctx ends or the connection drops; consumers then resubscribe and reload. A registry
+// opened with OpenReadOnly polls instead (see subscribePoll).
 func (r *Postgres) Subscribe(ctx context.Context) (<-chan Change, error) {
+	if r.readOnly {
+		return r.subscribePoll(ctx)
+	}
 	conn, err := r.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err

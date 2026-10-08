@@ -26,21 +26,32 @@ type Memory struct {
 	upgrades  []Upgrade
 	nextID    int64
 	subs      map[chan Change]struct{}
+	// The cluster store (cluster_mem.go).
+	nodes      map[string]Node
+	cluster    Cluster
+	replicas   map[string]Replica
+	optouts    []ReplicaOptout
+	joinTokens map[string]JoinToken
+	moves      []Move
 }
 
 func NewMemory() *Memory {
-	return &Memory{
+	m := &Memory{
 		projects: map[string]Project{},
 		secrets:  map[string]map[string][]byte{},
 		routes:   map[string]Route{},
 		subs:     map[chan Change]struct{}{},
 	}
+	m.seedCluster()
+	return m
 }
 
 func (m *Memory) id() int64 { m.nextID++; return m.nextID }
 
-// notify must be called with m.mu held.
+// notify must be called with m.mu held. Like the triggers of migration 1300 it also moves the
+// cluster's change_seq.
 func (m *Memory) notify(table, op, key string) {
+	m.bumpCluster()
 	for ch := range m.subs {
 		select {
 		case ch <- Change{Table: table, Op: op, Key: key}:
@@ -182,6 +193,12 @@ func (m *Memory) CreateProject(_ context.Context, p *Project) error {
 	if p.Versions == nil {
 		p.Versions = map[string]string{}
 	}
+	// A new project lives where the leader does.
+	if p.NodeID == "" {
+		p.NodeID = m.cluster.Leader
+	} else if _, ok := m.nodes[p.NodeID]; !ok {
+		return fmt.Errorf("%w: projects_node_id_fkey", ErrConflict)
+	}
 	now := time.Now()
 	p.CreatedAt, p.UpdatedAt = now, now
 	m.projects[p.Ref] = cloneProject(*p)
@@ -293,6 +310,19 @@ func (m *Memory) DeleteProject(_ context.Context, ref string) error {
 	}
 	delete(m.projects, ref)
 	delete(m.secrets, ref)
+	for id, r := range m.replicas {
+		if r.Ref == ref {
+			delete(m.replicas, id)
+			m.notify("replicas", "delete", id)
+		}
+	}
+	optouts := m.optouts[:0]
+	for _, o := range m.optouts {
+		if o.Ref != ref {
+			optouts = append(optouts, o)
+		}
+	}
+	m.optouts = optouts
 	kept := m.upgrades[:0]
 	for _, u := range m.upgrades {
 		if u.Ref != ref {

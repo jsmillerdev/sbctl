@@ -26,12 +26,17 @@ const (
 	PortEdgeRuntime          = 9000
 	PortAdmin                = 7000
 	PortProjectBase          = 20000
+	PortReplicaBase          = 10000
+	PortPeer                 = 7443 // the mesh: one mTLS port between the nodes of a cluster
 )
 
 // Ports is the [ports] config section.
 type Ports struct {
 	// ProjectBase: project n gets Postgres ProjectBase+3n, GoTrue +1, PostgREST +2.
-	ProjectBase          int `toml:"project_base"`
+	ProjectBase int `toml:"project_base"`
+	// ReplicaBase: the replica of project n on a node that is not its home gets Postgres
+	// ReplicaBase+3n and PostgREST +2. The range must end below ProjectBase (see ReplicaPorts).
+	ReplicaBase          int `toml:"replica_base"`
 	SupavisorSession     int `toml:"supavisor_session"`
 	SupavisorTransaction int `toml:"supavisor_transaction"`
 	SystemPostgres       int `toml:"system_postgres"`
@@ -48,7 +53,7 @@ type Ports struct {
 // DefaultPorts returns the production port plan.
 func DefaultPorts() Ports {
 	return Ports{
-		ProjectBase: PortProjectBase, SupavisorSession: PortSupavisorSession, SupavisorTransaction: PortSupavisorTransaction,
+		ProjectBase: PortProjectBase, ReplicaBase: PortReplicaBase, SupavisorSession: PortSupavisorSession, SupavisorTransaction: PortSupavisorTransaction,
 		SystemPostgres: PortSystemPostgres, SystemGoTrue: PortSystemGoTrue, Realtime: PortRealtime, Storage: PortStorage,
 		StorageAdmin: PortStorageAdmin, Imgproxy: PortImgproxy, PGMeta: PortPGMeta, Studio: PortStudio, EdgeRuntime: PortEdgeRuntime,
 	}
@@ -73,6 +78,33 @@ func (c *Config) PortsFor(ref string, seq int) ProjectPorts {
 	}
 	b := c.Ports.ProjectBase + 3*seq
 	return ProjectPorts{Postgres: b, GoTrue: b + 1, PostgREST: b + 2}
+}
+
+// ReplicaBase is Ports.ReplicaBase, or PortReplicaBase when a configuration built in code left it unset.
+func (c *Config) ReplicaBase() int {
+	if c.Ports.ReplicaBase > 0 {
+		return c.Ports.ReplicaBase
+	}
+	return PortReplicaBase
+}
+
+// MaxReplicaSeq is the largest project sequence whose replica ports end below ProjectBase, so
+// that the replica range and the project range never meet. With the defaults it is 3332;
+// a project with a larger sequence cannot have a replica. Zero or less when ReplicaBase leaves no room.
+func (c *Config) MaxReplicaSeq() int { return (c.Ports.ProjectBase - c.ReplicaBase() - 3) / 3 }
+
+// ReplicaPorts returns the ports of ref's replica on a node that is not the project's home:
+// Postgres ReplicaBase+3*seq and PostgREST two above it. A replica has no GoTrue (the field
+// stays zero). On the home node the same project's PortsFor ports are the project itself; on any
+// other node they are forwarders to the home, and these ports are the replica itself or, on a
+// third node, a forwarder to it. The system project's standby takes ReplicaBase itself and has no
+// PostgREST. Callers refuse a seq above MaxReplicaSeq.
+func (c *Config) ReplicaPorts(ref string, seq int) ProjectPorts {
+	if ref == SystemRef {
+		return ProjectPorts{Postgres: c.ReplicaBase()}
+	}
+	b := c.ReplicaBase() + 3*seq
+	return ProjectPorts{Postgres: b, PostgREST: b + 2}
 }
 
 // Service names, as used in unit names, env file names, artifact directories and
@@ -178,6 +210,18 @@ func (p Paths) WALSocket(ref string) string { return filepath.Join(p.WALDir(ref)
 func (p Paths) RestoreSources(ref string) string {
 	return filepath.Join(p.Root, "projects", ref, "restore-sources")
 }
+
+// PromoteOK is the file whose content is the cluster epoch (a decimal number and a newline) at
+// which this node's promotion of ref's standby was authorized. The WAL relay refuses to push the
+// WAL of a ref whose cluster here is a replica unless the file holds the current epoch, so an
+// accidental pg_promote cannot write into the archive. Only the promotion procedure writes it.
+func (p Paths) PromoteOK(ref string) string {
+	return filepath.Join(p.Root, "projects", ref, "promote.ok")
+}
+
+// FailoverState is where `supavise failover` keeps its progress until the system cluster is
+// promoted (after that the moves table in the registry holds it).
+func (p Paths) FailoverState() string { return filepath.Join(p.Root, "failover.json") }
 
 func (p Paths) System(svc string) string { return filepath.Join(p.Root, "system", svc) }
 

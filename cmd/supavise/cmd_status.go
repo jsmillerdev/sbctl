@@ -12,9 +12,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/health"
+	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/lifecycle"
+	"github.com/supavise/supavise/internal/notimpl"
 	"github.com/supavise/supavise/internal/units"
 )
 
@@ -73,14 +76,81 @@ func runStatus(ctx context.Context, w io.Writer, asJSON, verbose bool) (int, err
 	if err != nil {
 		return 0, err
 	}
+	sections := collectStatusSections(ctx, cfg)
 	if asJSON {
-		if err := printJSON(w, rep); err != nil {
+		if err := printJSON(w, statusJSON{Report: rep, statusSections: sections}); err != nil {
 			return 0, err
 		}
 	} else {
 		health.Render(w, rep, verbose)
+		sections.render(w)
 	}
 	return rep.Verdict.ExitCode(), nil
+}
+
+// statusSections are the blocks a cluster adds below the node report: the nodes and replicas, the
+// failover readiness and the infrastructure the release needs. Each is nil on a node that has
+// nothing to say, which is every node that is not part of a cluster or on a stack that lags, so
+// for those the output is the node report alone. They do not change the verdict.
+type statusSections struct {
+	Cluster        *clusterBlock       `json:"cluster,omitempty"`
+	Failover       *failover.Readiness `json:"failover,omitempty"`
+	Infrastructure *infra.Report       `json:"infrastructure,omitempty"`
+	// Errors are the blocks that could not be read, by name.
+	Errors map[string]string `json:"errors,omitempty"`
+}
+
+// statusJSON is the report with the sections beside it.
+type statusJSON struct {
+	*health.Report
+	statusSections
+}
+
+// collectStatusSections reads each block. A block that cannot be read is named in Errors and
+// does not stop the others; a stub that is not implemented yet is skipped.
+func collectStatusSections(ctx context.Context, cfg *config.Config) statusSections {
+	var s statusSections
+	fail := func(name string, err error) {
+		if errors.Is(err, notimpl.Err) {
+			return
+		}
+		if s.Errors == nil {
+			s.Errors = map[string]string{}
+		}
+		s.Errors[name] = err.Error()
+	}
+	var err error
+	if s.Cluster, err = clusterStatus(ctx, cfg); err != nil {
+		fail("cluster", err)
+	}
+	if s.Failover, err = failoverStatus(ctx, cfg); err != nil {
+		fail("failover", err)
+	}
+	if s.Infrastructure, err = infraStatus(ctx, cfg); err != nil {
+		fail("infrastructure", err)
+	}
+	return s
+}
+
+// render writes the blocks, each after a blank line.
+func (s statusSections) render(w io.Writer) {
+	if s.Cluster != nil {
+		fmt.Fprintln(w)
+		s.Cluster.render(w)
+	}
+	if s.Failover != nil {
+		fmt.Fprintln(w)
+		s.Failover.Render(w)
+	}
+	if s.Infrastructure != nil && s.Infrastructure.Behind() {
+		fmt.Fprintln(w)
+		s.Infrastructure.Render(w)
+	}
+	for _, name := range []string{"cluster", "failover", "infrastructure"} {
+		if msg, ok := s.Errors[name]; ok {
+			fmt.Fprintf(w, "\n%s  could not be read: %s\n", name, msg)
+		}
+	}
 }
 
 // statusDeps opens the node for the checks and returns the function that closes it. A node

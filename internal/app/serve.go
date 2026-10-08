@@ -172,6 +172,18 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		}
 		apiDeps.Functions = fnSyncer
 	}
+	// The hooks of the cluster work (wire.go) see the node and the options the Management API and
+	// the edge proxy are built from, before either exists.
+	popts := proxy.Options{
+		Config: cfg, Registry: node.Registry, Keys: node.Engine,
+		FunctionsEnabled: cfg.Functions.Enabled,
+		Logger:           log.With("component", "proxy"),
+	}
+	wire := newWire(cfg, log, node, o, &apiDeps, &popts)
+	defer wire.stop()
+	if err := wire.run(ctx); err != nil {
+		return err
+	}
 	apiH, err := api.NewServer(apiDeps)
 	if err != nil {
 		return err
@@ -183,11 +195,8 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	} else if m+t > 0 {
 		log.Warn("removed the stand-in seats and tokens that `functions dev` left behind", "memberships", m, "tokens", t)
 	}
-	edge, err := proxy.New(proxy.Options{
-		Config: cfg, Registry: node.Registry, Keys: node.Engine, APIHandler: apiH,
-		FunctionsEnabled: cfg.Functions.Enabled,
-		Logger:           log.With("component", "proxy"),
-	})
+	popts.APIHandler = apiH
+	edge, err := proxy.New(popts)
 	if err != nil {
 		return err
 	}
@@ -202,6 +211,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
+	wire.start(g, gctx)
 	g.Go(func() error {
 		log.Info("management API listening", "admin", adminLn.Addr().String())
 		if err := admin.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {

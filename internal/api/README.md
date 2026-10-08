@@ -38,6 +38,8 @@ Tests validate every stub and handler response against the spec's schema, becaus
 
 Upgrades and backups are described below.
 
+**Route groups by file.** Each group of routes is registered by one `routesX(add)` method that `implemented()` in `server.go` calls, so that a group is added without editing the others. The read-replica and failover groups have their file and method in place (`replicas.go`, `databases.go`, `load_balancers.go`, `infra_monitoring.go`, `failover.go`); a group with no routes yet leaves its operations to the spec-derived stubs.
+
 **Function uploads.** Where `Deps.Functions` is set the runtime serves bundles only, so multipart sources (`supabase functions deploy --use-api`, Studio's editor) are bundled in a sandbox by `api.SourceBundler` and stored with the bundle (`.supavise-bundle.ezbr`, `.supavise-bundle.json`); they stay readable through `.../body`. Answers: 400 with the bundler's output for broken code, 501 where the node cannot bundle, 429 when the queue is full. A bundle upload (`Content-Type: application/vnd.denoland.eszip`, `EZBR` + Brotli; what plain `supabase functions deploy` sends) has its `ezbr_sha256` checked. `Deps.Functions` (`api.FunctionsHook`) is told after each change so `internal/functions` can put the files where the Edge Runtime reads them.
 
 ## Pooler config

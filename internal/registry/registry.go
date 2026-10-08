@@ -1,7 +1,8 @@
 // Package registry is supavise's control-plane state: organizations, projects, sealed
-// project secrets, access tokens, host routes, backups and events. It lives in the
-// "supavise" schema of the "supavise" database in the system cluster (Postgres), with an
-// in-memory implementation for tests.
+// project secrets, access tokens, host routes, backups and events, and the cluster of servers
+// the projects live on (nodes, replicas, join tokens, moves). It lives in the "supavise" schema
+// of the "supavise" database in the system cluster (Postgres), with an in-memory
+// implementation for tests.
 package registry
 
 import (
@@ -69,6 +70,10 @@ type Project struct {
 	UpdatedAt time.Time
 	// Branch is set when the project is a branch of another project (branching).
 	Branch *BranchInfo
+	// NodeID is the project's home: the node whose primary, GoTrue and PostgREST serve it.
+	// CreateProject puts a new project on the cluster leader when it is empty; SetProjectNode
+	// moves it.
+	NodeID string
 }
 
 // BranchState is the (deprecated but still decoded) status of the Management API's branch
@@ -173,8 +178,11 @@ type Event struct {
 	CreatedAt time.Time
 }
 
-// Change is one row change, delivered by Subscribe. Table is "projects", "routes" or
-// "project_secrets"; Key is the ref (or host for routes); Op is insert|update|delete.
+// Change is one row change, delivered by Subscribe. Table is "projects", "routes",
+// "project_secrets", "nodes" or "replicas"; Key is the ref (the host for routes, the node id for
+// nodes, the identifier for replicas); Op is insert|update|delete. A registry opened with
+// OpenReadOnly cannot tell which row changed: it delivers Op "reload" with an empty Key for
+// each table when its change_seq moved, which means "read the whole table again".
 type Change struct {
 	Table string `json:"table"`
 	Op    string `json:"op"`
@@ -244,9 +252,12 @@ type Registry interface {
 	// ListEvents returns ref's newest events first; ref "" lists all.
 	ListEvents(ctx context.Context, ref string, limit int) ([]Event, error)
 
-	// Subscribe delivers changes to projects, routes and project_secrets until ctx
-	// ends. Delivery is best effort: consumers must also tolerate a full reload.
+	// Subscribe delivers changes to projects, routes, project_secrets, nodes and replicas
+	// until ctx ends. Delivery is best effort: consumers must also tolerate a full reload.
 	Subscribe(ctx context.Context) (<-chan Change, error)
+
+	// ClusterStore is the cluster membership and placement (cluster.go).
+	ClusterStore
 
 	Close()
 }
