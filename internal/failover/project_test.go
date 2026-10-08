@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -10,7 +11,9 @@ import (
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/failover/fenced"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
+	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -573,4 +576,45 @@ func TestTheOldHomeIsAskedAgainWhileItsRegistryTrails(t *testing.T) {
 	if err != nil || w.count("aside n1/"+refA) != 1 || !strings.HasPrefix(w.stepDetail(mv, "reseed-old"), "warning:") {
 		t.Fatalf("move %+v, error %v, %d tries", mv, err, w.count("aside n1/"+refA))
 	}
+}
+
+// What a node answers to a promotion says what happened to it. The placement layer gives the
+// sentinels back through errors.Is: a node that did not reach the position promoted nothing, so the
+// old primary starts again; a node at a higher epoch refused a leader that has been replaced, and
+// repeating the call changes nothing.
+func TestAPromotionThatTheNodeAnswersWithASentinelIsClassified(t *testing.T) {
+	t.Run("the replica did not reach the position: nothing was promoted", func(t *testing.T) {
+		w := newWorld(t)
+		w.fail("promote n2/", fmt.Errorf("%w: waiting for %s: not reached within 2m0s", lifecycle.ErrReplayBehind, w.lsn[refA]), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		w.assertOrder("stop n1/"+refA, "promote n2/", "start n1/"+refA)
+		if p := projectOf(t, w, refA); p.NodeID != "n1" || p.Status != registry.StatusActiveHealthy {
+			t.Fatalf("project: %+v", p)
+		}
+	})
+	t.Run("an unplanned failover has no position to wait for", func(t *testing.T) {
+		w := newWorld(t)
+		w.prim["n1/"+refA].healthy = false
+		w.fail("promote n2/", fmt.Errorf("%w: late", lifecycle.ErrReplayBehind), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveFailed {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		w.assertNever("start n1/")
+	})
+	t.Run("the node is at a higher epoch", func(t *testing.T) {
+		w := newWorld(t)
+		w.fail("promote n2/", fmt.Errorf("%w: the request is under epoch 1 and this node is at 3", placement.ErrStaleEpoch), -1)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if !errors.Is(err, ErrEpochLost) || mv.State != registry.MoveFailed || !strings.Contains(err.Error(), "epoch 1") {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if n := w.count("promote n2/"); n != 1 {
+			t.Fatalf("a refusal for the epoch was repeated %d times", n)
+		}
+		w.assertNever("start n1/") // the node may be a primary under the other leader: the old one stays down
+	})
 }

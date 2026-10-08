@@ -220,6 +220,36 @@ func TestANodeFenceRecordsThePeersAndStopsTheSharedServices(t *testing.T) {
 	w2.assertNever("services.stop")
 }
 
+// A daemon that has the membership layer's own local fence (cluster.FenceLocal) hands the stops to it:
+// it knows every unit of the node, replicas and shared services included.
+func TestANodeFenceUsesTheNodesOwnLocalFenceWhenThereIsOne(t *testing.T) {
+	w := newWorld(t)
+	var calls int
+	o := w.orch(func(d *Deps) {
+		d.FenceNode = func(context.Context) ([]string, error) {
+			calls++
+			w.log("fence-node")
+			return []string{config.SystemRef, refA}, nil
+		}
+	})
+	var resp peerapi.FenceResponse
+	rec := serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, "n2", FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 2, Leader: "n2"}}, &resp)
+	if rec.Code != http.StatusOK || !resp.Fenced || len(resp.Stopped) != 2 || calls != 1 {
+		t.Fatalf("%d %s, %d calls", rec.Code, rec.Body, calls)
+	}
+	if rc, _ := fenced.Node(w.cfg.Paths()); rc == nil {
+		t.Fatal("the record is written before the stops")
+	}
+	if w.has("local.stop") || w.has("services.stop") {
+		t.Fatalf("the stops were done twice:\n%v", w.snapshot())
+	}
+	// One project's fence is the orchestrator's own: the node's local fence would stop the rest of the node.
+	serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, "n1", FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 1, Leader: "n1"}, Ref: refB}, nil)
+	if calls != 1 || !w.has("local.stop "+refB) {
+		t.Fatalf("project fence: %d calls\n%v", calls, w.snapshot())
+	}
+}
+
 func fencedPath(w *world) string { return fenced.NodePath(w.cfg.Paths()) }
 
 func TestFenceRequestsAtAnEpochTheNodeAlreadyHasDoNothing(t *testing.T) {

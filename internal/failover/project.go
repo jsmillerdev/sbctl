@@ -12,8 +12,10 @@ import (
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
+	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -400,10 +402,18 @@ func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, i
 		_, err := o.d.Instances.Do(ctx, node.ID, identifier, peerapi.ActionPromote, req)
 		return err
 	})
-	if err != nil {
-		return "", fmt.Errorf("promoting %s on %s: %w", identifier, node.Name, err)
+	switch {
+	case err == nil:
+		return "primary on " + node.Name, nil
+	case a.WaitLSN != "" && errors.Is(err, lifecycle.ErrReplayBehind):
+		// The node waits for the position before it writes anything (promote.ok comes after the
+		// wait), so this answer says the same as the wait above: nothing was promoted.
+		return "", &abortError{cause: fmt.Errorf("%w: %s on %s: %v", ErrReplayBehind, identifier, node.Name, err)}
+	case errors.Is(err, placement.ErrStaleEpoch):
+		// The node is at a higher epoch than this move: a leader that was not replaced would not be.
+		return "", fmt.Errorf("%w: promoting %s on %s was refused: %v", ErrEpochLost, identifier, node.Name, err)
 	}
-	return "primary on " + node.Name, nil
+	return "", fmt.Errorf("promoting %s on %s: %w", identifier, node.Name, err)
 }
 
 // whileTheNodeLearnsWhoLeads runs a call to another node and repeats it while the node refuses it

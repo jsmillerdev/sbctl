@@ -44,6 +44,11 @@ type Deps struct {
 	// LocalPrimaries and LocalServices are this node's side of the peer endpoints of peer.go.
 	LocalPrimaries LocalPrimaries
 	LocalServices  LocalServices
+	// FenceNode stops everything on this node that could write as a primary or serve as the leader and
+	// removes the launchers of the clusters, and returns the refs it stopped (cluster.FenceLocal over
+	// the node's supervisor). When it is set, a fence of the whole node uses it in place of stopping
+	// the primaries and the shared services one by one; a fence of one project never does.
+	FenceNode func(ctx context.Context) (stopped []string, err error)
 
 	// Extra adds checks to the preflight of a server move.
 	Extra ExtraChecks

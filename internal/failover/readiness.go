@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -147,6 +148,9 @@ func (o *Orchestrator) markerStatus(ctx context.Context) string {
 		return "none: no leader marker store in this build or backup mode"
 	}
 	if _, err := o.d.Marker.ReadLeaderMarker(ctx); err != nil {
+		if strings.Contains(err.Error(), "malformed") {
+			return "marker unreadable (an operator who has checked which node leads deletes _node/leader.json): " + err.Error()
+		}
 		return "store not reachable: " + err.Error()
 	}
 	return "store reachable"

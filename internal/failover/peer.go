@@ -382,6 +382,9 @@ func (o *Orchestrator) fencePrimaries(ctx context.Context, refs []string, record
 	if err := record(); err != nil {
 		return nil, fmt.Errorf("recording the fence: %w", err)
 	}
+	if services && o.d.FenceNode != nil {
+		return o.d.FenceNode(ctx)
+	}
 	var stopped []string
 	var first error
 	if services && o.d.LocalServices != nil {
