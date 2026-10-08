@@ -113,8 +113,15 @@ multi_incus_install() {
       arm64) pkgs+=(qemu-system-arm qemu-efi-aarch64) ;;
     esac
   fi
-  # The runner's own apt timers may hold the dpkg lock for a while after it boots.
-  apt-get -o DPkg::Lock::Timeout=300 update -qq
+  # The runner's own apt timers may hold the apt locks for a while after it boots. The dpkg lock timeout covers install;
+  # `update` takes the lock of the package lists, which it does not cover (lib.sh's wait_apt_idle), so it is repeated.
+  local try
+  wait_apt_idle 360
+  for try in 1 2 3 4 5 6; do
+    apt-get -o DPkg::Lock::Timeout=300 update -qq && break
+    [[ $try -lt 6 ]] || fail "apt-get update failed six times"
+    sleep 10
+  done
   apt-get -o DPkg::Lock::Timeout=300 install -y -qq "${pkgs[@]}"
   # Unprivileged containers need an id range for root.
   grep -q '^root:' /etc/subuid || echo 'root:1000000:1000000000' >>/etc/subuid
@@ -466,6 +473,13 @@ multi_collect_logs() {
     incus info "$n" >"$LOG_DIR/$n/incus-info.txt" 2>&1 || true
     incus config show "$n" --expanded >"$LOG_DIR/$n/incus-config.yaml" 2>&1 || true
     incus console "$n" --show-log >"$LOG_DIR/$n/console.log" 2>&1 || true
+    # A node that a check stopped (multi_kill_node) and did not start again has no journal to read, in the run where the
+    # old leader's journal is the one that explains the failure: it is started, after its console log is taken.
+    if [[ $(incus info "$n" 2>/dev/null | awk '/^Status:/ {print toupper($2); exit}') == STOPPED ]]; then
+      echo "$n was stopped when the run ended; it was started to collect its logs. incus-info.txt and console.log are from before" \
+        >"$LOG_DIR/$n/started-for-collection.txt"
+      incus start "$n" >/dev/null 2>&1 && multi_wait "$n" >/dev/null 2>&1 || true
+    fi
     timeout 60 incus exec "$n" -- journalctl --no-pager -o short-iso >"$LOG_DIR/$n/journal.log" 2>&1 || true
     # The daemon and every project's PostgreSQL on their own, for reading: the journal holds everything.
     timeout 60 incus exec "$n" -- journalctl --no-pager -o short-iso -u supavise.service >"$LOG_DIR/$n/daemon.journal" 2>&1 || true

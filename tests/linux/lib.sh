@@ -37,16 +37,25 @@ preflight() {
   } | tee "$LOG_DIR/host.txt" >&2
 }
 
-# wait_apt_idle [SECONDS]: no apt-daily service and no apt, dpkg or unattended-upgrade process is running. A
-# fresh runner starts the distribution's apt timers at boot and again when a step turns them on, and a package
-# command that meets their lock fails; the commands that follow use the dpkg lock timeout as well.
+# apt_busy: an apt-daily service is starting or running (they are oneshot units: "activating" is how systemd reports
+# one that runs), or an apt, dpkg or unattended-upgrade process is.
+apt_busy() {
+  local u s
+  for u in apt-daily.service apt-daily-upgrade.service; do
+    s=$(systemctl show -p ActiveState --value "$u" 2>/dev/null || true)
+    case $s in active | activating | deactivating | reloading) return 0 ;; esac
+  done
+  pgrep -x 'apt|apt-get|dpkg' >/dev/null || pgrep -f '/usr/bin/unattended-upgrade|apt.systemd.daily' >/dev/null
+}
+
+# wait_apt_idle [SECONDS]: waits until apt_busy says no. A fresh runner starts the distribution's apt timers at boot
+# and again when a step turns them on, and a package command that meets their lock fails. `-o DPkg::Lock::Timeout=N`
+# makes apt-get install wait for the dpkg lock, but `apt-get update` takes the lock of the package lists, which that
+# option does not cover: call this before an update, and repeat the update if it must not fail.
 wait_apt_idle() {
   local n=${1:-360} i
   for ((i = 0; i < n; i += 5)); do
-    if ! systemctl is-active --quiet apt-daily.service apt-daily-upgrade.service 2>/dev/null \
-      && ! pgrep -x 'apt|apt-get|dpkg' >/dev/null && ! pgrep -f '/usr/bin/unattended-upgrade' >/dev/null; then
-      return 0
-    fi
+    apt_busy || return 0
     sleep 5
   done
   log "apt is still busy after ${n}s: $(pgrep -a -x 'apt|apt-get|dpkg' | head -n 3 | paste -sd';' -)"
