@@ -355,8 +355,10 @@ func fileExists(path string) bool {
 }
 
 // recoverySettingNames are the settings of a cluster in recovery that a primary must not carry.
+// hot_standby is the one the backup service's seeder writes and a primary ignores; the replica's units
+// pass it on the command line.
 var recoverySettingNames = map[string]bool{
-	"primary_conninfo": true, "primary_slot_name": true, "restore_command": true,
+	"primary_conninfo": true, "primary_slot_name": true, "restore_command": true, "hot_standby": true,
 	"recovery_target_timeline": true, "recovery_target": true, "recovery_target_name": true,
 	"recovery_target_time": true, "recovery_target_xid": true, "recovery_target_lsn": true,
 	"recovery_target_inclusive": true, "recovery_target_action": true, "archive_cleanup_command": true,
@@ -390,8 +392,21 @@ func recoverySettingOf(line string) (string, bool) {
 	return "", false
 }
 
-// rewriteAutoConf drops every assignment of a recovery setting from postgresql.auto.conf, keeps the
-// rest as it is and appends add.
+// standbyBlockHeaders open the block of settings the backup service's seeder appends to a standby's
+// postgresql.auto.conf (backup.SeedReplica); the settings go with the block, so its header does too.
+var standbyBlockHeaders = []string{"# --- supavise standby ", "# --- supavise archive-only standby "}
+
+func isStandbyBlockHeader(line string) bool {
+	for _, h := range standbyBlockHeaders {
+		if strings.HasPrefix(strings.TrimSpace(line), h) {
+			return true
+		}
+	}
+	return false
+}
+
+// rewriteAutoConf drops every assignment of a recovery setting, and the header of the seeder's block
+// of them, from postgresql.auto.conf, keeps the rest as it is and appends add.
 func rewriteAutoConf(dataDir string, add []string) error {
 	path := filepath.Join(dataDir, "postgresql.auto.conf")
 	b, err := os.ReadFile(path)
@@ -403,7 +418,7 @@ func rewriteAutoConf(dataDir string, add []string) error {
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	for sc.Scan() {
 		line := sc.Text()
-		if _, ok := recoverySettingOf(line); ok {
+		if _, ok := recoverySettingOf(line); ok || isStandbyBlockHeader(line) {
 			continue
 		}
 		out.WriteString(line + "\n")

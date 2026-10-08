@@ -89,12 +89,16 @@ func (p portSup) Start(ctx context.Context, u string) error {
 // forwarderFixture is a standby whose project has a forwarder on its canonical port.
 func forwarderFixture(t *testing.T) (*replicaFixture, net.Listener) {
 	t.Helper()
-	replicaPoll = time.Millisecond
+	fastReplicaPoll(t)
 	f := newReplicaFixture(t)
 	f.seeded(t, true)
 	f.sql.status[f.rp.Port] = ClusterStatus{InRecovery: true, ReceiverStatus: "streaming"}
 	fwd, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", f.cp.Port))
 	if err != nil {
+		// A machine that is busy skips the test; CI must not, or the hold would go untested unseen.
+		if os.Getenv("CI") != "" {
+			t.Fatalf("port %d is in use on this machine: %v", f.cp.Port, err)
+		}
 		t.Skipf("port %d is in use on this machine: %v", f.cp.Port, err)
 	}
 	t.Cleanup(func() { fwd.Close() })
