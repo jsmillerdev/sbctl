@@ -39,7 +39,8 @@ type LiveOptions struct {
 	OnFenced func(FencedRecord)
 	// Marker, when set, is the backup store's leader marker, which Run reads every MarkerEvery while
 	// this node leads a cluster of more than one node: a leader that no peer can reach still learns from
-	// it that another node was promoted. Zero MarkerEvery is 30 s.
+	// it that another node was promoted. Zero MarkerEvery is 30 s. A marker left by a move that failed
+	// after writing it fences a healthy leader here exactly as it does at boot.
 	Marker      backup.EpochMarkerStore
 	MarkerEvery time.Duration
 	Log         *slog.Logger
