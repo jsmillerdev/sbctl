@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/nodeupgrade"
 	"github.com/supavise/supavise/internal/selfupdate"
 	"github.com/supavise/supavise/internal/update"
 )
@@ -37,10 +39,11 @@ func init() {
 --version), verifies the ed25519 signature of its SHA256SUMS against the public key built
 into this binary (the current one, or the next one while a key rotation is under way), checks
 the signed release manifest and the binary against their checksums, replaces /usr/local/bin/supavise
-atomically (the previous binary stays beside it as supavise.prev), refreshes the systemd units
-with the new binary and restarts supavise.service. Project units are not restarted: they
-belong to systemd and keep running. If the restarted daemon does not answer on its admin
-listener within --wait (default 5 minutes; the installer's readiness check, because systemd
+atomically (the previous binary stays beside it as supavise.prev), brings the host to what the
+new binary expects (` + "`supavise system converge`" + `: its systemd units and the rest of its host layer;
+` + "`system install-units`" + ` for a release from before the host layer) and restarts
+supavise.service. Project units are not restarted: they belong to systemd and keep running. If the
+restarted daemon does not answer on its admin listener within --wait (default 5 minutes; the installer's readiness check, because systemd
 calls a daemon active the moment it forks), the previous binary is put back, the units are
 rendered again with it and the service is restarted.
 
@@ -109,12 +112,11 @@ not through this command. A release states the oldest version it upgrades from
 				return nil
 			}
 			if !noUnits {
-				// The new binary carries the new units; an unchanged set is a no-op.
-				c := exec.CommandContext(cmd.Context(), exe, "system", "install-units")
-				c.Stdout, c.Stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
-				if err := c.Run(); err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: supavise system install-units failed: %v\n", err)
-				}
+				// The new binary carries the units and the host layer of its release; a node that is
+				// already converged changes nothing. A failure is a warning here: the daemon raises
+				// host_not_converged while the host is behind, and `sudo supavise system converge`
+				// repeats the step. (`supavise upgrade` treats it as a failure and rolls back.)
+				applyHostLayer(cmd.Context(), exe, cmd.OutOrStdout(), cmd.ErrOrStderr())
 			}
 			if noRestart || !serviceInstalled(cmd.Context()) {
 				fmt.Fprintln(cmd.OutOrStdout(), "supavise.service was not restarted; run `systemctl restart supavise.service` to use the new binary")
@@ -145,6 +147,27 @@ not through this command. A release states the oldest version it upgrades from
 	_ = cmd.Flags().MarkHidden("api-base")
 	_ = cmd.Flags().MarkHidden("public-key-file")
 	rootCmd.AddCommand(cmd)
+}
+
+// hostLayerCommand is the `system` subcommand of the binary at exe that brings the host to what its
+// release expects: converge for a release that has a host layer, and install-units, which renders
+// the units as it always did, for one that does not (--force can install an older release, which has
+// no converge and would only print the help of `system`).
+func hostLayerCommand(ctx context.Context, exe string) string {
+	if info, err := nodeupgrade.ProbeInfo(ctx, exe); err == nil && info.ConvergeRevision > 0 {
+		return "converge"
+	}
+	return "install-units"
+}
+
+// applyHostLayer runs the host layer of the binary at exe and reports a failure as a warning.
+func applyHostLayer(ctx context.Context, exe string, stdout, stderr io.Writer) {
+	sub := hostLayerCommand(ctx, exe)
+	c := exec.CommandContext(ctx, exe, "system", sub)
+	c.Stdout, c.Stderr = stdout, stderr
+	if err := c.Run(); err != nil {
+		fmt.Fprintf(stderr, "warning: supavise system %s failed: %v\n", sub, err)
+	}
 }
 
 func serviceInstalled(ctx context.Context) bool {

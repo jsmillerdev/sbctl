@@ -10,8 +10,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/supavise/supavise/deploy/systemd"
-	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/diskquota"
 	"github.com/supavise/supavise/internal/lifecycle"
@@ -121,58 +119,55 @@ configuration. Run it as the user that owns the state directory (supavise).`,
 		},
 	}
 
-	install := &cobra.Command{
-		Use:   "install-units",
-		Short: "Install the systemd units and the polkit rule, and enable the system units (needs root)",
-		Args:  cobra.NoArgs,
+	var (
+		convergeCheck, convergeJSON bool
+	)
+	converge := &cobra.Command{
+		Use:   "converge",
+		Short: "Bring this server's units, directories, mounts, firewall and packages to what this release expects (needs root)",
+		Long: `Runs the host layer of a release: a list of idempotent steps that bring the server to what this
+binary expects. A second run changes nothing. The steps, in order:
+
+  units        the systemd units and the polkit rule (the backup and upgrade timers from config.toml)
+  directories  /etc/supavise/cluster and /etc/supavise/config.d, mode 0750, owned by supavise
+  mounts       RequiresMountsFor drop-ins for every supavise unit whose state directory or config
+               directory is a mount, so that a unit never starts against an empty directory
+               when its volume is missing
+  ufw          the mesh port (7443/tcp) when ufw is active
+  packages     the packages the release declares, if any
+  config.d     on a node that is in a cluster, the cluster settings from the leader
+
+Each step prints what it changed. When every step succeeded, converge writes the revision it
+completed to <state_dir>/converged; the daemon raises host_not_converged while that file is behind
+the binary, and ` + "`supavise upgrade`" + ` runs converge after it swaps the binary and fails, and rolls back,
+when it does not succeed.
+
+--check changes nothing and needs no root: it prints, for every step, whether it has something to
+do. --json prints a list of {id, title, pending, needs_root, detail} for --check and the same with
+what changed after a run. Exit status 0 means the command ran; --check reports pending steps in its
+output and does not signal them in the status.
+
+` + "`install-units`" + ` is an alias: an older ` + "`supavise upgrade`" + ` runs it on the new binary right after the swap,
+which is how a node reaches this command from a release that does not know it.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := loadConfig()
-			if err != nil {
-				return err
-			}
-			// The embedded timer carries the default schedule; the node's own comes from
-			// config and is written in the same pass, so a second run changes nothing.
-			timer, err := backup.RenderBackupTimerChecked(cfg.Backup.BaseBackupOnCalendar)
-			if err != nil {
-				return fmt.Errorf("config backup.base_backup_on_calendar: %w", err)
-			}
-			upgradeTimer, err := update.RenderTimer(cfg.Update)
-			if err != nil {
-				return fmt.Errorf("config update: %w", err)
-			}
-			changed, err := systemd.InstallWith(sysUnitDir, sysPolkitDir, map[string][]byte{
-				backup.BackupTimerUnit: []byte(timer),
-				update.TimerUnit:       []byte(upgradeTimer),
-			})
-			if err != nil {
-				return err
-			}
-			for _, f := range changed {
-				fmt.Fprintln(cmd.OutOrStdout(), "installed", f)
-			}
-			if len(changed) == 0 {
-				fmt.Fprintln(cmd.OutOrStdout(), "units are up to date")
-			}
-			apply, err := lifecycle.OpenOptions{Log: newLogger(cfg)}.UnitInstaller(cfg)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "run `systemctl daemon-reload` and enable the system units yourself:", err)
-				return nil
-			}
-			if err := apply(cmd.Context(), len(changed) > 0); err != nil {
-				return err
-			}
-			if sysUnitDir != defaultUnitDir {
-				return nil // a test directory: systemd loads nothing from it
-			}
-			timerChanged := false
-			for _, f := range changed {
-				timerChanged = timerChanged || strings.HasSuffix(f, "/"+update.TimerUnit)
-			}
-			return applyUpgradeTimer(cmd.Context(), cfg, timerChanged, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			return runConverge(cmd, convergeCheck, convergeJSON)
 		},
 	}
-	install.Flags().StringVar(&sysUnitDir, "unit-dir", defaultUnitDir, "where to write unit files")
-	install.Flags().StringVar(&sysPolkitDir, "polkit-dir", "/etc/polkit-1/rules.d", "where to write the polkit rule (empty skips it)")
+	install := &cobra.Command{
+		Use:   "install-units",
+		Short: "Alias of converge: install the systemd units and the polkit rule, and everything else the release expects (needs root)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runConverge(cmd, convergeCheck, convergeJSON)
+		},
+	}
+	for _, c := range []*cobra.Command{converge, install} {
+		c.Flags().BoolVar(&convergeCheck, "check", false, "change nothing: print, for every step, whether it has something to do (needs no root)")
+		c.Flags().BoolVar(&convergeJSON, "json", false, "print the steps as JSON")
+		c.Flags().StringVar(&sysUnitDir, "unit-dir", defaultUnitDir, "where to write unit files; any other directory is a test: only the units are installed there, nothing is reloaded and the host is not marked converged")
+		c.Flags().StringVar(&sysPolkitDir, "polkit-dir", "/etc/polkit-1/rules.d", "where to write the polkit rule (empty skips it)")
+	}
 
 	quota := &cobra.Command{
 		Use:    "set-disk-quota <ref>",
@@ -190,7 +185,7 @@ configuration. Run it as the user that owns the state directory (supavise).`,
 			return diskquota.New(cfg, nil).ApplyStored(cmd.Context(), args[0])
 		},
 	}
-	systemCmd.AddCommand(initCmd, status, start, stop, install, quota)
+	systemCmd.AddCommand(initCmd, status, start, stop, converge, install, quota)
 	rootCmd.AddCommand(systemCmd)
 }
 

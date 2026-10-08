@@ -69,6 +69,13 @@ type installOptions struct {
 	ClaimTokenFile string
 	Firewall       string
 	SkipOSCheck    bool
+
+	// AWSFirstBoot prepares the EC2 data volume and the mounts before the install proper
+	// (DataDevice names the volume when the instance has more than one). JoinTokenFile makes the
+	// server join the cluster the token names instead of creating a system project of its own.
+	AWSFirstBoot  bool
+	DataDevice    string
+	JoinTokenFile string
 }
 
 // applyInstall puts the options whose flags were given (changed) into cfg.

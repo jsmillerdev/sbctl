@@ -26,6 +26,8 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/fleet"
+	"github.com/supavise/supavise/internal/hostsetup"
+	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/nodeupgrade"
 	"github.com/supavise/supavise/internal/notice"
@@ -50,6 +52,9 @@ type nodeHost struct {
 	cfgPath string
 	root    bool
 	wait    time.Duration
+	// restart restarts supavise.service and waits until it answers; nil is restartAndWait. A test
+	// sets it, so that it never touches the machine's units.
+	restart func(ctx context.Context) error
 
 	rel      nodeupgrade.Releases
 	selfOpts selfupdate.Options
@@ -242,6 +247,10 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 		n.Projects[i].HeldRestart = lifecycle.HeldRestart(h.cfg, n.Projects[i].Ref)
 	}
 	h.nodePins(n)
+	if m, err := hostsetup.ReadMarker(h.cfg.StateDir); err == nil {
+		n.ConvergeRevision, n.ConvergeKnown = m.Revision, true
+	}
+	n.Infra = h.infraReport(ctx)
 
 	n.Verdict, n.Summary, n.Escrow = h.statusReport(ctx)
 	n.DiskPath = h.cfg.StateDir
@@ -436,6 +445,10 @@ func (h *nodeHost) Stage(ctx context.Context, c *nodeupgrade.Candidate) (*nodeup
 	// versions.yaml; the binary reports the ones built into it. They are the same file, so a
 	// difference means the binary is not the one the manifest describes.
 	if err := nodeupgrade.CheckManifestPins(info, r.ver.Manifest.Artifacts, r.ver.Manifest.Studio); err != nil {
+		st.Discard()
+		return nil, err
+	}
+	if err := nodeupgrade.CheckManifestRevisions(info, r.ver.Manifest); err != nil {
 		st.Discard()
 		return nil, err
 	}
@@ -647,23 +660,66 @@ func (h *nodeHost) Install(ctx context.Context, s *nodeupgrade.Staged, prev, nex
 	if _, err := sd.st.Install(); err != nil {
 		return false, err
 	}
-	return true, h.activate(ctx)
+	// A release that has a host layer converges the host as part of installing it.
+	return true, h.activate(ctx, s.Info.ConvergeRevision > 0)
 }
 
 // activate renders the units with the binary at BinPath, restarts the daemon and waits until it
-// answers.
-func (h *nodeHost) activate(ctx context.Context) error {
+// answers. With converge the binary is the one of a release that has a host layer, and its
+// `system converge` has to succeed: the daemon is not restarted onto a host that was not brought to
+// what the release expects, and the failure is the upgrade's. Without it (a rollback to an older
+// release, whose install-units renders the units as it always did) a failure is a warning.
+func (h *nodeHost) activate(ctx context.Context, converge bool) error {
 	// A service counts as moved when it restarted after this point: the daemon restarts them
 	// while it starts, possibly before it answers on its admin listener.
 	h.swappedAt = time.Now()
 	h.tagsAtSwap = h.renderedTags()
-	c := exec.CommandContext(ctx, h.binPath, "system", "install-units")
+	sub := "install-units"
+	if converge {
+		sub = "converge"
+	}
+	c := exec.CommandContext(ctx, h.binPath, "system", sub)
 	c.Stdout, c.Stderr = h.out, h.errw
 	if err := c.Run(); err != nil {
-		fmt.Fprintf(h.errw, "warning: supavise system install-units failed: %v\n", err)
+		if converge {
+			return fmt.Errorf("supavise system converge: %w", err)
+		}
+		fmt.Fprintf(h.errw, "warning: supavise system %s failed: %v\n", sub, err)
+	}
+	if h.restart != nil {
+		return h.restart(ctx)
 	}
 	_ = exec.CommandContext(ctx, "systemctl", "reset-failed", "supavise.service").Run()
 	return restartAndWait(ctx, h.cfg, h.wait)
+}
+
+// Converge implements nodeupgrade.HostConverger: the host layer of the installed binary, for an
+// upgrade that does not swap the binary.
+func (h *nodeHost) Converge(ctx context.Context) error {
+	c := exec.CommandContext(ctx, h.binPath, "system", "converge")
+	c.Stdout, c.Stderr = h.out, h.errw
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("supavise system converge: %w", err)
+	}
+	return nil
+}
+
+// infraReport is what the node knows of its AWS stack. A host that is not on EC2, or that cannot
+// answer in time (infraGapTimeout), has none to report: a question that cannot be asked is not a
+// reason to hold an upgrade or a rollback.
+func (h *nodeHost) infraReport(ctx context.Context) *infra.Report {
+	if !ec2Likely() {
+		return nil
+	}
+	r, err := infraGap(ctx)
+	if err != nil {
+		h.log.Debug("could not read the AWS stack's revision", "error", err)
+		return nil
+	}
+	if r.Platform == "" {
+		return nil
+	}
+	return &r
 }
 
 // renderedTags are the releases the units of the node's services are set to run, by service.
@@ -698,7 +754,7 @@ func (h *nodeHost) Restore(ctx context.Context, from string, rec nodeupgrade.Rec
 	if err := replaceFile(src, h.binPath); err != nil {
 		return fmt.Errorf("installing the kept %s: %w", rec.Version, err)
 	}
-	if err := h.activate(ctx); err != nil {
+	if err := h.activate(ctx, false); err != nil {
 		return err
 	}
 	if err := h.rel.Touch(rec.Version, time.Now()); err != nil {

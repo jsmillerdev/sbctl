@@ -101,6 +101,12 @@ type fakeHost struct {
 	marks         []string
 	restored      bool   // after Restore the node reports the verdict it had before
 	halted        string // the project the rollout stopped at (HaltReporter)
+
+	convergeErr error        // Converge (a host layer without a swap) fails
+	stackErr    error        // UpdateStack fails
+	stackCmd    string       // UpdateStack could not run and returns this command
+	notices     []Event      // what Notify received
+	stackOpts   StackOptions // what UpdateStack was asked
 }
 
 func newFakeHost() *fakeHost {
@@ -271,3 +277,16 @@ var errBoom = errors.New("boom")
 
 // HaltedProject implements HaltReporter.
 func (f *fakeHost) HaltedProject() string { return f.halted }
+
+// Converge implements HostConverger.
+func (f *fakeHost) Converge(context.Context) error {
+	f.rec("converge")
+	return f.convergeErr
+}
+
+// UpdateStack implements StackUpdater.
+func (f *fakeHost) UpdateStack(_ context.Context, c *Candidate, o StackOptions) (StackOutcome, error) {
+	f.rec("stack %s", c.Tag)
+	f.stackOpts = o
+	return StackOutcome{Command: f.stackCmd}, f.stackErr
+}

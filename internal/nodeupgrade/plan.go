@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/selfupdate"
 )
@@ -51,9 +52,18 @@ type Plan struct {
 	Canary, Batch   int
 	// NewMigrations are the registry migrations the release adds.
 	NewMigrations []string
-	Restarts      []string
-	Impact        []string
-	Notes         []string
+	// HostPending is true when the release's host layer is ahead of the node's: `supavise system
+	// converge` of the new binary has something to do (HostFrom to HostTo, HostChanges are its
+	// steps). The node's own run restarts no project for it.
+	HostPending      bool
+	HostFrom, HostTo int
+	HostChanges      []string
+	// Stack is the AWS stack against the release's needs; nil when the node is not on a stack or
+	// the release needs none.
+	Stack    *StackGap
+	Restarts []string
+	Impact   []string
+	Notes    []string
 	// Refusal is set when the upgrade must not run; nothing has changed.
 	Refusal string
 
@@ -65,10 +75,33 @@ type SkippedProject struct {
 	Ref, Why string
 }
 
+// StackGap is the AWS stack against what the release needs.
+type StackGap struct {
+	// Report is what the node's own binary says about the stack (internal/infra); its Need is the
+	// installed release's, which can be lower than Need below.
+	Report infra.Report
+	// Need is the stack revision the release needs.
+	Need int
+}
+
+// Pending reports whether the stack is behind the release.
+func (g *StackGap) Pending() bool {
+	return g != nil && g.Report.Platform != "" && g.Report.Have < g.Need
+}
+
+// StackPending reports whether the AWS stack needs an update for the release.
+func (p *Plan) StackPending() bool { return p.Stack.Pending() }
+
 // Empty reports whether the upgrade has nothing to do: same binary, services already on the
-// target, no project to move or to restart.
+// target, no project to move or to restart, a host layer and an AWS stack that are current.
 func (p *Plan) Empty() bool {
-	return !p.BinaryChange && len(p.Shared) == 0 && len(p.System) == 0 && len(p.Upgrade) == 0 && len(p.Pending) == 0
+	return !p.NodeChanges() && !p.StackPending()
+}
+
+// NodeChanges reports whether the upgrade changes the node itself: the binary, a service, a
+// project or the host layer. A plan that only has an AWS stack to update changes none of these.
+func (p *Plan) NodeChanges() bool {
+	return p.BinaryChange || len(p.Shared) > 0 || len(p.System) > 0 || len(p.Upgrade) > 0 || len(p.Pending) > 0 || p.HostPending
 }
 
 // Rollout reports whether the plan runs the project rollout: a project to move, a project whose
@@ -154,6 +187,12 @@ func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 	sort.Strings(p.Pending)
 	if len(to.RegistryMigrations) > 0 {
 		p.NewMigrations = missing(to.RegistryMigrations, n.AppliedMigrations)
+	}
+	if to.ConvergeRevision > 0 && n.ConvergeKnown && n.ConvergeRevision < to.ConvergeRevision {
+		p.HostPending, p.HostFrom, p.HostTo, p.HostChanges = true, n.ConvergeRevision, to.ConvergeRevision, to.HostChanges
+	}
+	if n.Infra != nil && n.Infra.Platform != "" && to.InfraRevision > 0 {
+		p.Stack = &StackGap{Report: *n.Infra, Need: to.InfraRevision}
 	}
 	p.describe()
 	return p
@@ -243,6 +282,16 @@ func (p *Plan) describe() {
 	if len(p.NewMigrations) > 0 {
 		p.Notes = append(p.Notes, fmt.Sprintf("the release adds %d registry migration(s) (%s). The new daemon applies them when it starts, and migrations only go forward: from then on the node cannot go back to the previous release by itself, and `supavise rollback` is refused until the system cluster is restored by hand from its pre-upgrade backup (internal/backup/README.md, \"Disaster recovery of the system cluster\")", len(p.NewMigrations), refList(p.NewMigrations)))
 	}
+	if p.HostPending {
+		when := "right after the binary is swapped, before the daemon restarts"
+		if !p.BinaryChange {
+			when = "after the backups"
+		}
+		p.Notes = append(p.Notes, fmt.Sprintf("the host layer (`supavise system converge`, revision %d -> %d) runs %s; it restarts no project, and a failure of it fails the upgrade and rolls it back", p.HostFrom, p.HostTo, when))
+	}
+	if p.StackPending() {
+		p.Notes = append(p.Notes, "the AWS stack is changed only by `sudo -E supavise upgrade --aws`, with your own AWS credentials: this node's instance role has no right to change it. Everything else in this plan can go ahead without it, and the new features that need the stack stay off until it is updated")
+	}
 	for _, s := range p.Skipped {
 		p.Notes = append(p.Notes, fmt.Sprintf("project %s is skipped: %s", s.Ref, s.Why))
 	}
@@ -253,7 +302,9 @@ func (p *Plan) describe() {
 	case len(p.NewMigrations) > 0:
 		back = "If the new daemon fails before it applies the migrations, the node goes back to the previous release by itself; after that it stays on the new binary, the projects this run moved are put back, and the node needs you."
 	}
-	p.Notes = append(p.Notes, "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "+back)
+	if p.NodeChanges() {
+		p.Notes = append(p.Notes, "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "+back)
+	}
 	if p.BinaryChange {
 		p.Notes = append(p.Notes, "The new daemon restarts any shared service whose files it renders differently, whether or not the service's release moves, so a service this list does not name can restart too; if that is Supavisor, every pooled connection drops, and if it is Realtime, every websocket drops. The files are rendered by the new binary, so this list cannot name those services before the upgrade.")
 		p.Notes = append(p.Notes, "A project whose PostgreSQL, GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order (a PostgreSQL restart drops the project's database connections and restarts its GoTrue and PostgREST with it); the files are rendered by the new binary, so this list cannot name those projects before the upgrade. That restart also applies PostgreSQL settings an Owner saved without restarting; a project with only such a setting waiting is not restarted for it.")
@@ -291,6 +342,25 @@ func (p *Plan) Render(w io.Writer) {
 		}
 		fmt.Fprintf(w, "Projects (%s): %d to upgrade, %d skipped, %d already there\n", strings.Join(targets, ", "), len(p.Upgrade), len(p.Skipped), p.Current)
 	}
+	if p.NodeChanges() {
+		if p.HostPending {
+			fmt.Fprintf(w, "Host (converge revision %d -> %d, restarts no project):\n", p.HostFrom, p.HostTo)
+			for _, c := range p.HostChanges {
+				fmt.Fprintf(w, "  - %s\n", c)
+			}
+		}
+		if len(p.NewMigrations) > 0 {
+			fmt.Fprintf(w, "Registry migrations (forward only): %s\n", strings.Join(p.NewMigrations, ", "))
+		}
+		// A new binary can render a project's files differently, and the notes below say so; the line
+		// is for a run whose only work is the host and the registry.
+		if len(p.Upgrade) == 0 && len(p.Pending) == 0 && !p.BinaryChange {
+			fmt.Fprintln(w, "Projects restarted: none expected")
+		}
+	}
+	if p.Stack != nil {
+		p.Stack.render(w)
+	}
 	if len(p.Restarts) > 0 {
 		fmt.Fprintln(w, "What restarts:")
 		for _, r := range p.Restarts {
@@ -306,6 +376,32 @@ func (p *Plan) Render(w io.Writer) {
 	for _, r := range p.Notes {
 		fmt.Fprintf(w, "note: %s\n", r)
 	}
+}
+
+// render writes the infrastructure block of the plan: the gap between the stack and the release,
+// and the command that closes it. A stack that is current writes nothing.
+func (g *StackGap) render(w io.Writer) {
+	if !g.Pending() {
+		return
+	}
+	r := g.Report
+	if r.Behind() && r.Need == g.Need {
+		r.Render(w) // the installed release needs what this one does: its own words
+		return
+	}
+	stack := "AWS stack"
+	if r.Stack != "" {
+		stack += fmt.Sprintf(" %q", r.Stack)
+	}
+	fmt.Fprintf(w, "Infrastructure  %s is at revision %d; this release needs %d\n", stack, r.Have, g.Need)
+	for _, m := range r.Missing {
+		fmt.Fprintf(w, "  missing  %s (%s)\n", m.Title, m.Why)
+	}
+	fix := r.Fix
+	if fix == "" {
+		fix = "sudo -E supavise upgrade --aws"
+	}
+	fmt.Fprintf(w, "  Fix: %s\n", fix)
 }
 
 // BackupRefs lists the projects the upgrade backs up first: the system project (the registry) and

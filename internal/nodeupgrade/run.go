@@ -43,6 +43,10 @@ func refused(format string, a ...any) error {
 	return &Failure{Code: ExitRefused, Err: fmt.Errorf(format, a...)}
 }
 
+// ErrAWSUnattended is why --aws is refused together with --unattended: the stack update shows a
+// change set and waits for the operator to type apply.
+var ErrAWSUnattended = errors.New("--aws changes the AWS stack with your credentials and asks you to confirm it: it cannot run with --unattended")
+
 // Phases written to the upgrade marker (<state_dir>/system/upgrade.json), which `supavise status`
 // and the dashboard banner read. The last four end the upgrade.
 const (
@@ -157,6 +161,12 @@ type Options struct {
 	Check, Plan     bool
 	Yes, Unattended bool
 	IncludePostgres bool
+	// AWS also brings the AWS stack to the release's template first (`supavise upgrade --aws`),
+	// with StackName and StackSets as the operator's choices. It needs an operator at the
+	// terminal, so it is refused with Unattended.
+	AWS       bool
+	StackName string
+	StackSets []string
 	// Canary, Batch and Keep are the [upgrade] settings.
 	Canary, Batch, Keep int
 	// BackupParallel bounds the base backups taken at once (default 3).
@@ -214,6 +224,9 @@ type run struct {
 
 func (r *run) run(ctx context.Context) error {
 	o := &r.o
+	if o.AWS && o.Unattended {
+		return &Failure{Code: ExitRefused, Err: ErrAWSUnattended}
+	}
 	inspect := r.h.Inspect
 	if vi, ok := r.h.(VersionInspector); ok && o.Check {
 		inspect = vi.InspectVersion
@@ -263,8 +276,11 @@ func (r *run) run(ctx context.Context) error {
 	if r.plan.Refusal != "" {
 		return refused("%s", r.plan.Refusal)
 	}
-	if r.plan.Empty() {
+	if r.plan.Empty() && !o.AWS {
 		return nil
+	}
+	if !r.plan.NodeChanges() {
+		return r.stackOnly(ctx, cand)
 	}
 	gates := CheckGates(node, r.plan, GateOptions{Unattended: o.Unattended, Now: o.now()})
 	for _, w := range gates.Warnings {
@@ -285,12 +301,71 @@ func (r *run) run(ctx context.Context) error {
 			return refused("nothing was changed")
 		}
 	}
+	// The stack comes first: a refusal or a failure of it leaves the host as it was, and a later
+	// failure of the host needs no change to the stack, whose changes only add what is not used yet.
+	var stackCmd string
+	if o.AWS {
+		var err error
+		if stackCmd, err = r.stackStep(ctx, cand); err != nil {
+			return err
+		}
+	}
 	if staged == nil {
 		// Same release, services behind it: there is no binary to swap, but the artifacts and the
 		// backups are prepared the same way.
 		staged = &Staged{Info: info}
 	}
-	return r.apply(ctx, staged)
+	if err := r.apply(ctx, staged); err != nil {
+		return err
+	}
+	if stackCmd != "" {
+		o.say("The AWS stack was not updated. To update it, run:\n\n  %s", stackCmd)
+	}
+	r.notifyInfraBehind(ctx)
+	return nil
+}
+
+// notifyInfraBehind raises infra_behind when a timer's run leaves the AWS stack behind the release
+// it needs. A run with an operator at the terminal has printed the gap and the command, and a
+// read-only run (--plan) tells nobody.
+func (r *run) notifyInfraBehind(ctx context.Context) {
+	o := &r.o
+	if !o.Unattended || o.Plan || !r.plan.StackPending() {
+		return
+	}
+	g := r.plan.Stack
+	o.notify(ctx, Event{Kind: EventInfraBehind, From: r.node.Version, To: r.plan.To, Cause: fmt.Sprintf("the AWS stack is at revision %d and %s needs %d", g.Report.Have, r.plan.To, g.Need)})
+}
+
+// stackOnly ends a run whose plan changes nothing on the node and has an AWS stack to update (or,
+// with --aws, a stack to look at). Without --aws it only says so: the plan has printed the gap and
+// the command, and a timer that finds the stack behind raises infra_behind, never a failure.
+func (r *run) stackOnly(ctx context.Context, cand *Candidate) error {
+	o := &r.o
+	if !o.AWS {
+		r.notifyInfraBehind(ctx)
+		return nil
+	}
+	if o.Plan {
+		return nil
+	}
+	if !o.Yes {
+		ok, err := r.h.Confirm("Update the AWS stack now?")
+		if err != nil {
+			return refused("%v", err)
+		}
+		if !ok {
+			return refused("nothing was changed")
+		}
+	}
+	cmd, err := r.stackStep(ctx, cand)
+	if err != nil {
+		return err
+	}
+	if cmd != "" {
+		return refused("the stack was not updated: no AWS credentials of yours are in the environment")
+	}
+	return nil
 }
 
 // compareTags orders two release tags; ok is false when either is not a release version.
@@ -339,7 +414,21 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 			if !swapped {
 				return r.endRefused(ctx, fmt.Errorf("installing %s failed before the binary was replaced: %w; nothing was changed", plan.To, err))
 			}
-			return r.rollback(ctx, prev, nil, fmt.Errorf("the new daemon did not come up: %w", err))
+			return r.rollback(ctx, prev, nil, fmt.Errorf("the new release did not come up: %w", err))
+		}
+	}
+
+	lateConverge := false
+	if plan.HostPending && !plan.BinaryChange {
+		// A swap converges the host as part of installing the binary; without one, the installed
+		// binary does it here.
+		if hc, ok := h.(HostConverger); ok {
+			r.mark(PhaseSwitching, "converging the host")
+			o.say("converging the host (revision %d -> %d)", plan.HostFrom, plan.HostTo)
+			if err := hc.Converge(ctx); err != nil {
+				return r.rollback(ctx, prev, nil, fmt.Errorf("converging the host failed: %w", err))
+			}
+			lateConverge = true
 		}
 	}
 
@@ -381,6 +470,10 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	r.mark(PhaseDone, "")
 	log.Info("upgrade_succeeded", "from", node.Version, "to", plan.To, "projects", len(projectMoves))
 	o.say("Supavise %s is running; %d project(s) upgraded", plan.To, len(projectMoves))
+	if lateConverge {
+		// The daemon reads the state of the host when it starts; this one started before the converge.
+		o.say("The daemon started before the host was converged and reads that state only at its start: run `sudo systemctl restart supavise.service` when it suits you (no project restarts).")
+	}
 	o.notify(ctx, Event{Kind: EventSucceeded, From: node.Version, To: plan.To, Projects: len(projectMoves)})
 	return nil
 }

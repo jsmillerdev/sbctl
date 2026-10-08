@@ -2,6 +2,10 @@ package selfupdate
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,5 +106,75 @@ func TestCompare(t *testing.T) {
 	}
 	if _, ok := Compare("dev", "v1.0.0"); ok {
 		t.Fatal("dev was placed")
+	}
+}
+
+// The AWS script and template are taken from the signed list, and a manifest that disagrees with
+// the list about the template is refused.
+func TestAWSAssets(t *testing.T) {
+	ctx := context.Background()
+	script, tmpl := []byte("#!/usr/bin/env bash\necho update\n"), []byte("AWSTemplateFormatVersion: 2010-09-09\n")
+	files := map[string][]byte{AWSDeployAsset: script, "supavise.yaml": tmpl}
+	hex := func(b []byte) string { s := sha256.Sum256(b); return fmt.Sprintf("%x", s) }
+
+	serve := func(t *testing.T) (*Verified, Options) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if b, ok := files[strings.TrimPrefix(r.URL.Path, "/dl/")]; ok {
+				_, _ = w.Write(b)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		t.Cleanup(srv.Close)
+		sums := fmt.Sprintf("%s  %s\n%s  supavise.yaml\n", hex(script), AWSDeployAsset, hex(tmpl))
+		ver := &Verified{
+			Release: &Release{Tag: "v1.2.0", Assets: map[string]string{AWSDeployAsset: srv.URL + "/dl/" + AWSDeployAsset, "supavise.yaml": srv.URL + "/dl/supavise.yaml"}},
+			Sums:    []byte(sums),
+			Manifest: &Manifest{Schema: 1, Version: "v1.2.0", MinUpgradeFrom: "v0.0.0",
+				AWS: &ManifestAWS{StackRevision: 2, TemplateAsset: "supavise.yaml", TemplateSHA256: hex(tmpl)}},
+		}
+		return ver, Options{HTTP: srv.Client()}
+	}
+
+	ver, o := serve(t)
+	a, err := ver.AWSAssets(ctx, o)
+	if err != nil || string(a.Script) != string(script) || string(a.Template) != string(tmpl) || a.TemplateName != "supavise.yaml" || a.StackRevision != 2 {
+		t.Fatalf("assets = %+v, %v", a, err)
+	}
+
+	// A body that is not what the signed list says.
+	files["supavise.yaml"] = []byte("tampered")
+	if _, err := ver.AWSAssets(ctx, o); err == nil || !strings.Contains(err.Error(), "does not match its checksum") {
+		t.Errorf("tampered template: %v", err)
+	}
+	files["supavise.yaml"] = tmpl
+	files[AWSDeployAsset] = []byte("rm -rf /")
+	if _, err := ver.AWSAssets(ctx, o); err == nil || !strings.Contains(err.Error(), "does not match its checksum") {
+		t.Errorf("tampered script: %v", err)
+	}
+	files[AWSDeployAsset] = script
+
+	// The manifest and the list disagree.
+	ver.Manifest.AWS.TemplateSHA256 = strings.Repeat("0", 64)
+	if _, err := ver.AWSAssets(ctx, o); err == nil || !strings.Contains(err.Error(), "disagree") {
+		t.Errorf("manifest hash: %v", err)
+	}
+	ver.Manifest.AWS.TemplateSHA256 = hex(tmpl)
+
+	// A script the list does not carry; a release without an aws section; an odd asset name.
+	short := *ver
+	short.Sums = []byte(fmt.Sprintf("%s  supavise.yaml\n", hex(tmpl)))
+	if _, err := short.AWSAssets(ctx, o); err == nil || !strings.Contains(err.Error(), "lists no checksum for "+AWSDeployAsset) {
+		t.Errorf("unlisted script: %v", err)
+	}
+	none := *ver
+	none.Manifest = &Manifest{Schema: 1, Version: "v1.2.0", MinUpgradeFrom: "v0.0.0"}
+	if _, err := none.AWSAssets(ctx, o); err == nil || !strings.Contains(err.Error(), "no AWS stack template") {
+		t.Errorf("no aws section: %v", err)
+	}
+	odd := *ver
+	odd.Manifest = &Manifest{Schema: 1, Version: "v1.2.0", MinUpgradeFrom: "v0.0.0", AWS: &ManifestAWS{TemplateAsset: "../etc/passwd"}}
+	if _, err := odd.AWSAssets(ctx, o); err == nil || !strings.Contains(err.Error(), "plain asset name") {
+		t.Errorf("odd name: %v", err)
 	}
 }

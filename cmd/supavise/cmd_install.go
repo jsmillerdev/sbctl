@@ -33,16 +33,25 @@ func init() {
 		Short: "Set this server up as a Supavise node (run as root; deploy/install.sh calls it)",
 		Long: `Turns a Linux server into a Supavise node. It checks the host (Ubuntu 24.04+ or Debian 12+,
 glibc 2.35+, systemd), creates the supavise user, writes /etc/supavise/config.toml from the flags,
-installs the systemd units and the polkit rule, opens the firewall ports, creates the system
-project (` + "`supavise system init`" + `), starts the shared services, enables and starts supavise.service and
-prints the dashboard URL and the claim token that creates the first administrator.
+installs the systemd units and the polkit rule (` + "`supavise system converge`" + `), opens the firewall ports,
+creates the system project (` + "`supavise system init`" + `), starts the shared services, enables and starts
+supavise.service and prints the dashboard URL and the claim token that creates the first administrator.
 
 It is idempotent. A flag you leave out keeps the value already in config.toml; the master key,
 the registry and every project are never touched. Run it again with a flag to change that
 setting (for example --email), or with no flags to repair a half-finished install.
 
 Without --domain the node uses <public ip>.sslip.io, which works for a trial. With one, create
-the DNS records the summary lists (a wildcard A record for *.api.<domain> is required).`,
+the DNS records the summary lists (a wildcard A record for *.api.<domain> is required).
+
+--aws-first-boot is for an EC2 instance that a CloudFormation stack created with a data volume: before
+anything else it finds the volume (the EBS disk that is not the root disk), makes an XFS file system on
+it only when it is blank, mounts it at /var/lib/supavise with project quotas, binds /etc/supavise to
+it, and makes the units wait for both mounts. It is safe to repeat.
+
+--join-token-file F joins an existing cluster instead of creating a system project: the file holds the
+token ` + "`supavise node token`" + ` printed on the leader. The server gets its settings, the master key and a
+copy of the registry from the leader (` + "`supavise node join`" + `), and the dashboard stays on the leader.`,
 		Args: cobra.NoArgs,
 	}
 	f := cmd.Flags()
@@ -76,8 +85,14 @@ the DNS records the summary lists (a wildcard A record for *.api.<domain> is req
 	f.StringVar(&o.ClaimTokenFile, "claim-token-file", "", "also write the claim token to this file (mode 0600)")
 	f.StringVar(&o.Firewall, "firewall", "auto", "auto: open the ports in ufw when it is active and warn otherwise; ufw: install, enable and configure ufw (SSH stays open); none")
 	f.BoolVar(&o.SkipOSCheck, "skip-os-check", false, "do not refuse an unlisted distribution (glibc 2.35+ is still required)")
+	f.BoolVar(&o.AWSFirstBoot, "aws-first-boot", false, "first boot of an EC2 instance: find the data volume, make an XFS file system on it when it is blank, mount it with project quotas and bind /etc/supavise to it")
+	f.StringVar(&o.DataDevice, "data-device", "", "with --aws-first-boot: the data volume's device node, when the instance has more than one EBS volume besides the root volume")
+	f.StringVar(&o.JoinTokenFile, "join-token-file", "", "join the cluster whose leader printed the token in this file (mode 0600) instead of creating a system project")
 	printCfg := f.Bool("print-config", false, "print the config.toml this run would write and exit; changes nothing")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if err := checkInstallFlags(cmd.Flags().Changed, o); err != nil {
+			return err
+		}
 		if *printCfg {
 			return printInstallConfig(cmd, o)
 		}
@@ -161,6 +176,23 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 	if err := preflight(o.SkipOSCheck); err != nil {
 		return err
 	}
+	// A bad token file fails here, before the install changes anything.
+	if o.JoinTokenFile != "" {
+		if err := checkJoinOptions(o); err != nil {
+			return err
+		}
+	}
+	// The data volume and the bind mount of /etc/supavise come before anything reads or writes
+	// either: a replacement instance finds config.toml and the master key on the volume.
+	var stackName string
+	if o.AWSFirstBoot {
+		in.step("preparing the EC2 data volume")
+		res, err := firstBootAWS(in.ctx, in.out, o)
+		if err != nil {
+			return err
+		}
+		stackName = res.StackName
+	}
 	// A bad passphrase file fails here, before the install changes anything.
 	var keyPass []byte
 	if o.KeyPassphraseFile != "" {
@@ -194,14 +226,17 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 			cfg.PublicIP = publicIP
 		}
 	}
-	if cfg.TLS.Mode != "off" && cfg.TLS.Email == "" {
-		in.warn("no --email: Let's Encrypt cannot send expiry notices")
-	}
-	if cfg.Domain != "" && cfg.TLS.DNSProvider == "" && cfg.TLS.Mode != "off" {
-		in.warn("no --dns provider: certificates are requested per host on first use (HTTP-01), which needs every name below to resolve here first")
-	}
-	if cfg.Domain == "" {
-		in.warn("no --domain: using %s (sslip.io), which is for trials; Let's Encrypt rate limits apply to the shared sslip.io domain", cfg.BaseDomain())
+	// A joining server takes the domain and the TLS settings from the leader.
+	if o.JoinTokenFile == "" {
+		if cfg.TLS.Mode != "off" && cfg.TLS.Email == "" {
+			in.warn("no --email: Let's Encrypt cannot send expiry notices")
+		}
+		if cfg.Domain != "" && cfg.TLS.DNSProvider == "" && cfg.TLS.Mode != "off" {
+			in.warn("no --dns provider: certificates are requested per host on first use (HTTP-01), which needs every name below to resolve here first")
+		}
+		if cfg.Domain == "" {
+			in.warn("no --domain: using %s (sslip.io), which is for trials; Let's Encrypt rate limits apply to the shared sslip.io domain", cfg.BaseDomain())
+		}
 	}
 
 	in.step("creating the %s user and its directories", installUser)
@@ -252,14 +287,30 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 		return err
 	}
 
-	in.step("installing the systemd units")
-	if err := in.run(cfg.BinPath, "--config", config.DefaultPath, "system", "install-units"); err != nil {
+	in.step("converging the host (systemd units, directories, mount protection, firewall rule for the mesh port)")
+	if err := in.run(cfg.BinPath, "--config", config.DefaultPath, "system", "converge"); err != nil {
 		return err
+	}
+	if stackName != "" {
+		// The tags of the instance name its stack; the node remembers it for `supavise upgrade --aws`.
+		if err := writeAWSConfig(filepath.Dir(config.DefaultPath), stackName); err != nil {
+			in.warn("could not record the stack name in config.d: %v", err)
+		}
 	}
 	if err := in.firewall(o.Firewall, existed); err != nil {
 		return err
 	}
+	if o.Firewall != "none" {
+		// ufw may have been switched on just now; converge opens the mesh port in it.
+		if err := in.run(cfg.BinPath, "--config", config.DefaultPath, "system", "converge"); err != nil {
+			return err
+		}
+	}
 	in.osUpdates()
+
+	if o.JoinTokenFile != "" {
+		return in.joinCluster(o, configChanged, existed, uid, gid)
+	}
 
 	in.step("creating the system project (first run downloads Postgres and the auth service)")
 	if err := in.asSupavise(nil, "system", "init"); err != nil {
@@ -270,22 +321,7 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 		return err
 	}
 
-	in.step("starting supavise.service")
-	if err := in.run("systemctl", "enable", "supavise.service"); err != nil {
-		return err
-	}
-	verb := "start"
-	switch {
-	case configChanged && existed:
-		verb = "restart" // the running daemon holds the old settings
-	case in.daemonStale():
-		// install.sh swapped the binary file under a daemon that is still running the old
-		// one, and the units were just re-rendered by the new one.
-		in.step("the running daemon is not the installed binary: restarting it")
-		verb = "restart"
-	}
-	if err := in.run("systemctl", verb, "supavise.service"); err != nil {
-		_ = in.run("journalctl", "-u", "supavise.service", "-n", "40", "--no-pager")
+	if err := in.startDaemon(configChanged, existed); err != nil {
 		return err
 	}
 	if err := waitDaemon(in.ctx, cfg, 5*time.Minute); err != nil {
@@ -311,6 +347,30 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 		return err
 	}
 	printSummary(in.out, cfg, publicIP, token, claimed, o)
+	return nil
+}
+
+// startDaemon enables supavise.service and starts it, or restarts it when it runs with settings or a
+// binary that are not the ones just installed.
+func (in *installer) startDaemon(configChanged, existed bool) error {
+	in.step("starting supavise.service")
+	if err := in.run("systemctl", "enable", "supavise.service"); err != nil {
+		return err
+	}
+	verb := "start"
+	switch {
+	case configChanged && existed:
+		verb = "restart" // the running daemon holds the old settings
+	case in.daemonStale():
+		// install.sh swapped the binary file under a daemon that is still running the old
+		// one, and the units were just re-rendered by the new one.
+		in.step("the running daemon is not the installed binary: restarting it")
+		verb = "restart"
+	}
+	if err := in.run("systemctl", verb, "supavise.service"); err != nil {
+		_ = in.run("journalctl", "-u", "supavise.service", "-n", "40", "--no-pager")
+		return err
+	}
 	return nil
 }
 

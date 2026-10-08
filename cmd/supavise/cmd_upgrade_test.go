@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/hostsetup"
+	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/nodeupgrade"
 )
 
@@ -23,7 +25,7 @@ func TestUpgradeCommandsAreRegistered(t *testing.T) {
 		}
 	}
 	up, _, _ := rootCmd.Find([]string{"upgrade"})
-	for _, flag := range []string{"check", "plan", "yes", "unattended", "version", "include-postgres"} {
+	for _, flag := range []string{"check", "plan", "yes", "unattended", "version", "include-postgres", "aws", "stack-name", "set"} {
 		if up.Flags().Lookup(flag) == nil {
 			t.Errorf("upgrade has no --%s", flag)
 		}
@@ -44,6 +46,67 @@ func TestUpgradeRefusesOutsideALinuxServerWithStatus2(t *testing.T) {
 	}
 }
 
+// Every flag of `upgrade` reaches the options of the run. A stack flag that is registered and
+// validated but not copied makes `--aws` a plain upgrade that never touches the stack and drops a
+// `--set` without a word.
+func TestUpgradeFlagsReachTheRunOptions(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	up, fl := newUpgradeCmd()
+	args := []string{"--aws", "--stack-name", "supavise-b", "--set", "Failover=on", "--set", "PeerCidr1=203.0.113.7/32", "--version", "v1.2.0", "--include-postgres", "--plan", "--check", "--yes"}
+	if err := up.ParseFlags(args); err != nil {
+		t.Fatal(err)
+	}
+	if err := fl.validate(); err != nil {
+		t.Fatal(err)
+	}
+	o := upgradeOptions(cfg, &bytes.Buffer{}, fl)
+	if !o.AWS || o.StackName != "supavise-b" || strings.Join(o.StackSets, " ") != "Failover=on PeerCidr1=203.0.113.7/32" {
+		t.Errorf("the stack flags did not arrive: %+v", o)
+	}
+	if o.Version != "v1.2.0" || !o.IncludePostgres || !o.Plan || !o.Check || !o.Yes || o.Unattended {
+		t.Errorf("the other flags did not arrive: %+v", o)
+	}
+	if o.Notify == nil || o.Keep != cfg.Upgrade.Keep() || o.Canary != cfg.Upgrade.Canary() || o.Batch != cfg.Upgrade.Batch() {
+		t.Errorf("the settings and the alert hook did not arrive: %+v", o)
+	}
+
+	// Without --aws the stack is not asked for, and --unattended implies --yes.
+	up, fl = newUpgradeCmd()
+	if err := up.ParseFlags([]string{"--unattended"}); err != nil {
+		t.Fatal(err)
+	}
+	if o := upgradeOptions(cfg, &bytes.Buffer{}, fl); o.AWS || o.StackName != "" || len(o.StackSets) != 0 || !o.Unattended || !o.Yes {
+		t.Errorf("options = %+v", o)
+	}
+}
+
+// A command line that cannot be a run is refused with status 2 before the node is read: that holds
+// on any machine, so the refusal here is the flag's and not the platform's.
+func TestUpgradeRefusesStackFlagsThatCannotBeARun(t *testing.T) {
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--aws", "--unattended"}, "cannot run with --unattended"},
+		{[]string{"--aws", "--unattended", "--yes"}, "cannot run with --unattended"},
+		{[]string{"--stack-name", "supavise"}, "belong to --aws"},
+		{[]string{"--set", "Failover=on"}, "belong to --aws"},
+		{[]string{"--aws", "--set", "Failover"}, "Parameter=Value"},
+		{[]string{"--aws", "--stack-name", "1 bad"}, "not a CloudFormation stack name"},
+	} {
+		up, _ := newUpgradeCmd()
+		var out bytes.Buffer
+		up.SetOut(&out)
+		up.SetErr(&out)
+		up.SetArgs(c.args)
+		err := up.Execute()
+		if err == nil || nodeupgrade.ExitCode(err) != nodeupgrade.ExitRefused || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%v: err = %v (exit %d), want a refusal with status 2 saying %q", c.args, err, nodeupgrade.ExitCode(err), c.want)
+		}
+	}
+}
+
 func TestReleaseInfoReportsThePins(t *testing.T) {
 	out, err := runRoot(t, "release-info", "--json")
 	if err != nil {
@@ -55,6 +118,9 @@ func TestReleaseInfoReportsThePins(t *testing.T) {
 	}
 	if i.RegistrySchema == "" || i.Pins["gotrue"] == "" || i.Pins["postgres"] == "" || i.Pins["studio"] == "" || i.Pins["supavisor"] == "" {
 		t.Fatalf("info = %+v", i)
+	}
+	if i.ConvergeRevision != hostsetup.Revision || i.InfraRevision != infra.Revision || len(i.HostChanges) == 0 {
+		t.Fatalf("the host and stack revisions are missing: %+v", i)
 	}
 	if _, err := nodeupgrade.ParseInfo([]byte(out)); err != nil {
 		t.Fatalf("ParseInfo cannot read what release-info prints: %v", err)
