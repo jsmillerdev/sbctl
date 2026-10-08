@@ -5,6 +5,8 @@
 #   sudo SUPAVISE_BIN_PREV=/path/to/prev SUPAVISE_BIN=/path/to/new tests/linux/converge-e2e.sh
 #
 # Without the two binaries the script builds them with go and git (origin/main must be fetched).
+# Case 6b needs a third binary, SUPAVISE_BIN_NEXT (this checkout as v0.2.1; built with go when it is
+# there) and, without go, a built deploy/releasetool in SUPAVISE_RELEASETOOL.
 # Needs root, systemd, cgroup v2 and network access (artifact downloads). Do not run it on a machine
 # you care about: it creates the supavise user, writes /etc/supavise, installs units and starts real
 # clusters. Exit status is non-zero on the first failure. The cases, in order:
@@ -25,6 +27,11 @@
 #     `converge` sets the marker right again.
 #  6. `converge --check` needs no root (the supavise user runs it), and a fake ufw that is active
 #     without the rule: `--check` reports it, `converge` opens 7443/tcp, a second run does not.
+#  6b. The new driver: `supavise upgrade` to a signed release (a build of this checkout as v0.2.1,
+#     served by a local server) whose converge fails after the swap (a ufw that refuses the rule).
+#     That fails the upgrade: exit status 3, the node back on v0.2.0, the marker as it was, no project
+#     restarted. The same upgrade without the broken ufw succeeds (exit 0) and converges the host
+#     with no project restarted (invariant I4).
 #  7. install.sh refuses a --join-token-file that cannot be used before it downloads or changes
 #     anything, `supavise install --aws-first-boot` formats nothing off EC2, and the flag is listed.
 #  8. The mounts: with /var/lib/supavise and /etc/supavise mount points (bind mounts of themselves),
@@ -38,10 +45,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 WORK=$(mktemp -d)
 chmod 0755 "$WORK"
 HOOK_PID=""
+SRV_PID=""
 BOUND=0 # set once the mount checks have bound the two directories to themselves
 cleanup() {
   local rc=$?
   [[ -n $HOOK_PID ]] && kill "$HOOK_PID" 2>/dev/null || true
+  [[ -n $SRV_PID ]] && kill "$SRV_PID" 2>/dev/null || true
   if [[ $BOUND -eq 1 ]]; then
     umount -l /etc/supavise 2>/dev/null || true
     umount -l /var/lib/supavise 2>/dev/null || true
@@ -88,9 +97,17 @@ if [[ -z $NEW ]]; then
   NEW=$WORK/supavise-new
   CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.2.0" -o "$NEW" ./cmd/supavise
 fi
+NEXT=${SUPAVISE_BIN_NEXT:-}
+if [[ -z $NEXT ]]; then
+  command -v go >/dev/null || fail "no SUPAVISE_BIN_NEXT and no go toolchain"
+  NEXT=$WORK/supavise-next
+  CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.2.1" -o "$NEXT" ./cmd/supavise
+fi
+[[ $("$NEXT" --version) == *v0.2.1* ]] || fail "SUPAVISE_BIN_NEXT reports $("$NEXT" --version), want v0.2.1"
 install -d -m 0755 /opt/supavise-e2e
 install -m 0755 "$PREV" /opt/supavise-e2e/prev
 install -m 0755 "$NEW" /opt/supavise-e2e/new
+install -m 0755 "$NEXT" /opt/supavise-e2e/next
 PREV_HAS_CONVERGE=0
 /opt/supavise-e2e/prev system --help >"$WORK/prev-help.log" 2>&1 || true
 grep -q '^  converge' "$WORK/prev-help.log" && PREV_HAS_CONVERGE=1
@@ -259,6 +276,78 @@ grep -q '^7443/tcp .*ALLOW' "$UFW_STATE" || fail "ufw was not told to allow 7443
 PATH="$FAKE:$PATH" $SV system converge >"$WORK/converge3b.log" 2>&1 || fail "the second converge with ufw failed"
 grep -q "allowed 7443" "$WORK/converge3b.log" && fail "the second converge opened 7443/tcp again"
 [[ $(grep -c '^7443/tcp' "$UFW_STATE") == 1 ]] || fail "the rule was added twice: $(cat "$UFW_STATE")"
+
+# ---- 6b. the new driver: a converge that fails after the swap ------------------------------
+log "the new driver: a converge that fails after the swap fails the upgrade and rolls it back"
+KEYS=$WORK/keys; mkdir -p "$KEYS"
+openssl genpkey -algorithm ed25519 -out "$KEYS/sign.pem" 2>/dev/null
+openssl pkey -in "$KEYS/sign.pem" -pubout -out "$KEYS/pub.pem"
+ARCH=$(dpkg --print-architecture)
+SRV_PORT=38804
+REL=$WORK/srv/download/v0.2.1
+mkdir -p "$REL" "$WORK/srv/repos/o/r/releases/tags"
+cp "$NEXT" "$REL/supavise-linux-$ARCH"
+if [[ $ARCH == amd64 ]]; then echo other-arch >"$REL/supavise-linux-arm64"; else echo other-arch >"$REL/supavise-linux-amd64"; fi
+echo "not a real studio build" >"$REL/supavise-studio-test-p1-linux-$ARCH.tar.zst"
+env SUPAVISE_RELEASE_TAG=v0.2.1 SUPAVISE_RELEASETOOL="${SUPAVISE_RELEASETOOL:-}" deploy/release-assets.sh "$REL" "$KEYS/sign.pem" "$KEYS/pub.pem" >/dev/null
+python3 - v0.2.1 "$REL" "$SRV_PORT" "$WORK/srv/repos/o/r/releases" <<'PY'
+import json, os, sys
+tag, d, port, out = sys.argv[1:]
+rel = {"tag_name": tag, "assets": [{"name": n, "browser_download_url": f"http://127.0.0.1:{port}/download/{tag}/{n}"} for n in sorted(os.listdir(d))]}
+for name in ("latest", f"tags/{tag}"):
+    with open(os.path.join(out, name), "w") as f:
+        json.dump(rel, f)
+PY
+(cd "$WORK/srv" && exec python3 -m http.server "$SRV_PORT" --bind 127.0.0.1 >"$WORK/http.log" 2>&1) &
+SRV_PID=$!
+for ((i = 0; i < 20; i++)); do [[ $(http_code "http://127.0.0.1:$SRV_PORT/download/v0.2.1/SHA256SUMS") == 200 ]] && break; sleep 0.5; done
+[[ $(http_code "http://127.0.0.1:$SRV_PORT/download/v0.2.1/SHA256SUMS") == 200 ]] || fail "the local release server does not answer"
+
+# upgrade_next [DIR]: the driver is a copy of the target release, as in upgrade-e2e.sh; a DIR is put
+# first on the PATH of the driver, which its `system converge` inherits.
+upgrade_next() {
+  PATH="${1:+$1:}$PATH" timeout 1800 /opt/supavise-e2e/next upgrade --repo o/r --api-base "http://127.0.0.1:$SRV_PORT" \
+    --public-key-file "$KEYS/pub.pem" --version v0.2.1 --yes
+}
+projects_pids() { for u in "${UNITS[@]:1}"; do systemctl show -p MainPID --value "$u"; done | paste -sd, -; }
+upgrade_phase() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["phase"])' "$STATE/system/upgrade.json"; }
+
+BROKEN=$WORK/brokenbin; mkdir -p "$BROKEN"
+cat >"$BROKEN/ufw" <<'UFW'
+#!/usr/bin/env bash
+case "$1" in
+  status) printf 'Status: active\n\nTo                         Action      From\n--                         ------      ----\n22/tcp                     ALLOW       Anywhere\n' ;;
+  *) echo "ERROR: ufw is broken" >&2; exit 1 ;;
+esac
+UFW
+chmod 0755 "$BROKEN/ufw"
+
+rc=0
+out=$(upgrade_next "$BROKEN" 2>&1) || rc=$?
+printf '%s\n' "$out" >"$WORK/upgrade-broken-converge.log"
+[[ $rc -eq 3 ]] || { printf '%s\n' "$out" >&2; fail "an upgrade whose converge failed exited with status $rc, want 3"; }
+[[ $out == *"system converge"* && $out == *"rolled back"* ]] || { printf '%s\n' "$out" >&2; fail "the failed upgrade does not name the converge or the rollback"; }
+[[ $($SV --version) == *v0.2.0* ]] || fail "after the rollback the installed binary is $($SV --version), want v0.2.0"
+wait_daemon
+for u in "${UNITS[@]:1}"; do wait_active "$u" 60; done
+[[ $(upgrade_phase) == rolled_back ]] || fail "the upgrade marker says $(upgrade_phase), want rolled_back"
+grep -qx "revision=$REV" "$STATE/converged" || fail "the failed converge changed the marker: $(cat "$STATE/converged")"
+[[ $(projects_pids) == "${PIDS0#*,}" ]] || fail "the failed upgrade restarted a project's process"
+log "exit status 3, back on v0.2.0, the marker and the projects as they were"
+
+log "the same upgrade with a working ufw: exit 0, converged, no project restarted (I4)"
+rc=0
+out=$(upgrade_next 2>&1) || rc=$?
+printf '%s\n' "$out" >"$WORK/upgrade-converge.log"
+[[ $rc -eq 0 ]] || { printf '%s\n' "$out" >&2; fail "the upgrade exited with status $rc"; }
+[[ $($SV --version) == *v0.2.1* ]] || fail "after the upgrade the installed binary is $($SV --version), want v0.2.1"
+[[ $(upgrade_phase) == done ]] || fail "the upgrade marker says $(upgrade_phase), want done"
+wait_daemon
+for u in "${UNITS[@]:1}"; do wait_active "$u" 60; done
+grep -qx "revision=$REV" "$STATE/converged" || fail "the marker after the upgrade is $(cat "$STATE/converged")"
+[[ $(pending_ids) == ",," ]] || fail "steps are pending after the upgrade: $($SV system converge --check --json)"
+[[ $(projects_pids) == "${PIDS0#*,}" ]] || fail "the upgrade restarted a project's process (I4)"
+[[ $(papi GET "/v1/projects/$REF" | json_get 'd["status"]') == ACTIVE_HEALTHY ]] || fail "the project is not ACTIVE_HEALTHY after the upgrade"
 
 # ---- 7. install.sh and --aws-first-boot -----------------------------------------------------
 log "install.sh --join-token-file refuses a token file that cannot be used, before it changes anything"
