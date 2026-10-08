@@ -89,7 +89,7 @@ For hands-off updates, turn on automatic upgrades in a weekly maintenance window
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="brand/readme/architecture-dark.svg">
-  <img alt="Supavise architecture: Supabase Studio, the Supabase CLI, the MCP server and your apps reach one node over HTTPS; the supavise binary fronts per-project Postgres, Auth and REST plus shared Supavisor, Realtime, Storage, Edge Runtime and Studio; backups go to S3 or local disk" src="brand/readme/architecture-light.svg" width="100%">
+  <img alt="Supavise architecture: Supabase Studio, the Supabase CLI, the MCP server and your apps reach one node over HTTPS; the supavise binary fronts per-project Postgres, Auth and REST plus shared Supavisor, Realtime, Storage, Edge Runtime and Studio; backups go to S3 or local disk; an optional second server joins over the mesh port for read replicas and failover" src="brand/readme/architecture-light.svg" width="100%">
 </picture>
 
 One Go program installs Supabase's open-source services and adds what self-hosting lacks: HTTPS, multiple projects, the API that the dashboard and CLI need, and backups. See [how Supavise compares](docs/guide.md#how-supavise-compares) to self-hosted and hosted Supabase, or read the [design](docs/design.md). To add a second server for read replicas and failover, see [Read replicas and failover](docs/guide.md#read-replicas-and-failover).
