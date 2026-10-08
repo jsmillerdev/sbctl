@@ -22,7 +22,7 @@ alerts.Notify(ctx, alerts.Event{Kind: alerts.KindUpgradeFailed, Severity: "criti
 | `node_unhealthy` | the registry, the system cluster or a shared service is not healthy | warning; critical for the registry and system Postgres |
 | `update_available` | a release newer than the running version exists | info, once per version |
 
-Other parts of the node raise `upgrade_started`, `upgrade_succeeded` and `upgrade_failed` (the upgrade commands) and may raise any kind. Those three, `update_available` and `test` are announcements: each is sent when it happens, subject only to the hourly cap. Everything else is a condition: sent once while it lasts.
+Other parts of the node may raise any kind through `alerts.Notify`. The kinds `upgrade_started`, `upgrade_succeeded` and `upgrade_failed` are defined, but no upgrade command raises them: the upgrade and unattended-upgrade events are log lines only. Those three, `update_available` and `test` are announcements: each is sent when it happens, subject only to the hourly cap. Everything else is a condition: sent once while it lasts.
 
 ## De-duplication, recovery and the cap
 

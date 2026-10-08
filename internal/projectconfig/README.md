@@ -81,7 +81,7 @@ without the token is answered `404`.
 
 **Line breaks.** A setting that renders to an environment variable (everything with an `Env`
 except the template bodies) refuses `\r` and `\n`, because a unit's environment file cannot carry
-them. The save is a 400 instead of a resume that fails.  `Manager.Patch` also renders the service's
+them. The save is a 400 instead of a resume that fails. `Manager.Patch` also renders the service's
 environment before it saves and refuses any value with a line break or NUL. A multi-line SMS template therefore cannot be saved
 (GoTrue reads `GOTRUE_SMS_TEMPLATE` from the environment only).
 
@@ -97,7 +97,7 @@ refuses to start with SAML on and no signing key, so `Manager.AuthEnv` adds the 
 `GOTRUE_SAML_PRIVATE_KEY` whenever `saml_enabled` renders as true (`Options.SigningKey`, which the
 lifecycle wires to `sso.EnsureSigningKey`: an RSA 2048 key, created on first use and sealed as the
 project secret `saml_private_key`, never shared between projects). The key is not a setting: a client
-cannot read or set it, and `rotate-keys` does not touch it.  With SAML off nothing is rendered and no
+cannot read or set it, and `rotate-keys` does not touch it. With SAML off nothing is rendered and no
 key exists. The project's identity
 providers are managed through `/v1/projects/{ref}/config/auth/sso/providers` (`internal/api`, Single
 sign-on), which answers 404 until `saml_enabled` is on, as on hosted.

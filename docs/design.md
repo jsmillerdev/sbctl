@@ -71,7 +71,7 @@ Management API subset: `/v1` projects, api-keys, `database/query`, migrations, `
 
 **AWS.** Use the Launch Stack link, upload the release's template in the console, or run `deploy/aws/deploy.sh`. Fill in the admin email; instance size (Graviton, 8 GiB by default), domain and hosted zone are optional. CloudFormation creates one Ubuntu 24.04 instance, a data volume, an IAM role, a security group and an S3 bucket; user data runs the installer; the stack outputs the dashboard URL and the command that fetches the one-time claim token. Deleting the stack keeps the bucket and a final snapshot of the data volume.
 
-**Any Linux server.** Ubuntu 24.04+ or Debian 12+ (glibc 2.35 for the artifacts; polkit 121+ for the unit-management rule, so Ubuntu 22.04 is out). Two DNS records, then:
+**Any Linux server.** Ubuntu 24.04+ or Debian 12+ (glibc 2.35 for the artifacts; polkit 121+ for the unit-management rule, so Ubuntu 22.04 is out). Four DNS records (`api.`, `studio.`, `pooler.`, `*.api.`), then:
 
 ```bash
 curl -fsSL https://github.com/supavise/supavise/releases/latest/download/install.sh | sudo bash -s -- --domain example.com --dns cloudflare

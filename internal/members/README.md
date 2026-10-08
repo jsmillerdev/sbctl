@@ -4,7 +4,7 @@ Who belongs to which organization with which role, project-scoped roles, invitat
 permissions those roles grant, in the shape Studio and the Management API use (hosted's
 `PermissionAction` model). The API server (`internal/api`, `authz.go` and `members_api.go`) enforces
 them on every `/platform` and `/v1` route and serves them to Studio; `supavise users` (`cmd/supavise`) and
-single sign-on (`internal/sso`) use the same `Service`. The route table, the capability table and the HTTP
+the dashboard single sign-on (`internal/api`, `sso_dashboard.go`) use the same `Service`. The route table, the capability table and the HTTP
 behavior are documented in `internal/api/README.md` (Members, roles and permissions).
 
 | File | What |

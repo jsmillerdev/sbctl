@@ -4,7 +4,7 @@ Memory, cold start and disk use of a node at 10, 25 and 50 projects, under real 
 
 ## What is measured
 
-One node, one `supavise` binary, real artifacts, the systemd backend and one project class (the class is part of the result). Each project runs `supavise-postgres@`, `supavise-gotrue@` and `supavise-postgrest@`. The system project (`supavise-postgres@system`, `supavise-gotrue@system`) is measured separately because it exists once. The shared services (Supavisor, Realtime, Storage, postgres-meta, Studio) are not started by the script; add their idle RSS, roughly 1 GB once per node, as a fixed cost.
+One node, one `supavise` binary, real artifacts, the systemd backend and one project class (the class is part of the result). Each project runs `supavise-postgres@`, `supavise-gotrue@` and `supavise-postgrest@`. The system project (`supavise-postgres@system`, `supavise-gotrue@system`) is measured separately because it exists once. The shared services (Supavisor, Realtime, Storage, postgres-meta, Studio) are not started by the script; add their idle RSS from the artifact manifests (not measured here), roughly 1 GB once per node, as a fixed cost.
 
 For each size N in 10, 25, 50 the script creates projects until N exist, waits 30 s for idle, then records:
 
@@ -54,4 +54,4 @@ The runs used class `default` as it was before compute sizes: 32 MB `shared_buff
 
 Measured 2026-10-07 at commit 83815eb, Ubuntu 24.04.5, kernel 6.17. The shared services were not running.
 
-A project's own memory (PSS) is about 65 MB idle; RSS counts shared pages once per process and overstates it about 3.5 times. The slice's `memory.current` grows by about 148 MB per project between 10 and 50 projects because it also charges page cache. Size an instance at about 150 MB per idle project plus about 1.5 GB fixed.
+A project's own memory (PSS) is about 65 MB idle; RSS counts shared pages once per process and overstates it about 3.5 times. The slice's `memory.current` grows by about 148 MB per project between 10 and 50 projects because it also charges page cache. Size an instance at about 150 MB per idle project plus about 1.5 GB fixed. Fifty idle projects used 7.4 GB of a 16 GB host.
