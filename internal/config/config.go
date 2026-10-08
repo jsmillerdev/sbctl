@@ -62,6 +62,12 @@ type Config struct {
 	Alerts    Alerts    `toml:"alerts"`
 	Health    Health    `toml:"health"`
 	Compute   Compute   `toml:"compute"`
+	// Node, Replicas, Failover and AWS configure the cluster of servers (cluster.go). Replicas
+	// and Failover are the same on every node; Node and AWS belong to one.
+	Node     Node     `toml:"node"`
+	Replicas Replicas `toml:"replicas"`
+	Failover Failover `toml:"failover"`
+	AWS      AWS      `toml:"aws"`
 	// Defaults are the systemd limits of the shared services and the system project. A user
 	// project takes the limits of its size (internal/lifecycle, sizes.go) instead.
 	Defaults Limits `toml:"defaults"`
@@ -164,19 +170,18 @@ func Default() *Config {
 		},
 		Artifacts: Artifacts{BaseURL: "https://github.com/supabase/slim-services/releases/download"},
 		Update:    DefaultUpdate(),
+		Node:      Node{PeerListen: ":" + strconv.Itoa(PortPeer)},
+		Replicas:  DefaultReplicas(),
+		Failover:  DefaultFailover(),
 		Defaults:  Limits{MemoryMax: "1G", CPUQuota: "100%"},
 	}
 }
 
-// Load reads the file at path (DefaultPath, or $SUPAVISE_CONFIG, when path is empty),
-// applies SUPAVISE_* overrides and validates. A missing file is not an error.
+// Load reads the file at path (DefaultPath, or $SUPAVISE_CONFIG, when path is empty), merges
+// the *.toml files of the config.d directory next to it over it in lexical order, applies
+// SUPAVISE_* overrides and validates. A missing file or directory is not an error.
 func Load(path string) (*Config, error) {
-	if path == "" {
-		path = os.Getenv(EnvConfigPath)
-	}
-	if path == "" {
-		path = DefaultPath
-	}
+	path = ResolvePath(path)
 	c := Default()
 	b, err := os.ReadFile(path)
 	switch {
@@ -186,6 +191,9 @@ func Load(path string) (*Config, error) {
 		}
 	case errors.Is(err, os.ErrNotExist):
 	default:
+		return nil, err
+	}
+	if err := loadConfigD(c, path); err != nil {
 		return nil, err
 	}
 	if err := applyEnv(reflect.ValueOf(c).Elem(), EnvPrefix, os.Environ()); err != nil {
@@ -251,7 +259,7 @@ func (c *Config) Validate() error {
 	if c.Ports.ProjectBase < 1024 || c.MaxProjectSeq() < 1 {
 		return fmt.Errorf("config: ports.project_base %d out of range", c.Ports.ProjectBase)
 	}
-	return nil
+	return c.validateCluster()
 }
 
 func applyEnv(v reflect.Value, prefix string, environ []string) error {

@@ -39,6 +39,12 @@ type Fleet struct {
 	// config.toml in plain text, so keep that file 0600 and owned by the supavise user.
 	StorageS3AccessKeyID     string `toml:"storage_s3_access_key_id"`
 	StorageS3SecretAccessKey string `toml:"storage_s3_secret_access_key"`
+	// StorageS3CredentialsSecret is the ARN of an AWS Secrets Manager secret that holds
+	// {"bucket", "region", "access_key_id", "secret_access_key"}. The daemon reads it with the
+	// instance role when it renders Storage's environment, so the key is not in config.toml and
+	// rotating it is a restart. It takes the place of the storage_s3_* settings above that it
+	// names. supavise-storage cannot use the instance role itself: IMDS is denied to it.
+	StorageS3CredentialsSecret string `toml:"storage_s3_credentials_secret"`
 	// StorageFileSizeLimit is the per-object upload limit in bytes; zero means
 	// DefaultStorageFileSizeLimit.
 	StorageFileSizeLimit int64 `toml:"storage_file_size_limit"`
