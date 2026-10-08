@@ -194,8 +194,10 @@ func (s *blockingSink) HandleReport(_ context.Context, rep peerapi.Report) {
 	s.mu.Unlock()
 }
 
-// On a node of a cluster the Management API is given the controller; on a single server it is not.
-func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeOnly(t *testing.T) {
+// On a node of a cluster that runs the controller the Management API is given it; on a single server it is
+// not, and neither is it on a node whose controller is off: a setup request there would leave a row that
+// nothing picks up.
+func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(t *testing.T) {
 	w := testWire(t)
 	if err := wireReplicas(context.Background(), w); err != nil {
 		t.Fatal(err)
@@ -203,16 +205,19 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeOnly(t *tes
 	if w.API.Replicas != nil || w.API.Placement != nil {
 		t.Fatal("a single server's Management API got the controller")
 	}
+
+	// A cluster node that cannot reach the replica nodes or take base backups runs no controller. The
+	// Management API still lists replicas (Placement) and answers a setup request that replicas are not
+	// set up.
 	w2 := testWire(t)
 	Provide[mesh.Mesh](w2, stubMesh{})
 	Provide[placement.Resolver](w2, placement.RegistryResolver{Reg: w2.Node.Registry})
-	reports := cluster.NewReports()
-	Provide(w2, reports)
+	Provide(w2, cluster.NewReports())
 	if err := wireReplicas(context.Background(), w2); err != nil {
 		t.Fatal(err)
 	}
-	if w2.API.Replicas == nil || w2.API.Placement == nil {
-		t.Fatal("a cluster node's Management API has no controller")
+	if w2.API.Replicas != nil || w2.API.Placement == nil {
+		t.Fatalf("replicas %v, placement %v: the controller does not run, so the API takes no setup request", w2.API.Replicas, w2.API.Placement)
 	}
 	var names []string
 	for _, r := range w2.runners {
@@ -221,7 +226,28 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeOnly(t *tes
 	if strings.Join(names, ",") != "replica report intake" {
 		t.Fatalf("runners %v: the controller needs node operations and base backups to run", names)
 	}
-	if r, off := w2.offReason("replica controller"); !off || !strings.Contains(r, "base backups") {
-		t.Fatalf("controller off: %q, %v", r, off)
+	for _, feature := range []string{"replica controller", "api.Deps.Replicas"} {
+		if r, off := w2.offReason(feature); !off || !strings.Contains(r, "base backups") {
+			t.Fatalf("%s off: %q, %v", feature, r, off)
+		}
+	}
+
+	// With both, the controller runs and the Management API has it.
+	w3 := testWire(t)
+	Provide[mesh.Mesh](w3, stubMesh{})
+	Provide[placement.Resolver](w3, placement.RegistryResolver{Reg: w3.Node.Registry})
+	Provide(w3, cluster.NewReports())
+	Provide[placement.InstanceOps](w3, noOps{})
+	Provide[backup.BaseBackupEnsurer](w3, noBackups{})
+	if err := wireReplicas(context.Background(), w3); err != nil {
+		t.Fatal(err)
+	}
+	if w3.API.Replicas == nil || w3.API.Placement == nil {
+		t.Fatal("a cluster node that runs the controller gave the Management API none")
+	}
+	_, controllerOff := w3.offReason("replica controller")
+	_, apiOff := w3.offReason("api.Deps.Replicas")
+	if !hasRunner(w3, "replicas") || controllerOff || apiOff {
+		t.Fatalf("runs the controller: %v, off: %v", hasRunner(w3, "replicas"), w3.off)
 	}
 }

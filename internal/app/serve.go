@@ -276,7 +276,9 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		// Next to the projects: a shared service that takes minutes to answer (Realtime and
 		// Supavisor run migrations first) must not hold the projects back.
 		g.Go(func() error {
-			wire.fleetMu.Lock() // the role reconciliation of wireFleet changes the same units
+			if wire.fleetMu.Lock(gctx) != nil { // the role reconciliation of wireFleet changes the same units
+				return nil // the daemon stops
+			}
 			defer wire.fleetMu.Unlock()
 			defer close(fleetStarted)
 			fleetUp <- startFleet(gctx, node, log)

@@ -98,7 +98,10 @@ func wireFleet(ctx context.Context, w *Wire) error {
 	}
 	w.Go("fleet role", func(ctx context.Context) error {
 		apply := func(ctx context.Context, mode fleet.Mode) error {
-			w.fleetMu.Lock() // startFleet may still be starting the services the other way
+			// startFleet may still be starting the services the other way; a newer role cancels this wait.
+			if err := w.fleetMu.Lock(ctx); err != nil {
+				return err
+			}
 			defer w.fleetMu.Unlock()
 			return mgr.Apply(ctx, mode)
 		}

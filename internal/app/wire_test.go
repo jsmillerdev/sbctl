@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -45,6 +46,32 @@ func TestHooksOfASingleServerStartOnlyTheIdentityWatcher(t *testing.T) {
 		}
 		seen[h.name] = true
 	}
+}
+
+// A reconciliation that waits behind the boot start of the shared services stops waiting when a newer
+// role cancels it, and the lock is not lost by the wait that gave up.
+func TestFleetLockGivesUpWhenItsContextEnds(t *testing.T) {
+	var l ctxLock // the zero value is unlocked
+	if err := l.Lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	got := make(chan error, 1)
+	go func() { got <- l.Lock(ctx) }()
+	cancel()
+	select {
+	case err := <-got:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("a cancelled wait returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait for the lock did not end with its context")
+	}
+	l.Unlock()
+	if err := l.Lock(context.Background()); err != nil {
+		t.Fatalf("the lock was not free after the unlock: %v", err)
+	}
+	l.Unlock()
 }
 
 func TestWireStartsWhatHooksRegisterAndStopsLastFirst(t *testing.T) {

@@ -67,11 +67,32 @@ type Wire struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 	// fleetMu serializes the changes to the shared services' units: startFleet at boot and the role
-	// reconciliation that wireFleet runs when the node's role changes.
-	fleetMu sync.Mutex
+	// reconciliation that wireFleet runs when the node's role changes. A reconciliation that a newer
+	// role overtakes gives up its wait for the lock when it is cancelled.
+	fleetMu ctxLock
 	// serverChecks are the preflight checks of a server move that the hooks add (AddServerCheck).
 	serverChecks []failover.ExtraChecks
 }
+
+// ctxLock is a mutex whose Lock gives up when its context ends. The zero value is unlocked.
+type ctxLock struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+// Lock waits for the lock and returns nil once it holds it, or returns the context's error.
+func (l *ctxLock) Lock(ctx context.Context) error {
+	l.once.Do(func() { l.ch = make(chan struct{}, 1) })
+	select {
+	case l.ch <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Unlock releases a lock that Lock returned nil for.
+func (l *ctxLock) Unlock() { <-l.ch }
 
 type namedRunner struct {
 	name string
