@@ -27,8 +27,13 @@ type LocalBackups interface {
 
 // HandlerDeps are what the peer API handlers of this package need.
 type HandlerDeps struct {
-	Agent    Agent
-	Plane    lifecycle.Plane // the node's own plane, for PathPlane
+	Agent Agent
+	Plane lifecycle.Plane // the node's own plane, for PathPlane
+	// Checkpoints reads the control file of a cluster of this node (*lifecycle.PostgresPlane); nil
+	// answers 501 to the final_checkpoint request.
+	Checkpoints interface {
+		FinalCheckpoint(ref string) (lifecycle.ControlInfo, error)
+	}
 	Resolver Resolver
 	Members  cluster.Membership
 	Backups  LocalBackups
@@ -202,6 +207,9 @@ func (h *handlers) plane(w http.ResponseWriter, r *http.Request) {
 	}
 	ref, method := r.PathValue("ref"), peerapi.PlaneMethod(r.PathValue("method"))
 	call, ok := planeCalls[method]
+	if method == planeFinalCheckpoint {
+		ok, call = true, h.finalCheckpoint
+	}
 	if !ok {
 		badRequest(w, "unknown plane method %q", method)
 		return
@@ -235,6 +243,14 @@ func (h *handlers) plane(w http.ResponseWriter, r *http.Request) {
 		out.Result = b
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// finalCheckpoint is the plane call that reads a stopped cluster's control file.
+func (h *handlers) finalCheckpoint(_ context.Context, _ lifecycle.Plane, ref string, _ json.RawMessage) (any, error) {
+	if h.d.Checkpoints == nil {
+		return nil, lifecycle.ErrNoSnapshot
+	}
+	return h.d.Checkpoints.FinalCheckpoint(ref)
 }
 
 func (h *handlers) backup(w http.ResponseWriter, r *http.Request) {

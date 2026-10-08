@@ -55,7 +55,7 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	})
 	agent.Start(ctx)
 	ops := &placement.Ops{Self: self, Agent: agent, Backups: bk, RPC: m, Epoch: mem.Epoch}
-	placement.Register(handle, placement.HandlerDeps{Agent: agent, Plane: node.Plane, Resolver: res, Members: mem, Backups: bk})
+	placement.Register(handle, placement.HandlerDeps{Agent: agent, Plane: node.Plane, Checkpoints: node.Plane, Resolver: res, Members: mem, Backups: bk})
 
 	// A demoted cluster catches up through the node's own relay.
 	node.Plane.SetRestoreCommand(func(ref string) string { return backup.RestoreCommandFor(w.Cfg, ref, ref, w.Options.ConfigPath) })

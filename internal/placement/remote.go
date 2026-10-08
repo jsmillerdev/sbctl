@@ -132,3 +132,12 @@ func (r *RemotePlane) Health(ctx context.Context, p *registry.Project, _ *secret
 	}
 	return hs
 }
+
+var _ CheckpointReader = (*RemotePlane)(nil)
+
+// FinalCheckpoint implements CheckpointReader: the control file of ref's cluster on the node.
+func (r *RemotePlane) FinalCheckpoint(ctx context.Context, ref string) (lifecycle.ControlInfo, error) {
+	var ci lifecycle.ControlInfo
+	err := r.call(ctx, ref, planeFinalCheckpoint, nil, &ci)
+	return ci, err
+}

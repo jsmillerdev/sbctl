@@ -670,7 +670,8 @@ func (a *NodeAgent) adopt(identifier, ref string) {
 }
 
 // StartLocal starts the replicas of this node whose setup is complete, after a restart of the
-// machine or of the daemon: their units are not enabled for boot. A replica whose setup was
+// machine or of the daemon: their units are not enabled for boot (the system cluster's standby is,
+// and is left to systemd). A replica whose setup was
 // interrupted resumes when the leader asks for it again (Ensure). The errors are logged.
 func (a *NodeAgent) StartLocal(ctx context.Context) {
 	self := a.self()
@@ -683,7 +684,9 @@ func (a *NodeAgent) StartLocal(ctx context.Context) {
 		return
 	}
 	for _, r := range rs {
-		if r.InitStep != StepCompleted {
+		// The system cluster's standby is the daemon's own registry: systemd starts it before the
+		// daemon, and the daemon does not restart it.
+		if r.InitStep != StepCompleted || r.Ref == config.SystemRef {
 			continue
 		}
 		unlock := a.lockRef(r.Ref)

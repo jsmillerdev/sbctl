@@ -140,6 +140,10 @@ func (f *fakeSQL) Promote(_ context.Context, a ClusterAddr, _ time.Duration) err
 	return nil
 }
 func (f *fakeSQL) Checkpoint(context.Context, ClusterAddr) error { f.rec("checkpoint"); return nil }
+func (f *fakeSQL) AlterSystem(_ context.Context, a ClusterAddr, name, value string) error {
+	f.rec(fmt.Sprintf("alter-system %s=%q on %d", name, value, a.Port))
+	return nil
+}
 
 // roundTripper answers every request with a status.
 type roundTripper func(*http.Request) (*http.Response, error)
@@ -878,4 +882,18 @@ func (p pidSup) Status(ctx context.Context, u string) (units.Status, error) {
 	st, err := p.replicaSup.Status(ctx, u)
 	st.MainPID = p.pid
 	return st, err
+}
+
+func TestSetWALKeepSizeAltersTheCanonicalCluster(t *testing.T) {
+	f := newReplicaFixture(t)
+	if err := f.pl.SetWALKeepSize(context.Background(), f.t.Project, "2GB"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.pl.SetWALKeepSize(context.Background(), f.t.Project, ""); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("alter-system wal_keep_size=\"2GB\" on %d,alter-system wal_keep_size=\"\" on %d", f.cp.Port, f.cp.Port)
+	if got := f.sql.calls(); got != want {
+		t.Fatalf("calls = %s\nwant    %s", got, want)
+	}
 }

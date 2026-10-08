@@ -49,6 +49,8 @@ type ClusterSQL interface {
 	Promote(ctx context.Context, a ClusterAddr, wait time.Duration) error
 	// Checkpoint runs CHECKPOINT.
 	Checkpoint(ctx context.Context, a ClusterAddr) error
+	// AlterSystem sets a server setting with ALTER SYSTEM (reset when value is empty) and reloads.
+	AlterSystem(ctx context.Context, a ClusterAddr, name, value string) error
 }
 
 func (pl *PostgresPlane) sql() ClusterSQL {
@@ -154,5 +156,27 @@ func (pgSQL) Checkpoint(ctx context.Context, a ClusterAddr) error {
 	}
 	defer c.Close(context.Background())
 	_, err = c.Exec(ctx, `checkpoint`)
+	return err
+}
+
+func (pgSQL) AlterSystem(ctx context.Context, a ClusterAddr, name, value string) error {
+	c, err := connect(ctx, a.dsn())
+	if err != nil {
+		return err
+	}
+	defer c.Close(context.Background())
+	var stmt string
+	if value == "" {
+		err = c.QueryRow(ctx, `select format('alter system reset %I', $1::text)`, name).Scan(&stmt)
+	} else {
+		err = c.QueryRow(ctx, `select format('alter system set %I = %L', $1::text, $2::text)`, name, value).Scan(&stmt)
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := c.Exec(ctx, stmt); err != nil {
+		return fmt.Errorf("lifecycle: %s: %w", stmt, err)
+	}
+	_, err = c.Exec(ctx, `select pg_reload_conf()`)
 	return err
 }

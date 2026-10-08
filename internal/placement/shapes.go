@@ -45,6 +45,16 @@ func planeMethodName(goName string) peerapi.PlaneMethod {
 	return peerapi.PlaneMethod(b.String())
 }
 
+// planeFinalCheckpoint is a request on the plane path that is not a method of lifecycle.Plane: the
+// state and latest checkpoint of a stopped cluster (lifecycle.ReadControl), which a switchover reads
+// after the old primary's fast shutdown to learn the position the new primary must replay to.
+const planeFinalCheckpoint peerapi.PlaneMethod = "final_checkpoint"
+
+// CheckpointReader reads the control file of a project's cluster on its home node.
+type CheckpointReader interface {
+	FinalCheckpoint(ctx context.Context, ref string) (lifecycle.ControlInfo, error)
+}
+
 // planeCall is one method of lifecycle.Plane as the agent runs it on its local plane.
 type planeCall func(ctx context.Context, local lifecycle.Plane, ref string, args json.RawMessage) (any, error)
 

@@ -60,6 +60,9 @@ func (s *standbySQL) Promote(context.Context, lifecycle.ClusterAddr, time.Durati
 	return nil
 }
 func (s *standbySQL) Checkpoint(context.Context, lifecycle.ClusterAddr) error { return nil }
+func (s *standbySQL) AlterSystem(context.Context, lifecycle.ClusterAddr, string, string) error {
+	return nil
+}
 
 // What PromoteReplica writes into promote.ok is what the WAL relay of the backup package reads.
 func TestPromoteOKIsWhatTheBackupPackageParses(t *testing.T) {

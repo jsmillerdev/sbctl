@@ -44,6 +44,7 @@ type Router struct {
 var (
 	_ PlaneRouter         = (*Router)(nil)
 	_ lifecycle.FullPlane = (*Router)(nil)
+	_ CheckpointReader    = (*Router)(nil)
 )
 
 // NewRouter builds the router.
@@ -173,6 +174,23 @@ func (r *Router) Health(ctx context.Context, p *registry.Project, keys *secrets.
 		return []lifecycle.ServiceHealth{{Name: "placement", Status: "UNHEALTHY", Error: err.Error()}}
 	}
 	return pl.Health(ctx, p, keys)
+}
+
+// FinalCheckpoint implements CheckpointReader: the control file of ref's cluster, read on its home.
+func (r *Router) FinalCheckpoint(ctx context.Context, ref string) (lifecycle.ControlInfo, error) {
+	pl, err := r.For(ctx, ref)
+	if err != nil {
+		return lifecycle.ControlInfo{}, err
+	}
+	if cr, ok := pl.(CheckpointReader); ok {
+		return cr.FinalCheckpoint(ctx, ref)
+	}
+	if lr, ok := pl.(interface {
+		FinalCheckpoint(ref string) (lifecycle.ControlInfo, error)
+	}); ok {
+		return lr.FinalCheckpoint(ref)
+	}
+	return lifecycle.ControlInfo{}, fmt.Errorf("%w: the plane cannot read a control file", lifecycle.ErrNotSupported)
 }
 
 // local returns the node's own plane when p is homed here, and otherwise the error an optional

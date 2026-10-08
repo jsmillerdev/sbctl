@@ -26,6 +26,10 @@ holds the replica (replica design, sections 2.5 to 2.7 and 2.10).
   the project row and keys for `create`, `start`, `start_database`, `reconfigure`; the row for `health`;
   nothing for the rest. A seed (`DataSeeder`) is a function and does not travel (`ErrRemoteSeed`).
   `Health` has no error to return, so an unreachable node is every service unhealthy, with the cause.
+- `POST /peer/v1/projects/{ref}/plane/final_checkpoint` is not a method of `lifecycle.Plane`: it reads the
+  control file of a stopped cluster on its home (`lifecycle.ReadControl`, answered as `lifecycle.ControlInfo`),
+  which a switchover needs after the old primary's fast shutdown to learn the position the new primary
+  must replay to (`PromoteOptions.WaitLSN`). `Router` and `RemotePlane` implement `CheckpointReader`.
 - A test fails when `lifecycle.Plane` gains a method that lacks a `peerapi.PlaneMethod`, an entry in the
   agent's table (`planeCalls`) or a method on `RemotePlane`.
 

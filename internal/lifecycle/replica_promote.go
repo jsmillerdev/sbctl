@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // replicaPoll is how often the waits of PromoteReplica look at the standby. A variable so that
@@ -242,6 +243,16 @@ func (pl *PostgresPlane) DemoteToReplica(ctx context.Context, t ReplicaTarget) e
 	}
 	pl.log.Info("demoting the cluster to a replica", "ref", p.Ref, "replica", t.Identifier)
 	return pl.StartReplica(ctx, t)
+}
+
+// SetWALKeepSize makes the primary of p keep size of WAL for its standbys (wal_keep_size, for example
+// "2GB"; empty removes the setting) with ALTER SYSTEM and a reload. Standbys use no replication slots
+// (the archive covers any gap), so this is an option for a deployment whose standbys fall behind the
+// archive's reach; it is never part of the unit's arguments, which keeps a primary's units as they
+// were. The setting survives restarts in postgresql.auto.conf. A settings save through the
+// Management API does not touch it.
+func (pl *PostgresPlane) SetWALKeepSize(ctx context.Context, p *registry.Project, size string) error {
+	return pl.sql().AlterSystem(ctx, addrOf(pl.paths(p)), "wal_keep_size", size)
 }
 
 // primaryConninfo is the primary_conninfo of a standby that streams through the loopback port of the

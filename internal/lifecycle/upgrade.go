@@ -155,6 +155,9 @@ const (
 	BlockerNoBackup      = "no_backup_service"
 	BlockerSystem        = "system_project"
 	BlockerExtension     = "unsupported_extension"
+	// BlockerReplicas: the project has read replicas and the target is another Postgres major
+	// version, which a standby cannot follow. They are removed first.
+	BlockerReplicas = "has_replicas"
 )
 
 // UpgradeBlocker is one reason a project cannot be upgraded now.
@@ -323,6 +326,17 @@ func (e *Engine) plan(ctx context.Context, p *registry.Project, target map[strin
 		block(BlockerSystem, "the system project belongs to the node and is upgraded with it, not on its own")
 	case el.CurrentMajor != 0 && el.TargetMajor != 0 && el.CurrentMajor != el.TargetMajor:
 		block(BlockerNoUpgradePath, "the project runs Postgres %d and the target is Postgres %d; upgrades across major versions are not supported yet", el.CurrentMajor, el.TargetMajor)
+	}
+	// A standby follows its primary's WAL: another major version needs the replicas removed first, and a
+	// restart onto another release of the same major leaves each replica on the release its node runs
+	// until that node is upgraded too (any order works for a release that keeps the WAL format).
+	if rs, err := e.reg.ListReplicas(ctx, p.Ref); err == nil && len(rs) > 0 {
+		switch {
+		case el.CurrentMajor != 0 && el.TargetMajor != 0 && el.CurrentMajor != el.TargetMajor:
+			block(BlockerReplicas, "the project has %d read replica(s), which cannot follow a major version; remove them first", len(rs))
+		case el.PostgresRestart:
+			el.Notes = append(el.Notes, fmt.Sprintf("The project has %d read replica(s). Each keeps the PostgreSQL release its node runs until that node is upgraded (`supavise upgrade`).", len(rs)))
+		}
 	}
 	switch p.Status {
 	case registry.StatusActiveHealthy:

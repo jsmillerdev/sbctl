@@ -506,7 +506,13 @@ jobs:
   # base backup, streaming, PostgREST on the standby seeing DDL within the reload interval, a
   # switchover (promote and demote in place), pg_cron and pg_net idle on a standby.
   replica-blocks:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

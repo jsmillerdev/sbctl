@@ -25,6 +25,19 @@ type remoteEnv struct {
 	rpc    *muxRPC
 	remote *RemotePlane
 	agent  *recordingAgent
+	// checkpoints answers the final_checkpoint request.
+	checkpoints *fakeCheckpoints
+}
+
+type fakeCheckpoints struct {
+	info lifecycle.ControlInfo
+	err  error
+	refs []string
+}
+
+func (f *fakeCheckpoints) FinalCheckpoint(ref string) (lifecycle.ControlInfo, error) {
+	f.refs = append(f.refs, ref)
+	return f.info, f.err
 }
 
 func newRemoteEnv(t *testing.T, caller string, epoch int64) *remoteEnv {
@@ -38,11 +51,11 @@ func newRemoteEnv(t *testing.T, caller string, epoch int64) *remoteEnv {
 	if err := reg.SetProjectNode(ctx, testRef, "n2", 1); err != nil {
 		t.Fatal(err)
 	}
-	e := &remoteEnv{local: newFakeLocal(), reg: reg, agent: &recordingAgent{}}
+	e := &remoteEnv{local: newFakeLocal(), reg: reg, agent: &recordingAgent{}, checkpoints: &fakeCheckpoints{info: lifecycle.ControlInfo{State: "shut down", Checkpoint: "0/3000060"}}}
 	mux := mesh.NewMux()
 	Register(mux.Handle, HandlerDeps{
 		Agent: e.agent, Plane: e.local, Resolver: RegistryResolver{Reg: reg}, Members: members("n2", "n1", 5),
-		Backups: &fakeBackups{},
+		Backups: &fakeBackups{}, Checkpoints: e.checkpoints,
 	})
 	e.rpc = &muxRPC{mux: mux, caller: caller}
 	e.remote = &RemotePlane{Node: "n2", RPC: e.rpc, Epoch: func() int64 { return epoch }}
@@ -300,4 +313,57 @@ func TestRemotePlaneCoversEveryPlaneMethod(t *testing.T) {
 			t.Errorf("planeMethodName(%s) = %s, want %s", c.goName, planeMethodName(c.goName), c.m)
 		}
 	}
+}
+
+// The control file of a stopped cluster is read on its home, for the position a switchover waits for.
+func TestFinalCheckpointIsReadOnTheHome(t *testing.T) {
+	ctx := context.Background()
+	e := newRemoteEnv(t, "n1", 5)
+	ci, err := e.remote.FinalCheckpoint(ctx, testRef)
+	if err != nil || ci.State != "shut down" || ci.Checkpoint != "0/3000060" || !ci.ShutDown() {
+		t.Fatalf("FinalCheckpoint = %+v, %v", ci, err)
+	}
+	if len(e.checkpoints.refs) != 1 || e.checkpoints.refs[0] != testRef || len(e.local.calls) != 0 {
+		t.Fatalf("refs %v, plane calls %v", e.checkpoints.refs, e.local.calls)
+	}
+	if !strings.Contains(e.rpc.callLog(), "/plane/final_checkpoint") {
+		t.Fatalf("calls:\n%s", e.rpc.callLog())
+	}
+	// A cluster that cannot be read says why.
+	e.checkpoints.err = fmt.Errorf("open pg_control: %w", registry.ErrNotFound)
+	if _, err := e.remote.FinalCheckpoint(ctx, testRef); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("unreadable: %v", err)
+	}
+	// The router reads it where the project is homed: here through the local plane, elsewhere over the wire.
+	r := newRouterEnv(t)
+	local := &localWithCheckpoint{fakeLocal: r.local}
+	r.r.opts.Local = local
+	if ci, err := r.r.FinalCheckpoint(ctx, r.a); err != nil || ci.Checkpoint != "0/28" {
+		t.Fatalf("local: %+v %v", ci, err)
+	}
+	if _, err := r.r.FinalCheckpoint(ctx, r.b); err != nil || len(r.rpc.calls) != 1 || !strings.HasSuffix(r.rpc.calls[0], "/plane/final_checkpoint") {
+		t.Fatalf("remote: %v %v", err, r.rpc.calls)
+	}
+	if _, err := r.r.FinalCheckpoint(ctx, "zzzzzzzzzzzzzzzzzzzz"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("unknown project: %v", err)
+	}
+	// A plane that cannot read one is not supported.
+	r.r.opts.Local = r.local
+	if _, err := r.r.FinalCheckpoint(ctx, r.a); !errors.Is(err, lifecycle.ErrNotSupported) {
+		t.Fatalf("a plane without a reader: %v", err)
+	}
+	// A node with no reader answers that it has no such capability.
+	e2 := newRemoteEnv(t, "n1", 5)
+	e2.rpc.mux = mesh.NewMux()
+	Register(e2.rpc.mux.Handle, HandlerDeps{Agent: e2.agent, Plane: e2.local, Resolver: RegistryResolver{Reg: e2.reg}, Members: members("n2", "n1", 5)})
+	if _, err := e2.remote.FinalCheckpoint(ctx, testRef); !errors.Is(err, lifecycle.ErrNoSnapshot) {
+		t.Fatalf("no reader: %v", err)
+	}
+}
+
+// localWithCheckpoint is a local plane that can read a control file.
+type localWithCheckpoint struct{ *fakeLocal }
+
+func (localWithCheckpoint) FinalCheckpoint(string) (lifecycle.ControlInfo, error) {
+	return lifecycle.ControlInfo{State: "shut down", Checkpoint: "0/28"}, nil
 }

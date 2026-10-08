@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -398,5 +399,61 @@ func TestAdmitReplica(t *testing.T) {
 	c.e.freeBytes = func(string) int64 { return -1 }
 	if err := c.e.AdmitReplica(ctx, c.home1, id, 10*gib); err != nil {
 		t.Fatalf("an unreadable disk is not a refusal: %v", err)
+	}
+}
+
+// A project with replicas: a Postgres release of the same major version restarts the primary and
+// tells the owner the replicas follow their nodes' releases; another major version is refused.
+func TestUpgradeOfAProjectWithReplicas(t *testing.T) {
+	ctx := context.Background()
+	h := newUpHarness(t)
+	mustNode := func(name string) *registry.Node {
+		n := &registry.Node{Name: name, State: registry.NodeActive}
+		if err := h.reg.CreateNode(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	n2 := mustNode("second")
+	rid := registry.ReplicaIdentifier(h.ref, "us-east-1", "abc123")
+	if err := h.reg.CreateReplica(ctx, &registry.Replica{Identifier: rid, Ref: h.ref, NodeID: n2.ID}); err != nil {
+		t.Fatal(err)
+	}
+	h.arts.pin(config.SvcPostgres, "postgres-17.2.0-r1")
+	el, err := h.e.UpgradeEligibility(ctx, h.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var note string
+	for _, n := range el.Notes {
+		if strings.Contains(n, "read replica") {
+			note = n
+		}
+	}
+	if !el.Eligible || !el.PostgresRestart || note == "" {
+		t.Fatalf("same major: eligible %v, notes %v, blockers %+v", el.Eligible, el.Notes, el.Blockers)
+	}
+	// Only GoTrue and PostgREST move: the replicas are not mentioned.
+	h2 := newUpHarness(t)
+	if err := h2.reg.CreateNode(ctx, &registry.Node{Name: "second", State: registry.NodeActive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.reg.CreateReplica(ctx, &registry.Replica{Identifier: registry.ReplicaIdentifier(h2.ref, "us-east-1", "abc123"), Ref: h2.ref, NodeID: "n2"}); err != nil {
+		t.Fatal(err)
+	}
+	if el, _ := h2.e.UpgradeEligibility(ctx, h2.ref); !el.Eligible || strings.Contains(strings.Join(el.Notes, " "), "replica") {
+		t.Fatalf("API-only upgrade: %+v", el)
+	}
+	// Another major version needs the replicas removed first (and is not offered at all yet).
+	h.arts.pin(config.SvcPostgres, "postgres-18.0.0-r1")
+	el, _ = h.e.UpgradeEligibility(ctx, h.ref)
+	found := false
+	for _, b := range el.Blockers {
+		if b.Type == BlockerReplicas {
+			found = true
+		}
+	}
+	if el.Eligible || !found {
+		t.Fatalf("major version: eligible %v, blockers %+v", el.Eligible, el.Blockers)
 	}
 }
