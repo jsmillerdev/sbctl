@@ -227,9 +227,11 @@ func (r reservation) release(s *state) {
 
 // exemptFromCap reports whether ev is sent even when the hourly cap is reached. update_available
 // is one message per version and the checker records the version as told once it is sent, so a
-// held-back notice would never come again.
+// held-back notice would never come again. The failover_* events are one-shot like the upgrade
+// ones: each says what a move that cannot be repeated just did, and a burst of conditions
+// must not swallow the message that a failover started, finished or stopped.
 func exemptFromCap(ev Event) bool {
-	return ev.Severity == SeverityCritical || strings.HasPrefix(ev.Kind, "upgrade_") || ev.Kind == KindUpdateAvailable
+	return ev.Severity == SeverityCritical || strings.HasPrefix(ev.Kind, "upgrade_") || strings.HasPrefix(ev.Kind, "failover_") || ev.Kind == KindUpdateAvailable
 }
 
 // worthLogging reports whether ev is news for the log. The checker offers every standing

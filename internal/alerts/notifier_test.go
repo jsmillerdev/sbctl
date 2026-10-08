@@ -801,6 +801,42 @@ func TestHourlyCapDoesNotHoldBackCriticalAlertsOrTheUpgradesOwnEvents(t *testing
 	}
 }
 
+// The failover_* kinds are announcements like the upgrade ones: one that starts, finishes or
+// stops a move is sent even when the cap is reached, at any severity, and every time.
+func TestHourlyCapDoesNotHoldBackTheFailoverAnnouncements(t *testing.T) {
+	s := newSink(t)
+	cfg := testCfg(t, config.AlertWebhook{URL: s.srv.URL})
+	cfg.Alerts.MaxPerHour = 2
+	n := New(cfg, Options{Now: newClock().now})
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		_ = n.Notify(ctx, Event{Kind: KindBackupFailed, Ref: fmt.Sprint("p", i), Title: "t"})
+	}
+	_ = n.Notify(ctx, Event{Kind: KindBackupFailed, Ref: "p3", Title: "t"}) // held
+	if s.count() != 2 {
+		t.Fatalf("%d sent under a cap of 2", s.count())
+	}
+	for _, ev := range []Event{
+		{Kind: KindFailoverStarted, Severity: SeverityInfo, Title: "Server failover started"},
+		{Kind: KindFailoverCompleted, Severity: SeverityInfo, Title: "Server failover completed"},
+		{Kind: KindFailoverFailed, Severity: SeverityWarning, Title: "Project switchover aborted"},
+		{Kind: KindFailoverFailed, Severity: SeverityWarning, Title: "Project switchover aborted"}, // a second one is news too
+		{Kind: KindFenced, Severity: SeverityCritical, Title: "This node was fenced"},
+	} {
+		if err := n.Notify(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.count() != 7 {
+		t.Errorf("%d sent, want 7: a failover_* announcement was held back by the cap", s.count())
+	}
+	// A condition of the cluster work is not an announcement: the cap still holds it.
+	_ = n.Notify(ctx, Event{Kind: KindReplicaLag, Ref: "p4", Title: "lag"})
+	if s.count() != 7 {
+		t.Errorf("%d sent: replica_lag went past the cap", s.count())
+	}
+}
+
 func TestForgetDropsAnActiveAlertWithoutSendingAnything(t *testing.T) {
 	s := newSink(t)
 	cfg := testCfg(t, config.AlertWebhook{URL: s.srv.URL})
