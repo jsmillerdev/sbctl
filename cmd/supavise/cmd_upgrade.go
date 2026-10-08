@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/nodeupgrade"
 	"github.com/jsmillerdev/supavise/internal/selfupdate"
 	"github.com/jsmillerdev/supavise/internal/update"
@@ -21,6 +23,24 @@ import (
 // refusal (exit status 2): the contract has no other status for a command that changed nothing.
 func refusedBefore(err error) error {
 	return &nodeupgrade.Failure{Code: nodeupgrade.ExitRefused, Err: err}
+}
+
+// upgradeOptions are the options of `supavise upgrade`: the flags, the [upgrade] settings, and the
+// hook that turns the run's events into alerts (upgradeNotifier). It is a function of its own so that
+// a test can see the hook is there: a run without it raises no alert and says nothing about it.
+func upgradeOptions(cfg *config.Config, out io.Writer, version string, check, plan, yes, unattended, includePostgres bool) nodeupgrade.Options {
+	log := newLogger(cfg)
+	return nodeupgrade.Options{
+		Version: version, Check: check, Plan: plan, Yes: yes || unattended, Unattended: unattended, IncludePostgres: includePostgres,
+		Canary: cfg.Upgrade.Canary(), Batch: cfg.Upgrade.Batch(), Keep: cfg.Upgrade.Keep(),
+		Out: out, Log: log, Notify: upgradeNotifier(cfg, log),
+	}
+}
+
+// rollbackOptions are the options of `supavise rollback`.
+func rollbackOptions(cfg *config.Config, out io.Writer, yes bool) nodeupgrade.Options {
+	log := newLogger(cfg)
+	return nodeupgrade.Options{Yes: yes, Out: out, Log: log, Notify: upgradeNotifier(cfg, log)}
 }
 
 func init() {
@@ -107,11 +127,7 @@ rolled back; 4 failed and the node needs the operator. While it runs, the state 
 				signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 				defer signal.Reset(syscall.SIGHUP, syscall.SIGPIPE)
 			}
-			return nodeupgrade.Run(cmd.Context(), h, nodeupgrade.Options{
-				Version: target, Check: check, Plan: plan, Yes: yes || unattended, Unattended: unattended, IncludePostgres: includePostgres,
-				Canary: cfg.Upgrade.Canary(), Batch: cfg.Upgrade.Batch(), Keep: cfg.Upgrade.Keep(),
-				Out: cmd.OutOrStdout(), Log: newLogger(cfg),
-			})
+			return nodeupgrade.Run(cmd.Context(), h, upgradeOptions(cfg, cmd.OutOrStdout(), target, check, plan, yes, unattended, includePostgres))
 		},
 	}
 	f := cmd.Flags()
@@ -169,7 +185,7 @@ status 4. Needs root.`,
 			defer unlock()
 			signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 			defer signal.Reset(syscall.SIGHUP, syscall.SIGPIPE)
-			return nodeupgrade.Rollback(cmd.Context(), h, nodeupgrade.Options{Yes: rollYes, Out: cmd.OutOrStdout(), Log: newLogger(cfg), Notify: upgradeNotifier(cfg, newLogger(cfg))})
+			return nodeupgrade.Rollback(cmd.Context(), h, rollbackOptions(cfg, cmd.OutOrStdout(), rollYes))
 		},
 	}
 	roll.Flags().BoolVar(&rollYes, "yes", false, "do not ask for confirmation")

@@ -210,3 +210,25 @@ func TestHaltTeeFindsTheProjectTheRolloutStoppedAt(t *testing.T) {
 		})
 	}
 }
+
+// The commands hand their events to the alerts: a run whose options lack the hook raises nothing.
+func TestUpgradeAndRollbackOptionsCarryTheAlertHook(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	var out bytes.Buffer
+	up := upgradeOptions(cfg, &out, "v1.4.0", false, false, false, true, false)
+	if up.Notify == nil || !up.Yes || !up.Unattended || up.Version != "v1.4.0" || up.Keep != cfg.Upgrade.Keep() {
+		t.Errorf("upgrade options = %+v", up)
+	}
+	if rb := rollbackOptions(cfg, &out, true); rb.Notify == nil || !rb.Yes {
+		t.Errorf("rollback options = %+v", rb)
+	}
+	// And the hook reaches the webhook through the real Run: a refused run raises nothing, one that changes the node does.
+	w := newWebhook(t)
+	cfg = alertCfg(t, w.srv.URL)
+	opts := upgradeOptions(cfg, &out, "", false, false, true, false, false)
+	opts.Notify(context.Background(), nodeupgrade.Event{Kind: nodeupgrade.EventStarted, From: "v1", To: "v2"})
+	if got := w.kinds(); got != "upgrade_started/info" {
+		t.Errorf("sent %q", got)
+	}
+}
