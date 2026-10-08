@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"io"
 	"net/http"
@@ -14,8 +16,10 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/secrets"
 )
 
 // guardFixture is a relay guard on a node (n2, named "second") whose registry holds a project homed on
@@ -86,6 +90,60 @@ func TestRelayGuardKnowsAReplicaFromTheRegistry(t *testing.T) {
 	}
 	if e, err := g.epoch(ctx); err != nil || e != 1 {
 		t.Fatalf("epoch = %d, %v", e, err)
+	}
+}
+
+// The node is found by the id in its certificate: a node that joined under a name other than the one the
+// config gives now (`node token --name`, a renamed host) still archives for the projects it is home to and
+// is still known as the holder of the replicas it has. Looking it up by name would answer an error, which
+// the push guard turns into a 503 for every project's WAL.
+func TestRelayGuardFindsTheNodeByItsCertificateNotItsName(t *testing.T) {
+	g, reg, ref := guardFixture(t, true)
+	ctx := context.Background()
+	g.cfg.Node.Name = "renamed-host"
+	if _, err := reg.GetNodeByName(ctx, g.cfg.NodeName()); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("the registry knows %q: %v", g.cfg.NodeName(), err)
+	}
+	// Without a readable certificate there is nothing but the name, and the guard says so.
+	if _, err := g.replica(ctx, ref); err == nil || !strings.Contains(err.Error(), "renamed-host") {
+		t.Fatalf("an unreadable certificate and an unknown name: %v", err)
+	}
+	// With the certificate of n2 the name does not matter.
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	sec, err := secrets.New(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := cluster.NewCA(sec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, err := reg.GetNodeByName(ctx, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	issued, err := ca.Issue(pub, n2.ID, time.Now(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(g.clusterDir, config.NodeCertFile), issued.PEM(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := g.replica(ctx, ref); rep || err != nil {
+		t.Fatalf("no row yet: %v, %v", rep, err)
+	}
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: registry.ReplicaIdentifier(ref, "us-east-1", "abc123"), Ref: ref, NodeID: n2.ID, Status: "ACTIVE_HEALTHY"}); err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := g.replica(ctx, ref); !rep || err != nil {
+		t.Fatalf("a replica row of the node the certificate names: %v, %v", rep, err)
 	}
 }
 

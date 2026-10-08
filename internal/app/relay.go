@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +16,7 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -171,7 +174,10 @@ func (g *relayGuard) replica(ctx context.Context, ref string) (bool, error) {
 	return false, nil
 }
 
-// selfID is this node's id in the registry, found by name and kept.
+// selfID is this node's id, kept. The node certificate in the cluster directory names it from the day
+// the node joined, whatever the node is called now (`node token --name`, a renamed host); only a
+// certificate that cannot be read sends the guard to the registry's node named [node] name, which is
+// how lifecycle.SelfNode finds it.
 func (g *relayGuard) selfID(ctx context.Context, reg registry.Registry) (string, error) {
 	g.mu.Lock()
 	id := g.self
@@ -179,17 +185,39 @@ func (g *relayGuard) selfID(ctx context.Context, reg registry.Registry) (string,
 	if id != "" {
 		return id, nil
 	}
-	n, err := reg.GetNodeByName(ctx, g.cfg.NodeName())
-	if err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return "", fmt.Errorf("this node (%q) is not in the cluster registry", g.cfg.NodeName())
+	if id = g.certNodeID(); id == "" {
+		n, err := reg.GetNodeByName(ctx, g.cfg.NodeName())
+		if err != nil {
+			if errors.Is(err, registry.ErrNotFound) {
+				return "", fmt.Errorf("this node (%q) is not in the cluster registry", g.cfg.NodeName())
+			}
+			return "", err
 		}
-		return "", err
+		id = n.ID
 	}
 	g.mu.Lock()
-	g.self = n.ID
+	g.self = id
 	g.mu.Unlock()
-	return n.ID, nil
+	return id, nil
+}
+
+// certNodeID is the node id in the node certificate (supavise://node/<id>), or "" when the file cannot
+// be read. Only the certificate is read: a command-line process may not be able to read the key.
+func (g *relayGuard) certNodeID() string {
+	b, err := os.ReadFile(filepath.Join(g.clusterDir, config.NodeCertFile))
+	if err != nil {
+		return ""
+	}
+	blk, _ := pem.Decode(b)
+	if blk == nil {
+		return ""
+	}
+	leaf, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		return ""
+	}
+	id, _ := mesh.NodeIDOf(leaf)
+	return id
 }
 
 // epoch is the cluster's epoch; a promote.ok for a lower one does not authorize a push.
