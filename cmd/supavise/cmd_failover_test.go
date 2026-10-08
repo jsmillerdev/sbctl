@@ -208,6 +208,26 @@ func TestFailoverFollowsTheMoveAcrossTheRestartOfTheDaemon(t *testing.T) {
 			}
 		})
 	}
+	t.Run("the steps the lost run printed are not printed again", func(t *testing.T) {
+		// The daemon that starts sends the log from its first step.
+		f := &fakeFailover{plan: goodPlan(), runErr: failover.ErrStreamClosed,
+			steps:       []registry.MoveStep{{Name: "begin", At: at}, {Name: "marker", At: at, Detail: "epoch 2"}, {Name: "promote-system", At: at, Detail: "primary on standby"}},
+			followSteps: []registry.MoveStep{{Name: "begin", At: at}, {Name: "marker", At: at, Detail: "epoch 2"}, {Name: "promote-system", At: at, Detail: "primary on standby"}, {Name: "leader", At: at, Detail: "standby leads at epoch 2"}},
+			followMove:  doneMove()}
+		withFailover(t, f)
+		out, err := run(t, "failover", "--yes")
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		for _, name := range []string{"marker: epoch 2", "promote-system: primary on standby"} {
+			if n := strings.Count(out, name); n != 1 {
+				t.Errorf("%q printed %d times in\n%s", name, n, out)
+			}
+		}
+		if !strings.Contains(out, "leader: standby leads at epoch 2") {
+			t.Errorf("the step the daemon that starts recorded is missing in\n%s", out)
+		}
+	})
 	t.Run("the move fails after the restart", func(t *testing.T) {
 		mv := doneMove()
 		mv.State = registry.MoveFailed

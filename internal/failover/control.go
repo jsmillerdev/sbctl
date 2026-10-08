@@ -508,33 +508,53 @@ var (
 	// followIdleGrace is how long a daemon that answers and shows no move is waited for: the move of a
 	// daemon that has just started is written to its log within moments.
 	followIdleGrace = 10 * time.Second
+	// followStall is how long Follow waits for a move that is running and records no step. A move that
+	// nothing continues stays running in its log; a command that waited for it would never end.
+	followStall = 30 * time.Minute
 )
 
 // Follow shows a server move of epoch after the connection that ran it was cut by the daemon's
 // restart in its new role: it calls onStep for each step the daemon that starts records (the node that
-// leads now continues the move; a node that follows it reads the log from the registry) and returns
-// the move when it ends, or an error when it failed. It waits for the daemon to answer first.
+// leads now continues the move; a node that follows it reads the log from the registry, or asks the
+// leader) and returns the move when it ends, or an error when it failed. It waits for the daemon to
+// answer first, and again when the daemon is up and cannot read the log yet. It reports every step the
+// daemon has: the caller that printed some from the run it lost leaves those out.
 // ErrNothingRunning when the daemon has no move to show.
 func (c Client) Follow(ctx context.Context, epoch int64, onStep func(registry.MoveStep)) (*registry.Move, error) {
-	from, deadline := 0, time.Now().Add(followPatience)
+	from := 0
 	var lastErr error
-	var idleSince time.Time
+	var idleSince, failingSince time.Time
+	progress := time.Now()
 	for {
 		var st ServerStatus
 		err := c.call(ctx, http.MethodGet, "/v1/follow?from="+strconv.Itoa(from)+"&epoch="+strconv.FormatInt(epoch, 10), nil, &st)
+		if err == nil && st.State == stateUnknown {
+			// The daemon is up and cannot read the log of the move (the registry copy of a follower that has
+			// just started): that is no answer, and not the absence of a move.
+			err = fmt.Errorf("the daemon cannot read the log of the move yet: %s", st.Error)
+		}
 		switch {
 		case ctx.Err() != nil:
 			return nil, ctx.Err()
 		case err != nil:
 			lastErr = err
-			if time.Now().After(deadline) {
+			if failingSince.IsZero() {
+				failingSince = time.Now()
+			}
+			if time.Since(failingSince) > followPatience {
 				return nil, fmt.Errorf("failover: the daemon did not answer again within %s: %w", followPatience, lastErr)
 			}
 		default:
+			if !failingSince.IsZero() { // the daemon is back: the move is looked at afresh
+				failingSince, progress = time.Time{}, time.Now()
+			}
 			for _, s := range st.Steps {
 				if onStep != nil {
 					onStep(registry.MoveStep{Name: s.Name, At: s.At, Detail: s.Detail})
 				}
+			}
+			if len(st.Steps) > 0 {
+				progress = time.Now()
 			}
 			from = st.Next
 			if st.State != "idle" {
@@ -553,6 +573,10 @@ func (c Client) Follow(ctx context.Context, epoch int64, onStep func(registry.Mo
 				}
 				if time.Since(idleSince) > followIdleGrace {
 					return nil, ErrNothingRunning
+				}
+			default:
+				if time.Since(progress) > followStall {
+					return nil, fmt.Errorf("failover: the move is running and has recorded no step for %s, so it may have stopped. This command stops waiting for it: supavise status shows where the cluster leads, and supavise failover --resume on the node it goes to continues a move that stopped", followStall)
 				}
 			}
 		}

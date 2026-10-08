@@ -408,3 +408,63 @@ func TestFollowOfAServiceThatKeepsNoRunIsIdle(t *testing.T) {
 		t.Fatalf("error: %v", err)
 	}
 }
+
+// A daemon that is up and cannot read the log of the move yet is waited for like one that is down, and
+// is not taken for a daemon that has no move. A move that is running and records nothing is not waited
+// for for ever, and the time the daemon was away does not count against the move.
+func TestFollowWaitsForALogThatCannotBeReadAndStopsWaitingForAMoveThatRecordsNothing(t *testing.T) {
+	followPollWas, followPatienceWas, followIdleWas, followStallWas := followPoll, followPatience, followIdleGrace, followStall
+	followPoll, followPatience, followIdleGrace = 5*time.Millisecond, 5*time.Second, 0
+	defer func() {
+		followPoll, followPatience, followIdleGrace, followStall = followPollWas, followPatienceWas, followIdleWas, followStallWas
+	}()
+	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	done := ServerStatus{State: "done", Next: 1, Steps: []stepJSON{{Name: "dns", At: at}}, Move: &moveJSON{ID: 5, Scope: "server", Kind: "switchover", From: "n1", To: "n2", Epoch: 2, State: "done"}}
+
+	t.Run("an unreadable log, then the move", func(t *testing.T) {
+		// With no grace for a daemon that shows no move, an unknown log taken for an idle daemon would end the wait.
+		svc := &followingService{fakeService: &fakeService{}, answers: []ServerStatus{
+			{State: stateUnknown, Error: "the registry copy is not readable"}, {State: stateUnknown}, done,
+		}}
+		c, _ := rigFor(t, svc)
+		mv, err := c.Follow(context.Background(), 2, nil)
+		if err != nil || mv == nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+	})
+	t.Run("a log that stays unreadable", func(t *testing.T) {
+		followPatience = 80 * time.Millisecond
+		defer func() { followPatience = 5 * time.Second }()
+		svc := &followingService{fakeService: &fakeService{}, answers: []ServerStatus{{State: stateUnknown, Error: "the registry copy is not readable"}}}
+		c, _ := rigFor(t, svc)
+		_, err := c.Follow(context.Background(), 2, nil)
+		if err == nil || !strings.Contains(err.Error(), "did not answer again") || !strings.Contains(err.Error(), "cannot read the log") || errors.Is(err, ErrNothingRunning) {
+			t.Fatalf("error: %v", err)
+		}
+	})
+	t.Run("a move that records nothing", func(t *testing.T) {
+		followStall = 60 * time.Millisecond
+		svc := &followingService{fakeService: &fakeService{}, answers: []ServerStatus{{State: "running", Next: 1, Steps: []stepJSON{{Name: "leader", At: at}}}, {State: "running", Next: 1}}}
+		c, _ := rigFor(t, svc)
+		var seen []string
+		_, err := c.Follow(context.Background(), 2, func(s registry.MoveStep) { seen = append(seen, s.Name) })
+		if err == nil || !strings.Contains(err.Error(), "no step") || !strings.Contains(err.Error(), "--resume") || len(seen) != 1 {
+			t.Fatalf("error %v, steps %v", err, seen)
+		}
+	})
+	t.Run("a daemon that was away for longer than the stall is not a stalled move", func(t *testing.T) {
+		followStall = 150 * time.Millisecond
+		defer func() { followStall = time.Hour }()
+		svc := &followingService{fakeService: &fakeService{}, answers: []ServerStatus{{State: stateUnknown}}}
+		c, _ := rigFor(t, svc)
+		go func() { // the log becomes readable after the stall has passed
+			time.Sleep(250 * time.Millisecond)
+			svc.mu.Lock()
+			svc.answers = []ServerStatus{{State: "running", Next: 1}, done}
+			svc.mu.Unlock()
+		}()
+		if mv, err := c.Follow(context.Background(), 2, nil); err != nil || mv == nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+	})
+}

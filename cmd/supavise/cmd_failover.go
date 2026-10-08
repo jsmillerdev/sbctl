@@ -60,7 +60,7 @@ when its own system cluster becomes a standby.`,
 	}
 	f := cmd.Flags()
 	f.StringVar(&o.To, "to", "", "the node to promote (default: this one)")
-	f.BoolVar(&o.Force, "force", false, "go on although a precondition that is not marked hard fails: a replica that lags or is not healthy, nodes on different releases")
+	f.BoolVar(&o.Force, "force", false, "go on although a precondition that is not marked hard fails: a replica that lags or is not healthy, nodes on different releases, an unreachable epoch-marker store")
 	f.BoolVar(&o.DryRun, "dry-run", false, "print the preconditions and what would happen, and change nothing")
 	f.BoolVar(&o.Resume, "resume", false, "continue the run that stopped")
 	f.BoolVar(&o.Abort, "abort", false, "discard the run that stopped before the leader marker was written, and start the old leader again if it was stopped for a switchover")
@@ -110,19 +110,21 @@ func runServerFailover(cmd *cobra.Command, o failover.ServerOptions) error {
 	if !o.Resume { // the daemon refuses to run a plan other than the one that was shown
 		o.ExpectKind, o.ExpectEpoch = plan.Kind, plan.Epoch
 	}
-	mv, err := c.RunServer(ctx, o, stepPrinter(out))
+	show := printOnce(stepPrinter(out))
+	mv, err := c.RunServer(ctx, o, show)
 	if errors.Is(err, failover.ErrRestarting) || errors.Is(err, failover.ErrStreamClosed) {
-		mv, err = followRestart(ctx, out, c, plan.Epoch, mv)
+		mv, err = followRestart(ctx, out, c, plan.Epoch, mv, show)
 	}
 	return finishMove(out, mv, err)
 }
 
 // followRestart goes on with a server move whose connection the daemon's restart cut: the daemon that
 // starts continues the move (the node that leads now) or has the log from the leader (a node that
-// follows now), and the steps it records are printed from where they stopped.
-func followRestart(ctx context.Context, out io.Writer, c failoverClient, epoch int64, mv *registry.Move) (*registry.Move, error) {
+// follows now), and the steps it records are printed from where they stopped: the daemon sends the log
+// from its start, and what the lost run printed is not printed again (show).
+func followRestart(ctx context.Context, out io.Writer, c failoverClient, epoch int64, mv *registry.Move, show func(registry.MoveStep)) (*registry.Move, error) {
 	fmt.Fprintln(out, "\nThe daemon of this node restarts in the role the move gives it. Waiting for it, and following the move from there.")
-	next, err := c.Follow(ctx, epoch, stepPrinter(out))
+	next, err := c.Follow(ctx, epoch, show)
 	switch {
 	case errors.Is(err, failover.ErrNothingRunning):
 		return mv, errors.New("the daemon restarted and has no record of this move. The move goes on where the cluster leads: supavise status shows the leader and the cluster, and supavise failover --resume on the node it goes to continues a move that stopped")
@@ -254,6 +256,18 @@ func stepPrinter(w io.Writer) func(registry.MoveStep) {
 			line += ": " + detail
 		}
 		fmt.Fprintln(w, line)
+	}
+}
+
+// printOnce passes on the first step of each name. The steps of one move have names of their own, and
+// a step the stream printed comes again from the log when the CLI follows the move.
+func printOnce(show func(registry.MoveStep)) func(registry.MoveStep) {
+	seen := map[string]bool{}
+	return func(s registry.MoveStep) {
+		if !seen[s.Name] {
+			seen[s.Name] = true
+			show(s)
+		}
 	}
 }
 
