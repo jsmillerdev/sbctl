@@ -246,9 +246,14 @@ func TestAutoModeStaysOffWhenTheSurvivorCannotTakeTheAddressOver(t *testing.T) {
 	if k := m.alertKinds(); len(k) != 1 || k[0] != alerts.KindFailoverAutoOff {
 		t.Fatalf("alerts: %v", k)
 	}
+	// The monitor looks every few seconds; EC2 is asked about the survivor once a minute.
+	m.mon.Tick(m.ctx)
+	m.mon.Tick(m.ctx)
+	if n := m.world.count("provider.probetakeover"); n != 1 {
+		t.Fatalf("the survivor's address was probed %d times in a minute", n)
+	}
 	m.advance(2 * time.Minute)
 	m.world.clearFailures()
-	m.o.probes = probeCache{}
 	if d := m.mon.Tick(m.ctx); strings.Contains(d.Reason, "automatic failover is off") {
 		t.Fatalf("the mode did not come back: %+v", d)
 	}

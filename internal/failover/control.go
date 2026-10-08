@@ -380,6 +380,8 @@ func (c Client) http() *http.Client {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", c.Path)
 		},
+		// A client is made for each call, and Follow makes many: none keeps a connection open.
+		DisableKeepAlives: true,
 	}}
 }
 

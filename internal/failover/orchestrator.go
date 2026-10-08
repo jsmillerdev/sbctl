@@ -87,7 +87,8 @@ type Orchestrator struct {
 	delegMu sync.Mutex
 	deleg   *delegated
 
-	probes probeCache
+	probes    probeCache
+	takeovers probeCache
 	// off is why the automatic mode is not running, "" while it is or was not asked for.
 	offMu sync.Mutex
 	off   string

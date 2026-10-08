@@ -22,22 +22,32 @@ type probeCache struct {
 	err error
 }
 
-// probe runs the provider's probe, at most once per probeTTL.
-func (o *Orchestrator) probe(ctx context.Context) error {
-	c := &o.probes
+// run calls fn, at most once per probeTTL, and remembers its answer.
+func (c *probeCache) run(ctx context.Context, now func() time.Time, fn func(context.Context) error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.at.IsZero() && o.d.Now().Sub(c.at) < probeTTL {
+	if !c.at.IsZero() && now().Sub(c.at) < probeTTL {
 		return c.err
 	}
-	err := o.d.Provider.Probe(ctx)
+	err := fn(ctx)
 	if err != nil && ctx.Err() != nil {
 		// The caller gave up (an interrupted status, a request that timed out): that says nothing about
-		// the fencer, and the next caller must not read it for a minute as a probe that failed.
+		// the fencer, and the next caller must not be told for a minute that the probe failed.
 		return err
 	}
-	c.err, c.at = err, o.d.Now()
+	c.err, c.at = err, now()
 	return c.err
+}
+
+// probe runs the provider's probe, at most once per probeTTL.
+func (o *Orchestrator) probe(ctx context.Context) error {
+	return o.probes.run(ctx, o.d.Now, o.d.Provider.Probe)
+}
+
+// probeTakeover asks the provider whether this node can take the service address over, at most once
+// per probeTTL. Only the automatic mode asks: a failover by hand hands the address to the operator.
+func (o *Orchestrator) probeTakeover(ctx context.Context, ap AddressProber) error {
+	return o.takeovers.run(ctx, o.d.Now, ap.ProbeTakeover)
 }
 
 // Readiness reports whether a server failover would be accepted now, for the node that would

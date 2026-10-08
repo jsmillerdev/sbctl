@@ -139,7 +139,7 @@ func (m *Monitor) arm(ctx context.Context) string {
 	default:
 		err := o.probe(ctx)
 		if ap, ok := o.d.Provider.(AddressProber); ok && err == nil {
-			err = ap.ProbeTakeover(ctx)
+			err = o.probeTakeover(ctx, ap)
 		}
 		if err != nil {
 			if ctx.Err() != nil { // the daemon is stopping: that is no verdict on the fencer
