@@ -342,7 +342,7 @@ A server of a cluster may call `ec2:DescribeInstances`, the one read that the me
 
 ## Failover and failback
 
-Run `supavise failover` and `supavise projects failover <ref>` with `--dry-run` first. It prints every precondition with its verdict and changes nothing. [The reference](../docs/reference/replicas.md#failover) has the step lists, the failure matrix and the bounds on data loss.
+Run `supavise failover` and `supavise projects failover <ref>` with `--dry-run` first. Each prints every precondition with its verdict and changes nothing. [The reference](../docs/reference/replicas.md#failover) has the step lists, the failure matrix and the bounds on data loss.
 
 **Switchover** (the old primary is alive: nothing is lost).
 
@@ -351,7 +351,7 @@ sudo -u supavise supavise projects failover <ref> [--to NODE]   # on the leader:
 sudo -u supavise supavise failover [--to NODE]                  # on the node that takes over: the whole server
 ```
 
-A project move runs on the leader, shows `RESTARTING`, and the old primary becomes a replica in place. A server move quiesces the leader (maintenance, project clusters stopped eight at a time, then the system cluster), promotes the standby of the registry, takes the service address and moves each project four at a time. Each node's daemon restarts once when its system cluster changes role, so a server move shows a short restart at each node, and the CLI waits for it. A move that stopped continues with `--resume`. A failed server move that went no further than stopping the leader is discarded with `--abort`.
+A project move runs on the leader, shows `RESTARTING`, and the old primary becomes a replica in place. A server move quiesces the leader (maintenance, project clusters stopped eight at a time, then the system cluster), takes the service address, promotes the standby of the registry and moves each project four at a time. Each node's daemon restarts once when its system cluster changes role, so a server move shows a short restart at each node, and the CLI waits for it. A move that stopped continues with `--resume`. A failed server move that went no further than stopping the leader is discarded with `--abort`.
 
 **Failover** (the old primary is dead or silent: at most the replica's lag is lost). Run the same commands on a survivor. A project failover asks you to type the project's ref before it fences the old primary and sets its data aside (`--yes` skips the question). The old primary must be fenced before anything is promoted:
 
