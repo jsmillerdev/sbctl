@@ -36,12 +36,13 @@ The unpacked artifacts default to `~/.cache/sbctl/unpacked`, a path the test cod
 | Workflow | Jobs |
 |---|---|
 | `ci` | `test`, `cfn-lint`, `aws-deploy`, `actionlint`, `functions-main` |
-| `linux` | `systemd-smoke`, `backup-integration`, `pebble`, `fleet-smoke`, `settings-smoke`, `compute-smoke`, `backups-smoke`, `upgrade-smoke`, `upgrade-e2e`, `roles-smoke`, `sso-smoke`, `install-e2e`, `os-updates`, `functions-smoke`, `branching-xfs` (which also runs `branching-egress`) |
+| `linux` | `systemd-smoke`, `backup-integration`, `pebble`, `fleet-smoke`, `settings-smoke`, `compute-smoke`, `backups-smoke`, `upgrade-smoke`, `upgrade-e2e`, `roles-smoke`, `sso-smoke`, `install-e2e`, `os-updates`, `functions-smoke`, `branching-xfs` (which also runs `branching-egress`), `converge-e2e`, `firstboot-e2e`, `cluster-identity`, `replica-blocks`, `fleet-follower`, `storage-migrate` |
 | `conformance` | `suites`, `specdiff`, `bump-check` |
 | `studio` | `build` (runs `studio/build.sh`, then `studio/spike.sh`) |
 | `footprint` | manual; see [reference/footprint.md](reference/footprint.md) |
 | `bump-proposals` | nightly; opens one pull request per upstream release newer than its pin |
 | `release` | on a `v*` tag |
+| `replication-spike` | the two-node Incus harness of `tests/linux/multi` on both architectures |
 | `screenshots` | README screenshots |
 
 ## Conventions
@@ -56,10 +57,10 @@ Rules the code follows. A change that breaks one needs a reason in [design.md](d
 | Logs | journald; the unit name selects the log |
 | Units | templates `supavise-postgres@`, `supavise-gotrue@`, `supavise-postgrest@`; singletons `supavise-supavisor`, `-realtime`, `-storage`, `-pgmeta`, `-studio`, optional `-imgproxy` and `-edge-runtime`; all in `supavise.slice`, with `MemoryMax` and `CPUQuota` per project |
 | Ref | 20 lowercase ASCII letters; `system` is the reserved ref of the system project |
-| Ports | project services listen on loopback: Postgres `20000 + 3n`, GoTrue `20001 + 3n`, PostgREST `20002 + 3n` (`n` is the project's registry sequence). Public: Supavisor 5432 (session) and 6543 (transaction), the proxy on 80 and 443. Loopback: Realtime 4000, Storage 5000 (admin 5001), imgproxy 5002, Studio 3000, pgmeta 8080, edge-runtime 9000, system Postgres 5433, system GoTrue 9999, admin API 7000. All are set in `internal/config/layout.go` and changeable in `[ports]` |
-| Hostnames | project `<ref>.api.<domain>`, dashboard `studio.<domain>`, API `api.<domain>`, pooler `pooler.<domain>`; Realtime gets `Host: <ref>.realtime.internal`, Storage gets `x-forwarded-host: <ref>.api.<domain>`. Without a domain, `<ip>.sslip.io` is the base domain |
+| Ports | project services listen on loopback: Postgres `20000 + 3n`, GoTrue `20001 + 3n`, PostgREST `20002 + 3n` (`n` is the project's registry sequence). Public: Supavisor 5432 (session) and 6543 (transaction), the proxy on 80 and 443. Loopback: Realtime 4000, Storage 5000 (admin 5001), imgproxy 5002, Studio 3000, pgmeta 8080, edge-runtime 9000, system Postgres 5433, system GoTrue 9999, admin API 7000, the Storage credential endpoint 4010 (`[fleet] storage_credentials_port`). A replica of project `n` on a node that is not its home: Postgres `10000 + 3n`, PostgREST `10002 + 3n` (`[ports] replica_base`), and the standby of the system cluster on `10000`. Between the nodes of a cluster: TCP 7443 (`[node] peer_listen`). All are set in `internal/config/layout.go` and changeable in `[ports]` |
+| Hostnames | project `<ref>.api.<domain>`, replica `<ref>-rr-<region>-<id6>.api.<domain>`, load balancer `<ref>-lb.api.<domain>`, dashboard `studio.<domain>`, API `api.<domain>`, pooler `pooler.<domain>`; Realtime gets `Host: <ref>.realtime.internal`, Storage gets `x-forwarded-host: <ref>.api.<domain>`. Without a domain, `<ip>.sslip.io` is the base domain |
 | Keys | per project: a 40-character JWT secret, legacy `anon` and `service_role` JWTs, and `sb_publishable_<base58>` and `sb_secret_<base58>` keys that the proxy maps to the legacy JWTs. Personal access tokens are `sbp_` plus 40 lowercase hex characters |
-| Registry | database `supavise` in the system cluster, schema `supavise`. Migrations in `internal/registry/migrations` are embedded in the binary and applied in file-name order; number ranges per area are listed in `0001_init.sql` and continue in the later files |
+| Registry | database `supavise` in the system cluster, schema `supavise`. Migrations in `internal/registry/migrations` are embedded in the binary and applied in file-name order; number ranges per area are listed in `0001_init.sql` and continue in the later files. Migrations from 1300 on only add (create a table or index, add a column with a default), so a binary one minor behind runs against the newer schema; `migrations_lint_test.go` enforces it |
 | Versions | `internal/versions/versions.yaml` is the only pin source: `artifacts.<service>`, `studio.tag`, `cli.version_tested` |
 | API types | generated from the three Management API specs (`v1`, `v2`, `platform`) in `internal/api/gen/` with `go generate`; never hand-written. Refresh the specs with `internal/api/gen/fetch-specs.sh` |
 | Interfaces | `lifecycle.DataPlane` (`Create`, `Delete`, `Snapshot`, `Route`, `Usage`), `fleet.Tenant` (`EnsureTenant`, `RemoveTenant`), `units.Supervisor` (`Render`, `Start`, `Stop`, `Status`, `Remove`), `secrets.Secrets` (`Seal`, `Open`), `backup.Backup` (`PushWAL`, `FetchWAL`, `BaseBackup`, `Restore`) |
