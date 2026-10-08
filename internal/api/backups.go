@@ -80,11 +80,16 @@ func restorable(p *registry.Project) error {
 	return nil
 }
 
+// pitrEnabled is whether the node keeps what point-in-time recovery needs, which is the same for
+// every project: a backup service. The dashboard's project detail reports it as
+// is_physical_backups_enabled, the flag its Add read replica button waits for.
+func (s *Server) pitrEnabled() bool { return s.backups != nil }
+
 // backupInfoOf reads the node's restorable backups of p. Without a backup service nothing is
 // restorable and PITR is off.
 func (s *Server) backupInfoOf(ctx context.Context, p *registry.Project) (backupInfo, error) {
 	var bi backupInfo
-	if s.backups == nil {
+	if !s.pitrEnabled() {
 		return bi, nil
 	}
 	bi.enabled = true
