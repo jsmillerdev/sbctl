@@ -404,25 +404,33 @@ func (r *Postgres) SetReplicaStatus(ctx context.Context, identifier, status, ini
 }
 
 func (r *Postgres) SetReplicaStatusUnlessGoingDown(ctx context.Context, identifier, status, initStep, initError string) (bool, error) {
-	// One statement, whose condition holds for the row as it is when the update runs: a mark that landed
-	// after the caller read the replica wins. It writes nothing when the three values are unchanged (the
-	// report runs every ten seconds), and the row is read only when it wrote nothing, to tell a replica
-	// that is going down from one that is as asked or gone.
-	tag, err := r.pool.Exec(ctx, `
-		update supavise.replicas set status = $2, init_step = $3, init_error = $4, updated_at = now()
-		where identifier = $1 and status <> $5 and (status, init_step, init_error) is distinct from ($2::text, $3::text, $4::text)`,
-		identifier, status, initStep, initError, string(StatusGoingDown))
-	if err != nil {
-		return false, mapErr(err)
-	}
-	if tag.RowsAffected() > 0 {
-		return true, nil
-	}
+	// The row is read first, as SetReplicaStatus does: the statement trigger of the replicas table moves
+	// change_seq for every UPDATE, one that matches no row included, so an UPDATE whose condition is false
+	// is not free, and the report that runs every ten seconds must not issue one when nothing changed.
 	cur, err := r.GetReplica(ctx, identifier)
 	if err != nil {
 		return false, err
 	}
-	return cur.Status != string(StatusGoingDown), nil
+	if cur.Status == string(StatusGoingDown) {
+		return false, nil
+	}
+	if cur.Status == status && cur.InitStep == initStep && cur.InitError == initError {
+		return true, nil
+	}
+	// The condition is in the statement, so a mark that landed after the read above wins.
+	tag, err := r.pool.Exec(ctx, `
+		update supavise.replicas set status = $2, init_step = $3, init_error = $4, updated_at = now()
+		where identifier = $1 and status <> $5`, identifier, status, initStep, initError, string(StatusGoingDown))
+	if err != nil {
+		return false, mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := r.GetReplica(ctx, identifier); err != nil { // deleted since the read
+			return false, err
+		}
+		return false, nil
+	}
+	return true, nil
 }
 
 func (r *Postgres) DeleteReplica(ctx context.Context, identifier string) error {
