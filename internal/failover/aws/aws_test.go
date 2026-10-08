@@ -23,11 +23,19 @@ type rig struct {
 
 func newRig(t *testing.T, mut ...func(*awsfake.Server)) *rig {
 	t.Helper()
+	return newRigOn(t, true, mut...)
+}
+
+// newRigOn is newRig; withOwnEIP says whether n2 has an Elastic IP of its own on its primary address.
+func newRigOn(t *testing.T, withOwnEIP bool, mut ...func(*awsfake.Server)) *rig {
+	t.Helper()
 	fake := awsfake.New(t)
 	fake.AddInstance(awsfake.Instance{ID: "i-n1", PrivateIP: "10.77.0.10", StopPolls: 2})
 	fake.AddInstance(awsfake.Instance{ID: "i-n2", PrivateIP: "10.77.0.20", SecondaryIPs: []string{"10.77.0.21"}})
 	fake.AddAddress(awsfake.Address{AllocationID: "eipalloc-svc", PublicIP: "203.0.113.9", InstanceID: "i-n1"})
-	fake.AddAddress(awsfake.Address{AllocationID: "eipalloc-n2", PublicIP: "203.0.113.20", InstanceID: "i-n2"})
+	if withOwnEIP {
+		fake.AddAddress(awsfake.Address{AllocationID: "eipalloc-n2", PublicIP: "203.0.113.20", InstanceID: "i-n2"})
+	}
 	for _, m := range mut {
 		m(fake)
 	}
@@ -199,9 +207,8 @@ func TestAPlannedSwitchoverHasNothingToFence(t *testing.T) {
 }
 
 func TestTakeOverUsesThePrimaryAddressWhenThereIsNoElasticIPOfItsOwn(t *testing.T) {
-	r := newRig(t, func(f *awsfake.Server) {
+	r := newRigOn(t, false, func(f *awsfake.Server) {
 		f.AddInstance(awsfake.Instance{ID: "i-n2", PrivateIP: "10.77.0.20", PublicIP: "198.51.100.7"})
-		f.AddAddress(awsfake.Address{AllocationID: "eipalloc-n2"}) // allocated, not associated
 	})
 	if err := r.p.TakeOver(context.Background(), r.req); err != nil {
 		t.Fatal(err)
@@ -216,17 +223,24 @@ func TestTakeOverUsesThePrimaryAddressWhenThereIsNoElasticIPOfItsOwn(t *testing.
 	}
 }
 
-func TestTakeOverFallsBackToThePrimaryWhenItHasNoSecondaryAddress(t *testing.T) {
+// A survivor whose only private address carries an Elastic IP of its own keeps it: the association
+// would take it away, so nothing is associated and the operator is told (ErrNoTakeover).
+func TestTakeOverLeavesTheSurvivorsOwnElasticIPAloneWhenItHasNoSecondaryAddress(t *testing.T) {
 	r := newRig(t, func(f *awsfake.Server) { f.AddInstance(awsfake.Instance{ID: "i-n2", PrivateIP: "10.77.0.20"}) })
-	if err := r.p.TakeOver(context.Background(), r.req); err != nil {
-		t.Fatal(err)
+	err := r.p.TakeOver(context.Background(), r.req)
+	if !errors.Is(err, failover.ErrNoTakeover) || !strings.Contains(err.Error(), "secondary") {
+		t.Fatalf("error: %v", err)
 	}
-	// The survivor's own Elastic IP stays allocated and is released from the address.
-	if a := r.fake.AddressOf("eipalloc-svc"); a.InstanceID != "i-n2" || a.PrivateIP != "10.77.0.20" {
+	if a := r.fake.AddressOf("eipalloc-svc"); a.InstanceID != "i-n1" {
 		t.Fatalf("service address: %+v", a)
 	}
-	if own := r.fake.AddressOf("eipalloc-n2"); own.InstanceID != "" || own.AllocationID == "" {
+	if own := r.fake.AddressOf("eipalloc-n2"); own.InstanceID != "i-n2" || own.PrivateIP != "10.77.0.20" {
 		t.Fatalf("n2's own address: %+v", own)
+	}
+	for _, c := range r.fake.Calls() {
+		if c.Action == "AssociateAddress" {
+			t.Fatalf("an address was associated: %v", c.Params)
+		}
 	}
 }
 

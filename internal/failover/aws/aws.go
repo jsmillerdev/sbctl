@@ -194,7 +194,9 @@ func status(ctx context.Context, c EC2, id string) (*awsapi.InstanceStatus, erro
 // TakeOver associates the cluster's Elastic IP with the survivor. The private address it maps to
 // is the survivor's own secondary address when its primary address carries an Elastic IP of its own
 // (a stack from the template that creates one), so that the association replaces nothing; else
-// it is the primary address, and a public address the survivor had there is replaced.
+// it is the primary address, and a public address the survivor had there is replaced. A survivor
+// whose only private address carries an Elastic IP of its own is not touched: ErrNoTakeover, and
+// the operator moves the address.
 func (p *Provider) TakeOver(ctx context.Context, req failover.Request) error {
 	alloc := req.ServiceAddress.AllocationID
 	if alloc == "" {
@@ -219,7 +221,10 @@ func (p *Provider) TakeOver(ctx context.Context, req failover.Request) error {
 	if err != nil {
 		return fmt.Errorf("aws: DescribeAddresses for %s: %w", newAWS.InstanceID, err)
 	}
-	target := takeoverIP(inst, own, alloc)
+	target, err := takeoverIP(inst, own, alloc)
+	if err != nil {
+		return err
+	}
 
 	svc, err := c.DescribeAddresses(ctx, awsapi.DescribeAddressesInput{AllocationIDs: []string{alloc}})
 	if err != nil {
@@ -248,8 +253,11 @@ func (p *Provider) TakeOver(ctx context.Context, req failover.Request) error {
 
 // takeoverIP picks the private address of the survivor that the service address maps to: its
 // secondary address when its primary one has an Elastic IP of its own, else "" (the primary one).
-// own are the Elastic IPs associated with the survivor now; the service address itself does not count.
-func takeoverIP(inst awsapi.Instance, own []awsapi.Address, serviceAlloc string) string {
+// When every private address has an Elastic IP of its own, associating the service address would
+// take one of them from the survivor (its peers and its operator may reach it there): that is
+// ErrNoTakeover. own are the Elastic IPs associated with the survivor now; the service address
+// itself does not count.
+func takeoverIP(inst awsapi.Instance, own []awsapi.Address, serviceAlloc string) (string, error) {
 	taken := map[string]bool{} // private addresses with an Elastic IP other than the service address
 	for _, a := range own {
 		if a.AllocationID != serviceAlloc && a.PrivateIP != "" {
@@ -274,14 +282,14 @@ func takeoverIP(inst awsapi.Instance, own []awsapi.Address, serviceAlloc string)
 		primary = inst.PrivateIP
 	}
 	if !taken[primary] {
-		return ""
+		return "", nil
 	}
 	for _, s := range secondary {
 		if !taken[s] {
-			return s
+			return s, nil
 		}
 	}
-	return ""
+	return "", fmt.Errorf("%w: %s's private address %s has an Elastic IP of its own and it has no free secondary address, so the service address would replace it; add a secondary private address to its network interface or move the service address by hand", failover.ErrNoTakeover, inst.ID, primary)
 }
 
 // Probe asks EC2, with DryRun and no side effect, whether the instance role may do what a
