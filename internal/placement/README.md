@@ -12,7 +12,9 @@ holds the replica (replica design, sections 2.5 to 2.7 and 2.10).
 ## Plane router and remote plane
 
 - `Router` (`router.go`) is the plane the Engine drives (`Engine.SetPlane`). A call for a project homed
-  on this node goes to the node's own plane; any other goes to a `RemotePlane` for the home. The home is
+  on this node goes to the node's own plane; any other goes to a `RemotePlane` for the home. A `Router`
+  is a `lifecycle.HomeRouter`: an Engine drives a project homed elsewhere only through one, so the CLI,
+  which opens the node's own plane, refuses a project that runs on another node. The home is
   the `node_id` of the project's row, so a project that moved is routed to its new home from the next
   call. `Route` always answers from the local plane: a canonical port is the service on the home and a
   forwarder to it elsewhere, so the answer is the same on every node. A delete or stop for a ref the
@@ -47,6 +49,7 @@ leader as it did on the node:
 | 422 | not allowed in the current state | `lifecycle.ErrInvalidState` |
 | 501 | the node has no backup engine | `lifecycle.ErrNoSnapshot` |
 | 504 | replay did not reach the position asked | `lifecycle.ErrReplayBehind` |
+| 507 | the node has no room for the replica | `ErrNoRoom` |
 
 ## Node agent and peer API endpoints
 
@@ -56,8 +59,11 @@ leader as it did on the node:
 handler admits the cluster leader only (the client certificate's node), refuses a request under an
 older epoch than the node's, and, for the plane and backup endpoints, one for a project that is not
 homed on the node (the node's copy of the registry can trail the leader's by a moment; the leader asks
-again). `Ops` implements `InstanceOps` and `BackupOps`: the agent itself for this node, the peer API for
-another.
+again; after the registry moves a home, the first plane call for the new home can arrive before the new
+home's copy has the row, and `Router` and `RemotePlane` do not retry it: the caller that moved the
+home does). `Register` refuses to be built without the agent, the membership and the resolver, which
+the handlers check against. `Ops` implements `InstanceOps` and `BackupOps`: the agent itself for this
+node, the peer API for another.
 
 `NodeAgent` (`agent.go`) implements `Agent` over the node's plane (`ReplicaPlane`, which
 `*lifecycle.PostgresPlane` satisfies):
@@ -65,6 +71,9 @@ another.
 - `Ensure` checks the replica (an identifier of the project, never on the project's home, the port
   sequence fits, one replica of the project per node, room for it: `Engine.AdmitReplica`) and sets it up
   in the background, answering at once; a repeated request reports what is there and starts nothing.
+  The node finds the replica it holds by `replica.json` as well as in memory, so a request for a second
+  one after a restart of the daemon is refused. A replica with no room for it (`ErrNoRoom`, 507: the
+  memory budget or the disk) is recorded nowhere, so the leader asks again once there is room.
   The setup follows design 2.7.2 and records its step in `projects/<ref>/replica.json` (0600):
 
   | Step reached | Work that leads to the next | Failure code while at this step |
@@ -82,17 +91,30 @@ another.
   nothing for 15 minutes fails at step 4. An archive-only standby (`NoUpstream`) completes without
   streaming and without PostgREST.
 - `Observe` reports the step and error plus the live state of the standby (`InstanceStatus`).
-- `Remove` stops a setup in flight, then the units, and deletes the directory. It refuses when the
-  project is homed on this node or the cluster here has become the primary: removing a replica must
-  never remove a home.
+- `Remove` stops a setup in flight, then the units, and deletes the directory. It removes only the
+  replica the node holds (another identifier of the project is refused) and refuses when the project is
+  homed on this node, when the cluster here has become the primary, or when the data directory is a
+  cluster without `standby.signal` (a promoted replica that is stopped does not answer), unless the
+  setup it belongs to has not finished: removing a replica must never remove a home.
 - `Do` runs `restart` (renders from `InstanceAction.Class` when the leader names the size, because the
   node's copy of the registry may not have it yet), `stop`, `start`, `promote` and `demote` (the failover
   orchestrator's steps 4 and 7 of a project switchover; `lifecycle.PromoteReplica` and
-  `DemoteToReplica`). An action during a setup is refused.
+  `DemoteToReplica`). An action during a setup is refused. `start`, `restart` and `stop` are refused
+  when the registry names this node the project's home, and so is a `promote`, except one repeated after
+  the home moved here, which finds the cluster a primary and ends the replica instance. A promotion
+  and a demotion take the project's ports from the mesh's forwarders while they run
+  (`lifecycle.PlaneOptions.HoldPorts`; `internal/app/wire_placement.go` binds it to
+  `mesh.Forwarders.Suspend`): on a replica's node the canonical ports are forwarders to the old home,
+  and Postgres could not bind them.
 - `StartLocal` starts the node's complete replicas after a restart; their units are not enabled for boot.
 
-`Reporter` tells the leader what the node observes every 10 seconds (`POST /peer/v1/report`): its
-replicas and, on a node that is not the leader, the health of the projects homed there.
+`ReportCache` keeps the observation of the node's replicas and of the projects homed there in memory and
+refreshes it every 10 seconds, so that a report answers from memory and never waits for a probe (each
+replica is a SQL and an HTTP probe). `Contribution` is its answer in the shape the cluster package's
+reporter adds to the report it sends (`cluster.Contributor`); the cluster's reporter stores the report of
+a leader too, which covers the replicas the leader holds. `Reporter` is the sender until then: it tells
+the leader what the node observes every 10 seconds (`POST /peer/v1/report`) when the node is not the
+leader, and logs once, not every tick, that a leader has no report endpoint (`ErrNoReportEndpoint`).
 
 `Fleet` is the `lifecycle.ReplicaFleet` of the leader's Engine: it restarts a project's replicas through
 `InstanceOps` when the project is resized.
@@ -104,10 +126,14 @@ exactly as before.
 
 `go test ./internal/placement/` runs against fakes: the remote plane through the handlers in one process
 (every method, every status, authorization and epochs), the router, the agent's state machine (steps,
-failures, resume, removal guards, actions), `Ops`, `Fleet`, `Reporter`, and the format of `promote.ok`
-against `internal/backup`. `TestIntegrationReplicaBlocks` runs a seed, a stream, a PostgREST reload, a
-promotion and a demotion on real clusters (exec backend); it needs `SUPAVISE_TEST_UNPACKED` and runs in
-the linux job `replica-blocks` through `tests/linux/replica-blocks.sh`.
+failures, resume, removal guards, actions), `Ops`, `Fleet`, `Reporter`, `ReportCache`, and the format of
+`promote.ok` against `internal/backup`. `TestIntegrationReplicaBlocks` runs a seed, a stream, a PostgREST
+reload, a promotion and a demotion on real clusters (exec backend); it needs `SUPAVISE_TEST_UNPACKED` and
+runs in the linux job `replica-blocks` through `tests/linux/replica-blocks.sh`. It turns the event
+triggers that NOTIFY PostgREST off before the DDL change it makes, so that only the reload timer can make
+the change visible, and checks that the change is not visible before the timer starts. One machine plays
+two nodes there, with no mesh forwarders: the canonical port stands for the forwarder, and the hold on
+the ports is covered by the unit tests of `internal/lifecycle`.
 
 ## Limits
 

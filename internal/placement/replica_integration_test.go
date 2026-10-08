@@ -230,6 +230,41 @@ func (e *rrEnv) text(port int, query string) string {
 	return s
 }
 
+// admin connects to the primary of node A as supabase_admin, whom pg_hba trusts on the cluster's socket.
+func (e *rrEnv) admin() *pgx.Conn {
+	e.t.Helper()
+	prim, _ := e.ports()
+	sock := filepath.Join(e.cfgA.Paths().ProjectService(e.project.Ref, config.SvcPostgres), "sock")
+	c, err := pgx.Connect(context.Background(), fmt.Sprintf("host=%s port=%d user=supabase_admin dbname=postgres sslmode=disable", sock, prim.Postgres))
+	if err != nil {
+		e.t.Fatalf("connect as supabase_admin: %v", err)
+	}
+	e.t.Cleanup(func() { c.Close(context.Background()) })
+	return c
+}
+
+// pgrstTriggers enables or disables the event triggers that NOTIFY PostgREST of a DDL change and
+// returns how many there are.
+func (e *rrEnv) pgrstTriggers(enable bool) int {
+	e.t.Helper()
+	verb := "disable"
+	if enable {
+		verb = "enable"
+	}
+	c := e.admin()
+	var n int
+	if err := c.QueryRow(context.Background(), `select count(*) from pg_event_trigger where evtname like 'pgrst%'`).Scan(&n); err != nil {
+		e.t.Fatal(err)
+	}
+	if _, err := c.Exec(context.Background(), `do $$ declare t name; begin
+		for t in select evtname from pg_event_trigger where evtname like 'pgrst%' loop
+			execute format('alter event trigger %I `+verb+`', t);
+		end loop; end $$`); err != nil {
+		e.t.Fatalf("%s the event triggers: %v", verb, err)
+	}
+	return n
+}
+
 // eventually polls ok until it returns "" or the time is up; the last message is the failure.
 func eventually(t *testing.T, within time.Duration, what string, ok func() string) {
 	t.Helper()
@@ -469,26 +504,46 @@ func TestIntegrationReplicaBlocks(t *testing.T) {
 
 	// 5. PostgREST on the standby sees a DDL change within the reload interval (spike S3), reads the
 	// standby, listens on the primary, and refuses writes.
-	rctx, stopReload := context.WithCancel(ctx)
-	reloadDone := make(chan struct{})
-	go func() {
-		defer close(reloadDone)
-		e.planeB.RunSchemaReload(rctx, 2*time.Second, func(context.Context) ([]string, error) { return []string{ref}, nil })
-	}()
-	t.Cleanup(func() { stopReload(); <-reloadDone })
 	restURL := fmt.Sprintf("http://127.0.0.1:%d", repl.PostgREST)
 	if code, body := httpStatus(restURL+"/items?select=id&id=lt.3", keys.AnonKey, "GET", ""); code != 200 {
 		t.Fatalf("GET /items on the replica's PostgREST = %d %s", code, body)
 	}
+	// The timer is what is under test, so the NOTIFY that would tell PostgREST of the change without
+	// it is taken away: with the event triggers off, nothing but SIGUSR1 can make the table visible.
+	t.Logf("%d event triggers notify PostgREST of DDL changes; they are off for the next change", e.pgrstTriggers(false))
 	e.exec(prim.Postgres, `create table public.rr_probe (id int primary key, v text); insert into public.rr_probe values (1, 'x'); grant select on public.rr_probe to anon`)
+	eventually(t, 30*time.Second, "the new table on the standby", func() string {
+		if n := e.count(repl.Postgres, `select count(*) from pg_class where relname = 'rr_probe'`); n != 1 {
+			return fmt.Sprintf("%d tables", n)
+		}
+		return ""
+	})
+	// Without the timer the schema cache is not rebuilt, however long the table has been on the standby.
+	for stop := time.Now().Add(5 * time.Second); time.Now().Before(stop); time.Sleep(500 * time.Millisecond) {
+		if code, body := httpStatus(restURL+"/rr_probe?select=id", keys.AnonKey, "GET", ""); code == 200 {
+			t.Fatalf("the new table was visible through the replica's PostgREST with no notification and no reload: %s", body)
+		}
+	}
+	// With it every change is visible within one interval.
+	const reloadEvery = 2 * time.Second
+	rctx, stopReload := context.WithCancel(ctx)
+	reloadDone := make(chan struct{})
+	go func() {
+		defer close(reloadDone)
+		e.planeB.RunSchemaReload(rctx, reloadEvery, func(context.Context) ([]string, error) { return []string{ref}, nil })
+	}()
+	t.Cleanup(func() { stopReload(); <-reloadDone })
 	start := time.Now()
-	eventually(t, 30*time.Second, "the new table in the replica's PostgREST", func() string {
+	eventually(t, 3*reloadEvery, "the new table in the replica's PostgREST after the reload timer started", func() string {
 		if code, body := httpStatus(restURL+"/rr_probe?select=id", keys.AnonKey, "GET", ""); code != 200 {
 			return fmt.Sprintf("%d %s", code, body)
 		}
 		return ""
 	})
-	t.Logf("the DDL change was visible through the replica's PostgREST after %s", time.Since(start).Round(100*time.Millisecond))
+	t.Logf("the DDL change was visible through the replica's PostgREST %s after the reload timer started", time.Since(start).Round(100*time.Millisecond))
+	stopReload()
+	<-reloadDone
+	e.pgrstTriggers(true)
 	if code, _ := httpStatus(restURL+"/items", keys.ServiceRoleKey, "POST", `{"id": 1000, "v": "nope"}`); code < 400 {
 		t.Fatalf("a write through the replica's PostgREST answered %d", code)
 	}
@@ -498,8 +553,6 @@ func TestIntegrationReplicaBlocks(t *testing.T) {
 	if n := e.count(repl.Postgres, `select count(*) from pg_stat_activity where application_name = 'postgrest-replica'`); n < 1 {
 		t.Fatal("the replica's PostgREST has no session on the replica")
 	}
-	stopReload()
-	<-reloadDone
 
 	// 6. Switchover. The primary stops, B's standby is promoted onto the canonical port once it has
 	// replayed the primary's shutdown checkpoint.
