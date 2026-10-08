@@ -134,7 +134,9 @@ func (e *Engine) applySavedSettings(ctx context.Context, p *registry.Project, ke
 		e.log.Warn("resume: could not apply the saved "+what+"; save it again to retry", "ref", p.Ref, "error", err)
 		e.event(ctx, p.Ref, "project.config_apply_failed", map[string]string{"service": what, "error": err.Error()})
 	}
-	if cp, ok := e.plane.(configPlane); ok {
+	// The Postgres settings of a project homed elsewhere are not this node's to apply: the router
+	// answers ErrNotSupported for them, which is no failure of the resume.
+	if cp, ok := e.plane.(configPlane); ok && e.homedHere(p) {
 		pending, err := cp.ApplyPostgresSettings(ctx, p, keys, false, nil)
 		if err != nil {
 			fail(string(projectconfig.Postgres)+" settings", err)

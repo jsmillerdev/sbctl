@@ -124,6 +124,40 @@ func TestRoutedEngineRefusesWhatNeedsTheHomesDisk(t *testing.T) {
 	}
 }
 
+// notSupportedPlane is a routing plane that, like internal/placement's Router, answers
+// ErrNotSupported to the settings of a project homed on another node.
+type notSupportedPlane struct{ *cfgPlane }
+
+func (notSupportedPlane) RoutesByHome() {}
+func (notSupportedPlane) ApplyPostgresSettings(context.Context, *registry.Project, *secrets.ProjectKeys, bool, func(context.Context)) (bool, error) {
+	return false, ErrNotSupported
+}
+
+// Resuming a project homed on another node is no failure when the router cannot apply its saved Postgres
+// settings: the resume records no config_apply_failed event for every project that runs elsewhere.
+func TestResumeOfAProjectHomedElsewhereAppliesNoPostgresSettings(t *testing.T) {
+	ctx := context.Background()
+	c := newClusterHarness(t, "n1")
+	cp := &cfgPlane{fakePlane: c.plane}
+	c.e = NewEngine(c.cfg, c.reg, c.sec, fakeArts{}, notSupportedPlane{cp}, Options{Fleet: fleet.Fleet{c.tenant}, Settings: &fakeSettings{}, NodeID: "n1"})
+	ref := c.home2.Ref
+	if err := c.e.Pause(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.e.Resume(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	if ev := c.events(t, ref); strings.Contains(ev, "project.config_apply_failed") {
+		t.Fatalf("events = %s", ev)
+	}
+	if len(cp.pgCalls) != 0 {
+		t.Fatalf("Postgres settings were applied: %v", cp.pgCalls)
+	}
+	if len(c.tenant.ensured) == 0 || c.tenant.ensured[len(c.tenant.ensured)-1].Ref != ref {
+		t.Fatalf("the tenants of the shared services were not refreshed: %+v", c.tenant.ensured)
+	}
+}
+
 // remoteNodes answers the resources of the node a project is homed on.
 type remoteNodes struct {
 	res   NodeResources
