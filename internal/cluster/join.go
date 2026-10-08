@@ -55,8 +55,19 @@ type JoinOptions struct {
 	MasterKey []byte
 	// Resume continues a join that has its certificate and is not confirmed.
 	Resume bool
+	// Reset discards the cluster identity this server already holds (a join that never finished and was
+	// reaped, a fenced node that cannot rejoin, a node that was removed while it was down) and joins as a
+	// new node. What runs here is stopped with StopLocal and the data is set aside, as a retirement does.
+	// Ignored with Resume.
+	Reset bool
+	// StopLocal stops everything that runs on this server (FenceLocal). Required with Reset.
+	StopLocal func(ctx context.Context) error
 	// Seed builds and starts the system standby. Required.
 	Seed SeedFunc
+	// Preflight, when set, runs before anything is asked of the leader or changed here. An error stops
+	// the join with the server as it was: use it for what Seed needs and a refusal later would waste,
+	// because the token is spent and the node exists on the leader once the exchange is done.
+	Preflight func(ctx context.Context) error
 	// DSNs are the sockets the system standby answers on, to see it stream.
 	DSNs []string
 	// StreamTimeout bounds the wait for the standby to stream; zero is 30 minutes.
@@ -107,6 +118,11 @@ func Join(ctx context.Context, o JoinOptions) (*JoinResult, error) {
 	if o.Seed == nil {
 		return nil, errors.New("cluster: a join needs a way to seed the system standby")
 	}
+	if o.Preflight != nil {
+		if err := o.Preflight(ctx); err != nil {
+			return nil, err
+		}
+	}
 	dir := config.ClusterDir(o.ConfigPath)
 	var st *JoinState
 	var err error
@@ -116,7 +132,9 @@ func Join(ctx context.Context, o JoinOptions) (*JoinResult, error) {
 		}
 	} else {
 		if Joined(dir) {
-			return nil, errors.New("cluster: this server already joined a cluster; use `supavise node join --resume` to finish a join that stopped, or `supavise node rejoin` for a fenced node")
+			if err := o.startOver(ctx); err != nil {
+				return nil, err
+			}
 		}
 		if st, err = o.exchange(ctx, dir); err != nil {
 			return nil, err
@@ -131,6 +149,25 @@ func Join(ctx context.Context, o JoinOptions) (*JoinResult, error) {
 		return nil, err
 	}
 	return &JoinResult{NodeID: st.NodeID, System: st.System}, nil
+}
+
+// startOver deals with a server that already holds a cluster identity when a join with a token
+// begins. The identity of a node that was removed is revoked, and the record of the removal says so:
+// it is deleted without more ado (its files stay when the daemon's unit did not let it delete them).
+// Any other identity may be a working member's, so it is refused unless Reset says to discard it.
+func (o *JoinOptions) startOver(ctx context.Context) error {
+	if rec, _ := ReadFenced(o.Cfg); rec != nil && rec.Removed {
+		return forgetIdentity(o.ConfigPath)
+	}
+	if !o.Reset {
+		return errors.New("cluster: this server already joined a cluster; use `supavise node join --resume` to finish a join that stopped, `supavise node rejoin` for a fenced node, " +
+			"or `supavise node join --reset` to give up its place in that cluster and join as a new node (run `supavise node rm` for the old node on its leader first)")
+	}
+	if o.StopLocal == nil {
+		return errors.New("cluster: a reset needs a way to stop the local clusters")
+	}
+	_, err := Retire(ctx, o.Cfg, o.ConfigPath, o.StopLocal, o.now())
+	return err
 }
 
 // ReadJoinState reads join.json from the cluster directory.

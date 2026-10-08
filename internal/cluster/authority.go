@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -70,9 +71,24 @@ type Authority struct {
 	Changed func(ctx context.Context)
 	Now     func() time.Time
 
-	mu     sync.Mutex
-	nonces map[string]time.Time
+	mu      sync.Mutex
+	nonces  map[string]time.Time
+	buckets map[string]*bucket
 }
+
+// bucket is the challenges one remote address may still ask for.
+type bucket struct {
+	tokens float64
+	at     time.Time
+}
+
+// A caller with no certificate gets challengeBurst challenges at once and one more every
+// challengeEvery, and the leader remembers at most maxBuckets callers.
+const (
+	challengeBurst = 20
+	challengeEvery = 3 * time.Second
+	maxBuckets     = 4096
+)
 
 func (a *Authority) now() time.Time {
 	if a.Now != nil {
@@ -173,6 +189,46 @@ func (a *Authority) IssueToken(ctx context.Context, o TokenOptions) (string, err
 		V: 1, ID: id, Leader: addr, CAFpr: a.CA.Fingerprint(), Secret: base64.RawURLEncoding.EncodeToString(secret),
 		Exp: exp.Unix(), Region: o.Region, Name: o.Name,
 	}.Encode(), nil
+}
+
+// ChallengeFrom is Challenge for a caller at remote (an IP address, empty when unknown), refused when
+// that address asks for more than challengeBurst at once or faster than one every challengeEvery.
+func (a *Authority) ChallengeFrom(remote string) (peerapi.JoinChallenge, error) {
+	if remote != "" && !a.allowChallenge(remote) {
+		return peerapi.JoinChallenge{}, fail(http.StatusTooManyRequests, "too_many_requests", "too many join attempts from this address; wait a minute")
+	}
+	return a.Challenge(), nil
+}
+
+func (a *Authority) allowChallenge(remote string) bool {
+	now := a.now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.buckets == nil {
+		a.buckets = map[string]*bucket{}
+	}
+	b := a.buckets[remote]
+	if b == nil {
+		for len(a.buckets) >= maxBuckets { // the caller that asked longest ago goes
+			var oldest string
+			var at time.Time
+			for k, o := range a.buckets {
+				if oldest == "" || o.at.Before(at) {
+					oldest, at = k, o.at
+				}
+			}
+			delete(a.buckets, oldest)
+		}
+		b = &bucket{tokens: challengeBurst, at: now}
+		a.buckets[remote] = b
+	}
+	b.tokens = min(challengeBurst, b.tokens+float64(now.Sub(b.at))/float64(challengeEvery))
+	b.at = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }
 
 // Challenge starts a join: a nonce the joiner mixes into its proof. A nonce works once and for two
@@ -325,11 +381,45 @@ func (a *Authority) checkJoinRequest(ctx context.Context, tok *registry.JoinToke
 	if len(req.PublicHost) > 253 || len(req.PeerAddr) > 300 {
 		return fail(http.StatusBadRequest, "bad_address", "the public host or peer address is too long")
 	}
+	if !reRelease.MatchString(req.Version) {
+		return fail(http.StatusBadRequest, "bad_version", "the release name is not valid")
+	}
+	if err := checkAWSIdentity(req.Provider.AWS); err != nil {
+		return fail(http.StatusBadRequest, "bad_provider", "%v", err)
+	}
 	if err := CheckVersionWindow(a.Version, req.Version, a.Pins, req.ArtifactPins); err != nil {
 		return fail(http.StatusConflict, "version_skew", "%v", err)
 	}
 	if csr, err := x509.ParseCertificateRequest(req.CSR); err != nil || csr.CheckSignature() != nil {
 		return fail(http.StatusBadRequest, "bad_csr", "the certificate request is not valid")
+	}
+	return nil
+}
+
+// What a joiner may say about itself. The leader stores these and later acts on them (a failover
+// stops the instance an id names), so each has the shape the cloud gives it and no other.
+var (
+	reRelease    = regexp.MustCompile(`^[A-Za-z0-9._+~-]{0,64}$`)
+	reInstanceID = regexp.MustCompile(`^i-[0-9a-f]{8,17}$`)
+	reAllocation = regexp.MustCompile(`^eipalloc-[0-9a-f]{8,17}$`)
+	reAWSRegion  = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$`)
+	reAWSZone    = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}[a-z0-9-]{0,16}$`)
+)
+
+// checkAWSIdentity refuses an AWS identity whose ids do not look like the cloud's. nil is fine: a
+// node need not be on AWS.
+func checkAWSIdentity(a *registry.NodeAWS) error {
+	switch {
+	case a == nil:
+		return nil
+	case !reInstanceID.MatchString(a.InstanceID):
+		return errors.New("the AWS instance id is not an instance id (i-...)")
+	case a.Region != "" && !reAWSRegion.MatchString(a.Region):
+		return errors.New("the AWS region is not a region name")
+	case a.Zone != "" && !reAWSZone.MatchString(a.Zone):
+		return errors.New("the AWS zone is not an availability zone name")
+	case a.AllocationID != "" && !reAllocation.MatchString(a.AllocationID):
+		return errors.New("the AWS allocation id is not an Elastic IP allocation id (eipalloc-...)")
 	}
 	return nil
 }
@@ -482,7 +572,8 @@ func (a *Authority) SelfIssue(ctx context.Context, nodeID string, pub ed25519.Pu
 
 // Rejoin lets a fenced node back in: its row goes to joining, its system replica row is kept (or
 // made), and it is told how to rebuild its system standby. The node keeps its identity and its
-// certificate; PathJoinConfirm makes it active when its standby streams.
+// certificate; PathJoinConfirm makes it active when its standby streams. The leader reaps the node
+// if that takes longer than JoiningTimeout from the moment its row went to joining.
 func (a *Authority) Rejoin(ctx context.Context, caller string, req peerapi.RejoinRequest) (*peerapi.RejoinResponse, error) {
 	if err := a.needLeader(); err != nil {
 		return nil, err
@@ -491,7 +582,9 @@ func (a *Authority) Rejoin(ctx context.Context, caller string, req peerapi.Rejoi
 	if err != nil {
 		return nil, err
 	}
-	if n.State != registry.NodeFenced {
+	// A node that is joining asked before: its rejoin stopped after this part (the local clusters would
+	// not stop, say) and it asks again. It gets the same answer, and its joining time keeps running.
+	if n.State != registry.NodeFenced && n.State != registry.NodeJoining {
 		return nil, fail(http.StatusConflict, "not_fenced", "node %s is %s; only a fenced node rejoins", caller, n.State)
 	}
 	if err := CheckVersionWindow(a.Version, req.Version, a.Pins, req.ArtifactPins); err != nil {

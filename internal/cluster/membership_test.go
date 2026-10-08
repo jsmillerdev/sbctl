@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -541,6 +542,425 @@ func TestRetireClearsTheNodeFromTheCluster(t *testing.T) {
 	}
 }
 
+// A fenced node that rejoins has been a member for a long time, but the leader's patience with a node
+// that is joining runs from the moment it went back to joining, not from the day it first joined.
+func TestRejoiningNodeIsNotReapedForItsAge(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	l.clk.Advance(90 * 24 * time.Hour) // a quarter of a year a member
+	if err := l.reg.SetNodeState(ctx, "n2", registry.NodeFenced); err != nil {
+		t.Fatal(err)
+	}
+	l.live.Refresh(ctx)
+	req := peerapi.RejoinRequest{Version: "v0.2.0", ArtifactPins: testPins}
+	first, err := l.auth.Rejoin(ctx, "n2", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := l.auth.ReapJoining(ctx); len(got) != 0 {
+		t.Fatalf("a node that went back to joining a moment ago was reaped: %v", got)
+	}
+	l.clk.Advance(JoiningTimeout - 5*time.Minute)
+	// Asking again, because the first attempt stopped on the node, gets the same answer.
+	again, err := l.auth.Rejoin(ctx, "n2", req)
+	if err != nil || again.System.Identifier != first.System.Identifier {
+		t.Fatalf("a second rejoin of a joining node: %+v, %v", again, err)
+	}
+	if got, _ := l.auth.ReapJoining(ctx); len(got) != 0 {
+		t.Fatalf("a rejoin inside the joining time was reaped: %v", got)
+	}
+	if n, _ := l.reg.GetNode(ctx, "n2"); n.State != registry.NodeJoining {
+		t.Fatalf("node n2 is %s", n.State)
+	}
+	// A node that is not fenced or joining is refused.
+	if _, err := l.auth.Rejoin(ctx, "n1", req); err == nil || !strings.Contains(err.Error(), "only a fenced node rejoins") {
+		t.Fatalf("rejoin of the leader: %v", err)
+	}
+	// The joining time still runs out.
+	l.clk.Advance(10 * time.Minute)
+	if got, _ := l.auth.ReapJoining(ctx); len(got) != 1 || got[0] != "n2" {
+		t.Fatalf("reaped %v after the joining time", got)
+	}
+}
+
+// A rejoin that stops on the node (a unit that will not stop) can be run again, and a leader the
+// operator names by address needs no node id from the record, which may be an older leader's.
+func TestRejoinRepeatsAfterAFailureOnTheNode(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.reg.SetNodeState(ctx, "n2", registry.NodeFenced); err != nil {
+		t.Fatal(err)
+	}
+	l.live.Refresh(ctx)
+	if err := os.MkdirAll(j.cfg.Paths().PostgresData("system"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The record names a leader that no longer leads, with no address.
+	if err := WriteFenced(j.cfg, FencedRecord{Epoch: 2, Leader: "n9", Reason: "replaced", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	o := RejoinOptions{Cfg: j.cfg, ConfigPath: j.confPath, Leader: l.cfg.PeerAddr(), Version: "v0.2.0", Pins: testPins, Seed: seed, Log: quiet(),
+		StopLocal: func(context.Context) error { return errors.New("a unit would not stop") },
+		Streaming: func(context.Context) (string, error) { return "0/4000000", nil }}
+	if _, err := Rejoin(ctx, o); err == nil || !strings.Contains(err.Error(), "would not stop") {
+		t.Fatalf("a rejoin whose units do not stop: %v", err)
+	}
+	if n, _ := l.reg.GetNode(ctx, "n2"); n.State != registry.NodeJoining {
+		t.Fatalf("the leader holds node n2 as %s", n.State)
+	}
+	if rec, _ := ReadFenced(j.cfg); rec == nil {
+		t.Fatal("the node forgot that it is fenced")
+	}
+	if _, err := os.Stat(j.cfg.Paths().PostgresData("system")); err != nil {
+		t.Fatalf("data was moved although nothing stopped: %v", err)
+	}
+
+	o.StopLocal = func(context.Context) error { return nil }
+	if _, err := Rejoin(ctx, o); err != nil {
+		t.Fatalf("the rejoin run again: %v", err)
+	}
+	if n, _ := l.reg.GetNode(ctx, "n2"); n.State != registry.NodeActive {
+		t.Fatalf("node n2 is %s", n.State)
+	}
+	if rec, _ := ReadFenced(j.cfg); rec != nil {
+		t.Fatal("the fenced record is still there")
+	}
+}
+
+// The preflight of a join or a rejoin runs before anything is spent, asked or moved.
+func TestPreflightRefusesBeforeAnythingChanges(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	tok := l.token(t, TokenOptions{})
+	no := errors.New("the data directory is not empty")
+	o := j.joinOptions(tok, "second", seed)
+	o.Preflight = func(context.Context) error { return no }
+	if _, err := Join(ctx, o); !errors.Is(err, no) {
+		t.Fatalf("join with a refusing preflight: %v", err)
+	}
+	if ns, _ := l.reg.ListNodes(ctx); len(ns) != 1 {
+		t.Fatalf("the leader created a node: %v", ns)
+	}
+	if Joined(config.ClusterDir(j.confPath)) {
+		t.Fatal("the server has an identity")
+	}
+	o.Preflight = nil
+	if _, err := Join(ctx, o); err != nil { // the token was not spent
+		t.Fatalf("join after the preflight passed: %v", err)
+	}
+
+	if err := l.reg.SetNodeState(ctx, "n2", registry.NodeFenced); err != nil {
+		t.Fatal(err)
+	}
+	l.live.Refresh(ctx)
+	if err := os.MkdirAll(j.cfg.Paths().PostgresData("system"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFenced(j.cfg, FencedRecord{Epoch: 2, Leader: "n1", At: time.Now(), Peers: map[string]string{"n1": l.cfg.PeerAddr()}}); err != nil {
+		t.Fatal(err)
+	}
+	ro := RejoinOptions{Cfg: j.cfg, ConfigPath: j.confPath, Version: "v0.2.0", Pins: testPins, Seed: seed, Log: quiet(), Preflight: func(context.Context) error { return no },
+		StopLocal: func(context.Context) error { t.Error("something was stopped"); return nil }}
+	if _, err := Rejoin(ctx, ro); !errors.Is(err, no) {
+		t.Fatalf("rejoin with a refusing preflight: %v", err)
+	}
+	if n, _ := l.reg.GetNode(ctx, "n2"); n.State != registry.NodeFenced {
+		t.Fatalf("the leader moved node n2 to %s", n.State)
+	}
+	if _, err := os.Stat(j.cfg.Paths().PostgresData("system")); err != nil {
+		t.Fatalf("data was moved: %v", err)
+	}
+}
+
+// A server that holds the identity of a join the leader gave up on starts over with Reset; without
+// it the join says how.
+func TestJoinResetStartsOverFromAnUnfinishedJoin(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	stuck := func(context.Context, peerapi.SystemBootstrap) error { return errors.New("stuck") }
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", stuck)); err == nil {
+		t.Fatal("expected the seed to fail")
+	}
+	if err := os.MkdirAll(j.cfg.Paths().PostgresData("system"), 0o700); err != nil { // the half-seeded standby
+		t.Fatal(err)
+	}
+	if err := l.reg.SetNodeState(ctx, "n2", registry.NodeLeft); err != nil { // what the reaper does to a join that took an hour
+		t.Fatal(err)
+	}
+	l.live.Refresh(ctx)
+
+	seed, boot := okSeed(t)
+	o := j.joinOptions(l.token(t, TokenOptions{}), "second-b", seed)
+	if _, err := Join(ctx, o); err == nil || !strings.Contains(err.Error(), "--reset") {
+		t.Fatalf("a join on a server with an identity: %v", err)
+	}
+	o.Reset = true
+	if _, err := Join(ctx, o); err == nil || !strings.Contains(err.Error(), "stop") {
+		t.Fatalf("a reset without a way to stop what runs: %v", err)
+	}
+	stopped := 0
+	o.StopLocal = func(context.Context) error { stopped++; return nil }
+	res, err := Join(ctx, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped != 1 || res.NodeID == "n2" || len(*boot) != 1 {
+		t.Fatalf("stopped %d, node %s, seeded %d", stopped, res.NodeID, len(*boot))
+	}
+	if creds, err := LoadCredentials(config.ClusterDir(j.confPath)); err != nil || creds.NodeID != res.NodeID {
+		t.Fatalf("the identity on disk: %+v, %v", creds, err)
+	}
+	if _, err := os.Stat(j.cfg.Paths().PostgresData("system")); !os.IsNotExist(err) {
+		t.Fatal("the half-seeded data is still in place")
+	}
+	if rec, _ := ReadFenced(j.cfg); rec != nil {
+		t.Fatalf("the record of the reset is still there: %+v", rec)
+	}
+	if n, _ := l.reg.GetNode(ctx, res.NodeID); n.State != registry.NodeActive || n.Name != "second-b" {
+		t.Fatalf("the new node: %+v", n)
+	}
+}
+
+// A node that was removed while the daemon could not delete its identity keeps the record of the removal
+// and the files, says what stayed, and the next join clears them without a flag.
+func TestRetireRecordsTheRemovalAndReportsWhatStayed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root deletes files in a directory it cannot write")
+	}
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	dir := config.ClusterDir(j.confPath)
+	if err := os.Chmod(dir, 0o500); err != nil { // the unit does not let the daemon write here
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
+	moved, err := Retire(ctx, j.cfg, j.confPath, nil, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "not deleted completely") || !strings.Contains(err.Error(), dir) {
+		t.Fatalf("retire in a directory it cannot write: %v (moved %v)", err, moved)
+	}
+	if rec, _ := ReadFenced(j.cfg); rec == nil || !rec.Removed {
+		t.Fatalf("no record of the removal: %+v", rec)
+	}
+	if d, err := DecideBoot(ctx, BootEnv{Cfg: j.cfg, ConfigPath: j.confPath}); err != nil || d.Role != RoleFenced {
+		t.Fatalf("the boot of a node whose identity stayed: %+v, %v", d, err)
+	}
+	if !Joined(dir) {
+		t.Fatal("the identity went although the directory cannot be written")
+	}
+
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.reg.SetNodeState(ctx, "n2", registry.NodeLeft); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second-b", seed))
+	if err != nil {
+		t.Fatalf("join after a removal that left the identity: %v", err)
+	}
+	if creds, err := LoadCredentials(dir); err != nil || creds.NodeID != res.NodeID || res.NodeID == "n2" {
+		t.Fatalf("the identity on disk: %+v, %v", creds, err)
+	}
+	if rec, _ := ReadFenced(j.cfg); rec != nil {
+		t.Fatalf("the record of the removal is still there: %+v", rec)
+	}
+}
+
+// A certificate that the node could not keep would lock it out at its next restart, so the renewal
+// waits while the cluster directory cannot be written and says so; it goes ahead when it can.
+func TestRenewalWaitsWhileTheDaemonCannotKeepTheCertificate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a directory that is not writable")
+	}
+	l := newLeader(t)
+	ctx := context.Background()
+	key := l.store.Creds().Cert.PrivateKey.(ed25519.PrivateKey)
+	short, err := l.ca.Issue(key.Public().(ed25519.PublicKey), "n1", time.Now(), 5*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.reg.SetNodeCert(ctx, "n1", short.Serial)
+	if err := l.store.Replace(short.DER); err != nil {
+		t.Fatal(err)
+	}
+	l.live.Refresh(ctx)
+	var told []error
+	r := &Renewer{Store: l.store, Self: l.live.Self, IsLeader: func() bool { return true }, Authority: l.auth, Grace: time.Millisecond, Wait: time.Second,
+		Blocked: func(err error) { told = append(told, err) }}
+
+	dir := config.ClusterDir(l.confPath)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
+	if done, err := r.Once(ctx); done || !errors.Is(err, ErrIdentityReadOnly) {
+		t.Fatalf("a renewal in a directory the daemon cannot write: %v, %v", done, err)
+	}
+	if n, _ := l.reg.GetNode(ctx, "n1"); n.CertSerial != short.Serial {
+		t.Fatal("the leader issued a certificate the node could not keep")
+	}
+	if len(told) != 1 || !errors.Is(told[0], ErrIdentityReadOnly) {
+		t.Fatalf("Blocked was told %v", told)
+	}
+
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := r.Once(ctx); err != nil || !done {
+		t.Fatalf("the renewal once the directory can be written: %v, %v", done, err)
+	}
+	if len(told) != 2 || told[1] != nil {
+		t.Fatalf("Blocked was told %v", told)
+	}
+	if left, _ := os.ReadDir(dir); len(left) != 3 {
+		t.Fatalf("the write check left files in %s: %v", dir, left)
+	}
+}
+
+// The joiner's own claims about itself are stored and acted on later, so each has the shape the cloud
+// gives it; a refusal spends nothing.
+func TestJoinRefusesIdentitiesThatAreNotTheClouds(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	tok := l.token(t, TokenOptions{})
+	secret, _ := tokenSecretBytes(tok)
+	key, _ := NewKey()
+	csr, _ := NewCSR(key, "second")
+	build := func(edit func(*peerapi.JoinRequest)) peerapi.JoinRequest {
+		ch := l.auth.Challenge()
+		req := peerapi.JoinRequest{TokenID: tok.ID, Nonce: ch.Nonce, Proof: Proof(secret, ch.Nonce, csr, "second"), CSR: csr, Name: "second",
+			Region: "eu-west-1", PeerAddr: "127.0.0.1:7443", Version: "v0.2.0", ArtifactPins: testPins}
+		edit(&req)
+		return req
+	}
+	code := func(err error) string {
+		var ce *Error
+		if errors.As(err, &ce) {
+			return ce.Code
+		}
+		return ""
+	}
+	good := &registry.NodeAWS{InstanceID: "i-0123456789abcdef0", Zone: "eu-west-1a", Region: "eu-west-1", AllocationID: "eipalloc-0abc1234ef567890a"}
+	for name, c := range map[string]struct {
+		edit func(*peerapi.JoinRequest)
+		want string
+	}{
+		"an instance id with a path": {func(r *peerapi.JoinRequest) { r.Provider.AWS = &registry.NodeAWS{InstanceID: "i-../../x"} }, "bad_provider"},
+		"a short instance id":        {func(r *peerapi.JoinRequest) { r.Provider.AWS = &registry.NodeAWS{InstanceID: "i-0abc"} }, "bad_provider"},
+		"a region with spaces": {func(r *peerapi.JoinRequest) {
+			a := *good
+			a.Region = "eu west 1"
+			r.Provider.AWS = &a
+		}, "bad_provider"},
+		"a zone that is a sentence": {func(r *peerapi.JoinRequest) {
+			a := *good
+			a.Zone = "any zone you like"
+			r.Provider.AWS = &a
+		}, "bad_provider"},
+		"an allocation that is not": {func(r *peerapi.JoinRequest) {
+			a := *good
+			a.AllocationID = "eipalloc-zzz"
+			r.Provider.AWS = &a
+		}, "bad_provider"},
+		"a release name of a book":      {func(r *peerapi.JoinRequest) { r.Version = strings.Repeat("v", 200) }, "bad_version"},
+		"a release name with a newline": {func(r *peerapi.JoinRequest) { r.Version = "v0.2.0\nadmin" }, "bad_version"},
+	} {
+		if _, err := l.auth.Join(ctx, build(c.edit)); code(err) != c.want {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if ns, _ := l.reg.ListNodes(ctx); len(ns) != 1 {
+		t.Fatalf("a refused join created a node: %v", ns)
+	}
+	resp, err := l.auth.Join(ctx, build(func(r *peerapi.JoinRequest) { r.Provider.AWS = good }))
+	if err != nil {
+		t.Fatalf("a well-formed identity: %v", err)
+	}
+	if n, _ := l.reg.GetNode(ctx, resp.NodeID); n.Provider.AWS == nil || n.Provider.AWS.InstanceID != good.InstanceID {
+		t.Fatalf("the node row: %+v", n)
+	}
+}
+
+// Challenges are rationed per address, and the peer API tells the address of a caller with no
+// certificate to the authority.
+func TestChallengesAreRationedPerAddress(t *testing.T) {
+	l := newLeader(t)
+	tooMany := func(err error) bool {
+		var ce *Error
+		return errors.As(err, &ce) && ce.Status == http.StatusTooManyRequests && ce.Code == "too_many_requests"
+	}
+	for i := 0; i < challengeBurst; i++ {
+		if _, err := l.auth.ChallengeFrom("192.0.2.1"); err != nil {
+			t.Fatalf("challenge %d: %v", i, err)
+		}
+	}
+	if _, err := l.auth.ChallengeFrom("192.0.2.1"); !tooMany(err) {
+		t.Fatalf("the challenge beyond the burst: %v", err)
+	}
+	if _, err := l.auth.ChallengeFrom("192.0.2.2"); err != nil {
+		t.Fatalf("another address was held up: %v", err)
+	}
+	l.clk.Advance(challengeEvery)
+	if _, err := l.auth.ChallengeFrom("192.0.2.1"); err != nil {
+		t.Fatalf("a challenge after the wait: %v", err)
+	}
+	if _, err := l.auth.ChallengeFrom("192.0.2.1"); !tooMany(err) {
+		t.Fatalf("a second challenge after one wait: %v", err)
+	}
+	for i := 0; i < 100; i++ { // no address, no ration (the caller is not remote)
+		if _, err := l.auth.ChallengeFrom(""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2*maxBuckets; i++ {
+		_, _ = l.auth.ChallengeFrom(fmt.Sprintf("10.%d.%d.%d", i>>16&255, i>>8&255, i&255))
+	}
+	l.auth.mu.Lock()
+	n := len(l.auth.buckets)
+	l.auth.mu.Unlock()
+	if n > maxBuckets {
+		t.Fatalf("%d addresses remembered", n)
+	}
+
+	// Over the wire: the address is the one the connection came from.
+	ctx := context.Background()
+	c, err := mesh.DialClient(ctx, l.cfg.PeerAddr(), "leader", mesh.PinnedTLS(l.ca.Fingerprint(), nil, time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ok := 0
+	var last error
+	for i := 0; i < challengeBurst+5; i++ {
+		var ch peerapi.JoinChallenge
+		if last = c.Call(ctx, "GET", peerapi.PathJoin, nil, &ch); last == nil {
+			ok++
+		}
+	}
+	var re *mesh.RemoteError
+	if ok < challengeBurst || ok > challengeBurst+2 || !errors.As(last, &re) || re.Status != http.StatusTooManyRequests || re.Code != "too_many_requests" {
+		t.Fatalf("%d challenges served; the last: %v", ok, last)
+	}
+}
+
 // ---- the resolver ----
 
 func TestAWSResolverUsesTheCurrentAddressesOfThePeer(t *testing.T) {
@@ -560,10 +980,18 @@ func TestAWSResolverUsesTheCurrentAddressesOfThePeer(t *testing.T) {
 	if err != nil || strings.Join(got, ",") != "10.77.0.5:7443,203.0.113.9:7443" {
 		t.Fatalf("same region: %v, %v", got, err)
 	}
-	peer.Provider.AWS.Region = "us-east-1"
+	// The client asks the region this node runs in, so a peer in another region is not looked up; a
+	// resolver that does not know its own region tries.
+	other := peer
+	other.Provider = registry.NodeProvider{AWS: &registry.NodeAWS{InstanceID: "i-0peer", Region: "us-east-1"}}
+	calls := len(f.Calls())
 	r2 := &AWSResolver{EC2: ec2, Self: func() registry.Node { return self }}
-	if got, _ = r2.Addrs(context.Background(), peer); strings.Join(got, ",") != "203.0.113.9:7443,10.77.0.5:7443" {
-		t.Fatalf("another region: %v", got)
+	if got, err = r2.Addrs(context.Background(), other); err != nil || len(got) != 0 || len(f.Calls()) != calls {
+		t.Fatalf("another region: %v, %v, %d calls", got, err, len(f.Calls())-calls)
+	}
+	unaware := &AWSResolver{EC2: ec2}
+	if got, _ = unaware.Addrs(context.Background(), other); strings.Join(got, ",") != "203.0.113.9:7443,10.77.0.5:7443" {
+		t.Fatalf("a resolver without a region of its own: %v", got)
 	}
 	// Answers are cached, so a dial that retries does not call EC2 each time.
 	before := len(f.Calls())

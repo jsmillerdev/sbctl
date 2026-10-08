@@ -48,7 +48,13 @@ func (p *PeerAPI) Register(m *mesh.Mux) {
 			respond(w, err)
 			return
 		}
-		mesh.RespondJSON(w, http.StatusOK, p.Authority.Challenge())
+		peer, _ := mesh.PeerFrom(r.Context())
+		ch, err := p.Authority.ChallengeFrom(peer.Remote)
+		if err != nil {
+			respond(w, err)
+			return
+		}
+		mesh.RespondJSON(w, http.StatusOK, ch)
 	})
 	m.Handle("POST "+peerapi.PathJoin, func(w http.ResponseWriter, r *http.Request) {
 		var req peerapi.JoinRequest

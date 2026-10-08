@@ -21,8 +21,9 @@ type InstanceDescriber interface {
 // AWSResolver finds the current address of a peer on AWS. The registry's peer_addr is a hint: a
 // node that lost its Elastic IP to a takeover (design 2.10.6) is on an auto-assigned public address,
 // or only on a private one, and the survivor reaches it through the addresses EC2 reports for its
-// instance. A peer in the same region is tried on its private address first. A node without an AWS
-// identity in its row gets no address from here.
+// instance. A peer in the same region is tried on its private address first. The lookup goes to the
+// region this node runs in, so a peer in another region gets no address from here (it is dialed on
+// the peer_addr of its row), and so does a node without an AWS identity in its row.
 type AWSResolver struct {
 	EC2 InstanceDescriber
 	// Self is this node, to tell a peer in its region from one in another.
@@ -47,7 +48,7 @@ var _ mesh.AddrResolver = (*AWSResolver)(nil)
 
 // Addrs implements mesh.AddrResolver.
 func (r *AWSResolver) Addrs(ctx context.Context, n registry.Node) ([]string, error) {
-	if n.Provider.AWS == nil || n.Provider.AWS.InstanceID == "" {
+	if n.Provider.AWS == nil || n.Provider.AWS.InstanceID == "" || r.otherRegion(n) {
 		return nil, nil
 	}
 	id := n.Provider.AWS.InstanceID
@@ -115,6 +116,15 @@ func (r *AWSResolver) port(n registry.Node) string {
 		return strconv.Itoa(r.Port)
 	}
 	return strconv.Itoa(config.PortPeer)
+}
+
+// otherRegion reports whether n is known to be in another region than this node.
+func (r *AWSResolver) otherRegion(n registry.Node) bool {
+	if r.Self == nil {
+		return false
+	}
+	a, b := r.Self().Provider.AWS, n.Provider.AWS
+	return a != nil && b != nil && a.Region != "" && b.Region != "" && a.Region != b.Region
 }
 
 func (r *AWSResolver) sameRegion(n registry.Node) bool {

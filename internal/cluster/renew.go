@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -26,6 +27,9 @@ type Renewer struct {
 	Authority *Authority
 	Log       *slog.Logger
 	Now       func() time.Time
+	// Blocked, when set, is told why the certificate cannot be renewed (the daemon cannot write the
+	// cluster directory), and told nil when it can, each time the directory is looked at.
+	Blocked func(err error)
 	// Every is how often the certificate is looked at; zero is six hours. Grace is the wait after the
 	// serial shows; zero is ten seconds. Wait bounds the wait for the serial; zero is two minutes.
 	Every, Grace, Wait time.Duration
@@ -38,7 +42,18 @@ func (r *Renewer) now() time.Time {
 	return time.Now()
 }
 
-// Run checks the certificate until ctx ends.
+// writable checks the cluster directory and tells Blocked what it found.
+func (r *Renewer) writable() error {
+	err := r.Store.Writable()
+	if r.Blocked != nil {
+		r.Blocked(err)
+	}
+	return err
+}
+
+// Run checks the certificate until ctx ends. It looks at the cluster directory when it starts, so
+// that a unit that does not let the daemon write there is reported while the certificate has most of
+// its life left, not on the day it has to be replaced.
 func (r *Renewer) Run(ctx context.Context) error {
 	every := r.Every
 	if every <= 0 {
@@ -46,9 +61,24 @@ func (r *Renewer) Run(ctx context.Context) error {
 	}
 	tick := time.NewTicker(every)
 	defer tick.Stop()
+	until := ""
+	if c := r.Store.Creds(); c != nil {
+		until = c.NotAfter.Format(time.RFC3339)
+	}
+	if err := r.writable(); err != nil {
+		if r.Log != nil {
+			r.Log.Error("the node certificate cannot be renewed; the current one works until it expires", "not_after", until, "error", err)
+		}
+	} else if r.Log != nil {
+		r.Log.Info("the node certificate is renewed before it expires", "not_after", until)
+	}
 	for {
 		if _, err := r.Once(ctx); err != nil && r.Log != nil {
-			r.Log.Warn("certificate renewal failed; it is tried again later", "error", err)
+			if errors.Is(err, ErrIdentityReadOnly) {
+				r.Log.Error("the node certificate is due and cannot be renewed", "error", err)
+			} else {
+				r.Log.Warn("certificate renewal failed; it is tried again later", "error", err)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -66,6 +96,11 @@ func (r *Renewer) Once(ctx context.Context) (bool, error) {
 	}
 	if cur.NotAfter.Sub(r.now()) > RenewBefore {
 		return false, nil
+	}
+	// A new certificate that the node could not keep would lock it out at its next restart, so the
+	// old one is left to run out in that case.
+	if err := r.writable(); err != nil {
+		return false, err
 	}
 	key, ok := cur.Cert.PrivateKey.(ed25519.PrivateKey)
 	if !ok {
@@ -117,10 +152,11 @@ func (r *Renewer) Once(ctx context.Context) (bool, error) {
 	case <-time.After(grace):
 	}
 	if err := r.Store.Replace(der); err != nil {
-		// The certificate is in use in memory when only the file write failed.
+		// The leader has recorded the new serial, so the old file is no good to anyone: the new
+		// certificate stays in use in memory and the operator is told the file is stale.
 		if r.Store.Creds().Serial == resp.Serial {
 			if r.Log != nil {
-				r.Log.Warn("certificate renewed", "serial", resp.Serial, "warning", err.Error())
+				r.Log.Error("certificate renewed but its file was not written; a restart of the daemon would lock the node out", "serial", resp.Serial, "error", err.Error())
 			}
 			return true, nil
 		}

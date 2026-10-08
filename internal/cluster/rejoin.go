@@ -30,6 +30,9 @@ type RejoinOptions struct {
 	StopLocal func(ctx context.Context) error
 	// Seed builds the system standby from the leader's archive and starts it; see SeedFunc. Required.
 	Seed SeedFunc
+	// Preflight, when set, runs before anything is asked of the leader or changed here. An error stops
+	// the rejoin with the node as it was: use it for what Seed needs and a refusal later would waste.
+	Preflight func(ctx context.Context) error
 	// DSNs are the sockets the standby answers on.
 	DSNs          []string
 	StreamTimeout time.Duration
@@ -66,6 +69,11 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	if o.Preflight != nil {
+		if err := o.Preflight(ctx); err != nil {
+			return nil, err
+		}
+	}
 	rec, err := ReadFenced(o.Cfg)
 	if err != nil {
 		return nil, err
@@ -81,18 +89,20 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster: a rejoin keeps the node's identity, and it cannot be read: %w", err)
 	}
-	addr, leaderID := o.Leader, rec.Leader
+	// The record names the leader as it was when the node was fenced, and the node expects that one
+	// at the address the record keeps. An address the operator gives may be a later leader's, so no
+	// node id is expected there: the certificate is checked against the cluster CA, and the node that
+	// answers must be the leader, which the leader's own refusal of anyone else enforces.
+	addr, want := o.Leader, ""
 	if addr == "" {
-		addr = rec.Peers[rec.Leader]
+		addr, want = rec.Peers[rec.Leader], rec.Leader
 	}
 	if addr == "" {
 		return nil, fmt.Errorf("cluster: the address of the leader (%s) is not known; pass --leader host:port", rec.Leader)
 	}
 
 	getCreds := func() *mesh.Credentials { return creds }
-	// The leader's node id is the one the record names; when the operator named another address the
-	// id is learned from the certificate it presents.
-	c, err := mesh.DialClient(ctx, addr, leaderID, mesh.ClientTLS(getCreds, leaderID, nil, now))
+	c, err := mesh.DialClient(ctx, addr, firstNonEmpty(want, "leader"), mesh.ClientTLS(getCreds, want, nil, now))
 	if err != nil {
 		return nil, fmt.Errorf("cluster: cannot reach the leader at %s: %w", addr, err)
 	}
@@ -194,10 +204,12 @@ func pruneDiverged(cfg *config.Config, now time.Time) {
 const RemovedReason = "this node was removed from the cluster; join it again with a token from `supavise node token` (`supavise node join`)"
 
 // Retire is what a node that learns it was removed from the cluster does: it stops what runs, sets the
-// project directories aside like a rejoin does, deletes its cluster identity and the cluster settings
-// it was given, and records that it was removed. The daemon then starts as a node that is down like a
+// project directories aside like a rejoin does, records that it was removed, and deletes its cluster
+// identity and the cluster settings it was given. The daemon then starts as a node that is down like a
 // fenced one, with the reason, until `supavise node join` makes it a member again; the master key
-// stays. It returns the directories it set aside.
+// stays. The record comes before the deletion, so that a node whose files cannot be deleted (the unit
+// may not let the daemon write there) still comes up down; the error then names what stayed, and
+// `supavise node join` clears it. It returns the directories it set aside.
 func Retire(ctx context.Context, cfg *config.Config, configPath string, stop func(context.Context) error, now time.Time) ([]string, error) {
 	if stop != nil {
 		if err := stop(ctx); err != nil {
@@ -208,12 +220,31 @@ func Retire(ctx context.Context, cfg *config.Config, configPath string, stop fun
 	if err != nil {
 		return moved, err
 	}
-	dir := config.ClusterDir(configPath)
-	for _, f := range []string{config.NodeCertFile, config.NodeKeyFile, config.ClusterCAFile, JoinStateFile} {
-		_ = os.Remove(filepath.Join(dir, f))
+	if err := WriteFenced(cfg, FencedRecord{Reason: RemovedReason, Removed: true, At: now.UTC()}); err != nil {
+		return moved, err
 	}
-	_ = os.Remove(filepath.Join(config.ConfigDDir(configPath), config.ClusterConfigFile))
-	return moved, WriteFenced(cfg, FencedRecord{Reason: RemovedReason, Removed: true, At: now.UTC()})
+	return moved, forgetIdentity(configPath)
+}
+
+// forgetIdentity deletes the node's certificate, key, the CA it was given, the state of an unfinished
+// join and the cluster settings the leader sent. A file that is not there is fine; every other
+// failure is reported, after the rest were tried.
+func forgetIdentity(configPath string) error {
+	dir := config.ClusterDir(configPath)
+	var errs []error
+	for _, p := range []string{
+		filepath.Join(dir, config.NodeCertFile), filepath.Join(dir, config.NodeKeyFile), filepath.Join(dir, config.ClusterCAFile),
+		filepath.Join(dir, JoinStateFile), filepath.Join(config.ConfigDDir(configPath), config.ClusterConfigFile),
+	} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("cluster: the node's identity was not deleted completely (the daemon's unit must allow writes to %s and %s): %w",
+			dir, config.ConfigDDir(configPath), errors.Join(errs...))
+	}
+	return nil
 }
 
 // PeersOf lists the peer addresses of the nodes other than self, for the fenced record.

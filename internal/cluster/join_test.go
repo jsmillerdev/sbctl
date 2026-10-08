@@ -178,6 +178,7 @@ func newLeader(t *testing.T) *leaderFixture {
 		t.Fatal(err)
 	}
 	clk := &fakeClock{}
+	reg.Now = clk.Now // the rows' joining times follow the clock the tests move
 	if _, err := EnsureFounder(ctx, reg, ca, s.cfg, s.confPath, "v0.2.0", clk.Now()); err != nil {
 		t.Fatal(err)
 	}

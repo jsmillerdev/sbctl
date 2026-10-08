@@ -66,10 +66,31 @@ func (s *Store) Creds() *mesh.Credentials { return s.cur.Load() }
 // Dir is the cluster directory.
 func (s *Store) Dir() string { return s.dir }
 
+// ErrIdentityReadOnly: the daemon cannot write to the cluster directory (the unit may not allow it),
+// so a renewed certificate could not be kept.
+var ErrIdentityReadOnly = errors.New("cluster: the daemon cannot write to the cluster directory")
+
+// Writable checks that a file can be created in the cluster directory, which keeping a renewed
+// certificate takes. It creates a file and removes it.
+func (s *Store) Writable() error {
+	f, err := os.CreateTemp(s.dir, ".write-check-*")
+	if err != nil {
+		return fmt.Errorf("%w (%s): %v", ErrIdentityReadOnly, s.dir, err)
+	}
+	name := f.Name()
+	_ = f.Close()
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("%w (%s): %v", ErrIdentityReadOnly, s.dir, err)
+	}
+	return nil
+}
+
 // Replace uses a new certificate (DER) for the node's key from now on and writes it to the cluster
-// directory. A write that fails (the daemon may not be allowed to write there) leaves the new
-// certificate in use in memory; the error says the file was not updated, and the node asks again
-// at its next start, when the old file is still valid.
+// directory. By the time it is called the leader has recorded the new serial, and peers admit a node
+// by the serial in the registry, so the old file no longer works for anyone. A write that fails
+// leaves the new certificate in use in memory only: after the next restart the node loads the old
+// file and no peer admits it. The renewer checks Writable before it asks for a certificate, so that a
+// directory the daemon cannot write to is found while the current certificate still works.
 func (s *Store) Replace(certDER []byte) error {
 	old := s.cur.Load()
 	if old == nil {
