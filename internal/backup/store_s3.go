@@ -328,7 +328,9 @@ func (s *S3Store) GetTagged(ctx context.Context, key string) ([]byte, string, er
 	return b, aws.ToString(out.ETag), nil
 }
 
-// PutIf implements ConditionalStore with If-None-Match: * (no tag) or If-Match: <ETag>.
+// PutIf implements ConditionalStore with If-None-Match: * (no tag) or If-Match: <ETag>. A service
+// that answers 501 or refuses the header as a bad request (400 InvalidArgument or MalformedHeader)
+// counts as one without conditional writes.
 func (s *S3Store) PutIf(ctx context.Context, key string, data []byte, tag string) error {
 	if err := validKey(key); err != nil {
 		return err
@@ -357,7 +359,9 @@ func (s *S3Store) PutIf(ctx context.Context, key string, data []byte, tag string
 	switch {
 	case status == http.StatusPreconditionFailed || code == "PreconditionFailed" || code == "ConditionalRequestConflict":
 		return fmt.Errorf("%w: s3 put %s", ErrPreconditionFailed, k)
-	case status == http.StatusNotImplemented || code == "NotImplemented":
+	case status == http.StatusNotImplemented || code == "NotImplemented",
+		// A service that does not know the header may refuse it as a bad request instead.
+		status == http.StatusBadRequest && (code == "InvalidArgument" || code == "MalformedHeader"):
 		return fmt.Errorf("%w: s3 put %s: %v", ErrConditionalUnsupported, k, err)
 	}
 	return fmt.Errorf("backup: s3 put %s: %w%s", k, err, accessDeniedHint(err))

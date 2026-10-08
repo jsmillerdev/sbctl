@@ -25,12 +25,17 @@ func BackupIDOf(b *registry.Backup) string {
 // EnsureBase implements BaseBackupEnsurer. Calls for one ref run one at a time, so two replicas
 // of a project that are set up together share the backup the first call takes. A backup counts
 // when it is complete, on the archive's current timeline and its first WAL file is still in the
-// archive; its age is the time since it finished.
+// archive; its age is the time since it finished. A call that waits for another one gives up when
+// its context ends.
 func (s *Service) EnsureBase(ctx context.Context, ref string, maxAge time.Duration) (*registry.Backup, error) {
 	if err := validRef(ref); err != nil {
 		return nil, err
 	}
-	defer s.ensure.lock(ref)()
+	unlock, err := s.ensure.lock(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if maxAge > 0 {
 		m, err := s.newestUsableBase(ctx, ref)
 		if err != nil {
@@ -46,26 +51,31 @@ func (s *Service) EnsureBase(ctx context.Context, ref string, maxAge time.Durati
 	return s.BaseBackup(ctx, ref)
 }
 
-// refLocks is one mutex per ref.
+// refLocks is one lock per ref: a channel with room for one, so that a wait can end with its context.
 type refLocks struct {
 	mu sync.Mutex
-	m  map[string]*sync.Mutex
+	m  map[string]chan struct{}
 }
 
-// lock takes ref's mutex and returns the function that releases it.
-func (l *refLocks) lock(ref string) (unlock func()) {
+// lock takes ref's lock and returns the function that releases it, or ctx's error when the context
+// ends first.
+func (l *refLocks) lock(ctx context.Context, ref string) (unlock func(), err error) {
 	l.mu.Lock()
 	if l.m == nil {
-		l.m = map[string]*sync.Mutex{}
+		l.m = map[string]chan struct{}{}
 	}
-	m := l.m[ref]
-	if m == nil {
-		m = &sync.Mutex{}
-		l.m[ref] = m
+	ch := l.m[ref]
+	if ch == nil {
+		ch = make(chan struct{}, 1)
+		l.m[ref] = ch
 	}
 	l.mu.Unlock()
-	m.Lock()
-	return m.Unlock
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // newestUsableBase is the newest complete base backup of ref that a standby can start from, or
