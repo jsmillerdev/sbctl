@@ -321,7 +321,20 @@ func (r *run) run(ctx context.Context) error {
 	if stackCmd != "" {
 		o.say("The AWS stack was not updated. To update it, run:\n\n  %s", stackCmd)
 	}
+	r.notifyInfraBehind(ctx)
 	return nil
+}
+
+// notifyInfraBehind raises infra_behind when a timer's run leaves the AWS stack behind the release
+// it needs. A run with an operator at the terminal has printed the gap and the command, and a
+// read-only run (--plan) tells nobody.
+func (r *run) notifyInfraBehind(ctx context.Context) {
+	o := &r.o
+	if !o.Unattended || o.Plan || !r.plan.StackPending() {
+		return
+	}
+	g := r.plan.Stack
+	o.notify(ctx, Event{Kind: EventInfraBehind, From: r.node.Version, To: r.plan.To, Cause: fmt.Sprintf("the AWS stack is at revision %d and %s needs %d", g.Report.Have, r.plan.To, g.Need)})
 }
 
 // stackOnly ends a run whose plan changes nothing on the node and has an AWS stack to update (or,
@@ -330,10 +343,7 @@ func (r *run) run(ctx context.Context) error {
 func (r *run) stackOnly(ctx context.Context, cand *Candidate) error {
 	o := &r.o
 	if !o.AWS {
-		if r.plan.StackPending() {
-			g := r.plan.Stack
-			o.notify(ctx, Event{Kind: EventInfraBehind, From: r.node.Version, To: r.plan.To, Cause: fmt.Sprintf("the AWS stack is at revision %d and %s needs %d", g.Report.Have, r.plan.To, g.Need)})
-		}
+		r.notifyInfraBehind(ctx)
 		return nil
 	}
 	if o.Plan {

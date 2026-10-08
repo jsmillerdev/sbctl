@@ -320,13 +320,25 @@ func TestStackOnly(t *testing.T) {
 	if len(events) != 1 || events[0].Kind != EventInfraBehind || !events[0].Unattended || !strings.Contains(events[0].Cause, "revision 1") {
 		t.Errorf("events = %+v", events)
 	}
-	// An interactive run only prints the plan.
+	// An interactive run, and a read-only one, only print the plan: nobody is alerted to what the
+	// operator is looking at.
+	for _, plan := range []bool{false, true} {
+		h = stackOnly()
+		events = nil
+		o = runOpts(h)
+		o.Plan = plan
+		o.Notify = func(_ context.Context, ev Event) { events = append(events, ev) }
+		if err := Run(context.Background(), h, o); err != nil || len(events) != 0 {
+			t.Errorf("plan=%v: %v, %v", plan, err, events)
+		}
+	}
 	h = stackOnly()
 	events = nil
 	o = runOpts(h)
+	o.Unattended, o.Plan = true, true
 	o.Notify = func(_ context.Context, ev Event) { events = append(events, ev) }
-	if err := Run(context.Background(), h, o); err != nil || len(events) != 1 {
-		t.Errorf("%v, %v", err, events)
+	if err := Run(context.Background(), h, o); err != nil || len(events) != 0 {
+		t.Errorf("unattended --plan: %v, %v", err, events)
 	}
 
 	// With --aws: the update, with no node gates, no confirmation under --yes, no backups.
@@ -363,6 +375,53 @@ func TestStackOnly(t *testing.T) {
 	o.AWS = true
 	if err := Run(context.Background(), h, o); err != nil || !h.has("stack v1.1.0") {
 		t.Errorf("a current stack with --aws: %v, %s", err, h.order())
+	}
+}
+
+// An unattended run that changes the node and leaves the stack behind raises infra_behind once it
+// has succeeded; one that fails raises none.
+func TestUnattendedRunWithAStackGapRaisesInfraBehindAfterTheUpgrade(t *testing.T) {
+	var events []Event
+	notify := func(_ context.Context, ev Event) { events = append(events, ev) }
+	kinds := func() string {
+		var k []string
+		for _, ev := range events {
+			k = append(k, ev.Kind)
+		}
+		return strings.Join(k, ",")
+	}
+
+	h := newFakeHost()
+	h.node.ConvergeKnown, h.node.ConvergeRevision = true, 2
+	h.node.Infra = &infra.Report{Platform: "aws", Stack: "supavise", Have: 1, Need: 2}
+	h.info = newInfoWithHost()
+	o := runOpts(h)
+	o.Unattended, o.Notify = true, notify
+	if err := Run(context.Background(), h, o); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	if got := kinds(); got != EventStarted+","+EventSucceeded+","+EventInfraBehind {
+		t.Fatalf("events = %s", got)
+	}
+	if last := events[len(events)-1]; !last.Unattended || !strings.Contains(last.Cause, "revision 1") {
+		t.Errorf("event = %+v", last)
+	}
+
+	events = nil
+	h = newFakeHost()
+	h.node.ConvergeKnown, h.node.ConvergeRevision = true, 2
+	h.node.Infra = &infra.Report{Platform: "aws", Stack: "supavise", Have: 1, Need: 2}
+	h.info = newInfoWithHost()
+	h.sharedErr, h.sharedErrOnce = errors.New("realtime did not answer"), true
+	o = runOpts(h)
+	o.Unattended, o.Notify = true, notify
+	if err := Run(context.Background(), h, o); code(t, err) != ExitRolledBack {
+		t.Fatalf("err = %v", err)
+	}
+	for _, ev := range events {
+		if ev.Kind == EventInfraBehind {
+			t.Errorf("a failed upgrade raised infra_behind: %s", kinds())
+		}
 	}
 }
 
