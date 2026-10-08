@@ -88,9 +88,13 @@ type AdmitFunc func(nodeID, serial string) (registry.NodeState, error)
 // stream its first copy of the system cluster; a fenced node must hear that it is fenced. What
 // each state may then do is the stream and request policy's business (Authorizer, rpcAllowed).
 // A node that is left, unknown or holds an older certificate is refused at the handshake.
-func AdmitFromTopology(t Topology) AdmitFunc {
+func AdmitFromTopology(t Topology) AdmitFunc { return AdmitFromNodes(t.Nodes) }
+
+// AdmitFromNodes is AdmitFromTopology over any list of node rows: a node that is starting up and
+// has read the registry once uses it before it has a Topology.
+func AdmitFromNodes(nodes func() []registry.Node) AdmitFunc {
 	return func(id, serial string) (registry.NodeState, error) {
-		for _, n := range t.Nodes() {
+		for _, n := range nodes() {
 			if n.ID != id {
 				continue
 			}
@@ -158,6 +162,11 @@ func serverTLS(creds func() *Credentials, admit AdmitFunc, now func() time.Time)
 			return err
 		},
 	}
+}
+
+// ClientTLS is the configuration for dialing node want with the node's own credentials: see clientTLS.
+func ClientTLS(creds func() *Credentials, want string, admit AdmitFunc, now func() time.Time) *tls.Config {
+	return clientTLS(creds, want, admit, now)
 }
 
 // clientTLS is the configuration for dialing node want: it presents this node's certificate and
