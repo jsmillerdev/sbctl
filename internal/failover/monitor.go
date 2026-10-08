@@ -138,6 +138,9 @@ func (m *Monitor) arm(ctx context.Context) string {
 		reason = "automatic failover needs [failover] fencing = \"aws\""
 	default:
 		if err := o.probe(ctx); err != nil {
+			if ctx.Err() != nil { // the daemon is stopping: that is no verdict on the fencer
+				return o.autoOff()
+			}
 			reason = err.Error()
 		}
 	}
@@ -158,13 +161,13 @@ func (m *Monitor) arm(ctx context.Context) string {
 
 // gates are the conditions that hold for every automatic move. It returns the reason one is
 // closed, or "".
-func (m *Monitor) gates(ctx context.Context, snap cluster.Snapshot, home, target registry.Node) string {
+func (m *Monitor) gates(ctx context.Context, snap cluster.Snapshot, ref string, home, target registry.Node) string {
 	o := m.o
 	now := o.d.Now()
 	if snap.Maintenance.Active(now) {
 		return fmt.Sprintf("maintenance on %s until %s (%s)", snap.Maintenance.Node, snap.Maintenance.Until.Format(time.RFC3339), snap.Maintenance.Reason)
 	}
-	if reason := m.cooldown(ctx, now); reason != "" {
+	if reason := m.cooldown(ctx, now, ref); reason != "" {
 		return reason
 	}
 	if home.Version != "" && target.Version != "" && home.Version != target.Version {
@@ -176,10 +179,15 @@ func (m *Monitor) gates(ctx context.Context, snap cluster.Snapshot, home, target
 	return ""
 }
 
-// cooldown returns a reason when an unplanned failover ran within [failover] cooldown_minutes.
-// A failed or aborted one counts: a node that cannot finish a move should not try again every minute.
-func (m *Monitor) cooldown(ctx context.Context, now time.Time) string {
-	ms, err := m.o.store().ListMoves(ctx, "", 20)
+// cooldown returns a reason when an unplanned failover ran within [failover] cooldown_minutes. A failed
+// or aborted one counts: a node that cannot finish a move should not try again every minute.
+//
+// It is kept per what moves. In project mode a project waits for its own earlier failover, and for any
+// failover of the server (which moved every project): one project that failed over does not hold the
+// others back for an hour. A failover of the server counts the failovers of the server only: the leader
+// that died after a project of it failed over still has to be replaced. ref is "" for the server.
+func (m *Monitor) cooldown(ctx context.Context, now time.Time, ref string) string {
+	ms, err := m.o.store().ListMoves(ctx, "", cooldownLook)
 	if err != nil {
 		return "the moves log cannot be read: " + err.Error()
 	}
@@ -188,16 +196,29 @@ func (m *Monitor) cooldown(ctx context.Context, now time.Time) string {
 		if mv.Kind != registry.MoveFailover {
 			continue
 		}
+		switch {
+		case mv.Scope == registry.MoveServer:
+		case ref != "" && mv.Scope == registry.MoveProject && mv.Ref == ref:
+		default:
+			continue
+		}
 		at := mv.StartedAt
 		if mv.EndedAt != nil {
 			at = *mv.EndedAt
 		}
 		if now.Sub(at) < window {
-			return fmt.Sprintf("a failover ran at %s, within the cooldown of %s", at.Format(time.RFC3339), window)
+			what := "a failover of the server"
+			if mv.Scope == registry.MoveProject {
+				what = "a failover of this project"
+			}
+			return fmt.Sprintf("%s ran at %s, within the cooldown of %s", what, at.Format(time.RFC3339), window)
 		}
 	}
 	return ""
 }
+
+// cooldownLook is how many of the newest moves the cooldown reads.
+const cooldownLook = 200
 
 // serverTick is the follower's look at the leader.
 func (m *Monitor) serverTick(ctx context.Context, snap cluster.Snapshot) Decision {
@@ -267,7 +288,7 @@ func (m *Monitor) serverTick(ctx context.Context, snap cluster.Snapshot) Decisio
 	if err != nil {
 		return none("%v", err)
 	}
-	if reason := m.gates(ctx, snap, leader, self); reason != "" {
+	if reason := m.gates(ctx, snap, "", leader, self); reason != "" {
 		return none("%s", reason)
 	}
 	// A project with no replica has an unknown lag, and no automatic move runs on one: restoring it
@@ -379,7 +400,7 @@ func (m *Monitor) projectGate(ctx context.Context, snap cluster.Snapshot, ref st
 	if err != nil {
 		return err.Error()
 	}
-	if reason := m.gates(ctx, snap, home, target); reason != "" {
+	if reason := m.gates(ctx, snap, ref, home, target); reason != "" {
 		return fmt.Sprintf("project %s: %s", ref, reason)
 	}
 	return ""

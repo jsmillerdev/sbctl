@@ -232,3 +232,58 @@ func TestAPortThatIsNotWiredIsLoggedAndShownInReadiness(t *testing.T) {
 		t.Fatalf("gaps of the test world: %v", ports)
 	}
 }
+
+// ctxProvider is a fencer whose probe fails with the caller's context when it ends and passes otherwise.
+type ctxProvider struct {
+	*fakeProvider
+	calls int
+}
+
+func (p *ctxProvider) Probe(ctx context.Context) error {
+	p.calls++
+	return ctx.Err()
+}
+
+// An interrupted `supavise status`, or a request that timed out, ends the probe's context. That says
+// nothing about the fencer, and the next caller must not be told for a minute that the probe failed.
+func TestAProbeThatTheCallerCutShortIsNotRemembered(t *testing.T) {
+	w := serverWorld(t)
+	cp := &ctxProvider{fakeProvider: w.provider}
+	o := w.orch(func(d *Deps) { d.Provider = cp })
+	gone, cancel := context.WithCancel(w.ctx)
+	cancel()
+	if err := o.probe(gone); err == nil {
+		t.Fatal("a probe with a cancelled context passed")
+	}
+	if err := o.probe(w.ctx); err != nil || cp.calls != 2 {
+		t.Fatalf("the next caller: %v after %d probe(s)", err, cp.calls)
+	}
+	// What the fencer says is remembered, so that every status does not cost EC2 calls.
+	if err := o.probe(w.ctx); err != nil || cp.calls != 2 {
+		t.Fatalf("a repeated probe: %v after %d probe(s)", err, cp.calls)
+	}
+	r, err := o.Readiness(w.ctx)
+	if err != nil || strings.Contains(strings.Join(r.Blockers, "\n"), "fencer fails its probe") {
+		t.Fatalf("readiness after it: %+v, %v", r, err)
+	}
+}
+
+// The monitor's own context ends when the daemon stops: no verdict on the fencer, no alert.
+func TestTheMonitorDoesNotTurnAutomaticModeOffBecauseItsOwnContextEnded(t *testing.T) {
+	m := newMonitorRig(t, "server")
+	cp := &ctxProvider{fakeProvider: m.provider}
+	m.o.d.Provider = cp
+	gone, cancel := context.WithCancel(m.ctx)
+	cancel()
+	if reason := m.mon.arm(gone); reason != "" {
+		t.Fatalf("armed with a cancelled context: %q", reason)
+	}
+	for _, k := range m.alertKinds() {
+		if k == "failover_auto_off" {
+			t.Fatalf("alerts: %v", m.alerts)
+		}
+	}
+	if reason := m.mon.arm(m.ctx); reason != "" {
+		t.Fatalf("arm: %q", reason)
+	}
+}

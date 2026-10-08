@@ -227,7 +227,9 @@ func (o *Orchestrator) planProject(ctx context.Context, opts ProjectOptions) (*P
 	pl.Checks = append(pl.Checks, advice("capacity", fmt.Sprintf("%s already holds the replica, which counts against its capacity", to.Name)))
 
 	// A project whose primary answers is switched over (the old primary stops cleanly and nothing
-	// is lost); one that does not is failed over and its old primary is fenced first.
+	// is lost); one that does not is failed over and its old primary is fenced first. A paused
+	// project has no answering primary on purpose: its cluster is stopped cleanly already, so it is
+	// switched over too, and its control file gives the position the replica must reach.
 	healthy, detail, herr := o.projectHealthy(ctx, from, p.Ref)
 	switch {
 	case herr != nil:
@@ -236,6 +238,9 @@ func (o *Orchestrator) planProject(ctx context.Context, opts ProjectOptions) (*P
 	case healthy:
 		pl.Kind = string(registry.MoveSwitchover)
 		pl.Checks = append(pl.Checks, advice("primary", "healthy: a switchover, the old primary stops cleanly and becomes a replica"))
+	case p.Status == registry.StatusInactive:
+		pl.Kind = string(registry.MoveSwitchover)
+		pl.Checks = append(pl.Checks, advice("primary", "paused: a switchover, the stopped primary becomes a replica of the new home and the project stays paused"))
 	default:
 		pl.Kind = string(registry.MoveFailover)
 		pl.Checks = append(pl.Checks, advice("primary", fmt.Sprintf("not healthy (%s): a failover, the old primary is fenced first and loses what the replica has not received", detail)))

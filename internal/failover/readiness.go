@@ -29,8 +29,13 @@ func (o *Orchestrator) probe(ctx context.Context) error {
 	if !c.at.IsZero() && o.d.Now().Sub(c.at) < probeTTL {
 		return c.err
 	}
-	c.err = o.d.Provider.Probe(ctx)
-	c.at = o.d.Now()
+	err := o.d.Provider.Probe(ctx)
+	if err != nil && ctx.Err() != nil {
+		// The caller gave up (an interrupted status, a request that timed out): that says nothing about
+		// the fencer, and the next caller must not read it for a minute as a probe that failed.
+		return err
+	}
+	c.err, c.at = err, o.d.Now()
 	return c.err
 }
 

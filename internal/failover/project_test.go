@@ -3,12 +3,14 @@ package failover
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/failover/fenced"
+	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -494,5 +496,81 @@ func TestProjectResumeAtEveryStep(t *testing.T) {
 				t.Errorf("%d moves rows, want the one that was resumed", len(mvs))
 			}
 		})
+	}
+}
+
+// A paused project has no answering primary on purpose. It is switched over, not failed over: nothing
+// is fenced or set aside, the replica waits for the stopped cluster's last checkpoint, and the project
+// is paused on its new home like it was.
+func TestAPausedProjectIsSwitchedOverAndStaysPaused(t *testing.T) {
+	w := newWorld(t)
+	must(t, w.reg.SetProjectStatus(w.ctx, refA, registry.StatusInactive))
+	w.prim["n1/"+refA] = &primState{} // stopped by the pause: not running, not healthy
+	o := w.orch()
+
+	pl, err := o.PlanProject(w.ctx, ProjectOptions{Ref: refA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.Kind != string(registry.MoveSwitchover) || len(pl.Refused(false)) != 0 {
+		t.Fatalf("plan: %+v", pl)
+	}
+	if c := findCheck(t, pl, "primary"); !strings.Contains(c.Detail, "paused") {
+		t.Fatalf("check: %+v", c)
+	}
+
+	mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA, ExpectKind: string(registry.MoveSwitchover)})
+	if err != nil || mv.State != registry.MoveDone || mv.Kind != registry.MoveSwitchover {
+		t.Fatalf("move %+v, error %v\n%v", mv, err, w.snapshot())
+	}
+	w.assertNever("fence ")
+	w.assertNever("local.stop")
+	w.assertNever("aside ")
+	w.assertOrder("stop n1/"+refA, "promote n2/"+idAN2+" epoch=1 wait="+w.lsn[refA], "registry.SetProjectNode "+refA+" n2 1", "stop n2/"+refA, "demote n1/")
+	w.assertNever("start n2/" + refA)
+	w.assertNever("fleet.ensure " + refA)
+	if p := projectOf(t, w, refA); p.NodeID != "n2" || p.Status != registry.StatusInactive {
+		t.Fatalf("project: %+v", p)
+	}
+	if r := replicaOn(t, w, refA, "n1"); r == nil {
+		t.Fatal("the old home is a replica of the new one")
+	}
+	// A project that is not paused and does not answer is still failed over.
+	w2 := newWorld(t)
+	w2.prim["n1/"+refA].healthy = false
+	if pl, _ := w2.orch().PlanProject(w2.ctx, ProjectOptions{Ref: refA}); pl.Kind != string(registry.MoveFailover) {
+		t.Fatalf("plan: %+v", pl)
+	}
+}
+
+// The old home refuses to set its data aside while its registry copy still homes the project there; the
+// copy follows the leader by a moment, so the move asks again.
+func TestTheOldHomeIsAskedAgainWhileItsRegistryTrails(t *testing.T) {
+	trailing := &mesh.RemoteError{Node: "n1", Status: http.StatusConflict, Code: CodeHomedHere, Message: "the registry homes it on this node"}
+	run := func(t *testing.T, refusals int) (*world, string) {
+		w := newWorld(t)
+		w.prim["n1/"+refA].healthy = false
+		w.fail("aside n1/"+refA, trailing, refusals)
+		mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		return w, w.stepDetail(mv, "reseed-old")
+	}
+	w, detail := run(t, 3)
+	if n := w.count("aside n1/" + refA); n != 4 || strings.HasPrefix(detail, "warning:") {
+		t.Fatalf("%d tries, step %q", n, detail)
+	}
+	w, detail = run(t, -1)
+	if n := w.count("aside n1/" + refA); n != asideAttempts || !strings.HasPrefix(detail, "warning: the old primary's data") || !strings.Contains(detail, "supavise replicas add") {
+		t.Fatalf("%d tries, step %q", n, detail)
+	}
+	// Another refusal is not waited for.
+	w = newWorld(t)
+	w.prim["n1/"+refA].healthy = false
+	w.fail("aside n1/"+refA, errors.New("permission denied"), -1)
+	mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+	if err != nil || w.count("aside n1/"+refA) != 1 || !strings.HasPrefix(w.stepDetail(mv, "reseed-old"), "warning:") {
+		t.Fatalf("move %+v, error %v, %d tries", mv, err, w.count("aside n1/"+refA))
 	}
 }

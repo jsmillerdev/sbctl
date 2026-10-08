@@ -41,6 +41,10 @@ const (
 	PathPrimary = "/peer/v1/failover/primary/{ref}/{op}"
 )
 
+// CodeHomedHere is the code of the answer to an aside request for a project the node's registry still
+// homes on it.
+const CodeHomedHere = "homed_here"
+
 // Operations of PathPrimary.
 const (
 	OpStop   = "stop"
@@ -695,9 +699,16 @@ func (o *Orchestrator) handlePrimary(w http.ResponseWriter, r *http.Request) {
 		res.Healthy, res.Detail, err = o.d.LocalPrimaries.Healthy(ctx, ref)
 	case OpAside:
 		// Data moves aside only for a project the registry homes elsewhere: the leader homes the
-		// project on the replica's node before it asks, and one this node still homes is live.
-		if p, gerr := o.store().GetProject(ctx, ref); gerr == nil && p.NodeID == o.self().ID {
-			writePeerError(w, http.StatusConflict, "homed_here", "the registry homes "+ref+" on this node: its data is not set aside")
+		// project on the replica's node before it asks, and one this node still homes is live. A
+		// registry that cannot be read cannot say, and a rename of live data is not undone by a
+		// retry: the answer is no, and the leader asks again.
+		p, gerr := o.store().GetProject(ctx, ref)
+		switch {
+		case gerr == nil && p.NodeID == o.self().ID:
+			writePeerError(w, http.StatusConflict, CodeHomedHere, "the registry homes "+ref+" on this node: its data is not set aside")
+			return
+		case gerr != nil && !errors.Is(gerr, registry.ErrNotFound):
+			writePeerError(w, http.StatusServiceUnavailable, "registry_unavailable", "this node's registry cannot say where "+ref+" is homed, so its data is not set aside: "+gerr.Error())
 			return
 		}
 		err = o.d.LocalPrimaries.SetAside(ctx, ref, req.Epoch)

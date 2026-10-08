@@ -600,7 +600,7 @@ func (o *Orchestrator) demoteOld(ctx context.Context, from registry.Node, ref, i
 // failure undoes the move, which has served the project for a while by now; both are
 // reported in the log and the alert as work left to do.
 func (o *Orchestrator) reseedOld(ctx context.Context, from registry.Node, ref string, epoch int64) string {
-	if err := o.d.Primaries.SetAside(ctx, from.ID, ref, epoch); err != nil {
+	if err := o.setAside(ctx, from, ref, epoch); err != nil {
 		return fmt.Sprintf("warning: the old primary's data on %s was not set aside (%v); remove it, then run supavise replicas add %s --node %s", from.Name, err, ref, from.ID)
 	}
 	if o.d.Replicas == nil {
@@ -610,6 +610,38 @@ func (o *Orchestrator) reseedOld(ctx context.Context, from registry.Node, ref st
 		return fmt.Sprintf("warning: a replica could not be added on %s (%v); run supavise replicas add %s --node %s", from.Name, err, ref, from.ID)
 	}
 	return "a replica is being built on " + from.Name
+}
+
+// asideAttempts and asideWait bound the tries to set the old primary's data aside. The old home
+// refuses while its copy of the registry still names it the project's home, and the copy follows the
+// leader's change by a moment.
+const (
+	asideAttempts = 6
+	asideWait     = 5 * time.Second
+)
+
+// setAside asks the old home to set the project's data aside, again while it answers that its registry
+// still homes the project there (the answer a node gives until the leader's SetProjectNode has
+// reached its copy).
+func (o *Orchestrator) setAside(ctx context.Context, from registry.Node, ref string, epoch int64) error {
+	var err error
+	for attempt := 0; attempt < asideAttempts; attempt++ {
+		if attempt > 0 {
+			if werr := o.wait(ctx, asideWait); werr != nil {
+				return werr
+			}
+		}
+		if err = o.d.Primaries.SetAside(ctx, from.ID, ref, epoch); err == nil || !homedHere(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// homedHere reports whether a node refused to set data aside because its registry homes the project on it.
+func homedHere(err error) bool {
+	var re *mesh.RemoteError
+	return errors.As(err, &re) && re.Code == CodeHomedHere
 }
 
 // baseBackup takes a fresh base backup of the project on its new timeline. The move does not wait

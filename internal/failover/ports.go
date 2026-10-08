@@ -77,7 +77,9 @@ type Primaries interface {
 	Healthy(ctx context.Context, node, ref string) (ok bool, detail string, err error)
 	// SetAside moves the data of the project's old primary on node to data.diverged-<epoch>,
 	// where `supavise node rejoin` and the janitor of [failover] keep_diverged_days find it, and
-	// clears the project's fence record, so that a replica can be built in its place.
+	// clears the project's fence record, so that a replica can be built in its place. It must refuse
+	// while the cluster runs (SetAsideDiverged does), and the node refuses it for a project its
+	// registry homes there (the answer carries CodeHomedHere).
 	SetAside(ctx context.Context, node, ref string, epoch int64) error
 }
 

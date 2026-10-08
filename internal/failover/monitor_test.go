@@ -173,6 +173,66 @@ func (m *mrig) move(kind registry.MoveKind, state registry.MoveState, age time.D
 	m.now = time.Now().Add(age)
 }
 
+// projectMove records a project failover of ref that ended age ago.
+func (m *mrig) projectMove(ref string, kind registry.MoveKind, state registry.MoveState, age time.Duration) {
+	mv := registry.Move{Scope: registry.MoveProject, Ref: ref, Kind: kind, FromNode: "n1", ToNode: "n2", Epoch: 1}
+	must(m.t, m.reg.CreateMove(m.ctx, &mv))
+	must(m.t, m.reg.FinishMove(m.ctx, mv.ID, state, ""))
+	m.now = time.Now().Add(age)
+}
+
+// The cooldown is kept per what moves: a project that failed over holds back itself, not the others,
+// and not the replacement of a leader that died after.
+func TestTheCooldownIsPerProjectInProjectModeAndForTheServerInServerMode(t *testing.T) {
+	due := func(m *mrig) {
+		m.world.prim["n1/"+refA].healthy = false
+		m.setStatus(refA, registry.StatusActiveUnhealthy)
+		m.mon.Tick(m.ctx)
+		m.advance(4 * time.Minute)
+	}
+	t.Run("another project failed over a minute ago", func(t *testing.T) {
+		m := newProjectRig(t, config.FailoverProject)
+		m.projectMove(refB, registry.MoveFailover, registry.MoveDone, time.Minute)
+		due(m)
+		if d := m.mon.Tick(m.ctx); d.Action != "project" || d.Ref != refA || d.Err != nil {
+			t.Fatalf("decision: %+v\n%v", d, m.snapshot())
+		}
+	})
+	t.Run("this project failed over a minute ago", func(t *testing.T) {
+		m := newProjectRig(t, config.FailoverProject)
+		m.projectMove(refA, registry.MoveFailover, registry.MoveDone, time.Minute)
+		due(m)
+		d := m.mon.Tick(m.ctx)
+		if d.Action != "none" || !strings.Contains(d.Reason, "a failover of this project") || !strings.Contains(d.Reason, "cooldown") {
+			t.Fatalf("decision: %+v", d)
+		}
+	})
+	t.Run("a switchover of this project is no failover", func(t *testing.T) {
+		m := newProjectRig(t, config.FailoverProject)
+		m.projectMove(refA, registry.MoveSwitchover, registry.MoveDone, time.Minute)
+		due(m)
+		if d := m.mon.Tick(m.ctx); d.Action != "project" {
+			t.Fatalf("decision: %+v", d)
+		}
+	})
+	t.Run("a failover of the server moved every project", func(t *testing.T) {
+		m := newProjectRig(t, config.FailoverProject)
+		m.move(registry.MoveFailover, registry.MoveDone, time.Minute)
+		due(m)
+		if d := m.mon.Tick(m.ctx); d.Action != "none" || !strings.Contains(d.Reason, "a failover of the server") {
+			t.Fatalf("decision: %+v", d)
+		}
+	})
+	t.Run("the leader dies after a project failed over", func(t *testing.T) {
+		m := newMonitorRig(t, config.FailoverServer)
+		m.projectMove(refA, registry.MoveFailover, registry.MoveDone, time.Minute)
+		m.open()
+		if d := m.mon.Tick(m.ctx); d.Action != "server" || d.Err != nil {
+			t.Fatalf("decision: %+v\n%v", d, m.snapshot())
+		}
+	})
+}
+
 func TestAutoModeDowngradesToManualWhenTheProbeFailsAndSaysSo(t *testing.T) {
 	m := newMonitorRig(t, config.FailoverServer)
 	m.world.fail("provider.probe", errors.New("the instance role may not call ec2:StopInstances (UnauthorizedOperation)"), -1)

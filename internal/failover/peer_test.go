@@ -569,6 +569,31 @@ func TestAsideRefusesAProjectTheRegistryHomesOnThisNode(t *testing.T) {
 	}
 }
 
+// A registry that cannot say where the project is homed cannot clear the data for a rename.
+func TestAsideRefusesWhenTheRegistryCannotSayWhereTheProjectIsHomed(t *testing.T) {
+	w := newWorld(t)
+	w.setSelf("n2", false)
+	o := w.orch(func(d *Deps) {
+		d.Store = func() Store { return unreadableProjects{&gatedStore{w: w, Registry: w.reg}} }
+	})
+	rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(refB, OpAside), "n1", PrimaryCall{Epoch: 1}, nil)
+	if rec.Code != http.StatusServiceUnavailable || errorOf(rec).Code != "registry_unavailable" || w.has("local.aside") {
+		t.Fatalf("%d %s\n%v", rec.Code, rec.Body, w.snapshot())
+	}
+	// A project the registry does not know has nothing homed here to protect.
+	o = w.orch()
+	if rec := serve(t, o, "POST "+PathPrimary, PrimaryPath("zzzzzzzzzzzzzzzzzzzz", OpAside), "n1", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("an unknown project: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// unreadableProjects is a registry whose project rows cannot be read.
+type unreadableProjects struct{ Store }
+
+func (unreadableProjects) GetProject(context.Context, string) (*registry.Project, error) {
+	return nil, errRegistryDown
+}
+
 // A ref from a peer builds paths (the launcher, the fence record, the set-aside data): only a real ref passes.
 func TestARefThatIsNotAProjectRefIsRefusedBeforeItBuildsAPath(t *testing.T) {
 	w := newWorld(t)
