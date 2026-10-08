@@ -13,12 +13,12 @@ name: replication
 # runs amd64 only, as linux.yml does; integrate/** and a dispatch run both architectures.
 #
 # It is not in deploy/release-gate.sh's list yet. The gate accepts a workflow_dispatch run on the tagged commit, so
-# this workflow can be listed as it stands: `gh workflow run replication.yml --ref <branch>`, then tag. A run takes
-# 60 to 75 minutes when every check passes and up to 150 when a wait times out, so the run is dispatched before the
-# tag, or the gate's GATE_TIMEOUT_SECONDS is raised above 150 minutes.
+# this workflow can be listed as it stands: `gh workflow run replication.yml --ref <branch>`, then tag. A run is
+# expected to take 60 to 75 minutes when every check passes and is cut off at 150 when a wait times out, so the run
+# is dispatched before the tag, or the gate's GATE_TIMEOUT_SECONDS is raised above 150 minutes.
 on:
   push:
-    branches: ["ws/rep-x2", "integrate/**"]
+    branches: ["ws/rep-x2", "ws/rep-fx", "integrate/**"]
   workflow_dispatch:
 
 permissions:
