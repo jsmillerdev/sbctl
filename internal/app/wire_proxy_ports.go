@@ -44,7 +44,16 @@ func certificatesCheck(src proxy.CertSource, dir string, role *proxy.CertRole, s
 				continue
 			}
 			total++
-			local, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(f.Path)))
+			// The path comes from the leader; the mirror refuses one that leaves its directory (proxy.CertSync),
+			// and so does the check: it counts such a file as one the mirror does not hold and reads nothing.
+			rel := filepath.FromSlash(f.Path)
+			var local []byte
+			var err error
+			if filepath.IsLocal(rel) && !strings.ContainsRune(f.Path, 0) {
+				local, err = os.ReadFile(filepath.Join(dir, rel))
+			} else {
+				err = os.ErrInvalid
+			}
 			if err != nil || !bytes.Equal(local, f.Data) {
 				differ++
 				if first == "" {

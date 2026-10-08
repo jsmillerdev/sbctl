@@ -213,3 +213,29 @@ func TestCertificatesCheck(t *testing.T) {
 		t.Fatalf("a check of a node that manages its certificates: %+v", got)
 	}
 }
+
+// The paths of the leader's snapshot are not trusted: a path that leaves the certificate directory is
+// counted as a certificate the node does not hold, and nothing outside the directory is read, even
+// when a file there has the bytes the snapshot names.
+func TestCertificatesCheckReadsNothingOutsideItsDirectory(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "store")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "outside.crt"), []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "abs.crt"), []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snap := peerapi.CertSnapshot{Files: []peerapi.CertFile{
+		{Path: "../outside.crt", Data: []byte("same")},
+		{Path: "certificates/../../outside.crt", Data: []byte("same")},
+		{Path: filepath.Join(root, "abs.crt"), Data: []byte("same")},
+	}}
+	got := certificatesCheck(fakeCertSource{snap: snap}, dir, proxy.NewCertRole(false), func() string { return "n2" })(context.Background(), registry.Node{ID: "n2", Name: "second"})
+	if len(got) != 1 || got[0].OK || got[0].Blocking || !strings.Contains(got[0].Detail, "3 of 3") {
+		t.Fatalf("paths that leave the directory: %+v", got)
+	}
+}
