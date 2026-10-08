@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // ALPN is the application protocol the mesh negotiates in the TLS handshake.
@@ -117,11 +118,20 @@ type RemoteError struct {
 	Node    string
 	Status  int
 	Message string
+	// Code is the peerapi.Error code of the answer, when it had one ("not_leader", "stale_epoch").
+	Code string
 }
 
 func (e *RemoteError) Error() string {
 	return fmt.Sprintf("mesh: node %s answered %d: %s", e.Node, e.Status, e.Message)
 }
+
+// Is makes a refusal of the peer server (code "refused") answer errors.Is(err, ErrRefused).
+func (e *RemoteError) Is(target error) bool { return target == ErrRefused && e.Code == CodeRefused }
+
+// CodeRefused is the code of the answer the peer server gives a request it will not serve: the
+// caller is not admitted, or its state does not allow the endpoint.
+const CodeRefused = "refused"
 
 // Header is the first line of every stream, written as one line of JSON ending in a newline.
 type Header struct {
@@ -174,7 +184,10 @@ func WriteHeader(w io.Writer, h Header) error {
 }
 
 // ReadHeader reads one header line from r, one byte at a time so that it consumes nothing of
-// what follows it, and validates it. A line longer than 1 KiB is an error.
+// what follows it, and validates it. A line longer than 1 KiB is an error. Fields it does not
+// know are ignored, so that a node of the next release can add one to a header an older node
+// still accepts; a kind or type it does not know is refused by Validate. Anything on the line
+// after the JSON object is an error: a header is one object.
 func ReadHeader(r io.Reader) (Header, error) {
 	var line bytes.Buffer
 	one := make([]byte, 1)
@@ -192,9 +205,11 @@ func ReadHeader(r io.Reader) (Header, error) {
 	}
 	var h Header
 	dec := json.NewDecoder(&line)
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&h); err != nil {
 		return Header{}, fmt.Errorf("mesh: the stream header is not valid: %w", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return Header{}, errors.New("mesh: the stream header has more than one JSON value on its line")
 	}
 	return h, h.Validate()
 }
@@ -202,8 +217,20 @@ func ReadHeader(r io.Reader) (Header, error) {
 // LocalPort is the loopback port a forward stream of kind k for project ref (registry sequence
 // seq) reaches on a node that serves it, and the port a forwarder binds on a node that does not.
 // The two sides compute the same number from the same configuration, which is what makes a
-// forwarder transparent. ErrNoPort when the project has no such service.
+// forwarder transparent. ErrNoPort when the project has no such service, when seq is not the
+// sequence of a project (a user project's starts at 1, and its ports must fit below 65536), and
+// for a replica kind when seq is above cfg.MaxReplicaSeq(): the replica range would run into the
+// project ports.
 func LocalPort(cfg *config.Config, k Kind, ref string, seq int) (int, error) {
+	if !k.IsService() && ref != config.SystemRef {
+		limit := cfg.MaxProjectSeq()
+		if k == KindReplicaPostgres || k == KindReplicaPostgREST {
+			limit = min(limit, cfg.MaxReplicaSeq())
+		}
+		if seq < 1 || seq > limit {
+			return 0, fmt.Errorf("%w: %s of %s has sequence %d, outside 1..%d", ErrNoPort, k, ref, seq, limit)
+		}
+	}
 	var port int
 	switch k {
 	case KindPostgres:
@@ -282,11 +309,20 @@ type Mesh interface {
 }
 
 // Peer is the authenticated far end of a request: the node whose certificate the TLS handshake
-// verified against the cluster CA and the registry (state active, serial current).
+// verified against the cluster CA and the registry (serial current, state joining, active or
+// fenced).
 type Peer struct {
 	// Node is the node id. Empty for a request that arrived without a client certificate, which
 	// only the join endpoints accept.
 	Node string
+	// State is the node's state in the registry when the request arrived. The peer server serves
+	// a joining node the ping and the join confirmation, and a fenced node the ping, the fence
+	// and the rejoin, and refuses it everything else, so a handler sees NodeActive unless it is one
+	// of those.
+	State registry.NodeState
+	// Remote is the IP address of the far end of the connection (no port). The join endpoints rate
+	// limit by it.
+	Remote string
 }
 
 type peerKey struct{}

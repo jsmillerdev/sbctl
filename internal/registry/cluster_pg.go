@@ -27,6 +27,29 @@ func mapWriteErr(err error) error {
 	return mapErr(err)
 }
 
+// legacyReprobe is how often a registry that reads as legacy looks again for migration 1300. A
+// variable so that tests can shorten it.
+var legacyReprobe = time.Second
+
+// isLegacy reports whether the registry has not run migration 1300. A registry opened before the
+// migration looks again, at most once per legacyReprobe, so that the daemon that migrates it
+// behind this handle's back (a `supavise upgrade` reads the registry it is about to migrate; a
+// standby's handle outlives the leader's upgrade) is noticed and projects report their real node.
+func (r *Postgres) isLegacy(ctx context.Context) bool {
+	if !r.legacy.Load() {
+		return false
+	}
+	now := time.Now().UnixNano()
+	last := r.probedAt.Load()
+	if now-last < int64(legacyReprobe) || !r.probedAt.CompareAndSwap(last, now) {
+		return true
+	}
+	if err := r.probe(ctx); err != nil {
+		return true
+	}
+	return r.legacy.Load()
+}
+
 // subscribePoll is Subscribe for a read-only registry (a standby cannot LISTEN): it reads
 // cluster.change_seq every readOnlyPoll and, when it moved, tells the consumer to reload each
 // table. The channel closes when ctx ends or a poll fails.
@@ -175,6 +198,9 @@ func (r *Postgres) SetNodeState(ctx context.Context, id string, s NodeState) err
 	if err != nil || cur.State == s {
 		return err
 	}
+	if s == NodeJoining {
+		return affected(r.pool.Exec(ctx, `update supavise.nodes set state = $2, joined_at = now() where id = $1`, id, s))
+	}
 	return affected(r.pool.Exec(ctx, `update supavise.nodes set state = $2 where id = $1`, id, s))
 }
 
@@ -240,47 +266,38 @@ func (r *Postgres) SetLeader(ctx context.Context, node string, epoch int64) erro
 	return nil
 }
 
-// SetProjectNode implements ClusterStore. The project row is written before the replica row so
-// that the order in which it takes locks matches the writers of projects (project, then the
-// cluster row the change_seq trigger updates).
+// SetProjectNode implements ClusterStore. It takes the project row first and the cluster row
+// second, the order of every writer of projects (the change_seq trigger updates the cluster row
+// last), and holds both until it commits: a SetLeader that raises the epoch waits for a move
+// that checked the old one, so a move made under a stale epoch cannot land after the new
+// leader's. The cluster row is locked for update rather than for share, because the trigger
+// would have to upgrade a share lock and two moves that each hold one would deadlock.
 func (r *Postgres) SetProjectNode(ctx context.Context, ref, node string, epoch int64) error {
 	return pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			update supavise.projects set node_id = $2, updated_at = now()
-			where ref = $1
-			  and (select epoch from supavise.cluster) = $3
-			  and exists (select 1 from supavise.nodes where id = $2 and state = 'active')`, ref, node, epoch)
-		if err != nil {
+		var home string
+		if err := tx.QueryRow(ctx, `select node_id from supavise.projects where ref = $1 for no key update`, ref).Scan(&home); err != nil {
+			return mapErr(err)
+		}
+		var have int64
+		if err := tx.QueryRow(ctx, `select epoch from supavise.cluster for no key update`).Scan(&have); err != nil {
+			return mapErr(err)
+		}
+		if have != epoch {
+			return fmt.Errorf("%w: epoch %d is not the cluster's %d", ErrConflict, epoch, have)
+		}
+		var state NodeState
+		if err := tx.QueryRow(ctx, `select state from supavise.nodes where id = $1`, node).Scan(&state); err != nil {
+			return mapErr(err)
+		}
+		if state != NodeActive {
+			return fmt.Errorf("%w: node %s is %s", ErrConflict, node, state)
+		}
+		if _, err := tx.Exec(ctx, `update supavise.projects set node_id = $2, updated_at = now() where ref = $1`, ref, node); err != nil {
 			return mapWriteErr(err)
 		}
-		if tag.RowsAffected() == 0 {
-			return r.whyNotMoved(ctx, tx, ref, node, epoch)
-		}
-		_, err = tx.Exec(ctx, `delete from supavise.replicas where ref = $1 and node_id = $2`, ref, node)
+		_, err := tx.Exec(ctx, `delete from supavise.replicas where ref = $1 and node_id = $2`, ref, node)
 		return mapErr(err)
 	})
-}
-
-func (r *Postgres) whyNotMoved(ctx context.Context, tx pgx.Tx, ref, node string, epoch int64) error {
-	var have int64
-	var projectOK bool
-	if err := tx.QueryRow(ctx, `select epoch, exists (select 1 from supavise.projects where ref = $1) from supavise.cluster`, ref).Scan(&have, &projectOK); err != nil {
-		return mapErr(err)
-	}
-	if !projectOK {
-		return ErrNotFound
-	}
-	if have != epoch {
-		return fmt.Errorf("%w: epoch %d is not the cluster's %d", ErrConflict, epoch, have)
-	}
-	var state *string
-	if err := tx.QueryRow(ctx, `select (select state from supavise.nodes where id = $1)`, node).Scan(&state); err != nil {
-		return mapErr(err)
-	}
-	if state == nil {
-		return ErrNotFound
-	}
-	return fmt.Errorf("%w: node %s is %s", ErrConflict, node, *state)
 }
 
 // Replicas

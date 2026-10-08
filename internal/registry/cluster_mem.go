@@ -22,6 +22,14 @@ func (m *Memory) seedCluster() {
 	m.joinTokens = map[string]JoinToken{}
 }
 
+// now is the time a node row is stamped with: Now when a test set it, else the wall clock.
+func (m *Memory) now() time.Time {
+	if m.Now != nil {
+		return m.Now()
+	}
+	return time.Now()
+}
+
 func nodeNumber(id string) int {
 	n, _ := strconv.Atoi(id[1:])
 	return n
@@ -64,8 +72,8 @@ func (m *Memory) CreateNode(_ context.Context, n *Node) error {
 			return fmt.Errorf("%w: nodes_name_key", ErrConflict)
 		}
 	}
-	n.ID, n.JoinedAt = id, time.Now()
-	m.nodes[id] = *n
+	n.ID, n.JoinedAt = id, m.now()
+	m.nodes[id] = n.clone()
 	m.notify("nodes", "insert", id)
 	return nil
 }
@@ -77,6 +85,7 @@ func (m *Memory) GetNode(_ context.Context, id string) (*Node, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
+	n = n.clone()
 	return &n, nil
 }
 
@@ -85,6 +94,7 @@ func (m *Memory) GetNodeByName(_ context.Context, name string) (*Node, error) {
 	defer m.mu.Unlock()
 	for _, n := range m.nodes {
 		if n.Name == name {
+			n = n.clone()
 			return &n, nil
 		}
 	}
@@ -96,7 +106,7 @@ func (m *Memory) ListNodes(context.Context) ([]Node, error) {
 	defer m.mu.Unlock()
 	out := make([]Node, 0, len(m.nodes))
 	for _, n := range m.nodes {
-		out = append(out, n)
+		out = append(out, n.clone())
 	}
 	sort.Slice(out, func(i, j int) bool { return nodeNumber(out[i].ID) < nodeNumber(out[j].ID) })
 	return out, nil
@@ -118,12 +128,12 @@ func (m *Memory) UpdateNode(_ context.Context, n *Node) error {
 		}
 	}
 	next := cur
-	next.Name, next.Region, next.PublicHost, next.PeerAddr, next.Provider, next.Version = n.Name, n.Region, n.PublicHost, n.PeerAddr, n.Provider, n.Version
+	next.Name, next.Region, next.PublicHost, next.PeerAddr, next.Provider, next.Version = n.Name, n.Region, n.PublicHost, n.PeerAddr, n.clone().Provider, n.Version
 	if !reflect.DeepEqual(next, cur) {
 		m.nodes[n.ID] = next
 		m.notify("nodes", "update", n.ID)
 	}
-	*n = m.nodes[n.ID]
+	*n = m.nodes[n.ID].clone()
 	return nil
 }
 
@@ -139,6 +149,9 @@ func (m *Memory) SetNodeState(_ context.Context, id string, s NodeState) error {
 	}
 	if n.State != s {
 		n.State = s
+		if s == NodeJoining {
+			n.JoinedAt = m.now()
+		}
 		m.nodes[id] = n
 		m.notify("nodes", "update", id)
 	}

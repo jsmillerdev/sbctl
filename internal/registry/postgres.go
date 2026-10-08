@@ -22,6 +22,10 @@ type Postgres struct {
 	// OpenReadOnly can meet: projects have no node_id column and every project is on the
 	// founder node. Open and NewPostgres see a migrated registry.
 	legacy atomic.Bool
+	// probedAt is when a registry that reads as legacy last looked for migration 1300 (unix
+	// nanoseconds), so that a daemon that migrates the registry behind this handle is noticed
+	// within legacyReprobe without a query per call.
+	probedAt atomic.Int64
 }
 
 var (
@@ -78,8 +82,8 @@ func (r *Postgres) probe(ctx context.Context) error {
 
 // projectCols is the column list of a project query: the legacy one reports every project on the
 // founder node.
-func (r *Postgres) projectCols() string {
-	if r.legacy.Load() {
+func (r *Postgres) projectCols(ctx context.Context) string {
+	if r.isLegacy(ctx) {
 		return projectBaseCols + `, '` + FounderNodeID + `'::text`
 	}
 	return projectBaseCols + `, node_id`
@@ -282,7 +286,7 @@ func (r *Postgres) CreateProject(ctx context.Context, p *Project) error {
 		args := append([]any{p.Ref, nullOrg(p.OrgID), seq, p.Name, p.Region, p.Engine, p.Class, p.Status, versions, limits}, branchArgs(p.Branch)...)
 		// A new project lives where the leader does. A registry from before clusters has one node.
 		nodeCol, nodeVal := "", ""
-		if r.legacy.Load() {
+		if r.isLegacy(ctx) {
 			if p.NodeID != "" && p.NodeID != FounderNodeID {
 				return fmt.Errorf("%w: projects_node_id_fkey", ErrConflict)
 			}
@@ -295,7 +299,7 @@ func (r *Postgres) CreateProject(ctx context.Context, p *Project) error {
 				branch_id, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
 				notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress`+nodeCol+`)
 			values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-				$11::text::uuid, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24`+nodeVal+`) returning `+r.projectCols(), args...))
+				$11::text::uuid, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24`+nodeVal+`) returning `+r.projectCols(ctx), args...))
 		if err != nil {
 			return err
 		}
@@ -357,11 +361,11 @@ func (r *Postgres) SetBranchEgress(ctx context.Context, ref, from, to string) er
 }
 
 func (r *Postgres) GetProject(ctx context.Context, ref string) (*Project, error) {
-	return scanProject(r.pool.QueryRow(ctx, `select `+r.projectCols()+` from supavise.projects where ref = $1`, ref))
+	return scanProject(r.pool.QueryRow(ctx, `select `+r.projectCols(ctx)+` from supavise.projects where ref = $1`, ref))
 }
 
 func (r *Postgres) ListProjects(ctx context.Context) ([]Project, error) {
-	rows, err := r.pool.Query(ctx, `select `+r.projectCols()+` from supavise.projects order by seq`)
+	rows, err := r.pool.Query(ctx, `select `+r.projectCols(ctx)+` from supavise.projects order by seq`)
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +383,7 @@ func (r *Postgres) UpdateProject(ctx context.Context, p *Project) error {
 	limits, _ := json.Marshal(p.Limits)
 	got, err := scanProject(r.pool.QueryRow(ctx, `
 		update supavise.projects set name = $2, region = $3, class = $4, status = $5, versions = $6, limits = $7, updated_at = now()
-		where ref = $1 returning `+r.projectCols(), p.Ref, p.Name, p.Region, p.Class, p.Status, versions, limits))
+		where ref = $1 returning `+r.projectCols(ctx), p.Ref, p.Name, p.Region, p.Class, p.Status, versions, limits))
 	if err != nil {
 		return err
 	}

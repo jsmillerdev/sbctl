@@ -33,8 +33,10 @@ func TestUnimplementedHooksAreSkipped(t *testing.T) {
 	if err := w.run(context.Background()); err != nil {
 		t.Fatalf("run with the stubs: %v", err)
 	}
-	if len(w.runners) != 0 || len(w.stops) != 0 {
-		t.Fatalf("a stub started something: %d runners, %d stops", len(w.runners), len(w.stops))
+	// The mesh hook of a server that never joined a cluster watches for the cluster identity that
+	// `supavise node token` writes, and starts nothing else.
+	if len(w.runners) != 1 || w.runners[0].name != "cluster identity" || len(w.stops) != 0 {
+		t.Fatalf("the hooks started more than the identity watcher: %d runners, %d stops", len(w.runners), len(w.stops))
 	}
 	seen := map[string]bool{}
 	for _, h := range wireHooks {

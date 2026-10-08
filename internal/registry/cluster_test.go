@@ -198,6 +198,34 @@ func testCluster(t *testing.T, r Registry) {
 		t.Fatal(err)
 	}
 
+	// Entering joining restarts the joining clock (JoinedAt); other moves, and a move to the state the
+	// node is in, leave it.
+	created, _ := r.GetNode(ctx, "n2")
+	time.Sleep(5 * time.Millisecond)
+	if err := r.SetNodeState(ctx, "n2", NodeFenced); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.GetNode(ctx, "n2"); !got.JoinedAt.Equal(created.JoinedAt) {
+		t.Fatalf("fencing moved JoinedAt: %s -> %s", created.JoinedAt, got.JoinedAt)
+	}
+	if err := r.SetNodeState(ctx, "n2", NodeJoining); err != nil {
+		t.Fatal(err)
+	}
+	rejoined, _ := r.GetNode(ctx, "n2")
+	if !rejoined.JoinedAt.After(created.JoinedAt) {
+		t.Fatalf("entering joining did not restart the clock: %s -> %s", created.JoinedAt, rejoined.JoinedAt)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := r.SetNodeState(ctx, "n2", NodeJoining); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.GetNode(ctx, "n2"); !got.JoinedAt.Equal(rejoined.JoinedAt) {
+		t.Fatalf("a move to the current state moved JoinedAt: %s -> %s", rejoined.JoinedAt, got.JoinedAt)
+	}
+	if err := r.SetNodeState(ctx, "n2", NodeActive); err != nil {
+		t.Fatal(err)
+	}
+
 	// Replicas.
 	idA := ReplicaIdentifier(refA, "eu-west-1", "k3j9d2")
 	if ref, region, id6, ok := ParseReplicaIdentifier(idA); !ok || ref != refA || region != "eu-west-1" || id6 != "k3j9d2" {

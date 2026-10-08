@@ -12,6 +12,8 @@ import (
 
 // Memory is an in-process Registry for tests and the exec-supervisor dev mode.
 type Memory struct {
+	// Now, when set, is the clock that stamps node rows (Node.JoinedAt); tests that move a clock set it.
+	Now      func() time.Time
 	mu       sync.Mutex
 	orgs     []Organization
 	projects map[string]Project

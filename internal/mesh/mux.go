@@ -24,19 +24,51 @@ type Session interface {
 	NumStreams() int
 }
 
+// The multiplexer's windows and timers, from spike S6 (physical replication through a TLS and
+// smux forwarder). The stream window and the session buffer are what keeps the lag of a standby
+// at 0.10 to 0.41 s at 20 MB/s over 2 to 70 ms of round trip: with smaller ones the sender waits
+// for window updates and the lag grows with the round trip. The receiver's setting governs, so
+// both ends of a session use the same. The keepalive timeout stays below wal_receiver_timeout
+// (60 s), so that a dead session is noticed, and the standby's receiver retried, before Postgres
+// gives up on the connection.
+const (
+	// StreamWindow is the flow-control window of one stream (smux MaxStreamBuffer): at least 4 MiB.
+	StreamWindow = 4 << 20
+	// SessionBuffer bounds what all streams of a session hold in memory (smux MaxReceiveBuffer): at
+	// least 16 MiB. It is 32 MiB, so that several busy streams keep their windows.
+	SessionBuffer = 32 << 20
+	// KeepAliveInterval and KeepAliveTimeout: a session with no frame for the timeout is closed.
+	KeepAliveInterval = 10 * time.Second
+	KeepAliveTimeout  = 30 * time.Second
+	// frameSize is the largest frame smux sends.
+	frameSize = 32768
+)
+
+// The windows of the session of a caller with no certificate (a joiner). The join exchange is a few
+// KiB each way, and a stranger must not be able to make the daemon hold more than this per session.
+const (
+	anonSessionBuffer = 1 << 20
+	anonStreamWindow  = 256 << 10
+)
+
 // muxConfig is smux protocol 2, which has a flow-control window per stream: a stalled stream (a
-// replica that stopped reading) cannot hold up the others. The stream window is sized for
-// WAL at 20 MB/s over a 100 ms round trip (2 MB in flight) with room to spare; the session
-// buffer bounds what all streams together hold in memory.
+// replica that stopped reading) cannot hold up the others.
 func muxConfig() *smux.Config {
 	return &smux.Config{
 		Version:           2,
-		KeepAliveInterval: 10 * time.Second,
-		KeepAliveTimeout:  30 * time.Second,
-		MaxFrameSize:      32768,
-		MaxReceiveBuffer:  32 << 20,
-		MaxStreamBuffer:   4 << 20,
+		KeepAliveInterval: KeepAliveInterval,
+		KeepAliveTimeout:  KeepAliveTimeout,
+		MaxFrameSize:      frameSize,
+		MaxReceiveBuffer:  SessionBuffer,
+		MaxStreamBuffer:   StreamWindow,
 	}
+}
+
+// anonMuxConfig is muxConfig with the small windows of a caller with no certificate.
+func anonMuxConfig() *smux.Config {
+	c := muxConfig()
+	c.MaxReceiveBuffer, c.MaxStreamBuffer = anonSessionBuffer, anonStreamWindow
+	return c
 }
 
 type session struct{ s *smux.Session }
@@ -45,12 +77,21 @@ type session struct{ s *smux.Session }
 // dialed the TCP connection; the roles only keep the two sides' stream numbers apart, and both
 // sides may open and accept streams. Closing the Session closes conn.
 func NewSession(conn net.Conn, client bool) (Session, error) {
+	return newSession(conn, client, muxConfig())
+}
+
+// newAnonSession is the accepting side of a session with a caller that presented no certificate.
+func newAnonSession(conn net.Conn) (Session, error) {
+	return newSession(conn, false, anonMuxConfig())
+}
+
+func newSession(conn net.Conn, client bool, cfg *smux.Config) (Session, error) {
 	var s *smux.Session
 	var err error
 	if client {
-		s, err = smux.Client(conn, muxConfig())
+		s, err = smux.Client(conn, cfg)
 	} else {
-		s, err = smux.Server(conn, muxConfig())
+		s, err = smux.Server(conn, cfg)
 	}
 	if err != nil {
 		return nil, err

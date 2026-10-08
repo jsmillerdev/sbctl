@@ -12,6 +12,8 @@ package peerapi
 import (
 	"encoding/json"
 	"net/url"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/registry"
@@ -55,6 +57,10 @@ const (
 	PathJoin = "/peer/v1/join"
 	// PathJoinConfirm: POST, joiner to leader, once its system standby streams. A JoinConfirm in, 204 out.
 	PathJoinConfirm = "/peer/v1/join/confirm"
+	// PathRejoin: POST, a fenced node to the leader, over mutual TLS with the certificate the node
+	// keeps. A RejoinRequest in, a RejoinResponse out. The node's row goes back to joining and
+	// PathJoinConfirm makes it active.
+	PathRejoin = "/peer/v1/rejoin"
 )
 
 func InstancePath(identifier string) string {
@@ -95,12 +101,46 @@ type Ping struct {
 	// sender believes them.
 	Epoch  int64  `json:"epoch"`
 	Leader string `json:"leader"`
-	// Version is the release; Schema is registry.SchemaVersion() of its binary.
+	// Version is the release; Schema is the registry migrations the node's database has applied
+	// (registry.AppliedMigrations, joined with commas), not the label registry.SchemaVersion()
+	// gives: two nodes of different releases compare what their databases hold.
 	Version string `json:"version"`
 	Schema  string `json:"schema"`
 	// Health is the node's own verdict: "healthy", "degraded" or "down" (health.Verdict).
 	Health string    `json:"health"`
 	Time   time.Time `json:"time"`
+}
+
+// SchemaString writes a set of applied registry migrations as Ping.Schema: the names, sorted, joined
+// by commas.
+func SchemaString(names []string) string {
+	sorted := append([]string(nil), names...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, ",")
+}
+
+// ParseSchema reads Ping.Schema back into the set of migration names.
+func ParseSchema(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
+}
+
+// SchemaAhead lists the migrations that remote has applied and local has not: what a node whose
+// binary knows only local cannot run on remote's database.
+func SchemaAhead(remote, local []string) []string {
+	have := make(map[string]bool, len(local))
+	for _, n := range local {
+		have[n] = true
+	}
+	var out []string
+	for _, n := range remote {
+		if !have[n] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // Action is a replica operation of PathInstanceAction.
@@ -355,6 +395,9 @@ type JoinRequest struct {
 	Version  string                `json:"version"`
 	// ArtifactPins are the service versions the joiner's release pins, for the version window.
 	ArtifactPins map[string]string `json:"artifact_pins,omitempty"`
+	// WithoutKey: the joiner has the master key already (--master-key-file, --key-from-escrow), so
+	// the leader leaves it out of the answer. The CA pin of the token proves it is the same key.
+	WithoutKey bool `json:"without_key,omitempty"`
 }
 
 // JoinResponse is the answer of POST PathJoin. The node row is joining until JoinConfirm.
@@ -370,6 +413,20 @@ type JoinResponse struct {
 	System        SystemBootstrap `json:"system"`
 }
 
+// RejoinRequest is the body of POST PathRejoin.
+type RejoinRequest struct {
+	Version string `json:"version"`
+	// ArtifactPins: see JoinRequest.
+	ArtifactPins map[string]string `json:"artifact_pins,omitempty"`
+}
+
+// RejoinResponse is the answer of POST PathRejoin: how to rebuild the system standby, and the
+// cluster-scoped configuration as of now.
+type RejoinResponse struct {
+	System        SystemBootstrap `json:"system"`
+	ClusterConfig string          `json:"cluster_config"`
+}
+
 // SystemBootstrap describes how the joiner seeds its standby of the system cluster.
 type SystemBootstrap struct {
 	// Identifier is the replica row of the system cluster on the new node.
@@ -378,6 +435,11 @@ type SystemBootstrap struct {
 	BackupID string `json:"backup_id"`
 	Leader   string `json:"leader"`
 	Epoch    int64  `json:"epoch"`
+	// ReplicationPassword is the opened password of the system cluster's replication role
+	// (supabase_replication_admin): the joiner has no registry to read it from yet, and the standby's
+	// primary_conninfo needs it. It is a secret: it goes into the 0600 postgresql.auto.conf of the
+	// standby and the 0600 join state, and into no log.
+	ReplicationPassword string `json:"replication_password,omitempty"`
 }
 
 // JoinConfirm is the body of POST PathJoinConfirm: the joiner's standby streams, so the node
