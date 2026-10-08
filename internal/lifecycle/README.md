@@ -188,7 +188,12 @@ it; SIGKILL, the OOM killer or a daemon restart can. A project that is `UPGRADIN
 claim free lost its runner: `Recover` (at the daemon's start) and `SettleUpgrades` (every 2 minutes)
 stop its units, mark the upgrade failed, and start the project on the recorded, previous versions as
 `ACTIVE_UNHEALTHY`. An upgrade that died before it touched a unit (the artifact fetch or the base
-backup) only has its row marked failed and the project set `ACTIVE_HEALTHY`. While the claim is held they
+backup) only has its row marked failed and the project set `ACTIVE_HEALTHY`; so does one whose row is
+already `failed` before the stopping step, which is what a `BeginUpgrade` leaves whose write of the
+`UPGRADING` status lost its answer. `BeginUpgrade` itself puts the status back when that write returns
+an error: a context that ends while the registry answers (the stop signal `supavise upgrade` sends its
+worker) can cut the answer and keep the write, and a project left `UPGRADING` with no runner would have
+its units, the cluster included, stopped by the next `Recover`. While the claim is held they
 leave the project alone. The same pass closes a row that still says running on a project that is not
 `UPGRADING`: `done` when the project runs the row's target versions, `failed` otherwise. An operator
 needs to do nothing beyond waiting for the next pass or restarting the daemon; with no daemon,
@@ -200,7 +205,10 @@ instance; Studio draws them under its own labels, and the constants in `upgrade.
 
 `Engine.UpgradeEligibility` answers for the node's pins: the changes, whether PostgreSQL restarts, an
 estimated downtime (about 3 minutes without a PostgreSQL restart, 15 with one; the base backup does not
-count) and blockers. Blockers: not `ACTIVE_HEALTHY`, another Postgres major version, a service the
+count) and blockers. A project homed on another node (`registry.Project.NodeID` is not `Options.NodeID`) is answered with
+one blocker, `BlockerElsewhere` ("homed on node n2; upgrade it there"): an upgrade renders and restarts
+the project from the artifacts and the data directory of the node it runs on, and `supavise upgrade`
+runs on every node over the whole registry. Blockers: not `ACTIVE_HEALTHY`, another Postgres major version, a service the
 project runs a newer release of than the target (`CompareTags` orders tags by upstream version, then
 packaging revision; tags it cannot order are refused too), no backup service, the system project, and an
 extension the target release cannot serve. `Rollout` (`rollout.go`) runs many upgrades for
@@ -225,14 +233,21 @@ Making a release take effect on running units:
 - A held-back restart leaves a mark (`<svc>.held`, next to the unit's env file) with the digest of the
   files the process started with. The rollout restarts a unit that has a mark or whose files are newer
   than its process (`PendingRestart`, `RestartPending`); restarting a project's PostgreSQL stops its
-  GoTrue and PostgREST first. A setting an Owner saved without restarting leaves no mark, so the rollout
-  does not restart a cluster for it. `projects upgrade --all --restart-changed` (hidden) puts such
+  GoTrue and PostgREST first. A look that renders new files for a running unit (`PendingRestart`, which the
+  rollout calls before `RestartPending`) leaves the mark itself, so the second look finds the restart
+  still owed: a daemon that started while the project was `UPGRADING` skipped it and held nothing back.
+  Both look at projects homed on this node only (`PendingRestart` answers no for any other, and
+  `RestartPending` refuses it: on a node that holds a replica of the project they would render the
+  primary's files over the replica's units). A setting an Owner saved without restarting leaves no mark,
+  so the rollout does not restart a cluster for it. `projects upgrade --all --restart-changed` (hidden) puts such
   projects in the same canary and batch order as the ones whose release moves.
 - On rollback, a unit whose files render back to the mark's digest keeps running (nothing restarts, the
   mark is removed). A daemon start with a mark left (a rollout cut short) leaves a PostgreSQL cluster
   alone, restarts GoTrue and PostgREST, and leaves the cluster to `supavise upgrade`.
 - `Engine.EnsureTenants` registers every active project with Supavisor, Realtime and Storage again once
-  the shared services and projects have started. The tenants' fingerprints include the release tag of
+  the shared services and projects have started (a writable Engine registers the projects homed on other
+  nodes too, because the shared services run on the leader; a follower's registers its own), and each
+  project's replicas that are up as tenants of their own (`fleet.TenantSpec.ReplicaID`). The tenants' fingerprints include the release tag of
   Storage and Realtime (`internal/fleet`), so after a release moved either of them each tenant is sent
   once more, which runs the new release's tenant migrations in every project's database; with nothing
   changed it sends nothing.
@@ -503,14 +518,34 @@ replica, never both. The role decides the ports and the settings when the units 
   change was replayed (spike S3). A PostgREST that started less than 5 seconds ago is left alone, because
   `SIGUSR1` ends a process that has not installed its handler yet.
 
+The settings of a cluster in recovery are written and removed by one set of helpers (`standbyconf.go`):
+`ConfString` and `KVQuote` quote the values, `ClearStandbyBlock` removes every recovery setting and the
+header of the block the backup service's seeder appends (with `archive`, the archive settings of that
+block too, so that a cycle of demotion and promotion does not add a pair of them each time).
+`internal/backup` imports them; there is no second copy of the quoting. The seeder keeps a marker file
+(`SeedMarker`) in the data directory while it fills it: nothing starts a unit on a directory that carries
+it (`replicaPostgresSpec`, `DemoteToReplica`), because a seed that was cut off holds a `backup_label` and
+no `standby.signal` and would come up as a primary. A standby that starts removes a `promote.ok` an
+aborted promotion left, since the relay trusts that file for the epoch it names.
+
+A server that joins a cluster builds its standby of the system cluster before its daemon runs
+(`SeedSystemStandby`, `SystemStandbyPreflight`; `placement.SystemStandby` adapts them to the join's
+`SeedFunc` and `Preflight`). The plane renders the replica's spec for the system project from this
+node's pins, with credentials of its own for the pgsodium root key (nothing in the system cluster is
+encrypted with it; the node agent renders the registry's key over it once the registry can be read)
+and the leader's replication password. It can be repeated: a directory with the seeder's marker is
+started over, a standby of the same identifier that was built and did not start is started, and any
+other data is refused with `ErrClusterExists` and left untouched.
+
 `pg_cron` and `pg_net` need no setting: their workers do not start on a standby and start at the
 promotion without a restart (spike S2). `ClusterSQL` (`PlaneOptions.ClusterSQL`) is the seam for the SQL
 these operations run, so that the state machines are tested with a fake runner.
 
 ### The Engine in a cluster
 
-`Options.NodeID` is the node the Engine runs on. `StartActive`, `Recover`, `EnsureTenants` and
-`SettleUpgrades` leave a project homed on another node (`registry.Project.NodeID`) to its home, and the
+`Options.NodeID` is the node the Engine runs on. `StartActive`, `Recover` and `SettleUpgrades` leave a
+project homed on another node (`registry.Project.NodeID`) to its home (`EnsureTenants` registers every
+project on a writable Engine, because the shared services run on the leader), and the
 Engine of a follower (`OpenOptions.ReadOnly`: the registry opens with `registry.OpenReadOnly` through the
 system standby's socket on the replica port, `FollowerRegistryDSN`) takes no advisory locks and settles
 nothing. `Open` looks the node id up (`SelfNode`: the node named `[node] name`, else the founder on a
@@ -534,8 +569,27 @@ through two more seams that `internal/app` sets beside it:
   `[compute] overcommit`. Without it a project homed elsewhere is not judged.
 
 What reads or writes this node's own disk, backup service or artifacts is refused for a project homed on
-another node whatever the plane: restore, upgrade and the final backup of a delete. Delete it with
-`SkipFinalBackup` (the data is gone afterwards), or move the project here first.
+another node whatever the plane: restore and upgrade (the upgrade runs on the home: see
+`BlockerElsewhere`). The final backup of a delete is taken on the home when `SetRemoteBackups` gives
+the Engine a `RemoteBackups` (`internal/placement`'s `RoutedBackups`: the Storage objects and Edge Functions
+are snapshotted here, where the shared services keep them, and the base backup is taken on the home and
+recorded here); without it that delete is refused as well, and `SkipFinalBackup` deletes without one.
+
+Three more seams belong to the cluster. `SetPeerRefresher` (`fleet.PeerRefresher`): after the Engine
+refreshes a tenant in this node's Supavisor (a database password, a restore, `EnsureTenant`) it asks the
+other nodes that run Supavisor to drop their copy, and an unreachable one costs a warning.
+`EnsureTenant(ref)`, `QuiesceTenant(ref)` and `Lock(ref)` are the failover orchestrator's `Fleet` and
+`Locker`: register a project and its replicas again once its database answers at the home it moved to,
+let the shared services go of its database before a planned stop (the error is returned, unlike a pause's
+quiesce), and hold the project's operation lock for the steps of a move.
+
+A primary that a peer replaced is not rendered or started: `fencedErr` reads the fence records of the
+node and of the project (`internal/failover/fenced`) in `postgresSpecFor` for a primary, `apiSpecs`,
+`startRendered`, `PromoteReplica` and `DemoteToReplica`'s start, and `Engine.startOne`, so boot, a
+resume, a settings restart, an upgrade's rollback and the Engine's other restarts all answer
+`ErrFenced` and write no launcher. A record that cannot be read blocks too. A replica is not a
+primary and starts on a fenced node (it is how the node is rebuilt). `PromoteReplica` checks first, so
+`ErrFenced` from it is a refusal that changed nothing.
 
 - `Capacity` counts the replicas on the node with their project's memory cap (`ComputeNodeCapacity`);
   a failed or going-down replica and the system standby count nothing. The replica of a paused project
@@ -543,9 +597,16 @@ another node whatever the plane: restore, upgrade and the final backup of a dele
   `AdmitReplica` is the check a node runs before it takes a replica: room in the budget and on the
   disk (the base backup's size plus a quarter and 1 GiB).
 - Resize: a larger size restarts the replicas first, a smaller one last (`ReplicaFleet`,
-  `Options.Replicas`). A replica that does not come back is `ACTIVE_UNHEALTHY`, leaves the event
-  `replica.resize_failed` and is reported through `ReplicaFleet.Failed`; it does not stop the primary.
-  A grow whose primary fails puts the replicas back on the old size.
+  `Options.Replicas`). The replicas of a project restart together, four at a time, and each has a
+  deadline (`Options.ReplicaRestartTimeout`, five minutes), so a node that does not answer holds the
+  resize or the save of a setting for that long and no longer. A replica that does not come back is
+  `ACTIVE_UNHEALTHY`, leaves the event `replica.resize_failed` and is reported through
+  `ReplicaFleet.Failed`; it does not stop the primary. A caller that gives up (a stopped daemon) leaves
+  the replica's status as it was and raises nothing. A grow whose primary fails puts the replicas back on
+  the old size.
+- Restarting a project restarts its primary only: the Management API restarts with a pause and a
+  resume, and neither touches the replicas, which keep their rows, their units and their stream from
+  the archive while the primary is down (a test pins it).
 - Postgres settings: a save that restarts the primary (`ApplyOptions.RestartDatabase`, with a setting
   that waits for a restart) restarts the replicas after it. A standby pauses replay when its
   `max_connections`, `max_worker_processes`, `max_wal_senders`, `max_prepared_transactions` or
@@ -585,10 +646,16 @@ and `upgrade-smoke` run the systemd, compute size, saved settings and upgrade fl
   Postgres settings, made while the project is paused, and the restart that applies a held-back setting
   (`RestartPending`), restart no replica. A standby whose limits are below the primary's pauses replay
   until it restarts, so restart the replica after such a change.
-- Restore, upgrade and the final backup of a delete are refused for a project homed on another node: the
-  Engine works on this node's disk. They run once the project is homed here again.
-- A project homed on another node answers `ErrNotSupported` to the optional capabilities (saved
-  settings, role passwords, extensions); they are applied on its home. Create with a `DataSeeder` runs
+- Restore and upgrade are refused for a project homed on another node: the Engine works on this node's
+  disk, and a restore drives the Manager of the node that holds the data. They run once the project is
+  homed here again (an upgrade, on its home with `supavise upgrade`).
+- A project homed on another node answers `ErrNotSupported` to the optional capabilities (Postgres
+  settings, role passwords, extensions, render checks); they are applied on its home. The settings of
+  GoTrue and PostgREST reach it as a `Reconfigure`, which restarts both. Create with a `DataSeeder` runs
   on the node that is the home.
+- The move of a project between nodes has a window between the planned stop of the old primary and the
+  move of the home in the registry: a daemon restart in it starts the old primary again at boot, because
+  the registry still names the node the home, until the fence record the orchestrator writes after the
+  promotion. `LocalPrimaries.Stop` (`internal/placement`) leaves no hold of its own.
 - A replica is not stopped, started or removed with its project (pause, resume, delete): the replica
   controller does that through the node agent.

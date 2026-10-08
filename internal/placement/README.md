@@ -53,10 +53,17 @@ leader as it did on the node:
 | 410 | no restorable state | `lifecycle.ErrNoRestorableState` |
 | 412 | the directory holds a cluster | `lifecycle.ErrClusterExists` |
 | 421 | the project is not homed on the node | `ErrNotHome` |
-| 422 | not allowed in the current state | `lifecycle.ErrInvalidState` |
+| 422 | not allowed in the current state | `lifecycle.ErrInvalidState`; the answer's code also tells `lifecycle.ErrFenced` (the node or the project is fenced), `ErrNotStandby` (both of these match `ErrInvalidState` too) and `ErrNotCleanShutdown` (it does not) apart |
 | 501 | the node has no backup engine | `lifecycle.ErrNoSnapshot` |
 | 504 | replay did not reach the position asked | `lifecycle.ErrReplayBehind` |
-| 507 | the node has no room for the replica | `ErrNoRoom` |
+| 507 | the node has no room for the replica | `*NoRoomError`, which matches `ErrNoRoom` and has the `NoRoom() bool` method the replica controller looks for; on the leader's own node the admission's `*lifecycle.CapacityError` (or an error wrapping `lifecycle.ErrReplicaDisk`) comes through `ErrNoRoom` |
+
+`Refused(err)` says whether an error is a node's refusal before it changed anything (not the leader, an
+older epoch, not the home, not found, the state does not allow it, a fenced node, a standby that has not
+replayed as far as asked, no room, no backup engine, nothing to restore). The failover orchestrator
+treats a promotion that ends in anything else as possibly done: a status 500, a lost answer, a failure
+in the middle of the work, or `ErrNotCleanShutdown`, which the node answers after it stopped the
+cluster.
 
 ## Node agent and peer API endpoints
 
@@ -64,7 +71,8 @@ leader as it did on the node:
 `GET` and `DELETE /peer/v1/instances/{identifier}`, `POST /peer/v1/instances/{identifier}/{action}`,
 `POST /peer/v1/projects/{ref}/plane/{method}` and `POST /peer/v1/projects/{ref}/backup/{op}`. Every
 handler admits the cluster leader only (the client certificate's node), refuses a request under an
-older epoch than the node's, and, for the plane and backup endpoints, one for a project that is not
+older epoch than the node's (the removal of an instance, which has no body, carries it as `?epoch=`; a
+request without one is judged by the leader check alone), and, for the plane and backup endpoints, one for a project that is not
 homed on the node (the node's copy of the registry can trail the leader's by a moment; the leader asks
 again; after the registry moves a home, the first plane call for the new home can arrive before the new
 home's copy has the row, and `Router` and `RemotePlane` do not retry it: the caller that moved the
@@ -99,15 +107,19 @@ node, the peer API for another.
   streaming and without PostgREST.
 - `Observe` reports the step and error plus the live state of the standby (`InstanceStatus`).
 - `Remove` stops a setup in flight, then the units, and deletes the directory. It removes only the
-  replica the node holds (another identifier of the project is refused) and refuses when the project is
-  homed on this node, when the cluster here has become the primary, or when the data directory is a
+  replica the node holds (another identifier of the project is refused), never the standby of the system
+  cluster (the node's own registry; it goes with the node when the node leaves), and refuses when the
+  project is homed on this node, when the cluster here has become the primary, or when the data directory is a
   cluster without `standby.signal` (a promoted replica that is stopped does not answer), unless the
   setup it belongs to has not finished: removing a replica must never remove a home.
 - `Do` runs `restart` (renders from `InstanceAction.Class` when the leader names the size, because the
   node's copy of the registry may not have it yet), `stop`, `start`, `promote` and `demote` (the failover
   orchestrator's steps 4 and 7 of a project switchover; `lifecycle.PromoteReplica` and
   `DemoteToReplica`). An action during a setup is refused. `start`, `restart` and `stop` are refused
-  when the registry names this node the project's home, and so is a `promote`, except one repeated after
+  when the registry names this node the project's home, and `start` and `restart` also when the cluster
+  here is a primary (no `standby.signal`) or follows as another replica: the replica's spec would be
+  rendered over a writable cluster. A resume of an interrupted setup (`Ensure`) is refused on the home
+  too, because it deletes the project's directory, and so is a `promote`, except one repeated after
   the home moved here, which finds the cluster a primary and ends the replica instance. A `demote` is
   refused while the registry still names this node the home: the registry moves the home first (design
   2.10.3, steps 5 and 7), and a demotion of the home would stop its primary. A promotion
@@ -115,7 +127,11 @@ node, the peer API for another.
   (`lifecycle.PlaneOptions.HoldPorts`; `internal/app/wire_placement.go` binds it to
   `mesh.Forwarders.Suspend`): on a replica's node the canonical ports are forwarders to the old home,
   and Postgres could not bind them.
-- `StartLocal` starts the node's complete replicas after a restart; their units are not enabled for boot.
+- `StartLocal` starts the node's complete replicas after a restart, four at a time
+  (`AgentOptions.Concurrency`); their units are not enabled for boot. `ObserveAll` reads them four at
+  a time as well, and `ReportCache` probes the replicas and the projects side by side, so a follower
+  that holds a replica of every project neither starts them one after another nor misses its report's
+  interval.
   A cluster that is no standby of its replica (no `standby.signal`, or a standby that follows as another
   replica) is left alone: the node was promoted and the registry has not caught up, and the replica's spec
   would run a writable cluster on the replica port beside the real one.
@@ -131,6 +147,26 @@ leader, and logs once, not every tick, that a leader has no report endpoint (`Er
 
 `Fleet` is the `lifecycle.ReplicaFleet` of the leader's Engine: it restarts a project's replicas through
 `InstanceOps` when the project is resized.
+
+Four more pieces are the wiring's to attach:
+
+- `LocalPrimaries` (`localprimaries.go`) is the failover orchestrator's hand on the primaries homed here
+  (it has the methods of `failover.LocalPrimaries`; this package does not import `internal/failover`). `Stop`
+  stops the backup timer and the units and returns the cluster's latest checkpoint location from
+  its control file, an error when it cannot be read or the cluster did not shut down cleanly; `Start`
+  starts a primary (a fenced one answers `lifecycle.ErrFenced`); `Healthy`; `SetAside` refuses while a
+  postmaster of the directory is alive and otherwise calls `MoveAside`, which the wiring binds to
+  `failover.SetAsideDiverged`.
+- `RoutedBackups` (`routedbackups.go`) takes a base backup on the node a project is homed on and records
+  it on the leader: the home takes it without writing its registry (`backup.BackupOptions.NoRecord`;
+  the backup handler always asks for that, because a follower's registry is a read-only copy), and the
+  leader writes the row and the event (`backup.Service.RecordBase`). `TakeBase` is
+  `backup.Options.TakeBase`, which `EnsureBase` uses to seed a replica; `FinalBackup` is
+  `lifecycle.RemoteBackups`, which `Engine.SetRemoteBackups` takes for the final backup of a delete.
+- `SystemStandby` (`systemstandby.go`) adapts `lifecycle.PostgresPlane.SeedSystemStandby` to the join's
+  `cluster.SeedFunc` and `Preflight`, for a server that joins before its daemon and its registry exist.
+- `Router.ReconfigureService` sends the settings of GoTrue and PostgREST of a project homed elsewhere to
+  its home as a `Reconfigure` (both services restart).
 
 `internal/app/wire_placement.go` wires all of it when the mesh is up, and provides `placement.Resolver`,
 `PlaneRouter`, `InstanceOps`, `BackupOps`, `Contribution` and the node's own backup timers as
@@ -155,7 +191,10 @@ the ports is covered by the unit tests of `internal/lifecycle`.
 
 ## Limits
 
-- The backup handlers run the backup service of the node that is the home. On a follower, whose registry
-  is read-only, a base backup cannot record its row.
-- Create with a seed, and the optional capabilities of the Engine's plane (saved settings, role
-  passwords, extensions), are not carried to another node.
+- The backup handlers run the backup service of the node that is the home. A base backup there does not
+  write the registry (the leader records it: `RoutedBackups`); a restore still drives the Manager of that
+  node, whose registry is read-only on a follower, and is refused for a project homed elsewhere.
+- The nightly base backup of a project homed on a follower (`supavise-basebackup@<ref>.timer`) runs the
+  follower's own backup service, which cannot record its row in a read-only registry.
+- Create with a seed, and the optional capabilities of the Engine's plane (Postgres settings, role
+  passwords, extensions, render checks), are not carried to another node.
