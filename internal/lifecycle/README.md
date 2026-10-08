@@ -438,9 +438,128 @@ Choices worth knowing:
 - Unix socket paths are limited to about 100 bytes, so on macOS and in tests the state directory must be
   short; the plane refuses a longer one with a clear error.
 
+## Replicas
+
+A replica is the project's Postgres in standby mode plus its own PostgREST, on a node that is not the
+project's home (design 2.7). It uses the units `supavise-postgres@<ref>` and `supavise-postgrest@<ref>` of
+its node, so no unit template differs from a primary's; a node is either a project's home or holds its
+replica, never both. The role decides the ports and the settings when the units are rendered
+(`replica.go`, `replica_promote.go`, `cluster_sql.go`). A primary's units are rendered exactly as before:
+`TestPrimaryUnitsMatchV011` compares them with golden files the v0.1.1 sources produced
+(`testdata/v0.1.1`), so an upgrade restarts no project.
+
+| | Primary | Replica |
+|---|---|---|
+| Postgres port | `config.PortsFor` (`project_base + 3*seq`) | `config.ReplicaPorts` (`replica_base + 3*seq`); the system cluster's standby takes `replica_base` itself |
+| Postgres settings | the class's and the saved ones | the same, plus `hot_standby=on` and `hot_standby_feedback=on`; `archive_mode=on` (a standby never archives) |
+| PostgREST port | `project_base + 3*seq + 2` | `replica_base + 3*seq + 2` |
+| `PGRST_DB_URI` | the primary on its canonical port | `postgres://authenticator:...@127.0.0.1:<replica>,127.0.0.1:<canonical>/postgres?target_session_attrs=read-only`: the pool uses the replica; only the `LISTEN` session reaches the primary, through the canonical port, which is a forwarder to the home on another node |
+| JWT secrets, saved PostgREST settings | the project's | the same, so one apikey works on every database |
+| GoTrue | yes | no |
+
+`PostgresPlane` operations (all take a `ReplicaTarget`: identifier, project row, keys):
+
+- `CreateReplica`: directories, `pg_hba.conf` and the pgsodium root key, the seeder (`ReplicaSeeder`,
+  the backup service's `SeedReplica`; it receives the canonical Postgres port and the replication
+  password, or no upstream for an archive-only standby), `postmaster.opts`, then the cluster, waiting
+  until it accepts connections. A failed seed removes the partly extracted directory, so the call can
+  be repeated. `ErrClusterExists` when the directory holds a cluster. `ReplicaCreateOptions.Progress`
+  reports the stages the node agent turns into setup steps.
+- `StartReplicaDatabase`, `StartReplicaAPI`, `StartReplica`, `StopReplica`, `RemoveReplica`,
+  `ReplicaHealth` (cluster and PostgREST; a replica has no GoTrue) and `ObserveReplica` (role,
+  receiver status, LSNs and lag as Studio computes it: 0 when everything received is replayed and
+  the receiver streams, else the time since the last replayed commit).
+- `PromoteReplica` (step 4 of a project switchover): waits for replay to reach `WaitLSN` (the record that
+  starts there must be replayed, and everything received: `FinalCheckpoint` gives the start of the
+  old primary's shutdown checkpoint, its last record), optionally lets `restore_command` drain the archive
+  (replay must stand still for one `wal_retrieve_retry_interval`, at most 10 seconds), writes
+  `promote.ok` with the epoch (the content `backup.FormatPromoteOK` writes, which lets the WAL relay
+  accept the first push; a standby that does not promote carries none), runs `pg_promote` and a
+  checkpoint, stops the units, removes the recovery settings (`hot_standby` and the header of the
+  backup service's block among them) from `postgresql.auto.conf` and `standby.signal`, and starts the
+  cluster from the primary's spec on the canonical port. GoTrue and PostgREST start with `Start` once the
+  registry names the node the home. A repeat after a failure at any point finishes the job; a cluster
+  that already runs as a primary on its canonical port is left alone.
+- `DemoteToReplica` (step 7): for a cluster that shut down cleanly (`ReadControl` reads `pg_control`, so
+  no binary is needed; `ErrNotCleanShutdown` otherwise): removes `promote.ok` and the GoTrue unit, writes
+  `primary_conninfo` (the canonical port, a forwarder to the new home), `restore_command`
+  (`PlaneOptions.RestoreCommandFor`) and `recovery_target_timeline = 'latest'`, creates
+  `standby.signal` and starts the replica's units. The old timeline ends at the shutdown checkpoint
+  where the new primary's begins, so no base backup is read. A repeat after the standby it started
+  stopped or crashed starts it again without the shutdown check, which only a primary has to pass.
+- The ports. On the node of a replica the canonical ports are forwarders to the project's home, and on
+  a project's old home the replica ports may be forwarders to another replica. `PromoteReplica` and
+  `DemoteToReplica` take the project's ports from the forwarders before they start Postgres on one
+  (`PlaneOptions.HoldPorts`, `SetPortHolder`; the daemon binds it to `mesh.Forwarders.Suspend`). A
+  promotion does so once the standby is promoted, so a promotion that stops earlier leaves the standby's
+  stream through the forwarder alone. A demotion gives them back when it returns; the hold covers every
+  forwarder of the project, the canonical Postgres one the standby streams through included, so the
+  demoted cluster catches up from the archive meanwhile and streams once the call has returned. A
+  promotion keeps them until `Start` of the project succeeds on the node, which is after the registry
+  names the node the home, and gives them back at once when it fails. `Start` of a project with no hold
+  does nothing more than before.
+- `ReloadSchema` and `RunSchemaReload` send `SIGUSR1` to the replica's PostgREST every
+  `[replicas] schema_reload_seconds` (default 10): the NOTIFY alone can arrive before the WAL of the
+  change was replayed (spike S3). A PostgREST that started less than 5 seconds ago is left alone, because
+  `SIGUSR1` ends a process that has not installed its handler yet.
+
+`pg_cron` and `pg_net` need no setting: their workers do not start on a standby and start at the
+promotion without a restart (spike S2). `ClusterSQL` (`PlaneOptions.ClusterSQL`) is the seam for the SQL
+these operations run, so that the state machines are tested with a fake runner.
+
+### The Engine in a cluster
+
+`Options.NodeID` is the node the Engine runs on. `StartActive`, `Recover`, `EnsureTenants` and
+`SettleUpgrades` leave a project homed on another node (`registry.Project.NodeID`) to its home, and the
+Engine of a follower (`OpenOptions.ReadOnly`: the registry opens with `registry.OpenReadOnly` through the
+system standby's socket on the replica port, `FollowerRegistryDSN`) takes no advisory locks and settles
+nothing. `Open` looks the node id up (`SelfNode`: the node named `[node] name`, else the founder on a
+writable registry).
+
+A project homed on another node is driven only by an Engine whose plane is a `HomeRouter`
+(`internal/placement`'s `Router`), and only through the operations whose every step is a plane call, a
+registry write or a call on the shared services: pause, resume, delete (but see the final backup below),
+key rotation, settings, password change, resize and health. Anywhere else they answer `ErrInvalidState` naming the home, because this node's plane would act
+on whatever it holds of the project, which is a replica, and `Health` would report the replica's units
+as the project's. `Engine.SetPlane` puts the router in front of the node's plane; the router has every
+optional capability the Engine finds by type assertion (`FullPlane`), and answers `ErrNotSupported` to
+the ones that apply settings on the node itself. The rest of what such an operation does follows the home
+through two more seams that `internal/app` sets beside it:
+
+- `SetTimers`: the nightly base backup timer starts and stops on the node that is the project's home,
+  where its data is, and not on the leader. `Engine.Timers` is the node's own, which the daemon provides
+  as `lifecycle.Timers` to whoever starts or stops a primary on this node (the failover).
+- `SetRemoteNodes` (`NodeResourcer`): a resume, a resize and `Offers` are judged against the memory and
+  cores of the home, read on that node, with the registry's projects and replicas for it and the leader's
+  `[compute] overcommit`. Without it a project homed elsewhere is not judged.
+
+What reads or writes this node's own disk, backup service or artifacts is refused for a project homed on
+another node whatever the plane: restore, upgrade and the final backup of a delete. Delete it with
+`SkipFinalBackup` (the data is gone afterwards), or move the project here first.
+
+- `Capacity` counts the replicas on the node with their project's memory cap (`ComputeNodeCapacity`);
+  a failed or going-down replica and the system standby count nothing. The replica of a paused project
+  counts: pausing stops the project's own units, and its replicas keep their memory.
+  `AdmitReplica` is the check a node runs before it takes a replica: room in the budget and on the
+  disk (the base backup's size plus a quarter and 1 GiB).
+- Resize: a larger size restarts the replicas first, a smaller one last (`ReplicaFleet`,
+  `Options.Replicas`). A replica that does not come back is `ACTIVE_UNHEALTHY`, leaves the event
+  `replica.resize_failed` and is reported through `ReplicaFleet.Failed`; it does not stop the primary.
+  A grow whose primary fails puts the replicas back on the old size.
+- Postgres settings: a save that restarts the primary (`ApplyOptions.RestartDatabase`, with a setting
+  that waits for a restart) restarts the replicas after it. A standby pauses replay when its
+  `max_connections`, `max_worker_processes`, `max_wal_senders`, `max_prepared_transactions` or
+  `max_locks_per_transaction` is below the primary's, and resumes when it restarts on the new values.
+  The replicas restart after the primary whichever way the value moved, so a raise leaves a replica
+  paused for the seconds the restart takes. A replica that does not come back is `ACTIVE_UNHEALTHY`,
+  leaves the event `replica.restart_failed` and is reported through `ReplicaFleet.Failed`. A save that
+  leaves the restart to the user restarts no replica, and neither does the restart that applies it later.
+
 ## Tests
 
-The `test` job of the `ci` workflow runs `go test ./internal/lifecycle/` against fakes. The integration
+The `test` job of the `ci` workflow runs `go test ./internal/lifecycle/` against fakes. The replica
+operations run against a fake supervisor and a fake `ClusterSQL`; the linux job `replica-blocks` runs
+them on real clusters (`internal/placement`, `TestIntegrationReplicaBlocks`). The integration
 tests (`go test -run Integration -v ./internal/lifecycle/`) run the create, health, SQL, pause, resume,
 rotate, delete cycle against real artifacts with the exec backend. They need unpacked slim-services
 artifacts (`postgres-17*`, `auth-*`, `postgrest-*`) in the directory `SUPAVISE_TEST_UNPACKED` names
@@ -459,3 +578,17 @@ and `upgrade-smoke` run the systemd, compute size, saved settings and upgrade fl
   path. Upgrades never touch the shared services (Supavisor, Realtime, Storage, pgmeta, Studio, the edge
   runtime); they move with the node.
 - `Usage` reports disk bytes and unit memory only.
+- A major upgrade of a project that has replicas is refused (`has_replicas`); there is no option that
+  drops the replicas first, and a bump of the Postgres artifact has no replicas-first order: the manifest
+  has no `wal_compat` field to say when one is needed.
+- Replicas follow the primary's size and settings only through the restarts above. A resize, or a save of
+  Postgres settings, made while the project is paused, and the restart that applies a held-back setting
+  (`RestartPending`), restart no replica. A standby whose limits are below the primary's pauses replay
+  until it restarts, so restart the replica after such a change.
+- Restore, upgrade and the final backup of a delete are refused for a project homed on another node: the
+  Engine works on this node's disk. They run once the project is homed here again.
+- A project homed on another node answers `ErrNotSupported` to the optional capabilities (saved
+  settings, role passwords, extensions); they are applied on its home. Create with a `DataSeeder` runs
+  on the node that is the home.
+- A replica is not stopped, started or removed with its project (pause, resume, delete): the replica
+  controller does that through the node agent.

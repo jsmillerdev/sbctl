@@ -155,6 +155,9 @@ const (
 	BlockerNoBackup      = "no_backup_service"
 	BlockerSystem        = "system_project"
 	BlockerExtension     = "unsupported_extension"
+	// BlockerReplicas: the project has read replicas and the target is another Postgres major
+	// version, which a standby cannot follow. They are removed first.
+	BlockerReplicas = "has_replicas"
 )
 
 // UpgradeBlocker is one reason a project cannot be upgraded now.
@@ -324,6 +327,17 @@ func (e *Engine) plan(ctx context.Context, p *registry.Project, target map[strin
 	case el.CurrentMajor != 0 && el.TargetMajor != 0 && el.CurrentMajor != el.TargetMajor:
 		block(BlockerNoUpgradePath, "the project runs Postgres %d and the target is Postgres %d; upgrades across major versions are not supported yet", el.CurrentMajor, el.TargetMajor)
 	}
+	// A standby follows its primary's WAL: another major version needs the replicas removed first, and a
+	// restart onto another release of the same major leaves each replica on the release its node runs
+	// until that node is upgraded too (any order works for a release that keeps the WAL format).
+	if rs, err := e.reg.ListReplicas(ctx, p.Ref); err == nil && len(rs) > 0 {
+		switch {
+		case el.CurrentMajor != 0 && el.TargetMajor != 0 && el.CurrentMajor != el.TargetMajor:
+			block(BlockerReplicas, "the project has %d read replica(s), which cannot follow a major version; remove them first", len(rs))
+		case el.PostgresRestart:
+			el.Notes = append(el.Notes, fmt.Sprintf("The project has %d read replica(s). Each keeps the PostgreSQL release its node runs until that node is upgraded (`supavise upgrade`).", len(rs)))
+		}
+	}
 	switch p.Status {
 	case registry.StatusActiveHealthy:
 	case registry.StatusInactive:
@@ -396,6 +410,9 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return nil, err
+	}
+	if err := e.onHome(p, "upgrade", "an upgrade stops and renders the project from this node's artifacts and data; move the project to this node first"); err != nil {
 		return nil, err
 	}
 	if p.Ref == config.SystemRef {
@@ -951,6 +968,9 @@ func (e *Engine) settleUpgrading(ctx context.Context, ref string) (Recovered, bo
 // ACTIVE_HEALTHY); an upgrade whose process still holds its claim is not touched. The daemon
 // calls it every few minutes.
 func (e *Engine) SettleUpgrades(ctx context.Context) []Recovered {
+	if e.opts.ReadOnly {
+		return nil // a follower settles nothing: its registry is a copy
+	}
 	ps, err := e.reg.ListProjects(ctx)
 	if err != nil {
 		e.log.Error("settle upgrades: listing projects", "error", err)
@@ -959,7 +979,7 @@ func (e *Engine) SettleUpgrades(ctx context.Context) []Recovered {
 	var out []Recovered
 	for i := range ps {
 		p := ps[i]
-		if p.Ref == config.SystemRef || p.Status != registry.StatusUpgrading || e.runnerLive(ctx, p.Ref) {
+		if p.Ref == config.SystemRef || p.Status != registry.StatusUpgrading || !e.drives(&p) || e.runnerLive(ctx, p.Ref) {
 			continue
 		}
 		r, ok := e.settleUpgrading(ctx, p.Ref)
@@ -994,7 +1014,7 @@ func (e *Engine) settleUpgradeRows(ctx context.Context, ps []registry.Project) {
 	}
 	for i := range ps {
 		p := &ps[i]
-		if p.Ref == config.SystemRef || p.Status == registry.StatusUpgrading {
+		if p.Ref == config.SystemRef || p.Status == registry.StatusUpgrading || !e.drives(p) {
 			continue
 		}
 		u, err := store.LatestUpgrade(ctx, p.Ref)
@@ -1146,6 +1166,9 @@ func (e *Engine) RestartPending(ctx context.Context, ref string) (bool, error) {
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return false, err
+	}
+	if err := e.atHome(p, "restart"); err != nil {
 		return false, err
 	}
 	if !active(p.Status) {

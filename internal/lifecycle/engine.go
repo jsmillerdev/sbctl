@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,17 @@ type Options struct {
 	// the caller starts any slow delivery itself. `supavise upgrade` leaves it nil: it reports the
 	// node's upgrade as one, not every project's move.
 	UpgradeNotify func(ctx context.Context, n UpgradeNotice)
+	// NodeID is the id of the node this Engine runs on (registry.Node.ID). StartActive, Recover and
+	// EnsureTenants leave a project homed on another node (registry.Project.NodeID) to that node. Empty
+	// means every project is this node's: a server outside a cluster, and tests.
+	NodeID string
+	// ReadOnly is the Engine of a follower, whose registry is a hot standby of the leader's: it takes
+	// no advisory locks (a standby refuses them), and Recover, which settles statuses in the
+	// registry, does nothing. The operations that write the registry fail with registry.ErrReadOnly.
+	ReadOnly bool
+	// Replicas reaches the replicas of a project on the nodes that hold them, so that a resize can
+	// restart them in the right order (see ReplicaFleet). Nil: the node has none.
+	Replicas ReplicaFleet
 }
 
 // Timers drives the per-project nightly base backup timer (supavise-basebackup@<ref>.timer).
@@ -53,6 +65,16 @@ type Timers interface {
 	StartTimer(ctx context.Context, ref string) error
 	StopTimer(ctx context.Context, ref string) error
 }
+
+// Timers is the Timers the Engine drives: the node's own, or the one that sends each call to the node a
+// project is homed on once SetTimers has put it in front (nil: none).
+func (e *Engine) Timers() Timers { return e.opts.Timers }
+
+// SetTimers replaces the Timers the Engine drives. internal/app calls it before the Engine serves a
+// request, to put the router of internal/placement in front of the node's own timers in a cluster: a
+// backup timer runs where the project's data is, which is its home. It is not safe to call while
+// operations run.
+func (e *Engine) SetTimers(t Timers) { e.opts.Timers = t }
 
 func (e *Engine) startTimer(ctx context.Context, ref string) {
 	if e.opts.Timers == nil {
@@ -122,7 +144,7 @@ func (e *Engine) lock(ctx context.Context, ref string) (func(), error) {
 	mu := m.(*sync.Mutex)
 	mu.Lock()
 	ap, ok := e.reg.(advisoryPool)
-	if !ok || ap.Pool() == nil {
+	if !ok || ap.Pool() == nil || e.opts.ReadOnly {
 		return mu.Unlock, nil
 	}
 	conn, err := pgx.ConnectConfig(ctx, ap.Pool().Config().ConnConfig)
@@ -142,6 +164,59 @@ func (e *Engine) lock(ctx context.Context, ref string) (func(), error) {
 		mu.Unlock()
 	}, nil
 }
+
+// homedHere reports whether p is this node's to run: its home is this node, or the Engine has no
+// node (a server outside a cluster).
+func (e *Engine) homedHere(p *registry.Project) bool {
+	return e.opts.NodeID == "" || p.NodeID == "" || p.NodeID == e.opts.NodeID
+}
+
+// atHome refuses op on a project that is homed on another node unless the Engine drives a plane that
+// routes by home. A node that holds a replica of the project would otherwise stop, restart or delete
+// the replica and flip the project's status in the registry. Only an operation whose every step is a
+// plane call, a registry write or a call on the shared services may use it (the leader's Timers and
+// capacity check follow the home too, see SetTimers and SetRemoteNodes); an operation that reads or
+// writes this node's own disk uses onHome.
+func (e *Engine) atHome(p *registry.Project, op string) error {
+	if e.drives(p) {
+		return nil
+	}
+	return e.notHomedHere(p, op, "")
+}
+
+// drives reports whether the Engine acts on p: it is homed here, or the plane routes by home.
+func (e *Engine) drives(p *registry.Project) bool {
+	if e.homedHere(p) {
+		return true
+	}
+	_, ok := e.plane.(HomeRouter)
+	return ok
+}
+
+// onHome refuses op on a project that is not homed on this node, whatever the plane: the operation
+// works on the data directory, the backup service or the artifacts of this node, which hold nothing of
+// a project that runs elsewhere. why says what stays here, for the message.
+func (e *Engine) onHome(p *registry.Project, op, why string) error {
+	if e.homedHere(p) {
+		return nil
+	}
+	return e.notHomedHere(p, op, why)
+}
+
+func (e *Engine) notHomedHere(p *registry.Project, op, why string) error {
+	if why != "" {
+		why = "; " + why
+	}
+	return fmt.Errorf("%w: cannot %s %s here: it is homed on node %s and this is node %s%s", ErrInvalidState, op, p.Ref, p.NodeID, e.opts.NodeID, why)
+}
+
+// SetPlane replaces the plane the Engine drives. internal/app calls it before the Engine serves a
+// request, to put the plane router (internal/placement) in front of the node's own plane in a
+// cluster; it is not safe to call while operations run.
+func (e *Engine) SetPlane(p Plane) { e.plane = p }
+
+// NodeID is the node the Engine runs on ("" outside a cluster).
+func (e *Engine) NodeID() string { return e.opts.NodeID }
 
 // cleanupCtx outlives a cancelled request: cleanup after a failure must still run.
 func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -475,6 +550,9 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
+	if err := e.atHome(p, "pause"); err != nil {
+		return err
+	}
 	// A project whose restore failed can be paused, and resumed after: the way back to ACTIVE_HEALTHY
 	// when the original data is intact.
 	if ref == config.SystemRef || !(active(p.Status) || p.Status == registry.StatusRestoreFailed || inRestore(ctx, p)) {
@@ -520,6 +598,9 @@ func (e *Engine) resume(ctx context.Context, ref string, checkNode bool) error {
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return err
+	}
+	if err := e.atHome(p, "resume"); err != nil {
 		return err
 	}
 	if ref == config.SystemRef || !(p.Status == registry.StatusInactive || inRestore(ctx, p)) {
@@ -583,6 +664,9 @@ func (e *Engine) DeleteWith(ctx context.Context, ref string, o DeleteOptions) er
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return err
+	}
+	if err := e.atHome(p, "delete"); err != nil {
 		return err
 	}
 	if ref == config.SystemRef {
@@ -756,6 +840,9 @@ func (e *Engine) deleteProgress(ctx context.Context, ref string) deleteState {
 }
 
 func (e *Engine) finalBackup(ctx context.Context, p *registry.Project, prev registry.Status) error {
+	if err := e.onHome(p, "take the final backup of", "the backup service reads the data directory of this node; delete it with SkipFinalBackup (the data is gone afterwards) or move it to this node first"); err != nil {
+		return err
+	}
 	keys, err := e.loadKeys(ctx, p.Ref)
 	if err != nil {
 		return err
@@ -797,6 +884,9 @@ func (e *Engine) RotateKeys(ctx context.Context, ref string) (*secrets.ProjectKe
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return nil, err
+	}
+	if err := e.atHome(p, "rotate keys of"); err != nil {
 		return nil, err
 	}
 	if p.Status != registry.StatusInactive && !active(p.Status) {
@@ -865,7 +955,7 @@ func (e *Engine) StartActive(ctx context.Context) map[string]error {
 	}
 	for i := range ps {
 		p := ps[i]
-		if p.Ref == config.SystemRef || !active(p.Status) {
+		if p.Ref == config.SystemRef || !active(p.Status) || !e.homedHere(&p) {
 			continue
 		}
 		if err := e.startOne(ctx, &p); err != nil {
@@ -892,7 +982,7 @@ func (e *Engine) EnsureTenants(ctx context.Context) map[string]error {
 		return errs
 	}
 	for i := range ps {
-		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) {
+		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) || !e.homedHere(&ps[i]) {
 			continue
 		}
 		if err := e.ensureTenantsOf(ctx, ps[i].Ref); err != nil {
@@ -981,8 +1071,13 @@ func (e *Engine) Health(ctx context.Context, ref string) ([]ServiceHealth, error
 	if err != nil {
 		return nil, err
 	}
+	// The units of a project that runs elsewhere are not this node's to judge: its plane would find the
+	// replica's units, or none, and the verdict would be written to the registry.
+	if err := e.atHome(p, "check the health of"); err != nil {
+		return nil, err
+	}
 	hs := e.plane.Health(ctx, p, nil)
-	if active(p.Status) {
+	if active(p.Status) && !e.opts.ReadOnly {
 		want := registry.StatusActiveHealthy
 		for _, h := range hs {
 			if !h.Healthy {
@@ -1095,13 +1190,19 @@ const StatusDeleted registry.Status = "DELETED"
 //     intent; the project is INACTIVE and Recovered.Resume is set, so ResumeRecovered
 //     brings it back. A stale intent on a project that is not paused is cleared.
 //
-// RESTORING is not touched: a restore is for its operator to judge.
+// RESTORING is not touched: a restore is for its operator to judge. A project homed on another node
+// is that node's to recover, and a read-only Engine (a follower) recovers nothing.
 func (e *Engine) Recover(ctx context.Context) []Recovered {
+	if e.opts.ReadOnly {
+		return nil // a follower settles nothing: it cannot write the registry
+	}
 	ps, err := e.reg.ListProjects(ctx)
 	if err != nil {
 		e.log.Error("recover: listing projects", "error", err)
 		return nil
 	}
+	// A project homed on another node is that node's to recover.
+	ps = slices.DeleteFunc(ps, func(p registry.Project) bool { return !e.homedHere(&p) })
 	routes := map[string]bool{}
 	if rs, err := e.reg.ListRoutes(ctx); err == nil {
 		for _, r := range rs {

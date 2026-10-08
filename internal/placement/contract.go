@@ -59,6 +59,7 @@ type PlaneRouter interface {
 // orchestrator code against it; its fake is a map of nodes.
 type InstanceOps interface {
 	// Ensure creates the instance on node, or finds it already there, and returns what the node observes.
+	// ErrNoRoom when the node has no room for it: nothing is recorded there, and asking again later starts it.
 	Ensure(ctx context.Context, node string, spec peerapi.InstanceSpec) (peerapi.InstanceStatus, error)
 	// Observe returns what node observes about the instance.
 	Observe(ctx context.Context, node, identifier string) (peerapi.InstanceStatus, error)

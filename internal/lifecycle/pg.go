@@ -79,6 +79,15 @@ func RegistryDSN(cfg *config.Config) string {
 	return socketDSN(p, "supavise") + " pool_max_conns=6"
 }
 
+// FollowerRegistryDSN is the DSN of the "supavise" registry database as a follower reads it: the
+// socket of the system cluster's hot standby, which listens on the replica port
+// (config.ReplicaPorts of the system project), not on ports.system_postgres, the port the leader's
+// system cluster has and that is a forwarder to it on a follower.
+func FollowerRegistryDSN(cfg *config.Config) string {
+	p := pathsFor(cfg, config.SystemRef, cfg.ReplicaPorts(config.SystemRef, 0).Postgres)
+	return socketDSN(p, "supavise") + " pool_max_conns=6"
+}
+
 // SystemSocketDSN connects to database db of the system cluster as supabase_admin.
 func SystemSocketDSN(cfg *config.Config, db string) string {
 	return socketDSN(pathsFor(cfg, config.SystemRef, cfg.Ports.SystemPostgres), db)

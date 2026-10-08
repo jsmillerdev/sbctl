@@ -134,6 +134,20 @@ type OpenOptions struct {
 	// RegistryDSN replaces RegistryDSN(cfg), the system cluster's private socket (a command run
 	// with SUPAVISE_REGISTRY_DSN set, tests with a database of their own). Empty means the default.
 	RegistryDSN string
+	// ReadOnly opens the node as a follower: the registry is the replicated copy in the hot standby of
+	// the leader's system cluster, so it is opened with registry.OpenReadOnly (no migrations, no
+	// advisory locks, writes refused), through the socket of the standby, which listens on the
+	// replica port (FollowerRegistryDSN), and the Engine is read-only (Options.ReadOnly). The daemon
+	// decides this before the node opens, from whether the system cluster is in recovery.
+	ReadOnly bool
+	// NodeID is this node's id in the registry. Empty: Open looks up the node named [node] name
+	// (the host name by default) and, on a writable registry that has no such node, takes the
+	// founder, n1, as a server that never joined a cluster is.
+	NodeID string
+	// Replicas reaches the replicas of a project on their nodes (Options.Replicas). Nil: none.
+	Replicas ReplicaFleet
+	// RestoreCommandFor builds restore_command for a project's cluster (PlaneOptions.RestoreCommandFor).
+	RestoreCommandFor func(ref string) string
 }
 
 func (o *OpenOptions) log() *slog.Logger {
@@ -145,7 +159,8 @@ func (o *OpenOptions) log() *slog.Logger {
 
 func (o *OpenOptions) planeOptions() PlaneOptions {
 	return PlaneOptions{Log: o.log(), ConfigPath: o.ConfigPath, ArchiveCommand: o.ArchiveCommand,
-		ArchiveCommandFor: o.ArchiveCommandFor, ArchiveTimeout: o.ArchiveTimeout, ArchiveReady: o.ArchiveReady, Backup: o.Backup}
+		ArchiveCommandFor: o.ArchiveCommandFor, ArchiveTimeout: o.ArchiveTimeout, ArchiveReady: o.ArchiveReady, Backup: o.Backup,
+		RestoreCommandFor: o.RestoreCommandFor}
 }
 
 // Node is everything a process needs to manage projects on this machine: the secrets
@@ -268,13 +283,31 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	dsn := o.RegistryDSN
 	if dsn == "" {
 		dsn = RegistryDSN(cfg)
+		if o.ReadOnly {
+			dsn = FollowerRegistryDSN(cfg)
+		}
 	}
-	reg, err := registry.Open(ctx, dsn)
+	var reg *registry.Postgres
+	if o.ReadOnly {
+		reg, err = registry.OpenReadOnly(ctx, dsn)
+	} else {
+		reg, err = registry.Open(ctx, dsn)
+	}
 	if err != nil {
 		if c, ok := sup.(interface{ Close() }); ok {
 			c.Close() // a caller that retries must not leak a bus connection per attempt
 		}
 		return nil, fmt.Errorf("lifecycle: %w (is supavise-postgres@system running? run `supavise system init`): %w", ErrRegistryUnreachable, err)
+	}
+	nodeID := o.NodeID
+	if nodeID == "" {
+		if nodeID, err = SelfNode(ctx, reg, cfg, o.ReadOnly); err != nil {
+			reg.Close()
+			if c, ok := sup.(interface{ Close() }); ok {
+				c.Close()
+			}
+			return nil, err
+		}
 	}
 	node := &Node{Cfg: cfg, Secrets: sec, Supervisor: sup, Artifacts: arts, Registry: reg}
 	bk := o.lateBackup(node)
@@ -284,9 +317,27 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	po.Settings = node.Settings
 	po.SystemAuth = systemAuth(cfg, func() registry.Registry { return node.Registry }, sec)
 	node.Plane = NewPostgresPlane(cfg, sup, arts, reg, po)
-	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings, UpgradeNotify: o.UpgradeNotify})
+	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings, UpgradeNotify: o.UpgradeNotify,
+		NodeID: nodeID, ReadOnly: o.ReadOnly, Replicas: o.Replicas})
 	node.Engine.SetNode(func() NodeResources { return DetectNode(cfg) })
 	return node, nil
+}
+
+// SelfNode is the id of the node this process runs on: the registry's node named [node] name (the
+// host name unless set), and, when the registry has none, the founder, n1, which is what a server
+// that never joined a cluster is. A follower (readOnly) has a node row from the day it joined, so
+// a missing one is an error: guessing the founder there would start the leader's projects on it.
+func SelfNode(ctx context.Context, reg registry.Registry, cfg *config.Config, readOnly bool) (string, error) {
+	n, err := reg.GetNodeByName(ctx, cfg.NodeName())
+	switch {
+	case err == nil:
+		return n.ID, nil
+	case !errors.Is(err, registry.ErrNotFound):
+		return "", fmt.Errorf("lifecycle: look up this node in the registry: %w", err)
+	case readOnly:
+		return "", fmt.Errorf("lifecycle: this server (node name %q) is not in the cluster registry; set [node] name to the name it joined with", cfg.NodeName())
+	}
+	return registry.FounderNodeID, nil
 }
 
 // supervisorTimers starts and stops supavise-basebackup@<ref>.timer through the supervisor

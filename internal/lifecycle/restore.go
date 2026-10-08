@@ -128,6 +128,9 @@ func (e *Engine) BeginRestore(ctx context.Context, ref string) (RestoreRun, erro
 	if err != nil {
 		return nil, err
 	}
+	if err := e.onHome(p, "restore", "a restore replaces the data directory of its home; move the project to this node first"); err != nil {
+		return nil, err
+	}
 	if !active(p.Status) && p.Status != registry.StatusRestoreFailed {
 		return nil, invalidState(p, "restore")
 	}

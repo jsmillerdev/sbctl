@@ -55,6 +55,9 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 	if err != nil {
 		return ApplyResult{}, err
 	}
+	if err := e.atHome(p, "apply settings to"); err != nil {
+		return ApplyResult{}, err
+	}
 	if p.Status == registry.StatusInactive {
 		if rc, ok := e.plane.(renderChecker); ok {
 			keys, err := e.loadKeys(ctx, ref)
@@ -97,7 +100,15 @@ func (e *Engine) ApplyConfig(ctx context.Context, ref string, svc projectconfig.
 				}
 			}
 		}
-		res.PendingRestart, err = cp.ApplyPostgresSettings(ctx, p, keys, opts.RestartDatabase, func(ctx context.Context) { e.quiesce(ctx, ref) })
+		restarted := false
+		res.PendingRestart, err = cp.ApplyPostgresSettings(ctx, p, keys, opts.RestartDatabase, func(ctx context.Context) { restarted = true; e.quiesce(ctx, ref) })
+		if err == nil && restarted {
+			// A standby needs max_connections, max_worker_processes, max_wal_senders,
+			// max_prepared_transactions and max_locks_per_transaction at least as high as its
+			// primary's, or it pauses replay at the change. Restarting the replicas on the settings
+			// the primary has now covers a raise and a cut alike.
+			e.restartReplicas(ctx, p, "the Postgres settings changed", EventReplicaRestartFailed, "")
+		}
 	default:
 		return ApplyResult{}, fmt.Errorf("lifecycle: unknown settings service %q", svc)
 	}
@@ -123,7 +134,9 @@ func (e *Engine) applySavedSettings(ctx context.Context, p *registry.Project, ke
 		e.log.Warn("resume: could not apply the saved "+what+"; save it again to retry", "ref", p.Ref, "error", err)
 		e.event(ctx, p.Ref, "project.config_apply_failed", map[string]string{"service": what, "error": err.Error()})
 	}
-	if cp, ok := e.plane.(configPlane); ok {
+	// The Postgres settings of a project homed elsewhere are not this node's to apply: the router
+	// answers ErrNotSupported for them, which is no failure of the resume.
+	if cp, ok := e.plane.(configPlane); ok && e.homedHere(p) {
 		pending, err := cp.ApplyPostgresSettings(ctx, p, keys, false, nil)
 		if err != nil {
 			fail(string(projectconfig.Postgres)+" settings", err)
@@ -158,6 +171,9 @@ func (e *Engine) SetDatabasePassword(ctx context.Context, ref, password string) 
 	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if err != nil {
+		return err
+	}
+	if err := e.atHome(p, "change the database password of"); err != nil {
 		return err
 	}
 	if !active(p.Status) {

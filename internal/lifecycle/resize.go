@@ -58,6 +58,7 @@ type ResizeRun struct {
 	prev             registry.Status
 	unlock           func()
 	noop             bool // nothing to restart: the size is unchanged, or the project is paused
+	replicasFirst    bool // the replicas were restarted on the new size before the primary (a larger size)
 	once             sync.Once
 	fromName, toName string
 	changed          bool
@@ -114,6 +115,9 @@ func (e *Engine) beginResize(ctx context.Context, ref string, to Class, unlock f
 	if err != nil {
 		return nil, err
 	}
+	if err := e.atHome(p, "resize"); err != nil {
+		return nil, err
+	}
 	if !(active(p.Status) || p.Status == registry.StatusInactive) {
 		return nil, invalidState(p, "resize")
 	}
@@ -141,7 +145,7 @@ func (e *Engine) beginResize(ctx context.Context, ref string, to Class, unlock f
 		return nil, err
 	}
 	defer release()
-	cp, known, err := e.Capacity(ctx, ref)
+	cp, known, err := e.capacityOf(ctx, p, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +194,15 @@ func (r *ResizeRun) Run(ctx context.Context) error {
 	if err != nil {
 		return r.fail(ctx, fmt.Errorf("load credentials: %w", err), false)
 	}
+	// A larger size reaches the replicas first, a smaller one last (design 2.7.8): a standby needs at
+	// least the primary's connection and worker limits, so it must never run on less than the
+	// primary does. A replica that does not come back on the new size is ACTIVE_UNHEALTHY and
+	// alerts; it does not stop the primary.
+	grow := r.to.MemoryBytes > r.from.MemoryBytes || r.to.VCPUs() > r.from.VCPUs()
+	if grow {
+		e.resizeReplicas(ctx, &np)
+		r.replicasFirst = true
+	}
 	e.quiesce(ctx, p.Ref)
 	if err := e.plane.Stop(ctx, p.Ref); err != nil {
 		return r.fail(ctx, fmt.Errorf("stop: %w", err), true)
@@ -210,6 +223,9 @@ func (r *ResizeRun) Run(ctx context.Context) error {
 		return r.fail(ctx, fmt.Errorf("record the status: %w", err), true)
 	}
 	e.startTimer(ctx, p.Ref)
+	if !grow {
+		e.resizeReplicas(ctx, &np)
+	}
 	e.event(ctx, p.Ref, EventResized, map[string]any{"from": r.from.Name, "to": r.to.Name})
 	r.noop = true // settled: Close must not undo it
 	return nil
@@ -228,6 +244,10 @@ func (r *ResizeRun) fail(ctx context.Context, cause error, restart bool) error {
 	// are back: Studio keeps showing the restart, and a daemon that dies meanwhile recovers a
 	// RESIZING project.
 	e.restoreRecord(cctx, p, false)
+	if r.replicasFirst {
+		// The replicas grew before the primary failed; they follow the size the record has again.
+		e.resizeReplicas(cctx, p)
+	}
 	if restart {
 		keys, err := e.loadKeys(cctx, p.Ref)
 		if err == nil {
