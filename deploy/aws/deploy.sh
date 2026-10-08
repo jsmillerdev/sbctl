@@ -1179,9 +1179,6 @@ STACK_ID=""
 PB_NAME=() PB_WHAT=() PB_VERS=() PB_MARKS=() PB_BYTES=() PB_USERS=()  # the buckets: name, role, versions, delete markers, bytes, other stacks that use it
 PS_ID=() PS_VOL=() PS_SIZE=() PS_WHEN=() PS_STATE=()      # the snapshots
 re_vol='^vol-[0-9a-f]{8,17}$'
-re_snapid='^snap-[0-9a-f]{8,17}$'
-re_bucket='^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
-re_allf='^vol-f+$'
 
 # A volume ID that names a data volume. EC2 reports vol-ffffffff as the volume of every snapshot that
 # is a copy (of a snapshot or of an image) and of the ones an image holds: one value for unrelated
@@ -1282,7 +1279,7 @@ collect_snapshots() { # TAGVALUE [VOLUME...]
   fi
   PS_ID=() PS_VOL=() PS_SIZE=() PS_WHEN=() PS_STATE=()
   while IFS=$'\t' read -r id vol size when state; do
-    [[ $id =~ $re_snapid ]] || continue
+    [[ $id =~ $re_snap ]] || continue
     PS_ID+=("$id")
     PS_VOL+=("$vol")
     PS_SIZE+=("$size")
