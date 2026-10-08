@@ -80,7 +80,7 @@ jobs:
           "$RUNNER_TEMP/checkov/bin/pip" install --quiet checkov==3.3.25
           "$RUNNER_TEMP/checkov/bin/checkov" -f deploy/cloudformation/supavise.yaml --framework cloudformation --compact --quiet
       - name: shellcheck
-        run: shellcheck deploy/aws/deploy.sh deploy/release-assets.sh deploy/release-gate.sh tests/conformance/propose-bumps.sh
+        run: shellcheck deploy/aws/deploy.sh deploy/aws/rehearse.sh deploy/release-assets.sh deploy/release-gate.sh tests/conformance/propose-bumps.sh
       - name: template, deploy.sh and release assets
         run: go test -count=1 -v ./deploy/...
 
