@@ -156,3 +156,37 @@ func TestReadinessOnTheLeaderOfAClusterWithoutAFencerIsReady(t *testing.T) {
 		t.Fatalf("plan: %+v", pl)
 	}
 }
+
+// A fencer that fails its probe makes the block NOT READY even when the leader answers and the
+// plan is a switchover that never asks the fencer: a failover would be refused.
+func TestReadinessIsNotReadyWhileTheFencerFailsItsProbe(t *testing.T) {
+	w := newWorld(t) // n1 leads and is this node, so the plan is a switchover
+	w.fail("provider.probe", errors.New("UnauthorizedOperation: ec2:StopInstances"), -1)
+	r, err := w.orch().Readiness(w.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Ready || len(r.Blockers) != 1 || !strings.Contains(r.Blockers[0], "fencing") || !strings.Contains(r.Blockers[0], "UnauthorizedOperation") {
+		t.Fatalf("readiness: %+v", r)
+	}
+	var b strings.Builder
+	r.Render(&b)
+	if !strings.HasPrefix(b.String(), "failover  NOT READY: fencing") {
+		t.Fatalf("rendered:\n%s", b.String())
+	}
+	// A cluster that never configured a fencer has none to fail, and --old-primary-is-down is open to it.
+	r, _ = w.orch(func(d *Deps) { d.Provider = Manual{} }).Readiness(w.ctx)
+	if !r.Ready {
+		t.Fatalf("without a fencer: %+v", r)
+	}
+}
+
+func TestReadinessSaysAutomaticServerModeWaitsForProjectsWithoutAReplica(t *testing.T) {
+	m := newMonitorRig(t, config.FailoverServer)
+	org, _ := m.reg.GetOrganization(m.ctx, "acme")
+	must(t, m.reg.CreateProject(m.ctx, &registry.Project{Ref: refC, OrgID: org.ID, Name: "c", Status: registry.StatusActiveHealthy}))
+	r, err := m.o.Readiness(m.ctx)
+	if err != nil || !strings.Contains(strings.Join(r.Notes, "\n"), "does not run while a project has no replica") {
+		t.Fatalf("notes %v, %v", r.Notes, err)
+	}
+}

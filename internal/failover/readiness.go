@@ -62,6 +62,13 @@ func (o *Orchestrator) Readiness(ctx context.Context) (Readiness, error) {
 	}
 
 	r.FencerStatus = o.fencerStatus(ctx, &r)
+	// On a healthy cluster the plan is a switchover and never asks the fencer, but a failover is
+	// what the block exists to warn about: a fencer that fails its probe would refuse it.
+	if r.Fencer != "none" {
+		if err := o.probe(ctx); err != nil {
+			r.Blockers = append(r.Blockers, fmt.Sprintf("fencing: the %s fencer fails its probe: %v", r.Fencer, err))
+		}
+	}
 	r.EpochMarker = o.markerStatus(ctx)
 	if reason := o.autoOff(); reason != "" {
 		r.Notes = append(r.Notes, "automatic failover is off: "+reason)
@@ -88,6 +95,9 @@ func (o *Orchestrator) Readiness(ctx context.Context) (Readiness, error) {
 	if len(without) > 0 {
 		r.ProjectsWithoutReplica = without
 		r.Notes = append(r.Notes, fmt.Sprintf("%d project(s) have no replica (--restore-missing: RPO up to archive_timeout)", len(without)))
+		if f.Mode == config.FailoverServer {
+			r.Notes = append(r.Notes, "automatic server failover does not run while a project has no replica: it never restores from the archive by itself")
+		}
 	}
 	if r.Fencer == "none" {
 		r.Notes = append(r.Notes, "no fencing method: an unplanned failover needs --old-primary-is-down and the DNS change by hand")
