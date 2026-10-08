@@ -355,7 +355,7 @@ func (c *Config) validateCluster() error {
 	}
 	// The replica port range only matters once replicas can exist; a node that never uses them keeps
 	// whatever ports.project_base it has always had.
-	if r.AllByDefault() || f.Automatic() || c.Ports.ReplicaBase != PortReplicaBase {
+	if r.AllByDefault() || f.Automatic() || c.ReplicaBase() != PortReplicaBase {
 		return c.CheckReplicaPorts()
 	}
 	return nil
