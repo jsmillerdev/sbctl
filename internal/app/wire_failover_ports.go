@@ -84,8 +84,9 @@ func (t *handoffTakeover) notify(ctx context.Context, ev alerts.Event) {
 // connection closes even if the process dies (Engine.lock). The engine exports no way to take its
 // lock, so this takes the same advisory lock, `pg_advisory_lock(hashtext('supavise:' || ref))`, which
 // excludes the engine's operations in this process and in the CLI's. Where the registry has no
-// advisory locks to give (a standby, an in-memory registry) the lock is a mutex per project in this
-// process, which is what the engine has there too.
+// advisory locks to give (an in-memory registry, or one that refuses them as read-only) the lock is a
+// mutex per project in this process, which is what the engine has there too. On a standby the lock is
+// the standby's own, which excludes the sessions of this node and no others.
 type projectLocker struct {
 	reg func() registry.Registry
 	mus sync.Map // ref -> chan struct{} of capacity 1
@@ -114,7 +115,7 @@ func (l *projectLocker) Lock(ctx context.Context, ref string) (func(), error) {
 	if _, err := conn.Exec(ctx, `select pg_advisory_lock(hashtext('supavise:' || $1::text))`, ref); err != nil {
 		_ = conn.Close(context.WithoutCancel(ctx))
 		var pe *pgconn.PgError
-		if errors.As(err, &pe) && pe.Code == "25006" { // a standby takes no advisory locks
+		if errors.As(err, &pe) && pe.Code == "25006" { // read_only_sql_transaction: the registry gives no lock
 			return release, nil
 		}
 		release()
