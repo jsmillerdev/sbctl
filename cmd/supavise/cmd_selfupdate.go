@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/nodeupgrade"
 	"github.com/supavise/supavise/internal/selfupdate"
 	"github.com/supavise/supavise/internal/update"
 )
@@ -38,10 +39,10 @@ func init() {
 into this binary (the current one, or the next one while a key rotation is under way), checks
 the signed release manifest and the binary against their checksums, replaces /usr/local/bin/supavise
 atomically (the previous binary stays beside it as supavise.prev), brings the host to what the
-new binary expects (` + "`supavise system converge`" + `: its systemd units and the rest of its host layer)
-and restarts supavise.service. Project units are not restarted: they belong to systemd and keep
-running. If the restarted daemon does not answer on its admin
-listener within --wait (default 5 minutes; the installer's readiness check, because systemd
+new binary expects (` + "`supavise system converge`" + `: its systemd units and the rest of its host layer;
+` + "`system install-units`" + ` for a release from before the host layer) and restarts
+supavise.service. Project units are not restarted: they belong to systemd and keep running. If the
+restarted daemon does not answer on its admin listener within --wait (default 5 minutes; the installer's readiness check, because systemd
 calls a daemon active the moment it forks), the previous binary is put back, the units are
 rendered again with it and the service is restarted.
 
@@ -149,6 +150,17 @@ not through this command. A release states the oldest version it upgrades from
 	_ = cmd.Flags().MarkHidden("api-base")
 	_ = cmd.Flags().MarkHidden("public-key-file")
 	rootCmd.AddCommand(cmd)
+}
+
+// hostLayerCommand is the `system` subcommand of the binary at exe that brings the host to what its
+// release expects: converge for a release that has a host layer, and install-units, which renders
+// the units as it always did, for one that does not (--force can install an older release, which has
+// no converge and would only print the help of `system`).
+func hostLayerCommand(ctx context.Context, exe string) string {
+	if info, err := nodeupgrade.ProbeInfo(ctx, exe); err == nil && info.ConvergeRevision > 0 {
+		return "converge"
+	}
+	return "install-units"
 }
 
 func serviceInstalled(ctx context.Context) bool {
