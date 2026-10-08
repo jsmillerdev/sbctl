@@ -142,7 +142,7 @@ The server move writes the new leader and epoch to `_node/leader.json` in the ba
 | No room on the replica's node | admission on that node | the row waits at `0_requested`, `replica_capacity` opens, the controller asks each minute | free room or add a node |
 | Streaming or mesh failure | the receiver status | the replica catches up from the WAL archive; `ACTIVE_UNHEALTHY` after 2 minutes; `replica_unhealthy` | none |
 | Replica behind WAL that left the archive | the receiver cannot fetch a segment | none: the replica stays `ACTIVE_UNHEALTHY` and nothing rebuilds it | remove the replica and add it again |
-| `pg_promote` run by hand on a replica | the WAL relay | a push without a matching `promote.ok` is refused with `412`, so nothing reaches the archive | remove the replica and add it again |
+| `pg_promote` run by hand on a replica | the WAL relay | a push without a matching `promote.ok` is refused with `412`, so nothing reaches the archive. The node also refuses to remove a cluster that has become a primary, so `supavise replicas rm` does not clear it. | clear the replica's data on that node by hand, then remove the replica and add it again |
 | Replica's node goes silent | no report for 2 minutes | `ACTIVE_UNHEALTHY`; the balancer leaves it out | none |
 | A replica stops answering between two status reports | a refused or broken connection | a balanced read repeats once on the primary; a read from the replica's own API answers `502` | none |
 | Peer cannot be reached but runs | missed pings, public probe fine | manual: nothing. Automatic: no takeover, because EC2 shows the peer running | none |
