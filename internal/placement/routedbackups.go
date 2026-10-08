@@ -33,7 +33,14 @@ type RoutedBackups struct {
 	Local    BackupService
 }
 
-var _ lifecycle.RemoteBackups = (*RoutedBackups)(nil)
+var (
+	_ lifecycle.RemoteBackups = (*RoutedBackups)(nil)
+	// The leader's backup service serves the seams the daemon wires: a drift in its signatures fails
+	// here and not in the wiring of a node.
+	_ BackupService = (*backup.Service)(nil)
+	_ BaseRecorder  = (*backup.Service)(nil)
+	_ LocalBackups  = (*backup.Service)(nil)
+)
 
 // TakeBase takes a base backup of ref wherever ref is homed. It has the signature of
 // backup.Options.TakeBase.

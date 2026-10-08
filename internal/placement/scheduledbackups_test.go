@@ -150,3 +150,103 @@ func TestScheduledBackupsRetryAfterAFailure(t *testing.T) {
 		t.Fatalf("errors = %v, n2 asked %d times", errs, len(e.backups.reasons))
 	}
 }
+
+// A registry that runs a hook while a project's backups are listed, which is a step of that
+// project's turn in the round.
+type hookedReg struct {
+	registry.Registry
+	onListBackups func(ref string)
+}
+
+func (r hookedReg) ListBackups(ctx context.Context, ref string) ([]registry.Backup, error) {
+	if r.onListBackups != nil {
+		r.onListBackups(ref)
+	}
+	return r.Registry.ListBackups(ctx, ref)
+}
+
+// The round lists the projects once and may run for hours: a project that moved to the leader, was
+// paused or was deleted before its turn is left alone, and its former home is not asked.
+func TestScheduledBackupsReadTheProjectAgainBeforeItsTurn(t *testing.T) {
+	ctx := context.Background()
+	e := newScheduledEnv(t)
+	others := map[string]func(){}
+	for _, ref := range []string{"cdefghijklmnopqrstuv", "defghijklmnopqrstuvw", "efghijklmnopqrstuvwx"} {
+		if err := e.reg.CreateProject(ctx, &registry.Project{Ref: ref, Name: ref, Status: registry.StatusActiveHealthy}); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.reg.SetProjectNode(ctx, ref, "n2", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	others["cdefghijklmnopqrstuv"] = func() {
+		if err := e.reg.SetProjectNode(ctx, "cdefghijklmnopqrstuv", "n1", 1); err != nil {
+			t.Error(err)
+		}
+	}
+	others["defghijklmnopqrstuvw"] = func() { _ = e.reg.SetProjectStatus(ctx, "defghijklmnopqrstuvw", registry.StatusInactive) }
+	others["efghijklmnopqrstuvwx"] = func() { _ = e.reg.DeleteProject(ctx, "efghijklmnopqrstuvwx") }
+	// The first project's turn changes the three that come after it.
+	e.s.Registry = hookedReg{Registry: e.reg, onListBackups: func(ref string) {
+		if ref != e.remote {
+			return
+		}
+		for _, f := range others {
+			f()
+		}
+	}}
+
+	if errs := e.s.Once(ctx); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if len(e.local.files) != 1 || e.local.files[0] != e.remote+" "+backup.ReasonScheduled || len(e.backups.reasons) != 1 {
+		t.Fatalf("files snapshots %v, n2 took %v", e.local.files, e.backups.reasons)
+	}
+}
+
+// hangingFiles is a backup service whose files snapshot waits for its context.
+type hangingFiles struct{ *fakeBackups }
+
+func (h hangingFiles) BackupFiles(ctx context.Context, ref string, fo backup.FilesOptions) (*backup.FilesResult, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// One project whose backup hangs ends at its deadline and the projects after it get their turn.
+func TestScheduledBackupsBoundEachProject(t *testing.T) {
+	ctx := context.Background()
+	e := newScheduledEnv(t)
+	const second = "cdefghijklmnopqrstuv"
+	if err := e.reg.CreateProject(ctx, &registry.Project{Ref: second, Name: second, Status: registry.StatusActiveHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.reg.SetProjectNode(ctx, second, "n2", 1); err != nil {
+		t.Fatal(err)
+	}
+	e.s.Routed.Local = hangingFiles{e.local}
+	e.s.Timeout = 30 * time.Millisecond
+
+	start := time.Now()
+	errs := e.s.Once(ctx)
+	if time.Since(start) > 10*time.Second {
+		t.Fatalf("the round took %s", time.Since(start))
+	}
+	for _, ref := range []string{e.remote, second} {
+		if err := errs[ref]; !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("errors = %v", errs)
+		}
+	}
+	// The deadline of the first did not end the round, and the failure is in the history of each.
+	evs, _ := e.reg.ListEvents(ctx, second, 10)
+	if len(evs) != 1 || evs[0].Kind != "backup.failed" {
+		t.Fatalf("events of the second = %+v", evs)
+	}
+}
+
+// A schedule that is not set up reports it and does nothing.
+func TestScheduledBackupsNeedTheirSeams(t *testing.T) {
+	s := &ScheduledBackups{Registry: registry.NewMemory()}
+	if errs := s.Once(context.Background()); errs[""] == nil {
+		t.Fatalf("errors = %v", errs)
+	}
+}

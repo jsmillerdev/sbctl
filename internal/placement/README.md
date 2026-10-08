@@ -173,9 +173,12 @@ Five more pieces are the wiring's to attach:
   (`StartTimer` stops the timer, `lifecycle`'s `followerTimers`). A round lists the projects that are
   active and homed on another node; one whose newest completed base backup is older than `Every` (a day)
   gets the snapshot of its Storage objects and Edge Functions here, where the shared services keep them,
-  and a base backup on its home through `RoutedBackups`. The timer's calendar is not read. A failure
-  leaves a `backup.failed` event and the project waits `Retry` (an hour). Retention is the node's prune
-  timer's, which prunes every project of the registry.
+  and a base backup on its home through `RoutedBackups`. The timer's calendar is not read. A round can run
+  for hours, so each project is read again just before its turn and left out if it was deleted, paused or
+  moved to this node meanwhile, and its backup runs under a deadline of `Timeout` (two hours), so that a
+  home that hangs does not hold up the projects after it. A failure leaves a `backup.failed` event and the
+  project waits `Retry` (an hour). Retention is the node's prune timer's, which prunes every project of
+  the registry.
 - `SystemStandby` (`systemstandby.go`) adapts `lifecycle.PostgresPlane.SeedSystemStandby` to the join's
   `cluster.SeedFunc` and `Preflight`, for a server that joins before its daemon and its registry exist.
 - `Router.ReconfigureService` sends the settings of GoTrue and PostgREST of a project homed elsewhere to
