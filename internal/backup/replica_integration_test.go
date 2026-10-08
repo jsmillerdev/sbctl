@@ -2,13 +2,19 @@ package backup
 
 // Integration tests of SeedReplica over a real PostgreSQL (see integration_test.go for what they
 // need): a seeded directory starts as a hot standby, streams from the primary, takes over, and
-// keeps archiving under the same ref; the archive-only variant drains the archive and promotes.
+// keeps archiving under the same ref; the archive-only variant drains the archive and promotes; a
+// standby promoted by accident is refused by the relay until promote.ok holds the epoch.
 
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -241,4 +247,92 @@ func TestSeedReplicaArchiveStandbyDrainsAndPromotes(t *testing.T) {
 		t.Fatalf("write on the promoted standby: %v", err)
 	}
 	waitIDs(t, rc, "[1 2 3 4]")
+}
+
+// An accidental pg_promote() on a standby: its archiver is the real `supavise wal push` against the
+// relay of the node. The relay refuses every push (the archiver fails and retries, nothing of the
+// new timeline reaches the archive) until the promotion procedure writes promote.ok.
+func TestSeedReplicaAccidentalPromoteIsRefusedByTheRelay(t *testing.T) {
+	f := newReplicaFixture(t)
+	ctx := context.Background()
+	f.mustExec("create table public.t (id int primary key)")
+	f.mustExec("insert into public.t values (1)")
+	f.mustExec("create role supabase_replication_admin replication login password 'replpw'")
+	b, err := f.e.svc.EnsureBase(ctx, testRef, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The relay of this node: the project's cluster is a replica at epoch 1. Unix socket paths are short.
+	sockDir, err := os.MkdirTemp("/tmp", "sbr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "wal.sock")
+	var refusals atomic.Int32
+	relay := NewRelay(RelayOptions{
+		Config:    f.e.cfg,
+		Service:   func(context.Context) (*Service, error) { return f.e.svc, nil },
+		Refs:      func() []string { return []string{testRef} },
+		Socket:    func(string) string { return sock },
+		PeerCheck: func(net.Conn, string) error { return nil },
+		Replica:   func(context.Context, string) (bool, error) { return true, nil },
+		Epoch:     func(context.Context) (int64, error) { return 1, nil },
+		Refused:   func(string, error) { refusals.Add(1) },
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	t.Cleanup(relay.Close)
+	relay.Reconcile()
+
+	dd := filepath.Join(f.root, "replica", "pgdata")
+	if err := f.e.svc.SeedReplica(ctx, ReplicaSeedPlan{Ref: testRef, Identifier: testReplicaID, DataDir: dd,
+		BackupID: BackupIDOf(b), PrimaryPort: f.src.port, ReplicationPassword: "replpw"}); err != nil {
+		t.Fatal(err)
+	}
+	// The standby archives through the relay, as it does where the relay is on.
+	if err := appendAutoConf(dd, "archive_command = "+confQuote(ArchiveCommandRelay(f.e.cfg.BinPath, testRef, sock))+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	_, rc := f.standby(dd)
+	waitIDs(t, rc, "[1]")
+
+	var promoted bool
+	if err := rc.QueryRow(ctx, "select pg_promote(true, 60)").Scan(&promoted); err != nil || !promoted {
+		t.Fatalf("pg_promote = %v, %v", promoted, err)
+	}
+	if _, err := rc.Exec(ctx, "insert into public.t values (2)"); err != nil {
+		t.Fatalf("write on the promoted standby: %v", err)
+	}
+	if _, err := rc.Exec(ctx, "select pg_switch_wal()"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the archiver of the promoted standby to be refused", 60*time.Second, func() (bool, error) {
+		var failed int64
+		err := rc.QueryRow(ctx, "select failed_count from pg_stat_archiver").Scan(&failed)
+		return failed > 0, fmt.Errorf("failed_count %d, %v", failed, err)
+	})
+	time.Sleep(3 * time.Second) // the archiver retries while we look
+	if objs, err := f.st.List(ctx, walDir(testRef)+"00000002"); err != nil || len(objs) != 0 {
+		t.Fatalf("timeline 2 in the archive of a refused replica: %v, %v", objs, err)
+	}
+	if refusals.Load() == 0 {
+		t.Fatal("the archiver failed, but the relay never reported a refusal")
+	}
+
+	// The promotion procedure wrote promote.ok: the archiver gets through on its next attempt (a new
+	// segment wakes it up).
+	writeFile(t, f.e.cfg.Paths().PromoteOK(testRef), FormatPromoteOK(1))
+	n := 3
+	waitFor(t, "the archiver to push timeline 2 after promote.ok", 120*time.Second, func() (bool, error) {
+		n++
+		if _, err := rc.Exec(ctx, fmt.Sprintf("insert into public.t values (%d)", n)); err != nil {
+			return false, err
+		}
+		if _, err := rc.Exec(ctx, "select pg_switch_wal()"); err != nil {
+			return false, err
+		}
+		_, err := f.st.Stat(ctx, walKey(testRef, "00000002.history"))
+		return err == nil, err
+	})
 }
