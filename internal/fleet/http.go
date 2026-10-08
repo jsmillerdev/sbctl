@@ -246,6 +246,15 @@ func validTenantRef(ref string) error {
 	return nil
 }
 
+// validTenantID checks an external id of a Supavisor tenant: a project ref, or the identifier of a
+// project's replica (<ref>-rr-<region>-<id6>).
+func validTenantID(id string) error {
+	if registry.ValidReplicaIdentifier(id) {
+		return nil
+	}
+	return validTenantRef(id)
+}
+
 // withRelease folds the release tag of the service into a tenant fingerprint. An empty tag (a node
 // that cannot say which release it runs) leaves the fingerprint as it was.
 func withRelease(fp, tag string) string {

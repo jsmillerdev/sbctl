@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/registry"
 )
 
 // Supavisor pools every project's Postgres behind one pair of ports and routes on the
@@ -53,6 +54,7 @@ func managerPassword(adminPassword string) string {
 
 // SupavisorTenant registers projects with Supavisor's HTTP API.
 type supavisorTenant struct {
+	followerGate
 	cl     *apiClient
 	store  tenantStore
 	base   string // http://127.0.0.1:<port>
@@ -117,8 +119,11 @@ func supavisorBody(spec TenantSpec, managerPW string) map[string]any {
 	return map[string]any{"tenant": tenant}
 }
 
-// EnsureTenant implements Tenant.
+// EnsureTenant implements Tenant. A follower leaves it to the leader.
 func (t *supavisorTenant) EnsureTenant(ctx context.Context, spec TenantSpec) error {
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return err
+	}
 	if err := validTenantRef(spec.Ref); err != nil {
 		return err
 	}
@@ -170,33 +175,121 @@ func (t *supavisorTenant) EnsureTenant(ctx context.Context, spec TenantSpec) err
 // RemoveTenant implements Tenant: stop the tenant's pools (best effort, once), then delete
 // the record. A tenant that is not there counts as removed.
 func (t *supavisorTenant) RemoveTenant(ctx context.Context, ref string) error {
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return err
+	}
 	if err := validTenantRef(ref); err != nil {
 		return err
 	}
+	return t.remove(ctx, ref, config.SvcSupavisor, ref)
+}
+
+// remove stops the pools of the tenant with external id id and deletes it; the fingerprint it
+// kept under project ref and name is cleared.
+func (t *supavisorTenant) remove(ctx context.Context, ref, name, id string) error {
 	h, err := t.headers()
 	if err != nil {
 		return err
 	}
 	once := *t.cl
 	once.retry = Retry{Attempts: 1}
-	_, _ = once.do(ctx, "GET", t.tenantURL(ref)+"/terminate", h, nil)
-	del, err := t.cl.do(ctx, "DELETE", t.tenantURL(ref), h, nil)
+	_, _ = once.do(ctx, "GET", t.tenantURL(id)+"/terminate", h, nil)
+	del, err := t.cl.do(ctx, "DELETE", t.tenantURL(id), h, nil)
 	if err != nil {
 		return err
 	}
 	if !del.ok() && del.Status != 404 {
-		return t.cl.apiError("delete tenant "+ref, del)
+		return t.cl.apiError("delete tenant "+id, del)
 	}
-	t.store.forget(ctx, ref, config.SvcSupavisor)
+	t.store.forget(ctx, ref, name)
 	return nil
+}
+
+// supavisorReplicaService is the name a replica's tenant fingerprint is kept under, next to the
+// project's own (config.SvcSupavisor).
+func supavisorReplicaService(identifier string) string { return config.SvcSupavisor + "-" + identifier }
+
+// EnsureReplicaTenant implements ReplicaTenanter: a tenant with the replica's identifier as its
+// external id, pointing at the replica's port, so that postgres.<identifier> logs in to the
+// standby (design 2.7.6). Supavisor keeps the row in _supavisor, which replicates to every
+// follower's Supavisor. Everything else is the project's own tenant: the manager login is the
+// project's pgbouncer role, whose password the project's EnsureTenant set and the standby
+// replicated (a standby cannot be written, so this call sets nothing), so that tenant is
+// ensured first. A follower leaves the call to the leader.
+func (t *supavisorTenant) EnsureReplicaTenant(ctx context.Context, spec TenantSpec) error {
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return err
+	}
+	if err := validTenantRef(spec.Ref); err != nil {
+		return err
+	}
+	if ref, _, _, ok := registry.ParseReplicaIdentifier(spec.ReplicaID); !ok || ref != spec.Ref {
+		return fmt.Errorf("fleet: %q is not a replica identifier of project %s", spec.ReplicaID, spec.Ref)
+	}
+	if spec.DBPort <= 0 || spec.DBPassword == "" {
+		return fmt.Errorf("fleet: supavisor tenant %s needs the replica's port and the supabase_admin password", spec.ReplicaID)
+	}
+	body := supavisorBody(spec, managerPassword(spec.DBPassword))
+	fp, err := fingerprintOf(body)
+	if err != nil {
+		return err
+	}
+	h, err := t.headers()
+	if err != nil {
+		return err
+	}
+	name := supavisorReplicaService(spec.ReplicaID)
+	got, err := t.cl.do(ctx, "GET", t.tenantURL(spec.ReplicaID), h, nil)
+	if err != nil {
+		return err
+	}
+	switch {
+	case got.ok():
+		if t.store.get(ctx, spec.Ref, name) == fp {
+			return nil
+		}
+	case got.Status == 404:
+	default:
+		return t.cl.apiError("get tenant "+spec.ReplicaID, got)
+	}
+	if h, err = t.headers(); err != nil {
+		return err
+	}
+	put, err := t.cl.do(ctx, "PUT", t.tenantURL(spec.ReplicaID), h, body)
+	if err != nil {
+		return err
+	}
+	if !put.ok() {
+		return t.cl.apiError("put tenant "+spec.ReplicaID, put)
+	}
+	if err := t.store.put(ctx, spec.Ref, name, fp); err != nil {
+		t.cl.log.Warn("fleet: could not record the supavisor replica tenant fingerprint", "replica", spec.ReplicaID, "error", err)
+	}
+	return nil
+}
+
+// RemoveReplicaTenant implements ReplicaTenanter: stop the replica tenant's pools and delete it.
+// One that is not there counts as removed.
+func (t *supavisorTenant) RemoveReplicaTenant(ctx context.Context, identifier string) error {
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return err
+	}
+	ref, _, _, ok := registry.ParseReplicaIdentifier(identifier)
+	if !ok {
+		return fmt.Errorf("fleet: %q is not a replica identifier", identifier)
+	}
+	return t.remove(ctx, ref, supavisorReplicaService(identifier), identifier)
 }
 
 // RefreshTenant implements Refresher: GET /api/tenants/<ref>/terminate stops the tenant's
 // pools and drops its cached credentials, so the next login asks the project's database
 // again (auth_query) and a changed role password takes effect at once. The tenant record
-// stays. Pooled client sessions end; clients reconnect.
+// stays. Pooled client sessions end; clients reconnect. ref may be a replica identifier. A
+// follower's Supavisor keeps the target of a tenant row until this call, so the leader asks for
+// it on every node that runs Supavisor once the node's standby has replayed the change
+// (PeerRefresher); it is the one tenant call a follower makes.
 func (t *supavisorTenant) RefreshTenant(ctx context.Context, ref string) error {
-	if err := validTenantRef(ref); err != nil {
+	if err := validTenantID(ref); err != nil {
 		return err
 	}
 	h, err := t.headers()

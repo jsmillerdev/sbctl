@@ -68,6 +68,10 @@ type Deps struct {
 	// DashboardSSO reports whether the dashboard has a SAML identity provider (Studio shows
 	// "Continue with SSO" only then). Nil asks the registry (registry.Postgres.HasDashboardSSO).
 	DashboardSSO func(ctx context.Context) (bool, error)
+	// Follower says whether this node's system cluster is a hot standby, which puts the shared
+	// services in follower mode (follower.go). Nil asks the registry's cluster
+	// (pg_is_in_recovery()); a registry that cannot be asked, the in-memory one of tests, is a leader.
+	Follower func(ctx context.Context) (bool, error)
 }
 
 func (d *Deps) log() *slog.Logger {
@@ -208,7 +212,11 @@ func (m *Manager) Specs(ctx context.Context) ([]units.Spec, error) {
 	if m.d.Registry == nil || m.d.Secrets == nil || m.d.Artifacts == nil {
 		return nil, errors.New("fleet: rendering units needs Deps.Registry, Secrets and Artifacts")
 	}
-	c, err := loadCreds(ctx, m.d, true)
+	follower, err := m.follower(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	c, err := loadCreds(ctx, m.d, !follower)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +226,7 @@ func (m *Manager) Specs(ctx context.Context) ([]units.Spec, error) {
 		if m.d.skipped(svc) {
 			continue
 		}
-		s, err := m.spec(svc, c)
+		s, err := m.spec(svc, c, follower)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", svc, err))
 			continue
@@ -239,11 +247,20 @@ const studioReadyTimeout = time.Minute
 // optional: it needs our own artifact, and nothing depends on it, so when it cannot start
 // (no artifact, a unit that fails) Start logs a warning and does not return an error; the
 // failure shows in Status.
-func (m *Manager) Start(ctx context.Context) error {
+//
+// On a node whose system cluster is a hot standby Start runs the follower profile instead
+// (follower.go): only Supavisor starts, and nothing is written to the registry.
+func (m *Manager) Start(ctx context.Context) error { return m.start(ctx, nil) }
+
+func (m *Manager) start(ctx context.Context, forced *bool) error {
 	if m.d.Registry == nil || m.d.Secrets == nil || m.d.Artifacts == nil {
 		return errors.New("fleet: starting services needs Deps.Registry, Secrets and Artifacts")
 	}
-	c, err := loadCreds(ctx, m.d, true)
+	follower, err := m.follower(ctx, forced)
+	if err != nil {
+		return err
+	}
+	c, err := loadCreds(ctx, m.d, !follower)
 	if err != nil {
 		return err
 	}
@@ -256,12 +273,19 @@ func (m *Manager) Start(ctx context.Context) error {
 		if m.d.skipped(svc) {
 			continue
 		}
-		spec, err := m.spec(svc, c)
+		cold := isCold(follower, svc)
+		spec, err := m.spec(svc, c, follower)
 		if err == nil {
-			err = m.startOne(ctx, spec)
+			if cold {
+				err = m.park(ctx, spec)
+			} else {
+				err = m.startOne(ctx, spec)
+			}
 		}
-		if err != nil && svc == config.SvcStudio {
-			m.log.Warn("studio did not start; the other services are not affected", "error", err)
+		if err != nil && (svc == config.SvcStudio || cold) {
+			// Studio is optional, and a follower does not run the service it parks: neither
+			// holds the node back.
+			m.log.Warn("fleet service not ready; the others are not affected", "service", svc, "follower", follower, "error", err)
 			continue
 		}
 		if err != nil {
@@ -273,6 +297,7 @@ func (m *Manager) Start(ctx context.Context) error {
 			}
 		}
 	}
+	m.recordMode(modeOf(follower))
 	return errors.Join(errs...)
 }
 
@@ -417,6 +442,7 @@ func (m *Manager) neverRendered(svc string) bool {
 // Status checks every service (except Deps.Skip): unit state plus a request to its
 // health endpoint.
 func (m *Manager) Status(ctx context.Context) []Health {
+	follower := m.followerForStatus(ctx)
 	var out []Health
 	for _, svc := range m.lifecycleServices() {
 		if m.d.skipped(svc) {
@@ -454,6 +480,15 @@ func (m *Manager) Status(ctx context.Context) []Health {
 				h.Healthy, h.Status = true, "ACTIVE_HEALTHY"
 			}
 		}
+		if isCold(follower, svc) {
+			// A follower parks this service: stopped is what it should be, and running is the fault,
+			// because its port belongs to the forwarder to the leader's copy.
+			if err == nil && (st.State == units.StateActive || st.State == units.StateActivating) {
+				h.Healthy, h.Optional, h.Status, h.Error = false, false, "UNHEALTHY", "runs on a follower; the leader's copy serves it and its port is the forwarder's"
+			} else {
+				h.Healthy, h.Optional, h.Status, h.Error = false, true, "STOPPED", "parked: this node follows the leader, which runs it"
+			}
+		}
 		out = append(out, h)
 	}
 	return out
@@ -471,11 +506,15 @@ func (m *Manager) RefreshStudio(ctx context.Context) error {
 	if m.d.Registry == nil || m.d.Secrets == nil || m.d.Artifacts == nil {
 		return errors.New("fleet: rendering Studio needs Deps.Registry, Secrets and Artifacts")
 	}
+	follower, err := m.follower(ctx, nil)
+	if err != nil || follower {
+		return err // a follower's Studio is parked: the leader's answers
+	}
 	c, err := loadCreds(ctx, m.d, false)
 	if err != nil {
 		return err
 	}
-	spec, err := m.spec(config.SvcStudio, c)
+	spec, err := m.spec(config.SvcStudio, c, false)
 	if err != nil {
 		return err
 	}

@@ -54,8 +54,9 @@ func regexpQuote(s string) string {
 	return string(b)
 }
 
-// spec builds the unit spec of svc.
-func (m *Manager) spec(svc string, c *creds) (units.Spec, error) {
+// spec builds the unit spec of svc. A follower's specs carry no PreStart: bin/prepare migrates a
+// database, and a standby's cannot be written (spike S1: it exits 1 there).
+func (m *Manager) spec(svc string, c *creds, follower bool) (units.Spec, error) {
 	cfg := m.cfg()
 	art, err := m.d.Artifacts.Dir(svc)
 	if err != nil {
@@ -77,7 +78,7 @@ func (m *Manager) spec(svc string, c *creds) (units.Spec, error) {
 			return units.Spec{}, err
 		}
 		s.Env[downstreamCertMarkerEnv] = sum
-		s.PreStart = [][]string{{"bin/prepare"}} // schema migrations of _supavisor
+		s.PreStart = [][]string{{"bin/prepare"}} // schema migrations of _supavisor, not on a standby
 	case config.SvcRealtime:
 		s.Env = realtimeEnv(cfg, c)
 		s.PreStart = [][]string{{"bin/prepare"}} // schema migrations of _realtime (no self-host seeding)
@@ -100,6 +101,9 @@ func (m *Manager) spec(svc string, c *creds) (units.Spec, error) {
 		return edgeRuntimeSpec(cfg, s)
 	default:
 		return units.Spec{}, fmt.Errorf("fleet: no unit definition for %q", svc)
+	}
+	if follower {
+		s.PreStart = nil
 	}
 	return s, nil
 }

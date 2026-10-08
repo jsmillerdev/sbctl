@@ -62,9 +62,9 @@ func probeTenant(ctx context.Context, cl *apiClient, name, url string, header ma
 	return false, fmt.Errorf("fleet: %s answered %d for the tenant: %s", name, res.Status, res.excerpt())
 }
 
-// HasTenant implements TenantChecker.
+// HasTenant implements TenantChecker. ref may be a replica identifier.
 func (t *supavisorTenant) HasTenant(ctx context.Context, ref string) (bool, error) {
-	if err := validTenantRef(ref); err != nil {
+	if err := validTenantID(ref); err != nil {
 		return false, err
 	}
 	h, err := t.headers()
@@ -74,10 +74,14 @@ func (t *supavisorTenant) HasTenant(ctx context.Context, ref string) (bool, erro
 	return probeTenant(ctx, t.cl, "supavisor", t.tenantURL(ref), h)
 }
 
-// HasTenant implements TenantChecker.
+// HasTenant implements TenantChecker. A follower parks Realtime, so it holds no tenant there and
+// is not blamed for it.
 func (t *realtimeTenant) HasTenant(ctx context.Context, ref string) (bool, error) {
 	if err := validTenantRef(ref); err != nil {
 		return false, err
+	}
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return skip, err
 	}
 	h, err := t.headers()
 	if err != nil {
@@ -86,10 +90,13 @@ func (t *realtimeTenant) HasTenant(ctx context.Context, ref string) (bool, error
 	return probeTenant(ctx, t.cl, "realtime", t.tenantURL(ref), h)
 }
 
-// HasTenant implements TenantChecker.
+// HasTenant implements TenantChecker. A follower parks Storage: see realtimeTenant.HasTenant.
 func (t *storageTenant) HasTenant(ctx context.Context, ref string) (bool, error) {
 	if err := validTenantRef(ref); err != nil {
 		return false, err
+	}
+	if skip, err := t.skip(ctx); skip || err != nil {
+		return skip, err
 	}
 	return probeTenant(ctx, t.cl, "storage", t.tenantURL(ref), t.headers())
 }
