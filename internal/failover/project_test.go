@@ -237,3 +237,91 @@ func TestPromotionWithAnUnknownOutcomeKeepsTheOldPrimaryDown(t *testing.T) {
 		t.Fatalf("nothing is restarting the project any more: %+v", p)
 	}
 }
+
+// A project move can stop after any step. Each failure is injected in turn; the move is resumed by
+// a fresh orchestrator and must end as an uninterrupted one does, with nothing irreversible done twice.
+func TestProjectResumeAtEveryStep(t *testing.T) {
+	type tc struct {
+		name      string
+		unhealthy bool
+		fail      string
+		// aborts: the switchover undoes itself instead of stopping (nothing was promoted).
+		aborts bool
+	}
+	cases := []tc{
+		{name: "planned/stop", fail: "stop n1/" + refA},
+		{name: "planned/promote", fail: "promote n2/", aborts: true},
+		{name: "planned/promote answered", fail: "promote-after n2/"},
+		{name: "planned/home", fail: "registry.SetProjectNode"},
+		{name: "planned/old home's row", fail: "registry.CreateReplica"},
+		{name: "planned/start", fail: "start n2/"},
+		{name: "planned/tenant", fail: "fleet.ensure"},
+		{name: "planned/demote", fail: "demote n1/"},
+		{name: "unplanned/fence", unhealthy: true, fail: "fence n1"},
+		{name: "unplanned/promote", unhealthy: true, fail: "promote n2/"},
+		{name: "unplanned/promote answered", unhealthy: true, fail: "promote-after n2/"},
+		{name: "unplanned/home", unhealthy: true, fail: "registry.SetProjectNode"},
+		{name: "unplanned/start", unhealthy: true, fail: "start n2/"},
+		{name: "unplanned/tenant", unhealthy: true, fail: "fleet.ensure"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := newWorld(t)
+			if c.unhealthy {
+				w.prim["n1/"+refA].healthy = false
+			}
+			w.fail(c.fail, errors.New("injected"), -1)
+			mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+			if err == nil {
+				t.Fatalf("no error although %q fails", c.fail)
+			}
+			if c.aborts {
+				if mv.State != registry.MoveAborted {
+					t.Fatalf("move: %+v", mv)
+				}
+				// Undone: the old primary runs, and a new try works.
+				w.clearFailures()
+				mv, err = w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+				if err != nil || mv.State != registry.MoveDone {
+					t.Fatalf("new try: %+v, %v", mv, err)
+				}
+				return
+			}
+			if mv.State != registry.MoveFailed {
+				t.Fatalf("move: %+v", mv)
+			}
+			if p := projectOf(t, w, refA); p.Status == registry.StatusRestarting {
+				t.Fatalf("nothing is restarting the project any more: %+v", p)
+			}
+			w.clearFailures()
+			// A new process: nothing is remembered but the registry and the world.
+			mv, err = w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA, Resume: true})
+			if err != nil {
+				t.Fatalf("resume: %v\n%v", err, w.snapshot())
+			}
+			if mv.State != registry.MoveDone {
+				t.Fatalf("resumed move: %+v", mv)
+			}
+			p := projectOf(t, w, refA)
+			if p.NodeID != "n2" || p.Status != registry.StatusActiveHealthy {
+				t.Fatalf("project: %+v", p)
+			}
+			// The stop and the promotion ran once; a promotion that was only repeated because it
+			// failed is the only second one.
+			// (twice when the stop itself was what failed)
+			if n := w.count("stop n1/" + refA); n > 1 && !strings.HasPrefix(c.fail, "stop ") {
+				t.Errorf("the old primary was stopped %d times", n)
+			}
+			if n := w.count("promote n2/"); n > 2 || (c.fail == "promote-after n2/" && n != 1) {
+				t.Errorf("%d promotions", n)
+			}
+			reps, _ := w.reg.ListReplicas(w.ctx, refA)
+			if !c.unhealthy && (len(reps) != 1 || reps[0].NodeID != "n1") {
+				t.Errorf("replica rows after a switchover: %+v", reps)
+			}
+			if mvs, _ := w.reg.ListMoves(w.ctx, "", 10); len(mvs) != 1 {
+				t.Errorf("%d moves rows, want the one that was resumed", len(mvs))
+			}
+		})
+	}
+}

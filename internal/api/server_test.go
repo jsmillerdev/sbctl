@@ -19,6 +19,8 @@ func TestRouteTableBuilds(t *testing.T) {
 			// Studio calls these; the platform spec omits them.
 		case key == "GET /healthz/detail":
 			// supavise's own: the node's health for operators (health.go).
+		case key == "GET /supavise/v1/failover/readiness":
+			// supavise's own: whether a server failover would be accepted now (failover.go).
 		case strings.Contains(key, "/platform/organizations/{slug}/sso/"):
 			// supavise's own routes for several identity providers and the users waiting for approval.
 		default:
