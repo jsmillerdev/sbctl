@@ -55,13 +55,15 @@
 # 7. Upgrade
 #   upgrade-leader     `supavise upgrade` to v0.0.2 on the leader: no PostgreSQL cluster restarts
 #   upgrade-follower   and on the follower
-#   status-final       `supavise status` exits 0 on both
+#   status-final       `supavise status` exits 0 on the leader
+#   follower-status-final
+#                      `supavise status` exits 0 on the follower, a check of its own
 #
 # What a check needs, it names with `needs`; a state that a failed check may still have reached (a move that
 # ended with an error but moved the leader) is marked with `reached`, so that the checks after it still run.
 # Needs root and Ubuntu 24.04 with Docker; see lib-multi.sh. Logs, results.md and the per-check output are in
 # $LOG_DIR (default /tmp/supavise-multi-logs): both nodes' journals and PostgreSQL logs, their state after each
-# step and when a check fails, the writer's files and the fake AWS service's calls.
+# step and when a check fails, and the writer's files. The fake AWS service is not started: no check here talks to AWS.
 : "${MULTI_MEM:=5GiB}"
 export MULTI_MEM
 # shellcheck source=lib-multi.sh
@@ -70,8 +72,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib-multi.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib-checks.sh"
 
 RESULTS_TITLE="Two-server release test"
+MULTI_FAKE_AWS=0                 # lib-checks.sh does not start the fake AWS service (the spike's fakeaws checks use it)
+export MULTI_FAKE_AWS
 FACT_PREFIX=replication
-CHECK_ORDER="incus services launch boot prep net install claim projects storage token join cluster follower-status replica-setup replica-shapes replica-read replica-ddl pooler lb project-switchover project-failback server-switchover server-failback hard-failover fenced rejoin upgrade-leader upgrade-follower status-final"
+CHECK_ORDER="incus services launch boot prep net install claim projects storage token join cluster follower-status replica-setup replica-shapes replica-read replica-ddl pooler lb project-switchover project-failback server-switchover server-failback hard-failover fenced rejoin upgrade-leader upgrade-follower status-final follower-status-final"
 CHECK_ON_FAIL=on_fail
 
 # One prefix and one domain for the cluster: a joining server takes the leader's settings, and a domain left to the
@@ -81,7 +85,8 @@ MULTI_DOMAIN=cluster.test
 export S3_PREFIX MULTI_DOMAIN
 REGION=us-east-1                 # both servers are in the default region
 LAG_BUDGET_S=20                  # a row written on the primary is read from the replica's endpoint within this
-RPO_BUDGET_S=5                   # an unplanned failover may lose the rows of the last seconds, not more
+RPO_BUDGET_S=5                   # an unplanned failover loses the rows of the last seconds at most, whatever the replay lag was
+RPO_SLACK_S=2                    # and at most the replay lag measured before the stop plus this
 WRITER_RATE=20                   # rows a second (writer.py)
 RTO_BUDGET_S=300                 # from the stop of the leader to the first acknowledged write on the new one
 MULTI_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -269,10 +274,12 @@ c_replica_setup() {
 
 c_replica_shapes() {
   needs replica-setup
-  local ref n
+  local ref key
   for ref in $(refs); do onl n1 check_database_shapes "$ref" 1; done
-  # The CLI reads the replicas on either node (the follower's registry is a standby).
-  for n in n1 n2; do onl "$n" supavise replicas ls; done
+  # `replicas ls` is a command of the leader (its help says so): it opens the registry for writing, which a follower's
+  # standby refuses. It lists each replica on the other node.
+  onl "$(lead)" supavise replicas ls
+  for key in ident1 ident2; do onl "$(lead)" replica_listed "$(sget "$key")" "$(follower)"; done
 }
 
 c_replica_read() {
@@ -399,7 +406,7 @@ c_server_failback() { needs server-moved-n2; server_move n1 n1; }
 # ---- 6. a hard failure ------------------------------------------------------------------------------------------------
 c_hard_failover() {
   needs server-moved-n1
-  local ref1 ref2 sha1 run tstop t0 rc=0 lag lost win rto epoch0 ref
+  local ref1 ref2 sha1 run tstop t0 rc=0 lag lost win rto epoch0 ref budget
   ref1=$(sget ref1) ref2=$(sget ref2) sha1=$(sget sha1)
   epoch0=$(onl n1 node_epoch)
   for ref in $ref1 $ref2; do onl n1 wait_replicas "$ref" 1 600; done
@@ -441,14 +448,18 @@ c_hard_failover() {
   [[ $(cmp_get "$run" phantom) == 0 && $(cmp_get "$run" duplicates) == 0 ]] || fail "the table holds rows nobody wrote, or an id twice: $(paste -sd' ' "$WORK/w/$run.cmp")"
   [[ $(cmp_get "$run" acked) -gt 100 ]] || fail "the writer got only $(cmp_get "$run" acked) acknowledgements"
   [[ $rto != none ]] || fail "no write was acknowledged after the stop"
-  awk -v l="$lost" -v w="$win" -v r="$rto" -v rows=$((RPO_BUDGET_S * WRITER_RATE)) -v ws="$RPO_BUDGET_S" -v rb="$RTO_BUDGET_S" \
-    'BEGIN {exit !(l <= rows && w <= ws && r <= rb)}' \
-    || fail "RPO $lost rows over $win s (budget $((RPO_BUDGET_S * WRITER_RATE)) rows, $RPO_BUDGET_S s), RTO $rto s (budget $RTO_BUDGET_S s)"
+  # Asynchronous replication loses what the standby had not received: the writes of the replay lag, and a little more for
+  # the stop itself. The budget is the lag measured before the stop and RPO_SLACK_S, and never more than RPO_BUDGET_S.
+  budget=$(awk -v lag="$lag" -v slack="$RPO_SLACK_S" -v cap="$RPO_BUDGET_S" 'BEGIN {b = lag + slack; print (b > cap ? cap : b)}')
+  note hard.rpo_budget_seconds "$budget"
+  awk -v l="$lost" -v w="$win" -v r="$rto" -v b="$budget" -v rate="$WRITER_RATE" -v rb="$RTO_BUDGET_S" \
+    'BEGIN {exit !(l <= rate * b && w <= b && r <= rb)}' \
+    || fail "RPO $lost rows over $win s (budget $budget s: at most $(awk -v b="$budget" -v rate="$WRITER_RATE" 'BEGIN {print int(rate * b)}') rows; the replay lag was $lag s), RTO $rto s (budget $RTO_BUDGET_S s)"
   onl n2 data_intact "$ref1" "$sha1"
   onl n2 wait_items_rest "$ref2" 100 120
   onl n2 primary_write "$ref1" $((9200000000 + RANDOM))
   [[ $rc -eq 0 ]] || fail "supavise failover --force exited $rc, although n2 leads"
-  echo "# RPO $lost rows ($win s of writes), RTO $rto s; the failover command took $((SECONDS - t0)) s; the fence command ran once; epoch $((epoch0 + 1))"
+  echo "# RPO $lost rows ($win s of writes), RTO $rto s; the failover command took $((SECONDS - t0)) s; the fence command ran to the end; epoch $((epoch0 + 1))"
 }
 
 c_fenced() {
@@ -532,11 +543,18 @@ c_upgrade_follower() {
   echo "# $f (the follower) runs v0.0.2 too; both nodes report v0.0.2; no PostgreSQL cluster restarted"
 }
 
+# The cluster after the upgrade: the leader's status gates; the follower's is its own check, like follower-status, so that
+# a follower that reports degraded does not hide the leader's state.
 c_status_final() {
   needs upgrade-follower
-  local n
-  for n in n1 n2; do onl "$n" wait_healthy 300; done
-  echo "# supavise status exits 0 on both nodes after the upgrade"
+  onl "$(lead)" wait_healthy 300
+  echo "# supavise status exits 0 on the leader $(lead) after the upgrade"
+}
+
+c_follower_status_final() {
+  needs upgrade-follower
+  onl "$(follower)" wait_healthy 300
+  echo "# supavise status exits 0 on the follower $(follower) after the upgrade"
 }
 
 # ---- run -------------------------------------------------------------------------------------------------------------
@@ -561,7 +579,7 @@ note mode "$MULTI_RESOLVED"
 mem_snapshot start 2>/dev/null || true
 
 check incus "Incus is installed and the bridge is up" c_incus
-check services "Garage, the release server and the fake AWS service listen on the bridge" c_services
+check services "Garage and the release server listen on the bridge" c_services
 check launch "both nodes are created and started" c_launch
 check_each boot "systemd boots" c_boot
 check_each prep "apt packages install" c_prep
@@ -591,7 +609,8 @@ check fenced "n1 returns fenced and runs no primary" c_fenced
 check_snap rejoin "node rejoin brings n1 back as a follower" c_rejoin
 check_snap upgrade-leader "supavise upgrade of the leader restarts no PostgreSQL cluster" c_upgrade_leader
 check_snap upgrade-follower "supavise upgrade of the follower restarts no PostgreSQL cluster" c_upgrade_follower
-check status-final "supavise status is healthy on both nodes" c_status_final
+check status-final "supavise status is healthy on the leader" c_status_final
+check follower-status-final "supavise status is healthy on the follower" c_follower_status_final
 
 for n in "${NODES[@]}"; do note "$n.root_used_mb_at_end" "$(on "$n" df -BM --output=used / 2>/dev/null | tail -n1 | tr -dc 0-9 || true)"; done
 note garage.bucket "$(docker exec garage /garage bucket info "$S3_BUCKET" 2>&1 | grep -i -E 'objects|size' | paste -sd ' ' - || true)"

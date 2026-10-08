@@ -449,6 +449,15 @@ PY
 
 replica_ids() { reg "select identifier from supavise.replicas where ref = '$1' order by created_at"; }
 
+# replica_listed IDENTIFIER NODE: `supavise replicas ls --json` lists the replica on NODE as ACTIVE_HEALTHY. The
+# command opens the registry for writing, so it belongs to the leader: on a follower the registry is a standby.
+replica_listed() {
+  local got
+  got=$(supavise replicas ls --json | json_get '[(r["node"], r["status"]) for r in d if r["identifier"] == "'"$1"'"]') \
+    || fail "supavise replicas ls --json"
+  [[ $got == "[('$2', 'ACTIVE_HEALTHY')]" ]] || fail "supavise replicas ls lists $1 as $got, want [('$2', 'ACTIVE_HEALTHY')]"
+}
+
 replica_get() { # IDENTIFIER REF PATH: a Data API read of the replica through this node's proxy, with REF's publishable key
   curl -sS -m 20 -H "Host: $1.api.$SUPAVISE_DOMAIN" -H "@/root/keys/$2.pub.hdr" "http://127.0.0.1$3"
 }

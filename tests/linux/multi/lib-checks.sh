@@ -152,15 +152,23 @@ c_incus() {
   echo "# incus $(incus --version), nodes as $MULTI_RESOLVED"
 }
 
+# MULTI_FAKE_AWS=0 leaves the fake AWS service out (a script with no check that talks to AWS, replication.sh, sets it).
+fake_aws_wanted() { [[ ${MULTI_FAKE_AWS:-1} != 0 ]]; }
+
 c_services() {
   needs incus
   local t0=$SECONDS
   garage_up
   release_server_up v0.0.1 "$SUPAVISE_BIN"
-  fake_aws_up
-  stamp "host: Garage, release server, fake AWS" "$t0"
+  if fake_aws_wanted; then
+    fake_aws_up
+    stamp "host: Garage, release server, fake AWS" "$t0"
+    echo "# Garage :$S3_PORT, release server :$RELEASE_PORT, fake AWS :$AWS_PORT on $BRIDGE_IP"
+  else
+    stamp "host: Garage, release server" "$t0"
+    echo "# Garage :$S3_PORT, release server :$RELEASE_PORT on $BRIDGE_IP"
+  fi
   note garage.image "$GARAGE_IMAGE"
-  echo "# Garage :$S3_PORT, release server :$RELEASE_PORT, fake AWS :$AWS_PORT on $BRIDGE_IP"
 }
 
 c_launch() {
@@ -220,9 +228,11 @@ c_net() {
   [[ $code =~ ^(200|400|403|404)$ ]] || fail "$n: Garage on the bridge answered '$code'"
   code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$RELEASE_PORT/download/v0.0.1/SHA256SUMS") || true
   [[ $code == 200 ]] || fail "$n: the release server on the bridge answered '$code'"
-  code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$AWS_PORT/_calls") || true
-  [[ $code == 200 ]] || fail "$n: the fake AWS service on the bridge answered '$code'"
+  if fake_aws_wanted; then
+    code=$(on "$n" curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$BRIDGE_IP:$AWS_PORT/_calls") || true
+    [[ $code == 200 ]] || fail "$n: the fake AWS service on the bridge answered '$code'"
+  fi
   note "$n.rtt_ms_to_bridge" "$(on "$n" ping -c 5 -q "$BRIDGE_IP" | awk -F/ '/^rtt/ {print $5}')"
-  echo "# internet, S3, release server and fake AWS reachable"
+  if fake_aws_wanted; then echo "# internet, S3, release server and fake AWS reachable"; else echo "# internet, S3 and release server reachable"; fi
 }
 
