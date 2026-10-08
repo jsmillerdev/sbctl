@@ -157,7 +157,7 @@ func TestPlacementWiringPutsTheRouterInFrontOfTheEngineAndServesThePeerAPI(t *te
 	for _, r := range w.runners {
 		names = append(names, r.name)
 	}
-	if strings.Join(names, ",") != "replicas start,replica report cache,replica report,replica schema reload" {
+	if strings.Join(names, ",") != "replicas start,replica report cache,replica schema reload" {
 		t.Errorf("runners = %v", names)
 	}
 
@@ -278,6 +278,42 @@ func TestPlacementWiringWithoutForwardersHoldsNothing(t *testing.T) {
 	}
 	if in, pr := contrib(ctx); len(in) != 0 || len(pr) != 0 {
 		t.Fatalf("a contribution before the first refresh: %v %v", in, pr)
+	}
+}
+
+// One sender speaks for the node: the mesh's reporter, to which the placement hook adds the node's
+// replicas and the health of its projects. The hook starts no reporter of its own.
+func TestPlacementWiringAddsToTheMeshsReporterAndSendsNoReportOfItsOwn(t *testing.T) {
+	ctx := context.Background()
+	w, _, _ := clusterWire(t)
+	reports := cluster.NewReports()
+	rep := &cluster.Reporter{Self: func() string { return "n1" }, Epoch: func() int64 { return 3 }, IsLeader: func() bool { return true }, Reports: reports}
+	Provide(w, rep)
+	if err := placementWiring(ctx, w, mesh.NewMux().Handle); err != nil {
+		t.Fatal(err)
+	}
+	if reason, off := w.offReason("cluster.Reporter"); off {
+		t.Fatalf("the reporter was there and the feature is off: %s", reason)
+	}
+	for _, r := range w.runners {
+		if strings.Contains(r.name, "report") && r.name != "replica report cache" {
+			t.Errorf("the hook runs a reporter of its own: %q", r.name)
+		}
+	}
+	if err := rep.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reports.Latest("n1"); !ok {
+		t.Fatal("the node's report was not stored")
+	}
+
+	// With no reporter to add to, the hook says that the node reports nothing.
+	w2, _, _ := clusterWire(t)
+	if err := placementWiring(ctx, w2, mesh.NewMux().Handle); err != nil {
+		t.Fatal(err)
+	}
+	if reason, off := w2.offReason("cluster.Reporter"); !off || reason == "" {
+		t.Fatal("no reporter and no reason")
 	}
 }
 

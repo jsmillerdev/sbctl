@@ -1,0 +1,54 @@
+name: start S3 (Garage)
+description: >-
+  Starts Garage, a one-binary S3 service with a flat key namespace like AWS S3, on 127.0.0.1:9000, with
+  the access key GK0123456789abcdef01234567 and one bucket the key may read, write and own. The linux
+  jobs that need a real S3 service share it. MinIO no longer publishes images or binaries (dl.min.io
+  answers 410) and SeaweedFS lists empty "directories" as prefixes.
+inputs:
+  bucket:
+    description: The bucket to create.
+    default: supavise-test
+runs:
+  using: composite
+  steps:
+    - name: start S3 (Garage)
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+      run: |
+        mkdir -p /tmp/garage/meta /tmp/garage/data
+        cat >/tmp/garage/garage.toml <<'TOML'
+        metadata_dir = "/var/lib/garage/meta"
+        data_dir = "/var/lib/garage/data"
+        db_engine = "sqlite"
+        replication_factor = 1
+        rpc_bind_addr = "127.0.0.1:3901"
+        rpc_public_addr = "127.0.0.1:3901"
+        rpc_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        [s3_api]
+        s3_region = "us-east-1"
+        api_bind_addr = "127.0.0.1:9000"
+        [admin]
+        api_bind_addr = "127.0.0.1:3903"
+        admin_token = "supavise-ci-admin-token"
+        TOML
+        docker run -d --name garage --network host \
+          -v /tmp/garage/garage.toml:/etc/garage.toml \
+          -v /tmp/garage/meta:/var/lib/garage/meta -v /tmp/garage/data:/var/lib/garage/data \
+          dxflrs/garage:v1.1.0
+        for i in $(seq 1 60); do
+          docker exec garage /garage status >/dev/null 2>&1 && break
+          sleep 1
+        done
+        ID=$(docker exec garage /garage node id -q | cut -d@ -f1)
+        docker exec garage /garage layout assign -z dc1 -c 1G "$ID"
+        docker exec garage /garage layout apply --version 1
+        docker exec garage /garage key import --yes -n ci GK0123456789abcdef01234567 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        docker exec garage /garage bucket create "$BUCKET"
+        docker exec garage /garage bucket allow --read --write --owner "$BUCKET" --key ci
+        for i in $(seq 1 30); do
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ || true)
+          [ "$code" != "000" ] && break
+          sleep 1
+        done
+        echo "S3 answered $code"

@@ -98,9 +98,15 @@ func TestWireMeshStartsTheClusterOfAJoinedNode(t *testing.T) {
 		t.Fatal("no reporter provided for the replica agent to add to")
 	}
 	patterns := strings.Join(mesh.DefaultMux.Patterns(), "\n")
-	for _, want := range []string{peerapi.PathPing, peerapi.PathJoin, peerapi.PathJoinConfirm, peerapi.PathRejoin, peerapi.PathCertsRenew, peerapi.PathConfig, peerapi.PathCerts, peerapi.PathReport} {
+	for _, want := range []string{peerapi.PathPing, peerapi.PathJoin, peerapi.PathJoinConfirm, peerapi.PathRejoin, peerapi.PathCertsRenew, peerapi.PathConfig, peerapi.PathReport} {
 		if !strings.Contains(patterns, want) {
 			t.Errorf("the peer API lacks %s:\n%s", want, patterns)
+		}
+	}
+	// The certificate store is the proxy's endpoint: registering it here too would panic the mux.
+	for _, p := range mesh.DefaultMux.Patterns() {
+		if p == "GET "+peerapi.PathCerts {
+			t.Errorf("wireMesh registered %s, which wireProxy serves", p)
 		}
 	}
 	names := map[string]bool{}

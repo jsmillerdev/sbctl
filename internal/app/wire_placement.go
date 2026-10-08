@@ -10,6 +10,7 @@ import (
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
+	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -56,11 +57,13 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	node.Engine.SetRemoteNodes(router)
 	if localTimers != nil {
 		Provide[lifecycle.Timers](w, localTimers)
+	} else {
+		w.Off("lifecycle.Timers", "the node has no backup timers (supervisor "+w.Cfg.Supervisor+"); base backups are taken with `supavise backups create`")
 	}
 
 	agent := placement.NewNodeAgent(placement.AgentOptions{
 		Cfg: w.Cfg, Plane: node.Plane, Registry: node.Registry, Keys: node.Engine.Keys, Members: mem,
-		Seeder: bk.seed, Admit: node.Engine.AdmitReplica, Log: w.Log.With("component", "replica-agent"),
+		Seeder: placement.SeederFrom(bk), Admit: node.Engine.AdmitReplica, Log: w.Log.With("component", "replica-agent"),
 	})
 	agent.Start(ctx)
 	ops := &placement.Ops{Self: self, Agent: agent, Backups: bk, RPC: m, Epoch: mem.Epoch}
@@ -75,6 +78,8 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	// ports on a replica's node are forwarders to the home).
 	if h, ok := providedAs[portHolder](w); ok {
 		node.Plane.SetPortHolder(h.Suspend)
+	} else {
+		w.Off("mesh.Forwarders", "the mesh provided no forwarders; a promotion cannot take the project's ports from them")
 	}
 
 	// A demoted cluster catches up through the node's own relay.
@@ -87,18 +92,27 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	Provide[placement.InstanceOps](w, ops)
 	Provide[placement.BackupOps](w, ops)
 
-	// The replicas of this node start with the daemon, report to the leader and get their PostgREST's
-	// schema cache reloaded on a timer. The observation of the replicas and of the projects homed here
-	// is kept in memory and refreshed in the background, so that a report answers from it.
+	// The failover orchestrator's operations on the primaries of this node: the node's own plane, not the
+	// router, with the backup timers that stop and start with a primary.
+	Provide[failover.LocalPrimaries](w, &localPrimaries{
+		cfg: w.Cfg, plane: node.Plane, reg: func() registry.Registry { return node.Registry }, keys: node.Engine.Keys,
+		timers: localTimers, log: w.Log.With("component", "failover"), now: time.Now,
+	})
+
+	// The replicas of this node start with the daemon and report to the leader, and their PostgREST's
+	// schema cache gets reloaded on a timer. The observation of the replicas and of the projects homed
+	// here is kept in memory and refreshed in the background, so that a report answers from it. The
+	// report is the mesh's (cluster.Reporter, which the mesh hook runs): this adds the node's
+	// observations to it, so that one sender speaks for the node.
 	cache := &placement.ReportCache{Agent: agent, Projects: unlessLeader(mem, projectHealth(node.Registry, node.Plane, self))}
 	Provide[placement.Contribution](w, cache.Contribute)
-	reporter := &placement.Reporter{Members: mem, RPC: m, Agent: cache, Projects: cache.ProjectHealth}
+	if rep, ok := Get[*cluster.Reporter](w); ok {
+		rep.Add(cluster.Contributor(cache.Contribute))
+	} else {
+		w.Off("cluster.Reporter", "the mesh provided no reporter; this node's replicas and projects are not reported to the leader")
+	}
 	w.Go("replicas start", func(ctx context.Context) error { agent.StartLocal(ctx); return nil })
 	w.Go("replica report cache", func(ctx context.Context) error { cache.Run(ctx, 10*time.Second); return nil })
-	w.Go("replica report", func(ctx context.Context) error {
-		reporter.Run(ctx, 10*time.Second, func(err error) { w.Log.Warn("replica report", "error", err) })
-		return nil
-	})
 	w.Go("replica schema reload", func(ctx context.Context) error {
 		node.Plane.RunSchemaReload(ctx, w.Cfg.Replicas.SchemaReload(), func(ctx context.Context) ([]string, error) {
 			rs, err := node.Registry.ListReplicasOn(ctx, self())
@@ -204,17 +218,16 @@ func (l *lazyBackups) get(ctx context.Context) (*backup.Service, error) {
 
 var _ placement.LocalBackups = (*lazyBackups)(nil)
 
-// seed is the lifecycle.ReplicaSeeder of the node: the backup service's SeedReplica.
-func (l *lazyBackups) seed(ctx context.Context, plan lifecycle.ReplicaSeedPlan) error {
+var _ backup.ReplicaSeeder = (*lazyBackups)(nil)
+
+// SeedReplica is the backup service's, which opens on first use; placement.SeederFrom makes the plane's
+// seeder of it.
+func (l *lazyBackups) SeedReplica(ctx context.Context, plan backup.ReplicaSeedPlan) error {
 	s, err := l.get(ctx)
 	if err != nil {
 		return err
 	}
-	rs, ok := any(s).(backup.ReplicaSeeder)
-	if !ok {
-		return errors.New("this release's backup service cannot seed a replica")
-	}
-	return rs.SeedReplica(ctx, backup.ReplicaSeedPlan(plan))
+	return s.SeedReplica(ctx, plan)
 }
 
 func (l *lazyBackups) BaseBackupWith(ctx context.Context, ref string, bo backup.BackupOptions) (*registry.Backup, error) {

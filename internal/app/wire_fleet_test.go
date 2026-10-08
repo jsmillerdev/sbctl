@@ -113,6 +113,8 @@ func TestWireFleetDoesNothingOnANodeWithoutACluster(t *testing.T) {
 
 func TestWireFleetInACluster(t *testing.T) {
 	w := testWire(t)
+	mesh.ResetDefaultMux()
+	t.Cleanup(mesh.ResetDefaultMux)
 	mem := clusterOf("n2", cluster.RoleFollower, "n1", nodeRow("n1", registry.NodeActive), nodeRow("n2", registry.NodeActive))
 	Provide[cluster.Membership](w, mem)
 	Provide[mesh.Mesh](w, &fakeMesh{})
@@ -134,7 +136,8 @@ func TestWireFleetInACluster(t *testing.T) {
 	if !found {
 		t.Errorf("the refresh endpoint is not registered: %v", mesh.DefaultMux.Patterns())
 	}
-	// A second daemon in the same process registers again without a panic.
+	// A second daemon in the same process (wireMesh resets the mux) registers again without a panic.
+	mesh.ResetDefaultMux()
 	registerFleetRefresh(&fleetRefreshServer{mem: mem, log: slog.New(slog.NewTextHandler(io.Discard, nil))})
 }
 
@@ -353,7 +356,7 @@ func runRoles(t *testing.T, h *roleHarness) (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
 	go func() {
-		followRole(ctx, h.snaps, h.apply, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Millisecond)
+		followRole(ctx, h.snaps, cluster.RoleFollower, h.apply, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Millisecond)
 		close(finished)
 	}()
 	return func() {
@@ -432,6 +435,92 @@ func TestFollowRoleRetriesAFailedApply(t *testing.T) {
 	}
 }
 
+// A start that fails at once (a missing artifact, a unit that does not render) is not tried again until
+// the retry interval has passed, whatever the membership says meanwhile about the same role.
+func TestFollowRoleWaitsForTheRetryIntervalAfterAFailure(t *testing.T) {
+	const retry = 300 * time.Millisecond
+	var mu sync.Mutex
+	var at []time.Time
+	reached := make(chan struct{})
+	apply := func(context.Context, fleet.Mode) error {
+		mu.Lock()
+		defer mu.Unlock()
+		at = append(at, time.Now())
+		if len(at) == 3 {
+			close(reached)
+		}
+		return errors.New("realtime: no such artifact")
+	}
+	snaps := make(chan cluster.Snapshot, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go followRole(ctx, snaps, cluster.RoleFollower, apply, slog.New(slog.NewTextHandler(io.Discard, nil)), retry)
+	snaps <- snap(cluster.RoleFollower)
+	snaps <- snap(cluster.RoleLeader)
+	// Node rows change while the retry is pending: the same role must not start another apply.
+	for range 20 {
+		snaps <- snap(cluster.RoleLeader)
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the failed apply was not tried again")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 1; i < len(at); i++ {
+		// The wait starts when the apply returns, a moment after it was called; a slow host only lengthens the gap.
+		if gap := at[i].Sub(at[i-1]); gap < retry*3/4 {
+			t.Fatalf("apply %d started %v after apply %d, want at least the retry interval %v", i+1, gap, i, retry)
+		}
+	}
+}
+
+// A failure holds back the role that failed, not a newer one: a fence that arrives while the promotion
+// waits for its retry is applied at once.
+func TestFollowRoleAppliesANewerRoleWhileAFailedOneWaits(t *testing.T) {
+	var mu sync.Mutex
+	var leaders int
+	stopped := make(chan struct{})
+	apply := func(_ context.Context, m fleet.Mode) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if m == fleet.ModeStopped {
+			close(stopped)
+			return nil
+		}
+		leaders++
+		return errors.New("realtime: address already in use")
+	}
+	snaps := make(chan cluster.Snapshot, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go followRole(ctx, snaps, cluster.RoleFollower, apply, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Hour)
+	snaps <- snap(cluster.RoleFollower)
+	snaps <- snap(cluster.RoleLeader)
+	for { // the promotion has failed and waits for an hour
+		mu.Lock()
+		n := leaders
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	snaps <- snap(cluster.RoleFenced)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fence waited for the promotion's retry")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if leaders != 1 {
+		t.Fatalf("the promotion was applied %d times", leaders)
+	}
+}
+
 // A promotion that half-worked and was reverted before the retry still leaves services running
 // that the follower must not run: the revert is applied, though the role is the booted one.
 func TestFollowRoleAppliesTheRoleAgainAfterAFailureEvenIfItReverted(t *testing.T) {
@@ -439,13 +528,97 @@ func TestFollowRoleAppliesTheRoleAgainAfterAFailureEvenIfItReverted(t *testing.T
 	h.snaps, h.done = make(chan cluster.Snapshot, 8), make(chan struct{}, 8)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go followRole(ctx, h.snaps, h.apply, slog.New(slog.NewTextHandler(io.Discard, nil)), 50*time.Millisecond)
+	go followRole(ctx, h.snaps, cluster.RoleFollower, h.apply, slog.New(slog.NewTextHandler(io.Discard, nil)), 50*time.Millisecond)
 	h.snaps <- snap(cluster.RoleFollower)
 	h.snaps <- snap(cluster.RoleLeader)   // the apply fails
 	h.snaps <- snap(cluster.RoleFollower) // and the node is a follower again before the retry
 	h.waitApplied(t, 1)
 	if got := h.applied(); got[0] != fleet.ModeFollower {
 		t.Fatalf("applied %v; the follower profile must be applied to undo the half-started leader", got)
+	}
+}
+
+// The first snapshot is not taken for the role the daemon booted in: when startFleet put another one in
+// effect (a node that booted before its system cluster was promoted), the first snapshot is applied.
+func TestFollowRoleAppliesAFirstSnapshotThatIsNotTheBootRole(t *testing.T) {
+	h := &roleHarness{}
+	h.snaps, h.done = make(chan cluster.Snapshot, 8), make(chan struct{}, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go followRole(ctx, h.snaps, cluster.RoleFollower, h.apply, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Millisecond)
+	h.snaps <- snap(cluster.RoleLeader)
+	h.waitApplied(t, 1)
+	if got := h.applied(); got[0] != fleet.ModeLeader {
+		t.Fatalf("applied %v", got)
+	}
+}
+
+// With no boot role given, the first snapshot is the boot role.
+func TestFollowRoleTakesTheFirstSnapshotForTheBootRoleWhenNoneIsGiven(t *testing.T) {
+	h := &roleHarness{}
+	h.snaps, h.done = make(chan cluster.Snapshot, 8), make(chan struct{}, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	go followRole(ctx, h.snaps, "", h.apply, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Millisecond)
+	h.snaps <- snap(cluster.RoleLeader)
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	if got := h.applied(); len(got) != 0 {
+		t.Fatalf("applied %v for the boot role", got)
+	}
+}
+
+// A start that is still waiting for a service when the node is fenced is cancelled, so that the fence
+// does not wait behind it; what it half started is stopped by the apply that follows.
+func TestFollowRoleCancelsAnApplyThatANewerRoleOvertakes(t *testing.T) {
+	var mu sync.Mutex
+	var seen []fleet.Mode
+	started, cancelled := make(chan struct{}), make(chan struct{})
+	apply := func(ctx context.Context, m fleet.Mode) error {
+		mu.Lock()
+		seen = append(seen, m)
+		mu.Unlock()
+		if m == fleet.ModeLeader { // Realtime's migrations: this one outlasts the promotion
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			return ctx.Err()
+		}
+		return nil
+	}
+	snaps := make(chan cluster.Snapshot, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	finished := make(chan struct{})
+	go func() {
+		followRole(ctx, snaps, cluster.RoleFollower, apply, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Hour)
+		close(finished)
+	}()
+	snaps <- snap(cluster.RoleLeader)
+	<-started
+	snaps <- snap(cluster.RoleFenced)
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the start for the promotion was not cancelled when the node was fenced")
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(seen)
+		mu.Unlock()
+		if n == 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("applied %v", seen)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seen[0] != fleet.ModeLeader || seen[1] != fleet.ModeStopped {
+		t.Fatalf("applied %v, want the promotion's start and then the stop", seen)
 	}
 }
 
@@ -457,7 +630,7 @@ func TestFollowRoleEndsWithItsContextOrItsChannel(t *testing.T) {
 	h2.snaps, h2.done = make(chan cluster.Snapshot), make(chan struct{})
 	finished := make(chan struct{})
 	go func() {
-		followRole(context.Background(), h2.snaps, h2.apply, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Millisecond)
+		followRole(context.Background(), h2.snaps, cluster.RoleFollower, h2.apply, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Millisecond)
 		close(finished)
 	}()
 	close(h2.snaps)

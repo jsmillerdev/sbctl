@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,17 +17,22 @@ import (
 	"github.com/supavise/supavise/internal/awsapi"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
+	"github.com/supavise/supavise/internal/replicas"
 	"github.com/supavise/supavise/internal/units"
 )
 
-// wireFleet puts the shared services in follower mode when this node follows (design 2.6): no
-// bin/prepare and no tenant writes on a standby, cold units whose ports are forwarders, the
-// Supavisor tenant refresh endpoint, and the reconciliation that starts or stops the services when the
-// role changes. On a leader it does nothing.
+// wireFleet connects the shared services to the cluster work (design 2.6). It serves the credential
+// endpoint of Storage on AWS wherever it is set up, and on a node that belongs to a cluster it provides
+// the ports the other hooks read (fleet.Fleet, fleet.PeerRefresher, replicas.Pooler, failover.Fleet,
+// failover.LocalServices, a server check for the artifacts), puts the services in follower mode when
+// this node follows (no bin/prepare and no tenant writes on a standby, cold units whose ports are
+// forwarders), serves the Supavisor tenant refresh endpoint, and reconciles the services with the role
+// when it changes. A server with no cluster is a leader for good and startFleet is all it needs.
 //
 // Which profile the services start in at boot is the fleet package's to decide, from the system
 // cluster itself (fleet.Deps.Follower), so startFleet needs no help. This hook adds what changes
@@ -52,26 +56,56 @@ func wireFleet(ctx context.Context, w *Wire) error {
 	}
 	lz := fleet.NewLazy(fleet.Deps{Cfg: w.Cfg, Log: log})
 	lz.Bind(w.Node.Registry, w.Node.Secrets)
-	Provide[fleet.Fleet](w, lz.Fleet())
+	fl := lz.Fleet()
+	Provide[fleet.Fleet](w, fl)
 
-	rs := &fleetRefreshServer{mem: mem, log: log}
+	// The leader tells the other nodes that run Supavisor to drop a tenant once their standby has
+	// replayed the change (PeerRefresh is the receiving half). The WAL position to wait for comes from
+	// the registry's pool; a registry without one (an in-memory one) has no WAL, and the peers then
+	// refresh at once.
+	rs := &fleetRefreshServer{mem: mem, log: log, pr: fleet.PeerRefresh{Refresh: fl, Runs: supavisorRendered(w.Cfg)}}
+	peers := &peerRefresher{mem: mem, rpc: rpc, log: log}
 	if p, ok := w.Node.Registry.(interface{ Pool() *pgxpool.Pool }); ok && p.Pool() != nil {
 		replay := fleet.PGReplay{Pool: p.Pool()}
-		rs.pr = fleet.PeerRefresh{Replay: replay, Refresh: lz.Fleet(), Runs: supavisorRendered(w.Cfg)}
-		Provide[fleet.PeerRefresher](w, &peerRefresher{mem: mem, rpc: rpc, lsn: replay.CurrentLSN, log: log})
+		rs.pr.Replay, peers.lsn = replay, replay.CurrentLSN
 	}
+	Provide[fleet.PeerRefresher](w, peers)
 	registerFleetRefresh(rs)
 
+	// What the other packages ask of the shared services, as the ports they declare: the pooler tenant
+	// of a replica (replicas.Pooler) and the tenants of a project that moves (failover.Fleet).
+	deps := fleet.Deps{Cfg: w.Cfg, Log: log, Registry: w.Node.Registry, Secrets: w.Node.Secrets}
+	Provide[replicas.Pooler](w, &replicaPooler{fleet: fl, deps: deps, peers: peers, log: log})
+	Provide[failover.Fleet](w, &projectTenants{fleet: fl, deps: deps, peers: peers, log: log})
+
 	if w.Cfg.Supervisor != config.SupervisorSystemd || w.Node.Supervisor == nil {
-		return nil // the daemon starts the shared services only under systemd (startFleet)
+		// The daemon starts the shared services only under systemd (startFleet), so a move has none to
+		// stop or start.
+		w.Off("failover.LocalServices", "the shared services run under systemd; this node's supervisor is "+w.Cfg.Supervisor)
+		return nil
 	}
 	mgr, err := fleet.NewManager(fleet.Deps{Cfg: w.Cfg, Log: log, Registry: w.Node.Registry, Secrets: w.Node.Secrets,
 		Supervisor: w.Node.Supervisor, Artifacts: w.Node.Artifacts})
 	if err != nil {
 		return err
 	}
+	Provide[failover.LocalServices](w, &localServices{mgr: mgr, sup: w.Node.Supervisor})
+	w.AddServerCheck(artifactsCheck(mgr, func() string { return mem.Self().ID }))
+
+	booted := cluster.RoleLeader
+	if b, ok := Get[cluster.BootDecision](w); ok && b.Role != "" {
+		booted = b.Role
+	}
 	w.Go("fleet role", func(ctx context.Context) error {
-		followRole(ctx, mem.Watch(ctx), mgr.Apply, log, roleRetry)
+		apply := func(ctx context.Context, mode fleet.Mode) error {
+			// startFleet may still be starting the services the other way; a newer role cancels this wait.
+			if err := w.fleetMu.Lock(ctx); err != nil {
+				return err
+			}
+			defer w.fleetMu.Unlock()
+			return mgr.Apply(ctx, mode)
+		}
+		followRole(ctx, mem.Watch(ctx), booted, apply, log, roleRetry)
 		return nil
 	})
 	return nil
@@ -127,24 +161,10 @@ type fleetRefreshServer struct {
 	log *slog.Logger
 }
 
-// current is the server the registered handler dispatches to: mesh.DefaultMux is process-wide and
-// panics on a second registration, and a daemon started twice in one process (tests) must still work.
-var (
-	currentRefresh atomic.Pointer[fleetRefreshServer]
-	refreshOnce    sync.Once
-)
-
+// registerFleetRefresh serves the refresh endpoint on the process-wide peer mux. wireMesh resets the mux
+// when a daemon starts, so a process that starts the daemon twice (tests) registers it once each time.
 func registerFleetRefresh(s *fleetRefreshServer) {
-	currentRefresh.Store(s)
-	refreshOnce.Do(func() {
-		mesh.Handle("POST "+peerapi.PathFleetRefresh, func(w http.ResponseWriter, r *http.Request) {
-			if cur := currentRefresh.Load(); cur != nil {
-				cur.ServeHTTP(w, r)
-				return
-			}
-			peerError(w, http.StatusServiceUnavailable, "unavailable", "the fleet is not set up on this node")
-		})
-	})
+	mesh.Handle("POST "+peerapi.PathFleetRefresh, s.ServeHTTP)
 }
 
 // ServeHTTP answers POST /peer/v1/fleet/refresh/{tenant}: only the leader asks.
@@ -188,7 +208,8 @@ func peerError(w http.ResponseWriter, status int, code, msg string) {
 type peerRefresher struct {
 	mem cluster.Membership
 	rpc mesh.RPC
-	// lsn reads the leader's WAL position after its write.
+	// lsn reads the leader's WAL position after its write; nil sends no position, and the peers refresh
+	// at once.
 	lsn func(ctx context.Context) (string, error)
 	log *slog.Logger
 }
@@ -207,9 +228,12 @@ func (p *peerRefresher) RefreshPeers(ctx context.Context, tenant string) error {
 	if len(peers) == 0 {
 		return nil
 	}
-	lsn, err := p.lsn(ctx)
-	if err != nil {
-		return fmt.Errorf("fleet: the leader's WAL position: %w", err)
+	var lsn string
+	if p.lsn != nil {
+		var err error
+		if lsn, err = p.lsn(ctx); err != nil {
+			return fmt.Errorf("fleet: the leader's WAL position: %w", err)
+		}
 	}
 	errs := make([]error, len(peers))
 	var wg sync.WaitGroup
@@ -245,14 +269,38 @@ func modeFor(r cluster.Role) fleet.Mode {
 	return fleet.ModeLeader
 }
 
-// followRole keeps the shared services in the mode of the node's role. The first snapshot is the
-// role the daemon booted in, which startFleet has already put in effect; every change after it is
-// applied. A failed apply leaves the services half in step, so it is tried again after retry,
-// whatever role is wanted by then, until one works.
-func followRole(ctx context.Context, snaps <-chan cluster.Snapshot, apply func(context.Context, fleet.Mode) error, log *slog.Logger, retry time.Duration) {
-	var applied, want cluster.Role
+// followRole keeps the shared services in the mode of the node's role. It is an early, best-effort
+// reconciliation: the daemon restarts on every role change (Live.Changed ends Serve with ErrRoleChanged)
+// and startFleet puts the units in step at that start, so what followRole does makes a fence take effect
+// at once and leaves the restart to make the result final. booted is the role the daemon
+// started in, which startFleet has already put in effect (empty: the first snapshot says it); a
+// snapshot of any other role, the first one included, is applied. An apply that fails leaves the
+// services half in step, so it is tried again after retry, whatever role is wanted by then, until one
+// works; until then a snapshot of the same role starts nothing, and one of another role is applied at
+// once. An apply that is still running when a snapshot of another role arrives is cancelled, so that
+// a fence does not wait behind a promotion's start (Realtime and Supavisor run migrations before they
+// answer); the services it left half started are put in step by the next apply.
+func followRole(ctx context.Context, snaps <-chan cluster.Snapshot, booted cluster.Role, apply func(context.Context, fleet.Mode) error, log *slog.Logger, retry time.Duration) {
+	applied, want := booted, cluster.Role("")
 	var dirty bool
+	// waiting is the role whose apply failed and is held back until again fires; empty: nothing is held.
+	var waiting cluster.Role
 	var again <-chan time.Time
+	type outcome struct {
+		role cluster.Role
+		err  error
+	}
+	var running struct {
+		role   cluster.Role
+		cancel context.CancelFunc
+	}
+	done := make(chan outcome, 1)
+	defer func() {
+		if running.cancel != nil {
+			running.cancel()
+			<-done
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -262,26 +310,44 @@ func followRole(ctx context.Context, snaps <-chan cluster.Snapshot, apply func(c
 				return
 			}
 			if applied == "" {
-				applied = s.Role
+				applied = s.Role // the role the daemon booted in
 				continue
 			}
 			want = s.Role
-		case <-again:
-		}
-		again = nil
-		if want == "" || (want == applied && !dirty) {
-			continue
-		}
-		mode := modeFor(want)
-		log.Info("the node's role changed; putting the shared services in step", "from", applied, "to", want, "mode", mode.String())
-		if err := apply(ctx, mode); err != nil {
-			if ctx.Err() != nil {
-				return
+			if running.cancel != nil && s.Role != running.role {
+				running.cancel()
 			}
-			log.Error("shared services not yet in step with the node's role; trying again", "role", want, "error", err)
-			dirty, again = true, time.After(retry)
+		case o := <-done:
+			running.cancel()
+			running.cancel = nil
+			switch {
+			case ctx.Err() != nil:
+				return
+			case errors.Is(o.err, context.Canceled):
+				dirty = true // cancelled for a newer role: what it started is put in step by the next apply
+			case o.err != nil:
+				log.Error("shared services not yet in step with the node's role; trying again", "role", o.role, "error", o.err)
+				dirty, again = true, time.After(retry)
+				if want == o.role { // a newer role is not held back by the failure of an older one
+					waiting = o.role
+				}
+			default:
+				applied, dirty = o.role, false
+				if want == applied {
+					want = ""
+				}
+			}
+		case <-again:
+			again, waiting = nil, ""
+		}
+		if running.cancel != nil || want == "" || (want == applied && !dirty) || (waiting != "" && waiting == want) {
 			continue
 		}
-		applied, want, dirty = want, "", false
+		waiting = ""
+		role, mode := want, modeFor(want)
+		log.Info("the node's role changed; putting the shared services in step", "from", applied, "to", role, "mode", mode.String())
+		actx, cancel := context.WithCancel(ctx)
+		running.role, running.cancel = role, cancel
+		go func() { done <- outcome{role, apply(actx, mode)} }()
 	}
 }

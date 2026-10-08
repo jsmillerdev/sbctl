@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -27,11 +28,11 @@ func testWire(t *testing.T) *Wire {
 	return newWire(config.Default(), log, node, Options{}, &api.Deps{}, &proxy.Options{})
 }
 
-// Until a hook is implemented its stub says so, and Serve goes on without it.
-func TestUnimplementedHooksAreSkipped(t *testing.T) {
+// On a server with no cluster every hook runs and does nothing but the watch for a cluster identity.
+func TestHooksOfASingleServerStartOnlyTheIdentityWatcher(t *testing.T) {
 	w := testWire(t)
 	if err := w.run(context.Background()); err != nil {
-		t.Fatalf("run with the stubs: %v", err)
+		t.Fatalf("run: %v", err)
 	}
 	// The mesh hook of a server that never joined a cluster watches for the cluster identity that
 	// `supavise node token` writes, and starts nothing else.
@@ -45,6 +46,32 @@ func TestUnimplementedHooksAreSkipped(t *testing.T) {
 		}
 		seen[h.name] = true
 	}
+}
+
+// A reconciliation that waits behind the boot start of the shared services stops waiting when a newer
+// role cancels it, and the lock is not lost by the wait that gave up.
+func TestFleetLockGivesUpWhenItsContextEnds(t *testing.T) {
+	var l ctxLock // the zero value is unlocked
+	if err := l.Lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	got := make(chan error, 1)
+	go func() { got <- l.Lock(ctx) }()
+	cancel()
+	select {
+	case err := <-got:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("a cancelled wait returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait for the lock did not end with its context")
+	}
+	l.Unlock()
+	if err := l.Lock(context.Background()); err != nil {
+		t.Fatalf("the lock was not free after the unlock: %v", err)
+	}
+	l.Unlock()
 }
 
 func TestWireStartsWhatHooksRegisterAndStopsLastFirst(t *testing.T) {
@@ -135,5 +162,26 @@ func TestWireDefaults(t *testing.T) {
 	}
 	if m, _ := Get[cluster.Membership](w); m.IsLeader() {
 		t.Fatal("providing the concrete type replaced the interface")
+	}
+}
+
+// A hook reads what an earlier one provided, so the order of the table is part of the wiring: the mesh
+// before everything, placement before the failover orchestrator that needs its ports, the fleet before
+// the replica controller (the pooler) and the failover ports (tenants, services), the controller
+// before the proxy (the lag of a replica) and the failover orchestrator (replica setup).
+func TestHookOrderGivesEachHookWhatItReads(t *testing.T) {
+	pos := map[string]int{}
+	for i, h := range wireHooks {
+		pos[h.name] = i
+	}
+	for _, c := range []struct{ first, then string }{
+		{"host", "mesh"}, {"mesh", "placement"}, {"mesh", "fleet"}, {"placement", "replicas"}, {"fleet", "replicas"},
+		{"replicas", "proxy"}, {"placement", "failover"}, {"fleet", "failover"}, {"replicas", "failover"}, {"proxy", "failover"},
+	} {
+		a, aok := pos[c.first]
+		b, bok := pos[c.then]
+		if !aok || !bok || a >= b {
+			t.Errorf("hook %q must run before %q (positions %d, %d)", c.first, c.then, a, b)
+		}
 	}
 }

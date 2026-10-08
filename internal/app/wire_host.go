@@ -18,7 +18,11 @@ import (
 // it, which enable the cluster features, so that they stay off until `supavise system converge` has
 // run and the daemon has restarted: the state they Get is the one the daemon started with (a hook
 // that wants the marker as it is now reads hostsetup.StatusOf). The hook adds itself to the front of
-// the list, so that the others can Get the state.
+// the list, so that the others can Get the state. hostBehind is how they read it: wireMesh does not turn
+// a server into a cluster, wireReplicas runs no replica controller (and the Management API takes no
+// replica request) and wireFailover no monitor, while the host is behind. The other hooks do not read
+// it: a node that has joined a cluster keeps its mesh, its shared services and its routes as they are,
+// and a behind host costs the features that start something new.
 func init() {
 	wireHooks = append([]struct {
 		name string
@@ -56,6 +60,18 @@ func wireHost(_ context.Context, w *Wire) error {
 	}
 	w.Go("host-monitor", func(ctx context.Context) error { m.Run(ctx); return nil })
 	return nil
+}
+
+// hostBehind says whether the host layer is behind this binary (internal/hostsetup): the node has not
+// run `supavise system converge` for this release, which opens the peer port, gives the daemon the
+// directories it writes and so on. A node in that state keeps what runs, and starts nothing new of the
+// cluster work. The state is the one the daemon started with (wireHost).
+func hostBehind(w *Wire) (reason string, behind bool) {
+	st, ok := Get[hostsetup.Status](w)
+	if !ok || !st.Behind() {
+		return "", false
+	}
+	return fmt.Sprintf("the host setup is at revision %d and this release needs %d: run `sudo supavise system converge` and restart the daemon", st.Have, st.Want), true
 }
 
 // hostAlert is host_not_converged while the node is behind, and its resolution once it is not. A

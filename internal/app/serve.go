@@ -19,6 +19,7 @@ import (
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/diskquota"
+	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/functions"
 	"github.com/supavise/supavise/internal/health"
@@ -64,7 +65,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	// through (backup.Relay). It starts before the node opens, because the system cluster
 	// archives too and the daemon may wait for it to be reachable, and it stops after the
 	// drain: a delete's final base backup needs WAL archived until the very end.
-	if relay, stop := StartWALRelay(ctx, cfg, log, false); relay != nil {
+	if relay, stop := StartWALRelayAt(ctx, cfg, o.ConfigPath, log, false); relay != nil {
 		defer stop()
 		o.ArchiveReady = func(ref string) {
 			if err := relay.Ensure(ref); err != nil {
@@ -111,7 +112,11 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	// Create the shared postgres-meta passphrase now, so the unit that starts pg-meta
 	// reads the same sealed secret the API uses (PGMetaCryptoKey).
 	if _, err := PGMetaCryptoKey(ctx, cfg, node.Registry, node.Secrets); err != nil {
-		return err
+		// A follower reads the leader's copy and cannot create one; the leader made it before any node joined.
+		if boot.Role != cluster.RoleFollower {
+			return err
+		}
+		log.Warn("the shared pg-meta passphrase is not in the registry copy yet", "error", err)
 	}
 	// The artifact versions this release pins join the node's release history, which
 	// `supavise artifacts gc` reads to keep the artifacts of the previous release.
@@ -152,7 +157,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	// alert checker below (internal/health, internal/alerts).
 	hz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
 	hz.Bind(node.Registry, node.Secrets)
-	hdeps, err := health.ForNode(node, health.NodeOptions{Version: o.Version, Log: log.With("component", "health"), InDaemon: true, Tenants: hz.Fleet()})
+	hdeps, err := health.ForNode(nodeSeenBy(node, boot), health.NodeOptions{Version: o.Version, Log: log.With("component", "health"), InDaemon: true, Tenants: hz.Fleet()})
 	if err != nil {
 		return err
 	}
@@ -216,10 +221,12 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	}
 	// `supavise functions dev --token-file` grants a stand-in Owner seat and removes it when it
 	// exits; one that was killed leaves the seat behind.
-	if m, t, err := api.SweepStandIn(ctx, node.Registry, apiH.Members()); err != nil {
-		log.Warn("could not sweep the stand-in seats of `functions dev`", "error", err)
-	} else if m+t > 0 {
-		log.Warn("removed the stand-in seats and tokens that `functions dev` left behind", "memberships", m, "tokens", t)
+	if boot.Role != cluster.RoleFollower { // the sweep writes the registry, which a follower only reads
+		if m, t, err := api.SweepStandIn(ctx, node.Registry, apiH.Members()); err != nil {
+			log.Warn("could not sweep the stand-in seats of `functions dev`", "error", err)
+		} else if m+t > 0 {
+			log.Warn("removed the stand-in seats and tokens that `functions dev` left behind", "memberships", m, "tokens", t)
+		}
 	}
 	popts.APIHandler = apiH
 	edge, err := proxy.New(popts)
@@ -263,11 +270,20 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 	}
 	superviseStop(g, gctx, budget, edge.Run, drain, admin.Shutdown, log)
 	fleetUp := make(chan bool, 1)
+	fleetStarted := make(chan struct{})
 	projectsUp := make(chan struct{})
 	if cfg.Supervisor == config.SupervisorSystemd {
 		// Next to the projects: a shared service that takes minutes to answer (Realtime and
 		// Supavisor run migrations first) must not hold the projects back.
-		g.Go(func() error { fleetUp <- startFleet(gctx, node, log); return nil })
+		g.Go(func() error {
+			if wire.fleetMu.Lock(gctx) != nil { // the role reconciliation of wireFleet changes the same units
+				return nil // the daemon stops
+			}
+			defer wire.fleetMu.Unlock()
+			defer close(fleetStarted)
+			fleetUp <- startFleet(gctx, node, log)
+			return nil
+		})
 		// Once both are up, every project is registered with the shared services again. It is a
 		// no-op when nothing changed, and when a release moved Storage or Realtime it is what runs
 		// the new release's migrations in each project's database (they need the database, so the
@@ -287,13 +303,16 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 				return nil
 			}
 			ensureTenants(gctx, node, log)
+			ensureRemoteTenants(gctx, wire, log)
 			return nil
 		})
 	}
-	g.Go(func() error {
-		_ = bsvc.Run(gctx) // expiry sweeper; returns when the daemon stops
-		return nil
-	})
+	if boot.Role != cluster.RoleFollower { // the sweeper deletes branches: the leader's registry only
+		g.Go(func() error {
+			_ = bsvc.Run(gctx) // expiry sweeper; returns when the daemon stops
+			return nil
+		})
+	}
 	g.Go(func() error {
 		checker.Run(gctx) // alerts on what the health report finds, and the daily update check
 		return nil
@@ -305,7 +324,24 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		})
 	}
 	g.Go(func() error {
-		startProjects(gctx, node, recovered, backups(node), log, func() { close(projectsUp) })
+		startProjects(gctx, node, recovered, backups(node), log, boot.Role == cluster.RoleFollower, func() { close(projectsUp) })
+		return nil
+	})
+	// The work that needs the shared services and the projects (a server move that registers the
+	// projects with the pooler again) waits for this.
+	g.Go(func() error {
+		if cfg.Supervisor == config.SupervisorSystemd {
+			select {
+			case <-fleetStarted:
+			case <-gctx.Done():
+				return nil
+			}
+		}
+		select {
+		case <-projectsUp:
+			wire.markReady()
+		case <-gctx.Done():
+		}
 		return nil
 	})
 	g.Go(func() error { settleUpgrades(gctx, node, log); return nil })
@@ -384,21 +420,94 @@ func ensureTenants(ctx context.Context, n *lifecycle.Node, log *slog.Logger) {
 	log.Info("projects registered with the shared services", "failed", len(errs))
 }
 
+// ensureRemoteTenants registers the active projects that are homed on other nodes with the shared
+// services of this one, which are the leader's (lifecycle.Engine.EnsureTenants leaves such a project to
+// its home node, whose shared services are parked). The tenant points at the project's canonical port,
+// a forwarder to its home (invariant I3), so it is the same call as for a project homed here. A
+// reset Supavisor or Realtime database, or a release that changed a tenant's fingerprint, is then put
+// right for every project and not only for those that run on the leader. Nothing is done on a node that
+// does not lead.
+func ensureRemoteTenants(ctx context.Context, w *Wire, log *slog.Logger) {
+	mem, ok := Get[cluster.Membership](w)
+	f, haveFleet := Get[failover.Fleet](w)
+	if !ok || !haveFleet || !mem.IsLeader() {
+		return
+	}
+	ps, err := w.Node.Registry.ListProjects(ctx)
+	if err != nil {
+		log.Warn("projects homed elsewhere not registered with the shared services", "error", err)
+		return
+	}
+	self := mem.Self().ID
+	locks, _ := Get[failover.Locker](w)
+	failed, done := 0, 0
+	for _, p := range ps {
+		if p.Ref == config.SystemRef || p.NodeID == "" || p.NodeID == self ||
+			(p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy) {
+			continue
+		}
+		done++
+		if err := ensureRemoteTenant(ctx, locks, f, p.Ref); err != nil {
+			log.Warn("project homed elsewhere not registered with the shared services", "ref", p.Ref, "node", p.NodeID, "error", err)
+			failed++
+		}
+	}
+	if done > 0 {
+		log.Info("projects homed on other nodes registered with the shared services", "projects", done, "failed", failed)
+	}
+}
+
+// splitTenants is what projectTenants offers beyond failover.Fleet: the write on this node and the
+// refresh of the other nodes apart.
+type splitTenants interface {
+	ensureTenantHere(ctx context.Context, ref string) error
+	tellPeers(ctx context.Context, ref string)
+}
+
+// ensureRemoteTenant registers one project under its lock. The lock is held for the write on this node;
+// the other nodes are told after it is released, because each of them may take its whole timeout to
+// answer and a lifecycle operation on the project must not wait for that. A failover.Fleet that cannot
+// split the two is called under the lock.
+func ensureRemoteTenant(ctx context.Context, locks failover.Locker, f failover.Fleet, ref string) error {
+	s, split := f.(splitTenants)
+	err := underProjectLock(ctx, locks, ref, func() error {
+		if split {
+			return s.ensureTenantHere(ctx, ref)
+		}
+		return f.EnsureTenant(ctx, ref)
+	})
+	if err == nil && split {
+		s.tellPeers(ctx, ref)
+	}
+	return err
+}
+
+func underProjectLock(ctx context.Context, locks failover.Locker, ref string, fn func() error) error {
+	if locks != nil {
+		unlock, err := locks.Lock(ctx, ref)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+	return fn()
+}
+
 // startProjects brings the system project's backup timer and every active project up
 // after a (re)start, one project at a time so that boot does not start a hundred
 // Postgres clusters at once. It runs next to the listeners: the API answers while
 // projects start, and a project that fails is marked ACTIVE_UNHEALTHY. Projects whose
 // restart the previous process cut off after the pause are resumed first, and restored
 // clones whose recovery outlasted the restore's wait are finished in the background.
-func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle.Recovered, bk *backup.Service, log *slog.Logger, ready func()) {
-	if n.Cfg.Supervisor == config.SupervisorSystemd {
+func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle.Recovered, bk *backup.Service, log *slog.Logger, follower bool, ready func()) {
+	// A follower's system cluster is a standby of the leader's: it takes no base backups of its own and
+	// its unit is the standby's, which refreshSystem would render over as a primary's.
+	if n.Cfg.Supervisor == config.SupervisorSystemd && !follower {
 		for _, unit := range []string{backup.BackupTimerInstance(config.SystemRef), backup.PruneTimerUnit} {
 			if err := n.Supervisor.Start(ctx, unit); err != nil {
 				log.Warn("backup timer did not start", "unit", unit, "error", err)
 			}
 		}
-	}
-	if n.Cfg.Supervisor == config.SupervisorSystemd {
 		refreshSystem(ctx, n, log)
 	}
 	for ref, err := range n.Engine.ResumeRecovered(ctx, recovered) {

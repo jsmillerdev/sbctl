@@ -2,13 +2,18 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/supavise/supavise/internal/cluster"
+	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/proxy"
@@ -142,5 +147,95 @@ func TestWireProxyLeaderManages(t *testing.T) {
 	}
 	if w.Proxy.Cluster.Lag != nil {
 		t.Error("a lag source without a replica controller")
+	}
+}
+
+type fakeCertSource struct {
+	snap peerapi.CertSnapshot
+	err  error
+}
+
+func (f fakeCertSource) Certs(context.Context, string) (peerapi.CertSnapshot, error) {
+	return f.snap, f.err
+}
+
+// A node that is about to take over compares its mirror with the leader's certificates, for itself only
+// and only while it mirrors; a leader that does not answer is the usual failover and passes.
+func TestCertificatesCheck(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, data string) {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("certificates/ca/api.example.test/api.example.test.crt", "one")
+	write("certificates/ca/studio.example.test/studio.example.test.crt", "two")
+	leader := peerapi.CertSnapshot{Files: []peerapi.CertFile{
+		{Path: "certificates/ca/api.example.test/api.example.test.crt", Data: []byte("one")},
+		{Path: "certificates/ca/api.example.test/api.example.test.key", Data: []byte("secret")},
+		{Path: "certificates/ca/studio.example.test/studio.example.test.crt", Data: []byte("two")},
+	}}
+	role := proxy.NewCertRole(false)
+	self := func() string { return "n2" }
+	check := func(src proxy.CertSource, to string) []failover.Check {
+		return certificatesCheck(src, dir, role, self)(context.Background(), registry.Node{ID: to, Name: "second"})
+	}
+	got := check(fakeCertSource{snap: leader}, "n2")
+	if len(got) != 1 || !got[0].OK || got[0].Blocking || !strings.Contains(got[0].Detail, "2 certificate(s) match") {
+		t.Fatalf("a current mirror: %+v", got)
+	}
+	// The leader renewed one: the check says which, and still does not stop the move.
+	leader.Files[2].Data = []byte("two, renewed")
+	got = check(fakeCertSource{snap: leader}, "n2")
+	if len(got) != 1 || got[0].OK || got[0].Blocking || !strings.Contains(got[0].Detail, "1 of 2") || !strings.Contains(got[0].Detail, "studio.example.test.crt") {
+		t.Fatalf("a stale mirror: %+v", got)
+	}
+	// A certificate the node does not hold at all differs too.
+	leader.Files = append(leader.Files, peerapi.CertFile{Path: "certificates/ca/new.example.test/new.example.test.crt", Data: []byte("three")})
+	if got = check(fakeCertSource{snap: leader}, "n2"); !strings.Contains(got[0].Detail, "2 of 3") {
+		t.Fatalf("a missing certificate: %+v", got)
+	}
+	// A leader that is down is the case of a failover.
+	got = check(fakeCertSource{err: errors.New("no session")}, "n2")
+	if len(got) != 1 || !got[0].OK || !strings.Contains(got[0].Detail, "last mirrored") {
+		t.Fatalf("a leader that does not answer: %+v", got)
+	}
+	// Another node's mirror is its own to check, and a node that issues has nothing mirrored.
+	if got = check(fakeCertSource{snap: leader}, "n3"); got != nil {
+		t.Fatalf("a check of another node: %+v", got)
+	}
+	role.Promote()
+	if got = check(fakeCertSource{snap: leader}, "n2"); got != nil {
+		t.Fatalf("a check of a node that manages its certificates: %+v", got)
+	}
+}
+
+// The paths of the leader's snapshot are not trusted: a path that leaves the certificate directory is
+// counted as a certificate the node does not hold, and nothing outside the directory is read, even
+// when a file there has the bytes the snapshot names.
+func TestCertificatesCheckReadsNothingOutsideItsDirectory(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "store")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "outside.crt"), []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "abs.crt"), []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snap := peerapi.CertSnapshot{Files: []peerapi.CertFile{
+		{Path: "../outside.crt", Data: []byte("same")},
+		{Path: "certificates/../../outside.crt", Data: []byte("same")},
+		{Path: filepath.Join(root, "abs.crt"), Data: []byte("same")},
+	}}
+	got := certificatesCheck(fakeCertSource{snap: snap}, dir, proxy.NewCertRole(false), func() string { return "n2" })(context.Background(), registry.Node{ID: "n2", Name: "second"})
+	if len(got) != 1 || got[0].OK || got[0].Blocking || !strings.Contains(got[0].Detail, "3 of 3") {
+		t.Fatalf("paths that leave the directory: %+v", got)
 	}
 }
