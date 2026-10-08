@@ -89,10 +89,6 @@ is the daemon that `supavise.service` runs.
   store, the leader writes the registry row) and `wireReplicas`' `baseBackups` is given a `TakeBase`
   that calls `BackupOps.BaseBackup` on the project's home. A restore, an upgrade backup and a final
   backup of a project homed on a follower are refused by the leader's Engine; routing them through `placement.BackupOps` is the same follow-up.
-- `supavise node join`, `node rejoin` and `install --join-token-file` cannot complete: `seedSystemStandby`
-  and `seedPreflight` (`cmd/supavise/cmd_node.go`) return `notimpl.Err`, because nothing in the tree builds
-  a joining server's standby of the system cluster (`backup.SeedReplica`, then the replica unit of
-  `lifecycle`). The cluster commands that remain stubs are those two functions.
 - The commands of the CLI that open the node (`openNode`, `openOptions`) open the registry as a
   leader's; a follower needs the read-only open that `openFollower` gives the daemon.
 - A server move that the restart interrupts is finished by the daemon that starts as the leader, without

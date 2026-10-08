@@ -146,7 +146,10 @@ func (h *nodeHost) asSupaviseTo(ctx context.Context, stdout, stderr io.Writer, e
 }
 
 // superviseCredential is the uid, gid and groups of the supavise user.
-func (h *nodeHost) superviseCredential() (*syscall.Credential, error) {
+func (h *nodeHost) superviseCredential() (*syscall.Credential, error) { return supaviseCredential() }
+
+// supaviseCredential is the uid, gid and groups of the supavise user.
+func supaviseCredential() (*syscall.Credential, error) {
 	u, err := user.Lookup(installUser)
 	if err != nil {
 		return nil, fmt.Errorf("the %s user: %w", installUser, err)
