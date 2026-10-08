@@ -4,13 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"io/fs"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
@@ -31,7 +26,9 @@ type PeerAPI struct {
 	Now  func() time.Time
 }
 
-// Register adds the endpoints to m:
+// Register adds the endpoints to m. The certificate store (GET /peer/v1/certs) is not among them: the
+// proxy owns the store's layout and registers that endpoint itself with mesh.Handle, and a second
+// registration of the pattern would panic when the daemon starts.
 //
 //	GET  /peer/v1/ping            any node
 //	GET  /peer/v1/join            a joiner with no certificate: a challenge
@@ -40,7 +37,6 @@ type PeerAPI struct {
 //	POST /peer/v1/rejoin          a fenced node, to be let back in
 //	POST /peer/v1/certs/renew     an active node, for a new certificate
 //	GET  /peer/v1/config          a follower, for the cluster-scoped settings (leader only)
-//	GET  /peer/v1/certs           a follower, for the certificate store (leader only)
 //	POST /peer/v1/report          a node, for what it observes (leader only)
 func (p *PeerAPI) Register(m *mesh.Mux) {
 	m.Handle("GET "+peerapi.PathPing, mesh.PingHandler(p.Ping))
@@ -120,7 +116,6 @@ func (p *PeerAPI) Register(m *mesh.Mux) {
 		sum := sha256.Sum256(b)
 		mesh.RespondJSON(w, http.StatusOK, peerapi.ClusterConfig{Revision: hex.EncodeToString(sum[:]), TOML: string(b)})
 	})
-	m.Handle("GET "+peerapi.PathCerts, p.certs)
 	m.Handle("POST "+peerapi.PathReport, func(w http.ResponseWriter, r *http.Request) {
 		if err := p.Authority.needLeader(); err != nil {
 			respond(w, r, err)
@@ -164,84 +159,4 @@ func respond(w http.ResponseWriter, r *http.Request, err error) {
 		}
 		mesh.RespondError(w, http.StatusInternalServerError, "", err.Error())
 	}
-}
-
-// maxCertStore bounds the certificate snapshot.
-const maxCertStore = 32 << 20
-
-// certs answers GET /peer/v1/certs: every file of the certificate store, with an ETag over their
-// names, modes and contents, and 304 for a follower that has the current one. The locks the
-// issuer holds while it works are left out.
-func (p *PeerAPI) certs(w http.ResponseWriter, r *http.Request) {
-	if err := p.Authority.needLeader(); err != nil {
-		respond(w, r, err)
-		return
-	}
-	snap, etag, err := SnapshotCerts(p.Cfg.Paths().Certs())
-	if err != nil {
-		respond(w, r, err)
-		return
-	}
-	w.Header().Set("ETag", etag)
-	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-	mesh.RespondJSON(w, http.StatusOK, snap)
-}
-
-// SnapshotCerts reads the certificate store under root and returns it with its ETag. A store that
-// does not exist is empty.
-func SnapshotCerts(root string) (peerapi.CertSnapshot, string, error) {
-	snap := peerapi.CertSnapshot{Files: []peerapi.CertFile{}}
-	h := sha256.New()
-	total := 0
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) && path == root {
-				return filepath.SkipAll
-			}
-			return err
-		}
-		if d.IsDir() {
-			if d.Name() == "locks" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !d.Type().IsRegular() || strings.HasPrefix(d.Name(), ".") {
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) { // removed while walking
-				return nil
-			}
-			return err
-		}
-		if total += len(b); total > maxCertStore {
-			return errors.New("cluster: the certificate store is larger than the peer API will send")
-		}
-		fi, err := d.Info()
-		if err != nil {
-			return err
-		}
-		snap.Files = append(snap.Files, peerapi.CertFile{Path: filepath.ToSlash(rel), Mode: uint32(fi.Mode().Perm()), Data: b})
-		return nil
-	})
-	if err != nil {
-		return peerapi.CertSnapshot{}, "", err
-	}
-	sort.Slice(snap.Files, func(i, j int) bool { return snap.Files[i].Path < snap.Files[j].Path })
-	for _, f := range snap.Files {
-		h.Write([]byte(f.Path))
-		h.Write([]byte{0, byte(f.Mode >> 8), byte(f.Mode)})
-		sum := sha256.Sum256(f.Data)
-		h.Write(sum[:])
-	}
-	return snap, `"` + hex.EncodeToString(h.Sum(nil)) + `"`, nil
 }

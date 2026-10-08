@@ -1161,66 +1161,19 @@ func TestStatusFileRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCertificateSnapshotAndTheEndpoint(t *testing.T) {
-	root := t.TempDir()
-	write := func(rel, data string, mode os.FileMode) {
-		p := filepath.Join(root, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(data), mode); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write("certificates/acme/example.test/example.test.crt", "CERT", 0o644)
-	write("certificates/acme/example.test/example.test.key", "KEY", 0o600)
-	write("locks/issue_cert_example.test.lock", "busy", 0o644)
-	write(".hidden", "x", 0o644)
-
-	snap, etag, err := SnapshotCerts(root)
-	if err != nil || len(snap.Files) != 2 || snap.Files[0].Path != "certificates/acme/example.test/example.test.crt" || snap.Files[1].Mode != 0o600 {
-		t.Fatalf("snapshot %+v, %v", snap, err)
-	}
-	if _, again, _ := SnapshotCerts(root); again != etag {
-		t.Fatal("the ETag of an unchanged store changed")
-	}
-	write("certificates/acme/example.test/example.test.crt", "CERT2", 0o644)
-	if _, changed, _ := SnapshotCerts(root); changed == etag {
-		t.Fatal("the ETag did not change with the content")
-	}
-	if empty, e, err := SnapshotCerts(filepath.Join(root, "missing")); err != nil || len(empty.Files) != 0 || e == "" {
-		t.Fatalf("a store that does not exist: %+v %q %v", empty, e, err)
-	}
-
+// The certificate store is the proxy's endpoint. If the membership endpoints took the pattern too, the
+// daemon of any cluster node would panic at start (http.ServeMux refuses a pattern registered twice).
+func TestPeerAPILeavesTheCertificateStoreToTheProxy(t *testing.T) {
 	l := newLeader(t)
-	l.cfg.StateDir = filepath.Dir(root)
-	_ = os.Rename(root, l.cfg.Paths().Certs())
-	api := &PeerAPI{Authority: l.auth, Topology: l.live, Cfg: l.cfg, Reports: l.rep}
 	mux := mesh.NewMux()
-	api.Register(mux)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", peerapi.PathCerts, nil))
-	if rec.Code != 200 || rec.Header().Get("ETag") == "" {
-		t.Fatalf("certs: %d %v", rec.Code, rec.Header())
+	(&PeerAPI{Authority: l.auth, Topology: l.live, Cfg: l.cfg, Reports: l.rep}).Register(mux)
+	certs := "GET " + peerapi.PathCerts
+	for _, p := range mux.Patterns() {
+		if p == certs {
+			t.Fatalf("the membership endpoints register %q", p)
+		}
 	}
-	var got peerapi.CertSnapshot
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || len(got.Files) != 2 {
-		t.Fatalf("body %v, %v", got, err)
-	}
-	req := httptest.NewRequest("GET", peerapi.PathCerts, nil)
-	req.Header.Set("If-None-Match", rec.Header().Get("ETag"))
-	rec2 := httptest.NewRecorder()
-	mux.ServeHTTP(rec2, req)
-	if rec2.Code != http.StatusNotModified || rec2.Body.Len() != 0 {
-		t.Fatalf("conditional get: %d %q", rec2.Code, rec2.Body.String())
-	}
-	// A node that is not the leader holds no authoritative store.
-	l.auth.Topology = cluster2Follower{l.auth.Topology}
-	rec3 := httptest.NewRecorder()
-	mux.ServeHTTP(rec3, httptest.NewRequest("GET", peerapi.PathCerts, nil))
-	if rec3.Code != http.StatusServiceUnavailable {
-		t.Fatalf("certs on a follower: %d", rec3.Code)
-	}
+	mux.Handle(certs, func(http.ResponseWriter, *http.Request) {}) // the proxy's registration must not clash
 }
 
 func TestDNSRecords(t *testing.T) {
