@@ -33,7 +33,13 @@ const (
 func refuse(format string, args ...any) error { return &UserError{Msg: fmt.Sprintf(format, args...)} }
 
 // Setup implements Service: the replica goes to the least loaded server joined in region.
+//
+// A request holds setupMu from the first read to the check after the insert, so two requests to
+// this process (Studio's double click, the API beside the daemon's own) take turns. Requests of
+// two processes meet only in the registry; create covers them.
 func (c *Controller) Setup(ctx context.Context, ref, region string) error {
+	c.setupMu.Lock()
+	defer c.setupMu.Unlock()
 	p, nodes, err := c.setupContext(ctx, ref)
 	if err != nil {
 		return err
@@ -87,6 +93,8 @@ func (c *Controller) Setup(ctx context.Context, ref, region string) error {
 
 // SetupOn implements Service: the replica goes to the named server (its id, or its name).
 func (c *Controller) SetupOn(ctx context.Context, ref, node string) error {
+	c.setupMu.Lock()
+	defer c.setupMu.Unlock()
 	p, nodes, err := c.setupContext(ctx, ref)
 	if err != nil {
 		return err
@@ -191,13 +199,16 @@ func (c *Controller) leastLoaded(ctx context.Context, nodes []registry.Node) (re
 	return best, nil
 }
 
-// create applies the refusals that depend on the target, then writes the row.
+// create applies the refusals that depend on the target, then writes the row and checks the cap
+// once more. The count in front of the insert is a fast path: a request in another process, the
+// daemon beside `supavise replicas add`, can pass it at the same time. The registry has no
+// multi-statement transaction to hold the count and the insert together, so the check is made after
+// the insert instead: a row that leaves the project over its limit is deleted again and refused.
+// The request that inserts last always sees the others' rows, so the limit is never exceeded; two
+// that insert together may both see the excess and both withdraw, and a retry succeeds.
 func (c *Controller) create(ctx context.Context, p *registry.Project, nodes []registry.Node, existing []registry.Replica, target registry.Node) error {
-	live := 0
-	for _, r := range existing {
-		if r.Status != statusGoingDown {
-			live++
-		}
+	if target.ID == p.NodeID {
+		return refuse(msgSameServer)
 	}
 	active := 0
 	for _, n := range nodes {
@@ -205,7 +216,8 @@ func (c *Controller) create(ctx context.Context, p *registry.Project, nodes []re
 			active++
 		}
 	}
-	if limit := min(MaxReplicas(p.Class), active-1); live >= limit {
+	limit := min(MaxReplicas(p.Class), active-1)
+	if liveCount(existing) >= limit {
 		return refuse(msgMaxReplicas, limit)
 	}
 	if c.o.Admit != nil {
@@ -226,8 +238,11 @@ func (c *Controller) create(ctx context.Context, p *registry.Project, nodes []re
 	r, err := replicaid.Create(ctx, c.reg, p.Ref, target, registry.ReplicaManual, c.o.NewID)
 	if err != nil {
 		if errors.Is(err, registry.ErrConflict) {
-			return refuse(msgHasReplica, nodeLabel(target))
+			return c.conflict(ctx, p.Ref, target)
 		}
+		return err
+	}
+	if err := c.checkCap(ctx, r, limit); err != nil {
 		return err
 	}
 	// Asking for the replica again after removing a default one is a change of mind.
@@ -237,4 +252,45 @@ func (c *Controller) create(ctx context.Context, p *registry.Project, nodes []re
 	c.log.Info("replicas: replica requested", "identifier", r.Identifier, "ref", p.Ref, "node", target.ID)
 	c.kick()
 	return nil
+}
+
+// liveCount is how many of the rows are replicas that are not going down.
+func liveCount(rows []registry.Replica) int {
+	n := 0
+	for _, r := range rows {
+		if r.Status != statusGoingDown {
+			n++
+		}
+	}
+	return n
+}
+
+// conflict words the registry's refusal of a replica on target: the project's home is target (a
+// failover moved it since the request began) or target already holds a replica.
+func (c *Controller) conflict(ctx context.Context, ref string, target registry.Node) error {
+	if cur, err := c.reg.GetProject(ctx, ref); err == nil && cur.NodeID == target.ID {
+		return refuse(msgSameServer)
+	}
+	return refuse(msgHasReplica, nodeLabel(target))
+}
+
+// checkCap withdraws the row r when the project has more replicas than limit now, and says why.
+// When it cannot count, it withdraws the row too: a replica nobody could check is not kept.
+func (c *Controller) checkCap(ctx context.Context, r *registry.Replica, limit int) error {
+	rows, err := c.reg.ListReplicas(ctx, r.Ref)
+	if err == nil && liveCount(rows) <= limit {
+		return nil
+	}
+	if derr := c.reg.DeleteReplica(ctx, r.Identifier); derr != nil && !errors.Is(derr, registry.ErrNotFound) {
+		c.log.Warn("replicas: a replica over the limit could not be withdrawn", "identifier", r.Identifier, "error", derr)
+		if err == nil {
+			err = derr
+		}
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	c.log.Info("replicas: a concurrent request took the last place, the replica is withdrawn", "identifier", r.Identifier, "ref", r.Ref, "limit", limit)
+	return refuse(msgMaxReplicas, limit)
 }

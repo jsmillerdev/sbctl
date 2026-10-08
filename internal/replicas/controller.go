@@ -71,6 +71,8 @@ type Timeouts struct {
 	// (it may be creating the instance at this moment) before they report the removal as pending.
 	// Default 30 seconds.
 	Busy time.Duration
+	// Restart is how long the call that restarts a replica's units on its node may take. Default 5 minutes.
+	Restart time.Duration
 }
 
 func (t Timeouts) withDefaults() Timeouts {
@@ -85,6 +87,7 @@ func (t Timeouts) withDefaults() Timeouts {
 	def(&t.Replay, 2*time.Hour)
 	def(&t.Complete, 10*time.Minute)
 	def(&t.Busy, 30*time.Second)
+	def(&t.Restart, 5*time.Minute)
 	return t
 }
 
@@ -102,6 +105,9 @@ type Controller struct {
 	// wmu orders the controller's writes of a replica's status with a removal, so that a setup
 	// that finishes a step never writes over GOING_DOWN.
 	wmu sync.Mutex
+	// setupMu makes a Setup request, from its first read to the check after its insert, one step
+	// among this process's requests (setup.go).
+	setupMu sync.Mutex
 
 	mu    sync.Mutex
 	state map[string]*replicaState
@@ -396,12 +402,31 @@ func (c *Controller) work(ctx context.Context, r *registry.Replica, project regi
 // HandleReport implements ReportSink: it takes the instances a node reports as observations, for
 // the replicas that really are on that node.
 func (c *Controller) HandleReport(ctx context.Context, rep peerapi.Report) {
+	if len(rep.Instances) == 0 {
+		c.kick()
+		return
+	}
+	// The intake runs this in its own goroutine and must not wait long: one query for the node's
+	// replicas, however many instances the report holds.
+	rows, err := c.reg.ListReplicasOn(ctx, rep.Node)
+	if err != nil {
+		c.log.Debug("replicas: report from a node whose replicas cannot be read", "node", rep.Node, "error", err)
+		return
+	}
+	byID := make(map[string]*registry.Replica, len(rows))
+	for i := range rows {
+		byID[rows[i].Identifier] = &rows[i]
+	}
 	for i := range rep.Instances {
 		st := rep.Instances[i]
-		r, err := c.reg.GetReplica(ctx, st.Identifier)
-		if err != nil || r.NodeID != rep.Node {
-			continue // a node reports only its own instances
+		// A node reports only its own instances, and an instance only under the project its row
+		// names: a report that puts it under another would skew that project's WAL position
+		// estimate. A status that names no project takes the row's.
+		r := byID[st.Identifier]
+		if r == nil || (st.Ref != "" && st.Ref != r.Ref) {
+			continue
 		}
+		st.Ref = r.Ref
 		c.observed(r.Identifier, st)
 	}
 	c.kick()

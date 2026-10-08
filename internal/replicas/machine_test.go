@@ -10,6 +10,7 @@ import (
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
+	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -367,6 +368,21 @@ func TestAdmitSeesWhatTheNodeHolds(t *testing.T) {
 	}
 }
 
+// The standby of the system cluster is not a hosted project: the capacity accounting leaves the
+// system project out, and a stand-in under the replica's identifier would count its class as one.
+func TestAdmitDoesNotCountTheSystemStandby(t *testing.T) {
+	e := newEnv(t)
+	e.systemReplica("n2")
+	if err := e.ctrl.SetupOn(e.ctx, refA, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	e.tick(1)
+	req := e.admit.reqs[len(e.admit.reqs)-1]
+	if len(req.Hosted) != 0 {
+		t.Fatalf("n2 holds a system standby and nothing else, hosted %+v", req.Hosted)
+	}
+}
+
 // What counts as a node's refusal for lack of room: the capacity error the node's admission makes,
 // and anything that says NoRoom, through any wrapping; nothing else does.
 func TestNoRoom(t *testing.T) {
@@ -379,6 +395,8 @@ func TestNoRoom(t *testing.T) {
 		"a capacity error":           {capacity, true},
 		"a wrapped capacity error":   {fmt.Errorf("node n2: %w", capacity), true},
 		"a NoRoom error":             {fmt.Errorf("call: %w", fakeNoRoom{"disk"}), true},
+		"the agent's refusal":        {fmt.Errorf("node n2: %w", placement.ErrNoRoom), true},
+		"a refusal for the disk":     {fmt.Errorf("%w: %w", placement.ErrNoRoom, lifecycle.ErrReplicaDisk), true},
 		"a NoRoom that says no":      {noRoomNo{}, false},
 		"a failure of another kind":  {errors.New("boom"), false},
 		"a remote error without one": {&mesh.RemoteError{Node: "n2", Status: 507}, false},
@@ -446,6 +464,44 @@ func TestNodeRefusalForRoomWaits(t *testing.T) {
 	}
 }
 
+// A node that keeps refusing a replica keeps its replica_capacity alert open. The pass that admits
+// the replica again writes 1_started, and the next pass, a fraction of a second later, must not
+// take that for room found while the launch is still on its way and may be refused again.
+func TestCapacityAlertStaysOpenWhileTheLaunchAfterARefusalIsInFlight(t *testing.T) {
+	e := newEnv(t)
+	if err := e.ctrl.SetupOn(e.ctx, refA, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	e.nodes.ensureErr = fakeNoRoom{"not enough memory"}
+	e.tick(2)
+	if e.alerts.count(alerts.KindReplicaCapacity, false) != 1 {
+		t.Fatalf("capacity alerts: %+v", e.alerts.evs)
+	}
+
+	// A minute later the node is asked again, and the answer is slow.
+	e.nodes.ensureErr = nil
+	e.nodes.ensureGate = make(chan struct{})
+	e.clock.Advance(time.Minute + time.Second)
+	e.ctrl.pass(e.ctx)
+	waitFor(t, "the launch to reach the node", func() bool { return e.nodes.callsMatching("ensure n2") == 2 })
+	if got := e.replica(refA, "n2").InitStep; got != StepStarted {
+		t.Fatalf("step %s", got)
+	}
+	e.ctrl.pass(e.ctx) // the pass the row's change wakes
+	if e.alerts.count(alerts.KindReplicaCapacity, true) != 0 {
+		t.Fatalf("the alert closed while the node had not taken the replica: %+v", e.alerts.evs)
+	}
+
+	// The node takes it: the room was there, and the alert closes once.
+	close(e.nodes.ensureGate)
+	e.ctrl.wg.Wait()
+	e.settle(refA, "n2")
+	if e.alerts.count(alerts.KindReplicaCapacity, true) != 1 || e.alerts.count(alerts.KindReplicaCapacity, false) != 1 {
+		t.Fatalf("capacity alerts: %+v", e.alerts.evs)
+	}
+	e.alerts.checkTitles(t)
+}
+
 // The node's report makes the leader's picture fresher, and a node can report only its own instances.
 func TestHandleReportRecordsOnlyTheNodesOwnInstances(t *testing.T) {
 	e := newEnv(t)
@@ -470,6 +526,33 @@ func TestHandleReportRecordsOnlyTheNodesOwnInstances(t *testing.T) {
 	e.tick(1)
 	if got := e.nodes.callsMatching("observe n2 " + id); got != calls {
 		t.Fatalf("polled despite a fresh report: %d -> %d", calls, got)
+	}
+}
+
+// A report is read with one query for the node's replicas, however many instances it holds, and an
+// instance under another project than its row names is not taken: it would skew that project's
+// estimate of the WAL position.
+func TestHandleReportReadsTheNodeOnceAndChecksTheProject(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.Registry = &hookRegistry{Registry: o.Registry} })
+	h := e.opts.Registry.(*hookRegistry)
+	idA := e.activeReplica().Identifier
+	if err := e.ctrl.SetupOn(e.ctx, refB, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	idB := e.settle(refB, "n2").Identifier
+	lag := 7.0
+	good, wrong := fakeStatus(idA, refA), fakeStatus(idB, refA) // the second names the wrong project
+	good.LagSeconds, wrong.LagSeconds = &lag, &lag
+	before := h.reads()
+	e.ctrl.HandleReport(e.ctx, reportOf("n2", good, wrong, fakeStatus("nonsense", refA)))
+	if got := h.reads() - before; got != 1 {
+		t.Fatalf("%d reads of the node's replicas for one report", got)
+	}
+	if got := e.ctrl.lagNow(idA); got != 7 {
+		t.Fatalf("lag of the right instance %v", got)
+	}
+	if got := e.ctrl.lagNow(idB); got == 7 {
+		t.Fatal("took an instance under another project")
 	}
 }
 

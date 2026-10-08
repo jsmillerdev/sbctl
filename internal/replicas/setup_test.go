@@ -3,6 +3,7 @@ package replicas
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -292,4 +293,129 @@ func TestSetupWritesTheRowAndKicksTheController(t *testing.T) {
 	default:
 		t.Fatal("the request did not wake the controller")
 	}
+}
+
+// Requests that arrive together, as Studio's double click and the API beside `supavise replicas add`
+// do, take turns: a small project may have four replicas, and of eight requests four are accepted.
+func TestConcurrentSetupsRespectTheCap(t *testing.T) {
+	e := newEnv(t)
+	targets := []string{"n2", "n3"}
+	for _, id := range []string{"n4", "n5", "n6", "n7", "n8", "n9"} {
+		e.addNode(id, "x"+id, "region-"+id)
+		targets = append(targets, id)
+	}
+	errs := make([]error, len(targets))
+	var wg sync.WaitGroup
+	for i, n := range targets {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = e.ctrl.SetupOn(e.ctx, refA, n)
+		}()
+	}
+	wg.Wait()
+	accepted := 0
+	for _, err := range errs {
+		if err == nil {
+			accepted++
+		} else if got := e.user(err); got != "The project already has the maximum of 4 read replicas." {
+			t.Fatalf("refused with %q", got)
+		}
+	}
+	if rows := mustList(e, refA); accepted != 4 || len(rows) != 4 {
+		t.Fatalf("%d requests accepted, %d rows", accepted, len(rows))
+	}
+}
+
+// Two processes share the registry and not the controller's lock. When both pass the count and
+// both insert, whoever looks after the other's row has gone in sees the excess and withdraws
+// its own: the project is never over its cap. Both may withdraw, and a retry then succeeds.
+func TestSetupsOfTwoProcessesNeverExceedTheCap(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.Registry = &hookRegistry{Registry: o.Registry} })
+	h := e.opts.Registry.(*hookRegistry)
+	other := New(e.opts) // the second process
+	for _, id := range []string{"n4", "n5", "n6"} {
+		e.addNode(id, "x"+id, "region-"+id)
+	}
+	for _, n := range []string{"n2", "n3", "n4"} { // three of four places taken
+		if err := e.ctrl.SetupOn(e.ctx, refA, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Each request waits until the other has counted, then until the other has inserted its row.
+	counted, inserted := barrier(2), barrier(2)
+	h.beforeAdd, h.afterAdd = counted.wait, inserted.wait
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = e.ctrl.SetupOn(e.ctx, refA, "n5") }()
+	go func() { defer wg.Done(); errs[1] = other.SetupOn(e.ctx, refA, "n6") }()
+	wg.Wait()
+	if counted.arrived() != 2 || inserted.arrived() != 2 {
+		t.Fatalf("%d requests counted and %d inserted, the test needs both", counted.arrived(), inserted.arrived())
+	}
+	refused := 0
+	for i, err := range errs {
+		if err == nil {
+			continue
+		}
+		refused++
+		if got := e.user(err); got != "The project already has the maximum of 4 read replicas." {
+			t.Fatalf("request %d refused with %q", i, got)
+		}
+	}
+	rows := mustList(e, refA)
+	if refused == 0 || len(rows) > 4 || len(rows) != 5-refused {
+		t.Fatalf("%d requests refused, %d rows: %+v", refused, len(rows), rows)
+	}
+}
+
+// A failover that moves the project's home onto the chosen server after the checks is caught by
+// the registry when it inserts the row (I2), and the request is refused in the words for it.
+func TestSetupRefusesWhenTheProjectMovedOntoTheChosenServer(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.Registry = &hookRegistry{Registry: o.Registry} })
+	h := e.opts.Registry.(*hookRegistry)
+	cl, err := e.reg.GetCluster(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.beforeAdd = func() {
+		if err := e.reg.SetProjectNode(e.ctx, refA, "n2", cl.Epoch); err != nil {
+			t.Error(err)
+		}
+	}
+	if got := e.user(e.ctrl.Setup(e.ctx, refA, "eu-west-1")); got != msgSameServer {
+		t.Fatalf("refused with %q", got)
+	}
+	if rows := mustList(e, refA); len(rows) != 0 {
+		t.Fatalf("rows: %+v", rows)
+	}
+}
+
+// gate lets n callers of wait through together, or none after five seconds.
+type gate struct {
+	mu   sync.Mutex
+	n    int
+	open chan struct{}
+	seen int
+}
+
+func barrier(n int) *gate { return &gate{n: n, open: make(chan struct{})} }
+
+func (g *gate) wait() {
+	g.mu.Lock()
+	if g.seen++; g.seen == g.n {
+		close(g.open)
+	}
+	g.mu.Unlock()
+	select {
+	case <-g.open:
+	case <-time.After(5 * time.Second):
+	}
+}
+
+func (g *gate) arrived() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.seen
 }

@@ -43,21 +43,21 @@ func (c *Controller) Remove(ctx context.Context, ref, identifier string) error {
 			return err
 		}
 	}
-	if !c.markGoingDown(ctx, r) {
-		return ErrNotFound
+	if err := c.markGoingDown(ctx, r); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return ErrNotFound
+		}
+		return err
 	}
 	c.kick()
 	return nil
 }
 
-// markGoingDown writes GOING_DOWN, keeping the step the setup reached.
-func (c *Controller) markGoingDown(ctx context.Context, r *registry.Replica) bool {
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	if _, err := c.reg.GetReplica(ctx, r.Identifier); err != nil {
-		return false
-	}
-	return c.reg.SetReplicaStatus(ctx, r.Identifier, statusGoingDown, r.InitStep, r.InitError) == nil
+// markGoingDown writes GOING_DOWN, keeping the step the setup reached. A row that is gone comes
+// back as registry.ErrNotFound; any other error is a write that did not happen (a registry that
+// is read-only or unreachable), which the caller must not take for a removal.
+func (c *Controller) markGoingDown(ctx context.Context, r *registry.Replica) error {
+	return c.writeStatus(ctx, r.Identifier, statusGoingDown, r.InitStep, r.InitError)
 }
 
 // RemoveAll implements Remover.
@@ -69,8 +69,12 @@ func (c *Controller) RemoveAll(ctx context.Context, ref string) error {
 	return c.removeNow(ctx, rows)
 }
 
-// RemoveOn implements Remover.
+// RemoveOn implements Remover. An active node is refused: the default reconciler would make its
+// replicas again, and the caller's order (leave, then remove) is the one that closes the gap.
 func (c *Controller) RemoveOn(ctx context.Context, node string) error {
+	if n, err := c.reg.GetNode(ctx, node); err == nil && n.State == registry.NodeActive {
+		return fmt.Errorf("replicas: node %s is still active: move it out of the cluster before its replicas are removed", node)
+	}
 	rows, err := c.reg.ListReplicasOn(ctx, node)
 	if err != nil {
 		return err
@@ -85,8 +89,16 @@ func (c *Controller) removeNow(ctx context.Context, rows []registry.Replica) err
 	var pending []string
 	for i := range rows {
 		r := rows[i]
-		if r.Status != statusGoingDown && !c.markGoingDown(ctx, &r) {
-			continue
+		if r.Status != statusGoingDown {
+			if err := c.markGoingDown(ctx, &r); errors.Is(err, registry.ErrNotFound) {
+				continue // gone already
+			} else if err != nil {
+				// Not marked, so the controller will not retry it: the caller has to hear that
+				// the replica is still there.
+				c.log.Warn("replicas: could not mark the replica for removal", "identifier", r.Identifier, "node", r.NodeID, "error", err)
+				pending = append(pending, r.Identifier)
+				continue
+			}
 		}
 		r.Status = statusGoingDown
 		if !c.idle(ctx, r.Identifier) || !c.removeOnce(ctx, &r) {
@@ -162,7 +174,10 @@ func (c *Controller) removeOnce(ctx context.Context, r *registry.Replica) bool {
 			return false
 		}
 	}
-	if !gone {
+	// The standby of the system cluster is the node's own cluster. Removing the instance would wipe
+	// the registry copy of a node that may be alive, so only the row goes; the retirement of a node
+	// takes its system cluster with it (internal/cluster).
+	if !gone && r.Origin != registry.ReplicaSystem {
 		if c.o.Ops == nil {
 			c.removeFailed(r, errNoOps)
 			return false
@@ -238,9 +253,15 @@ func (c *Controller) Restart(ctx context.Context, ref, identifier string) error 
 	c.wg.Add(1) // under the lock, so that it cannot overtake the wait at the end of Run
 	bg := c.runCtx
 	c.mu.Unlock()
-	if !c.setStatus(ctx, r.Identifier, statusRestart, StepDone, "") {
+	if err := c.writeStatus(ctx, r.Identifier, statusRestart, StepDone, ""); err != nil {
 		c.wg.Done()
-		return ErrNotFound
+		switch {
+		case errors.Is(err, registry.ErrNotFound):
+			return ErrNotFound
+		case errors.Is(err, errGoingDown):
+			return refuse("The read replica %s is being removed.", identifier)
+		}
+		return err
 	}
 	c.mu.Lock()
 	s := c.st(r.Identifier)
@@ -250,26 +271,40 @@ func (c *Controller) Restart(ctx context.Context, ref, identifier string) error 
 	if bg == nil { // not running: the call outlives the request that made it
 		bg = context.WithoutCancel(ctx)
 	}
-	go func() {
-		defer c.wg.Done()
-		bg, cancel := context.WithTimeout(bg, 5*time.Minute)
-		defer cancel()
-		st, err := c.o.Ops.Do(bg, r.NodeID, r.Identifier, peerapi.ActionRestart, peerapi.InstanceAction{Epoch: epoch})
-		c.mu.Lock()
-		c.st(r.Identifier).restarting = false
-		c.mu.Unlock()
-		if err != nil {
-			c.log.Error("replicas: restart failed", "identifier", r.Identifier, "node", r.NodeID, "error", err)
-			c.setStatus(bg, r.Identifier, statusUnhealthy, StepDone, "")
-			c.alert(bg, alerts.Event{
-				Kind: alerts.KindReplicaUnhealthy, Ref: r.Ref, Key: "replica_unhealthy/" + r.Identifier,
-				Title:  titleUnhealthy,
-				Detail: fmt.Sprintf("Restarting the read replica %s of project %s on node %s failed: %v.", r.Identifier, r.Ref, r.NodeID, err),
-			})
-			return
-		}
+	go c.restartOnNode(bg, r, epoch)
+	return nil
+}
+
+// restartOnNode makes the node restart the replica's units and records the outcome. run is the
+// context of the controller (or, for a controller that does not run, one that outlives the
+// request): the call has Timeouts.Restart, and its failure is recorded under a context of its own,
+// so that a call that timed out still gets its status and alert written.
+func (c *Controller) restartOnNode(run context.Context, r *registry.Replica, epoch int64) {
+	defer c.wg.Done()
+	call, cancel := context.WithTimeout(run, c.to.Restart)
+	defer cancel()
+	st, err := c.o.Ops.Do(call, r.NodeID, r.Identifier, peerapi.ActionRestart, peerapi.InstanceAction{Epoch: epoch})
+	c.mu.Lock()
+	c.st(r.Identifier).restarting = false
+	c.mu.Unlock()
+	if err == nil {
 		c.observed(r.Identifier, st)
 		c.kick()
-	}()
-	return nil
+		return
+	}
+	if run.Err() != nil {
+		// The daemon is stopping: the node may well have restarted the units. The next daemon
+		// looks at the replica again, as it does after any restart.
+		c.log.Info("replicas: restart interrupted by shutdown", "identifier", r.Identifier, "node", r.NodeID)
+		return
+	}
+	c.log.Error("replicas: restart failed", "identifier", r.Identifier, "node", r.NodeID, "error", err)
+	rec, stop := context.WithTimeout(context.WithoutCancel(run), 10*time.Second)
+	defer stop()
+	c.setStatus(rec, r.Identifier, statusUnhealthy, StepDone, "")
+	c.alert(rec, alerts.Event{
+		Kind: alerts.KindReplicaUnhealthy, Ref: r.Ref, Key: "replica_unhealthy/" + r.Identifier,
+		Title:  titleUnhealthy,
+		Detail: fmt.Sprintf("Restarting the read replica %s of project %s on node %s failed: %v.", r.Identifier, r.Ref, r.NodeID, err),
+	})
 }

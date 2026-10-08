@@ -2,6 +2,7 @@ package replicas
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -177,24 +178,34 @@ func (c *Controller) stepClock(id, step string) time.Duration {
 	return now.Sub(s.stepSince)
 }
 
-// setStatus writes a replica's status, step and failure code unless the row is being removed
-// (GOING_DOWN is never overwritten by the setup or the health check) or is gone. It reports
-// whether it wrote.
-func (c *Controller) setStatus(ctx context.Context, id, status, step, code string) bool {
+// errGoingDown is what writeStatus returns for a status it refused to write over GOING_DOWN.
+var errGoingDown = errors.New("replicas: the replica is being removed")
+
+// writeStatus writes a replica's status, step and failure code unless the row is being removed
+// (GOING_DOWN is never overwritten by the setup or the health check). It returns
+// registry.ErrNotFound for a row that is gone, errGoingDown for one that is being removed, and the
+// registry's own error for a write that failed.
+func (c *Controller) writeStatus(ctx context.Context, id, status, step, code string) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	cur, err := c.reg.GetReplica(ctx, id)
 	if err != nil {
-		return false
+		return err
 	}
 	if cur.Status == statusGoingDown && status != statusGoingDown {
-		return false
+		return errGoingDown
 	}
-	if err := c.reg.SetReplicaStatus(ctx, id, status, step, code); err != nil {
+	return c.reg.SetReplicaStatus(ctx, id, status, step, code)
+}
+
+// setStatus is writeStatus for the controller's own passes, which only need to know whether the
+// row was written: a refusal is silent, a failed write is logged.
+func (c *Controller) setStatus(ctx context.Context, id, status, step, code string) bool {
+	err := c.writeStatus(ctx, id, status, step, code)
+	if err != nil && !errors.Is(err, errGoingDown) && !errors.Is(err, registry.ErrNotFound) {
 		c.log.Warn("replicas: write status", "identifier", id, "status", status, "step", step, "error", err)
-		return false
 	}
-	return true
+	return err == nil
 }
 
 // seedSize is the stored size of the newest completed base backup of ref: what a replica would download.
