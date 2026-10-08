@@ -679,6 +679,169 @@ func TestAnonymousSessionsAreFew(t *testing.T) {
 	})
 }
 
+// A caller with no certificate that opens no stream is closed after AnonFirstStream, long before
+// AnonLife; one that opened a stream is not closed for being idle until AnonLife.
+func TestAnonymousSessionsMustOpenAStreamSoon(t *testing.T) {
+	h := newHarness(t, "n1")
+	n1 := h.nodes["n1"]
+	n1.mgr.o.AnonFirstStream = 300 * time.Millisecond
+	n1.mgr.o.AnonLife = time.Hour
+	h.start()
+	addr := n1.ln.Addr().String()
+	pin := Fingerprint(h.ca.cert.Raw)
+	dial := func() (Session, func()) {
+		conn, err := tls.Dial("tcp", addr, PinnedTLS(pin, nil, time.Now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sess, err := NewSession(conn, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sess, func() { conn.Close() }
+	}
+	silent, closeSilent := dial()
+	defer closeSilent()
+	used, closeUsed := dial()
+	defer closeUsed()
+	st, err := used.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteHeader(st, Header{T: StreamRPC}); err != nil {
+		t.Fatal(err)
+	}
+	// AcceptStream returns when the far end closes the connection.
+	ended := func(s Session) chan error {
+		c := make(chan error, 1)
+		go func() { _, err := s.AcceptStream(); c <- err }()
+		return c
+	}
+	silentEnded, usedEnded := ended(silent), ended(used)
+
+	select {
+	case <-silentEnded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a session that opened no stream was kept")
+	}
+	select {
+	case err := <-usedEnded:
+		t.Fatalf("a session that opened a stream was closed for being idle before AnonLife: %v", err)
+	case <-time.After(600 * time.Millisecond):
+	}
+}
+
+// One address holds only so many sessions without a certificate, however many there is room for in
+// all, and its slots are free again when it lets go.
+func TestAnonymousSessionsAreFewPerAddress(t *testing.T) {
+	h := newHarness(t, "n1")
+	n1 := h.nodes["n1"]
+	n1.mgr.o.MaxAnonPerAddr = 2
+	n1.mgr.o.Mux.Handle("GET "+peerapi.PathJoin, func(w http.ResponseWriter, r *http.Request) { RespondJSON(w, 200, peerapi.JoinChallenge{}) })
+	h.start()
+	a, b := anonClient(t, h, n1), anonClient(t, h, n1)
+	for _, c := range []*Client{a, b} {
+		if err := c.Call(h.ctx, "GET", peerapi.PathJoin, nil, nil); err != nil {
+			t.Fatalf("a session within the limit: %v", err)
+		}
+	}
+	third, err := DialClient(h.ctx, n1.ln.Addr().String(), "n1", PinnedTLS(Fingerprint(h.ca.cert.Raw), nil, time.Now))
+	if err == nil {
+		defer third.Close()
+		if err := third.Call(h.ctx, "GET", peerapi.PathJoin, nil, nil); err == nil {
+			t.Fatal("a third session from one address was served")
+		}
+	}
+	a.Close()
+	eventually(t, "the slot to be free again", func() bool {
+		c, err := DialClient(h.ctx, n1.ln.Addr().String(), "n1", PinnedTLS(Fingerprint(h.ca.cert.Raw), nil, time.Now))
+		if err != nil {
+			return false
+		}
+		defer c.Close()
+		return c.Call(h.ctx, "GET", peerapi.PathJoin, nil, nil) == nil
+	})
+}
+
+// A connection that does not finish its handshake holds a slot for the time it has; one address has
+// only so many, and the rest of its connections are closed at once.
+func TestHandshakesInFlightAreFewPerAddress(t *testing.T) {
+	h := newHarness(t, "n1")
+	n1 := h.nodes["n1"]
+	n1.mgr.o.MaxShakesPerIP = 2
+	h.start()
+	var conns []net.Conn
+	for range 4 {
+		c, err := net.Dial("tcp", n1.ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		conns = append(conns, c)
+	}
+	closed := func() int {
+		n := 0
+		for _, c := range conns {
+			_ = c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			var ne net.Error
+			if _, err := c.Read(make([]byte, 1)); err != nil && !(errors.As(err, &ne) && ne.Timeout()) {
+				n++
+			}
+		}
+		return n
+	}
+	eventually(t, "the connections beyond the limit to be closed", func() bool { return closed() == 2 })
+	// The slots come back when the stalled connections go.
+	for _, c := range conns {
+		c.Close()
+	}
+	eventually(t, "the address to handshake again", func() bool {
+		c, err := DialClient(h.ctx, n1.ln.Addr().String(), "n1", PinnedTLS(Fingerprint(h.ca.cert.Raw), nil, time.Now))
+		if err != nil {
+			return false
+		}
+		c.Close()
+		return true
+	})
+}
+
+// Close does not wait for a handshake that is in progress: it ends the dial.
+func TestClientCloseDoesNotWaitForADial(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() { // takes connections and says nothing: the handshake never ends
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	c := &Client{addr: ln.Addr().String(), cfg: PinnedTLS("00", nil, time.Now), node: "x"}
+	called := make(chan error, 1)
+	go func() { called <- c.Call(context.Background(), "GET", peerapi.PathPing, nil, nil) }()
+	time.Sleep(300 * time.Millisecond) // the call is dialing
+	done := make(chan struct{})
+	go func() { c.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close waits for the dial")
+	}
+	select {
+	case err := <-called:
+		if !errors.Is(err, ErrNoSession) {
+			t.Fatalf("the call that was dialing: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the dial was not ended by Close")
+	}
+}
+
 // failingListener fails the first n accepts with err.
 type failingListener struct {
 	net.Listener

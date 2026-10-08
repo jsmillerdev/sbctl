@@ -19,9 +19,11 @@ type Client struct {
 	cfg  *tls.Config
 	node string
 
-	mu     sync.Mutex
-	sess   Session
-	closed bool
+	mu         sync.Mutex
+	sess       Session
+	closed     bool
+	dialing    chan struct{} // non-nil while a session is being dialed; closed when that ends
+	stopDialer context.CancelFunc
 }
 
 // DialClient connects to addr with cfg (ClientTLS, PinnedTLS). node names the far end in errors.
@@ -54,22 +56,54 @@ func dialSession(ctx context.Context, addr string, cfg *tls.Config) (Session, er
 	return sess, nil
 }
 
-// session returns the open session, dialing a new one when the last has ended.
+// session returns the open session, dialing a new one when the last has ended. One caller dials at a
+// time and the others wait for its answer; the lock is not held while dialing, so that Close does not
+// wait for a handshake and ends the dial instead.
 func (c *Client) session(ctx context.Context) (Session, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil, fmt.Errorf("%w: the client is closed", ErrNoSession)
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("%w: the client is closed", ErrNoSession)
+		}
+		if c.sess != nil && !c.sess.IsClosed() {
+			s := c.sess
+			c.mu.Unlock()
+			return s, nil
+		}
+		if wait := c.dialing; wait != nil {
+			c.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return nil, fmt.Errorf("%w: %v", ErrNoSession, ctx.Err())
+			}
+		}
+		done := make(chan struct{})
+		dctx, cancel := context.WithCancel(ctx)
+		c.dialing, c.stopDialer = done, cancel
+		c.mu.Unlock()
+
+		sess, err := dialSession(dctx, c.addr, c.cfg)
+		cancel()
+
+		c.mu.Lock()
+		c.dialing, c.stopDialer = nil, nil
+		close(done)
+		if err != nil {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("%w: %v", ErrNoSession, err)
+		}
+		if c.closed {
+			c.mu.Unlock()
+			_ = sess.Close()
+			return nil, fmt.Errorf("%w: the client is closed", ErrNoSession)
+		}
+		c.sess = sess
+		c.mu.Unlock()
+		return sess, nil
 	}
-	if c.sess != nil && !c.sess.IsClosed() {
-		return c.sess, nil
-	}
-	sess, err := dialSession(ctx, c.addr, c.cfg)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrNoSession, err)
-	}
-	c.sess = sess
-	return sess, nil
 }
 
 // open opens a stream that starts with h. A session that fails to open one is closed and replaced
@@ -113,6 +147,9 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true
+	if c.stopDialer != nil {
+		c.stopDialer()
+	}
 	if c.sess == nil {
 		return nil
 	}

@@ -53,12 +53,16 @@ type Options struct {
 	RevokeGrace     time.Duration // 10 s: how long a session outlives its node's admission
 	AnonReadTimeout time.Duration // 10 s: how long a caller with no certificate has to send its request
 	AnonLife        time.Duration // 2 min: how long its session may be open before it is closed once idle
+	AnonFirstStream time.Duration // 10 s: how long its session has to open its first stream
 	MaxAnonSessions int           // 32: sessions of callers with no certificate open at once
+	MaxAnonPerAddr  int           // 4: of which one address may hold this many
+	MaxShakesPerIP  int           // 16: TLS handshakes in flight from one address, any caller
 }
 
 // What a caller with no certificate (a joiner) may cost. Its request is a few KiB, so the body is
-// bounded far below maxRPCBody; its session is short, small (anonMuxConfig) and few, and it may have
-// only so many streams open. An open session is closed at anonSessionMax whatever it is doing.
+// bounded far below maxRPCBody; its session is short, small (anonMuxConfig) and few (in all, and from one
+// address), it has to open a stream soon after the handshake, and it may have only so many streams open.
+// An open session is closed at anonSessionMax whatever it is doing.
 const (
 	maxAnonBody    = 64 << 10
 	maxAnonStreams = 16
@@ -83,13 +87,15 @@ func (o *Options) fill() {
 	}
 	for p, d := range map[*time.Duration]time.Duration{&o.PingEvery: 5 * time.Second, &o.Tick: 2 * time.Second,
 		&o.DialDelay: 3 * time.Second, &o.RevokeGrace: 10 * time.Second, &o.AnonReadTimeout: 10 * time.Second,
-		&o.AnonLife: 2 * time.Minute} {
+		&o.AnonLife: 2 * time.Minute, &o.AnonFirstStream: 10 * time.Second} {
 		if *p <= 0 {
 			*p = d
 		}
 	}
-	if o.MaxAnonSessions <= 0 {
-		o.MaxAnonSessions = 32
+	for p, d := range map[*int]int{&o.MaxAnonSessions: 32, &o.MaxAnonPerAddr: 4, &o.MaxShakesPerIP: 16} {
+		if *p <= 0 {
+			*p = d
+		}
 	}
 }
 
@@ -103,6 +109,8 @@ type Manager struct {
 
 	rpcOnce sync.Once
 	anon    atomic.Int32 // sessions of callers with no certificate that are open
+	anonIP  perAddr      // of which each address holds so many
+	shaking perAddr      // TLS handshakes in flight, by address
 
 	mu       sync.Mutex
 	sessions map[string]*peerConn
@@ -545,10 +553,18 @@ func (m *Manager) accept(ctx context.Context, conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	ip := remoteIP(conn)
+	if !m.shaking.take(ip, m.o.MaxShakesPerIP) { // a handshake that does not finish holds its slot for 10 s
+		m.o.Log.Debug("mesh: too many handshakes from one address", "remote", ip)
+		_ = conn.Close()
+		return
+	}
 	tc := tls.Server(conn, serverTLS(m.credentials, m.admit, m.o.Now))
 	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := tc.HandshakeContext(hctx); err != nil {
+	err := tc.HandshakeContext(hctx)
+	m.shaking.drop(ip)
+	if err != nil {
 		m.o.Log.Debug("mesh: handshake refused", "remote", conn.RemoteAddr().String(), "error", err)
 		_ = conn.Close()
 		return
@@ -558,7 +574,7 @@ func (m *Manager) accept(ctx context.Context, conn net.Conn) {
 		node, _ = NodeIDOf(certs[0])
 	}
 	if node == "" { // a joiner: serve it without keeping the session
-		m.serveAnonymous(tc, remoteIP(conn))
+		m.serveAnonymous(tc, ip)
 		return
 	}
 	sess, err := NewSession(tc, false)
@@ -578,8 +594,8 @@ func remoteIP(c net.Conn) string {
 }
 
 // serveAnonymous serves the streams of a caller that presented no certificate until its session
-// ends. There is room for MaxAnonSessions at a time, and a session that has been open for AnonLife is
-// closed once nothing runs on it.
+// ends. There is room for MaxAnonSessions at a time, MaxAnonPerAddr of them for one address, and a
+// session that opens no stream within AnonFirstStream is closed (see reapAnonymous).
 func (m *Manager) serveAnonymous(conn net.Conn, remote string) {
 	if int(m.anon.Add(1)) > m.o.MaxAnonSessions {
 		m.anon.Add(-1)
@@ -588,22 +604,44 @@ func (m *Manager) serveAnonymous(conn net.Conn, remote string) {
 		return
 	}
 	defer m.anon.Add(-1)
-	sess, err := newAnonSession(conn)
+	if !m.anonIP.take(remote, m.o.MaxAnonPerAddr) {
+		m.o.Log.Debug("mesh: too many sessions without a certificate from one address", "remote", remote)
+		_ = conn.Close()
+		return
+	}
+	defer m.anonIP.drop(remote)
+	s, err := newAnonSession(conn)
 	if err != nil {
 		_ = conn.Close()
 		return
 	}
+	sess := &streamSeen{Session: s}
 	go m.reapAnonymous(sess)
 	m.serveStreams(sess, "", remote)
 	_ = sess.Close()
 }
 
-// reapAnonymous closes sess once it has been open for AnonLife and has no stream, and at anonSessionMax
-// in any case. A joiner needs its session for the time of its requests; a stranger that keeps one open
-// (the keepalive holds it) gets no more than that.
-func (m *Manager) reapAnonymous(sess Session) {
-	life := m.o.AnonLife
-	tick := time.NewTicker(min(max(life/4, 10*time.Millisecond), 5*time.Second))
+// streamSeen is a Session that notes whether the far end ever opened a stream.
+type streamSeen struct {
+	Session
+	seen atomic.Bool
+}
+
+func (s *streamSeen) AcceptStream() (net.Conn, error) {
+	st, err := s.Session.AcceptStream()
+	if err == nil {
+		s.seen.Store(true)
+	}
+	return st, err
+}
+
+// reapAnonymous closes sess when it opened no stream within AnonFirstStream, once it has been open for
+// AnonLife and has no stream, and at anonSessionMax in any case. A joiner opens its first stream as soon
+// as the handshake is done and needs its session for the time of its requests; a stranger that keeps one
+// open (the keepalive holds it) gets no more than that.
+func (m *Manager) reapAnonymous(sess *streamSeen) {
+	life, first := m.o.AnonLife, m.o.AnonFirstStream
+	tick := time.NewTicker(min(max(min(life, first)/4, 10*time.Millisecond), 5*time.Second))
 	defer tick.Stop()
 	start := time.Now()
 	for {
@@ -612,11 +650,42 @@ func (m *Manager) reapAnonymous(sess Session) {
 			return
 		case <-tick.C:
 		}
-		if age := time.Since(start); age >= anonSessionMax || (age >= life && sess.NumStreams() == 0) {
+		age := time.Since(start)
+		if age >= anonSessionMax || (age >= first && !sess.seen.Load()) || (age >= life && sess.NumStreams() == 0) {
 			_ = sess.Close()
 			return
 		}
 	}
+}
+
+// perAddr counts what each remote address holds at once.
+type perAddr struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+// take reserves one for addr; false when addr holds max already.
+func (p *perAddr) take(addr string, max int) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.n == nil {
+		p.n = map[string]int{}
+	}
+	if p.n[addr] >= max {
+		return false
+	}
+	p.n[addr]++
+	return true
+}
+
+func (p *perAddr) drop(addr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.n[addr] <= 1 {
+		delete(p.n, addr)
+		return
+	}
+	p.n[addr]--
 }
 
 // register makes pc the session to its node. When there already is one (both sides dialed at
