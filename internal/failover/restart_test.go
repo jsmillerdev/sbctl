@@ -440,3 +440,45 @@ func TestTheDaemonDoesNotStartAMoveThatTheWiringFinishedMeanwhile(t *testing.T) 
 		t.Fatalf("the move ran twice:\n%v", w.snapshot())
 	}
 }
+
+// The whole path of a CLI over real sockets: the run is cut, the first daemon answers "restarting",
+// and the client follows the move on the daemon that started, which continues it.
+func TestAClientFollowsAServerMoveAcrossTheRestartOverTheControlSocket(t *testing.T) {
+	followPollWas := followPoll
+	followPoll = 5 * time.Millisecond
+	defer func() { followPoll = followPollWas }()
+	w := serverWorld(t)
+	w.frozen = true // the promotion is shown while this process still has the standby's registry
+	first, _ := rigFor(t, w.orch())
+	var steps []string
+	mv, err := first.RunServer(w.ctx, ServerOptions{}, func(s registry.MoveStep) { steps = append(steps, s.Name) })
+	var re *RemoteError
+	if !errors.Is(err, ErrRestarting) || !errors.As(err, &re) || re.Code != "restarting" || mv == nil {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if !strings.Contains(strings.Join(steps, ","), "promote-system") {
+		t.Fatalf("steps seen before the cut: %v", steps)
+	}
+
+	// The daemon that starts: it leads, writes, and continues the move behind its own socket.
+	w.frozen = false
+	w.restarted(2)
+	daemon := w.orch()
+	second, _ := rigFor(t, daemon)
+	done := make(chan error, 1)
+	go func() {
+		_, err := daemon.FailoverServer(w.ctx, ServerOptions{Resume: true}) // what the wiring does
+		done <- err
+	}()
+	var followed []string
+	moved, err := second.Follow(w.ctx, 2, func(s registry.MoveStep) { followed = append(followed, s.Name) })
+	if err != nil || moved == nil || moved.State != registry.MoveDone || moved.Epoch != 2 {
+		t.Fatalf("follow: %+v, %v", moved, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(followed, ","), "dns") && moved.Steps == nil {
+		t.Fatalf("followed steps: %v", followed)
+	}
+}

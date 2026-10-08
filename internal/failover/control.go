@@ -239,6 +239,8 @@ func errorEvent(err error) event {
 		ev.Code = "plan_changed"
 	case errors.Is(err, ErrNoCluster):
 		ev.Code = "no_cluster"
+	case errors.Is(err, ErrRestarting):
+		ev.Code = "restarting"
 	}
 	return ev
 }
