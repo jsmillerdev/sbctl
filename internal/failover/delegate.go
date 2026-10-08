@@ -95,6 +95,9 @@ func (o *Orchestrator) delegateServer(ctx context.Context, opts ServerOptions, r
 	if !ok {
 		return nil, fmt.Errorf("failover: this node cannot ask %s to take over: run it on %s", run.to.Name, run.to.Name)
 	}
+	// The slot this move holds is lent to the node that runs the switchover: its quiesce of this node
+	// (handleQuiesce) arrives while the move is waiting for it.
+	defer o.delegate(run.to.ID)()
 	if err := remote.StartServer(ctx, run.to.ID, opts); err != nil {
 		var re *mesh.RemoteError
 		// The refusal is a 409 whose text is the RefusedError (the peer API's code does not

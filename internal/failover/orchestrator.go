@@ -66,6 +66,9 @@ type Orchestrator struct {
 
 	mu   sync.Mutex
 	busy bool
+	// delegating is the node that runs a switchover for this node's own move (delegate.go) while
+	// the move holds the slot: that node's quiesce and resume are the move itself, not another move.
+	delegating string
 
 	lockMu sync.Mutex
 	locks  map[string]*sync.Mutex
@@ -153,6 +156,32 @@ func (o *Orchestrator) acquire() (release func(), err error) {
 		o.busy = false
 		o.mu.Unlock()
 	}, nil
+}
+
+// acquireForDelegate is acquire for a request from the node that this node's own move has asked to
+// run a switchover. The move holds the slot for the whole delegation, and the node asks the leader
+// to quiesce in the middle of it: that request is the move continuing, so it gets through without
+// taking the slot a second time. Any other caller finds the slot held, as before.
+func (o *Orchestrator) acquireForDelegate(node string) (release func(), err error) {
+	o.mu.Lock()
+	if o.busy && o.delegating != "" && o.delegating == node {
+		o.mu.Unlock()
+		return func() {}, nil
+	}
+	o.mu.Unlock()
+	return o.acquire()
+}
+
+// delegate marks the slot as held for a switchover that node runs, until the returned function is called.
+func (o *Orchestrator) delegate(node string) (done func()) {
+	o.mu.Lock()
+	o.delegating = node
+	o.mu.Unlock()
+	return func() {
+		o.mu.Lock()
+		o.delegating = ""
+		o.mu.Unlock()
+	}
 }
 
 // Busy reports whether a move is running on this node.

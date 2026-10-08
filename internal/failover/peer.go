@@ -414,10 +414,12 @@ func (o *Orchestrator) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 	// One quiesce at a time, and not beside a move of this node's own: a second request waits for
 	// the first and answers from its record, and a project move that started during the stops would
 	// stop or start the same clusters. Only the quiesce a switchover is waiting for holds the slot;
-	// the leader refuses to start another move until it has finished.
+	// the leader refuses to start another move until it has finished. A switchover that this node
+	// started with --to holds the slot itself while the survivor runs it, and the survivor's
+	// quiesce is that move continuing: it passes (acquireForDelegate).
 	o.quiesceMu.Lock()
 	defer o.quiesceMu.Unlock()
-	release, err := o.acquire()
+	release, err := o.acquireForDelegate(peer.Node)
 	if err != nil {
 		writePeerError(w, http.StatusConflict, "busy", "a move is running on the leader")
 		return

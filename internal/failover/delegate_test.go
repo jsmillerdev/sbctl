@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -77,6 +78,76 @@ func TestTheLeaderHasTheSurvivorRunTheSwitchoverAndFollowsIt(t *testing.T) {
 	// This node did none of the work: its registry stops partway and the survivor's takes over.
 	for _, e := range []string{"quiesce", "stop ", "local.stop", "provider.", "marker", "promote", "registry.CreateMove"} {
 		w.assertNever(e)
+	}
+}
+
+// survivingRemote plays the survivor's daemon: when the leader asks it to run the switchover, it
+// does what the real one does first and calls the leader's quiesce, from inside the leader's
+// delegation, which is still holding the leader's move slot.
+type survivingRemote struct {
+	*scriptedRemote
+	onStart func(ctx context.Context) error
+}
+
+func (r survivingRemote) StartServer(ctx context.Context, node string, o ServerOptions) error {
+	if err := r.onStart(ctx); err != nil {
+		return err
+	}
+	return r.scriptedRemote.StartServer(ctx, node, o)
+}
+
+// A switchover started on the leader with --to can run: the survivor's quiesce, its repeat and its
+// resume reach the leader's handlers while the leader's own move waits for the survivor, and no
+// other move or caller gets through the slot the delegation holds.
+func TestTheSurvivorsQuiesceAndResumeReachTheLeaderThatDelegated(t *testing.T) {
+	rem := &scriptedRemote{statuses: []ServerStatus{{State: "done", Next: 1, Move: &moveJSON{ID: 5, Scope: "server", Kind: "switchover", From: "n1", To: "n2", Epoch: 2, State: "done"}}}}
+	w := newWorld(t) // n1 leads and is this node
+	var o *Orchestrator
+	var first, again QuiesceResult
+	var codes struct{ first, again, stranger, resume int }
+	var projectErr error
+	sr := survivingRemote{scriptedRemote: rem}
+	sr.onStart = func(ctx context.Context) error {
+		codes.first = serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, &first).Code
+		codes.again = serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, &again).Code
+		// The slot is the delegation's and only the node it was lent to may use it.
+		codes.stranger = serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n3", QuiesceRequest{Epoch: 2, To: "n3"}, nil).Code
+		_, projectErr = o.FailoverProject(ctx, ProjectOptions{Ref: refA})
+		codes.resume = serve(t, o, "POST "+PathResume, PathResume, "n2", struct{}{}, nil).Code
+		return nil
+	}
+	o = w.orch(func(d *Deps) { rem.Peers = d.Peers; d.Peers = sr })
+
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{To: "n2"})
+	if err != nil || mv == nil || mv.State != registry.MoveDone {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if codes.first != http.StatusOK || codes.again != http.StatusOK {
+		t.Fatalf("the survivor's quiesce was answered %d, its repeat %d", codes.first, codes.again)
+	}
+	for _, ref := range []string{config.SystemRef, refA, refB} {
+		if first.LSNs[ref] != w.lsn[ref] || again.LSNs[ref] != w.lsn[ref] {
+			t.Errorf("%s: stopped at %q, then %q, want %q", ref, first.LSNs[ref], again.LSNs[ref], w.lsn[ref])
+		}
+	}
+	if codes.stranger != http.StatusConflict {
+		t.Fatalf("a quiesce from a node the slot was not lent to: %d", codes.stranger)
+	}
+	if !errors.Is(projectErr, ErrBusy) {
+		t.Fatalf("a project move beside the delegation: %v", projectErr)
+	}
+	if codes.resume != http.StatusOK || !w.has("local.start system") {
+		t.Fatalf("the survivor's undo: %d, events %v", codes.resume, w.snapshot())
+	}
+	if w.count("local.stop system") != 1 {
+		t.Fatalf("the repeat stopped the system cluster again: %d", w.count("local.stop system"))
+	}
+	if o.Busy() {
+		t.Fatal("the slot was not given back when the delegation ended")
+	}
+	// Once the delegation is over, a quiesce takes the slot like any other.
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("a quiesce after the delegation: %d %s", rec.Code, rec.Body)
 	}
 }
 
