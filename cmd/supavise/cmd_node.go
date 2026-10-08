@@ -87,13 +87,23 @@ S3-compatible backup storage, which the new server reads its first copy from.`,
 		Short: "Create a one-time join token (run on the leader)",
 		Long: `Creates a token that lets one server join, and prints it. The token holds the leader's
 address, the fingerprint of the cluster CA and a secret; the leader keeps only the secret's hash. It works
-once and expires after --ttl. Refused on a node that is not the leader and when [backup] is a file://
-backend.
+once and expires after --ttl. Refused on a node that is not the leader, when [backup] is a file://
+backend and while the host is behind this release (run "supavise system converge" first).
 
 The first token also gives this server its cluster identity (a certificate signed by the CA that the
 master key derives); the daemon restarts once to listen on the peer port.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// The first token gives this server its cluster identity and restarts the daemon to listen on
+			// the peer port, so it waits for a converged host like the join does, before the registry is
+			// opened.
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			if err := hostReady(cfg); err != nil {
+				return err
+			}
 			env, closeEnv, err := writableNodeEnv(cmd)
 			if err != nil {
 				return err
@@ -290,13 +300,19 @@ replicas from the current leader's archive, and keeps its identity.`,
 // when the server holds the identity of a node that was removed from its cluster: that identity is
 // revoked, the join deletes it without more ado, and there is nothing to ask or to stop.
 func confirmJoinReset(cmd *cobra.Command, o *cluster.JoinOptions, yes, tokenFromStdin bool) (removed bool, err error) {
-	if rec, _ := cluster.ReadFenced(o.Cfg); rec != nil && rec.Removed {
+	rec, _ := cluster.ReadFenced(o.Cfg)
+	if rec != nil && rec.Removed {
 		return true, nil
 	}
 	if err := o.CheckInputs(); err != nil {
 		return false, err
 	}
-	err = confirmReset(cmd.OutOrStdout(), cmd.InOrStdin(), leadsHere(cmd.Context(), o.ConfigPath, app.RegistryDSNs(o.Cfg)), cluster.LocalData(o.Cfg), o.Cfg.Failover.KeepDiverged(), yes)
+	// A fenced node does not lead, and its database is stopped, which would leave the question open.
+	lead := cluster.LeadsNo
+	if rec == nil {
+		lead = leadsHere(cmd.Context(), o.Cfg, o.ConfigPath, app.RegistryDSNs(o.Cfg))
+	}
+	err = confirmReset(cmd.OutOrStdout(), cmd.InOrStdin(), lead, cluster.LocalData(o.Cfg), o.Cfg.Failover.KeepDiverged(), yes)
 	if err != nil && tokenFromStdin && !yes {
 		err = fmt.Errorf("%w (the token was read from standard input, which leaves nothing to answer with: pass --yes)", err)
 	}
@@ -305,8 +321,9 @@ func confirmJoinReset(cmd *cobra.Command, o *cluster.JoinOptions, yes, tokenFrom
 
 // confirmReset says what `node join --reset` does to this server and asks the operator to agree; yes
 // agrees in advance. A server that leads its cluster is refused without yes, whatever is typed: its
-// projects stop, and the cluster has no leader until another node is promoted.
-func confirmReset(w io.Writer, in io.Reader, leads bool, data []string, keep time.Duration, yes bool) error {
+// projects stop, and the cluster has no leader until another node is promoted. So is a server whose
+// leadership could not be checked, because a leader whose database is down is still a leader.
+func confirmReset(w io.Writer, in io.Reader, lead cluster.Leadership, data []string, keep time.Duration, yes bool) error {
 	fmt.Fprintf(w, "--reset gives up this server's place in its cluster: it stops everything that runs here, sets the data below aside (kept %d days, then removed), deletes the node's cluster identity and joins as a new node.\n", int(keep.Hours()/24))
 	for _, d := range data {
 		fmt.Fprintf(w, "  %s\n", d)
@@ -314,10 +331,17 @@ func confirmReset(w io.Writer, in io.Reader, leads bool, data []string, keep tim
 	if len(data) == 0 {
 		fmt.Fprintln(w, "  (no project data on this server)")
 	}
-	if leads {
+	switch lead {
+	case cluster.LeadsYes:
 		fmt.Fprintln(w, "This server is the LEADER of its cluster: its projects stop and the cluster has no leader until another node is promoted.")
 		if !yes {
 			return errors.New("not reset: this server leads its cluster; promote another node first, or pass --yes")
+		}
+		return nil
+	case cluster.LeadsUnknown:
+		fmt.Fprintln(w, "Whether this server is the LEADER of its cluster could not be checked: its system cluster, or the registry in it, did not answer. If it is, its projects stop and the cluster has no leader until another node is promoted.")
+		if !yes {
+			return errors.New("not reset: it could not be checked whether this server leads its cluster; start the system cluster and try again, or pass --yes")
 		}
 		return nil
 	}

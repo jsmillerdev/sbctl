@@ -295,21 +295,23 @@ func TestConfirmReset(t *testing.T) {
 	keep := 3 * 24 * time.Hour
 	for _, tc := range []struct {
 		name  string
-		leads bool
+		lead  cluster.Leadership
 		yes   bool
 		input string
 		ok    bool
 	}{
-		{"a member that is told yes", false, false, "y\n", true},
-		{"a member that is told yes in words", false, false, "YES\n", true},
-		{"a member that is told no", false, false, "n\n", false},
-		{"a member and no answer", false, false, "", false},
-		{"a member with --yes", false, true, "", true},
-		{"the leader and a typed yes", true, false, "y\n", false},
-		{"the leader with --yes", true, true, "", true},
+		{"a member that is told yes", cluster.LeadsNo, false, "y\n", true},
+		{"a member that is told yes in words", cluster.LeadsNo, false, "YES\n", true},
+		{"a member that is told no", cluster.LeadsNo, false, "n\n", false},
+		{"a member and no answer", cluster.LeadsNo, false, "", false},
+		{"a member with --yes", cluster.LeadsNo, true, "", true},
+		{"the leader and a typed yes", cluster.LeadsYes, false, "y\n", false},
+		{"the leader with --yes", cluster.LeadsYes, true, "", true},
+		{"a server that cannot tell and a typed yes", cluster.LeadsUnknown, false, "y\n", false},
+		{"a server that cannot tell with --yes", cluster.LeadsUnknown, true, "", true},
 	} {
 		var out bytes.Buffer
-		err := confirmReset(&out, strings.NewReader(tc.input), tc.leads, data, keep, tc.yes)
+		err := confirmReset(&out, strings.NewReader(tc.input), tc.lead, data, keep, tc.yes)
 		if (err == nil) != tc.ok {
 			t.Errorf("%s: %v", tc.name, err)
 		}
@@ -319,12 +321,15 @@ func TestConfirmReset(t *testing.T) {
 				t.Errorf("%s: the output does not list %s:\n%s", tc.name, d, text)
 			}
 		}
-		if !strings.Contains(text, "kept 3 days") || strings.Contains(text, "LEADER") != tc.leads {
+		if !strings.Contains(text, "kept 3 days") || strings.Contains(text, "LEADER") != tc.lead.MayLead() {
 			t.Errorf("%s: the output:\n%s", tc.name, text)
+		}
+		if tc.lead == cluster.LeadsUnknown && !tc.yes && (err == nil || !strings.Contains(err.Error(), "could not be checked")) {
+			t.Errorf("%s: the refusal does not say why: %v", tc.name, err)
 		}
 	}
 	var out bytes.Buffer
-	if err := confirmReset(&out, strings.NewReader("y\n"), false, nil, keep, false); err != nil || !strings.Contains(out.String(), "no project data") {
+	if err := confirmReset(&out, strings.NewReader("y\n"), cluster.LeadsNo, nil, keep, false); err != nil || !strings.Contains(out.String(), "no project data") {
 		t.Errorf("a server with no data: %v\n%s", err, out.String())
 	}
 }
@@ -392,6 +397,7 @@ type joinedHost struct {
 	cfg     *config.Config
 	data    string // a data directory a reset would set aside
 	leads   bool
+	unknown bool // leads cannot be told: the system cluster does not answer
 	stopped int
 	asked   int // how often the units were wanted
 }
@@ -434,7 +440,15 @@ func newJoinedHost(t *testing.T) *joinedHost {
 		h.asked++
 		return func(context.Context) error { h.stopped++; return nil }, func() {}, nil
 	}
-	leadsHere = func(context.Context, string, []string) bool { return h.leads }
+	leadsHere = func(context.Context, *config.Config, string, []string) cluster.Leadership {
+		switch {
+		case h.unknown:
+			return cluster.LeadsUnknown
+		case h.leads:
+			return cluster.LeadsYes
+		}
+		return cluster.LeadsNo
+	}
 	seedSystemStandby = func(context.Context, peerapi.SystemBootstrap) error { return nil }
 	seedPreflight = func(context.Context) error { return nil }
 	t.Cleanup(func() {
@@ -555,6 +569,34 @@ func TestNodeJoinResetAsksBeforeItStopsAnything(t *testing.T) {
 	}
 }
 
+// A server whose database does not answer may still lead its cluster: the reset is refused without --yes
+// and says that leadership could not be checked. A fenced node does not lead, and its stopped database
+// is not held against it.
+func TestNodeJoinResetWhenLeadershipCannotBeChecked(t *testing.T) {
+	h := newJoinedHost(t)
+	file := h.token(t, deadAddr(t))
+	h.unknown = true
+	rootCmd.SetIn(strings.NewReader("y\n"))
+	out, err := run(t, "node", "join", "--reset", "--token-file", file)
+	if err == nil || !strings.Contains(err.Error(), "could not be checked") || !strings.Contains(out, "LEADER") || strings.Contains(out, "Go ahead?") {
+		t.Fatalf("leadership unknown, a typed yes: %v\n%s", err, out)
+	}
+	h.unchanged(t, "leadership unknown")
+
+	rec := cluster.FencedRecord{Epoch: 2, Leader: "n2", Reason: "replaced as leader", At: time.Now()}
+	if err := cluster.WriteFenced(h.cfg, rec); err != nil {
+		t.Fatal(err)
+	}
+	rootCmd.SetIn(strings.NewReader("no\n"))
+	out, err = run(t, "node", "join", "--reset", "--token-file", file)
+	if err == nil || !strings.Contains(err.Error(), "not reset") || !strings.Contains(out, "Go ahead? [y/N]") || strings.Contains(out, "LEADER") {
+		t.Fatalf("a fenced node: %v\n%s", err, out)
+	}
+	if h.asked != 0 || h.stopped != 0 {
+		t.Errorf("a fenced node that answered no: the units were wanted %d times and stopped %d times", h.asked, h.stopped)
+	}
+}
+
 func mustRead(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -616,7 +658,7 @@ func TestNodeCommandsRefuseWhileTheHostIsBehind(t *testing.T) {
 	if err := hostsetup.WriteMarker(h.cfg.StateDir, hostsetup.Marker{Revision: hostsetup.Revision - 1, Version: "old", At: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	for _, args := range [][]string{{"node", "join", "--token-file", h.token(t, deadAddr(t))}, {"node", "rejoin"}} {
+	for _, args := range [][]string{{"node", "token"}, {"node", "join", "--token-file", h.token(t, deadAddr(t))}, {"node", "rejoin"}} {
 		_, err := run(t, args...)
 		if err == nil || !strings.Contains(err.Error(), "system converge") {
 			t.Errorf("supavise %s with the host behind: %v", strings.Join(args, " "), err)

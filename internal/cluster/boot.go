@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -79,8 +81,9 @@ type Evidence struct {
 // the registry has not caught up with yet (the failover procedure wrote the marker and promoted the
 // cluster): the node leads at that epoch, and the claims of nodes that still name the old leader at the
 // old epoch are stale. The node's own promote.ok is such a source, so a promotion made while the backup
-// store could not be written still starts as the leader it was made for. A node that is a primary while the registry names another leader, and that no
-// source names, is a stale or accidental primary and does not start.
+// store could not be written still starts as the leader it was made for. A node that is a primary while
+// the registry names another leader, and that no source names, is a stale or accidental primary and
+// does not start.
 func Decide(ev Evidence) BootDecision {
 	d := BootDecision{Role: RoleLeader, Joined: true, SelfID: ev.SelfID, Epoch: ev.Epoch, Leader: ev.SelfID}
 	fenced := func(epoch int64, leader, why string) BootDecision {
@@ -206,25 +209,79 @@ func DecideBoot(ctx context.Context, env BootEnv) (BootDecision, error) {
 	return d, nil
 }
 
+// Leadership is what LeadsHere found out about this server.
+type Leadership int
+
+const (
+	// LeadsNo: the server is not the leader of its cluster: it has no cluster identity, its system cluster
+	// is a standby or holds no primary's data, or the registry in it names another node.
+	LeadsNo Leadership = iota
+	// LeadsYes: the system cluster answers as a primary and the registry in it names this node.
+	LeadsYes
+	// LeadsUnknown: the database or the registry in it did not answer, and the system cluster's data could
+	// be a primary's. A caller that stops something on the strength of the answer treats this server as
+	// the leader.
+	LeadsUnknown
+)
+
+func (l Leadership) String() string {
+	switch l {
+	case LeadsYes:
+		return "leads"
+	case LeadsUnknown:
+		return "cannot tell"
+	}
+	return "does not lead"
+}
+
+// MayLead is true for a server that leads its cluster or might.
+func (l Leadership) MayLead() bool { return l != LeadsNo }
+
 // LeadsHere reports whether this server is the leader of its cluster as far as its own database says:
 // the system cluster answers as a primary within a few seconds and the registry in it names this node as
-// the leader. A server whose database is stopped, or is a standby, or names another leader, is not.
-func LeadsHere(ctx context.Context, configPath string, dsns []string) bool {
+// the leader. A server whose database is stopped does not lead when nothing there could be a primary's
+// (no data, or a standby's), and is LeadsUnknown otherwise: a leader whose database is slow or down is
+// still a leader.
+func LeadsHere(ctx context.Context, cfg *config.Config, configPath string, dsns []string) Leadership {
 	creds, err := LoadCredentials(config.ClusterDir(configPath))
 	if err != nil {
-		return false
+		return LeadsNo
+	}
+	unknown := LeadsNo
+	if mayHoldPrimary(cfg) {
+		unknown = LeadsUnknown
 	}
 	dsn, inRecovery, err := probeSystem(ctx, dsns, 3*time.Second)
-	if err != nil || inRecovery {
-		return false
+	if err != nil {
+		return unknown
+	}
+	if inRecovery {
+		return LeadsNo
 	}
 	reg, err := registry.OpenReadOnly(ctx, dsn)
 	if err != nil {
-		return false
+		return LeadsUnknown
 	}
 	defer reg.Close()
 	cl, err := reg.GetCluster(ctx)
-	return err == nil && cl.Leader == creds.NodeID
+	switch {
+	case err != nil:
+		return LeadsUnknown
+	case cl.Leader == creds.NodeID:
+		return LeadsYes
+	}
+	return LeadsNo
+}
+
+// mayHoldPrimary is false when the system cluster's data directory is missing or is a standby's, which
+// is all a stopped database can be told by. A directory that cannot be looked at may be a primary's.
+func mayHoldPrimary(cfg *config.Config) bool {
+	data := cfg.Paths().PostgresData(config.SystemRef)
+	if _, err := os.Stat(data); err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	_, err := os.Stat(filepath.Join(data, "standby.signal"))
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // probeSystem asks each candidate DSN whether its cluster is in recovery, retrying until wait ends.
