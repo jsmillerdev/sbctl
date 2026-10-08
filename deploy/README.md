@@ -410,21 +410,21 @@ The `t` types are burstable: they run well while load is light and slow down whe
 
 ### Project sizes and disk
 
-Each project has a compute size, as on hosted Supabase: Nano, Micro, Small, Medium, Large, XL, 2XL and up to 16XL. New projects are Micro (1 GB memory cap, 60 connections). A size sets the memory cap and CPU quota of the project's units, its Postgres settings (`shared_buffers`, `work_mem`, `max_connections`, ...) and its Supavisor pool; the table is in [internal/lifecycle/README.md](../internal/lifecycle/README.md#compute-sizes). Change it in Studio under Project settings, Compute and Disk, with `supavise projects resize <ref> --size small`, or with the Management API (`PATCH /v1/projects/{ref}/billing/addons`). The project restarts (about as long as a pause and a resume) and shows `RESIZING`; if the new size does not start, the old one is put back. Prices are always 0. `supavise projects sizes` lists the sizes and which of them the node can give now.
+Each project has a compute size, as on hosted Supabase: Nano, Micro, Small, Medium, Large, XL, 2XL and up to 16XL. New projects are Micro (1 GB memory cap, 60 connections). A size sets the memory cap and CPU quota of the project's units, its Postgres settings (`shared_buffers`, `work_mem`, `max_connections`, ...) and its Supavisor pool; the table is in [internal/lifecycle/README.md](../internal/lifecycle/README.md#compute-sizes). Change it in Studio under Project settings, Compute and Disk, with `supavise projects resize <ref> --size small`, or with the Management API (`PATCH /v1/projects/{ref}/billing/addons`). The project restarts (about as long as a pause and a resume) and shows `RESIZING`; if the new size does not start, the old one is put back. A resize is refused with the setting named when the Postgres or pooler settings saved for the project do not fit the new size (for example a `shared_buffers` of 3GB on a Micro), so change that setting first. Prices are always 0. `supavise projects sizes` lists the sizes and which of them the node can give now.
 
-A size is a memory cap, not a reservation. The node accepts sizes while the caps of its projects add up to its memory times `[compute] overcommit` (default 3, because an idle project uses about 150 MB of a 1 GB cap) and refuses a create or resize beyond that, and any size that needs more cores than the node has, with the reason. What that means for the default instance:
+A size is a memory cap, not a reservation. The node accepts sizes while the caps of its projects add up to its memory times `[compute] overcommit` (default 6, because an idle project uses about 150 MB of a 1 GB cap, which is what the table above counts on) and refuses a create with a size, a branch, a restore as a new project, a resize and the resume of a paused project beyond that, and any size that needs more cores than the node has, with the reason. A create without a size takes Micro and is not refused. What that means for the default instance:
 
-| Node memory | Room for caps at overcommit 3 | Micro projects | Small projects | Medium projects |
+| Node memory | Room for caps at overcommit 6 | Micro projects | Small projects | Medium projects |
 |---|---|---|---|---|
-| 8 GiB (`t4g.large`) | 24 GB | 24 | 12 | 6 |
-| 16 GiB | 48 GB | 48 | 24 | 12 |
-| 32 GiB | 96 GB | 96 | 48 | 24 |
+| 8 GiB (`t4g.large`) | 48 GB | 48 | 24 | 12 |
+| 16 GiB | 96 GB | 96 | 48 | 24 |
+| 32 GiB | 192 GB | 192 | 96 | 48 |
 
 If projects are busy, lower the ratio: at 1 the caps fit in the node's memory, and no combination of busy projects can exhaust it. `supavise status` shows how much is promised.
 
 ```toml
 [compute]
-overcommit = 3        # sum of project memory caps / node memory; SUPAVISE_COMPUTE_OVERCOMMIT
+overcommit = 6        # sum of project memory caps / node memory; SUPAVISE_COMPUTE_OVERCOMMIT
 # node_memory = "16G" # when /proc shows the host's memory and not your VM's
 # node_cpus = 4
 ```

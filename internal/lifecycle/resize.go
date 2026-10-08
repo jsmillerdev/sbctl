@@ -10,6 +10,7 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/fleet"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
 	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
@@ -78,7 +79,7 @@ func (r *ResizeRun) Close() {
 		if !r.noop {
 			ctx, cancel := cleanupCtx(context.Background())
 			defer cancel()
-			r.e.restoreRecord(ctx, r.p)
+			r.e.restoreRecord(ctx, r.p, true)
 		}
 		r.unlock()
 	})
@@ -128,11 +129,18 @@ func (e *Engine) beginResize(ctx context.Context, ref string, to Class, unlock f
 		return run, nil
 	}
 	run.changed = true
+	if err := e.checkSavedSettings(ctx, p, to); err != nil {
+		return nil, err
+	}
 
-	// The capacity check and the registry write that makes it true are one step, so two
-	// resizes or creates cannot both take the last room.
-	e.capacity.mu.Lock()
-	defer e.capacity.mu.Unlock()
+	// The capacity check and the registry write that makes it true are one step, on this node
+	// and across the processes that share the registry, so two resizes or creates cannot both
+	// take the last room.
+	release, err := e.lockCapacity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	cp, known, err := e.Capacity(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -216,7 +224,10 @@ func (r *ResizeRun) fail(ctx context.Context, cause error, restart bool) error {
 	r.noop = true // from here Close only releases the lock
 	rolled := true
 	var rerr error
-	e.restoreRecord(cctx, p)
+	// The old size goes back into the record, but the project stays RESIZING until its old units
+	// are back: Studio keeps showing the restart, and a daemon that dies meanwhile recovers a
+	// RESIZING project.
+	e.restoreRecord(cctx, p, false)
 	if restart {
 		keys, err := e.loadKeys(cctx, p.Ref)
 		if err == nil {
@@ -262,9 +273,11 @@ func (r *ResizeRun) fail(ctx context.Context, cause error, restart bool) error {
 	return fmt.Errorf("lifecycle: resize %s to %s failed and the project is back on %s: %w", p.Ref, r.to.Title, r.from.Title, cause)
 }
 
-// restoreRecord writes back the size, limits and status a project had before BeginResize changed
-// the record, unless the record is no longer RESIZING (something else moved it on).
-func (e *Engine) restoreRecord(ctx context.Context, old *registry.Project) {
+// restoreRecord writes back the size and limits a project had before BeginResize changed the
+// record, unless the record is no longer RESIZING (something else moved it on). With final it
+// writes the status the project had as well; without, the project stays RESIZING until the caller
+// has put its units back and sets the status itself.
+func (e *Engine) restoreRecord(ctx context.Context, old *registry.Project, final bool) {
 	cur, err := e.reg.GetProject(ctx, old.Ref)
 	if err != nil {
 		e.log.Warn("resize: could not read the project to restore its size", "ref", old.Ref, "error", err)
@@ -273,13 +286,67 @@ func (e *Engine) restoreRecord(ctx context.Context, old *registry.Project) {
 	if cur.Status != registry.StatusResizing {
 		return
 	}
-	cur.Class, cur.Limits, cur.Status = old.Class, old.Limits, old.Status
-	if !active(cur.Status) {
-		cur.Status = registry.StatusActiveHealthy
+	cur.Class, cur.Limits = old.Class, old.Limits
+	if final {
+		cur.Status = old.Status
+		if !active(cur.Status) {
+			cur.Status = registry.StatusActiveHealthy
+		}
 	}
 	if err := e.reg.UpdateProject(ctx, cur); err != nil {
 		e.log.Error("resize: could not restore the project's size in the registry", "ref", old.Ref, "error", err)
 	}
+}
+
+// SettingsChecker is the optional Settings capability that judges a project's saved settings
+// against a memory cap. *projectconfig.Manager implements it.
+type SettingsChecker interface {
+	// CheckSaved validates the saved settings of svc as a whole under cx, as a save of them
+	// would be, and returns the *projectconfig.ValidationError that names the setting that does
+	// not fit. A pooler check takes max_connections from the saved Postgres settings when they
+	// hold one, else from cx.
+	CheckSaved(ctx context.Context, ref string, svc projectconfig.Service, cx projectconfig.CrossContext) error
+}
+
+// SettingsError is a resize refused because settings saved for the project do not fit the new
+// size. The Management API answers it with 400.
+type SettingsError struct {
+	Message string
+}
+
+func (e *SettingsError) Error() string { return "lifecycle: " + e.Message }
+
+// IsSettings reports whether err is a resize refused over saved settings.
+func IsSettings(err error) (*SettingsError, bool) {
+	var se *SettingsError
+	if errors.As(err, &se) {
+		return se, true
+	}
+	return nil, false
+}
+
+// checkSavedSettings refuses a change to size to when the Postgres or pooler settings saved for
+// the project would not pass validation under it: a shared_buffers of 3GB that was fine on Large
+// would fill a Micro's 1 GB cgroup and get Postgres killed after it had passed its health check.
+// Nothing is checked without a Settings source that can check.
+func (e *Engine) checkSavedSettings(ctx context.Context, p *registry.Project, to Class) error {
+	sc, ok := e.opts.Settings.(SettingsChecker)
+	if !ok || p.Ref == config.SystemRef {
+		return nil
+	}
+	for _, svc := range []projectconfig.Service{projectconfig.Postgres, projectconfig.Pooler} {
+		cx := projectconfig.CrossContext{MemoryLimit: to.MemoryBytes, MaxConnections: int64(to.MaxConnections)}
+		if err := sc.CheckSaved(ctx, p.Ref, svc, cx); err != nil {
+			var ve *projectconfig.ValidationError
+			if errors.As(err, &ve) {
+				return &SettingsError{Message: fmt.Sprintf(
+					"the %s settings saved for this project do not fit %s (memory cap %s, %d connections): %s; change that setting in Database settings first, or choose a larger size",
+					svc, to.Title, sizeText(to.MemoryBytes), to.MaxConnections, ve.Msg)}
+			}
+			return fmt.Errorf("lifecycle: check the saved %s settings of %s: %w", svc, p.Ref, err)
+		}
+	}
+	return nil
 }
 
 // Resize changes the size of ref and waits for the project to be healthy on it (BeginResize

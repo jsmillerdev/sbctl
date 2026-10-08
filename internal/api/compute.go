@@ -191,8 +191,14 @@ func (s *Server) removeAddon(w http.ResponseWriter, r *http.Request, key string)
 		stubHandler(operationByKey(key))(w, r)
 		return nil
 	}
-	if _, ok := lifecycle.ClassByVariant(r.PathValue("addon_variant")); !ok {
-		return inputError("%q is not a compute size", r.PathValue("addon_variant"))
+	variant := r.PathValue("addon_variant")
+	if _, ok := lifecycle.ClassByVariant(variant); !ok {
+		return inputError("%q is not a compute size", variant)
+	}
+	if cur := sizeOf(p); cur.Variant != variant {
+		// Only the add-on the project has can be taken away; a project on Small does not drop to
+		// Nano because someone named another variant.
+		return inputError("this project does not have the %s compute add-on (it is on %s)", variant, cur.Title)
 	}
 	return s.resize(w, r, p, "nano", http.StatusOK)
 }
@@ -240,6 +246,9 @@ func (s *Server) resize(w http.ResponseWriter, r *http.Request, p *registry.Proj
 func mapResizeErr(err error) error {
 	if ce, ok := lifecycle.IsCapacity(err); ok {
 		return inputError("%s", capitalize(ce.Message))
+	}
+	if se, ok := lifecycle.IsSettings(err); ok {
+		return inputError("%s", capitalize(se.Message))
 	}
 	return mapErr(err)
 }

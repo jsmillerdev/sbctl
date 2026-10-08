@@ -29,6 +29,8 @@ type fakePlane struct {
 	started []registry.Project
 	// failOnce fails the next call named by the key and then forgets it.
 	failOnce map[string]error
+	// onStart, when set, runs at every Start with the project passed in.
+	onStart func(p registry.Project)
 }
 
 func newFakePlane() *fakePlane {
@@ -72,6 +74,9 @@ func (f *fakePlane) Start(_ context.Context, p *registry.Project, _ *secrets.Pro
 	f.mu.Lock()
 	f.started = append(f.started, *p)
 	f.mu.Unlock()
+	if f.onStart != nil {
+		f.onStart(*p)
+	}
 	return f.rec("Start " + p.Ref)
 }
 func (f *fakePlane) StartDatabase(_ context.Context, p *registry.Project, _ *secrets.ProjectKeys) error {

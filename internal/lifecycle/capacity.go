@@ -10,6 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/registry"
@@ -238,20 +241,87 @@ func (e *Engine) Offers(ctx context.Context, ref string) ([]Offer, error) {
 	return out, nil
 }
 
+// lockCapacity takes the lock that orders every capacity check with the registry write that makes
+// it true: the Engine's mutex, and with the Postgres registry a node-wide advisory lock as well,
+// so that `supavise projects resize` and the daemon (two processes, each with an Engine) cannot
+// both take the last room. It is always taken after a project's own lock and held only for the
+// check and one registry write.
+func (e *Engine) lockCapacity(ctx context.Context) (func(), error) {
+	e.capacity.mu.Lock()
+	ap, ok := e.reg.(advisoryPool)
+	if !ok || ap.Pool() == nil {
+		return e.capacity.mu.Unlock, nil
+	}
+	conn, err := pgx.ConnectConfig(ctx, ap.Pool().Config().ConnConfig)
+	if err != nil {
+		e.capacity.mu.Unlock()
+		return nil, fmt.Errorf("lifecycle: lock the node's capacity: %w", err)
+	}
+	if _, err := conn.Exec(ctx, `select pg_advisory_lock(hashtext('supavise:capacity'))`); err != nil {
+		_ = conn.Close(context.WithoutCancel(ctx))
+		e.capacity.mu.Unlock()
+		return nil, fmt.Errorf("lifecycle: lock the node's capacity: %w", err)
+	}
+	return func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = conn.Close(cctx) // ends the session, which drops the advisory lock
+		e.capacity.mu.Unlock()
+	}, nil
+}
+
 // holdCapacity judges a create that names its size (CreateRequest.Class is not empty) against
 // the node, and returns the release of the lock that keeps another create or resize from taking
-// the room before the new row counts. Without a node (SetNode) or an explicit size it checks nothing.
+// the room before the new row counts. Without a node (SetNode) or an explicit size it checks nothing:
+// a plain create takes the default size and is never refused. Branches and restores as a new
+// project always name their size (the branch's, the original's), so the node judges them.
 func (e *Engine) holdCapacity(ctx context.Context, req CreateRequest, size Class) (release func(), err error) {
 	noop := func() {}
 	if req.Class == "" || e.capacity.node == nil {
 		return noop, nil
 	}
-	e.capacity.mu.Lock()
+	unlock, err := e.lockCapacity(ctx)
+	if err != nil {
+		return noop, err
+	}
 	var once sync.Once
-	release = func() { once.Do(e.capacity.mu.Unlock) }
+	release = func() { once.Do(unlock) }
 	cp, known, err := e.Capacity(ctx, "")
 	if err == nil && known {
 		err = cp.Fits(size)
+	}
+	if err != nil {
+		release()
+		return noop, err
+	}
+	return release, nil
+}
+
+// holdResume judges a paused project coming back against the node, as an upsize is judged: its
+// cap must fit on top of the projects that run. A paused project holds no room, so without this
+// a resize could take the room of a paused project and the resume would put the node over its
+// budget. The returned release keeps the room until the status that counts it is written.
+func (e *Engine) holdResume(ctx context.Context, p *registry.Project) (release func(), err error) {
+	noop := func() {}
+	if e.capacity.node == nil {
+		return noop, nil
+	}
+	unlock, err := e.lockCapacity(ctx)
+	if err != nil {
+		return noop, err
+	}
+	var once sync.Once
+	release = func() { once.Do(unlock) }
+	cp, known, err := e.Capacity(ctx, p.Ref)
+	if err == nil && known {
+		cl, cerr := ClassFor(p.Class)
+		if cerr != nil {
+			cl = Class{Title: p.Class} // a class no migration renamed: judge the memory it holds
+		}
+		if n := projectMemory(p); n > 0 {
+			cl.MemoryBytes = n // limits set by hand count as they are
+		}
+		err = cp.Fits(cl)
 	}
 	if err != nil {
 		release()

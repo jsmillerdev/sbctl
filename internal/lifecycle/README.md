@@ -209,7 +209,7 @@ How the derived columns follow from the published ones (`newSize`):
   check counts one cap per project.
 
 **Saved Postgres settings win**, as hosted's custom Postgres config wins over its generated one. A saved
-`shared_buffers` stays when a project changes size; review saved settings after a downsize. `work_mem` is on
+`shared_buffers` stays when a project changes size, so a resize is refused (see Resize, step 1) when the saved Postgres or pooler settings would not pass validation under the new size. `work_mem` is on
 the command line with the other sizing settings (`cmdlineSettings`), so a saved `work_mem` takes effect at the
 next restart like they do.
 
@@ -222,13 +222,15 @@ node default took the limits of its size. Sizes above 16XL are not offered.
 
 **Node capacity.** A size is a cap, not a reservation, and an idle project uses a small part of it
 (docs/research/09-footprint.md: about 65 MB PSS, or 150 MB with page cache, against Micro's 1 GB). The node
-therefore promises more memory than it has. `[compute] overcommit` (default 3) is the ratio: the sum of the memory
+therefore promises more memory than it has. `[compute] overcommit` (default 6, chosen so that the budget covers the
+idle projects docs/guide.md says a node holds: 48 Micro caps on 8 GiB, 96 on 16 GiB, 192 on 32 GiB) is the ratio: the sum of the memory
 caps of the projects that count may reach the node's memory times the ratio, and a size whose vCPUs exceed the
 node's cores is never offered. A create that names its size (`CreateRequest.Class`; a create without one gets Micro
-unchecked) and a resize are refused with `*CapacityError` (400 through the API, with the reason in the message) when
-the node cannot honor them. Going down never needs room, so a node that is over its budget can still shrink a
+unchecked), a resize and a resume are refused with `*CapacityError` (400 through the API, with the reason in the
+message) when the node cannot honor them. Branch creates and restores as a new project always name their size (the
+branch's, the original's), so they are judged like `--size`; the plain create is the one exception. Going down never needs room, so a node that is over its budget can still shrink a
 project. Projects that count: every one but the system project, a paused one (`INACTIVE`, its units are down;
-resuming is not refused), a failed one and a removed one. `[compute] node_memory` and `node_cpus` override what is
+it holds no room, so `Resume` judges its cap and cores like an upsize, which keeps a resize into a paused project's room from being undone by resuming it; the restart recovery of a daemon is not judged), a failed one and a removed one. `[compute] node_memory` and `node_cpus` override what is
 read from `/proc/meminfo` and the machine, for VMs whose view is the host's. Without `Engine.SetNode` (tests) nothing
 is checked; `Open` and `InitSystem` set it. `Engine.Offers` lists every size with whether it fits;
 `supavise projects sizes` and the dashboard's size list use it, and `supavise status` shows the headroom
@@ -237,8 +239,11 @@ is checked; `Open` and `InitSystem` set it. `Engine.Offers` lists every size wit
 **Resize** (`resize.go`; `Engine.BeginResize` and `Run`, or `Resize` for both):
 
 1. Under the project's lock, taken without waiting (another operation running on the project, in this process or
-   another, is `ErrInvalidState`, 409 through the API): the project must be `ACTIVE_*` or paused. The capacity check and
-   the registry write are one step, so two requests cannot take the last room.
+   another, is `ErrInvalidState`, 409 through the API): the project must be `ACTIVE_*` or paused. The saved Postgres and
+   pooler settings are validated against the new size (memory cap, `max_connections`); one that does not fit refuses
+   the resize with a 400 that names it (`*SettingsError`). The capacity check and the registry write are one step under
+   a node-wide lock (the Engine's mutex and, with the Postgres registry, an advisory lock, so the daemon and a CLI
+   `supavise projects resize` cannot both take the last room).
 2. The registry gets the new size and limits and the status `RESIZING`, which Studio shows as "Resizing"
    (`project.resize_started`). `BeginResize` returns here; the Management API answers and runs `Run` in the
    background, and the dashboard polls the status.
@@ -247,7 +252,8 @@ is checked; `Open` and `InitSystem` set it. `Engine.Offers` lists every size wit
    top), waits for PostgreSQL, GoTrue and PostgREST to answer a real request, and updates the Supavisor tenant with the
    size's pool. Only this project restarts. The status returns to `ACTIVE_HEALTHY` and `project.resized` is recorded.
 4. Any failure puts the previous size back: the record, the units (stopped and started again on the old size) and the
-   tenant. The project is `ACTIVE_HEALTHY` on the old size, `project.resize_failed` carries the cause, and the error says
+   tenant. The project stays `RESIZING` until the old units are back (a daemon that stops meanwhile recovers a `RESIZING`
+   project), then it is `ACTIVE_HEALTHY` on the old size, `project.resize_failed` carries the cause, and the error says
    so. Downsizing a project that holds more replication slots than the smaller size allows is the case that fails: Postgres
    refuses to start. If the old size does not come back either, the project is `ACTIVE_UNHEALTHY` and the error says that.
 5. A paused project only gets the new size in its record; `Resume` renders the units from it. A resize to the size the

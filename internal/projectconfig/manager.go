@@ -87,6 +87,33 @@ func (m *Manager) Get(ctx context.Context, ref string, svc Service) (*State, err
 	return m.state(sch, rec)
 }
 
+// CheckSaved validates the saved settings of svc as a whole under cx, the way a save of them
+// would be: a nil error means they would be accepted. A project whose size is about to change
+// uses it to find settings the new size cannot hold. For the pooler, a max_connections saved in
+// the Postgres settings takes the place of cx.MaxConnections, because that is what the database
+// will run with.
+func (m *Manager) CheckSaved(ctx context.Context, ref string, svc Service, cx CrossContext) error {
+	sch, err := schemaOf(svc)
+	if err != nil {
+		return err
+	}
+	if sch.Cross == nil {
+		return nil
+	}
+	st, err := m.Get(ctx, ref, svc)
+	if err != nil {
+		return err
+	}
+	if svc == Pooler {
+		if pg, err := m.Get(ctx, ref, Postgres); err == nil {
+			if n, ok := pg.Set.Int("max_connections"); ok && n > 0 {
+				cx.MaxConnections = n
+			}
+		}
+	}
+	return sch.Cross(st.Effective, st.Set, cx)
+}
+
 func (m *Manager) state(sch *Schema, rec *Record) (*State, error) {
 	set, err := m.open(sch, rec)
 	if err != nil {

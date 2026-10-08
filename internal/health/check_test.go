@@ -362,10 +362,10 @@ func TestRegistryUnreachableIsDownAndSaysWhy(t *testing.T) {
 func TestCapacity(t *testing.T) {
 	e := newEnv(t) // two running Micro projects (1 GB each); the paused one holds nothing
 	comp, ok := e.check().Component("capacity")
-	if !ok || comp.State != OK || !strings.Contains(comp.Detail, "2 GB of 48 GB project memory caps promised to 2 projects (16 GB of memory x 3 overcommit); 4 cores") {
+	if !ok || comp.State != OK || !strings.Contains(comp.Detail, "2 GB of 96 GB project memory caps promised to 2 projects (16 GB of memory x 6 overcommit); 4 cores") {
 		t.Fatalf("capacity = %+v %v", comp, ok)
 	}
-	e.deps.Node = func() lifecycle.NodeResources { return lifecycle.NodeResources{MemoryBytes: 512 << 20, CPUs: 1} }
+	e.deps.Node = func() lifecycle.NodeResources { return lifecycle.NodeResources{MemoryBytes: 256 << 20, CPUs: 1} }
 	comp, _ = e.check().Component("capacity")
 	if comp.State != Warn || !strings.Contains(comp.Detail, "over the budget") {
 		t.Fatalf("over the budget = %+v", comp)

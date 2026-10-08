@@ -230,6 +230,26 @@ func TestChangingTheSizeIsRefusedWithAClearMessage(t *testing.T) {
 	if p := f.projectRow(t); sizeOf(p).Name != "micro" || p.Status != registry.StatusActiveHealthy {
 		t.Fatalf("a refused change touched the project: %+v", p)
 	}
+	// Taking away an add-on the project does not have changes nothing.
+	for _, path := range []string{platAddons, v1Addons} {
+		rec := f.do("DELETE", path+"/ci_large", nil)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "does not have the ci_large") {
+			t.Errorf("DELETE %s/ci_large on a Micro project: %d %s", path, rec.Code, rec.Body)
+		}
+	}
+	// Saved settings that the new size cannot hold are a 400 with the setting named.
+	f.mgr.mu.Lock()
+	f.mgr.resizeErr = &lifecycle.SettingsError{Message: "the postgres settings saved for this project do not fit Micro: shared_buffers 3GB is too large"}
+	f.mgr.mu.Unlock()
+	if rec := f.do("POST", platAddons, map[string]any{"addon_type": "compute_instance", "addon_variant": "ci_small"}); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "shared_buffers 3GB") {
+		t.Errorf("settings refusal: %d %s", rec.Code, rec.Body)
+	}
+	f.mgr.mu.Lock()
+	f.mgr.resizeErr = nil
+	f.mgr.mu.Unlock()
+	if p := f.projectRow(t); sizeOf(p).Name != "micro" {
+		t.Fatalf("a refused change touched the project: %+v", p)
+	}
 	// Other add-ons are not sold: the call succeeds and changes nothing.
 	f.body(t, "POST", platAddons, map[string]any{"addon_type": "ipv4", "addon_variant": "ipv4_default"}, http.StatusCreated)
 	// A project that is not running cannot be resized.

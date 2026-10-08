@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jsmillerdev/supavise/internal/config"
+	"github.com/jsmillerdev/supavise/internal/projectconfig"
 	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
@@ -399,5 +400,155 @@ func TestRecoverBringsAResizeBackOnTheRecordedSize(t *testing.T) {
 	}
 	if len(h.plane.started) != 1 || h.plane.started[0].Limits.MemoryMax != "2G" {
 		t.Fatalf("started = %+v", h.plane.started)
+	}
+}
+
+// The default overcommit agrees with the sizing table of docs/guide.md: a node filled with the
+// idle projects the guide promises is never refused.
+func TestDefaultOvercommitCoversTheGuidesNodeSizes(t *testing.T) {
+	cfg := config.Default()
+	for _, tc := range []struct {
+		memGB  int64
+		micros int // the guide's "idle projects that fit", at the 1 GB cap of a Micro
+	}{{8, 35}, {16, 90}} {
+		budget := int64(float64(tc.memGB*gib) * cfg.Compute.OvercommitRatio())
+		if budget < int64(tc.micros)*gib {
+			t.Errorf("%d GiB node: budget %d GB for %d Micro projects", tc.memGB, budget/gib, tc.micros)
+		}
+	}
+}
+
+// A branch and a restore as a new project name their size, so the node judges them like a create
+// with --size; a plain create is not judged.
+func TestBranchAndRestoreAsCreatesAreCheckedAgainstTheNode(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.node(1, 2, 1) // a budget of 1 GB: one Micro
+	parent := h.create(t)
+	info := &registry.BranchInfo{ID: "6f9619ff-8b86-4011-b42d-00c04fc964ff", ParentRef: parent.Ref, Name: "feature", State: registry.BranchCreatingProject}
+	_, err := h.e.Create(ctx, CreateRequest{Name: "feature", Class: "micro", Branch: info})
+	if _, ok := IsCapacity(err); !ok {
+		t.Fatalf("a branch past the budget: %v", err)
+	}
+	// restoreAsNew passes the original's size and limits.
+	_, err = h.e.Create(ctx, CreateRequest{Name: "copy", Class: parent.Class})
+	if _, ok := IsCapacity(err); !ok {
+		t.Fatalf("a restore as new past the budget: %v", err)
+	}
+	if ps, _ := h.reg.ListProjects(ctx); len(ps) != 1 {
+		t.Fatalf("refused creates left %d rows", len(ps))
+	}
+	if _, err := h.e.Create(ctx, CreateRequest{Name: "plain"}); err != nil {
+		t.Fatalf("a create without a size is not judged: %v", err)
+	}
+}
+
+// Pausing a project frees its room for a resize, and resuming it must not put the node over.
+func TestResumeIsCheckedAgainstTheNode(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.node(8, 4, 1) // 8 GB
+	a := h.create(t)
+	b, err := h.e.Create(ctx, CreateRequest{Name: "b", Class: "large"}) // 8 GB: does not fit beside a
+	if _, ok := IsCapacity(err); !ok {
+		t.Fatalf("b = %v, %v", b, err)
+	}
+	b, err = h.e.Create(ctx, CreateRequest{Name: "b", Class: "medium"}) // 4 GB
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.e.Pause(ctx, b.Ref); err != nil {
+		t.Fatal(err)
+	}
+	// With b paused, a can grow into b's room: 7 GB of 8.
+	if _, err := h.e.Resize(ctx, a.Ref, "large"); err != nil {
+		t.Fatal(err)
+	}
+	h.plane.calls = nil
+	err = h.e.Resume(ctx, b.Ref)
+	ce, ok := IsCapacity(err)
+	if !ok || !strings.Contains(ce.Message, "Medium") {
+		t.Fatalf("resume over the budget: %v", err)
+	}
+	if got := h.project(t, b.Ref); got.Status != registry.StatusInactive || len(h.plane.calls) != 0 {
+		t.Fatalf("a refused resume touched the project: %s %v", got.Status, h.plane.calls)
+	}
+	// Shrinking a makes room, and the resume goes through.
+	if _, err := h.e.Resize(ctx, a.Ref, "small"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.e.Resume(ctx, b.Ref); err != nil {
+		t.Fatalf("resume with room: %v", err)
+	}
+}
+
+// While the rollback restarts the old size the project stays RESIZING, and only then is it healthy.
+func TestResizeRollbackStaysResizingUntilTheOldUnitsAreBack(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	p := h.create(t)
+	var seen []registry.Status
+	h.plane.onStart = func(started registry.Project) {
+		seen = append(seen, h.project(t, p.Ref).Status)
+		if started.Class == "micro" {
+			if rec := h.project(t, p.Ref); rec.Class != "micro" {
+				t.Errorf("the record still says %s while the old units start", rec.Class)
+			}
+		}
+	}
+	h.plane.failOnce["Start"] = errors.New("postgres did not answer")
+	if _, err := h.e.Resize(ctx, p.Ref, "large"); err == nil {
+		t.Fatal("no error")
+	}
+	if len(seen) != 2 || seen[0] != registry.StatusResizing || seen[1] != registry.StatusResizing {
+		t.Fatalf("statuses at the two starts = %v", seen)
+	}
+	if got := h.project(t, p.Ref); got.Status != registry.StatusActiveHealthy || got.Class != "micro" {
+		t.Fatalf("after: %+v", got)
+	}
+}
+
+// settingsCheck is a Settings that holds saved Postgres settings and judges them as the real
+// validator does for the two rules the tests need.
+type settingsCheck struct {
+	fakeSettings
+	savedSharedBuffers int64
+	got                []projectconfig.CrossContext
+}
+
+func (s *settingsCheck) CheckSaved(_ context.Context, _ string, svc projectconfig.Service, cx projectconfig.CrossContext) error {
+	s.got = append(s.got, cx)
+	if svc == projectconfig.Postgres && cx.MemoryLimit > 0 && float64(s.savedSharedBuffers) > float64(cx.MemoryLimit)*0.4 {
+		return &projectconfig.ValidationError{Msg: "shared_buffers 3GB is more than 40% of the project's memory limit"}
+	}
+	return nil
+}
+
+func TestDownsizeIsRefusedWhenSavedSettingsDoNotFit(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	st := &settingsCheck{savedSharedBuffers: 3 << 30}
+	h.e.opts.Settings = st
+	p := h.create(t)
+	if _, err := h.e.Resize(ctx, p.Ref, "large"); err != nil {
+		t.Fatalf("Large holds 3GB of shared buffers: %v", err)
+	}
+	h.plane.calls = nil
+	_, err := h.e.Resize(ctx, p.Ref, "micro")
+	se, ok := IsSettings(err)
+	if !ok || !strings.Contains(se.Message, "shared_buffers 3GB") || !strings.Contains(se.Message, "Micro") {
+		t.Fatalf("downsize with 3GB shared_buffers: %v", err)
+	}
+	if got := h.project(t, p.Ref); got.Class != "large" || got.Status != registry.StatusActiveHealthy || len(h.plane.calls) != 0 {
+		t.Fatalf("a refused resize touched the project: %+v %v", got, h.plane.calls)
+	}
+	last := st.got[len(st.got)-1]
+	if last.MemoryLimit != 1<<30 {
+		t.Fatalf("settings were judged against %d bytes, not the target's cap", last.MemoryLimit)
+	}
+	// Once the setting fits, the downsize goes through.
+	st.savedSharedBuffers = 256 << 20
+	if _, err := h.e.Resize(ctx, p.Ref, "micro"); err != nil {
+		t.Fatal(err)
 	}
 }

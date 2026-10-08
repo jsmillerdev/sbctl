@@ -490,7 +490,14 @@ func (e *Engine) Pause(ctx context.Context, ref string) error {
 
 // Resume implements Manager: the reverse of Pause. If a unit does not come up, what
 // started is stopped again and the project stays INACTIVE, so Resume can be retried.
-func (e *Engine) Resume(ctx context.Context, ref string) error {
+//
+// A paused project holds no room on the node, so Resume judges its memory cap and CPU against the
+// node the way an upsize is judged and refuses with a *CapacityError when they no longer fit.
+func (e *Engine) Resume(ctx context.Context, ref string) error { return e.resume(ctx, ref, true) }
+
+// resume is Resume; checkNode is false for a project the daemon itself paused around a restart,
+// which comes back whatever the node's budget says (it ran before).
+func (e *Engine) resume(ctx context.Context, ref string, checkNode bool) error {
 	unlock, err := e.lock(ctx, ref)
 	if err != nil {
 		return err
@@ -507,7 +514,15 @@ func (e *Engine) Resume(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	if err := e.setStatus(ctx, ref, registry.StatusComingUp); err != nil {
+	releaseCap := func() {}
+	if checkNode && p.Status == registry.StatusInactive {
+		if releaseCap, err = e.holdResume(ctx, p); err != nil {
+			return err
+		}
+	}
+	err = e.setStatus(ctx, ref, registry.StatusComingUp) // the project counts against the node from here
+	releaseCap()
+	if err != nil {
 		return err
 	}
 	if err := e.plane.Start(ctx, p, keys); err != nil {
@@ -1138,7 +1153,7 @@ func (e *Engine) ResumeRecovered(ctx context.Context, rs []Recovered) map[string
 		if !r.Resume {
 			continue
 		}
-		err := e.Resume(ctx, r.Ref)
+		err := e.resume(ctx, r.Ref, false)
 		res := "resumed"
 		if err != nil {
 			errs[r.Ref] = err
