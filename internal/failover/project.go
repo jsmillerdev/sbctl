@@ -44,12 +44,14 @@ func (o *Orchestrator) FailoverProject(ctx context.Context, opts ProjectOptions)
 
 	// The project's lock first, and the plan under it: a pause or a resume cannot change the status
 	// the move records, and a move that cannot get the lock leaves no row behind.
+	hold := &lockHold{o: o, ref: opts.Ref}
 	if !opts.DryRun {
 		unlock, err := o.lockProject(ctx, opts.Ref)
 		if err != nil {
 			return nil, err
 		}
-		defer unlock()
+		hold.unlock = unlock
+		defer hold.release()
 	}
 	pl, run, err := o.planProject(ctx, opts)
 	if err != nil {
@@ -90,7 +92,7 @@ func (o *Orchestrator) FailoverProject(ctx context.Context, opts ProjectOptions)
 
 	o.announce(ctx, alerts.KindFailoverStarted, alerts.SeverityInfo, j.snapshot(),
 		fmt.Sprintf("Moving project %s from %s to %s.", run.project.Ref, run.from.Name, run.to.Name))
-	err = o.projectSteps(ctx, j, run, begin, timeoutSeconds(o.conf().StopTimeout()))
+	err = o.projectSteps(ctx, j, run, begin, timeoutSeconds(o.conf().StopTimeout()), hold)
 	return o.endMove(ctx, j, run.project.Ref, err)
 }
 
@@ -236,7 +238,7 @@ func (o *Orchestrator) announce(ctx context.Context, kind, severity string, mv r
 }
 
 // projectSteps runs the steps of a project move that are not in the log yet.
-func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projectRun, begin projectBegin, timeout int) (err error) {
+func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projectRun, begin projectBegin, timeout int, hold *lockHold) (err error) {
 	ref := run.project.Ref
 	paused := begin.Status == registry.StatusInactive
 	st := o.store()
@@ -268,7 +270,7 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 		}); err != nil {
 			var abort *abortError
 			if errors.As(err, &abort) {
-				return o.undoSwitchover(ctx, j, run, begin, abort)
+				return o.undoSwitchover(ctx, j, run, begin, abort, hold)
 			}
 			return err
 		}
@@ -288,7 +290,7 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 	}); err != nil {
 		var abort *abortError
 		if errors.As(err, &abort) && run.planned {
-			return o.undoSwitchover(ctx, j, run, begin, abort)
+			return o.undoSwitchover(ctx, j, run, begin, abort, hold)
 		}
 		return err
 	}
@@ -316,7 +318,15 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 		}); err != nil {
 			return err
 		}
-		if err := j.step(ctx, "tenant", func() (string, error) { return "", o.ensureTenant(ctx, ref) }); err != nil {
+		if err := j.step(ctx, "tenant", func() (string, error) {
+			// The engine registers a project only while it is active, and takes the project's lock to do
+			// it: the project is active again, and the move lets go of the lock meanwhile.
+			if o.d.Fleet == nil {
+				return "", nil
+			}
+			setStatus(statusAfter(begin.Status))
+			return "", hold.without(ctx, func() error { return o.ensureTenant(ctx, ref) })
+		}); err != nil {
 			return err
 		}
 	}
@@ -337,8 +347,26 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 			return err
 		}
 	}
-	setStatus(statusAfter(begin.Status))
+	o.settle(ctx, ref, statusAfter(begin.Status))
 	return nil
+}
+
+// settle gives the project the status the move ends with, unless something else changed it while the
+// move let go of the lock: a project that was paused meanwhile keeps what that did.
+func (o *Orchestrator) settle(ctx context.Context, ref string, s registry.Status) {
+	st := o.store()
+	if p, err := st.GetProject(ctx, ref); err == nil && !movable(p.Status) {
+		return
+	}
+	if err := st.SetProjectStatus(ctx, ref, s); err != nil {
+		o.d.Log.Warn("could not set the project's status", "ref", ref, "status", s, "error", err)
+	}
+}
+
+// movable reports whether the status is one a move leaves behind or sets: the move's own RESTARTING,
+// and the active ones it gives back.
+func movable(s registry.Status) bool {
+	return s == registry.StatusRestarting || s == registry.StatusActiveHealthy || s == registry.StatusActiveUnhealthy
 }
 
 // statusAfter is the status a project gets back once its move is over: paused stays paused, and
@@ -447,16 +475,19 @@ func notYetLeader(err error) bool {
 // undoSwitchover puts a switchover back that stopped before the promotion: the old primary starts
 // again, the shared services take the project back, and the project gets its status. The move ends
 // aborted. If the old primary does not start, the project is down and the move says so.
-func (o *Orchestrator) undoSwitchover(ctx context.Context, j *journal, run *projectRun, begin projectBegin, abort *abortError) error {
+func (o *Orchestrator) undoSwitchover(ctx context.Context, j *journal, run *projectRun, begin projectBegin, abort *abortError, hold *lockHold) error {
 	ref := run.project.Ref
 	if err := o.d.Primaries.Start(ctx, run.from.ID, ref); err != nil {
 		_ = o.store().SetProjectStatus(ctx, ref, registry.StatusActiveUnhealthy)
 		return fmt.Errorf("%w; starting the old primary on %s again also failed: %v", abort.cause, run.from.Name, err)
 	}
-	if err := o.ensureTenant(ctx, ref); err != nil {
-		o.d.Log.Warn("could not register the project with the shared services again", "ref", ref, "error", err)
-	}
+	// Active again first: the engine registers a project with the shared services only while it is.
 	_ = o.store().SetProjectStatus(ctx, ref, statusAfter(begin.Status))
+	if begin.Status != registry.StatusInactive && o.d.Fleet != nil {
+		if err := hold.without(ctx, func() error { return o.ensureTenant(ctx, ref) }); err != nil {
+			o.d.Log.Warn("could not register the project with the shared services again", "ref", ref, "error", err)
+		}
+	}
 	_ = j.record(ctx, "undo", "the old primary on "+run.from.Name+" runs again")
 	return &abortError{cause: abort.cause}
 }
@@ -555,6 +586,37 @@ func newID6() string {
 		b[i] = alphabet[int(b[i])%len(alphabet)]
 	}
 	return string(b[:])
+}
+
+// lockHold is the project's lock as a move holds it, released once whatever happens.
+type lockHold struct {
+	o      *Orchestrator
+	ref    string
+	unlock func()
+}
+
+func (h *lockHold) release() {
+	if h != nil && h.unlock != nil {
+		h.unlock()
+		h.unlock = nil
+	}
+}
+
+// without runs fn with the project's lock let go and takes it again after. The engine's registration
+// of a project with the shared services takes the same lock, which is not reentrant. The project is
+// active then, not RESTARTING, so what else wants the lock finds it as it finds any active project.
+func (h *lockHold) without(ctx context.Context, fn func() error) error {
+	if h == nil || h.unlock == nil {
+		return fn()
+	}
+	h.release()
+	err := fn()
+	unlock, lerr := h.o.lockProject(ctx, h.ref)
+	if lerr != nil {
+		return errors.Join(err, fmt.Errorf("taking the project's lock again: %w", lerr))
+	}
+	h.unlock = unlock
+	return err
 }
 
 // tenantAttempts and tenantWait bound the tries to register a project with the shared services. A

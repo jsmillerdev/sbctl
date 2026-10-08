@@ -231,7 +231,9 @@ func TestAProjectMoveHoldsTheLockBeforeItPlans(t *testing.T) {
 	if _, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil {
 		t.Fatal(err)
 	}
-	if len(order) != 2 || order[0] != "lock "+refA || order[1] != "unlock "+refA || w.index("registry.CreateMove") < 0 {
+	// The lock is let go of around the registration with the shared services, which takes it itself,
+	// and taken again for the rest of the move.
+	if strings.Join(order, ",") != "lock "+refA+",unlock "+refA+",lock "+refA+",unlock "+refA || w.index("registry.CreateMove") < 0 {
 		t.Fatalf("lock calls: %v", order)
 	}
 	// A dry run changes nothing and needs no lock.
@@ -617,4 +619,182 @@ func TestAPromotionThatTheNodeAnswersWithASentinelIsClassified(t *testing.T) {
 		}
 		w.assertNever("start n1/") // the node may be a primary under the other leader: the old one stays down
 	})
+}
+
+// engineLike plays the lifecycle engine as the orchestrator meets it: its project lock is not
+// reentrant, and its registration of a project with the shared services takes that lock and does
+// nothing for a project that is not active.
+type engineLike struct {
+	w       *world
+	mu      sync.Mutex
+	locks   map[string]*sync.Mutex
+	held    map[string]bool
+	skipped []string
+	locked  []string // refs registered while the move held their lock: a deadlock in the real engine
+	ensured []string
+}
+
+func newEngineLike(w *world) *engineLike {
+	return &engineLike{w: w, locks: map[string]*sync.Mutex{}, held: map[string]bool{}}
+}
+
+func (e *engineLike) lockOf(ref string) *sync.Mutex {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.locks[ref] == nil {
+		e.locks[ref] = &sync.Mutex{}
+	}
+	return e.locks[ref]
+}
+
+func (e *engineLike) Lock(_ context.Context, ref string) (func(), error) {
+	m := e.lockOf(ref)
+	m.Lock()
+	e.mu.Lock()
+	e.held[ref] = true
+	e.mu.Unlock()
+	return func() {
+		e.mu.Lock()
+		e.held[ref] = false
+		e.mu.Unlock()
+		m.Unlock()
+	}, nil
+}
+
+func (e *engineLike) isHeld(ref string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.held[ref]
+}
+
+func (e *engineLike) QuiesceTenant(_ context.Context, ref string) error {
+	return e.w.do("fleet.quiesce %s", ref)
+}
+
+func (e *engineLike) EnsureTenant(_ context.Context, ref string) error {
+	if err := e.w.do("fleet.ensure %s", ref); err != nil {
+		return err
+	}
+	m := e.lockOf(ref)
+	if !m.TryLock() {
+		e.mu.Lock()
+		e.locked = append(e.locked, ref)
+		e.mu.Unlock()
+		return errors.New("the project's lock is held: the real engine would wait for ever")
+	}
+	defer m.Unlock()
+	p, err := e.w.reg.GetProject(e.w.ctx, ref)
+	if err != nil {
+		return err
+	}
+	if p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy {
+		e.mu.Lock()
+		e.skipped = append(e.skipped, ref+" "+string(p.Status))
+		e.mu.Unlock()
+		return nil // its own operation registers it
+	}
+	e.mu.Lock()
+	e.ensured = append(e.ensured, ref)
+	e.mu.Unlock()
+	return nil
+}
+
+// The engine's registration takes the project's lock and skips a project that is not active, so a move
+// that held the lock across it would wait for itself, and one that called it while the project was
+// RESTARTING or COMING_UP would register nothing and say nothing.
+func TestTheMoveRegistersTheProjectWithTheEngineWhileItIsActiveAndNotUnderItsOwnLock(t *testing.T) {
+	t.Run("a project switchover", func(t *testing.T) {
+		w := newWorld(t)
+		eng := newEngineLike(w)
+		var heldAtDemote, heldAtEnsure bool
+		w.afterEvent("demote n1/", func() { heldAtDemote = eng.isHeld(refA) })
+		w.afterEvent("fleet.ensure "+refA, func() { heldAtEnsure = eng.isHeld(refA) })
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if len(eng.locked) != 0 || heldAtEnsure {
+			t.Fatalf("registered under the move's lock: %v (held %v)", eng.locked, heldAtEnsure)
+		}
+		if len(eng.skipped) != 0 || len(eng.ensured) != 1 || eng.ensured[0] != refA {
+			t.Fatalf("registered %v, skipped %v", eng.ensured, eng.skipped)
+		}
+		if !heldAtDemote || eng.isHeld(refA) {
+			t.Fatalf("the lock is taken again after the registration (%v) and let go at the end (%v)", heldAtDemote, eng.isHeld(refA))
+		}
+		if p := projectOf(t, w, refA); p.Status != registry.StatusActiveHealthy || p.NodeID != "n2" {
+			t.Fatalf("project: %+v", p)
+		}
+	})
+	t.Run("a project failover", func(t *testing.T) {
+		w := newWorld(t)
+		w.prim["n1/"+refA].healthy = false
+		eng := newEngineLike(w)
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		if mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if len(eng.locked) != 0 || len(eng.skipped) != 0 || len(eng.ensured) != 1 {
+			t.Fatalf("registered %v, skipped %v, under the lock %v", eng.ensured, eng.skipped, eng.locked)
+		}
+	})
+	t.Run("a switchover that is undone", func(t *testing.T) {
+		w := newWorld(t)
+		eng := newEngineLike(w)
+		w.fail("promote n2/", fmt.Errorf("%w: late", lifecycle.ErrReplayBehind), -1)
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+		if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if len(eng.locked) != 0 || len(eng.skipped) != 0 || len(eng.ensured) != 1 {
+			t.Fatalf("registered %v, skipped %v, under the lock %v", eng.ensured, eng.skipped, eng.locked)
+		}
+		if eng.isHeld(refA) {
+			t.Fatal("the lock outlives the move")
+		}
+	})
+	t.Run("a paused project is not registered", func(t *testing.T) {
+		w := newWorld(t)
+		must(t, w.reg.SetProjectStatus(w.ctx, refA, registry.StatusInactive))
+		w.prim["n1/"+refA] = &primState{}
+		eng := newEngineLike(w)
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		if mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if len(eng.ensured)+len(eng.skipped)+len(eng.locked) != 0 {
+			t.Fatalf("registered %v, skipped %v", eng.ensured, eng.skipped)
+		}
+		if p := projectOf(t, w, refA); p.Status != registry.StatusInactive {
+			t.Fatalf("project: %+v", p)
+		}
+	})
+	t.Run("a pause that got in while the move let go of the lock is kept", func(t *testing.T) {
+		w := newWorld(t)
+		eng := newEngineLike(w)
+		w.afterEvent("fleet.ensure "+refA, func() { must(t, w.reg.SetProjectStatus(w.ctx, refA, registry.StatusInactive)) })
+		o := w.orch(func(d *Deps) { d.Fleet, d.Locks = eng, eng })
+		if mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+			t.Fatalf("move %+v, error %v", mv, err)
+		}
+		if p := projectOf(t, w, refA); p.Status != registry.StatusInactive {
+			t.Fatalf("the move overwrote a pause: %+v", p)
+		}
+	})
+}
+
+// A server move holds no project lock, and still registers a project only while it is active.
+func TestAServerMoveRegistersEachProjectWithTheEngineWhileItIsActive(t *testing.T) {
+	w := serverWorld(t)
+	eng := newEngineLike(w)
+	o := w.orch(func(d *Deps) { d.Fleet = eng })
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{})
+	if err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if len(eng.skipped) != 0 || len(eng.locked) != 0 || len(eng.ensured) != 2 {
+		t.Fatalf("registered %v, skipped %v", eng.ensured, eng.skipped)
+	}
 }

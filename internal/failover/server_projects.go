@@ -125,7 +125,13 @@ func (o *Orchestrator) serverProject(ctx context.Context, j *journal, run *serve
 		}); err != nil {
 			return err
 		}
-		if err := j.step(ctx, pfx+"tenant", func() (string, error) { return "", o.ensureTenant(ctx, ref) }); err != nil {
+		if err := j.step(ctx, pfx+"tenant", func() (string, error) {
+			// The engine registers a project with the shared services only while it is active.
+			if err := st.SetProjectStatus(ctx, ref, registry.StatusActiveHealthy); err != nil {
+				o.d.Log.Warn("could not set the project's status", "ref", ref, "error", err)
+			}
+			return "", o.ensureTenant(ctx, ref)
+		}); err != nil {
 			return err
 		}
 	}
