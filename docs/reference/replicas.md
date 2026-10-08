@@ -94,7 +94,7 @@ The replica's PostgREST reloads its schema cache when the primary notifies it an
 - Every answer carries `X-Supavise-Route: <identifier>` (the ref for the primary), and the access log gets `load_balancer_redirect_identifier`.
 - A read whose chosen replica refuses the connection or breaks before it answers is repeated once on the primary. A request with a body is not repeated and answers `502`.
 - Custom and vanity hostnames always go to the primary.
-- Lag readings live on the leader. On a follower, a nonzero `lb_max_lag_seconds` leaves every replica out and reads go to the primary.
+- Lag readings live on the leader, and nothing carries them to a follower. On a follower, a nonzero `lb_max_lag_seconds` leaves every replica out and reads go to the primary, so the limit takes effect only on the leader. With the limit at zero every node spreads reads as described above.
 
 **Pooler.** `postgres.<identifier>` on the replica's node logs in to the standby. The Supavisor tenant is a row of the replicated pooler database, so each node's Supavisor serves it.
 
@@ -183,7 +183,7 @@ Cluster-scoped keys are the same on every node. The leader's values win: `supavi
 | `[replicas] concurrency` | 2 | setups at once |
 | `[replicas] bootstrap_max_backup_age` | `24h` | a base backup older than this is replaced before seeding |
 | `[replicas] unhealthy_lag_seconds` | 300 | lag above this is `ACTIVE_UNHEALTHY` |
-| `[replicas] lb_max_lag_seconds` | 0 | the balancer skips a replica over this lag; 0 ignores lag |
+| `[replicas] lb_max_lag_seconds` | 0 | the balancer skips a replica over this lag; 0 ignores lag. Only the leader knows the lag, so a balancer on a follower sends every read to the primary while this is set |
 | `[replicas] schema_reload_seconds` | 10 | the replica's PostgREST schema reload interval |
 | `[failover] mode` | `manual` | `manual`, `project` or `server` |
 | `[failover] fencing` | empty | `aws`, `command` or empty |
