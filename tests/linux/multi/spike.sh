@@ -6,7 +6,8 @@
 #   go build -o /tmp/releasetool ./deploy/releasetool
 #   sudo MULTI_MODE=container SUPAVISE_BIN=/tmp/supavise SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/multi/spike.sh
 #
-# MULTI_MODE is vm, container, container-privileged or auto (a virtual machine when /dev/kvm works). The
+# MULTI_MODE is vm, container, container-privileged or auto (a virtual machine when /dev/kvm works, else a
+# privileged container). The
 # checks, in order, each recorded as PASS, FAIL or SKIP (a check whose predecessor failed) in
 # $LOG_DIR/results.md:
 #

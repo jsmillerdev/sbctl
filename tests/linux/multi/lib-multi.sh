@@ -13,7 +13,7 @@ LOG_DIR=${LOG_DIR:-/tmp/supavise-multi-logs}
 # shellcheck source=../lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
-MULTI_MODE=${MULTI_MODE:-auto}        # vm, container, container-privileged, or auto (vm when /dev/kvm works)
+MULTI_MODE=${MULTI_MODE:-auto}        # vm, container, container-privileged, or auto (vm when /dev/kvm works, else container-privileged)
 MULTI_IMAGE=${MULTI_IMAGE:-images:ubuntu/24.04}
 MULTI_CPU=${MULTI_CPU:-2}
 MULTI_MEM=${MULTI_MEM:-4GiB}
@@ -96,7 +96,8 @@ kvm_enable() {
 
 multi_resolve_mode() { # sets MULTI_RESOLVED
   case $MULTI_MODE in
-    auto) if kvm_usable; then MULTI_RESOLVED=vm; else MULTI_RESOLVED=container; fi ;;
+    # Unprivileged containers do not enforce IPAddressDeny (README.md).
+    auto) if kvm_usable; then MULTI_RESOLVED=vm; else MULTI_RESOLVED=container-privileged; fi ;;
     vm | container | container-privileged) MULTI_RESOLVED=$MULTI_MODE ;;
     *) fail "MULTI_MODE=$MULTI_MODE: want auto, vm, container or container-privileged" ;;
   esac
@@ -143,9 +144,10 @@ profiles:
 PRESEED
 }
 
-# multi_docker_rules: the runner image runs Docker, which sets the FORWARD policy to DROP and loads
-# br_netfilter, so the bridge's traffic (to the internet and between the nodes) reaches the DOCKER-USER
-# chain first. Accept what leaves the bridge, and what comes back.
+# multi_docker_rules: the runner image runs Docker, which sets the FORWARD policy to DROP, so what the
+# nodes send to the internet reaches the DOCKER-USER chain first. Accept what leaves the bridge, and what
+# comes back. (Traffic between the nodes is bridged, not forwarded; br_netfilter is not loaded on the
+# runner, so it never meets the policy. The `rules` check in spike.sh shows both.)
 multi_docker_rules() {
   if ! iptables -w -nL DOCKER-USER >/dev/null 2>&1; then
     log "no DOCKER-USER chain: Docker does not filter forwarding on this host"

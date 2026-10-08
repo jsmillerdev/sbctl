@@ -8,7 +8,8 @@ name: replication-spike
 # expect_fail lists the checks that are known to fail in a mode (see SPIKE_EXPECT_FAIL in spike.sh): a job is
 # red when another check fails, and also when one of those passes, because the README would then be wrong.
 #   amd64 vm                  all checks pass
-#   amd64/arm64 container     unprivileged system containers cannot load the BPF program IPAddressDeny needs
+#   amd64/arm64 container     unprivileged system containers do not enforce IPAddressDeny; systemd-smoke.sh
+#                             (the smoke input) stops at the same place
 #   container-privileged      all checks pass
 #   arm64 vm                  the arm64 runners have no /dev/kvm
 on:
@@ -31,15 +32,16 @@ defaults:
 
 jobs:
   two-nodes:
+    name: two-nodes (${{ matrix.arch }}, ${{ matrix.mode }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - { runner: ubuntu-24.04, arch: amd64, mode: vm, expect_fail: "" }
           - { runner: ubuntu-24.04, arch: amd64, mode: container-privileged, expect_fail: "" }
-          - { runner: ubuntu-24.04, arch: amd64, mode: container, expect_fail: imds }
+          - { runner: ubuntu-24.04, arch: amd64, mode: container, expect_fail: "imds smoke" }
           - { runner: ubuntu-24.04-arm, arch: arm64, mode: container-privileged, expect_fail: "" }
-          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container, expect_fail: imds }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container, expect_fail: "imds smoke" }
           - { runner: ubuntu-24.04-arm, arch: arm64, mode: vm, expect_fail: incus }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
