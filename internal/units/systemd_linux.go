@@ -198,33 +198,45 @@ func (s *Systemd) applyLimits(ctx context.Context, unit string, l config.Limits)
 }
 
 // Start implements Supervisor. It waits for the start job and returns an error if the
-// job did not complete or the unit is not active afterwards.
+// job did not complete or the unit is not active afterwards. A request the bus drops without
+// an answer is sent again (retryBus).
 func (s *Systemd) Start(ctx context.Context, unit string) error {
-	c, err := s.dial(ctx)
-	if err != nil {
+	var ch chan string
+	err := retryBus(ctx, s.log, "start "+unit, func() error {
+		c, err := s.dial(ctx)
+		if err != nil {
+			return err
+		}
+		// A start the node's own operations ask for (a resume, a resize, a rollback after one) must not
+		// be refused by the unit's rate limit (StartLimitBurst): reset-failed clears the start counter
+		// of a unit in any state, not only the failed state of one that hit the limit. A unit that is
+		// not loaded answers with an error, which is ignored.
+		_ = c.ResetFailedUnitContext(ctx, unit)
+		ch = make(chan string, 1)
+		_, err = c.StartUnitContext(ctx, unit, "replace", ch)
 		return err
-	}
-	// A start the node's own operations ask for (a resume, a resize, a rollback after one) must not
-	// be refused by the unit's rate limit (StartLimitBurst): reset-failed clears the start counter
-	// of a unit in any state, not only the failed state of one that hit the limit. A unit that is
-	// not loaded answers with an error, which is ignored.
-	_ = c.ResetFailedUnitContext(ctx, unit)
-	ch := make(chan string, 1)
-	if _, err := c.StartUnitContext(ctx, unit, "replace", ch); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("units: start %s: %w", unit, err)
 	}
 	return waitJob(ctx, unit, "start", ch)
 }
 
 // Stop implements Supervisor. systemd applies the template's KillSignal (SIGINT for
-// Postgres) and TimeoutStopSec.
+// Postgres) and TimeoutStopSec. A request the bus drops without an answer is sent again
+// (retryBus).
 func (s *Systemd) Stop(ctx context.Context, unit string) error {
-	c, err := s.dial(ctx)
-	if err != nil {
+	var ch chan string
+	err := retryBus(ctx, s.log, "stop "+unit, func() error {
+		c, err := s.dial(ctx)
+		if err != nil {
+			return err
+		}
+		ch = make(chan string, 1)
+		_, err = c.StopUnitContext(ctx, unit, "replace", ch)
 		return err
-	}
-	ch := make(chan string, 1)
-	if _, err := c.StopUnitContext(ctx, unit, "replace", ch); err != nil {
+	})
+	if err != nil {
 		var de godbus.Error
 		if errors.As(err, &de) && de.Name == "org.freedesktop.systemd1.NoSuchUnit" {
 			return nil
