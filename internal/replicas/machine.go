@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
@@ -229,8 +230,8 @@ const roomRetry = time.Minute
 // RoomError is what InstanceOps.Ensure returns when the node refused the replica because it has no
 // room for it (memory, cores or disk), before it created anything. The replica then waits at
 // 0_requested with a replica_capacity alert, as for a node the leader knows to be full, instead of
-// failing its setup. placement's errors wrap one when the node's admission says no, and keep it
-// across the peer API.
+// failing its setup. The *lifecycle.CapacityError a node's admission produces counts as one, so
+// does any error with a NoRoom method that says so, and both are found through wrapping.
 type RoomError interface {
 	error
 	NoRoom() bool
@@ -238,8 +239,15 @@ type RoomError interface {
 
 // noRoom reports whether err is a node's refusal for lack of room.
 func noRoom(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ce *lifecycle.CapacityError
+	if errors.As(err, &ce) {
+		return true
+	}
 	var re RoomError
-	return err != nil && errors.As(err, &re) && re.NoRoom()
+	return errors.As(err, &re) && re.NoRoom()
 }
 
 // roomRefusal returns the node's last refusal of the replica, or nil.

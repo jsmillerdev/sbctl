@@ -2,11 +2,13 @@ package replicas
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -364,6 +366,33 @@ func TestAdmitSeesWhatTheNodeHolds(t *testing.T) {
 		t.Fatalf("seed bytes %d with no base backup row", second.SeedBytes)
 	}
 }
+
+// What counts as a node's refusal for lack of room: the capacity error the node's admission makes,
+// and anything that says NoRoom, through any wrapping; nothing else does.
+func TestNoRoom(t *testing.T) {
+	capacity := &lifecycle.CapacityError{Message: "node n2 has 1.0 GB of memory left and a small project needs 2.0 GB"}
+	for name, tt := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"nil":                        {nil, false},
+		"a capacity error":           {capacity, true},
+		"a wrapped capacity error":   {fmt.Errorf("node n2: %w", capacity), true},
+		"a NoRoom error":             {fmt.Errorf("call: %w", fakeNoRoom{"disk"}), true},
+		"a NoRoom that says no":      {noRoomNo{}, false},
+		"a failure of another kind":  {errors.New("boom"), false},
+		"a remote error without one": {&mesh.RemoteError{Node: "n2", Status: 507}, false},
+	} {
+		if got := noRoom(tt.err); got != tt.want {
+			t.Errorf("%s: noRoom = %v, want %v", name, got, tt.want)
+		}
+	}
+}
+
+type noRoomNo struct{}
+
+func (noRoomNo) Error() string { return "no" }
+func (noRoomNo) NoRoom() bool  { return false }
 
 // A node the leader cannot judge refuses the replica itself when it is asked to create it. That
 // is a wait, not a failure: the row goes back to 0_requested, the node gets one replica_capacity
