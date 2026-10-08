@@ -203,12 +203,12 @@ func (f *FirstBoot) Run(ctx context.Context) (*FirstBootResult, error) {
 // findDevice returns the device node of the data volume: the EBS volume that is not the one the
 // root file system is on. The volume is attached after the instance starts, so it waits.
 func (f *FirstBoot) findDevice(ctx context.Context) (string, error) {
-	if f.Device != "" {
-		return f.Device, nil
-	}
-	root, err := f.rootDisk(ctx)
+	source, root, err := f.rootInfo(ctx)
 	if err != nil {
 		return "", err
+	}
+	if f.Device != "" {
+		return f.Device, f.checkNamedDevice(ctx, source, root)
 	}
 	deadline := time.Now().Add(f.Timeout)
 	for {
@@ -230,23 +230,47 @@ func (f *FirstBoot) findDevice(ctx context.Context) (string, error) {
 	}
 }
 
-// rootDisk is the name of the disk that holds the root file system ("nvme0n1"). It must be known:
-// without it the root volume could be taken for the data volume.
-func (f *FirstBoot) rootDisk(ctx context.Context) (string, error) {
+// rootInfo is the device that holds the root file system ("/dev/nvme0n1p1") and the name of the disk
+// it is on ("nvme0n1"). Both must be known: without them the root volume could be taken for the
+// data volume, or named as it.
+func (f *FirstBoot) rootInfo(ctx context.Context) (source, disk string, err error) {
 	src, err := f.Runner.Run(ctx, nil, "findmnt", "-n", "-o", "SOURCE", "/")
 	if err != nil {
-		return "", fmt.Errorf("cannot tell which disk holds /: %w", err)
+		return "", "", fmt.Errorf("cannot tell which disk holds /: %w", err)
 	}
-	out, err := f.Runner.Run(ctx, nil, "lsblk", "-no", "PKNAME", strings.TrimSpace(string(src)))
+	source = strings.TrimSpace(string(src))
+	out, err := f.Runner.Run(ctx, nil, "lsblk", "-no", "PKNAME", source)
 	if err != nil {
-		return "", fmt.Errorf("cannot tell which disk holds /: %w", err)
+		return "", "", fmt.Errorf("cannot tell which disk holds /: %w", err)
 	}
 	for _, l := range strings.Split(string(out), "\n") {
 		if l = strings.TrimSpace(l); l != "" {
-			return l, nil
+			return source, l, nil
 		}
 	}
-	return "", errors.New("cannot tell which disk holds /: lsblk named no parent disk")
+	return "", "", errors.New("cannot tell which disk holds /: lsblk named no parent disk")
+}
+
+// checkNamedDevice refuses a --data-device that is the root volume: the root disk, one of its
+// partitions, or the device the root file system is mounted from. Blank-device and XFS checks would
+// stop most of these later, but a root partition that holds XFS passes them, and the root volume
+// would be mounted a second time as the data volume.
+func (f *FirstBoot) checkNamedDevice(ctx context.Context, source, rootDisk string) error {
+	dev := f.Device
+	if real, err := filepath.EvalSymlinks(dev); err == nil {
+		dev = real
+	}
+	if dev == source || f.Device == source || filepath.Base(dev) == rootDisk {
+		return fmt.Errorf("--data-device %s is the root volume (the root file system is on %s); name the data volume", f.Device, source)
+	}
+	if out, err := f.Runner.Run(ctx, nil, "lsblk", "-no", "PKNAME", dev); err == nil {
+		for _, l := range nonEmptyLines(out) {
+			if l == rootDisk {
+				return fmt.Errorf("--data-device %s is a partition of the root volume (%s); name the data volume", f.Device, rootDisk)
+			}
+		}
+	}
+	return nil
 }
 
 // dataCandidates lists the whole-disk EBS devices other than the root disk. udev can give one disk

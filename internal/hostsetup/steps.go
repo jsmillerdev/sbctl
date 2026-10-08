@@ -404,7 +404,8 @@ func ufwStep(o Options) Step {
 		if _, err := o.lookPath("ufw"); err != nil {
 			return true, "ufw is not installed", false
 		}
-		out, err := o.runner().Run(ctx, nil, "ufw", "status")
+		// ufw translates its output, and sudo keeps LANG and LC_*: "Status: active" is read in English.
+		out, err := o.runner().Run(ctx, []string{"LC_ALL=C"}, "ufw", "status")
 		if err != nil {
 			if o.geteuid() != 0 {
 				return true, "ufw's rules cannot be read without root", false
@@ -503,10 +504,13 @@ func packageStep(o Options, p PackageSpec) Step {
 				return Outcome{}, err
 			}
 			env := []string{"DEBIAN_FRONTEND=noninteractive"}
+			// unattended-upgrades holds the dpkg lock for minutes at times; wait for it instead of
+			// failing the converge (and, under the upgrade, rolling it back).
+			lock := []string{"-o", "DPkg::Lock::Timeout=300"}
 			// A stale package index is common on a server that has been up for months; a failed
 			// refresh is not fatal if the install can still find the packages.
-			_, _ = o.runner().Run(ctx, env, "apt-get", "update", "-qq")
-			if _, err := o.runner().Run(ctx, env, "apt-get", append([]string{"install", "-y", "-qq"}, m...)...); err != nil {
+			_, _ = o.runner().Run(ctx, env, "apt-get", append(append([]string{}, lock...), "update", "-qq")...)
+			if _, err := o.runner().Run(ctx, env, "apt-get", append(append([]string{}, lock...), append([]string{"install", "-y", "-qq"}, m...)...)...); err != nil {
 				return Outcome{}, err
 			}
 			return Outcome{Changed: []string{"installed " + strings.Join(m, ", ")}}, nil
@@ -527,10 +531,13 @@ type ConfigSyncer interface {
 func configSyncStep(o Options) Step {
 	return &funcStep{
 		id: "config-d", title: titleConfigD, root: true,
+		// A leader that cannot be reached is no reason to fail a host: the settings stay as they are
+		// and the step says so (an upgrade that failed on it would roll the node back for the sake of
+		// a copy of the leader's settings).
 		check: func(ctx context.Context) (Pending, error) {
 			changed, err := o.ConfigSync.Sync(ctx, true)
 			if err != nil {
-				return Pending{}, err
+				return Pending{Detail: "the cluster settings were not refreshed: " + err.Error()}, nil
 			}
 			sort.Strings(changed)
 			return Pending{Pending: len(changed) > 0, Detail: strings.Join(changed, ", ")}, nil
@@ -538,11 +545,15 @@ func configSyncStep(o Options) Step {
 		apply: func(ctx context.Context) (Outcome, error) {
 			changed, err := o.ConfigSync.Sync(ctx, false)
 			var out Outcome
+			if err != nil {
+				out.Warnings = append(out.Warnings, "the cluster settings were not refreshed: "+err.Error())
+				return out, nil
+			}
 			for _, f := range changed {
 				out.Changed = append(out.Changed, "wrote "+f)
 			}
 			out.Files = changed
-			return out, err
+			return out, nil
 		},
 	}
 }

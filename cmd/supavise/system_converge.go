@@ -112,8 +112,12 @@ func newConverger(cfg *config.Config, unitDir, polkitDir string, sandbox bool, o
 		},
 		PeerPort: peerPort(cfg),
 	}
+	// A server in a cluster refreshes the cluster-scoped settings from its leader.
+	if cs := newClusterConfigSync(cfg, selfUpdateConfigPath()); cs != nil {
+		o.ConfigSync = cs
+	}
 	if sandbox {
-		o.Owner, o.PeerPort = nil, 0
+		o.Owner, o.PeerPort, o.ConfigSync = nil, 0, nil
 		o.MountInfo = func() ([]byte, error) { return nil, errors.New("not read in a test directory") }
 	}
 	// A test directory takes the unit files and nothing else, so it must not record that the host is
