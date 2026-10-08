@@ -90,7 +90,7 @@ func TestDelegationRefusals(t *testing.T) {
 			// The move that runs on n2 is in the registry the leader replicates.
 			must(w.t, w.reg.CreateMove(w.ctx, &registry.Move{Scope: registry.MoveServer, Kind: registry.MoveSwitchover, FromNode: "n1", ToNode: "n2", Epoch: 2}))
 		}, want: "--resume on standby"},
-		"a failover is not delegated":   {opts: ServerOptions{To: "n2", OldPrimaryIsDown: true}, want: "failover runs on the node that takes over"},
+		"a failover is not delegated": {opts: ServerOptions{To: "n2", OldPrimaryIsDown: true}, want: "failover runs on the node that takes over"},
 		"a follower cannot ask": {opts: ServerOptions{To: "n2"}, mut: func(w *world) {
 			w.addNode3()
 			w.setSelf("n3", false)

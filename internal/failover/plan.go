@@ -419,7 +419,7 @@ func (o *Orchestrator) planServer(ctx context.Context, opts ServerOptions) (*Pla
 	pl.From, pl.To, pl.FromName, pl.ToName = leader.ID, toNode.ID, leader.Name, toNode.Name
 	switch {
 	case leader.ID == toNode.ID:
-		pl.Checks = append(pl.Checks, hard(fail("target node", fmt.Sprintf("%s is the leader already", toNode.Name))))
+		pl.Checks = append(pl.Checks, hard(fail("target node", fmt.Sprintf("%s is the leader already: run this on the node that should lead, or name it with --to", toNode.Name))))
 		return pl, run, nil
 	case toNode.State != registry.NodeActive:
 		pl.Checks = append(pl.Checks, hard(fail("target node", fmt.Sprintf("%s is %s", toNode.Name, toNode.State))))

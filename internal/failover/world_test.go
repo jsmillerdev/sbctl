@@ -32,7 +32,7 @@ type world struct {
 	events []string
 
 	cfg     *config.Config
-	reg     *registry.Memory
+	reg     registry.Registry
 	members *cluster.Static
 	snap    cluster.Snapshot
 	self    string
@@ -99,7 +99,12 @@ func f64(v float64) *float64 { return &v }
 
 // newWorld builds the standard cluster: n1 leads with the system project and two projects
 // (refA, refB), n2 follows and holds a healthy standby of each, Storage is on S3 and the epoch is 1.
-func newWorld(t *testing.T) *world {
+func newWorld(t *testing.T) *world { return newWorldFunc(t) }
+
+// newWorldFunc builds the standard world; the tests that also run on Postgres swap it (pg_test.go).
+var newWorldFunc = func(t *testing.T) *world { return newWorldOn(t, registry.NewMemory()) }
+
+func newWorldOn(t *testing.T, reg registry.Registry) *world {
 	t.Helper()
 	ctx := context.Background()
 	cfg := config.Default()
@@ -107,7 +112,7 @@ func newWorld(t *testing.T) *world {
 	cfg.Domain = "example.test"
 	cfg.Fleet.StorageBackend = "s3"
 	w := &world{
-		t: t, ctx: ctx, cfg: cfg, reg: registry.NewMemory(), self: "n1", writable: true,
+		t: t, ctx: ctx, cfg: cfg, reg: reg, self: "n1", writable: true,
 		down: map[string]bool{}, partitioned: map[string]bool{}, failures: map[string]*failure{},
 		prim: map[string]*primState{}, inst: map[string]*instState{}, lsn: map[string]string{}, replay: map[string]string{},
 	}
@@ -351,7 +356,7 @@ func (w *world) assertNever(prefix string) {
 func (w *world) deps() Deps {
 	return Deps{
 		Cfg: w.cfg, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Store: func() Store { return &gatedStore{w: w, Memory: w.reg} }, Members: w.members,
+		Store: func() Store { return &gatedStore{w: w, Registry: w.reg} }, Members: w.members,
 		Instances: (*worldInstances)(w), Primaries: (*worldPrimaries)(w), Backups: (*worldBackups)(w), Fleet: (*worldFleet)(w),
 		Peers: (*worldPeers)(w), Leader: (*worldLeader)(w), Takeover: (*worldTakeover)(w), Replicas: (*worldReplicas)(w),
 		Marker: (*worldMarker)(w), Provider: w.provider, LocalPrimaries: (*worldLocal)(w), LocalServices: (*worldServices)(w),
@@ -393,7 +398,7 @@ func (w *world) alertKinds() []string {
 // gatedStore is the in-memory registry with its writes refused while the node is a standby.
 type gatedStore struct {
 	w *world
-	*registry.Memory
+	registry.Registry
 }
 
 func (g *gatedStore) gate(what string) error {
@@ -407,21 +412,21 @@ func (g *gatedStore) SetProjectStatus(ctx context.Context, ref string, s registr
 	if err := g.gate("SetProjectStatus " + ref + " " + string(s)); err != nil {
 		return err
 	}
-	return g.Memory.SetProjectStatus(ctx, ref, s)
+	return g.Registry.SetProjectStatus(ctx, ref, s)
 }
 
 func (g *gatedStore) SetNodeState(ctx context.Context, id string, s registry.NodeState) error {
 	if err := g.gate("SetNodeState " + id + " " + string(s)); err != nil {
 		return err
 	}
-	return g.Memory.SetNodeState(ctx, id, s)
+	return g.Registry.SetNodeState(ctx, id, s)
 }
 
 func (g *gatedStore) SetLeader(ctx context.Context, node string, epoch int64) error {
 	if err := g.gate(fmt.Sprintf("SetLeader %s %d", node, epoch)); err != nil {
 		return err
 	}
-	if err := g.Memory.SetLeader(ctx, node, epoch); err != nil {
+	if err := g.Registry.SetLeader(ctx, node, epoch); err != nil {
 		return err
 	}
 	g.w.refreshMembers()
@@ -432,42 +437,42 @@ func (g *gatedStore) SetMaintenance(ctx context.Context, m registry.Maintenance)
 	if err := g.gate("SetMaintenance " + m.Node); err != nil {
 		return err
 	}
-	return g.Memory.SetMaintenance(ctx, m)
+	return g.Registry.SetMaintenance(ctx, m)
 }
 
 func (g *gatedStore) SetProjectNode(ctx context.Context, ref, node string, epoch int64) error {
 	if err := g.gate(fmt.Sprintf("SetProjectNode %s %s %d", ref, node, epoch)); err != nil {
 		return err
 	}
-	return g.Memory.SetProjectNode(ctx, ref, node, epoch)
+	return g.Registry.SetProjectNode(ctx, ref, node, epoch)
 }
 
 func (g *gatedStore) CreateReplica(ctx context.Context, r *registry.Replica) error {
 	if err := g.gate("CreateReplica " + r.Ref + " " + r.NodeID); err != nil {
 		return err
 	}
-	return g.Memory.CreateReplica(ctx, r)
+	return g.Registry.CreateReplica(ctx, r)
 }
 
 func (g *gatedStore) CreateMove(ctx context.Context, m *registry.Move) error {
 	if err := g.gate("CreateMove " + string(m.Scope)); err != nil {
 		return err
 	}
-	return g.Memory.CreateMove(ctx, m)
+	return g.Registry.CreateMove(ctx, m)
 }
 
 func (g *gatedStore) AppendMoveStep(ctx context.Context, id int64, s registry.MoveStep) error {
 	if !g.w.writable {
 		return registry.ErrReadOnly
 	}
-	return g.Memory.AppendMoveStep(ctx, id, s)
+	return g.Registry.AppendMoveStep(ctx, id, s)
 }
 
 func (g *gatedStore) FinishMove(ctx context.Context, id int64, st registry.MoveState, e string) error {
 	if err := g.gate("FinishMove " + string(st)); err != nil {
 		return err
 	}
-	return g.Memory.FinishMove(ctx, id, st, e)
+	return g.Registry.FinishMove(ctx, id, st, e)
 }
 
 // worldPrimaries implements Primaries.
