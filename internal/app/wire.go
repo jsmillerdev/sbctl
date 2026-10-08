@@ -28,7 +28,8 @@ import (
 // still plain options; register peer API handlers with mesh.Handle; start background work with
 // w.Go; and publish what later hooks need with Provide. A hook that has nothing to do on this
 // node (no cluster is configured) returns nil without doing anything, so a node that does not use
-// the cluster features behaves as it did.
+// the cluster features behaves as it did. A hook that cannot provide a part of the cluster work says
+// so with Off and the reason, and wire_ports.go lists the parts a node of a cluster must have.
 
 // wireHooks run in this order. A hook may Get what an earlier one provided.
 var wireHooks = []struct {
@@ -121,8 +122,8 @@ func Get[T any](w *Wire) (T, bool) {
 	return v, ok
 }
 
-// run calls the hooks in order. A hook that returns notimpl.Err is skipped; any other error stops
-// the daemon before it serves.
+// run calls the hooks in order, then checks the ports of the cluster (verifyPorts). A hook that
+// returns notimpl.Err is skipped; any other error stops the daemon before it serves.
 func (w *Wire) run(ctx context.Context) error {
 	for _, h := range wireHooks {
 		err := h.fn(ctx, w)

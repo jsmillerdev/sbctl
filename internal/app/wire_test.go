@@ -27,11 +27,11 @@ func testWire(t *testing.T) *Wire {
 	return newWire(config.Default(), log, node, Options{}, &api.Deps{}, &proxy.Options{})
 }
 
-// Until a hook is implemented its stub says so, and Serve goes on without it.
-func TestUnimplementedHooksAreSkipped(t *testing.T) {
+// On a server with no cluster every hook runs and does nothing but the watch for a cluster identity.
+func TestHooksOfASingleServerStartOnlyTheIdentityWatcher(t *testing.T) {
 	w := testWire(t)
 	if err := w.run(context.Background()); err != nil {
-		t.Fatalf("run with the stubs: %v", err)
+		t.Fatalf("run: %v", err)
 	}
 	// The mesh hook of a server that never joined a cluster watches for the cluster identity that
 	// `supavise node token` writes, and starts nothing else.
@@ -135,5 +135,26 @@ func TestWireDefaults(t *testing.T) {
 	}
 	if m, _ := Get[cluster.Membership](w); m.IsLeader() {
 		t.Fatal("providing the concrete type replaced the interface")
+	}
+}
+
+// A hook reads what an earlier one provided, so the order of the table is part of the wiring: the mesh
+// before everything, placement before the failover orchestrator that needs its ports, the fleet before
+// the replica controller (the pooler) and the failover ports (tenants, services), the controller
+// before the proxy (the lag of a replica) and the failover orchestrator (replica setup).
+func TestHookOrderGivesEachHookWhatItReads(t *testing.T) {
+	pos := map[string]int{}
+	for i, h := range wireHooks {
+		pos[h.name] = i
+	}
+	for _, c := range []struct{ first, then string }{
+		{"host", "mesh"}, {"mesh", "placement"}, {"mesh", "fleet"}, {"placement", "replicas"}, {"fleet", "replicas"},
+		{"replicas", "proxy"}, {"placement", "failover"}, {"fleet", "failover"}, {"replicas", "failover"}, {"proxy", "failover"},
+	} {
+		a, aok := pos[c.first]
+		b, bok := pos[c.then]
+		if !aok || !bok || a >= b {
+			t.Errorf("hook %q must run before %q (positions %d, %d)", c.first, c.then, a, b)
+		}
 	}
 }
