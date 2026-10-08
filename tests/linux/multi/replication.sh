@@ -332,7 +332,7 @@ project_move() {
   ref=$(sget ref1) sha1=$(sget sha1) lead=$(lead)
   onl "$lead" wait_replicas "$ref" 1 600
   run=$(next_run)
-  onl n2 writer_start "$ref" "$run"
+  onl n2 writer_start "$ref" "$run" "$WRITER_RATE"
   sleep 10
   onl "$lead" supavise projects failover "$ref" --to "$to" --dry-run || log "the dry run was refused (the move would be refused)"
   t0=$SECONDS
@@ -367,7 +367,7 @@ server_move() {
   epoch0=$(onl "$old" node_epoch)
   for ref in $ref1 $ref2; do onl "$old" wait_replicas "$ref" 1 600; done
   run=$(next_run)
-  onl n2 writer_start "$ref1" "$run"
+  onl n2 writer_start "$ref1" "$run" "$WRITER_RATE"
   sleep 10
   onl "$runner" supavise failover --to "$new" --dry-run || log "the dry run was refused (the move would be refused)"
   t0=$SECONDS
@@ -411,7 +411,7 @@ c_hard_failover() {
   epoch0=$(onl n1 node_epoch)
   for ref in $ref1 $ref2; do onl n1 wait_replicas "$ref" 1 600; done
   run=$(next_run)
-  onl n2 writer_start "$ref1" "$run"
+  onl n2 writer_start "$ref1" "$run" "$WRITER_RATE"
   sleep 5
   lag=$(onl n1 replay_lag_max "$ref1" 10)
   note hard.replay_lag_before_seconds "$lag"

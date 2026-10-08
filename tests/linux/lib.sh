@@ -61,12 +61,6 @@ wait_apt_idle() {
   log "apt is still busy after ${n}s: $(pgrep -a -x 'apt|apt-get|dpkg' | head -n 3 | paste -sd';' -)"
 }
 
-# free_port: prints a TCP port on 127.0.0.1 that nothing listens on now, for a local server the test starts
-# (a fixed port that another process holds fails the test for a reason that is not the test's).
-free_port() {
-  python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
-}
-
 # install_binary: put supavise at /usr/local/bin/supavise (build it when SUPAVISE_BIN is not set).
 install_binary() {
   if [[ -z "$SUPAVISE_BIN" ]]; then

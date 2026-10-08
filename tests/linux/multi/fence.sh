@@ -18,7 +18,15 @@ if [ -z "$host" ] || [ "$host" = "$OLD_NODE_ADDR" ]; then
   echo "fence: the registry has no address for $OLD_NODE" >&2
   exit 1
 fi
-if timeout 4 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+case $port in
+  '' | *[!0-9]*)
+    echo "$(stamp) fence refused: no numeric port in the address of $OLD_NODE" >>"$log"
+    echo "fence: the registry has no port for $OLD_NODE" >&2
+    exit 1
+    ;;
+esac
+# The address is data from the registry: it goes to the shell as arguments, never into the text of a command.
+if timeout 4 bash -c 'exec 3<>/dev/tcp/$0/$1' "$host" "$port" 2>/dev/null; then
   echo "$(stamp) fence refused: $OLD_NODE still answers on $host:$port" >>"$log"
   echo "fence: $OLD_NODE still answers on $host:$port, so it can still write" >&2
   exit 1
