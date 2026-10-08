@@ -67,6 +67,10 @@ type Timeouts struct {
 	Replay time.Duration
 	// Complete is how long the standby may take to accept connections once it streams. Default 10 minutes.
 	Complete time.Duration
+	// Busy is how long RemoveAll and RemoveOn wait for a worker that is acting on a replica
+	// (it may be creating the instance at this moment) before they report the removal as pending.
+	// Default 30 seconds.
+	Busy time.Duration
 }
 
 func (t Timeouts) withDefaults() Timeouts {
@@ -80,6 +84,7 @@ func (t Timeouts) withDefaults() Timeouts {
 	def(&t.Download, 30*time.Minute)
 	def(&t.Replay, 2*time.Hour)
 	def(&t.Complete, 10*time.Minute)
+	def(&t.Busy, 30*time.Second)
 	return t
 }
 
@@ -110,10 +115,22 @@ type Controller struct {
 
 	// runCtx is the context of Run while it runs; Restart's background call ends with it.
 	runCtx context.Context
+	// stopped is set when Run is winding down: no new background call may start.
+	stopped bool
+
+	// workers holds a token for each running worker, so a pass never starts more than maxWorkers.
+	workers chan struct{}
+	// resume is the row the next pass starts at, after one that ran out of worker tokens, so that
+	// the rows at the end of the list are not starved.
+	resume int
 
 	wg   sync.WaitGroup
 	wake chan struct{}
 }
+
+// maxWorkers bounds how many replicas the controller acts on at once. A pass that has more to do
+// goes on with the rest in the next one.
+const maxWorkers = 32
 
 var (
 	_ Service    = (*Controller)(nil)
@@ -126,7 +143,7 @@ func New(o Options) *Controller {
 	c := &Controller{
 		o: o, cfg: o.Config, reg: o.Registry, log: o.Log, to: o.Timeouts.withDefaults(), now: o.Now,
 		state: map[string]*replicaState{}, busy: map[string]bool{}, capacityAlerted: map[string]bool{},
-		warned: map[string]bool{}, wake: make(chan struct{}, 1),
+		warned: map[string]bool{}, wake: make(chan struct{}, 1), workers: make(chan struct{}, maxWorkers),
 	}
 	if c.log == nil {
 		c.log = slog.New(slog.DiscardHandler)
@@ -188,9 +205,12 @@ func (c *Controller) Run(ctx context.Context) error {
 		changes = nil
 	}
 	c.mu.Lock()
-	c.runCtx = ctx
+	c.runCtx, c.stopped = ctx, false
 	c.mu.Unlock()
 	defer func() {
+		c.mu.Lock()
+		c.stopped = true
+		c.mu.Unlock()
 		c.wg.Wait()
 		c.mu.Lock()
 		c.runCtx = nil
@@ -285,10 +305,15 @@ func (c *Controller) pass(ctx context.Context) (idle bool) {
 	}
 	for i := range rows {
 		live[rows[i].Identifier] = true
-		if needsWork(&rows[i]) {
-			c.spawn(ctx, rows[i], status[rows[i].Ref])
+	}
+	start, n, left := c.resume, len(rows), -1
+	for k := range n {
+		i := (start + k) % n
+		if needsWork(&rows[i]) && !c.spawn(ctx, rows[i], status[rows[i].Ref]) && left < 0 {
+			left = i // out of workers: begin here next time
 		}
 	}
+	c.resume = max(left, 0)
 	c.forget(live)
 	c.writeSnapshot(rows)
 	return false
@@ -310,13 +335,20 @@ func needsWork(r *registry.Replica) bool {
 	return active(r)
 }
 
-// spawn starts a worker for the replica unless one is running for it.
-func (c *Controller) spawn(ctx context.Context, row registry.Replica, project registry.Status) {
+// spawn starts a worker for the replica unless one is running for it. It reports false when there
+// is no free worker, so the replica waits for the next pass.
+func (c *Controller) spawn(ctx context.Context, row registry.Replica, project registry.Status) bool {
 	id := row.Identifier
 	c.mu.Lock()
 	if c.busy[id] {
 		c.mu.Unlock()
-		return
+		return true
+	}
+	select {
+	case c.workers <- struct{}{}:
+	default:
+		c.mu.Unlock()
+		return false
 	}
 	c.busy[id] = true
 	c.mu.Unlock()
@@ -327,9 +359,11 @@ func (c *Controller) spawn(ctx context.Context, row registry.Replica, project re
 			c.mu.Lock()
 			delete(c.busy, id)
 			c.mu.Unlock()
+			<-c.workers
 		}()
 		c.work(ctx, &row, project)
 	}()
+	return true
 }
 
 // forget drops what is kept in memory for replicas that no longer have a row.
@@ -383,3 +417,6 @@ func nodeLabel(n registry.Node) string {
 
 // errNoOps is returned by the calls that need the node operations on a Controller built without them.
 var errNoOps = errors.New("replicas: this node cannot reach the replica nodes")
+
+// errStopping is returned by a call that would start background work while the controller shuts down.
+var errStopping = errors.New("replicas: the controller is shutting down")

@@ -39,18 +39,28 @@ type Service interface {
 // Service. The controller implements both. Neither method records an opt-out: the default
 // reconciler may create the replicas again when the project or the node comes back.
 type Remover interface {
-	// RemoveAll removes every replica of ref (a project delete or an in-place restore). A removal
-	// that cannot finish now, because the node does not answer, leaves its row GOING_DOWN for the
-	// controller to retry and is returned in a *PendingError.
+	// RemoveAll removes every replica of ref (a project delete or an in-place restore). It waits
+	// a short while for a setup that is acting on a replica, then removes it. A removal that cannot
+	// finish now, because the node does not answer, leaves its row GOING_DOWN for the controller to
+	// retry and is returned in a *PendingError.
+	//
+	// A project row owns its replica rows (the registry deletes them with it), so the caller must
+	// not delete the project while RemoveAll returns a *PendingError: the retry would go with the
+	// row and the instance would stay on the node. It refuses the delete (the node can be tried
+	// again) or retries RemoveAll until it returns nil. An in-place restore may go on only
+	// when RemoveAll returns nil, too.
 	RemoveAll(ctx context.Context, ref string) error
 	// RemoveOn removes every replica on node, the standby of the system cluster included
-	// (`supavise node rm`). A node whose state is left has nothing to reach: its rows are deleted.
+	// (`supavise node rm`). The caller first moves the node out of the active state (left): while
+	// it is active the default reconciler makes the replicas again. A node whose state is left has
+	// nothing to reach: its rows are deleted.
 	RemoveOn(ctx context.Context, node string) error
 }
 
 // ReportSink takes the observed state a node reports to the leader (peerapi.PathReport). The
 // mesh's intake handler calls it; the controller also polls the nodes, so a report only makes
-// the leader's picture fresher.
+// the leader's picture fresher. The sink trusts Report.Node (it takes an instance only from the
+// node whose row it is), so the intake must set Node from the node's authenticated identity.
 type ReportSink interface {
 	HandleReport(ctx context.Context, rep peerapi.Report)
 }

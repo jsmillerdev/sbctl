@@ -275,7 +275,7 @@ func TestRestartNeedsTheNodeOperations(t *testing.T) {
 // A replica a worker is acting on is not removed under it: RemoveAll leaves it GOING_DOWN, reports
 // it, and the controller removes it when the worker is done.
 func TestRemoveAllWaitsForABusyWorker(t *testing.T) {
-	e := newEnv(t)
+	e := newEnv(t, func(o *Options) { o.Timeouts.Busy = 50 * time.Millisecond })
 	r := e.activeReplica()
 	e.ctrl.mu.Lock()
 	e.ctrl.busy[r.Identifier] = true
@@ -294,5 +294,27 @@ func TestRemoveAllWaitsForABusyWorker(t *testing.T) {
 	e.tick(1)
 	if e.hasReplica(refA, "n2") {
 		t.Fatal("not removed after the worker was done")
+	}
+}
+
+// A worker that finishes within the wait does not make the removal pending: the caller can delete
+// the project when RemoveAll returns nil.
+func TestRemoveAllWaitsUntilTheWorkerIsDone(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.Timeouts.Busy = 5 * time.Second })
+	r := e.activeReplica()
+	e.ctrl.mu.Lock()
+	e.ctrl.busy[r.Identifier] = true
+	e.ctrl.mu.Unlock()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		e.ctrl.mu.Lock()
+		delete(e.ctrl.busy, r.Identifier)
+		e.ctrl.mu.Unlock()
+	}()
+	if err := e.ctrl.RemoveAll(e.ctx, refA); err != nil {
+		t.Fatalf("RemoveAll = %v", err)
+	}
+	if e.hasReplica(refA, "n2") || e.nodes.get("n2", r.Identifier) != nil {
+		t.Fatal("not removed")
 	}
 }

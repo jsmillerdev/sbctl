@@ -2,8 +2,10 @@ package replicas
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,5 +179,72 @@ func TestReadSnapshot(t *testing.T) {
 	var none *Snapshot
 	if _, ok := none.Entry("x"); ok {
 		t.Fatal("entry of a nil snapshot")
+	}
+}
+
+// A pass starts at most as many workers as there are tokens; the rows it could not serve go first
+// in the next pass.
+func TestPassBoundsItsWorkers(t *testing.T) {
+	e := newEnv(t)
+	e.addProject(refC, "small")
+	refs := []string{refA, refB, refC}
+	ids := map[string]string{}
+	for _, ref := range refs {
+		if err := e.ctrl.SetupOn(e.ctx, ref, "n2"); err != nil {
+			t.Fatal(err)
+		}
+		ids[ref] = e.settle(ref, "n2").Identifier
+	}
+	e.ctrl.workers = make(chan struct{}, 2)
+	// observed runs a pass whose workers wait at the gate until the pass is over, and returns the
+	// replicas they observed.
+	observed := func() map[string]bool {
+		e.clock.Advance(time.Minute)
+		before := len(e.nodes.calls)
+		e.nodes.gate = make(chan struct{})
+		e.ctrl.pass(e.ctx)
+		close(e.nodes.gate)
+		e.ctrl.wg.Wait()
+		got := map[string]bool{}
+		for _, c := range e.nodes.calls[before:] {
+			for ref, id := range ids {
+				if strings.HasSuffix(c, id) && strings.HasPrefix(c, "observe") {
+					got[ref] = true
+				}
+			}
+		}
+		return got
+	}
+	if got := observed(); len(got) != 2 || !got[refA] || !got[refB] || e.ctrl.resume != 2 {
+		t.Fatalf("first pass observed %v, resume %d", got, e.ctrl.resume)
+	}
+	// The row left over goes first, then the ones from the start of the list.
+	if got := observed(); len(got) != 2 || !got[refC] || !got[refA] || e.ctrl.resume != 1 {
+		t.Fatalf("second pass observed %v, resume %d", got, e.ctrl.resume)
+	}
+	if got := observed(); len(got) != 2 || !got[refB] || !got[refC] || e.ctrl.resume != 0 {
+		t.Fatalf("third pass observed %v, resume %d", got, e.ctrl.resume)
+	}
+	if len(e.ctrl.workers) != 0 {
+		t.Fatalf("%d tokens still held", len(e.ctrl.workers))
+	}
+}
+
+// Restart after Run has wound down starts nothing.
+func TestRestartAfterTheControllerStopped(t *testing.T) {
+	e := newEnv(t)
+	r := e.activeReplica()
+	ctx, cancel := context.WithCancel(e.ctx)
+	done := make(chan error, 1)
+	go func() { done <- e.ctrl.Run(ctx) }()
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v", err)
+	}
+	if err := e.ctrl.Restart(e.ctx, refA, r.Identifier); !errors.Is(err, errStopping) {
+		t.Fatalf("Restart = %v", err)
+	}
+	if got := e.replica(refA, "n2").Status; got != statusHealthy {
+		t.Fatalf("status %s", got)
 	}
 }

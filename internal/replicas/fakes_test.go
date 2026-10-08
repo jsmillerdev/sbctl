@@ -73,6 +73,8 @@ type fakeNodes struct {
 	ensured   []peerapi.InstanceSpec
 	// script customizes a new instance.
 	script func(*fakeInstance)
+	// gate, when set, holds every Observe until it is closed.
+	gate chan struct{}
 }
 
 func newFakeNodes() *fakeNodes {
@@ -133,6 +135,9 @@ func (f *fakeNodes) Ensure(_ context.Context, node string, spec peerapi.Instance
 }
 
 func (f *fakeNodes) Observe(_ context.Context, node, identifier string) (peerapi.InstanceStatus, error) {
+	if g := f.gate; g != nil {
+		<-g
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("observe " + node + " " + identifier)
