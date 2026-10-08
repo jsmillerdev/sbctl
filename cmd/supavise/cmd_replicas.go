@@ -154,7 +154,7 @@ that [replicas] default = "all" made keeps the default from making it again.`,
 				if errors.Is(err, replicas.ErrNotFound) {
 					return fmt.Errorf("no read replica %s (see `supavise replicas ls`)", args[0])
 				}
-				return err
+				return leaderOnly(err)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "removing %s; the daemon finishes it in the background\n", args[0])
 			return nil
@@ -179,6 +179,14 @@ func confirmRemoval(cmd *cobra.Command, question string) error {
 	return nil
 }
 
+// leaderOnly says what to do when the registry refuses a write because this node follows.
+func leaderOnly(err error) error {
+	if errors.Is(err, registry.ErrReadOnly) {
+		return errors.New("this node follows another: run the command on the leader")
+	}
+	return err
+}
+
 // addReplica asks for a replica of ref in region, on node when one is named, and prints the
 // identifier of the row it made.
 func addReplica(ctx context.Context, w io.Writer, re *replicasEnv, ref, region, node string) error {
@@ -200,7 +208,7 @@ func addReplica(ctx context.Context, w io.Writer, re *replicasEnv, ref, region, 
 		err = re.svc.SetupOn(ctx, ref, node)
 	}
 	if err != nil {
-		return err
+		return leaderOnly(err)
 	}
 	after, err := re.svc.List(ctx, ref)
 	if err != nil {

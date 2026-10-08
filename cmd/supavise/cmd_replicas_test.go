@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -153,5 +154,16 @@ func TestStepText(t *testing.T) {
 		if got := stepText(in); got != want {
 			t.Errorf("stepText(%+v) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// A follower's registry is read-only: the command says where to run.
+func TestReplicasWriteOnAFollower(t *testing.T) {
+	if got := leaderOnly(registry.ErrReadOnly); got == nil || !strings.Contains(got.Error(), "run the command on the leader") {
+		t.Fatalf("leaderOnly = %v", got)
+	}
+	other := errors.New("boom")
+	if leaderOnly(other) != other {
+		t.Fatal("another error must pass through")
 	}
 }
