@@ -13,7 +13,7 @@ import (
 
 // This file is the contract of the replica work in this package: what the replica controller and
 // the failover orchestrator call, and the formats other packages write and this package reads.
-// Service implements ReplicaSeeder, BaseBackupEnsurer and EpochMarkerStore.
+// Service implements ReplicaSeeder, StandbyConfigurer, BaseBackupEnsurer and EpochMarkerStore.
 
 // ReplicaSeedPlan describes a standby Postgres to build.
 type ReplicaSeedPlan struct {
@@ -21,7 +21,8 @@ type ReplicaSeedPlan struct {
 	// standby's application_name is the identifier.
 	Ref        string
 	Identifier string
-	// DataDir is the empty directory to extract into (PGDATA of the standby).
+	// DataDir is the empty directory to extract into (PGDATA of the standby); for ConfigureStandby,
+	// the stopped cluster to turn into a standby.
 	DataDir string
 	// BackupID is the base backup to seed from (a Manifest.ID); empty means the newest complete
 	// one of Ref.
@@ -46,8 +47,21 @@ type ReplicaSeedPlan struct {
 // standby.signal and never recovery.signal. It also writes postmaster.opts, which the launcher
 // needs, and syncs the tree. It refuses a DataDir that is not empty. The standby sets
 // archive_mode = on, not always, so it never archives; after a promotion it pushes WAL under Ref's prefix.
+//
+// A seed that fails removes what it extracted. One that was cut off (a kill, a power loss) leaves
+// a marker in DataDir: SeedUnfinished reports it, nothing may start a cluster on that directory,
+// and the next SeedReplica clears it and starts over.
 type ReplicaSeeder interface {
 	SeedReplica(ctx context.Context, plan ReplicaSeedPlan) error
+}
+
+// StandbyConfigurer turns a stopped cluster that already has its data into a standby: the demotion
+// of a primary in place (design 2.10.3 step 7 and 2.10.4 step 9), which has the same end state as
+// a seed and no base backup to extract. ConfigureStandby writes what SeedReplica writes after the
+// extraction, from the same plan (BackupID only names the backup in a comment and may be empty),
+// and deletes the project's promote.ok.
+type StandbyConfigurer interface {
+	ConfigureStandby(plan ReplicaSeedPlan) error
 }
 
 // BaseBackupEnsurer hands out a base backup that is recent enough to seed from.
@@ -73,8 +87,8 @@ type LeaderMarker struct {
 	At     time.Time `json:"at"`
 }
 
-// ErrMarkerNewer is returned by WriteLeaderMarker when the store already holds a higher epoch:
-// someone else was promoted first, and the writer must stop.
+// ErrMarkerNewer is returned by WriteLeaderMarker when the store already holds a higher epoch, or
+// the same epoch under another leader: someone else was promoted first, and the writer must stop.
 var ErrMarkerNewer = errors.New("backup: the leader marker holds a higher epoch")
 
 // EpochMarkerStore reads and writes the leader marker.
@@ -82,13 +96,20 @@ type EpochMarkerStore interface {
 	// ReadLeaderMarker returns the marker, or nil with no error when none was written.
 	ReadLeaderMarker(ctx context.Context) (*LeaderMarker, error)
 	// WriteLeaderMarker stores m. It is a conditional write where the store supports one and a
-	// read followed by a plain write otherwise; either way it returns ErrMarkerNewer, and writes
-	// nothing, when the stored epoch is higher than m.Epoch.
+	// read followed by a plain write otherwise; either way it returns an error wrapping
+	// ErrMarkerNewer, and writes nothing, when the stored epoch is higher than m.Epoch or equal
+	// to it under another leader. The same epoch under the same leader is written again. A zero
+	// m.At is the time of the call.
 	WriteLeaderMarker(ctx context.Context, m LeaderMarker) error
 }
 
 // FormatPromoteOK is the content of projects/<ref>/promote.ok (config.Paths.PromoteOK): the
 // epoch, in decimal, and a newline. Only the promotion procedure writes the file.
+//
+// The relay trusts a promote.ok for the cluster's epoch or a later one for as long as the file
+// exists, and the epoch does not change when a project switches over or fails back. The file must
+// therefore go whenever the cluster stops being the primary: SeedReplica and ConfigureStandby delete
+// it, and a promotion that is aborted or rolled back after it wrote the file deletes it too.
 func FormatPromoteOK(epoch int64) []byte { return []byte(strconv.FormatInt(epoch, 10) + "\n") }
 
 // ParsePromoteOK reads the epoch out of a promote.ok file.

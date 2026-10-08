@@ -71,6 +71,9 @@ type Options struct {
 	// dies of a fatal recovery error is restarted by its supervisor, answers again for a
 	// moment, and dies again.
 	RecoveryMaxOutages int
+	// TakeBase takes a base backup of ref for EnsureBase. Default: BaseBackup, which needs ref's
+	// data directory on this node; the leader sets it to run the backup on the project's home node.
+	TakeBase func(ctx context.Context, ref string) (*registry.Backup, error)
 	// ArchiveFlushTimeout bounds how long a restore to the end of the archive waits for a
 	// running source to archive its newest WAL before a time or latest restore (default 60 seconds).
 	ArchiveFlushTimeout time.Duration
@@ -79,6 +82,8 @@ type Options struct {
 // Service implements Backup over a Store and the registry.
 type Service struct {
 	opt Options
+	// ensure serializes EnsureBase per ref; copies of the service (WithManager) share it.
+	ensure *refLocks
 	// probe and alter are the database calls of the post-restore wait; tests replace them.
 	probe func(ctx context.Context, ref string) (inRecovery bool, err error)
 	alter func(ctx context.Context, ref string, gucs []string) error
@@ -116,7 +121,7 @@ func New(o Options) (*Service, error) {
 	if o.ArchiveFlushTimeout <= 0 {
 		o.ArchiveFlushTimeout = time.Minute
 	}
-	s := &Service{opt: o}
+	s := &Service{opt: o, ensure: &refLocks{}}
 	s.probe, s.alter = s.pgInRecovery, s.pgResetSettings
 	return s, nil
 }

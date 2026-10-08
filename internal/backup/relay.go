@@ -92,6 +92,23 @@ type RelayOptions struct {
 	// PeerCheck decides whether the process on the other end of a connection to ref's
 	// socket may use it. Default: the systemd unit of the peer (relay_peer.go).
 	PeerCheck func(c net.Conn, ref string) error
+	// Replica reports whether this node's cluster of ref is a replica, from the registry (a
+	// follower reads its replicated copy). The relay refuses to push the WAL of a replica unless
+	// promote.ok holds the current epoch; it fetches for one as for any other project. An error
+	// answers the push with 503, which Postgres retries. Nil: no cluster here is a replica, and
+	// the guard is off. It is called on every push of every project, the system project's
+	// included, so it must answer from state that exists before the registry opens, or tolerate a
+	// registry that is not open yet.
+	Replica func(ctx context.Context, ref string) (bool, error)
+	// Epoch returns the epoch of the cluster. A promote.ok that holds a lower one is stale and
+	// does not authorize a push. Nil: any well-formed promote.ok does.
+	Epoch func(ctx context.Context) (int64, error)
+	// PromoteOK returns the path of ref's promote.ok. Default: config.Paths.PromoteOK. Without it
+	// (and without Config) a replica has no way to be promoted, and every push of one is refused.
+	PromoteOK func(ref string) string
+	// Refused is called when the guard refuses a push, at most once a minute per project, so the
+	// daemon can raise an alert.
+	Refused func(ref string, reason error)
 	// Interval is how often Run looks for projects to serve (default 3 seconds).
 	Interval time.Duration
 	Log      *slog.Logger
@@ -104,15 +121,17 @@ type Relay struct {
 
 	pushAllowance time.Duration // relayPushAllowance; tests shorten it
 	pushMinRate   int64         // relayPushMinRate
+	now           func() time.Time
 
 	// A relay never replaces a socket that answers: the daemon and a CLI relay (which serves
 	// while the daemon is down) can run at once, and the one that listens first keeps the
 	// project until it stops.
-	mu     sync.Mutex // guards ls, pinned, refMu and done; never held across I/O
-	ls     map[string]*relayListener
-	pinned map[string]bool
-	refMu  map[string]*sync.Mutex
-	done   bool
+	mu      sync.Mutex // guards ls, pinned, refMu, refused and done; never held across I/O
+	ls      map[string]*relayListener
+	pinned  map[string]bool
+	refMu   map[string]*sync.Mutex
+	refused map[string]time.Time // when the guard last reported a refusal, per project
+	done    bool
 
 	// svcMu guards svc and is held while the backend opens (up to the factory's timeout),
 	// which must not block Ensure and Reconcile.
@@ -147,7 +166,10 @@ func NewRelay(o RelayOptions) *Relay {
 	if o.Sources == nil && o.Config != nil {
 		o.Sources = func(ref string) []string { return readRestoreSources(o.Config, ref) }
 	}
-	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), pushAllowance: relayPushAllowance, pushMinRate: relayPushMinRate, ls: map[string]*relayListener{}, pinned: map[string]bool{}, refMu: map[string]*sync.Mutex{}}
+	if o.PromoteOK == nil && o.Config != nil {
+		o.PromoteOK = o.Config.Paths().PromoteOK
+	}
+	return &Relay{opt: o, sem: make(chan struct{}, relayConcurrency), pushAllowance: relayPushAllowance, pushMinRate: relayPushMinRate, now: time.Now, ls: map[string]*relayListener{}, pinned: map[string]bool{}, refMu: map[string]*sync.Mutex{}, refused: map[string]time.Time{}}
 }
 
 // projectsWithWALDir lists the refs that have a WAL directory under projects/.
@@ -437,6 +459,13 @@ func (r *Relay) push(own string, slots chan struct{}, w http.ResponseWriter, req
 		relayError(w, http.StatusRequestEntityTooLarge, "WAL file too large")
 		return
 	}
+	if code, err := r.pushGuard(req.Context(), own); err != nil {
+		// Read the file the client is still sending, so it sees the answer and not a broken pipe.
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(relayDrainTimeout))
+		_, _ = io.Copy(io.Discard, io.LimitReader(req.Body, relayMaxWAL))
+		relayError(w, code, err.Error())
+		return
+	}
 	svc, err := r.service(req.Context())
 	if err != nil {
 		r.opt.Log.Warn("wal relay: backup backend unavailable", "ref", own, "error", err)
@@ -472,6 +501,72 @@ func (r *Relay) push(own string, slots chan struct{}, w http.ResponseWriter, req
 	default:
 		r.opt.Log.Warn("wal relay: push failed", "ref", own, "file", name, "error", err)
 		relayError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+// pushGuard decides whether ref's cluster may archive through this relay: a replica may not,
+// until the promotion procedure wrote promote.ok for the current epoch (the first line of defense
+// against a stray pg_promote(); ErrWALConflict is the second). It returns the status to answer
+// with when the push is refused.
+func (r *Relay) pushGuard(ctx context.Context, ref string) (int, error) {
+	if r.opt.Replica == nil {
+		return 0, nil
+	}
+	replica, err := r.opt.Replica(ctx, ref)
+	if err != nil {
+		return http.StatusServiceUnavailable, fmt.Errorf("cannot tell whether %s is a replica on this node: %w", ref, err)
+	}
+	if !replica {
+		return 0, nil
+	}
+	refuse := func(format string, a ...any) (int, error) {
+		err := fmt.Errorf(format, a...)
+		r.reportRefused(ref, err)
+		return http.StatusPreconditionFailed, err
+	}
+	if r.opt.PromoteOK == nil {
+		return refuse("this node holds a replica of %s and the relay has no promote.ok path to check", ref)
+	}
+	b, err := os.ReadFile(r.opt.PromoteOK(ref))
+	if errors.Is(err, fs.ErrNotExist) {
+		return refuse("this node holds a replica of %s, which archives WAL only after its promotion (no promote.ok)", ref)
+	}
+	if err != nil {
+		return refuse("this node holds a replica of %s and its promote.ok cannot be read: %v", ref, err)
+	}
+	have, err := ParsePromoteOK(b)
+	if err != nil {
+		return refuse("this node holds a replica of %s and its promote.ok is unreadable: %v", ref, err)
+	}
+	if r.opt.Epoch != nil {
+		cur, err := r.opt.Epoch(ctx)
+		if err != nil {
+			return http.StatusServiceUnavailable, fmt.Errorf("cannot read the cluster epoch: %w", err)
+		}
+		if have < cur {
+			return refuse("this node holds a replica of %s and its promote.ok is for epoch %d, but the cluster is at epoch %d", ref, have, cur)
+		}
+	}
+	return 0, nil
+}
+
+// reportRefused logs a refused push and tells Refused, at most once a minute per project:
+// Postgres retries archive_command every few seconds.
+func (r *Relay) reportRefused(ref string, reason error) {
+	r.mu.Lock()
+	last := r.refused[ref]
+	now := r.now()
+	quiet := now.Sub(last) < time.Minute
+	if !quiet {
+		r.refused[ref] = now
+	}
+	r.mu.Unlock()
+	if quiet {
+		return
+	}
+	r.opt.Log.Error("wal relay: push refused for a replica", "ref", ref, "reason", reason)
+	if r.opt.Refused != nil {
+		r.opt.Refused(ref, reason)
 	}
 }
 
@@ -560,6 +655,10 @@ func (r *Relay) fetch(own string, slots chan struct{}, w http.ResponseWriter, re
 // the project's relay is not set up). archive_command fails and Postgres retries it.
 var ErrRelayDown = errors.New("backup: the WAL relay does not answer (is supavise.service running?)")
 
+// ErrPushRefused means the relay refused to archive for a replica that was not promoted.
+// archive_command fails and Postgres retries it.
+var ErrPushRefused = errors.New("backup: the WAL relay refuses to archive for a replica that was not promoted")
+
 func relayClient(socket string) *http.Client {
 	return &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -590,6 +689,8 @@ func relayFailure(resp *http.Response) error {
 		return fmt.Errorf("%w: %s", ErrWALConflict, msg)
 	case http.StatusNotFound:
 		return fmt.Errorf("%w: %s", ErrNoWAL, msg)
+	case http.StatusPreconditionFailed:
+		return fmt.Errorf("%w: %s", ErrPushRefused, msg)
 	}
 	return fmt.Errorf("backup: WAL relay answered %s: %s", resp.Status, msg)
 }

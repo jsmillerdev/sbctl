@@ -170,28 +170,10 @@ func (r *storageRun) walk(ctx context.Context) error {
 	}
 	g.Go(func() error {
 		defer close(tasks)
-		return filepath.WalkDir(r.root, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					return nil // removed while walking
-				}
-				return err
-			}
-			if d.IsDir() {
-				return nil
-			}
-			if !d.Type().IsRegular() {
-				// Storage writes regular files only. A link or device here would make the
-				// backup read something outside the tree, so it is left out.
-				r.s.opt.Log.Warn("object backup skips a file that is not a regular file", "path", p)
-				return nil
-			}
-			rel, err := filepath.Rel(r.root, p)
-			if err != nil {
-				return err
-			}
+		skipped := func(p string) { r.s.opt.Log.Warn("object backup skips a file that is not a regular file", "path", p) }
+		return walkObjects(gctx, r.root, skipped, func(abs, rel string) error {
 			select {
-			case tasks <- walked{abs: p, rel: filepath.ToSlash(rel)}:
+			case tasks <- walked{abs: abs, rel: rel}:
 				return nil
 			case <-gctx.Done():
 				return gctx.Err()

@@ -42,5 +42,5 @@ if [[ -z "${SUPAVISE_TEST_PG_BIN:-}" ]]; then
 fi
 
 go test -race -count=1 -timeout 15m -v \
-  -run 'PointInTimeRestore|BaseBackupRefusals|WALCommandsExitStatuses|S3Store|RestoreRunningSourceToRecentTime|RestoreInPlaceRollsBackWhenRecovery|FilesBackupOverS3' \
+  -run 'PointInTimeRestore|BaseBackupRefusals|WALCommandsExitStatuses|S3Store|RestoreRunningSourceToRecentTime|RestoreInPlaceRollsBackWhenRecovery|FilesBackupOverS3|SeedReplica|LeaderMarker' \
   ./internal/backup/

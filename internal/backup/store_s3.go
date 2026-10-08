@@ -305,6 +305,68 @@ func (s *S3Store) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 	return ObjectInfo{Key: key, Size: aws.ToInt64(out.ContentLength), ModTime: aws.ToTime(out.LastModified)}, nil
 }
 
+var _ ConditionalStore = (*S3Store)(nil)
+
+// GetTagged implements ConditionalStore; the tag is the object's ETag.
+func (s *S3Store) GetTagged(ctx context.Context, key string) ([]byte, string, error) {
+	if err := validKey(key); err != nil {
+		return nil, "", err
+	}
+	k := s.key(key)
+	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &k})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, "", ErrNotFound
+		}
+		return nil, "", fmt.Errorf("backup: s3 get %s: %w%s", k, err, accessDeniedHint(err))
+	}
+	defer out.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(out.Body, markerMaxBytes))
+	if err != nil {
+		return nil, "", fmt.Errorf("backup: s3 get %s: %w", k, err)
+	}
+	return b, aws.ToString(out.ETag), nil
+}
+
+// PutIf implements ConditionalStore with If-None-Match: * (no tag) or If-Match: <ETag>. A service
+// that answers 501 or refuses the header as a bad request (400 InvalidArgument or MalformedHeader)
+// counts as one without conditional writes.
+func (s *S3Store) PutIf(ctx context.Context, key string, data []byte, tag string) error {
+	if err := validKey(key); err != nil {
+		return err
+	}
+	k := s.key(key)
+	in := &s3.PutObjectInput{Bucket: &s.bucket, Key: &k, Body: bytes.NewReader(data), ContentLength: aws.Int64(int64(len(data)))}
+	if tag == "" {
+		in.IfNoneMatch = aws.String("*")
+	} else {
+		in.IfMatch = aws.String(tag)
+	}
+	_, err := s.c.PutObject(ctx, in)
+	if err == nil {
+		return nil
+	}
+	var ae smithy.APIError
+	var re *awshttp.ResponseError
+	code := ""
+	if errors.As(err, &ae) {
+		code = ae.ErrorCode()
+	}
+	status := 0
+	if errors.As(err, &re) {
+		status = re.HTTPStatusCode()
+	}
+	switch {
+	case status == http.StatusPreconditionFailed || code == "PreconditionFailed" || code == "ConditionalRequestConflict":
+		return fmt.Errorf("%w: s3 put %s", ErrPreconditionFailed, k)
+	case status == http.StatusNotImplemented || code == "NotImplemented",
+		// A service that does not know the header may refuse it as a bad request instead.
+		status == http.StatusBadRequest && (code == "InvalidArgument" || code == "MalformedHeader"):
+		return fmt.Errorf("%w: s3 put %s: %v", ErrConditionalUnsupported, k, err)
+	}
+	return fmt.Errorf("backup: s3 put %s: %w%s", k, err, accessDeniedHint(err))
+}
+
 // List implements Store.
 func (s *S3Store) List(ctx context.Context, prefix string) ([]ObjectInfo, error) {
 	p := s.key(prefix)

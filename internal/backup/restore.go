@@ -726,7 +726,27 @@ func (s *Service) Seeder(plan *RestorePlan) lifecycle.DataSeeder {
 }
 
 func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) error {
-	m := &plan.Manifest
+	if err := prepareDataDir(dataDir); err != nil {
+		return err
+	}
+	if err := s.allowSource(plan); err != nil {
+		return err
+	}
+	if err := s.unpackBase(ctx, &plan.Manifest, dataDir); err != nil {
+		return err
+	}
+	if err := appendAutoConf(dataDir, s.recoveryConf(plan)); err != nil {
+		return err
+	}
+	// recovery.signal last: it is what turns the start into a recovery.
+	if err := writeSyncFile(filepath.Join(dataDir, "recovery.signal"), nil, 0o600); err != nil {
+		return err
+	}
+	return syncTree(dataDir)
+}
+
+// prepareDataDir creates dataDir (0700) when it is missing and refuses one that holds anything.
+func prepareDataDir(dataDir string) error {
 	if ents, err := os.ReadDir(dataDir); err == nil && len(ents) > 0 {
 		return fmt.Errorf("backup: refusing to restore into non-empty directory %s", dataDir)
 	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -735,12 +755,11 @@ func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) e
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return err
 	}
-	if err := os.Chmod(dataDir, 0o700); err != nil {
-		return err
-	}
-	if err := s.allowSource(plan); err != nil {
-		return err
-	}
+	return os.Chmod(dataDir, 0o700)
+}
+
+// unpackBase extracts the base backup m into the prepared dataDir and writes postmaster.opts.
+func (s *Service) unpackBase(ctx context.Context, m *Manifest, dataDir string) error {
 	rc, err := s.opt.Store.Get(ctx, m.Dir()+"/"+m.Data)
 	if err != nil {
 		return fmt.Errorf("backup: read base backup %s: %w", m.ID, err)
@@ -757,14 +776,17 @@ func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) e
 
 	// The Supabase launcher refuses an existing cluster without a non-empty
 	// postmaster.opts, and pg_basebackup-style backups omit it. Postgres rewrites it.
-	if err := writeSyncFile(filepath.Join(dataDir, "postmaster.opts"), []byte("# recreated by supavise restore\n"), 0o600); err != nil {
-		return err
-	}
-	conf, err := os.OpenFile(filepath.Join(dataDir, "postgresql.auto.conf"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	return writeSyncFile(filepath.Join(dataDir, "postmaster.opts"), []byte("# recreated by supavise restore\n"), 0o600)
+}
+
+// appendAutoConf appends text to the data directory's postgresql.auto.conf (0600) and syncs it.
+func appendAutoConf(dataDir, text string) error {
+	p := filepath.Join(dataDir, "postgresql.auto.conf")
+	conf, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
 	}
-	if _, err := conf.WriteString(s.recoveryConf(plan)); err != nil {
+	if _, err := conf.WriteString(text); err != nil {
 		conf.Close()
 		return err
 	}
@@ -775,11 +797,7 @@ func (s *Service) seed(ctx context.Context, plan *RestorePlan, dataDir string) e
 	if err := conf.Close(); err != nil {
 		return err
 	}
-	// recovery.signal last: it is what turns the start into a recovery.
-	if err := writeSyncFile(filepath.Join(dataDir, "recovery.signal"), nil, 0o600); err != nil {
-		return err
-	}
-	return syncTree(dataDir)
+	return os.Chmod(p, 0o600)
 }
 
 // allowSource lets the relay of a restored clone read the archive of its source project
