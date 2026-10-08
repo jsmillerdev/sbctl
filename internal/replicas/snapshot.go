@@ -10,8 +10,10 @@ import (
 )
 
 // The leader keeps lag and receiver state in memory (I5). A command that runs in another process,
-// `supavise replicas ls`, reads a snapshot file the controller rewrites on every pass. The file
-// holds no secrets: identifiers, nodes and the numbers Studio shows.
+// `supavise replicas ls`, reads a snapshot file the controller rewrites on every pass. It holds
+// what that command shows (each replica's receiver status and lag), no LSNs and no secrets, and is
+// readable by the daemon's user only, like the registry connection `ls` needs anyway. It is a view
+// of the last pass, not state: nothing reads it back into the controller.
 
 // SnapshotName is the file in the state directory.
 const SnapshotName = "replicas-status.json"
@@ -28,12 +30,10 @@ type Snapshot struct {
 
 // SnapshotEntry is one replica as observed.
 type SnapshotEntry struct {
-	Identifier     string    `json:"identifier"`
-	Receiver       string    `json:"receiver,omitempty"`
-	ReplayLSN      string    `json:"replay_lsn,omitempty"`
-	LagSeconds     *float64  `json:"lag_seconds,omitempty"`
-	PostgRESTReady bool      `json:"postgrest_ready"`
-	ObservedAt     time.Time `json:"observed_at"`
+	Identifier string    `json:"identifier"`
+	Receiver   string    `json:"receiver,omitempty"`
+	LagSeconds *float64  `json:"lag_seconds,omitempty"`
+	ObservedAt time.Time `json:"observed_at"`
 }
 
 // Entry returns the entry of identifier.
@@ -78,8 +78,7 @@ func (c *Controller) writeSnapshot(rows []registry.Replica) {
 			continue
 		}
 		snap.Replicas = append(snap.Replicas, SnapshotEntry{
-			Identifier: r.Identifier, Receiver: s.obs.ReceiverStatus, ReplayLSN: s.obs.ReplayLSN,
-			LagSeconds: s.obs.LagSeconds, PostgRESTReady: s.obs.PostgRESTReady, ObservedAt: s.obsAt.UTC(),
+			Identifier: r.Identifier, Receiver: s.obs.ReceiverStatus, LagSeconds: s.obs.LagSeconds, ObservedAt: s.obsAt.UTC(),
 		})
 	}
 	c.mu.Unlock()
@@ -92,7 +91,7 @@ func (c *Controller) writeSnapshot(rows []registry.Replica) {
 	}
 }
 
-// writeFileAtomic replaces path with b, mode 0644, so a reader never sees half a file.
+// writeFileAtomic replaces path with b, mode 0600, so a reader never sees half a file.
 func writeFileAtomic(path string, b []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
 	if err != nil {
@@ -104,7 +103,7 @@ func writeFileAtomic(path string, b []byte) error {
 		err = cerr
 	}
 	if err == nil {
-		err = os.Chmod(tmp, 0o644)
+		err = os.Chmod(tmp, 0o600)
 	}
 	if err == nil {
 		err = os.Rename(tmp, path)

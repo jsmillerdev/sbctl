@@ -45,8 +45,10 @@ type replicaState struct {
 	seedBytes  int64
 	backupLSN  string
 	downloadAt time.Time
-	// alerted holds the alert keys that are open for this replica.
+	// alerted holds the names of the alerts that are open for this replica (see healthAlerts).
 	alerted map[string]bool
+	// synced is set once the health alerts have looked at the replica in this process.
+	synced bool
 }
 
 // callState is the retry bookkeeping of one kind of call: since when it has been failing, how

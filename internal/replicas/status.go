@@ -25,6 +25,15 @@ const (
 	lagWarn = 60 * time.Second
 )
 
+// The titles of the alerts a replica raises, one per alert name. A recovery repeats the title of
+// the problem it closes (alerts.Event), so each name keeps one however it was raised.
+const (
+	titleUnhealthy = "Read replica is unhealthy"
+	titleLag       = "Read replica is behind"
+	titleRemoval   = "Read replica removal is stuck"
+	titleCapacity  = "No room for read replicas on "
+)
+
 // health maps an observation to a status: ACTIVE_HEALTHY when the standby streams, lags less than
 // unhealthy_lag_seconds and its PostgREST answers; ACTIVE_UNHEALTHY when the receiver has been down
 // for two minutes, PostgREST is down, the lag is over the limit or the node has not answered for
@@ -160,15 +169,21 @@ func (c *Controller) healthAlerts(ctx context.Context, r *registry.Replica, stat
 		open bool
 		ev   alerts.Event
 	}
+	c.mu.Lock()
+	// After a restart of the daemon the memory of open alerts is gone; a replica the registry
+	// holds as unhealthy raised its alert before.
+	known := c.st(r.Identifier).synced
+	c.st(r.Identifier).synced = true
+	c.mu.Unlock()
 	var edges []edge
 	edges = append(edges, edge{"replica_unhealthy", status == statusUnhealthy, alerts.Event{
 		Kind: alerts.KindReplicaUnhealthy, Ref: r.Ref, Key: "replica_unhealthy/" + r.Identifier,
-		Title:  "Read replica is unhealthy",
+		Title:  titleUnhealthy,
 		Detail: fmt.Sprintf("The read replica %s of project %s on node %s is unhealthy: %s.", r.Identifier, r.Ref, r.NodeID, reason),
 	}})
 	lagging := status == statusHealthy && obs != nil && obs.LagSeconds != nil &&
 		time.Duration(*obs.LagSeconds*float64(time.Second)) > min(lagWarn, c.cfg.Replicas.UnhealthyLag()/2)
-	lagEv := alerts.Event{Kind: alerts.KindReplicaLag, Ref: r.Ref, Key: "replica_lag/" + r.Identifier, Title: "Read replica is behind"}
+	lagEv := alerts.Event{Kind: alerts.KindReplicaLag, Ref: r.Ref, Key: "replica_lag/" + r.Identifier, Title: titleLag}
 	if lagging {
 		lagEv.Detail = fmt.Sprintf("The read replica %s of project %s on node %s is %.0f s behind its primary.", r.Identifier, r.Ref, r.NodeID, *obs.LagSeconds)
 	}
@@ -176,7 +191,7 @@ func (c *Controller) healthAlerts(ctx context.Context, r *registry.Replica, stat
 	for _, e := range edges {
 		c.mu.Lock()
 		s := c.st(r.Identifier)
-		was := s.alerted[e.name]
+		was := s.alerted[e.name] || (!known && e.name == "replica_unhealthy" && r.Status == statusUnhealthy)
 		s.alerted[e.name] = e.open
 		c.mu.Unlock()
 		switch {
@@ -260,11 +275,15 @@ func (c *Controller) Statuses(ctx context.Context, ref string) ([]Status, error)
 	return out, nil
 }
 
-// initStatus is replicaInitializationStatus.
+// initStatus is replicaInitializationStatus. A replica that is going down keeps what its setup
+// came to: failed when it failed, in progress when it never finished, otherwise completed.
 func (c *Controller) initStatus(ctx context.Context, r *registry.Replica) *InitStatus {
+	leaving := r.Status == statusGoingDown
 	switch {
-	case r.Status == registry.ReplicaInitError:
+	case r.Status == registry.ReplicaInitError || (leaving && r.InitError != ""):
 		return &InitStatus{Status: "failed", Progress: r.InitStep, Error: r.InitError}
+	case leaving && r.InitStep != StepDone:
+		return &InitStatus{Status: "in_progress", Progress: r.InitStep}
 	case settingUp(r) && r.InitStep != StepDone:
 		is := &InitStatus{Status: "in_progress", Progress: r.InitStep}
 		est := c.estimate(ctx, r)

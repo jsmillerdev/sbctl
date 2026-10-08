@@ -160,12 +160,13 @@ func (c *Controller) capacityAlerts(ctx context.Context, nodes map[string]regist
 	c.mu.Unlock()
 	for _, id := range resolve {
 		c.alert(ctx, alerts.Event{Kind: alerts.KindReplicaCapacity, Severity: alerts.SeverityInfo, Key: "replica_capacity/" + id, Resolved: true,
-			Title: "Read replicas fit on " + nodeLabel(nodes[id]) + " again"})
+			Title:  titleCapacity + nodeLabel(nodes[id]),
+			Detail: "Read replicas fit on node " + nodeLabel(nodes[id]) + " again."})
 	}
 	for _, id := range raise {
 		c.alert(ctx, alerts.Event{
 			Kind: alerts.KindReplicaCapacity, Key: "replica_capacity/" + id,
-			Title: "No room for read replicas on " + nodeLabel(nodes[id]),
+			Title: titleCapacity + nodeLabel(nodes[id]),
 			Detail: fmt.Sprintf("%d read replicas wait for room on node %s (%s). Free memory or disk there, raise [compute] overcommit, or remove replicas you do not need.",
 				len(blocked[id]), nodeLabel(nodes[id]), reasons[id]),
 		})
@@ -424,8 +425,8 @@ func (c *Controller) failSetup(ctx context.Context, r *registry.Replica, code, d
 	c.log.Error("replicas: setup failed", "identifier", r.Identifier, "node", r.NodeID, "step", step, "code", code, "detail", detail)
 	c.alert(ctx, alerts.Event{
 		Kind: alerts.KindReplicaUnhealthy, Ref: r.Ref, Key: "replica_unhealthy/" + r.Identifier,
-		Title:  "Read replica setup failed",
-		Detail: fmt.Sprintf("The read replica %s of project %s on node %s failed (%s): %s. Remove it and add it again.", r.Identifier, r.Ref, r.NodeID, code, detail),
+		Title:  titleUnhealthy,
+		Detail: fmt.Sprintf("The setup of the read replica %s of project %s on node %s failed (%s): %s. Remove it and add it again.", r.Identifier, r.Ref, r.NodeID, code, detail),
 	})
 	c.mu.Lock()
 	c.st(r.Identifier).alerted["replica_unhealthy"] = true

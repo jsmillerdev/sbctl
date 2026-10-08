@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
@@ -133,15 +134,15 @@ func (c *Controller) removeStep(ctx context.Context, r *registry.Replica) {
 	if s.removeSince.IsZero() {
 		s.removeSince = c.now()
 	}
-	stuck := c.now().Sub(s.removeSince) >= stuckAfter && !s.alerted["remove"]
+	stuck := c.now().Sub(s.removeSince) >= stuckAfter && !s.alerted["replica_remove"]
 	if stuck {
-		s.alerted["remove"] = true
+		s.alerted["replica_remove"] = true
 	}
 	c.mu.Unlock()
 	if stuck {
 		c.alert(ctx, alerts.Event{
 			Kind: alerts.KindReplicaUnhealthy, Ref: r.Ref, Key: "replica_remove/" + r.Identifier,
-			Title:  "Read replica removal is stuck",
+			Title:  titleRemoval,
 			Detail: fmt.Sprintf("The read replica %s of project %s could not be removed from node %s for %s: %s. The controller keeps trying.", r.Identifier, r.Ref, r.NodeID, stuckAfter, c.lastError(r.Identifier, "remove")),
 		})
 	}
@@ -197,14 +198,22 @@ func (c *Controller) removeFailed(r *registry.Replica, err error) {
 }
 
 // resolveAlerts closes the alerts (by name, as healthAlerts keeps them) a removed replica had open.
+// A replica whose setup failed raised one that this process may not remember.
 func (c *Controller) resolveAlerts(ctx context.Context, r *registry.Replica, open []string) {
+	if r.InitError != "" && !slices.Contains(open, "replica_unhealthy") {
+		open = append(open, "replica_unhealthy")
+	}
 	for _, name := range open {
-		kind := alerts.KindReplicaUnhealthy
-		if name == "replica_lag" {
-			kind = alerts.KindReplicaLag
+		ev := alerts.Event{Kind: alerts.KindReplicaUnhealthy, Ref: r.Ref, Key: name + "/" + r.Identifier, Resolved: true, Severity: alerts.SeverityInfo,
+			Title:  titleUnhealthy,
+			Detail: fmt.Sprintf("The read replica %s of project %s on node %s was removed.", r.Identifier, r.Ref, r.NodeID)}
+		switch name {
+		case "replica_lag":
+			ev.Kind, ev.Title = alerts.KindReplicaLag, titleLag
+		case "replica_remove":
+			ev.Title = titleRemoval
 		}
-		c.alert(ctx, alerts.Event{Kind: kind, Ref: r.Ref, Key: name + "/" + r.Identifier, Resolved: true, Severity: alerts.SeverityInfo,
-			Title: "Read replica removed"})
+		c.alert(ctx, ev)
 	}
 }
 
@@ -254,7 +263,7 @@ func (c *Controller) Restart(ctx context.Context, ref, identifier string) error 
 			c.setStatus(bg, r.Identifier, statusUnhealthy, StepDone, "")
 			c.alert(bg, alerts.Event{
 				Kind: alerts.KindReplicaUnhealthy, Ref: r.Ref, Key: "replica_unhealthy/" + r.Identifier,
-				Title:  "Read replica is unhealthy",
+				Title:  titleUnhealthy,
 				Detail: fmt.Sprintf("Restarting the read replica %s of project %s on node %s failed: %v.", r.Identifier, r.Ref, r.NodeID, err),
 			})
 			return

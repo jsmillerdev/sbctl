@@ -131,6 +131,7 @@ func TestRemoveRetriesWhenTheNodeIsUnreachable(t *testing.T) {
 	if e.alerts.count(alerts.KindReplicaUnhealthy, true) != 1 {
 		t.Fatalf("the alert did not resolve: %+v", e.alerts.evs)
 	}
+	e.alerts.checkTitles(t)
 }
 
 // A node that left the cluster has nothing to reach: its replicas' rows just go.
@@ -260,6 +261,58 @@ func TestRestartRefusesAReplicaThatIsNotUp(t *testing.T) {
 	if got := e.user(e.ctrl.Restart(e.ctx, refA, id)); got != "The read replica "+id+" cannot restart now: it is INIT_READ_REPLICA." {
 		t.Fatalf("refused with %q", got)
 	}
+}
+
+// A setup that failed raised an alert; removing the replica closes it, even in a process that
+// started after the failure, and with the title it was raised with.
+func TestRemovingAFailedSetupClosesItsAlert(t *testing.T) {
+	e := newEnv(t)
+	e.nodes.script = func(in *fakeInstance) { in.failAt, in.errCode = StepLaunched, FailInitiate }
+	if err := e.ctrl.SetupOn(e.ctx, refA, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	e.tick(3)
+	r := e.replica(refA, "n2")
+	if r.Status != registry.ReplicaInitError || e.alerts.count(alerts.KindReplicaUnhealthy, false) != 1 {
+		t.Fatalf("row %+v, alerts %+v", r, e.alerts.evs)
+	}
+	// The daemon restarts: the controller forgets what it raised.
+	e.ctrl = New(e.opts)
+	if err := e.ctrl.Remove(e.ctx, refA, r.Identifier); err != nil {
+		t.Fatal(err)
+	}
+	e.tick(1)
+	if e.hasReplica(refA, "n2") {
+		t.Fatal("not removed")
+	}
+	if e.alerts.count(alerts.KindReplicaUnhealthy, true) != 1 {
+		t.Fatalf("the alert did not close: %+v", e.alerts.evs)
+	}
+	e.alerts.checkTitles(t)
+}
+
+// A removal that stays stuck raises its alert once, and closes it under the same title.
+func TestStuckRemovalAlertIsClosedWithItsTitle(t *testing.T) {
+	e := newEnv(t)
+	r := e.activeReplica()
+	e.nodes.down["n2"] = true
+	if err := e.ctrl.Remove(e.ctx, refA, r.Identifier); err != nil {
+		t.Fatal(err)
+	}
+	for range 12 {
+		e.clock.Advance(2 * time.Minute)
+		e.tick(1)
+	}
+	if e.alerts.count(alerts.KindReplicaUnhealthy, false) != 1 {
+		t.Fatalf("alerts: %+v", e.alerts.evs)
+	}
+	e.nodes.down["n2"] = false
+	e.clock.Advance(3 * time.Minute)
+	e.tick(1)
+	if e.hasReplica(refA, "n2") || e.alerts.count(alerts.KindReplicaUnhealthy, true) != 1 {
+		t.Fatalf("alerts: %+v", e.alerts.evs)
+	}
+	e.alerts.checkTitles(t)
 }
 
 // Restart without the node operations (a controller built for the CLI) says so.

@@ -76,7 +76,7 @@ func TestTwoNodeRunReachesActiveHealthy(t *testing.T) {
 		return ok
 	})
 	fi, err := os.Stat(snap)
-	if err != nil || fi.Mode().Perm() != 0o644 {
+	if err != nil || fi.Mode().Perm() != 0o600 {
 		t.Fatalf("snapshot file: %v %v", fi, err)
 	}
 
@@ -161,7 +161,7 @@ func TestReadSnapshot(t *testing.T) {
 		t.Fatal("a damaged file")
 	}
 	lag := 4.0
-	b := `{"at":"2026-10-08T11:59:00Z","replicas":[{"identifier":"x-rr-eu-west-1-abcdef","lag_seconds":4,"receiver":"streaming","postgrest_ready":true,"observed_at":"2026-10-08T11:59:00Z"}]}`
+	b := `{"at":"2026-10-08T11:59:00Z","replicas":[{"identifier":"x-rr-eu-west-1-abcdef","lag_seconds":4,"receiver":"streaming","observed_at":"2026-10-08T11:59:00Z"}]}`
 	if err := os.WriteFile(path, []byte(b), 0o644); err != nil {
 		t.Fatal(err)
 	}

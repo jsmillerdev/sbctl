@@ -336,6 +336,7 @@ func TestSetupWaitsForCapacity(t *testing.T) {
 	if e.alerts.count(alerts.KindReplicaCapacity, true) != 1 {
 		t.Fatalf("the capacity alert did not close: %+v", e.alerts.evs)
 	}
+	e.alerts.checkTitles(t)
 }
 
 // The room a replica needs counts the projects homed on the node and the replicas past admission,

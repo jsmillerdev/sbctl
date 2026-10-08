@@ -299,6 +299,21 @@ func (a *alertLog) count(kind string, resolved bool) int {
 	return n
 }
 
+// checkTitles fails the test when a recovery does not repeat the title of the alert it closes.
+func (a *alertLog) checkTitles(t *testing.T) {
+	t.Helper()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	raised := map[string]string{}
+	for _, ev := range a.evs {
+		if !ev.Resolved {
+			raised[ev.Key] = ev.Title
+		} else if title, ok := raised[ev.Key]; !ok || title != ev.Title {
+			t.Errorf("recovery of %s is titled %q, the alert %q", ev.Key, ev.Title, title)
+		}
+	}
+}
+
 // env is a leader n1 with the projects, other nodes and fakes a test needs.
 type env struct {
 	t       *testing.T

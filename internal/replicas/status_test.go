@@ -156,6 +156,7 @@ func TestMonitorWritesTransitionsAndAlerts(t *testing.T) {
 	if e.alerts.count(alerts.KindReplicaUnhealthy, true) != 1 {
 		t.Fatalf("alerts: %+v", e.alerts.evs)
 	}
+	e.alerts.checkTitles(t)
 
 	// PostgREST down is unhealthy at once.
 	set(func(in *fakeInstance) { in.postgrest = false })
@@ -396,5 +397,80 @@ func TestLagComesFromObservations(t *testing.T) {
 	pts, err = e.ctrl.Lag(e.ctx, "nope-rr-eu-west-1-aaaaaa", time.Time{})
 	if err != nil || pts == nil || len(pts) != 0 {
 		t.Fatalf("unknown replica: %#v %v", pts, err)
+	}
+}
+
+// A replica that is going down keeps the outcome of its setup in replicaInitializationStatus.
+func TestInitStatusOfAReplicaGoingDown(t *testing.T) {
+	e := newEnv(t)
+	e.nodes.down["n2"] = true // the removals cannot finish
+	init := func(ref string) *InitStatus {
+		st, err := e.ctrl.Statuses(e.ctx, ref)
+		if err != nil || len(st) != 1 || st[0].Status != statusGoingDown {
+			t.Fatalf("statuses: %+v %v", st, err)
+		}
+		return st[0].Init
+	}
+	// Finished its setup.
+	if err := e.ctrl.SetupOn(e.ctx, refA, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	e.nodes.down["n2"] = false
+	e.settle(refA, "n2")
+	e.nodes.down["n2"] = true
+	if err := e.ctrl.Remove(e.ctx, refA, e.replica(refA, "n2").Identifier); err != nil {
+		t.Fatal(err)
+	}
+	if is := init(refA); is.Status != "completed" || is.Progress != StepDone {
+		t.Fatalf("completed then removed: %+v", is)
+	}
+	// Never finished it.
+	if err := e.ctrl.SetupOn(e.ctx, refB, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.reg.SetReplicaStatus(e.ctx, e.replica(refB, "n2").Identifier, registry.ReplicaInit, StepInitiated, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ctrl.Remove(e.ctx, refB, e.replica(refB, "n2").Identifier); err != nil {
+		t.Fatal(err)
+	}
+	if is := init(refB); is.Status != "in_progress" || is.Progress != StepInitiated {
+		t.Fatalf("removed mid-setup: %+v", is)
+	}
+	// Failed.
+	e.addProject(refC, "small")
+	if err := e.ctrl.SetupOn(e.ctx, refC, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.reg.SetReplicaStatus(e.ctx, e.replica(refC, "n2").Identifier, registry.ReplicaInitError, StepDownloaded, FailDownload); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ctrl.Remove(e.ctx, refC, e.replica(refC, "n2").Identifier); err != nil {
+		t.Fatal(err)
+	}
+	if is := init(refC); is.Status != "failed" || is.Error != FailDownload || is.Progress != StepDownloaded {
+		t.Fatalf("failed then removed: %+v", is)
+	}
+}
+
+// A leader that restarts while a replica is ACTIVE_UNHEALTHY in the registry has lost the memory
+// of its alert; when the replica is well it closes the alert all the same.
+func TestRecoveryAfterARestartClosesTheAlert(t *testing.T) {
+	e := newEnv(t)
+	r := e.activeReplica()
+	if err := e.reg.SetReplicaStatus(e.ctx, r.Identifier, statusUnhealthy, StepDone, ""); err != nil {
+		t.Fatal(err)
+	}
+	e.ctrl = New(e.opts)
+	e.clock.Advance(15 * time.Second)
+	e.tick(1)
+	if got := e.replica(refA, "n2").Status; got != statusHealthy {
+		t.Fatalf("status %s", got)
+	}
+	if e.alerts.count(alerts.KindReplicaUnhealthy, true) != 1 || e.alerts.count(alerts.KindReplicaUnhealthy, false) != 0 {
+		t.Fatalf("alerts: %+v", e.alerts.evs)
+	}
+	if ev := e.alerts.evs[0]; ev.Title != titleUnhealthy || ev.Key != "replica_unhealthy/"+r.Identifier {
+		t.Fatalf("recovery: %+v", ev)
 	}
 }
