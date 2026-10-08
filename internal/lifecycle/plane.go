@@ -363,6 +363,9 @@ func (pl *PostgresPlane) startCluster(ctx context.Context, spec units.Spec, pp p
 // needs no credentials, and waits for it. The system project uses it to reach its own
 // registry, where its credentials are stored.
 func (pl *PostgresPlane) startRendered(ctx context.Context, p *registry.Project) error {
+	if err := fencedErr(pl.cfg, p.Ref); err != nil {
+		return err
+	}
 	unit := config.UnitName(config.SvcPostgres, p.Ref)
 	files := units.FilesFor(pl.cfg, units.Spec{Service: config.SvcPostgres, Ref: p.Ref})
 	if _, err := os.Stat(files.Run); err != nil {

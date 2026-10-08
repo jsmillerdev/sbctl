@@ -1039,6 +1039,11 @@ func (e *Engine) startOne(ctx context.Context, listed *registry.Project) error {
 	if !active(p.Status) {
 		return nil
 	}
+	// A primary that a peer replaced does not start at boot, whatever this node's copy of the registry
+	// says. Its status is not touched either: the copy is the diverged one, and the node is rebuilt.
+	if err := fencedErr(e.cfg, p.Ref); err != nil {
+		return err
+	}
 	keys, err := e.loadKeys(ctx, p.Ref)
 	if err == nil {
 		err = e.plane.Start(ctx, p, keys)

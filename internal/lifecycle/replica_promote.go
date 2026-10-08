@@ -82,6 +82,12 @@ func (pl *PostgresPlane) PromoteReplica(ctx context.Context, t ReplicaTarget, o 
 		return errors.New("lifecycle: PromoteReplica needs the cluster epoch")
 	}
 	p := t.Project
+	// A fenced node does not promote anything. The check comes before every other step so that
+	// ErrFenced is a refusal that changed nothing, which the orchestrator can tell from a promotion
+	// that may have happened.
+	if err := fencedErr(pl.cfg, p.Ref); err != nil {
+		return err
+	}
 	if st, err := pl.sql().Status(ctx, addrOf(pl.paths(p))); err == nil && !st.InRecovery && pl.promoteOKAtLeast(p.Ref, o.Epoch) {
 		return nil // promoted and restarted earlier
 	}

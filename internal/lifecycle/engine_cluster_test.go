@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/fleet"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -456,5 +457,35 @@ func TestUpgradeOfAProjectWithReplicas(t *testing.T) {
 	}
 	if el.Eligible || !found {
 		t.Fatalf("major version: eligible %v, blockers %+v", el.Eligible, el.Blockers)
+	}
+}
+
+// A primary that a peer replaced does not start at boot, though this node's copy of the registry
+// still names it the home: StartActive reports it, does not call the plane and leaves the status.
+func TestStartActiveLeavesAFencedPrimaryDown(t *testing.T) {
+	ctx := context.Background()
+	c := newClusterHarness(t, "n1")
+	c.cfg.StateDir = t.TempDir()
+	if err := fenced.WriteProject(c.cfg.Paths(), fenced.Record{Epoch: 5, Leader: "n2", Ref: c.home1.Ref, Reason: "project failover"}); err != nil {
+		t.Fatal(err)
+	}
+	errs := c.e.StartActive(ctx)
+	if len(errs) != 1 || !errors.Is(errs[c.home1.Ref], ErrFenced) {
+		t.Fatalf("StartActive errors = %v", errs)
+	}
+	if c.plane.has("Start " + c.home1.Ref) {
+		t.Fatalf("the fenced primary was started: %v", c.plane.calls)
+	}
+	if p, _ := c.reg.GetProject(ctx, c.home1.Ref); p.Status != registry.StatusActiveHealthy {
+		t.Fatalf("the status changed to %s", p.Status)
+	}
+
+	// The node's own record covers everything homed here, the replicas' units apart.
+	if err := fenced.WriteNode(c.cfg.Paths(), fenced.Record{Epoch: 5, Leader: "n2", Reason: "n2 leads"}); err != nil {
+		t.Fatal(err)
+	}
+	c.plane.calls = nil
+	if errs := c.e.StartActive(ctx); !errors.Is(errs[c.home1.Ref], ErrFenced) || len(c.plane.calls) != 0 {
+		t.Fatalf("StartActive on a fenced node: %v, calls %v", errs, c.plane.calls)
 	}
 }

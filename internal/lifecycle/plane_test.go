@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 	"github.com/supavise/supavise/internal/units"
@@ -1010,5 +1011,84 @@ func TestPendingRestartLeavesTheOwedRestartOnRecordForRestartPending(t *testing.
 	}
 	if HeldRestart(cfg, ref) {
 		t.Fatal("the restart left its mark behind")
+	}
+}
+
+// The fence records of a node (failover/fenced) keep a primary from being rendered or started: its
+// launcher was removed to keep it down, and rendering it again would bring it back.
+func TestFencedPrimaryIsNeitherRenderedNorStarted(t *testing.T) {
+	const ref = "abcdefghijklmnopqrst"
+	for _, tc := range []struct {
+		name  string
+		write func(config.Paths) error
+	}{
+		{"project", func(p config.Paths) error {
+			return fenced.WriteProject(p, fenced.Record{Epoch: 3, Leader: "n2", Ref: ref, Reason: "project failover of " + ref})
+		}},
+		{"node", func(p config.Paths) error { return fenced.WriteNode(p, fenced.Record{Epoch: 3, Leader: "n2", Reason: "n2 leads"}) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.StateDir = shortTempDir(t)
+			cfg.Domain = "example.test"
+			cfg.BinPath = "/usr/local/bin/supavise"
+			sup := &recSup{state: units.StateInactive, changed: true}
+			pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: time.Millisecond, ServiceReadyTimeout: time.Millisecond})
+			p := testProject(cfg, ref, 2)
+			keys := testKeys(t, ref)
+			if err := tc.write(cfg.Paths()); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			for name, call := range map[string]func() error{
+				"StartDatabase": func() error { return pl.StartDatabase(ctx, p, keys) },
+				"Start":         func() error { return pl.Start(ctx, p, keys) },
+				"Reconfigure":   func() error { return pl.Reconfigure(ctx, p, keys) },
+				"PendingRestart": func() error {
+					_, err := pl.PendingRestart(ctx, p, keys)
+					return err
+				},
+				"startRendered": func() error { return pl.startRendered(ctx, p) },
+				"PromoteReplica": func() error {
+					return pl.PromoteReplica(ctx, ReplicaTarget{Identifier: registry.ReplicaIdentifier(ref, "local", "abc123"), Project: p, Keys: keys}, PromoteOptions{Epoch: 3})
+				},
+			} {
+				if err := call(); !errors.Is(err, ErrFenced) {
+					t.Errorf("%s on a fenced %s = %v", name, tc.name, err)
+				}
+			}
+			if len(sup.calls) != 0 {
+				t.Fatalf("the supervisor was asked: %v", sup.calls)
+			}
+			if _, err := os.Stat(units.FilesFor(cfg, units.Spec{Service: config.SvcPostgres, Ref: ref}).Run); !os.IsNotExist(err) {
+				t.Fatalf("the launcher was written again: %v", err)
+			}
+
+			// The fence is lifted (`supavise node rejoin`, or the data set aside): the primary renders again.
+			if tc.name == "node" {
+				_ = fenced.ClearNode(cfg.Paths())
+			} else {
+				_ = fenced.ClearProject(cfg.Paths(), ref)
+			}
+			if _, err := pl.postgresSpec(ctx, p, keys); err != nil {
+				t.Fatalf("spec after the fence: %v", err)
+			}
+		})
+	}
+}
+
+// An unreadable record blocks too: the answer fails closed.
+func TestUnreadableFenceRecordBlocksThePrimary(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	path := fenced.NodePath(cfg.Paths())
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fencedErr(cfg, "abcdefghijklmnopqrst"); !errors.Is(err, ErrFenced) {
+		t.Fatalf("fencedErr = %v", err)
 	}
 }
