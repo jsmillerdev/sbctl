@@ -26,6 +26,22 @@ A failure from the swap on rolls back (`rollBackTo`): the registry rule first (b
 
 An upgrade that does not change the binary (the services and projects are brought onto the release the installed binary already is, for example after `supavise update`) has no kept binary to go back to and no old pins to wait for, so a failure runs `revertProjectsOnly`: it puts back the projects this run moved and checks the node. Exit 3 when they went back and the node is as healthy as before (the shared services stay on the releases the binary pins); exit 4 when a shared service did not come up, because no rollback of this run can change what the binary pins (`supavise rollback` goes to the previous kept release), or when a project did not go back.
 
+## Alerts
+
+`Options.Notify` receives an `Event` (`events.go`) when the node is about to change and when the run ends: the package sends no message itself. `cmd/supavise/upgrade_alerts.go` turns each event into an `internal/alerts` event with `alerts.New(cfg, ...)`, because `supavise upgrade` and `supavise rollback` run in their own process, as root, outside the daemon; they share the daemon's destinations, hourly cap and state file (`internal/alerts`, "Root and the supavise user").
+
+| Event | When | Alert |
+|---|---|---|
+| `started` | after the artifacts are fetched and the backups are taken, before the binary is swapped: nothing that runs has changed until now, so a run that is refused earlier says nothing | `upgrade_started`, info |
+| `succeeded` | the node runs the new release and its status is no worse than before | `upgrade_succeeded`, info |
+| `rolled_back` | the change failed and the node is back on the previous release (exit status 3); names the release, the cause and the project the rollout halted at | `upgrade_failed`, warning |
+| `needs_operator` | the change failed and the node is not back (exit status 4); the cause says what state it is in | `upgrade_failed`, critical |
+| `refused` | only after `started`: the run stopped before it changed anything (the new binary could not be installed) | `upgrade_failed`, warning |
+
+`supavise rollback` sends `started`, `succeeded` and `needs_operator` with `Rollback` set. Every alert says who started the run (`Unattended`: the maintenance window) and the from and to versions. A maintenance window or the upgrade marker does not hold these back: they quiet the daemon's checker, not the announcements of the upgrade (an upgrade that fails inside an announced window is told), and the announcements are not de-duplicated, so a second failed upgrade is news. A destination that is down is logged and never fails the upgrade; the delivery gets 90 seconds and survives the SIGTERM that stopped the upgrade. The halted project comes from the rollout worker's error (`haltTee` reads its stderr, `HaltReporter`): the worker prints the ref in `rollout halted: <ref> failed`, and it is the only place it is told.
+
+**What this does not cover.** The driver of an upgrade is the installed binary, not the one being installed, so the first upgrade from a release that has no alerts sends none, and an upgrade the daemon of the old release cannot report stays in the journal. A run killed with SIGKILL, or a node that loses power mid-upgrade, sends nothing: the marker (`upgrade.json`) and `supavise status` show it, and `supavise-upgrade.service` pauses automatic upgrades (`unattended_upgrade_interrupted` in the journal).
+
 ## Exit statuses
 
 | Status | Meaning |
@@ -69,4 +85,4 @@ Unit tests over a fake `Host`: the plan and the diff (order of the moves, Postgr
 - Going back to the previous release restarts, one after another when the old daemon starts and outside the canary and batches, every project whose PostgreSQL, GoTrue or PostgREST files the rollout had already restarted onto the new release's files (the mark of a unit the rollout never reached names the files the old release renders back, so that unit keeps running). The plan and the output of `supavise rollback` say so, because each such restart drops the project's database connections. A previous release built before the marks existed restarts every project whose files differ.
 - The registry is not restored by the upgrade. The system cluster's restore is a documented manual procedure, not tested end to end, and an automatic one could not be tried safely here; the plan and the failure messages say what to do instead.
 - The rollback of a project puts GoTrue back on the release it ran; GoTrue's migrations went forward and stay, and the older GoTrue runs on the newer schema.
-- Events are log lines (`upgrade_started`, `upgrade_succeeded`, `upgrade_failed`, `upgrade_rolled_back`, `upgrade_refused`, `upgrade_needs_operator`, `rollback_started`, `rollback_succeeded`, `rollback_failed`); sending them anywhere is the alerting package's job.
+- Log lines: `upgrade_started`, `upgrade_succeeded`, `upgrade_failed`, `upgrade_rolled_back`, `upgrade_refused`, `upgrade_needs_operator`, `rollback_started`, `rollback_succeeded`, `rollback_failed`. The alerts below are separate.

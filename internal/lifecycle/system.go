@@ -129,6 +129,8 @@ type OpenOptions struct {
 	Artifacts Artifacts
 	// Store options for the default artifact store.
 	StoreOptions []artifacts.Option
+	// UpgradeNotify is Options.UpgradeNotify of the Engine (the daemon raises alerts through it).
+	UpgradeNotify func(ctx context.Context, n UpgradeNotice)
 	// RegistryDSN replaces RegistryDSN(cfg), the system cluster's private socket (a command run
 	// with SUPAVISE_REGISTRY_DSN set, tests with a database of their own). Empty means the default.
 	RegistryDSN string
@@ -282,7 +284,7 @@ func Open(ctx context.Context, cfg *config.Config, o OpenOptions) (*Node, error)
 	po.Settings = node.Settings
 	po.SystemAuth = systemAuth(cfg, func() registry.Registry { return node.Registry }, sec)
 	node.Plane = NewPostgresPlane(cfg, sup, arts, reg, po)
-	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
+	node.Engine = NewEngine(cfg, reg, sec, arts, node.Plane, Options{Log: o.log(), Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings, UpgradeNotify: o.UpgradeNotify})
 	node.Engine.SetNode(func() NodeResources { return DetectNode(cfg) })
 	return node, nil
 }
@@ -541,7 +543,7 @@ func InitSystem(ctx context.Context, cfg *config.Config, o OpenOptions, fetch bo
 	node.Settings = o.newSettings(cfg, reg, sec)
 	plane.opts.Settings = node.Settings
 	plane.opts.SystemAuth = systemAuth(cfg, func() registry.Registry { return node.Registry }, sec)
-	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings})
+	eng := NewEngine(cfg, reg, sec, arts, plane, Options{Log: log, Fleet: o.Fleet, Backup: bk, Timers: o.timers(cfg, sup), Settings: node.Settings, UpgradeNotify: o.UpgradeNotify})
 	node.Engine = eng
 	eng.SetNode(func() NodeResources { return DetectNode(cfg) })
 

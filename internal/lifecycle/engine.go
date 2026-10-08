@@ -37,6 +37,13 @@ type Options struct {
 	// Settings supplies the saved per-project settings for Storage and Realtime tenants
 	// (and, through the plane, for units); nil means defaults.
 	Settings Settings
+	// UpgradeNotify, when set, is told when a project's upgrade starts, succeeds or fails
+	// (UpgradeNotice). The daemon sets it to raise alerts; this package cannot import the alerting
+	// package (which reads the node's health through this one), so the hook is how an event gets out.
+	// It is called on the upgrade's own goroutine after the event is recorded and must not block:
+	// the caller starts any slow delivery itself. `supavise upgrade` leaves it nil: it reports the
+	// node's upgrade as one, not every project's move.
+	UpgradeNotify func(ctx context.Context, n UpgradeNotice)
 }
 
 // Timers drives the per-project nightly base backup timer (supavise-basebackup@<ref>.timer).

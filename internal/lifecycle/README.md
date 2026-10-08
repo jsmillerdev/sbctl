@@ -173,6 +173,18 @@ migrations run when the service starts and only go forward, so an older GoTrue c
 newer one migrated: the pre-upgrade base backup is the way back for the data
 (`supavise backups restore`), and its id is in the error, the events and the status row.
 
+**Alerts.** The Engine cannot import `internal/alerts` (alerts read the node's health through this
+package), so each upgrade event also goes to `Options.UpgradeNotify`, a hook that receives an
+`UpgradeNotice` (event, ref, tracking id, the service moves in words, backup id, and for a failure
+the stage's error code, the cause and the outcome: `nothing was changed`, `rolled back to the
+previous versions`, `the rollback failed too: ...` or `interrupted`). It is called after the registry
+event is recorded, from the six places that record one: `BeginUpgrade`, a successful `swap`, `failed`
+(every failure path), `settleUpgradeRows` and `recoverUpgrade` (an upgrade whose process died; the
+notice has `Settled`). The daemon sets it (`internal/app`, `upgrade_started`, `upgrade_succeeded` and
+`upgrade_failed` alerts); the CLI does not, because `supavise upgrade` reports a node's upgrade as one
+(`internal/nodeupgrade`), not as a message for every project the rollout moves. The hook must not
+block.
+
 Who runs an upgrade can die: the daemon restarts, or the CLI's process is killed (`projects
 upgrade` ignores SIGHUP and SIGPIPE, so a dropped SSH session does not end it, but SIGKILL and the
 OOM killer can). The claim tells a live runner from a dead one. A project that is `UPGRADING` with

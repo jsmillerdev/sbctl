@@ -22,7 +22,17 @@ alerts.Notify(ctx, alerts.Event{Kind: alerts.KindUpgradeFailed, Severity: "criti
 | `node_unhealthy` | the registry, the system cluster or a shared service is not healthy | warning; critical for the registry and system Postgres |
 | `update_available` | a release newer than the running version exists | info, once per version |
 
-Other parts of the node raise `upgrade_started`, `upgrade_succeeded` and `upgrade_failed` (the upgrade commands) and may raise any kind. Those three, `update_available` and `test` are announcements: each is sent when it happens, subject only to the hourly cap. Everything else is a condition: sent once while it lasts.
+Other parts of the node raise `upgrade_started`, `upgrade_succeeded` and `upgrade_failed` and may raise any kind. Those three, `update_available` and `test` are announcements: each is sent when it happens, subject only to the hourly cap (and exempt from it, below). Everything else is a condition: sent once while it lasts.
+
+Three places raise the `upgrade_*` events, each about its own scope:
+
+| Raised by | About | Process |
+|---|---|---|
+| the daemon, from `lifecycle.Options.UpgradeNotify` (`internal/app`) | one project's upgrade: Studio's "Upgrade project", `POST /v1/projects/{ref}/upgrade`, and the upgrades the daemon closes after a crash. `Ref` is the project | the daemon |
+| `supavise upgrade` (`internal/nodeupgrade` events, `cmd/supavise/upgrade_alerts.go`) | the node's upgrade: started, succeeded, failed and rolled back (warning), failed and needs the operator (critical), with the versions and the halted project | the CLI, as root, also when `supavise update run` starts it |
+| `supavise rollback` | the node's rollback: started, succeeded, failed (critical) | the CLI, as root |
+
+The rollout of a node upgrade runs project upgrades in worker processes that have no hook, so a node upgrade is one set of messages and not one per project. Neither the maintenance window nor the upgrade marker holds an `upgrade_*` event back: they quiet the checker's `project_unhealthy` and `node_unhealthy`, and the operator who starts an upgrade inside a window they announced still hears that it failed. A run that is refused before it changes anything raises nothing.
 
 ## De-duplication, recovery and the cap
 

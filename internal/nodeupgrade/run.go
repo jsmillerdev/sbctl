@@ -167,6 +167,10 @@ type Options struct {
 	Out                        io.Writer
 	Log                        *slog.Logger
 	Now                        func() time.Time
+	// Notify, when set, is told about the start and the end of an upgrade or rollback that changes the
+	// node (Event). It runs on the command's goroutine and may take a while (it delivers alerts), so
+	// the caller bounds it. A refusal, which changes nothing, is not an Event.
+	Notify func(ctx context.Context, ev Event)
 }
 
 func (o *Options) say(format string, a ...any) {
@@ -202,6 +206,8 @@ type run struct {
 	started time.Time
 	node    *Node
 	plan    *Plan
+	// announced is set once EventStarted was sent.
+	announced bool
 	// sharedFailed is set when a shared service did not come up on the release this run moved it to.
 	sharedFailed bool
 }
@@ -298,7 +304,7 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 
 	r.mark(PhasePreparing, "downloading the new release")
 	if err := h.Prefetch(ctx, staged, node, plan); err != nil {
-		return r.endRefused(fmt.Errorf("fetching the artifacts of %s: %w; nothing was changed", plan.To, err))
+		return r.endRefused(ctx, fmt.Errorf("fetching the artifacts of %s: %w; nothing was changed", plan.To, err))
 	}
 	refs := BackupRefs(node)
 	r.mark(PhasePreparing, fmt.Sprintf("backing up %d project(s)", len(refs)))
@@ -308,8 +314,12 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 		par = 3
 	}
 	if err := h.Backup(ctx, refs, par); err != nil {
-		return r.endRefused(fmt.Errorf("the base backups failed: %w; nothing was stopped or changed", err))
+		return r.endRefused(ctx, fmt.Errorf("the base backups failed: %w; nothing was stopped or changed", err))
 	}
+
+	// Everything above changed nothing that runs; from here the node changes.
+	o.notify(ctx, Event{Kind: EventStarted, From: node.Version, To: plan.To, Projects: len(plan.Upgrade) + len(plan.Pending)})
+	r.announced = true
 
 	// The release that runs is kept with the migrations it knows: what its binary says, or, for a
 	// binary built before it could say, the ones the registry holds now (it has run on them). Its
@@ -327,7 +337,7 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 		swapped, err := h.Install(ctx, staged, prev, next)
 		if err != nil {
 			if !swapped {
-				return r.endRefused(fmt.Errorf("installing %s failed before the binary was replaced: %w; nothing was changed", plan.To, err))
+				return r.endRefused(ctx, fmt.Errorf("installing %s failed before the binary was replaced: %w; nothing was changed", plan.To, err))
 			}
 			return r.rollback(ctx, prev, nil, fmt.Errorf("the new daemon did not come up: %w", err))
 		}
@@ -371,6 +381,7 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	r.mark(PhaseDone, "")
 	log.Info("upgrade_succeeded", "from", node.Version, "to", plan.To, "projects", len(projectMoves))
 	o.say("Supavise %s is running; %d project(s) upgraded", plan.To, len(projectMoves))
+	o.notify(ctx, Event{Kind: EventSucceeded, From: node.Version, To: plan.To, Projects: len(projectMoves)})
 	return nil
 }
 
@@ -402,8 +413,12 @@ func (r *run) endUpgrade(ctx context.Context) {
 }
 
 // endRefused ends an upgrade that changed nothing.
-func (r *run) endRefused(err error) error {
+func (r *run) endRefused(ctx context.Context, err error) error {
 	r.mark(PhaseRefused, err.Error())
+	if r.announced {
+		// The operator was told the node was about to change; say that it did not.
+		r.o.notify(ctx, Event{Kind: EventRefused, From: r.node.Version, To: r.plan.To, Cause: err.Error()})
+	}
 	r.o.log().Warn("upgrade_refused", "to", r.plan.To, "error", err.Error())
 	return &Failure{Code: ExitRefused, Err: err}
 }
@@ -470,11 +485,14 @@ func (r *run) rollback(ctx context.Context, prev Record, moves []ProjectMove, ca
 		if errors.Is(err, ErrRegistryNewer) {
 			err = fmt.Errorf("%w. The projects the rollout had not reached may still run the PostgreSQL, GoTrue and PostgREST they ran before, on the settings of the old release; `sudo supavise upgrade` restarts them in canary order", err)
 		}
-		return &Failure{Code: ExitNeedsOperator, Err: fmt.Errorf("%w (the upgrade failed because: %v)", err, cause)}
+		fail := &Failure{Code: ExitNeedsOperator, Err: fmt.Errorf("%w (the upgrade failed because: %v)", err, cause)}
+		o.notify(ctx, Event{Kind: EventNeedsOperator, From: r.node.Version, To: r.plan.To, Halted: r.halted(), Cause: fail.Error()})
+		return fail
 	}
 	r.mark(PhaseRolledBack, cause.Error())
 	o.log().Warn("upgrade_rolled_back", "to", prev.Version, "error", cause.Error())
 	o.say("rolled back: Supavise %s is running again", prev.Version)
+	o.notify(ctx, Event{Kind: EventRolledBack, From: r.node.Version, To: r.plan.To, BackTo: prev.Version, Halted: r.halted(), Cause: cause.Error()})
 	return &Failure{Code: ExitRolledBack, Err: fmt.Errorf("the upgrade to %s failed and the node is back on %s: %w", r.plan.To, prev.Version, cause)}
 }
 
@@ -489,7 +507,9 @@ func (r *run) revertProjectsOnly(ctx context.Context, moves []ProjectMove, cause
 	fail := func(err error) error {
 		r.mark(PhaseFailed, err.Error())
 		o.log().Error("upgrade_needs_operator", "error", err.Error())
-		return &Failure{Code: ExitNeedsOperator, Err: fmt.Errorf("%w (the upgrade failed because: %v)", err, cause)}
+		f := &Failure{Code: ExitNeedsOperator, Err: fmt.Errorf("%w (the upgrade failed because: %v)", err, cause)}
+		o.notify(ctx, Event{Kind: EventNeedsOperator, From: r.node.Version, To: r.plan.To, Halted: r.halted(), Cause: f.Error()})
+		return f
 	}
 	var revertErr error
 	if len(moves) > 0 {
@@ -510,5 +530,6 @@ func (r *run) revertProjectsOnly(ctx context.Context, moves []ProjectMove, cause
 	r.mark(PhaseRolledBack, cause.Error())
 	o.log().Warn("upgrade_rolled_back", "to", r.node.Version, "error", cause.Error())
 	o.say("rolled back: the projects are on the releases they ran; the binary %s did not change", r.node.Version)
+	o.notify(ctx, Event{Kind: EventRolledBack, From: r.node.Version, To: r.plan.To, BackTo: r.node.Version, Halted: r.halted(), Cause: cause.Error()})
 	return &Failure{Code: ExitRolledBack, Err: fmt.Errorf("the upgrade to %s failed and the projects it moved are back on the releases they ran (the binary did not change, so the node's services stay on the releases it pins): %w", r.plan.To, cause)}
 }

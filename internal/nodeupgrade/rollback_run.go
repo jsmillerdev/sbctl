@@ -93,14 +93,17 @@ func Rollback(ctx context.Context, h Host, o Options) error {
 	o.log().Info("rollback_started", "from", node.Version, "to", prev.Version, "projects", len(moves))
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Minute)
 	defer cancel()
+	o.notify(ctx, Event{Kind: EventStarted, Rollback: true, From: node.Version, To: prev.Version, Projects: len(moves)})
 	if err := rollBackTo(ctx, h, o, rollbackArgs{From: node.Version, FromPins: node.Pins, To: prev, Moves: moves, Verdict: node.Verdict, Mark: r.mark}); err != nil {
 		r.mark(PhaseFailed, err.Error())
 		o.log().Error("rollback_failed", "error", err.Error())
+		o.notify(ctx, Event{Kind: EventNeedsOperator, Rollback: true, From: node.Version, To: prev.Version, Cause: err.Error()})
 		return &Failure{Code: ExitNeedsOperator, Err: err}
 	}
 	r.mark(PhaseRolledBack, "")
 	o.log().Info("rollback_succeeded", "to", prev.Version)
 	o.say("rolled back: Supavise %s is running", prev.Version)
+	o.notify(ctx, Event{Kind: EventSucceeded, Rollback: true, From: node.Version, To: prev.Version, Projects: len(moves)})
 	return nil
 }
 

@@ -169,7 +169,7 @@ status 4. Needs root.`,
 			defer unlock()
 			signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 			defer signal.Reset(syscall.SIGHUP, syscall.SIGPIPE)
-			return nodeupgrade.Rollback(cmd.Context(), h, nodeupgrade.Options{Yes: rollYes, Out: cmd.OutOrStdout(), Log: newLogger(cfg)})
+			return nodeupgrade.Rollback(cmd.Context(), h, nodeupgrade.Options{Yes: rollYes, Out: cmd.OutOrStdout(), Log: newLogger(cfg), Notify: upgradeNotifier(cfg, newLogger(cfg))})
 		},
 	}
 	roll.Flags().BoolVar(&rollYes, "yes", false, "do not ask for confirmation")
