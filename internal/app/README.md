@@ -86,8 +86,8 @@ is the daemon that `supavise.service` runs.
   are recorded by the leader (`backup.Options.TakeBase` and `placement.BackupOps` are not connected).
 - The commands of the CLI that open the node (`openNode`, `openOptions`) open the registry as a
   leader's; a follower needs the read-only open that `openFollower` gives the daemon.
-- A server move that the restart interrupts is finished by the new leader's daemon without the CLI
-  that started it: the CLI's stream ends when the old daemon stops, and `supavise failover --resume`
+- A server move that the restart interrupts is finished by the daemon that starts as the leader, without
+  the CLI that started it: the CLI's stream ends when the old daemon stops, and `supavise failover --resume`
   or the log shows the rest.
 
 ## Test
