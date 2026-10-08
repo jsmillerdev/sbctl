@@ -174,7 +174,7 @@ type awsRelease struct {
 func newAWSRelease(t *testing.T) *awsRelease {
 	t.Helper()
 	r := &awsRelease{record: filepath.Join(t.TempDir(), "args")}
-	script := []byte("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >\"$RECORD\"\nprintf 'pubkey=%s base=%s\\n' \"${SUPAVISE_DEPLOY_PUBKEY_B64-unset}\" \"${SUPAVISE_DEPLOY_BASE_URL-unset}\" >\"$RECORD.seen\"\ncat \"${5:-/dev/null}\" >>\"$RECORD\"\nexit \"${EXIT_CODE:-0}\"\n")
+	script := []byte("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >\"$RECORD\"\nprintf 'pubkey=%s base=%s imds=%s\\n' \"${SUPAVISE_DEPLOY_PUBKEY_B64-unset}\" \"${SUPAVISE_DEPLOY_BASE_URL-unset}\" \"${SUPAVISE_IMDS_ENDPOINT-unset}\" >\"$RECORD.seen\"\ncat \"${5:-/dev/null}\" >>\"$RECORD\"\nexit \"${EXIT_CODE:-0}\"\n")
 	tmpl := []byte("AWSTemplateFormatVersion: 2010-09-09\n")
 	r.files = map[string][]byte{selfupdate.AWSDeployAsset: script, "supavise.yaml": tmpl}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -340,9 +340,9 @@ var (
 	_ nodeupgrade.HostConverger = (*nodeHost)(nil)
 )
 
-// The two variables that replace the script's trust root do not reach it from the environment the
-// operator's `sudo -E` passes on.
-func TestUpdateStackKeepsTheScriptsTrustRootOutOfTheEnvironment(t *testing.T) {
+// The variables that replace what the script trusts (the release key, the download address, the
+// metadata service) do not reach it from the environment the operator's `sudo -E` passes on.
+func TestUpdateStackKeepsTheScriptsTestHooksOutOfTheEnvironment(t *testing.T) {
 	rel := newAWSRelease(t)
 	h, _, _ := awsHost(t)
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAOPERATOR")
@@ -350,11 +350,12 @@ func TestUpdateStackKeepsTheScriptsTrustRootOutOfTheEnvironment(t *testing.T) {
 	t.Setenv("EXIT_CODE", "0")
 	t.Setenv("SUPAVISE_DEPLOY_PUBKEY_B64", "bm90LXRoZS1yZWxlYXNlLWtleQ==")
 	t.Setenv("SUPAVISE_DEPLOY_BASE_URL", "https://evil.example/releases")
+	t.Setenv("SUPAVISE_IMDS_ENDPOINT", "http://127.0.0.1:1")
 	if _, err := h.UpdateStack(context.Background(), rel.cand, nodeupgrade.StackOptions{Name: "supavise"}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(rel.record + ".seen")
-	if err != nil || strings.TrimSpace(string(got)) != "pubkey=unset base=unset" {
+	if err != nil || strings.TrimSpace(string(got)) != "pubkey=unset base=unset imds=unset" {
 		t.Errorf("the script saw %q (%v)", got, err)
 	}
 	if os.Getenv("SUPAVISE_DEPLOY_BASE_URL") == "" {

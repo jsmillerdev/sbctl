@@ -240,10 +240,11 @@ func (h *nodeHost) UpdateStack(ctx context.Context, c *nodeupgrade.Candidate, so
 	// script's own check of itself, which only runs on its download path.
 	cmd := exec.CommandContext(ctx, "bash", append([]string{script}, awsUpdateArgs(stack, template, so.Sets)...)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, h.out, h.errw
-	// The script takes its trust root (the release key, the download address) from these two variables
-	// when they are set, for tests. `sudo -E` passes on whatever the caller exported, and the stack is
-	// changed with this script: the variables do not reach it.
-	cmd.Env = withoutEnv(os.Environ(), scriptTrustRootVars...)
+	// The script takes its trust root (the release key, the download address) and the address of the
+	// metadata service it checks the node's identity against from these variables when they are set,
+	// for tests. `sudo -E` passes on whatever the caller exported, and the stack is changed with this
+	// script: the variables do not reach it.
+	cmd.Env = withoutEnv(os.Environ(), scriptTestHookVars...)
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
@@ -259,8 +260,9 @@ func (h *nodeHost) UpdateStack(ctx context.Context, c *nodeupgrade.Candidate, so
 	return nodeupgrade.StackOutcome{}, nil
 }
 
-// scriptTrustRootVars are the variables that replace the trust root of supavise-aws-deploy.sh.
-var scriptTrustRootVars = []string{"SUPAVISE_DEPLOY_PUBKEY_B64", "SUPAVISE_DEPLOY_BASE_URL"}
+// scriptTestHookVars are the variables that replace what supavise-aws-deploy.sh trusts: the release
+// key, the address the release is fetched from and the address of the metadata service.
+var scriptTestHookVars = []string{"SUPAVISE_DEPLOY_PUBKEY_B64", "SUPAVISE_DEPLOY_BASE_URL", "SUPAVISE_IMDS_ENDPOINT"}
 
 // withoutEnv returns env without the variables named.
 func withoutEnv(env []string, names ...string) []string {

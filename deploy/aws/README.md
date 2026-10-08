@@ -96,7 +96,7 @@ Without a command word, `deploy.sh` creates a stack with `aws cloudformation dep
 
 `deploy/release-assets.sh` stamps first and signs last: `install.sh`, `supavise.yaml` and `supavise-aws-deploy.sh` are in `SHA256SUMS` with the hashes of the files as attached, and `supavise-release.json` names the stack revision, the template asset and its SHA-256 (`aws`) and the host converge revision of the binary (`host`).
 
-Test hooks, as in `install.sh`: `SUPAVISE_DEPLOY_BASE_URL` replaces `https://github.com/supavise/supavise/releases`, `SUPAVISE_DEPLOY_PUBKEY_B64` the stamped key, `SUPAVISE_IMDS_ENDPOINT` the metadata service address. They are for tests: the first two replace the trust root of the script, so never set them in a session that changes a real stack.
+Test hooks, as in `install.sh`: `SUPAVISE_DEPLOY_BASE_URL` replaces `https://github.com/supavise/supavise/releases`, `SUPAVISE_DEPLOY_PUBKEY_B64` the stamped key, `SUPAVISE_IMDS_ENDPOINT` the metadata service address. They are for tests: the first two replace the trust root of the script, so never set them in a session that changes a real stack. `supavise upgrade --aws` removes all three from the environment it starts the script with.
 
 ## rehearse.sh
 
