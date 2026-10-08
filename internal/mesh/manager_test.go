@@ -425,6 +425,19 @@ func TestStrangersAndTheJoinEndpoint(t *testing.T) {
 	if n, err := fst.Read(make([]byte, 1)); n != 0 || err == nil {
 		t.Fatalf("an anonymous forward stream got %d bytes, %v", n, err)
 	}
+	// A client that does not speak the mesh protocol is turned away by the server, which checks the
+	// ALPN itself (TLS 1.3 reports it on the first read).
+	for _, protos := range [][]string{nil, {"h2"}} {
+		conn, err := tls.Dial("tcp", addr, &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true, NextProtos: protos})
+		if err != nil {
+			continue
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.Read(make([]byte, 1)); err == nil {
+			t.Fatalf("a client with ALPN %v was served", protos)
+		}
+		conn.Close()
+	}
 	// A pin of another CA fails the handshake.
 	if conn, err := tls.Dial("tcp", addr, PinnedTLS(Fingerprint(newTestCA(t).cert.Raw), nil, time.Now)); err == nil {
 		conn.Close()
@@ -459,4 +472,32 @@ func dialAnonymous(t *testing.T, addr string, cfg *tls.Config, header ...Header)
 		t.Fatal(err)
 	}
 	return st
+}
+
+// A session that dies is replaced: the next connection through a forwarder opens another, and the
+// upkeep brings the session back for the pings.
+func TestForwardingSurvivesASessionLoss(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	h.project(refA, 1, "n1")
+	n1, n2 := h.nodes["n1"], h.nodes["n2"]
+	echoServer(t, n1.cfg.PortsFor(refA, 1).Postgres, "A@n1")
+	h.start()
+	go n2.fwd.Run(h.ctx)
+	port := n2.cfg.PortsFor(refA, 1).Postgres
+	eventually(t, "forwarding", func() bool { got, err := roundTrip(port, "1"); return err == nil && got == "A@n1:1" })
+
+	for range 3 {
+		n2.mgr.mu.Lock()
+		pc := n2.mgr.sessions["n1"]
+		n2.mgr.mu.Unlock()
+		if pc == nil {
+			t.Fatal("no session to close")
+		}
+		_ = pc.sess.Close()
+		eventually(t, "forwarding after the session was closed", func() bool {
+			got, err := roundTrip(port, "2")
+			return err == nil && got == "A@n1:2"
+		})
+		eventually(t, "both sides to hold a session again", func() bool { return n1.mgr.Connected("n2") && n2.mgr.Connected("n1") })
+	}
 }

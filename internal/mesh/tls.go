@@ -135,6 +135,9 @@ func checkPeer(certs []*x509.Certificate, ca *x509.Certificate, usage x509.ExtKe
 	return id, nil
 }
 
+// errALPN is the handshake error of a peer that does not speak the mesh protocol.
+var errALPN = errors.New("mesh: the peer did not negotiate " + ALPN)
+
 // serverTLS is the configuration of the peer listener: TLS 1.3, the mesh's ALPN, the node's
 // certificate, and a client certificate that is asked for and verified when given. A client with
 // none is a joiner; the request policy lets it reach the join endpoints and nothing else.
@@ -151,6 +154,9 @@ func serverTLS(creds func() *Credentials, admit AdmitFunc, now func() time.Time)
 		},
 		ClientAuth: tls.RequestClientCert,
 		VerifyConnection: func(cs tls.ConnectionState) error {
+			if cs.NegotiatedProtocol != ALPN {
+				return errALPN
+			}
 			if len(cs.PeerCertificates) == 0 {
 				return nil
 			}
@@ -185,6 +191,9 @@ func clientTLS(creds func() *Credentials, want string, admit AdmitFunc, now func
 			return &tls.Certificate{}, nil
 		},
 		VerifyConnection: func(cs tls.ConnectionState) error {
+			if cs.NegotiatedProtocol != ALPN {
+				return errALPN
+			}
 			c := creds()
 			if c == nil {
 				return errors.New("mesh: this node has no certificate")
@@ -220,6 +229,9 @@ func PinnedTLS(caFingerprint string, creds func() *Credentials, now func() time.
 			return &tls.Certificate{}, nil
 		},
 		VerifyConnection: func(cs tls.ConnectionState) error {
+			if cs.NegotiatedProtocol != ALPN {
+				return errALPN
+			}
 			certs := cs.PeerCertificates
 			if len(certs) < 2 {
 				return errors.New("mesh: the server did not present its CA certificate")
