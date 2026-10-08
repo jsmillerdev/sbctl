@@ -116,7 +116,7 @@ sudo -u supavise supavise node ls
 
 The servers talk over TCP port 7443, so open it between them. `--region` is the region that Studio shows for the new server's replicas. The token works once and expires after an hour.
 
-**Add a replica.** In Studio, open **Project Settings**, **Infrastructure**, then **Add read replica**, and pick the new server's region. The button needs a project of size Small or larger. The same from the leader's shell, and for every project at once:
+**Add a replica.** In Studio, open **Project Settings**, **Infrastructure**, then **Add read replica**, and pick the new server's region. The button needs a project of size Small or larger. The same from the leader's shell:
 
 ```bash
 sudo -u supavise supavise replicas add <ref> --region eu-west-1
@@ -125,7 +125,7 @@ sudo -u supavise supavise replicas ls          # the setup step, status and lag
 
 To give every project a replica on every other server, set `[replicas] default = "all"` in the leader's `/etc/supavise/config.toml`. That roughly doubles the footprint of the cluster.
 
-**Use it.** A replica answers reads at `https://<identifier>.api.<domain>/rest/v1`, with the project's own keys, and through the pooler as the user `postgres.<identifier>`. Studio lists both next to the primary. `https://<ref>-lb.api.<domain>` is a load balancer that sends reads (`GET` and `HEAD` on `/rest/v1`) to the nearest healthy database and everything else to the primary. Point a latency-routed DNS record at each server to spread reads; a name that resolves to the primary's server always answers from the primary. [Read replicas reference](reference/replicas.md#names-and-ports) has the names.
+**Use it.** A replica answers reads at `https://<identifier>.api.<domain>/rest/v1`, with the project's own keys, and through the pooler as the user `postgres.<identifier>`. Studio lists both next to the primary. `https://<ref>-lb.api.<domain>` is a load balancer that sends reads (`GET` and `HEAD` on `/rest/v1`) to the nearest healthy database and everything else to the primary. Point a latency-routed DNS record at each server to spread reads; a name that resolves to the primary's server answers from the primary. [Read replicas reference](reference/replicas.md#names-and-ports) has the names.
 
 **Switch over or fail over.** A switchover is planned and loses nothing. A failover follows a failure and loses at most what the replica had not received. Run each command with `--dry-run` first: it prints every precondition and changes nothing.
 
