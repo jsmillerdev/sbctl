@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +17,8 @@ import (
 
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/hostsetup"
+	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 )
@@ -376,4 +381,246 @@ func TestClusterStatusIsAbsentOnASingleServer(t *testing.T) {
 	if err != nil || b == nil || b.Fenced == nil || b.Epoch != 4 {
 		t.Fatalf("%+v, %v", b, err)
 	}
+}
+
+// ---- the commands, driven through the root command ----
+
+// joinedHost is a server with a config file in a temporary directory and a cluster identity: the
+// files that make cluster.Joined true. leads and the units are the test's: nothing real is asked.
+type joinedHost struct {
+	cfgPath string
+	cfg     *config.Config
+	data    string // a data directory a reset would set aside
+	leads   bool
+	stopped int
+	asked   int // how often the units were wanted
+}
+
+func newJoinedHost(t *testing.T) *joinedHost {
+	t.Helper()
+	dir := t.TempDir()
+	h := &joinedHost{cfgPath: filepath.Join(dir, "etc", "config.toml")}
+	if err := os.MkdirAll(filepath.Dir(h.cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "state_dir = \"" + filepath.Join(dir, "state") + "\"\nkey_path = \"" + filepath.Join(dir, "etc", "master.key") + "\"\n"
+	if err := os.WriteFile(h.cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(h.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.cfg = cfg
+	cdir := config.ClusterDir(h.cfgPath)
+	if err := os.MkdirAll(cdir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cdir, config.NodeCertFile), []byte("certificate"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.data = cfg.Paths().PostgresData("system")
+	if err := os.MkdirAll(h.data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A host that converged: the commands that turn cluster features on wait for it.
+	if err := hostsetup.WriteMarker(cfg.StateDir, hostsetup.Marker{Revision: hostsetup.Revision, Version: "test", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldPath, oldStop, oldLeads, oldSeed, oldPre := configPath, stopLocalFn, leadsHere, seedSystemStandby, seedPreflight
+	configPath = h.cfgPath
+	stopLocalFn = func(*config.Config, *slog.Logger) (func(context.Context) error, func(), error) {
+		h.asked++
+		return func(context.Context) error { h.stopped++; return nil }, func() {}, nil
+	}
+	leadsHere = func(context.Context, string, []string) bool { return h.leads }
+	seedSystemStandby = func(context.Context, peerapi.SystemBootstrap) error { return nil }
+	seedPreflight = func(context.Context) error { return nil }
+	t.Cleanup(func() {
+		configPath, stopLocalFn, leadsHere, seedSystemStandby, seedPreflight = oldPath, oldStop, oldLeads, oldSeed, oldPre
+		rootCmd.SetIn(nil)
+	})
+	return h
+}
+
+// token is a join token that parses, has not expired and names a leader at leaderAddr.
+func (h *joinedHost) token(t *testing.T, leaderAddr string) string {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "token")
+	tok := cluster.Token{V: 1, ID: "tokenid", Leader: leaderAddr, CAFpr: strings.Repeat("0", 64),
+		Secret: base64.RawURLEncoding.EncodeToString([]byte("secret")), Exp: time.Now().Add(time.Hour).Unix()}
+	if err := os.WriteFile(file, []byte(tok.Encode()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
+// deadAddr is an address nothing listens on.
+func deadAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().String()
+}
+
+// unchanged fails when the server was touched: the units wanted, the identity or the data moved.
+func (h *joinedHost) unchanged(t *testing.T, what string) {
+	t.Helper()
+	if h.asked != 0 || h.stopped != 0 {
+		t.Errorf("%s: the units were wanted %d times and stopped %d times", what, h.asked, h.stopped)
+	}
+	if !cluster.Joined(config.ClusterDir(h.cfgPath)) {
+		t.Errorf("%s: the identity was deleted", what)
+	}
+	if _, err := os.Stat(h.data); err != nil {
+		t.Errorf("%s: the data was moved: %v", what, err)
+	}
+	if rec, _ := cluster.ReadFenced(h.cfg); rec != nil {
+		t.Errorf("%s: the server was recorded as fenced or removed: %+v", what, rec)
+	}
+}
+
+// `node join --reset` on a server that leads its cluster is refused without --yes, before anything is
+// stopped or moved; on another server it lists the data and asks, and only a yes goes on.
+func TestNodeJoinResetAsksBeforeItStopsAnything(t *testing.T) {
+	h := newJoinedHost(t)
+	file := h.token(t, deadAddr(t))
+
+	// The leader, without --yes.
+	h.leads = true
+	out, err := run(t, "node", "join", "--reset", "--token-file", file)
+	if err == nil || !strings.Contains(err.Error(), "leads its cluster") {
+		t.Fatalf("a leader without --yes: %v\n%s", err, out)
+	}
+	for _, want := range []string{"--reset gives up this server's place", h.data, "LEADER"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the confirmation lacks %q:\n%s", want, out)
+		}
+	}
+	h.unchanged(t, "leader without --yes")
+
+	// Not the leader: asked, and any answer but yes leaves everything.
+	h.leads = false
+	rootCmd.SetIn(strings.NewReader("no\n"))
+	out, err = run(t, "node", "join", "--reset", "--token-file", file)
+	if err == nil || !strings.Contains(err.Error(), "not reset") || !strings.Contains(out, "Go ahead? [y/N]") {
+		t.Fatalf("a no: %v\n%s", err, out)
+	}
+	h.unchanged(t, "an answer of no")
+
+	// The token read from standard input leaves no answer to give, and the refusal says so.
+	rootCmd.SetIn(strings.NewReader(mustRead(t, file)))
+	if _, err := run(t, "node", "join", "--reset", "--token-file", "-"); err == nil || !strings.Contains(err.Error(), "pass --yes") {
+		t.Fatalf("a token from standard input: %v", err)
+	}
+	h.unchanged(t, "token from stdin")
+
+	// An expired token is refused before the question is asked.
+	expired := filepath.Join(t.TempDir(), "expired")
+	old := cluster.Token{V: 1, ID: "t", Leader: deadAddr(t), CAFpr: strings.Repeat("0", 64), Secret: base64.RawURLEncoding.EncodeToString([]byte("s")), Exp: time.Now().Add(-time.Hour).Unix()}
+	if err := os.WriteFile(expired, []byte(old.Encode()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run(t, "node", "join", "--reset", "--token-file", expired, "--yes")
+	if err == nil || !strings.Contains(err.Error(), "expired") || strings.Contains(out, "gives up") {
+		t.Fatalf("an expired token: %v\n%s", err, out)
+	}
+	h.unchanged(t, "expired token")
+
+	// A yes goes on: the leader named in the token is looked at before the server is stopped, finds
+	// nobody, and the server is as it was.
+	rootCmd.SetIn(strings.NewReader("yes\n"))
+	out, err = run(t, "node", "join", "--reset", "--token-file", file)
+	if err == nil || !strings.Contains(err.Error(), "cannot reach the leader") || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Fatalf("a yes with no leader: %v\n%s", err, out)
+	}
+	if h.asked != 1 || h.stopped != 0 {
+		t.Errorf("after a yes: the units were wanted %d times and stopped %d times, want wanted once and not stopped", h.asked, h.stopped)
+	}
+	if _, err := os.Stat(h.data); err != nil || !cluster.Joined(config.ClusterDir(h.cfgPath)) {
+		t.Errorf("a join that could not reach the leader changed the server: %v", err)
+	}
+
+	// --yes on the leader goes on the same way.
+	h.leads, h.asked = true, 0
+	if _, err := run(t, "node", "join", "--reset", "--token-file", file, "--yes"); err == nil || !strings.Contains(err.Error(), "cannot reach the leader") {
+		t.Fatalf("--yes on a leader: %v", err)
+	}
+	if h.asked != 1 {
+		t.Errorf("--yes on a leader: the units were wanted %d times", h.asked)
+	}
+}
+
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// A server that holds the identity of a node that was removed has nothing to confirm and no units to
+// stop: the identity is revoked, and the join deletes it.
+func TestNodeJoinResetOfARemovedNodeAsksNothing(t *testing.T) {
+	h := newJoinedHost(t)
+	if err := cluster.WriteFenced(h.cfg, cluster.FencedRecord{Reason: cluster.RemovedReason, Removed: true, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	h.leads = true // would be refused, if it were asked
+	out, err := run(t, "node", "join", "--reset", "--token-file", h.token(t, deadAddr(t)))
+	if err == nil || strings.Contains(out, "gives up") || strings.Contains(err.Error(), "leads its cluster") {
+		t.Fatalf("a removed node: %v\n%s", err, out)
+	}
+	if h.asked != 0 || h.stopped != 0 {
+		t.Errorf("units were wanted for a removed node: %d, %d", h.asked, h.stopped)
+	}
+	if cluster.Joined(config.ClusterDir(h.cfgPath)) {
+		t.Error("the revoked identity is still there")
+	}
+}
+
+// Without --reset a join refuses a server that holds an identity, and says what to run instead.
+func TestNodeJoinWithoutResetRefusesAJoinedServer(t *testing.T) {
+	h := newJoinedHost(t)
+	_, err := run(t, "node", "join", "--token-file", h.token(t, deadAddr(t)))
+	if err == nil || !strings.Contains(err.Error(), "already joined") || !strings.Contains(err.Error(), "--reset") {
+		t.Fatalf("join on a joined server: %v", err)
+	}
+	h.unchanged(t, "join without --reset")
+}
+
+// `node rejoin` on a server that is not fenced stops nothing and changes nothing; its units are asked
+// for only to hand to the rejoin.
+func TestNodeRejoinOfAServerThatIsNotFenced(t *testing.T) {
+	h := newJoinedHost(t)
+	_, err := run(t, "node", "rejoin")
+	if err == nil || !strings.Contains(err.Error(), "not fenced") {
+		t.Fatalf("rejoin of a server that is not fenced: %v", err)
+	}
+	if h.stopped != 0 {
+		t.Error("rejoin stopped the units of a server that is not fenced")
+	}
+	if !cluster.Joined(config.ClusterDir(h.cfgPath)) {
+		t.Error("the identity was deleted")
+	}
+}
+
+// The commands that turn the cluster features on wait for the host to be converged.
+func TestNodeCommandsRefuseWhileTheHostIsBehind(t *testing.T) {
+	h := newJoinedHost(t)
+	if err := hostsetup.WriteMarker(h.cfg.StateDir, hostsetup.Marker{Revision: hostsetup.Revision - 1, Version: "old", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"node", "join", "--token-file", h.token(t, deadAddr(t))}, {"node", "rejoin"}} {
+		_, err := run(t, args...)
+		if err == nil || !strings.Contains(err.Error(), "system converge") {
+			t.Errorf("supavise %s with the host behind: %v", strings.Join(args, " "), err)
+		}
+	}
+	h.unchanged(t, "host behind")
 }

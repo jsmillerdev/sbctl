@@ -18,6 +18,7 @@ import (
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/notimpl"
 	"github.com/supavise/supavise/internal/registry"
@@ -42,6 +43,23 @@ var seedSystemStandby cluster.SeedFunc = func(context.Context, peerapi.SystemBoo
 // seedSystemStandby), and a resumed join does not call it.
 var seedPreflight = func(context.Context) error {
 	return notimpl.For("seeding the system standby")
+}
+
+// stopLocalFn and leadsHere are what the join and the rejoin use to stop the units of this server and to
+// ask whether it leads its cluster; the tests of the commands replace them.
+var (
+	stopLocalFn = stopLocal
+	leadsHere   = cluster.LeadsHere
+)
+
+// hostReady refuses a command that turns the cluster features on while the host layer is behind this
+// binary (design 2.15.1): the peer port, the units' rights on the cluster directory and the rest are
+// what `supavise system converge` brings. A node whose marker cannot be read is not called behind.
+func hostReady(cfg *config.Config) error {
+	if st := hostsetup.StatusOf(cfg.StateDir); st.Behind() {
+		return fmt.Errorf("the host is at converge revision %d and this release needs %d; run `sudo supavise system converge` first, because the cluster features stay off until it has run", st.Have, st.Want)
+	}
+	return nil
 }
 
 func init() {
@@ -103,26 +121,24 @@ A server that holds the identity of a join that was given up on (the leader remo
 joining after an hour), of a node that cannot rejoin, or of a node that was removed while it was down,
 starts over with --reset and a new token: it stops what runs, sets its data aside and joins as a new node;
 run "supavise node rm" on the leader first when the old node is still listed there. --reset checks the
-token, lists the data it will set aside and asks for confirmation; --yes answers it, and is required on
-a server that leads its cluster. Without a connection to the key's holder, --master-key-file or
---key-from-escrow supply the master key; the token still authenticates the node. The token may be read
-from a file (--token-file) so that it never appears in a process listing.`,
+token and the master key, lists the data it will set aside and asks for confirmation; --yes answers it,
+and is required on a server that leads its cluster. It then looks at the leader, stops what runs and sets
+the data aside before it asks the leader to admit the node, so a refusal that only the leader can make
+(the token was used already, the name is taken, the release is outside the window) leaves this server
+stopped with its data set aside; the join then runs again with a new token. Without a connection to the
+key's holder, --master-key-file or --key-from-escrow supply the master key; the token still authenticates
+the node. The token may be read from a file (--token-file) so that it never appears in a process listing.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
 			if err != nil {
 				return err
 			}
+			if err := hostReady(cfg); err != nil {
+				return err
+			}
 			o := cluster.JoinOptions{Cfg: cfg, ConfigPath: config.ResolvePath(configPath), Resume: joinResume, Reset: joinReset, Region: joinRegion, Address: joinAddress,
 				Version: version, Log: newLogger(cfg), Seed: seedSystemStandby, Preflight: seedPreflight, DSNs: app.RegistryDSNs(cfg)}
-			if joinReset && !joinResume && cluster.Joined(config.ClusterDir(o.ConfigPath)) {
-				stop, closeUnits, err := stopLocal(cfg, o.Log)
-				if err != nil {
-					return err
-				}
-				defer closeUnits()
-				o.StopLocal = stop
-			}
 			if !joinResume {
 				raw, err := tokenInput(args, joinTokenFile, cmd.InOrStdin())
 				if err != nil {
@@ -140,6 +156,23 @@ from a file (--token-file) so that it never appears in a process listing.`,
 				o.PublicHost = cfg.PublicIP
 				if id := app.AWSIdentity(cmd.Context(), cfg); id != nil {
 					o.Provider = registry.NodeProvider{AWS: id}
+				}
+			}
+			// A reset throws away the identity this server holds, so it is asked before anything is
+			// stopped or moved: after the inputs are checked, with the data listed, and refused on a
+			// leader without --yes.
+			if joinReset && !joinResume && cluster.Joined(config.ClusterDir(o.ConfigPath)) {
+				removed, err := confirmJoinReset(cmd, &o, joinYes, joinTokenFile == "-" || (len(args) == 1 && args[0] == "-"))
+				if err != nil {
+					return err
+				}
+				if !removed {
+					stop, closeUnits, err := stopLocalFn(cfg, o.Log)
+					if err != nil {
+						return err
+					}
+					defer closeUnits()
+					o.StopLocal = stop
 				}
 			}
 			res, err := cluster.Join(cmd.Context(), o)
@@ -183,15 +216,16 @@ from a file (--token-file) so that it never appears in a process listing.`,
 	rm := &cobra.Command{
 		Use:   "rm <node>",
 		Short: "Remove a node from the cluster (run on the leader)",
-		Long: `Removes the node's replicas, marks it left and revokes its certificate at the next handshake.
-A node that is up retires itself when its copy of the registry shows the change: it stops what runs, sets
-its data aside and waits to be joined again. A node that was down or cut off from the leader when this ran
-does not learn it; once it is reachable again its peers refuse it, and it is reset on that server with
-"supavise node join --reset" and a new token.
+		Long: `Marks the node left, which revokes its certificate at the next handshake, and removes its replicas.
+The node is marked first: while it is active the replica controller would make a replica again for each
+one that goes. A node that is up retires itself when its copy of the registry shows the change: it stops
+what runs, sets its data aside and waits to be joined again. A node that was down or cut off from the
+leader when this ran does not learn it; once it is reachable again its peers refuse it, and it is reset
+on that server with "supavise node join --reset" and a new token.
 
-The replica controller removes the replicas while this command waits; --force deletes their rows at
-once, for a node that cannot be reached. A node that is the home of a project is refused: move the
-projects first.`,
+The replica controller removes the replicas while this command waits; if the wait ends first, the node
+is removed already and the controller finishes. --force deletes their rows at once, for a node that
+cannot be reached. A node that is the home of a project is refused: move the projects first.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			env, closeEnv, err := writableNodeEnv(cmd)
@@ -219,8 +253,11 @@ replicas from the current leader's archive, and keeps its identity.`,
 			if err != nil {
 				return err
 			}
+			if err := hostReady(cfg); err != nil {
+				return err
+			}
 			log := newLogger(cfg)
-			stop, closeUnits, err := stopLocal(cfg, log)
+			stop, closeUnits, err := stopLocalFn(cfg, log)
 			if err != nil {
 				return err
 			}
@@ -245,6 +282,25 @@ replicas from the current leader's archive, and keeps its identity.`,
 
 	nodeCmd.AddCommand(token, join, ls, rm, rejoin)
 	rootCmd.AddCommand(nodeCmd)
+}
+
+// confirmJoinReset is the check that comes before a `node join --reset` stops anything: the token and the
+// master key are good (cluster.JoinOptions.CheckInputs), then the operator is told what the reset does to
+// this server and asked, and a server that leads its cluster is refused unless yes. It reports removed
+// when the server holds the identity of a node that was removed from its cluster: that identity is
+// revoked, the join deletes it without more ado, and there is nothing to ask or to stop.
+func confirmJoinReset(cmd *cobra.Command, o *cluster.JoinOptions, yes, tokenFromStdin bool) (removed bool, err error) {
+	if rec, _ := cluster.ReadFenced(o.Cfg); rec != nil && rec.Removed {
+		return true, nil
+	}
+	if err := o.CheckInputs(); err != nil {
+		return false, err
+	}
+	err = confirmReset(cmd.OutOrStdout(), cmd.InOrStdin(), leadsHere(cmd.Context(), o.ConfigPath, app.RegistryDSNs(o.Cfg)), cluster.LocalData(o.Cfg), o.Cfg.Failover.KeepDiverged(), yes)
+	if err != nil && tokenFromStdin && !yes {
+		err = fmt.Errorf("%w (the token was read from standard input, which leaves nothing to answer with: pass --yes)", err)
+	}
+	return false, err
 }
 
 // confirmReset says what `node join --reset` does to this server and asks the operator to agree; yes
