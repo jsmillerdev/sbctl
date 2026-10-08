@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/storagemigrate"
@@ -278,5 +279,71 @@ func TestStorageSettingsPreviewChangesNothing(t *testing.T) {
 	}
 	if _, err := (storageSettings{path: filepath.Join(t.TempDir(), "none.toml")}).Preview(context.Background(), d, creds); err == nil {
 		t.Error("a node without a configuration file")
+	}
+}
+
+// Preview copies the node's other drop-ins, which can hold secrets, into a directory of its own. It
+// lives under the migration's directory when the command says so, and a directory an earlier
+// Preview left behind when it was killed is removed, a younger one (a Preview that is running) is not.
+func TestStorageSettingsPreviewScratchIsCleanedUp(t *testing.T) {
+	path, _ := storageNode(t, "domain = \"example.test\"\n")
+	scratch := t.TempDir()
+	stale := filepath.Join(scratch, previewPrefix+"old")
+	fresh := filepath.Join(scratch, previewPrefix+"fresh")
+	other := filepath.Join(scratch, "state.json.d")
+	for _, d := range []string{stale, fresh, other} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(other, old, old); err != nil {
+		t.Fatal(err)
+	}
+	s := storageSettings{path: path, scratch: scratch}
+	d := storagemigrate.Destination{Bucket: "objects", Region: "us-east-1"}
+	if _, err := s.Preview(context.Background(), d, storagemigrate.Credentials{Source: storagemigrate.CredFile, AccessKeyID: "K", SecretAccessKey: "S"}); err != nil {
+		t.Fatal(err)
+	}
+	ents, _ := os.ReadDir(scratch)
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	if strings.Join(names, ",") != "state.json.d,"+previewPrefix+"fresh" {
+		t.Errorf("left in the scratch directory: %v", names)
+	}
+}
+
+// The role [fleet] storage_s3_role_arn names serves a run that was given nothing else, and a
+// rollback that only has Storage left to start needs no credentials at all.
+func TestStorageCredentialsFromTheConfiguredRoleAndForALateRollback(t *testing.T) {
+	_, cfg := storageNode(t, "")
+	cfg.Fleet.StorageS3RoleARN = "arn:aws:iam::1:role/storage"
+	c, file, err := storageCredentials(cfg, nil, "", "")
+	if err != nil || c.Source != storagemigrate.CredConfig || c.RoleARN != cfg.Fleet.StorageS3RoleARN || file != "" {
+		t.Fatalf("configured role: %+v %q %v", c, file, err)
+	}
+	// A key beside it does not take its place: Storage uses the role when both are set.
+	cfg.Fleet.StorageS3AccessKeyID, cfg.Fleet.StorageS3SecretAccessKey = "K", "V"
+	if c, _, err := storageCredentials(cfg, nil, "", ""); err != nil || c.RoleARN == "" || c.AccessKeyID != "" {
+		t.Fatalf("role and key: %+v %v", c, err)
+	}
+	// The role of a run in the state still wins over the configuration's.
+	if c, _, err := storageCredentials(cfg, &storagemigrate.State{RoleARN: "arn:r"}, "", ""); err != nil || c.Source != storagemigrate.CredRole || c.RoleARN != "arn:r" {
+		t.Fatalf("the run's role: %+v %v", c, err)
+	}
+
+	cfg.Fleet = config.Fleet{}
+	late := &storagemigrate.State{Phase: storagemigrate.PhaseRollingBack, Step: "switched", CredentialsFile: filepath.Join(t.TempDir(), "gone")}
+	if c, _, err := storageCredentials(cfg, late, "", ""); err != nil || c.Source != "" {
+		t.Fatalf("a rollback past the copy needs none: %+v %v", c, err)
+	}
+	early := &storagemigrate.State{Phase: storagemigrate.PhaseRollingBack, Step: "final", CredentialsFile: late.CredentialsFile}
+	if _, _, err := storageCredentials(cfg, early, "", ""); err == nil {
+		t.Error("a rollback that still copies went on without credentials")
 	}
 }

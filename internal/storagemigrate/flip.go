@@ -67,6 +67,7 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 	}
 	stopped := done(stepStopped) && !done(stepLive)
 	switched := done(stepSwitched) && !done(stepLive)
+	var stoppedAt time.Time // when this process stopped Storage; a run that continues one cannot say
 
 	if !done(stepFinal) {
 		e.say("holding Storage's writes; copying what changed")
@@ -78,8 +79,9 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 		}
 	}
 	if !done(stepStopped) {
-		e.say("stopping supavise-storage: reads fail until it runs again")
+		e.say("stopping supavise-storage: reads fail until it runs again, for a time that grows with the number of files")
 		stopped = true // a stop that fails may still have stopped it
+		stoppedAt = e.now()
 		if err := e.d.Storage.Stop(ctx); err != nil {
 			return e.abortFlip(ctx, err, stopped, switched)
 		}
@@ -120,6 +122,9 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 		if err := e.mark(stepLive); err != nil {
 			return fmt.Errorf("Storage runs on the bucket, but the run could not record it: %w", err)
 		}
+		if !stoppedAt.IsZero() {
+			e.say("supavise-storage was stopped for %s: the pass over the files, the check of the rows, the new configuration and the start", e.now().Sub(stoppedAt).Round(100*time.Millisecond))
+		}
 	} else if err := e.d.Storage.Healthy(ctx); err != nil {
 		// An earlier attempt got Storage onto the bucket and it is not answering now.
 		e.say("starting supavise-storage on the bucket")
@@ -129,7 +134,7 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 	}
 	if !done(stepStarted) {
 		if err := e.probe(ctx, "the bucket"); err != nil {
-			return fmt.Errorf("%w (Storage runs on the bucket and may have taken writes that the files lack: fix the cause and --resume, or --rollback to copy them back)", err)
+			return fmt.Errorf("%w (Storage runs on the bucket and may have taken writes that the files lack: fix the cause and --resume, or --rollback to copy them back)%s", err, e.roleHint())
 		}
 		if err := e.mark(stepStarted); err != nil {
 			return err
@@ -156,6 +161,17 @@ func (e *Engine) flip(ctx context.Context, b Bucket) error {
 	return nil
 }
 
+// roleHint is what to add to the failure of Storage's first reads from the bucket when the run uses a
+// role: the daemon serves the role's credentials to supavise-storage, and reads [fleet]
+// storage_s3_role_arn when it starts. A daemon that started before this run wrote the role does not
+// serve them, and Storage cannot sign a request until it is restarted.
+func (e *Engine) roleHint() string {
+	if !e.creds.assumesARole() && e.st.RoleARN == "" {
+		return ""
+	}
+	return " With a role the daemon serves Storage's credentials, and it reads the role when it starts: if supavise.service started before the role was in the configuration, run sudo systemctl restart supavise.service, then --resume."
+}
+
 // abortFlip puts Storage back on the files after a failure before Storage has started on the bucket.
 // The run goes back to the catch-up phase, so --resume copies, verifies and tries the switch again.
 func (e *Engine) abortFlip(ctx context.Context, cause error, stopped, switched bool) error {
@@ -163,10 +179,13 @@ func (e *Engine) abortFlip(ctx context.Context, cause error, stopped, switched b
 	defer cancel()
 	if switched {
 		if err := e.d.Settings.UseFiles(cctx, e.st.PrevBackend, e.st.WroteCredentials); err != nil {
-			cause = fmt.Errorf("%w; and the configuration could not be put back on the files: %v", cause, err)
-		} else {
-			e.st.WroteCredentials = false
+			// The configuration still names the bucket, and a Storage started now would come up on
+			// it, with writes that only the bucket would have. It stays stopped, and the run stays
+			// in the switch: --resume writes the bucket into the configuration again and finishes it.
+			e.fence = false
+			return fmt.Errorf("%w; and the configuration could not be put back on the files: %v. supavise-storage is left stopped, because it would start on the bucket. Fix the cause and run --resume to finish the switch, or set [fleet] storage_backend back to %q yourself and start supavise-storage (sudo systemctl start supavise-storage.service)", cause, err, e.st.PrevBackend)
 		}
+		e.st.WroteCredentials = false
 	}
 	if stopped || switched {
 		if err := e.d.Storage.Start(cctx); err != nil {
@@ -190,7 +209,7 @@ func (e *Engine) checkAllRows(ctx context.Context) error {
 			continue
 		}
 		inv := e.inv[p.Ref]
-		_, pending, err := e.checkRows(ctx, p.Ref, inv)
+		_, pending, _, err := e.checkRows(ctx, p.Ref, inv)
 		if errors.Is(err, ErrOffline) {
 			continue
 		}
@@ -358,9 +377,11 @@ func (e *Engine) Rollback(ctx context.Context, req Request) error {
 	}
 	st.Error = ""
 	e.begin(req)
-	b, err := e.connect(ctx, st.Dest, req.Credentials)
-	if err != nil {
-		return err
+	var b Bucket
+	if st.NeedsBucket() {
+		if b, err = e.connect(ctx, st.Dest, req.Credentials); err != nil {
+			return err
+		}
 	}
 	return e.rollback(ctx, b)
 }
@@ -470,9 +491,16 @@ func (e *Engine) doRollback(ctx context.Context, b Bucket) error {
 func (e *Engine) restoreFiles() error {
 	objs := objectsDir(e.paths)
 	kept := ""
-	if e.st.Retained != "" && !e.st.Cleaned {
-		kept = filepath.Join(serviceDir(e.paths), e.st.Retained)
-		if _, err := os.Lstat(kept); err != nil {
+	// The directory the switch renamed the files to is recorded as Retained once the rename is done
+	// and saved. A run that was killed between the rename and that save names it only as KeepAs,
+	// which is written before the rename: the files are there all the same.
+	name := e.st.Retained
+	if name == "" {
+		name = e.st.KeepAs
+	}
+	if name != "" && !e.st.Cleaned {
+		kept = filepath.Join(serviceDir(e.paths), name)
+		if fi, err := os.Lstat(kept); err != nil || !fi.IsDir() {
 			kept = ""
 		}
 	}
@@ -692,10 +720,10 @@ func (e *Engine) download(ctx context.Context, b Bucket, ref string, en Entry) (
 		err = cerr
 	}
 	if err != nil {
-		return 0, fmt.Errorf("%s: %w", en.Key, err)
+		return 0, fmt.Errorf("%s: %w", quote(en.Key), err)
 	}
 	if ok, err := e.files.SetMeta(tmp.Name(), meta); err != nil {
-		return 0, fmt.Errorf("%s: write extended attributes: %w", en.Key, err)
+		return 0, fmt.Errorf("%s: write extended attributes: %w", quote(en.Key), err)
 	} else if !ok && (meta.ContentType != "" || meta.CacheControl != "") {
 		e.log.Warn("this file system has no extended attributes: objects copied back lose their content type and cache control", "path", dst)
 	}

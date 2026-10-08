@@ -2,12 +2,10 @@
 
 package storagemigrate
 
-import "os"
-
 // No extended attributes outside Linux and macOS, the platforms Storage's file backend runs on.
 
 func readAttr(string, string) (string, bool, error) { return "", false, nil }
 
-func writeAttr(string, string, string) (bool, error) { return false, nil }
+func readAttrFd(int, string) (string, bool, error) { return "", false, nil }
 
-func openFileNoFollow(path string) (*os.File, error) { return os.Open(path) }
+func writeAttr(string, string, string) (bool, error) { return false, nil }

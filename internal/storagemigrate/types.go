@@ -57,7 +57,7 @@ type Destination struct {
 const (
 	CredFile   = "file"   // an access key from a file only its reader may open
 	CredRole   = "role"   // an IAM role the node assumes
-	CredConfig = "config" // the static key already in the [fleet] settings
+	CredConfig = "config" // the static key, or the role, already in the [fleet] settings
 )
 
 // Credentials say how to sign requests to the bucket. The secret never reaches a log or a state
@@ -67,6 +67,12 @@ type Credentials struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	RoleARN         string
+}
+
+// assumesARole says whether the credentials are those of a role the node assumes: one named for the
+// run (CredRole) or the one [fleet] storage_s3_role_arn already names (CredConfig with RoleARN).
+func (c Credentials) assumesARole() bool {
+	return c.Source == CredRole || (c.Source == CredConfig && c.RoleARN != "")
 }
 
 func (c Credentials) String() string   { return "credentials(" + c.Source + ")" }
@@ -94,6 +100,9 @@ type Tenant struct {
 	Bytes   int64  `json:"bytes"` // their size
 	Files   int    `json:"files"` // files in the project's directory
 	Orphans int    `json:"orphans,omitempty"`
+	// Unversioned counts rows without a version: the key of their file is not known, so they are
+	// not verified, and their files are copied by path like any other.
+	Unversioned int `json:"unversioned,omitempty"`
 	// Extra counts keys in the bucket that no file matches; they are left alone.
 	Extra   int  `json:"extra,omitempty"`
 	Offline bool `json:"offline,omitempty"` // the database was not running: only the copy was checked
@@ -146,6 +155,14 @@ type State struct {
 
 	// Error is why the last attempt stopped.
 	Error string `json:"error,omitempty"`
+}
+
+// NeedsBucket says whether continuing the run talks to the bucket, and so needs credentials for it.
+// A rollback that has copied the bucket's changes back to the files and stopped Storage only
+// switches the configuration and starts Storage on the files; the credentials it first used may be
+// gone by then (a credentials file deleted since), and are not asked for again.
+func (s *State) NeedsBucket() bool {
+	return s.Phase != PhaseRollingBack || !reached(rollbackSteps, s.Step, stepSwitched)
 }
 
 // RetainFor is how long the files stay after a switch (design 2.11).

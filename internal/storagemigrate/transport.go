@@ -1,6 +1,7 @@
 package storagemigrate
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,11 @@ const (
 	// stallAfter is how long a request may go without moving a byte before it is ended. The SDK
 	// tries a request that ended this way again, up to its attempts.
 	stallAfter = 2 * time.Minute
+	// completeWait is how long the store may take to answer CompleteMultipartUpload once the request
+	// is sent. A store assembles the parts before it answers, and for a large object that takes
+	// longer than a connection that moves no data would be believed to be alive; ending the
+	// request would only start the assembly again, up to the SDK's attempts.
+	completeWait = 30 * time.Minute
 )
 
 // errStalled ends a request whose connection stopped moving data.
@@ -30,12 +36,23 @@ type pacedTransport struct {
 	next  http.RoundTripper
 	lim   atomic.Pointer[limiter]
 	stall time.Duration
+	// complete is how long the answer to a CompleteMultipartUpload may take after its body is sent;
+	// zero means completeWait.
+	complete time.Duration
+}
+
+// completesMultipart says whether req is CompleteMultipartUpload: a POST with an uploadId.
+func completesMultipart(req *http.Request) bool {
+	return req.Method == http.MethodPost && req.URL.Query().Has("uploadId")
 }
 
 // RoundTrip implements http.RoundTripper.
 func (t *pacedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	ctx, cancel := context.WithCancelCause(req.Context())
-	g := &watchdog{ctx: ctx, d: t.stall}
+	g := &watchdog{ctx: ctx, d: t.stall, afterBody: t.stall}
+	if completesMultipart(req) {
+		g.afterBody = max(t.stall, cmp.Or(t.complete, completeWait))
+	}
 	g.timer = time.AfterFunc(t.stall, func() { cancel(errStalled) })
 	lim := t.lim.Load()
 	out := req.Clone(ctx)
@@ -63,11 +80,13 @@ func (t *pacedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// watchdog ends a request that moves no data for d: every read of a body is progress.
+// watchdog ends a request that moves no data for d: every read of a body is progress. Once the
+// request body is all sent, the store may take afterBody to start its answer.
 type watchdog struct {
-	ctx   context.Context
-	d     time.Duration
-	timer *time.Timer
+	ctx       context.Context
+	d         time.Duration
+	afterBody time.Duration
+	timer     *time.Timer
 }
 
 func (g *watchdog) wrap(rc io.ReadCloser) io.ReadCloser { return &watchedBody{ReadCloser: rc, g: g} }
@@ -87,7 +106,10 @@ type watchedBody struct {
 
 func (b *watchedBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
-	if n > 0 {
+	switch {
+	case err == io.EOF:
+		b.g.timer.Reset(b.g.afterBody)
+	case n > 0:
 		b.g.timer.Reset(b.g.d)
 	}
 	return n, b.g.explain(err)

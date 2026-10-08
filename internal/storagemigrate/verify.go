@@ -42,9 +42,14 @@ func first[T any](s []T, n int) []T {
 }
 
 // checkRows compares the rows of ref's database with inv. Rows whose object is in inv at the size
-// the row records are counted; the others come back in pending.
-func (e *Engine) checkRows(ctx context.Context, ref string, inv inventory) (ok Counts, pending []Row, err error) {
+// the row records are counted; the others come back in pending. A row without a version has no path
+// to look for and is neither: it is counted in unversioned.
+func (e *Engine) checkRows(ctx context.Context, ref string, inv inventory) (ok Counts, pending []Row, unversioned int, err error) {
 	err = e.d.Tenants.Rows(ctx, ref, func(r Row) error {
+		if r.Version == "" {
+			unversioned++
+			return nil
+		}
 		if f, found := inv.find(rowPath(r)); found && (!r.HasSize || r.Size == f.Size) {
 			ok.Files++
 			ok.Bytes += f.Size
@@ -53,7 +58,7 @@ func (e *Engine) checkRows(ctx context.Context, ref string, inv inventory) (ok C
 		pending = append(pending, r)
 		return nil
 	})
-	return ok, pending, err
+	return ok, pending, unversioned, err
 }
 
 // verifyTenant checks that every object the project's database lists is in the bucket at the size it
@@ -70,13 +75,14 @@ func (e *Engine) verifyTenant(ctx context.Context, b Bucket, ref string, p Proje
 	}
 	var ok Counts
 	var pending []Row
+	unversioned := 0
 	offline := !p.Online
 	if p.Online {
 		var err error
-		ok, pending, err = e.checkRows(ctx, ref, e.inv[ref])
+		ok, pending, unversioned, err = e.checkRows(ctx, ref, e.inv[ref])
 		switch {
 		case errors.Is(err, ErrOffline):
-			offline, ok, pending = true, Counts{}, nil
+			offline, ok, pending, unversioned = true, Counts{}, nil, 0
 		case err != nil:
 			return Tenant{}, fmt.Errorf("%s: read storage.objects: %w", ref, err)
 		}
@@ -107,7 +113,7 @@ func (e *Engine) verifyTenant(ctx context.Context, b Bucket, ref string, p Proje
 		verr.Rows = ok.Files + len(verr.Missing) + len(verr.MismatchedSize)
 		return Tenant{}, verr
 	}
-	return Tenant{Ref: ref, Rows: ok.Files, Bytes: ok.Bytes, Files: len(inv), Orphans: max(0, len(inv)-ok.Files), Extra: extra, Offline: offline}, nil
+	return Tenant{Ref: ref, Rows: ok.Files, Bytes: ok.Bytes, Files: len(inv), Orphans: max(0, len(inv)-ok.Files-unversioned), Unversioned: unversioned, Extra: extra, Offline: offline}, nil
 }
 
 // compareBucket lists the project's keys in the bucket and compares them with inv: missing are

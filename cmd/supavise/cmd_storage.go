@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,18 +37,23 @@ func init() {
 catch-up passes until they are short, checks that every object each project's database lists is in
 the bucket, and then switches Storage to the bucket. At the switch Storage's writes get 503 with
 Retry-After 5 while a copy of what changed runs and reads continue. Then supavise-storage is
-stopped, and reads fail until it starts again on the bucket: a last copy of files that no longer
-change, the new configuration and a restart (5 to 15 seconds). The copy runs at --rate-limit; the
-passes of the switch run at full speed.
+stopped, and reads fail until it starts again on the bucket. That is more than a restart (5 to 15
+seconds): it also covers a last pass over the files, which looks at every file once, and a read of
+every running project's rows, so it grows with the number of files. The command prints how long it
+lasted. The copy runs at --rate-limit; the passes of the switch run at full speed.
 
 The bucket's endpoint, region and addressing come from the [fleet] storage_s3_* settings
 (storage_s3_endpoint, storage_s3_region, storage_s3_force_path_style); --bucket overrides
 storage_s3_bucket. Credentials come from a file or from an AWS role, never from a flag:
 
-  --credentials-file F  a file with access_key_id=... and secret_access_key=... lines, mode 0600.
+  --credentials-file F  a file with access_key_id=... and secret_access_key=... lines that only its owner
+                        can read (mode 0600 or 0400), owned by you, by root or by the supavise user.
                         The key goes into /etc/supavise/config.d/` + storageS3DropIn + ` (0600), not config.toml.
   --role-arn ARN        an IAM role this node assumes with its own credentials (the instance role).
-  neither               the static key already in [fleet], if there is one.
+                        The daemon serves the role's credentials to supavise-storage and reads the role when
+                        it starts, so a daemon that started before the role was in the configuration needs
+                        sudo systemctl restart supavise.service before Storage can use the bucket.
+  neither               the role [fleet] storage_s3_role_arn names, or the static key already in [fleet].
 
 Server failover needs Storage on S3. The files stay under objects.migrated-<date>; --rollback copies
 what changed in the bucket back to them and switches back (it fetches everything when they were
@@ -68,7 +74,7 @@ reason, continues with --resume.`,
 	f := migrate.Flags()
 	f.StringVar(&to, "to", "s3", "the backend to move to (s3)")
 	f.StringVar(&bucket, "bucket", "", "the bucket (default: [fleet] storage_s3_bucket)")
-	f.StringVar(&credsFile, "credentials-file", "", "file with access_key_id=... and secret_access_key=... lines, mode 0600")
+	f.StringVar(&credsFile, "credentials-file", "", "file with access_key_id=... and secret_access_key=... lines that only its owner can read (mode 0600)")
 	f.StringVar(&roleARN, "role-arn", "", "IAM role to assume with this node's credentials")
 	f.IntVar(&rate, "rate-limit", storagemigrate.DefaultRateMiB, "MiB per second the copy may send to the bucket (0: no limit); the passes of the switch ignore it")
 	f.BoolVar(&resume, "resume", false, "continue the run that stopped")
@@ -94,7 +100,7 @@ func runStorageMigrate(cmd *cobra.Command, fl storageFlags) error {
 		return err
 	}
 	out := cmd.OutOrStdout()
-	deps := storagemigrate.Deps{Cfg: cfg, Log: newLogger(cfg), Out: out, Settings: storageSettings{path: selfUpdateConfigPath()}}
+	deps := storagemigrate.Deps{Cfg: cfg, Log: newLogger(cfg), Out: out, Settings: storageSettings{path: selfUpdateConfigPath(), scratch: storagemigrate.RunDir(cfg.Paths())}}
 	switch {
 	case fl.status:
 		st, err := storagemigrate.New(deps).Status()
@@ -150,9 +156,10 @@ func storageBackendName(cfg *config.Config) string {
 }
 
 // storageCredentials decides how the run signs requests to the bucket: a credentials file or a role
-// from the flags; else the role the run in the state used; else the static key of the [fleet]
-// settings (which holds the key a finished migration wrote to config.d); else the credentials file
-// the run used. The second result is the path of the credentials file, for the state.
+// from the flags; else none for a rollback that no longer talks to the bucket; else the role the run
+// in the state used; else the role [fleet] storage_s3_role_arn names; else the static key of the
+// [fleet] settings (which holds the key a finished migration wrote to config.d); else the credentials
+// file the run used. The second result is the path of the credentials file, for the state.
 func storageCredentials(cfg *config.Config, st *storagemigrate.State, file, role string) (storagemigrate.Credentials, string, error) {
 	switch {
 	case file != "":
@@ -160,8 +167,16 @@ func storageCredentials(cfg *config.Config, st *storagemigrate.State, file, role
 		return c, file, err
 	case role != "":
 		return storagemigrate.Credentials{Source: storagemigrate.CredRole, RoleARN: role}, "", nil
+	case st != nil && !st.NeedsBucket():
+		// A rollback that has copied everything back only switches the configuration and starts
+		// Storage; it never talks to the bucket again, so there is nothing to sign.
+		return storagemigrate.Credentials{}, "", nil
 	case st != nil && st.RoleARN != "":
 		return storagemigrate.Credentials{Source: storagemigrate.CredRole, RoleARN: st.RoleARN}, "", nil
+	case cfg.Fleet.StorageS3RoleARN != "":
+		// The role the node was set up with (the AWS first boot writes it); the daemon serves it to
+		// Storage already, and the run writes nothing of its own for it.
+		return storagemigrate.Credentials{Source: storagemigrate.CredConfig, RoleARN: cfg.Fleet.StorageS3RoleARN}, "", nil
 	case cfg.Fleet.StorageS3AccessKeyID != "" && cfg.Fleet.StorageS3SecretAccessKey != "":
 		return storagemigrate.Credentials{Source: storagemigrate.CredConfig, AccessKeyID: cfg.Fleet.StorageS3AccessKeyID,
 			SecretAccessKey: cfg.Fleet.StorageS3SecretAccessKey}, "", nil
@@ -233,7 +248,13 @@ type storageS3Fleet struct {
 // storageSettings writes the switch into the node's configuration: storage_backend and the bucket
 // into config.toml through the same read and render the installer uses, the credentials into a
 // file of their own under config.d.
-type storageSettings struct{ path string }
+type storageSettings struct {
+	path string
+	// scratch is the directory Preview makes its own in. Empty means the system's temporary
+	// directory, which the tests use; the command gives the migration's directory in the state
+	// directory, which the daemon's user owns.
+	scratch string
+}
 
 func (s storageSettings) dropIn() string {
 	return filepath.Join(config.ConfigDDir(s.path), storageS3DropIn)
@@ -310,9 +331,34 @@ func (s storageSettings) UseBucket(_ context.Context, d storagemigrate.Destinati
 	return wrote, s.check("s3")
 }
 
+// previewPrefix names the scratch directories of Preview.
+const previewPrefix = "supavise-storage-preview-"
+
+// removeStalePreviews deletes the scratch directories an earlier Preview left behind when it was
+// killed before it could remove them: they hold copies of the node's drop-ins, which can hold
+// secrets. A directory younger than an hour may be a Preview that is running.
+func removeStalePreviews(dir string) {
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, en := range ents {
+		if !en.IsDir() || !strings.HasPrefix(en.Name(), previewPrefix) {
+			continue
+		}
+		if fi, err := en.Info(); err == nil && time.Since(fi.ModTime()) > time.Hour {
+			_ = os.RemoveAll(filepath.Join(dir, en.Name()))
+		}
+	}
+}
+
 // Preview implements storagemigrate.Settings. It builds what UseBucket would write, config.toml and
 // the credentials drop-in beside the node's other drop-ins, in a directory of its own (mode 0700,
-// removed on return) and loads it the way the daemon does. Nothing on the node changes.
+// under the migration's directory in the state directory, removed on return) and loads it the way
+// the daemon does. Nothing on the node changes.
 func (s storageSettings) Preview(_ context.Context, d storagemigrate.Destination, c storagemigrate.Credentials) (*config.Config, error) {
 	cfg, existed, err := readConfigFile(s.path)
 	if err != nil {
@@ -327,7 +373,8 @@ func (s storageSettings) Preview(_ context.Context, d storagemigrate.Destination
 	if err != nil {
 		return nil, err
 	}
-	scratch, err := os.MkdirTemp("", "supavise-storage-preview-")
+	removeStalePreviews(s.scratch)
+	scratch, err := os.MkdirTemp(s.scratch, previewPrefix)
 	if err != nil {
 		return nil, err
 	}
