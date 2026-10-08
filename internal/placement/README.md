@@ -148,7 +148,7 @@ leader, and logs once, not every tick, that a leader has no report endpoint (`Er
 `Fleet` is the `lifecycle.ReplicaFleet` of the leader's Engine: it restarts a project's replicas through
 `InstanceOps` when the project is resized.
 
-Four more pieces are the wiring's to attach:
+Five more pieces are the wiring's to attach:
 
 - `LocalPrimaries` (`localprimaries.go`) is the failover orchestrator's hand on the primaries homed here
   (it has the methods of `failover.LocalPrimaries`; this package does not import `internal/failover`). `Stop`
@@ -163,6 +163,19 @@ Four more pieces are the wiring's to attach:
   leader writes the row and the event (`backup.Service.RecordBase`). `TakeBase` is
   `backup.Options.TakeBase`, which `EnsureBase` uses to seed a replica; `FinalBackup` is
   `lifecycle.RemoteBackups`, which `Engine.SetRemoteBackups` takes for the final backup of a delete.
+  Every other caller of `Ops.BaseBackup` for a project homed elsewhere (the failover orchestrator's backup on
+  the new timeline) gets the same record from `Ops.Recorder` (the leader's `backup.Service`): the call
+  returns once the row is written, and `RecordBase` writes a backup once, so `RoutedBackups`, which needs
+  the row, finds the one `Ops` wrote.
+- `ScheduledBackups` (`scheduledbackups.go`) takes the nightly backup of the projects homed on other nodes
+  and runs on the leader. The timer of such a project cannot do it: `supavise backups create` writes the
+  registry, which a follower's copy does not take, so a follower's `lifecycle.Timers` start nothing
+  (`StartTimer` stops the timer, `lifecycle`'s `followerTimers`). A round lists the projects that are
+  active and homed on another node; one whose newest completed base backup is older than `Every` (a day)
+  gets the snapshot of its Storage objects and Edge Functions here, where the shared services keep them,
+  and a base backup on its home through `RoutedBackups`. The timer's calendar is not read. A failure
+  leaves a `backup.failed` event and the project waits `Retry` (an hour). Retention is the node's prune
+  timer's, which prunes every project of the registry.
 - `SystemStandby` (`systemstandby.go`) adapts `lifecycle.PostgresPlane.SeedSystemStandby` to the join's
   `cluster.SeedFunc` and `Preflight`, for a server that joins before its daemon and its registry exist.
 - `Router.ReconfigureService` sends the settings of GoTrue and PostgREST of a project homed elsewhere to
@@ -194,7 +207,9 @@ the ports is covered by the unit tests of `internal/lifecycle`.
 - The backup handlers run the backup service of the node that is the home. A base backup there does not
   write the registry (the leader records it: `RoutedBackups`); a restore still drives the Manager of that
   node, whose registry is read-only on a follower, and is refused for a project homed elsewhere.
-- The nightly base backup of a project homed on a follower (`supavise-basebackup@<ref>.timer`) runs the
-  follower's own backup service, which cannot record its row in a read-only registry.
+- A project homed on a follower is backed up once a day by the leader (`ScheduledBackups`), not at the
+  calendar of `[backup] base_backup_on_calendar`; `supavise backups create` on a follower is refused by
+  its read-only registry, and on the leader it takes the local data directory, which a project homed
+  elsewhere does not have there.
 - Create with a seed, and the optional capabilities of the Engine's plane (Postgres settings, role
   passwords, extensions, render checks), are not carried to another node.

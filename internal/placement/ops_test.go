@@ -461,6 +461,48 @@ func TestABackupAskedOfAFollowerDoesNotWriteItsRegistry(t *testing.T) {
 	}
 }
 
+// Whoever asks for the base backup of a project homed elsewhere, the leader records what the home
+// reports: the failover orchestrator's backup on the new timeline has a row and an event like the
+// others. The leader's own backup records itself, and Ops without a Recorder leaves recording to
+// the caller.
+func TestOpsRecordABaseBackupThatAnotherNodeTook(t *testing.T) {
+	ctx := context.Background()
+	e := newOpsEnv(t)
+	rec := &fakeBackups{}
+	e.ops.Recorder = rec
+
+	res, err := e.ops.BaseBackup(ctx, "n2", testRef, peerapi.BackupRequest{Reason: "failover"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.recorded) != 1 || rec.recorded[0].ID != res.ID || rec.recorded[0].Reason != "failover" ||
+		rec.recorded[0].Timeline != 2 || rec.recorded[0].StopLSN != "0/3000100" {
+		t.Fatalf("recorded %+v for %+v", rec.recorded, res)
+	}
+
+	if _, err := e.ops.BaseBackup(ctx, "n1", testRef, peerapi.BackupRequest{Reason: "manual"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.recorded) != 1 {
+		t.Fatalf("the leader's own backup was recorded a second time: %+v", rec.recorded)
+	}
+
+	// The backup is in the store whether or not it was recorded: the result comes back with the error.
+	rec.recordErr = errors.New("registry down")
+	res, err = e.ops.BaseBackup(ctx, "n2", testRef, peerapi.BackupRequest{Reason: "failover"})
+	if err == nil || !strings.Contains(err.Error(), "registry down") || !strings.Contains(err.Error(), "node n2") || res.ID == "" {
+		t.Fatalf("a recording that failed = %+v, %v", res, err)
+	}
+
+	e.ops.Recorder = nil
+	if _, err := e.ops.BaseBackup(ctx, "n2", testRef, peerapi.BackupRequest{Reason: "failover"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.recorded) != 2 { // the failed one counted
+		t.Fatalf("an Ops without a Recorder recorded: %+v", rec.recorded)
+	}
+}
+
 // RoutedBackups takes a project's base backup on its home and records it on the leader.
 func TestRoutedBackupsTakeTheBackupOnTheHomeAndRecordItHere(t *testing.T) {
 	ctx := context.Background()

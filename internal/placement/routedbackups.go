@@ -62,6 +62,7 @@ func (r *RoutedBackups) at(ctx context.Context, node, ref string, bo backup.Back
 	if res.ID == "" {
 		return nil, fmt.Errorf("node %s took a base backup of %s and named no backup", node, ref)
 	}
+	// An Ops with a Recorder has recorded the backup already; RecordBase returns that row.
 	return r.Local.RecordBase(ctx, ref, backup.RemoteBase{ID: res.ID, Reason: bo.Reason, Timeline: res.Timeline,
 		StartLSN: res.StartLSN, StopLSN: res.StopLSN, SizeBytes: res.SizeBytes})
 }

@@ -596,25 +596,24 @@ func (a *NodeAgent) ObserveAll(ctx context.Context) []peerapi.InstanceStatus {
 		order = append(order, id)
 	}
 	slices.Sort(order)
-	got := make([]*peerapi.InstanceStatus, len(order))
-	eachLimit(ctx, a.o.Concurrency, indexes(len(order)), func(i int) {
-		if st, err := a.Observe(ctx, order[i]); err == nil {
-			got[i] = &st
+	type observed struct {
+		id string
+		st *peerapi.InstanceStatus
+	}
+	got := make([]*observed, len(order))
+	for i, id := range order {
+		got[i] = &observed{id: id}
+	}
+	eachLimit(ctx, a.o.Concurrency, got, func(o *observed) {
+		if st, err := a.Observe(ctx, o.id); err == nil {
+			o.st = &st
 		}
 	})
 	var out []peerapi.InstanceStatus
-	for _, st := range got {
-		if st != nil {
-			out = append(out, *st)
+	for _, o := range got {
+		if o.st != nil {
+			out = append(out, *o.st)
 		}
-	}
-	return out
-}
-
-func indexes(n int) []int {
-	out := make([]int, n)
-	for i := range out {
-		out[i] = i
 	}
 	return out
 }

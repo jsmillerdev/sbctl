@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
@@ -31,6 +32,17 @@ type Ops struct {
 	RPC mesh.RPC
 	// Epoch is the cluster epoch requests are made under unless the request names one.
 	Epoch func() int64
+	// Recorder records, in the registry this node writes, a base backup that another node took for it
+	// (backup.Service.RecordBase on the leader). With it every BaseBackup of a project homed elsewhere
+	// leaves its row and its event, whoever asked: the failover orchestrator's backup on the new
+	// timeline, RoutedBackups, the final backup of a delete. Without it the caller records, or the
+	// backup is in the store and in no list.
+	Recorder BaseRecorder
+}
+
+// BaseRecorder is the part of the leader's backup service that records a base backup taken elsewhere.
+type BaseRecorder interface {
+	RecordBase(ctx context.Context, ref string, b backup.RemoteBase) (*registry.Backup, error)
 }
 
 var (
@@ -97,9 +109,23 @@ func (o *Ops) Do(ctx context.Context, node, identifier string, a peerapi.Action,
 	return st, nil
 }
 
-// BaseBackup implements BackupOps.
+// BaseBackup implements BackupOps. A backup that another node took is recorded with Recorder before
+// the call returns; RecordBase writes a backup once, so a caller that records it too (RoutedBackups,
+// which needs the row) finds the one written. When recording fails the result is returned with the
+// error: the backup is complete in the store.
 func (o *Ops) BaseBackup(ctx context.Context, node, ref string, req peerapi.BackupRequest) (peerapi.BackupResult, error) {
-	return o.backup(ctx, node, ref, peerapi.BackupBase, req)
+	res, err := o.backup(ctx, node, ref, peerapi.BackupBase, req)
+	if err != nil || o.local(node) || o.Recorder == nil {
+		return res, err
+	}
+	if res.ID == "" {
+		return res, fmt.Errorf("node %s took a base backup of %s and named no backup", node, ref)
+	}
+	if _, err := o.Recorder.RecordBase(ctx, ref, backup.RemoteBase{ID: res.ID, Reason: req.Reason, Timeline: res.Timeline,
+		StartLSN: res.StartLSN, StopLSN: res.StopLSN, SizeBytes: res.SizeBytes}); err != nil {
+		return res, fmt.Errorf("recording the base backup %s of %s that node %s took: %w", res.ID, ref, node, err)
+	}
+	return res, nil
 }
 
 // Restore implements BackupOps.

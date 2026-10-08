@@ -265,6 +265,8 @@ type fakeBackups struct {
 	files    []string
 	recorded []backup.RemoteBase
 	err      error
+	// recordErr is what RecordBase answers instead of a row.
+	recordErr error
 }
 
 func (f *fakeBackups) BaseBackupWith(_ context.Context, ref string, bo backup.BackupOptions) (*registry.Backup, error) {
@@ -284,6 +286,9 @@ func (f *fakeBackups) RecordBase(_ context.Context, ref string, b backup.RemoteB
 	f.mu.Lock()
 	f.recorded = append(f.recorded, b)
 	f.mu.Unlock()
+	if f.recordErr != nil {
+		return nil, f.recordErr
+	}
 	return &registry.Backup{ID: 31, Ref: ref, Status: registry.BackupCompleted, Location: "file:///b/" + ref + "/base/" + b.ID + "/", Timeline: b.Timeline}, nil
 }
 func (f *fakeBackups) RestoreInPlace(_ context.Context, ref string, req lifecycle.RestoreRequest) error {
