@@ -366,3 +366,77 @@ func TestTheMonitorContinuesTheMoveTheRestartCutOffBeforeItLooks(t *testing.T) {
 		t.Fatalf("move: %+v\n%v", mv, w.snapshot())
 	}
 }
+
+// The wiring of a daemon continues the move itself once the shared services are up, with the plain
+// FailoverServer call. Nothing in memory says so, and the CLI that lost its connection, and the old
+// leader that waits for the survivor, still follow it: they read the move from its log.
+func TestTheMoveIsFollowedFromItsLogWhoeverContinuesIt(t *testing.T) {
+	w := serverWorld(t)
+	ctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
+	o := w.orch(func(d *Deps) { d.Takeover = cutAtTheTakeover(w, cancel) })
+	if _, err := o.FailoverServer(ctx, ServerOptions{}); !errors.Is(err, ErrRestarting) {
+		t.Fatal(err)
+	}
+	w.restarted(2)
+	fresh := w.orch() // the daemon that started: nothing in memory
+
+	// Before anything continues it, the log shows a move that is running, with the steps it holds.
+	st := fresh.Follow(w.ctx, 0, 2)
+	if st.State != "running" || len(st.Steps) == 0 || st.Move == nil || st.Move.Epoch != 2 || st.Steps[len(st.Steps)-1].Name != "promote-system" {
+		t.Fatalf("follow: %+v", st)
+	}
+	var seen ServerStatus
+	if rec := serve(t, fresh, "GET "+PathServer, PathServer+"?from=0", "n1", nil, &seen); rec.Code != http.StatusOK || seen.State != "running" || seen.Next != st.Next {
+		t.Fatalf("status for the old leader: %d %+v", rec.Code, seen)
+	}
+	if rec := serve(t, fresh, "GET "+PathServer, PathServer+"?from=0", "n3", nil, &seen); rec.Code != http.StatusOK || seen.State != "idle" {
+		t.Fatalf("a node the move is not for: %d %+v", rec.Code, seen)
+	}
+
+	// The wiring continues it with the plain call.
+	mv, err := fresh.FailoverServer(w.ctx, ServerOptions{Resume: true})
+	if err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("resume: %+v, %v", mv, err)
+	}
+	later := w.orch() // and the CLI asks a daemon that did not run it, or one that restarted again
+	st = later.Follow(w.ctx, st.Next, 2)
+	if st.State != "done" || st.Move == nil || st.Move.State != "done" || len(st.Steps) == 0 {
+		t.Fatalf("follow after: %+v", st)
+	}
+	if rec := serve(t, later, "GET "+PathServer, PathServer+"?from=0", "n1", nil, &seen); rec.Code != http.StatusOK || seen.State != "done" {
+		t.Fatalf("status for the old leader after: %d %+v", rec.Code, seen)
+	}
+}
+
+// What the wiring finished in the time the daemon waited is not started again by the daemon.
+func TestTheDaemonDoesNotStartAMoveThatTheWiringFinishedMeanwhile(t *testing.T) {
+	w := serverWorld(t)
+	ctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
+	o := w.orch(func(d *Deps) { d.Takeover = cutAtTheTakeover(w, cancel) })
+	if _, err := o.FailoverServer(ctx, ServerOptions{}); !errors.Is(err, ErrRestarting) {
+		t.Fatal(err)
+	}
+	w.restarted(2)
+	var wiring *Orchestrator
+	d := w.deps()
+	d.Sleep = func(c context.Context, _ time.Duration) error {
+		if wiring != nil { // the wait of ResumeInterrupted: the wiring's resume runs in it
+			if mv, err := wiring.FailoverServer(c, ServerOptions{Resume: true}); err != nil || mv.State != registry.MoveDone {
+				t.Errorf("the wiring's resume: %+v, %v", mv, err)
+			}
+			wiring = nil
+		}
+		return c.Err()
+	}
+	daemon, err := New(d)
+	must(t, err)
+	wiring = w.orch()
+	if got, err := daemon.ResumeInterrupted(w.ctx); got != nil || err != nil {
+		t.Fatalf("the daemon started it again: %+v, %v", got, err)
+	}
+	if w.count("registry.CreateMove") != 1 || w.count("promote n2/"+idAN2) != 1 {
+		t.Fatalf("the move ran twice:\n%v", w.snapshot())
+	}
+}

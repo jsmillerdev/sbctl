@@ -378,9 +378,9 @@ func TestFollowShowsTheMoveTheDaemonContinuedAfterItsRestart(t *testing.T) {
 		}
 	})
 	t.Run("a daemon that has no move", func(t *testing.T) {
-		resumeSettleWas := resumeSettle
-		resumeSettle = 0
-		defer func() { resumeSettle = resumeSettleWas }()
+		idleWas := followIdleGrace
+		followIdleGrace = 0
+		defer func() { followIdleGrace = idleWas }()
 		svc.answers = []ServerStatus{{State: "idle"}}
 		if _, err := c.Follow(context.Background(), 2, nil); !errors.Is(err, ErrNothingRunning) {
 			t.Fatalf("error: %v", err)
@@ -398,9 +398,9 @@ func TestFollowShowsTheMoveTheDaemonContinuedAfterItsRestart(t *testing.T) {
 // A Service without a run to follow (a test double, or a daemon without an orchestrator) says idle.
 func TestFollowOfAServiceThatKeepsNoRunIsIdle(t *testing.T) {
 	c, _ := rigFor(t, &fakeService{})
-	resumeSettleWas := resumeSettle
-	resumeSettle = 0
-	defer func() { resumeSettle = resumeSettleWas }()
+	idleWas := followIdleGrace
+	followIdleGrace = 0
+	defer func() { followIdleGrace = idleWas }()
 	followPollWas := followPoll
 	followPoll = time.Millisecond
 	defer func() { followPoll = followPollWas }()

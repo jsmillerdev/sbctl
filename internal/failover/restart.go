@@ -18,9 +18,11 @@ import (
 // moves table) in the state running, and the daemon that starts continues it (ResumeInterrupted),
 // which the CLI follows (Follow, Client.Follow).
 
-// resumeSettle is how long a restarted daemon waits before it continues a move, so that the shared
-// services and the mesh sessions it needs have had time to come up. A variable for tests.
-var resumeSettle = 15 * time.Second
+// resumeFallback is how long a restarted daemon waits before it continues a move itself. The wiring of
+// a daemon continues one as soon as the shared services are up, because the move registers the projects
+// with them again, and what it finds finished is not started twice; this is for a wiring that does not,
+// and it is slower than any wiring needs to be. A variable for tests.
+var resumeFallback = 3 * time.Minute
 
 // interrupted reports whether the run of the move ended because of the daemon's role change: it is a
 // server move that passed its leader marker (from there the system cluster is promoted or about to be
@@ -54,7 +56,11 @@ func (o *Orchestrator) ResumeInterrupted(ctx context.Context) (*registry.Move, e
 		return nil, nil
 	}
 	o.d.Log.Info("continuing the server move that the restart of the daemon cut off", "from", prior.from, "to", prior.to, "epoch", prior.epoch, "last", prior.last)
-	if err := o.wait(ctx, resumeSettle); err != nil {
+	if err := o.wait(ctx, resumeFallback); err != nil {
+		return nil, err
+	}
+	// The wait is a chance for the wiring to have continued the move: what it finished is not here.
+	if again, _, err := o.unfinishedServer(ctx); err != nil || again == nil || !again.running {
 		return nil, err
 	}
 	run := o.keepRun(prior.from)
@@ -64,7 +70,11 @@ func (o *Orchestrator) ResumeInterrupted(ctx context.Context) (*registry.Move, e
 		mv, rerr = o.FailoverServer(ctx, ServerOptions{Resume: true, Yes: true})
 		return mv, rerr
 	})
-	if rerr != nil {
+	switch {
+	case errors.Is(rerr, ErrBusy):
+		o.d.Log.Info("another caller continues the server move that the restart cut off")
+		return nil, nil
+	case rerr != nil:
 		o.d.Log.Error("the server move that was cut off by the restart did not finish; run supavise failover --resume", "error", rerr)
 	}
 	return mv, rerr

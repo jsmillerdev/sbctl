@@ -501,6 +501,9 @@ func (c Client) stream(ctx context.Context, path string, in any, onStep func(reg
 var (
 	followPatience = 5 * time.Minute
 	followPoll     = 2 * time.Second
+	// followIdleGrace is how long a daemon that answers and shows no move is waited for: the move of a
+	// daemon that has just started is written to its log within moments.
+	followIdleGrace = 10 * time.Second
 )
 
 // Follow shows a server move of epoch after the connection that ran it was cut by the daemon's
@@ -539,12 +542,12 @@ func (c Client) Follow(ctx context.Context, epoch int64, onStep func(registry.Mo
 			case "failed", "aborted":
 				return st.Move.move(), &RemoteError{Code: "failed", Message: st.Error}
 			case "idle":
-				// A daemon that is up and runs nothing yet may be about to pick the move up (it waits a
-				// moment after it starts); one that stays idle has none.
+				// A daemon that is up and shows nothing yet may be about to write the move to its log; one
+				// that stays idle has none.
 				if idleSince.IsZero() {
 					idleSince = time.Now()
 				}
-				if time.Since(idleSince) > resumeSettle+3*followPoll {
+				if time.Since(idleSince) > followIdleGrace {
 					return nil, ErrNothingRunning
 				}
 			}

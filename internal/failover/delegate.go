@@ -230,7 +230,8 @@ func (d *delegated) record(base context.Context, do func(ctx context.Context) (*
 
 // Follow reports a server move for someone who lost the connection that ran it: the run this node
 // keeps (a switchover it runs for a leader, or the move it continued after its daemon restarted),
-// else the server move of that epoch in the registry, which a node that restarted as a follower has
+// else the move of that epoch in failover.json or the moves table, which any caller that continued it
+// writes (the daemon's wiring continues one too) and which a node that restarted as a follower has
 // from the new leader's log. It gives the steps from index from on. The control socket serves it to
 // the CLI, whose daemon restarted in the middle of the move.
 func (o *Orchestrator) Follow(ctx context.Context, from int, epoch int64) ServerStatus {
@@ -246,25 +247,46 @@ func (o *Orchestrator) Follow(ctx context.Context, from int, epoch int64) Server
 	if epoch <= 0 {
 		return ServerStatus{State: "idle"}
 	}
-	ms, err := o.store().ListMoves(ctx, "", 20)
-	if err != nil {
-		return ServerStatus{State: "idle"}
-	}
-	for _, m := range ms {
-		if m.Scope != registry.MoveServer || m.Epoch != epoch {
-			continue
-		}
-		from = max(0, min(from, len(m.Steps)))
-		st := ServerStatus{State: string(m.State), Next: len(m.Steps), Error: m.Error, Move: toMoveJSON(&m)}
-		for _, s := range m.Steps[from:] {
-			st.Steps = append(st.Steps, stepJSON{Name: s.Name, At: s.At, Detail: s.Detail})
-		}
-		if m.State == registry.MoveFailed && st.Error == "" {
-			st.Error = "the move stopped"
-		}
+	if st, ok := o.loggedStatus(ctx, from, func(_, _ string, e int64) bool { return e == epoch }); ok {
 		return st
 	}
 	return ServerStatus{State: "idle"}
+}
+
+// loggedStatus reports the newest server move that match accepts, from failover.json (the log of a
+// move until its system cluster is promoted) or else the moves table.
+func (o *Orchestrator) loggedStatus(ctx context.Context, from int, match func(fromNode, toNode string, epoch int64) bool) (ServerStatus, bool) {
+	if fs, err := readStateFile(o.d.Cfg.Paths().FailoverState()); err == nil && fs != nil && match(fs.From, fs.To, fs.Epoch) {
+		state := fs.State
+		if state == "" {
+			state = registry.MoveRunning
+		}
+		mv := registry.Move{Scope: registry.MoveServer, Kind: fs.Kind, FromNode: fs.From, ToNode: fs.To, Epoch: fs.Epoch, State: state, Error: fs.Error, Steps: fs.Steps}
+		return statusOfMove(mv, from), true
+	}
+	ms, err := o.store().ListMoves(ctx, "", 50)
+	if err != nil {
+		return ServerStatus{}, false
+	}
+	for _, m := range ms {
+		if m.Scope == registry.MoveServer && match(m.FromNode, m.ToNode, m.Epoch) {
+			return statusOfMove(m, from), true
+		}
+	}
+	return ServerStatus{}, false
+}
+
+// statusOfMove is a logged move as a ServerStatus, with the steps from index from on.
+func statusOfMove(m registry.Move, from int) ServerStatus {
+	from = max(0, min(from, len(m.Steps)))
+	st := ServerStatus{State: string(m.State), Next: len(m.Steps), Error: m.Error, Move: toMoveJSON(&m)}
+	for _, s := range m.Steps[from:] {
+		st.Steps = append(st.Steps, stepJSON{Name: s.Name, At: s.At, Detail: s.Detail})
+	}
+	if m.State == registry.MoveFailed && st.Error == "" {
+		st.Error = "the move stopped"
+	}
+	return st
 }
 
 // handleServerStatus tells the leader that asked how the move goes.
@@ -276,14 +298,21 @@ func (o *Orchestrator) handleServerStatus(w http.ResponseWriter, r *http.Request
 	o.delegMu.Lock()
 	run := o.deleg
 	o.delegMu.Unlock()
-	if run == nil {
-		writePeerJSON(w, http.StatusOK, ServerStatus{State: "idle"})
-		return
-	}
-	if run.by != peer.Node {
+	from, _ := strconv.Atoi(r.URL.Query().Get("from"))
+	if run != nil && run.by != peer.Node && run.by != "" {
 		writePeerError(w, http.StatusForbidden, "forbidden", "the move runs for another node")
 		return
 	}
-	from, _ := strconv.Atoi(r.URL.Query().Get("from"))
-	writePeerJSON(w, http.StatusOK, run.status(from))
+	if run != nil {
+		writePeerJSON(w, http.StatusOK, run.status(from))
+		return
+	}
+	// A daemon that restarted keeps no run in memory; the move it continues is in its log, and the node
+	// that asked for it is the one it moves the leadership away from.
+	self := o.self().ID
+	if st, ok := o.loggedStatus(r.Context(), from, func(fromNode, toNode string, _ int64) bool { return fromNode == peer.Node && toNode == self }); ok {
+		writePeerJSON(w, http.StatusOK, st)
+		return
+	}
+	writePeerJSON(w, http.StatusOK, ServerStatus{State: "idle"})
 }
