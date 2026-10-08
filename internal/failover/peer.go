@@ -411,6 +411,18 @@ func (o *Orchestrator) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 		writePeerError(w, http.StatusNotImplemented, "unsupported", "this node cannot stop a primary")
 		return
 	}
+	// One quiesce at a time, and not beside a move of this node's own: a second request waits for
+	// the first and answers from its record, and a project move that started during the stops would
+	// stop or start the same clusters. Only the quiesce a switchover is waiting for holds the slot;
+	// the leader refuses to start another move until it has finished.
+	o.quiesceMu.Lock()
+	defer o.quiesceMu.Unlock()
+	release, err := o.acquire()
+	if err != nil {
+		writePeerError(w, http.StatusConflict, "busy", "a move is running on the leader")
+		return
+	}
+	defer release()
 	// A quiesce is not undone by a caller that gives up: the record is what a retry and the undo go by.
 	rec, err := o.currentQuiesce()
 	switch {
@@ -520,6 +532,9 @@ func (o *Orchestrator) handleResume(w http.ResponseWriter, r *http.Request) {
 		writePeerError(w, http.StatusNotImplemented, "unsupported", "this node cannot start a primary")
 		return
 	}
+	// A quiesce that is still stopping clusters finishes first; its record is what this undo reads.
+	o.quiesceMu.Lock()
+	defer o.quiesceMu.Unlock()
 	// Only the node a quiesce was made for may undo it. The record is a file: the registry is the
 	// system cluster this very quiesce stopped.
 	rec, err := o.currentQuiesce()

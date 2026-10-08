@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/config"
@@ -725,4 +726,109 @@ func (w *world) setMarkerEpoch(epoch int64, leader string) {
 	w.mu.Lock()
 	w.marker = &backupMarker{Epoch: epoch, Leader: leader}
 	w.mu.Unlock()
+}
+
+// quiesceInFlight starts a quiesce for n2 whose stop of refA does not return until release is closed.
+type quiesceAnswer struct {
+	code int
+	res  QuiesceResult
+}
+
+func quiesceInFlight(t *testing.T, w *world, o *Orchestrator) (first chan quiesceAnswer, release chan struct{}) {
+	t.Helper()
+	inStop := make(chan struct{})
+	release = make(chan struct{})
+	w.afterEvent("local.stop "+refA, func() { close(inStop); <-release })
+	first = askPeer(t, o, PathQuiesce, QuiesceRequest{Epoch: 2, To: "n2"})
+	<-inStop
+	return first, release
+}
+
+func askPeer(t *testing.T, o *Orchestrator, path string, body any) chan quiesceAnswer {
+	ch := make(chan quiesceAnswer, 1)
+	go func() {
+		var a quiesceAnswer
+		defer func() { ch <- a }() // also when serve stops the goroutine with t.Fatal
+		var out any
+		if path == PathQuiesce { // the resume answers with no body
+			out = &a.res
+		}
+		a.code = serve(t, o, "POST "+path, path, "n2", body, out).Code
+	}()
+	return ch
+}
+
+func assertHeldBack(t *testing.T, what string, ch chan quiesceAnswer) {
+	t.Helper()
+	select {
+	case a := <-ch:
+		t.Fatalf("%s answered while the quiesce was stopping clusters: %+v", what, a)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// A quiesce that is stopping clusters holds the move slot: no move of the leader's own runs beside
+// it, and a repeated request waits for it and answers from its record instead of stopping again.
+func TestARepeatedQuiesceWaitsForTheOneInFlightAndAnswersFromItsRecord(t *testing.T) {
+	w := newWorld(t)
+	o := w.orch()
+	first, release := quiesceInFlight(t, w, o)
+	if !o.Busy() {
+		t.Fatal("the quiesce does not hold the move slot")
+	}
+	if _, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refB, DryRun: true}); !errors.Is(err, ErrBusy) {
+		t.Fatalf("a move beside the quiesce: %v", err)
+	}
+	again := askPeer(t, o, PathQuiesce, QuiesceRequest{Epoch: 2, To: "n2"})
+	assertHeldBack(t, "the repeated quiesce", again)
+	close(release)
+	if a := <-first; a.code != http.StatusOK || len(a.res.LSNs) != 3 {
+		t.Fatalf("first: %+v", a)
+	}
+	if a := <-again; a.code != http.StatusOK || len(a.res.LSNs) != 3 {
+		t.Fatalf("repeat: %+v", a)
+	}
+	if n := w.count("local.stop system"); n != 1 {
+		t.Fatalf("the system cluster was stopped %d times", n)
+	}
+	if o.Busy() {
+		t.Fatal("the slot was not released")
+	}
+}
+
+// A resume that arrives while the quiesce it undoes is still stopping clusters waits for it: it
+// would start clusters the quiesce goes on to stop.
+func TestAResumeWaitsForTheQuiesceInFlight(t *testing.T) {
+	w := newWorld(t)
+	o := w.orch()
+	first, release := quiesceInFlight(t, w, o)
+	resume := askPeer(t, o, PathResume, struct{}{})
+	assertHeldBack(t, "the resume", resume)
+	if w.has("local.start") {
+		t.Fatalf("the resume started a cluster during the quiesce:\n%v", w.snapshot())
+	}
+	close(release)
+	if a := <-first; a.code != http.StatusOK {
+		t.Fatalf("first: %+v", a)
+	}
+	if a := <-resume; a.code != http.StatusOK {
+		t.Fatalf("resume: %+v", a)
+	}
+	w.assertOrder("local.stop system", "local.start system", "local.start "+refA)
+}
+
+// A move of the leader's own that is running turns the quiesce away; the survivor undoes and tries later.
+func TestAQuiesceIsRefusedWhileALeaderMoveRuns(t *testing.T) {
+	w := newWorld(t)
+	o := w.orch()
+	rel, err := o.acquire()
+	must(t, err)
+	defer rel()
+	rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, nil)
+	if rec.Code != http.StatusConflict || errorOf(rec).Code != "busy" {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if w.has("local.stop") || w.has("registry.SetMaintenance") {
+		t.Fatalf("a refused quiesce did something:\n%v", w.snapshot())
+	}
 }

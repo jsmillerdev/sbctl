@@ -70,6 +70,11 @@ type Orchestrator struct {
 	lockMu sync.Mutex
 	locks  map[string]*sync.Mutex
 
+	// quiesceMu serializes the quiesce and the resume this node answers as the leader (peer.go): a
+	// repeated request waits for the one that is stopping clusters and then answers from the record,
+	// and a resume does not start clusters a quiesce is still stopping.
+	quiesceMu sync.Mutex
+
 	// deleg is the switchover this node runs for a leader that asked (delegate.go).
 	delegMu sync.Mutex
 	deleg   *delegated
