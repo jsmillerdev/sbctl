@@ -151,10 +151,19 @@ func (o *Orchestrator) handleServerStart(w http.ResponseWriter, r *http.Request)
 	}
 	opts := req.options()
 	opts.To, opts.DryRun, opts.Resume = o.self().ID, false, false
-	if o.Busy() {
+	// The node's move is taken before the answer, so that two requests cannot both pass, and the
+	// run below is the one that holds it.
+	release, err := o.acquire()
+	if err != nil {
 		writePeerError(w, http.StatusConflict, "busy", ErrBusy.Error())
 		return
 	}
+	started := false
+	defer func() {
+		if !started {
+			release()
+		}
+	}()
 	pl, err := o.PlanServer(r.Context(), opts)
 	if err != nil {
 		writePeerError(w, http.StatusInternalServerError, "plan_failed", err.Error())
@@ -172,13 +181,15 @@ func (o *Orchestrator) handleServerStart(w http.ResponseWriter, r *http.Request)
 	o.delegMu.Lock()
 	o.deleg = run
 	o.delegMu.Unlock()
+	started = true
 	go func() {
+		defer release()
 		ctx := WithProgress(context.Background(), func(s registry.MoveStep) {
 			run.mu.Lock()
 			run.steps = append(run.steps, stepJSON{Name: s.Name, At: s.At, Detail: s.Detail})
 			run.mu.Unlock()
 		})
-		mv, err := o.FailoverServer(ctx, opts)
+		mv, err := o.failoverServer(ctx, opts)
 		run.mu.Lock()
 		defer run.mu.Unlock()
 		run.move = toMoveJSON(mv)

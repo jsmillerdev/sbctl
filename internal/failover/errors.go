@@ -34,6 +34,9 @@ var (
 	ErrCrossRegion      = fmt.Errorf("%w: the nodes are in different regions and an Elastic IP belongs to one", ErrNoTakeover)
 	// ErrNoCluster: this server has not joined a cluster, so there is nothing to fail over to.
 	ErrNoCluster = errors.New("failover: this server is not part of a cluster")
+	// ErrPlanChanged: the plan at the start of the run is not the one the operator confirmed
+	// (ProjectOptions.ExpectKind, ServerOptions.ExpectKind). Nothing was changed.
+	ErrPlanChanged = errors.New("failover: the plan changed since it was confirmed")
 	// ErrNotLeader: the operation belongs to the leader.
 	ErrNotLeader = errors.New("failover: this node is not the leader")
 )

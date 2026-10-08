@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/supavise/supavise/internal/alerts"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -134,8 +136,14 @@ func TestUnplannedProjectFailover(t *testing.T) {
 	}
 	// The old primary is told to stop and stay stopped before anything is promoted, and the
 	// replica drains the archive instead of waiting for a position nobody can give.
-	w.assertOrder("fence n1 epoch=1 ref="+refA, "promote n2/"+idAN2+" epoch=1 wait= drain=true",
+	// The home is the leader itself, which cannot ask itself over the mesh: it records the fence and
+	// stops the primary on its own.
+	w.assertOrder("local.stop "+refA, "promote n2/"+idAN2+" epoch=1 wait= drain=true",
 		"registry.SetProjectNode "+refA, "start n2/"+refA, "fleet.ensure "+refA, "aside n1/"+refA, "replicas.setup "+refA+" on n1", "basebackup n2/"+refA)
+	if rec, err := fenced.Project(w.cfg.Paths(), refA); err != nil || rec == nil || rec.Epoch != 1 || rec.Leader != "n1" {
+		t.Fatalf("fence record: %+v, %v", rec, err)
+	}
+	w.assertNever("fence ")
 	w.assertNever("stop n1/")
 	w.assertNever("fleet.quiesce")
 	w.assertNever("demote")
@@ -147,6 +155,102 @@ func TestUnplannedProjectFailover(t *testing.T) {
 	}
 }
 
+// A project homed on a follower is fenced through the mesh: the leader that runs the move is not
+// its home.
+func TestUnplannedFailoverOfAProjectHomedOnAFollowerFencesThroughTheMesh(t *testing.T) {
+	w := newWorld(t) // n1 leads
+	rehomeOn(t, w, refB, "n2", "n1")
+	w.prim["n2/"+refB] = &primState{running: true, healthy: false}
+	mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refB})
+	if err != nil || mv.Kind != registry.MoveFailover || mv.State != registry.MoveDone || mv.FromNode != "n2" || mv.ToNode != "n1" {
+		t.Fatalf("move: %+v, %v", mv, err)
+	}
+	w.assertOrder("fence n2 epoch=1 ref="+refB, "promote n1/", "registry.SetProjectNode "+refB+" n1 1", "aside n2/"+refB)
+	w.assertNever("local.stop")
+}
+
+// rehomeOn homes ref on node with its replica on the other, as an earlier switchover leaves it.
+func rehomeOn(t *testing.T, w *world, ref, node, replicaNode string) {
+	t.Helper()
+	must(t, w.reg.SetProjectNode(w.ctx, ref, node, 1))
+	reps, err := w.reg.ListReplicas(w.ctx, ref)
+	must(t, err)
+	var old registry.Replica
+	for _, r := range reps {
+		old = r
+		must(t, w.reg.DeleteReplica(w.ctx, r.Identifier))
+		delete(w.inst, r.Identifier)
+	}
+	id := ref + "-rr-eu-west-1-r1r1r1"
+	must(t, w.reg.CreateReplica(w.ctx, &registry.Replica{Identifier: id, Ref: ref, NodeID: replicaNode, Origin: old.Origin, Status: statusHealthy, InitStep: registry.ReplicaStepDone}))
+	w.inst[id] = &instState{node: replicaNode, ref: ref, role: "replica", lag: f64(0.4), postgres: true}
+	w.replay[id] = w.lsn[ref]
+	w.prim[replicaNode+"/"+ref] = &primState{}
+	delete(w.prim, "n1/"+ref)
+	if node == "n1" {
+		w.prim["n1/"+ref] = &primState{running: true, healthy: true}
+	}
+}
+
+// The plan the operator confirmed is the plan that runs: a project whose primary stopped answering
+// after the confirmation of a clean switchover is not fenced on its strength.
+func TestAProjectMoveRefusesAPlanOtherThanTheConfirmedOne(t *testing.T) {
+	w := newWorld(t)
+	w.prim["n1/"+refA].healthy = false
+	_, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA, ExpectKind: string(registry.MoveSwitchover)})
+	if !errors.Is(err, ErrPlanChanged) {
+		t.Fatalf("error: %v", err)
+	}
+	w.assertNever("local.stop")
+	w.assertNever("promote")
+	if moves, _ := w.reg.ListMoves(w.ctx, "", 10); len(moves) != 0 {
+		t.Fatalf("a refused move left %d row(s)", len(moves))
+	}
+	if _, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA, ExpectKind: string(registry.MoveFailover)}); err != nil {
+		t.Fatalf("the confirmed kind: %v", err)
+	}
+}
+
+// The project's lock is taken before the plan is read, and a move that cannot get it records nothing.
+func TestAProjectMoveHoldsTheLockBeforeItPlans(t *testing.T) {
+	w := newWorld(t)
+	var mu sync.Mutex
+	var order []string
+	locks := lockerFunc(func(_ context.Context, ref string) (func(), error) {
+		mu.Lock()
+		order = append(order, "lock "+ref)
+		mu.Unlock()
+		return func() { mu.Lock(); order = append(order, "unlock "+ref); mu.Unlock() }, nil
+	})
+	o := w.orch(func(d *Deps) { d.Locks = locks })
+	if _, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 2 || order[0] != "lock "+refA || order[1] != "unlock "+refA || w.index("registry.CreateMove") < 0 {
+		t.Fatalf("lock calls: %v", order)
+	}
+	// A dry run changes nothing and needs no lock.
+	order = nil
+	if _, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refB, DryRun: true}); err != nil || len(order) != 0 {
+		t.Fatalf("dry run: %v, locks %v", err, order)
+	}
+	// A lock that cannot be had leaves no moves row.
+	w2 := newWorld(t)
+	o2 := w2.orch(func(d *Deps) {
+		d.Locks = lockerFunc(func(context.Context, string) (func(), error) { return nil, errors.New("project is locked") })
+	})
+	if _, err := o2.FailoverProject(w2.ctx, ProjectOptions{Ref: refA}); err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("error: %v", err)
+	}
+	if moves, _ := w2.reg.ListMoves(w2.ctx, "", 10); len(moves) != 0 {
+		t.Fatalf("a move that never got the lock left %d row(s)", len(moves))
+	}
+}
+
+type lockerFunc func(ctx context.Context, ref string) (func(), error)
+
+func (f lockerFunc) Lock(ctx context.Context, ref string) (func(), error) { return f(ctx, ref) }
+
 func TestProjectFailoverWhenTheHomeDoesNotAnswerIsRefused(t *testing.T) {
 	w := newWorld(t)
 	w.down["n1"] = true
@@ -156,7 +260,7 @@ func TestProjectFailoverWhenTheHomeDoesNotAnswerIsRefused(t *testing.T) {
 	if !errors.Is(err, ErrRefused) || !errors.As(err, &re) {
 		t.Fatalf("error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "node failure") {
+	if !strings.Contains(err.Error(), "node failure") || !strings.Contains(err.Error(), "supavise failover on a survivor") {
 		t.Fatalf("the refusal should send the operator to the server failover: %v", err)
 	}
 	// Even with --force: no fence can be made without the node.
@@ -167,6 +271,19 @@ func TestProjectFailoverWhenTheHomeDoesNotAnswerIsRefused(t *testing.T) {
 	if moves, _ := w.reg.ListMoves(w.ctx, "", 10); len(moves) != 0 {
 		t.Fatalf("a refused move left %d row(s)", len(moves))
 	}
+}
+
+// A project whose home is a follower that does not answer has no move: the refusal says so instead
+// of sending the operator to a server failover that would leave the project where it is.
+func TestAProjectHomedOnAFollowerThatIsDownIsRefusedWithTheTruth(t *testing.T) {
+	w := newWorld(t)
+	rehomeOn(t, w, refB, "n2", "n1")
+	w.down["n2"] = true
+	_, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refB, Force: true})
+	if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "does not lead") || strings.Contains(err.Error(), "run supavise failover") {
+		t.Fatalf("error: %v", err)
+	}
+	w.assertNever("promote")
 }
 
 func TestSwitchoverThatCannotCatchUpIsUndone(t *testing.T) {
@@ -257,7 +374,7 @@ func TestProjectResumeAtEveryStep(t *testing.T) {
 		{name: "planned/start", fail: "start n2/"},
 		{name: "planned/tenant", fail: "fleet.ensure"},
 		{name: "planned/demote", fail: "demote n1/"},
-		{name: "unplanned/fence", unhealthy: true, fail: "fence n1"},
+		{name: "unplanned/fence", unhealthy: true, fail: "local.stop " + refA},
 		{name: "unplanned/promote", unhealthy: true, fail: "promote n2/"},
 		{name: "unplanned/promote answered", unhealthy: true, fail: "promote-after n2/"},
 		{name: "unplanned/home", unhealthy: true, fail: "registry.SetProjectNode"},

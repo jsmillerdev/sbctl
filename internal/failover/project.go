@@ -39,6 +39,15 @@ func (o *Orchestrator) FailoverProject(ctx context.Context, opts ProjectOptions)
 	}
 	defer release()
 
+	// The project's lock first, and the plan under it: a pause or a resume cannot change the status
+	// the move records, and a move that cannot get the lock leaves no row behind.
+	if !opts.DryRun {
+		unlock, err := o.lockProject(ctx, opts.Ref)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+	}
 	pl, run, err := o.planProject(ctx, opts)
 	if err != nil {
 		return nil, err
@@ -48,6 +57,9 @@ func (o *Orchestrator) FailoverProject(ctx context.Context, opts ProjectOptions)
 	}
 	if refused := pl.Refused(opts.Force || opts.Resume); len(refused) > 0 {
 		return nil, &RefusedError{Checks: refused, Force: opts.Force}
+	}
+	if opts.ExpectKind != "" && !opts.Resume && pl.Kind != opts.ExpectKind {
+		return nil, fmt.Errorf("%w: it was a %s and is a %s now", ErrPlanChanged, opts.ExpectKind, pl.Kind)
 	}
 
 	var j *journal
@@ -72,12 +84,6 @@ func (o *Orchestrator) FailoverProject(ctx context.Context, opts ProjectOptions)
 			return nil, err
 		}
 	}
-
-	unlock, err := o.lockProject(ctx, run.project.Ref)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
 
 	o.announce(ctx, alerts.KindFailoverStarted, alerts.SeverityInfo, j.snapshot(),
 		fmt.Sprintf("Moving project %s from %s to %s.", run.project.Ref, run.from.Name, run.to.Name))
@@ -415,18 +421,27 @@ func (o *Orchestrator) undoSwitchover(ctx context.Context, j *journal, run *proj
 	return &abortError{cause: fmt.Errorf("%w (%v)", ErrReplayBehind, abort.cause)}
 }
 
-// fenceProject asks the old home to stop the project's primary and keep it stopped.
+// fenceProject asks the old home to stop the project's primary and keep it stopped. A home that is
+// this node, the usual case since the leader runs the move and homes most projects, does it
+// itself: a node cannot ask itself over the mesh.
 func (o *Orchestrator) fenceProject(ctx context.Context, run *projectRun) (string, error) {
-	if o.d.Peers == nil {
-		return "", errors.New("no way to reach the old home")
-	}
 	req := FenceCall{
 		FenceRequest: peerapi.FenceRequest{Epoch: run.epoch, Leader: o.self().ID, Reason: "project failover of " + run.project.Ref},
 		Ref:          run.project.Ref,
 	}
-	resp, err := o.d.Peers.Fence(ctx, run.from.ID, req)
-	if err != nil {
-		return "", fmt.Errorf("%w: %s did not answer the fence: %v", ErrHomeUnreachable, run.from.Name, err)
+	var resp peerapi.FenceResponse
+	var err error
+	switch {
+	case run.from.ID == o.self().ID:
+		if resp, err = o.fenceProjectHere(ctx, req); err != nil {
+			return "", fmt.Errorf("%w: %s could not stop the project: %v", ErrFence, run.from.Name, err)
+		}
+	case o.d.Peers == nil:
+		return "", errors.New("no way to reach the old home")
+	default:
+		if resp, err = o.d.Peers.Fence(ctx, run.from.ID, req); err != nil {
+			return "", fmt.Errorf("%w: %s did not answer the fence: %v", ErrHomeUnreachable, run.from.Name, err)
+		}
 	}
 	if !resp.Fenced {
 		return "", fmt.Errorf("%w: %s did not fence the project (it is at epoch %d)", ErrFence, run.from.Name, resp.Epoch)

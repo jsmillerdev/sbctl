@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -137,12 +138,13 @@ func (m *Monitor) arm(ctx context.Context) string {
 	prev := o.autoOff()
 	if reason != prev {
 		o.setAutoOff(reason)
+		ev := alerts.Event{Kind: alerts.KindFailoverAutoOff, Severity: alerts.SeverityWarning, Title: "Automatic failover is off", Key: "failover/auto-off"}
 		if reason != "" {
-			o.alert(ctx, alerts.Event{
-				Kind: alerts.KindFailoverFailed, Severity: alerts.SeverityWarning, Title: "Automatic failover is off",
-				Detail: "[failover] mode is " + o.conf().Mode + ", but the node cannot fence: " + reason + ". The node runs as manual until the check passes.",
-				Key:    "failover/auto-off",
-			})
+			ev.Detail = "[failover] mode is " + o.conf().Mode + ", but the node cannot fence: " + reason + ". The node runs as manual until the check passes."
+			o.alert(ctx, ev)
+		} else if prev != "" {
+			ev.Resolved, ev.Detail = true, "The node can fence again: automatic failover is on."
+			o.alert(ctx, ev)
 		}
 	}
 	return reason
@@ -217,8 +219,18 @@ func (m *Monitor) serverTick(ctx context.Context, snap cluster.Snapshot) Decisio
 	}
 	silent := now.Sub(m.leaderSilentSince)
 	m.mu.Unlock()
-	if grace := o.conf().Grace(); silent < grace {
+	grace := o.conf().Grace()
+	if silent < grace {
 		return none("the leader %s has been silent for %s of %s", leader.Name, silent.Round(time.Second), grace)
+	}
+	// With more than one follower every one of them reaches this point. They take turns: the
+	// follower first in line (by node id) goes ahead after the grace period, the next one a grace
+	// period later, and so on, so that the one that acts first has taken over, and shows as the
+	// leader, before the others look again. The epoch marker is what holds when two still act at once.
+	if turn := o.turn(snap.Self.ID, leader.ID); turn > 0 {
+		if wait := grace * time.Duration(turn+1); silent < wait {
+			return none("the leader %s has been silent for %s; %d follower(s) take their turn first, this node's is at %s", leader.Name, silent.Round(time.Second), turn, wait)
+		}
 	}
 
 	// 2. The public address, from outside. A leader that no peer reaches may still serve clients.
@@ -251,7 +263,7 @@ func (m *Monitor) serverTick(ctx context.Context, snap cluster.Snapshot) Decisio
 	if reason := m.gates(ctx, snap, leader, self); reason != "" {
 		return none("%s", reason)
 	}
-	opts := ServerOptions{RestoreMissing: true, Yes: true}
+	opts := ServerOptions{RestoreMissing: true}
 	pl, err := o.PlanServer(ctx, opts)
 	if err != nil {
 		return none("the plan failed: %v", err)
@@ -259,6 +271,12 @@ func (m *Monitor) serverTick(ctx context.Context, snap cluster.Snapshot) Decisio
 	if blocked := pl.Refused(false); len(blocked) > 0 {
 		return none("%s: %s", blocked[0].Name, blocked[0].Detail)
 	}
+	// The plan pings the leader once more. A leader that answers now is not stopped, cleanly or
+	// otherwise, by a monitor that saw it silent a moment ago.
+	if pl.Kind != string(registry.MoveFailover) {
+		return none("the leader %s answers again", leader.Name)
+	}
+	opts.ExpectKind, opts.ExpectEpoch = pl.Kind, pl.Epoch
 
 	o.d.Log.Warn("automatic server failover", "leader", leader.Name, "silent", now.Sub(m.leaderSilentSince).String(), "cloud", state.State)
 	_, err = o.FailoverServer(ctx, opts)
@@ -306,7 +324,7 @@ func (m *Monitor) projectTick(ctx context.Context, snap cluster.Snapshot) Decisi
 		return none("no project has been unhealthy for %s", grace)
 	}
 
-	// One project per look, the oldest first: the moves are serialized anyway.
+	// One project per look, the first in the registry's order: the moves are serialized anyway.
 	ref := due[0]
 	pl, err := o.PlanProject(ctx, ProjectOptions{Ref: ref})
 	if err != nil {
@@ -330,8 +348,26 @@ func (m *Monitor) projectTick(ctx context.Context, snap cluster.Snapshot) Decisi
 		return Decision{Action: "none", Ref: ref, Reason: reason}
 	}
 	o.d.Log.Warn("automatic project failover", "ref", ref, "unhealthy_for", now.Sub(m.since(ref)).String())
-	_, err = o.FailoverProject(ctx, ProjectOptions{Ref: ref})
+	_, err = o.FailoverProject(ctx, ProjectOptions{Ref: ref, ExpectKind: string(registry.MoveFailover)})
 	return Decision{Action: "project", Ref: ref, Reason: fmt.Sprintf("the primary of %s was unhealthy for %s", ref, grace), Err: err}
+}
+
+// turn is the place of node self among the followers that could take over from the leader: 0 for
+// the first by node id. A node that is not in the list is last.
+func (o *Orchestrator) turn(self, leader string) int {
+	var ids []string
+	for _, n := range o.d.Members.Nodes() {
+		if n.State == registry.NodeActive && n.ID != leader {
+			ids = append(ids, n.ID)
+		}
+	}
+	sort.Strings(ids)
+	for i, id := range ids {
+		if id == self {
+			return i
+		}
+	}
+	return len(ids)
 }
 
 func (m *Monitor) since(ref string) time.Time {

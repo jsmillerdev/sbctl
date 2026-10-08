@@ -109,10 +109,14 @@ func wireFailover(ctx context.Context, w *Wire) error {
 		mesh.Handle(pattern, h)
 	}
 
-	// At boot, before any project starts: a node that was replaced while it was away learns it.
+	// At boot, before any project starts: a node that was replaced while it was away learns it. A
+	// registry that cannot be read does not skip the check: the node is taken to claim a primary.
 	claims := members.IsLeader()
 	if !claims {
-		if ps, err := store().ListProjects(ctx); err == nil {
+		if ps, err := store().ListProjects(ctx); err != nil {
+			w.Log.Warn("the registry could not be read for the boot epoch check; checking as if this node homed a project", "error", err)
+			claims = true
+		} else {
 			for _, p := range ps {
 				if p.NodeID == members.Self().ID {
 					claims = true

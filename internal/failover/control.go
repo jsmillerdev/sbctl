@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,8 +24,9 @@ import (
 // daemon: its mesh sessions, its plane, its registry (read-only on a follower until the move
 // promotes it), its shared services. The CLI is therefore a client: it asks for a plan, prints it,
 // asks the operator, and follows the run, which goes on in the daemon if the CLI goes away
-// (--resume continues it). The socket is HTTP over a unix socket in a directory only the daemon's
-// user and root can enter; it carries no secrets.
+// (--resume continues it). The socket is HTTP over a unix socket, mode 0600, in a directory of mode
+// 0700: only the daemon's user and root reach it, and it authorizes a failover with no other check.
+// It carries no secrets.
 //
 //	GET  /v1/readiness      the failover-readiness block (404 on a node that is not in a cluster)
 //	POST /v1/plan/project   ProjectOptions in, a Plan out
@@ -42,11 +44,12 @@ func ControlSocket(cfg *config.Config) string {
 
 // projectReq and serverReq are the wire forms of the options.
 type projectReq struct {
-	Ref    string `json:"ref"`
-	To     string `json:"to,omitempty"`
-	Force  bool   `json:"force,omitempty"`
-	DryRun bool   `json:"dry_run,omitempty"`
-	Resume bool   `json:"resume,omitempty"`
+	Ref        string `json:"ref"`
+	To         string `json:"to,omitempty"`
+	Force      bool   `json:"force,omitempty"`
+	DryRun     bool   `json:"dry_run,omitempty"`
+	Resume     bool   `json:"resume,omitempty"`
+	ExpectKind string `json:"expect_kind,omitempty"`
 }
 
 type serverReq struct {
@@ -56,14 +59,17 @@ type serverReq struct {
 	Resume           bool   `json:"resume,omitempty"`
 	RestoreMissing   bool   `json:"restore_missing,omitempty"`
 	OldPrimaryIsDown bool   `json:"old_primary_is_down,omitempty"`
+	ExpectKind       string `json:"expect_kind,omitempty"`
+	ExpectEpoch      int64  `json:"expect_epoch,omitempty"`
 }
 
 func (r projectReq) options() ProjectOptions {
-	return ProjectOptions{Ref: r.Ref, To: r.To, Force: r.Force, DryRun: r.DryRun, Resume: r.Resume}
+	return ProjectOptions{Ref: r.Ref, To: r.To, Force: r.Force, DryRun: r.DryRun, Resume: r.Resume, ExpectKind: r.ExpectKind}
 }
 
 func (r serverReq) options() ServerOptions {
-	return ServerOptions{To: r.To, Force: r.Force, DryRun: r.DryRun, Resume: r.Resume, RestoreMissing: r.RestoreMissing, OldPrimaryIsDown: r.OldPrimaryIsDown, Yes: true}
+	return ServerOptions{To: r.To, Force: r.Force, DryRun: r.DryRun, Resume: r.Resume, RestoreMissing: r.RestoreMissing, OldPrimaryIsDown: r.OldPrimaryIsDown, Yes: true,
+		ExpectKind: r.ExpectKind, ExpectEpoch: r.ExpectEpoch}
 }
 
 // stepJSON, moveJSON and event are what the stream carries.
@@ -90,7 +96,7 @@ type event struct {
 	Step  *stepJSON `json:"step,omitempty"`
 	Move  *moveJSON `json:"move,omitempty"`
 	Error string    `json:"error,omitempty"`
-	// Code names the kind of error: "refused", "busy", "nothing_to_resume", "no_cluster" or "failed".
+	// Code names the kind of error: "refused", "busy", "nothing_to_resume", "plan_changed", "no_cluster" or "failed".
 	Code   string  `json:"code,omitempty"`
 	Checks []Check `json:"checks,omitempty"`
 	// Move is set with an error too when the move got as far as being recorded.
@@ -207,6 +213,8 @@ func errorEvent(err error) event {
 		ev.Code = "busy"
 	case errors.Is(err, ErrNothingToResume):
 		ev.Code = "nothing_to_resume"
+	case errors.Is(err, ErrPlanChanged):
+		ev.Code = "plan_changed"
 	case errors.Is(err, ErrNoCluster):
 		ev.Code = "no_cluster"
 	}
@@ -215,7 +223,9 @@ func errorEvent(err error) event {
 
 // run starts a move on a goroutine of the daemon and streams its steps until it ends.
 func (s *ControlServer) run(base context.Context, w http.ResponseWriter, r *http.Request, do func(context.Context) (*registry.Move, error)) {
-	steps := make(chan registry.MoveStep)
+	// The buffer is for a client that reads slower than the move records. A step that finds it full
+	// is not reported: it is in the log, and a move must not wait on a terminal.
+	steps := make(chan registry.MoveStep, 256)
 	type result struct {
 		mv  *registry.Move
 		err error
@@ -225,7 +235,7 @@ func (s *ControlServer) run(base context.Context, w http.ResponseWriter, r *http
 	ctx := WithProgress(base, func(st registry.MoveStep) {
 		select {
 		case steps <- st:
-		case <-gone: // nobody is reading: the step is in the log
+		default:
 		}
 	})
 	go func() {
@@ -248,8 +258,14 @@ func (s *ControlServer) run(base context.Context, w http.ResponseWriter, r *http
 		case st := <-steps:
 			emit(event{Step: &stepJSON{Name: st.Name, At: st.At, Detail: st.Detail}})
 		case res := <-done:
-			// Steps that were sent just before the end are still in the channel's senders: none
-			// block, because the send selects on the request.
+			for drained := false; !drained; { // the steps recorded just before the end
+				select {
+				case st := <-steps:
+					emit(event{Step: &stepJSON{Name: st.Name, At: st.At, Detail: st.Detail}})
+				default:
+					drained = true
+				}
+			}
 			ev := event{Move: toMoveJSON(res.mv)}
 			if res.err != nil {
 				e := errorEvent(res.err)
@@ -268,7 +284,13 @@ func (s *ControlServer) Serve(ctx context.Context, path string) error {
 	if len(path) > maxSocketPath {
 		return fmt.Errorf("failover: the control socket path %q is longer than %d bytes", path, maxSocketPath)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+	// The directory is closed to everyone else before the socket exists in it, so the socket is not
+	// reachable in the moment between Listen and Chmod.
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("failover: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
 		return fmt.Errorf("failover: %w", err)
 	}
 	_ = os.Remove(path) // a socket the last daemon left
@@ -276,7 +298,7 @@ func (s *ControlServer) Serve(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("failover: listening on %s: %w", path, err)
 	}
-	if err := os.Chmod(path, 0o660); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil {
 		ln.Close()
 		return fmt.Errorf("failover: %w", err)
 	}
@@ -318,6 +340,8 @@ func (e *RemoteError) Is(target error) bool {
 		return target == ErrBusy
 	case "nothing_to_resume":
 		return target == ErrNothingToResume
+	case "plan_changed":
+		return target == ErrPlanChanged
 	case "no_cluster":
 		return target == ErrNoCluster
 	}
@@ -350,7 +374,12 @@ func (c Client) do(ctx context.Context, method, path string, in any) (*http.Resp
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.http().Do(req)
-	if err != nil {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("failover: there is no control socket at %s: this server is not part of a cluster, or supavise is not running on it: %w", c.Path, err)
+	case errors.Is(err, fs.ErrPermission):
+		return nil, fmt.Errorf("failover: the control socket %s is for root and the user supavise runs as: run this command as one of them: %w", c.Path, err)
+	case err != nil:
 		return nil, fmt.Errorf("failover: the daemon's control socket %s does not answer (is supavise running on this node?): %w", c.Path, err)
 	}
 	return resp, nil
@@ -394,13 +423,14 @@ func (c Client) PlanServer(ctx context.Context, o ServerOptions) (*Plan, error) 
 }
 
 func serverFromOptions(o ServerOptions) serverReq {
-	return serverReq{To: o.To, Force: o.Force, Resume: o.Resume, RestoreMissing: o.RestoreMissing, OldPrimaryIsDown: o.OldPrimaryIsDown}
+	return serverReq{To: o.To, Force: o.Force, Resume: o.Resume, RestoreMissing: o.RestoreMissing, OldPrimaryIsDown: o.OldPrimaryIsDown,
+		ExpectKind: o.ExpectKind, ExpectEpoch: o.ExpectEpoch}
 }
 
 // RunProject starts the move and calls onStep for each step as the daemon records it. The move is
 // returned with the error when it got as far as being recorded.
 func (c Client) RunProject(ctx context.Context, o ProjectOptions, onStep func(registry.MoveStep)) (*registry.Move, error) {
-	return c.stream(ctx, "/v1/run/project", projectReq{Ref: o.Ref, To: o.To, Force: o.Force, Resume: o.Resume}, onStep)
+	return c.stream(ctx, "/v1/run/project", projectReq{Ref: o.Ref, To: o.To, Force: o.Force, Resume: o.Resume, ExpectKind: o.ExpectKind}, onStep)
 }
 
 func (c Client) RunServer(ctx context.Context, o ServerOptions, onStep func(registry.MoveStep)) (*registry.Move, error) {

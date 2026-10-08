@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -14,9 +15,15 @@ import (
 // The old primary's return, on its own side (design 2.10.8). A node that was down, or cut off,
 // while another node took over does not know it; at boot, before the daemon lets any cluster run as
 // a primary, it asks its peers for the epoch and reads the leader marker in the backup store. A
-// higher epoch, or a different leader, fences it: the record is written (the plane starts no
-// primary while it exists), the clusters that systemd already started are stopped, and the
-// critical alert `fenced` goes out. `supavise node rejoin` is the way back.
+// higher epoch, or a different leader, fences a node that led: the record is written (the plane
+// starts no primary while it exists), the clusters that systemd already started are stopped, and
+// the critical alert `fenced` goes out. `supavise node rejoin` is the way back.
+//
+// Only a node that led is fenced by what it learns. A follower that was down while the leader
+// changed holds a registry copy that is behind, and nothing it homes moved: the leadership change
+// of a server move touches the projects of the old leader only, and a project move reaches its
+// home with a fence of its own. Fencing the follower would put its projects offline and set all its
+// data aside at the rejoin.
 
 // bootTimeout bounds the whole check: a node that cannot find out starts only when its record
 // shows no demotion, and must not wait for ever to find out.
@@ -36,8 +43,9 @@ type BootResult struct {
 
 // BootCheck runs the boot-time epoch check. claims says whether this node would run a primary: it
 // leads according to its own registry, or homes a project. A node that claims nothing has no
-// primary to fence, and its registry follows the leader's anyway. It never returns an error for
-// a source that is unreachable; that is the point of having two.
+// primary to fence, and neither has one that does not lead (see above); both only have their
+// record read. It never returns an error for a source that is unreachable; that is the point of
+// having two.
 func (o *Orchestrator) BootCheck(ctx context.Context, claims bool) (BootResult, error) {
 	paths := o.d.Cfg.Paths()
 	if rec, err := fenced.Node(paths); err != nil {
@@ -45,7 +53,7 @@ func (o *Orchestrator) BootCheck(ctx context.Context, claims bool) (BootResult, 
 	} else if rec != nil {
 		return BootResult{Fenced: true, Reason: rec.Reason, Epoch: rec.Epoch, Leader: rec.Leader}, nil
 	}
-	if !claims {
+	if !claims || !o.d.Members.IsLeader() {
 		return BootResult{}, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, bootTimeout)
@@ -127,25 +135,25 @@ func (o *Orchestrator) BootCheck(ctx context.Context, claims bool) (BootResult, 
 }
 
 // fenceSelf makes the verdict stick: the record first, so that nothing starts a primary behind
-// the daemon's back, then the clusters that run now are stopped and the alert goes out.
+// the daemon's back, then the clusters that run now are stopped and the alert goes out. A record
+// that cannot be written (a full disk is likely on a node that is failing) does not leave the
+// primaries running: they are stopped and their launchers removed all the same.
 func (o *Orchestrator) fenceSelf(ctx context.Context, res BootResult) error {
+	var errs []error
 	if err := fenced.WriteNode(o.d.Cfg.Paths(), fenced.Record{Epoch: res.Epoch, Leader: res.Leader, Reason: res.Reason, At: o.d.Now().UTC()}); err != nil {
-		return fmt.Errorf("failover: recording that this node is fenced: %w", err)
+		errs = append(errs, fmt.Errorf("failover: recording that this node is fenced: %w", err))
 	}
-	var first error
 	if o.d.LocalPrimaries != nil {
-		_, err := o.fencePrimaries(context.WithoutCancel(ctx), o.primaryRefs(ctx), func() error { return nil })
-		first = err
+		if _, err := o.fencePrimaries(context.WithoutCancel(ctx), o.primaryRefs(ctx), func() error { return nil }); err != nil {
+			errs = append(errs, fmt.Errorf("failover: this node is fenced, but a primary could not be stopped: %w", err))
+		}
 	}
 	o.alert(ctx, alerts.Event{
 		Kind: alerts.KindFenced, Severity: alerts.SeverityCritical, Title: "This node was fenced",
 		Detail: "At boot: " + res.Reason + ". No cluster starts as a primary here until `supavise node rejoin` rebuilds this node as a follower of the current leader.",
 		Key:    "fenced",
 	})
-	if first != nil {
-		return fmt.Errorf("failover: this node is fenced, but a primary could not be stopped: %w", first)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Fenced reports whether the node has a fence record: the status line and the proxy ask.

@@ -20,7 +20,8 @@ nothing is lost. --dry-run prints each precondition; --resume continues a move t
 
 Run it on the leader. A project whose primary does not answer is failed over instead: the old primary
 is fenced first, and what the replica has not received is lost. A project whose home node does not
-answer at all is a node failure: run supavise failover on a surviving node.`,
+answer at all is a node failure: if that node is the leader, run supavise failover on a surviving node.
+No move covers the projects of a follower that is down.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.Ref = args[0]
@@ -29,7 +30,7 @@ answer at all is a node failure: run supavise failover on a surviving node.`,
 	}
 	f := cmd.Flags()
 	f.StringVar(&o.To, "to", "", "the node to move the project to (default: the healthiest replica)")
-	f.BoolVar(&o.Force, "force", false, "go on although the replica lags more than [failover] max_lag_seconds")
+	f.BoolVar(&o.Force, "force", false, "go on although a precondition that is not marked hard fails: a replica that lags or is not healthy, nodes on different releases")
 	f.BoolVar(&o.DryRun, "dry-run", false, "print the preconditions and what would happen, and change nothing")
 	f.BoolVar(&o.Resume, "resume", false, "continue the move that stopped")
 	projectsCmd.AddCommand(cmd)
@@ -65,6 +66,9 @@ func runProjectFailover(cmd *cobra.Command, o failover.ProjectOptions) error {
 		return &failover.RefusedError{Checks: refused, Force: o.Force}
 	}
 	fmt.Fprintln(out)
+	if !o.Resume { // the daemon refuses to run a plan other than the one that was shown
+		o.ExpectKind = plan.Kind
+	}
 	mv, err := c.RunProject(ctx, o, stepPrinter(out))
 	return finishMove(out, mv, err)
 }

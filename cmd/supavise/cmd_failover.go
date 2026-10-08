@@ -52,7 +52,7 @@ its standby from the WAL archive (data loss up to archive_timeout).`,
 	}
 	f := cmd.Flags()
 	f.StringVar(&o.To, "to", "", "the node to promote (default: this one)")
-	f.BoolVar(&o.Force, "force", false, "go on although a replica lags more than [failover] max_lag_seconds")
+	f.BoolVar(&o.Force, "force", false, "go on although a precondition that is not marked hard fails: a replica that lags or is not healthy, nodes on different releases, an unreachable epoch-marker store")
 	f.BoolVar(&o.DryRun, "dry-run", false, "print the preconditions and what would happen, and change nothing")
 	f.BoolVar(&o.Resume, "resume", false, "continue the run that stopped")
 	f.BoolVar(&o.RestoreMissing, "restore-missing", false, "seed a project that has no replica from the archive")
@@ -95,6 +95,9 @@ func runServerFailover(cmd *cobra.Command, o failover.ServerOptions) error {
 		}
 	}
 	fmt.Fprintln(out)
+	if !o.Resume { // the daemon refuses to run a plan other than the one that was shown
+		o.ExpectKind, o.ExpectEpoch = plan.Kind, plan.Epoch
+	}
 	mv, err := c.RunServer(ctx, o, stepPrinter(out))
 	return finishMove(out, mv, err)
 }

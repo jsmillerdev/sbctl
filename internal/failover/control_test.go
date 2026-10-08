@@ -3,6 +3,8 @@ package failover
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,8 +82,11 @@ func controlRig(t *testing.T) (*fakeService, Client, context.CancelFunc) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o660 {
+	if fi.Mode().Perm() != 0o600 {
 		t.Fatalf("socket mode %v", fi.Mode())
+	}
+	if di, err := os.Stat(dir); err != nil || di.Mode().Perm() != 0o700 {
+		t.Fatalf("socket directory: %v, %v", di, err)
 	}
 	return svc, Client{Path: path}, cancel
 }
@@ -163,6 +168,7 @@ func TestRunErrorsKeepTheirMeaningAcrossTheSocket(t *testing.T) {
 		"refused": {&RefusedError{Checks: []Check{{Name: "storage backend", Detail: "file", Blocking: true, Hard: true}}}, ErrRefused, "storage backend"},
 		"busy":    {ErrBusy, ErrBusy, "another move"},
 		"nothing": {ErrNothingToResume, ErrNothingToResume, "unfinished"},
+		"changed": {ErrPlanChanged, ErrPlanChanged, "plan changed"},
 		"plain":   {errors.New("the registry is read-only"), nil, "read-only"},
 	} {
 		svc.run = func(context.Context, func(string, string)) (*registry.Move, error) {
@@ -227,8 +233,78 @@ func TestARunSurvivesItsClient(t *testing.T) {
 
 func TestClientWithoutADaemonSaysSo(t *testing.T) {
 	c := Client{Path: filepath.Join(t.TempDir(), "none.sock")}
-	if _, err := c.Readiness(context.Background()); err == nil || !strings.Contains(err.Error(), "control socket") {
+	// No socket: the server is not in a cluster, or the daemon does not run.
+	if _, err := c.Readiness(context.Background()); err == nil || !strings.Contains(err.Error(), "not part of a cluster, or supavise is not running") {
 		t.Fatalf("error: %v", err)
+	}
+	// A socket nobody listens on: the daemon is there and does not answer.
+	dead := filepath.Join(t.TempDir(), "dead.sock")
+	ln, err := net.Listen("unix", dead)
+	must(t, err)
+	ln.(*net.UnixListener).SetUnlinkOnClose(false) // the file stays, as a daemon that died leaves it
+	ln.Close()
+	if _, err := (Client{Path: dead}).Readiness(context.Background()); err == nil || !strings.Contains(err.Error(), "does not answer") {
+		t.Fatalf("error: %v", err)
+	}
+}
+
+// What the operator confirmed travels to the daemon, which holds the run to it.
+func TestTheConfirmedPlanTravelsWithTheRun(t *testing.T) {
+	svc, c, _ := controlRig(t)
+	svc.run = func(context.Context, func(string, string)) (*registry.Move, error) {
+		return &registry.Move{ID: 1, State: registry.MoveDone}, nil
+	}
+	if _, err := c.RunServer(context.Background(), ServerOptions{ExpectKind: "switchover", ExpectEpoch: 4}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if svc.gotServer.ExpectKind != "switchover" || svc.gotServer.ExpectEpoch != 4 {
+		t.Fatalf("server options: %+v", svc.gotServer)
+	}
+	if _, err := c.RunProject(context.Background(), ProjectOptions{Ref: refA, ExpectKind: "failover"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if svc.gotProj.ExpectKind != "failover" {
+		t.Fatalf("project options: %+v", svc.gotProj)
+	}
+}
+
+// A client that is connected and does not read stalls nothing: the steps of the move do not wait
+// for it, and the end of the move still reaches it with every step it has not read yet.
+func TestAClientThatDoesNotReadDoesNotStallTheMove(t *testing.T) {
+	svc, c, _ := controlRig(t)
+	finished := make(chan struct{})
+	svc.run = func(ctx context.Context, report func(string, string)) (*registry.Move, error) {
+		for i := 0; i < 600; i++ { // more than the buffer holds
+			report(fmt.Sprintf("step-%d", i), "")
+		}
+		close(finished)
+		return &registry.Move{ID: 1, State: registry.MoveDone}, nil
+	}
+	got := make(chan int, 1)
+	block := make(chan struct{})
+	go func() {
+		n := 0
+		_, _ = c.RunServer(context.Background(), ServerOptions{}, func(registry.MoveStep) {
+			if n == 0 {
+				<-block // the terminal is paused
+			}
+			n++
+		})
+		got <- n
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the move waited for a client that does not read")
+	}
+	close(block)
+	select {
+	case n := <-got:
+		if n == 0 {
+			t.Fatal("the client saw no step")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client never got the end of the move")
 	}
 }
 

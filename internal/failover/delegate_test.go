@@ -250,6 +250,9 @@ func TestTheSurvivorRefusesWhatItCannotRun(t *testing.T) {
 		if rec := serve(t, o, "POST "+PathServer, PathServer, "n1", serverReq{}, nil); rec.Code != http.StatusConflict || errorOf(rec).Code != "busy" {
 			t.Fatalf("%d %s", rec.Code, rec.Body)
 		}
+		if o.deleg != nil {
+			t.Fatal("a request that was turned away replaced the run the leader follows")
+		}
 	})
 	t.Run("nothing was asked yet", func(t *testing.T) {
 		w := serverWorld(t)

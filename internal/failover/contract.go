@@ -66,21 +66,33 @@ type Provider interface {
 type ProjectOptions struct {
 	Ref string
 	// To is the node to move the project to; empty picks the healthiest replica.
-	To     string
-	Force  bool
+	To    string
+	Force bool
+	// DryRun changes nothing: the plan is made and FailoverProject returns a nil move.
 	DryRun bool
 	Resume bool
+	// ExpectKind is the kind of move the operator confirmed in the plan, "switchover" or "failover".
+	// When it is set and the plan made at the start of the run says the other, the run is
+	// refused with ErrPlanChanged: a project that stopped answering between the plan and the run
+	// is not fenced on the strength of a confirmation for a clean stop.
+	ExpectKind string
 }
 
 // ServerOptions are the flags of `supavise failover`.
 type ServerOptions struct {
-	To               string
-	Force            bool
+	To    string
+	Force bool
+	// DryRun changes nothing: the plan is made and FailoverServer returns a nil move.
 	DryRun           bool
 	Resume           bool
 	RestoreMissing   bool
 	OldPrimaryIsDown bool
 	Yes              bool
+	// ExpectKind and ExpectEpoch are what the operator confirmed in the plan. When ExpectKind is
+	// set and the plan made at the start of the run differs in kind or epoch, the run is refused
+	// with ErrPlanChanged.
+	ExpectKind  string
+	ExpectEpoch int64
 }
 
 // Check is one precondition and its verdict.

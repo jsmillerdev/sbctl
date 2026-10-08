@@ -655,6 +655,12 @@ func TestPreflightRefusals(t *testing.T) {
 			must(w.t, w.reg.UpdateNode(w.ctx, n))
 			w.refreshMembers()
 		}, check: "same release", forced: true},
+		"a project without a replica": {mut: func(w *world) {
+			org, _ := w.reg.GetOrganization(w.ctx, "acme")
+			must(w.t, w.reg.CreateProject(w.ctx, &registry.Project{Ref: refC, OrgID: org.ID, Name: "c", Status: registry.StatusActiveHealthy}))
+			w.prim["n1/"+refC] = &primState{running: true, healthy: true}
+			w.lsn[refC] = "0/9000060"
+		}, check: "projects without a replica", hard: true},
 		"no system replica": {mut: func(w *world) { must(w.t, w.reg.DeleteReplica(w.ctx, idSysN2)) }, check: "system replica", hard: true},
 		"target left":       {mut: func(w *world) { must(w.t, w.reg.SetNodeState(w.ctx, "n2", registry.NodeLeft)) }, check: "target node", hard: true},
 	} {
@@ -804,5 +810,91 @@ func TestACallTurnedAwayWhileTheNodeLearnsWhoLeadsIsRepeated(t *testing.T) {
 		if got := w2.count("promote n2/" + idBN2); got != 1 {
 			t.Fatalf("%d promote calls for %v", got, err)
 		}
+	}
+}
+
+// A store that ignores conditional writes (Garage does) lets both survivors write. The one whose
+// marker was overwritten sees the other's when it reads back, and stops before the address.
+func TestASurvivorWhoseMarkerIsOverwrittenAfterItsWriteStopsBeforeTheAddress(t *testing.T) {
+	w := serverWorld(t)
+	w.down["n1"] = true
+	w.markerRace = &backup.LeaderMarker{Epoch: 2, Leader: "n3"}
+	mv, err := w.orch().FailoverServer(w.ctx, ServerOptions{})
+	if !errors.Is(err, ErrEpochLost) || mv.State != registry.MoveAborted {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	w.assertNever("provider.takeover")
+	w.assertNever("promote")
+}
+
+func TestAServerMoveRefusesAPlanOtherThanTheConfirmedOne(t *testing.T) {
+	w := serverWorld(t)
+	o := w.orch()
+	// The operator confirmed a clean stop of the leader; the leader stops answering before the run.
+	pl, err := o.PlanServer(w.ctx, ServerOptions{})
+	must(t, err)
+	if pl.Kind != string(registry.MoveSwitchover) {
+		t.Fatalf("plan: %+v", pl)
+	}
+	w.down["n1"] = true
+	_, err = o.FailoverServer(w.ctx, ServerOptions{ExpectKind: pl.Kind, ExpectEpoch: pl.Epoch})
+	if !errors.Is(err, ErrPlanChanged) {
+		t.Fatalf("error: %v", err)
+	}
+	for _, e := range []string{"provider.fence", "fence ", "marker", "promote"} {
+		w.assertNever(e)
+	}
+	if stateFileExists(w) {
+		t.Fatal("a refused run left a state file")
+	}
+	// The epoch is part of the plan too.
+	w.down["n1"] = false
+	if _, err := o.FailoverServer(w.ctx, ServerOptions{ExpectKind: pl.Kind, ExpectEpoch: pl.Epoch + 1}); !errors.Is(err, ErrPlanChanged) {
+		t.Fatalf("another epoch: %v", err)
+	}
+	if _, err := o.FailoverServer(w.ctx, ServerOptions{ExpectKind: pl.Kind, ExpectEpoch: pl.Epoch}); err != nil {
+		t.Fatalf("the confirmed plan: %v", err)
+	}
+}
+
+// A project that finishes on a later --resume gets a base backup then, not never.
+func TestAProjectThatFinishesOnAResumeGetsItsBaseBackup(t *testing.T) {
+	w := serverWorld(t)
+	w.fail("start n2/"+refB, errors.New("PostgREST did not start"), -1)
+	o := w.orch()
+	mv, err := o.FailoverServer(w.ctx, ServerOptions{})
+	if err == nil || mv == nil || mv.State != registry.MoveFailed {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if !w.has("basebackup n2/"+refA) || w.has("basebackup n2/"+refB) {
+		t.Fatalf("base backups after the first run:\n%v", w.snapshot())
+	}
+	if hasStep(serverMove(t, w), "base-backups") {
+		t.Fatal("the base backup step is over although a project has not finished")
+	}
+	w.clearFailures()
+	if _, err := w.orch().FailoverServer(w.ctx, ServerOptions{Resume: true}); err != nil {
+		t.Fatal(err)
+	}
+	if w.count("basebackup n2/"+refB) != 1 || w.count("basebackup n2/"+refA) != 1 || w.count("basebackup n2/system") != 1 {
+		t.Fatalf("each project gets one base backup:\n%v", w.snapshot())
+	}
+	if !hasStep(serverMove(t, w), "base-backups") {
+		t.Fatal("the step did not end")
+	}
+}
+
+// A project restored from the archive says so in the announcement: its data loss is the owner's to know.
+func TestTheAnnouncementNamesTheProjectsRestoredFromTheArchive(t *testing.T) {
+	w := serverWorld(t)
+	org, _ := w.reg.GetOrganization(w.ctx, "acme")
+	must(t, w.reg.CreateProject(w.ctx, &registry.Project{Ref: refC, OrgID: org.ID, Name: "c", Status: registry.StatusActiveHealthy}))
+	w.prim["n1/"+refC] = &primState{running: true, healthy: true}
+	w.lsn[refC] = "0/9000060"
+	if _, err := w.orch().FailoverServer(w.ctx, ServerOptions{RestoreMissing: true}); err != nil {
+		t.Fatal(err)
+	}
+	if d := w.alerts[0].Detail; w.alerts[0].Kind != alerts.KindFailoverStarted || !strings.Contains(d, refC) || !strings.Contains(d, "archive_timeout") {
+		t.Fatalf("announcement: %+v", w.alerts[0])
 	}
 }

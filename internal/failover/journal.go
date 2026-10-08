@@ -217,8 +217,12 @@ func (j *journal) writeFileLocked() error {
 	return writeStateFile(j.file, st)
 }
 
-func writeStateFile(path string, st stateFile) error {
-	b, err := json.MarshalIndent(st, "", "  ")
+func writeStateFile(path string, st stateFile) error { return writeJSONFile(path, st) }
+
+// writeJSONFile writes v to path, 0600, through a temporary file and a rename, so that a reader
+// sees the old file or the new one.
+func writeJSONFile(path string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -267,7 +271,8 @@ func readStateFile(path string) (*stateFile, error) {
 	return &st, nil
 }
 
-// findServerMove returns the newest server move to the node at the epoch that is not done or aborted, or nil.
+// findServerMove returns the newest server move to the node at the epoch, or nil. A server move
+// that was adopted into the registry carries its epoch, which no other move of that node has.
 func findServerMove(ctx context.Context, st Store, to string, epoch int64) (*registry.Move, error) {
 	ms, err := st.ListMoves(ctx, "", 100)
 	if err != nil {

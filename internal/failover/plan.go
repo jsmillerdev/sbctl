@@ -205,7 +205,7 @@ func (o *Orchestrator) planProject(ctx context.Context, opts ProjectOptions) (*P
 	switch {
 	case herr != nil:
 		pl.Kind = string(registry.MoveFailover)
-		pl.Checks = append(pl.Checks, hard(fail("home answers", fmt.Sprintf("%s does not answer (%v): that is a node failure, run supavise failover on a survivor", from.Name, herr))))
+		pl.Checks = append(pl.Checks, hard(fail("home answers", fmt.Sprintf("%s does not answer (%v): that is a node failure, %s", from.Name, herr, o.nodeFailureAdvice(from)))))
 	case healthy:
 		pl.Kind = string(registry.MoveSwitchover)
 		pl.Checks = append(pl.Checks, advice("primary", "healthy: a switchover, the old primary stops cleanly and becomes a replica"))
@@ -218,6 +218,16 @@ func (o *Orchestrator) planProject(ctx context.Context, opts ProjectOptions) (*P
 		return nil, nil, err
 	}
 	return pl, run, nil
+}
+
+// nodeFailureAdvice says what an operator does about a project whose home node is down. Only the
+// server failover fences a node, and it moves only the projects homed on the old leader; a
+// follower's projects have no move that covers them.
+func (o *Orchestrator) nodeFailureAdvice(home registry.Node) string {
+	if l, ok := o.d.Members.Leader(); ok && l.ID == home.ID {
+		return "run supavise failover on a survivor"
+	}
+	return fmt.Sprintf("and %s does not lead: no move fences a node but the leader's, so the project stays down until %s is back, and its replica keeps the data", home.Name, home.Name)
 }
 
 func (o *Orchestrator) leaderName() string {
@@ -476,9 +486,12 @@ func (o *Orchestrator) failoverChecks(ctx context.Context, leader, to registry.N
 	return cs
 }
 
-// leaderAlive asks the leader over the mesh. A leader that is this very node, or that has no mesh
-// to be asked over (a test), is alive.
+// leaderAlive asks the leader over the mesh. A leader that is this very node is alive, and a node
+// cannot ask itself over the mesh; a leader with no mesh to be asked over (a test) is taken as down.
 func (o *Orchestrator) leaderAlive(ctx context.Context, leader registry.Node) bool {
+	if leader.ID == o.self().ID {
+		return true
+	}
 	if o.d.Peers == nil {
 		return false
 	}
@@ -606,7 +619,9 @@ func (o *Orchestrator) planProjects(ctx context.Context, pl *Plan, run *serverRu
 	case len(without) > 0 && opts.RestoreMissing:
 		pl.Checks = append(pl.Checks, advice("projects without a replica", fmt.Sprintf("%d: %s will be restored from the archive (data loss up to archive_timeout)", len(without), listRefs(without))))
 	case len(without) > 0:
-		pl.Checks = append(pl.Checks, fail("projects without a replica", fmt.Sprintf("%d: %s (--restore-missing builds their standby from the archive, with data loss up to archive_timeout)", len(without), listRefs(without))))
+		// Hard: --force does not skip them. A project with no replica would stay homed on the old
+		// leader, which is stopped, and the move would report success.
+		pl.Checks = append(pl.Checks, hard(fail("projects without a replica", fmt.Sprintf("%d: %s (--restore-missing builds their standby from the archive, with data loss up to archive_timeout)", len(without), listRefs(without)))))
 	}
 	if len(skipped) > 0 {
 		pl.Notes = append(pl.Notes, fmt.Sprintf("%d branch project(s) have no replica and stay on %s: %s", len(skipped), run.from.Name, listRefs(skipped)))

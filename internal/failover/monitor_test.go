@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,7 +186,7 @@ func TestAutoModeDowngradesToManualWhenTheProbeFailsAndSaysSo(t *testing.T) {
 	// One alert, however many looks: the state flipped once.
 	n := 0
 	for _, a := range m.alerts {
-		if a.Kind == alerts.KindFailoverFailed && a.Title == "Automatic failover is off" {
+		if a.Kind == alerts.KindFailoverAutoOff && a.Title == "Automatic failover is off" && !a.Resolved {
 			n++
 		}
 	}
@@ -201,6 +202,11 @@ func TestAutoModeDowngradesToManualWhenTheProbeFailsAndSaysSo(t *testing.T) {
 	m.mon.Tick(m.ctx)
 	if reason := m.o.autoOff(); reason != "" {
 		t.Fatalf("still off: %q", reason)
+	}
+	// It says so: the condition has a recovery message, and it is not a announcement of a move.
+	last := m.alerts[len(m.alerts)-1]
+	if last.Kind != alerts.KindFailoverAutoOff || !last.Resolved || last.Key != "failover/auto-off" {
+		t.Fatalf("the last alert: %+v", last)
 	}
 }
 
@@ -252,7 +258,7 @@ func TestProjectModeWaitsForTheGracePeriodAndThenFailsTheProjectOver(t *testing.
 		t.Fatalf("decision: %+v\n%v", d, m.snapshot())
 	}
 	// Failed over, not switched over: the old primary was fenced, nothing was stopped cleanly.
-	m.assertOrder("fence n1 epoch=1 ref="+refA, "promote n2/"+idAN2, "registry.SetProjectNode "+refA+" n2 1")
+	m.assertOrder("local.stop "+refA, "promote n2/"+idAN2, "registry.SetProjectNode "+refA+" n2 1")
 	m.assertNever("stop n1/")
 	if p := projectOf(t, m.world, refA); p.NodeID != "n2" {
 		t.Fatalf("project: %+v", p)
@@ -358,4 +364,104 @@ func TestServerModeAlsoWatchesTheProjectsOfTheLeader(t *testing.T) {
 	if d := m.mon.Tick(m.ctx); d.Action != "project" || d.Ref != refB {
 		t.Fatalf("decision: %+v", d)
 	}
+}
+
+// The plan pings the leader once more. A leader that answers by then is not stopped by a monitor that
+// saw it silent a moment ago: the plan would be a switchover, which quiesces and stops it cleanly.
+func TestAFollowerThatSeesTheLeaderAnswerWhilePlanningDoesNotStopIt(t *testing.T) {
+	m := newMonitorRig(t, config.FailoverServer)
+	m.open()
+	m.world.afterEvent("provider.peerstate", func() {
+		m.world.mu.Lock()
+		delete(m.world.down, "n1")
+		m.world.mu.Unlock()
+	})
+	d := m.mon.Tick(m.ctx)
+	if d.Action != "none" || !strings.Contains(d.Reason, "answers again") {
+		t.Fatalf("decision: %+v\n%v", d, m.snapshot())
+	}
+	for _, e := range []string{"quiesce", "stop n1", "provider.fence", "marker", "promote"} {
+		m.assertNever(e)
+	}
+}
+
+// With three nodes every follower reaches the gates. The first in line (by node id) acts at the
+// grace period; the next waits one more.
+func TestFollowersTakeTurnsAndTheFirstInLineActsAtTheGracePeriod(t *testing.T) {
+	m := newMonitorRig(t, config.FailoverServer)
+	m.addNode3()
+	m.open()
+	if d := m.mon.Tick(m.ctx); d.Action != "server" || d.Err != nil {
+		t.Fatalf("n2 is first in line: %+v\n%v", d, m.snapshot())
+	}
+}
+
+func TestAFollowerLaterInLineWaitsAnotherGracePeriod(t *testing.T) {
+	m := newMonitorRig(t, config.FailoverServer)
+	m.addNode3()
+	m.setSelf("n3", false)
+	m.open() // two minutes of silence: n3's turn comes at twice the 90 seconds
+	d := m.mon.Tick(m.ctx)
+	if d.Action != "none" || !strings.Contains(d.Reason, "take their turn first") {
+		t.Fatalf("inside the second grace period: %+v", d)
+	}
+	m.advance(70 * time.Second)
+	if d := m.mon.Tick(m.ctx); strings.Contains(d.Reason, "turn") {
+		// n3 holds no standby of the system cluster here, so the plan refuses it; the turn is no longer what stops it.
+		t.Fatalf("after its turn: %+v", d)
+	}
+	for _, e := range []string{"provider.fence", "marker", "promote"} {
+		m.assertNever(e)
+	}
+}
+
+// Only a project that is still unhealthy and has no answering primary at the run is failed over.
+func TestProjectModeDoesNotFenceAProjectThatRecoversBetweenThePlanAndTheRun(t *testing.T) {
+	m := newProjectRig(t, config.FailoverProject)
+	m.world.prim["n1/"+refA].healthy = false
+	m.setStatus(refA, registry.StatusActiveUnhealthy)
+	m.mon.Tick(m.ctx)
+	m.advance(190 * time.Second)
+	// The primary answers again after the monitor's plan and before the move's own.
+	m.o.d.Primaries = &flipPrimaries{inner: m.o.d.Primaries, flipAfter: 1, onFlip: func() {
+		m.world.mu.Lock()
+		m.world.prim["n1/"+refA].healthy = true
+		m.world.mu.Unlock()
+	}}
+	d := m.mon.Tick(m.ctx)
+	if d.Action != "project" || !errors.Is(d.Err, ErrPlanChanged) {
+		t.Fatalf("decision: %+v\n%v", d, m.snapshot())
+	}
+	m.assertNever("local.stop")
+	m.assertNever("promote")
+}
+
+// flipPrimaries answers the first flipAfter health questions as the world does, then runs onFlip.
+type flipPrimaries struct {
+	inner     Primaries
+	flipAfter int
+	onFlip    func()
+	mu        sync.Mutex
+	asked     int
+}
+
+func (f *flipPrimaries) Healthy(ctx context.Context, node, ref string) (bool, string, error) {
+	ok, detail, err := f.inner.Healthy(ctx, node, ref)
+	f.mu.Lock()
+	f.asked++
+	flip := f.asked == f.flipAfter
+	f.mu.Unlock()
+	if flip {
+		f.onFlip()
+	}
+	return ok, detail, err
+}
+func (f *flipPrimaries) Stop(ctx context.Context, node, ref string) (string, error) {
+	return f.inner.Stop(ctx, node, ref)
+}
+func (f *flipPrimaries) Start(ctx context.Context, node, ref string) error {
+	return f.inner.Start(ctx, node, ref)
+}
+func (f *flipPrimaries) SetAside(ctx context.Context, node, ref string, epoch int64) error {
+	return f.inner.SetAside(ctx, node, ref, epoch)
 }

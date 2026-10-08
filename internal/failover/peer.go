@@ -253,7 +253,13 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 	}
 	local := o.d.Members.Epoch()
 	paths := o.d.Cfg.Paths()
+	// The stops go on when the caller gives up: the fence is recorded and the launchers are gone by then.
+	ctx := context.WithoutCancel(r.Context())
 	if req.Ref != "" {
+		if !fenced.ValidRef(req.Ref) {
+			writePeerError(w, http.StatusBadRequest, "bad_request", "not a project ref: "+req.Ref)
+			return
+		}
 		// A project fence runs in the current epoch, and only the leader asks for it.
 		if req.Epoch < local {
 			writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local})
@@ -262,14 +268,12 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 		if !o.callerLeads(w, peer) {
 			return
 		}
-		stopped, err := o.fencePrimaries(r.Context(), []string{req.Ref}, func() error {
-			return fenced.WriteProject(paths, fenced.Record{Epoch: req.Epoch, Leader: req.Leader, Ref: req.Ref, Reason: reasonOf(req), At: o.d.Now().UTC()})
-		})
+		resp, err := o.fenceProjectHere(ctx, req)
 		if err != nil {
 			writePeerError(w, http.StatusInternalServerError, "fence_failed", err.Error())
 			return
 		}
-		writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local, Fenced: true, Stopped: stopped})
+		writePeerJSON(w, http.StatusOK, resp)
 		return
 	}
 	if req.Epoch <= local {
@@ -280,20 +284,36 @@ func (o *Orchestrator) handleFence(w http.ResponseWriter, r *http.Request) {
 		writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: local, Fenced: already})
 		return
 	}
-	refs := o.primaryRefs(r.Context())
-	stopped, err := o.fencePrimaries(r.Context(), refs, func() error {
+	refs := o.primaryRefs(ctx)
+	stopped, err := o.fencePrimaries(ctx, refs, func() error {
 		return fenced.WriteNode(paths, fenced.Record{Epoch: req.Epoch, Leader: req.Leader, Reason: reasonOf(req), At: o.d.Now().UTC()})
 	})
 	if err != nil {
 		writePeerError(w, http.StatusInternalServerError, "fence_failed", err.Error())
 		return
 	}
-	o.alert(r.Context(), alerts.Event{
+	o.alert(ctx, alerts.Event{
 		Kind: alerts.KindFenced, Severity: alerts.SeverityCritical, Title: "This node was fenced",
 		Detail: fmt.Sprintf("Node %s leads at epoch %d and asked this node to stop acting as a primary. No cluster starts as a primary here until `supavise node rejoin` rebuilds it as a follower.", req.Leader, req.Epoch),
 		Key:    "fenced",
 	})
 	writePeerJSON(w, http.StatusOK, peerapi.FenceResponse{Epoch: req.Epoch, Fenced: true, Stopped: stopped})
+}
+
+// fenceProjectHere records the fence of one project's primary on this node, then removes its
+// launcher and stops it. The leader calls it for a project that is homed on the leader itself; a
+// node cannot ask itself over the mesh.
+func (o *Orchestrator) fenceProjectHere(ctx context.Context, req FenceCall) (peerapi.FenceResponse, error) {
+	if o.d.LocalPrimaries == nil {
+		return peerapi.FenceResponse{}, errors.New("this node cannot stop a primary")
+	}
+	stopped, err := o.fencePrimaries(ctx, []string{req.Ref}, func() error {
+		return fenced.WriteProject(o.d.Cfg.Paths(), fenced.Record{Epoch: req.Epoch, Leader: req.Leader, Ref: req.Ref, Reason: reasonOf(req), At: o.d.Now().UTC()})
+	})
+	if err != nil {
+		return peerapi.FenceResponse{}, err
+	}
+	return peerapi.FenceResponse{Epoch: o.d.Members.Epoch(), Fenced: true, Stopped: stopped}, nil
 }
 
 func reasonOf(req FenceCall) string {
@@ -391,7 +411,17 @@ func (o *Orchestrator) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 		writePeerError(w, http.StatusNotImplemented, "unsupported", "this node cannot stop a primary")
 		return
 	}
-	res, err := o.quiesceLocal(r.Context(), req)
+	// A quiesce is not undone by a caller that gives up: the record is what a retry and the undo go by.
+	rec, err := o.currentQuiesce()
+	switch {
+	case err != nil:
+		writePeerError(w, http.StatusInternalServerError, "quiesce_failed", err.Error())
+		return
+	case rec != nil && !rec.matches(req):
+		writePeerError(w, http.StatusConflict, "quiesce_pending", fmt.Sprintf("a switchover to %s at epoch %d is waiting; its survivor continues or undoes it", rec.To, rec.Epoch))
+		return
+	}
+	res, err := o.quiesceLocal(context.WithoutCancel(r.Context()), req, rec)
 	if err != nil {
 		writePeerError(w, http.StatusInternalServerError, "quiesce_failed", err.Error())
 		return
@@ -403,33 +433,38 @@ func (o *Orchestrator) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 // pooler let go first), the shared services and last the system cluster. The daemon, and the WAL
 // relay in it, keeps running: a cluster that cannot archive its last segments cannot finish
 // its shutdown, and the survivor replays the archive up to these positions.
-func (o *Orchestrator) quiesceLocal(ctx context.Context, req QuiesceRequest) (QuiesceResult, error) {
-	st := o.store()
-	self := o.self()
-	m := registry.Maintenance{Node: self.ID, Until: o.d.Now().Add(maintenanceTTL), Reason: maintenanceReason(req.To)}
-	if err := st.SetMaintenance(ctx, m); err != nil {
-		return QuiesceResult{}, fmt.Errorf("announcing maintenance: %w", err)
-	}
-	ps, err := st.ListProjects(ctx)
-	if err != nil {
-		return QuiesceResult{}, fmt.Errorf("listing projects: %w", err)
+//
+// rec is the record of an earlier try of the same request, nil at the first one. The stops are safe
+// to repeat (a stopped cluster answers with its checkpoint), and a try that finds the record
+// complete answers from it, because the registry it would list the projects from is stopped.
+func (o *Orchestrator) quiesceLocal(ctx context.Context, req QuiesceRequest, rec *quiesceRecord) (QuiesceResult, error) {
+	var err error
+	switch {
+	case rec == nil:
+		if rec, err = o.startQuiesce(ctx, req); err != nil {
+			return QuiesceResult{}, err
+		}
+	case rec.LSNs != nil:
+		return QuiesceResult{LSNs: rec.LSNs}, nil
+	case !rec.Announced:
+		m := registry.Maintenance{Node: o.self().ID, Until: o.d.Now().Add(maintenanceTTL), Reason: rec.Reason}
+		if err := o.store().SetMaintenance(ctx, m); err != nil {
+			return QuiesceResult{}, fmt.Errorf("announcing maintenance: %w", err)
+		}
 	}
 	res := QuiesceResult{LSNs: map[string]string{}}
 	var mu sync.Mutex
 	var g errgroup.Group
 	g.SetLimit(quiesceParallel)
-	for _, p := range ps {
-		if p.Ref == config.SystemRef || p.NodeID != self.ID {
-			continue
-		}
+	for _, ref := range rec.Refs {
 		g.Go(func() error {
-			o.quiesceTenant(ctx, p.Ref)
-			lsn, err := o.d.LocalPrimaries.Stop(ctx, p.Ref)
+			o.quiesceTenant(ctx, ref)
+			lsn, err := o.d.LocalPrimaries.Stop(ctx, ref)
 			if err != nil {
-				return fmt.Errorf("stopping %s: %w", p.Ref, err)
+				return fmt.Errorf("stopping %s: %w", ref, err)
 			}
 			mu.Lock()
-			res.LSNs[p.Ref] = lsn
+			res.LSNs[ref] = lsn
 			mu.Unlock()
 			return nil
 		})
@@ -447,6 +482,10 @@ func (o *Orchestrator) quiesceLocal(ctx context.Context, req QuiesceRequest) (Qu
 		return QuiesceResult{}, fmt.Errorf("stopping the system cluster: %w", err)
 	}
 	res.LSNs[config.SystemRef] = lsn
+	rec.LSNs = res.LSNs
+	if err := o.saveQuiesce(rec); err != nil {
+		return QuiesceResult{}, fmt.Errorf("recording where each cluster stopped: %w", err)
+	}
 	return res, nil
 }
 
@@ -481,16 +520,22 @@ func (o *Orchestrator) handleResume(w http.ResponseWriter, r *http.Request) {
 		writePeerError(w, http.StatusNotImplemented, "unsupported", "this node cannot start a primary")
 		return
 	}
-	// Only the node a quiesce was announced for may undo it.
-	cl, err := o.store().GetCluster(r.Context())
-	if err != nil || cl.Maintenance.Node != o.self().ID || cl.Maintenance.Reason != maintenanceReason(peer.Node) {
-		writePeerError(w, http.StatusConflict, "no_quiesce", "no switchover to that node is waiting")
-		return
-	}
-	if err := o.resumeLocal(r.Context()); err != nil {
+	// Only the node a quiesce was made for may undo it. The record is a file: the registry is the
+	// system cluster this very quiesce stopped.
+	rec, err := o.currentQuiesce()
+	if err != nil {
 		writePeerError(w, http.StatusInternalServerError, "resume_failed", err.Error())
 		return
 	}
+	if rec == nil || rec.To != peer.Node {
+		writePeerError(w, http.StatusConflict, "no_quiesce", "no switchover to that node is waiting")
+		return
+	}
+	if err := o.resumeLocal(context.WithoutCancel(r.Context())); err != nil {
+		writePeerError(w, http.StatusInternalServerError, "resume_failed", err.Error())
+		return
+	}
+	o.clearQuiesce()
 	writePeerJSON(w, http.StatusOK, nil)
 }
 
@@ -553,6 +598,10 @@ func (o *Orchestrator) handlePrimary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !o.callerLeads(w, peer) {
+		return
+	}
+	if !fenced.ValidRef(ref) {
+		writePeerError(w, http.StatusBadRequest, "bad_request", "not a project ref: "+ref)
 		return
 	}
 	if local := o.d.Members.Epoch(); req.Epoch < local {

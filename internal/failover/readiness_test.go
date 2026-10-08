@@ -137,3 +137,22 @@ func TestReadinessShowsWhyAutomaticModeIsOff(t *testing.T) {
 		t.Fatalf("notes: %v", r.Notes)
 	}
 }
+
+// The readiness is asked on the leader (the API serves it there). The leader is this node and cannot
+// ping itself over the mesh; it answers, so a failover would be a switchover, which needs no fencer.
+func TestReadinessOnTheLeaderOfAClusterWithoutAFencerIsReady(t *testing.T) {
+	w := newWorld(t) // n1 leads and is this node
+	o := w.orch(func(d *Deps) { d.Provider = Manual{} })
+	r, err := o.Readiness(w.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Ready || len(r.Blockers) != 0 {
+		t.Fatalf("readiness: %+v", r)
+	}
+	pl, err := o.PlanServer(w.ctx, ServerOptions{To: "n2"})
+	must(t, err)
+	if pl.Kind != "switchover" {
+		t.Fatalf("plan: %+v", pl)
+	}
+}

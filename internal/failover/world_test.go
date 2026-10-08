@@ -54,6 +54,8 @@ type world struct {
 	alerts  []alerts.Event
 	marker  *backup.LeaderMarker
 	markErr error
+	// markerRace, when set, replaces the marker right after the next write.
+	markerRace *backup.LeaderMarker
 	// pingAs, when set, is what every reachable peer answers to a ping.
 	pingAs *peerapi.Ping
 
@@ -677,8 +679,20 @@ func (r *worldReplicas) SetupOn(_ context.Context, ref, node string) error {
 // worldPeers implements Peers.
 type worldPeers world
 
+// errSelf is what the mesh answers for a call to this very node (mesh.ErrNoSession): the orchestrator
+// has to handle itself without the peer API.
+func (w *world) errSelf(node string) error {
+	if node == w.self {
+		return fmt.Errorf("node %s is this node", node)
+	}
+	return nil
+}
+
 func (p *worldPeers) Ping(_ context.Context, node string) (peerapi.Ping, error) {
 	w := (*world)(p)
+	if err := w.errSelf(node); err != nil {
+		return peerapi.Ping{}, err
+	}
 	if err := w.nodeUp(node); err != nil {
 		return peerapi.Ping{}, err
 	}
@@ -696,6 +710,9 @@ func (p *worldPeers) Ping(_ context.Context, node string) (peerapi.Ping, error) 
 
 func (p *worldPeers) Fence(_ context.Context, node string, req FenceCall) (peerapi.FenceResponse, error) {
 	w := (*world)(p)
+	if err := w.errSelf(node); err != nil {
+		return peerapi.FenceResponse{}, err
+	}
 	if err := w.nodeUp(node); err != nil {
 		w.log("fence %s unreachable ref=%s", node, req.Ref)
 		return peerapi.FenceResponse{}, err
@@ -803,6 +820,9 @@ func (m *worldMarker) WriteLeaderMarker(_ context.Context, lm backup.LeaderMarke
 		return backup.ErrMarkerNewer
 	}
 	w.marker = &lm
+	if w.markerRace != nil { // another survivor's write lands after this one: the store ignores conditions
+		w.marker = w.markerRace
+	}
 	return nil
 }
 
@@ -866,6 +886,9 @@ type worldLocal world
 
 func (l *worldLocal) Stop(ctx context.Context, ref string) (string, error) {
 	w := (*world)(l)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := w.do("local.stop %s", ref); err != nil {
 		return "", err
 	}

@@ -202,37 +202,56 @@ func (o *Orchestrator) demoteOldLeader(ctx context.Context, j *journal, run *ser
 }
 
 // baseBackups takes a base backup of the system project and of each project that was promoted, on
-// its new timeline. A failure is a warning in the log: the projects run, and their backup timers
-// take the next one.
+// its new timeline, once per project: a project that finishes on a later --resume gets its own
+// then, as base-backup:<ref>. A failure is a warning in the log: the projects run, and their
+// backup timers take the next one. "base-backups" ends the step when every project has been
+// promoted and had its turn.
 func (o *Orchestrator) baseBackups(ctx context.Context, j *journal, run *serverRun, rec serverPlanRecord) {
 	if j.has("base-backups") || o.d.Backups == nil {
 		return
 	}
 	type target struct{ ref, node string }
-	targets := []target{{config.SystemRef, run.to.ID}}
-	for _, ch := range rec.Projects {
-		if ch.Paused || !j.has("p:"+ch.Ref+":done") {
-			continue
-		}
-		targets = append(targets, target{ch.Ref, ch.Node})
+	var targets []target
+	if !j.has("base-backup:" + config.SystemRef) {
+		targets = append(targets, target{config.SystemRef, run.to.ID})
 	}
-	var mu sync.Mutex
-	var warned []string
+	complete := true
+	for _, ch := range rec.Projects {
+		switch {
+		case ch.Paused:
+		case !j.has("p:" + ch.Ref + ":done"):
+			complete = false
+		case !j.has("base-backup:" + ch.Ref):
+			targets = append(targets, target{ch.Ref, ch.Node})
+		}
+	}
 	var g errgroup.Group
 	g.SetLimit(backupParallel)
 	for _, t := range targets {
 		g.Go(func() error {
+			detail := "taken"
 			if _, err := o.d.Backups.BaseBackup(ctx, t.node, t.ref, peerapi.BackupRequest{Epoch: run.epoch, Reason: "failover"}); err != nil {
-				mu.Lock()
-				warned = append(warned, fmt.Sprintf("%s (%v)", t.ref, err))
-				mu.Unlock()
+				detail = "warning: " + err.Error()
 			}
+			_ = j.record(ctx, "base-backup:"+t.ref, detail)
 			return nil
 		})
 	}
 	_ = g.Wait()
+	if !complete {
+		return
+	}
+	var warned []string
+	taken := 0
+	for ref, d := range j.withPrefix("base-backup:") {
+		if rest, ok := strings.CutPrefix(d, "warning: "); ok {
+			warned = append(warned, fmt.Sprintf("%s (%s)", ref, rest))
+		} else {
+			taken++
+		}
+	}
 	sort.Strings(warned)
-	detail := fmt.Sprintf("%d taken", len(targets)-len(warned))
+	detail := fmt.Sprintf("%d taken", taken)
 	if len(warned) > 0 {
 		detail = "warning: no base backup on the new timeline for " + strings.Join(warned, ", ") + "; their backup timers take the next one"
 	}

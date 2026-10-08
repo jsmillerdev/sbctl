@@ -218,6 +218,34 @@ func TestFailoverResumeSkipsTheLagCheckLikeTheDaemon(t *testing.T) {
 	}
 }
 
+// The daemon is told which plan the operator saw, so that it refuses a run that has become another.
+func TestFailoverRunsOnlyThePlanThatWasShown(t *testing.T) {
+	f := &fakeFailover{plan: goodPlan(), move: doneMove()}
+	withFailover(t, f)
+	if _, err := run(t, "failover", "--yes"); err != nil {
+		t.Fatal(err)
+	}
+	if f.gotSrv.ExpectKind != f.plan.Kind || f.gotSrv.ExpectEpoch != f.plan.Epoch || f.plan.Kind == "" || f.plan.Epoch == 0 {
+		t.Fatalf("the run was not tied to the plan %+v: %+v", f.plan, f.gotSrv)
+	}
+	// A resume continues the move that exists; its plan is not the one this run would make.
+	if _, err := run(t, "failover", "--resume", "--yes"); err != nil {
+		t.Fatal(err)
+	}
+	if f.gotSrv.ExpectKind != "" || f.gotSrv.ExpectEpoch != 0 {
+		t.Fatalf("a resume was tied to a plan: %+v", f.gotSrv)
+	}
+	pf := &fakeFailover{plan: &failover.Plan{Kind: "failover", Ref: "aaaaaaaaaaaaaaaaaaaa", Epoch: 1,
+		Checks: []failover.Check{{Name: "replica", OK: true, Blocking: true}}}, move: doneMove()}
+	withFailover(t, pf)
+	if _, err := run(t, "projects", "failover", "aaaaaaaaaaaaaaaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+	if pf.gotProj.ExpectKind != "failover" {
+		t.Fatalf("project options: %+v", pf.gotProj)
+	}
+}
+
 func TestFailoverReportsAMoveThatStopped(t *testing.T) {
 	mv := doneMove()
 	mv.State = registry.MoveFailed

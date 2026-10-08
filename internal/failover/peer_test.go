@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/supavise/supavise/internal/alerts"
@@ -24,6 +25,12 @@ import (
 // serve sends a request to the handler of pattern as the peer node, and decodes the answer.
 func serve(t *testing.T, o *Orchestrator, pattern, path string, peer string, body any, out any) *httptest.ResponseRecorder {
 	t.Helper()
+	return serveWith(t, context.Background(), o, pattern, path, peer, body, out)
+}
+
+// serveWith is serve for a request that carries ctx, which a caller that gives up cancels.
+func serveWith(t *testing.T, ctx context.Context, o *Orchestrator, pattern, path string, peer string, body any, out any) *httptest.ResponseRecorder {
+	t.Helper()
 	mux := mesh.NewMux()
 	for p, h := range o.PeerHandlers() {
 		mux.Handle(p, h)
@@ -33,7 +40,7 @@ func serve(t *testing.T, o *Orchestrator, pattern, path string, peer string, bod
 		must(t, json.NewEncoder(&rd).Encode(body))
 	}
 	method, _, _ := strings.Cut(pattern, " ")
-	req := httptest.NewRequest(method, path, &rd)
+	req := httptest.NewRequest(method, path, &rd).WithContext(ctx)
 	if peer != "" {
 		req = req.WithContext(mesh.WithPeer(req.Context(), mesh.Peer{Node: peer}))
 	}
@@ -209,6 +216,36 @@ func TestNodeFenceWithoutARegistryFencesWhatHasALauncher(t *testing.T) {
 	}
 }
 
+// deadStore is the registry of a node whose system cluster has stopped: every question fails.
+type deadStore struct{ Store }
+
+var errRegistryDown = errors.New("connection refused")
+
+func (deadStore) GetCluster(context.Context) (*registry.Cluster, error) { return nil, errRegistryDown }
+func (deadStore) ListProjects(context.Context) ([]registry.Project, error) {
+	return nil, errRegistryDown
+}
+func (deadStore) ListNodes(context.Context) ([]registry.Node, error) { return nil, errRegistryDown }
+func (deadStore) SetMaintenance(context.Context, registry.Maintenance) error {
+	return errRegistryDown
+}
+
+// registryGoneWithTheSystemCluster makes the world's registry fail from the moment the system
+// cluster stops until it starts again, which is what the leader's own registry does.
+func registryGoneWithTheSystemCluster(w *world) func(d *Deps) {
+	var down atomic.Bool
+	w.afterEvent("local.stop system", func() { down.Store(true) })
+	w.afterEvent("local.start system", func() { down.Store(false) })
+	return func(d *Deps) {
+		d.Store = func() Store {
+			if down.Load() {
+				return deadStore{}
+			}
+			return &gatedStore{w: w, Registry: w.reg}
+		}
+	}
+}
+
 type brokenStore struct{ Store }
 
 func (brokenStore) ListProjects(context.Context) ([]registry.Project, error) {
@@ -238,6 +275,88 @@ func TestQuiesceStopsEverythingInOrderAndReportsWhereEachStopped(t *testing.T) {
 	cl, _ := w.reg.GetCluster(w.ctx)
 	if !cl.Maintenance.Active(w.now()) || cl.Maintenance.Node != "n1" || cl.Maintenance.Reason != "switchover to n2" {
 		t.Fatalf("maintenance: %+v", cl.Maintenance)
+	}
+}
+
+// The leader's registry is the system cluster that the quiesce stops. A survivor that asks again
+// (it crashed before it recorded the answer) is answered from the record the leader keeps in a file,
+// and the undo is authorized from the same file.
+func TestAQuiesceIsRepeatableAndUndoableAfterTheRegistryStopped(t *testing.T) {
+	w := newWorld(t)
+	o := w.orch(registryGoneWithTheSystemCluster(w))
+	var first, again QuiesceResult
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, &first); rec.Code != http.StatusOK || len(first.LSNs) != 3 {
+		t.Fatalf("first: %d %s", rec.Code, rec.Body)
+	}
+	if _, err := o.store().GetCluster(w.ctx); err == nil {
+		t.Fatal("the registry should be down: the system cluster stopped")
+	}
+
+	// Asked again, it answers from the record and stops nothing a second time.
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, &again); rec.Code != http.StatusOK {
+		t.Fatalf("again: %d %s", rec.Code, rec.Body)
+	}
+	for ref, lsn := range first.LSNs {
+		if again.LSNs[ref] != lsn {
+			t.Errorf("%s: %q, then %q", ref, lsn, again.LSNs[ref])
+		}
+	}
+	if n := w.count("local.stop system"); n != 1 {
+		t.Fatalf("the system cluster was stopped %d times", n)
+	}
+	// Another switchover is turned away while this one waits.
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n3", QuiesceRequest{Epoch: 2, To: "n3"}, nil); rec.Code != http.StatusConflict || errorOf(rec).Code != "quiesce_pending" {
+		t.Fatalf("another node: %d %s", rec.Code, rec.Body)
+	}
+
+	// The undo works with the registry down: it is the node the quiesce was for, by the record.
+	if rec := serve(t, o, "POST "+PathResume, PathResume, "n3", struct{}{}, nil); rec.Code != http.StatusConflict {
+		t.Fatalf("resume by another node: %d", rec.Code)
+	}
+	if rec := serve(t, o, "POST "+PathResume, PathResume, "n2", struct{}{}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("resume: %d %s", rec.Code, rec.Body)
+	}
+	w.assertOrder("local.start system", "services.start", "local.start "+refA, "local.start "+refB)
+	if cl, _ := w.reg.GetCluster(w.ctx); cl.Maintenance.Node != "" {
+		t.Fatalf("maintenance is still announced: %+v", cl.Maintenance)
+	}
+	if exists1(quiescePath(w.cfg.Paths())) {
+		t.Fatal("the record outlived the undo")
+	}
+	// With the record gone there is nothing to undo, and a new switchover is accepted.
+	if rec := serve(t, o, "POST "+PathResume, PathResume, "n2", struct{}{}, nil); rec.Code != http.StatusConflict {
+		t.Fatalf("resume of nothing: %d", rec.Code)
+	}
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n3", QuiesceRequest{Epoch: 2, To: "n3"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("a new switchover: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A quiesce that stopped on a project is tried again with the list of projects it made the first
+// time, and maintenance is announced once.
+func TestARetriedQuiesceKeepsItsListAndAnnouncesMaintenanceOnce(t *testing.T) {
+	w := newWorld(t)
+	w.fail("local.stop "+refB, errors.New("shutdown timed out"), 1)
+	o := w.orch()
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, nil); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("first: %d", rec.Code)
+	}
+	var res QuiesceResult
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, &res); rec.Code != http.StatusOK || len(res.LSNs) != 3 {
+		t.Fatalf("retry: %d %s", rec.Code, rec.Body)
+	}
+	if n := w.count("registry.SetMaintenance"); n != 1 {
+		t.Fatalf("maintenance announced %d times", n)
+	}
+}
+
+// A record of an epoch the cluster has reached is over: it does not block the next switchover.
+func TestAStaleQuiesceRecordIsIgnored(t *testing.T) {
+	w := newWorld(t)
+	o := w.orch()
+	must(t, o.saveQuiesce(&quiesceRecord{To: "n3", Epoch: 1, Reason: "switchover to n3", At: w.now(), LSNs: map[string]string{"system": "0/1"}}))
+	if rec := serve(t, o, "POST "+PathQuiesce, PathQuiesce, "n2", QuiesceRequest{Epoch: 2, To: "n2"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 }
 
@@ -331,6 +450,43 @@ func TestPrimaryEndpointsServeOnlyTheLeader(t *testing.T) {
 	w.fail("local.stop "+refB, errors.New("boom"), -1)
 	if rec := serve(t, o, "POST "+PathPrimary, path(refB, OpStop), "n1", PrimaryCall{Epoch: 1}, nil); rec.Code != http.StatusInternalServerError || !strings.Contains(errorOf(rec).Message, "boom") {
 		t.Errorf("an error: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A ref from a peer builds paths (the launcher, the fence record, the set-aside data): only a real ref passes.
+func TestARefThatIsNotAProjectRefIsRefusedBeforeItBuildsAPath(t *testing.T) {
+	w := newWorld(t)
+	w.setSelf("n2", false)
+	o := w.orch()
+	for _, ref := range []string{"../etc", "UPPERCASEUPPERCASEUP", "short", "aaaaaaaaaaaaaaaaaaaaa"} {
+		rec := serve(t, o, "POST "+peerapi.PathFence, peerapi.PathFence, "n1", FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 1, Leader: "n1"}, Ref: ref}, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("fence of %q: %d %s", ref, rec.Code, rec.Body)
+		}
+	}
+	for _, ref := range []string{"UPPERCASEUPPERCASEUP", "short"} {
+		rec := serve(t, o, "POST "+PathPrimary, PrimaryPath(ref, OpStop), "n1", PrimaryCall{Epoch: 1}, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("stop of %q: %d %s", ref, rec.Code, rec.Body)
+		}
+	}
+	if w.has("local.") {
+		t.Fatalf("a bad ref reached the plane:\n%v", w.snapshot())
+	}
+}
+
+// The caller of a fence may give up after its 20 seconds; the launchers are gone and the record is
+// written by then, so the stops go on.
+func TestTheStopsOfAFenceOutliveACallerThatGaveUp(t *testing.T) {
+	w := newWorld(t)
+	launcher(t, w, refA)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var resp peerapi.FenceResponse
+	rec := serveWith(t, ctx, w.orch(), "POST "+peerapi.PathFence, peerapi.PathFence, "n2",
+		FenceCall{FenceRequest: peerapi.FenceRequest{Epoch: 2, Leader: "n2"}}, &resp)
+	if rec.Code != http.StatusOK || !resp.Fenced || !w.has("local.stop "+refA) {
+		t.Fatalf("%d %s\n%v", rec.Code, rec.Body, w.snapshot())
 	}
 }
 
@@ -483,6 +639,8 @@ func TestBootCheck(t *testing.T) {
 			mut: func(w *world) { w.setPeerEpoch(0, "n1") }},
 		"neither source reachable": {claims: true,
 			mut: func(w *world) { w.down["n2"] = true; w.markErr = errors.New("store down") }},
+		"a follower that missed a leader change is not fenced for it": {claims: true,
+			mut: func(w *world) { w.setSelf("n2", false); w.setPeerEpoch(2, "n3") }},
 		"an earlier record": {claims: false, fenced: true, why: "peer n2 leads",
 			mut: func(w *world) {
 				must(w.t, fenced.WriteNode(w.cfg.Paths(), fenced.Record{Epoch: 3, Leader: "n2", Reason: "peer n2 leads at epoch 3"}))
@@ -525,6 +683,34 @@ func TestBootCheck(t *testing.T) {
 				t.Fatalf("a node that was not replaced changed: record %+v, stopped %v, alerts %v", rec, stopped, w.alerts)
 			}
 		})
+	}
+}
+
+// A node that cannot write its fence record (a full disk is likely on a node that is failing) still
+// stops its primaries and takes their launchers away.
+func TestFenceSelfStopsThePrimariesEvenWhenTheRecordCannotBeWritten(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	w := bootRig(t)
+	root := w.cfg.Paths().Root
+	must(t, os.Chmod(root, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
+	w.setPeerEpoch(2, "n2")
+	res, err := w.orch().BootCheck(w.ctx, true)
+	if err == nil || !res.Fenced || !strings.Contains(err.Error(), "recording that this node is fenced") {
+		t.Fatalf("result %+v, error %v", res, err)
+	}
+	for _, ref := range []string{config.SystemRef, refA, refB} {
+		if !w.has("local.stop " + ref) {
+			t.Errorf("%s was not stopped", ref)
+		}
+		if exists1(units.FilesFor(w.cfg, units.Spec{Service: config.SvcPostgres, Ref: ref}).Run) {
+			t.Errorf("%s keeps its launcher", ref)
+		}
+	}
+	if k := w.alertKinds(); len(k) != 1 || k[0] != alerts.KindFenced {
+		t.Fatalf("alerts: %v", k)
 	}
 }
 

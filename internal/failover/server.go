@@ -55,7 +55,11 @@ func (o *Orchestrator) FailoverServer(ctx context.Context, opts ServerOptions) (
 		return nil, err
 	}
 	defer release()
+	return o.failoverServer(ctx, opts)
+}
 
+// failoverServer is FailoverServer for a caller that holds the node's move already.
+func (o *Orchestrator) failoverServer(ctx context.Context, opts ServerOptions) (*registry.Move, error) {
 	pl, run, err := o.planServer(ctx, opts)
 	if err != nil {
 		return nil, err
@@ -65,6 +69,9 @@ func (o *Orchestrator) FailoverServer(ctx context.Context, opts ServerOptions) (
 	}
 	if refused := pl.Refused(opts.Force || opts.Resume); len(refused) > 0 {
 		return nil, &RefusedError{Checks: refused, Force: opts.Force}
+	}
+	if opts.ExpectKind != "" && !opts.Resume && (pl.Kind != opts.ExpectKind || pl.Epoch != opts.ExpectEpoch) {
+		return nil, fmt.Errorf("%w: it was a %s at epoch %d and is a %s at epoch %d now", ErrPlanChanged, opts.ExpectKind, opts.ExpectEpoch, pl.Kind, pl.Epoch)
 	}
 	if run.to.ID != o.self().ID {
 		return o.delegateServer(ctx, opts, run)
@@ -81,9 +88,23 @@ func (o *Orchestrator) FailoverServer(ctx context.Context, opts ServerOptions) (
 			return nil, err
 		}
 	}
-	o.announce(ctx, alerts.KindFailoverStarted, alerts.SeverityInfo, j.snapshot(),
-		fmt.Sprintf("Moving the leadership from %s to %s (epoch %d).", run.from.Name, run.to.Name, run.epoch))
+	detail := fmt.Sprintf("Moving the leadership from %s to %s (epoch %d).", run.from.Name, run.to.Name, run.epoch)
+	if restored := restoredRefs(rec); len(restored) > 0 {
+		detail += fmt.Sprintf(" No replica exists for %s: their standbys are built from the archive, with data loss up to archive_timeout.", listRefs(restored))
+	}
+	o.announce(ctx, alerts.KindFailoverStarted, alerts.SeverityInfo, j.snapshot(), detail)
 	return o.endMove(ctx, j, "", o.serverSteps(ctx, j, run, rec))
+}
+
+// restoredRefs are the projects of the plan that get a standby from the archive.
+func restoredRefs(rec serverPlanRecord) []string {
+	var refs []string
+	for _, p := range rec.Projects {
+		if p.Restore {
+			refs = append(refs, p.Ref)
+		}
+	}
+	return refs
 }
 
 // beginServer opens the log in failover.json with the plan as its first step.
@@ -341,6 +362,11 @@ func (o *Orchestrator) writeMarker(ctx context.Context, run *serverRun) (string,
 	err := o.d.Marker.WriteLeaderMarker(ctx, backup.LeaderMarker{Epoch: run.epoch, Leader: run.to.ID, At: o.d.Now().UTC()})
 	switch {
 	case err == nil:
+		// A store that ignores conditional writes (Garage does) lets two survivors both write; the
+		// one whose marker was overwritten sees the other's when it reads back.
+		if m, rerr := o.d.Marker.ReadLeaderMarker(ctx); rerr == nil && m != nil && (m.Epoch > run.epoch || m.Epoch == run.epoch && m.Leader != run.to.ID) {
+			return "", lost
+		}
 		return fmt.Sprintf("epoch %d, leader %s", run.epoch, run.to.ID), nil
 	case errors.Is(err, backup.ErrMarkerNewer):
 		return "", lost
