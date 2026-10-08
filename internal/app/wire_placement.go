@@ -63,7 +63,7 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 
 	agent := placement.NewNodeAgent(placement.AgentOptions{
 		Cfg: w.Cfg, Plane: node.Plane, Registry: node.Registry, Keys: node.Engine.Keys, Members: mem,
-		Seeder: bk.seed, Admit: node.Engine.AdmitReplica, Log: w.Log.With("component", "replica-agent"),
+		Seeder: placement.SeederFrom(bk), Admit: node.Engine.AdmitReplica, Log: w.Log.With("component", "replica-agent"),
 	})
 	agent.Start(ctx)
 	ops := &placement.Ops{Self: self, Agent: agent, Backups: bk, RPC: m, Epoch: mem.Epoch}
@@ -216,13 +216,16 @@ func (l *lazyBackups) get(ctx context.Context) (*backup.Service, error) {
 
 var _ placement.LocalBackups = (*lazyBackups)(nil)
 
-// seed is the lifecycle.ReplicaSeeder of the node: the backup service's SeedReplica.
-func (l *lazyBackups) seed(ctx context.Context, plan lifecycle.ReplicaSeedPlan) error {
+var _ backup.ReplicaSeeder = (*lazyBackups)(nil)
+
+// SeedReplica is the backup service's, which opens on first use; placement.SeederFrom makes the plane's
+// seeder of it.
+func (l *lazyBackups) SeedReplica(ctx context.Context, plan backup.ReplicaSeedPlan) error {
 	s, err := l.get(ctx)
 	if err != nil {
 		return err
 	}
-	return s.SeedReplica(ctx, backup.ReplicaSeedPlan(plan))
+	return s.SeedReplica(ctx, plan)
 }
 
 func (l *lazyBackups) BaseBackupWith(ctx context.Context, ref string, bo backup.BackupOptions) (*registry.Backup, error) {
