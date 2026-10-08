@@ -77,16 +77,18 @@ func newSite(t *testing.T, reg registry.Registry, id string) *site {
 	s.cfg.KeyPath = filepath.Join(root, "etc", "master.key")
 	s.cfg.Domain = "example.test"
 	s.cfg.Backup.Backend = "s3://bucket/prefix"
-	s.cfg.Ports.ReplicaBase = freeWindow(t, 20000, 25000, 8) - 3
-	s.cfg.Ports.ProjectBase = freeWindow(t, 26000, 31000, 8) - 3
-	s.cfg.Ports.SystemPostgres = freeWindow(t, 31000, 32000, 1)
-	s.cfg.Ports.Studio = freeWindow(t, 32000, 32500, 1)
-	s.cfg.Ports.PGMeta = freeWindow(t, 32500, 33000, 1)
-	s.cfg.Ports.Realtime = freeWindow(t, 33000, 33500, 1)
-	s.cfg.Ports.Storage = freeWindow(t, 33500, 34000, 1)
-	s.cfg.Ports.Imgproxy = freeWindow(t, 34000, 34500, 1)
-	s.cfg.Ports.EdgeRuntime = freeWindow(t, 34500, 35000, 1)
-	s.cfg.Listen.Admin = fmt.Sprintf("127.0.0.1:%d", freeWindow(t, 35000, 35500, 1))
+	// Below the kernel's ephemeral range, and apart from the ranges the mesh tests use, so that
+	// test packages running side by side do not take each other's ports.
+	s.cfg.Ports.ReplicaBase = freeWindow(t, 11000, 14000, 8) - 3
+	s.cfg.Ports.ProjectBase = freeWindow(t, 15000, 19000, 8) - 3
+	s.cfg.Ports.SystemPostgres = freeWindow(t, 6000, 6500, 1)
+	s.cfg.Ports.Studio = freeWindow(t, 6500, 7000, 1)
+	s.cfg.Ports.PGMeta = freeWindow(t, 7000, 7500, 1)
+	s.cfg.Ports.Realtime = freeWindow(t, 7500, 8000, 1)
+	s.cfg.Ports.Storage = freeWindow(t, 8000, 8500, 1)
+	s.cfg.Ports.Imgproxy = freeWindow(t, 8500, 9000, 1)
+	s.cfg.Ports.EdgeRuntime = freeWindow(t, 9500, 10000, 1)
+	s.cfg.Listen.Admin = fmt.Sprintf("127.0.0.1:%d", freeWindow(t, 10000, 10500, 1))
 	var err error
 	if s.ln, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
 		t.Fatal(err)

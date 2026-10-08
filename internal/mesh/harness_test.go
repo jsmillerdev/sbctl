@@ -126,9 +126,6 @@ type harness struct {
 
 func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-// freePort finds a loopback port nothing listens on.
-func freePort(t testing.TB) int { return freePorts(t, 1)[0] }
-
 // freeWindow finds size consecutive loopback ports nothing listens on, with the lowest between lo and hi.
 func freeWindow(t testing.TB, lo, hi, size int) int {
 	t.Helper()
@@ -155,26 +152,6 @@ func freeWindow(t testing.TB, lo, hi, size int) int {
 	return 0
 }
 
-// freePorts finds n different loopback ports nothing listens on: it holds them all until it has
-// them all, because asking for one at a time can return the same port twice.
-func freePorts(t testing.TB, n int) []int {
-	t.Helper()
-	var lns []net.Listener
-	var ports []int
-	for range n {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		lns = append(lns, ln)
-		ports = append(ports, ln.Addr().(*net.TCPAddr).Port)
-	}
-	for _, ln := range lns {
-		ln.Close()
-	}
-	return ports
-}
-
 // newHarness starts the named nodes (the first is the founder and the leader) sharing one registry,
 // each with a manager on a loopback port and its own port plan, so that a forwarder of one node
 // does not collide with the service of another in the same process.
@@ -190,7 +167,9 @@ func newHarness(t *testing.T, ids ...string) *harness {
 		// The replica range must end below the project range, so each gets a window of its own.
 		n.cfg.Ports.ReplicaBase = freeWindow(t, 20000, 25000, 8) - 3
 		n.cfg.Ports.ProjectBase = freeWindow(t, 26000, 31000, 8) - 3
-		ps := freePorts(t, 7)
+		// Below the kernel's ephemeral range, which a client socket of the test could take later.
+		svc := freeWindow(t, 31000, 32700, 7)
+		ps := []int{svc, svc + 1, svc + 2, svc + 3, svc + 4, svc + 5, svc + 6}
 		for i, p := range []*int{&n.cfg.Ports.Studio, &n.cfg.Ports.PGMeta, &n.cfg.Ports.Realtime, &n.cfg.Ports.Storage, &n.cfg.Ports.Imgproxy, &n.cfg.Ports.EdgeRuntime} {
 			*p = ps[i]
 		}
