@@ -285,6 +285,38 @@ func TestInjectedFaultsRunOutAndFiltersWork(t *testing.T) {
 	}
 }
 
+// An applied fault is an answer lost on the way: the call took effect and the client saw an error.
+func TestAppliedFaultTakesEffect(t *testing.T) {
+	fake := awsfake.New(t)
+	seedPair(fake, awsfake.Instance{})
+	cfg := fake.Config()
+	cfg.MaxAttempts = 1
+	c, err := awsapi.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.Inject("ec2", "StopInstances", awsfake.Fault{Status: 503, Code: "InternalError", Message: "lost", Times: 2, Applied: true})
+	stop := awsapi.StopInstancesInput{InstanceIDs: []string{"i-0peer"}}
+
+	stop.DryRun = true
+	if _, err := c.EC2.StopInstances(ctx, stop); !awsapi.IsCode(err, "InternalError") {
+		t.Errorf("dry run: %v", err)
+	}
+	if got := fake.InstanceState("i-0peer"); got != "running" {
+		t.Errorf("a dry run with an applied fault changed the state to %s", got)
+	}
+	stop.DryRun = false
+	if _, err := c.EC2.StopInstances(ctx, stop); !awsapi.IsCode(err, "InternalError") {
+		t.Errorf("real call: %v", err)
+	}
+	if got := fake.InstanceState("i-0peer"); got != "stopping" {
+		t.Errorf("the applied fault left the state at %s", got)
+	}
+	if _, err := c.EC2.StopInstances(ctx, stop); err != nil {
+		t.Errorf("after the faults ran out: %v", err)
+	}
+}
+
 func TestPaging(t *testing.T) {
 	fake := awsfake.New(t)
 	for _, id := range []string{"i-1", "i-2", "i-3", "i-4", "i-5"} {

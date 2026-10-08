@@ -285,7 +285,9 @@ func (e *EC2) StopInstances(ctx context.Context, in StopInstancesInput) ([]State
 // the instance's primary interface) or NetworkInterfaceID. PrivateIP picks one of that interface's
 // private addresses; without it the primary one is used, and an Elastic IP already on it is
 // released from it (it stays allocated). With AllowReassociation false the call fails when the
-// Elastic IP is already associated; with true it moves it.
+// Elastic IP is already associated; with true it moves it. A call that had to be sent again
+// counts that failure as success when the Elastic IP is by then on the target the call named: see
+// AssociateAddress.
 type AssociateAddressInput struct {
 	AllocationID       string
 	InstanceID         string
@@ -296,6 +298,13 @@ type AssociateAddressInput struct {
 }
 
 // AssociateAddress returns the id of the new association.
+//
+// A send that reached EC2 but lost its answer is sent again, and with AllowReassociation false the
+// second send meets Resource.AlreadyAssociated, for its own work. So after a send that was
+// repeated, that error is success when DescribeAddresses shows the Elastic IP on the instance or
+// interface the call named, and on PrivateIP when the call gave one (without it, any private
+// address of that instance or interface counts). The association id is the one it has now. An
+// Elastic IP that is somewhere else, and a first send that already meets the error, still fail.
 func (e *EC2) AssociateAddress(ctx context.Context, in AssociateAddressInput) (associationID string, err error) {
 	p := params{}
 	p.set("AllocationId", in.AllocationID)
@@ -306,10 +315,35 @@ func (e *EC2) AssociateAddress(ctx context.Context, in AssociateAddressInput) (a
 	var resp struct {
 		AssociationID string `xml:"associationId"`
 	}
-	if err := e.call(ctx, "AssociateAddress", p, in.DryRun, &resp); err != nil || in.DryRun {
+	sent, err := e.send(ctx, "AssociateAddress", p, in.DryRun, &resp)
+	if err != nil {
+		if sent > 1 && !in.DryRun && IsCode(err, "Resource.AlreadyAssociated") {
+			if id, ok := e.associatedTo(ctx, in); ok {
+				return id, nil
+			}
+		}
 		return "", err
 	}
+	if in.DryRun {
+		return "", nil
+	}
 	return resp.AssociationID, nil
+}
+
+// associatedTo reports whether the Elastic IP of the call is associated with the target the call
+// named, and with which association. Any failure to find out is "no".
+func (e *EC2) associatedTo(ctx context.Context, in AssociateAddressInput) (string, bool) {
+	addrs, err := e.DescribeAddresses(ctx, DescribeAddressesInput{AllocationIDs: []string{in.AllocationID}})
+	if err != nil || len(addrs) != 1 || addrs[0].AssociationID == "" {
+		return "", false
+	}
+	a := addrs[0]
+	if (in.InstanceID != "" && a.InstanceID != in.InstanceID) ||
+		(in.NetworkInterfaceID != "" && a.NetworkInterfaceID != in.NetworkInterfaceID) ||
+		(in.PrivateIP != "" && a.PrivateIP != in.PrivateIP) {
+		return "", false
+	}
+	return a.AssociationID, true
 }
 
 // DisassociateAddressInput names an association, as DescribeAddresses and AssociateAddress give it.
@@ -377,12 +411,18 @@ func (e *EC2) DescribeAddresses(ctx context.Context, in DescribeAddressesInput) 
 // call sends one Query API action and decodes the XML answer into out (nil to ignore it). For a
 // DryRun it maps EC2's answer: DryRunOperation is success, anything else is returned as it is.
 func (e *EC2) call(ctx context.Context, action string, p params, dryRun bool, out any) error {
+	_, err := e.send(ctx, action, p, dryRun, out)
+	return err
+}
+
+// send is call that also returns how many times the request was sent.
+func (e *EC2) send(ctx context.Context, action string, p params, dryRun bool, out any) (int, error) {
 	p.set("Action", action)
 	p.set("Version", ec2Version)
 	if dryRun {
 		p.set("DryRun", "true")
 	}
-	body, err := e.c.do(ctx, apiCall{
+	body, sent, err := e.c.send(ctx, apiCall{
 		service: "ec2", host: "ec2", action: action,
 		header:   http.Header{"Content-Type": {contentForm}},
 		body:     p.encode(),
@@ -390,20 +430,20 @@ func (e *EC2) call(ctx context.Context, action string, p params, dryRun bool, ou
 	})
 	if dryRun {
 		if IsCode(err, "DryRunOperation") {
-			return nil
+			return sent, nil
 		}
-		return err
+		return sent, err
 	}
 	if err != nil {
-		return err
+		return sent, err
 	}
 	if out == nil {
-		return nil
+		return sent, nil
 	}
 	if err := xml.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("aws ec2 %s: unreadable response: %w", action, err)
+		return sent, fmt.Errorf("aws ec2 %s: unreadable response: %w", action, err)
 	}
-	return nil
+	return sent, nil
 }
 
 // params are the form fields of a Query API request.

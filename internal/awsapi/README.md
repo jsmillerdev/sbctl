@@ -45,7 +45,7 @@ Each service has a public endpoint (`https://ec2.<region>.amazonaws.com`, `secre
 | `EC2.DescribeInstances` | Query API | follows result pages; returns state, private and public IP, zone, every network interface with its private IPs (`Primary`, `PublicIP`) and the tags |
 | `EC2.DescribeInstanceStatus` | Query API | `IncludeAll` also lists instances that are not running; system and instance status, scheduled events |
 | `EC2.StopInstances` | Query API | `Force`; returns the state change and does not wait, so the caller polls `DescribeInstances` for `stopped` |
-| `EC2.AssociateAddress` | Query API | by instance or network interface, optionally one `PrivateIP`; `AllowReassociation` is always sent, `false` or `true` |
+| `EC2.AssociateAddress` | Query API | by instance or network interface, optionally one `PrivateIP`; `AllowReassociation` is always sent, `false` or `true`; idempotent across a retry (below) |
 | `EC2.DisassociateAddress` | Query API | by association id |
 | `EC2.DescribeAddresses` | Query API | allocation id, association id, instance, interface, private IP, tags |
 | `SecretsManager.GetSecretValue` | awsJson1.1 | by name or ARN, optional version id or stage; string or binary secrets |
@@ -59,6 +59,8 @@ Every EC2 call that takes `DryRun` asks only whether the call would be allowed, 
 | `DryRunOperation` | `nil`: the call would have succeeded |
 | `UnauthorizedOperation` | an `*Error` for which `IsAccessDenied` is true: the call would be refused |
 | anything else, such as `InvalidInstanceID.NotFound` | that `*Error` |
+
+`AssociateAddress` with `AllowReassociation` false is idempotent across a retry. A send that reached EC2 but lost its answer is sent again and meets `Resource.AlreadyAssociated` for its own work. When the call was sent more than once and `DescribeAddresses` then shows the Elastic IP on the instance or interface it named (and on `PrivateIP`, when it gave one), the call succeeds with the association that exists. An Elastic IP somewhere else, and an `AlreadyAssociated` on the first send, stay errors.
 
 `Instance.State` is EC2's name (`running`, `stopping`, `stopped`, ...). `IMDS.PublicIPv4` returns an empty string for an instance without a public address. `IMDS.Tags` returns an empty map when the instance has no tags or does not expose them in metadata (`InstanceMetadataTags`); a node on a stack without tags reads the same.
 
@@ -97,7 +99,7 @@ fake.Order()                    // ["ec2:DescribeInstances", "ec2:StopInstances"
 | `AddAddress`, `AddressOf` | Elastic IPs and their associations |
 | `AddSecret`, `AddRole`, `AddCredentials` | secrets, roles that `AssumeRole` may assume, further accepted credentials |
 | `SetIMDS`, `IMDS`, `ExpireIMDSTokens` | what the metadata service says (id, region, zone, addresses, tags, role) and its session tokens |
-| `Inject`, `Deny` | an API error for an action, for a number of calls or for all; `Deny` answers the way a role without the permission does, for `DryRun` and real calls alike |
+| `Inject`, `Deny` | an API error for an action, for a number of calls or for all; `Applied` makes an EC2 call take effect before it fails, like an answer lost on the way; `Deny` answers the way a role without the permission does, for `DryRun` and real calls alike |
 | `SetPageSize` | pages of `DescribeInstances` and `DescribeInstanceStatus` |
 
 What it models: `StopInstances` moves a running instance to `stopping`, then to `stopped` after the chosen number of describe polls; `AssociateAddress` moves an Elastic IP, fails with `Resource.AlreadyAssociated` when it is already associated and `AllowReassociation` is false, releases the Elastic IP that was on the same private address (it stays allocated) and drops an auto-assigned public IP when the primary address gets an Elastic IP; `DryRun` checks the permission and changes nothing; describe calls filter on `instance-id`, `instance-state-name`, `private-ip-address`, `ip-address`, `tag:<key>` (instances) and `allocation-id`, `instance-id`, `public-ip`, `tag:<key>` (addresses). Any other filter name is an error, so a typo in a test fails.
@@ -110,6 +112,7 @@ What it does not model: IAM policy evaluation (use `Deny`), tag-scoped resources
 
 - the signer against the cases of AWS's published Signature Version 4 test suite (`aws-sig-v4-test-suite`, query and path normalization, header ordering and trimming, session tokens, form bodies) and the documented IAM `ListUsers` example, including the derived signing key;
 - the exact form body of every EC2, STS and Secrets Manager request, and one signed request's headers;
+- `AssociateAddress` after a lost answer: success on the named target, an error elsewhere, no check on a first answer;
 - replies parsed from XML and JSON fixtures in `testdata/` shaped like the API reference examples;
 - the `DryRun` mapping, error parsing, retries (throttle codes, the jittered schedule and its bounds), a cancelled context and endpoint and region resolution;
 - the credential chain, the cache, the instance-role path and `AWS_EC2_METADATA_DISABLED`;

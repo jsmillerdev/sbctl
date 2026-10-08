@@ -50,6 +50,9 @@ type Fault struct {
 	Message string
 	// Times is how many calls fail; zero means every call.
 	Times int
+	// Applied makes an EC2 call take effect before it fails, like an answer lost on the way: the
+	// client sends the request again and finds the work done. A DryRun call has no effect to apply.
+	Applied bool
 }
 
 type fault struct {
@@ -353,6 +356,11 @@ func contentType(service string) string {
 
 // injected returns the fault that applies to the call, if any, and counts the use.
 func (s *Server) injected(service, action string) (result, bool) {
+	f, hit := s.nextFault(service, action)
+	return fail(f.Status, f.Code, f.Message), hit
+}
+
+func (s *Server) nextFault(service, action string) (Fault, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, f := range s.faults {
@@ -360,9 +368,9 @@ func (s *Server) injected(service, action string) (result, bool) {
 			continue
 		}
 		f.used++
-		return fail(f.Status, f.Code, f.Message), true
+		return f.Fault, true
 	}
-	return result{}, false
+	return Fault{}, false
 }
 
 func esc(s string) string {

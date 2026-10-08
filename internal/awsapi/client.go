@@ -215,13 +215,19 @@ type apiCall struct {
 // Anything else is an *Error. A request that got no answer, a 5xx or a throttle is sent again
 // with a fresh signature, after a jittered wait.
 func (c *core) do(ctx context.Context, call apiCall) ([]byte, error) {
+	body, _, err := c.send(ctx, call)
+	return body, err
+}
+
+// send is do that also returns how many times the request was sent.
+func (c *core) send(ctx context.Context, call apiCall) (body []byte, sent int, err error) {
 	for attempt := 1; ; attempt++ {
 		body, err := c.once(ctx, call)
 		if err == nil || attempt >= c.retry.attempts || !retryable(err) || ctx.Err() != nil {
-			return body, err
+			return body, attempt, err
 		}
 		if werr := c.retry.wait(ctx, attempt); werr != nil {
-			return nil, fmt.Errorf("%w: %w", err, werr)
+			return nil, attempt, fmt.Errorf("%w: %w", err, werr)
 		}
 	}
 }
