@@ -78,7 +78,8 @@ func (c *Controller) RemoveOn(ctx context.Context, node string) error {
 }
 
 // removeNow marks the rows GOING_DOWN and tries each removal once, here. The ones that cannot
-// finish stay GOING_DOWN for the controller to retry.
+// finish stay GOING_DOWN for the controller to retry; so does one a worker is acting on, because
+// the worker may be creating the instance this very moment.
 func (c *Controller) removeNow(ctx context.Context, rows []registry.Replica) error {
 	var pending []string
 	for i := range rows {
@@ -87,7 +88,7 @@ func (c *Controller) removeNow(ctx context.Context, rows []registry.Replica) err
 			continue
 		}
 		r.Status = statusGoingDown
-		if !c.removeOnce(ctx, &r) {
+		if c.isBusy(r.Identifier) || !c.removeOnce(ctx, &r) {
 			pending = append(pending, r.Identifier)
 		}
 	}
@@ -96,6 +97,12 @@ func (c *Controller) removeNow(ctx context.Context, rows []registry.Replica) err
 		return &PendingError{Identifiers: pending}
 	}
 	return nil
+}
+
+func (c *Controller) isBusy(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.busy[id]
 }
 
 // removeStep is the controller's retry of a removal that did not finish.
@@ -207,7 +214,12 @@ func (c *Controller) Restart(ctx context.Context, ref, identifier string) error 
 	s.transient, s.restarting = c.now(), true
 	c.mu.Unlock()
 	epoch, _ := c.leader()
-	bg := context.WithoutCancel(ctx)
+	c.mu.Lock()
+	bg := c.runCtx
+	c.mu.Unlock()
+	if bg == nil { // not running: the call outlives the request that made it
+		bg = context.WithoutCancel(ctx)
+	}
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()

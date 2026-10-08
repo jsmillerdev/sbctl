@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -21,6 +22,7 @@ const (
 	msgNoCapacity    = "Not enough capacity on %s."
 	msgNeedS3        = "Read replicas need S3-compatible backup storage."
 	msgBranch        = "Read replicas are not offered for branches."
+	msgSystem        = "The system project has no read replicas of its own: its standby is made when a server joins."
 	msgNodeNotActive = "The server %s has not finished joining the cluster."
 )
 
@@ -111,6 +113,8 @@ func (c *Controller) setupContext(ctx context.Context, ref string) (*registry.Pr
 		return nil, nil, fmt.Errorf("replicas: project %s: %w", ref, err)
 	}
 	switch {
+	case ref == config.SystemRef:
+		return nil, nil, refuse(msgSystem)
 	case p.Branch != nil:
 		return nil, nil, refuse(msgBranch)
 	case MaxReplicas(p.Class) == 0:

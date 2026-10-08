@@ -277,3 +277,28 @@ func TestRestartNeedsTheNodeOperations(t *testing.T) {
 		t.Fatalf("Restart = %v", err)
 	}
 }
+
+// A replica a worker is acting on is not removed under it: RemoveAll leaves it GOING_DOWN, reports
+// it, and the controller removes it when the worker is done.
+func TestRemoveAllWaitsForABusyWorker(t *testing.T) {
+	e := newEnv(t)
+	r := e.activeReplica()
+	e.ctrl.mu.Lock()
+	e.ctrl.busy[r.Identifier] = true
+	e.ctrl.mu.Unlock()
+	calls := e.nodes.callsMatching("remove")
+	var pe *PendingError
+	if err := e.ctrl.RemoveAll(e.ctx, refA); !errors.As(err, &pe) || len(pe.Identifiers) != 1 {
+		t.Fatalf("RemoveAll = %v", err)
+	}
+	if e.nodes.callsMatching("remove") != calls || e.replica(refA, "n2").Status != statusGoingDown {
+		t.Fatal("removed under a busy worker")
+	}
+	e.ctrl.mu.Lock()
+	delete(e.ctrl.busy, r.Identifier)
+	e.ctrl.mu.Unlock()
+	e.tick(1)
+	if e.hasReplica(refA, "n2") {
+		t.Fatal("not removed after the worker was done")
+	}
+}

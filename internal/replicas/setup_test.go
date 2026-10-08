@@ -18,6 +18,7 @@ func TestSetupRefusals(t *testing.T) {
 		want    string
 	}{
 		{"no server in the region", nil, refA, "sa-east-1", "No Supavise server is joined in sa-east-1."},
+		{"the system project", nil, "system", "eu-west-1", msgSystem},
 		{"a region that is no region", nil, refA, "mars-1", "No Supavise server is joined in mars-1."},
 		{"the only server there is the home", nil, refA, "us-east-1", "Read replicas on the same server as the primary are not offered."},
 		{"a server that is still joining does not count", func(e *env) {

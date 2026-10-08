@@ -389,3 +389,33 @@ func TestHandleReportRecordsOnlyTheNodesOwnInstances(t *testing.T) {
 		t.Fatalf("polled despite a fresh report: %d -> %d", calls, got)
 	}
 }
+
+// A setup that stops moving is nudged: the node is asked for the instance again, which resumes a
+// setup a restart of its daemon interrupted, and not more often than every two minutes.
+func TestSetupNudgesAStalledStep(t *testing.T) {
+	e := newEnv(t)
+	e.nodes.script = func(in *fakeInstance) { in.stopAt = StepInitiated }
+	if err := e.ctrl.SetupOn(e.ctx, refA, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	e.tick(4)
+	id := e.replica(refA, "n2").Identifier
+	if got := e.nodes.callsMatching("ensure n2 " + id); got != 1 {
+		t.Fatalf("ensure calls before the stall: %d", got)
+	}
+	e.clock.Advance(time.Minute)
+	e.tick(1)
+	if got := e.nodes.callsMatching("ensure n2 " + id); got != 1 {
+		t.Fatalf("nudged after a minute: %d", got)
+	}
+	e.clock.Advance(90 * time.Second)
+	e.tick(1)
+	if got := e.nodes.callsMatching("ensure n2 " + id); got != 2 {
+		t.Fatalf("not nudged after two minutes: %d", got)
+	}
+	e.clock.Advance(30 * time.Second)
+	e.tick(1)
+	if got := e.nodes.callsMatching("ensure n2 " + id); got != 2 {
+		t.Fatalf("nudged twice within two minutes: %d", got)
+	}
+}

@@ -109,6 +109,9 @@ type Controller struct {
 	capacityAlerted map[string]bool
 	warned          map[string]bool
 
+	// runCtx is the context of Run while it runs; Restart's background call ends with it.
+	runCtx context.Context
+
 	wg   sync.WaitGroup
 	wake chan struct{}
 }
@@ -185,7 +188,15 @@ func (c *Controller) Run(ctx context.Context) error {
 		c.log.Warn("replicas: cannot follow registry changes, polling instead", "error", err)
 		changes = nil
 	}
-	defer c.wg.Wait()
+	c.mu.Lock()
+	c.runCtx = ctx
+	c.mu.Unlock()
+	defer func() {
+		c.wg.Wait()
+		c.mu.Lock()
+		c.runCtx = nil
+		c.mu.Unlock()
+	}()
 	last := time.Time{}
 	for {
 		if wait := c.minGap() - c.now().Sub(last); wait > 0 {
@@ -269,10 +280,14 @@ func (c *Controller) pass(ctx context.Context) (idle bool) {
 		return false
 	}
 	live := make(map[string]bool, len(rows))
+	status := make(map[string]registry.Status, len(projects))
+	for _, p := range projects {
+		status[p.Ref] = p.Status
+	}
 	for i := range rows {
 		live[rows[i].Identifier] = true
 		if needsWork(&rows[i]) {
-			c.spawn(ctx, rows[i])
+			c.spawn(ctx, rows[i], status[rows[i].Ref])
 		}
 	}
 	c.forget(live)
@@ -297,7 +312,7 @@ func needsWork(r *registry.Replica) bool {
 }
 
 // spawn starts a worker for the replica unless one is running for it.
-func (c *Controller) spawn(ctx context.Context, row registry.Replica) {
+func (c *Controller) spawn(ctx context.Context, row registry.Replica, project registry.Status) {
 	id := row.Identifier
 	c.mu.Lock()
 	if c.busy[id] {
@@ -314,7 +329,7 @@ func (c *Controller) spawn(ctx context.Context, row registry.Replica) {
 			delete(c.busy, id)
 			c.mu.Unlock()
 		}()
-		c.work(ctx, &row)
+		c.work(ctx, &row, project)
 	}()
 }
 
@@ -330,8 +345,9 @@ func (c *Controller) forget(live map[string]bool) {
 }
 
 // work acts on one replica once, whatever the row says is next. The row is the pass's copy:
-// the writes below check that the replica is not being removed.
-func (c *Controller) work(ctx context.Context, r *registry.Replica) {
+// the writes below check that the replica is not being removed. project is the status of the
+// replica's project, as the pass read it ("" when the project is gone).
+func (c *Controller) work(ctx context.Context, r *registry.Replica, project registry.Status) {
 	switch {
 	case r.Status == statusGoingDown:
 		c.removeStep(ctx, r)
@@ -340,7 +356,7 @@ func (c *Controller) work(ctx context.Context, r *registry.Replica) {
 	case settingUp(r):
 		c.setupStep(ctx, r)
 	case active(r):
-		c.monitor(ctx, r)
+		c.monitor(ctx, r, project)
 	}
 }
 

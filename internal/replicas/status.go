@@ -87,8 +87,8 @@ func (c *Controller) health(ctx context.Context, r *registry.Replica, obs *peera
 
 // monitor looks at a replica that finished its setup: it polls the node unless a report is fresh,
 // maps the observation to a status, writes it when it changed and raises or resolves the alerts.
-func (c *Controller) monitor(ctx context.Context, r *registry.Replica) {
-	if c.parentPaused(ctx, r.Ref) {
+func (c *Controller) monitor(ctx context.Context, r *registry.Replica, project registry.Status) {
+	if paused(project) {
 		return // the replica stops and starts with its project
 	}
 	obs, ok := c.fresh(r.Identifier, c.interval()-time.Second)
@@ -138,14 +138,10 @@ func (c *Controller) recreateActive(ctx context.Context, r *registry.Replica) {
 	c.observed(r.Identifier, st)
 }
 
-// parentPaused reports whether the replica's project is paused or going away: its replicas are
+// paused reports whether a project of that status is paused or going away: its replicas are
 // stopped with it and say nothing.
-func (c *Controller) parentPaused(ctx context.Context, ref string) bool {
-	p, err := c.reg.GetProject(ctx, ref)
-	if err != nil {
-		return false
-	}
-	switch p.Status {
+func paused(s registry.Status) bool {
+	switch s {
 	case registry.StatusInactive, registry.StatusPausing, registry.StatusGoingDown, registry.StatusRemoved, registry.StatusRestoring:
 		return true
 	}

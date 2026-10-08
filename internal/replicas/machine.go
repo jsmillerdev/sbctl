@@ -242,8 +242,7 @@ func (c *Controller) watch(ctx context.Context, r *registry.Replica) {
 		return
 	case st.Role == "absent":
 		// The node does not have the instance (it was wiped, or it never got it): ask again.
-		// The node's answer to the same spec is the same instance.
-		c.recreate(ctx, r)
+		c.ensureAgain(ctx, r, time.Minute)
 		return
 	}
 	step := laterStep(r.InitStep, boundStep(st.Step))
@@ -255,19 +254,30 @@ func (c *Controller) watch(ctx context.Context, r *registry.Replica) {
 		c.finish(ctx, r)
 		return
 	}
-	if age := c.stepClock(r.Identifier, r.InitStep); age > c.stepTimeout(ctx, r) {
+	age := c.stepClock(r.Identifier, r.InitStep)
+	if age >= nudgeAfter {
+		c.ensureAgain(ctx, r, nudgeAfter)
+	}
+	if age > c.stepTimeout(ctx, r) {
 		c.failSetup(ctx, r, failureFor(r.InitStep), fmt.Sprintf("no progress for %s at %s", age.Round(time.Second), r.InitStep))
 	}
 }
 
-// recreate puts the instance back on a node that lost it. Asking too often would only hammer the node.
-func (c *Controller) recreate(ctx context.Context, r *registry.Replica) {
+// nudgeAfter is how long a step may sit unchanged before the node is asked for the instance
+// again, and the shortest time between two such requests.
+const nudgeAfter = 2 * time.Minute
+
+// ensureAgain asks the node for the instance again. The node answers a repeated request with what
+// it has and resumes a setup that a restart of its daemon interrupted, so this is how an
+// instance the node lost comes back and how a setup that stopped moving is nudged. gap is the
+// shortest time since the last request.
+func (c *Controller) ensureAgain(ctx context.Context, r *registry.Replica, gap time.Duration) {
 	if !c.due(r.Identifier, "recreate") {
 		return
 	}
 	c.mu.Lock()
 	s := c.st(r.Identifier)
-	if c.now().Sub(s.reensured) < time.Minute {
+	if c.now().Sub(s.reensured) < gap {
 		c.mu.Unlock()
 		return
 	}
@@ -277,7 +287,7 @@ func (c *Controller) recreate(ctx context.Context, r *registry.Replica) {
 	spec.Epoch, _ = c.leader()
 	st, err := c.o.Ops.Ensure(ctx, r.NodeID, spec)
 	if err != nil {
-		c.stepError(ctx, r, "recreate", fmt.Errorf("create the instance again on %s: %w", r.NodeID, err), terminal(err))
+		c.stepError(ctx, r, "recreate", fmt.Errorf("ask %s for the instance again: %w", r.NodeID, err), terminal(err))
 		return
 	}
 	c.worked(r.Identifier, "recreate")
