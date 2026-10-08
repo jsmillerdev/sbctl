@@ -238,7 +238,10 @@ func (o *Orchestrator) Follow(ctx context.Context, from int, epoch int64) Server
 	run := o.deleg
 	o.delegMu.Unlock()
 	if run != nil {
-		return run.status(from)
+		// A run that ended is the one of its own epoch; a caller asking about another is not shown it.
+		if st := run.status(from); epoch <= 0 || st.Move == nil || st.Move.Epoch == epoch {
+			return st
+		}
 	}
 	if epoch <= 0 {
 		return ServerStatus{State: "idle"}

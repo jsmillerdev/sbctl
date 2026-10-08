@@ -121,6 +121,10 @@ func TestAServerMoveCutOffByTheRestartContinuesInTheDaemonThatStarts(t *testing.
 			if other := w.orch().Follow(w.ctx, 0, 9); other.State != "idle" {
 				t.Fatalf("a move of another epoch: %+v", other)
 			}
+			// A finished run answers only for its own epoch: another move's CLI is not shown it.
+			if other := o2.Follow(w.ctx, 0, 9); other.State != "idle" {
+				t.Fatalf("a run of epoch 2 shown for epoch 9: %+v", other)
+			}
 			// So does the old leader that asked for the switchover, which polls the delegation endpoint.
 			var seen ServerStatus
 			if rec := serve(t, o2, "GET "+PathServer, PathServer+"?from=0", "n1", nil, &seen); rec.Code != http.StatusOK || seen.State != "done" {

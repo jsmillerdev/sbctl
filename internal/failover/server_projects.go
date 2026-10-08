@@ -195,7 +195,7 @@ func (o *Orchestrator) waitForNode(ctx context.Context, n registry.Node, epoch i
 		case err != nil:
 			last = err.Error()
 		case epoch > 0 && (p.Epoch < epoch || leader != "" && p.Leader != leader):
-			last = fmt.Sprintf("it still reports epoch %d under %q", p.Epoch, p.Leader)
+			last = fmt.Sprintf("it answers and still reports epoch %d under %q; its daemon restarts by itself once its system cluster is a standby, and if it does not, restart supavise on it and run supavise failover --resume", p.Epoch, p.Leader)
 		default:
 			return nil
 		}

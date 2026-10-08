@@ -671,7 +671,11 @@ func (o *Orchestrator) demoteOld(ctx context.Context, from registry.Node, ref, i
 			return identifier + " on " + from.Name, nil
 		}
 	}
-	return "", fmt.Errorf("turning the old primary on %s into a replica failed: %w; run the move again with --resume", from.Name, err)
+	hint := ""
+	if ref == config.SystemRef {
+		hint = " (the node's agent reads its registry to render the standby, and that registry is the system cluster it stopped for this switchover: see the limits in the failover README)"
+	}
+	return "", fmt.Errorf("turning the old primary on %s into a replica failed: %w%s; run the move again with --resume", from.Name, err, hint)
 }
 
 // reseedOld rebuilds the old home of a failed-over project as a replica: its data diverged from the
