@@ -15,14 +15,19 @@ defaults:
   run:
     shell: bash
 
+# A newer push to a branch cancels that branch's older run; main keeps every run (the release gate
+# reads them). Work-in-progress branches (ws/**) run the two-architecture jobs on amd64 only;
+# main and integrate/** run them on amd64 and arm64.
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   systemd-smoke:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -120,9 +125,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -151,9 +154,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -227,9 +228,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -299,9 +298,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -332,9 +329,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -363,9 +358,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -396,9 +389,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -430,9 +421,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -463,9 +452,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -537,9 +524,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -591,9 +576,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -661,9 +644,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -703,9 +684,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -725,9 +704,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
