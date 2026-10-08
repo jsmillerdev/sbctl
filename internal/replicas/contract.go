@@ -97,7 +97,7 @@ type Status struct {
 	// RESIZING, GOING_DOWN, INIT_READ_REPLICA or INIT_READ_REPLICA_FAILED.
 	Status string
 	// Init is set on every replica: in progress while it sets up, failed after a failed setup,
-	// completed once it served.
+	// completed once it served. A replica going down keeps the outcome of its setup.
 	Init *InitStatus
 	// LagSeconds is the latest lag, or -1 when unknown.
 	LagSeconds float64

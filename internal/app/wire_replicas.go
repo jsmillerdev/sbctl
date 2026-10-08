@@ -42,8 +42,17 @@ func wireReplicas(ctx context.Context, w *Wire) error {
 	Provide[replicas.Remover](w, c)
 	Provide[replicas.ReportSink](w, c)
 	if o.Ops == nil || o.Backups == nil {
-		w.Log.Debug("replica controller idle: no node operations or no base backups on this node", "ops", o.Ops != nil, "backups", o.Backups != nil)
+		// A single server has nothing to run; a server that has joined others and cannot create
+		// replicas is a gap in the wiring the operator should hear about.
+		if nodes, err := w.Node.Registry.ListNodes(ctx); err == nil && len(nodes) > 1 {
+			w.Log.Warn("replica controller idle: this node cannot reach the replica nodes or take base backups", "ops", o.Ops != nil, "backups", o.Backups != nil)
+		} else {
+			w.Log.Debug("replica controller idle: no node operations or no base backups on this node", "ops", o.Ops != nil, "backups", o.Backups != nil)
+		}
 		return nil
+	}
+	if o.Pooler == nil {
+		w.Log.Warn("replica controller has no Supavisor pooler: replicas will have no pooler tenant")
 	}
 	w.Go("replicas", func(ctx context.Context) error {
 		if err := c.Run(ctx); !errors.Is(err, context.Canceled) {
