@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
@@ -16,7 +19,9 @@ import (
 // clusterView finds this node's place in its cluster and keeps, of the registry's projects, the
 // ones homed here. A server that is not in a cluster (its registry has no other node, or none of the
 // cluster tables yet: a v0.1.x registry that the new binary reads before migration 1300) gets no view
-// and every project, as before.
+// and every project, as before. A registry that cannot be read for any other reason is an error: a
+// clustered server that took a failed read for a single server would roll out the projects of the
+// others.
 //
 // A project homed on another node is that node's to back up, upgrade and restart: its data and its
 // units are there, and this node's engine refuses to act on it. The upgrade of this node leaves it
@@ -24,7 +29,10 @@ import (
 func clusterView(ctx context.Context, cfg *config.Config, reg registry.Registry, rows []registry.Project) (*nodeupgrade.ClusterView, []registry.Project, error) {
 	nodes, err := reg.ListNodes(ctx)
 	if err != nil {
-		return nil, rows, nil // a registry that predates the cluster tables
+		if noClusterTables(err) {
+			return nil, rows, nil
+		}
+		return nil, nil, fmt.Errorf("cannot read the cluster's nodes from the registry: %w", err)
 	}
 	var live []registry.Node
 	for _, n := range nodes {
@@ -78,6 +86,13 @@ func clusterView(ctx context.Context, cfg *config.Config, reg registry.Registry,
 		}
 	}
 	return view, here, nil
+}
+
+// noClusterTables reports whether err says the cluster tables do not exist (undefined_table): a
+// registry that migration 1300 has not reached.
+func noClusterTables(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "42P01"
 }
 
 // readableRegistryDSN is the DSN of the registry this server can read as the user it runs as: the

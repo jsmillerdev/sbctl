@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
@@ -121,6 +125,42 @@ func TestClusterViewOfASingleServerAndOfAStranger(t *testing.T) {
 	cfg.Node.Name = "nobody"
 	if _, _, err := clusterView(ctx, cfg, reg, rows); err == nil {
 		t.Error("a server the cluster registry does not know was taken for the founder")
+	}
+}
+
+// nodesFail is a registry whose node list cannot be read.
+type nodesFail struct {
+	registry.Registry
+	err error
+}
+
+func (n nodesFail) ListNodes(context.Context) ([]registry.Node, error) { return nil, n.err }
+
+// Only a registry without the cluster tables reads as a single server. Any other failure to read the
+// nodes is an error: a clustered server that took it for a single one would plan and roll out the
+// projects homed on the others.
+func TestClusterViewTreatsOnlyMissingTablesAsASingleServer(t *testing.T) {
+	ctx := context.Background()
+	reg, rows := clusterRegistry(t)
+	cfg := config.Default()
+	cfg.Node.Name = "primary"
+
+	legacy := nodesFail{reg, fmt.Errorf("list nodes: %w", &pgconn.PgError{Code: "42P01", Message: `relation "supavise.nodes" does not exist`})}
+	view, here, err := clusterView(ctx, cfg, legacy, rows)
+	if err != nil || view != nil || len(here) != len(rows) {
+		t.Errorf("a registry without the cluster tables: %+v %d %v", view, len(here), err)
+	}
+
+	for name, e := range map[string]error{
+		"connection":            errors.New("write: connection reset by peer"),
+		"permission":            &pgconn.PgError{Code: "42501", Message: "permission denied for table nodes"},
+		"cancelled":             context.DeadlineExceeded,
+		"text without the code": errors.New(`relation "supavise.nodes" does not exist`), // text alone is not the code
+	} {
+		view, here, err := clusterView(ctx, cfg, nodesFail{reg, e}, rows)
+		if err == nil || view != nil || here != nil {
+			t.Errorf("%s: a failed read gave %+v %d %v, want an error", name, view, len(here), err)
+		}
 	}
 }
 
