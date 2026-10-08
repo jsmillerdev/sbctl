@@ -55,6 +55,10 @@ func TestOnPostgres(t *testing.T) {
 		"AbortBeforeTheMarker":            TestAbortDiscardsAMoveThatStoppedBeforeTheMarkerAndStartsTheLeaderAgain,
 		"PausedProject":                   TestAPausedProjectIsSwitchedOverAndStaysPaused,
 		"CooldownPerProject":              TestTheCooldownIsPerProjectInProjectModeAndForTheServerInServerMode,
+		"DelegatedMoveCutByTheRoleChange": TestADelegatedMoveCutByTheRoleChangeIsRunningAndNotFailed,
+		"StatusMatchedOnItsEpoch":         TestTheStatusOfAMoveIsMatchedOnItsEpoch,
+		"AbortOfThePlanAlone":             TestAbortOfASwitchoverWhoseLogHoldsOnlyThePlanStartsTheLeaderAgain,
+		"AbortedPausedSwitchover":         TestAnAbortedSwitchoverOfAPausedProjectDoesNotStartIt,
 	} {
 		t.Run(name, func(t *testing.T) {
 			old := newWorldFunc
