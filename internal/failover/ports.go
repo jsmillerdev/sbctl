@@ -84,6 +84,11 @@ type Primaries interface {
 }
 
 // LocalPrimaries is Primaries for this node, implemented over the node's plane (lifecycle).
+//
+// The system project is one of the refs. A planned switchover stops the leader's system cluster, and
+// with it the registry the node reads projects from; the undo of that stop (Leader.Resume) starts the
+// system cluster first, so Start and Stop of ref "system" must not read the registry. Healthy and
+// SetAside of "system" are never asked of a node.
 type LocalPrimaries interface {
 	Stop(ctx context.Context, ref string) (lsn string, err error)
 	Start(ctx context.Context, ref string) error
