@@ -1180,4 +1180,34 @@ func TestAToolOfANodeDoesNotDisplaceTheNodesSession(t *testing.T) {
 		cl := dial(n2, n1)
 		return cl.Call(h.ctx, "GET", peerapi.PathPing, nil, &p) == nil
 	})
+
+}
+
+// A short session (OneShot) that stays open is closed by the server after OneShotLife: it is not in the
+// table, so the sweep that closes the sessions of a revoked node does not see it.
+func TestAShortSessionThatStaysOpenIsClosed(t *testing.T) {
+	h := newHarness(t, "n1", "n2")
+	pingEndpoint(h)
+	n1, n2 := h.nodes["n1"], h.nodes["n2"]
+	n2.mgr.o.OneShotLife = 200 * time.Millisecond
+	go n2.mgr.Serve(h.ctx, n2.ln)
+	go n2.mgr.Run(h.ctx)
+	c, err := DialClient(h.ctx, n2.ln.Addr().String(), "n2", OneShot(ClientTLS(func() *Credentials { return n1.creds }, "n2", nil, time.Now)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var p peerapi.Ping
+	if err := c.Call(h.ctx, "GET", peerapi.PathPing, nil, &p); err != nil {
+		t.Fatal(err)
+	}
+	held := func() int {
+		n2.mgr.oneShot.mu.Lock()
+		defer n2.mgr.oneShot.mu.Unlock()
+		return n2.mgr.oneShot.n["n1"]
+	}
+	if held() != 1 {
+		t.Fatalf("the server holds %d short sessions of n1, want 1", held())
+	}
+	eventually(t, "the server to close a short session that stayed open", func() bool { return held() == 0 })
 }

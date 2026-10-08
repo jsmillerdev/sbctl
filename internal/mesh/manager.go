@@ -54,6 +54,7 @@ type Options struct {
 	AnonReadTimeout time.Duration // 10 s: how long a caller with no certificate has to send its request
 	AnonLife        time.Duration // 2 min: how long its session may be open before it is closed once idle
 	AnonFirstStream time.Duration // 10 s: how long its session has to open its first stream
+	OneShotLife     time.Duration // 2 min: how long a node's short session (OneShot) may stay open
 	MaxAnonSessions int           // 32: sessions of callers with no certificate open at once
 	MaxAnonPerAddr  int           // 4: of which one address may hold this many
 	MaxShakesPerIP  int           // 16: TLS handshakes in flight from one address, any caller
@@ -87,7 +88,7 @@ func (o *Options) fill() {
 	}
 	for p, d := range map[*time.Duration]time.Duration{&o.PingEvery: 5 * time.Second, &o.Tick: 2 * time.Second,
 		&o.DialDelay: 3 * time.Second, &o.RevokeGrace: 10 * time.Second, &o.AnonReadTimeout: 10 * time.Second,
-		&o.AnonLife: 2 * time.Minute, &o.AnonFirstStream: 10 * time.Second} {
+		&o.AnonLife: 2 * time.Minute, &o.AnonFirstStream: 10 * time.Second, &o.OneShotLife: 2 * time.Minute} {
 		if *p <= 0 {
 			*p = d
 		}
@@ -603,7 +604,7 @@ const maxOneShotPerNode = 4
 
 // serveOneShot serves a node's short call (OneShot) until its session ends. The node was admitted at the
 // handshake and its streams are judged as those of any session of the node, but the session is not kept
-// in the table, is not pinged and does not replace the one the node's daemon holds.
+// in the table, is not pinged, does not replace the one the node's daemon holds and ends after OneShotLife.
 func (m *Manager) serveOneShot(conn net.Conn, node string) {
 	if !m.oneShot.take(node, maxOneShotPerNode) {
 		m.o.Log.Debug("mesh: too many short sessions from one node", "node", node)
@@ -616,6 +617,9 @@ func (m *Manager) serveOneShot(conn net.Conn, node string) {
 		_ = conn.Close()
 		return
 	}
+	// A short call is short: the session is not in the table, so the sweep that closes the sessions of a
+	// node the registry stopped admitting does not see it.
+	defer time.AfterFunc(m.o.OneShotLife, func() { _ = sess.Close() }).Stop()
 	m.serveStreams(sess, node, "")
 }
 
