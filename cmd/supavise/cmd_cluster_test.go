@@ -73,8 +73,7 @@ func hasCommandLine(help, name string) bool {
 
 // Every command of the cluster work is registered and says plainly that it is not there yet.
 func TestClusterCommandsAreStubs(t *testing.T) {
-	for _, args := range [][]string{
-	} {
+	for _, args := range [][]string{} {
 		_, err := run(t, args...)
 		if !errors.Is(err, notimpl.Err) {
 			t.Errorf("supavise %s: %v, want not implemented yet", strings.Join(args, " "), err)
