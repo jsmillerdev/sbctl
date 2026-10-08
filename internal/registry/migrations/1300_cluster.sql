@@ -52,6 +52,8 @@ create table supavise.join_tokens (
 alter table supavise.projects
   add column node_id text not null default 'n1' references supavise.nodes (id);
 
+-- A statement trigger fires for every statement, also one that matches no row; the registry's
+-- setters read first and skip a write that would change nothing.
 create function supavise.bump_change_seq() returns trigger
 language plpgsql as $$
 begin

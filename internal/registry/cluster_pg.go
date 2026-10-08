@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,32 +25,6 @@ func mapWriteErr(err error) error {
 		return fmt.Errorf("%w: %s", ErrNotFound, pe.ConstraintName)
 	}
 	return mapErr(err)
-}
-
-// exists reports whether the query (select exists (...)) with args finds a row.
-func (r *Postgres) exists(ctx context.Context, q string, args ...any) (bool, error) {
-	var ok bool
-	err := r.pool.QueryRow(ctx, q, args...).Scan(&ok)
-	return ok, mapErr(err)
-}
-
-// changed finishes an update that matches a row only when a value would change: no rows is a
-// success when the row exists (nothing to change) and ErrNotFound when it does not.
-func (r *Postgres) changed(ctx context.Context, tag pgconn.CommandTag, err error, existsQuery string, key any) error {
-	if err != nil {
-		return mapWriteErr(err)
-	}
-	if tag.RowsAffected() > 0 {
-		return nil
-	}
-	ok, err := r.exists(ctx, existsQuery, key)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return ErrNotFound
-	}
-	return nil
 }
 
 // subscribePoll is Subscribe for a read-only registry (a standby cannot LISTEN): it reads
@@ -160,19 +135,26 @@ func (r *Postgres) ListNodes(ctx context.Context) ([]Node, error) {
 	})
 }
 
+// The setters below read the row first and write only a change. The change_seq trigger is a
+// statement trigger, which fires even when an update matches no row, so a conditional update
+// would still move the counter on every status report.
+
 func (r *Postgres) UpdateNode(ctx context.Context, n *Node) error {
-	tag, err := r.pool.Exec(ctx, `
-		update supavise.nodes set name = $2, region = $3, public_host = $4, peer_addr = $5, provider = $6, version = $7
-		where id = $1 and (name, region, public_host, peer_addr, provider, version) is distinct from ($2, $3, $4, $5, $6::jsonb, $7)`,
-		n.ID, n.Name, n.Region, n.PublicHost, n.PeerAddr, marshalJSON(n.Provider), n.Version)
-	if err := r.changed(ctx, tag, err, `select exists (select 1 from supavise.nodes where id = $1)`, n.ID); err != nil {
-		return err
-	}
-	got, err := r.GetNode(ctx, n.ID)
+	cur, err := r.GetNode(ctx, n.ID)
 	if err != nil {
 		return err
 	}
-	*n = *got
+	if cur.Name != n.Name || cur.Region != n.Region || cur.PublicHost != n.PublicHost || cur.PeerAddr != n.PeerAddr ||
+		cur.Version != n.Version || !reflect.DeepEqual(cur.Provider, n.Provider) {
+		cur, err = scanNode(r.pool.QueryRow(ctx, `
+			update supavise.nodes set name = $2, region = $3, public_host = $4, peer_addr = $5, provider = $6, version = $7
+			where id = $1 returning `+nodeCols,
+			n.ID, n.Name, n.Region, n.PublicHost, n.PeerAddr, marshalJSON(n.Provider), n.Version))
+		if err != nil {
+			return err
+		}
+	}
+	*n = *cur
 	return nil
 }
 
@@ -180,13 +162,19 @@ func (r *Postgres) SetNodeState(ctx context.Context, id string, s NodeState) err
 	if !s.valid() {
 		return fmt.Errorf("registry: node state %q", s)
 	}
-	tag, err := r.pool.Exec(ctx, `update supavise.nodes set state = $2 where id = $1 and state <> $2`, id, s)
-	return r.changed(ctx, tag, err, `select exists (select 1 from supavise.nodes where id = $1)`, id)
+	cur, err := r.GetNode(ctx, id)
+	if err != nil || cur.State == s {
+		return err
+	}
+	return affected(r.pool.Exec(ctx, `update supavise.nodes set state = $2 where id = $1`, id, s))
 }
 
 func (r *Postgres) SetNodeCert(ctx context.Context, id, serial string) error {
-	tag, err := r.pool.Exec(ctx, `update supavise.nodes set cert_serial = $2 where id = $1 and cert_serial <> $2`, id, serial)
-	return r.changed(ctx, tag, err, `select exists (select 1 from supavise.nodes where id = $1)`, id)
+	cur, err := r.GetNode(ctx, id)
+	if err != nil || cur.CertSerial == serial {
+		return err
+	}
+	return affected(r.pool.Exec(ctx, `update supavise.nodes set cert_serial = $2 where id = $1`, id, serial))
 }
 
 func (r *Postgres) DeleteNode(ctx context.Context, id string) error {
@@ -377,11 +365,13 @@ func (r *Postgres) ListReplicasOn(ctx context.Context, node string) ([]Replica, 
 }
 
 func (r *Postgres) SetReplicaStatus(ctx context.Context, identifier, status, initStep, initError string) error {
-	tag, err := r.pool.Exec(ctx, `
-		update supavise.replicas set status = $2, init_step = $3, init_error = $4, updated_at = now()
-		where identifier = $1 and (status, init_step, init_error) is distinct from ($2, $3, $4)`,
-		identifier, status, initStep, initError)
-	return r.changed(ctx, tag, err, `select exists (select 1 from supavise.replicas where identifier = $1)`, identifier)
+	cur, err := r.GetReplica(ctx, identifier)
+	if err != nil || (cur.Status == status && cur.InitStep == initStep && cur.InitError == initError) {
+		return err
+	}
+	return affected(r.pool.Exec(ctx, `
+		update supavise.replicas set status = $2, init_step = $3, init_error = $4, updated_at = now() where identifier = $1`,
+		identifier, status, initStep, initError))
 }
 
 func (r *Postgres) DeleteReplica(ctx context.Context, identifier string) error {
