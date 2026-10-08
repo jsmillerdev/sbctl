@@ -3,17 +3,14 @@
 // needs a revision, and what lies between them is the gap: a Storage bucket and its key, a rule
 // for the mesh port, the fencing permissions. The node reads its stack's revision from the
 // instance tags (instance metadata, no IAM); a stack from before revisions carries none and counts as revision 1.
-// This file is the contract; the capability table and the detection live in the other files.
+// This file is the contract; the revision table is in revisions.go and the detection in detect.go.
 package infra
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"strings"
 	"text/tabwriter"
-
-	"github.com/supavise/supavise/internal/notimpl"
 )
 
 // Missing is one thing the stack lacks.
@@ -41,6 +38,21 @@ type Report struct {
 	Missing  []Missing `json:"missing,omitempty"`
 	// Fix is the exact command that closes the gap ("sudo -E supavise upgrade --aws").
 	Fix string `json:"fix,omitempty"`
+	// Enabled names the capabilities the stack has switched on, as its instance tag
+	// supavise:caps lists them ("storage-role", "fencing", "peer-rule"). A stack without the tag
+	// has none.
+	Enabled []string `json:"enabled,omitempty"`
+}
+
+// Has reports whether the stack has switched the capability on. A feature that needs one
+// (automatic failover needs "fencing") asks here.
+func (r Report) Has(capability string) bool {
+	for _, c := range r.Enabled {
+		if c == capability {
+			return true
+		}
+	}
+	return false
 }
 
 // Behind reports whether the stack lacks anything this release needs.
@@ -76,6 +88,3 @@ func (r Report) Render(w io.Writer) {
 		fmt.Fprintf(w, "  Fix: %s\n", r.Fix)
 	}
 }
-
-// Gap computes the Report for this node. It is not implemented yet.
-func Gap(ctx context.Context) (Report, error) { return Report{}, notimpl.For("infra.Gap") }
