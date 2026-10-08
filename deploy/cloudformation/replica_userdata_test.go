@@ -121,8 +121,11 @@ func runReplicaUserData(t *testing.T, tamper func(rel string, pub ed25519.Public
 		"curl": stubCurl, "apt-get": "#!/bin/sh\nexit 0\n", "snap": "#!/bin/sh\nexit 0\n", "sleep": "#!/bin/sh\nexit 0\n",
 		"aws": "#!/bin/sh\ncase \"$*\" in *get-secret-value*) printf 'svj1.TESTTOKEN' ;; esac\n",
 	}
-	if _, err := exec.LookPath("sha256sum"); err != nil {
-		stubs["sha256sum"] = "#!/bin/sh\nexec shasum -a 256 \"$@\"\n"
+	// The script's PATH is the stubs, OpenSSL and the system directories; macOS keeps sha256sum elsewhere.
+	if _, err := os.Stat("/usr/bin/sha256sum"); err != nil {
+		if _, err := os.Stat("/bin/sha256sum"); err != nil {
+			stubs["sha256sum"] = "#!/bin/sh\nexec shasum -a 256 \"$@\"\n"
+		}
 	}
 	for name, body := range stubs {
 		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {

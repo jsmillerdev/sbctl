@@ -99,26 +99,39 @@ func TestInstanceTagsForTheNode(t *testing.T) {
 			t.Errorf("%s lacks the supavise:cluster tag %s", c.res, clusterTag)
 		}
 	}
-	// A stack with every feature off lists the capabilities every stack has, in the order the
-	// parser of internal/infra reads them.
-	r0 := render(t, d, map[string]string{"AdminEmail": "a@b.co"})
-	caps := get(t, r0.res["Instance"], "Properties", "Tags").([]any)
-	var capsVal doc
-	for _, tag := range caps {
-		if m, ok := tag.(doc); ok && m["Key"] == "supavise:caps" {
-			capsVal = m["Value"].(doc)
-		}
-	}
-	if got := canon(capsVal); got != `{"Fn::Join":[",",["tags","storage-role"]]}` {
-		t.Errorf("capabilities at the defaults: %s", got)
-	}
-	r1 := render(t, d, map[string]string{"AdminEmail": "a@b.co", "Failover": "on", "PeerCidr2": "203.0.113.4/32"})
-	for _, tag := range get(t, r1.res["Instance"], "Properties", "Tags").([]any) {
-		if m, ok := tag.(doc); ok && m["Key"] == "supavise:caps" {
-			if got := canon(m["Value"]); got != `{"Fn::Join":[",",["tags","storage-role","fencing","peer-rule"]]}` {
-				t.Errorf("capabilities with failover and a peer rule: %s", got)
+	// A stack with every feature off lists the capabilities every stack has; the optional ones are
+	// added as the features are turned on, in the order internal/infra reads them.
+	caps := func(over map[string]string) string {
+		over["AdminEmail"] = "a@b.co"
+		for _, tag := range get(t, render(t, d, over).res["Instance"], "Properties", "Tags").([]any) {
+			if m, ok := tag.(doc); ok && m["Key"] == "supavise:caps" {
+				join := get(t, m["Value"], "Fn::Join").([]any)
+				var out []string
+				for _, part := range join[1].([]any) {
+					out = append(out, part.(string))
+				}
+				return strings.Join(out, join[0].(string))
 			}
 		}
+		t.Fatal("no supavise:caps tag")
+		return ""
+	}
+	for _, c := range []struct {
+		over map[string]string
+		want string
+	}{
+		{map[string]string{}, "tags,storage-role"},
+		{map[string]string{"Failover": "on", "PeerCidr2": "203.0.113.4/32"}, "tags,storage-role,fencing,peer-rule"},
+		{map[string]string{"PeerCidr3": "203.0.113.4/32"}, "tags,storage-role,peer-rule"},
+	} {
+		if got := caps(c.over); got != c.want {
+			t.Errorf("capabilities with %v: %q, want %q", c.over, got, c.want)
+		}
+	}
+	jo := joinerParams()
+	delete(jo, "AdminEmail")
+	if got := caps(jo); got != "tags,storage-role,replica-server" {
+		t.Errorf("capabilities of a replica server: %q", got)
 	}
 	// internal/infra knows every name the template can write.
 	known := map[string]bool{}

@@ -982,12 +982,11 @@ Resources:
         - { Key: "supavise:storage-role", Value: !If [IsJoiner, !Ref StorageRoleArn, !GetAtt StorageRole.Arn] }
         - Key: "supavise:caps"
           Value: !Join
-            - ","
-            - - tags
-              - storage-role
-              - !If [FailoverOn, fencing, !Ref "AWS::NoValue"]
-              - !If [HasAnyPeerCidr, peer-rule, !Ref "AWS::NoValue"]
-              - !If [IsJoiner, replica-server, !Ref "AWS::NoValue"]
+            - ""
+            - - "tags,storage-role"
+              - !If [FailoverOn, ",fencing", ""]
+              - !If [HasAnyPeerCidr, ",peer-rule", ""]
+              - !If [IsJoiner, ",replica-server", ""]
         - !If
           - IsJoiner
           - { Key: "supavise:leader", Value: !Ref JoinLeader }
