@@ -53,12 +53,25 @@ func TestWireHostMonitorsAServiceOnly(t *testing.T) {
 }
 
 func TestHostAlert(t *testing.T) {
-	ev := hostAlert(hostsetup.Status{Have: 0, Want: 1, Known: true})
-	if ev.Kind != alerts.KindHostNotConverged || ev.Resolved || ev.Severity != alerts.SeverityWarning || !strings.Contains(ev.Detail, "sudo supavise system converge") || !strings.Contains(ev.Detail, "revision 0") {
+	ev := hostAlert(hostsetup.Status{Have: 0, Want: 1, Known: true}, false)
+	if ev.Kind != alerts.KindHostNotConverged || ev.Resolved || ev.Severity != alerts.SeverityWarning || !strings.Contains(ev.Detail, "sudo supavise system converge") || !strings.Contains(ev.Detail, "revision 0") || strings.Contains(ev.Detail, "restart") {
 		t.Errorf("behind: %+v", ev)
 	}
-	ev2 := hostAlert(hostsetup.Status{Have: 1, Want: 1, Known: true})
-	if !ev2.Resolved || ev2.Kind != alerts.KindHostNotConverged || ev2.Title != ev.Title {
+	ev2 := hostAlert(hostsetup.Status{Have: 1, Want: 1, Known: true}, false)
+	if !ev2.Resolved || ev2.Kind != alerts.KindHostNotConverged || ev2.Title != ev.Title || strings.Contains(ev2.Detail, "restart") {
 		t.Errorf("caught up: %+v", ev2)
+	}
+}
+
+// The cluster features read the state the daemon started with, so a daemon that started behind has to
+// be restarted after the converge: the alert and its resolution both say so.
+func TestHostAlertSaysARestartIsNeededWhenTheDaemonStartedBehind(t *testing.T) {
+	behind := hostAlert(hostsetup.Status{Have: 0, Want: 1, Known: true}, true)
+	if !strings.Contains(behind.Detail, "sudo supavise system converge, then sudo systemctl restart supavise.service") {
+		t.Errorf("behind: %q", behind.Detail)
+	}
+	done := hostAlert(hostsetup.Status{Have: 1, Want: 1, Known: true}, true)
+	if !done.Resolved || !strings.Contains(done.Detail, "sudo systemctl restart supavise.service") {
+		t.Errorf("caught up: %+v", done)
 	}
 }
