@@ -62,6 +62,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 BINS=${UPGRADE_E2E_BIN_DIR:?run tests/linux/upgrade-e2e-build.sh OUT_DIR first and pass UPGRADE_E2E_BIN_DIR}
 SRV_PORT=38801
 WORK=$(mktemp -d)
+START_TS=$(date +%s)
 # The supavise user reads the release key (--plan as that user); the private files keep their own modes.
 chmod 0755 "$WORK"
 SRV_PID=""
@@ -71,6 +72,11 @@ cleanup() {
   [[ -n $SRV_PID ]] && kill "$SRV_PID" 2>/dev/null || true
   [[ -n $HOOK_PID ]] && kill "$HOOK_PID" 2>/dev/null || true
   journalctl --no-pager -u supavise-upgrade.service >"$WORK/outputs/supavise-upgrade.journal" 2>/dev/null || true
+  # Every unit, not just supavise's: a bus drop's cause (dbus, polkit, apt, a daemon-reexec) shows here.
+  journalctl --no-pager -o short-iso --since "@$START_TS" >"$WORK/outputs/system.journal" 2>/dev/null || true
+  if journalctl --no-pager --since "@$START_TS" -u 'supavise*' 2>/dev/null | grep -q "systemd did not answer the request; sending it again"; then
+    echo "::warning title=systemd bus drop::a unit request was sent again; see system.journal in the upgrade-e2e artifact"
+  fi
   collect_logs
   cp -r "$WORK/outputs" "$LOG_DIR/" 2>/dev/null || true
   rm -rf "$WORK"
@@ -78,6 +84,30 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -p "$WORK/outputs"
+
+# systemd's bus is away for a moment now and then (right after the daemon restarts, for one):
+# "Transport endpoint is not connected", "Connection reset by peer", "disconnected from message bus
+# without replying". The calls that only read are repeated for a few seconds; any other call, and
+# any other failure, runs once and fails as it did.
+systemctl() {
+  case " $* " in
+    *" show "* | *" is-active "* | *" is-enabled "*) ;;
+    *) command systemctl "$@"; return ;;
+  esac
+  local try err rc=0
+  err=$(mktemp -p "$WORK")
+  for try in 1 2 3 4 5 6; do
+    rc=0
+    command systemctl "$@" 2>"$err" || rc=$?
+    [[ $rc -eq 0 ]] && break
+    grep -q -e "Transport endpoint is not connected" -e "Connection reset by peer" -e "disconnected from message bus" \
+      -e "D-Bus connection terminated" -e "Failed to connect to bus" "$err" || break
+    sleep 1
+  done
+  cat "$err" >&2
+  rm -f "$err"
+  return $rc
+}
 
 need_root
 preflight
@@ -422,6 +452,13 @@ unchanged "refused rollback"
 [[ $(versions_of "$REF") == "$NEWER_AUTH $NEW_REST "* ]] || fail "a refused rollback moved a project"
 reg "delete from supavise.schema_migrations where version = 'migrations/9999_from_the_future.sql'" >/dev/null
 
+log "projects upgrade <ref> plans that project alone, whichever of the two it is (a revert must touch nothing else)"
+for pair in "$REF $REF2" "$REF2 $REF"; do
+  read -r mine other <<<"$pair"
+  run supavise projects upgrade "$mine" --dry-run --allow-older --to "gotrue=$NEW_AUTH"
+  [[ $RC -eq 0 && $OUT == *"$mine"* && $OUT != *"$other"* ]] || fail "projects upgrade $mine --dry-run lists or acts on the other project: $RC $OUT"
+done
+
 log "supavise rollback --yes: back to v0.0.2, the projects back on their GoTrue"
 run "$SV" rollback --yes
 [[ $RC -eq 0 ]] || { journalctl --no-pager -u supavise.service | tail -60 >&2; fail "rollback exited $RC: $OUT"; }
@@ -646,7 +683,18 @@ UNIT
 systemctl daemon-reload
 start_unit() { # runs supavise-upgrade.service to its end; UNIT_RC is the exit status of systemctl start
   UNIT_RC=0
-  timeout 3000 systemctl start supavise-upgrade.service || UNIT_RC=$?
+  timeout 3000 systemctl start supavise-upgrade.service 2>"$WORK/start-unit.err" || UNIT_RC=$?
+  cat "$WORK/start-unit.err" >&2
+  # systemctl can lose its connection to systemd while it waits for the job ("D-Bus connection
+  # terminated", "Connection reset by peer"); the job goes on. The unit's own result decides then.
+  if [[ $UNIT_RC -ne 0 ]] && grep -q -e "D-Bus connection terminated" -e "Connection reset by peer" "$WORK/start-unit.err"; then
+    local i
+    for i in $(seq 1 600); do
+      [[ $(systemctl show -p ActiveState --value supavise-upgrade.service) == activating ]] || break
+      sleep 5
+    done
+    if [[ $(systemctl show -p ActiveState --value supavise-upgrade.service) == inactive && $(systemctl show -p Result --value supavise-upgrade.service) == success ]]; then UNIT_RC=0; fi
+  fi
 }
 unit_journal() { journalctl --no-pager -u supavise-upgrade.service --since "$1"; }
 journal_has() { # SINCE TEXT: the unit's journal since SINCE mentions TEXT (a file, not a pipe: grep -q would end a pipe early)

@@ -937,20 +937,6 @@ func netMoves(ups []registry.Upgrade) []nodeupgrade.ProjectMove {
 	return out
 }
 
-// RevertProjects implements nodeupgrade.Host.
-func (h *nodeHost) RevertProjects(ctx context.Context, moves []nodeupgrade.ProjectMove) error {
-	var mu sync.Mutex
-	lw := &prefixWriter{w: h.out, mu: &mu}
-	var errs []error
-	for _, m := range moves {
-		args := append([]string{"projects", "upgrade", m.Ref, "--yes", "--no-gc", "--allow-older"}, toArgs(m.RevertTargets())...)
-		if err := h.asSupavise(ctx, lw.with(m.Ref+": "), nil, h.binPath, args...); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", m.Ref, err))
-		}
-	}
-	return errors.Join(errs...)
-}
-
 // AppliedMigrations implements nodeupgrade.Host.
 func (h *nodeHost) AppliedMigrations(ctx context.Context) ([]string, error) {
 	return registry.AppliedMigrations(ctx, lifecycle.SystemSocketDSN(h.cfg, "supavise"))
