@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -30,6 +31,13 @@ import (
 // command that joins a server (`supavise install --join-token-file`) and the join below both call the
 // same function; the join itself (cluster.Join) does everything around it.
 var seedSystemStandby cluster.SeedFunc = func(context.Context, peerapi.SystemBootstrap) error {
+	return notimpl.For("seeding the system standby")
+}
+
+// seedPreflight checks what seedSystemStandby needs (room on the disk, the backup store, an empty data
+// directory) before a join or a rejoin spends the token or moves data aside. The join and the rejoin
+// call it first, so a seeding that cannot work refuses before anything has changed.
+var seedPreflight = func(context.Context) error {
 	return notimpl.For("seeding the system standby")
 }
 
@@ -78,7 +86,7 @@ master key derives); the daemon restarts once to listen on the peer port.`,
 	token.Flags().DurationVar(&tokenTTL, "ttl", time.Hour, "how long the token works")
 
 	var joinRegion, joinAddress, joinTokenFile, joinKeyFile, joinPassFile string
-	var joinResume, joinKeyFromEscrow bool
+	var joinResume, joinReset, joinKeyFromEscrow bool
 	join := &cobra.Command{
 		Use:   "join [token]",
 		Short: "Join this server to a cluster with a token from the leader",
@@ -88,17 +96,29 @@ settings and the first copy of the system cluster. The node is "joining" until i
 "active".
 
 A join that stopped after the certificate was issued continues with --resume, which needs no token.
-Without a connection to the key's holder, --master-key-file or --key-from-escrow supply the master key;
-the token still authenticates the node. The token may be read from a file (--token-file) so that it never
-appears in a process listing.`,
+A server that holds the identity of a join that was given up on (the leader removes a node that is still
+joining after an hour), of a node that cannot rejoin, or of a node that was removed while it was down,
+starts over with --reset and a new token: it stops what runs, sets its data aside and joins as a new node;
+run "supavise node rm" on the leader first when the old node is still listed there. Without a connection
+to the key's holder, --master-key-file or --key-from-escrow supply the master key; the token still
+authenticates the node. The token may be read from a file (--token-file) so that it never appears in a
+process listing.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
 			if err != nil {
 				return err
 			}
-			o := cluster.JoinOptions{Cfg: cfg, ConfigPath: config.ResolvePath(configPath), Resume: joinResume, Region: joinRegion, Address: joinAddress,
-				Version: version, Log: newLogger(cfg), Seed: seedSystemStandby, DSNs: app.RegistryDSNs(cfg)}
+			o := cluster.JoinOptions{Cfg: cfg, ConfigPath: config.ResolvePath(configPath), Resume: joinResume, Reset: joinReset, Region: joinRegion, Address: joinAddress,
+				Version: version, Log: newLogger(cfg), Seed: seedSystemStandby, Preflight: seedPreflight, DSNs: app.RegistryDSNs(cfg)}
+			if joinReset && !joinResume && cluster.Joined(config.ClusterDir(o.ConfigPath)) {
+				stop, closeUnits, err := stopLocal(cfg, o.Log)
+				if err != nil {
+					return err
+				}
+				defer closeUnits()
+				o.StopLocal = stop
+			}
 			if !joinResume {
 				raw, err := tokenInput(args, joinTokenFile, cmd.InOrStdin())
 				if err != nil {
@@ -134,6 +154,7 @@ appears in a process listing.`,
 	join.Flags().BoolVar(&joinKeyFromEscrow, "key-from-escrow", false, "fetch the master key from the backup store's key escrow (needs [backup] in config.toml and --passphrase-file)")
 	join.Flags().StringVar(&joinPassFile, "passphrase-file", "", "file holding the escrow passphrase (mode 0600), or - for standard input")
 	join.Flags().BoolVar(&joinResume, "resume", false, "continue a join that stopped after the certificate was issued")
+	join.Flags().BoolVar(&joinReset, "reset", false, "give up this server's place in the cluster it joined before (its data is set aside) and join as a new node")
 
 	var lsDNS, lsJSON bool
 	ls := &cobra.Command{
@@ -158,7 +179,10 @@ appears in a process listing.`,
 		Use:   "rm <node>",
 		Short: "Remove a node from the cluster (run on the leader)",
 		Long: `Removes the node's replicas, marks it left and revokes its certificate at the next handshake.
-The node wipes itself when it next reaches the leader.
+A node that is up retires itself when its copy of the registry shows the change: it stops what runs, sets
+its data aside and waits to be joined again. A node that was down or cut off from the leader when this ran
+does not learn it; once it is reachable again its peers refuse it, and it is reset on that server with
+"supavise node join --reset" and a new token.
 
 The replica controller removes the replicas while this command waits; --force deletes their rows at
 once, for a node that cannot be reached. A node that is the home of a project is refused: move the
@@ -191,13 +215,13 @@ replicas from the current leader's archive, and keeps its identity.`,
 				return err
 			}
 			log := newLogger(cfg)
-			sup, err := units.New(cfg, log)
+			stop, closeUnits, err := stopLocal(cfg, log)
 			if err != nil {
-				return fmt.Errorf("the units cannot be reached to stop them: %w", err)
+				return err
 			}
+			defer closeUnits()
 			o := cluster.RejoinOptions{Cfg: cfg, ConfigPath: config.ResolvePath(configPath), Leader: rejoinLeader, Version: version, Log: log,
-				Seed: seedSystemStandby, DSNs: app.RegistryDSNs(cfg),
-				StopLocal: func(ctx context.Context) error { _, err := cluster.FenceLocal(ctx, cfg, sup, log); return err }}
+				Seed: seedSystemStandby, Preflight: seedPreflight, DSNs: app.RegistryDSNs(cfg), StopLocal: stop}
 			if v, err := artifacts.ParseVersions(versions.VersionsYAML); err == nil {
 				o.Pins = v.Pins()
 			}
@@ -216,6 +240,21 @@ replicas from the current leader's archive, and keeps its identity.`,
 
 	nodeCmd.AddCommand(token, join, ls, rm, rejoin)
 	rootCmd.AddCommand(nodeCmd)
+}
+
+// stopLocal returns the function that stops everything on this server that could write as a primary
+// (cluster.FenceLocal), and the function that lets go of the supervisor it uses.
+func stopLocal(cfg *config.Config, log *slog.Logger) (func(context.Context) error, func(), error) {
+	sup, err := units.New(cfg, log)
+	if err != nil {
+		return nil, nil, fmt.Errorf("the units cannot be reached to stop them: %w", err)
+	}
+	closeUnits := func() {
+		if c, ok := sup.(interface{ Close() }); ok {
+			c.Close()
+		}
+	}
+	return func(ctx context.Context) error { _, err := cluster.FenceLocal(ctx, cfg, sup, log); return err }, closeUnits, nil
 }
 
 // ---- reading what the commands need ----

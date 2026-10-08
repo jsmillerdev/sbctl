@@ -368,6 +368,7 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	reports := cluster.NewReports()
 
 	schema := &schemaCache{dsns: dsns, log: log}
+	schema.get() // the first look starts now, so that the first pings carry the schema
 	skews := &skewState{}
 	var monitor *health.Monitor
 	if m, ok := Get[*health.Monitor](w); ok {
@@ -406,7 +407,8 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		Leader: func() (string, bool) { l, ok := live.Leader(); return l.ID, ok },
 	}
 	renewer := &cluster.Renewer{Store: store, Self: live.Self, IsLeader: live.IsLeader, RPC: mgr, Authority: auth, Log: log,
-		Leader: func() (string, bool) { l, ok := live.Leader(); return l.ID, ok }}
+		Leader:  func() (string, bool) { l, ok := live.Leader(); return l.ID, ok },
+		Blocked: func(err error) { certRenewalBlocked(store, err) }}
 	Provide[mesh.Mesh](w, mgr)
 	Provide(w, fwd)
 	Provide(w, auth)
@@ -444,6 +446,25 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 		}
 	})
 	return nil
+}
+
+// certRenewalBlocked raises the alert that the node certificate cannot be renewed (err is why) or
+// resolves it (err is nil). The certificate works until it expires; the unit has to let the daemon write
+// the cluster directory before then.
+func certRenewalBlocked(store *cluster.Store, err error) {
+	ev := alerts.Event{Kind: alerts.KindCertificateExpiring, Title: "The node certificate cannot be renewed", Key: "node_cert_renewal"}
+	if err != nil {
+		until := "its end"
+		if c := store.Creds(); c != nil {
+			until = c.NotAfter.Format("2006-01-02")
+		}
+		ev.Severity = alerts.SeverityWarning
+		ev.Detail = fmt.Sprintf("%v. The current certificate works until %s, after which this node can no longer reach its peers. "+
+			"Let the daemon write there (ReadWritePaths= in supavise.service) and restart it.", err, until)
+	} else {
+		ev.Resolved = true
+	}
+	_ = alerts.Notify(context.Background(), ev)
 }
 
 // retireWhenRemoved watches this node's own row, which the registry copy it follows keeps current:
@@ -526,37 +547,53 @@ func peerSeen(ctx context.Context, reg registry.Registry, live *cluster.Live, sk
 }
 
 // schemaCache holds the registry migrations the node's database has applied, for the ping, and
-// raises standby_behind while the database holds migrations this binary lacks.
+// raises standby_behind while the database holds migrations this binary lacks. The ping answers from
+// what it holds; a look at the database runs in the background at most once a minute, so that a slow
+// database never holds up the pings (the far end counts a ping that times out against the session).
 type schemaCache struct {
 	dsns []string
 	log  *slog.Logger
 
-	mu     sync.Mutex
-	at     time.Time
-	text   string
-	behind bool
+	mu         sync.Mutex
+	at         time.Time
+	text       string
+	behind     bool
+	refreshing bool
 }
 
 func (s *schemaCache) get() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if time.Since(s.at) < time.Minute {
-		return s.text
+	if !s.refreshing && time.Since(s.at) >= time.Minute {
+		s.at = time.Now()
+		s.refreshing = true
+		go s.refresh()
 	}
-	s.at = time.Now()
+	return s.text
+}
+
+func (s *schemaCache) refresh() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	defer func() {
+		s.mu.Lock()
+		s.refreshing = false
+		s.mu.Unlock()
+	}()
 	for _, dsn := range s.dsns {
 		applied, err := registry.AppliedMigrations(ctx, cluster.PlainDSN(dsn))
 		if err != nil {
 			continue
 		}
-		s.text = peerapi.SchemaString(applied)
 		ahead := peerapi.SchemaAhead(applied, registry.MigrationNames())
-		if (len(ahead) > 0) != s.behind {
-			s.behind = len(ahead) > 0
+		s.mu.Lock()
+		s.text = peerapi.SchemaString(applied)
+		changed := (len(ahead) > 0) != s.behind
+		s.behind = len(ahead) > 0
+		s.mu.Unlock()
+		if changed {
 			ev := alerts.Event{Kind: alerts.KindStandbyBehind, Title: "The registry is newer than this binary", Key: "standby_behind"}
-			if s.behind {
+			if len(ahead) > 0 {
 				ev.Severity = alerts.SeverityWarning
 				ev.Detail = fmt.Sprintf("The registry has migrations this release lacks (%v). Running instances are left alone; upgrade this node.", ahead)
 			} else {
@@ -564,9 +601,8 @@ func (s *schemaCache) get() string {
 			}
 			_ = alerts.Notify(ctx, ev)
 		}
-		break
+		return
 	}
-	return s.text
 }
 
 // leaderUpkeep does the leader's periodic membership work: it records the node's own row, retires
