@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -80,6 +81,35 @@ func TestACommandThatHangsIsKilledWithWhatItStarted(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if alive(pid) {
 		t.Fatalf("the child %s survived the timeout", pid)
+	}
+}
+
+// A descendant that left the process group (setsid) and holds the command's output must not hold the
+// fence: a timeout still ends it, and a command that exited 0 still counts as done.
+func TestADescendantOutsideTheProcessGroupDoesNotHoldTheFence(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("no setsid on this system")
+	}
+	old := waitDelay
+	waitDelay = 200 * time.Millisecond
+	t.Cleanup(func() { waitDelay = old })
+
+	start := time.Now()
+	p := &Provider{FenceCommand: `setsid sleep 8 & sleep 8`, Timeout: 300 * time.Millisecond}
+	if err := p.Fence(context.Background(), request()); err == nil || !strings.Contains(err.Error(), "did not finish") {
+		t.Fatalf("a timeout: %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("the timeout took %s: the fence waited for the descendant", time.Since(start))
+	}
+
+	start = time.Now()
+	p = &Provider{FenceCommand: `setsid sleep 8 & exit 0`, Timeout: 30 * time.Second}
+	if err := p.Fence(context.Background(), request()); err != nil {
+		t.Fatalf("a command that exited 0: %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("the fence took %s: it waited for the descendant", time.Since(start))
 	}
 }
 

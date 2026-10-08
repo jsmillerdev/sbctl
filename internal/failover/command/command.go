@@ -140,12 +140,17 @@ func tail(out string) string {
 	return ": " + out
 }
 
+// waitDelay is how long shell waits for a killed command's output to end. A descendant that left the
+// process group (setsid, nohup) and still holds the output would keep Wait blocked for ever.
+var waitDelay = 5 * time.Second
+
 // shell runs command through /bin/sh in its own process group, so that a timeout stops what the
 // command started too.
 func shell(ctx context.Context, command string, env []string) (string, error) {
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Env = append(os.Environ(), env...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = waitDelay
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {
@@ -155,6 +160,9 @@ func shell(ctx context.Context, command string, env []string) (string, error) {
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
+		if errors.Is(err, exec.ErrWaitDelay) { // the command succeeded; only a descendant still holds its output
+			err = nil
+		}
 		return out.String(), err
 	case <-ctx.Done():
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
