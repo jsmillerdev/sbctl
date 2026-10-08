@@ -41,11 +41,17 @@ func interrupted(ctx context.Context, j *journal, runErr error) bool {
 // does nothing unless the move is still running (a move that ended failed is the operator's:
 // `supavise failover --resume`), passed its leader marker, and this node leads now, which is what
 // the restart was for. The run is kept for Follow, and for the node that started the move to follow
-// (the old leader of a switchover it asked for with --to). It returns nil, nil when there was
-// nothing to continue.
+// (the old leader of a switchover it asked for with --to), once the node's move slot is taken, so that a
+// caller that holds the slot (the wiring's resume) keeps the run it shows. It returns nil, nil when there
+// was nothing to continue.
 func (o *Orchestrator) ResumeInterrupted(ctx context.Context) (*registry.Move, error) {
 	prior, _, err := o.unfinishedServer(ctx)
 	switch {
+	case err != nil && !o.d.Members.IsLeader():
+		// The registry copy of a node that follows may not answer yet, and a node that does not lead
+		// continues nothing: the daemon that starts as the leader looks again.
+		o.d.Log.Debug("the registry could not be read for a server move to continue", "error", err)
+		return nil, nil
 	case err != nil:
 		return nil, err
 	case prior == nil || prior.to != o.self().ID || !prior.running || !recordedStep(prior.steps, "marker"):
@@ -59,27 +65,28 @@ func (o *Orchestrator) ResumeInterrupted(ctx context.Context) (*registry.Move, e
 	if err := o.wait(ctx, resumeFallback); err != nil {
 		return nil, err
 	}
+	// Another caller may be running it now (the wiring's, which is slower than the wait on a node whose
+	// services take long to come up): its run is the one that is followed, and this one starts nothing.
+	release, err := o.acquire()
+	if err != nil {
+		o.d.Log.Info("another caller continues the server move that the restart cut off")
+		return nil, nil
+	}
+	defer release()
 	// The wait is a chance for the wiring to have continued the move: what it finished is not here.
 	if again, _, err := o.unfinishedServer(ctx); err != nil || again == nil || !again.running {
 		return nil, err
-	}
-	// Another caller may be running it now (the wiring's, which is slower than the wait on a node whose
-	// services take long to come up): its run is the one that is followed, and this one starts nothing.
-	if o.Busy() {
-		o.d.Log.Info("another caller continues the server move that the restart cut off")
-		return nil, nil
 	}
 	run := o.keepRun(prior.from)
 	var mv *registry.Move
 	var rerr error
 	run.record(ctx, func(ctx context.Context) (*registry.Move, error) {
-		mv, rerr = o.FailoverServer(ctx, ServerOptions{Resume: true, Yes: true})
+		mv, rerr = o.failoverServer(ctx, ServerOptions{Resume: true, Yes: true})
 		return mv, rerr
 	})
 	switch {
-	case errors.Is(rerr, ErrBusy): // it started between the look and the call
-		o.d.Log.Info("another caller continues the server move that the restart cut off")
-		return nil, nil
+	case errors.Is(rerr, ErrRestarting):
+		o.d.Log.Info("the daemon stops again in the middle of the server move; the daemon that starts continues it", "error", rerr)
 	case rerr != nil:
 		o.d.Log.Error("the server move that was cut off by the restart did not finish; run supavise failover --resume", "error", rerr)
 	}

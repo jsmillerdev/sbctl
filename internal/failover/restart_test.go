@@ -280,7 +280,7 @@ type scriptedStatus struct {
 	next func() (ServerStatus, error)
 }
 
-func (s scriptedStatus) ServerStatus(context.Context, string, int) (ServerStatus, error) {
+func (s scriptedStatus) ServerStatus(context.Context, string, int, int64) (ServerStatus, error) {
 	return s.next()
 }
 
@@ -506,4 +506,22 @@ func TestTheDaemonLeavesAMoveThatIsRunningNowToItsCaller(t *testing.T) {
 		t.Fatalf("the followed run changed: %+v, then %+v", before, after)
 	}
 	w.assertNever("registry.CreateMove")
+}
+
+// The registry copy of a node that follows may not answer when its monitor starts; a node that does not
+// lead continues nothing, and that is no error to log. A leader that cannot read it cannot tell whether a
+// move was cut, and says so.
+func TestAnUnreadableRegistryIsNoErrorForANodeThatDoesNotLead(t *testing.T) {
+	w := serverWorld(t)
+	unreadable := func(d *Deps) {
+		inner := d.Store
+		d.Store = func() Store { return unreadableLog{inner()} }
+	}
+	if got, err := w.orch(unreadable).ResumeInterrupted(w.ctx); got != nil || err != nil {
+		t.Fatalf("a follower: %+v, %v", got, err)
+	}
+	w.restarted(2)
+	if _, err := w.orch(unreadable).ResumeInterrupted(w.ctx); err == nil {
+		t.Fatal("a leader that cannot read the registry went on")
+	}
 }
