@@ -366,6 +366,8 @@ func startCluster(ctx context.Context, w *Wire, boot cluster.BootDecision, dir s
 	}
 	if bs, ok := Get[*backup.Service](w); ok {
 		auth.Ensure = bs
+	} else {
+		w.Off("cluster.BaseBackup", "the backup service did not open: the leader cannot take the base backup that a joining node's standby of the system cluster starts from")
 	}
 	reports := cluster.NewReports()
 

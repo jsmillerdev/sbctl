@@ -46,30 +46,31 @@ func provided[T any](name string) clusterPort {
 // clusterPorts are the ports a node with a cluster identity must have connected. Each hook that
 // provides one is named in its entry.
 var clusterPorts = []clusterPort{
-	provided[mesh.Mesh]("mesh.Mesh"),                             // wireMesh
-	provided[cluster.Membership]("cluster.Membership"),           // wireMesh
-	provided[*cluster.Reporter]("cluster.Reporter"),              // wireMesh; wirePlacement adds the node's observations
-	provided[*cluster.Reports]("cluster.Reports"),                // wireMesh; wireReplicas subscribes to it
-	provided[placement.Resolver]("placement.Resolver"),           // wirePlacement
-	provided[placement.PlaneRouter]("placement.PlaneRouter"),     // wirePlacement
-	provided[placement.InstanceOps]("placement.InstanceOps"),     // wirePlacement
-	provided[placement.BackupOps]("placement.BackupOps"),         // wirePlacement
-	provided[placement.Contribution]("placement.Contribution"),   // wirePlacement
-	provided[lifecycle.Timers]("lifecycle.Timers"),               // wirePlacement: the node's own backup timers
-	provided[fleet.Fleet]("fleet.Fleet"),                         // wireFleet
-	provided[fleet.PeerRefresher]("fleet.PeerRefresher"),         // wireFleet
-	provided[replicas.Pooler]("replicas.Pooler"),                 // wireFleet
-	provided[replicas.Service]("replicas.Service"),               // wireReplicas
-	provided[replicas.Remover]("replicas.Remover"),               // wireReplicas
-	provided[replicas.ReportSink]("replicas.ReportSink"),         // wireReplicas
-	provided[*proxy.CertRole]("proxy.CertRole"),                  // wireProxy
-	provided[failover.LocalPrimaries]("failover.LocalPrimaries"), // wireFailover
-	provided[failover.Fleet]("failover.Fleet"),                   // wireFailover
-	provided[failover.LocalServices]("failover.LocalServices"),   // wireFailover
-	provided[failover.Locker]("failover.Locker"),                 // wireFailover
-	provided[failover.ExtraChecks]("failover.ExtraChecks"),       // wireFailover
-	provided[failover.Takeover]("failover.Takeover"),             // wireFailover
-	provided[failover.Service]("failover.Service"),               // wireFailover
+	provided[mesh.Mesh]("mesh.Mesh"),                                                                     // wireMesh
+	provided[cluster.Membership]("cluster.Membership"),                                                   // wireMesh
+	provided[*cluster.Reporter]("cluster.Reporter"),                                                      // wireMesh; wirePlacement adds the node's observations
+	provided[*cluster.Reports]("cluster.Reports"),                                                        // wireMesh; wireReplicas subscribes to it
+	{Name: "mesh.Forwarders", Has: func(w *Wire) bool { _, ok := providedAs[portHolder](w); return ok }}, // wireMesh; a promotion takes the project's ports from it (wirePlacement)
+	provided[placement.Resolver]("placement.Resolver"),                                                   // wirePlacement
+	provided[placement.PlaneRouter]("placement.PlaneRouter"),                                             // wirePlacement
+	provided[placement.InstanceOps]("placement.InstanceOps"),                                             // wirePlacement
+	provided[placement.BackupOps]("placement.BackupOps"),                                                 // wirePlacement
+	provided[placement.Contribution]("placement.Contribution"),                                           // wirePlacement
+	provided[lifecycle.Timers]("lifecycle.Timers"),                                                       // wirePlacement: the node's own backup timers
+	provided[fleet.Fleet]("fleet.Fleet"),                                                                 // wireFleet
+	provided[fleet.PeerRefresher]("fleet.PeerRefresher"),                                                 // wireFleet
+	provided[replicas.Pooler]("replicas.Pooler"),                                                         // wireFleet
+	provided[replicas.Service]("replicas.Service"),                                                       // wireReplicas
+	provided[replicas.Remover]("replicas.Remover"),                                                       // wireReplicas
+	provided[replicas.ReportSink]("replicas.ReportSink"),                                                 // wireReplicas
+	provided[*proxy.CertRole]("proxy.CertRole"),                                                          // wireProxy
+	provided[failover.LocalPrimaries]("failover.LocalPrimaries"),                                         // wireFailover
+	provided[failover.Fleet]("failover.Fleet"),                                                           // wireFailover
+	provided[failover.LocalServices]("failover.LocalServices"),                                           // wireFailover
+	provided[failover.Locker]("failover.Locker"),                                                         // wireFailover
+	provided[failover.ExtraChecks]("failover.ExtraChecks"),                                               // wireFailover
+	provided[failover.Takeover]("failover.Takeover"),                                                     // wireFailover
+	provided[failover.Service]("failover.Service"),                                                       // wireFailover
 }
 
 // apiPorts are the fields of api.Deps that a node with a cluster identity must set, by the

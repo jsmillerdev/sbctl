@@ -55,6 +55,8 @@ func wireProxy(ctx context.Context, w *Wire) error {
 	// limit has nothing to read.
 	if svc, ok := Get[replicas.Service](w); ok {
 		c.Lag = proxy.ReplicaLag(svc, ms.IsLeader)
+	} else {
+		w.Off("proxy.ReplicaLag", "no replica controller was provided; the load balancer's lag limit has nothing to read")
 	}
 	w.Proxy.Cluster = c
 	// The proxy serves <ref>-lb.api.<domain> once a project has a replica; Studio lists the endpoint

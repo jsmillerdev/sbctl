@@ -78,6 +78,8 @@ func placementWiring(ctx context.Context, w *Wire, handle func(pattern string, f
 	// ports on a replica's node are forwarders to the home).
 	if h, ok := providedAs[portHolder](w); ok {
 		node.Plane.SetPortHolder(h.Suspend)
+	} else {
+		w.Off("mesh.Forwarders", "the mesh provided no forwarders; a promotion cannot take the project's ports from them")
 	}
 
 	// A demoted cluster catches up through the node's own relay.
