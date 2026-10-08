@@ -275,7 +275,22 @@ sudo -u supavise supavise storage migrate --to s3 --bucket <ObjectsBucket> --rol
 sudo -u supavise supavise storage migrate --to s3 --status
 ```
 
-The bucket's endpoint, region and addressing come from `[fleet] storage_s3_endpoint`, `storage_s3_region` and `storage_s3_force_path_style`; the region defaults to `[backup]`'s. A secret is never an argument. The credentials file has `access_key_id=` and `secret_access_key=` lines and a mode that only its owner can read; the key lands in `/etc/supavise/config.d/30-storage-s3.toml` (0600), never in `config.toml`. With `--role-arn`, the config gets `[fleet] storage_s3_role_arn`, the daemon assumes the role with the instance's credentials and serves the short-lived result to `supavise-storage` on `127.0.0.1:[fleet] storage_credentials_port` (4010). No key is stored. The role and a static key exclude each other. Restart `supavise.service` if the daemon started before the role was in the configuration.
+The bucket's endpoint, region and addressing come from `[fleet] storage_s3_endpoint`, `storage_s3_region` and `storage_s3_force_path_style`; the region defaults to `[backup]`'s. A secret is never an argument. The credentials file has `access_key_id=` and `secret_access_key=` lines and a mode that only its owner can read; the key lands in `/etc/supavise/config.d/30-storage-s3.toml` (0600), never in `config.toml`. With `--role-arn`, the config gets `[fleet] storage_s3_role_arn`, the daemon assumes the role with the instance's credentials and serves the short-lived result to `supavise-storage` on `127.0.0.1:[fleet] storage_credentials_port` (4010). No key is stored. The role and a static key exclude each other.
+
+The daemon reads `storage_s3_role_arn` when it starts. On AWS the stack's first boot does not write it, so a daemon that started without the role cannot serve Storage's credentials: Storage starts on the bucket and fails to sign its first requests, and the command says to restart `supavise.service` and run `--resume`. Avoid that by setting the role and the bucket first and restarting the daemon, then migrate with no credential flag:
+
+```toml
+[fleet]
+storage_s3_role_arn = "<StorageRoleArn>"
+storage_s3_bucket = "<ObjectsBucket>"
+```
+
+```bash
+sudo systemctl restart supavise.service
+sudo -u supavise supavise storage migrate --to s3
+```
+
+A node that joins later takes `[fleet] storage_*` from the leader (they are cluster-scoped), and its daemon assumes the same role with its own instance role.
 
 What the command does:
 
