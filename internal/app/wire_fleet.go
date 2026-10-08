@@ -270,12 +270,15 @@ func modeFor(r cluster.Role) fleet.Mode {
 // started in, which startFleet has already put in effect (empty: the first snapshot says it); a
 // snapshot of any other role, the first one included, is applied. An apply that fails leaves the
 // services half in step, so it is tried again after retry, whatever role is wanted by then, until one
-// works. An apply that is still running when a snapshot of another role arrives is cancelled, so that
+// works; until then a snapshot of the same role starts nothing, and one of another role is applied at
+// once. An apply that is still running when a snapshot of another role arrives is cancelled, so that
 // a fence does not wait behind a promotion's start (Realtime and Supavisor run migrations before they
 // answer); the services it left half started are put in step by the next apply.
 func followRole(ctx context.Context, snaps <-chan cluster.Snapshot, booted cluster.Role, apply func(context.Context, fleet.Mode) error, log *slog.Logger, retry time.Duration) {
 	applied, want := booted, cluster.Role("")
 	var dirty bool
+	// waiting is the role whose apply failed and is held back until again fires; empty: nothing is held.
+	var waiting cluster.Role
 	var again <-chan time.Time
 	type outcome struct {
 		role cluster.Role
@@ -319,6 +322,9 @@ func followRole(ctx context.Context, snaps <-chan cluster.Snapshot, booted clust
 			case o.err != nil:
 				log.Error("shared services not yet in step with the node's role; trying again", "role", o.role, "error", o.err)
 				dirty, again = true, time.After(retry)
+				if want == o.role { // a newer role is not held back by the failure of an older one
+					waiting = o.role
+				}
 			default:
 				applied, dirty = o.role, false
 				if want == applied {
@@ -326,11 +332,12 @@ func followRole(ctx context.Context, snaps <-chan cluster.Snapshot, booted clust
 				}
 			}
 		case <-again:
-			again = nil
+			again, waiting = nil, ""
 		}
-		if running.cancel != nil || want == "" || (want == applied && !dirty) {
+		if running.cancel != nil || want == "" || (want == applied && !dirty) || (waiting != "" && waiting == want) {
 			continue
 		}
+		waiting = ""
 		role, mode := want, modeFor(want)
 		log.Info("the node's role changed; putting the shared services in step", "from", applied, "to", role, "mode", mode.String())
 		actx, cancel := context.WithCancel(ctx)

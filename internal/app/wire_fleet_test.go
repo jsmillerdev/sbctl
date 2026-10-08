@@ -435,6 +435,92 @@ func TestFollowRoleRetriesAFailedApply(t *testing.T) {
 	}
 }
 
+// A start that fails at once (a missing artifact, a unit that does not render) is not tried again until
+// the retry interval has passed, whatever the membership says meanwhile about the same role.
+func TestFollowRoleWaitsForTheRetryIntervalAfterAFailure(t *testing.T) {
+	const retry = 300 * time.Millisecond
+	var mu sync.Mutex
+	var at []time.Time
+	reached := make(chan struct{})
+	apply := func(context.Context, fleet.Mode) error {
+		mu.Lock()
+		defer mu.Unlock()
+		at = append(at, time.Now())
+		if len(at) == 3 {
+			close(reached)
+		}
+		return errors.New("realtime: no such artifact")
+	}
+	snaps := make(chan cluster.Snapshot, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go followRole(ctx, snaps, cluster.RoleFollower, apply, slog.New(slog.NewTextHandler(io.Discard, nil)), retry)
+	snaps <- snap(cluster.RoleFollower)
+	snaps <- snap(cluster.RoleLeader)
+	// Node rows change while the retry is pending: the same role must not start another apply.
+	for range 20 {
+		snaps <- snap(cluster.RoleLeader)
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the failed apply was not tried again")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 1; i < len(at); i++ {
+		// The wait starts when the apply returns, a moment after it was called; a slow host only lengthens the gap.
+		if gap := at[i].Sub(at[i-1]); gap < retry*3/4 {
+			t.Fatalf("apply %d started %v after apply %d, want at least the retry interval %v", i+1, gap, i, retry)
+		}
+	}
+}
+
+// A failure holds back the role that failed, not a newer one: a fence that arrives while the promotion
+// waits for its retry is applied at once.
+func TestFollowRoleAppliesANewerRoleWhileAFailedOneWaits(t *testing.T) {
+	var mu sync.Mutex
+	var leaders int
+	stopped := make(chan struct{})
+	apply := func(_ context.Context, m fleet.Mode) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if m == fleet.ModeStopped {
+			close(stopped)
+			return nil
+		}
+		leaders++
+		return errors.New("realtime: address already in use")
+	}
+	snaps := make(chan cluster.Snapshot, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go followRole(ctx, snaps, cluster.RoleFollower, apply, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Hour)
+	snaps <- snap(cluster.RoleFollower)
+	snaps <- snap(cluster.RoleLeader)
+	for { // the promotion has failed and waits for an hour
+		mu.Lock()
+		n := leaders
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	snaps <- snap(cluster.RoleFenced)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fence waited for the promotion's retry")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if leaders != 1 {
+		t.Fatalf("the promotion was applied %d times", leaders)
+	}
+}
+
 // A promotion that half-worked and was reverted before the retry still leaves services running
 // that the follower must not run: the revert is applied, though the role is the booted one.
 func TestFollowRoleAppliesTheRoleAgainAfterAFailureEvenIfItReverted(t *testing.T) {
