@@ -235,7 +235,7 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 
 	n.Verdict, n.Summary, n.Escrow = h.statusReport(ctx)
 	n.DiskPath = h.cfg.StateDir
-	n.DiskFree = freeBytes(h.cfg.StateDir)
+	n.DiskFree, n.DiskUnknown = freeBytes(h.cfg.StateDir)
 	n.LocalBackups = strings.HasPrefix(h.cfg.Backup.Backend, "file://")
 	if n.LocalBackups {
 		for i := range n.Projects {
@@ -285,12 +285,14 @@ func pidAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-func freeBytes(path string) uint64 {
+// freeBytes returns the free space of the volume holding path; unknown is true when it cannot be
+// read.
+func freeBytes(path string) (free uint64, unknown bool) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
-		return 0
+		return 0, true
 	}
-	return uint64(st.Bavail) * uint64(st.Bsize)
+	return uint64(st.Bavail) * uint64(st.Bsize), false
 }
 
 func dirBytes(root string) int64 {

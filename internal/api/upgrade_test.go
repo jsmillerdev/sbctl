@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
 	"github.com/jsmillerdev/supavise/internal/members"
+	"github.com/jsmillerdev/supavise/internal/notice"
 	"github.com/jsmillerdev/supavise/internal/registry"
 	"github.com/jsmillerdev/supavise/internal/secrets"
 )
@@ -296,6 +298,36 @@ func TestUpgradeThroughTheAPI(t *testing.T) {
 	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "already runs") {
 		t.Fatalf("second upgrade = %d %s", rec.Code, rec.Body.String())
 	}
+}
+
+// While `supavise upgrade` moves the node, a project upgrade from Studio or the API waits: the
+// daemon restarts under it, and the rollout would take it for its own move and revert it on a
+// failure.
+func TestProjectUpgradeIsRefusedWhileTheNodeUpgrades(t *testing.T) {
+	f := newUpgradeFixture(t)
+	f.cfg.StateDir = t.TempDir()
+	const p = "/v1/projects/" + testRef
+	marker := notice.Upgrade{Phase: "projects", From: "v1.0.0", To: "v1.1.0", StartedAt: time.Now(), PID: os.Getpid()}
+	if err := notice.WriteUpgrade(f.cfg.Paths(), marker); err != nil {
+		t.Fatal(err)
+	}
+	rec := f.do("POST", p+"/upgrade", map[string]any{"target_version": "17"})
+	if rec.Code != 409 || !strings.Contains(rec.Body.String(), "being upgraded") {
+		t.Fatalf("during the node upgrade = %d %s", rec.Code, rec.Body.String())
+	}
+	if pr, err := f.reg.GetProject(context.Background(), testRef); err != nil || pr.Status != registry.StatusActiveHealthy {
+		t.Fatalf("project = %v, %v", pr, err)
+	}
+	// Once the marker says it is over, the same request starts the upgrade.
+	marker.Phase = "done"
+	if err := notice.WriteUpgrade(f.cfg.Paths(), marker); err != nil {
+		t.Fatal(err)
+	}
+	f.plane.gate = make(chan struct{})
+	upJSON(t, f.fixture, "POST", p+"/upgrade", map[string]any{"target_version": "17"}, 201, "")
+	f.waitStatus(t, registry.StatusUpgrading)
+	close(f.plane.gate)
+	f.waitStatus(t, registry.StatusActiveHealthy)
 }
 
 func TestUpgradeRequestValidation(t *testing.T) {

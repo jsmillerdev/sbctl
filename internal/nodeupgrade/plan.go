@@ -168,7 +168,7 @@ func short(svc, tag string) string {
 func (p *Plan) describe() {
 	if p.BinaryChange {
 		p.Restarts = append(p.Restarts, "supavise.service, the daemon with the HTTPS proxy and the Management API")
-		p.Impact = append(p.Impact, "HTTPS requests fail for a few seconds while the daemon restarts; the projects' databases keep running")
+		p.Impact = append(p.Impact, "HTTPS requests fail for a few seconds while the daemon restarts; the projects' databases and services keep running unless the new release renders their files differently (see the notes)")
 	}
 	for _, m := range p.System {
 		switch m.Service {
@@ -233,7 +233,8 @@ func (p *Plan) describe() {
 	p.Notes = append(p.Notes, "A base backup of the system project and of every running project is taken first; if one fails nothing is changed. "+back)
 	if p.BinaryChange {
 		p.Notes = append(p.Notes, "The new daemon restarts any shared service whose files it renders differently, whether or not the service's release moves, so a service this list does not name can restart too; if that is Supavisor, every pooled connection drops, and if it is Realtime, every websocket drops. The files are rendered by the new binary, so this list cannot name those services before the upgrade.")
-		p.Notes = append(p.Notes, "A project whose GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order; the files are rendered by the new binary, so this list cannot name those projects before the upgrade.")
+		p.Notes = append(p.Notes, "A project whose PostgreSQL, GoTrue or PostgREST files the new release renders differently restarts too, in the same canary and batch order (a PostgreSQL restart drops the project's database connections and restarts its GoTrue and PostgREST with it); the files are rendered by the new binary, so this list cannot name those projects before the upgrade.")
+		p.Notes = append(p.Notes, "The system PostgreSQL cluster restarts when the daemon starts if the new release renders its files differently, even when its release does not move. The registry, the dashboard's sign-in and the Management API are unavailable for some seconds then; this is not part of the rollout.")
 	}
 }
 
@@ -360,7 +361,15 @@ func CheckGates(n *Node, p *Plan, o GateOptions) Gates {
 			warn("`supavise status` could not be read")
 		}
 	}
-	if need := DiskNeeded(n, p); n.DiskFree != 0 && n.DiskFree < need {
+	if n.DiskUnknown {
+		// The check is part of the brief; a timer does not go on without it.
+		msg := "could not read the free space of " + n.DiskPath + ", so the upgrade cannot check that it has room for the new artifacts and the backups"
+		if o.Unattended {
+			refuse("%s", msg)
+		} else {
+			warn("%s", msg)
+		}
+	} else if need := DiskNeeded(n, p); n.DiskFree < need {
 		refuse("%s has %s free and the upgrade needs about %s (new artifacts and, with local backups, a copy of every project's data)", n.DiskPath, human(n.DiskFree), human(need))
 	}
 	if !n.Escrow.Covered {

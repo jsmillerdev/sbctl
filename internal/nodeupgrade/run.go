@@ -111,7 +111,7 @@ type Host interface {
 	WaitShared(ctx context.Context, moves []ServiceMove) error
 	// UpgradeProjects runs `projects upgrade --all` on the new binary for the target releases and
 	// returns every project that moved since `since`, also when it fails. The same rollout also
-	// restarts the projects whose GoTrue or PostgREST files the new daemon rendered differently
+	// restarts the projects whose PostgreSQL, GoTrue or PostgREST files the new daemon rendered differently
 	// and left running (the daemon holds those restarts back while an upgrade runs), in the same
 	// canary and batch order.
 	UpgradeProjects(ctx context.Context, target map[string]string, since time.Time) ([]ProjectMove, error)
@@ -344,14 +344,14 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	}
 
 	var projectMoves []ProjectMove
-	// A new binary can render a project's GoTrue or PostgREST files differently without moving a
+	// A new binary can render a project's PostgreSQL, GoTrue or PostgREST files differently without moving a
 	// release; the daemon leaves those units running while the upgrade runs, and the rollout
 	// restarts them, so the rollout runs after every change of binary.
 	if len(plan.Upgrade) > 0 || plan.BinaryChange {
 		r.mark(PhaseProjects, fmt.Sprintf("upgrading %d project(s)", len(plan.Upgrade)))
 		o.say("upgrading %d project(s): %d canary, then %d at a time", len(plan.Upgrade), plan.Canary, plan.Batch)
 		if len(plan.Upgrade) == 0 {
-			o.say("(and restarting the projects whose service files the new release renders differently)")
+			o.say("(and restarting the projects whose service files the new release renders differently, PostgreSQL included)")
 		}
 		var err error
 		if projectMoves, err = h.UpgradeProjects(ctx, plan.ProjectTarget, r.started); err != nil {
@@ -363,9 +363,7 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 	if err := waitVerdict(ctx, h, r.o, node.Verdict); err != nil {
 		return r.rollback(ctx, prev, projectMoves, fmt.Errorf("the node is not healthy after the upgrade: %w", err))
 	}
-	if err := h.EndUpgrade(ctx, plan.To, o.now()); err != nil {
-		log.Warn("could not record the end of the upgrade", "error", err.Error())
-	}
+	r.endUpgrade(ctx)
 	h.Cleanup(ctx, o.Keep, plan.To)
 	r.mark(PhaseDone, "")
 	log.Info("upgrade_succeeded", "from", node.Version, "to", plan.To, "projects", len(projectMoves))
@@ -374,6 +372,31 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 }
 
 func (r *run) mark(phase, detail string) { r.h.Mark(phase, detail) }
+
+// endUpgrade records the end of the upgrade in the kept record, trying a few times: without it a
+// later rollback cannot tell which projects the upgrade moved from the ones an Owner upgraded
+// afterwards, and leaves the projects alone.
+func (r *run) endUpgrade(ctx context.Context) {
+	every := min(r.o.VerifyEvery, 2*time.Second)
+	if every <= 0 {
+		every = 2 * time.Second
+	}
+	end := r.o.now()
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(every):
+			}
+		}
+		if err = r.h.EndUpgrade(ctx, r.plan.To, end); err == nil {
+			return
+		}
+	}
+	r.o.log().Warn("could not record the end of the upgrade", "error", err.Error())
+	r.o.say("warning: could not record the end of the upgrade (%v); `supavise rollback` will leave the projects it moved on their releases", err)
+}
 
 // endRefused ends an upgrade that changed nothing.
 func (r *run) endRefused(err error) error {

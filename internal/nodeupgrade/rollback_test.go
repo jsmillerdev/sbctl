@@ -250,3 +250,21 @@ func TestEndOfTheUpgradeIsKeptInTheRecord(t *testing.T) {
 		t.Fatalf("record = %+v", rec)
 	}
 }
+
+// A kept record that has the start of its upgrade and no end cannot tell the upgrade's moves from
+// an Owner's later ones: a rollback puts none of them back, and does not even read them.
+func TestRollbackWithoutTheEndOfTheUpgradeLeavesTheProjects(t *testing.T) {
+	h := rollbackHost()
+	h.cur.UpgradeStartedAt = t0.Add(-3 * time.Hour)
+	if err := Rollback(context.Background(), h, runOpts(h)); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	if h.has("revert") {
+		t.Fatalf("projects were reverted: %s", h.order())
+	}
+	if !h.window[0].IsZero() {
+		t.Fatalf("the moves were read for %v", h.window)
+	}
+	mustContain(t, h.out.String(), "does not say when its upgrade ended")
+	mustContain(t, h.out.String(), "rolled back: Supavise v1.0.0 is running")
+}

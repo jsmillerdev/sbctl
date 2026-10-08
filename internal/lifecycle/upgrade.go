@@ -1063,10 +1063,10 @@ func (e *Engine) CollectArtifacts(ctx context.Context, keepReleases int, dryRun 
 	return st.GC(keepSet, dryRun)
 }
 
-// PendingRestart reports whether the GoTrue or PostgREST of ref runs older files than the ones
-// the node renders for it now: a release (or a setting) changed them while the daemon, which held
-// its restarts back for an upgrade's rollout (DeferRestarts), left the unit running. A plane that
-// cannot tell answers no.
+// PendingRestart reports whether the PostgreSQL, GoTrue or PostgREST of ref runs older files than
+// the ones the node renders for it now: a release (or a setting) changed them while the daemon,
+// which held its restarts back for an upgrade's rollout (DeferRestarts), left the unit running. A
+// plane that cannot tell answers no.
 func (e *Engine) PendingRestart(ctx context.Context, ref string) (bool, error) {
 	pr, ok := e.plane.(PendingRestarter)
 	if !ok {
@@ -1083,9 +1083,10 @@ func (e *Engine) PendingRestart(ctx context.Context, ref string) (bool, error) {
 	return pr.PendingRestart(ctx, p, keys)
 }
 
-// RestartPending restarts the GoTrue and PostgREST of ref that run older files than the ones
-// rendered for them, and waits until they answer. It reports whether it restarted any. The
-// project's database is not touched.
+// RestartPending restarts the PostgreSQL, GoTrue and PostgREST of ref that run older files than
+// the ones rendered for them, and waits until they answer. It reports whether it restarted any.
+// A restarted database takes the project's GoTrue and PostgREST down with it, and they start
+// again on the rendered files. A database on its current files is not touched.
 func (e *Engine) RestartPending(ctx context.Context, ref string) (bool, error) {
 	pr, ok := e.plane.(PendingRestarter)
 	if !ok {

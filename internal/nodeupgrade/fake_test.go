@@ -91,6 +91,7 @@ type fakeHost struct {
 	applied       []string
 	appliedErr    error
 	revertErr     error
+	endFails      int // EndUpgrade fails this many times, then succeeds
 	restoreErr    error
 	prev, cur     *Record
 	since         []ProjectMove
@@ -251,6 +252,12 @@ func (f *fakeHost) Restore(_ context.Context, from string, rec Record) error {
 
 func (f *fakeHost) EndUpgrade(_ context.Context, version string, _ time.Time) error {
 	f.rec("end %s", version)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.endFails > 0 {
+		f.endFails--
+		return errBoom
+	}
 	return nil
 }
 

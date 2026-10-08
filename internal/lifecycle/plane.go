@@ -279,7 +279,13 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 		// A running cluster keeps the settings it started with (Start on a running unit is
 		// a no-op), so changed sizing, archive_command or launcher path need a restart.
 		st, serr := pl.sup.Status(ctx, spec.Unit())
+		running := serr != nil || st.State == units.StateActive || st.State == units.StateActivating
 		switch {
+		case !running:
+		case restartsDeferred(ctx):
+			// A restart stops the project's GoTrue and PostgREST with it (their units require the
+			// cluster), so it belongs to the upgrade's rollout like theirs (RestartPending).
+			pl.log.Info("postgres settings changed; the restart waits for the upgrade's rollout", "unit", spec.Unit())
 		case serr != nil:
 			// Cannot tell whether it runs. Start on a running unit is a no-op, so skipping
 			// the stop would leave the cluster on its old settings without a trace; Stop on a
@@ -288,7 +294,7 @@ func (pl *PostgresPlane) StartDatabase(ctx context.Context, p *registry.Project,
 			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
 				return err
 			}
-		case st.State == units.StateActive || st.State == units.StateActivating:
+		default:
 			pl.log.Info("postgres settings changed; restarting the running cluster", "unit", spec.Unit())
 			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
 				return err
@@ -398,12 +404,13 @@ func (pl *PostgresPlane) filesNewerThan(spec units.Spec, st units.Status) bool {
 
 type deferRestartsKey struct{}
 
-// DeferRestarts marks ctx so that Start renders the GoTrue and PostgREST files of a project and
-// leaves a running unit on its old ones. The daemon marks its start while `supavise upgrade`
-// moves the node forward: a new binary can render every project's files differently, and the
-// restart of fifty projects one after the other, with no canary and no stop at the first failure,
-// belongs to the upgrade's rollout (Engine.RestartPending, `projects upgrade --restart-changed`),
-// not to the daemon's start.
+// DeferRestarts marks ctx so that Start renders the PostgreSQL, GoTrue and PostgREST files of a
+// project and leaves a running unit on its old ones. The daemon marks its start while `supavise
+// upgrade` moves the node forward: a new binary can render every project's files differently, and
+// the restart of fifty projects one after the other, with no canary and no stop at the first
+// failure, belongs to the upgrade's rollout (Engine.RestartPending, `projects upgrade
+// --restart-changed`), not to the daemon's start. The system cluster is not deferred: the daemon
+// needs it, and the plan names its restart.
 func DeferRestarts(ctx context.Context) context.Context {
 	return context.WithValue(ctx, deferRestartsKey{}, true)
 }
@@ -415,11 +422,12 @@ func restartsDeferred(ctx context.Context) bool {
 
 // PendingRestarter is the optional Plane capability behind Engine.PendingRestart.
 type PendingRestarter interface {
-	// PendingRestart reports whether a running GoTrue or PostgREST unit of p runs older files than
-	// the ones rendered for it now.
+	// PendingRestart reports whether a running PostgreSQL, GoTrue or PostgREST unit of p runs older
+	// files than the ones rendered for it now.
 	PendingRestart(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (bool, error)
 	// RestartPending stops the units PendingRestart names, starts them on the new files and waits
-	// until they answer. It reports whether it restarted any.
+	// until they answer. It reports whether it restarted any. A restarted cluster takes the
+	// project's GoTrue and PostgREST down with it, and they start again on the new files.
 	RestartPending(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (bool, error)
 }
 
@@ -448,22 +456,75 @@ func (pl *PostgresPlane) pendingAPI(ctx context.Context, p *registry.Project, ke
 	return out, nil
 }
 
+// pendingDatabase renders the cluster unit of p and returns its spec when the running cluster
+// started on older files than the ones rendered. A saved setting that waits for a restart renders
+// into the unit too, so such a cluster counts as pending.
+func (pl *PostgresPlane) pendingDatabase(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (*units.Spec, error) {
+	spec, err := pl.postgresSpec(ctx, p, keys)
+	if err != nil {
+		return nil, err
+	}
+	changed, err := pl.render(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	st, err := pl.sup.Status(ctx, spec.Unit())
+	if err != nil || (st.State != units.StateActive && st.State != units.StateActivating) {
+		return nil, nil
+	}
+	if changed || pl.filesNewerThan(spec, st) {
+		return &spec, nil
+	}
+	return nil, nil
+}
+
 // PendingRestart implements PendingRestarter.
 func (pl *PostgresPlane) PendingRestart(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (bool, error) {
+	db, err := pl.pendingDatabase(ctx, p, keys)
+	if err != nil || db != nil {
+		return db != nil, err
+	}
 	pending, err := pl.pendingAPI(ctx, p, keys)
 	return len(pending) > 0, err
 }
 
 // RestartPending implements PendingRestarter.
 func (pl *PostgresPlane) RestartPending(ctx context.Context, p *registry.Project, keys *secrets.ProjectKeys) (bool, error) {
-	pending, err := pl.pendingAPI(ctx, p, keys)
-	if err != nil || len(pending) == 0 {
+	// The rollout restarts what the daemon held back: nothing here may be deferred again.
+	ctx = context.WithValue(ctx, deferRestartsKey{}, false)
+	db, err := pl.pendingDatabase(ctx, p, keys)
+	if err != nil {
 		return false, err
 	}
-	for _, spec := range pending {
-		pl.log.Info("service files changed; restarting the running unit", "unit", spec.Unit())
-		if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
+	api, err := pl.pendingAPI(ctx, p, keys)
+	if err != nil || (db == nil && len(api) == 0) {
+		return false, err
+	}
+	if db != nil {
+		// GoTrue and PostgREST require the cluster, so they go down with it. Stop them first, in
+		// the order Stop uses, then the cluster; startAPI starts them again after it.
+		all, err := pl.apiSpecs(ctx, p, keys)
+		if err != nil {
 			return false, err
+		}
+		for i := len(all) - 1; i >= 0; i-- {
+			if err := pl.sup.Stop(ctx, all[i].Unit()); err != nil {
+				return false, err
+			}
+		}
+		pl.log.Info("postgres files changed; restarting the running cluster", "unit", db.Unit())
+		if err := pl.sup.Stop(ctx, db.Unit()); err != nil {
+			return false, err
+		}
+		if err := pl.StartDatabase(ctx, p, keys); err != nil {
+			return false, err
+		}
+	} else {
+		for _, spec := range api {
+			pl.log.Info("service files changed; restarting the running unit", "unit", spec.Unit())
+			if err := pl.sup.Stop(ctx, spec.Unit()); err != nil {
+				return false, err
+			}
 		}
 	}
 	return true, pl.startAPI(ctx, p, keys)

@@ -31,7 +31,9 @@ type Node struct {
 
 	// DiskFree is the free space of the state volume (DiskPath). LocalBackups says the backup
 	// backend is on that volume, so the base backups taken first use it.
-	DiskFree     uint64
+	DiskFree uint64
+	// DiskUnknown is true when the free space could not be read (DiskFree is then meaningless).
+	DiskUnknown  bool
 	DiskPath     string
 	LocalBackups bool
 

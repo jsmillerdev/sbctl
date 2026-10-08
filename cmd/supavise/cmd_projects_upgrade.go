@@ -207,17 +207,20 @@ func upgradeProject(ctx context.Context, n *lifecycle.Node, out *lineWriter, ref
 	return nil
 }
 
-// restartChanged restarts the GoTrue and PostgREST of ref that run older files than the ones
-// rendered for them, and prints what happened.
+// restartChanged restarts the PostgreSQL, GoTrue and PostgREST of ref that run older files than the
+// ones rendered for them, and prints what happened.
 func restartChanged(ctx context.Context, n *lifecycle.Node, out *lineWriter, ref string) error {
+	if pending, err := n.Engine.PendingRestart(ctx, ref); err != nil || !pending {
+		return err
+	}
 	started := time.Now()
-	out.printf("%s: restarting GoTrue and PostgREST on their changed service files\n", ref)
+	out.printf("%s: restarting the services whose files changed\n", ref)
 	restarted, err := n.Engine.RestartPending(ctx, ref)
 	switch {
 	case err != nil:
 		out.printf("%s: FAILED after %s: %v\n", ref, time.Since(started).Round(time.Second), err)
 	case restarted:
-		out.printf("%s: restarted on their changed files in %s\n", ref, time.Since(started).Round(time.Second))
+		out.printf("%s: restarted on the changed files in %s\n", ref, time.Since(started).Round(time.Second))
 	}
 	return err
 }
@@ -282,7 +285,7 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 		fmt.Fprintf(cmd.OutOrStdout(), "note: %s\n", note)
 	}
 	if len(restartOnly) > 0 {
-		fmt.Fprintf(cmd.OutOrStdout(), "%d project(s) only restart GoTrue and PostgREST: their service files changed and the units still run the old ones.\n", len(restartOnly))
+		fmt.Fprintf(cmd.OutOrStdout(), "%d project(s) only restart: their PostgreSQL, GoTrue or PostgREST files changed and the units still run the old ones.\n", len(restartOnly))
 	}
 	if len(restartOnly) < len(todo) {
 		fmt.Fprintln(cmd.OutOrStdout(), "A base backup is taken first; if it fails nothing is stopped. If the new versions do not start, the previous ones are started again.")
@@ -538,7 +541,7 @@ and stops. Run as the user that owns the state directory (supavise).`
 	upgrade.Flags().StringArrayVar(&upTo, "to", nil, "move this service to this release instead of the node's pin, <service>=<release tag> (repeatable; services not named keep the version they run)")
 	upgrade.Flags().StringVar(&upReuseBackupSince, "reuse-backup-since", "", "use a base backup of the project that finished after this time (RFC 3339) as the pre-upgrade backup (what `supavise upgrade` passes after it backed everything up)")
 	_ = upgrade.Flags().MarkHidden("reuse-backup-since")
-	upgrade.Flags().BoolVar(&upRestartChanged, "restart-changed", false, "with --all: also restart the GoTrue and PostgREST of projects that run older service files than the ones rendered for them (what `supavise upgrade` passes; the daemon holds those restarts back while it runs)")
+	upgrade.Flags().BoolVar(&upRestartChanged, "restart-changed", false, "with --all: also restart the PostgreSQL, GoTrue and PostgREST of projects that run older service files than the ones rendered for them (what `supavise upgrade` passes; the daemon holds those restarts back while it runs)")
 	_ = upgrade.Flags().MarkHidden("restart-changed")
 	upgrade.Flags().BoolVar(&upAllowOlder, "allow-older", false, "allow --to to name an older release than the project runs (what `supavise rollback` does for the projects an upgrade moved)")
 

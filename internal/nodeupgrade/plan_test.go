@@ -264,6 +264,15 @@ func TestGates(t *testing.T) {
 	if g := CheckGates(n, plan(n), opts); len(g.Refusals) != 1 || !strings.Contains(g.Refusals[0], "free") {
 		t.Fatalf("disk: %+v", g)
 	}
+	// Free space that cannot be read: a warning for a person, a refusal for a timer.
+	n = testNode()
+	n.DiskUnknown, n.DiskFree = true, 0
+	if g := CheckGates(n, plan(n), GateOptions{Now: t0}); len(g.Refusals) != 0 || len(g.Warnings) != 1 || !strings.Contains(g.Warnings[0], "free space") {
+		t.Fatalf("disk unknown, attended: %+v", g)
+	}
+	if g := CheckGates(n, plan(n), GateOptions{Now: t0, Unattended: true}); len(g.Refusals) != 1 || !strings.Contains(g.Refusals[0], "free space") {
+		t.Fatalf("disk unknown, unattended: %+v", g)
+	}
 	n = testNode()
 	n.LocalBackups = true
 	n.Projects[1].DiskBytes, n.Projects[2].DiskBytes = 120<<30, 120<<30
@@ -307,6 +316,16 @@ func TestPlanSaysSharedServicesCanRestartWithoutAMove(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("plan lacks %q:\n%s", want, out.String())
 		}
+	}
+	// The databases are not promised to keep running: a project's PostgreSQL and the system cluster
+	// can restart when the new binary renders their files differently.
+	for _, want := range []string{"PostgreSQL, GoTrue or PostgREST files the new release renders differently", "drops the project's database connections", "The system PostgreSQL cluster restarts when the daemon starts"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("plan lacks %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "databases keep running") {
+		t.Fatalf("the plan promises that databases keep running:\n%s", out.String())
 	}
 	// The same binary renders the same files: nothing to warn about.
 	n.Version = to.Version

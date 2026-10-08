@@ -768,7 +768,7 @@ or volume is another size gets that sentence, although an upgrade resizes nothin
   project `UPGRADING`, the upgrade running in the background on a context detached from the request and
   bounded to 2 hours (a shutdown waits for it like for a delete). 400 for a target that is not the
   node's, another channel, a project that already runs the node's versions or has no upgrade path; 409 for a
-  project that is not `ACTIVE_HEALTHY` or is being upgraded; 503 on a node without a backup service.
+  project that is not `ACTIVE_HEALTHY` or is being upgraded, and for any project while `supavise upgrade` moves the node (the upgrade marker says it runs; the daemon restarts under a project upgrade, and the node upgrade's rollback would revert it); 503 on a node without a backup service.
 - `GET .../upgrade/status`: `databaseUpgradeStatus` is null for a project never upgraded, otherwise the newest upgrade:
   `status` 0 upgrading, 1 upgraded, 2 failed (Studio's `DatabaseUpgradeStatus`), `progress` and `error` as hosted names
   them (the mapping is in `internal/lifecycle/README.md`), `initiated_at`, `latest_status_at`, `target_version`. The

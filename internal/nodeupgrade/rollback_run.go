@@ -46,11 +46,17 @@ func Rollback(ctx context.Context, h Host, o Options) error {
 		if since.IsZero() {
 			since = cur.InstalledAt
 		}
-		all, err := h.MovesBetween(ctx, since, cur.UpgradeEndedAt)
-		if err != nil {
-			return refused("cannot read which projects the upgrade moved: %v", err)
+		if !cur.UpgradeStartedAt.IsZero() && cur.UpgradeEndedAt.IsZero() {
+			// Without the end, a project an Owner upgraded after the node's upgrade would look like
+			// one of the upgrade's moves, so none is put back.
+			o.say("note: the kept record of %s does not say when its upgrade ended, so the projects it upgraded are left on their releases (`supavise projects versions` lists them)", node.Version)
+		} else {
+			all, err := h.MovesBetween(ctx, since, cur.UpgradeEndedAt)
+			if err != nil {
+				return refused("cannot read which projects the upgrade moved: %v", err)
+			}
+			moves = revertable(all, node, cur.UpgradeEndedAt)
 		}
-		moves = revertable(all, node, cur.UpgradeEndedAt)
 	} else {
 		o.say("note: the kept record of %s is gone, so the projects it upgraded are left on their releases (`supavise projects versions` lists them)", node.Version)
 	}

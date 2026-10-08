@@ -557,6 +557,118 @@ func TestRestartPendingRestartsOnlyUnitsOnOlderFiles(t *testing.T) {
 	}
 }
 
+// A restart of the cluster stops the project's GoTrue and PostgREST with it, so it is held back
+// with theirs: while an upgrade moves the node, the daemon renders the cluster's files and leaves a
+// running cluster on its old ones.
+func TestStartDatabaseDefersTheRestartWhenAsked(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		state    units.State
+		deferred bool
+		want     string
+	}{
+		{"running, changed", units.StateActive, false, "render stop start"},
+		{"running, changed, deferred", units.StateActive, true, "render start"},
+		{"stopped, changed, deferred", units.StateInactive, true, "render start"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.StateDir = shortTempDir(t)
+			cfg.Domain = "example.test"
+			cfg.BinPath = "/usr/local/bin/supavise"
+			sup := &recSup{state: tc.state, changed: true}
+			pl := NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: time.Millisecond})
+			p := testProject(cfg, "abcdefghijklmnopqrst", 2)
+			ctx := context.Background()
+			if tc.deferred {
+				ctx = DeferRestarts(ctx)
+			}
+			_ = pl.StartDatabase(ctx, p, testKeys(t, p.Ref))
+			if got := strings.Join(sup.calls, " "); got != tc.want {
+				t.Fatalf("calls = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// namedSup records the unit each start and stop names.
+type namedSup struct {
+	recSup
+	units []string
+}
+
+func (n *namedSup) Start(ctx context.Context, unit string) error {
+	n.units = append(n.units, "start "+unit)
+	return n.recSup.Start(ctx, unit)
+}
+
+func (n *namedSup) Stop(ctx context.Context, unit string) error {
+	n.units = append(n.units, "stop "+unit)
+	return n.recSup.Stop(ctx, unit)
+}
+
+// The rollout finds a cluster the daemon left on older files and restarts it: GoTrue and PostgREST
+// stop first (their units require the cluster), then the cluster, and it starts again on the
+// rendered files. A project whose cluster is current is not touched.
+func TestRestartPendingRestartsAClusterOnOlderFiles(t *testing.T) {
+	const ref = "abcdefghijklmnopqrst"
+	now := time.Now()
+	cfg := config.Default()
+	cfg.StateDir = shortTempDir(t)
+	cfg.Domain = "example.test"
+	cfg.BinPath = "/usr/local/bin/supavise"
+	p := testProject(cfg, ref, 2)
+	pgFiles := units.FilesFor(cfg, units.Spec{Service: config.SvcPostgres, Ref: ref})
+	// The API units' files are old; the cluster's were rendered after the process started.
+	writeAPIFiles(t, cfg, ref, now.Add(-2*time.Hour))
+	for _, f := range []string{pgFiles.Env, pgFiles.Run} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(f, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newPlane := func(started time.Time) (*PostgresPlane, *namedSup) {
+		sup := &namedSup{recSup: recSup{state: units.StateActive, since: started}}
+		return NewPostgresPlane(cfg, sup, fakeArts{}, registry.NewMemory(), PlaneOptions{PostgresReadyTimeout: time.Millisecond, ServiceReadyTimeout: time.Millisecond}), sup
+	}
+
+	pl, sup := newPlane(now.Add(time.Hour)) // started after every file
+	if pending, err := pl.PendingRestart(context.Background(), p, testKeys(t, ref)); err != nil || pending {
+		t.Fatalf("current: pending = %v, %v", pending, err)
+	}
+	if restarted, err := pl.RestartPending(context.Background(), p, testKeys(t, ref)); err != nil || restarted || len(sup.units) != 0 {
+		t.Fatalf("current: restarted = %v, %v, units %v", restarted, err, sup.units)
+	}
+
+	pl, sup = newPlane(now.Add(-time.Hour)) // started before the cluster's files, after the API's
+	if pending, err := pl.PendingRestart(context.Background(), p, testKeys(t, ref)); err != nil || !pending {
+		t.Fatalf("held back: pending = %v, %v", pending, err)
+	}
+	// The daemon's start leaves the cluster running...
+	_ = pl.StartDatabase(DeferRestarts(context.Background()), p, testKeys(t, ref))
+	if len(sup.units) != 1 || !strings.HasPrefix(sup.units[0], "start ") {
+		t.Fatalf("a deferred start touched the running cluster: %v", sup.units)
+	}
+	sup.units = nil
+	// ...and the rollout restarts it, even when it carries a deferral. (Nothing answers, so the
+	// wait for the cluster ends the call; the order of the stops and the start is what is checked.)
+	_, _ = pl.RestartPending(DeferRestarts(context.Background()), p, testKeys(t, ref))
+	cluster := config.UnitName(config.SvcPostgres, ref)
+	var want []string
+	if hasPostgREST(ref) {
+		want = append(want, "stop "+config.UnitName(config.SvcPostgREST, ref))
+	}
+	want = append(want, "stop "+config.UnitName(config.SvcGoTrue, ref), "stop "+cluster, "start "+cluster)
+	if got := strings.Join(sup.units, ", "); got != strings.Join(want, ", ") {
+		t.Fatalf("units:\n got %s\nwant %s", got, strings.Join(want, ", "))
+	}
+}
+
 // Deleting a project also removes the bundler's unit instance of the project: the module
 // cache of its uploads is private to that unit and goes with it.
 type namedRemoveSup struct {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/jsmillerdev/supavise/internal/config"
 	"github.com/jsmillerdev/supavise/internal/lifecycle"
+	"github.com/jsmillerdev/supavise/internal/notice"
 	"github.com/jsmillerdev/supavise/internal/registry"
 )
 
@@ -165,6 +166,12 @@ func (s *Server) upgradeProject(w http.ResponseWriter, r *http.Request) error {
 	p, err := s.loadProject(r.Context(), r.PathValue("ref"))
 	if err != nil {
 		return err
+	}
+	// A node upgrade restarts the daemon and moves every project; a project upgrade started now
+	// would be cut off by the restart, and the rollout would count it as its own move (and put it
+	// back if the node upgrade failed).
+	if u, running := notice.UpgradeRunning(s.cfg.Paths(), s.now()); running && u.ProcessAlive() {
+		return errf(http.StatusConflict, "the node is being upgraded (%s); try again when it has finished", u.Phase)
 	}
 	if in.ReleaseChannel != "" && in.ReleaseChannel != "ga" {
 		return errf(http.StatusBadRequest, "release_channel %q is not available: this node has the ga channel only", in.ReleaseChannel)

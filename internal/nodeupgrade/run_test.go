@@ -508,3 +508,30 @@ func TestCheckNeedsNeitherTheRegistryNorAQuietNode(t *testing.T) {
 		t.Fatalf("an upgrade reads the registry: %v", err)
 	}
 }
+
+// The end of the upgrade is what lets a rollback tell its moves from an Owner's later ones, so a
+// failed write is retried, and the operator hears when it never lands.
+func TestEndOfTheUpgradeIsRecordedWithRetries(t *testing.T) {
+	h := newFakeHost()
+	h.endFails = 2
+	if err := Run(context.Background(), h, runOpts(h)); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	if n := strings.Count(h.order(), "end v1.1.0"); n != 3 {
+		t.Fatalf("EndUpgrade called %d times, want 3 (two failures, one success): %s", n, h.order())
+	}
+	if strings.Contains(h.out.String(), "could not record") {
+		t.Fatalf("warned although the third try worked:\n%s", h.out)
+	}
+
+	h = newFakeHost()
+	h.endFails = 100
+	if err := Run(context.Background(), h, runOpts(h)); err != nil {
+		t.Fatalf("a record that cannot be written fails the upgrade: %v", err)
+	}
+	if n := strings.Count(h.order(), "end v1.1.0"); n != 4 {
+		t.Fatalf("EndUpgrade called %d times, want 4", n)
+	}
+	mustContain(t, h.out.String(), "could not record the end of the upgrade")
+	mustContain(t, h.out.String(), "leave the projects it moved")
+}
