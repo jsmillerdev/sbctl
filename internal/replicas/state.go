@@ -36,6 +36,8 @@ type replicaState struct {
 	reensured time.Time
 	// removeSince is when the removal of the replica first failed.
 	removeSince time.Time
+	// room is set while the node has refused the replica for lack of room, until a launch goes through.
+	room *roomRefusal
 
 	// What the setup learned, for the estimates: the base backup's id, size and stop LSN, and when
 	// the download began.
@@ -54,6 +56,13 @@ type callState struct {
 	tries int
 	next  time.Time
 	err   string
+}
+
+// roomRefusal is a node's refusal of a replica for lack of room: the pass does not ask the node
+// again before until, and reason is the node's words for the alert.
+type roomRefusal struct {
+	until  time.Time
+	reason string
 }
 
 // st returns id's state, creating it. The caller holds c.mu.

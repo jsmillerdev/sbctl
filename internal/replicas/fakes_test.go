@@ -245,6 +245,12 @@ func (f *fakePooler) RemoveReplicaTenant(_ context.Context, identifier string) e
 	return nil
 }
 
+// fakeNoRoom is the error a node's Ensure returns when its own admission says it is full.
+type fakeNoRoom struct{ msg string }
+
+func (e fakeNoRoom) Error() string { return "node n2: " + e.msg }
+func (e fakeNoRoom) NoRoom() bool  { return true }
+
 // fakeAdmit refuses the nodes in full.
 type fakeAdmit struct {
 	mu   sync.Mutex

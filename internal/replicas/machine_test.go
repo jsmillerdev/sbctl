@@ -2,6 +2,7 @@ package replicas
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -360,6 +361,58 @@ func TestAdmitSeesWhatTheNodeHolds(t *testing.T) {
 	}
 	if second.SeedBytes != 0 {
 		t.Fatalf("seed bytes %d with no base backup row", second.SeedBytes)
+	}
+}
+
+// A node the leader cannot judge refuses the replica itself when it is asked to create it. That
+// is a wait, not a failure: the row goes back to 0_requested, the node gets one replica_capacity
+// alert, the node is asked again every minute however long it takes, and the setup goes on when it fits.
+func TestNodeRefusalForRoomWaits(t *testing.T) {
+	e := newEnv(t)
+	if err := e.ctrl.SetupOn(e.ctx, refA, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	id := e.replica(refA, "n2").Identifier
+	e.nodes.ensureErr = fakeNoRoom{"not enough memory"}
+	e.tick(2)
+	if r := e.replica(refA, "n2"); r.Status != registry.ReplicaInit || r.InitStep != StepRequested || r.InitError != "" {
+		t.Fatalf("after the refusal: %+v", r)
+	}
+	if got := e.nodes.callsMatching("ensure n2 " + id); got != 1 {
+		t.Fatalf("ensure calls: %d", got)
+	}
+	if e.alerts.count(alerts.KindReplicaCapacity, false) != 1 || !strings.Contains(e.alerts.evs[0].Detail, "not enough memory") {
+		t.Fatalf("capacity alerts: %+v", e.alerts.evs)
+	}
+	// Not asked again within the minute.
+	e.clock.Advance(30 * time.Second)
+	e.tick(2)
+	if got := e.nodes.callsMatching("ensure n2 " + id); got != 1 {
+		t.Fatalf("asked again within a minute: %d", got)
+	}
+	// Refused for longer than the window of failed calls: still waiting, one alert, no failure.
+	for range 14 {
+		e.clock.Advance(time.Minute)
+		e.tick(2)
+	}
+	if r := e.replica(refA, "n2"); r.Status != registry.ReplicaInit || r.InitError != "" {
+		t.Fatalf("after 14 minutes of refusals: %+v", r)
+	}
+	if got := e.nodes.callsMatching("ensure n2 " + id); got < 10 {
+		t.Fatalf("ensure calls: %d", got)
+	}
+	if e.alerts.count(alerts.KindReplicaCapacity, false) != 1 || e.alerts.count(alerts.KindReplicaCapacity, true) != 0 {
+		t.Fatalf("capacity alerts flapped: %+v", e.alerts.evs)
+	}
+	// Room is made: the next ask is taken and the setup runs to the end.
+	e.nodes.ensureErr = nil
+	e.clock.Advance(time.Minute)
+	e.settle(refA, "n2")
+	if e.alerts.count(alerts.KindReplicaCapacity, true) != 1 {
+		t.Fatalf("the capacity alert did not close: %+v", e.alerts.evs)
+	}
+	if e.alerts.count(alerts.KindReplicaUnhealthy, false) != 0 {
+		t.Fatalf("a refusal raised a failure: %+v", e.alerts.evs)
 	}
 }
 

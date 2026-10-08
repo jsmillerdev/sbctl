@@ -75,6 +75,12 @@ func (c *Controller) admit(ctx context.Context, nodes []registry.Node, projects 
 			continue
 		}
 		waiting[n.ID]++
+		refused := c.roomRefusal(r.Identifier)
+		if refused != nil && c.now().Before(refused.until) {
+			blocked[n.ID] = append(blocked[n.ID], r.Ref)
+			reasons[n.ID] = refused.reason
+			continue
+		}
 		if slots <= 0 {
 			continue
 		}
@@ -97,7 +103,8 @@ func (c *Controller) admit(ctx context.Context, nodes []registry.Node, projects 
 		}
 		if c.setStatus(ctx, r.Identifier, registry.ReplicaInit, StepStarted, "") {
 			slots--
-			cleared[n.ID] = true
+			// A replica the node refused is not a room found until the node takes it.
+			cleared[n.ID] = cleared[n.ID] || refused == nil
 		}
 	}
 	c.capacityAlerts(ctx, nodeByID, blocked, reasons, func(node string) bool { return waiting[node] == 0 || cleared[node] })
@@ -192,6 +199,10 @@ func (c *Controller) launch(ctx context.Context, r *registry.Replica) {
 	}
 	spec := peerapi.InstanceSpec{Identifier: r.Identifier, Ref: r.Ref, BackupID: backupID(bk), Epoch: epoch}
 	st, err := c.o.Ops.Ensure(ctx, r.NodeID, spec)
+	if noRoom(err) {
+		c.waitForRoom(ctx, r, err)
+		return
+	}
 	if err != nil {
 		c.stepError(ctx, r, "launch", fmt.Errorf("create the instance on %s: %w", r.NodeID, err), terminal(err))
 		return
@@ -200,6 +211,7 @@ func (c *Controller) launch(ctx context.Context, r *registry.Replica) {
 	c.mu.Lock()
 	s := c.st(r.Identifier)
 	s.backupID, s.seedBytes, s.backupLSN = spec.BackupID, bk.SizeBytes, bk.StopLSN
+	s.room = nil
 	c.mu.Unlock()
 	c.observed(r.Identifier, st)
 	if st.Error != "" {
@@ -207,6 +219,49 @@ func (c *Controller) launch(ctx context.Context, r *registry.Replica) {
 		return
 	}
 	c.advance(ctx, r, laterStep(StepLaunched, boundStep(st.Step)))
+}
+
+// roomRetry is how long a replica that a node refused for lack of room waits before the node is
+// asked again. The wait is not a failure: it is not bounded by Timeouts.Retry.
+const roomRetry = time.Minute
+
+// RoomError is what InstanceOps.Ensure returns when the node refused the replica because it has no
+// room for it (memory, cores or disk), before it created anything. The replica then waits at
+// 0_requested with a replica_capacity alert, as for a node the leader knows to be full, instead of
+// failing its setup. placement's errors wrap one when the node's admission says no, and keep it
+// across the peer API.
+type RoomError interface {
+	error
+	NoRoom() bool
+}
+
+// noRoom reports whether err is a node's refusal for lack of room.
+func noRoom(err error) bool {
+	var re RoomError
+	return err != nil && errors.As(err, &re) && re.NoRoom()
+}
+
+// roomRefusal returns the node's last refusal of the replica, or nil.
+func (c *Controller) roomRefusal(id string) *roomRefusal {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s := c.state[id]; s != nil {
+		return s.room
+	}
+	return nil
+}
+
+// waitForRoom puts back a replica that the node has no room for: the row returns to 0_requested,
+// where the pass holds it for roomRetry, raises the node's replica_capacity alert and asks again.
+func (c *Controller) waitForRoom(ctx context.Context, r *registry.Replica, err error) {
+	c.mu.Lock()
+	s := c.st(r.Identifier)
+	s.room = &roomRefusal{until: c.now().Add(roomRetry), reason: err.Error()}
+	delete(s.calls, "launch") // a refusal is not a failed call
+	c.mu.Unlock()
+	if c.setStatus(ctx, r.Identifier, registry.ReplicaInit, StepRequested, "") {
+		c.log.Info("replicas: the node has no room for the replica, it waits", "identifier", r.Identifier, "node", r.NodeID, "reason", err.Error())
+	}
 }
 
 // backupID is the id of a base backup, the last element of its location, which is what

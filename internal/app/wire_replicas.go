@@ -69,8 +69,9 @@ func baseBackups(w *Wire) backup.BaseBackupEnsurer {
 }
 
 // localRoom is what this daemon knows of a node's room: its own machine's memory, cores and free
-// disk. A remote node's are not known here, so its replicas are judged by the node itself when it
-// is asked to create them.
+// disk. A remote node's are not known here, so the node judges its replicas itself when it is asked
+// to create them: a refusal for lack of room (replicas.RoomError) leaves the replica waiting at
+// 0_requested with a replica_capacity alert.
 func localRoom(w *Wire) func(ctx context.Context, n registry.Node) replicas.Room {
 	return func(_ context.Context, n registry.Node) replicas.Room {
 		self := registry.FounderNodeID
