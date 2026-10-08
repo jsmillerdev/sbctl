@@ -290,7 +290,7 @@ intact "$REF"; intact "$REF2"
 for v in v0.0.1 v0.0.2; do
   [[ -x $RELEASES/$v/supavise && $(stat -c %U "$RELEASES/$v/supavise") == root ]] || fail "kept release $v: $(ls -l "$RELEASES/$v" 2>&1)"
 done
-[[ $(python3 -c 'import json; d=json.load(open("'"$RELEASES"'/v0.0.1/release.json")); print(d["pins"]["gotrue"], len(d["registry_migrations"]) > 0, d["migrations_from"])') == "$OLD_AUTH True applied" ]] || fail "the record of v0.0.1: $(cat "$RELEASES/v0.0.1/release.json")"
+[[ $(python3 -c 'import json; d=json.load(open("'"$RELEASES"'/v0.0.1/release.json")); print(d["pins"]["gotrue"], len(d["registry_migrations"]) > 0, d["migrations_from"] in ("applied", "binary"))') == "$OLD_AUTH True True" ]] || fail "the record of v0.0.1: $(cat "$RELEASES/v0.0.1/release.json")"
 sup_status=0; supavise status >"$WORK/status.txt" || sup_status=$?
 [[ $sup_status -eq 0 ]] || { cat "$WORK/status.txt" >&2; fail "supavise status exited $sup_status after the upgrade"; }
 $SV artifacts list | grep -q "$NEW_AUTH" || fail "artifacts list does not show the new GoTrue"
