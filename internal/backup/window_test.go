@@ -102,7 +102,12 @@ func TestRestoreWindowOfAProjectThatIsNotRunning(t *testing.T) {
 	if !w.Latest.Equal(want) {
 		t.Fatalf("latest = %s, want %s", w.Latest, want)
 	}
-	if w.Latest.After(e.now.Add(48 * time.Hour)) {
+	// Neither clock may be passed: the test clock (the manifest) or the real one (the file store).
+	limit := e.now
+	if real := time.Now(); real.After(limit) {
+		limit = real
+	}
+	if w.Latest.After(limit.Add(time.Minute)) {
 		t.Fatalf("latest %s is in the future", w.Latest)
 	}
 }
