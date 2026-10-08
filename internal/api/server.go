@@ -93,6 +93,10 @@ type Deps struct {
 	// Replicas is the read-replica controller (internal/replicas): the setup, remove and restart
 	// of a replica, the listings of a project's databases and the replication lag. Nil: the node
 	// has no controller, the listings show the primary alone and adding a replica is refused.
+	// A node of a cluster always sets it; while its controller does not run, the value refuses a setup,
+	// an add and a restart and still lists and removes, and it is also a replicas.Remover, which the
+	// code that deletes or restores a project asks first so that no replica row is dropped with its
+	// instance still on another node.
 	Replicas replicas.Service
 	// Placement says where a project's replicas are (replicas.go, pgmeta.go). Empty derives it
 	// from Registry.
