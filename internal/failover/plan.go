@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/registry"
 )
@@ -61,6 +63,31 @@ func (o *Orchestrator) viewReplica(ctx context.Context, r registry.Replica) repl
 		v.OK, v.Lag = true, obs.LagSeconds
 	}
 	return v
+}
+
+// viewParallel bounds how many nodes a plan asks at once.
+const viewParallel = 8
+
+// viewReplicas views each replica, viewParallel at a time, and returns the views by identifier. A
+// plan of a cluster with dozens of projects asks as many nodes as it has replicas, and one after
+// another a remote follower would make the plan outlast the timeouts of `status` and the readiness
+// route.
+func (o *Orchestrator) viewReplicas(ctx context.Context, reps []registry.Replica) map[string]replicaView {
+	views := make([]replicaView, len(reps))
+	var g errgroup.Group
+	g.SetLimit(viewParallel)
+	for i, r := range reps {
+		g.Go(func() error {
+			views[i] = o.viewReplica(ctx, r)
+			return nil
+		})
+	}
+	_ = g.Wait()
+	by := make(map[string]replicaView, len(reps))
+	for i, r := range reps {
+		by[r.Identifier] = views[i]
+	}
+	return by
 }
 
 // lagCheck judges the lag of a replica view that is otherwise fine.
@@ -514,7 +541,7 @@ func (o *Orchestrator) storageCheck() Check {
 // must not already hold the epoch of the move or a higher one (another node was promoted).
 func (o *Orchestrator) markerCheck(ctx context.Context, epoch int64) []Check {
 	if o.d.Marker == nil {
-		return []Check{hard(fail("epoch marker", "the backup store is not S3-compatible, so the leader marker cannot be written"))}
+		return []Check{hard(fail("epoch marker", "no leader marker store in this build or backup mode (an S3-compatible backup store has one), so the leader marker cannot be written"))}
 	}
 	m, err := o.d.Marker.ReadLeaderMarker(ctx)
 	switch {
@@ -560,6 +587,16 @@ func (o *Orchestrator) planProjects(ctx context.Context, pl *Plan, run *serverRu
 		pl.Checks = append(pl.Checks, hard(fail("projects", err.Error())))
 		return
 	}
+	// Every replica of every project to move is viewed in one pass, in parallel.
+	repsOf := map[string][]registry.Replica{}
+	var all []registry.Replica
+	for _, p := range projects {
+		if p.Ref != config.SystemRef && p.NodeID == run.from.ID && p.Branch == nil {
+			repsOf[p.Ref], _ = st.ListReplicas(ctx, p.Ref)
+			all = append(all, repsOf[p.Ref]...)
+		}
+	}
+	seen := o.viewReplicas(ctx, all)
 	var without, skipped []string
 	healthy := 0
 	for _, p := range projects {
@@ -571,10 +608,9 @@ func (o *Orchestrator) planProjects(ctx context.Context, pl *Plan, run *serverRu
 			continue
 		}
 		ch := projectChoice{Ref: p.Ref, Paused: p.Status == registry.StatusInactive}
-		reps, _ := st.ListReplicas(ctx, p.Ref)
 		var views []replicaView
-		for _, r := range reps {
-			views = append(views, o.viewReplica(ctx, r))
+		for _, r := range repsOf[p.Ref] {
+			views = append(views, seen[r.Identifier])
 		}
 		// A replica on the new leader wins: the project then lives where the control plane does.
 		var best *replicaView

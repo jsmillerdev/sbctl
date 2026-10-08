@@ -1,15 +1,19 @@
 package failover
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/alerts"
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/mesh"
+	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -896,5 +900,54 @@ func TestTheAnnouncementNamesTheProjectsRestoredFromTheArchive(t *testing.T) {
 	}
 	if d := w.alerts[0].Detail; w.alerts[0].Kind != alerts.KindFailoverStarted || !strings.Contains(d, refC) || !strings.Contains(d, "archive_timeout") {
 		t.Fatalf("announcement: %+v", w.alerts[0])
+	}
+}
+
+// countingInstances records how many Observe calls are in flight at once.
+type countingInstances struct {
+	Instances
+	cur, peak atomic.Int32
+}
+
+func (c *countingInstances) Observe(ctx context.Context, node, identifier string) (peerapi.InstanceStatus, error) {
+	n := c.cur.Add(1)
+	for {
+		p := c.peak.Load()
+		if n <= p || c.peak.CompareAndSwap(p, n) {
+			break
+		}
+	}
+	time.Sleep(5 * time.Millisecond) // long enough for the others to arrive
+	defer c.cur.Add(-1)
+	return c.Instances.Observe(ctx, node, identifier)
+}
+
+// A plan reads the replicas of every project it would move from the nodes that hold them, in
+// parallel and no more than viewParallel at a time, so that dozens of projects do not make the
+// plan outlast the timeout of `supavise status`.
+func TestAPlanViewsTheReplicasInParallelButBounded(t *testing.T) {
+	w := serverWorld(t)
+	org, _ := w.reg.GetOrganization(w.ctx, "acme")
+	for i := 0; i < 24; i++ {
+		ref := "q" + strings.Repeat("a", 17) + string(rune('a'+i/26)) + string(rune('a'+i%26)) // a valid ref
+		must(t, w.reg.CreateProject(w.ctx, &registry.Project{Ref: ref, OrgID: org.ID, Name: ref[:4], Status: registry.StatusActiveHealthy}))
+		id := ref + "-rr-eu-west-1-aaaaaa"
+		must(t, w.reg.CreateReplica(w.ctx, &registry.Replica{Identifier: id, Ref: ref, NodeID: "n2", Origin: registry.ReplicaDefault, Status: statusHealthy, InitStep: registry.ReplicaStepDone}))
+		w.inst[id] = &instState{node: "n2", ref: ref, role: "replica", lag: f64(0.4), postgres: true}
+		w.lsn[ref] = "0/9000060"
+		w.replay[id] = caughtUp(w.lsn[ref])
+		w.prim["n1/"+ref] = &primState{running: true, healthy: true}
+	}
+	ci := &countingInstances{}
+	o := w.orch(func(d *Deps) { ci.Instances = d.Instances; d.Instances = ci })
+	pl, err := o.PlanServer(w.ctx, ServerOptions{To: "n2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pl.Projects) != 26 || len(pl.Blocked()) != 0 {
+		t.Fatalf("%d projects, blocked %+v", len(pl.Projects), pl.Blocked())
+	}
+	if peak := ci.peak.Load(); peak < 2 || peak > viewParallel {
+		t.Fatalf("%d nodes were asked at once; want between 2 and %d", peak, viewParallel)
 	}
 }

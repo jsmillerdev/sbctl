@@ -130,7 +130,7 @@ func (o *Orchestrator) fencerStatus(ctx context.Context, r *Readiness) string {
 
 func (o *Orchestrator) markerStatus(ctx context.Context) string {
 	if o.d.Marker == nil {
-		return "none: the backup store is not S3-compatible"
+		return "none: no leader marker store in this build or backup mode"
 	}
 	if _, err := o.d.Marker.ReadLeaderMarker(ctx); err != nil {
 		return "store not reachable: " + err.Error()
@@ -153,14 +153,19 @@ func (o *Orchestrator) candidate(ctx context.Context, nodes []registry.Node) (re
 	for _, n := range nodes {
 		byID[n.ID] = n
 	}
-	var views []replicaView
+	var held []registry.Replica
 	for _, rep := range reps {
 		if n, ok := byID[rep.NodeID]; ok && n.State == registry.NodeActive && n.ID != self.ID {
-			views = append(views, o.viewReplica(ctx, rep))
+			held = append(held, rep)
 		}
 	}
-	if len(views) == 0 {
+	if len(held) == 0 {
 		return registry.Node{}, false
+	}
+	seen := o.viewReplicas(ctx, held)
+	views := make([]replicaView, 0, len(held))
+	for _, rep := range held {
+		views = append(views, seen[rep.Identifier])
 	}
 	return byID[bestReplica(views).Row.NodeID], true
 }
