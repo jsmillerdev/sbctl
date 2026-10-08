@@ -501,3 +501,21 @@ jobs:
           name: branching-egress
           path: /tmp/supavise-egress-logs
           if-no-files-found: ignore
+
+  # The replica data plane on real clusters, one machine playing two nodes: a standby seeded from a
+  # base backup, streaming, PostgREST on the standby seeing DDL within the reload interval, a
+  # switchover (promote and demote in place), pg_cron and pg_net idle on a standby.
+  replica-blocks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The test clusters use ports 39000-39999, which lie inside Linux's ephemeral range (see
+      # branching-xfs).
+      - name: keep the test ports out of the ephemeral range
+        run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=39000-39999
+      - name: replica blocks
+        run: tests/linux/replica-blocks.sh
