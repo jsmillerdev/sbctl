@@ -26,10 +26,13 @@ import (
 	"github.com/supavise/supavise/internal/units"
 )
 
-// wireFleet puts the shared services in follower mode when this node follows (design 2.6): no
-// bin/prepare and no tenant writes on a standby, cold units whose ports are forwarders, the
-// Supavisor tenant refresh endpoint, and the reconciliation that starts or stops the services when the
-// role changes. On a leader it does nothing.
+// wireFleet connects the shared services to the cluster work (design 2.6). It serves the credential
+// endpoint of Storage on AWS wherever it is set up, and on a node that belongs to a cluster it provides
+// the ports the other hooks read (fleet.Fleet, fleet.PeerRefresher, replicas.Pooler, failover.Fleet,
+// failover.LocalServices, a server check for the artifacts), puts the services in follower mode when
+// this node follows (no bin/prepare and no tenant writes on a standby, cold units whose ports are
+// forwarders), serves the Supavisor tenant refresh endpoint, and reconciles the services with the role
+// when it changes. A server with no cluster is a leader for good and startFleet is all it needs.
 //
 // Which profile the services start in at boot is the fleet package's to decide, from the system
 // cluster itself (fleet.Deps.Follower), so startFleet needs no help. This hook adds what changes
