@@ -81,14 +81,15 @@ is the daemon that `supavise.service` runs.
 
 - `Serve` does not supervise: a crashed project unit is systemd's to restart (`Restart=on-failure`)
   and shows as unhealthy through `Health`.
-- The base backup a replica starts from is taken by the leader's backup service. For a project homed on
-  a follower the home node would take it, and its backup service records the backup in its registry
-  copy, which is read-only there. Connecting `backup.Options.TakeBase` to `placement.BackupOps` here
-  would therefore fail at the home node, so a replica of such a project cannot be set up until the
-  backup package takes a base backup that the leader records (the home node writes the manifest to the
-  store, the leader writes the registry row) and `wireReplicas`' `baseBackups` is given a `TakeBase`
-  that calls `BackupOps.BaseBackup` on the project's home. A restore, an upgrade backup and a final
-  backup of a project homed on a follower are refused by the leader's Engine; routing them through `placement.BackupOps` is the same follow-up.
+- Backups of a project homed on a follower go through `routeBackups` (`wire_placement.go`): the home takes
+  the base backup and writes it to the store without touching its read-only registry copy
+  (`BackupOptions.NoRecord`), and the leader records it (`backup.Service.RecordBase`, through
+  `placement.Ops.Recorder`). That serves a replica's seed (`Service.SetTakeBase`), the final backup of a
+  delete (`Engine.SetRemoteBackups`) and the leader's nightly round for those projects
+  (`placement.ScheduledBackups`, every 15 minutes, a project is due when its newest completed base backup
+  is a day old). A restore, an upgrade and an upgrade's backup of such a project are still refused by the
+  leader's Engine until the project is moved to it. Without the backup service none of this runs, and the
+  node says so (`placement.RoutedBackups` is off).
 - The commands of the CLI that open the node (`openNode`, `openOptions`) open the registry as a
   leader's; a follower needs the read-only open that `openFollower` gives the daemon.
 - A server move that the restart interrupts is finished by the daemon that starts as the leader, without

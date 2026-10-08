@@ -148,7 +148,8 @@ var baseIDShape = regexp.MustCompile(`^\d{8}T\d{6}Z-[0-9a-f]{6}$`)
 // row in the backups table and its event, which BaseBackupWith writes when it runs here. The backup
 // must be complete in the store: the manifest the home wrote is read, and its timeline and positions
 // must be the ones the home reported, and the row takes its size from the manifest. A row that exists
-// for it already is returned, so a report that is repeated records once.
+// for it already is returned, so a report that is repeated records once, also when two reports of it
+// overlap: the calls for one ref run one at a time.
 func (s *Service) RecordBase(ctx context.Context, ref string, b RemoteBase) (*registry.Backup, error) {
 	if err := validRef(ref); err != nil {
 		return nil, err
@@ -159,12 +160,19 @@ func (s *Service) RecordBase(ctx context.Context, ref string, b RemoteBase) (*re
 	if !baseIDShape.MatchString(b.ID) {
 		return nil, fmt.Errorf("backup: %q is not a base backup id", b.ID)
 	}
+	unlock, err := s.record.lock(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	loc := s.opt.Store.URL(baseDir(ref) + b.ID)
-	if rows, err := s.opt.Registry.ListBackups(ctx, ref); err == nil {
-		for i := range rows {
-			if rows[i].Location == loc && rows[i].Status == registry.BackupCompleted {
-				return &rows[i], nil
-			}
+	rows, err := s.opt.Registry.ListBackups(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		if rows[i].Location == loc && rows[i].Status == registry.BackupCompleted {
+			return &rows[i], nil
 		}
 	}
 	m, err := s.readManifest(ctx, ref, b.ID)
