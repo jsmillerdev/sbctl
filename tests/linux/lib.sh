@@ -37,6 +37,36 @@ preflight() {
   } | tee "$LOG_DIR/host.txt" >&2
 }
 
+# apt_busy: an apt-daily service is starting or running (they are oneshot units: "activating" is how systemd reports
+# one that runs), or an apt, dpkg or unattended-upgrade process is.
+apt_busy() {
+  local u s
+  for u in apt-daily.service apt-daily-upgrade.service; do
+    s=$(systemctl show -p ActiveState --value "$u" 2>/dev/null || true)
+    case $s in active | activating | deactivating | reloading) return 0 ;; esac
+  done
+  pgrep -x 'apt|apt-get|dpkg' >/dev/null || pgrep -f '/usr/bin/unattended-upgrade|apt.systemd.daily' >/dev/null
+}
+
+# wait_apt_idle [SECONDS]: waits until apt_busy says no. A fresh runner starts the distribution's apt timers at boot
+# and again when a step turns them on, and a package command that meets their lock fails. `-o DPkg::Lock::Timeout=N`
+# makes apt-get install wait for the dpkg lock, but `apt-get update` takes the lock of the package lists, which that
+# option does not cover: call this before an update, and repeat the update if it must not fail.
+wait_apt_idle() {
+  local n=${1:-360} i
+  for ((i = 0; i < n; i += 5)); do
+    apt_busy || return 0
+    sleep 5
+  done
+  log "apt is still busy after ${n}s: $(pgrep -a -x 'apt|apt-get|dpkg' | head -n 3 | paste -sd';' -)"
+}
+
+# free_port: prints a TCP port on 127.0.0.1 that nothing listens on now, for a local server the test starts
+# (a fixed port that another process holds fails the test for a reason that is not the test's).
+free_port() {
+  python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+
 # install_binary: put supavise at /usr/local/bin/supavise (build it when SUPAVISE_BIN is not set).
 install_binary() {
   if [[ -z "$SUPAVISE_BIN" ]]; then
@@ -55,9 +85,10 @@ setup_node() {
   # `supavise system install-units` installs.
   if ! command -v pkaction >/dev/null; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq || log "apt-get update failed; trying the install anyway"
-    apt-get install -y polkitd pkexec \
-      || apt-get install -y policykit-1 \
+    wait_apt_idle 300
+    apt-get -o DPkg::Lock::Timeout=300 update -qq || log "apt-get update failed; trying the install anyway"
+    apt-get -o DPkg::Lock::Timeout=300 install -y polkitd pkexec \
+      || apt-get -o DPkg::Lock::Timeout=300 install -y policykit-1 \
       || fail "polkit is not installed and could not be installed"
   fi
   id "$SUPAVISE_USER" >/dev/null 2>&1 || useradd --system --home-dir "$SUPAVISE_STATE" --shell /usr/sbin/nologin "$SUPAVISE_USER"
@@ -363,6 +394,7 @@ assert_os_updates() { # on|off
     # while, and unattended-upgrade then says nothing about origins: look again for up to six minutes (enabling the timers makes
     # apt-daily-upgrade run at once on a runner whose last run was long ago).
     local run="" n
+    wait_apt_idle 360
     for ((n = 0; n < 36; n++)); do
       run=$(timeout 240 unattended-upgrade --dry-run --debug 2>&1 || true)
       origins=$(grep -m1 'Allowed origins are' <<<"$run" || true)

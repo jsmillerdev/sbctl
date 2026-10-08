@@ -23,7 +23,8 @@ BRIDGE_IP=$MULTI_NET.1
 PEER_PORT=${PEER_PORT:-7443}          # the mesh port of the design
 S3_PORT=3900 RELEASE_PORT=38801 AWS_PORT=38170
 GARAGE_IMAGE=${GARAGE_IMAGE:-dxflrs/garage:v1.1.0}
-S3_BUCKET=supavise-test
+S3_BUCKET=supavise-test              # backups (one prefix per cluster) and the key escrow
+S3_OBJECTS_BUCKET=supavise-objects    # Storage's objects, after `supavise storage migrate --to s3`
 NODES=(n1 n2)
 SMOKE_NODE=n3                         # a third, fresh instance for systemd-smoke.sh (MULTI_SMOKE=1)
 WORK=${WORK:-}
@@ -45,7 +46,7 @@ multi_init() {
 # on NODE CMD...: run CMD in the node as root. A script goes in on standard input: on n1 bash -s <<'EOS'.
 on() { local node=$1; shift; incus exec "$node" --env HOME=/root -- "$@"; }
 
-node_push() { incus file push --quiet --mode "${4:-0644}" "$2" "$1$3"; } # NODE SRC DEST [MODE]
+node_push() { incus file push --quiet --create-dirs --mode "${4:-0644}" "$2" "$1$3"; } # NODE SRC DEST [MODE]
 
 # nsystemctl NODE ARGS...: systemctl in the node. systemd's bus is away for a moment now and then
 # ("Transport endpoint is not connected", "Connection reset by peer", "disconnected from message bus
@@ -112,8 +113,16 @@ multi_incus_install() {
       arm64) pkgs+=(qemu-system-arm qemu-efi-aarch64) ;;
     esac
   fi
-  apt-get update -qq
-  apt-get install -y -qq "${pkgs[@]}"
+  # The runner's own apt timers may hold the apt locks for a while after it boots. The dpkg lock timeout covers install;
+  # `update` takes the lock of the package lists, which it does not cover (lib.sh's wait_apt_idle), so it is repeated.
+  local try
+  wait_apt_idle 360
+  for try in 1 2 3 4 5 6; do
+    apt-get -o DPkg::Lock::Timeout=300 update -qq && break
+    [[ $try -lt 6 ]] || fail "apt-get update failed six times"
+    sleep 10
+  done
+  apt-get -o DPkg::Lock::Timeout=300 install -y -qq "${pkgs[@]}"
   # Unprivileged containers need an id range for root.
   grep -q '^root:' /etc/subuid || echo 'root:1000000:1000000000' >>/etc/subuid
   grep -q '^root:' /etc/subgid || echo 'root:1000000:1000000000' >>/etc/subgid
@@ -205,7 +214,7 @@ set -euo pipefail
 src=$(findmnt -no SOURCE /)
 disk=/dev/$(lsblk -no PKNAME "$src")
 num=$(cat "/sys/class/block/$(basename "$src")/partition")
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloud-guest-utils
+DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq cloud-guest-utils
 growpart "$disk" "$num" || true
 resize2fs "$src"
 EOS
@@ -224,12 +233,62 @@ apt-get -o DPkg::Lock::Timeout=300 install -y -qq curl ca-certificates sudo pyth
 EOS
 }
 
+# multi_install NODE [FLAGS...]: copies the binary (SUPAVISE_BIN), install.sh, lib.sh and the S3 credentials (a
+# 0600 file) into the node and runs `install.sh --binary` there with the flags every node of the harness takes:
+# its own address, no TLS, no firewall changes, no dashboard, no OS updates, and Garage as the backup backend
+# under the prefix S3_PREFIX (default: the node's name; a cluster shares one prefix, so a joining server gets the
+# same one as the server it joins). When MULTI_DOMAIN is set, that is the domain: left to the default, a domain
+# follows each node's own address, and the nodes of a cluster need one. FLAGS follow, for example
+# --claim-token-file or --join-token-file. The output goes to $LOG_DIR/NODE/install.log; the exit status is
+# install.sh's.
+multi_install() {
+  local n=$1 ip d=$LOG_DIR/$1 rc=0 try
+  shift
+  ip=$(node_ip "$n")
+  mkdir -p "$d"
+  node_push "$n" "$SUPAVISE_BIN" /root/supavise 0755
+  node_push "$n" "$REPO_ROOT/deploy/install.sh" /root/install.sh 0755
+  node_push "$n" "$REPO_ROOT/tests/linux/lib.sh" /root/lib.sh
+  printf 'access_key_id=%s\nsecret_access_key=%s\n' "$S3_KEY_ID" "$S3_SECRET" | on "$n" bash -c 'umask 077; cat >/root/s3.cred'
+  # install.sh is idempotent. The artifact host answers 500 now and then, and the installer does not try again,
+  # so a run that fails on a server error of that host is run once more.
+  for try in 1 2; do
+    rc=0
+    on "$n" /root/install.sh --binary /root/supavise --public-ip "$ip" --tls off --email ci@example.com --firewall none \
+      --no-studio --no-os-updates ${MULTI_DOMAIN:+--domain "$MULTI_DOMAIN"} \
+      --s3-endpoint "http://$BRIDGE_IP:$S3_PORT" --s3-bucket "$S3_BUCKET" --s3-prefix "${S3_PREFIX:-$n}" --s3-region us-east-1 \
+      --s3-path-style --s3-credentials-file /root/s3.cred "$@" >"$d/install.log" 2>&1 || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    grep -q -E 'GET https://[^ ]+: status 5[0-9][0-9]' "$d/install.log" || return $rc
+    log "$n: install.sh failed on a server error of the artifact host; running it once more"
+    cp "$d/install.log" "$d/install-try$try.log"
+  done
+  return $rc
+}
+
+# multi_push_tests NODE: the helpers the replication test runs inside the node, and the environment they read.
+multi_push_tests() {
+  local n=$1 here=$REPO_ROOT/tests/linux
+  node_push "$n" "$here/lib.sh" /root/lib.sh
+  node_push "$n" "$here/multi/node-lib.sh" /root/node-lib.sh
+  node_push "$n" "$here/multi/writer.py" /root/writer.py 0755
+  node_push "$n" "$here/multi/fence.sh" /usr/local/lib/supavise-ci/fence.sh 0755
+  printf 'export SUPAVISE_DOMAIN=%s\nexport BRIDGE_IP=%s\nexport S3_BUCKET=%s\nexport S3_OBJECTS_BUCKET=%s\n' \
+    "${MULTI_DOMAIN:-$(node_ip n1).sslip.io}" "$BRIDGE_IP" "$S3_BUCKET" "$S3_OBJECTS_BUCKET" | on "$n" tee /root/multi-env.sh >/dev/null
+}
+
+# multi_kill_node NODE: the node stops at once, the way a failed machine does (no shutdown, no flush).
+multi_kill_node() { incus stop --force "$1"; }
+
+# multi_start_node NODE: starts a stopped node and waits for systemd. Prints the state.
+multi_start_node() { incus start "$1" && multi_wait "$1"; }
+
 # ---- services on the host, bound to the bridge ------------------------------------------------------
 # garage_up: Garage as the S3 service (MinIO no longer publishes images; the backup-integration job uses
 # Garage the same way), one bucket and one key. The image is a single static binary.
 garage_up() {
-  command -v docker >/dev/null || { apt-get install -y -qq docker.io; }
-  local d=$WORK/garage i id
+  command -v docker >/dev/null || { apt-get -o DPkg::Lock::Timeout=300 install -y -qq docker.io; }
+  local d=$WORK/garage i id b
   mkdir -p "$d/meta" "$d/data"
   cat >"$d/garage.toml" <<TOML
 metadata_dir = "/var/lib/garage/meta"
@@ -255,8 +314,10 @@ TOML
   docker exec garage /garage layout assign -z dc1 -c 1G "$id" >/dev/null
   docker exec garage /garage layout apply --version 1 >/dev/null
   docker exec garage /garage key import --yes -n ci "$S3_KEY_ID" "$S3_SECRET" >/dev/null
-  docker exec garage /garage bucket create "$S3_BUCKET" >/dev/null
-  docker exec garage /garage bucket allow --read --write --owner "$S3_BUCKET" --key ci >/dev/null
+  for b in "$S3_BUCKET" "$S3_OBJECTS_BUCKET"; do
+    docker exec garage /garage bucket create "$b" >/dev/null
+    docker exec garage /garage bucket allow --read --write --owner "$b" --key ci >/dev/null
+  done
   for ((i = 0; i < 30; i++)); do
     [[ $(http_code "http://$BRIDGE_IP:$S3_PORT/") != 000 ]] && return 0
     sleep 1
@@ -412,7 +473,21 @@ multi_collect_logs() {
     incus info "$n" >"$LOG_DIR/$n/incus-info.txt" 2>&1 || true
     incus config show "$n" --expanded >"$LOG_DIR/$n/incus-config.yaml" 2>&1 || true
     incus console "$n" --show-log >"$LOG_DIR/$n/console.log" 2>&1 || true
+    # A node that a check stopped (multi_kill_node) and did not start again has no journal to read, in the run where the
+    # old leader's journal is the one that explains the failure: it is started, after its console log is taken.
+    if [[ $(incus info "$n" 2>/dev/null | awk '/^Status:/ {print toupper($2); exit}') == STOPPED ]]; then
+      echo "$n was stopped when the run ended; it was started to collect its logs. incus-info.txt and console.log are from before" \
+        >"$LOG_DIR/$n/started-for-collection.txt"
+      incus start "$n" >/dev/null 2>&1 && multi_wait "$n" >/dev/null 2>&1 || true
+    fi
     timeout 60 incus exec "$n" -- journalctl --no-pager -o short-iso >"$LOG_DIR/$n/journal.log" 2>&1 || true
+    # The daemon and every project's PostgreSQL on their own, for reading: the journal holds everything.
+    timeout 60 incus exec "$n" -- journalctl --no-pager -o short-iso -u supavise.service >"$LOG_DIR/$n/daemon.journal" 2>&1 || true
+    timeout 60 incus exec "$n" -- journalctl --no-pager -o short-iso -u 'supavise-postgres@*' >"$LOG_DIR/$n/postgres.journal" 2>&1 || true
+    if incus exec "$n" -- test -f /root/node-lib.sh 2>/dev/null; then
+      timeout 120 incus exec "$n" --env HOME=/root -- bash -c 'source /root/node-lib.sh && node_dump' >"$LOG_DIR/$n/state.txt" 2>&1 || true
+    fi
+    incus file pull --quiet -r "$n/root/writer" "$LOG_DIR/$n/" >/dev/null 2>&1 || true
     timeout 30 incus exec "$n" -- systemctl list-units --all --no-pager >"$LOG_DIR/$n/units.txt" 2>&1 || true
     timeout 30 incus exec "$n" -- systemctl --failed --no-pager >"$LOG_DIR/$n/failed-units.txt" 2>&1 || true
   done

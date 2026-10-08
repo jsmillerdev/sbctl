@@ -5,16 +5,27 @@ name: replication-spike
 # reach each other, Garage, a signed release server and a fake AWS service. Virtual machines where /dev/kvm
 # works, system containers otherwise; both architectures. tests/linux/multi/README.md has the outcome.
 #
-# expect_fail lists the checks that are known to fail in a mode (see SPIKE_EXPECT_FAIL in spike.sh): a job is
-# red when another check fails, and also when one of those passes, because the README would then be wrong.
+# expect_fail lists the checks that are known to fail in a mode, each with the reason its failure gives (see
+# EXPECT_FAIL in lib-checks.sh): a job is red when another check fails, when one of those fails for another
+# reason, and also when one of them passes, because the README would then be wrong.
 #   amd64 vm                  all checks pass
 #   amd64/arm64 container     unprivileged system containers do not enforce IPAddressDeny; systemd-smoke.sh
 #                             (the smoke input) stops at the same place
 #   container-privileged      all checks pass
 #   arm64 vm                  the arm64 runners have no /dev/kvm
+#   auto                      the choice replication.yml makes: a virtual machine where /dev/kvm works, else a
+#                             privileged container
+# It runs when the harness changes; replication.yml is the test that uses the harness.
 on:
   push:
-    branches: ["ws/rep-x1"]
+    branches: ["ws/rep-x1", "ws/rep-x2", "integrate/**"]
+    paths:
+      - ".github/workflows/replication-spike.yml"
+      - "tests/linux/multi/lib-multi.sh"
+      - "tests/linux/multi/lib-checks.sh"
+      - "tests/linux/multi/spike.sh"
+      - "tests/linux/multi/fake-aws.py"
+      - "tests/linux/lib.sh"
   workflow_dispatch:
     inputs:
       smoke:
@@ -39,10 +50,12 @@ jobs:
         include:
           - { runner: ubuntu-24.04, arch: amd64, mode: vm, expect_fail: "" }
           - { runner: ubuntu-24.04, arch: amd64, mode: container-privileged, expect_fail: "" }
-          - { runner: ubuntu-24.04, arch: amd64, mode: container, expect_fail: "imds smoke" }
+          - { runner: ubuntu-24.04, arch: amd64, mode: auto, expect_fail: "" }
+          - { runner: ubuntu-24.04, arch: amd64, mode: container, expect_fail: "imds=can reach the instance metadata service;smoke=can reach the instance metadata service" }
           - { runner: ubuntu-24.04-arm, arch: arm64, mode: container-privileged, expect_fail: "" }
-          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container, expect_fail: "imds smoke" }
-          - { runner: ubuntu-24.04-arm, arch: arm64, mode: vm, expect_fail: incus }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: auto, expect_fail: "" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container, expect_fail: "imds=can reach the instance metadata service;smoke=can reach the instance metadata service" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: vm, expect_fail: "incus=virtual machines need a usable /dev/kvm" }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -59,13 +72,14 @@ jobs:
       - name: two nodes (${{ matrix.mode }})
         run: |
           sudo env LOG_DIR=/tmp/supavise-multi-logs MULTI_MODE=${{ matrix.mode }} MULTI_SMOKE=${{ inputs.smoke && '1' || '0' }} \
-            SPIKE_EXPECT_FAIL="${{ matrix.expect_fail }}" \
+            EXPECT_FAIL="${{ matrix.expect_fail }}" \
             SUPAVISE_BIN=/tmp/supavise SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/multi/spike.sh 2>&1 | tee /tmp/spike.log
       - if: always()
         name: results
         run: |
+          # The log directory belongs to root, which ran the script: the copy needs sudo as well.
+          sudo cp /tmp/spike.log /tmp/supavise-multi-logs/ || true
           sudo chmod -R a+rX /tmp/supavise-multi-logs || true
-          cp /tmp/spike.log /tmp/supavise-multi-logs/ || true
           cat /tmp/supavise-multi-logs/results.md >> "$GITHUB_STEP_SUMMARY" || true
       - if: always()
         uses: actions/upload-artifact@v4

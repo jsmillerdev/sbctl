@@ -1,0 +1,80 @@
+name: replication
+
+# The two-server test of the replica release (design 3.5): two Incus nodes with a real systemd on one runner,
+# Supavise from this checkout installed on both, and a project's life across them: a read replica through the
+# Management API, planned moves of a project and of the server with a continuous writer, a hard stop of the
+# leader and a forced failover with RPO and RTO measured, the old leader's return and `supavise node rejoin`, and
+# `supavise upgrade` of both servers. tests/linux/multi/replication.sh lists the checks; the job summary has them
+# as a table, and the artifact has both nodes' journals and PostgreSQL logs, their state after each step and the
+# writer's files.
+#
+# Virtual machines where /dev/kvm works (amd64), privileged system containers where it does not (arm64): unit
+# hardening and the instance metadata block need either (tests/linux/multi/README.md). A push to a ws/** branch
+# runs amd64 only, as linux.yml does; integrate/** and a dispatch run both architectures.
+#
+# It is not in deploy/release-gate.sh's list yet. The gate accepts a workflow_dispatch run on the tagged commit, so
+# this workflow can be listed as it stands: `gh workflow run replication.yml --ref <branch>`, then tag. A run takes
+# 60 to 75 minutes when every check passes and up to 150 when a wait times out, so the run is dispatched before the
+# tag, or the gate's GATE_TIMEOUT_SECONDS is raised above 150 minutes.
+on:
+  push:
+    branches: ["ws/rep-x2", "integrate/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a branch ends the run that is still going on it: a run is up to 150 minutes on two runners.
+concurrency:
+  group: replication-${{ github.ref }}
+  cancel-in-progress: true
+
+# bash with -eo pipefail, so a failing command piped into tee fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  two-servers:
+    name: two-servers (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Two builds of one checkout: the release server signs the first as v0.0.1, which both nodes install, and the
+      # second as v0.0.2, which `supavise upgrade` moves them to. deploy/release-assets.sh writes the manifest with the
+      # release tool (root has no Go toolchain).
+      - name: build supavise twice and the release tool
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.2" -o /tmp/supavise-next ./cmd/supavise
+          go build -o /tmp/releasetool ./deploy/releasetool
+      # The script has its own deadline, 120 minutes: `timeout` sends SIGTERM, the script's EXIT trap collects both
+      # nodes' journals and PostgreSQL logs and removes the nodes (10 minutes at most before SIGKILL), and the steps after
+      # this one still run. The step's limit is the backstop, below the job's.
+      - name: two servers
+        timeout-minutes: 135
+        run: |
+          sudo env LOG_DIR=/tmp/supavise-multi-logs MULTI_MODE=auto \
+            SUPAVISE_BIN=/tmp/supavise SUPAVISE_BIN_NEXT=/tmp/supavise-next SUPAVISE_RELEASETOOL=/tmp/releasetool \
+            timeout -k 600 7200 tests/linux/multi/replication.sh 2>&1 | tee /tmp/replication.log
+      - if: always()
+        name: results
+        run: |
+          # The log directory belongs to root, which ran the script: the copy needs sudo as well.
+          sudo cp /tmp/replication.log /tmp/supavise-multi-logs/ || true
+          sudo chmod -R a+rX /tmp/supavise-multi-logs || true
+          cat /tmp/supavise-multi-logs/results.md >> "$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replication-${{ matrix.arch }}
+          path: /tmp/supavise-multi-logs
+          if-no-files-found: ignore
