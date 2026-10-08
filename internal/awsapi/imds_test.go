@@ -1,10 +1,13 @@
 package awsapi_test
 
 import (
+	"context"
 	"errors"
+	"net"
 	"net/http"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -139,5 +142,125 @@ func TestIMDSRoleCredentials(t *testing.T) {
 	}
 	if c.Expires.Before(before.Add(5*time.Hour)) || c.Expires.After(before.Add(7*time.Hour)) {
 		t.Errorf("expires %v", c.Expires)
+	}
+}
+
+// closedIMDS is a metadata service that takes every connection and drops it, like a machine that is
+// not on EC2 and has nothing at that address. connections says how many were made.
+func closedIMDS(t *testing.T) (url string, connections func() int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var n atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			n.Add(1)
+			c.Close()
+		}
+	}()
+	return "http://" + ln.Addr().String(), func() int { return int(n.Load()) }
+}
+
+// A metadata service that does not answer is asked again only after a pause, whoever asks: a read,
+// the region lookup or the credentials of an EC2 call.
+func TestIMDSUnreachableIsRememberedBriefly(t *testing.T) {
+	url, connections := closedIMDS(t)
+	now := testNow
+	cfg := awsapi.Config{
+		Credentials: nil, Endpoints: awsapi.Endpoints{IMDS: url, EC2: "http://127.0.0.1:1"}, Getenv: envOf(nil),
+		Now: func() time.Time { return now }, MaxAttempts: 2, RetryBackoff: time.Millisecond,
+	}
+	c := newClient(t, cfg)
+
+	if _, err := c.IMDS.InstanceID(ctx); !errors.Is(err, awsapi.ErrIMDSUnreachable) {
+		t.Fatalf("first read: %v", err)
+	}
+	asked := connections()
+	if asked < 2 {
+		t.Fatalf("%d connections for two tries", asked)
+	}
+
+	reads := map[string]error{}
+	_, reads["InstanceID"] = c.IMDS.InstanceID(ctx)
+	_, reads["Tags"] = c.IMDS.Tags(ctx)
+	_, reads["Region"] = c.Region(ctx)
+	_, reads["IMDSCredentials"] = awsapi.IMDSCredentials(c.IMDS).Retrieve(ctx)
+	_, reads["an EC2 call without a region"] = c.EC2.DescribeInstances(ctx, awsapi.DescribeInstancesInput{})
+	for what, err := range reads {
+		if !errors.Is(err, awsapi.ErrIMDSUnreachable) {
+			t.Errorf("%s: %v", what, err)
+		}
+	}
+	if got := connections(); got != asked {
+		t.Errorf("%d more connections within the memo", got-asked)
+	}
+	if err := reads["InstanceID"]; !strings.HasPrefix(err.Error(), "aws imds /latest/meta-data/instance-id: ") || !strings.Contains(err.Error(), "not asked again for") {
+		t.Errorf("message: %v", err)
+	}
+
+	// An EC2 call with a region and no credentials in the environment asks the service for the
+	// instance role once, and fails at once the next time.
+	cfg.Region = "us-east-1"
+	withRegion := newClient(t, cfg)
+	for i := 0; i < 2; i++ {
+		_, err := withRegion.EC2.DescribeInstances(ctx, awsapi.DescribeInstancesInput{})
+		if !errors.Is(err, awsapi.ErrNoCredentials) || !errors.Is(err, awsapi.ErrIMDSUnreachable) {
+			t.Errorf("EC2 call %d: %v", i+1, err)
+		}
+		if i == 0 {
+			asked = connections()
+		}
+	}
+	if got := connections(); got != asked {
+		t.Errorf("the second EC2 call made %d connections", got-asked)
+	}
+
+	// The memo lapses.
+	asked = connections()
+	now = now.Add(29 * time.Second)
+	c.IMDS.InstanceID(ctx)
+	if got := connections(); got != asked {
+		t.Errorf("a connection after 29 s")
+	}
+	now = now.Add(2 * time.Second)
+	if _, err := c.IMDS.InstanceID(ctx); !errors.Is(err, awsapi.ErrIMDSUnreachable) {
+		t.Errorf("after the memo: %v", err)
+	}
+	if got := connections(); got <= asked {
+		t.Errorf("no new connection after 31 s")
+	}
+}
+
+// What the memo records is the service's silence. A caller that gave up and a service that
+// answered with an error say nothing about whether it is there.
+func TestIMDSUnreachableIsNotRememberedFromOtherFailures(t *testing.T) {
+	url, connections := closedIMDS(t)
+	cfg := awsapi.Config{Endpoints: awsapi.Endpoints{IMDS: url}, Getenv: envOf(nil), MaxAttempts: 2, RetryBackoff: time.Millisecond}
+	c := newClient(t, cfg)
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := c.IMDS.InstanceID(cancelled); errors.Is(err, awsapi.ErrIMDSUnreachable) || !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled: %v", err)
+	}
+	if _, err := c.IMDS.InstanceID(ctx); !errors.Is(err, awsapi.ErrIMDSUnreachable) || connections() == 0 {
+		t.Errorf("after a cancelled call the service was not asked: %v, %d connections", err, connections())
+	}
+
+	fake := awsfake.New(t)
+	m := fake.Client().IMDS
+	fake.Inject("imds", "/latest/meta-data/instance-id", awsfake.Fault{Status: 503, Times: 3})
+	if _, err := m.InstanceID(ctx); err == nil || errors.Is(err, awsapi.ErrIMDSUnreachable) {
+		t.Errorf("a 503: %v", err)
+	}
+	if id, err := m.InstanceID(ctx); err != nil || id == "" {
+		t.Errorf("after a 503 the service is asked again: %q, %v", id, err)
 	}
 }

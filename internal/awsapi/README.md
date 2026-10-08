@@ -70,7 +70,7 @@ An API error is an `*Error` with `Service`, `Action`, `StatusCode`, `Code`, `Mes
 
 An error names what failed first: `aws <service> <action>:` for a call (also when the credentials or the region could not be found), `aws imds <path>:` for the metadata service and `awsapi:` for the client's own setup. Errors wrap their causes, so `errors.Is` finds `ErrIMDSDisabled`, `ErrNotFound` and a cancelled context through the credential chain and the region lookup as well.
 
-The metadata service has its own loop: a token request, then the read with `X-aws-ec2-metadata-token`. The token is kept for just under six hours and fetched again after a 401. A refused token request (403, 404, 405) is final: there is no IMDSv1 fallback. A request that gets no answer or a 5xx is tried again, three times in all, on the same jittered schedule. Each request times out after two seconds, so a machine that is not on EC2 and has no credentials in the environment fails after about six seconds and tries again at the next call.
+The metadata service has its own loop: a token request, then the read with `X-aws-ec2-metadata-token`. The token is kept for just under six hours and fetched again after a 401. A refused token request (403, 404, 405) is final: there is no IMDSv1 fallback. A request that gets no answer or a 5xx is tried again, three times in all, on the same jittered schedule. Each request times out after two seconds, so a machine that is not on EC2 and has no credentials in the environment fails after about six seconds with an error for which `errors.Is(err, ErrIMDSUnreachable)` is true. The client then does not ask the service again for 30 seconds: reads, the region lookup and the credentials of a call fail at once with the same error. A caller whose context ended, and a service that answered with an error status, are not remembered.
 
 ## The signer
 
@@ -116,11 +116,11 @@ What it does not model: IAM policy evaluation (use `Deny`), tag-scoped resources
 - replies parsed from XML and JSON fixtures in `testdata/` shaped like the API reference examples;
 - the `DryRun` mapping, error parsing, retries (throttle codes, the jittered schedule and its bounds), a cancelled context and endpoint and region resolution;
 - the credential chain, the cache, the instance-role path and `AWS_EC2_METADATA_DISABLED`;
-- the metadata service token flow, with an expired token and a refused one;
+- the metadata service token flow, with an expired token and a refused one, and the memo of a service that does not answer;
 - the fake: the order of the fencing sequence, a stop that needs `Force`, address moves and replacement, `Deny`, signature checks and paging.
 
 ## Limits
 
 - Only the actions in the table exist. Adding one is a method, a form-field list and a parser.
 - A real EC2, STS or Secrets Manager endpoint is never contacted by the tests. The request shapes follow the API reference; whether a role's policy allows `AssociateAddress` with an instance and a private IP is answered by a `DryRun` call on a real stack, which no test here makes.
-- Credentials renewal is serialized per client, and a metadata-service failure is not remembered between calls.
+- Credentials renewal is serialized per client. The memo of an unreachable metadata service belongs to the client that saw the failure.

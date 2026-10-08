@@ -23,11 +23,18 @@ var ErrNotFound = errors.New("not found")
 // the stack step never uses the instance role.
 var ErrIMDSDisabled = errors.New("the instance metadata service is disabled (AWS_EC2_METADATA_DISABLED=true)")
 
+// ErrIMDSUnreachable means the metadata service gave no answer: no route, a refused connection or
+// a timeout, as on a machine that is not on EC2. The client remembers it for a short while and
+// answers with it at once, so that every call does not spend the full retries finding out again.
+var ErrIMDSUnreachable = errors.New("the instance metadata service did not answer")
+
 const (
 	imdsTokenTTL    = 6 * time.Hour
 	imdsTokenMargin = time.Minute
 	imdsTimeout     = 2 * time.Second
 	imdsMaxBytes    = 1 << 20
+	// imdsDownMemo is how long an unreachable service is not asked again.
+	imdsDownMemo = 30 * time.Second
 )
 
 // IMDS reads the instance metadata service with IMDSv2: every read carries a session token that
@@ -42,7 +49,17 @@ type IMDS struct {
 	mu      sync.Mutex
 	token   string
 	expires time.Time
+	// down is the last failure to get any answer and downAt when it happened.
+	down   *unreachableError
+	downAt time.Time
 }
+
+// unreachableError is a request that got no answer from the metadata service. It matches
+// ErrIMDSUnreachable and keeps the transport error underneath.
+type unreachableError struct{ err error }
+
+func (e *unreachableError) Error() string   { return ErrIMDSUnreachable.Error() + ": " + e.err.Error() }
+func (e *unreachableError) Unwrap() []error { return []error{ErrIMDSUnreachable, e.err} }
 
 func newIMDS(cfg Config, base string, attempts int) *IMDS {
 	if base == "" {
@@ -62,11 +79,40 @@ func newIMDS(cfg Config, base string, attempts int) *IMDS {
 }
 
 // Get returns the body of path, such as "/latest/meta-data/instance-id". A missing path is
-// ErrNotFound.
+// ErrNotFound. A service that gave no answer is ErrIMDSUnreachable, and is not asked again for 30
+// seconds: the next reads fail at once with the same error.
 func (m *IMDS) Get(ctx context.Context, path string) (string, error) {
 	if strings.EqualFold(m.getenv("AWS_EC2_METADATA_DISABLED"), "true") {
 		return "", fmt.Errorf("aws imds %s: %w", path, ErrIMDSDisabled)
 	}
+	if err := m.recall(path); err != nil {
+		return "", err
+	}
+	body, err := m.getWithRetries(ctx, path)
+	var down *unreachableError
+	if errors.As(err, &down) {
+		m.mu.Lock()
+		m.down, m.downAt = down, m.now()
+		m.mu.Unlock()
+	}
+	return body, err
+}
+
+// recall returns the error for a service that failed to answer a short while ago, or nil.
+func (m *IMDS) recall(path string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.down == nil {
+		return nil
+	}
+	ago := m.now().Sub(m.downAt)
+	if ago < 0 || ago >= imdsDownMemo {
+		return nil
+	}
+	return fmt.Errorf("aws imds %s: %w (%s ago; not asked again for %s)", path, m.down, ago.Round(time.Second), (imdsDownMemo - ago).Round(time.Second))
+}
+
+func (m *IMDS) getWithRetries(ctx context.Context, path string) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= m.retry.attempts; attempt++ {
 		if attempt > 1 {
@@ -150,17 +196,26 @@ func (m *IMDS) forgetToken(tok string) {
 	}
 }
 
+// send makes one request. A failure to get an answer is an *unreachableError, unless the caller's
+// context ended, which says nothing about the service.
 func (m *IMDS) send(req *http.Request) (string, int, error) {
 	resp, err := m.hc.Do(req)
 	if err != nil {
-		return "", 0, err
+		return "", 0, m.noAnswer(req, err)
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, imdsMaxBytes))
 	if err != nil {
-		return "", 0, err
+		return "", 0, m.noAnswer(req, err)
 	}
 	return strings.TrimSpace(string(b)), resp.StatusCode, nil
+}
+
+func (m *IMDS) noAnswer(req *http.Request, err error) error {
+	if req.Context().Err() != nil {
+		return err
+	}
+	return &unreachableError{err}
 }
 
 // InstanceID is this instance's id.
