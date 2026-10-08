@@ -1561,6 +1561,9 @@ WARN
     say ""
     say "Destroyed once the stack is deleted, none of it to be brought back:"
     print_purge_list
+    if [[ ${#PB_NAME[@]} -eq 0 && ${#PS_ID[@]} -eq 0 ]]; then
+      say "  (no bucket and no snapshot of the stack exists yet)"
+    fi
     if [[ -n $VOLUME ]]; then
       say "  and the final snapshot of $VOLUME that CloudFormation takes when the stack deletes it"
     fi

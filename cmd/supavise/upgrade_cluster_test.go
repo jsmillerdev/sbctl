@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -133,5 +136,19 @@ func TestClusterViewIgnoresANodeThatLeft(t *testing.T) {
 	view, here, err := clusterView(ctx, cfg, reg, rows)
 	if err != nil || view != nil || len(here) != len(rows) {
 		t.Errorf("after n2 left: %+v %d %v", view, len(here), err)
+	}
+}
+
+// The DSN this run reads the registry through is a plain connection string (no pool size), whichever
+// socket answers; with none answering it is the system cluster's own, so that the error is the one
+// the commands have always shown.
+func TestReadableRegistryDSNIsAPlainConnectionString(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got := readableRegistryDSN(ctx, cfg)
+	if got != lifecycle.SystemSocketDSN(cfg, "supavise") || strings.Contains(got, "pool_max_conns") {
+		t.Errorf("DSN = %q", got)
 	}
 }

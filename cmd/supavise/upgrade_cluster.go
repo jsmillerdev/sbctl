@@ -86,10 +86,11 @@ func clusterView(ctx context.Context, cfg *config.Config, reg registry.Registry,
 // returned, so that the caller's error is the one it has always shown. A follower's registry is the
 // replicated copy, which `supavise upgrade` only reads.
 func readableRegistryDSN(ctx context.Context, cfg *config.Config) string {
-	cands := []string{lifecycle.SystemSocketDSN(cfg, "supavise"), lifecycle.FollowerRegistryDSN(cfg)}
+	// The follower's DSN carries a pool size of its own, which a single connection cannot take.
+	cands := []string{lifecycle.SystemSocketDSN(cfg, "supavise"), strings.TrimSuffix(lifecycle.FollowerRegistryDSN(cfg), " pool_max_conns=6")}
 	for _, c := range cands {
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err := registry.AppliedMigrations(cctx, strings.TrimSuffix(c, " pool_max_conns=6"))
+		_, err := registry.AppliedMigrations(cctx, c)
 		cancel()
 		if err == nil {
 			return c
