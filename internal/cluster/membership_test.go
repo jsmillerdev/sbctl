@@ -1595,3 +1595,70 @@ func TestJoinRefusesAMasterKeyOfItsOwnBeforeAskingTheLeader(t *testing.T) {
 		t.Fatalf("join with the cluster's key already in place: %v", err)
 	}
 }
+
+// lostAnswers is an RPC whose first answers to the renewal never arrive: the leader handled the
+// request, as a lost response looks from the node.
+type lostAnswers struct {
+	mesh.RPC
+	mu    sync.Mutex
+	lose  int
+	calls int
+}
+
+func (l *lostAnswers) Call(ctx context.Context, node, method, path string, in, out any) error {
+	err := l.RPC.Call(ctx, node, method, path, in, out)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	if err == nil && path == peerapi.PathCertsRenew && l.lose > 0 {
+		l.lose--
+		return fmt.Errorf("%w: the answer was lost", mesh.ErrNoSession)
+	}
+	return err
+}
+
+// The leader records the serial of a new certificate before the node has it. When the answer is lost
+// the node retries within the retry wait and ends with a certificate the leader's record names, not
+// at the next look six hours on.
+func TestRenewalIsTriedAgainSoonAfterALostAnswer(t *testing.T) {
+	l, j := followerNearExpiry(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	before := j.store.Creds().Serial
+	lossy := &lostAnswers{RPC: j.mgr, lose: 1}
+	r := j.renewer(time.Second)
+	r.RPC, r.Every, r.Retry = lossy, time.Hour, 50*time.Millisecond
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Run(ctx) }()
+	eventually(t, "the renewed certificate", func() bool {
+		n2, _ := l.reg.GetNode(ctx, "n2")
+		got := j.store.Creds().Serial
+		return got != before && got == n2.CertSerial
+	})
+	cancel()
+	<-done
+	lossy.mu.Lock()
+	defer lossy.mu.Unlock()
+	if lossy.lose != 0 {
+		t.Fatal("the answer was never lost")
+	}
+}
+
+func TestRenewalRetryBacksOffToABound(t *testing.T) {
+	r := &Renewer{}
+	var got []time.Duration
+	var last time.Duration
+	for range 8 {
+		last = r.nextRetry(last)
+		got = append(got, last)
+	}
+	want := []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 10 * time.Minute, 10 * time.Minute, 10 * time.Minute}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("waits %v, want %v", got, want)
+		}
+	}
+	if r2 := (&Renewer{Retry: time.Second}); r2.nextRetry(0) != time.Second || r2.nextRetry(time.Second) != 2*time.Second {
+		t.Fatal("Retry does not set the first wait")
+	}
+}

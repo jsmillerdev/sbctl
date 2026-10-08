@@ -204,9 +204,12 @@ func TestNodeRm(t *testing.T) {
 	if !strings.Contains(errw.String(), "Remove node n2 (second)") {
 		t.Fatalf("prompt: %q", errw.String())
 	}
-	// The replica stays: the removal times out and says what to do.
+	// The replica stays: the removal times out and says what to do. The node has left by then.
 	if err := runNodeRm(ctx, env, "n2", true, cluster.RemoveOptions{Wait: 50 * time.Millisecond, Poll: 5 * time.Millisecond}); err == nil || !strings.Contains(err.Error(), "--force") {
 		t.Fatalf("stuck replica: %v", err)
+	}
+	if n, _ := env.reg.GetNode(ctx, "n2"); n.State != registry.NodeLeft {
+		t.Fatalf("the node is %s after its removal was asked for", n.State)
 	}
 	if err := runNodeRm(ctx, env, "nobody", true, cluster.RemoveOptions{}); err == nil || !strings.Contains(err.Error(), "no node") {
 		t.Fatalf("unknown node: %v", err)

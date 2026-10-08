@@ -416,19 +416,28 @@ func TestRemoveNode(t *testing.T) {
 	}
 
 	// The replica controller removes the user replica while the removal waits; the system replica row goes at once.
+	// The node has left by the time the replica is marked: the default reconciler would make it again
+	// on a node that is active.
+	leftWhenMarked := make(chan bool, 1)
 	go func() {
 		for range 200 {
 			time.Sleep(10 * time.Millisecond)
 			if r, err := reg.GetReplica(ctx, "aaaaaaaaaaaaaaaaaaaa-rr-local-rep001"); err == nil && r.Status == string(registry.StatusGoingDown) {
+				n, _ := reg.GetNode(ctx, "n2")
+				leftWhenMarked <- n.State == registry.NodeLeft
 				_ = reg.DeleteReplica(ctx, r.Identifier)
 				return
 			}
 		}
+		leftWhenMarked <- false
 	}()
 	var waited []string
 	err := RemoveNode(ctx, reg, "n2", RemoveOptions{Wait: 5 * time.Second, Poll: 10 * time.Millisecond, Log: func(f string, a ...any) { waited = append(waited, f) }})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !<-leftWhenMarked {
+		t.Error("the replica was marked going down before the node left")
 	}
 	if n, _ := reg.GetNode(ctx, "n2"); n.State != registry.NodeLeft {
 		t.Fatalf("state %s", n.State)
@@ -443,22 +452,74 @@ func TestRemoveNode(t *testing.T) {
 		t.Fatalf("removing twice: %v", err)
 	}
 
-	// Nobody removes the replica: the wait ends with an error that names it, and the node stays.
+	// Nobody removes the replica: the wait ends with an error that names it and says the node is gone
+	// already. The same command, run again, finishes with --force.
 	reg = newReg()
 	err = RemoveNode(ctx, reg, "n2", RemoveOptions{Wait: 50 * time.Millisecond, Poll: 10 * time.Millisecond})
-	if err == nil || !strings.Contains(err.Error(), "aaaaaaaaaaaaaaaaaaaa-rr-local-rep001") || !strings.Contains(err.Error(), "--force") {
+	if err == nil || !strings.Contains(err.Error(), "aaaaaaaaaaaaaaaaaaaa-rr-local-rep001") || !strings.Contains(err.Error(), "--force") || !strings.Contains(err.Error(), "is removed") {
 		t.Fatalf("a replica that stays: %v", err)
 	}
-	if n, _ := reg.GetNode(ctx, "n2"); n.State != registry.NodeActive {
-		t.Fatalf("the node left with a replica on it: %s", n.State)
+	if n, _ := reg.GetNode(ctx, "n2"); n.State != registry.NodeLeft {
+		t.Fatalf("the node is %s although its removal was asked for", n.State)
 	}
-	// --force does not wait.
+	if r, _ := reg.GetReplica(ctx, "aaaaaaaaaaaaaaaaaaaa-rr-local-rep001"); r == nil || r.Status != string(registry.StatusGoingDown) {
+		t.Fatalf("the replica is %+v", r)
+	}
+	if err := RemoveNode(ctx, reg, "n2", RemoveOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if rs, _ := reg.ListReplicasOn(ctx, "n2"); len(rs) != 0 {
+		t.Fatalf("replicas left after --force: %v", rs)
+	}
+	if err := RemoveNode(ctx, reg, "n2", RemoveOptions{}); err == nil || !strings.Contains(err.Error(), "removed already") {
+		t.Fatalf("removing after --force: %v", err)
+	}
+
+	// --force on a node that is active does not wait.
+	reg = newReg()
 	if err := RemoveNode(ctx, reg, "n2", RemoveOptions{Force: true}); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := reg.GetNode(ctx, "n2"); n.State != registry.NodeLeft {
 		t.Fatalf("state %s", n.State)
 	}
+
+	// Inside the daemon the controller removes the replicas: it is asked after the node left, and the
+	// rows it leaves GOING_DOWN are waited for.
+	reg = newReg()
+	rm := &fakeRemover{reg: reg}
+	if err := RemoveNode(ctx, reg, "n2", RemoveOptions{Remover: rm, Wait: time.Second, Poll: 10 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	if rm.calls != 1 || rm.node != "n2" || rm.state != registry.NodeLeft {
+		t.Fatalf("remover: %+v", rm)
+	}
+	if rs, _ := reg.ListReplicasOn(ctx, "n2"); len(rs) != 0 {
+		t.Fatalf("replicas left: %v", rs)
+	}
+}
+
+// fakeRemover removes the replicas on a node as the replica controller does, and notes the state the
+// node was in when it was asked.
+type fakeRemover struct {
+	reg   registry.Registry
+	calls int
+	node  string
+	state registry.NodeState
+}
+
+func (f *fakeRemover) RemoveOn(ctx context.Context, node string) error {
+	f.calls, f.node = f.calls+1, node
+	n, err := f.reg.GetNode(ctx, node)
+	if err != nil {
+		return err
+	}
+	f.state = n.State
+	rs, _ := f.reg.ListReplicasOn(ctx, node)
+	for _, r := range rs {
+		_ = f.reg.DeleteReplica(ctx, r.Identifier)
+	}
+	return nil
 }
 
 // ---- diverged data, fencing the local clusters ----
