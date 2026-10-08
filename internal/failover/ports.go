@@ -61,7 +61,10 @@ type Instances interface {
 type Primaries interface {
 	// Stop stops the project's units on node, PostgREST and GoTrue first and Postgres last with
 	// a fast shutdown, and its backup timer, and returns when the cluster has stopped. The LSN is the cluster's
-	// shutdown checkpoint ("0/3000060"), which is the last WAL the old primary wrote. Stopping a
+	// shutdown checkpoint ("0/3000060"), which is the last WAL the old primary wrote: pg_controldata's
+	// latest checkpoint location, where the checkpoint record starts. A standby has replayed it only
+	// once its replay position is past that location, so the orchestrator waits for strictly more.
+	// An empty or unreadable LSN is an error, not a position. Stopping a
 	// project that is not running returns the checkpoint of its control file. The daemon, and
 	// with it the WAL relay the cluster archives through, stays up: a cluster that cannot
 	// archive its last segments cannot finish its shutdown.
