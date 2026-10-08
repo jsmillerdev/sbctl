@@ -27,7 +27,7 @@ const replicationRole = "supabase_replication_admin"
 // seedMarker is the file that tells a data directory is half seeded. SeedReplica writes it before
 // the first byte of the base backup lands and removes it as its last step, so a directory that
 // holds it was cut off (a kill, a power loss) and carries a backup_label without standby.signal.
-const seedMarker = "supavise-seeding"
+const seedMarker = lifecycle.SeedMarker
 
 // SeedUnfinished reports whether dataDir holds a seed that did not finish. Nothing may start a
 // cluster on such a directory (it would come up as a primary); SeedReplica clears it and starts

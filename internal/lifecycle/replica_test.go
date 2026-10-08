@@ -1002,3 +1002,79 @@ func TestReplicaUnitsGolden(t *testing.T) {
 		t.Fatalf("the replica's units changed:\n%s", firstDifference(string(want), got))
 	}
 }
+
+// pg-meta and the parameterized-query path of the Management API connect to the replica's port on
+// loopback with a password, as postgres and as supavise_read_only, as they do to the primary's: the
+// standby's pg_hba.conf is the primary's, which takes a SCRAM login from any role on 127.0.0.1 and
+// ::1 and trusts no TCP connection.
+func TestReplicaHBATakesPasswordLoginsOnLoopback(t *testing.T) {
+	f := newReplicaFixture(t)
+	if err := f.pl.prepareAt(f.t.Project, f.t.Keys, f.rp, true); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(f.rp.HBA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rules []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			rules = append(rules, strings.Join(strings.Fields(line), " "))
+		}
+	}
+	has := func(want string) bool {
+		for _, r := range rules {
+			if r == want {
+				return true
+			}
+		}
+		return false
+	}
+	for _, want := range []string{"host all all 127.0.0.1/32 scram-sha-256", "host all all ::1/128 scram-sha-256"} {
+		if !has(want) {
+			t.Errorf("the replica's pg_hba.conf lacks %q:\n%s", want, b)
+		}
+	}
+	for _, r := range rules {
+		if strings.HasPrefix(r, "host") && strings.HasSuffix(r, " trust") {
+			t.Errorf("the replica trusts a TCP connection: %q", r)
+		}
+	}
+	if fi, err := os.Stat(f.rp.HBA); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("pg_hba.conf = %v, %v", fi, err)
+	}
+	// It is the file of the primary: one source for both.
+	p, err := os.ReadFile(f.cp.HBA)
+	if err != nil || string(p) != string(b) {
+		t.Errorf("the primary's pg_hba.conf differs: %v", err)
+	}
+}
+
+// A directory that carries the seeder's marker was cut off while it was filled: it holds a backup_label
+// and no standby.signal, and a unit started on it would be a primary. Nothing starts one.
+func TestNoUnitStartsOnADirectoryASeedLeftUnfinished(t *testing.T) {
+	ctx := context.Background()
+	f := newReplicaFixture(t)
+	f.seeded(t, true)
+	if err := os.WriteFile(filepath.Join(f.rp.Data, SeedMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, call := range map[string]func() error{
+		"StartReplicaDatabase": func() error { return f.pl.StartReplicaDatabase(ctx, f.t) },
+		"StartReplica":         func() error { return f.pl.StartReplica(ctx, f.t) },
+		"DemoteToReplica":      func() error { return f.pl.DemoteToReplica(ctx, f.t) },
+	} {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "did not finish") {
+			t.Errorf("%s on an unfinished seed = %v", name, err)
+		}
+	}
+	if ops := f.sup.ops(); ops != "" {
+		t.Fatalf("the supervisor was asked: %s", ops)
+	}
+	if err := os.Remove(filepath.Join(f.rp.Data, SeedMarker)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pl.replicaPostgresSpec(ctx, f.t); err != nil {
+		t.Fatalf("a finished seed: %v", err)
+	}
+}

@@ -75,6 +75,10 @@ func (pl *PostgresPlane) replicaPaths(p *registry.Project) pgPaths {
 	return pathsFor(pl.cfg, p.Ref, pl.cfg.ReplicaPorts(p.Ref, p.Seq).Postgres)
 }
 
+// SeedMarker is the file the backup service's seeder keeps in a data directory while it fills it
+// (backup.SeedReplica writes it first and removes it last).
+const SeedMarker = "supavise-seeding"
+
 // ReplicaSeedPlan describes the standby to build. It has the fields of backup.ReplicaSeedPlan, which
 // the daemon converts to (this package cannot import backup).
 type ReplicaSeedPlan struct {
@@ -171,6 +175,12 @@ func (pl *PostgresPlane) replicaPostgresSpec(ctx context.Context, t ReplicaTarge
 	pp := pl.replicaPaths(t.Project)
 	if bootstrapPending(pp.Data) {
 		return units.Spec{}, fmt.Errorf("lifecycle: replica %s has no seeded data directory at %s", t.Identifier, pp.Data)
+	}
+	// A seed that was cut off (a kill, a power loss) holds a backup_label and no standby.signal, so a
+	// cluster started on it would come up as a primary. The seeder leaves its marker until it has
+	// finished (backup.SeedUnfinished); nothing starts a unit on a directory that carries it.
+	if fileExists(filepath.Join(pp.Data, SeedMarker)) {
+		return units.Spec{}, fmt.Errorf("lifecycle: the seeding of replica %s in %s did not finish; it is seeded again, not started", t.Identifier, pp.Data)
 	}
 	return pl.postgresSpecFor(ctx, t.Project, t.Keys, pp, true)
 }

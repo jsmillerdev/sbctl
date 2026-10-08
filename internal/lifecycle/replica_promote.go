@@ -270,6 +270,9 @@ func (pl *PostgresPlane) DemoteToReplica(ctx context.Context, t ReplicaTarget) e
 	}
 	p := t.Project
 	rp, cp := pl.replicaPaths(p), pl.paths(p)
+	if fileExists(filepath.Join(rp.Data, SeedMarker)) {
+		return fmt.Errorf("lifecycle: the seeding of replica %s in %s did not finish; it is seeded again, not demoted onto", t.Identifier, rp.Data)
+	}
 	pl.holdPorts(p.Ref)
 	defer pl.releasePorts(p.Ref)
 	if fileExists(filepath.Join(rp.Data, "standby.signal")) {

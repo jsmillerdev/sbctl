@@ -173,6 +173,9 @@ func TestRouterOptionalCapabilities(t *testing.T) {
 			t.Errorf("%s on the home: %v (calls %v)", o.name, err, e.local.calls)
 		}
 		before := len(e.local.calls)
+		if o.name == "ReconfigureService" {
+			continue // goes through Reconfigure for GoTrue and PostgREST: see below
+		}
 		if err := o.run(remote); !errors.Is(err, lifecycle.ErrNotSupported) || len(e.local.calls) != before {
 			t.Errorf("%s for a project homed elsewhere: %v", o.name, err)
 		}
@@ -180,6 +183,21 @@ func TestRouterOptionalCapabilities(t *testing.T) {
 	if len(e.rpc.calls) != 0 {
 		t.Fatalf("an optional capability went over the wire: %v", e.rpc.calls)
 	}
+	// The settings of GoTrue and PostgREST of a project homed elsewhere reach its home as a Reconfigure;
+	// any other service is applied there.
+	before := len(e.local.calls)
+	for _, svc := range []string{"gotrue", "postgrest"} {
+		if err := e.r.ReconfigureService(ctx, remote, k, svc); err != nil {
+			t.Fatalf("ReconfigureService(%s) for a project homed elsewhere: %v", svc, err)
+		}
+	}
+	if err := e.r.ReconfigureService(ctx, remote, k, "storage"); !errors.Is(err, lifecycle.ErrNotSupported) {
+		t.Fatalf("ReconfigureService(storage) for a project homed elsewhere: %v", err)
+	}
+	if len(e.local.calls) != before || len(e.rpc.calls) != 2 || e.rpc.nodes[0] != "n2" || !strings.HasSuffix(e.rpc.calls[0], "/plane/reconfigure") {
+		t.Fatalf("local calls %v, wire %v to %v", e.local.calls, e.rpc.calls, e.rpc.nodes)
+	}
+	e.rpc.calls, e.rpc.nodes = nil, nil
 	// A failure of the local plane comes back as it is.
 	boom := errors.New("boom")
 	e.local.err["RecoverPostgres"] = boom
