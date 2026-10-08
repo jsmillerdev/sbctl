@@ -15,6 +15,7 @@ import (
 
 	"github.com/supavise/supavise/internal/awsapi/awsfake"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/nodeupgrade"
 	"github.com/supavise/supavise/internal/selfupdate"
 )
@@ -199,6 +200,108 @@ func TestUpdateStackRunsTheVerifiedScript(t *testing.T) {
 		t.Errorf("config.Load: %+v, %v", cfg.AWS, err)
 	}
 }
+
+// stackHost is a node whose only work is its AWS stack, the way a stack-only `upgrade --aws` sees it.
+// It implements what that run calls and nothing else (the embedded Host is nil: a call to any other
+// method is a failure of the test); the stack update itself is the real nodeHost's.
+type stackHost struct {
+	nodeupgrade.Host
+	node *nodeupgrade.Node
+	cand *nodeupgrade.Candidate
+	real *nodeHost
+}
+
+func (s *stackHost) Inspect(context.Context) (*nodeupgrade.Node, error) { return s.node, nil }
+func (s *stackHost) Resolve(context.Context, string, *nodeupgrade.Node) (*nodeupgrade.Candidate, error) {
+	return s.cand, nil
+}
+func (s *stackHost) UpdateStack(ctx context.Context, c *nodeupgrade.Candidate, o nodeupgrade.StackOptions) (nodeupgrade.StackOutcome, error) {
+	return s.real.UpdateStack(ctx, c, o)
+}
+
+func newStackHost(t *testing.T, rel *awsRelease) *stackHost {
+	t.Helper()
+	info := &nodeupgrade.Info{Version: "v1.2.0", Platform: "linux-amd64", Pins: map[string]string{"gotrue": "auth-v1"},
+		RegistrySchema: "1.sql", RegistryMigrations: []string{"1.sql"}, ConvergeRevision: 2, InfraRevision: 2}
+	node := &nodeupgrade.Node{Version: "v1.2.0", BinaryInfo: info, Pins: info.Pins, AppliedMigrations: info.RegistryMigrations, Platform: info.Platform,
+		Verdict: nodeupgrade.VerdictHealthy, ConvergeKnown: true, ConvergeRevision: 2,
+		Infra: &infra.Report{Platform: "aws", Stack: "supavise-b", Have: 1, Need: 2}}
+	h, _, _ := awsHost(t)
+	return &stackHost{node: node, cand: rel.cand, real: h}
+}
+
+// The chain of `supavise upgrade --aws`, from the command line to the script: the flags make the
+// options, the run reaches the stack step, and the host runs the release's script with the stack and
+// the parameters the operator named. A flag that stops short of the options leaves `--aws` a plain
+// upgrade, with the stack untouched and a `--set` dropped without a word.
+func TestUpgradeAWSFlagsReachTheScript(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAOPERATOR")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	t.Setenv("EXIT_CODE", "0")
+	run := func(rel *awsRelease, args ...string) (string, error) {
+		t.Helper()
+		up, fl := newUpgradeCmd()
+		if err := up.ParseFlags(args); err != nil {
+			t.Fatal(err)
+		}
+		if err := fl.validate(); err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		err := nodeupgrade.Run(context.Background(), newStackHost(t, rel), upgradeOptions(cfg, &out, fl))
+		return out.String(), err
+	}
+
+	rel := newAWSRelease(t)
+	out, err := run(rel, "--aws", "--stack-name", "supavise-b", "--set", "Failover=on", "--set", "PeerCidr1=203.0.113.7/32", "--yes")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	b, rerr := os.ReadFile(rel.record)
+	if rerr != nil {
+		t.Fatalf("the script did not run:\n%s", out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) < 11 || strings.Join(lines[:3], " ") != "update --stack supavise-b" || lines[5] != "--params-from-stack" ||
+		strings.Join(lines[6:10], " ") != "--set Failover=on --set PeerCidr1=203.0.113.7/32" {
+		t.Errorf("script arguments:\n%s", b)
+	}
+
+	// Without --aws the plan names the gap and nothing runs.
+	rel = newAWSRelease(t)
+	out, err = run(rel, "--yes")
+	if err != nil || !strings.Contains(out, "supavise upgrade --aws") {
+		t.Errorf("without --aws: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(rel.record); err == nil {
+		t.Error("the stack was updated without --aws")
+	}
+
+	// --plan --aws prints the plan and runs nothing.
+	rel = newAWSRelease(t)
+	if out, err = run(rel, "--aws", "--plan"); err != nil {
+		t.Errorf("--plan --aws: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(rel.record); err == nil {
+		t.Error("--plan updated the stack")
+	}
+
+	// The script's refusal is the run's: exit 2, and the message says what the script said.
+	rel = newAWSRelease(t)
+	t.Setenv("EXIT_CODE", "2")
+	if _, err = run(rel, "--aws", "--stack-name", "supavise-b", "--yes"); nodeupgrade.ExitCode(err) != nodeupgrade.ExitRefused || !strings.Contains(err.Error(), "was refused") {
+		t.Errorf("a refused change set: %v", err)
+	}
+}
+
+// What the node's own type has to be for the run to find it: the optional capabilities are looked
+// up by interface, and a method whose signature drifts takes the capability away without an error.
+var (
+	_ nodeupgrade.StackUpdater  = (*nodeHost)(nil)
+	_ nodeupgrade.HostConverger = (*nodeHost)(nil)
+)
 
 func TestUpdateStackMapsTheScriptsExitStatus(t *testing.T) {
 	rel := newAWSRelease(t)

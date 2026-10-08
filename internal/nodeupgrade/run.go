@@ -43,6 +43,10 @@ func refused(format string, a ...any) error {
 	return &Failure{Code: ExitRefused, Err: fmt.Errorf(format, a...)}
 }
 
+// ErrAWSUnattended is why --aws is refused together with --unattended: the stack update shows a
+// change set and waits for the operator to type apply.
+var ErrAWSUnattended = errors.New("--aws changes the AWS stack with your credentials and asks you to confirm it: it cannot run with --unattended")
+
 // Phases written to the upgrade marker (<state_dir>/system/upgrade.json), which `supavise status`
 // and the dashboard banner read. The last four end the upgrade.
 const (
@@ -221,7 +225,7 @@ type run struct {
 func (r *run) run(ctx context.Context) error {
 	o := &r.o
 	if o.AWS && o.Unattended {
-		return refused("--aws changes the AWS stack with your credentials and asks you to confirm it: it cannot run with --unattended")
+		return &Failure{Code: ExitRefused, Err: ErrAWSUnattended}
 	}
 	inspect := r.h.Inspect
 	if vi, ok := r.h.(VersionInspector); ok && o.Check {

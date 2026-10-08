@@ -216,7 +216,7 @@ func TestUpgradeAndRollbackOptionsCarryTheAlertHook(t *testing.T) {
 	cfg := config.Default()
 	cfg.StateDir = t.TempDir()
 	var out bytes.Buffer
-	up := upgradeOptions(cfg, &out, "v1.4.0", false, false, false, true, false)
+	up := upgradeOptions(cfg, &out, &upgradeFlags{target: "v1.4.0", unattended: true})
 	if up.Notify == nil || !up.Yes || !up.Unattended || up.Version != "v1.4.0" || up.Keep != cfg.Upgrade.Keep() {
 		t.Errorf("upgrade options = %+v", up)
 	}
@@ -226,7 +226,7 @@ func TestUpgradeAndRollbackOptionsCarryTheAlertHook(t *testing.T) {
 	// And the hook reaches the webhook through the real Run: a refused run raises nothing, one that changes the node does.
 	w := newWebhook(t)
 	cfg = alertCfg(t, w.srv.URL)
-	opts := upgradeOptions(cfg, &out, "", false, false, true, false, false)
+	opts := upgradeOptions(cfg, &out, &upgradeFlags{yes: true})
 	opts.Notify(context.Background(), nodeupgrade.Event{Kind: nodeupgrade.EventStarted, From: "v1", To: "v2"})
 	if got := w.kinds(); got != "upgrade_started/info" {
 		t.Errorf("sent %q", got)
