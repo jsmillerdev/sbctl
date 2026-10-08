@@ -45,10 +45,10 @@ func rollbackOptions(cfg *config.Config, out io.Writer, yes bool) nodeupgrade.Op
 
 func init() {
 	var (
-		check, plan, yes, unattended, includePostgres bool
-		target, repo, apiBase                         string
-		keyFiles                                      []string
-		wait                                          time.Duration
+		check, plan, yes, unattended, includePostgres, aws bool
+		target, repo, apiBase, stackName                   string
+		keyFiles, stackSets                                []string
+		wait                                               time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "upgrade",
@@ -62,14 +62,29 @@ it. This command moves the whole node onto one, in these steps:
   prepare  downloads and verifies the new binary and every new artifact, checks the disk, and takes a
            fresh base backup of every running project and of the system project; if any of it fails
            nothing is changed
-  apply    installs the binary and restarts the daemon (a few seconds of HTTPS interruption), rolls
-           the shared services one at a time, each waited for, then upgrades the projects' GoTrue
-           and PostgREST: [upgrade] canary_projects first, then [upgrade] batch_size at a time, and
-           stops at the first failure
+  apply    installs the binary, converges the host (` + "`supavise system converge`" + `: unit files, directories,
+           mount protection, the firewall rule for the mesh port; it restarts no project) and restarts
+           the daemon (a few seconds of HTTPS interruption), rolls the shared services one at a time,
+           each waited for, then upgrades the projects' GoTrue and PostgREST: [upgrade]
+           canary_projects first, then [upgrade] batch_size at a time, and stops at the first failure
   verify   waits for the node to be no worse than it was
 
-If the new release does not come up, or a project fails, the projects the run moved go back to the
-releases they ran, the previous binary is put back, and the node is checked again. A project's
+The plan also names the host changes, the registry migrations the release adds and the projects
+that restart (none expected), and, on a server made by a CloudFormation stack, how far the stack is
+behind what the release needs.
+
+--aws also updates that stack, first, before anything on the node changes: it fetches the release's
+signed template and update script and runs ` + "`supavise-aws-deploy.sh update`" + ` with your AWS credentials,
+which sudo must keep (` + "`sudo -E supavise upgrade --aws`" + `). The script shows the change set, refuses
+a change that would replace the instance, the data volume or the address, and asks you to type
+apply. This server's instance role never changes its stack. Without credentials of yours in the
+environment the node side goes ahead and the command to run yourself is printed. --stack-name names
+the stack of a server made before the stack was tagged (it is then remembered in
+/etc/supavise/config.d/20-aws.toml); --set Parameter=Value turns a feature on (Failover=on).
+A stack failure or refusal exits with status 2 and leaves the node unchanged.
+
+If the new release does not come up, if its host layer fails, or a project fails, the projects the run
+moved go back to the releases they ran, the previous binary is put back, and the node is checked again. A project's
 PostgreSQL release moves only with --include-postgres: on hosted Supabase the owner of a project
 decides when its Postgres is upgraded, and each move restarts PostgreSQL.
 
@@ -77,7 +92,8 @@ decides when its Postgres is upgraded, and each move restarts PostgreSQL.
 --plan also prints the plan and stops. Neither changes anything, and neither needs root. The upgrade needs root (the binary is root's); it runs everything that
 touches the node's data as the supavise user.
 
---unattended is for a timer. It implies --yes, never asks, and refuses (exit status 2) unless
+--unattended is for a timer. It implies --yes, never asks, cannot be combined with --aws, raises
+infra_behind (and does not fail) when the stack lags, and refuses (exit status 2) unless
 ` + "`supavise status`" + ` says healthy, every running project has a backup newer than 24 hours (fresh ones
 are taken anyway) and the master key has a copy in the backup backend.
 
@@ -91,7 +107,10 @@ rolled back; 4 failed and the node needs the operator. While it runs, the state 
 			}
 			apply := !check && !plan
 			if apply && os.Geteuid() != 0 {
-				return &nodeupgrade.Failure{Code: nodeupgrade.ExitRefused, Err: errors.New("run as root: sudo supavise upgrade")}
+				return &nodeupgrade.Failure{Code: nodeupgrade.ExitRefused, Err: errors.New("run as root: sudo supavise upgrade (sudo -E for --aws)")}
+			}
+			if err := checkAWSFlags(aws, stackName, stackSets); err != nil {
+				return refusedBefore(err)
 			}
 			// Whatever stops the command before it has looked at the node is a refusal: nothing changed.
 			cfg, err := loadConfig()
@@ -136,6 +155,9 @@ rolled back; 4 failed and the node needs the operator. While it runs, the state 
 	f.BoolVar(&yes, "yes", false, "do not ask for confirmation")
 	f.BoolVar(&unattended, "unattended", false, "for a timer: implies --yes, and refuses unless the node is healthy, backed up and its key escrowed")
 	f.StringVar(&target, "version", "", "upgrade to this release tag (default: the newest release)")
+	f.BoolVar(&aws, "aws", false, "also update this server's AWS CloudFormation stack to the release's template, with your AWS credentials (sudo -E keeps them)")
+	f.StringVar(&stackName, "stack-name", "", "with --aws: the stack that made this server (default: [aws] stack_name, else the instance's supavise:stack-name tag)")
+	f.StringArrayVar(&stackSets, "set", nil, "with --aws: a stack parameter, Parameter=Value, repeatable (Failover=on)")
 	f.BoolVar(&includePostgres, "include-postgres", false, "also move the projects' PostgreSQL release (each restarts PostgreSQL)")
 	f.DurationVar(&wait, "wait", 5*time.Minute, "how long the restarted daemon has to answer before the upgrade is rolled back")
 	// For tests against a local release server and a throwaway key.
@@ -195,9 +217,10 @@ status 4. Needs root.`,
 	var infoJSON bool
 	info := &cobra.Command{
 		Use:   "release-info",
-		Short: "Print the release this binary is: its version, the service versions it pins and its registry schema",
+		Short: "Print the release this binary is: its version, the service versions it pins, its registry schema and its host and stack revisions",
 		Long: `The same facts the release carries in its versions.yaml and its migrations, as the binary itself
-reports them. ` + "`supavise upgrade`" + ` runs the new binary with this to plan the upgrade.`,
+reports them, with the converge revision and the changes of its host layer and the AWS stack revision it
+needs. ` + "`supavise upgrade`" + ` runs the new binary with this to plan the upgrade.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			i, err := nodeupgrade.OwnInfo(version)
@@ -210,7 +233,10 @@ reports them. ` + "`supavise upgrade`" + ` runs the new binary with this to plan
 				return enc.Encode(i)
 			}
 			w := cmd.OutOrStdout()
-			fmt.Fprintf(w, "version          %s\nplatform         %s\nregistry schema  %s\n", i.Version, i.Platform, i.RegistrySchema)
+			fmt.Fprintf(w, "version          %s\nplatform         %s\nregistry schema  %s\nconverge         revision %d\nstack            revision %d\n", i.Version, i.Platform, i.RegistrySchema, i.ConvergeRevision, i.InfraRevision)
+			for _, c := range i.HostChanges {
+				fmt.Fprintf(w, "host change      %s\n", c)
+			}
 			t := newTable(w)
 			fmt.Fprintln(t, "SERVICE\tRELEASE")
 			for _, m := range nodeupgrade.DiffPins(nil, i.Pins) {

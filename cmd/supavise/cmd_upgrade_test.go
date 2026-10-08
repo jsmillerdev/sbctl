@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/hostsetup"
+	"github.com/supavise/supavise/internal/infra"
 	"github.com/supavise/supavise/internal/nodeupgrade"
 )
 
@@ -23,7 +25,7 @@ func TestUpgradeCommandsAreRegistered(t *testing.T) {
 		}
 	}
 	up, _, _ := rootCmd.Find([]string{"upgrade"})
-	for _, flag := range []string{"check", "plan", "yes", "unattended", "version", "include-postgres"} {
+	for _, flag := range []string{"check", "plan", "yes", "unattended", "version", "include-postgres", "aws", "stack-name", "set"} {
 		if up.Flags().Lookup(flag) == nil {
 			t.Errorf("upgrade has no --%s", flag)
 		}
@@ -55,6 +57,9 @@ func TestReleaseInfoReportsThePins(t *testing.T) {
 	}
 	if i.RegistrySchema == "" || i.Pins["gotrue"] == "" || i.Pins["postgres"] == "" || i.Pins["studio"] == "" || i.Pins["supavisor"] == "" {
 		t.Fatalf("info = %+v", i)
+	}
+	if i.ConvergeRevision != hostsetup.Revision || i.InfraRevision != infra.Revision || len(i.HostChanges) == 0 {
+		t.Fatalf("the host and stack revisions are missing: %+v", i)
 	}
 	if _, err := nodeupgrade.ParseInfo([]byte(out)); err != nil {
 		t.Fatalf("ParseInfo cannot read what release-info prints: %v", err)

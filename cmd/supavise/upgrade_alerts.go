@@ -93,6 +93,12 @@ func upgradeAlert(ev nodeupgrade.Event) alerts.Event {
 		if ev.Unattended {
 			a.Detail += " Automatic upgrades skip this release until a newer one exists; `sudo supavise update resume` lifts that."
 		}
+	case nodeupgrade.EventInfraBehind:
+		// A condition, not an announcement: it is sent again only after the repeat interval, and an
+		// upgrade that finds the stack behind is no failure.
+		a.Kind, a.Severity = alerts.KindInfraBehind, alerts.SeverityWarning
+		a.Title = "The AWS stack is behind this release"
+		a.Detail = fmt.Sprintf("%s. What the release adds on top of the stack stays off until the stack is updated. Run `sudo -E supavise upgrade --aws` with your AWS credentials, or `supavise-aws-deploy.sh update` from any shell that has them.", ev.Cause)
 	case nodeupgrade.EventNeedsOperator:
 		a.Kind, a.Severity = alerts.KindUpgradeFailed, alerts.SeverityCritical
 		a.Title = fmt.Sprintf("%s to %s failed: the node needs you", what, target)
