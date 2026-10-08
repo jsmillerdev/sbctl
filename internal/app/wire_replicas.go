@@ -10,7 +10,6 @@ import (
 
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
-	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
 	"github.com/supavise/supavise/internal/placement"
@@ -25,8 +24,9 @@ import (
 // backups (backup.BaseBackupEnsurer): it creates and watches the standbys, keeps the default
 // replicas and removes the ones that go. On a node with no cluster it only serves the registry,
 // which makes a setup request answer "No Supavise server is joined" and runs nothing; the Management
-// API is given the controller only on a node that belongs to a cluster, so a single server answers as
-// it always did.
+// API is given the controller only on a node that belongs to a cluster and runs it, so a single server
+// answers as it always did and a node whose controller is off (the host is behind, or it cannot take
+// base backups) answers that replicas are not set up.
 //
 // The reports that nodes send the leader (cluster.Reports) reach the controller through a subscription
 // made here: the mesh hook runs first and provides the store, this hook subscribes the sink the
@@ -52,9 +52,25 @@ func wireReplicas(ctx context.Context, w *Wire) error {
 	Provide[replicas.Remover](w, c)
 	Provide[replicas.ReportSink](w, c)
 	clustered := w.clustered()
+	// Whether the controller runs here, and if not, why. A controller that is not running still takes a
+	// setup request and writes its row, which nothing then picks up, so a node whose controller is off
+	// does not give it to the Management API (Deps.Replicas stays nil and the API says replicas are not
+	// set up on this server).
+	hostReason, behind := hostBehind(w)
+	var why string
+	switch {
+	case behind:
+		why = hostReason
+	case o.Ops == nil || o.Backups == nil:
+		why = fmt.Sprintf("this node cannot reach the replica nodes or take base backups (node operations: %v, base backups: %v)", o.Ops != nil, o.Backups != nil)
+	}
 	if clustered {
-		// A typed nil in an interface field would read as a controller; c is not nil here.
-		w.API.Replicas = c
+		if why == "" {
+			// A typed nil in an interface field would read as a controller; c is not nil here.
+			w.API.Replicas = c
+		} else {
+			w.Off("api.Deps.Replicas", "the replica controller does not run on this node: "+why)
+		}
 		if r, ok := Get[placement.Resolver](w); ok {
 			w.API.Placement = r
 		}
@@ -70,15 +86,15 @@ func wireReplicas(ctx context.Context, w *Wire) error {
 		}
 	}
 
-	switch reason, behind := hostBehind(w); {
+	switch {
 	case behind:
-		w.Off("replica controller", reason)
+		w.Off("replica controller", why)
 		return nil
-	case o.Ops == nil || o.Backups == nil:
+	case why != "":
 		if clustered {
 			// A node that has joined others and cannot create replicas is a gap in the wiring the
 			// operator should hear about; a single server has nothing to run.
-			w.Off("replica controller", fmt.Sprintf("this node cannot reach the replica nodes or take base backups (node operations: %v, base backups: %v)", o.Ops != nil, o.Backups != nil))
+			w.Off("replica controller", why)
 		}
 		return nil
 	}
@@ -137,18 +153,6 @@ func (in *reportIntake) Run(ctx context.Context) {
 			in.sink.HandleReport(ctx, rep)
 		}
 	}
-}
-
-// hostBehind says whether the host layer is behind this binary (internal/hostsetup): the node has not
-// run `supavise system converge` for this release, which opens the peer port, gives the daemon the
-// directories it writes and so on. A node in that state keeps what runs, and starts nothing new of the
-// cluster work. The state is the one the daemon started with (wireHost).
-func hostBehind(w *Wire) (reason string, behind bool) {
-	st, ok := Get[hostsetup.Status](w)
-	if !ok || !st.Behind() {
-		return "", false
-	}
-	return fmt.Sprintf("the host setup is at revision %d and this release needs %d: run `sudo supavise system converge` and restart the daemon", st.Have, st.Want), true
 }
 
 // baseBackups finds what takes the base backup a replica starts from: a hook that provides it, or

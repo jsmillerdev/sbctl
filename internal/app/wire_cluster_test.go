@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/cluster"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover"
+	"github.com/supavise/supavise/internal/hostsetup"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -39,11 +43,10 @@ func clusterNodeWire(t *testing.T) *Wire {
 	return w
 }
 
-// A node that belongs to a cluster has every port the design requires connected, or switched off with
-// a reason a person can act on. A hook that stops providing a port, or a port added to clusterPorts
-// that nobody provides, fails here and not in a cluster's first failover.
-func TestEveryClusterPortIsProvidedOrOff(t *testing.T) {
-	w := clusterNodeWire(t)
+// runClusterWire runs the hooks of a cluster node and checks what every such test checks: the node has
+// its mesh, and every port is provided or switched off with a reason a person can act on.
+func runClusterWire(t *testing.T, w *Wire) {
+	t.Helper()
 	t.Cleanup(w.stop)
 	if err := w.run(context.Background()); err != nil {
 		t.Fatal(err)
@@ -60,13 +63,105 @@ func TestEveryClusterPortIsProvidedOrOff(t *testing.T) {
 			t.Errorf("%s is switched off with no reason", name)
 		}
 	}
-	// What the Management API needs to answer for a cluster.
-	if w.API.Replicas == nil || w.API.Placement == nil || !w.API.LoadBalancers || w.API.Failover == nil {
+}
+
+// wantOff fails unless the features that are off are exactly these: a hook that switches a feature off by
+// mistake changes the list, and so does one that stops switching off what it cannot run.
+func wantOff(t *testing.T, w *Wire, features ...string) {
+	t.Helper()
+	got := slices.Sorted(maps.Keys(w.off))
+	if !slices.Equal(got, features) {
+		t.Fatalf("features off: %v, want %v", got, features)
+	}
+}
+
+func hasRunner(w *Wire, name string) bool {
+	return slices.ContainsFunc(w.runners, func(r namedRunner) bool { return r.name == name })
+}
+
+// withBackups gives the wire a backup service over a file store, as Serve does when the store opens: as
+// the service the hooks Get and as the Management API's Backups.
+func withBackups(t *testing.T, w *Wire) {
+	t.Helper()
+	store, err := backup.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs, err := backup.New(backup.Options{Config: w.Cfg, Registry: w.Node.Registry, Store: store, Secrets: w.Node.Secrets})
+	if err != nil {
+		t.Fatal(err)
+	}
+	Provide(w, bs)
+	w.API.Backups = bs
+}
+
+// A node that belongs to a cluster has every port the design requires connected, or switched off with
+// a reason a person can act on. A hook that stops providing a port, or a port added to clusterPorts
+// that nobody provides, fails here and not in a cluster's first failover.
+//
+// This node has no backup service (the store did not open). What that switches off is pinned, so that a
+// feature that goes off by mistake does not pass as "off is accepted": the base backup the system cluster's
+// standbys start from, the leader marker, and the replica controller with the Management API's way to it.
+func TestEveryClusterPortIsProvidedOrOff(t *testing.T) {
+	w := clusterNodeWire(t)
+	runClusterWire(t, w)
+	wantOff(t, w, "api.Deps.Replicas", "cluster.BaseBackup", "failover.Marker", "replica controller")
+	// What the Management API needs to answer for a cluster. Replicas is off: a controller that does not
+	// run would take a request and leave its row for nobody.
+	if w.API.Replicas != nil || w.API.Placement == nil || !w.API.LoadBalancers || w.API.Failover == nil {
 		t.Fatalf("Deps: replicas %v, placement %v, load balancers %v, failover %v", w.API.Replicas, w.API.Placement, w.API.LoadBalancers, w.API.Failover)
+	}
+	if hasRunner(w, "replicas") {
+		t.Fatal("the replica controller runs on a node that cannot take base backups")
 	}
 	// The proxy has its cluster, and the one certificate endpoint is the proxy's.
 	if w.Proxy.Cluster == nil {
 		t.Fatal("the proxy was not given its cluster")
+	}
+}
+
+// The same node with the backup service that Serve provides: nothing is off, the Management API has the
+// replica controller, and the controller runs.
+func TestAClusterNodeWithBackupsHasNothingOff(t *testing.T) {
+	w := clusterNodeWire(t)
+	withBackups(t, w)
+	runClusterWire(t, w)
+	wantOff(t, w)
+	if w.API.Replicas == nil || w.API.Placement == nil || !w.API.LoadBalancers || w.API.Failover == nil {
+		t.Fatalf("Deps: replicas %v, placement %v, load balancers %v, failover %v", w.API.Replicas, w.API.Placement, w.API.LoadBalancers, w.API.Failover)
+	}
+	for _, name := range []string{"replicas", "replica report intake", "failover monitor"} {
+		if !hasRunner(w, name) {
+			t.Errorf("%s does not run", name)
+		}
+	}
+	if d, ok := Get[failover.Service](w); !ok || d == nil {
+		t.Fatal("no failover service")
+	}
+}
+
+// A node that has joined a cluster while its host is behind this release keeps its mesh and runs no
+// replica controller and no failover monitor. The Management API is not given the controller either, so
+// that a setup request is refused and does not leave a row for nobody.
+func TestAClusterNodeWhoseHostIsBehindTakesNoReplicaRequests(t *testing.T) {
+	w := clusterNodeWire(t)
+	withBackups(t, w)
+	Provide(w, hostsetup.Status{Have: 1, Want: 2, Known: true})
+	runClusterWire(t, w)
+	wantOff(t, w, "api.Deps.Replicas", "failover monitor", "replica controller")
+	if r, _ := w.offReason("api.Deps.Replicas"); !strings.Contains(r, "supavise system converge") {
+		t.Errorf("the reason does not say how to turn it on: %q", r)
+	}
+	if w.API.Replicas != nil {
+		t.Fatal("the Management API was given a replica controller that does not run")
+	}
+	if w.API.Placement == nil || w.API.Failover == nil || !w.API.LoadBalancers {
+		t.Fatalf("Deps: placement %v, load balancers %v, failover %v", w.API.Placement, w.API.LoadBalancers, w.API.Failover)
+	}
+	for _, name := range []string{"replicas", "failover monitor"} {
+		if hasRunner(w, name) {
+			t.Errorf("%s runs while the host is behind", name)
+		}
 	}
 }
 
