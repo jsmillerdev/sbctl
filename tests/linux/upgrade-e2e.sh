@@ -79,6 +79,30 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$WORK/outputs"
 
+# systemd's bus is away for a moment now and then (right after the daemon restarts, for one):
+# "Transport endpoint is not connected", "Connection reset by peer", "disconnected from message bus
+# without replying". The calls that only read are repeated for a few seconds; any other call, and
+# any other failure, runs once and fails as it did.
+systemctl() {
+  case " $* " in
+    *" show "* | *" is-active "* | *" is-enabled "*) ;;
+    *) command systemctl "$@"; return ;;
+  esac
+  local try err rc=0
+  err=$(mktemp -p "$WORK")
+  for try in 1 2 3 4 5 6; do
+    rc=0
+    command systemctl "$@" 2>"$err" || rc=$?
+    [[ $rc -eq 0 ]] && break
+    grep -q -e "Transport endpoint is not connected" -e "Connection reset by peer" -e "disconnected from message bus" \
+      -e "D-Bus connection terminated" -e "Failed to connect to bus" "$err" || break
+    sleep 1
+  done
+  cat "$err" >&2
+  rm -f "$err"
+  return $rc
+}
+
 need_root
 preflight
 ARCH=$(dpkg --print-architecture)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"syscall"
 	"testing"
 	"time"
 
@@ -31,6 +32,9 @@ func TestTransientBusError(t *testing.T) {
 		{godbus.Error{Name: "org.freedesktop.DBus.Error.Disconnected"}, true},
 		{godbus.ErrClosed, true},
 		{io.EOF, true},
+		{fmt.Errorf("dial unix /run/systemd/private: %w", syscall.ECONNREFUSED), true},
+		{fmt.Errorf("read: %w", syscall.ECONNRESET), true},
+		{syscall.ENOENT, false},
 		{godbus.Error{Name: "org.freedesktop.DBus.Error.AccessDenied"}, false},
 		{godbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit"}, false},
 		{errors.New("units: start job finished with \"failed\""), false},

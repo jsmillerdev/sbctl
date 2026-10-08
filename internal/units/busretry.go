@@ -5,14 +5,15 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"syscall"
 	"time"
 
 	godbus "github.com/godbus/dbus/v5"
 )
 
-// busAttempts is how many times a start or stop request is sent when the bus drops it: the
-// request itself, then two more.
-const busAttempts = 3
+// busAttempts is how many times a request is sent when the bus drops it: the
+// request itself, then up to three more.
+const busAttempts = 4
 
 // busRetryDelay is the wait before the next attempt; a variable so that tests do not sleep.
 var busRetryDelay = func(attempt int) time.Duration { return time.Duration(attempt) * 250 * time.Millisecond }
@@ -21,7 +22,7 @@ var busRetryDelay = func(attempt int) time.Duration { return time.Duration(attem
 // systemd went away while it was answering: the bus daemon's NoReply ("Message recipient
 // disconnected from message bus without replying", what a caller gets when the bus daemon loses
 // the other end before it answers, as while PID 1 re-executes), a closed connection, or a
-// connection that was reset. The same request may be sent again: stopping a stopped unit and
+// connection that was reset, refused or not connected (the private socket while systemd re-executes). The same request may be sent again: stopping a stopped unit and
 // starting a running one are no-ops, and a job that was queued is replaced by the new one.
 //
 // A refusal (access denied, no such unit, a job that failed) is not transient.
@@ -36,6 +37,11 @@ func transientBusError(err error) bool {
 			return true
 		}
 		return false
+	}
+	for _, errno := range []syscall.Errno{syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.ENOTCONN, syscall.EPIPE} {
+		if errors.Is(err, errno) {
+			return true
+		}
 	}
 	return errors.Is(err, godbus.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }

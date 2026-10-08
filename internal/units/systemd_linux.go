@@ -65,6 +65,19 @@ func (s *Systemd) dial(ctx context.Context) (*sddbus.Conn, error) {
 	return c, nil
 }
 
+// call dials and runs op on the connection, and again when the bus drops the request without an
+// answer (retryBus). op must be safe to repeat: every call made through it is a read, a property
+// set, or a start or stop job (which "replace" merges).
+func (s *Systemd) call(ctx context.Context, what string, op func(c *sddbus.Conn) error) error {
+	return retryBus(ctx, s.log, what, func() error {
+		c, err := s.dial(ctx)
+		if err != nil {
+			return err
+		}
+		return op(c)
+	})
+}
+
 // Close releases the D-Bus connection.
 func (s *Systemd) Close() {
 	s.mu.Lock()
@@ -119,18 +132,19 @@ func (s *Systemd) applyEgress(ctx context.Context, unit string, deny bool) error
 	if !deny && !egressManaged(unit) {
 		return nil
 	}
-	c, err := s.dial(ctx)
-	if err != nil {
-		return err
-	}
-	cur, err := c.GetUnitTypePropertiesContext(ctx, unit, "Service")
-	if err != nil {
-		cur = nil // not loaded: it has no restriction
-	}
-	if egressMatches(cur, deny) {
-		return nil
-	}
-	return s.setEgress(ctx, c, unit, deny)
+	return s.call(ctx, "egress of "+unit, func(c *sddbus.Conn) error {
+		cur, err := c.GetUnitTypePropertiesContext(ctx, unit, "Service")
+		if err != nil {
+			if transientBusError(err) {
+				return err
+			}
+			cur = nil // not loaded: it has no restriction
+		}
+		if egressMatches(cur, deny) {
+			return nil
+		}
+		return s.setEgress(ctx, c, unit, deny)
+	})
 }
 
 func (s *Systemd) setEgress(ctx context.Context, c *sddbus.Conn, unit string, deny bool) error {
@@ -179,22 +193,22 @@ func (s *Systemd) applyLimits(ctx context.Context, unit string, l config.Limits)
 	if err != nil {
 		return err
 	}
-	c, err := s.dial(ctx)
-	if err != nil {
-		return err
-	}
-	cur, err := c.GetUnitTypePropertiesContext(ctx, unit, "Service")
-	if err == nil {
-		m, _ := cur["MemoryMax"].(uint64)
-		q, _ := cur["CPUQuotaPerSecUSec"].(uint64)
-		if m == mem && q == cpu {
-			return nil
+	return s.call(ctx, "limits of "+unit, func(c *sddbus.Conn) error {
+		cur, err := c.GetUnitTypePropertiesContext(ctx, unit, "Service")
+		if err == nil {
+			m, _ := cur["MemoryMax"].(uint64)
+			q, _ := cur["CPUQuotaPerSecUSec"].(uint64)
+			if m == mem && q == cpu {
+				return nil
+			}
+		} else if transientBusError(err) {
+			return err
 		}
-	}
-	return c.SetUnitPropertiesContext(ctx, unit, false,
-		sddbus.Property{Name: "MemoryMax", Value: godbus.MakeVariant(mem)},
-		sddbus.Property{Name: "CPUQuotaPerSecUSec", Value: godbus.MakeVariant(cpu)},
-	)
+		return c.SetUnitPropertiesContext(ctx, unit, false,
+			sddbus.Property{Name: "MemoryMax", Value: godbus.MakeVariant(mem)},
+			sddbus.Property{Name: "CPUQuotaPerSecUSec", Value: godbus.MakeVariant(cpu)},
+		)
+	})
 }
 
 // Start implements Supervisor. It waits for the start job and returns an error if the
@@ -202,18 +216,14 @@ func (s *Systemd) applyLimits(ctx context.Context, unit string, l config.Limits)
 // an answer is sent again (retryBus).
 func (s *Systemd) Start(ctx context.Context, unit string) error {
 	var ch chan string
-	err := retryBus(ctx, s.log, "start "+unit, func() error {
-		c, err := s.dial(ctx)
-		if err != nil {
-			return err
-		}
+	err := s.call(ctx, "start "+unit, func(c *sddbus.Conn) error {
 		// A start the node's own operations ask for (a resume, a resize, a rollback after one) must not
 		// be refused by the unit's rate limit (StartLimitBurst): reset-failed clears the start counter
 		// of a unit in any state, not only the failed state of one that hit the limit. A unit that is
 		// not loaded answers with an error, which is ignored.
 		_ = c.ResetFailedUnitContext(ctx, unit)
 		ch = make(chan string, 1)
-		_, err = c.StartUnitContext(ctx, unit, "replace", ch)
+		_, err := c.StartUnitContext(ctx, unit, "replace", ch)
 		return err
 	})
 	if err != nil {
@@ -227,13 +237,9 @@ func (s *Systemd) Start(ctx context.Context, unit string) error {
 // (retryBus).
 func (s *Systemd) Stop(ctx context.Context, unit string) error {
 	var ch chan string
-	err := retryBus(ctx, s.log, "stop "+unit, func() error {
-		c, err := s.dial(ctx)
-		if err != nil {
-			return err
-		}
+	err := s.call(ctx, "stop "+unit, func(c *sddbus.Conn) error {
 		ch = make(chan string, 1)
-		_, err = c.StopUnitContext(ctx, unit, "replace", ch)
+		_, err := c.StopUnitContext(ctx, unit, "replace", ch)
 		return err
 	})
 	if err != nil {
@@ -263,12 +269,13 @@ func (s *Systemd) Status(ctx context.Context, unit string) (Status, error) {
 	if _, _, err := ParseUnit(unit); err != nil {
 		return Status{}, err
 	}
-	c, err := s.dial(ctx)
-	if err != nil {
-		return Status{}, err
-	}
-	u, err := c.GetUnitPropertiesContext(ctx, unit)
-	if err != nil {
+	var c *sddbus.Conn
+	var u map[string]any
+	if err := s.call(ctx, "status of "+unit, func(conn *sddbus.Conn) (err error) {
+		c = conn
+		u, err = conn.GetUnitPropertiesContext(ctx, unit)
+		return err
+	}); err != nil {
 		return Status{}, fmt.Errorf("units: status %s: %w", unit, err)
 	}
 	st := Status{Unit: unit, State: StateUnknown}
