@@ -22,6 +22,10 @@ type ReplicaFleet interface {
 	Failed(ctx context.Context, r registry.Replica, cause error)
 }
 
+// SetReplicaFleet sets Options.Replicas on an Engine that was built without it. The daemon calls it
+// while it wires the cluster features, before the Engine serves a request.
+func (e *Engine) SetReplicaFleet(f ReplicaFleet) { e.opts.Replicas = f }
+
 // EventReplicaResizeFailed is the event a replica that did not come back on a new size leaves
 // on its project.
 const EventReplicaResizeFailed = "replica.resize_failed"

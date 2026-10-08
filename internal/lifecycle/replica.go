@@ -202,6 +202,10 @@ func replicaRESTURI(password string, replicaPort, primaryPort int) string {
 	return u.String()
 }
 
+// SetRestoreCommand sets PlaneOptions.RestoreCommandFor on a plane that was built without it. The
+// daemon calls it while it wires the cluster features, before any request is served.
+func (pl *PostgresPlane) SetRestoreCommand(f func(ref string) string) { pl.opts.RestoreCommandFor = f }
+
 func (pl *PostgresPlane) replicaReadyTimeout() time.Duration {
 	if pl.opts.ReplicaReadyTimeout > 0 {
 		return pl.opts.ReplicaReadyTimeout
