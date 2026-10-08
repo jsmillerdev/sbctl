@@ -97,6 +97,51 @@ func TestEnsureTenantRegistersTheProjectAndItsReplicasAndRefreshesThePeers(t *te
 	}
 }
 
+// The orchestrator holds Lock for the whole move and calls EnsureTenant inside it: the lock is not
+// reentrant, so EnsureTenant must not take it. The daemon's sweep holds no lock and takes it.
+func TestEnsureTenantRunsUnderTheLockTheOrchestratorHolds(t *testing.T) {
+	ctx := context.Background()
+	h, p, _, _ := replicaHarness(t)
+	rt := &replicaTenant{}
+	h.e.opts.Fleet = fleet.Fleet{rt}
+	unlock, err := h.e.Lock(ctx, p.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	release := func() { once.Do(unlock) }
+	defer release()
+
+	done := make(chan error, 1)
+	go func() { done <- h.e.EnsureTenant(ctx, p.Ref) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("EnsureTenant waits for the lock its caller holds")
+	}
+	if len(rt.ensured) != 1 {
+		t.Fatalf("project tenants = %+v", rt.ensured)
+	}
+
+	// The sweep does not run on a project whose lock is held.
+	swept := make(chan struct{})
+	go func() { h.e.EnsureTenants(ctx); close(swept) }()
+	select {
+	case <-swept:
+		t.Fatal("the sweep ran on a project that a move holds")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-swept:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sweep did not run after the lock was released")
+	}
+}
+
 func TestQuiesceTenantAndLockServeTheFailoverOrchestrator(t *testing.T) {
 	ctx := context.Background()
 	h, _, _, rt := configHarness(t)

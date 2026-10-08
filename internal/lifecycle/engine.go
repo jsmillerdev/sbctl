@@ -1019,7 +1019,7 @@ func (e *Engine) EnsureTenants(ctx context.Context) map[string]error {
 		if ps[i].Ref == config.SystemRef || !active(ps[i].Status) || (e.opts.ReadOnly && !e.homedHere(&ps[i])) {
 			continue
 		}
-		if err := e.ensureTenantsOf(ctx, ps[i].Ref, false); err != nil {
+		if err := e.ensureTenantsLocked(ctx, ps[i].Ref); err != nil {
 			errs[ps[i].Ref] = err
 		}
 	}
@@ -1035,6 +1035,16 @@ func (e *Engine) EnsureTenant(ctx context.Context, ref string) error {
 		return nil
 	}
 	return e.ensureTenantsOf(ctx, ref, true)
+}
+
+// ensureTenantsLocked is ensureTenantsOf under the project's lock, for the sweep at start.
+func (e *Engine) ensureTenantsLocked(ctx context.Context, ref string) error {
+	unlock, err := e.lock(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return e.ensureTenantsOf(ctx, ref, false)
 }
 
 // QuiesceTenant asks the shared services to let go of ref's database and keeps their clients out until
@@ -1074,13 +1084,8 @@ func (e *Engine) refreshPeers(ctx context.Context, tenant string) {
 // ensureTenantsOf registers ref with the shared services, and with it the tenants of its replicas
 // that are up. peers asks the other nodes to drop their cached copy afterwards, which a call that
 // moved the project's home needs and the daemon's sweep at start does not (a follower learns the
-// tenant rows by replication when it starts).
+// tenant rows by replication when it starts). The caller holds the project's lock.
 func (e *Engine) ensureTenantsOf(ctx context.Context, ref string, peers bool) error {
-	unlock, err := e.lock(ctx, ref)
-	if err != nil {
-		return err
-	}
-	defer unlock()
 	p, err := e.reg.GetProject(ctx, ref)
 	if errors.Is(err, registry.ErrNotFound) {
 		return nil

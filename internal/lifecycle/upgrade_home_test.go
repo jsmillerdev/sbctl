@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -15,16 +16,17 @@ import (
 type pendingPlane struct {
 	*upPlane
 	asked []string
+	err   error // what both calls answer instead of yes
 }
 
 func (p *pendingPlane) PendingRestart(_ context.Context, pr *registry.Project, _ *secrets.ProjectKeys) (bool, error) {
 	p.asked = append(p.asked, "PendingRestart "+pr.Ref)
-	return true, nil
+	return p.err == nil, p.err
 }
 
 func (p *pendingPlane) RestartPending(_ context.Context, pr *registry.Project, _ *secrets.ProjectKeys) (bool, error) {
 	p.asked = append(p.asked, "RestartPending "+pr.Ref)
-	return true, nil
+	return p.err == nil, p.err
 }
 
 var _ PendingRestarter = (*pendingPlane)(nil)
@@ -99,6 +101,26 @@ func TestUpgradePlannerAndPendingRestartLeaveAProjectToItsHome(t *testing.T) {
 	}
 	if got := strings.Join(pp.asked, ","); got != "PendingRestart "+h.ref {
 		t.Fatalf("asked = %s", got)
+	}
+}
+
+// A node that holds fenced primaries and awaits `node rejoin` finishes `supavise upgrade`: the fenced
+// primary does not run here, so it owes no restart, and the CLI's loop reaches the projects after it.
+// Any other error still stops the call.
+func TestPendingRestartOfAFencedPrimaryOwesNothing(t *testing.T) {
+	ctx := context.Background()
+	h := newUpHarness(t)
+	pp := &pendingPlane{upPlane: h.plane, err: fmt.Errorf("%w: n2 leads", ErrFenced)}
+	e := NewEngine(h.cfg, h.reg, h.e.sec, h.arts, pp, Options{Fleet: fleet.Fleet{&fakeTenant{}}, Backup: h.backup})
+	if pending, err := e.PendingRestart(ctx, h.ref); err != nil || pending {
+		t.Fatalf("PendingRestart = %v, %v", pending, err)
+	}
+	if restarted, err := e.RestartPending(ctx, h.ref); err != nil || restarted {
+		t.Fatalf("RestartPending = %v, %v", restarted, err)
+	}
+	pp.err = errors.New("the supervisor did not answer")
+	if _, err := e.PendingRestart(ctx, h.ref); err == nil {
+		t.Fatal("another failure was hidden")
 	}
 }
 

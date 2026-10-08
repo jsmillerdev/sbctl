@@ -563,7 +563,10 @@ through two more seams that `internal/app` sets beside it:
 
 - `SetTimers`: the nightly base backup timer starts and stops on the node that is the project's home,
   where its data is, and not on the leader. `Engine.Timers` is the node's own, which the daemon provides
-  as `lifecycle.Timers` to whoever starts or stops a primary on this node (the failover).
+  as `lifecycle.Timers` to whoever starts or stops a primary on this node (the failover). A follower
+  (`OpenOptions.ReadOnly`) has no timers to start: `supavise backups create` writes the registry,
+  which its copy does not take, so its `StartTimer` stops the timer (one left from when the node led)
+  and the leader takes the nightly backup of the projects homed on it (`placement.ScheduledBackups`).
 - `SetRemoteNodes` (`NodeResourcer`): a resume, a resize and `Offers` are judged against the memory and
   cores of the home, read on that node, with the registry's projects and replicas for it and the leader's
   `[compute] overcommit`. Without it a project homed elsewhere is not judged.
@@ -581,15 +584,20 @@ other nodes that run Supavisor to drop their copy, and an unreachable one costs 
 `EnsureTenant(ref)`, `QuiesceTenant(ref)` and `Lock(ref)` are the failover orchestrator's `Fleet` and
 `Locker`: register a project and its replicas again once its database answers at the home it moved to,
 let the shared services go of its database before a planned stop (the error is returned, unlike a pause's
-quiesce), and hold the project's operation lock for the steps of a move.
+quiesce), and hold the project's operation lock for the steps of a move. Only `Lock` takes the lock:
+the orchestrator holds it while it calls the other two, and the lock is not reentrant. The daemon's
+sweep (`EnsureTenants`) holds no lock of its own and takes one project's lock at a time.
 
 A primary that a peer replaced is not rendered or started: `fencedErr` reads the fence records of the
 node and of the project (`internal/failover/fenced`) in `postgresSpecFor` for a primary, `apiSpecs`,
-`startRendered`, `PromoteReplica` and `DemoteToReplica`'s start, and `Engine.startOne`, so boot, a
+`startRendered`, `PromoteReplica` and `Engine.startOne`, so boot, a
 resume, a settings restart, an upgrade's rollback and the Engine's other restarts all answer
 `ErrFenced` and write no launcher. A record that cannot be read blocks too. A replica is not a
-primary and starts on a fenced node (it is how the node is rebuilt). `PromoteReplica` checks first, so
-`ErrFenced` from it is a refusal that changed nothing.
+primary and starts on a fenced node (it is how the node is rebuilt), so `DemoteToReplica` and the
+replica starts do not check the fence. `PromoteReplica` checks first, so `ErrFenced` from it is a
+refusal that changed nothing. `Engine.PendingRestart` and `Engine.RestartPending` answer no for a
+fenced primary instead of the error: it does not run here, so no restart is owed, and
+`supavise upgrade` goes on to the next project.
 
 - `Capacity` counts the replicas on the node with their project's memory cap (`ComputeNodeCapacity`);
   a failed or going-down replica and the system standby count nothing. The replica of a paused project

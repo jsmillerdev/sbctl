@@ -51,3 +51,46 @@ func TestFollowerRegistryDSNUsesTheStandbysPort(t *testing.T) {
 		t.Fatalf("the two differ by more than the port:\n%s\n%s", leader, follower)
 	}
 }
+
+// unitSup notes the unit each supervisor call names.
+type unitSup struct {
+	recSup
+	named []string
+}
+
+func (u *unitSup) Start(_ context.Context, unit string) error {
+	u.named = append(u.named, "start "+unit)
+	return nil
+}
+func (u *unitSup) Stop(_ context.Context, unit string) error {
+	u.named = append(u.named, "stop "+unit)
+	return nil
+}
+
+// The leader takes the nightly backup of a project homed on a follower, so a follower never starts a
+// timer: asked to, it stops the one an earlier run as the leader left.
+func TestAFollowerStartsNoBackupTimer(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Supervisor = config.SupervisorSystemd
+	const ref = "abcdefghijklmnopqrst"
+	timer := "supavise-basebackup@" + ref + ".timer"
+
+	sup := &unitSup{}
+	own := (&OpenOptions{}).timers(cfg, sup)
+	if err := own.StartTimer(ctx, ref); err != nil || strings.Join(sup.named, ",") != "start "+timer {
+		t.Fatalf("a writable node: %v, %v", sup.named, err)
+	}
+
+	sup = &unitSup{}
+	follower := (&OpenOptions{ReadOnly: true}).timers(cfg, sup)
+	if err := follower.StartTimer(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := follower.StopTimer(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(sup.named, ","); got != "stop "+timer+",stop "+timer {
+		t.Fatalf("a follower: %s", got)
+	}
+}
