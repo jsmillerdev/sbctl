@@ -125,12 +125,12 @@ func TestServerModeGates(t *testing.T) {
 			mut: func(m *mrig) { _, _ = m.o.acquire() }, want: "a move is running"},
 		"the mode is manual":                       {mode: config.FailoverManual, want: "manual"},
 		"project mode does not take over a leader": {mode: config.FailoverProject, want: "only the leader decides"},
-		"a project without a replica is restored from the archive": {
+		"a project without a replica is never restored from the archive by itself": {
 			mut: func(m *mrig) {
 				org, _ := m.reg.GetOrganization(m.ctx, "acme")
 				must(m.t, m.reg.CreateProject(m.ctx, &registry.Project{Ref: refC, OrgID: org.ID, Name: "c", Status: registry.StatusActiveHealthy}))
 				m.lsn[refC] = "0/9000060"
-			}, want: "server"},
+			}, want: "projects without a replica"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			mode := tc.mode
@@ -353,6 +353,47 @@ func TestProjectModeGates(t *testing.T) {
 			m.assertNever("promote")
 		})
 	}
+}
+
+// A project that cannot move does not hold back the due projects after it: the first of two
+// unhealthy projects has no replica, and the second is failed over.
+func TestProjectModeWalksPastAProjectThatCannotMove(t *testing.T) {
+	m := newProjectRig(t, config.FailoverProject)
+	must(t, m.reg.DeleteReplica(m.ctx, idAN2))
+	for _, ref := range []string{refA, refB} {
+		m.world.prim["n1/"+ref].healthy = false
+		m.setStatus(ref, registry.StatusActiveUnhealthy)
+	}
+	m.mon.Tick(m.ctx)
+	m.advance(4 * time.Minute)
+	d := m.mon.Tick(m.ctx)
+	if d.Action != "project" || d.Ref != refB || d.Err != nil {
+		t.Fatalf("decision: %+v\n%v", d, m.snapshot())
+	}
+	if p := projectOf(t, m.world, refB); p.NodeID != "n2" {
+		t.Fatalf("B: %+v", p)
+	}
+	if p := projectOf(t, m.world, refA); p.NodeID != "n1" {
+		t.Fatalf("A has no replica and stays: %+v", p)
+	}
+}
+
+// When every due project is refused the look says why for each, and starts nothing.
+func TestProjectModeNamesEveryProjectItRefused(t *testing.T) {
+	m := newProjectRig(t, config.FailoverProject)
+	must(t, m.reg.DeleteReplica(m.ctx, idAN2))
+	must(t, m.reg.DeleteReplica(m.ctx, idBN2))
+	for _, ref := range []string{refA, refB} {
+		m.world.prim["n1/"+ref].healthy = false
+		m.setStatus(ref, registry.StatusActiveUnhealthy)
+	}
+	m.mon.Tick(m.ctx)
+	m.advance(4 * time.Minute)
+	d := m.mon.Tick(m.ctx)
+	if d.Action != "none" || !strings.Contains(d.Reason, refA) || !strings.Contains(d.Reason, refB) {
+		t.Fatalf("decision: %+v", d)
+	}
+	m.assertNever("promote")
 }
 
 func TestServerModeAlsoWatchesTheProjectsOfTheLeader(t *testing.T) {

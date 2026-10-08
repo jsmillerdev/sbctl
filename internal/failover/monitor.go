@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -155,12 +156,13 @@ func (m *Monitor) arm(ctx context.Context) string {
 func (m *Monitor) gates(ctx context.Context, snap cluster.Snapshot, home, target registry.Node) string {
 	o := m.o
 	now := o.d.Now()
-	switch {
-	case snap.Maintenance.Active(now):
+	if snap.Maintenance.Active(now) {
 		return fmt.Sprintf("maintenance on %s until %s (%s)", snap.Maintenance.Node, snap.Maintenance.Until.Format(time.RFC3339), snap.Maintenance.Reason)
-	case m.cooldown(ctx, now) != "":
-		return m.cooldown(ctx, now)
-	case home.Version != "" && target.Version != "" && home.Version != target.Version:
+	}
+	if reason := m.cooldown(ctx, now); reason != "" {
+		return reason
+	}
+	if home.Version != "" && target.Version != "" && home.Version != target.Version {
 		return fmt.Sprintf("the nodes run different releases (%s, %s)", home.Version, target.Version)
 	}
 	if a, b := home.Provider.AWS, target.Provider.AWS; a != nil && b != nil && a.Region != "" && b.Region != "" && a.Region != b.Region {
@@ -263,7 +265,10 @@ func (m *Monitor) serverTick(ctx context.Context, snap cluster.Snapshot) Decisio
 	if reason := m.gates(ctx, snap, leader, self); reason != "" {
 		return none("%s", reason)
 	}
-	opts := ServerOptions{RestoreMissing: true}
+	// A project with no replica has an unknown lag, and no automatic move runs on one: restoring it
+	// from the archive loses up to archive_timeout of its writes, which an operator chooses
+	// (--restore-missing). The plan then refuses the whole server and the gate says why.
+	opts := ServerOptions{}
 	pl, err := o.PlanServer(ctx, opts)
 	if err != nil {
 		return none("the plan failed: %v", err)
@@ -324,32 +329,55 @@ func (m *Monitor) projectTick(ctx context.Context, snap cluster.Snapshot) Decisi
 		return none("no project has been unhealthy for %s", grace)
 	}
 
-	// One project per look, the first in the registry's order: the moves are serialized anyway.
-	ref := due[0]
+	// One move per look, but not one project per look: the moves are serialized anyway, and a
+	// project that cannot move (no replica, a replica behind, a home that does not answer) must not
+	// hold back the due projects after it. The first one that passes every gate is the move.
+	var refused []string
+	for _, ref := range due {
+		reason := m.projectGate(ctx, snap, ref)
+		if reason != "" {
+			refused = append(refused, reason)
+			continue
+		}
+		o.d.Log.Warn("automatic project failover", "ref", ref, "unhealthy_for", now.Sub(m.since(ref)).String())
+		_, err = o.FailoverProject(ctx, ProjectOptions{Ref: ref, ExpectKind: string(registry.MoveFailover)})
+		return Decision{Action: "project", Ref: ref, Reason: fmt.Sprintf("the primary of %s was unhealthy for %s", ref, grace), Err: err}
+	}
+	if len(refused) > maxReasons {
+		refused = append(refused[:maxReasons], fmt.Sprintf("and %d more", len(refused)-maxReasons))
+	}
+	return Decision{Action: "none", Ref: due[0], Reason: strings.Join(refused, "; ")}
+}
+
+// maxReasons is how many refusals a look reports when it refused several projects.
+const maxReasons = 3
+
+// projectGate plans the failover of one project and checks the gates of an automatic move. It
+// returns the reason the project is not failed over now, or "" when it is to be.
+func (m *Monitor) projectGate(ctx context.Context, snap cluster.Snapshot, ref string) string {
+	o := m.o
 	pl, err := o.PlanProject(ctx, ProjectOptions{Ref: ref})
 	if err != nil {
-		return none("project %s: the plan failed: %v", ref, err)
+		return fmt.Sprintf("project %s: the plan failed: %v", ref, err)
 	}
 	if blocked := pl.Refused(false); len(blocked) > 0 {
-		return Decision{Action: "none", Ref: ref, Reason: fmt.Sprintf("project %s: %s: %s", ref, blocked[0].Name, blocked[0].Detail)}
+		return fmt.Sprintf("project %s: %s: %s", ref, blocked[0].Name, blocked[0].Detail)
 	}
 	if pl.Kind != string(registry.MoveFailover) {
-		return none("project %s: its primary answers now", ref)
+		return fmt.Sprintf("project %s: its primary answers now", ref)
 	}
 	home, err := o.node(ctx, pl.From)
 	if err != nil {
-		return none("%v", err)
+		return err.Error()
 	}
 	target, err := o.node(ctx, pl.To)
 	if err != nil {
-		return none("%v", err)
+		return err.Error()
 	}
 	if reason := m.gates(ctx, snap, home, target); reason != "" {
-		return Decision{Action: "none", Ref: ref, Reason: reason}
+		return fmt.Sprintf("project %s: %s", ref, reason)
 	}
-	o.d.Log.Warn("automatic project failover", "ref", ref, "unhealthy_for", now.Sub(m.since(ref)).String())
-	_, err = o.FailoverProject(ctx, ProjectOptions{Ref: ref, ExpectKind: string(registry.MoveFailover)})
-	return Decision{Action: "project", Ref: ref, Reason: fmt.Sprintf("the primary of %s was unhealthy for %s", ref, grace), Err: err}
+	return ""
 }
 
 // turn is the place of node self among the followers that could take over from the leader: 0 for
