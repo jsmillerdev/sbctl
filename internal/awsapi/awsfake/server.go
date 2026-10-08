@@ -1,6 +1,6 @@
 // Package awsfake is an in-process fake of the AWS endpoints that package awsapi calls: EC2,
 // Secrets Manager, STS and the instance metadata service, all on one loopback listener. It checks
-// every signature with awsapi.Verify, so a test notices a client that signs the wrong thing or
+// every signature with Verify, so a test notices a client that signs the wrong thing or
 // uses the wrong credentials, and it records every call in arrival order, so a test can assert
 // that a fencer stopped the peer, waited for "stopped" and only then took the address.
 //
@@ -50,6 +50,9 @@ type Fault struct {
 	Message string
 	// Times is how many calls fail; zero means every call.
 	Times int
+	// Applied makes an EC2 call take effect before it fails, like an answer lost on the way: the
+	// client sends the request again and finds the work done. A DryRun call has no effect to apply.
+	Applied bool
 }
 
 type fault struct {
@@ -149,14 +152,14 @@ func (s *Server) Env() map[string]string {
 	}
 }
 
-// SetEnv sets Env for the test and clears the variables that would give the client credentials
-// or turn the metadata service off.
+// SetEnv sets Env for the test and clears the variables that would give the client credentials,
+// turn the metadata service off or keep the client from using the instance role.
 func (s *Server) SetEnv(t testing.TB) {
 	t.Helper()
 	for k, v := range s.Env() {
 		t.Setenv(k, v)
 	}
-	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION", "AWS_EC2_METADATA_DISABLED"} {
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION", "AWS_EC2_METADATA_DISABLED", awsapi.EnvNoInstanceRole} {
 		t.Setenv(k, "")
 	}
 }
@@ -273,7 +276,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonAPI := strings.HasPrefix(r.Header.Get("X-Amz-Target"), "secretsmanager.")
 	s.mu.Lock()
-	sc, verr := awsapi.Verify(r, body, func(id string) (awsapi.Credentials, bool) { c, ok := s.creds[id]; return c, ok })
+	sc, verr := Verify(r, body, func(id string) (awsapi.Credentials, bool) { c, ok := s.creds[id]; return c, ok })
 	s.mu.Unlock()
 	rec := Call{AccessKeyID: sc.AccessKeyID, Service: sc.Service}
 	if jsonAPI {
@@ -353,6 +356,11 @@ func contentType(service string) string {
 
 // injected returns the fault that applies to the call, if any, and counts the use.
 func (s *Server) injected(service, action string) (result, bool) {
+	f, hit := s.nextFault(service, action)
+	return fail(f.Status, f.Code, f.Message), hit
+}
+
+func (s *Server) nextFault(service, action string) (Fault, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, f := range s.faults {
@@ -360,9 +368,9 @@ func (s *Server) injected(service, action string) (result, bool) {
 			continue
 		}
 		f.used++
-		return fail(f.Status, f.Code, f.Message), true
+		return f.Fault, true
 	}
-	return result{}, false
+	return Fault{}, false
 }
 
 func esc(s string) string {

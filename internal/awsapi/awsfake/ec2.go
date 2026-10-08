@@ -138,9 +138,18 @@ func (s *Server) publicIP(i *instance, privateIP string) string {
 }
 
 func (s *Server) ec2(c Call) result {
-	if r, hit := s.injected("ec2", c.Action); hit {
-		return r
+	f, hit := s.nextFault("ec2", c.Action)
+	if hit && !(f.Applied && !c.DryRun) {
+		return fail(f.Status, f.Code, f.Message)
 	}
+	r := s.ec2Action(c)
+	if hit {
+		return fail(f.Status, f.Code, f.Message)
+	}
+	return r
+}
+
+func (s *Server) ec2Action(c Call) result {
 	q := c.Params
 	var r result
 	switch c.Action {

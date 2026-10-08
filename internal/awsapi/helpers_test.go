@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/awsapi"
+	"github.com/supavise/supavise/internal/awsapi/awsfake"
 )
 
 var testCreds = awsapi.Credentials{AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"}
@@ -56,7 +57,7 @@ func stub(t *testing.T, answers ...answer) (awsapi.Config, func() []request) {
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		if _, err := awsapi.Verify(r, body, func(id string) (awsapi.Credentials, bool) { return testCreds, id == testCreds.AccessKeyID }); err != nil {
+		if _, err := awsfake.Verify(r, body, func(id string) (awsapi.Credentials, bool) { return testCreds, id == testCreds.AccessKeyID }); err != nil {
 			t.Errorf("signature: %v", err)
 		}
 		mu.Lock()

@@ -96,7 +96,7 @@ func TestEC2RequestBodies(t *testing.T) {
 }
 
 // The whole signed request for one call, pinned so that a change to the headers, the signed set
-// or the scope shows up as a diff. The signature is checked independently by Verify in stub.
+// or the scope shows up as a diff. The signature is checked independently by awsfake.Verify in stub.
 func TestEC2SignedRequestGolden(t *testing.T) {
 	cfg, seen := stub(t, xmlOK("<DescribeInstancesResponse/>"))
 	if _, err := newClient(t, cfg).EC2.DescribeInstances(ctx, awsapi.DescribeInstancesInput{InstanceIDs: []string{"i-1"}}); err != nil {
@@ -285,8 +285,8 @@ func TestRetries(t *testing.T) {
 	if _, err := newClient(t, cfg).EC2.StopInstances(ctx, in); !awsapi.IsCode(err, "RequestLimitExceeded") {
 		t.Errorf("persistent throttle: %v", err)
 	}
-	if n := len(seen()); n != 3 {
-		t.Errorf("%d attempts, want the default 3", n)
+	if n := len(seen()); n != 5 {
+		t.Errorf("%d attempts, want the default 5", n)
 	}
 
 	cfg, seen = stub(t, throttle)

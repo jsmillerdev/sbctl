@@ -62,12 +62,13 @@ func EnvCredentials(getenv func(string) string) CredentialProvider {
 
 // IMDSCredentials returns the credentials of the instance's role from the metadata service. Every
 // failure to get them, including a service that is off or unreachable and an instance with no
-// role, wraps ErrNoCredentials.
+// role, wraps ErrNoCredentials and also the cause, so errors.Is finds ErrIMDSDisabled or a
+// cancelled context.
 func IMDSCredentials(m *IMDS) CredentialProvider {
 	return CredentialProviderFunc(func(ctx context.Context) (Credentials, error) {
 		c, err := m.RoleCredentials(ctx)
 		if err != nil {
-			return Credentials{}, fmt.Errorf("%w: instance metadata: %v", ErrNoCredentials, err)
+			return Credentials{}, fmt.Errorf("%w: instance metadata: %w", ErrNoCredentials, err)
 		}
 		return c, nil
 	})
@@ -75,10 +76,11 @@ func IMDSCredentials(m *IMDS) CredentialProvider {
 
 // ChainCredentials asks each provider in turn and returns the first answer. A provider that
 // returns ErrNoCredentials is skipped; any other error stops the chain. When every provider is
-// skipped the error wraps ErrNoCredentials and carries each reason.
+// skipped the error wraps ErrNoCredentials and the error of each provider, and its text carries
+// each reason.
 func ChainCredentials(providers ...CredentialProvider) CredentialProvider {
 	return CredentialProviderFunc(func(ctx context.Context) (Credentials, error) {
-		var reasons []string
+		var skipped noCredentialsError
 		for _, p := range providers {
 			c, err := p.Retrieve(ctx)
 			if err == nil {
@@ -87,11 +89,24 @@ func ChainCredentials(providers ...CredentialProvider) CredentialProvider {
 			if !errors.Is(err, ErrNoCredentials) {
 				return Credentials{}, err
 			}
-			reasons = append(reasons, strings.TrimPrefix(err.Error(), ErrNoCredentials.Error()+": "))
+			skipped.reasons = append(skipped.reasons, strings.TrimPrefix(err.Error(), ErrNoCredentials.Error()+": "))
+			skipped.causes = append(skipped.causes, err)
 		}
-		return Credentials{}, fmt.Errorf("%w: %s", ErrNoCredentials, strings.Join(reasons, "; "))
+		return Credentials{}, &skipped
 	})
 }
+
+// noCredentialsError is what a chain returns when every provider was skipped.
+type noCredentialsError struct {
+	reasons []string
+	causes  []error
+}
+
+func (e *noCredentialsError) Error() string {
+	return ErrNoCredentials.Error() + ": " + strings.Join(e.reasons, "; ")
+}
+
+func (e *noCredentialsError) Unwrap() []error { return append([]error{ErrNoCredentials}, e.causes...) }
 
 // CachedCredentials remembers what p returns until refreshWindow before it expires, and
 // serializes refreshes. Credentials without an expiry are kept for good. When a refresh fails

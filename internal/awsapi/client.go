@@ -4,9 +4,11 @@
 // Signature Version 4 and uses nothing outside the standard library.
 //
 // Credentials come from the standard AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and
-// AWS_SESSION_TOKEN variables, then from the instance role. Endpoints can be overridden per
-// service with AWS_ENDPOINT_URL_EC2, AWS_ENDPOINT_URL_SECRETSMANAGER, AWS_ENDPOINT_URL_STS and
-// AWS_ENDPOINT_URL_IMDS, which is how tests and the two-node CI harness point it at a fake.
+// AWS_SESSION_TOKEN variables, then from the instance role. SUPAVISE_AWS_NO_INSTANCE_ROLE=1 drops
+// the instance role and keeps the metadata service for the instance id, the region and the tags.
+// Endpoints can be overridden per service with AWS_ENDPOINT_URL_EC2,
+// AWS_ENDPOINT_URL_SECRETSMANAGER, AWS_ENDPOINT_URL_STS and AWS_ENDPOINT_URL_IMDS, which is how
+// tests and the two-node CI harness point it at a fake.
 package awsapi
 
 import (
@@ -21,6 +23,11 @@ import (
 	"sync"
 	"time"
 )
+
+// EnvNoInstanceRole, set to 1 or true, is Config.NoInstanceRole. Unlike AWS_EC2_METADATA_DISABLED it
+// keeps the identity reads of the metadata service, so a tool can act with the operator's
+// credentials and still ask which instance it runs on.
+const EnvNoInstanceRole = "SUPAVISE_AWS_NO_INSTANCE_ROLE"
 
 // Environment variables that override a service endpoint. Secrets Manager also answers to the
 // name the AWS SDKs and CLI use, and the metadata service to AWS_EC2_METADATA_SERVICE_ENDPOINT.
@@ -53,15 +60,20 @@ type Config struct {
 	Endpoints Endpoints
 	// HTTPClient sends API requests. Nil uses a client with a 30 second timeout.
 	HTTPClient *http.Client
+	// NoInstanceRole stops the default credentials from falling back to the instance role: only the
+	// AWS_* variables are used. The metadata service is still read for the instance id, the region,
+	// the addresses and the tags. SUPAVISE_AWS_NO_INSTANCE_ROLE=1 sets it from the environment.
+	NoInstanceRole bool
 	// Getenv reads the environment. Nil is os.Getenv.
 	Getenv func(string) string
 	// Now is the clock for signing and for credential expiry. Nil is time.Now.
 	Now func() time.Time
 	// MaxAttempts is how many times a request that got no answer, a 5xx or a throttle is sent.
-	// Zero is 3.
+	// Zero is 5 for the service calls and 3 for the metadata service.
 	MaxAttempts int
-	// RetryBackoff is the wait after the first failed attempt, doubled for each further one.
-	// Zero is 200 ms.
+	// RetryBackoff is the wait after the first failed attempt, doubled for each further one up to
+	// 5 seconds. Each wait is a random point in the upper half of that, so a wait is at least half
+	// of it. Zero is 200 ms.
 	RetryBackoff time.Duration
 }
 
@@ -92,11 +104,15 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	imdsAttempts := cfg.MaxAttempts
+	if imdsAttempts <= 0 {
+		imdsAttempts = defaultIMDSAttempts
+	}
 	if cfg.MaxAttempts <= 0 {
-		cfg.MaxAttempts = 3
+		cfg.MaxAttempts = defaultMaxAttempts
 	}
 	if cfg.RetryBackoff <= 0 {
-		cfg.RetryBackoff = 200 * time.Millisecond
+		cfg.RetryBackoff = defaultRetryBackoff
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
@@ -117,12 +133,12 @@ func New(cfg Config) (*Client, error) {
 		}
 		ep[name] = strings.TrimRight(v, "/")
 	}
-	imds := newIMDS(cfg, ep["imds"])
+	imds := newIMDS(cfg, ep["imds"], imdsAttempts)
 	creds := cfg.Credentials
 	if creds == nil {
-		creds = DefaultCredentials(cfg.Getenv, imds, cfg.Now)
+		creds = defaultCredentials(cfg.Getenv, imds, cfg.Now, cfg.NoInstanceRole)
 	}
-	c := &core{cfg: cfg, endpoints: ep, creds: creds, imds: imds}
+	c := &core{cfg: cfg, endpoints: ep, creds: creds, imds: imds, retry: newRetrier(cfg.MaxAttempts, cfg.RetryBackoff)}
 	return &Client{
 		EC2:            &EC2{c: c},
 		SecretsManager: &SecretsManager{c: c},
@@ -132,13 +148,32 @@ func New(cfg Config) (*Client, error) {
 	}, nil
 }
 
-// DefaultCredentials is the environment, then the instance role, cached.
+// DefaultCredentials is the environment, then the instance role, cached. With
+// SUPAVISE_AWS_NO_INSTANCE_ROLE=1 it is the environment alone.
 func DefaultCredentials(getenv func(string) string, imds *IMDS, now func() time.Time) CredentialProvider {
+	return defaultCredentials(getenv, imds, now, false)
+}
+
+func defaultCredentials(getenv func(string) string, imds *IMDS, now func() time.Time, noRole bool) CredentialProvider {
+	if v := strings.TrimSpace(getenv(EnvNoInstanceRole)); noRole || v == "1" || strings.EqualFold(v, "true") {
+		return ChainCredentials(EnvCredentials(getenv), noInstanceRole)
+	}
 	return ChainCredentials(EnvCredentials(getenv), CachedCredentials(IMDSCredentials(imds), now))
 }
 
+// noInstanceRole stands in for the instance role when it is switched off.
+var noInstanceRole = CredentialProviderFunc(func(context.Context) (Credentials, error) {
+	return Credentials{}, fmt.Errorf("%w: the instance role is not used (Config.NoInstanceRole or %s=1)", ErrNoCredentials, EnvNoInstanceRole)
+})
+
 // Region returns the region calls go to, resolving it the first time.
-func (c *Client) Region(ctx context.Context) (string, error) { return c.core.region(ctx) }
+func (c *Client) Region(ctx context.Context) (string, error) {
+	r, err := c.core.region(ctx)
+	if err != nil {
+		return "", fmt.Errorf("awsapi: %w", err)
+	}
+	return r, nil
+}
 
 func firstNonEmpty(vs ...string) string {
 	for _, v := range vs {
@@ -155,6 +190,7 @@ type core struct {
 	endpoints map[string]string
 	creds     CredentialProvider
 	imds      *IMDS
+	retry     *retrier
 
 	mu         sync.Mutex
 	regionName string
@@ -170,7 +206,7 @@ func (c *core) region(ctx context.Context) (string, error) {
 	if r == "" {
 		var err error
 		if r, err = c.imds.Region(ctx); err != nil {
-			return "", fmt.Errorf("awsapi: no region: set AWS_REGION, or run on an EC2 instance (%v)", err)
+			return "", fmt.Errorf("no region: set AWS_REGION, or run on an EC2 instance (%w)", err)
 		}
 	}
 	c.regionName = r
@@ -201,19 +237,21 @@ type apiCall struct {
 
 // do sends the call, signed with the current credentials, and returns the body of a 2xx answer.
 // Anything else is an *Error. A request that got no answer, a 5xx or a throttle is sent again
-// with a fresh signature.
+// with a fresh signature, after a jittered wait.
 func (c *core) do(ctx context.Context, call apiCall) ([]byte, error) {
+	body, _, err := c.send(ctx, call)
+	return body, err
+}
+
+// send is do that also returns how many times the request was sent.
+func (c *core) send(ctx context.Context, call apiCall) ([]byte, int, error) {
 	for attempt := 1; ; attempt++ {
 		body, err := c.once(ctx, call)
-		if err == nil || attempt >= c.cfg.MaxAttempts || !retryable(err) || ctx.Err() != nil {
-			return body, err
+		if err == nil || attempt >= c.retry.attempts || !retryable(err) || ctx.Err() != nil {
+			return body, attempt, err
 		}
-		t := time.NewTimer(c.cfg.RetryBackoff << (attempt - 1))
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return nil, fmt.Errorf("%w (after: %v)", ctx.Err(), err)
-		case <-t.C:
+		if werr := c.retry.wait(ctx, attempt); werr != nil {
+			return nil, attempt, fmt.Errorf("%w: %w", err, werr)
 		}
 	}
 }
@@ -221,15 +259,15 @@ func (c *core) do(ctx context.Context, call apiCall) ([]byte, error) {
 func (c *core) once(ctx context.Context, call apiCall) ([]byte, error) {
 	region, err := c.region(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("aws %s %s: %w", call.service, call.action, err)
 	}
 	creds, err := c.creds.Retrieve(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("awsapi: %s %s: %w", call.service, call.action, err)
+		return nil, fmt.Errorf("aws %s %s: %w", call.service, call.action, err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(call.service, call.host, region)+"/", bytes.NewReader(call.body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("aws %s %s: %w", call.service, call.action, err)
 	}
 	for k, v := range call.header {
 		req.Header[k] = v
