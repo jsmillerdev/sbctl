@@ -280,6 +280,47 @@ func TestJoinInputs(t *testing.T) {
 	}
 }
 
+// `node join --reset` says what it will set aside and asks; a server that leads its cluster is not reset
+// without --yes, whatever is typed.
+func TestConfirmReset(t *testing.T) {
+	data := []string{"/var/lib/supavise/projects/system/postgres/data", "/var/lib/supavise/projects/abc/postgres/data"}
+	keep := 3 * 24 * time.Hour
+	for _, tc := range []struct {
+		name  string
+		leads bool
+		yes   bool
+		input string
+		ok    bool
+	}{
+		{"a member that is told yes", false, false, "y\n", true},
+		{"a member that is told yes in words", false, false, "YES\n", true},
+		{"a member that is told no", false, false, "n\n", false},
+		{"a member and no answer", false, false, "", false},
+		{"a member with --yes", false, true, "", true},
+		{"the leader and a typed yes", true, false, "y\n", false},
+		{"the leader with --yes", true, true, "", true},
+	} {
+		var out bytes.Buffer
+		err := confirmReset(&out, strings.NewReader(tc.input), tc.leads, data, keep, tc.yes)
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: %v", tc.name, err)
+		}
+		text := out.String()
+		for _, d := range data {
+			if !strings.Contains(text, d) {
+				t.Errorf("%s: the output does not list %s:\n%s", tc.name, d, text)
+			}
+		}
+		if !strings.Contains(text, "kept 3 days") || strings.Contains(text, "LEADER") != tc.leads {
+			t.Errorf("%s: the output:\n%s", tc.name, text)
+		}
+	}
+	var out bytes.Buffer
+	if err := confirmReset(&out, strings.NewReader("y\n"), false, nil, keep, false); err != nil || !strings.Contains(out.String(), "no project data") {
+		t.Errorf("a server with no data: %v\n%s", err, out.String())
+	}
+}
+
 func TestClusterBlockRendersNodesReplicasAndFencing(t *testing.T) {
 	lag := 0.8
 	b := &clusterBlock{Name: "prod", Epoch: 3, Leader: "n1", Node: "n1", Role: "leader", Live: true,

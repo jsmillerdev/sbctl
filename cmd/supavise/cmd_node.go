@@ -29,14 +29,17 @@ import (
 // seedSystemStandby builds this server's standby of the system cluster from the base backup the
 // leader names and starts it (backup.SeedReplica, then the replica unit of lifecycle). The install
 // command that joins a server (`supavise install --join-token-file`) and the join below both call the
-// same function; the join itself (cluster.Join) does everything around it.
+// same function; the join itself (cluster.Join) does everything around it. It refuses to overwrite
+// data that is not a seeding of its own that stopped: a join with --reset and a rejoin set the old
+// data aside before they call it, and a resumed join or a repeated rejoin finds the partial copy.
 var seedSystemStandby cluster.SeedFunc = func(context.Context, peerapi.SystemBootstrap) error {
 	return notimpl.For("seeding the system standby")
 }
 
-// seedPreflight checks what seedSystemStandby needs (room on the disk, the backup store, an empty data
-// directory) before a join or a rejoin spends the token or moves data aside. The join and the rejoin
-// call it first, so a seeding that cannot work refuses before anything has changed.
+// seedPreflight checks what seedSystemStandby needs (room on the disk, the backup store) before a join
+// or a rejoin spends the token or moves data aside. The join and the rejoin call it first, so a seeding
+// that cannot work refuses before anything has changed. It does not look at the data directories (see
+// seedSystemStandby), and a resumed join does not call it.
 var seedPreflight = func(context.Context) error {
 	return notimpl.For("seeding the system standby")
 }
@@ -86,7 +89,7 @@ master key derives); the daemon restarts once to listen on the peer port.`,
 	token.Flags().DurationVar(&tokenTTL, "ttl", time.Hour, "how long the token works")
 
 	var joinRegion, joinAddress, joinTokenFile, joinKeyFile, joinPassFile string
-	var joinResume, joinReset, joinKeyFromEscrow bool
+	var joinResume, joinReset, joinKeyFromEscrow, joinYes bool
 	join := &cobra.Command{
 		Use:   "join [token]",
 		Short: "Join this server to a cluster with a token from the leader",
@@ -99,10 +102,11 @@ A join that stopped after the certificate was issued continues with --resume, wh
 A server that holds the identity of a join that was given up on (the leader removes a node that is still
 joining after an hour), of a node that cannot rejoin, or of a node that was removed while it was down,
 starts over with --reset and a new token: it stops what runs, sets its data aside and joins as a new node;
-run "supavise node rm" on the leader first when the old node is still listed there. Without a connection
-to the key's holder, --master-key-file or --key-from-escrow supply the master key; the token still
-authenticates the node. The token may be read from a file (--token-file) so that it never appears in a
-process listing.`,
+run "supavise node rm" on the leader first when the old node is still listed there. --reset checks the
+token, lists the data it will set aside and asks for confirmation; --yes answers it, and is required on
+a server that leads its cluster. Without a connection to the key's holder, --master-key-file or
+--key-from-escrow supply the master key; the token still authenticates the node. The token may be read
+from a file (--token-file) so that it never appears in a process listing.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
@@ -155,6 +159,7 @@ process listing.`,
 	join.Flags().StringVar(&joinPassFile, "passphrase-file", "", "file holding the escrow passphrase (mode 0600), or - for standard input")
 	join.Flags().BoolVar(&joinResume, "resume", false, "continue a join that stopped after the certificate was issued")
 	join.Flags().BoolVar(&joinReset, "reset", false, "give up this server's place in the cluster it joined before (its data is set aside) and join as a new node")
+	join.Flags().BoolVarP(&joinYes, "yes", "y", false, "with --reset: do not ask for confirmation, and reset a server that is the leader")
 
 	var lsDNS, lsJSON bool
 	ls := &cobra.Command{
@@ -236,10 +241,39 @@ replicas from the current leader's archive, and keeps its identity.`,
 			return nil
 		},
 	}
-	rejoin.Flags().StringVar(&rejoinLeader, "leader", "", "host:port of the current leader (default: ask the peers)")
+	rejoin.Flags().StringVar(&rejoinLeader, "leader", "", "host:port of the current leader (default: the leader's address this node recorded when it was fenced)")
 
 	nodeCmd.AddCommand(token, join, ls, rm, rejoin)
 	rootCmd.AddCommand(nodeCmd)
+}
+
+// confirmReset says what `node join --reset` does to this server and asks the operator to agree; yes
+// agrees in advance. A server that leads its cluster is refused without yes, whatever is typed: its
+// projects stop, and the cluster has no leader until another node is promoted.
+func confirmReset(w io.Writer, in io.Reader, leads bool, data []string, keep time.Duration, yes bool) error {
+	fmt.Fprintf(w, "--reset gives up this server's place in its cluster: it stops everything that runs here, sets the data below aside (kept %d days, then removed), deletes the node's cluster identity and joins as a new node.\n", int(keep.Hours()/24))
+	for _, d := range data {
+		fmt.Fprintf(w, "  %s\n", d)
+	}
+	if len(data) == 0 {
+		fmt.Fprintln(w, "  (no project data on this server)")
+	}
+	if leads {
+		fmt.Fprintln(w, "This server is the LEADER of its cluster: its projects stop and the cluster has no leader until another node is promoted.")
+		if !yes {
+			return errors.New("not reset: this server leads its cluster; promote another node first, or pass --yes")
+		}
+		return nil
+	}
+	if yes {
+		return nil
+	}
+	fmt.Fprint(w, "Go ahead? [y/N] ")
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
+		return errors.New("not reset")
+	}
+	return nil
 }
 
 // stopLocal returns the function that stops everything on this server that could write as a primary
