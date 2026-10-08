@@ -399,7 +399,7 @@ func TestPermissionsEndpointMatchesEnforcement(t *testing.T) {
 // account, the lists that filter themselves, an invitation by its token). Anything else, such as
 // a route of a family added later, needs a rule: otherwise a user without a role could use it.
 func TestImplementedRoutesOpenToEveryUserAreAllowlisted(t *testing.T) {
-	open := regexp.MustCompile(`^(/platform/(profile|cli/login)(/|$)|/v1/profile$|/(platform|v1)/(organizations|projects)$|/platform/organizations/\{slug\}/members/invitations/\{token\}$)`)
+	open := regexp.MustCompile(`^(/platform/(profile|cli/login)(/|$)|/v1/profile$|/(platform|v1)/(organizations|projects)$|/(platform|v1)/projects/available-regions$|/platform/organizations/\{slug\}/members/invitations/\{token\}$)`)
 	for key := range newFixture(t).srv.implemented() {
 		m, p, _ := strings.Cut(key, " ")
 		if n := routeNeed(m, p); n.kind == needAny && !open.MatchString(p) {
