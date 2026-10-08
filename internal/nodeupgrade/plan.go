@@ -68,6 +68,8 @@ type Plan struct {
 	Refusal string
 
 	Target *Info
+	// cluster is the node's view of its cluster, kept for the notes.
+	cluster *ClusterView
 }
 
 // SkippedProject is a project the upgrade leaves alone.
@@ -116,7 +118,7 @@ var projectServices = []string{config.SvcGoTrue, config.SvcPostgREST, config.Svc
 // BuildPlan computes what moving n onto the release described by to does.
 func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 	p := &Plan{From: n.Version, To: to.Version, BinaryChange: n.Version != to.Version, IncludePostgres: o.IncludePostgres,
-		Canary: o.Canary, Batch: o.Batch, Target: to, ProjectTarget: map[string]string{}}
+		Canary: o.Canary, Batch: o.Batch, Target: to, ProjectTarget: map[string]string{}, cluster: n.Cluster}
 	if c, ok := selfupdate.Compare(to.Version, n.Version); ok && c < 0 {
 		p.Refusal = fmt.Sprintf("%s is older than the installed %s; `supavise rollback` goes back to the previous release", to.Version, n.Version)
 		return p
@@ -175,6 +177,12 @@ func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 		p.Upgrade = append(p.Upgrade, pr.Ref)
 	}
 	sort.Strings(p.Upgrade)
+	if to.WALIncompatible && n.Cluster != nil && p.movesPostgres(n) {
+		if behind := n.Cluster.Behind(to.Version); len(behind) > 0 {
+			p.Refusal = walOrderRefusal(to.Version, behind)
+			return p
+		}
+	}
 	moving := map[string]bool{}
 	for _, ref := range p.Upgrade {
 		moving[ref] = true
@@ -196,6 +204,52 @@ func BuildPlan(n *Node, to *Info, o PlanOptions) *Plan {
 	}
 	p.describe()
 	return p
+}
+
+// movesPostgres reports whether the upgrade changes a PostgreSQL release that runs on this node:
+// the system cluster's, or a project's when the projects' PostgreSQL moves too.
+func (p *Plan) movesPostgres(n *Node) bool {
+	for _, m := range p.System {
+		if m.Service == config.SvcPostgres {
+			return true
+		}
+	}
+	if t := p.ProjectTarget[config.SvcPostgres]; t != "" {
+		for _, ref := range p.Upgrade {
+			for _, pr := range n.UserProjects() {
+				if pr.Ref == ref && pr.Effective(config.SvcPostgres, n.Pins) != t {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// walOrderRefusal is why a release whose PostgreSQL keeps no WAL compatibility waits for the nodes
+// that hold standbys: a standby reads the WAL of a primary on the same or an older release, so the
+// standbys are upgraded first.
+func walOrderRefusal(version string, behind []Standby) string {
+	var parts []string
+	for _, b := range behind {
+		who := b.Node
+		if b.Name != "" && b.Name != b.Node {
+			who += " (" + b.Name + ")"
+		}
+		running := b.Version
+		if running == "" {
+			running = "an unknown release"
+		}
+		parts = append(parts, fmt.Sprintf("%s runs %s and holds standbys of %s", who, running, standbyRefs(b.Refs)))
+	}
+	return fmt.Sprintf("%s changes PostgreSQL in a way a standby on an older release cannot follow (the release manifest says wal_compat: false), so the servers that hold standbys of this server's databases are upgraded first: %s. Run `sudo supavise upgrade` on each of them, then here. A project's primary moves to another server with `supavise projects failover`, if two servers hold standbys of each other's databases", version, strings.Join(parts, "; "))
+}
+
+func standbyRefs(refs []string) string {
+	if len(refs) == 0 {
+		return "the system cluster"
+	}
+	return refList(refs)
 }
 
 // skipReason says why a project is not upgraded now, or "" when it is.
@@ -278,6 +332,9 @@ func (p *Plan) describe() {
 	}
 	if p.HeldBack > 0 {
 		p.Notes = append(p.Notes, fmt.Sprintf("%d project(s) keep their PostgreSQL release (the release pins %s); pass --include-postgres to move them, each restarts PostgreSQL", p.HeldBack, short(config.SvcPostgres, p.HeldTo)))
+	}
+	if c := p.cluster; c != nil && len(c.Elsewhere) > 0 {
+		p.Notes = append(p.Notes, fmt.Sprintf("%d project(s) are homed on other servers of the cluster (%s): each server upgrades the projects it runs, and takes their backups, so run `sudo supavise upgrade` on those servers too", len(c.Elsewhere), refList(c.Elsewhere)))
 	}
 	if len(p.NewMigrations) > 0 {
 		p.Notes = append(p.Notes, fmt.Sprintf("the release adds %d registry migration(s) (%s). The new daemon applies them when it starts, and migrations only go forward: from then on the node cannot go back to the previous release by itself, and `supavise rollback` is refused until the system cluster is restored by hand from its pre-upgrade backup (internal/backup/README.md, \"Disaster recovery of the system cluster\")", len(p.NewMigrations), refList(p.NewMigrations)))
@@ -404,8 +461,9 @@ func (g *StackGap) render(w io.Writer) {
 	fmt.Fprintf(w, "  Fix: %s\n", fix)
 }
 
-// BackupRefs lists the projects the upgrade backs up first: the system project (the registry) and
-// every project whose database runs. A paused project's data does not change.
+// BackupRefs lists the projects the upgrade backs up first: the system project (the registry, on
+// the node that leads) and every project homed on the node whose database runs. A paused project's
+// data does not change.
 func BackupRefs(n *Node) []string {
 	var rest []string
 	for _, pr := range n.UserProjects() {
@@ -414,6 +472,11 @@ func BackupRefs(n *Node) []string {
 		}
 	}
 	sort.Strings(rest)
+	if n.Cluster != nil && !n.Cluster.Leader {
+		// The system cluster of a follower is a standby of the leader's: its base backup is the
+		// leader's to take, and a standby has no data of its own to back up.
+		return rest
+	}
 	return append([]string{config.SystemRef}, rest...)
 }
 

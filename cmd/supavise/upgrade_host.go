@@ -226,6 +226,11 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	// In a cluster the upgrade is the node's own: the projects homed here, and the standbys other
+	// nodes hold of them (the order of a release that keeps no WAL compatibility).
+	if n.Cluster, rows, err = clusterView(ctx, h.cfg, reg, rows); err != nil {
+		return nil, err
+	}
 	var listErr error
 	n.Projects = nodeupgrade.ProjectsOf(rows, func(ref string) time.Time {
 		bs, err := reg.ListBackups(ctx, ref)
@@ -452,6 +457,8 @@ func (h *nodeHost) Stage(ctx context.Context, c *nodeupgrade.Candidate) (*nodeup
 		st.Discard()
 		return nil, err
 	}
+	// The signed manifest says whether this release keeps the WAL format; the binary cannot.
+	info.WALIncompatible = !r.ver.Manifest.WALCompatible()
 	s := &staged{st: st}
 	s.studio.name, s.studio.url, s.studio.sha, _ = r.ver.Studio(o.Platform)
 	return &nodeupgrade.Staged{Info: info, Data: s}, nil

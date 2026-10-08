@@ -19,6 +19,10 @@ type StackOutcome struct {
 	// Command, when set, is the command line the operator runs by hand: the host found no AWS
 	// credentials of the operator's own, so nothing was run.
 	Command string
+	// Standalone, with Command, is the same update run from a shell that holds the credentials and
+	// is not this node (AWS CloudShell, a laptop): the release's signed script, which also runs on
+	// its own.
+	Standalone string
 }
 
 // StackError is the stack update ending without success: the script's exit status (2 refused
@@ -72,6 +76,9 @@ func (r *run) stackStep(ctx context.Context, cand *Candidate) (todo string, err 
 	}
 	if out.Command != "" {
 		o.say("There are no AWS credentials of yours in the environment (`sudo -E` keeps them), so the stack was not updated. To update it, run:\n\n  %s\n", out.Command)
+		if out.Standalone != "" {
+			o.say("or, where your credentials are (AWS CloudShell, your laptop), with the supavise-aws-deploy.sh attached to the release %s:\n\n  %s\n", cand.Tag, out.Standalone)
+		}
 		return out.Command, nil
 	}
 	o.say("The AWS stack is up to date")

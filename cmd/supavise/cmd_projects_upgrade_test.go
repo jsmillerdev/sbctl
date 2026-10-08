@@ -107,3 +107,20 @@ func TestSelectProjectsNamesOnlyTheRef(t *testing.T) {
 		}
 	}
 }
+
+// Without a ref, a node upgrades the projects it runs; a project homed on another node is that
+// node's, and the rollout does not halt on it.
+func TestSplitByHomeLeavesOtherNodesProjectsToThem(t *testing.T) {
+	ps := []*registry.Project{
+		{Ref: "aaaaaaaaaaaaaaaaaaaa", NodeID: "n1"},
+		{Ref: "bbbbbbbbbbbbbbbbbbbb", NodeID: "n2"},
+		{Ref: "cccccccccccccccccccc"}, // a registry that predates homes
+	}
+	here, elsewhere := splitByHome(ps, "n1")
+	if len(here) != 2 || here[0].Ref != "aaaaaaaaaaaaaaaaaaaa" || here[1].Ref != "cccccccccccccccccccc" || len(elsewhere) != 1 || elsewhere[0] != "bbbbbbbbbbbbbbbbbbbb" {
+		t.Errorf("here %v, elsewhere %v", here, elsewhere)
+	}
+	if here, elsewhere := splitByHome(ps, ""); len(here) != 3 || len(elsewhere) != 0 {
+		t.Errorf("an engine that does not know its node keeps every project: %v %v", here, elsewhere)
+	}
+}

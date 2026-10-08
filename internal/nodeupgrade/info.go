@@ -49,6 +49,10 @@ type Info struct {
 	HostChanges      []string `json:"host_changes,omitempty"`
 	ConvergeRevision int      `json:"converge_revision"`
 	InfraRevision    int      `json:"infra_revision"`
+	// WALIncompatible is the signed manifest's wal_compat: false. The binary cannot know it (it is a
+	// fact about this release against the ones before it), so the upgrade fills it in from the
+	// manifest after the binary has described itself.
+	WALIncompatible bool `json:"-"`
 }
 
 // PinsOf maps a versions.yaml to service names.

@@ -115,23 +115,49 @@ func selectProjects(ps []registry.Project, refs []string) ([]*registry.Project, 
 
 // upgradeRows computes the eligibility of every user project (or of refs).
 func upgradeRows(ctx context.Context, n *lifecycle.Node, refs []string, req lifecycle.UpgradeRequest) ([]upgradeRow, error) {
+	rows, _, err := upgradeRowsFor(ctx, n, refs, req, false)
+	return rows, err
+}
+
+// upgradeRowsFor is upgradeRows that, with homedHere and no refs, leaves out the projects homed on
+// other nodes of a cluster and returns their refs. Such a project's data and units are on its home,
+// so this node's engine refuses to upgrade or restart it, and a rollout that listed it would halt
+// there and leave the rest not attempted. A project named in refs is kept: the engine then says why
+// it cannot be upgraded here.
+func upgradeRowsFor(ctx context.Context, n *lifecycle.Node, refs []string, req lifecycle.UpgradeRequest, homedHere bool) (rows []upgradeRow, elsewhere []string, err error) {
 	ps, err := n.Registry.ListProjects(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	selected, err := selectProjects(ps, refs)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	rows := make([]upgradeRow, 0, len(selected))
+	if homedHere && len(refs) == 0 {
+		selected, elsewhere = splitByHome(selected, n.Engine.NodeID())
+	}
+	rows = make([]upgradeRow, 0, len(selected))
 	for _, p := range selected {
 		el, err := n.Engine.UpgradeEligibilityFor(ctx, p.Ref, req)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", p.Ref, err)
+			return nil, nil, fmt.Errorf("%s: %w", p.Ref, err)
 		}
 		rows = append(rows, upgradeRow{Project: p, El: el})
 	}
-	return rows, nil
+	return rows, elsewhere, nil
+}
+
+// splitByHome separates the projects homed on node self (or on no node, or when self is not
+// known) from the refs of those homed on another node.
+func splitByHome(ps []*registry.Project, self string) (here []*registry.Project, elsewhere []string) {
+	for _, p := range ps {
+		if self != "" && p.NodeID != "" && p.NodeID != self {
+			elsewhere = append(elsewhere, p.Ref)
+			continue
+		}
+		here = append(here, p)
+	}
+	return here, elsewhere
 }
 
 func printPlan(w io.Writer, rows []upgradeRow) {
@@ -145,8 +171,14 @@ func printPlan(w io.Writer, rows []upgradeRow) {
 
 // confirm asks on a terminal, and refuses to guess when stdin is not one.
 func confirm(cmd *cobra.Command, question string) error {
+	return confirmTo(cmd, question, "upgrade")
+}
+
+// confirmTo is confirm for a command that does something else than upgrade: doing is the verb the
+// hint names ("run it again with --yes to remove without being asked").
+func confirmTo(cmd *cobra.Command, question, doing string) error {
 	if fi, err := os.Stdin.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
-		return errors.New("nothing was changed; run it again with --yes to upgrade without being asked")
+		return fmt.Errorf("nothing was changed; run it again with --yes to %s without being asked", doing)
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "%s [y/N] ", question)
 	line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
@@ -250,9 +282,12 @@ func runUpgrade(cmd *cobra.Command, n *lifecycle.Node, args []string) error {
 	if err != nil {
 		return err
 	}
-	rows, err := upgradeRows(ctx, n, args, req)
+	rows, elsewhere, err := upgradeRowsFor(ctx, n, args, req, true)
 	if err != nil {
 		return err
+	}
+	if len(elsewhere) > 0 {
+		fmt.Fprintf(cmd.OutOrStdout(), "%d project(s) are homed on other nodes and are left to them (run this command there): %s\n", len(elsewhere), strings.Join(elsewhere, ", "))
 	}
 	var todo []upgradeRow
 	for _, r := range rows {
