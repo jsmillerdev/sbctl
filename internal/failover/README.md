@@ -14,11 +14,13 @@ GET /supavise/v1/failover/readiness
 
 The orchestrator never touches a database, a unit or a file of another node itself. It calls ports (below), which the daemon wires to `placement`, the mesh, `fleet` and `backup`. Every step is written to a log after it is done, and a step that is in the log is not done again, so `--resume` continues a move that stopped. Every step is also written so that doing it twice is harmless, because a crash can fall between the work and its record.
 
-One move runs at a time on a node (`ErrBusy`). A project move holds the project's lock with the lifecycle operations (pause, resume, delete, upgrade).
+One move runs at a time on a node (`ErrBusy`). A project move takes the project's lock, shared with the lifecycle operations (pause, resume, delete, upgrade), before it plans, so the status it records is the one the project has; a move that cannot get the lock leaves no row. A server move takes no project locks.
+
+The plan the CLI showed is the plan that runs: `supavise failover` and `supavise projects failover` send the kind (and for a server move the epoch) they confirmed with the operator, and the daemon refuses with `ErrPlanChanged` when planning at the start of the run gives another, for instance a clean stop that has become a fence because the primary stopped answering in between. A resume sends none.
 
 ### Project move
 
-The leader runs it. The project shows `RESTARTING` while it moves. A project whose primary answers is switched over; one that does not is failed over. A project whose home node does not answer at all is a node failure: the plan refuses and names `supavise failover`.
+The leader runs it. The project shows `RESTARTING` while it moves. A project whose primary answers is switched over; one that does not is failed over. A project whose home node does not answer at all is a node failure, and the plan refuses (hard). For a home that is the leader, `supavise failover` on a survivor moves the project with the rest. For a home that is a follower no move applies (see Limits).
 
 | Switchover | What it does |
 |---|---|
@@ -32,7 +34,7 @@ The leader runs it. The project shows `RESTARTING` while it moves. A project who
 | `demote-old` | the old home becomes a replica of the new one, in place |
 | `base-backup` | a base backup on the new timeline; a failure is a warning |
 
-A failover has `begin`, `fence-old`, `promote` (drains the archive instead of waiting for an LSN), `homed`, `start-new`, `tenant`, `reseed-old` and `base-backup`. `fence-old` is the cooperative fence of that one project. `reseed-old` sets the old primary's data aside as `data.diverged-<epoch>` and asks the replica controller for a new replica there. A paused project is promoted like the others and stopped again.
+A failover has `begin`, `fence-old`, `promote` (drains the archive instead of waiting for an LSN), `homed`, `start-new`, `tenant`, `reseed-old` and `base-backup`. `fence-old` is the cooperative fence of that one project: the home node records `projects/<ref>/fenced.json`, removes the launcher and stops the primary. A home that is the leader itself, the usual case, does this in its own process, because a node cannot call itself over the mesh. `reseed-old` sets the old primary's data aside as `data.diverged-<epoch>` and asks the replica controller for a new replica there. A paused project is promoted like the others and stopped again.
 
 ### Server move
 
@@ -50,9 +52,11 @@ Run on the node that takes over (`--to` defaults to it). From the leader, `--to 
 | `leader` | the daemon becomes the leader (`Takeover`), the log moves into a `moves` row and `failover.json` is removed, `SetLeader`, the old leader is marked `fenced` after a failover, the system project is homed here, maintenance ends |
 | `system-homed`, `p:<ref>:seed|promote|homed|started|tenant|done` | the projects, four at a time, in sequence order. A project with no replica on the new leader goes to the node holding its healthiest replica; with `--restore-missing` a project with no replica gets a standby seeded from the archive and drained (data loss up to `archive_timeout`) |
 | `demote:<ref>` (switchover) | the old leader's clusters become replicas in place, the system cluster first; a project restored from the archive is rebuilt instead (`reseed:<ref>`) |
-| `base-backups`, `dns` | base backups on the new timelines, and the DNS guidance |
+| `base-backups`, `dns` | base backups on the new timelines, one step per project (`base-backup:<ref>`) so that a project that finishes on a later resume gets its own, and the DNS guidance |
 
 Nothing is promoted before the old leader cannot write, and nothing is written to the marker before the old leader is beyond return, so a switchover that fails before then can still be undone. A project that fails does not stop the others: the move ends `failed`, names it, and a resume runs what is left.
+
+The leader keeps what it needs to answer a survivor that asks twice, and to undo the stop, in `<state_dir>/failover-quiesce.json` (0600): the node and epoch the quiesce is for, the project clusters it stops (listed before the first stop) and, once every cluster has stopped, where each stopped. The registry cannot hold it, because the quiesce stops the system cluster. A repeated request answers from the file, a request for another switchover is refused (`quiesce_pending`), and `resume` is authorized by it. The record ends with the undo, or when the cluster has reached its epoch, or after an hour like the maintenance announcement.
 
 The planned stop never touches the daemon. The WAL relay in it stays up until the cluster has stopped, because a cluster that cannot archive its last segments cannot finish its shutdown. `SetProjectNode` comes after the old primary has stopped, so the relay of the old home keeps serving until then.
 
@@ -66,7 +70,7 @@ The planned stop never touches the daemon. The WAL relay in it stays up until th
 | same release on both nodes | yes | no |
 | capacity of the target: the replica already counts against it (advice, from the project check) | no | no |
 | the epoch marker store is reachable | yes | no |
-| projects without a replica (unless `--restore-missing`) | yes | no |
+| projects without a replica (unless `--restore-missing`) | yes | yes |
 | `[fleet] storage_backend = "s3"` | yes | yes |
 | the marker does not already hold this epoch or a higher one | yes | yes |
 | the target is active; the system cluster has a standby on it | yes | yes |
@@ -91,7 +95,7 @@ A planned switchover has nothing to fence: the clean stop takes its place. The a
 
 ## Automatic modes
 
-`[failover] mode = "project"` lets the leader fail over a project; `"server"` adds the follower taking over a dead leader. Both need `fencing = "aws"` and a probe that passes at the start and is repeated; a node whose probe fails runs as manual, raises `failover_failed` (title "Automatic failover is off") once, and arms itself again when the probe passes. `Monitor.Tick` looks every 10 seconds. Every gate must be open:
+`[failover] mode = "project"` lets the leader fail over a project; `"server"` adds the follower taking over a dead leader. Both need `fencing = "aws"` and a probe that passes at the start and is repeated; a node whose probe fails runs as manual, raises `failover_auto_off` (title "Automatic failover is off") once, says so again when the probe passes, and arms itself again. It is a condition, not an announcement: the hourly cap holds it. `Monitor.Tick` looks every 10 seconds. Every gate must be open:
 
 | Gate | Server mode (the follower decides) | Project mode (the leader decides) |
 |---|---|---|
@@ -105,13 +109,13 @@ A planned switchover has nothing to fence: the clean stop takes its place. The a
 | lag | the plan passes with no `--force`: the lag of every replica needed is known and within `max_lag_seconds` | same |
 | one move | none is running | same |
 
-With three or more nodes every follower may decide at once; the marker lets one go on, and the others stop before they touch the address. A leader that merely misses pings, while its address answers or EC2 says it runs, is not stopped. Projects without a replica are restored from the archive by the automatic server mode, because refusing the whole server over one project would leave it down. A project whose home does not answer is left to the server mode. There is no automatic failback.
+With three or more nodes the followers take turns: the first by node id acts after the grace period, the next a grace period later, and so on, so that the one that acts first leads before the others look again. The epoch marker holds when two still act at once: it is read before the write and again after it, and the node whose marker is not the one in the store stops before it touches the address. A leader that merely misses pings, while its address answers or EC2 says it runs, is not stopped. The plan pings the leader once more; a leader that answers by then is left alone (the plan would be a switchover). Projects without a replica are restored from the archive by the automatic server mode, because refusing the whole server over one project would leave it down; the `failover_started` alert names them and the data loss. A project whose home does not answer is left to the server mode. There is no automatic failback.
 
 ## The old primary's return
 
-At boot, before the daemon lets a primary start, `BootCheck` asks the peers for the epoch and reads `_node/leader.json`. A higher epoch, or a different leader at the same epoch, fences the node: `fenced.json` is written (`fenced/`), the clusters systemd started are stopped, their launchers are removed (the unit's `ConditionPathExists` then keeps them down, also at boot), and the critical alert `fenced` is raised. With neither source reachable the node starts, because its own record shows no demotion.
+At boot, before the daemon lets a primary start, `BootCheck` asks the peers for the epoch and reads `_node/leader.json`. A higher epoch, or a different leader at the same epoch, fences a node that led according to its own registry: `fenced.json` is written (`fenced/`), the clusters systemd started are stopped, their launchers are removed (the unit's `ConditionPathExists` then keeps them down, also at boot), and the critical alert `fenced` is raised. A node that does not lead is only checked for its record: a follower that was down while the leader changed has a registry copy that is behind, and nothing it homes moved, so fencing it would take its projects offline and set all its data aside at the rejoin. With neither source reachable the node starts, because its own record shows no demotion. A fence record that cannot be written (a full disk) does not leave the primaries running: they are stopped and their launchers removed, and the error is returned.
 
-The cooperative fence (`POST /peer/v1/fence`) does the same on request: the node that will lead asks, and the node records the fence first, removes the launchers and stops the primaries. A project fence (with a `ref`, in the current epoch, from the leader) does it for one project and writes `projects/<ref>/fenced.json`. The plane must not start a primary while `fenced.Blocks(paths, ref)` says so.
+The cooperative fence (`POST /peer/v1/fence`) does the same on request: the node that will lead asks, and the node records the fence first, removes the launchers and stops the primaries. A project fence (with a `ref`, in the current epoch, from the leader) does it for one project and writes `projects/<ref>/fenced.json`. The stops run to the end when the caller gives up. A `ref` from a peer must be `system` or a 20-letter project ref before it builds a path, in the handlers and in `fenced` and `SetAsideDiverged`. The plane must not start a primary while `fenced.Blocks(paths, ref)` says so.
 
 `SetAsideDiverged` moves a project's data to `data.diverged-<epoch>` with a `DIVERGED.json` (when, and the size of the lost tail when both LSNs are known) and clears the project's fence record; `SweepDiverged` removes what is older than `keep_diverged_days`, hourly in the daemon. A planned switchover needs no rejoin: the old leader's clusters are demoted in place.
 
@@ -142,23 +146,24 @@ The cooperative fence (`POST /peer/v1/fence`) does the same on request: the node
 | `POST /peer/v1/failover/primary/{ref}/{op}` | the leader | `stop`, `start`, `health`, `aside` on a project's primary |
 | `POST` and `GET /peer/v1/failover/server` | the leader | run a switchover for it, and tell how it goes |
 
-The CLI reaches the orchestrator through a unix socket of the daemon, `<state_dir>/system/failover/control.sock` (mode 0660), because a move needs the daemon's mesh sessions, plane and registry, and on a follower the admin port is a forwarder to the leader. `GET /v1/readiness`, `POST /v1/plan/{project,server}` and `POST /v1/run/{project,server}` (a stream of steps, one JSON object per line). A run belongs to the daemon: a CLI that goes away does not stop it.
+The CLI reaches the orchestrator through a unix socket of the daemon, `<state_dir>/system/failover/control.sock` (mode 0600 in a 0700 directory), because a move needs the daemon's mesh sessions, plane and registry, and on a follower the admin port is a forwarder to the leader. `GET /v1/readiness`, `POST /v1/plan/{project,server}` and `POST /v1/run/{project,server}` (a stream of steps, one JSON object per line). A run belongs to the daemon: a CLI that goes away does not stop it, and a CLI that is connected and does not read does not stall it (a step that finds the buffer full is in the log only). Without a socket the client says the server is not part of a cluster or supavise is not running; without permission, that the socket is for root and the user supavise runs as.
 
 ## Readiness
 
-`Readiness` is what `supavise status` shows and `GET /supavise/v1/failover/readiness` returns (Owners and Administrators): whether a server failover would be accepted now, for the node that would take over (this one when it follows, else the follower with the healthiest system standby). The failed blocking checks are the blockers; the rest are notes, among them the projects with no replica. The fencer probe is cached for a minute. A server with no other node answers `ErrNoCluster` (404, and no block in `status`).
+`Readiness` is what `supavise status` shows and `GET /supavise/v1/failover/readiness` returns (Owners and Administrators): whether a server failover would be accepted now, for the node that would take over (this one when it follows, else the follower with the healthiest system standby). The failed blocking checks are the blockers; the rest are notes, among them the projects with no replica. On the leader, which is this node and answers, the plan is a switchover to that follower and needs no fencer. The fencer probe is cached for a minute. A server with no other node answers `ErrNoCluster` (404, and no block in `status`).
 
 ## Alerts
 
-`failover_started`, `failover_completed` and `failover_failed` announce each move (warning when it was undone and aborted, critical when it stopped). They are one-shot and the hourly cap does not hold them back. `fenced` is critical.
+`failover_started`, `failover_completed` and `failover_failed` announce each move (warning when it was undone and aborted, critical when it stopped). They are one-shot and the hourly cap does not hold them back; `failover_auto_off` is a condition with a recovery message and stays under the cap. `fenced` is critical.
 
 ## Tests
 
-`go test ./internal/failover/...` runs the orchestrator against a fake cluster (`world_test.go`) over the in-memory registry behind a gate that refuses writes while the node is a standby. Covered: every branch of both moves (a failed fence means no promotion, an epoch race, a promotion that fails halfway, partial project failures, restore of missing replicas, a third node, paused projects), a resume after a failure at each step with a fresh orchestrator, the order of the events, the preconditions and `--dry-run`, the automatic gates, the boot check, the peer endpoints, the control socket and the delegation. `aws/` runs the provider against awsapi's fake for the order stop, wait stopped, associate and promote, and for a partitioned peer that is never stopped. `pg_test.go` runs the main flows again over a Postgres registry when `SUPAVISE_TEST_DATABASE_URL` is set, as in CI.
+`go test ./internal/failover/...` runs the orchestrator against a fake cluster (`world_test.go`) over the in-memory registry behind a gate that refuses writes while the node is a standby. Covered: the leader as the home of a project and the mesh refusing a call to itself (the fake peers do), the quiesce record with the registry stopped, every branch of both moves (a failed fence means no promotion, an epoch race, a promotion that fails halfway, partial project failures, restore of missing replicas, a third node, paused projects), a resume after a failure at each step with a fresh orchestrator, the order of the events, the preconditions and `--dry-run`, the automatic gates, the boot check, the peer endpoints, the control socket and the delegation. `aws/` runs the provider against awsapi's fake for the order stop, wait stopped, associate and promote, and for a partitioned peer that is never stopped. `pg_test.go` runs the main flows again over a Postgres registry when `SUPAVISE_TEST_DATABASE_URL` is set, as in CI.
 
 ## Limits
 
 - The automatic modes need the AWS fencer. Without one, a failover is an operator's act.
-- A project that is homed on a node that does not answer is failed over only by the server move.
+- A project homed on a follower that does not answer is failed over by nothing. A project move fences the home through the mesh and needs it to answer, a server move moves only the projects homed on the old leader, and the monitor watches only the leader. The project stays down until its node returns; its replica holds the data, and the backup store has its WAL. Getting it to serve before then is by hand. A fence that can reach a dead node needs a node-level fenced state and an epoch bump, which no part of this package does.
+- A node that led and reboots before its registry copy has replayed a planned switchover reads itself as the leader the cluster has replaced, and is fenced; `supavise node rejoin` brings it back.
 - The boot check runs in the daemon's wiring, after the node opened: a cluster that systemd started before the daemon is stopped by it, not prevented.
 - `supavise node rejoin` (workstream M) clears `fenced.json` and calls `SetAsideDiverged`; until it does, a fenced node stays fenced.
