@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -55,14 +56,73 @@ type Result struct {
 }
 
 // Store reads and writes State.
-type Store struct{ Path string }
+type Store struct {
+	Path string
+	// pinned marks a Store from PinnedStore: it creates no directory but DefaultStateDir.
+	pinned bool
+}
 
-// StatePath is where the state of a node with the given state directory lives: a directory of its
-// own next to it, <state_dir>-upgrade (/var/lib/supavise-upgrade, the unit's StateDirectory). The
-// state decides whether a root-run service upgrades and reboots the node, so it must not sit in
-// the state directory, which every supavise unit (a project's Postgres among them) can write.
-func StatePath(stateDir string) string {
-	return filepath.Join(filepath.Clean(stateDir)+"-upgrade", "state.json")
+// DefaultStateDir is where `supavise update run` keeps its record: the StateDirectory of
+// supavise-upgrade.service. It is a fixed path, not <state_dir>-upgrade or anything else the config
+// names: the unit runs as root, `supavise` owns config.toml, and a record whose place the config
+// decides is a record the supavise account can send root to read and write somewhere else.
+const DefaultStateDir = "/var/lib/supavise-upgrade"
+
+// stateDirEnv is the variable systemd sets for a unit with StateDirectory=: the absolute path of
+// the directory it created for the unit (a colon-separated list when there are several).
+const stateDirEnv = "STATE_DIRECTORY"
+
+// PinnedStateDir returns the directory of the record: $STATE_DIRECTORY when the service was started
+// by systemd, DefaultStateDir (the directory that variable names for the shipped unit) when a person
+// runs the command by hand. Nothing in config.toml reaches it. A value that is not one clean
+// absolute path is an error, so that a unit edited to list several directories, or an environment
+// that names a relative one, stops the command instead of choosing for it.
+func PinnedStateDir(getenv func(string) string) (string, error) {
+	v := getenv(stateDirEnv)
+	switch {
+	case v == "":
+		return DefaultStateDir, nil
+	case strings.Contains(v, ":"):
+		return "", fmt.Errorf("$%s lists several directories (%q): the update record has one place", stateDirEnv, v)
+	case !filepath.IsAbs(v) || filepath.Clean(v) != v:
+		return "", fmt.Errorf("$%s is %q, not a clean absolute path", stateDirEnv, v)
+	}
+	return v, nil
+}
+
+// PinnedStore returns the Store of the node's update record, at the pinned directory. Unlike a Store
+// literal it refuses to create a directory: systemd makes the unit's StateDirectory before the
+// service starts, and a missing one elsewhere means the unit is not what it should be. DefaultStateDir
+// is the one directory it creates (a person running `sudo supavise update run` before the timer
+// ever ran), with the mode checkDir demands.
+func PinnedStore(getenv func(string) string) (Store, error) {
+	dir, err := PinnedStateDir(getenv)
+	if err != nil {
+		return Store{}, err
+	}
+	return Store{Path: filepath.Join(dir, "state.json"), pinned: true}, nil
+}
+
+// ensureDir makes sure the directory of the record exists. A Store from a literal creates it with
+// MkdirAll (tests, the dry run's scratch directory); a pinned one never creates a directory but
+// DefaultStateDir.
+func (s Store) ensureDir() error {
+	dir := filepath.Dir(s.Path)
+	if !s.pinned {
+		return os.MkdirAll(dir, 0o755)
+	}
+	if _, err := os.Lstat(dir); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if dir != DefaultStateDir {
+		return fmt.Errorf("%s does not exist: systemd creates it for supavise-upgrade.service (StateDirectory=), and the update record is not created anywhere else", dir)
+	}
+	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	return os.Chmod(dir, 0o755) // the umask may have opened it up; checkDir refuses a directory others can write
 }
 
 // checkDir refuses a state directory that someone else could have changed: a symlink, a directory
@@ -118,7 +178,7 @@ func (s Store) Save(st State) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
+	if err := s.ensureDir(); err != nil {
 		return err
 	}
 	if err := s.checkDir(); err != nil {
@@ -150,6 +210,9 @@ var ErrBusy = errors.New("another `supavise update run` is in progress")
 // run by hand): the second one would otherwise read the first one's in-progress record as a
 // crashed upgrade. The lock is a flock, so a crash releases it. It sits next to the state file.
 func (s Store) Lock() (release func(), err error) {
+	if err := s.ensureDir(); err != nil {
+		return nil, err
+	}
 	release, held, err := tryLock(filepath.Join(filepath.Dir(s.Path), "run.lock"))
 	switch {
 	case err != nil:

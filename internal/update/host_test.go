@@ -97,3 +97,25 @@ func TestLockHostRefusesWhileHeld(t *testing.T) {
 	}
 	release()
 }
+
+// The end-to-end test points the upgrade at a local release server; the unit passes nothing extra.
+func TestRunUpgradePassesExtraArguments(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "args")
+	exe := filepath.Join(dir, "fake")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\necho \"$@\" > "+out+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if exit, err := RunUpgrade(context.Background(), exe, "", nil, nil, "--repo", "o/r", "--api-base", "http://127.0.0.1:1"); err != nil || exit != 0 {
+		t.Fatalf("RunUpgrade = %d, %v", exit, err)
+	}
+	if b, _ := os.ReadFile(out); strings.TrimSpace(string(b)) != "upgrade --unattended --repo o/r --api-base http://127.0.0.1:1" {
+		t.Errorf("arguments: %q", b)
+	}
+	if exit, err := RunUpgrade(context.Background(), exe, "", nil, nil); err != nil || exit != 0 {
+		t.Fatal(exit, err)
+	}
+	if b, _ := os.ReadFile(out); strings.TrimSpace(string(b)) != "upgrade --unattended" {
+		t.Errorf("arguments without extras: %q", b)
+	}
+}

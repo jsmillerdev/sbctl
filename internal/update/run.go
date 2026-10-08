@@ -62,8 +62,31 @@ type Deps struct {
 	// operation in flight. A nil RebootBlocker blocks every reboot, so that a caller who forgot
 	// the gate gets no reboot rather than an ungated one.
 	RebootBlocker func(ctx context.Context) string
+	// LockHost takes the host lock (LockHost, HostLockPath) and returns the function that gives it
+	// back; it fails when `supavise upgrade`, `supavise rollback` or `supavise self-update` holds it.
+	// Run takes it before the reboot gate's checks and keeps it through the reboot, so that none of
+	// them can start between the check and the machine going down. A nil LockHost blocks every
+	// reboot, like a nil RebootBlocker. The upgrade this pass runs itself takes the lock in its own
+	// process, so Run asks for it only after that upgrade has returned.
+	LockHost func() (release func(), err error)
 	// Reboot restarts the machine.
 	Reboot func(ctx context.Context) error
+	// AwaitShutdown, when set, is called after Reboot returned and before Run gives the host lock
+	// back: `systemctl reboot` returns when the reboot is queued, not when the machine is down, and
+	// the lock must outlast that gap. It returns when the service is told to stop (the shutdown does
+	// that) or after a grace period, whichever is first.
+	AwaitShutdown func(ctx context.Context)
+	// Notify tells the operator about an unattended outcome that no other process reports: an
+	// upgrade that was cut short, and one that could not run or ended in a status the contract
+	// does not name. (`supavise upgrade` reports its own failures, including exit 3 and 4.) A
+	// delivery problem is the hook's to log; a nil Notify sends nothing.
+	Notify func(ctx context.Context, title, detail string)
+}
+
+func (d Deps) notify(ctx context.Context, title, detail string) {
+	if d.Notify != nil {
+		d.Notify(ctx, title, detail)
+	}
 }
 
 // The latest moment, counted back from the close of the window, at which an unattended upgrade or
@@ -116,6 +139,8 @@ func Run(ctx context.Context, d Deps) error {
 		if err := d.Store.Save(st); err != nil {
 			return err
 		}
+		d.notify(ctx, "Automatic upgrade was interrupted",
+			fmt.Sprintf("The unattended upgrade that started at %s from Supavise %s did not report how it ended: the node or the service was stopped part way through. Automatic upgrades are paused until `sudo supavise update resume`.\nRun `supavise status` and `supavise upgrade --check` first.", p.Started.Format(time.RFC3339), d.Version))
 		return fmt.Errorf("an unattended upgrade was interrupted; automatic upgrades are paused until `sudo supavise update resume`")
 	}
 
@@ -175,6 +200,10 @@ func Run(ctx context.Context, d Deps) error {
 				st.Blocked = fmt.Sprintf("%s at %s", res.Meaning, res.At.Format(time.RFC3339))
 				upgradeFailed = true
 				d.Log.Error("unattended_upgrade_result", "exit", exit, "outcome", "needs_operator", "detail", res.Meaning)
+				if exit != ExitNeedsOperator { // `supavise upgrade` told the operator about its own exit 4
+					d.notify(ctx, "Automatic upgrade could not run to the end",
+						fmt.Sprintf("`supavise upgrade --unattended` from Supavise %s: %s. Automatic upgrades are paused until `sudo supavise update resume`.\nRun `supavise status` and `supavise upgrade --check` first.", d.Version, res.Meaning))
+				}
 				upgradeErr = fmt.Errorf("unattended upgrade needs the operator (supavise upgrade exit %d); automatic upgrades are paused until `supavise update resume`", exit)
 			}
 		}
@@ -183,11 +212,31 @@ func Run(ctx context.Context, d Deps) error {
 	// 2. An OS patch that needs a reboot gets it inside the window, once per window. The reboot
 	// waits when the upgrade failed or was refused (a person should see the node first, and a
 	// refusal means the node is unhealthy or not backed up), when the window is about to close or
-	// closed during the upgrade, and while the node is unhealthy or busy.
+	// closed during the upgrade, and while the node is unhealthy or busy. The host lock is taken
+	// before any of those checks and held until the machine is going down: an upgrade or a
+	// self-update that started between the check and the reboot would be cut off by it.
 	if d.Update.RebootsInWindow() && inWindow && !upgradeFailed && st.Blocked == "" && !st.RebootWindow.Equal(opened) && d.RebootRequired(ctx) {
-		if reason := d.rebootDeferral(ctx, win, opened, upgradeRefused); reason != "" {
+		released := false
+		release := func() {}
+		reason := ""
+		if d.LockHost == nil {
+			reason = "no host lock is configured"
+		} else if rel, err := d.LockHost(); err != nil {
+			reason = err.Error()
+		} else {
+			release = func() {
+				if !released {
+					released = true
+					rel()
+				}
+			}
+			reason = d.rebootDeferral(ctx, win, opened, upgradeRefused)
+		}
+		if reason != "" {
+			release()
 			d.Log.Warn("os_reboot_deferred", "window", opened.Format(time.RFC3339), "reason", reason, "next_try", "the next tick or window")
 		} else {
+			defer release()
 			st.RebootWindow = opened
 			if err := d.Store.Save(st); err != nil {
 				return err // no reboot without the record that stops a reboot loop
@@ -195,6 +244,9 @@ func Run(ctx context.Context, d Deps) error {
 			d.Log.Warn("os_reboot", "window", opened.Format(time.RFC3339), "reason", "an OS update needs a reboot")
 			if err := d.Reboot(ctx); err != nil {
 				return fmt.Errorf("reboot: %w", err)
+			}
+			if d.AwaitShutdown != nil {
+				d.AwaitShutdown(ctx)
 			}
 			return upgradeErr
 		}

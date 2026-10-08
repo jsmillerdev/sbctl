@@ -62,6 +62,14 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		}
 	}
 	lo := LifecycleOptions(cfg, o)
+	// Alerts: what the rest of the node raises through alerts.Notify, and the project upgrades'
+	// events, which the Engine hands to a hook because it cannot import the alerting package. Both
+	// come before the node opens, so the upgrades that Recover closes are told too.
+	notifier := alerts.New(cfg, alerts.Options{Log: log.With("component", "alerts")})
+	alerts.SetDefault(notifier)
+	upgradeAlerts := newUpgradeAlerter(notifier, log.With("component", "alerts"))
+	defer upgradeAlerts.wait()
+	lo.UpgradeNotify = upgradeAlerts.notify
 	// Without a Fleet from the caller the Engine registers projects with Supavisor,
 	// Realtime and Storage through a Lazy fleet (credentials loaded on first use, a
 	// service this node never rendered skipped), so a project created through the API
@@ -130,8 +138,6 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		return err
 	}
 	monitor := health.NewMonitor(func(ctx context.Context) (*health.Report, error) { return health.CheckNode(ctx, hdeps) }, cfg.Health.Cache())
-	notifier := alerts.New(cfg, alerts.Options{Log: log.With("component", "alerts")})
-	alerts.SetDefault(notifier) // what the rest of the node raises through alerts.Notify
 	checker := &alerts.Checker{Notifier: notifier, Report: monitor.Fresh, Cfg: cfg, Log: log.With("component", "alerts")}
 	if us := health.ReadUpdateSettings(o.ConfigPath); !us.Off {
 		checker.UpdateInterval = us.CheckInterval

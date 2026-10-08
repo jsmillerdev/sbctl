@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,6 +113,7 @@ func CheckNode(ctx context.Context, d Deps) (*Report, error) {
 		r.Components = append(r.Components, *sysBk)
 	}
 	r.Components = append(r.Components, d.checkLocal(ctx)...)
+	r.Components = append(r.Components, d.checkHeldRestarts(projects)...)
 	r.Projects = projects
 	r.Finish()
 	return r, nil
@@ -424,17 +426,64 @@ func (d *Deps) checkNotices() []Component {
 	paths := d.Cfg.Paths()
 	now := d.now()
 	if u, ok := notice.UpgradeRunning(paths, now); ok {
-		detail := "phase " + u.Phase
-		if u.To != "" {
-			detail = fmt.Sprintf("%s to %s", detail, u.To)
-		}
-		out = append(out, Component{Name: "upgrade", State: Info, Detail: detail})
+		out = append(out, Component{Name: "upgrade", State: Info, Detail: upgradeDetail(u, now)})
 	}
 	if m, err := notice.ReadMaintenance(paths); err == nil && m != nil && now.Before(m.EndsAt) {
 		detail := fmt.Sprintf("%q from %s to %s", m.Message, m.StartsAt.Format(time.RFC3339), m.EndsAt.Format(time.RFC3339))
 		out = append(out, Component{Name: "maintenance", State: Info, Detail: detail})
 	}
 	return out
+}
+
+// upgradeDetail says what the node's running upgrade is doing, from its marker: the phase, the
+// releases, how long it has run and the process, so that someone who finds the node busy knows why
+// and whether the process behind it is still there. A running upgrade is a note, not a problem.
+func upgradeDetail(u *notice.Upgrade, now time.Time) string {
+	detail := "phase " + u.Phase
+	switch {
+	case u.From != "" && u.To != "":
+		detail += fmt.Sprintf(", %s to %s", u.From, u.To)
+	case u.To != "":
+		detail += ", to " + u.To
+	}
+	if !u.StartedAt.IsZero() {
+		detail += ", running for " + humanAge(now.Sub(u.StartedAt))
+	}
+	if u.Detail != "" {
+		detail += " (" + u.Detail + ")"
+	}
+	if u.PID != 0 && !u.ProcessAlive() {
+		detail += "; its process (" + strconv.Itoa(u.PID) + ") is gone, so the marker is believed for up to two hours: check `supavise upgrade --check`, then run `sudo supavise upgrade` again"
+	}
+	return detail
+}
+
+// checkHeldRestarts lists the projects whose restart an upgrade held back (lifecycle.HeldRestart:
+// the daemon rendered new PostgreSQL, GoTrue or PostgREST files and left the running unit on the old
+// ones, because the upgrade's rollout restarts them in canary order). They are notes, not
+// problems: the project serves on the files it started with. `sudo supavise upgrade` finishes
+// them, and the next upgrade does it as part of its own rollout.
+func (d *Deps) checkHeldRestarts(projects []ProjectResult) []Component {
+	var held []string
+	for _, p := range projects {
+		if p.Status == string(registry.StatusActiveHealthy) && p.Ref != config.SystemRef && lifecycle.HeldRestart(d.Cfg, p.Ref) {
+			held = append(held, p.Ref)
+		}
+	}
+	if len(held) == 0 {
+		return nil
+	}
+	sort.Strings(held)
+	what := plural(len(held), "project") + " still run the files they started with"
+	if len(held) == 1 {
+		what = "1 project still runs the files it started with"
+	}
+	finish := "`sudo supavise upgrade` restarts them in canary order"
+	if _, running := notice.UpgradeRunning(d.Cfg.Paths(), d.now()); running {
+		finish = "the upgrade that is running restarts them"
+	}
+	detail := fmt.Sprintf("%s: %s; %s", what, refList(held), finish)
+	return []Component{{Name: "held restarts", State: Info, Detail: detail}}
 }
 
 // humanAge renders d as "5m", "3h" or "2d".

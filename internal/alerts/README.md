@@ -22,7 +22,17 @@ alerts.Notify(ctx, alerts.Event{Kind: alerts.KindUpgradeFailed, Severity: "criti
 | `node_unhealthy` | the registry, the system cluster or a shared service is not healthy | warning; critical for the registry and system Postgres |
 | `update_available` | a release newer than the running version exists | info, once per version |
 
-Other parts of the node may raise any kind through `alerts.Notify`. The kinds `upgrade_started`, `upgrade_succeeded` and `upgrade_failed` are defined, but no upgrade command raises them: the upgrade and unattended-upgrade events are log lines only. Those three, `update_available` and `test` are announcements: each is sent when it happens, subject only to the hourly cap. Everything else is a condition: sent once while it lasts.
+Other parts of the node may raise any kind through `alerts.Notify`. The kinds `upgrade_started`, `upgrade_succeeded` and `upgrade_failed` are raised by the upgrade paths below. Those three, `update_available` and `test` are announcements: each is sent when it happens (see the cap, below). Everything else is a condition: sent once while it lasts.
+
+Three places raise the `upgrade_*` events, each about its own scope:
+
+| Raised by | About | Process |
+|---|---|---|
+| the daemon, from `lifecycle.Options.UpgradeNotify` (`internal/app`) | one project's upgrade: Studio's "Upgrade project", `POST /v1/projects/{ref}/upgrade`, and the upgrades the daemon closes after a crash. `Ref` is the project | the daemon |
+| `supavise upgrade` (`internal/nodeupgrade` events, `cmd/supavise/upgrade_alerts.go`) | the node's upgrade: started, succeeded, failed and rolled back (warning), failed and needs the operator (critical), with the versions and the halted project | the CLI, as root, also when `supavise update run` starts it |
+| `supavise rollback` | the node's rollback: started, succeeded, failed (critical) | the CLI, as root |
+
+A node upgrade rolls out project upgrades in worker processes that have no hook, so it sends one set of messages, not one per project. Neither the maintenance window nor the upgrade marker holds an `upgrade_*` event back: they quiet the checker's `project_unhealthy` and `node_unhealthy`, and the operator who starts an upgrade inside a window still hears that it failed. A run refused before it changes anything raises nothing.
 
 ## De-duplication, recovery and the cap
 
@@ -34,7 +44,7 @@ Other parts of the node may raise any kind through `alerts.Notify`. The kinds `u
 
 The state is `<state_dir>/system/alerts.json`, guarded by a file lock so the daemon and a CLI run never both decide to send the same alert. The lock is held while the decision is recorded (and again if a delivery has to be undone), not while the message travels, which can take 40 seconds: the decision reserves the notification, so a second process sees a duplicate, and a delivery that fails everywhere gives the reservation back. It is a file and not the registry because the most important alerts are about the system cluster that holds the registry.
 
-**Root and the supavise user.** `sudo supavise upgrade` raises events as root and the daemon runs as `supavise`. When the effective user is root, the state and lock files go to the owner of `<state_dir>/system` (the rule of `internal/artifacts`), so a root run never leaves files the daemon cannot open. A command that calls `alerts.Configure` and `Notify` needs nothing else.
+**Root and the supavise user.** `sudo supavise upgrade` raises events as root and the daemon runs as `supavise`. When the effective user is root, the state and lock files go to the owner of `<state_dir>/system` (the rule of `internal/artifacts`), so a root run never leaves files the daemon cannot open. A command that calls `alerts.New` (or `Configure`) and `Notify` needs nothing else: the CLI builds its own notifier from the node's config (`cmd/supavise/upgrade_alerts.go`) and shares this state file, the daemon's per-project upgrades use the `UpgradeNotify` hook (`internal/app/upgrade_alerts.go`), and no event passes from one process to the other. Because `<state_dir>/system` belongs to the supavise account, the store as root does not trust it: the directory must be a real directory (not a link) owned by root or by the owner of `state_dir`, and the lock, state and temporary files are opened through an `os.Root` with `O_NOFOLLOW`, must be regular files, and are handed to the owner through the open file, so a planted link cannot make root create or change a file elsewhere. `supavise update run` adds one critical `upgrade_failed` through the same notifier for an unattended upgrade that was interrupted or could not run.
 
 ## The checker
 

@@ -22,7 +22,9 @@ rep.Verdict.ExitCode() // 0 healthy, 1 degraded, 2 down
 | `certificates` | the earliest expiry among the certificates the node must keep valid: `api.<domain>`, `studio.<domain>` and the `*.api.<domain>` wildcard under `<state_dir>/certs`; for each name the newest copy counts, because CertMagic keeps one copy per issuer and an old issuer's copy (after `[tls] ca` changed) is never renewed | degraded |
 | `key escrow` | whether the backup backend holds an encrypted copy of the master key | note |
 | `update` | the record of the daily update check (below) | note |
-| `upgrade`, `maintenance` | the notice files (`internal/notice`) | note |
+| `upgrade` | a node upgrade that is running (`<state_dir>/system/upgrade.json`, `internal/notice`): the phase, the releases it moves between, how long it has run, what it is doing now, and, when the process that wrote the marker is gone, that and what to run | note |
+| `maintenance` | the announced maintenance window (`internal/notice`) | note |
+| `held restarts` | the projects whose restart an upgrade held back (`lifecycle.HeldRestart`: the daemon rendered new PostgreSQL, GoTrue or PostgREST files and left the running unit on the old ones for the rollout to restart); the detail names them and the command that finishes them, `sudo supavise upgrade` (during a running upgrade it says the rollout restarts them). Only `ACTIVE_HEALTHY` projects count, as in the upgrade plan | note |
 
 A project is probed only when it should answer. A paused project (`INACTIVE`) is listed as paused, one being created, restored or deleted as busy, `INIT_FAILED` as a note and `RESTORE_FAILED` as a warning; a removed project is not listed. The checks never write: unlike `Engine.Health` they leave the registry's project status alone.
 
@@ -32,7 +34,7 @@ Projects are probed 16 at a time with 10 seconds for each. A backup is stale aft
 
 ## The verdict
 
-- **healthy**: nothing failed or warned. Notes (a release is available, the master key has no copy in the backups, a maintenance window is announced) do not change it, so they do not stop `supavise upgrade --unattended` and do not turn an uptime monitor red.
+- **healthy**: nothing failed or warned. Notes (a release is available, the master key has no copy in the backups, a maintenance window is announced, a node upgrade is running, a project's restart is held back for the next upgrade) do not change it, so they do not stop `supavise upgrade --unattended` and do not turn an uptime monitor red.
 - **degraded**: the node serves but something needs the operator: a project or shared service is down, a backup is stale or failed, the disk or a certificate is running out.
 - **down**: the daemon, the edge, the registry or the system cluster's Postgres is not running.
 

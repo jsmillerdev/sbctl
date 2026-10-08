@@ -822,10 +822,10 @@ func TestForgetDropsAnActiveAlertWithoutSendingAnything(t *testing.T) {
 // state directory, or the daemon would be locked out of the alert state.
 func TestRootHandsTheStateFilesToTheStateOwner(t *testing.T) {
 	var chowned []string
-	oldE, oldC := geteuid, lchown
+	oldE, oldC := geteuid, fchown
 	geteuid = func() int { return 0 }
-	lchown = func(path string, uid, gid int) error { chowned = append(chowned, filepath.Base(path)); return nil }
-	defer func() { geteuid, lchown = oldE, oldC }()
+	fchown = func(f *os.File, uid, gid int) error { chowned = append(chowned, filepath.Base(f.Name())); return nil }
+	defer func() { geteuid, fchown = oldE, oldC }()
 
 	s := newSink(t)
 	cfg := testCfg(t, config.AlertWebhook{URL: s.srv.URL})
@@ -850,5 +850,73 @@ func TestRootHandsTheStateFilesToTheStateOwner(t *testing.T) {
 	geteuid = func() int { return 1000 }
 	if err := n.Notify(context.Background(), Event{Kind: KindBackupFailed, Title: "t"}); err != nil || len(chowned) != 0 {
 		t.Errorf("an ordinary user chowned %v (%v)", chowned, err)
+	}
+}
+
+// The supavise account can write <state_dir>/system. As root the alert store must not follow a
+// link that account plants there, or root creates files wherever the link points.
+func TestRootDoesNotFollowLinksInTheStateDirectory(t *testing.T) {
+	oldE := geteuid
+	geteuid = func() int { return 0 }
+	defer func() { geteuid = oldE }()
+
+	s := newSink(t)
+	cfg := testCfg(t, config.AlertWebhook{URL: s.srv.URL})
+	sys := filepath.Join(cfg.StateDir, "system")
+	if err := os.MkdirAll(sys, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	notify := func() error {
+		return New(cfg, Options{}).Notify(context.Background(), Event{Kind: KindDiskLow, Title: "t"})
+	}
+	empty := func(what string) {
+		t.Helper()
+		if ents, _ := os.ReadDir(outside); len(ents) != 0 {
+			t.Errorf("%s: root created %v outside the state directory", what, ents)
+		}
+	}
+
+	// A dangling link for the lock file, to a file that does not exist.
+	target := filepath.Join(outside, "nologin")
+	if err := os.Symlink(target, filepath.Join(sys, "alerts.json.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := notify(); err == nil {
+		t.Error("a link for the lock file was followed")
+	}
+	empty("lock link")
+	os.Remove(filepath.Join(sys, "alerts.json.lock"))
+
+	// A link for the state file: root must not read through it.
+	if err := os.Symlink(target, filepath.Join(sys, "alerts.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := notify(); err == nil {
+		t.Error("a link for the state file was followed")
+	}
+	empty("state link")
+	os.Remove(filepath.Join(sys, "alerts.json"))
+	os.Remove(filepath.Join(sys, "alerts.json.lock"))
+
+	// A link for the directory itself.
+	if err := os.RemoveAll(sys); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, sys); err != nil {
+		t.Fatal(err)
+	}
+	if err := notify(); err == nil {
+		t.Error("a link for the state directory was followed")
+	}
+	empty("directory link")
+	if _, err := New(cfg, Options{}).Active(); err == nil {
+		t.Error("the snapshot followed a link for the state directory")
+	}
+	os.Remove(sys)
+
+	// With the links gone the same root run works.
+	if err := notify(); err != nil {
+		t.Errorf("a plain directory is refused: %v", err)
 	}
 }

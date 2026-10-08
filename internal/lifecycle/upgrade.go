@@ -98,6 +98,42 @@ const (
 	EventUpgradeFailed     = "project.upgrade_failed"
 )
 
+// UpgradeNotice is what Options.UpgradeNotify receives: one of the three events of a project's
+// upgrade, with what an alert about it says.
+type UpgradeNotice struct {
+	// Event is EventUpgradeStarted, EventUpgradeSucceeded or EventUpgradeFailed.
+	Event      string
+	Ref        string
+	TrackingID string
+	// Changes lists the service moves in words ("gotrue 2.195.0 -> 2.196.0"); empty when the
+	// record has none.
+	Changes string
+	// BackupID is the base backup taken before the upgrade; 0 when none was.
+	BackupID int64
+	// Seconds is how long the upgrade took (EventUpgradeSucceeded).
+	Seconds int
+	// ErrorCode is the API's code of the stage that failed, Cause the error in words and Outcome
+	// what became of the project (EventUpgradeFailed): "nothing was changed", "rolled back to the
+	// previous versions", "the rollback failed too: ..." or "interrupted".
+	ErrorCode, Cause, Outcome string
+	// Settled is true when the event closes an upgrade whose process had stopped (the daemon found
+	// the record running with nobody behind it).
+	Settled bool
+}
+
+// Unresolved reports whether a failed upgrade left the project broken: the rollback failed too,
+// so the project is ACTIVE_UNHEALTHY and a person has to look. Every other failure leaves the
+// project on its previous versions (an interrupted one is started on them again by the daemon).
+func (n UpgradeNotice) Unresolved() bool {
+	return n.Event == EventUpgradeFailed && strings.HasPrefix(n.Outcome, "the rollback failed too")
+}
+
+func (e *Engine) notifyUpgrade(ctx context.Context, n UpgradeNotice) {
+	if e.opts.UpgradeNotify != nil {
+		e.opts.UpgradeNotify(ctx, n)
+	}
+}
+
 var (
 	// ErrUpgradeNotNeeded: the project already runs the target versions.
 	ErrUpgradeNotNeeded = errors.New("lifecycle: the project already runs the target versions")
@@ -392,6 +428,7 @@ func (e *Engine) BeginUpgrade(ctx context.Context, ref string, req UpgradeReques
 	e.upgrading.Store(ref, struct{}{})
 	e.event(ctx, ref, EventUpgradeStarted, map[string]any{"tracking_id": up.TrackingID, "from": up.From, "to": up.To, "target_version": req.TargetVersion})
 	e.log.Info("upgrade_started", "ref", ref, "tracking_id", up.TrackingID, "changes", describeChanges(el.Changes))
+	e.notifyUpgrade(ctx, UpgradeNotice{Event: EventUpgradeStarted, Ref: ref, TrackingID: up.TrackingID, Changes: describeChanges(el.Changes)})
 	started = true
 	return &upgradeRun{e: e, store: store, up: up, prev: p.Status, restarts: el.PostgresRestart, release: release, reuseSince: req.ReuseBackupSince}, nil
 }
@@ -687,6 +724,8 @@ func (r *upgradeRun) failed(ctx context.Context, code string, cause error, outco
 	r.e.event(ctx, r.up.Ref, EventUpgradeFailed, map[string]any{"tracking_id": r.up.TrackingID, "error_code": code, "error": cause.Error(),
 		"outcome": outcome, "backup_id": r.up.BackupID, "progress": r.up.Progress})
 	r.e.log.Error("upgrade_failed", "ref", r.up.Ref, "tracking_id", r.up.TrackingID, "stage", code, "backup_id", r.up.BackupID, "outcome", outcome, "error", cause)
+	r.e.notifyUpgrade(ctx, UpgradeNotice{Event: EventUpgradeFailed, Ref: r.up.Ref, TrackingID: r.up.TrackingID, Changes: describeChanges(DiffVersions(r.up.From, r.up.To)),
+		BackupID: r.up.BackupID, ErrorCode: code, Cause: cause.Error(), Outcome: outcome})
 }
 
 // refuse ends an upgrade that has not touched a service, with the project's lock held: the
@@ -763,6 +802,8 @@ func (r *upgradeRun) swap(ctx context.Context) error {
 	e.event(ctx, ref, EventUpgradeSucceeded, map[string]any{"tracking_id": r.up.TrackingID, "from": r.up.From, "to": r.up.To,
 		"backup_id": r.up.BackupID, "seconds": int(e.opts.Now().Sub(r.up.InitiatedAt).Seconds())})
 	e.log.Info("upgrade_succeeded", "ref", ref, "tracking_id", r.up.TrackingID, "backup_id", r.up.BackupID)
+	e.notifyUpgrade(ctx, UpgradeNotice{Event: EventUpgradeSucceeded, Ref: ref, TrackingID: r.up.TrackingID, Changes: describeChanges(DiffVersions(r.up.From, r.up.To)),
+		BackupID: r.up.BackupID, Seconds: int(e.opts.Now().Sub(r.up.InitiatedAt).Seconds())})
 	return nil
 }
 
@@ -972,6 +1013,8 @@ func (e *Engine) settleUpgradeRows(ctx context.Context, ps []registry.Project) {
 			e.event(ctx, p.Ref, EventUpgradeSucceeded, map[string]any{"tracking_id": u.TrackingID, "from": u.From, "to": u.To,
 				"backup_id": u.BackupID, "outcome": "settled: the project runs the target versions"})
 			e.log.Warn("upgrade_succeeded", "ref", p.Ref, "tracking_id", u.TrackingID, "backup_id", u.BackupID, "outcome", "settled")
+			e.notifyUpgrade(ctx, UpgradeNotice{Event: EventUpgradeSucceeded, Ref: p.Ref, TrackingID: u.TrackingID, Changes: describeChanges(DiffVersions(u.From, u.To)),
+				BackupID: u.BackupID, Settled: true})
 			continue
 		}
 		u.Status, u.Error, u.LatestStatusAt = registry.UpgradeFailed, UpgradeErrHealth, now
@@ -983,6 +1026,8 @@ func (e *Engine) settleUpgradeRows(ctx context.Context, ps []registry.Project) {
 		e.event(ctx, p.Ref, EventUpgradeFailed, map[string]any{"tracking_id": u.TrackingID, "error_code": u.Error, "error": u.Detail,
 			"outcome": "interrupted", "backup_id": u.BackupID, "progress": u.Progress})
 		e.log.Error("upgrade_failed", "ref", p.Ref, "tracking_id", u.TrackingID, "stage", u.Progress, "backup_id", u.BackupID, "outcome", "interrupted")
+		e.notifyUpgrade(ctx, UpgradeNotice{Event: EventUpgradeFailed, Ref: p.Ref, TrackingID: u.TrackingID, Changes: describeChanges(DiffVersions(u.From, u.To)),
+			BackupID: u.BackupID, ErrorCode: u.Error, Cause: u.Detail, Outcome: "interrupted", Settled: true})
 	}
 }
 
@@ -1013,6 +1058,8 @@ func (e *Engine) recoverUpgrade(ctx context.Context, ref string) (touched bool) 
 			e.event(ctx, ref, EventUpgradeFailed, map[string]any{"tracking_id": u.TrackingID, "error_code": u.Error, "error": u.Detail,
 				"outcome": "interrupted", "backup_id": u.BackupID, "progress": u.Progress})
 			e.log.Error("upgrade_failed", "ref", ref, "tracking_id", u.TrackingID, "stage", u.Progress, "backup_id", u.BackupID, "outcome", "interrupted")
+			e.notifyUpgrade(ctx, UpgradeNotice{Event: EventUpgradeFailed, Ref: ref, TrackingID: u.TrackingID, Changes: describeChanges(DiffVersions(u.From, u.To)),
+				BackupID: u.BackupID, ErrorCode: u.Error, Cause: u.Detail, Outcome: "interrupted", Settled: true})
 		}
 	}
 	if !touched {

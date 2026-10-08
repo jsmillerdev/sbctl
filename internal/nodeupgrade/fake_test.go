@@ -99,7 +99,8 @@ type fakeHost struct {
 	confirm       bool
 	confirmErr    error
 	marks         []string
-	restored      bool // after Restore the node reports the verdict it had before
+	restored      bool   // after Restore the node reports the verdict it had before
+	halted        string // the project the rollout stopped at (HaltReporter)
 }
 
 func newFakeHost() *fakeHost {
@@ -267,3 +268,6 @@ func (f *fakeHost) Confirm(q string) (bool, error) {
 }
 
 var errBoom = errors.New("boom")
+
+// HaltedProject implements HaltReporter.
+func (f *fakeHost) HaltedProject() string { return f.halted }

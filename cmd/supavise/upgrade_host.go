@@ -59,11 +59,13 @@ type nodeHost struct {
 	last        notice.Upgrade
 	hbStop      chan struct{}
 	knowsReason bool
-	from, to    string
-	started     time.Time
-	swappedAt   time.Time
-	stageDir    string
-	tmpStage    bool
+	// halted is the project the last rollout stopped at (HaltedProject).
+	halted    string
+	from, to  string
+	started   time.Time
+	swappedAt time.Time
+	stageDir  string
+	tmpStage  bool
 	// tagsAtSwap are the releases the node's units were set to run just before the binary was
 	// swapped (by Install or by Restore), by service.
 	tagsAtSwap map[string]string
@@ -102,6 +104,11 @@ func releasesDir(binPath string) string {
 // and keeps a parent that, on SIGTERM, sends the worker SIGKILL two seconds later, which would cut
 // a project upgrade off between its steps.
 func (h *nodeHost) asSupavise(ctx context.Context, stdout io.Writer, env []string, bin string, args ...string) error {
+	return h.asSupaviseTo(ctx, stdout, h.errw, env, bin, args...)
+}
+
+// asSupaviseTo is asSupavise with the worker's stderr sent to stderr.
+func (h *nodeHost) asSupaviseTo(ctx context.Context, stdout, stderr io.Writer, env []string, bin string, args ...string) error {
 	full := append([]string{bin, "--config", h.cfgPath}, args...)
 	c := exec.CommandContext(ctx, full[0], full[1:]...)
 	c.Env = append(os.Environ(), env...)
@@ -116,7 +123,7 @@ func (h *nodeHost) asSupavise(ctx context.Context, stdout io.Writer, env []strin
 	if stdout == nil {
 		stdout = h.out
 	}
-	c.Stdout, c.Stderr = stdout, h.errw
+	c.Stdout, c.Stderr = stdout, stderr
 	// A cancelled upgrade asks the worker to stop. It gets the signal itself: a project upgrade
 	// that is cut off rolls its project back and settles it, and is given two minutes to do that.
 	c.Cancel = func() error { return c.Process.Signal(syscall.SIGTERM) }
@@ -853,12 +860,23 @@ func upgradeProjectsArgs(target map[string]string, since time.Time) []string {
 
 // UpgradeProjects implements nodeupgrade.Host.
 func (h *nodeHost) UpgradeProjects(ctx context.Context, target map[string]string, since time.Time) ([]nodeupgrade.ProjectMove, error) {
-	err := h.asSupavise(ctx, h.out, nil, h.binPath, upgradeProjectsArgs(target, since)...)
+	tee := &haltTee{w: h.errw}
+	err := h.asSupaviseTo(ctx, h.out, tee, nil, h.binPath, upgradeProjectsArgs(target, since)...)
+	h.mu.Lock()
+	h.halted = tee.Ref()
+	h.mu.Unlock()
 	moves, merr := h.MovesBetween(context.WithoutCancel(ctx), since, time.Time{})
 	if merr != nil {
 		h.log.Warn("could not read which projects were upgraded", "error", merr)
 	}
 	return moves, err
+}
+
+// HaltedProject implements nodeupgrade.HaltReporter: the project the rollout stopped at.
+func (h *nodeHost) HaltedProject() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.halted
 }
 
 // EndUpgrade implements nodeupgrade.Host.

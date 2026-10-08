@@ -165,6 +165,17 @@ none does not float onto the release that just failed), starts and health checks
 and the error names the pre-upgrade backup. The nightly backup timer starts again whenever PostgreSQL
 runs after the rollback.
 
+**Alerts.** The Engine cannot import `internal/alerts` (alerts read the node's health through this
+package), so each upgrade event also goes to `Options.UpgradeNotify`, a hook that receives an
+`UpgradeNotice` (event, ref, tracking id, the service moves in words, backup id, and for a failure the
+error code, the cause and the outcome: `nothing was changed`, `rolled back to the previous versions`,
+`the rollback failed too: ...` or `interrupted`). It is called after the registry event is recorded,
+from the six places that record one: `BeginUpgrade`, a successful `swap`, `failed` (every failure
+path), `settleUpgradeRows` and `recoverUpgrade` (a dead runner; the notice has `Settled`). The daemon
+sets it (`internal/app`: `upgrade_started`, `upgrade_succeeded` and `upgrade_failed` alerts); the CLI
+does not, because `supavise upgrade` reports a node's upgrade as one (`internal/nodeupgrade`), not as a
+message per project. The hook must not block.
+
 **A rollback does not restore the data directory.** Minor releases do not change the file format, so the
 previous binaries read what the new ones left. GoTrue's (and Storage's) migrations only go forward, so an
 older GoTrue can meet a schema a newer one migrated: the pre-upgrade base backup is the way back for the

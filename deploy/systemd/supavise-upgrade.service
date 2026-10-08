@@ -18,9 +18,14 @@ Type=oneshot
 # anything that account can write. PATH is fixed for the same reason (systemctl,
 # needrestart and apt-get are found by name).
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# The service's own memory (the pause after a failed upgrade, the window that already ran) lives
-# in /var/lib/supavise-upgrade, owned by root. It must not sit in /var/lib/supavise, where every
-# supavise unit can write and could clear the pause. A custom state_dir puts it at <state_dir>-upgrade.
+# The service's own memory (the pause after a failed upgrade, the window that already ran, the
+# reboot that already happened) lives in /var/lib/supavise-upgrade, owned by root: it decides
+# whether this root service upgrades and reboots the node, so it must not sit in /var/lib/supavise,
+# where every supavise unit can write and could clear the pause. systemd creates the directory
+# and sets $STATE_DIRECTORY to it, and `supavise update run` takes its record from there and from
+# nowhere else. The path is not derived from config.toml (the supavise account can edit that file,
+# and a state_dir it chose would have root read and write a record anywhere) and does not follow a
+# custom state_dir; the command refuses to create a directory of its own.
 StateDirectory=supavise-upgrade
 StateDirectoryMode=0755
 ExecStart=/usr/local/bin/supavise update run

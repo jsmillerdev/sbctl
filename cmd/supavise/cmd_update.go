@@ -147,7 +147,11 @@ restart of supavise.service. A re-run of the installer keeps what this sets.
 			if err != nil {
 				return err
 			}
-			st, err := (update.Store{Path: update.StatePath(cfg.StateDir)}).Load()
+			store, err := update.PinnedStore(os.Getenv)
+			if err != nil {
+				return err
+			}
+			st, err := store.Load()
 			if err != nil {
 				return err
 			}
@@ -168,7 +172,8 @@ restart of supavise.service. A re-run of the installer keeps what this sets.
 	statusCmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
 
 	// ---- run (the timer's command) ----------------------------------------
-	var at string
+	var at, upRepo, upAPIBase string
+	var upKeyFiles []string
 	var dryRun bool
 	runCmd := &cobra.Command{
 		Use:   "run",
@@ -212,7 +217,12 @@ what a pass would do and changes nothing (no upgrade, no reboot, no record kept)
 				dryRun = true // a pretend clock must never start a real upgrade or reboot
 			}
 			log := newLogger(cfg).With("component", "update")
-			store := update.Store{Path: update.StatePath(cfg.StateDir)}
+			// The record's place is the unit's StateDirectory, never a path from config.toml, which the
+			// supavise account can edit.
+			store, err := update.PinnedStore(os.Getenv)
+			if err != nil {
+				return err
+			}
 			d := update.Deps{
 				Update:  cfg.Update,
 				Version: version,
@@ -227,13 +237,17 @@ what a pass would do and changes nothing (no upgrade, no reboot, no record kept)
 					return update.LatestStable(ctx, selfupdate.Options{})
 				},
 				Upgrade: func(ctx context.Context) (int, error) {
-					return update.RunUpgrade(ctx, exe, configPath, cmd.OutOrStdout(), cmd.ErrOrStderr())
+					return update.RunUpgrade(ctx, exe, configPath, cmd.OutOrStdout(), cmd.ErrOrStderr(), upgradeTestArgs(upRepo, upAPIBase, upKeyFiles)...)
 				},
 				RebootRequired: update.HostRebootRequired,
 				RebootBlocker: update.HostRebootBlocker(update.Gate{
-					Exe: exe, ConfigPath: cmp.Or(configPath, config.DefaultPath), User: installUser, StateDir: cfg.StateDir,
-					LockPath: update.HostLockPath}),
-				Reboot: update.HostReboot,
+					Exe: exe, ConfigPath: cmp.Or(configPath, config.DefaultPath), User: installUser, StateDir: cfg.StateDir}),
+				// Taken before the gate looks at the node and held through the reboot, so that no
+				// `supavise upgrade`, `rollback` or `self-update` starts in between.
+				LockHost:      func() (func(), error) { return update.LockHost(update.HostLockPath) },
+				Reboot:        update.HostReboot,
+				AwaitShutdown: awaitShutdown,
+				Notify:        unattendedNotifier(cfg, log),
 			}
 			if dryRun {
 				// A copy of the record in a scratch directory, so that the pass leaves the real one alone.
@@ -258,6 +272,7 @@ what a pass would do and changes nothing (no upgrade, no reboot, no record kept)
 					log.Info("dry_run", "would", "reboot the node (systemctl reboot)")
 					return nil
 				}
+				d.AwaitShutdown = nil
 				return update.Run(cmd.Context(), d)
 			}
 			// One pass at a time: the timer's service and a run by hand would otherwise read each
@@ -273,6 +288,13 @@ what a pass would do and changes nothing (no upgrade, no reboot, no record kept)
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "log what a pass would do (no upgrade, no reboot, no record kept)")
 	runCmd.Flags().StringVar(&at, "at", "", "pretend it is this time (RFC 3339); implies --dry-run (tests)")
 	_ = runCmd.Flags().MarkHidden("at")
+	// For tests against a local release server and a throwaway key: handed to `supavise upgrade`.
+	runCmd.Flags().StringVar(&upRepo, "repo", "", "GitHub repository to read releases from, owner/name (tests)")
+	runCmd.Flags().StringVar(&upAPIBase, "api-base", "", "GitHub API root (tests)")
+	runCmd.Flags().StringArrayVar(&upKeyFiles, "public-key-file", nil, "verify releases against this PEM public key instead of the built-in release keys (tests)")
+	for _, n := range []string{"repo", "api-base", "public-key-file"} {
+		_ = runCmd.Flags().MarkHidden(n)
+	}
 
 	// ---- resume ------------------------------------------------------------
 	resumeCmd := &cobra.Command{
@@ -283,14 +305,14 @@ the node stops trying until you have looked. After one that was rolled back (exi
 that release until a newer one exists. Check the node, then run this to lift either.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := loadConfig()
-			if err != nil {
-				return err
-			}
 			if os.Geteuid() != 0 {
 				return errors.New("run as root: sudo supavise update resume")
 			}
-			was, err := update.Resume(update.Store{Path: update.StatePath(cfg.StateDir)})
+			store, err := update.PinnedStore(os.Getenv)
+			if err != nil {
+				return err
+			}
+			was, err := update.Resume(store)
 			if err != nil {
 				return err
 			}
@@ -340,6 +362,36 @@ The installer calls it.`,
 	osCmd.Flags().BoolVar(&osEnable, "enable", false, "set up unattended security updates whatever config.toml says")
 	osCmd.Flags().BoolVar(&osDisable, "disable", false, "remove the Supavise configuration for them")
 	systemCmd.AddCommand(osCmd)
+}
+
+// upgradeTestArgs are the hidden flags of `update run` as arguments of `supavise upgrade`.
+func upgradeTestArgs(repo, apiBase string, keyFiles []string) []string {
+	var a []string
+	if repo != "" {
+		a = append(a, "--repo", repo)
+	}
+	if apiBase != "" {
+		a = append(a, "--api-base", apiBase)
+	}
+	for _, f := range keyFiles {
+		a = append(a, "--public-key-file", f)
+	}
+	return a
+}
+
+// shutdownGrace is how long `update run` waits, after `systemctl reboot` returned, for the machine
+// to stop the service. The shutdown ends the wait by cancelling the command's context (SIGTERM).
+const shutdownGrace = 10 * time.Minute
+
+// awaitShutdown keeps the host lock held across the gap between the reboot being queued and the
+// service being stopped by it.
+func awaitShutdown(ctx context.Context) {
+	t := time.NewTimer(shutdownGrace)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
 }
 
 // applyUpdateFlags puts the [update] flags that were given into u.
