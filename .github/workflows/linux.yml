@@ -501,3 +501,44 @@ jobs:
           name: branching-egress
           path: /tmp/supavise-egress-logs
           if-no-files-found: ignore
+
+  # Host convergence on a node that a v0.1.x-shaped release installed (the merge base with
+  # origin/main), with a project: `system install-units` on the new binary as the old driver runs it,
+  # the converged marker and `--check --json`, no unit restarted by it or by the daemon's restart
+  # (invariant I4), host_not_converged while the marker is behind, the ufw and mount steps, and the
+  # refusals of install.sh --join-token-file and install --aws-first-boot off EC2.
+  converge-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      # The whole history: the previous release is origin/main as this branch last merged it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build the previous release and this checkout
+        run: |
+          git fetch --no-tags origin main
+          base=$(git merge-base HEAD FETCH_HEAD)
+          git worktree add --detach /tmp/prev-tree "$base"
+          (cd /tmp/prev-tree && CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.1.1" -o /tmp/supavise-prev ./cmd/supavise)
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.2.0" -o /tmp/supavise-new ./cmd/supavise
+      - name: converge end to end
+        run: sudo LOG_DIR=/tmp/supavise-converge-logs SUPAVISE_BIN_PREV=/tmp/supavise-prev SUPAVISE_BIN=/tmp/supavise-new tests/linux/converge-e2e.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/supavise-converge-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: converge-e2e-${{ matrix.arch }}
+          path: /tmp/supavise-converge-logs
+          if-no-files-found: ignore
