@@ -236,9 +236,9 @@ A config check refuses `replicas.default = "all"` and any automatic failover mod
 - A replica of a project is on a node other than the project's home. Two replicas of one project never share a node.
 - `supavise projects delete` and `supavise backups restore` on the server leave a project's replicas where they are (see above).
 - A project homed on a follower can be failed over by nothing while its node is down.
-- Studio actions that need the project's own disk (restore, upgrade, the final backup of a delete) are refused for a project homed on another node. They run once the project is homed on the leader again.
-- A major Postgres upgrade of a project that has replicas is refused. Remove the replicas first.
-- A bump of the Postgres artifact has no replicas-first order. Replicas follow the primary's size and saved settings only through the restarts a resize or a settings save makes.
+- A project that is homed on a follower (after a failover) keeps serving, with some limits. A restore or an upgrade of it is refused until it is homed on the leader again, and a follower cannot roll out its upgrade because that writes the read-only registry. Its Postgres settings, role passwords and extensions are not applied from the leader, which answers that it does not support them; the settings of Auth and REST reach the home and restart both services. Its nightly base backup runs on the follower, which cannot record the backup's row in its read-only registry, so a backup list on the leader can lag behind what the archive holds. WAL archiving is unaffected.
+- A major Postgres upgrade of a project that has replicas is refused, and no option removes the replicas first: `supavise replicas rm` does. A release whose manifest says `wal_compat: false` makes `supavise upgrade` refuse a server that holds a primary while another server holds a standby of it on an older release; upgrade the servers that hold standbys first.
+- Replicas follow the primary's size and saved settings only through the restarts that a resize or a settings save makes. A resize or a save made while the project is paused restarts no replica; restart it by hand.
 - Logs have no per-replica routing in Studio.
 - An old v0.1.x stack that has only one Elastic IP loses its stable address when it is the node that gives up the service address. The survivor still reaches it, and a failback restores it.
 - Two independent deployments in one AWS account need distinct `ClusterName` values (see the deploy guide).
