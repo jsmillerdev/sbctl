@@ -13,7 +13,11 @@ import (
 )
 
 // Postgres is the production Registry.
-type Postgres struct{ pool *pgxpool.Pool }
+type Postgres struct {
+	pool *pgxpool.Pool
+	// readOnly is set by OpenReadOnly: the registry does not LISTEN and its pool refuses writes.
+	readOnly bool
+}
 
 var (
 	_ Registry = (*Postgres)(nil)
@@ -48,6 +52,31 @@ func OpenExisting(ctx context.Context, dsn string) (*Postgres, error) {
 	return &Postgres{pool: pool}, nil
 }
 
+// readOnlyPoll is how often a read-only registry looks at cluster.change_seq. A variable so
+// that tests can shorten it.
+var readOnlyPoll = time.Second
+
+// OpenReadOnly connects to the registry at dsn the way a standby's daemon must: it neither
+// migrates nor takes advisory locks, every connection is read-only (a write fails with
+// ErrReadOnly), and Subscribe polls cluster.change_seq once a second instead of LISTENing,
+// which Postgres refuses during recovery. It also works against a primary.
+func OpenReadOnly(ctx context.Context, dsn string) (*Postgres, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &Postgres{pool: pool, readOnly: true}, nil
+}
+
 // NewPostgres wraps an existing, already migrated pool.
 func NewPostgres(pool *pgxpool.Pool) *Postgres { return &Postgres{pool: pool} }
 
@@ -61,9 +90,15 @@ func mapErr(err error) error {
 		return ErrNotFound
 	}
 	var pe *pgconn.PgError
-	if errors.As(err, &pe) && (pe.Code == "23505" || pe.Code == "23503") {
-		// unique_violation, or foreign_key_violation (a project that still has branches)
-		return fmt.Errorf("%w: %s", ErrConflict, pe.ConstraintName)
+	if errors.As(err, &pe) {
+		switch pe.Code {
+		case "23505", "23503":
+			// unique_violation, or foreign_key_violation (a project that still has branches)
+			return fmt.Errorf("%w: %s", ErrConflict, pe.ConstraintName)
+		case "25006":
+			// read_only_sql_transaction: a standby, or a registry opened with OpenReadOnly
+			return fmt.Errorf("%w: %s", ErrReadOnly, pe.Message)
+		}
 	}
 	return err
 }
@@ -129,7 +164,7 @@ func (r *Postgres) DeleteOrganization(ctx context.Context, id int64) error {
 
 const projectCols = `ref, coalesce(org_id, 0), seq, name, region, engine, class, status, versions, limits, created_at, updated_at,
 	branch_id::text, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
-	notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress`
+	notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress, node_id`
 
 func scanProject(row pgx.Row) (*Project, error) {
 	var p Project
@@ -142,7 +177,7 @@ func scanProject(row pgx.Row) (*Project, error) {
 	if err := row.Scan(&p.Ref, &p.OrgID, &p.Seq, &p.Name, &p.Region, &p.Engine, &p.Class, &p.Status,
 		&versions, &limits, &p.CreatedAt, &p.UpdatedAt,
 		&bID, &bParent, &bName, &bGit, &bPersistent, &bData, &bExpires, &bDeletion,
-		&bNotify, &bState, &bDetail, &bMethod, &bReview, &bEgress); err != nil {
+		&bNotify, &bState, &bDetail, &bMethod, &bReview, &bEgress, &p.NodeID); err != nil {
 		return nil, mapErr(err)
 	}
 	if bParent != nil {
@@ -208,10 +243,11 @@ func (r *Postgres) CreateProject(ctx context.Context, p *Project) error {
 		got, err := scanProject(tx.QueryRow(ctx, `
 			insert into supavise.projects (ref, org_id, seq, name, region, engine, class, status, versions, limits,
 				branch_id, parent_ref, branch_name, git_branch, persistent, with_data, expires_at, deletion_scheduled_at,
-				notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress)
+				notify_url, branch_state, branch_detail, clone_method, review_requested_at, branch_egress, node_id)
 			values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-				$11::text::uuid, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) returning `+projectCols,
-			append([]any{p.Ref, nullOrg(p.OrgID), seq, p.Name, p.Region, p.Engine, p.Class, p.Status, versions, limits}, branchArgs(p.Branch)...)...))
+				$11::text::uuid, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+				coalesce($25::text, (select leader from supavise.cluster))) returning `+projectCols,
+			append(append([]any{p.Ref, nullOrg(p.OrgID), seq, p.Name, p.Region, p.Engine, p.Class, p.Status, versions, limits}, branchArgs(p.Branch)...), nullStr(p.NodeID))...))
 		if err != nil {
 			return err
 		}
@@ -537,8 +573,12 @@ func (r *Postgres) ListEvents(ctx context.Context, ref string, limit int) ([]Eve
 }
 
 // Subscribe LISTENs on supavise_changes with a dedicated connection. The channel closes
-// when ctx ends or the connection drops; consumers then resubscribe and reload.
+// when ctx ends or the connection drops; consumers then resubscribe and reload. A registry
+// opened with OpenReadOnly polls instead (see subscribePoll).
 func (r *Postgres) Subscribe(ctx context.Context) (<-chan Change, error) {
+	if r.readOnly {
+		return r.subscribePoll(ctx)
+	}
 	conn, err := r.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
