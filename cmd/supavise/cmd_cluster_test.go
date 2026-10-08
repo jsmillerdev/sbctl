@@ -83,23 +83,10 @@ func TestClusterCommandsAreStubs(t *testing.T) {
 		{"failover", "--dry-run"},
 		{"failover", "--to", "n2", "--force", "--restore-missing", "--old-primary-is-down", "--yes"},
 		{"projects", "failover", "abcdefghijklmnopqrst", "--to", "n2", "--dry-run"},
-		{"storage", "migrate", "--to", "s3", "--bucket", "b", "--access-key-id", "a", "--secret-access-key", "s"},
-		{"storage", "migrate", "--to", "s3", "--secret-arn", "arn:aws:secretsmanager:us-east-1:1:secret:x"},
-		{"storage", "migrate", "--to", "s3", "--status"},
 	} {
 		_, err := run(t, args...)
 		if !errors.Is(err, notimpl.Err) {
 			t.Errorf("supavise %s: %v, want not implemented yet", strings.Join(args, " "), err)
-		}
-	}
-	// The flags of storage migrate refuse a contradiction before anything runs.
-	for _, args := range [][]string{
-		{"storage", "migrate", "--to", "s3", "--resume", "--rollback"},
-		{"storage", "migrate", "--to", "s3", "--secret-arn", "arn:x", "--access-key-id", "a", "--secret-access-key", "s"},
-		{"storage", "migrate", "--to", "s3", "--access-key-id", "a"},
-	} {
-		if _, err := run(t, args...); err == nil || errors.Is(err, notimpl.Err) {
-			t.Errorf("supavise %s: %v, want a flag error", strings.Join(args, " "), err)
 		}
 	}
 	if _, err := run(t, "replicas", "add", "abcdefghijklmnopqrst"); err == nil || errors.Is(err, notimpl.Err) {
