@@ -689,21 +689,22 @@ func TestConfigureStandbyTwiceLeavesOneBlock(t *testing.T) {
 	}
 }
 
-// The leader records a base backup that its home took without writing the registry.
+// The leader records a base backup that its home took without writing the registry, with the size the
+// manifest says and not the size the report claims.
 func TestRecordBaseWritesTheRowAndTheEventOnce(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()
 	if err := e.reg.CreateProject(ctx, &registry.Project{Ref: testRef, Name: "demo"}); err != nil {
 		t.Fatal(err)
 	}
-	b := RemoteBase{ID: "20261008T120000Z-abcdef", Reason: ReasonFinal, Timeline: 3, StartLSN: "0/3000028", StopLSN: "0/3000120", SizeBytes: 4096}
+	b := RemoteBase{ID: "20261008T120000Z-abcdef", Reason: ReasonFinal, Timeline: 3, StartLSN: "0/3000028", StopLSN: "0/3000120", SizeBytes: 1 << 40}
 
 	// The backup must be complete in the store, and be the one the home reports.
 	if _, err := e.svc.RecordBase(ctx, testRef, b); err == nil || !strings.Contains(err.Error(), "not complete in the store") {
 		t.Fatalf("a backup with no manifest = %v", err)
 	}
 	started := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	m := &Manifest{Version: manifestVersion, ID: b.ID, Ref: testRef, Timeline: 3, StartLSN: "0/3000028", StopLSN: "0/3000999", StartTime: started}
+	m := &Manifest{Version: manifestVersion, ID: b.ID, Ref: testRef, Timeline: 3, StartLSN: "0/3000028", StopLSN: "0/3000999", StartTime: started, StoredBytes: 4096}
 	if err := e.svc.writeManifest(ctx, m); err != nil {
 		t.Fatal(err)
 	}
@@ -737,7 +738,7 @@ func TestRecordBaseWritesTheRowAndTheEventOnce(t *testing.T) {
 		t.Fatalf("%d rows after a repeated report", len(rows))
 	}
 	evs, _ := e.reg.ListEvents(ctx, testRef, 10)
-	if len(evs) != 1 || evs[0].Kind != "backup.completed" {
+	if len(evs) != 1 || evs[0].Kind != "backup.completed" || !strings.Contains(string(evs[0].Payload), `"stored_bytes":4096`) {
 		t.Fatalf("events = %+v", evs)
 	}
 	for _, bad := range []string{"", "a/b", "a b", "a\nb", "..", "20261008T120000Z-abcdef/..", "20261008T120000Z-ABCDEF", "b1"} {
