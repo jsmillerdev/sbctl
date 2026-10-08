@@ -66,6 +66,7 @@ type fakeNodes struct {
 	mu        sync.Mutex
 	inst      map[string]map[string]*fakeInstance // node -> identifier -> instance
 	down      map[string]bool                     // unreachable nodes
+	absent    map[string]bool                     // nodes that answer Ensure but report every instance absent
 	ensureErr error
 	removeErr map[string]error
 	calls     []string
@@ -75,7 +76,7 @@ type fakeNodes struct {
 }
 
 func newFakeNodes() *fakeNodes {
-	return &fakeNodes{inst: map[string]map[string]*fakeInstance{}, down: map[string]bool{}, removeErr: map[string]error{}}
+	return &fakeNodes{inst: map[string]map[string]*fakeInstance{}, down: map[string]bool{}, absent: map[string]bool{}, removeErr: map[string]error{}}
 }
 
 var _ interface {
@@ -139,7 +140,7 @@ func (f *fakeNodes) Observe(_ context.Context, node, identifier string) (peerapi
 		return peerapi.InstanceStatus{}, fmt.Errorf("mesh: no session to node %s", node)
 	}
 	in := f.inst[node][identifier]
-	if in == nil {
+	if in == nil || f.absent[node] {
 		return peerapi.InstanceStatus{Identifier: identifier, Role: "absent", At: time.Now()}, nil
 	}
 	if in.stopAt != in.step && !(in.failAt == in.step && in.errCode != "") {

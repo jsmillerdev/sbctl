@@ -443,6 +443,36 @@ func TestHandleReportRecordsOnlyTheNodesOwnInstances(t *testing.T) {
 	}
 }
 
+// A node that answers every request and still reports the instance absent does not hold the
+// setup for ever: the step runs out of its allowance like any other, and the node is asked for the
+// instance again at most once a minute.
+func TestSetupFailsWhenTheNodeKeepsReportingTheInstanceAbsent(t *testing.T) {
+	e := newEnv(t)
+	if err := e.ctrl.SetupOn(e.ctx, refA, "n2"); err != nil {
+		t.Fatal(err)
+	}
+	e.tick(1)
+	id := e.replica(refA, "n2").Identifier
+	e.nodes.absent["n2"] = true
+	for range 12 {
+		e.clock.Advance(30 * time.Second)
+		e.tick(1)
+		if e.replica(refA, "n2").Status == registry.ReplicaInitError {
+			break
+		}
+	}
+	r := e.replica(refA, "n2")
+	if r.Status != registry.ReplicaInitError || r.InitError != FailInitiate {
+		t.Fatalf("row: %+v", r)
+	}
+	if got := e.nodes.callsMatching("ensure n2 " + id); got < 2 || got > 8 {
+		t.Fatalf("ensure calls: %d", got)
+	}
+	if e.alerts.count(alerts.KindReplicaUnhealthy, false) != 1 {
+		t.Fatalf("alerts: %+v", e.alerts.evs)
+	}
+}
+
 // A setup that stops moving is nudged: the node is asked for the instance again, which resumes a
 // setup a restart of its daemon interrupted, and not more often than every two minutes.
 func TestSetupNudgesAStalledStep(t *testing.T) {

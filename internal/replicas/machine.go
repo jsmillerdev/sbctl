@@ -296,22 +296,25 @@ func (c *Controller) watch(ctx context.Context, r *registry.Replica) {
 		c.failSetup(ctx, r, st.Error, st.Detail)
 		return
 	case st.Role == "absent":
-		// The node does not have the instance (it was wiped, or it never got it): ask again.
-		c.ensureAgain(ctx, r, time.Minute)
-		return
-	}
-	step := laterStep(r.InitStep, boundStep(st.Step))
-	if step != r.InitStep {
-		c.advance(ctx, r, step)
-		r.InitStep = step
-	}
-	if stepIndex(st.Step) >= stepIndex(StepDone) && st.PostgresUp && st.PostgRESTReady && st.InRecovery {
-		c.finish(ctx, r)
-		return
+		// The node does not have the instance (it was wiped, or it never got it): ask again. A node
+		// that keeps answering and keeps not having it runs out the step's allowance below.
+		if c.ensureAgain(ctx, r, time.Minute) {
+			return
+		}
+	default:
+		step := laterStep(r.InitStep, boundStep(st.Step))
+		if step != r.InitStep {
+			c.advance(ctx, r, step)
+			r.InitStep = step
+		}
+		if stepIndex(st.Step) >= stepIndex(StepDone) && st.PostgresUp && st.PostgRESTReady && st.InRecovery {
+			c.finish(ctx, r)
+			return
+		}
 	}
 	age := c.stepClock(r.Identifier, r.InitStep)
-	if age >= nudgeAfter {
-		c.ensureAgain(ctx, r, nudgeAfter)
+	if age >= nudgeAfter && c.ensureAgain(ctx, r, nudgeAfter) {
+		return
 	}
 	if age > c.stepTimeout(ctx, r) {
 		c.failSetup(ctx, r, failureFor(r.InitStep), fmt.Sprintf("no progress for %s at %s", age.Round(time.Second), r.InitStep))
@@ -325,16 +328,16 @@ const nudgeAfter = 2 * time.Minute
 // ensureAgain asks the node for the instance again. The node answers a repeated request with what
 // it has and resumes a setup that a restart of its daemon interrupted, so this is how an
 // instance the node lost comes back and how a setup that stopped moving is nudged. gap is the
-// shortest time since the last request.
-func (c *Controller) ensureAgain(ctx context.Context, r *registry.Replica, gap time.Duration) {
+// shortest time since the last request. It reports whether the setup failed.
+func (c *Controller) ensureAgain(ctx context.Context, r *registry.Replica, gap time.Duration) (failed bool) {
 	if !c.due(r.Identifier, "recreate") {
-		return
+		return false
 	}
 	c.mu.Lock()
 	s := c.st(r.Identifier)
 	if c.now().Sub(s.reensured) < gap {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	s.reensured = c.now()
 	spec := peerapi.InstanceSpec{Identifier: r.Identifier, Ref: r.Ref, BackupID: s.backupID}
@@ -342,14 +345,15 @@ func (c *Controller) ensureAgain(ctx context.Context, r *registry.Replica, gap t
 	spec.Epoch, _ = c.leader()
 	st, err := c.o.Ops.Ensure(ctx, r.NodeID, spec)
 	if err != nil {
-		c.stepError(ctx, r, "recreate", fmt.Errorf("ask %s for the instance again: %w", r.NodeID, err), terminal(err))
-		return
+		return c.stepError(ctx, r, "recreate", fmt.Errorf("ask %s for the instance again: %w", r.NodeID, err), terminal(err))
 	}
 	c.worked(r.Identifier, "recreate")
 	c.observed(r.Identifier, st)
 	if st.Error != "" {
 		c.failSetup(ctx, r, st.Error, st.Detail)
+		return true
 	}
+	return false
 }
 
 // finish does the leader's part of the last step, the Supavisor tenant, and marks the replica
@@ -391,13 +395,14 @@ func (c *Controller) advance(ctx context.Context, r *registry.Replica, step stri
 }
 
 // stepError handles a failed call at a step: it is tried again later unless it can never work or
-// has failed for the whole retry window.
-func (c *Controller) stepError(ctx context.Context, r *registry.Replica, key string, err error, never bool) {
+// has failed for the whole retry window, in which case the setup fails and stepError reports it.
+func (c *Controller) stepError(ctx context.Context, r *registry.Replica, key string, err error, never bool) (failed bool) {
 	if c.failedCall(r.Identifier, key, err) || never {
 		c.failSetup(ctx, r, failureFor(r.InitStep), err.Error())
-		return
+		return true
 	}
 	c.log.Warn("replicas: setup step will be tried again", "identifier", r.Identifier, "step", r.InitStep, "error", err)
+	return false
 }
 
 // failSetup ends the setup: INIT_READ_REPLICA_FAILED with the step's code. code is a failure code
