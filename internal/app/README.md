@@ -55,6 +55,8 @@ is the daemon that `supavise.service` runs.
   serves the sockets nobody answers for a command-line process that waits for WAL
   (`supavise backups ...`, `projects delete`) while the daemon is down.
 
+- **Hooks.** The cluster features join `Serve` through hooks, one file each (`wire_mesh.go`, `wire_placement.go`, `wire_fleet.go`, `wire_replicas.go`, `wire_proxy.go`, `wire_failover.go`, `wire_storagemigrate.go`), run by `wire.go` in that order after the node opens and before the Management API and the edge proxy are built. A hook gets a `Wire`: the config, the logger, the open node, and the `api.Deps` and `proxy.Options` the two servers are built from, so it can set the collaborators it owns. It registers peer API handlers with `mesh.Handle`, starts background work with `w.Go` (the work runs in the daemon's group and its error stops the daemon), registers cleanups with `w.OnStop`, and passes what later hooks need with `Provide[T](w, v)`, read with `Get[T](w)`. `T` is the interface the consumer asks for, so a mesh is provided as `Provide[mesh.Mesh](w, m)`. Before any hook runs `Wire` already provides `cluster.Membership` (the founder node, leading at epoch 1) and `placement.Resolver` (over the registry). A hook that has nothing to do returns nil; a hook that is still a stub returns `notimpl.Err`, which `Serve` skips, so a node that does not use the cluster features starts as it always did.
+
 ## Limits
 
 - `Serve` does not supervise: a crashed project unit is systemd's to restart (`Restart=on-failure`)
