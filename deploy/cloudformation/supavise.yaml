@@ -234,6 +234,8 @@ Parameters:
       name. A replica server uses the name of the leader's stack (the leader's ClusterName output).
       Give each independent deployment in one AWS account its own name: stack names repeat across
       regions, and the failover permissions and the Storage role trust the name in every region.
+      Whoever may tag an instance role of the account (iam:TagRole) with this name, and may assume
+      roles, can reach the objects bucket and the fencing permissions of the cluster.
   Failover:
     Type: String
     Default: "off"
@@ -242,7 +244,9 @@ Parameters:
       "on" lets this server stop a peer server of the same cluster and move the service address to
       itself (automatic failover). It adds a policy to the instance role that allows
       ec2:StopInstances, ec2:AssociateAddress and ec2:DisassociateAddress on resources that carry
-      this cluster's tag, and three read-only EC2 describe calls. "off" adds nothing.
+      this cluster's tag, and three read-only EC2 describe calls. "off" adds nothing. A principal
+      that may tag an instance role of the account (iam:TagRole) can give it the cluster's tag, so
+      that permission is equivalent to these.
   PeerCidr1:
     Type: String
     Default: ""
@@ -1031,7 +1035,7 @@ Resources:
 
               step "installing packages"
               apt-get update -qq || fail "apt-get update"
-              apt-get install -y -qq curl ca-certificates openssl || fail "apt-get install"
+              apt-get install -y -qq xfsprogs curl ca-certificates openssl || fail "apt-get install"
               apt-get install -y -qq awscli || snap install aws-cli --classic || fail "cannot install the AWS CLI"
 
               step "downloading and verifying the installer"

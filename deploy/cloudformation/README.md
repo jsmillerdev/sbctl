@@ -27,6 +27,8 @@ Storage cannot use the instance role (the metadata service is denied to it). The
 
 The tag is what ties the servers of one cluster together, in every region: the fencing permissions cover the instances and addresses of the account that carry it, and the Storage role admits the roles that carry it. Stack names repeat across regions, so two independent deployments in one account that both keep the default (`supavise` in us-east-1 and in eu-west-1, say) share a cluster name, and a server with `Failover` on could stop the other deployment's instance. Set a distinct `ClusterName` for each.
 
+The same tag decides who may reach the objects bucket and the fencing permissions, so `iam:TagRole` on an instance role of the account is equivalent to both: a principal that may tag a role with the cluster name and may assume roles can assume `StorageRole` and take what `FencingPolicy` allows. Grant `iam:TagRole` on instance roles as narrowly as `sts:AssumeRole`.
+
 ## What the tests guard
 
 | Test | Guards |

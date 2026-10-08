@@ -510,6 +510,7 @@ func TestReplicaUserData(t *testing.T) {
 		last = i
 	}
 	for _, want := range []string{
+		"apt-get install -y -qq xfsprogs ", // install.sh --aws-first-boot formats the data volume
 		"--aws-first-boot", "--join-token-file /root/join-token", "--firewall none",
 		"> /root/join-token)",       // the secret goes to the file, never to the log
 		"umask 077",                 // root-only
