@@ -325,7 +325,10 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 				return "", nil
 			}
 			setStatus(statusAfter(begin.Status))
-			return "", hold.without(ctx, func() error { return o.ensureTenant(ctx, ref) })
+			err := hold.without(ctx, func() error { return o.ensureTenant(ctx, ref) })
+			// The lock is held again: the project is in the move again, unless a pause or a delete got in.
+			o.restarting(ctx, ref)
+			return "", err
 		}); err != nil {
 			return err
 		}
@@ -349,6 +352,19 @@ func (o *Orchestrator) projectSteps(ctx context.Context, j *journal, run *projec
 	}
 	o.settle(ctx, ref, statusAfter(begin.Status))
 	return nil
+}
+
+// restarting shows the project as moving again after the registration with the shared services, which
+// ran with the project active and its lock let go. A project that something else changed meanwhile (a
+// pause, say) keeps what that did.
+func (o *Orchestrator) restarting(ctx context.Context, ref string) {
+	st := o.store()
+	if p, err := st.GetProject(ctx, ref); err != nil || !movable(p.Status) {
+		return
+	}
+	if err := st.SetProjectStatus(ctx, ref, registry.StatusRestarting); err != nil {
+		o.d.Log.Warn("could not set the project's status", "ref", ref, "status", registry.StatusRestarting, "error", err)
+	}
 }
 
 // settle gives the project the status the move ends with, unless something else changed it while the
@@ -441,14 +457,22 @@ func (o *Orchestrator) promoteReplica(ctx context.Context, node registry.Node, i
 		// The node waits for the position before it writes anything (promote.ok comes after the
 		// wait), so this answer says the same as the wait above: nothing was promoted.
 		return "", &abortError{cause: fmt.Errorf("%w: %s on %s: %v", ErrReplayBehind, identifier, node.Name, err)}
-	case a.WaitLSN != "" && refusedByTheNode(err) && !errors.Is(err, cluster.ErrNotLeader):
+	case a.WaitLSN != "" && refusedByTheNode(err) && !errors.Is(err, cluster.ErrNotLeader) && o.stillStandby(ctx, node.ID, identifier):
 		// A refusal is an answer before the node changed anything (the project is not homed there, the
 		// node is fenced, the cluster is no standby): the old primary, stopped for this switchover, starts
 		// again. A node that does not take this leader for the leader is not asked to settle it: the
-		// leadership may be what is in doubt.
+		// leadership may be what is in doubt. The same answers can come after pg_promote ran (the restart
+		// on the canonical port can fail with an invalid state), so the instance is looked at: the move is
+		// undone only while it is a standby that is up, and any other look leaves the old primary stopped.
 		return "", &abortError{cause: fmt.Errorf("promoting %s on %s was refused, so nothing was promoted: %w", identifier, node.Name, err)}
 	}
 	return "", fmt.Errorf("promoting %s on %s: %w", identifier, node.Name, err)
+}
+
+// stillStandby reports whether the instance is up and in recovery, which a promotion that ran is not.
+func (o *Orchestrator) stillStandby(ctx context.Context, node, identifier string) bool {
+	obs, err := o.d.Instances.Observe(ctx, node, identifier)
+	return err == nil && obs.PostgresUp && obs.InRecovery
 }
 
 // whileTheNodeLearnsWhoLeads runs a call to another node and repeats it while the node refuses it
@@ -481,21 +505,29 @@ func notYetLeader(err error) bool {
 
 // undoSwitchover puts a switchover back that stopped before the promotion: the old primary starts
 // again, the shared services take the project back, and the project gets its status. The move ends
-// aborted. If the old primary does not start, the project is down and the move says so.
+// aborted. If the old primary does not start, the project is down and the move says so. A project that
+// was paused had its cluster stopped before the move and has it stopped after: only its status comes back.
 func (o *Orchestrator) undoSwitchover(ctx context.Context, j *journal, run *projectRun, begin projectBegin, abort *abortError, hold *lockHold) error {
 	ref := run.project.Ref
-	if err := o.d.Primaries.Start(ctx, run.from.ID, ref); err != nil {
-		_ = o.store().SetProjectStatus(ctx, ref, registry.StatusActiveUnhealthy)
-		return fmt.Errorf("%w; starting the old primary on %s again also failed: %v", abort.cause, run.from.Name, err)
+	paused := begin.Status == registry.StatusInactive
+	if !paused {
+		if err := o.d.Primaries.Start(ctx, run.from.ID, ref); err != nil {
+			_ = o.store().SetProjectStatus(ctx, ref, registry.StatusActiveUnhealthy)
+			return fmt.Errorf("%w; starting the old primary on %s again also failed: %v", abort.cause, run.from.Name, err)
+		}
 	}
 	// Active again first: the engine registers a project with the shared services only while it is.
 	_ = o.store().SetProjectStatus(ctx, ref, statusAfter(begin.Status))
-	if begin.Status != registry.StatusInactive && o.d.Fleet != nil {
+	if !paused && o.d.Fleet != nil {
 		if err := hold.without(ctx, func() error { return o.ensureTenant(ctx, ref) }); err != nil {
 			o.d.Log.Warn("could not register the project with the shared services again", "ref", ref, "error", err)
 		}
 	}
-	_ = j.record(ctx, "undo", "the old primary on "+run.from.Name+" runs again")
+	if paused {
+		_ = j.record(ctx, "undo", "the project stays paused on "+run.from.Name)
+	} else {
+		_ = j.record(ctx, "undo", "the old primary on "+run.from.Name+" runs again")
+	}
 	return &abortError{cause: abort.cause}
 }
 

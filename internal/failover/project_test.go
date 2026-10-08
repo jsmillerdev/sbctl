@@ -837,3 +837,83 @@ func TestAServerMoveRegistersEachProjectWithTheEngineWhileItIsActive(t *testing.
 		t.Fatalf("registered %v, skipped %v", eng.ensured, eng.skipped)
 	}
 }
+
+// A paused project had its cluster stopped before the move. A switchover that is undone leaves it so:
+// it is not started, and its status comes back.
+func TestAnAbortedSwitchoverOfAPausedProjectDoesNotStartIt(t *testing.T) {
+	w := newWorld(t)
+	must(t, w.reg.SetProjectStatus(w.ctx, refA, registry.StatusInactive))
+	w.prim["n1/"+refA] = &primState{}
+	w.replay[idAN2] = "0/1000000" // the standby is far behind the cluster's last checkpoint
+	o := w.orch()
+	mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+	if !errors.Is(err, ErrReplayBehind) || mv.State != registry.MoveAborted {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	w.assertNever("start n1/")
+	w.assertNever("fleet.ensure")
+	w.assertNever("promote")
+	if p := projectOf(t, w, refA); p.NodeID != "n1" || p.Status != registry.StatusInactive {
+		t.Fatalf("project: %+v", p)
+	}
+	if !hasStep(mv, "undo") {
+		t.Fatalf("steps %v", stepNames(mv))
+	}
+	// It moves once the standby has caught up.
+	w.replay[idAN2] = caughtUp(w.lsn[refA])
+	if mv, err := o.FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("a new try: %+v, %v", mv, err)
+	}
+}
+
+// The answers that count as a refusal also come after the node has promoted (the restart on the canonical
+// port fails with an invalid state, say). The old primary starts again only while the node's instance
+// still is a standby that is up; otherwise it stays down, because two primaries are worse.
+func TestARefusalAfterThePromotionRanDoesNotStartTheOldPrimary(t *testing.T) {
+	for name, tc := range map[string]struct {
+		setup  func(w *world)
+		undone bool
+	}{
+		"the instance is still a standby": {setup: func(w *world) { w.fail("promote n2/", fmt.Errorf("%w: refused", placement.ErrNotHome), -1) }, undone: true},
+		"the instance promoted": {setup: func(w *world) {
+			w.fail("promote-after n2/"+idAN2, fmt.Errorf("%w: restarting on the canonical port", lifecycle.ErrInvalidState), -1)
+		}},
+		"the instance cannot be looked at": {setup: func(w *world) {
+			w.fail("promote n2/", fmt.Errorf("%w: refused", placement.ErrNotHome), -1)
+			w.afterEvent("promote n2/", func() { w.down["n2"] = true }) // the node stops answering after the refusal
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWorld(t)
+			tc.setup(w)
+			mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA})
+			if err == nil {
+				t.Fatalf("move %+v", mv)
+			}
+			switch {
+			case tc.undone && (mv.State != registry.MoveAborted || !w.has("start n1/"+refA)):
+				t.Fatalf("move %+v, error %v\n%v", mv, err, w.snapshot())
+			case !tc.undone && (mv.State != registry.MoveFailed || w.has("start n1/")):
+				t.Fatalf("move %+v, error %v\n%v", mv, err, w.snapshot())
+			}
+		})
+	}
+}
+
+// The project is in the move for its whole length except while the shared services take it: after that it
+// shows RESTARTING again, so that what looks at the status and not at the lock still finds it moving.
+func TestTheProjectIsMovingAgainAfterTheSharedServicesTookIt(t *testing.T) {
+	w := newWorld(t)
+	var during, between registry.Status
+	w.afterEvent("fleet.ensure "+refA, func() { during = projectOf(t, w, refA).Status })
+	w.afterEvent("demote n1/", func() { between = projectOf(t, w, refA).Status })
+	if mv, err := w.orch().FailoverProject(w.ctx, ProjectOptions{Ref: refA}); err != nil || mv.State != registry.MoveDone {
+		t.Fatalf("move %+v, error %v", mv, err)
+	}
+	if during != registry.StatusActiveHealthy || between != registry.StatusRestarting {
+		t.Fatalf("status during the registration %s, after it %s", during, between)
+	}
+	if p := projectOf(t, w, refA); p.Status != registry.StatusActiveHealthy {
+		t.Fatalf("project: %+v", p)
+	}
+}
