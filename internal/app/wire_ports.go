@@ -21,7 +21,7 @@ import (
 // so a forgotten Provide is a feature that silently does nothing. The rule for a node that belongs to
 // a cluster is therefore that every port in clusterPorts is either provided or switched off on
 // purpose, with the reason, by Wire.Off. Wire.run checks it after the hooks ran and names each port that
-// is neither in the log, and TestEveryClusterPortIsProvidedOrOff fails the build.
+// is neither in the log, and TestEveryClusterPortIsProvidedOrOff fails for it.
 
 // What the backup service must be able to do for the cluster work is checked when the package builds,
 // not guessed at run time: a release whose service lacks one of these does not compile.
@@ -39,6 +39,9 @@ type clusterPort struct {
 	Has func(w *Wire) bool
 }
 
+// hasForwarders reports whether the mesh hook provided its forwarders, under whatever type it chose.
+func hasForwarders(w *Wire) bool { _, ok := providedAs[portHolder](w); return ok }
+
 func provided[T any](name string) clusterPort {
 	return clusterPort{Name: name, Has: func(w *Wire) bool { _, ok := Get[T](w); return ok }}
 }
@@ -46,31 +49,31 @@ func provided[T any](name string) clusterPort {
 // clusterPorts are the ports a node with a cluster identity must have connected. Each hook that
 // provides one is named in its entry.
 var clusterPorts = []clusterPort{
-	provided[mesh.Mesh]("mesh.Mesh"),                                                                     // wireMesh
-	provided[cluster.Membership]("cluster.Membership"),                                                   // wireMesh
-	provided[*cluster.Reporter]("cluster.Reporter"),                                                      // wireMesh; wirePlacement adds the node's observations
-	provided[*cluster.Reports]("cluster.Reports"),                                                        // wireMesh; wireReplicas subscribes to it
-	{Name: "mesh.Forwarders", Has: func(w *Wire) bool { _, ok := providedAs[portHolder](w); return ok }}, // wireMesh; a promotion takes the project's ports from it (wirePlacement)
-	provided[placement.Resolver]("placement.Resolver"),                                                   // wirePlacement
-	provided[placement.PlaneRouter]("placement.PlaneRouter"),                                             // wirePlacement
-	provided[placement.InstanceOps]("placement.InstanceOps"),                                             // wirePlacement
-	provided[placement.BackupOps]("placement.BackupOps"),                                                 // wirePlacement
-	provided[placement.Contribution]("placement.Contribution"),                                           // wirePlacement
-	provided[lifecycle.Timers]("lifecycle.Timers"),                                                       // wirePlacement: the node's own backup timers
-	provided[fleet.Fleet]("fleet.Fleet"),                                                                 // wireFleet
-	provided[fleet.PeerRefresher]("fleet.PeerRefresher"),                                                 // wireFleet
-	provided[replicas.Pooler]("replicas.Pooler"),                                                         // wireFleet
-	provided[replicas.Service]("replicas.Service"),                                                       // wireReplicas
-	provided[replicas.Remover]("replicas.Remover"),                                                       // wireReplicas
-	provided[replicas.ReportSink]("replicas.ReportSink"),                                                 // wireReplicas
-	provided[*proxy.CertRole]("proxy.CertRole"),                                                          // wireProxy
-	provided[failover.LocalPrimaries]("failover.LocalPrimaries"),                                         // wireFailover
-	provided[failover.Fleet]("failover.Fleet"),                                                           // wireFailover
-	provided[failover.LocalServices]("failover.LocalServices"),                                           // wireFailover
-	provided[failover.Locker]("failover.Locker"),                                                         // wireFailover
-	provided[failover.ExtraChecks]("failover.ExtraChecks"),                                               // wireFailover
-	provided[failover.Takeover]("failover.Takeover"),                                                     // wireFailover
-	provided[failover.Service]("failover.Service"),                                                       // wireFailover
+	provided[mesh.Mesh]("mesh.Mesh"),                             // wireMesh
+	provided[cluster.Membership]("cluster.Membership"),           // wireMesh
+	provided[*cluster.Reporter]("cluster.Reporter"),              // wireMesh; wirePlacement adds the node's observations
+	provided[*cluster.Reports]("cluster.Reports"),                // wireMesh; wireReplicas subscribes to it
+	{Name: "mesh.Forwarders", Has: hasForwarders},                // wireMesh; a promotion takes the project's ports from it (wirePlacement)
+	provided[placement.Resolver]("placement.Resolver"),           // wirePlacement
+	provided[placement.PlaneRouter]("placement.PlaneRouter"),     // wirePlacement
+	provided[placement.InstanceOps]("placement.InstanceOps"),     // wirePlacement
+	provided[placement.BackupOps]("placement.BackupOps"),         // wirePlacement
+	provided[placement.Contribution]("placement.Contribution"),   // wirePlacement
+	provided[lifecycle.Timers]("lifecycle.Timers"),               // wirePlacement: the node's own backup timers
+	provided[fleet.Fleet]("fleet.Fleet"),                         // wireFleet
+	provided[fleet.PeerRefresher]("fleet.PeerRefresher"),         // wireFleet
+	provided[replicas.Pooler]("replicas.Pooler"),                 // wireFleet
+	provided[replicas.Service]("replicas.Service"),               // wireReplicas
+	provided[replicas.Remover]("replicas.Remover"),               // wireReplicas
+	provided[replicas.ReportSink]("replicas.ReportSink"),         // wireReplicas
+	provided[*proxy.CertRole]("proxy.CertRole"),                  // wireProxy
+	provided[failover.LocalPrimaries]("failover.LocalPrimaries"), // wireFailover
+	provided[failover.Fleet]("failover.Fleet"),                   // wireFailover
+	provided[failover.LocalServices]("failover.LocalServices"),   // wireFailover
+	provided[failover.Locker]("failover.Locker"),                 // wireFailover
+	provided[failover.ExtraChecks]("failover.ExtraChecks"),       // wireFailover
+	provided[failover.Takeover]("failover.Takeover"),             // wireFailover
+	provided[failover.Service]("failover.Service"),               // wireFailover
 }
 
 // apiPorts are the fields of api.Deps that a node with a cluster identity must set, by the
@@ -86,9 +89,8 @@ var apiPorts = []struct {
 }
 
 // Off records that a feature of the cluster work is not running on this node, and why, and says so in
-// the log. It is how a hook declines a port without hiding it: a reason that a person reading the log
-// can act on, such as "the registry has no connection pool". Off after Provide of the same name
-// keeps the reason, which the log then shows next to a working feature; call it only for what does not run.
+// the log. It is how a hook declines a port without hiding it: the reason is one that a person reading
+// the log can act on, such as "the shared services run under systemd". Call it only for what does not run.
 func (w *Wire) Off(feature, reason string) {
 	if w.off == nil {
 		w.off = map[string]string{}
