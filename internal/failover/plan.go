@@ -405,6 +405,8 @@ func (o *Orchestrator) planServer(ctx context.Context, opts ServerOptions) (*Pla
 			pl.Checks = append(pl.Checks, hard(fail("target node", err.Error())))
 			return pl, run, nil
 		}
+	} else if toNode, err = o.node(ctx, toNode.ID); err != nil { // the registry's word, not the daemon's last look
+		return nil, nil, err
 	}
 	leader, ok := o.d.Members.Leader()
 	if !ok {

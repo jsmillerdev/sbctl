@@ -81,7 +81,9 @@ func (o *Orchestrator) serverProject(ctx context.Context, j *journal, run *serve
 	if err := j.step(ctx, pfx+"promote", func() (string, error) {
 		a := promoteArgs{Epoch: run.epoch, Timeout: timeout, Drain: !run.planned || ch.Restore}
 		if run.planned && !ch.Restore {
-			a.WaitLSN = j.detail("stopped:" + ref)
+			if a.WaitLSN = j.detail("stopped:" + ref); a.WaitLSN == "" {
+				return "", errors.New("the old leader reported no final position for the project")
+			}
 		}
 		d, err := o.promoteReplica(ctx, to, identifier, a)
 		var abort *abortError

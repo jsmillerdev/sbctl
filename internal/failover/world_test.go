@@ -55,6 +55,7 @@ type world struct {
 	marker  *backup.LeaderMarker
 	markErr error
 
+	clock    int
 	provider *fakeProvider
 	steps    []registry.MoveStep // progress reported through the context
 }
@@ -353,11 +354,18 @@ func (w *world) deps() Deps {
 		Peers: (*worldPeers)(w), Leader: (*worldLeader)(w), Takeover: (*worldTakeover)(w), Replicas: (*worldReplicas)(w),
 		Marker: (*worldMarker)(w), Provider: w.provider,
 		Notify: func(_ context.Context, ev alerts.Event) { w.mu.Lock(); w.alerts = append(w.alerts, ev); w.mu.Unlock() },
-		Now: func() time.Time {
-			return time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC).Add(time.Duration(len(w.snapshot())) * time.Second)
-		},
-		Sleep: func(ctx context.Context, d time.Duration) error { return ctx.Err() },
+		Now:    w.now,
+		Sleep:  func(ctx context.Context, d time.Duration) error { return ctx.Err() },
 	}
+}
+
+// now is the world's clock: it moves one second at every look, so a loop that waits for a
+// deadline ends even though Sleep returns at once.
+func (w *world) now() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.clock++
+	return time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC).Add(time.Duration(w.clock) * time.Second)
 }
 
 func (w *world) orch(mut ...func(*Deps)) *Orchestrator {
@@ -390,8 +398,7 @@ func (g *gatedStore) gate(what string) error {
 	if !g.w.writable {
 		return fmt.Errorf("%s: %w", what, registry.ErrReadOnly)
 	}
-	g.w.log("registry.%s", what)
-	return nil
+	return g.w.do("registry.%s", what)
 }
 
 func (g *gatedStore) SetProjectStatus(ctx context.Context, ref string, s registry.Status) error {
@@ -428,9 +435,6 @@ func (g *gatedStore) SetMaintenance(ctx context.Context, m registry.Maintenance)
 
 func (g *gatedStore) SetProjectNode(ctx context.Context, ref, node string, epoch int64) error {
 	if err := g.gate(fmt.Sprintf("SetProjectNode %s %s %d", ref, node, epoch)); err != nil {
-		return err
-	}
-	if err := g.w.failing(fmt.Sprintf("registry.SetProjectNode %s", ref)); err != nil {
 		return err
 	}
 	return g.Memory.SetProjectNode(ctx, ref, node, epoch)
