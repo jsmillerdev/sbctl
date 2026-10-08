@@ -47,9 +47,13 @@ type IMDS struct {
 	now    func() time.Time
 	retry  *retrier
 
+	// mu guards the session token and is held across its round trip, so that callers share one.
 	mu      sync.Mutex
 	token   string
 	expires time.Time
+	// memoMu guards down and downAt. It is never held across a request: a call that has to fail at
+	// once does not wait behind a token fetch.
+	memoMu sync.Mutex
 	// down is the last failure to get any answer and downAt when it happened.
 	down   *unreachableError
 	downAt time.Time
@@ -81,28 +85,32 @@ func newIMDS(cfg Config, base string, attempts int) *IMDS {
 
 // Get returns the body of path, such as "/latest/meta-data/instance-id". A missing path is
 // ErrNotFound. A service that gave no answer is ErrIMDSUnreachable, and is not asked again for 30
-// seconds: the next reads fail at once with the same error.
+// seconds: the next reads fail at once with the same error, and so do the reads that were waiting
+// on the first one.
 func (m *IMDS) Get(ctx context.Context, path string) (string, error) {
 	if strings.EqualFold(m.getenv("AWS_EC2_METADATA_DISABLED"), "true") {
 		return "", fmt.Errorf("aws imds %s: %w", path, ErrIMDSDisabled)
 	}
-	if err := m.recall(path); err != nil {
-		return "", err
-	}
 	body, err := m.getWithRetries(ctx, path)
 	var down *unreachableError
-	if errors.As(err, &down) {
-		m.mu.Lock()
+	// The memo records the service's silence over a whole run of tries. It is not renewed by a call
+	// that was refused because of it, and a caller that gave up part way says nothing about the service.
+	if errors.As(err, &down) && !errors.Is(err, errRecalled) && ctx.Err() == nil {
+		m.memoMu.Lock()
 		m.down, m.downAt = down, m.now()
-		m.mu.Unlock()
+		m.memoMu.Unlock()
 	}
 	return body, err
 }
 
+// errRecalled marks the error of a call that was not made because the service had not answered a
+// short while ago.
+var errRecalled = errors.New("not asked: the service did not answer a short while ago")
+
 // recall returns the error for a service that failed to answer a short while ago, or nil.
 func (m *IMDS) recall(path string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.memoMu.Lock()
+	defer m.memoMu.Unlock()
 	if m.down == nil {
 		return nil
 	}
@@ -110,12 +118,17 @@ func (m *IMDS) recall(path string) error {
 	if ago < 0 || ago >= imdsDownMemo {
 		return nil
 	}
-	return fmt.Errorf("aws imds %s: %w (%s ago; not asked again for %s)", path, m.down, ago.Round(time.Second), (imdsDownMemo - ago).Round(time.Second))
+	return fmt.Errorf("aws imds %s: %w (%s ago; not asked again for %s): %w", path, m.down, ago.Round(time.Second), (imdsDownMemo - ago).Round(time.Second), errRecalled)
 }
 
 func (m *IMDS) getWithRetries(ctx context.Context, path string) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= m.retry.attempts; attempt++ {
+		// Looked at before every try: a caller that waited behind another one's fetch, or between
+		// two of its own tries, stops as soon as one of them has recorded the silence.
+		if err := m.recall(path); err != nil {
+			return "", err
+		}
 		if attempt > 1 {
 			if werr := m.retry.wait(ctx, attempt-1); werr != nil {
 				return "", fmt.Errorf("%w: %w", lastErr, werr)
@@ -169,6 +182,10 @@ func (m *IMDS) sessionToken(ctx context.Context) (string, error) {
 	defer m.mu.Unlock()
 	if m.token != "" && m.now().Before(m.expires) {
 		return m.token, nil
+	}
+	// A caller that queued for the lock while another one found the service silent does not ask again.
+	if err := m.recall("/latest/api/token"); err != nil {
+		return "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, m.base+"/latest/api/token", nil)
 	if err != nil {

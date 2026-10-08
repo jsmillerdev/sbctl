@@ -264,3 +264,81 @@ func TestIMDSUnreachableIsNotRememberedFromOtherFailures(t *testing.T) {
 		t.Errorf("after a 503 the service is asked again: %q, %v", id, err)
 	}
 }
+
+// A caller that gave up between two tries has seen one failure, which says nothing about the
+// service: the next caller asks it again.
+func TestIMDSUnreachableIsNotRememberedWhenTheCallerGivesUpBetweenTries(t *testing.T) {
+	url, connections := closedIMDS(t)
+	c := newClient(t, awsapi.Config{Endpoints: awsapi.Endpoints{IMDS: url}, Getenv: envOf(nil), MaxAttempts: 3, RetryBackoff: time.Millisecond})
+
+	callerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	awsapi.SetRetryHooks(c, func(ctx context.Context, _ time.Duration) error {
+		cancel() // the caller gives up while it waits for its second try
+		return ctx.Err()
+	}, nil)
+	if _, err := c.IMDS.InstanceID(callerCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("the cancelled call: %v", err)
+	}
+	asked := connections()
+
+	awsapi.SetRetryHooks(c, func(context.Context, time.Duration) error { return nil }, nil)
+	if _, err := c.IMDS.InstanceID(ctx); !errors.Is(err, awsapi.ErrIMDSUnreachable) {
+		t.Fatalf("the next call: %v", err)
+	}
+	if connections() <= asked {
+		t.Errorf("the next call did not ask the service: %d connections", connections())
+	}
+}
+
+type callerKey struct{}
+
+// Callers that waited for the same silent service stop once one of them has found it silent: they
+// do not each spend their own tries on it.
+func TestIMDSQueuedCallersStopWhenOneHasFoundTheServiceSilent(t *testing.T) {
+	url, connections := closedIMDS(t)
+	const slow, attempts = 4, 3
+	c := newClient(t, awsapi.Config{Endpoints: awsapi.Endpoints{IMDS: url}, Getenv: envOf(nil), MaxAttempts: attempts, RetryBackoff: time.Millisecond})
+
+	// The slow callers wait for the release after their first try; the fast one never waits.
+	release := make(chan struct{})
+	awsapi.SetRetryHooks(c, func(ctx context.Context, _ time.Duration) error {
+		if ctx.Value(callerKey{}) == "fast" {
+			return nil
+		}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}, nil)
+
+	errs := make(chan error, slow+1)
+	for i := 0; i < slow; i++ {
+		go func() {
+			_, err := c.IMDS.InstanceID(context.WithValue(ctx, callerKey{}, "slow"))
+			errs <- err
+		}()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for connections() < slow && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if connections() < slow {
+		t.Fatalf("%d connections: the slow callers did not each make a first try", connections())
+	}
+	if _, err := c.IMDS.InstanceID(context.WithValue(ctx, callerKey{}, "fast")); !errors.Is(err, awsapi.ErrIMDSUnreachable) {
+		t.Fatalf("the fast caller: %v", err)
+	}
+	asked := connections()
+	close(release)
+	for i := 0; i < slow; i++ {
+		if err := <-errs; !errors.Is(err, awsapi.ErrIMDSUnreachable) {
+			t.Errorf("a queued caller: %v", err)
+		}
+	}
+	if got := connections(); got != asked {
+		t.Errorf("the queued callers made %d more connections after the service was found silent", got-asked)
+	}
+}
