@@ -24,9 +24,14 @@ import (
 // backups (backup.BaseBackupEnsurer): it creates and watches the standbys, keeps the default
 // replicas and removes the ones that go. On a node with no cluster it only serves the registry,
 // which makes a setup request answer "No Supavise server is joined" and runs nothing; the Management
-// API is given the controller only on a node that belongs to a cluster and runs it, so a single server
-// answers as it always did and a node whose controller is off (the host is behind, or it cannot take
-// base backups) answers that replicas are not set up.
+// API is given nothing there, so a single server answers as it always did.
+//
+// A node that belongs to a cluster always gives the Management API its controller, because replica rows
+// can exist on it (they were made while the controller ran, and whether it runs is decided at each boot)
+// and a project delete or an in-place restore removes them through replicas.Remover first. When the
+// controller does not run (the host is behind, or the node cannot reach the others or take base
+// backups) the API is given replicasOff: it lists the replicas and removes them, which need no running
+// controller, and refuses a setup, an add or a restart with the reason.
 //
 // The reports that nodes send the leader (cluster.Reports) reach the controller through a subscription
 // made here: the mesh hook runs first and provides the store, this hook subscribes the sink the
@@ -53,23 +58,16 @@ func wireReplicas(ctx context.Context, w *Wire) error {
 	Provide[replicas.ReportSink](w, c)
 	clustered := w.clustered()
 	// Whether the controller runs here, and if not, why. A controller that is not running still takes a
-	// setup request and writes its row, which nothing then picks up, so a node whose controller is off
-	// does not give it to the Management API (Deps.Replicas stays nil and the API says replicas are not
-	// set up on this server).
-	hostReason, behind := hostBehind(w)
-	var why string
-	switch {
-	case behind:
-		why = hostReason
-	case o.Ops == nil || o.Backups == nil:
+	// setup request and writes its row, which nothing then picks up.
+	why, _ := hostBehind(w)
+	if why == "" && (o.Ops == nil || o.Backups == nil) {
 		why = fmt.Sprintf("this node cannot reach the replica nodes or take base backups (node operations: %v, base backups: %v)", o.Ops != nil, o.Backups != nil)
 	}
 	if clustered {
 		if why == "" {
-			// A typed nil in an interface field would read as a controller; c is not nil here.
 			w.API.Replicas = c
 		} else {
-			w.Off("api.Deps.Replicas", "the replica controller does not run on this node: "+why)
+			w.API.Replicas = replicasOff{Controller: c, why: why}
 		}
 		if r, ok := Get[placement.Resolver](w); ok {
 			w.API.Placement = r
@@ -85,16 +83,11 @@ func wireReplicas(ctx context.Context, w *Wire) error {
 			w.Off("replicas.ReportSink", "the mesh provided no report store; the controller learns what the replicas do by polling only")
 		}
 	}
-
-	switch {
-	case behind:
-		w.Off("replica controller", why)
-		return nil
-	case why != "":
+	if why != "" {
+		// A node that has joined others and cannot create replicas is a gap in the wiring the operator
+		// should hear about; a single server has nothing to run.
 		if clustered {
-			// A node that has joined others and cannot create replicas is a gap in the wiring the
-			// operator should hear about; a single server has nothing to run.
-			w.Off("replica controller", why)
+			w.Off("replica controller", why+"; the Management API lists and removes replicas but refuses to set one up")
 		}
 		return nil
 	}
@@ -109,6 +102,27 @@ func wireReplicas(ctx context.Context, w *Wire) error {
 	})
 	return nil
 }
+
+// replicasOff is the replica controller as the Management API gets it while the controller does not run
+// on this node. Setting up, adding and restarting a replica need the running controller and are refused
+// with the reason (a *replicas.UserError, which the API shows). Everything else is the controller's:
+// listing and the status and lag of the replicas that exist, and replicas.Remover (RemoveAll, RemoveOn),
+// which removes through placement.InstanceOps and leaves what it cannot reach for the controller to
+// retry (*replicas.PendingError). A project delete asks the Remover first, so it never drops the
+// replica rows of an instance that nothing then finds.
+type replicasOff struct {
+	*replicas.Controller
+	why string
+}
+
+func (r replicasOff) refusal() error {
+	return &replicas.UserError{Msg: "Read replicas are not available on this Supavise server: " + r.why + "."}
+}
+
+func (r replicasOff) Setup(context.Context, string, string) error   { return r.refusal() }
+func (r replicasOff) SetupOn(context.Context, string, string) error { return r.refusal() }
+func (r replicasOff) Remove(context.Context, string, string) error  { return r.refusal() }
+func (r replicasOff) Restart(context.Context, string, string) error { return r.refusal() }
 
 // reportIntake hands the reports that arrive at the leader to the replica controller. Reports.Put calls
 // its subscribers on the goroutine of the peer API request, and the controller reads the registry for

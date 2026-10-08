@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -195,8 +196,9 @@ func (s *blockingSink) HandleReport(_ context.Context, rep peerapi.Report) {
 }
 
 // On a node of a cluster that runs the controller the Management API is given it; on a single server it is
-// not, and neither is it on a node whose controller is off: a setup request there would leave a row that
-// nothing picks up.
+// given nothing. A cluster node whose controller is off is given the controller behind replicasOff: replica
+// rows can exist on it, and a project delete removes them through the Remover before the registry cascades
+// them away.
 func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(t *testing.T) {
 	w := testWire(t)
 	if err := wireReplicas(context.Background(), w); err != nil {
@@ -205,10 +207,13 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(
 	if w.API.Replicas != nil || w.API.Placement != nil {
 		t.Fatal("a single server's Management API got the controller")
 	}
+	if len(w.off) != 0 {
+		t.Fatalf("a single server switched features off: %v", w.off)
+	}
 
 	// A cluster node that cannot reach the replica nodes or take base backups runs no controller. The
-	// Management API still lists replicas (Placement) and answers a setup request that replicas are not
-	// set up.
+	// Management API still lists replicas (Placement) and has the Remover; a setup request is refused with
+	// the reason.
 	w2 := testWire(t)
 	Provide[mesh.Mesh](w2, stubMesh{})
 	Provide[placement.Resolver](w2, placement.RegistryResolver{Reg: w2.Node.Registry})
@@ -216,8 +221,8 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(
 	if err := wireReplicas(context.Background(), w2); err != nil {
 		t.Fatal(err)
 	}
-	if w2.API.Replicas != nil || w2.API.Placement == nil {
-		t.Fatalf("replicas %v, placement %v: the controller does not run, so the API takes no setup request", w2.API.Replicas, w2.API.Placement)
+	if w2.API.Replicas == nil || w2.API.Placement == nil {
+		t.Fatalf("replicas %v, placement %v: a cluster node gives the API both", w2.API.Replicas, w2.API.Placement)
 	}
 	var names []string
 	for _, r := range w2.runners {
@@ -226,13 +231,26 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(
 	if strings.Join(names, ",") != "replica report intake" {
 		t.Fatalf("runners %v: the controller needs node operations and base backups to run", names)
 	}
-	for _, feature := range []string{"replica controller", "api.Deps.Replicas"} {
-		if r, off := w2.offReason(feature); !off || !strings.Contains(r, "base backups") {
-			t.Fatalf("%s off: %q, %v", feature, r, off)
+	if r, off := w2.offReason("replica controller"); !off || !strings.Contains(r, "base backups") {
+		t.Fatalf("replica controller off: %q, %v", r, off)
+	}
+	if slices.Contains(w2.unaccounted(), "api.Deps.Replicas") {
+		t.Fatalf("api.Deps.Replicas unaccounted: %v", w2.unaccounted())
+	}
+	ctx := context.Background()
+	for name, call := range map[string]func() error{
+		"Setup":   func() error { return w2.API.Replicas.Setup(ctx, "r", "eu-west-1") },
+		"SetupOn": func() error { return w2.API.Replicas.SetupOn(ctx, "r", "n2") },
+		"Remove":  func() error { return w2.API.Replicas.Remove(ctx, "r", "x") },
+		"Restart": func() error { return w2.API.Replicas.Restart(ctx, "r", "x") },
+	} {
+		var ue *replicas.UserError
+		if err := call(); !errors.As(err, &ue) || !strings.Contains(ue.Msg, "base backups") {
+			t.Fatalf("%s on a node whose controller is off = %v, want a refusal that says why", name, err)
 		}
 	}
 
-	// With both, the controller runs and the Management API has it.
+	// With both, the controller runs and the Management API has it as it is.
 	w3 := testWire(t)
 	Provide[mesh.Mesh](w3, stubMesh{})
 	Provide[placement.Resolver](w3, placement.RegistryResolver{Reg: w3.Node.Registry})
@@ -242,12 +260,57 @@ func TestWireReplicasGivesTheManagementAPIItsControllerOnAClusterNodeThatRunsIt(
 	if err := wireReplicas(context.Background(), w3); err != nil {
 		t.Fatal(err)
 	}
-	if w3.API.Replicas == nil || w3.API.Placement == nil {
-		t.Fatal("a cluster node that runs the controller gave the Management API none")
+	if _, isController := w3.API.Replicas.(*replicas.Controller); !isController || w3.API.Placement == nil {
+		t.Fatalf("a cluster node that runs the controller gave the Management API %T", w3.API.Replicas)
 	}
 	_, controllerOff := w3.offReason("replica controller")
-	_, apiOff := w3.offReason("api.Deps.Replicas")
-	if !hasRunner(w3, "replicas") || controllerOff || apiOff {
+	if !hasRunner(w3, "replicas") || controllerOff {
 		t.Fatalf("runs the controller: %v, off: %v", hasRunner(w3, "replicas"), w3.off)
+	}
+}
+
+// A project delete and an in-place restore remove the replicas first, through the Remover the Management
+// API is given. A node whose controller is off must still give it, and it must reach the replica rows
+// the node holds: the instances that RemoveAll cannot reach stay as GOING_DOWN rows and the delete is
+// refused with a *replicas.PendingError, not carried out with the rows cascaded away.
+func TestAControllerThatIsOffStillRemovesTheReplicasOfAProject(t *testing.T) {
+	w := testWire(t)
+	Provide[mesh.Mesh](w, stubMesh{})
+	Provide[placement.Resolver](w, placement.RegistryResolver{Reg: w.Node.Registry})
+	Provide(w, cluster.NewReports())
+	if err := wireReplicas(context.Background(), w); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ref = "aaaaaaaaaaaaaaaaaaaa"
+	reg := w.Node.Registry
+	if err := reg.CreateProject(ctx, &registry.Project{Ref: ref, Name: "a", Class: "small", Status: registry.StatusActiveHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	n2 := &registry.Node{Name: "second", Region: "eu-west-1", State: registry.NodeActive}
+	if err := reg.CreateNode(ctx, n2); err != nil {
+		t.Fatal(err)
+	}
+	id := registry.ReplicaIdentifier(ref, "eu-west-1", "abc123")
+	if err := reg.CreateReplica(ctx, &registry.Replica{Identifier: id, Ref: ref, NodeID: n2.ID, Status: "ACTIVE_HEALTHY", Origin: registry.ReplicaManual}); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := w.API.Replicas.List(ctx, ref)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("List = %v, %v: a node whose controller is off still lists the replicas that exist", list, err)
+	}
+	rm, ok := w.API.Replicas.(replicas.Remover)
+	if !ok {
+		t.Fatalf("%T is not a replicas.Remover: a delete would not know there are replicas to remove", w.API.Replicas)
+	}
+	// No node operations here, so the instance cannot be reached.
+	var pending *replicas.PendingError
+	if err := rm.RemoveAll(ctx, ref); !errors.As(err, &pending) {
+		t.Fatalf("RemoveAll = %v, want a *replicas.PendingError: the instance is on a node this one cannot reach", err)
+	}
+	rows, err := reg.ListReplicas(ctx, ref)
+	if err != nil || len(rows) != 1 || rows[0].Status != "GOING_DOWN" {
+		t.Fatalf("replica rows after RemoveAll: %+v, %v: the row stays for the controller to retry", rows, err)
 	}
 }
