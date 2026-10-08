@@ -71,6 +71,10 @@ With `[replicas] default = "all"`, each pass writes a missing row (`origin = "de
 
 `RoomAdmitter` judges a replica as a create judges a project: `lifecycle.ComputeCapacity` over the projects homed on the node plus a stand-in for each replica already admitted there, against the node's memory budget (`[compute] overcommit`) and cores, and the node's free disk against 1.25 times the base backup plus 1 GiB. A resource that is not known skips its check. The daemon knows its own machine only (`internal/app/wire_replicas.go`), so a remote node's replica is judged by the node when it is asked to create it.
 
+## Command line
+
+`supavise replicas ls [ref] [--json]`, `add <ref> --region R [--node N]` and `rm <identifier>` (`cmd/supavise/cmd_replicas.go`) build a `Controller` over the registry with no node operations, so they only read and write rows; the daemon on the leader does the work, whether it was running when the row was written or not. `add` therefore does not judge capacity (the daemon does when it admits the replica) and `ls` takes lag from the snapshot file. On a node that follows, the registry is read-only and `add` and `rm` say to run on the leader.
+
 ## Wiring
 
 `internal/app/wire_replicas.go` builds the controller from what earlier hooks provide: `cluster.Membership`, `placement.InstanceOps`, `backup.BaseBackupEnsurer` (or the Management API's backup service when it implements it) and `replicas.Pooler`. It provides `replicas.Service`, `replicas.Remover` and `replicas.ReportSink`. It starts `Run` only when both `InstanceOps` and `BaseBackupEnsurer` exist; otherwise the service only reads and writes rows, and a node with no cluster answers a setup request with "No Supavise server is joined". A cluster of one node with no replica rows is looked at once a minute.
