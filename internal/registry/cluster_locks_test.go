@@ -164,3 +164,55 @@ func TestPostgresLegacyHandleSeesTheMigration(t *testing.T) {
 		t.Fatal("the handle still reads the legacy columns")
 	}
 }
+
+// SetProjectNode reads the target node's state under a share lock: a `node rm` that is committing
+// holds the row, the move waits for it and then sees the node left, instead of reading the old
+// state and putting the project on a node that no longer exists.
+func TestPostgresMoveWaitsForANodeThatIsLeaving(t *testing.T) {
+	dsn := os.Getenv("SUPAVISE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SUPAVISE_TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	r, err := Open(ctx, tempDatabase(t, dsn, "supavise_leaving"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.CreateNode(ctx, &Node{Name: "second", State: NodeActive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.CreateProject(ctx, &Project{Ref: refA, Name: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `update supavise.nodes set state = 'left' where id = 'n2'`); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.SetProjectNode(ctx, refA, "n2", 1) }()
+	select {
+	case err := <-done:
+		t.Fatalf("the move did not wait for the node row (it returned %v)", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrConflict) {
+			t.Fatalf("a move to a node that left: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the move never finished")
+	}
+	if p, _ := r.GetProject(ctx, refA); p.NodeID != "n1" {
+		t.Fatalf("the project moved to %s", p.NodeID)
+	}
+}

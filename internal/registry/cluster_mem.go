@@ -380,6 +380,24 @@ func (m *Memory) SetReplicaStatus(_ context.Context, identifier, status, initSte
 	return nil
 }
 
+func (m *Memory) SetReplicaStatusUnlessGoingDown(_ context.Context, identifier, status, initStep, initError string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.replicas[identifier]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if r.Status == string(StatusGoingDown) {
+		return false, nil
+	}
+	if r.Status != status || r.InitStep != initStep || r.InitError != initError {
+		r.Status, r.InitStep, r.InitError, r.UpdatedAt = status, initStep, initError, time.Now()
+		m.replicas[identifier] = r
+		m.notify("replicas", "update", identifier)
+	}
+	return true, nil
+}
+
 func (m *Memory) DeleteReplica(_ context.Context, identifier string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
