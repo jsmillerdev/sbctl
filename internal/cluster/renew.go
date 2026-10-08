@@ -36,6 +36,25 @@ type Renewer struct {
 	// Every is how often the certificate is looked at; zero is six hours. Grace is the wait after the
 	// serial shows; zero is ten seconds. Wait bounds the wait for the serial; zero is two minutes.
 	Every, Grace, Wait time.Duration
+	// Retry is the wait before the look that follows a failure (a request or its answer lost, a file that
+	// could not be written); zero is 30 seconds. It doubles with each failure in a row, up to ten
+	// minutes and never beyond Every.
+	Retry time.Duration
+}
+
+// maxRetry bounds the wait between looks after failures.
+const maxRetry = 10 * time.Minute
+
+// nextRetry is the wait after another failure: Retry, then twice the last wait, up to maxRetry.
+func (r *Renewer) nextRetry(last time.Duration) time.Duration {
+	first := r.Retry
+	if first <= 0 {
+		first = 30 * time.Second
+	}
+	if last <= 0 {
+		return first
+	}
+	return min(2*last, maxRetry)
 }
 
 func (r *Renewer) now() time.Time {
@@ -62,8 +81,6 @@ func (r *Renewer) Run(ctx context.Context) error {
 	if every <= 0 {
 		every = 6 * time.Hour
 	}
-	tick := time.NewTicker(every)
-	defer tick.Stop()
 	until := ""
 	if c := r.Store.Creds(); c != nil {
 		until = c.NotAfter.Format(time.RFC3339)
@@ -75,8 +92,15 @@ func (r *Renewer) Run(ctx context.Context) error {
 	} else if r.Log != nil {
 		r.Log.Info("the node certificate is renewed before it expires", "not_after", until)
 	}
+	var retry time.Duration
 	for {
-		if _, err := r.Once(ctx); err != nil && r.Log != nil {
+		_, err := r.Once(ctx)
+		// A failure is tried again soon, not at the next look: the leader records the serial of a new
+		// certificate before the node has it, so a request whose answer was lost leaves the node with a
+		// certificate its peers are about to refuse. A directory the daemon cannot write to and a node
+		// with no identity are not helped by trying sooner.
+		failed := err != nil && !errors.Is(err, ErrNoIdentity) && !errors.Is(err, ErrIdentityReadOnly)
+		if err != nil && r.Log != nil {
 			if errors.Is(err, ErrIdentityReadOnly) {
 				r.Log.Error("the node certificate is due and cannot be renewed", "error", err)
 			} else {
@@ -85,8 +109,11 @@ func (r *Renewer) Run(ctx context.Context) error {
 		}
 		// A renewal that could not write the file leaves the certificate in use ahead of the file.
 		if wrote, err := r.Store.Resync(); err != nil {
-			if r.Log != nil && !errors.Is(err, ErrNoIdentity) {
-				r.Log.Warn("the node certificate in use is not on disk yet; it is tried again later", "error", err)
+			if !errors.Is(err, ErrNoIdentity) {
+				failed = true
+				if r.Log != nil {
+					r.Log.Warn("the node certificate in use is not on disk yet; it is tried again later", "error", err)
+				}
 			}
 		} else if wrote {
 			if r.Log != nil {
@@ -96,10 +123,19 @@ func (r *Renewer) Run(ctx context.Context) error {
 				r.Blocked(nil)
 			}
 		}
+		wait := every
+		if failed {
+			retry = r.nextRetry(retry)
+			wait = min(retry, every)
+		} else {
+			retry = 0
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return nil
-		case <-tick.C:
+		case <-timer.C:
 		}
 	}
 }

@@ -127,6 +127,9 @@ func Rejoin(ctx context.Context, o RejoinOptions) (*RejoinResult, error) {
 			return nil, fmt.Errorf("cluster: writing %s: %w", p, err)
 		}
 	}
+	if err := markFollower(dir, creds.NodeID, addr, firstNonEmpty(resp.System.Leader, want), now()); err != nil {
+		return nil, fmt.Errorf("cluster: writing %s: %w", FollowerFile, err)
+	}
 	st := &JoinState{NodeID: creds.NodeID, Leader: addr, System: resp.System, At: now().UTC()}
 	if err := writeJSON(filepath.Join(dir, JoinStateFile), st); err != nil {
 		return nil, err
@@ -265,7 +268,7 @@ func forgetIdentity(configPath string) error {
 	var errs []error
 	for _, p := range []string{
 		filepath.Join(dir, config.NodeCertFile), filepath.Join(dir, config.NodeKeyFile), filepath.Join(dir, config.ClusterCAFile),
-		filepath.Join(dir, JoinStateFile), filepath.Join(config.ConfigDDir(configPath), config.ClusterConfigFile),
+		filepath.Join(dir, JoinStateFile), filepath.Join(dir, FollowerFile), filepath.Join(config.ConfigDDir(configPath), config.ClusterConfigFile),
 	} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err)

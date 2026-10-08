@@ -210,6 +210,22 @@ func clientTLS(creds func() *Credentials, want string, admit AdmitFunc, now func
 	}
 }
 
+// OneShotName is the server name (SNI) a command-line tool of a node puts in its handshake to say that
+// its session is for one question and is not the node's session to the peer: see OneShot.
+const OneShotName = "oneshot.supavise.invalid"
+
+// OneShot marks a client configuration as the one of a short call made by a tool that runs beside the
+// node's daemon (`supavise system converge` asking the leader for the cluster settings). The marker is
+// the server name, which a peer that does not know it ignores, so the call works against any release.
+// A peer that knows it serves the session and leaves its table of sessions alone: the node's daemon holds
+// the session the peer keeps, and a second one from the same node would displace it by the tie-break of
+// the table, or lose to it and be closed before the call is made.
+func OneShot(cfg *tls.Config) *tls.Config {
+	c := cfg.Clone()
+	c.ServerName = OneShotName
+	return c
+}
+
 // PinnedTLS is the configuration of a joiner, which has no certificate and does not yet know the
 // CA: it accepts the server when the root of the chain the server presents hashes to caFingerprint
 // (hex SHA-256 of the CA certificate, the pin in the join token) and the leaf chains to that root.

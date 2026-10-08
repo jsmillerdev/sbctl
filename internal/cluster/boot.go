@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -63,6 +66,10 @@ type Evidence struct {
 	Peers []PeerView
 	// Marker is the leader marker in the backup store; nil when none was written or the store did not answer.
 	Marker *backup.LeaderMarker
+	// Promoted is the epoch in this node's own promote.ok of the system cluster, which the failover
+	// procedure writes before it promotes the cluster: the node's own word that it was promoted for that
+	// epoch, from the one source that needs neither a peer nor the backup store. 0 when there is none.
+	Promoted int64
 }
 
 // Decide is the rule of 2.10.8 for a node that finds its system cluster to be a primary. It starts
@@ -73,8 +80,10 @@ type Evidence struct {
 // A source that names this node as leader at a higher epoch than the local record is a promotion that
 // the registry has not caught up with yet (the failover procedure wrote the marker and promoted the
 // cluster): the node leads at that epoch, and the claims of nodes that still name the old leader at the
-// old epoch are stale. A node that is a primary while the registry names another leader, and that no
-// source names, is a stale or accidental primary and does not start.
+// old epoch are stale. The node's own promote.ok is such a source, so a promotion made while the backup
+// store could not be written still starts as the leader it was made for. A node that is a primary while
+// the registry names another leader, and that no source names, is a stale or accidental primary and
+// does not start.
 func Decide(ev Evidence) BootDecision {
 	d := BootDecision{Role: RoleLeader, Joined: true, SelfID: ev.SelfID, Epoch: ev.Epoch, Leader: ev.SelfID}
 	fenced := func(epoch int64, leader, why string) BootDecision {
@@ -96,6 +105,9 @@ func Decide(ev Evidence) BootDecision {
 	}
 	if m := ev.Marker; m != nil && m.Leader != "" {
 		claims = append(claims, claim{"the leader marker in the backup store", m.Epoch, m.Leader})
+	}
+	if ev.Promoted > 0 {
+		claims = append(claims, claim{"this node's promote.ok", ev.Promoted, ev.SelfID})
 	}
 	raised := ev.Epoch
 	for _, c := range claims {
@@ -197,25 +209,79 @@ func DecideBoot(ctx context.Context, env BootEnv) (BootDecision, error) {
 	return d, nil
 }
 
+// Leadership is what LeadsHere found out about this server.
+type Leadership int
+
+const (
+	// LeadsNo: the server is not the leader of its cluster: it has no cluster identity, its system cluster
+	// is a standby or holds no primary's data, or the registry in it names another node.
+	LeadsNo Leadership = iota
+	// LeadsYes: the system cluster answers as a primary and the registry in it names this node.
+	LeadsYes
+	// LeadsUnknown: the database or the registry in it did not answer, and the system cluster's data could
+	// be a primary's. A caller that stops something on the strength of the answer treats this server as
+	// the leader.
+	LeadsUnknown
+)
+
+func (l Leadership) String() string {
+	switch l {
+	case LeadsYes:
+		return "leads"
+	case LeadsUnknown:
+		return "cannot tell"
+	}
+	return "does not lead"
+}
+
+// MayLead is true for a server that leads its cluster or might.
+func (l Leadership) MayLead() bool { return l != LeadsNo }
+
 // LeadsHere reports whether this server is the leader of its cluster as far as its own database says:
 // the system cluster answers as a primary within a few seconds and the registry in it names this node as
-// the leader. A server whose database is stopped, or is a standby, or names another leader, is not.
-func LeadsHere(ctx context.Context, configPath string, dsns []string) bool {
+// the leader. A server whose database is stopped does not lead when nothing there could be a primary's
+// (no data, or a standby's), and is LeadsUnknown otherwise: a leader whose database is slow or down is
+// still a leader.
+func LeadsHere(ctx context.Context, cfg *config.Config, configPath string, dsns []string) Leadership {
 	creds, err := LoadCredentials(config.ClusterDir(configPath))
 	if err != nil {
-		return false
+		return LeadsNo
+	}
+	unknown := LeadsNo
+	if mayHoldPrimary(cfg) {
+		unknown = LeadsUnknown
 	}
 	dsn, inRecovery, err := probeSystem(ctx, dsns, 3*time.Second)
-	if err != nil || inRecovery {
-		return false
+	if err != nil {
+		return unknown
+	}
+	if inRecovery {
+		return LeadsNo
 	}
 	reg, err := registry.OpenReadOnly(ctx, dsn)
 	if err != nil {
-		return false
+		return LeadsUnknown
 	}
 	defer reg.Close()
 	cl, err := reg.GetCluster(ctx)
-	return err == nil && cl.Leader == creds.NodeID
+	switch {
+	case err != nil:
+		return LeadsUnknown
+	case cl.Leader == creds.NodeID:
+		return LeadsYes
+	}
+	return LeadsNo
+}
+
+// mayHoldPrimary is false when the system cluster's data directory is missing or is a standby's, which
+// is all a stopped database can be told by. A directory that cannot be looked at may be a primary's.
+func mayHoldPrimary(cfg *config.Config) bool {
+	data := cfg.Paths().PostgresData(config.SystemRef)
+	if _, err := os.Stat(data); err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	_, err := os.Stat(filepath.Join(data, "standby.signal"))
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // probeSystem asks each candidate DSN whether its cluster is in recovery, retrying until wait ends.
@@ -312,6 +378,11 @@ func (e *BootEnv) gather(ctx context.Context, dsn string, creds *mesh.Credential
 		return Evidence{}, err
 	}
 	ev := Evidence{SelfID: creds.NodeID, Epoch: cl.Epoch, Leader: cl.Leader}
+	if b, err := os.ReadFile(e.Cfg.Paths().PromoteOK(config.SystemRef)); err == nil {
+		if n, err := backup.ParsePromoteOK(b); err == nil {
+			ev.Promoted = n
+		}
+	}
 	for _, n := range nodes {
 		if n.ID == creds.NodeID {
 			ev.Self = n

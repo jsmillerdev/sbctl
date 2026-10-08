@@ -54,6 +54,7 @@ type Options struct {
 	AnonReadTimeout time.Duration // 10 s: how long a caller with no certificate has to send its request
 	AnonLife        time.Duration // 2 min: how long its session may be open before it is closed once idle
 	AnonFirstStream time.Duration // 10 s: how long its session has to open its first stream
+	OneShotLife     time.Duration // 2 min: how long a node's short session (OneShot) may stay open
 	MaxAnonSessions int           // 32: sessions of callers with no certificate open at once
 	MaxAnonPerAddr  int           // 4: of which one address may hold this many
 	MaxShakesPerIP  int           // 16: TLS handshakes in flight from one address, any caller
@@ -87,7 +88,7 @@ func (o *Options) fill() {
 	}
 	for p, d := range map[*time.Duration]time.Duration{&o.PingEvery: 5 * time.Second, &o.Tick: 2 * time.Second,
 		&o.DialDelay: 3 * time.Second, &o.RevokeGrace: 10 * time.Second, &o.AnonReadTimeout: 10 * time.Second,
-		&o.AnonLife: 2 * time.Minute, &o.AnonFirstStream: 10 * time.Second} {
+		&o.AnonLife: 2 * time.Minute, &o.AnonFirstStream: 10 * time.Second, &o.OneShotLife: 2 * time.Minute} {
 		if *p <= 0 {
 			*p = d
 		}
@@ -110,6 +111,7 @@ type Manager struct {
 	rpcOnce sync.Once
 	anon    atomic.Int32 // sessions of callers with no certificate that are open
 	anonIP  perAddr      // of which each address holds so many
+	oneShot perAddr      // sessions of a node's command-line tools (OneShot), by node
 	shaking perAddr      // TLS handshakes in flight, by address
 
 	mu       sync.Mutex
@@ -577,6 +579,10 @@ func (m *Manager) accept(ctx context.Context, conn net.Conn) {
 		m.serveAnonymous(tc, ip)
 		return
 	}
+	if tc.ConnectionState().ServerName == OneShotName { // a tool of the node: its own session, not the node's
+		m.serveOneShot(tc, node)
+		return
+	}
 	sess, err := NewSession(tc, false)
 	if err != nil {
 		_ = conn.Close()
@@ -591,6 +597,30 @@ func remoteIP(c net.Conn) string {
 		return ""
 	}
 	return host
+}
+
+// maxOneShotPerNode is how many sessions of its command-line tools (OneShot) one node may hold at once.
+const maxOneShotPerNode = 4
+
+// serveOneShot serves a node's short call (OneShot) until its session ends. The node was admitted at the
+// handshake and its streams are judged as those of any session of the node, but the session is not kept
+// in the table, is not pinged, does not replace the one the node's daemon holds and ends after OneShotLife.
+func (m *Manager) serveOneShot(conn net.Conn, node string) {
+	if !m.oneShot.take(node, maxOneShotPerNode) {
+		m.o.Log.Debug("mesh: too many short sessions from one node", "node", node)
+		_ = conn.Close()
+		return
+	}
+	defer m.oneShot.drop(node)
+	sess, err := NewSession(conn, false)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	// A short call is short: the session is not in the table, so the sweep that closes the sessions of a
+	// node the registry stopped admitting does not see it.
+	defer time.AfterFunc(m.o.OneShotLife, func() { _ = sess.Close() }).Stop()
+	m.serveStreams(sess, node, "")
 }
 
 // serveAnonymous serves the streams of a caller that presented no certificate until its session
@@ -769,6 +799,11 @@ func (m *Manager) serveStreams(sess Session, node, remote string) {
 	for {
 		st, err := sess.AcceptStream()
 		if err != nil {
+			// The far end is gone or the session ended. smux reports a remote close here and nowhere
+			// else (its CloseChan fires on a local Close or the keepalive timeout), so the session is
+			// closed now: watch then drops it from the table, and a node that restarted is not shut out
+			// by its own dead session when the tie-break prefers it.
+			_ = sess.Close()
 			return
 		}
 		if node == "" {
@@ -845,30 +880,20 @@ func (m *Manager) serveForward(st net.Conn, peer Peer, h Header) {
 	Pipe(st, c)
 }
 
-// pingLoop pings the peer every PingEvery: it measures the round trip, hands the answer to OnPing,
-// and closes a session whose pings fail three times in a row (the connection is up but the far
-// end's handler is not answering).
+// pingLoop pings an active peer every PingEvery: it measures the round trip, hands the answer to
+// OnPing, and closes a session whose pings fail three times in a row (the connection is up but the far
+// end's handler is not answering). A peer that is not active is not pinged. Its session is a joiner's or
+// a fenced node's, and what holds the far end there is `supavise node join` or `node rejoin`, a Client
+// that has no peer API to answer with; counting its silence would cut the session that carries the
+// standby's stream a few seconds into the join. The state is read at every round, so the first ping
+// follows the node's confirmation.
 func (m *Manager) pingLoop(pc *peerConn) {
 	fails := 0
 	for {
-		ctx, cancel := context.WithTimeout(m.runCtx(), 5*time.Second)
-		start := time.Now()
-		var p peerapi.Ping
-		err := m.callOn(ctx, pc, "GET", peerapi.PathPing, nil, &p)
-		cancel()
-		if err == nil || peerAnswered(err) { // a refusal still proves the far end answers
+		if m.peerOf(pc.node).State != registry.NodeActive {
 			fails = 0
-			if err == nil {
-				rtt := time.Since(start)
-				pc.rtt.Store(int64(rtt))
-				pc.lastPng.Store(&pingState{At: m.o.Now(), Ping: p})
-				if m.o.OnPing != nil {
-					m.o.OnPing(pc.node, p, rtt)
-				}
-			}
-		} else if fails++; fails >= 3 && !pc.sess.IsClosed() {
-			m.o.Log.Warn("mesh: closing a session whose pings fail", "node", pc.node, "error", err)
-			_ = pc.sess.Close()
+		} else {
+			fails = m.pingOnce(pc, fails)
 		}
 		select {
 		case <-pc.sess.CloseChan():
@@ -878,6 +903,31 @@ func (m *Manager) pingLoop(pc *peerConn) {
 		case <-time.After(m.o.PingEvery):
 		}
 	}
+}
+
+// pingOnce sends one ping and returns the number of failures in a row after it.
+func (m *Manager) pingOnce(pc *peerConn, fails int) int {
+	ctx, cancel := context.WithTimeout(m.runCtx(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	var p peerapi.Ping
+	err := m.callOn(ctx, pc, "GET", peerapi.PathPing, nil, &p)
+	if err == nil || peerAnswered(err) { // a refusal still proves the far end answers
+		if err == nil {
+			rtt := time.Since(start)
+			pc.rtt.Store(int64(rtt))
+			pc.lastPng.Store(&pingState{At: m.o.Now(), Ping: p})
+			if m.o.OnPing != nil {
+				m.o.OnPing(pc.node, p, rtt)
+			}
+		}
+		return 0
+	}
+	if fails++; fails >= 3 && !pc.sess.IsClosed() {
+		m.o.Log.Warn("mesh: closing a session whose pings fail", "node", pc.node, "error", err)
+		_ = pc.sess.Close()
+	}
+	return fails
 }
 
 // peerAnswered reports whether err is an answer of the far end, of any status.

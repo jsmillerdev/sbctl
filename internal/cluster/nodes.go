@@ -53,11 +53,21 @@ func EnsureFounder(ctx context.Context, reg registry.Registry, ca *CA, cfg *conf
 	return true, nil
 }
 
+// ReplicaRemover removes the replicas on a node: *replicas.Controller implements it (Remover.RemoveOn).
+// The code that runs inside the daemon passes it; `supavise node rm`, a separate process, has none and
+// leaves the replicas to the daemon's controller through the registry.
+type ReplicaRemover interface {
+	RemoveOn(ctx context.Context, node string) error
+}
+
 // RemoveOptions are the flags of `supavise node rm`.
 type RemoveOptions struct {
 	// Force deletes the node's replica rows at once instead of waiting for the replica controller to
 	// remove the instances: for a node that is unreachable.
 	Force bool
+	// Remover, when set, removes the node's replicas (RemoveOn) after the node is marked left. Without it
+	// the rows are marked GOING_DOWN, which the replica controller of the daemon removes.
+	Remover ReplicaRemover
 	// Wait bounds the wait for the replicas to go; zero is five minutes. Poll is how often the registry
 	// is looked at; zero is two seconds.
 	Wait, Poll time.Duration
@@ -65,11 +75,16 @@ type RemoveOptions struct {
 	Log func(format string, a ...any)
 }
 
-// RemoveNode takes a node out of the cluster, on the leader, through the registry: it refuses the
-// leader and a node that is the home of a project (fail the projects over first), sets the node's
-// replicas GOING_DOWN for the replica controller to remove, deletes the system replica row, waits for
-// the others to be gone, and sets the node left. A left node's certificate is refused at the next
-// handshake, and the node, which sees its own row in its copy of the registry, retires itself.
+// RemoveNode takes a node out of the cluster, on the leader, through the registry. It refuses the
+// leader and a node that is the home of a project (fail the projects over first). Then it sets the node
+// left, and only then deals with the replicas on it: while the node is active the replica controller's
+// default (`[replicas] default = "all"`) makes a replica again for every one that goes, and the removal
+// would never see the node empty. A left node's certificate is refused at the next handshake, and the
+// node, which sees its own row in its copy of the registry, retires itself, so its instances need no
+// removal: the controller drops what belongs to the pooler and deletes the rows of a node that has
+// left. The system replica row is deleted here, the others are marked GOING_DOWN (or handed to Remover,
+// or deleted with Force), and the call waits for them to go. A wait that ends first returns an error that
+// says the node is removed already and what is left; the same command, run again, waits for the rest.
 func RemoveNode(ctx context.Context, reg registry.Registry, id string, o RemoveOptions) error {
 	if o.Wait <= 0 {
 		o.Wait = 5 * time.Minute
@@ -92,44 +107,52 @@ func RemoveNode(ctx context.Context, reg registry.Registry, id string, o RemoveO
 	if err != nil {
 		return err
 	}
-	if n.State == registry.NodeLeft {
+	rs, err := reg.ListReplicasOn(ctx, n.ID)
+	if err != nil {
+		return err
+	}
+	if n.State == registry.NodeLeft && len(rs) == 0 {
 		return fmt.Errorf("node %s (%s) has been removed already", n.ID, n.Name)
 	}
 	if cl.Leader == n.ID {
 		return fmt.Errorf("node %s is the leader; fail over to another node first (`supavise failover`)", n.ID)
 	}
-	ps, err := reg.ListProjects(ctx)
-	if err != nil {
+	if err := refuseHomed(ctx, reg, n.ID); err != nil {
 		return err
 	}
-	var homed []string
-	for _, p := range ps {
-		if p.NodeID == n.ID {
-			homed = append(homed, p.Ref)
+	prev := n.State
+	if err := reg.SetNodeState(ctx, n.ID, registry.NodeLeft); err != nil {
+		return err
+	}
+	// A move of a project onto the node that committed between the check above and the state change is
+	// seen now; one that comes later is refused by the registry, which takes the node row for share and
+	// finds it left. The node is put back as it was, because a project homed on a left node would be
+	// stranded there, and the node, which reads its own row, would retire itself under it.
+	if err := refuseHomed(ctx, reg, n.ID); err != nil {
+		if rerr := reg.SetNodeState(ctx, n.ID, prev); rerr != nil {
+			return fmt.Errorf("%w; and node %s could not be put back to %s: %v", err, n.ID, prev, rerr)
 		}
-	}
-	if len(homed) > 0 {
-		return fmt.Errorf("node %s is the home of %d project(s) (%s); move them with `supavise projects failover` first", n.ID, len(homed), strings.Join(homed, ", "))
-	}
-	rs, err := reg.ListReplicasOn(ctx, n.ID)
-	if err != nil {
 		return err
 	}
 	for _, r := range rs {
-		if r.Origin == registry.ReplicaSystem {
+		if r.Origin == registry.ReplicaSystem || o.Force {
 			if err := reg.DeleteReplica(ctx, r.Identifier); err != nil && !errors.Is(err, registry.ErrNotFound) {
 				return err
 			}
 			continue
 		}
-		if o.Force {
-			if err := reg.DeleteReplica(ctx, r.Identifier); err != nil && !errors.Is(err, registry.ErrNotFound) {
-				return err
-			}
+		if o.Remover != nil {
 			continue
 		}
 		if err := reg.SetReplicaStatus(ctx, r.Identifier, string(registry.StatusGoingDown), r.InitStep, r.InitError); err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return err
+		}
+	}
+	if o.Remover != nil && !o.Force {
+		// A removal the remover could not finish stays GOING_DOWN for its controller to retry; the wait
+		// below sees it through.
+		if err := o.Remover.RemoveOn(ctx, n.ID); err != nil {
+			logf("removing the replicas on %s: %v", n.ID, err)
 		}
 	}
 	deadline := time.Now().Add(o.Wait)
@@ -139,14 +162,15 @@ func RemoveNode(ctx context.Context, reg registry.Registry, id string, o RemoveO
 			return err
 		}
 		if len(left) == 0 {
-			break
+			return nil
 		}
 		if !time.Now().Before(deadline) {
 			ids := make([]string, len(left))
 			for i, r := range left {
 				ids[i] = r.Identifier
 			}
-			return fmt.Errorf("the replicas %s are still being removed from node %s; try again later, or use --force if the node cannot be reached", strings.Join(ids, ", "), n.ID)
+			return fmt.Errorf("node %s is removed, but the replicas %s are still being cleaned up: the replica controller of the leader's daemon does that and tries again, "+
+				"or run this command with --force to delete their rows now", n.ID, strings.Join(ids, ", "))
 		}
 		logf("waiting for %d replica(s) on %s to be removed", len(left), n.ID)
 		select {
@@ -155,7 +179,24 @@ func RemoveNode(ctx context.Context, reg registry.Registry, id string, o RemoveO
 		case <-time.After(o.Poll):
 		}
 	}
-	return reg.SetNodeState(ctx, n.ID, registry.NodeLeft)
+}
+
+// refuseHomed is the error of a node that is the home of a project: the projects are moved first.
+func refuseHomed(ctx context.Context, reg registry.Registry, id string) error {
+	ps, err := reg.ListProjects(ctx)
+	if err != nil {
+		return err
+	}
+	var homed []string
+	for _, p := range ps {
+		if p.NodeID == id {
+			homed = append(homed, p.Ref)
+		}
+	}
+	if len(homed) > 0 {
+		return fmt.Errorf("node %s is the home of %d project(s) (%s); move them with `supavise projects failover` first", id, len(homed), strings.Join(homed, ", "))
+	}
+	return nil
 }
 
 // DNSRecord is one record `supavise node ls --dns` says the cluster still needs.

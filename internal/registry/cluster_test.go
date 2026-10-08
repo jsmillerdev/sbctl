@@ -290,6 +290,32 @@ func testCluster(t *testing.T, r Registry) {
 	if got, _ := r.GetReplica(ctx, idA); got.Status != ReplicaInitError || got.InitError != "3_read_replica_setup_failed" {
 		t.Fatalf("replica failure: %+v", got)
 	}
+	// A status write that must not undo a removal: it leaves a GOING_DOWN replica alone.
+	if ok, err := r.SetReplicaStatusUnlessGoingDown(ctx, idA, "ACTIVE_HEALTHY", ReplicaStepDone, ""); err != nil || !ok {
+		t.Fatalf("a write to a replica that is not going down: %v %v", ok, err)
+	}
+	seq6, _ := r.GetCluster(ctx)
+	if ok, err := r.SetReplicaStatusUnlessGoingDown(ctx, idA, "ACTIVE_HEALTHY", ReplicaStepDone, ""); err != nil || !ok {
+		t.Fatalf("the same values again: %v %v", ok, err)
+	}
+	if seq7, _ := r.GetCluster(ctx); seq7.ChangeSeq != seq6.ChangeSeq {
+		t.Fatal("a conditional write that changed nothing was written")
+	}
+	if err := r.SetReplicaStatus(ctx, idA, string(StatusGoingDown), ReplicaStepDone, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := r.SetReplicaStatusUnlessGoingDown(ctx, idA, "ACTIVE_HEALTHY", ReplicaStepDone, ""); err != nil || ok {
+		t.Fatalf("a write to a replica that is going down: %v %v", ok, err)
+	}
+	if got, _ := r.GetReplica(ctx, idA); got.Status != string(StatusGoingDown) {
+		t.Fatalf("the removal was overwritten: %+v", got)
+	}
+	if _, err := r.SetReplicaStatusUnlessGoingDown(ctx, "nope", "x", "y", "z"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("an unknown replica: %v", err)
+	}
+	if err := r.SetReplicaStatus(ctx, idA, ReplicaInitError, "3_initiated_read_replica_setup", "3_read_replica_setup_failed"); err != nil {
+		t.Fatal(err)
+	}
 	wantErr(t, "delete a node with replicas", r.DeleteNode(ctx, "n2"), ErrConflict)
 
 	// Opt-outs.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/failover/fenced"
 	"github.com/supavise/supavise/internal/registry"
 )
 
@@ -51,6 +53,13 @@ func TestDecide(t *testing.T) {
 		{"the registry names another leader and nothing names this node", ev(func(e *Evidence) { e.Leader = "n2" }), RoleFenced, 3, "names node n2"},
 		{"promoted: the marker names this node at a higher epoch",
 			ev(func(e *Evidence) { e.Leader = "n2"; e.Marker = marker(4, "n1") }), RoleLeader, 4, ""},
+		{"promoted: the node's own promote.ok names it, with no marker", ev(func(e *Evidence) { e.Leader = "n2"; e.Promoted = 4 }), RoleLeader, 4, ""},
+		{"an old promote.ok changes nothing", ev(func(e *Evidence) { e.Leader = "n2"; e.Promoted = 3 }), RoleFenced, 3, "names node n2"},
+		{"a peer at a higher epoch beats the node's promote.ok", ev(func(e *Evidence) {
+			e.Leader = "n2"
+			e.Promoted = 4
+			e.Peers = []PeerView{{"n3", 5, "n3"}}
+		}), RoleFenced, 5, "node n3"},
 		{"promoted: the old leader still claims the old epoch",
 			ev(func(e *Evidence) {
 				e.Leader = "n2"
@@ -371,6 +380,44 @@ func TestLiveStartsFencedWhenBootedFenced(t *testing.T) {
 	}
 }
 
+// A leader whose database does not answer is still a leader: LeadsHere says it cannot tell when the system
+// cluster's data could be a primary's, and says no only when nothing there could be.
+func TestLeadsHereWhenTheDatabaseDoesNotAnswer(t *testing.T) {
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	conf := filepath.Join(t.TempDir(), "etc", "config.toml")
+	ca, _ := NewCA(newSecrets(t))
+	if _, err := EnsureFounder(context.Background(), registry.NewMemory(), ca, cfg, conf, "v0.2.0", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// A context that has ended turns the probe's wait into one attempt.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	dsns := []string{"host=/nonexistent port=1 user=x connect_timeout=1"}
+	check := func(want Leadership, what string) {
+		t.Helper()
+		if got := LeadsHere(ctx, cfg, conf, dsns); got != want {
+			t.Errorf("%s: %v, want %v", what, got, want)
+		}
+	}
+	check(LeadsNo, "no system data")
+	data := cfg.Paths().PostgresData(config.SystemRef)
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	check(LeadsUnknown, "a data directory that could be a primary's")
+	if err := os.WriteFile(filepath.Join(data, "standby.signal"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check(LeadsNo, "a standby's data directory")
+	if got := LeadsHere(ctx, cfg, filepath.Join(t.TempDir(), "etc", "config.toml"), dsns); got != LeadsNo {
+		t.Errorf("no cluster identity: %v", got)
+	}
+	if LeadsNo.MayLead() || !LeadsYes.MayLead() || !LeadsUnknown.MayLead() {
+		t.Error("MayLead")
+	}
+}
+
 // ---- removal ----
 
 func TestRemoveNode(t *testing.T) {
@@ -415,20 +462,42 @@ func TestRemoveNode(t *testing.T) {
 		t.Fatalf("removing a node that homes a project: %v", err)
 	}
 
+	// A project that moves onto the node between the check and the state change is not left on a node that
+	// is left: the node is put back, and nothing of its replicas is touched.
+	race := &movesInFirst{Registry: newReg(), ref: "bbbbbbbbbbbbbbbbbbbb", node: "n3", epoch: 1}
+	if err := RemoveNode(ctx, race, "n3", RemoveOptions{}); err == nil || !strings.Contains(err.Error(), "bbbbbbbbbbbbbbbbbbbb") {
+		t.Fatalf("a project moved onto the node meanwhile: %v", err)
+	}
+	if n, _ := race.GetNode(ctx, "n3"); n.State != registry.NodeActive {
+		t.Fatalf("the node is %s although a project was homed on it", n.State)
+	}
+	if p, _ := race.GetProject(ctx, "bbbbbbbbbbbbbbbbbbbb"); p == nil || p.NodeID != "n3" {
+		t.Fatalf("the project %+v", p)
+	}
+
 	// The replica controller removes the user replica while the removal waits; the system replica row goes at once.
+	// The node has left by the time the replica is marked: the default reconciler would make it again
+	// on a node that is active.
+	leftWhenMarked := make(chan bool, 1)
 	go func() {
 		for range 200 {
 			time.Sleep(10 * time.Millisecond)
 			if r, err := reg.GetReplica(ctx, "aaaaaaaaaaaaaaaaaaaa-rr-local-rep001"); err == nil && r.Status == string(registry.StatusGoingDown) {
+				n, _ := reg.GetNode(ctx, "n2")
+				leftWhenMarked <- n.State == registry.NodeLeft
 				_ = reg.DeleteReplica(ctx, r.Identifier)
 				return
 			}
 		}
+		leftWhenMarked <- false
 	}()
 	var waited []string
 	err := RemoveNode(ctx, reg, "n2", RemoveOptions{Wait: 5 * time.Second, Poll: 10 * time.Millisecond, Log: func(f string, a ...any) { waited = append(waited, f) }})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !<-leftWhenMarked {
+		t.Error("the replica was marked going down before the node left")
 	}
 	if n, _ := reg.GetNode(ctx, "n2"); n.State != registry.NodeLeft {
 		t.Fatalf("state %s", n.State)
@@ -443,22 +512,91 @@ func TestRemoveNode(t *testing.T) {
 		t.Fatalf("removing twice: %v", err)
 	}
 
-	// Nobody removes the replica: the wait ends with an error that names it, and the node stays.
+	// Nobody removes the replica: the wait ends with an error that names it and says the node is gone
+	// already. The same command, run again, finishes with --force.
 	reg = newReg()
 	err = RemoveNode(ctx, reg, "n2", RemoveOptions{Wait: 50 * time.Millisecond, Poll: 10 * time.Millisecond})
-	if err == nil || !strings.Contains(err.Error(), "aaaaaaaaaaaaaaaaaaaa-rr-local-rep001") || !strings.Contains(err.Error(), "--force") {
+	if err == nil || !strings.Contains(err.Error(), "aaaaaaaaaaaaaaaaaaaa-rr-local-rep001") || !strings.Contains(err.Error(), "--force") || !strings.Contains(err.Error(), "is removed") {
 		t.Fatalf("a replica that stays: %v", err)
 	}
-	if n, _ := reg.GetNode(ctx, "n2"); n.State != registry.NodeActive {
-		t.Fatalf("the node left with a replica on it: %s", n.State)
+	if n, _ := reg.GetNode(ctx, "n2"); n.State != registry.NodeLeft {
+		t.Fatalf("the node is %s although its removal was asked for", n.State)
 	}
-	// --force does not wait.
+	if r, _ := reg.GetReplica(ctx, "aaaaaaaaaaaaaaaaaaaa-rr-local-rep001"); r == nil || r.Status != string(registry.StatusGoingDown) {
+		t.Fatalf("the replica is %+v", r)
+	}
+	if err := RemoveNode(ctx, reg, "n2", RemoveOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if rs, _ := reg.ListReplicasOn(ctx, "n2"); len(rs) != 0 {
+		t.Fatalf("replicas left after --force: %v", rs)
+	}
+	if err := RemoveNode(ctx, reg, "n2", RemoveOptions{}); err == nil || !strings.Contains(err.Error(), "removed already") {
+		t.Fatalf("removing after --force: %v", err)
+	}
+
+	// --force on a node that is active does not wait.
+	reg = newReg()
 	if err := RemoveNode(ctx, reg, "n2", RemoveOptions{Force: true}); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := reg.GetNode(ctx, "n2"); n.State != registry.NodeLeft {
 		t.Fatalf("state %s", n.State)
 	}
+
+	// Inside the daemon the controller removes the replicas: it is asked after the node left, and the
+	// rows it leaves GOING_DOWN are waited for.
+	reg = newReg()
+	rm := &fakeRemover{reg: reg}
+	if err := RemoveNode(ctx, reg, "n2", RemoveOptions{Remover: rm, Wait: time.Second, Poll: 10 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	if rm.calls != 1 || rm.node != "n2" || rm.state != registry.NodeLeft {
+		t.Fatalf("remover: %+v", rm)
+	}
+	if rs, _ := reg.ListReplicasOn(ctx, "n2"); len(rs) != 0 {
+		t.Fatalf("replicas left: %v", rs)
+	}
+}
+
+// movesInFirst has a project move onto a node just before the node is marked left: the move a `node rm`
+// can meet between its check and its state change.
+type movesInFirst struct {
+	registry.Registry
+	ref, node string
+	epoch     int64
+}
+
+func (m *movesInFirst) SetNodeState(ctx context.Context, id string, s registry.NodeState) error {
+	if s == registry.NodeLeft {
+		if err := m.Registry.SetProjectNode(ctx, m.ref, m.node, m.epoch); err != nil {
+			return err
+		}
+	}
+	return m.Registry.SetNodeState(ctx, id, s)
+}
+
+// fakeRemover removes the replicas on a node as the replica controller does, and notes the state the
+// node was in when it was asked.
+type fakeRemover struct {
+	reg   registry.Registry
+	calls int
+	node  string
+	state registry.NodeState
+}
+
+func (f *fakeRemover) RemoveOn(ctx context.Context, node string) error {
+	f.calls, f.node = f.calls+1, node
+	n, err := f.reg.GetNode(ctx, node)
+	if err != nil {
+		return err
+	}
+	f.state = n.State
+	rs, _ := f.reg.ListReplicasOn(ctx, node)
+	for _, r := range rs {
+		_ = f.reg.DeleteReplica(ctx, r.Identifier)
+	}
+	return nil
 }
 
 // ---- diverged data, fencing the local clusters ----
@@ -658,5 +796,304 @@ func TestPlainDSNDropsThePoolParameters(t *testing.T) {
 		if got := PlainDSN(in); got != want {
 			t.Errorf("PlainDSN(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// ---- Live: the failover procedure's side of the membership ----
+
+// The cooperative fence of the failover procedure writes fenced.json from outside the daemon's own
+// observation. The membership reports the node fenced as soon as it reads the record, tells the daemon
+// to restart in that role, and does so when the registry cannot be read either: the fence stops the
+// system cluster too.
+func TestLiveReportsFencedWhenTheRecordAppears(t *testing.T) {
+	ctx := context.Background()
+	l, reg, cfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	l.Refresh(ctx)
+	if l.Role() != RoleLeader {
+		t.Fatalf("role %s", l.Role())
+	}
+	if err := fenced.WriteNode(cfg.Paths(), fenced.Record{Epoch: 2, Leader: "n2", Reason: "a survivor fenced this node", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	l.Refresh(ctx)
+	if l.Role() != RoleFenced || l.IsLeader() {
+		t.Fatalf("role %s after the record appeared", l.Role())
+	}
+	if rec := l.Fenced(); rec == nil || rec.Leader != "n2" || rec.Epoch != 2 {
+		t.Fatalf("record %+v", rec)
+	}
+	select {
+	case <-l.Changed():
+	default:
+		t.Fatal("the daemon was not told to restart as a fenced node")
+	}
+
+	// The registry is down: the node is fenced all the same.
+	g, _, gcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	g.Refresh(ctx)
+	g.o.Reg = noCluster{reg}
+	if err := fenced.WriteNode(gcfg.Paths(), fenced.Record{Epoch: 2, Leader: "n2", Reason: "fenced", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	g.Refresh(ctx)
+	if g.Role() != RoleFenced {
+		t.Fatalf("role %s with the registry down", g.Role())
+	}
+
+	// The record of a removal is the retirement's own and does not fence a running leader.
+	r, _, rcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	if err := WriteFenced(rcfg, FencedRecord{Reason: RemovedReason, Removed: true, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	r.Refresh(ctx)
+	if r.Role() != RoleLeader {
+		t.Fatalf("role %s with the record of a removal", r.Role())
+	}
+
+	// A record that cannot be read does not make a leader a fenced node by itself.
+	h, _, hcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	if err := os.WriteFile(fenced.NodePath(hcfg.Paths()), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.Refresh(ctx)
+	if h.Role() != RoleLeader {
+		t.Fatalf("role %s with a damaged record", h.Role())
+	}
+}
+
+type noCluster struct{ registry.Registry }
+
+func (noCluster) GetCluster(context.Context) (*registry.Cluster, error) {
+	return nil, errors.New("the system cluster is stopped")
+}
+
+// The orchestrator's FenceOnHigherEpoch is asked while the membership still reports the leader, and its
+// verdict decides: a node it will not fence keeps leading, one it fences is fenced and the daemon told.
+func TestLiveAsksTheFencerBeforeItFencesALeader(t *testing.T) {
+	ctx := context.Background()
+	l, reg, cfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	n2, err := reg.GetNode(ctx, "n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2.PeerAddr = "10.0.0.2:7443"
+	if err := reg.UpdateNode(ctx, n2); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	var verdict bool
+	var ferr error
+	l.o.Fence = func(_ context.Context, source string, epoch int64, leader string) (bool, error) {
+		calls = append(calls, fmt.Sprintf("%s|%d|%s|leader=%v", source, epoch, leader, l.IsLeader()))
+		return verdict, ferr
+	}
+	var told []FencedRecord
+	l.o.OnFenced = func(r FencedRecord) { told = append(told, r) }
+	l.Refresh(ctx)
+
+	l.ObserveEpoch("n2", 5, "n2") // the fencer says no
+	if l.Role() != RoleLeader || len(told) != 0 || len(calls) != 1 {
+		t.Fatalf("role %s, told %d, calls %v", l.Role(), len(told), calls)
+	}
+	if calls[0] != "node n2|5|n2|leader=true" {
+		t.Fatalf("the fencer was asked %q", calls[0])
+	}
+	verdict, ferr = true, errors.New("a primary did not stop")
+	l.ObserveEpoch("n2", 5, "n2")
+	if l.Role() != RoleFenced || len(told) != 1 || len(calls) != 2 {
+		t.Fatalf("role %s, told %d, calls %v", l.Role(), len(told), calls)
+	}
+	if rec, err := ReadFenced(cfg); err != nil || rec == nil || rec.Leader != "n2" || len(rec.Peers) != 1 {
+		t.Fatalf("fenced.json: %+v, %v", rec, err)
+	}
+	l.ObserveEpoch("n3", 6, "n3")
+	if len(calls) != 2 || len(told) != 1 {
+		t.Fatal("fenced twice")
+	}
+
+	// The fencer writes its record first and stops the primaries after; the membership polls meanwhile
+	// and must neither report the node fenced nor tell the daemon to restart until the fencer is done.
+	// The record that stays is the observation's, with the peers' addresses, and the daemon is told once.
+	m, mreg, mcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	mn2, err := mreg.GetNode(ctx, "n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mn2.PeerAddr = "10.0.0.2:7443"
+	if err := mreg.UpdateNode(ctx, mn2); err != nil {
+		t.Fatal(err)
+	}
+	var mtold int
+	m.o.OnFenced = func(FencedRecord) { mtold++ }
+	m.o.Fence = func(context.Context, string, int64, string) (bool, error) {
+		if err := fenced.WriteNode(mcfg.Paths(), fenced.Record{Epoch: 5, Leader: "n2", Reason: "fenced", At: time.Now()}); err != nil {
+			t.Error(err)
+		}
+		m.Refresh(ctx) // the membership polls while the primaries stop
+		m.Refresh(ctx)
+		select {
+		case <-m.Changed():
+			t.Error("the daemon was told to restart while the fencer was still stopping the primaries")
+		default:
+		}
+		if m.Role() != RoleLeader || m.Fenced() != nil {
+			t.Errorf("the fencer's record was adopted while it ran: role %s", m.Role())
+		}
+		return true, nil
+	}
+	m.Refresh(ctx)
+	m.ObserveEpoch("n2", 5, "n2")
+	if m.Role() != RoleFenced || mtold != 1 {
+		t.Fatalf("role %s, told %d", m.Role(), mtold)
+	}
+	select {
+	case <-m.Changed():
+	default:
+		t.Fatal("the daemon was not told to restart once the fencer was done")
+	}
+	if rec, err := ReadFenced(mcfg); err != nil || rec == nil || rec.Peers["n2"] != "10.0.0.2:7443" {
+		t.Fatalf("fenced.json after the fence: %+v, %v", rec, err)
+	}
+}
+
+// A record that the failover wrote has no peers' addresses, and `node rejoin` needs the leader's: the
+// membership adds them when it adopts the record, and leaves a record that has some alone.
+func TestLiveAddsThePeersToARecordThatHasNone(t *testing.T) {
+	ctx := context.Background()
+	l, reg, cfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	n2, err := reg.GetNode(ctx, "n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2.PeerAddr = "10.0.0.2:7443"
+	if err := reg.UpdateNode(ctx, n2); err != nil {
+		t.Fatal(err)
+	}
+	l.Refresh(ctx)
+	if err := fenced.WriteNode(cfg.Paths(), fenced.Record{Epoch: 2, Leader: "n2", Reason: "a survivor fenced this node", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	l.Refresh(ctx)
+	rec, err := ReadFenced(cfg)
+	if err != nil || rec == nil || rec.Leader != "n2" || rec.Epoch != 2 || rec.Reason != "a survivor fenced this node" {
+		t.Fatalf("the failover's record did not survive: %+v, %v", rec, err)
+	}
+	if rec.Peers["n2"] != "10.0.0.2:7443" || len(rec.Peers) != 1 {
+		t.Fatalf("peers %+v", rec.Peers)
+	}
+	if got := l.Fenced(); got == nil || got.Peers["n2"] != "10.0.0.2:7443" {
+		t.Fatalf("the membership's record %+v", got)
+	}
+
+	// A record with peers is not rewritten.
+	k, kreg, kcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	kn2, err := kreg.GetNode(ctx, "n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kn2.PeerAddr = "10.0.0.2:7443"
+	if err := kreg.UpdateNode(ctx, kn2); err != nil {
+		t.Fatal(err)
+	}
+	k.Refresh(ctx)
+	if err := WriteFenced(kcfg, FencedRecord{Epoch: 2, Leader: "n3", Reason: "x", At: time.Now(), Peers: map[string]string{"n3": "10.0.0.3:7443"}}); err != nil {
+		t.Fatal(err)
+	}
+	k.Refresh(ctx)
+	if got, err := ReadFenced(kcfg); err != nil || len(got.Peers) != 1 || got.Peers["n3"] != "10.0.0.3:7443" {
+		t.Fatalf("a record with peers was rewritten: %+v, %v", got, err)
+	}
+}
+
+// A leader that no peer reaches learns from the backup store's leader marker that another node was
+// promoted; a store that does not answer, a follower and a cluster of one node leave things as they are.
+func TestLiveReadsTheLeaderMarker(t *testing.T) {
+	ctx := context.Background()
+	newLeader := func(m fakeMarker) *Live {
+		l, _, _ := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+		l.o.Marker = m
+		l.Refresh(ctx)
+		return l
+	}
+	l := newLeader(fakeMarker{err: errors.New("the store does not answer")})
+	l.CheckMarker(ctx)
+	if l.Role() != RoleLeader {
+		t.Fatal("an unreadable marker fenced the leader")
+	}
+	l = newLeader(fakeMarker{m: &backup.LeaderMarker{Epoch: 1, Leader: "n1"}})
+	l.CheckMarker(ctx)
+	if l.Role() != RoleLeader {
+		t.Fatal("a marker that names this node fenced it")
+	}
+	l = newLeader(fakeMarker{m: &backup.LeaderMarker{Epoch: 3, Leader: "n2"}})
+	var called string
+	l.o.Fence = func(_ context.Context, source string, epoch int64, leader string) (bool, error) {
+		called = fmt.Sprintf("%s|%d|%s", source, epoch, leader)
+		return true, nil
+	}
+	l.CheckMarker(ctx)
+	if l.Role() != RoleFenced || called != "the leader marker in the backup store|3|n2" {
+		t.Fatalf("role %s, fencer asked %q", l.Role(), called)
+	}
+	if rec := l.Fenced(); rec == nil || !strings.Contains(rec.Reason, "leader marker") {
+		t.Fatalf("record %+v", rec)
+	}
+
+	f, _, _ := newLive(t, BootDecision{Role: RoleFollower, SelfID: "n2"}, &probe{rec: true})
+	f.o.Marker = fakeMarker{m: &backup.LeaderMarker{Epoch: 9, Leader: "n3"}}
+	f.Refresh(ctx)
+	f.CheckMarker(ctx)
+	if f.Role() != RoleFollower {
+		t.Fatal("a follower fenced itself on the marker")
+	}
+
+	// Run reads the marker on its own timer.
+	r := newLeader(fakeMarker{m: &backup.LeaderMarker{Epoch: 3, Leader: "n2"}})
+	r.o.MarkerEvery = 10 * time.Millisecond
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go r.Run(rctx)
+	eventually(t, "Run to read the marker", func() bool { return r.Role() == RoleFenced })
+}
+
+// A node that was just promoted leads at the epoch it was promoted for before the registry says so:
+// the procedure that promoted it waits for the membership to show it. An older promote.ok shows nothing.
+func TestLiveShowsThePromotedEpoch(t *testing.T) {
+	ctx := context.Background()
+	p := &probe{rec: true}
+	l, _, cfg := newLive(t, BootDecision{Role: RoleFollower, SelfID: "n2"}, p)
+	l.Refresh(ctx)
+	path := cfg.Paths().PromoteOK(config.SystemRef)
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, backup.FormatPromoteOK(4), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l.Refresh(ctx) // still a standby: promote.ok is written before pg_promote, and says nothing yet
+	if l.IsLeader() || l.Epoch() != 1 {
+		t.Fatalf("a standby: leader %v, epoch %d", l.IsLeader(), l.Epoch())
+	}
+	p.set(false, nil)
+	l.Refresh(ctx)
+	if !l.IsLeader() || l.Epoch() != 4 {
+		t.Fatalf("after the promotion: leader %v, epoch %d, want epoch 4", l.IsLeader(), l.Epoch())
+	}
+	if lead, ok := l.Leader(); !ok || lead.ID != "n2" {
+		t.Fatalf("leader %+v", lead)
+	}
+	// A promote.ok from an epoch the registry has passed changes nothing.
+	if err := os.WriteFile(path, backup.FormatPromoteOK(1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, _, mcfg := newLive(t, BootDecision{Role: RoleLeader, SelfID: "n1"}, &probe{})
+	mp := mcfg.Paths().PromoteOK(config.SystemRef)
+	_ = os.MkdirAll(filepath.Dir(mp), 0o750)
+	if err := os.WriteFile(mp, backup.FormatPromoteOK(1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.Refresh(ctx)
+	if m.Epoch() != 1 {
+		t.Fatalf("epoch %d", m.Epoch())
 	}
 }

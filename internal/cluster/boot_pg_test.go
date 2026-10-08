@@ -276,8 +276,8 @@ func TestLeadsHereAgainstPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	dsns := []string{"host=/nonexistent port=1 user=x connect_timeout=1", dsn}
-	if !LeadsHere(ctx, conf, dsns) {
-		t.Fatal("the founder, a primary that the registry names, does not lead")
+	if got := LeadsHere(ctx, cfg, conf, dsns); got != LeadsYes {
+		t.Fatalf("the founder, a primary that the registry names: %v", got)
 	}
 	n2 := &registry.Node{Name: "second", State: registry.NodeActive}
 	if err := reg.CreateNode(ctx, n2); err != nil {
@@ -286,13 +286,14 @@ func TestLeadsHereAgainstPostgres(t *testing.T) {
 	if err := reg.SetLeader(ctx, n2.ID, 2); err != nil {
 		t.Fatal(err)
 	}
-	if LeadsHere(ctx, conf, dsns) {
-		t.Fatal("a primary whose registry names another leader leads")
+	if got := LeadsHere(ctx, cfg, conf, dsns); got != LeadsNo {
+		t.Fatalf("a primary whose registry names another leader: %v", got)
 	}
-	if LeadsHere(ctx, filepath.Join(t.TempDir(), "etc", "config.toml"), dsns) {
-		t.Fatal("a server with no cluster identity leads")
+	if got := LeadsHere(ctx, cfg, filepath.Join(t.TempDir(), "etc", "config.toml"), dsns); got != LeadsNo {
+		t.Fatalf("a server with no cluster identity: %v", got)
 	}
-	if LeadsHere(ctx, conf, []string{"host=/nonexistent port=1 user=x connect_timeout=1"}) {
-		t.Fatal("a server whose database does not answer leads")
+	// A database that does not answer is not an answer: with no data directory it cannot be a primary.
+	if got := LeadsHere(ctx, cfg, conf, []string{"host=/nonexistent port=1 user=x connect_timeout=1"}); got != LeadsNo {
+		t.Fatalf("a server whose database does not answer and holds no data: %v", got)
 	}
 }

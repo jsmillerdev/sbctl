@@ -313,6 +313,13 @@ type ClusterStore interface {
 	// SetReplicaStatus writes the status, the setup step and the failed step's code. It writes
 	// nothing when all three are unchanged, so a status report every 10 seconds costs no WAL.
 	SetReplicaStatus(ctx context.Context, identifier, status, initStep, initError string) error
+	// SetReplicaStatusUnlessGoingDown is SetReplicaStatus that leaves a replica which is GOING_DOWN as
+	// it is, in the same statement that writes. A removal marks the row GOING_DOWN from a process of
+	// its own (`supavise replicas rm`, `node rm`) while the daemon's controller writes what it
+	// observes; an observation that read the row before the mark must not write over it. It reports
+	// whether the row was written or already held these values (false: it is GOING_DOWN and was not
+	// touched). ErrNotFound when the replica does not exist.
+	SetReplicaStatusUnlessGoingDown(ctx context.Context, identifier, status, initStep, initError string) (written bool, err error)
 	DeleteReplica(ctx context.Context, identifier string) error
 
 	// PutReplicaOptout records an opt-out; putting one that exists changes nothing.

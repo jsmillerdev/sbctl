@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
@@ -9,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -179,6 +181,11 @@ func TestRejoin(t *testing.T) {
 	if err := WriteFenced(j.cfg, FencedRecord{Epoch: 2, Leader: "n1", Reason: "replaced", At: time.Now(), Peers: map[string]string{"n1": l.cfg.PeerAddr()}}); err != nil {
 		t.Fatal(err)
 	}
+	// The old leader was a founder, with no follower mark; the rejoin makes it a follower of the new one.
+	dir := config.ClusterDir(j.confPath)
+	if err := os.Remove(filepath.Join(dir, FollowerFile)); err != nil || IsFollower(dir) {
+		t.Fatalf("setting up a founder: %v", err)
+	}
 	stopped := 0
 	rejoin.StopLocal = func(context.Context) error { stopped++; return nil }
 	var boot []peerapi.SystemBootstrap
@@ -203,6 +210,9 @@ func TestRejoin(t *testing.T) {
 	}
 	if rec, _ := ReadFenced(j.cfg); rec != nil {
 		t.Fatal("the fenced record is still there")
+	}
+	if !IsFollower(dir) {
+		t.Fatal("a node that rejoined is not marked as a follower")
 	}
 	if rs, _ := l.reg.ListReplicasOn(ctx, "n2"); len(rs) != 1 || rs[0].Ref != "system" || boot[0].Identifier != rs[0].Identifier {
 		t.Fatalf("system replica rows %+v for bootstrap %+v", rs, boot)
@@ -1161,66 +1171,19 @@ func TestStatusFileRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCertificateSnapshotAndTheEndpoint(t *testing.T) {
-	root := t.TempDir()
-	write := func(rel, data string, mode os.FileMode) {
-		p := filepath.Join(root, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(data), mode); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write("certificates/acme/example.test/example.test.crt", "CERT", 0o644)
-	write("certificates/acme/example.test/example.test.key", "KEY", 0o600)
-	write("locks/issue_cert_example.test.lock", "busy", 0o644)
-	write(".hidden", "x", 0o644)
-
-	snap, etag, err := SnapshotCerts(root)
-	if err != nil || len(snap.Files) != 2 || snap.Files[0].Path != "certificates/acme/example.test/example.test.crt" || snap.Files[1].Mode != 0o600 {
-		t.Fatalf("snapshot %+v, %v", snap, err)
-	}
-	if _, again, _ := SnapshotCerts(root); again != etag {
-		t.Fatal("the ETag of an unchanged store changed")
-	}
-	write("certificates/acme/example.test/example.test.crt", "CERT2", 0o644)
-	if _, changed, _ := SnapshotCerts(root); changed == etag {
-		t.Fatal("the ETag did not change with the content")
-	}
-	if empty, e, err := SnapshotCerts(filepath.Join(root, "missing")); err != nil || len(empty.Files) != 0 || e == "" {
-		t.Fatalf("a store that does not exist: %+v %q %v", empty, e, err)
-	}
-
+// The certificate store is the proxy's endpoint. If the membership endpoints took the pattern too, the
+// daemon of any cluster node would panic at start (http.ServeMux refuses a pattern registered twice).
+func TestPeerAPILeavesTheCertificateStoreToTheProxy(t *testing.T) {
 	l := newLeader(t)
-	l.cfg.StateDir = filepath.Dir(root)
-	_ = os.Rename(root, l.cfg.Paths().Certs())
-	api := &PeerAPI{Authority: l.auth, Topology: l.live, Cfg: l.cfg, Reports: l.rep}
 	mux := mesh.NewMux()
-	api.Register(mux)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", peerapi.PathCerts, nil))
-	if rec.Code != 200 || rec.Header().Get("ETag") == "" {
-		t.Fatalf("certs: %d %v", rec.Code, rec.Header())
+	(&PeerAPI{Authority: l.auth, Topology: l.live, Cfg: l.cfg, Reports: l.rep}).Register(mux)
+	certs := "GET " + peerapi.PathCerts
+	for _, p := range mux.Patterns() {
+		if p == certs {
+			t.Fatalf("the membership endpoints register %q", p)
+		}
 	}
-	var got peerapi.CertSnapshot
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || len(got.Files) != 2 {
-		t.Fatalf("body %v, %v", got, err)
-	}
-	req := httptest.NewRequest("GET", peerapi.PathCerts, nil)
-	req.Header.Set("If-None-Match", rec.Header().Get("ETag"))
-	rec2 := httptest.NewRecorder()
-	mux.ServeHTTP(rec2, req)
-	if rec2.Code != http.StatusNotModified || rec2.Body.Len() != 0 {
-		t.Fatalf("conditional get: %d %q", rec2.Code, rec2.Body.String())
-	}
-	// A node that is not the leader holds no authoritative store.
-	l.auth.Topology = cluster2Follower{l.auth.Topology}
-	rec3 := httptest.NewRecorder()
-	mux.ServeHTTP(rec3, httptest.NewRequest("GET", peerapi.PathCerts, nil))
-	if rec3.Code != http.StatusServiceUnavailable {
-		t.Fatalf("certs on a follower: %d", rec3.Code)
-	}
+	mux.Handle(certs, func(http.ResponseWriter, *http.Request) {}) // the proxy's registration must not clash
 }
 
 func TestDNSRecords(t *testing.T) {
@@ -1537,5 +1500,336 @@ func TestPeerAPIKeepsInternalDetailFromCallersWithNoCertificate(t *testing.T) {
 	}
 	if code, body := post(mesh.Peer{Node: "n2", Remote: "198.51.100.9"}); code != http.StatusInternalServerError || !strings.Contains(body, "connection refused") {
 		t.Fatalf("a node got %d %s", code, body)
+	}
+}
+
+// A reset retires the server before the exchange, so the leader is looked at first: one that cannot be
+// reached, or does not take joins, costs nothing, where it would have left the server down with its
+// data set aside.
+func TestJoinResetLooksAtTheLeaderBeforeItRetiresTheNode(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(j.cfg.Paths().PostgresData("system"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stop := func(context.Context) error { t.Error("something was stopped"); return nil }
+	unchanged := func(what string) {
+		t.Helper()
+		if !Joined(config.ClusterDir(j.confPath)) {
+			t.Fatalf("%s: the identity was deleted", what)
+		}
+		if rec, _ := ReadFenced(j.cfg); rec != nil {
+			t.Fatalf("%s: the node was recorded as removed: %+v", what, rec)
+		}
+		if _, err := os.Stat(j.cfg.Paths().PostgresData("system")); err != nil {
+			t.Fatalf("%s: data was moved: %v", what, err)
+		}
+	}
+
+	// A leader at an address nothing listens on.
+	gone, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := gone.Addr().String()
+	gone.Close()
+	tok := l.token(t, TokenOptions{})
+	tok.Leader = dead
+	o := j.joinOptions(tok, "second-b", seed)
+	o.Reset, o.StopLocal = true, stop
+	if _, err := Join(ctx, o); err == nil || !strings.Contains(err.Error(), "cannot reach the leader") || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Fatalf("reset with an unreachable leader: %v", err)
+	}
+	unchanged("unreachable leader")
+
+	// A node that answers but is not the leader.
+	l.auth.Topology = cluster2Follower{l.auth.Topology}
+	o = j.joinOptions(l.token2(t), "second-b", seed)
+	o.Reset, o.StopLocal = true, stop
+	if _, err := Join(ctx, o); err == nil || !strings.Contains(err.Error(), "does not take joins") {
+		t.Fatalf("reset against a node that is not the leader: %v", err)
+	}
+	unchanged("not the leader")
+}
+
+// A server with a master key of its own finds out before the exchange that it is not the cluster's:
+// the token is not spent and the leader has no row for the node.
+func TestJoinRefusesAMasterKeyOfItsOwnBeforeAskingTheLeader(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	seed, _ := okSeed(t)
+	tok := l.token(t, TokenOptions{})
+	j := l.joiner(t, "n2")
+	own := make([]byte, 32)
+	if _, err := crand.Read(own); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(j.cfg.KeyPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(j.cfg.KeyPath, []byte(hex.EncodeToString(own)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Join(ctx, j.joinOptions(tok, "second", seed))
+	if err == nil || !strings.Contains(err.Error(), "holds another key than the cluster's") || !strings.Contains(err.Error(), "--master-key-file") {
+		t.Fatalf("join with a key of its own: %v", err)
+	}
+	if ns, _ := l.reg.ListNodes(ctx); len(ns) != 1 {
+		t.Fatalf("the leader created a node: %v", ns)
+	}
+	if got, err := l.reg.GetJoinToken(ctx, tok.ID); err != nil || got.UsedAt != nil {
+		t.Fatalf("the token was spent: %+v, %v", got, err)
+	}
+	// A key file that is not a key at all is no better.
+	if err := os.WriteFile(j.cfg.KeyPath, []byte("not a key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Join(ctx, j.joinOptions(tok, "second", seed)); err == nil || !strings.Contains(err.Error(), "holds another key") {
+		t.Fatalf("join with a damaged key file: %v", err)
+	}
+	// The cluster's own key in that place is fine, and the same token joins.
+	body, err := os.ReadFile(l.cfg.KeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(j.cfg.KeyPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Join(ctx, j.joinOptions(tok, "second", seed)); err != nil {
+		t.Fatalf("join with the cluster's key already in place: %v", err)
+	}
+}
+
+// lostAnswers is an RPC whose first answers to the renewal never arrive: the leader handled the
+// request, as a lost response looks from the node.
+type lostAnswers struct {
+	mesh.RPC
+	mu    sync.Mutex
+	lose  int
+	calls int
+}
+
+func (l *lostAnswers) Call(ctx context.Context, node, method, path string, in, out any) error {
+	err := l.RPC.Call(ctx, node, method, path, in, out)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	if err == nil && path == peerapi.PathCertsRenew && l.lose > 0 {
+		l.lose--
+		return fmt.Errorf("%w: the answer was lost", mesh.ErrNoSession)
+	}
+	return err
+}
+
+// The leader records the serial of a new certificate before the node has it. When the answer is lost
+// the node retries within the retry wait and ends with a certificate the leader's record names, not
+// at the next look six hours on.
+func TestRenewalIsTriedAgainSoonAfterALostAnswer(t *testing.T) {
+	l, j := followerNearExpiry(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	before := j.store.Creds().Serial
+	lossy := &lostAnswers{RPC: j.mgr, lose: 1}
+	r := j.renewer(time.Second)
+	r.RPC, r.Every, r.Retry = lossy, time.Hour, 50*time.Millisecond
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Run(ctx) }()
+	eventually(t, "the renewed certificate", func() bool {
+		n2, _ := l.reg.GetNode(ctx, "n2")
+		got := j.store.Creds().Serial
+		return got != before && got == n2.CertSerial
+	})
+	cancel()
+	<-done
+	lossy.mu.Lock()
+	defer lossy.mu.Unlock()
+	if lossy.lose != 0 {
+		t.Fatal("the answer was never lost")
+	}
+}
+
+func TestRenewalRetryBacksOffToABound(t *testing.T) {
+	r := &Renewer{}
+	var got []time.Duration
+	var last time.Duration
+	for range 8 {
+		last = r.nextRetry(last)
+		got = append(got, last)
+	}
+	want := []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 10 * time.Minute, 10 * time.Minute, 10 * time.Minute}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("waits %v, want %v", got, want)
+		}
+	}
+	if r2 := (&Renewer{Retry: time.Second}); r2.nextRetry(0) != time.Second || r2.nextRetry(time.Second) != 2*time.Second {
+		t.Fatal("Retry does not set the first wait")
+	}
+}
+
+// A server that joined a cluster is marked a follower, which a founder, with its certificate, is not;
+// the mark goes with the identity.
+func TestFollowerMarkTellsAMemberFromTheFounder(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	if IsFollower(config.ClusterDir(l.confPath)) {
+		t.Fatal("the founder is marked a follower")
+	}
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	dir := config.ClusterDir(j.confPath)
+	if !IsFollower(dir) {
+		t.Fatal("a server that joined is not marked a follower")
+	}
+	info, err := os.Stat(filepath.Join(dir, FollowerFile))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("%s: %v, %v", FollowerFile, info, err)
+	}
+	if _, err := Retire(ctx, j.cfg, j.confPath, func(context.Context) error { return nil }, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if IsFollower(dir) || Joined(dir) {
+		t.Fatal("the identity or its mark survived a retirement")
+	}
+	// A mark without a certificate is not a member.
+	if err := markFollower(dir, "n2", "x", "n1", time.Now()); err != nil || IsFollower(dir) {
+		t.Fatalf("a mark with no certificate: %v", err)
+	}
+}
+
+// The converge step that refreshes config.d/10-cluster.toml fetches the leader's cluster settings with
+// the node's certificate, reports what it would change without writing, writes the file 0600 when the
+// text differs, and leaves a server that leads, that never joined, or whose leader does not answer alone.
+func TestConfigSyncRefreshesTheClusterSettingsFromTheLeader(t *testing.T) {
+	l := newLeader(t)
+	ctx := context.Background()
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(ctx, j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(config.ConfigDDir(j.confPath), config.ClusterConfigFile)
+	joined, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync := &ConfigSync{Cfg: j.cfg, ConfigPath: j.confPath, Log: quiet(),
+		Where: func(context.Context) (string, string, error) { return "n1", l.cfg.PeerAddr(), nil }}
+
+	if got, err := sync.Sync(ctx, true); err != nil || len(got) != 0 {
+		t.Fatalf("settings that match: %v, %v", got, err)
+	}
+	l.cfg.Domain = "changed.example.test" // a cluster-scoped key
+	got, err := sync.Sync(ctx, true)
+	if err != nil || len(got) != 1 || got[0] != path {
+		t.Fatalf("a changed setting, dry run: %v, %v", got, err)
+	}
+	if now, _ := os.ReadFile(path); !bytes.Equal(now, joined) {
+		t.Fatal("a dry run wrote the file")
+	}
+	if got, err := sync.Sync(ctx, false); err != nil || len(got) != 1 {
+		t.Fatalf("a changed setting: %v, %v", got, err)
+	}
+	now, err := os.ReadFile(path)
+	if err != nil || bytes.Equal(now, joined) || !strings.Contains(string(now), "changed.example.test") {
+		t.Fatalf("the file after the sync: %q, %v", now, err)
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v", info.Mode().Perm())
+	}
+	if got, err := sync.Sync(ctx, false); err != nil || len(got) != 0 {
+		t.Fatalf("the second run: %v, %v", got, err)
+	}
+
+	// A leader that does not answer is no failure of the convergence, and the file stays.
+	gone, _ := net.Listen("tcp", "127.0.0.1:0")
+	dead := gone.Addr().String()
+	gone.Close()
+	l.cfg.Domain = "again.example.test"
+	down := &ConfigSync{Cfg: j.cfg, ConfigPath: j.confPath, Log: quiet(),
+		Where: func(context.Context) (string, string, error) { return "n1", dead, nil }}
+	if got, err := down.Sync(ctx, false); err != nil || len(got) != 0 {
+		t.Fatalf("an unreachable leader: %v, %v", got, err)
+	}
+	if after, _ := os.ReadFile(path); !bytes.Equal(after, now) {
+		t.Fatal("the file changed although the leader did not answer")
+	}
+	// The leader and a server that never joined have nothing to fetch.
+	lead := &ConfigSync{Cfg: l.cfg, ConfigPath: l.confPath, Log: quiet(), Where: sync.Where}
+	if got, err := lead.Sync(ctx, false); err != nil || len(got) != 0 {
+		t.Fatalf("the founder: %v, %v", got, err)
+	}
+	none := &ConfigSync{Cfg: l.cfg, ConfigPath: filepath.Join(t.TempDir(), "etc", "config.toml"), Log: quiet(), Where: sync.Where}
+	if got, err := none.Sync(ctx, false); err != nil || len(got) != 0 {
+		t.Fatalf("a server that never joined: %v, %v", got, err)
+	}
+}
+
+// With the registry out of reach the converge step falls back on the leader the node joined, and it holds
+// the leader to the node id the join recorded: a mark written by an older release has none, and then any
+// node of the cluster may answer.
+func TestConfigSyncFallbackNamesTheLeaderTheNodeJoined(t *testing.T) {
+	l := newLeader(t)
+	j := l.joiner(t, "n2")
+	seed, _ := okSeed(t)
+	if _, err := Join(context.Background(), j.joinOptions(l.token(t, TokenOptions{}), "second", seed)); err != nil {
+		t.Fatal(err)
+	}
+	dir := config.ClusterDir(j.confPath)
+	ended, cancel := context.WithCancel(context.Background()) // the system cluster is not asked for long
+	cancel()
+	sync := &ConfigSync{Cfg: j.cfg, ConfigPath: j.confPath, Log: quiet(), DSNs: []string{"host=/nonexistent port=1 user=x connect_timeout=1"}}
+	id, addr, err := sync.where(ended, dir, "n2")
+	if err != nil || id != "n1" || addr != l.cfg.PeerAddr() {
+		t.Fatalf("the leader the join recorded: %q %q %v", id, addr, err)
+	}
+	old := filepath.Join(dir, FollowerFile)
+	if err := os.WriteFile(old, []byte(`{"node_id":"n2","leader":"203.0.113.9:7443"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if id, addr, err := sync.where(ended, dir, "n2"); err != nil || id != "" || addr != "203.0.113.9:7443" {
+		t.Fatalf("a mark with no leader id: %q %q %v", id, addr, err)
+	}
+}
+
+// The report intake names the reporting node from the certificate of the connection, never from the
+// body: a node cannot report for another, and an empty name in the body is the caller's own.
+func TestReportIntakeTakesTheNodeFromTheCertificate(t *testing.T) {
+	l := newLeader(t)
+	mux := mesh.NewMux()
+	(&PeerAPI{Authority: l.auth, Topology: l.live, Cfg: l.cfg, Reports: l.rep}).Register(mux)
+	var seen []string
+	l.rep.Subscribe(func(rep peerapi.Report) { seen = append(seen, rep.Node) })
+	post := func(body string) int {
+		req := httptest.NewRequest("POST", peerapi.PathReport, strings.NewReader(body))
+		req = req.WithContext(mesh.WithPeer(req.Context(), mesh.Peer{Node: "n2", State: registry.NodeActive}))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := post(`{"node":"n3","epoch":1}`); code != http.StatusForbidden {
+		t.Fatalf("a report for another node: %d", code)
+	}
+	if len(seen) != 0 {
+		t.Fatalf("the subscriber heard of a refused report: %v", seen)
+	}
+	for _, body := range []string{`{"epoch":1}`, `{"node":"n2","epoch":2}`} {
+		if code := post(body); code != http.StatusNoContent {
+			t.Fatalf("%s: %d", body, code)
+		}
+	}
+	if got := strings.Join(seen, ","); got != "n2,n2" {
+		t.Fatalf("the subscriber saw %q, want the peer's name twice", got)
+	}
+	if _, ok := l.rep.Latest("n3"); ok {
+		t.Fatal("a report was kept for n3")
 	}
 }
