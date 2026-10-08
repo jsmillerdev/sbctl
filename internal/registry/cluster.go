@@ -65,7 +65,9 @@ type Node struct {
 	Version    string
 	State      NodeState
 	CertSerial string
-	JoinedAt   time.Time
+	// JoinedAt is when the row was created and, after that, when the node last entered joining (a
+	// fenced node that rejoins). The leader measures how long a node has been joining from it.
+	JoinedAt time.Time
 }
 
 // clone returns n with its own copy of what it points to, so that a registry never hands out or
@@ -274,7 +276,8 @@ type ClusterStore interface {
 	// nothing else; it is a no-op (no write) when none of them changed. ErrConflict when the
 	// name belongs to another node.
 	UpdateNode(ctx context.Context, n *Node) error
-	// SetNodeState moves the node to s. It does not check that the move is a legal transition.
+	// SetNodeState moves the node to s. It does not check that the move is a legal transition. A node
+	// that enters joining gets a new JoinedAt, so that one that rejoins is not as old as its row.
 	SetNodeState(ctx context.Context, id string, s NodeState) error
 	// SetNodeCert records the serial of the certificate that authorizes the node.
 	SetNodeCert(ctx context.Context, id, serial string) error

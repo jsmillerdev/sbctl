@@ -22,6 +22,14 @@ func (m *Memory) seedCluster() {
 	m.joinTokens = map[string]JoinToken{}
 }
 
+// now is the time a node row is stamped with: Now when a test set it, else the wall clock.
+func (m *Memory) now() time.Time {
+	if m.Now != nil {
+		return m.Now()
+	}
+	return time.Now()
+}
+
 func nodeNumber(id string) int {
 	n, _ := strconv.Atoi(id[1:])
 	return n
@@ -64,7 +72,7 @@ func (m *Memory) CreateNode(_ context.Context, n *Node) error {
 			return fmt.Errorf("%w: nodes_name_key", ErrConflict)
 		}
 	}
-	n.ID, n.JoinedAt = id, time.Now()
+	n.ID, n.JoinedAt = id, m.now()
 	m.nodes[id] = n.clone()
 	m.notify("nodes", "insert", id)
 	return nil
@@ -141,6 +149,9 @@ func (m *Memory) SetNodeState(_ context.Context, id string, s NodeState) error {
 	}
 	if n.State != s {
 		n.State = s
+		if s == NodeJoining {
+			n.JoinedAt = m.now()
+		}
 		m.nodes[id] = n
 		m.notify("nodes", "update", id)
 	}

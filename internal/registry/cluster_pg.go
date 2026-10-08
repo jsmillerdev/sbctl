@@ -198,6 +198,9 @@ func (r *Postgres) SetNodeState(ctx context.Context, id string, s NodeState) err
 	if err != nil || cur.State == s {
 		return err
 	}
+	if s == NodeJoining {
+		return affected(r.pool.Exec(ctx, `update supavise.nodes set state = $2, joined_at = now() where id = $1`, id, s))
+	}
 	return affected(r.pool.Exec(ctx, `update supavise.nodes set state = $2 where id = $1`, id, s))
 }
 
