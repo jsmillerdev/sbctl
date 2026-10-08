@@ -97,9 +97,7 @@ func (o *Orchestrator) abortServer(ctx context.Context) (*registry.Move, error) 
 		}
 	}
 	if recordedStep(prior.steps, "quiesce") {
-		switch err := o.restartLeader(ctx, prior.from); {
-		case err == nil:
-		default:
+		if err := o.restartLeader(ctx, prior.from); err != nil {
 			return nil, fmt.Errorf("failover: starting %s again failed, so the move is kept: %w", prior.from, err)
 		}
 	}
