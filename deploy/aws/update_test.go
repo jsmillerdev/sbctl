@@ -55,6 +55,8 @@ case "$*" in
   *"cloudformation wait stack-create-complete"*) exit "${CREATE_WAIT_RC-${STACK_WAIT_RC-0}}" ;;
   *"ec2 describe-addresses"*)
     if [ -n "$ADDRESS_FAILS" ]; then echo "An error occurred (UnauthorizedOperation)" >&2; exit 254; fi
+    # ADDRESS_HOLDER_LATER: where the address is from the second look on (a failover during the review).
+    if [ -n "$ADDRESS_HOLDER_LATER" ] && [ "$(grep -c 'ec2 describe-addresses' "$DIR/calls.log")" -ge 2 ]; then echo "$ADDRESS_HOLDER_LATER"; exit 0; fi
     echo "${ADDRESS_HOLDER-i-0123456789abcdef0}" ;;
   *"ec2 describe-instances"*) echo ami-0bbbbbbbbbbbbbbbb ;;
   *"s3api head-bucket"*) exit "${HEAD_BUCKET_RC-254}" ;;
@@ -559,9 +561,18 @@ func TestUpdateRefusesTheInstanceRole(t *testing.T) {
 // A failover moved the service address: the update goes on, and refuses to touch the association.
 func TestUpdateAfterAFailover(t *testing.T) {
 	f := newUpdFake(t)
+	f.copy("changeset-peer-rule.json", "changeset.json")
 	r := f.run([]string{"ADDRESS_HOLDER=i-0peerpeerpeer00001"}, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplate(t), "--yes")
-	if r.code != 0 || !strings.Contains(r.stdout, "WARNING: the service address of supavise is not on its instance") {
-		t.Errorf("a change set that leaves the association alone goes on: exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	if r.code != 0 || !strings.Contains(r.stdout, "WARNING: the service address of supavise is not on its instance") || len(f.callsMatching("execute-change-set")) != 1 {
+		t.Errorf("a change set that leaves the address and the instance alone goes on: exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	// Any update of the instance waits for the address to be back: CloudFormation attaches an Elastic
+	// IP again after it updates its instance, and a rehearsal has not shown that tags are an exception.
+	f = newUpdFake(t)
+	r = f.run([]string{"ADDRESS_HOLDER=i-0peerpeerpeer00001"}, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplate(t), "--yes", "--allow-risky")
+	if r.code != 2 || !strings.Contains(r.stdout, "Instance (AWS::EC2::Instance): the service address is on another server after a failover, and an update of the instance can move it back") ||
+		len(f.callsMatching("execute-change-set")) != 0 {
+		t.Errorf("a tags-only update of the instance after a failover is blocked: exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
 	}
 	for _, risky := range []string{"", "--allow-risky"} {
 		f = newUpdFake(t)
@@ -592,6 +603,140 @@ func TestUpdateAfterAFailover(t *testing.T) {
 	r = f.run([]string{"ADDRESS_FAILS=1"}, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplate(t), "--yes")
 	if r.code != 2 {
 		t.Errorf("an unreadable address: exit %d\n%s", r.code, r.stdout)
+	}
+}
+
+// The review and the question take time: the address is looked at again before the change set runs,
+// and a failover in between is judged like one before.
+func TestUpdateLooksAtTheAddressAgainBeforeRunning(t *testing.T) {
+	args := []string{"update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplate(t), "--yes"}
+	// The change set updates the instance, which is fine while the address is there and not after.
+	f := newUpdFake(t)
+	r := f.run([]string{"ADDRESS_HOLDER_LATER=i-0peerpeerpeer00001"}, args...)
+	if r.code != 2 || !strings.Contains(r.stderr, "a failover moved the service address while the change set was under review") {
+		t.Errorf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	if len(f.callsMatching("execute-change-set")) != 0 || len(f.callsMatching("delete-change-set")) != 1 {
+		t.Errorf("a change set that can take the address back was run, or was not deleted: %v", f.calls())
+	}
+	// One that leaves the instance and the address alone goes on, with a warning.
+	f = newUpdFake(t)
+	f.copy("changeset-peer-rule.json", "changeset.json")
+	r = f.run([]string{"ADDRESS_HOLDER_LATER=i-0peerpeerpeer00001"}, args...)
+	if r.code != 0 || !strings.Contains(r.stdout, "the service address moved to another server during the review") || len(f.callsMatching("execute-change-set")) != 1 {
+		t.Errorf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	// With the address in place both times there is no warning, and it was looked at twice; when it
+	// was elsewhere from the start the second look is not needed.
+	f = newUpdFake(t)
+	r = f.run(nil, args...)
+	if r.code != 0 || strings.Contains(r.stdout, "moved") || len(f.callsMatching("ec2 describe-addresses")) != 2 {
+		t.Errorf("exit %d\n%s\n%s\ncalls: %v", r.code, r.stdout, r.stderr, f.calls())
+	}
+	f = newUpdFake(t)
+	f.copy("changeset-peer-rule.json", "changeset.json")
+	f.run([]string{"ADDRESS_HOLDER=i-0peerpeerpeer00001"}, args...)
+	if n := len(f.callsMatching("ec2 describe-addresses")); n != 1 {
+		t.Errorf("the address was looked at %d times, want once when it was already elsewhere", n)
+	}
+}
+
+// setStackParam changes a parameter of the stack the stub describes.
+func setStackParam(t *testing.T, f *updFake, key, value string) {
+	t.Helper()
+	path := filepath.Join(f.dir, "stack.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Stacks []map[string]any
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range doc.Stacks[0]["Parameters"].([]any) {
+		if m := p.(map[string]any); m["ParameterKey"] == key {
+			m["ParameterValue"], found = value, true
+		}
+	}
+	if !found {
+		t.Fatalf("the stack has no parameter %s", key)
+	}
+	if b, err = json.Marshal(doc); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The stack of a replica server shows its leader's bucket. A template staged there is read with the
+// replica's region, which fails when the leader is somewhere else.
+func TestUpdateOfAReplicaServerStagesInABucketOfItsRegion(t *testing.T) {
+	replica := func(leaderRegion string) *updFake {
+		f := newUpdFake(t)
+		f.copy("stack-rev2.json", "stack.json")
+		setStackParam(t, f, "JoinLeader", "203.0.113.50:7443")
+		setStackParam(t, f, "BackupBucketRegion", leaderRegion)
+		return f
+	}
+	args := []string{"update", "--stack", "supavise-replica", "--region", "eu-west-1", "--template", realTemplate(t), "--yes"}
+
+	f := replica("us-east-1")
+	r := f.run(nil, args...)
+	if r.code != 0 {
+		t.Fatalf("exit %d\n%s\n%s\ncalls: %v", r.code, r.stdout, r.stderr, f.calls())
+	}
+	if up := f.callsMatching("s3api put-object"); len(up) != 1 || !strings.Contains(up[0], "--bucket supavise-templates-111122223333-eu-west-1 --key _stack/") || !strings.Contains(up[0], "--expected-bucket-owner 111122223333") {
+		t.Errorf("upload: %v", up)
+	}
+	if cs := f.callsMatching("create-change-set"); len(cs) != 1 || !strings.Contains(cs[0], "--template-url https://supavise-templates-111122223333-eu-west-1.s3.eu-west-1.amazonaws.com/_stack/") {
+		t.Errorf("change set: %v", cs)
+	}
+	for _, c := range f.calls() {
+		if strings.Contains(c, "supavise-backupbucket-abc123") {
+			t.Errorf("the leader's bucket was used from another region: %s", c)
+		}
+	}
+	// --template-bucket names the bucket whatever the regions are.
+	f = replica("us-east-1")
+	if r = f.run(nil, append(args, "--template-bucket", "my-eu-templates")...); r.code != 0 || len(f.callsMatching("s3api put-object --bucket my-eu-templates ")) != 1 {
+		t.Errorf("--template-bucket: exit %d\n%s\ncalls: %v", r.code, r.stderr, f.calls())
+	}
+	// In the leader's own region its backup bucket is read from the same region, and is used.
+	f = replica("eu-west-1")
+	if r = f.run(nil, args...); r.code != 0 || len(f.callsMatching("s3api put-object --bucket supavise-backupbucket-abc123 ")) != 1 {
+		t.Errorf("same region: exit %d\n%s\ncalls: %v", r.code, r.stderr, f.calls())
+	}
+	// A template that fits in the request needs no bucket, made or not.
+	f = replica("us-east-1")
+	if r = f.run(nil, "update", "--stack", "supavise-replica", "--region", "eu-west-1", "--template", smallTemplate(t), "--yes"); r.code != 0 || len(f.callsMatching("s3")) != 0 {
+		t.Errorf("small template: exit %d\n%s\ncalls: %v", r.code, r.stderr, f.calls())
+	}
+}
+
+// The exit status of update is 0, 2 or 3 whatever goes wrong: a helper that crashes is a failure.
+func TestUpdateHelperCrashIsAFailure(t *testing.T) {
+	f := newUpdFake(t)
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("no python3")
+	}
+	wrapper := "#!/bin/sh\ncase \"$3\" in params) echo 'Traceback: simulated crash of the helper' >&2; exit 1 ;; esac\nexec " + py + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(f.dir, "python3"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := f.run(nil, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplate(t), "--yes")
+	if r.code != 3 || !strings.Contains(r.stderr, "cannot build the parameters of the update") || len(f.callsMatching("create-change-set")) != 0 {
+		t.Errorf("exit %d\n%s", r.code, r.stderr)
+	}
+	// A refusal of the helper (a --set it does not accept) stays a refusal.
+	f = newUpdFake(t)
+	r = f.run(nil, "update", "--stack", "supavise", "--region", "us-east-1", "--template", smallTemplate(t), "--yes", "--set", "SupaviseVersion=v2.0.0")
+	if r.code != 2 {
+		t.Errorf("a refused --set: exit %d\n%s", r.code, r.stderr)
 	}
 }
 
@@ -1243,7 +1388,13 @@ func TestClassifier(t *testing.T) {
 			"modify   Instance (AWS::EC2::Instance): Tags, MetadataOptions (no interruption)", "modify   ElasticIp (AWS::EC2::EIP): Tags (no interruption)",
 			"modify   InstanceRole (AWS::IAM::Role): Tags (no interruption)", "7 change(s): 7 allowed, 0 refused, 0 blocked"}, []string{"REPLACE", "REMOVE"}},
 		{"the same with failover and a peer rule", "changeset-v011-to-rev2-features.json", nil, 0, []string{"add      FencingPolicy (AWS::IAM::Policy)", "add      PeerIngress1 (AWS::EC2::SecurityGroupIngress)", "9 change(s): 9 allowed"}, nil},
-		{"the same after a failover", "changeset-v011-to-rev2-features.json", []string{"--failed-over"}, 0, []string{"9 change(s): 9 allowed"}, nil},
+		{"the same after a failover: the instance waits for the address", "changeset-v011-to-rev2-features.json", []string{"--failed-over"}, 11, []string{
+			"Instance (AWS::EC2::Instance): the service address is on another server after a failover, and an update of the instance can move it back",
+			"add      FencingPolicy (AWS::IAM::Policy)", "9 change(s): 8 allowed, 0 refused, 1 blocked"}, nil},
+		{"turning the features off removes a policy and a rule", "changeset-features-off.json", nil, 0, []string{
+			"remove   FencingPolicy (AWS::IAM::Policy)", "remove   PeerIngress1 (AWS::EC2::SecurityGroupIngress)", "modify   Instance (AWS::EC2::Instance): Tags (no interruption)",
+			"3 change(s): 3 allowed, 0 refused, 0 blocked"}, []string{"REMOVE"}},
+		{"a rule that changes after a failover is not held back", "changeset-peer-rule.json", []string{"--failed-over"}, 0, []string{"2 change(s): 2 allowed, 0 refused, 0 blocked"}, nil},
 		{"instance, volume and address replaced", "changeset-instance-replaced.json", nil, 10, []string{
 			"REPLACE  Instance (AWS::EC2::Instance) would be replaced: ImageId", "REPLACE  DataVolume (AWS::EC2::Volume) would be replaced: AvailabilityZone",
 			"REPLACE  DataVolumeAttachment (AWS::EC2::VolumeAttachment) would be replaced", "REPLACE  ElasticIpAssociation (AWS::EC2::EIPAssociation) would be replaced",
@@ -1254,7 +1405,7 @@ func TestClassifier(t *testing.T) {
 			"REPLACE  SecurityGroup (AWS::EC2::SecurityGroup) would be replaced: GroupDescription",
 			"REMOVE   DnsRecords (AWS::Route53::RecordSetGroup) would be deleted"}, nil},
 		{"the address association after a failover is blocked", "changeset-association.json", []string{"--failed-over"}, 11, []string{
-			"ElasticIpAssociation (AWS::EC2::EIPAssociation): the service address is on another server after a failover, and this would move it back", "1 allowed, 0 refused, 1 blocked"}, nil},
+			"ElasticIpAssociation (AWS::EC2::EIPAssociation): the service address is on another server after a failover, and this would move it back", "0 allowed, 0 refused, 2 blocked"}, nil},
 		{"the address association in place is not on the safe list", "changeset-association.json", nil, 10, []string{"MODIFY   ElasticIpAssociation (AWS::EC2::EIPAssociation): InstanceId changes in place"}, []string{"blocked:"}},
 		{"a peer rule that changes is replaced, which is harmless", "changeset-peer-rule.json", nil, 0, []string{
 			"replace  PeerIngress1 (AWS::EC2::SecurityGroupIngress): CidrIp", "add      PeerIngress2 (AWS::EC2::SecurityGroupIngress)"}, nil},
@@ -1284,8 +1435,8 @@ func TestClassifier(t *testing.T) {
 		})
 	}
 	// The worst findings come first.
-	out, _ := classify(t, "changeset-association.json", "--failed-over")
-	if strings.Index(out, "ElasticIpAssociation") > strings.Index(out, "modify   Instance") {
+	out, _ := classify(t, "changeset-v011-to-rev2-features.json", "--failed-over")
+	if strings.Index(out, "Instance (AWS::EC2::Instance): the service address") > strings.Index(out, "add      ObjectsBucket") {
 		t.Errorf("a blocked change is listed after an allowed one:\n%s", out)
 	}
 }

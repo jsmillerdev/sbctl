@@ -159,7 +159,10 @@ func TestRehearsePasses(t *testing.T) {
 		"PASS  a second update finds nothing to change", "== every check passed", "supavise:infra=2", "associate-address --dry-run --allocation-id eipalloc-0123456789abcdef0",
 		// What the script cannot see: a reboot keeps the launch time, and an update of the instance's tags may attach the address again.
 		"uptime -s", "expect a time before 20", "associate-address --allocation-id eipalloc-0123456789abcdef0 --instance-id OTHER_INSTANCE --allow-reassociation",
-		"describe-addresses --allocation-ids eipalloc-0123456789abcdef0", "expect OTHER_INSTANCE"} {
+		"describe-addresses --allocation-ids eipalloc-0123456789abcdef0", "expect OTHER_INSTANCE",
+		// The call that names a private address (a replica server's service address is one), and the update the guard holds back.
+		"associate-address --dry-run --allocation-id eipalloc-0123456789abcdef0 --instance-id i-0123456789abcdef0 --private-ip-address PRIVATE_IP --allow-reassociation",
+		"an update of the instance can move it back", "aws cloudformation deploy --region"} {
 		if !strings.Contains(r.stdout, want) {
 			t.Errorf("output lacks %q:\n%s", want, r.stdout)
 		}

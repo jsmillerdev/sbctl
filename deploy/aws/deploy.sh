@@ -216,6 +216,11 @@ import io, json, re, sys
 REPLACE_OK = set([
     "AWS::EC2::SecurityGroupIngress", "AWS::IAM::Policy", "AWS::S3::BucketPolicy",
 ])
+# Resource types whose removal is allowed: turning Failover off or clearing a PeerCidr takes a
+# permission or a firewall rule away, which interrupts nothing. Any other removal is refused.
+REMOVE_OK = set([
+    "AWS::EC2::SecurityGroupIngress", "AWS::IAM::Policy",
+])
 # Properties that change in place without an interruption, per type. Any other change to a
 # resource is refused until a person has read it (--allow-risky).
 SAFE = {
@@ -324,9 +329,16 @@ def judge(rc, failed_over):
         only_tags = action == "Modify" and not recreate and labels and not [l for l in labels if l != "Tags"]
         if not only_tags and action != "Add":
             return "blocked", "%s: the service address is on another server after a failover, and this would move it back" % what
+    if failed_over and typ == "AWS::EC2::Instance" and action != "Add":
+        # CloudFormation attaches an Elastic IP again after it updates the instance it belongs to,
+        # whatever the property was; until a rehearsal shows that a change of tags does not, any
+        # update of the instance is held back while the address is on another server.
+        return "blocked", "%s: the service address is on another server after a failover, and an update of the instance can move it back" % what
     if action == "Add":
         return "ok", "add      %s" % what
     if action == "Remove":
+        if typ in REMOVE_OK:
+            return "ok", "remove   %s" % what
         return "refused", "REMOVE   %s would be deleted" % what
     if action != "Modify":
         return "refused", "%-8s %s is a change this script does not know" % (action.upper(), what)
@@ -748,7 +760,7 @@ review_change_set() { # ASK(1/0)
   py classify "$WORK/cs.json" ${args[@]+"${args[@]}"} || rc=$?
   case $rc in
     0) ;;
-    11) drop_change_set; die "refused: the change set would take the service address back from the server it failed over to. Nothing was changed" ;;
+    11) drop_change_set; die "refused: the change set could take the service address back from the server it failed over to. Nothing was changed" ;;
     10)
       if [[ $ALLOW_RISKY -eq 0 ]]; then
         drop_change_set
@@ -765,6 +777,20 @@ review_change_set() { # ASK(1/0)
   printf 'Type apply to run this change set: '
   read -r answer
   [[ $answer == apply ]] || { drop_change_set; die "not applied; the change set was deleted"; }
+}
+# The review and the question to the person take time. A failover in between moves the address to
+# another server, and a change set that was fine before may take it back: judge it again.
+recheck_failover() { # TAG
+  local rc=0
+  [[ $FAILED_OVER -eq 0 ]] || return 0
+  if service_address_here "$1"; then return 0; fi
+  FAILED_OVER=1
+  py classify "$WORK/cs.json" --failed-over >/dev/null || rc=$?
+  case $rc in
+    0 | 10) say "WARNING: the service address moved to another server during the review; the change set does not touch it." ;;
+    11) drop_change_set; die "refused: a failover moved the service address while the change set was under review, and the change set could take it back. Nothing was changed" ;;
+    *) drop_change_set; fail "could not read the change set (the review exited $rc)" ;;
+  esac
 }
 execute_change_set() {
   "${AWS[@]}" cloudformation execute-change-set --stack-name "$STACK" --change-set-name "$CS" || fail "cannot run the change set"
@@ -800,14 +826,16 @@ run_update() { # TAG HOW
     say "The stack has no AmiId: keeping the image its instance runs, $image"
     sets+=("AmiId=$image")
   fi
-  py params "$WORK/stack.$tag.json" "$TEMPLATE" ${sets[@]+"${sets[@]}"} >"$WORK/params.json" || exit $?
+  # (exit 2 is a refusal of a --set; anything else is the helper failing, which is a failure)
+  py params "$WORK/stack.$tag.json" "$TEMPLATE" ${sets[@]+"${sets[@]}"} >"$WORK/params.json" \
+    || { [[ $? -ne 2 ]] || exit 2; fail "cannot build the parameters of the update from the description of stack $STACK"; }
 
   if service_address_here "$tag"; then
     FAILED_OVER=0
   else
     FAILED_OVER=1
     say "WARNING: the service address of $STACK is not on its instance ${inst:-?} (a failover moved it, or it cannot be read)."
-    say "         The change set is refused if it touches the address association."
+    say "         The change set is refused if it touches the address association or updates the instance."
   fi
   have=$(fact "$tag" output:InfraRevision); have=${have:-1}
   want=$(template_revision "$TEMPLATE")
@@ -817,8 +845,13 @@ run_update() { # TAG HOW
   fi
 
   bucket=$STAGE_BUCKET
-  [[ -n $bucket ]] || bucket=$(fact "$tag" output:BackupBucket)
-  [[ -n $bucket ]] || bucket=$(ensure_template_bucket)
+  if [[ -z $bucket ]] && [[ $(wc -c <"$TEMPLATE" | tr -d ' ') -gt $INLINE_LIMIT ]]; then
+    bucket=$(fact "$tag" output:BackupBucket)
+    # The stack of a replica server shows its leader's bucket. CloudFormation reads a staged template
+    # with this stack's region, which fails for a bucket of the leader's other region.
+    if [[ -n $(fact "$tag" param:JoinLeader) && $(fact "$tag" param:BackupBucketRegion) != "$REGION" ]]; then bucket=""; fi
+    [[ -n $bucket ]] || bucket=$(ensure_template_bucket)
+  fi
   stage_template "$bucket"
   make_change_set UPDATE || rc=$?
   if [[ $rc -eq 10 ]]; then
@@ -831,6 +864,7 @@ run_update() { # TAG HOW
     return 0
   fi
   review_change_set 1
+  recheck_failover "$tag"
   execute_change_set
   wait_stack update
   load_facts "$STACK" "$REGION" "$tag"
@@ -868,14 +902,15 @@ mode_update() {
     note "Is the service address still on the stack's instance, or did a failover move it?"
     show "${AWS[@]}" ec2 describe-addresses --allocation-ids "<ElasticIpAllocationId>" --query 'Addresses[0].InstanceId' --output text
     resolve_template
-    note "a template over $INLINE_LIMIT bytes is staged in the stack's backup bucket (or --template-bucket), which must be in your account:"
+    note "a template over $INLINE_LIMIT bytes is staged in the stack's backup bucket (or --template-bucket), which must be in your account;"
+    note "the stack of a replica server in another region than its leader's bucket uses $NAME-templates-<account>-<region> instead:"
     show "${AWS[@]}" s3api put-object --bucket "<BackupBucket>" --key "_stack/<sha256>.yaml" --body "$TEMPLATE" --expected-bucket-owner "<account>"
     show "${AWS[@]}" cloudformation create-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>" --change-set-type UPDATE --capabilities CAPABILITY_IAM --template-url "<staged template>" --parameters "file://<params.json>"
     show "${AWS[@]}" cloudformation wait change-set-create-complete --stack-name "$STACK" --change-set-name "$NAME-update-<time>"
     note "the template the change set holds is read back and must be the file that was verified; if it is not, the change set is deleted:"
     show "${AWS[@]}" cloudformation get-template --stack-name "$STACK" --change-set-name "$NAME-update-<time>" --template-stage Original --query TemplateBody --output json
     show "${AWS[@]}" cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>" --output json
-    note "every resource change is reviewed; a replacement or removal is refused and the change set deleted. Otherwise, after you type apply:"
+    note "every resource change is reviewed; a replacement or removal (but of a security group rule or an IAM policy) is refused and the change set deleted. Otherwise, after you type apply:"
     show "${AWS[@]}" cloudformation execute-change-set --stack-name "$STACK" --change-set-name "$NAME-update-<time>"
     show "${AWS[@]}" cloudformation wait stack-update-complete --stack-name "$STACK"
     return 0

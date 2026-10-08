@@ -225,18 +225,29 @@ cat <<LIST
     aws ec2 stop-instances --dry-run --instance-ids $INSTANCE --region $REGION
       expect DryRunOperation (the instance carries supavise:cluster)
     aws ec2 associate-address --dry-run --allocation-id ${ALLOCATION:-ALLOCATION_ID} --instance-id $INSTANCE --allow-reassociation --region $REGION
-      expect DryRunOperation; note whether a call that names a private address (--private-ip-address) also passes
+      expect DryRunOperation
+    aws ec2 associate-address --dry-run --allocation-id ${ALLOCATION:-ALLOCATION_ID} --instance-id $INSTANCE --private-ip-address PRIVATE_IP --allow-reassociation --region $REGION
+      PRIVATE_IP is a private address of the instance (aws ec2 describe-instances --instance-ids $INSTANCE --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text --region $REGION).
+      expect DryRunOperation. UnauthorizedOperation means that FencingPolicy, which lists no network interface, does not cover
+      the interface the address would go to: a failover onto a replica server, whose service address is a second private address,
+      could not move it (the policy then needs a network-interface resource).
   The instance was not rebooted. The launch time stays the same across a reboot, so look at the boot time:
     uptime -s
       expect a time before $START (UTC, when the update began)
   The service address stays where a failover put it. Move it by hand to another instance of yours in $REGION:
     aws ec2 associate-address --allocation-id ${ALLOCATION:-ALLOCATION_ID} --instance-id OTHER_INSTANCE --allow-reassociation --region $REGION
-  copy deploy/cloudformation/supavise.yaml, add { Key: rehearsal, Value: "1" } to the Tags of the resource Instance, and run
+  copy deploy/cloudformation/supavise.yaml and add { Key: rehearsal, Value: "1" } to the Tags of the resource Instance. While the address is on
+  another server, $DEPLOY update holds back any update of the instance, so run it first to see that:
     $DEPLOY update --region $REGION --stack $STACK --template THE_COPY --set Failover=on --set PeerCidr1=198.51.100.0/24 --yes
-      expect: modify Instance: Tags (no interruption), and nothing else of the instance
+      expect: blocked, "an update of the instance can move it back", the change set deleted, exit status 2
+  Then make the same change without that check, to see what CloudFormation does (this stack is a throwaway):
+    aws cloudformation deploy --region $REGION --stack-name $STACK --template-file THE_COPY --s3-bucket A_BUCKET_OF_YOURS_IN_$REGION --capabilities CAPABILITY_IAM \\
+      --parameter-overrides Failover=on PeerCidr1=198.51.100.0/24
+      (a parameter that is not named keeps the stack's value; the template is over the size the API takes inline, so it goes through a bucket)
     aws ec2 describe-addresses --allocation-ids ${ALLOCATION:-ALLOCATION_ID} --query 'Addresses[0].InstanceId' --output text --region $REGION
-      expect OTHER_INSTANCE. If it prints $INSTANCE, CloudFormation attached the address again when it updated the
-      instance: an update after a failover would take the service address back, and the README must say so.
+      expect OTHER_INSTANCE. If it prints $INSTANCE, CloudFormation attached the address again when it updated the instance: an update
+      after a failover would take the service address back, and the check that holds such updates back is needed as it is. If it
+      prints OTHER_INSTANCE, a change of tags leaves the address alone, and that check can be narrowed (judge() in deploy.sh).
   Then run  $DEPLOY replica --leader-stack $STACK ...  against this stack to see the second server join (see deploy/aws/README.md).
 LIST
 if [[ $YES -eq 0 && -t 0 ]]; then
