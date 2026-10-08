@@ -174,7 +174,10 @@ func WriteHeader(w io.Writer, h Header) error {
 }
 
 // ReadHeader reads one header line from r, one byte at a time so that it consumes nothing of
-// what follows it, and validates it. A line longer than 1 KiB is an error.
+// what follows it, and validates it. A line longer than 1 KiB is an error. Fields it does not
+// know are ignored, so that a node of the next release can add one to a header an older node
+// still accepts; a kind or type it does not know is refused by Validate. Anything on the line
+// after the JSON object is an error: a header is one object.
 func ReadHeader(r io.Reader) (Header, error) {
 	var line bytes.Buffer
 	one := make([]byte, 1)
@@ -192,9 +195,11 @@ func ReadHeader(r io.Reader) (Header, error) {
 	}
 	var h Header
 	dec := json.NewDecoder(&line)
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&h); err != nil {
 		return Header{}, fmt.Errorf("mesh: the stream header is not valid: %w", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return Header{}, errors.New("mesh: the stream header has more than one JSON value on its line")
 	}
 	return h, h.Validate()
 }
@@ -202,8 +207,20 @@ func ReadHeader(r io.Reader) (Header, error) {
 // LocalPort is the loopback port a forward stream of kind k for project ref (registry sequence
 // seq) reaches on a node that serves it, and the port a forwarder binds on a node that does not.
 // The two sides compute the same number from the same configuration, which is what makes a
-// forwarder transparent. ErrNoPort when the project has no such service.
+// forwarder transparent. ErrNoPort when the project has no such service, when seq is not the
+// sequence of a project (a user project's starts at 1, and its ports must fit below 65536), and
+// for a replica kind when seq is above cfg.MaxReplicaSeq(): the replica range would run into the
+// project ports.
 func LocalPort(cfg *config.Config, k Kind, ref string, seq int) (int, error) {
+	if !k.IsService() && ref != config.SystemRef {
+		limit := cfg.MaxProjectSeq()
+		if k == KindReplicaPostgres || k == KindReplicaPostgREST {
+			limit = min(limit, cfg.MaxReplicaSeq())
+		}
+		if seq < 1 || seq > limit {
+			return 0, fmt.Errorf("%w: %s of %s has sequence %d, outside 1..%d", ErrNoPort, k, ref, seq, limit)
+		}
+	}
 	var port int
 	switch k {
 	case KindPostgres:

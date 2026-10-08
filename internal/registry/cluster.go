@@ -68,6 +68,16 @@ type Node struct {
 	JoinedAt   time.Time
 }
 
+// clone returns n with its own copy of what it points to, so that a registry never hands out or
+// keeps a Node that shares memory with the caller's.
+func (n Node) clone() Node {
+	if n.Provider.AWS != nil {
+		a := *n.Provider.AWS
+		n.Provider.AWS = &a
+	}
+	return n
+}
+
 // NodeProvider says where a node runs when that matters to the cluster. The keys it does not
 // know are not kept.
 type NodeProvider struct {

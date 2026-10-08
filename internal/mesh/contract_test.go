@@ -64,8 +64,11 @@ func TestHeaderValidation(t *testing.T) {
 	}
 	for _, line := range []string{
 		"not json\n",
-		`{"t":"fwd","kind":"postgres","ref":"` + ref + `","port":22}` + "\n", // unknown field
 		`{"t":"rpc"` + "\n",
+		`{"t":"rpc"}{"t":"rpc"}` + "\n",         // two objects on the line
+		`{"t":"rpc"} trailing` + "\n",           // text after the object
+		`{"t":"fwd","kind":"svc:shell"}` + "\n", // an unknown kind is refused, not ignored
+		`{"t":"rpc","kind":"postgres"}` + "\n",
 		strings.Repeat("x", 2000) + "\n",
 	} {
 		if _, err := ReadHeader(strings.NewReader(line)); err == nil {
@@ -74,6 +77,22 @@ func TestHeaderValidation(t *testing.T) {
 	}
 	if _, err := ReadHeader(strings.NewReader(`{"t":"rpc"}`)); err == nil {
 		t.Error("a header with no newline was accepted")
+	}
+}
+
+// A header may carry fields this release does not know, which a node one release ahead can send,
+// and the bytes after the line are the stream's payload, not part of the header.
+func TestHeaderToleratesUnknownFields(t *testing.T) {
+	r := strings.NewReader(`{"t":"fwd","kind":"postgres","ref":"` + ref + `","port":22,"trace":{"id":1}}` + "\n" + `{"t":"rpc"}` + "\n")
+	h, err := ReadHeader(r)
+	if err != nil || h != (Header{T: StreamForward, Kind: KindPostgres, Ref: ref}) {
+		t.Fatalf("header with unknown fields: %+v, %v", h, err)
+	}
+	if next, err := ReadHeader(r); err != nil || next.T != StreamRPC {
+		t.Fatalf("the line after the header: %+v, %v", next, err)
+	}
+	if _, err := ReadHeader(strings.NewReader(`  {"t":"rpc"}  ` + "\n")); err != nil {
+		t.Fatalf("spaces around the object: %v", err)
 	}
 }
 
@@ -106,6 +125,27 @@ func TestLocalPort(t *testing.T) {
 	}
 	if _, err := LocalPort(cfg, KindPostgREST, "system", 0); !errors.Is(err, ErrNoPort) {
 		t.Errorf("system has no PostgREST: %v", err)
+	}
+	// The replica range ends where the project range begins: the largest sequence that fits has
+	// ports, the next has none. A user project's sequence starts at 1.
+	maxSeq := cfg.MaxReplicaSeq()
+	if p, err := LocalPort(cfg, KindReplicaPostgREST, ref, maxSeq); err != nil || p >= cfg.Ports.ProjectBase {
+		t.Errorf("replica PostgREST at the largest sequence: %d, %v", p, err)
+	}
+	for _, tc := range []struct {
+		kind Kind
+		seq  int
+	}{
+		{KindReplicaPostgres, maxSeq + 1}, {KindReplicaPostgREST, maxSeq + 1}, {KindReplicaPostgres, 0}, {KindPostgres, 0},
+		{KindGoTrue, -1}, {KindPostgREST, cfg.MaxProjectSeq() + 1},
+	} {
+		if p, err := LocalPort(cfg, tc.kind, ref, tc.seq); !errors.Is(err, ErrNoPort) {
+			t.Errorf("LocalPort(%s, seq %d) = %d, %v, want ErrNoPort", tc.kind, tc.seq, p, err)
+		}
+	}
+	// The project range may run past the replica range: a canonical port is still fine there.
+	if p, err := LocalPort(cfg, KindPostgres, ref, maxSeq+1); err != nil || p != cfg.PortsFor(ref, maxSeq+1).Postgres {
+		t.Errorf("canonical Postgres above the replica limit: %d, %v", p, err)
 	}
 	// Every valid kind has a port for an ordinary project, so the reconciler can bind them all.
 	for _, k := range append(append([]Kind{}, ProjectKinds...), ServiceKinds...) {
