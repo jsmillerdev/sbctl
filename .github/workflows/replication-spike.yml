@@ -1,0 +1,60 @@
+name: replication-spike
+
+# Two Incus nodes with a real systemd on one runner (design spike S9): do they boot, run the polkit rule and
+# the unit hardening, take `install.sh --binary` of this checkout, block the instance metadata address, and
+# reach each other, Garage, a signed release server and a fake AWS service. Virtual machines where /dev/kvm
+# works, system containers otherwise; both architectures. tests/linux/multi/README.md has the outcome.
+on:
+  push:
+    branches: ["ws/rep-x1"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# bash with -eo pipefail, so a failing command piped into tee fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  two-nodes:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64, mode: vm }
+          - { runner: ubuntu-24.04, arch: amd64, mode: container }
+          - { runner: ubuntu-24.04, arch: amd64, mode: container-privileged }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: vm }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container }
+          - { runner: ubuntu-24.04-arm, arch: arm64, mode: container-privileged }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The release server signs this build as v0.0.1; deploy/release-assets.sh writes the manifest with the
+      # release tool (root has no Go toolchain).
+      - name: build supavise and the release tool
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=v0.0.1" -o /tmp/supavise ./cmd/supavise
+          go build -o /tmp/releasetool ./deploy/releasetool
+      - name: two nodes (${{ matrix.mode }})
+        run: |
+          sudo env LOG_DIR=/tmp/supavise-multi-logs MULTI_MODE=${{ matrix.mode }} SUPAVISE_BIN=/tmp/supavise \
+            SUPAVISE_RELEASETOOL=/tmp/releasetool tests/linux/multi/spike.sh 2>&1 | tee /tmp/spike.log
+      - if: always()
+        name: results
+        run: |
+          sudo chmod -R a+rX /tmp/supavise-multi-logs || true
+          cp /tmp/spike.log /tmp/supavise-multi-logs/ || true
+          cat /tmp/supavise-multi-logs/results.md >> "$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replication-spike-${{ matrix.arch }}-${{ matrix.mode }}
+          path: /tmp/supavise-multi-logs
+          if-no-files-found: ignore
