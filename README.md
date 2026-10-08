@@ -73,6 +73,17 @@ Either way, open the claim URL, enter the token to create your admin account, an
   <img alt="Supabase Studio's table editor on Supavise showing a products table with 12 rows" src="docs/images/screenshots/table-editor-dark.png" width="880">
 </p>
 
+## Updates and maintenance
+
+Each Supavise release is a tested bundle of Supabase's services, so you track one version number. One command applies it:
+
+```bash
+sudo supavise upgrade --check   # what's new
+sudo supavise upgrade           # backs up every project, rolls out with health checks, rolls back on failure
+```
+
+For hands-off updates, turn on automatic upgrades in a weekly maintenance window with `sudo supavise update config --mode auto --window "Sun 03:00-05:00"`. OS security patches install on their own, and project owners upgrade their own project from the dashboard, as on hosted Supabase. The [guide](docs/guide.md#updates-and-maintenance) has the full routine.
+
 ## <picture><source media="(prefers-color-scheme: dark)" srcset="brand/readme/glyph-dark.svg"><img alt="" src="brand/readme/glyph-light.svg" height="22"></picture>How it works
 
 <picture>

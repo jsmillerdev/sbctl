@@ -8,6 +8,7 @@ This guide picks up after the install in the [README](../README.md#get-started).
 - [Give an agent or a preview its own branch](#give-an-agent-or-a-preview-its-own-branch)
 - [Back up and restore](#back-up-and-restore)
 - [Monitor the node](#monitor-the-node)
+- [Updates and maintenance](#updates-and-maintenance)
 - [How Supavise compares](#how-supavise-compares)
 - [Sizing and cost](#sizing-and-cost)
 - [FAQ](#faq)
@@ -114,6 +115,38 @@ Add an `[alerts]` section to `/etc/supavise/config.toml` to get a webhook or ema
 | Who you pay | Your hosting provider | Your hosting provider | Supabase |
 
 Some hosted features depend on your Supabase plan. The self-hosted column follows [Supabase's self-hosting docs](https://supabase.com/docs/guides/self-hosting) and its Docker Compose setup. The docs also say that self-hosted Supabase is community-supported.
+
+## Updates and maintenance
+
+A Supavise release is a tested bundle: the `supavise` binary plus pinned versions of every Supabase service. Before a release ships, it passes the conformance suite and a test that upgrades a node with data from the previous release.
+
+**The routine.** Run these on the server:
+
+```bash
+sudo supavise upgrade --check   # is there a newer release, and what changes?
+sudo supavise upgrade --plan    # exactly what will update and restart
+sudo supavise upgrade           # apply it
+sudo -u supavise supavise status
+```
+
+`supavise upgrade` checks that the node is healthy and the release is signed, then backs up every project before it changes anything. It restarts Supavise (HTTPS pauses for a few seconds), updates the shared services one at a time, then updates projects: one canary first, then batches of five, with a health check after each. A project that restarts drops its connections briefly. The rollout stops at the first failure and puts the node back on the previous release.
+
+**Going back.** `sudo supavise rollback` returns to the previous release; the node keeps the last three. If the newer release changed Supavise's own database, rollback refuses and explains how to restore that database from its pre-upgrade backup first.
+
+**Automatic upgrades (opt-in).** By default the node only tells you a release exists. To let it upgrade itself inside a weekly window:
+
+```bash
+sudo supavise update config --mode auto --window "Sun 03:00-05:00"
+sudo supavise update status    # settings, the next window, the last automatic run
+```
+
+An automatic upgrade runs only inside the window and only when the node is healthy and backed up. If one fails, automatic upgrades pause until you run `sudo supavise update resume`.
+
+**Project upgrades.** As on hosted Supabase, a project's Owner or Administrator upgrades that project's services from **Project Settings**, **General**, **Service versions**, or with `sudo -u supavise supavise projects upgrade <ref>`. `sudo supavise upgrade --include-postgres` moves every project's Postgres release as part of a node upgrade.
+
+**OS patches.** New installs apply security updates for Ubuntu or Debian automatically. When a patch needs a reboot, the node reboots inside the maintenance window, and projects start again on their own. Turn this off with `sudo supavise update config --os-security-updates=false` or `--os-reboot never`.
+
+**Planned work.** `sudo -u supavise supavise maintenance announce --at "2026-10-12 22:00" --duration 2h --message "Database maintenance"` shows a notice in the dashboard and quiets alerts during the window.
 
 ## Sizing and cost
 
