@@ -30,7 +30,6 @@ The cluster kinds are raised by the code that owns the event, not by the checker
 |---|---|---|
 | `replica_unhealthy` | a replica's receiver is down for 2 minutes, its PostgREST does not answer, or its lag is above `[replicas] unhealthy_lag_seconds` | the replica controller |
 | `replica_lag` | replication lag is high (60 seconds) but the replica is still within its limit | the replica controller |
-| `replica_needs_rebuild` | a replica fell behind the WAL archive and no base backup is old enough to reseed it | the replica agent |
 | `replica_capacity` | a node has no room for a replica that `[replicas] default = "all"` wants | the default reconciler |
 | `node_unreachable` | a peer does not answer the mesh | the mesh |
 | `node_version_skew` | a peer runs a release outside the window this one works with | the mesh, at join and ping |
@@ -40,7 +39,6 @@ The cluster kinds are raised by the code that owns the event, not by the checker
 | `infra_behind` | the AWS stack lacks resources this release needs | `supavise upgrade` and the daemon |
 | `host_not_converged` | `supavise system converge` has not run for this release | the daemon |
 | `standby_behind` | the registry is newer than this binary, which leaves running instances alone | a standby's daemon |
-| `storage_not_s3` | a cluster feature needs Storage on S3 and the node still uses files | the cluster features |
 
 Three places raise the `upgrade_*` events, each about its own scope:
 
