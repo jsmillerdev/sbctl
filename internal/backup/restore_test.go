@@ -291,7 +291,12 @@ func TestRestoreAsNewProjectKeysAndRequest(t *testing.T) {
 	fm := &fakeManager{e: e, dataDir: filepath.Join(t.TempDir(), "restored")}
 	e.svc.opt.Manager = fm
 
-	p, err := e.svc.Restore(ctx, testRef, e.now.Add(-time.Minute), testRef2)
+	// A restore into a new project replaces nothing, so it prepares nothing.
+	noHook := func(context.Context, string) error {
+		t.Error("BeforeReplace ran for a restore into a new project")
+		return nil
+	}
+	p, err := e.svc.RestoreWith(ctx, testRef, e.now.Add(-time.Minute), testRef2, RestoreOptions{BeforeReplace: noHook})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,6 +397,54 @@ func TestRestoreInPlaceMovesOldDataAside(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(asides[0], "PG_VERSION")); string(b) != "old" {
 		t.Errorf("aside copy = %q", b)
+	}
+}
+
+// BeforeReplace (which removes the project's read replicas for `backups restore`) runs once the target, the
+// base backup and the data directory are checked, and before anything of the project is touched: a restore
+// that cannot start leaves the replicas alone, and one the hook stops leaves the project running on its data.
+func TestRestoreInPlaceCallsBeforeReplaceOnlyForARestoreThatCanStart(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	e.addProject(t, testRef)
+	e.storeBase(t, testRef, fakeDataDir(t), e.now.Add(-time.Hour), nil)
+	dd := e.svc.opt.DataDir(testRef)
+	writeFile(t, filepath.Join(dd, "PG_VERSION"), []byte("old"))
+	fm := &fakeManager{e: e}
+	e.svc.opt.Manager = fm
+	var called []string
+	hook := func(_ context.Context, ref string) error { called = append(called, ref); return nil }
+
+	// A target before the first base backup: there is no backup to restore from.
+	if _, err := e.svc.RestoreWith(ctx, testRef, e.now.Add(-2*time.Hour), "", RestoreOptions{Force: true, BeforeReplace: hook}); err == nil {
+		t.Fatal("a target before the first backup was restored")
+	}
+	if len(called) != 0 {
+		t.Fatalf("BeforeReplace ran for a restore with no backup to start from: %v", called)
+	}
+
+	// The hook refuses: nothing was stopped, moved or replaced.
+	errStop := errors.New("replicas are still being removed")
+	if _, err := e.svc.RestoreWith(ctx, testRef, e.now, "", RestoreOptions{Force: true,
+		BeforeReplace: func(context.Context, string) error { return errStop }}); !errors.Is(err, errStop) {
+		t.Fatalf("restore with a refusing hook = %v", err)
+	}
+	if len(fm.paused) != 0 {
+		t.Fatalf("the project was stopped: %v", fm.paused)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dd, "PG_VERSION")); string(b) != "old" {
+		t.Fatalf("the data directory was touched: %q", b)
+	}
+	if asides, _ := filepath.Glob(dd + ".pre-restore-*"); len(asides) != 0 {
+		t.Fatalf("data moved aside: %v", asides)
+	}
+
+	// It passes: the restore goes on, and the hook has run once, for the project.
+	if _, err := e.svc.RestoreWith(ctx, testRef, e.now, "", RestoreOptions{Force: true, BeforeReplace: hook}); err != nil {
+		t.Fatal(err)
+	}
+	if len(called) != 1 || called[0] != testRef || len(fm.paused) != 1 {
+		t.Fatalf("hook calls %v, paused %v", called, fm.paused)
 	}
 }
 

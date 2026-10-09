@@ -60,6 +60,11 @@ type RestoreOptions struct {
 	SkipFiles bool
 	// Progress receives one line per notable step of the file restore (default: dropped).
 	Progress func(msg string)
+	// BeforeReplace is called for an in-place restore once the target and the base backup are chosen and
+	// the data directory is checked, before the project is stopped or anything of it is touched. An error
+	// stops the restore with nothing changed. `supavise backups restore` removes the project's read
+	// replicas here, so that a typo in --to or a project that is not running leaves them alone.
+	BeforeReplace func(ctx context.Context, ref string) error
 }
 
 func (o RestoreOptions) mode() (string, error) {
@@ -217,7 +222,7 @@ func (s *Service) RestoreWith(ctx context.Context, ref string, target time.Time,
 
 	var p *registry.Project
 	if inPlace {
-		p, err = s.restoreInPlace(ctx, plan)
+		p, err = s.restoreInPlace(ctx, plan, opts)
 	} else {
 		var keys *secrets.ProjectKeys
 		if keys, err = s.sourceKeys(ctx, &plan.Manifest); err != nil {
@@ -300,7 +305,7 @@ func (s *Service) restoreAsNew(ctx context.Context, plan *RestorePlan, src *secr
 	return p, nil
 }
 
-func (s *Service) restoreInPlace(ctx context.Context, plan *RestorePlan) (*registry.Project, error) {
+func (s *Service) restoreInPlace(ctx context.Context, plan *RestorePlan, opts RestoreOptions) (*registry.Project, error) {
 	ref := plan.Source
 	proj, err := s.opt.Registry.GetProject(ctx, ref)
 	if err != nil {
@@ -312,6 +317,11 @@ func (s *Service) restoreInPlace(ctx context.Context, plan *RestorePlan) (*regis
 	dataDir := s.opt.DataDir(ref)
 	if err := s.checkDataDir(ctx, ref, dataDir); err != nil {
 		return nil, err
+	}
+	if opts.BeforeReplace != nil {
+		if err := opts.BeforeReplace(ctx, ref); err != nil {
+			return nil, err
+		}
 	}
 	s.warnPasswordDrift(ctx, ref, &plan.Manifest)
 	if err := s.opt.Manager.Pause(ctx, ref); err != nil {

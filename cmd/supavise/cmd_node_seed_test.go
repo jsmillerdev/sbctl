@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/supavise/supavise/internal/backup"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/mesh/peerapi"
@@ -73,7 +74,12 @@ type standbyRig struct {
 
 func newStandbyRig(t *testing.T, joining bool, body string) *standbyRig {
 	t.Helper()
-	dir := t.TempDir()
+	return newStandbyRigIn(t, t.TempDir(), joining, body)
+}
+
+// newStandbyRigIn is newStandbyRig with the server's directories under dir.
+func newStandbyRigIn(t *testing.T, dir string, joining bool, body string) *standbyRig {
+	t.Helper()
 	r := &standbyRig{cfgPath: filepath.Join(dir, "etc", "config.toml")}
 	if err := os.MkdirAll(filepath.Dir(r.cfgPath), 0o755); err != nil {
 		t.Fatal(err)
@@ -262,5 +268,65 @@ func TestStandbyArchiveReadyReachesTheRelay(t *testing.T) {
 	lo.ArchiveReady(config.SystemRef)
 	if !reflect.DeepEqual(refs, []string{config.SystemRef}) {
 		t.Fatalf("ready was told %v", refs)
+	}
+}
+
+// readyPlane is standbyPlane that runs ready when it is asked to seed: the real plane calls ArchiveReady
+// once the system cluster's directories exist, before it starts the standby.
+type readyPlane struct {
+	standbyPlane
+	seeding func()
+}
+
+func (p readyPlane) SeedSystemStandby(ctx context.Context, plan lifecycle.SystemStandbyPlan, seeder lifecycle.ReplicaSeeder) error {
+	p.seeding()
+	return p.standbyPlane.SeedSystemStandby(ctx, plan, seeder)
+}
+
+// With the relay on, Seed serves the system cluster's WAL socket from this process, from the moment the
+// plane says the cluster's directories exist until Close: the standby replays the archive through it before
+// it streams, and no daemon runs during a join. This is the wiring from Seed through StartWALRelayAt and the
+// plane's ArchiveReady to Relay.Ensure; the tests above stop at the closure the plane is handed.
+func TestStandbySeedServesTheSystemSocketUntilClose(t *testing.T) {
+	// A unix socket path is limited to 103 bytes on macOS, which t.TempDir() can exceed.
+	dir, err := os.MkdirTemp("/tmp", "sbs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	r := newStandbyRigIn(t, dir, true, "[backup]\nbackend = \"s3://bucket/prefix\"\nwal_relay = \"on\"\n")
+
+	var sock string
+	var duringSeed error
+	r.s.openPlane = func(cfg *config.Config, lo lifecycle.OpenOptions) (placement.StandbyPlane, func(), error) {
+		plane := readyPlane{standbyPlane: standbyPlane{calls: &r.calls, plan: &r.plan, seeder: &r.seeder}}
+		plane.seeding = func() {
+			sock = cfg.Paths().WALSocket(config.SystemRef)
+			if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
+				t.Error(err)
+				return
+			}
+			if lo.ArchiveReady == nil {
+				t.Error("the plane was given no ArchiveReady")
+				return
+			}
+			lo.ArchiveReady(config.SystemRef)
+			duringSeed = backup.RelayPing(context.Background(), sock)
+		}
+		return plane, func() {}, nil
+	}
+
+	if err := r.s.Seed(context.Background(), peerapi.SystemBootstrap{Identifier: "system-rr-us-east-1-abc123"}); err != nil {
+		t.Fatal(err)
+	}
+	if duringSeed != nil {
+		t.Fatalf("the system socket %s did not answer once the plane said its directories exist: %v", sock, duringSeed)
+	}
+	if err := backup.RelayPing(context.Background(), sock); err != nil {
+		t.Fatalf("the relay stopped when Seed returned, and the standby still replays through it: %v", err)
+	}
+	r.s.Close()
+	if err := backup.RelayPing(context.Background(), sock); err == nil {
+		t.Fatal("the relay still answers after Close")
 	}
 }
