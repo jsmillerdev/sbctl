@@ -2,6 +2,7 @@ package api
 
 import (
 	"embed"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -29,6 +30,9 @@ type Operation struct {
 	JSON bool
 	// Streams is true for non-JSON success bodies (files); stubs send them empty.
 	Streams bool
+	// Scope is the OAuth scope the spec annotates the operation with (x-oauth-scope), "" when it has
+	// none. An OAuth access token may call only an annotated operation (oauth_scopes.go).
+	Scope string
 }
 
 // Key is "METHOD /path", the ServeMux pattern of the operation.
@@ -59,7 +63,8 @@ func loadOperations() ([]*Operation, error) {
 		}
 		for path, item := range doc.Paths.Map() {
 			for method, op := range item.Operations() {
-				o := &Operation{Spec: name, Method: strings.ToUpper(method), Path: path, ID: op.OperationID}
+				o := &Operation{Spec: name, Method: strings.ToUpper(method), Path: path, ID: op.OperationID,
+					Scope: extensionString(op.Extensions, "x-oauth-scope")}
 				fillResponse(o, op)
 				out = append(out, o)
 			}
@@ -72,6 +77,21 @@ func loadOperations() ([]*Operation, error) {
 		return out[i].Method < out[j].Method
 	})
 	return out, nil
+}
+
+// extensionString reads a string-valued OpenAPI extension. The loader decodes extensions to plain
+// Go values (a string here); raw JSON is accepted too. Anything else reads as "".
+func extensionString(ext map[string]any, key string) string {
+	switch v := ext[key].(type) {
+	case string:
+		return v
+	case json.RawMessage:
+		var s string
+		if json.Unmarshal(v, &s) == nil {
+			return s
+		}
+	}
+	return ""
 }
 
 // fillResponse picks the lowest 2xx response of op as the success response.

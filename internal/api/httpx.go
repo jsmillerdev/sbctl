@@ -14,6 +14,10 @@ import (
 type Error struct {
 	Status  int
 	Message string
+	// Header is added to the response of this error (WWW-Authenticate on an insufficient_scope
+	// refusal). Nil for nearly every error. Shared errors such as errUnauthorized never carry one:
+	// build a new Error to add a header.
+	Header http.Header
 }
 
 func (e *Error) Error() string { return e.Message }
@@ -50,6 +54,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, e *Error) {
+	for k, vs := range e.Header {
+		w.Header()[http.CanonicalHeaderKey(k)] = append([]string(nil), vs...)
+	}
 	writeJSON(w, e.Status, errorBody{Message: e.Message})
 }
 
