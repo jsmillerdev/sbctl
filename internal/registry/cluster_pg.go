@@ -52,7 +52,8 @@ func (r *Postgres) isLegacy(ctx context.Context) bool {
 
 // subscribePoll is Subscribe for a read-only registry (a standby cannot LISTEN): it reads
 // cluster.change_seq every readOnlyPoll and, when it moved, tells the consumer to reload each
-// table. The channel closes when ctx ends or a poll fails.
+// table. One poll serves every subscriber of the registry (changePoller). The channel closes when
+// ctx ends or a poll fails.
 func (r *Postgres) subscribePoll(ctx context.Context) (<-chan Change, error) {
 	// A registry that had not run migration 1300 may have since: look again before giving up.
 	if r.legacy.Load() {
@@ -67,35 +68,8 @@ func (r *Postgres) subscribePoll(ctx context.Context) (<-chan Change, error) {
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan Change, len(reloadTables)*4)
-	go func() {
-		defer close(ch)
-		tick := time.NewTicker(readOnlyPoll)
-		defer tick.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-			}
-			cur, err := r.changeSeq(ctx)
-			if err != nil {
-				return
-			}
-			if cur == seq {
-				continue
-			}
-			seq = cur
-			for _, t := range reloadTables {
-				select {
-				case ch <- Change{Table: t, Op: "reload"}:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-	return ch, nil
+	r.pollerOnce.Do(func() { r.poller = &changePoller{seq: r.changeSeq} })
+	return r.poller.add(ctx, seq), nil
 }
 
 func (r *Postgres) changeSeq(ctx context.Context) (int64, error) {
