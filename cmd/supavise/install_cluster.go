@@ -138,11 +138,7 @@ func joinUnfinished(configPath string) bool {
 // services itself. Nothing here creates a system project or starts one.
 func (in *installer) keepFollower(configChanged, existed bool) error {
 	in.step("this server follows a leader (its system cluster is a standby): keeping it, not creating a system project")
-	if err := in.startDaemon(configChanged, existed); err != nil {
-		return err
-	}
-	if err := in.waitActive(30 * time.Second); err != nil {
-		_ = in.run("journalctl", "-u", "supavise.service", "-n", "40", "--no-pager")
+	if err := in.startAndWait(configChanged, existed, func() error { return in.waitActive(30 * time.Second) }); err != nil {
 		return err
 	}
 	fmt.Fprintln(in.out)
@@ -177,11 +173,7 @@ func (in *installer) joinCluster(o installOptions, configChanged, existed bool, 
 	if err := in.joinAndConverge(cliJoiner{in}, o.JoinTokenFile, config.DefaultPath, uid, gid); err != nil {
 		return err
 	}
-	if err := in.startDaemon(configChanged, existed); err != nil {
-		return err
-	}
-	if err := in.waitActive(30 * time.Second); err != nil {
-		_ = in.run("journalctl", "-u", "supavise.service", "-n", "40", "--no-pager")
+	if err := in.startAndWait(configChanged, existed, func() error { return in.waitActive(30 * time.Second) }); err != nil {
 		return err
 	}
 	printJoinSummary(in.out)

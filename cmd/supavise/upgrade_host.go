@@ -31,6 +31,7 @@ import (
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/nodeupgrade"
 	"github.com/supavise/supavise/internal/notice"
+	"github.com/supavise/supavise/internal/procutil"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/selfupdate"
 	"github.com/supavise/supavise/internal/units"
@@ -223,7 +224,7 @@ func (h *nodeHost) Inspect(ctx context.Context) (*nodeupgrade.Node, error) {
 	}
 	// A binary that reports its release is one that knows the reason "pre-upgrade" for a backup.
 	h.knowsReason = n.BinaryInfo != nil
-	if u := notice.ReadUpgrade(h.cfg.Paths()); u != nil && u.Running(time.Now()) && u.PID != os.Getpid() && (u.PID == 0 || pidAlive(u.PID)) {
+	if u := notice.ReadUpgrade(h.cfg.Paths()); u != nil && u.Running(time.Now()) && u.PID != os.Getpid() && (u.PID == 0 || procutil.Alive(u.PID)) {
 		n.Running = &nodeupgrade.Running{PID: u.PID, Phase: u.Phase, To: u.To}
 	}
 
@@ -319,11 +320,6 @@ func (h *nodeHost) nodePins(n *nodeupgrade.Node) {
 		}
 		n.Pins[svc] = best
 	}
-}
-
-func pidAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // freeBytes returns the free space of the volume holding path; unknown is true when it cannot be

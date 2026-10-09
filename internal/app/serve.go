@@ -471,8 +471,7 @@ func ensureRemoteTenants(ctx context.Context, w *Wire, log *slog.Logger) {
 	locks, _ := Get[failover.Locker](w)
 	failed, done := 0, 0
 	for _, p := range ps {
-		if p.Ref == config.SystemRef || p.NodeID == "" || p.NodeID == self ||
-			(p.Status != registry.StatusActiveHealthy && p.Status != registry.StatusActiveUnhealthy) {
+		if p.Ref == config.SystemRef || p.NodeID == "" || p.NodeID == self || !p.Status.Running() {
 			continue
 		}
 		done++
@@ -564,7 +563,7 @@ func startProjects(ctx context.Context, n *lifecycle.Node, recovered []lifecycle
 	}
 	started := 0
 	for _, p := range ps {
-		if p.Ref != config.SystemRef && (p.Status == registry.StatusActiveHealthy || p.Status == registry.StatusActiveUnhealthy) {
+		if p.Ref != config.SystemRef && p.Status.Running() {
 			started++
 		}
 	}

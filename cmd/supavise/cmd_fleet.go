@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -60,7 +61,7 @@ when no artifact is installed and [studio] artifact_url is not set.`,
 					Fetch(context.Context, string) (string, error)
 				}); ok {
 					for _, svc := range fleet.ServicesFor(cfg) {
-						if contains(skip, svc) || (svc == config.SvcStudio && cfg.Studio.ArtifactURL == "") {
+						if slices.Contains(skip, svc) || (svc == config.SvcStudio && cfg.Studio.ArtifactURL == "") {
 							continue
 						}
 						if _, err := s.Fetch(cmd.Context(), svc); err != nil {
@@ -69,7 +70,7 @@ when no artifact is installed and [studio] artifact_url is not set.`,
 					}
 				}
 			}
-			if _, err := n.Artifacts.Dir(config.SvcStudio); err != nil && !contains(skip, config.SvcStudio) && cfg.Studio.ArtifactURL == "" {
+			if _, err := n.Artifacts.Dir(config.SvcStudio); err != nil && !slices.Contains(skip, config.SvcStudio) && cfg.Studio.ArtifactURL == "" {
 				fmt.Fprintln(cmd.ErrOrStderr(), "skipping studio: no artifact installed and [studio] artifact_url is not set")
 				skip = append(skip[:len(skip):len(skip)], config.SvcStudio)
 			}
@@ -148,7 +149,7 @@ the shared services must be running. --all does every active project.`,
 						return err
 					}
 					for _, p := range ps {
-						if p.Ref != config.SystemRef && (p.Status == registry.StatusActiveHealthy || p.Status == registry.StatusActiveUnhealthy) {
+						if p.Ref != config.SystemRef && p.Status.Running() {
 							refs = append(refs, p.Ref)
 						}
 					}
@@ -266,13 +267,4 @@ func serviceNames(f fleet.Fleet) string {
 		s = append(s, t.Service())
 	}
 	return strings.Join(s, ", ")
-}
-
-func contains(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }

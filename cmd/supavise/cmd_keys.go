@@ -8,13 +8,13 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/supavise/supavise/internal/backup"
+	"github.com/supavise/supavise/internal/fsutil"
 	"github.com/supavise/supavise/internal/secrets"
 )
 
@@ -277,29 +277,5 @@ func readPassphrase(path string, stdin io.Reader) ([]byte, error) {
 // writeSecretFileAtomic writes b to path with mode 0600 through a temporary file in the same
 // directory, so a crash leaves the old file or the whole new one.
 func writeSecretFileAtomic(path string, b []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return fsutil.WriteFile(path, b, 0o600, fsutil.Options{Sync: true, MkdirMode: 0o750})
 }

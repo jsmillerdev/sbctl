@@ -346,11 +346,7 @@ func runInstall(cmd *cobra.Command, o installOptions) error {
 		return err
 	}
 
-	if err := in.startDaemon(configChanged, existed); err != nil {
-		return err
-	}
-	if err := waitDaemon(in.ctx, cfg, 5*time.Minute); err != nil {
-		_ = in.run("journalctl", "-u", "supavise.service", "-n", "40", "--no-pager")
+	if err := in.startAndWait(configChanged, existed, func() error { return waitDaemon(in.ctx, cfg, 5*time.Minute) }); err != nil {
 		return err
 	}
 
@@ -393,10 +389,29 @@ func (in *installer) startDaemon(configChanged, existed bool) error {
 		verb = "restart"
 	}
 	if err := in.run("systemctl", verb, "supavise.service"); err != nil {
-		_ = in.run("journalctl", "-u", "supavise.service", "-n", "40", "--no-pager")
+		in.journalTail()
 		return err
 	}
 	return nil
+}
+
+// startAndWait starts the daemon (startDaemon), then calls wait, which returns once the daemon is
+// up. When wait fails, the end of the daemon's journal is printed before the error is returned.
+func (in *installer) startAndWait(configChanged, existed bool, wait func() error) error {
+	if err := in.startDaemon(configChanged, existed); err != nil {
+		return err
+	}
+	if err := wait(); err != nil {
+		in.journalTail()
+		return err
+	}
+	return nil
+}
+
+// journalTail prints the last lines of supavise.service's journal, for an install that stopped
+// because the daemon did not start.
+func (in *installer) journalTail() {
+	_ = in.run("journalctl", "-u", "supavise.service", "-n", "40", "--no-pager")
 }
 
 // osUpdates sets up (or, after --no-os-updates, takes down) unattended OS security updates. A

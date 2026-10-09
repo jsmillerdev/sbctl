@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -205,15 +206,6 @@ func filters(q url.Values) []filter {
 	return out
 }
 
-func contains(vs []string, v string) bool {
-	for _, x := range vs {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
 // page cuts items to the page that NextToken asks for and returns the token of the next one.
 func (s *Server) page(n int, q url.Values) (from, to int, next string) {
 	from, to = 0, n
@@ -248,7 +240,7 @@ func (s *Server) selectInstances(q url.Values) ([]*instance, *result) {
 	fs := filters(q)
 	var out []*instance
 	for _, i := range s.sortedInstances() {
-		if len(ids) > 0 && !contains(ids, i.ID) {
+		if len(ids) > 0 && !slices.Contains(ids, i.ID) {
 			continue
 		}
 		match := true
@@ -269,7 +261,7 @@ func (s *Server) selectInstances(q url.Values) ([]*instance, *result) {
 				r := fail(http.StatusBadRequest, "InvalidParameterValue", "The filter '"+f.name+"' is invalid")
 				return nil, &r
 			}
-			if !present || !contains(f.values, have) {
+			if !present || !slices.Contains(f.values, have) {
 				match = false
 			}
 		}
@@ -396,7 +388,7 @@ func (s *Server) describeAddresses(q url.Values) result {
 	var b strings.Builder
 	b.WriteString("<addressesSet>")
 	for _, a := range s.addresses {
-		if (len(allocs) > 0 && !contains(allocs, a.AllocationID)) || (len(ips) > 0 && !contains(ips, a.PublicIP)) {
+		if (len(allocs) > 0 && !slices.Contains(allocs, a.AllocationID)) || (len(ips) > 0 && !slices.Contains(ips, a.PublicIP)) {
 			continue
 		}
 		match := true
@@ -414,7 +406,7 @@ func (s *Server) describeAddresses(q url.Values) result {
 			default:
 				return fail(http.StatusBadRequest, "InvalidParameterValue", "The filter '"+f.name+"' is invalid")
 			}
-			if !contains(f.values, have) {
+			if !slices.Contains(f.values, have) {
 				match = false
 			}
 		}
@@ -500,7 +492,7 @@ func (s *Server) associateAddress(q url.Values, dryRun bool) result {
 	if priv == "" {
 		priv = target.PrivateIP
 	}
-	if !contains(target.ips(), priv) {
+	if !slices.Contains(target.ips(), priv) {
 		return fail(http.StatusBadRequest, "InvalidParameterValue", fmt.Sprintf("The address %s does not belong to the network interface.", priv))
 	}
 	if a.InstanceID != "" && q.Get("AllowReassociation") != "true" {

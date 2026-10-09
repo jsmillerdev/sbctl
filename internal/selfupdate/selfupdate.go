@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -201,12 +202,7 @@ func Newer(tag, current string) bool {
 	if !ok {
 		return true
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return a[i] > b[i]
-		}
-	}
-	return false
+	return slices.Compare(a[:], b[:]) > 0
 }
 
 // ParseVersion reads "v1.2.3"; a suffix ("-rc1", "-4-gabcdef", "-dirty") is dropped, so a
@@ -413,15 +409,7 @@ func Compare(a, b string) (c int, ok bool) {
 	if !ok1 || !ok2 {
 		return 0, false
 	}
-	for i := range x {
-		if x[i] != y[i] {
-			if x[i] < y[i] {
-				return -1, true
-			}
-			return 1, true
-		}
-	}
-	return 0, true
+	return slices.Compare(x[:], y[:]), true
 }
 
 func runVersion(ctx context.Context, path string) (string, error) {

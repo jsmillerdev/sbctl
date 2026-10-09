@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -37,12 +38,7 @@ func IsCode(err error, codes ...string) bool {
 	if !errors.As(err, &e) {
 		return false
 	}
-	for _, c := range codes {
-		if e.Code == c {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(codes, e.Code)
 }
 
 // IsAccessDenied reports whether err says the caller's credentials lack the permission. For a

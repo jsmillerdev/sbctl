@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -44,31 +43,16 @@ No move covers the projects of a follower that is down.`,
 // sets its data aside and loses what the replica has not received, so it asks for the project's ref
 // (--yes skips it), like the server failover does for the new leader's name.
 func runProjectFailover(cmd *cobra.Command, o failover.ProjectOptions) error {
-	cfg, err := loadConfig()
+	ctx, c, out, err := openFailover(cmd)
 	if err != nil {
 		return err
 	}
-	ctx := cmd.Context()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	c := newFailoverClient(cfg)
-	out := cmd.OutOrStdout()
 	plan, err := c.PlanProject(ctx, o)
 	if err != nil {
 		return planError(err)
 	}
-	printMovePlan(out, plan, o.Force || o.Resume)
-	refused := plan.Refused(o.Force || o.Resume)
-	if o.DryRun {
-		if len(refused) > 0 {
-			return fmt.Errorf("the move would be refused: %d precondition(s) fail", len(refused))
-		}
-		fmt.Fprintln(out, "\nDry run: nothing was changed.")
-		return nil
-	}
-	if len(refused) > 0 {
-		return &failover.RefusedError{Checks: refused, Force: o.Force}
+	if run, err := reviewMovePlan(out, plan, o.Force, o.Resume, o.DryRun); !run {
+		return err
 	}
 	if plan.Kind == string(registry.MoveFailover) && !o.Resume && !o.Yes {
 		if err := confirmTyped(cmd, projectQuestion(plan), "the project ref", plan.Ref, plan.Ref); err != nil {
