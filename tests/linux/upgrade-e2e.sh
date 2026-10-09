@@ -20,7 +20,9 @@
 #     binary's pins, backs everything up, swaps, restarts the daemon, rolls pgmeta, Storage and the
 #     system GoTrue, then the two projects with a canary): versions in the registry and in the
 #     running processes, PostgreSQL untouched (same PID), data and the auth user intact, the kept
-#     releases, the marker, `supavise status` healthy, and a second run that has nothing to do.
+#     releases, the marker, `supavise status` healthy, migration 1350 (OAuth) applied with its five
+#     tables, the authorization server's metadata served, the personal access token made on v0.0.1
+#     still working, and a second run that has nothing to do.
 #  4. A release whose daemon dies when it starts (v0.0.3): exit status 3, the node back on v0.0.2.
 #  5. A release whose PostgREST does not start (v0.0.4): the rollout halts at the first project, the
 #     other project is not touched, exit status 3, back on v0.0.2.
@@ -365,6 +367,15 @@ runs supavise-gotrue@system.service "$NEW_AUTH"
 intact "$REF"; intact "$REF2"
 [[ $(reg "select count(*) from supavise.backups where status = 'completed' and ref in ('$REF','$REF2','system')") -ge 3 ]] || fail "the upgrade took no base backups"
 [[ $(reg "select count(*) from supavise.project_upgrades where status = 1") == 2 ]] || fail "the projects' upgrade rows"
+# OAuth sign-in for MCP clients (migration 1350): the upgrade applied it, its five tables exist, the
+# authorization server answers, and the personal access token made on v0.0.1 still works.
+[[ $(reg "select count(*) from supavise.schema_migrations where version = 'migrations/1350_oauth.sql'") == 1 ]] || fail "migration 1350_oauth.sql is not applied after the upgrade"
+for t in oauth_apps oauth_app_secrets oauth_grants oauth_authorizations oauth_tokens; do
+  [[ $(reg "select to_regclass('supavise.$t') is not null") == t ]] || fail "supavise.$t is missing after the upgrade"
+done
+[[ $(api GET /.well-known/oauth-authorization-server | json_get 'd["issuer"]') == *"://api.$BASE" ]] || fail "the authorization server's metadata does not name api.$BASE as its issuer"
+[[ $(papi GET /v1/organizations -o /dev/null -w '%{http_code}') == 200 ]] || fail "the personal access token made before the upgrade stopped working"
+[[ $(papi GET /v1/projects/"$REF" -o /dev/null -w '%{http_code}') == 200 ]] || fail "the personal access token cannot read a project after the upgrade"
 # Two kept releases, root's, with their pins and the schema they run on.
 for v in v0.0.1 v0.0.2; do
   [[ -x $RELEASES/$v/supavise && $(stat -c %U "$RELEASES/$v/supavise") == root ]] || fail "kept release $v: $(ls -l "$RELEASES/$v" 2>&1)"

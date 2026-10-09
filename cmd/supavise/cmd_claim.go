@@ -32,6 +32,8 @@ func openAccounts(ctx context.Context) (*api.Accounts, *config.Config, func(), e
 	// `users remove` forgets an SSO account's record and remembers its removal by address, as the
 	// daemon's does (the daemon gets this from NewDashboardSSO).
 	acc.SSOUsers = api.NewPGSSOStore(pg.Pool())
+	// `users remove` also ends the user's OAuth grants, as the daemon's does.
+	acc.OAuth = newOAuthService(n, pg)
 	return acc, n.Cfg, n.Close, nil
 }
 
@@ -287,7 +289,8 @@ accounts share without a password account among them is refused until you do.`,
 		Short: "Delete a dashboard user, their memberships and the access tokens they created",
 		Long: `Deletes the account from supavise-gotrue@system, the user's memberships and roles, and every
 personal access token it created (a token is not re-checked against its owner's account, so it
-would keep working). Sessions already issued by GoTrue expire within an hour.
+would keep working). It also revokes the user's OAuth grants. Sessions already issued by GoTrue
+expire within an hour.
 
 An organization always keeps an owner: removing the only owner of an organization is refused
 unless --force is given.

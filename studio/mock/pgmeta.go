@@ -145,3 +145,12 @@ func (s *server) pgMetaQuery(w *respWriter, r *http.Request, c *reqCtx) {
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
+
+// managementQuery implements POST /v1/projects/{ref}/database/query, the SQL runner of the
+// Management API that the MCP tools call with the caller's token. It runs the query through
+// postgres-meta as pgMetaQuery does, so it answers the rows with 200 where the API says 201.
+// read_only in the body is accepted and not enforced.
+func (s *server) managementQuery(w *respWriter, r *http.Request, c *reqCtx) {
+	r.Header.Set("X-Connection-Encrypted", "built-by-the-mock") // only checked for presence; the mock builds the real one
+	s.pgMetaQuery(w, r, c)
+}

@@ -275,12 +275,15 @@ func TestStudioEnv(t *testing.T) {
 	cfg.Ports.Studio = 37040
 	env := studioEnv(cfg, false)
 	want := map[string]string{
-		"HOSTNAME":                "127.0.0.1",
-		"PORT":                    "37040",
-		"NEXT_PUBLIC_API_URL":     "https://api.example.com/platform",
-		"NEXT_PUBLIC_GOTRUE_URL":  "https://api.example.com/auth/v1",
-		"NEXT_PUBLIC_SITE_URL":    "https://studio.example.com",
-		"CSP_EXTRA_PROJECT_HOSTS": "*.api.example.com",
+		"HOSTNAME":                      "127.0.0.1",
+		"PORT":                          "37040",
+		"NEXT_PUBLIC_API_URL":           "https://api.example.com/platform",
+		"NEXT_PUBLIC_GOTRUE_URL":        "https://api.example.com/auth/v1",
+		"NEXT_PUBLIC_SITE_URL":          "https://studio.example.com",
+		"CSP_EXTRA_PROJECT_HOSTS":       "*.api.example.com",
+		"NEXT_PUBLIC_MCP_URL":           "https://api.example.com/mcp",
+		"SUPAVISE_MANAGEMENT_API_URL":   "http://127.0.0.1:7000",
+		"SUPAVISE_PROJECT_URL_TEMPLATE": "https://{ref}.api.example.com",
 	}
 	for k, v := range want {
 		if env[k] != v {
@@ -295,6 +298,9 @@ func TestStudioEnv(t *testing.T) {
 	env = studioEnv(cfg, false)
 	if env["NEXT_PUBLIC_HCAPTCHA_SITE_KEY"] != "site-key" || env["NEXT_PUBLIC_API_URL"] != "http://api.example.com/platform" {
 		t.Errorf("env = %v", env)
+	}
+	if env["NEXT_PUBLIC_MCP_URL"] != "http://api.example.com/mcp" || env["SUPAVISE_PROJECT_URL_TEMPLATE"] != "http://{ref}.api.example.com" {
+		t.Errorf("without TLS the MCP URL and the project URL template must be http: %v", env)
 	}
 	// The runtime substitution only accepts this alphabet (studio/README.md).
 	safe := regexp.MustCompile(`^[A-Za-z0-9._~:/@%+,*=-]*$`)
@@ -366,4 +372,106 @@ func TestStudioDisabledFeaturesMatchThePlaceholderFile(t *testing.T) {
 		}
 	}
 	t.Fatal("NEXT_PUBLIC_DISABLED_FEATURES is not in studio/placeholders.json")
+}
+
+// The MCP variables follow the node's own addresses: a public URL for the browser, the admin
+// listener for the server side, and the scheme of the public listeners for project URLs.
+func TestStudioEnvMCP(t *testing.T) {
+	cfg := config.Default()
+	cfg.Domain = "example.com"
+
+	for _, tc := range []struct{ name, admin, publicURL, api, mgmt string }{
+		{"default", "", "", "https://api.example.com/mcp", "http://127.0.0.1:7000"},
+		{"public url", "", "https://api.example.org/", "https://api.example.org/mcp", "http://127.0.0.1:7000"},
+		{"other loopback port", "127.0.0.1:7123", "", "https://api.example.com/mcp", "http://127.0.0.1:7123"},
+		{"all addresses", "0.0.0.0:7000", "", "https://api.example.com/mcp", "http://127.0.0.1:7000"},
+		{"no host", ":7001", "", "https://api.example.com/mcp", "http://127.0.0.1:7001"},
+		{"ipv6 unspecified", "[::]:7000", "", "https://api.example.com/mcp", "http://127.0.0.1:7000"},
+		{"ipv6 loopback", "[::1]:7000", "", "https://api.example.com/mcp", "http://[::1]:7000"},
+		{"not an address", "garbage", "", "https://api.example.com/mcp", "http://127.0.0.1:7000"},
+	} {
+		c := *cfg
+		if tc.admin != "" {
+			c.Listen.Admin = tc.admin
+		}
+		c.API.PublicURL = tc.publicURL
+		env := studioEnv(&c, false)
+		if env["NEXT_PUBLIC_MCP_URL"] != tc.api || env["SUPAVISE_MANAGEMENT_API_URL"] != tc.mgmt {
+			t.Errorf("%s: MCP URL %q, Management API URL %q; want %q and %q", tc.name,
+				env["NEXT_PUBLIC_MCP_URL"], env["SUPAVISE_MANAGEMENT_API_URL"], tc.api, tc.mgmt)
+		}
+		// Projects keep their own hosts whatever the public API URL is.
+		if env["SUPAVISE_PROJECT_URL_TEMPLATE"] != "https://{ref}.api.example.com" {
+			t.Errorf("%s: project URL template %q", tc.name, env["SUPAVISE_PROJECT_URL_TEMPLATE"])
+		}
+	}
+}
+
+// [api] disable_oauth removes the MCP endpoint, so Studio is not told about one: the Connect
+// panel keeps the URL the build defaults to, and the route has no Management API to call.
+func TestStudioEnvOAuthOff(t *testing.T) {
+	cfg := config.Default()
+	cfg.Domain = "example.com"
+	cfg.API.DisableOAuth = true
+	env := studioEnv(cfg, true)
+	for _, k := range []string{"NEXT_PUBLIC_MCP_URL", "SUPAVISE_MANAGEMENT_API_URL", "SUPAVISE_PROJECT_URL_TEMPLATE"} {
+		if v, ok := env[k]; ok {
+			t.Errorf("%s = %q with OAuth disabled; want it unset", k, v)
+		}
+	}
+	if env["NEXT_PUBLIC_API_URL"] == "" || env["NEXT_PUBLIC_DISABLED_FEATURES"] == "" {
+		t.Errorf("the rest of the environment must not change: %v", env)
+	}
+}
+
+// Every required placeholder of the build is set by studioEnv, and so is every optional one but the
+// two a node sets only when it departs from the default. An optional value that a unit forgets
+// would otherwise fall back to the build's default without any sign of it (an old MCP URL).
+func TestStudioEnvCoversPlaceholders(t *testing.T) {
+	b, err := os.ReadFile("../../studio/placeholders.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Values []struct {
+			Env      string `json:"env"`
+			Required bool   `json:"required"`
+			Default  string `json:"default"`
+		} `json:"values"`
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Domain = "example.com"
+	env := studioEnv(cfg, false)
+	// Placeholders a node sets only when it differs from the build's default.
+	optional := map[string]bool{"NEXT_PUBLIC_HCAPTCHA_SITE_KEY": true, "NEXT_PUBLIC_DISABLED_FEATURES": true}
+	seen := map[string]bool{}
+	for _, v := range doc.Values {
+		seen[v.Env] = true
+		if _, ok := env[v.Env]; !ok && (v.Required || !optional[v.Env]) {
+			t.Errorf("%s is in studio/placeholders.json (required: %v) and studioEnv does not set it", v.Env, v.Required)
+		}
+	}
+	if !seen["NEXT_PUBLIC_MCP_URL"] {
+		t.Error("NEXT_PUBLIC_MCP_URL is not in studio/placeholders.json")
+	}
+	// Server-side variables of patch 0004: not placeholders (read per request), always set.
+	for _, k := range []string{"SUPAVISE_MANAGEMENT_API_URL", "SUPAVISE_PROJECT_URL_TEMPLATE"} {
+		if env[k] == "" {
+			t.Errorf("%s is not set", k)
+		}
+		if seen[k] {
+			t.Errorf("%s is read at request time and must not be a placeholder", k)
+		}
+	}
+	// The launcher refuses placeholder values outside this alphabet; {ref} is only for the
+	// server-side template.
+	safe := regexp.MustCompile(`^[A-Za-z0-9._~:/@%+,*=-]*$`)
+	for _, v := range doc.Values {
+		if val, ok := env[v.Env]; ok && !safe.MatchString(val) {
+			t.Errorf("%s = %q has characters the launcher refuses", v.Env, val)
+		}
+	}
 }

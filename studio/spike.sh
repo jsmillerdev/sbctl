@@ -12,8 +12,11 @@
 #   +4 the mock Management API (studio/mock, built here with go)
 #   +5 Studio (our platform-mode build)
 # Then Playwright signs in, lists the two projects, opens the table editor on each, runs SQL,
-# visits the project home, auth users, storage, database and settings pages, and writes the
-# request log of the mock plus screenshots. Exit status is non-zero if any step failed.
+# visits the project home, auth users, storage, database and settings pages, opens Connect > MCP
+# (the substituted MCP URL), approves and declines a request on the OAuth consent page against the
+# mock's authorization endpoints, and calls Studio's /api/mcp route (patch 0004) with a project
+# scope. It writes the request log of the mock plus screenshots. Exit status is non-zero if any
+# step failed.
 #
 # Needs on the VM: curl, tar, zstd, git is not needed; go (to build the mock) unless
 # SPIKE_MOCK_BIN is set; node 20+ and npm (for playwright-core); sudo or root if Chromium's system
@@ -137,6 +140,9 @@ echo "spike: Studio $(basename "$STUDIO_ARCHIVE") sha256 $(sha256_of "$STUDIO_AR
 # $OUT/mock.json, both mode 600; SQL passwords go through psql's stdin, not argv) ------------------
 PGPW="$(rand 24)"; JWT_SECRET="$(rand 48)"; META_KEY="$(rand 32)"; USER_EMAIL="admin@example.test"; USER_PW="$(rand 20)"
 REF_A=mockprojectalphaaaaa; REF_B=mockprojectbetabbbbb   # 20 lowercase letters, like real refs
+# Two pending OAuth authorization requests for the consent page (the mock has no authorization server).
+AUTH_APPROVE=11111111-1111-4111-8111-111111111111; AUTH_DECLINE=22222222-2222-4222-8222-222222222222
+AUTH_NAME="Spike MCP Client"
 
 # ---- Postgres ---------------------------------------------------------------------------------
 log "postgres on :$PG_PORT"
@@ -223,6 +229,10 @@ cat > "$OUT/mock.json" <<JSON
   "projects": [
     {"ref": "$REF_A", "name": "Alpha", "db_url": "postgresql://postgres:$PGPW@$HOST:$PG_PORT/proj_a?sslmode=disable"},
     {"ref": "$REF_B", "name": "Beta",  "db_url": "postgresql://postgres:$PGPW@$HOST:$PG_PORT/proj_b?sslmode=disable"}
+  ],
+  "authorizations": [
+    {"id": "$AUTH_APPROVE", "name": "$AUTH_NAME", "redirect_uri": "http://$HOST:$MOCK_PORT/oauth-callback"},
+    {"id": "$AUTH_DECLINE", "name": "Declined Client", "redirect_uri": "https://client.example.test/callback", "scopes": ["projects:read"]}
   ]
 }
 JSON
@@ -233,9 +243,15 @@ wait_http "http://$HOST:$MOCK_PORT/healthz" 20 mock
 
 # ---- Studio -----------------------------------------------------------------------------------
 log "studio on :$STUDIO_PORT"
+# NEXT_PUBLIC_MCP_URL is what Connect > MCP shows; the other two are what the MCP route of patch 0004
+# reads (the Management API on loopback, and the project API URL for get_project_url). The mock stands
+# in for the Management API, as it does for NEXT_PUBLIC_API_URL.
+MCP_URL="http://$HOST:$MOCK_PORT/mcp"
 PORT="$STUDIO_PORT" HOSTNAME="$HOST" \
   NEXT_PUBLIC_API_URL="http://$HOST:$MOCK_PORT/platform" NEXT_PUBLIC_GOTRUE_URL="http://$HOST:$AUTH_PORT" \
   NEXT_PUBLIC_SITE_URL="http://$HOST:$STUDIO_PORT" CSP_EXTRA_PROJECT_HOSTS="*.localhost:$MOCK_PORT" \
+  NEXT_PUBLIC_MCP_URL="$MCP_URL" SUPAVISE_MANAGEMENT_API_URL="http://$HOST:$MOCK_PORT" \
+  SUPAVISE_PROJECT_URL_TEMPLATE="http://{ref}.localhost:$MOCK_PORT" \
   start studio "$STUDIO_DIR/bin/studio"
 wait_http "http://$HOST:$STUDIO_PORT/sign-in" 180 studio
 
@@ -298,6 +314,8 @@ set +e
 (cd "$PWDIR" && \
   SPIKE_STUDIO_URL="http://$HOST:$STUDIO_PORT" SPIKE_EMAIL="$USER_EMAIL" SPIKE_PASSWORD="$USER_PW" \
   SPIKE_REFS="$REF_A,$REF_B" SPIKE_MARKERS="alpha,beta" SPIKE_DATABASES="proj_a,proj_b" SPIKE_OUT="$OUT" \
+  SPIKE_MCP_URL="$MCP_URL" SPIKE_MOCK_URL="http://$HOST:$MOCK_PORT" SPIKE_AUTH_APPROVE="$AUTH_APPROVE" \
+  SPIKE_AUTH_DECLINE="$AUTH_DECLINE" SPIKE_AUTH_NAME="$AUTH_NAME" \
   SPIKE_REQUEST_LOG="$OUT/request-log.jsonl" SPIKE_CHROME="${SPIKE_CHROME:-}" node spike.mjs)
 RC=$?
 set -e

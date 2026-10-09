@@ -14,6 +14,7 @@ import (
 
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/oauth"
 	"github.com/supavise/supavise/internal/registry"
 	"github.com/supavise/supavise/internal/secrets"
 	"github.com/supavise/supavise/internal/sso"
@@ -583,12 +584,12 @@ func (d *DashboardSSO) Update(ctx context.Context, actor *members.Access, id str
 }
 
 // Remove deletes a provider: the memberships and roles of its users are removed, the provider goes
-// from GoTrue, the personal access tokens of its users are revoked (a token would otherwise outlive
-// the identity provider that vouched for its owner), and supavise's record of it goes last, so a
-// removal that stopped halfway can be run again and finishes. A token that cannot be revoked
-// stops the removal (502) with the record kept: a token without a record would pass AdmitUser,
-// which takes a user with no record for a password account. A provider that only GoTrue still
-// has can be removed too. orgID limits the removal to that organization (0: any).
+// from GoTrue, the personal access tokens and OAuth grants of its users are revoked (a token would
+// otherwise outlive the identity provider that vouched for its owner), and supavise's record of it
+// goes last, so a removal that stopped halfway can be run again and finishes. A token or grant that
+// cannot be revoked stops the removal (502) with the record kept: a token without a record would
+// pass AdmitUser, which takes a user with no record for a password account. A provider that only
+// GoTrue still has can be removed too. orgID limits the removal to that organization (0: any).
 func (d *DashboardSSO) Remove(ctx context.Context, actor *members.Access, id string, orgID int64) (*DashboardProvider, error) {
 	return d.remove(ctx, actor, id, orgID, 0)
 }
@@ -661,6 +662,10 @@ func (d *DashboardSSO) remove(ctx context.Context, actor *members.Access, id str
 				d.log().Warn("personal access tokens of a removed SSO user could not be revoked; the provider record stays", "user", u.UserID, "error", err)
 				return nil, errf(http.StatusBadGateway, "The personal access tokens of %s could not be revoked, so the provider was kept. Try again.", u.Email)
 			}
+			if err := d.revokeGrants(ctx, actor, u.UserID); err != nil {
+				d.log().Warn("OAuth grants of a removed SSO user could not be revoked; the provider record stays", "user", u.UserID, "error", err)
+				return nil, errf(http.StatusBadGateway, "The OAuth grants of %s could not be revoked, so the provider was kept. Try again.", u.Email)
+			}
 		}
 		// The record goes last: it is what a retry needs when a step above failed.
 		if _, err := d.Store.DeleteProvider(ctx, id); err != nil && !errors.Is(err, ErrNotFound) {
@@ -713,6 +718,23 @@ func (d *DashboardSSO) revokeTokens(ctx context.Context, userID string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// revokeGrants revokes the OAuth grants of a user that the provider no longer vouches for: an MCP
+// client holds a grant for the user's authority, and its refresh token would otherwise outlive the
+// identity provider. actor is the administrator who removed the provider or denied the user, nil
+// for the command line. The API refuses a denied user's access token whether or not the grants are
+// revoked here (see Deny); the grants are revoked so that nothing of them stays live.
+func (d *DashboardSSO) revokeGrants(ctx context.Context, actor *members.Access, userID string) error {
+	if d.Accounts == nil {
+		return nil
+	}
+	by := oauth.ActorOperator
+	if actor != nil && actor.UserID != "" {
+		by = actor.UserID
+	}
+	_, err := d.Accounts.revokeGrants(ctx, userID, by)
+	return err
 }
 
 // changed tells the owner of Studio's unit that the dashboard may have gained or lost its
@@ -878,6 +900,9 @@ func (d *DashboardSSO) Deny(ctx context.Context, actor *members.Access, org memb
 	// are deleted here: a failure is only logged.
 	if err := d.revokeTokens(ctx, u.UserID); err != nil {
 		d.log().Warn("personal access tokens of a denied SSO user could not be deleted", "user", u.UserID, "error", err)
+	}
+	if err := d.revokeGrants(ctx, actor, u.UserID); err != nil {
+		d.log().Warn("OAuth grants of a denied SSO user could not be revoked", "user", u.UserID, "error", err)
 	}
 	d.mu.Lock()
 	delete(d.admitted, userID)

@@ -61,6 +61,14 @@ type Options struct {
 	// Cluster, when set, ties the proxy to the other nodes: the load balancer's view of them and the
 	// follower's certificate mirror. Nil is a server on its own.
 	Cluster *Cluster
+	// MCPGate guards the remote MCP endpoint, api.<domain>/mcp. The proxy calls it for a request to
+	// that path before it forwards anything to Studio. The gate authenticates the bearer and answers
+	// CORS preflights and every refusal itself (it has written the response when ok is false); when ok
+	// is true the proxy forwards the request to Studio's /api/mcp with rawQuery as its query, which is
+	// the gate's rebuilt query and never the client's. The Management API implements it
+	// ((*api.Server).MCPGate). Nil: /mcp is not special; the request goes to the Management API like
+	// any other path of api.<domain>, which serves nothing there.
+	MCPGate func(w http.ResponseWriter, r *http.Request) (rawQuery string, ok bool)
 	Logger  *slog.Logger
 }
 

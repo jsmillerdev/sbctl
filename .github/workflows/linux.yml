@@ -369,6 +369,41 @@ jobs:
           path: /tmp/supavise-roles-logs
           if-no-files-found: ignore
 
+  # OAuth sign-in for MCP clients under systemd, without Studio (tests/linux/oauth/oauth-walk.mjs, steps
+  # L-01 to L-14, the contract of docs/design.md section 13): dynamic registration, authorize and consent, the token
+  # endpoint, revoke, an OAuth token on /v1 (bound to one organization, checked against its scopes, refused
+  # on /platform), the organization's OAuth Apps API, the gate in front of /mcp, CORS, the limiters, and
+  # that no secret sits in a table, an audit event or the journal. The real stdio MCP server runs with an
+  # OAuth access token. The /mcp checks that need Studio run in the `mcp-e2e` job of studio.yml.
+  oauth-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ws/') && '[{"runner":"ubuntu-24.04","arch":"amd64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: build supavise
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/supavise ./cmd/supavise
+      - name: oauth smoke
+        run: sudo env "PATH=$PATH" LOG_DIR=/tmp/supavise-oauth-logs SUPAVISE_BIN=/tmp/supavise REQUIRE_CLIENTS=1 tests/linux/oauth-smoke.sh
+      - if: always()
+        name: collect logs
+        run: sudo chmod -R a+rX /tmp/supavise-oauth-logs || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oauth-smoke-${{ matrix.arch }}
+          path: /tmp/supavise-oauth-logs
+          if-no-files-found: ignore
+
   # Single sign-on under systemd against a real SAML identity provider (SimpleSAMLphp in a
   # container; the image is amd64 only): the dashboard's providers and default roles, a person
   # of an unmapped domain waiting for approval, closed sign-up, Studio's SSO button, and a

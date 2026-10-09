@@ -48,6 +48,14 @@
       "required": false,
       "default": "",
       "doc": "Host sources that serve project APIs, for example *.api.example.com (patch 0003). Each is allowed over https and wss."
+    },
+    {
+      "env": "NEXT_PUBLIC_MCP_URL",
+      "kind": "url",
+      "placeholder": "https://supavise-placeholder-mcp.invalid/supavise-mcp",
+      "required": false,
+      "default": "http://localhost:8080/mcp",
+      "doc": "Remote MCP endpoint shown in Connect > MCP, for example https://api.example.com/mcp."
     }
   ]
 }

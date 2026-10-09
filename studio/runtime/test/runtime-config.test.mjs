@@ -41,7 +41,8 @@ function makeApp() {
     join(app, 'apps/studio/.next/static/chunks/a.js'),
     `let API_URL="${ph.NEXT_PUBLIC_API_URL.placeholder}",G="${ph.NEXT_PUBLIC_GOTRUE_URL.placeholder}",` +
       `S=\`${ph.NEXT_PUBLIC_SITE_URL.placeholder}/x\`,K="${ph.NEXT_PUBLIC_HCAPTCHA_SITE_KEY.placeholder}",` +
-      `D="${ph.NEXT_PUBLIC_DISABLED_FEATURES.placeholder}".split(",");`
+      `D="${ph.NEXT_PUBLIC_DISABLED_FEATURES.placeholder}".split(","),` +
+      `M="${ph.NEXT_PUBLIC_MCP_URL.placeholder}";`
   )
   writeFileSync(
     join(app, 'apps/studio/.next/server/pages/sign-in.html'),
@@ -67,7 +68,7 @@ function packaged() {
 }
 
 test('placeholders file is well formed', () => {
-  assert.ok(allPlaceholderStrings(spec).length >= 7)
+  assert.ok(allPlaceholderStrings(spec).length >= 9)
   for (const v of spec.values) {
     if (v.origin) assert.ok(v.placeholder.startsWith(v.origin), v.env)
   }
@@ -107,6 +108,7 @@ test('apply substitutes values, origins and CSP hosts', () => {
     applyRuntimeConfig(root, {
       ...goodEnv,
       NEXT_PUBLIC_HCAPTCHA_SITE_KEY: 'abc-123',
+      NEXT_PUBLIC_MCP_URL: 'https://api.example.com/mcp/',
       CSP_EXTRA_PROJECT_HOSTS: '*.api.example.com, db.example.net:8443',
     })
     const js = readFileSync(join(app, 'apps/studio/.next/static/chunks/a.js'), 'utf8')
@@ -115,6 +117,7 @@ test('apply substitutes values, origins and CSP hosts', () => {
     assert.match(js, /`https:\/\/studio\.example\.com\/x`/)
     assert.match(js, /K="abc-123"/)
     assert.match(js, /D="dashboard_auth:sign_up,/)
+    assert.match(js, /M="https:\/\/api\.example\.com\/mcp"/)
     const manifest = JSON.parse(readFileSync(join(app, 'apps/studio/.next/routes-manifest.json'), 'utf8'))
     const csp = manifest.headers[0].value
     assert.ok(csp.includes("connect-src 'self' https://api.example.com https://api.example.com "))
@@ -139,6 +142,8 @@ test('empty optional values: no captcha, default feature list, no extra CSP host
     const js = readFileSync(join(app, 'apps/studio/.next/static/chunks/a.js'), 'utf8')
     assert.match(js, /K="",/)
     assert.match(js, /D="dashboard_auth:sign_up,dashboard_auth:sign_in_with_github/)
+    // an install that does not set the MCP URL (an older unit) keeps the value Studio always had
+    assert.match(js, /M="http:\/\/localhost:8080\/mcp"/)
     const csp = JSON.parse(readFileSync(join(app, 'apps/studio/.next/routes-manifest.json'), 'utf8'))
       .headers[0].value
     assert.ok(!csp.includes('placeholder'))
@@ -201,8 +206,9 @@ test('missing required values and unsafe values are rejected', () => {
     NEXT_PUBLIC_HCAPTCHA_SITE_KEY: 'a"b',
     NEXT_PUBLIC_DISABLED_FEATURES: 'ok:key,not a key',
     CSP_EXTRA_PROJECT_HOSTS: "evil.com; script-src * 'unsafe-eval'",
+    NEXT_PUBLIC_MCP_URL: 'https://x.example.com/mcp?next=https://evil.example',
   })
-  assert.equal(bad.errors.length, 6, bad.errors.join('\n'))
+  assert.equal(bad.errors.length, 7, bad.errors.join('\n'))
 })
 
 test('applyRuntimeConfig reports bad input as a configError', () => {
@@ -241,4 +247,20 @@ test('SUPAVISE_STUDIO_SKIP_RUNTIME_CONFIG skips everything', () => {
 test('url-platform keeps an existing /platform suffix and trims slashes', () => {
   const { resolved } = resolveValues(spec, { ...goodEnv, NEXT_PUBLIC_API_URL: 'http://127.0.0.1:7000/platform//' })
   assert.equal(resolved.NEXT_PUBLIC_API_URL, 'http://127.0.0.1:7000/platform')
+})
+
+test('the MCP URL is optional, keeps its old default and is not a CSP source', () => {
+  const v = ph.NEXT_PUBLIC_MCP_URL
+  assert.equal(v.kind, 'url')
+  assert.equal(v.required, false)
+  assert.equal(v.default, 'http://localhost:8080/mcp')
+  assert.equal(v.origin, undefined)
+  const { resolved, errors } = resolveValues(spec, goodEnv)
+  assert.deepEqual(errors, [])
+  assert.equal(resolved.NEXT_PUBLIC_MCP_URL, 'http://localhost:8080/mcp')
+  assert.equal(
+    resolveValues(spec, { ...goodEnv, NEXT_PUBLIC_MCP_URL: 'https://api.example.com/mcp' }).resolved
+      .NEXT_PUBLIC_MCP_URL,
+    'https://api.example.com/mcp'
+  )
 })

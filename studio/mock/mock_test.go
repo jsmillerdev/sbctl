@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,8 @@ const (
 	refA          = "mockprojectalphaaaaa"
 	refB          = "mockprojectbetabbbbb"
 	studioOrigin  = "http://127.0.0.1:3000"
+	authApprove   = "11111111-1111-4111-8111-111111111111"
+	authDecline   = "22222222-2222-4222-8222-222222222222"
 )
 
 func testConfig(t *testing.T, pgmeta string) *Config {
@@ -33,6 +36,10 @@ func testConfig(t *testing.T, pgmeta string) *Config {
 		Projects: []Project{
 			{Ref: refA, Name: "Alpha", DBURL: "postgresql://postgres:p%40ss@127.0.0.1:5433/proj_a?sslmode=disable"},
 			{Ref: refB, Name: "Beta", DBURL: "postgresql://postgres:p%40ss@127.0.0.1:5433/proj_b?sslmode=disable"},
+		},
+		Authorizations: []Authorization{
+			{ID: authApprove, Name: "Test MCP Client", RedirectURI: "http://127.0.0.1:41234/callback?keep=1"},
+			{ID: authDecline, Name: "Other Client", RedirectURI: "https://client.example.test/cb", Scopes: []string{"projects:read"}},
 		},
 	}
 	if err := c.normalize(); err != nil {
@@ -155,6 +162,7 @@ func TestRealHandlersCarryTheDocumentedRequiredFields(t *testing.T) {
 		path := rt.template
 		path = strings.ReplaceAll(path, "{ref}", refA)
 		path = strings.ReplaceAll(path, "{slug}", orgSlug)
+		path = strings.ReplaceAll(path, "{id}", authApprove)
 		code, body, _ := do(t, "GET", ts.URL+path, tok, "")
 		if code != rt.shape.Status {
 			t.Errorf("%s: status %d, spec says %d", rt.template, code, rt.shape.Status)
@@ -330,6 +338,37 @@ func TestPgMetaProxyBuildsTheConnectionHeaderAndPassesStatusAndBody(t *testing.T
 	}
 }
 
+// The MCP tools run SQL through the Management API, not through the dashboard's pg-meta route.
+func TestManagementQueryRunsThroughPgMeta(t *testing.T) {
+	var gotQuery, gotConn string
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotConn, _ = decryptConnString(r.Header.Get("X-Connection-Encrypted"), testCryptoKey)
+		var in struct{ Query string }
+		_ = json.Unmarshal(b, &in)
+		gotQuery = in.Query
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"db":"proj_b"}]`))
+	}))
+	defer fake.Close()
+	s, ts, tok := newTestServer(t, fake.URL)
+
+	code, body, _ := do(t, "POST", ts.URL+"/v1/projects/"+refB+"/database/query", tok,
+		`{"query":"select current_database() as db","parameters":[],"read_only":true}`, "Content-Type", "application/json")
+	if code != 200 || string(body) != `[{"db":"proj_b"}]` {
+		t.Fatalf("query: %d %s", code, body)
+	}
+	if gotQuery != "select current_database() as db" || gotConn != s.cfg.Projects[1].DBURL {
+		t.Fatalf("pg-meta saw query=%q conn=%q", gotQuery, gotConn)
+	}
+	if code, _, _ = do(t, "POST", ts.URL+"/v1/projects/nosuchprojectxxxxxxx/database/query", tok, `{"query":"select 1"}`); code != 404 {
+		t.Fatalf("unknown project: %d", code)
+	}
+	if code, _, _ = do(t, "POST", ts.URL+"/v1/projects/"+refB+"/database/query", "", `{"query":"select 1"}`); code != 401 {
+		t.Fatalf("without a token: %d", code)
+	}
+}
+
 func TestCORS(t *testing.T) {
 	_, ts, _ := newTestServer(t, "")
 	code, _, h := do(t, "OPTIONS", ts.URL+"/platform/profile", "", "", "Origin", studioOrigin,
@@ -457,11 +496,16 @@ func TestConfigValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, body := range map[string]string{
-		"no secret":   `{"projects":[{"ref":"mockprojectalphaaaaa"}]}`,
-		"no projects": `{"jwt_secret":"s","projects":[]}`,
-		"bad ref":     `{"jwt_secret":"s","projects":[{"ref":"short"}]}`,
-		"duplicate":   `{"jwt_secret":"s","projects":[{"ref":"mockprojectalphaaaaa"},{"ref":"mockprojectalphaaaaa"}]}`,
-		"unknown key": `{"jwt_secret":"s","nope":1,"projects":[{"ref":"mockprojectalphaaaaa"}]}`,
+		"no secret":                `{"projects":[{"ref":"mockprojectalphaaaaa"}]}`,
+		"no projects":              `{"jwt_secret":"s","projects":[]}`,
+		"bad ref":                  `{"jwt_secret":"s","projects":[{"ref":"short"}]}`,
+		"duplicate":                `{"jwt_secret":"s","projects":[{"ref":"mockprojectalphaaaaa"},{"ref":"mockprojectalphaaaaa"}]}`,
+		"unknown key":              `{"jwt_secret":"s","nope":1,"projects":[{"ref":"mockprojectalphaaaaa"}]}`,
+		"short authorization id":   `{"jwt_secret":"s","projects":[{"ref":"mockprojectalphaaaaa"}],"authorizations":[{"id":"abc","name":"n","redirect_uri":"http://127.0.0.1/cb"}]}`,
+		"authorization no name":    `{"jwt_secret":"s","projects":[{"ref":"mockprojectalphaaaaa"}],"authorizations":[{"id":"abcdefgh","redirect_uri":"http://127.0.0.1/cb"}]}`,
+		"authorization bad scheme": `{"jwt_secret":"s","projects":[{"ref":"mockprojectalphaaaaa"}],"authorizations":[{"id":"abcdefgh","name":"n","redirect_uri":"javascript:alert(1)"}]}`,
+		"authorization fragment":   `{"jwt_secret":"s","projects":[{"ref":"mockprojectalphaaaaa"}],"authorizations":[{"id":"abcdefgh","name":"n","redirect_uri":"http://127.0.0.1/cb#x"}]}`,
+		"authorization duplicate":  `{"jwt_secret":"s","projects":[{"ref":"mockprojectalphaaaaa"}],"authorizations":[{"id":"abcdefgh","name":"n","redirect_uri":"http://127.0.0.1/cb"},{"id":"abcdefgh","name":"m","redirect_uri":"http://127.0.0.1/cb"}]}`,
 	} {
 		if _, err := loadConfig(write(body)); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -523,5 +567,108 @@ func TestRequestLogFileIsPrivate(t *testing.T) {
 	}
 	if st.Mode().Perm() != 0o600 {
 		t.Errorf("request log mode = %v, want 0600", st.Mode().Perm())
+	}
+}
+
+func TestAuthorizationDescribeApproveAndDecline(t *testing.T) {
+	_, ts, tok := newTestServer(t, "")
+	describe := func(id string) (int, map[string]any) {
+		t.Helper()
+		code, body, _ := do(t, "GET", ts.URL+"/platform/oauth/authorizations/"+id, tok, "")
+		var out map[string]any
+		_ = json.Unmarshal(body, &out)
+		return code, out
+	}
+
+	code, d := describe(authApprove)
+	if code != 200 || d["name"] != "Test MCP Client" || d["domain"] != "127.0.0.1" || d["registration_type"] != "dynamic" ||
+		d["approved_at"] != nil || d["website"] != "" || d["icon"] != nil {
+		t.Fatalf("describe: %d %v", code, d)
+	}
+	if scopes, _ := d["scopes"].([]any); len(scopes) == 0 {
+		t.Fatalf("a request without scopes gets the default set: %v", d)
+	}
+	if exp, err := time.Parse(time.RFC3339, d["expires_at"].(string)); err != nil || !exp.After(time.Now()) {
+		t.Fatalf("expires_at = %v (%v)", d["expires_at"], err)
+	}
+	if code, _ = describe("00000000-0000-4000-8000-000000000000"); code != 404 {
+		t.Fatalf("unknown id: %d", code)
+	}
+
+	// Approve answers with the redirect URL the client would get: its own query kept, plus code,
+	// state and the issuer.
+	approve := ts.URL + "/platform/organizations/" + orgSlug + "/oauth/authorizations/" + authApprove + "?skip_browser_redirect=true"
+	code, body, _ := do(t, "POST", approve, tok, "")
+	var res struct {
+		URL string `json:"url"`
+	}
+	if code != 201 || json.Unmarshal(body, &res) != nil {
+		t.Fatalf("approve: %d %s", code, body)
+	}
+	u, err := url.Parse(res.URL)
+	if err != nil || u.Host != "127.0.0.1:41234" || u.Path != "/callback" {
+		t.Fatalf("approve url = %q", res.URL)
+	}
+	q := u.Query()
+	if q.Get("keep") != "1" || q.Get("code") == "" || q.Get("state") == "" || q.Get("iss") != "http://"+strings.TrimPrefix(ts.URL, "http://") {
+		t.Fatalf("approve url query = %v", q)
+	}
+	// The request now reads as approved, in the organization that approved it, and cannot be decided again.
+	code, d = describe(authApprove)
+	if code != 200 || d["approved_at"] == nil || d["approved_organization_slug"] != orgSlug {
+		t.Fatalf("describe after approve: %d %v", code, d)
+	}
+	if code, _, _ = do(t, "POST", approve, tok, ""); code != 409 {
+		t.Fatalf("second approve: %d", code)
+	}
+	decline := ts.URL + "/platform/organizations/" + orgSlug + "/oauth/authorizations/" + authApprove
+	if code, _, _ = do(t, "DELETE", decline, tok, ""); code != 409 {
+		t.Fatalf("decline after approve: %d", code)
+	}
+
+	// Decline removes the request.
+	decline = ts.URL + "/platform/organizations/" + orgSlug + "/oauth/authorizations/" + authDecline
+	code, body, _ = do(t, "DELETE", decline, tok, "")
+	if code != 200 || !strings.Contains(string(body), authDecline) {
+		t.Fatalf("decline: %d %s", code, body)
+	}
+	if code, _ = describe(authDecline); code != 404 {
+		t.Fatalf("describe after decline: %d", code)
+	}
+	if code, _, _ = do(t, "DELETE", decline, tok, ""); code != 404 {
+		t.Fatalf("second decline: %d", code)
+	}
+	// Another organization is not this mock's.
+	other := ts.URL + "/platform/organizations/other-org/oauth/authorizations/" + authApprove
+	if code, _, _ = do(t, "POST", other, tok, ""); code != 404 {
+		t.Fatalf("approve in another organization: %d", code)
+	}
+}
+
+func TestAuthorizationRoutesNeedAToken(t *testing.T) {
+	_, ts, _ := newTestServer(t, "")
+	if code, _, _ := do(t, "GET", ts.URL+"/platform/oauth/authorizations/"+authApprove, "", ""); code != 401 {
+		t.Fatalf("describe without a token: %d", code)
+	}
+	if code, _, _ := do(t, "POST", ts.URL+"/platform/organizations/"+orgSlug+"/oauth/authorizations/"+authApprove, "", ""); code != 401 {
+		t.Fatalf("approve without a token: %d", code)
+	}
+}
+
+// The page the browser lands on after approving answers without a token, and its query (the
+// authorization code) never reaches the request log.
+func TestCallbackPageAnswersAndLogsNoQuery(t *testing.T) {
+	s, ts, _ := newTestServer(t, "")
+	code, body, hdr := do(t, "GET", ts.URL+callbackPath+"?code=secret-code&state=s", "", "")
+	if code != 200 || !strings.Contains(string(body), "Authorization received") || !strings.HasPrefix(hdr.Get("Content-Type"), "text/html") {
+		t.Fatalf("callback: %d %s", code, body)
+	}
+	s.close()
+	b, err := os.ReadFile(s.cfg.RequestLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), callbackPath) || strings.Contains(string(b), "secret-code") {
+		t.Fatalf("request log: %s", b)
 	}
 }

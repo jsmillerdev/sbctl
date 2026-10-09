@@ -2,12 +2,13 @@ package proxy
 
 import (
 	"net/http"
+	"path"
 	"strings"
 
 	"github.com/supavise/supavise/internal/notice"
 )
 
-// Studio is served unmodified (three patches, no fixups), so the two things its build
+// Studio is served unmodified (four patches, no fixups), so the two things its build
 // gets wrong for a self-hosted node are corrected here, on the way through.
 
 // Studio's own /api/incident-banner route asks incident.io, answers 500 without a key, and
@@ -100,4 +101,67 @@ func rewriteStudioResponse(h http.Header) {
 			h[http.CanonicalHeaderKey(name)][i] = scrubCSP(v, blockedStudioHosts)
 		}
 	}
+}
+
+// isStudioMCPPath reports whether a request to Studio's host is for Studio's own MCP route, /api/mcp.
+// The route serves the remote MCP endpoint, which is api.<domain>/mcp behind the Management API's
+// gate (serveMCP); the host Studio is served on has no gate, so the route is not reachable here. The
+// match ignores case and any prefix, and sees through dot segments, repeated slashes and an encoded
+// slash, so that no spelling of the path gets by.
+func isStudioMCPPath(p string) bool {
+	return strings.Contains(strings.ToLower(path.Clean("/"+p))+"/", "/api/mcp/")
+}
+
+// isStudioConsentPath reports whether p is a Studio page that approves access for someone else:
+// /authorize, where a user approves what an OAuth client may do, and /cli/login, where they approve
+// the Supabase CLI. A page that another site frames can be made to look like something else under a
+// click, so these two are served with framing forbidden (denyFraming).
+func isStudioConsentPath(p string) bool {
+	switch strings.ToLower(path.Clean("/" + p)) {
+	case "/authorize", "/cli/login":
+		return true
+	}
+	return false
+}
+
+// denyFraming forbids another site to frame the response: X-Frame-Options DENY for old browsers and
+// frame-ancestors 'none' in the Content-Security-Policy, whether Studio sent one or not. A policy that
+// already has a frame-ancestors directive gets its sources replaced, since a second directive of the
+// name is ignored by the browser.
+func denyFraming(h http.Header) {
+	const none = "frame-ancestors 'none'"
+	h.Set("X-Frame-Options", "DENY")
+	vals := h.Values("Content-Security-Policy")
+	if len(vals) == 0 {
+		h.Set("Content-Security-Policy", none)
+		return
+	}
+	for i, v := range vals {
+		h[http.CanonicalHeaderKey("Content-Security-Policy")][i] = withFrameAncestorsNone(v)
+	}
+}
+
+// withFrameAncestorsNone returns csp with frame-ancestors 'none' in place of its frame-ancestors
+// directive, or added at the end if it has none.
+func withFrameAncestorsNone(csp string) string {
+	const none = "frame-ancestors 'none'"
+	found := false
+	var kept []string
+	for _, d := range strings.Split(csp, ";") {
+		d = strings.TrimSpace(d)
+		switch fields := strings.Fields(d); {
+		case len(fields) == 0:
+		case strings.EqualFold(fields[0], "frame-ancestors"):
+			if !found {
+				kept = append(kept, none)
+			}
+			found = true
+		default:
+			kept = append(kept, d)
+		}
+	}
+	if !found {
+		kept = append(kept, none)
+	}
+	return strings.Join(kept, "; ")
 }
