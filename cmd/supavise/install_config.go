@@ -530,3 +530,26 @@ func dnsRecords(cfg *config.Config, ip string) []string {
 		fmt.Sprintf("%-28s %s  %s", "*.api."+cfg.BaseDomain(), typ, ip),
 	}
 }
+
+// roleARNRe is an IAM role ARN as AWS spells one: a partition, an account and a path-and-name that stay
+// within what a TOML string and a shell argument can hold without quoting.
+var roleARNRe = regexp.MustCompile(`^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$`)
+
+// applyStorageRole sets [fleet] storage_s3_role_arn from the instance's supavise:storage-role tag, so that
+// the daemon serves Storage short-lived credentials of the stack's role from the first start and
+// `supavise storage migrate --to s3` needs no credential flag (design addendum, decision 2). It leaves
+// alone a configuration that names a role already, and one with a static key, which excludes a role
+// (config.Validate); note says what it did or why not.
+func applyStorageRole(cfg *config.Config, arn string) (note string, err error) {
+	if !roleARNRe.MatchString(arn) {
+		return "", fmt.Errorf("%q is not the ARN of an IAM role", arn)
+	}
+	switch {
+	case cfg.Fleet.StorageS3RoleARN != "":
+		return "", nil
+	case cfg.Fleet.StorageS3AccessKeyID != "" || cfg.Fleet.StorageS3SecretAccessKey != "":
+		return "[fleet] holds a static key for Storage's bucket, so the stack's storage role is left unused", nil
+	}
+	cfg.Fleet.StorageS3RoleARN = arn
+	return "Storage gets credentials from the stack's role " + arn, nil
+}
