@@ -28,6 +28,9 @@ var roleNames = []string{"owner", "admin", "dev", "ro", "scoped", "stranger"}
 
 const secondRef = "bbbbbbbbbbbbbbbbbbbb"
 
+// matrixAuthID is the id of an authorization request that does not exist.
+const matrixAuthID = "5c1f6f0e-3b0a-4d7e-8a41-9e2d7b6c0a11"
+
 func newRolesFixture(t testing.TB) *rolesFixture {
 	t.Helper()
 	f := newFixture(t)
@@ -123,6 +126,12 @@ func matrixCases() []routeCase {
 		rc("YYNNNN", "POST", "/v1/projects/"+testRef+"/config/auth/sso/providers", map[string]any{"type": "saml"}),
 		rc("YYNNNN", "DELETE", "/v1/projects/"+testRef+"/config/auth/sso/providers/a0000000-0000-4000-8000-000000000001", nil),
 		rc("YYNNNN", "POST", org+"/oauth/apps", map[string]any{}),
+		// OAuth sign-in for MCP clients: only Owners and Administrators see an authorization request
+		// (the spec's organization_admin_read) and decide it. The decisions change state, so only the
+		// refusals are checked.
+		rc("YYNNNN", "GET", "/platform/oauth/authorizations/"+matrixAuthID, nil),
+		rd("YYNNNN", "POST", org+"/oauth/authorizations/"+matrixAuthID, map[string]any{}),
+		rd("YYNNNN", "DELETE", org+"/oauth/authorizations/"+matrixAuthID, nil),
 		rc("YYYYYN", "GET", "/v1/organizations/default/members", nil),
 		rc("YYYYYN", "GET", "/v2/organizations/default/roles", nil),
 		// project: reading
@@ -408,7 +417,9 @@ func TestPermissionsEndpointMatchesEnforcement(t *testing.T) {
 // account, the lists that filter themselves, an invitation by its token). Anything else, such as
 // a route of a family added later, needs a rule: otherwise a user without a role could use it.
 func TestImplementedRoutesOpenToEveryUserAreAllowlisted(t *testing.T) {
-	open := regexp.MustCompile(`^(/platform/(profile|cli/login)(/|$)|/v1/profile$|/(platform|v1)/(organizations|projects)$|/(platform|v1)/projects/available-regions$|/platform/organizations/\{slug\}/members/invitations/\{token\}$)`)
+	// The OAuth endpoints of /v1 are the clients' own: authorize, token and revoke carry no session (they
+	// are authNone, so the rule never decides), and the project-claim stub is open like its siblings.
+	open := regexp.MustCompile(`^(/platform/(profile|cli/login)(/|$)|/v1/profile$|/(platform|v1)/(organizations|projects)$|/(platform|v1)/projects/available-regions$|/platform/organizations/\{slug\}/members/invitations/\{token\}$|/v1/oauth/)`)
 	for key := range newFixture(t).srv.implemented() {
 		m, p, _ := strings.Cut(key, " ")
 		if n := routeNeed(m, p); n.kind == needAny && !open.MatchString(p) {
