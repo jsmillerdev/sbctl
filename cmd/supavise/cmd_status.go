@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/supavise/supavise/internal/app"
 	"github.com/supavise/supavise/internal/config"
 	"github.com/supavise/supavise/internal/failover"
 	"github.com/supavise/supavise/internal/fleet"
@@ -178,7 +179,8 @@ func statusDeps(ctx context.Context, cfg *config.Config) (health.Deps, func(), e
 	}
 	lz := fleet.NewLazy(fleet.Deps{Cfg: cfg, Log: log.With("component", "fleet")})
 	lz.Bind(node.Registry, node.Secrets)
-	deps, err := health.ForNode(node, health.NodeOptions{Version: version, Log: log, Tenants: lz.Fleet()})
+	// The projects homed on other nodes have no units here; their nodes report them.
+	deps, err := health.ForNode(app.NodeAtHome(node), health.NodeOptions{Version: version, Log: log, Tenants: lz.Fleet()})
 	if err != nil {
 		node.Close()
 		return downDeps(cfg, log, err), func() {}, err

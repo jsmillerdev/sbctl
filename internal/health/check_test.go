@@ -781,3 +781,29 @@ func TestHeldBackRestartsAreListedAndInformational(t *testing.T) {
 		t.Errorf("rendered report:\n%s", out.String())
 	}
 }
+
+// A node that follows has no primary GoTrue: it is parked, which the leader runs, and a parked
+// service is not a failure.
+func TestAFollowersSystemGoTrueIsParkedNotFailed(t *testing.T) {
+	e := newEnv(t)
+	e.deps.Follower = true
+	e.deps.System = func(context.Context) []lifecycle.ServiceHealth {
+		return []lifecycle.ServiceHealth{{Name: config.SvcPostgres, Healthy: true, Status: "ACTIVE_HEALTHY"}}
+	}
+	r := e.check()
+	if r.Verdict != Healthy {
+		t.Fatalf("verdict %q: %s\n%+v", r.Verdict, r.Summary, r.Components)
+	}
+	c, ok := r.Component("system gotrue")
+	if !ok || c.State != Info || !strings.Contains(c.Detail, "parked") {
+		t.Fatalf("system gotrue: %+v", c)
+	}
+	// The standby itself is still critical.
+	e.deps.System = func(context.Context) []lifecycle.ServiceHealth {
+		return []lifecycle.ServiceHealth{{Name: config.SvcPostgres, Status: "UNHEALTHY", Error: "the system cluster of a follower is not in recovery"}}
+	}
+	r = e.check()
+	if c, _ := r.Component("system postgres"); c.State != Fail || !c.Critical || r.Verdict != Down {
+		t.Fatalf("a follower whose standby is not one: %+v, verdict %q", c, r.Verdict)
+	}
+}

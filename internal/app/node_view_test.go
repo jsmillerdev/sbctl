@@ -68,3 +68,11 @@ func TestOpenFollowerAsksForAReadOnlyNode(t *testing.T) {
 		t.Fatal("the DSN an override named was replaced")
 	}
 }
+
+// `supavise status` sees a node through the same view; a node whose id is not known is returned as it is.
+func TestNodeAtHomeLeavesANodeWithoutAnIdAlone(t *testing.T) {
+	n := &lifecycle.Node{Registry: registry.NewMemory()}
+	if got := NodeAtHome(n); got != n {
+		t.Fatal("a node with no engine got a view of its registry")
+	}
+}

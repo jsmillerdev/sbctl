@@ -50,6 +50,9 @@ type Deps struct {
 	Plane ProjectProber
 	// System probes the system project (supavise-postgres@system and supavise-gotrue@system).
 	System func(ctx context.Context) []lifecycle.ServiceHealth
+	// Follower marks a node that follows the leader of its cluster: System probes the standby and not
+	// a primary, and the system GoTrue is parked, which is not a failure.
+	Follower bool
 	// Services reports the shared services (fleet.Manager.Status).
 	Services func(ctx context.Context) []fleet.Health
 	// Tenants asks the shared services whether they hold each project's tenant.
@@ -146,6 +149,8 @@ func (d *Deps) checkNode(ctx context.Context) []Component {
 			h, ok := got[svc]
 			c := Component{Name: "system " + svc, Critical: svc == config.SvcPostgres, State: OK}
 			switch {
+			case d.Follower && svc == config.SvcGoTrue:
+				c.State, c.Detail = Info, "parked: this node follows the leader, which runs it"
 			case !ok:
 				c.State, c.Detail = Fail, "not checked"
 			case !h.Healthy:
