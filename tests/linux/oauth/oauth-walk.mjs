@@ -45,6 +45,11 @@ export function sseMessages(body) {
   return out;
 }
 
+// canon sorts the keys of every object in v, so that a comparison sees values and not the order in which
+// a server happened to write them. Arrays keep their order.
+export const canon = (v) =>
+  Array.isArray(v) ? v.map(canon) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SCOPES13 = [
   "organizations:read", "projects:read", "projects:write", "database:read", "database:write",
@@ -72,6 +77,7 @@ function selfTest() {
   const msgs = sseMessages('event: message\ndata: {"id":1,"result":{"a":1}}\n\nevent: message\ndata: {"id":2}\n\n');
   must(msgs.length === 2 && msgs[0].result.a === 1 && msgs[1].id === 2, "sse parse");
   must(UUID_RE.test(crypto.randomUUID()), "uuid shape");
+  must(JSON.stringify(canon({ b: [{ d: 1, c: 2 }, 3], a: null })) === '{"a":null,"b":[{"c":2,"d":1},3]}', "canon sorts object keys and keeps array order");
   console.log("oauth-walk self-test ok");
 }
 
@@ -98,7 +104,7 @@ function ok(cond, what) {
   if (!cond) throw new WalkError(what);
 }
 function eq(got, want, what) {
-  if (JSON.stringify(got) !== JSON.stringify(want)) throw new WalkError(`${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+  if (JSON.stringify(canon(got)) !== JSON.stringify(canon(want))) throw new WalkError(`${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
 }
 
 async function step(id, title, fn) {
@@ -363,18 +369,25 @@ await step("L-01", "/mcp without a token, and the two discovery documents", asyn
     authorization_response_iss_parameter_supported: true,
   }, "authorization server metadata");
 
-  // Built from configuration, never from the Host header.
-  const evil = status(await call("GET", "/.well-known/oauth-authorization-server", { host: "evil.example" }), 200, "metadata with a foreign Host");
-  eq(evil.json.issuer, issuer, "issuer under Host: evil.example");
-  eq(evil.json.token_endpoint, `${issuer}/v1/oauth/token`, "token endpoint under Host: evil.example");
-  // The path form only: hosted answers 404 for the root form.
-  status(await call("GET", "/.well-known/oauth-protected-resource"), 404, "root form of the protected resource metadata");
-  // /mcp is not served on the loopback admin listener.
+  // Built from configuration, never from the Host header. The edge dispatches on Host, so a foreign one
+  // never reaches the API through it; the loopback admin listener serves the API for any Host.
   if (cfg.admin_url) {
     const a = new URL(cfg.admin_url);
-    const r2 = await call("POST", "/mcp", { target: { host: a.hostname, port: Number(a.port) }, host: a.host, json: { jsonrpc: "2.0", id: 1, method: "tools/list" } });
+    const admin = { target: { host: a.hostname, port: Number(a.port) } };
+    const evil = status(await call("GET", "/.well-known/oauth-authorization-server", { ...admin, host: "evil.example" }), 200, "metadata with a foreign Host on the admin listener");
+    eq(evil.json.issuer, issuer, "issuer under Host: evil.example");
+    eq(evil.json.token_endpoint, `${issuer}/v1/oauth/token`, "token endpoint under Host: evil.example");
+    status(await call("GET", "/.well-known/oauth-authorization-server", { host: "evil.example" }), 404, "metadata with a foreign Host at the edge");
+    // /mcp is not served on the loopback admin listener.
+    const r2 = await call("POST", "/mcp", { ...admin, host: a.host, json: { jsonrpc: "2.0", id: 1, method: "tools/list" } });
     ok(r2.status >= 400 && !(r2.h("www-authenticate") ?? "").includes("resource_metadata"), `the admin listener serves /mcp: ${r2.describe()}`);
+  } else {
+    log("      no admin_url in the config: the foreign Host and the admin listener checks are skipped");
   }
+  // The path form only: the root form is an unrouted path, which answers like any other (401 without a
+  // credential, 404 with one).
+  status(await call("GET", "/.well-known/oauth-protected-resource", { token: cfg.owner_pat }), 404, "root form of the protected resource metadata");
+  status(await call("GET", "/.well-known/oauth-protected-resource"), [401, 404], "root form of the protected resource metadata without a credential");
 });
 
 await step("L-02", "dynamic registration: a loopback client, and what is refused", async () => {
@@ -600,14 +613,17 @@ await step("L-07", "refresh: rotation, reuse inside the grace window, narrowing"
   log(`      refresh asking for organizations:read -> scope ${r3.scope.split(" ").length > 3 ? "unchanged (" + r3.scope.split(" ").length + " scopes)" : r3.scope}`);
   status(await call("GET", "/v1/organizations", { token: r3.access_token }), 200, "organizations:read after the narrowed refresh");
   oauthError(await token(pub, { grant_type: "refresh_token", refresh_token: r3.refresh_token, scope: "analytics:write" }, "post"), 400, "invalid_scope", "a scope outside the grant");
-  // Design section 2.7 admits a dynamic client without a secret "only for authorization_code". Whether a
-  // public client may refresh without its secret is recorded here, not judged.
-  const probe = await token(pub, { grant_type: "refresh_token", refresh_token: r3.refresh_token }, "none");
-  log(`      refresh by a public client without its secret -> ${probe.status} ${probe.status === 200 ? "(accepted)" : String(probe.text).slice(0, 80)}`);
+  // A dynamic app registered with token_endpoint_auth_method none has no secret to present: it redeems a
+  // code with its PKCE verifier and refreshes with the token alone (the token rotates and a reuse revokes
+  // the grant). An app that registered for a secret never gets either without it.
+  const r4 = checkTokenResponse(await token(pub, { grant_type: "refresh_token", refresh_token: r3.refresh_token }, "none"), "refresh by a public client without a secret");
+  ok(r4.refresh_token !== r3.refresh_token, "a refresh without a secret returned the old refresh token");
+  const cx = await obtain(conf, owner, org, { how: "post" });
+  oauthError(await token(conf, { grant_type: "refresh_token", refresh_token: cx.refresh_token }, "none"), 401, "invalid_client", "refresh by a confidential client without its secret");
   // Another client cannot use the refresh token.
-  oauthError(await token(conf, { grant_type: "refresh_token", refresh_token: r3.refresh_token }, "post"), 400, "invalid_grant", "a refresh token of another client");
+  oauthError(await token(conf, { grant_type: "refresh_token", refresh_token: r4.refresh_token }, "post"), 400, "invalid_grant", "a refresh token of another client");
   // The resource, when sent, has to be the stored one.
-  oauthError(await token(pub, { grant_type: "refresh_token", refresh_token: r3.refresh_token, resource: "https://evil.example/mcp" }, "post"), 400, "invalid_target", "a different resource on refresh");
+  oauthError(await token(pub, { grant_type: "refresh_token", refresh_token: r4.refresh_token, resource: "https://evil.example/mcp" }, "post"), 400, "invalid_target", "a different resource on refresh");
 });
 
 await step("L-08", "revoke: client credentials, other clients' tokens, the 401 at the API and at /mcp", async () => {
@@ -723,6 +739,15 @@ if (cfg.mcp) {
     // Studio's own route is not reachable on the dashboard host.
     const direct = await call("POST", "/api/mcp", { host: new URL(dashboard).host, token: t, json: { jsonrpc: "2.0", id: 1, method: "tools/list" } });
     eq(direct.status, 404, "studio.<domain>/api/mcp");
+
+    // The pages that approve access cannot be framed, whatever Studio sends (the proxy sets the headers).
+    for (const p of [`/authorize?auth_id=${crypto.randomUUID()}`, "/cli/login?session_id=walk"]) {
+      const f = await call("GET", p, { host: new URL(dashboard).host, headers: { accept: "text/html" } });
+      const name = p.split("?")[0];
+      eq((f.h("x-frame-options") ?? "").toUpperCase(), "DENY", `${name}: X-Frame-Options`);
+      const csp = f.h("content-security-policy") ?? "";
+      ok(/(^|[;,]\s*)frame-ancestors\s+'none'\s*([;,]|$)/i.test(csp), `${name}: Content-Security-Policy lacks frame-ancestors 'none': ${csp.slice(0, 200)}`);
+    }
   });
 }
 

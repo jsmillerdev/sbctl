@@ -2,6 +2,12 @@
 // oauth-walk.mjs can be checked on a development machine (see selftest.mjs). It is not the server:
 // it keeps everything in memory, skips MFA and SSO, and implements only the routes the walk calls.
 // When the walk and the real server disagree, the design decides which one is wrong.
+//
+// It serves the two listeners a node has. The edge dispatches on the Host header the way
+// internal/proxy/handler.go does: api.<domain> reaches the Management API, studio.<domain> reaches Studio
+// and any other host is a 404. The admin listener serves the Management API for any Host, without /mcp.
+// Routes the API does not define answer 401 without a token and 404 with one, as the mux fallback does.
+// A walk that passes here has not been checked against the real edge; that happens in oauth-smoke.
 import crypto from "node:crypto";
 import http from "node:http";
 
@@ -38,7 +44,8 @@ export async function startFake({ mcp = false, domain = "supavise.test" } = {}) 
   const jwtFor = (u) => { const j = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: u.id, email: u.email, n: hex(4) })).toString("base64url")}.${hex(8)}`; jwts.set(j, u.id); return j; };
   const userById = (id) => [...users.values()].find((u) => u.id === id);
 
-  const server = http.createServer(async (req, res) => {
+  // handle serves one request. edge is true on the listener that dispatches on Host, false on the admin one.
+  const handle = async (req, res, edge) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString("utf8");
@@ -62,9 +69,15 @@ export async function startFake({ mcp = false, domain = "supavise.test" } = {}) 
     // ---- internal hooks for fake-cli.mjs
     if (url.pathname.startsWith("/__cli/")) return cliRoute(url, q, out, err);
 
-    // ---- the dashboard host
-    if (host === `studio.${domain}`) {
+    // ---- the edge: a host that is neither the API's nor Studio's is not ours
+    if (edge && host !== `api.${domain}` && host !== `studio.${domain}`) return err(404, "Not Found");
+
+    // ---- the dashboard host: Studio, when there is one. The proxy forbids framing of the consent pages.
+    if (edge && host === `studio.${domain}`) {
       if (url.pathname === "/api/mcp") return err(404, "Not Found");
+      if (mcp && (url.pathname === "/authorize" || url.pathname === "/cli/login")) {
+        return out(200, "<html></html>", { "content-type": "text/html", "x-frame-options": "DENY", "content-security-policy": "default-src 'self'; frame-ancestors 'none'" });
+      }
       return err(404, "no studio here");
     }
 
@@ -86,7 +99,6 @@ export async function startFake({ mcp = false, domain = "supavise.test" } = {}) 
       token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"], revocation_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"],
       code_challenge_methods_supported: ["S256"], scopes_supported: ADVERTISED, authorization_response_iss_parameter_supported: true,
     }, { "cache-control": "public, max-age=3600" });
-    if (url.pathname.startsWith("/.well-known/")) return err(404, "Not Found");
 
     // ---- dashboard sign-in and the claim page
     if (R("POST", "/auth/v1/token")) { const b = body(); const u = users.get(b?.email); if (!u || u.removed || u.password !== b.password) return err(400, "Invalid login credentials"); return out(200, { access_token: jwtFor(u), token_type: "bearer" }); }
@@ -114,8 +126,8 @@ export async function startFake({ mcp = false, domain = "supavise.test" } = {}) 
     const roleIn = (p, orgId) => (p.orgs.includes(orgId) ? p.user.roles[orgId] : undefined);
     const orgBySlug = (s) => orgs.find((o) => o.slug === s);
 
-    // ---- /mcp: the edge gate
-    if (url.pathname === "/mcp") {
+    // ---- /mcp: the edge gate (the admin listener does not serve it)
+    if (edge && url.pathname === "/mcp") {
       const prm = `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource/mcp"`;
       if (!bearer) return out(401, { message: "No access token provided" }, { "www-authenticate": prm });
       const p = principal();
@@ -278,8 +290,11 @@ export async function startFake({ mcp = false, domain = "supavise.test" } = {}) 
     }
     if (R("GET", "/platform/profile")) { const p = principal(); return p && p.via === "jwt" ? out(200, { id: 1 }) : err(401, "Unauthorized"); }
 
-    return err(404, "Not Found");
-  });
+    // The mux fallback takes any credential: no token is a 401, a valid one a 404.
+    return principal() ? err(404, "Not Found") : err(401, "Unauthorized");
+  };
+  const server = http.createServer((req, res) => handle(req, res, true));
+  const adminServer = http.createServer((req, res) => handle(req, res, false));
 
   // ---- helpers that need the server's state
   function corsOpen(path) { return path.startsWith("/.well-known/") || path === "/v1/oauth/token" || path === "/v1/oauth/revoke" || path === "/platform/oauth/apps/register" || path === "/mcp"; }
@@ -315,7 +330,7 @@ export async function startFake({ mcp = false, domain = "supavise.test" } = {}) 
     const badClient = () => fail(401, "invalid_client", "Client authentication failed", usedBasic ? { "www-authenticate": "Basic" } : {});
     if (!app || app.deleted) return badClient();
     if (secret) { if (!app.secrets.some((s) => s.hash === sha(secret))) return badClient(); }
-    else if (app.type === "manual" || f.grant_type !== "authorization_code") return badClient();
+    else if (app.type === "manual" || !(f.grant_type === "authorization_code" || (f.grant_type === "refresh_token" && app.method === "none"))) return badClient();
     const gt = f.grant_type;
     if (gt === "authorization_code") {
       const a = [...auths.values()].find((x) => x.code === f.code && x.app === app.id);
@@ -392,8 +407,9 @@ export async function startFake({ mcp = false, domain = "supavise.test" } = {}) 
   }
 
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  await new Promise((r) => adminServer.listen(0, "127.0.0.1", r));
   return {
-    port: server.address().port, issuer, dashboard, domain, pat, org: "default", org2: "second", ref: projects[0].ref, ref2: projects[1].ref,
-    owner: { email: owner.email, password: owner.password }, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(r); }),
+    port: server.address().port, adminPort: adminServer.address().port, issuer, dashboard, domain, pat, org: "default", org2: "second", ref: projects[0].ref, ref2: projects[1].ref,
+    owner: { email: owner.email, password: owner.password }, close: () => Promise.all([server, adminServer].map((x) => new Promise((r) => { x.closeAllConnections?.(); x.close(r); }))),
   };
 }
