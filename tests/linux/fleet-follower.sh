@@ -12,7 +12,10 @@
 #            without bin/prepare and parks the other services; the replicated tenant of the project
 #            logs in; a replica tenant written by the leader is served after the standby replayed it
 #            and the follower's Supavisor was told to forget the old target (GET
-#            /api/tenants/<id>/terminate); nothing writes to the standby.
+#            /api/tenants/<id>/terminate); nothing writes to the standby. The follower's edge
+#            also serves the remote MCP endpoint (api.<domain>/mcp): its gate reads the standby,
+#            refuses a request with no token or an unknown one, and lets the leader's personal
+#            access token through to Studio's port (a stand-in here for the mesh's forwarder).
 #
 #   sudo SUPAVISE_BIN=/path/to/supavise-linux-amd64 FLEET_FOLLOWER_TEST=/path/to/fleet.test tests/linux/fleet-follower.sh
 #
@@ -309,8 +312,8 @@ chmod 0640 "$FF_ROOT/follower.toml"
 
 log "the follower node's shared services on its standby (Go test, as the supavise user)"
 T0=$(stamp)
-export FLEET_FOLLOWER_CONFIG=$FF_ROOT/follower.toml FLEET_LEADER_CONFIG=$SUPAVISE_CONF FLEET_REF=$REF FLEET_DB_PASSWORD=$DBPW FLEET_REPLICA_PORT=$REPLICA_PORT
-(cd / && sudo -u "$SUPAVISE_USER" -H --preserve-env=FLEET_FOLLOWER_CONFIG,FLEET_LEADER_CONFIG,FLEET_REF,FLEET_DB_PASSWORD,FLEET_REPLICA_PORT \
+export FLEET_FOLLOWER_CONFIG=$FF_ROOT/follower.toml FLEET_LEADER_CONFIG=$SUPAVISE_CONF FLEET_REF=$REF FLEET_DB_PASSWORD=$DBPW FLEET_REPLICA_PORT=$REPLICA_PORT FLEET_PAT=$PAT
+(cd / && sudo -u "$SUPAVISE_USER" -H --preserve-env=FLEET_FOLLOWER_CONFIG,FLEET_LEADER_CONFIG,FLEET_REF,FLEET_DB_PASSWORD,FLEET_REPLICA_PORT,FLEET_PAT \
   "$FOLLOWER_TEST" -test.v -test.run '^TestLinuxFollower$' -test.timeout 20m) 2>&1 | tee "$LOG_DIR/follower-test.log" || fail "the follower test failed"
 
 log "nothing wrote to the standby"
