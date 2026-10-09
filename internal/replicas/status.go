@@ -77,7 +77,7 @@ func (c *Controller) health(ctx context.Context, r *registry.Replica, obs *peera
 		return stay, "" // promoted: the failover procedure owns the row now
 	case obs.Role == "absent" || !obs.PostgresUp:
 		bad = "Postgres is not running"
-	case r.Origin != registry.ReplicaSystem && !obs.PostgRESTReady:
+	case !r.IsSystemStandby() && !obs.PostgRESTReady:
 		bad = "PostgREST does not answer"
 	case !recvDown.IsZero() && now.Sub(recvDown) >= receiverGrace:
 		bad = fmt.Sprintf("the WAL receiver has not been streaming for %s", now.Sub(recvDown).Round(time.Second))

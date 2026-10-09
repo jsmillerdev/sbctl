@@ -399,7 +399,7 @@ func (o *Orchestrator) settle(ctx context.Context, ref string, s registry.Status
 // movable reports whether the status is one a move leaves behind or sets: the move's own RESTARTING,
 // and the active ones it gives back.
 func movable(s registry.Status) bool {
-	return s == registry.StatusRestarting || s == registry.StatusActiveHealthy || s == registry.StatusActiveUnhealthy
+	return s == registry.StatusRestarting || s.Running()
 }
 
 // statusAfter is the status a project gets back once its move is over: paused stays paused, and

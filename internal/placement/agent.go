@@ -145,7 +145,7 @@ func NewNodeAgent(o AgentOptions) *NodeAgent {
 		o.Poll = 2 * time.Second
 	}
 	if o.Concurrency <= 0 {
-		o.Concurrency = defaultConcurrency
+		o.Concurrency = DefaultConcurrency
 	}
 	return &NodeAgent{o: o, insts: map[string]*instance{}, locks: map[string]*sync.Mutex{}, base: context.Background()}
 }
@@ -585,7 +585,7 @@ func (a *NodeAgent) ObserveAll(ctx context.Context) []peerapi.InstanceStatus {
 	for i, id := range order {
 		got[i] = &observed{id: id}
 	}
-	eachLimit(ctx, a.o.Concurrency, got, func(o *observed) {
+	EachLimit(ctx, a.o.Concurrency, got, func(o *observed) {
 		if st, err := a.Observe(ctx, o.id); err == nil {
 			o.st = &st
 		}
@@ -861,7 +861,7 @@ func (a *NodeAgent) StartLocal(ctx context.Context) {
 			todo = append(todo, r)
 		}
 	}
-	eachLimit(ctx, a.o.Concurrency, todo, func(r registry.Replica) {
+	EachLimit(ctx, a.o.Concurrency, todo, func(r registry.Replica) {
 		unlock := a.lockRef(r.Ref)
 		// A cluster that is no standby of this replica was promoted, and the registry has not caught up
 		// (the daemon or the machine restarted between the promotion and the move of the home): starting

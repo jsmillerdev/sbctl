@@ -331,7 +331,7 @@ func needsWork(r *registry.Replica) bool {
 	switch {
 	case r.Status == statusGoingDown:
 		return true
-	case r.Origin == registry.ReplicaSystem:
+	case r.IsSystemStandby():
 		return true
 	case r.Status == registry.ReplicaInitError:
 		return false
@@ -390,7 +390,7 @@ func (c *Controller) work(ctx context.Context, r *registry.Replica, project regi
 	switch {
 	case r.Status == statusGoingDown:
 		c.removeStep(ctx, r)
-	case r.Origin == registry.ReplicaSystem:
+	case r.IsSystemStandby():
 		c.watchSystem(ctx, r)
 	case settingUp(r):
 		c.setupStep(ctx, r)

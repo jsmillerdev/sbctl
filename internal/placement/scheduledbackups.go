@@ -176,8 +176,7 @@ func (s *ScheduledBackups) Once(ctx context.Context) map[string]error {
 
 // homedElsewhere reports whether p is a running project of another node: the ones the schedule backs up.
 func (s *ScheduledBackups) homedElsewhere(p *registry.Project) bool {
-	return p.Ref != config.SystemRef && p.NodeID != "" && p.NodeID != s.Self() &&
-		(p.Status == registry.StatusActiveHealthy || p.Status == registry.StatusActiveUnhealthy)
+	return p.Ref != config.SystemRef && p.NodeID != "" && p.NodeID != s.Self() && p.Status.Running()
 }
 
 // due reports whether ref has no completed base backup newer than Every.

@@ -32,7 +32,7 @@ func (c *Controller) Remove(ctx context.Context, ref, identifier string) error {
 	if err != nil {
 		return err
 	}
-	if r.Origin == registry.ReplicaSystem {
+	if r.IsSystemStandby() {
 		return refuse("The standby of the system cluster goes away with its server: use `supavise node rm`.")
 	}
 	if r.Status == statusGoingDown {
@@ -168,7 +168,7 @@ func (c *Controller) removeOnce(ctx context.Context, r *registry.Replica) bool {
 	if n, err := c.reg.GetNode(ctx, r.NodeID); err == nil && n.State == registry.NodeLeft {
 		gone = true
 	}
-	if c.o.Pooler != nil && r.Origin != registry.ReplicaSystem {
+	if c.o.Pooler != nil && !r.IsSystemStandby() {
 		if err := c.o.Pooler.RemoveReplicaTenant(ctx, r.Identifier); err != nil {
 			c.removeFailed(r, fmt.Errorf("drop the Supavisor tenant: %w", err))
 			return false
@@ -177,7 +177,7 @@ func (c *Controller) removeOnce(ctx context.Context, r *registry.Replica) bool {
 	// The standby of the system cluster is the node's own cluster. Removing the instance would wipe
 	// the registry copy of a node that may be alive, so only the row goes; the retirement of a node
 	// takes its system cluster with it (internal/cluster).
-	if !gone && r.Origin != registry.ReplicaSystem {
+	if !gone && !r.IsSystemStandby() {
 		if c.o.Ops == nil {
 			c.removeFailed(r, errNoOps)
 			return false
