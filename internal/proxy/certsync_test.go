@@ -299,6 +299,50 @@ func newMirrorOf(l *leaderStore, dir string) *certMirror {
 	return newCertMirror(dir, &CertSync{Source: l.src, Interval: time.Hour}, quietLog())
 }
 
+// A first snapshot that could not be written is fetched whole again: asking for it by its tag would
+// be answered with 304 and the mirror would never apply it.
+func TestMirrorFetchesTheWholeStoreAgainAfterAFailedFirstApply(t *testing.T) {
+	ctx := context.Background()
+	l := newLeaderStore(t)
+	issuer := "acme.test-dir"
+	crt, key := testCert(t, "api.example.com")
+	writeSite(t, l.dir, issuer, "api.example.com", crt, key)
+
+	local := t.TempDir()
+	// A file sits where the site's directory belongs: the first apply fails.
+	site := filepath.Join(local, "certificates", issuer, "api.example.com")
+	writeFile(t, site, "in the way")
+	m := newMirrorOf(l, local)
+	told := 0
+	m.onSnapshot = func(context.Context, peerapi.CertSnapshot) { told++ }
+	if err := m.sync(ctx); err == nil {
+		t.Fatal("the first snapshot was applied over a file")
+	}
+	if told != 0 {
+		t.Fatalf("onSnapshot told %d times of a snapshot that is not on disk", told)
+	}
+	if err := os.Remove(site); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.sync(ctx); err != nil {
+		t.Fatalf("the retry: %v", err)
+	}
+	paths := l.rpc.paths()
+	if len(paths) != 2 || strings.Contains(paths[1], "etag=") {
+		t.Fatalf("fetches: %v, want the second to ask for the whole store", paths)
+	}
+	if b, _ := os.ReadFile(filepath.Join(site, "api.example.com.crt")); string(b) != string(crt) || told != 1 {
+		t.Fatalf("after the retry: the certificate is on disk: %v, onSnapshot told %d times", string(b) == string(crt), told)
+	}
+	// Once applied, the tag is used again.
+	if err := m.sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if paths := l.rpc.paths(); len(paths) != 3 || !strings.HasPrefix(paths[2], peerapi.PathCerts+"?etag=") {
+		t.Fatalf("fetches: %v, want the third to carry the tag", paths)
+	}
+}
+
 // A snapshot that could not be written is applied again on the next fetch, even though the leader
 // answers 304 to its tag; once it is on disk, a 304 does nothing.
 func TestMirrorAppliesAFailedSnapshotOnTheNextNotModified(t *testing.T) {

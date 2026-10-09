@@ -559,7 +559,13 @@ func (m *certMirror) sync(ctx context.Context) error {
 	defer m.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	snap, err := m.src.Certs(ctx, m.tag)
+	tag := m.tag
+	if !m.have {
+		// Nothing is applied yet. The tag may name a snapshot that was fetched and could not be written;
+		// asking for it by tag would be answered with "not modified" for ever, so ask for the whole store.
+		tag = ""
+	}
+	snap, err := m.src.Certs(ctx, tag)
 	switch {
 	case errors.Is(err, ErrCertsNotModified):
 		if !m.have {
