@@ -444,8 +444,9 @@ type certMirror struct {
 	src      CertSource
 	interval time.Duration
 	log      *slog.Logger
-	// onSnapshot is told of the store after every fetch that reached the leader and brought files,
-	// changed or not, and once at the start of run of what the node already holds on disk.
+	// onSnapshot is told of the store after every fetch that brought files, and once at the start of
+	// run of what the node already holds on disk. A fetch the leader answers with "not modified" tells
+	// it again only while the snapshot is not fully applied (see applied).
 	onSnapshot func(ctx context.Context, snap peerapi.CertSnapshot)
 	poke       chan struct{}
 	// pokeGap is the least time between two fetches that pokes ask for.
@@ -459,6 +460,10 @@ type certMirror struct {
 	shown   peerapi.CertSnapshot
 	carried map[string]bool
 	have    bool
+	// applied is the tag of the fetched snapshot once it is on disk and onSnapshot has been told, with
+	// no file carried over: the disk then holds the snapshot as it is, and a "not modified" answer has
+	// nothing left to do.
+	applied string
 }
 
 // pokeEvery is the least time between two fetches that a handshake for an unknown name asks for.
@@ -484,7 +489,7 @@ func (m *certMirror) wake() {
 // disk. A node does it before it mirrors again, because it may have written its own files while it led.
 func (m *certMirror) reset() {
 	m.mu.Lock()
-	m.tag, m.fetched, m.shown, m.carried, m.have = "", peerapi.CertSnapshot{}, peerapi.CertSnapshot{}, nil, false
+	m.tag, m.fetched, m.shown, m.carried, m.have, m.applied = "", peerapi.CertSnapshot{}, peerapi.CertSnapshot{}, nil, false, ""
 	m.mu.Unlock()
 }
 
@@ -560,11 +565,14 @@ func (m *certMirror) sync(ctx context.Context) error {
 		if !m.have {
 			return errors.New("the leader answered not modified to a request without a tag")
 		}
+		if m.applied == m.tag && len(m.carried) == 0 {
+			return nil // what the disk and the cache hold is this snapshot
+		}
 		snap = m.fetched
 	case err != nil:
 		return err
 	default:
-		m.fetched, m.tag = snap, snapshotTag(snap)
+		m.fetched, m.tag, m.applied = snap, snapshotTag(snap), ""
 	}
 	if len(snap.Files) == 0 {
 		// A leader that has issued nothing yet: applySnapshot would change nothing on disk, so the
@@ -579,6 +587,9 @@ func (m *certMirror) sync(ctx context.Context) error {
 	m.shown, m.have = shown, true
 	if m.onSnapshot != nil {
 		m.onSnapshot(ctx, shown)
+	}
+	if len(m.carried) == 0 {
+		m.applied = m.tag
 	}
 	return nil
 }

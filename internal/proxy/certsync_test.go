@@ -299,6 +299,54 @@ func newMirrorOf(l *leaderStore, dir string) *certMirror {
 	return newCertMirror(dir, &CertSync{Source: l.src, Interval: time.Hour}, quietLog())
 }
 
+// A snapshot that could not be written is applied again on the next fetch, even though the leader
+// answers 304 to its tag; once it is on disk, a 304 does nothing.
+func TestMirrorAppliesAFailedSnapshotOnTheNextNotModified(t *testing.T) {
+	ctx := context.Background()
+	l := newLeaderStore(t)
+	issuer := "acme.test-dir"
+	crt, key := testCert(t, "api.example.com")
+	writeSite(t, l.dir, issuer, "api.example.com", crt, key)
+
+	local := t.TempDir()
+	m := newMirrorOf(l, local)
+	told := 0
+	m.onSnapshot = func(context.Context, peerapi.CertSnapshot) { told++ }
+	if err := m.sync(ctx); err != nil || told != 1 {
+		t.Fatalf("the first fetch: %v, onSnapshot told %d times", err, told)
+	}
+
+	// A renewal arrives while a file sits where the site's directory belongs: the apply fails.
+	site := filepath.Join(local, "certificates", issuer, "api.example.com")
+	if err := os.RemoveAll(site); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, site, "in the way")
+	crtN, keyN := testCert(t, "api.example.com")
+	writeSite(t, l.dir, issuer, "api.example.com", crtN, keyN)
+	if err := m.sync(ctx); err == nil {
+		t.Fatal("the renewal was applied over a file")
+	}
+	if told != 1 {
+		t.Fatalf("onSnapshot told %d times of a snapshot that is not on disk", told)
+	}
+	if err := os.Remove(site); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if paths := l.rpc.paths(); len(paths) != 3 || !strings.HasPrefix(paths[2], peerapi.PathCerts+"?etag=") {
+		t.Fatalf("fetches: %v, want the third to carry the tag", paths)
+	}
+	if b, _ := os.ReadFile(filepath.Join(site, "api.example.com.crt")); string(b) != string(crtN) || told != 2 {
+		t.Fatalf("after the retry: the renewal is on disk: %v, onSnapshot told %d times", string(b) == string(crtN), told)
+	}
+	if err := m.sync(ctx); err != nil || told != 2 {
+		t.Fatalf("a 304 on an applied snapshot: %v, onSnapshot told %d times", err, told)
+	}
+}
+
 func TestMirrorCopiesTheLeadersStoreByETag(t *testing.T) {
 	ctx := context.Background()
 	l := newLeaderStore(t)
@@ -362,8 +410,8 @@ func TestMirrorCopiesTheLeadersStoreByETag(t *testing.T) {
 	if len(paths) != 2 || !strings.HasPrefix(paths[1], peerapi.PathCerts+"?etag=") {
 		t.Errorf("second fetch: %v", paths)
 	}
-	if len(told) != 2 || told[0] != told[1] {
-		t.Errorf("onSnapshot told %v: it should hear the store after every fetch", told)
+	if len(told) != 1 {
+		t.Errorf("onSnapshot told %v: a 304 on a snapshot that is fully applied has nothing new to tell", told)
 	}
 	for p, c := range tree(t, local) {
 		if before[p] != c {
