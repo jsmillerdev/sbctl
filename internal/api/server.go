@@ -18,6 +18,7 @@ import (
 	"github.com/supavise/supavise/internal/domains"
 	"github.com/supavise/supavise/internal/lifecycle"
 	"github.com/supavise/supavise/internal/members"
+	"github.com/supavise/supavise/internal/oauth"
 	"github.com/supavise/supavise/internal/placement"
 	"github.com/supavise/supavise/internal/projectconfig"
 	"github.com/supavise/supavise/internal/registry"
@@ -109,6 +110,15 @@ type Deps struct {
 	// *failover.Orchestrator implements it. Nil: the node is not part of a cluster and the route
 	// answers 404.
 	Failover FailoverSource
+	// OAuth is the OAuth authorization server's service (internal/oauth): dynamic registration, the
+	// consent flow, the token endpoint, the organization's OAuth Apps and the lookup of OAuth access
+	// tokens. Empty builds one. NewServer fills the fields of the service that are empty, in place:
+	// Store from Registry (the registry's database for a Postgres registry, memory otherwise),
+	// Issuer from Config.APIURL(), DashboardURL from Config.DashboardURL(), Now, Admit (the checks the
+	// API applies to every user: not removed, still admitted by SSO, still a member of the
+	// organization), Audit (registry events on the system project) and Log. A caller sets what it must
+	// provide itself, such as Alert, which internal/app wires to the alerts notifier.
+	OAuth *oauth.Service
 }
 
 // Server is the Management API. It implements http.Handler.
@@ -165,6 +175,10 @@ type Server struct {
 	lbOn      bool
 	// failover is Deps.Failover (failover.go).
 	failover FailoverSource
+
+	// oauth is the OAuth service (Deps.OAuth, completed by oauthService). Handlers read it when they
+	// run, never when their routes are registered, so that a test can put a fake in its place.
+	oauth oauth.Authority
 
 	// disk is the data volume and the projects' disk limits (compute.go).
 	disk DiskLimits
@@ -347,6 +361,7 @@ func NewServer(d Deps) (*Server, error) {
 	s.auth.removed = claims.UserRemoved
 	s.auth.sso = s.sso.Admit
 	s.auth.ssoUser = s.sso.AdmitUser
+	s.oauth = s.oauthService(d.OAuth)
 	h, err := s.build()
 	if err != nil {
 		return nil, err
@@ -358,6 +373,81 @@ func NewServer(d Deps) (*Server, error) {
 // Members returns the roles service the server enforces permissions with. The SSO code
 // calls GrantSSODefault on it when a user signs in through SSO for the first time.
 func (s *Server) Members() *members.Service { return s.members }
+
+// oauthDisabled reports [api] disable_oauth. Every OAuth route (oauth_http.go, oauth_consent.go,
+// oauth_metadata.go, oauth_apps_api.go) and the /mcp gate (mcp.go) answers 404 while it is set, except
+// GET /v1/oauth/authorize/project-claim, which stays the stub it is.
+func (s *Server) oauthDisabled() bool { return s.cfg.API.DisableOAuth }
+
+// oauthService completes the service in Deps.OAuth, or a new one, with what only the server knows
+// (see Deps.OAuth) and returns it. It changes only the fields that are empty.
+func (s *Server) oauthService(svc *oauth.Service) *oauth.Service {
+	if svc == nil {
+		svc = &oauth.Service{}
+	}
+	if svc.Store == nil {
+		if pg, ok := s.reg.(*registry.Postgres); ok {
+			svc.Store = oauth.NewPGStore(pg.Pool())
+		} else {
+			svc.Store = oauth.NewMemoryStore()
+		}
+	}
+	if svc.Issuer == "" {
+		svc.Issuer = s.cfg.APIURL()
+	}
+	if svc.DashboardURL == "" {
+		svc.DashboardURL = s.cfg.DashboardURL()
+	}
+	if svc.Now == nil {
+		svc.Now = s.now
+	}
+	if svc.Admit == nil {
+		svc.Admit = s.oauthAdmit
+	}
+	if svc.Audit == nil {
+		svc.Audit = s.oauthAudit
+	}
+	if svc.Log == nil {
+		svc.Log = s.log.With("component", "oauth")
+	}
+	return svc
+}
+
+// oauthAdmit is oauth.Service.Admit: whether the user may hold OAuth grants in the organization
+// now. It applies to the owner of a grant what authenticate applies to the owner of a personal
+// access token (the user was not removed; an SSO user is still admitted) and adds the membership.
+// A refusal is oauth.ErrNotAdmitted or oauth.ErrNotMember; any other error means it could not find out.
+func (s *Server) oauthAdmit(ctx context.Context, userID string, orgID int64) error {
+	if gone, err := s.auth.isRemoved(ctx, userID); err != nil {
+		return err
+	} else if gone {
+		return oauth.ErrNotAdmitted
+	}
+	if s.auth.ssoUser != nil {
+		if err := s.auth.ssoUser(ctx, userID); err != nil {
+			if e := asError(err); e.Status < http.StatusInternalServerError {
+				return oauth.ErrNotAdmitted
+			}
+			return err
+		}
+	}
+	a, err := s.members.Access(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !a.IsMember(orgID) {
+		return oauth.ErrNotMember
+	}
+	return nil
+}
+
+// oauthAudit is oauth.Service.Audit: an event on the system project, in the way of the SSO events. A
+// failure is logged and does not fail the request.
+func (s *Server) oauthAudit(ctx context.Context, kind string, payload map[string]any) {
+	if err := s.reg.AppendEvent(context.WithoutCancel(ctx), config.SystemRef, kind, payload); err != nil {
+		s.log.Warn("an OAuth audit event was not recorded", "kind", kind, "error", err)
+	}
+}
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
@@ -409,10 +499,21 @@ func (s *Server) implemented() map[string]route {
 	s.routesLoadBalancers(add)
 	s.routesInfraMonitoring(add)
 	s.routesFailover(add)
+	// The OAuth authorization server and the organization's OAuth Apps. Both are registered whether
+	// or not [api] disable_oauth is set; their handlers answer 404 when it is (oauthDisabled).
+	s.routesOAuth(add)
+	s.routesOAuthApps(add)
 	// The device-login poll carries no credentials: the CLI has none yet.
 	r := m["GET /platform/cli/login/{session_id}"]
 	r.auth = authNone
 	m["GET /platform/cli/login/{session_id}"] = r
+	// So do the OAuth endpoints a client calls before it has a token (oauthPublicRoutes).
+	for _, key := range oauthPublicRoutes {
+		if rt, ok := m[key]; ok {
+			rt.auth = authNone
+			m[key] = rt
+		}
+	}
 	return m
 }
 
@@ -445,6 +546,7 @@ func (s *Server) build() (http.Handler, error) {
 		}
 	}
 	s.claimRoutes(mux)
+	s.oauthWellKnown(mux)
 	s.healthzRoutes(mux)
 	mux.handle("GET /internal/templates/{ref}/{name}", s.wrap("", authNone, s.serveTemplate))
 	mux.handle("POST "+sso.HookPath, s.wrap("", authNone, s.serveBeforeUserCreated))
@@ -553,7 +655,13 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			id = newRequestID()
 		}
 		w.Header().Set("X-Request-Id", id)
-		if origin := r.Header.Get("Origin"); origin != "" && allowed[strings.TrimRight(origin, "/")] {
+		// The OAuth endpoints have their own, open CORS policy (oauth_cors.go). A path it covers does not
+		// get the dashboard's.
+		covered, done := s.oauthCORS(w, r)
+		if done {
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" && !covered && allowed[strings.TrimRight(origin, "/")] {
 			h := w.Header()
 			h.Set("Access-Control-Allow-Origin", origin)
 			h.Set("Access-Control-Allow-Credentials", "true")

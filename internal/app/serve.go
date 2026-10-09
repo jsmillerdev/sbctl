@@ -229,6 +229,7 @@ func Serve(ctx context.Context, cfg *config.Config, o Options) error {
 		}
 	}
 	popts.APIHandler = apiH
+	popts.MCPGate = apiH.MCPGate
 	edge, err := proxy.New(popts)
 	if err != nil {
 		return err
