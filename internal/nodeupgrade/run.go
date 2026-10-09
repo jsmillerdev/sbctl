@@ -395,7 +395,15 @@ func (r *run) apply(ctx context.Context, staged *Staged) error {
 		}
 	}
 
-	// Everything above changed nothing that runs; from here the node changes.
+	// Everything above changed nothing that runs; from here the node changes. A leader announces it first
+	// (design 2.10.7), so that no automatic failover fires while its daemon and services restart.
+	end, err := announce(ctx, h, o, node, MaintenanceReason(plan.To))
+	if err != nil {
+		return r.endRefused(ctx, fmt.Errorf("%w; nothing was stopped or changed", err))
+	}
+	if end != nil {
+		defer end()
+	}
 	o.notify(ctx, Event{Kind: EventStarted, From: node.Version, To: plan.To, Projects: len(plan.Upgrade) + len(plan.Pending)})
 	r.announced = true
 
