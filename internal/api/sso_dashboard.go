@@ -75,8 +75,12 @@ type DashboardSSO struct {
 	// notSSO is when AdmitUser last found that a user has no SSO record, which is the answer for every
 	// user who signs in with a password and holds a personal access token or an OAuth grant. It lives
 	// ssoCacheTTL, as admitted does, and goes with it (forgetUser, forgetAdmitted).
-	notSSO  map[string]time.Time
-	firstMu sync.Mutex
+	notSSO map[string]time.Time
+	// notSSOGen counts the times something was forgotten or a user was recorded. A lookup that found no
+	// record stores its answer only if the count is the one it started with, so that an answer read
+	// before firstSight inserted the record cannot be stored after firstSight dropped it.
+	notSSOGen uint64
+	firstMu   sync.Mutex
 }
 
 type cachedProvider struct {
@@ -94,6 +98,7 @@ func (d *DashboardSSO) forgetUser(userID string) {
 	d.mu.Lock()
 	delete(d.admitted, userID)
 	delete(d.notSSO, userID)
+	d.notSSOGen++
 	d.mu.Unlock()
 }
 
@@ -101,6 +106,7 @@ func (d *DashboardSSO) forgetUser(userID string) {
 func (d *DashboardSSO) forgetAdmitted() {
 	d.mu.Lock()
 	d.admitted, d.notSSO = nil, nil
+	d.notSSOGen++
 	d.mu.Unlock()
 }
 
@@ -1080,6 +1086,7 @@ func (d *DashboardSSO) AdmitUser(ctx context.Context, userID string) error {
 	d.mu.Lock()
 	at, ok := d.admitted[userID]
 	none, notSSO := d.notSSO[userID]
+	gen := d.notSSOGen
 	d.mu.Unlock()
 	if ok && now.Sub(at) < ssoCacheTTL || notSSO && now.Sub(none) < ssoCacheTTL {
 		return nil
@@ -1087,10 +1094,12 @@ func (d *DashboardSSO) AdmitUser(ctx context.Context, userID string) error {
 	u, err := d.Store.GetSSOUser(ctx, userID)
 	if errors.Is(err, ErrNotFound) {
 		d.mu.Lock()
-		if d.notSSO == nil || len(d.notSSO) >= maxAdmitted {
-			d.notSSO = map[string]time.Time{} // entries are ten seconds old at most; a reset only costs a lookup
+		if d.notSSOGen == gen { // else the user was recorded or forgotten while the lookup ran: ask again next time
+			if d.notSSO == nil || len(d.notSSO) >= maxAdmitted {
+				d.notSSO = map[string]time.Time{} // entries are ten seconds old at most; a reset only costs a lookup
+			}
+			d.notSSO[userID] = now
 		}
-		d.notSSO[userID] = now
 		d.mu.Unlock()
 		return nil
 	}
@@ -1145,6 +1154,7 @@ func (d *DashboardSSO) firstSight(ctx context.Context, row *SSOProviderRow, user
 	}
 	d.mu.Lock()
 	delete(d.notSSO, userID)
+	d.notSSOGen++
 	d.mu.Unlock()
 	payload := map[string]any{"user": userID, "provider": row.ID, "state": u.State}
 	if denied && !member {

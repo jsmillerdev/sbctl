@@ -1795,3 +1795,44 @@ func TestAdmitUserRemembersThatAUserIsNotAnSSOUser(t *testing.T) {
 		t.Fatal("a token of a user who waits for approval passed on the answer remembered before the user was recorded")
 	}
 }
+
+// raceSSOStore runs hook once, after a lookup of an SSO user found no record and before the lookup
+// returns, which is when another request records the user.
+type raceSSOStore struct {
+	SSOStore
+	hook func()
+}
+
+func (c *raceSSOStore) GetSSOUser(ctx context.Context, userID string) (*SSOUser, error) {
+	u, err := c.SSOStore.GetSSOUser(ctx, userID)
+	if errors.Is(err, ErrNotFound) && c.hook != nil {
+		h := c.hook
+		c.hook = nil
+		h()
+	}
+	return u, err
+}
+
+// A lookup that found no record before the user was recorded must not leave "not an SSO user" behind
+// once the record is there: the next token request of the user is refused, not admitted for ssoCacheTTL.
+func TestAdmitUserDoesNotRememberAnAnswerThatTheRecordingOverTook(t *testing.T) {
+	f := newSSOFixture(t)
+	ctx := context.Background()
+	id := f.addProvider(acmeIdP, "developer", "acme.test")
+	race := &raceSSOStore{SSOStore: f.srv.sso.Store}
+	f.srv.sso.Store = race
+	race.hook = func() {
+		if err := f.srv.sso.Admit(ctx, ssoUser2, "mallory@contractor.test", id); err == nil {
+			t.Error("a user of an unmapped domain was admitted")
+		}
+	}
+	if err := f.srv.sso.AdmitUser(ctx, ssoUser2); err != nil {
+		t.Fatalf("the request that looked before the user was recorded: %v", err)
+	}
+	if race.hook != nil {
+		t.Fatal("the user was not recorded during the lookup")
+	}
+	if err := f.srv.sso.AdmitUser(ctx, ssoUser2); err == nil {
+		t.Fatal("a user who waits for approval was admitted on the answer remembered before the record")
+	}
+}
