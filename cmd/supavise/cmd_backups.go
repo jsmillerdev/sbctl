@@ -161,7 +161,7 @@ func init() {
 					errs = append(errs, err)
 				} else {
 					fmt.Fprintf(w, "backup %d of %s complete: %s, %s stored, WAL %s to %s (timeline %d)\n",
-						rec.ID, rec.Ref, rec.Location, humanBytes(rec.SizeBytes), rec.StartLSN, rec.StopLSN, rec.Timeline)
+						rec.ID, rec.Ref, rec.Location, lifecycle.HumanBytes(rec.SizeBytes), rec.StartLSN, rec.StopLSN, rec.Timeline)
 				}
 			}
 			if err := errors.Join(errs...); err != nil {
@@ -205,7 +205,7 @@ func init() {
 				fmt.Fprintln(tw, "ID\tKIND\tREASON\tFINISHED\tFILES\tSIZE\tUPLOADED")
 				for _, m := range all {
 					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", m.ID, m.Kind, m.Reason, m.StopTime.UTC().Format(time.RFC3339),
-						m.Files, humanBytes(m.Bytes), humanBytes(m.NewBytes))
+						m.Files, lifecycle.HumanBytes(m.Bytes), lifecycle.HumanBytes(m.NewBytes))
 				}
 				return tw.Flush()
 			}
@@ -221,7 +221,7 @@ func init() {
 				fmt.Fprintln(tw, "ID\tREASON\tSTARTED\tSTOPPED\tTIMELINE\tSTART LSN\tSTORED")
 				for _, m := range ms {
 					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", m.ID, m.Reason, m.StartTime.UTC().Format(time.RFC3339),
-						m.StopTime.UTC().Format(time.RFC3339), m.Timeline, m.StartLSN, humanBytes(m.StoredBytes))
+						m.StopTime.UTC().Format(time.RFC3339), m.Timeline, m.StartLSN, lifecycle.HumanBytes(m.StoredBytes))
 				}
 				return tw.Flush()
 			}
@@ -236,7 +236,7 @@ func init() {
 			fmt.Fprintln(tw, "ID\tSTATUS\tSTARTED\tTIMELINE\tSTART LSN\tSTOP LSN\tSTORED\tLOCATION")
 			for _, b := range reg {
 				fmt.Fprintf(tw, "%d\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", b.ID, b.Status, b.StartedAt.UTC().Format(time.RFC3339),
-					b.Timeline, b.StartLSN, b.StopLSN, humanBytes(b.SizeBytes), b.Location)
+					b.Timeline, b.StartLSN, b.StopLSN, lifecycle.HumanBytes(b.SizeBytes), b.Location)
 			}
 			return tw.Flush()
 		},
@@ -576,7 +576,7 @@ func printFilesResult(w io.Writer, ref string, res *backup.FilesResult) {
 			return
 		}
 		fmt.Fprintf(w, "%s of %s backed up: %d files, %s; %d new or changed (%s stored); snapshot %s\n",
-			what, ref, m.Files, humanBytes(m.Bytes), m.NewFiles, humanBytes(m.NewBytes), m.ID)
+			what, ref, m.Files, lifecycle.HumanBytes(m.Bytes), m.NewFiles, lifecycle.HumanBytes(m.NewBytes), m.ID)
 	}
 	line("objects", res.Storage)
 	line("functions", res.Functions)
@@ -687,17 +687,4 @@ func printBackupStatus(cmd *cobra.Command) error {
 		}
 	}
 	return nil
-}
-
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

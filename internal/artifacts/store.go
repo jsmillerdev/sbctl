@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
+	"github.com/supavise/supavise/internal/ctxutil"
+	"github.com/supavise/supavise/internal/fsutil"
 )
 
 // ErrNotFetched is returned by Dir when the artifact is not unpacked yet.
@@ -235,15 +237,19 @@ func (s *Store) releaseDigest(ctx context.Context, tag, name string) (string, er
 	return want, nil
 }
 
+// fetchAttempts bounds the tries of one download; retryDelay(n) is the wait before try n (1, 2, 4
+// and 8 seconds), long enough to ride out a release host's brief run of 5xx answers.
+const fetchAttempts = 5
+
+func retryDelay(attempt int) time.Duration { return time.Second << (attempt - 1) }
+
 // get downloads a small file with a few retries.
 func (s *Store) get(ctx context.Context, url string) ([]byte, error) {
 	var last error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < fetchAttempts; attempt++ {
 		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
+			if err := ctxutil.Sleep(ctx, retryDelay(attempt)); err != nil {
+				return nil, err
 			}
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -283,12 +289,10 @@ func (s *Store) ensureArchive(ctx context.Context, archive, want, url string) er
 	}
 	s.log.Info("downloading artifact", "url", url)
 	var last error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < fetchAttempts; attempt++ {
 		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(time.Duration(attempt*2) * time.Second):
+			if err := ctxutil.Sleep(ctx, retryDelay(attempt)); err != nil {
+				return err
 			}
 		}
 		if last = s.download(ctx, url, archive, want); last == nil {
@@ -406,10 +410,8 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// writeAtomic replaces path with b through a temporary file of its own, so two writers never share
+// one.
 func writeAtomic(path string, b []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsutil.WriteFile(path, b, 0o644, fsutil.Options{})
 }
