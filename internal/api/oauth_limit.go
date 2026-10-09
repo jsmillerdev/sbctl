@@ -7,9 +7,9 @@ import (
 )
 
 // Per-address limits of the OAuth endpoints (design 2.14). They are in memory and per node, in the
-// way of claimLimiter, so a cluster of n nodes lets n times as many requests through. Behind them
-// stand the caps of internal/oauth (stored dynamic apps, pending authorizations), which count rows
-// and so hold across nodes.
+// way of the limiter of POST /claim, so a cluster of n nodes lets n times as many requests
+// through. Behind them stand the caps of internal/oauth (stored dynamic apps, pending
+// authorizations), which count rows and so hold across nodes.
 const (
 	// oauthRegisterLimit registrations per oauthRegisterWindow per client address. Claude Code
 	// registers again on every connect, so the limit is generous.

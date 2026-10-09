@@ -18,7 +18,6 @@ import (
 	"net/mail"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/supavise/supavise/internal/config"
@@ -543,65 +542,16 @@ func (a *Accounts) RemoveUserBy(ctx context.Context, email string, force bool, s
 
 // ---- HTTP -----------------------------------------------------------------
 
-// claimLimiter bounds failed redemptions per client address: with 192-bit tokens guessing is
-// out of reach, so this only keeps the endpoint from being a free oracle for load. It is keyed
-// by client so that an anonymous caller who sends junk cannot lock the first administrator or
-// an invitee out; a distributed flood is a load problem for the network layer, not something a
-// shared counter could absorb without becoming a lockout.
-type claimLimiter struct {
-	mu      sync.Mutex
-	clients map[string]*claimWindow
-}
-
-type claimWindow struct {
-	start time.Time
-	fails int
-}
-
+// The limiter of POST /claim (a windowLimiter) bounds failed redemptions per client address: with
+// 192-bit tokens guessing is out of reach, so this only keeps the endpoint from being a free oracle
+// for load. It is keyed by client so that an anonymous caller who sends junk cannot lock the first
+// administrator or an invitee out; a distributed flood is a load problem for the network layer, not
+// something a shared counter could absorb without becoming a lockout. Entries of ended windows are
+// dropped first, then unknown clients fail open (see windowLimiter.slot).
 const (
 	claimFailLimit  = 10
 	claimFailWindow = time.Minute
-	claimMaxClients = 4096 // bounds memory; entries older than a window are dropped first, then unknown clients fail open
 )
-
-// window returns the live window of key (starting a new one when the old expired). Caller holds mu.
-func (l *claimLimiter) window(key string, now time.Time) *claimWindow {
-	if l.clients == nil {
-		l.clients = map[string]*claimWindow{}
-	}
-	w := l.clients[key]
-	if w != nil && now.Sub(w.start) <= claimFailWindow {
-		return w
-	}
-	if w == nil && len(l.clients) >= claimMaxClients {
-		for k, o := range l.clients {
-			if now.Sub(o.start) > claimFailWindow {
-				delete(l.clients, k)
-			}
-		}
-		if len(l.clients) >= claimMaxClients {
-			// Every slot is a live window. Fail open for an unknown client: hand back a window
-			// that is not stored, so its failures count for nothing. A shared overflow bucket
-			// would let a flood of junk clients lock out the first administrator.
-			return &claimWindow{start: now}
-		}
-	}
-	w = &claimWindow{start: now}
-	l.clients[key] = w
-	return w
-}
-
-func (l *claimLimiter) blocked(key string, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.window(key, now).fails >= claimFailLimit
-}
-
-func (l *claimLimiter) fail(key string, now time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.window(key, now).fails++
-}
 
 // trustForwarded reports whether X-Forwarded-For of a request from a loopback peer may be
 // believed. On a node without Edge Functions only local processes the node's owner runs
@@ -651,7 +601,7 @@ func claimClient(r *http.Request, trustForwarded bool) string {
 // claimRoutes registers GET and POST /claim, served on api.<domain> and the loopback
 // admin listener without credentials (the token is the credential).
 func (s *Server) claimRoutes(mux *muxSet) {
-	lim := &claimLimiter{}
+	lim := newWindowLimiter(claimFailLimit, claimFailWindow)
 	mux.handle("GET /claim", s.wrap("", authNone, func(w http.ResponseWriter, r *http.Request) error {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
@@ -664,7 +614,7 @@ func (s *Server) claimRoutes(mux *muxSet) {
 	mux.handle("POST /claim", s.wrap("", authNone, func(w http.ResponseWriter, r *http.Request) error {
 		now := s.now()
 		client := claimClient(r, s.trustForwarded(r))
-		if lim.blocked(client, now) {
+		if _, blocked := lim.blocked(client, now); blocked {
 			w.Header().Set("Retry-After", "60")
 			return errf(http.StatusTooManyRequests, "Too many failed attempts; wait a minute")
 		}
